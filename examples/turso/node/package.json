@@ -1,0 +1,9 @@
+{
+  "name": "musql-turso-node-test",
+  "private": true,
+  "type": "module",
+  "description": "Turso's @libsql/client against musqld. Run: node test.mjs http://127.0.0.1:8080",
+  "dependencies": {
+    "@libsql/client": "^0.18.0"
+  }
+}

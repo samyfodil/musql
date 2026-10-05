@@ -1,0 +1,138 @@
+package engine
+
+import (
+	"sync"
+
+	"github.com/samyfodil/musql/internal/jit"
+)
+
+// The JITted VDBE's filter path: compile predicates to machine code once,
+// then run over every segment. Enabled by default on amd64 and arm64;
+// disabled elsewhere or with WithoutJIT. Kernels are cached and never unmapped.
+
+var jitEnabled = jit.Available
+
+// JITEnabled reports whether this process will execute generated machine code.
+func JITEnabled() bool { return jitEnabled }
+
+type jitFilterKey struct {
+	opA, opC segPredOp
+	two      bool
+}
+
+var jitFilterCache sync.Map // jitFilterKey -> *jit.Code
+
+// jitCondOf maps a predicate operator to the condition code the emitter uses.
+func jitCondOf(op segPredOp) jit.Cond {
+	switch op {
+	case segGT:
+		return jit.CondG
+	case segGE:
+		return jit.CondGE
+	case segLT:
+		return jit.CondL
+	case segLE:
+		return jit.CondLE
+	case segEQ:
+		return jit.CondE
+	default:
+		return jit.CondNE
+	}
+}
+
+// jitFilterKernel returns the compiled kernel for this predicate shape,
+// emitting it on first use. nil when the shape is not one the emitter handles.
+func jitFilterKernel(preds []segPred) *jit.Code {
+	if !jitEnabled || len(preds) == 0 || len(preds) > 2 {
+		// Three or more predicates have no emitter yet.
+		//
+		// One USED to be excluded here, on the grounds that Go's single-compare
+		// loop was already 0.75 ns/row and the trampoline call would eat the
+		// difference. That was true of the branchy kernel and is not true of
+		// this one: a single compare is five instructions with no jump, against
+		// a Go loop that still mispredicts.
+		return nil
+	}
+	two := len(preds) == 2
+	key := jitFilterKey{opA: preds[0].Op, two: two}
+	if two {
+		key.opC = preds[1].Op
+	}
+	if c, ok := jitFilterCache.Load(key); ok {
+		if c == nil {
+			return nil
+		}
+		return c.(*jit.Code)
+	}
+	// Vectors where they exist, the branch-free scalar loop where they do not.
+	// Both answer identically -- TestJITFilterMatchesInterpreter checks each
+	// against the same reference -- so this decides only speed.
+	condA := jitCondOf(preds[0].Op)
+	condC := condA
+	if two {
+		condC = jitCondOf(preds[1].Op)
+	}
+	var code []byte
+	var err error
+	if jit.HasVector() {
+		code, err = jit.EmitFilterCountSIMD(condA, two, condC)
+	} else {
+		code, err = jit.EmitFilterCount(condA, two, condC)
+	}
+	if err != nil {
+		jitFilterCache.Store(key, (*jit.Code)(nil))
+		return nil
+	}
+	k, err := jit.Map(code)
+	if err != nil {
+		jitFilterCache.Store(key, (*jit.Code)(nil))
+		return nil
+	}
+	actual, _ := jitFilterCache.LoadOrStore(key, k)
+	if got := actual.(*jit.Code); got != k {
+		// Another goroutine won the race; this one's mapping is unreferenced.
+		k.Close()
+		return got
+	}
+	return k
+}
+
+// jitFilterCount runs the compiled kernel over one segment, or returns -1 when
+// this predicate shape or this segment cannot use it.
+//
+// Both columns must be fixed-width int64 blocks with no NULL and no exception,
+// which is the same condition the zero-copy read requires -- the kernel reads
+// the block directly and has no way to consult a bitmap or a side list.
+func jitFilterCount(s *segment, preds []segPred) int {
+	k := jitFilterKernel(preds)
+	if k == nil {
+		return -1
+	}
+	cols := make([][]int64, len(preds))
+	for i, p := range preds {
+		if p.Val.Typ != Int {
+			return -1
+		}
+		if kind, _ := s.scanKind(p.Col); kind != segScanSlice {
+			return -1
+		}
+		col, ok := s.Int64Column(p.Col)
+		if !ok {
+			return -1
+		}
+		cols[i] = col
+	}
+	n := len(cols[0])
+	args := jit.Args{A: &cols[0][0], XA: preds[0].Val.I}
+	if len(preds) == 2 {
+		n = min(n, len(cols[1]))
+		args.C, args.XC = &cols[1][0], preds[1].Val.I
+	}
+	if n == 0 {
+		return 0
+	}
+	var out int64
+	args.N, args.Out = int64(n), &out
+	k.Call(&args)
+	return int(out)
+}

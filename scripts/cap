@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Run a command inside a rootless, memory-capped cgroup-v2 scope so a runaway
+# test is killed inside its own cgroup — never the host.
+#
+#   scripts/cap -- go test ./...
+#
+# MEM defaults to $MUSQL_CAP_MEM or 2G, and 2G is a CEILING: a larger request,
+# positional or environment, is clamped down to it. The full engine test binary
+# does not fit in 2G; run it on a machine with more memory.
+#
+# ★★★ THREE CONTROLS, AND THE SECOND IS WHY THE DESKTOP KEPT DYING.
+#
+# MemoryMax is the HARD ceiling: cross it and the kernel kills inside this
+# cgroup. It works. Every kernel OOM on this box since the cap was adopted is
+# "Memory cgroup out of memory", contained, host survived.
+#
+# But a job is free to THRASH right up against MemoryMax, and the sustained
+# reclaim that causes is system-wide memory PRESSURE (PSI). systemd-oomd watches
+# pressure, not limits, and kills the cgroup under the most pressure -- which on
+# a desktop can be the desktop session, not the test. MemoryHigh is the missing
+# half: it THROTTLES this cgroup and reclaims inside it before the pressure
+# escapes, so the job slows down instead. Set to 75% of MemoryMax.
+#
+# GOMEMLIMIT is aimed at MemoryHigh rather than at MemoryMax, so Go's pacer
+# bounds itself AT the throttle point and the cgroup rarely enters sustained
+# reclaim at all. A genuine leak still exceeds it and is still killed by
+# MemoryMax, which is the point of the cap.
+#
+# CPU is capped via $MUSQL_CAP_CPU (a systemd CPUQuota, e.g. "300%"). Memory
+# alone does not protect the host: `go test` builds and runs with GOMAXPROCS =
+# every core, so N concurrent agent worktrees oversubscribe the CPU N-fold and
+# the machine stops responding long before any cgroup hits its MemoryMax.
+#
+# MUSQL_NO_CAP=1 bypasses entirely. An unavailable systemd-run is now a HARD
+# ERROR rather than a silent uncapped exec: "always safe to invoke" is not the
+# same as "always capping", and the silent fallback is indistinguishable from
+# protection right up until the host dies.
+mem="${MUSQL_CAP_MEM:-2G}"
+case "${1:-}" in
+  [0-9]*[GMK]) mem="$1"; shift ;;
+esac
+[ "${1:-}" = "--" ] && shift
+
+mem_bytes() {
+  case "$1" in
+    *G|*g) echo $(( ${1%[Gg]} * 1024 * 1024 * 1024 )) ;;
+    *M|*m) echo $(( ${1%[Mm]} * 1024 * 1024 )) ;;
+    *K|*k) echo $(( ${1%[Kk]} * 1024 )) ;;
+    *)     echo 0 ;;
+  esac
+}
+ceiling=$(( 2 * 1024 * 1024 * 1024 ))
+if [ "$(mem_bytes "$mem")" -gt "$ceiling" ]; then
+  echo "cap: requested $mem exceeds the 2G ceiling -- clamping to 2G." >&2
+  mem=2G
+fi
+
+# MemoryHigh = 75% of MemoryMax, in the same unit.
+high="$mem"
+case "$mem" in
+  *G|*g) high="$(( ${mem%[Gg]} * 768 ))M" ;;
+  *M|*m) high="$(( ${mem%[Mm]} * 3 / 4 ))M" ;;
+  *K|*k) high="$(( ${mem%[Kk]} * 3 / 4 ))K" ;;
+esac
+
+if [ "${MUSQL_NO_CAP:-0}" = "1" ]; then
+  echo "cap: MUSQL_NO_CAP=1 -- running UNCAPPED, the host is unprotected." >&2
+  exec "$@"
+fi
+
+# Not Linux: there are no cgroups to put anything in, so capping is not merely
+# unavailable, it is meaningless, so run directly rather than refusing (refusing
+# made a whole sweep report success while executing nothing).
+if [ "$(uname -s)" != "Linux" ]; then
+  exec "$@"
+fi
+
+runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+if ! command -v systemd-run >/dev/null 2>&1 || [ ! -S "$runtime/systemd/private" ]; then
+  echo "scripts/cap: REFUSING to run uncapped -- systemd-run --user is unavailable." >&2
+  echo "  An uncapped run on this host has taken the desktop down more than once." >&2
+  echo "  Set MUSQL_NO_CAP=1 to override deliberately." >&2
+  exit 70
+fi
+
+if [ -z "${GOMEMLIMIT:-}" ]; then
+  hb="$(mem_bytes "$high")"
+  [ "$hb" -gt 0 ] && export GOMEMLIMIT="$hb"
+fi
+
+cpuargs=()
+if [ -n "${MUSQL_CAP_CPU:-}" ] && [ "${MUSQL_CAP_CPU}" != "0" ]; then
+  cpuargs=(-p CPUQuota="${MUSQL_CAP_CPU}")
+  if [ -z "${GOMAXPROCS:-}" ]; then
+    pct="${MUSQL_CAP_CPU%\%}"
+    cores=$(( (pct + 99) / 100 ))
+    [ "$cores" -lt 1 ] && cores=1
+    export GOMAXPROCS="$cores"
+  fi
+fi
+
+exec systemd-run --user --scope -q --collect \
+  -p MemoryMax="$mem" -p MemoryHigh="$high" -p MemorySwapMax=0 -p TasksMax=4096 "${cpuargs[@]}" \
+  -E GOMEMLIMIT="${GOMEMLIMIT:-}" -E GOMAXPROCS="${GOMAXPROCS:-}" -- "$@"

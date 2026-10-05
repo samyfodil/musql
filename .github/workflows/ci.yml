@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Every OS/arch pair the JIT targets runs the suites natively: the file format,
+# the lock ladder (OFD locks on unix, LockFileEx on Windows), and the JIT's
+# executable-memory mapping (mmap on unix, VirtualAlloc on Windows) are only
+# cross-compiled anywhere else.
+jobs:
+  test:
+    name: test ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    name: linux-amd64,   race: "-race" }
+          - { os: ubuntu-24.04-arm, name: linux-arm64,   race: "" }
+          - { os: macos-14,         name: darwin-arm64,  race: "" }
+          - { os: macos-15-intel,   name: darwin-amd64,  race: "" }
+          - { os: windows-latest,   name: windows-amd64, race: "" }
+          - { os: windows-11-arm,   name: windows-arm64, race: "" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go build ./...
+      - name: JIT
+        run: go test ./internal/jit/ ${{ matrix.race }} -count=1 -timeout 10m
+      - name: engine suite
+        run: go test ./engine/ ${{ matrix.race }} -count=1 -timeout 20m
+      - name: engine suite (fts5 build tag)
+        run: go test ./engine/ ${{ matrix.race }} -tags sqlite_fts5 -count=1 -timeout 20m
+      - name: engine suite without the JIT
+        if: matrix.race == ''
+        env:
+          MUSQL_JIT: "0"
+        run: go test ./engine/ -count=1 -timeout 20m
+      - name: driver, converter, replication
+        run: go test ./driver/ ./convert/... ./replication/... ./hrana/ ${{ matrix.race }} -count=1 -timeout 15m
+
+  crossbuild:
+    name: cross-compile all targets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: build and vet every supported triple
+        run: |
+          set -e
+          for t in linux/amd64 linux/arm64 linux/386 linux/arm darwin/amd64 darwin/arm64 \
+                   windows/amd64 windows/arm64 freebsd/amd64 freebsd/arm64 \
+                   openbsd/amd64 netbsd/amd64 illumos/amd64 android/arm64; do
+            echo "== $t =="
+            CGO_ENABLED=0 GOOS=${t%/*} GOARCH=${t#*/} go build ./...
+            CGO_ENABLED=0 GOOS=${t%/*} GOARCH=${t#*/} go vet ./internal/jit/
+          done
+
+  # Concurrent writers and readers on one file at real scale. Push-only: it takes
+  # tens of minutes.
+  n4-stress:
+    name: concurrent writer/reader stress
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: |
+          go test ./engine/ -race -count=15 -timeout=50m \
+            -run 'TestN4ConcurrentWritersOnly|TestN4ConcurrentReadersAndWriters'
+
+  libp2p:
+    name: libp2p example (nested module)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - working-directory: examples/libp2p
+        run: |
+          go build ./...
+          go test ./... -count=1 -timeout 10m
+
+  turso:
+    name: Turso client against musqld (nested module)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - working-directory: examples/turso
+        run: go test ./... -count=1 -timeout 10m
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Turso's Node client (@libsql/client) over http, ws and libsql URLs
+        run: |
+          set -e
+          go build -o /tmp/musqld ./cmd/musqld
+          cd examples/turso/node
+          npm install --no-audit --no-fund
+          for url in http://127.0.0.1:8080 ws://127.0.0.1:8080 "libsql://127.0.0.1:8080?tls=0"; do
+            rm -f /tmp/node.musq*
+            /tmp/musqld -db /tmp/node.musq -listen 127.0.0.1:8080 -auth-token tok &
+            pid=$!
+            sleep 1
+            node test.mjs "$url"
+            kill $pid; wait $pid || true
+          done
+
+  vet:
+    name: go vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: go vet -tags sqlite_fts5 ./...

@@ -1,0 +1,14 @@
+.claude/
+
+# compiled test binaries left behind by "go test -cpuprofile" (which writes
+# the binary into the package directory)
+*.test
+# ...but NOT SQLite's own vendored corpus, which uses the same extension. The
+# blanket rule above silently kept five upstream files (mptest/*.test,
+# tool/genfkey.test) out of a corpus refresh.
+!compat-harness/testdata/tcl/*.test
+
+# machine-specific agent notes
+CLAUDE.local.md
+scripts/local-*
+docs/local-*

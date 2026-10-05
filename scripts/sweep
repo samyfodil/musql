@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# Run the whole-corpus TestTCLCorpus sweep, chunked, and report each chunk's
+# tally plus any file that came back wrong or panicked.
+#
+# This is the project's only gate that has repeatedly caught real regressions
+# the fast gates miss (see AGENTS.md), so it exists as a script rather than as a
+# command to copy: the pattern below has one load-bearing character that is very
+# easy to lose.
+#
+#   scripts/sweep              # every chunk, then the lockstep replay once
+#   scripts/sweep '[a-c]' t    # only the named chunks (no lockstep run)
+#
+# THE "$" IN 'TestTCLCorpus$/^<chunk>' IS LOAD-BEARING. Without it the pattern
+# also matches TestTCLCorpusTxnLockstep, whose full 2,548-statement replay is
+# then re-run for EVERY chunk -- 15 times, ~48s each, for a test that needs to
+# run once. Measured: the unanchored form took ~40 minutes and the anchored one
+# ~8.5, for byte-identical tallies. So the lockstep replay is run ONCE at the
+# end instead, at full breadth, which "go test -short" does NOT do (it truncates
+# its file list to tclShortFileCount).
+#
+# WHY CHUNKED: the corpus is replayed against a live cgo SQLite, and a single
+# whole-corpus process climbs into GBs. Chunking bounds peak RSS per process.
+# sq* is split into 'sqld' (the sqldiff files), 'sqllo' (sqllog) and 'sqlli'
+# (sqllimits1) for that reason and no other now: sqllimits1.test used to climb
+# past 16GB RSS and never complete, because a statement of its own crosses
+# "PRAGMA max_page_count" while still growing and this engine only checked the
+# ceiling once the statement had ENDED. The pager refuses the page now
+# (btc_pager.go), as pager.c:5637 does, and the file replays in 1.5s.
+#
+# THE CHUNK LIST MUST COVER THE CORPUS. It once silently did not:
+# 's[a-h] si so sp sqld s[r-z]' leaves sj/sk/sl/sm/sn and sqllo* unmatched ('q'
+# is not in [r-z], which the old comment got wrong), and a leading digit matched
+# nothing at all. That hid 13 files -- every skipscan*.test and snapshot*.test,
+# sqllog.test and 8_3_names.test -- from every sweep this gate has ever run,
+# including a real wrong=1 in snapshot2.test. assert_chunks_cover_corpus below
+# fails the sweep rather than let that recur; add a chunk when it complains.
+#
+# EVERY chunk must report wrong=0 panics=0. Do not edit engine/ while this runs:
+# each chunk recompiles, so a mid-sweep edit silently tests a tree that never
+# existed.
+set -u
+
+cd "$(dirname "$0")/../compat-harness" || exit 1
+
+DEFAULT_CHUNKS=('[a-c]' '[d-f]' '[g-l]' '[m-o]' '[p-r]' 's[a-h]' 'si' 'sk' 'sn'
+                'so' 'sp' 'sqld' 'sqlli' 'sqllo' 's[r-z]' 't' 'u' 'v' '[w-z]' '[0-9]')
+
+# Nothing is omitted. This used to name sqllimits1.test; see the chunk
+# rationale above for what closed it.
+UNSWEPT_BY_DESIGN='^$'
+
+# assert_chunks_cover_corpus lists every testdata/tcl/*.test that no chunk
+# pattern matches. A file matched by nothing is never replayed, so its wrongs
+# and panics are invisible -- the failure mode this function exists to prevent.
+assert_chunks_cover_corpus() {
+  local f base uncovered=() p hit
+  for f in testdata/tcl/*.test; do
+    base=$(basename "$f")
+    [[ $base =~ $UNSWEPT_BY_DESIGN ]] && continue
+    hit=0
+    for p in "${DEFAULT_CHUNKS[@]}"; do
+      [[ $base =~ ^$p ]] && { hit=1; break; }
+    done
+    [ "$hit" = 0 ] && uncovered+=("$base")
+  done
+  if [ "${#uncovered[@]}" -gt 0 ]; then
+    echo "sweep: ${#uncovered[@]} corpus file(s) match NO chunk -- they would never run:" >&2
+    printf '  %s\n' "${uncovered[@]}" >&2
+    echo "sweep: add a chunk to DEFAULT_CHUNKS (or to UNSWEPT_BY_DESIGN with a reason)" >&2
+    exit 1
+  fi
+}
+assert_chunks_cover_corpus
+
+if [ "$#" -gt 0 ]; then
+  chunks=("$@")
+  run_lockstep=0
+else
+  chunks=("${DEFAULT_CHUNKS[@]}")
+  run_lockstep=1
+fi
+
+# `timeout` is GNU coreutils and is NOT on a stock macOS, where this sweep also
+# runs. Every chunk piped its stderr into the filter below, so
+# "timeout: command not found" was SWALLOWED and the sweep reported 19 chunk
+# headers, no TOTAL lines, exit 0 and 1.97s wall -- a clean-looking result for a
+# run that executed nothing. Resolve it once, and fall back to running without a
+# wall-clock guard rather than to running nothing at all.
+TIMEOUT=""
+for t in timeout gtimeout; do
+  if command -v "$t" >/dev/null 2>&1; then TIMEOUT="$t"; break; fi
+done
+guard() { # guard SECONDS CMD...
+  local secs="$1"; shift
+  if [ -n "$TIMEOUT" ]; then "$TIMEOUT" "$secs" "$@"; else "$@"; fi
+}
+[ -n "$TIMEOUT" ] || echo "===== note: no timeout(1); chunks run without a wall-clock guard" >&2
+
+# status was assigned 0 here and never reassigned, so `exit $status` was
+# ALWAYS 0 and the sweep could not fail. Its exit code proved nothing, and a
+# caller checking it -- which is the obvious thing to do -- got a green light
+# from a run that had found wrong answers, panicked, or executed nothing at all.
+# Every claim of "sweep exit=0" made before this commit was unearned.
+#
+# Judge the OUTPUT instead, which is the only thing that carries the verdict:
+#   - any unsupported=N, wrong=N or panics=N with N>0 is a failure -- a refusal
+#     of something real SQLite runs counts, since unsupported reached 0;
+#   - a chunk that printed NO TOTAL line at all is ALSO a failure, because that
+#     is what a chunk looks like when it never ran. That is not hypothetical:
+#     `timeout` is absent on macOS and every chunk failed instantly, printing
+#     nineteen headers, no TOTALs, and exit 0.
+# ONE test binary, built up front, runs every chunk. It is a frozen snapshot of
+# the tree: the old per-chunk `go test` recompiled 19 times, so an edit landing
+# mid-sweep silently tested a tree that never existed. The binary cannot drift.
+#
+# SWEEP_JOBS runs that many chunks at once (default 1). Leave it at 1 on this
+# workstation -- each chunk climbs into GBs and runs inside its own 2G cap -- and
+# raise it on machines that run uncapped (MUSQL_NO_CAP=1). Every chunk's FULL
+# -v output is kept under SWEEP_LOG (default
+# a fresh temp dir, printed at the end): the per-file "[x.test] ... unsupported=N"
+# lines are what a bucket diff between two trees needs, and TOTAL lines cannot
+# show a compensating pair. TCL_DUMP_UNSUPPORTED is on, so every decline is
+# listed at the end too -- the goal this sweep currently tracks is that list
+# reaching empty.
+# SWEEP_TAGS passes build tags to the one compile, which is how the fts5 build
+# gets a CHUNKED corpus run at all. The standing six-gate order ends with
+# "TestTCLCorpus over the WHOLE corpus, -tags sqlite_fts5", and as a single
+# `go test -run 'TestTCLCorpus$'` it does not fit in 30G of RAM: it reached
+# 26.2 GB anon RSS and was killed by the kernel OOM killer (global_oom, CONSTRAINT_NONE) -- which reports as
+# "signal: killed\tFAIL", a line that reads exactly like the gate failing.
+# Chunking is the whole reason this script exists; the fts5 build needed it too
+# and did not have it.
+#
+#   SWEEP_TAGS=sqlite_fts5 SWEEP_JOBS=3 scripts/sweep
+log="${SWEEP_LOG:-$(mktemp -d "${TMPDIR:-/tmp}/sweep.XXXXXX")}"
+mkdir -p "$log"
+bin="$log/compat-harness.test"
+echo "===== building the test binary once -> $bin${SWEEP_TAGS:+ (-tags $SWEEP_TAGS)}"
+if ! ../scripts/cap -- go test -c ${SWEEP_TAGS:+-tags "$SWEEP_TAGS"} -o "$bin" ./ >"$log/build.log" 2>&1; then
+  cat "$log/build.log" >&2
+  echo "===== FAIL test binary did not build" >&2
+  exit 1
+fi
+
+# run_job INDEX runs chunk INDEX (full output to $log/chunk-INDEX.log), or the
+# lockstep replay for INDEX "lockstep". Only the INDEX crosses xargs: xargs does
+# its own quote processing, so a pattern like '[a-c]' handed to it would reach
+# bash unquoted and glob. The pattern is looked up from CHUNK_LIST instead.
+run_job() {
+  if [ "$1" = lockstep ]; then
+    guard 1800 ../scripts/cap -- "$bin" -test.count=1 -test.timeout=1700s -test.v \
+      -test.run 'TestTCLCorpusTxnLockstep$' >"$log/lockstep.log" 2>&1
+    return
+  fi
+  local P
+  P="$(printf '%s\n' "$CHUNK_LIST" | sed -n "$(( $1 + 1 ))p")"
+  guard 5400 env TCL_WRONG_LOG=3 TCL_DUMP_UNSUPPORTED=1 ../scripts/cap -- "$bin" \
+    -test.count=1 -test.timeout=5300s -test.v -test.run "TestTCLCorpus\$/^$P" \
+    >"$log/chunk-$1.log" 2>&1
+}
+CHUNK_LIST="$(printf '%s\n' "${chunks[@]}")"
+export -f run_job guard
+export log bin TIMEOUT CHUNK_LIST
+
+{ for i in "${!chunks[@]}"; do echo "$i"; done
+  [ "$run_lockstep" = 1 ] && echo lockstep; } |
+  xargs -P "${SWEEP_JOBS:-1}" -I{} bash -c 'run_job {}'
+
+# status was assigned 0 here and never reassigned, so `exit $status` was
+# ALWAYS 0 and the sweep could not fail. Its exit code proved nothing, and a
+# caller checking it -- which is the obvious thing to do -- got a green light
+# from a run that had found wrong answers, panicked, or executed nothing at all.
+# Every claim of "sweep exit=0" made before this commit was unearned.
+#
+# Judge the OUTPUT instead, which is the only thing that carries the verdict:
+#   - any unsupported=N, wrong=N or panics=N with N>0 is a failure -- a refusal
+#     of something real SQLite runs counts, since unsupported reached 0;
+#   - a chunk that printed NO TOTAL line at all is ALSO a failure, because that
+#     is what a chunk looks like when it never ran. That is not hypothetical:
+#     `timeout` is absent on macOS and every chunk failed instantly, printing
+#     nineteen headers, no TOTALs, and exit 0.
+status=0
+for i in "${!chunks[@]}"; do
+  P="${chunks[$i]}"
+  echo "===== chunk $P"
+  out="$(grep -aoE '\[[a-z0-9_]+\.test\].*(wrong=[1-9]|panics=[1-9]).*|TOTAL: .*' "$log/chunk-$i.log" | tail -1)"
+  printf '%s\n' "$out"
+  case "$out" in
+    *TOTAL:*) ;;
+    *) echo "===== FAIL chunk $P produced no TOTAL line -- it did not run" >&2; status=1; continue ;;
+  esac
+  case "$out" in
+    *unsupported=0*wrong=0*panics=0*) ;;
+    *) echo "===== FAIL chunk $P reports unsupported, wrong or panics" >&2; status=1 ;;
+  esac
+done
+
+if [ "$run_lockstep" = 1 ]; then
+  echo "===== txn lockstep (once, every file)"
+  lock="$(grep -aoE 'checked [0-9]+ transaction-control.*|^--- (PASS|FAIL): .*' "$log/lockstep.log" | tail -2)"
+  printf '%s\n' "$lock"
+  case "$lock" in
+    *"--- PASS"*) ;;
+    *) echo "===== FAIL txn lockstep did not PASS" >&2; status=1 ;;
+  esac
+fi
+
+# The corpus-wide buckets, summed over the chunks that ran. A decline is listed
+# once per statement: differ() executes a failing statement twice (see the
+# worker double-execution trap), so its DECLINED line can repeat.
+echo "===== buckets"
+cat "$log"/chunk-*.log | grep -aoE 'TOTAL: .*' | awk '
+  { for (i = 1; i <= NF; i++) if (split($i, kv, "=") == 2 && kv[2] ~ /^[0-9]+$/) sum[kv[1]] += kv[2] }
+  END { n = split("statements pass mutualReject propertyMatch outOfScope unsupported wrong panics", k, " ")
+        for (i = 1; i <= n; i++) printf "%s=%d ", k[i], sum[k[i]]; print "" }'
+echo "===== declines"
+cat "$log"/chunk-*.log | grep -a 'DECLINED'$'\t' | sed 's/^.*DECLINED\t//' | awk -F'\t' '!seen[$1 FS $2]++' | cut -c1-400
+echo "===== full logs: $log"
+echo "===== sweep done (status $status)"
+exit $status
