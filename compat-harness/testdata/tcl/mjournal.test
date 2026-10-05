@@ -1,0 +1,298 @@
+# 2017 September 15
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# This file implements regression tests for SQLite library.
+#
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix mjournal
+
+if {[permutation]=="inmemory_journal"} {
+  finish_test
+  return
+}
+
+# Test that nothing bad happens if a journal file contains a pointer to
+# a master journal file that does not have a "-" in the name. At one point
+# this was causing a segfault on unix.
+#
+do_execsql_test 1.0 {
+  CREATE TABLE t1(a, b);
+}
+
+do_test 1.1 {
+  forcedelete test.db2journal test.db-journal
+
+  close [open test.db-journal w]
+  
+  hexio_write test.db-journal 0 746573742e6462326a6f75726e616c00
+  hexio_write test.db-journal 16 00000010
+  hexio_write test.db-journal 20 000005e1
+  hexio_write test.db-journal 24 d9d505f920a163d7
+
+  close [open test.db2journal w]
+  hexio_write test.db2journal 0 abcd
+} {2}
+
+do_execsql_test 1.2 {
+  SELECT * FROM t1;
+}
+
+do_test 1.3 {
+  forcedelete test0db2journal test.db-journal
+  close [open test.db-journal w]
+  hexio_write test.db-journal 0 74657374306462326a6f75726e616c00
+  hexio_write test.db-journal 16 00000010
+  hexio_write test.db-journal 20 000005e3
+  hexio_write test.db-journal 24 d9d505f920a163d7
+
+  close [open test0db2journal w]
+  hexio_write test0db2journal 0 abcd
+} {2}
+
+do_execsql_test 1.4 {
+  SELECT * FROM t1;
+}
+
+# And now test that nothing bad happens if a master journal contains a
+# pointer to a journal file that does not have a "-" in the name. 
+#
+do_test 1.5 {
+  forcedelete test.db2-master test.db-journal test1
+  close [open test.db-journal w]
+  hexio_write test.db-journal 0 746573742e6462322d6d617374657200
+  hexio_write test.db-journal 16 00000010
+  hexio_write test.db-journal 20 0000059f
+  hexio_write test.db-journal 24 d9d505f920a163d7
+
+  close [open test.db2-master w]
+  hexio_write test.db2-master 0 746573743100
+
+  close [open test1 w]
+  hexio_write test1 0 abcd
+} {2}
+
+do_execsql_test 1.6 {
+  SELECT * FROM t1;
+}
+
+#-------------------------------------------------------------------------
+# Check that master journals are not created if the transaction involves
+# multiple temp files.
+#
+db close
+testvfs tvfs
+tvfs filter xOpen
+tvfs script open_cb
+set ::open ""
+proc open_cb {method file arglist} {
+  lappend ::open $file
+}
+
+proc contains_mj {} {
+  foreach f $::open {
+    set t [file tail $f]
+    if {[string match *mj* $t]} { return 1 }
+  }
+  return 0
+}
+
+# Like [do_execsql_test], except that a boolean indicating whether or
+# not a master journal file was opened ([file tail] contains "mj") or
+# not. Example:
+#
+#   do_hasmj_test 1.0 { SELECT 'a', 'b' } {0 a b}
+#
+proc do_hasmj_test {tn sql expected} {
+  set ::open [list]
+  uplevel [list do_test $tn [subst -nocommands {
+    set res [execsql "$sql"]
+    concat [contains_mj] [set res]
+  }] [list {*}$expected]]
+}
+
+forcedelete test.db
+forcedelete test.db2
+forcedelete test.db3
+sqlite3 db test.db -vfs tvfs
+
+do_execsql_test 2.0 {
+  ATTACH 'test.db2' AS dbfile;
+  ATTACH ''         AS dbtemp;
+  ATTACH ':memory:'  AS dbmem;
+
+  CREATE TABLE t1(x);
+  CREATE TABLE dbfile.t2(x);
+  CREATE TABLE dbtemp.t3(x);
+  CREATE TABLE dbmem.t4(x);
+}
+
+# Two real files.
+do_hasmj_test 2.1 {
+  BEGIN;
+    INSERT INTO t1 VALUES(1);
+    INSERT INTO t2 VALUES(1);
+  COMMIT;
+} {1}
+
+# One real, one temp file.
+do_hasmj_test 2.2 {
+  BEGIN;
+    INSERT INTO t1 VALUES(1);
+    INSERT INTO t3 VALUES(1);
+  COMMIT;
+} {0}
+
+# One file, one :memory: db.
+do_hasmj_test 2.3 {
+  BEGIN;
+    INSERT INTO t1 VALUES(1);
+    INSERT INTO t4 VALUES(1);
+  COMMIT;
+} {0}
+
+#-------------------------------------------------------------------------
+reset_db
+
+do_execsql_test 3.0 {
+  PRAGMA synchronous = OFF;
+  CREATE TABLE t1(x, y);
+}
+
+do_execsql_test 3.1 {
+  BEGIN;
+    INSERT INTO t1 VALUES(100, 200);
+}
+
+db_save
+db close
+db_restore
+
+do_test 3.2 {
+
+  # Append super-journal name to test.db-journal
+  #
+  set mjname [file join [pwd] test.db-super]
+  binary scan $mjname c* bytes
+  set cksum 0
+  foreach b $bytes { incr cksum $b }
+  set fd [open test.db-journal a+]
+  fconfigure $fd -translation binary -encoding iso8859-1
+  puts -nonewline $fd $mjname
+  puts -nonewline $fd [binary format I [string length $mjname]]
+  puts -nonewline $fd [binary format I $cksum]
+  puts -nonewline $fd [binary decode hex "d9d505f920a163d7"]
+  close $fd
+
+  # Create super-journal
+  #
+  set fd [open test.db-super w]
+  fconfigure $fd -translation binary -encoding iso8859-1
+  puts -nonewline $fd "test2.db-journal\0test.db-journal\0"
+  close $fd
+
+  # Create corrupt child journal
+  #
+  set fd [open test2.db-journal w]
+  fconfigure $fd -translation binary -encoding iso8859-1
+  puts -nonewline $fd [binary decode hex "00200001[string repeat 41 512]"]
+  puts -nonewline $fd [binary decode hex "0000020000008200d9d505f920a163d7"]
+  close $fd
+} {}
+
+sqlite3 db test.db
+do_execsql_test 3.3 {
+  SELECT type, name, tbl_name, sql FROM sqlite_schema
+} {table t1 t1 {CREATE TABLE t1(x, y)}}
+
+#-------------------------------------------------------------------------
+reset_db
+do_execsql_test 4.0 {
+  CREATE TABLE t1(x INTEGER PRIMARY KEY);
+}
+db_save_and_close
+
+proc append_super_journal {jrnl mjname} {
+  binary scan $mjname c* bytes
+  set cksum 0
+  foreach b $bytes { incr cksum $b }
+  set fd [open $jrnl a+]
+  fconfigure $fd -translation binary -encoding iso8859-1
+  puts -nonewline $fd $mjname
+  puts -nonewline $fd [binary format I [string length $mjname]]
+  puts -nonewline $fd [binary format I $cksum]
+  puts -nonewline $fd [binary decode hex "d9d505f920a163d7"]
+  close $fd
+}
+
+set c 0
+ifcapable 8_3_names { set c 1 }
+
+set tests [subst {
+  1 notamasterjournal   0
+  2 master.9FF          $c
+  3 master-mj1234569AA  1
+  4 master-mj123456_AA  0
+  5 abc                 0
+  6 masterr9FF          0
+  7 master-fj123456_AA  0
+  8 -mj1234569AA        1
+  9 1-mj1234569AA       1
+  10 .9AB               0
+  11 master.9X2         0
+  12 master.92X         0
+  13 master-mj12G4569AA 0
+}]
+
+foreach {tn mjname bDel} $tests {
+  for {set content 0} {$content<2} {incr content} {
+    db_restore_and_reopen
+    execsql {
+      PRAGMA synchronous = OFF;
+      BEGIN;
+        INSERT INTO t1 DEFAULT VALUES;
+    }
+  
+    db_save_and_close
+    db_restore
+  
+    append_super_journal test.db-journal $mjname
+    set fd [open $mjname w]
+    if {$content} {
+      set jname [file normalize test.db-journal]
+      if {$::tcl_platform(platform) eq "windows"} {
+        set jname [string map [list / \\] $jname]
+      }
+      puts -nonewline $fd $jname
+      puts -nonewline $fd "\0"
+      set mjexists [expr !$bDel]
+    } else {
+      puts -nonewline $fd "helloworld"
+      set mjexists 1
+    }
+    close $fd
+  
+    sqlite3 db test.db
+    do_test 4.$tn.$content.1 {
+      execsql { SELECT * FROM t1 }
+      file exists $mjname
+    } $mjexists
+    do_test 4.$tn.$content.2 {
+      file exists test.db-journal
+    } {0}
+    
+    forcedelete $mjname
+  }
+}
+
+finish_test
+
+

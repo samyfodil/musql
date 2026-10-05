@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Aggregate TestTCLCorpus's unsupported-reason histogram across every chunk.
+#
+# scripts/sweep reports only the per-chunk TALLIES, which say how many
+# statements this engine declined but not WHY. This runs the same chunk list and
+# sums the ranked histogram each chunk prints, so the output is one corpus-wide
+# "reason -> count" ranking -- the input to deciding what is actually closable.
+#
+# Usage: scripts/histogram [out-file]   (default: /tmp/musql-histogram.txt)
+#
+# Same chunking rationale as scripts/sweep: peak RSS per process, and sq* split
+# for the same reason. Nothing is left out of the list any more.
+#
+# THE CHUNK LIST IS SOURCED FROM scripts/sweep, deliberately, and must never be
+# copied back here. It used to be a copy, and it had silently drifted
+# into the same coverage hole: 13 corpus files matched no chunk, so every
+# ranking this script produced -- the input to deciding what to work on -- was
+# blind to them. One list, one place, one assertion.
+set -u
+
+SCRIPTS="$(cd "$(dirname "$0")" && pwd)"   # resolve BEFORE the cd below
+cd "$SCRIPTS/../compat-harness" || exit 1
+OUT="${1:-/tmp/musql-histogram.txt}"
+RAW="$(mktemp)"
+
+# Pull DEFAULT_CHUNKS out of scripts/sweep rather than restating it. Sourcing
+# the whole script would run the sweep, so take just the array assignment.
+eval "$(sed -n '/^DEFAULT_CHUNKS=(/,/)$/p' "$SCRIPTS/sweep")"
+if [ "${#DEFAULT_CHUNKS[@]}" -eq 0 ]; then
+  echo "histogram: could not read DEFAULT_CHUNKS from $SCRIPTS/sweep" >&2
+  exit 1
+fi
+CHUNKS=("${DEFAULT_CHUNKS[@]}")
+
+for P in "${CHUNKS[@]}"; do
+  echo "===== chunk $P" >&2
+  timeout 5400 env TCL_WRONG_LOG=1 ../scripts/cap -- go test -count=1 \
+    -timeout 5300s -v -run "TestTCLCorpus\$/^$P" ./ 2>&1 |
+    grep -aoE '^[[:space:]]+tcl_test\.go:[0-9]+:[[:space:]]+[0-9]+[[:space:]]+.*' >> "$RAW"
+done
+
+# Each line is "<file>:<line>:   <count>  <reason>"; sum counts per reason.
+sed -E 's/^[[:space:]]*tcl_test\.go:[0-9]+:[[:space:]]*//' "$RAW" |
+  awk '{ n=$1; $1=""; sub(/^[[:space:]]+/,""); s[$0]+=n }
+       END { for (k in s) printf "%7d  %s\n", s[k], k }' |
+  sort -rn > "$OUT"
+rm -f "$RAW"
+
+if [ ! -s "$OUT" ]; then
+  # An empty ranking is never a real answer -- the corpus always declines
+  # something -- so it means the chunks did not run or the histogram lines
+  # stopped matching. Fail loudly rather than hand back a blank worklist.
+  echo "histogram: NO histogram lines captured -- $OUT is empty." >&2
+  echo "histogram: the chunk runs failed, or tcl_test.go's histogram format changed." >&2
+  exit 1
+fi
+echo "===== total declined: $(awk '{s+=$1} END {print s}' "$OUT")" >&2
+echo "wrote $OUT" >&2
+head -40 "$OUT"

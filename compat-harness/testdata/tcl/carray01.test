@@ -1,0 +1,181 @@
+# 2020-11-17
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# 
+# This file implements tests for CARRAY extension
+#
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix carray01
+
+ifcapable !vtab {
+  finish_test
+  return
+}
+#load_static_extension db carray
+
+# Parameter $stmt must be a prepared statement created using
+# the sqlite3_prepare_v2 command and with parameters fully bound.
+# This routine simply runs the statement, gathers the result, and
+# returns a list containing the result.
+#
+# If the optional second argument is true, then the stmt is finalized
+# after it is run.
+#
+proc run_stmt {stmt} {
+  set r {}
+  while {[sqlite3_step $stmt]=="SQLITE_ROW"} {
+    for {set i 0} {$i<[sqlite3_data_count $stmt]} {incr i} {
+      lappend r [sqlite3_column_text $stmt $i]
+    }
+  }
+  sqlite3_reset $stmt
+  return $r
+}
+
+do_test 100 {
+  set STMT [sqlite3_prepare_v2 db {SELECT 5 IN carray(?3)} -1]
+  sqlite3_carray_bind $STMT 3 1 2 3 4 5 6 7
+  run_stmt $STMT
+} {1}
+do_test 101 {
+  sqlite3_carray_bind -static $STMT 3 1 2 3 4 5 6 7
+  run_stmt $STMT
+} {1}
+do_test 102 {
+  sqlite3_carray_bind -v2 -malloc $STMT 3 1 2 3 4 5 6 7
+  run_stmt $STMT
+} {1}
+do_test 103 {
+  set STMT2 [sqlite3_prepare_v2 db {
+       SELECT DISTINCT typeof(value) FROM carray(?3)} -1]
+  sqlite3_carray_bind $STMT2 3 1 2 3 4 5 6 7
+  run_stmt $STMT2
+} {integer}
+do_test 110 {
+  sqlite3_carray_bind $STMT 3 1 2 3 4 6 7
+  run_stmt $STMT
+} {0}
+do_test 120 {
+  sqlite3_carray_bind -int64 $STMT 3 1 2 3 4 5 6 7
+  run_stmt $STMT
+} {1}
+do_test 120b {
+  sqlite3_carray_bind -int64 $STMT2 3 1 2 3 4 5 6 7
+  run_stmt $STMT2
+} {integer}
+do_test 121 {
+  sqlite3_carray_bind -int64 -transient $STMT 3 1 2 3 4 5 6 7
+  run_stmt $STMT
+} {1}
+do_test 122 {
+  sqlite3_carray_bind -int64 -static $STMT 3 1 2 3 4 5 6 7
+  run_stmt $STMT
+} {1}
+do_test 123 {
+  sqlite3_carray_bind -int32 -transient $STMT 3 1 2 3 4 5 6 7
+  run_stmt $STMT
+} {1}
+do_test 124 {
+  sqlite3_carray_bind -int32 -static $STMT 3 1 2 3 4 5 6 7
+  run_stmt $STMT
+} {1}
+do_test 125 {
+  sqlite3_carray_bind -int32 $STMT 3 1 2 3 4 5 6 7
+  run_stmt $STMT
+} {1}
+do_test 130 {
+  sqlite3_carray_bind -int64 $STMT 3 1 2 3 4 6 7
+  run_stmt $STMT
+} {0}
+do_test 131 {
+  sqlite3_carray_bind -int64 -transient $STMT 3 1 2 3 4 6 7
+  run_stmt $STMT
+} {0}
+do_test 131 {
+  sqlite3_carray_bind -int64 -static $STMT 3 1 2 3 4 6 7
+  run_stmt $STMT
+} {0}
+do_test 140 {
+  sqlite3_carray_bind -double $STMT 3 1 2 3 4 5 6 7
+  run_stmt $STMT
+} {1}
+do_test 141 {
+  sqlite3_carray_bind -double -transient $STMT 3 1 2 3 4 5 6 7
+  run_stmt $STMT
+} {1}
+do_test 142 {
+  sqlite3_carray_bind -double -static $STMT 3 1 2 3 4 5 6 7
+  run_stmt $STMT
+} {1}
+do_test 143 {
+  sqlite3_carray_bind -double $STMT2 3 1 2 3 4 5 6 7
+  run_stmt $STMT2
+} {real}
+do_test 150 {
+  sqlite3_carray_bind -double $STMT 3 1 2 3 4 6 7
+  run_stmt $STMT
+} {0}
+do_test 160 {
+  sqlite3_carray_bind -double $STMT 3 1 2 3 4 5 6 7
+  run_stmt $STMT
+} {1}
+do_test 161 {
+  sqlite3_carray_bind -double -v2 $STMT 3 1 2 3 4 5 6 7
+  run_stmt $STMT
+} {1}
+do_test 170 {
+  sqlite3_carray_bind -text -static $STMT 3 1 2 3 4 6 7
+  run_stmt $STMT
+} {0}
+do_test 171 {
+  sqlite3_carray_bind -text -static $STMT2 3 1 2 3 4 6 7
+  run_stmt $STMT2
+} {text}
+do_test 180 {
+  sqlite3_carray_bind -text -transient $STMT 3 1 2 3 4 5 6 7
+  run_stmt $STMT
+} {0}
+do_test 190 {
+  sqlite3_carray_bind -blob -static $STMT 3 1 2 3 4 5 6 7
+  run_stmt $STMT
+} {0}
+do_test 191 {
+  sqlite3_carray_bind -blob -static $STMT2 3 1 2 3 4 5 6 7
+  run_stmt $STMT2
+} {blob}
+do_test 200 {
+  sqlite3_carray_bind -blob -transient $STMT 3 1 2 3 4 5 6 7
+  run_stmt $STMT
+} {0}
+do_test 300 {
+  sqlite3_carray_bind $STMT 3
+  run_stmt $STMT
+} {0}
+
+sqlite3_finalize $STMT
+sqlite3_finalize $STMT2
+
+# 2026-05-31 dbsqlfuzz case 55c60cf7eb9e0f14c811b7c9227b8d2a0c32f022
+# 2026-06-01 dbsqlfuzz case 78e187a0fb61b19ff2e0cb76d4e8609df5248302
+# Probably also Bug 2026-06-01T07:23:11Z
+do_catchsql_test 400 {
+  DROP TABLE IF EXISTS t1;
+  CREATE TABLE t1(a INT PRIMARY KEY, b INT) WITHOUT ROWID;
+  WITH c(x) AS (
+    VALUES(1)
+    UNION
+    SELECT x+1 FROM (carray NATURAL FULL JOIN carray(t1.b)), t1, c
+  )
+  SELECT * FROM c;
+} {1 {table-function argument references tables to its right}}
+
+finish_test

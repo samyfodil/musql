@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Throwaway copy of scripts/sweep's DEFAULT_CHUNKS loop with -tags sqlite_fts5
+# added to the go test invocation. See scripts/sweep's own header for why the
+# "$" in 'TestTCLCorpus$/^<chunk>' is load-bearing and why this is chunked.
+set -u
+
+cd "$(dirname "$0")/../compat-harness" || exit 1
+
+DEFAULT_CHUNKS=('[a-c]' '[d-f]' '[g-l]' '[m-o]' '[p-r]' 's[a-h]' 'si' 'sk' 'sn'
+                'so' 'sp' 'sqld' 'sqllo' 's[r-z]' 't' 'u' 'v' '[w-z]' '[0-9]')
+
+for P in "${DEFAULT_CHUNKS[@]}"; do
+  echo "===== chunk $P"
+  timeout 5400 env TCL_WRONG_LOG=3 ../scripts/cap -- go test -tags sqlite_fts5 -count=1 \
+    -timeout 5300s -v -run "TestTCLCorpus\$/^$P" ./ 2>&1 |
+    grep -aoE '\[[a-z0-9_]+\.test\].*(wrong=[1-9]|panics=[1-9]).*|TOTAL: .*' | tail -1
+done
+
+echo "===== txn lockstep (once, every file)"
+timeout 1800 ../scripts/cap -- go test -tags sqlite_fts5 -count=1 -timeout 1700s -v \
+  -run 'TestTCLCorpusTxnLockstep$' ./ 2>&1 |
+  grep -aoE 'checked [0-9]+ transaction-control.*|^--- (PASS|FAIL): .*' | tail -2
+
+echo "===== sweep-fts5 done"

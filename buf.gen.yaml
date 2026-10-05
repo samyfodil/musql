@@ -1,0 +1,16 @@
+version: v2
+
+# Regenerate with `buf generate` from the repository root. `clean` makes the
+# output a function of the .proto files alone.
+clean: true
+
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/samyfodil/musql/gen
+
+plugins:
+  - local: protoc-gen-go
+    out: gen
+    opt: paths=source_relative

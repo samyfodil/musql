@@ -1,0 +1,126 @@
+syntax = "proto3";
+
+package replicationpb;
+
+option go_package = "github.com/samyfodil/musql/examples/libp2p/pb;pb";
+
+// Cell represents a single column value in an operation.
+message Cell {
+  string col = 1;
+  uint32 type = 2;
+  bytes val = 3;
+}
+
+// Op represents a single operation (Insert/Update/Delete) captured from the database.
+message Op {
+  string site = 1;
+  uint64 seq = 2;
+  uint64 hlc = 3;
+  string tbl = 4;
+  bytes pk = 5;
+  uint32 kind = 6;
+  repeated Cell cells = 7;
+}
+
+// VVEntry is one (site, seq) pair of a version vector.
+message VVEntry {
+  string site = 1;
+  uint64 seq = 2;
+}
+
+// ExchangeVVRequest carries the caller's local version vector.
+message ExchangeVVRequest {
+  repeated VVEntry vv = 1;
+}
+
+// ExchangeVVResponse carries the responder's local version vector.
+message ExchangeVVResponse {
+  repeated VVEntry vv = 1;
+}
+
+// GetOpsRequest asks for ops from a given site after fromSeq, capped at limit.
+message GetOpsRequest {
+  string site = 1;
+  uint64 from_seq = 2;
+  uint32 limit = 3;
+}
+
+// GetOpsResponse carries the requested ops, or pruned: the responder no
+// longer holds them (replication.ErrPruned), and a snapshot is needed.
+message GetOpsResponse {
+  repeated Op ops = 1;
+  bool pruned = 2;
+}
+
+// AckEntry is one site's ack: its version vector, stamped by its clock.
+message AckEntry {
+  string site = 1;
+  uint64 hlc = 2;
+  repeated VVEntry vv = 3;
+}
+
+// ExchangeAcksRequest carries the acks the caller knows; the response, the
+// responder's.
+message ExchangeAcksRequest {
+  repeated AckEntry acks = 1;
+}
+
+message ExchangeAcksResponse {
+  repeated AckEntry acks = 1;
+}
+
+// ClockCell is one _repl_clock row.
+message ClockCell {
+  string tbl = 1;
+  bytes pk = 2;
+  string col = 3;
+  uint64 hlc = 4;
+  string site = 5;
+  bytes val = 6;
+}
+
+// RangeEntry is a rowid range's owner: site, and the range's lo.
+message RangeEntry {
+  string site = 1;
+  uint64 lo = 2;
+}
+
+// GetSnapshotRequest asks for one page of a part of the responder's snapshot.
+message GetSnapshotRequest {
+  uint32 part = 1;
+  bytes cursor = 2;
+}
+
+// GetSnapshotResponse is that page; next is empty after the part's last.
+message GetSnapshotResponse {
+  repeated Op ops = 1;
+  repeated VVEntry floors = 2;
+  repeated RangeEntry ranges = 3;
+  repeated ClockCell cells = 4;
+  bytes next = 5;
+}
+
+// PushMessage carries a single pushed op, published over gossipsub.
+message PushMessage {
+  Op op = 1;
+}
+
+// Request is the one message a request/response stream carries from the caller.
+message Request {
+  oneof msg {
+    ExchangeVVRequest exchange_vv = 1;
+    GetOpsRequest get_ops = 2;
+    GetSnapshotRequest get_snapshot = 3;
+    ExchangeAcksRequest exchange_acks = 4;
+  }
+}
+
+// Response is the one message the responder answers a Request with.
+message Response {
+  oneof msg {
+    ExchangeVVResponse exchange_vv = 1;
+    GetOpsResponse get_ops = 2;
+    GetSnapshotResponse get_snapshot = 3;
+    ExchangeAcksResponse exchange_acks = 4;
+  }
+}

@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Throwaway fts5-tagged variant of scripts/histogram. See that script's own
+# header for the rationale; this just adds -tags sqlite_fts5.
+set -u
+SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPTS/../compat-harness" || exit 1
+OUT="${1:-/tmp/musql-histogram-fts5.txt}"
+RAW="$(mktemp)"
+eval "$(sed -n '/^DEFAULT_CHUNKS=(/,/)$/p' "$SCRIPTS/sweep")"
+for P in "${DEFAULT_CHUNKS[@]}"; do
+  echo "===== chunk $P" >&2
+  timeout 5400 env TCL_WRONG_LOG=1 ../scripts/cap -- go test -tags sqlite_fts5 -count=1 \
+    -timeout 5300s -v -run "TestTCLCorpus\$/^$P" ./ 2>&1 |
+    grep -aoE '^[[:space:]]+tcl_test\.go:[0-9]+:[[:space:]]+[0-9]+[[:space:]]+.*' >> "$RAW"
+done
+sed -E 's/^[[:space:]]*tcl_test\.go:[0-9]+:[[:space:]]*//' "$RAW" |
+  awk '{ n=$1; $1=""; sub(/^[[:space:]]+/,""); s[$0]+=n }
+       END { for (k in s) printf "%7d  %s\n", s[k], k }' |
+  sort -rn > "$OUT"
+rm -f "$RAW"
+echo "===== total declined: $(awk '{s+=$1} END {print s}' "$OUT")" >&2
+echo "wrote $OUT" >&2
+head -40 "$OUT"
