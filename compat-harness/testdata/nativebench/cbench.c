@@ -11,7 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include "sqlite3.h"
+#include "sqlite3-binding.h" /* mattn's copy of sqlite3.h, 3.53.3 */
 
 #define TARGET_NS 200000000LL
 
