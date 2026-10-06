@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -105,12 +106,20 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, rootPage uint32, low *segLowered, ipk
 		regs[reg] = v.I
 	}
 
-	var total int64
-	matched := int64(0)
-	for _, s := range segs {
+	// Each segment runs on its own copy of the register file (on its own
+	// goroutine under WithWorkers); the results are then combined in segment
+	// order, exactly as a single pass combines them.
+	type segResult struct {
+		out, rows int64
+		ovf       bool
+		empty     bool
+	}
+	results := make([]segResult, len(segs))
+	ok = segEach(len(segs), func(si int) bool {
+		s, res := segs[si], &results[si]
 		blocks, isRowid, okCols := segProgColumns(s, low.cols, low.nullCol, ipkCol)
 		if !okCols {
-			return Value{}, false
+			return false
 		}
 		// A rowid-alias column has no block of its own -- the values live in
 		// the segment's rowid block -- and the program reads a flat int64
@@ -127,29 +136,46 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, rootPage uint32, low *segLowered, ipk
 			blocks[i] = buf
 		}
 		if s.nRows == 0 {
-			continue
+			res.empty = true
+			return true
 		}
-		var out, ovf int64
 		// min()/max() of a whole column, with no predicate: the zone map
 		// already holds the segment's extreme, so no row is read.
 		if extreme, ok := segZoneExtreme(s, low); ok {
-			out = extreme
-			regs[low.rowsReg] += int64(s.nRows)
-		} else {
-			args := &jit.ProgArgs{N: int64(s.nRows), Regs: &regs[0], Out: &out, Overflow: &ovf}
-			for i, b := range blocks {
-				if len(b) < s.nRows {
-					return Value{}, false
-				}
-				args.Col[i] = &b[0]
-			}
-			kern.Call2(args)
+			res.out, res.rows = extreme, int64(s.nRows)
+			return true
 		}
-		if ovf != 0 {
+		local := slices.Clone(regs)
+		var out, ovf int64
+		args := &jit.ProgArgs{N: int64(s.nRows), Regs: &local[0], Out: &out, Overflow: &ovf}
+		for i, b := range blocks {
+			if len(b) < s.nRows {
+				return false
+			}
+			args.Col[i] = &b[0]
+		}
+		kern.Call2(args)
+		res.out, res.ovf = out, ovf != 0
+		if low.agg != aggCountStar && low.agg != aggCount {
+			res.rows = local[low.rowsReg]
+		}
+		return true
+	})
+	if !ok {
+		return Value{}, false
+	}
+	var total int64
+	matched := int64(0)
+	for _, res := range results {
+		if res.empty {
+			continue
+		}
+		if res.ovf {
 			// sum() overflowed int64. SQLite switches to floating point there
 			// and this cannot, so the whole statement goes back to the loop.
 			return Value{}, false
 		}
+		out := res.out
 		switch low.agg {
 		case aggCountStar, aggCount:
 			total += out
@@ -158,24 +184,21 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, rootPage uint32, low *segLowered, ipk
 			// Combine ACROSS segments: each call answered over its own rows and
 			// started from its own seed, so a segment that matched nothing must
 			// not vote.
-			n := regs[low.rowsReg]
-			regs[low.rowsReg] = 0
-			if n == 0 {
+			if res.rows == 0 {
 				continue
 			}
 			if matched == 0 || (low.agg == aggMin && out < total) ||
 				(low.agg == aggMax && out > total) {
 				total = out
 			}
-			matched += n
+			matched += res.rows
 		default:
 			sum := total + out
 			if (out > 0 && sum < total) || (out < 0 && sum > total) {
 				return Value{}, false
 			}
 			total = sum
-			matched += regs[low.rowsReg]
-			regs[low.rowsReg] = 0
+			matched += res.rows
 		}
 	}
 	// func.c's finalizers, for the all-integer non-NULL case this path is the

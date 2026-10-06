@@ -20,6 +20,11 @@ func TestSegmentWorkersMatchTheLoop(t *testing.T) {
 		`SELECT k, count(*), sum(v) FROM t GROUP BY k ORDER BY k`,
 		`SELECT w, count(*) FROM t GROUP BY w ORDER BY w`,
 		`SELECT k, min(v), max(v), max(w) FROM t GROUP BY k ORDER BY k`,
+		`SELECT count(*) FROM t WHERE v > 0 OR k = 3`,
+		`SELECT count(*) FROM t WHERE k IN (1, 4, 9)`,
+		`SELECT sum(v) FROM t WHERE k IN (2, 5) OR w < 100`,
+		`SELECT min(v), max(w) FROM t WHERE k <> 4`,
+		`SELECT avg(v) FROM t WHERE v > 500 OR k = 1`,
 	}
 	defer func(n int) { segWorkers = n }(segWorkers)
 	for _, q := range queries {
