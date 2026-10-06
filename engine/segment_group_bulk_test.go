@@ -38,7 +38,12 @@ func TestColumnarGroupBulkMatchesTheLoop(t *testing.T) {
 		{`SELECT k, sum(wide) FROM t GROUP BY k ORDER BY k`, true},
 		{`SELECT k, count(n) FROM t GROUP BY k ORDER BY k`, false}, // NULLs
 		{`SELECT k, avg(v) FROM t GROUP BY k ORDER BY k`, false},
-		{`SELECT k, min(v) FROM t GROUP BY k ORDER BY k`, false},
+		{`SELECT k, min(v) FROM t GROUP BY k ORDER BY k`, true},
+		{`SELECT k, min(v), max(v) FROM t GROUP BY k ORDER BY k`, true},
+		{`SELECT k, max(wide), count(*), min(v), sum(v) FROM t GROUP BY k ORDER BY k`, true},
+		{`SELECT wide, max(v) FROM t GROUP BY wide ORDER BY wide`, true},
+		{`SELECT k, max(v), v FROM t GROUP BY k ORDER BY k`, false}, // bare column: anchors
+		{`SELECT k, min(n) FROM t GROUP BY k ORDER BY k`, false},    // NULLs
 		{`SELECT k, count(DISTINCT v) FROM t GROUP BY k ORDER BY k`, false},
 		{`SELECT id, count(*) FROM t GROUP BY id ORDER BY id LIMIT 20`, false}, // rowid key
 	}

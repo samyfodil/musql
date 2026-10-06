@@ -9,7 +9,8 @@ import (
 var segGroupBulkHits atomic.Int64
 
 // Block-at-a-time GROUP BY, for the shape most grouped queries have: one
-// INTEGER key and count(*), count(col) and sum(col) over INTEGER columns.
+// INTEGER key and count(*), count(col), sum(col), min(col) and max(col) over
+// INTEGER columns.
 //
 // segHashAggWalk steps every row through hashAggStepRow, which hashes the key
 // and runs the accumulator machinery once per row -- the time DuckDB was
@@ -24,9 +25,17 @@ var segGroupBulkHits atomic.Int64
 //   - sum(col) over integers adds the rest of the integer sum, and is used
 //     only when the group's sum of |v| fits in an int64, so no partial sum in
 //     ANY order overflows -- sumStep's overflow latch never fires either way;
+//   - min(col) and max(col) take the group's extreme. Two integers that compare
+//     equal are identical, so which of a tie arrived first cannot show;
 //   - no DISTINCT, FILTER, ORDER BY inside the call, order-strict
-//     accumulator, min/max census or anchor certificate: each of those reads
-//     the rows individually.
+//     accumulator or anchor certificate: each of those reads the rows
+//     individually.
+//
+// A min()/max() also raises a census (aggPlan.magnet) that picks the row a
+// bare column reads. The recognizer admits only plans with no bare column and
+// no HAVING (aggPlanReadsOnlyLoweredColsExceptOrder), so nothing reads that
+// row; the census sites are stepped with the last row and given the extreme
+// like any other min/max.
 // Anything else, and any table with rows pending in the delta, returns false
 // before touching state, and the row walk runs as it always has.
 
@@ -38,6 +47,8 @@ type segGroupAcc struct {
 	n       int64
 	sums    []int64  // per argument column
 	abs     []uint64 // per argument column: sum of |v|, the overflow guard
+	mins    []int64  // per argument column
+	maxs    []int64
 	lastSeg int
 	lastRow int
 }
@@ -50,9 +61,7 @@ const (
 )
 
 func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, rowids, keyVals []Value) int {
-	// A census with no sites is what every grouped plan carries; only a min()/max()
-	// site reads rows one at a time.
-	if len(plan.keyCols) != 1 || (plan.agg.magnet != nil && len(plan.agg.magnet.sites) > 0) || plan.agg.anchorCheck != nil {
+	if len(plan.keyCols) != 1 || plan.agg.anchorCheck != nil {
 		return bulkNotEligible
 	}
 	// Which argument column each count(col)/sum(col) reads, by its register.
@@ -61,20 +70,20 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		argOf[r] = i
 	}
 	needSum := make([]bool, len(plan.argCols))
+	needMM := make([]bool, len(plan.argCols))
 	for _, it := range aggPlanTemplates(plan.agg) {
 		if it.filter != nil || it.orderBy != nil || it.distinct || it.orderStrict || it.stepSeg != plan.seg {
 			return bulkNotEligible
 		}
 		switch it.kind {
 		case aggCountStar:
-		case aggCount, aggSum:
+		case aggCount, aggSum, aggMin, aggMax:
 			a, ok := argOf[it.rowRegs[aggExprArg]-1]
-			if !ok {
+			if !ok || it.minMaxLastWins {
 				return bulkNotEligible
 			}
-			if it.kind == aggSum {
-				needSum[a] = true
-			}
+			needSum[a] = needSum[a] || it.kind == aggSum
+			needMM[a] = needMM[a] || it.kind == aggMin || it.kind == aggMax
 		default:
 			return bulkNotEligible
 		}
@@ -125,6 +134,10 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		}
 		if g.sums == nil {
 			g.sums, g.abs = make([]int64, na), make([]uint64, na)
+			g.mins, g.maxs = make([]int64, na), make([]int64, na)
+			for a := range na {
+				g.mins[a], g.maxs[a] = math.MaxInt64, math.MinInt64
+			}
 		}
 		return g
 	}
@@ -145,10 +158,13 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 			g.n++
 			g.lastSeg, g.lastRow = si, r
 			for a, col := range b.args {
+				v := col[r]
+				if needMM[a] {
+					g.mins[a], g.maxs[a] = min(g.mins[a], v), max(g.maxs[a], v)
+				}
 				if !needSum[a] {
 					continue
 				}
-				v := col[r]
 				g.sums[a] += v // wraps only when abs does not fit, checked below
 				u := uint64(v)
 				if v < 0 {
@@ -178,6 +194,7 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		g.n += from.n
 		g.lastSeg, g.lastRow = from.lastSeg, from.lastRow
 		for a := range na {
+			g.mins[a], g.maxs[a] = min(g.mins[a], from.mins[a]), max(g.maxs[a], from.maxs[a])
 			g.sums[a] += from.sums[a]
 			if g.abs[a]+from.abs[a] < g.abs[a] || g.abs[a]+from.abs[a] > math.MaxInt64 {
 				return false
@@ -230,6 +247,10 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 				a := argOf[it.rowRegs[aggExprArg]-1]
 				it.cnt += g.n - 1
 				it.iSum += g.sums[a] - b.args[a][g.lastRow]
+			case aggMin:
+				it.best = Value{Typ: Int, I: g.mins[argOf[it.rowRegs[aggExprArg]-1]]}
+			case aggMax:
+				it.best = Value{Typ: Int, I: g.maxs[argOf[it.rowRegs[aggExprArg]-1]]}
 			}
 		}
 		accs := m.aggAccs
@@ -245,6 +266,9 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 			for _, it := range set {
 				rest(it)
 			}
+		}
+		for _, it := range accs.magnets {
+			rest(it)
 		}
 		return true
 	}
