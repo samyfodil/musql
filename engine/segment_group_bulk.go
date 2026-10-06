@@ -111,7 +111,7 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 
 	// Sum every group. Nothing is written to the VM until this succeeds. Each
 	// segment builds its own partial groups (on its own goroutine under
-	// WithThreads); merging them in segment order keeps every group's LAST row
+	// WithWorkers); merging them in segment order keeps every group's LAST row
 	// the one a single pass would have seen last.
 	na := len(plan.argCols)
 	dense := uint64(hi-lo) < segGroupBulkMaxDense

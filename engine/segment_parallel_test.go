@@ -20,11 +20,11 @@ func TestSegmentThreadsMatchTheLoop(t *testing.T) {
 		`SELECT k, count(*), sum(v) FROM t GROUP BY k ORDER BY k`,
 		`SELECT w, count(*) FROM t GROUP BY w ORDER BY w`,
 	}
-	defer func(n int) { segThreads = n }(segThreads)
+	defer func(n int) { segWorkers = n }(segWorkers)
 	for _, q := range queries {
 		want := fmt.Sprint(typedRows(p.mustPlain(q)))
 		for _, n := range []int{1, 4} {
-			segThreads = n
+			segWorkers = n
 			if got := fmt.Sprint(typedRows(p.mustFast(q))); got != want {
 				t.Errorf("threads=%d %s:\n fast  %.300s\n plain %.300s", n, q, got, want)
 			}

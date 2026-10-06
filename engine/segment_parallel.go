@@ -5,15 +5,15 @@ import (
 	"sync/atomic"
 )
 
-// segThreads is how many goroutines a columnar scan may use (WithThreads).
-var segThreads = 1
+// segWorkers is how many goroutines a columnar scan may use (WithWorkers).
+var segWorkers = 1
 
-// segEach runs work(i) for every segment index, on up to segThreads
+// segEach runs work(i) for every segment index, on up to segWorkers
 // goroutines, and reports whether every call succeeded. A call that fails
-// stops the others taking new segments. With one thread, or one segment, it
+// stops the others taking new segments. With one worker, or one segment, it
 // is a plain loop on the caller's goroutine.
 func segEach(n int, work func(i int) bool) bool {
-	workers := min(segThreads, n)
+	workers := min(segWorkers, n)
 	if workers <= 1 {
 		for i := range n {
 			if !work(i) {
