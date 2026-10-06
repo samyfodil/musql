@@ -90,6 +90,11 @@ func TestBenchColumnarVsC(t *testing.T) {
 		defer tdb.Close()
 	}
 
+	ddb := openDuckDB(t, filepath.Join(dir, "duck.db"))
+	if ddb != nil {
+		defer ddb.Close()
+	}
+
 	// Every row into segments, none left in the delta: the format at rest.
 	vacStart := time.Now()
 	if _, err := mdb.Exec(`VACUUM`); err != nil {
@@ -146,6 +151,8 @@ func TestBenchColumnarVsC(t *testing.T) {
 		mushCol, mushDrv  time.Duration
 		c, cNative, turso time.Duration
 		tursoErr          string
+		duck1, duckN      time.Duration
+		duckErr           string
 		jitted            bool
 	}
 
@@ -341,7 +348,20 @@ func TestBenchColumnarVsC(t *testing.T) {
 				w.name, served)
 		}
 		td, terr := timeDriverSoft(tdb, w.sql, w.args)
+		var d1, dN time.Duration
+		derr := "arm skipped"
+		if ddb != nil {
+			setDuckThreads(t, ddb, 1)
+			d1, derr = timeDriverSoft(ddb, w.sql, w.args)
+			setDuckThreads(t, ddb, 0)
+			if derr == "" {
+				dN, derr = timeDriverSoft(ddb, w.sql, w.args)
+			}
+		}
 		rows = append(rows, row{
+			duck1:    d1,
+			duckN:    dN,
+			duckErr:  derr,
 			name:     w.name,
 			mushCol:  cl,
 			mushDrv:  timeDriver(mdb, w.sql, w.args),
@@ -416,6 +436,13 @@ func TestBenchColumnarVsC(t *testing.T) {
 			if gotD != oracle {
 				t.Fatalf("%s %v: musql driver %q, C %q", w.name, args, gotD, oracle)
 			}
+			if ddb != nil {
+				want, werr := renderValues(cdb, w.sql, args)
+				got, gerr := renderValues(ddb, w.sql, args)
+				if werr == nil && gerr == nil && got != want && i == 0 {
+					t.Logf("DUCKDB DIFFERS %s %v: %q, C %q", w.name, args, got, want)
+				}
+			}
 			if tdb != nil {
 				if gotT, terr := renderDriverInts(tdb, w.sql, args); terr != nil {
 					if i == 0 {
@@ -470,6 +497,26 @@ func TestBenchColumnarVsC(t *testing.T) {
 			tursoCell, vsNative, speedup(r.c, r.mushCol), vsTurso, mark)
 	}
 	t.Logf("the vs-X columns are how many times FASTER musql+JIT is than X.")
+
+	// DuckDB, a different class of engine: a reference, not a headline.
+	t.Logf("")
+	t.Logf("DuckDB reference (analytical engine; 1 thread like the others, and its default)")
+	t.Logf("%-32s | %12s | %12s | %13s | %13s | %13s", "workload",
+		"musql+JIT", "C native", "duckdb 1 thr", "duckdb", "vs duckdb 1")
+	for _, r := range rows {
+		if r.duckErr != "" {
+			t.Logf("%-32s | %12s | duckdb: %s", r.name, r.mushCol.Round(time.Microsecond), r.duckErr)
+			continue
+		}
+		nativeCell := "n/a"
+		if r.cNative > 0 {
+			nativeCell = r.cNative.Round(100 * time.Nanosecond).String()
+		}
+		t.Logf("%-32s | %12s | %12s | %13s | %13s | %13s", r.name,
+			r.mushCol.Round(time.Microsecond), nativeCell,
+			r.duck1.Round(time.Microsecond), r.duckN.Round(time.Microsecond),
+			speedup(r.duck1, r.mushCol))
+	}
 
 	// ---- WRITES, where this engine is at its worst. ----
 	//
