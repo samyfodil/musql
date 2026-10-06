@@ -5,9 +5,9 @@ import (
 	"testing"
 )
 
-// TestSegmentThreadsMatchTheLoop runs the parallelized scans over a table of
-// several segments with one and with four goroutines, against the plain VDBE.
-func TestSegmentThreadsMatchTheLoop(t *testing.T) {
+// TestSegmentWorkersMatchTheLoop runs the parallelized scans over a table of
+// several segments with one and with four workers, against the plain VDBE.
+func TestSegmentWorkersMatchTheLoop(t *testing.T) {
 	p := newSegPair(t,
 		`CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, w INTEGER)`,
 		`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i < 300000)
@@ -26,7 +26,7 @@ func TestSegmentThreadsMatchTheLoop(t *testing.T) {
 		for _, n := range []int{1, 4} {
 			segWorkers = n
 			if got := fmt.Sprint(typedRows(p.mustFast(q))); got != want {
-				t.Errorf("threads=%d %s:\n fast  %.300s\n plain %.300s", n, q, got, want)
+				t.Errorf("workers=%d %s:\n fast  %.300s\n plain %.300s", n, q, got, want)
 			}
 		}
 	}
