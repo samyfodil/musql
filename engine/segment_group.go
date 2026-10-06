@@ -55,6 +55,14 @@ func (m *vdbe) segHashAggWalk(p *ReadOnlyPager, rootPage uint32, plan *segGroupP
 	// first time it sees one (append([]Value(nil), keyVals...)) and otherwise
 	// only hashes it, so nothing downstream retains this slice.
 	keyVals := make([]Value, len(plan.keyRegs))
+	if len(deltaLive) == 0 && !segAnySkips(skips) {
+		switch m.segGroupBulk(segs, plan, segTableIPK(m, plan), row, rowids, keyVals) {
+		case bulkAnswered:
+			return true
+		case bulkFailed:
+			return false
+		}
+	}
 	for si, s := range segs {
 		skip, sk := skips[si], 0
 		// TYPED READERS, not int64 blocks. segOrderColumns refuses anything that
@@ -197,4 +205,13 @@ func segTableIPK(m *vdbe, plan *segGroupPlan) int {
 		return -1
 	}
 	return cur.tbl.ipkIndex
+}
+
+func segAnySkips(skips [][]int) bool {
+	for _, s := range skips {
+		if len(s) > 0 {
+			return true
+		}
+	}
+	return false
 }
