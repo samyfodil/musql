@@ -2,6 +2,7 @@ package engine
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/samyfodil/musql/internal/jit"
 )
@@ -129,14 +130,21 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, rootPage uint32, low *segLowered, ipk
 			continue
 		}
 		var out, ovf int64
-		args := &jit.ProgArgs{N: int64(s.nRows), Regs: &regs[0], Out: &out, Overflow: &ovf}
-		for i, b := range blocks {
-			if len(b) < s.nRows {
-				return Value{}, false
+		// min()/max() of a whole column, with no predicate: the zone map
+		// already holds the segment's extreme, so no row is read.
+		if extreme, ok := segZoneExtreme(s, low); ok {
+			out = extreme
+			regs[low.rowsReg] += int64(s.nRows)
+		} else {
+			args := &jit.ProgArgs{N: int64(s.nRows), Regs: &regs[0], Out: &out, Overflow: &ovf}
+			for i, b := range blocks {
+				if len(b) < s.nRows {
+					return Value{}, false
+				}
+				args.Col[i] = &b[0]
 			}
-			args.Col[i] = &b[0]
+			kern.Call2(args)
 		}
-		kern.Call2(args)
 		if ovf != 0 {
 			// sum() overflowed int64. SQLite switches to floating point there
 			// and this cannot, so the whole statement goes back to the loop.
@@ -196,4 +204,43 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, rootPage uint32, low *segLowered, ipk
 		return Value{Typ: Float, F: float64(total)}, true
 	}
 	return Value{Typ: Int, I: total}, true
+}
+
+// segZoneExtremeHits counts segments answered from a zone map, for tests.
+var segZoneExtremeHits atomic.Int64
+
+// segZoneExtreme answers a predicate-free min(col) or max(col) over one segment
+// from its zone map. The body must hold nothing but loads of its one column and
+// copies between registers, with no bound parameters, so every register it
+// writes -- the accumulated one included -- holds that column's value.
+func segZoneExtreme(s *segment, low *segLowered) (int64, bool) {
+	n := len(low.insns)
+	if (low.agg != aggMin && low.agg != aggMax) || len(low.cols) != 1 || low.nullCol[0] ||
+		len(low.consts) != 0 || n < 2 {
+		return 0, false
+	}
+	holds := map[int]bool{} // registers holding the column's value
+	for _, in := range low.insns[:n-1] {
+		switch {
+		case in.Op == jit.POpLoadCol && in.B == 0:
+			holds[in.A] = true
+		case in.Op == jit.POpLoadReg && holds[in.B]:
+			holds[in.A] = true
+		default:
+			return 0, false
+		}
+	}
+	acc := low.insns[n-1]
+	if (acc.Op != jit.POpAccMin && acc.Op != jit.POpAccMax) || !holds[acc.A] {
+		return 0, false
+	}
+	z, ok := s.intZones(low.cols[0])
+	if !ok {
+		return 0, false
+	}
+	segZoneExtremeHits.Add(1)
+	if low.agg == aggMin {
+		return z.min, true
+	}
+	return z.max, true
 }

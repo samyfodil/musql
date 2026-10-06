@@ -1,6 +1,12 @@
 package engine
 
-import "github.com/samyfodil/musql/internal/jit"
+import (
+	"fmt"
+	"maps"
+	"slices"
+
+	"github.com/samyfodil/musql/internal/jit"
+)
 
 // Lowering a compiled VDBE loop body into the JIT's IR. Only values that
 // are non-NULL int64 are accepted. Three-valued-logic tests on comparisons
@@ -105,34 +111,25 @@ func (l *segLowered) clone() *segLowered {
 // segLowerBody compiles the instructions of a scan loop body, or reports false
 // when it contains an opcode this does not model.
 func segLowerBody(body []Instruction, base int, cursor int, aggAt int) (*segLowered, bool) {
-	// ANY OpNull REFUSES THE WHOLE BODY, and the previous attempt at being
-	// cleverer than that is why this is blunt now.
+	// AN OpNull ON A PATH THAT RUNS REFUSES THE WHOLE BODY, and modelling NULL
+	// any more cleverly than that is how this went wrong before.
 	//
 	// "col = NULL" and "col = 0" compile to STRUCTURALLY IDENTICAL programs --
 	// Column, then Null or Integer into the same register, then Eq -- so a NULL
 	// literal is a value the comparison reads, not an unreachable epilogue. This
-	// lowering wrote it as the constant zero, which silently turned every
+	// lowering once wrote it as the constant zero, which silently turned every
 	// "col op NULL" into "col op 0": slt's index/random/scale1000_slt_good_5
-	// answered COUNT(*) = 1000 where C SQLite answers 0, and "col = NULL"
-	// answered 1 -- the single row whose column really is zero.
+	// answered COUNT(*) = 1000 where C SQLite answers 0. It also wrote that zero
+	// to the wrong register (OpNull's destination is P2, not P1).
 	//
-	// It also wrote that zero to the WRONG REGISTER. OpNull's destination is P2
-	// (the disassembler prints "Null 0 2 0  r[2]=NULL"), and both this lowering
-	// and its operand table treated P1 as the destination -- so the comparison
-	// read an untouched register that happened to hold 0. A first attempt at a
-	// narrow guard inherited that same mistake and appeared to fix one query by
-	// coincidence, because "col < 0" is empty for this data and so is the right
-	// answer.
-	//
-	// Two independent errors in three lines is the argument for refusing the
-	// opcode rather than modelling it. A body with a NULL in it goes to the
-	// ordinary loop, which knows three-valued logic; the fast path exists to be
-	// faster, not to re-derive semantics.
-	for _, in := range body {
-		if in.Op == OpNull {
-			return nil, false
-		}
-	}
+	// So NULL is never given a value here. What IS admitted is an OpNull no
+	// lowered path can reach: the NULL arm of the three-valued epilogue OR and
+	// IN compile into, which only an OpIsNull or a not-taken OpNotNull leads to
+	// -- and no value in a compiled program is NULL, so neither branches there.
+	// Each OpNull lowers to a marker, and after the jumps are resolved a walk of
+	// the lowered control flow from the entry refuses the body if any marker
+	// is reached. "col = NULL" reaches its OpNull on the straight-line path and
+	// is refused exactly as before.
 	out := &segLowered{}
 	colSlot := map[int]int{}         // table column -> program column slot
 	irOf := make([]int, len(body)+1) // body index -> IR index
@@ -163,6 +160,7 @@ func segLowerBody(body []Instruction, base int, cursor int, aggAt int) (*segLowe
 	// OpColumn that loads the register comes BEFORE the tests that constrain it
 	// and the decision has to be made at the load.
 	nullOnly := segNullTestedOnly(body)
+	var nullMarks []int // IR indices of OpNull markers
 	note := func(r int) {
 		if r+1 > maxReg {
 			maxReg = r + 1
@@ -308,9 +306,12 @@ func segLowerBody(body []Instruction, base int, cursor int, aggAt int) (*segLowe
 			note(in.P3)
 			out.insns = append(out.insns, jit.ProgInsn{Op: pop, A: in.P3, B: in.P2, C: in.P1})
 		case OpNull:
-			// REFUSED, ALWAYS. See segLowerBody's own guard; this arm is
-			// unreachable and kept only so the switch still names the opcode.
-			return nil, false
+			// A marker, proven unreachable below or the body is refused. It
+			// writes the lowering's scratch register, never a register the
+			// program reads.
+			note(scratchReg)
+			nullMarks = append(nullMarks, len(out.insns))
+			out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpSetConst, A: scratchReg, B: 0})
 		case OpSCopy:
 			note(in.P2)
 			out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpLoadReg, A: in.P2, B: in.P1})
@@ -333,11 +334,106 @@ func segLowerBody(body []Instruction, base int, cursor int, aggAt int) (*segLowe
 			out.insns[i].A = irOf[t]
 		}
 	}
+	if len(nullMarks) > 0 {
+		reach := segLoweredReachable(out.insns)
+		for _, at := range nullMarks {
+			if reach[at] {
+				return nil, false
+			}
+		}
+	}
 	if scratchReg+1 > maxReg {
 		maxReg = scratchReg + 1
 	}
 	out.nRegs = maxReg + 1
 	return out, true
+}
+
+// segLoweredReachable marks every IR instruction some path from the entry can
+// execute. It follows jumps and fall-through, and it is path-sensitive about
+// registers set by POpSetConst: a branch on a register whose value is known on
+// that path takes only the edge the value selects. That is what proves the
+// NULL arm of an IN list dead -- it hangs off a flag the list sets to 0 and
+// sets to 1 only on a NotNull branch no compiled value takes. Every other write
+// makes a register unknown, so the walk never assumes more than the code says.
+// A body too branchy to finish within the step budget reports every
+// instruction reachable, which refuses it.
+func segLoweredReachable(insns []jit.ProgInsn) []bool {
+	seen := make([]bool, len(insns))
+	type state struct {
+		at    int
+		known map[int]int64
+	}
+	key := func(st state) string {
+		b := make([]byte, 0, 16+len(st.known)*12)
+		b = append(b, fmt.Sprint(st.at, ":")...)
+		regs := make([]int, 0, len(st.known))
+		for r := range st.known {
+			regs = append(regs, r)
+		}
+		slices.Sort(regs)
+		for _, r := range regs {
+			b = append(b, fmt.Sprint(r, "=", st.known[r], ";")...)
+		}
+		return string(b)
+	}
+	visited := map[string]bool{}
+	work := []state{{at: 0, known: map[int]int64{}}}
+	for steps := 0; len(work) > 0; steps++ {
+		if steps > 1<<14 {
+			for i := range seen {
+				seen[i] = true
+			}
+			return seen
+		}
+		st := work[len(work)-1]
+		work = work[:len(work)-1]
+		if st.at < 0 || st.at >= len(insns) {
+			continue
+		}
+		k := key(st)
+		if visited[k] {
+			continue
+		}
+		visited[k] = true
+		seen[st.at] = true
+		in := insns[st.at]
+		next := func(at int, known map[int]int64) { work = append(work, state{at, known}) }
+		switch in.Op {
+		case jit.POpJump:
+			if in.A != jit.ProgNextRow {
+				next(in.A, st.known)
+			}
+			continue
+		case jit.POpJumpIfZero, jit.POpJumpIfNotZero:
+			v, ok := st.known[in.B]
+			taken := ok && (v == 0) == (in.Op == jit.POpJumpIfZero)
+			if (!ok || taken) && in.A != jit.ProgNextRow {
+				next(in.A, st.known)
+			}
+			if !ok || !taken {
+				next(st.at+1, st.known)
+			}
+			continue
+		case jit.POpSkipIfZero:
+			next(st.at+1, st.known)
+			continue
+		}
+		known := st.known
+		switch in.Op {
+		case jit.POpSetConst:
+			known = maps.Clone(known)
+			known[in.A] = int64(in.B)
+		case jit.POpLoadCol, jit.POpLoadReg, jit.POpCmp, jit.POpAnd, jit.POpOr,
+			jit.POpNot, jit.POpAdd, jit.POpSub, jit.POpMul:
+			if _, ok := known[in.A]; ok {
+				known = maps.Clone(known)
+				delete(known, in.A)
+			}
+		}
+		next(st.at+1, known)
+	}
+	return seen
 }
 
 // jitCondOfOpcode maps a VDBE comparison opcode to the JIT's condition.
