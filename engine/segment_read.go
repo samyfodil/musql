@@ -388,6 +388,15 @@ func (p *ReadOnlyPager) segFilterSumTable(rootPage uint32, preds []segPred, col 
 	parts := make([]part, len(segs))
 	ok = segEach(len(segs), func(si int) bool {
 		s := segs[si]
+		pt := &parts[si]
+		// The column's range proves the sum cannot overflow: no per-row check,
+		// and runs the zone maps rule out are not read at all.
+		if sum, n, ok := segFilterSumZoned(s, preds, col); ok {
+			vz, _ := s.intZones(col)
+			pt.sum, pt.matched = sum, n
+			pt.abs = uint64(s.nRows) * uint64(max(-(vz.min+1), vz.max)+1)
+			return true
+		}
 		vals, okCol := segCleanInt64Column(s, col)
 		if !okCol {
 			return false
@@ -396,7 +405,6 @@ func (p *ReadOnlyPager) segFilterSumTable(rootPage uint32, preds []segPred, col 
 		if !okPreds {
 			return false
 		}
-		pt := &parts[si]
 		for i := 0; i < s.nRows; i++ {
 			keep := true
 			for j, pr := range preds {

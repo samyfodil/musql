@@ -85,6 +85,9 @@ type segment struct {
 	// per row. See segment_prefix.go.
 	prefMu  eqCountMu
 	prefIdx map[int][]uint64
+	// Lazily built zone maps, one per int64 column. See segment_zone.go.
+	zoneMu eqCountMu
+	zones  map[int]*segZones
 }
 
 // Rowid is the key row i is stored under, which a converter must preserve
