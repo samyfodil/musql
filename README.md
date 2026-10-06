@@ -16,7 +16,7 @@ just-in-time (JIT) compilation. The format stores columns contiguously; the JIT
 turns supported query paths into native machine code at runtime. Filters and
 aggregates work directly over those columns, reducing row decoding and
 interpreter overhead. In a 100,000-row read benchmark, a filtered count ran
-**about 75× faster than C SQLite and over 200× faster than Turso**.
+**about 100× faster than C SQLite and over 200× faster than Turso**.
 See [performance](#performance) for the full comparison and measurement scope.
 
 Use it as an embedded database through `database/sql`, import existing SQLite
@@ -104,25 +104,28 @@ The release archive also has `musql-convert`:
 
 ## Performance
 
-Read workloads over **100,000 rows**. Each workload is checked against C
-SQLite on 40 bind values before timing, then timed for about 200 ms. The
-figures are averaged over two machines, one arm64 and one amd64.
+Read workloads over **100,000 rows**, against C SQLite called natively from
+C (no Go in its path) and Turso through its Go driver. Each workload is checked
+against C SQLite on up to 40 bind values before timing, then timed for about
+200 ms. The figures average an arm64 and an amd64 machine.
 
 | Query | musql vs C SQLite | musql vs Turso |
 | --- | ---: | ---: |
-| Filtered count, one predicate | **73× faster** | 212× faster |
-| Filtered count, two predicates | **77× faster** | 226× faster |
-| Rowid lookup | **1.3× slower** | 1.3× faster |
-| Secondary-index equality | **1.9× slower** | 1.4× faster |
-| Indexed equi-join | **same** | 1.9× faster |
-| Sum over a filter | **8.0× faster** | 25× faster |
-| Grouped aggregate | **2.3× faster** | 5.2× faster |
-| `ORDER BY v DESC LIMIT 20` | **2.4× faster** | 21× faster |
-| Whole-table count | **1.7× faster** | 5.8× faster |
+| Filtered count, one predicate | **100× faster** | 280× faster |
+| Filtered count, two predicates | **77× faster** | 230× faster |
+| Rowid lookup | **2.5× slower** | 1.5× faster |
+| Secondary-index equality | **2.7× slower** | 1.7× faster |
+| Indexed equi-join | **2.3× slower** | 1.9× faster |
+| Sum over a filter | **7.8× faster** | 25× faster |
+| Grouped aggregate | **2.2× faster** | 5.2× faster |
+| `ORDER BY v DESC LIMIT 20` | **2.4× faster** | 23× faster |
+| Whole-table count | **about the same** | 7.5× faster |
 
-Without the JIT, musql loses to C SQLite by a large multiple
-on these scans. Point lookups and joins do not use the JIT. Per-machine
-timings are in [docs/benchmarks.md](docs/benchmarks.md).
+The scans run as JIT-compiled code over musql's columnar format, and their
+multiples hold at 1,000,000 rows. Point lookups and joins do not use the JIT,
+and C SQLite is faster there. Without the JIT, musql loses to C SQLite by a
+large multiple on these scans. Per-machine timings, the 1M-row runs and the
+cost of calling C from Go are in [docs/benchmarks.md](docs/benchmarks.md).
 
 The current engine uses segment storage with a writable delta. Its
 [comparison harness](compat-harness/bench_columnar_vs_c_test.go) measures both
