@@ -109,29 +109,39 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		return bulkAnswered // no rows: no groups, which is what the walk would leave
 	}
 
-	// Sum every group. Nothing is written to the VM until this succeeds.
+	// Sum every group. Nothing is written to the VM until this succeeds. Each
+	// segment builds its own partial groups (on its own goroutine under
+	// WithThreads); merging them in segment order keeps every group's LAST row
+	// the one a single pass would have seen last.
 	na := len(plan.argCols)
-	var dense []segGroupAcc
-	var sparse map[int64]*segGroupAcc
-	if uint64(hi-lo) < segGroupBulkMaxDense {
-		dense = make([]segGroupAcc, hi-lo+1)
-	} else {
-		sparse = map[int64]*segGroupAcc{}
+	dense := uint64(hi-lo) < segGroupBulkMaxDense
+	add := func(groups map[int64]*segGroupAcc, slots []segGroupAcc, k int64) *segGroupAcc {
+		var g *segGroupAcc
+		if slots != nil {
+			g = &slots[k-lo]
+		} else if g = groups[k]; g == nil {
+			g = &segGroupAcc{}
+			groups[k] = g
+		}
+		if g.sums == nil {
+			g.sums, g.abs = make([]int64, na), make([]uint64, na)
+		}
+		return g
 	}
-	for si, s := range segs {
-		b := bs[si]
+	type partial struct {
+		slots  []segGroupAcc
+		groups map[int64]*segGroupAcc
+	}
+	parts := make([]partial, len(segs))
+	ok := segEach(len(segs), func(si int) bool {
+		s, b, pt := segs[si], bs[si], &parts[si]
+		if dense {
+			pt.slots = make([]segGroupAcc, hi-lo+1)
+		} else {
+			pt.groups = map[int64]*segGroupAcc{}
+		}
 		for r := 0; r < s.nRows; r++ {
-			k := b.key[r]
-			var g *segGroupAcc
-			if dense != nil {
-				g = &dense[k-lo]
-			} else if g = sparse[k]; g == nil {
-				g = &segGroupAcc{}
-				sparse[k] = g
-			}
-			if g.sums == nil {
-				g.sums, g.abs = make([]int64, na), make([]uint64, na)
-			}
+			g := add(pt.groups, pt.slots, b.key[r])
 			g.n++
 			g.lastSeg, g.lastRow = si, r
 			for a, col := range b.args {
@@ -145,11 +155,52 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 					u = -u
 				}
 				if g.abs[a]+u < g.abs[a] || g.abs[a]+u > math.MaxInt64 {
-					return bulkNotEligible
+					return false
 				}
 				g.abs[a] += u
 			}
 		}
+		return true
+	})
+	if !ok {
+		return bulkNotEligible
+	}
+	var slots []segGroupAcc
+	groups := map[int64]*segGroupAcc{}
+	if dense {
+		slots = make([]segGroupAcc, hi-lo+1)
+	}
+	merge := func(k int64, from *segGroupAcc) bool {
+		if from.n == 0 {
+			return true
+		}
+		g := add(groups, slots, k)
+		g.n += from.n
+		g.lastSeg, g.lastRow = from.lastSeg, from.lastRow
+		for a := range na {
+			g.sums[a] += from.sums[a]
+			if g.abs[a]+from.abs[a] < g.abs[a] || g.abs[a]+from.abs[a] > math.MaxInt64 {
+				return false
+			}
+			g.abs[a] += from.abs[a]
+		}
+		return true
+	}
+	for _, pt := range parts {
+		for i := range pt.slots {
+			if !merge(lo+int64(i), &pt.slots[i]) {
+				return bulkNotEligible
+			}
+		}
+		for k, g := range pt.groups {
+			if !merge(k, g) {
+				return bulkNotEligible
+			}
+		}
+	}
+	var sparse map[int64]*segGroupAcc
+	if !dense {
+		sparse = groups
 	}
 
 	// Step each group's last row through the shared code, then add the rest.
@@ -198,9 +249,9 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		return true
 	}
 	segGroupBulkHits.Add(1)
-	if dense != nil {
-		for i := range dense {
-			if dense[i].n > 0 && !apply(lo+int64(i), &dense[i]) {
+	if dense {
+		for i := range slots {
+			if slots[i].n > 0 && !apply(lo+int64(i), &slots[i]) {
 				return bulkFailed
 			}
 		}

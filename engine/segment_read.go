@@ -339,17 +339,22 @@ func (p *ReadOnlyPager) segFilterCountTable(rootPage uint32, preds []segPred) (i
 		// A column with no index falls through to the scan below rather than
 		// declining: the kernel answers equality perfectly well, just slower.
 	}
-	total := 0
-	for _, s := range segs {
+	counts := make([]int, len(segs))
+	scanned := segEach(len(segs), func(i int) bool {
+		s := segs[i]
 		// Refuse columns whose NULLs might not be NULLs (ALTER TABLE ADD COLUMN
 		// leaves older records short and synthesizes DEFAULT at read time).
 		if !segPredColsFilterable(s, preds) {
-			return 0, false
+			return false
 		}
-		n := segFilterCount(s, preds)
-		if n < 0 {
-			return 0, false
-		}
+		counts[i] = segFilterCount(s, preds)
+		return counts[i] >= 0
+	})
+	if !scanned {
+		return 0, false
+	}
+	total := 0
+	for _, n := range counts {
 		total += n
 	}
 	return total - sub + add, true
@@ -370,18 +375,28 @@ func (p *ReadOnlyPager) segFilterSumTable(rootPage uint32, preds []segPred, col 
 	if !ok {
 		return Value{}, false
 	}
-	var total int64
-	matched := 0
-	for _, s := range segs {
+	// Each segment sums on its own; the parts are added afterwards. That is
+	// only the same answer as one pass in row order when no partial sum can
+	// overflow in ANY order, so the sum of |v| must fit -- otherwise this
+	// declines, and the row loop decides between a value and C SQLite's
+	// "integer overflow" error.
+	type part struct {
+		sum     int64
+		abs     uint64
+		matched int
+	}
+	parts := make([]part, len(segs))
+	ok = segEach(len(segs), func(si int) bool {
+		s := segs[si]
 		vals, okCol := segCleanInt64Column(s, col)
 		if !okCol {
-			return Value{}, false
+			return false
 		}
-		// Filter and accumulate in one pass; no intermediate allocations.
 		cols, okPreds := segPredColumns(s, preds)
 		if !okPreds {
-			return Value{}, false
+			return false
 		}
+		pt := &parts[si]
 		for i := 0; i < s.nRows; i++ {
 			keep := true
 			for j, pr := range preds {
@@ -394,18 +409,35 @@ func (p *ReadOnlyPager) segFilterSumTable(rootPage uint32, preds []segPred, col 
 				continue
 			}
 			if i >= len(vals) {
-				return Value{}, false
+				return false
 			}
 			v := vals[i]
-			sum := total + v
-			// Signed overflow: the result moved the wrong way for the addend's
-			// sign. Decline rather than wrap.
-			if (v > 0 && sum < total) || (v < 0 && sum > total) {
-				return Value{}, false
+			u := uint64(v)
+			if v < 0 {
+				u = -u
 			}
-			total = sum
-			matched++
+			if pt.abs+u < pt.abs || pt.abs+u > 1<<63-1 {
+				return false
+			}
+			pt.abs += u
+			pt.sum += v
+			pt.matched++
 		}
+		return true
+	})
+	if !ok {
+		return Value{}, false
+	}
+	var total int64
+	var abs uint64
+	matched := 0
+	for _, pt := range parts {
+		if abs+pt.abs < abs || abs+pt.abs > 1<<63-1 {
+			return Value{}, false
+		}
+		abs += pt.abs
+		total += pt.sum
+		matched += pt.matched
 	}
 	if matched == 0 {
 		return Value{Typ: Null}, true
