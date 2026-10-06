@@ -153,6 +153,9 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		} else {
 			pt.groups = map[int64]*segGroupAcc{}
 		}
+		if dense && segGroupDenseFlat(s, plan.argCols, b.key, b.args, needSum, needMM, lo, si, pt.slots) {
+			return true
+		}
 		for r := 0; r < s.nRows; r++ {
 			g := add(pt.groups, pt.slots, b.key[r])
 			g.n++
@@ -287,4 +290,93 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		}
 	}
 	return bulkAnswered
+}
+
+// segGroupDenseFlat is one segment's per-group work for dense keys, written as
+// one tight loop per statistic over flat per-key arrays rather than one loop
+// over rows that updates a struct per row. It is used only when every summed
+// column's zone map proves no sum in this segment can overflow, so the loops
+// carry no check; it reports false otherwise, and the checked loop runs.
+// Results land in slots exactly as the row loop leaves them.
+func segGroupDenseFlat(s *segment, argCols []int, keys []int64, args [][]int64,
+	needSum, needMM []bool, lo int64, si int, slots []segGroupAcc) bool {
+	for a, need := range needSum {
+		if !need {
+			continue
+		}
+		z, ok := s.intZones(argCols[a])
+		if !ok || !segSumCannotOverflow(s.nRows, z.min, z.max) {
+			return false
+		}
+	}
+	nr := s.nRows
+	keys = keys[:nr]
+	width := len(slots)
+	n := make([]int64, width)
+	last := make([]int32, width)
+	for r, k := range keys {
+		i := k - lo
+		n[i]++
+		last[i] = int32(r)
+	}
+	na := len(args)
+	sums := make([][]int64, na)
+	mins := make([][]int64, na)
+	maxs := make([][]int64, na)
+	for a, col := range args {
+		col = col[:nr]
+		if needSum[a] {
+			sm := make([]int64, width)
+			for r, k := range keys {
+				sm[k-lo] += col[r]
+			}
+			sums[a] = sm
+		}
+		if needMM[a] {
+			mn, mx := make([]int64, width), make([]int64, width)
+			for i := range mn {
+				mn[i], mx[i] = math.MaxInt64, math.MinInt64
+			}
+			for r, k := range keys {
+				v, i := col[r], k-lo
+				if v < mn[i] {
+					mn[i] = v
+				}
+				if v > mx[i] {
+					mx[i] = v
+				}
+			}
+			mins[a], maxs[a] = mn, mx
+		}
+	}
+	for i := range width {
+		if n[i] == 0 {
+			continue
+		}
+		g := &slots[i]
+		g.n, g.lastSeg, g.lastRow = n[i], si, int(last[i])
+		g.sums, g.abs = make([]int64, na), make([]uint64, na)
+		g.mins, g.maxs = make([]int64, na), make([]int64, na)
+		for a := range na {
+			g.mins[a], g.maxs[a] = math.MaxInt64, math.MinInt64
+			if sums[a] != nil {
+				g.sums[a] = sums[a][i]
+				// The bound the zone map proved, standing in for the exact
+				// sum of |v| the merge checks against.
+				z, _ := s.intZones(argCols[a])
+				g.abs[a] = uint64(n[i]) * max(segAbs(z.min), segAbs(z.max))
+			}
+			if mins[a] != nil {
+				g.mins[a], g.maxs[a] = mins[a][i], maxs[a][i]
+			}
+		}
+	}
+	return true
+}
+
+func segAbs(v int64) uint64 {
+	if v < 0 {
+		return uint64(-(v + 1)) + 1
+	}
+	return uint64(v)
 }

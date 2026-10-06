@@ -211,7 +211,7 @@ func TestBenchColumnarVsC(t *testing.T) {
 		{"min/max whole table", "SELECT min(v), max(v) FROM t",
 			func(rng *rand.Rand) []any { return nil }, true},
 		{"grouped min/max", "SELECT k, min(v), max(v) FROM t GROUP BY k ORDER BY k",
-			func(rng *rand.Rand) []any { return nil }, false},
+			func(rng *rand.Rand) []any { return nil }, true},
 		// HAVING, which the GROUP BY driver also declines.
 		{"GROUP BY with HAVING", "SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > ? ORDER BY k",
 			func(rng *rand.Rand) []any { return []any{5000 + rng.Intn(100)} }, false},
