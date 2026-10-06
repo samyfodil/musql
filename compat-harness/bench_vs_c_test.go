@@ -5,19 +5,27 @@ import (
 	"database/sql"
 	"fmt"
 	"math/rand"
+	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3" // driver "sqlite3" (C SQLite, CGo)
+	_ "github.com/mattn/go-sqlite3"     // driver "sqlite3" (C SQLite, CGo)
 	"github.com/samyfodil/musql/driver" // driver "musql"
 )
 
 // Benchmark sizing and seeding for reproducibility.
-const (
-	benchN    = 100_000 // rows in t and in b
-	benchSeed = 0x5eed
-)
+const benchSeed = 0x5eed
+
+// benchN is the rows in t and in b: 100,000, or BENCH_ROWS when set (a larger
+// table shows how a ratio moves as per-call overhead shrinks against the work).
+var benchN = func() int {
+	if n, err := strconv.Atoi(os.Getenv("BENCH_ROWS")); err == nil && n > 0 {
+		return n
+	}
+	return 100_000
+}()
 
 // Iteration counts per workload type.
 const (
@@ -366,7 +374,7 @@ func reportBench(t *testing.T, order []string, results map[string]map[string]tim
 	t.Helper()
 	const (
 		musql = "musql"
-		mattn  = "mattn-C"
+		mattn = "mattn-C"
 	)
 	line := "----------------------------------------------------------------------------------------------"
 	t.Logf("\nBENCHMARK: %d rows, disk-backed (t.TempDir), warm, seed=0x%x\n%s",
