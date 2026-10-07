@@ -132,7 +132,7 @@ var (
 // the VDBE spends several ns on, does once anything rides along with it. The
 // platform's figure is jit.VMMinWork: an entry on js/wasm crosses into the JS
 // host and back, about eight times the native cost.
-const vmJITMinWork = jit.VMMinWork
+var vmJITMinWork = jit.VMMinWork
 
 // nativeRun weighs the native instructions from pc along the fall-through and
 // unconditional-jump path, up to vmJITMinWork: a copy or a constant is 1, a
