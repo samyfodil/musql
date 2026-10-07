@@ -211,7 +211,7 @@ describe the conversion rules.
 clients speak, so an app built on Turso can point at musql without code changes:
 
 ```sh
-go run ./cmd/musqld -db app.musq -listen :8080 -auth-token "$TOKEN"
+go run -C hrana ./cmd/musqld -db app.musq -listen :8080 -auth-token "$TOKEN"
 ```
 
 ```ts
@@ -231,7 +231,7 @@ the host name picks the database, so `http://app.example.com:8080` serves
 `./dbs/app.musq`:
 
 ```sh
-go run ./cmd/musqld -dir ./dbs -create -listen :8080
+go run -C hrana ./cmd/musqld -dir ./dbs -create -listen :8080
 ```
 
 ## Replicate a database

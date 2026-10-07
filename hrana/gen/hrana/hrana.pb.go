@@ -1469,9 +1469,9 @@ const file_hrana_hrana_proto_rawDesc = "" +
 	"\x04text\x18\x04 \x01(\tH\x00R\x04text\x12\x14\n" +
 	"\x04blob\x18\x05 \x01(\fH\x00R\x04blob\x1a\x06\n" +
 	"\x04NullB\a\n" +
-	"\x05valueBq\n" +
+	"\x05valueBw\n" +
 	"\tcom.hranaB\n" +
-	"HranaProtoP\x01Z$github.com/samyfodil/musql/gen/hrana\xa2\x02\x03HXX\xaa\x02\x05Hrana\xca\x02\x05Hrana\xe2\x02\x11Hrana\\GPBMetadata\xea\x02\x05Hranab\x06proto3"
+	"HranaProtoP\x01Z*github.com/samyfodil/musql/hrana/gen/hrana\xa2\x02\x03HXX\xaa\x02\x05Hrana\xca\x02\x05Hrana\xe2\x02\x11Hrana\\GPBMetadata\xea\x02\x05Hranab\x06proto3"
 
 var (
 	file_hrana_hrana_proto_rawDescOnce sync.Once

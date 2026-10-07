@@ -1,7 +1,7 @@
 package hrana
 
 import (
-	pbws "github.com/samyfodil/musql/gen/hrana/ws"
+	pbws "github.com/samyfodil/musql/hrana/gen/hrana/ws"
 )
 
 // JSON encoding of Hrana over WebSocket messages (subprotocols hrana1, hrana2

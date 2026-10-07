@@ -3,10 +3,9 @@
 FROM --platform=$BUILDPLATFORM golang:1.27 AS build
 ARG TARGETOS TARGETARCH
 WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /musqld ./cmd/musqld
+RUN cd hrana && go mod download
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -C hrana -trimpath -ldflags="-s -w" -o /musqld ./cmd/musqld
 # UPX shrinks the binary from ~17 MB to ~5 MB for ~0.3 s of startup, a fine
 # trade for a long-running server.
 RUN apt-get update -qq && apt-get install -qq -y upx-ucl >/dev/null && upx -q --best --lzma /musqld

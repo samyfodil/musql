@@ -18,8 +18,8 @@ import (
 	"google.golang.org/protobuf/encoding/protodelim"
 	"google.golang.org/protobuf/proto"
 
-	pb "github.com/samyfodil/musql/gen/hrana"
-	pbhttp "github.com/samyfodil/musql/gen/hrana/http"
+	pb "github.com/samyfodil/musql/hrana/gen/hrana"
+	pbhttp "github.com/samyfodil/musql/hrana/gen/hrana/http"
 )
 
 // Server serves Hrana over HTTP (versions 2 and 3, JSON and Protobuf) for one

@@ -11,7 +11,7 @@
 package ws
 
 import (
-	hrana "github.com/samyfodil/musql/gen/hrana"
+	hrana "github.com/samyfodil/musql/hrana/gen/hrana"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
@@ -2110,8 +2110,8 @@ const file_hrana_ws_ws_proto_rawDesc = "" +
 	"\x10GetAutocommitReq\x12\x1b\n" +
 	"\tstream_id\x18\x01 \x01(\x05R\bstreamId\"8\n" +
 	"\x11GetAutocommitResp\x12#\n" +
-	"\ris_autocommit\x18\x01 \x01(\bR\fisAutocommitB\x81\x01\n" +
-	"\fcom.hrana.wsB\aWsProtoP\x01Z'github.com/samyfodil/musql/gen/hrana/ws\xa2\x02\x03HWX\xaa\x02\bHrana.Ws\xca\x02\bHrana\\Ws\xe2\x02\x14Hrana\\Ws\\GPBMetadata\xea\x02\tHrana::Wsb\x06proto3"
+	"\ris_autocommit\x18\x01 \x01(\bR\fisAutocommitB\x87\x01\n" +
+	"\fcom.hrana.wsB\aWsProtoP\x01Z-github.com/samyfodil/musql/hrana/gen/hrana/ws\xa2\x02\x03HWX\xaa\x02\bHrana.Ws\xca\x02\bHrana\\Ws\xe2\x02\x14Hrana\\Ws\\GPBMetadata\xea\x02\tHrana::Wsb\x06proto3"
 
 var (
 	file_hrana_ws_ws_proto_rawDescOnce sync.Once

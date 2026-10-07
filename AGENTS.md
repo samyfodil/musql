@@ -62,8 +62,8 @@ The engine runs a program two ways only: the VDBE, or the JIT-compiled VDBE.
 | `convert/sqlite/` | SQLite-format converter: page and b-tree reader/writer, WAL and hot-journal reading, integrity walk, `Import`/`Export`. |
 | `cmd/musql-convert/` | The conversion CLI. |
 | `driver/` | The `database/sql` driver (registered as `"sqlite"`). |
-| `hrana/`, `cmd/musqld/` | The Hrana server (HTTP, JSON and Protobuf), so libSQL/Turso clients can use musql. |
-| `proto/`, `gen/` | Protobuf definitions and the code `buf generate` writes from them. Never edit `gen/` by hand. |
+| `hrana/` | The Hrana server (HTTP, JSON and Protobuf) and `cmd/musqld`, so libSQL/Turso clients can use musql. Its own module, so the engine and driver depend on nothing but `golang.org/x/sys`. Generated code in `hrana/gen/`. |
+| `proto/` | Protobuf definitions. `buf generate` (repo root) writes the Go code into `hrana/gen/` and `examples/libp2p` has its own config. Never edit generated code by hand. |
 | `replication/` | Replication: capture, HLC, op log, CRDT and leader modes. The network is supplied by the caller (`WithTransport`). |
 | `examples/libp2p/` | An example `Transport` over libp2p, its own module. |
 | `internal/jit/` | The JIT: x86-64 and AArch64 emitters, W^X mapping, trampolines. |

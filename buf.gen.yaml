@@ -8,9 +8,9 @@ managed:
   enabled: true
   override:
     - file_option: go_package_prefix
-      value: github.com/samyfodil/musql/gen
+      value: github.com/samyfodil/musql/hrana/gen
 
 plugins:
   - local: protoc-gen-go
-    out: gen
+    out: hrana/gen
     opt: paths=source_relative

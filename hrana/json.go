@@ -7,8 +7,8 @@ import (
 	"math"
 	"strconv"
 
-	pb "github.com/samyfodil/musql/gen/hrana"
-	pbhttp "github.com/samyfodil/musql/gen/hrana/http"
+	pb "github.com/samyfodil/musql/hrana/gen/hrana"
+	pbhttp "github.com/samyfodil/musql/hrana/gen/hrana/http"
 )
 
 // Hrana's JSON encoding, the canonical one. It is not protojson: unions are

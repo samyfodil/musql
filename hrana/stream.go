@@ -2,7 +2,7 @@
 // Turso clients speak, so those clients can use musql unchanged.
 //
 // The protocol is specified in libsql's docs/HRANA_3_SPEC.md. Messages are the
-// generated types in gen/hrana (proto/hrana); this package adds the JSON
+// generated types in hrana/gen/hrana (proto/hrana); this package adds the JSON
 // encoding, the HTTP endpoints and the mapping of a stream onto a musql
 // connection.
 package hrana
@@ -17,7 +17,7 @@ import (
 	"time"
 
 	musqldriver "github.com/samyfodil/musql/driver"
-	pb "github.com/samyfodil/musql/gen/hrana"
+	pb "github.com/samyfodil/musql/hrana/gen/hrana"
 )
 
 // stream is one Hrana stream: one musql connection, plus the SQL texts stored

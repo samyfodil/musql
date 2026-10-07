@@ -11,7 +11,7 @@
 package http
 
 import (
-	hrana "github.com/samyfodil/musql/gen/hrana"
+	hrana "github.com/samyfodil/musql/hrana/gen/hrana"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
@@ -1442,8 +1442,8 @@ const file_hrana_http_http_proto_rawDesc = "" +
 	"\x12CloseSqlStreamResp\"\x18\n" +
 	"\x16GetAutocommitStreamReq\">\n" +
 	"\x17GetAutocommitStreamResp\x12#\n" +
-	"\ris_autocommit\x18\x01 \x01(\bR\fisAutocommitB\x8f\x01\n" +
-	"\x0ecom.hrana.httpB\tHttpProtoP\x01Z)github.com/samyfodil/musql/gen/hrana/http\xa2\x02\x03HHX\xaa\x02\n" +
+	"\ris_autocommit\x18\x01 \x01(\bR\fisAutocommitB\x95\x01\n" +
+	"\x0ecom.hrana.httpB\tHttpProtoP\x01Z/github.com/samyfodil/musql/hrana/gen/hrana/http\xa2\x02\x03HHX\xaa\x02\n" +
 	"Hrana.Http\xca\x02\n" +
 	"Hrana\\Http\xe2\x02\x16Hrana\\Http\\GPBMetadata\xea\x02\vHrana::Httpb\x06proto3"
 

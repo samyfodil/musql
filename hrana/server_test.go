@@ -19,9 +19,9 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	_ "github.com/samyfodil/musql/driver"
-	pb "github.com/samyfodil/musql/gen/hrana"
-	pbhttp "github.com/samyfodil/musql/gen/hrana/http"
-	pbws "github.com/samyfodil/musql/gen/hrana/ws"
+	pb "github.com/samyfodil/musql/hrana/gen/hrana"
+	pbhttp "github.com/samyfodil/musql/hrana/gen/hrana/http"
+	pbws "github.com/samyfodil/musql/hrana/gen/hrana/ws"
 )
 
 func newTestServer(t *testing.T) string {
