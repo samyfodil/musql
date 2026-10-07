@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"math/rand"
+	"runtime"
 	"testing"
 )
 
@@ -119,3 +120,7 @@ func TestJITIsActuallyReachedByTheFilter(t *testing.T) {
 	}
 	_ = fmt.Sprint
 }
+
+// programJITEnabled is JITEnabled for the paths the program and VM JITs serve:
+// js/wasm has only the filter kernels so far.
+func programJITEnabled() bool { return JITEnabled() && runtime.GOARCH != "wasm" }

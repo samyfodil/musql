@@ -29,7 +29,7 @@ func TestZoneMinMaxMatchesTheLoop(t *testing.T) {
 		if got != want {
 			t.Errorf("%s: fast %s plain %s", c.sql, got, want)
 		}
-		if JITEnabled() && (segZoneExtremeHits.Load() > before) != c.zone {
+		if programJITEnabled() && (segZoneExtremeHits.Load() > before) != c.zone {
 			t.Errorf("%s: zone used=%v", c.sql, segZoneExtremeHits.Load() > before)
 		}
 	}

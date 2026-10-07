@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# go test -exec for GOOS=js with the musqljit imports:
+#   GOOS=js GOARCH=wasm go test -exec "$PWD/examples/wasm/go_js_wasm_exec" ./internal/jit/
+exec node --stack-size=8192 "$(dirname "$0")/node_exec.js" "$@"
