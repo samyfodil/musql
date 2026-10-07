@@ -1,6 +1,9 @@
 package engine
 
-import "sort"
+import (
+	"cmp"
+	"slices"
+)
 
 // The CATALOG a segment file has to carry to be a database rather than a pile of
 // rows: every index, view and trigger, every AUTOINCREMENT counter, and the
@@ -150,7 +153,7 @@ func catalogRanks(seqs []uint64) []uint32 {
 	for i := range order {
 		order[i] = i
 	}
-	sort.SliceStable(order, func(a, b int) bool { return seqs[order[a]] < seqs[order[b]] })
+	slices.SortStableFunc(order, func(a, b int) int { return cmp.Compare(seqs[a], seqs[b]) })
 	ranks := make([]uint32, len(seqs))
 	for pos, i := range order {
 		ranks[i] = uint32(pos + 1)
@@ -181,12 +184,12 @@ func sortCatalogRows(rows []SchemaRow, keys []catalogOrderKey) []SchemaRow {
 	for i := range idx {
 		idx[i] = i
 	}
-	sort.SliceStable(idx, func(a, b int) bool {
-		ka, kb := keys[idx[a]], keys[idx[b]]
-		if ka.rank != kb.rank {
-			return ka.rank < kb.rank
+	slices.SortStableFunc(idx, func(a, b int) int {
+		ka, kb := keys[a], keys[b]
+		if c := cmp.Compare(ka.rank, kb.rank); c != 0 {
+			return c
 		}
-		return ka.sub < kb.sub
+		return cmp.Compare(ka.sub, kb.sub)
 	})
 	out := make([]SchemaRow, len(rows))
 	for i, j := range idx {
