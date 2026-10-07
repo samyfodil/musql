@@ -16,7 +16,7 @@ just-in-time (JIT) compilation. The format stores columns contiguously; the JIT
 turns supported query paths into native machine code at runtime. Filters and
 aggregates work directly over those columns, reducing row decoding and
 interpreter overhead. In a 100,000-row read benchmark, a filtered count ran
-**about 100× faster than C SQLite and over 200× faster than Turso**.
+**about 300× faster than C SQLite and nearly 1,000× faster than Turso**.
 See [performance](#performance) for the full comparison and measurement scope.
 
 Use it as an embedded database through `database/sql`, import existing SQLite
@@ -104,28 +104,35 @@ The release archive also has `musql-convert`:
 
 ## Performance
 
-Read workloads over **100,000 rows**, against C SQLite called natively from
-C (no Go in its path) and Turso through its Go driver. Each workload is checked
-against C SQLite on up to 40 bind values before timing, then timed for about
-200 ms. The figures average an arm64 and an amd64 machine.
+Read workloads over **100,000 rows**, one thread each, against C SQLite called
+natively from C (no Go in its path), Turso through its Go driver, and DuckDB.
+Each workload is checked against C SQLite on up to 40 bind values before
+timing, then timed for about 200 ms. Measured on an amd64 server; musql through
+its direct engine API.
 
-| Query | musql vs C SQLite | musql vs Turso |
-| --- | ---: | ---: |
-| Filtered count, one predicate | **100× faster** | 280× faster |
-| Filtered count, two predicates | **77× faster** | 230× faster |
-| Rowid lookup | **2.5× slower** | 1.5× faster |
-| Secondary-index equality | **2.7× slower** | 1.7× faster |
-| Indexed equi-join | **2.3× slower** | 1.9× faster |
-| Sum over a filter | **7.8× faster** | 25× faster |
-| Grouped aggregate | **2.2× faster** | 5.2× faster |
-| `ORDER BY v DESC LIMIT 20` | **2.4× faster** | 23× faster |
-| Whole-table count | **about the same** | 7.5× faster |
+| Query | musql | vs C SQLite | vs Turso | vs DuckDB |
+| --- | ---: | ---: | ---: | ---: |
+| Filtered count, one predicate | 21 µs | **300× faster** | 970× faster | 29× faster |
+| Filtered count, two predicates | 73 µs | **95× faster** | 380× faster | 10× faster |
+| Rowid lookup | 3 µs | **4× faster** | 17× faster | 130× faster |
+| Secondary-index equality | 1 µs | **9× faster** | 37× faster | 280× faster |
+| Indexed equi-join | 8 µs | **2× faster** | 10× faster | 100× faster |
+| Sum over a filter | 49 µs | **130× faster** | 500× faster | 15× faster |
+| Grouped aggregate | 418 µs | **95× faster** | 260× faster | 3× faster |
+| `ORDER BY v DESC LIMIT 20` | 345 µs | **25× faster** | 270× faster | 3× faster |
+| Grouped `min`/`max` | 1.0 ms | **42× faster** | 120× faster | 1.4× faster |
+| `OR` predicate | 747 µs | **9× faster** | 33× faster | 3× faster |
+| `IN` list | 1.6 ms | **7× faster** | 20× faster | 1.7× faster |
 
-The scans run as JIT-compiled code over musql's columnar format, and their
-multiples hold at 1,000,000 rows. Point lookups and joins do not use the JIT,
-and C SQLite is faster there. Without the JIT, musql loses to C SQLite by a
-large multiple on these scans. Per-machine timings, the 1M-row runs and the
-cost of calling C from Go are in [docs/benchmarks.md](docs/benchmarks.md).
+Scans and aggregates run as JIT-compiled code over musql's columnar format, and
+the multiples hold or grow at 1,000,000 rows. Through `database/sql`, a point
+lookup costs about as much as native C SQLite (12 µs here) rather than 4× less.
+DuckDB is an analytical engine and not SQLite-compatible; with its default
+thread count it is faster on some of these, and `engine.WithWorkers(n)` lets
+musql split scans across goroutines too. Without the JIT, musql loses to C
+SQLite by a large multiple on scans. Per-machine timings, the 1M-row runs, the
+multithreaded comparison with DuckDB and the cost of calling C from Go are in
+[docs/benchmarks.md](docs/benchmarks.md).
 
 The current engine uses segment storage with a writable delta. Its
 [comparison harness](compat-harness/bench_columnar_vs_c_test.go) measures both
