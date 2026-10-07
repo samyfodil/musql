@@ -126,11 +126,13 @@ var (
 )
 
 // vmJITMinWork is the least native work worth an entry from the VDBE, in
-// nativeRun's units. An entry and its exit cost ~4.7ns (measured on a
-// two-SCopy block), about what the VDBE spends interpreting two copies --
+// nativeRun's units. An entry and its exit cost ~4.7ns natively (measured on
+// a two-SCopy block), about what the VDBE spends interpreting two copies --
 // so a run of copies and constants never pays, while one integer opcode, which
-// the VDBE spends several ns on, does once anything rides along with it.
-const vmJITMinWork = 3
+// the VDBE spends several ns on, does once anything rides along with it. The
+// platform's figure is jit.VMMinWork: an entry on js/wasm crosses into the JS
+// host and back, about eight times the native cost.
+const vmJITMinWork = jit.VMMinWork
 
 // nativeRun weighs the native instructions from pc along the fall-through and
 // unconditional-jump path, up to vmJITMinWork: a copy or a constant is 1, a

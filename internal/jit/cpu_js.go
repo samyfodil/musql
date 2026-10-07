@@ -9,3 +9,8 @@ var HasVector = sync.OnceValue(func() bool {
 	_, err := Map(code)
 	return err == nil
 })
+
+// VMMinWork is the least native work worth an entry from the VDBE (see
+// engine/vdbe_jit.go's vmJITMinWork). An entry crosses into the JS host
+// and back, ~36ns against ~4.7ns natively (BenchmarkWasmEntry).
+const VMMinWork = 24

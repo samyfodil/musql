@@ -46,6 +46,9 @@ var workloads = []struct {
 	{"aggregate GROUP BY", "SELECT k, count(*), sum(v) FROM t GROUP BY k ORDER BY k", nil},
 	{"ORDER BY v DESC LIMIT 20", "SELECT id, v FROM t ORDER BY v DESC, id DESC LIMIT 20", nil},
 	{"count(*) whole table", "SELECT count(*) FROM t", nil},
+	// Not in the harness: arithmetic the VM JIT runs, over rows and in a loop.
+	{"arithmetic over every row", "SELECT sum(v * 3 + k - id) FROM t", nil},
+	{"recursive CTE arithmetic", "WITH RECURSIVE c(i, x) AS (SELECT 1, 0 UNION ALL SELECT i + 1, (x + i * i) % 1000003 FROM c WHERE i < 100000) SELECT max(x) FROM c", nil},
 }
 
 func open() error {
