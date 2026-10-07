@@ -56,9 +56,13 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # Only the build archives: the image job's build action uploads a
+      # build-record artifact of its own, which cannot be extracted here, and a
+      # bare download takes every artifact the run has.
       - uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: "{linux,darwin,windows}-*"
           merge-multiple: true
       - name: checksums
         run: cd dist && sha256sum * > SHA256SUMS
