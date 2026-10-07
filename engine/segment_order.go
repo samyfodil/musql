@@ -125,7 +125,49 @@ func (p *ReadOnlyPager) segOrderLimitTable(rootPage uint32, plan *segOrderPlan, 
 		if !okOuts {
 			return nil, false
 		}
+		// Once the heap is full its root is the cutoff: a row whose FIRST key
+		// sorts strictly after the root's cannot enter, whatever the later
+		// keys say. That is tested on the bare value before anything is built,
+		// and the zone maps test it for a whole run of rows at once.
+		var first []int64
+		var zones *segZones
+		if !keyIsRowid[0] {
+			first = keyCols[0]
+			zones, _ = s.intZones(plan.keyCols[0])
+		}
+		desc := plan.keyDesc[0]
+		after := func(v, cut int64) bool { // v sorts strictly after cut
+			if desc {
+				return v < cut
+			}
+			return v > cut
+		}
 		for r := 0; r < s.nRows; r++ {
+			if first != nil && len(heap) == plan.limit {
+				cut := heap[0].key[0]
+				if zones != nil && r%segFilterBatch == 0 {
+					b := r / segFilterBatch
+					best := zones.zmax[b]
+					if !desc {
+						best = zones.zmin[b]
+					}
+					if after(best, cut) {
+						end := min(r+segFilterBatch, s.nRows)
+						seq += end - r - segSkipsIn(skip, &sk, r, end)
+						r = end - 1
+						continue
+					}
+				}
+				if r < len(first) && after(first[r], cut) {
+					for sk < len(skip) && skip[sk] < r {
+						sk++
+					}
+					if !(sk < len(skip) && skip[sk] == r) {
+						seq++
+					}
+					continue
+				}
+			}
 			// A row the log superseded or removed is not this block's to offer.
 			for sk < len(skip) && skip[sk] < r {
 				sk++
@@ -730,3 +772,17 @@ var segOrderBytesServed atomic.Int64
 
 // SegOrderBytesServedForTest reports segOrderBytesServed and zeroes it.
 func SegOrderBytesServedForTest() int64 { return segOrderBytesServed.Swap(0) }
+
+// segSkipsIn counts the skipped positions in [lo, hi), advancing *sk past them,
+// so a run passed over whole keeps seq exactly what a row-at-a-time walk would.
+func segSkipsIn(skip []int, sk *int, lo, hi int) int {
+	for *sk < len(skip) && skip[*sk] < lo {
+		*sk++
+	}
+	n := 0
+	for *sk < len(skip) && skip[*sk] < hi {
+		*sk++
+		n++
+	}
+	return n
+}

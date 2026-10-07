@@ -162,22 +162,44 @@ func segPeephole(prog *Program) bool {
 	// allowed -- `SELECT count(*) FROM t` has no predicates at all, and a
 	// segment already knows its row count, so that query is addition rather
 	// than a scan.
+	//
+	// The groups come in two spellings. A WHERE of plain conjuncts jumps each
+	// failed test straight to the Next (IfNot P3=1). An AND inside one
+	// expression -- what BETWEEN compiles to -- jumps every failed test to a
+	// shared FALSE label (IfNot P3=0) and then settles the three-valued result
+	// in a fixed tail; segAndTreeTail checks that tail.
 	preds := make([]segPlanPred, 0, 2)
+	var cmpRegs []int
+	falseAt := -1
 	pc := rewindAt + 1
-	for pc+3 < predEnd {
+	for pc+3 < predEnd && in[pc].Op == OpColumn {
 		col, bound, cmp, ifnot := in[pc], in[pc+1], in[pc+2], in[pc+3]
+		// A negative numeric literal is spelled "Integer 100; Negative": the
+		// bound then sits in the Negative's register, and the group is five
+		// instructions long.
+		boundReg, size, negate := bound.P2, 4, false
+		if (bound.Op == OpInteger || bound.Op == OpReal) && cmp.Op == OpNegative &&
+			cmp.P1 == bound.P2 && pc+4 < predEnd {
+			boundReg, size, negate = cmp.P2, 5, true
+			cmp, ifnot = in[pc+3], in[pc+4]
+		}
+		direct := ifnot.P3 == 1 && ifnot.P2 == nextAt
+		tree := ifnot.P3 == 0 && (falseAt < 0 || ifnot.P2 == falseAt)
+		if tree {
+			falseAt = ifnot.P2
+		}
 		// OpInteger for a literal, OpVariable for a bound parameter. Both do
 		// the same thing here -- put the comparison value in a register -- and
 		// the instructions after them are identical, which is why one matcher
 		// covers both. Nothing else is accepted: an expression bound would put
 		// arbitrary opcodes in this slot.
 		if col.Op != OpColumn || col.P1 != in[rewindAt].P1 ||
-			!segPeepholeBoundOp(bound.Op) || bound.P2 != col.P3+1 ||
-			ifnot.Op != OpIfNot || ifnot.P2 != nextAt || ifnot.P3 != 1 {
+			!segPeepholeBoundOp(bound.Op) || bound.P2 != col.P3+1 || (negate && boundReg != bound.P2+1) ||
+			ifnot.Op != OpIfNot || !(direct || tree) || (direct && falseAt >= 0) {
 			return false
 		}
 		op, ok := segOpOfCompare(cmp.Op)
-		if !ok || cmp.P3 != col.P3 || cmp.P1 != bound.P2 || cmp.P2 != bound.P2+1 ||
+		if !ok || cmp.P3 != col.P3 || cmp.P1 != boundReg || cmp.P2 != boundReg+1 ||
 			ifnot.P1 != cmp.P2 {
 			return false
 		}
@@ -210,8 +232,26 @@ func segPeephole(prog *Program) bool {
 		default:
 			pred.Lit = Value{Typ: Int, I: int64(bound.P1)}
 		}
+		if negate {
+			switch pred.Lit.Typ {
+			case Int:
+				pred.Lit.I = -pred.Lit.I
+			case Float:
+				pred.Lit.F = -pred.Lit.F
+			default:
+				return false
+			}
+		}
 		preds = append(preds, pred)
-		pc += 4
+		cmpRegs = append(cmpRegs, cmp.P2)
+		pc += size
+	}
+	if falseAt >= 0 {
+		end, ok := segAndTreeTail(in, pc, cmpRegs, falseAt, nextAt)
+		if !ok {
+			return false
+		}
+		pc = end
 	}
 	// Zero, one or two. One was excluded only because the first scalar kernel
 	// could not beat Go's loop at a single compare, which is no longer true on
@@ -245,7 +285,7 @@ func segPeephole(prog *Program) bool {
 	// there is one, then the Rewind -- one address later than it was.
 	for _, ins := range in[3:] {
 		switch ins.Op {
-		case OpRewind, OpNext, OpIfNot:
+		case OpRewind, OpNext, OpIfNot, OpIsNull, OpGoto:
 			ins.P2++
 		}
 		out = append(out, ins)
@@ -487,4 +527,43 @@ func segAggPlanOf(in Instruction) *aggPlan {
 		return nil
 	}
 	return info.plan
+}
+
+// segAndTreeTail checks the code an AND inside one expression ends with, and
+// returns the address after it. For tests whose results sit in regs:
+//
+//	IsNull  reg_i -> N        once per test, in order
+//	Integer 1 -> R
+//	Goto    J
+//	N: Null -> R
+//	Goto    J
+//	F: Integer 0 -> R         every failed test jumped here
+//	J: IfNot R -> next (P3=1)
+//
+// With NULL-free columns (segPredColsFilterable) and non-NULL bounds
+// (segPlanPreds) no test can produce NULL, so the IsNull arm is never taken and
+// R is exactly the AND of the tests: what the kernel computes.
+func segAndTreeTail(in []Instruction, pc int, regs []int, falseAt, nextAt int) (int, bool) {
+	n := len(regs)
+	if pc+n+6 > len(in) {
+		return 0, false
+	}
+	nullAt := pc + n + 2
+	for i, r := range regs {
+		if in[pc+i].Op != OpIsNull || in[pc+i].P1 != r || in[pc+i].P2 != nullAt {
+			return 0, false
+		}
+	}
+	t := pc + n
+	one, j1, null, j2, zero, test := in[t], in[t+1], in[t+2], in[t+3], in[t+4], in[t+5]
+	r, join := one.P2, t+5
+	if one.Op != OpInteger || one.P1 != 1 ||
+		j1.Op != OpGoto || j1.P2 != join ||
+		null.Op != OpNull || null.P2 != r ||
+		j2.Op != OpGoto || j2.P2 != join ||
+		zero.Op != OpInteger || zero.P1 != 0 || zero.P2 != r || t+4 != falseAt ||
+		test.Op != OpIfNot || test.P1 != r || test.P2 != nextAt || test.P3 != 1 {
+		return 0, false
+	}
+	return t + 6, true
 }

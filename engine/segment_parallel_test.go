@@ -1,0 +1,39 @@
+package engine
+
+import (
+	"fmt"
+	"testing"
+)
+
+// TestSegmentWorkersMatchTheLoop runs the parallelized scans over a table of
+// several segments with one and with four workers, against the plain VDBE.
+func TestSegmentWorkersMatchTheLoop(t *testing.T) {
+	p := newSegPair(t,
+		`CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, w INTEGER)`,
+		`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i < 300000)
+		 INSERT INTO t SELECT i, (i * 7919) % 13, (i * 104729) % 2000001 - 1000000, (i * 31) % 70001 FROM c`)
+	queries := []string{
+		`SELECT count(*) FROM t WHERE v > 0`,
+		`SELECT count(*) FROM t WHERE v > -500000 AND k <> 3`,
+		`SELECT sum(v) FROM t WHERE v > 100`,
+		`SELECT sum(w) FROM t WHERE w < 1000`,
+		`SELECT k, count(*), sum(v) FROM t GROUP BY k ORDER BY k`,
+		`SELECT w, count(*) FROM t GROUP BY w ORDER BY w`,
+		`SELECT k, min(v), max(v), max(w) FROM t GROUP BY k ORDER BY k`,
+		`SELECT count(*) FROM t WHERE v > 0 OR k = 3`,
+		`SELECT count(*) FROM t WHERE k IN (1, 4, 9)`,
+		`SELECT sum(v) FROM t WHERE k IN (2, 5) OR w < 100`,
+		`SELECT min(v), max(w) FROM t WHERE k <> 4`,
+		`SELECT avg(v) FROM t WHERE v > 500 OR k = 1`,
+	}
+	defer func(n int) { segWorkers = n }(segWorkers)
+	for _, q := range queries {
+		want := fmt.Sprint(typedRows(p.mustPlain(q)))
+		for _, n := range []int{1, 4} {
+			segWorkers = n
+			if got := fmt.Sprint(typedRows(p.mustFast(q))); got != want {
+				t.Errorf("workers=%d %s:\n fast  %.300s\n plain %.300s", n, q, got, want)
+			}
+		}
+	}
+}

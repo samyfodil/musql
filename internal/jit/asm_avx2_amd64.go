@@ -76,6 +76,11 @@ func (a *Asm) VpsubqYmm(dst, src1, src2 Reg) {
 	a.vinst(0xFB, dst, src1, src2, vexMap0F, 0, 1, vexP66, false)
 }
 
+// VpaddqYmm is dst = src1 + src2, four int64 lanes (VPADDQ).
+func (a *Asm) VpaddqYmm(dst, src1, src2 Reg) {
+	a.vinst(0xD4, dst, src1, src2, vexMap0F, 0, 1, vexP66, false)
+}
+
 // VpxorYmm is  dst = src1 XOR src2, used as dst = 0.
 func (a *Asm) VpxorYmm(dst, src1, src2 Reg) {
 	a.vinst(0xEF, dst, src1, src2, vexMap0F, 0, 1, vexP66, false)

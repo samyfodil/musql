@@ -1,7 +1,9 @@
 package engine
 
 import (
+	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/samyfodil/musql/internal/jit"
 )
@@ -104,12 +106,20 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, rootPage uint32, low *segLowered, ipk
 		regs[reg] = v.I
 	}
 
-	var total int64
-	matched := int64(0)
-	for _, s := range segs {
+	// Each segment runs on its own copy of the register file (on its own
+	// goroutine under WithWorkers); the results are then combined in segment
+	// order, exactly as a single pass combines them.
+	type segResult struct {
+		out, rows int64
+		ovf       bool
+		empty     bool
+	}
+	results := make([]segResult, len(segs))
+	ok = segEach(len(segs), func(si int) bool {
+		s, res := segs[si], &results[si]
 		blocks, isRowid, okCols := segProgColumns(s, low.cols, low.nullCol, ipkCol)
 		if !okCols {
-			return Value{}, false
+			return false
 		}
 		// A rowid-alias column has no block of its own -- the values live in
 		// the segment's rowid block -- and the program reads a flat int64
@@ -126,22 +136,46 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, rootPage uint32, low *segLowered, ipk
 			blocks[i] = buf
 		}
 		if s.nRows == 0 {
-			continue
+			res.empty = true
+			return true
 		}
+		// min()/max() of a whole column, with no predicate: the zone map
+		// already holds the segment's extreme, so no row is read.
+		if extreme, ok := segZoneExtreme(s, low); ok {
+			res.out, res.rows = extreme, int64(s.nRows)
+			return true
+		}
+		local := slices.Clone(regs)
 		var out, ovf int64
-		args := &jit.ProgArgs{N: int64(s.nRows), Regs: &regs[0], Out: &out, Overflow: &ovf}
+		args := &jit.ProgArgs{N: int64(s.nRows), Regs: &local[0], Out: &out, Overflow: &ovf}
 		for i, b := range blocks {
 			if len(b) < s.nRows {
-				return Value{}, false
+				return false
 			}
 			args.Col[i] = &b[0]
 		}
 		kern.Call2(args)
-		if ovf != 0 {
+		res.out, res.ovf = out, ovf != 0
+		if low.agg != aggCountStar && low.agg != aggCount {
+			res.rows = local[low.rowsReg]
+		}
+		return true
+	})
+	if !ok {
+		return Value{}, false
+	}
+	var total int64
+	matched := int64(0)
+	for _, res := range results {
+		if res.empty {
+			continue
+		}
+		if res.ovf {
 			// sum() overflowed int64. SQLite switches to floating point there
 			// and this cannot, so the whole statement goes back to the loop.
 			return Value{}, false
 		}
+		out := res.out
 		switch low.agg {
 		case aggCountStar, aggCount:
 			total += out
@@ -150,24 +184,21 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, rootPage uint32, low *segLowered, ipk
 			// Combine ACROSS segments: each call answered over its own rows and
 			// started from its own seed, so a segment that matched nothing must
 			// not vote.
-			n := regs[low.rowsReg]
-			regs[low.rowsReg] = 0
-			if n == 0 {
+			if res.rows == 0 {
 				continue
 			}
 			if matched == 0 || (low.agg == aggMin && out < total) ||
 				(low.agg == aggMax && out > total) {
 				total = out
 			}
-			matched += n
+			matched += res.rows
 		default:
 			sum := total + out
 			if (out > 0 && sum < total) || (out < 0 && sum > total) {
 				return Value{}, false
 			}
 			total = sum
-			matched += regs[low.rowsReg]
-			regs[low.rowsReg] = 0
+			matched += res.rows
 		}
 	}
 	// func.c's finalizers, for the all-integer non-NULL case this path is the
@@ -196,4 +227,43 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, rootPage uint32, low *segLowered, ipk
 		return Value{Typ: Float, F: float64(total)}, true
 	}
 	return Value{Typ: Int, I: total}, true
+}
+
+// segZoneExtremeHits counts segments answered from a zone map, for tests.
+var segZoneExtremeHits atomic.Int64
+
+// segZoneExtreme answers a predicate-free min(col) or max(col) over one segment
+// from its zone map. The body must hold nothing but loads of its one column and
+// copies between registers, with no bound parameters, so every register it
+// writes -- the accumulated one included -- holds that column's value.
+func segZoneExtreme(s *segment, low *segLowered) (int64, bool) {
+	n := len(low.insns)
+	if (low.agg != aggMin && low.agg != aggMax) || len(low.cols) != 1 || low.nullCol[0] ||
+		len(low.consts) != 0 || n < 2 {
+		return 0, false
+	}
+	holds := map[int]bool{} // registers holding the column's value
+	for _, in := range low.insns[:n-1] {
+		switch {
+		case in.Op == jit.POpLoadCol && in.B == 0:
+			holds[in.A] = true
+		case in.Op == jit.POpLoadReg && holds[in.B]:
+			holds[in.A] = true
+		default:
+			return 0, false
+		}
+	}
+	acc := low.insns[n-1]
+	if (acc.Op != jit.POpAccMin && acc.Op != jit.POpAccMax) || !holds[acc.A] {
+		return 0, false
+	}
+	z, ok := s.intZones(low.cols[0])
+	if !ok {
+		return 0, false
+	}
+	segZoneExtremeHits.Add(1)
+	if low.agg == aggMin {
+		return z.min, true
+	}
+	return z.max, true
 }

@@ -18,7 +18,7 @@ var segProgShapes = []string{
 	`SELECT count(*) FROM t WHERE v + 1 > 10`,
 	`SELECT count(*) FROM t WHERE v * 2 < k`,
 	`SELECT count(*) FROM t WHERE v - k > 0`,
-	`SELECT count(*) FROM t WHERE v BETWEEN -50 AND 50`,
+	`SELECT count(*) FROM t WHERE v BETWEEN k - 50 AND 50`, // literal BETWEEN is the count kernel's now (segment_between_test.go)
 	`SELECT count(*) FROM t WHERE v > 10 OR k = 0`,
 	`SELECT count(*) FROM t WHERE v > 10 AND k <> 3 AND v < 100`,
 	`SELECT sum(v) FROM t WHERE k IN (2,4)`,

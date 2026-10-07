@@ -209,19 +209,19 @@ func TestBenchColumnarVsC(t *testing.T) {
 		// min()/max(): the GROUP BY driver declines them outright, because the
 		// anchor reads the gathered row.
 		{"min/max whole table", "SELECT min(v), max(v) FROM t",
-			func(rng *rand.Rand) []any { return nil }, false},
+			func(rng *rand.Rand) []any { return nil }, true},
 		{"grouped min/max", "SELECT k, min(v), max(v) FROM t GROUP BY k ORDER BY k",
-			func(rng *rand.Rand) []any { return nil }, false},
+			func(rng *rand.Rand) []any { return nil }, true},
 		// HAVING, which the GROUP BY driver also declines.
 		{"GROUP BY with HAVING", "SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > ? ORDER BY k",
 			func(rng *rand.Rand) []any { return []any{5000 + rng.Intn(100)} }, false},
 		// Predicate shapes the recogniser does not model.
 		{"OR predicate", "SELECT count(*) FROM t WHERE v > ? OR k = ?",
-			func(rng *rand.Rand) []any { return []any{rng.Intn(1_000_000), rng.Intn(10)} }, false},
+			func(rng *rand.Rand) []any { return []any{rng.Intn(1_000_000), rng.Intn(10)} }, true},
 		{"BETWEEN range", "SELECT count(*) FROM t WHERE v BETWEEN ? AND ?",
-			func(rng *rand.Rand) []any { n := rng.Intn(500_000); return []any{n, n + 250_000} }, false},
+			func(rng *rand.Rand) []any { n := rng.Intn(500_000); return []any{n, n + 250_000} }, true},
 		{"IN list", "SELECT count(*) FROM t WHERE k IN (1,3,5,7)",
-			func(rng *rand.Rand) []any { return nil }, false},
+			func(rng *rand.Rand) []any { return nil }, true},
 		{"IS NULL scan", "SELECT count(*) FROM t WHERE payload IS NULL",
 			func(rng *rand.Rand) []any { return nil }, false},
 		// TEXT: ordering, matching and aggregation, none of it columnar.

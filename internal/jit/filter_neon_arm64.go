@@ -94,3 +94,88 @@ func emitLaneCmp(a *Arm, dst, src, bound VReg, cond Cond) {
 		a.NotV(dst, dst)
 	}
 }
+
+// EmitFilterSumSIMD is EmitFilterCountSIMD summing the V column over the rows
+// that match: Out gets the sum, Out2 the count. Each lane's mask is ANDed with
+// the values before the add. The count accumulator lives in V16, outside the
+// V0-V7 the count kernel uses: V16-V31 are as caller-saved as V0-V7 under
+// AAPCS. No overflow detection; see the amd64 twin.
+func EmitFilterSumSIMD(condA Cond, two bool, condC Cond) ([]byte, error) {
+	a := NewArm()
+
+	// V1 = xa, V2 = xc, V0 = sum, V16 = count.
+	a.LdrImm(X1, X0, OffA)
+	a.LdrImm(X10, X0, OffV)
+	a.LdrImm(X3, X0, OffN)
+	a.LdrImm(X4, X0, OffXA)
+	if two {
+		a.LdrImm(X2, X0, OffC)
+		a.LdrImm(X5, X0, OffXC)
+	}
+	a.MovImm16(X6, 0)
+	a.MovImm16(X11, 0)
+	a.Dup(1, X4)
+	if two {
+		a.Dup(2, X5)
+	}
+	a.EorV(0, 0, 0)
+	a.EorV(16, 16, 16)
+
+	a.LsrImm(X7, X3, 1)
+	a.AndImmLow(X3, X3, 1)
+	a.Cbz(X7, "tail")
+
+	a.Label("block")
+	a.LdrQPost(3, X1, 16)
+	emitLaneCmp(a, 4, 3, 1, condA)
+	mask := VReg(4)
+	if two {
+		a.LdrQPost(5, X2, 16)
+		emitLaneCmp(a, 6, 5, 2, condC)
+		a.AndV(7, 4, 6)
+		mask = 7
+	}
+	a.LdrQPost(3, X10, 16)
+	a.AndV(3, 3, mask)
+	a.AddV(0, 0, 3)
+	a.SubV(16, 16, mask) // += 1 per hit
+	a.SubsImm(X7, X7, 1)
+	a.Bcond(CondNE, "block")
+
+	a.UmovD(X8, 0, 0)
+	a.AddReg(X6, X6, X8)
+	a.UmovD(X8, 0, 1)
+	a.AddReg(X6, X6, X8)
+	a.UmovD(X8, 16, 0)
+	a.AddReg(X11, X11, X8)
+	a.UmovD(X8, 16, 1)
+	a.AddReg(X11, X11, X8)
+
+	a.Label("tail")
+	a.Cbz(X3, "done")
+	a.Label("tailloop")
+	a.LdrPost(X8, X1, 8)
+	a.LdrPost(X9, X10, 8)
+	cond := condA
+	if two {
+		a.LdrPost(X12, X2, 8)
+		a.Cmp(X8, X4)
+		a.Ccmp(X12, X5, nzcvFalseFor(condC), condA)
+		cond = condC
+	} else {
+		a.Cmp(X8, X4)
+	}
+	a.Csel(X9, X9, xzr, cond) // the value, or zero when the row fails
+	a.AddReg(X6, X6, X9)
+	a.Cinc(X11, X11, cond)
+	a.SubsImm(X3, X3, 1)
+	a.Bcond(CondNE, "tailloop")
+
+	a.Label("done")
+	a.LdrImm(X8, X0, OffOut)
+	a.StrImm(X6, X8, 0)
+	a.LdrImm(X8, X0, OffOut2)
+	a.StrImm(X11, X8, 0)
+	a.Ret()
+	return a.Code()
+}

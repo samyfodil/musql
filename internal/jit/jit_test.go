@@ -22,6 +22,8 @@ func TestArgsLayout(t *testing.T) {
 		{"XA", unsafe.Offsetof(a.XA), OffXA},
 		{"XC", unsafe.Offsetof(a.XC), OffXC},
 		{"Out", unsafe.Offsetof(a.Out), OffOut},
+		{"V", unsafe.Offsetof(a.V), OffV},
+		{"Out2", unsafe.Offsetof(a.Out2), OffOut2},
 	} {
 		if c.got != c.want {
 			t.Errorf("Args.%s is at %d, generated code reads %d", c.name, c.got, c.want)
