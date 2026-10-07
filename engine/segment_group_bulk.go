@@ -346,14 +346,24 @@ func segGroupDenseFlat(s *segment, argCols []int, keys []int64, args [][]int64,
 			mins[a], maxs[a] = mn, mx
 		}
 	}
+	// Every group's per-column slices are carved from two shared arrays rather
+	// than four allocations per group.
+	groups := 0
+	for i := range width {
+		if n[i] != 0 {
+			groups++
+		}
+	}
+	ints := make([]int64, 3*na*groups)
+	uints := make([]uint64, na*groups)
 	for i := range width {
 		if n[i] == 0 {
 			continue
 		}
 		g := &slots[i]
 		g.n, g.lastSeg, g.lastRow = n[i], si, int(last[i])
-		g.sums, g.abs = make([]int64, na), make([]uint64, na)
-		g.mins, g.maxs = make([]int64, na), make([]int64, na)
+		g.sums, g.mins, g.maxs, ints = ints[:na:na], ints[na:2*na:2*na], ints[2*na:3*na:3*na], ints[3*na:]
+		g.abs, uints = uints[:na:na], uints[na:]
 		for a := range na {
 			g.mins[a], g.maxs[a] = math.MaxInt64, math.MinInt64
 			if sums[a] != nil {

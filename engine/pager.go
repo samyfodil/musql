@@ -273,8 +273,8 @@ type ReadOnlyPager struct {
 	writableSchema bool
 
 	// schemaCorrupt is the session's shared, cookie-keyed verdict for
-	// schemaLoadCorruptRefuses. nil for a pager no session stamped, which simply
-	// means the check runs uncached. See DB.schemaCorrupt.
+	// schemaLoadCorruptRefuses. A pager no session stamped gets a private one on
+	// first use. See DB.schemaCorrupt.
 	schemaCorrupt *schemaCorruptVerdict
 	// schemaCorruptGen is the session's commit generation at the moment this pager
 	// was built -- the second half of that cache's key.

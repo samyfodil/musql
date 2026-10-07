@@ -114,6 +114,7 @@ func (p *ReadOnlyPager) segOrderLimitTable(rootPage uint32, plan *segOrderPlan, 
 		}
 	}
 	heap := make([]segOrderEntry, 0, plan.limit)
+	scratchKey := make([]int64, len(plan.keyCols))
 	seq := 0
 	for si, s := range segs {
 		skip, sk := skips[si], 0
@@ -176,12 +177,11 @@ func (p *ReadOnlyPager) segOrderLimitTable(rootPage uint32, plan *segOrderPlan, 
 				sk++
 				continue
 			}
-			cand := segOrderEntry{seq: seq}
+			cand := segOrderEntry{seq: seq, key: scratchKey}
 			seq++
-			// Build the key first and test it before touching the output
-			// columns, which is loses()'s saving: a row that cannot make the
-			// cut costs one comparison.
-			cand.key = make([]int64, len(keyCols))
+			// Build the key first, in a reused buffer, and test it before
+			// touching the output columns, which is loses()'s saving: a row
+			// that cannot make the cut costs one comparison and no allocation.
 			for i := range keyCols {
 				if keyIsRowid[i] {
 					cand.key[i] = int64(s.Rowid(r))
@@ -195,7 +195,14 @@ func (p *ReadOnlyPager) segOrderLimitTable(rootPage uint32, plan *segOrderPlan, 
 			if len(heap) == plan.limit && !segOrderBefore(plan, cand, heap[0]) {
 				continue
 			}
-			cand.out = make([]int64, len(outCols))
+			// A full heap evicts its root: its slices become this entry's.
+			if len(heap) == plan.limit {
+				cand.key, cand.out = heap[0].key, heap[0].out
+				copy(cand.key, scratchKey)
+			} else {
+				cand.key = append([]int64(nil), scratchKey...)
+				cand.out = make([]int64, len(outCols))
+			}
 			for i := range outCols {
 				if outIsRowid[i] {
 					cand.out[i] = int64(s.Rowid(r))

@@ -305,6 +305,13 @@ func (p *ReadOnlyPager) schemaLoadCorruptRefuses(sqlText string) error {
 	if verb, ok := LeadingStatementVerb(sqlText); ok && strings.EqualFold(verb, "PRAGMA") {
 		return nil
 	}
+	// A pager no session stamped keeps a verdict of its own. Uncached, every
+	// statement re-read and copied the whole catalog -- about 120 KB per query
+	// through the direct engine path, a rowid lookup included. The key is the
+	// same schema cookie C's sqlite3ReadSchema re-reads on.
+	if p.schemaCorrupt == nil {
+		p.schemaCorrupt = &schemaCorruptVerdict{}
+	}
 	if c := p.schemaCorrupt; c != nil && c.valid &&
 		c.cookie == p.meta.schemaCookie && c.gen == p.schemaCorruptGen {
 		if !c.bad {

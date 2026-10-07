@@ -35,6 +35,9 @@ type Session struct {
 	*DB
 	src     *ReadOnlyPager // the segment read side: schema, segments, delta
 	segPath string
+	// deltaPath is segDeltaPath(deltaFor), kept so the per-statement staleness
+	// check (pairStamp) does not build the string every time.
+	deltaPath, deltaFor string
 
 	baseCtr, basePages uint32 // the segment file's identity, for pairing
 	endCtr, endPages   uint32 // the state the pair is at, which each commit moves
@@ -951,7 +954,7 @@ func (db *DB) segmentPager(freeze bool) (*ReadOnlyPager, error) {
 // not the other would make an UPDATE of sqlite_schema edit a row no reader can
 // see, or miss one it can.
 func (db *DB) segmentSchemaRows() []SchemaRow {
-	var rows []SchemaRow
+	rows := make([]SchemaRow, 0, len(db.tables)+len(db.indexes)+len(db.views)+len(db.triggers)+len(db.vtabs))
 	for _, t := range db.tables {
 		// TEMP tables INCLUDED, unlike the file rewrite which must exclude them:
 		// a temp table is session-private and never persisted, but it is very much
@@ -1329,7 +1332,10 @@ func stampOf(path string) fileStamp {
 
 // pairStamp is the segment file's stamp and its delta's.
 func (n *Session) pairStamp() [2]fileStamp {
-	return [2]fileStamp{stampOf(n.segPath), stampOf(segDeltaPath(n.segPath))}
+	if n.deltaFor != n.segPath || n.deltaPath == "" {
+		n.deltaPath, n.deltaFor = segDeltaPath(n.segPath), n.segPath
+	}
+	return [2]fileStamp{stampOf(n.segPath), stampOf(n.deltaPath)}
 }
 
 // RefreshIfStale rebuilds this session when the file it is reading has moved

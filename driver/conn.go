@@ -28,6 +28,11 @@ import (
 // file gets a held session of its own (ndbs, sessionFor).
 type Conn struct {
 	path string
+	// paramInfo caches engine.ParseParamInfo by SQL text. database/sql prepares
+	// on every QueryRow, and parsing just to count parameters was a fifth of a
+	// point lookup's time. The result depends on the text alone and is only
+	// read afterwards, so it is shared; the cache is dropped when it fills.
+	paramInfo map[string]engine.ParamInfo
 	tx   *engine.DB // non-nil while a transaction (BeginTx) is open on this Conn
 
 	// ndb is this connection's HELD segment session -- one for the connection's
@@ -432,7 +437,16 @@ func (c *Conn) prepareContextImpl(ctx context.Context, query string) (driver.Stm
 			}
 		}
 	}
-	info, err := engine.ParseParamInfo(query)
+	info, cached := c.paramInfo[query]
+	var err error
+	if !cached {
+		if info, err = engine.ParseParamInfo(query); err == nil {
+			if c.paramInfo == nil || len(c.paramInfo) >= 256 {
+				c.paramInfo = make(map[string]engine.ParamInfo, 32)
+			}
+			c.paramInfo[query] = info
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
