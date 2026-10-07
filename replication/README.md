@@ -14,7 +14,7 @@ Conflicts resolve per column by last-writer-wins on a hybrid logical clock. See
 import "github.com/samyfodil/musql/replication"
 
 // newTransport builds your network's replication.Transport (examples/libp2p has one).
-db, err := replication.Open(ctx, "app.db", replication.CRDT(), replication.WithTransport(newTransport))
+db, err := replication.Open(ctx, "app.musq", replication.CRDT(), replication.WithTransport(newTransport))
 if err != nil { ... }
 defer db.Close()
 
@@ -119,7 +119,7 @@ tables is refused.
 q := replication.NewQuorum(func(ctx context.Context, entry []byte) error {
     return r.Apply(entry, 5*time.Second).Error() // hashicorp/raft: committed and applied here
 })
-db, err := replication.Open(ctx, "app.db", replication.Leader(isLeader, q))
+db, err := replication.Open(ctx, "app.musq", replication.Leader(isLeader, q))
 // in the raft FSM: func (f *fsm) Apply(l *raft.Log) any { return q.Apply(ctx, l.Data) }
 ```
 

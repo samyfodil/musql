@@ -15,7 +15,7 @@ import (
 
 host, _ := libp2p.New() // + however your app discovers and connects peers
 
-db, err := replication.Open(ctx, "app.db", replication.CRDT(), repllibp2p.Sync(host, "my-app"))
+db, err := replication.Open(ctx, "app.musq", replication.CRDT(), repllibp2p.Sync(host, "my-app"))
 ```
 
 `Sync` starts a pubsub router of its own; a host that carries several

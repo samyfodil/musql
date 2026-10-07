@@ -22,7 +22,7 @@ import (
 // or Leader(isWriter) -- and every node of one database must run the same one:
 // the first recorded wins, and Open refuses another.
 //
-//	db, err := replication.Open(ctx, "app.db", replication.CRDT(), replication.WithTransport(newTransport))
+//	db, err := replication.Open(ctx, "app.musq", replication.CRDT(), replication.WithTransport(newTransport))
 //	defer db.Close()
 //
 // The node's site id is generated on first open and kept in the database
