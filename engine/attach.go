@@ -712,7 +712,7 @@ func (db *DB) execAttach(trimmed string) error {
 		// session sees it, nothing else can name it, DETACH throws it away --
 		// while reusing the ordinary file machinery. Mirrors driver's own
 		// ':memory:' attachment (driver/attach.go).
-		f, ferr := os.CreateTemp("", "musql-attach-mem-*.db")
+		f, ferr := os.CreateTemp("", "musql-attach-mem-*.musq")
 		if ferr != nil {
 			return fmt.Errorf("engine: ATTACH ':memory:': %w", ferr)
 		}

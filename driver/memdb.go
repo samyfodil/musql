@@ -59,7 +59,7 @@ func memBacking(dsn string) (path string, private bool, shared string, ok bool) 
 	if name != "" && strings.EqualFold(v.Get("cache"), "shared") {
 		return sharedMemPath(name), false, name, true
 	}
-	f, err := os.CreateTemp("", "musql-mem-*.db")
+	f, err := os.CreateTemp("", "musql-mem-*.musq")
 	if err != nil {
 		// Nothing sensible to fall back to; let the caller open the literal
 		// path and report the real error from there.

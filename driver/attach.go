@@ -113,7 +113,7 @@ func (c *Conn) attach(name, path string) error {
 		// behavior (this connection sees its own writes; no other connection
 		// ever opens this path) while reusing the ordinary file machinery; it
 		// is removed on DETACH / Conn.Close.
-		f, err := os.CreateTemp("", "musql-attach-mem-*.db")
+		f, err := os.CreateTemp("", "musql-attach-mem-*.musq")
 		if err != nil {
 			return fmt.Errorf("driver: ATTACH ':memory:': %w", err)
 		}

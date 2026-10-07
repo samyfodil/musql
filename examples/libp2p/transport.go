@@ -390,7 +390,7 @@ func (t *Transport) readGossip(ctx context.Context) {
 // the ones that were away. It starts a gossipsub router of its own on h, which
 // db.Close stops; a host that runs one already needs SyncWith.
 //
-//	db, err := replication.Open(ctx, "app.db", replication.CRDT(), repllibp2p.Sync(host, "my-app"))
+//	db, err := replication.Open(ctx, "app.musq", replication.CRDT(), repllibp2p.Sync(host, "my-app"))
 func Sync(h host.Host, topic string) replication.Option { return SyncWith(h, nil, topic) }
 
 // SyncWith is Sync over the application's own pubsub router ps, which is how

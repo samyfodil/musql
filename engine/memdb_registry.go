@@ -69,7 +69,7 @@ func memdbAcquire(name string) (path string, err error) {
 		s.refCount++
 		return s.path, nil
 	}
-	f, ferr := os.CreateTemp("", "musql-memdb-*.db")
+	f, ferr := os.CreateTemp("", "musql-memdb-*.musq")
 	if ferr != nil {
 		return "", fmt.Errorf("engine: ATTACH vfs=memdb: %w", ferr)
 	}

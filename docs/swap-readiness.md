@@ -87,7 +87,7 @@ that type fails against the default.
 `auto` for `time.Local`) places the result, as mattn's own `_loc` does:
 
 ```go
-db, _ := sql.Open("sqlite", "app.db?_time_decltype=1&_loc=auto")
+db, _ := sql.Open("sqlite", "app.musq?_time_decltype=1&_loc=auto")
 ```
 
 "Exactly" is the claim the gate makes, including the parts that surprise —
