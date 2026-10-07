@@ -32,6 +32,9 @@ The engine runs a program two ways only: the VDBE, or the JIT-compiled VDBE.
   engine runs, no per-operator-combination loops.
 - No checked-in `.s` files except the JIT trampoline, one per architecture
   (`internal/jit/trampoline_*.s`).
+  On js/wasm the "trampoline" is the `musqljit.call_kernel` import (with
+  `compile_kernel`) plus a few lines of JS glue, `examples/wasm/musqljit.js`:
+  kernels are wasm modules emitted by `internal/jit` like any other.
 - Specialising a query shape is the JIT's job (`internal/jit`). It is reached by
   a peephole over the compiled program (`engine/segment_peephole.go`), never by
   a branch in the compiler. The peephole leaves anything it does not recognise

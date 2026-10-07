@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>musql in the browser</title>
+<style>
+	:root { --bg: #fff; --fg: #1a1a1a; --muted: #666; --line: #ddd; --accent: #0b6e4f; }
+	@media (prefers-color-scheme: dark) { :root { --bg: #141414; --fg: #e8e8e8; --muted: #999; --line: #333; --accent: #4cc38a; } }
+	body { background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 980px; padding: 24px 16px; }
+	h1 { font-size: 22px; margin: 0 0 4px; }
+	p, #status { color: var(--muted); }
+	button, input { font: inherit; padding: 6px 12px; }
+	.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 12px 0; }
+	table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+	th, td { border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: right; }
+	th:first-child, td:first-child { text-align: left; }
+	td.win { color: var(--accent); font-weight: 600; }
+	.wrap { overflow-x: auto; }
+	textarea { width: 100%; box-sizing: border-box; font: 13px ui-monospace, monospace; }
+	pre { font: 13px ui-monospace, monospace; overflow-x: auto; }
+</style>
+</head>
+<body>
+<h1>musql in the browser</h1>
+<p>Each mode runs in its own Web Worker and wasm instance, because the plan cache keeps the plan a query's first run compiled.
+<b>vdbe</b> is the plain VDBE (<code>WithoutJIT</code>), <b>go</b> keeps the columnar paths with Go's own loops (the host declines every kernel), and <b>jit</b> runs the wasm kernels.</p>
+<div class="row">
+	<label>rows <input id="rows" type="number" value="100000" min="1000" step="1000"></label>
+	<button id="run">Seed and benchmark</button>
+	<label>or load a .musq <input id="file" type="file" accept=".musq"></label>
+</div>
+<div id="status">starting…</div>
+<div class="wrap"><table id="out" hidden><thead><tr><th>query</th><th>vdbe µs</th><th>go µs</th><th>jit µs</th><th>vdbe/jit</th><th>go/jit</th></tr></thead><tbody></tbody></table></div>
+<h2>Query</h2>
+<textarea id="sql" rows="3">SELECT k, count(*), sum(v) FROM t WHERE v > 500000 GROUP BY k ORDER BY k</textarea>
+<div class="row"><button id="q">Run in the jit worker</button></div>
+<pre id="qout"></pre>
+<script>
+const status = (s) => { document.getElementById("status").textContent = s; };
+let seq = 0;
+function spawn(mode) {
+	const w = new Worker(`worker.js?mode=${mode}`);
+	const pending = new Map();
+	const ready = new Promise((resolve, reject) => {
+		w.onmessage = ({ data }) => {
+			if (data.ready) return resolve(data);
+			if (data.error && data.id === undefined) return reject(new Error(data.error));
+			const p = pending.get(data.id);
+			pending.delete(data.id);
+			data.error ? p.reject(new Error(data.error)) : p.resolve(data.result);
+		};
+	});
+	const call = (op, ...args) => new Promise((resolve, reject) => {
+		const id = ++seq;
+		pending.set(id, { resolve, reject });
+		w.postMessage({ id, op, args });
+	});
+	return { mode, ready, call };
+}
+const modes = ["vdbe", "go", "jit"];
+let workers = Object.fromEntries(modes.map((m) => [m, spawn(m)]));
+Promise.all(modes.map((m) => workers[m].ready)).then((r) => {
+	status(`ready · kernels compile: ${r[2].vector ? "SIMD128" : "scalar"} · ${navigator.userAgent}`);
+	window.musqlReady = true;
+}, (e) => status("failed: " + e.message));
+
+async function benchAll(bytes) {
+	const out = document.getElementById("out"), body = out.tBodies[0];
+	body.innerHTML = "";
+	for (const m of modes) await workers[m].call("load", bytes);
+	const res = {};
+	for (const m of modes) {
+		status(`benchmarking ${m}…`);
+		res[m] = await workers[m].call("bench");
+	}
+	const rows = res.vdbe.map((r, i) => ({ name: r.name, sql: r.sql, vdbe: r.us, go: res.go[i].us, jit: res.jit[i].us }));
+	for (const r of rows) {
+		const tr = body.insertRow();
+		tr.title = r.sql;
+		const best = Math.min(r.vdbe, r.go, r.jit);
+		tr.insertCell().textContent = r.name;
+		for (const m of modes) {
+			const td = tr.insertCell();
+			td.textContent = r[m].toFixed(1);
+			if (r[m] === best) td.className = "win";
+		}
+		tr.insertCell().textContent = (r.vdbe / r.jit).toFixed(2) + "×";
+		tr.insertCell().textContent = (r.go / r.jit).toFixed(2) + "×";
+	}
+	out.hidden = false;
+	window.musqlResults = rows;
+	status("done");
+}
+
+document.getElementById("run").onclick = async () => {
+	try {
+		const n = Number(document.getElementById("rows").value);
+		status(`seeding ${n} rows…`);
+		status(await workers.jit.call("seed", n));
+		await benchAll(await workers.jit.call("save"));
+	} catch (e) { status("failed: " + e.message); }
+};
+document.getElementById("file").onchange = async (ev) => {
+	try { await benchAll(new Uint8Array(await ev.target.files[0].arrayBuffer())); }
+	catch (e) { status("failed: " + e.message); }
+};
+document.getElementById("q").onclick = async () => {
+	try {
+		const r = await workers.jit.call("query", document.getElementById("sql").value);
+		document.getElementById("qout").textContent =
+			[r.columns.join("\t"), ...r.rows.map((x) => x.join("\t"))].join("\n") + `\n\n${r.ms} ms`;
+	} catch (e) { document.getElementById("qout").textContent = e.message; }
+};
+</script>
+</body>
+</html>
