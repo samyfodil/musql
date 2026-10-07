@@ -84,6 +84,41 @@ The scan multiples hold or grow with ten times the rows.
 the amd64 machine; it has not been investigated, so it is left out of any
 summary.
 
+## Against DuckDB
+
+DuckDB is an analytical engine: columnar, vectorized, and multithreaded by
+default. It is not SQLite-compatible, so it is a yardstick for musql's columnar
+paths, not a replacement. The harness times it on the same data and bind values,
+once on one thread and once with its default thread count, and checks its
+answers against C SQLite by value.
+
+musql runs single-threaded by default, as SQLite does. `engine.WithWorkers(n)`
+lets its columnar kernels, GROUP BY and compiled predicates split a table's
+segments (64k rows each) across n goroutines.
+
+**1,000,000 rows, Intel Xeon D-2123IT** (amd64, 8 cores)
+
+| Query | musql, 1 worker | musql, 4 workers | DuckDB, 1 thread | DuckDB, default | C native |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Filtered count, one predicate | 458 µs | **166 µs** | 3.36 ms | 2.00 ms | 61.9 ms |
+| Filtered count, two predicates | 1.14 ms | **501 µs** | 4.89 ms | 2.52 ms | 71.3 ms |
+| Sum over a filter | 652 µs | **232 µs** | 4.34 ms | 2.27 ms | 67.6 ms |
+| Grouped aggregate | 4.57 ms | **3.13 ms** | 8.43 ms | 3.59 ms | 424 ms |
+| `ORDER BY v DESC LIMIT 20` | 597 µs | **573 µs** | 6.06 ms | 3.08 ms | 87.2 ms |
+| `BETWEEN` range | 779 µs | **278 µs** | 4.51 ms | 2.26 ms | 66.6 ms |
+| `min`/`max` whole table | **28 µs** | 60 µs | 4.64 ms | 2.11 ms | 90.5 ms |
+| Grouped `min`/`max` | 10.6 ms | 4.83 ms | 8.91 ms | **3.78 ms** | 448 ms |
+| `OR` predicate | 7.43 ms | **2.56 ms** | 19.2 ms | 7.11 ms | 69.8 ms |
+| `IN` list | 16.3 ms | **5.58 ms** | 24.0 ms | 7.45 ms | 114 ms |
+| Rowid lookup | 15 µs | 15 µs | 353 µs | 510 µs | **14.4 µs** |
+
+On one thread each, musql is ahead of DuckDB on every row except grouped
+`min`/`max` (1.2× behind). With four workers it is ahead of DuckDB's default
+multithreaded mode on every row but that one, where DuckDB leads by 1.3×.
+Point lookups are DuckDB's weak spot and C SQLite's strength.
+
+Run with `MUSQL_WORKERS=4` for the four-worker column.
+
 ## Notes
 
 - The Go bridge costs C SQLite microseconds per statement: point lookups take
@@ -105,7 +140,8 @@ BENCH_SKIP='min/max,GROUP BY with HAVING,OR predicate,BETWEEN,IN list,IS NULL,LI
   go test -run '^TestBenchColumnarVsC$' -count=1 -v -timeout 2h .
 ```
 
-`BENCH_ROWS` sets the table size (default 100,000). Without `BENCH_SKIP` the
+`BENCH_ROWS` sets the table size (default 100,000), and `MUSQL_WORKERS` the
+number of musql workers (default 1). Without `BENCH_SKIP` the
 harness measures every workload, which takes hours. `MUSQL_JIT=0` runs musql
 without the JIT; that run reports FAIL because the harness asserts the JIT
 served each JIT workload, but its timings are still valid.
