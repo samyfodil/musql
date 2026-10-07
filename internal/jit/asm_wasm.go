@@ -114,7 +114,10 @@ func (w *Wasm) StoreI64(off uint32) { w.op(opI64Store); w.memarg(3, off) }
 func (w *Wasm) Simd(sub uint32) { w.op(opSIMD); w.body = uleb(w.body, uint64(sub)) }
 
 // LoadV128 replaces the i32 address on the stack with the 16 bytes there.
-func (w *Wasm) LoadV128() { w.Simd(simdV128Load); w.memarg(3, 0) }
+func (w *Wasm) LoadV128() { w.LoadV128At(0) }
+
+// LoadV128At loads the 16 bytes at the stack address plus off.
+func (w *Wasm) LoadV128At(off uint32) { w.Simd(simdV128Load); w.memarg(3, off) }
 
 // ExtractLane pushes lane i of the i64x2 on the stack.
 func (w *Wasm) ExtractLane(i byte) { w.Simd(simdI64x2Extract); w.op(i) }

@@ -145,7 +145,7 @@ func (k *filterKernel) scalarLoop() {
 	w.op(opEnd, opEnd)
 }
 
-// vectorLoop handles two rows per iteration while at least two remain, the
+// vectorLoop handles four rows per iteration while at least four remain, the
 // way the NEON kernel does: a compare leaves each lane all-ones or zero, so
 // subtracting the mask counts hits and ANDing it with the values sums them.
 func (k *filterKernel) vectorLoop() {
@@ -163,45 +163,49 @@ func (k *filterKernel) vectorLoop() {
 	}
 	// v128 locals start zeroed, so vcnt and vacc need no init.
 
+	// Four rows per iteration, as two independent lane pairs, so the
+	// engine's compiled loop is not one serial chain of adds.
 	w.op(opBlock, opVoid, opLoop, opVoid)
-	// exit when a+16 > end
+	// exit when a+32 > end
 	w.Get(k.a)
-	w.I32(16)
+	w.I32(32)
 	w.op(opI32Add)
 	w.Get(k.end)
 	w.op(opI32GtU)
 	w.BrIf(1)
-
-	w.Get(k.a)
-	w.LoadV128()
-	w.Get(vxa)
-	w.Simd(laneCmp(k.condA))
-	if k.two {
-		w.Get(k.c)
-		w.LoadV128()
-		w.Get(vxc)
-		w.Simd(laneCmp(k.condC))
-		w.Simd(simdV128And)
-	}
-	w.Set(mask)
-	if k.sum {
-		w.Get(vacc)
-		w.Get(k.v)
-		w.LoadV128()
+	for _, off := range []uint32{0, 16} {
+		w.Get(k.a)
+		w.LoadV128At(off)
+		w.Get(vxa)
+		w.Simd(laneCmp(k.condA))
+		if k.two {
+			w.Get(k.c)
+			w.LoadV128At(off)
+			w.Get(vxc)
+			w.Simd(laneCmp(k.condC))
+			w.Simd(simdV128And)
+		}
+		w.Set(mask)
+		if k.sum {
+			w.Get(vacc)
+			w.Get(k.v)
+			w.LoadV128At(off)
+			w.Get(mask)
+			w.Simd(simdV128And)
+			w.Simd(simdI64x2Add)
+			w.Set(vacc)
+		}
+		w.Get(vcnt)
 		w.Get(mask)
-		w.Simd(simdV128And)
-		w.Simd(simdI64x2Add)
-		w.Set(vacc)
-		k.bump(k.v, 16)
+		w.Simd(simdI64x2Sub)
+		w.Set(vcnt)
 	}
-	w.Get(vcnt)
-	w.Get(mask)
-	w.Simd(simdI64x2Sub)
-	w.Set(vcnt)
-
-	k.bump(k.a, 16)
+	k.bump(k.a, 32)
 	if k.two {
-		k.bump(k.c, 16)
+		k.bump(k.c, 32)
+	}
+	if k.sum {
+		k.bump(k.v, 32)
 	}
 	w.Br(0)
 	w.op(opEnd, opEnd)
