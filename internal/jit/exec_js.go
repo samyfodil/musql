@@ -18,10 +18,16 @@ import (
 // host's decision, reported by Map.
 const Available = true
 
+// The host keeps no pointer past either call (compile_kernel copies the
+// module's bytes), so neither argument escapes: Args and the outputs it
+// points at stay on the caller's stack, as the native trampoline's do.
+//
 //go:wasmimport musqljit compile_kernel
+//go:noescape
 func compileKernel(p unsafe.Pointer, n int32) int32
 
 //go:wasmimport musqljit call_kernel
+//go:noescape
 func callKernel(slot int32, args unsafe.Pointer)
 
 // Code is a compiled kernel: its slot in the host's table.

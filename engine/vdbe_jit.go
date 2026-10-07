@@ -131,7 +131,7 @@ var (
 // so a run of copies and constants never pays, while one integer opcode, which
 // the VDBE spends several ns on, does once anything rides along with it. The
 // platform's figure is jit.VMMinWork: an entry on js/wasm crosses into the JS
-// host and back, about eight times the native cost.
+// host and back, which costs more than a native call.
 var vmJITMinWork = jit.VMMinWork
 
 // nativeRun weighs the native instructions from pc along the fall-through and

@@ -5,7 +5,11 @@ import (
 	"unsafe"
 )
 
+// The host reads path and writes out during the call and keeps neither, so
+// both stay on the stack: a stamp is two per statement.
+//
 //go:wasmimport musqljit stat_stamp
+//go:noescape
 func statStamp(path unsafe.Pointer, n int32, out unsafe.Pointer) int32
 
 // Of returns path's size and mtime in nanoseconds; ok is false when it
@@ -15,9 +19,8 @@ func Of(path string) (size, mtime int64, ok bool) {
 		return 0, 0, false
 	}
 	var out [2]int64
-	p := []byte(path)
-	r := statStamp(unsafe.Pointer(&p[0]), int32(len(p)), unsafe.Pointer(&out))
-	runtime.KeepAlive(p)
+	r := statStamp(unsafe.Pointer(unsafe.StringData(path)), int32(len(path)), unsafe.Pointer(&out))
+	runtime.KeepAlive(path)
 	if r == 0 {
 		return 0, 0, false
 	}
