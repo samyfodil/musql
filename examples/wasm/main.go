@@ -193,6 +193,15 @@ func main() {
 	api := js.Global().Get("Object").New()
 	api.Set("seed", async(func(a []js.Value) (any, error) { return seed(a[0].Int()) }))
 	api.Set("open", async(func(a []js.Value) (any, error) { return nil, open() }))
+	api.Set("loop", async(func(a []js.Value) (any, error) {
+		start := time.Now()
+		for range a[1].Int() {
+			if _, _, err := queryRows(a[0].String()); err != nil {
+				return nil, err
+			}
+		}
+		return float64(time.Since(start).Microseconds()) / float64(a[1].Int()), nil
+	}))
 	api.Set("bench", async(func(a []js.Value) (any, error) { return bench() }))
 	api.Set("vector", js.ValueOf(jit.HasVector()))
 	api.Set("query", async(func(a []js.Value) (any, error) {

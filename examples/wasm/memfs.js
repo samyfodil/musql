@@ -9,6 +9,10 @@
 	const nodes = new Map(); // normalized path -> node
 	const fds = new Map(); // fd -> { node, pos, flags }
 	let nextIno = 1, nextFd = 100;
+	// mtimes in ns, strictly increasing: the engine's change check compares
+	// size and mtime, so two writes in one millisecond must not share one.
+	let lastNs = 0n;
+	const nowNs = () => { const t = BigInt(Date.now()) * 1000000n; lastNs = t > lastNs ? t : lastNs + 1n; return lastNs; };
 
 	const fail = (code) => { const e = new Error(code); e.code = code; return e; };
 	const norm = (p) => {
@@ -20,14 +24,14 @@
 		return "/" + out.join("/");
 	};
 	const parent = (p) => p === "/" ? "/" : norm(p + "/..");
-	const mkdirNode = (p, mode) => nodes.set(p, { dir: true, ino: nextIno++, mode: S_IFDIR | (mode & 0o777), mtime: Date.now() });
+	const mkdirNode = (p, mode) => nodes.set(p, { dir: true, ino: nextIno++, mode: S_IFDIR | (mode & 0o777), mtime: nowNs() });
 	mkdirNode("/", 0o755);
 	mkdirNode("/tmp", 0o777);
 
 	const stat = (n) => ({
 		dev: 1, ino: n.ino, mode: n.mode, nlink: 1, uid: 0, gid: 0, rdev: 0,
 		size: n.dir ? 0 : n.size, blksize: 4096, blocks: n.dir ? 0 : Math.ceil(n.size / 512),
-		atimeMs: n.mtime, mtimeMs: n.mtime, ctimeMs: n.mtime,
+		atimeMs: Number(n.mtime / 1000000n), mtimeMs: Number(n.mtime / 1000000n), ctimeMs: Number(n.mtime / 1000000n),
 		isDirectory: () => !!n.dir,
 	});
 	const grow = (n, size) => {
@@ -41,7 +45,7 @@
 		grow(n, size);
 		if (size < n.size) n.data.fill(0, size, n.size);
 		n.size = size;
-		n.mtime = Date.now();
+		n.mtime = nowNs();
 	};
 	const lookup = (p) => { const n = nodes.get(norm(p)); if (!n) throw fail("ENOENT"); return n; };
 	const fdOf = (fd) => { const f = fds.get(fd); if (!f) throw fail("EBADF"); return f; };
@@ -64,7 +68,7 @@
 				const dir = nodes.get(parent(p));
 				if (!dir) throw fail("ENOENT");
 				if (!dir.dir) throw fail("ENOTDIR");
-				n = { ino: nextIno++, mode: S_IFREG | (mode & 0o777), data: new Uint8Array(0), size: 0, mtime: Date.now() };
+				n = { ino: nextIno++, mode: S_IFREG | (mode & 0o777), data: new Uint8Array(0), size: 0, mtime: nowNs() };
 				nodes.set(p, n);
 			}
 			if ((flags & O.O_DIRECTORY) && !n.dir) throw fail("ENOTDIR");
@@ -94,7 +98,7 @@
 			grow(n, at + len);
 			n.data.set(buf.subarray(off, off + len), at);
 			if (at + len > n.size) n.size = at + len;
-			n.mtime = Date.now();
+			n.mtime = nowNs();
 			if (pos === null || pos === undefined) f.pos = at + len;
 			return len;
 		}),
@@ -137,7 +141,7 @@
 			for (const [k] of moved) nodes.delete(k);
 			for (const [k, v] of moved) nodes.set(b + k.slice(a.length), v);
 		}),
-		utimes: cb((path, atime, mtime) => { lookup(path).mtime = mtime * 1000; }),
+		utimes: cb((path, atime, mtime) => { lookup(path).mtime = BigInt(Math.round(mtime * 1e9)); }),
 		chmod: cb((path, mode) => { const n = lookup(path); n.mode = (n.mode & ~0o777) | (mode & 0o777); }),
 		fchmod: cb((fd, mode) => { const n = fdOf(fd).node; n.mode = (n.mode & ~0o777) | (mode & 0o777); }),
 		chown: cb(() => {}), fchown: cb(() => {}), lchown: cb(() => {}),
@@ -158,8 +162,9 @@
 		// Synchronous helpers for the page's own use: put a file in, take one out.
 		writeFileSync(path, bytes) {
 			const p = norm(path);
-			nodes.set(p, { ino: nextIno++, mode: S_IFREG | 0o644, data: new Uint8Array(bytes), size: bytes.byteLength, mtime: Date.now() });
+			nodes.set(p, { ino: nextIno++, mode: S_IFREG | 0o644, data: new Uint8Array(bytes), size: bytes.byteLength, mtime: nowNs() });
 		},
+		statStamp(path) { const n = nodes.get(norm(path)); return n ? [n.dir ? 0 : n.size, n.mtime] : null; },
 		readFileSync(path) { const n = lookup(path); return n.data.slice(0, n.size); },
 	};
 	// Writes to stdout/stderr come through write() with fd 1 or 2 too.

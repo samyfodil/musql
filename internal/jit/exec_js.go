@@ -55,5 +55,8 @@ func (c *Code) Call(args *Args) {
 // bounded by the number of predicate shapes.
 func (c *Code) Close() error { return nil }
 
-// Call2 is the program JIT's entry, which has no wasm emitter yet.
-func (c *Code) Call2(args *ProgArgs) { panic("jit: no program JIT on js/wasm") }
+// Call2 runs a program emitted by EmitProgram.
+func (c *Code) Call2(args *ProgArgs) {
+	callKernel(c.slot, unsafe.Pointer(args))
+	runtime.KeepAlive(args)
+}

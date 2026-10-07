@@ -43,7 +43,7 @@ func TestColumnarBetweenMatchesTheLoop(t *testing.T) {
 		if fmt.Sprint(typedRows(got)) != fmt.Sprint(typedRows(want)) {
 			t.Errorf("%s %v: fast %v plain %v", c.sql, c.args, typedRows(got), typedRows(want))
 		}
-		if programJITEnabled() && (served > 0) != c.served {
+		if JITEnabled() && (served > 0) != c.served {
 			t.Errorf("%s %v: served=%d", c.sql, c.args, served)
 		}
 	}

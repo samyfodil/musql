@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 	"unsafe"
+
+	"github.com/samyfodil/musql/internal/fsstamp"
 )
 
 // Writing this format: a commit is an append. The rows a transaction changed
@@ -1323,11 +1325,11 @@ type fileStamp struct {
 }
 
 func stampOf(path string) fileStamp {
-	fi, err := os.Stat(path)
-	if err != nil {
+	size, mtime, ok := fsstamp.Of(path)
+	if !ok {
 		return fileStamp{}
 	}
-	return fileStamp{size: fi.Size(), mtime: fi.ModTime().UnixNano(), there: true}
+	return fileStamp{size: size, mtime: mtime, there: true}
 }
 
 // pairStamp is the segment file's stamp and its delta's.
