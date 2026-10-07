@@ -2,10 +2,14 @@ module github.com/samyfodil/musql/examples/turso
 
 go 1.27.0
 
-replace github.com/samyfodil/musql => ../..
+replace (
+	github.com/samyfodil/musql => ../..
+	github.com/samyfodil/musql/hrana => ../../hrana
+)
 
 require (
-	github.com/samyfodil/musql v0.0.0
+	github.com/samyfodil/musql v0.1.1
+	github.com/samyfodil/musql/hrana v0.0.0
 	github.com/tursodatabase/libsql-client-go v0.0.0-20260528064733-9d5d30a29a60
 )
 

@@ -39,7 +39,7 @@ jobs:
           out="$PWD/dist/$name"
           mkdir -p "$out"
           flags=(-trimpath -ldflags="-s -w")
-          go build "${flags[@]}" -o "$out/musqld$ext" ./cmd/musqld
+          (cd hrana && go build "${flags[@]}" -o "$out/musqld$ext" ./cmd/musqld)
           go build "${flags[@]}" -o "$out/musql-convert$ext" ./cmd/musql-convert
           (cd examples/doom && go build "${flags[@]}" -o "$out/musql-doom$ext" ./cmd/doom)
           cp LICENSE README.md "$out/"

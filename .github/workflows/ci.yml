@@ -42,7 +42,7 @@ jobs:
           MUSQL_JIT: "0"
         run: go test ./engine/ -count=1 -timeout 20m
       - name: driver, converter, replication
-        run: go test ./driver/ ./convert/... ./replication/... ./hrana/ ${{ matrix.race }} -count=1 -timeout 15m
+        run: go test ./driver/ ./convert/... ./replication/... ${{ matrix.race }} -count=1 -timeout 15m
 
   crossbuild:
     name: cross-compile all targets
@@ -111,7 +111,7 @@ jobs:
       - name: Turso's Node client (@libsql/client) over http, ws and libsql URLs
         run: |
           set -e
-          go build -o /tmp/musqld ./cmd/musqld
+          (cd hrana && go build -o /tmp/musqld ./cmd/musqld)
           cd examples/turso/node
           npm install --no-audit --no-fund
           for url in http://127.0.0.1:8080 ws://127.0.0.1:8080 "libsql://127.0.0.1:8080?tls=0"; do
@@ -133,4 +133,6 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: go vet ./...
+      - working-directory: hrana
+        run: go vet ./... && go test ./... -count=1 -timeout 10m
       - run: go vet -tags sqlite_fts5 ./...

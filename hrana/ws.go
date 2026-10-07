@@ -11,8 +11,8 @@ import (
 	"github.com/coder/websocket"
 	"google.golang.org/protobuf/proto"
 
-	pb "github.com/samyfodil/musql/gen/hrana"
-	pbws "github.com/samyfodil/musql/gen/hrana/ws"
+	pb "github.com/samyfodil/musql/hrana/gen/hrana"
+	pbws "github.com/samyfodil/musql/hrana/gen/hrana/ws"
 )
 
 // Hrana over WebSocket. Each WebSocket connection hosts any number of streams;
