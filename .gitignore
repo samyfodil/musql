@@ -12,3 +12,4 @@
 CLAUDE.local.md
 scripts/local-*
 docs/local-*
+.gstack/

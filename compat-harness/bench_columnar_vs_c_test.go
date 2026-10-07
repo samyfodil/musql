@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	musqlengine "github.com/samyfodil/musql/engine"
 	"github.com/samyfodil/musql/driver"
+	musqlengine "github.com/samyfodil/musql/engine"
 	_ "turso.tech/database/tursogo" // driver "turso": the Rust rewrite
 )
 
@@ -90,6 +90,11 @@ func TestBenchColumnarVsC(t *testing.T) {
 		defer tdb.Close()
 	}
 
+	ddb := openDuckDB(t, filepath.Join(dir, "duck.db"))
+	if ddb != nil {
+		defer ddb.Close()
+	}
+
 	// Every row into segments, none left in the delta: the format at rest.
 	vacStart := time.Now()
 	if _, err := mdb.Exec(`VACUUM`); err != nil {
@@ -142,11 +147,13 @@ func TestBenchColumnarVsC(t *testing.T) {
 		return n
 	}
 	type row struct {
-		name                        string
-		mushCol, mushDrv time.Duration
-		c, turso                    time.Duration
-		tursoErr                    string
-		jitted                      bool
+		name              string
+		mushCol, mushDrv  time.Duration
+		c, cNative, turso time.Duration
+		tursoErr          string
+		duck1, duckN      time.Duration
+		duckErr           string
+		jitted            bool
 	}
 
 	// Each workload: the SQL, and a bind-value generator used identically by
@@ -341,14 +348,27 @@ func TestBenchColumnarVsC(t *testing.T) {
 				w.name, served)
 		}
 		td, terr := timeDriverSoft(tdb, w.sql, w.args)
+		var d1, dN time.Duration
+		derr := "arm skipped"
+		if ddb != nil {
+			setDuckThreads(t, ddb, 1)
+			d1, derr = timeDriverSoft(ddb, w.sql, w.args)
+			setDuckThreads(t, ddb, 0)
+			if derr == "" {
+				dN, derr = timeDriverSoft(ddb, w.sql, w.args)
+			}
+		}
 		rows = append(rows, row{
-			name:      w.name,
-			mushCol:   cl,
-			mushDrv:   timeDriver(mdb, w.sql, w.args),
-			c:         timeDriver(cdb, w.sql, w.args),
-			turso:     td,
-			tursoErr:  terr,
-			jitted:    served > 0 && declined == 0,
+			duck1:    d1,
+			duckN:    dN,
+			duckErr:  derr,
+			name:     w.name,
+			mushCol:  cl,
+			mushDrv:  timeDriver(mdb, w.sql, w.args),
+			c:        timeDriver(cdb, w.sql, w.args),
+			turso:    td,
+			tursoErr: terr,
+			jitted:   served > 0 && declined == 0,
 		})
 	}
 
@@ -416,6 +436,13 @@ func TestBenchColumnarVsC(t *testing.T) {
 			if gotD != oracle {
 				t.Fatalf("%s %v: musql driver %q, C %q", w.name, args, gotD, oracle)
 			}
+			if ddb != nil {
+				want, werr := renderValues(cdb, w.sql, args)
+				got, gerr := renderValues(ddb, w.sql, args)
+				if werr == nil && gerr == nil && got != want && i == 0 {
+					t.Logf("DUCKDB DIFFERS %s %v: %q, C %q", w.name, args, got, want)
+				}
+			}
 			if tdb != nil {
 				if gotT, terr := renderDriverInts(tdb, w.sql, args); terr != nil {
 					if i == 0 {
@@ -428,12 +455,27 @@ func TestBenchColumnarVsC(t *testing.T) {
 		}
 	}
 
+	// The native-C baseline, timed after the Go arms so they never share the
+	// machine. cdb has finished writing (seedBench commits before returning),
+	// so the C side opens the same file read-only.
+	var natives []nativeWorkload
+	for _, w := range workloads {
+		if !benchSkipped(w.name) {
+			natives = append(natives, nativeWorkload{w.name, w.sql, w.args})
+		}
+	}
+	if native := nativeCTimes(t, cee.path, natives); native != nil {
+		for i := range rows {
+			rows[i].cNative = native[rows[i].name]
+		}
+	}
+
 	t.Logf("\nCOLUMNAR + JIT vs C SQLite -- %d rows, disk-backed, warm, JIT=%v",
 		benchN, musqlengine.JITEnabled())
 	t.Logf("segments laid out by VACUUM in %s", vacDur.Round(time.Millisecond))
-	t.Logf("%-32s | %12s | %12s | %12s | %12s | %11s | %11s", "workload",
-		"musql+JIT", "musql drv", "mattn-C", "turso-rust",
-		"vs C", "vs turso")
+	t.Logf("%-32s | %12s | %12s | %12s | %12s | %12s | %13s | %11s | %11s", "workload",
+		"musql+JIT", "musql drv", "C native", "mattn-C", "turso-rust",
+		"vs C native", "vs mattn-C", "vs turso")
 	t.Logf("%s", "-----------------------------------------------------------------------------------------------------------------------------------")
 	for _, r := range rows {
 		mark := ""
@@ -445,12 +487,36 @@ func TestBenchColumnarVsC(t *testing.T) {
 			tursoCell = r.turso.Round(time.Microsecond).String()
 			vsTurso = speedup(r.turso, r.mushCol)
 		}
-		t.Logf("%-32s | %12s | %12s | %12s | %12s | %11s | %11s%s", r.name,
+		nativeCell, vsNative := "n/a", "n/a"
+		if r.cNative > 0 {
+			nativeCell, vsNative = r.cNative.Round(100*time.Nanosecond).String(), speedup(r.cNative, r.mushCol)
+		}
+		t.Logf("%-32s | %12s | %12s | %12s | %12s | %12s | %13s | %11s | %11s%s", r.name,
 			r.mushCol.Round(time.Microsecond),
-			r.mushDrv.Round(time.Microsecond), r.c.Round(time.Microsecond),
-			tursoCell, speedup(r.c, r.mushCol), vsTurso, mark)
+			r.mushDrv.Round(time.Microsecond), nativeCell, r.c.Round(time.Microsecond),
+			tursoCell, vsNative, speedup(r.c, r.mushCol), vsTurso, mark)
 	}
 	t.Logf("the vs-X columns are how many times FASTER musql+JIT is than X.")
+
+	// DuckDB, a different class of engine: a reference, not a headline.
+	t.Logf("")
+	t.Logf("DuckDB reference (analytical engine; 1 thread like the others, and its default)")
+	t.Logf("%-32s | %12s | %12s | %13s | %13s | %13s", "workload",
+		"musql+JIT", "C native", "duckdb 1 thr", "duckdb", "vs duckdb 1")
+	for _, r := range rows {
+		if r.duckErr != "" {
+			t.Logf("%-32s | %12s | duckdb: %s", r.name, r.mushCol.Round(time.Microsecond), r.duckErr)
+			continue
+		}
+		nativeCell := "n/a"
+		if r.cNative > 0 {
+			nativeCell = r.cNative.Round(100 * time.Nanosecond).String()
+		}
+		t.Logf("%-32s | %12s | %12s | %13s | %13s | %13s", r.name,
+			r.mushCol.Round(time.Microsecond), nativeCell,
+			r.duck1.Round(time.Microsecond), r.duckN.Round(time.Microsecond),
+			speedup(r.duck1, r.mushCol))
+	}
 
 	// ---- WRITES, where this engine is at its worst. ----
 	//
