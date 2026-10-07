@@ -18,6 +18,7 @@ func JITEnabled() bool { return jitEnabled }
 type jitFilterKey struct {
 	opA, opC segPredOp
 	two      bool
+	sum      bool // EmitFilterSumSIMD rather than the count kernel
 }
 
 var jitFilterCache sync.Map // jitFilterKey -> *jit.Code
@@ -135,4 +136,58 @@ func jitFilterCount(s *segment, preds []segPred) int {
 	args.N, args.Out = int64(n), &out
 	k.Call(&args)
 	return int(out)
+}
+
+// jitFilterSumKernel is jitFilterKernel for the masked sum: vector units only,
+// one or two predicates. nil when the shape or the machine has none.
+func jitFilterSumKernel(preds []segPred) *jit.Code {
+	if !jitEnabled || !jit.HasVector() || len(preds) == 0 || len(preds) > 2 {
+		return nil
+	}
+	two := len(preds) == 2
+	key := jitFilterKey{opA: preds[0].Op, two: two, sum: true}
+	if two {
+		key.opC = preds[1].Op
+	}
+	if c, ok := jitFilterCache.Load(key); ok {
+		if c == nil {
+			return nil
+		}
+		return c.(*jit.Code)
+	}
+	condC := jitCondOf(preds[0].Op)
+	if two {
+		condC = jitCondOf(preds[1].Op)
+	}
+	code, err := jit.EmitFilterSumSIMD(jitCondOf(preds[0].Op), two, condC)
+	var k *jit.Code
+	if err == nil {
+		k, err = jit.Map(code)
+	}
+	if err != nil {
+		jitFilterCache.Store(key, (*jit.Code)(nil))
+		return nil
+	}
+	actual, _ := jitFilterCache.LoadOrStore(key, k)
+	if got := actual.(*jit.Code); got != k {
+		k.Close()
+		return got
+	}
+	return k
+}
+
+// jitFilterSumRange sums vals over rows [lo, hi) satisfying preds with the
+// vector kernel, reporting false when there is none for this shape. The
+// caller has already proved the sum cannot overflow.
+func jitFilterSumRange(k *jit.Code, cols [][]int64, preds []segPred, vals []int64, lo, hi int) (sum int64, n int) {
+	if hi <= lo {
+		return 0, 0
+	}
+	var out, cnt int64
+	args := jit.Args{A: &cols[0][lo], XA: preds[0].Val.I, V: &vals[lo], N: int64(hi - lo), Out: &out, Out2: &cnt}
+	if len(preds) == 2 {
+		args.C, args.XC = &cols[1][lo], preds[1].Val.I
+	}
+	k.Call(&args)
+	return out, int(cnt)
 }

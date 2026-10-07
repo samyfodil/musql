@@ -18,3 +18,8 @@ func EmitFilterCountSIMD(condA Cond, two bool, condC Cond) ([]byte, error) {
 func EmitFilterCount(condA Cond, two bool, condC Cond) ([]byte, error) {
 	return nil, fmt.Errorf("jit: no encoder for this architecture")
 }
+
+// EmitFilterSumSIMD likewise.
+func EmitFilterSumSIMD(condA Cond, two bool, condC Cond) ([]byte, error) {
+	return nil, fmt.Errorf("jit: no vector encoder for this architecture")
+}

@@ -29,6 +29,10 @@ type Args struct {
 	XA  int64  // first comparison constant           (offset 24)
 	XC  int64  // second comparison constant          (offset 32)
 	Out *int64 // where the kernel writes its answer  (offset 40)
+	// EmitFilterSumSIMD only: the column summed over matching rows, and where
+	// the number of matching rows goes (Out receives the sum).
+	V    *int64 // (offset 48)
+	Out2 *int64 // (offset 56)
 }
 
 // Byte offsets of Args' fields, asserted by TestArgsLayout. Generated code uses
@@ -40,6 +44,8 @@ const (
 	OffXA  = 24
 	OffXC  = 32
 	OffOut = 40
+	OffV    = 48
+	OffOut2 = 56
 )
 
 // Cond is a condition code. Its numeric values are x86 Jcc nibbles, which is an

@@ -252,6 +252,11 @@ func (a *Arm) AndV(vd, vn, vm VReg) {
 
 // SubV emits SUB Vd.2D, Vn.2D, Vm.2D: subtracting an all-ones lane adds one,
 // which is the branch-free accumulate.
+// AddV emits ADD Vd.2D, Vn.2D, Vm.2D.
+func (a *Arm) AddV(vd, vn, vm VReg) {
+	a.emit(0x4EE08400 | uint32(vm)<<16 | uint32(vn)<<5 | uint32(vd))
+}
+
 func (a *Arm) SubV(vd, vn, vm VReg) {
 	a.emit(0x6EE08400 | uint32(vm)<<16 | uint32(vn)<<5 | uint32(vd))
 }

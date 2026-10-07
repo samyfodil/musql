@@ -136,6 +136,32 @@ func segFilterSumZoned(s *segment, preds []segPred, col int) (sum int64, matched
 			return 0, 0, false
 		}
 	}
+	// The vector kernel takes every run the zone maps leave undecided, as one
+	// call per stretch of consecutive such runs; without one, each run is
+	// filtered into flags and summed branch-free.
+	kern := jitFilterSumKernel(preds)
+	var cols [][]int64
+	if kern != nil {
+		if c, ok := segPredColumns(s, preds); ok && len(vals) >= s.nRows {
+			cols = c
+			for _, c := range cols {
+				if len(c) < s.nRows {
+					kern = nil
+				}
+			}
+		} else {
+			kern = nil
+		}
+	}
+	pending := -1 // start of the undecided stretch the kernel has yet to take
+	flush := func(end int) {
+		if pending >= 0 {
+			sm, n := jitFilterSumRange(kern, cols, preds, vals, pending, end)
+			sum += sm
+			matched += n
+			pending = -1
+		}
+	}
 	var flags [segFilterBatch]uint8
 	for b, lo := 0, 0; lo < s.nRows; b, lo = b+1, lo+segFilterBatch {
 		hi := min(lo+segFilterBatch, s.nRows)
@@ -149,7 +175,16 @@ func segFilterSumZoned(s *segment, preds []segPred, col int) (sum int64, matched
 				all = false
 			}
 		}
+		if skip || all {
+			flush(lo)
+		}
 		if skip {
+			continue
+		}
+		if !all && kern != nil {
+			if pending < 0 {
+				pending = lo
+			}
 			continue
 		}
 		if all {
@@ -172,5 +207,6 @@ func segFilterSumZoned(s *segment, preds []segPred, col int) (sum int64, matched
 			matched += int(m)
 		}
 	}
+	flush(s.nRows)
 	return sum, matched, true
 }

@@ -337,14 +337,11 @@ func segGroupDenseFlat(s *segment, argCols []int, keys []int64, args [][]int64,
 			for i := range mn {
 				mn[i], mx[i] = math.MaxInt64, math.MinInt64
 			}
+			// The builtins compile to conditional moves: no branch per row for
+			// the predictor to miss on unordered data.
 			for r, k := range keys {
 				v, i := col[r], k-lo
-				if v < mn[i] {
-					mn[i] = v
-				}
-				if v > mx[i] {
-					mx[i] = v
-				}
+				mn[i], mx[i] = min(mn[i], v), max(mx[i], v)
 			}
 			mins[a], maxs[a] = mn, mx
 		}
