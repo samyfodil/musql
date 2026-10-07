@@ -6,7 +6,7 @@
 const path = require("path");
 const goroot = require("child_process").execSync("go env GOROOT").toString().trim();
 require(path.join(__dirname, "memfs.js"));
-require(path.join(__dirname, "musqljit.js"));
+require(path.join(__dirname, "musql.js"));
 require(path.join(goroot, "lib/wasm/wasm_exec.js"));
 (async () => {
 	const [wasm, mode = "jit", rows = "100000"] = process.argv.slice(2);

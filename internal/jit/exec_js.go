@@ -9,7 +9,7 @@ import (
 // On js/wasm a kernel is a WebAssembly module, compiled and instantiated by
 // the JS host and kept in a JS-side WebAssembly.Table. Go cannot call_indirect
 // into a table it does not own, so the "trampoline" is two imports the host
-// supplies (examples/wasm/musqljit.js): compile_kernel and call_kernel. Both
+// supplies (examples/wasm/musql.js): compile_kernel and call_kernel. Both
 // are synchronous, which browsers allow off the main thread -- run musql in a
 // Web Worker. A host that does not want the JIT supplies a compile_kernel
 // that returns -1; every kernel then declines and the VDBE answers.

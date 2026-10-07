@@ -1,7 +1,7 @@
 //go:build js && wasm
 
 // Command wasm is musql in a browser: a Web Worker runs this module over an
-// in-memory filesystem (memfs.js) with the JIT's host imports (musqljit.js),
+// in-memory filesystem (memfs.js) with the JIT's host imports (musql.js),
 // and index.html drives it.
 //
 //	GOOS=js GOARCH=wasm go build -o examples/wasm/musql.wasm ./examples/wasm

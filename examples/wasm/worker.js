@@ -1,6 +1,6 @@
 // Runs musql (musql.wasm) in a Web Worker: synchronous wasm compiles, which
 // the JIT needs, are allowed here and not on the main thread.
-importScripts("memfs.js", "musqljit.js", "wasm_exec.js");
+importScripts("memfs.js", "musql.js", "wasm_exec.js");
 
 const ready = new Promise((resolve) => { globalThis.musqlReady = resolve; });
 (async () => {

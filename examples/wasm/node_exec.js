@@ -4,7 +4,7 @@
 const path = require("path");
 const goroot = require("child_process").execSync("go env GOROOT").toString().trim();
 globalThis.fs = require("fs");
-require(path.join(__dirname, "musqljit.js"));
+require(path.join(__dirname, "musql.js"));
 require(path.join(goroot, "lib/wasm/wasm_exec.js"));
 // wasm_exec_node.js constructs Go and instantiates as it loads, so the
 // imports go in through a subclass. Its own require("./wasm_exec") is the
