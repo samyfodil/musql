@@ -2465,7 +2465,9 @@ func (db *DB) compileDeleteStmt(stmt *deleteStmt, trig *trigCompileCtx) (*Progra
 	// A rowid point lookup, when the WHERE pins one: the scan fetches that row
 	// instead of materializing the table. Pure candidate-set restriction -- the
 	// conjunct below still runs on the fetched row. See write_rowid_seek.go.
-	emitWriteRowidSeekHint(c, tbl, 0, stmt.where)
+	if !emitWriteRowidSeekHint(c, tbl, 0, stmt.where) {
+		emitWriteIndexSeekHint(c, tbl, 0, stmt.where)
+	}
 	rewind := c.emit(Instruction{Op: OpRewind, P1: 0})
 	loopTop := c.here()
 
@@ -2804,7 +2806,9 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 		// A rowid point lookup, when the WHERE pins one. Only for the ordinary
 		// UPDATE: with a FROM clause the scan drives pass one's EPHEMERAL table,
 		// whose rowids are its own and have nothing to do with the target's.
-		emitWriteRowidSeekHint(c, tbl, scanCur, stmt.where)
+		if !emitWriteRowidSeekHint(c, tbl, scanCur, stmt.where) {
+			emitWriteIndexSeekHint(c, tbl, scanCur, stmt.where)
+		}
 	}
 	// THE ORDER THIS LOOP VISITS ROWS IN, when a SET subquery may depend on it
 	// (a per-row lowering reads the rows before it -- see the liveRow block

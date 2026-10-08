@@ -486,6 +486,29 @@ func (cur *vdbeCursor) rewind() error {
 				cur.rowidNull = false
 				return nil
 			}
+			// A column equality (emitWriteIndexSeekHint): the store's equality
+			// index names the candidates, ascending, and nothing else is built.
+			// It refuses a column holding anything but integers and NULLs, and
+			// only an integer probe can use it; either falls to the walk.
+			if cur.idxSeekConfigured && !tbl.withoutRowid && tbl.rows != nil && cur.idxSeekProbe.Typ == Int {
+				if hits, ok := tbl.rows.eqRowids(cur.idxSeekCol, cur.idxSeekProbe.I); ok {
+					writeIndexSeeksServed++
+					cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
+					for _, rid := range hits {
+						if vals, found := tbl.rows.get(rid); found {
+							cur.rows = append(cur.rows, normalizeRow(tbl.name, tbl.cols, tbl.ipkIndex, rid, vals))
+							cur.rowids = append(cur.rowids, rid)
+						}
+					}
+					if !slices.IsSorted(cur.rowids) { // the short rows come unioned at the end
+						sortRowsByRowid(cur)
+					}
+					cur.materialized = true
+					cur.pos = -1
+					cur.rowidNull = false
+					return nil
+				}
+			}
 			cur.materializeRowStore()
 			cur.pos = -1
 			cur.rowidNull = false
@@ -1179,4 +1202,19 @@ func (cur *vdbeCursor) orderByWithoutRowidPK() {
 		key.desc = append(key.desc, desc)
 	}
 	autoIndexOrderCursor(cur, key, cur.pager.encoding())
+}
+
+// sortRowsByRowid orders cur's materialized rows by rowid, keeping each row
+// with its rowid.
+func sortRowsByRowid(cur *vdbeCursor) {
+	idx := make([]int, len(cur.rowids))
+	for i := range idx {
+		idx[i] = i
+	}
+	slices.SortFunc(idx, func(a, b int) int { return cmp.Compare(cur.rowids[a], cur.rowids[b]) })
+	rids, rows := make([]uint64, len(idx)), make([][]Value, len(idx))
+	for i, j := range idx {
+		rids[i], rows[i] = cur.rowids[j], cur.rows[j]
+	}
+	cur.rowids, cur.rows = rids, rows
 }

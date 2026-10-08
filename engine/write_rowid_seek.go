@@ -64,3 +64,58 @@ func emitWriteRowidSeekHint(c *compiler, tbl *tableMeta, cursor int, where Expr)
 	c.emit(Instruction{Op: OpSeekRowidHint, P1: cursor, P2: reg})
 	return true
 }
+
+// emitWriteIndexSeekHint is the column twin of emitWriteRowidSeekHint: for a
+// WHERE conjunct "<col> = <column-free key>" on the written table it emits an
+// OpSeekIndexHint, which the row-store cursor answers from the store's own
+// equality index (row_store_eqindex.go) instead of materializing the table.
+// It needs no declared index: the candidates come in rowid order, which is the
+// order C visits one key's rows in whether it walks an index or the table, and
+// the conjunct still runs on every fetched row, so the hint only narrows.
+func emitWriteIndexSeekHint(c *compiler, tbl *tableMeta, cursor int, where Expr) bool {
+	if writeIndexSeekOffForTest || where == nil || tbl == nil || tbl.withoutRowid || hasGeneratedCols(tbl.cols) {
+		return false
+	}
+	for _, cj := range splitTopLevelAnd(where) {
+		be, ok := cj.(BinaryExpr)
+		if !ok || (be.Op != "=" && be.Op != "==") {
+			continue
+		}
+		for _, side := range [2][2]Expr{{be.L, be.R}, {be.R, be.L}} {
+			colExpr, key := side[0], side[1]
+			col, ok := writeColumnRef(c, cursor, colExpr)
+			if !ok || !isSeekKeyCandidate(key) {
+				continue
+			}
+			reg, err := c.compileExpr(key)
+			if err != nil {
+				return false
+			}
+			c.emit(Instruction{Op: OpSeekIndexHint, P1: cursor, P2: reg,
+				P4: &indexSeekHint{aff: comparisonAffinity(c.affCtx(), colExpr, key), leadingCol: col}})
+			return true
+		}
+	}
+	return false
+}
+
+// writeColumnRef reports whether e is a plain reference to a stored column of
+// cursor's table (not its rowid), returning the column's index.
+func writeColumnRef(c *compiler, cursor int, e Expr) (int, bool) {
+	ce, ok := e.(ColumnExpr)
+	if !ok || ce.UsingRepr || ce.Schema != "" {
+		return 0, false
+	}
+	cur, colIdx, isRowid, found, fb, hard := resolveInScopes(c.scopes, ce, c.pager)
+	if hard != nil || !found || isRowid || fb.has || cur != cursor {
+		return 0, false
+	}
+	return colIdx, true
+}
+
+// writeIndexSeekOffForTest turns emitWriteIndexSeekHint off, so a test's
+// reference is the full walk; writeIndexSeeksServed counts the seeks served.
+var (
+	writeIndexSeekOffForTest bool
+	writeIndexSeeksServed    int64
+)
