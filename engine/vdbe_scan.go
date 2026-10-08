@@ -110,6 +110,9 @@ func compileSelectScanRow(p *ReadOnlyPager, stmt *SelectStmt, outer *compiler, r
 		// composes with whatever did or did not match (segment_row_filter.go).
 		if !segPeepholesOffForTest {
 			segRowFilterPeephole(prog)
+			// A correlated EXISTS as a subroutine of this program rather than
+			// a machine per outer row (exists_inline.go).
+			existsInlinePeephole(prog)
 		}
 	}
 	return prog, err
