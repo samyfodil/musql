@@ -469,6 +469,40 @@ func aggPlanReadsOnlyLoweredCols(plan *aggPlan) bool {
 	return aggPlanReadsOnlyLoweredColsExceptOrder(plan) && len(plan.orderPlans) == 0
 }
 
+// havingReadsNoRow reports whether a rewritten HAVING is built only of
+// aggregate and group-key placeholders, literals, parameters and operators over
+// them. Anything else -- a subquery, which can read the outer row, or a node
+// this list does not know -- answers false.
+func havingReadsNoRow(e Expr) bool {
+	all := func(es ...Expr) bool {
+		for _, x := range es {
+			if x != nil && !havingReadsNoRow(x) {
+				return false
+			}
+		}
+		return true
+	}
+	switch x := e.(type) {
+	case groupAggExpr, groupKeyExpr, LiteralExpr, ParamExpr:
+		return true
+	case UnaryExpr:
+		return all(x.X)
+	case BinaryExpr:
+		return all(x.L, x.R)
+	case IsNullExpr:
+		return all(x.X)
+	case BetweenExpr:
+		return all(x.X, x.Lo, x.Hi)
+	case CastExpr:
+		return all(x.X)
+	case CollateExpr:
+		return all(x.X)
+	case InExpr:
+		return x.Sub == nil && all(x.X) && all(x.List...)
+	}
+	return false
+}
+
 // aggPlanReadsOnlyLoweredColsExceptOrder is the same test without the ORDER BY
 // exclusion, for the columnar GROUP BY recognizer, which accepts only an
 // OpHashAggSort drain, emitted only when ORDER BY is the group keys ascending
@@ -476,13 +510,19 @@ func aggPlanReadsOnlyLoweredCols(plan *aggPlan) bool {
 // "... GROUP BY k ORDER BY k" declined while the same query without ORDER BY was
 // served.
 func aggPlanReadsOnlyLoweredColsExceptOrder(plan *aggPlan) bool {
-	if plan == nil || plan.havingPlan != nil {
+	if plan == nil {
 		return false
 	}
 	for _, item := range plan.outPlans {
 		if item == nil || item.usesGroupBare || len(item.hoisted) != 0 {
 			return false
 		}
+	}
+	// A HAVING is the same test plus havingReadsNoRow: its aggregates are
+	// stepped from lowered registers like the outputs' (aggPlanStepOrder lists
+	// them), and over aggregates, group keys and constants it reads no row.
+	if hp := plan.havingPlan; hp != nil && (hp.usesGroupBare || len(hp.hoisted) != 0 || !havingReadsNoRow(hp.rewritten)) {
+		return false
 	}
 	// A min()/max() census does not disqualify the plan once the checks
 	// above pass: a site exists so a bare column can read the anchor row,

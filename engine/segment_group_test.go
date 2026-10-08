@@ -34,7 +34,15 @@ func TestColumnarGroupByMatchesTheLoop(t *testing.T) {
 		{`SELECT k, max(v) FROM t GROUP BY k`, true},
 		{`SELECT k, min(v), max(v) FROM t GROUP BY k`, true},
 		{`SELECT k, max(v), s FROM t GROUP BY k`, false},
-		{`SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > 10`, false},
+		// A HAVING over aggregates, keys and constants reads no row.
+		{`SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > 10`, true},
+		{`SELECT k, count(*) FROM t GROUP BY k HAVING sum(v) > 0 ORDER BY k`, true},             // an aggregate not in the output
+		{`SELECT k, count(*) FROM t GROUP BY k HAVING sum(v) > 0 AND k <> 2 ORDER BY k`, false}, // a key term: not recognized yet
+		{`SELECT k, max(v) FROM t GROUP BY k HAVING min(v) BETWEEN -5 AND 5`, true},
+		{`SELECT k FROM t GROUP BY k HAVING count(*) IN (1, 2, 3) OR avg(v) IS NULL`, true},
+		{`SELECT k, count(*) FROM t GROUP BY k HAVING s > 'a'`, false},                                                  // a bare column
+		{`SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > (SELECT count(*) FROM t AS u WHERE u.k = t.k)`, false}, // a subquery
+		{`SELECT k, count(*) FROM t GROUP BY k HAVING abs(sum(v)) > 1`, false},                                          // a function: not listed
 		// same design paying off that count(DISTINCT v) below already showed: the
 		// driver reimplements nothing, it replaces the ROW SOURCE and calls the
 		// same hashAggStepRow. What used to make these wrong was reading a TEXT
