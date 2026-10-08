@@ -956,8 +956,11 @@ func detectIndexSeekKey(c *compiler, srcs []joinSource, where Expr) (int, *index
 			sp = c.pager.attachedReaders[s.dbIdx-1].pager
 		}
 		cands, err := sp.secondaryIndexSeekCandidates(s.scope.tableName, s.tbl.root, s.tbl.cols)
-		if err != nil || len(cands) == 0 {
+		if err != nil {
 			continue
+		}
+		if !automaticSeeksOffForTest {
+			cands = append(cands, automaticSeekCandidates(s.tbl.cols, cands)...)
 		}
 		for _, cj := range conjuncts {
 			be, ok := cj.(BinaryExpr)
@@ -1008,6 +1011,38 @@ func outerSeekCollationAgrees(c *compiler, be BinaryExpr, plan *indexSeekPlan) b
 		return true
 	}
 	return equalFoldName(effectiveCollation(resolveCompareCollation(c.affCtx(), be.L, be.R)), effectiveCollation(plan.coll))
+}
+
+// automaticSeeksOffForTest turns automaticSeekCandidates off, so a test can
+// run the same SQL with and without them.
+var automaticSeeksOffForTest bool
+
+// automaticSeekCandidates is C's automatic index (where.c's AUTOINDEX), for
+// free: every plain column with no SQL index of its own already has one, the
+// equality index each segment keeps per column, which SeekIndexRowidsSegments
+// answers the seek from. C builds a transient b-tree to get the same lookup;
+// this offers the column as a candidate with no index root, which the segment
+// seek never reads. The collation is the column's declared one, as for an
+// indexed column, so the same checks hold; a column the segments cannot index
+// declines at run time to the scan.
+func automaticSeekCandidates(cols []columnInfo, have []indexSeekCandidate) []indexSeekCandidate {
+	var out []indexSeekCandidate
+	for i, c := range cols {
+		if c.IsGenerated() || c.Hidden || c.IsRowidAlias {
+			continue
+		}
+		indexed := false
+		for _, h := range have {
+			if h.leadingCol == i {
+				indexed = true
+				break
+			}
+		}
+		if !indexed {
+			out = append(out, indexSeekCandidate{leadingCol: i, coll: effectiveCollation(c.Collation)})
+		}
+	}
+	return out
 }
 
 // planForColumn builds an indexSeekPlan if some candidate index leads with

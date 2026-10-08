@@ -123,6 +123,9 @@ func (src *segSource) seekIndexRowids(rootPage uint32, col int, probe Value) (ro
 	return src.withDeltaRowids(rootPage, out), true
 }
 
+// segIndexSeeksServed counts index seeks the segments answered, for tests.
+var segIndexSeeksServed int64
+
 // segIndexRowids finds rowids holding probe across a table's segments from each
 // segment's equality index. Returns false when any segment cannot answer.
 func segIndexRowids(segs []*segment, col int, probe Value) ([]int64, bool) {

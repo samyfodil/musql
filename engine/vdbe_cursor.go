@@ -407,6 +407,22 @@ func cursorHasNoBtree(cur *vdbeCursor) bool {
 // which calls rewind then advance together). The underlying table scan is
 // materialized only on this cursor's very first rewind (see this file's
 // package doc comment); every later call just resets the position index.
+// startSegSource makes src the cursor's row source: the lazy segment scan.
+func (cur *vdbeCursor) startSegSource(src *segRowSource) {
+	// The compiled pre-filter, when OpRewind carried one. Purely a
+	// candidate-set restriction: the WHERE it was lowered from is still in the
+	// program and still runs on every row it selects.
+	src.filter = cur.segFilter
+	src.params = cur.params
+	src.ipkCol = cur.tbl.ipkIndex
+	cur.segSrc = src
+	cur.segSrcCols = src.cols
+	cur.segCur = nil
+	cur.streamErrPending = nil
+	cur.pos = -1
+	cur.rowidNull = false
+}
+
 func (cur *vdbeCursor) rewind() error {
 	if cur.sub != nil {
 		return cur.rewindStream()
@@ -423,18 +439,7 @@ func (cur *vdbeCursor) rewind() error {
 		// declining to it, so the two never split: a table either scans from
 		// segments or from its b-tree, never both in one program.
 		if src := cur.pager.newSegRowSource(cur); src != nil {
-			// The compiled pre-filter, when OpRewind carried one. Purely a
-			// candidate-set restriction: the WHERE it was lowered from is
-			// still in the program and still runs on every row it selects.
-			src.filter = cur.segFilter
-			src.params = cur.params
-			src.ipkCol = cur.tbl.ipkIndex
-			cur.segSrc = src
-			cur.segSrcCols = src.cols
-			cur.segCur = nil
-			cur.streamErrPending = nil
-			cur.pos = -1
-			cur.rowidNull = false
+			cur.startSegSource(src)
 			return nil
 		}
 	}
@@ -533,6 +538,7 @@ func (cur *vdbeCursor) rewind() error {
 		if cur.idxSeekConfigured && !cur.tbl.withoutRowid && !virtualKey {
 			rowids, served := cur.pager.SeekIndexRowidsSegments(cur.tbl.root, cur.idxSeekCol, cur.idxSeekProbe, cur.idxSeekColl)
 			if served {
+				segIndexSeeksServed++
 				cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
 				shared := cur.pager.ServesLiveRows(cur.tbl.root)
 				for _, rid := range rowids {
@@ -549,8 +555,17 @@ func (cur *vdbeCursor) rewind() error {
 				return nil
 			}
 		}
-		// A seek the segments cannot serve is a scan.
+		// A seek the segments cannot serve is a scan -- the lazy one where this
+		// cursor may stream, as it would have been with no seek planned. An
+		// automatic seek (automaticSeekCandidates) declines this way for any
+		// column the segments keep no equality index for.
 		cur.seekConfigured, cur.idxSeekConfigured = false, false
+		if cur.streamable && !cur.tbl.withoutRowid {
+			if src := cur.pager.newSegRowSource(cur); src != nil {
+				cur.startSegSource(src)
+				return nil
+			}
+		}
 		seq, errFn := cur.pager.ScanTable(cur.tbl.root)
 		shared := cur.pager.ServesLiveRows(cur.tbl.root)
 		for rowid, vals := range seq {
