@@ -325,6 +325,13 @@ func segProgColumns(s *segment, want []int, asNull []bool, ipkCol int) (blocks [
 	isRowid = make([]bool, len(want))
 	for i, c := range want {
 		if i < len(asNull) && asNull[i] {
+			if c == ipkCol && ipkCol >= 0 {
+				// The rowid alias is stored as NULL and read as the rowid,
+				// which is never NULL: its indicator is all zeros, not the
+				// stored column's bitmap.
+				blocks[i] = make([]int64, s.nRows)
+				continue
+			}
 			idx, okIdx := s.nullIndicator(c)
 			if !okIdx {
 				return nil, nil, false

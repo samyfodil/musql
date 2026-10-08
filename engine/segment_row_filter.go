@@ -196,7 +196,12 @@ func segFilterColumns(s *segment, want []int, asNull []bool, ipkCol int) (blocks
 	for i, c := range want {
 		if i < len(asNull) && asNull[i] {
 			// A NULL INDICATOR is exact for every row -- it IS the bitmap -- so
-			// it makes nothing uncertain.
+			// it makes nothing uncertain. The rowid alias's is all zeros: it is
+			// stored as NULL but reads as the rowid, which is never NULL.
+			if c == ipkCol && ipkCol >= 0 {
+				blocks[i] = make([]int64, s.nRows)
+				continue
+			}
 			idx, okIdx := s.nullIndicator(c)
 			if !okIdx {
 				return nil, nil, nil, false
