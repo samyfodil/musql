@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"strconv"
@@ -74,7 +75,18 @@ type Session struct {
 	// appendAt is where this session's last batch ended, carried so a commit does
 	// not re-read the whole delta to find its own tail. See SegDeltaAppendState.
 	appendAt SegDeltaAppendState
-	recBuf   []SegDeltaRecord // the delta records of a commit, reused (segDeltaRecordsInto)
+
+	// commitLock is the lock file held open for this session's autocommit
+	// commits (withCommitLock), and commitLockFI what it was when opened. Its
+	// own descriptor, never shared: OFD locks belong to the open description, so
+	// two sessions sharing one would not exclude each other.
+	commitLock   *os.File
+	commitLockFI os.FileInfo
+
+	// segStat and deltaStat stamp the segment file and its delta (pairStamp).
+	segStat, deltaStat heldStamp
+
+	recBuf []SegDeltaRecord // the delta records of a commit, reused (segDeltaRecordsInto)
 
 	// catalogAtLastWrite is the catalog fingerprint as of the last time the FILE
 	// was written. Commit compares against it rather than trusting Exec to have
@@ -83,7 +95,8 @@ type Session struct {
 	// Exec of ours ever sees the statement. Detecting at the commit makes it
 	// impossible to miss: whoever ran the DDL, the catalog either moved or it did
 	// not.
-	catalogAtLastWrite string
+	catalogAtLastWrite []byte
+	fpScratch          []byte // catalogMoved's buffer
 
 	// seenStat is the (size, mtime) of the segment file and its delta as of the
 	// last time this session looked. The freshness check compares THESE first,
@@ -277,41 +290,79 @@ func pragmaDeclineFor(sql string) error {
 
 // catalogFingerprint is every schema object's name and text, so a statement that
 // moved the catalog can be caught rather than half-applied.
-func (n *Session) catalogFingerprint() string {
+func (n *Session) catalogFingerprint() []byte {
+	return n.appendCatalogFingerprint(nil)
+}
+
+// catalogMoved reports whether the catalog differs from catalogAtLastWrite. It
+// builds the fingerprint into a buffer the session keeps, so the check every
+// commit makes allocates nothing once the buffer has grown -- it used to build
+// a fresh string by concatenation, three allocations per statement and more
+// per table -- and compares bytes, which stays exact.
+func (n *Session) catalogMoved() bool {
+	n.fpScratch = n.appendCatalogFingerprint(n.fpScratch[:0])
+	return !bytes.Equal(n.fpScratch, n.catalogAtLastWrite)
+}
+
+// appendCatalogFingerprint appends the fingerprint to b.
+func (n *Session) appendCatalogFingerprint(b []byte) []byte {
 	// The application-owned header words (user_version etc.) live in the
 	// catalog on this format (ConvertedCatalog.UserVersion), so changing one
 	// changes the catalog and the commit must rewrite the file; a delta
 	// batch carries no catalog. The schema cookie is one of them: "PRAGMA
 	// schema_version=777" alone was forgotten at reopen.
-	out := "C" + strconv.FormatUint(uint64(n.schemaCookie), 10) +
-		"U" + strconv.FormatUint(uint64(n.userVersion), 10) +
-		"A" + strconv.FormatUint(uint64(n.applicationID), 10) +
-		"E" + strconv.FormatUint(uint64(n.encoding()), 10) +
-		"P" + strconv.FormatUint(uint64(n.pageSize), 10) +
-		"V" + strconv.FormatUint(uint64(n.autoVacuum), 10) +
-		"W" + strconv.FormatBool(n.segWAL) +
-		"G" + n.captureGuard + "\x00"
+	b = append(b, 'C')
+	b = strconv.AppendUint(b, uint64(n.schemaCookie), 10)
+	b = append(b, 'U')
+	b = strconv.AppendUint(b, uint64(n.userVersion), 10)
+	b = append(b, 'A')
+	b = strconv.AppendUint(b, uint64(n.applicationID), 10)
+	b = append(b, 'E')
+	b = strconv.AppendUint(b, uint64(n.encoding()), 10)
+	b = append(b, 'P')
+	b = strconv.AppendUint(b, uint64(n.pageSize), 10)
+	b = append(b, 'V')
+	b = strconv.AppendUint(b, uint64(n.autoVacuum), 10)
+	b = append(b, 'W')
+	b = strconv.AppendBool(b, n.segWAL)
+	b = append(b, 'G')
+	b = append(b, n.captureGuard...)
+	b = append(b, 0)
 	for _, t := range n.tables {
-		out += "T" + t.name + "\x00" + t.sql + "\x00" + t.aliasOf + "\x00"
+		b = append(b, 'T')
+		b = append(b, t.name...)
+		b = append(b, 0)
+		b = append(b, t.sql...)
+		b = append(b, 0)
+		b = append(b, t.aliasOf...)
+		b = append(b, 0)
 	}
 	// A direct catalog edit changes what the file must say without changing the
 	// live schema (applyCatalogEditsForWrite), so the overlay is part of it.
 	if n.writableSchemaEditsActive() {
 		for _, r := range n.wsCatalogWithOverlay() {
-			out += "X" + fmt.Sprint(r.vals) + "\x00"
+			b = append(b, 'X')
+			b = fmt.Append(b, r.vals)
+			b = append(b, 0)
 		}
 	}
 	for _, i := range n.indexes {
-		out += "I" + i.name + "\x00"
+		b = append(b, 'I')
+		b = append(b, i.name...)
+		b = append(b, 0)
 	}
 	// Views and triggers too. Leaving them out let CREATE VIEW through, which is
 	// exactly the shape this exists to stop: accepted, visible for the session,
 	// gone at the next open.
 	for _, v := range n.views {
-		out += "V" + v.name + "\x00"
+		b = append(b, 'V')
+		b = append(b, v.name...)
+		b = append(b, 0)
 	}
 	for _, g := range n.triggers {
-		out += "G" + g.name + "\x00"
+		b = append(b, 'G')
+		b = append(b, g.name...)
+		b = append(b, 0)
 	}
 	// ...and VIRTUAL TABLES, for exactly the reason views and triggers are here. A
 	// module with SHADOW TABLES (fts5, rtree) changed the table list above and so
@@ -320,9 +371,13 @@ func (n *Session) catalogFingerprint() string {
 	// the next open -- the fingerprint never moved, so the commit appended a delta
 	// batch and the catalog holding that definition was never written.
 	for _, vt := range n.vtabs {
-		out += "X" + vt.name + "\x00" + vt.sql + "\x00"
+		b = append(b, 'X')
+		b = append(b, vt.name...)
+		b = append(b, 0)
+		b = append(b, vt.sql...)
+		b = append(b, 0)
 	}
-	return out
+	return b
 }
 
 // ExecArgsNoRet runs one statement and discards its counts, which is what a
@@ -390,7 +445,7 @@ func (n *Session) Commit() (bool, error) {
 	} else if n.DB != nil && n.segLockFile != nil {
 		err = commit()
 	} else {
-		err = withSegmentWriteLockWait(n.segPath, n.busyTimeout(), commit)
+		err = n.withCommitLock(commit)
 	}
 	if !n.InTransaction() {
 		n.EndWriteTxn() // the transaction a BEGIN IMMEDIATE opened is over
@@ -455,7 +510,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 		n.noteCommittedColumnsStale()
 		return true, nil
 	}
-	if n.catalogFingerprint() != n.catalogAtLastWrite {
+	if n.catalogMoved() {
 		// A catalog change cannot be a delta record, and it also invalidates every
 		// record already in the log: a record names its table by its INDEX in the
 		// directory, which a DROP moves. rewriteFile folds the log in and writes
@@ -483,6 +538,10 @@ func (n *Session) commitMainLocked() (bool, error) {
 		}
 	}
 	changes := n.TakeRowChanges()
+	// Handed back for the next statement once this commit is done with it, so
+	// the log does not regrow from nothing every statement. Not under full
+	// capture, whose changes may be held past the commit.
+	defer n.DB.recycleChangeLog(changes)
 	// A ROW WRITE THE CHANGE LOG DOES NOT DESCRIBE cannot become a delta record,
 	// and appending the log and stopping LOSES it. Fall back to the whole-file
 	// rewrite, which writes every table's live rows and so cannot miss one.
@@ -500,7 +559,18 @@ func (n *Session) commitMainLocked() (bool, error) {
 	// CONSUMING, when nothing else reads the log -- see segDeltaRecordsInto.
 	recs, err := segDeltaRecordsInto(n.recBuf, changes, n.effectiveTableIndex(), n.ipkOf, n.storeOf(false))
 	// Kept for the next commit, and emptied on the way out so it pins no row.
-	defer func() { clear(recs[:cap(recs)]); n.recBuf = recs[:0] }()
+	// Only [0:len) was written: every commit clears what it wrote, and an
+	// error returns nil, dropping the buffer. Clearing the whole capacity cost
+	// a one-row commit megabytes of memclr once a bulk load had grown it, so a
+	// buffer that large is dropped instead of kept.
+	defer func() {
+		if cap(recs) > 1<<14 {
+			n.recBuf = nil
+			return
+		}
+		clear(recs)
+		n.recBuf = recs[:0]
+	}()
 	if err != nil {
 		return false, err
 	}
@@ -637,6 +707,10 @@ func (n *Session) Close() error {
 	n.EndWriteTxn()
 	n.ReleaseLockingMode()
 	n.releaseSegmentLockingModeLock() // the engine-direct pragma's lock (holdLockingModeLock)
+	n.appendAt.release()
+	n.releaseCommitLock()
+	n.segStat.release()
+	n.deltaStat.release()
 	n.closed = true
 	n.dropTempFileIfUnclaimed() // C's temp database is OPEN_DELETEONCLOSE
 	n.DB.closed = true
@@ -806,6 +880,10 @@ func (n *Session) Discard() error {
 	n.EndWriteTxn()
 	n.ReleaseLockingMode()
 	n.releaseSegmentLockingModeLock() // the engine-direct pragma's lock (holdLockingModeLock)
+	n.appendAt.release()
+	n.releaseCommitLock()
+	n.segStat.release()
+	n.deltaStat.release()
 	n.closed = true
 	n.dropTempFileIfUnclaimed() // C's temp database is OPEN_DELETEONCLOSE
 	n.DB.closed = true
@@ -825,14 +903,7 @@ func (n *Session) Discard() error {
 // and ran for minutes (262ms without). It needs a session to survive its own
 // compaction without reloading every table.
 func (n *Session) CompactIfLargerThan(nBytes int64) (bool, error) {
-	st, err := os.Stat(segDeltaPath(n.segPath))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	if st.Size() < nBytes {
+	if st := n.pairStamp()[1]; !st.there || st.size < nBytes {
 		return false, nil
 	}
 	did, cerr := CompactSegmentFile(n.segPath)
@@ -1225,11 +1296,11 @@ func (n *Session) compactIfWorthIt() {
 		return
 	}
 	const floor = 1 << 20
-	st, err := os.Stat(n.segPath)
-	if err != nil {
+	st := n.pairStamp()[0]
+	if !st.there {
 		return
 	}
-	threshold := st.Size() / 4
+	threshold := st.size / 4
 	if threshold < floor {
 		threshold = floor
 	}
@@ -1336,8 +1407,46 @@ func stampOf(path string) fileStamp {
 func (n *Session) pairStamp() [2]fileStamp {
 	if n.deltaFor != n.segPath || n.deltaPath == "" {
 		n.deltaPath, n.deltaFor = segDeltaPath(n.segPath), n.segPath
+		n.segStat.release()
+		n.deltaStat.release()
 	}
-	return [2]fileStamp{stampOf(n.segPath), stampOf(n.deltaPath)}
+	return [2]fileStamp{n.segStat.stamp(n.segPath), n.deltaStat.stamp(n.deltaPath)}
+}
+
+// heldStamp stamps a file through a descriptor held open for the purpose. A
+// statement stamps both files several times, and a path stat costs a lookup
+// and an allocation (the path's NUL-terminated copy); fstat on a held
+// descriptor costs neither. The descriptor is trusted only while its file is
+// still linked: renamed over or deleted, it no longer describes the path, and
+// the path is stat'ed and the descriptor reopened. A file opened just after
+// its path was stat'ed can only be newer than that stamp, so the next check
+// reports a change it may not need to -- never misses one.
+//
+// Only where fsstamp.FileStamps (Linux and macOS): not on Windows, where a held
+// handle stops another process renaming or deleting the file.
+type heldStamp struct {
+	f *os.File
+}
+
+func (h *heldStamp) stamp(path string) fileStamp {
+	if h.f != nil {
+		if size, mtime, linked, ok := fsstamp.OfFile(h.f.Fd()); ok && linked {
+			return fileStamp{size: size, mtime: mtime, there: true}
+		}
+		h.release()
+	}
+	st := stampOf(path)
+	if st.there && fsstamp.FileStamps {
+		h.f, _ = os.Open(path)
+	}
+	return st
+}
+
+func (h *heldStamp) release() {
+	if h.f != nil {
+		h.f.Close()
+		h.f = nil
+	}
 }
 
 // RefreshIfStale rebuilds this session when the file it is reading has moved
@@ -1479,7 +1588,7 @@ func (n *Session) reopen(afterFailedCommit bool) error {
 	n.endCtr, n.endPages = fresh.endCtr, fresh.endPages
 	n.loadedCtr, n.loadedPages = fresh.loadedCtr, fresh.loadedPages
 	n.tableIndex, n.ipkOf = fresh.tableIndex, fresh.ipkOf
-	n.appendAt = SegDeltaAppendState{}
+	n.appendAt.release()
 	n.catalogAtLastWrite = fresh.catalogAtLastWrite
 	n.seenStat = stamp
 	if old != nil {
@@ -1703,4 +1812,48 @@ func (db *DB) cachedSegSource(rows []SchemaRow, cols *ReadOnlyPager, freeze bool
 	}
 	db.segSrcCache, db.segSrcKey = src, h
 	return src, nil
+}
+
+// withCommitLock is withSegmentWriteLockWait on a lock file this session keeps
+// open, so a commit costs the lock and its release rather than an open, the
+// runtime's poller registration, the lock, the release and a close. The path is
+// checked against the file the descriptor was opened on, so a lock file
+// replaced underneath is reopened rather than locked stale.
+func (n *Session) withCommitLock(fn func() error) error {
+	if n.commitLock != nil {
+		// Through the held descriptor when the platform can (no path, no
+		// allocation): still linked means the path still names it.
+		if _, _, linked, ok := fsstamp.OfFile(n.commitLock.Fd()); ok {
+			if !linked {
+				n.releaseCommitLock()
+			}
+		} else if fi, err := os.Stat(n.segPath + segmentLockSuffix); err != nil || !os.SameFile(fi, n.commitLockFI) {
+			n.releaseCommitLock()
+		}
+	}
+	if n.commitLock == nil {
+		f, oerr := openSegmentLockFile(n.segPath)
+		if oerr != nil {
+			return oerr
+		}
+		ofi, serr := f.Stat()
+		if serr != nil {
+			f.Close()
+			return serr
+		}
+		n.commitLock, n.commitLockFI = f, ofi
+	}
+	if lerr := acquireLock(n.commitLock, segStateByte, 2, true, n.busyTimeout()); lerr != nil {
+		return segmentLockBusy(lerr, "write")
+	}
+	defer releaseLock(n.commitLock, segStateByte, 2)
+	return fn()
+}
+
+// releaseCommitLock closes the commit lock file, if this session holds one.
+func (n *Session) releaseCommitLock() {
+	if n.commitLock != nil {
+		n.commitLock.Close()
+		n.commitLock, n.commitLockFI = nil, nil
+	}
 }

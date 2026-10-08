@@ -62,6 +62,18 @@ func (db *DB) TakeRowChanges() []RowChange {
 	return out
 }
 
+// recycleChangeLog gives a log taken by TakeRowChanges back as the next
+// statement's empty one, cleared so it pins no row. Only when nothing has been
+// logged since and capture is delta-only: under full capture a consumer may
+// still hold the changes.
+func (db *DB) recycleChangeLog(log []RowChange) {
+	if db.captureFull || db.changeLog != nil || cap(log) == 0 || cap(log) > 1<<14 {
+		return
+	}
+	clear(log)
+	db.changeLog = log[:0]
+}
+
 // changeMark returns a point in the change log to truncate back to (see
 // truncateChanges), for a caller about to apply rows it may later undo.
 func (db *DB) changeMark() int { return len(db.changeLog) }

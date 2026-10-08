@@ -3,6 +3,7 @@ package engine
 import (
 	"maps"
 	"slices"
+	"sync"
 )
 
 // A table's rows, never loaded whole. A session reads rows on demand
@@ -123,7 +124,11 @@ func (b *segRows) walkFiltered(f *segRowFilter, params []Value, yield func(uint6
 		row, err := fullStoredRow(b.tbl, rid, vals)
 		return err == nil && yield(rid, row)
 	}
-	var buf []int64
+	// The selection buffer is a row per segment row: pooled, since a write
+	// statement walks here once and a one-row UPDATE allocated 800 KB for it.
+	bp := segSelPool.Get().(*[]int64)
+	buf := (*bp)[:0]
+	defer func() { *bp = buf[:0]; segSelPool.Put(bp) }()
 	for _, sg := range segs {
 		sel, judged := segSelectRows(sg, f, b.tbl.ipkIndex, params, buf)
 		n := sg.nRows
@@ -369,3 +374,6 @@ func (s *rowStore) segMaxRowid() (uint64, bool) {
 	}
 	return max, found
 }
+
+// segSelPool holds walkFiltered's selection buffers.
+var segSelPool = sync.Pool{New: func() any { return new([]int64) }}

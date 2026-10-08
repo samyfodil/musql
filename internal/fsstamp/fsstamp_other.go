@@ -13,3 +13,10 @@ func Of(path string) (size, mtime int64, ok bool) {
 	}
 	return fi.Size(), fi.ModTime().UnixNano(), true
 }
+
+// OfFile is not available here; ok is always false and the caller stats the
+// path instead.
+func OfFile(fd uintptr) (size, mtime int64, linked, ok bool) { return 0, 0, false, false }
+
+// FileStamps reports whether OfFile works on this platform.
+const FileStamps = false

@@ -1755,7 +1755,7 @@ func (db *DB) fkStoreChildRow(child *tableMeta, childIdx []int, rid uint64, stor
 // it.
 func (db *DB) fkJournal(undo func()) {
 	if db.activeWC != nil {
-		db.activeWC.journal = append(db.activeWC.journal, undo)
+		db.activeWC.undoFn(undo)
 	}
 }
 

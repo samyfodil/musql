@@ -164,7 +164,7 @@ func (n *Session) rewriteFile() error {
 	// both start again from it.
 	n.baseCtr, n.basePages = n.endCtr, n.endPages
 	n.loadedCtr, n.loadedPages = n.endCtr, n.endPages // every row was folded in above
-	n.appendAt = SegDeltaAppendState{}
+	n.appendAt.release()
 	f, ferr := OpenSegmentFile(n.segPath)
 	if ferr != nil {
 		return ferr
@@ -571,7 +571,7 @@ func (n *Session) refreshPairIdentity() error {
 	if baseCtr != n.baseCtr || basePages != n.basePages {
 		// A different generation of the file: nothing this session carried about
 		// where to append is still true.
-		n.appendAt = SegDeltaAppendState{}
+		n.appendAt.release()
 	}
 	n.baseCtr, n.basePages = baseCtr, basePages
 	n.endCtr, n.endPages = endCtr, endPages

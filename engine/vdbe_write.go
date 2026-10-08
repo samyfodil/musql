@@ -40,11 +40,14 @@ type writeCtx struct {
 	// created by fireState.
 	fs *triggerFireState
 
-	// journal is this statement's undo log: one closure per storage mutation
+	// journal is this statement's undo log: one entry per storage mutation
 	// (insert, delete, update), each of which puts the row store back exactly
 	// as it was. runWrite runs them in reverse on any failure -- the engine's
-	// equivalent of SQLite's statement journal.
-	journal []func()
+	// equivalent of SQLite's statement journal. The row-store mutations are
+	// typed entries rather than closures, and the first few live in
+	// journalBuf, so a one-row statement journals without allocating.
+	journal    []undoEntry
+	journalBuf [2]undoEntry
 
 	rowsAffected int // affected-row count, incremented by the storage opcodes; returned by runWrite
 
@@ -621,7 +624,7 @@ func (wc *writeCtx) rollback() {
 	}
 	if !wc.db.journalOffUndoDisabled() {
 		for i := len(wc.journal) - 1; i >= 0; i-- {
-			wc.journal[i]()
+			wc.journal[i].run()
 		}
 		wc.db.truncateChanges(wc.changeMark)
 	}
@@ -2465,7 +2468,9 @@ func (db *DB) compileDeleteStmt(stmt *deleteStmt, trig *trigCompileCtx) (*Progra
 	// A rowid point lookup, when the WHERE pins one: the scan fetches that row
 	// instead of materializing the table. Pure candidate-set restriction -- the
 	// conjunct below still runs on the fetched row. See write_rowid_seek.go.
-	emitWriteRowidSeekHint(c, tbl, 0, stmt.where)
+	if !emitWriteRowidSeekHint(c, tbl, 0, stmt.where) {
+		emitWriteIndexSeekHint(c, tbl, 0, stmt.where)
+	}
 	rewind := c.emit(Instruction{Op: OpRewind, P1: 0})
 	loopTop := c.here()
 
@@ -2804,7 +2809,9 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 		// A rowid point lookup, when the WHERE pins one. Only for the ordinary
 		// UPDATE: with a FROM clause the scan drives pass one's EPHEMERAL table,
 		// whose rowids are its own and have nothing to do with the target's.
-		emitWriteRowidSeekHint(c, tbl, scanCur, stmt.where)
+		if !emitWriteRowidSeekHint(c, tbl, scanCur, stmt.where) {
+			emitWriteIndexSeekHint(c, tbl, scanCur, stmt.where)
+		}
 	}
 	// THE ORDER THIS LOOP VISITS ROWS IN, when a SET subquery may depend on it
 	// (a per-row lowering reads the rows before it -- see the liveRow block
@@ -3581,7 +3588,7 @@ func (m *vdbe) fireReplaceVictimDeleteRow(tbl *tableMeta, before, after *trigger
 	db.noteRowChange(tbl, RowDelete, rid, victim, nil)
 	db.fkRowMutated(tbl, rid, rid, victim, nil, nil)
 	tbl.dropRow(rid)
-	m.wctx.journal = append(m.wctx.journal, func() { tbl.putRow(rid, victim) })
+	m.wctx.undoPut(tbl, rid, victim)
 	if after != nil {
 		if err := m.firePlanForRow(after, nil, 0, oldRow, int64(rid)); err != nil && !isRaiseIgnore(err) {
 			return err
@@ -3664,7 +3671,7 @@ func (m *vdbe) storeResolvingConflicts(plan *insertPlan, rowid uint64, full []Va
 				db.noteRowChange(tbl, RowDelete, rid, victim, nil)
 				db.fkRowMutated(tbl, rid, rid, victim, nil, nil)
 				tbl.dropRow(rid)
-				m.wctx.journal = append(m.wctx.journal, func() { tbl.putRow(rid, victim) })
+				m.wctx.undoPut(tbl, rid, victim)
 			}
 		}
 	}
@@ -3689,7 +3696,7 @@ func (m *vdbe) storeRow(tbl *tableMeta, rowid uint64, full []Value) {
 	if !tbl.withoutRowid {
 		m.wctx.db.lastInsertRowid = int64(rowid)
 	}
-	m.wctx.journal = append(m.wctx.journal, func() { tbl.dropRow(rowid) })
+	m.wctx.undoDrop(tbl, rowid)
 }
 
 // opDelete implements OP_Delete: remove the row the cursor points at from the
@@ -3706,7 +3713,7 @@ func (m *vdbe) opDelete(op *Instruction) error {
 	m.wctx.db.noteRowChange(tbl, RowDelete, rowid, victim, nil) // capture log (rowhook.go)
 	m.wctx.db.fkRowMutated(tbl, rowid, rowid, victim, nil, nil)
 	tbl.dropRow(rowid)
-	m.wctx.journal = append(m.wctx.journal, func() { tbl.putRow(rowid, victim) })
+	m.wctx.undoPut(tbl, rowid, victim)
 	m.wctx.rowsAffected++
 	return nil
 }
@@ -3839,7 +3846,7 @@ func (m *vdbe) opUpdateRow(op *Instruction) (int, error) {
 					m.wctx.db.noteRowChange(tbl, RowDelete, rid, victim, nil)
 					m.wctx.db.fkRowMutated(tbl, rid, rid, victim, nil, nil)
 					tbl.dropRow(rid)
-					m.wctx.journal = append(m.wctx.journal, func() { tbl.putRow(rid, victim) })
+					m.wctx.undoPut(tbl, rid, victim)
 				}
 			}
 		}
@@ -3869,10 +3876,7 @@ func (m *vdbe) opUpdateRow(op *Instruction) (int, error) {
 		tbl.putRow(oldRowid, oldVals)
 		return -1, err
 	}
-	m.wctx.journal = append(m.wctx.journal, func() {
-		tbl.dropRow(newRowid)
-		tbl.putRow(oldRowid, oldVals)
-	})
+	m.wctx.undoMove(tbl, newRowid, oldRowid, oldVals)
 	m.wctx.db.noteRowUpdate(tbl, oldRowid, newRowid, oldVals, full) // capture log (rowhook.go)
 	m.wctx.db.fkRowMutated(tbl, oldRowid, newRowid, oldVals, full, fkColMask(len(tbl.cols), plan.colIdx))
 	m.wctx.rowsAffected++
@@ -4058,10 +4062,7 @@ func (m *vdbe) opUpsertStore(op *Instruction) error {
 		tbl.putRow(oldRowid, oldVals)
 		return err
 	}
-	m.wctx.journal = append(m.wctx.journal, func() {
-		tbl.dropRow(newRowid)
-		tbl.putRow(oldRowid, oldVals)
-	})
+	m.wctx.undoMove(tbl, newRowid, oldRowid, oldVals)
 	m.wctx.db.noteRowUpdate(tbl, oldRowid, newRowid, oldVals, full)
 	m.wctx.db.fkRowMutated(tbl, oldRowid, newRowid, oldVals, full, fkColMask(len(tbl.cols), plan.colIdx))
 	m.wctx.rowsAffected++
@@ -4797,4 +4798,55 @@ func insertRejectOmittedDefaults(tbl *tableMeta, stmt *insertStmt, slotOf []int)
 		}
 	}
 	return nil
+}
+
+// undoEntry is one journal entry: a row-store mutation's inverse -- drop a row
+// it added, put back a row it replaced or removed, or both for an update --
+// or, for anything else, a function.
+type undoEntry struct {
+	fn        func()
+	tbl       *tableMeta
+	dropRid   uint64
+	putRid    uint64
+	putVals   []Value
+	drop, put bool
+}
+
+func (e *undoEntry) run() {
+	if e.fn != nil {
+		e.fn()
+		return
+	}
+	if e.drop {
+		e.tbl.dropRow(e.dropRid)
+	}
+	if e.put {
+		e.tbl.putRow(e.putRid, e.putVals)
+	}
+}
+
+func (wc *writeCtx) journalAppend(e undoEntry) {
+	if wc.journal == nil {
+		wc.journal = wc.journalBuf[:0]
+	}
+	wc.journal = append(wc.journal, e)
+}
+
+// undoFn journals an arbitrary undo step.
+func (wc *writeCtx) undoFn(fn func()) { wc.journalAppend(undoEntry{fn: fn}) }
+
+// undoPut journals putting vals back at rid.
+func (wc *writeCtx) undoPut(tbl *tableMeta, rid uint64, vals []Value) {
+	wc.journalAppend(undoEntry{tbl: tbl, putRid: rid, putVals: vals, put: true})
+}
+
+// undoDrop journals dropping the row at rid.
+func (wc *writeCtx) undoDrop(tbl *tableMeta, rid uint64) {
+	wc.journalAppend(undoEntry{tbl: tbl, dropRid: rid, drop: true})
+}
+
+// undoMove journals an update's inverse: drop the row at newRid, then put
+// oldVals back at oldRid.
+func (wc *writeCtx) undoMove(tbl *tableMeta, newRid, oldRid uint64, oldVals []Value) {
+	wc.journalAppend(undoEntry{tbl: tbl, dropRid: newRid, drop: true, putRid: oldRid, putVals: oldVals, put: true})
 }

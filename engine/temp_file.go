@@ -110,7 +110,14 @@ func (db *DB) commitTempFile(changes []RowChange) error {
 	}
 	tp.endCtr++
 	// No fsync: temp database doesn't outlive the connection.
-	if aerr := appendSegmentDeltaAt(tp.path, tp.baseCtr, 0, recs, tp.endCtr, 0, &tp.appendAt, syncNone); aerr != nil {
+	aerr := appendSegmentDeltaAt(tp.path, tp.baseCtr, 0, recs, tp.endCtr, 0, &tp.appendAt, syncNone)
+	// The temp file is deleted when its connection closes, so its delta is not
+	// held open between commits.
+	if tp.appendAt.f != nil {
+		tp.appendAt.f.Close()
+		tp.appendAt.f, tp.appendAt.fi = nil, nil
+	}
+	if aerr != nil {
 		tp.endCtr--
 		tp.fp = "" // the next commit rewrites the file from the live rows
 		return fmt.Errorf("engine: TEMP database: %w", aerr)
@@ -170,7 +177,8 @@ func (db *DB) rewriteTempFile(fp string) error {
 	}
 	old := tp.src
 	tp.src, tp.tableIndex, tp.ipkOf, tp.fp = src, tableIndex, ipkOf, fp
-	tp.baseCtr, tp.endCtr, tp.appendAt = ctr, ctr, SegDeltaAppendState{}
+	tp.appendAt.release()
+	tp.baseCtr, tp.endCtr = ctr, ctr
 	if old != nil {
 		old.Close()
 	}
