@@ -28,9 +28,14 @@ func TestColumnarOrderLimitMatchesTheSorter(t *testing.T) {
 		{`SELECT id FROM t ORDER BY id DESC LIMIT 1`, true},
 		// LIMIT past end: emit every row in order.
 		{`SELECT id, hi FROM t ORDER BY hi DESC LIMIT 100000`, true},
+		// A literal OFFSET: the heap keeps OFFSET+LIMIT and the first OFFSET go.
+		{`SELECT id, hi FROM t ORDER BY hi DESC LIMIT 20 OFFSET 5`, true},
+		{`SELECT id, lo FROM t ORDER BY lo ASC, id DESC LIMIT 3 OFFSET 40`, true},
+		{`SELECT id, hi FROM t ORDER BY hi DESC LIMIT 20 OFFSET 100000`, true}, // OFFSET past end
+		{`SELECT id, hi FROM t ORDER BY hi DESC LIMIT 20 OFFSET 0`, true},
+		{`SELECT id, hi FROM t ORDER BY hi DESC LIMIT 2, 9`, true}, // "LIMIT offset, count"
 		// Shapes it must not serve.
 		{`SELECT id, hi FROM t ORDER BY hi DESC`, false},                       // no LIMIT
-		{`SELECT id, hi FROM t ORDER BY hi DESC LIMIT 20 OFFSET 5`, false},     // OFFSET
 		{`SELECT id, hi FROM t WHERE hi > 0 ORDER BY hi DESC LIMIT 20`, false}, // a WHERE
 		{`SELECT id, hi FROM t ORDER BY hi + 1 DESC LIMIT 20`, false},          // an expression key
 		{`SELECT DISTINCT lo FROM t ORDER BY lo LIMIT 5`, false},               // DISTINCT

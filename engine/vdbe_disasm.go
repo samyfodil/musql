@@ -21,6 +21,7 @@ var opNames = [numOpCodes]string{
 	OpSegHashAgg:           "SegHashAgg",
 	OpSegProgram:           "SegProgram",
 	OpSegEmitRow:           "SegEmitRow",
+	OpSegDistinct:          "SegDistinct",
 	OpGoto:                 "Goto",
 	OpHalt:                 "Halt",
 	OpResultRow:            "ResultRow",

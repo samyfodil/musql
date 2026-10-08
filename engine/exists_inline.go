@@ -85,11 +85,11 @@ func existsInlineOperands(in Instruction) bool {
 // existsInline replaces prog.Insns[at], a correlated OpExists over sub, with a
 // Gosub into a relocated copy of sub appended to prog.
 //
-// The subroutine sets the result to 0, runs the body, and leaves through one
-// of two exits: a result row sets it to 1 and closes the body's cursors (the
-// row is the answer; nothing more is read), and the body's Halt -- reached
-// after its own Close, with no row -- leaves it 0. Either then applies NOT for
-// NOT EXISTS and returns.
+// The subroutine sets the result to "no row", runs the body, and leaves through
+// one of two exits: a result row sets it to "a row" and closes the body's
+// cursors (the row is the answer; nothing more is read), and the body's Halt --
+// reached after its own Close, with no row -- leaves it as it was. NOT EXISTS
+// just swaps the two constants, so no Not runs on either exit.
 func existsInline(prog *Program, at int, sub *Program) {
 	call := prog.Insns[at]
 	dest, not := call.P1, call.P3 != 0
@@ -97,18 +97,18 @@ func existsInline(prog *Program, at int, sub *Program) {
 	retReg := prog.NReg + sub.NReg
 
 	base := len(prog.Insns)
-	body := base + 1               // sub address a lands at body+a
-	found := body + len(sub.Insns) // the result-row exit
-	nfound := 1 + sub.NCursors + 2 // Integer 1, the Closes, then Not? and Return
-	if !not {
-		nfound--
+	body := base + 1                     // sub address a lands at body+a
+	found := body + len(sub.Insns)       // the result-row exit
+	done := found + 1 + sub.NCursors + 1 // past Integer, the Closes and Return: the no-row exit
+	none, some := 0, 1
+	if not {
+		none, some = 1, 0
 	}
-	done := found + nfound // the no-row exit
 	reg := func(r int) int { return r + regOff }
 	cur := func(c int) int { return c + curOff }
 	jump := func(a int) int { return body + a }
 
-	out := append(prog.Insns, Instruction{Op: OpInteger, P1: 0, P2: dest})
+	out := append(prog.Insns, Instruction{Op: OpInteger, P1: none, P2: dest})
 	for _, in := range sub.Insns {
 		r := in
 		switch in.Op {
@@ -160,18 +160,12 @@ func existsInline(prog *Program, at int, sub *Program) {
 		out = append(out, r)
 	}
 	// found: the answer is yes; close what the body left open.
-	out = append(out, Instruction{Op: OpInteger, P1: 1, P2: dest})
+	out = append(out, Instruction{Op: OpInteger, P1: some, P2: dest})
 	for c := 0; c < sub.NCursors; c++ {
 		out = append(out, Instruction{Op: OpClose, P1: cur(c)})
 	}
-	if not {
-		out = append(out, Instruction{Op: OpNot, P1: dest, P2: dest})
-	}
 	out = append(out, Instruction{Op: OpReturn, P1: retReg})
 	// done: no row; the body closed its cursors before its Halt.
-	if not {
-		out = append(out, Instruction{Op: OpNot, P1: dest, P2: dest})
-	}
 	out = append(out, Instruction{Op: OpReturn, P1: retReg})
 
 	out[at] = Instruction{Op: OpGosub, P1: retReg, P2: base}

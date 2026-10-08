@@ -7,6 +7,7 @@
 package engine
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"sort"
@@ -223,6 +224,9 @@ type vdbe struct {
 	yield    bool
 	resumePC int
 	done     bool
+
+	// likePlan is the last LIKE pattern this machine analysed (likePlanFor).
+	likePlan *likePlan
 
 	// firstRow stops the run at its first result row, handing back one empty
 	// row instead of a copy: all EXISTS asks is whether there is one.
@@ -918,6 +922,19 @@ func (prog *Program) execWithParentRun(parent *vdbe, pager *ReadOnlyPager, first
 	return rows, err
 }
 
+// likePlanFor is pat analysed for the byte matcher, reused while the pattern
+// stays the same -- which a constant pattern does for the whole run.
+func (m *vdbe) likePlanFor(pat Value) *likePlan {
+	if pat.Typ != Text {
+		return nil
+	}
+	if lp := m.likePlan; lp != nil && bytes.Equal(lp.src, pat.S) {
+		return lp
+	}
+	m.likePlan = newLikePlan(pat.S)
+	return m.likePlan
+}
+
 // outerCtxUnread reports whether no instruction of prog can read the
 // machine's enclosing evalCtx (m.outer), so a correlated run need not build it:
 // buildOuterEvalCtx gathers the whole outer row, on every run, once per outer
@@ -1405,7 +1422,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			} else {
 				cs := m.likeCaseSensitive()
 				var matched bool
-				if hasEsc {
+				if lp := m.likePlanFor(pat); !hasEsc && x.Typ == Text && lp != nil && lp.ok {
+					matched = lp.match(x.S, cs)
+				} else if hasEsc {
 					matched = likeMatchEscape(valueToText(pat), valueToText(x), esc, cs)
 				} else {
 					matched = likeMatch(valueToText(pat), valueToText(x), cs)
@@ -2027,11 +2046,12 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			// Every one of these reads the cursor's own pager, not m.pager: a
 			// root page is file-local, so counting root N in main for a cursor
 			// over TEMP or an attachment answers about a different table.
-			if preds, okBounds := m.segPlanPreds(plan); okBounds && (len(plan.semis) > 0 || len(plan.ins) > 0) {
+			if preds, okBounds := m.segPlanPreds(plan); okBounds && (len(plan.semis) > 0 || len(plan.ins) > 0 || len(plan.likes) > 0) {
 				semis, okSemi := m.segSemis(plan.semis)
 				ins, okIn := m.segIns(plan.ins)
-				if okSemi && okIn {
-					if total, served := cur.pager.segSemiCountTable(cur.tbl.root, cur.tbl, preds, semis, ins); served {
+				likes, okLike := m.segLikes(plan.likes)
+				if okSemi && okIn && okLike {
+					if total, served := cur.pager.segSemiCountTable(cur.tbl.root, cur.tbl, preds, semis, ins, likes); served {
 						segFilterServed.Add(1)
 						m.regs[op.P1] = Value{Typ: Int, I: int64(total)}
 						pc = op.P3
@@ -2078,6 +2098,20 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				rows, served = cur.pager.segOrderLimitValues(cur.tbl.root, plan, cur.tbl.ipkIndex)
 			}
 			if served {
+				segFilterServed.Add(1)
+				m.segRows, m.segRow = rows[min(plan.offset, len(rows)):], 0
+				pc = op.P3
+				continue
+			}
+			segFilterDeclined.Add(1)
+
+		case OpSegDistinct:
+			dplan, okPlan := op.P4.(*segDistinctPlan)
+			cur := m.cursors[op.P2]
+			if !okPlan || cur == nil || cur.tbl == nil || cur.pager == nil {
+				return nil, fmt.Errorf("vdbe: OpSegDistinct without a plan or an open cursor")
+			}
+			if rows, served := cur.pager.segDistinctTable(cur.tbl.root, dplan.col, cur.tbl.ipkIndex); served {
 				segFilterServed.Add(1)
 				m.segRows, m.segRow = rows, 0
 				pc = op.P3

@@ -3,6 +3,7 @@
 package engine
 
 import (
+	"bytes"
 	"fmt"
 )
 
@@ -259,3 +260,96 @@ func globMatchClass(p []rune, c rune) (matched bool, rest []rune, ok bool) {
 }
 
 // ---- arithmetic ----
+
+// likePlan is a LIKE pattern analysed once for the common shape -- pure ASCII,
+// '%' wildcards, no '_' -- so a row is matched against byte pieces without
+// decoding either side to runes. likeMatch decoded both strings into fresh
+// rune slices and backtracked, per row. The two agree exactly on this shape:
+// an ASCII piece can only match at ASCII bytes, which are always character
+// boundaries in UTF-8 (and every byte of an invalid sequence decodes to its
+// own replacement rune, which no ASCII byte equals), and ASCII folding is the
+// only case rule LIKE has. Anything else -- '_', ESCAPE, a non-ASCII pattern --
+// keeps likeMatch.
+type likePlan struct {
+	src        []byte // the pattern bytes it was built from
+	ok         bool
+	exact      bool // no '%': the text must equal the pattern
+	head, tail bool // the pattern does not start / end with '%'
+	pieces     [][]byte
+}
+
+func newLikePlan(pat []byte) *likePlan {
+	lp := &likePlan{src: append([]byte(nil), pat...)}
+	p := pat
+	if i := bytes.IndexByte(p, 0); i >= 0 {
+		p = p[:i] // walked as a C string, as likeMatch's textBeforeNUL does
+	}
+	for _, c := range p {
+		if c >= 0x80 || c == '_' {
+			return lp
+		}
+	}
+	lp.ok = true
+	if bytes.IndexByte(p, '%') < 0 {
+		lp.exact, lp.pieces = true, [][]byte{p}
+		return lp
+	}
+	lp.head, lp.tail = p[0] != '%', p[len(p)-1] != '%'
+	for _, piece := range bytes.Split(p, []byte{'%'}) {
+		if len(piece) > 0 {
+			lp.pieces = append(lp.pieces, piece)
+		}
+	}
+	return lp
+}
+
+// match reports whether text matches the pattern, under case_sensitive_like
+// when cs.
+func (lp *likePlan) match(text []byte, cs bool) bool {
+	if i := bytes.IndexByte(text, 0); i >= 0 {
+		text = text[:i]
+	}
+	eq := func(a, b []byte) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for i := range a {
+			if a[i] != b[i] && (cs || asciiUpperByte(a[i]) != asciiUpperByte(b[i])) {
+				return false
+			}
+		}
+		return true
+	}
+	if lp.exact {
+		return eq(text, lp.pieces[0])
+	}
+	pieces, lo, hi := lp.pieces, 0, len(text)
+	if lp.head && len(pieces) > 0 {
+		first := pieces[0]
+		if len(first) > hi || !eq(text[:len(first)], first) {
+			return false
+		}
+		lo, pieces = len(first), pieces[1:]
+	}
+	if lp.tail && len(pieces) > 0 {
+		last := pieces[len(pieces)-1]
+		if hi-len(last) < lo || !eq(text[hi-len(last):], last) {
+			return false
+		}
+		hi, pieces = hi-len(last), pieces[:len(pieces)-1]
+	}
+	for _, piece := range pieces {
+		at := -1
+		for i := lo; i+len(piece) <= hi; i++ {
+			if eq(text[i:i+len(piece)], piece) {
+				at = i
+				break
+			}
+		}
+		if at < 0 {
+			return false
+		}
+		lo = at + len(piece)
+	}
+	return true
+}

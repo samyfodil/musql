@@ -35,7 +35,7 @@ type segPlanSemi struct {
 // on its result to the row's Next" and checks the subroutine is exactly the
 // rowid-seek EXISTS existsInline emits:
 //
-//	S:   Integer 0 -> dest ; Goto S+2
+//	S:   Integer none -> dest ; Goto S+2
 //	     OpenRead B (this database, a rowid table)
 //	     Column cursor.keyCol -> k ; SeekRowidHint B k ; Rewind B -> closeB
 //	top: Column B.ipk / Column cursor.keyCol ; Eq (stored) ; IfNot -> nextB
@@ -43,8 +43,10 @@ type segPlanSemi struct {
 //	     <constants the select list loads> ; Goto found
 //	nextB: Next B -> top
 //	closeB: Close B ; Goto done
-//	found: Integer 1 -> dest ; Close B ; Return
+//	found: Integer some -> dest ; Close B ; Return
 //	done:  Return
+//
+// where none/some are 0/1 for EXISTS and 1/0 for NOT EXISTS.
 func segParseSemiGroup(in []Instruction, pc, limit, cursor, nextAt int) (segPlanSemi, int, bool) {
 	var no segPlanSemi
 	if pc+1 >= limit {
@@ -83,7 +85,7 @@ func segParseSemiGroup(in []Instruction, pc, limit, cursor, nextAt int) (segPlan
 		return no, 0, false
 	}
 	dest := test.P1
-	if i0.Op != OpInteger || i0.P1 != 0 || i0.P2 != dest || i1.Op != OpGoto || i1.P2 != s+2 {
+	if i0.Op != OpInteger || (i0.P1 != 0 && i0.P1 != 1) || i0.P2 != dest || i1.Op != OpGoto || i1.P2 != s+2 {
 		return no, 0, false
 	}
 	bt, okT := open.P4.(*resolvedTable)
@@ -140,24 +142,19 @@ func segParseSemiGroup(in []Instruction, pc, limit, cursor, nextAt int) (segPlan
 	f0, ok8 := at(found)
 	f1, ok9 := at(found + 1)
 	if !(ok6 && ok7 && ok8 && ok9) || rew.P2 != nextB+1 || cl.Op != OpClose || cl.P1 != b || toDone.Op != OpGoto ||
-		f0.Op != OpInteger || f0.P1 != 1 || f0.P2 != dest || f1.Op != OpClose || f1.P1 != b {
+		f0.Op != OpInteger || f0.P1 != 1-i0.P1 || f0.P2 != dest || f1.Op != OpClose || f1.P1 != b {
 		return no, 0, false
 	}
-	// Each exit is "Return", or "Not dest; Return" for NOT EXISTS -- the same
-	// on both, or this is not the subroutine existsInline writes.
-	exitNot := func(at0 int) (anti, ok bool) {
-		x, okx := at(at0)
-		if okx && x.Op == OpNot && x.P1 == dest && x.P2 == dest {
-			r, okr := at(at0 + 1)
-			return true, okr && r.Op == OpReturn && r.P1 == ret
-		}
-		return false, okx && x.Op == OpReturn && x.P1 == ret
+	// Both exits are a bare Return, or this is not the subroutine existsInline
+	// writes.
+	isReturn := func(a int) bool {
+		x, okx := at(a)
+		return okx && x.Op == OpReturn && x.P1 == ret
 	}
-	antiF, okF2 := exitNot(found + 2)
-	antiD, okD2 := exitNot(toDone.P2)
-	if !okF2 || !okD2 || antiF != antiD {
+	if !isReturn(found+2) || !isReturn(toDone.P2) {
 		return no, 0, false
 	}
+	antiF := i0.P1 == 1 // "no row" is true: NOT EXISTS
 	if antiF && parentNot {
 		return no, 0, false // negated twice: not a shape anything compiles
 	}
@@ -206,7 +203,7 @@ func (p *ReadOnlyPager) segCleanSegments(rootPage uint32) ([]*segment, bool) {
 
 // segSemiCountTable counts the rows of tRoot (whose table is tTbl) satisfying
 // preds and every semi-join, or reports false to decline.
-func (p *ReadOnlyPager) segSemiCountTable(tRoot uint32, tTbl *resolvedTable, preds []segPred, semis []segSemi, ins []segIn) (int, bool) {
+func (p *ReadOnlyPager) segSemiCountTable(tRoot uint32, tTbl *resolvedTable, preds []segPred, semis []segSemi, ins []segIn, likes []segLike) (int, bool) {
 	tSegs, ok := p.segCleanSegments(tRoot)
 	if !ok || tTbl == nil {
 		return 0, false
@@ -247,6 +244,18 @@ func (p *ReadOnlyPager) segSemiCountTable(tRoot uint32, tTbl *resolvedTable, pre
 			}
 			keys[i] = col
 		}
+		type likeCol struct {
+			cells []uint64
+			heap  []byte
+		}
+		likeCols := make([]likeCol, len(likes))
+		for i, sl := range likes {
+			cells, heap, ok := s.BytesColumn(sl.col)
+			if !ok || s.cols[sl.col].phys != PhysText || !segPredColsFilterable(s, []segPred{{Col: sl.col}}) {
+				return 0, false
+			}
+			likeCols[i] = likeCol{cells, heap}
+		}
 		inCols := make([][]int64, len(ins))
 		for i, si := range ins {
 			if si.col == tTbl.ipkIndex {
@@ -285,6 +294,17 @@ func (p *ReadOnlyPager) segSemiCountTable(tRoot uint32, tTbl *resolvedTable, pre
 						in = false
 						break
 					}
+				}
+				for i, sl := range likes {
+					if !in {
+						break
+					}
+					raw := likeCols[i].cells[lo+r]
+					o, n := uint32(raw), uint32(raw>>32)
+					if int(o)+int(n) > len(likeCols[i].heap) {
+						return 0, false
+					}
+					in = sl.plan.match(likeCols[i].heap[o:o+n], sl.cs) != sl.not
 				}
 				for i, si := range ins {
 					if !in {
