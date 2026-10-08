@@ -10,6 +10,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/samyfodil/musql/internal/fsio"
 	"github.com/samyfodil/musql/internal/fsstamp"
 	"github.com/samyfodil/musql/internal/mmapfile"
 )
@@ -385,7 +386,7 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 		}
 		if vf != nil {
 			var tail [8]byte
-			_, rerr := vf.ReadAt(tail[:], carry.offset-8)
+			_, rerr := fsio.ReadAt(vf, tail[:], carry.offset-8)
 			if rerr == nil && binary.LittleEndian.Uint64(tail[:]) == carry.cksum {
 				st = &segDeltaState{bytes: carry.offset, cksum: carry.cksum,
 					endCtr: endCtr, endPages: endPages, version: carry.version}
@@ -507,7 +508,7 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs
 	at, cksum := off, seed
 	flush := func() error {
 		cksum = segDeltaChecksum(buf, cksum)
-		if _, err := f.WriteAt(buf, at); err != nil {
+		if _, err := fsio.WriteAt(f, buf, at); err != nil {
 			return err
 		}
 		at += int64(len(buf))
@@ -564,7 +565,7 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs
 	// chunk is summed, and goes out in the same write: one call, not two.
 	cksum = segDeltaChecksum(buf, cksum)
 	buf = binary.LittleEndian.AppendUint64(buf, cksum)
-	if _, err := f.WriteAt(buf, at); err != nil {
+	if _, err := fsio.WriteAt(f, buf, at); err != nil {
 		return 0, 0, err
 	}
 	return at + int64(len(buf)), cksum, nil

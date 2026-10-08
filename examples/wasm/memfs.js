@@ -172,6 +172,27 @@
 			if (old) old.unlinked = true;
 			nodes.set(p, { ino: nextIno++, mode: S_IFREG | 0o644, data: new Uint8Array(bytes), size: bytes.byteLength, mtime: nowNs() });
 		},
+		// Positioned read and write for the engine's commit path (internal/fsio):
+		// read and write above at an explicit position, called directly.
+		preadSync(fd, dst, pos) {
+			const f = fds.get(fd);
+			if (!f || f.node.dir) return -1;
+			const n = f.node, k = Math.max(0, Math.min(dst.length, n.size - pos));
+			dst.set(n.data.subarray(pos, pos + k));
+			return k;
+		},
+		pwriteSync(fd, src, pos) {
+			const f = fds.get(fd);
+			if (!f || f.node.dir) return -1;
+			const n = f.node;
+			const at = f.flags & O.O_APPEND ? n.size : pos;
+			grow(n, at + src.length);
+			n.data.set(src, at);
+			if (at + src.length > n.size) n.size = at + src.length;
+			n.mtime = nowNs();
+			return src.length;
+		},
+		fsyncSync(fd) { return fds.has(fd) ? 0 : -1; },
 		// fstat for the engine's held-descriptor stamp (internal/fsstamp OfFile):
 		// size, mtime in ns, and whether the file still has a name.
 		fstatStamp(fd) { const f = fds.get(fd); if (!f) return null; const n = f.node; return [n.dir ? 0 : n.size, n.mtime, n.unlinked ? 0 : 1]; },

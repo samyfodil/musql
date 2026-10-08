@@ -66,6 +66,36 @@ globalThis.musqlJIT = (go, { enabled = true } = {}) => {
 			dv.setBigInt64(out + 16, BigInt(st[2]), true);
 			return 1;
 		},
+		// The commit path's positioned read, positioned write and fsync
+		// (internal/fsio): memfs's own when it is the filesystem, Node's
+		// otherwise. -1 on any failure.
+		file_pread(fd, ptr, n, off) {
+			const dst = new Uint8Array(go._inst.exports.mem.buffer, ptr, n);
+			try {
+				return globalThis.fs.preadSync ? globalThis.fs.preadSync(fd, dst, Number(off)) : globalThis.fs.readSync(fd, dst, 0, n, Number(off));
+			} catch {
+				return -1;
+			}
+		},
+		file_pwrite(fd, ptr, n, off) {
+			const src = new Uint8Array(go._inst.exports.mem.buffer, ptr, n);
+			try {
+				return globalThis.fs.pwriteSync ? globalThis.fs.pwriteSync(fd, src, Number(off)) : globalThis.fs.writeSync(fd, src, 0, n, Number(off));
+			} catch {
+				return -1;
+			}
+		},
+		file_fsync(fd) {
+			try {
+				if (globalThis.fs.fsyncSync) {
+					const r = globalThis.fs.fsyncSync(fd);
+					return typeof r === "number" ? r : 0;
+				}
+				return 0;
+			} catch {
+				return -1;
+			}
+		},
 		call_kernel(slot, args) {
 			kernels[slot](args);
 		},
