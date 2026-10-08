@@ -368,6 +368,14 @@ const (
 	cteRecursionRowCap        = 300_000
 	cteRecursionByteCap       = 512 << 20
 	cteRecursionStreamByteCap = 4 << 30
+	// cteRecursionStreamRowCap is the row cap for rows streamed into an
+	// INSERT: ten times the in-memory one, so a single statement can load
+	// millions of rows, and still low enough that a recursion nothing stops
+	// declines in seconds (about 17 at the rate the 300k cap was measured)
+	// rather than running until the content cap -- minutes, while every row's
+	// change record accumulated (the fts5 -short harness was OOM-killed at
+	// 30 GB with no row cap here).
+	cteRecursionStreamRowCap = 3_000_000
 )
 
 // recursiveRowFootprint is one produced row's contribution to

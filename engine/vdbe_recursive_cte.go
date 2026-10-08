@@ -477,10 +477,12 @@ func (m *vdbe) recQueueFill(op *Instruction) error {
 		if q.producedBytes > cteRecursionStreamByteCap {
 			return fmt.Errorf("engine: unsupported: recursive CTE %s produced more than %d bytes of row content with nothing bounding it", q.spec.name, int64(cteRecursionStreamByteCap))
 		}
-		// No row cap here. It bounds TIME for narrow rows held in memory, and
-		// these rows are not held: they leave as the INSERT stores them. A
-		// terminating recursion of any length then runs, as in C, and a
-		// runaway one still stops at the content cap above.
+		// A row cap of its own: these rows are not held in memory, so it can
+		// be far above the in-memory one, but a runaway still has to stop
+		// in seconds (cteRecursionStreamRowCap).
+		if q.emitted+int64(q.len()) > cteRecursionStreamRowCap {
+			return fmt.Errorf("engine: unsupported: recursive CTE %s exceeded this engine's internal row limit of %d rows streamed into an INSERT (possible non-terminating recursion)", q.spec.name, int64(cteRecursionStreamRowCap))
+		}
 		return nil
 	}
 	if q.producedBytes > cteRecursionByteCap {
