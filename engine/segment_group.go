@@ -15,6 +15,9 @@ type segGroupPlan struct {
 	argRegs []int // register the scan body writes that argument into
 	agg     *aggPlan
 	seg     int // the AggStep segment selector (OpHashAggStep's P2)
+	// preds is the WHERE, when there is one: only rows satisfying every
+	// predicate reach the aggregate, as in the loop this replaces.
+	preds []segPlanPred
 }
 
 // segHashAggTable drives the whole grouped scan from segments, or declines to
@@ -25,15 +28,32 @@ func (m *vdbe) segHashAggTable(p *ReadOnlyPager, rootPage uint32, plan *segGroup
 	if saved != nil && len(saved.buckets) > 0 {
 		return false // not the fresh table this walk may throw away
 	}
+	// The WHERE's bounds resolve now, when the parameters are bound. A bound no
+	// predicate kernel models (a NULL) declines the whole walk, as it does for
+	// the filtered count.
+	var preds []segPred
+	if len(plan.preds) > 0 {
+		var ok bool
+		if preds, ok = m.segPlanPreds(&segFilterPlan{preds: plan.preds}); !ok {
+			return false
+		}
+		// The rowid alias is stored as NULL and substituted on read, so neither
+		// a block nor a log row can be compared on it here.
+		for _, pr := range preds {
+			if pr.Col == segTableIPK(m, plan) {
+				return false
+			}
+		}
+	}
 	m.hashAgg = nil
-	if !m.segHashAggWalk(p, rootPage, plan) {
+	if !m.segHashAggWalk(p, rootPage, plan, preds) {
 		m.hashAgg = saved
 		return false
 	}
 	return true
 }
 
-func (m *vdbe) segHashAggWalk(p *ReadOnlyPager, rootPage uint32, plan *segGroupPlan) bool {
+func (m *vdbe) segHashAggWalk(p *ReadOnlyPager, rootPage uint32, plan *segGroupPlan, preds []segPred) bool {
 	if p == nil || p.segs == nil || plan == nil || plan.agg == nil {
 		return false
 	}
@@ -56,7 +76,7 @@ func (m *vdbe) segHashAggWalk(p *ReadOnlyPager, rootPage uint32, plan *segGroupP
 	// only hashes it, so nothing downstream retains this slice.
 	keyVals := make([]Value, len(plan.keyRegs))
 	if len(deltaLive) == 0 && !segAnySkips(skips) {
-		switch m.segGroupBulk(segs, plan, segTableIPK(m, plan), row, rowids, keyVals) {
+		switch m.segGroupBulk(segs, plan, segTableIPK(m, plan), row, rowids, keyVals, preds) {
 		case bulkAnswered:
 			return true
 		case bulkFailed:
@@ -80,6 +100,15 @@ func (m *vdbe) segHashAggWalk(p *ReadOnlyPager, rootPage uint32, plan *segGroupP
 		if !okArgs {
 			return false
 		}
+		// The WHERE is evaluated a batch at a time into live, by the same
+		// segApplyPred the filtered count uses, so the two cannot disagree on
+		// which rows match. A column it cannot filter exactly (a NULL, an
+		// exception, a short row's default) declines the whole walk.
+		if len(preds) > 0 && !segPredColsFilterable(s, preds) {
+			return false
+		}
+		var flags [segFilterBatch]uint8
+		batchLo := -1
 		for r := 0; r < s.nRows; r++ {
 			// The log's own copy of this row supersedes or removes the block's,
 			// and both sides are position-ordered, so one pointer walks the skip
@@ -90,6 +119,21 @@ func (m *vdbe) segHashAggWalk(p *ReadOnlyPager, rootPage uint32, plan *segGroupP
 			if sk < len(skip) && skip[sk] == r {
 				sk++
 				continue
+			}
+			if len(preds) > 0 {
+				if lo := r - r%segFilterBatch; lo != batchLo {
+					batchLo = lo
+					live := flags[:min(lo+segFilterBatch, s.nRows)-lo]
+					for i := range live {
+						live[i] = 1
+					}
+					for _, pr := range preds {
+						segApplyPred(s, pr, lo, live)
+					}
+				}
+				if flags[r-batchLo] == 0 {
+					continue
+				}
 			}
 			for i := range plan.keyRegs {
 				val, okv := keyCols[i].value(s, r)
@@ -139,6 +183,15 @@ func (m *vdbe) segHashAggWalk(p *ReadOnlyPager, rootPage uint32, plan *segGroupP
 		slices.Sort(rids)
 		for _, rid := range rids {
 			vals := deltaLive[rid]
+			if len(preds) > 0 {
+				matched, served := rowMatchesPreds(vals, preds)
+				if !served {
+					return false
+				}
+				if !matched {
+					continue
+				}
+			}
 			if !segGroupStepRow(m, plan, row, rowids, keyVals, rid, vals) {
 				return false
 			}

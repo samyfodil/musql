@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync/atomic"
+	"unsafe"
 )
 
 // vdbe holds one execution's mutable state: the register file, the open
@@ -34,7 +36,6 @@ type vdbe struct {
 	// OpSegEmitRow.
 	segRows [][]Value
 	segRow  int
-
 
 	// outer is the enclosing query's evalCtx when this program is executing a
 	// correlated subquery (threaded in by execOuter); nil for a top-level run.
@@ -71,7 +72,7 @@ type vdbe struct {
 	// machine, and only the aggregate opcodes ever touch it. Inline it and every
 	// point lookup pays for a field it never reads -- and a machine is allocated
 	// per statement AND per nested subquery.
-	aggCtx      *evalCtx
+	aggCtx *evalCtx
 
 	// fnArgBuf is OpFunction's reusable argument vector -- sqlite3_context.argv,
 	// which C allocates once per opcode (P4_FUNCCTX, vdbe.c:8866). Allocating per
@@ -222,6 +223,10 @@ type vdbe struct {
 	yield    bool
 	resumePC int
 	done     bool
+
+	// firstRow stops the run at its first result row, handing back one empty
+	// row instead of a copy: all EXISTS asks is whether there is one.
+	firstRow bool
 
 	// accumChecked/accumulates memoize whether this machine's program holds an
 	// opcode that gathers every row before producing any (programAccumulates),
@@ -837,9 +842,23 @@ func (prog *Program) execWithParent(parent *vdbe) (rows [][]Value, err error) {
 	return prog.execWithParentOn(parent, pager)
 }
 
+// execWithParentFirst is execWithParent for EXISTS: it stops at the first
+// result row and returns it empty (see vdbe.firstRow).
+func (prog *Program) execWithParentFirst(parent *vdbe) ([][]Value, error) {
+	prog, pager, err := parent.liveLower(prog, parent.pager)
+	if err != nil {
+		return nil, err
+	}
+	return prog.execWithParentRun(parent, pager, true)
+}
+
 // execWithParentOn is execWithParent over an explicit pager: the parent's own
 // for every ordinary body, the fresh image liveLower built for a live one.
 func (prog *Program) execWithParentOn(parent *vdbe, pager *ReadOnlyPager) (rows [][]Value, err error) {
+	return prog.execWithParentRun(parent, pager, false)
+}
+
+func (prog *Program) execWithParentRun(parent *vdbe, pager *ReadOnlyPager, firstRow bool) (rows [][]Value, err error) {
 	if prog.Compound != nil {
 		// A compound has no machine of its own -- its arms ARE the frames --
 		// so the parent is handed to each arm directly rather than wrapped in
@@ -850,22 +869,24 @@ func (prog *Program) execWithParentOn(parent *vdbe, pager *ReadOnlyPager) (rows 
 	// The aggregate opcodes resolve a correlated
 	// reference through evalCtx.outer, not through OpOuterColumn -- see
 	// Program.OuterFrames and buildOuterEvalCtx.
-	outerCtx, oerr := buildOuterEvalCtx(prog.OuterFrames, parent)
-	if oerr != nil {
-		return nil, oerr
+	var outerCtx *evalCtx
+	if !prog.outerCtxUnread() {
+		var oerr error
+		if outerCtx, oerr = buildOuterEvalCtx(prog.OuterFrames, parent); oerr != nil {
+			return nil, oerr
+		}
 	}
-	m := &vdbe{
-		regs:         make([]Value, prog.NReg),
-		cursors:      make([]*vdbeCursor, prog.NCursors),
-		recRegs:      make([][]Value, prog.NRecRegs),
-		sorters:      make([]*vdbeSorter, prog.NSorters),
-		distinctSets: make([]*vdbeDistinctSet, prog.NDistinct),
-		subCache:     make([]subCacheEntry, prog.NSubCache),
-		pager:        pager,
-		params:       parent.params,
-		parent:       parent,
-		outer:        outerCtx,
-	}
+	// From the machine pool, as execOuterTrig's machines are: a correlated
+	// subquery runs once per outer row, and a fresh machine for every run was
+	// most of what such a query allocated. See vdbe_machine_pool.go for what
+	// may be reused.
+	m := prog.getMachine()
+	m.jx = prog.jitCode()
+	m.sorters = make([]*vdbeSorter, prog.NSorters)
+	m.distinctSets = make([]*vdbeDistinctSet, prog.NDistinct)
+	m.subCache = make([]subCacheEntry, prog.NSubCache)
+	m.pager, m.params, m.parent, m.outer = pager, parent.params, parent, outerCtx
+	m.firstRow = firstRow
 	// The four pseudo-rows travel down here exactly as they do in
 	// execOuterTrig above, and for the identical reason: OpParam reads them off
 	// the RUNNING machine, not off a frame, so a sub-program invoked through
@@ -889,7 +910,49 @@ func (prog *Program) execWithParentOn(parent *vdbe, pager *ReadOnlyPager) (rows 
 		pager.cteScopes = prog.CTEScopeSnapshot
 		defer func() { pager.cteScopes = saved }()
 	}
-	return m.run(prog.Insns)
+	rows, err = m.run(prog.Insns)
+	// Released only once finished, as execOuterTrig releases its own.
+	if !m.yield {
+		prog.putMachine(m)
+	}
+	return rows, err
+}
+
+// outerCtxUnread reports whether no instruction of prog can read the
+// machine's enclosing evalCtx (m.outer), so a correlated run need not build it:
+// buildOuterEvalCtx gathers the whole outer row, on every run, once per outer
+// row. Only the aggregate, window, fts auxiliary, virtual-table and function
+// opcodes read m.outer, so this is a WHITELIST of opcodes that do not -- an
+// opcode missing from it keeps the context, which is the safe direction.
+func (prog *Program) outerCtxUnread() bool {
+	if len(prog.Insns) == 0 {
+		return false
+	}
+	if v := (*outerCtxVerdict)(atomic.LoadPointer(&prog.outerCtx)); v != nil && v.insns == &prog.Insns[0] && v.n == len(prog.Insns) {
+		return v.unread
+	}
+	unread := true
+	for i := range prog.Insns {
+		switch prog.Insns[i].Op {
+		case OpInit, OpOpenRead, OpRewind, OpNext, OpClose, OpHalt, OpGoto,
+			OpColumn, OpRowid, OpOuterColumn, OpOuterRowid,
+			OpInteger, OpVariable, OpNull, OpString8, OpReal, OpSCopy, OpCopy,
+			OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull,
+			OpSeekRowidHint, OpSeekIndexHint, OpAutoIndexOrder, OpResultRow:
+		default:
+			unread = false
+		}
+	}
+	atomic.StorePointer(&prog.outerCtx, unsafe.Pointer(&outerCtxVerdict{insns: &prog.Insns[0], n: len(prog.Insns), unread: unread}))
+	return unread
+}
+
+// outerCtxVerdict is outerCtxUnread's cached answer and the instructions it is
+// about.
+type outerCtxVerdict struct {
+	insns  *Instruction
+	n      int
+	unread bool
 }
 
 // outerFrame returns the ancestor vdbe levels frames up (levels >= 1): the
@@ -1135,6 +1198,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 
 		case OpResultRow:
+			if m.firstRow {
+				return [][]Value{nil}, nil
+			}
 			row := make([]Value, op.P2)
 			copy(row, m.regs[op.P1:op.P1+op.P2])
 			rows = append(rows, row)
@@ -2168,7 +2234,15 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 
 		case OpExists:
-			rows, serr := m.runSub(op.P5&p5Correlated != 0, op.P2, op.P4.(*Program))
+			var rows [][]Value
+			var serr error
+			if sub := op.P4.(*Program); op.P5&p5Correlated != 0 && sub.Compound == nil && sub.NSorters == 0 {
+				// Correlated, so run once per outer row: stop at the first row.
+				// No sorter, so stopping early leaves no spilled sort behind.
+				rows, serr = sub.execWithParentFirst(m)
+			} else {
+				rows, serr = m.runSub(op.P5&p5Correlated != 0, op.P2, sub)
+			}
 			if serr != nil {
 				return nil, serr
 			}
