@@ -108,6 +108,9 @@ type DB struct {
 	// writePlanStat1 is the statistics snapshot they were planned under: an
 	// ANALYZE over an existing sqlite_stat1 moves neither guard above.
 	writePlanStat1 *planStat1
+	// writePlanReverse is the reverse_unordered_selects setting they were
+	// compiled under (cachedWriteProgram).
+	writePlanReverse bool
 
 	// stat1 is sqlite_stat1 as this connection last LOADED it, and stat1Loaded
 	// whether it has -- the Table/Index statistics C keeps in its schema. See
@@ -549,7 +552,7 @@ type DB struct {
 	// commitsEachStatement: the caller commits after every autocommit
 	// statement (SetCommitsEachStatement).
 	commitsEachStatement bool
-	changeLog   []RowChange
+	changeLog            []RowChange
 
 	// segments is the read side of a SEGMENT session (segment_write.go): the
 	// pager whose ScanTable serves segments with the delta merged. Non-nil only

@@ -339,11 +339,17 @@ func openRowStoreCursor(tbl *tableMeta) *vdbeCursor {
 //   - Program.WritePager: a program reading a frozen snapshot is never cached,
 //     or "INSERT INTO t SELECT ... FROM t" would re-read its first snapshot.
 func (db *DB) cachedWriteProgram(sqlText string) (*Program, error) {
+	// reverse_unordered_selects is read at compile time -- the scan order a
+	// write's subqueries and its one-pass choice take -- so a program compiled
+	// under one setting is not the program for the other, as for the read plan
+	// cache (SetPragmaTuningValues drops that one).
+	reverse := db.pragmaState.ReverseUnorderedSelects()
 	if db.writePlans == nil || db.writePlanCookie != db.schemaGen || db.writePlanTxGen != db.txGen ||
-		db.writePlanStat1 != db.planStats() {
+		db.writePlanStat1 != db.planStats() || db.writePlanReverse != reverse {
 		db.writePlans = make(map[string]*Program)
 		db.writePlanCookie, db.writePlanTxGen = db.schemaGen, db.txGen
 		db.writePlanStat1 = db.planStats()
+		db.writePlanReverse = reverse
 	}
 	if p, ok := db.writePlans[sqlText]; ok {
 		return p, nil
