@@ -11,7 +11,12 @@ import (
 // did, for every queue discipline, and a runaway recursion still stops at the
 // same cap.
 func TestRecInlineMatchesTheSubProgram(t *testing.T) {
-	p := newSegPair(t, `CREATE TABLE t(id INTEGER PRIMARY KEY, sec INTEGER, payload TEXT)`)
+	p := newSegPair(t, `CREATE TABLE t(id INTEGER PRIMARY KEY, sec INTEGER, payload TEXT)`,
+		`CREATE TABLE link(aa INT, bb INT)`,
+		`INSERT INTO link VALUES(1,3),(5,3),(5,6),(6,7),(3,10)`,
+		`CREATE TABLE t1(x)`,
+		`INSERT INTO t1 VALUES(1),(2)`,
+		`CREATE VIEW v AS SELECT * FROM t1`)
 	queries := []string{
 		`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 500) SELECT count(*), sum(i), max(i) FROM c`,
 		`WITH RECURSIVE c(i, s) AS (SELECT 1, 'a' UNION ALL SELECT i + 1, s || i FROM c WHERE i < 40) SELECT i, s FROM c`,
@@ -24,6 +29,10 @@ func TestRecInlineMatchesTheSubProgram(t *testing.T) {
 		`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < ?) SELECT count(*) FROM c`,
 		`WITH RECURSIVE c(i, n) AS (SELECT 1, NULL UNION ALL SELECT i + 1, CASE WHEN i % 3 = 0 THEN NULL ELSE i END FROM c WHERE i < 50) SELECT count(n), sum(n) FROM c`,
 		`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c) SELECT count(*) FROM c`, // runaway: the cap
+		// A step that joins: its self cursor and a table scan on one pooled
+		// machine (with5.test, with2.test).
+		`WITH RECURSIVE closure(x) AS (VALUES(1) UNION SELECT aa FROM link, closure WHERE link.bb=closure.x UNION SELECT bb FROM closure, link WHERE link.aa=closure.x) SELECT group_concat(x) FROM (SELECT x FROM closure ORDER BY x)`,
+		`WITH q(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM q, v WHERE a<5) SELECT count(*), sum(a) FROM q`,
 	}
 	ask := func(q string, inline bool) string {
 		recInlineOffForTest = !inline
@@ -44,7 +53,11 @@ func TestRecInlineMatchesTheSubProgram(t *testing.T) {
 		return fmt.Sprint(typedRows(rows))
 	}
 	for _, q := range queries {
-		if want, got := ask(q, false), ask(q, true); got != want {
+		want, got := ask(q, false), ask(q, true)
+		if strings.HasPrefix(want, "error: ") && !strings.Contains(q, "runaway") && !strings.Contains(q, "FROM c) SELECT count(*)") {
+			t.Errorf("%s: %s", q, want)
+		}
+		if got != want {
 			t.Errorf("%s:\n inlined     %s\n sub-program %s", q, got, want)
 		}
 	}

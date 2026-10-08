@@ -1748,7 +1748,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				break
 			}
 			if ds.recSelf != nil {
-				cur, rerr := m.openRecursiveSelf(ds)
+				cur, rerr := m.openRecursiveSelf(ds, m.cursors[op.P1])
 				if rerr != nil {
 					return nil, rerr
 				}
