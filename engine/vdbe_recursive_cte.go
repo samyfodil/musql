@@ -16,6 +16,7 @@ package engine
 
 import (
 	"container/heap"
+	"encoding/binary"
 	"fmt"
 )
 
@@ -286,6 +287,10 @@ type recQueue struct {
 
 	seen *rowKeySet // UNION's iDistinct; nil for UNION ALL
 
+	// disk is the FIFO's tail once it has outgrown recQueueSpillBytes, as C
+	// keeps its queue in an ephemeral table that spills (select.c:2740).
+	disk *recQueueDisk
+
 	limit, offset int64
 	emitted       int64
 	producedBytes int64
@@ -319,7 +324,11 @@ func (q *recQueue) len() int {
 	if len(q.spec.orderKeys) > 0 {
 		return len(q.pq.items)
 	}
-	return len(q.fifo) - q.head
+	n := len(q.fifo) - q.head
+	if q.disk != nil {
+		n += q.disk.n
+	}
+	return n
 }
 
 // push queues one row the setup query or a recursive step produced. The row
@@ -341,6 +350,18 @@ func (q *recQueue) push(row []Value) {
 		q.seq++
 		return
 	}
+	// Once rows are on disk every later one follows them there, so the queue
+	// stays in order: memory is its head, the file its tail.
+	if q.disk == nil && q.queuedBytes > recQueueSpillBytes {
+		q.disk = newRecQueueDisk() // nil when no file can be made: stays in memory
+	}
+	// To disk while the file holds rows (they precede this one) or memory is
+	// full; back to memory once the file has drained.
+	if q.disk != nil && (q.disk.n > 0 || q.queuedBytes > recQueueSpillBytes) {
+		q.queuedBytes -= fp
+		q.disk.push(row)
+		return
+	}
 	q.fifo = append(q.fifo, row)
 }
 
@@ -357,6 +378,9 @@ func (q *recQueue) pop() ([]Value, bool) {
 	}
 	if q.head >= len(q.fifo) {
 		q.fifo, q.head = q.fifo[:0], 0
+		if q.disk != nil && q.disk.n > 0 {
+			return q.disk.pop()
+		}
 		return nil, false
 	}
 	row := q.fifo[q.head]
@@ -453,9 +477,10 @@ func (m *vdbe) recQueueFill(op *Instruction) error {
 		if q.producedBytes > cteRecursionStreamByteCap {
 			return fmt.Errorf("engine: unsupported: recursive CTE %s produced more than %d bytes of row content with nothing bounding it", q.spec.name, int64(cteRecursionStreamByteCap))
 		}
-		if q.emitted+int64(q.len()) > cteRecursionRowCap {
-			return fmt.Errorf("engine: unsupported: recursive CTE %s exceeded this engine's internal row limit (possible non-terminating recursion relying on an outer LIMIT, which this engine's eager evaluation cannot short-circuit)", q.spec.name)
-		}
+		// No row cap here. It bounds TIME for narrow rows held in memory, and
+		// these rows are not held: they leave as the INSERT stores them. A
+		// terminating recursion of any length then runs, as in C, and a
+		// runaway one still stops at the content cap above.
 		return nil
 	}
 	if q.producedBytes > cteRecursionByteCap {
@@ -476,6 +501,11 @@ func (m *vdbe) recQueuePop(op *Instruction) (bool, error) {
 		return false, fmt.Errorf("vdbe: recursive CTE queue read with no open queue")
 	}
 	row, ok := q.pop()
+	if q.disk != nil && q.disk.err != nil {
+		// A row that could not be written or read back is a row the answer
+		// needs: an error, never a shorter result.
+		return false, fmt.Errorf("engine: recursive CTE %s queue spill: %w", q.spec.name, q.disk.err)
+	}
 	if !ok {
 		return false, nil
 	}
@@ -528,4 +558,113 @@ func (m *vdbe) openRecursiveSelf(ds *derivedSource) (*vdbeCursor, error) {
 	row := make([]Value, len(cur.row))
 	copy(row, cur.row)
 	return openDerivedCursor(ds.tbl, [][]Value{row}, nil), nil
+}
+
+// recQueueSpilled counts rows written to a queue file, for tests.
+var recQueueSpilled int64
+
+// recQueueSpillBytes is how much of a FIFO queue stays in memory before its
+// tail goes to disk. A variable so a test can force the spill.
+var recQueueSpillBytes int64 = 64 << 20
+
+// recQueueDisk is a FIFO queue's tail in a temp file: records, each after its
+// length as a uvarint, written and read through 1MB buffers in order.
+type recQueueDisk struct {
+	f    *spillFile
+	wbuf []byte // written next, at f.at
+	rbuf []byte // read from file offset rat, consumed up to rpos
+	rat  int64
+	rpos int
+	n    int // rows on disk or in wbuf, not yet popped
+	err  error
+	rec  []byte // one record being encoded, reused
+}
+
+func newRecQueueDisk() *recQueueDisk {
+	f, err := newSpillFile()
+	if err != nil {
+		return nil
+	}
+	return &recQueueDisk{f: f}
+}
+
+func (d *recQueueDisk) push(row []Value) {
+	if d.err != nil {
+		return
+	}
+	d.rec = appendRecord(d.rec[:0], row)
+	rec := d.rec
+	recQueueSpilled++
+	var lenBuf [binary.MaxVarintLen64]byte
+	d.wbuf = append(d.wbuf, lenBuf[:binary.PutUvarint(lenBuf[:], uint64(len(rec)))]...)
+	d.wbuf = append(d.wbuf, rec...)
+	d.n++
+	if len(d.wbuf) >= 1<<20 {
+		d.flush()
+	}
+}
+
+func (d *recQueueDisk) flush() {
+	if len(d.wbuf) == 0 || d.err != nil {
+		return
+	}
+	if _, err := d.f.f.WriteAt(d.wbuf, d.f.at); err != nil {
+		d.err = err
+		return
+	}
+	d.f.at += int64(len(d.wbuf))
+	d.wbuf = d.wbuf[:0]
+}
+
+// pop reads the next record back. Rows still in wbuf are flushed first, so
+// the file holds every row in order.
+func (d *recQueueDisk) pop() ([]Value, bool) {
+	if d.err != nil || d.n == 0 {
+		return nil, false
+	}
+	for {
+		if l, k := binary.Uvarint(d.rbuf[d.rpos:]); k > 0 && d.rpos+k+int(l) <= len(d.rbuf) {
+			// decodeRecord's TEXT and BLOB values point into the bytes it is
+			// given, and rbuf is overwritten by the next refill: the row gets
+			// its own copy, one allocation that owns all of its payload.
+			rec := append([]byte(nil), d.rbuf[d.rpos+k:d.rpos+k+int(l)]...)
+			row, err := decodeRecord(rec)
+			if err != nil {
+				d.err = err
+				return nil, false
+			}
+			d.rpos += k + int(l)
+			d.n--
+			if d.n == 0 {
+				// Drained: start the file over rather than let it grow.
+				d.f.at, d.rat, d.rbuf, d.rpos = 0, 0, d.rbuf[:0], 0
+			}
+			return row, true
+		}
+		// Not a whole record buffered: refill from the file.
+		d.flush()
+		if d.err != nil {
+			return nil, false
+		}
+		d.rat += int64(d.rpos)
+		rest := copy(d.rbuf, d.rbuf[d.rpos:])
+		d.rbuf, d.rpos = d.rbuf[:rest], 0
+		// 1MB, grown only when one record does not fit in what is left.
+		if cap(d.rbuf) < 1<<20 {
+			d.rbuf = append(make([]byte, 0, 1<<20), d.rbuf...)
+		} else if len(d.rbuf) == cap(d.rbuf) {
+			d.rbuf = append(make([]byte, 0, 2*cap(d.rbuf)), d.rbuf...)
+		}
+		from := d.rat + int64(len(d.rbuf))
+		if from >= d.f.at {
+			d.err = fmt.Errorf("queue file ends with %d rows unread", d.n)
+			return nil, false
+		}
+		k, err := d.f.f.ReadAt(d.rbuf[len(d.rbuf):cap(d.rbuf)], from)
+		if k == 0 && err != nil {
+			d.err = err
+			return nil, false
+		}
+		d.rbuf = d.rbuf[:len(d.rbuf)+k]
+	}
 }
