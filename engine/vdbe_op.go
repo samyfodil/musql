@@ -1019,6 +1019,10 @@ type Instruction struct {
 type Program struct {
 	Insns      []Instruction
 	vmJIT      unsafe.Pointer // *vmJIT: the native code jitCode compiled for Insns, or noVMJIT
+	// outerCtx is *outerCtxVerdict: outerCtxUnread's answer for Insns, checked
+	// against them as vmJIT is, since a Program copied by value can be handed
+	// different instructions.
+	outerCtx unsafe.Pointer
 	NReg       int      // registers to allocate (r[0..NReg-1]).
 	NCursors   int      // table cursors to allocate (cursors[0..NCursors-1]); 0 for a cursor-free (FROM-less) program.
 	NRecRegs   int      // record registers to allocate (rr[0..NRecRegs-1]); 0 for a program with no ORDER BY (see the sorter opcodes above).

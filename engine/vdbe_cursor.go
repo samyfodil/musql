@@ -490,6 +490,20 @@ func (cur *vdbeCursor) rewind() error {
 		// the delta's two maps in front. Same precedence as the merged scan,
 		// same normalize, so a seeked row is the row a scan would have found.
 		if cur.seekConfigured && !cur.tbl.withoutRowid {
+			// Positioned, not built, when the segments are the whole answer:
+			// columns are read one at a time as the program asks for them.
+			// Not marked materialized, so the next rewind seeks again.
+			if src, served := cur.pager.segPointSeek(cur, cur.seekKey); served {
+				cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
+				cur.segSrc, cur.segCur = src, nil
+				if src != nil {
+					cur.segSrcCols = src.cols
+				}
+				cur.streamErrPending = nil
+				cur.pos = -1
+				cur.rowidNull = false
+				return nil
+			}
 			raw, found, served := cur.pager.SeekRowidSegments(cur.tbl.root, cur.seekKey)
 			if served {
 				cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]

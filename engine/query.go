@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // resolvedTable is a table's metadata as needed to execute a query against
@@ -41,6 +42,10 @@ type resolvedTable struct {
 	// vdbeCursor.orderByWithoutRowidPK (vdbe_cursor.go), which is where a
 	// segment-backed one gets that order rather than the order rows were written.
 	pkDesc []bool
+
+	// segPlans caches segColPlansFor: the per-column read rules a lazy segment
+	// read applies, which are properties of the table alone.
+	segPlans atomic.Pointer[[]segColPlan]
 }
 
 // sqlTextTableIsWithoutRowid reports whether a CREATE TABLE ends in a top-level

@@ -66,7 +66,10 @@ var segRowQueries = []struct {
 	{`SELECT k, count(*) FROM t GROUP BY k ORDER BY k`, false, "the columnar GROUP BY driver answers it"},
 	{`SELECT id, v FROM t ORDER BY v DESC, id DESC LIMIT 10`, false, "the bounded top-N path answers it"},
 	{`SELECT id FROM t WHERE s = 's42'`, true, ""},
-	{`SELECT typeof(r), typeof(n), typeof(b) FROM t WHERE id = 1`, false, "a rowid seek, which rewind excludes"},
+	{`SELECT typeof(r), typeof(n), typeof(b) FROM t WHERE id = 1`, true, "a rowid seek, positioned rather than built (segPointSeek)"},
+	{`SELECT * FROM t WHERE id = 7`, true, "a whole row through a point seek"},
+	{`SELECT rowid, id, r FROM t WHERE rowid = 1999`, true, ""},
+	{`SELECT * FROM t WHERE id = 999999`, false, "a miss: the seek finds no row to serve"},
 	{`SELECT id, v FROM t WHERE v > 900000 ORDER BY id LIMIT 5`, true, ""},
 }
 

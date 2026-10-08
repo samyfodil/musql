@@ -102,6 +102,13 @@ type segRowSource struct {
 	selPos int
 	selOn  bool // sel is authoritative for this segment (it may legitimately be empty)
 
+	// point is a rowid point lookup (segPointSeek): the one row pointSeg/
+	// pointRow, yielded once.
+	point     bool
+	pointDone bool
+	pointSeg  *segment
+	pointRow  int
+
 	// cols is the per-column work segColumn would otherwise redo on every row.
 	// All four facts are properties of the TABLE, not of the row, and deriving
 	// them per read meant two loads out of a columnInfo slice per column per
@@ -169,10 +176,20 @@ func (p *ReadOnlyPager) newSegRowSource(cur *vdbeCursor) *segRowSource {
 			return nil
 		}
 	}
-	plans := make([]segColPlan, len(cur.tbl.cols))
-	for i, c := range cur.tbl.cols {
+	return &segRowSource{segs: segs, cols: segColPlansFor(cur.tbl)}
+}
+
+// segColPlansFor is tbl's per-column read rules, built once per table and
+// cached on it: a point lookup inside a correlated subquery opens a source
+// once per outer row.
+func segColPlansFor(tbl *resolvedTable) []segColPlan {
+	if p := tbl.segPlans.Load(); p != nil {
+		return *p
+	}
+	plans := make([]segColPlan, len(tbl.cols))
+	for i, c := range tbl.cols {
 		plans[i] = segColPlan{
-			isIPK:  i == cur.tbl.ipkIndex,
+			isIPK:  i == tbl.ipkIndex,
 			isReal: c.Aff == affReal,
 			hasDef: c.HasDefault && c.DefaultKnown,
 		}
@@ -182,7 +199,73 @@ func (p *ReadOnlyPager) newSegRowSource(cur *vdbeCursor) *segRowSource {
 			plans[i].def = applyAffinityToValue(c.DefaultValue, c.Aff)
 		}
 	}
-	return &segRowSource{segs: segs, cols: plans}
+	tbl.segPlans.Store(&plans)
+	return plans
+}
+
+// segPointSeek positions a lazy source on the one row with rowid rid, for a
+// rowid point lookup, instead of building, normalizing and wrapping that row
+// as a one-row table. served is false when the segments are not the whole
+// answer for this table -- a row this session wrote, rows pending in the log,
+// a generated column, a segment of the wrong width -- and the caller then does
+// what it always did. A nil src with served true is a miss: no such row.
+//
+// The eligibility is newSegRowSource's, without its cost rule: there is no
+// scan here to weigh, only one row whose columns are read as they are asked
+// for, through the same segColumn every lazy read uses.
+func (p *ReadOnlyPager) segPointSeek(cur *vdbeCursor, rid int64) (src *segRowSource, served bool) {
+	if !segLazyRows || p == nil || p.segs == nil || cur == nil || cur.tbl == nil {
+		return nil, false
+	}
+	if cur.tbl.withoutRowid || cur.hasGeneratedCols() {
+		return nil, false
+	}
+	var segs []*segment
+	if p.segs.isLive(cur.tbl.root) {
+		// A write session's row store, which a held connection reads through.
+		// rowStore.segGet's precedence, step for step: this session's own copy
+		// wins (declined: it is already in memory), a dropped row is a miss,
+		// and otherwise the row is the committed one -- the segments behind
+		// the store's base pager, when nothing for this table is pending in
+		// that pager's log.
+		rows, have, err := p.segs.liveRows(cur.tbl.root)
+		if err != nil || !have || rows == nil || rows.seg == nil {
+			return nil, false
+		}
+		if _, over := rows.m[uint64(rid)]; over {
+			return nil, false
+		}
+		if rows.baseGone || rows.gone[uint64(rid)] {
+			return nil, true
+		}
+		base := rows.seg
+		if base.rp == nil || base.rp.segs == nil || base.rp.segs.isLive(base.root) || !base.rp.segCleanFor(base.root) {
+			return nil, false
+		}
+		segs = base.rp.segs.byRoot[base.root]
+	} else {
+		if !p.segCleanFor(cur.tbl.root) {
+			return nil, false
+		}
+		segs = p.segs.byRoot[cur.tbl.root]
+	}
+	if len(segs) == 0 {
+		return nil, false
+	}
+	for _, s := range segs {
+		if s == nil {
+			return nil, false
+		}
+		i, hit := s.findRowid(rid)
+		if !hit {
+			continue
+		}
+		if len(s.cols) != len(cur.tbl.cols) {
+			return nil, false
+		}
+		return &segRowSource{point: true, pointSeg: s, pointRow: i, cols: segColPlansFor(cur.tbl)}, true
+	}
+	return nil, true
 }
 
 // segRowSourceWins decides whether a per-column read beats one whole-row read
@@ -227,6 +310,14 @@ func segRowSourceWins(cur *vdbeCursor) bool {
 // next advances to the next row, or reports false at the end of the last
 // segment.
 func (src *segRowSource) next() (s *segment, row int, rowid uint64, ok bool) {
+	if src.point {
+		if src.pointDone {
+			return nil, 0, 0, false
+		}
+		src.pointDone = true
+		segRowsServed++
+		return src.pointSeg, src.pointRow, src.pointSeg.Rowid(src.pointRow), true
+	}
 	for src.si < len(src.segs) {
 		s = src.segs[src.si]
 		if src.filter != nil && !src.selOn {
