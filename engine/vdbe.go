@@ -35,7 +35,6 @@ type vdbe struct {
 	segRows [][]Value
 	segRow  int
 
-
 	// outer is the enclosing query's evalCtx when this program is executing a
 	// correlated subquery (threaded in by execOuter); nil for a top-level run.
 	// The aggregate opcodes thread it onto every evalCtx they build so a
@@ -71,7 +70,7 @@ type vdbe struct {
 	// machine, and only the aggregate opcodes ever touch it. Inline it and every
 	// point lookup pays for a field it never reads -- and a machine is allocated
 	// per statement AND per nested subquery.
-	aggCtx      *evalCtx
+	aggCtx *evalCtx
 
 	// fnArgBuf is OpFunction's reusable argument vector -- sqlite3_context.argv,
 	// which C allocates once per opcode (P4_FUNCCTX, vdbe.c:8866). Allocating per
@@ -854,18 +853,15 @@ func (prog *Program) execWithParentOn(parent *vdbe, pager *ReadOnlyPager) (rows 
 	if oerr != nil {
 		return nil, oerr
 	}
-	m := &vdbe{
-		regs:         make([]Value, prog.NReg),
-		cursors:      make([]*vdbeCursor, prog.NCursors),
-		recRegs:      make([][]Value, prog.NRecRegs),
-		sorters:      make([]*vdbeSorter, prog.NSorters),
-		distinctSets: make([]*vdbeDistinctSet, prog.NDistinct),
-		subCache:     make([]subCacheEntry, prog.NSubCache),
-		pager:        pager,
-		params:       parent.params,
-		parent:       parent,
-		outer:        outerCtx,
-	}
+	// From the machine pool, as execOuterTrig's machines are: a correlated
+	// subquery runs once per outer row, and a fresh machine for every run was
+	// most of what such a query allocated. See vdbe_machine_pool.go for what
+	// may be reused.
+	m := prog.getMachine()
+	m.sorters = make([]*vdbeSorter, prog.NSorters)
+	m.distinctSets = make([]*vdbeDistinctSet, prog.NDistinct)
+	m.subCache = make([]subCacheEntry, prog.NSubCache)
+	m.pager, m.params, m.parent, m.outer = pager, parent.params, parent, outerCtx
 	// The four pseudo-rows travel down here exactly as they do in
 	// execOuterTrig above, and for the identical reason: OpParam reads them off
 	// the RUNNING machine, not off a frame, so a sub-program invoked through
@@ -889,7 +885,12 @@ func (prog *Program) execWithParentOn(parent *vdbe, pager *ReadOnlyPager) (rows 
 		pager.cteScopes = prog.CTEScopeSnapshot
 		defer func() { pager.cteScopes = saved }()
 	}
-	return m.run(prog.Insns)
+	rows, err = m.run(prog.Insns)
+	// Released only once finished, as execOuterTrig releases its own.
+	if !m.yield {
+		prog.putMachine(m)
+	}
+	return rows, err
 }
 
 // outerFrame returns the ancestor vdbe levels frames up (levels >= 1): the
