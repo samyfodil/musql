@@ -744,7 +744,11 @@ func compileScanPlain(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols 
 //     an outer join target);
 //   - a top-level AND conjunct is "="/"==" between srcs[i]'s rowid
 //     (rowid/_rowid_/oid) or INTEGER PRIMARY KEY and a column-free E (a
-//     literal or bound parameter).
+//     literal or bound parameter), or a column of an ENCLOSING query
+//     (isOuterSeekKey), which is as constant for one run of a correlated
+//     subquery as a literal. Collation cannot matter: the seek fires only for
+//     an integer key, and any coercion the comparison would apply leaves a
+//     non-integer key and so a full scan.
 //
 // E needs no cursor, so it is evaluated once after srcs[i]'s OpOpenRead,
 // before any Rewind, at any FROM or execution position. Outer join targets
@@ -769,10 +773,10 @@ func detectRowidSeekKey(c *compiler, srcs []joinSource, where Expr) (int, Expr, 
 			if !ok || (be.Op != "=" && be.Op != "==") {
 				continue
 			}
-			if isScopeRowidRef(c, s, be.L) && isSeekKeyCandidate(be.R) {
+			if isScopeRowidRef(c, s, be.L) && (isSeekKeyCandidate(be.R) || isOuterSeekKey(c, be.R)) {
 				return i, be.R, true
 			}
-			if isScopeRowidRef(c, s, be.R) && isSeekKeyCandidate(be.L) {
+			if isScopeRowidRef(c, s, be.R) && (isSeekKeyCandidate(be.L) || isOuterSeekKey(c, be.L)) {
 				return i, be.L, true
 			}
 		}
