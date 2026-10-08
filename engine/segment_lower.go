@@ -43,7 +43,7 @@ func segLowerRegOperands(in Instruction) [3]int {
 		return [3]int{in.P1, -1, -1}
 	case OpNot, OpSCopy, OpNegative: // P1 source, P2 destination
 		return [3]int{in.P1, in.P2, -1}
-	case OpAdd, OpSubtract, OpMultiply, OpBitAnd, OpBitOr: // r[P3] = r[P2] op r[P1]
+	case OpAdd, OpSubtract, OpMultiply, OpRemainder, OpBitAnd, OpBitOr: // r[P3] = r[P2] op r[P1]
 		return [3]int{in.P1, in.P2, in.P3}
 	case OpNull: // P1 destination
 		return [3]int{in.P1, -1, -1}
@@ -74,7 +74,7 @@ func segNullTestedOnly(body []Instruction) map[int]bool {
 		case OpInteger, OpVariable, OpNot, OpSCopy, OpNegative, OpNull:
 			writes[in.P2]++
 			reads[in.P2]--
-		case OpAdd, OpSubtract, OpMultiply, OpBitAnd, OpBitOr:
+		case OpAdd, OpSubtract, OpMultiply, OpRemainder, OpBitAnd, OpBitOr:
 			writes[in.P3]++
 			reads[in.P3]--
 		case OpGt, OpGe, OpLt, OpLe, OpEq, OpNe:
@@ -263,16 +263,19 @@ func segLowerBody(body []Instruction, base int, cursor int, aggAt int) (*segLowe
 		case OpNot:
 			note(in.P2)
 			out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpNot, A: in.P2, B: in.P1})
-		case OpAdd, OpSubtract, OpMultiply:
+		case OpAdd, OpSubtract, OpMultiply, OpRemainder:
 			// The VDBE's arithmetic is "r[P3] = r[P2] <op> r[P1]" -- the RIGHT
 			// operand is P1 (vdbe_op.go's own note), which is why the operands
-			// look reversed here.
+			// look reversed here. A remainder by zero is NULL in SQL; POpRem
+			// flags it like an overflow and the VDBE answers instead.
 			var pop jit.POp
 			switch in.Op {
 			case OpAdd:
 				pop = jit.POpAdd
 			case OpSubtract:
 				pop = jit.POpSub
+			case OpRemainder:
+				pop = jit.POpRem
 			default:
 				pop = jit.POpMul
 			}
@@ -425,7 +428,7 @@ func segLoweredReachable(insns []jit.ProgInsn) []bool {
 			known = maps.Clone(known)
 			known[in.A] = int64(in.B)
 		case jit.POpLoadCol, jit.POpLoadReg, jit.POpCmp, jit.POpAnd, jit.POpOr,
-			jit.POpNot, jit.POpAdd, jit.POpSub, jit.POpMul:
+			jit.POpNot, jit.POpAdd, jit.POpSub, jit.POpMul, jit.POpRem:
 			if _, ok := known[in.A]; ok {
 				known = maps.Clone(known)
 				delete(known, in.A)

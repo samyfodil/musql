@@ -173,6 +173,12 @@ const (
 	POpAccMin
 	POpAccMax
 
+	// POpRem: r[A] = r[B] % r[C], truncating like C's %. A zero divisor is
+	// SQL's NULL, which the IR cannot hold, so it is recorded the way an
+	// overflow is and the caller declines; a divisor of -1 gives 0 (vdbe.c's
+	// "if( iA==-1 ) iA = 1"), which also keeps MinInt64 % -1 from trapping.
+	POpRem
+
 	// POpEmitRow appends the current row index to Sel and counts it in the
 	// accumulator, which the epilogue leaves in *Out. It is what turns a
 	// compiled predicate into a SELECTION rather than a tally: the program

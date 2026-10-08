@@ -18,6 +18,7 @@ const (
 	opI64Sub  byte = 0x7D
 	opI64Mul  byte = 0x7E
 	opI64DivS byte = 0x7F
+	opI64RemS byte = 0x81
 	opI64And  byte = 0x83
 	opI64Or   byte = 0x84
 	opI64Xor  byte = 0x85
@@ -151,6 +152,29 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			w.BrIf(depthTo(i, in.A))
 		case POpNot:
 			storeReg(in.A, func() { loadReg(in.B); w.op(opI64Eqz); bool64() })
+		case POpRem:
+			// rem_s traps on a zero divisor, so a zero is flagged (SQL NULL:
+			// the caller declines) and replaced by 1. MinInt64 rem_s -1 is 0,
+			// which is already vdbe.c's answer for a divisor of -1.
+			loadReg(in.B)
+			w.Set(t1)
+			loadReg(in.C)
+			w.Set(t2)
+			w.Get(ovf)
+			w.Get(t2)
+			w.op(opI64Eqz)
+			w.op(opI64ExtendI32U)
+			w.op(opI64Or)
+			w.Set(ovf)
+			w.Get(t1)
+			w.I64(1)
+			w.Get(t2)
+			w.Get(t2)
+			w.op(opI64Eqz)
+			w.op(opSelect)
+			w.op(opI64RemS)
+			w.Set(t3)
+			storeReg(in.A, func() { w.Get(t3) })
 		case POpAdd, POpSub, POpMul:
 			loadReg(in.B)
 			w.Set(t1)

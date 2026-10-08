@@ -445,3 +445,12 @@ func (a *Asm) JmpReg(r Reg) {
 	}
 	a.emit(0xFF, modrm(0b11, 4, r))
 }
+
+// Cqo sign-extends RAX into RDX:RAX, ahead of an idiv.
+func (a *Asm) Cqo() { a.emit(0x48, 0x99) }
+
+// IdivReg divides RDX:RAX by src: quotient in RAX, remainder in RDX.
+func (a *Asm) IdivReg(src Reg) {
+	a.rex(7, src)
+	a.emit(0xF7, modrm(0b11, 7, src))
+}

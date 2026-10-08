@@ -488,3 +488,14 @@ const (
 	armVS = 0x6 // signed overflow
 	armHI = 0x8 // unsigned higher
 )
+
+// Sdiv emits SDIV Xd, Xn, Xm. It does not trap: a zero divisor gives 0 and
+// MinInt64 / -1 wraps to MinInt64.
+func (a *Arm) Sdiv(rd, rn, rm Reg64) {
+	a.emit(0x9AC00C00 | uint32(rm)<<16 | uint32(rn)<<5 | uint32(rd))
+}
+
+// Msub emits MSUB Xd, Xn, Xm, Xa: Xd = Xa - Xn*Xm.
+func (a *Arm) Msub(rd, rn, rm, ra Reg64) {
+	a.emit(0x9B008000 | uint32(rm)<<16 | uint32(ra)<<10 | uint32(rn)<<5 | uint32(rd))
+}

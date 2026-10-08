@@ -166,7 +166,7 @@ var segWriteFilterSafeOps = map[OpCode]bool{
 	OpInit: true, OpOpenWrite: true, OpRewind: true, OpNext: true, OpHalt: true, OpGoto: true,
 	OpColumn: true, OpRowid: true, OpVariable: true, OpInteger: true, OpReal: true, OpString8: true, OpNull: true,
 	OpEq: true, OpNe: true, OpLt: true, OpLe: true, OpGt: true, OpGe: true, OpIf: true, OpIfNot: true, OpNot: true,
-	OpAdd: true, OpSubtract: true, OpMultiply: true, OpCopy: true, OpSCopy: true,
+	OpAdd: true, OpSubtract: true, OpMultiply: true, OpRemainder: true, OpCopy: true, OpSCopy: true,
 	OpAffinity: true, OpMakeRecord: true, OpUpdateRow: true, OpDelete: true,
 }
 

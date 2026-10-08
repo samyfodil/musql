@@ -122,6 +122,27 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.Setcc(condOverflow, R11)
 			a.OrRegReg(R9, R11)
 			a.MovMemReg32(RSI, in.A, RAX)
+		case POpRem:
+			// RCX is the loop index and R9 the overflow flag, so the divisor
+			// goes in R10; idiv clobbers RDX, which is scratch here.
+			z, m1, st := "rz"+itoa(idx), "rm"+itoa(idx), "rs"+itoa(idx)
+			a.MovRegMem32(RAX, RSI, in.B)
+			a.MovRegMem32(R10, RSI, in.C)
+			a.TestRegReg(R10, R10)
+			a.Jcc(CondE, z)
+			a.CmpRegImm32(R10, -1)
+			a.Jcc(CondE, m1)
+			a.Cqo()
+			a.IdivReg(R10)
+			a.MovRegReg(RAX, RDX)
+			a.Jmp(st)
+			a.Label(z)
+			a.MovRegImm64(R11, 1)
+			a.OrRegReg(R9, R11)
+			a.Label(m1)
+			a.XorRegReg(RAX, RAX)
+			a.Label(st)
+			a.MovMemReg32(RSI, in.A, RAX)
 		case POpAccCount:
 			a.IncReg(R8)
 		case POpEmitRow:

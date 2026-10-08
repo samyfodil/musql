@@ -88,6 +88,22 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.Cmp(X9, xzr)
 			a.Cset(X10, CondE)
 			a.StrImm(X10, X1, in.A*8)
+		case POpRem:
+			// SDIV does not trap, and MSUB then gives C's truncating remainder,
+			// 0 for a divisor of -1 included; only a zero divisor (SQL NULL) is
+			// flagged, for the caller to decline.
+			nz, st := "rn"+itoa(idx), "rs"+itoa(idx)
+			a.LdrImm(X9, X1, in.B*8)
+			a.LdrImm(X10, X1, in.C*8)
+			a.Cbnz(X10, nz)
+			a.MovImm16(X11, 1)
+			a.OrrReg(X4, X4, X11)
+			a.B(st)
+			a.Label(nz)
+			a.Sdiv(X11, X9, X10)
+			a.Msub(X9, X11, X10, X9)
+			a.Label(st)
+			a.StrImm(X9, X1, in.A*8)
 		case POpAdd, POpSub, POpMul:
 			a.LdrImm(X9, X1, in.B*8)
 			a.LdrImm(X10, X1, in.C*8)
