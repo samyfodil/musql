@@ -599,6 +599,18 @@ func (n *Session) commitMainLocked() (bool, error) {
 	// limit, rewrite instead, one file of the live rows, dropping dead
 	// records (this transaction's deletes included, so deleting makes room),
 	// judged whole by rewriteFile: it fits or nothing is written.
+	// A BULK LOAD: when this batch takes the delta past the size the commit's
+	// own compaction check (compactIfWorthIt) rewrites at, appending it first
+	// only writes the rows twice -- once into the delta, once more into the
+	// file the compaction then builds. Rewrite now, once.
+	if !compactionOffForTest && n.compactionDueAfter(recs) {
+		if err := n.rewriteFile(); err != nil {
+			return false, err
+		}
+		n.clearWrittenSinceCommit()
+		n.noteCommittedColumnsStale()
+		return true, nil
+	}
 	if n.maxSize > 0 && n.deltaAppendExceeds(recs) {
 		if err := n.rewriteFile(); err != nil {
 			return false, err
@@ -1291,19 +1303,32 @@ func (n *Session) CommitIfAutocommit() (bool, error) {
 // tests.
 var compactionOffForTest bool
 
+// compactionThreshold is the delta size compactIfWorthIt rewrites the file
+// at: a quarter of the segment file, and never under 1 MiB.
+func compactionThreshold(segSize int64) int64 {
+	return max(segSize/4, 1<<20)
+}
+
+// compactionDueAfter reports whether appending recs would take the delta past
+// compactionThreshold, so the compaction after the commit would rewrite the
+// file anyway.
+func (n *Session) compactionDueAfter(recs []SegDeltaRecord) bool {
+	st := n.pairStamp()
+	if !st[0].there {
+		return false
+	}
+	return st[1].size+segDeltaBatchBytes(recs) > compactionThreshold(st[0].size)
+}
+
 func (n *Session) compactIfWorthIt() {
 	if compactionOffForTest {
 		return
 	}
-	const floor = 1 << 20
 	st := n.pairStamp()[0]
 	if !st.there {
 		return
 	}
-	threshold := st.size / 4
-	if threshold < floor {
-		threshold = floor
-	}
+	threshold := compactionThreshold(st.size)
 	did, cerr := n.CompactIfLargerThan(threshold)
 	if !did || cerr != nil {
 		return

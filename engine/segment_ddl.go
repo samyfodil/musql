@@ -304,10 +304,29 @@ func (db *DB) segmentFileContentsOf(temp bool, w *segFileWriter) ([]ConvertedTab
 			continue
 		}
 
+		ti := len(tables)
+		// A table whose rows are still exactly its file's segments -- nothing
+		// written, deleted or spilled this session, nothing waiting for it in
+		// the delta, the same columns -- is copied segment by segment as the
+		// bytes it already is: a rebuild would cut and encode the same rows
+		// and rebuild the same column indexes. A VACUUM right after a bulk
+		// load paid a whole second rebuild for nothing.
+		if segs, ok := pristineSegments(t); ok {
+			var aerr error
+			for _, sg := range segs {
+				if aerr = w.addSegment(ti, sg.buf); aerr != nil {
+					break
+				}
+			}
+			if aerr != nil {
+				return nil, ConvertedCatalog{}, fmt.Errorf("engine: DDL: %w", aerr)
+			}
+			tables = append(tables, ct)
+			continue
+		}
 		// ONE SEGMENT IN HAND at a time (segCutter): the rows are read in rowid
 		// order and cut as they fill, so a table this session spilled
 		// (row_store_spill.go) is read back a segment at a time, not whole.
-		ti := len(tables)
 		cut := &segCutter{cols: colInfos, what: t.name, emit: func(raw []byte) error { return w.addSegment(ti, raw) }}
 		var cerr error
 		t.rows.eachSortedUntil(func(rid uint64, vals []Value) bool {
@@ -695,4 +714,31 @@ func (db *DB) checkNewIndex(idx *indexMeta, tbl *tableMeta) error {
 		}
 	}
 	return nil
+}
+
+// pristineSegments returns t's file segments when its row store has not moved
+// off them: no row written or deleted this session, none spilled, no delta
+// record for the table, and every segment as wide as the table.
+func pristineSegments(t *tableMeta) ([]*segment, bool) {
+	st := t.rows
+	if st == nil || st.seg == nil || len(st.m) != 0 || len(st.gone) != 0 || st.baseGone || st.spill != nil {
+		return nil, false
+	}
+	rp := st.seg.rp
+	if rp == nil || rp.segs == nil {
+		return nil, false
+	}
+	segs, ok := rp.segs.byRoot[st.seg.root]
+	if !ok {
+		return nil, false
+	}
+	if rows, dead, clean := rp.segs.overlayFor(st.seg.root); !clean || len(rows) != 0 || len(dead) != 0 {
+		return nil, false
+	}
+	for _, sg := range segs {
+		if len(sg.cols) != len(t.cols) {
+			return nil, false
+		}
+	}
+	return segs, true
 }
