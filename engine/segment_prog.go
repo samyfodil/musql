@@ -53,13 +53,14 @@ func segProgKernel(low *segLowered) *jit.Code {
 // enough that a shared-accumulator IR is not worth the complexity: the whole
 // point of "SELECT min(v), max(v) FROM t" being here is that it measured 4.49x
 // SLOWER than C SQLite while every single-aggregate form measured faster.
-func (m *vdbe) segRunProgramAll(p *ReadOnlyPager, rootPage uint32, plan *segProgPlan, ipkCol int) ([]Value, bool) {
+func (m *vdbe) segRunProgramAll(p *ReadOnlyPager, tbl *resolvedTable, plan *segProgPlan) ([]Value, bool) {
+	rootPage, ipkCol := tbl.root, tbl.ipkIndex
 	if plan == nil || len(plan.lows) == 0 {
 		return nil, false
 	}
 	out := make([]Value, len(plan.lows))
 	for i, low := range plan.lows {
-		v, ok := m.segRunOne(p, rootPage, low, ipkCol)
+		v, ok := m.segRunOne(p, tbl, rootPage, low, ipkCol)
 		if !ok {
 			return nil, false
 		}
@@ -68,7 +69,7 @@ func (m *vdbe) segRunProgramAll(p *ReadOnlyPager, rootPage uint32, plan *segProg
 	return out, true
 }
 
-func (m *vdbe) segRunOne(p *ReadOnlyPager, rootPage uint32, low *segLowered, ipkCol int) (Value, bool) {
+func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, low *segLowered, ipkCol int) (Value, bool) {
 	// A row-major delta beside the segments makes a raw block read wrong; see
 	// segCleanFor.
 	if !p.segCleanFor(rootPage) {
@@ -115,7 +116,22 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, rootPage uint32, low *segLowered, ipk
 		empty     bool
 	}
 	results := make([]segResult, len(segs))
-	ok = segEach(len(segs), func(si int) bool {
+	// Service blocks share one window across the statement, in row order, as
+	// the interpreter shares its registers: their segments run one at a time.
+	var svc *segSvcRunner
+	each := segEach
+	if len(low.blocks) > 0 {
+		svc = newSegSvcRunner(m, tbl)
+		each = func(n int, work func(int) bool) bool {
+			for i := range n {
+				if !work(i) {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	ok = each(len(segs), func(si int) bool {
 		s, res := segs[si], &results[si]
 		blocks, isRowid, okCols := segProgColumns(s, low.cols, low.nullCol, ipkCol)
 		if !okCols {
@@ -154,7 +170,9 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, rootPage uint32, low *segLowered, ipk
 			}
 			args.Col[i] = &b[0]
 		}
-		kern.Call2(args)
+		if !segCallKernel(kern, args, svc, low.blocks, s, local) {
+			return false
+		}
 		res.out, res.ovf = out, ovf != 0
 		if low.agg != aggCountStar && low.agg != aggCount {
 			res.rows = local[low.rowsReg]

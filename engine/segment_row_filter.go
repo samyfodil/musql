@@ -284,6 +284,11 @@ func segSelectRows(s *segment, f *segRowFilter, ipkCol int, params []Value, buf 
 		return nil, false
 	}
 	low := f.low
+	if len(low.blocks) > 0 {
+		// A selection kernel with services needs the driver loop and a
+		// machine to run them on, which this hint path does not have yet.
+		return nil, false
+	}
 	kern := segProgKernel(low)
 	if kern == nil {
 		return nil, false

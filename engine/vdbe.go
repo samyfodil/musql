@@ -2070,7 +2070,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			if cur == nil || cur.tbl == nil || cur.pager == nil {
 				return nil, fmt.Errorf("vdbe: OpSegProgram on a closed cursor")
 			}
-			if vs, served := m.segRunProgramAll(cur.pager, cur.tbl.root, pplan, cur.tbl.ipkIndex); served {
+			if vs, served := m.segRunProgramAll(cur.pager, cur.tbl, pplan); served {
 				segFilterServed.Add(1)
 				// P1 is the FIRST destination register; the statement's N
 				// aggregates land in P1..P1+N-1, which is the range the

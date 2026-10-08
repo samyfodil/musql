@@ -136,8 +136,15 @@ func segProgPeephole(prog *Program) bool {
 	// aggregate gets a copy with its own terminal op. N aggregates are N passes
 	// over the same int64 blocks, which is the trade segRunProgramAll explains.
 	base, okLow := segLowerBody(in[rewindAt+1:bodyEnd], rewindAt+1, cursor, aggAt)
-	if !okLow || len(base.cols) == 0 {
+	if !okLow || (len(base.cols) == 0 && len(base.blocks) == 0) {
 		return false
+	}
+	// Each aggregate's argument is read by the accumulate appended below,
+	// outside the body: a service block that computes it must write it back.
+	for _, a := range aggs {
+		if a.expr != nil && a.rowRegs[aggExprArg] != 0 {
+			base.readNatively(a.rowRegs[aggExprArg] - 1)
+		}
 	}
 	lows := make([]*segLowered, 0, len(aggs))
 	for _, a := range aggs {

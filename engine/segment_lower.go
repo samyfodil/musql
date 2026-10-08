@@ -28,6 +28,9 @@ type segLowered struct {
 	agg     aggKind
 	sumReg  int
 	rowsReg int // counts matched rows; sum()/avg() answer NULL at 0
+	// blocks are the service blocks the body stops for (segment_service.go),
+	// indexed by POpService's A; none when the whole body is native.
+	blocks []segSvcBlock
 }
 
 // segLowerRegOperands returns the operands of in that name a REGISTER, -1 for
@@ -170,15 +173,53 @@ func segLowerBody(body []Instruction, base int, cursor int, aggAt int) (*segLowe
 	// OpColumn that loads the register comes BEFORE the tests that constrain it
 	// and the decision has to be made at the load.
 	nullOnly := segNullTestedOnly(body)
+	// Instructions with no native form run in service blocks. A register a
+	// block reads holds a VALUE, never a NULL indicator.
+	svc := segClassifyServices(body, cursor)
+	if svc == nil {
+		return nil, false
+	}
+	for i, in := range body {
+		if svc[i] {
+			r, _, _, _ := segInsnRegs(in)
+			for _, x := range r {
+				delete(nullOnly, x)
+			}
+		}
+	}
 	var nullMarks []int // IR indices of OpNull markers
 	note := func(r int) {
 		if r+1 > maxReg {
 			maxReg = r + 1
 		}
 	}
+	blocks, blockAt := segBuildBlocks(body, svc, base, scratchReg+1)
+	segBlockHomes(body, svc, blocks)
+	for _, b := range blocks {
+		for _, x := range append(append([]int(nil), b.load...), b.writeBack...) {
+			note(x)
+		}
+		if b.flag >= 0 {
+			note(b.flag)
+		}
+	}
+	out.blocks = blocks
 
 	for i, in := range body {
 		irOf[i] = len(out.insns)
+		if svc[i] {
+			// Run by its block: the block's first instruction stops the
+			// kernel for it, and a block ending in a jump branches on the flag
+			// it leaves. Nothing branches into the middle of a block.
+			if bi := blockAt[i]; bi >= 0 {
+				out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpService, A: bi})
+				if blk := blocks[bi]; blk.flag >= 0 {
+					last := blk.insns[len(blk.insns)-1]
+					out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpJumpIfNotZero, A: last.P2 - base, B: blk.flag})
+				}
+			}
+			continue
+		}
 		switch in.Op {
 		case OpColumn:
 			if in.P1 != cursor {
