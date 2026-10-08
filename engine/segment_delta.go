@@ -418,7 +418,9 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs
 	if lenWidth == 4 && n > math.MaxUint32 {
 		return 0, 0, fmt.Errorf("engine: segment delta: a %d-byte commit does not fit this version-1 delta's batch length; compact it first", n)
 	}
-	buf := make([]byte, 0, segDeltaChunk+64)
+	// Sized to the batch when it is smaller than a chunk: a one-row commit
+	// allocated (and zeroed) the whole megabyte.
+	buf := make([]byte, 0, min(n+lenWidth+segDeltaTrailerSz, segDeltaChunk+64))
 	if lenWidth == 4 {
 		buf = binary.LittleEndian.AppendUint32(buf, uint32(n))
 	} else {

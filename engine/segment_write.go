@@ -500,7 +500,18 @@ func (n *Session) commitMainLocked() (bool, error) {
 	// CONSUMING, when nothing else reads the log -- see segDeltaRecordsInto.
 	recs, err := segDeltaRecordsInto(n.recBuf, changes, n.effectiveTableIndex(), n.ipkOf, n.storeOf(false))
 	// Kept for the next commit, and emptied on the way out so it pins no row.
-	defer func() { clear(recs[:cap(recs)]); n.recBuf = recs[:0] }()
+	// Only [0:len) was written: every commit clears what it wrote, and an
+	// error returns nil, dropping the buffer. Clearing the whole capacity cost
+	// a one-row commit megabytes of memclr once a bulk load had grown it, so a
+	// buffer that large is dropped instead of kept.
+	defer func() {
+		if cap(recs) > 1<<14 {
+			n.recBuf = nil
+			return
+		}
+		clear(recs)
+		n.recBuf = recs[:0]
+	}()
 	if err != nil {
 		return false, err
 	}

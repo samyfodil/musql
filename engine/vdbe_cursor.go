@@ -937,10 +937,11 @@ func (cur *vdbeCursor) materializeRowStore() {
 		// A write scan the filter peephole judged safe to restrict
 		// (segWriteFilterPeephole): only the base rows that can match, and
 		// every row the overlay holds, are decoded. Sized for the overlay, which
-		// arrives whole, plus a margin -- not n: the point is that most of the
-		// table never arrives.
-		rowids = make([]uint64, 0, len(st.m)+n/8)
-		rows = make([][]Value, 0, len(st.m)+n/8)
+		// arrives whole, plus a small margin -- not n, nor a fraction of it: the
+		// point is that most of the table never arrives, and a point UPDATE
+		// keeps one row.
+		rowids = make([]uint64, 0, len(st.m)+16)
+		rows = make([][]Value, 0, len(st.m)+16)
 		st.segEachSortedOver(func(y func(uint64, []Value) bool) {
 			st.seg.walkFiltered(f, cur.params, y)
 		}, func(rowid uint64, vals []Value) bool {
