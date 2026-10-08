@@ -35,7 +35,9 @@ func TestRewriteRebasesTheSession(t *testing.T) {
 		t.Fatalf("after the rewrite t is still an in-memory store of %d rows", len(tbl.rows.m))
 	}
 	SegRowsSelectedForTest()
-	if err := n.Exec(`UPDATE t SET v = v + 1 WHERE k = 3`); err != nil {
+	// A range, not "k = 3": an equality takes the row store's column seek
+	// (emitWriteIndexSeekHint) and never reaches the filter this checks.
+	if err := n.Exec(`UPDATE t SET v = v + 1 WHERE k >= 3 AND k <= 3`); err != nil {
 		t.Fatal(err)
 	}
 	if jitEnabled && SegRowsSelectedForTest() == 0 {
