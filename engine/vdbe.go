@@ -1335,7 +1335,16 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			m.regs[op.P2] = Value{Typ: Float, F: op.P4.(float64)}
 
 		case OpString8:
-			m.regs[op.P2] = Value{Typ: Text, S: []byte(op.P4.(string))}
+			// The constant's own bytes, not a copy per execution: a register's
+			// bytes are never written in place (SCopy and Column share them
+			// already, and OpBlob hands out its P4 slice the same way). The
+			// capacity is capped at the length, so an append can never grow
+			// into them; "" keeps the conversion, whose slice is never nil.
+			if str := op.P4.(string); str != "" {
+				m.regs[op.P2] = Value{Typ: Text, S: unsafe.Slice(unsafe.StringData(str), len(str))[:len(str):len(str)]}
+			} else {
+				m.regs[op.P2] = Value{Typ: Text, S: []byte(str)}
+			}
 
 		case OpNull:
 			m.regs[op.P2] = Value{Typ: Null}
