@@ -27,9 +27,20 @@ func Of(path string) (size, mtime int64, ok bool) {
 	return out[0], out[1], true
 }
 
-// OfFile is not available here; ok is always false and the caller stats the
-// path instead.
-func OfFile(fd uintptr) (size, mtime int64, linked, ok bool) { return 0, 0, false, false }
+//go:wasmimport musqljit fstat_stamp
+//go:noescape
+func fstatStamp(fd int32, out unsafe.Pointer) int32
+
+// OfFile returns an open file's size, mtime in nanoseconds, and whether it
+// still has a name (a nonzero link count): the host's fstat, one call, where
+// stat'ing the path again was a syscall/js round trip per commit.
+func OfFile(fd uintptr) (size, mtime int64, linked, ok bool) {
+	var out [3]int64
+	if fstatStamp(int32(fd), unsafe.Pointer(&out)) == 0 {
+		return 0, 0, false, false
+	}
+	return out[0], out[1], out[2] > 0, true
+}
 
 // FileStamps reports whether OfFile works on this platform.
-const FileStamps = false
+const FileStamps = true

@@ -29,7 +29,7 @@
 	mkdirNode("/tmp", 0o777);
 
 	const stat = (n) => ({
-		dev: 1, ino: n.ino, mode: n.mode, nlink: 1, uid: 0, gid: 0, rdev: 0,
+		dev: 1, ino: n.ino, mode: n.mode, nlink: n.unlinked ? 0 : 1, uid: 0, gid: 0, rdev: 0,
 		size: n.dir ? 0 : n.size, blksize: 4096, blocks: n.dir ? 0 : Math.ceil(n.size / 512),
 		atimeMs: Number(n.mtime / 1000000n), mtimeMs: Number(n.mtime / 1000000n), ctimeMs: Number(n.mtime / 1000000n),
 		isDirectory: () => !!n.dir,
@@ -123,7 +123,9 @@
 		}),
 		unlink: cb((path) => {
 			const p = norm(path);
-			if (lookup(p).dir) throw fail("EISDIR");
+			const n = lookup(p);
+			if (n.dir) throw fail("EISDIR");
+			n.unlinked = true; // open descriptors keep it, with no name: nlink 0
 			nodes.delete(p);
 		}),
 		rmdir: cb((path) => {
@@ -139,7 +141,11 @@
 			const moved = [[a, n]];
 			if (n.dir) for (const [k, v] of nodes) if (k.startsWith(a + "/")) moved.push([k, v]);
 			for (const [k] of moved) nodes.delete(k);
-			for (const [k, v] of moved) nodes.set(b + k.slice(a.length), v);
+			for (const [k, v] of moved) {
+				const old = nodes.get(b + k.slice(a.length));
+				if (old && old !== v) old.unlinked = true; // replaced: its descriptors now name no path
+				nodes.set(b + k.slice(a.length), v);
+			}
 		}),
 		utimes: cb((path, atime, mtime) => { lookup(path).mtime = BigInt(Math.round(mtime * 1e9)); }),
 		chmod: cb((path, mode) => { const n = lookup(path); n.mode = (n.mode & ~0o777) | (mode & 0o777); }),
@@ -162,8 +168,13 @@
 		// Synchronous helpers for the page's own use: put a file in, take one out.
 		writeFileSync(path, bytes) {
 			const p = norm(path);
+			const old = nodes.get(p);
+			if (old) old.unlinked = true;
 			nodes.set(p, { ino: nextIno++, mode: S_IFREG | 0o644, data: new Uint8Array(bytes), size: bytes.byteLength, mtime: nowNs() });
 		},
+		// fstat for the engine's held-descriptor stamp (internal/fsstamp OfFile):
+		// size, mtime in ns, and whether the file still has a name.
+		fstatStamp(fd) { const f = fds.get(fd); if (!f) return null; const n = f.node; return [n.dir ? 0 : n.size, n.mtime, n.unlinked ? 0 : 1]; },
 		statStamp(path) { const n = nodes.get(norm(path)); return n ? [n.dir ? 0 : n.size, n.mtime] : null; },
 		readFileSync(path) { const n = lookup(path); return n.data.slice(0, n.size); },
 	};

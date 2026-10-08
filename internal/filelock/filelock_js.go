@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"runtime"
 	"sync"
 	"syscall"
+	"weak"
 )
 
 // On js/wasm the "filesystem" is the host's fs object -- in a browser, an
@@ -49,7 +51,40 @@ var (
 	locks = map[fileID]map[*os.File][]held{}
 )
 
+// ids caches each open file's identity. An *os.File names one file for its
+// whole life, so its identity is asked of the host once, not on every lock and
+// unlock: on js/wasm a stat is a syscall/js round trip, and the two per commit
+// were a quarter of a single-row INSERT. Weak keys, dropped when the file is
+// collected, so a closed file is not kept alive by the cache.
+var (
+	idMu sync.Mutex
+	ids  = map[weak.Pointer[os.File]]fileID{}
+)
+
 func idOf(f *os.File) (fileID, error) {
+	wp := weak.Make(f)
+	idMu.Lock()
+	id, ok := ids[wp]
+	idMu.Unlock()
+	if ok {
+		return id, nil
+	}
+	id, err := statID(f)
+	if err != nil {
+		return fileID{}, err
+	}
+	idMu.Lock()
+	ids[wp] = id
+	idMu.Unlock()
+	runtime.AddCleanup(f, func(wp weak.Pointer[os.File]) {
+		idMu.Lock()
+		delete(ids, wp)
+		idMu.Unlock()
+	}, wp)
+	return id, nil
+}
+
+func statID(f *os.File) (fileID, error) {
 	fi, err := f.Stat()
 	if err != nil {
 		return fileID{}, err

@@ -45,6 +45,27 @@ globalThis.musqlJIT = (go, { enabled = true } = {}) => {
 			dv.setBigInt64(out + 8, st[1], true);
 			return 1;
 		},
+		// The held-descriptor stamp (internal/fsstamp OfFile): size, mtime in
+		// ns and link count of an open file, so a commit need not stat its path.
+		fstat_stamp(fd, out) {
+			let st;
+			if (globalThis.fs.fstatStamp) {
+				st = globalThis.fs.fstatStamp(fd);
+			} else {
+				try {
+					const s = globalThis.fs.fstatSync(fd, { bigint: true });
+					st = [Number(s.size), s.mtimeNs, Number(s.nlink)];
+				} catch {
+					st = null;
+				}
+			}
+			if (!st) return 0;
+			const dv = new DataView(go._inst.exports.mem.buffer);
+			dv.setBigInt64(out, BigInt(st[0]), true);
+			dv.setBigInt64(out + 8, BigInt(st[1]), true);
+			dv.setBigInt64(out + 16, BigInt(st[2]), true);
+			return 1;
+		},
 		call_kernel(slot, args) {
 			kernels[slot](args);
 		},
