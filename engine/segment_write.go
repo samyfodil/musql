@@ -630,8 +630,50 @@ func (n *Session) commitMainLocked() (bool, error) {
 	}
 	n.seenStat = n.pairStamp()
 	n.clearWrittenSinceCommit()
-	n.noteCommittedColumnsStale()
+	if !wasCurrent || !n.extendCommittedColumns(n.appendAt.lastBatch) {
+		n.noteCommittedColumnsStale()
+	}
+	n.appendAt.lastBatch = nil
 	return true, nil
+}
+
+// extendCommittedColumns brings the committed read view (DB.segColumns) past
+// the batch this commit just appended, by replaying that one batch into it
+// (applyBatch, the replay's own step), instead of marking it stale -- which
+// re-read the whole segment file and replayed the whole delta on the next
+// statement: 90% of a single-row write loop in wasm, where reading the file is
+// a copy of all of it, and 1.9 ms a statement for a DELETE with a subquery.
+//
+// Only a view that was current just before this commit is extended: any
+// other connection's commit reopens the session (RefreshIfStale) with a view
+// of its own, and every commit of this session either extends the view or
+// marks it stale, so a view not marked stale is the file as of this session's
+// previous commit. The caller passes wasCurrent too. false leaves the caller
+// to mark it stale: no view, a stale one, or a batch too big to have been kept.
+func (n *Session) extendCommittedColumns(batch []byte) bool {
+	db := n.DB
+	cols := db.segColumns
+	if batch == nil || cols == nil || db.segColumnsStale || cols.segs == nil {
+		return false
+	}
+	st := cols.segs.delta
+	if st == nil {
+		st = &segDeltaState{live: map[int]map[int64][]Value{}, dead: map[int]map[int64]bool{}, version: segDeltaVersion}
+	}
+	if err := st.applyBatch(batch); err != nil {
+		return false
+	}
+	st.endCtr, st.endPages = n.endCtr, n.endPages
+	st.batches++
+	cols.segs.delta = st
+	// A read source built over the view before this commit may hold a nil
+	// delta where there is one now, and its cache key need not have moved
+	// (the written flags are back to what they were): build the next afresh.
+	db.segSrcCache = nil
+	// The catalog-corruption verdict is keyed on the same generation a stale
+	// mark bumps; the rows moved, so it moves too.
+	db.schemaCorruptGen++
+	return true
 }
 
 // deltaAppendExceeds reports whether appending recs could leave main's segment

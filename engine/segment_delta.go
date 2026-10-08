@@ -262,6 +262,11 @@ type SegDeltaAppendState struct {
 	// handle stops another process renaming or deleting the file.
 	f  *os.File
 	fi os.FileInfo
+
+	// lastBatch is the records of the batch the last append wrote, when it fit
+	// in one chunk; nil otherwise. Session.commitMainLocked applies it to the
+	// committed read view instead of re-reading the whole pair.
+	lastBatch []byte
 }
 
 // release closes the held delta, if any, and forgets the append point.
@@ -423,7 +428,11 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 	//
 	// At st.bytes, not at the file's end: a previous torn append is OVERWRITTEN
 	// rather than kept, exactly as a WAL writer overwrites an aborted tail.
-	end, cksum, werr := writeSegDeltaBatch(f, st.bytes, st.cksum, segDeltaLenWidth(st.version), recs, endCtr, endPages)
+	var keep *[]byte
+	if carry != nil {
+		keep = &carry.lastBatch
+	}
+	end, cksum, werr := writeSegDeltaBatch(f, st.bytes, st.cksum, segDeltaLenWidth(st.version), recs, endCtr, endPages, keep)
 	if werr != nil {
 		return werr
 	}
@@ -467,7 +476,7 @@ const segDeltaChunk = 1 << 20
 // that first byte, so the total is computed first (recordSize), and every
 // record's encoding is checked against its prediction: a mismatch fails the
 // commit rather than writing a batch whose length lies.
-func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs []SegDeltaRecord, endCtr, endPages uint32) (end int64, cksum uint64, err error) {
+func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs []SegDeltaRecord, endCtr, endPages uint32, keep *[]byte) (end int64, cksum uint64, err error) {
 	var n int64
 	// Each put's record length, measured once; on the stack for a small batch.
 	var sizesBuf [16]int32
@@ -536,6 +545,16 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs
 	}
 	if written != n {
 		return 0, 0, fmt.Errorf("engine: segment delta: batch wrote %d bytes where %d were predicted", written, n)
+	}
+	// The batch's records, for a caller that applies them to a delta state it
+	// already holds (applyBatch, as a replay of this batch would). Only when no
+	// chunk went out early, so buf still holds every record: a single-row
+	// commit always, a bulk one never.
+	if keep != nil {
+		*keep = nil
+		if at == off {
+			*keep = append((*keep)[:0], buf[lenWidth:lenWidth+n]...)
+		}
 	}
 	var tr [segDeltaTrailerSz]byte
 	binary.LittleEndian.PutUint32(tr[0:], endCtr)

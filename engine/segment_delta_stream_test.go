@@ -34,7 +34,7 @@ func TestSegDeltaBatchStreamsAndReplays(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		end, _, err := writeSegDeltaBatch(f, segDeltaHdrSize, segDeltaChecksum(hdr[:24], 0), segDeltaLenWidth(version), recs, 9, 10)
+		end, _, err := writeSegDeltaBatch(f, segDeltaHdrSize, segDeltaChecksum(hdr[:24], 0), segDeltaLenWidth(version), recs, 9, 10, nil)
 		f.Close()
 		if err != nil {
 			t.Fatalf("v%d: %v", version, err)
