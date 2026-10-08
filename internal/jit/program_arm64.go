@@ -104,6 +104,16 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.Msub(X9, X11, X10, X9)
 			a.Label(st)
 			a.StrImm(X9, X1, in.A*8)
+		case POpAbs:
+			a.LdrImm(X9, X1, in.B*8)
+			a.MovImm64(X11, math.MinInt64)
+			a.Cmp(X9, X11)
+			a.Cset(X11, CondE)
+			a.OrrReg(X4, X4, X11)
+			a.NegReg(X10, X9)
+			a.Cmp(X9, xzr)
+			a.Csel(X9, X10, X9, CondL)
+			a.StrImm(X9, X1, in.A*8)
 		case POpAdd, POpSub, POpMul:
 			a.LdrImm(X9, X1, in.B*8)
 			a.LdrImm(X10, X1, in.C*8)

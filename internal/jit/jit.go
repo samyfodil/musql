@@ -69,6 +69,9 @@ const (
 // rather than sitting in the enum looking like an ordering.
 const condOverflow Cond = 0x0
 
+// condSign is x86's SF condition, used only by CMOVS in POpAbs.
+const condSign Cond = 0x8
+
 // Negate returns the condition that is true exactly when c is false, which is
 // what a filter loop jumps on: "skip this row unless it matches".
 func (c Cond) Negate() Cond {
@@ -178,6 +181,11 @@ const (
 	// overflow is and the caller declines; a divisor of -1 gives 0 (vdbe.c's
 	// "if( iA==-1 ) iA = 1"), which also keeps MinInt64 % -1 from trapping.
 	POpRem
+
+	// POpAbs: r[A] = |r[B]|. abs(MinInt64) is SQLite's "integer overflow"
+	// error, which the program cannot raise, so it is flagged like an
+	// overflow and the caller declines; the VDBE then reports the error.
+	POpAbs
 
 	// POpEmitRow appends the current row index to Sel and counts it in the
 	// accumulator, which the epilogue leaves in *Out. It is what turns a

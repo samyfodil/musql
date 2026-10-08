@@ -175,6 +175,26 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			w.op(opI64RemS)
 			w.Set(t3)
 			storeReg(in.A, func() { w.Get(t3) })
+		case POpAbs:
+			loadReg(in.B)
+			w.Set(t1)
+			w.Get(ovf)
+			w.Get(t1)
+			w.I64(math.MinInt64)
+			w.op(opI64Eq)
+			w.op(opI64ExtendI32U)
+			w.op(opI64Or)
+			w.Set(ovf)
+			storeReg(in.A, func() {
+				w.I64(0)
+				w.Get(t1)
+				w.op(opI64Sub)
+				w.Get(t1)
+				w.Get(t1)
+				w.I64(0)
+				w.op(opI64LtS)
+				w.op(opSelect) // t1 < 0 ? -t1 : t1
+			})
 		case POpAdd, POpSub, POpMul:
 			loadReg(in.B)
 			w.Set(t1)

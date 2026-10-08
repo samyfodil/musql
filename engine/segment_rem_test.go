@@ -80,3 +80,48 @@ func TestRemainderKernelMatchesTheLoop(t *testing.T) {
 		}
 	}
 }
+
+// TestAbsKernelMatchesTheLoop: abs() lowered to POpAbs answers as the builtin
+// does, and abs(MinInt64) -- SQLite's integer-overflow error -- declines to the
+// VDBE, which raises it. The lowering trusts the name "abs" because no
+// application function can take it, which the first check pins.
+func TestAbsKernelMatchesTheLoop(t *testing.T) {
+	if err := RegisterFunction(ScalarFunction{Name: "ABS", NArg: 1, Fn: func([]Value) (Value, error) { return Value{}, nil }}); err == nil {
+		t.Fatal("an application function was registered as abs, which segLowerableFunc would lower as the builtin")
+	}
+	stmts := []string{`CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER, w INTEGER)`}
+	rng := rand.New(rand.NewSource(19))
+	for i := 1; i <= 1200; i++ {
+		w := fmt.Sprint(rng.Intn(2000) - 1000)
+		if i == 600 {
+			w = "-9223372036854775808"
+		}
+		stmts = append(stmts, fmt.Sprintf(`INSERT INTO t VALUES(%d, %d, %s)`, i, rng.Intn(20001)-10000, w))
+	}
+	p := newSegPair(t, stmts...)
+	for _, c := range []struct {
+		sql    string
+		served bool
+	}{
+		{`SELECT count(*) FROM t WHERE abs(v) < 500`, true},
+		{`SELECT count(*) FROM t WHERE abs(v - 300) BETWEEN 10 AND 900`, true},
+		{`SELECT sum(abs(v)) FROM t`, true},
+		{`SELECT max(abs(v)), min(abs(v)) FROM t`, true},
+		{`SELECT count(*) FROM t WHERE abs(w) > 10`, false}, // reaches abs(MinInt64): declined, and an error
+	} {
+		_, want, werr := p.plain(c.sql)
+		ResetSegFilterCountersForTest()
+		_, got, gerr := p.fast(c.sql)
+		served, _ := SegFilterCountersForTest()
+		if (werr == nil) != (gerr == nil) || (werr != nil && werr.Error() != gerr.Error()) {
+			t.Errorf("%s: kernel error %v, loop error %v", c.sql, gerr, werr)
+			continue
+		}
+		if g, w := fmt.Sprint(typedRows(got)), fmt.Sprint(typedRows(want)); g != w {
+			t.Errorf("%s:\n kernel %.200s\n loop   %.200s", c.sql, g, w)
+		}
+		if JITEnabled() && c.served && served == 0 {
+			t.Errorf("%s: not served by a kernel", c.sql)
+		}
+	}
+}

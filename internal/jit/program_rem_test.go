@@ -79,3 +79,59 @@ func TestEmittedRemainderMatchesSQLite(t *testing.T) {
 		t.Fatal("a zero divisor was not flagged")
 	}
 }
+
+// TestEmittedAbsMatchesSQLite: POpAbs is |x|, and abs(MinInt64) -- SQLite's
+// "integer overflow" -- is flagged for the caller to decline.
+func TestEmittedAbsMatchesSQLite(t *testing.T) {
+	if !Available {
+		t.Skip("no JIT on this platform")
+	}
+	const n = 2048
+	rng := rand.New(rand.NewSource(13))
+	a, want := make([]int64, n), make([]int64, n)
+	edges := []int64{math.MaxInt64, math.MinInt64 + 1, -1, 0, 1}
+	for i := range a {
+		if i%7 == 0 {
+			a[i] = edges[i%len(edges)]
+		} else {
+			a[i] = rng.Int63n(2_000_001) - 1_000_000
+		}
+		want[i] = a[i]
+		if want[i] < 0 {
+			want[i] = -want[i]
+		}
+	}
+	run := func(col []int64) (int64, int64) {
+		insns := []ProgInsn{
+			{Op: POpLoadCol, A: 0, B: 0},
+			{Op: POpAbs, A: 1, B: 0},
+			{Op: POpLoadCol, A: 2, B: 1},
+			{Op: POpCmp, A: 3, B: 1, C: 2, Cond: CondE},
+			{Op: POpSkipIfZero, A: 3},
+			{Op: POpAccCount},
+		}
+		code, err := EmitProgram(insns, 2)
+		if err != nil {
+			t.Fatalf("emit: %v", err)
+		}
+		kern, err := Map(code)
+		if err != nil {
+			t.Fatalf("map: %v", err)
+		}
+		defer kern.Close()
+		regs := make([]int64, 8)
+		var out, ovf int64
+		args := &ProgArgs{N: n, Regs: &regs[0], Out: &out, Overflow: &ovf}
+		args.Col[0], args.Col[1] = &col[0], &want[0]
+		kern.Call2(args)
+		return out, ovf
+	}
+	if got, ovf := run(a); got != n || ovf != 0 {
+		t.Fatalf("abs matching |x|: %d of %d (overflow flag %d)", got, n, ovf)
+	}
+	withMin := append([]int64(nil), a...)
+	withMin[n/3] = math.MinInt64
+	if _, ovf := run(withMin); ovf == 0 {
+		t.Fatal("abs(MinInt64) was not flagged")
+	}
+}

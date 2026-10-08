@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
 	"github.com/samyfodil/musql/internal/jit"
 )
@@ -47,6 +48,10 @@ func segLowerRegOperands(in Instruction) [3]int {
 		return [3]int{in.P1, in.P2, in.P3}
 	case OpNull: // P1 destination
 		return [3]int{in.P1, -1, -1}
+	case OpFunction: // P1 first argument, P3 destination
+		if segLowerableFunc(in) {
+			return [3]int{in.P1, in.P3, -1}
+		}
 	}
 	return [3]int{-1, -1, -1} // OpGoto and anything the switch will refuse
 }
@@ -77,6 +82,11 @@ func segNullTestedOnly(body []Instruction) map[int]bool {
 		case OpAdd, OpSubtract, OpMultiply, OpRemainder, OpBitAnd, OpBitOr:
 			writes[in.P3]++
 			reads[in.P3]--
+		case OpFunction:
+			if segLowerableFunc(in) {
+				writes[in.P3]++
+				reads[in.P3]--
+			}
 		case OpGt, OpGe, OpLt, OpLe, OpEq, OpNe:
 			if store, _ := segCompareLowerable(in.P5); store {
 				writes[in.P3]++
@@ -281,6 +291,15 @@ func segLowerBody(body []Instruction, base int, cursor int, aggAt int) (*segLowe
 			}
 			note(in.P3)
 			out.insns = append(out.insns, jit.ProgInsn{Op: pop, A: in.P3, B: in.P2, C: in.P1})
+		case OpFunction:
+			// The builtin abs() of one argument, which over an int64 is |x|;
+			// abs(MinInt64) is SQLite's overflow error, which POpAbs flags so
+			// the VDBE answers (and raises it). Any other call is refused below.
+			if !segLowerableFunc(in) {
+				return nil, false
+			}
+			note(in.P3)
+			out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpAbs, A: in.P3, B: in.P1})
 		case OpNegative:
 			// -v as 0 - v. OpNegative's own doc note says a subtraction is NOT
 			// equivalent because it does not preserve IEEE negative zero -- and
@@ -428,7 +447,7 @@ func segLoweredReachable(insns []jit.ProgInsn) []bool {
 			known = maps.Clone(known)
 			known[in.A] = int64(in.B)
 		case jit.POpLoadCol, jit.POpLoadReg, jit.POpCmp, jit.POpAnd, jit.POpOr,
-			jit.POpNot, jit.POpAdd, jit.POpSub, jit.POpMul, jit.POpRem:
+			jit.POpNot, jit.POpAdd, jit.POpSub, jit.POpMul, jit.POpRem, jit.POpAbs:
 			if _, ok := known[in.A]; ok {
 				known = maps.Clone(known)
 				delete(known, in.A)
@@ -485,4 +504,13 @@ func segCompareLowerable(p5 uint16) (store bool, ok bool) {
 		return false, false
 	}
 	return p5&p5StoreP2 != 0, true
+}
+
+// segLowerableFunc reports whether in is a call the program JIT has an
+// instruction for: today the builtin abs() of one argument. The name alone
+// identifies it: RegisterFunction refuses a built-in name, so no application
+// function can be called abs.
+func segLowerableFunc(in Instruction) bool {
+	name, ok := in.P4.(string)
+	return ok && in.P2 == 1 && strings.EqualFold(name, "abs")
 }

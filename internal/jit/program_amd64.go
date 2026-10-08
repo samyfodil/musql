@@ -143,6 +143,16 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.XorRegReg(RAX, RAX)
 			a.Label(st)
 			a.MovMemReg32(RSI, in.A, RAX)
+		case POpAbs:
+			// NEG sets OF exactly for MinInt64, and SF when the original was
+			// positive, in which case the original is the answer.
+			a.MovRegMem32(RAX, RSI, in.B)
+			a.MovRegReg(RDX, RAX)
+			a.NegReg(RDX)
+			a.Setcc(condOverflow, R11)   // SETcc and CMOVcc leave the flags alone;
+			a.Cmovcc(condSign, RDX, RAX) // the OR below does not, so it goes last
+			a.OrRegReg(R9, R11)
+			a.MovMemReg32(RSI, in.A, RDX)
 		case POpAccCount:
 			a.IncReg(R8)
 		case POpEmitRow:
