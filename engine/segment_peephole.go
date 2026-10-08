@@ -54,6 +54,7 @@ type segFilterPlan struct {
 	// IN subqueries answered from their hashed rows; a count only.
 	semis []segPlanSemi
 	ins   []segPlanIn
+	likes []segPlanLike
 }
 
 // segPlanPred is a predicate whose bound is a literal, or the 1-based index of
@@ -183,6 +184,7 @@ func segPeephole(prog *Program) bool {
 	var preds []segPlanPred
 	var semis []segPlanSemi
 	var insubs []segPlanIn
+	var likes []segPlanLike
 	pc := rewindAt + 1
 	for {
 		more, npc, ok := segParsePredBlock(in, pc, predEnd, in[rewindAt].P1, nextAt)
@@ -192,6 +194,10 @@ func segPeephole(prog *Program) bool {
 		preds, pc = append(preds, more...), npc
 		if sj, npc, ok := segParseSemiGroup(in, pc, predEnd, in[rewindAt].P1, nextAt); ok {
 			semis, pc = append(semis, sj), npc
+			continue
+		}
+		if pl, npc, ok := segParseLikeGroup(in, pc, predEnd, in[rewindAt].P1, nextAt); ok {
+			likes, pc = append(likes, pl), npc
 			continue
 		}
 		if pi, npc, ok := segParseInGroup(in, pc, predEnd, in[rewindAt].P1, nextAt); ok {
@@ -205,7 +211,7 @@ func segPeephole(prog *Program) bool {
 		}
 		break
 	}
-	if (len(semis) > 0 || len(insubs) > 0) && isSum {
+	if (len(semis) > 0 || len(insubs) > 0 || len(likes) > 0) && isSum {
 		return false // the semi-join answers a count only
 	}
 	// Zero, one or two. One was excluded only because the first scalar kernel
@@ -235,7 +241,7 @@ func segPeephole(prog *Program) bool {
 	out = append(out, in[0], in[1], in[2])
 	guardTarget := len(in) + 1 // the duplicated tail, after every shifted insn
 	out = append(out, Instruction{Op: OpSegFilterCount, P1: dst, P2: in[rewindAt].P1, P3: guardTarget,
-		P4: &segFilterPlan{preds: preds, isSum: isSum, sumCol: sumCol, semis: semis, ins: insubs}})
+		P4: &segFilterPlan{preds: preds, isSum: isSum, sumCol: sumCol, semis: semis, ins: insubs, likes: likes}})
 	// Everything from the third instruction on -- which is OpAutoIndexOrder when
 	// there is one, then the Rewind -- one address later than it was.
 	for _, ins := range in[3:] {

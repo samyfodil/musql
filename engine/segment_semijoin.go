@@ -206,7 +206,7 @@ func (p *ReadOnlyPager) segCleanSegments(rootPage uint32) ([]*segment, bool) {
 
 // segSemiCountTable counts the rows of tRoot (whose table is tTbl) satisfying
 // preds and every semi-join, or reports false to decline.
-func (p *ReadOnlyPager) segSemiCountTable(tRoot uint32, tTbl *resolvedTable, preds []segPred, semis []segSemi, ins []segIn) (int, bool) {
+func (p *ReadOnlyPager) segSemiCountTable(tRoot uint32, tTbl *resolvedTable, preds []segPred, semis []segSemi, ins []segIn, likes []segLike) (int, bool) {
 	tSegs, ok := p.segCleanSegments(tRoot)
 	if !ok || tTbl == nil {
 		return 0, false
@@ -247,6 +247,18 @@ func (p *ReadOnlyPager) segSemiCountTable(tRoot uint32, tTbl *resolvedTable, pre
 			}
 			keys[i] = col
 		}
+		type likeCol struct {
+			cells []uint64
+			heap  []byte
+		}
+		likeCols := make([]likeCol, len(likes))
+		for i, sl := range likes {
+			cells, heap, ok := s.BytesColumn(sl.col)
+			if !ok || s.cols[sl.col].phys != PhysText || !segPredColsFilterable(s, []segPred{{Col: sl.col}}) {
+				return 0, false
+			}
+			likeCols[i] = likeCol{cells, heap}
+		}
 		inCols := make([][]int64, len(ins))
 		for i, si := range ins {
 			if si.col == tTbl.ipkIndex {
@@ -285,6 +297,17 @@ func (p *ReadOnlyPager) segSemiCountTable(tRoot uint32, tTbl *resolvedTable, pre
 						in = false
 						break
 					}
+				}
+				for i, sl := range likes {
+					if !in {
+						break
+					}
+					raw := likeCols[i].cells[lo+r]
+					o, n := uint32(raw), uint32(raw>>32)
+					if int(o)+int(n) > len(likeCols[i].heap) {
+						return 0, false
+					}
+					in = sl.plan.match(likeCols[i].heap[o:o+n], sl.cs) != sl.not
 				}
 				for i, si := range ins {
 					if !in {
