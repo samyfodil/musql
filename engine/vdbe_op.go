@@ -381,6 +381,12 @@ const (
 	// OpSegFilterCount produced a single value.
 	OpSegEmitRow
 
+	// OpSegDistinct answers "SELECT DISTINCT <int column>" from a columnar
+	// table (segment_distinct.go): P1 the output register, P2 the cursor, P3
+	// the emit loop, taken only when it serves; P4(*segDistinctPlan). A guard
+	// like OpSegOrderLimit, falling through to the loop when it declines.
+	OpSegDistinct
+
 	// OpSegHashAgg drives a whole GROUP BY scan from a columnar table into the
 	// same hash buckets the ordinary loop fills, leaving the drain unchanged.
 	// P1: cursor. P2: jump target (the draining OpHashAggSort), taken only when

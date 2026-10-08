@@ -2105,6 +2105,20 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			segFilterDeclined.Add(1)
 
+		case OpSegDistinct:
+			dplan, okPlan := op.P4.(*segDistinctPlan)
+			cur := m.cursors[op.P2]
+			if !okPlan || cur == nil || cur.tbl == nil || cur.pager == nil {
+				return nil, fmt.Errorf("vdbe: OpSegDistinct without a plan or an open cursor")
+			}
+			if rows, served := cur.pager.segDistinctTable(cur.tbl.root, dplan.col, cur.tbl.ipkIndex); served {
+				segFilterServed.Add(1)
+				m.segRows, m.segRow = rows, 0
+				pc = op.P3
+				continue
+			}
+			segFilterDeclined.Add(1)
+
 		case OpSegProgram:
 			pplan, okPlan := op.P4.(*segProgPlan)
 			if !okPlan || m.pager == nil {
