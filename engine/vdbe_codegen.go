@@ -2620,6 +2620,12 @@ func (c *compiler) compileUnary(x UnaryExpr) (int, error) {
 		// and storage class pass through unchanged.
 		return c.compileExpr(x.X)
 	case "NOT":
+		if e, ok := x.X.(ExistsExpr); ok {
+			// EXISTS is never NULL, so its NOT is OpExists's own P3 flag: no
+			// separate OpNot, and an inlined body just writes the other constant.
+			e.Not = !e.Not
+			return c.compileExistsSubquery(e)
+		}
 		r, err := c.compileExpr(x.X)
 		if err != nil {
 			return 0, err
