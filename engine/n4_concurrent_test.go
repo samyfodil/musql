@@ -472,6 +472,16 @@ func runN4Scenario(t *testing.T, cfg n4Config) (path string, ledger *n4Ledger, t
 				}
 				tally.classifyReadErr(err)
 				i++
+				if runtime.GOOS == "js" {
+					// One thread, no preemption, and a sleeping goroutine wakes
+					// only when Go hands the thread back to the JS event loop,
+					// which it does only once nothing is runnable. A query here
+					// never blocks, so a reader that never parks starved the
+					// writers asleep in their busy-retry backoff for ever (238
+					// of 240 writes, then one reader alone). Parking each
+					// reader briefly lets the event loop run their timers.
+					time.Sleep(time.Millisecond)
+				}
 			}
 		}(cfg.nWriters+r, r*7+1)
 	}
@@ -640,14 +650,6 @@ func TestN4ConcurrentWritersOnly(t *testing.T) {
 // TestN4ConcurrentReadersAndWriters tests reader-vs-writer interleaving,
 // the critical case that finds correctness issues.
 func TestN4ConcurrentReadersAndWriters(t *testing.T) {
-	if runtime.GOOS == "js" {
-		// One thread and no preemption: some goroutine of this scenario
-		// never blocks, the others never run, and the run hangs until the
-		// test binary is killed. A browser worker runs one connection's
-		// statements in sequence, which is not this scenario; finding the
-		// non-yielding loop is open work.
-		t.Skip("js/wasm: the concurrent reader/writer scenario hangs under the cooperative scheduler")
-	}
 	path, ledger, tally := runN4Scenario(t, n4Config{
 		name:           "readers-and-writers",
 		nWriters:       6,
