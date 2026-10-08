@@ -98,6 +98,11 @@ func compileSelectScanRow(p *ReadOnlyPager, stmt *SelectStmt, outer *compiler, r
 		// fastest for its one shape; the compiled program covers the rest built
 		// from comparisons. (segPeepholesOffForTest: a differential test's
 		// reference is the plain loop.)
+		// A correlated EXISTS becomes a subroutine first (exists_inline.go), so
+		// the count recogniser below can see one as a semi-join.
+		if !segPeepholesOffForTest {
+			existsInlinePeephole(prog)
+		}
 		if !segPeepholesOffForTest && !segPeephole(prog) && !segOrderPeephole(prog) &&
 			!segGroupPeephole(prog) {
 			segProgPeephole(prog)
@@ -110,9 +115,6 @@ func compileSelectScanRow(p *ReadOnlyPager, stmt *SelectStmt, outer *compiler, r
 		// composes with whatever did or did not match (segment_row_filter.go).
 		if !segPeepholesOffForTest {
 			segRowFilterPeephole(prog)
-			// A correlated EXISTS as a subroutine of this program rather than
-			// a machine per outer row (exists_inline.go).
-			existsInlinePeephole(prog)
 		}
 	}
 	return prog, err

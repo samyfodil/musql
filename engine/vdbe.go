@@ -2027,7 +2027,16 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			// Every one of these reads the cursor's own pager, not m.pager: a
 			// root page is file-local, so counting root N in main for a cursor
 			// over TEMP or an attachment answers about a different table.
-			if preds, okBounds := m.segPlanPreds(plan); okBounds {
+			if preds, okBounds := m.segPlanPreds(plan); okBounds && len(plan.semis) > 0 {
+				if semis, okSemi := m.segSemis(plan.semis); okSemi {
+					if total, served := cur.pager.segSemiCountTable(cur.tbl.root, cur.tbl, preds, semis); served {
+						segFilterServed.Add(1)
+						m.regs[op.P1] = Value{Typ: Int, I: int64(total)}
+						pc = op.P3
+						continue
+					}
+				}
+			} else if okBounds {
 				if plan.isSum {
 					if v, served := cur.pager.segFilterSumTable(cur.tbl.root, preds, plan.sumCol); served {
 						segFilterServed.Add(1)
