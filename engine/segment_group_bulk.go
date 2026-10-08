@@ -60,7 +60,9 @@ const (
 	bulkFailed // buckets partly written: decline the statement
 )
 
-func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, rowids, keyVals []Value) int {
+// preds, when not empty, is the WHERE: only rows satisfying it are summed, and a
+// group none of whose rows does never gets a bucket, as in the row walk.
+func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, rowids, keyVals []Value, preds []segPred) int {
 	if len(plan.keyCols) != 1 || plan.agg.anchorCheck != nil {
 		return bulkNotEligible
 	}
@@ -153,10 +155,32 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		} else {
 			pt.groups = map[int64]*segGroupAcc{}
 		}
-		if dense && segGroupDenseFlat(s, plan.argCols, b.key, b.args, needSum, needMM, lo, si, pt.slots) {
+		if len(preds) == 0 && dense && segGroupDenseFlat(s, plan.argCols, b.key, b.args, needSum, needMM, lo, si, pt.slots) {
 			return true
 		}
+		if len(preds) > 0 && !segPredColsFilterable(s, preds) {
+			return false
+		}
+		// The WHERE a batch at a time, into flags on the stack, by the filtered
+		// count's own segApplyPred.
+		var flags [segFilterBatch]uint8
+		batchLo := -1
 		for r := 0; r < s.nRows; r++ {
+			if len(preds) > 0 {
+				if blo := r - r%segFilterBatch; blo != batchLo {
+					batchLo = blo
+					live := flags[:min(blo+segFilterBatch, s.nRows)-blo]
+					for i := range live {
+						live[i] = 1
+					}
+					for _, pr := range preds {
+						segApplyPred(s, pr, blo, live)
+					}
+				}
+				if flags[r-batchLo] == 0 {
+					continue
+				}
+			}
 			g := add(pt.groups, pt.slots, b.key[r])
 			g.n++
 			g.lastSeg, g.lastRow = si, r

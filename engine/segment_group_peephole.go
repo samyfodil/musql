@@ -4,7 +4,8 @@ package engine
 // (like ORDER BY) due to its own skeleton. Replaces only the scan loop; the drain
 // is unchanged, preserving group order and finalization.
 
-// segGroupPeephole rewrites GROUP BY with all-integer keys and lowered arguments.
+// segGroupPeephole rewrites GROUP BY with all-integer keys and lowered
+// arguments, optionally under a WHERE of the predicates segParsePredBlock reads.
 func segGroupPeephole(prog *Program) bool {
 	if !jitEnabled || prog == nil {
 		return false
@@ -25,9 +26,23 @@ func segGroupPeephole(prog *Program) bool {
 		return false
 	}
 
+	// An optional WHERE first: the same predicate groups the filtered count
+	// accepts, each skipping the row by jumping to the Next after the step.
+	stepAt := rewindAt + 1
+	for stepAt < len(in) && in[stepAt].Op != OpHashAggStep {
+		stepAt++
+	}
+	if stepAt+1 >= len(in) {
+		return false
+	}
+	preds, pc, okPreds := segParsePredBlock(in, rewindAt+1, stepAt, cursor, stepAt+1)
+	if !okPreds {
+		return false
+	}
+
 	// Scan body: Column/SCopy, MakeRecord for key, Column/SCopy for args, then step.
 	regCol := map[int]int{}
-	pc := rewindAt + 1
+	bodyAt := pc
 	var keyBase, keyN int
 	sawKey := false
 	for pc < len(in) {
@@ -83,7 +98,7 @@ bodyDone:
 		}
 	}
 
-	gplan := &segGroupPlan{agg: agg, seg: step.P2}
+	gplan := &segGroupPlan{agg: agg, seg: step.P2, preds: preds}
 	for i := 0; i < keyN; i++ {
 		c, okc := regCol[keyBase+i]
 		if !okc {
@@ -97,7 +112,7 @@ bodyDone:
 	// in first. Taking them from the SCopy destinations is what identifies
 	// them: planAggArgRegs reserved those registers, and the body copies each
 	// argument into its own.
-	for i := rewindAt + 1; i < pc; i++ {
+	for i := bodyAt; i < pc; i++ {
 		if in[i].Op != OpSCopy {
 			continue
 		}
@@ -131,7 +146,7 @@ bodyDone:
 	out = append(out, Instruction{Op: OpSegHashAgg, P1: cursor, P2: sortAt + 1, P4: gplan})
 	for _, ins := range in[2:] {
 		switch ins.Op {
-		case OpRewind, OpNext, OpIfNot, OpHashAggSort, OpHashAggNext, OpIf, OpGoto, OpSorterCheck:
+		case OpRewind, OpNext, OpIfNot, OpIsNull, OpHashAggSort, OpHashAggNext, OpIf, OpGoto, OpSorterCheck:
 			ins.P2++
 		}
 		out = append(out, ins)

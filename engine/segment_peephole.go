@@ -168,90 +168,9 @@ func segPeephole(prog *Program) bool {
 	// expression -- what BETWEEN compiles to -- jumps every failed test to a
 	// shared FALSE label (IfNot P3=0) and then settles the three-valued result
 	// in a fixed tail; segAndTreeTail checks that tail.
-	preds := make([]segPlanPred, 0, 2)
-	var cmpRegs []int
-	falseAt := -1
-	pc := rewindAt + 1
-	for pc+3 < predEnd && in[pc].Op == OpColumn {
-		col, bound, cmp, ifnot := in[pc], in[pc+1], in[pc+2], in[pc+3]
-		// A negative numeric literal is spelled "Integer 100; Negative": the
-		// bound then sits in the Negative's register, and the group is five
-		// instructions long.
-		boundReg, size, negate := bound.P2, 4, false
-		if (bound.Op == OpInteger || bound.Op == OpReal) && cmp.Op == OpNegative &&
-			cmp.P1 == bound.P2 && pc+4 < predEnd {
-			boundReg, size, negate = cmp.P2, 5, true
-			cmp, ifnot = in[pc+3], in[pc+4]
-		}
-		direct := ifnot.P3 == 1 && ifnot.P2 == nextAt
-		tree := ifnot.P3 == 0 && (falseAt < 0 || ifnot.P2 == falseAt)
-		if tree {
-			falseAt = ifnot.P2
-		}
-		// OpInteger for a literal, OpVariable for a bound parameter. Both do
-		// the same thing here -- put the comparison value in a register -- and
-		// the instructions after them are identical, which is why one matcher
-		// covers both. Nothing else is accepted: an expression bound would put
-		// arbitrary opcodes in this slot.
-		if col.Op != OpColumn || col.P1 != in[rewindAt].P1 ||
-			!segPeepholeBoundOp(bound.Op) || bound.P2 != col.P3+1 || (negate && boundReg != bound.P2+1) ||
-			ifnot.Op != OpIfNot || !(direct || tree) || (direct && falseAt >= 0) {
-			return false
-		}
-		op, ok := segOpOfCompare(cmp.Op)
-		if !ok || cmp.P3 != col.P3 || cmp.P1 != boundReg || cmp.P2 != boundReg+1 ||
-			ifnot.P1 != cmp.P2 {
-			return false
-		}
-		// The comparison must be one the block path actually implements.
-		if !segPeepholeCompareOK(cmp) {
-			return false
-		}
-		pred := segPlanPred{Col: col.P2, Op: op, Aff: affinity(cmp.P5 & p5AffMask)}
-		switch bound.Op {
-		case OpVariable:
-			pred.ParamIdx = bound.P1 // 1-based, per OpVariable's contract
-		case OpReal:
-			f, ok := bound.P4.(float64)
-			if !ok {
-				return false
-			}
-			pred.Lit = Value{Typ: Float, F: f}
-		case OpString8:
-			t, ok := bound.P4.(string)
-			if !ok {
-				return false
-			}
-			pred.Lit = Value{Typ: Text, S: []byte(t)}
-		case OpBlob:
-			b, ok := bound.P4.([]byte)
-			if !ok {
-				return false
-			}
-			pred.Lit = Value{Typ: Blob, S: append([]byte(nil), b...)}
-		default:
-			pred.Lit = Value{Typ: Int, I: int64(bound.P1)}
-		}
-		if negate {
-			switch pred.Lit.Typ {
-			case Int:
-				pred.Lit.I = -pred.Lit.I
-			case Float:
-				pred.Lit.F = -pred.Lit.F
-			default:
-				return false
-			}
-		}
-		preds = append(preds, pred)
-		cmpRegs = append(cmpRegs, cmp.P2)
-		pc += size
-	}
-	if falseAt >= 0 {
-		end, ok := segAndTreeTail(in, pc, cmpRegs, falseAt, nextAt)
-		if !ok {
-			return false
-		}
-		pc = end
+	preds, pc, ok := segParsePredBlock(in, rewindAt+1, predEnd, in[rewindAt].P1, nextAt)
+	if !ok {
+		return false
 	}
 	// Zero, one or two. One was excluded only because the first scalar kernel
 	// could not beat Go's loop at a single compare, which is no longer true on
@@ -338,6 +257,110 @@ func segPeepholeCompareOK(cmp Instruction) bool {
 }
 
 // segOpOfCompare maps a comparison opcode to the predicate operator, reporting
+
+// segParsePredBlock reads the predicate block that starts at pc over cursor:
+// groups of Column/bound/cmp/IfNot whose failed test skips the row (to nextAt),
+// possibly followed by an AND tree's tail. It stops at the first instruction
+// that does not start such a group and returns the predicates and that pc;
+// ok is false when a group starts but does not match exactly.
+func segParsePredBlock(in []Instruction, pc, limit, cursor, nextAt int) (preds []segPlanPred, end int, ok bool) {
+	preds = make([]segPlanPred, 0, 2)
+	var cmpRegs []int
+	falseAt := -1
+	for pc+3 < limit && in[pc].Op == OpColumn && segLooksLikePredGroup(in, pc, limit) {
+		col, bound, cmp, ifnot := in[pc], in[pc+1], in[pc+2], in[pc+3]
+		// A negative numeric literal is spelled "Integer 100; Negative": the
+		// bound then sits in the Negative's register, and the group is five
+		// instructions long.
+		boundReg, size, negate := bound.P2, 4, false
+		if (bound.Op == OpInteger || bound.Op == OpReal) && cmp.Op == OpNegative &&
+			cmp.P1 == bound.P2 && pc+4 < limit {
+			boundReg, size, negate = cmp.P2, 5, true
+			cmp, ifnot = in[pc+3], in[pc+4]
+		}
+		direct := ifnot.P3 == 1 && ifnot.P2 == nextAt
+		tree := ifnot.P3 == 0 && (falseAt < 0 || ifnot.P2 == falseAt)
+		if tree {
+			falseAt = ifnot.P2
+		}
+		// OpInteger for a literal, OpVariable for a bound parameter. Both do
+		// the same thing here -- put the comparison value in a register -- and
+		// the instructions after them are identical, which is why one matcher
+		// covers both. Nothing else is accepted: an expression bound would put
+		// arbitrary opcodes in this slot.
+		if col.Op != OpColumn || col.P1 != cursor ||
+			!segPeepholeBoundOp(bound.Op) || bound.P2 != col.P3+1 || (negate && boundReg != bound.P2+1) ||
+			ifnot.Op != OpIfNot || !(direct || tree) || (direct && falseAt >= 0) {
+			return nil, 0, false
+		}
+		op, ok := segOpOfCompare(cmp.Op)
+		if !ok || cmp.P3 != col.P3 || cmp.P1 != boundReg || cmp.P2 != boundReg+1 ||
+			ifnot.P1 != cmp.P2 {
+			return nil, 0, false
+		}
+		// The comparison must be one the block path actually implements.
+		if !segPeepholeCompareOK(cmp) {
+			return nil, 0, false
+		}
+		pred := segPlanPred{Col: col.P2, Op: op, Aff: affinity(cmp.P5 & p5AffMask)}
+		switch bound.Op {
+		case OpVariable:
+			pred.ParamIdx = bound.P1 // 1-based, per OpVariable's contract
+		case OpReal:
+			f, ok := bound.P4.(float64)
+			if !ok {
+				return nil, 0, false
+			}
+			pred.Lit = Value{Typ: Float, F: f}
+		case OpString8:
+			t, ok := bound.P4.(string)
+			if !ok {
+				return nil, 0, false
+			}
+			pred.Lit = Value{Typ: Text, S: []byte(t)}
+		case OpBlob:
+			b, ok := bound.P4.([]byte)
+			if !ok {
+				return nil, 0, false
+			}
+			pred.Lit = Value{Typ: Blob, S: append([]byte(nil), b...)}
+		default:
+			pred.Lit = Value{Typ: Int, I: int64(bound.P1)}
+		}
+		if negate {
+			switch pred.Lit.Typ {
+			case Int:
+				pred.Lit.I = -pred.Lit.I
+			case Float:
+				pred.Lit.F = -pred.Lit.F
+			default:
+				return nil, 0, false
+			}
+		}
+		preds = append(preds, pred)
+		cmpRegs = append(cmpRegs, cmp.P2)
+		pc += size
+	}
+	if falseAt >= 0 {
+		end, ok := segAndTreeTail(in, pc, cmpRegs, falseAt, nextAt)
+		if !ok {
+			return nil, 0, false
+		}
+		pc = end
+	}
+	return preds, pc, true
+}
+
+// segLooksLikePredGroup reports whether the Column at pc starts a predicate
+// group rather than, say, a GROUP BY key load: its IfNot sits three or (after a
+// Negative) four instructions on.
+func segLooksLikePredGroup(in []Instruction, pc, limit int) bool {
+	if in[pc+3].Op == OpIfNot {
+		return true
+	}
+	return pc+4 < limit && in[pc+2].Op == OpNegative && in[pc+4].Op == OpIfNot
+}
+
 // false for anything that is not one of the six.
 func segOpOfCompare(op OpCode) (segPredOp, bool) {
 	switch op {
