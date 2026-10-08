@@ -58,15 +58,24 @@ const QUERIES = [
 	["correlated EXISTS", "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.id = t.bid AND b.id < ?)", (r, n) => [int(r, n)]],
 ];
 
+// seedSQL fills both engines identically. The inserts go in chunks of
+// 200,000 rows: musql declines a recursive CTE past 300,000 rows that has no
+// LIMIT of its own (cteRecursionRowCap, engine/cte.go), a guard against
+// runaway recursion that C SQLite does not have.
 function seedSQL(n) {
-	return [
+	const chunk = 200000;
+	const out = [
 		"DROP TABLE IF EXISTS t", "DROP TABLE IF EXISTS b",
 		"CREATE TABLE t (id INTEGER PRIMARY KEY, sec INTEGER, k INTEGER, v INTEGER, bid INTEGER, payload TEXT)",
 		"CREATE TABLE b (id INTEGER PRIMARY KEY, label TEXT)",
 		"CREATE INDEX idx_t_sec ON t(sec)",
-		`WITH RECURSIVE c(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM c WHERE i < ${n - 1}) INSERT INTO b SELECT i, 'label-' || i FROM c`,
-		`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < ${n}) INSERT INTO t SELECT i, (i * 7919) % ${n}, (i * 31) % 10, (i * 104729) % 1000000, 1 + (i * 13) % ${n}, 'row-' || i || '-payload' FROM c`,
 	];
+	for (let lo = 0; lo < n; lo += chunk) {
+		const hi = Math.min(lo + chunk, n);
+		out.push(`WITH RECURSIVE c(i) AS (SELECT ${lo} UNION ALL SELECT i + 1 FROM c WHERE i < ${hi - 1}) INSERT INTO b SELECT i, 'label-' || i FROM c`);
+		out.push(`WITH RECURSIVE c(i) AS (SELECT ${lo + 1} UNION ALL SELECT i + 1 FROM c WHERE i < ${hi}) INSERT INTO t SELECT i, (i * 7919) % ${n}, (i * 31) % 10, (i * 104729) % 1000000, 1 + (i * 13) % ${n}, 'row-' || i || '-payload' FROM c`);
+	}
+	return out;
 }
 
 // Rows in a form both engines agree on: Turso may hand back a BigInt.
