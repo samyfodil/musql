@@ -52,7 +52,10 @@ func TestSemiJoinCountMatchesTheLoop(t *testing.T) {
 		{`SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM sparse WHERE sparse.id = t.bid * 1000000007 - 50)`, nil, false}, // an expression key
 		{`SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.id = t.mixed)`, nil, false},                           // a TEXT value in the key
 		{`SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.id = t.n)`, nil, false},                               // NULLs in the key
-		{`SELECT count(*) FROM t WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.id = t.bid)`, nil, false},
+		{`SELECT count(*) FROM t WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.id = t.bid)`, nil, true},                          // anti-join
+		{`SELECT count(*) FROM t WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.id = t.bid AND b.w > 4.5) AND k = 1`, nil, true},
+		{`SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.id = t.bid) AND NOT EXISTS (SELECT 1 FROM b WHERE b.id = t.id)`, nil, true},
+		{`SELECT count(*) FROM t WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.id = t.n)`, nil, false},                                       // NULL keys: NOT EXISTS is true for them
 		{`SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.id = t.bid AND b.id < ?)`, []Value{{Typ: Float, F: 10.5}}, false}, // a REAL bound on the rowid
 		{`SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.id = t.bid AND b.id < ?)`, []Value{{Typ: Null}}, false},
 	}

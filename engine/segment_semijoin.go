@@ -3,7 +3,8 @@ package engine
 import "math"
 
 // A correlated EXISTS over a rowid equality, answered as a SEMI-JOIN over the
-// two tables' column blocks rather than one seek per outer row:
+// two tables' column blocks rather than one seek per outer row -- and NOT
+// EXISTS as the ANTI-JOIN, the rows whose key is not in the set:
 //
 //	SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.id = t.bid AND b.x < ?)
 //
@@ -15,7 +16,8 @@ import "math"
 //
 // It is one more predicate kind of the filtered count (segPeephole), so it is
 // a guard in front of a loop that stays in the program: anything the blocks
-// cannot answer exactly -- a NULL or non-integer key, a block with exceptions,
+// cannot answer exactly -- a NULL key (for which NOT EXISTS is true) or a
+// non-integer one (which can equal a rowid through affinity), a block with exceptions,
 // rows in a log, a bound of the wrong class -- declines, and the inlined EXISTS
 // (exists_inline.go) answers row by row.
 
@@ -26,6 +28,7 @@ type segPlanSemi struct {
 	bRoot  uint32
 	bTbl   *resolvedTable
 	bPreds []segPlanPred // over the inner table; on its rowid alias they read the rowid
+	anti   bool          // NOT EXISTS: the row passes when its key is NOT in the set
 }
 
 // segParseSemiGroup reads, at pc, "Gosub to an inlined EXISTS subroutine; IfNot
@@ -47,7 +50,19 @@ func segParseSemiGroup(in []Instruction, pc, limit, cursor, nextAt int) (segPlan
 	if pc+1 >= limit {
 		return no, 0, false
 	}
+	// "Gosub; IfNot dest", or for NOT EXISTS as the compiler writes it,
+	// "Gosub; Not dest -> d; IfNot d".
 	call, test := in[pc], in[pc+1]
+	width, parentNot := 2, false
+	if test.Op == OpNot && pc+2 < limit {
+		notOp := test
+		test = in[pc+2]
+		if test.Op != OpIfNot || test.P1 != notOp.P2 {
+			return no, 0, false
+		}
+		test.P1 = notOp.P1 // the subroutine's own result register
+		width, parentNot = 3, true
+	}
 	if call.Op != OpGosub || test.Op != OpIfNot || test.P2 != nextAt || test.P3 != 1 {
 		return no, 0, false
 	}
@@ -124,16 +139,29 @@ func segParseSemiGroup(in []Instruction, pc, limit, cursor, nextAt int) (segPlan
 	toDone, ok7 := at(nextB + 2)
 	f0, ok8 := at(found)
 	f1, ok9 := at(found + 1)
-	f2, ok10 := at(found + 2)
-	if !(ok6 && ok7 && ok8 && ok9 && ok10) || rew.P2 != nextB+1 || cl.Op != OpClose || cl.P1 != b || toDone.Op != OpGoto ||
-		f0.Op != OpInteger || f0.P1 != 1 || f0.P2 != dest || f1.Op != OpClose || f1.P1 != b || f2.Op != OpReturn || f2.P1 != ret {
+	if !(ok6 && ok7 && ok8 && ok9) || rew.P2 != nextB+1 || cl.Op != OpClose || cl.P1 != b || toDone.Op != OpGoto ||
+		f0.Op != OpInteger || f0.P1 != 1 || f0.P2 != dest || f1.Op != OpClose || f1.P1 != b {
 		return no, 0, false
 	}
-	done, okD := at(toDone.P2)
-	if !okD || done.Op != OpReturn || done.P1 != ret {
+	// Each exit is "Return", or "Not dest; Return" for NOT EXISTS -- the same
+	// on both, or this is not the subroutine existsInline writes.
+	exitNot := func(at0 int) (anti, ok bool) {
+		x, okx := at(at0)
+		if okx && x.Op == OpNot && x.P1 == dest && x.P2 == dest {
+			r, okr := at(at0 + 1)
+			return true, okr && r.Op == OpReturn && r.P1 == ret
+		}
+		return false, okx && x.Op == OpReturn && x.P1 == ret
+	}
+	antiF, okF2 := exitNot(found + 2)
+	antiD, okD2 := exitNot(toDone.P2)
+	if !okF2 || !okD2 || antiF != antiD {
 		return no, 0, false
 	}
-	return segPlanSemi{keyCol: key.P2, bRoot: uint32(open.P2), bTbl: bt, bPreds: preds}, pc + 2, true
+	if antiF && parentNot {
+		return no, 0, false // negated twice: not a shape anything compiles
+	}
+	return segPlanSemi{keyCol: key.P2, bRoot: uint32(open.P2), bTbl: bt, bPreds: preds, anti: antiF || parentNot}, pc + width, true
 }
 
 // segSemis resolves each semi-join's inner bounds, as segPlanPreds resolves
@@ -145,7 +173,7 @@ func (m *vdbe) segSemis(plan []segPlanSemi) ([]segSemi, bool) {
 		if !ok {
 			return nil, false
 		}
-		out[i] = segSemi{keyCol: sj.keyCol, bRoot: sj.bRoot, bTbl: sj.bTbl, bPreds: preds}
+		out[i] = segSemi{keyCol: sj.keyCol, bRoot: sj.bRoot, bTbl: sj.bTbl, bPreds: preds, anti: sj.anti}
 	}
 	return out, true
 }
@@ -156,6 +184,7 @@ type segSemi struct {
 	bRoot  uint32
 	bTbl   *resolvedTable
 	bPreds []segPred
+	anti   bool
 }
 
 // segCleanSegments is the segments that are the whole of rootPage's rows: a
@@ -238,7 +267,7 @@ func (p *ReadOnlyPager) segSemiCountTable(tRoot uint32, tTbl *resolvedTable, pre
 					} else {
 						k = keys[i][lo+r]
 					}
-					if !set.has(k) {
+					if set.has(k) == semis[i].anti {
 						in = false
 						break
 					}
