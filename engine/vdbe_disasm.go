@@ -151,6 +151,11 @@ var opNames = [numOpCodes]string{
 	OpUpsertReload:         "UpsertReload",
 	OpMultiOrTag:           "MultiOrTag",
 	OpMultiOrSort:          "MultiOrSort",
+	OpFts3Aux:              "Fts3Aux",
+	OpFts3Optimize:         "Fts3Optimize",
+	OpFts5Aux:              "Fts5Aux",
+	OpSegFilterCount:       "SegFilterCount",
+	OpSkipIfRowGone:        "SkipIfRowGone",
 }
 
 // String gives an opcode its mnemonic (used in error messages and disassembly).
