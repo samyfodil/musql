@@ -424,7 +424,7 @@ func (db *DB) runRoutedTriggerBody(w *DB, prog *Program, firing *vdbe) (rowsAffe
 	// The refresh is inside the closure because there is no post-unwind
 	// hook: closures run in reverse, so the earliest routed body's runs last
 	// and publishes the fully unwound session.
-	firing.wctx.journal = append(firing.wctx.journal, func() {
+	firing.wctx.undoFn(func() {
 		wc.rollback()
 		// A SnapshotPager failure here cannot be reported -- a journal closure
 		// undoes, it does not fail -- and leaves ad.pager exactly as stale as

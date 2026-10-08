@@ -469,7 +469,13 @@ const segDeltaChunk = 1 << 20
 // commit rather than writing a batch whose length lies.
 func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs []SegDeltaRecord, endCtr, endPages uint32) (end int64, cksum uint64, err error) {
 	var n int64
-	sizes := make([]int32, len(recs)) // each put's record length, measured once
+	// Each put's record length, measured once; on the stack for a small batch.
+	var sizesBuf [16]int32
+	sizes := sizesBuf[:0]
+	if len(recs) > len(sizesBuf) {
+		sizes = make([]int32, 0, len(recs))
+	}
+	sizes = sizes[:len(recs)]
 	for i := range recs {
 		r := &recs[i]
 		n += 13

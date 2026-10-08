@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"strconv"
@@ -85,7 +86,7 @@ type Session struct {
 	// segStat and deltaStat stamp the segment file and its delta (pairStamp).
 	segStat, deltaStat heldStamp
 
-	recBuf   []SegDeltaRecord // the delta records of a commit, reused (segDeltaRecordsInto)
+	recBuf []SegDeltaRecord // the delta records of a commit, reused (segDeltaRecordsInto)
 
 	// catalogAtLastWrite is the catalog fingerprint as of the last time the FILE
 	// was written. Commit compares against it rather than trusting Exec to have
@@ -94,7 +95,8 @@ type Session struct {
 	// Exec of ours ever sees the statement. Detecting at the commit makes it
 	// impossible to miss: whoever ran the DDL, the catalog either moved or it did
 	// not.
-	catalogAtLastWrite string
+	catalogAtLastWrite []byte
+	fpScratch          []byte // catalogMoved's buffer
 
 	// seenStat is the (size, mtime) of the segment file and its delta as of the
 	// last time this session looked. The freshness check compares THESE first,
@@ -288,41 +290,79 @@ func pragmaDeclineFor(sql string) error {
 
 // catalogFingerprint is every schema object's name and text, so a statement that
 // moved the catalog can be caught rather than half-applied.
-func (n *Session) catalogFingerprint() string {
+func (n *Session) catalogFingerprint() []byte {
+	return n.appendCatalogFingerprint(nil)
+}
+
+// catalogMoved reports whether the catalog differs from catalogAtLastWrite. It
+// builds the fingerprint into a buffer the session keeps, so the check every
+// commit makes allocates nothing once the buffer has grown -- it used to build
+// a fresh string by concatenation, three allocations per statement and more
+// per table -- and compares bytes, which stays exact.
+func (n *Session) catalogMoved() bool {
+	n.fpScratch = n.appendCatalogFingerprint(n.fpScratch[:0])
+	return !bytes.Equal(n.fpScratch, n.catalogAtLastWrite)
+}
+
+// appendCatalogFingerprint appends the fingerprint to b.
+func (n *Session) appendCatalogFingerprint(b []byte) []byte {
 	// The application-owned header words (user_version etc.) live in the
 	// catalog on this format (ConvertedCatalog.UserVersion), so changing one
 	// changes the catalog and the commit must rewrite the file; a delta
 	// batch carries no catalog. The schema cookie is one of them: "PRAGMA
 	// schema_version=777" alone was forgotten at reopen.
-	out := "C" + strconv.FormatUint(uint64(n.schemaCookie), 10) +
-		"U" + strconv.FormatUint(uint64(n.userVersion), 10) +
-		"A" + strconv.FormatUint(uint64(n.applicationID), 10) +
-		"E" + strconv.FormatUint(uint64(n.encoding()), 10) +
-		"P" + strconv.FormatUint(uint64(n.pageSize), 10) +
-		"V" + strconv.FormatUint(uint64(n.autoVacuum), 10) +
-		"W" + strconv.FormatBool(n.segWAL) +
-		"G" + n.captureGuard + "\x00"
+	b = append(b, 'C')
+	b = strconv.AppendUint(b, uint64(n.schemaCookie), 10)
+	b = append(b, 'U')
+	b = strconv.AppendUint(b, uint64(n.userVersion), 10)
+	b = append(b, 'A')
+	b = strconv.AppendUint(b, uint64(n.applicationID), 10)
+	b = append(b, 'E')
+	b = strconv.AppendUint(b, uint64(n.encoding()), 10)
+	b = append(b, 'P')
+	b = strconv.AppendUint(b, uint64(n.pageSize), 10)
+	b = append(b, 'V')
+	b = strconv.AppendUint(b, uint64(n.autoVacuum), 10)
+	b = append(b, 'W')
+	b = strconv.AppendBool(b, n.segWAL)
+	b = append(b, 'G')
+	b = append(b, n.captureGuard...)
+	b = append(b, 0)
 	for _, t := range n.tables {
-		out += "T" + t.name + "\x00" + t.sql + "\x00" + t.aliasOf + "\x00"
+		b = append(b, 'T')
+		b = append(b, t.name...)
+		b = append(b, 0)
+		b = append(b, t.sql...)
+		b = append(b, 0)
+		b = append(b, t.aliasOf...)
+		b = append(b, 0)
 	}
 	// A direct catalog edit changes what the file must say without changing the
 	// live schema (applyCatalogEditsForWrite), so the overlay is part of it.
 	if n.writableSchemaEditsActive() {
 		for _, r := range n.wsCatalogWithOverlay() {
-			out += "X" + fmt.Sprint(r.vals) + "\x00"
+			b = append(b, 'X')
+			b = fmt.Append(b, r.vals)
+			b = append(b, 0)
 		}
 	}
 	for _, i := range n.indexes {
-		out += "I" + i.name + "\x00"
+		b = append(b, 'I')
+		b = append(b, i.name...)
+		b = append(b, 0)
 	}
 	// Views and triggers too. Leaving them out let CREATE VIEW through, which is
 	// exactly the shape this exists to stop: accepted, visible for the session,
 	// gone at the next open.
 	for _, v := range n.views {
-		out += "V" + v.name + "\x00"
+		b = append(b, 'V')
+		b = append(b, v.name...)
+		b = append(b, 0)
 	}
 	for _, g := range n.triggers {
-		out += "G" + g.name + "\x00"
+		b = append(b, 'G')
+		b = append(b, g.name...)
+		b = append(b, 0)
 	}
 	// ...and VIRTUAL TABLES, for exactly the reason views and triggers are here. A
 	// module with SHADOW TABLES (fts5, rtree) changed the table list above and so
@@ -331,9 +371,13 @@ func (n *Session) catalogFingerprint() string {
 	// the next open -- the fingerprint never moved, so the commit appended a delta
 	// batch and the catalog holding that definition was never written.
 	for _, vt := range n.vtabs {
-		out += "X" + vt.name + "\x00" + vt.sql + "\x00"
+		b = append(b, 'X')
+		b = append(b, vt.name...)
+		b = append(b, 0)
+		b = append(b, vt.sql...)
+		b = append(b, 0)
 	}
-	return out
+	return b
 }
 
 // ExecArgsNoRet runs one statement and discards its counts, which is what a
@@ -466,7 +510,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 		n.noteCommittedColumnsStale()
 		return true, nil
 	}
-	if n.catalogFingerprint() != n.catalogAtLastWrite {
+	if n.catalogMoved() {
 		// A catalog change cannot be a delta record, and it also invalidates every
 		// record already in the log: a record names its table by its INDEX in the
 		// directory, which a DROP moves. rewriteFile folds the log in and writes
@@ -494,6 +538,10 @@ func (n *Session) commitMainLocked() (bool, error) {
 		}
 	}
 	changes := n.TakeRowChanges()
+	// Handed back for the next statement once this commit is done with it, so
+	// the log does not regrow from nothing every statement. Not under full
+	// capture, whose changes may be held past the commit.
+	defer n.DB.recycleChangeLog(changes)
 	// A ROW WRITE THE CHANGE LOG DOES NOT DESCRIBE cannot become a delta record,
 	// and appending the log and stopping LOSES it. Fall back to the whole-file
 	// rewrite, which writes every table's live rows and so cannot miss one.

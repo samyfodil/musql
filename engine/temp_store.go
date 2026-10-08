@@ -251,6 +251,11 @@ func (t *TempDatabase) cloneTemp() *TempDatabase {
 func (db *DB) noteTempCommitted() {
 	var cur TempDatabase
 	db.tempContents(&cur)
+	// No temp objects, and the snapshot already says exactly that: nothing to
+	// take. A connection that never touches TEMP paid a clone per commit.
+	if cur.emptyAs(db.tempAtCommit) {
+		return
+	}
 	db.tempAtCommit = cur.cloneTemp()
 	db.publishTemp()
 }
@@ -469,4 +474,13 @@ func (n *Session) TempPager() (*ReadOnlyPager, error) {
 		return nil, err
 	}
 	return ar.pager, nil
+}
+
+// emptyAs reports whether t holds no object and o is the same empty database.
+func (t *TempDatabase) emptyAs(o *TempDatabase) bool {
+	empty := func(d *TempDatabase) bool {
+		return d.hdr == nil && len(d.tables)+len(d.views)+len(d.vtabs)+len(d.triggers)+len(d.indexes) == 0
+	}
+	return o != nil && empty(t) && empty(o) &&
+		t.version == o.version && t.pair == o.pair && t.opened == o.opened && t.held == o.held
 }

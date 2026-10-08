@@ -752,7 +752,7 @@ func (wc *writeCtx) aincEnd() {
 		}
 		old, existed := seq.rows.get(rowid)
 		seq.putRow(rowid, []Value{{Typ: Text, S: []byte(st.tbl.name)}, {Typ: Int, I: st.max}})
-		wc.journal = append(wc.journal, func() {
+		wc.undoFn(func() {
 			if existed {
 				seq.putRow(rowid, old)
 			} else {
