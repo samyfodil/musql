@@ -36,9 +36,15 @@ type segLowered struct {
 	// textCol marks, parallel to cols, a slot holding a TEXT column's cells
 	// (with its heap in ProgArgs.Heap) rather than an int64 block.
 	textCol []bool
-	// textVar is this body with its text operations native (POpTextLen),
-	// for a segment whose text columns are clean TEXT; nil when it has none.
+	// textVar is this body with its text operations native (POpTextLen,
+	// POpTextMatch), for a segment whose text columns are clean TEXT; nil
+	// when it has none.
 	textVar *segLowered
+	// textFold is the LIKE case rule a POpTextMatch was compiled for (true:
+	// case-insensitive); a statement run under the other rule uses the
+	// service-only program.
+	textFold bool
+	textLike bool // a POpTextMatch was lowered, so textFold matters
 }
 
 // segLowerRegOperands returns the operands of in that name a REGISTER, -1 for
@@ -137,11 +143,12 @@ func (l *segLowered) clone() *segLowered {
 // segLowerBody compiles the instructions of a scan loop body, or reports false
 // when it contains an opcode this does not model.
 func segLowerBody(body []Instruction, base int, cursor int, aggAt int) (*segLowered, bool) {
-	out, ok := segLowerBodyWith(body, base, cursor, aggAt, false)
+	out, ok := segLowerBodyWith(body, base, cursor, aggAt, false, false)
 	if !ok || len(out.blocks) == 0 {
 		return out, ok
 	}
-	if tv, tok := segLowerBodyWith(body, base, cursor, aggAt, true); tok && len(tv.textCol) > 0 && slices.Contains(tv.textCol, true) {
+	// LIKE's default rule is case-insensitive; that is the program compiled.
+	if tv, tok := segLowerBodyWith(body, base, cursor, aggAt, true, true); tok && len(tv.textCol) > 0 && slices.Contains(tv.textCol, true) {
 		out.textVar = tv
 	}
 	return out, ok
@@ -152,7 +159,7 @@ func segLowerBody(body []Instruction, base int, cursor int, aggAt int) (*segLowe
 // that column's cells, with the block kept right after it as the fallback for
 // a cell that is not pure ASCII. Only valid over a segment whose column is
 // clean TEXT, so it is a second program beside the first, not a replacement.
-func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text bool) (*segLowered, bool) {
+func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text, textFold bool) (*segLowered, bool) {
 	// AN OpNull ON A PATH THAT RUNS REFUSES THE WHOLE BODY, and modelling NULL
 	// any more cleverly than that is how this went wrong before.
 	//
@@ -176,6 +183,7 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text 
 	colSlot := map[int]int{}         // table column -> program column slot
 	irOf := make([]int, len(body)+1) // body index -> IR index
 	var irJumps [][2]int             // POpJumps whose target is already an IR index
+	neverNull := map[int]bool{}      // registers a native text op leaves never NULL
 	maxReg := 0
 	// One register the lowering owns, above anything the program names, for a
 	// comparison whose result the VDBE never stored.
@@ -242,7 +250,40 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text 
 			// kernel for it, and a block ending in a jump branches on the flag
 			// it leaves. Nothing branches into the middle of a block.
 			if bi := blockAt[i]; bi >= 0 {
-				if col, dst, isLen := segBlockIsLength(body, svc, blocks, bi, cursor); text && isLen && len(out.cols) < jit.MaxProgCols {
+				if t := blocks[bi].insns[0]; text && neverNull[t.P1] && segNullTestOf(&blocks[bi], t.P1) {
+					// A null test of a native LIKE's result: never NULL, so
+					// IsNull is never taken and NotNull always is.
+					if t.Op == OpNotNull {
+						out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpJump, A: t.P2 - base})
+					}
+					continue
+				}
+				if lk, isLike := segBlockIsLike(blocks, bi, cursor, textFold); text && isLike && len(out.cols) < jit.MaxProgCols {
+					// POpTextMatch decides the block's flag (inverted for NOT
+					// LIKE / IfNot); then past the block to its own branch.
+					slot := len(out.cols)
+					out.cols = append(out.cols, lk.col)
+					out.nullCol = append(out.nullCol, false)
+					for len(out.textCol) < slot {
+						out.textCol = append(out.textCol, false)
+					}
+					out.textCol = append(out.textCol, true)
+					out.textFold, out.textLike = textFold, true
+					neverNull[lk.result] = true
+					flag := blocks[bi].flag
+					note(flag)
+					at := len(out.insns)
+					out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpTextMatch, A: flag, B: slot, C: jit.ProgNextRow,
+						Pat: lk.pat, Mode: lk.mode, Fold: textFold})
+					if lk.invert {
+						out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpNot, A: flag, B: flag})
+					}
+					j := len(out.insns)
+					out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpJump})
+					// over the POpService to the flag's POpJumpIfNotZero
+					irJumps = append(irJumps, [2]int{j, j + 2})
+					_ = at
+				} else if col, dst, isLen := segBlockIsLength(body, svc, blocks, bi, cursor); text && isLen && len(out.cols) < jit.MaxProgCols {
 					// POpTextLen; on success jump past the block; the block
 					// itself is the fallback for a non-ASCII cell. Both targets
 					// are IR indices, patched after the jump resolution below,

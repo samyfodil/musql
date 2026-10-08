@@ -138,3 +138,129 @@ func TestEmittedTextLenMatchesLength(t *testing.T) {
 		t.Fatalf("native lengths matching %d (want %d), fallbacks %d (want %d) of %d", matched, counted, fell, fallbacks, n)
 	}
 }
+
+// textMatchModel is POpTextMatch's contract: LIKE's comparison of the text
+// before its first NUL against an ASCII pattern, folding ASCII letters when
+// fold is set.
+func textMatchModel(s, pat []byte, mode TextMode, fold bool) bool {
+	if i := bytes.IndexByte(s, 0); i >= 0 {
+		s = s[:i]
+	}
+	low := func(b byte) byte {
+		if fold && b >= 'A' && b <= 'Z' {
+			return b + 0x20
+		}
+		return b
+	}
+	at := func(i int) bool {
+		for j := range pat {
+			if low(s[i+j]) != pat[j] {
+				return false
+			}
+		}
+		return true
+	}
+	switch mode {
+	case TextEq:
+		return len(s) == len(pat) && at(0)
+	case TextPrefix:
+		return len(s) >= len(pat) && at(0)
+	}
+	for i := 0; i+len(pat) <= len(s); i++ {
+		if at(i) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestEmittedTextMatchMatchesLike runs every mode, folded and exact, over
+// texts and patterns built to hit both the 16-byte path and the byte path:
+// the heap is laid out so the last cells end at its edge.
+func TestEmittedTextMatchMatchesLike(t *testing.T) {
+	if !Available {
+		t.Skip("no JIT on this platform")
+	}
+	rng := rand.New(rand.NewSource(41))
+	alpha := []byte("abcABC_-%xyzXYZ0")
+	var strs [][]byte
+	for i := 0; i < 4000; i++ {
+		b := make([]byte, rng.Intn(30))
+		for j := range b {
+			b[j] = alpha[rng.Intn(len(alpha))]
+		}
+		switch rng.Intn(10) {
+		case 0:
+			if len(b) > 0 {
+				b[rng.Intn(len(b))] = 0
+			}
+		case 1:
+			b = append(b, "é"...)
+		}
+		strs = append(strs, b)
+	}
+	cells, heap := textCells(strs)
+	heap = heap[:len(heap)-1] // no padding: the last cell ends at the heap's edge
+	if len(heap) == 0 {
+		t.Fatal("empty heap")
+	}
+	n := len(strs)
+	for trial := 0; trial < 60; trial++ {
+		mode := TextMode(trial % 3)
+		fold := trial%2 == 0
+		pl := 1 + rng.Intn(16)
+		pat := make([]byte, pl)
+		for j := range pat {
+			pat[j] = alpha[rng.Intn(len(alpha))]
+			if fold && pat[j] >= 'A' && pat[j] <= 'Z' {
+				pat[j] += 0x20
+			}
+		}
+		if trial%5 == 0 && n > 0 { // a pattern taken from a text, so matches happen
+			s := strs[rng.Intn(n)]
+			if len(s) >= 1 {
+				lo := rng.Intn(len(s))
+				hi := min(len(s), lo+1+rng.Intn(16))
+				pat = bytes.ToLower(append([]byte(nil), s[lo:hi]...))
+				if !fold {
+					pat = append([]byte(nil), s[lo:hi]...)
+				}
+				if bytes.IndexByte(pat, 0) >= 0 || bytes.IndexFunc(pat, func(r rune) bool { return r >= 0x80 }) >= 0 {
+					continue
+				}
+			}
+		}
+		want := make([]int64, n)
+		var expect int64
+		for i, s := range strs {
+			if textMatchModel(s, pat, mode, fold) {
+				want[i] = 1
+				expect++
+			}
+		}
+		insns := []ProgInsn{
+			{Op: POpTextMatch, A: 1, B: 0, C: ProgNextRow, Pat: pat, Mode: mode, Fold: fold},
+			{Op: POpLoadCol, A: 2, B: 1},
+			{Op: POpCmp, A: 3, B: 1, C: 2, Cond: CondE},
+			{Op: POpSkipIfZero, A: 3},
+			{Op: POpAccCount},
+		}
+		code, err := EmitProgram(insns, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		kern, err := Map(code)
+		if err != nil {
+			t.Fatal(err)
+		}
+		regs := make([]int64, 8)
+		var out, ovf int64
+		args := &ProgArgs{N: int64(n), Regs: &regs[0], Out: &out, Overflow: &ovf}
+		args.Col[0], args.Col[1], args.Heap[0], args.HeapLen[0] = &cells[0], &want[0], &heap[0], int64(len(heap))
+		kern.Call2(args)
+		kern.Close()
+		if out != int64(n) {
+			t.Fatalf("mode %d fold %v pattern %q: %d of %d rows agree with LIKE (%d expected matches)", mode, fold, pat, out, n, expect)
+		}
+	}
+}

@@ -14,7 +14,7 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		return nil, fmt.Errorf("jit: %d column blocks, max %d", nCols, MaxProgCols)
 	}
 	for _, in := range insns {
-		if (in.Op == POpLoadCol || in.Op == POpTextLen) && (in.B < 0 || in.B >= nCols) {
+		if (in.Op == POpLoadCol || in.Op == POpTextLen || in.Op == POpTextMatch) && (in.B < 0 || in.B >= nCols) {
 			return nil, fmt.Errorf("jit: column %d out of range", in.B)
 		}
 	}
@@ -133,6 +133,11 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.StrImm(X9, X1, in.A*8)
 		case POpTextLen:
 			emitTextLenArm64(a, in, colReg[in.B], progTarget(in.C, len(insns)), idx)
+		case POpTextMatch:
+			if len(in.Pat) == 0 || len(in.Pat) > 16 {
+				return nil, fmt.Errorf("jit: text pattern of %d bytes", len(in.Pat))
+			}
+			emitTextMatchArm64(a, in, colReg[in.B], idx)
 		case POpService:
 			a.MovImm64(X9, int64(in.A)+1)
 			a.StrImm(X9, X0, POffPC)
@@ -208,6 +213,7 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	a.LdrImm(X9, X0, POffOverflow)
 	a.StrImm(X4, X9, 0)
 	a.Ret()
+	emitTextPoolArm64(a, insns)
 	return a.Code()
 }
 
@@ -280,4 +286,151 @@ func emitTextLenArm64(a *Arm, in ProgInsn, cells Reg64, fallback string, idx int
 	a.Label(done)
 	a.StrImm(X12, X1, in.A*8)
 	a.Label(after)
+}
+
+// emitTextPoolArm64 lays out POpTextMatch's constants after the code: each
+// pattern and its lane mask (m leading 0xFF bytes), and the fold's vectors.
+func emitTextPoolArm64(a *Arm, insns []ProgInsn) {
+	fold := false
+	for idx, in := range insns {
+		if in.Op != POpTextMatch {
+			continue
+		}
+		fold = fold || in.Fold
+		var p, mask [16]byte
+		copy(p[:], in.Pat)
+		for j := range in.Pat {
+			mask[j] = 0xFF
+		}
+		a.Label("pat" + itoa(idx))
+		a.Data(p[:])
+		a.Label("msk" + itoa(idx))
+		a.Data(mask[:])
+	}
+	if fold {
+		for _, k := range []struct {
+			l string
+			b byte
+		}{{"kA", 'A'}, {"k26", 26}, {"k20", 0x20}} {
+			a.Label(k.l)
+			var v [16]byte
+			for j := range v {
+				v[j] = k.b
+			}
+			a.Data(v[:])
+		}
+	}
+}
+
+// emitTextMatchArm64 is emitTextMatchAmd64 with NEON. The fold needs no
+// signed trick: CMHI is an unsigned compare, so a letter is 26 >u b-'A'. A
+// position matches when (text ^ pattern) & mask is all zero, which UMAXV
+// tests. X9..X14 are scratch; V0..V4.
+func emitTextMatchArm64(a *Arm, in ProgInsn, cells Reg64, idx int) {
+	m := len(in.Pat)
+	sfx := itoa(idx)
+	yes, no, end := "my"+sfx, "mn"+sfx, "me"+sfx
+	v := func(n int) VReg { return VReg(n) }
+	// X10 = the text, X11 = its length, X12 = the heap's end.
+	a.LdrRegIdx(X9, cells, X2)
+	a.LdrImm(X10, X0, POffHeap+in.B*8)
+	a.LdrImm(X12, X0, POffHeapLen+in.B*8)
+	a.AddReg(X12, X12, X10)
+	a.MovW(X13, X9)
+	a.AddReg(X10, X10, X13)
+	a.LsrImm(X11, X9, 32)
+
+	matchAt := func(fail string, k int) {
+		scalar, done := "ms"+sfx+"_"+itoa(k), "md"+sfx+"_"+itoa(k)
+		a.AddImm(X13, X10, 16)
+		a.Cmp(X13, X12)
+		a.BcondRaw(0x8, scalar) // HI: unsigned >, past the heap's end
+		a.LdrQ(v(0), X10)
+		if in.Fold {
+			a.Adr(X14, "kA")
+			a.LdrQ(v(2), X14)
+			a.SubV16B(v(2), v(0), v(2)) // b - 'A'
+			a.Adr(X14, "k26")
+			a.LdrQ(v(3), X14)
+			a.Cmhi16B(v(3), v(3), v(2)) // 26 >u b-'A'
+			a.Adr(X14, "k20")
+			a.LdrQ(v(4), X14)
+			a.AndV(v(3), v(3), v(4))
+			a.OrrV(v(0), v(0), v(3))
+		}
+		a.Adr(X14, "pat"+itoa(idx))
+		a.LdrQ(v(1), X14)
+		a.EorV(v(0), v(0), v(1))
+		a.Adr(X14, "msk"+itoa(idx))
+		a.LdrQ(v(1), X14)
+		a.AndV(v(0), v(0), v(1))
+		a.Umaxv16B(v(1), v(0))
+		a.UmovB0(X13, v(1))
+		a.Cbnz(X13, fail)
+		a.B(done)
+		a.Label(scalar)
+		for j, p := range in.Pat {
+			a.LdrbImm(X13, X10, j)
+			if in.Fold && p >= 'a' && p <= 'z' {
+				ok := "mk" + sfx + "_" + itoa(k) + "_" + itoa(j)
+				a.CmpImm(X13, uint32(p))
+				a.Bcond(CondE, ok)
+				a.CmpImm(X13, uint32(p-0x20))
+				a.Bcond(CondNE, fail)
+				a.Label(ok)
+				continue
+			}
+			a.CmpImm(X13, uint32(p))
+			a.Bcond(CondNE, fail)
+		}
+		a.Label(done)
+	}
+
+	a.CmpImm(X11, uint32(m))
+	a.Bcond(CondL, no)
+	switch in.Mode {
+	case TextEq:
+		eqOK := "mq" + sfx
+		a.Bcond(CondE, eqOK)
+		a.LdrbImm(X13, X10, m)
+		a.Cbnz(X13, no)
+		a.Label(eqOK)
+		matchAt(no, 0)
+		a.B(yes)
+	case TextPrefix:
+		matchAt(no, 0)
+		a.B(yes)
+	case TextContains:
+		loop, next := "mc"+sfx, "mx"+sfx
+		a.Label(loop)
+		a.CmpImm(X11, uint32(m))
+		a.Bcond(CondL, no)
+		a.LdrbImm(X13, X10, 0)
+		a.Cbz(X13, no)
+		p0 := in.Pat[0]
+		if in.Fold && p0 >= 'a' && p0 <= 'z' {
+			first := "mf" + sfx
+			a.CmpImm(X13, uint32(p0))
+			a.Bcond(CondE, first)
+			a.CmpImm(X13, uint32(p0-0x20))
+			a.Bcond(CondNE, next)
+			a.Label(first)
+		} else {
+			a.CmpImm(X13, uint32(p0))
+			a.Bcond(CondNE, next)
+		}
+		matchAt(next, 1)
+		a.B(yes)
+		a.Label(next)
+		a.AddImm(X10, X10, 1)
+		a.SubsImm(X11, X11, 1)
+		a.B(loop)
+	}
+	a.Label(yes)
+	a.MovImm16(X13, 1)
+	a.StrImm(X13, X1, in.A*8)
+	a.B(end)
+	a.Label(no)
+	a.StrImm(xzr, X1, in.A*8)
+	a.Label(end)
 }

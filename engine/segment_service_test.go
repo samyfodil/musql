@@ -160,3 +160,69 @@ func TestNativeTextLengthMatchesTheLoop(t *testing.T) {
 		}
 	}
 }
+
+// TestNativeTextMatchMatchesTheLoop: "col [NOT] LIKE 'literal'" over a clean
+// TEXT column runs as the kernel's POpTextMatch (equality, prefix, contains,
+// ASCII-folded), and must answer as the loop does -- including under
+// case_sensitive_like, which the folded program was not compiled for and so
+// must not serve.
+func TestNativeTextMatchMatchesTheLoop(t *testing.T) {
+	rng := rand.New(rand.NewSource(43))
+	alpha := []string{"x", "X", "1", "2", "a", "B", "%", "_", "é"}
+	stmts := []string{`CREATE TABLE t(id INTEGER PRIMARY KEY, s TEXT, k INTEGER)`}
+	for i := 1; i <= 3000; i++ {
+		var b strings.Builder
+		for range rng.Intn(24) {
+			b.WriteString(alpha[rng.Intn(len(alpha))])
+		}
+		v := "'" + b.String() + "'"
+		if i%23 == 0 {
+			v = "'x1' || char(0) || 'zz'"
+		}
+		stmts = append(stmts, fmt.Sprintf(`INSERT INTO t VALUES(%d, %s, %d)`, i, v, i%9))
+	}
+	p := newSegPair(t, stmts...)
+	queries := []string{
+		`SELECT max(k) FROM t WHERE s LIKE 'x1%'`,
+		`SELECT max(id) FROM t WHERE s LIKE '%1x%'`,
+		`SELECT min(id) FROM t WHERE s LIKE 'X1'`,
+		`SELECT sum(k) FROM t WHERE s NOT LIKE '%a%'`,
+		`SELECT min(id) FROM t WHERE s NOT LIKE 'x%' AND k % 3 = 0`,
+		`SELECT sum(length(s)) FROM t WHERE s LIKE '%b%'`,
+		`SELECT max(k) FROM t WHERE s LIKE 'zz%'`,
+		`SELECT max(k) FROM t WHERE s LIKE '%xxxxxxxxxxxxxxxxx%'`, // a 17-byte piece: not native
+		`SELECT max(k) FROM t WHERE s LIKE '%1'`,                  // a suffix: not native yet
+		`SELECT count(*) FROM t WHERE s LIKE 'x1%' OR k > 5`,      // the three-valued OR epilogue
+		`SELECT count(*) FROM t WHERE NOT (s LIKE 'a%') OR k = 2`,
+		`SELECT count(*) FROM t WHERE s LIKE '%B%' AND (k = 1 OR s LIKE '%x%')`,
+	}
+	run := func(cs bool) {
+		for _, q := range queries {
+			ask := func(fast bool) string {
+				segPeepholesOffForTest = !fast
+				defer func() { segPeepholesOffForTest = false }()
+				n, err := OpenWrite(p.path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer n.Discard()
+				if cs {
+					if err := n.Exec(`PRAGMA case_sensitive_like = ON`); err != nil {
+						t.Fatal(err)
+					}
+				}
+				_, rows, err := n.Query(q, nil)
+				if err != nil {
+					t.Fatalf("%s: %v", q, err)
+				}
+				return fmt.Sprint(typedRows(rows))
+			}
+			want := ask(false)
+			if got := ask(true); got != want {
+				t.Errorf("case_sensitive_like=%v %s:\n kernel %s\n loop   %s", cs, q, got, want)
+			}
+		}
+	}
+	run(false)
+	run(true)
+}

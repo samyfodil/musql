@@ -132,6 +132,16 @@ func segClassifyServices(body []Instruction, cursor int) []bool {
 	if !some {
 		return svc
 	}
+	// The NULL arm of a three-valued OR or IN: native lowering admits an
+	// OpNull only where it proves no path reaches it, and a test that runs in
+	// a block (an IsNull of a LIKE's result) defeats that proof. Run it in a
+	// block instead: a NULL that reaches a native register declines the
+	// statement there, and on rows that never take the arm it costs nothing.
+	for i, in := range body {
+		if in.Op == OpNull {
+			svc[i] = true
+		}
+	}
 	for changed := true; changed; {
 		changed = false
 		readers, writers := map[int][]int{}, map[int][]int{}
@@ -494,4 +504,125 @@ func segVecColumn(s *segment, c int) (cells []uint64, heap []byte, ok bool) {
 	}
 	cells, heap, ok = s.BytesColumn(c)
 	return cells, heap, ok && len(cells) >= s.nRows
+}
+
+// segBlockWindowPrivate reports whether no other block reads a register block
+// bi writes into the window -- what lets a native form skip the block.
+func segBlockWindowPrivate(blocks []segSvcBlock, bi int) bool {
+	writes := map[int]bool{}
+	for _, in := range blocks[bi].insns {
+		_, w, _, _ := segInsnRegs(in)
+		for _, x := range w {
+			writes[x] = true
+		}
+	}
+	for obi, ob := range blocks {
+		if obi == bi {
+			continue
+		}
+		for _, in := range ob.insns {
+			r, _, _, _ := segInsnRegs(in)
+			for _, x := range r {
+				if writes[x] {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// segBlockLike is a block that is exactly "col [NOT] LIKE 'literal'" and the
+// If/IfNot on it, reduced to one POpTextMatch: the mode and pattern, and
+// whether the branch flag is the match inverted.
+type segBlockLike struct {
+	col    int
+	pat    []byte
+	mode   jit.TextMode
+	invert bool
+	result int // the LIKE's result register: never NULL once it is native
+}
+
+// segNullTestOf reports whether block b is exactly one IsNull or NotNull of r.
+func segNullTestOf(b *segSvcBlock, r int) bool {
+	return len(b.insns) == 1 && (b.insns[0].Op == OpIsNull || b.insns[0].Op == OpNotNull) && b.insns[0].P1 == r
+}
+
+// segBlockIsLike recognizes block bi as a LIKE the kernel can test natively,
+// given the case rule the program is compiled for (fold: case-insensitive).
+// The pattern must be a literal: it is compiled into the machine code.
+func segBlockIsLike(blocks []segSvcBlock, bi, cursor int, fold bool) (segBlockLike, bool) {
+	var no segBlockLike
+	b := &blocks[bi]
+	n := len(b.insns)
+	if len(b.load) != 0 || b.flag < 0 || len(b.writeBack) != 0 || n < 3 {
+		return no, false
+	}
+	colOf, lit := map[int]int{}, map[int]string{}
+	for k, in := range b.insns[:n-2] {
+		switch {
+		case in.Op == OpColumn && in.P1 == cursor:
+			colOf[in.P3] = in.P2
+		case in.Op == OpSCopy:
+			if c, have := colOf[in.P1]; have {
+				colOf[in.P2] = c
+			} else if l, have := lit[in.P1]; have {
+				lit[in.P2] = l
+			} else {
+				return no, false
+			}
+		case in.Op == OpString8:
+			lit[in.P2] = in.P4.(string)
+		default:
+			_ = k
+			return no, false
+		}
+	}
+	like, test := b.insns[n-2], b.insns[n-1]
+	if esc, _ := like.P4.(int); like.Op != OpLike || esc >= 0 ||
+		(test.Op != OpIf && test.Op != OpIfNot) || test.P1 != like.P2 {
+		return no, false
+	}
+	col, okC := colOf[like.P1]
+	pat, okP := lit[like.P3]
+	if !okC || !okP {
+		return no, false
+	}
+	// Another block may read what this one leaves in the window only to test
+	// the LIKE's result for NULL -- the three-valued OR's epilogue -- which
+	// the native form answers: over clean TEXT and a literal it is never NULL.
+	for obi := range blocks {
+		if obi != bi && !segNullTestOf(&blocks[obi], like.P2) {
+			only := []segSvcBlock{blocks[bi], blocks[obi]}
+			if !segBlockWindowPrivate(only, 0) {
+				return no, false
+			}
+		}
+	}
+	lp := newLikePlan([]byte(pat))
+	if !lp.ok || len(lp.pieces) != 1 || len(lp.pieces[0]) == 0 || len(lp.pieces[0]) > 16 {
+		return no, false
+	}
+	out := segBlockLike{col: col, pat: append([]byte(nil), lp.pieces[0]...), result: like.P2}
+	switch {
+	case lp.exact:
+		out.mode = jit.TextEq
+	case lp.head && !lp.tail:
+		out.mode = jit.TextPrefix
+	case !lp.head && !lp.tail:
+		out.mode = jit.TextContains
+	default:
+		return no, false // a suffix: not native yet
+	}
+	if fold {
+		for i, c := range out.pat {
+			if c >= 'A' && c <= 'Z' {
+				out.pat[i] = c + 0x20
+			}
+		}
+	}
+	// The flag is "the jump is taken": If jumps on a true LIKE, IfNot on a
+	// false one, and NOT LIKE turns the match around first.
+	out.invert = (like.P5&p5LikeNot != 0) != (test.Op == OpIfNot)
+	return out, true
 }

@@ -142,7 +142,7 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 		// the service-only body otherwise.
 		low, kern := low, kern
 		var heaps [jit.MaxProgCols][]byte
-		if tv := low.textVar; tv != nil {
+		if tv := low.textVar; tv != nil && (!tv.textLike || tv.textFold == !m.likeCaseSensitive()) {
 			if tk := segProgKernel(tv); tk != nil {
 				clean := true
 				for i, isText := range tv.textCol {
@@ -210,7 +210,7 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 			}
 			args.Col[i] = &b[0]
 			if h := heaps[i]; len(h) > 0 {
-				args.Heap[i] = &h[0]
+				args.Heap[i], args.HeapLen[i] = &h[0], int64(len(h))
 			}
 		}
 		if !segCallKernel(kern, args, svc, low.blocks, s, local) {

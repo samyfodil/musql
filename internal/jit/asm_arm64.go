@@ -25,6 +25,8 @@ const (
 	X11
 	X12
 	X13
+	X14
+	X15
 )
 
 // xzr is the zero register, which shares encoding 31 with the stack pointer.
@@ -515,3 +517,25 @@ func (a *Arm) UmovB0(rd Reg64, vn VReg) { a.emit(0x0E013C00 | uint32(vn)<<5 | ui
 
 // MovW is  Wd = Wm: the low 32 bits, zero-extended into Xd.
 func (a *Arm) MovW(rd, rm Reg64) { a.emit(0x2A0003E0 | uint32(rm)<<16 | uint32(rd)) }
+
+// SubV16B is  Vd.16B = Vn.16B - Vm.16B, wrapping.
+func (a *Arm) SubV16B(vd, vn, vm VReg) {
+	a.emit(0x6E208400 | uint32(vm)<<16 | uint32(vn)<<5 | uint32(vd))
+}
+
+// Cmhi16B is  Vd.16B[i] = 0xFF where Vn[i] > Vm[i] unsigned, else 0.
+func (a *Arm) Cmhi16B(vd, vn, vm VReg) {
+	a.emit(0x6E203400 | uint32(vm)<<16 | uint32(vn)<<5 | uint32(vd))
+}
+
+// OrrV is  Vd = Vn | Vm.
+func (a *Arm) OrrV(vd, vn, vm VReg) {
+	a.emit(0x4EA01C00 | uint32(vm)<<16 | uint32(vn)<<5 | uint32(vd))
+}
+
+// Data appends raw bytes, a multiple of four, to the instruction stream.
+func (a *Arm) Data(b []byte) {
+	for i := 0; i+4 <= len(b); i += 4 {
+		a.emit(uint32(b[i]) | uint32(b[i+1])<<8 | uint32(b[i+2])<<16 | uint32(b[i+3])<<24)
+	}
+}

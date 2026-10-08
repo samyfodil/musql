@@ -207,6 +207,11 @@ const (
 	// SQLite's UTF-8 reader does.
 	POpTextLen
 
+	// POpTextMatch: r[A] = 1 when the TEXT cell in slot B matches Pat as Mode
+	// says, else 0 -- LIKE's comparison of the text before its first NUL. C is
+	// a fallback target, for a pattern this cannot test.
+	POpTextMatch
+
 	// POpEmitRow appends the current row index to Sel and counts it in the
 	// accumulator, which the epilogue leaves in *Out. It is what turns a
 	// compiled predicate into a SELECTION rather than a tally: the program
@@ -234,7 +239,22 @@ type ProgInsn struct {
 	Op      POp
 	A, B, C int
 	Cond    Cond
+	// POpTextMatch only: the pattern (ASCII, no NUL, at most 16 bytes, already
+	// lower-cased when Fold), the mode, and whether ASCII letters compare
+	// case-insensitively.
+	Pat  []byte
+	Mode TextMode
+	Fold bool
 }
+
+// TextMode is what POpTextMatch tests.
+type TextMode uint8
+
+const (
+	TextEq       TextMode = iota // the text before its first NUL equals Pat
+	TextPrefix                   // it starts with Pat
+	TextContains                 // Pat occurs in it
+)
 
 // MaxProgCols is how many distinct column blocks one compiled program may
 // read. They are preloaded into registers outside the row loop, so the limit is
@@ -264,6 +284,9 @@ type ProgArgs struct {
 	// Heap is, per column slot holding TEXT cells, the base of the bytes those
 	// cells point into (88..). A cell is offset | length<<32.
 	Heap [MaxProgCols]*byte
+	// HeapLen is each heap's length: a 16-byte load is taken only where it
+	// ends inside the heap, so reading past a short cell never leaves it.
+	HeapLen [MaxProgCols]int64
 }
 
 // Byte offsets of ProgArgs' fields, asserted by TestProgArgsLayout.
@@ -277,6 +300,7 @@ const (
 	POffPC       = POffSel + 8
 	POffRow      = POffPC + 8
 	POffHeap     = POffRow + 8
+	POffHeapLen  = POffHeap + MaxProgCols*8
 )
 
 // progHasService reports whether a program can stop for a service, and so

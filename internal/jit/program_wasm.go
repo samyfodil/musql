@@ -42,7 +42,7 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	}
 	n := len(insns)
 	for i, in := range insns {
-		if (in.Op == POpLoadCol || in.Op == POpTextLen) && (in.B < 0 || in.B >= nCols) {
+		if (in.Op == POpLoadCol || in.Op == POpTextLen || in.Op == POpTextMatch) && (in.B < 0 || in.B >= nCols) {
 			return nil, fmt.Errorf("jit: column %d out of range", in.B)
 		}
 		switch in.Op {
@@ -60,6 +60,7 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	}
 	t1, t2, t3 := w.Local(wI64), w.Local(wI64), w.Local(wI64)
 	tp, tl, tc, tb := w.Local(wI32), w.Local(wI32), w.Local(wI64), w.Local(wI32) // POpTextLen
+	te := w.Local(wI32)                                                         // POpTextMatch: the heap's end
 
 	w.LoadPtr(POffRegs)
 	w.Set(regs)
@@ -206,6 +207,11 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			storeReg(in.A, func() { loadReg(in.B); w.op(opI64Eqz); bool64() })
 		case POpTextLen:
 			emitTextLenWasm(w, in, regs, colEnd[in.B], idx, tp, tl, tc, tb, depthTo(i, in.C))
+		case POpTextMatch:
+			if len(in.Pat) == 0 || len(in.Pat) > 16 {
+				return nil, fmt.Errorf("jit: text pattern of %d bytes", len(in.Pat))
+			}
+			emitTextMatchWasm(w, in, regs, colEnd[in.B], idx, t1, tp, tl, te)
 		case POpService:
 			// Stop: PC = service+1, Row = idx, then out to $done past the
 			// "finished" store, so the epilogue saves acc and ovf as usual.
@@ -550,4 +556,204 @@ func emitTextLenWasm(w *Wasm, in ProgInsn, regs, colEnd, idx, tp, tl, tc, tb uin
 	w.op(opEnd) // $fb
 	w.Br(fallbackDepth + 1)
 	w.op(opEnd) // $after
+}
+
+// wasmBlocks names the open blocks of a structured emission so a branch says
+// where it goes rather than how deep that is.
+type wasmBlocks struct {
+	w     *Wasm
+	stack []string
+}
+
+func (b *wasmBlocks) open(op byte, name string) { b.w.op(op, opVoid); b.stack = append(b.stack, name) }
+func (b *wasmBlocks) close()                   { b.w.op(opEnd); b.stack = b.stack[:len(b.stack)-1] }
+func (b *wasmBlocks) depth(name string) uint32 {
+	for i := len(b.stack) - 1; i >= 0; i-- {
+		if b.stack[i] == name {
+			return uint32(len(b.stack) - 1 - i)
+		}
+	}
+	panic("jit: no open wasm block " + name)
+}
+func (b *wasmBlocks) br(name string)   { b.w.Br(b.depth(name)) }
+func (b *wasmBlocks) brIf(name string) { b.w.BrIf(b.depth(name)) }
+
+// emitTextMatchWasm is emitTextMatchAmd64 in SIMD128. The pattern, its lane
+// mask and the fold's vectors are v128.const immediates; the fold is an
+// unsigned i8x16.lt_u, and a position matches when (text ^ pattern) & mask has
+// no bit set (v128.any_true).
+func emitTextMatchWasm(w *Wasm, in ProgInsn, regs, colEnd, idx, t1, tp, tl, te uint32) {
+	const (
+		i32Load8U  = 0x2D
+		i32Sub     = 0x6B
+		i32GtU     = 0x4B
+		i32LtU     = 0x49
+		i32Ne      = 0x47
+		i64ShrU    = 0x88
+		v128Const  = 0x0C
+		i8x16Sub   = 0x71
+		i8x16LtU   = 0x26
+		v128And    = 0x4E
+		v128Or     = 0x50
+		v128Xor    = 0x51
+		v128AnyTru = 0x53
+	)
+	m := len(in.Pat)
+	b := &wasmBlocks{w: w}
+	vconst := func(v [16]byte) {
+		w.op(opSIMD)
+		w.body = uleb(w.body, v128Const)
+		w.op(v[:]...)
+	}
+	splat := func(c byte) (v [16]byte) {
+		for i := range v {
+			v[i] = c
+		}
+		return v
+	}
+	var pat, mask [16]byte
+	copy(pat[:], in.Pat)
+	for j := range in.Pat {
+		mask[j] = 0xFF
+	}
+	byteAt := func(off int) {
+		w.Get(tp)
+		w.op(i32Load8U, 0)
+		w.body = uleb(w.body, uint64(off))
+	}
+
+	// t1 = the cell; tp = the text, tl = its length, te = the heap's end.
+	w.Get(colEnd)
+	w.Get(idx)
+	w.op(opI32WrapI64)
+	w.I32(3)
+	w.op(opI32Shl)
+	w.op(opI32Add)
+	w.LoadI64(0)
+	w.Set(t1)
+	w.LoadPtr(uint32(POffHeap + in.B*8))
+	w.Set(te)
+	w.Get(te)
+	w.Get(t1)
+	w.op(opI32WrapI64)
+	w.op(opI32Add)
+	w.Set(tp)
+	w.Get(te)
+	w.Get(0)
+	w.LoadI64(uint32(POffHeapLen + in.B*8))
+	w.op(opI32WrapI64)
+	w.op(opI32Add)
+	w.Set(te)
+	w.Get(t1)
+	w.I64(32)
+	w.op(i64ShrU)
+	w.op(opI32WrapI64)
+	w.Set(tl)
+
+	// matchAt branches to fail unless the pattern is at tp.
+	matchAt := func(fail string) {
+		b.open(opBlock, "done")
+		b.open(opBlock, "scalar")
+		w.Get(tp)
+		w.I32(16)
+		w.op(opI32Add)
+		w.Get(te)
+		w.op(i32GtU)
+		b.brIf("scalar")
+		w.Get(tp)
+		w.op(opSIMD, simdV128Load, 0, 0)
+		if in.Fold {
+			// v | ((v - 'A' <u 26) & 0x20), the chunk loaded again rather
+			// than kept in a v128 local.
+			w.Get(tp)
+			w.op(opSIMD, simdV128Load, 0, 0)
+			vconst(splat('A'))
+			w.Simd(i8x16Sub)
+			vconst(splat(26))
+			w.Simd(i8x16LtU)
+			vconst(splat(0x20))
+			w.Simd(v128And)
+			w.Simd(v128Or)
+		}
+		vconst(pat)
+		w.Simd(v128Xor)
+		vconst(mask)
+		w.Simd(v128And)
+		w.Simd(v128AnyTru)
+		b.brIf(fail)
+		b.br("done")
+		b.close() // scalar
+		for j, p := range in.Pat {
+			if in.Fold && p >= 'a' && p <= 'z' {
+				// (byte | 0x20) == p, sound because p is a letter: only 'A'+n
+				// and 'a'+n map onto it.
+				byteAt(j)
+				w.I32(0x20)
+				w.op(0x72) // i32.or
+			} else {
+				byteAt(j)
+			}
+			w.I32(int32(p))
+			w.op(i32Ne)
+			b.brIf(fail)
+		}
+		b.close() // done
+	}
+
+	b.open(opBlock, "end")
+	b.open(opBlock, "no")
+	b.open(opBlock, "yes")
+	w.Get(tl)
+	w.I32(int32(m))
+	w.op(i32LtU)
+	b.brIf("no")
+	switch in.Mode {
+	case TextEq:
+		b.open(opBlock, "eqok")
+		w.Get(tl)
+		w.I32(int32(m))
+		w.op(0x46) // i32.eq
+		b.brIf("eqok")
+		byteAt(m)
+		b.brIf("no") // a byte other than NUL at m: the text is longer
+		b.close()
+		matchAt("no")
+		b.br("yes")
+	case TextPrefix:
+		matchAt("no")
+		b.br("yes")
+	case TextContains:
+		b.open(opLoop, "lp")
+		w.Get(tl)
+		w.I32(int32(m))
+		w.op(i32LtU)
+		b.brIf("no")
+		byteAt(0)
+		w.op(opI32Eqz)
+		b.brIf("no")
+		b.open(opBlock, "next")
+		matchAt("next")
+		b.br("yes")
+		b.close() // next
+		w.Get(tp)
+		w.I32(1)
+		w.op(opI32Add)
+		w.Set(tp)
+		w.Get(tl)
+		w.I32(1)
+		w.op(i32Sub)
+		w.Set(tl)
+		b.br("lp")
+		b.close() // lp
+	}
+	b.close() // yes
+	w.Get(regs)
+	w.I64(1)
+	w.StoreI64(uint32(in.A * 8))
+	b.br("end")
+	b.close() // no
+	w.Get(regs)
+	w.I64(0)
+	w.StoreI64(uint32(in.A * 8))
+	b.close() // end
 }

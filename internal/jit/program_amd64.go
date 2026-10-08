@@ -14,7 +14,7 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		return nil, fmt.Errorf("jit: %d column blocks, max %d", nCols, MaxProgCols)
 	}
 	for _, in := range insns {
-		if (in.Op == POpLoadCol || in.Op == POpTextLen) && (in.B < 0 || in.B >= nCols) {
+		if (in.Op == POpLoadCol || in.Op == POpTextLen || in.Op == POpTextMatch) && (in.B < 0 || in.B >= nCols) {
 			return nil, fmt.Errorf("jit: column %d out of range", in.B)
 		}
 	}
@@ -162,6 +162,11 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.Label(svcLabel(in.A))
 		case POpTextLen:
 			emitTextLenAmd64(a, in, colReg[in.B], progTarget(in.C, len(insns)), idx)
+		case POpTextMatch:
+			if len(in.Pat) == 0 || len(in.Pat) > 16 {
+				return nil, fmt.Errorf("jit: text pattern of %d bytes", len(in.Pat))
+			}
+			emitTextMatchAmd64(a, in, colReg[in.B], idx)
 		case POpAccCount:
 			a.IncReg(R8)
 		case POpEmitRow:
@@ -204,6 +209,7 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	a.MovRegMem(RDX, RDI, POffOverflow)
 	a.MovMemReg(RDX, 0, R9)
 	a.Ret()
+	emitTextPool(a, insns)
 	return a.Code()
 }
 
@@ -314,4 +320,164 @@ func emitTextLenAmd64(a *Asm, in ProgInsn, cells Reg, fallback string, idx int) 
 	a.XorRegReg(R11, R11)
 	a.Jmp(fallback)
 	a.Label(after)
+}
+
+// emitTextPool lays out the constants POpTextMatch loads RIP-relative: each
+// pattern padded to 16 bytes, and the three vectors the ASCII fold uses.
+func emitTextPool(a *Asm, insns []ProgInsn) {
+	fold := false
+	for idx, in := range insns {
+		if in.Op != POpTextMatch {
+			continue
+		}
+		fold = fold || in.Fold
+		a.Align(16)
+		a.Label("pat" + itoa(idx))
+		var p [16]byte
+		copy(p[:], in.Pat)
+		a.emit(p[:]...)
+	}
+	if fold {
+		for _, k := range []struct {
+			l string
+			b byte
+		}{{"kA", 'A'}, {"k26", 26}, {"k20", 0x20}} {
+			a.Align(16)
+			a.Label(k.l)
+			for range 16 {
+				a.emit(k.b)
+			}
+		}
+	}
+}
+
+// emitTextFoldX0 lower-cases the ASCII letters in X0: a byte b is one when
+// b-'A' is 0..25 as a signed byte, which two PCMPGTB decide without an
+// unsigned compare (SSE2 has none).
+func emitTextFoldX0(a *Asm) {
+	a.Movdqa(X2, X0)
+	a.MovdquRIP(X3, "kA")
+	a.Psubb(X2, X3)  // v = b - 'A'
+	a.MovdquRIP(X3, "k26")
+	a.Pcmpgtb(X3, X2) // 26 > v
+	a.Pxor(X1, X1)
+	a.Pcmpgtb(X1, X2) // 0 > v
+	a.Pandn(X1, X3)   // 0 <= v < 26
+	a.MovdquRIP(X3, "k20")
+	a.Pand(X1, X3)
+	a.Por(X0, X1)
+}
+
+// emitTextMatchAmd64 tests the cell in slot in.B against in.Pat. RAX, RDX,
+// R10 and R11 are scratch (R11 re-zeroed after: POpAccSum's SETO relies on
+// its upper bytes). The pattern is at most 16 bytes, so one comparison at a
+// position is one 16-byte load when 16 bytes remain in the heap, and an
+// unrolled run of byte compares against immediates otherwise.
+func emitTextMatchAmd64(a *Asm, in ProgInsn, cells Reg, idx int) {
+	m := len(in.Pat)
+	sfx := itoa(idx)
+	yes, no, end := "my"+sfx, "mn"+sfx, "me"+sfx
+	// R10 = the text, RDX = its length, R11 = the heap's end.
+	a.MovRegMemIdx(RAX, cells, RCX)
+	a.MovRegMem32(R10, RDI, (POffHeap+in.B*8)/8)
+	a.MovRegReg(R11, R10)
+	a.MovRegMem32(RDX, RDI, (POffHeapLen+in.B*8)/8)
+	a.AddRegReg(R11, RDX)
+	a.MovRegReg32(RDX, RAX)
+	a.AddRegReg(R10, RDX)
+	a.MovRegReg(RDX, RAX)
+	a.ShrRegImm8(RDX, 32)
+
+	// matchAt jumps to fail unless Pat is at [R10]; R10 has >= m bytes of
+	// text. Clobbers RAX.
+	matchAt := func(fail string, k int) {
+		scalar, done := "ms"+sfx+"_"+itoa(k), "md"+sfx+"_"+itoa(k)
+		a.LeaDisp(RAX, R10, 16)
+		a.CmpRegReg(RAX, R11)
+		a.Jcc(condAbove, scalar)
+		a.MovdquLoad(X0, R10)
+		if in.Fold {
+			emitTextFoldX0(a)
+		}
+		a.MovdquRIP(X1, "pat"+itoa(idx))
+		a.Pcmpeqb(X0, X1)
+		a.Pmovmskb(RAX, X0)
+		mask := int32(1)<<m - 1
+		a.AndRegImm32(RAX, mask)
+		a.CmpRegImm32(RAX, mask)
+		a.Jcc(CondNE, fail)
+		a.Jmp(done)
+		a.Label(scalar)
+		for j, p := range in.Pat {
+			a.MovzxByteDisp(RAX, R10, int8(j))
+			if in.Fold && p >= 'a' && p <= 'z' {
+				ok := "mk" + sfx + "_" + itoa(k) + "_" + itoa(j)
+				a.CmpALImm8(p)
+				a.Jcc(CondE, ok)
+				a.CmpALImm8(p - 0x20)
+				a.Jcc(CondNE, fail)
+				a.Label(ok)
+				continue
+			}
+			a.CmpALImm8(p)
+			a.Jcc(CondNE, fail)
+		}
+		a.Label(done)
+	}
+
+	a.CmpRegImm32(RDX, int32(m))
+	a.Jcc(CondL, no)
+	switch in.Mode {
+	case TextEq:
+		// The text ends at m, or holds a NUL there (it is a C string to LIKE).
+		eqOK := "mq" + sfx
+		a.Jcc(CondE, eqOK)
+		a.MovzxByteDisp(RAX, R10, int8(m))
+		a.TestRegReg(RAX, RAX)
+		a.Jcc(CondNE, no)
+		a.Label(eqOK)
+		matchAt(no, 0)
+		a.Jmp(yes)
+	case TextPrefix:
+		matchAt(no, 0)
+		a.Jmp(yes)
+	case TextContains:
+		// Every start position whose m bytes are inside the text, stopping at
+		// the first NUL: a match cannot span it, the pattern holding none.
+		loop, next := "mc"+sfx, "mx"+sfx
+		a.Label(loop)
+		a.CmpRegImm32(RDX, int32(m))
+		a.Jcc(CondL, no)
+		a.MovzxByteDisp(RAX, R10, 0)
+		a.TestRegReg(RAX, RAX)
+		a.Jcc(CondE, no)
+		// A first-byte test turns most positions away before the full one.
+		p0 := in.Pat[0]
+		if in.Fold && p0 >= 'a' && p0 <= 'z' {
+			first := "mf" + sfx
+			a.CmpALImm8(p0)
+			a.Jcc(CondE, first)
+			a.CmpALImm8(p0 - 0x20)
+			a.Jcc(CondNE, next)
+			a.Label(first)
+		} else {
+			a.CmpALImm8(p0)
+			a.Jcc(CondNE, next)
+		}
+		matchAt(next, 1)
+		a.Jmp(yes)
+		a.Label(next)
+		a.IncReg(R10)
+		a.DecReg(RDX)
+		a.Jmp(loop)
+	}
+	a.Label(yes)
+	a.MovRegImm64(RAX, 1)
+	a.MovMemReg32(RSI, in.A, RAX)
+	a.Jmp(end)
+	a.Label(no)
+	a.XorRegReg(RAX, RAX)
+	a.MovMemReg32(RSI, in.A, RAX)
+	a.Label(end)
+	a.XorRegReg(R11, R11)
 }
