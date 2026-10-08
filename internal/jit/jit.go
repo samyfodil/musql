@@ -20,6 +20,8 @@
 //     temporary) and X18 (darwin's platform register) alone.
 package jit
 
+import "strconv"
+
 // Args is the single struct a generated kernel reads, at fixed byte offsets.
 // APPEND ONLY -- see the package comment.
 type Args struct {
@@ -68,6 +70,9 @@ const (
 // arm64's armCond has no case for it -- so it lives here with that stated
 // rather than sitting in the enum looking like an ordering.
 const condOverflow Cond = 0x0
+
+// condSign is x86's SF condition, used only by CMOVS in POpAbs.
+const condSign Cond = 0x8
 
 // Negate returns the condition that is true exactly when c is false, which is
 // what a filter loop jumps on: "skip this row unless it matches".
@@ -173,6 +178,40 @@ const (
 	POpAccMin
 	POpAccMax
 
+	// POpRem: r[A] = r[B] % r[C], truncating like C's %. A zero divisor is
+	// SQL's NULL, which the IR cannot hold, so it is recorded the way an
+	// overflow is and the caller declines; a divisor of -1 gives 0 (vdbe.c's
+	// "if( iA==-1 ) iA = 1"), which also keeps MinInt64 % -1 from trapping.
+	POpRem
+
+	// POpAbs: r[A] = |r[B]|. abs(MinInt64) is SQLite's "integer overflow"
+	// error, which the program cannot raise, so it is flagged like an
+	// overflow and the caller declines; the VDBE then reports the error.
+	POpAbs
+
+	// POpService: hand the current row to the caller's service A (0-based) and
+	// stop. The program returns with ProgArgs.PC = A+1 and ProgArgs.Row = the
+	// loop index, the accumulator and overflow flag stored as at the end; the
+	// caller performs the service on that row -- whatever the engine has no
+	// native form for -- writing any results into the register file, and calls
+	// again with PC unchanged, which resumes right after this instruction on
+	// the same row. A normal finish leaves PC = 0. The program never calls
+	// out: native code returns, Go runs the service, native code is entered
+	// again, so Go's stack, GC and preemption only ever see Go frames.
+	POpService
+
+	// POpTextLen: r[A] = length() of the TEXT cell in column slot B -- its
+	// characters before the first NUL. Pure ASCII is counted natively, a
+	// SIMD chunk at a time; a cell with any byte >= 0x80 jumps to IR index C
+	// instead, where the lowering puts the service that counts it the way
+	// SQLite's UTF-8 reader does.
+	POpTextLen
+
+	// POpTextMatch: r[A] = 1 when the TEXT cell in slot B matches Pat as Mode
+	// says, else 0 -- LIKE's comparison of the text before its first NUL. C is
+	// a fallback target, for a pattern this cannot test.
+	POpTextMatch
+
 	// POpEmitRow appends the current row index to Sel and counts it in the
 	// accumulator, which the epilogue leaves in *Out. It is what turns a
 	// compiled predicate into a SELECTION rather than a tally: the program
@@ -200,7 +239,22 @@ type ProgInsn struct {
 	Op      POp
 	A, B, C int
 	Cond    Cond
+	// POpTextMatch only: the pattern (ASCII, no NUL, at most 16 bytes, already
+	// lower-cased when Fold), the mode, and whether ASCII letters compare
+	// case-insensitively.
+	Pat  []byte
+	Mode TextMode
+	Fold bool
 }
+
+// TextMode is what POpTextMatch tests.
+type TextMode uint8
+
+const (
+	TextEq       TextMode = iota // the text before its first NUL equals Pat
+	TextPrefix                   // it starts with Pat
+	TextContains                 // Pat occurs in it
+)
 
 // MaxProgCols is how many distinct column blocks one compiled program may
 // read. They are preloaded into registers outside the row loop, so the limit is
@@ -225,7 +279,14 @@ type ProgArgs struct {
 	Out      *int64              // accumulator out        (48)
 	Overflow *int64              // set non-zero by POpAccSum on overflow (56)
 	Sel      *int64              // POpEmitRow's selection buffer          (64)
-	PC       int64               // EmitVM: the pc to enter at, and on return the pc to resume at (72)
+	PC       int64               // EmitVM: the pc to enter at, and on return the pc to resume at (72); EmitProgram: the service to resume after, 1-based, 0 to start
+	Row      int64               // EmitProgram: the loop index a POpService stopped at (80)
+	// Heap is, per column slot holding TEXT cells, the base of the bytes those
+	// cells point into (88..). A cell is offset | length<<32.
+	Heap [MaxProgCols]*byte
+	// HeapLen is each heap's length: a 16-byte load is taken only where it
+	// ends inside the heap, so reading past a short cell never leaves it.
+	HeapLen [MaxProgCols]int64
 }
 
 // Byte offsets of ProgArgs' fields, asserted by TestProgArgsLayout.
@@ -237,4 +298,21 @@ const (
 	POffOverflow = POffOut + 8
 	POffSel      = POffOverflow + 8
 	POffPC       = POffSel + 8
+	POffRow      = POffPC + 8
+	POffHeap     = POffRow + 8
+	POffHeapLen  = POffHeap + MaxProgCols*8
 )
+
+// progHasService reports whether a program can stop for a service, and so
+// needs the re-entry dispatch.
+func progHasService(insns []ProgInsn) bool {
+	for _, in := range insns {
+		if in.Op == POpService {
+			return true
+		}
+	}
+	return false
+}
+
+// svcLabel names the resume point after service k.
+func svcLabel(k int) string { return "sr" + strconv.Itoa(k) }

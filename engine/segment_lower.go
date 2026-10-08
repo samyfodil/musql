@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
 	"github.com/samyfodil/musql/internal/jit"
 )
@@ -27,6 +28,23 @@ type segLowered struct {
 	agg     aggKind
 	sumReg  int
 	rowsReg int // counts matched rows; sum()/avg() answer NULL at 0
+	// blocks are the service blocks the body stops for (segment_service.go),
+	// indexed by POpService's A; none when the whole body is native.
+	blocks []segSvcBlock
+	// blockIR is the IR index of each block's POpService.
+	blockIR []int
+	// textCol marks, parallel to cols, a slot holding a TEXT column's cells
+	// (with its heap in ProgArgs.Heap) rather than an int64 block.
+	textCol []bool
+	// textVar is this body with its text operations native (POpTextLen,
+	// POpTextMatch), for a segment whose text columns are clean TEXT; nil
+	// when it has none.
+	textVar *segLowered
+	// textFold is the LIKE case rule a POpTextMatch was compiled for (true:
+	// case-insensitive); a statement run under the other rule uses the
+	// service-only program.
+	textFold bool
+	textLike bool // a POpTextMatch was lowered, so textFold matters
 }
 
 // segLowerRegOperands returns the operands of in that name a REGISTER, -1 for
@@ -43,10 +61,14 @@ func segLowerRegOperands(in Instruction) [3]int {
 		return [3]int{in.P1, -1, -1}
 	case OpNot, OpSCopy, OpNegative: // P1 source, P2 destination
 		return [3]int{in.P1, in.P2, -1}
-	case OpAdd, OpSubtract, OpMultiply, OpBitAnd, OpBitOr: // r[P3] = r[P2] op r[P1]
+	case OpAdd, OpSubtract, OpMultiply, OpRemainder, OpBitAnd, OpBitOr: // r[P3] = r[P2] op r[P1]
 		return [3]int{in.P1, in.P2, in.P3}
 	case OpNull: // P1 destination
 		return [3]int{in.P1, -1, -1}
+	case OpFunction: // P1 first argument, P3 destination
+		if segLowerableFunc(in) {
+			return [3]int{in.P1, in.P3, -1}
+		}
 	}
 	return [3]int{-1, -1, -1} // OpGoto and anything the switch will refuse
 }
@@ -74,9 +96,14 @@ func segNullTestedOnly(body []Instruction) map[int]bool {
 		case OpInteger, OpVariable, OpNot, OpSCopy, OpNegative, OpNull:
 			writes[in.P2]++
 			reads[in.P2]--
-		case OpAdd, OpSubtract, OpMultiply, OpBitAnd, OpBitOr:
+		case OpAdd, OpSubtract, OpMultiply, OpRemainder, OpBitAnd, OpBitOr:
 			writes[in.P3]++
 			reads[in.P3]--
+		case OpFunction:
+			if segLowerableFunc(in) {
+				writes[in.P3]++
+				reads[in.P3]--
+			}
 		case OpGt, OpGe, OpLt, OpLe, OpEq, OpNe:
 			if store, _ := segCompareLowerable(in.P5); store {
 				writes[in.P3]++
@@ -105,12 +132,34 @@ func (l *segLowered) clone() *segLowered {
 	out.consts = append([]int(nil), l.consts...)
 	out.cvKind = append([]bool(nil), l.cvKind...)
 	out.cvIndex = append([]int(nil), l.cvIndex...)
+	out.blockIR = append([]int(nil), l.blockIR...)
+	out.textCol = append([]bool(nil), l.textCol...)
+	if l.textVar != nil {
+		out.textVar = l.textVar.clone()
+	}
 	return &out
 }
 
 // segLowerBody compiles the instructions of a scan loop body, or reports false
 // when it contains an opcode this does not model.
 func segLowerBody(body []Instruction, base int, cursor int, aggAt int) (*segLowered, bool) {
+	out, ok := segLowerBodyWith(body, base, cursor, aggAt, false, false)
+	if !ok || len(out.blocks) == 0 {
+		return out, ok
+	}
+	// LIKE's default rule is case-insensitive; that is the program compiled.
+	if tv, tok := segLowerBodyWith(body, base, cursor, aggAt, true, true); tok && len(tv.textCol) > 0 && slices.Contains(tv.textCol, true) {
+		out.textVar = tv
+	}
+	return out, ok
+}
+
+// segLowerBodyWith is segLowerBody, with text operations lowered natively when
+// text is set: a block computing length() of a column becomes POpTextLen over
+// that column's cells, with the block kept right after it as the fallback for
+// a cell that is not pure ASCII. Only valid over a segment whose column is
+// clean TEXT, so it is a second program beside the first, not a replacement.
+func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text, textFold bool) (*segLowered, bool) {
 	// AN OpNull ON A PATH THAT RUNS REFUSES THE WHOLE BODY, and modelling NULL
 	// any more cleverly than that is how this went wrong before.
 	//
@@ -133,6 +182,8 @@ func segLowerBody(body []Instruction, base int, cursor int, aggAt int) (*segLowe
 	out := &segLowered{}
 	colSlot := map[int]int{}         // table column -> program column slot
 	irOf := make([]int, len(body)+1) // body index -> IR index
+	var irJumps [][2]int             // POpJumps whose target is already an IR index
+	neverNull := map[int]bool{}      // registers a native text op leaves never NULL
 	maxReg := 0
 	// One register the lowering owns, above anything the program names, for a
 	// comparison whose result the VDBE never stored.
@@ -160,15 +211,106 @@ func segLowerBody(body []Instruction, base int, cursor int, aggAt int) (*segLowe
 	// OpColumn that loads the register comes BEFORE the tests that constrain it
 	// and the decision has to be made at the load.
 	nullOnly := segNullTestedOnly(body)
+	// Instructions with no native form run in service blocks. A register a
+	// block reads holds a VALUE, never a NULL indicator.
+	svc := segClassifyServices(body, cursor)
+	if svc == nil {
+		return nil, false
+	}
+	for i, in := range body {
+		if svc[i] {
+			r, _, _, _ := segInsnRegs(in)
+			for _, x := range r {
+				delete(nullOnly, x)
+			}
+		}
+	}
 	var nullMarks []int // IR indices of OpNull markers
 	note := func(r int) {
 		if r+1 > maxReg {
 			maxReg = r + 1
 		}
 	}
+	blocks, blockAt := segBuildBlocks(body, svc, base, scratchReg+1)
+	segBlockHomes(body, svc, blocks)
+	for _, b := range blocks {
+		for _, x := range append(append([]int(nil), b.load...), b.writeBack...) {
+			note(x)
+		}
+		if b.flag >= 0 {
+			note(b.flag)
+		}
+	}
+	out.blocks = blocks
 
 	for i, in := range body {
 		irOf[i] = len(out.insns)
+		if svc[i] {
+			// Run by its block: the block's first instruction stops the
+			// kernel for it, and a block ending in a jump branches on the flag
+			// it leaves. Nothing branches into the middle of a block.
+			if bi := blockAt[i]; bi >= 0 {
+				if t := blocks[bi].insns[0]; text && neverNull[t.P1] && segNullTestOf(&blocks[bi], t.P1) {
+					// A null test of a native LIKE's result: never NULL, so
+					// IsNull is never taken and NotNull always is.
+					if t.Op == OpNotNull {
+						out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpJump, A: t.P2 - base})
+					}
+					continue
+				}
+				if lk, isLike := segBlockIsLike(blocks, bi, cursor, textFold); text && isLike && len(out.cols) < jit.MaxProgCols {
+					// POpTextMatch decides the block's flag (inverted for NOT
+					// LIKE / IfNot); then past the block to its own branch.
+					slot := len(out.cols)
+					out.cols = append(out.cols, lk.col)
+					out.nullCol = append(out.nullCol, false)
+					for len(out.textCol) < slot {
+						out.textCol = append(out.textCol, false)
+					}
+					out.textCol = append(out.textCol, true)
+					out.textFold, out.textLike = textFold, true
+					neverNull[lk.result] = true
+					flag := blocks[bi].flag
+					note(flag)
+					at := len(out.insns)
+					out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpTextMatch, A: flag, B: slot, C: jit.ProgNextRow,
+						Pat: lk.pat, Mode: lk.mode, Fold: textFold})
+					if lk.invert {
+						out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpNot, A: flag, B: flag})
+					}
+					j := len(out.insns)
+					out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpJump})
+					// over the POpService to the flag's POpJumpIfNotZero
+					irJumps = append(irJumps, [2]int{j, j + 2})
+					_ = at
+				} else if col, dst, isLen := segBlockIsLength(body, svc, blocks, bi, cursor); text && isLen && len(out.cols) < jit.MaxProgCols {
+					// POpTextLen; on success jump past the block; the block
+					// itself is the fallback for a non-ASCII cell. Both targets
+					// are IR indices, patched after the jump resolution below,
+					// which reads every jump as a program address.
+					slot := len(out.cols)
+					out.cols = append(out.cols, col)
+					out.nullCol = append(out.nullCol, false)
+					for len(out.textCol) < slot {
+						out.textCol = append(out.textCol, false)
+					}
+					out.textCol = append(out.textCol, true)
+					note(dst)
+					at := len(out.insns)
+					out.insns = append(out.insns,
+						jit.ProgInsn{Op: jit.POpTextLen, A: dst, B: slot, C: at + 2},
+						jit.ProgInsn{Op: jit.POpJump})
+					irJumps = append(irJumps, [2]int{at + 1, at + 3})
+				}
+				out.blockIR = append(out.blockIR, len(out.insns))
+				out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpService, A: bi})
+				if blk := blocks[bi]; blk.flag >= 0 {
+					last := blk.insns[len(blk.insns)-1]
+					out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpJumpIfNotZero, A: last.P2 - base, B: blk.flag})
+				}
+			}
+			continue
+		}
 		switch in.Op {
 		case OpColumn:
 			if in.P1 != cursor {
@@ -263,21 +405,33 @@ func segLowerBody(body []Instruction, base int, cursor int, aggAt int) (*segLowe
 		case OpNot:
 			note(in.P2)
 			out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpNot, A: in.P2, B: in.P1})
-		case OpAdd, OpSubtract, OpMultiply:
+		case OpAdd, OpSubtract, OpMultiply, OpRemainder:
 			// The VDBE's arithmetic is "r[P3] = r[P2] <op> r[P1]" -- the RIGHT
 			// operand is P1 (vdbe_op.go's own note), which is why the operands
-			// look reversed here.
+			// look reversed here. A remainder by zero is NULL in SQL; POpRem
+			// flags it like an overflow and the VDBE answers instead.
 			var pop jit.POp
 			switch in.Op {
 			case OpAdd:
 				pop = jit.POpAdd
 			case OpSubtract:
 				pop = jit.POpSub
+			case OpRemainder:
+				pop = jit.POpRem
 			default:
 				pop = jit.POpMul
 			}
 			note(in.P3)
 			out.insns = append(out.insns, jit.ProgInsn{Op: pop, A: in.P3, B: in.P2, C: in.P1})
+		case OpFunction:
+			// The builtin abs() of one argument, which over an int64 is |x|;
+			// abs(MinInt64) is SQLite's overflow error, which POpAbs flags so
+			// the VDBE answers (and raises it). Any other call is refused below.
+			if !segLowerableFunc(in) {
+				return nil, false
+			}
+			note(in.P3)
+			out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpAbs, A: in.P3, B: in.P1})
 		case OpNegative:
 			// -v as 0 - v. OpNegative's own doc note says a subtraction is NOT
 			// equivalent because it does not preserve IEEE negative zero -- and
@@ -333,6 +487,12 @@ func segLowerBody(body []Instruction, base int, cursor int, aggAt int) (*segLowe
 			}
 			out.insns[i].A = irOf[t]
 		}
+	}
+	for _, j := range irJumps {
+		out.insns[j[0]].A = j[1]
+	}
+	for len(out.textCol) < len(out.cols) {
+		out.textCol = append(out.textCol, false)
 	}
 	if len(nullMarks) > 0 {
 		reach := segLoweredReachable(out.insns)
@@ -425,7 +585,7 @@ func segLoweredReachable(insns []jit.ProgInsn) []bool {
 			known = maps.Clone(known)
 			known[in.A] = int64(in.B)
 		case jit.POpLoadCol, jit.POpLoadReg, jit.POpCmp, jit.POpAnd, jit.POpOr,
-			jit.POpNot, jit.POpAdd, jit.POpSub, jit.POpMul:
+			jit.POpNot, jit.POpAdd, jit.POpSub, jit.POpMul, jit.POpRem, jit.POpAbs:
 			if _, ok := known[in.A]; ok {
 				known = maps.Clone(known)
 				delete(known, in.A)
@@ -482,4 +642,13 @@ func segCompareLowerable(p5 uint16) (store bool, ok bool) {
 		return false, false
 	}
 	return p5&p5StoreP2 != 0, true
+}
+
+// segLowerableFunc reports whether in is a call the program JIT has an
+// instruction for: today the builtin abs() of one argument. The name alone
+// identifies it: RegisterFunction refuses a built-in name, so no application
+// function can be called abs.
+func segLowerableFunc(in Instruction) bool {
+	name, ok := in.P4.(string)
+	return ok && in.P2 == 1 && strings.EqualFold(name, "abs")
 }

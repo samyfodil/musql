@@ -100,6 +100,17 @@ func (w *Wasm) Set(l uint32)      { w.op(opLocalSet); w.body = uleb(w.body, uint
 func (w *Wasm) I32(v int32)       { w.op(opI32Const); w.body = sleb(w.body, int64(v)) }
 func (w *Wasm) I64(v int64)       { w.op(opI64Const); w.body = sleb(w.body, v) }
 func (w *Wasm) Br(depth uint32)   { w.op(opBr); w.body = uleb(w.body, uint64(depth)) }
+
+// BrTable pops an i32 and branches to depths[it], or to def when it is out of
+// range.
+func (w *Wasm) BrTable(depths []uint32, def uint32) {
+	w.op(0x0E)
+	w.body = uleb(w.body, uint64(len(depths)))
+	for _, d := range depths {
+		w.body = uleb(w.body, uint64(d))
+	}
+	w.body = uleb(w.body, uint64(def))
+}
 func (w *Wasm) BrIf(depth uint32) { w.op(opBrIf); w.body = uleb(w.body, uint64(depth)) }
 func (w *Wasm) memarg(align, off uint32) {
 	w.body = uleb(w.body, uint64(align))

@@ -166,7 +166,7 @@ var segWriteFilterSafeOps = map[OpCode]bool{
 	OpInit: true, OpOpenWrite: true, OpRewind: true, OpNext: true, OpHalt: true, OpGoto: true,
 	OpColumn: true, OpRowid: true, OpVariable: true, OpInteger: true, OpReal: true, OpString8: true, OpNull: true,
 	OpEq: true, OpNe: true, OpLt: true, OpLe: true, OpGt: true, OpGe: true, OpIf: true, OpIfNot: true, OpNot: true,
-	OpAdd: true, OpSubtract: true, OpMultiply: true, OpCopy: true, OpSCopy: true,
+	OpAdd: true, OpSubtract: true, OpMultiply: true, OpRemainder: true, OpCopy: true, OpSCopy: true,
 	OpAffinity: true, OpMakeRecord: true, OpUpdateRow: true, OpDelete: true,
 }
 
@@ -284,6 +284,11 @@ func segSelectRows(s *segment, f *segRowFilter, ipkCol int, params []Value, buf 
 		return nil, false
 	}
 	low := f.low
+	if len(low.blocks) > 0 {
+		// A selection kernel with services needs the driver loop and a
+		// machine to run them on, which this hint path does not have yet.
+		return nil, false
+	}
 	kern := segProgKernel(low)
 	if kern == nil {
 		return nil, false

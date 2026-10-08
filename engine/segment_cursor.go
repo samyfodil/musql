@@ -376,13 +376,21 @@ func (src *segRowSource) next() (s *segment, row int, rowid uint64, ok bool) {
 // integer as a float. The third fix-up -- generated columns -- is not
 // per-column, and newSegRowSource refuses a table that has any.
 func (cur *vdbeCursor) segColumn(c int) Value {
-	if c < 0 || c >= len(cur.segSrcCols) {
+	return segColumnValue(cur.segSrcCols, cur.segCur, cur.segRow, cur.segWidth, cur.rowid, c)
+}
+
+// segColumnValue is column c of row `row` in segment s, read exactly as a
+// segment cursor reads it: width is the row's stored width capped at the
+// plans (s.Width(row)), rowid its rowid. The cursor and the service blocks of
+// a compiled kernel (segment_service.go) both read through it.
+func segColumnValue(plans []segColPlan, s *segment, row, width int, rowid uint64, c int) Value {
+	if c < 0 || c >= len(plans) {
 		return Value{Typ: Null}
 	}
-	plan := &cur.segSrcCols[c]
+	plan := &plans[c]
 	var v Value
-	if c < cur.segWidth {
-		v = cur.segCur.Value(c, cur.segRow)
+	if c < width {
+		v = s.Value(c, row)
 	} else {
 		// PAST THE ROW'S STORED WIDTH: this row was written before an ALTER
 		// TABLE ADD COLUMN, so the column does not exist in it and reads its
@@ -401,7 +409,7 @@ func (cur *vdbeCursor) segColumn(c int) Value {
 		}
 	}
 	if plan.isIPK && v.Typ == Null {
-		return Value{Typ: Int, I: int64(cur.rowid)}
+		return Value{Typ: Int, I: int64(rowid)}
 	}
 	if plan.isReal && v.Typ == Int {
 		return Value{Typ: Float, F: float64(v.I)}

@@ -1370,26 +1370,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			m.regs[op.P1] = castValueEnc(m.regs[op.P1], op.P4.(string), m.encoding())
 
 		case OpFunction:
-			args := growValues(&m.fnArgBuf, op.P2) // vdbe.c:8866; see fnArgBuf
-			copy(args, m.regs[op.P1:op.P1+op.P2])
-			var v Value
-			var ferr error
-			switch f := op.P4.(type) {
-			case *ScalarFunction:
-				// Resolved when the program was built, as C's OP_Function
-				// carries its FuncDef (vdbe.c:8850): no lookup per call.
-				v, ferr = f.call(args)
-			case string:
-				if f == "rtreecheck" {
-					v, ferr = m.rtreecheck(args) // reads the database; see rtree_check.go
-				} else {
-					v, ferr = callScalarFuncEnc(f, args, m.likeCaseSensitive(), m.encoding(), op.P5)
-				}
-			}
-			if ferr != nil {
+			if ferr := m.opFunction(op); ferr != nil {
 				return nil, ferr
 			}
-			m.regs[op.P3] = v
 
 		case OpConnState:
 			v, cerr := m.connStateValue(op.P4.(string))
@@ -1399,53 +1382,12 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			m.regs[op.P3] = v
 
 		case OpLike:
-			x, pat := m.regs[op.P1], m.regs[op.P3]
-			escReg, _ := op.P4.(int)
-			var (
-				esc     rune
-				hasEsc  bool
-				escNull bool
-			)
-			if escReg >= 0 {
-				r, isNull, eerr := likeEscapeRune(m.regs[escReg])
-				if eerr != nil {
-					return nil, eerr
-				}
-				if isNull {
-					escNull = true
-				} else {
-					esc, hasEsc = r, true
-				}
-			}
-			if escNull || x.Typ == Null || pat.Typ == Null {
-				m.regs[op.P2] = Value{Typ: Null}
-			} else {
-				cs := m.likeCaseSensitive()
-				var matched bool
-				if lp := m.likePlanFor(pat); !hasEsc && x.Typ == Text && lp != nil && lp.ok {
-					matched = lp.match(x.S, cs)
-				} else if hasEsc {
-					matched = likeMatchEscape(valueToText(pat), valueToText(x), esc, cs)
-				} else {
-					matched = likeMatch(valueToText(pat), valueToText(x), cs)
-				}
-				if op.P5&p5LikeNot != 0 {
-					matched = !matched
-				}
-				m.regs[op.P2] = boolValue(matched)
+			if lerr := m.opLike(op); lerr != nil {
+				return nil, lerr
 			}
 
 		case OpGlob:
-			x, pat := m.regs[op.P1], m.regs[op.P3]
-			if x.Typ == Null || pat.Typ == Null {
-				m.regs[op.P2] = Value{Typ: Null}
-			} else {
-				matched := globMatch(valueToText(pat), valueToText(x))
-				if op.P5&p5GlobNot != 0 {
-					matched = !matched
-				}
-				m.regs[op.P2] = boolValue(matched)
-			}
+			m.opGlob(op)
 
 		case OpMatch:
 			info := op.P4.(*matchCompileInfo)
@@ -2128,7 +2070,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			if cur == nil || cur.tbl == nil || cur.pager == nil {
 				return nil, fmt.Errorf("vdbe: OpSegProgram on a closed cursor")
 			}
-			if vs, served := m.segRunProgramAll(cur.pager, cur.tbl.root, pplan, cur.tbl.ipkIndex); served {
+			if vs, served := m.segRunProgramAll(cur.pager, cur.tbl, pplan); served {
 				segFilterServed.Add(1)
 				// P1 is the FIRST destination register; the statement's N
 				// aggregates land in P1..P1+N-1, which is the range the

@@ -4,6 +4,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/samyfodil/musql/internal/jit"
 )
@@ -53,13 +54,14 @@ func segProgKernel(low *segLowered) *jit.Code {
 // enough that a shared-accumulator IR is not worth the complexity: the whole
 // point of "SELECT min(v), max(v) FROM t" being here is that it measured 4.49x
 // SLOWER than C SQLite while every single-aggregate form measured faster.
-func (m *vdbe) segRunProgramAll(p *ReadOnlyPager, rootPage uint32, plan *segProgPlan, ipkCol int) ([]Value, bool) {
+func (m *vdbe) segRunProgramAll(p *ReadOnlyPager, tbl *resolvedTable, plan *segProgPlan) ([]Value, bool) {
+	rootPage, ipkCol := tbl.root, tbl.ipkIndex
 	if plan == nil || len(plan.lows) == 0 {
 		return nil, false
 	}
 	out := make([]Value, len(plan.lows))
 	for i, low := range plan.lows {
-		v, ok := m.segRunOne(p, rootPage, low, ipkCol)
+		v, ok := m.segRunOne(p, tbl, rootPage, low, ipkCol)
 		if !ok {
 			return nil, false
 		}
@@ -68,7 +70,7 @@ func (m *vdbe) segRunProgramAll(p *ReadOnlyPager, rootPage uint32, plan *segProg
 	return out, true
 }
 
-func (m *vdbe) segRunOne(p *ReadOnlyPager, rootPage uint32, low *segLowered, ipkCol int) (Value, bool) {
+func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, low *segLowered, ipkCol int) (Value, bool) {
 	// A row-major delta beside the segments makes a raw block read wrong; see
 	// segCleanFor.
 	if !p.segCleanFor(rootPage) {
@@ -86,7 +88,11 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, rootPage uint32, low *segLowered, ipk
 		return Value{}, false
 	}
 
-	regs := make([]int64, low.nRegs+2)
+	nRegs := low.nRegs
+	if low.textVar != nil {
+		nRegs = max(nRegs, low.textVar.nRegs)
+	}
+	regs := make([]int64, nRegs+2)
 	// Bound parameters go into the registers the body reads them from. A
 	// non-integer bound declines: every value in a compiled program is an
 	// int64, and coercing here is exactly where SQLite's cross-class ordering
@@ -115,11 +121,61 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, rootPage uint32, low *segLowered, ipk
 		empty     bool
 	}
 	results := make([]segResult, len(segs))
-	ok = segEach(len(segs), func(si int) bool {
+	// Service blocks share one window across the statement, in row order, as
+	// the interpreter shares its registers: their segments run one at a time.
+	var svc *segSvcRunner
+	each := segEach
+	if len(low.blocks) > 0 {
+		svc = newSegSvcRunner(m, tbl)
+		each = func(n int, work func(int) bool) bool {
+			for i := range n {
+				if !work(i) {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	ok = each(len(segs), func(si int) bool {
 		s, res := segs[si], &results[si]
-		blocks, isRowid, okCols := segProgColumns(s, low.cols, low.nullCol, ipkCol)
-		if !okCols {
-			return false
+		// The text variant over a segment whose text columns are clean TEXT;
+		// the service-only body otherwise.
+		low, kern := low, kern
+		var heaps [jit.MaxProgCols][]byte
+		if tv := low.textVar; tv != nil && (!tv.textLike || tv.textFold == !m.likeCaseSensitive()) {
+			if tk := segProgKernel(tv); tk != nil {
+				clean := true
+				for i, isText := range tv.textCol {
+					if !isText {
+						continue
+					}
+					_, heap, okT := segVecColumn(s, tv.cols[i])
+					if !okT {
+						clean = false
+						break
+					}
+					heaps[i] = heap
+				}
+				if clean {
+					low, kern = tv, tk
+				}
+			}
+		}
+		blocks := make([][]int64, len(low.cols))
+		isRowid := make([]bool, len(low.cols))
+		for i, c := range low.cols {
+			if i < len(low.textCol) && low.textCol[i] {
+				// A text slot holds the column's cells; its heap goes in
+				// ProgArgs.Heap.
+				cells, _, _ := segVecColumn(s, c)
+				blocks[i] = unsafe.Slice((*int64)(unsafe.Pointer(unsafe.SliceData(cells))), len(cells))
+				continue
+			}
+			b, r, okCol := segProgColumns(s, low.cols[i:i+1], low.nullCol[i:i+1], ipkCol)
+			if !okCol {
+				return false
+			}
+			blocks[i], isRowid[i] = b[0], r[0]
 		}
 		// A rowid-alias column has no block of its own -- the values live in
 		// the segment's rowid block -- and the program reads a flat int64
@@ -153,8 +209,13 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, rootPage uint32, low *segLowered, ipk
 				return false
 			}
 			args.Col[i] = &b[0]
+			if h := heaps[i]; len(h) > 0 {
+				args.Heap[i], args.HeapLen[i] = &h[0], int64(len(h))
+			}
 		}
-		kern.Call2(args)
+		if !segCallKernel(kern, args, svc, low.blocks, s, local) {
+			return false
+		}
 		res.out, res.ovf = out, ovf != 0
 		if low.agg != aggCountStar && low.agg != aggCount {
 			res.rows = local[low.rowsReg]

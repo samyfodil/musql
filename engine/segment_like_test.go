@@ -38,7 +38,7 @@ func TestSegmentLikeMatchesTheLoop(t *testing.T) {
 		{`SELECT count(*) FROM t WHERE s LIKE ? AND k = 2`, []Value{tv("%1%2%")}, true},
 		{`SELECT count(*) FROM t WHERE s LIKE '%'`, nil, true},
 		{`SELECT count(*) FROM t WHERE s LIKE 'a_c%'`, nil, false},                  // '_'
-		{`SELECT count(*) FROM t WHERE s LIKE '50!%%' ESCAPE '!'`, nil, false},      // ESCAPE
+		{`SELECT count(*) FROM t WHERE s LIKE '50!%%' ESCAPE '!'`, nil, true},       // ESCAPE: the compiled kernel's service block
 		{`SELECT count(*) FROM t WHERE n LIKE '%7%'`, nil, false},                   // NULLs in the column
 		{`SELECT count(*) FROM t WHERE mixed LIKE '%1%'`, nil, false},               // numbers in the column
 		{`SELECT count(*) FROM t WHERE s LIKE ?`, []Value{{Typ: Int, I: 7}}, false}, // a non-text pattern

@@ -24,6 +24,9 @@ const (
 	X10
 	X11
 	X12
+	X13
+	X14
+	X15
 )
 
 // xzr is the zero register, which shares encoding 31 with the stack pointer.
@@ -488,3 +491,51 @@ const (
 	armVS = 0x6 // signed overflow
 	armHI = 0x8 // unsigned higher
 )
+
+// Sdiv emits SDIV Xd, Xn, Xm. It does not trap: a zero divisor gives 0 and
+// MinInt64 / -1 wraps to MinInt64.
+func (a *Arm) Sdiv(rd, rn, rm Reg64) {
+	a.emit(0x9AC00C00 | uint32(rm)<<16 | uint32(rn)<<5 | uint32(rd))
+}
+
+// Msub emits MSUB Xd, Xn, Xm, Xa: Xd = Xa - Xn*Xm.
+func (a *Arm) Msub(rd, rn, rm, ra Reg64) {
+	a.emit(0x9B008000 | uint32(rm)<<16 | uint32(ra)<<10 | uint32(rn)<<5 | uint32(rd))
+}
+
+// LdrQ loads the 16 bytes at [rn] into vt.
+func (a *Arm) LdrQ(vt VReg, rn Reg64) { a.emit(0x3DC00000 | uint32(rn)<<5 | uint32(vt)) }
+
+// Umaxv16B is  Bd = the largest of Vn's sixteen bytes.
+func (a *Arm) Umaxv16B(vd, vn VReg) { a.emit(0x6E30A800 | uint32(vn)<<5 | uint32(vd)) }
+
+// Cmeq0_16B is  Vd.16B[i] = 0xFF where Vn.16B[i] == 0, else 0.
+func (a *Arm) Cmeq0_16B(vd, vn VReg) { a.emit(0x4E209800 | uint32(vn)<<5 | uint32(vd)) }
+
+// UmovB0 is  Wd = Vn.B[0], zero-extended.
+func (a *Arm) UmovB0(rd Reg64, vn VReg) { a.emit(0x0E013C00 | uint32(vn)<<5 | uint32(rd)) }
+
+// MovW is  Wd = Wm: the low 32 bits, zero-extended into Xd.
+func (a *Arm) MovW(rd, rm Reg64) { a.emit(0x2A0003E0 | uint32(rm)<<16 | uint32(rd)) }
+
+// SubV16B is  Vd.16B = Vn.16B - Vm.16B, wrapping.
+func (a *Arm) SubV16B(vd, vn, vm VReg) {
+	a.emit(0x6E208400 | uint32(vm)<<16 | uint32(vn)<<5 | uint32(vd))
+}
+
+// Cmhi16B is  Vd.16B[i] = 0xFF where Vn[i] > Vm[i] unsigned, else 0.
+func (a *Arm) Cmhi16B(vd, vn, vm VReg) {
+	a.emit(0x6E203400 | uint32(vm)<<16 | uint32(vn)<<5 | uint32(vd))
+}
+
+// OrrV is  Vd = Vn | Vm.
+func (a *Arm) OrrV(vd, vn, vm VReg) {
+	a.emit(0x4EA01C00 | uint32(vm)<<16 | uint32(vn)<<5 | uint32(vd))
+}
+
+// Data appends raw bytes, a multiple of four, to the instruction stream.
+func (a *Arm) Data(b []byte) {
+	for i := 0; i+4 <= len(b); i += 4 {
+		a.emit(uint32(b[i]) | uint32(b[i+1])<<8 | uint32(b[i+2])<<16 | uint32(b[i+3])<<24)
+	}
+}

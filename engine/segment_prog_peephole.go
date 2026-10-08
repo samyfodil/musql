@@ -136,8 +136,18 @@ func segProgPeephole(prog *Program) bool {
 	// aggregate gets a copy with its own terminal op. N aggregates are N passes
 	// over the same int64 blocks, which is the trade segRunProgramAll explains.
 	base, okLow := segLowerBody(in[rewindAt+1:bodyEnd], rewindAt+1, cursor, aggAt)
-	if !okLow || len(base.cols) == 0 {
+	if !okLow || (len(base.cols) == 0 && len(base.blocks) == 0) {
 		return false
+	}
+	// Each aggregate's argument is read by the accumulate appended below,
+	// outside the body: a service block that computes it must write it back.
+	for _, a := range aggs {
+		if a.expr != nil && a.rowRegs[aggExprArg] != 0 {
+			base.readNatively(a.rowRegs[aggExprArg] - 1)
+			if base.textVar != nil {
+				base.textVar.readNatively(a.rowRegs[aggExprArg] - 1)
+			}
+		}
 	}
 	lows := make([]*segLowered, 0, len(aggs))
 	for _, a := range aggs {
@@ -173,6 +183,18 @@ func segProgPeephole(prog *Program) bool {
 			low.insns = append(low.insns, jit.ProgInsn{Op: jit.POpAccMax, A: argReg, B: rowsReg})
 		default:
 			low.insns = append(low.insns, jit.ProgInsn{Op: jit.POpAccSum, A: argReg, B: rowsReg})
+		}
+		if tv := low.textVar; tv != nil {
+			// The same accumulate, on the same registers, in the text variant;
+			// its own row counter sits past its own registers.
+			acc := low.insns[len(low.insns)-1]
+			if a.kind != aggCountStar && a.kind != aggCount {
+				acc.B = tv.nRegs
+				tv.nRegs++
+				tv.sumReg, tv.rowsReg = low.sumReg, acc.B
+			}
+			tv.agg = low.agg
+			tv.insns = append(tv.insns, acc)
 		}
 		lows = append(lows, low)
 	}
