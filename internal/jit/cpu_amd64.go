@@ -11,3 +11,7 @@ func cpuHasAVX2() bool { return cpu.X86.HasAVX2 }
 // caller must have a path for false -- which is the scalar kernel, and below
 // that the VDBE. (arm64 has no such case: see cpu_arm64.go.)
 func HasVector() bool { return cpuHasAVX2() }
+
+// VMMinWork is the least native work worth an entry from the VDBE (see
+// engine/vdbe_jit.go's vmJITMinWork).
+const VMMinWork = 3

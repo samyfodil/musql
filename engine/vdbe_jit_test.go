@@ -18,6 +18,7 @@ import (
 // error must be identical: an instruction the native code gets wrong for ANY
 // operand is a wrong answer, and this is the gate that sees it.
 func TestVMJITDifferential(t *testing.T) {
+	lowEntryThreshold(t)
 	if !vmJITEnabled {
 		t.Skip("JIT not enabled on this platform")
 	}
@@ -164,6 +165,7 @@ func runBoth(t *testing.T, name string, prog *Program) [][]Value {
 // with every kind of access -- type byte, value words, the S guard, a copy --
 // on registers past that.
 func TestVMJITFarRegisters(t *testing.T) {
+	lowEntryThreshold(t)
 	if !vmJITEnabled {
 		t.Skip("JIT not enabled on this platform")
 	}
@@ -193,6 +195,7 @@ func TestVMJITFarRegisters(t *testing.T) {
 // the program's end, and through ones no program has. (0 is not one: it
 // returns to this same OP_Return, forever, on both paths.)
 func TestVMJITReturnAddresses(t *testing.T) {
+	lowEntryThreshold(t)
 	if !vmJITEnabled {
 		t.Skip("JIT not enabled on this platform")
 	}
@@ -211,6 +214,7 @@ func TestVMJITReturnAddresses(t *testing.T) {
 // TestVMJITFuel: a loop long enough to spend the fuel several times over, so
 // the native code exits mid-loop and is entered again, must still count right.
 func TestVMJITFuel(t *testing.T) {
+	lowEntryThreshold(t)
 	if !vmJITEnabled {
 		t.Skip("JIT not enabled on this platform")
 	}
@@ -242,4 +246,13 @@ func TestVMJITFuel(t *testing.T) {
 	if want := iters / jit.VMFuel; st.m.jitEnters < want {
 		t.Fatalf("%d entries for %d iterations: the fuel never ran out", st.m.jitEnters, iters)
 	}
+}
+
+// lowEntryThreshold enters native code wherever there is any, as on amd64 and
+// arm64: these tests check what the emitted code computes, and on js/wasm the
+// platform's higher threshold would leave most of their programs on the VDBE.
+func lowEntryThreshold(t *testing.T) {
+	old := vmJITMinWork
+	vmJITMinWork = 3
+	t.Cleanup(func() { vmJITMinWork = old })
 }
