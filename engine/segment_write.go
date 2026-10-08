@@ -81,6 +81,10 @@ type Session struct {
 	// two sessions sharing one would not exclude each other.
 	commitLock   *os.File
 	commitLockFI os.FileInfo
+
+	// segStat and deltaStat stamp the segment file and its delta (pairStamp).
+	segStat, deltaStat heldStamp
+
 	recBuf   []SegDeltaRecord // the delta records of a commit, reused (segDeltaRecordsInto)
 
 	// catalogAtLastWrite is the catalog fingerprint as of the last time the FILE
@@ -657,6 +661,8 @@ func (n *Session) Close() error {
 	n.releaseSegmentLockingModeLock() // the engine-direct pragma's lock (holdLockingModeLock)
 	n.appendAt.release()
 	n.releaseCommitLock()
+	n.segStat.release()
+	n.deltaStat.release()
 	n.closed = true
 	n.dropTempFileIfUnclaimed() // C's temp database is OPEN_DELETEONCLOSE
 	n.DB.closed = true
@@ -828,6 +834,8 @@ func (n *Session) Discard() error {
 	n.releaseSegmentLockingModeLock() // the engine-direct pragma's lock (holdLockingModeLock)
 	n.appendAt.release()
 	n.releaseCommitLock()
+	n.segStat.release()
+	n.deltaStat.release()
 	n.closed = true
 	n.dropTempFileIfUnclaimed() // C's temp database is OPEN_DELETEONCLOSE
 	n.DB.closed = true
@@ -847,14 +855,7 @@ func (n *Session) Discard() error {
 // and ran for minutes (262ms without). It needs a session to survive its own
 // compaction without reloading every table.
 func (n *Session) CompactIfLargerThan(nBytes int64) (bool, error) {
-	st, err := os.Stat(segDeltaPath(n.segPath))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	if st.Size() < nBytes {
+	if st := n.pairStamp()[1]; !st.there || st.size < nBytes {
 		return false, nil
 	}
 	did, cerr := CompactSegmentFile(n.segPath)
@@ -1247,11 +1248,11 @@ func (n *Session) compactIfWorthIt() {
 		return
 	}
 	const floor = 1 << 20
-	st, err := os.Stat(n.segPath)
-	if err != nil {
+	st := n.pairStamp()[0]
+	if !st.there {
 		return
 	}
-	threshold := st.Size() / 4
+	threshold := st.size / 4
 	if threshold < floor {
 		threshold = floor
 	}
@@ -1358,8 +1359,46 @@ func stampOf(path string) fileStamp {
 func (n *Session) pairStamp() [2]fileStamp {
 	if n.deltaFor != n.segPath || n.deltaPath == "" {
 		n.deltaPath, n.deltaFor = segDeltaPath(n.segPath), n.segPath
+		n.segStat.release()
+		n.deltaStat.release()
 	}
-	return [2]fileStamp{stampOf(n.segPath), stampOf(n.deltaPath)}
+	return [2]fileStamp{n.segStat.stamp(n.segPath), n.deltaStat.stamp(n.deltaPath)}
+}
+
+// heldStamp stamps a file through a descriptor held open for the purpose. A
+// statement stamps both files several times, and a path stat costs a lookup
+// and an allocation (the path's NUL-terminated copy); fstat on a held
+// descriptor costs neither. The descriptor is trusted only while its file is
+// still linked: renamed over or deleted, it no longer describes the path, and
+// the path is stat'ed and the descriptor reopened. A file opened just after
+// its path was stat'ed can only be newer than that stamp, so the next check
+// reports a change it may not need to -- never misses one.
+//
+// Only where fsstamp.FileStamps (Linux and macOS): not on Windows, where a held
+// handle stops another process renaming or deleting the file.
+type heldStamp struct {
+	f *os.File
+}
+
+func (h *heldStamp) stamp(path string) fileStamp {
+	if h.f != nil {
+		if size, mtime, linked, ok := fsstamp.OfFile(h.f.Fd()); ok && linked {
+			return fileStamp{size: size, mtime: mtime, there: true}
+		}
+		h.release()
+	}
+	st := stampOf(path)
+	if st.there && fsstamp.FileStamps {
+		h.f, _ = os.Open(path)
+	}
+	return st
+}
+
+func (h *heldStamp) release() {
+	if h.f != nil {
+		h.f.Close()
+		h.f = nil
+	}
 }
 
 // RefreshIfStale rebuilds this session when the file it is reading has moved
@@ -1733,9 +1772,16 @@ func (db *DB) cachedSegSource(rows []SchemaRow, cols *ReadOnlyPager, freeze bool
 // checked against the file the descriptor was opened on, so a lock file
 // replaced underneath is reopened rather than locked stale.
 func (n *Session) withCommitLock(fn func() error) error {
-	fi, err := os.Stat(n.segPath + segmentLockSuffix)
-	if n.commitLock != nil && (err != nil || !os.SameFile(fi, n.commitLockFI)) {
-		n.releaseCommitLock()
+	if n.commitLock != nil {
+		// Through the held descriptor when the platform can (no path, no
+		// allocation): still linked means the path still names it.
+		if _, _, linked, ok := fsstamp.OfFile(n.commitLock.Fd()); ok {
+			if !linked {
+				n.releaseCommitLock()
+			}
+		} else if fi, err := os.Stat(n.segPath + segmentLockSuffix); err != nil || !os.SameFile(fi, n.commitLockFI) {
+			n.releaseCommitLock()
+		}
 	}
 	if n.commitLock == nil {
 		f, oerr := openSegmentLockFile(n.segPath)

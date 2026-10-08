@@ -10,6 +10,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/samyfodil/musql/internal/fsstamp"
 	"github.com/samyfodil/musql/internal/mmapfile"
 )
 
@@ -277,7 +278,23 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 		return nil
 	}
 	path := segDeltaPath(segPath)
-	fi, err := os.Stat(path)
+	// The held descriptor answers for the path while its file is still linked
+	// (fstat: no lookup, no allocation); otherwise the path is stat'ed.
+	var fileSize int64
+	held := false
+	if carry != nil && carry.f != nil {
+		if size, _, linked, ok := fsstamp.OfFile(carry.f.Fd()); ok && linked {
+			fileSize, held = size, true
+		}
+	}
+	var fi os.FileInfo
+	var err error
+	if !held {
+		fi, err = os.Stat(path)
+		if err == nil {
+			fileSize = fi.Size()
+		}
+	}
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return err
@@ -288,12 +305,13 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 		if carry != nil {
 			carry.known = false // the file is new; derive below
 		}
-		fi = nil
+		fi, fileSize = nil, 0
 	}
+	exists := held || fi != nil
 	// The held descriptor is good only while the path still names its file.
 	var f *os.File
 	if carry != nil && carry.f != nil {
-		if fi != nil && carry.fi != nil && os.SameFile(fi, carry.fi) {
+		if held || (fi != nil && carry.fi != nil && os.SameFile(fi, carry.fi)) {
 			f = carry.f
 		} else {
 			carry.f.Close()
@@ -352,7 +370,7 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 	// append time rather than at the next open, and what it buys is a commit that
 	// does not re-read its own history.
 	var st *segDeltaState
-	if carry != nil && carry.known && carry.offset > int64(segDeltaHdrSize) && fi != nil && fi.Size() == carry.offset {
+	if carry != nil && carry.known && carry.offset > int64(segDeltaHdrSize) && exists && fileSize == carry.offset {
 		vf := f
 		if vf == nil {
 			vf, _ = os.Open(path)
@@ -411,7 +429,7 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 	}
 	// A torn tail past where this batch started is cut off. When the file
 	// ended exactly there, nothing lies past the batch and the call is skipped.
-	if fi == nil || fi.Size() != st.bytes {
+	if !exists || fileSize != st.bytes {
 		if err := f.Truncate(end); err != nil {
 			return err
 		}
@@ -847,3 +865,4 @@ func segmentLockBusy(err error, kind string) error {
 	}
 	return fmt.Errorf("%w: another connection holds the %s (%s)", ErrBusy, SegmentLockBusyFragment, kind)
 }
+
