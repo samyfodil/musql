@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"sync/atomic"
 	"unsafe"
@@ -2369,6 +2370,19 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			tbl := op.P4.(*tableMeta)
 			var rid uint64
 			var rerr error
+			// Rows a bulk load holds (insert_bulk_direct.go) are not in the
+			// row store every rowid rule below reads. A plain table's next
+			// rowid only has to clear the last one the load took; anything
+			// else -- AUTOINCREMENT, a replication rowid range, a load already
+			// at the largest rowid, whose next one C picks at random among
+			// the unused -- gets them back in the row store first.
+			bl := tbl.bulk
+			if bl != nil && bl.any && (tbl.autoIncrement || m.wctx.db.rowidLo < m.wctx.db.rowidHi || int64(bl.last) == math.MaxInt64) {
+				if derr := m.bulkDrain(bl, tbl); derr != nil {
+					return nil, derr
+				}
+				bl = nil
+			}
 			switch db := m.wctx.db; {
 			case tbl.autoIncrement:
 				rid, rerr = m.wctx.aincNewRowid(tbl)
@@ -2377,6 +2391,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			if rerr != nil {
 				return nil, rerr
+			}
+			if bl != nil && bl.any && !rowidLess(bl.last, rid) {
+				rid = bl.last + 1
 			}
 			m.regs[op.P2] = Value{Typ: Int, I: int64(rid)}
 
