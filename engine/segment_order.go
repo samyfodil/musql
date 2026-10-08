@@ -28,7 +28,8 @@ type segOrderPlan struct {
 	keyDesc []bool
 	keyColl []string // per key: the declared collation, "" for the default
 	outCols []int
-	limit   int
+	limit   int // rows the heap keeps: the LIMIT plus the OFFSET
+	offset  int // leading rows of those the statement skips
 	nOut    int
 }
 

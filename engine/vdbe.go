@@ -2099,7 +2099,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			if served {
 				segFilterServed.Add(1)
-				m.segRows, m.segRow = rows, 0
+				m.segRows, m.segRow = rows[min(plan.offset, len(rows)):], 0
 				pc = op.P3
 				continue
 			}

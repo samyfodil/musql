@@ -1,6 +1,7 @@
 package engine
 
-// Recognizer for "ORDER BY <int columns> LIMIT n" over columnar tables.
+// Recognizer for "ORDER BY <int columns> LIMIT n [OFFSET m]" over columnar
+// tables (a literal OFFSET; the sorter's bound is then m+n).
 // Introduces a guard and leaves the original program as a fallback for
 // runtime declines (non-int64 columns, NULLs, exceptions).
 
@@ -99,14 +100,32 @@ bodyDone:
 		return false
 	}
 	at++
-	if at+1 >= len(in) || in[at].Op != OpInteger || in[at+1].Op != OpInteger {
+	// "Integer limit; Integer 1", or with an OFFSET "Integer offset; Integer
+	// limit; Integer 1", whose drain then skips the offset's rows first:
+	// "If offset -> skip; Goto rows; skip: Subtract; Goto next".
+	if at+2 >= len(in) || in[at].Op != OpInteger || in[at+1].Op != OpInteger {
 		return false
+	}
+	offset := 0
+	if in[at+2].Op == OpInteger {
+		offset = int(in[at].P1)
+		if offset < 0 || offset+int(in[at+1].P1) != ki.bound {
+			return false
+		}
+		at++
 	}
 	at += 2
 	if at >= len(in) || in[at].Op != OpSorterSort || in[at].P1 != sorterNum {
 		return false
 	}
 	sortAt := at
+	if offset > 0 {
+		if sortAt+4 >= len(in) || in[sortAt+1].Op != OpIf || in[sortAt+1].P2 != sortAt+3 ||
+			in[sortAt+2].Op != OpGoto || in[sortAt+2].P2 != sortAt+5 || in[sortAt+3].Op != OpSubtract || in[sortAt+4].Op != OpGoto {
+			return false
+		}
+		sortAt += 4
+	}
 	if sortAt+3 >= len(in) || in[sortAt+1].Op != OpIf || in[sortAt+2].Op != OpGoto ||
 		in[sortAt+3].Op != OpSorterData || in[sortAt+3].P1 != sorterNum {
 		return false
@@ -140,7 +159,7 @@ bodyDone:
 	if ki.nKey+nOut > nRec {
 		return false
 	}
-	plan := &segOrderPlan{limit: ki.bound, nOut: nOut}
+	plan := &segOrderPlan{limit: ki.bound, offset: offset, nOut: nOut}
 	for i := 0; i < ki.nKey; i++ {
 		plan.keyCols = append(plan.keyCols, cols[i])
 		desc := false
