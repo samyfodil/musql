@@ -126,3 +126,21 @@ func (t *tableMeta) bulkSegments() ([][]byte, error) {
 	}
 	return t.bulk.segs, nil
 }
+
+// bulkIntoRowStore puts t's direct-path rows into its row store as rows the
+// file already holds: not logged, not journalled, not written-since-commit.
+// For a rewrite that wrote them but left the session reading its row stores.
+func (t *tableMeta) bulkIntoRowStore() error {
+	written := t.rowsWrittenSinceCommit
+	for _, raw := range t.bulk.segs {
+		s, err := openSegment(raw)
+		if err != nil {
+			return err
+		}
+		for i := 0; i < s.nRows; i++ {
+			t.putRow(s.Rowid(i), s.rowAt(i))
+		}
+	}
+	t.rowsWrittenSinceCommit = written
+	return nil
+}

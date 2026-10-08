@@ -153,9 +153,14 @@ func (n *Session) rewriteFile() error {
 		return rerr
 	}
 	syncDir(n.segPath)
-	// A direct-path load's segments are in the file now.
+	// A direct-path load's segments are in the file now. Its table's row store
+	// holds none of them, which is right only once rebase below has pointed the
+	// session at this file; until then they are kept, for the fallback after it.
+	var bulked []*tableMeta
 	for _, t := range db.tables {
-		t.bulk = nil
+		if t.bulk != nil {
+			bulked = append(bulked, t)
+		}
 	}
 	// The delta is gone: its rows are in the segments now, and its records named
 	// table indexes the new directory may not use.
@@ -188,7 +193,24 @@ func (n *Session) rewriteFile() error {
 	for _, t := range db.tables {
 		t.inFile = !t.isTemp // every main table is the file's now
 	}
+	src := n.src
 	n.rebase(openSegmentsUnlocked) // the write lock is held: see openSegmentsUnlocked
+	if n.src == src {
+		// Not rebased -- a virtual table, an alias, a transaction, or the file
+		// would not open -- so the session still reads its row stores, and a
+		// bulk-loaded table's would read EMPTY: its rows were never in it. They
+		// go in now, from the segments still in hand, as rows the file already
+		// holds (an "INSERT INTO log SELECT rtreecheck('r1')" read back nothing
+		// in the same session; a reopen saw the row).
+		for _, t := range bulked {
+			if err := t.bulkIntoRowStore(); err != nil {
+				return err
+			}
+		}
+	}
+	for _, t := range bulked {
+		t.bulk = nil
+	}
 	return nil
 }
 
