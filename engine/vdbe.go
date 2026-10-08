@@ -1239,6 +1239,23 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				return nil, ferr
 			}
 
+		case OpRecQueuePush:
+			q := m.recq
+			if q == nil || op.P2 != q.spec.nCol {
+				return nil, fmt.Errorf("engine: internal: recursive CTE row push with no queue or %d values", op.P2)
+			}
+			row := make([]Value, op.P2)
+			copy(row, m.regs[op.P1:op.P1+op.P2])
+			q.push(row)
+
+		case OpRecQueueCheck:
+			if m.recq == nil {
+				return nil, fmt.Errorf("engine: internal: recursive CTE check with no queue")
+			}
+			if cerr := m.recQueueCaps(m.recq); cerr != nil {
+				return nil, cerr
+			}
+
 		case OpRecQueuePop:
 			ok, perr := m.recQueuePop(op)
 			if perr != nil {

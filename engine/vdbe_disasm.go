@@ -143,6 +143,8 @@ var opNames = [numOpCodes]string{
 	OpTxn:                  "Txn",
 	OpRecQueueOpen:         "RecQueueOpen",
 	OpRecQueueFill:         "RecQueueFill",
+	OpRecQueuePush:         "RecQueuePush",
+	OpRecQueueCheck:        "RecQueueCheck",
 	OpRecQueuePop:          "RecQueuePop",
 	OpRecQueueOffset:       "RecQueueOffset",
 	OpRecQueueLimit:        "RecQueueLimit",

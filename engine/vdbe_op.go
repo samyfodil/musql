@@ -616,6 +616,12 @@ const (
 	// select.c:1328/:1475). A recursive step reads the row most recently popped
 	// through OpOpenDerived's recSelf source.
 	OpRecQueueFill
+	// OpRecQueuePush: push r[P1..P1+P2) onto the recursive CTE's queue -- an
+	// inlined recursive step's result row (rec_inline.go).
+	OpRecQueuePush
+	// OpRecQueueCheck: the caps OpRecQueueFill applies after a recursive
+	// step, after an inlined one (recQueueCaps).
+	OpRecQueueCheck
 	// OpRecQueuePop: P2: jump target when the queue is empty. P3: base register
 	// of the popped row. select.c:2796-2805: OP_Rewind queue, OP_NullRow
 	// current, OP_RowData/OP_Column into regCurrent, OP_Delete.
