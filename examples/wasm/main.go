@@ -340,38 +340,41 @@ func main() {
 			}
 		}
 		rows, cols, err := queryRows(a[0].String(), args...)
-		b := jsonBuf[:0]
-		if err != nil {
-			b = appendJSONString(append(b, `{"error":`...), err.Error())
-		} else {
-			b = append(b, `{"columns":[`...)
-			for i, c := range cols {
-				if i > 0 {
-					b = append(b, ',')
-				}
-				b = appendJSONString(b, c)
-			}
-			b = append(b, `],"rows":[`...)
-			for i, r := range rows {
-				if i > 0 {
-					b = append(b, ',')
-				}
-				b = append(b, '[')
-				for j, v := range r {
-					if j > 0 {
-						b = append(b, ',')
-					}
-					b = appendJSONValue(b, v)
-				}
-				b = append(b, ']')
-			}
-			b = append(b, ']')
-		}
-		b = append(b, '}')
-		jsonBuf = b
-		return string(b)
+		jsonBuf = appendQueryJSON(jsonBuf[:0], rows, cols, err)
+		return string(jsonBuf)
 	}))
 	js.Global().Set("musql", api)
 	js.Global().Call("musqlReady")
 	select {}
+}
+
+// appendQueryJSON encodes a query's answer as querySync returns it:
+// {"columns", "rows"} or {"error"}.
+func appendQueryJSON(b []byte, rows [][]any, cols []string, err error) []byte {
+	if err != nil {
+		b = appendJSONString(append(b, `{"error":`...), err.Error())
+		return append(b, '}')
+	}
+	b = append(b, `{"columns":[`...)
+	for i, c := range cols {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		b = appendJSONString(b, c)
+	}
+	b = append(b, `],"rows":[`...)
+	for i, r := range rows {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		b = append(b, '[')
+		for j, v := range r {
+			if j > 0 {
+				b = append(b, ',')
+			}
+			b = appendJSONValue(b, v)
+		}
+		b = append(b, ']')
+	}
+	return append(b, ']', '}')
 }
