@@ -492,7 +492,7 @@ func (cur *vdbeCursor) rewind() error {
 			// only an integer probe can use it; either falls to the walk.
 			if cur.idxSeekConfigured && !tbl.withoutRowid && tbl.rows != nil && cur.idxSeekProbe.Typ == Int {
 				if hits, ok := tbl.rows.eqRowids(cur.idxSeekCol, cur.idxSeekProbe.I); ok {
-					writeIndexSeeksServed++
+					writeIndexSeeksServed.Add(1)
 					cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
 					for _, rid := range hits {
 						if vals, found := tbl.rows.get(rid); found {
@@ -561,7 +561,7 @@ func (cur *vdbeCursor) rewind() error {
 		if cur.idxSeekConfigured && !cur.tbl.withoutRowid && !virtualKey {
 			rowids, served := cur.pager.SeekIndexRowidsSegments(cur.tbl.root, cur.idxSeekCol, cur.idxSeekProbe, cur.idxSeekColl)
 			if served {
-				segIndexSeeksServed++
+				segIndexSeeksServed.Add(1)
 				cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
 				shared := cur.pager.ServesLiveRows(cur.tbl.root)
 				for _, rid := range rowids {

@@ -57,6 +57,7 @@ func open() error {
 	if db != nil {
 		db.Close()
 	}
+	stmts = map[string]*sql.Stmt{}
 	var err error
 	db, err = sql.Open(driver.DriverName, dbPath)
 	return err
@@ -106,9 +107,23 @@ func seed(n int) (string, error) {
 	return fmt.Sprintf("seeded %d rows in %v", n, time.Since(start).Round(time.Millisecond)), nil
 }
 
+// stmts holds each query's prepared statement, so a repeated query -- every
+// timed one -- is not prepared again per call, as a real application would
+// not. Reset with the *sql.DB they belong to (open); the worker is single
+// threaded.
+var stmts = map[string]*sql.Stmt{}
+
 // queryRows runs q and reads every row, which is what a timing must include.
 func queryRows(q string, args ...any) ([][]any, []string, error) {
-	rows, err := db.Query(q, args...)
+	st := stmts[q]
+	if st == nil {
+		var err error
+		if st, err = db.Prepare(q); err != nil {
+			return nil, nil, err
+		}
+		stmts[q] = st
+	}
+	rows, err := st.Query(args...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -340,38 +355,41 @@ func main() {
 			}
 		}
 		rows, cols, err := queryRows(a[0].String(), args...)
-		b := jsonBuf[:0]
-		if err != nil {
-			b = appendJSONString(append(b, `{"error":`...), err.Error())
-		} else {
-			b = append(b, `{"columns":[`...)
-			for i, c := range cols {
-				if i > 0 {
-					b = append(b, ',')
-				}
-				b = appendJSONString(b, c)
-			}
-			b = append(b, `],"rows":[`...)
-			for i, r := range rows {
-				if i > 0 {
-					b = append(b, ',')
-				}
-				b = append(b, '[')
-				for j, v := range r {
-					if j > 0 {
-						b = append(b, ',')
-					}
-					b = appendJSONValue(b, v)
-				}
-				b = append(b, ']')
-			}
-			b = append(b, ']')
-		}
-		b = append(b, '}')
-		jsonBuf = b
-		return string(b)
+		jsonBuf = appendQueryJSON(jsonBuf[:0], rows, cols, err)
+		return string(jsonBuf)
 	}))
 	js.Global().Set("musql", api)
 	js.Global().Call("musqlReady")
 	select {}
+}
+
+// appendQueryJSON encodes a query's answer as querySync returns it:
+// {"columns", "rows"} or {"error"}.
+func appendQueryJSON(b []byte, rows [][]any, cols []string, err error) []byte {
+	if err != nil {
+		b = appendJSONString(append(b, `{"error":`...), err.Error())
+		return append(b, '}')
+	}
+	b = append(b, `{"columns":[`...)
+	for i, c := range cols {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		b = appendJSONString(b, c)
+	}
+	b = append(b, `],"rows":[`...)
+	for i, r := range rows {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		b = append(b, '[')
+		for j, v := range r {
+			if j > 0 {
+				b = append(b, ',')
+			}
+			b = appendJSONValue(b, v)
+		}
+		b = append(b, ']')
+	}
+	return append(b, ']', '}')
 }

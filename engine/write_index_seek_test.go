@@ -69,7 +69,7 @@ func TestWriteIndexSeekMatchesTheWalk(t *testing.T) {
 		}
 		return fmt.Sprint(typedRows(rows))
 	}
-	served := writeIndexSeeksServed
+	served := writeIndexSeeksServed.Load()
 	for _, w := range writes {
 		gotN, _, gotErr := seek.ExecArgs(w, nil)
 		writeIndexSeekOffForTest = true
@@ -82,7 +82,7 @@ func TestWriteIndexSeekMatchesTheWalk(t *testing.T) {
 			t.Fatalf("%s: tables differ\n seek %.300s\n walk %.300s", w, g, wt)
 		}
 	}
-	if writeIndexSeeksServed-served < 8 {
-		t.Fatalf("the column seek served %d writes: the comparison proves nothing", writeIndexSeeksServed-served)
+	if writeIndexSeeksServed.Load()-served < 8 {
+		t.Fatalf("the column seek served %d writes: the comparison proves nothing", writeIndexSeeksServed.Load()-served)
 	}
 }

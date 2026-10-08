@@ -3,6 +3,9 @@
 importScripts("memfs.js", "musql.js", "wasm_exec.js");
 
 const ready = new Promise((resolve) => { globalThis.musqlReady = resolve; });
+// The query call: the module's own exports when it has them (musql.js's
+// musqlQueryFast), else musql.querySync.
+let querySync;
 (async () => {
 	// vdbe: the plain VDBE; go: columnar paths, every kernel declined; jit: all on.
 	const mode = new URLSearchParams(location.search).get("mode") || "jit";
@@ -12,6 +15,7 @@ const ready = new Promise((resolve) => { globalThis.musqlReady = resolve; });
 	const { instance } = await WebAssembly.instantiateStreaming(fetch("musql.wasm"), go.importObject);
 	go.run(instance);
 	await ready;
+	querySync = musqlQueryFast(instance) || musql.querySync;
 	postMessage({ ready: true, engine: "musql", mode, vector: musql.vector });
 })().catch((e) => postMessage({ error: String(e) }));
 
@@ -32,7 +36,7 @@ onmessage = async ({ data: { id, op, args = [] } }) => {
 			// Timed here, in JS around the call, exactly as turso-worker.js
 			// times Turso: both include their engine's JS binding.
 			const t = performance.now();
-			const r = JSON.parse(musql.querySync(...args));
+			const r = JSON.parse(querySync(...args));
 			r.ms = performance.now() - t;
 			if (r.error) throw new Error(r.error);
 			postMessage({ id, result: r });

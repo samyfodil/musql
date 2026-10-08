@@ -107,7 +107,11 @@ func (prog *Program) putMachine(m *vdbe) {
 			*c = vdbeCursor{}
 		}
 	}
-	*m = vdbe{regs: regs, cursors: cursors, recRegs: recRegs}
+	// The sub-cache slice too (reuseSubCache), emptied to its full capacity
+	// so no cached row is kept alive by the pool.
+	sub := m.subCache[:cap(m.subCache)]
+	clear(sub)
+	*m = vdbe{regs: regs, cursors: cursors, recRegs: recRegs, subCache: sub[:0]}
 	vdbeMachines.Put(m)
 }
 

@@ -87,6 +87,11 @@ type recSelfRef struct {
 // exactly as a trigger's NEW/OLD row does, and it names the spec it belongs to
 // so a machine can never hand one CTE's row to another CTE's reference.
 type recCurrentRow struct {
+	// openRecursiveSelf's reused row.
+	selfBuf  []Value
+	selfRows [][]Value
+	selfRids []uint64
+
 	spec *recQueueSpec
 	row  []Value
 }
@@ -234,14 +239,22 @@ func (p *ReadOnlyPager) compileRecursiveCTE(name string, b *cteBinding, cols []c
 	for i := range cols {
 		names[i] = cols[i].Name
 	}
-	return &Program{
+	prog := &Program{
 		Insns:            c.insns,
 		NReg:             c.nReg,
 		NResultCol:       nCol,
 		ColNames:         names,
 		CTEScopeSnapshot: p.snapshotCTEScopes(),
-	}, nil
+	}
+	if !recInlineOffForTest {
+		recInlinePeephole(prog)
+	}
+	return prog, nil
 }
+
+// recInlineOffForTest keeps every recursive step a sub-program, so a test's
+// reference is the path recInlinePeephole replaces.
+var recInlineOffForTest bool
 
 // compileRecursiveCTEPart compiles the setup query or one recursive arm of a
 // recursive CTE. It applies what execSelect applied to the same SELECT when the
@@ -463,7 +476,18 @@ func (m *vdbe) recQueueFill(op *Instruction) error {
 		}
 		q.push(r)
 	}
-	if op.P1 == 0 || !q.spec.unbounded() {
+	if op.P1 == 0 {
+		return nil
+	}
+	return m.recQueueCaps(q)
+}
+
+// recQueueCaps is the check after a recursive step: for an unbounded queue,
+// the caps cteRecursionRowCap and friends set, chosen by whether the rows end
+// in a bulk append. OpRecQueueFill runs it after a step's sub-program, and
+// OpRecQueueCheck after an inlined step (rec_inline.go).
+func (m *vdbe) recQueueCaps(q *recQueue) error {
+	if !q.spec.unbounded() {
 		return nil
 	}
 	if m.sink != nil && m.sink.bounded {
@@ -552,14 +576,31 @@ func (m *vdbe) recQueueLimit() (bool, error) {
 // the current row of the recursive CTE spec names, as SQLite's OP_OpenPseudo
 // over regCurrent. A machine that holds no current row for THAT spec is an
 // internal error, never another CTE's row.
-func (m *vdbe) openRecursiveSelf(ds *derivedSource) (*vdbeCursor, error) {
+func (m *vdbe) openRecursiveSelf(ds *derivedSource, shell *vdbeCursor) (*vdbeCursor, error) {
 	cur := m.recCur
 	if cur == nil || cur.spec != ds.recSelf || cur.row == nil {
 		return nil, fmt.Errorf("vdbe: recursive CTE %s self-reference has no current row", ds.recSelf.name)
 	}
-	row := make([]Value, len(cur.row))
-	copy(row, cur.row)
-	return openDerivedCursor(ds.tbl, [][]Value{row}, nil), nil
+	// One row buffer and backing slices, reused step after step: a recursive
+	// select may name its CTE only once, so at most one of these is live at a
+	// time, and building them per step was a quarter of every byte a 100k-row
+	// recursive INSERT allocated. The cursor itself is the machine's own shell
+	// when it has one -- never a struct shared between machines: putMachine
+	// keeps every cursor shell for the next machine, so a shared one would come
+	// back from the pool as some other cursor (a join's table scan read the
+	// self row's one column as its second: with5.test). It is rebuilt whole,
+	// so nothing of the previous step survives in it.
+	cur.selfBuf = append(cur.selfBuf[:0], cur.row...)
+	clearDerivedSubtypes(cur.selfBuf, nil) // openDerivedCursor's rule
+	if cur.selfRows == nil {
+		cur.selfRows, cur.selfRids = make([][]Value, 1), make([]uint64, 1)
+	}
+	cur.selfRows[0], cur.selfRids[0] = cur.selfBuf, 0
+	if shell == nil {
+		shell = new(vdbeCursor)
+	}
+	*shell = vdbeCursor{tbl: ds.tbl, rows: cur.selfRows, rowids: cur.selfRids, materialized: true, colMask: allColumns}
+	return shell, nil
 }
 
 // recQueueSpilled counts rows written to a queue file, for tests.

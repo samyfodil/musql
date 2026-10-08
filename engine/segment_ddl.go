@@ -153,6 +153,15 @@ func (n *Session) rewriteFile() error {
 		return rerr
 	}
 	syncDir(n.segPath)
+	// A direct-path load's segments are in the file now. Its table's row store
+	// holds none of them, which is right only once rebase below has pointed the
+	// session at this file; until then they are kept, for the fallback after it.
+	var bulked []*tableMeta
+	for _, t := range db.tables {
+		if t.bulk != nil {
+			bulked = append(bulked, t)
+		}
+	}
 	// The delta is gone: its rows are in the segments now, and its records named
 	// table indexes the new directory may not use.
 	if rerr := os.Remove(segDeltaPath(n.segPath)); rerr != nil && !os.IsNotExist(rerr) {
@@ -184,7 +193,24 @@ func (n *Session) rewriteFile() error {
 	for _, t := range db.tables {
 		t.inFile = !t.isTemp // every main table is the file's now
 	}
+	src := n.src
 	n.rebase(openSegmentsUnlocked) // the write lock is held: see openSegmentsUnlocked
+	if n.src == src {
+		// Not rebased -- a virtual table, an alias, a transaction, or the file
+		// would not open -- so the session still reads its row stores, and a
+		// bulk-loaded table's would read EMPTY: its rows were never in it. They
+		// go in now, from the segments still in hand, as rows the file already
+		// holds (an "INSERT INTO log SELECT rtreecheck('r1')" read back nothing
+		// in the same session; a reopen saw the row).
+		for _, t := range bulked {
+			if err := t.bulkIntoRowStore(); err != nil {
+				return err
+			}
+		}
+	}
+	for _, t := range bulked {
+		t.bulk = nil
+	}
 	return nil
 }
 
@@ -304,10 +330,45 @@ func (db *DB) segmentFileContentsOf(temp bool, w *segFileWriter) ([]ConvertedTab
 			continue
 		}
 
+		ti := len(tables)
+		// A direct-path load (insert_bulk_direct.go): its rows are already
+		// segments, and the row store holds none of them.
+		if t.bulk != nil {
+			segs, berr := t.bulkSegments()
+			for _, raw := range segs {
+				if berr != nil {
+					break
+				}
+				berr = w.addSegment(ti, raw)
+			}
+			if berr != nil {
+				return nil, ConvertedCatalog{}, fmt.Errorf("engine: DDL: %w", berr)
+			}
+			tables = append(tables, ct)
+			continue
+		}
+		// A table whose rows are still exactly its file's segments -- nothing
+		// written, deleted or spilled this session, nothing waiting for it in
+		// the delta, the same columns -- is copied segment by segment as the
+		// bytes it already is: a rebuild would cut and encode the same rows
+		// and rebuild the same column indexes. A VACUUM right after a bulk
+		// load paid a whole second rebuild for nothing.
+		if segs, ok := pristineSegments(t); ok {
+			var aerr error
+			for _, sg := range segs {
+				if aerr = w.addSegment(ti, sg.buf); aerr != nil {
+					break
+				}
+			}
+			if aerr != nil {
+				return nil, ConvertedCatalog{}, fmt.Errorf("engine: DDL: %w", aerr)
+			}
+			tables = append(tables, ct)
+			continue
+		}
 		// ONE SEGMENT IN HAND at a time (segCutter): the rows are read in rowid
 		// order and cut as they fill, so a table this session spilled
 		// (row_store_spill.go) is read back a segment at a time, not whole.
-		ti := len(tables)
 		cut := &segCutter{cols: colInfos, what: t.name, emit: func(raw []byte) error { return w.addSegment(ti, raw) }}
 		var cerr error
 		t.rows.eachSortedUntil(func(rid uint64, vals []Value) bool {
@@ -695,4 +756,31 @@ func (db *DB) checkNewIndex(idx *indexMeta, tbl *tableMeta) error {
 		}
 	}
 	return nil
+}
+
+// pristineSegments returns t's file segments when its row store has not moved
+// off them: no row written or deleted this session, none spilled, no delta
+// record for the table, and every segment as wide as the table.
+func pristineSegments(t *tableMeta) ([]*segment, bool) {
+	st := t.rows
+	if st == nil || st.seg == nil || len(st.m) != 0 || len(st.gone) != 0 || st.baseGone || st.spill != nil {
+		return nil, false
+	}
+	rp := st.seg.rp
+	if rp == nil || rp.segs == nil {
+		return nil, false
+	}
+	segs, ok := rp.segs.byRoot[st.seg.root]
+	if !ok {
+		return nil, false
+	}
+	if rows, dead, clean := rp.segs.overlayFor(st.seg.root); !clean || len(rows) != 0 || len(dead) != 0 {
+		return nil, false
+	}
+	for _, sg := range segs {
+		if len(sg.cols) != len(t.cols) {
+			return nil, false
+		}
+	}
+	return segs, true
 }

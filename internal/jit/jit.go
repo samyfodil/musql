@@ -254,6 +254,7 @@ const (
 	TextEq       TextMode = iota // the text before its first NUL equals Pat
 	TextPrefix                   // it starts with Pat
 	TextContains                 // Pat occurs in it
+	TextSuffix                   // it ends with Pat
 )
 
 // MaxProgCols is how many distinct column blocks one compiled program may

@@ -191,8 +191,9 @@ func TestNativeTextMatchMatchesTheLoop(t *testing.T) {
 		`SELECT sum(length(s)) FROM t WHERE s LIKE '%b%'`,
 		`SELECT max(k) FROM t WHERE s LIKE 'zz%'`,
 		`SELECT max(k) FROM t WHERE s LIKE '%xxxxxxxxxxxxxxxxx%'`, // a 17-byte piece: not native
-		`SELECT max(k) FROM t WHERE s LIKE '%1'`,                  // a suffix: not native yet
-		`SELECT count(*) FROM t WHERE s LIKE 'x1%' OR k > 5`,      // the three-valued OR epilogue
+		`SELECT max(k) FROM t WHERE s LIKE '%1'`,                  // a suffix
+		`SELECT count(*) FROM t WHERE s NOT LIKE '%X2' OR k = 0`,
+		`SELECT count(*) FROM t WHERE s LIKE 'x1%' OR k > 5`, // the three-valued OR epilogue
 		`SELECT count(*) FROM t WHERE NOT (s LIKE 'a%') OR k = 2`,
 		`SELECT count(*) FROM t WHERE s LIKE '%B%' AND (k = 1 OR s LIKE '%x%')`,
 	}

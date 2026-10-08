@@ -165,6 +165,8 @@ func textMatchModel(s, pat []byte, mode TextMode, fold bool) bool {
 		return len(s) == len(pat) && at(0)
 	case TextPrefix:
 		return len(s) >= len(pat) && at(0)
+	case TextSuffix:
+		return len(s) >= len(pat) && at(len(s)-len(pat))
 	}
 	for i := 0; i+len(pat) <= len(s); i++ {
 		if at(i) {
@@ -205,8 +207,8 @@ func TestEmittedTextMatchMatchesLike(t *testing.T) {
 		t.Fatal("empty heap")
 	}
 	n := len(strs)
-	for trial := 0; trial < 60; trial++ {
-		mode := TextMode(trial % 3)
+	for trial := 0; trial < 80; trial++ {
+		mode := TextMode(trial % 4)
 		fold := trial%2 == 0
 		pl := 1 + rng.Intn(16)
 		pat := make([]byte, pl)

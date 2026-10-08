@@ -132,6 +132,11 @@ type tableMeta struct {
 	// a full rewrite. The session-long flag would force a rewrite on every
 	// commit after the first write; this one only on the commits that need it.
 	rowsWrittenSinceCommit bool
+
+	// bulk is a direct-path load into this table in progress
+	// (insert_bulk_direct.go): its rows are segments, not row-store rows,
+	// until the commit's rewrite writes them out.
+	bulk *segBulkLoad
 }
 
 // putRow stores vals under rowid in the live row store. Every row write from

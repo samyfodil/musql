@@ -66,9 +66,9 @@ func TestAutomaticSeekMatchesTheScan(t *testing.T) {
 		}
 	}
 	run := func(stage string) {
-		segIndexSeeksServed = 0
+		segIndexSeeksServed.Store(0)
 		defer func() {
-			if segIndexSeeksServed == 0 {
+			if segIndexSeeksServed.Load() == 0 {
 				t.Errorf("%s: no seek was served, so every query compared a scan with a scan", stage)
 			}
 		}()

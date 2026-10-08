@@ -60,7 +60,7 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	}
 	t1, t2, t3 := w.Local(wI64), w.Local(wI64), w.Local(wI64)
 	tp, tl, tc, tb := w.Local(wI32), w.Local(wI32), w.Local(wI64), w.Local(wI32) // POpTextLen
-	te := w.Local(wI32)                                                         // POpTextMatch: the heap's end
+	te, ts := w.Local(wI32), w.Local(wI32)                                      // POpTextMatch: the heap's end, a scan pointer
 
 	w.LoadPtr(POffRegs)
 	w.Set(regs)
@@ -211,7 +211,7 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			if len(in.Pat) == 0 || len(in.Pat) > 16 {
 				return nil, fmt.Errorf("jit: text pattern of %d bytes", len(in.Pat))
 			}
-			emitTextMatchWasm(w, in, regs, colEnd[in.B], idx, t1, tp, tl, te)
+			emitTextMatchWasm(w, in, regs, colEnd[in.B], idx, t1, tp, tl, te, ts, tb)
 		case POpService:
 			// Stop: PC = service+1, Row = idx, then out to $done past the
 			// "finished" store, so the epilogue saves acc and ovf as usual.
@@ -582,7 +582,7 @@ func (b *wasmBlocks) brIf(name string) { b.w.BrIf(b.depth(name)) }
 // mask and the fold's vectors are v128.const immediates; the fold is an
 // unsigned i8x16.lt_u, and a position matches when (text ^ pattern) & mask has
 // no bit set (v128.any_true).
-func emitTextMatchWasm(w *Wasm, in ProgInsn, regs, colEnd, idx, t1, tp, tl, te uint32) {
+func emitTextMatchWasm(w *Wasm, in ProgInsn, regs, colEnd, idx, t1, tp, tl, te, ts, tb uint32) {
 	const (
 		i32Load8U  = 0x2D
 		i32Sub     = 0x6B
@@ -720,6 +720,82 @@ func emitTextMatchWasm(w *Wasm, in ProgInsn, regs, colEnd, idx, t1, tp, tl, te u
 		matchAt("no")
 		b.br("yes")
 	case TextPrefix:
+		matchAt("no")
+		b.br("yes")
+	case TextSuffix:
+		// The text ends at its first NUL: scan for it (16 bytes at a time
+		// while they lie inside the text, then byte by byte) with ts, then
+		// the last m bytes before it must be the pattern.
+		w.Get(tp)
+		w.Set(ts)
+		w.Get(tp)
+		w.Get(tl)
+		w.op(opI32Add)
+		w.Set(tl) // tl = the text's end, while scanning
+		b.open(opBlock, "eff")
+		b.open(opLoop, "slp")
+		b.open(opBlock, "stail")
+		w.Get(ts)
+		w.I32(16)
+		w.op(opI32Add)
+		w.Get(tl)
+		w.op(i32GtU)
+		b.brIf("stail")
+		w.Get(ts)
+		w.op(opSIMD, simdV128Load, 0, 0)
+		w.I32(0)
+		w.Simd(0x0F) // i8x16.splat
+		w.Simd(0x23) // i8x16.eq
+		w.Simd(0x64) // i8x16.bitmask
+		w.Set(tb)
+		b.open(opBlock, "nonul")
+		w.Get(tb)
+		w.op(opI32Eqz)
+		b.brIf("nonul")
+		w.Get(ts)
+		w.Get(tb)
+		w.op(0x68) // i32.ctz
+		w.op(opI32Add)
+		w.Set(ts)
+		b.br("eff")
+		b.close() // nonul
+		w.Get(ts)
+		w.I32(16)
+		w.op(opI32Add)
+		w.Set(ts)
+		b.br("slp")
+		b.close() // stail
+		b.open(opLoop, "sbyte")
+		w.Get(ts)
+		w.Get(tl)
+		w.op(0x46) // i32.eq
+		b.brIf("eff")
+		w.Get(ts)
+		w.op(i32Load8U, 0, 0)
+		w.op(opI32Eqz)
+		b.brIf("eff")
+		w.Get(ts)
+		w.I32(1)
+		w.op(opI32Add)
+		w.Set(ts)
+		b.br("sbyte")
+		b.close() // sbyte
+		b.close() // slp
+		b.close() // eff
+		w.Get(ts)
+		w.Get(tp)
+		w.op(i32Sub)
+		w.Set(tl) // the effective length
+		w.Get(tl)
+		w.I32(int32(m))
+		w.op(i32LtU)
+		b.brIf("no")
+		w.Get(tp)
+		w.Get(tl)
+		w.op(opI32Add)
+		w.I32(int32(m))
+		w.op(i32Sub)
+		w.Set(tp)
 		matchAt("no")
 		b.br("yes")
 	case TextContains:

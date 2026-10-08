@@ -14,6 +14,7 @@ package engine
 import (
 	"fmt"
 	"math"
+	"strconv"
 )
 
 func boolValue(b bool) Value {
@@ -189,7 +190,37 @@ func concatValues(l, r Value) Value {
 	// "INSERT INTO t4(b) SELECT b||b||b||b FROM t4" stores TEXT). Only NULL
 	// short-circuits, above. A blob's bytes are taken as text unchanged,
 	// exactly like CAST(blob AS TEXT).
-	return Value{Typ: Text, S: []byte(valueToText(l) + valueToText(r))}
+	// One buffer, sized up front, each operand's text appended straight in:
+	// the same bytes as valueToText(l)+valueToText(r), without the two
+	// intermediate strings, their concatenation and its copy back to bytes.
+	buf := make([]byte, 0, concatTextLen(l)+concatTextLen(r))
+	return Value{Typ: Text, S: appendValueText(appendValueText(buf, l), r)}
+}
+
+// appendValueText appends valueToText(v)'s bytes to b.
+func appendValueText(b []byte, v Value) []byte {
+	switch v.Typ {
+	case Int:
+		return strconv.AppendInt(b, v.I, 10)
+	case Text, Blob:
+		return append(b, v.S...)
+	case Float:
+		return append(b, formatFloatText(v.F)...)
+	}
+	return b
+}
+
+// concatTextLen is an upper bound on len(valueToText(v)), for sizing.
+func concatTextLen(v Value) int {
+	switch v.Typ {
+	case Int:
+		return 20
+	case Text, Blob:
+		return len(v.S)
+	case Float:
+		return 32
+	}
+	return 0
 }
 
 // concatValuesEnc is concatValues in a database whose encoding is UTF-16.
@@ -403,7 +434,6 @@ func floatOf(isFloat bool, i int64, f float64) float64 {
 	}
 	return float64(i)
 }
-
 
 func addInt64(a, b int64) (int64, bool) {
 	s := a + b

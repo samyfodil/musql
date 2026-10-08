@@ -33,7 +33,7 @@ type Conn struct {
 	// point lookup's time. The result depends on the text alone and is only
 	// read afterwards, so it is shared; the cache is dropped when it fills.
 	paramInfo map[string]engine.ParamInfo
-	tx   *engine.DB // non-nil while a transaction (BeginTx) is open on this Conn
+	tx        *engine.DB // non-nil while a transaction (BeginTx) is open on this Conn
 
 	// ndb is this connection's HELD segment session -- one for the connection's
 	// whole life, which is what this format allows and the SQLite format
@@ -564,20 +564,21 @@ func (c *Conn) openWriteOrCreatePath(path string) (*engine.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.SetInMemory(c.memBacked(path))                              // see memdb.go's memBacked
-	db.SetForeignKeys(c.foreignKeys)                               // connection-level; see Conn.foreignKeys
-	db.SetDeferForeignKeys(c.deferFKs)                             // likewise; see Conn.deferFKs
-	db.SetCaseSensitiveLike(c.caseSensitiveLike)                   // likewise; see Conn.caseSensitiveLike
-	db.SetWritableSchema(c.writableSchema)                         // likewise; see Conn.writableSchema
-	db.SetRecursiveTriggers(c.recursiveTriggers)                   // likewise; see Conn.recursiveTriggers
-	db.SetTrustedSchema(!c.untrustedSchema)                        // likewise; see Conn.untrustedSchema
-	db.SetRtreeConnections(c.rtreeConns)                           // likewise; see Conn.rtreeConns
-	db.SetQueryOnly(c.queryOnly)                                   // likewise; see Conn.queryOnly
-	db.SetWriteLock(c.captureLock(db, path))                       // see Conn.captureLock
+	db.SetInMemory(c.memBacked(path))            // see memdb.go's memBacked
+	db.SetCommitsEachStatement(true)             // finishAutocommit commits after every autocommit statement
+	db.SetForeignKeys(c.foreignKeys)             // connection-level; see Conn.foreignKeys
+	db.SetDeferForeignKeys(c.deferFKs)           // likewise; see Conn.deferFKs
+	db.SetCaseSensitiveLike(c.caseSensitiveLike) // likewise; see Conn.caseSensitiveLike
+	db.SetWritableSchema(c.writableSchema)       // likewise; see Conn.writableSchema
+	db.SetRecursiveTriggers(c.recursiveTriggers) // likewise; see Conn.recursiveTriggers
+	db.SetTrustedSchema(!c.untrustedSchema)      // likewise; see Conn.untrustedSchema
+	db.SetRtreeConnections(c.rtreeConns)         // likewise; see Conn.rtreeConns
+	db.SetQueryOnly(c.queryOnly)                 // likewise; see Conn.queryOnly
+	db.SetWriteLock(c.captureLock(db, path))     // see Conn.captureLock
 	if path == c.path {
 		db.SetMaxSize(c.maxSize) // see Conn.maxSizePragma; main only
 	}
-	db.SetLegacyAlterTable(c.legacyAlterTable)                     // likewise; see Conn.legacyAlterTable
+	db.SetLegacyAlterTable(c.legacyAlterTable) // likewise; see Conn.legacyAlterTable
 	db.SetIgnoreCheckConstraints(c.ignoreCheckConstraints)
 	db.SetAutomaticIndex(!c.noAutomaticIndex)      // likewise; see Conn.noAutomaticIndex
 	db.SetFullColumnNames(c.fullColumnNames)       // likewise; see Conn.fullColumnNames
@@ -1141,7 +1142,6 @@ func isJournalModeAssignment(sqlText string) bool {
 	return err == nil && stmt != nil && stmt.Name == "journal_mode" && stmt.HasValue
 }
 
-
 // journalModeGetterFor is the value-less form of a journal_mode assignment,
 // preserving its schema qualifier -- what queryArgs reads the resulting mode
 // back with once the assignment has been applied through the write path.
@@ -1601,7 +1601,6 @@ func (c *Conn) secureDeletePragma(sqlText string) (driver.Rows, bool, error) {
 	c.secureDelete = engine.SecureDeleteMain(c.pragmaState)
 	return &Rows{cols: cols, rows: rows}, true, nil
 }
-
 
 // schemaCorruptRefuses applies corruptSchema's latch (Conn.schemaCorruptObj)
 // on BOTH of this driver's paths, because unlike the engine's own the latch

@@ -612,7 +612,7 @@ func segBlockIsLike(blocks []segSvcBlock, bi, cursor int, fold bool) (segBlockLi
 	case !lp.head && !lp.tail:
 		out.mode = jit.TextContains
 	default:
-		return no, false // a suffix: not native yet
+		out.mode = jit.TextSuffix
 	}
 	if fold {
 		for i, c := range out.pat {

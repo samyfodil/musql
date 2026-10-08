@@ -49,6 +49,11 @@ type writeCtx struct {
 	journal    []undoEntry
 	journalBuf [2]undoEntry
 
+	// bulkChecked / bulkTbl: whether this statement has decided on a
+	// direct-path load (bulkLoadFor), and the table it is loading.
+	bulkChecked bool
+	bulkTbl     *tableMeta
+
 	rowsAffected int // affected-row count, incremented by the storage opcodes; returned by runWrite
 
 	// aincs is the AUTOINCREMENT state of every table this statement has read
@@ -3609,6 +3614,14 @@ func (m *vdbe) storeResolvingConflicts(plan *insertPlan, rowid uint64, full []Va
 	if perr := m.wctx.pinViolation(tbl); perr != nil {
 		return false, perr
 	}
+	if bl := m.bulkLoadFor(plan); bl != nil {
+		stored, err := m.bulkStore(bl, tbl, rowid, full)
+		if err != nil || stored {
+			return stored, err
+		}
+		// Out of order: the built rows are in the row store now; this one
+		// takes the ordinary path below.
+	}
 	hits := findRowConflicts(db, tbl, rowid, full)
 	if len(hits) > 0 {
 		nonReplace, actions, replaceRowids := classifyHits(hits, func(h conflictHit) conflictAction {
@@ -4810,6 +4823,10 @@ type undoEntry struct {
 	putRid    uint64
 	putVals   []Value
 	drop, put bool
+	// dropMore is how many further consecutive rowids, after dropRid, this
+	// entry drops: an INSERT of rowids n, n+1, n+2 ... into one table is one
+	// entry, not one per row.
+	dropMore uint64
 }
 
 func (e *undoEntry) run() {
@@ -4818,7 +4835,9 @@ func (e *undoEntry) run() {
 		return
 	}
 	if e.drop {
-		e.tbl.dropRow(e.dropRid)
+		for k := uint64(0); k <= e.dropMore; k++ {
+			e.tbl.dropRow(e.dropRid + k)
+		}
 	}
 	if e.put {
 		e.tbl.putRow(e.putRid, e.putVals)
@@ -4840,8 +4859,16 @@ func (wc *writeCtx) undoPut(tbl *tableMeta, rid uint64, vals []Value) {
 	wc.journalAppend(undoEntry{tbl: tbl, putRid: rid, putVals: vals, put: true})
 }
 
-// undoDrop journals dropping the row at rid.
+// undoDrop journals dropping the row at rid, extending the last entry when it
+// drops the rowid just before this one in the same table. Drops of distinct
+// rowids undo in any order, so a run is exact.
 func (wc *writeCtx) undoDrop(tbl *tableMeta, rid uint64) {
+	if n := len(wc.journal); n > 0 {
+		if l := &wc.journal[n-1]; l.fn == nil && l.drop && !l.put && l.tbl == tbl && l.dropRid+l.dropMore+1 == rid && rid != 0 {
+			l.dropMore++
+			return
+		}
+	}
 	wc.journalAppend(undoEntry{tbl: tbl, dropRid: rid, drop: true})
 }
 

@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"sync/atomic"
 	"unsafe"
@@ -224,6 +225,15 @@ type vdbe struct {
 	yield    bool
 	resumePC int
 	done     bool
+	// yieldReuse lets a yielding machine hand every row back in the same
+	// buffers, yieldRow and yieldRows, instead of two fresh slices per row. Only
+	// subStream sets it: its consumer, a cursor, copies out of the row before
+	// it advances (vdbeCursor's rowVals contract), so the row is dead when the
+	// next one overwrites it. ProgramStmt's caller may keep its rows, and
+	// gets fresh ones.
+	yieldReuse bool
+	yieldRow   []Value
+	yieldRows  [][]Value
 
 	// likePlan is the last LIKE pattern this machine analysed (likePlanFor).
 	likePlan *likePlan
@@ -807,7 +817,7 @@ func (prog *Program) newMachine(pager *ReadOnlyPager, outer *evalCtx, params []V
 	m.jx = prog.jitCode()
 	m.sorters = make([]*vdbeSorter, prog.NSorters)
 	m.distinctSets = make([]*vdbeDistinctSet, prog.NDistinct)
-	m.subCache = make([]subCacheEntry, prog.NSubCache)
+	m.subCache = reuseSubCache(m.subCache, prog.NSubCache)
 	m.pager = pager
 	m.params = params
 	m.outer = outer
@@ -888,7 +898,7 @@ func (prog *Program) execWithParentRun(parent *vdbe, pager *ReadOnlyPager, first
 	m.jx = prog.jitCode()
 	m.sorters = make([]*vdbeSorter, prog.NSorters)
 	m.distinctSets = make([]*vdbeDistinctSet, prog.NDistinct)
-	m.subCache = make([]subCacheEntry, prog.NSubCache)
+	m.subCache = reuseSubCache(m.subCache, prog.NSubCache)
 	m.pager, m.params, m.parent, m.outer = pager, parent.params, parent, outerCtx
 	m.firstRow = firstRow
 	// The four pseudo-rows travel down here exactly as they do in
@@ -1218,6 +1228,12 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			if m.firstRow {
 				return [][]Value{nil}, nil
 			}
+			if m.yieldReuse && len(rows) == 0 {
+				m.yieldRow = append(m.yieldRow[:0], m.regs[op.P1:op.P1+op.P2]...)
+				m.yieldRows = append(m.yieldRows[:0], m.yieldRow)
+				m.resumePC = pc + 1
+				return m.yieldRows, nil
+			}
 			row := make([]Value, op.P2)
 			copy(row, m.regs[op.P1:op.P1+op.P2])
 			rows = append(rows, row)
@@ -1237,6 +1253,23 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 		case OpRecQueueFill:
 			if ferr := m.recQueueFill(op); ferr != nil {
 				return nil, ferr
+			}
+
+		case OpRecQueuePush:
+			q := m.recq
+			if q == nil || op.P2 != q.spec.nCol {
+				return nil, fmt.Errorf("engine: internal: recursive CTE row push with no queue or %d values", op.P2)
+			}
+			row := make([]Value, op.P2)
+			copy(row, m.regs[op.P1:op.P1+op.P2])
+			q.push(row)
+
+		case OpRecQueueCheck:
+			if m.recq == nil {
+				return nil, fmt.Errorf("engine: internal: recursive CTE check with no queue")
+			}
+			if cerr := m.recQueueCaps(m.recq); cerr != nil {
+				return nil, cerr
 			}
 
 		case OpRecQueuePop:
@@ -1303,7 +1336,16 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			m.regs[op.P2] = Value{Typ: Float, F: op.P4.(float64)}
 
 		case OpString8:
-			m.regs[op.P2] = Value{Typ: Text, S: []byte(op.P4.(string))}
+			// The constant's own bytes, not a copy per execution: a register's
+			// bytes are never written in place (SCopy and Column share them
+			// already, and OpBlob hands out its P4 slice the same way). The
+			// capacity is capped at the length, so an append can never grow
+			// into them; "" keeps the conversion, whose slice is never nil.
+			if str := op.P4.(string); str != "" {
+				m.regs[op.P2] = Value{Typ: Text, S: unsafe.Slice(unsafe.StringData(str), len(str))[:len(str):len(str)]}
+			} else {
+				m.regs[op.P2] = Value{Typ: Text, S: []byte(str)}
+			}
 
 		case OpNull:
 			m.regs[op.P2] = Value{Typ: Null}
@@ -1716,7 +1758,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				break
 			}
 			if ds.recSelf != nil {
-				cur, rerr := m.openRecursiveSelf(ds)
+				cur, rerr := m.openRecursiveSelf(ds, m.cursors[op.P1])
 				if rerr != nil {
 					return nil, rerr
 				}
@@ -2328,6 +2370,19 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			tbl := op.P4.(*tableMeta)
 			var rid uint64
 			var rerr error
+			// Rows a bulk load holds (insert_bulk_direct.go) are not in the
+			// row store every rowid rule below reads. A plain table's next
+			// rowid only has to clear the last one the load took; anything
+			// else -- AUTOINCREMENT, a replication rowid range, a load already
+			// at the largest rowid, whose next one C picks at random among
+			// the unused -- gets them back in the row store first.
+			bl := tbl.bulk
+			if bl != nil && bl.any && (tbl.autoIncrement || m.wctx.db.rowidLo < m.wctx.db.rowidHi || int64(bl.last) == math.MaxInt64) {
+				if derr := m.bulkDrain(bl, tbl); derr != nil {
+					return nil, derr
+				}
+				bl = nil
+			}
 			switch db := m.wctx.db; {
 			case tbl.autoIncrement:
 				rid, rerr = m.wctx.aincNewRowid(tbl)
@@ -2336,6 +2391,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			if rerr != nil {
 				return nil, rerr
+			}
+			if bl != nil && bl.any && !rowidLess(bl.last, rid) {
+				rid = bl.last + 1
 			}
 			m.regs[op.P2] = Value{Typ: Int, I: int64(rid)}
 
@@ -2722,4 +2780,21 @@ func (m *vdbe) recAlloc(n int) []Value {
 	out := m.recChunk[:n:n]
 	m.recChunk = m.recChunk[n:]
 	return out
+}
+
+// reuseSubCache is a cleared sub-cache of n entries in s's storage when it is
+// big enough: a pooled machine keeps its slice, and a recursive CTE runs its
+// step program on one per row, so allocating it each time was one allocation
+// per row of every recursive INSERT. Cleared, so no earlier run's cached rows
+// are visible -- or kept alive.
+func reuseSubCache(s []subCacheEntry, n int) []subCacheEntry {
+	if n == 0 {
+		return nil
+	}
+	if cap(s) < n {
+		return make([]subCacheEntry, n)
+	}
+	s = s[:n]
+	clear(s)
+	return s
 }

@@ -12,14 +12,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/samyfodil/musql/engine"
 	_ "github.com/samyfodil/musql/driver"
+	"github.com/samyfodil/musql/engine"
 )
 
 const n4CrossProcessEnvVar = "MUSQL_N4_CROSSPROCESS_HELPER"
@@ -213,6 +214,9 @@ func n4ParseReaderOutput(out string) (reads, errs int, err error) {
 // every writer subprocess's own reported alive-id set -- no lost updates,
 // no phantom rows, across a REAL process boundary.
 func TestN4CrossProcess(t *testing.T) {
+	if runtime.GOOS == "js" {
+		t.Skip("js/wasm: no subprocesses (pipe is not implemented), and no other process can open the file")
+	}
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "n4-crossprocess.db")
