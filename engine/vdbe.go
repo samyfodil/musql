@@ -7,6 +7,7 @@
 package engine
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"sort"
@@ -223,6 +224,9 @@ type vdbe struct {
 	yield    bool
 	resumePC int
 	done     bool
+
+	// likePlan is the last LIKE pattern this machine analysed (likePlanFor).
+	likePlan *likePlan
 
 	// firstRow stops the run at its first result row, handing back one empty
 	// row instead of a copy: all EXISTS asks is whether there is one.
@@ -918,6 +922,19 @@ func (prog *Program) execWithParentRun(parent *vdbe, pager *ReadOnlyPager, first
 	return rows, err
 }
 
+// likePlanFor is pat analysed for the byte matcher, reused while the pattern
+// stays the same -- which a constant pattern does for the whole run.
+func (m *vdbe) likePlanFor(pat Value) *likePlan {
+	if pat.Typ != Text {
+		return nil
+	}
+	if lp := m.likePlan; lp != nil && bytes.Equal(lp.src, pat.S) {
+		return lp
+	}
+	m.likePlan = newLikePlan(pat.S)
+	return m.likePlan
+}
+
 // outerCtxUnread reports whether no instruction of prog can read the
 // machine's enclosing evalCtx (m.outer), so a correlated run need not build it:
 // buildOuterEvalCtx gathers the whole outer row, on every run, once per outer
@@ -1405,7 +1422,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			} else {
 				cs := m.likeCaseSensitive()
 				var matched bool
-				if hasEsc {
+				if lp := m.likePlanFor(pat); !hasEsc && x.Typ == Text && lp != nil && lp.ok {
+					matched = lp.match(x.S, cs)
+				} else if hasEsc {
 					matched = likeMatchEscape(valueToText(pat), valueToText(x), esc, cs)
 				} else {
 					matched = likeMatch(valueToText(pat), valueToText(x), cs)
