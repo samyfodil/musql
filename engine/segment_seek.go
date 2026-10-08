@@ -87,16 +87,24 @@ func (p *ReadOnlyPager) SeekRowidSegments(rootPage uint32, rid int64) (vals []Va
 // An index seek only prunes: the WHERE conjunct is re-evaluated on every row,
 // so overestimating is slow but safe. Results are ascending rowid.
 func (src *segSource) seekIndexRowids(rootPage uint32, col int, probe Value) (rowids []int64, served bool) {
-	// Committed blocks first: byRoot is populated only for tables with no
-	// uncommitted writes, so when it's present the disk index is correct and free.
-	if segs, have := src.byRoot[rootPage]; have && src.deltaIsSmallFor(rootPage, segs) {
+	// Committed blocks first, unless the session holds this table's rows
+	// live: byRoot is not a promise that it holds none -- after another
+	// connection's commit rebases the session, byRoot holds the new committed
+	// segments while this transaction's own rows are still live, and the
+	// committed index alone lost them (a replication op log reused a seq it had
+	// just written, as max(seq) WHERE site=? could not see it). An unloaded
+	// table has not been written by the session (segSource.unloaded), so it
+	// keeps the fast path without being loaded.
+	if segs, have := src.byRoot[rootPage]; have && src.live[rootPage] == nil && src.deltaIsSmallFor(rootPage, segs) {
 		if out, ok := segIndexRowids(segs, col, probe); ok {
 			return src.withDeltaRowids(rootPage, out), true
 		}
 	}
-	if rows, live, err := src.liveRows(rootPage); err != nil {
+	rows, live, err := src.liveRows(rootPage)
+	if err != nil {
 		return nil, false // the caller scans, and the scan reports the error
-	} else if live {
+	}
+	if live {
 		// Row store index is int64-only; TEXT/BLOB probes against dirty tables scan.
 		if probe.Typ != Int {
 			return nil, false
