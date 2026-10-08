@@ -139,7 +139,10 @@ type vdbeCursor struct {
 	// the third stream kind. segCur non-nil means the current row lives in a
 	// segment rather than in a decoded record: readColumn fetches one column
 	// from it, and rowVals holds nothing anyone may read.
-	segSrc           *segRowSource
+	segSrc *segRowSource
+	// pointSrc is the source a rowid point seek positions (segPointSeek),
+	// held here so a seek per outer row allocates none.
+	pointSrc         segRowSource
 	segCur           *segment
 	segRow           int
 	segFilter        *segRowFilter // the compiled pre-filter from OpRewind's P4
@@ -493,7 +496,7 @@ func (cur *vdbeCursor) rewind() error {
 			// Positioned, not built, when the segments are the whole answer:
 			// columns are read one at a time as the program asks for them.
 			// Not marked materialized, so the next rewind seeks again.
-			if src, served := cur.pager.segPointSeek(cur, cur.seekKey); served {
+			if src, served := cur.pager.segPointSeek(cur, cur.seekKey, &cur.pointSrc); served {
 				cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
 				cur.segSrc, cur.segCur = src, nil
 				if src != nil {
