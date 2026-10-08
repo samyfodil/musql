@@ -55,7 +55,18 @@ func TestSemiJoinCountMatchesTheLoop(t *testing.T) {
 		{`SELECT count(*) FROM t WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.id = t.bid)`, nil, true},                          // anti-join
 		{`SELECT count(*) FROM t WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.id = t.bid AND b.w > 4.5) AND k = 1`, nil, true},
 		{`SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.id = t.bid) AND NOT EXISTS (SELECT 1 FROM b WHERE b.id = t.id)`, nil, true},
-		{`SELECT count(*) FROM t WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.id = t.n)`, nil, false},                                       // NULL keys: NOT EXISTS is true for them
+		{`SELECT count(*) FROM t WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.id = t.n)`, nil, false}, // NULL keys: NOT EXISTS is true for them
+		// IN over a rowid subquery: the semi-join (segInAsSemi).
+		{`SELECT count(*) FROM t WHERE bid IN (SELECT id FROM b WHERE id < ?)`, []Value{iv(1000)}, true},
+		{`SELECT count(*) FROM t WHERE bid NOT IN (SELECT id FROM b WHERE w > 4.5)`, nil, true},
+		{`SELECT count(*) FROM t WHERE k = 1 AND id IN (SELECT id FROM b)`, nil, true},
+		// IN over any other column: the hashed set (in_hash.go).
+		{`SELECT count(*) FROM t WHERE bid IN (SELECT w * 2 FROM b)`, nil, true},
+		{`SELECT count(*) FROM t WHERE k IN (SELECT length(s) FROM b WHERE w < 3)`, nil, true},
+		{`SELECT count(*) FROM t WHERE bid NOT IN (SELECT CASE WHEN id = 4 THEN NULL ELSE id END FROM b)`, nil, true},                    // a NULL in the set
+		{`SELECT count(*) FROM t WHERE n IN (SELECT id FROM b)`, nil, false},                                                             // NULLs in the probe column
+		{`SELECT count(*) FROM t WHERE bid IN (SELECT id FROM b WHERE b.w > t.k)`, nil, false},                                           // correlated
+		{`SELECT count(*) FROM t WHERE (bid, k) IN (SELECT id, 1 FROM b)`, nil, false},                                                   // a row value
 		{`SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.id = t.bid AND b.id < ?)`, []Value{{Typ: Float, F: 10.5}}, false}, // a REAL bound on the rowid
 		{`SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.id = t.bid AND b.id < ?)`, []Value{{Typ: Null}}, false},
 	}

@@ -50,8 +50,10 @@ type segFilterPlan struct {
 	isSum  bool
 	sumCol int
 
-	// semis are correlated EXISTS answered as semi-joins; a count only.
+	// semis are correlated EXISTS answered as semi-joins, and ins uncorrelated
+	// IN subqueries answered from their hashed rows; a count only.
 	semis []segPlanSemi
+	ins   []segPlanIn
 }
 
 // segPlanPred is a predicate whose bound is a literal, or the 1-based index of
@@ -176,6 +178,7 @@ func segPeephole(prog *Program) bool {
 	// (segment_semijoin.go).
 	var preds []segPlanPred
 	var semis []segPlanSemi
+	var insubs []segPlanIn
 	pc := rewindAt + 1
 	for {
 		more, npc, ok := segParsePredBlock(in, pc, predEnd, in[rewindAt].P1, nextAt)
@@ -183,13 +186,22 @@ func segPeephole(prog *Program) bool {
 			return false
 		}
 		preds, pc = append(preds, more...), npc
-		sj, npc, ok := segParseSemiGroup(in, pc, predEnd, in[rewindAt].P1, nextAt)
-		if !ok {
-			break
+		if sj, npc, ok := segParseSemiGroup(in, pc, predEnd, in[rewindAt].P1, nextAt); ok {
+			semis, pc = append(semis, sj), npc
+			continue
 		}
-		semis, pc = append(semis, sj), npc
+		if pi, npc, ok := segParseInGroup(in, pc, predEnd, in[rewindAt].P1, nextAt); ok {
+			if sj, isSemi := segInAsSemi(pi); isSemi {
+				semis = append(semis, sj)
+			} else {
+				insubs = append(insubs, pi)
+			}
+			pc = npc
+			continue
+		}
+		break
 	}
-	if len(semis) > 0 && isSum {
+	if (len(semis) > 0 || len(insubs) > 0) && isSum {
 		return false // the semi-join answers a count only
 	}
 	// Zero, one or two. One was excluded only because the first scalar kernel
@@ -219,7 +231,7 @@ func segPeephole(prog *Program) bool {
 	out = append(out, in[0], in[1], in[2])
 	guardTarget := len(in) + 1 // the duplicated tail, after every shifted insn
 	out = append(out, Instruction{Op: OpSegFilterCount, P1: dst, P2: in[rewindAt].P1, P3: guardTarget,
-		P4: &segFilterPlan{preds: preds, isSum: isSum, sumCol: sumCol, semis: semis}})
+		P4: &segFilterPlan{preds: preds, isSum: isSum, sumCol: sumCol, semis: semis, ins: insubs}})
 	// Everything from the third instruction on -- which is OpAutoIndexOrder when
 	// there is one, then the Rewind -- one address later than it was.
 	for _, ins := range in[3:] {
@@ -406,13 +418,22 @@ func segJumpsP2(op OpCode) bool {
 }
 
 // segLooksLikePredGroup reports whether the Column at pc starts a predicate
-// group rather than, say, a GROUP BY key load: its IfNot sits three or (after a
-// Negative) four instructions on.
+// group rather than, say, a GROUP BY key load or an IN probe: a comparison and
+// then its IfNot, three or (after a Negative) four instructions on.
 func segLooksLikePredGroup(in []Instruction, pc, limit int) bool {
-	if in[pc+3].Op == OpIfNot {
+	if in[pc+3].Op == OpIfNot && segIsCompare(in[pc+2].Op) {
 		return true
 	}
-	return pc+4 < limit && in[pc+2].Op == OpNegative && in[pc+4].Op == OpIfNot
+	return pc+4 < limit && in[pc+2].Op == OpNegative && segIsCompare(in[pc+3].Op) && in[pc+4].Op == OpIfNot
+}
+
+// segIsCompare reports whether op is one of the six comparison opcodes.
+func segIsCompare(op OpCode) bool {
+	switch op {
+	case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
+		return true
+	}
+	return false
 }
 
 // false for anything that is not one of the six.

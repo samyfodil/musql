@@ -206,7 +206,7 @@ func (p *ReadOnlyPager) segCleanSegments(rootPage uint32) ([]*segment, bool) {
 
 // segSemiCountTable counts the rows of tRoot (whose table is tTbl) satisfying
 // preds and every semi-join, or reports false to decline.
-func (p *ReadOnlyPager) segSemiCountTable(tRoot uint32, tTbl *resolvedTable, preds []segPred, semis []segSemi) (int, bool) {
+func (p *ReadOnlyPager) segSemiCountTable(tRoot uint32, tTbl *resolvedTable, preds []segPred, semis []segSemi, ins []segIn) (int, bool) {
 	tSegs, ok := p.segCleanSegments(tRoot)
 	if !ok || tTbl == nil {
 		return 0, false
@@ -247,6 +247,20 @@ func (p *ReadOnlyPager) segSemiCountTable(tRoot uint32, tTbl *resolvedTable, pre
 			}
 			keys[i] = col
 		}
+		inCols := make([][]int64, len(ins))
+		for i, si := range ins {
+			if si.col == tTbl.ipkIndex {
+				continue // nil: read the rowid
+			}
+			if !segPredColsFilterable(s, []segPred{{Col: si.col}}) {
+				return 0, false
+			}
+			col, ok := s.Int64Column(si.col)
+			if !ok {
+				return 0, false
+			}
+			inCols[i] = col
+		}
 		for lo := 0; lo < s.nRows; lo += segFilterBatch {
 			live := flags[:min(lo+segFilterBatch, s.nRows)-lo]
 			for i := range live {
@@ -271,6 +285,18 @@ func (p *ReadOnlyPager) segSemiCountTable(tRoot uint32, tTbl *resolvedTable, pre
 						in = false
 						break
 					}
+				}
+				for i, si := range ins {
+					if !in {
+						break
+					}
+					var k int64
+					if inCols[i] == nil {
+						k = int64(s.Rowid(lo + r))
+					} else {
+						k = inCols[i][lo+r]
+					}
+					in = si.passes(k)
 				}
 				if in {
 					total++
@@ -379,4 +405,122 @@ func (p *ReadOnlyPager) segSemiBuild(sj segSemi) (*segRowidSet, bool) {
 		}
 	}
 	return set, true
+}
+
+// segPlanIn is "col IN (uncorrelated subquery)" in the filtered count: the
+// outer column, and the OpInSub whose cached rows form the set.
+type segPlanIn struct {
+	col  int
+	slot int
+	plan *inSubPlan
+}
+
+// segParseInGroup reads "Column cursor.col -> r; [SCopy r -> x;] InSub x ->
+// dest; IfNot dest -> next" for a single-column, uncorrelated IN.
+func segParseInGroup(in []Instruction, pc, limit, cursor, nextAt int) (segPlanIn, int, bool) {
+	var no segPlanIn
+	if pc+2 >= limit || in[pc].Op != OpColumn || in[pc].P1 != cursor {
+		return no, 0, false
+	}
+	col, reg, p := in[pc].P2, in[pc].P3, pc+1
+	if in[p].Op == OpSCopy && in[p].P1 == reg {
+		reg, p = in[p].P2, p+1
+	}
+	if p+1 >= limit {
+		return no, 0, false
+	}
+	sub, test := in[p], in[p+1]
+	plan, ok := sub.P4.(*inSubPlan)
+	if sub.Op != OpInSub || !ok || plan == nil || plan.correlated || len(plan.affs) != 1 || sub.P1 != reg ||
+		test.Op != OpIfNot || test.P1 != sub.P2 || test.P2 != nextAt || test.P3 != 1 {
+		return no, 0, false
+	}
+	return segPlanIn{col: col, slot: sub.P3, plan: plan}, p + 2, true
+}
+
+// segIn is a segPlanIn resolved for this run: its set, built from the
+// subquery's rows exactly as OpInSub builds it.
+type segIn struct {
+	col int
+	set *inHashSet
+	not bool
+}
+
+// segIns runs each IN's subquery once (its rows are cached, as OpInSub's are)
+// and builds its set; false declines.
+func (m *vdbe) segIns(plan []segPlanIn) ([]segIn, bool) {
+	out := make([]segIn, len(plan))
+	for i, pi := range plan {
+		rows, err := m.runSub(false, pi.slot, pi.plan.prog)
+		if err != nil {
+			return nil, false
+		}
+		set := m.inSetFor(pi.plan, pi.slot, rows)
+		if set == nil {
+			return nil, false
+		}
+		out[i] = segIn{col: pi.col, set: set, not: pi.plan.not}
+	}
+	return out, true
+}
+
+// passes reports whether the IN's result for integer v is TRUE -- a NULL
+// result (NOT IN over a set holding NULL) filters the row out, as WHERE does.
+func (si segIn) passes(v int64) bool {
+	r := si.set.membership(Value{Typ: Int, I: v}, si.not)
+	return r.Typ == Int && r.I != 0
+}
+
+// segInAsSemi recognizes "col IN (SELECT <rowid alias> FROM b WHERE <plain
+// predicates>)" as the semi-join it is: the set is b's qualifying rowids, built
+// from b's blocks without materializing the subquery's rows. NOT IN is the
+// anti-join, which is exact because the set holds no NULL (a rowid never is)
+// and the probe's key column, which segSemiCountTable requires to be a clean
+// int64 block, holds none either. A TEXT comparison affinity, which would turn
+// the key into text, keeps the hashed set.
+func segInAsSemi(pi segPlanIn) (segPlanSemi, bool) {
+	var no segPlanSemi
+	plan := pi.plan
+	if plan == nil || plan.prog == nil || plan.affs[0] == affText {
+		return no, false
+	}
+	sub := plan.prog.Insns
+	if plan.prog.Compound != nil || plan.prog.LiveSource != nil || len(sub) < 8 || sub[0].Op != OpInit || sub[0].P2 != 1 {
+		return no, false
+	}
+	open, rew := sub[1], sub[2]
+	bt, ok := open.P4.(*resolvedTable)
+	if open.Op != OpOpenRead || open.P3 != 0 || !ok || bt == nil || bt.withoutRowid || bt.ipkIndex < 0 ||
+		rew.Op != OpRewind || rew.P1 != open.P1 {
+		return no, false
+	}
+	b := open.P1
+	// The tail: Column b.ipk -> r; [SCopy r -> o;] ResultRow o 1; Next b -> top;
+	// Close b; Halt.
+	n := len(sub)
+	if sub[n-1].Op != OpHalt || sub[n-2].Op != OpClose || sub[n-2].P1 != b || sub[n-3].Op != OpNext || sub[n-3].P1 != b || sub[n-3].P2 != 3 {
+		return no, false
+	}
+	if rew.P2 != n-2 {
+		return no, false
+	}
+	nextAt, row := n-3, sub[n-4]
+	if row.Op != OpResultRow || row.P2 != 1 {
+		return no, false
+	}
+	p := n - 5
+	out := row.P1
+	if sub[p].Op == OpSCopy && sub[p].P2 == out {
+		out, p = sub[p].P1, p-1
+	}
+	if c := sub[p]; c.Op != OpColumn || c.P1 != b || c.P2 != bt.ipkIndex || c.P3 != out {
+		if c.Op != OpRowid || c.P1 != b || c.P2 != out {
+			return no, false
+		}
+	}
+	preds, end, ok := segParsePredBlock(sub, 3, p, b, nextAt)
+	if !ok || end != p {
+		return no, false
+	}
+	return segPlanSemi{keyCol: pi.col, bRoot: uint32(open.P2), bTbl: bt, bPreds: preds, anti: plan.not}, true
 }

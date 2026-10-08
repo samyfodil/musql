@@ -825,6 +825,9 @@ type subCacheEntry struct {
 	done   bool
 	rows   [][]Value
 	rowids []int64
+	// inSet is an IN's membership set over rows (in_hash.go), keyed by the
+	// rows it was built from.
+	inSet *inHashSet
 }
 
 // derivedSource is OpOpenDerived's P4. Exactly one of these is set:
