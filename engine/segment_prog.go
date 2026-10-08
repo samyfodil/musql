@@ -4,6 +4,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/samyfodil/musql/internal/jit"
 )
@@ -87,7 +88,11 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 		return Value{}, false
 	}
 
-	regs := make([]int64, low.nRegs+2)
+	nRegs := low.nRegs
+	if low.textVar != nil {
+		nRegs = max(nRegs, low.textVar.nRegs)
+	}
+	regs := make([]int64, nRegs+2)
 	// Bound parameters go into the registers the body reads them from. A
 	// non-integer bound declines: every value in a compiled program is an
 	// int64, and coercing here is exactly where SQLite's cross-class ordering
@@ -133,9 +138,44 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 	}
 	ok = each(len(segs), func(si int) bool {
 		s, res := segs[si], &results[si]
-		blocks, isRowid, okCols := segProgColumns(s, low.cols, low.nullCol, ipkCol)
-		if !okCols {
-			return false
+		// The text variant over a segment whose text columns are clean TEXT;
+		// the service-only body otherwise.
+		low, kern := low, kern
+		var heaps [jit.MaxProgCols][]byte
+		if tv := low.textVar; tv != nil {
+			if tk := segProgKernel(tv); tk != nil {
+				clean := true
+				for i, isText := range tv.textCol {
+					if !isText {
+						continue
+					}
+					_, heap, okT := segVecColumn(s, tv.cols[i])
+					if !okT {
+						clean = false
+						break
+					}
+					heaps[i] = heap
+				}
+				if clean {
+					low, kern = tv, tk
+				}
+			}
+		}
+		blocks := make([][]int64, len(low.cols))
+		isRowid := make([]bool, len(low.cols))
+		for i, c := range low.cols {
+			if i < len(low.textCol) && low.textCol[i] {
+				// A text slot holds the column's cells; its heap goes in
+				// ProgArgs.Heap.
+				cells, _, _ := segVecColumn(s, c)
+				blocks[i] = unsafe.Slice((*int64)(unsafe.Pointer(unsafe.SliceData(cells))), len(cells))
+				continue
+			}
+			b, r, okCol := segProgColumns(s, low.cols[i:i+1], low.nullCol[i:i+1], ipkCol)
+			if !okCol {
+				return false
+			}
+			blocks[i], isRowid[i] = b[0], r[0]
 		}
 		// A rowid-alias column has no block of its own -- the values live in
 		// the segment's rowid block -- and the program reads a flat int64
@@ -169,6 +209,9 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 				return false
 			}
 			args.Col[i] = &b[0]
+			if h := heaps[i]; len(h) > 0 {
+				args.Heap[i] = &h[0]
+			}
 		}
 		if !segCallKernel(kern, args, svc, low.blocks, s, local) {
 			return false

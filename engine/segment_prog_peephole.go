@@ -144,6 +144,9 @@ func segProgPeephole(prog *Program) bool {
 	for _, a := range aggs {
 		if a.expr != nil && a.rowRegs[aggExprArg] != 0 {
 			base.readNatively(a.rowRegs[aggExprArg] - 1)
+			if base.textVar != nil {
+				base.textVar.readNatively(a.rowRegs[aggExprArg] - 1)
+			}
 		}
 	}
 	lows := make([]*segLowered, 0, len(aggs))
@@ -180,6 +183,18 @@ func segProgPeephole(prog *Program) bool {
 			low.insns = append(low.insns, jit.ProgInsn{Op: jit.POpAccMax, A: argReg, B: rowsReg})
 		default:
 			low.insns = append(low.insns, jit.ProgInsn{Op: jit.POpAccSum, A: argReg, B: rowsReg})
+		}
+		if tv := low.textVar; tv != nil {
+			// The same accumulate, on the same registers, in the text variant;
+			// its own row counter sits past its own registers.
+			acc := low.insns[len(low.insns)-1]
+			if a.kind != aggCountStar && a.kind != aggCount {
+				acc.B = tv.nRegs
+				tv.nRegs++
+				tv.sumReg, tv.rowsReg = low.sumReg, acc.B
+			}
+			tv.agg = low.agg
+			tv.insns = append(tv.insns, acc)
 		}
 		lows = append(lows, low)
 	}

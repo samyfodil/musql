@@ -14,7 +14,7 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		return nil, fmt.Errorf("jit: %d column blocks, max %d", nCols, MaxProgCols)
 	}
 	for _, in := range insns {
-		if in.Op == POpLoadCol && (in.B < 0 || in.B >= nCols) {
+		if (in.Op == POpLoadCol || in.Op == POpTextLen) && (in.B < 0 || in.B >= nCols) {
 			return nil, fmt.Errorf("jit: column %d out of range", in.B)
 		}
 	}
@@ -131,6 +131,8 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.Cmp(X9, xzr)
 			a.Csel(X9, X10, X9, CondL)
 			a.StrImm(X9, X1, in.A*8)
+		case POpTextLen:
+			emitTextLenArm64(a, in, colReg[in.B], progTarget(in.C, len(insns)), idx)
 		case POpService:
 			a.MovImm64(X9, int64(in.A)+1)
 			a.StrImm(X9, X0, POffPC)
@@ -233,4 +235,49 @@ func itoa(i int) string {
 		i /= 10
 	}
 	return string(b[p:])
+}
+
+// emitTextLenArm64 is emitTextLenAmd64's algorithm with NEON: UMAXV over the
+// 16 bytes is the non-ASCII test (a maximum >= 0x80), and CMEQ #0 then UMAXV
+// says whether the chunk holds the NUL, whose position the byte loop finds.
+// X9..X13 are scratch.
+func emitTextLenArm64(a *Arm, in ProgInsn, cells Reg64, fallback string, idx int) {
+	lp, chunk, tail, done, after := "tl"+itoa(idx), "tc"+itoa(idx), "tt"+itoa(idx), "td"+itoa(idx), "ta"+itoa(idx)
+	a.LdrRegIdx(X9, cells, X2)
+	a.LdrImm(X10, X0, POffHeap+in.B*8)
+	a.MovW(X13, X9)
+	a.AddReg(X10, X10, X13)
+	a.LsrImm(X11, X9, 32)
+	a.MovImm16(X12, 0)
+	a.Label(lp)
+	a.CmpImm(X11, 16)
+	a.Bcond(CondL, tail)
+	a.LdrQ(VReg(0), X10)
+	a.Umaxv16B(VReg(1), VReg(0))
+	a.UmovB0(X13, VReg(1))
+	a.CmpImm(X13, 0x80)
+	a.Bcond(CondGE, fallback)
+	a.Cmeq0_16B(VReg(1), VReg(0))
+	a.Umaxv16B(VReg(1), VReg(1))
+	a.UmovB0(X13, VReg(1))
+	a.Cbnz(X13, chunk)
+	a.AddImm(X12, X12, 16)
+	a.AddImm(X10, X10, 16)
+	a.SubsImm(X11, X11, 16)
+	a.B(lp)
+	a.Label(chunk)
+	a.MovImm16(X11, 16) // the NUL is in these 16 bytes: let the byte loop find it
+	a.Label(tail)
+	a.Cbz(X11, done)
+	a.LdrbImm(X13, X10, 0)
+	a.CmpImm(X13, 0x80)
+	a.Bcond(CondGE, fallback)
+	a.Cbz(X13, done)
+	a.AddImm(X12, X12, 1)
+	a.AddImm(X10, X10, 1)
+	a.SubsImm(X11, X11, 1)
+	a.B(tail)
+	a.Label(done)
+	a.StrImm(X12, X1, in.A*8)
+	a.Label(after)
 }

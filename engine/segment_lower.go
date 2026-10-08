@@ -31,6 +31,14 @@ type segLowered struct {
 	// blocks are the service blocks the body stops for (segment_service.go),
 	// indexed by POpService's A; none when the whole body is native.
 	blocks []segSvcBlock
+	// blockIR is the IR index of each block's POpService.
+	blockIR []int
+	// textCol marks, parallel to cols, a slot holding a TEXT column's cells
+	// (with its heap in ProgArgs.Heap) rather than an int64 block.
+	textCol []bool
+	// textVar is this body with its text operations native (POpTextLen),
+	// for a segment whose text columns are clean TEXT; nil when it has none.
+	textVar *segLowered
 }
 
 // segLowerRegOperands returns the operands of in that name a REGISTER, -1 for
@@ -118,12 +126,33 @@ func (l *segLowered) clone() *segLowered {
 	out.consts = append([]int(nil), l.consts...)
 	out.cvKind = append([]bool(nil), l.cvKind...)
 	out.cvIndex = append([]int(nil), l.cvIndex...)
+	out.blockIR = append([]int(nil), l.blockIR...)
+	out.textCol = append([]bool(nil), l.textCol...)
+	if l.textVar != nil {
+		out.textVar = l.textVar.clone()
+	}
 	return &out
 }
 
 // segLowerBody compiles the instructions of a scan loop body, or reports false
 // when it contains an opcode this does not model.
 func segLowerBody(body []Instruction, base int, cursor int, aggAt int) (*segLowered, bool) {
+	out, ok := segLowerBodyWith(body, base, cursor, aggAt, false)
+	if !ok || len(out.blocks) == 0 {
+		return out, ok
+	}
+	if tv, tok := segLowerBodyWith(body, base, cursor, aggAt, true); tok && len(tv.textCol) > 0 && slices.Contains(tv.textCol, true) {
+		out.textVar = tv
+	}
+	return out, ok
+}
+
+// segLowerBodyWith is segLowerBody, with text operations lowered natively when
+// text is set: a block computing length() of a column becomes POpTextLen over
+// that column's cells, with the block kept right after it as the fallback for
+// a cell that is not pure ASCII. Only valid over a segment whose column is
+// clean TEXT, so it is a second program beside the first, not a replacement.
+func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text bool) (*segLowered, bool) {
 	// AN OpNull ON A PATH THAT RUNS REFUSES THE WHOLE BODY, and modelling NULL
 	// any more cleverly than that is how this went wrong before.
 	//
@@ -146,6 +175,7 @@ func segLowerBody(body []Instruction, base int, cursor int, aggAt int) (*segLowe
 	out := &segLowered{}
 	colSlot := map[int]int{}         // table column -> program column slot
 	irOf := make([]int, len(body)+1) // body index -> IR index
+	var irJumps [][2]int             // POpJumps whose target is already an IR index
 	maxReg := 0
 	// One register the lowering owns, above anything the program names, for a
 	// comparison whose result the VDBE never stored.
@@ -212,6 +242,26 @@ func segLowerBody(body []Instruction, base int, cursor int, aggAt int) (*segLowe
 			// kernel for it, and a block ending in a jump branches on the flag
 			// it leaves. Nothing branches into the middle of a block.
 			if bi := blockAt[i]; bi >= 0 {
+				if col, dst, isLen := segBlockIsLength(body, svc, blocks, bi, cursor); text && isLen && len(out.cols) < jit.MaxProgCols {
+					// POpTextLen; on success jump past the block; the block
+					// itself is the fallback for a non-ASCII cell. Both targets
+					// are IR indices, patched after the jump resolution below,
+					// which reads every jump as a program address.
+					slot := len(out.cols)
+					out.cols = append(out.cols, col)
+					out.nullCol = append(out.nullCol, false)
+					for len(out.textCol) < slot {
+						out.textCol = append(out.textCol, false)
+					}
+					out.textCol = append(out.textCol, true)
+					note(dst)
+					at := len(out.insns)
+					out.insns = append(out.insns,
+						jit.ProgInsn{Op: jit.POpTextLen, A: dst, B: slot, C: at + 2},
+						jit.ProgInsn{Op: jit.POpJump})
+					irJumps = append(irJumps, [2]int{at + 1, at + 3})
+				}
+				out.blockIR = append(out.blockIR, len(out.insns))
 				out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpService, A: bi})
 				if blk := blocks[bi]; blk.flag >= 0 {
 					last := blk.insns[len(blk.insns)-1]
@@ -396,6 +446,12 @@ func segLowerBody(body []Instruction, base int, cursor int, aggAt int) (*segLowe
 			}
 			out.insns[i].A = irOf[t]
 		}
+	}
+	for _, j := range irJumps {
+		out.insns[j[0]].A = j[1]
+	}
+	for len(out.textCol) < len(out.cols) {
+		out.textCol = append(out.textCol, false)
 	}
 	if len(nullMarks) > 0 {
 		reach := segLoweredReachable(out.insns)

@@ -94,3 +94,69 @@ func TestServiceBlocksMatchTheLoop(t *testing.T) {
 		}
 	}
 }
+
+// TestNativeTextLengthMatchesTheLoop: length() over a clean TEXT column runs as
+// the kernel's POpTextLen -- SIMD over ASCII, the service block for any cell
+// with a byte >= 0x80 -- and a column with NULLs takes the service-only
+// program. Both must answer as the loop does.
+func TestNativeTextLengthMatchesTheLoop(t *testing.T) {
+	rng := rand.New(rand.NewSource(37))
+	text := func(i int) string {
+		switch i % 11 {
+		case 0:
+			return ""
+		case 1:
+			return "é" + strings.Repeat("a", rng.Intn(20))
+		case 2:
+			return strings.Repeat("b", 15+rng.Intn(3)) // around one SIMD chunk
+		case 3:
+			return strings.Repeat("c", 40+rng.Intn(10))
+		case 4:
+			return "x" + strings.Repeat("d", rng.Intn(30)) + "ü"
+		default:
+			return strings.Repeat("e", rng.Intn(25))
+		}
+	}
+	for _, withNull := range []bool{false, true} {
+		stmts := []string{`CREATE TABLE t(id INTEGER PRIMARY KEY, s TEXT, k INTEGER)`}
+		for i := 1; i <= 3000; i++ {
+			v := "'" + text(i) + "'"
+			switch {
+			case withNull && i%13 == 0:
+				v = "NULL"
+			case i%17 == 0:
+				// An embedded NUL: length() stops at it.
+				v = "'ab' || char(0) || 'cdé'"
+			case i%19 == 0:
+				v = "'" + strings.Repeat("f", 20) + "' || char(0) || 'é'"
+			}
+			stmts = append(stmts, fmt.Sprintf(`INSERT INTO t VALUES(%d, %s, %d)`, i, v, i%7))
+		}
+		p := newSegPair(t, stmts...)
+		for _, q := range []string{
+			`SELECT max(length(s)) FROM t`,
+			`SELECT min(length(s)) FROM t`,
+			`SELECT sum(length(s)) FROM t`,
+			`SELECT count(*) FROM t WHERE length(s) > 16`,
+			`SELECT count(*) FROM t WHERE length(s) = 0 OR k = 3`,
+			`SELECT sum(k) FROM t WHERE length(s) BETWEEN 15 AND 17`,
+		} {
+			_, want, werr := p.plain(q)
+			ResetSegFilterCountersForTest()
+			_, got, gerr := p.fast(q)
+			served, _ := SegFilterCountersForTest()
+			if (werr == nil) != (gerr == nil) {
+				t.Fatalf("null=%v %s: kernel error %v, loop error %v", withNull, q, gerr, werr)
+			}
+			if g, w := fmt.Sprint(typedRows(got)), fmt.Sprint(typedRows(want)); g != w {
+				t.Errorf("null=%v %s:\n kernel %s\n loop   %s", withNull, q, g, w)
+			}
+			// With NULLs, length(s) is NULL on some rows, and a NULL written
+			// back to a native register declines the statement: the loop
+			// answers, which the comparison above already checked.
+			if JITEnabled() && served == 0 && !withNull {
+				t.Errorf("null=%v %s: not served", withNull, q)
+			}
+		}
+	}
+}

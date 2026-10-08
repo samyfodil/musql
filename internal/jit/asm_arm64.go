@@ -24,6 +24,7 @@ const (
 	X10
 	X11
 	X12
+	X13
 )
 
 // xzr is the zero register, which shares encoding 31 with the stack pointer.
@@ -499,3 +500,18 @@ func (a *Arm) Sdiv(rd, rn, rm Reg64) {
 func (a *Arm) Msub(rd, rn, rm, ra Reg64) {
 	a.emit(0x9B008000 | uint32(rm)<<16 | uint32(ra)<<10 | uint32(rn)<<5 | uint32(rd))
 }
+
+// LdrQ loads the 16 bytes at [rn] into vt.
+func (a *Arm) LdrQ(vt VReg, rn Reg64) { a.emit(0x3DC00000 | uint32(rn)<<5 | uint32(vt)) }
+
+// Umaxv16B is  Bd = the largest of Vn's sixteen bytes.
+func (a *Arm) Umaxv16B(vd, vn VReg) { a.emit(0x6E30A800 | uint32(vn)<<5 | uint32(vd)) }
+
+// Cmeq0_16B is  Vd.16B[i] = 0xFF where Vn.16B[i] == 0, else 0.
+func (a *Arm) Cmeq0_16B(vd, vn VReg) { a.emit(0x4E209800 | uint32(vn)<<5 | uint32(vd)) }
+
+// UmovB0 is  Wd = Vn.B[0], zero-extended.
+func (a *Arm) UmovB0(rd Reg64, vn VReg) { a.emit(0x0E013C00 | uint32(vn)<<5 | uint32(rd)) }
+
+// MovW is  Wd = Wm: the low 32 bits, zero-extended into Xd.
+func (a *Arm) MovW(rd, rm Reg64) { a.emit(0x2A0003E0 | uint32(rm)<<16 | uint32(rd)) }

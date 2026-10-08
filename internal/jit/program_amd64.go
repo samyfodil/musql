@@ -14,7 +14,7 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		return nil, fmt.Errorf("jit: %d column blocks, max %d", nCols, MaxProgCols)
 	}
 	for _, in := range insns {
-		if in.Op == POpLoadCol && (in.B < 0 || in.B >= nCols) {
+		if (in.Op == POpLoadCol || in.Op == POpTextLen) && (in.B < 0 || in.B >= nCols) {
 			return nil, fmt.Errorf("jit: column %d out of range", in.B)
 		}
 	}
@@ -160,6 +160,8 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.MovMemReg(RDI, POffRow, RCX)
 			a.Jmp("fin")
 			a.Label(svcLabel(in.A))
+		case POpTextLen:
+			emitTextLenAmd64(a, in, colReg[in.B], progTarget(in.C, len(insns)), idx)
 		case POpAccCount:
 			a.IncReg(R8)
 		case POpEmitRow:
@@ -255,4 +257,61 @@ func emitProgResume(a *Asm, insns []ProgInsn) {
 		}
 	}
 	a.Jmp("done") // no such service: finish rather than guess
+}
+
+// emitTextLenAmd64 counts the TEXT cell's characters before its first NUL, 16
+// bytes at a time while 16 remain in the cell (so it never reads past it),
+// then a byte at a time. PMOVMSKB of the bytes is their high bits, the
+// non-ASCII test; against zero it finds the NUL. RAX, RDX, R10 and R11 are
+// scratch; R11 is re-zeroed after, because POpAccSum's SETO relies on its
+// upper bytes being zero.
+func emitTextLenAmd64(a *Asm, in ProgInsn, cells Reg, fallback string, idx int) {
+	lp, nul, tail, done, fb, after := "tl"+itoa(idx), "tn"+itoa(idx), "tt"+itoa(idx), "td"+itoa(idx), "tf"+itoa(idx), "ta"+itoa(idx)
+	a.MovRegMemIdx(RAX, cells, RCX)
+	a.MovRegMem(R10, RDI, int8(POffHeap+in.B*8))
+	a.MovRegReg32(R11, RAX)
+	a.AddRegReg(R10, R11)
+	a.MovRegReg(RDX, RAX)
+	a.ShrRegImm8(RDX, 32)
+	a.XorRegReg(R11, R11)
+	a.Label(lp)
+	a.CmpRegImm32(RDX, 16)
+	a.Jcc(CondL, tail)
+	a.MovdquLoad(X0, R10)
+	a.Pmovmskb(RAX, X0)
+	a.TestRegReg(RAX, RAX)
+	a.Jcc(CondNE, fb)
+	a.Pxor(X1, X1)
+	a.Pcmpeqb(X1, X0)
+	a.Pmovmskb(RAX, X1)
+	a.TestRegReg(RAX, RAX)
+	a.Jcc(CondNE, nul)
+	a.AddRegImm8(R11, 16)
+	a.AddRegImm8(R10, 16)
+	a.AddRegImm8(RDX, -16)
+	a.Jmp(lp)
+	a.Label(nul)
+	a.BsfRegReg(RAX, RAX)
+	a.AddRegReg(R11, RAX)
+	a.Jmp(done)
+	a.Label(tail)
+	a.TestRegReg(RDX, RDX)
+	a.Jcc(CondE, done)
+	a.MovzxByte(RAX, R10)
+	a.TestRegImm8(RAX, 0x80)
+	a.Jcc(CondNE, fb)
+	a.TestRegReg(RAX, RAX)
+	a.Jcc(CondE, done)
+	a.IncReg(R11)
+	a.IncReg(R10)
+	a.DecReg(RDX)
+	a.Jmp(tail)
+	a.Label(done)
+	a.MovMemReg32(RSI, in.A, R11)
+	a.XorRegReg(R11, R11)
+	a.Jmp(after)
+	a.Label(fb)
+	a.XorRegReg(R11, R11)
+	a.Jmp(fallback)
+	a.Label(after)
 }

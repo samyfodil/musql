@@ -200,6 +200,13 @@ const (
 	// again, so Go's stack, GC and preemption only ever see Go frames.
 	POpService
 
+	// POpTextLen: r[A] = length() of the TEXT cell in column slot B -- its
+	// characters before the first NUL. Pure ASCII is counted natively, a
+	// SIMD chunk at a time; a cell with any byte >= 0x80 jumps to IR index C
+	// instead, where the lowering puts the service that counts it the way
+	// SQLite's UTF-8 reader does.
+	POpTextLen
+
 	// POpEmitRow appends the current row index to Sel and counts it in the
 	// accumulator, which the epilogue leaves in *Out. It is what turns a
 	// compiled predicate into a SELECTION rather than a tally: the program
@@ -254,6 +261,9 @@ type ProgArgs struct {
 	Sel      *int64              // POpEmitRow's selection buffer          (64)
 	PC       int64               // EmitVM: the pc to enter at, and on return the pc to resume at (72); EmitProgram: the service to resume after, 1-based, 0 to start
 	Row      int64               // EmitProgram: the loop index a POpService stopped at (80)
+	// Heap is, per column slot holding TEXT cells, the base of the bytes those
+	// cells point into (88..). A cell is offset | length<<32.
+	Heap [MaxProgCols]*byte
 }
 
 // Byte offsets of ProgArgs' fields, asserted by TestProgArgsLayout.
@@ -266,6 +276,7 @@ const (
 	POffSel      = POffOverflow + 8
 	POffPC       = POffSel + 8
 	POffRow      = POffPC + 8
+	POffHeap     = POffRow + 8
 )
 
 // progHasService reports whether a program can stop for a service, and so

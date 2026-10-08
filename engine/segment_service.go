@@ -220,7 +220,12 @@ func segBuildBlocks(body []Instruction, svc []bool, base int, flagFrom int) (blo
 		}
 		b := segSvcBlock{flag: -1}
 		start := i
-		for i < len(body) && svc[i] && (i == start || !target[i]) {
+		computed := false // the block already made a call or a test
+		for i < len(body) && svc[i] && (i == start || !target[i]) && !(computed && body[i].Op == OpColumn) {
+			switch body[i].Op {
+			case OpFunction, OpLike, OpGlob, OpConcat, OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
+				computed = true
+			}
 			b.insns = append(b.insns, body[i])
 			_, _, jump, _ := segInsnRegs(body[i])
 			i++
@@ -420,4 +425,73 @@ func (l *segLowered) readNatively(r int) {
 			b.writeBack = append(b.writeBack, r)
 		}
 	}
+}
+
+// segBlockIsLength reports whether block bi is exactly "length(col)" into one
+// register native code reads: Column, any SCopys of it, and the one-argument
+// built-in length, nothing loaded and nothing else written back -- and that no
+// other block reads what it leaves in the window, since POpTextLen skips it.
+func segBlockIsLength(body []Instruction, svc []bool, blocks []segSvcBlock, bi, cursor int) (col, dst int, ok bool) {
+	b := &blocks[bi]
+	if len(b.load) != 0 || b.flag >= 0 || len(b.writeBack) > 1 || len(b.insns) < 2 {
+		return 0, 0, false
+	}
+	// Column, SCopys of it, length(), then any SCopys of its result -- an
+	// aggregate's argument is copied into the aggregate's own register.
+	colOf := map[int]int{}
+	called := false
+	for _, in := range b.insns {
+		switch {
+		case !called && in.Op == OpColumn && in.P1 == cursor:
+			colOf[in.P3] = in.P2
+		case !called && in.Op == OpSCopy:
+			c, have := colOf[in.P1]
+			if !have {
+				return 0, 0, false
+			}
+			colOf[in.P2] = c
+		case !called && in.Op == OpFunction:
+			name, _ := in.P4.(string)
+			c, have := colOf[in.P1]
+			if !have || in.P2 != 1 || r33sFoldIdent(name) != "length" {
+				return 0, 0, false
+			}
+			col, dst, called = c, in.P3, true
+		case called && in.Op == OpSCopy && in.P1 == dst:
+			colOf[dst] = col // the earlier result is a window register now
+			dst = in.P2
+		default:
+			return 0, 0, false
+		}
+	}
+	// The result is written back, or read by no one at all (a min()/max()
+	// census copy the kernel never consults): POpTextLen writes it either way.
+	if !called || (len(b.writeBack) == 1 && b.writeBack[0] != dst) {
+		return 0, 0, false
+	}
+	for obi, ob := range blocks {
+		if obi == bi {
+			continue
+		}
+		for _, in := range ob.insns {
+			r, _, _, _ := segInsnRegs(in)
+			for _, x := range r {
+				if _, written := colOf[x]; written {
+					return 0, 0, false
+				}
+			}
+		}
+	}
+	return col, dst, true
+}
+
+// segVecColumn is column c of s when it is clean TEXT: every row a TEXT
+// value, no NULL (so no row predates the column) and no exception -- what a
+// text operation in a kernel may read as cells.
+func segVecColumn(s *segment, c int) (cells []uint64, heap []byte, ok bool) {
+	if c < 0 || c >= len(s.cols) || s.cols[c].phys != PhysText {
+		return nil, nil, false
+	}
+	cells, heap, ok = s.BytesColumn(c)
+	return cells, heap, ok && len(cells) >= s.nRows
 }

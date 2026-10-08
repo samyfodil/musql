@@ -42,7 +42,7 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	}
 	n := len(insns)
 	for i, in := range insns {
-		if in.Op == POpLoadCol && (in.B < 0 || in.B >= nCols) {
+		if (in.Op == POpLoadCol || in.Op == POpTextLen) && (in.B < 0 || in.B >= nCols) {
 			return nil, fmt.Errorf("jit: column %d out of range", in.B)
 		}
 		switch in.Op {
@@ -59,6 +59,7 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		colEnd[c] = w.Local(wI32)
 	}
 	t1, t2, t3 := w.Local(wI64), w.Local(wI64), w.Local(wI64)
+	tp, tl, tc, tb := w.Local(wI32), w.Local(wI32), w.Local(wI64), w.Local(wI32) // POpTextLen
 
 	w.LoadPtr(POffRegs)
 	w.Set(regs)
@@ -203,6 +204,8 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			w.BrIf(depthTo(i, in.A))
 		case POpNot:
 			storeReg(in.A, func() { loadReg(in.B); w.op(opI64Eqz); bool64() })
+		case POpTextLen:
+			emitTextLenWasm(w, in, regs, colEnd[in.B], idx, tp, tl, tc, tb, depthTo(i, in.C))
 		case POpService:
 			// Stop: PC = service+1, Row = idx, then out to $done past the
 			// "finished" store, so the epilogue saves acc and ovf as usual.
@@ -408,4 +411,143 @@ func emitCheckedArith(w *Wasm, op POp, a, b, dst, ovf uint32) {
 	w.op(opI64ExtendI32U)
 	w.op(opI64Or)
 	w.Set(ovf)
+}
+
+// emitTextLenWasm is emitTextLenAmd64's algorithm in SIMD128: i8x16.bitmask
+// of the bytes is their high bits, the non-ASCII test, and of an i8x16.eq
+// against zero the NULs, whose first one i32.ctz finds. The chunk is loaded
+// twice rather than kept in a v128 local. fallbackDepth is the branch depth
+// from instruction i to its fallback target. Structure:
+//
+//	block $after
+//	  block $fb
+//	    block $done
+//	      loop $lp
+//	        block $tail  -- 16-byte chunks while 16 remain
+//	          block $nonul
+//	          end
+//	        end
+//	        loop $tl2    -- then one byte at a time
+//	        end
+//	      end
+//	    end
+//	    r[A] = count; br $after
+//	  end
+//	  br fallback
+//	end
+func emitTextLenWasm(w *Wasm, in ProgInsn, regs, colEnd, idx, tp, tl, tc, tb uint32, fallbackDepth uint32) {
+	const (
+		i32Load8U  = 0x2D
+		i32Sub     = 0x6B
+		i32Ctz     = 0x68
+		i32LtU     = 0x49
+		i64ShrU    = 0x88
+		i8x16Splat = 0x0F
+		i8x16Eq    = 0x23
+		i8x16Bmask = 0x64
+	)
+	v128Load := func() { w.Get(tp); w.op(opSIMD, simdV128Load, 0, 0) }
+	// cell = Col[B][row]; tp = heap + offset; tl = length; tc = 0.
+	w.Get(colEnd)
+	w.Get(idx)
+	w.op(opI32WrapI64)
+	w.I32(3)
+	w.op(opI32Shl)
+	w.op(opI32Add)
+	w.LoadI64(0)
+	w.Set(tc)
+	w.LoadPtr(uint32(POffHeap + in.B*8))
+	w.Get(tc)
+	w.op(opI32WrapI64)
+	w.op(opI32Add)
+	w.Set(tp)
+	w.Get(tc)
+	w.I64(32)
+	w.op(i64ShrU)
+	w.op(opI32WrapI64)
+	w.Set(tl)
+	w.I64(0)
+	w.Set(tc)
+
+	w.op(opBlock, opVoid) // $after
+	w.op(opBlock, opVoid) // $fb
+	w.op(opBlock, opVoid) // $done
+	w.op(opLoop, opVoid)  // $lp
+	w.op(opBlock, opVoid) // $tail: $tail 0, $lp 1, $done 2, $fb 3
+	w.Get(tl)
+	w.I32(16)
+	w.op(i32LtU)
+	w.BrIf(0)
+	v128Load()
+	w.Simd(i8x16Bmask)
+	w.BrIf(3) // a byte >= 0x80: $fb
+	w.op(opBlock, opVoid) // $nonul: $nonul 0, $tail 1, $lp 2, $done 3
+	v128Load()
+	w.I32(0)
+	w.Simd(i8x16Splat)
+	w.Simd(i8x16Eq)
+	w.Simd(i8x16Bmask)
+	w.Set(tb)
+	w.Get(tb)
+	w.op(opI32Eqz)
+	w.BrIf(0)
+	w.Get(tc)
+	w.Get(tb)
+	w.op(i32Ctz)
+	w.op(opI64ExtendI32U)
+	w.op(opI64Add)
+	w.Set(tc)
+	w.Br(3) // $done
+	w.op(opEnd) // $nonul
+	w.Get(tc)
+	w.I64(16)
+	w.op(opI64Add)
+	w.Set(tc)
+	w.Get(tp)
+	w.I32(16)
+	w.op(opI32Add)
+	w.Set(tp)
+	w.Get(tl)
+	w.I32(16)
+	w.op(i32Sub)
+	w.Set(tl)
+	w.Br(1) // $lp
+	w.op(opEnd) // $tail
+	w.op(opLoop, opVoid) // $tl2: $tl2 0, $lp 1, $done 2, $fb 3
+	w.Get(tl)
+	w.op(opI32Eqz)
+	w.BrIf(2)
+	w.Get(tp)
+	w.op(i32Load8U, 0, 0)
+	w.Set(tb)
+	w.Get(tb)
+	w.I32(0x80)
+	w.op(opI32GeU)
+	w.BrIf(3)
+	w.Get(tb)
+	w.op(opI32Eqz)
+	w.BrIf(2)
+	w.Get(tc)
+	w.I64(1)
+	w.op(opI64Add)
+	w.Set(tc)
+	w.Get(tp)
+	w.I32(1)
+	w.op(opI32Add)
+	w.Set(tp)
+	w.Get(tl)
+	w.I32(1)
+	w.op(i32Sub)
+	w.Set(tl)
+	w.Br(0)
+	w.op(opEnd) // $tl2
+	w.op(opEnd) // $lp
+	w.op(opEnd) // $done
+	w.Get(regs)
+	w.Get(tc)
+	w.StoreI64(uint32(in.A * 8))
+	w.Br(1) // $after
+	w.op(opEnd) // $fb
+	w.Br(fallbackDepth + 1)
+	w.op(opEnd) // $after
 }
