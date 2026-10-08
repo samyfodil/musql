@@ -87,48 +87,73 @@ func (p *ReadOnlyPager) SeekRowidSegments(rootPage uint32, rid int64) (vals []Va
 // An index seek only prunes: the WHERE conjunct is re-evaluated on every row,
 // so overestimating is slow but safe. Results are ascending rowid.
 func (src *segSource) seekIndexRowids(rootPage uint32, col int, probe Value) (rowids []int64, served bool) {
-	// Committed blocks first, unless the session holds this table's rows
-	// live: byRoot is not a promise that it holds none -- after another
-	// connection's commit rebases the session, byRoot holds the new committed
-	// segments while this transaction's own rows are still live, and the
-	// committed index alone lost them (a replication op log reused a seq it had
-	// just written, as max(seq) WHERE site=? could not see it). An unloaded
-	// table has not been written by the session (segSource.unloaded), so it
-	// keeps the fast path without being loaded.
-	if segs, have := src.byRoot[rootPage]; have && src.live[rootPage] == nil && src.deltaIsSmallFor(rootPage, segs) {
-		if out, ok := segIndexRowids(segs, col, probe); ok {
-			return src.withDeltaRowids(rootPage, out), true
-		}
-	}
+	// A table the session holds live is answered from ITS rows, never from the
+	// committed segments in byRoot: the live store is this session's view --
+	// a transaction's snapshot, its own writes -- and byRoot may be a newer
+	// file. After another connection committed, the committed index lost a
+	// transaction's own rows, and a replication op log reused a seq it had
+	// just written (max(seq) WHERE site=? could not see it).
 	rows, live, err := src.liveRows(rootPage)
 	if err != nil {
 		return nil, false // the caller scans, and the scan reports the error
 	}
-	if live {
-		// Row store index is int64-only; TEXT/BLOB probes against dirty tables scan.
-		if probe.Typ != Int {
+	if !live {
+		segs, ok := src.byRoot[rootPage]
+		if !ok || (!src.deltaIsSmallFor(rootPage, segs) && probe.Typ != Int) {
 			return nil, false
 		}
-		hits, ok := rows.eqRowids(col, probe.I)
+		out, ok := segIndexRowids(segs, col, probe)
 		if !ok {
 			return nil, false
 		}
-		out := make([]int64, len(hits))
-		for i, r := range hits {
-			out[i] = int64(r)
-		}
+		return src.withDeltaRowids(rootPage, out), true
+	}
+	// A live store over segments answers from THOSE segments' equality index
+	// -- the snapshot it was loaded from -- with every rowid it has written
+	// over them added. A seek only prunes (every row it yields is re-checked,
+	// and one the store no longer holds is dropped by the fetch), so the extra
+	// candidates are safe. Answering such a table by a scan made every TEXT,
+	// REAL and BLOB equality on a table merely loaded a full scan: 33 ms a
+	// lookup at 100k rows, against 2.8 us.
+	if out, ok := rows.snapshotIndexRowids(col, probe); ok {
 		return out, true
 	}
-	segs, ok := src.byRoot[rootPage]
-	if !ok || probe.Typ != Int {
-		// Only INTEGER probes: segment index is over int64 blocks.
+	// Row store index is int64-only; TEXT/BLOB probes against dirty tables scan.
+	if probe.Typ != Int {
+		return nil, false
+	}
+	hits, ok := rows.eqRowids(col, probe.I)
+	if !ok {
+		return nil, false
+	}
+	out := make([]int64, len(hits))
+	for i, r := range hits {
+		out[i] = int64(r)
+	}
+	return out, true
+}
+
+// snapshotIndexRowids is a segment-backed row store's equality candidates for
+// col = probe: its base segments' index hits, the base's delta rows, and every
+// rowid written over them. false when the store is not over segments, has
+// spilled, or a segment cannot index col.
+func (s *rowStore) snapshotIndexRowids(col int, probe Value) ([]int64, bool) {
+	if s == nil || s.seg == nil || s.spill != nil || s.seg.rp == nil || s.seg.rp.segs == nil {
+		return nil, false
+	}
+	base := s.seg.rp.segs
+	segs, ok := base.byRoot[s.seg.root]
+	if !ok {
 		return nil, false
 	}
 	out, ok := segIndexRowids(segs, col, probe)
 	if !ok {
 		return nil, false
 	}
-	return src.withDeltaRowids(rootPage, out), true
+	for rid := range s.m {
+		out = append(out, int64(rid))
+	}
+	return base.withDeltaRowids(s.seg.root, out), true
 }
 
 // segIndexSeeksServed counts index seeks the segments answered, for tests.
