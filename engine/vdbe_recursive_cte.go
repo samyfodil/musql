@@ -87,6 +87,12 @@ type recSelfRef struct {
 // exactly as a trigger's NEW/OLD row does, and it names the spec it belongs to
 // so a machine can never hand one CTE's row to another CTE's reference.
 type recCurrentRow struct {
+	// openRecursiveSelf's reused cursor and its row.
+	selfCur  *vdbeCursor
+	selfBuf  []Value
+	selfRows [][]Value
+	selfRids []uint64
+
 	spec *recQueueSpec
 	row  []Value
 }
@@ -557,9 +563,19 @@ func (m *vdbe) openRecursiveSelf(ds *derivedSource) (*vdbeCursor, error) {
 	if cur == nil || cur.spec != ds.recSelf || cur.row == nil {
 		return nil, fmt.Errorf("vdbe: recursive CTE %s self-reference has no current row", ds.recSelf.name)
 	}
-	row := make([]Value, len(cur.row))
-	copy(row, cur.row)
-	return openDerivedCursor(ds.tbl, [][]Value{row}, nil), nil
+	// One cursor, row buffer and backing slices, reused step after step: a
+	// recursive select may name its CTE only once, so at most one of these is
+	// live at a time, and opening a fresh cursor per step was a quarter of
+	// every byte a 100k-row recursive INSERT allocated. The struct is
+	// rebuilt whole, so nothing of the previous step survives in it.
+	cur.selfBuf = append(cur.selfBuf[:0], cur.row...)
+	clearDerivedSubtypes(cur.selfBuf, nil) // openDerivedCursor's rule
+	if cur.selfCur == nil {
+		cur.selfCur, cur.selfRows, cur.selfRids = new(vdbeCursor), make([][]Value, 1), make([]uint64, 1)
+	}
+	cur.selfRows[0], cur.selfRids[0] = cur.selfBuf, 0
+	*cur.selfCur = vdbeCursor{tbl: ds.tbl, rows: cur.selfRows, rowids: cur.selfRids, materialized: true, colMask: allColumns}
+	return cur.selfCur, nil
 }
 
 // recQueueSpilled counts rows written to a queue file, for tests.

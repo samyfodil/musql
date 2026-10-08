@@ -546,6 +546,9 @@ type DB struct {
 	// captureFull says a consumer reads the OLD images and column names, not just
 	// the segment delta. See noteRowChange for what it costs when nobody does.
 	captureFull bool
+	// commitsEachStatement: the caller commits after every autocommit
+	// statement (SetCommitsEachStatement).
+	commitsEachStatement bool
 	changeLog   []RowChange
 
 	// segments is the read side of a SEGMENT session (segment_write.go): the

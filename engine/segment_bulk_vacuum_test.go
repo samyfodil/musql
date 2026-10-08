@@ -69,3 +69,27 @@ func TestBulkLoadAndVerbatimVacuumKeepEveryRow(t *testing.T) {
 	execDB(t, path, `VACUUM`)
 	check("after a delta row and another vacuum", 1)
 }
+
+// TestFailedBulkInsertUndoesEveryRow: a statement's undo journal folds an
+// INSERT of consecutive rowids into one entry (undoDrop's dropMore); a
+// statement that fails part way must still take every one of them back.
+func TestFailedBulkInsertUndoesEveryRow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "u.musq")
+	buildDB(t, path, `CREATE TABLE t(id INTEGER PRIMARY KEY, v NOT NULL)`, `INSERT INTO t VALUES (1, 'kept')`)
+	n, err := OpenWrite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Discard()
+	err = n.Exec(`WITH RECURSIVE c(i) AS (SELECT 2 UNION ALL SELECT i+1 FROM c WHERE i < 2000) INSERT INTO t SELECT i, CASE WHEN i = 500 THEN NULL ELSE i END FROM c`)
+	if err == nil {
+		t.Fatal("the NOT NULL violation at row 500 was accepted")
+	}
+	_, rows, qerr := n.Query(`SELECT count(*), max(id) FROM t`, nil)
+	if qerr != nil {
+		t.Fatal(qerr)
+	}
+	if got := fmt.Sprint(rows[0][0].I, rows[0][1].I); got != "1 1" {
+		t.Fatalf("after the failed INSERT: count, max(id) = %s, want 1 1", got)
+	}
+}

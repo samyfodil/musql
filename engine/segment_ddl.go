@@ -153,6 +153,10 @@ func (n *Session) rewriteFile() error {
 		return rerr
 	}
 	syncDir(n.segPath)
+	// A direct-path load's segments are in the file now.
+	for _, t := range db.tables {
+		t.bulk = nil
+	}
 	// The delta is gone: its rows are in the segments now, and its records named
 	// table indexes the new directory may not use.
 	if rerr := os.Remove(segDeltaPath(n.segPath)); rerr != nil && !os.IsNotExist(rerr) {
@@ -305,6 +309,22 @@ func (db *DB) segmentFileContentsOf(temp bool, w *segFileWriter) ([]ConvertedTab
 		}
 
 		ti := len(tables)
+		// A direct-path load (insert_bulk_direct.go): its rows are already
+		// segments, and the row store holds none of them.
+		if t.bulk != nil {
+			segs, berr := t.bulkSegments()
+			for _, raw := range segs {
+				if berr != nil {
+					break
+				}
+				berr = w.addSegment(ti, raw)
+			}
+			if berr != nil {
+				return nil, ConvertedCatalog{}, fmt.Errorf("engine: DDL: %w", berr)
+			}
+			tables = append(tables, ct)
+			continue
+		}
 		// A table whose rows are still exactly its file's segments -- nothing
 		// written, deleted or spilled this session, nothing waiting for it in
 		// the delta, the same columns -- is copied segment by segment as the
