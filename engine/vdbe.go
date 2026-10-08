@@ -807,7 +807,7 @@ func (prog *Program) newMachine(pager *ReadOnlyPager, outer *evalCtx, params []V
 	m.jx = prog.jitCode()
 	m.sorters = make([]*vdbeSorter, prog.NSorters)
 	m.distinctSets = make([]*vdbeDistinctSet, prog.NDistinct)
-	m.subCache = make([]subCacheEntry, prog.NSubCache)
+	m.subCache = reuseSubCache(m.subCache, prog.NSubCache)
 	m.pager = pager
 	m.params = params
 	m.outer = outer
@@ -888,7 +888,7 @@ func (prog *Program) execWithParentRun(parent *vdbe, pager *ReadOnlyPager, first
 	m.jx = prog.jitCode()
 	m.sorters = make([]*vdbeSorter, prog.NSorters)
 	m.distinctSets = make([]*vdbeDistinctSet, prog.NDistinct)
-	m.subCache = make([]subCacheEntry, prog.NSubCache)
+	m.subCache = reuseSubCache(m.subCache, prog.NSubCache)
 	m.pager, m.params, m.parent, m.outer = pager, parent.params, parent, outerCtx
 	m.firstRow = firstRow
 	// The four pseudo-rows travel down here exactly as they do in
@@ -2722,4 +2722,21 @@ func (m *vdbe) recAlloc(n int) []Value {
 	out := m.recChunk[:n:n]
 	m.recChunk = m.recChunk[n:]
 	return out
+}
+
+// reuseSubCache is a cleared sub-cache of n entries in s's storage when it is
+// big enough: a pooled machine keeps its slice, and a recursive CTE runs its
+// step program on one per row, so allocating it each time was one allocation
+// per row of every recursive INSERT. Cleared, so no earlier run's cached rows
+// are visible -- or kept alive.
+func reuseSubCache(s []subCacheEntry, n int) []subCacheEntry {
+	if n == 0 {
+		return nil
+	}
+	if cap(s) < n {
+		return make([]subCacheEntry, n)
+	}
+	s = s[:n]
+	clear(s)
+	return s
 }
