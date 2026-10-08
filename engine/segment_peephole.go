@@ -69,6 +69,10 @@ type segPlanPred struct {
 	// chance to.
 	Lit      Value
 	ParamIdx int // 1-based; 0 means the bound is the literal above
+	// SubProg, when set, is an UNCORRELATED scalar subquery supplying the
+	// bound, cached in sub-cache slot SubSlot as OpSubquery caches it.
+	SubProg *Program
+	SubSlot int
 	// Aff is the comparison's affinity (P5), which the loop applies to the
 	// bound before comparing and so must segPlanPreds.
 	Aff affinity
@@ -305,6 +309,9 @@ func segParsePredBlock(in []Instruction, pc, limit, cursor, nextAt int) (preds [
 		// bound then sits in the Negative's register, and the group is five
 		// instructions long.
 		boundReg, size, negate := bound.P2, 4, false
+		if bound.Op == OpSubquery {
+			boundReg = bound.P1 // OpSubquery's destination is P1
+		}
 		if (bound.Op == OpInteger || bound.Op == OpReal) && cmp.Op == OpNegative &&
 			cmp.P1 == bound.P2 && pc+4 < limit {
 			boundReg, size, negate = cmp.P2, 5, true
@@ -320,8 +327,10 @@ func segParsePredBlock(in []Instruction, pc, limit, cursor, nextAt int) (preds [
 		// the instructions after them are identical, which is why one matcher
 		// covers both. Nothing else is accepted: an expression bound would put
 		// arbitrary opcodes in this slot.
+		subBound := bound.Op == OpSubquery && bound.P3 <= 1 && bound.P5&p5Correlated == 0
 		if col.Op != OpColumn || col.P1 != cursor ||
-			!segPeepholeBoundOp(bound.Op) || bound.P2 != col.P3+1 || (negate && boundReg != bound.P2+1) ||
+			!(segPeepholeBoundOp(bound.Op) || subBound) || (!subBound && bound.P2 != col.P3+1) ||
+			(subBound && bound.P1 != col.P3+1) || (negate && (subBound || boundReg != bound.P2+1)) ||
 			ifnot.Op != OpIfNot || !(direct || tree) || (direct && falseAt >= 0) {
 			return nil, 0, false
 		}
@@ -336,6 +345,12 @@ func segParsePredBlock(in []Instruction, pc, limit, cursor, nextAt int) (preds [
 		}
 		pred := segPlanPred{Col: col.P2, Op: op, Aff: affinity(cmp.P5 & p5AffMask)}
 		switch bound.Op {
+		case OpSubquery:
+			sub, ok := bound.P4.(*Program)
+			if !ok || sub == nil {
+				return nil, 0, false
+			}
+			pred.SubProg, pred.SubSlot = sub, bound.P2
 		case OpVariable:
 			pred.ParamIdx = bound.P1 // 1-based, per OpVariable's contract
 		case OpReal:
@@ -506,6 +521,22 @@ func (m *vdbe) segPlanPreds(plan *segFilterPlan) ([]segPred, bool) {
 				return nil, false
 			}
 			v = m.params[p.ParamIdx-1]
+		}
+		if p.SubProg != nil {
+			// What OpSubquery would put in the bound's register: the cached
+			// first row's first value, NULL for none -- refused where that
+			// first row's order is not provably C's, as OpSubquery refuses.
+			if p.SubSlot < 0 || p.SubSlot >= len(m.subCache) {
+				return nil, false
+			}
+			rows, err := m.runSub(false, p.SubSlot, p.SubProg)
+			if err != nil || (p.SubProg.OrderUnproven && firstRowDependsOnOrder(rows)) {
+				return nil, false
+			}
+			v = Value{Typ: Null}
+			if len(rows) > 0 && len(rows[0]) > 0 {
+				v = rows[0][0]
+			}
 		}
 		// Everything but NULL. NULL declines: its three-valued logic is not
 		// "orders below every value". A bound of the wrong class needs no
