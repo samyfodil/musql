@@ -82,7 +82,7 @@ func (m *vdbe) streamsDerived(ds *derivedSource, insns []Instruction) bool {
 // other shares this machine's.
 func (m *vdbe) newSubStream(ds *derivedSource, pager *ReadOnlyPager) *subStream {
 	child := ds.prog.newMachine(pager, nil, m.params, m)
-	child.yield = true
+	child.yield, child.yieldReuse = true, true
 	child.sink = m.sink
 	if ds.stream == streamAlways {
 		child.sink = &streamSink{plan: ds.sinkPlan}

@@ -224,6 +224,15 @@ type vdbe struct {
 	yield    bool
 	resumePC int
 	done     bool
+	// yieldReuse lets a yielding machine hand every row back in the same
+	// buffers, yieldRow and yieldRows, instead of two fresh slices per row. Only
+	// subStream sets it: its consumer, a cursor, copies out of the row before
+	// it advances (vdbeCursor's rowVals contract), so the row is dead when the
+	// next one overwrites it. ProgramStmt's caller may keep its rows, and
+	// gets fresh ones.
+	yieldReuse bool
+	yieldRow   []Value
+	yieldRows  [][]Value
 
 	// likePlan is the last LIKE pattern this machine analysed (likePlanFor).
 	likePlan *likePlan
@@ -1217,6 +1226,12 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 		case OpResultRow:
 			if m.firstRow {
 				return [][]Value{nil}, nil
+			}
+			if m.yieldReuse && len(rows) == 0 {
+				m.yieldRow = append(m.yieldRow[:0], m.regs[op.P1:op.P1+op.P2]...)
+				m.yieldRows = append(m.yieldRows[:0], m.yieldRow)
+				m.resumePC = pc + 1
+				return m.yieldRows, nil
 			}
 			row := make([]Value, op.P2)
 			copy(row, m.regs[op.P1:op.P1+op.P2])
