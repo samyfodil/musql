@@ -441,6 +441,16 @@ func emitTextMatchAmd64(a *Asm, in ProgInsn, cells Reg, idx int) {
 	case TextPrefix:
 		matchAt(no, 0)
 		a.Jmp(yes)
+	case TextSuffix:
+		// The text ends at its first NUL: find it, then the last m bytes
+		// before it must be the pattern.
+		emitTextEffLenAmd64(a, in.B, sfx)
+		a.CmpRegImm32(RDX, int32(m))
+		a.Jcc(CondL, no)
+		a.AddRegReg(R10, RDX)
+		a.AddRegImm8(R10, int8(-m))
+		matchAt(no, 0)
+		a.Jmp(yes)
 	case TextContains:
 		// Every start position whose m bytes are inside the text, stopping at
 		// the first NUL: a match cannot span it, the pattern holding none.
@@ -480,4 +490,47 @@ func emitTextMatchAmd64(a *Asm, in ProgInsn, cells Reg, idx int) {
 	a.MovMemReg32(RSI, in.A, RAX)
 	a.Label(end)
 	a.XorRegReg(R11, R11)
+}
+
+// emitTextEffLenAmd64 sets RDX to the text's length before its first NUL,
+// given R10 = the text and RDX = its stored length. The scan reads 16 bytes at
+// a time only while they lie inside the text (so it needs no heap bound), then
+// a byte at a time. It uses RAX and R11 as scratch and X0, X1, then sets R11
+// back to the heap's end, which the comparison after it relies on.
+func emitTextEffLenAmd64(a *Asm, slot int, sfx string) {
+	lp, tail, nul, zero, done := "el"+sfx, "et"+sfx, "en"+sfx, "ez"+sfx, "ed"+sfx
+	a.MovRegReg(RAX, R10) // the scan pointer
+	a.AddRegReg(RDX, R10) // RDX = the text's end
+	a.Label(lp)
+	a.LeaDisp(R11, RAX, 16)
+	a.CmpRegReg(R11, RDX)
+	a.Jcc(condAbove, tail)
+	a.MovdquLoad(X0, RAX)
+	a.Pxor(X1, X1)
+	a.Pcmpeqb(X1, X0)
+	a.Pmovmskb(R11, X1)
+	a.TestRegReg(R11, R11)
+	a.Jcc(CondNE, nul)
+	a.AddRegImm8(RAX, 16)
+	a.Jmp(lp)
+	a.Label(nul)
+	a.BsfRegReg(R11, R11)
+	a.AddRegReg(RAX, R11)
+	a.MovRegReg(RDX, RAX)
+	a.Jmp(done)
+	a.Label(tail)
+	a.CmpRegReg(RAX, RDX)
+	a.Jcc(CondE, done)
+	a.MovzxByte(R11, RAX)
+	a.TestRegReg(R11, R11)
+	a.Jcc(CondE, zero)
+	a.IncReg(RAX)
+	a.Jmp(tail)
+	a.Label(zero)
+	a.MovRegReg(RDX, RAX)
+	a.Label(done)
+	a.SubRegReg(RDX, R10)
+	a.MovRegMem32(R11, RDI, (POffHeap+slot*8)/8)
+	a.MovRegMem32(RAX, RDI, (POffHeapLen+slot*8)/8)
+	a.AddRegReg(R11, RAX)
 }

@@ -400,6 +400,43 @@ func emitTextMatchArm64(a *Arm, in ProgInsn, cells Reg64, idx int) {
 	case TextPrefix:
 		matchAt(no, 0)
 		a.B(yes)
+	case TextSuffix:
+		// The text ends at its first NUL; find it, then the last m bytes
+		// before it must be the pattern. X13/X14 scan, X11 becomes the
+		// effective length.
+		lp, chunk, tail, done := "el"+sfx, "ec"+sfx, "et"+sfx, "ed"+sfx
+		a.MovReg(X14, X10)        // the scan pointer
+		a.AddReg(X11, X11, X10)   // X11 = the text's end
+		a.Label(lp)
+		a.AddImm(X13, X14, 16)
+		a.Cmp(X13, X11)
+		a.BcondRaw(0x8, tail) // HI: 16 more bytes would leave the text
+		a.LdrQ(v(0), X14)
+		a.Cmeq0_16B(v(1), v(0))
+		a.Umaxv16B(v(1), v(1))
+		a.UmovB0(X13, v(1))
+		a.Cbnz(X13, chunk)
+		a.AddImm(X14, X14, 16)
+		a.B(lp)
+		a.Label(chunk) // a NUL in these 16: the byte loop finds it
+		a.AddImm(X11, X14, 16)
+		a.Label(tail)
+		a.Cmp(X14, X11)
+		a.Bcond(CondE, done)
+		a.LdrbImm(X13, X14, 0)
+		a.Cbz(X13, "ez"+sfx)
+		a.AddImm(X14, X14, 1)
+		a.B(tail)
+		a.Label("ez" + sfx)
+		a.MovReg(X11, X14)
+		a.Label(done)
+		a.SubsReg(X11, X11, X10) // the effective length
+		a.CmpImm(X11, uint32(m))
+		a.Bcond(CondL, no)
+		a.AddReg(X10, X10, X11)
+		a.SubsImm(X10, X10, uint32(m))
+		matchAt(no, 0)
+		a.B(yes)
 	case TextContains:
 		loop, next := "mc"+sfx, "mx"+sfx
 		a.Label(loop)
