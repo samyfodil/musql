@@ -2572,13 +2572,17 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 	// table there -- with no seek hint and not itself a RIGHT/FULL JOIN sweep
 	// target -- can therefore iterate the b-tree LAZILY instead of materializing
 	// the whole table (see vdbeCursor.streamable). Deeper levels, and any
-	// rightOuter/seek/withoutRowid/derived source, keep materializing.
+	// rightOuter/withoutRowid/derived source, keep materializing.
 	streamOuter := -1
 	if len(plan.execOrder) > 0 {
 		o := plan.execOrder[0]
 		s := srcs[o]
+		// A planned seek does not exclude it: rewind seeks first and streams
+		// only when the seek declines at run time -- which an automatic seek
+		// does for any column the segments keep no equality index for
+		// (automaticSeekCandidates) -- instead of materializing the table.
 		if s.derived == nil && s.vtabItem == nil && s.cteItem == nil && s.catalogScope == scopeAny &&
-			!s.rightOuter && s.seekKeyExpr == nil && s.idxSeek == nil && !s.tbl.withoutRowid &&
+			!s.rightOuter && !s.tbl.withoutRowid &&
 			(len(plan.autoIdxKeys) == 0 || plan.autoIdxKeys[0] == nil) {
 			// A level carrying an index-order key must MATERIALIZE: the key is
 			// a permutation of the whole row set, which a one-row-at-a-time

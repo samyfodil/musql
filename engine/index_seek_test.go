@@ -177,10 +177,20 @@ func TestIndexSeekFiresWhenEligible(t *testing.T) {
 		}
 	}
 
+	// These three decline their SQL index -- a b-tree walk would need its
+	// collation and direction -- and now seek the segments' own per-column
+	// equality index instead (automaticSeekCandidates), which has no order to
+	// get wrong; a NOCASE TEXT probe still declines at run time.
+	for _, sql := range []string{
+		"SELECT id FROM t WHERE e = 'FOO'",
+		"SELECT id FROM t WHERE u = 'u1'",
+		"SELECT id FROM t WHERE f = 100",
+	} {
+		if d, err := DisassembleScan(p, sql); err == nil && !strings.Contains(d, "SeekIndexHint") {
+			t.Errorf("expected an automatic SeekIndexHint for %q, got:\n%s", sql, d)
+		}
+	}
 	noFire := []string{
-		"SELECT id FROM t WHERE e = 'FOO'",              // NOCASE col, only a BINARY index -> collation mismatch, declined
-		"SELECT id FROM t WHERE u = 'u1'",               // UNIQUE automatic index -> declined (can't confirm leading direction)
-		"SELECT id FROM t WHERE f = 100",                // DESC leading index -> declined
 		"SELECT id FROM t WHERE id = 3",                 // rowid: rowid-seek path, not index-seek
 		"SELECT id FROM t WHERE a > 'm'",                // not equality
 		"SELECT id FROM t WHERE a = b",                  // key references a column

@@ -146,13 +146,28 @@ func (p *ReadOnlyPager) newSegRowSource(cur *vdbeCursor) *segRowSource {
 	// session: "ORDER BY v DESC LIMIT 20" went from 502 allocations per query to
 	// 114,626 and from 9.34ms to 41.97ms, a 4.5x LOSS, because this source started
 	// serving a scan whose rows the session was already holding.
-	if p.segs.isLive(cur.tbl.root) {
+	if cur.tbl.withoutRowid || cur.hasGeneratedCols() {
 		return nil
+	}
+	if p.segs.isLive(cur.tbl.root) {
+		// A write session's store over segments that the session has not
+		// written to holds no rows of its own: its rows ARE its base's
+		// segments, read on demand, and the alternative to this source builds
+		// and normalizes a copy of every one. segRowSourceWins' cost rule was
+		// measured against decoding one record per row, which this is not, so
+		// it does not apply here.
+		segs, ok := p.segs.liveBaseSegments(cur.tbl.root)
+		if !ok {
+			return nil
+		}
+		for _, s := range segs {
+			if s == nil || len(s.cols) != len(cur.tbl.cols) {
+				return nil
+			}
+		}
+		return &segRowSource{segs: segs, cols: segColPlansFor(cur.tbl)}
 	}
 	if !segRowSourceWins(cur) {
-		return nil
-	}
-	if cur.tbl.withoutRowid || cur.hasGeneratedCols() {
 		return nil
 	}
 	// A row-major delta beside the segments makes a per-COLUMN read wrong: this
@@ -208,12 +223,13 @@ func segColPlansFor(tbl *resolvedTable) []segColPlan {
 // as a one-row table. served is false when the segments are not the whole
 // answer for this table -- a row this session wrote, rows pending in the log,
 // a generated column, a segment of the wrong width -- and the caller then does
-// what it always did. A nil src with served true is a miss: no such row.
+// what it always did. A nil src with served true is a miss: no such row. The
+// source is built in into, which the cursor owns, so a seek allocates nothing.
 //
 // The eligibility is newSegRowSource's, without its cost rule: there is no
 // scan here to weigh, only one row whose columns are read as they are asked
 // for, through the same segColumn every lazy read uses.
-func (p *ReadOnlyPager) segPointSeek(cur *vdbeCursor, rid int64) (src *segRowSource, served bool) {
+func (p *ReadOnlyPager) segPointSeek(cur *vdbeCursor, rid int64, into *segRowSource) (src *segRowSource, served bool) {
 	if !segLazyRows || p == nil || p.segs == nil || cur == nil || cur.tbl == nil {
 		return nil, false
 	}
@@ -263,7 +279,8 @@ func (p *ReadOnlyPager) segPointSeek(cur *vdbeCursor, rid int64) (src *segRowSou
 		if len(s.cols) != len(cur.tbl.cols) {
 			return nil, false
 		}
-		return &segRowSource{point: true, pointSeg: s, pointRow: i, cols: segColPlansFor(cur.tbl)}, true
+		*into = segRowSource{point: true, pointSeg: s, pointRow: i, cols: segColPlansFor(cur.tbl)}
+		return into, true
 	}
 	return nil, true
 }
@@ -404,4 +421,24 @@ func (cur *vdbeCursor) segFullRow() []Value {
 		cur.rowVals[c] = cur.segColumn(c)
 	}
 	return cur.rowVals
+}
+
+// liveBaseSegments is the segments behind a write session's row store for
+// rootPage when they are the whole of it: the store holds no row of its own
+// and has dropped none, and its base pager has nothing for the table pending in
+// its log. ok is false otherwise.
+func (src *segSource) liveBaseSegments(rootPage uint32) (segs []*segment, ok bool) {
+	rows, have, err := src.liveRows(rootPage)
+	if err != nil || !have || rows == nil || rows.seg == nil {
+		return nil, false
+	}
+	if len(rows.m) != 0 || len(rows.gone) != 0 || rows.baseGone {
+		return nil, false
+	}
+	base := rows.seg
+	if base.rp == nil || base.rp.segs == nil || base.rp.segs.isLive(base.root) || !base.rp.segCleanFor(base.root) {
+		return nil, false
+	}
+	segs = base.rp.segs.byRoot[base.root]
+	return segs, len(segs) > 0
 }

@@ -49,6 +49,11 @@ type segFilterPlan struct {
 	// this recogniser has no scope for.
 	isSum  bool
 	sumCol int
+
+	// semis are correlated EXISTS answered as semi-joins, and ins uncorrelated
+	// IN subqueries answered from their hashed rows; a count only.
+	semis []segPlanSemi
+	ins   []segPlanIn
 }
 
 // segPlanPred is a predicate whose bound is a literal, or the 1-based index of
@@ -109,8 +114,8 @@ func segPeephole(prog *Program) bool {
 	if rewindAt >= len(in) || in[rewindAt].Op != OpRewind {
 		return false
 	}
-	end := len(in)
-	if in[end-1].Op != OpHalt || in[end-2].Op != OpResultRow ||
+	end := segMainEnd(in)
+	if end < 4 || in[end-1].Op != OpHalt || in[end-2].Op != OpResultRow ||
 		in[end-3].Op != OpAggResult || in[end-4].Op != OpClose {
 		return false
 	}
@@ -168,9 +173,36 @@ func segPeephole(prog *Program) bool {
 	// expression -- what BETWEEN compiles to -- jumps every failed test to a
 	// shared FALSE label (IfNot P3=0) and then settles the three-valued result
 	// in a fixed tail; segAndTreeTail checks that tail.
-	preds, pc, ok := segParsePredBlock(in, rewindAt+1, predEnd, in[rewindAt].P1, nextAt)
-	if !ok {
-		return false
+	// Plain predicate groups, and between them any correlated EXISTS the
+	// inliner turned into a subroutine call that a semi-join can answer
+	// (segment_semijoin.go).
+	var preds []segPlanPred
+	var semis []segPlanSemi
+	var insubs []segPlanIn
+	pc := rewindAt + 1
+	for {
+		more, npc, ok := segParsePredBlock(in, pc, predEnd, in[rewindAt].P1, nextAt)
+		if !ok {
+			return false
+		}
+		preds, pc = append(preds, more...), npc
+		if sj, npc, ok := segParseSemiGroup(in, pc, predEnd, in[rewindAt].P1, nextAt); ok {
+			semis, pc = append(semis, sj), npc
+			continue
+		}
+		if pi, npc, ok := segParseInGroup(in, pc, predEnd, in[rewindAt].P1, nextAt); ok {
+			if sj, isSemi := segInAsSemi(pi); isSemi {
+				semis = append(semis, sj)
+			} else {
+				insubs = append(insubs, pi)
+			}
+			pc = npc
+			continue
+		}
+		break
+	}
+	if (len(semis) > 0 || len(insubs) > 0) && isSum {
+		return false // the semi-join answers a count only
 	}
 	// Zero, one or two. One was excluded only because the first scalar kernel
 	// could not beat Go's loop at a single compare, which is no longer true on
@@ -199,12 +231,12 @@ func segPeephole(prog *Program) bool {
 	out = append(out, in[0], in[1], in[2])
 	guardTarget := len(in) + 1 // the duplicated tail, after every shifted insn
 	out = append(out, Instruction{Op: OpSegFilterCount, P1: dst, P2: in[rewindAt].P1, P3: guardTarget,
-		P4: &segFilterPlan{preds: preds, isSum: isSum, sumCol: sumCol}})
+		P4: &segFilterPlan{preds: preds, isSum: isSum, sumCol: sumCol, semis: semis, ins: insubs}})
 	// Everything from the third instruction on -- which is OpAutoIndexOrder when
 	// there is one, then the Rewind -- one address later than it was.
 	for _, ins := range in[3:] {
 		switch ins.Op {
-		case OpRewind, OpNext, OpIfNot, OpIsNull, OpGoto:
+		case OpRewind, OpNext, OpIfNot, OpIsNull, OpGoto, OpGosub:
 			ins.P2++
 		}
 		out = append(out, ins)
@@ -351,14 +383,57 @@ func segParsePredBlock(in []Instruction, pc, limit, cursor, nextAt int) (preds [
 	return preds, pc, true
 }
 
-// segLooksLikePredGroup reports whether the Column at pc starts a predicate
-// group rather than, say, a GROUP BY key load: its IfNot sits three or (after a
-// Negative) four instructions on.
-func segLooksLikePredGroup(in []Instruction, pc, limit int) bool {
-	if in[pc+3].Op == OpIfNot {
+// segMainEnd is where prog's main body ends: len(in), or, when inlined
+// subroutines follow the body (existsInline appends them), just past the Halt
+// that precedes the first of them. Everything after it must be reachable only
+// through a Gosub, which this checks rather than assumes.
+func segMainEnd(in []Instruction) int {
+	first := len(in)
+	for _, ins := range in {
+		if ins.Op == OpGosub && ins.P2 < first {
+			first = ins.P2
+		}
+	}
+	if first == len(in) {
+		return len(in)
+	}
+	if first < 1 || in[first-1].Op != OpHalt {
+		return -1
+	}
+	for i := 0; i < first; i++ {
+		if in[i].Op != OpGosub && in[i].P2 >= first && segJumpsP2(in[i].Op) {
+			return -1 // the body jumps into the subroutines: not a plain tail
+		}
+	}
+	return first
+}
+
+// segJumpsP2 reports whether op's P2 is a jump target, for segMainEnd.
+func segJumpsP2(op OpCode) bool {
+	switch op {
+	case OpRewind, OpNext, OpIfNot, OpIf, OpIsNull, OpNotNull, OpGoto, OpInit:
 		return true
 	}
-	return pc+4 < limit && in[pc+2].Op == OpNegative && in[pc+4].Op == OpIfNot
+	return false
+}
+
+// segLooksLikePredGroup reports whether the Column at pc starts a predicate
+// group rather than, say, a GROUP BY key load or an IN probe: a comparison and
+// then its IfNot, three or (after a Negative) four instructions on.
+func segLooksLikePredGroup(in []Instruction, pc, limit int) bool {
+	if in[pc+3].Op == OpIfNot && segIsCompare(in[pc+2].Op) {
+		return true
+	}
+	return pc+4 < limit && in[pc+2].Op == OpNegative && segIsCompare(in[pc+3].Op) && in[pc+4].Op == OpIfNot
+}
+
+// segIsCompare reports whether op is one of the six comparison opcodes.
+func segIsCompare(op OpCode) bool {
+	switch op {
+	case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
+		return true
+	}
+	return false
 }
 
 // false for anything that is not one of the six.

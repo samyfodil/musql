@@ -65,7 +65,7 @@ var segRowQueries = []struct {
 	{`SELECT count(*), sum(v) FROM t WHERE k < 5`, false, "the multi-aggregate program answers it without reading rows"},
 	{`SELECT k, count(*) FROM t GROUP BY k ORDER BY k`, false, "the columnar GROUP BY driver answers it"},
 	{`SELECT id, v FROM t ORDER BY v DESC, id DESC LIMIT 10`, false, "the bounded top-N path answers it"},
-	{`SELECT id FROM t WHERE s = 's42'`, true, ""},
+	{`SELECT id FROM t WHERE s = 's42'`, false, "an equality seeks the column's segment index (automaticSeekCandidates)"},
 	{`SELECT typeof(r), typeof(n), typeof(b) FROM t WHERE id = 1`, true, "a rowid seek, positioned rather than built (segPointSeek)"},
 	{`SELECT * FROM t WHERE id = 7`, true, "a whole row through a point seek"},
 	{`SELECT rowid, id, r FROM t WHERE rowid = 1999`, true, ""},

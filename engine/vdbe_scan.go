@@ -98,6 +98,11 @@ func compileSelectScanRow(p *ReadOnlyPager, stmt *SelectStmt, outer *compiler, r
 		// fastest for its one shape; the compiled program covers the rest built
 		// from comparisons. (segPeepholesOffForTest: a differential test's
 		// reference is the plain loop.)
+		// A correlated EXISTS becomes a subroutine first (exists_inline.go), so
+		// the count recogniser below can see one as a semi-join.
+		if !segPeepholesOffForTest {
+			existsInlinePeephole(prog)
+		}
 		if !segPeepholesOffForTest && !segPeephole(prog) && !segOrderPeephole(prog) &&
 			!segGroupPeephole(prog) {
 			segProgPeephole(prog)
@@ -763,7 +768,7 @@ func detectRowidSeekKey(c *compiler, srcs []joinSource, where Expr) (int, Expr, 
 	if where == nil {
 		return 0, nil, false
 	}
-	conjuncts := splitTopLevelAnd(where)
+	conjuncts := seekConjuncts(where)
 	for i, s := range srcs {
 		if s.derived != nil || s.tbl == nil || s.tbl.withoutRowid || s.left || s.rightOuter {
 			continue
@@ -782,6 +787,66 @@ func detectRowidSeekKey(c *compiler, srcs []joinSource, where Expr) (int, Expr, 
 		}
 	}
 	return 0, nil, false
+}
+
+// seekConjuncts is the WHERE's top-level conjuncts as the seek planners read
+// them: each one with an always-false OR arm or an always-true AND arm removed
+// (C's ExprAlwaysFalse/ExprAlwaysTrue over a literal 0/1 or FALSE/TRUE token),
+// and split again if what remains is itself an AND. "(b.id = t.bid OR 0)"
+// then offers b.id = t.bid as a seek key. Only the PLANNERS read this: the
+// WHERE still evaluates every conjunct as written, so a seek found here only
+// narrows the rows it is evaluated on.
+func seekConjuncts(where Expr) []Expr {
+	var out []Expr
+	for _, cj := range splitTopLevelAnd(where) {
+		if s, changed := simplifyConstAndOr(cj); changed {
+			out = append(out, seekConjuncts(s)...)
+			continue
+		}
+		out = append(out, cj)
+	}
+	return out
+}
+
+// simplifyConstAndOr drops an arm that cannot change the truth of an AND or
+// OR: "x OR 0" is x and "x AND 1" is x, for a WHERE (NULL OR 0 is NULL, which
+// is not true, exactly as NULL is not). changed reports whether it did.
+func simplifyConstAndOr(e Expr) (Expr, bool) {
+	b, ok := e.(BinaryExpr)
+	if !ok || (b.Op != "OR" && b.Op != "AND") {
+		return e, false
+	}
+	l, lc := simplifyConstAndOr(b.L)
+	r, rc := simplifyConstAndOr(b.R)
+	switch {
+	case b.Op == "OR" && literalTruth(r) == 0:
+		return l, true
+	case b.Op == "OR" && literalTruth(l) == 0:
+		return r, true
+	case b.Op == "AND" && literalTruth(r) == 1:
+		return l, true
+	case b.Op == "AND" && literalTruth(l) == 1:
+		return r, true
+	}
+	if lc || rc {
+		b.L, b.R = l, r
+		return b, true
+	}
+	return e, false
+}
+
+// literalTruth is 1 for a literal integer that is non-zero, 0 for the literal
+// integer 0, and -1 for anything else -- a literal of another class, a value
+// substituted from a row, any expression. TRUE and FALSE parse to 1 and 0.
+func literalTruth(e Expr) int {
+	lit, ok := e.(LiteralExpr)
+	if !ok || lit.materialized || lit.Val.Typ != Int {
+		return -1
+	}
+	if lit.Val.I == 0 {
+		return 0
+	}
+	return 1
 }
 
 // isScopeRowidRef reports whether e is a reference to s's rowid: either the
@@ -864,7 +929,7 @@ func detectIndexSeekKey(c *compiler, srcs []joinSource, where Expr) (int, *index
 	if c == nil || c.pager == nil || where == nil {
 		return 0, nil, false
 	}
-	conjuncts := splitTopLevelAnd(where)
+	conjuncts := seekConjuncts(where)
 	for i, s := range srcs {
 		if s.derived != nil || s.tbl == nil || s.tbl.withoutRowid || s.left || s.rightOuter {
 			continue
@@ -891,8 +956,11 @@ func detectIndexSeekKey(c *compiler, srcs []joinSource, where Expr) (int, *index
 			sp = c.pager.attachedReaders[s.dbIdx-1].pager
 		}
 		cands, err := sp.secondaryIndexSeekCandidates(s.scope.tableName, s.tbl.root, s.tbl.cols)
-		if err != nil || len(cands) == 0 {
+		if err != nil {
 			continue
+		}
+		if !automaticSeeksOffForTest {
+			cands = append(cands, automaticSeekCandidates(s.tbl.cols, cands)...)
 		}
 		for _, cj := range conjuncts {
 			be, ok := cj.(BinaryExpr)
@@ -943,6 +1011,38 @@ func outerSeekCollationAgrees(c *compiler, be BinaryExpr, plan *indexSeekPlan) b
 		return true
 	}
 	return equalFoldName(effectiveCollation(resolveCompareCollation(c.affCtx(), be.L, be.R)), effectiveCollation(plan.coll))
+}
+
+// automaticSeeksOffForTest turns automaticSeekCandidates off, so a test can
+// run the same SQL with and without them.
+var automaticSeeksOffForTest bool
+
+// automaticSeekCandidates is C's automatic index (where.c's AUTOINDEX), for
+// free: every plain column with no SQL index of its own already has one, the
+// equality index each segment keeps per column, which SeekIndexRowidsSegments
+// answers the seek from. C builds a transient b-tree to get the same lookup;
+// this offers the column as a candidate with no index root, which the segment
+// seek never reads. The collation is the column's declared one, as for an
+// indexed column, so the same checks hold; a column the segments cannot index
+// declines at run time to the scan.
+func automaticSeekCandidates(cols []columnInfo, have []indexSeekCandidate) []indexSeekCandidate {
+	var out []indexSeekCandidate
+	for i, c := range cols {
+		if c.IsGenerated() || c.Hidden || c.IsRowidAlias {
+			continue
+		}
+		indexed := false
+		for _, h := range have {
+			if h.leadingCol == i {
+				indexed = true
+				break
+			}
+		}
+		if !indexed {
+			out = append(out, indexSeekCandidate{leadingCol: i, coll: effectiveCollation(c.Collation)})
+		}
+	}
+	return out
 }
 
 // planForColumn builds an indexSeekPlan if some candidate index leads with
