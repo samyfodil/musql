@@ -1,12 +1,12 @@
 //go:build js && wasm
 
 // Command wasm is musql in a browser: a Web Worker runs this module over an
-// in-memory filesystem (memfs.js) with the JIT's host imports (musql.js),
-// and index.html drives it.
+// in-memory filesystem (memfs.js) with the JIT's host imports (musql.js).
+// index.html benchmarks it in three modes; race.html races it against Turso's
+// browser build, with every answer cross-checked.
 //
-//	GOOS=js GOARCH=wasm go build -o examples/wasm/musql.wasm ./examples/wasm
-//	cp "$(go env GOROOT)/lib/wasm/wasm_exec.js" examples/wasm/
-//	python3 -m http.server -d examples/wasm 8080
+//	examples/wasm/setup.sh          # musql.wasm, wasm_exec.js, Turso into vendor/
+//	go run ./examples/wasm/serve    # http://localhost:8080/race.html
 package main
 
 import (
@@ -14,8 +14,10 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"strconv"
 	"syscall/js"
 	"time"
+	"unicode/utf8"
 
 	"github.com/samyfodil/musql/driver"
 	"github.com/samyfodil/musql/engine"
@@ -169,11 +171,93 @@ func bench() ([]any, error) {
 	return res, nil
 }
 
+// jsonBuf is querySync's output buffer, kept between calls: the worker is
+// single-threaded, and a buffer that has grown to the largest answer seen
+// stops allocating.
+var jsonBuf []byte
+
+// appendJSONValue encodes one value queryRows produces: int64, float64,
+// string, bool or nil. encoding/json's generic path was a quarter of a point
+// query here.
+func appendJSONValue(b []byte, v any) []byte {
+	switch x := v.(type) {
+	case int64:
+		return strconv.AppendInt(b, x, 10)
+	case float64:
+		return strconv.AppendFloat(b, x, 'g', -1, 64)
+	case string:
+		return appendJSONString(b, x)
+	case bool:
+		return strconv.AppendBool(b, x)
+	case nil:
+		return append(b, "null"...)
+	}
+	return appendJSONString(b, fmt.Sprint(v))
+}
+
+// appendJSONString quotes s by JSON's rules, which are not Go's: control
+// characters as \u00XX, invalid UTF-8 as U+FFFD.
+func appendJSONString(b []byte, s string) []byte {
+	const hex = "0123456789abcdef"
+	b = append(b, '"')
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c >= 0x20 && c != '"' && c != '\\' && c < utf8.RuneSelf {
+			b = append(b, c)
+			i++
+			continue
+		}
+		if c < utf8.RuneSelf {
+			switch c {
+			case '"', '\\':
+				b = append(b, '\\', c)
+			case '\n':
+				b = append(b, '\\', 'n')
+			case '\t':
+				b = append(b, '\\', 't')
+			case '\r':
+				b = append(b, '\\', 'r')
+			default:
+				b = append(b, '\\', 'u', '0', '0', hex[c>>4], hex[c&0xF])
+			}
+			i++
+			continue
+		}
+		r, n := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && n == 1 {
+			b = append(b, "\\ufffd"...)
+		} else {
+			b = append(b, s[i:i+n]...)
+		}
+		i += n
+	}
+	return append(b, '"')
+}
+
+// jsArg converts one JS argument: a whole number binds as INTEGER.
+func jsArg(v js.Value) any {
+	switch v.Type() {
+	case js.TypeNumber:
+		if f := v.Float(); f == float64(int64(f)) {
+			return int64(f)
+		} else {
+			return f
+		}
+	case js.TypeString:
+		return v.String()
+	case js.TypeBoolean:
+		return v.Bool()
+	}
+	return nil
+}
+
 // async exposes f to JS as a function returning a Promise: Go must not block
 // inside a JS callback, and every file operation here does.
 func async(f func(args []js.Value) (any, error)) js.Func {
 	return js.FuncOf(func(this js.Value, args []js.Value) any {
-		return js.Global().Get("Promise").New(js.FuncOf(func(_ js.Value, pr []js.Value) any {
+		var exec js.Func
+		exec = js.FuncOf(func(_ js.Value, pr []js.Value) any {
+			exec.Release() // the Promise calls its executor once
 			go func() {
 				v, err := f(args)
 				if err != nil {
@@ -183,7 +267,8 @@ func async(f func(args []js.Value) (any, error)) js.Func {
 				pr[0].Invoke(js.ValueOf(v))
 			}()
 			return nil
-		}))
+		})
+		return js.Global().Get("Promise").New(exec)
 	})
 }
 
@@ -207,9 +292,26 @@ func main() {
 	}))
 	api.Set("bench", async(func(a []js.Value) (any, error) { return bench() }))
 	api.Set("vector", js.ValueOf(jit.HasVector()))
+	api.Set("exec", async(func(a []js.Value) (any, error) {
+		if db == nil {
+			if err := open(); err != nil {
+				return nil, err
+			}
+		}
+		_, err := db.Exec(a[0].String())
+		return nil, err
+	}))
+	// query(sql, args?) runs one statement with optional bound arguments, a JS
+	// array of numbers, strings or nulls.
 	api.Set("query", async(func(a []js.Value) (any, error) {
+		var args []any
+		if len(a) > 1 && a[1].Type() == js.TypeObject {
+			for i := range a[1].Length() {
+				args = append(args, jsArg(a[1].Index(i)))
+			}
+		}
 		start := time.Now()
-		rows, cols, err := queryRows(a[0].String())
+		rows, cols, err := queryRows(a[0].String(), args...)
 		if err != nil {
 			return nil, err
 		}
@@ -223,6 +325,51 @@ func main() {
 			jc[i] = c
 		}
 		return map[string]any{"columns": jc, "rows": jr, "ms": ms}, nil
+	}))
+	// querySync(sql, args?) answers on the calling event's own goroutine and
+	// returns one JSON string, {"columns", "rows"} or {"error"}. The async API
+	// above pays a new goroutine (whose stack then grows through the whole
+	// engine) and a finalizer per JS value it builds, ~80us a call against a
+	// ~20us point lookup. Nothing here blocks: memfs answers the fs calls
+	// synchronously and the file stamp is a direct import.
+	api.Set("querySync", js.FuncOf(func(_ js.Value, a []js.Value) any {
+		var args []any
+		if len(a) > 1 && a[1].Type() == js.TypeObject {
+			for i := range a[1].Length() {
+				args = append(args, jsArg(a[1].Index(i)))
+			}
+		}
+		rows, cols, err := queryRows(a[0].String(), args...)
+		b := jsonBuf[:0]
+		if err != nil {
+			b = appendJSONString(append(b, `{"error":`...), err.Error())
+		} else {
+			b = append(b, `{"columns":[`...)
+			for i, c := range cols {
+				if i > 0 {
+					b = append(b, ',')
+				}
+				b = appendJSONString(b, c)
+			}
+			b = append(b, `],"rows":[`...)
+			for i, r := range rows {
+				if i > 0 {
+					b = append(b, ',')
+				}
+				b = append(b, '[')
+				for j, v := range r {
+					if j > 0 {
+						b = append(b, ',')
+					}
+					b = appendJSONValue(b, v)
+				}
+				b = append(b, ']')
+			}
+			b = append(b, ']')
+		}
+		b = append(b, '}')
+		jsonBuf = b
+		return string(b)
 	}))
 	js.Global().Set("musql", api)
 	js.Global().Call("musqlReady")

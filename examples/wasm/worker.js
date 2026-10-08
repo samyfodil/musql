@@ -12,7 +12,7 @@ const ready = new Promise((resolve) => { globalThis.musqlReady = resolve; });
 	const { instance } = await WebAssembly.instantiateStreaming(fetch("musql.wasm"), go.importObject);
 	go.run(instance);
 	await ready;
-	postMessage({ ready: true, mode, vector: musql.vector });
+	postMessage({ ready: true, engine: "musql", mode, vector: musql.vector });
 })().catch((e) => postMessage({ error: String(e) }));
 
 onmessage = async ({ data: { id, op, args = [] } }) => {
@@ -26,6 +26,16 @@ onmessage = async ({ data: { id, op, args = [] } }) => {
 		}
 		if (op === "save") {
 			postMessage({ id, result: fs.readFileSync("/bench.musq") });
+			return;
+		}
+		if (op === "query") {
+			// Timed here, in JS around the call, exactly as turso-worker.js
+			// times Turso: both include their engine's JS binding.
+			const t = performance.now();
+			const r = JSON.parse(musql.querySync(...args));
+			r.ms = performance.now() - t;
+			if (r.error) throw new Error(r.error);
+			postMessage({ id, result: r });
 			return;
 		}
 		postMessage({ id, result: await musql[op](...args) });

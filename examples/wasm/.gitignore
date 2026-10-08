@@ -1,2 +1,3 @@
 musql.wasm
 wasm_exec.js
+vendor/

@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>musql vs Turso</title>
+<style>
+	:root {
+		--bg: #f6f5f1; --card: #fff; --fg: #1b1b1b; --muted: #6b6b6b; --line: #e3e1da;
+		--musql: #0b7a55; --turso: #4f46e5; --win: #c27c0e; --bad: #c0362c;
+	}
+	@media (prefers-color-scheme: dark) {
+		:root { --bg: #121212; --card: #1b1b1b; --fg: #ececec; --muted: #9a9a9a; --line: #2c2c2c;
+			--musql: #3ccf95; --turso: #8b85ff; --win: #f0b23e; --bad: #ff6b5e; }
+	}
+	* { box-sizing: border-box; }
+	body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
+	main { max-width: 1040px; margin: 0 auto; padding: 24px 16px 64px; }
+	h1 { font-size: 26px; margin: 0; letter-spacing: -0.01em; }
+	h1 .vs { color: var(--muted); font-weight: 400; }
+	.sub { color: var(--muted); margin: 4px 0 20px; }
+	.lanes { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+	@media (max-width: 640px) { .lanes { grid-template-columns: 1fr; } }
+	.lane { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; position: relative; overflow: hidden; }
+	.lane h2 { margin: 0; font-size: 18px; display: flex; align-items: baseline; gap: 8px; }
+	.lane[data-e=musql] h2 { color: var(--musql); }
+	.lane[data-e=turso] h2 { color: var(--turso); }
+	.lane .meta { color: var(--muted); font-size: 13px; min-height: 20px; }
+	.score { font-size: 40px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; margin-top: 6px; }
+	.score small { font-size: 14px; color: var(--muted); font-weight: 400; }
+	.track { height: 10px; background: var(--line); border-radius: 99px; margin-top: 12px; overflow: hidden; }
+	.track i { display: block; height: 100%; width: 0; border-radius: 99px; transition: width 0.12s linear; }
+	.lane[data-e=musql] .track i { background: var(--musql); }
+	.lane[data-e=turso] .track i { background: var(--turso); }
+	.lane.winner { border-color: var(--win); box-shadow: 0 0 0 2px var(--win) inset; }
+	.lane.winner::after { content: "🏁 winner"; position: absolute; top: 12px; right: 14px; color: var(--win); font-weight: 600; font-size: 13px; }
+	.controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 16px 0; }
+	button, select, input { font: inherit; }
+	button { padding: 8px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
+	button.primary { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+	button:disabled { opacity: 0.45; cursor: default; }
+	select, input[type=number] { padding: 7px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--fg); }
+	label { color: var(--muted); font-size: 14px; }
+	#banner { min-height: 28px; font-weight: 600; margin: 4px 0 12px; }
+	.wrap { overflow-x: auto; background: var(--card); border: 1px solid var(--line); border-radius: 12px; }
+	table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: 14px; }
+	th, td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+	th:first-child, td:first-child { text-align: left; }
+	th { color: var(--muted); font-weight: 500; }
+	tr:last-child td { border-bottom: 0; }
+	td.w-musql { color: var(--musql); font-weight: 600; }
+	td.w-turso { color: var(--turso); font-weight: 600; }
+	td.ok { color: var(--musql); } td.bad { color: var(--bad); font-weight: 600; }
+	tr.running td { background: color-mix(in srgb, var(--win) 10%, transparent); }
+	h3 { margin: 28px 0 8px; font-size: 16px; }
+	textarea { width: 100%; font: 13px ui-monospace, monospace; padding: 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--fg); }
+	.duo { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+	@media (max-width: 640px) { .duo { grid-template-columns: 1fr; } }
+	pre { margin: 0; font: 12px ui-monospace, monospace; background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow-x: auto; max-height: 240px; }
+	.note { color: var(--muted); font-size: 13px; margin-top: 18px; }
+	#history li { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+	<h1>musql <span class="vs">vs</span> Turso</h1>
+	<p class="sub">Two SQLite-compatible engines, both compiled to WebAssembly, each in its own Web Worker in this tab. Same data, same queries, same bound values. Every answer is cross-checked.</p>
+
+	<div class="lanes">
+		<section class="lane" data-e="musql"><h2>musql <span class="meta" id="musql-ver"></span></h2><div class="meta" id="musql-status">loading…</div><div class="score"><span id="musql-score">0</span> <small>pts</small></div><div class="track"><i id="musql-bar"></i></div><div class="meta" id="musql-total"></div></section>
+		<section class="lane" data-e="turso"><h2>Turso <span class="meta">0.8.2</span></h2><div class="meta" id="turso-status">loading…</div><div class="score"><span id="turso-score">0</span> <small>pts</small></div><div class="track"><i id="turso-bar"></i></div><div class="meta" id="turso-total"></div></section>
+	</div>
+
+	<div class="controls">
+		<label>rows <select id="rows"><option>10000</option><option selected>100000</option><option>1000000</option></select></label>
+		<button id="seed" class="primary" disabled>Load data</button>
+		<label>runs per query <input id="runs" type="number" value="20" min="1" max="500" style="width:72px"></label>
+		<button id="race" disabled>🏎️ Race (both at once)</button>
+		<button id="duel" disabled>⚔️ Duel (one at a time)</button>
+	</div>
+	<div id="banner"></div>
+
+	<div class="wrap"><table id="board">
+		<thead><tr><th>query</th><th>musql ms</th><th>Turso ms</th><th>faster</th><th>by</th><th>same answer</th></tr></thead>
+		<tbody></tbody>
+	</table></div>
+
+	<h3>Your query</h3>
+	<textarea id="sql" rows="3">SELECT k, count(*), sum(v) FROM t WHERE v > 500000 GROUP BY k ORDER BY k</textarea>
+	<div class="controls"><button id="custom" disabled>Run on both</button><span id="custom-res" class="meta"></span></div>
+	<div class="duo"><pre id="musql-out"></pre><pre id="turso-out"></pre></div>
+
+	<h3>This session</h3>
+	<ol id="history"></ol>
+
+	<p class="note">Tables: <code>t(id, sec, k, v, bid, payload)</code> with an index on <code>sec</code>, and <code>b(id, label)</code>, filled by one deterministic SQL statement in both engines. After loading, musql runs <code>VACUUM</code>, which lays the rows out in its columnar segments; Turso's <code>VACUUM</code> is experimental and off in its browser build, so it runs none. Times are measured in each worker around the engine's own JS API, so both include their binding. <b>Race</b> runs both workers at once, sharing your CPU; <b>Duel</b> runs one engine at a time, alternating who goes first, and scores the median.</p>
+</main>
+<script src="race.js"></script>
+</body>
+</html>
