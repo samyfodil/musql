@@ -74,6 +74,13 @@ type Session struct {
 	// appendAt is where this session's last batch ended, carried so a commit does
 	// not re-read the whole delta to find its own tail. See SegDeltaAppendState.
 	appendAt SegDeltaAppendState
+
+	// commitLock is the lock file held open for this session's autocommit
+	// commits (withCommitLock), and commitLockFI what it was when opened. Its
+	// own descriptor, never shared: OFD locks belong to the open description, so
+	// two sessions sharing one would not exclude each other.
+	commitLock   *os.File
+	commitLockFI os.FileInfo
 	recBuf   []SegDeltaRecord // the delta records of a commit, reused (segDeltaRecordsInto)
 
 	// catalogAtLastWrite is the catalog fingerprint as of the last time the FILE
@@ -390,7 +397,7 @@ func (n *Session) Commit() (bool, error) {
 	} else if n.DB != nil && n.segLockFile != nil {
 		err = commit()
 	} else {
-		err = withSegmentWriteLockWait(n.segPath, n.busyTimeout(), commit)
+		err = n.withCommitLock(commit)
 	}
 	if !n.InTransaction() {
 		n.EndWriteTxn() // the transaction a BEGIN IMMEDIATE opened is over
@@ -648,6 +655,8 @@ func (n *Session) Close() error {
 	n.EndWriteTxn()
 	n.ReleaseLockingMode()
 	n.releaseSegmentLockingModeLock() // the engine-direct pragma's lock (holdLockingModeLock)
+	n.appendAt.release()
+	n.releaseCommitLock()
 	n.closed = true
 	n.dropTempFileIfUnclaimed() // C's temp database is OPEN_DELETEONCLOSE
 	n.DB.closed = true
@@ -817,6 +826,8 @@ func (n *Session) Discard() error {
 	n.EndWriteTxn()
 	n.ReleaseLockingMode()
 	n.releaseSegmentLockingModeLock() // the engine-direct pragma's lock (holdLockingModeLock)
+	n.appendAt.release()
+	n.releaseCommitLock()
 	n.closed = true
 	n.dropTempFileIfUnclaimed() // C's temp database is OPEN_DELETEONCLOSE
 	n.DB.closed = true
@@ -1490,7 +1501,7 @@ func (n *Session) reopen(afterFailedCommit bool) error {
 	n.endCtr, n.endPages = fresh.endCtr, fresh.endPages
 	n.loadedCtr, n.loadedPages = fresh.loadedCtr, fresh.loadedPages
 	n.tableIndex, n.ipkOf = fresh.tableIndex, fresh.ipkOf
-	n.appendAt = SegDeltaAppendState{}
+	n.appendAt.release()
 	n.catalogAtLastWrite = fresh.catalogAtLastWrite
 	n.seenStat = stamp
 	if old != nil {
@@ -1714,4 +1725,41 @@ func (db *DB) cachedSegSource(rows []SchemaRow, cols *ReadOnlyPager, freeze bool
 	}
 	db.segSrcCache, db.segSrcKey = src, h
 	return src, nil
+}
+
+// withCommitLock is withSegmentWriteLockWait on a lock file this session keeps
+// open, so a commit costs the lock and its release rather than an open, the
+// runtime's poller registration, the lock, the release and a close. The path is
+// checked against the file the descriptor was opened on, so a lock file
+// replaced underneath is reopened rather than locked stale.
+func (n *Session) withCommitLock(fn func() error) error {
+	fi, err := os.Stat(n.segPath + segmentLockSuffix)
+	if n.commitLock != nil && (err != nil || !os.SameFile(fi, n.commitLockFI)) {
+		n.releaseCommitLock()
+	}
+	if n.commitLock == nil {
+		f, oerr := openSegmentLockFile(n.segPath)
+		if oerr != nil {
+			return oerr
+		}
+		ofi, serr := f.Stat()
+		if serr != nil {
+			f.Close()
+			return serr
+		}
+		n.commitLock, n.commitLockFI = f, ofi
+	}
+	if lerr := acquireLock(n.commitLock, segStateByte, 2, true, n.busyTimeout()); lerr != nil {
+		return segmentLockBusy(lerr, "write")
+	}
+	defer releaseLock(n.commitLock, segStateByte, 2)
+	return fn()
+}
+
+// releaseCommitLock closes the commit lock file, if this session holds one.
+func (n *Session) releaseCommitLock() {
+	if n.commitLock != nil {
+		n.commitLock.Close()
+		n.commitLock, n.commitLockFI = nil, nil
+	}
 }

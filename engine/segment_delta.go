@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"runtime"
 	"sort"
 	"time"
 
@@ -251,6 +252,23 @@ type SegDeltaAppendState struct {
 	cksum   uint64
 	version uint32
 	known   bool
+
+	// f is the delta held open across commits, and fi what it was when opened:
+	// a commit that finds the path still naming that file (os.SameFile) at the
+	// carried length writes through it instead of opening the file twice --
+	// once to read the tail, once to write -- each open costing a path lookup
+	// and the runtime's poller registration. Not kept on Windows, where an open
+	// handle stops another process renaming or deleting the file.
+	f  *os.File
+	fi os.FileInfo
+}
+
+// release closes the held delta, if any, and forgets the append point.
+func (c *SegDeltaAppendState) release() {
+	if c.f != nil {
+		c.f.Close()
+	}
+	*c = SegDeltaAppendState{}
 }
 
 // appendSegmentDeltaAt is AppendSegmentDelta carrying the append point forward.
@@ -259,7 +277,8 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 		return nil
 	}
 	path := segDeltaPath(segPath)
-	if _, err := os.Stat(path); err != nil {
+	fi, err := os.Stat(path)
+	if err != nil {
 		if !os.IsNotExist(err) {
 			return err
 		}
@@ -268,6 +287,17 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 		}
 		if carry != nil {
 			carry.known = false // the file is new; derive below
+		}
+		fi = nil
+	}
+	// The held descriptor is good only while the path still names its file.
+	var f *os.File
+	if carry != nil && carry.f != nil {
+		if fi != nil && carry.fi != nil && os.SameFile(fi, carry.fi) {
+			f = carry.f
+		} else {
+			carry.f.Close()
+			carry.f, carry.fi = nil, nil
 		}
 	}
 	// THE APPEND POINT IS DERIVED FROM THE BYTES, every time.
@@ -322,16 +352,20 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 	// append time rather than at the next open, and what it buys is a commit that
 	// does not re-read its own history.
 	var st *segDeltaState
-	if carry != nil && carry.known && carry.offset > int64(segDeltaHdrSize) {
-		if fi, serr := os.Stat(path); serr == nil && fi.Size() == carry.offset {
-			if vf, oerr := os.Open(path); oerr == nil {
-				var tail [8]byte
-				_, rerr := vf.ReadAt(tail[:], carry.offset-8)
-				vf.Close()
-				if rerr == nil && binary.LittleEndian.Uint64(tail[:]) == carry.cksum {
-					st = &segDeltaState{bytes: carry.offset, cksum: carry.cksum,
-						endCtr: endCtr, endPages: endPages, version: carry.version}
-				}
+	if carry != nil && carry.known && carry.offset > int64(segDeltaHdrSize) && fi != nil && fi.Size() == carry.offset {
+		vf := f
+		if vf == nil {
+			vf, _ = os.Open(path)
+			if vf != nil {
+				defer vf.Close()
+			}
+		}
+		if vf != nil {
+			var tail [8]byte
+			_, rerr := vf.ReadAt(tail[:], carry.offset-8)
+			if rerr == nil && binary.LittleEndian.Uint64(tail[:]) == carry.cksum {
+				st = &segDeltaState{bytes: carry.offset, cksum: carry.cksum,
+					endCtr: endCtr, endPages: endPages, version: carry.version}
 			}
 		}
 	}
@@ -351,11 +385,18 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 		}
 	}
 
-	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
-	if err != nil {
-		return err
+	if f == nil {
+		f, err = os.OpenFile(path, os.O_RDWR, 0o644)
+		if err != nil {
+			return err
+		}
+		ofi, serr := f.Stat()
+		if carry != nil && serr == nil && runtime.GOOS != "windows" {
+			carry.f, carry.fi = f, ofi
+		} else {
+			defer f.Close()
+		}
 	}
-	defer f.Close()
 
 	// ONE WRITER AT A TIME, for the whole read-decide-write: the caller holds the
 	// segment-file write lock (withSegmentWriteLock), so this function takes none
@@ -368,8 +409,12 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 	if werr != nil {
 		return werr
 	}
-	if err := f.Truncate(end); err != nil {
-		return err
+	// A torn tail past where this batch started is cut off. When the file
+	// ended exactly there, nothing lies past the batch and the call is skipped.
+	if fi == nil || fi.Size() != st.bytes {
+		if err := f.Truncate(end); err != nil {
+			return err
+		}
 	}
 	// DURABILITY IS THE CALLER'S CHOICE, and naming it is the only way a
 	// comparison against C SQLite means anything: C's WAL default
@@ -472,14 +517,14 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs
 	binary.LittleEndian.PutUint32(tr[0:], endCtr)
 	binary.LittleEndian.PutUint32(tr[4:], endPages)
 	buf = append(buf, tr[:8]...)
-	if err := flush(); err != nil {
+	// The checksum covers everything before it, so it is known once the last
+	// chunk is summed, and goes out in the same write: one call, not two.
+	cksum = segDeltaChecksum(buf, cksum)
+	buf = binary.LittleEndian.AppendUint64(buf, cksum)
+	if _, err := f.WriteAt(buf, at); err != nil {
 		return 0, 0, err
 	}
-	binary.LittleEndian.PutUint64(tr[8:], cksum)
-	if _, err := f.WriteAt(tr[8:], at); err != nil {
-		return 0, 0, err
-	}
-	return at + 8, cksum, nil
+	return at + int64(len(buf)), cksum, nil
 }
 
 // segDeltaBatchBytes is the most writeSegDeltaBatch appends for recs: the wider
