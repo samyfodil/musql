@@ -103,8 +103,9 @@ guard() { # guard SECONDS CMD...
 # Every claim of "sweep exit=0" made before this commit was unearned.
 #
 # Judge the OUTPUT instead, which is the only thing that carries the verdict:
-#   - any unsupported=N, wrong=N or panics=N with N>0 is a failure -- a refusal
-#     of something real SQLite runs counts, since unsupported reached 0;
+#   - any wrong=N or panics=N with N>0 is a failure, and so is any decline
+#     (unsupported=N) other than ACCEPTED_DECLINE -- a refusal of something C
+#     SQLite runs counts;
 #   - a chunk that printed NO TOTAL line at all is ALSO a failure, because that
 #     is what a chunk looks like when it never ran. That is not hypothetical:
 #     `timeout` is absent on macOS and every chunk failed instantly, printing
@@ -173,12 +174,17 @@ export log bin TIMEOUT CHUNK_LIST
 # Every claim of "sweep exit=0" made before this commit was unearned.
 #
 # Judge the OUTPUT instead, which is the only thing that carries the verdict:
-#   - any unsupported=N, wrong=N or panics=N with N>0 is a failure -- a refusal
-#     of something real SQLite runs counts, since unsupported reached 0;
+#   - any wrong=N or panics=N with N>0 is a failure, and so is any decline
+#     (unsupported=N) other than ACCEPTED_DECLINE -- a refusal of something C
+#     SQLite runs counts;
 #   - a chunk that printed NO TOTAL line at all is ALSO a failure, because that
 #     is what a chunk looks like when it never ran. That is not hypothetical:
 #     `timeout` is absent on macOS and every chunk failed instantly, printing
 #     nineteen headers, no TOTALs, and exit 0.
+# The one accepted decline: PRAGMA max_page_count has no meaning on this
+# format (see docs/segment-format-compatibility.md), so the 16 corpus
+# statements that set it are refused on purpose and do not fail a sweep.
+ACCEPTED_DECLINE='PRAGMA max_page_count has no meaning on this format'
 status=0
 for i in "${!chunks[@]}"; do
   P="${chunks[$i]}"
@@ -190,8 +196,23 @@ for i in "${!chunks[@]}"; do
     *) echo "===== FAIL chunk $P produced no TOTAL line -- it did not run" >&2; status=1; continue ;;
   esac
   case "$out" in
-    *unsupported=0*wrong=0*panics=0*) ;;
-    *) echo "===== FAIL chunk $P reports unsupported, wrong or panics" >&2; status=1 ;;
+    *wrong=0*panics=0*) ;;
+    *) echo "===== FAIL chunk $P reports wrong or panics" >&2; status=1; continue ;;
+  esac
+  case "$out" in
+    *unsupported=0*) ;;
+    *)
+      # Declines fail the chunk unless every one is ACCEPTED_DECLINE. Each is
+      # logged as a DECLINED line (TCL_DUMP_UNSUPPORTED=1 in run_job), so a
+      # nonzero count with none logged cannot be checked and fails too.
+      declined="$(grep -a 'DECLINED'$'\t' "$log/chunk-$i.log" || true)"
+      other="$(printf '%s\n' "$declined" | grep -av -- "$ACCEPTED_DECLINE" | grep -a . || true)"
+      if [ -z "$declined" ] || [ -n "$other" ]; then
+        echo "===== FAIL chunk $P reports declines other than the accepted ones" >&2
+        printf '%s\n' "$other" | cut -c1-300 >&2
+        status=1
+      fi
+      ;;
   esac
 done
 
