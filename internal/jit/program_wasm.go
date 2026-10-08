@@ -95,6 +95,31 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	bool64 := func() { w.op(opI64ExtendI32U) }
 
 	w.op(opBlock, opVoid) // $done
+	// Re-entry after a POpService (the protocol is in jit.go): restore the
+	// loop state the exit stored, and remember which service to resume after.
+	svc := progHasService(insns)
+	var resume uint32
+	if svc {
+		resume = w.Local(wI32)
+		w.Get(0)
+		w.LoadI64(POffPC)
+		w.op(opI32WrapI64)
+		w.Set(resume)
+		w.op(opBlock, opVoid)
+		w.Get(resume)
+		w.op(opI32Eqz)
+		w.BrIf(0)
+		w.Get(0)
+		w.LoadI64(POffRow)
+		w.Set(idx)
+		w.LoadPtr(POffOut)
+		w.LoadI64(0)
+		w.Set(acc)
+		w.LoadPtr(POffOverflow)
+		w.LoadI64(0)
+		w.Set(ovf)
+		w.op(opEnd)
+	}
 	w.Get(idx)
 	w.op(opI64Eqz)
 	w.BrIf(0)
@@ -102,6 +127,32 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	// Blocks: outermost ends at "next", then one per instruction n-1 .. 1.
 	for range n {
 		w.op(opBlock, opVoid)
+	}
+	if svc {
+		// The first pass through the loop may resume mid-row: one more block,
+		// innermost, whose end is instruction 0, and a br_table on the
+		// service to resume after -- 0 falls through to instruction 0,
+		// service k branches to the instruction after it. The local is
+		// cleared as it is read, so every later row starts at the top.
+		w.op(opBlock, opVoid)
+		maxSvc := 0
+		for _, in := range insns {
+			if in.Op == POpService {
+				maxSvc = max(maxSvc, in.A+1)
+			}
+		}
+		depths := make([]uint32, maxSvc+1) // entries with no service fall through
+		for i, in := range insns {
+			if in.Op == POpService {
+				// From inside the extra block, instruction t is t+1 levels out.
+				depths[in.A+1] = uint32(i + 1)
+			}
+		}
+		w.Get(resume)
+		w.I32(0)
+		w.Set(resume)
+		w.BrTable(depths, 0)
+		w.op(opEnd)
 	}
 	// depthTo is the br depth from inside instruction i to target t; the
 	// enclosing blocks at i are those of i+1 .. n (n being "next").
@@ -152,6 +203,16 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			w.BrIf(depthTo(i, in.A))
 		case POpNot:
 			storeReg(in.A, func() { loadReg(in.B); w.op(opI64Eqz); bool64() })
+		case POpService:
+			// Stop: PC = service+1, Row = idx, then out to $done past the
+			// "finished" store, so the epilogue saves acc and ovf as usual.
+			w.Get(0)
+			w.I64(int64(in.A) + 1)
+			w.StoreI64(POffPC)
+			w.Get(0)
+			w.Get(idx)
+			w.StoreI64(POffRow)
+			w.Br(uint32(n-i) + 1)
 		case POpRem:
 			// rem_s traps on a zero divisor, so a zero is flagged (SQL NULL:
 			// the caller declines) and replaced by 1. MinInt64 rem_s -1 is 0,
@@ -258,7 +319,12 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	w.op(opI64Eqz)
 	w.op(opI32Eqz)
 	w.BrIf(0)
-	w.op(opEnd, opEnd) // $row, $done
+	w.op(opEnd) // $row
+	// Finished every row: PC = 0. A service exit branches past this.
+	w.Get(0)
+	w.I64(0)
+	w.StoreI64(POffPC)
+	w.op(opEnd) // $done
 
 	w.LoadPtr(POffOut)
 	w.Get(acc)

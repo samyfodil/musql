@@ -50,6 +50,7 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		a.LeaIdx(colReg[c], colReg[c], RCX)
 	}
 	a.NegReg(RCX)
+	emitProgResume(a, insns)
 
 	a.Label("loop")
 	// One label per IR instruction, so a lowered OpIf/OpIfNot/OpGoto becomes an
@@ -153,6 +154,12 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.Cmovcc(condSign, RDX, RAX) // the OR below does not, so it goes last
 			a.OrRegReg(R9, R11)
 			a.MovMemReg32(RSI, in.A, RDX)
+		case POpService:
+			a.MovRegImm64(RAX, int64(in.A)+1)
+			a.MovMemReg(RDI, POffPC, RAX)
+			a.MovMemReg(RDI, POffRow, RCX)
+			a.Jmp("fin")
+			a.Label(svcLabel(in.A))
 		case POpAccCount:
 			a.IncReg(R8)
 		case POpEmitRow:
@@ -187,6 +194,9 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	a.Jcc(CondNE, "loop")
 
 	a.Label("done")
+	a.XorRegReg(RAX, RAX)
+	a.MovMemReg(RDI, POffPC, RAX)
+	a.Label("fin")
 	a.MovRegMem(RDX, RDI, POffOut)
 	a.MovMemReg(RDX, 0, R8)
 	a.MovRegMem(RDX, RDI, POffOverflow)
@@ -219,4 +229,30 @@ func itoa(i int) string {
 		i /= 10
 	}
 	return string(b[p:])
+}
+
+// emitProgResume re-enters a program a POpService stopped: with PC non-zero,
+// restore the loop index, the accumulator and the overflow flag the exit
+// stored, and jump to the instruction after that service. The column bases
+// were just rebuilt from N exactly as for a fresh start, which is what the
+// stored index is relative to.
+func emitProgResume(a *Asm, insns []ProgInsn) {
+	if !progHasService(insns) {
+		return
+	}
+	a.MovRegMem(RAX, RDI, POffPC)
+	a.TestRegReg(RAX, RAX)
+	a.Jcc(CondE, "loop")
+	a.MovRegMem(RCX, RDI, POffRow)
+	a.MovRegMem(RDX, RDI, POffOut)
+	a.MovRegMem(R8, RDX, 0)
+	a.MovRegMem(RDX, RDI, POffOverflow)
+	a.MovRegMem(R9, RDX, 0)
+	for _, in := range insns {
+		if in.Op == POpService {
+			a.CmpRegImm32(RAX, int32(in.A)+1)
+			a.Jcc(CondE, svcLabel(in.A))
+		}
+	}
+	a.Jmp("done") // no such service: finish rather than guess
 }

@@ -43,6 +43,23 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		a.AddRegLSL3(colReg[c], colReg[c], X2)
 	}
 	a.NegReg(X2, X2)
+	if progHasService(insns) {
+		// Re-entry after a POpService: see emitProgResume (program_amd64.go).
+		a.LdrImm(X9, X0, POffPC)
+		a.Cbz(X9, "loop")
+		a.LdrImm(X2, X0, POffRow)
+		a.LdrImm(X10, X0, POffOut)
+		a.LdrImm(X3, X10, 0)
+		a.LdrImm(X10, X0, POffOverflow)
+		a.LdrImm(X4, X10, 0)
+		for _, in := range insns {
+			if in.Op == POpService {
+				a.CmpImm(X9, uint32(in.A)+1)
+				a.Bcond(CondE, svcLabel(in.A))
+			}
+		}
+		a.B("done")
+	}
 
 	a.Label("loop")
 	for idx, in := range insns {
@@ -114,6 +131,12 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.Cmp(X9, xzr)
 			a.Csel(X9, X10, X9, CondL)
 			a.StrImm(X9, X1, in.A*8)
+		case POpService:
+			a.MovImm64(X9, int64(in.A)+1)
+			a.StrImm(X9, X0, POffPC)
+			a.StrImm(X2, X0, POffRow)
+			a.B("fin")
+			a.Label(svcLabel(in.A))
 		case POpAdd, POpSub, POpMul:
 			a.LdrImm(X9, X1, in.B*8)
 			a.LdrImm(X10, X1, in.C*8)
@@ -175,6 +198,9 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	a.Cbnz(X2, "loop")
 
 	a.Label("done")
+	a.MovImm16(X9, 0)
+	a.StrImm(X9, X0, POffPC)
+	a.Label("fin")
 	a.LdrImm(X9, X0, POffOut)
 	a.StrImm(X3, X9, 0)
 	a.LdrImm(X9, X0, POffOverflow)

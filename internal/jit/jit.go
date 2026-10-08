@@ -20,6 +20,8 @@
 //     temporary) and X18 (darwin's platform register) alone.
 package jit
 
+import "strconv"
+
 // Args is the single struct a generated kernel reads, at fixed byte offsets.
 // APPEND ONLY -- see the package comment.
 type Args struct {
@@ -187,6 +189,17 @@ const (
 	// overflow and the caller declines; the VDBE then reports the error.
 	POpAbs
 
+	// POpService: hand the current row to the caller's service A (0-based) and
+	// stop. The program returns with ProgArgs.PC = A+1 and ProgArgs.Row = the
+	// loop index, the accumulator and overflow flag stored as at the end; the
+	// caller performs the service on that row -- whatever the engine has no
+	// native form for -- writing any results into the register file, and calls
+	// again with PC unchanged, which resumes right after this instruction on
+	// the same row. A normal finish leaves PC = 0. The program never calls
+	// out: native code returns, Go runs the service, native code is entered
+	// again, so Go's stack, GC and preemption only ever see Go frames.
+	POpService
+
 	// POpEmitRow appends the current row index to Sel and counts it in the
 	// accumulator, which the epilogue leaves in *Out. It is what turns a
 	// compiled predicate into a SELECTION rather than a tally: the program
@@ -239,7 +252,8 @@ type ProgArgs struct {
 	Out      *int64              // accumulator out        (48)
 	Overflow *int64              // set non-zero by POpAccSum on overflow (56)
 	Sel      *int64              // POpEmitRow's selection buffer          (64)
-	PC       int64               // EmitVM: the pc to enter at, and on return the pc to resume at (72)
+	PC       int64               // EmitVM: the pc to enter at, and on return the pc to resume at (72); EmitProgram: the service to resume after, 1-based, 0 to start
+	Row      int64               // EmitProgram: the loop index a POpService stopped at (80)
 }
 
 // Byte offsets of ProgArgs' fields, asserted by TestProgArgsLayout.
@@ -251,4 +265,19 @@ const (
 	POffOverflow = POffOut + 8
 	POffSel      = POffOverflow + 8
 	POffPC       = POffSel + 8
+	POffRow      = POffPC + 8
 )
+
+// progHasService reports whether a program can stop for a service, and so
+// needs the re-entry dispatch.
+func progHasService(insns []ProgInsn) bool {
+	for _, in := range insns {
+		if in.Op == POpService {
+			return true
+		}
+	}
+	return false
+}
+
+// svcLabel names the resume point after service k.
+func svcLabel(k int) string { return "sr" + strconv.Itoa(k) }
