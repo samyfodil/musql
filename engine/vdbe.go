@@ -1264,6 +1264,17 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			copy(row, m.regs[op.P1:op.P1+op.P2])
 			q.push(row)
 
+		case OpRowidBound:
+			if rid, found, served := m.pager.RowidBound(op.P4.(uint32), op.P3 == 1); served {
+				if found {
+					m.regs[op.P1] = Value{Typ: Int, I: int64(rid)}
+				} else {
+					m.regs[op.P1] = Value{Typ: Null}
+				}
+				pc = op.P2
+				continue
+			}
+
 		case OpRecQueueCheck:
 			if m.recq == nil {
 				return nil, fmt.Errorf("engine: internal: recursive CTE check with no queue")

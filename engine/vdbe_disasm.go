@@ -145,6 +145,7 @@ var opNames = [numOpCodes]string{
 	OpRecQueueFill:         "RecQueueFill",
 	OpRecQueuePush:         "RecQueuePush",
 	OpRecQueueCheck:        "RecQueueCheck",
+	OpRowidBound:           "RowidBound",
 	OpRecQueuePop:          "RecQueuePop",
 	OpRecQueueOffset:       "RecQueueOffset",
 	OpRecQueueLimit:        "RecQueueLimit",

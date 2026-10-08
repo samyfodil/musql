@@ -9,7 +9,7 @@ import (
 // mnemonic, and one missing from opNames printed as "Op(84)". The loop ends at
 // the last opcode declared; move its bound when one is added after it.
 func TestEveryOpcodeHasAName(t *testing.T) {
-	for op := OpCode(1); op <= OpRecQueueCheck; op++ {
+	for op := OpCode(1); op <= OpRowidBound; op++ {
 		if strings.HasPrefix(op.String(), "Op(") {
 			t.Errorf("opcode %d has no name in opNames", op)
 		}

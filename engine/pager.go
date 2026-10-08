@@ -177,6 +177,11 @@ type ReadOnlyPager struct {
 	// schemaFP memoises schemaRows' fingerprint for this pager's lifetime; 0 means
 	// not computed yet. See ReadOnlyPager.schemaFingerprint.
 	schemaFP uint64
+
+	// fromColumnsOnly makes resolveFrom resolve a base table's columns without
+	// reading its rows, for a caller that needs only the column metadata
+	// (derivedSelectScope).
+	fromColumnsOnly bool
 	// fts5ConfigGen is DB.fts5ConfigGen as of this pager, stamped by stampPager.
 	fts5ConfigGen uint64
 	schemaLoaded   bool
