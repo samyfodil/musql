@@ -1,5 +1,7 @@
 package engine
 
+import "sync/atomic"
+
 // A rowid point lookup for a write.
 //
 // When a WHERE pins a table's rowid (or INTEGER PRIMARY KEY) to a constant,
@@ -117,5 +119,5 @@ func writeColumnRef(c *compiler, cursor int, e Expr) (int, bool) {
 // reference is the full walk; writeIndexSeeksServed counts the seeks served.
 var (
 	writeIndexSeekOffForTest bool
-	writeIndexSeeksServed    int64
+	writeIndexSeeksServed    atomic.Int64
 )

@@ -1,5 +1,7 @@
 package engine
 
+import "sync/atomic"
+
 // A LAZY row source over a table's segments.
 //
 // The columnar format beats a row format by orders of magnitude where a query
@@ -70,14 +72,14 @@ func ForceSegRowSourceForTest(on bool) func() {
 
 // segRowsServed counts rows handed out by this source, so a test can prove it
 // ran rather than quietly declining to the b-tree and passing for that reason.
-var segRowsServed int64
+var segRowsServed atomic.Int64
 
 // segRowsSelected counts rows the compiled PRE-FILTER chose, so a test can
 // tell "the filter ran and skipped rows" from "the filter declined".
 var segRowsSelected int64
 
 // SegRowsServedForTest reads and clears the counter.
-func SegRowsServedForTest() int64 { n := segRowsServed; segRowsServed = 0; return n }
+func SegRowsServedForTest() int64 { return segRowsServed.Swap(0) }
 
 // SegRowsSelectedForTest reads and clears the pre-filter counter.
 func SegRowsSelectedForTest() int64 { n := segRowsSelected; segRowsSelected = 0; return n }
@@ -332,7 +334,7 @@ func (src *segRowSource) next() (s *segment, row int, rowid uint64, ok bool) {
 			return nil, 0, 0, false
 		}
 		src.pointDone = true
-		segRowsServed++
+		segRowsServed.Add(1)
 		return src.pointSeg, src.pointRow, src.pointSeg.Rowid(src.pointRow), true
 	}
 	for src.si < len(src.segs) {
@@ -348,14 +350,14 @@ func (src *segRowSource) next() (s *segment, row int, rowid uint64, ok bool) {
 			if src.selPos < len(src.sel) {
 				row = int(src.sel[src.selPos])
 				src.selPos++
-				segRowsServed++
+				segRowsServed.Add(1)
 				segRowsSelected++
 				return s, row, s.Rowid(row), true
 			}
 		} else if src.ri < s.nRows {
 			row = src.ri
 			src.ri++
-			segRowsServed++
+			segRowsServed.Add(1)
 			return s, row, s.Rowid(row), true
 		}
 		src.si++

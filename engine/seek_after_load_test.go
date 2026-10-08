@@ -33,7 +33,7 @@ func TestSeekServedAfterALoadWithoutAWrite(t *testing.T) {
 		`SELECT id FROM t WHERE rv = 77.5`,
 		`SELECT id FROM t WHERE bv = x'004d'`,
 	} {
-		segIndexSeeksServed = 0
+		segIndexSeeksServed.Store(0)
 		_, rows, err := n.Query(q, nil)
 		if err != nil {
 			t.Fatalf("%s: %v", q, err)
@@ -41,7 +41,7 @@ func TestSeekServedAfterALoadWithoutAWrite(t *testing.T) {
 		if len(rows) != 1 || rows[0][0].I != 77 {
 			t.Errorf("%s: %v, want 77", q, typedRows(rows))
 		}
-		if segIndexSeeksServed == 0 {
+		if segIndexSeeksServed.Load() == 0 {
 			t.Errorf("%s: answered by a scan, not the segments' equality index", q)
 		}
 	}

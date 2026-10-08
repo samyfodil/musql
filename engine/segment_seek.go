@@ -3,6 +3,7 @@ package engine
 import (
 	"slices"
 	"sort"
+	"sync/atomic"
 )
 
 // A point lookup on our format: seekRowid finds a row by rowid through segments,
@@ -157,7 +158,8 @@ func (s *rowStore) snapshotIndexRowids(col int, probe Value) ([]int64, bool) {
 }
 
 // segIndexSeeksServed counts index seeks the segments answered, for tests.
-var segIndexSeeksServed int64
+// Atomic: concurrent connections seek at once (replication runs several).
+var segIndexSeeksServed atomic.Int64
 
 // segIndexRowids finds rowids holding probe across a table's segments from each
 // segment's equality index. Returns false when any segment cannot answer.
