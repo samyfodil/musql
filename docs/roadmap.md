@@ -90,6 +90,43 @@ SQLite it is a cron job of DELETEs.
 Not planned: stored procedures and a server-side language (out of SQLite's
 model), and types SQLite has no affinity for -- except vectors, above.
 
+## SQL that SQLite rejects
+
+SQLite keeps its dialect small, and some of what it leaves out costs
+applications real work. The rule for adding any of it: **only syntax C SQLite
+rejects with an error.** A statement C SQLite accepts must mean exactly what it
+means there, so the differential gates stay true, and a statement that uses an
+extension fails loudly on C SQLite instead of quietly answering something else.
+The harness gets an "extension" bucket for them: musql answers, C errors, and
+the answer is checked against PostgreSQL's where PostgreSQL has the feature.
+
+**Schema changes SQLite cannot make in place.** `ALTER TABLE ... ALTER COLUMN`
+(type, NOT NULL, DEFAULT), `ADD CONSTRAINT` / `DROP CONSTRAINT` for CHECK,
+UNIQUE and foreign keys, and `ADD COLUMN` with a non-constant default. In
+SQLite each of these is the twelve-step create-copy-drop-rename recipe, done
+by hand. Here it is a catalog change plus, where the data must be checked or
+rewritten, one pass that compaction already knows how to do.
+
+**Grouping and filtering.** `GROUPING SETS`, `ROLLUP` and `CUBE` (one query
+instead of a UNION ALL per level), `DISTINCT ON (...)`, and `QUALIFY` (filter
+on a window function's result without a subquery). All lower to plans the
+VDBE already runs.
+
+**Joins and upserts.** `LATERAL` joins (a subquery in FROM that reads the row
+to its left -- SQLite only allows it through a correlated scalar subquery),
+and `MERGE` (insert, update or delete by match in one statement, beyond what
+`INSERT ... ON CONFLICT` covers).
+
+**Smaller ones.** `TRUNCATE`; `UPDATE` / `DELETE` with `ORDER BY` and `LIMIT`
+always available (a compile-time option in C SQLite, so builds disagree);
+foreign keys on by default per connection through a PRAGMA a server can set
+once.
+
+**Access control, later.** Read-only and per-table permissions for a
+connection, and row-level security for the Hrana server, where many clients
+share one database. SQLite has none, since it trusts whoever opens the file;
+a server cannot.
+
 ## Write path in the browser
 
 Single-row writes in wasm run at 20-25 us under Node; in the browser race,
