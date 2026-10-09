@@ -2055,13 +2055,13 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				}
 			} else if okBounds {
 				if plan.isSum {
-					if v, served := cur.pager.segFilterSumTable(cur.tbl.root, preds, plan.sumCol); served {
+					if v, served := cur.pager.segFilterSumTable(cur.tbl.root, preds, plan.sumCol, cur.tbl.ipkIndex); served {
 						segFilterServed.Add(1)
 						m.regs[op.P1] = v
 						pc = op.P3
 						continue
 					}
-				} else if total, served := cur.pager.segFilterCountTable(cur.tbl.root, preds); served {
+				} else if total, served := cur.pager.segFilterCountTable(cur.tbl.root, preds, cur.tbl.ipkIndex); served {
 					segFilterServed.Add(1)
 					m.regs[op.P1] = Value{Typ: Int, I: int64(total)}
 					pc = op.P3

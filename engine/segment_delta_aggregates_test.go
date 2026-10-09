@@ -32,6 +32,15 @@ func TestColumnarAggregatesMergeTheDelta(t *testing.T) {
 		`SELECT sum(v * 2 + w) FROM t WHERE k < 5`,
 		`SELECT max(id), min(id), count(id) FROM t`,
 		`SELECT sum(v) FROM t WHERE v > ?`,
+		// The INTEGER PRIMARY KEY: a delta row stores it as NULL and its rowid
+		// carries the value, so neither a predicate on it nor a sum of it may be
+		// answered from the stored column.
+		`SELECT count(*) FROM t WHERE id > 100`,
+		`SELECT sum(v) FROM t WHERE id >= 3000`,
+		`SELECT sum(id) FROM t`,
+		// A FILTER is per aggregate: the other aggregate must still see the row.
+		`SELECT sum(abs(v)) FILTER (WHERE 0), count(*) FROM t`,
+		`SELECT sum(v) FILTER (WHERE k = 3), count(*), sum(w) FROM t`,
 	}
 	check := func(label string) {
 		t.Helper()
@@ -48,6 +57,18 @@ func TestColumnarAggregatesMergeTheDelta(t *testing.T) {
 		}
 	}
 	check("segments")
+	// A table whose rows are all in the delta: no segment to correct, so a
+	// correction alone answers.
+	p.delta(`CREATE TABLE u(id INTEGER PRIMARY KEY, v INTEGER)`, `INSERT INTO u VALUES (1, 5)`, `INSERT INTO u VALUES (2, 6)`)
+	for _, q := range []string{
+		`SELECT count(*) FROM u WHERE id > 0`, `SELECT sum(id) FROM u`, `SELECT sum(v) FROM u WHERE id > 1`,
+		`SELECT count(*), sum(v), min(v), max(id) FROM u`,
+	} {
+		want := fmt.Sprint(typedRows(p.mustPlain(q)))
+		if got := fmt.Sprint(typedRows(p.mustFast(q))); got != want {
+			t.Errorf("delta-only %s:\n fast  %s\n plain %s", q, got, want)
+		}
+	}
 	p.delta(`UPDATE t SET v = v + 1 WHERE id = 7`)
 	check("one update")
 	p.delta(`INSERT INTO t VALUES (9001, 3, 999, 1), (9002, 4, -5, 2)`, `DELETE FROM t WHERE id IN (1, 2, 4000)`)
