@@ -199,10 +199,3 @@ a browser (its cost there is several times what Node measures).
 aggregate path, even on a clean table (15 ms at 100k rows, against 0.1 ms
 without the subquery). An uncorrelated scalar subquery there is a constant;
 the recognizer should let it through.
-
-## TinyGo build of the wasm module
-
-The npm package's module compiles with TinyGo (one `os.SameFile` stub
-needed). Its garbage collectors and size against the Go toolchain's build are
-being measured; adopt it only if it is faster on bench_node.js with every
-answer the same.
