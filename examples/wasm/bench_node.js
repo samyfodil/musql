@@ -73,6 +73,7 @@ function seedSQL(n) {
 	console.log("-- reads after the writes (the table now has a delta)");
 	time("count(*) WHERE v > ?", "SELECT count(*) FROM t WHERE v > ?", () => [500000], 50);
 	time("count(*), sum(v)", "SELECT count(*), sum(v) FROM t", () => [], 50);
-	console.log("state", JSON.stringify(run("SELECT count(*), sum(v), (SELECT count(*) FROM b), (SELECT max(id) FROM b) FROM t")));
+	time("count(*), max(id) FROM b", "SELECT count(*), max(id) FROM b", () => [], 50);
+	console.log("state", JSON.stringify([...run("SELECT count(*), sum(v) FROM t"), ...run("SELECT count(*), max(id) FROM b")]));
 	process.exit(0);
 })().catch((e) => { console.error(e); process.exit(1); });
