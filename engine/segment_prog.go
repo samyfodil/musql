@@ -2,6 +2,7 @@ package engine
 
 import (
 	"slices"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -71,17 +72,24 @@ func (m *vdbe) segRunProgramAll(p *ReadOnlyPager, tbl *resolvedTable, plan *segP
 }
 
 func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, low *segLowered, ipkCol int) (Value, bool) {
-	// A row-major delta beside the segments makes a raw block read wrong; see
-	// segCleanFor.
-	if !p.segCleanFor(rootPage) {
-		return Value{}, false
-	}
 	if p == nil || p.segs == nil || low == nil {
 		return Value{}, false
 	}
 	segs, ok := p.segs.byRoot[rootPage]
 	if !ok {
 		return Value{}, false
+	}
+	// A row-major delta beside the segments makes a raw block read wrong
+	// (segCleanFor). It is merged instead (segDeltaSplit): the kernel runs over
+	// the runs of segment rows the delta does not name, and once more over the
+	// delta's own live rows laid out as blocks. Every aggregate here is an
+	// integer one combined exactly across runs, so the split cannot move an
+	// answer.
+	var split *segDeltaSplit
+	if !p.segCleanFor(rootPage) {
+		if split, ok = p.segs.deltaSplitFor(rootPage, segs, low, ipkCol); !ok {
+			return Value{}, false
+		}
 	}
 	kern := segProgKernel(low)
 	if kern == nil {
@@ -115,12 +123,12 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 	// Each segment runs on its own copy of the register file (on its own
 	// goroutine under WithWorkers); the results are then combined in segment
 	// order, exactly as a single pass combines them.
-	type segResult struct {
-		out, rows int64
-		ovf       bool
-		empty     bool
+	type segResult = segRunResult
+	nSlots := len(segs)
+	if split != nil {
+		nSlots++ // the delta's own rows, after every segment
 	}
-	results := make([]segResult, len(segs))
+	results := make([]segResult, nSlots)
 	// Service blocks share one window across the statement, in row order, as
 	// the interpreter shares its registers: their segments run one at a time.
 	var svc *segSvcRunner
@@ -136,8 +144,12 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 			return true
 		}
 	}
-	ok = each(len(segs), func(si int) bool {
-		s, res := segs[si], &results[si]
+	ok = each(nSlots, func(si int) bool {
+		res := &results[si]
+		if si == len(segs) {
+			return split.runDelta(kern, low, regs, res)
+		}
+		s := segs[si]
 		// The text variant over a segment whose text columns are clean TEXT;
 		// the service-only body otherwise.
 		low, kern := low, kern
@@ -195,30 +207,58 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 			res.empty = true
 			return true
 		}
-		// min()/max() of a whole column, with no predicate: the zone map
-		// already holds the segment's extreme, so no row is read.
-		if extreme, ok := segZoneExtreme(s, low); ok {
-			res.out, res.rows = extreme, int64(s.nRows)
-			return true
+		var skip []int // positions of the rows the delta names, ascending
+		if split != nil {
+			skip = split.skipIn(s)
 		}
-		local := slices.Clone(regs)
-		var out, ovf int64
-		args := &jit.ProgArgs{N: int64(s.nRows), Regs: &local[0], Out: &out, Overflow: &ovf}
-		for i, b := range blocks {
+		// min()/max() of a whole column, with no predicate: the zone map
+		// already holds the segment's extreme, so no row is read -- unless the
+		// delta replaced a row, whose value the zone map may still hold.
+		if len(skip) == 0 {
+			if extreme, ok := segZoneExtreme(s, low); ok {
+				res.out, res.rows = extreme, int64(s.nRows)
+				return true
+			}
+		}
+		for _, b := range blocks {
 			if len(b) < s.nRows {
 				return false
 			}
-			args.Col[i] = &b[0]
-			if h := heaps[i]; len(h) > 0 {
-				args.Heap[i], args.HeapLen[i] = &h[0], int64(len(h))
+		}
+		// The segment's rows in runs between the skipped ones, each its own
+		// kernel call on its own copy of the registers, combined as segments
+		// are (segCombine).
+		start := 0
+		for k := 0; k <= len(skip); k++ {
+			end := s.nRows
+			if k < len(skip) {
+				end = skip[k]
 			}
+			if end > start {
+				local := slices.Clone(regs)
+				var out, ovf int64
+				args := &jit.ProgArgs{N: int64(end - start), Regs: &local[0], Out: &out, Overflow: &ovf}
+				for i, b := range blocks {
+					args.Col[i] = &b[start]
+					if h := heaps[i]; len(h) > 0 {
+						args.Heap[i], args.HeapLen[i] = &h[0], int64(len(h))
+					}
+				}
+				if !segCallKernel(kern, args, svc, low.blocks, s, local) {
+					return false
+				}
+				part := segResult{out: out, ovf: ovf != 0}
+				if low.agg != aggCountStar && low.agg != aggCount {
+					part.rows = local[low.rowsReg]
+				}
+				if !segCombine(low.agg, res, part) {
+					return false
+				}
+			}
+			start = end + 1
 		}
-		if !segCallKernel(kern, args, svc, low.blocks, s, local) {
-			return false
-		}
-		res.out, res.ovf = out, ovf != 0
-		if low.agg != aggCountStar && low.agg != aggCount {
-			res.rows = local[low.rowsReg]
+		if len(skip) == s.nRows {
+			res.empty = true
 		}
 		return true
 	})
@@ -327,4 +367,162 @@ func segZoneExtreme(s *segment, low *segLowered) (int64, bool) {
 		return z.min, true
 	}
 	return z.max, true
+}
+
+// segRunResult is one kernel run's answer: a segment's, a run of a segment's
+// rows, or the delta's rows. rows is the count matched, for the aggregates
+// whose out is not itself a count.
+type segRunResult struct {
+	out, rows int64
+	ovf       bool
+	empty     bool
+}
+
+// segCombine folds part into acc as segRunOne's final loop folds segments:
+// counts and sums add (a sum that overflows declines), min and max keep the
+// extreme of the runs that matched anything.
+func segCombine(agg aggKind, acc *segRunResult, part segRunResult) bool {
+	if part.ovf {
+		acc.ovf = true
+		return true
+	}
+	switch agg {
+	case aggCountStar, aggCount:
+		acc.out += part.out
+	case aggMin, aggMax:
+		if part.rows == 0 {
+			return true
+		}
+		if acc.rows == 0 || (agg == aggMin && part.out < acc.out) || (agg == aggMax && part.out > acc.out) {
+			acc.out = part.out
+		}
+		acc.rows += part.rows
+	default:
+		sum := acc.out + part.out
+		if (part.out > 0 && sum < acc.out) || (part.out < 0 && sum > acc.out) {
+			acc.ovf = true
+			return true
+		}
+		acc.out = sum
+		acc.rows += part.rows
+	}
+	return true
+}
+
+// segDeltaSplitMax bounds the delta rows a split merges: past it a statement
+// takes the row loop, as before, rather than many tiny kernel runs.
+const segDeltaSplitMax = 4096
+
+// segDeltaSplit is a table's delta, arranged for segRunOne: the rowids it names
+// (superseded or removed), whose segment rows the kernel skips, and its live
+// rows as int64 blocks in the lowered program's slot order.
+type segDeltaSplit struct {
+	named  map[int64]bool
+	blocks [][]int64
+	n      int
+}
+
+// deltaSplitFor arranges root's delta for low, or declines: a program with
+// text slots or service blocks, a delta past segDeltaSplitMax, or a live row
+// whose value for a slot is not what a clean int64 block would hold there.
+func (src *segSource) deltaSplitFor(rootPage uint32, segs []*segment, low *segLowered, ipkCol int) (*segDeltaSplit, bool) {
+	if src.delta == nil {
+		return nil, false
+	}
+	ti, known := src.tableOf[rootPage]
+	if !known || low.textVar != nil || len(low.blocks) > 0 {
+		return nil, false
+	}
+	for _, t := range low.textCol {
+		if t {
+			return nil, false
+		}
+	}
+	live, dead := src.delta.live[ti], src.delta.dead[ti]
+	if len(live)+len(dead) > segDeltaSplitMax {
+		return nil, false
+	}
+	sp := &segDeltaSplit{named: make(map[int64]bool, len(live)+len(dead)), blocks: make([][]int64, len(low.cols))}
+	for rid := range dead {
+		sp.named[rid] = true
+	}
+	rids := make([]int64, 0, len(live))
+	for rid := range live {
+		sp.named[rid] = true
+		rids = append(rids, rid)
+	}
+	slices.Sort(rids) // ascending, as a scan meets them; the aggregates do not care, a reader of this might
+	for i := range sp.blocks {
+		sp.blocks[i] = make([]int64, len(rids))
+	}
+	for r, rid := range rids {
+		vals := live[rid]
+		for i, c := range low.cols {
+			asNull := i < len(low.nullCol) && low.nullCol[i]
+			isIPK := c == ipkCol && ipkCol >= 0
+			switch {
+			case asNull && isIPK:
+				sp.blocks[i][r] = 0 // the rowid is never NULL
+			case asNull:
+				if c >= len(vals) {
+					return nil, false
+				}
+				if vals[c].Typ == Null {
+					sp.blocks[i][r] = 1
+				}
+			case isIPK:
+				sp.blocks[i][r] = rid
+			default:
+				if c >= len(vals) || vals[c].Typ != Int {
+					return nil, false
+				}
+				sp.blocks[i][r] = vals[c].I
+			}
+		}
+	}
+	sp.n = len(rids)
+	return sp, true
+}
+
+// skipIn returns the positions in s of the rows the delta names, ascending.
+// A segment's rowids are sorted, so each is a binary search.
+func (sp *segDeltaSplit) skipIn(s *segment) []int {
+	if len(sp.named) == 0 || s.nRows == 0 {
+		return nil
+	}
+	lo, hi := int64(s.Rowid(0)), int64(s.Rowid(s.nRows-1))
+	var out []int
+	for rid := range sp.named {
+		if rid < lo || rid > hi {
+			continue
+		}
+		i := sort.Search(s.nRows, func(i int) bool { return int64(s.Rowid(i)) >= rid })
+		if i < s.nRows && int64(s.Rowid(i)) == rid {
+			out = append(out, i)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// runDelta runs the kernel over the delta's live rows.
+func (sp *segDeltaSplit) runDelta(kern *jit.Code, low *segLowered, regs []int64, res *segRunResult) bool {
+	if sp.n == 0 {
+		res.empty = true
+		return true
+	}
+	local := slices.Clone(regs)
+	var out, ovf int64
+	args := &jit.ProgArgs{N: int64(sp.n), Regs: &local[0], Out: &out, Overflow: &ovf}
+	for i, b := range sp.blocks {
+		args.Col[i] = &b[0]
+	}
+	if !segCallKernel(kern, args, nil, nil, nil, local) {
+		return false
+	}
+	res.out, res.ovf = out, ovf != 0
+	if low.agg != aggCountStar && low.agg != aggCount {
+		res.rows = local[low.rowsReg]
+	}
+	return true
 }

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"math"
+	"slices"
 	"sync/atomic"
 )
 
@@ -51,6 +52,10 @@ type segGroupAcc struct {
 	maxs    []int64
 	lastSeg int
 	lastRow int
+	// lastDelta is the argument values of the group's last row when that row is
+	// a delta row (the walk steps the log's rows after every segment's, so a
+	// group with any is last-stepped on one); nil when it is lastSeg/lastRow.
+	lastDelta []int64
 }
 
 // segGroupBulk's outcomes.
@@ -62,7 +67,7 @@ const (
 
 // preds, when not empty, is the WHERE: only rows satisfying it are summed, and a
 // group none of whose rows does never gets a bucket, as in the row walk.
-func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, rowids, keyVals []Value, preds []segPred) int {
+func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, rowids, keyVals []Value, preds []segPred, skips [][]int, deltaLive map[int64][]Value) int {
 	if len(plan.keyCols) != 1 || plan.agg.anchorCheck != nil {
 		return bulkNotEligible
 	}
@@ -117,6 +122,9 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		}
 	}
 	if lo > hi {
+		if len(deltaLive) > 0 {
+			return bulkNotEligible // only log rows: the walk takes them
+		}
 		return bulkAnswered // no rows: no groups, which is what the walk would leave
 	}
 
@@ -155,7 +163,8 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		} else {
 			pt.groups = map[int64]*segGroupAcc{}
 		}
-		if len(preds) == 0 && dense && segGroupDenseFlat(s, plan.argCols, b.key, b.args, needSum, needMM, lo, si, pt.slots) {
+		skip, sk := skips[si], 0
+		if len(preds) == 0 && dense && len(skip) == 0 && segGroupDenseFlat(s, plan.argCols, b.key, b.args, needSum, needMM, lo, si, pt.slots) {
 			return true
 		}
 		if len(preds) > 0 && !segPredColsFilterable(s, preds) {
@@ -166,6 +175,15 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		var flags [segFilterBatch]uint8
 		batchLo := -1
 		for r := 0; r < s.nRows; r++ {
+			// A row the log superseded or removed: its copy here is not the
+			// table's (segHashAggWalk's own skip, the same position list).
+			for sk < len(skip) && skip[sk] < r {
+				sk++
+			}
+			if sk < len(skip) && skip[sk] == r {
+				sk++
+				continue
+			}
 			if len(preds) > 0 {
 				if blo := r - r%segFilterBatch; blo != batchLo {
 					batchLo = blo
@@ -242,6 +260,59 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 			}
 		}
 	}
+	// The log's own live rows, after every segment's and in rowid order, as the
+	// walk steps them. A value the blocks could not have held -- not an
+	// integer, or a key outside the dense range -- leaves it to the walk;
+	// nothing has been written yet.
+	if len(deltaLive) > 0 {
+		rids := make([]int64, 0, len(deltaLive))
+		for rid := range deltaLive {
+			rids = append(rids, rid)
+		}
+		slices.Sort(rids)
+		keyCol := plan.keyCols[0]
+		for _, rid := range rids {
+			vals := deltaLive[rid]
+			if len(preds) > 0 {
+				matched, served := rowMatchesPreds(vals, preds)
+				if !served {
+					return bulkNotEligible
+				}
+				if !matched {
+					continue
+				}
+			}
+			if keyCol < 0 || keyCol >= len(vals) || vals[keyCol].Typ != Int {
+				return bulkNotEligible
+			}
+			k := vals[keyCol].I
+			if dense && (k < lo || k > hi) {
+				return bulkNotEligible
+			}
+			args := make([]int64, na)
+			for a, c := range plan.argCols {
+				if c < 0 || c >= len(vals) || vals[c].Typ != Int {
+					return bulkNotEligible
+				}
+				args[a] = vals[c].I
+			}
+			g := add(groups, slots, k)
+			g.n++
+			g.lastDelta = args
+			for a, v := range args {
+				g.mins[a], g.maxs[a] = min(g.mins[a], v), max(g.maxs[a], v)
+				g.sums[a] += v
+				u := uint64(v)
+				if v < 0 {
+					u = -u
+				}
+				if g.abs[a]+u < g.abs[a] || g.abs[a]+u > math.MaxInt64 {
+					return bulkNotEligible
+				}
+				g.abs[a] += u
+			}
+		}
+	}
 	var sparse map[int64]*segGroupAcc
 	if !dense {
 		sparse = groups
@@ -255,8 +326,14 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		if c := plan.keyCols[0]; c >= 0 && c < len(row) {
 			row[c] = val
 		}
-		for a, col := range b.args {
-			v := Value{Typ: Int, I: col[g.lastRow]}
+		lastArg := func(a int) int64 {
+			if g.lastDelta != nil {
+				return g.lastDelta[a]
+			}
+			return b.args[a][g.lastRow]
+		}
+		for a := range b.args {
+			v := Value{Typ: Int, I: lastArg(a)}
 			m.regs[plan.argRegs[a]] = v
 			if c := plan.argCols[a]; c >= 0 && c < len(row) {
 				row[c] = v
@@ -273,7 +350,7 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 			case aggSum:
 				a := argOf[it.rowRegs[aggExprArg]-1]
 				it.cnt += g.n - 1
-				it.iSum += g.sums[a] - b.args[a][g.lastRow]
+				it.iSum += g.sums[a] - lastArg(a)
 			case aggMin:
 				it.best = Value{Typ: Int, I: g.mins[argOf[it.rowRegs[aggExprArg]-1]]}
 			case aggMax:
