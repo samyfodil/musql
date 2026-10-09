@@ -7,7 +7,7 @@
 
 # musql
 
-*Pronounced "muscle."*
+*Pronounced "muscle." (In French)*
 
 **SQLite-compatible SQL, accelerated by columnar storage and a JIT compiler.**
 
