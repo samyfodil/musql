@@ -31,6 +31,7 @@ package engine
 
 import (
 	"fmt"
+	"strings"
 )
 
 // compileScanAggregate compiles a whole-table (no GROUP BY) aggregate, possibly
@@ -241,6 +242,14 @@ func compileScanAggregate(c *compiler, stmt *SelectStmt, srcs []joinSource, scop
 	c.emit(Instruction{Op: OpAggReset, P4: plan})
 
 	resultBase := c.allocN(len(outCols))
+	boundJump := -1
+	if root, max, ok := minMaxRowidQuery(c, stmt, srcs, plan, len(outCols)); ok {
+		p3 := 0
+		if max {
+			p3 = 1
+		}
+		boundJump = c.emit(Instruction{Op: OpRowidBound, P1: resultBase, P3: p3, P4: root})
+	}
 
 	// Constant-key seeks, as compileScanPlain does: without them an aggregate
 	// full-scanned even when the WHERE pinned a rowid or indexed column (count(*)
@@ -326,6 +335,9 @@ func compileScanAggregate(c *compiler, stmt *SelectStmt, srcs []joinSource, scop
 		havingReg := c.alloc()
 		c.emit(Instruction{Op: OpAggResult, P1: havingReg, P3: -1, P4: &aggResultInfo{plan: plan, set: aggSetHaving, idx: 0}})
 		havingJump = c.emit(Instruction{Op: OpIfNot, P1: havingReg, P3: 1})
+	}
+	if boundJump >= 0 {
+		c.patch(boundJump, c.here())
 	}
 	if !skipRow {
 		c.emit(Instruction{Op: OpResultRow, P1: resultBase, P2: len(outCols)})
@@ -3852,4 +3864,39 @@ func orderIsGroupKeyAscending(stmt *SelectStmt, gp *groupByPlan) bool {
 		}
 	}
 	return true
+}
+
+// minMaxRowidQuery recognises C's min/max-optimized shape (select.c
+// minMaxQuery): "SELECT min(x) FROM t" or max(x), where x is t's rowid or its
+// INTEGER PRIMARY KEY, over one ordinary rowid table of the main database, with
+// no WHERE, HAVING, LIMIT or OFFSET. Its answer is the table's first or last
+// rowid, which OpRowidBound reads without visiting the rows between: the scan
+// it falls back to was 20-35 ms at 100k rows, and a DELETE ... WHERE id =
+// (SELECT max(id) FROM t) ran it once per statement.
+func minMaxRowidQuery(c *compiler, stmt *SelectStmt, srcs []joinSource, plan *aggPlan, nOut int) (root uint32, max, ok bool) {
+	if nOut != 1 || len(stmt.Columns) != 1 || len(srcs) != 1 || stmt.Where != nil || stmt.Having != nil ||
+		len(stmt.GroupBy) != 0 || stmt.Limit != nil || stmt.Offset != nil || stmt.LimitParam != nil || stmt.OffsetParam != nil ||
+		plan.havingPlan != nil {
+		return 0, false, false
+	}
+	fe, isFunc := stmt.Columns[0].Expr.(FuncExpr)
+	if !isFunc || fe.Star || fe.Over != nil || fe.Filter != nil || len(fe.OrderBy) != 0 || len(fe.Args) != 1 {
+		return 0, false, false
+	}
+	switch strings.ToLower(fe.Name) {
+	case "max":
+		max = true
+	case "min":
+	default:
+		return 0, false, false
+	}
+	s := srcs[0]
+	if s.tbl == nil || s.tbl.withoutRowid || s.derived != nil || s.vtabItem != nil || s.cteItem != nil ||
+		s.catalogScope != scopeAny || s.dbIdx != 0 || len(s.memberScopes) != 0 || s.rightOuter || s.left {
+		return 0, false, false
+	}
+	if !isScopeRowidRef(c, s, fe.Args[0]) {
+		return 0, false, false
+	}
+	return s.tbl.root, max, true
 }

@@ -339,11 +339,17 @@ func openRowStoreCursor(tbl *tableMeta) *vdbeCursor {
 //   - Program.WritePager: a program reading a frozen snapshot is never cached,
 //     or "INSERT INTO t SELECT ... FROM t" would re-read its first snapshot.
 func (db *DB) cachedWriteProgram(sqlText string) (*Program, error) {
+	// reverse_unordered_selects is read at compile time -- the scan order a
+	// write's subqueries and its one-pass choice take -- so a program compiled
+	// under one setting is not the program for the other, as for the read plan
+	// cache (SetPragmaTuningValues drops that one).
+	reverse := db.pragmaState.ReverseUnorderedSelects()
 	if db.writePlans == nil || db.writePlanCookie != db.schemaGen || db.writePlanTxGen != db.txGen ||
-		db.writePlanStat1 != db.planStats() {
+		db.writePlanStat1 != db.planStats() || db.writePlanReverse != reverse {
 		db.writePlans = make(map[string]*Program)
 		db.writePlanCookie, db.writePlanTxGen = db.schemaGen, db.txGen
 		db.writePlanStat1 = db.planStats()
+		db.writePlanReverse = reverse
 	}
 	if p, ok := db.writePlans[sqlText]; ok {
 		return p, nil
@@ -355,7 +361,7 @@ func (db *DB) cachedWriteProgram(sqlText string) (*Program, error) {
 	if !segPeepholesOffForTest {
 		segWriteFilterPeephole(p) // see its doc comment for the shapes it may touch
 	}
-	if p.WritePager == nil {
+	if p.WritePager == nil || p.FreshWritePager {
 		db.writePlans[sqlText] = p
 	}
 	return p, nil
@@ -396,6 +402,13 @@ func (db *DB) execReturningViaVM(sqlText string, args []Value) (cols []string, r
 		params:       args,
 		wctx:         wc,
 		pager:        prog.WritePager,
+	}
+	if prog.FreshWritePager {
+		sp, serr := db.writeSubqueryPager()
+		if serr != nil {
+			return nil, nil, serr
+		}
+		m.pager = sp
 	}
 	if ferr := db.fkCheckTargets(prog); ferr != nil {
 		return nil, nil, ferr
@@ -469,6 +482,15 @@ func (db *DB) runWrite(prog *Program, args []Value) (rowsAffected int64, err err
 	m.params = args
 	m.wctx = wc
 	m.pager = prog.WritePager // subqueries read this snapshot (nil if none)
+	if prog.FreshWritePager {
+		// A cached program's subqueries read the image as it is now, as a
+		// fresh compile's would: the snapshot it was compiled against is old.
+		sp, serr := db.writeSubqueryPager()
+		if serr != nil {
+			return 0, serr
+		}
+		m.pager = sp
+	}
 	if ferr := db.fkCheckTargets(prog); ferr != nil {
 		return 0, ferr
 	}
@@ -1015,6 +1037,7 @@ func (db *DB) compileInsertStmt(stmt *insertStmt, trig *trigCompileCtx) (*Progra
 	//
 	// A trigger body takes the live branch below instead (vdbe_live_read.go).
 	var writePager *ReadOnlyPager
+	freshPager := false
 	if rowExprsContainSubquery(rows) {
 		sp, perr := db.writeSubqueryPager()
 		if perr != nil {
@@ -1032,6 +1055,7 @@ func (db *DB) compileInsertStmt(stmt *insertStmt, trig *trigCompileCtx) (*Progra
 			c.liveDB = db
 		} else {
 			writePager = sp
+			freshPager = trig == nil && len(stmt.ctes) == 0
 			// The leading WITH clause's CTEs, for the length of THIS COMPILE --
 			// the same push compileUpdateStmt/compileDeleteStmt do, and the
 			// reason insertStmt.ctes exists at all (dropping the clause
@@ -1163,7 +1187,7 @@ func (db *DB) compileInsertStmt(stmt *insertStmt, trig *trigCompileCtx) (*Progra
 	// is the frozen snapshot those subqueries read, and it also stops
 	// cachedWriteProgram reusing this program inside a transaction where the
 	// snapshot would be stale. Both are zero/nil when there is no subquery.
-	return &Program{Insns: c.insns, NReg: c.nReg, NRecRegs: c.nRec, NCursors: 1, NSubCache: c.nSub, WritePager: writePager, ColNames: colNames}, nil
+	return &Program{Insns: c.insns, NReg: c.nReg, NRecRegs: c.nRec, NCursors: 1, NSubCache: c.nSub, WritePager: writePager, FreshWritePager: freshPager, ColNames: colNames}, nil
 }
 
 // emitUpsertTail emits INSERT ... ON CONFLICT DO NOTHING / DO UPDATE for one
@@ -2447,6 +2471,7 @@ func (db *DB) compileDeleteStmt(stmt *deleteStmt, trig *trigCompileCtx) (*Progra
 	// one-pass kind, say what it is inside (whereSpan, update.c:804).
 	c.nQueryLoopKnown = true
 	var writePager *ReadOnlyPager
+	freshPager := false
 	if containsSubquery(stmt.where) {
 		sp, perr := db.writeSubqueryPager()
 		if perr != nil {
@@ -2460,6 +2485,7 @@ func (db *DB) compileDeleteStmt(stmt *deleteStmt, trig *trigCompileCtx) (*Progra
 			c.liveDB = db
 		} else {
 			writePager = sp
+			freshPager = trig == nil && len(stmt.ctes) == 0
 			// WITH CTEs are visible to this statement's WHERE subqueries, for the length
 			// of the compile; re-entered expressions carry Program.CTEScopeSnapshot.
 			if len(stmt.ctes) > 0 {
@@ -2575,7 +2601,7 @@ func (db *DB) compileDeleteStmt(stmt *deleteStmt, trig *trigCompileCtx) (*Progra
 	c.patch(rewind, c.here())
 	c.emit(Instruction{Op: OpHalt})
 
-	return &Program{Insns: c.insns, NReg: c.nReg, NCursors: c.nCursor, NSubCache: c.nSub, WritePager: writePager, ColNames: colNames}, nil
+	return &Program{Insns: c.insns, NReg: c.nReg, NCursors: c.nCursor, NSubCache: c.nSub, WritePager: writePager, FreshWritePager: freshPager, ColNames: colNames}, nil
 }
 
 // compileUpdateWrite compiles UPDATE into a row-store scan: WHERE, then each
@@ -2753,6 +2779,7 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 	// one-pass kind, say what it is inside (whereSpan, update.c:804).
 	c.nQueryLoopKnown = true
 	var writePager *ReadOnlyPager
+	freshPager := false
 	if hasSubquery {
 		sp, perr := db.writeSubqueryPager()
 		if perr != nil {
@@ -2766,6 +2793,7 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 			c.liveDB = db
 		} else {
 			writePager = sp
+			freshPager = trig == nil && len(stmt.ctes) == 0
 			// See compileDeleteStmt's identical push: a leading WITH clause's
 			// CTEs reach this statement's WHERE and SET subqueries, for this
 			// compile.
@@ -3169,7 +3197,7 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 		// a program whose WritePager is set.
 		writePager = upfromPager
 	}
-	return &Program{Insns: c.insns, NReg: c.nReg, NCursors: c.nCursor, NRecRegs: c.nRec, NSubCache: c.nSub, WritePager: writePager, ColNames: colNames}, nil
+	return &Program{Insns: c.insns, NReg: c.nReg, NCursors: c.nCursor, NRecRegs: c.nRec, NSubCache: c.nSub, WritePager: writePager, FreshWritePager: freshPager, ColNames: colNames}, nil
 }
 
 // compileDdlWrite compiles a CREATE TABLE / CREATE [UNIQUE] INDEX / DROP

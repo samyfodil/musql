@@ -377,3 +377,91 @@ func (s *rowStore) segMaxRowid() (uint64, bool) {
 
 // segSelPool holds walkFiltered's selection buffers.
 var segSelPool = sync.Pool{New: func() any { return new([]int64) }}
+
+// walkRowidsDesc is walkRowids from the other end: every live rowid of the
+// base, in descending order, stopping when yield returns false.
+func (b *segRows) walkRowidsDesc(yield func(uint64) bool) {
+	src := b.rp.segs
+	if src == nil {
+		return
+	}
+	segs := src.byRoot[b.root]
+	dRows, dead, _ := src.overlayFor(b.root)
+	di := len(dRows) - 1
+	for si := len(segs) - 1; si >= 0; si-- {
+		sg := segs[si]
+		for i := sg.nRows - 1; i >= 0; i-- {
+			rid := int64(sg.Rowid(i))
+			for di >= 0 && dRows[di].rowid > rid {
+				if !yield(uint64(dRows[di].rowid)) {
+					return
+				}
+				di--
+			}
+			if di >= 0 && dRows[di].rowid == rid {
+				if !yield(uint64(rid)) {
+					return
+				}
+				di--
+				continue
+			}
+			if dead[rid] {
+				continue
+			}
+			if !yield(uint64(rid)) {
+				return
+			}
+		}
+	}
+	for ; di >= 0; di-- {
+		if !yield(uint64(dRows[di].rowid)) {
+			return
+		}
+	}
+}
+
+// rowidBound is the store's smallest (max false) or largest rowid, by signed
+// order, and false for an empty store. Over segments it walks in from the
+// requested end and stops at the first rowid not dropped, instead of visiting
+// every row.
+func (s *rowStore) rowidBound(max bool) (uint64, bool) {
+	if s == nil {
+		return 0, false
+	}
+	if max && s.maxKnown {
+		return s.max, true
+	}
+	var best uint64
+	found := false
+	better := func(rid uint64) bool {
+		if !found {
+			return true
+		}
+		if max {
+			return rowidLess(best, rid)
+		}
+		return rowidLess(rid, best)
+	}
+	for rid := range s.m {
+		if better(rid) {
+			best, found = rid, true
+		}
+	}
+	if s.seg != nil && !s.baseGone {
+		pick := func(rid uint64) bool {
+			if s.gone[rid] {
+				return true
+			}
+			if better(rid) {
+				best, found = rid, true
+			}
+			return false // the first live rowid from this end is the bound
+		}
+		if max {
+			s.seg.walkRowidsDesc(pick)
+		} else {
+			s.seg.walkRowids(pick)
+		}
+	}
+	return best, found
+}

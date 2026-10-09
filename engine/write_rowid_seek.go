@@ -17,10 +17,10 @@ func detectWriteRowidSeekKey(c *compiler, tbl *tableMeta, cursor int, where Expr
 		if !ok || (be.Op != "=" && be.Op != "==") {
 			continue
 		}
-		if writeRowidRef(c, tbl, cursor, be.L) && isSeekKeyCandidate(be.R) {
+		if writeRowidRef(c, tbl, cursor, be.L) && isWriteSeekKeyCandidate(be.R) {
 			return be.R, true
 		}
-		if writeRowidRef(c, tbl, cursor, be.R) && isSeekKeyCandidate(be.L) {
+		if writeRowidRef(c, tbl, cursor, be.R) && isWriteSeekKeyCandidate(be.L) {
 			return be.L, true
 		}
 	}
@@ -58,12 +58,51 @@ func emitWriteRowidSeekHint(c *compiler, tbl *tableMeta, cursor int, where Expr)
 	if !ok {
 		return false
 	}
+	mark := len(c.insns)
 	reg, err := c.compileExpr(key)
 	if err != nil {
 		// Declining costs a full scan, which is where this started.
+		c.insns = c.insns[:mark]
+		return false
+	}
+	if !keyRunsBeforeTheLoop(c.insns[mark:], cursor) {
+		c.insns = c.insns[:mark]
 		return false
 	}
 	c.emit(Instruction{Op: OpSeekRowidHint, P1: cursor, P2: reg})
+	return true
+}
+
+// isWriteSeekKeyCandidate is isSeekKeyCandidate plus a scalar subquery: C
+// codes an uncorrelated one once, as a constant, and seeks with its value
+// ("DELETE FROM t WHERE id = (SELECT max(id) FROM t)" is one seek there, and
+// was a scan of every row here). Whether this one is uncorrelated is only
+// known once compiled -- keyRunsBeforeTheLoop.
+func isWriteSeekKeyCandidate(e Expr) bool {
+	if _, ok := e.(SubqueryExpr); ok {
+		return true
+	}
+	return isSeekKeyCandidate(e)
+}
+
+// keyRunsBeforeTheLoop reports whether a seek key compiled to insns can run
+// before the loop positions cursor: no correlated subquery (one re-runs
+// against the enclosing frame) and no read of cursor itself. An uncorrelated
+// subquery runs once and caches, so the WHERE that re-reads it on the row the
+// seek finds compares the same value.
+func keyRunsBeforeTheLoop(insns []Instruction, cursor int) bool {
+	for _, in := range insns {
+		switch in.Op {
+		case OpSubquery, OpExists:
+			if in.P5&p5Correlated != 0 {
+				return false
+			}
+		case OpColumn, OpRowid:
+			if in.P1 == cursor {
+				return false
+			}
+		}
+	}
 	return true
 }
 

@@ -252,3 +252,25 @@ func (p *ReadOnlyPager) SeekIndexRowidsSegments(rootPage uint32, col int, probe 
 	}
 	return p.segs.seekIndexRowids(rootPage, col, probe)
 }
+
+// RowidBound is min(rowid) (max false) or max(rowid) of the table rooted at
+// rootPage, as this pager reads it: from the session's live rows when it holds
+// the table, else from the committed segments and delta. served is false when
+// this pager has no segment source for it, and the caller scans.
+func (p *ReadOnlyPager) RowidBound(rootPage uint32, max bool) (rid uint64, found, served bool) {
+	if p == nil || p.segs == nil {
+		return 0, false, false
+	}
+	rows, live, err := p.segs.liveRows(rootPage)
+	if err != nil {
+		return 0, false, false
+	}
+	if !live {
+		if _, ok := p.segs.byRoot[rootPage]; !ok {
+			return 0, false, false
+		}
+		rows = &rowStore{seg: &segRows{rp: p, root: rootPage}}
+	}
+	rid, found = rows.rowidBound(max)
+	return rid, found, true
+}

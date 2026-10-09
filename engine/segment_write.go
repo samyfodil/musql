@@ -532,7 +532,11 @@ func (n *Session) commitMainLocked() (bool, error) {
 	// for the same question, and our own appends update seenStat, so a single
 	// writer's run of commits skips it entirely. Measured on the 500-commit
 	// segment-vs-C write bench: 955us per commit with it unconditional.
-	if n.pairStamp() != n.seenStat {
+	// The stamp is taken under the commit's write lock, so it stays the files'
+	// stamp until this commit writes: the compaction check below reuses it
+	// rather than stat'ing both files again.
+	lockedStamp := n.pairStamp()
+	if lockedStamp != n.seenStat {
 		if rerr := n.refreshPairIdentity(); rerr != nil {
 			return false, rerr
 		}
@@ -603,7 +607,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 	// own compaction check (compactIfWorthIt) rewrites at, appending it first
 	// only writes the rows twice -- once into the delta, once more into the
 	// file the compaction then builds. Rewrite now, once.
-	if !compactionOffForTest && n.compactionDueAfter(recs) {
+	if !compactionOffForTest && compactionDueAfter(lockedStamp, recs) {
 		if err := n.rewriteFile(); err != nil {
 			return false, err
 		}
@@ -630,8 +634,50 @@ func (n *Session) commitMainLocked() (bool, error) {
 	}
 	n.seenStat = n.pairStamp()
 	n.clearWrittenSinceCommit()
-	n.noteCommittedColumnsStale()
+	if !wasCurrent || !n.extendCommittedColumns(n.appendAt.lastBatch) {
+		n.noteCommittedColumnsStale()
+	}
+	n.appendAt.lastBatch = nil
 	return true, nil
+}
+
+// extendCommittedColumns brings the committed read view (DB.segColumns) past
+// the batch this commit just appended, by replaying that one batch into it
+// (applyBatch, the replay's own step), instead of marking it stale -- which
+// re-read the whole segment file and replayed the whole delta on the next
+// statement: 90% of a single-row write loop in wasm, where reading the file is
+// a copy of all of it, and 1.9 ms a statement for a DELETE with a subquery.
+//
+// Only a view that was current just before this commit is extended: any
+// other connection's commit reopens the session (RefreshIfStale) with a view
+// of its own, and every commit of this session either extends the view or
+// marks it stale, so a view not marked stale is the file as of this session's
+// previous commit. The caller passes wasCurrent too. false leaves the caller
+// to mark it stale: no view, a stale one, or a batch too big to have been kept.
+func (n *Session) extendCommittedColumns(batch []byte) bool {
+	db := n.DB
+	cols := db.segColumns
+	if batch == nil || cols == nil || db.segColumnsStale || cols.segs == nil {
+		return false
+	}
+	st := cols.segs.delta
+	if st == nil {
+		st = &segDeltaState{live: map[int]map[int64][]Value{}, dead: map[int]map[int64]bool{}, version: segDeltaVersion}
+	}
+	if err := st.applyBatch(batch); err != nil {
+		return false
+	}
+	st.endCtr, st.endPages = n.endCtr, n.endPages
+	st.batches++
+	cols.segs.delta = st
+	// A read source built over the view before this commit may hold a nil
+	// delta where there is one now, and its cache key need not have moved
+	// (the written flags are back to what they were): build the next afresh.
+	db.segSrcCache = nil
+	// The catalog-corruption verdict is keyed on the same generation a stale
+	// mark bumps; the rows moved, so it moves too.
+	db.schemaCorruptGen++
+	return true
 }
 
 // deltaAppendExceeds reports whether appending recs could leave main's segment
@@ -915,7 +961,13 @@ func (n *Session) Discard() error {
 // and ran for minutes (262ms without). It needs a session to survive its own
 // compaction without reloading every table.
 func (n *Session) CompactIfLargerThan(nBytes int64) (bool, error) {
-	if st := n.pairStamp()[1]; !st.there || st.size < nBytes {
+	return n.compactIfLargerThanAt(n.pairStamp(), nBytes)
+}
+
+// compactIfLargerThanAt is CompactIfLargerThan given the pair's stamp, for a
+// caller that holds a current one.
+func (n *Session) compactIfLargerThanAt(pair [2]fileStamp, nBytes int64) (bool, error) {
+	if st := pair[1]; !st.there || st.size < nBytes {
 		return false, nil
 	}
 	did, cerr := CompactSegmentFile(n.segPath)
@@ -1312,8 +1364,7 @@ func compactionThreshold(segSize int64) int64 {
 // compactionDueAfter reports whether appending recs would take the delta past
 // compactionThreshold, so the compaction after the commit would rewrite the
 // file anyway.
-func (n *Session) compactionDueAfter(recs []SegDeltaRecord) bool {
-	st := n.pairStamp()
+func compactionDueAfter(st [2]fileStamp, recs []SegDeltaRecord) bool {
 	if !st[0].there {
 		return false
 	}
@@ -1324,12 +1375,16 @@ func (n *Session) compactIfWorthIt() {
 	if compactionOffForTest {
 		return
 	}
-	st := n.pairStamp()[0]
+	// Runs right after this session's own commit, under the same write lock:
+	// seenStat is the stamp that commit just took of what it wrote, so the
+	// files are not stat'ed a third and fourth time.
+	pair := n.seenStat
+	st := pair[0]
 	if !st.there {
 		return
 	}
 	threshold := compactionThreshold(st.size)
-	did, cerr := n.CompactIfLargerThan(threshold)
+	did, cerr := n.compactIfLargerThanAt(pair, threshold)
 	if !did || cerr != nil {
 		return
 	}
@@ -1451,18 +1506,23 @@ func (n *Session) pairStamp() [2]fileStamp {
 // handle stops another process renaming or deleting the file.
 type heldStamp struct {
 	f *os.File
+	// fd is f.Fd(), taken once: on js/wasm each Fd() call also resets the
+	// descriptor's blocking mode through syscall/js, a round trip per stamp.
+	fd uintptr
 }
 
 func (h *heldStamp) stamp(path string) fileStamp {
 	if h.f != nil {
-		if size, mtime, linked, ok := fsstamp.OfFile(h.f.Fd()); ok && linked {
+		if size, mtime, linked, ok := fsstamp.OfFile(h.fd); ok && linked {
 			return fileStamp{size: size, mtime: mtime, there: true}
 		}
 		h.release()
 	}
 	st := stampOf(path)
 	if st.there && fsstamp.FileStamps {
-		h.f, _ = os.Open(path)
+		if h.f, _ = os.Open(path); h.f != nil {
+			h.fd = h.f.Fd()
+		}
 	}
 	return st
 }

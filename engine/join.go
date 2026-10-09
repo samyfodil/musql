@@ -267,13 +267,15 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 						return nil, nil, err
 					}
 				}
-				seq, errFn := rp.ScanTable(tbl.root)
-				for rowid, vals := range seq {
-					rows = append(rows, normalizeRow(tbl.name, tbl.cols, tbl.ipkIndex, rowid, vals))
-					rowids = append(rowids, int64(rowid))
-				}
-				if err := errFn(); err != nil {
-					return nil, nil, err
+				if !p.fromColumnsOnly {
+					seq, errFn := rp.ScanTable(tbl.root)
+					for rowid, vals := range seq {
+						rows = append(rows, normalizeRow(tbl.name, tbl.cols, tbl.ipkIndex, rowid, vals))
+						rowids = append(rowids, int64(rowid))
+					}
+					if err := errFn(); err != nil {
+						return nil, nil, err
+					}
 				}
 			} else if cscope, isCat, cerr := rp.schemaCatalogSourceScope(it); cerr != nil {
 				return nil, nil, cerr
@@ -571,7 +573,14 @@ func (p *ReadOnlyPager) derivedSelectScope(sub *SelectStmt, n int) derivedSelect
 	if sub == nil || len(sub.From) == 0 {
 		return derivedSelectScope{}
 	}
+	// Only the tables' columns are read from here on, never their rows: a
+	// base table's are left unloaded. Loading them made every compile of
+	// "... WHERE id = (SELECT max(id) FROM t)" read all of t to learn one
+	// column's affinity, and a write statement compiles every time.
+	saved := p.fromColumnsOnly
+	p.fromColumnsOnly = true
 	jts, _, err := p.resolveFrom(sub.From, nil)
+	p.fromColumnsOnly = saved
 	if err != nil {
 		return derivedSelectScope{}
 	}

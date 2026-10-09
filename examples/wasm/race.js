@@ -56,6 +56,14 @@ const QUERIES = [
 	["arithmetic over every row", "SELECT sum(v * 3 + k - id) FROM t", () => []],
 	["filtered GROUP BY", "SELECT k, count(*), sum(v) FROM t WHERE v > ? GROUP BY k ORDER BY k", (r) => [int(r, 1000000)]],
 	["correlated EXISTS", "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.id = t.bid AND b.id < ?)", (r, n) => [int(r, n)]],
+	// Single-row writes, each its own autocommit statement. They return no rows,
+	// so the read after them is what cross-checks them: both engines must be
+	// left holding the same data.
+	["UPDATE by rowid", "UPDATE t SET v = v + 1 WHERE id = ?", (r, n) => [1 + int(r, n)]],
+	["UPDATE by indexed column", "UPDATE t SET v = v + 1 WHERE sec = ?", (r, n) => [int(r, n)]],
+	["INSERT one row", "INSERT INTO b(label) VALUES(?)", (r) => [`row-${int(r, 1000000)}`]],
+	["DELETE the last row", "DELETE FROM b WHERE id = (SELECT max(id) FROM b)", () => []],
+	["state after the writes", "SELECT count(*), sum(v), (SELECT count(*) FROM b), (SELECT max(id) FROM b) FROM t", () => []],
 ];
 
 // seedSQL fills both engines identically. The inserts go in chunks of

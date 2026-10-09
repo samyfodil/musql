@@ -622,6 +622,12 @@ const (
 	// OpRecQueueCheck: the caps OpRecQueueFill applies after a recursive
 	// step, after an inlined one (recQueueCaps).
 	OpRecQueueCheck
+	// OpRowidBound: C's min/max optimization (select.c minMaxQuery, OP_Last).
+	// r[P1] = min(rowid) (P3 0) or max(rowid) (P3 1) of the table rooted at
+	// P4(uint32), NULL for an empty table, then jump to P2. Falls through,
+	// leaving r[P1] alone, when the pager cannot answer -- into the scan that
+	// computes it the slow way.
+	OpRowidBound
 	// OpRecQueuePop: P2: jump target when the queue is empty. P3: base register
 	// of the popped row. select.c:2796-2805: OP_Rewind queue, OP_NullRow
 	// current, OP_RowData/OP_Column into regCurrent, OP_Delete.
@@ -1060,6 +1066,11 @@ type Program struct {
 	// against here, and runWrite installs it as the VM's pager. See
 	// compileUpdateWrite/compileDeleteWrite.
 	WritePager *ReadOnlyPager
+	// FreshWritePager marks a WritePager that is db.writeSubqueryPager()'s
+	// pre-statement snapshot and nothing more (no CTE scope pushed on it, not a
+	// trigger's): such a program is cached, and every run reads a snapshot made
+	// for it instead (runWrite). Others are compiled per statement, as before.
+	FreshWritePager bool
 
 	// Ainc is the statement's pAinc list (insert.c:410-455): every
 	// AUTOINCREMENT table it may insert into, directly or through a trigger,
