@@ -152,6 +152,39 @@ connection, and row-level security for the Hrana server, where many clients
 share one database. SQLite has none, since it trusts whoever opens the file;
 a server cannot.
 
+## PostgreSQL and MySQL connections
+
+Servers beside Hrana, so applications use the driver they already have. Each
+is its own module, like `hrana/`, so the engine and driver still depend on
+nothing but `golang.org/x/sys`; the engine does not change. PostgreSQL first:
+its protocol is well specified, Go has a message codec for it (pgproto3, from
+pgx), and it is where demand -- and Turso -- is heading. MySQL is the same
+four layers after it, at somewhat more cost (a less tidy protocol, fewer Go
+building blocks).
+
+1. **Wire protocol, simple queries.** Startup and authentication (cleartext,
+   MD5, SCRAM), the simple query flow, text-format rows, errors with SQLSTATE
+   codes, transaction status. `psql` and simple-query clients work -- with
+   SQLite's SQL.
+2. **Extended protocol and types.** Parse/Bind/Describe/Execute, which pgx,
+   node-postgres, psycopg and JDBC all use; `$1` parameters; binary formats.
+   PostgreSQL reports a column's type before running the statement, where
+   SQLite types each value: types come from the declared type, `text`
+   otherwise. Most application drivers work.
+3. **Catalog emulation.** `pg_catalog` and `information_schema` as read-only
+   views over musql's catalog, and the `SET` / `SHOW` / `version()` traffic
+   drivers send at connect. ORMs (Prisma, Django, SQLAlchemy) and tools
+   (`psql`'s `\d`, DBeaver) work. Long tail: each tool's own catalog queries.
+4. **PostgreSQL's dialect** (`::` casts, `ILIKE`, `SERIAL`, schemas, real
+   booleans, `now()`): translated to the same AST before compiling. A
+   separate decision, taken only after 1-3: a dialect mismatch is a silent
+   wrong answer, so translation must refuse whatever it cannot map exactly.
+
+Stopping at 2 or 3 is a complete product -- PostgreSQL's protocol over
+SQLite's SQL, as Hrana is libSQL's protocol over it. Tested the way the Turso
+client job tests Hrana: real `psql`, pgx, node-postgres and psycopg against
+`musqld` in CI.
+
 ## Write path in the browser
 
 Single-row writes in wasm run at 20-25 us under Node; in the browser race,
