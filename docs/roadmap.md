@@ -117,6 +117,31 @@ to its left -- SQLite only allows it through a correlated scalar subquery),
 and `MERGE` (insert, update or delete by match in one statement, beyond what
 `INSERT ... ON CONFLICT` covers).
 
+**Foreign keys that hold.** musql enforces foreign keys as C SQLite does,
+DEFERRABLE ones checked at COMMIT included. What SQLite leaves sharp:
+
+- *Off unless every connection asks.* Enforcement is a per-connection PRAGMA,
+  so one connection that forgets it can break the database's integrity. A
+  database-level setting, stored in the catalog, makes every connection
+  enforce: `PRAGMA enforce_foreign_keys = ON` (a new name, so no existing
+  PRAGMA changes meaning).
+- *Errors that name the problem.* "FOREIGN KEY constraint failed" names no
+  constraint, table, column or value. Behind an opt-in PRAGMA (C SQLite's
+  error text stays the default, since applications match on it), the error
+  says which constraint, which child row and which missing parent value.
+- *Adding one checks what is there.* `ALTER TABLE ... ADD FOREIGN KEY` (with
+  the schema changes above) validates the existing rows and refuses with the
+  first violation, instead of SQLite's choice of accepting a constraint the
+  data already breaks.
+- *The missing index.* With no index on the child columns, every parent
+  DELETE or UPDATE scans the whole child table, silently. Options: index the
+  child columns automatically (as an automatic index, visible and
+  droppable), or report the unindexed foreign keys from a PRAGMA, as
+  `foreign_key_check` reports violations.
+- *ON DELETE / ON UPDATE actions already work*; what needs adding is
+  `foreign_key_check` over attached databases and a clear refusal, rather
+  than nothing, for a foreign key that names a table in another database.
+
 **Smaller ones.** `TRUNCATE`; `UPDATE` / `DELETE` with `ORDER BY` and `LIMIT`
 always available (a compile-time option in C SQLite, so builds disagree);
 foreign keys on by default per connection through a PRAGMA a server can set
