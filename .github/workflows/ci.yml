@@ -80,6 +80,23 @@ jobs:
           go test ./engine/ -race -count=15 -timeout=50m \
             -run 'TestN4ConcurrentWritersOnly|TestN4ConcurrentReadersAndWriters'
 
+
+  npm:
+    name: npm package (wasm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: build and test
+        working-directory: npm
+        run: |
+          sh build.sh
+          node test.mjs
   libp2p:
     name: libp2p example (nested module)
     runs-on: ubuntu-latest
