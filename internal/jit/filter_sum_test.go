@@ -1,6 +1,7 @@
 package jit
 
 import (
+	"unsafe"
 	"math/rand"
 	"testing"
 )
@@ -41,9 +42,9 @@ func TestEmittedVectorSumMatchesGo(t *testing.T) {
 			}
 			defer k.Close()
 			var sum, cnt int64
-			args := &Args{N: int64(n), XA: 0, XC: -1, Out: &sum, Out2: &cnt}
+			args := &Args{N: int64(n), XA: 0, XC: -1, Out: unsafe.Pointer(&sum), Out2: unsafe.Pointer(&cnt)}
 			if n > 0 {
-				args.A, args.C, args.V = &a[0], &c[0], &v[0]
+				args.A, args.C, args.V = unsafe.Pointer(&a[0]), unsafe.Pointer(&c[0]), unsafe.Pointer(&v[0])
 			}
 			k.Call(args)
 			var wantSum, wantCnt int64

@@ -3,6 +3,7 @@
 package jit
 
 import (
+	"unsafe"
 	"math/rand"
 	"testing"
 )
@@ -30,7 +31,7 @@ func BenchmarkFilterJITvsGo(b *testing.B) {
 	b.Logf("kernel is %d bytes of machine code", k.Size)
 
 	var out int64
-	args := &Args{A: &a[0], C: &c[0], N: n, XA: 500_000, XC: 7, Out: &out}
+	args := &Args{A: unsafe.Pointer(&a[0]), C: unsafe.Pointer(&c[0]), N: n, XA: 500_000, XC: 7, Out: unsafe.Pointer(&out)}
 	k.Call(args)
 	want := 0
 	for i := range a {
@@ -92,7 +93,7 @@ func BenchmarkFilterVectorvsGo(b *testing.B) {
 	b.Logf("vector kernel is %d bytes of machine code", k.Size)
 
 	var out int64
-	args := &Args{A: &a[0], C: &c[0], N: n, XA: 500_000, XC: 7, Out: &out}
+	args := &Args{A: unsafe.Pointer(&a[0]), C: unsafe.Pointer(&c[0]), N: n, XA: 500_000, XC: 7, Out: unsafe.Pointer(&out)}
 	k.Call(args)
 	want := 0
 	for i := range a {

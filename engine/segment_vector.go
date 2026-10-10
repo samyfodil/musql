@@ -524,13 +524,13 @@ func vecSumsJIT(k *jit.Code, l2 bool, heap []byte, offs []int, q []float32) ([]f
 		if ks := jitVecKernelOf(jitVecKey{l2: l2, strided: true}); ks != nil {
 			sums := make([]float32, 2*n)
 			args := jit.Args{
-				A:    (*int64)(unsafe.Pointer(&heap[offs[0]])),
+				A:    unsafe.Pointer(&heap[offs[0]]),
 				XC:   int64(4 * len(q)),
-				V:    (*int64)(unsafe.Pointer(unsafe.SliceData(q))),
+				V:    unsafe.Pointer(unsafe.SliceData(q)),
 				N:    int64(n),
 				XA:   int64(len(q)),
-				Out:  (*int64)(unsafe.Pointer(&sums[0])),
-				Out2: (*int64)(unsafe.Pointer(&sums[n])),
+				Out:  unsafe.Pointer(&sums[0]),
+				Out2: unsafe.Pointer(&sums[n]),
 			}
 			ks.Call(&args)
 			return sums, n
@@ -557,13 +557,13 @@ func vecSumsJIT(k *jit.Code, l2 bool, heap []byte, offs []int, q []float32) ([]f
 	}
 	sums := make([]float32, 2*n)
 	args := jit.Args{
-		A:    (*int64)(unsafe.Pointer(unsafe.SliceData(heap))),
-		C:    (*int64)(unsafe.Pointer(unsafe.SliceData(idx))),
-		V:    (*int64)(unsafe.Pointer(unsafe.SliceData(q))),
+		A:    unsafe.Pointer(unsafe.SliceData(heap)),
+		C:    unsafe.Pointer(unsafe.SliceData(idx)),
+		V:    unsafe.Pointer(unsafe.SliceData(q)),
 		N:    int64(n),
 		XA:   int64(len(q)),
-		Out:  (*int64)(unsafe.Pointer(&sums[0])),
-		Out2: (*int64)(unsafe.Pointer(&sums[n])),
+		Out:  unsafe.Pointer(&sums[0]),
+		Out2: unsafe.Pointer(&sums[n]),
 	}
 	k.Call(&args)
 	return sums, n

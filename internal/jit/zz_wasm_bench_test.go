@@ -2,6 +2,8 @@
 
 package jit
 
+import "unsafe"
+
 import "testing"
 
 func benchKernel(b *testing.B, emit func(Cond, bool, Cond) ([]byte, error), two bool) {
@@ -16,7 +18,7 @@ func benchKernel(b *testing.B, emit func(Cond, bool, Cond) ([]byte, error), two 
 		b.Fatal(err)
 	}
 	var out, out2 int64
-	args := &Args{A: &a[0], C: &c[0], V: &v[0], N: n, XA: 500000, XC: 3, Out: &out, Out2: &out2}
+	args := &Args{A: unsafe.Pointer(&a[0]), C: unsafe.Pointer(&c[0]), V: unsafe.Pointer(&v[0]), N: n, XA: 500000, XC: 3, Out: unsafe.Pointer(&out), Out2: unsafe.Pointer(&out2)}
 	b.ResetTimer()
 	for range b.N {
 		k.Call(args)

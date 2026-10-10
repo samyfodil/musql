@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"unsafe"
 	"sync"
 
 	"github.com/samyfodil/musql/internal/jit"
@@ -124,16 +125,16 @@ func jitFilterCount(s *segment, preds []segPred) int {
 		cols[i] = col
 	}
 	n := len(cols[0])
-	args := jit.Args{A: &cols[0][0], XA: preds[0].Val.I}
+	args := jit.Args{A: unsafe.Pointer(&cols[0][0]), XA: preds[0].Val.I}
 	if len(preds) == 2 {
 		n = min(n, len(cols[1]))
-		args.C, args.XC = &cols[1][0], preds[1].Val.I
+		args.C, args.XC = unsafe.Pointer(&cols[1][0]), preds[1].Val.I
 	}
 	if n == 0 {
 		return 0
 	}
 	var out int64
-	args.N, args.Out = int64(n), &out
+	args.N, args.Out = int64(n), unsafe.Pointer(&out)
 	k.Call(&args)
 	return int(out)
 }
@@ -184,9 +185,9 @@ func jitFilterSumRange(k *jit.Code, cols [][]int64, preds []segPred, vals []int6
 		return 0, 0
 	}
 	var out, cnt int64
-	args := jit.Args{A: &cols[0][lo], XA: preds[0].Val.I, V: &vals[lo], N: int64(hi - lo), Out: &out, Out2: &cnt}
+	args := jit.Args{A: unsafe.Pointer(&cols[0][lo]), XA: preds[0].Val.I, V: unsafe.Pointer(&vals[lo]), N: int64(hi - lo), Out: unsafe.Pointer(&out), Out2: unsafe.Pointer(&cnt)}
 	if len(preds) == 2 {
-		args.C, args.XC = &cols[1][lo], preds[1].Val.I
+		args.C, args.XC = unsafe.Pointer(&cols[1][lo]), preds[1].Val.I
 	}
 	k.Call(&args)
 	return out, int(cnt)
