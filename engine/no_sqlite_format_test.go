@@ -29,7 +29,8 @@ func TestEngineCarriesNoSQLiteFormat(t *testing.T) {
 }
 
 // TestOnlyTheCLICallsTheConverter: in this module, the converter's only
-// importers are its own package and the conversion tool.
+// importers are its own package, the conversion tool and the npm package's
+// wasm module (which converts files a browser hands it).
 func TestOnlyTheCLICallsTheConverter(t *testing.T) {
 	conv := `"github.com/samyfodil/musql/convert/` + `sqlite"`
 	root := ".."
@@ -40,7 +41,7 @@ func TestOnlyTheCLICallsTheConverter(t *testing.T) {
 		rel, _ := filepath.Rel(root, path)
 		if d.IsDir() {
 			// compat-harness is a module of its own, whose oracle is C SQLite.
-			if rel == "compat-harness" || rel == "convert" || rel == filepath.Join("cmd", "musql-convert") || strings.HasPrefix(d.Name(), ".") && rel != "." {
+			if rel == "compat-harness" || rel == "convert" || rel == filepath.Join("cmd", "musql-convert") || rel == filepath.Join("npm", "wasm") || strings.HasPrefix(d.Name(), ".") && rel != "." {
 				return filepath.SkipDir
 			}
 			return nil
@@ -53,7 +54,7 @@ func TestOnlyTheCLICallsTheConverter(t *testing.T) {
 			return rerr
 		}
 		if strings.Contains(string(b), conv) {
-			t.Errorf("%s imports the converter: only cmd/musql-convert may", rel)
+			t.Errorf("%s imports the converter: only cmd/musql-convert and npm/wasm may", rel)
 		}
 		return nil
 	})

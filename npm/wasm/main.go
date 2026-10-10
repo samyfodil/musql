@@ -12,6 +12,7 @@
 //	musql_close(handle)
 //	musql_query(handle, sqlLen, argsLen) -> outLen: {"columns","rows"} or {"error"}
 //	musql_exec(handle, sqlLen, argsLen)  -> outLen: {"changes","lastInsertRowid"} or {"error"}
+//	musql_convert(toSQLite, srcLen, dstLen) -> outLen: {} or {"error"}
 //
 // An argument is a tag byte then its value: 0 NULL, 1 int64 (8 bytes LE),
 // 2 float64 (8 bytes LE), 3 text and 4 blob (a 4-byte LE length, then the
@@ -30,6 +31,7 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
+	sqlite "github.com/samyfodil/musql/convert/sqlite"
 	"github.com/samyfodil/musql/driver"
 )
 
@@ -127,6 +129,32 @@ func musqlExec(h int32, sqlLen, argsLen uint32) uint32 {
 		}
 	}
 	outBuf = appendError(outBuf[:0], err)
+	return uint32(len(outBuf))
+}
+
+// musql_convert converts the file at the inbuf's first srcLen bytes (a path)
+// into the next dstLen: a SQLite file into a musql database, or with toSQLite
+// set, a musql database into a SQLite file. The package moves SQLite files in
+// and out of the browser through it, so they never meet the engine.
+//
+//go:wasmexport musql_convert
+func musqlConvert(toSQLite int32, srcLen, dstLen uint32) uint32 {
+	var err error
+	if uint64(srcLen)+uint64(dstLen) > uint64(len(inBuf)) {
+		err = errors.New("musql: request past its buffer")
+	} else {
+		src, dst := string(inBuf[:srcLen]), string(inBuf[srcLen:srcLen+dstLen])
+		if toSQLite != 0 {
+			err = sqlite.Export(src, dst, 0)
+		} else {
+			err = sqlite.Import(src, dst, sqlite.ImportOptions{})
+		}
+	}
+	if err != nil {
+		outBuf = appendError(outBuf[:0], err)
+	} else {
+		outBuf = append(outBuf[:0], "{}"...)
+	}
 	return uint32(len(outBuf))
 }
 
