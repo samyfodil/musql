@@ -346,6 +346,9 @@ type Conn struct {
 	// connection holds a reference on (released by Close).
 	memPrivate bool
 	memShared  string
+	// memGone is the in-memory attachments' files, removed once the sessions
+	// that hold them have closed (Close).
+	memGone []string
 }
 
 // stampReadPager carries every piece of CONNECTION state a read-only pager
@@ -490,18 +493,24 @@ func (c *Conn) Close() error {
 	// cleanupAttached below may still need a session. A held transaction needs no
 	// special handling -- c.tx's own discardSession below is live code, not
 	// deferred, so it completes before any defer here fires.
-	defer c.closeSessions()
+	//
+	// The in-memory databases' files go only after their sessions have closed:
+	// closing a session releases its lock and so recreates its lock file, and
+	// removing the files first left that file, and the delta log, behind.
+	defer func() {
+		c.closeSessions()
+		for _, p := range c.memGone {
+			engine.RemoveDatabaseFiles(p)
+		}
+		if c.memPrivate {
+			engine.RemoveDatabaseFiles(c.path)
+		}
+		if c.memShared != "" {
+			releaseSharedMem(c.memShared)
+		}
+	}()
 	defer c.dropTempObjects() // TEMP objects live only as long as their connection
-	defer c.cleanupAttached() // remove any private temp files backing ':memory:' attaches
-	if c.memPrivate {
-		defer func() {
-			os.Remove(c.path)
-			os.Remove(c.path + "-journal")
-		}()
-	}
-	if c.memShared != "" {
-		defer releaseSharedMem(c.memShared)
-	}
+	defer c.cleanupAttached()
 	if c.tx != nil {
 		db := c.tx
 		c.tx, c.txSavepoint = nil, ""

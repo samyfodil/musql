@@ -214,7 +214,13 @@ func (c *Conn) detach(name string) error {
 		if r33sIdentEq(a.name, name) {
 			c.attached = append(c.attached[:i], c.attached[i+1:]...)
 			if a.isMem {
-				os.Remove(a.path)
+				// An in-memory database ends here: its session first (which
+				// holds its mapping and its lock), then every file of it.
+				if nw := c.ndbs[a.path]; nw != nil {
+					nw.Close()
+					delete(c.ndbs, a.path)
+				}
+				engine.RemoveDatabaseFiles(a.path)
 			}
 			return nil
 		}
@@ -222,12 +228,12 @@ func (c *Conn) detach(name string) error {
 	return fmt.Errorf("driver: no such database: %s", name)
 }
 
-// cleanupAttached removes any private temp files backing ':memory:' attached
-// databases. Called from Conn.Close.
+// cleanupAttached forgets the attachments, noting the private temp files
+// backing ':memory:' ones for Close to remove once their sessions have closed.
 func (c *Conn) cleanupAttached() {
 	for _, a := range c.attached {
 		if a.isMem {
-			os.Remove(a.path)
+			c.memGone = append(c.memGone, a.path) // removed once its session closes
 		}
 	}
 	c.attached = nil
