@@ -20,21 +20,24 @@
 //     temporary) and X18 (darwin's platform register) alone.
 package jit
 
-import "strconv"
+import (
+	"strconv"
+	"unsafe"
+)
 
 // Args is the single struct a generated kernel reads, at fixed byte offsets.
 // APPEND ONLY -- see the package comment.
 type Args struct {
-	A   *int64 // first column block                 (offset 0)
-	C   *int64 // second column block, or nil        (offset 8)
+	A   unsafe.Pointer // first column block                 (offset 0)
+	C   unsafe.Pointer // second column block, or nil        (offset 8)
 	N   int64  // rows                                (offset 16)
 	XA  int64  // first comparison constant           (offset 24)
 	XC  int64  // second comparison constant          (offset 32)
-	Out *int64 // where the kernel writes its answer  (offset 40)
+	Out unsafe.Pointer // where the kernel writes its answer  (offset 40)
 	// EmitFilterSumSIMD only: the column summed over matching rows, and where
 	// the number of matching rows goes (Out receives the sum).
-	V    *int64 // (offset 48)
-	Out2 *int64 // (offset 56)
+	V    unsafe.Pointer // (offset 48)
+	Out2 unsafe.Pointer // (offset 56)
 }
 
 // Byte offsets of Args' fields, asserted by TestArgsLayout. Generated code uses

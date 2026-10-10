@@ -118,11 +118,11 @@ func quantizeRowsJIT(heap []byte, offs []int, dims int, side *segVecSide, first 
 	}
 	bits := make([]uint32, n)
 	args := jit.Args{
-		A:   (*int64)(unsafe.Pointer(&heap[offs[0]])),
+		A:   unsafe.Pointer(&heap[offs[0]]),
 		XC:  int64(4 * dims),
 		N:   int64(n),
 		XA:  int64(dims),
-		Out: (*int64)(unsafe.Pointer(&bits[0])),
+		Out: unsafe.Pointer(&bits[0]),
 	}
 	kMax.Call(&args)
 	inv := make([]float32, n)
@@ -140,9 +140,9 @@ func quantizeRowsJIT(heap []byte, offs []int, dims int, side *segVecSide, first 
 			inv[i] = 1 / scale
 		}
 	}
-	args.V = (*int64)(unsafe.Pointer(&inv[0]))
-	args.Out = (*int64)(unsafe.Pointer(&side.codes[first*dims]))
-	args.Out2 = (*int64)(unsafe.Pointer(&side.c1[first]))
+	args.V = unsafe.Pointer(&inv[0])
+	args.Out = unsafe.Pointer(&side.codes[first*dims])
+	args.Out2 = unsafe.Pointer(&side.c1[first])
 	kQuant.Call(&args)
 	for i := range n {
 		if inv[i] == 0 { // the special rows: code 0 (or, non-finite, unused)
@@ -480,11 +480,11 @@ func (vq *vecQuery) dots(side *segVecSide, lo, hi int) []int32 {
 	out := make([]int32, hi-lo)
 	if k := jitI8DotKernel(); k != nil && d%16 == 0 && hi > lo {
 		args := jit.Args{
-			A:   (*int64)(unsafe.Pointer(&side.codes[lo*d])),
-			C:   (*int64)(unsafe.Pointer(unsafe.SliceData(vq.t16))),
+			A:   unsafe.Pointer(&side.codes[lo*d]),
+			C:   unsafe.Pointer(unsafe.SliceData(vq.t16)),
 			N:   int64(hi - lo),
 			XA:  int64(d),
-			Out: (*int64)(unsafe.Pointer(&out[0])),
+			Out: unsafe.Pointer(&out[0]),
 		}
 		k.Call(&args)
 		return out

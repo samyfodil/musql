@@ -64,9 +64,9 @@ func TestEmittedFilterMatchesGo(t *testing.T) {
 				t.Fatalf("map: %v", err)
 			}
 			var out int64
-			args := &Args{N: int64(n), XA: 0, Out: &out}
+			args := &Args{N: int64(n), XA: 0, Out: unsafe.Pointer(&out)}
 			if n > 0 {
-				args.A, args.C = &a[0], &c[0]
+				args.A, args.C = unsafe.Pointer(&a[0]), unsafe.Pointer(&c[0])
 			}
 			k.Call(args)
 			want := 0
@@ -91,9 +91,9 @@ func TestEmittedFilterMatchesGo(t *testing.T) {
 					t.Fatalf("map: %v", err)
 				}
 				out = 0
-				args := &Args{N: int64(n), XA: 0, XC: 1, Out: &out}
+				args := &Args{N: int64(n), XA: 0, XC: 1, Out: unsafe.Pointer(&out)}
 				if n > 0 {
-					args.A, args.C = &a[0], &c[0]
+					args.A, args.C = unsafe.Pointer(&a[0]), unsafe.Pointer(&c[0])
 				}
 				k.Call(args)
 				want := 0
@@ -147,9 +147,9 @@ func TestEmittedVectorFilterMatchesGo(t *testing.T) {
 				t.Fatalf("map: %v", err)
 			}
 			var out int64
-			args := &Args{N: int64(n), XA: 0, Out: &out}
+			args := &Args{N: int64(n), XA: 0, Out: unsafe.Pointer(&out)}
 			if n > 0 {
-				args.A = &a[0]
+				args.A = unsafe.Pointer(&a[0])
 			}
 			k.Call(args)
 			want := 0
@@ -174,9 +174,9 @@ func TestEmittedVectorFilterMatchesGo(t *testing.T) {
 					t.Fatalf("map: %v", err)
 				}
 				var out int64
-				args := &Args{N: int64(n), XA: 0, XC: -1, Out: &out}
+				args := &Args{N: int64(n), XA: 0, XC: -1, Out: unsafe.Pointer(&out)}
 				if n > 0 {
-					args.A, args.C = &a[0], &c[0]
+					args.A, args.C = unsafe.Pointer(&a[0]), unsafe.Pointer(&c[0])
 				}
 				k.Call(args)
 				want := 0
