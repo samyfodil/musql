@@ -35,18 +35,24 @@ thousand vectors) need.
 **3. Indexes.** Done. `CREATE INDEX ... (libsql_vector_idx(v, ...))` and
 `vector_top_k(index, query, k)` take libSQL's syntax, options, write-time
 checks and error texts (engine/vector_index.go), so an application ports
-unchanged. Two modes:
+unchanged. Two kinds of search:
 
-- Exact, the default: the rows ranked by exact distance through the step-2
-  search, recall always 100%.
-- Approximate, when any of libSQL's graph options is given (`max_neighbors`,
-  `alpha`, `insert_l`, `search_l`, `compress_neighbors`): libSQL's DiskANN
+- Exact: the rows ranked by exact distance through the step-2 search, recall
+  always 100%.
+- Approximate: libSQL's DiskANN
   graph, one per table, each option meaning what it means in libSQL
   (engine/segment_vector_graph.go). The walk compares int8 codes through a
   gathering SIMD kernel (AVX2, NEON, SIMD128); the beam it finds is ranked by
   exact distances, so only recall is approximate. The graph is built in the
   background on the first approximate search, which, like every search until
   the graph is ready, is answered exactly.
+
+An index given any of libSQL's graph options (`max_neighbors`, `alpha`,
+`insert_l`, `search_l`, `compress_neighbors`) is approximate. One given none,
+which is how libSQL applications write them, is auto: exact up to 100k rows,
+approximate with libSQL's defaults past that. The crossover, measured on the M4
+with clustered vectors (BenchmarkVectorCrossover): exact 12 / 22 / 42 ms at
+250k / 500k / 1M rows, the graph 0.6 / 1.1 / 2.1 ms.
 
 At 100k x 384 on the M4 (BenchmarkVectorTopK), clustered vectors: exact
 2.5-4.4 ms, approximate 0.84 ms at recall@10 9/10, libSQL 6.1 ms at 10/10.

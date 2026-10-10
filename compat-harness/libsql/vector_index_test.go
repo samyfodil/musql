@@ -209,8 +209,8 @@ func TestVectorTopK(t *testing.T) {
 	}
 }
 
-// TestVectorTopKApprox checks the approximate mode a graph-tuning option turns
-// on. Strict about everything but recall: each row returned must be a real
+// TestVectorTopKApprox checks the approximate mode a graph option turns on,
+// and the one an index with none takes past the auto threshold. Strict about everything but recall: each row returned must be a real
 // row the index admits, in exact distance order (its rank in the exact
 // ranking only rising), and recall@k against the exact answer must reach a
 // floor on clustered data, the shape embeddings have.
@@ -245,7 +245,10 @@ func TestVectorTopKApprox(t *testing.T) {
 			t.Fatal(s, err)
 		}
 	}
+	// An index with no option is auto: approximate past the threshold.
+	defer engine.SetVecAutoGraphRowsForTest(engine.SetVecAutoGraphRowsForTest(10_000))
 	for _, tb := range []struct{ name, opts, dist string }{
+		{"auto", "", "vector_distance_cos"},
 		{"a", "'search_l=200'", "vector_distance_cos"},
 		{"b", "'metric=l2', 'max_neighbors=100', 'search_l=100'", "vector_distance_l2"},
 		{"c", "'search_l=10'", "vector_distance_cos"},
@@ -270,7 +273,11 @@ func TestVectorTopKApprox(t *testing.T) {
 		}
 		// The index is created on musql only: libSQL's graph build is not
 		// what this test compares against.
-		if _, err := m.Exec(fmt.Sprintf("CREATE INDEX %s_i ON %s(libsql_vector_idx(e, %s))", tb.name, tb.name, tb.opts)); err != nil {
+		opts := ""
+		if tb.opts != "" {
+			opts = ", " + tb.opts
+		}
+		if _, err := m.Exec(fmt.Sprintf("CREATE INDEX %s_i ON %s(libsql_vector_idx(e%s))", tb.name, tb.name, opts)); err != nil {
 			t.Fatal(err)
 		}
 		exec("VACUUM")

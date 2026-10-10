@@ -289,3 +289,40 @@ func fillRows(b *testing.B, db *sql.DB, d int, vecs [][]byte) {
 		b.Fatal(err)
 	}
 }
+
+// BenchmarkVectorCrossover finds where the graph overtakes the exact search:
+// musql's two modes on clustered vectors of 384 dimensions at growing sizes,
+// the graph timed once it is ready.
+func BenchmarkVectorCrossover(b *testing.B) {
+	const d, k = 384, 10
+	// The index with no option must stay exact at every size measured.
+	defer engine.SetVecAutoGraphRowsForTest(engine.SetVecAutoGraphRowsForTest(math.MaxInt))
+	q := clusteredBlobs(rand.New(rand.NewPCG(9, 9)), 1, d)[0]
+	for _, n := range []int{250_000, 500_000, 1_000_000} {
+		db := open(b, "sqlite", ":memory:")
+		fillRows(b, db, d, clusteredBlobs(rand.New(rand.NewPCG(1, 1)), n, d))
+		for _, mode := range []struct{ name, opts string }{{"exact", ""}, {"graph", ", 'search_l=200'"}} {
+			if _, err := db.Exec("CREATE INDEX i_" + mode.name + " ON docs(libsql_vector_idx(emb" + mode.opts + "))"); err != nil {
+				b.Fatal(err)
+			}
+			stmt := fmt.Sprintf("SELECT id FROM vector_top_k('i_%s', ?, %d)", mode.name, k)
+			b.Run(fmt.Sprintf("n=%d/%s", n, mode.name), func(b *testing.B) {
+				rows, err := db.Query(stmt, q)
+				if err != nil {
+					b.Fatal(err)
+				}
+				rows.Close()
+				engine.VecGraphsBuiltForTest()
+				for b.Loop() {
+					rows, err := db.Query(stmt, q)
+					if err != nil {
+						b.Fatal(err)
+					}
+					for rows.Next() {
+					}
+					rows.Close()
+				}
+			})
+		}
+	}
+}

@@ -4,23 +4,29 @@
 //	SELECT id FROM vector_top_k('i', vector('[...]'), 10)
 //
 // libSQL keeps an approximate DiskANN graph in shadow tables and answers
-// vector_top_k from it, so its rows are a guess at the nearest k. Here the
-// index stores nothing -- on this format no index does -- and vector_top_k
-// ranks rows by their exact distance, through the JIT search over the column
-// when it can (segment_vector.go) and a scan of the table otherwise. Every row
-// returned is one an exact nearest-neighbour search returns, in distance
-// order; equal distances go by rowid, and a zero vector's cosine (NaN) ranks
-// last.
+// vector_top_k from it. Here the index stores nothing -- on this format no
+// index does -- and a search is one of two kinds:
+//
+//   - exact: the rows ranked by their exact distance, through the JIT search
+//     over the column when it can (segment_vector.go) and a scan of the table
+//     otherwise. Equal distances go by rowid, and a zero vector's cosine (NaN)
+//     ranks last.
+//   - approximate: a walk of libSQL's graph, built in the background, whose
+//     beam is then ranked exactly (segment_vector_graph.go).
+//
+// An index given any of libSQL's graph options (max_neighbors, alpha,
+// insert_l, search_l, compress_neighbors) is approximate. One given none is
+// auto: exact until its table reaches vecAutoGraphRows rows, where reading
+// every row stops being the faster search, and approximate with libSQL's
+// defaults from there. Either way a search is exact until its graph is ready.
 //
 // The SQL is libSQL's: the same DDL and options, the same checks when the
 // index is created and when a row is written (type and dimensions), the same
 // error texts, and the same output column, id, the row's rowid. Ported from
 // libSQL's vectorIndex.c (vectorIndexCreate, parseVectorIdxParam,
 // vectorIdxParseColumnType, vectorIndexSearch) and vectorvtab.c. Not
-// reproduced: the shadow tables libSQL adds to sqlite_schema, and its
-// graph-tuning options, which are validated and otherwise have nothing to
-// tune. A WITHOUT ROWID table's index is accepted, as in libSQL, and its
-// search declines.
+// reproduced: the shadow tables libSQL adds to sqlite_schema. A WITHOUT ROWID
+// table's index is accepted, as in libSQL, and its search declines.
 package engine
 
 import (
@@ -104,6 +110,22 @@ func vecColumnType(decl string) (vecType, int, string) {
 		return ct.typ, dims, ""
 	}
 	return 0, 0, "unexpected vector column type"
+}
+
+// vecAutoGraphRows is the table size from which an index given no graph
+// option searches a graph instead of every row; vecAutoApprox is the graph's
+// options, libSQL's defaults.
+var (
+	vecAutoGraphRows = 100_000
+	vecAutoApprox    = vecApprox{alpha: 1.2, insertL: 70, searchL: 200}
+)
+
+// SetVecAutoGraphRowsForTest sets the size from which an index with no graph
+// option turns approximate, returning the old one.
+func SetVecAutoGraphRowsForTest(n int) int {
+	old := vecAutoGraphRows
+	vecAutoGraphRows = n
+	return old
 }
 
 // vecCompressTypes is compress_neighbors' words.
@@ -270,7 +292,8 @@ func vectorIndexOf(stmt *parsedCreateIndex, tbl *tableMeta) (*vecIndex, error) {
 		}
 		if name != "type" && name != "metric" {
 			if vi.approx == nil {
-				vi.approx = &vecApprox{alpha: 1.2, insertL: 70, searchL: 200} // libSQL's defaults
+				a := vecAutoApprox // libSQL's defaults
+				vi.approx = &a
 			}
 			switch name {
 			case "max_neighbors":
@@ -527,8 +550,20 @@ func (p *ReadOnlyPager) vectorTopKSegments(tm *tableMeta, vi *vecIndex, qv Value
 		ipk = len(tm.cols)
 	}
 	segs := p.segs.byRoot[tm.rootPage]
+	approx := vi.approx
+	if approx == nil {
+		// Auto: exact, until the table is large enough that a graph, with
+		// libSQL's defaults, beats reading every row.
+		rows := 0
+		for _, s := range segs {
+			rows += s.nRows
+		}
+		if rows >= vecAutoGraphRows {
+			approx = &vecAutoApprox
+		}
+	}
 	plan := &segVectorPlan{l2: vi.l2, col: vi.col, limit: int(k), outCols: []int{ipk}, nanLast: true,
-		skipNulls: true, approx: vi.approx,
+		skipNulls: true, approx: approx,
 		rowidOf: func(h vecHit) int64 {
 			if h.seg == len(segs) {
 				return h.rid
