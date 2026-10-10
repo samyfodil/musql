@@ -44,3 +44,17 @@ assert.equal(db.get("SELECT count(*) AS c FROM t").c, 3, "two databases are inde
 db.close();
 assert.throws(() => db.all("SELECT 1"), /closed/);
 console.log("ok");
+
+// SQLite files: out to C SQLite's format and back in, with a header check.
+{
+	const src = await open();
+	src.exec("CREATE TABLE p(id INTEGER PRIMARY KEY, name TEXT UNIQUE, b BLOB); CREATE INDEX pb ON p(b)");
+	src.run("INSERT INTO p(name, b) VALUES (?, ?), (?, ?)", "x", Uint8Array.of(7), "y", null);
+	const file = src.exportSQLite();
+	assert.equal(new TextDecoder().decode(file.subarray(0, 15)), "SQLite format 3");
+	const back = await open("from-sqlite.db", { data: file });
+	assert.deepEqual(back.all("SELECT * FROM p ORDER BY id"), [{ id: 1, name: "x", b: Uint8Array.of(7) }, { id: 2, name: "y", b: null }]);
+	assert.equal(back.get("SELECT count(*) AS n FROM sqlite_schema WHERE type = 'index'").n, 2);
+	await assert.rejects(open("bad.db", { data: file.slice(0, 200) }));
+	console.log("sqlite import/export ok");
+}

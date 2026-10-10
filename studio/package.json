@@ -1,0 +1,23 @@
+{
+  "name": "musql-studio",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@codemirror/lang-sql": "^6.8.0",
+    "@samyfodil/musql": "file:../npm",
+    "@uiw/react-codemirror": "^4.23.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "@codemirror/state": "^6.5.0",
+    "@codemirror/view": "^6.36.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.0",
+    "vite": "^6.0.0"
+  }
+}

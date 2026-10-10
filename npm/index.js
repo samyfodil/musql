@@ -8,6 +8,8 @@
 //   db.all("SELECT * FROM t");            // [{ id: 1, name: "ada" }]
 //   const bytes = db.export();             // the database file, to keep
 //   const again = await open("copy.db", { data: bytes });
+//   const sqlite = db.exportSQLite();      // the same database as a SQLite file
+//   const back = await open("c.db", { data: sqlite }); // SQLite files convert on open
 //
 // Every database lives in memory, in this page or process; export() and the
 // data option move one in and out. The JIT compiles query kernels to wasm at
@@ -115,6 +117,27 @@ function revive(_, v) {
 	return v;
 }
 
+const SQLITE_HEADER = enc.encode("SQLite format 3\0");
+
+function isSQLite(b) {
+	return b.length >= 16 && SQLITE_HEADER.every((c, i) => b[i] === c);
+}
+
+// convert runs the module's converter over two in-memory paths.
+function convert(x, toSQLite, src, dst) {
+	const s = enc.encode(src), d = enc.encode(dst);
+	const ptr = x.musql_inbuf(s.length + d.length);
+	const mem = new Uint8Array(x.mem.buffer);
+	mem.set(s, ptr);
+	mem.set(d, ptr + s.length);
+	const len = x.musql_convert(toSQLite ? 1 : 0, s.length, d.length);
+	const out = x.musql_outbuf();
+	const res = JSON.parse(dec.decode(new Uint8Array(x.mem.buffer).subarray(out, out + len)));
+	if (res.error !== undefined) throw new Error(res.error);
+}
+
+const unlink = (p) => globalThis.fs.unlink(p, () => {});
+
 class Database {
 	#x;
 	#h;
@@ -184,6 +207,18 @@ class Database {
 		return globalThis.fs.readFileSync(this.#path);
 	}
 
+	/** Returns the database as a C SQLite file's bytes, for sqlite3 and every other SQLite tool. */
+	exportSQLite() {
+		this.exec("VACUUM");
+		const tmp = `${this.#path}.export.sqlite`;
+		convert(this.#x, true, this.#path, tmp);
+		try {
+			return globalThis.fs.readFileSync(tmp);
+		} finally {
+			unlink(tmp);
+		}
+	}
+
 	/** Closes the database. Its file stays in memory until the page or process ends. */
 	close() {
 		if (this.#h !== 0) {
@@ -200,7 +235,8 @@ let anon = 0;
  *
  * @param {string} [name] a file name; ":memory:" or none gives a fresh, private one
  * @param {{data?: Uint8Array|ArrayBuffer, jit?: boolean}} [options]
- *   data: a database file to start from (an earlier export()); jit: force the
+ *   data: a database file to start from, musql's (an earlier export()) or a
+ *   C SQLite file, which is converted on the way in; jit: force the
  *   JIT on or off (default: on in Node and Web Workers, off on a page's main thread)
  */
 export async function open(name = ":memory:", options = {}) {
@@ -210,7 +246,17 @@ export async function open(name = ":memory:", options = {}) {
 	if (options.data !== undefined) {
 		const data = bytesOf(options.data);
 		if (!data) throw new TypeError("musql: data must be a Uint8Array or ArrayBuffer");
-		globalThis.fs.writeFileSync(path, data);
+		if (isSQLite(data)) {
+			const tmp = `${path}.import.sqlite`;
+			globalThis.fs.writeFileSync(tmp, data);
+			try {
+				convert(x, false, tmp, path);
+			} finally {
+				unlink(tmp);
+			}
+		} else {
+			globalThis.fs.writeFileSync(path, data);
+		}
 	}
 	const p = enc.encode(path);
 	const ptr = x.musql_inbuf(p.length);

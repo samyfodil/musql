@@ -52,7 +52,8 @@ The engine runs a program two ways only: the VDBE, or the JIT-compiled VDBE.
 - The engine has no relationship to the SQLite file format: no page reader,
   b-tree, header, WAL or journal code lives in `engine/`.
 - The converter is `convert/sqlite` (`Import`, `Export`). It imports `engine`,
-  never the reverse, and only `cmd/musql-convert` and `compat-harness` call it.
+  never the reverse, and only `cmd/musql-convert`, `compat-harness` and the npm
+  package's wasm module (`npm/wasm`, for files a browser opens or saves) call it.
   `engine/no_sqlite_format_test.go` enforces this.
 - A SQLite file handed to the driver or to ATTACH is an error like any other
   foreign file.
@@ -73,6 +74,7 @@ The engine runs a program two ways only: the VDBE, or the JIT-compiled VDBE.
 | `proto/` | Protobuf definitions. `buf generate` (repo root) writes the Go code into `hrana/gen/` and `examples/libp2p` has its own config. Never edit generated code by hand. |
 | `replication/` | Replication: capture, HLC, op log, CRDT and leader modes. The network is supplied by the caller (`WithTransport`). |
 | `npm/` | The npm package (`@samyfodil/musql`, GitHub Packages): `wasm/main.go` is its WebAssembly module, `index.js` the JavaScript API, `build.sh` builds both. Published by the release workflow on every tag. |
+| `studio/` | musql studio: a browser database editor (React, Vite) over the npm package, opening and exporting both musql and C SQLite files. |
 | `examples/libp2p/` | An example `Transport` over libp2p, its own module. |
 | `internal/jit/` | The JIT: x86-64 and AArch64 emitters, W^X mapping, trampolines. |
 | `internal/filelock/` | OFD byte-range locks used by the write path. |

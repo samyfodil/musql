@@ -31,9 +31,15 @@ db.query("SELECT id, name FROM t");    // { columns: ["id", "name"], rows: [[1, 
 
 const bytes = db.export();      // the whole database, compacted, as one file
 const copy = await open("copy.db", { data: bytes });
+
+const sqlite = db.exportSQLite(); // a C SQLite file: sqlite3 and every SQLite tool open it
+const again = await open("again.db", { data: sqlite }); // SQLite files convert on the way in
 db.close();
 ```
 
+- `open(name, { data })` takes either format: a C SQLite file (told apart by
+  its header) is converted into musql's, and one that fails `integrity_check`
+  is refused.
 - `run(sql, ...params)` returns `{ changes, lastInsertRowid }`; `exec(sql)` runs
   SQL that returns no rows.
 - Parameters: `null`, booleans, numbers (integers bind as INTEGER), `BigInt`,
