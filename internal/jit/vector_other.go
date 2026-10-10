@@ -29,3 +29,8 @@ func EmitQuantize() ([]byte, error) {
 func EmitVecDistStrided(l2 bool) ([]byte, error) {
 	return nil, fmt.Errorf("jit: no vector-distance encoder for this architecture")
 }
+
+// EmitI8DotGather likewise.
+func EmitI8DotGather() ([]byte, error) {
+	return nil, fmt.Errorf("jit: no int8 dot-product encoder for this architecture")
+}

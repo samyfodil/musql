@@ -293,6 +293,9 @@ func TestVectorTopKApprox(t *testing.T) {
 			}
 			return out
 		}
+		// The first search starts the graph and answers exactly; wait for it.
+		ids(m, fmt.Sprintf("SELECT id FROM vector_top_k('%s_i', vector('%s'), 1)", tb.name, point()))
+		engine.VecGraphsBuiltForTest()
 		hits, total := 0, 0
 		engine.VecApproxServedForTest()
 		for range 20 {

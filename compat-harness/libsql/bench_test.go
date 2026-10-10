@@ -165,8 +165,8 @@ func BenchmarkVectorInsert(b *testing.B) {
 // BenchmarkVectorTopK is vector_top_k over a libsql_vector_idx index on 100k
 // vectors of 384 dimensions: musql exact (the default), musql approximate (a
 // tuning option given), and libSQL's DiskANN graph. Each logs its recall@10
-// against the exact answer, and the approximate mode the cost of its first
-// search, which builds its lists. Two datasets: independent Gaussian vectors,
+// against the exact answer, its first search, and when musql's graph, built
+// in the background, was ready. Two datasets: independent Gaussian vectors,
 // where no index has structure to exploit, and clustered ones, which is what
 // embeddings look like. Building the indexes is not timed.
 func BenchmarkVectorTopK(b *testing.B) {
@@ -209,6 +209,13 @@ func BenchmarkVectorTopK(b *testing.B) {
 				start := time.Now()
 				got := ids()
 				first := time.Since(start)
+				// An approximate index answers exactly while its graph builds
+				// in the background; wait for it, and report how long it took.
+				engine.VecGraphsBuiltForTest()
+				built := time.Since(start)
+				if e.name == "musql-approx" {
+					got = ids()
+				}
 				if e.name == "musql-exact" {
 					for _, id := range got {
 						exact[id] = true
@@ -220,7 +227,7 @@ func BenchmarkVectorTopK(b *testing.B) {
 							hit++
 						}
 					}
-					b.Logf("%s %s: recall@%d %d/%d, first search %v", data, e.name, k, hit, k, first.Round(time.Millisecond))
+					b.Logf("%s %s: recall@%d %d/%d, first search %v, graph ready after %v", data, e.name, k, hit, k, first.Round(time.Millisecond), built.Round(time.Millisecond))
 				}
 				for b.Loop() {
 					if len(ids()) != k {

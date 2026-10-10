@@ -250,3 +250,8 @@ func EmitQuantize() ([]byte, error) {
 	a.Ret()
 	return a.Code()
 }
+
+// EmitI8DotGather has no encoder here yet; the engine sums in Go.
+func EmitI8DotGather() ([]byte, error) {
+	return nil, fmt.Errorf("jit: no gathering int8 dot-product encoder for this architecture")
+}

@@ -5,7 +5,11 @@ import (
 	"math"
 	"math/rand/v2"
 	"slices"
+	"sync"
 	"sync/atomic"
+	"unsafe"
+
+	"github.com/samyfodil/musql/internal/jit"
 )
 
 // vector_top_k's approximate mode (vector_index.go) is libSQL's: a DiskANN
@@ -16,7 +20,8 @@ import (
 // widths of building and searching, and compress_neighbors the type the walk
 // compares neighbours in.
 //
-// Two things differ, both in the answer's favour. The beam's candidates are
+// Where it differs, it differs in the answer's favour. The walk compares
+// int8 codes of the rows, which only steers it: the beam's candidates are
 // ranked by their exact distances before the k nearest are returned -- the
 // same kernels as the exact search -- so every row returned is a real row at
 // its real distance, and only recall is approximate. And the graph is built
@@ -43,31 +48,59 @@ type vecGraphKey struct {
 }
 
 // segVecGraph is one segment's graph over its rows: nbrs[r] are row r's
-// out-edges (nil for a NULL row), walked from entry. The walk compares
-// vectors in trav at toffs, the rows themselves unless compress_neighbors
-// rounded them.
+// out-edges (nil for a NULL row), walked from entry. The walk compares rows
+// as int8 codes, row r being about codes[r*dims:] times scale[r] -- after
+// rounding through compress_neighbors' type when it is set -- with sq[r] its
+// sum of squares. The beam it finds is ranked exactly afterwards, so the
+// codes only steer the walk.
 type segVecGraph struct {
 	nbrs  [][]int32
 	entry int32
-	trav  []byte
-	toffs []int
+	dims  int
+	codes []int8
+	scale []float32
+	sq    []float32
+	// ready is set once link has built the edges; until then a search
+	// answers exactly. order is the insertion order link takes.
+	ready atomic.Bool
+	order []int32
 }
 
-// vecGraph returns the segment's graph for key, building it with build the
-// first time; nil when the segment has none.
-func (s *segment) vecGraph(key vecGraphKey, build func() *segVecGraph) *segVecGraph {
+// vecGraph returns the segment's graph for key once it is built, nil until
+// then and for a segment that has none. The first call prepares it with prep
+// -- the int8 codes, from the segment's rows, while they are mapped -- and
+// links the edges in the background, from the codes alone, so no search waits
+// for a build and a segment closed meanwhile is never read.
+func (s *segment) vecGraph(key vecGraphKey, l2 bool, a vecApprox, prep func() *segVecGraph) *segVecGraph {
 	s.vecMu.Lock()
 	defer s.vecMu.Unlock()
 	if g, ok := s.vecGraphs[key]; ok {
-		return g
+		if g != nil && g.ready.Load() {
+			return g
+		}
+		return nil
 	}
-	g := build()
+	g := prep()
 	if s.vecGraphs == nil {
 		s.vecGraphs = map[vecGraphKey]*segVecGraph{}
 	}
 	s.vecGraphs[key] = g
-	return g
+	if g != nil {
+		vecGraphBuilds.Add(1)
+		go func() {
+			defer vecGraphBuilds.Done()
+			g.link(l2, a)
+			g.ready.Store(true)
+		}()
+	}
+	return nil
 }
+
+// vecGraphBuilds is the graphs still linking, for tests.
+var vecGraphBuilds sync.WaitGroup
+
+// VecGraphsBuiltForTest waits for every graph being built to be ready.
+func VecGraphsBuiltForTest() { vecGraphBuilds.Wait() }
 
 // vecGraphDegree is libSQL's default max_neighbors: 3(sqrt(dims)+1), capped
 // so the edges take at most fifty times the node's own vector.
@@ -85,16 +118,29 @@ const vecGraphMinRows = 1024
 type vecWalk struct {
 	g     *segVecGraph
 	l2    bool
-	dims  int
 	seen  []uint32 // seen[r] == stamp: row r is a candidate or was one
 	stamp uint32
 	ids   []int32
-	offs  []int
+	offs  []int64
+	dots  []int32
 	dist  []float32
 }
 
-func newVecWalk(g *segVecGraph, n, dims int, l2 bool) *vecWalk {
-	return &vecWalk{g: g, l2: l2, dims: dims, seen: make([]uint32, n)}
+func newVecWalk(g *segVecGraph, n int, l2 bool) *vecWalk {
+	return &vecWalk{g: g, l2: l2, seen: make([]uint32, n)}
+}
+
+// vecPoint is a vector as the walk compares it from: its int8 codes, its
+// scale and its sum of squares.
+type vecPoint struct {
+	codes     []int8
+	scale, sq float32
+}
+
+// point is row id as a vecPoint.
+func (w *vecWalk) point(id int32) vecPoint {
+	g := w.g
+	return vecPoint{g.codes[int(id)*g.dims : int(id+1)*g.dims], g.scale[id], g.sq[id]}
 }
 
 // vecCand is a beam entry: a row, its distance in the walk's metric, and
@@ -117,39 +163,63 @@ func candLess(a, b vecCand) bool {
 	return a.id < b.id
 }
 
-// dists is the walk's distance from q to each of ids.
-func (w *vecWalk) dists(q []float32, qn float32, ids []int32) ([]float32, bool) {
-	w.offs = w.offs[:0]
-	for _, id := range ids {
-		w.offs = append(w.offs, w.g.toffs[id])
-	}
-	if cap(w.dist) < len(ids) {
+// dists is the walk's distance from p to each of ids: from the int8 dot
+// products, the cosine distance or the Euclidean one.
+func (w *vecWalk) dists(p vecPoint, ids []int32) []float32 {
+	g := w.g
+	if cap(w.dots) < len(ids) {
+		w.dots = make([]int32, len(ids))
 		w.dist = make([]float32, len(ids))
 	}
-	d := w.dist[:len(ids)]
-	return d, vecDistRows(w.l2, w.g.trav, w.offs, q, qn, d)
+	dots, dist := w.dots[:len(ids)], w.dist[:len(ids)]
+	if k := jitI8DotGatherKernel(); k != nil && g.dims%16 == 0 && len(ids) > 0 {
+		w.offs = w.offs[:0]
+		for _, id := range ids {
+			w.offs = append(w.offs, int64(id)*int64(g.dims))
+		}
+		k.Call(&jit.Args{
+			A:   unsafe.Pointer(unsafe.SliceData(g.codes)),
+			V:   unsafe.Pointer(unsafe.SliceData(w.offs)),
+			C:   unsafe.Pointer(unsafe.SliceData(p.codes)),
+			N:   int64(len(ids)),
+			XA:  int64(g.dims),
+			Out: unsafe.Pointer(unsafe.SliceData(dots)),
+		})
+	} else {
+		for i, id := range ids {
+			dots[i] = int8Dot8(g.codes[int(id)*g.dims:int(id+1)*g.dims], p.codes)
+		}
+	}
+	for i, id := range ids {
+		dot := p.scale * g.scale[id] * float32(dots[i])
+		if w.l2 {
+			dist[i] = float32(math.Sqrt(math.Max(0, float64(p.sq+g.sq[id]-2*dot))))
+		} else if den := p.sq * g.sq[id]; den > 0 {
+			dist[i] = 1 - dot/float32(math.Sqrt(float64(den)))
+		} else {
+			dist[i] = 1
+		}
+	}
+	return dist
 }
 
 // search is diskAnnSearchInternal: a beam of width l from the entry,
 // following the nearest unfollowed candidate's edges until every one in the
 // beam has been followed. It returns the beam and every row it followed.
-func (w *vecWalk) search(q []float32, qn float32, l int) (beam []vecCand, visited []int32, ok bool) {
+func (w *vecWalk) search(q vecPoint, l int) (beam []vecCand, visited []int32) {
 	w.stamp++
 	if w.stamp == 0 { // wrapped: forget every old stamp
 		clear(w.seen)
 		w.stamp = 1
 	}
 	g := w.g
-	d, ok := w.dists(q, qn, []int32{g.entry})
-	if !ok {
-		return nil, nil, false
-	}
+	d := w.dists(q, []int32{g.entry})
 	w.seen[g.entry] = w.stamp
 	beam = append(beam, vecCand{id: g.entry, d: d[0]})
 	for {
 		i := slices.IndexFunc(beam, func(c vecCand) bool { return !c.done })
 		if i < 0 {
-			return beam, visited, true
+			return beam, visited
 		}
 		beam[i].done = true
 		visited = append(visited, beam[i].id)
@@ -163,10 +233,7 @@ func (w *vecWalk) search(q []float32, qn float32, l int) (beam []vecCand, visite
 		if len(w.ids) == 0 {
 			continue
 		}
-		ds, ok := w.dists(q, qn, w.ids)
-		if !ok {
-			return nil, nil, false
-		}
+		ds := w.dists(q, w.ids)
 		for j, id := range w.ids {
 			c := vecCand{id: id, d: ds[j]}
 			if len(beam) == l && !candLess(c, beam[l-1]) {
@@ -186,32 +253,16 @@ func (w *vecWalk) search(q []float32, qn float32, l int) (beam []vecCand, visite
 	}
 }
 
-// row is the walk's vector for row id.
-func (w *vecWalk) row(id int32) ([]float32, bool) {
-	rows, ok := f32Rows(w.g.trav, []int{w.g.toffs[id]}, w.dims)
-	if !ok {
-		return nil, false
-	}
-	return rows[0], true
-}
-
 // prune is DiskANN's robust prune of p's candidate edges, the rule libSQL's
 // diskAnnPruneEdges applies: nearest first, each kept edge c removing every
 // remaining candidate e with d(p,e) > alpha*d(c,e), at most r kept.
-func (w *vecWalk) prune(p int32, cands []int32, alpha float64, r int) ([]int32, bool) {
+func (w *vecWalk) prune(p int32, cands []int32, alpha float64, r int) []int32 {
 	slices.Sort(cands)
 	cands = slices.Compact(cands)
 	if i := slices.Index(cands, p); i >= 0 {
 		cands = slices.Delete(cands, i, i+1)
 	}
-	pv, ok := w.row(p)
-	if !ok {
-		return nil, false
-	}
-	dp, ok := w.dists(pv, vecSelfDot(pv), cands)
-	if !ok {
-		return nil, false
-	}
+	dp := w.dists(w.point(p), cands)
 	type ce struct {
 		id int32
 		d  float32
@@ -249,14 +300,7 @@ func (w *vecWalk) prune(p int32, cands []int32, alpha float64, r int) ([]int32, 
 		if len(rest) == 0 {
 			break
 		}
-		cv, ok := w.row(c.id)
-		if !ok {
-			return nil, false
-		}
-		dc, ok := w.dists(cv, vecSelfDot(cv), rest)
-		if !ok {
-			return nil, false
-		}
+		dc := w.dists(w.point(c.id), rest)
 		k := 0
 		for j := i + 1; j < len(cs); j++ {
 			if !alive[j] {
@@ -268,45 +312,47 @@ func (w *vecWalk) prune(p int32, cands []int32, alpha float64, r int) ([]int32, 
 			k++
 		}
 	}
-	return out, true
+	return out
 }
 
-// buildVecGraph builds the graph over a segment's rows (float32 vectors at
-// heap[offs[r]:]), leaving out the rows in nulls. nil when there are too few
-// rows for a walk to beat reading them all.
-func buildVecGraph(heap []byte, offs []int, nulls []int, dims int, l2 bool, a vecApprox) *segVecGraph {
+// prepVecGraph prepares the graph over a segment's rows (float32 vectors at
+// heap[offs[r]:]), leaving out the rows in nulls: each row's codes, the
+// insertion order and the entry. nil when there are too few rows for a walk
+// to beat reading them all.
+func prepVecGraph(heap []byte, offs []int, nulls []int, dims int, a vecApprox) *segVecGraph {
 	n := len(offs)
 	if n-len(nulls) < vecGraphMinRows {
 		return nil
 	}
-	g := &segVecGraph{nbrs: make([][]int32, n), trav: heap, toffs: offs}
-	if a.compress != 0 && a.compress != vecF32 {
-		// The walk compares rows rounded through the compressed type, as
-		// libSQL's edges store them.
-		g.trav = make([]byte, 0, 4*dims*n)
-		g.toffs = make([]int, n)
-		rows, ok := f32Rows(heap, offs, dims)
-		if !ok {
-			return nil
-		}
-		for r, x := range rows {
-			g.toffs[r] = len(g.trav)
-			data := make([]byte, 0, 4*dims)
-			for _, f := range x {
-				data = binary.LittleEndian.AppendUint32(data, math.Float32bits(f))
-			}
-			for _, f := range (vector{typ: vecF32, dims: dims, data: data}).convert(a.compress).floats() {
-				g.trav = binary.LittleEndian.AppendUint32(g.trav, math.Float32bits(f))
-			}
-		}
+	g := &segVecGraph{
+		nbrs: make([][]int32, n), dims: dims,
+		codes: make([]int8, n*dims), scale: make([]float32, n), sq: make([]float32, n),
 	}
-	degree := a.maxNeighbors
-	if degree <= 0 {
-		degree = vecGraphDegree(dims, vecF32, max(a.compress, vecF32))
+	rows, ok := f32Rows(heap, offs, dims)
+	if !ok {
+		return nil
+	}
+	step := segVectorChunkRows(dims)
+	if !segEachOn(vecWorkers, (n+step-1)/step, func(j int) bool {
+		for r := j * step; r < min((j+1)*step, n); r++ {
+			x := rows[r]
+			if a.compress != 0 && a.compress != vecF32 {
+				x = vecRound(x, a.compress)
+			}
+			g.scale[r], _, _ = quantizeRow(x, g.codes[r*dims:(r+1)*dims])
+			var sq float64
+			for _, v := range x {
+				sq += float64(v) * float64(v)
+			}
+			g.sq[r] = float32(sq)
+		}
+		return true
+	}) {
+		return nil
 	}
 
-	// The rows in a fixed shuffled order; the entry is the row nearest their
-	// mean, which every walk starts from.
+	// The rows in a fixed shuffled order; the entry, which every walk starts
+	// from, is the row nearest their mean.
 	order := make([]int32, 0, n-len(nulls))
 	for r, k := 0, 0; r < n; r++ {
 		if k < len(nulls) && nulls[k] == r {
@@ -319,16 +365,8 @@ func buildVecGraph(heap []byte, offs []int, nulls []int, dims int, l2 bool, a ve
 		order[i], order[j] = order[j], order[i]
 	})
 	mean := make([]float64, dims)
-	travOffs := make([]int, len(order))
-	for i, r := range order {
-		travOffs[i] = g.toffs[r]
-	}
-	rows, ok := f32Rows(g.trav, travOffs, dims)
-	if !ok {
-		return nil
-	}
-	for _, x := range rows {
-		for i, v := range x {
+	for _, r := range order {
+		for i, v := range rows[r] {
 			mean[i] += float64(v)
 		}
 	}
@@ -337,7 +375,11 @@ func buildVecGraph(heap []byte, offs []int, nulls []int, dims int, l2 bool, a ve
 		m[i] = float32(mean[i] / float64(len(order)))
 	}
 	md := make([]float32, len(order))
-	if !vecDistRows(true, g.trav, travOffs, m, 0, md) {
+	orderOffs := make([]int, len(order))
+	for i, r := range order {
+		orderOffs[i] = offs[r]
+	}
+	if !vecDistRows(true, heap, orderOffs, m, 0, md) {
 		return nil
 	}
 	best := 0
@@ -348,39 +390,40 @@ func buildVecGraph(heap []byte, offs []int, nulls []int, dims int, l2 bool, a ve
 	}
 	g.entry = order[best]
 	order[0], order[best] = order[best], order[0]
+	g.order = order
+	return g
+}
 
-	// Prefix doubling: each batch walks the graph built so far in parallel,
-	// then the batch's edges, and their reverse edges, go in.
+// link builds the edges, from the codes alone. Prefix doubling: each batch
+// walks the graph built so far in parallel, then the batch's edges, and their
+// reverse edges, go in.
+func (g *segVecGraph) link(l2 bool, a vecApprox) {
+	n, order := len(g.nbrs), g.order
+	degree := a.maxNeighbors
+	if degree <= 0 {
+		degree = vecGraphDegree(g.dims, vecF32, max(a.compress, vecF32))
+	}
 	maxBatch := max(1, len(order)/50)
 	walks := make(chan *vecWalk, vecWorkers)
 	for range vecWorkers {
-		walks <- newVecWalk(g, n, dims, l2)
+		walks <- newVecWalk(g, n, l2)
 	}
 	for lo := 1; lo < len(order); {
 		hi := min(len(order), lo+min(lo, maxBatch))
 		batch := order[lo:hi]
 		out := make([][]int32, len(batch))
-		if !segEachOn(vecWorkers, len(batch), func(i int) bool {
+		segEachOn(vecWorkers, len(batch), func(i int) bool {
 			w := <-walks
 			defer func() { walks <- w }()
 			p := batch[i]
-			pv, ok := w.row(p)
-			if !ok {
-				return false
-			}
-			beam, visited, ok := w.search(pv, vecSelfDot(pv), a.insertL)
-			if !ok {
-				return false
-			}
+			beam, visited := w.search(w.point(p), a.insertL)
 			cands := slices.Clone(visited)
 			for _, c := range beam {
 				cands = append(cands, c.id)
 			}
-			out[i], ok = w.prune(p, cands, a.alpha, degree)
-			return ok
-		}) {
-			return nil
-		}
+			out[i] = w.prune(p, cands, a.alpha, degree)
+			return true
+		})
 		rev := map[int32][]int32{}
 		for i, p := range batch {
 			g.nbrs[p] = out[i]
@@ -393,7 +436,7 @@ func buildVecGraph(heap []byte, offs []int, nulls []int, dims int, l2 bool, a ve
 			targets = append(targets, j)
 		}
 		next := make([][]int32, len(targets))
-		if !segEachOn(vecWorkers, len(targets), func(i int) bool {
+		segEachOn(vecWorkers, len(targets), func(i int) bool {
 			j := targets[i]
 			merged := append(slices.Clone(g.nbrs[j]), rev[j]...)
 			if len(merged) <= degree {
@@ -403,18 +446,25 @@ func buildVecGraph(heap []byte, offs []int, nulls []int, dims int, l2 bool, a ve
 			}
 			w := <-walks
 			defer func() { walks <- w }()
-			var ok bool
-			next[i], ok = w.prune(j, merged, a.alpha, degree)
-			return ok
-		}) {
-			return nil
-		}
+			next[i] = w.prune(j, merged, a.alpha, degree)
+			return true
+		})
 		for i, j := range targets {
 			g.nbrs[j] = next[i]
 		}
 		lo = hi
 	}
-	return g
+	g.order = nil
+}
+
+// vecRound is x rounded through type t and back, as compress_neighbors
+// stores a neighbour.
+func vecRound(x []float32, t vecType) []float32 {
+	data := make([]byte, 0, 4*len(x))
+	for _, f := range x {
+		data = binary.LittleEndian.AppendUint32(data, math.Float32bits(f))
+	}
+	return (vector{typ: vecF32, dims: len(x), data: data}).convert(t).floats()
 }
 
 // vecGraphTopK offers top each segment's beam for the query, at exact
@@ -428,17 +478,30 @@ func vecGraphTopK(plan *segVectorPlan, segs []*segment, cells [][]uint64, nulls,
 			continue
 		}
 		key := vecGraphKey{col: plan.col, l2: plan.l2, a: *a}
-		graphs[si] = s.vecGraph(key, func() *segVecGraph {
+		graphs[si] = s.vecGraph(key, plan.l2, *a, func() *segVecGraph {
 			offs := make([]int, len(cells[si]))
 			for i, c := range cells[si] {
 				offs[i] = int(uint32(c))
 			}
-			return buildVecGraph(s.heap, offs, nulls[si], len(query), plan.l2, *a)
+			return prepVecGraph(s.heap, offs, nulls[si], len(query), *a)
 		})
 		if graphs[si] == nil {
 			return false
 		}
 	}
+	// The query as the walk compares it.
+	x := query
+	if a.compress != 0 && a.compress != vecF32 {
+		x = vecRound(x, a.compress)
+	}
+	codes := make([]int8, len(x))
+	scale, _, _ := quantizeRow(x, codes)
+	var sq float64
+	for _, v := range x {
+		sq += float64(v) * float64(v)
+	}
+	qp := vecPoint{codes, scale, float32(sq)}
+
 	tops := make([]vecTopK, len(segs))
 	if !segEachOn(vecWorkers, len(segs), func(si int) bool {
 		g := graphs[si]
@@ -447,14 +510,11 @@ func vecGraphTopK(plan *segVectorPlan, segs []*segment, cells [][]uint64, nulls,
 			tops[si] = t
 			return true
 		}
-		w := newVecWalk(g, len(cells[si]), len(query), plan.l2)
+		w := newVecWalk(g, len(cells[si]), plan.l2)
 		// Deleted rows stay in the graph as stepping stones; the beam widens by
 		// as many so they do not crowd out the k.
 		l := max(a.searchL, plan.limit) + min(len(skips[si]), len(cells[si]))
-		beam, _, ok := w.search(query, qn, l)
-		if !ok {
-			return false
-		}
+		beam, _ := w.search(qp, l)
 		rows := make([]int, 0, len(beam))
 		for _, c := range beam {
 			if _, dead := slices.BinarySearch(skips[si], int(c.id)); !dead {
@@ -504,6 +564,29 @@ func vecDistRows(l2 bool, heap []byte, offs []int, q []float32, qn float32, dist
 	}
 	return true
 }
+
+// int8Dot8 is the exact int32 dot product of two rows of int8 codes.
+func int8Dot8(a, b []int8) int32 {
+	b = b[:len(a)]
+	var s0, s1, s2, s3 int32
+	i := 0
+	for ; i+4 <= len(a); i += 4 {
+		s0 += int32(a[i]) * int32(b[i])
+		s1 += int32(a[i+1]) * int32(b[i+1])
+		s2 += int32(a[i+2]) * int32(b[i+2])
+		s3 += int32(a[i+3]) * int32(b[i+3])
+	}
+	for ; i < len(a); i++ {
+		s0 += int32(a[i]) * int32(b[i])
+	}
+	return s0 + s1 + s2 + s3
+}
+
+var jitI8DotGather = sync.OnceValue(func() *jit.Code { return jitMapOnce(jit.EmitI8DotGather) })
+
+// jitI8DotGatherKernel is the compiled gathering int8 dot-product kernel, nil
+// without one.
+func jitI8DotGatherKernel() *jit.Code { return jitI8DotGather() }
 
 // vecApproxServed counts searches a graph answered, for tests.
 var vecApproxServed atomic.Int64

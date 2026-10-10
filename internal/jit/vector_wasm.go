@@ -456,3 +456,8 @@ func EmitQuantize() ([]byte, error) {
 // StoreI64Align stores the i64 on the stack at addr+off with alignment hint
 // 2^align: the codes' rows are only byte-aligned.
 func (w *Wasm) StoreI64Align(align, off uint32) { w.op(opI64Store); w.memarg(align, off) }
+
+// EmitI8DotGather has no encoder here yet; the engine sums in Go.
+func EmitI8DotGather() ([]byte, error) {
+	return nil, fmt.Errorf("jit: no gathering int8 dot-product encoder for this architecture")
+}

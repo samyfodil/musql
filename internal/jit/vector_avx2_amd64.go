@@ -258,29 +258,56 @@ func (a *Asm) VbroadcastssMemD(dst, base Reg, disp int8) {
 // Args: A the first row's codes (rows back to back, XA bytes each), C the
 // query's codes widened to int16, N the rows (at least 1), XA the dimensions
 // (a multiple of 16), Out an int32 per row.
-func EmitI8Dot() ([]byte, error) {
+func EmitI8Dot() ([]byte, error) { return emitI8Dot(false) }
+
+// EmitI8DotGather is EmitI8Dot over rows anywhere in one block, as a graph
+// walk reads a node's neighbours: Args V holds each row's byte offset from A,
+// an int64 per row, and C the query as int8 codes, widened here, so that a
+// row of the block can be the query as it stands.
+func EmitI8DotGather() ([]byte, error) { return emitI8Dot(true) }
+
+func emitI8Dot(gather bool) ([]byte, error) {
 	if !cpuHasAVX2() {
 		return nil, fmt.Errorf("jit: AVX2 not available on this machine")
 	}
 	a := NewAsm()
 	a.MovRegMem(RSI, RDI, OffA)
+	if gather {
+		a.MovRegReg(R8, RSI) // the block
+		a.MovRegMem(R11, RDI, OffV)
+	}
 	a.MovRegMem(RCX, RDI, OffN)
 	a.MovRegMem(R9, RDI, OffXA)
 	a.ShrRegImm8(R9, 4) // blocks of sixteen
 	a.MovRegMem(R10, RDI, OffOut)
 
 	a.Label("row")
+	if gather {
+		a.MovRegMem(RSI, R11, 0) // this row's offset
+		a.AddRegReg(RSI, R8)
+		a.AddRegImm8(R11, 8)
+	}
 	a.VpxorYmm(0, 0, 0)
 	a.MovRegMem(RDX, RDI, OffC)
 	a.MovRegReg(R12, R9)
 	a.Label("block")
 	a.vexm(1, 0, RSI, 0, vexMap0F38, 0, 1, vexP66) // vpmovsxbw ymm1, [rsi]
 	a.emit(0x20, modrm(0b00, 1, RSI))
-	a.vexm(1, 0, RDX, 1, vexMap0F, 0, 1, vexP66) // vpmaddwd ymm1, ymm1, [rdx]
-	a.emit(0xF5, modrm(0b00, 1, RDX))
+	if gather {
+		a.vexm(2, 0, RDX, 0, vexMap0F38, 0, 1, vexP66) // vpmovsxbw ymm2, [rdx]
+		a.emit(0x20, modrm(0b00, 2, RDX))
+		a.vinst(0xF5, 1, 1, 2, vexMap0F, 0, 1, vexP66, false) // vpmaddwd ymm1, ymm1, ymm2
+	} else {
+		a.vexm(1, 0, RDX, 1, vexMap0F, 0, 1, vexP66) // vpmaddwd ymm1, ymm1, [rdx]
+		a.emit(0xF5, modrm(0b00, 1, RDX))
+	}
 	a.vinst(0xFE, 0, 0, 1, vexMap0F, 0, 1, vexP66, false) // vpaddd ymm0, ymm0, ymm1
 	a.AddRegImm8(RSI, 16)
-	a.AddRegImm8(RDX, 32)
+	if gather {
+		a.AddRegImm8(RDX, 16)
+	} else {
+		a.AddRegImm8(RDX, 32)
+	}
 	a.DecReg(R12)
 	a.Jcc(CondNE, "block")
 
