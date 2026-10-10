@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ident, query, rows as rowsOf, run } from "../db.js";
 import { fmt, show } from "../values.js";
 import { useStudio } from "../studio.js";
 import Grid from "./Grid.jsx";
 import RowDialog from "./RowDialog.jsx";
+import { EMBED_DIMS, embed, setEmbedProgress, vectorBlob } from "../embed.js";
 
 const PAGE = 100;
 
@@ -23,6 +24,10 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 	const [error, setError] = useState(null);
 	const [picked, setPicked] = useState(new Set());
 	const [adding, setAdding] = useState(false);
+	// Semantic search: the text searched for, and the vector column it ranks by.
+	const [semDraft, setSemDraft] = useState("");
+	const [semantic, setSemantic] = useState(null); // {text, col}
+	const [embedding, setEmbedding] = useState(false);
 
 	useEffect(() => setMode(initialMode), [initialMode]);
 
@@ -41,7 +46,35 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 		rowsOf(`PRAGMA table_info(${ident(name)})`).then(setCols, (e) => status(e.message, true));
 	}, [name, sql]);
 
+	// Columns the embedder can search (F32_BLOB of its width) and embed from.
+	const vecCols = cols.filter((c) => new RegExp(`^F32_BLOB\\(\\s*${EMBED_DIMS}\\s*\\)$`, "i").test(c.type)).map((c) => c.name);
+	const textCols = cols.filter((c) => /CHAR|CLOB|TEXT/i.test(c.type) || c.type === "").map((c) => c.name);
+
+	useEffect(() => {
+		setEmbedProgress((p) => p.total && status(`Downloading the embedding model… ${Math.round((100 * p.loaded) / p.total)}%`));
+	}, [status]);
+
 	const load = useCallback(async () => {
+		if (semantic) {
+			try {
+				const t = performance.now();
+				const [v] = await embed([semantic.text]);
+				const t2 = performance.now();
+				const r = await query(
+					`SELECT *, vector_distance_cos(${ident(semantic.col)}, ?) AS distance FROM ${ident(name)} ORDER BY distance LIMIT ${PAGE}`,
+					[vectorBlob(v)],
+				);
+				setData({ ...r, semantic: true });
+				setTotal(r.rows.length);
+				setError(null);
+				setPicked(new Set());
+				status(`${name}: closest ${r.rows.length} to “${semantic.text}” · embed ${(t2 - t).toFixed(0)} ms, search ${(performance.now() - t2).toFixed(1)} ms`);
+			} catch (e) {
+				setError(e.message);
+				status(e.message, true);
+			}
+			return;
+		}
 		const filter = where ? ` WHERE ${where}` : "";
 		const order = sort ? ` ORDER BY ${ident(sort)}${desc ? " DESC" : ""}` : "";
 		const key = keyed ? keyCols.map((k, i) => `${ident(k)} AS "__k${i}"`).join(", ") + ", " : "";
@@ -58,15 +91,19 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 			setError(e.message);
 			status(e.message, true);
 		}
-	}, [name, where, sort, desc, offset, keyed, keyCols.join("\0")]);
+	}, [name, where, sort, desc, offset, keyed, keyCols.join("\0"), semantic]);
 
 	useEffect(() => {
 		if (cols.length || view) load();
 	}, [load, cols]);
 
-	const nk = keyed ? keyCols.length : 0;
-	const shown = data ? data.columns.slice(nk) : [];
-	const body = data ? data.rows.map((r) => r.slice(nk)) : [];
+	// Search results carry no row keys, so they are read-only, and they leave
+	// out the vector columns, whose distance is shown instead.
+	const searching = !!data?.semantic;
+	const nk = keyed && !searching ? keyCols.length : 0;
+	const keep = data ? data.columns.map((c, i) => i >= nk && !(searching && vecCols.includes(c))) : [];
+	const shown = data ? data.columns.filter((_, i) => keep[i]) : [];
+	const body = data ? data.rows.map((r) => r.filter((_, i) => keep[i])) : [];
 	const keyOf = (i) => data.rows[i].slice(0, nk);
 	const keyWhere = keyCols.map((k) => `${ident(k)} IS ?`).join(" AND ");
 	const types = Object.fromEntries(cols.map((c) => [c.name, c.type]));
@@ -101,6 +138,44 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 		}
 		changed(name);
 		await load();
+	}
+
+	// embedColumn fills <col>_emb with each row's embedding, adding the column
+	// first: 64 rows to a batch, each batch one transaction.
+	async function embedColumn(col) {
+		const target = `${col}_emb`;
+		setEmbedding(false);
+		try {
+			if (!cols.some((c) => c.name === target)) {
+				await run(`ALTER TABLE ${ident(name)} ADD COLUMN ${ident(target)} F32_BLOB(${EMBED_DIMS})`);
+			}
+			const total = (await query(`SELECT count(*) FROM ${ident(name)} WHERE ${ident(col)} IS NOT NULL`)).rows[0][0];
+			let last = null;
+			let done = 0;
+			const t = performance.now();
+			for (;;) {
+				const batch = await query(
+					`SELECT rowid, ${ident(col)} FROM ${ident(name)} WHERE ${ident(col)} IS NOT NULL${last === null ? "" : " AND rowid > ?"} ORDER BY rowid LIMIT 64`,
+					last === null ? [] : [last],
+				);
+				if (!batch.rows.length) break;
+				const vecs = await embed(batch.rows.map((r) => String(r[1])));
+				await run("BEGIN");
+				for (let i = 0; i < vecs.length; i++) {
+					await run(`UPDATE ${ident(name)} SET ${ident(target)} = ? WHERE rowid = ?`, [vectorBlob(vecs[i]), batch.rows[i][0]]);
+				}
+				await run("COMMIT");
+				last = batch.rows.at(-1)[0];
+				done += batch.rows.length;
+				status(`Embedding ${col}: ${fmt(done)} of ${fmt(total)}…`);
+			}
+			status(`Embedded ${fmt(done)} rows of ${col} into ${target} in ${((performance.now() - t) / 1000).toFixed(1)} s.`);
+			changed(name);
+			setCols(await rowsOf(`PRAGMA table_info(${ident(name)})`));
+		} catch (e) {
+			run("ROLLBACK").catch(() => {});
+			status(e.message, true);
+		}
 	}
 
 	async function insert(values) {
@@ -138,7 +213,22 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 								}
 							}}
 						/>
+						{vecCols.length > 0 && (
+							<input
+								className="where semantic"
+								placeholder={`✦ Semantic search over ${vecCols[0]}…`}
+								spellCheck={false}
+								value={semDraft}
+								onChange={(e) => setSemDraft(e.target.value)}
+								onKeyDown={(e) => {
+									if (e.key === "Enter") setSemantic(semDraft.trim() ? { text: semDraft.trim(), col: vecCols[0] } : null);
+									if (e.key === "Escape") { setSemDraft(""); setSemantic(null); }
+								}}
+							/>
+						)}
+						{semantic && <button title="Back to the table" onClick={() => { setSemDraft(""); setSemantic(null); }}>✕ Search</button>}
 						<button title="Reload" onClick={load}>↻</button>
+						<button disabled={!editable || withoutRowid || !textCols.length} title="Embed a text column for semantic search" onClick={() => setEmbedding(true)}>✦ Embed…</button>
 						<button disabled={!editable} onClick={() => setAdding(true)}>＋ Row</button>
 						<button disabled={!picked.size} onClick={remove}>{picked.size ? `Delete ${picked.size}` : "Delete"}</button>
 					</>
@@ -163,12 +253,12 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 										setSort(c);
 									}}
 									picked={picked}
-									onPick={keyed ? (i) => {
+									onPick={keyed && !searching ? (i) => {
 										const p = new Set(picked);
 										p.has(i) ? p.delete(i) : p.add(i);
 										setPicked(p);
 									} : undefined}
-									onEdit={editable ? edit : undefined}
+									onEdit={editable && !searching ? edit : undefined}
 								/>
 								{!body.length && <p className="dim pad">{where ? "No rows match." : "No rows."}</p>}
 							</>
@@ -177,7 +267,7 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 					<div className="pager">
 						<span>{total ? `${fmt(offset + 1)}–${fmt(last)} of ${fmt(total)}` : "0 rows"}</span>
 						<span className="grow" />
-						<span className="small">{editable ? "Double-click a cell to edit · click # to select" : view ? "Views are read-only" : ""}</span>
+						<span className="small">{searching ? "Closest first, by cosine distance" : editable ? "Double-click a cell to edit · click # to select" : view ? "Views are read-only" : ""}</span>
 						<button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - PAGE))}>‹ Prev</button>
 						<button disabled={last >= total} onClick={() => setOffset(offset + PAGE)}>Next ›</button>
 					</div>
@@ -186,7 +276,39 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 				<Structure name={name} obj={obj} cols={cols} schema={schema} />
 			)}
 			{adding && <RowDialog name={name} cols={cols} onClose={insert} />}
+			{embedding && <EmbedDialog name={name} textCols={textCols} onClose={(col) => (col ? embedColumn(col) : setEmbedding(false))} />}
 		</>
+	);
+}
+
+// EmbedDialog asks which text column to embed; onClose(column) or onClose(null).
+function EmbedDialog({ name, textCols, onClose }) {
+	const [col, setCol] = useState(textCols[0]);
+	const ref = useRef(null);
+	useEffect(() => ref.current.showModal(), []);
+	return (
+		<dialog ref={ref} onClose={() => onClose(null)}>
+			<form onSubmit={(e) => { e.preventDefault(); onClose(col); }}>
+				<h2>Embed a column of {name}</h2>
+				<p className="dim small">
+					Each row's text becomes a {EMBED_DIMS}-dimension vector (all-MiniLM-L6-v2, run in your browser) in a new
+					column <code>{col}_emb F32_BLOB({EMBED_DIMS})</code>, searchable with vector_distance_cos. The model, about
+					23 MB, downloads once.
+				</p>
+				<div className="fields">
+					<label className="field">
+						<span>column</span>
+						<select value={col} onChange={(e) => setCol(e.target.value)}>
+							{textCols.map((c) => <option key={c}>{c}</option>)}
+						</select>
+					</label>
+				</div>
+				<div className="dialog-actions">
+					<button type="button" onClick={() => onClose(null)}>Cancel</button>
+					<button type="submit" className="primary">Embed</button>
+				</div>
+			</form>
+		</dialog>
 	);
 }
 
