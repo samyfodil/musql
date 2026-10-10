@@ -447,7 +447,7 @@ func f16FromFloat(f float32) uint16 {
 	return uint16(sgn | uint32(exp+15+int(mnt>>10))<<10 | mnt&0x3ff)
 }
 
-func bf16ToFloat(h uint16) float32 { return math.Float32frombits(uint32(h) << 16) }
+func bf16ToFloat(h uint16) float32   { return math.Float32frombits(uint32(h) << 16) }
 func bf16FromFloat(f float32) uint16 { return uint16(math.Float32bits(f) >> 16) }
 
 // ---- encoding ------------------------------------------------------------------
