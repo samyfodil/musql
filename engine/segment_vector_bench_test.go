@@ -99,7 +99,8 @@ func BenchmarkVecGraphBuild(b *testing.B) {
 	heap, offs := vecBenchHeap(rows, dims)
 	a := vecApprox{alpha: 1.2, insertL: 70, searchL: 200}
 	for b.Loop() {
-		g := prepVecGraph(heap, offs, nil, dims, a)
+		rows, _ := f32Rows(heap, offs, dims)
+		g := prepVecGraph(rows, nil, dims, a)
 		if g == nil {
 			b.Fatal("no graph")
 		}
@@ -112,7 +113,8 @@ func BenchmarkVecGraphSearch(b *testing.B) {
 	const rows, dims = 65_536, 384
 	heap, offs := vecBenchHeap(rows, dims)
 	a := vecApprox{alpha: 1.2, insertL: 70, searchL: 200}
-	g := prepVecGraph(heap, offs, nil, dims, a)
+	rs, _ := f32Rows(heap, offs, dims)
+	g := prepVecGraph(rs, nil, dims, a)
 	g.link(false, a)
 	q := newVecWalk(g, rows, false).point(7)
 	for b.Loop() {

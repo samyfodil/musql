@@ -93,7 +93,7 @@ type segment struct {
 	vecMu       eqCountMu
 	vecSides    map[int]*segVecSide
 	vecSearches map[int]int // searches per column, until it has a sidecar
-	vecGraphs   map[vecGraphKey]*segVecGraph
+	vecGraphs   []vecGraphEntry // graphs over the table from this, its first segment
 }
 
 // Rowid is the key row i is stored under, which a converter must preserve

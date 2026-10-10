@@ -32,16 +32,26 @@ like the text kernels (internal/jit) -- feeding the existing top-k
 it is what most browser and edge workloads (thousands to a few hundred
 thousand vectors) need.
 
-**3. Indexes.** Done, exact rather than approximate.
-`CREATE INDEX ... (libsql_vector_idx(v, ...))` and `vector_top_k(index, query,
-k)` take libSQL's syntax, options, write-time checks and error texts
-(engine/vector_index.go), so an application ports unchanged. libSQL answers from
-a DiskANN graph; musql ranks the rows by exact distance through the step-2
-search, so recall is always 100%. At 100k x 384 that is 4.9 ms against
-libSQL's 17 ms, where libSQL's graph found 3 of the true 10 nearest
-(BenchmarkVectorTopK). libSQL's graph-tuning options are validated and have
-nothing to tune. If a table outgrows exact search, a graph can narrow the
-candidates for the same exact ranking.
+**3. Indexes.** Done. `CREATE INDEX ... (libsql_vector_idx(v, ...))` and
+`vector_top_k(index, query, k)` take libSQL's syntax, options, write-time
+checks and error texts (engine/vector_index.go), so an application ports
+unchanged. Two modes:
+
+- Exact, the default: the rows ranked by exact distance through the step-2
+  search, recall always 100%.
+- Approximate, when any of libSQL's graph options is given (`max_neighbors`,
+  `alpha`, `insert_l`, `search_l`, `compress_neighbors`): libSQL's DiskANN
+  graph, one per table, each option meaning what it means in libSQL
+  (engine/segment_vector_graph.go). The walk compares int8 codes through a
+  gathering SIMD kernel (AVX2, NEON, SIMD128); the beam it finds is ranked by
+  exact distances, so only recall is approximate. The graph is built in the
+  background on the first approximate search, which, like every search until
+  the graph is ready, is answered exactly.
+
+At 100k x 384 on the M4 (BenchmarkVectorTopK), clustered vectors: exact
+2.5-4.4 ms, approximate 0.84 ms at recall@10 9/10, libSQL 6.1 ms at 10/10.
+Independent random vectors, which no graph has structure to exploit: exact
+2.9 ms, approximate 2.4 ms at 5/10, libSQL 7.5 ms at 3/10.
 
 Out of scope until the above is done: embeddings computed in the database,
 and vector types outside libSQL's set.

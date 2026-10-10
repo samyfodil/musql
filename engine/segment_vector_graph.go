@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"slices"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -66,25 +67,27 @@ type segVecGraph struct {
 	order []int32
 }
 
-// vecGraph returns the segment's graph for key once it is built, nil until
-// then and for a segment that has none. The first call prepares it with prep
-// -- the int8 codes, from the segment's rows, while they are mapped -- and
-// links the edges in the background, from the codes alone, so no search waits
-// for a build and a segment closed meanwhile is never read.
-func (s *segment) vecGraph(key vecGraphKey, l2 bool, a vecApprox, prep func() *segVecGraph) *segVecGraph {
+// vecTableGraph returns the graph over a table's segments once it is built,
+// nil until then and for a table that has none. It is kept with the first
+// segment, for exactly this list of segments: compaction, which replaces
+// them, starts a new one. The first call prepares it with prep -- the int8
+// codes, from the rows, while they are mapped -- and links the edges in the
+// background, from the codes alone, so no search waits for a build and a
+// segment closed meanwhile is never read.
+func vecTableGraph(segs []*segment, key vecGraphKey, l2 bool, a vecApprox, prep func() *segVecGraph) *segVecGraph {
+	s := segs[0]
 	s.vecMu.Lock()
 	defer s.vecMu.Unlock()
-	if g, ok := s.vecGraphs[key]; ok {
-		if g != nil && g.ready.Load() {
-			return g
+	for _, e := range s.vecGraphs {
+		if e.key == key && slices.Equal(e.segs, segs) {
+			if e.g != nil && e.g.ready.Load() {
+				return e.g
+			}
+			return nil
 		}
-		return nil
 	}
 	g := prep()
-	if s.vecGraphs == nil {
-		s.vecGraphs = map[vecGraphKey]*segVecGraph{}
-	}
-	s.vecGraphs[key] = g
+	s.vecGraphs = append(s.vecGraphs, vecGraphEntry{key: key, segs: slices.Clone(segs), g: g})
 	if g != nil {
 		vecGraphBuilds.Add(1)
 		go func() {
@@ -94,6 +97,14 @@ func (s *segment) vecGraph(key vecGraphKey, l2 bool, a vecApprox, prep func() *s
 		}()
 	}
 	return nil
+}
+
+// vecGraphEntry is one graph a first segment keeps: its options and the
+// segments it spans.
+type vecGraphEntry struct {
+	key  vecGraphKey
+	segs []*segment
+	g    *segVecGraph
 }
 
 // vecGraphBuilds is the graphs still linking, for tests.
@@ -315,12 +326,11 @@ func (w *vecWalk) prune(p int32, cands []int32, alpha float64, r int) []int32 {
 	return out
 }
 
-// prepVecGraph prepares the graph over a segment's rows (float32 vectors at
-// heap[offs[r]:]), leaving out the rows in nulls: each row's codes, the
-// insertion order and the entry. nil when there are too few rows for a walk
-// to beat reading them all.
-func prepVecGraph(heap []byte, offs []int, nulls []int, dims int, a vecApprox) *segVecGraph {
-	n := len(offs)
+// prepVecGraph prepares the graph over rows, leaving out the rows in nulls
+// (sorted): each row's codes, the insertion order and the entry. nil when
+// there are too few rows for a walk to beat reading them all.
+func prepVecGraph(rows [][]float32, nulls []int, dims int, a vecApprox) *segVecGraph {
+	n := len(rows)
 	if n-len(nulls) < vecGraphMinRows {
 		return nil
 	}
@@ -328,12 +338,8 @@ func prepVecGraph(heap []byte, offs []int, nulls []int, dims int, a vecApprox) *
 		nbrs: make([][]int32, n), dims: dims,
 		codes: make([]int8, n*dims), scale: make([]float32, n), sq: make([]float32, n),
 	}
-	rows, ok := f32Rows(heap, offs, dims)
-	if !ok {
-		return nil
-	}
 	step := segVectorChunkRows(dims)
-	if !segEachOn(vecWorkers, (n+step-1)/step, func(j int) bool {
+	segEachOn(vecWorkers, (n+step-1)/step, func(j int) bool {
 		for r := j * step; r < min((j+1)*step, n); r++ {
 			x := rows[r]
 			if a.compress != 0 && a.compress != vecF32 {
@@ -347,9 +353,7 @@ func prepVecGraph(heap []byte, offs []int, nulls []int, dims int, a vecApprox) *
 			g.sq[r] = float32(sq)
 		}
 		return true
-	}) {
-		return nil
-	}
+	})
 
 	// The rows in a fixed shuffled order; the entry, which every walk starts
 	// from, is the row nearest their mean.
@@ -370,22 +374,18 @@ func prepVecGraph(heap []byte, offs []int, nulls []int, dims int, a vecApprox) *
 			mean[i] += float64(v)
 		}
 	}
-	m := make([]float32, dims)
-	for i := range m {
-		m[i] = float32(mean[i] / float64(len(order)))
+	for i := range mean {
+		mean[i] /= float64(len(order))
 	}
-	md := make([]float32, len(order))
-	orderOffs := make([]int, len(order))
+	best, bestD := 0, math.Inf(1)
 	for i, r := range order {
-		orderOffs[i] = offs[r]
-	}
-	if !vecDistRows(true, heap, orderOffs, m, 0, md) {
-		return nil
-	}
-	best := 0
-	for i, d := range md {
-		if d < md[best] {
-			best = i
+		var d float64
+		for j, v := range rows[r] {
+			e := float64(v) - mean[j]
+			d += e * e
+		}
+		if d < bestD {
+			best, bestD = i, d
 		}
 	}
 	g.entry = order[best]
@@ -467,28 +467,52 @@ func vecRound(x []float32, t vecType) []float32 {
 	return (vector{typ: vecF32, dims: len(x), data: data}).convert(t).floats()
 }
 
-// vecGraphTopK offers top each segment's beam for the query, at exact
-// distances. It reports false, having offered nothing, when a segment has no
-// graph.
+// vecGraphTopK offers top the beam a walk of the table's graph finds, at
+// exact distances. It reports false, having offered nothing, while the graph
+// is not ready, or when the table has none.
 func vecGraphTopK(plan *segVectorPlan, segs []*segment, cells [][]uint64, nulls, skips [][]int, query []float32, qn float32, top *vecTopK) bool {
 	a := plan.approx
-	graphs := make([]*segVecGraph, len(segs))
+	if len(segs) == 0 {
+		return false
+	}
+	// A row's id in the graph is its segment's base plus its row.
+	bases := make([]int, len(segs)+1)
 	for si, s := range segs {
-		if cells[si] == nil {
-			continue
-		}
-		key := vecGraphKey{col: plan.col, l2: plan.l2, a: *a}
-		graphs[si] = s.vecGraph(key, plan.l2, *a, func() *segVecGraph {
+		bases[si+1] = bases[si] + s.nRows
+	}
+	total := bases[len(segs)]
+	key := vecGraphKey{col: plan.col, l2: plan.l2, a: *a}
+	g := vecTableGraph(segs, key, plan.l2, *a, func() *segVecGraph {
+		rows := make([][]float32, 0, total)
+		var gnulls []int
+		zero := make([]float32, len(query))
+		for si, s := range segs {
+			if cells[si] == nil { // every row NULL
+				for r := range s.nRows {
+					rows = append(rows, zero)
+					gnulls = append(gnulls, bases[si]+r)
+				}
+				continue
+			}
 			offs := make([]int, len(cells[si]))
 			for i, c := range cells[si] {
 				offs[i] = int(uint32(c))
 			}
-			return prepVecGraph(s.heap, offs, nulls[si], len(query), *a)
-		})
-		if graphs[si] == nil {
-			return false
+			rs, ok := f32Rows(s.heap, offs, len(query))
+			if !ok {
+				return nil
+			}
+			rows = append(rows, rs...)
+			for _, r := range nulls[si] {
+				gnulls = append(gnulls, bases[si]+r)
+			}
 		}
+		return prepVecGraph(rows, gnulls, len(query), *a)
+	})
+	if g == nil {
+		return false
 	}
+
 	// The query as the walk compares it.
 	x := query
 	if a.compress != 0 && a.compress != vecF32 {
@@ -500,27 +524,25 @@ func vecGraphTopK(plan *segVectorPlan, segs []*segment, cells [][]uint64, nulls,
 	for _, v := range x {
 		sq += float64(v) * float64(v)
 	}
-	qp := vecPoint{codes, scale, float32(sq)}
+	dead := 0
+	for _, sk := range skips {
+		dead += len(sk)
+	}
+	// Deleted rows stay in the graph as stepping stones; the beam widens by
+	// as many so they do not crowd out the k.
+	l := max(a.searchL, plan.limit) + min(dead, total)
+	beam, _ := newVecWalk(g, total, plan.l2).search(vecPoint{codes, scale, float32(sq)}, l)
 
-	tops := make([]vecTopK, len(segs))
-	if !segEachOn(vecWorkers, len(segs), func(si int) bool {
-		g := graphs[si]
-		t := vecTopK{p: plan, h: make([]vecHit, 0, plan.limit)}
-		if g == nil {
-			tops[si] = t
-			return true
+	// The beam's live rows, by segment, at their exact distances.
+	bySeg := make([][]int, len(segs))
+	for _, c := range beam {
+		si := sort.SearchInts(bases, int(c.id)+1) - 1
+		r := int(c.id) - bases[si]
+		if _, gone := slices.BinarySearch(skips[si], r); !gone && cells[si] != nil {
+			bySeg[si] = append(bySeg[si], r)
 		}
-		w := newVecWalk(g, len(cells[si]), plan.l2)
-		// Deleted rows stay in the graph as stepping stones; the beam widens by
-		// as many so they do not crowd out the k.
-		l := max(a.searchL, plan.limit) + min(len(skips[si]), len(cells[si]))
-		beam, _ := w.search(qp, l)
-		rows := make([]int, 0, len(beam))
-		for _, c := range beam {
-			if _, dead := slices.BinarySearch(skips[si], int(c.id)); !dead {
-				rows = append(rows, int(c.id))
-			}
-		}
+	}
+	for si, rows := range bySeg {
 		offs := make([]int, len(rows))
 		for i, r := range rows {
 			offs[i] = int(uint32(cells[si][r]))
@@ -530,16 +552,7 @@ func vecGraphTopK(plan *segVectorPlan, segs []*segment, cells [][]uint64, nulls,
 			return false
 		}
 		for i, r := range rows {
-			t.offer(vecHit{d: dist[i], seg: si, row: r})
-		}
-		tops[si] = t
-		return true
-	}) {
-		return false
-	}
-	for _, t := range tops {
-		for _, c := range t.h {
-			top.offer(c)
+			top.offer(vecHit{d: dist[i], seg: si, row: r})
 		}
 	}
 	vecApproxServed.Add(1)
