@@ -87,7 +87,7 @@ func buildVecSide(heap []byte, offs []int, dims int) (*segVecSide, bool) {
 	zero := make([]float32, dims)
 	step := segVectorChunkRows(dims)
 	k := jitVecKernel(false)
-	return side, segEach((n+step-1)/step, func(j int) bool {
+	return side, segEachOn(vecWorkers, (n+step-1)/step, func(j int) bool {
 		lo, hi := j*step, min((j+1)*step, n)
 		rows, ok := f32Rows(heap, offs[lo:hi], dims)
 		if !ok {
@@ -357,7 +357,7 @@ func vecCandidates(plan *segVectorPlan, vq *vecQuery, sides []*segVecSide, skips
 	}
 	bounds := make([][]rowBound, len(jobs))
 	bests := make([][]float32, len(jobs)) // each job's k smallest fars
-	if !segEach(len(jobs), func(j int) bool {
+	if !segEachOn(vecWorkers, len(jobs), func(j int) bool {
 		w := jobs[j]
 		side, skip := sides[w.seg], skips[w.seg]
 		k, _ := slices.BinarySearch(skip, w.lo)

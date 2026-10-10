@@ -356,7 +356,7 @@ func (p *ReadOnlyPager) segVectorTopK(rootPage uint32, plan *segVectorPlan, ipkC
 	all := vecTopK{p: plan, h: make([]vecHit, 0, plan.limit)}
 	if !vecBoundedTopK(plan, segs, cells, skips, jobs, query, qn, &all) {
 		tops := make([]vecTopK, len(jobs))
-		if !segEach(len(jobs), func(j int) bool {
+		if !segEachOn(vecWorkers, len(jobs), func(j int) bool {
 			w := jobs[j]
 			s := segs[w.seg]
 			dist := make([]float32, w.hi-w.lo)
