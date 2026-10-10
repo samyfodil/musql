@@ -149,3 +149,112 @@ func (src *segSource) segDeltaSkips(rootPage uint32, segs []*segment) (skips [][
 	}
 	return skips, live, true
 }
+
+// segDeltaSum is the delta's correction to a filtered sum: the matching
+// segment copies it superseded or removed (sub), its own matching rows (add),
+// and the sum of every one of their absolute values, for the caller's overflow
+// bound. A NULL value counts toward neither, as sum() skips it.
+type segDeltaSum struct {
+	subSum, addSum int64
+	subN, addN     int
+	abs            uint64
+}
+
+// segDeltaSumCorrection is segDeltaCorrection for sum(col): which rows the
+// delta takes away from and adds to the segments' answer, and by how much.
+// served is false where the exact answer is out of reach -- a value that is
+// not an integer, a column a row does not reach, an absolute sum past int64.
+func (src *segSource) segDeltaSumCorrection(rootPage uint32, segs []*segment, preds []segPred, col int) (segDeltaSum, bool) {
+	var dc segDeltaSum
+	if src.delta == nil {
+		return dc, true
+	}
+	ti, known := src.tableOf[rootPage]
+	if !known {
+		return dc, true
+	}
+	live, dead := src.delta.live[ti], src.delta.dead[ti]
+	if len(live) == 0 && len(dead) == 0 {
+		return dc, true
+	}
+	// take folds one row's value into sum, n and dc.abs, if it matches.
+	take := func(vals []Value, sum *int64, n *int) bool {
+		matched, ok := rowMatchesPreds(vals, preds)
+		if !ok {
+			return false
+		}
+		if !matched {
+			return true
+		}
+		if col < 0 || col >= len(vals) {
+			return false
+		}
+		v := vals[col]
+		switch v.Typ {
+		case Null:
+			return true
+		case Int:
+		default:
+			return false
+		}
+		u := uint64(v.I)
+		if v.I < 0 {
+			u = -u
+		}
+		if dc.abs+u < dc.abs || dc.abs+u > 1<<63-1 {
+			return false
+		}
+		dc.abs += u
+		*sum += v.I
+		*n++
+		return true
+	}
+	// SUBTRACT the segment copy of every rowid the log names: superseded or
+	// removed, the segments counted it and the merged scan does not.
+	sub := func(rid int64) bool {
+		for _, s := range segs {
+			if i, hit := s.findRowid(rid); hit {
+				return take(s.rowAt(i), &dc.subSum, &dc.subN)
+			}
+		}
+		return true
+	}
+	for rid := range dead {
+		if !sub(rid) {
+			return dc, false
+		}
+	}
+	for rid, vals := range live {
+		if !sub(rid) || !take(vals, &dc.addSum, &dc.addN) {
+			return dc, false
+		}
+	}
+	return dc, true
+}
+
+// segPredsOnIPK reports whether a predicate reads the table's INTEGER PRIMARY
+// KEY. A delta row stores that column as NULL -- the rowid carries the value --
+// so testing the row (rowMatchesPreds) would compare NULL where the scan
+// compares the rowid. Where a table has a delta, the corrections decline such a
+// predicate, as the GROUP BY merge does (segHashAggTable): "count(*) WHERE id >
+// 0" over rows only in the delta answered 0.
+func segPredsOnIPK(preds []segPred, ipk int) bool {
+	if ipk < 0 {
+		return false
+	}
+	for _, pr := range preds {
+		if pr.Col == ipk {
+			return true
+		}
+	}
+	return false
+}
+
+// segDeltaCleanFor reports whether the table at rootPage has no delta rows.
+func (src *segSource) segDeltaCleanFor(rootPage uint32) bool {
+	if src.delta == nil {
+		return true
+	}
+	ti, known := src.tableOf[rootPage]
+	return !known || src.delta.emptyFor(ti)
+}

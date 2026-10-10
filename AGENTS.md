@@ -72,6 +72,7 @@ The engine runs a program two ways only: the VDBE, or the JIT-compiled VDBE.
 | `hrana/` | The Hrana server (HTTP, JSON and Protobuf) and `cmd/musqld`, so libSQL/Turso clients can use musql. Its own module, so the engine and driver depend on nothing but `golang.org/x/sys`. Generated code in `hrana/gen/`. |
 | `proto/` | Protobuf definitions. `buf generate` (repo root) writes the Go code into `hrana/gen/` and `examples/libp2p` has its own config. Never edit generated code by hand. |
 | `replication/` | Replication: capture, HLC, op log, CRDT and leader modes. The network is supplied by the caller (`WithTransport`). |
+| `npm/` | The npm package (`@samyfodil/musql`, GitHub Packages): `wasm/main.go` is its WebAssembly module, `index.js` the JavaScript API, `build.sh` builds both. Published by the release workflow on every tag. |
 | `examples/libp2p/` | An example `Transport` over libp2p, its own module. |
 | `internal/jit/` | The JIT: x86-64 and AArch64 emitters, W^X mapping, trampolines. |
 | `internal/filelock/` | OFD byte-range locks used by the write path. |

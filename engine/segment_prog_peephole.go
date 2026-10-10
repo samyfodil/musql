@@ -107,6 +107,15 @@ func segProgPeephole(prog *Program) bool {
 	if aggs == nil {
 		return false
 	}
+	// A FILTER is per aggregate, and the lowered body is shared: its jump
+	// past the filtered aggregate's argument reads, compiled, as a row filter
+	// for every aggregate in the step. "SELECT sum(abs(y)) FILTER (WHERE 0),
+	// count(*) FROM t" counted no rows (C: 1). The loop answers instead.
+	for _, a := range aggs {
+		if a.filter != nil {
+			return false
+		}
+	}
 	// The MAGNET is admissible only when every site is one of THESE
 	// aggregates' own min()/max() census. A site means some column anchors to a
 	// particular row, and this program has nothing to anchor: the tail above is

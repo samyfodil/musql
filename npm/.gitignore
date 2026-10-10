@@ -1,0 +1,7 @@
+# Produced by build.sh from the repository's sources.
+musql.wasm
+wasm_exec.js
+memfs.js
+glue.js
+node_modules/
+*.tgz

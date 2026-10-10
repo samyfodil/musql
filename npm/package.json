@@ -1,0 +1,40 @@
+{
+  "name": "@samyfodil/musql",
+  "version": "0.3.0",
+  "description": "musql, a SQLite-compatible database in Go, compiled to WebAssembly with its JIT: in-memory databases for Node and browsers.",
+  "type": "module",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "musql.wasm",
+    "wasm_exec.js",
+    "memfs.js",
+    "glue.js",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "sh build.sh",
+    "test": "node test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/samyfodil/musql.git",
+    "directory": "npm"
+  },
+  "keywords": [
+    "sqlite",
+    "sql",
+    "database",
+    "wasm",
+    "webassembly"
+  ],
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  }
+}

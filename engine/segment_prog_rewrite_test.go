@@ -102,11 +102,11 @@ func TestSegProgRewritePreservesDeclinedProgram(t *testing.T) {
 		jitEnabled = jit0
 		ResetSegFilterCountersForTest()
 		got := segProgScalar(t, p.fast, q)
-		if served, _ := SegFilterCountersForTest(); served != 0 {
-			t.Fatalf("%s: a guard served over a table whose rows are in the delta", q)
-		}
+		// Every row of this table is in the delta. The guards used to decline
+		// over one; they merge the delta now (segDeltaSplit and friends), so a
+		// guard may serve, and whatever it answers must be the loop's answer.
 		if got != want {
-			t.Errorf("rewrite changed a DECLINED answer\n  %s\n  rewritten=%s unrewritten=%s", q, got, want)
+			t.Errorf("rewrite changed the answer over a table whose rows are in the delta\n  %s\n  rewritten=%s unrewritten=%s", q, got, want)
 		}
 	}
 	jitEnabled = jit0

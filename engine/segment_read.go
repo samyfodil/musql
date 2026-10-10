@@ -284,7 +284,7 @@ func (src *segSource) scanSegments(rootPage uint32) (iter.Seq2[uint64, []Value],
 // served is false when the table is not columnar here, or when any segment
 // declines the predicate shape -- in which case the caller must fall back, and
 // a PARTIAL count is never returned.
-func (p *ReadOnlyPager) segFilterCountTable(rootPage uint32, preds []segPred) (int, bool) {
+func (p *ReadOnlyPager) segFilterCountTable(rootPage uint32, preds []segPred, ipk int) (int, bool) {
 	if p == nil || p.segs == nil {
 		return 0, false
 	}
@@ -303,6 +303,9 @@ func (p *ReadOnlyPager) segFilterCountTable(rootPage uint32, preds []segPred) (i
 	// commit, because a delta is what a commit appends. The log is MERGED now
 	// instead: the correction is O(delta), not O(rows). See
 	// segment_delta_merge.go.
+	if !p.segs.segDeltaCleanFor(rootPage) && segPredsOnIPK(preds, ipk) {
+		return 0, false
+	}
 	sub, add, mergeable := p.segs.segDeltaCorrection(rootPage, segs, preds)
 	if !mergeable {
 		return 0, false
@@ -362,17 +365,23 @@ func (p *ReadOnlyPager) segFilterCountTable(rootPage uint32, preds []segPred) (i
 
 // segFilterSumTable answers `sum(col) WHERE <preds>` from the segments.
 // It declines on integer overflow rather than approximating.
-func (p *ReadOnlyPager) segFilterSumTable(rootPage uint32, preds []segPred, col int) (Value, bool) {
-	// A row-major delta beside the segments makes a raw block read wrong; see
-	// segCleanFor.
-	if !p.segCleanFor(rootPage) {
-		return Value{}, false
-	}
+func (p *ReadOnlyPager) segFilterSumTable(rootPage uint32, preds []segPred, col, ipk int) (Value, bool) {
 	if p == nil || p.segs == nil {
 		return Value{}, false
 	}
 	segs, ok := p.segs.byRoot[rootPage]
 	if !ok {
+		return Value{}, false
+	}
+	// A row-major delta beside the segments makes a raw block read wrong, so its
+	// rows are merged as a correction (segDeltaSumCorrection), as the count's
+	// are: the segment copies it superseded or removed come off, its own rows
+	// go on, and both count toward the overflow bound below.
+	if !p.segs.segDeltaCleanFor(rootPage) && (segPredsOnIPK(preds, ipk) || (col == ipk && ipk >= 0)) {
+		return Value{}, false
+	}
+	dc, mergeable := p.segs.segDeltaSumCorrection(rootPage, segs, preds, col)
+	if !mergeable {
 		return Value{}, false
 	}
 	// Each segment sums on its own; the parts are added afterwards. That is
@@ -437,8 +446,12 @@ func (p *ReadOnlyPager) segFilterSumTable(rootPage uint32, preds []segPred, col 
 		return Value{}, false
 	}
 	var total int64
-	var abs uint64
-	matched := 0
+	abs := dc.abs
+	matched := dc.addN - dc.subN
+	total = dc.addSum - dc.subSum
+	if abs > 1<<63-1 {
+		return Value{}, false
+	}
 	for _, pt := range parts {
 		if abs+pt.abs < abs || abs+pt.abs > 1<<63-1 {
 			return Value{}, false

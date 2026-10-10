@@ -56,13 +56,16 @@ func TestColumnarGroupBulkMatchesTheLoop(t *testing.T) {
 			if fmt.Sprint(got) != fmt.Sprint(want) {
 				t.Errorf("%s %s:\n fast  %v\n plain %v", label, c.sql, got, want)
 			}
-			if JITEnabled() && ran != (c.bulk && label == "segments") {
+			if JITEnabled() && ran != c.bulk {
 				t.Errorf("%s %s: bulk ran=%v", label, c.sql, ran)
 			}
 		}
 	}
 	check("segments")
-	// Rows pending in the delta: the bulk path must step aside.
-	p.delta(`INSERT INTO t VALUES(5001, 3, 1, 42, 1, 1)`, `UPDATE t SET v = v + 1 WHERE id % 10 = 0`)
+	// Rows pending in the delta -- added, replaced and removed: the bulk path
+	// merges them (the replaced and removed positions skipped, the log's rows
+	// folded in after every segment's), and must agree with the loop.
+	p.delta(`INSERT INTO t VALUES(5001, 3, 1, 42, 1, 1)`, `UPDATE t SET v = v + 1 WHERE id % 10 = 0`,
+		`DELETE FROM t WHERE id % 7 = 0`, `UPDATE t SET k = -6 WHERE id = 5`)
 	check("delta")
 }

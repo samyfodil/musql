@@ -473,14 +473,18 @@ func runN4Scenario(t *testing.T, cfg n4Config) (path string, ledger *n4Ledger, t
 				tally.classifyReadErr(err)
 				i++
 				if runtime.GOOS == "js" {
-					// One thread, no preemption, and a sleeping goroutine wakes
-					// only when Go hands the thread back to the JS event loop,
-					// which it does only once nothing is runnable. A query here
-					// never blocks, so a reader that never parks starved the
-					// writers asleep in their busy-retry backoff for ever (238
-					// of 240 writes, then one reader alone). Parking each
-					// reader briefly lets the event loop run their timers.
-					time.Sleep(time.Millisecond)
+					// One thread, no preemption, and a goroutine waiting on the
+					// JS host -- a timer, or a file call under Node's real fs,
+					// which is asynchronous there -- wakes only when Go hands the
+					// thread back to the event loop, which it does only once
+					// nothing is runnable. A query here never blocks, so readers
+					// that never park starved the writers for ever (238 of 240
+					// writes, then one reader alone). Each reader parks between
+					// queries, for longer than a query takes even on a loaded
+					// host: at 1 ms, four readers' sleeps covered each other on a
+					// busy server and the writers sat in an fs open for 100
+					// minutes.
+					time.Sleep(20 * time.Millisecond)
 				}
 			}
 		}(cfg.nWriters+r, r*7+1)

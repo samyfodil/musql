@@ -63,7 +63,8 @@ const QUERIES = [
 	["UPDATE by indexed column", "UPDATE t SET v = v + 1 WHERE sec = ?", (r, n) => [int(r, n)]],
 	["INSERT one row", "INSERT INTO b(label) VALUES(?)", (r) => [`row-${int(r, 1000000)}`]],
 	["DELETE the last row", "DELETE FROM b WHERE id = (SELECT max(id) FROM b)", () => []],
-	["state after the writes", "SELECT count(*), sum(v), (SELECT count(*) FROM b), (SELECT max(id) FROM b) FROM t", () => []],
+	["t after the writes", "SELECT count(*), sum(v) FROM t", () => []],
+	["b after the writes", "SELECT count(*), max(id) FROM b", () => []],
 ];
 
 // seedSQL fills both engines identically. The inserts go in chunks of

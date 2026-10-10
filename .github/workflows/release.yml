@@ -89,3 +89,30 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}:${{ github.ref_name }}
             ghcr.io/${{ github.repository }}:latest
+
+  # The npm package (npm/), to GitHub Packages as @samyfodil/musql: the wasm
+  # module built from this tag, tested, and versioned from the tag's name.
+  npm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://npm.pkg.github.com
+          scope: "@samyfodil"
+      - name: build and test
+        working-directory: npm
+        run: |
+          sh build.sh
+          node test.mjs
+      - name: publish
+        working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+        run: |
+          npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+          npm publish
