@@ -42,6 +42,8 @@ func isAggregateCall(fc FuncExpr) bool {
 		// a wrong argument count is still an aggregate call (just one
 		// planAggregateCall rejects), not a reason to fall back to row mode.
 		return !fc.Star
+	case "vec1_train":
+		return !fc.Star
 	}
 	return false
 }
@@ -166,6 +168,7 @@ const (
 	aggGroupConcat                    // group_concat(expr[, sep])
 	aggJSONGroupArray                 // json_group_array(expr) -- see engine/json_funcs.go
 	aggJSONGroupObject                // json_group_object(key, value) -- see engine/json_funcs.go
+	aggVec1Train                      // vec1_train(vector[, config]) -- see engine/vec1_train.go
 )
 
 // aggItem is one aggregate call's execution plan and running state: an
@@ -196,6 +199,7 @@ type aggItem struct {
 	best        Value
 	haveBest    bool
 	gcBuf       strings.Builder
+	vec1        *vec1TrainState // vec1_train's training vectors and options
 	gcHave      bool
 	gcFirstVal  string // the first contribution's text/separator, kept only when
 	gcFirstSep  string // orderStrict is set -- see orderRisk
@@ -445,6 +449,8 @@ func aggKindName(k aggKind) string {
 		return "json_group_array()"
 	case aggJSONGroupObject:
 		return "json_group_object()"
+	case aggVec1Train:
+		return "vec1_train()"
 	}
 	return "an order-sensitive aggregate"
 }
@@ -816,6 +822,24 @@ func planAggregateCallKind(fc FuncExpr) (*aggItem, error) {
 		// (json.c:5701), which only its result computation reads.
 		return &aggItem{kind: aggJSONGroupArray, expr: fc.Args[0], distinct: fc.Distinct, jsonb: name == "jsonb_group_array"}, nil
 
+	case "vec1_train":
+		if len(fc.Args) != 1 && len(fc.Args) != 2 {
+			return nil, semanticf("engine: wrong number of arguments to function %s()", name)
+		}
+		if fc.Distinct {
+			return nil, fmt.Errorf("%w: vec1_train(DISTINCT ...)", errVDBEUnsupported)
+		}
+		for _, a := range fc.Args {
+			if err := checkExprSupported(a); err != nil {
+				return nil, err
+			}
+		}
+		it := &aggItem{kind: aggVec1Train, expr: fc.Args[0]}
+		if len(fc.Args) == 2 {
+			it.sepExpr = fc.Args[1]
+		}
+		return it, nil
+
 	case "json_group_object", "jsonb_group_object":
 		if len(fc.Args) != 2 {
 			return nil, fmt.Errorf("engine: wrong number of arguments to function %s()", name)
@@ -873,6 +897,11 @@ func (it *aggItem) step(ctx *evalCtx, regs []Value) error {
 
 	case aggJSONGroupObject:
 		return it.stepJSONWatched(ctx, regs, it.stepJSONGroupObject)
+
+	case aggVec1Train:
+		// vec1TrainStep runs for every row, a NULL vector included (which it
+		// rejects).
+		return it.stepVec1Train(ctx, regs)
 	}
 
 	v, err := it.rowValue(aggExprArg, ctx, regs)
@@ -1370,6 +1399,9 @@ func (it *aggItem) finalize() (Value, error) {
 
 	case aggJSONGroupObject:
 		return it.finalizeJSONGroupObject(), nil
+
+	case aggVec1Train:
+		return it.finalizeVec1Train()
 	}
 	return Value{}, fmt.Errorf("engine: internal: unknown aggregate kind %d", it.kind)
 }

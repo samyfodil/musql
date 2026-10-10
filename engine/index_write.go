@@ -213,19 +213,24 @@ func r32nParseCreateIndexStmt(sqlText string, recordDQ bool) (*parsedCreateIndex
 		stmt.ifNotExi = true
 	}
 
+	// A name may be a string literal, as SQLite's "nm" rule allows: vec1
+	// creates "CREATE INDEX 'v_idx_idx' ON 'v_idx'(...)" (vec1_table.go).
 	t := p.peek()
-	if t.kind != tkIdent {
+	name, isName := objectNameToken(t)
+	if !isName {
 		return nil, fmt.Errorf("engine: CREATE INDEX: expected index name, got %q", p.tokenDesc(t))
 	}
 	p.next()
-	stmt.name = t.text
+	stmt.name = name
 	if p.peekIsPunct(".") { // schema-qualified: CREATE INDEX main.idx ...
 		p.next()
 		t2 := p.peek()
-		if t2.kind != tkIdent {
+		name2, isName2 := objectNameToken(t2)
+		if !isName2 {
 			return nil, fmt.Errorf("engine: CREATE INDEX: expected index name after schema qualifier")
 		}
 		p.next()
+		t.text, t2.text = name, name2
 		// "main."/"temp." select one of this engine's two catalogs
 		// (temp_schema.go); the qualifier constrains BOTH where the index is
 		// created and which catalog its target table must resolve in, which
@@ -246,11 +251,12 @@ func r32nParseCreateIndexStmt(sqlText string, recordDQ bool) (*parsedCreateIndex
 		return nil, fmt.Errorf("engine: CREATE INDEX: expected ON, got %q", p.tokenDesc(p.peek()))
 	}
 	tt := p.peek()
-	if tt.kind != tkIdent {
+	tname, isTName := objectNameToken(tt)
+	if !isTName {
 		return nil, fmt.Errorf("engine: CREATE INDEX: expected table name, got %q", p.tokenDesc(tt))
 	}
 	p.next()
-	stmt.table = tt.text
+	stmt.table = tname
 
 	if err := p.expectPunct("("); err != nil {
 		return nil, err

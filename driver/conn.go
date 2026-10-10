@@ -221,6 +221,10 @@ type Conn struct {
 	// which r-trees it created, which decides what a damaged one answers.
 	// Every session and read pager this Conn opens shares it.
 	rtreeConns *engine.RtreeConnections
+	// vec1Conns is this connection's vec1 state (engine/vec1_table.go): the
+	// settings vec1_config() makes and each vec1 table's cache and pending
+	// index writes, which every session and pager of the connection shares.
+	vec1Conns *engine.Vec1Connection
 
 	// queryOnly is this connection's "PRAGMA query_only" setting (see
 	// foreignKeys); its setter takes effect inside a transaction.
@@ -582,6 +586,7 @@ func (c *Conn) openWriteOrCreatePath(path string) (*engine.DB, error) {
 	db.SetRecursiveTriggers(c.recursiveTriggers) // likewise; see Conn.recursiveTriggers
 	db.SetTrustedSchema(!c.untrustedSchema)      // likewise; see Conn.untrustedSchema
 	db.SetRtreeConnections(c.rtreeConns)         // likewise; see Conn.rtreeConns
+	db.SetVec1Connection(c.vec1Conns)            // likewise; see Conn.vec1Conns
 	db.SetQueryOnly(c.queryOnly)                 // likewise; see Conn.queryOnly
 	db.SetWriteLock(c.captureLock(db, path))     // see Conn.captureLock
 	if path == c.path {
@@ -699,6 +704,7 @@ func (c *Conn) stampConnState(p *engine.ReadOnlyPager) {
 	p.SetConnState(c.changes, c.totalChanges, c.lastInsertRowid, c.totalChangesOpaque, c.lastRowidOpaque)
 	p.SetTrustedSchema(!c.untrustedSchema)
 	p.SetRtreeConnections(c.rtreeConns)
+	p.SetVec1Connection(c.vec1Conns)
 	// "PRAGMA defer_foreign_keys" is readable, and it is read off the
 	// CONNECTION rather than off the held session: it used to be
 	// c.tx.DeferForeignKeys(), which is 0 whenever there is no held transaction

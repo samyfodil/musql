@@ -95,7 +95,7 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 // hook over it (capture.go), so a hook can install change capture before the
 // connection is ever used.
 func newConn(dsn string) (driver.Conn, error) {
-	c := &Conn{path: splitDSN(dsn), rtreeConns: engine.NewRtreeConnections()}
+	c := &Conn{path: splitDSN(dsn), rtreeConns: engine.NewRtreeConnections(), vec1Conns: engine.NewVec1Connection()}
 	if path, private, shared, ok := memBacking(dsn); ok {
 		c.path = path
 		c.memPrivate = private // removed by Conn.Close (memdb.go)

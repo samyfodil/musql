@@ -156,6 +156,10 @@ type joinSource struct {
 	// Computed here against the item's owning pager.
 	vtabOmitCandidate int
 
+	// vtabOmitCandidates is vtabOmitCandidate for vec1, which consumes several
+	// conjuncts (vec1OmitCandidates): their tvfWhere indices.
+	vtabOmitCandidates []int
+
 	// isFtsVtab reports whether vtabItem is specifically a PERSISTED fts3/
 	// fts4/fts5 virtual table reference (isFtsVtabSource, vdbe_agg_codegen.go
 	// -- never a table-valued function call or any other vtab module),
@@ -1508,6 +1512,13 @@ func (p *ReadOnlyPager) resolveVtabSource(c *compiler, state *joinDesugarState, 
 	if om, ok := mod.(omittingVtabModule); ok && len(it.tvfWhere) > 0 && len(it.TableFuncArgs) == 0 {
 		if j := om.OmittedConjunct(it.tvfWhere, name); j >= 0 && j < len(it.tvfWhere) {
 			js.vtabOmitCandidate = j + 1
+		}
+	}
+	if _, isVec1 := mod.(vec1Module); isVec1 && len(it.tvfWhere) > 0 {
+		if _, vt, verr := vtabConnect(p.fts3Catalog(), mod, modArgs); verr == nil {
+			if st, ok := vt.(*vec1Store); ok {
+				js.vtabOmitCandidates = vec1OmitCandidates(st, it, name)
+			}
 		}
 	}
 	// isFtsVtab is computed against p, the item's owning pager, where p.forDB(0) is

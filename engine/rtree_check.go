@@ -483,6 +483,26 @@ func (p *ReadOnlyPager) integrityCheckRtrees(scope schemaScope, only string) ([]
 		if perr != nil {
 			continue
 		}
+		if r33sFoldIdent(module) == "vec1" {
+			// vec1's xIntegrity (vec1_integrity.go), main only as its read
+			// path is.
+			if scope == scopeTemp {
+				continue
+			}
+			_, _, args, _, _ := parseCreateVirtualTableStmt(tr.SQL)
+			_, vt, verr := vec1Module{}.Connect(args)
+			if verr != nil {
+				return nil, verr
+			}
+			msg, cerr := p.vec1Integrity(tr.Name, vt.(*vec1Store))
+			if cerr != nil {
+				return nil, cerr
+			}
+			if msg != "" {
+				out = append(out, Value{Typ: Text, S: []byte(msg)})
+			}
+			continue
+		}
 		if m := r33sFoldIdent(module); m != "rtree" && m != "rtree_i32" {
 			continue
 		}
@@ -507,7 +527,7 @@ func (p *ReadOnlyPager) integrityCheckRtrees(scope schemaScope, only string) ([]
 		}
 	}
 	if len(out) > 1 {
-		return nil, fmt.Errorf("%w: PRAGMA integrity_check with %d damaged r-trees, reported in schema hash order", errVDBEUnsupported, len(out))
+		return nil, fmt.Errorf("%w: PRAGMA integrity_check with %d damaged virtual tables, reported in schema hash order", errVDBEUnsupported, len(out))
 	}
 	return out, nil
 }

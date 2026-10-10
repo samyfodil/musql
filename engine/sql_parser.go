@@ -2651,7 +2651,7 @@ func isAggregateFuncName(name string) bool {
 	switch name {
 	case "count", "sum", "total", "avg", "group_concat", "string_agg",
 		"min", "max", "json_group_array", "json_group_object",
-		"jsonb_group_array", "jsonb_group_object":
+		"jsonb_group_array", "jsonb_group_object", "vec1_train":
 		return true
 	}
 	return false

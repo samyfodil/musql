@@ -694,7 +694,7 @@ func aggRowCanCarrySubtype(srcs []joinSource) bool {
 // coercion cannot fail today, so this does not depend on another file.
 func aggStepBodyMayRaise(k aggKind) bool {
 	switch k {
-	case aggGroupConcat, aggJSONGroupArray, aggJSONGroupObject:
+	case aggGroupConcat, aggJSONGroupArray, aggJSONGroupObject, aggVec1Train:
 		return true
 	}
 	return false

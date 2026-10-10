@@ -71,15 +71,20 @@ func vtabOmitConjuncts(stmt *SelectStmt, srcs []joinSource) *SelectStmt {
 	var claims map[int]int
 	var owner map[int]int
 	for i := range srcs {
-		j := srcs[i].vtabOmitCandidate - 1
-		if j < 0 || srcs[i].vtabItem == nil {
+		if srcs[i].vtabItem == nil {
 			continue
 		}
-		if claims == nil {
-			claims, owner = map[int]int{}, map[int]int{}
+		cands := srcs[i].vtabOmitCandidates
+		if j := srcs[i].vtabOmitCandidate - 1; j >= 0 {
+			cands = append([]int{j}, cands...)
 		}
-		claims[j]++
-		owner[j] = i
+		for _, j := range cands {
+			if claims == nil {
+				claims, owner = map[int]int{}, map[int]int{}
+			}
+			claims[j]++
+			owner[j] = i
+		}
 	}
 	if len(claims) == 0 {
 		return stmt
@@ -98,7 +103,12 @@ func vtabOmitConjuncts(stmt *SelectStmt, srcs []joinSource) *SelectStmt {
 			continue
 		}
 		drop[j] = true
-		srcs[owner[j]].vtabItem.tvfOmitPlus1 = j + 1
+		if len(srcs[owner[j]].vtabOmitCandidates) > 0 {
+			// A module claiming several (vec1) is told every one dropped.
+			srcs[owner[j]].vtabItem.tvfOmitSet = append(srcs[owner[j]].vtabItem.tvfOmitSet, j)
+		} else {
+			srcs[owner[j]].vtabItem.tvfOmitPlus1 = j + 1
+		}
 	}
 	if len(drop) == 0 {
 		return stmt

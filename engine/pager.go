@@ -245,6 +245,8 @@ type ReadOnlyPager struct {
 
 	// rtreeConns is the connection's r-tree registry (rtree_conn.go).
 	rtreeConns *RtreeConnections
+	// vec1Conns is the connection's vec1 state (vec1_table.go).
+	vec1Conns *Vec1Connection
 
 	// noAutoIndex mirrors the connection's "PRAGMA automatic_index" at the
 	// moment this pager was materialized, stored INVERTED so the zero value is

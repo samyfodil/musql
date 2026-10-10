@@ -370,6 +370,9 @@ func (db *DB) restoreSnapshot(snap *txSnapshot) {
 	// there is nothing to undo beyond forgetting it -- ROLLBACK and ROLLBACK
 	// TO both discard it, exactly like the fts3 line above (fts5_txn.go).
 	db.fts5TxnDiscard()
+	// vec1's pending index lists go with it, and its cached model (xRollback,
+	// xRollbackTo).
+	db.vec1Rollback(false)
 	// Every *tableMeta/*indexMeta/... pointer below is about to be replaced by
 	// a clone taken at BEGIN. schemaCookie is restored to its snapshot NUMBER a
 	// few lines down, so it cannot signal that -- bump txGen, which exists for
@@ -593,6 +596,11 @@ func (db *DB) commitTxn() error {
 	if err := db.attachedCommitLockCheck(); err != nil {
 		return err
 	}
+	// vec1's xSync writes the index lists its INSERTs kept in memory
+	// (vec1_write.go).
+	if err := db.vec1Sync(); err != nil {
+		return err
+	}
 	// Every ATTACHed database this transaction wrote into commits here too, main
 	// last -- see attach_write.go, including the cross-file atomicity ceiling
 	// that ordering does and does not buy.
@@ -626,6 +634,7 @@ func (db *DB) clearTxnState() {
 	// (above, on every such path) already called fts5TxnDiscard, clearing the
 	// pending set before this runs.
 	db.fts5TxnFlush()
+	db.vec1TxnEnd()
 	db.fts3AutomergeTouched = nil // see its own doc comment (writer.go)
 	db.txActive = false
 	db.txSnapshot = nil
@@ -759,6 +768,11 @@ func (db *DB) openSavepoint(name string) error {
 	// does not also undo it -- matching C fts5, where the flush happens
 	// before SQLite takes the pager-level savepoint mark.
 	db.fts5TxnFlush()
+	// ...and vec1's xSavepoint writes its pending index lists, so they too
+	// land in the state this savepoint captures.
+	if err := db.vec1Sync(); err != nil {
+		return err
+	}
 	snap := db.captureSharedSnapshot()
 	if snap == nil {
 		// See captureSnapshot's/beginTxn's identical check: a nil result
@@ -829,6 +843,10 @@ func (db *DB) releaseSavepoint(name string) error {
 		if err := db.attachedCommitLockCheck(); err != nil {
 			return err
 		}
+	}
+	// vec1's xRelease writes its pending index lists.
+	if err := db.vec1Sync(); err != nil {
+		return err
 	}
 	clear(db.savepoints[i:]) // drop the popped entries' snapshots for the GC
 	db.savepoints = db.savepoints[:i]

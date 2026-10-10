@@ -3465,6 +3465,17 @@ func vtabDeclaredColumnsAsSQLiteReportsThem(module, tableName string, vcols []Vt
 		return append(out, hide(tableName), hide("rank")), true
 	case "rtree", "rtree_i32", "fts4aux", "fts3tokenize":
 		return vcols, true
+	case "vec1":
+		// [rowid HIDDEN, cmd, arg, distance, vector, meta...] -> C's, which
+		// has no rowid column.
+		if len(vcols) == 0 {
+			return nil, false
+		}
+		out := make([]VtabColumn, 0, len(vcols)-1)
+		for _, c := range vcols[1:] {
+			out = append(out, VtabColumn{Name: c.Name, Type: c.Type, Hidden: c.Hidden})
+		}
+		return out, true
 	}
 	return nil, false
 }
