@@ -35,13 +35,44 @@ import (
 
 // segVectorPlan is what OpSegVectorTopK carries.
 type segVectorPlan struct {
-	l2      bool // vector_distance_l2, else _cos
-	col     int  // the vector column
-	param   int  // the query vector's parameter number
-	desc    bool
-	limit   int // rows the heap keeps: the LIMIT plus the OFFSET
-	offset  int
+	l2     bool // vector_distance_l2, else _cos
+	col    int  // the vector column
+	query  segVecArg
+	desc   bool
+	limit  int // rows the heap keeps: the LIMIT plus the OFFSET
+	offset int
+	// outCols are the columns each row emits; segVecOutDist is the distance.
 	outCols []int
+}
+
+// segVecOutDist in outCols is the distance itself, as in
+// "SELECT id, vector_distance_cos(emb, ?) AS d ... ORDER BY d".
+const segVecOutDist = -1
+
+// segVecArg is the query vector as the statement spells it: a parameter or a
+// literal, possibly through one of vector()'s encoders, as in
+// vector_distance_cos(emb, vector32(?)) or (emb, vector('[1,2,3]')).
+type segVecArg struct {
+	param int    // the parameter number, or -1 for the literal
+	lit   Value  // the literal
+	enc   string // vector(), vector32(), ... applied to it; "" for none
+}
+
+// value is the query vector's value for these parameters, computed by the
+// same function the loop would call, or false when that fails.
+func (a segVecArg) value(params []Value) (Value, bool) {
+	v := a.lit
+	if a.param >= 0 {
+		v = paramAt(params, a.param)
+	}
+	if a.enc != "" {
+		r, ok, err := callVectorFunc(a.enc, []Value{v})
+		if !ok || err != nil {
+			return Value{}, false
+		}
+		v = r
+	}
+	return v, true
 }
 
 // segVectorPeephole rewrites prog when it is a distance-ordered top-k over a
@@ -77,13 +108,15 @@ func segVectorPeephole(prog *Program) bool {
 		return false
 	}
 
-	// The fill loop: columns, the query parameter, and one distance call.
+	// The fill loop: columns, the query vector, and one distance call.
 	type src struct {
-		col, param int  // a column, or a parameter (the other is -1)
-		dist       bool // the distance
+		col  int // a column, or -1
+		arg  *segVecArg
+		dist bool // the distance
 	}
 	regs := map[int]src{}
-	plan := &segVectorPlan{param: -1}
+	plan := &segVectorPlan{}
+	found := false
 	pc := rewindAt + 1
 loop:
 	for ; pc < len(in); pc++ {
@@ -93,9 +126,15 @@ loop:
 			if ins.P1 != cursor {
 				return false
 			}
-			regs[ins.P3] = src{col: ins.P2, param: -1}
+			regs[ins.P3] = src{col: ins.P2}
 		case OpVariable:
-			regs[ins.P2] = src{col: -1, param: ins.P1}
+			regs[ins.P2] = src{col: -1, arg: &segVecArg{param: ins.P1}}
+		case OpString8:
+			lit, _ := ins.P4.(string)
+			regs[ins.P2] = src{col: -1, arg: &segVecArg{param: -1, lit: Value{Typ: Text, S: []byte(lit)}}}
+		case OpBlob:
+			lit, _ := ins.P4.([]byte)
+			regs[ins.P2] = src{col: -1, arg: &segVecArg{param: -1, lit: Value{Typ: Blob, S: lit}}}
 		case OpSCopy:
 			s, ok := regs[ins.P1]
 			if !ok {
@@ -104,7 +143,17 @@ loop:
 			regs[ins.P2] = s
 		case OpFunction:
 			name, _ := ins.P4.(string) // a registered UDF is a *ScalarFunction
-			if (name != "vector_distance_cos" && name != "vector_distance_l2") || ins.P2 != 2 || plan.param >= 0 {
+			if _, isEnc := vectorEncoders[name]; isEnc && ins.P2 == 1 {
+				a, ok := regs[ins.P1]
+				if !ok || a.arg == nil || a.arg.enc != "" {
+					return false
+				}
+				enc := *a.arg
+				enc.enc = name
+				regs[ins.P3] = src{col: -1, arg: &enc}
+				continue
+			}
+			if (name != "vector_distance_cos" && name != "vector_distance_l2") || ins.P2 != 2 || found {
 				return false
 			}
 			a, okA := regs[ins.P1]
@@ -112,20 +161,21 @@ loop:
 			if !okA || !okB || a.dist || b.dist {
 				return false
 			}
-			if a.col < 0 {
+			if a.arg != nil {
 				a, b = b, a // the distance is symmetric in its arguments
 			}
-			if a.col < 0 || b.param < 0 {
+			if a.arg != nil || a.col < 0 || b.arg == nil {
 				return false
 			}
 			plan.l2 = name == "vector_distance_l2"
-			plan.col, plan.param = a.col, b.param
-			regs[ins.P3] = src{col: -1, param: -1, dist: true}
+			plan.col, plan.query = a.col, *b.arg
+			found = true
+			regs[ins.P3] = src{col: -1, dist: true}
 		default:
 			break loop
 		}
 	}
-	if plan.param < 0 {
+	if !found {
 		return false
 	}
 	if pc < len(in) && in[pc].Op == OpSorterCheck {
@@ -146,10 +196,16 @@ loop:
 	}
 	for i := 1; i < nRec; i++ {
 		s, ok := regs[recBase+i]
-		if !ok || s.col < 0 {
+		switch {
+		case !ok || s.arg != nil:
+			return false
+		case s.dist:
+			plan.outCols = append(plan.outCols, segVecOutDist)
+		case s.col >= 0:
+			plan.outCols = append(plan.outCols, s.col)
+		default:
 			return false
 		}
-		plan.outCols = append(plan.outCols, s.col)
 	}
 	offset, outBase, nOut, ok := segSorterDrain(in, pc+3, sorterNum, ki.bound)
 	if !ok || nOut != nRec-1 {
@@ -380,6 +436,8 @@ func (p *ReadOnlyPager) segVectorTopK(rootPage uint32, plan *segVectorPlan, ipkC
 			vals := live[c.rid]
 			for j, col := range plan.outCols {
 				switch {
+				case col == segVecOutDist:
+					row[j] = distanceValue(c.d)
 				case col == ipkCol && ipkCol >= 0:
 					row[j] = Value{Typ: Int, I: c.rid}
 				case col < len(vals):
@@ -393,7 +451,11 @@ func (p *ReadOnlyPager) segVectorTopK(rootPage uint32, plan *segVectorPlan, ipkC
 			if readers[c.seg] == nil {
 				readers[c.seg] = segColReadersLenient(s, plan.outCols, ipkCol)
 			}
-			for j := range plan.outCols {
+			for j, col := range plan.outCols {
+				if col == segVecOutDist {
+					row[j] = distanceValue(c.d)
+					continue
+				}
 				v, ok := readers[c.seg][j].value(s, c.row)
 				if !ok {
 					return nil, false

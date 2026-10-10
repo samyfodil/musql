@@ -2106,11 +2106,14 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			if !okPlan || cur == nil || cur.tbl == nil || cur.pager == nil {
 				return nil, fmt.Errorf("vdbe: OpSegVectorTopK without a plan or an open cursor")
 			}
-			if rows, served := cur.pager.segVectorTopK(cur.tbl.root, vplan, cur.tbl.ipkIndex, paramAt(m.params, vplan.param)); served {
-				segFilterServed.Add(1)
-				m.segRows, m.segRow = rows[min(vplan.offset, len(rows)):], 0
-				pc = op.P3
-				continue
+			// A query whose encoder fails declines: the loop raises the error.
+			if q, ok := vplan.query.value(m.params); ok {
+				if rows, served := cur.pager.segVectorTopK(cur.tbl.root, vplan, cur.tbl.ipkIndex, q); served {
+					segFilterServed.Add(1)
+					m.segRows, m.segRow = rows[min(vplan.offset, len(rows)):], 0
+					pc = op.P3
+					continue
+				}
 			}
 			segFilterDeclined.Add(1)
 

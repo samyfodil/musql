@@ -3,6 +3,7 @@ package libsql
 import (
 	"fmt"
 	"math/rand/v2"
+	"strings"
 	"testing"
 
 	"github.com/samyfodil/musql/engine"
@@ -40,6 +41,7 @@ func TestKNN(t *testing.T) {
 		}
 	}
 	q := blob(r, d)
+	qtext := randVec(r, d)
 	var qs []string
 	for _, f := range []string{"vector_distance_cos(emb, ?)", "vector_distance_cos(?, emb)", "vector_distance_l2(emb, ?)", "vector_distance_l2(?, emb)"} {
 		for _, tail := range []string{"LIMIT 10", "LIMIT 1", "DESC LIMIT 15", "LIMIT 20 OFFSET 7", "DESC LIMIT 5 OFFSET 3", "LIMIT 5000"} {
@@ -47,14 +49,27 @@ func TestKNN(t *testing.T) {
 		}
 	}
 	engine.VecBoundedServedForTest()
+	// The spellings libSQL applications use: the query inline, through an
+	// encoder, and the distance returned alongside.
+	inline := []string{
+		fmt.Sprintf("SELECT id FROM docs ORDER BY vector_distance_cos(emb, vector('%s')) LIMIT 10", qtext),
+		fmt.Sprintf("SELECT id, vector_distance_cos(emb, vector32('%s')) AS d FROM docs ORDER BY d LIMIT 10", qtext),
+		fmt.Sprintf("SELECT id, tag, vector_distance_l2(vector('%s'), emb) AS d FROM docs ORDER BY d DESC LIMIT 7 OFFSET 2", qtext),
+		"SELECT vector_distance_cos(emb, vector32(?)) AS d, id FROM docs ORDER BY d LIMIT 10",
+	}
+	qs = append(qs, inline...)
 	for _, s := range qs {
+		arg := []any{q}
+		if !strings.Contains(s, "?") {
+			arg = nil
+		}
 		s0, d0 := engine.SegFilterCountersForTest()
-		got := answerArgs(m, s, q)
+		got := answerArgs(m, s, arg...)
 		s1, d1 := engine.SegFilterCountersForTest()
 		if s1-s0 != 1 || d1 != d0 {
 			t.Errorf("%s: the columnar top-k did not serve (served +%d, declined +%d)", s, s1-s0, d1-d0)
 		}
-		if want := answerArgs(l, s, q); got != want {
+		if want := answerArgs(l, s, arg...); got != want {
 			t.Errorf("%s\n musql:  %.300s\n libsql: %.300s", s, got, want)
 		}
 	}
