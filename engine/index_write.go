@@ -83,6 +83,10 @@ type indexMeta struct {
 	keys  []indexKey
 	where Expr
 
+	// vec is set for libSQL's vector index, an expression index keyed on
+	// libsql_vector_idx(col) (vector_index.go).
+	vec *vecIndex
+
 	// isTablePK is true ONLY for the synthetic indexMeta schema_write.go's
 	// CreateTable builds for a WITHOUT ROWID
 	// table's own PRIMARY KEY (tableMeta.pkIndex) -- see that field's doc
@@ -579,6 +583,19 @@ func (db *DB) createExprIndex(sqlText string, stmt *parsedCreateIndex, tbl *tabl
 		}
 		return fmt.Errorf("engine: CREATE INDEX %s: %w", stmt.name, err)
 	}
+	if idxm.vec != nil {
+		// libSQL fills a new vector index from the table's rows, each one
+		// checked as an INSERT would check it.
+		var whereProg *selfRowExpr
+		if idxm.where != nil {
+			whereProg, _ = compileIndexExprs(tbl, idxm)
+		}
+		for rowid, vals := range tbl.rows.all() {
+			if err := checkVectorIndexRow(tbl, idxm, whereProg, rowid, vals); err != nil {
+				return err
+			}
+		}
+	}
 	idxm.schemaSeq = db.nextSchemaSeq(tbl.isTemp)
 	if err := db.checkNewIndex(idxm, tbl); err != nil {
 		return err
@@ -632,11 +649,17 @@ func buildExprIndexMeta(name string, tbl *tableMeta, stmt *parsedCreateIndex, st
 		}
 	}
 
+	vec, err := vectorIndexOf(stmt, tbl)
+	if err != nil {
+		return nil, err
+	}
+
 	keys, err := resolveIndexKeys(tbl, stmt)
 	if err != nil {
 		return nil, err
 	}
 	return &indexMeta{
+		vec:           vec,
 		isTemp:        tbl.isTemp,
 		name:          name,
 		table:         tbl.name,
@@ -759,6 +782,21 @@ func compileIndexExprs(tbl *tableMeta, idx *indexMeta) (whereProg *selfRowExpr, 
 // if a bulk write into an expression-indexed table ever shows up in a profile.
 func (db *DB) checkIndexExprsForRow(tbl *tableMeta, rowid uint64, vals []Value) error {
 	for _, idx := range db.indexes {
+		if idx.vec != nil {
+			// Its key cannot fail (libsql_vector_idx is its argument), but
+			// the vector must fit the index, UNIQUE or not.
+			if !indexBelongsTo(idx, tbl) {
+				continue
+			}
+			var whereProg *selfRowExpr
+			if idx.where != nil {
+				whereProg, _ = compileIndexExprs(tbl, idx)
+			}
+			if err := checkVectorIndexRow(tbl, idx, whereProg, rowid, vals); err != nil {
+				return err
+			}
+			continue
+		}
 		if idx.unique || !idx.exprOrPartial || !indexBelongsTo(idx, tbl) {
 			continue
 		}

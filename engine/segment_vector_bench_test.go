@@ -76,3 +76,49 @@ func BenchmarkVectorText(b *testing.B) {
 		}
 	}
 }
+
+// vecBenchHeap is rows random float32 vectors of dims components, laid out as
+// a segment's heap.
+func vecBenchHeap(rows, dims int) ([]byte, []int) {
+	r := rand.New(rand.NewPCG(1, 1))
+	heap := make([]byte, 0, rows*dims*4)
+	offs := make([]int, rows)
+	for i := range rows {
+		offs[i] = len(heap)
+		for range dims {
+			heap = binary.LittleEndian.AppendUint32(heap, math.Float32bits(float32(r.NormFloat64())))
+		}
+	}
+	return heap, offs
+}
+
+// BenchmarkVecGraphBuild builds an approximate index's graph with libSQL's
+// default options.
+func BenchmarkVecGraphBuild(b *testing.B) {
+	const rows, dims = 20_000, 384
+	heap, offs := vecBenchHeap(rows, dims)
+	a := vecApprox{alpha: 1.2, insertL: 70, searchL: 200}
+	for b.Loop() {
+		rows, _ := f32Rows(heap, offs, dims)
+		g := prepVecGraph(rows, nil, dims, a)
+		if g == nil {
+			b.Fatal("no graph")
+		}
+		g.link(false, a)
+	}
+}
+
+// BenchmarkVecGraphSearch is one beam search of width 200 over that graph.
+func BenchmarkVecGraphSearch(b *testing.B) {
+	const rows, dims = 65_536, 384
+	heap, offs := vecBenchHeap(rows, dims)
+	a := vecApprox{alpha: 1.2, insertL: 70, searchL: 200}
+	rs, _ := f32Rows(heap, offs, dims)
+	g := prepVecGraph(rs, nil, dims, a)
+	g.link(false, a)
+	q := newVecWalk(g, rows, false).point(7)
+	for b.Loop() {
+		w := newVecWalk(g, rows, false)
+		w.search(q, 200)
+	}
+}

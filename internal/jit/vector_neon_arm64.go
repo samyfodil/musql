@@ -250,3 +250,43 @@ func EmitQuantize() ([]byte, error) {
 	a.Ret()
 	return a.Code()
 }
+
+// EmitI8DotGather is EmitI8Dot over rows anywhere in one block: each row's
+// byte offset from A comes from V, and the query, C, is int8 codes widened
+// here (see the AVX2 twin).
+func EmitI8DotGather() ([]byte, error) {
+	a := NewArm()
+	a.LdrImm(X8, X0, OffA)
+	a.LdrImm(X7, X0, OffV)
+	a.LdrImm(X2, X0, OffC)
+	a.LdrImm(X3, X0, OffN)
+	a.LdrImm(X4, X0, OffXA)
+	a.LsrImm(X4, X4, 4)
+	a.LdrImm(X6, X0, OffOut)
+	a.Label("row")
+	a.LdrPost(X1, X7, 8)
+	a.AddReg(X1, X1, X8)
+	a.movi0(3)
+	a.MovReg(X16, X2)
+	a.MovReg(X17, X4)
+	a.Label("block")
+	a.LdrQPost(0, X1, 16)
+	a.sxtl8h(1, 0)
+	a.sxtl2_8h(2, 0)
+	a.LdrQPost(6, X16, 16)
+	a.sxtl8h(4, 6)
+	a.sxtl2_8h(5, 6)
+	a.smlal4s(3, 1, 4)
+	a.smlal2_4s(3, 1, 4)
+	a.smlal4s(3, 2, 5)
+	a.smlal2_4s(3, 2, 5)
+	a.SubsImm(X17, X17, 1)
+	a.Bcond(CondNE, "block")
+	a.addvS(3, 3)
+	a.fmovWS(X9, 3)
+	a.strWPost(X9, X6)
+	a.SubsImm(X3, X3, 1)
+	a.Bcond(CondNE, "row")
+	a.Ret()
+	return a.Code()
+}

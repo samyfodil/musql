@@ -43,6 +43,17 @@ type segVectorPlan struct {
 	offset int
 	// outCols are the columns each row emits; segVecOutDist is the distance.
 	outCols []int
+	// nanLast ranks a NaN distance (a zero vector's cosine) after every other
+	// row, as vector_top_k does, instead of as the SQL sorter places a NULL.
+	nanLast bool
+	// rowidOf, when set, breaks a tie by rowid instead of scan order, which
+	// puts a row the log changed after its segment neighbours.
+	rowidOf func(vecHit) int64
+	// skipNulls leaves NULL rows out, as vector_top_k's index does, instead of
+	// declining them; approx, when set, walks each segment's DiskANN graph
+	// instead of reading every row (segment_vector_graph.go).
+	skipNulls bool
+	approx    *vecApprox
 }
 
 // segVecOutDist in outCols is the distance itself, as in
@@ -245,14 +256,18 @@ type vecHit struct {
 }
 
 // before is the sorter's order for one REAL key: NULL first ascending and last
-// descending, then the value, then scan order.
+// descending (or last always, under nanLast), then the value, then scan order
+// (or rowid).
 func (p *segVectorPlan) before(a, b vecHit) bool {
 	an, bn := a.d != a.d, b.d != b.d
 	if an != bn {
-		return an != p.desc
+		return an != (p.desc || p.nanLast)
 	}
 	if !an && a.d != b.d {
 		return (a.d < b.d) != p.desc
+	}
+	if p.rowidOf != nil {
+		return p.rowidOf(a) < p.rowidOf(b)
 	}
 	if a.seg != b.seg {
 		return a.seg < b.seg
@@ -334,17 +349,47 @@ func (p *ReadOnlyPager) segVectorTopK(rootPage uint32, plan *segVectorPlan, ipkC
 
 	// Every cell must be a BLOB of the query's length: then each one parses
 	// as a float32 vector of the query's dimensions, as the function would.
+	// Under skipNulls a NULL row is skipped like a deleted one, and its cell
+	// replaced by a real row's, so no kernel reads an offset that means nothing.
 	var jobs []vecJob
 	cells := make([][]uint64, len(segs))
+	nullsOf := make([][]int, len(segs))
 	for si, s := range segs {
-		c, _, ok := s.BytesColumn(plan.col)
+		var c []uint64
+		var nulls []byte
+		ok := false
+		if plan.skipNulls {
+			c, _, nulls, ok = s.BytesColumnNulls(plan.col)
+		} else {
+			c, _, ok = s.BytesColumn(plan.col)
+		}
 		if !ok || s.cols[plan.col].phys != PhysBlob {
 			return nil, false
 		}
-		for _, cell := range c {
+		var nullRows []int
+		valid := -1
+		for r, cell := range c {
+			if nulls != nil && nulls[r/8]&(1<<(r%8)) != 0 {
+				nullRows = append(nullRows, r)
+				continue
+			}
 			if int(cell>>32) != width {
 				return nil, false
 			}
+			if valid < 0 {
+				valid = r
+			}
+		}
+		if valid < 0 {
+			continue // every row NULL: nothing to search
+		}
+		nullsOf[si] = nullRows
+		if nullRows != nil {
+			c = slices.Clone(c)
+			for _, r := range nullRows {
+				c[r] = c[valid]
+			}
+			skips[si] = slices.Sorted(slices.Values(append(slices.Clone(skips[si]), nullRows...)))
 		}
 		cells[si] = c
 		for lo, step := 0, segVectorChunkRows(qv.dims); lo < s.nRows; lo += step {
@@ -354,7 +399,8 @@ func (p *ReadOnlyPager) segVectorTopK(rootPage uint32, plan *segVectorPlan, ipkC
 
 	qn := vecSelfDot(query) // the query's norm, summed as the function sums it
 	all := vecTopK{p: plan, h: make([]vecHit, 0, plan.limit)}
-	if !vecBoundedTopK(plan, segs, cells, skips, jobs, query, qn, &all) {
+	if !(plan.approx != nil && vecGraphTopK(plan, segs, cells, nullsOf, skips, query, qn, &all)) &&
+		!vecBoundedTopK(plan, segs, cells, skips, jobs, query, qn, &all) {
 		tops := make([]vecTopK, len(jobs))
 		if !segEachOn(vecWorkers, len(jobs), func(j int) bool {
 			w := jobs[j]
@@ -410,6 +456,9 @@ func (p *ReadOnlyPager) segVectorTopK(rootPage uint32, plan *segVectorPlan, ipkC
 		slices.Sort(rids)
 		for i, rid := range rids {
 			vals := live[rid]
+			if plan.skipNulls && plan.col < len(vals) && vals[plan.col].Typ == Null {
+				continue
+			}
 			if plan.col >= len(vals) || vals[plan.col].Typ != Blob || len(vals[plan.col].S) != width {
 				return nil, false
 			}

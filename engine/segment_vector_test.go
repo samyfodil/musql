@@ -197,6 +197,37 @@ func TestI8DotKernel(t *testing.T) {
 	}
 }
 
+// TestI8DotGatherKernel checks the graph walk's gathering int8 kernel against
+// int8Dot8, over rows taken in any order and repeated, the query one of them.
+func TestI8DotGatherKernel(t *testing.T) {
+	if jitI8DotGatherKernel() == nil {
+		t.Skip("no gathering int8 dot-product kernel here")
+	}
+	r := rand.New(rand.NewPCG(6, 6))
+	for _, d := range []int{16, 384, 4096} {
+		const n = 41
+		g := &segVecGraph{dims: d, codes: make([]int8, n*d), scale: make([]float32, n), sq: make([]float32, n)}
+		for i := range g.codes {
+			g.codes[i] = int8(r.IntN(255) - 127)
+			if r.IntN(5) == 0 {
+				g.codes[i] = []int8{-127, 127}[r.IntN(2)]
+			}
+		}
+		ids := make([]int32, 60)
+		for i := range ids {
+			ids[i] = int32(r.IntN(n))
+		}
+		w := newVecWalk(g, n, false)
+		p := w.point(int32(r.IntN(n)))
+		w.dists(p, ids)
+		for i, id := range ids {
+			if want := int8Dot8(g.codes[int(id)*d:int(id+1)*d], p.codes); w.dots[i] != want {
+				t.Fatalf("d=%d id %d: %d, want %d", d, id, w.dots[i], want)
+			}
+		}
+	}
+}
+
 // TestVecSideJITMatchesGo builds a sidecar both ways -- the JIT's max-abs and
 // quantize kernels, and quantizeRow -- and requires every array to agree,
 // over rows that take each special case: non-finite, zero, subnormal scale.
