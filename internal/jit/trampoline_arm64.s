@@ -13,9 +13,13 @@
 // emitted prologue in filter_arm64.go reads its Args from.
 //
 // Nothing is saved here, where the amd64 trampoline saves four registers. It
-// does not need to be: the kernels stay inside X0-X10 and V0-V7, which AAPCS
-// makes caller-saved outright, so a kernel can clobber every register it
-// touches and the assembler's own conventions still hold.
+// does not need to be. callKernel is an ABI0 function called only from Go,
+// and Go treats every register as clobbered across such a call except the
+// ones it reserves (below), so a kernel may use X0-X17 and V0-V31. The filter
+// kernels happen to stay inside X0-X10 and V0-V7; the vector-search kernels
+// (vector_neon_arm64.go) use X11-X17 and up to V27. AAPCS's callee-saved
+// registers (X19-X29, the low halves of V8-V15) would bind a C caller, and a
+// kernel never has one.
 //
 // What it does need is the FRAME. A zero-size frame makes this a leaf in the
 // assembler's eyes and LR is then not saved -- and BL overwrites LR, so the

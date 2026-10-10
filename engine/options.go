@@ -1,6 +1,10 @@
 package engine
 
-import "github.com/samyfodil/musql/internal/jit"
+import (
+	"runtime"
+
+	"github.com/samyfodil/musql/internal/jit"
+)
 
 // Option configures engine behavior through Configure.
 type Option func(*config)
@@ -12,7 +16,8 @@ type config struct {
 
 // WithWorkers lets a columnar scan or aggregate split its segments across n
 // goroutines. The default, 1, keeps every statement on its caller's goroutine,
-// as SQLite does. Only work whose answer cannot depend on the split is
+// as SQLite does, except a vector top-k search, which uses every core unless
+// n is given. Only work whose answer cannot depend on the split is
 // parallelized; everything else runs as before.
 func WithWorkers(n int) Option { return func(c *config) { c.workers = n } }
 
@@ -31,5 +36,9 @@ func Configure(opts ...Option) {
 	}
 	jitEnabled = !c.noJIT && jit.Available
 	segWorkers = max(c.workers, 1)
+	vecWorkers = runtime.GOMAXPROCS(0)
+	if c.workers > 0 {
+		vecWorkers = c.workers
+	}
 	vmJITEnabled = jitEnabled
 }

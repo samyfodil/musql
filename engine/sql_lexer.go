@@ -68,10 +68,42 @@ func asciiUpper(s string) string {
 }
 
 // lex tokenizes s, returning tokens terminated by a single tkEOF token.
+// lexQuoted reads a quoted literal or identifier whose body starts at s[j],
+// up to its closer; with double set, a doubled closer stands for one. It
+// returns the body and the index past the closer, or false when the closer
+// never comes. A body with no doubled closer -- nearly all of them -- is a
+// substring of s, found with IndexByte rather than copied a byte at a time,
+// which is what a statement carrying long literals (a vector('[...]') per
+// row) spends its parse on.
+func lexQuoted(s string, j int, closer byte, double bool) (string, int, bool) {
+	start := j
+	var esc []byte // the body so far, once an escape has made it differ from s
+	for {
+		k := strings.IndexByte(s[j:], closer)
+		if k < 0 {
+			return "", 0, false
+		}
+		j += k
+		if double && j+1 < len(s) && s[j+1] == closer {
+			esc = append(esc, s[start:j+1]...)
+			j += 2
+			start = j
+			continue
+		}
+		if esc == nil {
+			return s[start:j], j + 1, true
+		}
+		return string(append(esc, s[start:j]...)), j + 1, true
+	}
+}
+
 func lex(s string) ([]token, error) {
-	// Pre-sized for typical SQL token density; grows from nil if needed.
+	// Pre-sized for typical SQL token density, capped: a statement made of
+	// long literals (rows of vector('[...]')) has far fewer tokens than its
+	// length suggests, and an uncapped guess zeroed megabytes per statement.
+	// append grows it past the cap when a statement needs more.
 	n := len(s)
-	toks := make([]token, 0, n/4+8)
+	toks := make([]token, 0, min(n/4, 4096)+8)
 	i := 0
 
 	isIdentStart := func(c byte) bool {
@@ -131,26 +163,12 @@ func lex(s string) ([]token, error) {
 			toks = append(toks, token{kind: tkBlob, blob: b, Start: start, End: i})
 
 		case c == '\'': // string literal; '' escapes a literal quote
-			var sb strings.Builder
-			j := i + 1
-			for {
-				if j >= n {
-					return nil, fmt.Errorf("engine: unterminated string literal")
-				}
-				if s[j] == '\'' {
-					if j+1 < n && s[j+1] == '\'' {
-						sb.WriteByte('\'')
-						j += 2
-						continue
-					}
-					j++
-					break
-				}
-				sb.WriteByte(s[j])
-				j++
+			lit, j, ok := lexQuoted(s, i+1, '\'', true)
+			if !ok {
+				return nil, fmt.Errorf("engine: unterminated string literal")
 			}
 			i = j
-			toks = append(toks, token{kind: tkString, str: sb.String(), Start: start, End: i})
+			toks = append(toks, token{kind: tkString, str: lit, Start: start, End: i})
 
 		case c == '"' || c == '`' || c == '[': // quoted identifiers
 			closer := byte('"')
@@ -162,26 +180,12 @@ func lex(s string) ([]token, error) {
 				closer = ']'
 				doubleEscape = false
 			}
-			var sb strings.Builder
-			j := i + 1
-			for {
-				if j >= n {
-					return nil, fmt.Errorf("engine: unterminated quoted identifier")
-				}
-				if s[j] == closer {
-					if doubleEscape && j+1 < n && s[j+1] == closer {
-						sb.WriteByte(closer)
-						j += 2
-						continue
-					}
-					j++
-					break
-				}
-				sb.WriteByte(s[j])
-				j++
+			text, j, ok := lexQuoted(s, i+1, closer, doubleEscape)
+			if !ok {
+				return nil, fmt.Errorf("engine: unterminated quoted identifier")
 			}
 			i = j
-			toks = append(toks, token{kind: tkIdent, text: sb.String(), quoted: true, dquoted: closer == '"', Start: start, End: i})
+			toks = append(toks, token{kind: tkIdent, text: text, quoted: true, dquoted: closer == '"', Start: start, End: i})
 
 		case c == '0' && i+1 < n && (s[i+1] == 'x' || s[i+1] == 'X'):
 			// Hexadecimal integer literal: "0x"/"0X" followed by hex digits.

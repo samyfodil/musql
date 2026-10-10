@@ -94,65 +94,8 @@ bodyDone:
 		cols[i] = c
 	}
 
-	// The drain: matched exactly to avoid wrong answers.
-	at := pc + 3
-	if at >= len(in) || in[at].Op != OpClose {
-		return false
-	}
-	at++
-	// "Integer limit; Integer 1", or with an OFFSET "Integer offset; Integer
-	// limit; Integer 1", whose drain then skips the offset's rows first:
-	// "If offset -> skip; Goto rows; skip: Subtract; Goto next".
-	if at+2 >= len(in) || in[at].Op != OpInteger || in[at+1].Op != OpInteger {
-		return false
-	}
-	offset := 0
-	if in[at+2].Op == OpInteger {
-		offset = int(in[at].P1)
-		if offset < 0 || offset+int(in[at+1].P1) != ki.bound {
-			return false
-		}
-		at++
-	}
-	at += 2
-	if at >= len(in) || in[at].Op != OpSorterSort || in[at].P1 != sorterNum {
-		return false
-	}
-	sortAt := at
-	if offset > 0 {
-		if sortAt+4 >= len(in) || in[sortAt+1].Op != OpIf || in[sortAt+1].P2 != sortAt+3 ||
-			in[sortAt+2].Op != OpGoto || in[sortAt+2].P2 != sortAt+5 || in[sortAt+3].Op != OpSubtract || in[sortAt+4].Op != OpGoto {
-			return false
-		}
-		sortAt += 4
-	}
-	if sortAt+3 >= len(in) || in[sortAt+1].Op != OpIf || in[sortAt+2].Op != OpGoto ||
-		in[sortAt+3].Op != OpSorterData || in[sortAt+3].P1 != sorterNum {
-		return false
-	}
-	recReg := in[sortAt+3].P2
-	at = sortAt + 4
-	outBase, nOut := -1, 0
-	for at < len(in) && in[at].Op == OpRecordColumn {
-		if in[at].P1 != recReg || in[at].P2 != nOut {
-			return false
-		}
-		if outBase < 0 {
-			outBase = in[at].P3
-		} else if in[at].P3 != outBase+nOut {
-			return false
-		}
-		nOut++
-		at++
-	}
-	if nOut == 0 || at+3 >= len(in) {
-		return false
-	}
-	if in[at].Op != OpResultRow || in[at].P1 != outBase || in[at].P2 != nOut {
-		return false
-	}
-	if in[at+1].Op != OpSubtract || in[at+2].Op != OpSorterNext || in[at+2].P1 != sorterNum ||
-		in[at+3].Op != OpHalt || at+3 != len(in)-1 {
+	offset, outBase, nOut, ok := segSorterDrain(in, pc+3, sorterNum, ki.bound)
+	if !ok {
 		return false
 	}
 	// Output column i is record field nKey + i (payload starts after keys).
@@ -196,4 +139,71 @@ bodyDone:
 		Instruction{Op: OpHalt})
 	prog.Insns = out
 	return true
+}
+
+// segSorterDrain matches the sorter's drain from the OpClose that ends the
+// fill loop at closeAt to the program's final OpHalt -- exactly, because a
+// drain the recognizer misread would emit wrong rows. It reports the OFFSET,
+// the first output register and the number of output columns.
+func segSorterDrain(in []Instruction, closeAt, sorterNum, bound int) (offset, outBase, nOut int, ok bool) {
+	at := closeAt
+	if at >= len(in) || in[at].Op != OpClose {
+		return 0, 0, 0, false
+	}
+	at++
+	// "Integer limit; Integer 1", or with an OFFSET "Integer offset; Integer
+	// limit; Integer 1", whose drain then skips the offset's rows first:
+	// "If offset -> skip; Goto rows; skip: Subtract; Goto next".
+	if at+2 >= len(in) || in[at].Op != OpInteger || in[at+1].Op != OpInteger {
+		return 0, 0, 0, false
+	}
+	if in[at+2].Op == OpInteger {
+		offset = int(in[at].P1)
+		if offset < 0 || offset+int(in[at+1].P1) != bound {
+			return 0, 0, 0, false
+		}
+		at++
+	}
+	at += 2
+	if at >= len(in) || in[at].Op != OpSorterSort || in[at].P1 != sorterNum {
+		return 0, 0, 0, false
+	}
+	sortAt := at
+	if offset > 0 {
+		if sortAt+4 >= len(in) || in[sortAt+1].Op != OpIf || in[sortAt+1].P2 != sortAt+3 ||
+			in[sortAt+2].Op != OpGoto || in[sortAt+2].P2 != sortAt+5 || in[sortAt+3].Op != OpSubtract || in[sortAt+4].Op != OpGoto {
+			return 0, 0, 0, false
+		}
+		sortAt += 4
+	}
+	if sortAt+3 >= len(in) || in[sortAt+1].Op != OpIf || in[sortAt+2].Op != OpGoto ||
+		in[sortAt+3].Op != OpSorterData || in[sortAt+3].P1 != sorterNum {
+		return 0, 0, 0, false
+	}
+	recReg := in[sortAt+3].P2
+	at = sortAt + 4
+	outBase = -1
+	for at < len(in) && in[at].Op == OpRecordColumn {
+		if in[at].P1 != recReg || in[at].P2 != nOut {
+			return 0, 0, 0, false
+		}
+		if outBase < 0 {
+			outBase = in[at].P3
+		} else if in[at].P3 != outBase+nOut {
+			return 0, 0, 0, false
+		}
+		nOut++
+		at++
+	}
+	if nOut == 0 || at+3 >= len(in) {
+		return 0, 0, 0, false
+	}
+	if in[at].Op != OpResultRow || in[at].P1 != outBase || in[at].P2 != nOut {
+		return 0, 0, 0, false
+	}
+	if in[at+1].Op != OpSubtract || in[at+2].Op != OpSorterNext || in[at+2].P1 != sorterNum ||
+		in[at+3].Op != OpHalt || at+3 != len(in)-1 {
+		return 0, 0, 0, false
+	}
+	return offset, outBase, nOut, true
 }

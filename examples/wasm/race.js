@@ -65,7 +65,25 @@ const QUERIES = [
 	["DELETE the last row", "DELETE FROM b WHERE id = (SELECT max(id) FROM b)", () => []],
 	["t after the writes", "SELECT count(*), sum(v) FROM t", () => []],
 	["b after the writes", "SELECT count(*), max(id) FROM b", () => []],
+	// Exact nearest-neighbour search over 384-dimension embeddings.
+	["vector top-10, cosine", "SELECT id FROM vec ORDER BY vector_distance_cos(emb, vector32(?)) LIMIT 10", (r) => [vecText(r)]],
+	["vector top-10, L2", "SELECT id FROM vec ORDER BY vector_distance_l2(emb, vector32(?)) LIMIT 10", (r) => [vecText(r)]],
 ];
+
+// The vector table: VEC_ROWS random embeddings, the same in both engines.
+const VEC_ROWS = 20000, VEC_DIMS = 384;
+const vecText = (r) => "[" + Array.from({ length: VEC_DIMS }, () => (r() * 2 - 1).toFixed(4)).join(",") + "]";
+
+function vecSeedSQL() {
+	const r = rng(42);
+	const out = ["DROP TABLE IF EXISTS vec", `CREATE TABLE vec (id INTEGER PRIMARY KEY, emb F32_BLOB(${VEC_DIMS}))`];
+	for (let lo = 0; lo < VEC_ROWS; lo += 250) {
+		const vals = [];
+		for (let i = lo; i < Math.min(lo + 250, VEC_ROWS); i++) vals.push(`(${i + 1}, vector('${vecText(r)}'))`);
+		out.push(`INSERT INTO vec VALUES ${vals.join(",")}`);
+	}
+	return out;
+}
 
 // seedSQL fills both engines identically. The inserts go in chunks of
 // 200,000 rows: musql declines a recursive CTE past 300,000 rows that has no
@@ -153,7 +171,7 @@ async function seed() {
 	$("banner").textContent = `Loading ${n.toLocaleString()} rows into both…`;
 	const load = async (e) => {
 		const t = performance.now();
-		for (const q of seedSQL(n)) await eng[e].call("exec", q);
+		for (const q of [...seedSQL(n), ...vecSeedSQL()]) await eng[e].call("exec", q);
 		if (e === "musql") await eng.musql.call("exec", "VACUUM");
 		const ms = performance.now() - t;
 		$(`${e}-status`).textContent = `${n.toLocaleString()} rows loaded in ${(ms / 1000).toFixed(2)} s`;

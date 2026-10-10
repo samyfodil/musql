@@ -120,6 +120,9 @@ func funcArity(name string) (min, max int, ok bool) {
 		}
 		return f.NArg, f.NArg, true
 	}
+	if n, ok := vectorArity(name); ok {
+		return n, n, true
+	}
 	switch name {
 	case "abs", "length", "octet_length", "lower", "upper", "typeof", "hex":
 		return 1, 1, true
@@ -217,6 +220,9 @@ func funcArity(name string) (min, max int, ok bool) {
 func callScalarFuncEnc(name string, args []Value, caseSensitiveLike bool, enc TextEncoding, pureCtx uint16) (Value, error) {
 	if err := coerceUTF16BlobArgs(name, args, enc); err != nil {
 		return Value{}, err
+	}
+	if v, ok, err := callVectorFunc(name, args); ok {
+		return v, err
 	}
 	switch name {
 	case "abs":
