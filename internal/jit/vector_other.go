@@ -1,4 +1,4 @@
-//go:build !amd64
+//go:build !amd64 && !wasm
 
 package jit
 
@@ -23,4 +23,9 @@ func EmitMaxAbsBits() ([]byte, error) {
 // EmitQuantize likewise.
 func EmitQuantize() ([]byte, error) {
 	return nil, fmt.Errorf("jit: no quantize encoder for this architecture")
+}
+
+// EmitVecDistStrided likewise.
+func EmitVecDistStrided(l2 bool) ([]byte, error) {
+	return nil, fmt.Errorf("jit: no vector-distance encoder for this architecture")
 }

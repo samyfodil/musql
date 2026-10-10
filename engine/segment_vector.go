@@ -310,10 +310,7 @@ func (p *ReadOnlyPager) segVectorTopK(rootPage uint32, plan *segVectorPlan, ipkC
 			}
 			// The JIT kernel takes the rows sixteen at a time, straight off the
 			// heap; the Go tile takes the rest, and any rows it would have to copy.
-			done := 0
-			if k := jitVecKernel(plan.l2); k != nil {
-				done = vecDistJIT(k, plan.l2, s.heap, offs, query, qn, dist)
-			}
+			done := vecDistJIT(jitVecKernel(plan.l2), plan.l2, s.heap, offs, query, qn, dist)
 			if done < len(offs) {
 				rows, ok := f32Rows(s.heap, offs[done:], len(query))
 				if !ok {
