@@ -109,7 +109,7 @@ func BenchmarkVecGraphBuild(b *testing.B) {
 
 // BenchmarkVecGraphSearch is one beam search of width 200 over that graph.
 func BenchmarkVecGraphSearch(b *testing.B) {
-	const rows, dims = 20_000, 384
+	const rows, dims = 65_536, 384
 	heap, offs := vecBenchHeap(rows, dims)
 	a := vecApprox{alpha: 1.2, insertL: 70, searchL: 200}
 	g := prepVecGraph(heap, offs, nil, dims, a)
