@@ -772,6 +772,7 @@ func (n *Session) Close() error {
 	n.closed = true
 	n.dropTempFileIfUnclaimed() // C's temp database is OPEN_DELETEONCLOSE
 	n.DB.closed = true
+	n.releaseCommittedColumns()
 	if cerr := n.src.Close(); cerr != nil && err == nil {
 		err = cerr
 	}
@@ -945,6 +946,7 @@ func (n *Session) Discard() error {
 	n.closed = true
 	n.dropTempFileIfUnclaimed() // C's temp database is OPEN_DELETEONCLOSE
 	n.DB.closed = true
+	n.releaseCommittedColumns()
 	return n.src.Close()
 }
 
@@ -1705,6 +1707,17 @@ func (db *DB) committedColumns() *ReadOnlyPager {
 	}
 	db.segColumns, db.segColumnsStale = p, false
 	return p
+}
+
+// releaseCommittedColumns closes the columnar read handle, its own mapping of
+// the committed file. A closing session must: nothing else does, so every
+// closed connection left that mapping -- and the file's disk space, the whole
+// database for a ":memory:" one -- behind until the process exited.
+func (db *DB) releaseCommittedColumns() {
+	if db.segColumns != nil {
+		db.segColumns.Close()
+		db.segColumns = nil
+	}
 }
 
 // noteCommittedColumnsStale marks the columnar handle for a rebuild. Called by
