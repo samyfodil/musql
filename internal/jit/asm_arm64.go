@@ -27,6 +27,8 @@ const (
 	X13
 	X14
 	X15
+	X16
+	X17
 )
 
 // xzr is the zero register, which shares encoding 31 with the stack pointer.
@@ -34,8 +36,11 @@ const (
 // operand, so it is only ever used here where the manual says "zero".
 const xzr Reg64 = 31
 
-// VReg is a SIMD register number. The kernels stay in V0-V7: AAPCS makes them
-// caller-saved outright, where V8-V15 have their low 64 bits preserved.
+// VReg is a SIMD register number. The filter kernels stay in V0-V7; the
+// vector-search kernels use up to V27, which is safe because a kernel is only
+// ever entered from Go's ABI0 trampoline, under which every V register is
+// caller-saved (AAPCS's callee-saved V8-V15 bind C callers, and none exists).
+// See trampoline_arm64.s.
 type VReg uint8
 
 // Arm accumulates encoded instructions and resolves forward branches.

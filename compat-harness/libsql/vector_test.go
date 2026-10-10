@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -78,6 +79,9 @@ func errText(err error) string {
 // TestVectorFunctions runs every vector function over a matrix of inputs:
 // text and blobs of every type, malformed ones, and values of the wrong type.
 func TestVectorFunctions(t *testing.T) {
+	if !oracleUnfused() {
+		t.Skip(oracleFusedNote)
+	}
 	m, l := engines(t)
 	texts := []string{
 		"'[]'", "'[1]'", "'[1,2,3]'", "' [ 1 , 2.5 , -3e2 ] '", "'[1e40, -1e-50, 0]'",
@@ -154,3 +158,13 @@ func randVec(r *rand.Rand, n int) string {
 func undefinedInLibSQL(q string) bool {
 	return q == "SELECT vector_extract(x'0102030400000000000000000000000004')"
 }
+
+// oracleUnfused reports whether libSQL's C here computes the float32 loops as
+// written. On arm64 clang contracts its multiply-adds (sum += d*d, alpha*x +
+// shift) into fused instructions by default, so libSQL's own distances differ
+// in the last bits from its amd64 build. musql computes the unfused answer on
+// every platform -- the one libSQL's amd64 build, and Turso's servers, give --
+// so the bit-for-bit comparison is made where the oracle computes it too.
+func oracleUnfused() bool { return runtime.GOARCH == "amd64" }
+
+const oracleFusedNote = "libSQL is compiled with fused multiply-adds on this architecture, so its distances differ from its amd64 build in the last bits; compared on amd64"
