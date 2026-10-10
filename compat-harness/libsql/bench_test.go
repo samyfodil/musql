@@ -160,3 +160,58 @@ func BenchmarkVectorInsert(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkVectorTopK is vector_top_k over a libsql_vector_idx index: libSQL
+// walks its DiskANN graph, musql searches the column exactly. Each run logs
+// libSQL's recall@10 against the exact answer, which musql always returns.
+// The index build is not timed.
+func BenchmarkVectorTopK(b *testing.B) {
+	const n, d, k = 100_000, 384, 10
+	q := blob(rand.New(rand.NewPCG(9, 9)), d)
+	exact := map[int64]bool{}
+	for _, e := range []struct{ name, driver, dsn string }{
+		{"musql", "sqlite", ":memory:"},
+		{"libsql", "libsql", "file::memory:"},
+	} {
+		b.Run(e.name, func(b *testing.B) {
+			db := open(b, e.driver, e.dsn)
+			fill(b, db, n, d)
+			if _, err := db.Exec("CREATE INDEX docs_i ON docs(libsql_vector_idx(emb))"); err != nil {
+				b.Fatal(err)
+			}
+			ids := func() []int64 {
+				rows, err := db.Query(fmt.Sprintf("SELECT id FROM vector_top_k('docs_i', ?, %d)", k), q)
+				if err != nil {
+					b.Fatal(err)
+				}
+				defer rows.Close()
+				var out []int64
+				for rows.Next() {
+					var id int64
+					rows.Scan(&id)
+					out = append(out, id)
+				}
+				return out
+			}
+			got := ids()
+			if e.name == "musql" {
+				for _, id := range got {
+					exact[id] = true
+				}
+			} else {
+				hit := 0
+				for _, id := range got {
+					if exact[id] {
+						hit++
+					}
+				}
+				b.Logf("libSQL recall@%d: %d/%d", k, hit, k)
+			}
+			for b.Loop() {
+				if len(ids()) != k {
+					b.Fatal("short")
+				}
+			}
+		})
+	}
+}

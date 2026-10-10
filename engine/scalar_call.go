@@ -120,8 +120,8 @@ func funcArity(name string) (min, max int, ok bool) {
 		}
 		return f.NArg, f.NArg, true
 	}
-	if n, ok := vectorArity(name); ok {
-		return n, n, true
+	if lo, hi, ok := vectorArity(name); ok {
+		return lo, hi, true
 	}
 	switch name {
 	case "abs", "length", "octet_length", "lower", "upper", "typeof", "hex":

@@ -43,6 +43,12 @@ type segVectorPlan struct {
 	offset int
 	// outCols are the columns each row emits; segVecOutDist is the distance.
 	outCols []int
+	// nanLast ranks a NaN distance (a zero vector's cosine) after every other
+	// row, as vector_top_k does, instead of as the SQL sorter places a NULL.
+	nanLast bool
+	// rowidOf, when set, breaks a tie by rowid instead of scan order, which
+	// puts a row the log changed after its segment neighbours.
+	rowidOf func(vecHit) int64
 }
 
 // segVecOutDist in outCols is the distance itself, as in
@@ -245,14 +251,18 @@ type vecHit struct {
 }
 
 // before is the sorter's order for one REAL key: NULL first ascending and last
-// descending, then the value, then scan order.
+// descending (or last always, under nanLast), then the value, then scan order
+// (or rowid).
 func (p *segVectorPlan) before(a, b vecHit) bool {
 	an, bn := a.d != a.d, b.d != b.d
 	if an != bn {
-		return an != p.desc
+		return an != (p.desc || p.nanLast)
 	}
 	if !an && a.d != b.d {
 		return (a.d < b.d) != p.desc
+	}
+	if p.rowidOf != nil {
+		return p.rowidOf(a) < p.rowidOf(b)
 	}
 	if a.seg != b.seg {
 		return a.seg < b.seg

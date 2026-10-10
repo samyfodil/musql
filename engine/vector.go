@@ -652,21 +652,23 @@ func init() {
 	for name := range vectorEncoders {
 		supportedFuncs[name] = true
 	}
-	for _, name := range []string{"vector_extract", "vector_distance_cos", "vector_distance_l2"} {
+	for _, name := range []string{"vector_extract", "vector_distance_cos", "vector_distance_l2", "libsql_vector_idx"} {
 		supportedFuncs[name] = true
 	}
 }
 
 // vectorArity is funcArity for the vector functions.
-func vectorArity(name string) (n int, ok bool) {
+func vectorArity(name string) (lo, hi int, ok bool) {
 	switch name {
 	case "vector_distance_cos", "vector_distance_l2":
-		return 2, true
+		return 2, 2, true
 	case "vector_extract":
-		return 1, true
+		return 1, 1, true
+	case "libsql_vector_idx":
+		return 1, -1, true
 	}
 	_, ok = vectorEncoders[name]
-	return 1, ok
+	return 1, 1, ok
 }
 
 // callVectorFunc evaluates a vector function; ok is false for any other name.
@@ -680,6 +682,10 @@ func callVectorFunc(name string, args []Value) (res Value, ok bool, err error) {
 		return Value{Typ: Blob, S: v.convert(t).blob()}, true, nil
 	}
 	switch name {
+	case "libsql_vector_idx":
+		// Only a marker for CREATE INDEX (vector_index.go); called, it is its
+		// first argument, as in libSQL.
+		return args[0], true, nil
 	case "vector_extract":
 		v, err := parseVector(args[0], 0)
 		if err != nil {

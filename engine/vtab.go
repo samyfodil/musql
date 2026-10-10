@@ -277,7 +277,7 @@ func (p *ReadOnlyPager) isVtabItem(it FromItem) (bool, error) {
 // fts3tokenize (which does have an xCreate) succeeds.
 func eponymousOnlyVtabModule(name string) bool {
 	n := r33sFoldIdent(name)
-	return n == "generate_series" || strings.HasPrefix(n, "pragma_")
+	return n == "generate_series" || n == "vector_top_k" || strings.HasPrefix(n, "pragma_")
 }
 
 // isEponymousVtabName reports whether name is a registered virtual-table
@@ -453,6 +453,15 @@ func (p *ReadOnlyPager) materializeVtab(it FromItem, params []Value, outer *eval
 		return cols, rows, rowids, nil
 	}
 
+	// vector_top_k searches a table of this database (vector_index.go).
+	if _, isTopK := tab.(vectorTopKTable); isTopK {
+		rows, rowids, verr := p.vectorTopKRows(info.IdxNum, argv)
+		if verr != nil {
+			return nil, nil, nil, verr
+		}
+		return cols, rows, rowids, nil
+	}
+
 	cur, err := tab.Open()
 	if err != nil {
 		return nil, nil, nil, err
@@ -588,7 +597,8 @@ func (p *ReadOnlyPager) buildVtabConstraints(it FromItem, cols []columnInfo, par
 	hidden := hiddenColIndices(cols)
 	for ai, argExpr := range it.TableFuncArgs {
 		if ai >= len(hidden) {
-			return nil, nil, fmt.Errorf("engine: %s(): too many arguments (module declares %d hidden input columns)", it.Table, len(hidden))
+			// whereexpr.c:1922 names the eponymous table, which is the module.
+			return nil, nil, fmt.Errorf("engine: too many arguments on %s() - max %d", r33sFoldIdent(it.Table), len(hidden))
 		}
 		v, ok := vtabCorrArgFor(corr, ai, hidden[ai])
 		if !ok {

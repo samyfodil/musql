@@ -32,13 +32,16 @@ like the text kernels (internal/jit) -- feeding the existing top-k
 it is what most browser and edge workloads (thousands to a few hundred
 thousand vectors) need.
 
-**3. Approximate indexes.** `CREATE INDEX ... (libsql_vector_idx(v))` and the
-`vector_top_k(index, query, k)` table-valued function, for tables past what an
-exact scan answers in time. libSQL's index is DiskANN; ours needs to be an
-index of our own format (a segment-format catalog entry, rebuilt on
-compaction) that answers the same SQL. Recall is measured and published, and
-the option values libSQL accepts (metric, neighbors, and so on) are honored or
-rejected with an error -- never accepted and ignored.
+**3. Indexes.** Done, exact rather than approximate.
+`CREATE INDEX ... (libsql_vector_idx(v, ...))` and `vector_top_k(index, query,
+k)` take libSQL's syntax, options, write-time checks and error texts
+(engine/vector_index.go), so an application ports unchanged. libSQL answers from
+a DiskANN graph; musql ranks the rows by exact distance through the step-2
+search, so recall is always 100%. At 100k x 384 that is 4.9 ms against
+libSQL's 17 ms, where libSQL's graph found 3 of the true 10 nearest
+(BenchmarkVectorTopK). libSQL's graph-tuning options are validated and have
+nothing to tune. If a table outgrows exact search, a graph can narrow the
+candidates for the same exact ranking.
 
 Out of scope until the above is done: embeddings computed in the database,
 and vector types outside libSQL's set.
