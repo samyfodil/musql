@@ -5,6 +5,7 @@ import (
 	"slices"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/samyfodil/musql/internal/jit"
@@ -277,8 +278,7 @@ func (p *ReadOnlyPager) segVectorTopK(rootPage uint32, plan *segVectorPlan, ipkC
 
 	// Every cell must be a BLOB of the query's length: then each one parses
 	// as a float32 vector of the query's dimensions, as the function would.
-	type work struct{ seg, lo, hi int }
-	var jobs []work
+	var jobs []vecJob
 	cells := make([][]uint64, len(segs))
 	for si, s := range segs {
 		c, _, ok := s.BytesColumn(plan.col)
@@ -292,57 +292,59 @@ func (p *ReadOnlyPager) segVectorTopK(rootPage uint32, plan *segVectorPlan, ipkC
 		}
 		cells[si] = c
 		for lo, step := 0, segVectorChunkRows(qv.dims); lo < s.nRows; lo += step {
-			jobs = append(jobs, work{si, lo, min(lo+step, s.nRows)})
+			jobs = append(jobs, vecJob{si, lo, min(lo+step, s.nRows)})
 		}
 	}
 
 	qn := vecSelfDot(query) // the query's norm, summed as the function sums it
-	tops := make([]vecTopK, len(jobs))
-	if !segEach(len(jobs), func(j int) bool {
-		w := jobs[j]
-		s := segs[w.seg]
-		dist := make([]float32, w.hi-w.lo)
-		offs := make([]int, w.hi-w.lo)
-		for i := range offs {
-			offs[i] = int(uint32(cells[w.seg][w.lo+i]))
-		}
-		// The JIT kernel takes the rows sixteen at a time, straight off the
-		// heap; the Go tile takes the rest, and any rows it would have to copy.
-		done := 0
-		if k := jitVecKernel(plan.l2); k != nil {
-			done = vecDistJIT(k, plan.l2, s.heap, offs, query, qn, dist)
-		}
-		if done < len(offs) {
-			rows, ok := f32Rows(s.heap, offs[done:], len(query))
-			if !ok {
-				return false
-			}
-			if plan.l2 {
-				l2Tile(rows, query, dist[done:])
-			} else {
-				cosTile(rows, query, qn, dist[done:])
-			}
-		}
-		t := vecTopK{p: plan, h: make([]vecHit, 0, plan.limit)}
-		skip := skips[w.seg]
-		k, _ := slices.BinarySearch(skip, w.lo)
-		for i, d := range dist {
-			r := w.lo + i
-			if k < len(skip) && skip[k] == r {
-				k++
-				continue
-			}
-			t.offer(vecHit{d: d, seg: w.seg, row: r})
-		}
-		tops[j] = t
-		return true
-	}) {
-		return nil, false
-	}
 	all := vecTopK{p: plan, h: make([]vecHit, 0, plan.limit)}
-	for _, t := range tops {
-		for _, c := range t.h {
-			all.offer(c)
+	if !vecBoundedTopK(plan, segs, cells, skips, jobs, query, qn, &all) {
+		tops := make([]vecTopK, len(jobs))
+		if !segEach(len(jobs), func(j int) bool {
+			w := jobs[j]
+			s := segs[w.seg]
+			dist := make([]float32, w.hi-w.lo)
+			offs := make([]int, w.hi-w.lo)
+			for i := range offs {
+				offs[i] = int(uint32(cells[w.seg][w.lo+i]))
+			}
+			// The JIT kernel takes the rows sixteen at a time, straight off the
+			// heap; the Go tile takes the rest, and any rows it would have to copy.
+			done := 0
+			if k := jitVecKernel(plan.l2); k != nil {
+				done = vecDistJIT(k, plan.l2, s.heap, offs, query, qn, dist)
+			}
+			if done < len(offs) {
+				rows, ok := f32Rows(s.heap, offs[done:], len(query))
+				if !ok {
+					return false
+				}
+				if plan.l2 {
+					l2Tile(rows, query, dist[done:])
+				} else {
+					cosTile(rows, query, qn, dist[done:])
+				}
+			}
+			t := vecTopK{p: plan, h: make([]vecHit, 0, plan.limit)}
+			skip := skips[w.seg]
+			k, _ := slices.BinarySearch(skip, w.lo)
+			for i, d := range dist {
+				r := w.lo + i
+				if k < len(skip) && skip[k] == r {
+					k++
+					continue
+				}
+				t.offer(vecHit{d: d, seg: w.seg, row: r})
+			}
+			tops[j] = t
+			return true
+		}) {
+			return nil, false
+		}
+		for _, t := range tops {
+			for _, c := range t.h {
+				all.offer(c)
+			}
 		}
 	}
 
@@ -529,6 +531,76 @@ func vecStridedRows(heap []byte, offs []int, dims int) int {
 	}
 	return n
 }
+
+// vecBoundedTopK offers the plan's heap only the rows the int8 bounds cannot
+// rule out (segment_vector_bound.go), computing those exactly. It reports
+// false, having offered nothing, when the table is too small for that to pay,
+// a segment has no sidecar, or the bounds prune too little.
+func vecBoundedTopK(plan *segVectorPlan, segs []*segment, cells [][]uint64, skips [][]int, jobs []vecJob, query []float32, qn float32, top *vecTopK) bool {
+	rows := 0
+	for _, s := range segs {
+		rows += s.nRows
+	}
+	if rows < vecSideMinRows*plan.limit {
+		return false
+	}
+	vq, ok := newVecQuery(query, plan.l2)
+	if !ok {
+		return false
+	}
+	sides := make([]*segVecSide, len(segs))
+	for si, s := range segs {
+		side, ok := s.vecSide(plan.col, len(query), func() ([][]float32, bool) {
+			offs := make([]int, len(cells[si]))
+			for i, c := range cells[si] {
+				offs[i] = int(uint32(c))
+			}
+			return f32Rows(s.heap, offs, len(query))
+		})
+		if !ok {
+			return false
+		}
+		sides[si] = side
+	}
+	cands, ok := vecCandidates(plan, vq, sides, skips, jobs)
+	if !ok {
+		return false
+	}
+	t := vecTopK{p: plan, h: make([]vecHit, 0, plan.limit)}
+	for j, rs := range cands {
+		if len(rs) == 0 {
+			continue
+		}
+		si := jobs[j].seg
+		offs := make([]int, len(rs))
+		for i, r := range rs {
+			offs[i] = int(uint32(cells[si][r]))
+		}
+		vs, ok := f32Rows(segs[si].heap, offs, len(query))
+		if !ok {
+			return false
+		}
+		dist := make([]float32, len(rs))
+		if plan.l2 {
+			l2Tile(vs, query, dist)
+		} else {
+			cosTile(vs, query, qn, dist)
+		}
+		for i, r := range rs {
+			t.offer(vecHit{d: dist[i], seg: si, row: r})
+		}
+	}
+	*top = t
+	vecBoundedServed.Add(1)
+	return true
+}
+
+// vecBoundedServed counts searches the bounds answered, for tests.
+var vecBoundedServed atomic.Int64
+
+// VecBoundedServedForTest reports and resets how many searches the int8
+// bounds answered.
+func VecBoundedServedForTest() int64 { return vecBoundedServed.Swap(0) }
 
 // vecSelfDot is a vector's sum of squares, in component order, in float32.
 func vecSelfDot(q []float32) float32 {

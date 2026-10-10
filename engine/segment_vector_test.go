@@ -81,3 +81,106 @@ func TestVecDistKernelsExact(t *testing.T) {
 		}
 	}
 }
+
+// TestVecBoundsContainExact checks the int8 bounds against the distance they
+// stand in for, for every row: lo <= the exact float32 distance <= hi, over
+// rows built to stress them -- huge and subnormal magnitudes, near-duplicates
+// of the query (where L2's cancellation is worst), zeros, opposite vectors,
+// mixed scales within a row.
+func TestVecBoundsContainExact(t *testing.T) {
+	r := rand.New(rand.NewPCG(11, 13))
+	for _, dims := range []int{1, 2, 7, 64, 384} {
+		q := make([]float32, dims)
+		for i := range q {
+			q[i] = float32(r.NormFloat64())
+		}
+		var rows [][]float32
+		for k := range 400 {
+			x := make([]float32, dims)
+			for i := range x {
+				switch k % 8 {
+				case 0: // near the query
+					x[i] = q[i] * (1 + float32(r.NormFloat64())*1e-6)
+				case 1: // the query itself
+					x[i] = q[i]
+				case 2: // opposite
+					x[i] = -q[i]
+				case 3: // huge
+					x[i] = float32(r.NormFloat64() * 1e18)
+				case 4: // tiny, into the subnormals
+					x[i] = float32(r.NormFloat64() * 1e-40)
+				case 5: // mixed scales
+					x[i] = float32(r.NormFloat64() * math.Pow(10, float64(r.IntN(20)-10)))
+				default:
+					x[i] = float32(r.NormFloat64())
+				}
+			}
+			rows = append(rows, x)
+		}
+		side := buildVecSide(rows, dims)
+		qbytes := vector{typ: vecF32, dims: dims}
+		for _, v := range q {
+			qbytes.data = binary.LittleEndian.AppendUint32(qbytes.data, math.Float32bits(v))
+		}
+		for _, l2 := range []bool{false, true} {
+			vq, ok := newVecQuery(q, l2)
+			if !ok {
+				t.Fatal("query admits no bounds")
+			}
+			bounded := 0
+			for i, x := range rows {
+				lo, hi, ok := vq.bounds(side, i)
+				if !ok {
+					continue
+				}
+				bounded++
+				xv := vector{typ: vecF32, dims: dims}
+				for _, v := range x {
+					xv.data = binary.LittleEndian.AppendUint32(xv.data, math.Float32bits(v))
+				}
+				var d float32
+				if l2 {
+					d = distanceL2(xv, qbytes)
+				} else {
+					d = distanceCos(xv, qbytes)
+				}
+				if !(lo <= d && d <= hi) {
+					t.Fatalf("dims=%d l2=%v row %d (kind %d): %v not in [%v, %v]", dims, l2, i, i%8, d, lo, hi)
+				}
+			}
+			if bounded < len(rows)/2 {
+				t.Fatalf("dims=%d l2=%v: only %d of %d rows bounded", dims, l2, bounded, len(rows))
+			}
+		}
+	}
+}
+
+// TestI8DotKernel checks the JIT's int8 dot products against Go's, at the
+// extremes of the codes' range.
+func TestI8DotKernel(t *testing.T) {
+	if jitI8DotKernel() == nil {
+		t.Skip("no int8 dot-product kernel here")
+	}
+	r := rand.New(rand.NewPCG(5, 5))
+	for _, d := range []int{16, 384, 4096} {
+		const n = 37
+		side := &segVecSide{dims: d, codes: make([]int8, n*d)}
+		for i := range side.codes {
+			side.codes[i] = int8(r.IntN(255) - 127)
+			if r.IntN(5) == 0 {
+				side.codes[i] = []int8{-127, 127}[r.IntN(2)]
+			}
+		}
+		vq := &vecQuery{t32: make([]int32, d), t16: make([]int16, d)}
+		for i := range d {
+			c := int8(r.IntN(255) - 127)
+			vq.t32[i], vq.t16[i] = int32(c), int16(c)
+		}
+		got := vq.dots(side, 3, n)
+		for row := 3; row < n; row++ {
+			if want := int8Dot(side.codes[row*d:(row+1)*d], vq.t32); got[row-3] != want {
+				t.Fatalf("d=%d row %d: %d, want %d", d, row, got[row-3], want)
+			}
+		}
+	}
+}

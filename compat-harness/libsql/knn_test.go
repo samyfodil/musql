@@ -46,6 +46,7 @@ func TestKNN(t *testing.T) {
 			qs = append(qs, fmt.Sprintf("SELECT id, tag FROM docs ORDER BY %s %s", f, tail))
 		}
 	}
+	engine.VecBoundedServedForTest()
 	for _, s := range qs {
 		s0, d0 := engine.SegFilterCountersForTest()
 		got := answerArgs(m, s, q)
@@ -56,6 +57,11 @@ func TestKNN(t *testing.T) {
 		if want := answerArgs(l, s, q); got != want {
 			t.Errorf("%s\n musql:  %.300s\n libsql: %.300s", s, got, want)
 		}
+	}
+	// The int8 bounds answered most of them (the small-LIMIT ones, once the
+	// first search built the sidecar), and every answer above still matched.
+	if n := engine.VecBoundedServedForTest(); n < int64(len(qs)/2) {
+		t.Errorf("the int8 bounds answered %d of %d searches", n, len(qs))
 	}
 }
 

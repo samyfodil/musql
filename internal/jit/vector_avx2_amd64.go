@@ -249,6 +249,62 @@ func (a *Asm) VbroadcastssMemD(dst, base Reg, disp int8) {
 	a.emit(0x18, modrm(0b01, dst, base), byte(disp))
 }
 
+// EmitI8Dot emits the int8 dot-product kernel the vector search's bounding
+// pass runs: for each row of int8 codes, the exact int32 sum of code[i] *
+// query[i]. Sixteen codes are widened to int16 (VPMOVSXBW) and multiplied
+// and pair-summed against the query (VPMADDWD) per instruction; no product
+// or sum can overflow int32 (127*127*65536 < 2^31).
+//
+// Args: A the first row's codes (rows back to back, XA bytes each), C the
+// query's codes widened to int16, N the rows (at least 1), XA the dimensions
+// (a multiple of 16), Out an int32 per row.
+func EmitI8Dot() ([]byte, error) {
+	if !cpuHasAVX2() {
+		return nil, fmt.Errorf("jit: AVX2 not available on this machine")
+	}
+	a := NewAsm()
+	a.MovRegMem(RSI, RDI, OffA)
+	a.MovRegMem(RCX, RDI, OffN)
+	a.MovRegMem(R9, RDI, OffXA)
+	a.ShrRegImm8(R9, 4) // blocks of sixteen
+	a.MovRegMem(R10, RDI, OffOut)
+
+	a.Label("row")
+	a.VpxorYmm(0, 0, 0)
+	a.MovRegMem(RDX, RDI, OffC)
+	a.MovRegReg(R12, R9)
+	a.Label("block")
+	a.vexm(1, 0, RSI, 0, vexMap0F38, 0, 1, vexP66) // vpmovsxbw ymm1, [rsi]
+	a.emit(0x20, modrm(0b00, 1, RSI))
+	a.vexm(1, 0, RDX, 1, vexMap0F, 0, 1, vexP66) // vpmaddwd ymm1, ymm1, [rdx]
+	a.emit(0xF5, modrm(0b00, 1, RDX))
+	a.vinst(0xFE, 0, 0, 1, vexMap0F, 0, 1, vexP66, false) // vpaddd ymm0, ymm0, ymm1
+	a.AddRegImm8(RSI, 16)
+	a.AddRegImm8(RDX, 32)
+	a.DecReg(R12)
+	a.Jcc(CondNE, "block")
+
+	// The eight int32 lanes' sum, into the row's slot.
+	a.Vextracti128(1, 0, 1)
+	a.vinst(0xFE, 0, 0, 1, vexMap0F, 0, 0, vexP66, false) // vpaddd xmm0, xmm0, xmm1
+	a.vinst(0x70, 1, 0, 0, vexMap0F, 0, 0, vexP66, true)  // vpshufd xmm1, xmm0, 0x4E
+	a.emit(0x4E)
+	a.vinst(0xFE, 0, 0, 1, vexMap0F, 0, 0, vexP66, false)
+	a.vinst(0x70, 1, 0, 0, vexMap0F, 0, 0, vexP66, true) // vpshufd xmm1, xmm0, 0xB1
+	a.emit(0xB1)
+	a.vinst(0xFE, 0, 0, 1, vexMap0F, 0, 0, vexP66, false)
+	a.vex3(0, RAX, 0, vexMap0F, 0, 0, vexP66, true) // vmovd eax, xmm0
+	a.emit(0x7E, modrm(0b11, 0, RAX))
+	a.emit(0x41, 0x89, modrm(0b00, RAX, R10)) // mov [r10], eax
+	a.AddRegImm8(R10, 4)
+	a.DecReg(RCX)
+	a.Jcc(CondNE, "row")
+
+	a.Vzeroupper()
+	a.Ret()
+	return a.Code()
+}
+
 // vexm emits a three-byte VEX prefix for an instruction with a memory operand:
 // R from reg, X from the SIB index (a vector register for a gather), B from
 // the base.
