@@ -47,3 +47,9 @@ musql compiles query kernels to WebAssembly while it runs. Browsers allow that
 only in a Web Worker, so on a page's main thread the package runs without the
 JIT: the same answers, slower. Run it in a worker for full speed; in Node it is
 always on. `open(name, { jit: false })` turns it off.
+
+## Size
+
+`musql.wasm` is about 20 MB raw, 5.1 MB gzipped and 3.7 MB with brotli. Serve
+it compressed (`Content-Encoding: br` or `gzip`); most hosts and CDNs do this
+for `.wasm` once it is enabled.
