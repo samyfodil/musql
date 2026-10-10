@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/samyfodil/musql/engine"
 )
@@ -161,57 +162,123 @@ func BenchmarkVectorInsert(b *testing.B) {
 	}
 }
 
-// BenchmarkVectorTopK is vector_top_k over a libsql_vector_idx index: libSQL
-// walks its DiskANN graph, musql searches the column exactly. Each run logs
-// libSQL's recall@10 against the exact answer, which musql always returns.
-// The index build is not timed.
+// BenchmarkVectorTopK is vector_top_k over a libsql_vector_idx index on 100k
+// vectors of 384 dimensions: musql exact (the default), musql approximate (a
+// tuning option given), and libSQL's DiskANN graph. Each logs its recall@10
+// against the exact answer, and the approximate mode the cost of its first
+// search, which builds its lists. Two datasets: independent Gaussian vectors,
+// where no index has structure to exploit, and clustered ones, which is what
+// embeddings look like. Building the indexes is not timed.
 func BenchmarkVectorTopK(b *testing.B) {
 	const n, d, k = 100_000, 384, 10
-	q := blob(rand.New(rand.NewPCG(9, 9)), d)
-	exact := map[int64]bool{}
-	for _, e := range []struct{ name, driver, dsn string }{
-		{"musql", "sqlite", ":memory:"},
-		{"libsql", "libsql", "file::memory:"},
-	} {
-		b.Run(e.name, func(b *testing.B) {
-			db := open(b, e.driver, e.dsn)
-			fill(b, db, n, d)
-			if _, err := db.Exec("CREATE INDEX docs_i ON docs(libsql_vector_idx(emb))"); err != nil {
-				b.Fatal(err)
-			}
-			ids := func() []int64 {
-				rows, err := db.Query(fmt.Sprintf("SELECT id FROM vector_top_k('docs_i', ?, %d)", k), q)
-				if err != nil {
+	for _, data := range []string{"random", "clustered"} {
+		q := blob(rand.New(rand.NewPCG(9, 9)), d)
+		if data == "clustered" {
+			q = clusteredBlobs(rand.New(rand.NewPCG(9, 9)), 1, d)[0]
+		}
+		exact := map[int64]bool{}
+		for _, e := range []struct{ name, driver, dsn, opts string }{
+			{"musql-exact", "sqlite", ":memory:", ""},
+			{"musql-approx", "sqlite", ":memory:", ", 'search_l=200'"},
+			{"libsql", "libsql", "file::memory:", ""},
+		} {
+			b.Run(data+"/"+e.name, func(b *testing.B) {
+				db := open(b, e.driver, e.dsn)
+				if data == "clustered" {
+					fillRows(b, db, d, clusteredBlobs(rand.New(rand.NewPCG(1, 1)), n, d))
+				} else {
+					fill(b, db, n, d)
+				}
+				if _, err := db.Exec("CREATE INDEX docs_i ON docs(libsql_vector_idx(emb" + e.opts + "))"); err != nil {
 					b.Fatal(err)
 				}
-				defer rows.Close()
-				var out []int64
-				for rows.Next() {
-					var id int64
-					rows.Scan(&id)
-					out = append(out, id)
+				ids := func() []int64 {
+					rows, err := db.Query(fmt.Sprintf("SELECT id FROM vector_top_k('docs_i', ?, %d)", k), q)
+					if err != nil {
+						b.Fatal(err)
+					}
+					defer rows.Close()
+					var out []int64
+					for rows.Next() {
+						var id int64
+						rows.Scan(&id)
+						out = append(out, id)
+					}
+					return out
 				}
-				return out
-			}
-			got := ids()
-			if e.name == "musql" {
-				for _, id := range got {
-					exact[id] = true
+				start := time.Now()
+				got := ids()
+				first := time.Since(start)
+				if e.name == "musql-exact" {
+					for _, id := range got {
+						exact[id] = true
+					}
+				} else {
+					hit := 0
+					for _, id := range got {
+						if exact[id] {
+							hit++
+						}
+					}
+					b.Logf("%s %s: recall@%d %d/%d, first search %v", data, e.name, k, hit, k, first.Round(time.Millisecond))
 				}
-			} else {
-				hit := 0
-				for _, id := range got {
-					if exact[id] {
-						hit++
+				for b.Loop() {
+					if len(ids()) != k {
+						b.Fatal("short")
 					}
 				}
-				b.Logf("libSQL recall@%d: %d/%d", k, hit, k)
-			}
-			for b.Loop() {
-				if len(ids()) != k {
-					b.Fatal("short")
-				}
-			}
-		})
+			})
+		}
+	}
+}
+
+// clusteredBlobs is n float32 vectors around 1000 random centres, the
+// structure embeddings have.
+func clusteredBlobs(r *rand.Rand, n, d int) [][]byte {
+	cr := rand.New(rand.NewPCG(42, 42))
+	centres := make([][]float64, 1000)
+	for i := range centres {
+		centres[i] = make([]float64, d)
+		for j := range centres[i] {
+			centres[i][j] = cr.NormFloat64()
+		}
+	}
+	out := make([][]byte, n)
+	for i := range out {
+		c := centres[r.IntN(len(centres))]
+		v := make([]byte, 0, 4*d)
+		for j := range d {
+			v = binary.LittleEndian.AppendUint32(v, math.Float32bits(float32(c[j]+0.5*r.NormFloat64())))
+		}
+		out[i] = v
+	}
+	return out
+}
+
+// fillRows is fill with the given vectors.
+func fillRows(b *testing.B, db *sql.DB, d int, vecs [][]byte) {
+	b.Helper()
+	if _, err := db.Exec("CREATE TABLE docs(id INTEGER PRIMARY KEY, emb F32_BLOB(" + fmt.Sprint(d) + "))"); err != nil {
+		b.Fatal(err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		b.Fatal(err)
+	}
+	ins, err := tx.Prepare("INSERT INTO docs(emb) VALUES (?)")
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, v := range vecs {
+		if _, err := ins.Exec(v); err != nil {
+			b.Fatal(err)
+		}
+	}
+	ins.Close()
+	if err := tx.Commit(); err != nil {
+		b.Fatal(err)
+	}
+	if _, err := db.Exec("VACUUM"); err != nil {
+		b.Fatal(err)
 	}
 }

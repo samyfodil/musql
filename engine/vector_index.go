@@ -32,12 +32,15 @@ import (
 )
 
 // vecIndex is what a libsql_vector_idx index means: which column, holding
-// which vectors, ranked by which distance.
+// which vectors, ranked by which distance, and searched how: exactly, or,
+// when any of libSQL's graph-tuning options is given, approximately
+// (segment_vector_ivf.go).
 type vecIndex struct {
-	col  int
-	typ  vecType
-	dims int
-	l2   bool
+	col    int
+	typ    vecType
+	dims   int
+	l2     bool
+	approx *vecApprox
 }
 
 // vecColumnTypes is libSQL's VECTOR_COLUMN_TYPES, in its order: a declared
@@ -120,7 +123,8 @@ var vecIndexParams = []struct {
 }
 
 // parseVecIndexParam is parseVectorIdxParam: one "name=value" option. It
-// reports the option's name and value as matched, or libSQL's message.
+// reports the option's name and value as matched (the word, or an integer's
+// text), or libSQL's message.
 func parseVecIndexParam(param string) (name, word, msg string) {
 	eq := strings.IndexByte(param, '=')
 	if eq < 0 {
@@ -140,7 +144,7 @@ func parseVecIndexParam(param string) (name, word, msg string) {
 			if n < 0 {
 				return "", "", "integer vector index parameter must be positive"
 			}
-			return p.name, "", ""
+			return p.name, value, ""
 		case 2:
 			if _, rc := sqliteAtoF([]byte(value)); rc <= 0 {
 				return "", "", "invalid representation of floating point vector index parameter"
@@ -258,6 +262,19 @@ func vectorIndexOf(stmt *parsedCreateIndex, tbl *tableMeta) (*vecIndex, error) {
 			vi.l2 = word == "l2"
 		case "compress_neighbors":
 			compress = word
+		}
+		if name != "type" && name != "metric" {
+			if vi.approx == nil {
+				vi.approx = &vecApprox{searchL: 200, insertL: 70} // libSQL's defaults
+			}
+			switch name {
+			case "max_neighbors":
+				vi.approx.perList = int(vecAtoi(word))
+			case "search_l":
+				vi.approx.searchL = int(vecAtoi(word))
+			case "insert_l":
+				vi.approx.insertL = int(vecAtoi(word))
+			}
 		}
 	}
 	if tbl.withoutRowid && tbl.pkIndex != nil && len(tbl.pkIndex.colIdx) != 1 {
@@ -502,6 +519,7 @@ func (p *ReadOnlyPager) vectorTopKSegments(tm *tableMeta, vi *vecIndex, qv Value
 	}
 	segs := p.segs.byRoot[tm.rootPage]
 	plan := &segVectorPlan{l2: vi.l2, col: vi.col, limit: int(k), outCols: []int{ipk}, nanLast: true,
+		skipNulls: true, approx: vi.approx,
 		rowidOf: func(h vecHit) int64 {
 			if h.seg == len(segs) {
 				return h.rid

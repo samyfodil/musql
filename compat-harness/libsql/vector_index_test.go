@@ -1,10 +1,13 @@
 package libsql
 
 import (
+	"database/sql"
 	"fmt"
 	"math/rand/v2"
 	"strings"
 	"testing"
+
+	"github.com/samyfodil/musql/engine"
 )
 
 // TestVectorIndexStatements compares libSQL's vector index DDL, its write-time
@@ -203,5 +206,127 @@ func TestVectorTopK(t *testing.T) {
 	exec("CREATE INDEX zi ON z(libsql_vector_idx(e))")
 	if got := answer(m, "SELECT id FROM vector_top_k('zi', vector('[1,0.1]'), 3)"); got != "int64(2) \nint64(3) \nint64(1) \n" {
 		t.Errorf("zero vector: got %q, want it last", got)
+	}
+}
+
+// TestVectorTopKApprox checks the approximate mode a graph-tuning option turns
+// on. Strict about everything but recall: each row returned must be a real
+// row the index admits, in exact distance order (its rank in the exact
+// ranking only rising), and recall@k against the exact answer must reach a
+// floor on clustered data, the shape embeddings have.
+func TestVectorTopKApprox(t *testing.T) {
+	if !oracleUnfused() {
+		t.Skip(oracleFusedNote)
+	}
+	m, l := engines(t)
+	r := rand.New(rand.NewPCG(7, 8))
+	const n, d, clusters = 20000, 32, 64
+	centers := make([][]float64, clusters)
+	for i := range centers {
+		centers[i] = make([]float64, d)
+		for j := range centers[i] {
+			centers[i][j] = r.NormFloat64()
+		}
+	}
+	point := func() string {
+		c := centers[r.IntN(clusters)]
+		parts := make([]string, d)
+		for j := range parts {
+			parts[j] = fmt.Sprintf("%g", float32(c[j]+0.35*r.NormFloat64()))
+		}
+		return "[" + strings.Join(parts, ",") + "]"
+	}
+	exec := func(s string) {
+		t.Helper()
+		if _, err := m.Exec(s); err != nil {
+			t.Fatal(s, err)
+		}
+		if _, err := l.Exec(s); err != nil {
+			t.Fatal(s, err)
+		}
+	}
+	for _, tb := range []struct{ name, opts, dist string }{
+		{"a", "'search_l=200'", "vector_distance_cos"},
+		{"b", "'metric=l2', 'max_neighbors=100', 'search_l=100'", "vector_distance_l2"},
+		{"c", "'search_l=10'", "vector_distance_cos"},
+	} {
+		exec(fmt.Sprintf("CREATE TABLE %s(id INTEGER PRIMARY KEY, e F32_BLOB(%d))", tb.name, d))
+		var b strings.Builder
+		for i := 1; i <= n; i++ {
+			v := fmt.Sprintf("vector('%s')", point())
+			if i%40 == 0 {
+				v = "NULL"
+			}
+			if b.Len() > 0 {
+				b.WriteString(", ")
+			}
+			fmt.Fprintf(&b, "(%d, %s)", i, v)
+			if i%1000 == 0 {
+				exec(fmt.Sprintf("INSERT INTO %s VALUES %s", tb.name, b.String()))
+				b.Reset()
+			}
+		}
+		// The index is created on musql only: libSQL's graph build is not
+		// what this test compares against.
+		if _, err := m.Exec(fmt.Sprintf("CREATE INDEX %s_i ON %s(libsql_vector_idx(e, %s))", tb.name, tb.name, tb.opts)); err != nil {
+			t.Fatal(err)
+		}
+		exec("VACUUM")
+		exec(fmt.Sprintf("DELETE FROM %s WHERE id %% 31 = 0", tb.name))
+		exec(fmt.Sprintf("UPDATE %s SET e = vector('%s') WHERE id %% 37 = 0", tb.name, point()))
+
+		ids := func(db interface {
+			Query(string, ...any) (*sql.Rows, error)
+		}, q string) []int64 {
+			rows, err := db.Query(q)
+			if err != nil {
+				t.Fatal(q, err)
+			}
+			defer rows.Close()
+			var out []int64
+			for rows.Next() {
+				var id int64
+				rows.Scan(&id)
+				out = append(out, id)
+			}
+			return out
+		}
+		hits, total := 0, 0
+		engine.VecApproxServedForTest()
+		for range 20 {
+			q := fmt.Sprintf("vector('%s')", point())
+			const k = 10
+			got := ids(m, fmt.Sprintf("SELECT id FROM vector_top_k('%s_i', %s, %d)", tb.name, q, k))
+			rank := map[int64]int{}
+			for i, id := range ids(l, fmt.Sprintf("SELECT id FROM %s WHERE e IS NOT NULL ORDER BY %s(e, %s), id", tb.name, tb.dist, q)) {
+				rank[id] = i
+			}
+			if len(got) != k {
+				t.Fatalf("%s: %d rows, want %d", tb.name, len(got), k)
+			}
+			last := -1
+			for _, id := range got {
+				rk, ok := rank[id]
+				if !ok {
+					t.Fatalf("%s: row %d is not a row the index holds", tb.name, id)
+				}
+				if rk <= last {
+					t.Fatalf("%s: rows not in exact distance order: %v", tb.name, got)
+				}
+				last = rk
+				if rk < k {
+					hits++
+				}
+			}
+			total += k
+		}
+		if served := engine.VecApproxServedForTest(); served != 20 {
+			t.Errorf("%s: the lists answered %d of 20 searches", tb.name, served)
+		}
+		recall := float64(hits) / float64(total)
+		t.Logf("%s (%s): recall@10 %.3f", tb.name, tb.opts, recall)
+		if recall < 0.9 {
+			t.Errorf("%s: recall@10 %.3f, below 0.9", tb.name, recall)
+		}
 	}
 }

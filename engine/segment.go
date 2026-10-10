@@ -93,6 +93,7 @@ type segment struct {
 	vecMu       eqCountMu
 	vecSides    map[int]*segVecSide
 	vecSearches map[int]int // searches per column, until it has a sidecar
+	vecIVFs     map[vecIVFKey]*segVecIVF
 }
 
 // Rowid is the key row i is stored under, which a converter must preserve
@@ -558,6 +559,32 @@ func (s *segment) BytesColumn(c int) (cells []uint64, heap []byte, ok bool) {
 		return nil, nil, false
 	}
 	return unsafe.Slice((*uint64)(unsafe.Pointer(&s.buf[off])), s.nRows), s.heap, true
+}
+
+// BytesColumnNulls is BytesColumn for a column that may hold NULLs: nulls is
+// its bitmap, bit i set where row i is NULL, or nil when no row is. A NULL
+// row's cell means nothing.
+func (s *segment) BytesColumnNulls(c int) (cells []uint64, heap []byte, nulls []byte, ok bool) {
+	if c < 0 || c >= len(s.cols) || !segLittleEndian {
+		return nil, nil, nil, false
+	}
+	if ph := s.cols[c].phys; ph != PhysText && ph != PhysBlob {
+		return nil, nil, nil, false
+	}
+	if s.hasException(c) {
+		return nil, nil, nil, false
+	}
+	off := int(s.cols[c].blockOff)
+	if off == 0 || uintptr(unsafe.Pointer(&s.buf[off]))%8 != 0 {
+		return nil, nil, nil, false
+	}
+	if n := int(s.cols[c].nullOff); n != 0 {
+		if n+(s.nRows+7)/8 > len(s.buf) {
+			return nil, nil, nil, false
+		}
+		nulls = s.buf[n : n+(s.nRows+7)/8]
+	}
+	return unsafe.Slice((*uint64)(unsafe.Pointer(&s.buf[off])), s.nRows), s.heap, nulls, true
 }
 
 // Value is the general accessor: the value of column c in row i, whatever it
