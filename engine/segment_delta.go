@@ -858,6 +858,16 @@ func withSegmentReadLockWait(segPath string, wait time.Duration, fn func() error
 // segmentLockSuffix names the file every lock on a segment database is taken on.
 const segmentLockSuffix = ".lock"
 
+// RemoveDatabaseFiles deletes a database file and every file the engine keeps
+// beside it: the delta log, the lock file, and a rollback journal. It is for a
+// database whose life is over -- an in-memory one whose last connection has
+// closed -- and reports nothing, since any of them may never have existed.
+func RemoveDatabaseFiles(path string) {
+	for _, p := range []string{path, path + segDeltaSuffix, path + segmentLockSuffix, path + "-journal"} {
+		os.Remove(p)
+	}
+}
+
 // openSegmentLockFile opens (creating if needed) the file locks are taken on.
 //
 // IT IS A FILE OF ITS OWN, and that is the whole point. A byte-range lock belongs
