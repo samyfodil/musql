@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"math"
 	"math/rand/v2"
+	"strconv"
 	"testing"
 )
 
@@ -52,6 +53,26 @@ func BenchmarkVecSideBuild(b *testing.B) {
 	for b.Loop() {
 		if _, ok := buildVecSide(heap, offs, dims); !ok {
 			b.Fatal("declined")
+		}
+	}
+}
+
+// BenchmarkVectorText parses one 384-component vector written as text.
+func BenchmarkVectorText(b *testing.B) {
+	r := rand.New(rand.NewPCG(1, 1))
+	var sb []byte
+	sb = append(sb, '[')
+	for i := range 384 {
+		if i > 0 {
+			sb = append(sb, ',')
+		}
+		sb = strconv.AppendFloat(sb, r.NormFloat64(), 'g', 6, 64)
+	}
+	sb = append(sb, ']')
+	b.SetBytes(int64(len(sb)))
+	for b.Loop() {
+		if _, err := parseVectorText(sb, vecF32); err != nil {
+			b.Fatal(err)
 		}
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"strings"
 	"testing"
 
 	"github.com/samyfodil/musql/engine"
@@ -116,6 +117,42 @@ func BenchmarkKNNFirst(b *testing.B) {
 				for rows.Next() {
 				}
 				rows.Close()
+				b.StopTimer()
+				db.Close()
+				b.StartTimer()
+			}
+		})
+	}
+}
+
+// BenchmarkVectorInsert inserts rows written the libSQL way, the vector as
+// text through vector(), 250 to a statement as the browser race does.
+func BenchmarkVectorInsert(b *testing.B) {
+	const rows, d = 2000, 384
+	r := rand.New(rand.NewPCG(3, 3))
+	var stmts []string
+	for lo := 0; lo < rows; lo += 250 {
+		var vals []string
+		for i := lo; i < lo+250; i++ {
+			vals = append(vals, fmt.Sprintf("(%d, vector('%s'))", i+1, randVec(r, d)))
+		}
+		stmts = append(stmts, "INSERT INTO v VALUES "+strings.Join(vals, ","))
+	}
+	for _, e := range []struct{ name, driver, dsn string }{
+		{"musql", "sqlite", ":memory:"},
+		{"libsql", "libsql", "file::memory:"},
+	} {
+		b.Run(e.name, func(b *testing.B) {
+			for b.Loop() {
+				b.StopTimer()
+				db := open(b, e.driver, e.dsn)
+				db.Exec(fmt.Sprintf("CREATE TABLE v(id INTEGER PRIMARY KEY, emb F32_BLOB(%d))", d))
+				b.StartTimer()
+				for _, s := range stmts {
+					if _, err := db.Exec(s); err != nil {
+						b.Fatal(err)
+					}
+				}
 				b.StopTimer()
 				db.Close()
 				b.StartTimer()

@@ -23,6 +23,7 @@
 package engine
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -213,22 +214,51 @@ func parseVectorText(s []byte, t vecType) (vector, error) {
 	if t == vecF64 {
 		w = 8
 	}
-	var num, data []byte
+	var data []byte
 	n := 0
-	for ; i < len(s) && s[i] != 0; i++ {
-		c := s[i]
-		if sqlIsSpace(c) {
-			continue
-		}
-		if c != ',' && c != ']' {
-			if len(num) > vecMaxFloatSz {
-				return vector{}, vecErr("vector: float string length exceeded %d characters: '%s'", vecMaxFloatSz, num[:vecMaxFloatSz])
+	// One number per pass: its span runs to the next ',' or ']' (or a NUL,
+	// where C's string ends), found in one scan and parsed in place. Only a
+	// number with whitespace inside it -- which libSQL drops, so "1 2" is 12
+	// -- is copied to strip it.
+	for {
+		// e is the terminator; [lo, hi) the span from the first non-space to
+		// the last; inner whether a space falls between them.
+		e, lo, hi, inner, gap := i, -1, -1, false, false
+		for ; e < len(s); e++ {
+			c := s[e]
+			if c == ',' || c == ']' || c == 0 {
+				break
 			}
-			num = append(num, c)
-			continue
+			if sqlIsSpace(c) {
+				gap = lo >= 0
+				continue
+			}
+			if lo < 0 {
+				lo = e
+			}
+			inner = inner || gap
+			gap = false
+			hi = e + 1
 		}
-		if c == ']' && n == 0 && len(num) == 0 {
-			break // '[]'
+		var num []byte
+		if lo >= 0 {
+			num = s[lo:hi]
+		}
+		if inner {
+			num = bytes.Map(func(r rune) rune {
+				if r < 0x80 && sqlIsSpace(byte(r)) {
+					return -1
+				}
+				return r
+			}, num)
+		}
+		// libSQL buffers 1,025 characters and refuses the next.
+		if len(num) > vecMaxFloatSz+1 {
+			return vector{}, vecErr("vector: float string length exceeded %d characters: '%s'", vecMaxFloatSz, num[:vecMaxFloatSz+1])
+		}
+		i = e
+		if e == len(s) || s[e] == 0 || (s[e] == ']' && n == 0 && len(num) == 0) {
+			break // unterminated (reported below), or '[]'
 		}
 		x, rc := sqliteAtoF(num)
 		if rc <= 0 {
@@ -237,16 +267,16 @@ func parseVectorText(s []byte, t vecType) (vector, error) {
 		if n >= vecMaxDims {
 			return vector{}, vecErr("vector: max size exceeded %d", vecMaxDims)
 		}
-		num = num[:0]
 		if w == 4 {
 			data = binary.LittleEndian.AppendUint32(data, math.Float32bits(float32(x)))
 		} else {
 			data = binary.LittleEndian.AppendUint64(data, math.Float64bits(x))
 		}
 		n++
-		if c == ']' {
+		if s[e] == ']' {
 			break
 		}
+		i = e + 1
 	}
 	skip()
 	if i == len(s) || s[i] != ']' {

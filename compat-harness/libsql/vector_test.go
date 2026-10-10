@@ -118,6 +118,11 @@ func TestVectorFunctions(t *testing.T) {
 		"SELECT vector_distance_cos('[0,0]', '[0,0]')",
 		"SELECT vector_distance_cos(vector8('[2,2,2]'), vector8('[2,2,2]'))",
 		"SELECT vector()", "SELECT vector('[1]', '[2]')", "SELECT vector_distance_cos('[1]')",
+		// The longest number libSQL takes, and one past it.
+		"SELECT vector_extract(vector('[1"+strings.Repeat("0", 1024)+"e-1024]'))",
+		"SELECT vector('[1"+strings.Repeat("0", 1025)+"]')",
+		"SELECT vector('[1"+strings.Repeat("0", 1024)+"]')",
+		"SELECT vector_extract(vector('[ 1 2 , 3 ]'))", "SELECT vector('[1,2]  x')", "SELECT vector_extract(vector(char(91,49,93,0,120)))",
 	)
 	diffs := 0
 	for _, q := range qs {
