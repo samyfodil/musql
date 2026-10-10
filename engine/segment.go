@@ -90,8 +90,9 @@ type segment struct {
 	zones  map[int]*segZones
 	// Lazily built int8 copies of vector columns, a nil entry for a column
 	// that has none. See segment_vector_bound.go.
-	vecMu    eqCountMu
-	vecSides map[int]*segVecSide
+	vecMu       eqCountMu
+	vecSides    map[int]*segVecSide
+	vecSearches map[int]int // searches per column, until it has a sidecar
 }
 
 // Rowid is the key row i is stored under, which a converter must preserve

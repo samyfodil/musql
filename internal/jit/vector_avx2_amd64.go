@@ -305,6 +305,130 @@ func EmitI8Dot() ([]byte, error) {
 	return a.Code()
 }
 
+// EmitMaxAbsBits emits the first half of building a vector column's int8
+// copy: each row's largest |component|, as float32 BITS. With the sign masked
+// off, a float's bits are a non-negative int32 whose order is the floats'
+// order, and NaN and Inf sort above every finite value, so an integer max
+// (VPMAXSD) finds the largest magnitude and flags a non-finite component in
+// one pass.
+//
+// Args: A the first row, XC the stride, N the rows (at least 1), XA the
+// dimensions (a multiple of 8), Out a uint32 per row.
+func EmitMaxAbsBits() ([]byte, error) {
+	if !cpuHasAVX2() {
+		return nil, fmt.Errorf("jit: AVX2 not available on this machine")
+	}
+	a := NewAsm()
+	a.MovRegMem(RSI, RDI, OffA)
+	a.MovRegMem(RBX, RDI, OffXC)
+	a.MovRegMem(RCX, RDI, OffN)
+	a.MovRegMem(R9, RDI, OffXA)
+	a.ShrRegImm8(R9, 3)
+	a.MovRegMem(R10, RDI, OffOut)
+	a.VpcmpeqdYmm(7, 7, 7)
+	a.vpsrldImm(7, 7, 1) // 0x7fffffff in every lane
+
+	a.Label("row")
+	a.VpxorYmm(0, 0, 0)
+	a.MovRegReg(RAX, RSI)
+	a.MovRegReg(R12, R9)
+	a.Label("block")
+	a.VmovdquLoad(1, RAX)
+	a.VpandYmm(1, 1, 7)
+	a.vinst(0x3D, 0, 0, 1, vexMap0F38, 0, 1, vexP66, false) // vpmaxsd ymm0, ymm0, ymm1
+	a.AddRegImm8(RAX, 32)
+	a.DecReg(R12)
+	a.Jcc(CondNE, "block")
+	a.Vextracti128(1, 0, 1)
+	a.vinst(0x3D, 0, 0, 1, vexMap0F38, 0, 0, vexP66, false) // vpmaxsd xmm0, xmm0, xmm1
+	a.vinst(0x70, 1, 0, 0, vexMap0F, 0, 0, vexP66, true)
+	a.emit(0x4E)
+	a.vinst(0x3D, 0, 0, 1, vexMap0F38, 0, 0, vexP66, false)
+	a.vinst(0x70, 1, 0, 0, vexMap0F, 0, 0, vexP66, true)
+	a.emit(0xB1)
+	a.vinst(0x3D, 0, 0, 1, vexMap0F38, 0, 0, vexP66, false)
+	a.vex3(0, RAX, 0, vexMap0F, 0, 0, vexP66, true) // vmovd eax, xmm0
+	a.emit(0x7E, modrm(0b11, 0, RAX))
+	a.emit(0x41, 0x89, modrm(0b00, RAX, R10)) // mov [r10], eax
+	a.AddRegImm8(R10, 4)
+	a.AddRegReg(RSI, RBX)
+	a.DecReg(RCX)
+	a.Jcc(CondNE, "row")
+	a.Vzeroupper()
+	a.Ret()
+	return a.Code()
+}
+
+// EmitQuantize emits the second half: each component times its row's 1/scale,
+// rounded to the nearest integer (VCVTPS2DQ, round-to-nearest-even under
+// the default MXCSR) and packed to int8, and each row's sum of |code|. The
+// caller's scales keep every product within +-127.5, so the saturating packs
+// never saturate.
+//
+// Args: A the first row, XC the stride, V a float32 1/scale per row, N the
+// rows (at least 1), XA the dimensions (a multiple of 8), Out the codes (rows
+// back to back), Out2 an int32 per row.
+func EmitQuantize() ([]byte, error) {
+	if !cpuHasAVX2() {
+		return nil, fmt.Errorf("jit: AVX2 not available on this machine")
+	}
+	a := NewAsm()
+	a.MovRegMem(RSI, RDI, OffA)
+	a.MovRegMem(RBX, RDI, OffXC)
+	a.MovRegMem(RCX, RDI, OffN)
+	a.MovRegMem(R9, RDI, OffXA)
+	a.ShrRegImm8(R9, 3)
+	a.MovRegMem(R8, RDI, OffV)
+	a.MovRegMem(R10, RDI, OffOut)
+	a.MovRegMem(R11, RDI, OffOut2)
+
+	a.Label("row")
+	a.VbroadcastssMem(3, R8)
+	a.VpxorYmm(4, 4, 4)
+	a.MovRegReg(RAX, RSI)
+	a.MovRegReg(R12, R9)
+	a.Label("block")
+	a.VmovdquLoad(1, RAX)
+	a.VmulpsYmm(1, 1, 3)
+	a.vinst(0x5B, 1, 0, 1, vexMap0F, 0, 1, vexP66, true)   // vcvtps2dq ymm1, ymm1
+	a.vinst(0x1E, 2, 0, 1, vexMap0F38, 0, 1, vexP66, true) // vpabsd ymm2, ymm1
+	a.vinst(0xFE, 4, 4, 2, vexMap0F, 0, 1, vexP66, false)  // vpaddd ymm4, ymm4, ymm2
+	a.Vextracti128(2, 1, 1)
+	a.vinst(0x6B, 1, 1, 2, vexMap0F, 0, 0, vexP66, false) // vpackssdw xmm1, xmm1, xmm2
+	a.vinst(0x63, 1, 1, 1, vexMap0F, 0, 0, vexP66, false) // vpacksswb xmm1, xmm1, xmm1
+	a.vexm(1, 0, R10, 0, vexMap0F, 0, 0, vexP66)          // vmovq [r10], xmm1
+	a.emit(0xD6, modrm(0b00, 1, R10))
+	a.AddRegImm8(R10, 8)
+	a.AddRegImm8(RAX, 32)
+	a.DecReg(R12)
+	a.Jcc(CondNE, "block")
+	a.Vextracti128(2, 4, 1)
+	a.vinst(0xFE, 4, 4, 2, vexMap0F, 0, 0, vexP66, false)
+	a.vinst(0x70, 2, 0, 4, vexMap0F, 0, 0, vexP66, true)
+	a.emit(0x4E)
+	a.vinst(0xFE, 4, 4, 2, vexMap0F, 0, 0, vexP66, false)
+	a.vinst(0x70, 2, 0, 4, vexMap0F, 0, 0, vexP66, true)
+	a.emit(0xB1)
+	a.vinst(0xFE, 4, 4, 2, vexMap0F, 0, 0, vexP66, false)
+	a.vex3(4, RAX, 0, vexMap0F, 0, 0, vexP66, true) // vmovd eax, xmm4
+	a.emit(0x7E, modrm(0b11, 4, RAX))
+	a.emit(0x41, 0x89, modrm(0b00, RAX, R11)) // mov [r11], eax
+	a.AddRegImm8(R11, 4)
+	a.AddRegImm8(R8, 4)
+	a.AddRegReg(RSI, RBX)
+	a.DecReg(RCX)
+	a.Jcc(CondNE, "row")
+	a.Vzeroupper()
+	a.Ret()
+	return a.Code()
+}
+
+// vpsrldImm is  dst = src >> imm, eight uint32 lanes.
+func (a *Asm) vpsrldImm(dst, src Reg, imm byte) {
+	a.vex3(2, src, dst, vexMap0F, 0, 1, vexP66, false)
+	a.emit(0x72, modrm(0b11, 2, src), imm)
+}
+
 // vexm emits a three-byte VEX prefix for an instruction with a memory operand:
 // R from reg, X from the SIB index (a vector register for a gather), B from
 // the base.

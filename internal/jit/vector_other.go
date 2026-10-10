@@ -14,3 +14,13 @@ func EmitVecDist(l2 bool) ([]byte, error) {
 func EmitI8Dot() ([]byte, error) {
 	return nil, fmt.Errorf("jit: no int8 dot-product encoder for this architecture")
 }
+
+// EmitMaxAbsBits likewise.
+func EmitMaxAbsBits() ([]byte, error) {
+	return nil, fmt.Errorf("jit: no max-abs encoder for this architecture")
+}
+
+// EmitQuantize likewise.
+func EmitQuantize() ([]byte, error) {
+	return nil, fmt.Errorf("jit: no quantize encoder for this architecture")
+}

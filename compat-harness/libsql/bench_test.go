@@ -94,3 +94,32 @@ func blob(r *rand.Rand, d int) []byte {
 	}
 	return out
 }
+
+// BenchmarkKNNFirst is the first search on a freshly compacted table: what a
+// search costs before any per-segment state exists.
+func BenchmarkKNNFirst(b *testing.B) {
+	const n, d = 100_000, 384
+	for _, workers := range []int{1, 8} {
+		b.Run(fmt.Sprintf("musql-%dw", workers), func(b *testing.B) {
+			engine.Configure(engine.WithWorkers(workers))
+			defer engine.Configure()
+			q := blob(rand.New(rand.NewPCG(9, 9)), d)
+			for b.Loop() {
+				b.StopTimer()
+				db := open(b, "sqlite", ":memory:")
+				fill(b, db, n, d)
+				b.StartTimer()
+				rows, err := db.Query("SELECT id FROM docs ORDER BY vector_distance_cos(emb, ?) LIMIT 10", q)
+				if err != nil {
+					b.Fatal(err)
+				}
+				for rows.Next() {
+				}
+				rows.Close()
+				b.StopTimer()
+				db.Close()
+				b.StartTimer()
+			}
+		})
+	}
+}

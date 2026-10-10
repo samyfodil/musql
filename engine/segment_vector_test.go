@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"math"
 	"math/rand/v2"
+	"slices"
 	"testing"
 )
 
@@ -107,8 +108,8 @@ func TestVecBoundsContainExact(t *testing.T) {
 					x[i] = -q[i]
 				case 3: // huge
 					x[i] = float32(r.NormFloat64() * 1e18)
-				case 4: // tiny, into the subnormals
-					x[i] = float32(r.NormFloat64() * 1e-40)
+				case 4: // tiny: rows whose scale straddles float32's smallest normal
+					x[i] = float32(r.NormFloat64() * math.Pow(10, -34-float64(k%7)))
 				case 5: // mixed scales
 					x[i] = float32(r.NormFloat64() * math.Pow(10, float64(r.IntN(20)-10)))
 				default:
@@ -117,7 +118,18 @@ func TestVecBoundsContainExact(t *testing.T) {
 			}
 			rows = append(rows, x)
 		}
-		side := buildVecSide(rows, dims)
+		var heap []byte
+		offs := make([]int, len(rows))
+		for i, x := range rows {
+			offs[i] = len(heap)
+			for _, v := range x {
+				heap = binary.LittleEndian.AppendUint32(heap, math.Float32bits(v))
+			}
+		}
+		side, ok := buildVecSide(heap, offs, dims)
+		if !ok {
+			t.Fatal("buildVecSide declined")
+		}
 		qbytes := vector{typ: vecF32, dims: dims}
 		for _, v := range q {
 			qbytes.data = binary.LittleEndian.AppendUint32(qbytes.data, math.Float32bits(v))
@@ -180,6 +192,67 @@ func TestI8DotKernel(t *testing.T) {
 		for row := 3; row < n; row++ {
 			if want := int8Dot(side.codes[row*d:(row+1)*d], vq.t32); got[row-3] != want {
 				t.Fatalf("d=%d row %d: %d, want %d", d, row, got[row-3], want)
+			}
+		}
+	}
+}
+
+// TestVecSideJITMatchesGo builds a sidecar both ways -- the JIT's max-abs and
+// quantize kernels, and quantizeRow -- and requires every array to agree,
+// over rows that take each special case: non-finite, zero, subnormal scale.
+func TestVecSideJITMatchesGo(t *testing.T) {
+	if jitMaxAbs() == nil || jitQuantize() == nil {
+		t.Skip("no quantize kernels here")
+	}
+	r := rand.New(rand.NewPCG(17, 19))
+	for _, dims := range []int{8, 64, 384} {
+		const n = 203
+		var heap []byte
+		offs := make([]int, n)
+		rows := make([][]float32, n)
+		for i := range n {
+			x := make([]float32, dims)
+			for j := range x {
+				switch i % 9 {
+				case 0:
+					x[j] = 0
+				case 1:
+					x[j] = float32(r.NormFloat64() * 1e-38)
+				case 2:
+					x[j] = float32(r.NormFloat64() * 1e-44)
+				case 3:
+					x[j] = float32(r.NormFloat64() * 3e38)
+				default:
+					x[j] = float32(r.NormFloat64() * math.Pow(10, float64(r.IntN(10)-5)))
+				}
+			}
+			if i%9 == 4 {
+				x[r.IntN(dims)] = float32(math.NaN())
+			}
+			if i%9 == 5 {
+				x[r.IntN(dims)] = float32(math.Inf(-1))
+			}
+			offs[i] = len(heap)
+			for _, v := range x {
+				heap = binary.LittleEndian.AppendUint32(heap, math.Float32bits(v))
+			}
+			rows[i] = x
+		}
+		got, ok := buildVecSide(heap, offs, dims)
+		if !ok {
+			t.Fatal("buildVecSide declined")
+		}
+		for i, x := range rows {
+			code := make([]int8, dims)
+			s, e, c1 := quantizeRow(x, code)
+			if math.IsInf(float64(e), 0) && math.IsInf(float64(got.errb[i]), 0) {
+				continue // no bound: the rest does not matter
+			}
+			if got.scale[i] != s || got.errb[i] != e || got.c1[i] != c1 || !slices.Equal(got.codes[i*dims:(i+1)*dims], code) {
+				t.Fatalf("dims=%d row %d: jit (%v %v %d) go (%v %v %d)", dims, i, got.scale[i], got.errb[i], got.c1[i], s, e, c1)
+			}
+			if nn := vecSelfDot(x); math.Float32bits(got.norm[i]) != math.Float32bits(nn) && !(nn != nn && got.norm[i] != got.norm[i]) {
+				t.Fatalf("dims=%d row %d: norm %v, want %v", dims, i, got.norm[i], nn)
 			}
 		}
 	}

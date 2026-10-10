@@ -48,72 +48,167 @@ type segVecSide struct {
 // bounding pass is worth its own cost.
 const vecSideMinRows = 64
 
-// vecSide returns the sidecar of column col, building it from rows (the
-// column's float32 vectors, one per segment row) the first time.
-func (s *segment) vecSide(col, dims int, rows func() ([][]float32, bool)) (*segVecSide, bool) {
+// vecSide returns the sidecar of column col. It is built on a column's
+// SECOND search in a segment, not its first: building costs a few exact
+// scans, which a search that runs once should not pay.
+func (s *segment) vecSide(col, dims int, build func() (*segVecSide, bool)) (*segVecSide, bool) {
 	s.vecMu.Lock()
 	defer s.vecMu.Unlock()
 	if side, ok := s.vecSides[col]; ok {
 		return side, side != nil && side.dims == dims
 	}
-	vs, ok := rows()
-	var side *segVecSide
-	if ok {
-		side = buildVecSide(vs, dims)
+	if s.vecSearches == nil {
+		s.vecSearches = map[int]int{}
+	}
+	if s.vecSearches[col]++; s.vecSearches[col] < 2 {
+		return nil, false
+	}
+	side, ok := build()
+	if !ok {
+		side = nil
 	}
 	if s.vecSides == nil {
 		s.vecSides = map[int]*segVecSide{}
 	}
 	s.vecSides[col] = side
-	return side, side != nil
+	return side, ok
 }
 
-// buildVecSide quantizes each row symmetrically onto -127..127.
-func buildVecSide(rows [][]float32, dims int) *segVecSide {
-	n := len(rows)
+// buildVecSide quantizes each row (a float32 vector of dims components at
+// heap[offs[r]:]) symmetrically onto -127..127, in parallel over runs of
+// rows. Each row's sum of squares comes from the cosine kernel run against a
+// zero query, which sums exactly as the distance does.
+func buildVecSide(heap []byte, offs []int, dims int) (*segVecSide, bool) {
+	n := len(offs)
 	side := &segVecSide{
 		dims: dims, norm: make([]float32, n), scale: make([]float32, n),
 		errb: make([]float32, n), c1: make([]int32, n), codes: make([]int8, n*dims),
 	}
-	for r, x := range rows {
-		side.norm[r] = vecSelfDot(x)
-		code := side.codes[r*dims : (r+1)*dims]
-		s, e, c1 := quantizeRow(x, code)
-		side.scale[r], side.errb[r], side.c1[r] = s, e, c1
-	}
-	return side
+	zero := make([]float32, dims)
+	step := segVectorChunkRows(dims)
+	k := jitVecKernel(false)
+	return side, segEach((n+step-1)/step, func(j int) bool {
+		lo, hi := j*step, min((j+1)*step, n)
+		rows, ok := f32Rows(heap, offs[lo:hi], dims)
+		if !ok {
+			return false
+		}
+		sums, done := vecSumsJIT(k, false, heap, offs[lo:hi], zero)
+		copy(side.norm[lo:], sums[done:2*done])
+		for r := lo + done; r < hi; r++ {
+			side.norm[r] = vecSelfDot(rows[r-lo])
+		}
+		q := quantizeRowsJIT(heap, offs[lo:hi], dims, side, lo)
+		for r := lo + q; r < hi; r++ {
+			side.scale[r], side.errb[r], side.c1[r] = quantizeRow(rows[r-lo], side.codes[r*dims:(r+1)*dims])
+		}
+		return true
+	})
 }
 
-// quantizeRow writes x's codes and returns the scale, the error bound (+Inf
-// when a component is not finite) and the sum of |codes|.
+// quantizeRowsJIT quantizes the leading rows that sit back to back with the
+// JIT's two kernels -- each row's max |component| as an integer max over the
+// float bits, then the codes -- to the same rules as quantizeRow, and reports
+// how many rows it did.
+func quantizeRowsJIT(heap []byte, offs []int, dims int, side *segVecSide, first int) int {
+	n := vecStridedRows(heap, offs, dims)
+	kMax, kQuant := jitMaxAbs(), jitQuantize()
+	if n == 0 || kMax == nil || kQuant == nil {
+		return 0
+	}
+	bits := make([]uint32, n)
+	args := jit.Args{
+		A:   (*int64)(unsafe.Pointer(&heap[offs[0]])),
+		XC:  int64(4 * dims),
+		N:   int64(n),
+		XA:  int64(dims),
+		Out: (*int64)(unsafe.Pointer(&bits[0])),
+	}
+	kMax.Call(&args)
+	inv := make([]float32, n)
+	for i, b := range bits {
+		r := first + i
+		mx := math.Float32frombits(b)
+		switch {
+		case b >= 0x7f800000: // NaN or Inf: no bound, and the codes do not matter
+			side.scale[r], side.errb[r] = 0, float32(math.Inf(1))
+		case mx/127 < 0x1p-126: // zero, or a scale too small to trust: all code 0
+			side.scale[r], side.errb[r] = 0, mx
+		default:
+			scale := mx / 127
+			side.scale[r], side.errb[r] = scale, roundUp32(float64(scale)*(0.5+0x1p-14))
+			inv[i] = 1 / scale
+		}
+	}
+	args.V = (*int64)(unsafe.Pointer(&inv[0]))
+	args.Out = (*int64)(unsafe.Pointer(&side.codes[first*dims]))
+	args.Out2 = (*int64)(unsafe.Pointer(&side.c1[first]))
+	kQuant.Call(&args)
+	for i := range n {
+		if inv[i] == 0 { // the special rows: code 0 (or, non-finite, unused)
+			r := first + i
+			clear(side.codes[r*dims : (r+1)*dims])
+			side.c1[r] = 0
+		}
+	}
+	return n
+}
+
+var (
+	jitMaxAbs   = sync.OnceValue(func() *jit.Code { return jitMapOnce(jit.EmitMaxAbsBits) })
+	jitQuantize = sync.OnceValue(func() *jit.Code { return jitMapOnce(jit.EmitQuantize) })
+)
+
+// jitMapOnce emits and maps a kernel, nil where the JIT is off or cannot.
+func jitMapOnce(emit func() ([]byte, error)) *jit.Code {
+	if !jitEnabled || !jit.HasVector() {
+		return nil
+	}
+	code, err := emit()
+	if err != nil {
+		return nil
+	}
+	k, err := jit.Map(code)
+	if err != nil {
+		return nil
+	}
+	return k
+}
+
+// quantizeRow writes x's codes, c = round(x/s) with s = max|x|/127, and
+// returns s, the error bound and the sum of |codes|. Computing x/s as x*(1/s)
+// in float32 is off by at most 127*2^-22 in units of s, so every component is
+// within s*(0.5 + 2^-14) of its code's value -- the bound, by construction,
+// with no per-component bookkeeping. A row with a non-finite component gets
+// no bound (+Inf); one too small to scale is all code 0, its bound its max.
 func quantizeRow(x []float32, code []int8) (scale, errb float32, c1 int32) {
-	var mx float64
+	var mx float32
 	for _, v := range x {
-		a := math.Abs(float64(v))
-		if math.IsInf(a, 0) || math.IsNaN(a) {
+		a := float32(math.Abs(float64(v)))
+		if !(a <= math.MaxFloat32) { // NaN or Inf
 			return 0, float32(math.Inf(1)), 0
 		}
 		mx = max(mx, a)
 	}
 	if mx == 0 {
-		return 0, 0, 0 // all zero: exact, and every code 0
+		clear(code)
+		return 0, 0, 0
 	}
-	scale = float32(mx / 127)
-	if scale == 0 { // the components are subnormal: no useful code
-		return 0, float32(mx), 0
+	scale = mx / 127
+	if scale < 0x1p-126 {
+		// A subnormal scale has lost relative precision, so x/scale could pass
+		// 127 and the bound above would not hold: no codes, the max as bound.
+		clear(code)
+		return 0, mx, 0
 	}
-	s := float64(scale)
-	var e float64
+	inv := 1 / scale
 	for i, v := range x {
-		c := math.Round(float64(v) / s)
+		c := int32(math.RoundToEven(float64(v * inv)))
 		c = min(max(c, -127), 127)
 		code[i] = int8(c)
-		c1 += int32(math.Abs(c))
-		// v and c*s are exact in float64 (c*s has at most 32 significant
-		// bits), so only the difference can round; one ulp up covers it.
-		e = max(e, math.Abs(float64(v)-c*s))
+		c1 += max(c, -c)
 	}
-	return scale, roundUp32(e * (1 + 0x1p-50)), c1
+	return scale, roundUp32(float64(scale) * (0.5 + 0x1p-14)), c1
 }
 
 // roundUp32 is the smallest float32 not below x.
@@ -400,20 +495,7 @@ func (vq *vecQuery) dots(side *segVecSide, lo, hi int) []int32 {
 	return out
 }
 
-var jitI8Dot = sync.OnceValue(func() *jit.Code {
-	if !jitEnabled || !jit.HasVector() {
-		return nil
-	}
-	code, err := jit.EmitI8Dot()
-	if err != nil {
-		return nil
-	}
-	k, err := jit.Map(code)
-	if err != nil {
-		return nil
-	}
-	return k
-})
+var jitI8Dot = sync.OnceValue(func() *jit.Code { return jitMapOnce(jit.EmitI8Dot) })
 
 // jitI8DotKernel is the compiled int8 dot-product kernel, nil without one.
 func jitI8DotKernel() *jit.Code { return jitI8Dot() }

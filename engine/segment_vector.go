@@ -449,8 +449,17 @@ func jitVecKernelOf(key jitVecKey) *jit.Code {
 // eight at a time when the dimensions are a multiple of 8; otherwise rows
 // that sit 4-aligned take the gathering kernel k sixteen at a time.
 func vecDistJIT(k *jit.Code, l2 bool, heap []byte, offs []int, q []float32, qn float32, dist []float32) int {
+	sums, n := vecSumsJIT(k, l2, heap, offs, q)
+	vecFinish(l2, sums, n, qn, dist)
+	return n
+}
+
+// vecSumsJIT runs a kernel over the leading rows and returns their raw sums:
+// sums[:n] the dot products (or for L2 the squared distances), sums[n:2n]
+// for the cosine the rows' own sums of squares.
+func vecSumsJIT(k *jit.Code, l2 bool, heap []byte, offs []int, q []float32) ([]float32, int) {
 	if len(offs) == 0 || len(heap) == 0 {
-		return 0
+		return nil, 0
 	}
 	if n := vecStridedRows(heap, offs, len(q)); n > 0 {
 		if ks := jitVecKernelOf(jitVecKey{l2: l2, strided: true}); ks != nil {
@@ -465,13 +474,15 @@ func vecDistJIT(k *jit.Code, l2 bool, heap []byte, offs []int, q []float32, qn f
 				Out2: (*int64)(unsafe.Pointer(&sums[n])),
 			}
 			ks.Call(&args)
-			vecFinish(l2, sums, n, qn, dist)
-			return n
+			return sums, n
 		}
+	}
+	if k == nil {
+		return nil, 0
 	}
 	n := len(offs) &^ 15
 	if n == 0 {
-		return 0
+		return nil, 0
 	}
 	base := uintptr(unsafe.Pointer(unsafe.SliceData(heap)))
 	idx := make([]int32, n)
@@ -483,7 +494,7 @@ func vecDistJIT(k *jit.Code, l2 bool, heap []byte, offs []int, q []float32, qn f
 		idx[i] = int32(off)
 	}
 	if n == 0 {
-		return 0
+		return nil, 0
 	}
 	sums := make([]float32, 2*n)
 	args := jit.Args{
@@ -496,8 +507,7 @@ func vecDistJIT(k *jit.Code, l2 bool, heap []byte, offs []int, q []float32, qn f
 		Out2: (*int64)(unsafe.Pointer(&sums[n])),
 	}
 	k.Call(&args)
-	vecFinish(l2, sums, n, qn, dist)
-	return n
+	return sums, n
 }
 
 // vecFinish turns a kernel's per-row sums (sums[:n], and for the cosine the
@@ -550,12 +560,12 @@ func vecBoundedTopK(plan *segVectorPlan, segs []*segment, cells [][]uint64, skip
 	}
 	sides := make([]*segVecSide, len(segs))
 	for si, s := range segs {
-		side, ok := s.vecSide(plan.col, len(query), func() ([][]float32, bool) {
+		side, ok := s.vecSide(plan.col, len(query), func() (*segVecSide, bool) {
 			offs := make([]int, len(cells[si]))
 			for i, c := range cells[si] {
 				offs[i] = int(uint32(c))
 			}
-			return f32Rows(s.heap, offs, len(query))
+			return buildVecSide(s.heap, offs, len(query))
 		})
 		if !ok {
 			return false

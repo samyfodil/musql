@@ -35,3 +35,23 @@ func BenchmarkVecKernel(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkVecSideBuild times building one segment's int8 copy of a vector
+// column, which a column's second search pays.
+func BenchmarkVecSideBuild(b *testing.B) {
+	const rows, dims = 100_000, 384
+	r := rand.New(rand.NewPCG(1, 1))
+	heap := make([]byte, 0, rows*dims*4)
+	offs := make([]int, rows)
+	for i := range rows {
+		offs[i] = len(heap)
+		for range dims {
+			heap = binary.LittleEndian.AppendUint32(heap, math.Float32bits(float32(r.NormFloat64())))
+		}
+	}
+	for b.Loop() {
+		if _, ok := buildVecSide(heap, offs, dims); !ok {
+			b.Fatal("declined")
+		}
+	}
+}
