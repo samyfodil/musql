@@ -29,8 +29,10 @@ func engines(t testing.TB) (musql, libsql *sql.DB) {
 
 // answer is one statement's outcome, rendered so two engines compare equal
 // exactly when they agree: every column's type and value, or the error text.
-func answer(db *sql.DB, q string) string {
-	rows, err := db.Query(q)
+func answer(db *sql.DB, q string) string { return answerArgs(db, q) }
+
+func answerArgs(db *sql.DB, q string, args ...any) string {
+	rows, err := db.Query(q, args...)
 	if err != nil {
 		return "error: " + errText(err)
 	}

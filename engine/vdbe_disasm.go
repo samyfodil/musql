@@ -22,6 +22,7 @@ var opNames = [numOpCodes]string{
 	OpSegProgram:           "SegProgram",
 	OpSegEmitRow:           "SegEmitRow",
 	OpSegDistinct:          "SegDistinct",
+	OpSegVectorTopK:        "SegVectorTopK",
 	OpGoto:                 "Goto",
 	OpHalt:                 "Halt",
 	OpResultRow:            "ResultRow",

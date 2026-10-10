@@ -7,6 +7,8 @@ import (
 	"math"
 	"math/rand/v2"
 	"testing"
+
+	"github.com/samyfodil/musql/engine"
 )
 
 // BenchmarkKNN is exact nearest-neighbour search the way libSQL applications
@@ -15,11 +17,17 @@ import (
 func BenchmarkKNN(b *testing.B) {
 	for _, n := range []int{10_000, 100_000} {
 		for _, d := range []int{384} {
-			for _, e := range []struct{ name, driver, dsn string }{
-				{"musql", "sqlite", ":memory:"},
-				{"libsql", "libsql", "file::memory:"},
+			for _, e := range []struct {
+				name, driver, dsn string
+				workers           int
+			}{
+				{"musql", "sqlite", ":memory:", 1},
+				{"musql-8cores", "sqlite", ":memory:", 8},
+				{"libsql", "libsql", "file::memory:", 1},
 			} {
 				b.Run(fmt.Sprintf("%s/n=%d/d=%d", e.name, n, d), func(b *testing.B) {
+					engine.Configure(engine.WithWorkers(e.workers))
+					defer engine.Configure()
 					db := open(b, e.driver, e.dsn)
 					fill(b, db, n, d)
 					q := blob(rand.New(rand.NewPCG(9, 9)), d)
@@ -70,6 +78,10 @@ func fill(b *testing.B, db *sql.DB, n, d int) {
 	}
 	ins.Close()
 	if err := tx.Commit(); err != nil {
+		b.Fatal(err)
+	}
+	// Compacted, as a table that is read more than written is.
+	if _, err := db.Exec("VACUUM"); err != nil {
 		b.Fatal(err)
 	}
 }

@@ -162,8 +162,10 @@ func buildSegment(cols []columnInfo, rowids []uint64, rows [][]Value) ([]byte, e
 	heapLen := 0
 	for _, r := range rows {
 		for c := 0; c < nCols && c < len(r); c++ {
-			if v := r[c]; (phys[c] == PhysText && v.Typ == Text) || (phys[c] == PhysBlob && v.Typ == Blob) {
+			if v := r[c]; phys[c] == PhysText && v.Typ == Text {
 				heapLen += len(v.S)
+			} else if phys[c] == PhysBlob && v.Typ == Blob {
+				heapLen = segAlignBlob(heapLen) + len(v.S)
 			}
 		}
 	}
@@ -217,6 +219,11 @@ func buildSegment(cols []columnInfo, rowids []uint64, rows [][]Value) ([]byte, e
 			case phys[c] == PhysFloat64 && v.Typ == Float:
 				put(c, i, floatBits(v.F))
 			case (phys[c] == PhysText && v.Typ == Text) || (phys[c] == PhysBlob && v.Typ == Blob):
+				if phys[c] == PhysBlob {
+					for len(heap) < segAlignBlob(len(heap)) {
+						heap = append(heap, 0)
+					}
+				}
 				o := uint32(len(heap))
 				heap = append(heap, v.S...)
 				put(c, i, uint64(o)|uint64(len(v.S))<<32)
@@ -299,7 +306,7 @@ func buildSegment(cols []columnInfo, rowids []uint64, rows [][]Value) ([]byte, e
 			size += nullBytes
 		}
 	}
-	size += len(heap) + len(excBuf)
+	size = segAlign8(size) + len(heap) + len(excBuf)
 	for c := 0; c < nCols; c++ {
 		if idx[c] != nil {
 			size = segAlign8(size) + len(idx[c])
@@ -325,6 +332,9 @@ func buildSegment(cols []columnInfo, rowids []uint64, rows [][]Value) ([]byte, e
 		}
 		colDir[c].nullOff = uint32(len(out))
 		out = append(out, nulls[c]...)
+	}
+	for len(out)%8 != 0 { // the heap starts aligned, so its aligned cells are
+		out = append(out, 0)
 	}
 	heapOff := uint32(len(out))
 	out = append(out, heap...)
@@ -580,3 +590,8 @@ func (s *segment) Value(c, i int) Value {
 		return Value{Typ: Blob, S: b}
 	}
 }
+
+// segAlignBlob is where a BLOB cell starts in the heap: 4-aligned, so a vector
+// column's cells read as []float32 in place (segment_vector.go). TEXT cells
+// stay packed. The heap itself starts 8-aligned.
+func segAlignBlob(n int) int { return (n + 3) &^ 3 }

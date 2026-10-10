@@ -2100,6 +2100,20 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			segFilterDeclined.Add(1)
 
+		case OpSegVectorTopK:
+			vplan, okPlan := op.P4.(*segVectorPlan)
+			cur := m.cursors[op.P2]
+			if !okPlan || cur == nil || cur.tbl == nil || cur.pager == nil {
+				return nil, fmt.Errorf("vdbe: OpSegVectorTopK without a plan or an open cursor")
+			}
+			if rows, served := cur.pager.segVectorTopK(cur.tbl.root, vplan, cur.tbl.ipkIndex, paramAt(m.params, vplan.param)); served {
+				segFilterServed.Add(1)
+				m.segRows, m.segRow = rows[min(vplan.offset, len(rows)):], 0
+				pc = op.P3
+				continue
+			}
+			segFilterDeclined.Add(1)
+
 		case OpSegDistinct:
 			dplan, okPlan := op.P4.(*segDistinctPlan)
 			cur := m.cursors[op.P2]

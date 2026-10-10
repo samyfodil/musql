@@ -387,6 +387,12 @@ const (
 	// like OpSegOrderLimit, falling through to the loop when it declines.
 	OpSegDistinct
 
+	// OpSegVectorTopK answers "ORDER BY vector_distance_cos|l2(col, ?) LIMIT k"
+	// from a columnar table (segment_vector.go): P1 the output register base,
+	// P2 the cursor, P3 the emit loop, taken only when it serves;
+	// P4(*segVectorPlan). A guard like OpSegOrderLimit.
+	OpSegVectorTopK
+
 	// OpSegHashAgg drives a whole GROUP BY scan from a columnar table into the
 	// same hash buckets the ordinary loop fills, leaving the drain unchanged.
 	// P1: cursor. P2: jump target (the draining OpHashAggSort), taken only when

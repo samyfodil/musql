@@ -103,7 +103,7 @@ func compileSelectScanRow(p *ReadOnlyPager, stmt *SelectStmt, outer *compiler, r
 		if !segPeepholesOffForTest {
 			existsInlinePeephole(prog)
 		}
-		if !segPeepholesOffForTest && !segPeephole(prog) && !segOrderPeephole(prog) &&
+		if !segPeepholesOffForTest && !segPeephole(prog) && !segVectorPeephole(prog) && !segOrderPeephole(prog) &&
 			!segGroupPeephole(prog) && !segDistinctPeephole(prog) {
 			segProgPeephole(prog)
 		}
