@@ -106,6 +106,11 @@ func vecColumnType(decl string) (vecType, int, string) {
 	return 0, 0, "unexpected vector column type"
 }
 
+// vecCompressTypes is compress_neighbors' words.
+var vecCompressTypes = map[string]vecType{
+	"float1bit": vec1Bit, "float8": vecF8, "float16": vecF16, "floatb16": vecFB16, "float32": vecF32,
+}
+
 // vecIndexParams is libSQL's VECTOR_PARAM_NAMES: kind 0 takes one of the
 // listed words, 1 a positive integer, 2 a float.
 var vecIndexParams = []struct {
@@ -123,7 +128,7 @@ var vecIndexParams = []struct {
 }
 
 // parseVecIndexParam is parseVectorIdxParam: one "name=value" option. It
-// reports the option's name and value as matched (the word, or an integer's
+// reports the option's name and value as matched (the word, or a number's
 // text), or libSQL's message.
 func parseVecIndexParam(param string) (name, word, msg string) {
 	eq := strings.IndexByte(param, '=')
@@ -149,7 +154,7 @@ func parseVecIndexParam(param string) (name, word, msg string) {
 			if _, rc := sqliteAtoF([]byte(value)); rc <= 0 {
 				return "", "", "invalid representation of floating point vector index parameter"
 			}
-			return p.name, "", ""
+			return p.name, value, ""
 		}
 		// A value matches a word it is a prefix of, ignoring case, as
 		// sqlite3_strnicmp(word, value, len(value)) does: "metric=co" is
@@ -265,15 +270,19 @@ func vectorIndexOf(stmt *parsedCreateIndex, tbl *tableMeta) (*vecIndex, error) {
 		}
 		if name != "type" && name != "metric" {
 			if vi.approx == nil {
-				vi.approx = &vecApprox{searchL: 200, insertL: 70} // libSQL's defaults
+				vi.approx = &vecApprox{alpha: 1.2, insertL: 70, searchL: 200} // libSQL's defaults
 			}
 			switch name {
 			case "max_neighbors":
-				vi.approx.perList = int(vecAtoi(word))
+				vi.approx.maxNeighbors = int(vecAtoi(word))
 			case "search_l":
 				vi.approx.searchL = int(vecAtoi(word))
 			case "insert_l":
 				vi.approx.insertL = int(vecAtoi(word))
+			case "alpha":
+				vi.approx.alpha, _ = sqliteAtoF([]byte(word))
+			case "compress_neighbors":
+				vi.approx.compress = vecCompressTypes[word]
 			}
 		}
 	}

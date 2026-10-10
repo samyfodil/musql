@@ -249,6 +249,8 @@ func TestVectorTopKApprox(t *testing.T) {
 		{"a", "'search_l=200'", "vector_distance_cos"},
 		{"b", "'metric=l2', 'max_neighbors=100', 'search_l=100'", "vector_distance_l2"},
 		{"c", "'search_l=10'", "vector_distance_cos"},
+		{"d", "'compress_neighbors=float8', 'alpha=1.0', 'insert_l=40'", "vector_distance_cos"},
+		{"e", "'compress_neighbors=float1bit', 'max_neighbors=16'", "vector_distance_cos"},
 	} {
 		exec(fmt.Sprintf("CREATE TABLE %s(id INTEGER PRIMARY KEY, e F32_BLOB(%d))", tb.name, d))
 		var b strings.Builder

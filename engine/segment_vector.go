@@ -50,8 +50,8 @@ type segVectorPlan struct {
 	// puts a row the log changed after its segment neighbours.
 	rowidOf func(vecHit) int64
 	// skipNulls leaves NULL rows out, as vector_top_k's index does, instead of
-	// declining them; approx, when set, searches each segment's nearest lists
-	// only (segment_vector_ivf.go).
+	// declining them; approx, when set, walks each segment's DiskANN graph
+	// instead of reading every row (segment_vector_graph.go).
 	skipNulls bool
 	approx    *vecApprox
 }
@@ -353,6 +353,7 @@ func (p *ReadOnlyPager) segVectorTopK(rootPage uint32, plan *segVectorPlan, ipkC
 	// replaced by a real row's, so no kernel reads an offset that means nothing.
 	var jobs []vecJob
 	cells := make([][]uint64, len(segs))
+	nullsOf := make([][]int, len(segs))
 	for si, s := range segs {
 		var c []uint64
 		var nulls []byte
@@ -382,6 +383,7 @@ func (p *ReadOnlyPager) segVectorTopK(rootPage uint32, plan *segVectorPlan, ipkC
 		if valid < 0 {
 			continue // every row NULL: nothing to search
 		}
+		nullsOf[si] = nullRows
 		if nullRows != nil {
 			c = slices.Clone(c)
 			for _, r := range nullRows {
@@ -397,7 +399,7 @@ func (p *ReadOnlyPager) segVectorTopK(rootPage uint32, plan *segVectorPlan, ipkC
 
 	qn := vecSelfDot(query) // the query's norm, summed as the function sums it
 	all := vecTopK{p: plan, h: make([]vecHit, 0, plan.limit)}
-	if !(plan.approx != nil && vecApproxTopK(plan, segs, cells, skips, query, qn, &all)) &&
+	if !(plan.approx != nil && vecGraphTopK(plan, segs, cells, nullsOf, skips, query, qn, &all)) &&
 		!vecBoundedTopK(plan, segs, cells, skips, jobs, query, qn, &all) {
 		tops := make([]vecTopK, len(jobs))
 		if !segEachOn(vecWorkers, len(jobs), func(j int) bool {
