@@ -17,10 +17,12 @@ import (
 type vec1IdxRow struct {
 	id, bucket, first, last int64
 	val                     []byte
+	intBucket               bool // the bucket column holds an INTEGER
 }
 
 func vec1IdxRowOf(id int64, row []Value) vec1IdxRow {
 	r := vec1IdxRow{id: id, bucket: valueToInt64Trunc(vec1Col(row, 1)), first: valueToInt64Trunc(vec1Col(row, 2)), last: valueToInt64Trunc(vec1Col(row, 3))}
+	r.intBucket = vec1Col(row, 1).Typ == Int
 	if v := vec1Col(row, 4); v.Typ == Blob || v.Typ == Text {
 		r.val = v.S
 	}

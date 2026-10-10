@@ -449,7 +449,7 @@ func (w *vec1W) deleteByRowid(rowid int64) error {
 				}
 				tmp := make([]float32, w.t.tmpLen())
 				a := w.t.mod.transform(tmp, vec1Floats(vec))
-				bucket = vec1BestMatch(w.t.mod.cent, w.t.mod.nBucket(), a[:w.t.cfg.nElem], nil)
+				bucket = w.t.mod.bestBucket(a[:w.t.cfg.nElem], false)
 			}
 		}
 	}
@@ -778,15 +778,26 @@ func (w *vec1W) rebuildIndex() error {
 					tmp := make([]float32, tl)
 					n := jb.hi - jb.lo
 					bulk := n / vec1MultiNVec * vec1MultiNVec
-					for i := range n {
+					var tmps, ins [4][]float32
+					var codes [4][]byte
+					for i := range tmps {
+						tmps[i] = make([]float32, tl)
+					}
+					sc := &vec1Buf{}
+					for i := 0; i < bulk; i += 4 {
+						for j := range 4 {
+							clear(tmps[j])
+							ins[j] = vec1Floats(rows[jb.lo+i+j].raw)
+							codes[j] = jb.codes[(i+j)*nEnc : (i+j+1)*nEnc]
+						}
+						b := mod.quantizeN4(tmps, ins, codes, sc)
+						copy(jb.buckets[i:i+4], b[:])
+					}
+					for i := bulk; i < n; i++ {
 						clear(tmp)
 						v := vec1Floats(rows[jb.lo+i].raw)
 						code := jb.codes[i*nEnc : (i+1)*nEnc]
-						if i < bulk {
-							jb.buckets[i] = mod.quantizeN(tmp, v, code)
-						} else {
-							jb.buckets[i] = mod.quantize(tmp, v, code)
-						}
+						jb.buckets[i] = mod.quantize(tmp, v, code)
 					}
 				}()
 			}

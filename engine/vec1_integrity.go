@@ -112,7 +112,7 @@ func (p *ReadOnlyPager) vec1Integrity(name string, st *vec1Store) (string, error
 			a := mod.transform(tmp, vec1Floats(raw))
 			calc := 0
 			if mod.nBucket() > 0 {
-				calc = vec1BestMatch(mod.cent, mod.nBucket(), a[:nElem], nil)
+				calc = mod.bestBucket(a[:nElem], false)
 			}
 			if calc != int(int32(r.bucket)) {
 				return fmt.Sprintf("%s: vector from row %d is in wrong bucket", name, rowid), nil

@@ -204,6 +204,36 @@ type vec1Read struct {
 	scope string
 	// sqlOut is a table with no index's answer (vec1QueryToSql).
 	sqlOut *vec1Out
+	// lists holds the lists this statement has read, by bucket (-1 for all
+	// of them): a flat index's output rows read their vectors from the lists
+	// its search has just scanned, which nothing can change in between.
+	lists map[int64][]vec1IdxRow
+}
+
+// bucketLists is the shadow's bucketLists, kept for the statement.
+func (q *vec1Read) bucketLists(bucket int64) ([]vec1IdxRow, error) {
+	if l, ok := q.lists[bucket]; ok {
+		return l, nil
+	}
+	var l []vec1IdxRow
+	if all, ok := q.lists[-1]; ok {
+		for _, r := range all {
+			if r.intBucket && r.bucket == bucket {
+				l = append(l, r)
+			}
+		}
+		vec1IndexOrder(l)
+	} else {
+		var err error
+		if l, err = q.sh.bucketLists(bucket); err != nil {
+			return nil, err
+		}
+	}
+	if q.lists == nil {
+		q.lists = map[int64][]vec1IdxRow{}
+	}
+	q.lists[bucket] = l
+	return l, nil
 }
 
 // instr adds a qprofile counter's elapsed time and count.
@@ -448,8 +478,10 @@ func (q *vec1Read) findBuckets(a []float32, nProbe int) []vec1Bucket {
 	mod := q.t.mod
 	n := mod.nElem()
 	res := make([]vec1Bucket, mod.nBucket())
+	dist := make([]float64, 8*vec1T8Blocks(mod.t8().cent, n))
+	vec1T8L2D(mod.t8().cent, n, a[:n], dist)
 	for i := range res {
-		res[i] = vec1Bucket{bucket: i, dist: float32(vec1L2(a[:n], mod.centroid(i)))}
+		res[i] = vec1Bucket{bucket: i, dist: float32(dist[i])}
 	}
 	if nProbe < len(res) {
 		vec1SelectBuckets(res, nProbe)
@@ -500,15 +532,23 @@ func (q *vec1Read) doBucket(qy *vec1Query, bucket int, lut *vec1LUT) error {
 	var lists []vec1IdxRow
 	start := time.Now()
 	if bucket < 0 {
-		if err := q.sh.scan("_idx", func(id int64, row []Value) (bool, error) {
-			lists = append(lists, vec1IdxRowOf(id, row))
-			return true, nil
-		}); err != nil {
-			return err
+		if all, ok := q.lists[-1]; ok {
+			lists = all
+		} else {
+			if err := q.sh.scan("_idx", func(id int64, row []Value) (bool, error) {
+				lists = append(lists, vec1IdxRowOf(id, row))
+				return true, nil
+			}); err != nil {
+				return err
+			}
+			if q.lists == nil {
+				q.lists = map[int64][]vec1IdxRow{}
+			}
+			q.lists[-1] = lists
 		}
 	} else {
 		var err error
-		if lists, err = q.sh.bucketLists(int64(bucket)); err != nil {
+		if lists, err = q.bucketLists(int64(bucket)); err != nil {
 			return err
 		}
 	}
@@ -547,6 +587,9 @@ func (q *vec1Read) doBucket(qy *vec1Query, bucket int, lut *vec1LUT) error {
 		} else {
 			szVec := 4 * nElem
 			vec := make([]float32, nElem)
+			first := vec1ListHdr + nEntry*szRowid
+			dist := make([]float64, nEntry)
+			vec1RowDists(blob[first:first+nEntry*szVec], nEntry, nElem, qy.vector, mod.cos(), dist, vec)
 			for i := range nEntry {
 				if len(mask) > 0 && mask[i/8]&(1<<(i%8)) != 0 {
 					continue
@@ -563,15 +606,7 @@ func (q *vec1Read) doBucket(qy *vec1Query, bucket int, lut *vec1LUT) error {
 						continue
 					}
 				}
-				off := vec1ListHdr + nEntry*szRowid + i*szVec
-				vec1ReadFloats(vec, blob[off:off+szVec])
-				var d float64
-				if mod.cos() {
-					d = vec1Cos(qy.vector[:nElem], vec)
-				} else {
-					d = vec1L2(qy.vector[:nElem], vec)
-				}
-				qy.heap.insert(rowid, d)
+				qy.heap.insert(rowid, dist[i])
 			}
 		}
 		q.instr(vec1QPQScan, start)
@@ -619,43 +654,35 @@ func (q *vec1Read) metaFilters(qy *vec1Query, id int64, nEntry int, mask []byte)
 // into a distance by its norm. A block whose 16 partial sums are all past the
 // heap's admittance threshold is left early, which only skips what could not
 // be admitted.
+//
+// The sums come from vec1Scan16 for the whole list at once. Leaving a block
+// early cannot change what is admitted when the threshold is a float32 value:
+// the early test is only made for a PQ table, whose entries are sums of
+// squares, so a sum only grows and a lane past the threshold early is past it
+// at the end. A threshold no float32 equals is the exception (a final sum can
+// fall between it and its rounding), and such a block is summed as vec1 sums
+// it, early test included.
 func vec1ScanBlocked(heap *vec1Heap, mask []byte, lut []float32, nCodebook int, blob []byte, szRowid, nEntry, nNorm int, r2 float32) {
 	szBlk := vec1PQBlock * (nCodebook + nNorm)
 	early := nCodebook
 	if nNorm == 0 && !heap.streaming {
 		early = nCodebook / 4
 	}
+	first := vec1ListHdr + nEntry*szRowid
+	nBlk := (len(blob) - first) / szBlk
+	sums := make([]float32, vec1PQBlock*nBlk)
+	vec1Scan16(blob[first:], nBlk, nCodebook, nNorm, lut, sums)
 	var acc [vec1PQBlock]float32
-	blk := 0
-	for off := vec1ListHdr + nEntry*szRowid; off < len(blob); off, blk = off+szBlk, blk+1 {
-		b := blob[off : off+szBlk]
+	for blk := range nBlk {
+		b := blob[first+blk*szBlk : first+(blk+1)*szBlk]
 		rowids := blob[vec1ListHdr+blk*vec1PQBlock*szRowid:]
 		nSlot := min(vec1PQBlock, nEntry-blk*vec1PQBlock)
-		acc = [vec1PQBlock]float32{}
-		skip := false
-		for book := range nCodebook {
-			table := lut[book*vec1CodebookSize : (book+1)*vec1CodebookSize]
-			codes := b[(book+nNorm)*vec1PQBlock : (book+nNorm+1)*vec1PQBlock]
-			for j := range vec1PQBlock {
-				acc[j] += table[codes[j]]
+		if early < nCodebook && float64(float32(heap.fMin)) != heap.fMin {
+			if vec1SumBlock(&acc, heap, lut, nCodebook, b, nNorm, early) {
+				continue
 			}
-			if book >= early && book&3 == 3 {
-				any := false
-				fMin := float32(heap.fMin)
-				for j := range vec1PQBlock {
-					if acc[j] < fMin {
-						any = true
-						break
-					}
-				}
-				if !any {
-					skip = true
-					break
-				}
-			}
-		}
-		if skip {
-			continue
+		} else {
+			copy(acc[:], sums[blk*vec1PQBlock:])
 		}
 		if nNorm != 0 {
 			for j := range nSlot {
@@ -683,6 +710,33 @@ func vec1ScanBlocked(heap *vec1Heap, mask []byte, lut []float32, nCodebook int, 
 			}
 		}
 	}
+}
+
+// vec1SumBlock sums one block as vec1ScanBlocked does, codebook by codebook
+// with the early test, and reports whether the block was left early.
+func vec1SumBlock(acc *[vec1PQBlock]float32, heap *vec1Heap, lut []float32, nCodebook int, b []byte, nNorm, early int) bool {
+	*acc = [vec1PQBlock]float32{}
+	for book := range nCodebook {
+		table := lut[book*vec1CodebookSize : (book+1)*vec1CodebookSize]
+		codes := b[(book+nNorm)*vec1PQBlock : (book+nNorm+1)*vec1PQBlock]
+		for j := range vec1PQBlock {
+			acc[j] += table[codes[j]]
+		}
+		if book >= early && book&3 == 3 {
+			fMin := float32(heap.fMin)
+			past := true
+			for j := range vec1PQBlock {
+				if acc[j] < fMin {
+					past = false
+					break
+				}
+			}
+			if past {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // streamingNext is vec1StreamingNext: the rest of the heap reinserted, then
@@ -787,7 +841,7 @@ func (q *vec1Read) vector(rowid int64, base []Value) (Value, error) {
 			}
 		}
 	}
-	lists, err := q.sh.bucketLists(int64(bucket))
+	lists, err := q.bucketLists(int64(bucket))
 	if err != nil {
 		return Value{}, err
 	}

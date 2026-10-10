@@ -22,6 +22,8 @@ import (
 	"math"
 	"slices"
 	"unsafe"
+
+	"github.com/samyfodil/musql/internal/jit"
 )
 
 const (
@@ -127,6 +129,11 @@ func vec1Cos(a, b []float32) float64 {
 		as += float32(a[i] * a[i])
 		bs += float32(b[i] * b[i])
 	}
+	return vec1CosFinish(dot, as, bs)
+}
+
+// vec1CosFinish is vec1CosDist's distance from its three sums.
+func vec1CosFinish(dot, as, bs float32) float64 {
 	if as == 0 || bs == 0 {
 		return 1.0
 	}
@@ -174,13 +181,6 @@ func vec1ApplyWHT(x []float32) {
 	vec1WHTPow2(x[n-p:])
 }
 
-// vec1Rotate is vec1RotateVector: y = A x, A row-major.
-func vec1Rotate(d int, a, x, y []float32) {
-	for i := range d {
-		y[i] = vec1Dot(a[i*d:i*d+d], x)
-	}
-}
-
 // vec1Sub is vec1Sub: out = a - b.
 func vec1Sub(out, a, b []float32) {
 	for i := range out {
@@ -219,6 +219,7 @@ type vec1Model struct {
 	cent      []float32 // coarse centroids: nBucket x nElem
 	rot       []float32 // OPQ rotation: nElem x nElem, row-major
 	blob      []byte    // the stored blob, which a rebuild's model check rereads
+	t8m       vec1T8Model
 }
 
 func (m *vec1Model) bitQuant() bool { return m.hdr.flags&vec1ModelBitQuant != 0 }
@@ -321,7 +322,7 @@ func (m *vec1Model) transform(tmp, in []float32) []float32 {
 	n := m.nElem()
 	switch {
 	case m.hdr.flags&vec1ModelRotate != 0:
-		vec1Rotate(n, m.rot, in, tmp[:n])
+		m.rotate(in, tmp[:n])
 		if m.cos() {
 			vec1Normalize(tmp[:n])
 		}
@@ -349,7 +350,7 @@ func (m *vec1Model) transformN(tmp, in []float32) []float32 {
 	out := in
 	switch {
 	case m.hdr.flags&vec1ModelRotate != 0:
-		vec1Rotate(n, m.rot, in, tmp[:n])
+		m.rotate(in, tmp[:n])
 		out = tmp
 	case m.hdr.flags&vec1ModelWHT != 0:
 		copy(tmp, in[:n])
@@ -382,52 +383,34 @@ func vec1BestMatch(book []float32, nCode int, a []float32, total *float64) int {
 	return best
 }
 
-// vec1BestMatchF is the best match of the scalar vec1BestMatchN: the same
-// search, comparing each distance after rounding it to float32.
-func vec1BestMatchF(book []float32, nCode int, a []float32) (int, float32) {
-	n := len(a)
-	best, bestD := 0, float32(math.Inf(1))
-	for i := range nCode {
-		d := float32(vec1L2(a, book[i*n:i*n+n]))
-		if d < bestD {
-			best, bestD = i, d
-		}
-	}
-	return best, bestD
-}
-
 // encodePQ is vec1EncodeVectorPQ: each sub-vector's code by the float32 sums
 // the query LUT uses (vec1ModelTDist), the first of a tie winning.
 func (m *vec1Model) encodePQ(a []float32, code []byte) {
 	ne := m.nCodeElem
+	books := m.t8().book
+	buf := vec1Bufs.Get().(*vec1Buf)
 	for b := range m.nCodebook() {
-		sub := a[b*ne : b*ne+ne]
-		book := m.book[b*ne*vec1CodebookSize:]
-		bestD := float32(math.Inf(1))
-		for k := range vec1CodebookSize {
-			c := book[k*ne : k*ne+ne]
-			var acc float32
-			for d, v := range sub {
-				e := v - c[d]
-				acc += float32(e * e)
-			}
-			if acc < bestD {
-				bestD = acc
-				code[b] = byte(k)
-			}
+		var k int
+		k, buf.f = vec1BestT8F(books[b], vec1CodebookSize, ne, a[b*ne:b*ne+ne], buf.f)
+		if k >= 0 {
+			code[b] = byte(k)
 		}
 	}
+	vec1Bufs.Put(buf)
 }
 
 // encodePQN is a rebuild's PQ code (vec1EncodeVectorN): each sub-vector's
 // best match by float64 distances rounded to float32.
 func (m *vec1Model) encodePQN(a []float32, code []byte) {
 	ne := m.nCodeElem
+	books := m.t8().book
+	buf := vec1Bufs.Get().(*vec1Buf)
 	for b := range m.nCodebook() {
-		book := m.book[b*ne*vec1CodebookSize : (b+1)*ne*vec1CodebookSize]
-		k, _ := vec1BestMatchF(book, vec1CodebookSize, a[b*ne:b*ne+ne])
+		var k int
+		k, _, buf.d = vec1BestT8(books[b], vec1CodebookSize, ne, a[b*ne:b*ne+ne], true, buf.d)
 		code[b] = byte(k)
 	}
+	vec1Bufs.Put(buf)
 }
 
 // encodeBit is vec1EncodeVectorBit: the float32 norm, then a bit per
@@ -500,7 +483,7 @@ func (m *vec1Model) quantize(tmp, in []float32, code []byte) int {
 	bucket := 0
 	if m.nBucket() > 0 {
 		n := m.nElem()
-		bucket = vec1BestMatch(m.cent, m.nBucket(), a[:n], nil)
+		bucket = m.bestBucket(a[:n], false)
 		if m.nCodebook() > 0 && m.residual() {
 			vec1Sub(tmp[:n], a[:n], m.centroid(bucket))
 			a = tmp
@@ -518,7 +501,7 @@ func (m *vec1Model) quantizeN(tmp, in []float32, code []byte) int {
 	a := m.transformN(tmp, in)
 	bucket := 0
 	if m.nBucket() > 0 {
-		bucket, _ = vec1BestMatchF(m.cent, m.nBucket(), a[:n])
+		bucket = m.bestBucket(a[:n], true)
 		if m.nCodebook() > 0 && m.residual() {
 			vec1Sub(tmp[:n], a[:n], m.centroid(bucket))
 			a = tmp
@@ -534,24 +517,80 @@ func (m *vec1Model) quantizeN(tmp, in []float32, code []byte) int {
 	return bucket
 }
 
+// quantizeN4 is quantizeN for four vectors, the batch vec1QuantizeVectorN
+// takes: the bucket search goes four vectors to a pass over the centroids
+// (vec1BestT8x4). sc is the caller's scratch.
+func (m *vec1Model) quantizeN4(tmp, in [4][]float32, code [4][]byte, sc *vec1Buf) [4]int {
+	n := m.nElem()
+	var a [4][]float32
+	for i := range 4 {
+		a[i] = m.transformN(tmp[i], in[i])
+	}
+	t8 := m.t8()
+	var bucket [4]int
+	if m.nBucket() > 0 {
+		if cap(sc.f) < 4*n {
+			sc.f = make([]float32, 4*n)
+		}
+		vecs := sc.f[:4*n]
+		for i := range 4 {
+			copy(vecs[i*n:], a[i][:n])
+		}
+		sc.est = vec1BestT8x4(t8.cent, m.cent, m.nBucket(), n, vecs, true, &bucket, sc.est)
+		if m.nCodebook() > 0 && m.residual() {
+			for i := range 4 {
+				vec1Sub(tmp[i][:n], a[i][:n], m.centroid(bucket[i]))
+				a[i] = tmp[i]
+			}
+		}
+	}
+	if m.nCodebook() > 0 {
+		if m.bitQuant() {
+			for i := range 4 {
+				m.encodeBit(a[i], code[i])
+			}
+			return bucket
+		}
+		if !m.encodePQN4(a, code, sc) {
+			for i := range 4 {
+				m.encodePQN(a[i], code[i])
+			}
+		}
+	}
+	return bucket
+}
+
 // pqLUT is vec1PQLUTBuild: for each codebook, the float32 squared distance
 // from a's sub-vector to each of its 256 codes.
 func (m *vec1Model) pqLUT(a []float32, lut []float32) {
 	ne := m.nCodeElem
-	for b := range m.nCodebook() {
-		sub := a[b*ne : b*ne+ne]
-		book := m.book[b*ne*vec1CodebookSize:]
-		out := lut[b*vec1CodebookSize : (b+1)*vec1CodebookSize]
-		for k := range vec1CodebookSize {
-			c := book[k*ne : k*ne+ne]
-			var acc float32
-			for d, v := range sub {
-				e := v - c[d]
-				acc += float32(e * e)
-			}
-			out[k] = acc
-		}
+	for b, book := range m.t8().book {
+		vec1T8F(jit.Vec1L2F, book, ne, a[b*ne:b*ne+ne], lut[b*vec1CodebookSize:(b+1)*vec1CodebookSize])
 	}
+}
+
+// bestBucket is vec1PqBestMatch over the centroids, or with round the
+// scalar vec1BestMatchN's choice (each distance rounded to float32).
+func (m *vec1Model) bestBucket(a []float32, round bool) int {
+	buf := vec1Bufs.Get().(*vec1Buf)
+	var k int
+	k, _, buf.d = vec1BestT8(m.t8().cent, m.nBucket(), m.nElem(), a, round, buf.d)
+	vec1Bufs.Put(buf)
+	return k
+}
+
+// rotate is vec1Rotate by the model's rotation: out[i] is row i's float32
+// dot product with in.
+func (m *vec1Model) rotate(in, out []float32) {
+	n := m.nElem()
+	rot := m.t8().rot
+	buf := vec1Bufs.Get().(*vec1Buf)
+	if need := 8 * vec1T8Blocks(rot, n); cap(buf.f) < need {
+		buf.f = make([]float32, need)
+	}
+	vec1T8F(jit.Vec1DotF, rot, n, in, buf.f[:cap(buf.f)])
+	copy(out[:n], buf.f[:n])
+	vec1Bufs.Put(buf)
 }
 
 // bqLUT is vec1BinaryQuantLUTBuild: for each byte of a binary code, the

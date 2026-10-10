@@ -22,6 +22,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/samyfodil/musql/internal/jit"
 )
 
 const (
@@ -440,10 +442,13 @@ func (tr *vec1Trainer) train() ([]byte, error) {
 				return nil, err
 			}
 			t0 := time.Now()
+			t8 := vec1T8(cent, p.nBucket, n)
 			tr.parallel(p.nVec, func(lo, hi int) {
+				best := make([]int, hi-lo)
+				vec1Nearest(t8, p.nBucket, n, p.vecs[lo*n:hi*n], best, make([]float32, hi-lo))
 				for i := lo; i < hi; i++ {
 					v := p.vecs[i*n : i*n+n]
-					b := vec1BestMatch(cent, p.nBucket, v, nil)
+					b := best[i-lo]
 					vec1Sub(v, v, cent[b*n:b*n+n])
 				}
 			})
@@ -524,14 +529,14 @@ func (tr *vec1Trainer) kmeansInit(vecs []float32, nVec, n, k, perRound, tail int
 	nCent, nNew := 1, 1
 	for rr := 1; rr < k; rr += nNew {
 		first := nCent - nNew
+		t8 := vec1T8(out[first*n:nCent*n], nNew, n)
 		tr.parallel(nVec, func(lo, hi int) {
+			best := make([]int, hi-lo)
+			dist := make([]float32, hi-lo)
+			vec1Nearest(t8, nNew, n, vecs[lo*n:hi*n], best, dist)
 			for i := lo; i < hi; i++ {
-				v := vecs[i*n : i*n+n]
-				for c := first; c < nCent; c++ {
-					d := float32(vec1L2(v, out[c*n:c*n+n]))
-					if c == 0 || d < minD[i] {
-						minD[i] = d
-					}
+				if d := dist[i-lo]; first == 0 || d < minD[i] {
+					minD[i] = d
 				}
 			}
 		})
@@ -605,12 +610,15 @@ func (tr *vec1Trainer) lloyd(vecs []float32, nVec, n, k int, cent []float32) {
 	for iter := 0; iter < vec1KMeansIter; iter++ {
 		var mu sync.Mutex
 		var parts []*part
-		search := newVec1CentSearch(cent, k, n)
+		t8 := vec1T8(cent, k, n)
 		tr.parallel(nVec, func(lo, hi int) {
 			pt := &part{sum: make([]float32, k*n), count: make([]int, k)}
+			best := make([]int, hi-lo)
+			dist := make([]float32, hi-lo)
+			vec1Nearest(t8, k, n, vecs[lo*n:hi*n], best, dist)
 			for i := lo; i < hi; i++ {
 				v := vecs[i*n : i*n+n]
-				b, d := search.best(v)
+				b, d := best[i-lo], dist[i-lo]
 				pt.total += float64(d)
 				pt.count[b]++
 				s := pt.sum[b*n : b*n+n]
@@ -646,22 +654,6 @@ func (tr *vec1Trainer) lloyd(vecs []float32, nVec, n, k int, cent []float32) {
 		}
 		prev = total
 	}
-}
-
-// vec1CentSearch finds a vector's nearest centroid, by the squared distance
-// rounded to float32, the first of a tie winning (vec1BestMatchN).
-type vec1CentSearch struct {
-	cent []float32
-	k, n int
-	norm []float32
-}
-
-func newVec1CentSearch(cent []float32, k, n int) *vec1CentSearch {
-	return &vec1CentSearch{cent: cent, k: k, n: n}
-}
-
-func (s *vec1CentSearch) best(v []float32) (int, float32) {
-	return vec1BestMatchF(s.cent, s.k, v)
 }
 
 // trainCodebooks is vec1TrainPQCodebooks: one k-means of 256 per sub-space,
@@ -725,9 +717,12 @@ func (tr *vec1Trainer) trainRotation(book, rotation []float32) error {
 			vec1MatMulF(rotation, prev, r, n)
 		}
 		t0 = time.Now()
+		t8 := vec1T8(rotation, n, n)
 		tr.parallel(p.nVec, func(lo, hi int) {
+			buf := make([]float32, len(t8)/n)
 			for i := lo; i < hi; i++ {
-				vec1Rotate(n, rotation, p.vecs[i*n:i*n+n], rotated[i*n:i*n+n])
+				vec1T8F(jit.Vec1DotF, t8, n, p.vecs[i*n:i*n+n], buf)
+				copy(rotated[i*n:i*n+n], buf)
 			}
 		})
 		tr.times[vec1TRotVectors] += time.Since(t0)
@@ -737,6 +732,10 @@ func (tr *vec1Trainer) trainRotation(book, rotation []float32) error {
 	return nil
 }
 
+// vec1CovarBatch is how many training vectors findRotation sums in float32
+// before adding to the float64 covariance.
+const vec1CovarBatch = 32
+
 // findRotation is vec1PqFindRotation: M, the cross-covariance of the vectors
 // with their PQ codes (column-major), then R = U V^T from M's SVD.
 func (tr *vec1Trainer) findRotation(vecs, book []float32, r []float32) error {
@@ -744,6 +743,26 @@ func (tr *vec1Trainer) findRotation(vecs, book []float32, r []float32) error {
 	n, ne := p.nElem, p.nCodeElem
 	t0 := time.Now()
 	m := make([]float64, n*n)
+	// The vectors in batches of vec1CovarBatch, each batch transposed and
+	// laid out T8 (a row per component, a column per vector), so one kernel
+	// call adds a batch's contribution to a row of M: the products summed in
+	// float32 across the batch, then added to M in float64, as vec1's SIMD
+	// builds accumulate it.
+	nb := (p.nVec + vec1CovarBatch - 1) / vec1CovarBatch
+	batches := make([][]float32, nb)
+	tr.parallel(nb, func(lo, hi int) {
+		tv := make([]float32, n*vec1CovarBatch)
+		for b := lo; b < hi; b++ {
+			clear(tv)
+			for vv := range min(vec1CovarBatch, p.nVec-b*vec1CovarBatch) {
+				v := vecs[(b*vec1CovarBatch+vv)*n:]
+				for j := range n {
+					tv[j*vec1CovarBatch+vv] = v[j]
+				}
+			}
+			batches[b] = vec1T8(tv, n, vec1CovarBatch)
+		}
+	})
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, max(1, min(tr.workers, runtime.GOMAXPROCS(0))))
 	for b := range p.codesize {
@@ -755,18 +774,26 @@ func (tr *vec1Trainer) findRotation(vecs, book []float32, r []float32) error {
 			off := b * ne
 			kk := min(ne, n-off)
 			code := book[off*vec1CodebookSize : (off+ne)*vec1CodebookSize]
-			sub := make([]float32, ne)
+			t8 := vec1T8(code, vec1CodebookSize, ne)
+			subs := make([]float32, p.nVec*ne)
 			for i := range p.nVec {
-				v := vecs[i*n : i*n+n]
-				clear(sub)
-				copy(sub, v[off:off+kk])
-				best := vec1BestMatch(code, vec1CodebookSize, sub, nil)
-				hat := code[best*ne : best*ne+ne]
+				copy(subs[i*ne:i*ne+kk], vecs[i*n+off:i*n+off+kk])
+			}
+			bests := make([]int, p.nVec)
+			vec1Nearest(t8, vec1CodebookSize, ne, subs, bests, make([]float32, p.nVec))
+			q := make([]float32, vec1CovarBatch)
+			sums := make([]float32, len(batches[0])/vec1CovarBatch)
+			for bt, tv := range batches {
+				nIn := min(vec1CovarBatch, p.nVec-bt*vec1CovarBatch)
 				for k := range kk {
+					clear(q)
+					for vv := range nIn {
+						q[vv] = code[bests[bt*vec1CovarBatch+vv]*ne+k]
+					}
+					vec1T8F(jit.Vec1DotF, tv, vec1CovarBatch, q, sums)
 					col := m[(k+off)*n : (k+off)*n+n]
-					h := float64(hat[k])
-					for j, x := range v {
-						col[j] += float64(h * float64(x))
+					for j := range col {
+						col[j] += float64(sums[j])
 					}
 				}
 			}
