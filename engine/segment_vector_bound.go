@@ -213,11 +213,10 @@ func (vq *vecQuery) boundsDot(side *segVecSide, r int, dot int32) (lo, hi float3
 		r2lo, r2hi = max(r2lo-r2slack, 0), r2hi+r2slack
 		flo := max(r2lo*(1-vq.gamma)-vq.absErr, 0)
 		fhi := r2hi*(1+vq.gamma) + vq.absErr
-		hi = float32(math.Inf(1))
-		if fhi <= math.MaxFloat32 {
-			hi = float32(math.Sqrt(float64(roundUp32(fhi))))
+		if fhi > math.MaxFloat32 {
+			return widenLo(math.Sqrt(flo)), float32(math.Inf(1)), true
 		}
-		return float32(math.Sqrt(float64(roundDown32(flo)))), hi, true
+		return widenLo(math.Sqrt(flo)), widenHi(math.Sqrt(fhi)), true
 	}
 	// Cosine: only the float32 dot product is unknown. The loop's error in it
 	// is at most gamma * sum|x_i q_i| <= gamma * ||x|| ||q||.
@@ -232,12 +231,17 @@ func (vq *vecQuery) boundsDot(side *segVecSide, r int, dot int32) (lo, hi float3
 	}
 	// cosine() is non-increasing in the dot product: every step of it is
 	// monotone, the division being by a positive denominator.
-	lo, hi = cosine(roundUp32(dhi), n1, vq.qn), cosine(roundDown32(dlo), n1, vq.qn)
-	if lo != lo || hi != hi {
-		return 0, 0, false
-	}
-	return lo, hi, true
+	return widenLo(1 - dhi/denom), widenHi(1 - dlo/denom), true
 }
+
+// widenLo and widenHi turn a float64 evaluation of a distance formula at a
+// bound into a float32 bound on what the formula gives in float32. The float32
+// result differs from the real value by at most half a float32 ulp (2^-24
+// relative) and the float64 steps by about 2^-52 -- ABSOLUTE for the cosine,
+// whose 1 - dot/denom cancels near 0, where a relative margin would vanish.
+// 2^-20 relative plus 2^-48 absolute covers both with room.
+func widenLo(x float64) float32 { return float32(x - math.Abs(x)*0x1p-20 - 0x1p-48) }
+func widenHi(x float64) float32 { return float32(x + math.Abs(x)*0x1p-20 + 0x1p-48) }
 
 // vecJob is a run of one segment's rows that one worker takes.
 type vecJob struct{ seg, lo, hi int }
