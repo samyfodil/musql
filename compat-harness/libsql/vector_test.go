@@ -133,7 +133,7 @@ func TestVectorFunctions(t *testing.T) {
 		if undefinedInLibSQL(q) {
 			continue
 		}
-		if got, want := answer(m, q), answer(l, q); got != want {
+		if got, want := answer(m, q), answer(l, q); trimUnterminated(got) != trimUnterminated(want) {
 			diffs++
 			if diffs <= 40 {
 				t.Errorf("%s\n musql:  %s\n libsql: %s", q, got, want)
@@ -141,6 +141,17 @@ func TestVectorFunctions(t *testing.T) {
 		}
 	}
 	t.Logf("%d statements, %d differ", len(qs), diffs)
+}
+
+// trimUnterminated cuts libSQL's over-long-number error after the 1024
+// characters it quotes: it prints them from a buffer with no terminator, so
+// what follows is whatever memory held, different from run to run.
+func trimUnterminated(s string) string {
+	const head = "error: vector: float string length exceeded 1024 characters: '"
+	if strings.HasPrefix(s, head) && len(s) > len(head)+1024 {
+		return s[:len(head)+1024]
+	}
+	return s
 }
 
 func randVec(r *rand.Rand, n int) string {
