@@ -97,6 +97,11 @@ jobs:
         run: |
           sh build.sh
           node test.mjs
+      - name: studio builds
+        working-directory: studio
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
   libp2p:
     name: libp2p example (nested module)
     runs-on: ubuntu-latest
