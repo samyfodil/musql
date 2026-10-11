@@ -534,73 +534,76 @@ func (m *vec1Model) quantizeN(tmp, in []float32, code []byte) int {
 	return bucket
 }
 
-// quantizeN4 is quantizeN for four vectors, the batch vec1QuantizeVectorN
-// takes: each search goes four vectors to a pass over the centroids or a
-// codebook (vec1Best4). sc is the caller's scratch.
-func (m *vec1Model) quantizeN4(tmp, in [4][]float32, code [4][]byte, sc *vec1Buf) [4]int {
+// quantizeMany is quantizeN for a batch of vectors (a multiple of four),
+// as a rebuild's jobs take them: the bucket search goes over the centroids
+// once for many vectors (vec1BestMany), each codebook four vectors at a time
+// (vec1Best4). tmp[i] is vector i's scratch, tmpLen long; buckets receives
+// the buckets. sc is the caller's scratch.
+func (m *vec1Model) quantizeMany(tmp, in [][]float32, code [][]byte, buckets []int, sc *vec1Buf) {
 	n := m.nElem()
-	var a [4][]float32
-	for i := range 4 {
+	cnt := len(in)
+	a := make([][]float32, cnt)
+	for i := range cnt {
 		a[i] = m.transformN(tmp[i], in[i])
 	}
 	t8 := m.t8()
-	var bucket [4]int
 	if m.nBucket() > 0 {
-		if cap(sc.v) < 4*n {
-			sc.v = make([]float32, 4*n)
+		if cap(sc.pack) < cnt*n {
+			sc.pack = make([]float32, cnt*n)
 		}
-		vecs := sc.v[:4*n]
-		for i := range 4 {
+		vecs := sc.pack[:cnt*n]
+		for i := range cnt {
 			copy(vecs[i*n:], a[i][:n])
 		}
-		var b [4]int
-		if vec1Best4(t8.centN, m.cent, 1, m.nBucket(), n, vecs, n, true, sc, b[:]) {
-			bucket = b
-		} else {
-			for i := range 4 {
-				bucket[i] = m.bestBucket(a[i][:n], true)
+		if !vec1BestMany(t8.centN, m.cent, m.nBucket(), n, vecs, true, true, sc, buckets, nil) {
+			for i := range cnt {
+				buckets[i] = m.bestBucket(a[i][:n], true)
 			}
 		}
 		if m.nCodebook() > 0 && m.residual() {
-			for i := range 4 {
-				vec1Sub(tmp[i][:n], a[i][:n], m.centroid(bucket[i]))
+			for i := range cnt {
+				vec1Sub(tmp[i][:n], a[i][:n], m.centroid(buckets[i]))
 				a[i] = tmp[i]
 			}
 		}
+	} else {
+		clear(buckets)
 	}
-	if m.nCodebook() > 0 {
-		if m.bitQuant() {
-			for i := range 4 {
-				m.encodeBit(a[i], code[i])
-			}
-			return bucket
+	if m.nCodebook() == 0 {
+		return
+	}
+	if m.bitQuant() {
+		for i := range cnt {
+			m.encodeBit(a[i], code[i])
 		}
-		ne, nb := m.nCodeElem, m.nCodebook()
-		w := ne * nb
-		if cap(sc.v) < 4*w {
-			sc.v = make([]float32, 4*w)
-		}
-		vecs := sc.v[:4*w]
+		return
+	}
+	ne, nb := m.nCodeElem, m.nCodebook()
+	w := ne * nb
+	if cap(sc.pack) < 4*w {
+		sc.pack = make([]float32, 4*w)
+	}
+	vecs := sc.pack[:4*w]
+	if cap(sc.best) < 4*nb {
+		sc.best = make([]int, 4*nb)
+	}
+	codes := sc.best[:4*nb]
+	for g := 0; g < cnt; g += 4 {
 		for i := range 4 {
-			copy(vecs[i*w:i*w+w], a[i][:w])
+			copy(vecs[i*w:i*w+w], a[g+i][:w])
 		}
-		if cap(sc.best) < 4*nb {
-			sc.best = make([]int, 4*nb)
-		}
-		codes := sc.best[:4*nb]
 		if vec1Best4(t8.booksN, m.book, nb, vec1CodebookSize, ne, vecs, w, true, sc, codes) {
 			for b := range nb {
 				for i := range 4 {
-					code[i][b] = byte(codes[4*b+i])
+					code[g+i][b] = byte(codes[4*b+i])
 				}
 			}
 		} else {
 			for i := range 4 {
-				m.encodePQN(a[i], code[i])
+				m.encodePQN(a[g+i], code[g+i])
 			}
 		}
 	}
-	return bucket
 }
 
 // pqLUT is vec1PQLUTBuild: for each codebook, the float32 squared distance

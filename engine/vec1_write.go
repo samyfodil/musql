@@ -778,21 +778,16 @@ func (w *vec1W) rebuildIndex() error {
 					tmp := make([]float32, tl)
 					n := jb.hi - jb.lo
 					bulk := n / vec1MultiNVec * vec1MultiNVec
-					var tmps, ins [4][]float32
-					var codes [4][]byte
-					for i := range tmps {
-						tmps[i] = make([]float32, tl)
+					tmps := make([][]float32, bulk)
+					ins := make([][]float32, bulk)
+					codes := make([][]byte, bulk)
+					tbuf := make([]float32, bulk*tl)
+					for i := range bulk {
+						tmps[i] = tbuf[i*tl : (i+1)*tl : (i+1)*tl]
+						ins[i] = vec1Floats(rows[jb.lo+i].raw)
+						codes[i] = jb.codes[i*nEnc : (i+1)*nEnc]
 					}
-					sc := &vec1Buf{}
-					for i := 0; i < bulk; i += 4 {
-						for j := range 4 {
-							clear(tmps[j])
-							ins[j] = vec1Floats(rows[jb.lo+i+j].raw)
-							codes[j] = jb.codes[(i+j)*nEnc : (i+j+1)*nEnc]
-						}
-						b := mod.quantizeN4(tmps, ins, codes, sc)
-						copy(jb.buckets[i:i+4], b[:])
-					}
+					mod.quantizeMany(tmps, ins, codes, jb.buckets[:bulk], &vec1Buf{})
 					for i := bulk; i < n; i++ {
 						clear(tmp)
 						v := vec1Floats(rows[jb.lo+i].raw)

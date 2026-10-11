@@ -738,3 +738,209 @@ func (a *Asm) VblendpsYmm(dst, src1, src2 Reg, imm byte) {
 	a.vinst(0x0C, dst, src1, src2, vexMap0F3A, 0, 1, vexP66, false)
 	a.emit(imm)
 }
+
+// EmitVec1CandMany is EmitVec1Cand for one set of rows and many vectors: G
+// groups of four, every group's estimates computed a pair of blocks at a
+// time with the pair outermost, so a pair of blocks (two blocks of rows, a
+// few KiB) is read from memory once for all the groups rather than once for
+// each. A set of rows larger than the caches (the centroids of a big index)
+// is otherwise streamed through them once for every four vectors.
+//
+// Args: A the set (B blocks, B even), N the groups G (at least 1), XA the
+// dimensions, V the first vector, the vectors back to back at XC bytes each,
+// C scratch: B as an int64, eight float32 F at byte 32, eight float32 -2 at
+// byte 64; from byte 128 the groups' running minima (128 bytes each), then
+// their A (eight float32 for each of four vectors, 128 bytes a group), then
+// the estimates, 256 bytes per pair of blocks and group; Out per group the
+// four vectors' lo and bit sets, as EmitVec1Cand writes them.
+func EmitVec1CandMany() ([]byte, error) {
+	if !cpuHasAVX2() {
+		return nil, fmt.Errorf("jit: AVX2 not available on this machine")
+	}
+	a := NewAsm()
+	a.MovRegMem(RAX, RDI, OffC)
+	a.VmovdquLoadD(12, RAX, 64) // -2
+	a.MovRegMem(RDX, RDI, OffXC)
+	a.MovRegMem(R11, RDI, OffXA) // a block's bytes: (XA+1) * 32
+	a.IncReg(R11)
+	for range 5 {
+		a.AddRegReg(R11, R11)
+	}
+	a.MovRegReg(RBX, RDX) // three strides
+	a.AddRegReg(RBX, RDX)
+	a.AddRegReg(RBX, RDX)
+
+	// Every group's minima start at +Inf.
+	a.VpcmpeqdYmm(8, 8, 8)
+	a.VpsrldYmm(8, 8, 24)
+	a.VpslldYmm(8, 8, 23)
+	a.MovRegMem(R10, RDI, OffC)
+	a.AddRegImm8(R10, 127)
+	a.AddRegImm8(R10, 1)
+	a.MovRegMem(R9, RDI, OffN)
+	a.Label("init")
+	for vv := Reg(0); vv < 4; vv++ {
+		a.VmovupsStore(R10, int8(32*vv), 8)
+	}
+	a.AddRegImm8(R10, 127)
+	a.AddRegImm8(R10, 1)
+	a.DecReg(R9)
+	a.Jcc(CondNE, "init")
+	// R10 is past the minima, at the A; the estimates follow those.
+	a.MovRegMem(R13, RDI, OffN)
+	for range 7 {
+		a.AddRegReg(R13, R13)
+	}
+	a.AddRegReg(R13, R10)
+
+	a.MovRegMem(RSI, RDI, OffA)
+	a.MovRegReg(R8, RSI)
+	a.AddRegReg(R8, R11)
+	a.MovRegMem(RCX, RDI, OffC)
+	a.MovRegMem(RCX, RCX, 0) // B, then the pairs of blocks
+	a.ShrRegImm8(RCX, 1)
+
+	a.Label("pair")
+	a.MovRegMem(R15, RDI, OffV)
+	a.MovRegMem(R10, RDI, OffC)
+	a.AddRegImm8(R10, 127)
+	a.AddRegImm8(R10, 1) // group 0's minima
+	a.MovRegMem(R9, RDI, OffN)
+
+	a.Label("group")
+	for r := Reg(0); r < 8; r++ {
+		a.VxorpsYmm(r, r, r)
+	}
+	a.MovRegReg(RAX, R15)
+	a.MovRegMem(R12, RDI, OffXA)
+	a.Label("comp")
+	a.VmovdquLoad(13, RSI)
+	a.VmovdquLoadD(14, R8, 0)
+	for vv := Reg(0); vv < 4; vv++ {
+		switch vv {
+		case 0:
+			a.VbroadcastssMem(15, RAX)
+		case 1:
+			a.vbroadcastssSIB(15, RAX, RDX, 0)
+		case 2:
+			a.vbroadcastssSIB(15, RAX, RDX, 1)
+		case 3:
+			a.vbroadcastssSIB(15, RAX, RBX, 0)
+		}
+		a.fmaPs(vv, 13, 15)
+		a.fmaPs(4+vv, 14, 15)
+	}
+	a.AddRegImm8(RSI, 32)
+	a.AddRegImm8(R8, 32)
+	a.AddRegImm8(RAX, 4)
+	a.DecReg(R12)
+	a.Jcc(CondNE, "comp")
+
+	a.VmovdquLoad(13, RSI) // the rows' squared norms
+	a.VmovdquLoadD(14, R8, 0)
+	for _, p := range []Reg{RSI, R8} { // back to the blocks' first component
+		a.SubRegReg(p, R11)
+		a.AddRegImm8(p, 32)
+	}
+	for vv := Reg(0); vv < 4; vv++ {
+		a.VmulpsYmm(vv, vv, 12) // exact: a power of two
+		a.VaddpsYmm(vv, vv, 13)
+		a.VmulpsYmm(4+vv, 4+vv, 12)
+		a.VaddpsYmm(4+vv, 4+vv, 14)
+	}
+	for blk := Reg(0); blk < 2; blk++ {
+		for vv := Reg(0); vv < 4; vv++ {
+			a.VmovupsStore(R13, int8(32*vv), 4*blk+vv)
+		}
+		a.AddRegImm8(R13, 127)
+		a.AddRegImm8(R13, 1)
+	}
+	for vv := Reg(0); vv < 4; vv++ {
+		a.VmovdquLoadD(8+vv, R10, int8(32*vv))
+		a.VminpsYmm(8+vv, vv, 8+vv) // a NaN estimate leaves the minimum be
+		a.VminpsYmm(8+vv, 4+vv, 8+vv)
+		a.VmovupsStore(R10, int8(32*vv), 8+vv)
+	}
+	a.AddRegImm8(R10, 127)
+	a.AddRegImm8(R10, 1)
+	a.AddRegReg(R15, RBX) // the next group's vectors
+	a.AddRegReg(R15, RDX)
+	a.DecReg(R9)
+	a.Jcc(CondNE, "group")
+
+	a.AddRegReg(RSI, R11) // the next pair of blocks
+	a.AddRegReg(RSI, R11)
+	a.MovRegReg(R8, RSI)
+	a.AddRegReg(R8, R11)
+	a.DecReg(RCX)
+	a.Jcc(CondNE, "pair")
+
+	// Per group: each minimum across its lanes, stored as lo, the bound, and
+	// the bit sets. R10 the group's minima, R15 its A, R13 its estimates in
+	// the first pair, RDX the stride from pair to pair (G * 256), RBX out.
+	a.MovRegMem(R10, RDI, OffC)
+	a.MovRegReg(RAX, R10)
+	a.VmovdquLoadD(14, RAX, 32) // F
+	a.AddRegImm8(R10, 127)
+	a.AddRegImm8(R10, 1)
+	a.MovRegMem(RDX, RDI, OffN)
+	for range 7 {
+		a.AddRegReg(RDX, RDX)
+	}
+	a.MovRegReg(R15, R10)
+	a.AddRegReg(R15, RDX) // the A
+	a.MovRegReg(R13, R15)
+	a.AddRegReg(R13, RDX) // the estimates
+	a.AddRegReg(RDX, RDX)
+	a.MovRegMem(RBX, RDI, OffOut)
+	a.MovRegMem(R9, RDI, OffN)
+
+	a.Label("final")
+	for vv := Reg(0); vv < 4; vv++ {
+		m := 8 + vv
+		a.VmovdquLoadD(m, R10, int8(32*vv))
+		a.Vperm2f128(13, m, m, 0x01)
+		a.VminpsYmm(m, 13, m)
+		a.VpermilpsYmm(13, m, 0x4E)
+		a.VminpsYmm(m, 13, m)
+		a.VpermilpsYmm(13, m, 0xB1)
+		a.VminpsYmm(m, 13, m)
+		a.VmovssStore(RBX, int8(4*vv), m)
+		a.VmovdquLoadD(13, R15, int8(32*vv))
+		a.VaddpsYmm(m, m, 13)
+		a.VmulpsYmm(m, m, 14)
+	}
+	a.AddRegImm8(RBX, 16)
+	for vv := Reg(0); vv < 4; vv++ {
+		a.MovRegReg(R11, R13) // at the pair's second block: both in disp8 reach
+		a.AddRegImm8(R11, int8(32*vv))
+		a.AddRegImm8(R11, 127)
+		a.AddRegImm8(R11, 1)
+		a.MovRegMem(RCX, RDI, OffC)
+		a.MovRegMem(RCX, RCX, 0)
+		a.ShrRegImm8(RCX, 1)
+		a.Label(fmt.Sprintf("masks%d", vv))
+		for blk := 0; blk < 2; blk++ {
+			a.VmovdquLoadD(13, R11, int8(128*blk-128))
+			a.VcmplepsYmm(13, 13, 8+vv)
+			a.VmovmskpsYmm(RAX, 13)
+			a.MovMemByteAL(RBX, int8(blk))
+		}
+		a.AddRegImm8(RBX, 2)
+		a.AddRegReg(R11, RDX)
+		a.DecReg(RCX)
+		a.Jcc(CondNE, fmt.Sprintf("masks%d", vv))
+	}
+	a.AddRegImm8(R10, 127) // the next group
+	a.AddRegImm8(R10, 1)
+	a.AddRegImm8(R15, 127)
+	a.AddRegImm8(R15, 1)
+	a.MovRegImm64(RAX, 256)
+	a.AddRegReg(R13, RAX)
+	a.DecReg(R9)
+	a.Jcc(CondNE, "final")
+
+	a.Vzeroupper()
+	a.Ret()
+	return a.Code()
+}

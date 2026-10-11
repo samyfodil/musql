@@ -230,8 +230,8 @@ func TestVec1KernelsMatchGo(t *testing.T) {
 			}
 		}
 		for range 100 {
-			var a, tmp [4][]float32
-			var got, want [4][]byte
+			a, tmp := make([][]float32, 4), make([][]float32, 4)
+			got, want := make([][]byte, 4), make([][]byte, 4)
 			for i := range 4 {
 				a[i] = make([]float32, nb*ne)
 				for j := range a[i] {
@@ -241,10 +241,48 @@ func TestVec1KernelsMatchGo(t *testing.T) {
 				got[i], want[i] = make([]byte, nb), make([]byte, nb)
 				mod.encodePQN(a[i], want[i])
 			}
-			mod.quantizeN4(tmp, a, got, &vec1Buf{})
+			mod.quantizeMany(tmp, a, got, make([]int, 4), &vec1Buf{})
 			for i := range 4 {
 				if !slices.Equal(got[i], want[i]) {
-					t.Fatalf("quantizeN4 ne=%d vec %d: %v, want %v", ne, i, got[i], want[i])
+					t.Fatalf("quantizeMany ne=%d vec %d: %v, want %v", ne, i, got[i], want[i])
+				}
+			}
+		}
+	}
+	// Many vectors over one set, exactly and as training searches: against
+	// one vector at a time.
+	for _, n := range []int{8, 384} {
+		for _, m := range []int{9, 316} {
+			rows := make([]float32, m*n)
+			for i := range rows {
+				rows[i] = float32(r.IntN(3))
+			}
+			for _, nv := range []int{1, 5, 64, 70, 200} {
+				vecs := make([]float32, nv*n)
+				for i := range vecs {
+					vecs[i] = float32(r.IntN(3))
+				}
+				tn := vec1MakeT8N(rows, 1, m, n)
+				for _, exact := range []bool{true, false} {
+					best := make([]int, nv)
+					dist := make([]float32, nv)
+					if !vec1BestMany(tn, rows, m, n, vecs, exact, true, &vec1Buf{}, best, dist) {
+						break
+					}
+					for i := range nv {
+						q := vecs[i*n : i*n+n]
+						want := vec1BestRows(rows, m, n, q, true)
+						if !exact {
+							var wd float32
+							want, wd = vec1NearestGo(rows, m, n, q)
+							if dist[i] != wd {
+								t.Fatalf("many n=%d m=%d nv=%d vec %d: distance %v, want %v", n, m, nv, i, dist[i], wd)
+							}
+						}
+						if best[i] != want {
+							t.Fatalf("many n=%d m=%d nv=%d exact=%v vec %d: row %d, want %d", n, m, nv, exact, i, best[i], want)
+						}
+					}
 				}
 			}
 		}
