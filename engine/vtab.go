@@ -801,6 +801,11 @@ func flipVtabOp(op VtabOp) VtabOp {
 // text for validation and for the read path (createdVtabDef re-parses the
 // stored text rather than reading these).
 type vtabMeta struct {
+	// colInfos is vtabColumnInfos of the store's columns, kept with the slice
+	// it was built from (colInfosOf): an INSERT statement built it per row.
+	colInfos   []columnInfo
+	colInfosOf []VtabColumn
+
 	// schemaSeq is this object's CREATION rank within its database: the order
 	// its sqlite_schema row must appear in, which C SQLite gives by simply
 	// appending each new object's row to the catalog b-tree. materialize
