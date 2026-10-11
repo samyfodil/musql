@@ -84,6 +84,50 @@ func (s *rowStore) eqRowids(col int, v int64) ([]uint64, bool) {
 	return out, true
 }
 
+// segEqRowids is a write's equality candidates for col = v on a store over
+// segments, ascending: the committed rows the segments' own column index
+// names (and the delta's, which segIndexRowids cannot see), less those this
+// store has written over or deleted, plus every row it has written whose
+// column could equal v. A superset -- the WHERE is tested again on each row
+// -- so a value the index cannot judge is a candidate rather than a refusal.
+//
+// It is what keeps a held connection's writes off eqIndexFor's walk: that
+// builds an index of the whole table from rows read back one by one, and a
+// compaction -- which rebases the store -- threw it away, so the UPDATE after
+// every compaction paid the walk again.
+func (s *rowStore) segEqRowids(col int, v int64) ([]uint64, bool) {
+	if s == nil || s.seg == nil || s.spill != nil || s.seg.rp == nil || s.seg.rp.segs == nil {
+		return nil, false
+	}
+	base := s.seg.rp.segs
+	segs, ok := base.byRoot[s.seg.root]
+	if !ok {
+		return nil, false
+	}
+	hits, ok := segIndexRowids(segs, col, Value{Typ: Int, I: v})
+	if !ok {
+		return nil, false
+	}
+	hits = base.withDeltaRowids(s.seg.root, hits)
+	out := make([]uint64, 0, len(hits))
+	if !s.baseGone {
+		for _, r := range hits {
+			rid := uint64(r)
+			if _, over := s.m[rid]; over || s.gone[rid] {
+				continue
+			}
+			out = append(out, rid)
+		}
+	}
+	for rid, vals := range s.m {
+		if col >= len(vals) || vals[col].Typ != Int || vals[col].I == v {
+			out = append(out, rid)
+		}
+	}
+	radixSortRowids(out)
+	return slices.Compact(out), true
+}
+
 // eqIndexFor builds col's index on first use and caches it.
 func (s *rowStore) eqIndexFor(col int) (*rsEqIndex, bool) {
 	if s.eqIdx != nil {

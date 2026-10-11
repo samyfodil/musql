@@ -219,6 +219,17 @@ func (b *segRows) walkRowids(yield func(uint64) bool) {
 }
 
 // segGet is get over the overlay and the base.
+// segHas is whether segGet would find rid, without reading the row.
+func (s *rowStore) segHas(rid uint64) bool {
+	if _, ok := s.m[rid]; ok {
+		return true
+	}
+	if s.baseGone || s.gone[rid] {
+		return false
+	}
+	return s.seg.has(rid)
+}
+
 func (s *rowStore) segGet(rid uint64) ([]Value, bool) {
 	if vals, ok := s.m[rid]; ok {
 		return s.resolve(vals), true

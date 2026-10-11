@@ -129,9 +129,16 @@ func (s *rowStore) put(rowid uint64, vals []Value) {
 	var old []Value
 	haveOld := false
 	if s.seg != nil {
-		// The old row is the MERGED view's, and it is always needed: the
-		// visible count moves only when the rowid was not already a row.
-		old, haveOld = s.segGet(rowid)
+		// The MERGED view's old row, or only whether there is one: the
+		// visible count moves only when the rowid was not already a row, and
+		// the row itself is wanted only by an index or the undo log kept
+		// here. Reading it back regardless was a second fetch of every row an
+		// UPDATE writes, the first being the cursor's own.
+		if len(s.eqIdx) > 0 || len(s.uqIdx) > 0 || s.logging {
+			old, haveOld = s.segGet(rowid)
+		} else {
+			haveOld = s.segHas(rowid)
+		}
 		if !haveOld {
 			s.sorted, s.sortedValid = nil, false
 			if s.nKnown {

@@ -491,7 +491,11 @@ func (cur *vdbeCursor) rewind() error {
 			// It refuses a column holding anything but integers and NULLs, and
 			// only an integer probe can use it; either falls to the walk.
 			if cur.idxSeekConfigured && !tbl.withoutRowid && tbl.rows != nil && cur.idxSeekProbe.Typ == Int {
-				if hits, ok := tbl.rows.eqRowids(cur.idxSeekCol, cur.idxSeekProbe.I); ok {
+				hits, ok := tbl.rows.segEqRowids(cur.idxSeekCol, cur.idxSeekProbe.I)
+				if !ok {
+					hits, ok = tbl.rows.eqRowids(cur.idxSeekCol, cur.idxSeekProbe.I)
+				}
+				if ok {
 					writeIndexSeeksServed.Add(1)
 					cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
 					for _, rid := range hits {
