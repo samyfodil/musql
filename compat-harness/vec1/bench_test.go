@@ -189,7 +189,7 @@ func TestVec1Bench(t *testing.T) {
 			}
 			db.SetMaxOpenConns(1)
 			mustExec(t, db, fmt.Sprintf("SELECT vec1_config('nthread', %d)", threads))
-			params :=fmt.Sprintf(`{k:%d`, c.k)
+			params := fmt.Sprintf(`{k:%d`, c.k)
 			if c.nprobe > 0 {
 				params += fmt.Sprintf(`, nprobe:%g`, c.nprobe)
 			}
