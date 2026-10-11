@@ -152,8 +152,11 @@ func TestVec1KernelsMatchGo(t *testing.T) {
 						}
 					}
 					var four [4]int
-					vec1BestT8x4(vec1T8(rows, m, n), rows, m, n, vecs, round, &four, nil)
+					ok := vec1Best4(vec1MakeT8N(rows, 1, m, n), rows, 1, m, n, vecs, n, round, &vec1Buf{}, four[:])
 					for vv := range 4 {
+						if !ok {
+							break // no kernel here
+						}
 						if w, _, _ := vec1BestT8(vec1T8(rows, m, n), m, n, vecs[vv*n:vv*n+n], round, nil); four[vv] != w {
 							t.Fatalf("best4 n=%d m=%d round=%v vec %d: row %d, want %d", n, m, round, vv, four[vv], w)
 						}
@@ -198,8 +201,11 @@ func TestVec1KernelsMatchGo(t *testing.T) {
 			}
 			for _, round := range []bool{false, true} {
 				var four [4]int
-				vec1BestT8x4(t8, rows, m, n, vecs, round, &four, nil)
+				ok := vec1Best4(vec1MakeT8N(rows, 1, m, n), rows, 1, m, n, vecs, n, round, &vec1Buf{}, four[:])
 				for vv := range 4 {
+					if !ok {
+						break
+					}
 					if w, _, _ := vec1BestT8(t8, m, n, vecs[vv*n:vv*n+n], round, nil); four[vv] != w {
 						t.Fatalf("near best4 n=%d round=%v vec %d: row %d, want %d", n, round, vv, four[vv], w)
 					}
@@ -224,22 +230,21 @@ func TestVec1KernelsMatchGo(t *testing.T) {
 			}
 		}
 		for range 100 {
-			var a [4][]float32
+			var a, tmp [4][]float32
 			var got, want [4][]byte
 			for i := range 4 {
 				a[i] = make([]float32, nb*ne)
 				for j := range a[i] {
 					a[i][j] = base[j%ne] + float32(r.NormFloat64()*1e-3)
 				}
+				tmp[i] = make([]float32, nb*ne)
 				got[i], want[i] = make([]byte, nb), make([]byte, nb)
 				mod.encodePQN(a[i], want[i])
 			}
-			if !mod.encodePQN4(a, got, &vec1Buf{}) {
-				break
-			}
+			mod.quantizeN4(tmp, a, got, &vec1Buf{})
 			for i := range 4 {
 				if !slices.Equal(got[i], want[i]) {
-					t.Fatalf("encodePQN4 ne=%d vec %d: %v, want %v", ne, i, got[i], want[i])
+					t.Fatalf("quantizeN4 ne=%d vec %d: %v, want %v", ne, i, got[i], want[i])
 				}
 			}
 		}
@@ -259,7 +264,7 @@ func TestVec1KernelsMatchGo(t *testing.T) {
 				}
 				best := make([]int, nVec)
 				dist := make([]float32, nVec)
-				vec1Nearest(vec1T8(rows, m, n), m, n, vecs, best, dist)
+				vec1Nearest(vec1MakeT8N(rows, 1, m, n), rows, m, n, vecs, best, dist)
 				for i := range nVec {
 					wb, wd := 0, float32(math.Inf(1))
 					for j := range m {

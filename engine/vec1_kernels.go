@@ -19,13 +19,13 @@ import (
 )
 
 // vec1T8 lays m rows of n float32s out in blocks of eight: block b holds
-// component d of rows 8b..8b+7 at [b*8*n + 8*d + lane]. The blocks are an
-// even number, the kernels' unit; rows past m are +Inf, so no search can
-// choose one.
+// component d of rows 8b..8b+7 at [b*8*n + 8*d + lane]. The blocks are a
+// multiple of four, the kernels' unit; rows past m are +Inf, so no search
+// can choose one.
 func vec1T8(rows []float32, m, n int) []float32 {
-	nBlk := (m + 15) / 16 * 2
+	nBlk := (m + 31) / 32 * 4
 	out := make([]float32, nBlk*8*n)
-	for i := m * n; i < len(out); i++ {
+	for i := range out {
 		out[i] = float32(math.Inf(1))
 	}
 	for r := range m {
@@ -50,7 +50,7 @@ func vec1T8F(op jit.Vec1Op, t []float32, n int, q []float32, out []float32) {
 			A:   unsafe.Pointer(unsafe.SliceData(t)),
 			XC:  int64(32 * n),
 			V:   unsafe.Pointer(unsafe.SliceData(q)),
-			N:   int64(nBlk / 2),
+			N:   int64(nBlk / 4),
 			XA:  int64(n),
 			Out: unsafe.Pointer(unsafe.SliceData(out)),
 		}
@@ -214,27 +214,22 @@ func vec1RowsKernel() *jit.Code {
 }
 
 // vec1Nearest is training's nearest-row search: for each vector (rows of n
-// in vecs), the first of the m rows of T8 layout t nearest it by the float32
-// sum of squared differences, and that distance. vec1's training is
-// randomized and its builds differ in this arithmetic (see
-// jit.EmitVec1Best4), so a trained model is not compared to the bit.
-func vec1Nearest(t []float32, m, n int, vecs []float32, best []int, dist []float32) {
+// in vecs), the first of the m rows (row-major in rows, laid out in tn by
+// vec1MakeT8N) nearest it by the float32 estimate of jit.EmitVec1Cand, and
+// that distance. vec1's training is randomized and its builds differ in
+// this arithmetic, so a trained model is not compared to the bit.
+func vec1Nearest(tn *vec1T8N, rows []float32, m, n int, vecs []float32, best []int, dist []float32) {
 	nVec := len(vecs) / n
-	nBlk := vec1T8Blocks(t, n)
 	if m == 1 && n%8 == 0 && nVec >= 8 {
 		// One row (k-means++'s rounds): the vectors are the rows, back to
 		// back, and the one row the query, eight vectors to a lane-set.
 		if ks := jitVecKernelOf(jitVecKey{l2: true, strided: true}); ks != nil {
-			c := make([]float32, n)
-			for d := range n {
-				c[d] = t[8*d]
-			}
 			done := nVec &^ 7
 			sums := make([]float32, 2*done)
 			ks.Call(&jit.Args{
 				A:    unsafe.Pointer(unsafe.SliceData(vecs)),
 				XC:   int64(4 * n),
-				V:    unsafe.Pointer(unsafe.SliceData(c)),
+				V:    unsafe.Pointer(unsafe.SliceData(rows)),
 				N:    int64(done),
 				XA:   int64(n),
 				Out:  unsafe.Pointer(&sums[0]),
@@ -244,278 +239,83 @@ func vec1Nearest(t []float32, m, n int, vecs []float32, best []int, dist []float
 				best[i], dist[i] = 0, sums[i]
 			}
 			if done < nVec {
-				vec1Nearest(t, m, n, vecs[done*n:], best[done:], dist[done:])
+				vec1Nearest(tn, rows, m, n, vecs[done*n:], best[done:], dist[done:])
 			}
 			return
 		}
 	}
-	// The kernel visits only the blocks holding the m rows.
-	nBlk4 := (m + 7) / 8
-	k := vec1Best4Kernel()
-	if k == nil || nBlk == 0 {
-		buf := make([]float32, 8*nBlk)
+	k := vec1CandKernel()
+	b := tn.b
+	if k == nil || len(tn.t) < b*8*(n+1) {
 		for i := range nVec {
-			vec1T8FGo(jit.Vec1L2F, t, nBlk, n, vecs[i*n:i*n+n], buf)
-			b, d := 0, float32(math.Inf(1))
-			for j, x := range buf[:m] {
-				if x < d {
-					b, d = j, x
-				}
-			}
-			best[i], dist[i] = b, d
+			best[i], dist[i] = vec1NearestGo(rows, m, n, vecs[i*n:i*n+n])
 		}
 		return
 	}
-	// Groups of four vectors per call, as many as keep a call near a
-	// million row components: a kernel cannot be preempted while it runs.
-	per := max(1, (1<<20)/(8*nBlk4*n))
-	out := make([]uint32, 64*min(per, (nVec+3)/4))
-	var tail []float32
-	for i := 0; i < nVec; {
-		g := min(per, (nVec-i)/4)
+	// The kernel's candidates with no allowance are the rows whose estimate
+	// is the smallest; the first of them is the answer.
+	scratch := make([]float32, 64+32*b)
+	scratch[0] = math.Float32frombits(uint32(b))
+	for l := range 8 {
+		scratch[8+l], scratch[16+l] = 1, -2
+	}
+	res := make([]byte, 16+4*b)
+	group := make([]float32, 4*n)
+	for i := 0; i < nVec; i += 4 {
 		v := vecs[i*n:]
-		if g == 0 {
+		if nVec-i < 4 {
 			// The last one to three vectors, the last repeated to fill a group.
-			tail = make([]float32, 4*n)
 			for vv := range 4 {
-				copy(tail[vv*n:vv*n+n], vecs[min(i+vv, nVec-1)*n:])
+				copy(group[vv*n:vv*n+n], vecs[min(i+vv, nVec-1)*n:])
 			}
-			g, v = 1, tail
+			v = group
 		}
 		k.Call(&jit.Args{
-			A:   unsafe.Pointer(unsafe.SliceData(t)),
-			N:   int64(nBlk4),
+			A:   unsafe.Pointer(unsafe.SliceData(tn.t)),
+			N:   1,
 			XA:  int64(n),
 			V:   unsafe.Pointer(unsafe.SliceData(v)),
-			XC:  int64(g),
-			C:   unsafe.Pointer(&vec1Best4Table),
-			Out: unsafe.Pointer(unsafe.SliceData(out)),
+			XC:  int64(4 * n),
+			C:   unsafe.Pointer(unsafe.SliceData(scratch)),
+			Out: unsafe.Pointer(unsafe.SliceData(res)),
 		})
-		for gi := range g {
-			o := out[64*gi:]
-			for vv := range min(4, nVec-i-4*gi) {
-				b, d := 0, float32(math.Inf(1))
-				for l := range 8 {
-					x, r := math.Float32frombits(o[8*vv+l]), int(o[32+8*vv+l])
-					if x < d || (x == d && r < b) {
-						b, d = r, x
-					}
-				}
-				best[i+4*gi+vv], dist[i+4*gi+vv] = b, d
-			}
-		}
-		i += 4 * g
-	}
-}
-
-// vec1Best4Table is EmitVec1Best4's constants: the lanes' row numbers, the
-// step between blocks, and +Inf.
-var vec1Best4Table = func() (t [24]uint32) {
-	for i := range 8 {
-		t[i] = uint32(i)
-		t[8+i] = 8
-		t[16+i] = math.Float32bits(float32(math.Inf(1)))
-	}
-	return
-}()
-
-// vec1BestT8x4 is vec1BestT8 for four vectors at once (vecs, 4n floats),
-// answered from estimates: jit.EmitVec1T8x4's float32 sums find each
-// vector's nearest row approximately, and only the rows whose estimate
-// could hide the exact answer -- those within the estimates' error bound of
-// the smallest -- have their exact distance computed from rows (row-major).
-// The answers are vec1BestT8's, to the bit; where the bound cannot be relied
-// on (a non-finite or enormous estimate) a vector is searched exactly.
-func vec1BestT8x4(t, rows []float32, m, n int, vecs []float32, round bool, best *[4]int, est []float32) []float32 {
-	nBlk := vec1T8Blocks(t, n)
-	k := vec1T8x4Kernel()
-	if k == nil || nBlk == 0 || len(vecs) < 4*n {
-		for vv := range 4 {
-			best[vv], _, _ = vec1BestT8(t, m, n, vecs[vv*n:vv*n+n], round, nil)
-		}
-		return est
-	}
-	if cap(est) < 32*nBlk {
-		est = make([]float32, 32*nBlk)
-	}
-	est = est[:32*nBlk]
-	k.Call(&jit.Args{
-		A:   unsafe.Pointer(unsafe.SliceData(t)),
-		N:   int64(nBlk),
-		XA:  int64(n),
-		V:   unsafe.Pointer(unsafe.SliceData(vecs)),
-		XC:  int64(4 * n),
-		Out: unsafe.Pointer(unsafe.SliceData(est)),
-	})
-	// An estimate is a sum of n nonnegative terms, each operation rounded to
-	// float32: within gamma*d (+ A for underflow) of the true sum d. The
-	// exact key (float64, maybe rounded to float32) is within eps*d of it.
-	gamma := float64(n+2) * 0x1p-24 / (1 - float64(n+2)*0x1p-24)
-	delta := gamma + 0x1p-23
-	under := float64(2*n+2) * 0x1p-149
-	for vv := range 4 {
-		q := vecs[vv*n : vv*n+n]
-		lo := float32(math.Inf(1))
-		ok := true
-		for r := range m {
-			x := est[r/8*32+vv*8+r%8]
-			if x != x {
-				ok = false
-				break
-			}
-			lo = min(lo, x)
-		}
-		bound := (float64(lo)+under)*(1+delta)*(1+delta)/((1-delta)*(1-delta)) + under
-		if !ok || !(bound < 1e37) {
-			best[vv], _, _ = vec1BestT8(t, m, n, q, round, nil)
-			continue
-		}
-		b, bd := 0, math.Inf(1)
-		for r := range m {
-			if float64(est[r/8*32+vv*8+r%8]) > bound {
-				continue
-			}
-			d := vec1L2(q, rows[r*n:r*n+n])
-			if round {
-				d = float64(float32(d))
-			}
-			if d < bd {
-				b, bd = r, d
-			}
-		}
-		best[vv] = b
-	}
-	return est
-}
-
-// encodePQN4 is encodePQN for four vectors: jit.EmitVec1PQCand's estimates
-// name the rows that could be each sub-vector's nearest (vec1BestT8x4's
-// bound), and only those have their exact distance computed. false when
-// there is no kernel, the caller then encoding one vector at a time.
-func (m *vec1Model) encodePQN4(a [4][]float32, code [4][]byte, sc *vec1Buf) bool {
-	k := vec1PQCandKernel()
-	ne, nb := m.nCodeElem, m.nCodebook()
-	if k == nil || nb == 0 {
-		return false
-	}
-	t := m.t8()
-	w := nb * ne
-	if cap(sc.f) < 4*w+16+1024 {
-		sc.f = make([]float32, 4*w+16+1024)
-	}
-	vecs := sc.f[:4*w]
-	for i := range 4 {
-		copy(vecs[i*w:i*w+w], a[i][:w])
-	}
-	gamma := float64(ne+2) * 0x1p-24 / (1 - float64(ne+2)*0x1p-24)
-	delta := gamma + 0x1p-23
-	under := float64(2*ne+2) * 0x1p-149
-	// The kernel's bound is (lo + 2A) * F in float32: twice the underflow
-	// term covers the one added after the factor, and F is widened for the
-	// float32 rounding of the two operations.
-	f := (1 + delta) * (1 + delta) / ((1 - delta) * (1 - delta)) * (1 + 0x1p-20)
-	scratch := sc.f[4*w : 4*w+16+1024]
-	for i := range 8 {
-		scratch[i] = math.Nextafter32(float32(2*under), float32(math.Inf(1)))
-		scratch[8+i] = math.Nextafter32(float32(f), float32(math.Inf(1)))
-	}
-	if cap(sc.cand) < 144*nb {
-		sc.cand = make([]byte, 144*nb)
-	}
-	out := sc.cand[:144*nb]
-	k.Call(&jit.Args{
-		A:   unsafe.Pointer(unsafe.SliceData(t.books)),
-		N:   int64(nb),
-		XA:  int64(ne),
-		V:   unsafe.Pointer(unsafe.SliceData(vecs)),
-		XC:  int64(4 * w),
-		C:   unsafe.Pointer(unsafe.SliceData(scratch)),
-		Out: unsafe.Pointer(unsafe.SliceData(out)),
-	})
-	for b := range nb {
-		rec := out[144*b : 144*b+144]
-		book := m.book[b*ne*vec1CodebookSize : (b+1)*ne*vec1CodebookSize]
-		for i := range 4 {
-			sub := vecs[i*w+b*ne : i*w+b*ne+ne]
-			lo := math.Float32frombits(vec1Native.Uint32(rec[128+4*i:]))
-			if bound := (float64(lo) + 2*under) * f; !(bound < 1e37) {
-				best, _, _ := vec1BestT8(t.book[b], vec1CodebookSize, ne, sub, true, nil)
-				code[i][b] = byte(best)
-				continue
-			}
-			best, bd := 0, math.Inf(1)
-			for j, bits := range rec[32*i : 32*i+32] {
-				for ; bits != 0; bits &= bits - 1 {
-					r := 8*j + mathbits.TrailingZeros8(bits)
-					d := float64(float32(vec1L2(sub, book[r*ne:r*ne+ne])))
-					if d < bd {
-						best, bd = r, d
-					}
+		for vv := range min(4, nVec-i) {
+			q := v[vv*n : vv*n+n]
+			row := -1
+			for j, bits := range res[16+vv*b : 16+(vv+1)*b] {
+				if bits != 0 {
+					row = 8*j + mathbits.TrailingZeros8(bits)
+					break
 				}
 			}
-			code[i][b] = byte(best)
+			lo := math.Float32frombits(vec1Native.Uint32(res[4*vv:]))
+			if row < 0 || row >= m {
+				best[i+vv], dist[i+vv] = vec1NearestGo(rows, m, n, q)
+				continue
+			}
+			var sq float32
+			for _, x := range q {
+				sq += x * x
+			}
+			best[i+vv], dist[i+vv] = row, max(0, lo+sq)
 		}
 	}
-	return true
 }
 
-var vec1PQCandCode = sync.OnceValue(func() *jit.Code { return jitMapOnce(jit.EmitVec1PQCand) })
-
-func vec1PQCandKernel() *jit.Code {
-	if !jitEnabled {
-		return nil
+// vec1NearestGo is vec1Nearest for one vector, in Go.
+func vec1NearestGo(rows []float32, m, n int, q []float32) (int, float32) {
+	b, d := 0, float32(math.Inf(1))
+	for j := range m {
+		var s float32
+		for k, x := range rows[j*n : j*n+n] {
+			e := x - q[k]
+			s += e * e
+		}
+		if s < d {
+			b, d = j, s
+		}
 	}
-	return vec1PQCandCode()
-}
-
-var vec1T8x4Code = sync.OnceValue(func() *jit.Code { return jitMapOnce(jit.EmitVec1T8x4) })
-
-func vec1T8x4Kernel() *jit.Code {
-	if !jitEnabled {
-		return nil
-	}
-	return vec1T8x4Code()
-}
-
-// vec1BestDTable is EmitVec1BestD's constants: the lanes' rows, the step
-// between blocks, and +Inf, as float64.
-var vec1BestDTable = func() (t [16]float64) {
-	for i := range 8 {
-		t[i] = float64(i)
-	}
-	for i := range 4 {
-		t[8+i] = 8
-		t[12+i] = math.Inf(1)
-	}
-	return
-}()
-
-var vec1BestDCode [2]struct {
-	once sync.Once
-	code *jit.Code
-}
-
-// vec1BestDKernel is the compiled vec1PqBestMatch search, nil without one.
-func vec1BestDKernel(round bool) *jit.Code {
-	if !jitEnabled {
-		return nil
-	}
-	i := 0
-	if round {
-		i = 1
-	}
-	c := &vec1BestDCode[i]
-	c.once.Do(func() { c.code = jitMapOnce(func() ([]byte, error) { return jit.EmitVec1BestD(round) }) })
-	return c.code
-}
-
-var vec1Best4Code = sync.OnceValue(func() *jit.Code { return jitMapOnce(jit.EmitVec1Best4) })
-
-func vec1Best4Kernel() *jit.Code {
-	if !jitEnabled {
-		return nil
-	}
-	return vec1Best4Code()
+	return b, d
 }
 
 var vec1Kernels [3]sync.Once
@@ -546,8 +346,9 @@ func vec1ScanKernel() *jit.Code {
 type vec1Buf struct {
 	d    []float64
 	f    []float32
-	est  []float32
+	v    []float32
 	cand []byte
+	best []int
 }
 
 var vec1Bufs = sync.Pool{New: func() any { return new(vec1Buf) }}
@@ -560,6 +361,8 @@ type vec1T8Model struct {
 	books []float32   // every codebook, back to back
 	book  [][]float32 // each codebook's part of books
 	rot   []float32
+	// The centroids and codebooks as a rebuild's estimates read them.
+	centN, booksN *vec1T8N
 }
 
 func (m *vec1Model) t8() *vec1T8Model {
@@ -568,10 +371,12 @@ func (m *vec1Model) t8() *vec1T8Model {
 		n := m.nElem()
 		if m.nBucket() > 0 {
 			t.cent = vec1T8(m.cent, m.nBucket(), n)
+			t.centN = vec1MakeT8N(m.cent, 1, m.nBucket(), n)
 		}
 		if m.nCodebook() > 0 && !m.bitQuant() {
 			ne := m.nCodeElem
 			t.books = vec1T8(m.book, m.nCodebook()*vec1CodebookSize, ne)
+			t.booksN = vec1MakeT8N(m.book, m.nCodebook(), vec1CodebookSize, ne)
 			t.book = make([][]float32, m.nCodebook())
 			for b := range t.book {
 				t.book[b] = t.books[b*ne*vec1CodebookSize : (b+1)*ne*vec1CodebookSize]
@@ -648,4 +453,205 @@ func vec1BestT8F(t []float32, m, n int, a []float32, buf []float32) (int, []floa
 		}
 	}
 	return best, buf
+}
+
+// vec1T8N is sets of rows laid out for jit.EmitVec1Cand: each set b blocks
+// of eight rows, a block's components (T8) followed by its rows' squared
+// norms. Rows past a set's m have zero components and an infinite norm.
+type vec1T8N struct {
+	t    []float32
+	b    int
+	maxc []float64 // each set's largest row norm
+}
+
+func vec1MakeT8N(rows []float32, sets, m, n int) *vec1T8N {
+	b := (m + 15) / 16 * 2 // the kernel takes blocks in pairs
+	tn := &vec1T8N{t: make([]float32, sets*b*8*(n+1)), b: b, maxc: make([]float64, sets)}
+	for s := range sets {
+		blk := tn.t[s*b*8*(n+1):]
+		for r := range 8 * b {
+			base := r / 8 * 8 * (n + 1)
+			if r >= m {
+				blk[base+8*n+r%8] = float32(math.Inf(1))
+				continue
+			}
+			row := rows[(s*m+r)*n : (s*m+r+1)*n]
+			var sq float64
+			for d, x := range row {
+				blk[base+8*d+r%8] = x
+				sq += float64(x) * float64(x)
+			}
+			blk[base+8*n+r%8] = float32(sq)
+			if c := math.Sqrt(sq); !(c <= tn.maxc[s]) {
+				tn.maxc[s] = c // NaN sticks: the set is then searched exactly
+			}
+		}
+	}
+	return tn
+}
+
+// vec1Best4 is vec1BestT8 for four vectors at once over sets of rows: set s
+// is rows[s*m*comp:] (m rows of comp, row-major) laid out in tn, and vector
+// i's part for it the comp floats at vecs[i*stride+s*comp:]. out[4*s+i] is
+// the answer, vec1BestT8's to the bit: jit.EmitVec1Cand estimates every
+// distance in float32 and names the rows whose estimate is within the
+// estimates' error bound of the smallest, and only those have their exact
+// distance computed. Where the bound cannot be relied on (a non-finite
+// estimate or norm) the vector is searched exactly. false when there is no
+// kernel.
+func vec1Best4(tn *vec1T8N, rows []float32, sets, m, comp int, vecs []float32, stride int, round bool, sc *vec1Buf, out []int) bool {
+	k := vec1CandKernel()
+	b := tn.b
+	if k == nil || sets == 0 || b == 0 || len(tn.t) < sets*b*8*(comp+1) || len(vecs) < 3*stride+sets*comp {
+		return false
+	}
+	// The estimate of row c's distance from v, less ||v||^2, is ||c||^2 -
+	// 2 c.v: the norm rounded to float32 and the dot product summed in
+	// float32 (comp products, each operation rounded), so it is within
+	// (gamma + 2^-22) * G of the true value, G = (||v|| + max ||c||)^2. The
+	// exact key (the float64 sum, maybe rounded to float32) is within
+	// 2^-22 * d of the true distance d <= G. So a row can be nearest only if
+	// its estimate is within (2*gamma + 2^-20) * G of the smallest, lo, and
+	// the kernel's float32 lo + A rounds by at most 2^-24 * (G + A) more:
+	// A = (2*gamma + 2^-19) * G (+ the underflow terms) covers it all, per
+	// vector, over the sets' largest G -- provided nothing overflows float32,
+	// which G < 1e37 ensures (every norm, product and sum is at most G).
+	gamma := float64(comp+2) * 0x1p-24 / (1 - float64(comp+2)*0x1p-24)
+	under := float64(8*comp+8) * 0x1p-149
+	var maxc float64
+	for _, c := range tn.maxc[:sets] {
+		if !(c <= maxc) {
+			maxc = c
+		}
+	}
+	if need := 64 + 32*b; cap(sc.f) < need {
+		sc.f = make([]float32, need)
+	}
+	scratch := sc.f[:64+32*b]
+	scratch[0], scratch[1] = math.Float32frombits(uint32(b)), 0 // B, an int64
+	var slack [4]float64
+	for i := range 4 {
+		var vmax float64
+		for s := range sets {
+			var sq float64
+			for _, x := range vecs[i*stride+s*comp : i*stride+s*comp+comp] {
+				sq += float64(x) * float64(x)
+			}
+			if v := math.Sqrt(sq); !(v <= vmax) {
+				vmax = v
+			}
+		}
+		g := (vmax + maxc) * (vmax + maxc)
+		slack[i] = (2*gamma+0x1p-19)*g + under
+		if !(g < 1e37) {
+			slack[i] = math.Inf(1) // searched exactly
+		}
+		a := math.Nextafter32(float32(slack[i]), float32(math.Inf(1)))
+		for l := range 8 {
+			scratch[8+l] = 1 // F
+			scratch[16+l] = -2
+			scratch[32+8*i+l] = a
+		}
+	}
+	rec := 16 + 4*b
+	if cap(sc.cand) < sets*rec {
+		sc.cand = make([]byte, sets*rec)
+	}
+	res := sc.cand[:sets*rec]
+	k.Call(&jit.Args{
+		A:   unsafe.Pointer(unsafe.SliceData(tn.t)),
+		N:   int64(sets),
+		XA:  int64(comp),
+		V:   unsafe.Pointer(unsafe.SliceData(vecs)),
+		XC:  int64(4 * stride),
+		C:   unsafe.Pointer(unsafe.SliceData(scratch)),
+		Out: unsafe.Pointer(unsafe.SliceData(res)),
+	})
+	for s := range sets {
+		r := res[s*rec : (s+1)*rec]
+		set := rows[s*m*comp : (s+1)*m*comp]
+		for i := range 4 {
+			q := vecs[i*stride+s*comp : i*stride+s*comp+comp]
+			lo := float64(math.Float32frombits(vec1Native.Uint32(r[4*i:])))
+			if bound := lo + slack[i]; !(bound < 1e37 && bound > -1e37) {
+				out[4*s+i] = vec1BestRows(set, m, comp, q, round)
+				continue
+			}
+			best, bd := 0, math.Inf(1)
+			for j, bits := range r[16+i*b : 16+(i+1)*b] {
+				for ; bits != 0; bits &= bits - 1 {
+					row := 8*j + mathbits.TrailingZeros8(bits)
+					if row >= m {
+						break
+					}
+					d := vec1L2(q, set[row*comp:row*comp+comp])
+					if round {
+						d = float64(float32(d))
+					}
+					if d < bd {
+						best, bd = row, d
+					}
+				}
+			}
+			out[4*s+i] = best
+		}
+	}
+	return true
+}
+
+// vec1BestRows is vec1PqBestMatch over row-major rows, or with round the
+// scalar vec1BestMatchN's choice.
+func vec1BestRows(rows []float32, m, n int, q []float32, round bool) int {
+	best, bd := 0, math.Inf(1)
+	for r := range m {
+		d := vec1L2(q, rows[r*n:r*n+n])
+		if round {
+			d = float64(float32(d))
+		}
+		if d < bd {
+			best, bd = r, d
+		}
+	}
+	return best
+}
+
+var vec1CandCode = sync.OnceValue(func() *jit.Code { return jitMapOnce(jit.EmitVec1Cand) })
+
+func vec1CandKernel() *jit.Code {
+	if !jitEnabled {
+		return nil
+	}
+	return vec1CandCode()
+}
+
+// vec1BestDTable is EmitVec1BestD's constants: the lanes' rows, the step
+// between blocks, and +Inf, as float64.
+var vec1BestDTable = func() (t [16]float64) {
+	for i := range 8 {
+		t[i] = float64(i)
+	}
+	for i := range 4 {
+		t[8+i] = 8
+		t[12+i] = math.Inf(1)
+	}
+	return
+}()
+
+var vec1BestDCode [2]struct {
+	once sync.Once
+	code *jit.Code
+}
+
+// vec1BestDKernel is the compiled vec1PqBestMatch search, nil without one.
+func vec1BestDKernel(round bool) *jit.Code {
+	if !jitEnabled {
+		return nil
+	}
+	i := 0
+	if round {
+		i = 1
+	}
+	c := &vec1BestDCode[i]
+	c.once.Do(func() { c.code = jitMapOnce(func() ([]byte, error) { return jit.EmitVec1BestD(round) }) })
+	return c.code
 }

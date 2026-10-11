@@ -442,10 +442,10 @@ func (tr *vec1Trainer) train() ([]byte, error) {
 				return nil, err
 			}
 			t0 := time.Now()
-			t8 := vec1T8(cent, p.nBucket, n)
+			tn := vec1MakeT8N(cent, 1, p.nBucket, n)
 			tr.parallel(p.nVec, func(lo, hi int) {
 				best := make([]int, hi-lo)
-				vec1Nearest(t8, p.nBucket, n, p.vecs[lo*n:hi*n], best, make([]float32, hi-lo))
+				vec1Nearest(tn, cent, p.nBucket, n, p.vecs[lo*n:hi*n], best, make([]float32, hi-lo))
 				for i := lo; i < hi; i++ {
 					v := p.vecs[i*n : i*n+n]
 					b := best[i-lo]
@@ -529,11 +529,11 @@ func (tr *vec1Trainer) kmeansInit(vecs []float32, nVec, n, k, perRound, tail int
 	nCent, nNew := 1, 1
 	for rr := 1; rr < k; rr += nNew {
 		first := nCent - nNew
-		t8 := vec1T8(out[first*n:nCent*n], nNew, n)
+		tn := vec1MakeT8N(out[first*n:nCent*n], 1, nNew, n)
 		tr.parallel(nVec, func(lo, hi int) {
 			best := make([]int, hi-lo)
 			dist := make([]float32, hi-lo)
-			vec1Nearest(t8, nNew, n, vecs[lo*n:hi*n], best, dist)
+			vec1Nearest(tn, out[first*n:nCent*n], nNew, n, vecs[lo*n:hi*n], best, dist)
 			for i := lo; i < hi; i++ {
 				if d := dist[i-lo]; first == 0 || d < minD[i] {
 					minD[i] = d
@@ -610,12 +610,12 @@ func (tr *vec1Trainer) lloyd(vecs []float32, nVec, n, k int, cent []float32) {
 	for iter := 0; iter < vec1KMeansIter; iter++ {
 		var mu sync.Mutex
 		var parts []*part
-		t8 := vec1T8(cent, k, n)
+		tn := vec1MakeT8N(cent, 1, k, n)
 		tr.parallel(nVec, func(lo, hi int) {
 			pt := &part{sum: make([]float32, k*n), count: make([]int, k)}
 			best := make([]int, hi-lo)
 			dist := make([]float32, hi-lo)
-			vec1Nearest(t8, k, n, vecs[lo*n:hi*n], best, dist)
+			vec1Nearest(tn, cent, k, n, vecs[lo*n:hi*n], best, dist)
 			for i := lo; i < hi; i++ {
 				v := vecs[i*n : i*n+n]
 				b, d := best[i-lo], dist[i-lo]
@@ -774,13 +774,13 @@ func (tr *vec1Trainer) findRotation(vecs, book []float32, r []float32) error {
 			off := b * ne
 			kk := min(ne, n-off)
 			code := book[off*vec1CodebookSize : (off+ne)*vec1CodebookSize]
-			t8 := vec1T8(code, vec1CodebookSize, ne)
+			tn := vec1MakeT8N(code, 1, vec1CodebookSize, ne)
 			subs := make([]float32, p.nVec*ne)
 			for i := range p.nVec {
 				copy(subs[i*ne:i*ne+kk], vecs[i*n+off:i*n+off+kk])
 			}
 			bests := make([]int, p.nVec)
-			vec1Nearest(t8, vec1CodebookSize, ne, subs, bests, make([]float32, p.nVec))
+			vec1Nearest(tn, code, vec1CodebookSize, ne, subs, bests, make([]float32, p.nVec))
 			q := make([]float32, vec1CovarBatch)
 			sums := make([]float32, len(batches[0])/vec1CovarBatch)
 			for bt, tv := range batches {

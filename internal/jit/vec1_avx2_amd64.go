@@ -13,15 +13,20 @@ import (
 // component, so a ymm register holds one component of eight rows -- and each
 // row's sum accumulated in component order with one rounding per operation
 // (separate multiply and add, never fused), as vec1's portable C sums it.
-// Two blocks go per iteration, to cover the adds' latency.
+// Several blocks go per iteration, to cover the adds' latency: four for the
+// float32 sums, two for Vec1L2D (whose float64 sums take twice the
+// registers).
 //
 // Args: A the first block, XC a block's size in bytes (32 x dims), V the
-// query's float32 components, N the block PAIRS (at least 1), XA the
-// dimensions (at least 1), Out the sums: a float32 per row, or for Vec1L2D a
-// float64.
+// query's float32 components, N the groups of blocks (four, or two for
+// Vec1L2D; at least 1), XA the dimensions (at least 1), Out the sums: a
+// float32 per row, or for Vec1L2D a float64.
 func EmitVec1T8(op Vec1Op) ([]byte, error) {
 	if !cpuHasAVX2() {
 		return nil, fmt.Errorf("jit: AVX2 not available on this machine")
+	}
+	if op != Vec1L2D {
+		return emitVec1T8F(op)
 	}
 	a := NewAsm()
 	a.MovRegMem(RSI, RDI, OffA)
@@ -240,127 +245,6 @@ func EmitVec1RowsL2D() ([]byte, error) {
 	return a.Code()
 }
 
-// EmitVec1Best4 emits the nearest-row search vec1's training runs: vectors
-// four at a time against rows laid out T8 (as EmitVec1T8 takes them), each
-// distance the float32 sum of (x-q)^2, and for each vector and lane the
-// smallest distance and the first row reaching it. A row is loaded once for
-// the four vectors. Training is randomized, and vec1's own builds train with
-// different arithmetic (its AVX2 build fuses the multiply-add, as this does
-// where the machine can), so this is the scalar build's search in float32
-// rather than to the bit.
-//
-// Args: A the first block, N the blocks (at least 1), XA the dimensions (at
-// least 1), V the first vector, the vectors back to back, XC the groups of
-// four (at least 1), C a table of int32 0..7, eight 8s and eight float32
-// +Inf, Out per group the four vectors' eight lane minima (float32) then
-// their rows (int32), 256 bytes.
-func EmitVec1Best4() ([]byte, error) {
-	if !cpuHasAVX2() {
-		return nil, fmt.Errorf("jit: AVX2 not available on this machine")
-	}
-	a := NewAsm()
-	a.MovRegMem(R9, RDI, OffXA)
-	a.MovRegMem(R10, RDI, OffOut)
-	a.MovRegMem(R13, RDI, OffXC)
-	a.MovRegMem(R15, RDI, OffV)
-	a.MovRegReg(RDX, R9) // a vector's bytes
-	a.AddRegReg(RDX, RDX)
-	a.AddRegReg(RDX, RDX)
-
-	a.Label("group")
-	a.MovRegMem(RSI, RDI, OffA)
-	a.MovRegMem(RCX, RDI, OffN)
-	a.MovRegMem(RAX, RDI, OffC)
-	a.VmovdquLoad(14, RAX)      // the block's row numbers
-	a.VmovdquLoadD(15, RAX, 32) // the step between blocks
-	for vv := Reg(0); vv < 4; vv++ {
-		a.VmovdquLoadD(6+vv, RAX, 64) // minima
-		a.VpxorYmm(10+vv, 10+vv, 10+vv)
-	}
-
-	a.Label("blk")
-	for vv := Reg(0); vv < 4; vv++ {
-		a.VxorpsYmm(vv, vv, vv)
-	}
-	a.MovRegReg(RAX, R15)
-	a.MovRegReg(RBX, RAX)
-	a.AddRegReg(RBX, RDX)
-	a.MovRegReg(R8, RBX)
-	a.AddRegReg(R8, RDX)
-	a.MovRegReg(R11, R8)
-	a.AddRegReg(R11, RDX)
-	a.MovRegReg(R12, R9)
-
-	a.Label("comp")
-	a.VmovdquLoad(4, RSI)
-	for vv, p := range []Reg{RAX, RBX, R8, R11} {
-		a.VbroadcastssMem(5, p)
-		a.VsubpsYmm(5, 4, 5)
-		a.fmaSqPs(Reg(vv), 5)
-	}
-	a.AddRegImm8(RSI, 32)
-	for _, p := range []Reg{RAX, RBX, R8, R11} {
-		a.AddRegImm8(p, 4)
-	}
-	a.DecReg(R12)
-	a.Jcc(CondNE, "comp")
-
-	for vv := Reg(0); vv < 4; vv++ {
-		a.VcmpltpsYmm(5, vv, 6+vv)
-		a.VblendvpsYmm(6+vv, 6+vv, vv, 5)
-		a.VblendvpsYmm(10+vv, 10+vv, 14, 5)
-	}
-	a.VpadddYmm(14, 14, 15)
-	a.DecReg(RCX)
-	a.Jcc(CondNE, "blk")
-
-	for vv := Reg(0); vv < 4; vv++ {
-		a.VmovupsStore(R10, int8(32*vv), 6+vv)
-	}
-	a.AddRegImm8(R10, 127)
-	a.AddRegImm8(R10, 1)
-	for vv := Reg(0); vv < 4; vv++ {
-		a.VmovupsStore(R10, int8(32*vv), 10+vv)
-	}
-	a.AddRegImm8(R10, 127)
-	a.AddRegImm8(R10, 1)
-	a.MovRegReg(R15, R11) // the next group: past the fourth vector
-	a.DecReg(R13)
-	a.Jcc(CondNE, "group")
-
-	a.Vzeroupper()
-	a.Ret()
-	return a.Code()
-}
-
-// fmaSqPs is  acc += x*x  in float32, x clobbered: fused where the machine
-// has it.
-func (a *Asm) fmaSqPs(acc, x Reg) {
-	if cpu.X86.HasFMA {
-		a.vinst(0xB8, acc, x, x, vexMap0F38, 0, 1, vexP66, false) // VFMADD231PS
-		return
-	}
-	a.VmulpsYmm(x, x, x)
-	a.VaddpsYmm(acc, acc, x)
-}
-
-// VcmpltpsYmm is  dst = src1 < src2, lane-wise, all-ones where true.
-func (a *Asm) VcmpltpsYmm(dst, src1, src2 Reg) {
-	a.vinst(0xC2, dst, src1, src2, vexMap0F, 0, 1, 0, false)
-	a.emit(0x01)
-}
-
-// VblendvpsYmm is  dst = mask's sign bit ? src2 : src1, lane-wise.
-func (a *Asm) VblendvpsYmm(dst, src1, src2, mask Reg) {
-	a.vinst(0x4A, dst, src1, src2, vexMap0F3A, 0, 1, vexP66, false)
-	a.emit(byte(mask) << 4)
-}
-
-// VpadddYmm is  dst = src1 + src2, eight int32 lanes.
-func (a *Asm) VpadddYmm(dst, src1, src2 Reg) {
-	a.vinst(0xFE, dst, src1, src2, vexMap0F, 0, 1, vexP66, false)
-}
-
 // sqAccPd is  acc += x*x  in float64, x clobbered. x holds float32 values
 // widened, so x*x is exact and a fused multiply-add rounds once, as the
 // separate multiply and add do: the two are the same sum, and the fused one
@@ -482,192 +366,188 @@ func (a *Asm) VblendvpdYmm(dst, src1, src2, mask Reg) {
 	a.emit(byte(mask) << 4)
 }
 
-// EmitVec1T8x4 emits an estimate of four vectors' squared distances to every
-// row of a T8 layout, for a search that then settles its answer exactly:
-// float32 sums of (x-q)^2, fused multiply-adds where the machine has them.
-// Each row is loaded once for the four vectors.
+// EmitVec1Cand emits the first half of a nearest-row search settled
+// exactly: four vectors against row sets laid out T8 (each set B blocks of
+// eight rows, the sets back to back -- a PQ encode's codebooks, or one set
+// of centroids), each vector's part for a set the next XA components, every
+// row's squared distance estimated in float32 less the vector's own squared
+// norm, ||x||^2 - 2 x.q (one multiply-add a component), and for each vector
+// and set the rows whose estimate is within a bound of the smallest:
+// estimates no larger than (lo + A) * F, lo the smallest and A (per vector)
+// and F the caller's error terms, the bound computed in float32 (the caller
+// allows for its rounding). The caller computes those candidates' exact
+// distances. Each block of eight rows is followed by their squared norms, as
+// one more component; fused multiply-adds are used where the machine has
+// them.
 //
-// Args: A the first block, N the blocks (at least 1), XA the dimensions (at
-// least 1), V the first vector, XC the vectors' stride in bytes, Out per
-// block the four vectors' eight sums in turn (32 float32).
-func EmitVec1T8x4() ([]byte, error) {
-	if !cpuHasAVX2() {
-		return nil, fmt.Errorf("jit: AVX2 not available on this machine")
-	}
-	a := NewAsm()
-	a.MovRegMem(RSI, RDI, OffA)
-	a.MovRegMem(RCX, RDI, OffN)
-	a.MovRegMem(R9, RDI, OffXA)
-	a.MovRegMem(R10, RDI, OffOut)
-
-	a.Label("blk")
-	for vv := Reg(0); vv < 4; vv++ {
-		a.VxorpsYmm(vv, vv, vv)
-	}
-	a.MovRegMem(RAX, RDI, OffV)
-	a.MovRegMem(RDX, RDI, OffXC)
-	a.MovRegReg(RBX, RAX)
-	a.AddRegReg(RBX, RDX)
-	a.MovRegReg(R8, RBX)
-	a.AddRegReg(R8, RDX)
-	a.MovRegReg(R11, R8)
-	a.AddRegReg(R11, RDX)
-	a.MovRegReg(R12, R9)
-
-	a.Label("comp")
-	a.VmovdquLoad(4, RSI)
-	for vv, p := range []Reg{RAX, RBX, R8, R11} {
-		t := 5 + Reg(vv)
-		a.VbroadcastssMem(t, p)
-		a.VsubpsYmm(t, 4, t)
-		if cpu.X86.HasFMA {
-			a.vinst(0xB8, Reg(vv), t, t, vexMap0F38, 0, 1, vexP66, false) // VFMADD231PS
-		} else {
-			a.VmulpsYmm(t, t, t)
-			a.VaddpsYmm(Reg(vv), Reg(vv), t)
-		}
-	}
-	a.AddRegImm8(RSI, 32)
-	for _, p := range []Reg{RAX, RBX, R8, R11} {
-		a.AddRegImm8(p, 4)
-	}
-	a.DecReg(R12)
-	a.Jcc(CondNE, "comp")
-
-	for vv := Reg(0); vv < 4; vv++ {
-		a.VmovupsStore(R10, int8(32*vv), vv)
-	}
-	a.AddRegImm8(R10, 64)
-	a.AddRegImm8(R10, 64)
-	a.DecReg(RCX)
-	a.Jcc(CondNE, "blk")
-
-	a.Vzeroupper()
-	a.Ret()
-	return a.Code()
-}
-
-// EmitVec1PQCand emits the first half of a PQ encode settled exactly: four
-// vectors' sub-vectors against every codebook (laid out T8, 256 rows each,
-// the codebooks back to back), the squared distances estimated in float32
-// (as EmitVec1T8x4 does), and for each vector and codebook the rows whose
-// estimate is within a bound of the smallest: estimates no larger than
-// (lo + A) * F, lo the smallest and A and F the caller's error terms, the
-// bound computed in float32 (the caller allows for its rounding). The caller computes those candidates' exact distances.
-//
-// Args: A the first codebook, N the codebooks (at least 1), XA a sub-vector's
-// length (at least 1), V the first vector, XC the vectors' stride in bytes,
-// C scratch: eight float32 A, eight F, then 4 KiB the kernel uses, Out per
-// codebook the four vectors' candidate bit sets (32 bytes each, a bit per
-// row) and then their lo (float32), 144 bytes.
-func EmitVec1PQCand() ([]byte, error) {
+// Args: A the first set, N the sets (at least 1), XA a vector's components
+// per set (at least 1), V the first vector, XC the vectors' stride in bytes,
+// C scratch: B as an int64, eight float32 F at byte 32, eight float32 -2 at
+// byte 64, the four vectors' A (eight float32 each) from byte 128, then from
+// byte 256 128*B bytes the kernel uses; Out per set the four vectors' lo (float32) and
+// then their candidate bit sets (B bytes each, a bit per row), 16 + 4*B
+// bytes.
+func EmitVec1Cand() ([]byte, error) {
 	if !cpuHasAVX2() {
 		return nil, fmt.Errorf("jit: AVX2 not available on this machine")
 	}
 	a := NewAsm()
 	a.MovRegMem(RSI, RDI, OffA)
 	a.MovRegMem(R9, RDI, OffN)
-	a.MovRegMem(RDX, RDI, OffXC)
+	a.MovRegMem(RDX, RDI, OffXC) // the vectors' stride: vector k at RAX + k*RDX
 	a.MovRegMem(R10, RDI, OffOut)
 	a.MovRegMem(R15, RDI, OffV)
+	a.MovRegMem(RAX, RDI, OffC)
+	a.VmovdquLoadD(12, RAX, 64)  // -2
+	a.MovRegMem(R11, RDI, OffXA) // a block's bytes: (XA+1) * 32
+	a.IncReg(R11)
+	for range 5 {
+		a.AddRegReg(R11, R11)
+	}
 
-	a.Label("book")
+	a.Label("set")
+	a.MovRegReg(RBX, RDX) // three strides
+	a.AddRegReg(RBX, RDX)
+	a.AddRegReg(RBX, RDX)
 	// The minima start at +Inf: all-ones shifted to 0xFF << 23.
 	for vv := Reg(0); vv < 4; vv++ {
 		a.VpcmpeqdYmm(8+vv, 8+vv, 8+vv)
 		a.VpsrldYmm(8+vv, 8+vv, 24)
-		a.VpslldYmm(8+vv, 8+vv, 23) // 0xFF << 23 = +Inf
+		a.VpslldYmm(8+vv, 8+vv, 23)
 	}
 	a.MovRegMem(R13, RDI, OffC)
-	a.AddRegImm8(R13, 64) // the estimates
-	a.MovRegImm64(RCX, 32)
+	a.MovRegImm64(RCX, 256)
+	a.AddRegReg(R13, RCX) // the estimates
+	a.MovRegMem(RCX, RDI, OffC)
+	a.MovRegMem(RCX, RCX, 0) // B, then the pairs of blocks
+	a.ShrRegImm8(RCX, 1)
+	a.MovRegReg(R8, RSI)
+	a.AddRegReg(R8, R11) // the pair's second block
 
-	a.Label("blk")
-	for vv := Reg(0); vv < 4; vv++ {
-		a.VxorpsYmm(vv, vv, vv)
+	// Two blocks an iteration, eight chains of multiply-adds: sums Y0..Y3
+	// (first block) and Y4..Y7 (second), components Y13 and Y14, the
+	// vector's component Y15.
+	a.Label("pair")
+	for r := Reg(0); r < 8; r++ {
+		a.VxorpsYmm(r, r, r)
 	}
 	a.MovRegReg(RAX, R15)
-	a.MovRegReg(RBX, RAX)
-	a.AddRegReg(RBX, RDX)
-	a.MovRegReg(R8, RBX)
-	a.AddRegReg(R8, RDX)
-	a.MovRegReg(R11, R8)
-	a.AddRegReg(R11, RDX)
 	a.MovRegMem(R12, RDI, OffXA)
 
 	a.Label("comp")
-	a.VmovdquLoad(4, RSI)
-	for vv, p := range []Reg{RAX, RBX, R8, R11} {
-		a.VbroadcastssMem(5, p)
-		a.VsubpsYmm(5, 4, 5)
-		a.fmaSqPs(Reg(vv), 5)
+	a.VmovdquLoad(13, RSI)
+	a.VmovdquLoadD(14, R8, 0)
+	for vv := Reg(0); vv < 4; vv++ {
+		switch vv {
+		case 0:
+			a.VbroadcastssMem(15, RAX)
+		case 1:
+			a.vbroadcastssSIB(15, RAX, RDX, 0)
+		case 2:
+			a.vbroadcastssSIB(15, RAX, RDX, 1)
+		case 3:
+			a.vbroadcastssSIB(15, RAX, RBX, 0)
+		}
+		a.fmaPs(vv, 13, 15)
+		a.fmaPs(4+vv, 14, 15)
 	}
 	a.AddRegImm8(RSI, 32)
-	for _, p := range []Reg{RAX, RBX, R8, R11} {
-		a.AddRegImm8(p, 4)
-	}
+	a.AddRegImm8(R8, 32)
+	a.AddRegImm8(RAX, 4)
 	a.DecReg(R12)
 	a.Jcc(CondNE, "comp")
 
+	a.VmovdquLoad(13, RSI) // the rows' squared norms
+	a.VmovdquLoadD(14, R8, 0)
 	for vv := Reg(0); vv < 4; vv++ {
-		a.VmovupsStore(R13, int8(32*vv), vv)
-		a.VminpsYmm(8+vv, vv, 8+vv) // a NaN estimate leaves the minimum be
+		a.VmulpsYmm(vv, vv, 12) // exact: a power of two
+		a.VaddpsYmm(vv, vv, 13)
+		a.VmulpsYmm(4+vv, 4+vv, 12)
+		a.VaddpsYmm(4+vv, 4+vv, 14)
 	}
-	a.AddRegImm8(R13, 127)
-	a.AddRegImm8(R13, 1)
+	for blk := Reg(0); blk < 2; blk++ {
+		for vv := Reg(0); vv < 4; vv++ {
+			e := 4*blk + vv
+			a.VmovupsStore(R13, int8(32*vv), e)
+			a.VminpsYmm(8+vv, e, 8+vv) // a NaN estimate leaves the minimum be
+		}
+		a.AddRegImm8(R13, 127)
+		a.AddRegImm8(R13, 1)
+	}
+	a.AddRegImm8(R8, 32) // past the second block's norms: the next pair
+	a.MovRegReg(RSI, R8)
+	a.AddRegReg(R8, R11)
 	a.DecReg(RCX)
-	a.Jcc(CondNE, "blk")
+	a.Jcc(CondNE, "pair")
 
-	// Each minimum across its lanes, then the bound; lo stored for the caller.
+	// Each minimum across its lanes, stored as lo, then the bound.
 	a.MovRegMem(RAX, RDI, OffC)
-	a.MovRegReg(R11, R10) // where lo goes, past the bit sets
-	a.AddRegImm8(R11, 127)
-	a.AddRegImm8(R11, 1)
+	a.VmovdquLoadD(14, RAX, 32) // F
+	a.AddRegImm8(RAX, 127)
+	a.AddRegImm8(RAX, 1) // the vectors' A
 	for vv := Reg(0); vv < 4; vv++ {
 		m := 8 + vv
-		a.Vperm2f128(5, m, m, 0x01)
-		a.VminpsYmm(m, 5, m)
-		a.VpermilpsYmm(5, m, 0x4E)
-		a.VminpsYmm(m, 5, m)
-		a.VpermilpsYmm(5, m, 0xB1)
-		a.VminpsYmm(m, 5, m)
-		a.VmovssStore(R11, int8(4*vv), m)
-		a.VmovdquLoad(5, RAX) // A
-		a.VaddpsYmm(m, m, 5)
-		a.VmovdquLoadD(6, RAX, 32) // F
-		a.VmulpsYmm(m, m, 6)
+		a.Vperm2f128(13, m, m, 0x01)
+		a.VminpsYmm(m, 13, m)
+		a.VpermilpsYmm(13, m, 0x4E)
+		a.VminpsYmm(m, 13, m)
+		a.VpermilpsYmm(13, m, 0xB1)
+		a.VminpsYmm(m, 13, m)
+		a.VmovssStore(R10, int8(4*vv), m)
+		a.VmovdquLoadD(13, RAX, int8(32*vv))
+		a.VaddpsYmm(m, m, 13)
+		a.VmulpsYmm(m, m, 14)
 	}
 
-	a.MovRegMem(R13, RDI, OffC)
-	a.AddRegImm8(R13, 64)
+	// The bit sets, a vector at a time.
 	a.MovRegReg(RBX, R10)
-	a.MovRegImm64(RCX, 32)
-	a.Label("mask")
+	a.AddRegImm8(RBX, 16)
 	for vv := Reg(0); vv < 4; vv++ {
-		a.VmovdquLoadD(5, R13, int8(32*vv))
-		a.VcmplepsYmm(5, 5, 8+vv)
-		a.VmovmskpsYmm(RAX, 5)
-		a.MovMemByteAL(RBX, int8(32*vv))
+		a.MovRegMem(R13, RDI, OffC)
+		a.MovRegMem(RCX, R13, 0) // B
+		a.MovRegImm64(RAX, int64(256+32*int(vv)))
+		a.AddRegReg(R13, RAX) // this vector's estimates
+		a.Label(fmt.Sprintf("mask%d", vv))
+		a.VmovdquLoadD(13, R13, 0) // mod 00 with R13 would be RIP-relative
+		a.VcmplepsYmm(13, 13, 8+vv)
+		a.VmovmskpsYmm(RAX, 13)
+		a.MovMemByteAL(RBX, 0)
+		a.AddRegImm8(R13, 127)
+		a.AddRegImm8(R13, 1)
+		a.AddRegImm8(RBX, 1)
+		a.DecReg(RCX)
+		a.Jcc(CondNE, fmt.Sprintf("mask%d", vv))
 	}
-	a.AddRegImm8(R13, 127)
-	a.AddRegImm8(R13, 1)
-	a.AddRegImm8(RBX, 1)
-	a.DecReg(RCX)
-	a.Jcc(CondNE, "mask")
+	a.MovRegReg(R10, RBX) // the next set's record
 
-	a.AddRegImm8(R10, 127)
-	a.AddRegImm8(R10, 17) // 144 bytes a codebook
 	a.MovRegMem(RAX, RDI, OffXA)
-	a.AddRegReg(R15, RAX) // the next sub-vectors
+	a.AddRegReg(R15, RAX) // the next components
 	a.AddRegReg(R15, RAX)
 	a.AddRegReg(R15, RAX)
 	a.AddRegReg(R15, RAX)
 	a.DecReg(R9)
-	a.Jcc(CondNE, "book")
+	a.Jcc(CondNE, "set")
 
 	a.Vzeroupper()
 	a.Ret()
 	return a.Code()
+}
+
+// vbroadcastssSIB is  dst = the float32 at [base + index<<scale], in all
+// eight lanes. base must not be RBP or R13.
+func (a *Asm) vbroadcastssSIB(dst, base, index Reg, scale byte) {
+	a.vexm(dst, index, base, 0, vexMap0F38, 0, 1, vexP66)
+	a.emit(0x18, modrm(0b00, dst, RSP), sib(scale, index, base))
+}
+
+// fmaPs is  acc += x*y  in float32: fused where the machine has it.
+func (a *Asm) fmaPs(acc, x, y Reg) {
+	if cpu.X86.HasFMA {
+		a.vinst(0xB8, acc, x, y, vexMap0F38, 0, 1, vexP66, false) // VFMADD231PS
+		return
+	}
+	a.VmulpsYmm(y, x, y)
+	a.VaddpsYmm(acc, acc, y)
 }
 
 // VminpsYmm is  dst = src1 < src2 ? src1 : src2, lane-wise: src2 where
@@ -717,4 +597,63 @@ func (a *Asm) VpsrldYmm(dst, src Reg, imm byte) {
 func (a *Asm) VpslldYmm(dst, src Reg, imm byte) {
 	a.vex3(6, src, dst, vexMap0F, 0, 1, vexP66, false) // 72 /6
 	a.emit(0x72, modrm(0b11, 6, src), imm)
+}
+
+// emitVec1T8F is EmitVec1T8's float32 sums, four blocks an iteration: four
+// independent chains of adds, each row's still in component order.
+func emitVec1T8F(op Vec1Op) ([]byte, error) {
+	a := NewAsm()
+	a.MovRegMem(RSI, RDI, OffA)
+	a.MovRegMem(RBX, RDI, OffXC)
+	a.MovRegMem(RCX, RDI, OffN)
+	a.MovRegMem(R9, RDI, OffXA)
+	a.MovRegMem(R10, RDI, OffOut)
+
+	// Sums Y0..Y3, values Y4..Y7, Y8 the query component.
+	blocks := []Reg{RSI, RDX, R11, R13}
+	a.Label("quad")
+	for r := Reg(0); r < 4; r++ {
+		a.VxorpsYmm(r, r, r)
+	}
+	a.MovRegReg(RDX, RSI)
+	a.AddRegReg(RDX, RBX)
+	a.MovRegReg(R11, RDX)
+	a.AddRegReg(R11, RBX)
+	a.MovRegReg(R13, R11)
+	a.AddRegReg(R13, RBX)
+	a.MovRegMem(R8, RDI, OffV)
+	a.MovRegReg(R12, R9)
+
+	a.Label("comp")
+	a.VbroadcastssMem(8, R8)
+	for i, p := range blocks {
+		v := 4 + Reg(i)
+		a.VmovdquLoadD(v, p, 0) // disp8: mod 00 with R13 would be RIP-relative
+		if op == Vec1DotF {
+			a.VmulpsYmm(v, v, 8)
+		} else {
+			a.VsubpsYmm(v, 8, v)
+			a.VmulpsYmm(v, v, v)
+		}
+		a.VaddpsYmm(Reg(i), Reg(i), v)
+	}
+	for _, p := range blocks {
+		a.AddRegImm8(p, 32)
+	}
+	a.AddRegImm8(R8, 4)
+	a.DecReg(R12)
+	a.Jcc(CondNE, "comp")
+
+	for i := Reg(0); i < 4; i++ {
+		a.VmovupsStore(R10, int8(32*i), i)
+	}
+	a.AddRegImm8(R10, 127)
+	a.AddRegImm8(R10, 1)
+	a.MovRegReg(RSI, R13) // past the fourth block
+	a.DecReg(RCX)
+	a.Jcc(CondNE, "quad")
+
+	a.Vzeroupper()
+	a.Ret()
+	return a.Code()
 }

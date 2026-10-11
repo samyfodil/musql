@@ -157,9 +157,11 @@ func vec1WHTPow2(x []float32) {
 	n := len(x)
 	for stride := 1; stride < n; stride <<= 1 {
 		for i := 0; i < n; i += stride << 1 {
-			for j := i; j < i+stride; j++ {
-				a, b := x[j], x[j+stride]
-				x[j], x[j+stride] = a+b, a-b
+			lo, hi := x[i:i+stride], x[i+stride:i+2*stride]
+			hi = hi[:len(lo)]
+			for j, a := range lo {
+				b := hi[j]
+				lo[j], hi[j] = a+b, a-b
 			}
 		}
 	}
@@ -425,17 +427,26 @@ func (m *vec1Model) encodeBit(a []float32, code []byte) {
 	for i := 0; i < n; i += m.nCodeElem {
 		var v byte
 		for j := range 8 {
-			if m.nCodeElem == 8 {
-				if a[i+j] > 0 {
-					v |= 1 << j
-				}
-			} else if a[i+2*j]+a[i+2*j+1] > 0 {
-				v |= 1 << j
+			x := a[i+j]
+			if m.nCodeElem != 8 {
+				x = a[i+2*j] + a[i+2*j+1]
 			}
+			v |= vec1Positive(x) << j
 		}
 		code[out] = v
 		out++
 	}
+}
+
+// vec1Positive is 1 when x > 0, else 0, in a form the compiler makes a
+// conditional move: the signs a binary code records are random, and a
+// branch on each mispredicts half the time.
+func vec1Positive(x float32) byte {
+	var b byte
+	if x > 0 {
+		b = 1
+	}
+	return b
 }
 
 // encode is vec1EncodeVector.
@@ -518,8 +529,8 @@ func (m *vec1Model) quantizeN(tmp, in []float32, code []byte) int {
 }
 
 // quantizeN4 is quantizeN for four vectors, the batch vec1QuantizeVectorN
-// takes: the bucket search goes four vectors to a pass over the centroids
-// (vec1BestT8x4). sc is the caller's scratch.
+// takes: each search goes four vectors to a pass over the centroids or a
+// codebook (vec1Best4). sc is the caller's scratch.
 func (m *vec1Model) quantizeN4(tmp, in [4][]float32, code [4][]byte, sc *vec1Buf) [4]int {
 	n := m.nElem()
 	var a [4][]float32
@@ -529,14 +540,21 @@ func (m *vec1Model) quantizeN4(tmp, in [4][]float32, code [4][]byte, sc *vec1Buf
 	t8 := m.t8()
 	var bucket [4]int
 	if m.nBucket() > 0 {
-		if cap(sc.f) < 4*n {
-			sc.f = make([]float32, 4*n)
+		if cap(sc.v) < 4*n {
+			sc.v = make([]float32, 4*n)
 		}
-		vecs := sc.f[:4*n]
+		vecs := sc.v[:4*n]
 		for i := range 4 {
 			copy(vecs[i*n:], a[i][:n])
 		}
-		sc.est = vec1BestT8x4(t8.cent, m.cent, m.nBucket(), n, vecs, true, &bucket, sc.est)
+		var b [4]int
+		if vec1Best4(t8.centN, m.cent, 1, m.nBucket(), n, vecs, n, true, sc, b[:]) {
+			bucket = b
+		} else {
+			for i := range 4 {
+				bucket[i] = m.bestBucket(a[i][:n], true)
+			}
+		}
 		if m.nCodebook() > 0 && m.residual() {
 			for i := range 4 {
 				vec1Sub(tmp[i][:n], a[i][:n], m.centroid(bucket[i]))
@@ -551,7 +569,26 @@ func (m *vec1Model) quantizeN4(tmp, in [4][]float32, code [4][]byte, sc *vec1Buf
 			}
 			return bucket
 		}
-		if !m.encodePQN4(a, code, sc) {
+		ne, nb := m.nCodeElem, m.nCodebook()
+		w := ne * nb
+		if cap(sc.v) < 4*w {
+			sc.v = make([]float32, 4*w)
+		}
+		vecs := sc.v[:4*w]
+		for i := range 4 {
+			copy(vecs[i*w:i*w+w], a[i][:w])
+		}
+		if cap(sc.best) < 4*nb {
+			sc.best = make([]int, 4*nb)
+		}
+		codes := sc.best[:4*nb]
+		if vec1Best4(t8.booksN, m.book, nb, vec1CodebookSize, ne, vecs, w, true, sc, codes) {
+			for b := range nb {
+				for i := range 4 {
+					code[i][b] = byte(codes[4*b+i])
+				}
+			}
+		} else {
 			for i := range 4 {
 				m.encodePQN(a[i], code[i])
 			}
