@@ -405,5 +405,19 @@ func TestVec1KernelsMatchGo(t *testing.T) {
 			}
 		}
 	}
+	// Where the JIT has vector kernels at all, every vec1 kernel must be
+	// there, or the comparisons above tested the Go loops against themselves.
+	if jitEnabled && jit.HasVector() {
+		for name, k := range map[string]*jit.Code{
+			"L2F": vec1Kernel(jit.Vec1L2F), "DotF": vec1Kernel(jit.Vec1DotF), "L2D": vec1Kernel(jit.Vec1L2D),
+			"Scan16": vec1ScanKernel(), "RowsL2D": vec1RowsKernel(), "BestD": vec1BestDKernel(false),
+			"BestDRound": vec1BestDKernel(true), "Cand": vec1CandKernel(), "CandMany": vec1CandManyKernel(),
+			"WHT": vec1WHTKernel(), "Rot4": vec1Rot4Code(),
+		} {
+			if k == nil {
+				t.Errorf("no %s kernel on this machine", name)
+			}
+		}
+	}
 	t.Logf("JIT kernels: %v", vec1Kernel(jit.Vec1L2D) != nil && vec1ScanKernel() != nil)
 }

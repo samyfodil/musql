@@ -504,6 +504,7 @@ func vec1Best4(tn *vec1T8N, rows []float32, sets, m, comp int, vecs []float32, s
 	}
 	scratch := sc.f[:64+32*b]
 	scratch[0], scratch[1] = math.Float32frombits(uint32(b)), 0 // B, an int64
+	vec1CandWeights(scratch)
 	var slack [4]float64
 	for i := range 4 {
 		var vmax float64
@@ -619,6 +620,7 @@ func vec1BestMany(tn *vec1T8N, rows []float32, m, n int, vecs, norms []float32, 
 	for l := range 8 {
 		scratch[8+l], scratch[16+l] = 1, -2 // F, and -2
 	}
+	vec1CandWeights(scratch)
 	rec := 16 + 4*b
 	if cap(sc.cand) < g*rec {
 		sc.cand = make([]byte, g*rec)
@@ -833,4 +835,12 @@ func vec1Rotate4(rot []float32, n int, vecs []float32, out [4][]float32, buf []f
 		copy(out[i][:n], buf[i*rows:i*rows+n])
 	}
 	return buf, true
+}
+
+// vec1CandWeights puts at scratch byte 96 the lane weights a kernel without
+// a movemask (NEON, SIMD128) builds a bit set from: uint32 1, 2, 4, ... 128.
+func vec1CandWeights(scratch []float32) {
+	for l := range 8 {
+		scratch[24+l] = math.Float32frombits(1 << l)
+	}
 }
