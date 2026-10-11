@@ -99,16 +99,17 @@ func vec1FloatBytes(v []float32) []byte {
 // into the high lane comes only from a zero low lane, already a hit).
 func vec1NonFinite(b []byte) bool {
 	const exp2 = 0x7F8000007F800000
-	var hit uint64
+	const one2, top2 = 0x0000000100000001, 0x8000000080000000
 	i := 0
-	for ; i+32 <= len(b); i += 32 {
-		for k := 0; k < 32; k += 8 {
-			x := vec1Native.Uint64(b[i+k:])&exp2 ^ exp2
-			hit |= (x - 0x0000000100000001) &^ x & 0x8000000080000000
-		}
-		if hit != 0 {
+	for w := b; len(w) >= 32; w = w[32:] {
+		x0 := vec1Native.Uint64(w[0:8])&exp2 ^ exp2
+		x1 := vec1Native.Uint64(w[8:16])&exp2 ^ exp2
+		x2 := vec1Native.Uint64(w[16:24])&exp2 ^ exp2
+		x3 := vec1Native.Uint64(w[24:32])&exp2 ^ exp2
+		if ((x0-one2)&^x0|(x1-one2)&^x1|(x2-one2)&^x2|(x3-one2)&^x3)&top2 != 0 {
 			return true
 		}
+		i += 32
 	}
 	for ; i+4 <= len(b); i += 4 {
 		if vec1Native.Uint32(b[i:])&0x7F800000 == 0x7F800000 {
