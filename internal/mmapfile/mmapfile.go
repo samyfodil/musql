@@ -5,7 +5,7 @@ package mmapfile
 
 import (
 	"os"
-	"unsafe"
+	"sync"
 )
 
 // File is a mapped (or, on a platform without mapping, a loaded) file.
@@ -13,6 +13,7 @@ type File struct {
 	data   []byte
 	mapped bool
 	f      *os.File
+	ahead  sync.Once
 }
 
 // Data returns the file's bytes (read-only until Close).
@@ -34,23 +35,13 @@ func (f *File) Len() int {
 	return len(f.data)
 }
 
-// ReadOut returns b's bytes, b a slice of this file's mapping, read from the
-// file with pread rather than through the mapping -- on a platform where a
-// first touch of a mapped page costs more than reading it (readNotFault) --
-// and false when it did not: elsewhere, for bytes outside the mapping, or
-// when the read fails (the caller then reads b itself, as it would have).
-func (f *File) ReadOut(b []byte) ([]byte, bool) {
-	if !readNotFault || f == nil || !f.mapped || f.f == nil || len(b) == 0 || len(f.data) == 0 {
-		return nil, false
+// ReadAhead asks, once per mapping, for the whole file to be read into memory
+// ahead of its first touch, where the platform needs asking (see the darwin
+// readAhead); elsewhere it does nothing. A hint: the bytes read the same
+// either way.
+func (f *File) ReadAhead() {
+	if f == nil || !f.mapped {
+		return
 	}
-	base := uintptr(unsafe.Pointer(unsafe.SliceData(f.data)))
-	at := uintptr(unsafe.Pointer(unsafe.SliceData(b)))
-	if at < base || at+uintptr(len(b)) > base+uintptr(len(f.data)) {
-		return nil, false
-	}
-	out := make([]byte, len(b))
-	if _, err := f.f.ReadAt(out, int64(at-base)); err != nil {
-		return nil, false
-	}
-	return out, true
+	f.ahead.Do(func() { readAhead(f.data) })
 }
