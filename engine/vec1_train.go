@@ -32,14 +32,14 @@ const (
 	vec1QuantOPQ  = 2
 	vec1QuantBQ   = 3
 
-	vec1KMeansIter     = 30
-	vec1KMeansStop     = 0.999
-	vec1PQTrainMin     = vec1CodebookSize * 2
-	vec1MaxCodesize    = 256
-	vec1MinOPQRound    = 1
-	vec1MaxOPQRound    = 32
-	vec1DefaultOPQRnd  = 5
-	vec1TrainMaxVecLen = 64 << 30 // VEC1_TRAINING_MAXCHUNK chunks of 32MiB
+	vec1KMeansIter           = 30
+	vec1KMeansStop           = 0.999
+	vec1PQTrainMin           = vec1CodebookSize * 2
+	vec1MaxCodesize          = 256
+	vec1MinOPQRound          = 1
+	vec1MaxOPQRound          = 32
+	vec1DefaultOPQRnd        = 5
+	vec1TrainMaxVecLen int64 = 64 << 30 // VEC1_TRAINING_MAXCHUNK chunks of 32MiB
 )
 
 // vec1TrainState is Vec1TrainCtx.
@@ -109,7 +109,7 @@ func (it *aggItem) stepVec1Train(ctx *evalCtx, regs []Value) error {
 		p.defaults()
 		p.init = true
 	}
-	if p.nVec*p.nElem*4 >= vec1TrainMaxVecLen {
+	if int64(p.nVec)*int64(p.nElem)*4 >= vec1TrainMaxVecLen {
 		return fmt.Errorf("out of memory")
 	}
 	p.vecs = append(p.vecs, vec1Floats(b)...)
