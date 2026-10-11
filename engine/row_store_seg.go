@@ -32,6 +32,42 @@ type segRows struct {
 	rp   *ReadOnlyPager
 	root uint32
 	tbl  *tableMeta
+
+	// memo keeps rows get decoded, by rowid, for the next get of the same one:
+	// an UPDATE reads each row it writes twice -- its cursor, then the store
+	// again just before writing (opUpdateRow, for what a BEFORE trigger may
+	// have changed) -- and decoding a row from its segment was most of the
+	// cost of the second read. Committed rows change only with the source or
+	// its delta (a commit of this session replays its batch into the delta in
+	// place), so the memo is emptied whenever either has moved since it was
+	// filled. Made only once a store has done memoAfter gets, so a table read
+	// a few rows at a time costs nothing.
+	memoMu      sync.Mutex
+	memo        []segRowMemo
+	memoGets    int
+	memoSrc     *segSource
+	memoDelta   *segDeltaState
+	memoBatches int
+}
+
+// segRowMemo is one memo slot.
+type segRowMemo struct {
+	rid uint64
+	row []Value
+}
+
+const (
+	memoSlots = 1 << 14
+	memoAfter = 4096
+)
+
+// memoKey is what the memo's rows were decoded from.
+func (b *segRows) memoKey() (*segSource, *segDeltaState, int) {
+	src := b.rp.segs
+	if src == nil || src.delta == nil {
+		return src, nil, 0
+	}
+	return src, src.delta, src.delta.batches
 }
 
 // newSegRowStore is the row store over a table's committed rows.
@@ -48,6 +84,20 @@ func newSegRowStoreAt(rp *ReadOnlyPager, root uint32, tbl *tableMeta) *rowStore 
 // get is rid's committed row, normalized exactly as a table load normalizes it
 // (fullStoredRow: full width, generated columns computed).
 func (b *segRows) get(rid uint64) ([]Value, bool) {
+	b.memoMu.Lock()
+	src, delta, batches := b.memoKey()
+	if b.memo != nil && (src != b.memoSrc || delta != b.memoDelta || batches != b.memoBatches) {
+		clear(b.memo)
+	}
+	b.memoSrc, b.memoDelta, b.memoBatches = src, delta, batches
+	if b.memo != nil {
+		if e := &b.memo[rid%memoSlots]; e.row != nil && e.rid == rid {
+			row := e.row
+			b.memoMu.Unlock()
+			return row, true
+		}
+	}
+	b.memoMu.Unlock()
 	vals, found, served := b.rp.SeekRowidSegments(b.root, int64(rid))
 	if !served || !found {
 		return nil, false
@@ -56,6 +106,16 @@ func (b *segRows) get(rid uint64) ([]Value, bool) {
 	if err != nil {
 		return nil, false
 	}
+	b.memoMu.Lock()
+	if b.memo == nil {
+		if b.memoGets++; b.memoGets > memoAfter {
+			b.memo = make([]segRowMemo, memoSlots)
+		}
+	}
+	if b.memo != nil && src == b.memoSrc && delta == b.memoDelta && batches == b.memoBatches {
+		b.memo[rid%memoSlots] = segRowMemo{rid, row}
+	}
+	b.memoMu.Unlock()
 	return row, true
 }
 
