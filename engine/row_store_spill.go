@@ -400,8 +400,12 @@ func (s *rowStore) spillOutSegments() bool {
 		sf.res.ms = append(sf.res.ms, m)
 		idx := int64(len(sf.segs))
 		sf.segs = append(sf.segs, &spillSeg{seg: seg, m: m})
-		for i := 0; i < seg.nRows; i++ {
-			s.m[rowids[start+i]] = []Value{{Typ: valueSpilledSeg, I: idx, F: float64(i)}}
+		// One allocation for the segment's sentinels, each row a one-Value
+		// window of it (capped, so nothing appends into a neighbour).
+		sent := make([]Value, seg.nRows)
+		for i := range sent {
+			sent[i] = Value{Typ: valueSpilledSeg, I: idx, F: float64(i)}
+			s.m[rowids[start+i]] = sent[i : i+1 : i+1]
 		}
 		start += seg.nRows
 		spilledRows += int64(seg.nRows)
