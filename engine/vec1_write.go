@@ -749,8 +749,15 @@ func (w *vec1W) rebuildIndex() error {
 	var jobs []*job
 	next := make(chan *job, 256)
 	var wg sync.WaitGroup
+	// vec1's jobs are 1024 rows. Any multiple of four quantizes the same --
+	// only the last four-row batch can be short, wherever the jobs split --
+	// so one worker takes larger ones, and hands off less often.
+	jobRows := vec1QuantizeJob
 	if !zeroBase {
 		workers := max(1, min(runtime.GOMAXPROCS(0), w.db.vec1Conn().nThreadValue()))
+		if workers == 1 {
+			jobRows = 16 * vec1QuantizeJob
+		}
 		for range workers {
 			wg.Add(1)
 			go func() {
@@ -787,7 +794,7 @@ func (w *vec1W) rebuildIndex() error {
 			r.meta[i] = vec1OwnedValue(vec1Col(row, 2+i))
 		}
 		cur = append(cur, r)
-		if len(cur) == vec1QuantizeJob {
+		if len(cur) == jobRows {
 			send()
 		}
 		return true, nil
