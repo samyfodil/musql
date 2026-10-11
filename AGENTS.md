@@ -62,6 +62,21 @@ The engine runs a program two ways only: the VDBE, or the JIT-compiled VDBE.
 - The remaining deliberate declines are listed in
   `docs/segment-format-compatibility.md`.
 
+## Rule 4: a file that opened once opens forever
+
+The segment file carries its format version (`segFileVersion` in
+`engine/segment_file.go`); the delta log carries its own (`segDeltaVersion`).
+
+- Any change a reader would see takes a new version.
+- The reader goes on decoding every version back to `segFileMinVersion`,
+  branching on the file's own, as the delta log already does. An old file
+  opens as it was, and its next compaction writes it in the current format.
+- Each version has a database in `driver/testdata/format/v<N>/` with what it
+  answered (`TestFormatFixture`). A new version adds its own fixture
+  (`MUSQL_WRITE_FORMAT_FIXTURE=1`) and never regenerates an old one.
+- Raising `segFileMinVersion` strands files people have. It needs a converter
+  first.
+
 ## Layout
 
 | Path | What it is |

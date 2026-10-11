@@ -29,10 +29,21 @@ import (
 //	            (offset, length) of each of its segments; then the CATALOG --
 //	            every index, view and trigger, and every AUTOINCREMENT counter
 //	segments    each 8-byte aligned, in directory order
+//
+// segFileVersion is the format this build writes, and segFileMinVersion the
+// oldest it reads: a file is readable from every build after the one that
+// wrote it. A change to what a reader sees takes a new version, and the reader
+// goes on decoding every version back to segFileMinVersion -- branching on the
+// file's own, as the delta log does on segDeltaVersion -- so an old file opens
+// as it was and is written back in the current format by its next compaction.
+// driver/testdata/format holds a database of each version, and
+// TestFormatFixture fails a change that cannot read one. Raising
+// segFileMinVersion drops files people may have; it needs a converter first.
 const (
-	segFileMagic   = "MQSF"
-	segFileVersion = 4
-	segFileHdrSize = 24
+	segFileMagic      = "MQSF"
+	segFileVersion    = 4
+	segFileMinVersion = 4
+	segFileHdrSize    = 24
 )
 
 // SegmentFile is a mapped segment file.
@@ -373,9 +384,13 @@ func OpenSegmentFile(path string) (*SegmentFile, error) {
 		m.Close()
 		return nil, fmt.Errorf("segment file: not a segment file")
 	}
-	if v := binary.LittleEndian.Uint32(buf[4:]); v != segFileVersion {
+	switch v := binary.LittleEndian.Uint32(buf[4:]); {
+	case v > segFileVersion:
 		m.Close()
-		return nil, fmt.Errorf("segment file: version %d, this build writes %d", v, segFileVersion)
+		return nil, fmt.Errorf("segment file: format version %d is from a newer musql; this build reads versions %d to %d", v, segFileMinVersion, segFileVersion)
+	case v < segFileMinVersion:
+		m.Close()
+		return nil, fmt.Errorf("segment file: format version %d is older than this build reads (%d to %d)", v, segFileMinVersion, segFileVersion)
 	}
 	nTables := int(binary.LittleEndian.Uint32(buf[8:]))
 	dirLen := int(binary.LittleEndian.Uint32(buf[12:]))
