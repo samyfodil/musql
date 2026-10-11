@@ -227,9 +227,16 @@ func (n *Session) rewriteFile() error {
 // took 0.5ms. Once the file IS the session's view -- every row the session
 // holds has just been written to it -- reading back from it loses nothing.
 //
-// Skipped inside a transaction (a savepoint's snapshot shares these stores),
-// while a table aliases another's storage (the alias shares its owner's store
-// object, which unloading both would split), and while there is a virtual
+// Skipped inside an engine transaction (a savepoint's snapshot shares these
+// stores) -- but not for a DRIVER-held one (DB.heldTransaction): that one is
+// committing right now, and its engine BEGIN, if any, was committed first
+// (commitHeldSession), so no snapshot is left. Skipping it too left every
+// table a driver transaction loaded in memory for the connection's life, with
+// no index to seek: "SELECT * FROM t WHERE sec = ?" after a 100,000-row
+// BEGIN...COMMIT sorted the whole table per query, 150 ms against C's 17 us.
+//
+// Also skipped while a table aliases another's storage (the alias shares its
+// owner's store object, which unloading both would split), and while there is a virtual
 // table: fts3/fts4/fts5 and rtree write their shadow tables through putRow,
 // which assumes a loaded store (fts3StoreSegment on an unloaded one was a nil
 // dereference in TestVirtualTableRowsSurviveAReopen).
@@ -238,7 +245,7 @@ func (n *Session) rewriteFile() error {
 // keep its shadow tables loaded and re-base the rest if that ever matters.
 func (n *Session) rebase(open func(string) (*ReadOnlyPager, error)) {
 	db := n.DB
-	if db.inTransaction() || len(db.vtabs) > 0 {
+	if db.txActive || len(db.vtabs) > 0 {
 		return
 	}
 	for _, t := range db.tables {
