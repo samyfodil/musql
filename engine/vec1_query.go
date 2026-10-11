@@ -852,7 +852,11 @@ func (q *vec1Read) row(rowid int64, base []Value, dist Value) ([]Value, error) {
 // %_base holds the bucket) the list entry vec1FindByRowid finds.
 func (q *vec1Read) vector(rowid int64, base []Value) (Value, error) {
 	if !q.t.mod.isFlat() {
-		return vec1Col(base, 1), nil
+		v := vec1Col(base, 1)
+		if v.Typ == Blob {
+			v.S = q.p.readMapped(v.S)
+		}
+		return v, nil
 	}
 	bucket := int(int32(valueToInt64Trunc(vec1Col(base, 1))))
 	nElem := q.t.cfg.nElem
@@ -1192,4 +1196,33 @@ func vec1Grow(buf *[]float32, n int) []float32 {
 	}
 	*buf = (*buf)[:n]
 	return *buf
+}
+
+// readMapped is b, a value's bytes, read from the segment file with pread
+// where the platform faults a mapped page in more dearly than it reads it
+// (mmapfile.File.ReadOut), and b itself otherwise. A search's output rows
+// are scattered over the file: on macOS touching each one's page through the
+// mapping cost a page-in apiece. A write session's pager reads its
+// committed rows through the session's own segment pager.
+func (p *ReadOnlyPager) readMapped(b []byte) []byte {
+	for range 3 {
+		if p == nil || p.segs == nil {
+			return b
+		}
+		if f := p.segs.file; f != nil {
+			if out, ok := f.m.ReadOut(b); ok {
+				return out
+			}
+			return b
+		}
+		switch {
+		case p.segs.frozenSegs != nil:
+			p = p.segs.frozenSegs
+		case p.segs.session != nil:
+			p = p.segs.session.segments
+		default:
+			return b
+		}
+	}
+	return b
 }

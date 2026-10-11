@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -204,6 +205,8 @@ func TestVec1Bench(t *testing.T) {
 			}
 			hits := 0
 			stop := profile("query")
+			var ru0 syscall.Rusage
+			syscall.Getrusage(syscall.RUSAGE_SELF, &ru0)
 			// One warm-up, then each query once.
 			for qi := -1; qi < len(queries); qi++ {
 				qv := queries[max(qi, 0)]
@@ -246,6 +249,9 @@ func TestVec1Bench(t *testing.T) {
 			}
 			stmt.Close()
 			stop()
+			var ru1 syscall.Rusage
+			syscall.Getrusage(syscall.RUSAGE_SELF, &ru1)
+			t.Logf("%s %s queries: minor faults %d, major faults %d, in-blocks %d", c.name, eng, ru1.Minflt-ru0.Minflt, ru1.Majflt-ru0.Majflt, ru1.Inblock-ru0.Inblock)
 			rs.recall = float64(hits) / float64(10*len(queries))
 			res[eng] = rs
 			db.Close()
