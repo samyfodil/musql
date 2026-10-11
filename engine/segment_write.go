@@ -1605,6 +1605,7 @@ func (db *DB) adoptConnSettingsFrom(old *DB) {
 	db.recursiveTriggers = old.recursiveTriggers
 	db.untrustedSchema = old.untrustedSchema
 	db.rtreeConns = old.rtreeConns
+	db.vec1Conns = old.vec1Conns
 	db.queryOnly = old.queryOnly
 	db.writeLock = old.writeLock
 	db.maxSize = old.maxSize

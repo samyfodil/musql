@@ -132,38 +132,7 @@ func EmitVecDistStrided(l2 bool) ([]byte, error) {
 	a.MovRegReg(R12, R9)
 
 	a.Label("block")
-	for r, reg := range []Reg{0, 1, 2, 3} {
-		a.vmovupsLoadRow(reg, RAX, r)
-	}
-	for r, reg := range []Reg{4, 5, 6, 7} {
-		a.vmovupsLoadRow(reg, RDX, r)
-	}
-	// 8x8 transpose; afterwards component k of rows 0..7 is in col[k].
-	a.VunpcklpsYmm(8, 0, 1)
-	a.VunpckhpsYmm(0, 0, 1)
-	a.VunpcklpsYmm(9, 2, 3)
-	a.VunpckhpsYmm(2, 2, 3)
-	a.VunpcklpsYmm(10, 4, 5)
-	a.VunpckhpsYmm(4, 4, 5)
-	a.VunpcklpsYmm(11, 6, 7)
-	a.VunpckhpsYmm(6, 6, 7)
-	a.VshufpsYmm(1, 8, 9, 0x44)
-	a.VshufpsYmm(8, 8, 9, 0xEE)
-	a.VshufpsYmm(3, 0, 2, 0x44)
-	a.VshufpsYmm(0, 0, 2, 0xEE)
-	a.VshufpsYmm(5, 10, 11, 0x44)
-	a.VshufpsYmm(10, 10, 11, 0xEE)
-	a.VshufpsYmm(7, 4, 6, 0x44)
-	a.VshufpsYmm(4, 4, 6, 0xEE)
-	a.Vperm2f128(2, 1, 5, 0x20)
-	a.Vperm2f128(1, 1, 5, 0x31)
-	a.Vperm2f128(6, 8, 10, 0x20)
-	a.Vperm2f128(8, 8, 10, 0x31)
-	a.Vperm2f128(9, 3, 7, 0x20)
-	a.Vperm2f128(3, 3, 7, 0x31)
-	a.Vperm2f128(11, 0, 4, 0x20)
-	a.Vperm2f128(0, 0, 4, 0x31)
-	col := [8]Reg{2, 6, 9, 11, 1, 8, 3, 0}
+	col := a.loadTransposed8()
 	for k, c := range col {
 		a.VbroadcastssMemD(12, R8, int8(4*k))
 		if l2 {
@@ -196,6 +165,45 @@ func EmitVecDistStrided(l2 bool) ([]byte, error) {
 	a.Vzeroupper()
 	a.Ret()
 	return a.Code()
+}
+
+// loadTransposed8 loads eight components of eight rows -- rows 0..3 at RAX
+// (stride RBX, R13 three strides), rows 4..7 at RDX -- and transposes them,
+// returning the registers that hold component k of all eight rows. It uses
+// Y0..Y11.
+func (a *Asm) loadTransposed8() [8]Reg {
+	for r, reg := range []Reg{0, 1, 2, 3} {
+		a.vmovupsLoadRow(reg, RAX, r)
+	}
+	for r, reg := range []Reg{4, 5, 6, 7} {
+		a.vmovupsLoadRow(reg, RDX, r)
+	}
+	// 8x8 transpose; afterwards component k of rows 0..7 is in col[k].
+	a.VunpcklpsYmm(8, 0, 1)
+	a.VunpckhpsYmm(0, 0, 1)
+	a.VunpcklpsYmm(9, 2, 3)
+	a.VunpckhpsYmm(2, 2, 3)
+	a.VunpcklpsYmm(10, 4, 5)
+	a.VunpckhpsYmm(4, 4, 5)
+	a.VunpcklpsYmm(11, 6, 7)
+	a.VunpckhpsYmm(6, 6, 7)
+	a.VshufpsYmm(1, 8, 9, 0x44)
+	a.VshufpsYmm(8, 8, 9, 0xEE)
+	a.VshufpsYmm(3, 0, 2, 0x44)
+	a.VshufpsYmm(0, 0, 2, 0xEE)
+	a.VshufpsYmm(5, 10, 11, 0x44)
+	a.VshufpsYmm(10, 10, 11, 0xEE)
+	a.VshufpsYmm(7, 4, 6, 0x44)
+	a.VshufpsYmm(4, 4, 6, 0xEE)
+	a.Vperm2f128(2, 1, 5, 0x20)
+	a.Vperm2f128(1, 1, 5, 0x31)
+	a.Vperm2f128(6, 8, 10, 0x20)
+	a.Vperm2f128(8, 8, 10, 0x31)
+	a.Vperm2f128(9, 3, 7, 0x20)
+	a.Vperm2f128(3, 3, 7, 0x31)
+	a.Vperm2f128(11, 0, 4, 0x20)
+	a.Vperm2f128(0, 0, 4, 0x31)
+	return [8]Reg{2, 6, 9, 11, 1, 8, 3, 0}
 }
 
 // vmovupsLoadRow loads row r (0..3) of the four at p: [p], [p+RBX],

@@ -360,8 +360,9 @@ func (s *rowStore) eachSortedUntil(yield func(rowid uint64, vals []Value) bool) 
 	case s.seg != nil:
 		s.segEachSorted(yield)
 	default:
+		var rd spillReader
 		for _, rowid := range s.sortedRowids() {
-			if !yield(rowid, s.resolve(s.m[rowid])) {
+			if !yield(rowid, rd.resolve(s, s.m[rowid])) {
 				return
 			}
 		}
@@ -407,7 +408,9 @@ func (s *rowStore) clone(owner *tableMeta) *rowStore {
 // that cache is tested against.
 func sortedRowidsOf(s *rowStore) []uint64 {
 	out := make([]uint64, 0, s.len())
-	for rid := range s.all() {
+	// The keys alone: a walk through all() would read every spilled row back
+	// to throw it away.
+	for rid := range s.m {
 		out = append(out, rid)
 	}
 	radixSortRowids(out)

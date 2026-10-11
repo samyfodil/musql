@@ -814,6 +814,18 @@ type FromItem struct {
 	// row.
 	tvfOmitPlus1 int
 
+	// tvfOmitSet is tvfOmitPlus1 for a module that consumes several
+	// conjuncts at once -- vec1, whose nearest-neighbour search applies every
+	// metadata constraint inside the index (vec1_plan.go): the tvfWhere
+	// indices the scan compiler removed from the residual WHERE for it. The
+	// module recomputes the set at run time and declines unless it matches.
+	tvfOmitSet []int
+
+	// vtabSelect is the SELECT this item is a FROM item of, set with tvfWhere
+	// by withVtabWhere: vec1 reads the LIMIT C's planner would hand its
+	// xBestIndex (sqlite3WhereAddLimit), which depends on the whole statement.
+	vtabSelect *SelectStmt
+
 	// fts3ContentUnneeded marks a FROM item proved to need no read of its
 	// %_content (fts3StmtContentUnneeded). Set with tvfWhere by withVtabWhere and
 	// read only by materializeFts3Ascending, which then also offers docids the

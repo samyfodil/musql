@@ -123,6 +123,9 @@ func funcArity(name string) (min, max int, ok bool) {
 	if lo, hi, ok := vectorArity(name); ok {
 		return lo, hi, true
 	}
+	if lo, hi, ok := vec1Arity(name); ok {
+		return lo, hi, true
+	}
 	switch name {
 	case "abs", "length", "octet_length", "lower", "upper", "typeof", "hex":
 		return 1, 1, true
@@ -222,6 +225,9 @@ func callScalarFuncEnc(name string, args []Value, caseSensitiveLike bool, enc Te
 		return Value{}, err
 	}
 	if v, ok, err := callVectorFunc(name, args); ok {
+		return v, err
+	}
+	if v, ok, err := callVec1Func(name, args); ok {
 		return v, err
 	}
 	switch name {

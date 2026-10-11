@@ -748,6 +748,9 @@ type DB struct {
 	// the oracle; false still means "unknown", never "clean" -- clean is what
 	// txMayHaveDirtiedMain==false proves. Reset alongside it.
 	txDirtiedMain bool
+	// dirtiedText and dirtiedTarget are noteTransactionDirtiedMain's last parse:
+	// a statement's text and the table it writes ("" for none).
+	dirtiedText, dirtiedTarget string
 
 	//	// txSchemaChanged mirrors C's DBFLAG_SchemaChange (sqliteInt.h:1893):
 	//	// set once a schema-changing DDL succeeds in the open transaction
@@ -763,6 +766,11 @@ type DB struct {
 
 	// rtreeConns is this session's connection's r-tree registry (rtree_conn.go).
 	rtreeConns *RtreeConnections
+	// vec1Conns is this session's connection's vec1 state (vec1_table.go).
+	vec1Conns *Vec1Connection
+	// vec1Wctx is the write statement running a vec1 table's xUpdate, whose
+	// journal its shadow-table writes go into (vec1_shadow.go).
+	vec1Wctx *writeCtx
 
 	// heldTransaction marks a session a DRIVER is holding open as one logical
 	// transaction (driver's BeginTx keeps a single engine.DB from BEGIN to
@@ -895,6 +903,9 @@ func (db *DB) stampPager(p *ReadOnlyPager) {
 	p.untrustedSchema = db.untrustedSchema
 	// ...and the connection's r-tree registry (rtree_conn.go).
 	p.rtreeConns = db.rtreeConns
+	// ...and the connection's vec1 state, whose per-table cache and
+	// vec1_config() settings a read shares with the writes (vec1_table.go).
+	p.vec1Conns = db.vec1Conn()
 	// ...and PRAGMA defer_foreign_keys, whose getter has nowhere else to read
 	// it from (see ReadOnlyPager.deferFKs).
 	p.deferFKs = db.deferFKs

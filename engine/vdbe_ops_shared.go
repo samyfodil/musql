@@ -18,6 +18,8 @@ func (m *vdbe) opFunction(op *Instruction) error {
 	case string:
 		if f == "rtreecheck" {
 			v, ferr = m.rtreecheck(args) // reads the database; see rtree_check.go
+		} else if f == "vec1_config" {
+			v, ferr = m.vec1Config(args) // the connection's state; see vec1_func.go
 		} else {
 			v, ferr = callScalarFuncEnc(f, args, m.likeCaseSensitive(), m.encoding(), op.P5)
 		}

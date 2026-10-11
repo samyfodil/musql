@@ -820,6 +820,9 @@ func (db *DB) insertIntoVtab(vm *vtabMeta, stmt *insertStmt, pre [][]Value, preW
 	if serr := db.rtreeSyncIfNeeded(vm); serr != nil {
 		return 0, serr
 	}
+	if serr := db.vec1AfterStatement(vm); serr != nil {
+		return 0, serr
+	}
 	return count, nil
 }
 
@@ -833,6 +836,9 @@ func (db *DB) insertIntoVtab(vm *vtabMeta, stmt *insertStmt, pre [][]Value, preW
 // fst.InsertRowReplace mutates anything, with the exact count: whether this
 // row collides is one read-only lookup.
 func (db *DB) vtabInsertRowOne(vm *vtabMeta, stmt *insertStmt, full []Value) (int64, error) {
+	if st, isVec1 := vec1ModuleOf(vm); isVec1 {
+		return db.vec1Insert(vm, st, full)
+	}
 	if stmt.orAction != conflictReplace {
 		return vm.store.InsertRow(full)
 	}
@@ -896,6 +902,9 @@ func (db *DB) deleteVtab(vm *vtabMeta, stmt *deleteStmt, args []Value, outer *ev
 	}
 	if stmt.returning != nil {
 		return 0, fmt.Errorf("engine: DELETE ... RETURNING from a virtual table is not supported by this write path")
+	}
+	if st, isVec1 := vec1ModuleOf(vm); isVec1 {
+		return db.deleteVec1(vm, st, stmt, pre)
 	}
 	if containsSubquery(stmt.where) {
 		return 0, fmt.Errorf("engine: DELETE from a virtual table with a subquery in WHERE is not supported by this write path")
@@ -1009,6 +1018,23 @@ func (db *DB) updateVtab(vm *vtabMeta, stmt *updateStmt, args []Value, outer *ev
 	if containsSubquery(stmt.where) {
 		return 0, fmt.Errorf("engine: UPDATE against a virtual table with a subquery in WHERE is not supported by this write path")
 	}
+	vec1St, isVec1 := vec1ModuleOf(vm)
+	if isVec1 {
+		if err := vec1DeclineDistanceRef(stmt.where); err != nil {
+			return 0, err
+		}
+		for _, a := range stmt.sets {
+			if err := vec1DeclineDistanceRef(a.expr); err != nil {
+				return 0, err
+			}
+		}
+		if stmt.orAction == conflictReplace {
+			return 0, fmt.Errorf("engine: UPDATE against a virtual table with an OR clause is not supported by this write path")
+		}
+		if err := db.vec1StatementBegin(vm, stmt.where); err != nil {
+			return 0, err
+		}
+	}
 	cols := vtabColumnInfos(vm.store.vtabColumns())
 	setIdx := make([]int, len(stmt.sets))
 	for i, a := range stmt.sets {
@@ -1041,6 +1067,12 @@ func (db *DB) updateVtab(vm *vtabMeta, stmt *updateStmt, args []Value, outer *ev
 		scope.fts5Detail = fst.detail
 	}
 	rowids, rows := vm.store.vtabRows()
+	if isVec1 {
+		var werr error
+		if rowids, rows, werr = db.vec1WriteRows(vm, vec1St); werr != nil {
+			return 0, werr
+		}
+	}
 
 	type pending struct {
 		oldRowid int64
@@ -1132,7 +1164,13 @@ func (db *DB) updateVtab(vm *vtabMeta, stmt *updateStmt, args []Value, outer *ev
 	}
 	applied := 0
 	for _, pd := range pends {
-		if _, uerr := vtabUpdateRowConflict(vm.store, stmt.orAction, pd.oldRowid, pd.newVals, modified); uerr != nil {
+		var uerr error
+		if isVec1 {
+			_, uerr = db.vec1Update(vm, vec1St, pd.oldRowid, pd.newVals)
+		} else {
+			_, uerr = vtabUpdateRowConflict(vm.store, stmt.orAction, pd.oldRowid, pd.newVals, modified)
+		}
+		if uerr != nil {
 			if stmt.orAction == conflictIgnore && vtabIgnorable(uerr) {
 				// vdbe.c:8750, same OE_Ignore mechanism as insertIntoVtab's
 				// identical check: this row's rc was rewritten to SQLITE_OK
@@ -1160,6 +1198,11 @@ func (db *DB) updateVtab(vm *vtabMeta, stmt *updateStmt, args []Value, outer *ev
 	if applied > 0 { // see deleteVtab
 		if serr := db.rtreeSyncIfNeeded(vm); serr != nil {
 			return 0, serr
+		}
+	}
+	if isVec1 {
+		if err := db.vec1StatementEnd(vm, stmt.where); err != nil {
+			return 0, err
 		}
 	}
 	return applied, nil

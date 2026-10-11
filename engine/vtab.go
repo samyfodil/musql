@@ -236,6 +236,7 @@ func withVtabWhere(p *ReadOnlyPager, stmt *SelectStmt) []FromItem {
 	copy(out, from)
 	for i := range out {
 		out[i].tvfWhere = conj
+		out[i].vtabSelect = stmt
 		out[i].fts3ContentUnneeded, out[i].fts3ContentWanted = fts3StmtContentUnneeded(p, stmt, out[i].Table, out[i].Alias)
 	}
 	return out
@@ -336,6 +337,9 @@ func vtabDrivesBestIndex(mod VtabModule, it FromItem) bool {
 	if _, isFts5 := mod.(fts5Module); isFts5 {
 		return false
 	}
+	if _, isVec1 := mod.(vec1Module); isVec1 {
+		return false
+	}
 	if _, isWritable := mod.(writableVtabModule); isWritable {
 		return false
 	}
@@ -376,6 +380,16 @@ func (p *ReadOnlyPager) materializeVtab(it FromItem, params []Value, outer *eval
 	// An fts5 table is writable but keeps its rows in %_content instead, like
 	// fts3 -- see fts5_shadow.go's materializeFts5. Checked first, because it
 	// has no b-tree of its own for materializeWritableVtab to read.
+	// A vec1 table, read whole or searched, with or without the
+	// table-valued-function arguments that make it a search (vec1_query.go).
+	if _, isVec1 := mod.(vec1Module); isVec1 {
+		_, vt, _ := vtabConnect(p.fts3Catalog(), mod, modArgs)
+		st, ok := vt.(*vec1Store)
+		if !ok {
+			return nil, nil, nil, fmt.Errorf("engine: vec1 table %s has no store", it.Table)
+		}
+		return p.materializeVec1(it, cols, st, params, outer, trig, from, corr)
+	}
 	if _, isFts5 := mod.(fts5Module); isFts5 && !it.TableFunc {
 		return p.materializeFts5(it, cols)
 	}
@@ -453,6 +467,14 @@ func (p *ReadOnlyPager) materializeVtab(it FromItem, params []Value, outer *eval
 		return cols, rows, rowids, nil
 	}
 
+	// vec1cat lists the connection's vec1 tables (vec1_cat.go).
+	if _, isCat := tab.(vec1CatTable); isCat {
+		rows, rowids, cerr := p.vec1CatRows()
+		if cerr != nil {
+			return nil, nil, nil, cerr
+		}
+		return cols, rows, rowids, nil
+	}
 	// vector_top_k searches a table of this database (vector_index.go).
 	if _, isTopK := tab.(vectorTopKTable); isTopK {
 		rows, rowids, verr := p.vectorTopKRows(info.IdxNum, argv)
@@ -532,6 +554,13 @@ func (p *ReadOnlyPager) materializeWritableVtab(name string, cols []columnInfo) 
 // eponymous module. It errors "no such table" when none matches.
 func (p *ReadOnlyPager) resolveVtabModuleForItem(it FromItem) (VtabModule, []string, error) {
 	if it.TableFunc {
+		// A vec1 table is searched by calling it, "FROM t(vector, params)":
+		// its arguments are its hidden columns, as any virtual table's are.
+		if moduleName, args, ok, err := p.createdVtabDef(it.Table); err == nil && ok && strings.EqualFold(moduleName, "vec1") {
+			if m, found := lookupVtabModule(moduleName); found {
+				return m, args, nil
+			}
+		}
 		m, ok := lookupVtabModule(it.Table)
 		if !ok {
 			return nil, nil, fmt.Errorf("engine: no such table-valued function: %s()", it.Table)
@@ -969,6 +998,17 @@ func (db *DB) CreateVirtualTable(sqlText string) error {
 			}
 		}
 		if cerr := fm.createShadowTables(db, name, store.(*fts5Store), isTemp); cerr != nil {
+			return fmt.Errorf("engine: CREATE VIRTUAL TABLE %s: %w", name, cerr)
+		}
+	}
+	// vec1 keeps everything in five shadow tables of its own, created with
+	// the table (vec1_table.go). This engine's vec1 read path resolves them
+	// in main only.
+	if vm, isVec1 := mod.(vec1Module); isVec1 {
+		if isTemp {
+			return fmt.Errorf("engine: %w: CREATE VIRTUAL TABLE %s USING vec1 in the temp database", errVDBEUnsupported, name)
+		}
+		if cerr := vm.createShadowTables(db, name, store.(*vec1Store), isTemp); cerr != nil {
 			return fmt.Errorf("engine: CREATE VIRTUAL TABLE %s: %w", name, cerr)
 		}
 	}

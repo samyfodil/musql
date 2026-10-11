@@ -403,7 +403,12 @@ func (m *vdbe) runVInsert(plan *vtabInsertPlan, rows [][]Value) error {
 	// ("RETURNING id, ?"), which with nil answered NULL silently.
 	// outer is nil: a trigger body cannot carry RETURNING
 	// (build.c:1443-1444), so there is no enclosing row.
-	n, err := m.wctx.db.insertIntoVtab(plan.vm, plan.stmt, rows, plan.srcWidth, m.params, nil, ret)
+	db := m.wctx.db
+	prevWctx := db.vec1Wctx
+	db.vec1Wctx = m.wctx
+	n, err := db.insertIntoVtab(plan.vm, plan.stmt, rows, plan.srcWidth, m.params, nil, ret)
+	db.vec1Wctx = prevWctx
+	db.vec1FailedStatement(plan.vm, err)
 	if ret != nil {
 		// The COLUMNS are published even when no row was captured, and
 		// published as a NON-NIL empty slice in that case: execReturningViaVM
@@ -564,6 +569,9 @@ func (db *DB) vtabWriteRows(vm *vtabMeta) ([]int64, [][]Value, error) {
 		// Unreachable: vtabWriteScope declined a read-only module at compile
 		// time. Reported rather than dereferenced (AGENTS.md invariant 2).
 		return nil, nil, fmt.Errorf("engine: table %s may not be modified (virtual table is read-only)", vm.name)
+	}
+	if st, isVec1 := vec1ModuleOf(vm); isVec1 {
+		return db.vec1WriteRows(vm, st)
 	}
 	rowids, rows := vm.store.vtabRows()
 	return rowids, rows, nil
@@ -954,11 +962,16 @@ func (m *vdbe) opVWrite(op *Instruction) error {
 	m.vtabWrite = nil
 	var n int
 	var err error
+	db := m.wctx.db
+	prevWctx := db.vec1Wctx
+	db.vec1Wctx = m.wctx
 	if plan.del != nil {
-		n, err = m.wctx.db.deleteVtab(plan.vm, plan.del, nil, nil, sel)
+		n, err = db.deleteVtab(plan.vm, plan.del, nil, nil, sel)
 	} else {
-		n, err = m.wctx.db.updateVtab(plan.vm, plan.upd, nil, nil, sel)
+		n, err = db.updateVtab(plan.vm, plan.upd, nil, nil, sel)
 	}
+	db.vec1Wctx = prevWctx
+	db.vec1FailedStatement(plan.vm, err)
 	// Recorded even when the statement ERRORED, and by ASSIGNMENT -- for the
 	// reasons opVInsert's identical pair states: one OpVWrite is one whole
 	// statement however many rows it turns out to have touched, and an OR

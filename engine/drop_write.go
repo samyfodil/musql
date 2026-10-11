@@ -239,6 +239,12 @@ func (db *DB) DropTable(sqlText string) error {
 			if fm, isFts5 := fts5ModuleOf(vt); isFts5 {
 				fm.dropShadowTables(db, vt.name)
 			}
+			if _, isVec1 := vec1ModuleOf(vt); isVec1 {
+				// vec1DestroyMethod: "DROP TABLE IF EXISTS" each shadow table,
+				// and the connection forgets the table (xDisconnect).
+				vec1Module{}.dropShadowTables(db, vt.name, vt.isTemp)
+				db.vec1Conn().forget(schemaScopeName(createScope(vt.isTemp)), vt.name)
+			}
 			if _, isRtree := vt.store.(*rtreeStore); isRtree {
 				// rtree's xDestroy drops all three unconditionally
 				// (rtree.c:1083-1085, "DROP TABLE '%q'.'%q_node';" and its
