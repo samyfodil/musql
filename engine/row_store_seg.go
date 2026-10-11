@@ -283,16 +283,28 @@ func (s *rowStore) segEachSorted(yield func(uint64, []Value) bool) {
 	s.segEachSortedOver(s.seg.walk, yield)
 }
 
+// segEachSortedRaw is segEachSorted handing out the overlay's rows as m holds
+// them, a spilled row as its sentinel.
+func (s *rowStore) segEachSortedRaw(yield func(uint64, []Value) bool) {
+	s.segEachSortedOverWith(s.seg.walk, func(v []Value) []Value { return v }, yield)
+}
+
 // segEachSortedOver is segEachSorted over the base rows walk hands it, which
 // may be a subset (segRows.walkFiltered): every overlay row still goes out.
 func (s *rowStore) segEachSortedOver(walk func(func(uint64, []Value) bool), yield func(uint64, []Value) bool) {
+	s.segEachSortedOverWith(walk, s.resolve, yield)
+}
+
+// segEachSortedOverWith is segEachSortedOver reading each overlay row through
+// resolve.
+func (s *rowStore) segEachSortedOverWith(walk func(func(uint64, []Value) bool), resolve func([]Value) []Value, yield func(uint64, []Value) bool) {
 	over := s.overlaySorted()
 	oi := 0
 	stop := false
 	if !s.baseGone {
 		walk(func(rid uint64, vals []Value) bool {
 			for oi < len(over) && rowidLess(over[oi], rid) {
-				if v, ok := s.m[over[oi]]; ok && !yield(over[oi], s.resolve(v)) {
+				if v, ok := s.m[over[oi]]; ok && !yield(over[oi], resolve(v)) {
 					stop = true
 					return false
 				}
@@ -315,7 +327,7 @@ func (s *rowStore) segEachSortedOver(walk func(func(uint64, []Value) bool), yiel
 		return
 	}
 	for ; oi < len(over); oi++ {
-		if v, ok := s.m[over[oi]]; ok && !yield(over[oi], s.resolve(v)) {
+		if v, ok := s.m[over[oi]]; ok && !yield(over[oi], resolve(v)) {
 			return
 		}
 	}

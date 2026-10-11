@@ -370,11 +370,15 @@ func (db *DB) segmentFileContentsOf(temp bool, w *segFileWriter) ([]ConvertedTab
 		// order and cut as they fill, so a table this session spilled
 		// (row_store_spill.go) is read back a segment at a time, not whole.
 		cut := &segCutter{cols: colInfos, what: t.name, emit: func(raw []byte) error { return w.addSegment(ti, raw) }}
+		run := spillRun{st: t.rows, cut: cut, nCols: len(colInfos), emit: func(raw []byte) error { return w.addSegment(ti, raw) }}
 		var cerr error
-		t.rows.eachSortedUntil(func(rid uint64, vals []Value) bool {
-			cerr = cut.add(rid, vals)
+		t.rows.eachSortedRaw(func(rid uint64, vals []Value) bool {
+			cerr = run.add(rid, vals)
 			return cerr == nil
 		})
+		if cerr == nil {
+			cerr = run.end()
+		}
 		if cerr == nil {
 			cerr = cut.flush()
 		}
@@ -783,4 +787,65 @@ func pristineSegments(t *tableMeta) ([]*segment, bool) {
 		}
 	}
 	return segs, true
+}
+
+// spillRun feeds a table's rows, in rowid order and as its store holds them,
+// to a segCutter -- except where a run of them is exactly a segment the store
+// spilled (row_store_spill.go): every row of it, in its order, with no other
+// row between and the table's column count. Those rows are that segment's
+// bytes already, the bytes building them again would produce, so the segment
+// goes out as it is and the rows are never read back. A run that breaks
+// partway goes to the cutter row by row, as it would have without the spill.
+// spillSegsCopied counts spilled segments a commit copied as they were, so a
+// test can tell the copy ran.
+var spillSegsCopied int64
+
+type spillRun struct {
+	st    *rowStore
+	cut   *segCutter
+	nCols int
+	emit  func(raw []byte) error
+
+	sg      *spillSeg // the segment the pending rows are a prefix of, or nil
+	rowids  []uint64
+	pending [][]Value // the run's sentinels, resolved only if it breaks
+}
+
+func (r *spillRun) add(rid uint64, vals []Value) error {
+	sg, i := r.st.spilledSegRow(vals)
+	if r.sg != nil && (sg != r.sg || i != len(r.rowids)) {
+		if err := r.end(); err != nil {
+			return err
+		}
+	}
+	if sg != nil && r.sg == nil && i == 0 && len(sg.seg.cols) == r.nCols {
+		r.sg = sg
+	}
+	if r.sg == nil {
+		return r.cut.add(rid, r.st.resolve(vals))
+	}
+	r.rowids = append(r.rowids, rid)
+	r.pending = append(r.pending, vals)
+	if len(r.rowids) < r.sg.seg.nRows {
+		return nil
+	}
+	// The whole segment: what is cut so far goes out first, then it.
+	if err := r.cut.flush(); err != nil {
+		return err
+	}
+	raw := r.sg.seg.buf
+	r.sg, r.rowids, r.pending = nil, r.rowids[:0], r.pending[:0]
+	spillSegsCopied++
+	return r.emit(raw)
+}
+
+// end sends a broken run's rows to the cutter.
+func (r *spillRun) end() error {
+	for k, rid := range r.rowids {
+		if err := r.cut.add(rid, r.st.resolve(r.pending[k])); err != nil {
+			return err
+		}
+	}
+	r.sg, r.rowids, r.pending = nil, r.rowids[:0], r.pending[:0]
+	return nil
 }

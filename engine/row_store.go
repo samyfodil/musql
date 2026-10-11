@@ -369,6 +369,23 @@ func (s *rowStore) eachSortedUntil(yield func(rowid uint64, vals []Value) bool) 
 	}
 }
 
+// eachSortedRaw is eachSortedUntil handing out rows as m holds them: a
+// spilled row as its sentinel, for a caller that can use one as it is
+// (segment_ddl.go's spillRun).
+func (s *rowStore) eachSortedRaw(yield func(rowid uint64, vals []Value) bool) {
+	switch {
+	case s == nil:
+	case s.seg != nil:
+		s.segEachSortedRaw(yield)
+	default:
+		for _, rowid := range s.sortedRowids() {
+			if !yield(rowid, s.m[rowid]) {
+				return
+			}
+		}
+	}
+}
+
 // clone is a snapshot of s for the table owner: a new map over the SAME row
 // slices. That is sound because a stored row is never edited in place -- put
 // replaces it -- which is this type's contract, and the one place that broke it
