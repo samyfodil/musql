@@ -155,6 +155,12 @@ func vec1Normalize(v []float32) {
 // vec1WHTPow2 is vec1WHT over a power-of-two length.
 func vec1WHTPow2(x []float32) {
 	n := len(x)
+	if n >= 16 {
+		if k := vec1WHTKernel(); k != nil {
+			k.Call(&jit.Args{A: unsafe.Pointer(unsafe.SliceData(x)), N: int64(n)})
+			return
+		}
+	}
 	for stride := 1; stride < n; stride <<= 1 {
 		for i := 0; i < n; i += stride << 1 {
 			lo, hi := x[i:i+stride], x[i+stride:i+2*stride]

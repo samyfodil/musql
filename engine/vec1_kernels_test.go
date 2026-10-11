@@ -284,5 +284,27 @@ func TestVec1KernelsMatchGo(t *testing.T) {
 			}
 		}
 	}
+	// The Walsh-Hadamard transform, against the scalar loop.
+	for _, n := range []int{16, 32, 256, 1024} {
+		x := make([]float32, n)
+		for i := range x {
+			x[i] = val()
+		}
+		want := slices.Clone(x)
+		for stride := 1; stride < n; stride <<= 1 {
+			for i := 0; i < n; i += stride << 1 {
+				for j := i; j < i+stride; j++ {
+					a, b := want[j], want[j+stride]
+					want[j], want[j+stride] = a+b, a-b
+				}
+			}
+		}
+		vec1WHTPow2(x)
+		for i := range x {
+			if math.Float32bits(x[i]) != math.Float32bits(want[i]) {
+				t.Fatalf("WHT n=%d [%d]: %v, want %v", n, i, x[i], want[i])
+			}
+		}
+	}
 	t.Logf("JIT kernels: %v", vec1Kernel(jit.Vec1L2D) != nil && vec1ScanKernel() != nil)
 }

@@ -655,3 +655,13 @@ func vec1BestDKernel(round bool) *jit.Code {
 	c.once.Do(func() { c.code = jitMapOnce(func() ([]byte, error) { return jit.EmitVec1BestD(round) }) })
 	return c.code
 }
+
+var vec1WHTCode = sync.OnceValue(func() *jit.Code { return jitMapOnce(jit.EmitVec1WHT) })
+
+// vec1WHTKernel is the compiled Walsh-Hadamard transform, nil without one.
+func vec1WHTKernel() *jit.Code {
+	if !jitEnabled {
+		return nil
+	}
+	return vec1WHTCode()
+}

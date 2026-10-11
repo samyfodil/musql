@@ -274,9 +274,14 @@ func vec1Constraints(it FromItem, cols []columnInfo, scope string) (cons []vec1C
 				// either.
 				allTerms = false
 			case x.Sub != nil:
-				// "x IN (SELECT ...)" is offered and vec1 would consume it.
+				// "x IN (SELECT ...)" is offered, and vec1 would consume it on
+				// the query vector, its parameters or a metadata column. On
+				// the rowid, distance or vector of a nearest-neighbour query
+				// it only counts against a LIMIT.
 				add(vec1Cons{col: col, op: vec1CEQ, coll: coll})
-				uncertain = true
+				if col == 0 || col == 1 || col >= 4 {
+					uncertain = true
+				}
 				allTerms = false
 			case len(x.List) == 1 && !vec1Refs(x.List[0], cols, scope):
 				add(vec1Cons{col: col, op: vec1CEQ, rhs: x.List[0], coll: coll, usable: true})

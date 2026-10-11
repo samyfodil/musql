@@ -657,3 +657,84 @@ func emitVec1T8F(op Vec1Op) ([]byte, error) {
 	a.Ret()
 	return a.Code()
 }
+
+// EmitVec1WHT emits vec1's Walsh-Hadamard transform of a power-of-two run
+// of float32s, in place: stages of butterflies (a, b) -> (a+b, a-b) at
+// strides 1, 2, 4, ... in turn, each element's operations those of the
+// scalar loop, eight at a time. The strides under eight are done within a
+// register (a permute brings each element's partner alongside, a blend
+// keeps the sum or the difference), the rest between registers.
+//
+// Args: A the run, N its length (a power of two, at least 16).
+func EmitVec1WHT() ([]byte, error) {
+	if !cpuHasAVX2() {
+		return nil, fmt.Errorf("jit: AVX2 not available on this machine")
+	}
+	a := NewAsm()
+	a.MovRegMem(RSI, RDI, OffA)
+	a.MovRegMem(RAX, RDI, OffN)
+	a.AddRegReg(RAX, RAX)
+	a.AddRegReg(RAX, RAX)
+	a.AddRegReg(RAX, RSI) // the end
+
+	// Strides 1, 2 and 4, register by register.
+	a.MovRegReg(R10, RSI)
+	a.Label("small")
+	a.VmovdquLoad(0, R10)
+	for _, st := range []struct {
+		perm  func(dst, src Reg)
+		blend byte
+	}{
+		{func(d, s Reg) { a.VpermilpsYmm(d, s, 0xB1) }, 0xAA},
+		{func(d, s Reg) { a.VpermilpsYmm(d, s, 0x4E) }, 0xCC},
+		{func(d, s Reg) { a.Vperm2f128(d, s, s, 0x01) }, 0xF0},
+	} {
+		st.perm(1, 0)        // each element's partner
+		a.VaddpsYmm(2, 0, 1) // a+b where the element is the pair's first
+		a.VsubpsYmm(3, 1, 0) // a-b where it is the second
+		a.VblendpsYmm(0, 2, 3, st.blend)
+	}
+	a.VmovupsStore(R10, 0, 0)
+	a.AddRegImm8(R10, 32)
+	a.CmpRegReg(R10, RAX)
+	a.Jcc(CondL, "small")
+
+	// Strides of eight and more: RDX the stride in bytes.
+	a.MovRegImm64(RDX, 32)
+	a.Label("stage")
+	a.MovRegReg(R10, RSI) // the block of 2 strides
+	a.Label("block")
+	a.MovRegReg(R11, R10)
+	a.MovRegReg(R12, R10)
+	a.AddRegReg(R12, RDX) // the block's second half
+	a.MovRegReg(R8, R12)
+	a.Label("bfly")
+	a.VmovdquLoad(0, R11)
+	a.VmovdquLoadD(1, R8, 0)
+	a.VaddpsYmm(2, 0, 1)
+	a.VsubpsYmm(3, 0, 1)
+	a.VmovupsStore(R11, 0, 2)
+	a.VmovupsStore(R8, 0, 3)
+	a.AddRegImm8(R11, 32)
+	a.AddRegImm8(R8, 32)
+	a.CmpRegReg(R11, R12)
+	a.Jcc(CondL, "bfly")
+	a.MovRegReg(R10, R8) // the next block
+	a.CmpRegReg(R10, RAX)
+	a.Jcc(CondL, "block")
+	a.AddRegReg(RDX, RDX)
+	a.MovRegReg(R9, RSI)
+	a.AddRegReg(R9, RDX)
+	a.CmpRegReg(R9, RAX) // a stride of the whole run is past the last stage
+	a.Jcc(CondL, "stage")
+
+	a.Vzeroupper()
+	a.Ret()
+	return a.Code()
+}
+
+// VblendpsYmm is  dst lane i = imm bit i ? src2 : src1.
+func (a *Asm) VblendpsYmm(dst, src1, src2 Reg, imm byte) {
+	a.vinst(0x0C, dst, src1, src2, vexMap0F3A, 0, 1, vexP66, false)
+	a.emit(imm)
+}

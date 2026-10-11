@@ -777,9 +777,29 @@ func (q *vec1Read) streamingNext(qy *vec1Query) error {
 // each result row read from %_base.
 func (q *vec1Read) knnRows(qy *vec1Query) (*vec1Out, error) {
 	out := &vec1Out{}
+	// vec1 reads a result's %_base row only for a column it supplies, the
+	// vector or a metadata column (vec1SeekCsr): a row the index still holds
+	// but whose base row is gone -- deleted in this transaction, with the
+	// index's change still pending -- is reported only then.
+	needBase := q.needs("*")
+	for i := vec1ColVector; i < len(q.st.cols) && !needBase; i++ {
+		needBase = q.needs(q.st.cols[i].Name)
+	}
 	for {
 		for qy.cur < qy.nCur {
 			r := qy.heap.res[qy.cur]
+			if !needBase {
+				row := make([]Value, 5+q.st.nMeta)
+				for i := range row {
+					row[i] = Value{Typ: Null}
+				}
+				row[vec1ColRowid] = Value{Typ: Int, I: r.rowid}
+				row[vec1ColDistance] = Value{Typ: Float, F: r.dist}
+				out.rows = append(out.rows, row)
+				out.rowids = append(out.rowids, r.rowid)
+				qy.cur++
+				continue
+			}
 			base, ok, err := q.sh.get("_base", r.rowid)
 			if err != nil {
 				return nil, err
@@ -878,7 +898,7 @@ func (q *vec1Read) vector(rowid int64, base []Value) (Value, error) {
 
 // needs reports whether the statement names a column of this table by name
 // anywhere -- the conservative test for whether an expensive column must be
-// computed.
+// computed. "*" asks whether it has a star anywhere.
 func (q *vec1Read) needs(col string) bool {
 	if q.stmt == nil {
 		return true
@@ -915,6 +935,7 @@ func (q *vec1Read) needs(col string) bool {
 		}
 		for _, c := range s.Columns {
 			if c.Star {
+				found = found || col == "*"
 				continue
 			}
 			walk(c.Expr)

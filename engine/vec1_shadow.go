@@ -9,7 +9,10 @@ package engine
 
 import (
 	"cmp"
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"math"
 	"slices"
 )
 
@@ -145,6 +148,20 @@ func (s *vec1DBShadow) newRowid(suffix string) (int64, error) {
 	tbl, err := s.table(suffix)
 	if err != nil {
 		return 0, err
+	}
+	// The table's largest rowid taken, C's OP_NewRowid tries random ones
+	// (vdbe.c: up to 100, each in 1..2^62) and fails with SQLITE_FULL
+	// rather than wrap to the smallest, which may hold a row.
+	if max, ok := tbl.rows.maxRowid(); ok && int64(max) == math.MaxInt64 && !(s.db.rowidLo < s.db.rowidHi) {
+		for range 100 {
+			var b [8]byte
+			randomBytes(b[:])
+			v := int64(binary.LittleEndian.Uint64(b[:])&(math.MaxInt64>>1)) + 1
+			if _, taken := tbl.rows.get(uint64(v)); !taken {
+				return v, nil
+			}
+		}
+		return 0, errors.New(ErrMsgDiskFull)
 	}
 	rid, err := s.db.autoRowid(tbl)
 	return int64(rid), err

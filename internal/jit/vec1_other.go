@@ -29,3 +29,8 @@ func EmitVec1BestD(round bool) ([]byte, error) {
 func EmitVec1Cand() ([]byte, error) {
 	return nil, fmt.Errorf("jit: no vec1 encoder for this architecture")
 }
+
+// EmitVec1WHT likewise.
+func EmitVec1WHT() ([]byte, error) {
+	return nil, fmt.Errorf("jit: no vec1 encoder for this architecture")
+}
