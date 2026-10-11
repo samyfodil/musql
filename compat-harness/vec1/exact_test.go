@@ -166,25 +166,32 @@ func TestVec1Exact(t *testing.T) {
 		name  string
 		model string // a JSON model, or a vec1_train config when train is set
 		train bool
+		mine  bool // trained by musql rather than the oracle
 	}{
-		{"none", "", false},
-		{"flatl2", `{index:"flat", distance:"l2"}`, false},
-		{"flatcos", `{index:"flat", distance:"cos"}`, false},
-		{"nonecos", `{index:"none", distance:"cos"}`, false},
-		{"ivf", `{nbucket: 16}`, true},
-		{"ivfcos", `{nbucket: 16, distance:"cos"}`, true},
-		{"pq", `{codesize: 6, quantizer:"pq"}`, true},
-		{"ivfpq", `{nbucket: 8, codesize: 6, quantizer:"pq"}`, true},
-		{"ivfpqnores", `{nbucket: 8, codesize: 5, quantizer:"pq", residual: false}`, true},
-		{"ivfpqcos", `{nbucket: 8, codesize: 8, quantizer:"pq", distance:"cos"}`, true},
-		{"opq", `{nbucket: 8, codesize: 6, quantizer:"opq", nopq_round: 2}`, true},
-		{"opqcos", `{nbucket: 4, codesize: 4, quantizer:"opq", nopq_round: 2, distance:"cos"}`, true},
-		{"bq", `{quantizer:"bq"}`, true},
-		{"ivfbq", `{nbucket: 8, quantizer:"bq"}`, true},
-		{"ivfbqnores", `{nbucket: 8, quantizer:"bq", residual:false}`, true},
-		{"ivfbqhalf", `{nbucket: 8, quantizer:"bq", codesize: 2}`, true},
-		{"ivfbqcos", `{nbucket: 4, quantizer:"bq", distance:"cos"}`, true},
-		{"pqwht", `{nbucket: 4, codesize: 6, quantizer:"pq", wht: true}`, true},
+		{"none", "", false, false},
+		{"flatl2", `{index:"flat", distance:"l2"}`, false, false},
+		{"flatcos", `{index:"flat", distance:"cos"}`, false, false},
+		{"nonecos", `{index:"none", distance:"cos"}`, false, false},
+		{"ivf", `{nbucket: 16}`, true, false},
+		{"ivfcos", `{nbucket: 16, distance:"cos"}`, true, false},
+		{"pq", `{codesize: 6, quantizer:"pq"}`, true, false},
+		{"ivfpq", `{nbucket: 8, codesize: 6, quantizer:"pq"}`, true, false},
+		{"ivfpqnores", `{nbucket: 8, codesize: 5, quantizer:"pq", residual: false}`, true, false},
+		{"ivfpqcos", `{nbucket: 8, codesize: 8, quantizer:"pq", distance:"cos"}`, true, false},
+		{"opq", `{nbucket: 8, codesize: 6, quantizer:"opq", nopq_round: 2}`, true, false},
+		{"opqcos", `{nbucket: 4, codesize: 4, quantizer:"opq", nopq_round: 2, distance:"cos"}`, true, false},
+		{"bq", `{quantizer:"bq"}`, true, false},
+		{"ivfbq", `{nbucket: 8, quantizer:"bq"}`, true, false},
+		{"ivfbqnores", `{nbucket: 8, quantizer:"bq", residual:false}`, true, false},
+		{"ivfbqhalf", `{nbucket: 8, quantizer:"bq", codesize: 2}`, true, false},
+		{"ivfbqcos", `{nbucket: 4, quantizer:"bq", distance:"cos"}`, true, false},
+		{"pqwht", `{nbucket: 4, codesize: 6, quantizer:"pq", wht: true}`, true, false},
+		// Models musql trained, which the oracle must read and index
+		// exactly as musql does.
+		{"mine-ivfpq", `{nbucket: 8, codesize: 6, quantizer:"pq"}`, true, true},
+		{"mine-opq", `{nbucket: 8, codesize: 6, quantizer:"opq", nopq_round: 2}`, true, true},
+		{"mine-ivfbq", `{nbucket: 8, quantizer:"bq"}`, true, true},
+		{"mine-pqcos", `{nbucket: 4, codesize: 8, quantizer:"pq", distance:"cos", wht: true}`, true, true},
 	}
 	for _, cf := range configs {
 		t.Run(cf.name, func(t *testing.T) {
@@ -193,7 +200,9 @@ func TestVec1Exact(t *testing.T) {
 			same(t, m, c, "CREATE VIRTUAL TABLE v USING vec1(vector, m0, m1, m2, m3, m4)")
 			load(t, m, c, "v", vecs[:1000], nMeta)
 			var model any
-			if cf.train {
+			if cf.train && cf.mine {
+				model = trainModel(t, m, "v", cf.model)
+			} else if cf.train {
 				model = trainModel(t, c, "v", cf.model)
 			} else if cf.model != "" {
 				model = cf.model
