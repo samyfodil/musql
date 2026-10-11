@@ -118,6 +118,13 @@ func (s *segment) Width(i int) int {
 // (written before an ALTER TABLE ADD COLUMN) contributes NULL for the columns
 // it predates, which is what reading it back through the b-tree yields.
 func buildSegment(cols []columnInfo, rowids []uint64, rows [][]Value) ([]byte, error) {
+	return buildSegmentInto(nil, cols, rowids, rows)
+}
+
+// buildSegmentInto is buildSegment building into dst's memory when it is
+// large enough, for a caller that is done with the previous segment by the
+// time it builds the next (segCutter.reuse).
+func buildSegmentInto(dst []byte, cols []columnInfo, rowids []uint64, rows [][]Value) ([]byte, error) {
 	nRows, nCols := len(rows), len(cols)
 	if len(rowids) != nRows {
 		return nil, fmt.Errorf("segment: %d rowids for %d rows", len(rowids), nRows)
@@ -220,7 +227,13 @@ func buildSegment(cols []columnInfo, rowids []uint64, rows [][]Value) ([]byte, e
 		}
 	}
 	heapOff = segAlign8(heapOff)
-	out := make([]byte, blocksOff, heapOff+heapLen+64+idxSlack)
+	var out []byte
+	if want := heapOff + heapLen + 64 + idxSlack; cap(dst) >= want {
+		out = dst[:blocksOff]
+		clear(out)
+	} else {
+		out = make([]byte, blocksOff, want)
+	}
 	heap = out[heapOff:heapOff:heapOff+heapLen]
 
 	put := func(c, i int, x uint64) {

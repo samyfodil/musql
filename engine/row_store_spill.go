@@ -382,7 +382,7 @@ func (s *rowStore) spillOutSegments() bool {
 	page := int64(os.Getpagesize())
 	ok := true
 	start := 0
-	cut := &segCutter{cols: make([]columnInfo, nCols), what: "a spill", emit: func(raw []byte) error {
+	cut := &segCutter{cols: make([]columnInfo, nCols), what: "a spill", reuse: true, emit: func(raw []byte) error {
 		at := (sf.at + page - 1) / page * page
 		if _, err := sf.f.WriteAt(raw, at); err != nil {
 			return err
