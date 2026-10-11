@@ -408,7 +408,9 @@ func (s *rowStore) clone(owner *tableMeta) *rowStore {
 // that cache is tested against.
 func sortedRowidsOf(s *rowStore) []uint64 {
 	out := make([]uint64, 0, s.len())
-	for rid := range s.all() {
+	// The keys alone: a walk through all() would read every spilled row back
+	// to throw it away.
+	for rid := range s.m {
 		out = append(out, rid)
 	}
 	radixSortRowids(out)

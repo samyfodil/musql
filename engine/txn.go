@@ -522,23 +522,30 @@ func (db *DB) noteTransactionDirtiedMain(sqlText string, rowsAffected int64) {
 	if !db.inTransaction() || db.txDirtiedMain || rowsAffected < 1 {
 		return
 	}
-	verb, ok := LeadingStatementVerb(sqlText)
-	if !ok {
-		return
-	}
-	trimmed := strings.TrimSpace(sqlText)
+	// The target is a function of the text alone, and a prepared statement
+	// run once a row brings the same text every time: the last one is kept
+	// rather than parsed again (a virtual table's rows never set the flag, so
+	// every INSERT of a load into one came here).
 	var target string
-	switch verb {
-	case "INSERT", "REPLACE":
-		if st, err := parseInsertStmt(trimmed); err == nil {
-			target = st.table
+	if sqlText == db.dirtiedText {
+		target = db.dirtiedTarget
+	} else {
+		verb, ok := LeadingStatementVerb(sqlText)
+		if !ok {
+			return
 		}
-	case "DELETE":
-		if st, err := parseDeleteStmt(trimmed); err == nil {
-			target = st.table
+		trimmed := strings.TrimSpace(sqlText)
+		switch verb {
+		case "INSERT", "REPLACE":
+			if st, err := parseInsertStmt(trimmed); err == nil {
+				target = st.table
+			}
+		case "DELETE":
+			if st, err := parseDeleteStmt(trimmed); err == nil {
+				target = st.table
+			}
 		}
-	default:
-		return
+		db.dirtiedText, db.dirtiedTarget = sqlText, target
 	}
 	if target == "" {
 		return

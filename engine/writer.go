@@ -748,6 +748,9 @@ type DB struct {
 	// the oracle; false still means "unknown", never "clean" -- clean is what
 	// txMayHaveDirtiedMain==false proves. Reset alongside it.
 	txDirtiedMain bool
+	// dirtiedText and dirtiedTarget are noteTransactionDirtiedMain's last parse:
+	// a statement's text and the table it writes ("" for none).
+	dirtiedText, dirtiedTarget string
 
 	//	// txSchemaChanged mirrors C's DBFLAG_SchemaChange (sqliteInt.h:1893):
 	//	// set once a schema-changing DDL succeeds in the open transaction
