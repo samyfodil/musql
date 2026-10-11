@@ -1,0 +1,2 @@
+# Format fixtures are bytes: compared as written, never converted.
+driver/testdata/format/** -text
