@@ -360,8 +360,9 @@ func (s *rowStore) eachSortedUntil(yield func(rowid uint64, vals []Value) bool) 
 	case s.seg != nil:
 		s.segEachSorted(yield)
 	default:
+		var rd spillReader
 		for _, rowid := range s.sortedRowids() {
-			if !yield(rowid, s.resolve(s.m[rowid])) {
+			if !yield(rowid, rd.resolve(s, s.m[rowid])) {
 				return
 			}
 		}

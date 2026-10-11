@@ -113,6 +113,42 @@ func (s *rowStore) resolve(vals []Value) []Value {
 	return row
 }
 
+// spillReader is resolve for a walk over many rows: spilled records are read
+// a window at a time rather than one read each. A walk in rowid order meets
+// the records mostly in the order they were spilled, so most come out of the
+// window already read; one that does not starts a new window. Each window is
+// a fresh buffer, as each resolve's is, so a row handed out stays valid.
+type spillReader struct {
+	buf []byte
+	off int64 // the file offset of buf[0]
+}
+
+// spillWindow is how much a spillReader reads at once.
+const spillWindow = 1 << 20
+
+func (r *spillReader) resolve(s *rowStore, vals []Value) []Value {
+	if !isSpilled(vals) {
+		return vals
+	}
+	off, n := vals[0].I, int64(vals[0].F)
+	if off < r.off || off+n > r.off+int64(len(r.buf)) {
+		size := min(max(n, spillWindow), s.spill.at-off)
+		if size < n {
+			return s.resolve(vals)
+		}
+		buf := make([]byte, size)
+		if _, err := s.spill.f.ReadAt(buf, off); err != nil {
+			panic("engine: reading a spilled row back: " + err.Error())
+		}
+		r.buf, r.off = buf, off
+	}
+	row, err := decodeRecord(r.buf[off-r.off : off-r.off+n : off-r.off+n])
+	if err != nil {
+		panic("engine: decoding a spilled row: " + err.Error())
+	}
+	return row
+}
+
 // noteWritten counts a row put into m, and spills them all once they outgrow
 // rowSpillThreshold.
 func (s *rowStore) noteWritten(rowid uint64, vals []Value) {
