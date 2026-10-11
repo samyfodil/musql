@@ -176,7 +176,20 @@ func TestVec1Bench(t *testing.T) {
 			if eng == "musql" {
 				mustExec(t, db, "VACUUM")
 			}
-			params := fmt.Sprintf(`{k:%d`, c.k)
+			// Searched by a connection that did not build it, as a database
+			// is once it is served: both engines reopen the file.
+			db.Close()
+			if eng == "C" {
+				db, err = openOracle(path)
+			} else {
+				db, err = sql.Open(driver.DriverName, path)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			db.SetMaxOpenConns(1)
+			mustExec(t, db, fmt.Sprintf("SELECT vec1_config('nthread', %d)", threads))
+			params :=fmt.Sprintf(`{k:%d`, c.k)
 			if c.nprobe > 0 {
 				params += fmt.Sprintf(`, nprobe:%g`, c.nprobe)
 			}

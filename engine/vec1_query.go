@@ -257,6 +257,9 @@ type vec1Query struct {
 	buckets   []vec1Bucket // a streaming query's buckets still to scan
 	nOrigRes  int
 	cur, nCur int
+	// Scratch the scan reuses from bucket to bucket: a distance table (one
+	// table is live at a time) and a list's block sums.
+	lutBuf, sums []float32
 }
 
 // interpretNProbe is vec1InterpretNProbe.
@@ -518,10 +521,10 @@ func (q *vec1Read) doBucket(qy *vec1Query, bucket int, lut *vec1LUT) error {
 			enc = tmp
 		}
 		if pq {
-			lut.d = make([]float32, mod.nCodebook()*vec1CodebookSize)
+			lut.d = vec1Grow(&qy.lutBuf, mod.nCodebook()*vec1CodebookSize)
 			mod.pqLUT(enc, lut.d)
 		} else {
-			lut.d = make([]float32, vec1BQSize(nElem))
+			lut.d = vec1Grow(&qy.lutBuf, vec1BQSize(nElem))
 			mod.bqLUT(nElem, enc, lut.d)
 			norm2 = vec1Dot(enc[:nElem], enc[:nElem])
 		}
@@ -583,7 +586,7 @@ func (q *vec1Read) doBucket(qy *vec1Query, bucket int, lut *vec1LUT) error {
 			if len(qy.filters) > 0 {
 				m = mask
 			}
-			vec1ScanBlocked(qy.heap, m, lut.d, mod.nCodebook(), blob, szRowid, nEntry, nNorm, norm2)
+			vec1ScanBlocked(qy.heap, m, lut.d, mod.nCodebook(), blob, szRowid, nEntry, nNorm, norm2, &qy.sums)
 		} else {
 			szVec := 4 * nElem
 			vec := make([]float32, nElem)
@@ -662,7 +665,7 @@ func (q *vec1Read) metaFilters(qy *vec1Query, id int64, nEntry int, mask []byte)
 // at the end. A threshold no float32 equals is the exception (a final sum can
 // fall between it and its rounding), and such a block is summed as vec1 sums
 // it, early test included.
-func vec1ScanBlocked(heap *vec1Heap, mask []byte, lut []float32, nCodebook int, blob []byte, szRowid, nEntry, nNorm int, r2 float32) {
+func vec1ScanBlocked(heap *vec1Heap, mask []byte, lut []float32, nCodebook int, blob []byte, szRowid, nEntry, nNorm int, r2 float32, scratch *[]float32) {
 	szBlk := vec1PQBlock * (nCodebook + nNorm)
 	early := nCodebook
 	if nNorm == 0 && !heap.streaming {
@@ -670,7 +673,7 @@ func vec1ScanBlocked(heap *vec1Heap, mask []byte, lut []float32, nCodebook int, 
 	}
 	first := vec1ListHdr + nEntry*szRowid
 	nBlk := (len(blob) - first) / szBlk
-	sums := make([]float32, vec1PQBlock*nBlk)
+	sums := vec1Grow(scratch, vec1PQBlock*nBlk)
 	vec1Scan16(blob[first:], nBlk, nCodebook, nNorm, lut, sums)
 	var acc [vec1PQBlock]float32
 	for blk := range nBlk {
@@ -1179,4 +1182,14 @@ func (q *vec1Read) distanceStats(vecV Value) (Value, error) {
 		return Value{}, err
 	}
 	return s, nil
+}
+
+// vec1Grow is *buf resized to n, reallocated only when it is too short. Its
+// contents are not cleared.
+func vec1Grow(buf *[]float32, n int) []float32 {
+	if cap(*buf) < n {
+		*buf = make([]float32, n)
+	}
+	*buf = (*buf)[:n]
+	return *buf
 }
