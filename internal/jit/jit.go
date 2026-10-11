@@ -231,6 +231,16 @@ const (
 	// answer cannot change. That asymmetry is the whole safety argument, and
 	// it is why this may be reached for shapes an accumulator could not be.
 	POpEmitRow
+
+	// POpCmpSkip: abandon this row unless operand B <Cond> r[C]. Operand B is
+	// r[B], or with BCol the row's value in column slot B. The fusion pass
+	// (fuse.go) makes it from a POpCmp and the POpSkipIfZero testing it, and
+	// from the POpLoadCol feeding it: one compare-and-branch, no register
+	// written.
+	POpCmpSkip
+	// POpCmpJump: jump to A when operand B <Cond> r[C], operand B as for
+	// POpCmpSkip; fused from a POpCmp and the jump testing it.
+	POpCmpJump
 )
 
 // ProgNextRow is the jump target meaning "abandon this row and start the next".
@@ -248,6 +258,9 @@ type ProgInsn struct {
 	Pat  []byte
 	Mode TextMode
 	Fold bool
+	// BCol is POpCmpSkip's and POpCmpJump's: B is a column slot, read at the
+	// current row, rather than a register.
+	BCol bool
 }
 
 // TextMode is what POpTextMatch tests.

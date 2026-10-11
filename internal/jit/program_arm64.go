@@ -10,11 +10,12 @@ import (
 // EmitProgram compiles an instruction list into a native row loop (arm64 version).
 // Separate from program_amd64.go because the architectures differ at instruction level.
 func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
+	insns = progFused(insns)
 	if nCols > MaxProgCols {
 		return nil, fmt.Errorf("jit: %d column blocks, max %d", nCols, MaxProgCols)
 	}
 	for _, in := range insns {
-		if (in.Op == POpLoadCol || in.Op == POpTextLen || in.Op == POpTextMatch) && (in.B < 0 || in.B >= nCols) {
+		if (in.Op == POpLoadCol || in.Op == POpTextLen || in.Op == POpTextMatch || in.BCol) && (in.B < 0 || in.B >= nCols) {
 			return nil, fmt.Errorf("jit: column %d out of range", in.B)
 		}
 	}
@@ -89,6 +90,19 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		case POpSkipIfZero:
 			a.LdrImm(X9, X1, in.A*8)
 			a.Cbz(X9, "next")
+		case POpCmpSkip, POpCmpJump:
+			if in.BCol {
+				a.LdrRegIdx(X9, colReg[in.B], X2)
+			} else {
+				a.LdrImm(X9, X1, in.B*8)
+			}
+			a.LdrImm(X10, X1, in.C*8)
+			a.Cmp(X9, X10)
+			if in.Op == POpCmpSkip {
+				a.Bcond(in.Cond.Negate(), "next")
+			} else {
+				a.Bcond(in.Cond, progTarget(in.A, len(insns)))
+			}
 		case POpSetConst:
 			a.MovImm64(X9, int64(in.B))
 			a.StrImm(X9, X1, in.A*8)

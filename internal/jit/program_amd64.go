@@ -10,11 +10,12 @@ import (
 // EmitProgram compiles an instruction list into a native row loop. The loop
 // is emitted once per program; the body is whatever the instruction list says.
 func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
+	insns = progFused(insns)
 	if nCols > MaxProgCols {
 		return nil, fmt.Errorf("jit: %d column blocks, max %d", nCols, MaxProgCols)
 	}
 	for _, in := range insns {
-		if (in.Op == POpLoadCol || in.Op == POpTextLen || in.Op == POpTextMatch) && (in.B < 0 || in.B >= nCols) {
+		if (in.Op == POpLoadCol || in.Op == POpTextLen || in.Op == POpTextMatch || in.BCol) && (in.B < 0 || in.B >= nCols) {
 			return nil, fmt.Errorf("jit: column %d out of range", in.B)
 		}
 	}
@@ -90,6 +91,19 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.MovRegMem32(RAX, RSI, in.A)
 			a.TestRegReg(RAX, RAX)
 			a.Jcc(CondE, "next")
+		case POpCmpSkip, POpCmpJump:
+			if in.BCol {
+				a.MovRegMemIdx(RAX, colReg[in.B], RCX)
+			} else {
+				a.MovRegMem32(RAX, RSI, in.B)
+			}
+			a.MovRegMem32(RDX, RSI, in.C)
+			a.CmpRegReg(RAX, RDX)
+			if in.Op == POpCmpSkip {
+				a.Jcc(in.Cond.Negate(), "next")
+			} else {
+				a.Jcc(in.Cond, progTarget(in.A, len(insns)))
+			}
 		case POpSetConst:
 			a.MovRegImm64(RAX, int64(in.B))
 			a.MovMemReg32(RSI, in.A, RAX)

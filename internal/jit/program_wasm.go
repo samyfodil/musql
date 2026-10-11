@@ -37,16 +37,17 @@ const (
 // from -n up to 0 like the native loops, so the POpEmitRow selection means
 // the same thing on every architecture.
 func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
+	insns = progFused(insns)
 	if nCols > MaxProgCols {
 		return nil, fmt.Errorf("jit: %d column blocks, max %d", nCols, MaxProgCols)
 	}
 	n := len(insns)
 	for i, in := range insns {
-		if (in.Op == POpLoadCol || in.Op == POpTextLen || in.Op == POpTextMatch) && (in.B < 0 || in.B >= nCols) {
+		if (in.Op == POpLoadCol || in.Op == POpTextLen || in.Op == POpTextMatch || in.BCol) && (in.B < 0 || in.B >= nCols) {
 			return nil, fmt.Errorf("jit: column %d out of range", in.B)
 		}
 		switch in.Op {
-		case POpJump, POpJumpIfZero, POpJumpIfNotZero:
+		case POpJump, POpJumpIfZero, POpJumpIfNotZero, POpCmpJump:
 			if in.A != ProgNextRow && in.A <= i {
 				return nil, fmt.Errorf("jit: backward jump at %d", i)
 			}
@@ -190,6 +191,26 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			loadReg(in.A)
 			w.op(opI64Eqz)
 			w.BrIf(depthTo(i, ProgNextRow))
+		case POpCmpSkip, POpCmpJump:
+			if in.BCol {
+				w.Get(colEnd[in.B])
+				w.Get(idx)
+				w.op(opI32WrapI64)
+				w.I32(3)
+				w.op(opI32Shl)
+				w.op(opI32Add)
+				w.LoadI64(0)
+			} else {
+				loadReg(in.B)
+			}
+			loadReg(in.C)
+			if in.Op == POpCmpSkip {
+				w.op(scalarCmp(in.Cond.Negate()))
+				w.BrIf(depthTo(i, ProgNextRow))
+			} else {
+				w.op(scalarCmp(in.Cond))
+				w.BrIf(depthTo(i, in.A))
+			}
 		case POpSetConst:
 			storeReg(in.A, func() { w.I64(int64(in.B)) })
 		case POpJump:
