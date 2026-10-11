@@ -66,50 +66,111 @@ const (
 // commit that finds a spilled segment's rows still exactly that segment's
 // copies its bytes rather than reading the rows back and building them again
 // (spillRun, segment_ddl.go). Elsewhere it writes records.
+//
+// A spill file of segments can BECOME the database file a commit rewrites to
+// (segFileWriter.adoptSpill): its first page is left free for the header, the
+// segments the commit keeps are already where they belong, and the rest of the
+// file is appended to it. Then the transaction's rows are written once, as C
+// SQLite's are, not spilled and then copied.
 type spillFile struct {
 	f    *os.File
 	at   int64
 	segs []*spillSeg
 	res  *spillMaps // what the cleanup releases: the file's segment mappings
+
+	// anon is a file with no name yet that linkAnon can name (linux), name
+	// the name of one that has one; a file with neither was unlinked at
+	// creation and cannot be adopted.
+	anon bool
+	name string
+	// adopted is set once the file became a database file. It takes no more
+	// spills, which would grow that file: the next goes to a new file
+	// (reopen), and the segments already spilled stay where they are.
+	adopted bool
 }
 
-// spillSeg is one segment in a spill file, mapped.
+// spillSeg is one segment in a spill file, mapped, and where it is.
 type spillSeg struct {
 	seg *segment
 	m   *mmapfile.File
+	f   *os.File // the file it is in, at off
+	off int64
 }
 
-// spillMaps is a spill file's mappings, apart from the spillFile so its cleanup
-// can release them.
-type spillMaps struct{ ms []*mmapfile.File }
+// spillMaps is what a spill file's cleanup releases, apart from the spillFile
+// so the cleanup can: its mappings, its files, and the names it still owns.
+type spillMaps struct {
+	ms    []*mmapfile.File
+	files []*os.File
+	names map[string]bool
+}
+
+// adoptable reports whether the file can become a database file.
+func (sf *spillFile) adoptable() bool {
+	return sf != nil && !sf.adopted && len(sf.segs) > 0 && (sf.anon || sf.name != "")
+}
+
+// nameAs gives the file the name dst, replacing dst: what adopting it as a
+// database file ends with.
+func (sf *spillFile) nameAs(dst string) error {
+	if sf.anon {
+		return linkAnon(sf.f, dst)
+	}
+	if err := os.Rename(sf.name, dst); err != nil {
+		return err
+	}
+	delete(sf.res.names, sf.name) // the cleanup must not remove the database
+	sf.name = ""
+	return nil
+}
+
+// openFile starts the file spills are written to: the first, or the next
+// after one was adopted. A spill of segments leaves its first page for a header.
+func (sf *spillFile) openFile() error {
+	if f, ok := newAnonFile(os.TempDir()); ok && spillSegments {
+		sf.f, sf.anon, sf.name = f, true, ""
+	} else {
+		f, err := os.CreateTemp("", "musql-spill-*")
+		if err != nil {
+			return err
+		}
+		sf.f, sf.anon, sf.name = f, false, ""
+		if spillSegments || os.Remove(f.Name()) != nil {
+			sf.name = f.Name()
+			sf.res.names[sf.name] = true
+		}
+	}
+	sf.res.files = append(sf.res.files, sf.f)
+	sf.at = 0
+	sf.adopted = false
+	return nil
+}
 
 // spillSegments is whether spills write segments (see spillFile). A variable
 // so a test can run the record path where the platform maps.
 var spillSegments = mmapfile.CanMapAt
 
-// newSpillFile creates the file in the system temp directory, unlinked at once
-// where the platform allows it, so a crash leaves nothing behind.
+// newSpillFile creates the file in the system temp directory. Where the
+// platform has unnamed files (linux) it is one, so a crash leaves nothing
+// behind and a commit can still name it. Elsewhere, a file of segments keeps
+// its name, which adopting it needs, until the cleanup removes it; a file of
+// records is unlinked at once where the platform allows it.
 func newSpillFile() (*spillFile, error) {
-	f, err := os.CreateTemp("", "musql-spill-*")
-	if err != nil {
+	sf := &spillFile{res: &spillMaps{names: map[string]bool{}}}
+	if err := sf.openFile(); err != nil {
 		return nil, err
 	}
-	name := f.Name()
-	unlinked := os.Remove(name) == nil
-	sf := &spillFile{f: f, res: &spillMaps{}}
-	type held struct {
-		f   *os.File
-		res *spillMaps
-	}
-	runtime.AddCleanup(sf, func(h held) {
-		for _, m := range h.res.ms {
+	runtime.AddCleanup(sf, func(res *spillMaps) {
+		for _, m := range res.ms {
 			m.Close()
 		}
-		h.f.Close()
-		if !unlinked {
-			os.Remove(h.f.Name())
+		for _, f := range res.files {
+			f.Close()
 		}
-	}, held{f, sf.res})
+		for name := range res.names {
+			os.Remove(name)
+		}
+	}, sf.res)
 	return sf, nil
 }
 
@@ -233,6 +294,14 @@ func (s *rowStore) noteWritten(rowid uint64, vals []Value) {
 // stay in memory until a later put pushes the store over again; correct, only
 // not as small as it could be.
 func (s *rowStore) spillOut() {
+	if s.spill != nil && s.spill.adopted {
+		// That file is a database file now: spills go on in another, and the
+		// segments already spilled stay where they are.
+		if s.spill.openFile() != nil {
+			s.memBytes = 0 // do not retry on every put
+			return
+		}
+	}
 	if s.spill == nil {
 		sf, err := newSpillFile()
 		if err != nil {
@@ -380,6 +449,7 @@ func (s *rowStore) spillOutSegments() bool {
 		return false // rows of no columns are not a segment; keep them
 	}
 	page := int64(os.Getpagesize())
+	sf.at = max(sf.at, page) // the first page is a header's, should the file become a database file
 	ok := true
 	start := 0
 	cut := &segCutter{cols: make([]columnInfo, nCols), what: "a spill", reuse: true, emit: func(raw []byte) error {
@@ -399,7 +469,7 @@ func (s *rowStore) spillOutSegments() bool {
 		sf.at = at + int64(len(raw))
 		sf.res.ms = append(sf.res.ms, m)
 		idx := int64(len(sf.segs))
-		sf.segs = append(sf.segs, &spillSeg{seg: seg, m: m})
+		sf.segs = append(sf.segs, &spillSeg{seg: seg, m: m, f: sf.f, off: at})
 		// One allocation for the segment's sentinels, each row a one-Value
 		// window of it (capped, so nothing appends into a neighbour).
 		sent := make([]Value, seg.nRows)

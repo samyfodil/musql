@@ -106,7 +106,7 @@ func TestRowSpillAnswersAsMemory(t *testing.T) {
 		saved := spillSegments
 		spillSegments = segs
 		SpilledRowsForTest()
-		spillSegsCopied = 0
+		spillSegsCopied, spillsAdopted = 0, 0
 		spillEach, spillReopen := run(t, 16<<10)
 		spillSegments = saved
 		if SpilledRowsForTest() == 0 {
@@ -114,6 +114,9 @@ func TestRowSpillAnswersAsMemory(t *testing.T) {
 		}
 		if segs && spillSegments && spillSegsCopied == 0 {
 			t.Fatal("no spilled segment was copied -- the copy went untested")
+		}
+		if segs && spillSegments && spillsAdopted == 0 {
+			t.Fatal("no spill file became the database file -- adopting one went untested")
 		}
 		for i := range memEach {
 			if memEach[i] != spillEach[i] {

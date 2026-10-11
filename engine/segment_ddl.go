@@ -298,6 +298,20 @@ func (db *DB) segmentFileContentsOf(temp bool, w *segFileWriter) ([]ConvertedTab
 		}
 	}
 
+	// THE LARGEST SPILL BECOMES THE FILE (segFileWriter.adoptSpill): the
+	// segments of it this rewrite keeps are then already written. Its other
+	// segments, should later writes have broken them up, are dead space in the
+	// file until its next rewrite -- the space C's freelist would hold.
+	var big *spillFile
+	for _, t := range db.tables {
+		if t.isTemp == temp && t.rows != nil && t.rows.spill.adoptable() && (big == nil || t.rows.spill.at > big.at) {
+			big = t.rows.spill
+		}
+	}
+	if big != nil {
+		w.adoptSpill(big)
+	}
+
 	var tables []ConvertedTable
 	// seqs is every entry's schemaSeq, tables then objects -- the order the
 	// file lists them in -- from which catalogRanks derives each one's Rank.
@@ -372,7 +386,7 @@ func (db *DB) segmentFileContentsOf(temp bool, w *segFileWriter) ([]ConvertedTab
 		// addSegment is done with a segment's bytes when it returns: it copies
 		// them or writes them out.
 		cut := &segCutter{cols: colInfos, what: t.name, reuse: true, emit: func(raw []byte) error { return w.addSegment(ti, raw) }}
-		run := spillRun{st: t.rows, cut: cut, nCols: len(colInfos), emit: func(raw []byte) error { return w.addSegment(ti, raw) }}
+		run := spillRun{st: t.rows, cut: cut, nCols: len(colInfos), emit: func(sg *spillSeg) error { return w.addSpilled(ti, sg) }}
 		var cerr error
 		t.rows.eachSortedRaw(func(rid uint64, vals []Value) bool {
 			cerr = run.add(rid, vals)
@@ -806,7 +820,7 @@ type spillRun struct {
 	st    *rowStore
 	cut   *segCutter
 	nCols int
-	emit  func(raw []byte) error
+	emit  func(sg *spillSeg) error
 
 	sg      *spillSeg // the segment the pending rows are a prefix of, or nil
 	rowids  []uint64
@@ -835,10 +849,10 @@ func (r *spillRun) add(rid uint64, vals []Value) error {
 	if err := r.cut.flush(); err != nil {
 		return err
 	}
-	raw := r.sg.seg.buf
+	done := r.sg
 	r.sg, r.rowids, r.pending = nil, r.rowids[:0], r.pending[:0]
 	spillSegsCopied++
-	return r.emit(raw)
+	return r.emit(done)
 }
 
 // end sends a broken run's rows to the cutter.

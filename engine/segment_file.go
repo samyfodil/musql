@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -178,6 +179,39 @@ type segFileWriter struct {
 	mem     []byte   // the segments so far, laid out as the scratch would hold them
 	at      int64
 	segs    [][][2]int64 // per table: each segment's (offset, length) in mem or the scratch
+
+	// spill is the spill file adopted as the scratch (adoptSpill): the file
+	// this writer completes is that one, so it is neither closed nor removed
+	// here, and its segments that the new file keeps are not written again.
+	spill *spillFile
+}
+
+// spillsAdopted counts spill files a rewrite made its file, for a test.
+var spillsAdopted int64
+
+// adoptSpill makes sf, a spill file of segments, the file this writer writes:
+// what it adds goes after sf's segments, and addSpilled names one of those in
+// place. Only before anything was added, and only a file that can be named.
+func (w *segFileWriter) adoptSpill(sf *spillFile) bool {
+	if w.scratch != nil || w.at != 0 || len(w.mem) != 0 || !sf.adoptable() {
+		return false
+	}
+	w.scratch, w.spill = sf.f, sf
+	w.at = sf.at - segFileHdrSizeV5
+	return true
+}
+
+// addSpilled appends one of table ti's segments from a spill: recorded where
+// it is when it is in the adopted file, written like any other otherwise.
+func (w *segFileWriter) addSpilled(ti int, sg *spillSeg) error {
+	if w.spill == nil || sg.f != w.scratch {
+		return w.addSegment(ti, sg.seg.buf)
+	}
+	for len(w.segs) <= ti {
+		w.segs = append(w.segs, nil)
+	}
+	w.segs[ti] = append(w.segs[ti], [2]int64{sg.off - segFileHdrSizeV5, int64(len(sg.seg.buf))})
+	return nil
 }
 
 // segWriterMemBytes is how many bytes of segments a writer holds before it
@@ -351,6 +385,9 @@ func (w *segFileWriter) finish(path string, tables []ConvertedTable, cat Convert
 		if err := f.Chmod(0o644); err != nil { // CreateTemp's 0600 is not what a database file gets
 			return err
 		}
+		if sf := w.spill; sf != nil {
+			return w.nameSpill(sf, path, dirOff+int64(len(dir)))
+		}
 		if err := f.Close(); err != nil {
 			return err
 		}
@@ -376,9 +413,42 @@ func (w *segFileWriter) finish(path string, tables []ConvertedTable, cat Convert
 	return out.Close()
 }
 
+// nameSpill completes an adopted spill file as path: it takes the name, or,
+// across filesystems, where it cannot, its bytes are copied there. Either way
+// it is a database file from here, and spills go on in another.
+func (w *segFileWriter) nameSpill(sf *spillFile, path string, size int64) error {
+	w.scratch, w.spill = nil, nil
+	if err := sf.nameAs(path); err == nil {
+		sf.adopted = true
+		spillsAdopted++
+		return nil
+	}
+	out, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	// A LimitedReader over the file, so os.File.ReadFrom can hand the copy to
+	// copy_file_range on Linux; every other access to the spill is positioned.
+	if _, err := sf.f.Seek(0, io.SeekStart); err != nil {
+		out.Close()
+		return err
+	}
+	if _, err := io.Copy(out, io.LimitReader(sf.f, size)); err != nil {
+		out.Close()
+		return err
+	}
+	// Its tail is this writer's: a spill writes past what it holds, from at.
+	return out.Close()
+}
+
 // discard removes the scratch file, if there is one; it is safe after finish.
+// An adopted spill file stays: it is its store's.
 func (w *segFileWriter) discard() {
 	w.mem = nil
+	if w.spill != nil {
+		w.scratch, w.spill = nil, nil
+		return
+	}
 	if w.scratch == nil {
 		return
 	}
