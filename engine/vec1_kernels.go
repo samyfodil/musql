@@ -555,9 +555,19 @@ func vec1Best4(tn *vec1T8N, rows []float32, sets, m, comp int, vecs []float32, s
 				continue
 			}
 			best, bd := 0, math.Inf(1)
-			for j, bits := range r[16+i*b : 16+(i+1)*b] {
+			mask := r[16+i*b : 16+(i+1)*b]
+			for j := 0; j < len(mask); j += 8 {
+				// Eight bytes of the bit set at a time: most are empty.
+				var bits uint64
+				if j+8 <= len(mask) {
+					bits = vec1Native.Uint64(mask[j:])
+				} else {
+					for k, x := range mask[j:] {
+						bits |= uint64(x) << (8 * k)
+					}
+				}
 				for ; bits != 0; bits &= bits - 1 {
-					row := 8*j + mathbits.TrailingZeros8(bits)
+					row := 8*j + mathbits.TrailingZeros64(bits)
 					if row >= m {
 						break
 					}
@@ -791,4 +801,36 @@ func vec1WHTKernel() *jit.Code {
 		return nil
 	}
 	return vec1WHTCode()
+}
+
+var vec1Rot4Code = sync.OnceValue(func() *jit.Code { return jitMapOnce(jit.EmitVec1Rot4) })
+
+// vec1Rotate4 is vec1RotateVector for four vectors (row-major in vecs, n
+// each), the results into out[i][:n]; false when there is no kernel.
+func vec1Rotate4(rot []float32, n int, vecs []float32, out [4][]float32, buf []float32) ([]float32, bool) {
+	if !jitEnabled {
+		return buf, false
+	}
+	k := vec1Rot4Code()
+	nBlk := vec1T8Blocks(rot, n)
+	if k == nil || nBlk == 0 || len(vecs) < 4*n {
+		return buf, false
+	}
+	rows := 8 * nBlk
+	if cap(buf) < 4*rows {
+		buf = make([]float32, 4*rows)
+	}
+	buf = buf[:4*rows]
+	k.Call(&jit.Args{
+		A:   unsafe.Pointer(unsafe.SliceData(rot)),
+		N:   int64(nBlk / 2),
+		XA:  int64(n),
+		V:   unsafe.Pointer(unsafe.SliceData(vecs)),
+		XC:  int64(4 * n),
+		Out: unsafe.Pointer(unsafe.SliceData(buf)),
+	})
+	for i := range 4 {
+		copy(out[i][:n], buf[i*rows:i*rows+n])
+	}
+	return buf, true
 }

@@ -543,8 +543,33 @@ func (m *vec1Model) quantizeMany(tmp, in [][]float32, code [][]byte, buckets []i
 	n := m.nElem()
 	cnt := len(in)
 	a := make([][]float32, cnt)
-	for i := range cnt {
-		a[i] = m.transformN(tmp[i], in[i])
+	if m.hdr.flags&vec1ModelRotate != 0 {
+		// transformN's rotation, four vectors to a pass over the matrix.
+		rot := m.t8().rot
+		for g := 0; g < cnt; g += 4 {
+			if cap(sc.pack) < 4*n {
+				sc.pack = make([]float32, 4*n)
+			}
+			vecs := sc.pack[:4*n]
+			for i := range 4 {
+				copy(vecs[i*n:i*n+n], in[g+i][:n])
+			}
+			var ok bool
+			sc.f, ok = vec1Rotate4(rot, n, vecs, [4][]float32{tmp[g], tmp[g+1], tmp[g+2], tmp[g+3]}, sc.f)
+			for i := g; i < g+4; i++ {
+				if !ok {
+					m.rotate(in[i], tmp[i][:n])
+				}
+				if m.cos() {
+					vec1Normalize(tmp[i][:n])
+				}
+				a[i] = tmp[i]
+			}
+		}
+	} else {
+		for i := range cnt {
+			a[i] = m.transformN(tmp[i], in[i])
+		}
 	}
 	t8 := m.t8()
 	if m.nBucket() > 0 {

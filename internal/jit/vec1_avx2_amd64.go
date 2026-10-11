@@ -944,3 +944,85 @@ func EmitVec1CandMany() ([]byte, error) {
 	a.Ret()
 	return a.Code()
 }
+
+// EmitVec1Rot4 emits vec1's rotation (vec1RotateVector) of four vectors at
+// once: every row of a T8 layout's float32 dot product with each vector,
+// products and sums in component order, multiply and add separate. Two
+// blocks of rows and four vectors make eight chains of adds, so the kernel
+// runs at the multiply and add units' rate rather than at an add's latency,
+// and a block is loaded once for the four vectors.
+//
+// Args: A the first block, N the pairs of blocks, XA the dimensions, V the
+// first vector, XC the vectors' stride in bytes, Out the four results one
+// after another, each a float32 per row of the layout (16*N rows).
+func EmitVec1Rot4() ([]byte, error) {
+	if !cpuHasAVX2() {
+		return nil, fmt.Errorf("jit: AVX2 not available on this machine")
+	}
+	a := NewAsm()
+	a.MovRegMem(RSI, RDI, OffA)
+	a.MovRegMem(RCX, RDI, OffN)
+	a.MovRegMem(R9, RDI, OffXA)
+	a.MovRegMem(RDX, RDI, OffXC)
+	a.MovRegMem(R10, RDI, OffOut)
+	a.MovRegReg(RBX, RDX) // three strides
+	a.AddRegReg(RBX, RDX)
+	a.AddRegReg(RBX, RDX)
+	a.MovRegReg(R13, R9) // a block's bytes: 32 * XA
+	for range 5 {
+		a.AddRegReg(R13, R13)
+	}
+	a.MovRegReg(R11, RCX) // a result's bytes: 64 * N
+	for range 6 {
+		a.AddRegReg(R11, R11)
+	}
+	a.MovRegReg(R8, RSI)
+	a.AddRegReg(R8, R13)
+
+	a.Label("pair")
+	for r := Reg(0); r < 8; r++ {
+		a.VxorpsYmm(r, r, r)
+	}
+	a.MovRegMem(RAX, RDI, OffV)
+	a.MovRegReg(R12, R9)
+	a.Label("comp")
+	a.VmovdquLoad(8, RSI)
+	a.VmovdquLoadD(9, R8, 0)
+	for vv := Reg(0); vv < 4; vv++ {
+		switch vv {
+		case 0:
+			a.VbroadcastssMem(10, RAX)
+		case 1:
+			a.vbroadcastssSIB(10, RAX, RDX, 0)
+		case 2:
+			a.vbroadcastssSIB(10, RAX, RDX, 1)
+		case 3:
+			a.vbroadcastssSIB(10, RAX, RBX, 0)
+		}
+		a.VmulpsYmm(11, 8, 10)
+		a.VmulpsYmm(12, 9, 10)
+		a.VaddpsYmm(vv, vv, 11)
+		a.VaddpsYmm(4+vv, 4+vv, 12)
+	}
+	a.AddRegImm8(RSI, 32)
+	a.AddRegImm8(R8, 32)
+	a.AddRegImm8(RAX, 4)
+	a.DecReg(R12)
+	a.Jcc(CondNE, "comp")
+
+	a.MovRegReg(RAX, R10)
+	for vv := Reg(0); vv < 4; vv++ {
+		a.VmovupsStore(RAX, 0, vv)
+		a.VmovupsStore(RAX, 32, 4+vv)
+		a.AddRegReg(RAX, R11)
+	}
+	a.AddRegImm8(R10, 64)
+	a.MovRegReg(RSI, R8) // past the second block
+	a.AddRegReg(R8, R13)
+	a.DecReg(RCX)
+	a.Jcc(CondNE, "pair")
+
+	a.Vzeroupper()
+	a.Ret()
+	return a.Code()
+}

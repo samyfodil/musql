@@ -359,6 +359,30 @@ func TestVec1KernelsMatchGo(t *testing.T) {
 			}
 		}
 	}
+	// The rotation, four vectors at a time, against vec1Dot row by row.
+	for _, n := range []int{8, 24, 384} {
+		mat := make([]float32, n*n)
+		for i := range mat {
+			mat[i] = val()
+		}
+		vecs := make([]float32, 4*n)
+		for i := range vecs {
+			vecs[i] = val()
+		}
+		var out [4][]float32
+		for i := range out {
+			out[i] = make([]float32, n)
+		}
+		if _, ok := vec1Rotate4(vec1T8(mat, n, n), n, vecs, out, nil); ok {
+			for v := range 4 {
+				for i := range n {
+					if w := vec1Dot(mat[i*n:i*n+n], vecs[v*n:v*n+n]); math.Float32bits(out[v][i]) != math.Float32bits(w) {
+						t.Fatalf("rot4 n=%d vec %d row %d: %v, want %v", n, v, i, out[v][i], w)
+					}
+				}
+			}
+		}
+	}
 	// The Walsh-Hadamard transform, against the scalar loop.
 	for _, n := range []int{16, 32, 256, 1024} {
 		x := make([]float32, n)

@@ -707,18 +707,76 @@ func (w *vec1W) rebuildIndex() error {
 	zeroBase := mod.isFlat() && mod.nBucket() == 0
 	bucketBase := mod.isFlat()
 
-	// The rows, read first: vec1 rewrites %_base under its own scan.
+	// The rows are read first: vec1 rewrites %_base under its own scan.
+	// For a quantizing model they go to the workers 1024 at a time as the
+	// scan reaches them, and each job is written in order as it finishes --
+	// the order vec1's single-threaded rebuild writes them in -- while the
+	// scan and later jobs go on.
 	type baseRow struct {
 		id   int64
-		vec  []float32
 		raw  []byte
 		meta []Value
 	}
-	var rows []baseRow
+	type job struct {
+		rows    []baseRow
+		buckets []int
+		codes   []byte
+		done    chan struct{}
+	}
+	nEnc := mod.encodedSize()
+	tl := mod.tmpLen(nElem)
+	quantize := func(jb *job) {
+		n := len(jb.rows)
+		jb.buckets = make([]int, n)
+		jb.codes = make([]byte, n*nEnc)
+		bulk := n / vec1MultiNVec * vec1MultiNVec
+		tmps := make([][]float32, bulk)
+		ins := make([][]float32, bulk)
+		codes := make([][]byte, bulk)
+		tbuf := make([]float32, bulk*tl)
+		for i := range bulk {
+			tmps[i] = tbuf[i*tl : (i+1)*tl : (i+1)*tl]
+			ins[i] = vec1Floats(jb.rows[i].raw)
+			codes[i] = jb.codes[i*nEnc : (i+1)*nEnc]
+		}
+		mod.quantizeMany(tmps, ins, codes, jb.buckets[:bulk], &vec1Buf{})
+		tmp := make([]float32, tl)
+		for i := bulk; i < n; i++ {
+			clear(tmp)
+			jb.buckets[i] = mod.quantize(tmp, vec1Floats(jb.rows[i].raw), jb.codes[i*nEnc:(i+1)*nEnc])
+		}
+	}
+	var jobs []*job
+	next := make(chan *job, 256)
+	var wg sync.WaitGroup
+	if !zeroBase {
+		workers := max(1, min(runtime.GOMAXPROCS(0), w.db.vec1Conn().nThreadValue()))
+		for range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for jb := range next {
+					quantize(jb)
+					close(jb.done)
+				}
+			}()
+		}
+	}
+	var cur []baseRow
+	send := func() {
+		if len(cur) == 0 {
+			return
+		}
+		jb := &job{rows: cur, done: make(chan struct{})}
+		jobs = append(jobs, jb)
+		if !zeroBase {
+			next <- jb
+		}
+		cur = nil
+	}
 	var verr error
-	if err := w.sh.scan("_base", func(id int64, row []Value) (bool, error) {
-		v := vec1Col(row, 1)
-		b := vec1BlobOf(v)
+	err := w.sh.scan("_base", func(id int64, row []Value) (bool, error) {
+		b := vec1BlobOf(vec1Col(row, 1))
 		if len(b) != 4*nElem {
 			verr = fmt.Errorf("vec1: unexpected vector size in %s_base: %d", w.name, len(b))
 			return false, nil
@@ -728,96 +786,71 @@ func (w *vec1W) rebuildIndex() error {
 		for i := range w.nMeta {
 			r.meta[i] = vec1OwnedValue(vec1Col(row, 2+i))
 		}
-		rows = append(rows, r)
+		cur = append(cur, r)
+		if len(cur) == vec1QuantizeJob {
+			send()
+		}
 		return true, nil
-	}); err != nil {
-		return err
+	})
+	send()
+	close(next)
+	if err == nil {
+		err = verr
 	}
-	if verr != nil {
-		return verr
+	if err != nil {
+		wg.Wait()
+		return err
 	}
 
 	if zeroBase {
-		for _, r := range rows {
-			bucket, err := w.writerVector(wr, r.id, r.raw, -1)
-			if err != nil {
-				return err
-			}
-			for i := range w.nMeta {
-				wr.bld[bucket].meta[i].add(r.meta[i])
+		for _, jb := range jobs {
+			for _, r := range jb.rows {
+				bucket, err := w.writerVector(wr, r.id, r.raw, -1)
+				if err != nil {
+					return err
+				}
+				for i := range w.nMeta {
+					wr.bld[bucket].meta[i].add(r.meta[i])
+				}
 			}
 		}
-		for _, r := range rows {
-			if err := w.updateBaseVector(r.id, Value{Typ: Int, I: 0}); err != nil {
-				return err
+		for _, jb := range jobs {
+			for _, r := range jb.rows {
+				if err := w.updateBaseVector(r.id, Value{Typ: Int, I: 0}); err != nil {
+					return err
+				}
 			}
 		}
 	} else {
-		nEnc := mod.encodedSize()
-		tl := mod.tmpLen(nElem)
-		workers := max(1, min(runtime.GOMAXPROCS(0), w.db.vec1Conn().nThreadValue()))
-		for lo := 0; lo < len(rows); {
-			// One round: up to workers jobs of 1024 rows, quantized at once and
-			// then written in order, as vec1's job queue finishes them.
-			type job struct {
-				lo, hi  int
-				buckets []int
-				codes   []byte
+		var ferr error
+		for _, jb := range jobs {
+			<-jb.done
+			if ferr != nil {
+				continue
 			}
-			var jobs []*job
-			for j := 0; j < workers && lo < len(rows); j++ {
-				hi := min(lo+vec1QuantizeJob, len(rows))
-				jobs = append(jobs, &job{lo: lo, hi: hi, buckets: make([]int, hi-lo), codes: make([]byte, (hi-lo)*nEnc)})
-				lo = hi
-			}
-			var wg sync.WaitGroup
-			for _, jb := range jobs {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					tmp := make([]float32, tl)
-					n := jb.hi - jb.lo
-					bulk := n / vec1MultiNVec * vec1MultiNVec
-					tmps := make([][]float32, bulk)
-					ins := make([][]float32, bulk)
-					codes := make([][]byte, bulk)
-					tbuf := make([]float32, bulk*tl)
-					for i := range bulk {
-						tmps[i] = tbuf[i*tl : (i+1)*tl : (i+1)*tl]
-						ins[i] = vec1Floats(rows[jb.lo+i].raw)
-						codes[i] = jb.codes[i*nEnc : (i+1)*nEnc]
-					}
-					mod.quantizeMany(tmps, ins, codes, jb.buckets[:bulk], &vec1Buf{})
-					for i := bulk; i < n; i++ {
-						clear(tmp)
-						v := vec1Floats(rows[jb.lo+i].raw)
-						code := jb.codes[i*nEnc : (i+1)*nEnc]
-						jb.buckets[i] = mod.quantize(tmp, v, code)
-					}
-				}()
-			}
-			wg.Wait()
-			for _, jb := range jobs {
-				for i := range jb.hi - jb.lo {
-					r := rows[jb.lo+i]
-					bucket := jb.buckets[i]
-					store := r.raw
-					if nEnc > 0 {
-						store = jb.codes[i*nEnc : (i+1)*nEnc]
-					}
-					if err := w.listAdd(wr.bld[bucket], r.id, store); err != nil {
-						return err
-					}
-					if bucketBase {
-						if err := w.updateBaseVector(r.id, Value{Typ: Int, I: int64(bucket)}); err != nil {
-							return err
-						}
-					}
-					for m := range w.nMeta {
-						wr.bld[bucket].meta[m].add(r.meta[m])
+			for i, r := range jb.rows {
+				bucket := jb.buckets[i]
+				store := r.raw
+				if nEnc > 0 {
+					store = jb.codes[i*nEnc : (i+1)*nEnc]
+				}
+				if ferr = w.listAdd(wr.bld[bucket], r.id, store); ferr != nil {
+					break
+				}
+				if bucketBase {
+					if ferr = w.updateBaseVector(r.id, Value{Typ: Int, I: int64(bucket)}); ferr != nil {
+						break
 					}
 				}
+				for m := range w.nMeta {
+					wr.bld[bucket].meta[m].add(r.meta[m])
+				}
 			}
+			jb.rows, jb.codes = nil, nil
+		}
+		wg.Wait()
+		if ferr != nil {
+			return ferr
 		}
 	}
 	for _, b := range wr.bld {

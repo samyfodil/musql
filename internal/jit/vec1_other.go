@@ -39,3 +39,8 @@ func EmitVec1WHT() ([]byte, error) {
 func EmitVec1CandMany() ([]byte, error) {
 	return nil, fmt.Errorf("jit: no vec1 encoder for this architecture")
 }
+
+// EmitVec1Rot4 likewise.
+func EmitVec1Rot4() ([]byte, error) {
+	return nil, fmt.Errorf("jit: no vec1 encoder for this architecture")
+}
