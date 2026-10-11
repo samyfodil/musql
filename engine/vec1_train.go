@@ -445,7 +445,7 @@ func (tr *vec1Trainer) train() ([]byte, error) {
 			tn := vec1MakeT8N(cent, 1, p.nBucket, n)
 			tr.parallel(p.nVec, func(lo, hi int) {
 				best := make([]int, hi-lo)
-				vec1Nearest(tn, cent, p.nBucket, n, p.vecs[lo*n:hi*n], best, make([]float32, hi-lo))
+				vec1Nearest(tn, cent, p.nBucket, n, p.vecs[lo*n:hi*n], nil, best, make([]float32, hi-lo))
 				for i := lo; i < hi; i++ {
 					v := p.vecs[i*n : i*n+n]
 					b := best[i-lo]
@@ -522,7 +522,7 @@ func (r *vec1Rand) next() uint32 {
 // rounds of up to perRound at a time sampled in proportion to the squared
 // distance to the nearest centroid so far (k-means||), the last tail rounds
 // one at a time (k-means++).
-func (tr *vec1Trainer) kmeansInit(vecs []float32, nVec, n, k, perRound, tail int, out []float32) {
+func (tr *vec1Trainer) kmeansInit(vecs, norms []float32, nVec, n, k, perRound, tail int, out []float32) {
 	rnd := newVec1Rand(rand.Uint64()&0x7FFFFFFF, 0)
 	minD := make([]float32, nVec)
 	copy(out[:n], vecs[int(rnd.next())%nVec*n:][:n])
@@ -533,7 +533,7 @@ func (tr *vec1Trainer) kmeansInit(vecs []float32, nVec, n, k, perRound, tail int
 		tr.parallel(nVec, func(lo, hi int) {
 			best := make([]int, hi-lo)
 			dist := make([]float32, hi-lo)
-			vec1Nearest(tn, out[first*n:nCent*n], nNew, n, vecs[lo*n:hi*n], best, dist)
+			vec1Nearest(tn, out[first*n:nCent*n], nNew, n, vecs[lo*n:hi*n], norms[lo:hi], best, dist)
 			for i := lo; i < hi; i++ {
 				if d := dist[i-lo]; first == 0 || d < minD[i] {
 					minD[i] = d
@@ -582,7 +582,8 @@ func (tr *vec1Trainer) kmeansInit(vecs []float32, nVec, n, k, perRound, tail int
 // A centroid no vector chose keeps its place.
 func (tr *vec1Trainer) kmeans(vecs []float32, nVec, n, k int, out []float32, coarse bool) error {
 	t0 := time.Now()
-	tr.kmeansInit(vecs, nVec, n, k, 8, 32, out)
+	norms := vec1Norms(vecs[:nVec*n], n)
+	tr.kmeansInit(vecs, norms, nVec, n, k, 8, 32, out)
 	if coarse {
 		tr.times[vec1TCoarseInit] += time.Since(t0)
 		tr.done++
@@ -591,7 +592,7 @@ func (tr *vec1Trainer) kmeans(vecs []float32, nVec, n, k int, out []float32, coa
 		}
 	}
 	t0 = time.Now()
-	tr.lloyd(vecs, nVec, n, k, out)
+	tr.lloyd(vecs, norms, nVec, n, k, out)
 	if coarse {
 		tr.times[vec1TCoarseKMeans] += time.Since(t0)
 		tr.done++
@@ -600,7 +601,7 @@ func (tr *vec1Trainer) kmeans(vecs []float32, nVec, n, k int, out []float32, coa
 }
 
 // lloyd runs Lloyd's iterations over centroids in place.
-func (tr *vec1Trainer) lloyd(vecs []float32, nVec, n, k int, cent []float32) {
+func (tr *vec1Trainer) lloyd(vecs, norms []float32, nVec, n, k int, cent []float32) {
 	type part struct {
 		sum   []float32
 		count []int
@@ -615,7 +616,7 @@ func (tr *vec1Trainer) lloyd(vecs []float32, nVec, n, k int, cent []float32) {
 			pt := &part{sum: make([]float32, k*n), count: make([]int, k)}
 			best := make([]int, hi-lo)
 			dist := make([]float32, hi-lo)
-			vec1Nearest(tn, cent, k, n, vecs[lo*n:hi*n], best, dist)
+			vec1Nearest(tn, cent, k, n, vecs[lo*n:hi*n], norms[lo:hi], best, dist)
 			for i := lo; i < hi; i++ {
 				v := vecs[i*n : i*n+n]
 				b, d := best[i-lo], dist[i-lo]
@@ -677,8 +678,9 @@ func (tr *vec1Trainer) trainCodebooks(vecs []float32, book []float32) error {
 				copy(sv[i*ne:i*ne+cnt], vecs[i*n+off:i*n+off+cnt])
 			}
 			out := book[b*ne*vec1CodebookSize : (b+1)*ne*vec1CodebookSize]
-			sub.kmeansInit(sv, p.nVec, ne, vec1CodebookSize, 8, 32, out)
-			sub.lloyd(sv, p.nVec, ne, vec1CodebookSize, out)
+			norms := vec1Norms(sv, ne)
+			sub.kmeansInit(sv, norms, p.nVec, ne, vec1CodebookSize, 8, 32, out)
+			sub.lloyd(sv, norms, p.nVec, ne, vec1CodebookSize, out)
 		}(b)
 	}
 	wg.Wait()
@@ -780,7 +782,7 @@ func (tr *vec1Trainer) findRotation(vecs, book []float32, r []float32) error {
 				copy(subs[i*ne:i*ne+kk], vecs[i*n+off:i*n+off+kk])
 			}
 			bests := make([]int, p.nVec)
-			vec1Nearest(tn, code, vec1CodebookSize, ne, subs, bests, make([]float32, p.nVec))
+			vec1Nearest(tn, code, vec1CodebookSize, ne, subs, nil, bests, make([]float32, p.nVec))
 			q := make([]float32, vec1CovarBatch)
 			sums := make([]float32, len(batches[0])/vec1CovarBatch)
 			for bt, tv := range batches {

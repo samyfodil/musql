@@ -555,7 +555,7 @@ func (m *vec1Model) quantizeMany(tmp, in [][]float32, code [][]byte, buckets []i
 		for i := range cnt {
 			copy(vecs[i*n:], a[i][:n])
 		}
-		if !vec1BestMany(t8.centN, m.cent, m.nBucket(), n, vecs, true, true, sc, buckets, nil) {
+		if !vec1BestMany(t8.centN, m.cent, m.nBucket(), n, vecs, nil, true, true, sc, buckets, nil) {
 			for i := range cnt {
 				buckets[i] = m.bestBucket(a[i][:n], true)
 			}

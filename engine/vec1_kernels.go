@@ -216,9 +216,9 @@ func vec1RowsKernel() *jit.Code {
 // vec1Nearest is training's nearest-row search: for each vector (rows of n
 // in vecs), the first of the m rows (row-major in rows, laid out in tn by
 // vec1MakeT8N) nearest it by the float32 estimate of jit.EmitVec1Cand, and
-// that distance. vec1's training is randomized and its builds differ in
+// that distance. norms, when not nil, is vec1Norms(vecs). vec1's training is randomized and its builds differ in
 // this arithmetic, so a trained model is not compared to the bit.
-func vec1Nearest(tn *vec1T8N, rows []float32, m, n int, vecs []float32, best []int, dist []float32) {
+func vec1Nearest(tn *vec1T8N, rows []float32, m, n int, vecs, norms []float32, best []int, dist []float32) {
 	nVec := len(vecs) / n
 	if m == 1 && n%8 == 0 && nVec >= 8 {
 		// One row (k-means++'s rounds): the vectors are the rows, back to
@@ -239,16 +239,39 @@ func vec1Nearest(tn *vec1T8N, rows []float32, m, n int, vecs []float32, best []i
 				best[i], dist[i] = 0, sums[i]
 			}
 			if done < nVec {
-				vec1Nearest(tn, rows, m, n, vecs[done*n:], best[done:], dist[done:])
+				vec1Nearest(tn, rows, m, n, vecs[done*n:], vec1Tail(norms, done), best[done:], dist[done:])
 			}
 			return
 		}
 	}
-	if !vec1BestMany(tn, rows, m, n, vecs, false, false, &vec1Buf{}, best, dist) {
+	if !vec1BestMany(tn, rows, m, n, vecs, norms, false, false, &vec1Buf{}, best, dist) {
 		for i := range nVec {
 			best[i], dist[i] = vec1NearestGo(rows, m, n, vecs[i*n:i*n+n])
 		}
 	}
+}
+
+// vec1Tail is norms[i:], or nil for none.
+func vec1Tail(norms []float32, i int) []float32 {
+	if norms == nil {
+		return nil
+	}
+	return norms[i:]
+}
+
+// vec1Norms is each of the vectors' squared norm, in float32: what
+// vec1Nearest adds to an estimate to give a distance, computed once for a
+// k-means and not once a round.
+func vec1Norms(vecs []float32, n int) []float32 {
+	out := make([]float32, len(vecs)/n)
+	for i := range out {
+		var sq float32
+		for _, x := range vecs[i*n : i*n+n] {
+			sq += x * x
+		}
+		out[i] = sq
+	}
+	return out
 }
 
 // vec1NearestGo is vec1Nearest for one vector, in Go.
@@ -562,7 +585,7 @@ const vec1CandGroups = 16
 // dist[i] that estimate as a squared distance). The estimates come from
 // jit.EmitVec1CandMany, vec1CandGroups groups of four at a time. false when
 // there is no kernel.
-func vec1BestMany(tn *vec1T8N, rows []float32, m, n int, vecs []float32, exact, round bool, sc *vec1Buf, out []int, dist []float32) bool {
+func vec1BestMany(tn *vec1T8N, rows []float32, m, n int, vecs, norms []float32, exact, round bool, sc *vec1Buf, out []int, dist []float32) bool {
 	k := vec1CandManyKernel()
 	b := tn.b
 	nv := len(vecs) / n
@@ -675,8 +698,12 @@ func vec1BestMany(tn *vec1T8N, rows []float32, m, n int, vecs []float32, exact, 
 					continue
 				}
 				var sq float32
-				for _, x := range q {
-					sq += x * x
+				if norms != nil {
+					sq = norms[i+j]
+				} else {
+					for _, x := range q {
+						sq += x * x
+					}
 				}
 				dist[i+j] = max(0, float32(lo)+sq)
 			}

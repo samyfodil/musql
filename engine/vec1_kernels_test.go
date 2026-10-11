@@ -266,7 +266,7 @@ func TestVec1KernelsMatchGo(t *testing.T) {
 				for _, exact := range []bool{true, false} {
 					best := make([]int, nv)
 					dist := make([]float32, nv)
-					if !vec1BestMany(tn, rows, m, n, vecs, exact, true, &vec1Buf{}, best, dist) {
+					if !vec1BestMany(tn, rows, m, n, vecs, nil, exact, true, &vec1Buf{}, best, dist) {
 						break
 					}
 					for i := range nv {
@@ -302,7 +302,7 @@ func TestVec1KernelsMatchGo(t *testing.T) {
 				}
 				best := make([]int, nVec)
 				dist := make([]float32, nVec)
-				vec1Nearest(vec1MakeT8N(rows, 1, m, n), rows, m, n, vecs, best, dist)
+				vec1Nearest(vec1MakeT8N(rows, 1, m, n), rows, m, n, vecs, nil, best, dist)
 				for i := range nVec {
 					wb, wd := 0, float32(math.Inf(1))
 					for j := range m {
