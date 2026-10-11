@@ -287,6 +287,43 @@ func TestVec1KernelsMatchGo(t *testing.T) {
 			}
 		}
 	}
+	// Rows with a NaN or an infinity among large and small ones: the bound
+	// must still cover the large rows, and the answers stay exact.
+	{
+		n, m := 16, 40
+		rows := make([]float32, m*n)
+		for j := range m {
+			scale := float32(1)
+			if j%5 == 0 {
+				scale = 1e4
+			}
+			for d := range n {
+				rows[j*n+d] = scale * float32(r.NormFloat64())
+			}
+		}
+		rows[3*n+2] = float32(math.NaN())
+		for it := range 100 {
+			if it == 50 {
+				rows[17*n+5] = float32(math.Inf(1))
+			}
+			vecs := make([]float32, 8*n)
+			for i := range 8 {
+				base := rows[(5*r.IntN(8))*n:]
+				for d := range n {
+					vecs[i*n+d] = base[d] + float32(r.NormFloat64())
+				}
+			}
+			best := make([]int, 8)
+			if !vec1BestMany(vec1MakeT8N(rows, 1, m, n), rows, m, n, vecs, nil, true, true, &vec1Buf{}, best, nil) {
+				break
+			}
+			for i := range 8 {
+				if w := vec1BestRows(rows, m, n, vecs[i*n:i*n+n], true); best[i] != w {
+					t.Fatalf("NaN rows, vec %d: row %d, want %d", i, best[i], w)
+				}
+			}
+		}
+	}
 	// The training search: the kernel's lanes reduced to the first nearest
 	// row, as a row-by-row search finds it.
 	for _, n := range []int{1, 8, 384} {
