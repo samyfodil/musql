@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 
@@ -22,13 +21,22 @@ import (
 //
 // Layout, all integers little-endian:
 //
-//	header      24 bytes: magic, version, table count, directory length, and
-//	            the SOURCE database's change counter and page count
+//	header      32 bytes: magic, version, table count, directory length, the
+//	            SOURCE database's change counter and page count, and the
+//	            directory's offset
+//	segments    each 8-byte aligned, from byte 32
 //	directory   one entry per table: name, CREATE text, column names, the index
 //	            of the INTEGER PRIMARY KEY column (-1 for none), and the
 //	            (offset, length) of each of its segments; then the CATALOG --
 //	            every index, view and trigger, and every AUTOINCREMENT counter
-//	segments    each 8-byte aligned, in directory order
+//
+// Version 4, which this build still reads, had a 24-byte header with the
+// directory right after it and the segments last. Version 5 moved the
+// directory to the end so a writer can put each segment where it finally
+// lives as it is built: the directory's length, which version 4 needed before
+// the first segment's offset, is known only once every segment is. Version 4's
+// writer staged the segments in a scratch file and copied them in after the
+// directory -- every rewrite wrote its whole database twice.
 //
 // segFileVersion is the format this build writes, and segFileMinVersion the
 // oldest it reads: a file is readable from every build after the one that
@@ -41,9 +49,10 @@ import (
 // segFileMinVersion drops files people may have; it needs a converter first.
 const (
 	segFileMagic      = "MQSF"
-	segFileVersion    = 4
+	segFileVersion    = 5
 	segFileMinVersion = 4
-	segFileHdrSize    = 24
+	segFileHdrSize    = 24 // version 4's header, and the fields every version starts with
+	segFileHdrSizeV5  = 32 // version 5's: those, and the directory's offset
 )
 
 // SegmentFile is a mapped segment file.
@@ -186,11 +195,14 @@ func (w *segFileWriter) addSegment(ti int, raw []byte) error {
 	}
 	at := segAlign8Int64(w.at)
 	if w.scratch == nil && at+int64(len(raw)) > segWriterMemBytes {
+		// The scratch is the file itself, segments at their final offsets
+		// (segFileHdrSizeV5 on); finish adds the directory and the header and
+		// renames it into place.
 		f, err := os.CreateTemp(w.dir, ".segments-*")
 		if err != nil {
 			return err
 		}
-		if _, err := f.WriteAt(w.mem, 0); err != nil {
+		if _, err := f.WriteAt(w.mem, segFileHdrSizeV5); err != nil {
 			f.Close()
 			os.Remove(f.Name())
 			return err
@@ -198,7 +210,7 @@ func (w *segFileWriter) addSegment(ti int, raw []byte) error {
 		w.scratch, w.mem = f, nil
 	}
 	if w.scratch != nil {
-		if _, err := w.scratch.WriteAt(raw, at); err != nil {
+		if _, err := w.scratch.WriteAt(raw, segFileHdrSizeV5+at); err != nil {
 			return err
 		}
 	} else {
@@ -312,49 +324,54 @@ func (w *segFileWriter) finish(path string, tables []ConvertedTable, cat Convert
 	// ...and the capture guard (ConvertedCatalog.CaptureGuard), last.
 	dir = appendLenString(dir, cat.CaptureGuard)
 
-	head := make([]byte, segFileHdrSize+len(dir))
+	// Segments from byte 32, the directory after the last of them.
+	const base = segFileHdrSizeV5
+	dirOff := segAlign8Int64(base + w.at)
+	for _, p := range patches {
+		binary.LittleEndian.PutUint64(dir[p.at:], uint64(base+p.scratch))
+	}
+	head := make([]byte, segFileHdrSizeV5)
 	copy(head, segFileMagic)
 	binary.LittleEndian.PutUint32(head[4:], segFileVersion)
 	binary.LittleEndian.PutUint32(head[8:], uint32(len(tables)))
 	binary.LittleEndian.PutUint32(head[12:], uint32(len(dir)))
 	binary.LittleEndian.PutUint32(head[16:], srcChangeCounter)
 	binary.LittleEndian.PutUint32(head[20:], srcPageCount)
-	copy(head[segFileHdrSize:], dir)
-	// Every segment starts 8-byte aligned, or the zero-copy column cast is not
-	// available: the scratch's offsets are 8-aligned, so they stay so after a
-	// base that is.
-	base := segAlign8Int64(int64(len(head)))
-	for _, p := range patches {
-		binary.LittleEndian.PutUint64(head[segFileHdrSize+p.at:], uint64(base+p.scratch))
+	binary.LittleEndian.PutUint64(head[24:], uint64(dirOff))
+	if w.scratch != nil {
+		// The segments are already in place: the directory and the header
+		// complete the file, and it takes path's name.
+		f := w.scratch
+		if _, err := f.WriteAt(dir, dirOff); err != nil {
+			return err
+		}
+		if _, err := f.WriteAt(head, 0); err != nil {
+			return err
+		}
+		if err := f.Chmod(0o644); err != nil { // CreateTemp's 0600 is not what a database file gets
+			return err
+		}
+		if err := f.Close(); err != nil {
+			return err
+		}
+		w.scratch = nil
+		if err := os.Rename(f.Name(), path); err != nil {
+			os.Remove(f.Name())
+			return err
+		}
+		return nil
 	}
 	out, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
-	if _, err := out.WriteAt(head, 0); err != nil {
+	img := make([]byte, dirOff+int64(len(dir)))
+	copy(img, head)
+	copy(img[base:], w.mem)
+	copy(img[dirOff:], dir)
+	if _, err := out.WriteAt(img, 0); err != nil {
 		out.Close()
 		return err
-	}
-	if w.scratch == nil {
-		if _, err := out.WriteAt(w.mem, base); err != nil {
-			out.Close()
-			return err
-		}
-	} else if w.at > 0 {
-		if _, err := w.scratch.Seek(0, io.SeekStart); err != nil {
-			out.Close()
-			return err
-		}
-		if _, err := out.Seek(base, io.SeekStart); err != nil {
-			out.Close()
-			return err
-		}
-		// A LimitedReader over the file, not a SectionReader: it is what lets
-		// os.File.ReadFrom hand the copy to copy_file_range on Linux.
-		if _, err := io.Copy(out, io.LimitReader(w.scratch, w.at)); err != nil {
-			out.Close()
-			return err
-		}
 	}
 	return out.Close()
 }
@@ -394,11 +411,21 @@ func OpenSegmentFile(path string) (*SegmentFile, error) {
 	}
 	nTables := int(binary.LittleEndian.Uint32(buf[8:]))
 	dirLen := int(binary.LittleEndian.Uint32(buf[12:]))
-	if segFileHdrSize+dirLen > len(buf) {
+	// Version 4's directory follows its header; version 5's is wherever the
+	// header says, after the segments.
+	dirOff := uint64(segFileHdrSize)
+	if binary.LittleEndian.Uint32(buf[4:]) >= 5 {
+		if len(buf) < segFileHdrSizeV5 {
+			m.Close()
+			return nil, fmt.Errorf("segment file: header truncated")
+		}
+		dirOff = binary.LittleEndian.Uint64(buf[24:])
+	}
+	if dirOff > uint64(len(buf)) || uint64(dirLen) > uint64(len(buf))-dirOff {
 		m.Close()
 		return nil, fmt.Errorf("segment file: directory overruns the file")
 	}
-	d := &segDirReader{buf: buf[segFileHdrSize : segFileHdrSize+dirLen]}
+	d := &segDirReader{buf: buf[dirOff : dirOff+uint64(dirLen)]}
 	if got := int(d.u32()); got != nTables {
 		m.Close()
 		return nil, fmt.Errorf("segment file: header says %d tables, directory says %d", nTables, got)

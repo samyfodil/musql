@@ -23,7 +23,11 @@ import (
 // format version is added, into a directory of its own, leaving the old one.
 
 // formatFixtureDir is the fixture the current format writes.
-const formatFixtureDir = "testdata/format/v4"
+const formatFixtureDir = "testdata/format/v5"
+
+// formatVersionWritten is the segment file version a rewrite writes: a
+// fixture of any older version is written back as this one by its VACUUM.
+const formatVersionWritten = 5
 
 // formatFixtureSetup builds the fixture: every storage class and NULL, a
 // rowid alias and a WITHOUT ROWID table, indexes plain, expression and
@@ -171,6 +175,13 @@ func TestFormatFixture(t *testing.T) {
 				}
 			}
 			db.Close()
+			// The VACUUM rewrote the file, in the current version whatever
+			// version it was opened in.
+			if data, err := os.ReadFile(path); err != nil {
+				t.Fatal(err)
+			} else if len(data) < 8 || data[4] != formatVersionWritten || data[5]|data[6]|data[7] != 0 {
+				t.Errorf("after the VACUUM, %s's file is version %v, want %d", dir, data[4:8], formatVersionWritten)
+			}
 			db, err = sql.Open(DriverName, path)
 			if err != nil {
 				t.Fatal(err)
