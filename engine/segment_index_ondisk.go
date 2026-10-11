@@ -131,9 +131,37 @@ func buildSegColumnIndexBytes(cells []int64, heap []byte) ([]byte, bool) {
 			return nil, false // a cell that does not describe heap bytes
 		}
 	}
-	return buildSegColumnIndexWith(cells, segIdxCodecBytes, func(a, b int64) int {
-		return bytes.Compare(at(a), at(b))
-	})
+	compare := func(a, b int64) int { return bytes.Compare(at(a), at(b)) }
+	// ORDERED BY RADIX ON AN 8-BYTE PREFIX, then by the bytes within a run of
+	// equal prefixes: a sort calling bytes.Compare on every comparison cost a
+	// 300,000-row segment of vectors most of its build. The prefix is the
+	// first 8 bytes big-endian, zero-padded, so prefix order agrees with
+	// BINARY order wherever two prefixes differ, and a tie is settled by the
+	// full comparison (a shorter value padded with zeros ties its zero-extended
+	// neighbour here and sorts first there). Positions break the rest.
+	prefix := make([]int64, len(cells))
+	for i, c := range cells {
+		var k [8]byte
+		copy(k[:], at(c))
+		prefix[i] = int64(binary.BigEndian.Uint64(k[:]) ^ 1<<63) // radixOrderInt64 orders signed
+	}
+	order := radixOrderInt64(prefix)
+	for lo := 0; lo < len(order); {
+		hi := lo + 1
+		for hi < len(order) && prefix[order[hi]] == prefix[order[lo]] {
+			hi++
+		}
+		if hi-lo > 1 {
+			slices.SortFunc(order[lo:hi], func(x, y int32) int {
+				if c := compare(cells[x], cells[y]); c != 0 {
+					return c
+				}
+				return cmp.Compare(x, y)
+			})
+		}
+		lo = hi
+	}
+	return buildSegColumnIndexOrdered(cells, segIdxCodecBytes, compare, order)
 }
 
 // radixOrderInt64 returns the positions of vals ordered by (value, position):
@@ -198,6 +226,16 @@ func buildSegColumnIndexWith(vals []int64, codec uint16, compare func(a, b int64
 			}
 			return cmp.Compare(x, y)
 		})
+	}
+	return buildSegColumnIndexOrdered(vals, codec, compare, order)
+}
+
+// buildSegColumnIndexOrdered lays out the index of vals given order, their
+// positions sorted by (value, position).
+func buildSegColumnIndexOrdered(vals []int64, codec uint16, compare func(a, b int64) int, order []int32) ([]byte, bool) {
+	n := len(vals)
+	if n == 0 {
+		return nil, false
 	}
 	nVals := 1
 	for i := 1; i < n; i++ {
