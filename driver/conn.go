@@ -969,7 +969,7 @@ func (c *Conn) execArgs(sqlText string, args []engine.Value) (driver.Result, err
 		if aerr != nil {
 			return nil, aerr
 		}
-		n, _, err := c.tx.ExecArgs(sqlText, args)
+		n, _, err := c.tx.ExecArgsOwned(sqlText, args) // args are this call's copies (driverValueToEngine)
 		release()
 
 		// Read the counters back unconditionally, as the autocommit path does: a
@@ -1033,7 +1033,7 @@ func (c *Conn) execArgs(sqlText string, args []engine.Value) (driver.Result, err
 			}
 			defer release()
 		}
-		n, _, err = db.ExecArgs(sqlText, args)
+		n, _, err = db.ExecArgsOwned(sqlText, args) // args are this call's copies (driverValueToEngine)
 		// A "PRAGMA auto_vacuum = MODE" the session accepted leaves its
 		// DEFERRED request there, and the session is about to be thrown away --
 		// see Conn.autoVacuumPendingPlus1 -- and, for the same reason, the

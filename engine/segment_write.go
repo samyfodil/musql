@@ -392,6 +392,14 @@ func (n *Session) ExecArgs(sql string, args []Value) (int64, int64, error) {
 	return n.DB.ExecArgs(sql, args)
 }
 
+// ExecArgsOwned is ExecArgs handing args' bytes over (DB.ExecArgsOwned).
+func (n *Session) ExecArgsOwned(sql string, args []Value) (int64, int64, error) {
+	if n.closed {
+		return 0, 0, fmt.Errorf("engine: write session is closed")
+	}
+	return n.DB.ExecArgsOwned(sql, args)
+}
+
 // Commit appends everything executed since the last Commit as ONE delta batch
 // and fsyncs it. That batch's trailer is the commit point.
 //

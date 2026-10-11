@@ -2087,6 +2087,17 @@ func unsupportedStatementErr(trimmed string) error {
 	return fmt.Errorf("engine: unsupported statement (this write path only supports CREATE TABLE/VIEW/TRIGGER, CREATE/DROP INDEX, DROP TABLE/VIEW/TRIGGER, INSERT, UPDATE, DELETE, ATTACH/DETACH, BEGIN/COMMIT/END/ROLLBACK, and SAVEPOINT/RELEASE/ROLLBACK TO): %q", trimmed)
 }
 
+// ExecArgsOwned is ExecArgs for a caller that hands args' byte slices over:
+// it never reads or writes them again, so a row may keep them rather than a
+// copy. The driver's arguments are copies it made for the call
+// (database/sql's contract), so it passes them this way.
+func (db *DB) ExecArgsOwned(sqlText string, args []Value) (rowsAffected int64, lastInsertID int64, err error) {
+	saved := db.argsOwned
+	db.argsOwned = true
+	defer func() { db.argsOwned = saved }()
+	return db.ExecArgs(sqlText, args)
+}
+
 // ExecArgs is Exec with bound parameters: args[i] binds parameter i+1. It
 // returns rows affected and this *DB's last_insert_rowid after the statement
 // (only INSERT changes it, as with sqlite3_last_insert_rowid()).

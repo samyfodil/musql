@@ -32,6 +32,10 @@ import (
 type DB struct {
 	path string
 
+	// argsOwned is set for an ExecArgsOwned call: the bound arguments' bytes
+	// are the engine's, so a row may keep them without a copy.
+	argsOwned bool
+
 	pageSize uint32
 	// usable is the USABLE page size: pageSize, since this format reserves no
 	// bytes per page. fts3 sizes its leaves from it, as C does from the pager's.

@@ -343,6 +343,8 @@ func (w *vec1W) insertBase(rowidV Value, vec []byte, bucket int, meta []Value) (
 	row[0] = Value{Typ: Null}
 	if w.t.mod.isFlat() {
 		row[1] = Value{Typ: Int, I: int64(bucket)}
+	} else if w.db.argsOwned {
+		row[1] = Value{Typ: Blob, S: vec} // the caller handed it over (DB.ExecArgsOwned)
 	} else {
 		row[1] = Value{Typ: Blob, S: append([]byte(nil), vec...)}
 	}
