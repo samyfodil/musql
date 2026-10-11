@@ -91,8 +91,26 @@ func vec1FloatBytes(v []float32) []byte {
 
 // vec1NonFinite reports whether some element is NaN or infinite
 // (vec1VectorIsNonFinite: every exponent bit set).
+//
+// Two elements a 64-bit word: each 32-bit lane masked to its exponent and
+// XORed with all-ones-exponent is zero exactly for a non-finite element, and
+// a masked lane is below 2^31, so the classic has-a-zero-lane test is exact:
+// a zero lane's decrement sets its top bit, a nonzero one's cannot (a borrow
+// into the high lane comes only from a zero low lane, already a hit).
 func vec1NonFinite(b []byte) bool {
-	for i := 0; i+4 <= len(b); i += 4 {
+	const exp2 = 0x7F8000007F800000
+	var hit uint64
+	i := 0
+	for ; i+32 <= len(b); i += 32 {
+		for k := 0; k < 32; k += 8 {
+			x := vec1Native.Uint64(b[i+k:])&exp2 ^ exp2
+			hit |= (x - 0x0000000100000001) &^ x & 0x8000000080000000
+		}
+		if hit != 0 {
+			return true
+		}
+	}
+	for ; i+4 <= len(b); i += 4 {
 		if vec1Native.Uint32(b[i:])&0x7F800000 == 0x7F800000 {
 			return true
 		}
