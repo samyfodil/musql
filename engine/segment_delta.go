@@ -584,6 +584,23 @@ func segDeltaBatchBytes(recs []SegDeltaRecord) int64 {
 	return n
 }
 
+// segDeltaBatchBytesExceed is segDeltaBatchBytes(recs) > limit, measuring
+// only until the answer is known: a bulk load's batch is far past the limit
+// long before its last record, and measuring a record can mean encoding it.
+func segDeltaBatchBytesExceed(recs []SegDeltaRecord, limit int64) bool {
+	n := int64(8 + segDeltaTrailerSz)
+	for i := range recs {
+		if n > limit {
+			return true
+		}
+		n += 13
+		if !recs[i].Kill {
+			n += 4 + int64(recs[i].recordLen())
+		}
+	}
+	return n > limit
+}
+
 // syncMode is how a commit makes its batch durable.
 type syncMode int
 

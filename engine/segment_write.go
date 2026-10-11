@@ -1370,7 +1370,7 @@ func compactionDueAfter(st [2]fileStamp, recs []SegDeltaRecord) bool {
 	if !st[0].there {
 		return false
 	}
-	return st[1].size+segDeltaBatchBytes(recs) > compactionThreshold(st[0].size)
+	return segDeltaBatchBytesExceed(recs, compactionThreshold(st[0].size)-st[1].size)
 }
 
 func (n *Session) compactIfWorthIt() {
