@@ -201,7 +201,12 @@ func TestVec1Exact(t *testing.T) {
 			load(t, m, c, "v", vecs[:1000], nMeta)
 			var model any
 			if cf.train && cf.mine {
+				// Trained with four threads. The rebuilds stay on one: vec1
+				// finishes a multi-threaded rebuild's jobs in the order they
+				// complete, so its lists' order is not repeatable.
+				same(t, m, c, "SELECT vec1_config('nthread', 4)")
 				model = trainModel(t, m, "v", cf.model)
+				same(t, m, c, "SELECT vec1_config('nthread', 1)")
 			} else if cf.train {
 				model = trainModel(t, c, "v", cf.model)
 			} else if cf.model != "" {
@@ -394,3 +399,39 @@ SELECT vec1_train(x'0000803f00000040', '{nbucket:2}')
 SELECT vec1_train(x'0000803f00000040', '{codesize:1}')
 SELECT vec1_train(x) FROM (SELECT 1 AS x WHERE 0)
 `
+
+// TestVec1ParallelRebuild checks that musql's rebuild answers the same with
+// one thread or several: its jobs finish in order, as vec1's single-threaded
+// rebuild finishes them (vec1's own multi-threaded order is not repeatable,
+// so it is not the oracle here).
+func TestVec1ParallelRebuild(t *testing.T) {
+	r := rand.New(rand.NewPCG(21, 22))
+	vecs := clusteredVecs(r, 5000, 24, 30)
+	m, _ := engines(t)
+	mustExec(t, m, "CREATE VIRTUAL TABLE v USING vec1(vector, m0)")
+	tx, err := m.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range vecs {
+		if _, err := tx.Exec("INSERT INTO v(rowid, vector, m0) VALUES(?, ?, ?)", i+1, vecBlob(v), metaValue(i, 0)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	for _, cfg := range []string{`{nbucket: 30, codesize: 6, quantizer:"pq"}`, `{nbucket: 30, quantizer:"bq"}`, `{nbucket: 30, codesize: 6, quantizer:"opq", nopq_round: 2}`} {
+		model := trainModel(t, m, "v", cfg)
+		var dumps []string
+		for _, threads := range []int{1, 4} {
+			mustExec(t, m, fmt.Sprintf("SELECT vec1_config('nthread', %d)", threads))
+			mustExec(t, m, "INSERT INTO v(cmd, arg) VALUES('rebuild', ?)", model)
+			dumps = append(dumps, render(m, "SELECT id, bucket, first, last, hex(val) FROM v_idx ORDER BY id")+
+				render(m, "SELECT id, hex(val) FROM v_meta ORDER BY id")+render(m, "SELECT * FROM v_base ORDER BY id"))
+		}
+		if dumps[0] != dumps[1] {
+			t.Fatalf("%s: a rebuild on four threads differs from one on one", cfg)
+		}
+	}
+}
