@@ -6,8 +6,8 @@ package engine
 // register holds the same component of eight rows, and each row's sum is
 // accumulated in component order with one rounding per operation, as vec1's
 // portable C does it. The answers are its answers, to the bit; only the rows
-// done at once change. The JIT's kernels (internal/jit, vec1_jit.go) take a
-// call when the machine has one, these loops otherwise.
+// done at once change. The JIT's kernels (internal/jit's vec1 emitters) take
+// a call when the machine has one, these loops otherwise.
 
 import (
 	"math"
@@ -216,8 +216,9 @@ func vec1RowsKernel() *jit.Code {
 // vec1Nearest is training's nearest-row search: for each vector (rows of n
 // in vecs), the first of the m rows (row-major in rows, laid out in tn by
 // vec1MakeT8N) nearest it by the float32 estimate of jit.EmitVec1Cand, and
-// that distance. norms, when not nil, is vec1Norms(vecs). vec1's training is randomized and its builds differ in
-// this arithmetic, so a trained model is not compared to the bit.
+// that distance; norms, when not nil, is vec1Norms(vecs). vec1's training is
+// randomized and its builds differ in this arithmetic, so a trained model is
+// not compared to the bit.
 func vec1Nearest(tn *vec1T8N, rows []float32, m, n int, vecs, norms []float32, best []int, dist []float32) {
 	nVec := len(vecs) / n
 	if m == 1 && n%8 == 0 && nVec >= 8 {
@@ -455,8 +456,11 @@ func vec1MakeT8N(rows []float32, sets, m, n int) *vec1T8N {
 				sq += float64(x) * float64(x)
 			}
 			blk[base+8*n+r%8] = float32(sq)
-			if c := math.Sqrt(sq); !(c <= tn.maxc[s]) {
-				tn.maxc[s] = c // NaN sticks: the set is then searched exactly
+			// A row with a NaN is never anyone's nearest, so it does not
+			// bound the others; an infinite one makes the bound infinite,
+			// and the set is then searched exactly.
+			if c := math.Sqrt(sq); c > tn.maxc[s] {
+				tn.maxc[s] = c
 			}
 		}
 	}
@@ -493,9 +497,7 @@ func vec1Best4(tn *vec1T8N, rows []float32, sets, m, comp int, vecs []float32, s
 	under := float64(8*comp+8) * 0x1p-149
 	var maxc float64
 	for _, c := range tn.maxc[:sets] {
-		if !(c <= maxc) {
-			maxc = c
-		}
+		maxc = max(maxc, c)
 	}
 	if need := 64 + 32*b; cap(sc.f) < need {
 		sc.f = make([]float32, need)
@@ -510,7 +512,9 @@ func vec1Best4(tn *vec1T8N, rows []float32, sets, m, comp int, vecs []float32, s
 			for _, x := range vecs[i*stride+s*comp : i*stride+s*comp+comp] {
 				sq += float64(x) * float64(x)
 			}
-			if v := math.Sqrt(sq); !(v <= vmax) {
+			// A part with a NaN has no finite estimate: its lo is +Inf
+			// and it is searched exactly.
+			if v := math.Sqrt(sq); v > vmax {
 				vmax = v
 			}
 		}
