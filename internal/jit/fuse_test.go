@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/bits"
 	"math/rand"
+	"runtime"
 	"slices"
 	"testing"
 )
@@ -368,7 +369,7 @@ func TestFusionMatchesUnfused(t *testing.T) {
 	if condsSome < 60 {
 		t.Fatalf("only %d of 1500 programs had a condition fused into branches", condsSome)
 	}
-	if pred := PredicatedStatsForTest(); pred < 50 {
+	if pred := PredicatedStatsForTest(); pred < 50 && runtime.GOARCH != "wasm" { // the wasm emitter does not predicate
 		t.Fatalf("only %d programs emitted with a predicated row: it went untested", pred)
 	} else {
 		t.Logf("%d programs emitted with a predicated row", pred)
