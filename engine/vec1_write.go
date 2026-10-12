@@ -50,11 +50,19 @@ type vec1W struct {
 
 func (db *DB) vec1Writing(vm *vtabMeta, st *vec1Store) *vec1W {
 	c := db.vec1Conn()
+	// The writer of the last statement, while nothing it names has changed:
+	// built per statement, it was a map lookup and a key string per row of a
+	// prepared single-row INSERT. It holds no state of its own.
+	if w := vm.vec1w; w != nil && w.db == db && w.st == st && w.name == vm.name && vm.vec1wConn == c && vm.vec1wGen == c.gen {
+		return w
+	}
 	schema := "main"
 	if vm.isTemp {
 		schema = "temp"
 	}
-	return &vec1W{db: db, sh: db.vec1Shadow(createScope(vm.isTemp), vm.name), t: c.tab(schema, vm.name), st: st, name: vm.name, nMeta: st.nMeta}
+	w := &vec1W{db: db, sh: db.vec1Shadow(createScope(vm.isTemp), vm.name), t: c.tab(schema, vm.name), st: st, name: vm.name, nMeta: st.nMeta}
+	vm.vec1w, vm.vec1wConn, vm.vec1wGen = w, c, c.gen
+	return w
 }
 
 // begin is xBegin (vec1BeginMethod): the config loaded once per transaction.

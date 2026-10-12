@@ -806,6 +806,12 @@ type vtabMeta struct {
 	colInfos   []columnInfo
 	colInfosOf []VtabColumn
 
+	// vec1w is the vec1 writer last built for this table (DB.vec1Writing),
+	// with the connection state and its generation it was built under.
+	vec1w     *vec1W
+	vec1wConn *Vec1Connection
+	vec1wGen  uint64
+
 	// schemaSeq is this object's CREATION rank within its database: the order
 	// its sqlite_schema row must appear in, which C SQLite gives by simply
 	// appending each new object's row to the catalog b-tree. materialize
