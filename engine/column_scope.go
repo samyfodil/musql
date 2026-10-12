@@ -113,6 +113,17 @@ type tableScope struct {
 	// other join shapes.
 	coalesceFallback map[string][]int
 
+	// coalesceRightAt is, per name, one more than the position in
+	// coalesceFallback[name] of the last owner joined by a plain RIGHT JOIN
+	// (0: none). An unqualified reference is resolved by lookupName, which
+	// for a RIGHT JOIN's USING column drops every earlier match and keeps the
+	// right-hand table's (resolve.c, "A RIGHT JOIN. Use the right-most
+	// table"), while FULL JOIN extends a coalesce: so the read starts at that
+	// owner, not at the representative, and "SELECT x FROM a RIGHT JOIN b
+	// USING(x)" is b.x, with b.x's own type and affinity. The USING
+	// conditions themselves keep the whole coalesce (sqlite3ProcessJoin).
+	coalesceRightAt map[string]int
+
 	// unqualifiedHidden marks a scope reachable only through an explicit
 	// qualifier: the UPSERT "excluded" scope, and a trigger's OLD/NEW. C's grammar
 	// makes "excluded" reachable only as "excluded.col"; a bare "col" resolves
@@ -429,6 +440,7 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 		foundIdx, foundOffset := -1, -1
 		var foundCol *columnInfo
 		var foundFallback map[string][]int
+		var foundRightAt map[string]int
 		foundRowidTable := -1
 		for i, ts := range c.tables {
 			if ts.unqualifiedHidden {
@@ -451,6 +463,7 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 				foundIdx, foundOffset = colIdx, ts.offset
 				foundCol = &ts.cols[colIdx]
 				foundFallback = ts.coalesceFallback
+				foundRightAt = ts.coalesceRightAt
 				continue
 			}
 			if isRowidAliasName(lname) && !ts.noRowid {
@@ -471,7 +484,16 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 			// (representative, fallback[0], fallback[1], ...), computed fresh
 			// per row (never a static, compile-time-only choice).
 			if foundFallback != nil {
-				foundOffset, foundIdx, foundCol = resolveCoalesceChain(c.vals, c.tables, lname, foundOffset, foundIdx, foundCol, foundFallback[lname], math.MaxInt, true)
+				chain := foundFallback[lname]
+				// A RIGHT JOIN owner restarts the match (tableScope.coalesceRightAt).
+				if at := foundRightAt[lname]; at > 0 && at <= len(chain) && chain[at-1] >= 0 && chain[at-1] < len(c.tables) {
+					owner := c.tables[chain[at-1]]
+					if oc, ok := owner.colIndex[lname]; ok {
+						foundOffset, foundIdx, foundCol = owner.offset, oc, &owner.cols[oc]
+						chain = chain[at:]
+					}
+				}
+				foundOffset, foundIdx, foundCol = resolveCoalesceChain(c.vals, c.tables, lname, foundOffset, foundIdx, foundCol, chain, math.MaxInt, true)
 			}
 			return c, foundOffset + foundIdx, foundCol, -1, nil
 		}

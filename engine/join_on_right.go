@@ -21,11 +21,15 @@ package engine
 // subquery that has no FROM of its own; anything else is left to ordinary
 // resolution.
 func checkOnReferencesRight(items []FromItem, srcs []joinSource, absToSrcs map[int]int) error {
-	hasRight := false
+	hasRight, hasUpdateTarget := false, false
 	for i, it := range items {
 		if _, ok := absToSrcs[i]; ok && (it.Join == JoinRight || it.Join == JoinFull) {
 			hasRight = true
 		}
+		hasUpdateTarget = hasUpdateTarget || it.UpdateTarget
+	}
+	if err := checkUpdateFromUsingAmbiguity(items, srcs, absToSrcs, hasRight); err != nil {
+		return err
 	}
 	rank := func(k int) int {
 		if srcs[k].cteItem != nil && srcs[k].cteItem.recSelf != nil {
@@ -83,11 +87,13 @@ func checkOnReferencesRight(items []FromItem, srcs []joinSource, absToSrcs map[i
 			continue
 		}
 		outer := it.Join == JoinLeft || it.Join == JoinRight || it.Join == JoinFull
-		if !outer && !hasRight {
+		checkRight := outer || hasRight
+		if !checkRight && !hasUpdateTarget {
 			continue
 		}
 		limit := rank(k)
 		bad := false
+		var hidden *ColumnExpr // a reference to the UPDATE ... FROM target
 		var visitExpr func(e Expr, shadow map[string]bool, inSub, subHasFrom bool)
 		var visitSelect func(s *SelectStmt, shadow map[string]bool)
 		visitExpr = func(e Expr, shadow map[string]bool, inSub, subHasFrom bool) {
@@ -108,7 +114,10 @@ func checkOnReferencesRight(items []FromItem, srcs []joinSource, absToSrcs map[i
 				} else if !inSub || !subHasFrom {
 					target = byName(x.Name)
 				}
-				if target >= 0 && rank(target) > limit {
+				if target >= 0 && srcs[target].updateTarget {
+					hidden = &x
+					bad = true
+				} else if checkRight && target >= 0 && rank(target) > limit {
 					bad = true
 				}
 				return
@@ -164,8 +173,68 @@ func checkOnReferencesRight(items []FromItem, srcs []joinSource, absToSrcs map[i
 			}
 		}
 		visitExpr(it.On, nil, false, false)
+		if hidden != nil {
+			// UPDATE ... FROM with two or more sources wraps them in an
+			// SF_NestedFrom subquery (parse.y's UPDATE rule), and a FROM
+			// subquery cannot see its sibling, the target: "no such column".
+			if hidden.Qualifier != "" {
+				return semanticf("engine: no such column: %s.%s", hidden.Qualifier, hidden.Name)
+			}
+			return semanticf("engine: no such column: %s", hidden.Name)
+		}
 		if bad {
 			return semanticf("engine: ON clause references tables to its right")
+		}
+	}
+	return nil
+}
+
+// checkUpdateFromUsingAmbiguity: UPDATE ... FROM with two or more sources wraps
+// them in an SF_NestedFrom subquery (parse.y's UPDATE rule), whose expanded
+// list holds each USING/NATURAL column as a bare name (selectExpander's
+// bUsingTerm entry). lookupName skips only the sources whose own USING names
+// it, so a column two other sources declare is "ambiguous column name"
+// ("FROM s1 JOIN s2 USING(x) JOIN s3 ON ..." with x in s3), as it is for a
+// parenthesized group (checkRebuiltJoinGroups). A RIGHT or FULL join resolves
+// such a name differently and keeps the ordinary path.
+func checkUpdateFromUsingAmbiguity(items []FromItem, srcs []joinSource, absToSrcs map[int]int, hasRight bool) error {
+	if hasRight {
+		return nil
+	}
+	var from []int // the FROM sources, the target excluded
+	hasTarget := false
+	for i, it := range items {
+		k, ok := absToSrcs[i]
+		if !ok {
+			continue
+		}
+		if it.UpdateTarget {
+			hasTarget = true
+			continue
+		}
+		from = append(from, k)
+	}
+	if !hasTarget || len(from) < 2 {
+		return nil
+	}
+	for _, k := range from {
+		for lname := range srcs[k].scope.coalesced {
+			declaring, merged := 0, 0
+			name := lname
+			if ci, ok := srcs[k].scope.colIndex[lname]; ok {
+				name = srcs[k].scope.cols[ci].Name
+			}
+			for _, j := range from {
+				if _, ok := srcs[j].scope.colIndex[lname]; ok {
+					declaring++
+				}
+				if _, ok := srcs[j].scope.coalesced[lname]; ok {
+					merged++
+				}
+			}
+			if declaring > merged+1 {
+				return semanticf("engine: ambiguous column name: %s", name)
+			}
 		}
 	}
 	return nil

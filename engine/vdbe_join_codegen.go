@@ -357,7 +357,7 @@ func resolveJoinSources(p *ReadOnlyPager, c *compiler, items []FromItem) ([]join
 			// resolveGroupSource to the connector's own outer-facing hidden
 			// map, exactly like an ordinary item's) drives it identically.
 			if it.Join == JoinRight || it.Join == JoinFull {
-				installSrcCoalesceFallback(srcs, absToSrcs, gs.scope.coalesced, i)
+				installSrcCoalesceFallback(srcs, absToSrcs, gs.scope.coalesced, i, it.Join == JoinRight)
 			}
 			offset += len(gs.tbl.cols)
 			consumed := it.GroupLen
@@ -388,7 +388,7 @@ func resolveJoinSources(p *ReadOnlyPager, c *compiler, items []FromItem) ([]join
 			absToSrcs[i] = len(srcs)
 			srcs = append(srcs, vs)
 			if it.Join == JoinRight || it.Join == JoinFull {
-				installSrcCoalesceFallback(srcs, absToSrcs, vs.scope.coalesced, i)
+				installSrcCoalesceFallback(srcs, absToSrcs, vs.scope.coalesced, i, it.Join == JoinRight)
 			}
 			offset += len(vs.tbl.cols)
 			i++
@@ -414,7 +414,7 @@ func resolveJoinSources(p *ReadOnlyPager, c *compiler, items []FromItem) ([]join
 			// target too), reading the desugared coalescing off the source's
 			// own scope.
 			if it.Join == JoinRight || it.Join == JoinFull {
-				installSrcCoalesceFallback(srcs, absToSrcs, ds.scope.coalesced, i)
+				installSrcCoalesceFallback(srcs, absToSrcs, ds.scope.coalesced, i, it.Join == JoinRight)
 			}
 			offset += len(ds.tbl.cols)
 			i++
@@ -442,7 +442,7 @@ func resolveJoinSources(p *ReadOnlyPager, c *compiler, items []FromItem) ([]join
 				absToSrcs[i] = len(srcs)
 				srcs = append(srcs, cs)
 				if it.Join == JoinRight || it.Join == JoinFull {
-					installSrcCoalesceFallback(srcs, absToSrcs, cs.scope.coalesced, i)
+					installSrcCoalesceFallback(srcs, absToSrcs, cs.scope.coalesced, i, it.Join == JoinRight)
 				}
 				offset += len(cs.tbl.cols)
 				i++
@@ -509,7 +509,7 @@ func resolveJoinSources(p *ReadOnlyPager, c *compiler, items []FromItem) ([]join
 			absToSrcs[i] = len(srcs)
 			srcs = append(srcs, vs)
 			if it.Join == JoinRight || it.Join == JoinFull {
-				installSrcCoalesceFallback(srcs, absToSrcs, vs.scope.coalesced, i)
+				installSrcCoalesceFallback(srcs, absToSrcs, vs.scope.coalesced, i, it.Join == JoinRight)
 			}
 			offset += len(vs.tbl.cols)
 			i++
@@ -548,7 +548,7 @@ func resolveJoinSources(p *ReadOnlyPager, c *compiler, items []FromItem) ([]join
 			// vs.scope.coalesced is genuinely populated here and this wiring is
 			// load-bearing, not merely symmetric.
 			if it.Join == JoinRight || it.Join == JoinFull {
-				installSrcCoalesceFallback(srcs, absToSrcs, vs.scope.coalesced, i)
+				installSrcCoalesceFallback(srcs, absToSrcs, vs.scope.coalesced, i, it.Join == JoinRight)
 			}
 			offset += len(vs.tbl.cols)
 			i++
@@ -570,7 +570,7 @@ func resolveJoinSources(p *ReadOnlyPager, c *compiler, items []FromItem) ([]join
 				absToSrcs[i] = len(srcs)
 				srcs = append(srcs, vs)
 				if it.Join == JoinRight || it.Join == JoinFull {
-					installSrcCoalesceFallback(srcs, absToSrcs, vs.scope.coalesced, i)
+					installSrcCoalesceFallback(srcs, absToSrcs, vs.scope.coalesced, i, it.Join == JoinRight)
 				}
 				offset += len(vs.tbl.cols)
 				i++
@@ -622,7 +622,7 @@ func resolveJoinSources(p *ReadOnlyPager, c *compiler, items []FromItem) ([]join
 		// this source) instead of the representative's raw (possibly NULL)
 		// value alone -- see resolveInScopes/emitColumnReadCoalesce.
 		if it.Join == JoinRight || it.Join == JoinFull {
-			installSrcCoalesceFallback(srcs, absToSrcs, hidden, i)
+			installSrcCoalesceFallback(srcs, absToSrcs, hidden, i, it.Join == JoinRight)
 		}
 		offset += len(tbl.cols)
 		i++
@@ -890,15 +890,22 @@ func rowidAliasCandidate(cols []columnInfo) string {
 // materialized group, memberScopes[0]: they are struct copies that share the
 // map only once it exists, so creating it through one left the other nil
 // ("(t4 LEFT JOIN t5 USING(a)) RIGHT JOIN t1 USING(a)" read NULL).
-func installSrcCoalesceFallback(srcs []joinSource, absToSrcs map[int]int, coalesced map[string]int, ownerItem int) {
+func installSrcCoalesceFallback(srcs []joinSource, absToSrcs map[int]int, coalesced map[string]int, ownerItem int, rightOnly bool) {
 	for lname, repr := range coalesced {
 		k := absToSrcs[repr]
 		if srcs[k].scope.coalesceFallback == nil {
 			srcs[k].scope.coalesceFallback = make(map[string][]int, len(coalesced))
 		}
 		srcs[k].scope.coalesceFallback[lname] = append(srcs[k].scope.coalesceFallback[lname], ownerItem)
+		if rightOnly {
+			if srcs[k].scope.coalesceRightAt == nil {
+				srcs[k].scope.coalesceRightAt = make(map[string]int, len(coalesced))
+			}
+			srcs[k].scope.coalesceRightAt[lname] = len(srcs[k].scope.coalesceFallback[lname])
+		}
 		if len(srcs[k].memberScopes) > 0 {
 			srcs[k].memberScopes[0].coalesceFallback = srcs[k].scope.coalesceFallback
+			srcs[k].memberScopes[0].coalesceRightAt = srcs[k].scope.coalesceRightAt
 		}
 	}
 }
@@ -1126,8 +1133,11 @@ func checkOneRebuiltGroup(members []FromItem, scopes map[int]compileScope, base 
 				declaring++
 			}
 		}
+		// The rebuilt SF_NestedFrom list holds the bare name for the USING
+		// (selectExpander, the bUsingTerm entry), and lookupName skips only the
+		// members whose own USING names it: two others make it ambiguous.
 		if declaring > coalesceCount[ln]+1 {
-			return fmt.Errorf("%w: parenthesized join group in a position SQLite rebuilds the column list for, whose coalesced column %q is also declared by a member outside that USING/NATURAL (SQLite reports \"ambiguous column name\" there)", errVDBEUnsupported, n)
+			return semanticf("engine: ambiguous column name: %s", n)
 		}
 	}
 	if len(coalesced) > 0 {

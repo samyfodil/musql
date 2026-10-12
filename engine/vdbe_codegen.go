@@ -2632,6 +2632,17 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 		// comments: a materialized parenthesized join GROUP member's
 		// ALREADY-resolved owner pairs come FIRST, then whatever this level's
 		// own []int/scopes-indexed fallback names.
+		// A RIGHT JOIN owner restarts the match (tableScope.coalesceRightAt):
+		// the read is that owner's column, then the FULL owners after it.
+		if chain := foundScope.coalesceFallback[lname]; foundScope.coalesceRightAt[lname] > 0 && foundScope.coalesceRightAt[lname] <= len(chain) {
+			owners := coalesceOwnersFor(scopes, chain[foundScope.coalesceRightAt[lname]-1:], lname, math.MaxInt)
+			if len(owners) > 0 {
+				if len(owners) > 1 {
+					fb = coalesceFallbackRef{owners: owners[1:], has: true}
+				}
+				return owners[0].cursor, owners[0].colIdx, false, true, fb, nil
+			}
+		}
 		if owners := coalesceOwnersCombined(scopes, foundScope, lname, math.MaxInt); len(owners) > 0 {
 			fb = coalesceFallbackRef{owners: owners, has: true}
 		}

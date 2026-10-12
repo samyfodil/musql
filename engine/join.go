@@ -65,6 +65,7 @@ type joinedTable struct {
 	// RIGHT/FULL target whose USING/NATURAL chose this table as representative
 	// appends its index, in FROM order (installCoalesceFallback).
 	coalesceFallback map[string][]int
+	coalesceRightAt  map[string]int // tableScope.coalesceRightAt
 
 	// derived is true for a derived table (FromItem.Subquery): tbl is a
 	// synthetic *resolvedTable with only the output columns, and its scope
@@ -1281,6 +1282,12 @@ func installCoalesceFallback(jts []joinedTable, idx int, kind JoinKind, hidden m
 			jts[repr].coalesceFallback = make(map[string][]int, len(hidden))
 		}
 		jts[repr].coalesceFallback[lname] = append(jts[repr].coalesceFallback[lname], idx)
+		if kind == JoinRight {
+			if jts[repr].coalesceRightAt == nil {
+				jts[repr].coalesceRightAt = make(map[string]int, len(hidden))
+			}
+			jts[repr].coalesceRightAt[lname] = len(jts[repr].coalesceFallback[lname])
+		}
 	}
 	return nil
 }
@@ -1464,7 +1471,7 @@ func buildScopes(jts []joinedTable) []tableScope {
 		// doc comment, query.go): C SQLite errors "no such column:
 		// rowid"/"oid"/"_rowid_" against one just like it does for a
 		// derived table, verified directly.
-		scopes[i] = tableScope{name: jt.name, tableName: jt.tableName, cols: jt.tbl.cols, colIndex: buildColIndex(jt.tbl.cols), offset: jt.offset, coalesced: jt.coalesced, coalesceFallback: jt.coalesceFallback, noRowid: jt.derived || jt.tbl.withoutRowid, nestedNonLeading: jt.nestedNonLeading}
+		scopes[i] = tableScope{name: jt.name, tableName: jt.tableName, cols: jt.tbl.cols, colIndex: buildColIndex(jt.tbl.cols), offset: jt.offset, coalesced: jt.coalesced, coalesceFallback: jt.coalesceFallback, coalesceRightAt: jt.coalesceRightAt, noRowid: jt.derived || jt.tbl.withoutRowid, nestedNonLeading: jt.nestedNonLeading}
 	}
 	return scopes
 }
