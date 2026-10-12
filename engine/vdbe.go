@@ -1086,9 +1086,19 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 		code = jx.marked
 	}
 	jitSkip := -1
+	if jitScore {
+		native := 0
+		if jx != nil {
+			native = jx.native
+		}
+		jitScoreProgram(len(insns), native)
+	}
 	for pc < len(insns) {
 		op := &code[pc]
 	dispatch:
+		if jitScore && op.Op != OpJIT {
+			jitScoreStep(op.Op)
+		}
 		switch op.Op {
 		case OpJIT:
 			if pc == jitSkip {
@@ -1097,6 +1107,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				goto dispatch
 			}
 			m.jitEnters++
+			if jitScore {
+				jitScoreEnter()
+			}
 			pc = jx.enter(m.regs, pc)
 			jitSkip = pc
 			continue

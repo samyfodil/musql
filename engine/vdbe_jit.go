@@ -19,6 +19,7 @@ type vmJIT struct {
 	nReg   int
 	entry  []bool        // the pcs the VDBE enters native code at
 	marked []Instruction // the program with OpJIT at each entry: what run() dispatches on
+	native int           // how many of its instructions have native code (the JIT score's static share)
 }
 
 // vmJITEnabled controls the whole-program JIT (off with WithoutJIT).
@@ -115,7 +116,7 @@ func compileVMJIT(prog *Program) *vmJIT {
 			marked[pc].Op = OpJIT
 		}
 	}
-	return &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg, entry: entry, marked: marked}
+	return &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg, entry: entry, marked: marked, native: native}
 }
 
 var (
