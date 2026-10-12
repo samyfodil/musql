@@ -59,7 +59,19 @@ func Fusing() bool { return !fusionOff.Load() }
 // load and the comparison reading it, or a step and a copy of what it wrote.
 func Fusable(prev, next ProgInsn) bool {
 	switch prev.Op {
-	case POpCmp:
+	case POpCmp, POpAnd, POpOr, POpNot:
+		// A boolean feeding AND/OR/NOT: the start of a condition fuseConds
+		// turns into branches.
+		switch next.Op {
+		case POpAnd, POpOr:
+			if next.B == prev.A || next.C == prev.A {
+				return true
+			}
+		case POpNot:
+			if next.B == prev.A {
+				return true
+			}
+		}
 		switch next.Op {
 		case POpSkipIfZero:
 			return next.A == prev.A
@@ -331,7 +343,9 @@ func reverseCond(c Cond) Cond {
 func Fuse(insns []ProgInsn) []ProgInsn {
 	out := append([]ProgInsn(nil), insns...)
 	for {
-		next, changed := fuseOnce(out)
+		next, changedConds := fuseConds(out)
+		next, changed := fuseOnce(next)
+		changed = changed || changedConds
 		out = next
 		// Again only if this pass left a pair to merge: a comparison it fused
 		// whose column load it could not fold in the same pass, say. A pass
@@ -402,23 +416,39 @@ func fuseOnce(insns []ProgInsn) ([]ProgInsn, bool) {
 				continue
 			}
 		}
-		// A column load feeding only the compare-and-branch right after it.
-		if in.Op == POpLoadCol && i+1 < n && !tgt[i+1] {
-			j := work[i+1]
-			if (j.Op == POpCmpSkip || j.Op == POpCmpJump) && !j.BCol && dead(i+1, in.A) {
-				switch {
-				case j.B == in.A && j.C != in.A:
-					j.B, j.BCol = in.B, true
-				case j.C == in.A && j.B != in.A:
-					j.B, j.C, j.BCol, j.Cond = in.B, j.B, true, reverseCond(j.Cond)
-				default:
-					goto noLoad
+		// A column load feeding only one compare-and-branch further on, in the
+		// same straight run: the comparison reads the column itself, at the
+		// same row, and the load goes. Nothing between may be a jump target,
+		// redefine the register, or read it.
+		if in.Op == POpLoadCol {
+			for p := i + 1; p < n && !tgt[p]; p++ {
+				j := work[p]
+				if !keep[p] {
+					continue
 				}
-				work[i+1], keep[i], changed = j, false, true
+				st := stepOf(j)
+				if (j.Op == POpCmpSkip || j.Op == POpCmpJump) && !j.BCol && dead(p, in.A) {
+					switch {
+					case j.B == in.A && j.C != in.A:
+						j.B, j.BCol = in.B, true
+					case j.C == in.A && j.B != in.A:
+						j.B, j.C, j.BCol, j.Cond = in.B, j.B, true, reverseCond(j.Cond)
+					default:
+						break
+					}
+					if j.BCol {
+						work[p], keep[i], changed = j, false, true
+					}
+					break
+				}
+				if st.useAll || !st.fall || len(st.targets) > 0 || slicesContains(st.uses, in.A) || slicesContains(st.defs, in.A) {
+					break
+				}
+			}
+			if !keep[i] {
 				continue
 			}
 		}
-	noLoad:
 		// A pure step whose results nothing reads.
 		if st := stepOf(in); st.pure && !st.useAll && len(st.defs) > 0 {
 			all := true
@@ -435,7 +465,13 @@ func fuseOnce(insns []ProgInsn) ([]ProgInsn, bool) {
 	if !changed {
 		return insns, false
 	}
-	// Renumber: an index maps to the first kept instruction at or after it.
+	return progCompact(work, keep), true
+}
+
+// progCompact is work without the steps keep drops, every jump target
+// renumbered: an index maps to the first kept step at or after it.
+func progCompact(work []ProgInsn, keep []bool) []ProgInsn {
+	n := len(work)
 	newIdx := make([]int, n+1)
 	k := 0
 	for i := 0; i < n; i++ {
@@ -467,5 +503,280 @@ func fuseOnce(insns []ProgInsn) ([]ProgInsn, bool) {
 		}
 		out = append(out, in)
 	}
-	return out, true
+	return out
+}
+
+func slicesContains(xs []int, v int) bool {
+	for _, x := range xs {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// ---- conditions as branches ---------------------------------------------------
+
+// fuseConds rewrites each boolean expression a test reads -- comparisons
+// joined by AND, OR and NOT, each result read once, all of it computed in the
+// straight run right before the test -- into compare-and-branches, with no
+// boolean ever materialized: an AND of n comparisons becomes n branches to
+// the row's end, an OR jumps past the rest on its first true term. The
+// loads and constants interleaved with the comparisons (pure, reading
+// nothing the expression computes) are kept, moved to the run's top, where
+// they ran unconditionally all the same.
+func fuseConds(insns []ProgInsn) ([]ProgInsn, bool) {
+	n := len(insns)
+	nRegs := progRegs(insns)
+	if n == 0 || nRegs == 0 {
+		return insns, false
+	}
+	uses := make([]int, nRegs)
+	for _, in := range insns {
+		st := stepOf(in)
+		if st.useAll {
+			return insns, false // a service reads any register
+		}
+		for _, r := range st.uses {
+			uses[r]++
+		}
+	}
+	liveOut := progLiveness(insns, nRegs)
+	tgt := progJumpTargets(insns)
+	work := append([]ProgInsn(nil), insns...)
+	keep := make([]bool, n)
+	for i := range keep {
+		keep[i] = true
+	}
+	changed := false
+	isNode := func(op POp) bool { return op == POpCmp || op == POpAnd || op == POpOr || op == POpNot }
+	isHoistable := func(op POp) bool { return op == POpLoadCol || op == POpLoadReg || op == POpSetConst }
+	for j := 0; j < n; j++ {
+		test := work[j]
+		var root int
+		switch test.Op {
+		case POpSkipIfZero:
+			root = test.A
+		case POpJumpIfZero, POpJumpIfNotZero:
+			root = test.B
+			if test.A < 0 {
+				continue
+			}
+		default:
+			continue
+		}
+		// Walk back over the run feeding the test. A register may hold one
+		// node's value and then its parent's (the lowering reuses them), so
+		// nodes are steps, and an operand's node is the nearest one before.
+		need := map[int]bool{root: true}
+		nodeRegs := map[int]bool{} // registers some node writes
+		var nodes, hoist []int
+		k := j
+		for len(need) > 0 && k > 0 && keep[k-1] && !tgt[k] {
+			p := k - 1
+			in := work[p]
+			switch {
+			case isNode(in.Op) && need[in.A]:
+				delete(need, in.A)
+				nodeRegs[in.A] = true
+				nodes = append(nodes, p)
+				if in.Op != POpCmp {
+					if in.Op != POpNot && in.B == in.C {
+						k = -1
+						break
+					}
+					need[in.B] = true
+					if in.Op != POpNot {
+						need[in.C] = true
+					}
+				}
+			case isHoistable(in.Op) && !need[in.A]:
+				hoist = append(hoist, p)
+			default:
+				k = -1
+			}
+			if k < 0 {
+				break
+			}
+			k = p
+		}
+		if k < 0 || len(need) > 0 || len(nodes) < 2 {
+			continue // not a whole expression, or a single comparison (fuseOnce's)
+		}
+		// Every value a node computes is read once, by its parent or the
+		// test, and is dead once read; a comparison reads no node's value.
+		ok := true
+		for _, q := range nodes {
+			in := work[q]
+			d, readers, redef := in.A, 0, false
+			for s := q + 1; s <= j && !redef; s++ {
+				st := stepOf(work[s])
+				if slicesContains(st.uses, d) {
+					readers++
+				}
+				redef = slicesContains(st.defs, d)
+			}
+			if readers != 1 || (!redef && liveOut[j].has(d)) {
+				ok = false
+			}
+			if in.Op == POpCmp && (nodeRegs[in.B] || nodeRegs[in.C]) {
+				ok = false
+			}
+		}
+		childOf := func(p, r int) int {
+			for q := p - 1; q >= k; q-- {
+				if slicesContains(nodes, q) && work[q].A == r {
+					return q
+				}
+			}
+			return -1
+		}
+		// A column load whose value one comparison alone reads is folded
+		// into it: the comparison reads the column, the load goes. Loads
+		// reusing one register for each term are the common case, and could
+		// not be hoisted above the terms otherwise.
+		folded := map[int]bool{}      // load steps that go
+		leafCol := map[int]ProgInsn{} // a comparison step -> its folded form
+		for _, p := range hoist {
+			in := work[p]
+			if in.Op != POpLoadCol {
+				continue
+			}
+			d, reader, readers, redef := in.A, -1, 0, false
+			for q := p + 1; q <= j && !redef; q++ {
+				st := stepOf(work[q])
+				if slicesContains(st.uses, d) {
+					readers++
+					reader = q
+				}
+				redef = slicesContains(st.defs, d)
+			}
+			if readers != 1 || (!redef && liveOut[j].has(d)) || work[reader].Op != POpCmp {
+				continue
+			}
+			if _, done := leafCol[reader]; done {
+				continue
+			}
+			leaf := work[reader]
+			switch {
+			case leaf.B == d && leaf.C != d:
+				leaf.B, leaf.BCol = in.B, true
+			case leaf.C == d && leaf.B != d:
+				leaf.B, leaf.C, leaf.BCol, leaf.Cond = in.B, leaf.B, true, reverseCond(leaf.Cond)
+			default:
+				continue
+			}
+			leafCol[reader], folded[p] = leaf, true
+		}
+		// A hoisted step moves above the comparisons before it: none of them
+		// may read what it writes.
+		for _, p := range hoist {
+			if folded[p] {
+				continue
+			}
+			st := stepOf(work[p])
+			for _, r := range append(st.uses, st.defs...) {
+				if nodeRegs[r] {
+					ok = false
+				}
+			}
+			for _, q := range nodes {
+				if q < p {
+					in := work[q]
+					for _, d := range st.defs {
+						if in.Op == POpCmp && (in.B == d || in.C == d) {
+							ok = false
+						}
+					}
+				}
+			}
+		}
+		if !ok {
+			continue
+		}
+		// Emit into the run's own slots: the hoisted steps in their order,
+		// then one branch per comparison.
+		var out []ProgInsn
+		for p := k; p < j; p++ {
+			if slicesContains(hoist, p) && !folded[p] {
+				out = append(out, work[p])
+			}
+		}
+		base := k // the slot of out[0]; out[i] is old index base+i
+		const fall = -2
+		var placeholders []int // indices into out whose A awaits a "here" target
+		var gen func(q, onTrue, onFalse int)
+		here := func() int { return base + len(out) }
+		gen = func(q, onTrue, onFalse int) {
+			in := work[q]
+			if f, ok := leafCol[q]; ok {
+				in = f
+			}
+			switch in.Op {
+			case POpCmp:
+				leaf := ProgInsn{B: in.B, BCol: in.BCol, C: in.C, Cond: in.Cond}
+				switch {
+				case onFalse == fall:
+					leaf.Op, leaf.A = POpCmpJump, onTrue
+				case onFalse == ProgNextRow:
+					leaf.Op = POpCmpSkip
+				default:
+					leaf.Op, leaf.A, leaf.Cond = POpCmpJump, onFalse, in.Cond.Negate()
+				}
+				out = append(out, leaf)
+			case POpNot:
+				gen(childOf(q, in.B), onFalse, onTrue)
+			case POpAnd:
+				if onTrue == fall {
+					gen(childOf(q, in.B), fall, onFalse)
+					gen(childOf(q, in.C), fall, onFalse)
+				} else {
+					mark := len(placeholders)
+					placeholders = append(placeholders, -1)
+					gen(childOf(q, in.B), fall, -3-mark)
+					gen(childOf(q, in.C), onTrue, fall)
+					placeholders[mark] = here()
+				}
+			case POpOr:
+				if onFalse == fall {
+					gen(childOf(q, in.B), onTrue, fall)
+					gen(childOf(q, in.C), onTrue, fall)
+				} else {
+					mark := len(placeholders)
+					placeholders = append(placeholders, -1)
+					gen(childOf(q, in.B), -3-mark, fall)
+					gen(childOf(q, in.C), fall, onFalse)
+					placeholders[mark] = here()
+				}
+			}
+		}
+		top := childOf(j, root)
+		switch test.Op {
+		case POpSkipIfZero:
+			gen(top, fall, ProgNextRow)
+		case POpJumpIfZero:
+			gen(top, fall, test.A)
+		case POpJumpIfNotZero:
+			gen(top, test.A, fall)
+		}
+		for i := range out {
+			if out[i].Op == POpCmpJump && out[i].A <= -3 {
+				out[i].A = placeholders[-3-out[i].A]
+			}
+		}
+		if len(out) > j-k+1 {
+			continue // cannot happen: each comparison is one branch
+		}
+		for i := k; i <= j; i++ {
+			keep[i] = false
+		}
+		for i, in := range out {
+			work[k+i], keep[k+i] = in, true
+		}
+		changed = true
+	}
+	if !changed {
+		return insns, false
+	}
+	return progCompact(work, keep), true
 }

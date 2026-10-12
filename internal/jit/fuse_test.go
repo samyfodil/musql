@@ -171,6 +171,13 @@ func randProgram(rng *rand.Rand, nCols int) []ProgInsn {
 	conds := []Cond{CondE, CondNE, CondL, CondGE, CondLE, CondG}
 	accKind := []POp{POpAccCount, POpAccSum, POpAccMin, POpAccMax, POpEmitRow}[rng.Intn(5)]
 	counter := 12 // the accumulate's row counter, outside every other range
+	// A quarter of the programs are only conditions and their tests, the
+	// shape the condition fusion takes whole.
+	condOnly := rng.Intn(4) == 0
+	if condOnly {
+		n = 1 + rng.Intn(3)
+		accKind = []POp{POpAccCount, POpEmitRow}[rng.Intn(2)]
+	}
 	var p []ProgInsn
 	for i := 0; i < n; i++ {
 		target := func() int {
@@ -180,6 +187,19 @@ func randProgram(rng *rand.Rand, nCols int) []ProgInsn {
 			// Forward of where this instruction lands; past the end means
 			// the end of the row.
 			return len(p) + 1 + rng.Intn(n-i+2)
+		}
+		if condOnly || rng.Intn(3) == 0 {
+			p = append(p, randCondTree(rng, nCols, conds)...)
+			r := p[len(p)-1].A
+			switch rng.Intn(3) {
+			case 0:
+				p = append(p, ProgInsn{Op: POpSkipIfZero, A: r})
+			case 1:
+				p = append(p, ProgInsn{Op: POpJumpIfZero, A: target(), B: r})
+			default:
+				p = append(p, ProgInsn{Op: POpJumpIfNotZero, A: target(), B: r})
+			}
+			continue
 		}
 		var in ProgInsn
 		switch k := rng.Intn(13); k {
@@ -224,6 +244,47 @@ func randProgram(rng *rand.Rand, nCols int) []ProgInsn {
 	return p
 }
 
+// randCondTree is a boolean expression in post-order, the shape a WHERE
+// clause's AND/OR/NOT lowers to: comparisons of loaded columns and the
+// parked constants, joined, each result in its own temporary, the root last.
+// Some loads share one register across terms, as the lowering's do.
+func randCondTree(rng *rand.Rand, nCols int, conds []Cond) []ProgInsn {
+	free := rng.Perm(12)[:8:8]
+	take := func() int { r := free[0]; free = free[1:]; return r }
+	var p []ProgInsn
+	var gen func(depth int) int
+	gen = func(depth int) int {
+		if len(free) >= 7 && depth < 3 && rng.Intn(3) != 0 {
+			if rng.Intn(5) == 0 {
+				x := gen(depth + 1)
+				r := take()
+				p = append(p, ProgInsn{Op: POpNot, A: r, B: x})
+				return r
+			}
+			x := gen(depth + 1)
+			y := gen(depth + 1)
+			r := take()
+			p = append(p, ProgInsn{Op: []POp{POpAnd, POpOr}[rng.Intn(2)], A: r, B: x, C: y})
+			return r
+		}
+		r := take()
+		b := 8 + rng.Intn(4)
+		if len(free) > 0 && rng.Intn(3) != 0 {
+			l := free[len(free)-1] // a register no node holds yet
+			p = append(p, ProgInsn{Op: POpLoadCol, A: l, B: rng.Intn(nCols)})
+			b = l
+		}
+		c := 8 + rng.Intn(4)
+		if rng.Intn(2) == 0 {
+			b, c = c, b
+		}
+		p = append(p, ProgInsn{Op: POpCmp, A: r, B: b, C: c, Cond: conds[rng.Intn(len(conds))]})
+		return r
+	}
+	gen(0)
+	return p
+}
+
 // TestFusionMatchesUnfused runs random programs three ways -- the Go
 // reference, the emitted code unfused, the emitted code fused -- and
 // requires the three to agree on everything the caller can see.
@@ -234,7 +295,7 @@ func TestFusionMatchesUnfused(t *testing.T) {
 	defer SetFusion(true)
 	rng := rand.New(rand.NewSource(42))
 	const n = 300
-	fusedSome := 0
+	fusedSome, condsSome := 0, 0
 	for trial := 0; trial < 1500; trial++ {
 		nCols := 1 + rng.Intn(MaxProgCols)
 		cols := make([][]int64, nCols)
@@ -289,12 +350,18 @@ func TestFusionMatchesUnfused(t *testing.T) {
 		if len(Fuse(insns)) < len(insns) {
 			fusedSome++
 		}
+		if _, c := fuseConds(insns); c {
+			condsSome++
+		}
 		for _, fuse := range []bool{false, true} {
 			got := run(fuse)
 			if got.out != want.out || got.ovf != want.ovf || !slices.Equal(got.counters, want.counters) || !slices.Equal(got.sel, want.sel) {
 				t.Fatalf("trial %d fused=%v: got %+v, want %+v\nprogram %v\nfused %v", trial, fuse, got, want, insns, Fuse(insns))
 			}
 		}
+	}
+	if condsSome < 60 {
+		t.Fatalf("only %d of 1500 programs had a condition fused into branches", condsSome)
 	}
 	if fusedSome < 500 {
 		t.Fatalf("only %d of 1500 programs fused at all -- the test exercises too little", fusedSome)
@@ -377,5 +444,34 @@ func BenchmarkProgramFusion(b *testing.B) {
 				k.Call2(args)
 			}
 		})
+	}
+}
+
+// TestFusionCondChains checks AND, OR and NOT chains, many terms deep, fuse
+// into compare-and-branches with no boolean left.
+func TestFusionCondChains(t *testing.T) {
+	for _, op := range []POp{POpAnd, POpOr} {
+		var p []ProgInsn
+		const terms = 7
+		for i := 0; i < terms; i++ {
+			p = append(p, ProgInsn{Op: POpLoadCol, A: 0, B: i % MaxProgCols},
+				ProgInsn{Op: POpCmp, A: 1 + i, B: 0, C: 8 + i%4, Cond: CondG})
+		}
+		acc := 1
+		for i := 1; i < terms; i++ {
+			p = append(p, ProgInsn{Op: op, A: 1 + i, B: acc, C: 1 + i})
+			acc = 1 + i
+		}
+		p = append(p, ProgInsn{Op: POpNot, A: 15, B: acc}, ProgInsn{Op: POpSkipIfZero, A: 15}, ProgInsn{Op: POpAccCount})
+		got := Fuse(p)
+		for _, in := range got {
+			switch in.Op {
+			case POpCmp, POpAnd, POpOr, POpNot, POpSkipIfZero, POpLoadCol:
+				t.Fatalf("%v chain left %v:\n%v", op, in.Op, got)
+			}
+		}
+		if len(got) != terms+1 {
+			t.Fatalf("%v chain fused to %d steps, want %d:\n%v", op, len(got), terms+1, got)
+		}
 	}
 }
