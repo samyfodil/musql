@@ -2230,18 +2230,25 @@ func (c *compiler) compileColumn(x ColumnExpr) (int, error) {
 				// result phase or a write's RETURNING is refused here.
 				return 0, fmt.Errorf("%w: correlated reference %q to a non-row-live outer scope", errVDBEUnsupported, x.Name)
 			}
-			if fb.has {
-				// A RIGHT/FULL JOIN's coalesced column referenced from an
-				// outer/correlated scope: OpOuterColumn has no coalesce-aware
-				// counterpart (emitColumnReadCoalesce's OpNotNull/OpColumn
-				// chain only ever targets THIS frame's own cursors) -- a
-				// genuinely rare combination not worth that codegen
-				// complexity; decline cleanly (no fallback exists) instead of
-				// risking reading the wrong (uncoalesced) side.
-				return 0, fmt.Errorf("%w: RIGHT/FULL JOIN coalesced column %q referenced from an outer/correlated scope", errVDBEUnsupported, x.Name)
-			}
 			for p := c; p != oc; p = p.outer {
 				p.correlated = true
+			}
+			if fb.has {
+				// A RIGHT/FULL JOIN's coalesced column read from a correlated
+				// subquery: emitColumnReadCoalesce's chain, every arm an
+				// OpOuterColumn into the same enclosing frame (the owners are
+				// that frame's own cursors).
+				r := c.emitColumnRead(cursor, colIdx, false, level)
+				skips := make([]int, 0, len(fb.owners))
+				for _, o := range fb.owners {
+					skips = append(skips, c.emit(Instruction{Op: OpNotNull, P1: r}))
+					c.emit(Instruction{Op: OpSCopy, P1: c.emitColumnRead(o.cursor, o.colIdx, false, level), P2: r})
+				}
+				end := c.here()
+				for _, j := range skips {
+					c.patch(j, end)
+				}
+				return r, nil
 			}
 			return c.emitColumnRead(cursor, colIdx, isRowid, level), nil
 		}
