@@ -46,6 +46,7 @@ func benchWrites(b *testing.B, reopen, read, idle bool, stmt string) {
 	const seed, batch = 100000, 20000
 	b.ReportAllocs()
 	var timed int64
+	var lastCommit, commits time.Duration
 	for it := 0; it < b.N; it++ {
 		b.StopTimer()
 		dir, err := os.MkdirTemp("", "bi7a")
@@ -85,9 +86,11 @@ func benchWrites(b *testing.B, reopen, read, idle bool, stmt string) {
 				}
 			}
 			st.Close()
+			c0 := time.Now()
 			if err := tx.Commit(); err != nil {
 				b.Fatal(err)
 			}
+			lastCommit = time.Since(c0)
 		}
 		batchRow := func(i int) []any {
 			id := seed + i
@@ -141,6 +144,9 @@ func benchWrites(b *testing.B, reopen, read, idle bool, stmt string) {
 			timed++
 		})
 		b.StopTimer()
+		if stmt == "" {
+			commits += lastCommit
+		}
 		stopCPU()
 		writeAllocProfile("end")
 		db.Close()
@@ -151,6 +157,9 @@ func benchWrites(b *testing.B, reopen, read, idle bool, stmt string) {
 		unit = "ns/stmt"
 	}
 	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(timed), unit)
+	if stmt == "" {
+		b.ReportMetric(float64(commits.Nanoseconds())/float64(timed), "commit-ns/row")
+	}
 }
 
 // writeAllocProfile writes the heap allocation profile to $BENCH_ALLOC_PROF.<name>
