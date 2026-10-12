@@ -639,6 +639,9 @@ func resolveJoinSources(p *ReadOnlyPager, c *compiler, items []FromItem) ([]join
 			srcs[k].scope.groupAlias = it.GroupAlias
 		}
 	}
+	if err := checkOnReferencesRight(items, srcs, absToSrcs); err != nil {
+		return nil, err
+	}
 	if err := checkRebuiltJoinGroups(items, itemScopes(items, absToSrcs, srcs), c.groupSpanRecursion); err != nil {
 		return nil, err
 	}
@@ -1958,6 +1961,9 @@ func (p *ReadOnlyPager) cteSchemaCols(name string, b *cteBinding) ([]columnInfo,
 		// reference the guard below would report. See cteBinding.multiSelfRef.
 		return nil, semanticf("multiple references to recursive table: %s", name)
 	}
+	if b.recRefErr != "" {
+		return nil, semanticf("%s", b.recRefErr)
+	}
 	if b.schemaCols != nil {
 		return b.schemaCols, nil
 	}
@@ -2266,6 +2272,9 @@ func (p *ReadOnlyPager) finishGroupSource(c *compiler, state *joinDesugarState, 
 	memberScopes := make([]compileScope, len(subC.scopes))
 	for k, sc := range subC.scopes {
 		ts := sc.tableScope
+		// A direct member keeps its rowid as a C-visible candidate; a nested
+		// group's members were already forced, and C does not re-expose them.
+		ts.groupMemberRowid = !ts.noRowid
 		ts.noRowid = true
 		// Re-address a member's coalesce fallback onto this group's cursor: an owner's
 		// address is {cursor, colBases[ownerIdx] + its local column}. A nested group's
@@ -2583,6 +2592,7 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 	// here, the single funnel every join-shaped codegen path reaches, so the
 	// skip and the emission can never disagree. See vtab_correlated.go.
 	annotateVtabCorrelations(c, srcs, plan)
+	markRecursiveSelfNullExtension(c, srcs, plan)
 	// The source bound at execOrder[0] is the OUTERMOST nested loop, whose
 	// OpRewind runs exactly once per program execution (every deeper level
 	// rewinds once per outer-row combination). A plain full scan over a rowid
@@ -2740,6 +2750,18 @@ func (c *compiler) emitRightOuterSweep(srcs []joinSource, plan joinPlan, order [
 	cur := srcs[order[level]].scope.cursor
 	others := make([]int, 0, level)
 	for i := 0; i < level; i++ {
+		if s := srcs[order[i]]; s.isRecursiveSelf() {
+			keep, known := c.recSelfKeepsRow[s.scope.cursor]
+			if !known {
+				return errRecSelfNullExtension
+			}
+			if keep {
+				// C's NullRow leaves the recursive pseudo-cursor on its row
+				// (emitNullExtend): put it back on that row instead.
+				c.emitRecursiveSelfReposition(s.scope.cursor)
+				continue
+			}
+		}
 		others = append(others, srcs[order[i]].scope.cursor)
 	}
 	rewindJump := c.emit(Instruction{Op: OpRightJoinSweepRewind, P1: cur, P4: others})
@@ -2988,10 +3010,115 @@ func (c *compiler) emitJoinLevel(srcs []joinSource, plan joinPlan, level int, bo
 	c.patch(rewindJump, c.here()) // empty right table -> straight to the match check below, flag still 0
 
 	skipNull := c.emit(Instruction{Op: OpIf, P1: matchReg}) // matched at least once -> skip NULL-extension
-	c.emit(Instruction{Op: OpNullRow, P1: cur})
+	if err := c.emitNullExtend(s, cur); err != nil {
+		return err
+	}
 	if err := c.emitJoinLevel(srcs, plan, level+1, body); err != nil {
 		return err
 	}
 	c.patch(skipNull, c.here())
 	return nil
+}
+
+// isRecursiveSelf reports whether s is a recursive CTE's reference to itself
+// inside its recursive arm (resolveRecursiveSelfSource).
+func (s *joinSource) isRecursiveSelf() bool {
+	return s.cteItem != nil && s.cteItem.recSelf != nil
+}
+
+// emitNullExtend puts cur, the source s, into the NULL-extended state of an
+// outer join. C binds a recursive CTE's own reference to a pseudo-cursor over
+// the current queue row (generateWithRecursiveQuery), and OP_Column on a
+// pseudo-cursor reads that row even after OP_NullRow (vdbe.c, the
+// CURTYPE_PSEUDO arm of OP_Column's nullRow test), so the "NULL" row of an
+// outer join that null-extends the recursive table still shows the current
+// row: over edge(1), "... FROM edge FULL JOIN path USING(x)" expands path's
+// row 2 into path.x+1 = 3 for edge's unmatched row, not NULL+1.
+//
+// C first turns an outer join whose NULL row the WHERE rejects into a plainer
+// join (the sqlite3ExprImpliesNonNullRow loop in sqlite3Select), so no NULL row
+// of the recursive table is made at all there; a real NULL row, which the WHERE
+// then rejects, gives the same rows (markRecursiveSelfNullExtension).
+func (c *compiler) emitNullExtend(s joinSource, cur int) error {
+	if s.isRecursiveSelf() {
+		keep, known := c.recSelfKeepsRow[cur]
+		if !known {
+			return errRecSelfNullExtension
+		}
+		if keep {
+			c.emitRecursiveSelfReposition(cur)
+			return nil
+		}
+	}
+	c.emit(Instruction{Op: OpNullRow, P1: cur})
+	return nil
+}
+
+var errRecSelfNullExtension = fmt.Errorf("%w: an outer join NULL-extending a recursive CTE's own reference in a join this compiler cannot decide C's join reduction for", errVDBEUnsupported)
+
+// markRecursiveSelfNullExtension decides, for each recursive self-reference in
+// srcs, whether its NULL extension keeps the current row (C's pseudo-cursor) or
+// is a real NULL row because C would have reduced the outer join away: the
+// WHERE (and, with no RIGHT/FULL join, the inner joins' ON terms) implies a
+// non-NULL row of it. A FROM with a parenthesized group is left undecided.
+func markRecursiveSelfNullExtension(c *compiler, srcs []joinSource, plan joinPlan) {
+	var recs []int
+	hasRight, hasGroup := false, false
+	for i := range srcs {
+		if srcs[i].isRecursiveSelf() {
+			recs = append(recs, i)
+		}
+		if srcs[i].rightOuter {
+			hasRight = true
+		}
+		if len(srcs[i].memberScopes) > 0 {
+			hasGroup = true
+		}
+	}
+	if len(recs) == 0 || hasGroup {
+		return
+	}
+	var terms []Expr
+	for _, b := range plan.buckets {
+		for _, e := range b {
+			terms = append(terms, whereSplitTopAnd(e)...)
+		}
+	}
+	for _, e := range plan.deferred {
+		terms = append(terms, whereSplitTopAnd(e)...)
+	}
+	if !hasRight {
+		for i := range srcs {
+			if srcs[i].on != nil && !srcs[i].left {
+				terms = append(terms, whereSplitTopAnd(srcs[i].on)...)
+			}
+		}
+	}
+	jts := make([]joinedTable, len(srcs))
+	scopes := make([]tableScope, len(srcs))
+	for i := range srcs {
+		jts[i] = joinedTable{tbl: srcs[i].tbl}
+		scopes[i] = srcs[i].scope.tableScope
+	}
+	if c.recSelfKeepsRow == nil {
+		c.recSelfKeepsRow = map[int]bool{}
+	}
+	for _, i := range recs {
+		w := wherePlanNonNullWalk{jts: jts, scopes: scopes, iTab: i, coalesceIsFunc: true}
+		implied := false
+		for _, t := range terms {
+			if wherePlanImpliesNonNullRow(t, w) {
+				implied = true
+				break
+			}
+		}
+		c.recSelfKeepsRow[srcs[i].scope.cursor] = !implied
+	}
+}
+
+// emitRecursiveSelfReposition rewinds the recursive self-reference's one-row
+// cursor onto the current queue row (see emitNullExtend).
+func (c *compiler) emitRecursiveSelfReposition(cur int) {
+	j := c.emit(Instruction{Op: OpRewind, P1: cur})
+	c.patch(j, c.here())
 }

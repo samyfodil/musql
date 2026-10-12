@@ -142,6 +142,16 @@ type tableScope struct {
 	// nesting, an aliased group, or a name collision C would ":N"-suffix.
 	nestedRowidDisplayName string
 
+	// groupMemberRowid marks a member of a MATERIALIZED parenthesized join group
+	// (resolveGroupSource forces noRowid on every member) whose own table has a
+	// rowid C still exposes: an SF_NestedFrom subquery lists an ENAME_ROWID
+	// entry for each direct member with a visible rowid (selectExpander), and
+	// an unqualified rowid counts each such entry as a candidate (resolve.c's
+	// cntTab), so "pc JOIN (pa JOIN pb USING(id)) AS g ... rowid" is
+	// "ambiguous column name: rowid". This engine cannot read it through the
+	// group, so it only counts.
+	groupMemberRowid bool
+
 	// nestedColNames, parallel to cols, is each column's name in an ALIASED
 	// parenthesized join group's rebuilt column list, where duplicates carry
 	// SQLite's ":N" suffix (annotateNestedColNames, vdbe_join_codegen.go). A

@@ -134,6 +134,11 @@ func (p *ReadOnlyPager) compileRecursiveCTE(name string, b *cteBinding, cols []c
 		// select.c:5802's separate "circular reference" for it.
 		return nil, semanticf("engine: multiple references to recursive table: %s", name)
 	}
+	// generateWithRecursiveQuery (select.c:2690) refuses a window function in
+	// the recursive SELECT it is handed, the compound's last arm.
+	if last := rs.recursiveArms[len(rs.recursiveArms)-1]; last != nil && (selectHasWindow(last) || orderByHasWindow(last)) {
+		return nil, semanticf("engine: cannot use window functions in recursive queries")
+	}
 	for _, seen := range p.cteExpansion {
 		if seen.b == b {
 			return nil, fmt.Errorf("%w: circular reference: %s", errVDBESemantic, name)

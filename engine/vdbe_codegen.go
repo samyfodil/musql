@@ -23,6 +23,12 @@ import (
 type onceSlots struct{ base, count int }
 
 type compiler struct {
+	// recSelfKeepsRow maps the cursor of a recursive CTE's self-reference to
+	// whether an outer join's NULL extension of it keeps the current queue row
+	// (C's pseudo-cursor; emitNullExtend). Set by emitJoinLoops; a cursor
+	// missing from it could not be decided and declines.
+	recSelfKeepsRow map[int]bool
+
 	// pureFuncP5 is stamped onto every OpFunction this compiler emits: real
 	// SQLite's OP_PureFunc, naming the schema expression being compiled when
 	// there is one (pureCtxCheck / pureCtxGenerated / pureCtxIndex). Zero for
@@ -2583,6 +2589,7 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 
 	foundCursor, foundIdx := -1, -1
 	foundRowidCursor := -1
+	memberRowid := false
 	var foundScope compileScope
 	for _, s := range scopes {
 		if idx, ok := s.colIndex[lname]; ok {
@@ -2602,12 +2609,20 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 			foundScope = s
 			continue
 		}
-		if isRowidAliasName(x.Name) && !s.noRowid {
-			if foundCursor != -1 || foundRowidCursor != -1 {
+		if isRowidAliasName(x.Name) && (!s.noRowid || s.groupMemberRowid) {
+			if foundCursor != -1 || foundRowidCursor != -1 || memberRowid {
 				return 0, 0, false, false, fb, fmt.Errorf("engine: ambiguous column name: %s", x.Name)
+			}
+			if s.noRowid {
+				memberRowid = true
+				continue
 			}
 			foundRowidCursor = s.cursor
 		}
+	}
+	if memberRowid {
+		// The one candidate is a group member's rowid (tableScope.groupMemberRowid).
+		return 0, 0, false, false, fb, fmt.Errorf("%w: %s of a member of a parenthesized join group", errVDBEUnsupported, x.Name)
 	}
 	if foundRowidCursor != -1 {
 		return foundRowidCursor, 0, true, true, fb, nil

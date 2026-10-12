@@ -70,6 +70,10 @@ type cteBinding struct {
 	// wrong diagnosis.
 	multiSelfRef bool
 
+	// recRefErr is recursiveRefError's verdict: non-empty when C rejects the
+	// body for a self-reference outside a recursive arm's top-level FROM.
+	recRefErr string
+
 	// selfRef, when non-nil, is this RECURSIVE CTE's name bound to its own
 	// current row, for the length of the compile of its recursive arms
 	// (compileRecursiveCTE, vdbe_recursive_cte.go) -- SQLite binds the
@@ -154,13 +158,14 @@ type recursiveCTEShape struct {
 // same AST repeatedly.
 func newCTEBinding(def CTEDef, scopeDepth int) *cteBinding {
 	return &cteBinding{
-		name:       def.Name,
-		colNames:   def.ColNames,
-		core:       def.Select,
-		m10d:       def.Materialized,
-		recursive:  detectRecursiveShape(def.Name, def.Select),
+		name:         def.Name,
+		colNames:     def.ColNames,
+		core:         def.Select,
+		m10d:         def.Materialized,
+		recursive:    detectRecursiveShape(def.Name, def.Select),
 		multiSelfRef: recursiveArmHasMultipleSelfRefs(def.Name, def.Select),
-		scopeDepth: scopeDepth,
+		recRefErr:    recursiveRefError(def.Name, def.Select),
+		scopeDepth:   scopeDepth,
 	}
 }
 
@@ -281,6 +286,9 @@ func (p *ReadOnlyPager) resolveCTERows(name string, b *cteBinding, params []Valu
 	}
 	if b.multiSelfRef {
 		return nil, nil, fmt.Errorf("engine: multiple references to recursive table: %s", name)
+	}
+	if b.recRefErr != "" {
+		return nil, nil, semanticf("engine: %s", b.recRefErr)
 	}
 	for _, seen := range p.cteExpansion {
 		if seen.b == b {
