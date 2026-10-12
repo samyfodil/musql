@@ -201,15 +201,15 @@ type vmFix struct {
 
 func (e *vmEmit) d(r, off int) int32 { return int32(r*e.lay.Size + off) }
 
-// alignLoopHead pads to a 32-byte boundary before a block a backward branch
-// targets: a loop's head then starts a fetch block, and the loop body's
-// decoded lines do not shift with whatever code precedes it. The padding is
-// one multi-byte NOP run, executed only by a fall into the head.
+// alignLoopHead pads to loopAlign before a block a backward branch targets:
+// a loop's head then starts a fetch block, and the loop body's decoded lines
+// do not shift with whatever code precedes it. The padding is a run of
+// multi-byte NOPs, executed only by a fall into the head.
 func (e *vmEmit) alignLoopHead(pc int) {
 	if !e.cache || !e.heads[pc] {
 		return
 	}
-	padNops(e.a, 32)
+	padNops(e.a, loopAlign)
 }
 
 // exitAt returns to Go asking the VDBE to run pc.
@@ -234,7 +234,9 @@ func (e *vmEmit) jmpStub(pc int) {
 }
 
 // jmpBlock branches to target's block, or exits when target is past the end.
-// A backward branch spends fuel first, exiting at target when it runs out.
+// A backward branch spends fuel first, exiting at target when it runs out:
+// the branch back is the fuel test's own (JNZ), so going round a loop takes
+// one branch, and the exit is the fall-through nobody takes.
 func (e *vmEmit) jmpBlock(from, target int) {
 	if target < 0 || target >= e.n {
 		e.jmpStub(target)
@@ -242,7 +244,11 @@ func (e *vmEmit) jmpBlock(from, target int) {
 	}
 	if target <= from {
 		e.a.DecReg(R8)
-		e.jccStub(CondE, target)
+		e.a.emit(0x0F, 0x80|byte(CondNE))
+		e.fix = append(e.fix, vmFix{at: len(e.a.buf), pc: target})
+		e.a.emit(0, 0, 0, 0)
+		e.jmpStub(target)
+		return
 	}
 	e.a.emit(0xE9)
 	e.fix = append(e.fix, vmFix{at: len(e.a.buf), pc: target})
@@ -848,6 +854,9 @@ func patch(buf []byte, at, target int) {
 // padNops pads a's code to a multiple of align with the recommended
 // multi-byte NOPs, the fewest instructions that fill the gap.
 func padNops(a *Asm, align int) {
+	if align <= 1 {
+		return
+	}
 	nops := [][]byte{
 		{0x90},
 		{0x66, 0x90},

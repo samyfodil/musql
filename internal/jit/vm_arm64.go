@@ -73,11 +73,7 @@ func emitVMArm(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cac
 		if vmRunStart(prog, bound, pc) {
 			e.forget()
 			if e.cache && e.heads[pc] {
-				// A loop's head starts a 32-byte fetch block, so the loop's
-				// code does not shift with whatever precedes it.
-				for len(a.buf)%8 != 0 {
-					a.emit(armNop)
-				}
+				padArm(a, loopAlign)
 			}
 		} else if e.cache && pc < len(entry) && entry[pc] {
 			e.entryPoint(pc)
@@ -143,6 +139,16 @@ func emitVMArm(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cac
 
 // armNop is AArch64's NOP.
 const armNop uint32 = 0xD503201F
+
+// padArm pads a's code with NOPs to a multiple of align bytes (loopAlign).
+func padArm(a *Arm, align int) {
+	if align <= 4 {
+		return
+	}
+	for len(a.buf)%(align/4) != 0 {
+		a.emit(armNop)
+	}
+}
 
 // island emits the exit stubs requested since the last island, after a branch
 // over them to next ("" when nothing falls through).
@@ -296,6 +302,12 @@ func (e *vmEmitArm) jmpBlock(from, target int) {
 	}
 	if target <= from {
 		e.a.SubsImm(X2, X2, 1)
+		if !e.far {
+			// The branch back is the fuel test's own: one branch a loop.
+			e.a.Bcond(CondNE, vmBlock(target))
+			e.a.B(e.stub(target))
+			return
+		}
 		e.a.Bcond(CondE, e.stub(target))
 	}
 	e.a.B(vmBlock(target))

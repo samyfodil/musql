@@ -297,6 +297,7 @@ func TestFusionMatchesUnfused(t *testing.T) {
 	const n = 300
 	fusedSome, condsSome := 0, 0
 	RegAllocStatsForTest()
+	PredicatedStatsForTest()
 	for trial := 0; trial < 1500; trial++ {
 		nCols := 1 + rng.Intn(MaxProgCols)
 		cols := make([][]int64, nCols)
@@ -366,6 +367,11 @@ func TestFusionMatchesUnfused(t *testing.T) {
 	}
 	if condsSome < 60 {
 		t.Fatalf("only %d of 1500 programs had a condition fused into branches", condsSome)
+	}
+	if pred := PredicatedStatsForTest(); pred < 50 {
+		t.Fatalf("only %d programs emitted with a predicated row: it went untested", pred)
+	} else {
+		t.Logf("%d programs emitted with a predicated row", pred)
 	}
 	if fusedSome < 500 {
 		t.Fatalf("only %d of 1500 programs fused at all -- the test exercises too little", fusedSome)

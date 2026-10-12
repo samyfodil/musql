@@ -454,3 +454,9 @@ func (k *vmKnow) pruneForEntry(keep map[int]bool) (ints, noS []int) {
 	slices.Sort(noS)
 	return ints, noS
 }
+
+// loopAlign is the byte boundary the emitters start a loop's head on (the
+// program JIT's row loop, the VM JIT's backward-jump targets): the loop's
+// code then sits in the same fetch blocks whatever precedes it.
+// 0 or 1 turns it off, for a benchmark to compare.
+var loopAlign = 64

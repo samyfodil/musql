@@ -827,3 +827,73 @@ func fuseConds(insns []ProgInsn) ([]ProgInsn, bool) {
 	}
 	return progCompact(work, keep), true
 }
+
+// ---- predicated rows ---------------------------------------------------------
+
+// progPredicated reports whether a fused program's row ends in a run of
+// filters (POpCmpSkip, up to maxPredFilters) followed only by work that can
+// run for every row and count only for the rows that pass -- column loads,
+// POpAccSum, POpAccCount -- and returns where the filters start. The emitter
+// then computes the filters' conjunction without a branch and applies it to
+// the accumulators (a row that fails adds 0 and counts 0), instead of
+// branching to the next row on each filter.
+//
+// Branches a filter decides by the data are the ones a predictor cannot
+// learn: on random data each one is a misprediction a few rows in ten, which
+// is most of the kernel's time and made it vary 2x with where the code
+// happened to land. The predicated row costs the same whatever the data.
+//
+// A load in the tail runs for rows it used not to, so the register it writes
+// must not be one a row reads before writing it (carried from the last row)
+// or the caller reads after the loop. Nothing may jump into the run.
+// Unfused emission (SetFusion(false)) never predicates: it is the reference.
+func progPredicated(insns []ProgInsn) (int, bool) {
+	if !Fusing() {
+		return 0, false
+	}
+	n := len(insns)
+	t := n - 1
+	acc := false
+	for ; t >= 0; t-- {
+		op := insns[t].Op
+		if op == POpAccSum || op == POpAccCount {
+			acc = true
+		} else if op != POpLoadCol {
+			break
+		}
+	}
+	if !acc || t < 0 || insns[t].Op != POpCmpSkip {
+		return 0, false
+	}
+	s := t
+	for s > 0 && insns[s-1].Op == POpCmpSkip && t-s+1 < maxPredFilters {
+		s--
+	}
+	tgt := progJumpTargets(insns)
+	for i := s + 1; i < n; i++ {
+		if tgt[i] {
+			return 0, false
+		}
+	}
+	nRegs := progRegs(insns)
+	if nRegs > 0 {
+		_, liveIn := progLivenessInOut(insns, nRegs)
+		for _, in := range insns[t+1:] {
+			if in.Op == POpLoadCol && (liveIn[0].has(in.A) || liveIn[n].has(in.A)) {
+				return 0, false
+			}
+		}
+	}
+	progPredicatedRows.Add(1)
+	return s, true
+}
+
+// maxPredFilters bounds the filters a predicated row computes for every row.
+const maxPredFilters = 6
+
+// progPredicatedRows counts the programs emitted with a predicated row.
+var progPredicatedRows atomic.Int64
+
+// PredicatedStatsForTest reads and clears how many programs were emitted
+// with a predicated row.
+func PredicatedStatsForTest() int64 { return progPredicatedRows.Swap(0) }
