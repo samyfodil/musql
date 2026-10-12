@@ -241,13 +241,20 @@ func progRegs(insns []ProgInsn) int {
 
 // progLiveness returns, per instruction, the registers live after it.
 func progLiveness(insns []ProgInsn, nRegs int) []regSet {
+	out, _ := progLivenessInOut(insns, nRegs)
+	return out
+}
+
+// progLivenessInOut is progLiveness with the registers live BEFORE each
+// instruction too; [len(insns)] is the next row's (and the exit's).
+func progLivenessInOut(insns []ProgInsn, nRegs int) (liveOut, liveIn []regSet) {
 	n := len(insns)
 	steps := make([]progStep, n)
 	for i, in := range insns {
 		steps[i] = stepOf(in)
 	}
-	liveIn := make([]regSet, n+1) // [n] is "next row"
-	liveOut := make([]regSet, n)
+	liveIn = make([]regSet, n+1) // [n] is "next row"
+	liveOut = make([]regSet, n)
 	for i := range liveIn {
 		liveIn[i] = newRegSet(nRegs)
 	}
@@ -302,7 +309,7 @@ func progLiveness(insns []ProgInsn, nRegs int) []regSet {
 			}
 		}
 	}
-	return liveOut
+	return liveOut, liveIn
 }
 
 // progJumpTargets marks every instruction some instruction can jump to,

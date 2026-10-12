@@ -296,6 +296,7 @@ func TestFusionMatchesUnfused(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 	const n = 300
 	fusedSome, condsSome := 0, 0
+	RegAllocStatsForTest()
 	for trial := 0; trial < 1500; trial++ {
 		nCols := 1 + rng.Intn(MaxProgCols)
 		cols := make([][]int64, nCols)
@@ -359,6 +360,9 @@ func TestFusionMatchesUnfused(t *testing.T) {
 				t.Fatalf("trial %d fused=%v: got %+v, want %+v\nprogram %v\nfused %v", trial, fuse, got, want, insns, Fuse(insns))
 			}
 		}
+	}
+	if allocated, spilled, _ := RegAllocStatsForTest(); allocated == 0 {
+		t.Fatalf("%d registers allocated, %d left in the file: the allocator went untested", allocated, spilled)
 	}
 	if condsSome < 60 {
 		t.Fatalf("only %d of 1500 programs had a condition fused into branches", condsSome)

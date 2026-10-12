@@ -29,6 +29,14 @@ const (
 	X15
 	X16
 	X17
+	x18 // the platform register: never used (trampoline_arm64.s)
+	X19
+	X20
+	X21
+	X22
+	X23
+	X24
+	X25
 )
 
 // xzr is the zero register, which shares encoding 31 with the stack pointer.

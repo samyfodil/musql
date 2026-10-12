@@ -10,6 +10,7 @@ import (
 // EmitProgram compiles an instruction list into a native row loop. The loop
 // is emitted once per program; the body is whatever the instruction list says.
 func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
+	a0 := NewAsm()
 	if nCols > MaxProgCols {
 		return nil, fmt.Errorf("jit: %d column blocks, max %d", nCols, MaxProgCols)
 	}
@@ -19,8 +20,55 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		}
 	}
 	colReg := [MaxProgCols]Reg{RBX, R12, R13, R15}
+	// The column registers this program does not read hold its IR registers
+	// (allocProgRegs); the trampoline saves all four either way.
+	pool := colReg[nCols:]
+	pa := allocProgRegs(insns, len(pool))
+	phys := func(r int) (Reg, bool) {
+		if k := pa.at(r); k >= 0 {
+			return pool[k], true
+		}
+		return 0, false
+	}
+	// val is a register holding r's value: its own, or scratch loaded from
+	// the file.
+	val := func(r int, scratch Reg) Reg {
+		if p, ok := phys(r); ok {
+			return p
+		}
+		a0.MovRegMem32(scratch, RSI, r)
+		return scratch
+	}
+	// set makes r's value src.
+	set := func(r int, src Reg) {
+		if p, ok := phys(r); ok {
+			if p != src {
+				a0.MovRegReg(p, src)
+			}
+			return
+		}
+		a0.MovMemReg32(RSI, r, src)
+	}
+	// into is val, but the value lands in dst (which the caller then changes).
+	into := func(dst Reg, r int) {
+		if p, ok := phys(r); ok {
+			a0.MovRegReg(dst, p)
+			return
+		}
+		a0.MovRegMem32(dst, RSI, r)
+	}
 
-	a := NewAsm()
+	a := a0
+	// incReg is r++, a row counter.
+	incReg := func(r int) {
+		if p, ok := phys(r); ok {
+			a.IncReg(p)
+			return
+		}
+		a.MovRegMem32(RDX, RSI, r)
+		a.IncReg(RDX)
+		a.MovMemReg32(RSI, r, RDX)
+	}
 	a.MovRegMem(RSI, RDI, POffRegs)
 	a.MovRegMem(RCX, RDI, POffN)
 	a.XorRegReg(R8, R8)
@@ -41,6 +89,10 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	for c := 0; c < nCols; c++ {
 		a.MovRegMem(colReg[c], RDI, int8(POffCol+c*8))
 	}
+	for _, r := range pa.load {
+		p, _ := phys(r)
+		a.MovRegMem32(p, RSI, r)
+	}
 	a.TestRegReg(RCX, RCX)
 	a.Jcc(CondE, "done")
 	// The row index counts UP from -n to 0 so one INC both advances every
@@ -60,88 +112,110 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		a.Label(progLabel(idx))
 		switch in.Op {
 		case POpLoadCol:
+			if p, ok := phys(in.A); ok {
+				a.MovRegMemIdx(p, colReg[in.B], RCX)
+				break
+			}
 			a.MovRegMemIdx(RAX, colReg[in.B], RCX)
 			a.MovMemReg32(RSI, in.A, RAX)
 		case POpLoadReg:
-			a.MovRegMem32(RAX, RSI, in.B)
-			a.MovMemReg32(RSI, in.A, RAX)
+			set(in.A, val(in.B, RAX))
 		case POpCmp:
-			a.MovRegMem32(RAX, RSI, in.B)
-			a.MovRegMem32(RDX, RSI, in.C)
+			x, y := val(in.B, RAX), val(in.C, RDX)
 			// R10 is zeroed BEFORE the compare. XOR sets the flags, so zeroing
 			// it afterwards destroyed the comparison SETcc was about to read --
 			// every predicate came back constant, which the differential caught
 			// as "program 0, Go 1339" and "program 5000, Go 1588": all rows
 			// rejected under AND, all accepted under OR.
 			a.XorRegReg(R10, R10)
-			a.CmpRegReg(RAX, RDX)
+			a.CmpRegReg(x, y)
 			a.Setcc(in.Cond, R10)
-			a.MovMemReg32(RSI, in.A, R10)
+			set(in.A, R10)
 		case POpAnd, POpOr:
-			a.MovRegMem32(RAX, RSI, in.B)
-			a.MovRegMem32(RDX, RSI, in.C)
-			if in.Op == POpAnd {
-				a.AndRegReg(RAX, RDX)
-			} else {
-				a.OrRegReg(RAX, RDX)
+			op := a.AndRegReg
+			if in.Op == POpOr {
+				op = a.OrRegReg
 			}
-			a.MovMemReg32(RSI, in.A, RAX)
+			// In place when the result overwrites an operand that lives in
+			// a register: both are commutative.
+			if p, ok := phys(in.A); ok && (in.A == in.B || in.A == in.C) {
+				other := in.C
+				if in.A == in.C {
+					other = in.B
+				}
+				op(p, val(other, RDX))
+				break
+			}
+			into(RAX, in.B)
+			op(RAX, val(in.C, RDX))
+			set(in.A, RAX)
 		case POpSkipIfZero:
-			a.MovRegMem32(RAX, RSI, in.A)
-			a.TestRegReg(RAX, RAX)
+			x := val(in.A, RAX)
+			a.TestRegReg(x, x)
 			a.Jcc(CondE, "next")
 		case POpCmpSkip, POpCmpJump:
+			x := RAX
 			if in.BCol {
 				a.MovRegMemIdx(RAX, colReg[in.B], RCX)
 			} else {
-				a.MovRegMem32(RAX, RSI, in.B)
+				x = val(in.B, RAX)
 			}
-			a.MovRegMem32(RDX, RSI, in.C)
-			a.CmpRegReg(RAX, RDX)
+			a.CmpRegReg(x, val(in.C, RDX))
 			if in.Op == POpCmpSkip {
 				a.Jcc(in.Cond.Negate(), "next")
 			} else {
 				a.Jcc(in.Cond, progTarget(in.A, len(insns)))
 			}
 		case POpSetConst:
+			if p, ok := phys(in.A); ok {
+				a.MovRegImm64(p, int64(in.B))
+				break
+			}
 			a.MovRegImm64(RAX, int64(in.B))
 			a.MovMemReg32(RSI, in.A, RAX)
 		case POpJump:
 			a.Jmp(progTarget(in.A, len(insns)))
 		case POpJumpIfZero, POpJumpIfNotZero:
-			a.MovRegMem32(RAX, RSI, in.B)
-			a.TestRegReg(RAX, RAX)
+			x := val(in.B, RAX)
+			a.TestRegReg(x, x)
 			cond := CondE
 			if in.Op == POpJumpIfNotZero {
 				cond = CondNE
 			}
 			a.Jcc(cond, progTarget(in.A, len(insns)))
 		case POpNot:
-			a.MovRegMem32(RAX, RSI, in.B)
+			x := val(in.B, RAX)
 			a.XorRegReg(R10, R10)
-			a.TestRegReg(RAX, RAX)
+			a.TestRegReg(x, x)
 			a.Setcc(CondE, R10)
-			a.MovMemReg32(RSI, in.A, R10)
+			set(in.A, R10)
 		case POpAdd, POpSub, POpMul:
-			a.MovRegMem32(RAX, RSI, in.B)
-			a.MovRegMem32(RDX, RSI, in.C)
+			op := a.AddRegReg
 			switch in.Op {
-			case POpAdd:
-				a.AddRegReg(RAX, RDX)
 			case POpSub:
-				a.SubRegReg(RAX, RDX)
-			default:
-				a.ImulRegReg(RAX, RDX)
+				op = a.SubRegReg
+			case POpMul:
+				op = a.ImulRegReg
+			}
+			// x86's two-operand form in place when the result overwrites
+			// its left operand in a register (r = r + c, an accumulation).
+			dst := RAX
+			if p, ok := phys(in.A); ok && in.A == in.B {
+				dst = p
+				op(p, val(in.C, RDX))
+			} else {
+				into(RAX, in.B)
+				op(RAX, val(in.C, RDX))
 			}
 			a.Setcc(condOverflow, R11)
 			a.OrRegReg(R9, R11)
-			a.MovMemReg32(RSI, in.A, RAX)
+			set(in.A, dst)
 		case POpRem:
 			// RCX is the loop index and R9 the overflow flag, so the divisor
 			// goes in R10; idiv clobbers RDX, which is scratch here.
 			z, m1, st := "rz"+itoa(idx), "rm"+itoa(idx), "rs"+itoa(idx)
-			a.MovRegMem32(RAX, RSI, in.B)
-			a.MovRegMem32(R10, RSI, in.C)
+			into(RAX, in.B)
+			into(R10, in.C)
 			a.TestRegReg(R10, R10)
 			a.Jcc(CondE, z)
 			a.CmpRegImm32(R10, -1)
@@ -156,17 +230,17 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.Label(m1)
 			a.XorRegReg(RAX, RAX)
 			a.Label(st)
-			a.MovMemReg32(RSI, in.A, RAX)
+			set(in.A, RAX)
 		case POpAbs:
 			// NEG sets OF exactly for MinInt64, and SF when the original was
 			// positive, in which case the original is the answer.
-			a.MovRegMem32(RAX, RSI, in.B)
+			into(RAX, in.B)
 			a.MovRegReg(RDX, RAX)
 			a.NegReg(RDX)
 			a.Setcc(condOverflow, R11)   // SETcc and CMOVcc leave the flags alone;
 			a.Cmovcc(condSign, RDX, RAX) // the OR below does not, so it goes last
 			a.OrRegReg(R9, R11)
-			a.MovMemReg32(RSI, in.A, RDX)
+			set(in.A, RDX)
 		case POpService:
 			a.MovRegImm64(RAX, int64(in.A)+1)
 			a.MovMemReg(RDI, POffPC, RAX)
@@ -189,22 +263,17 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.MovMemIdxReg(RAX, R8, RCX)
 			a.IncReg(R8)
 		case POpAccMin, POpAccMax:
-			a.MovRegMem32(RAX, RSI, in.A)
-			a.CmpRegReg(R8, RAX)
+			x := val(in.A, RAX)
+			a.CmpRegReg(R8, x)
 			cond := CondG // min: acc > v, so take v
 			if in.Op == POpAccMax {
 				cond = CondL
 			}
-			a.Cmovcc(cond, R8, RAX)
-			a.MovRegMem32(RDX, RSI, in.B)
-			a.IncReg(RDX)
-			a.MovMemReg32(RSI, in.B, RDX)
+			a.Cmovcc(cond, R8, x)
+			incReg(in.B)
 		case POpAccSum:
-			a.MovRegMem32(RAX, RSI, in.A)
-			a.AddRegRegOverflow(R8, RAX, R9)
-			a.MovRegMem32(RDX, RSI, in.B)
-			a.IncReg(RDX)
-			a.MovMemReg32(RSI, in.B, RDX)
+			a.AddRegRegOverflow(R8, val(in.A, RAX), R9)
+			incReg(in.B)
 		default:
 			return nil, fmt.Errorf("jit: unknown program opcode %d", in.Op)
 		}
@@ -214,6 +283,10 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	a.Jcc(CondNE, "loop")
 
 	a.Label("done")
+	for _, r := range pa.store {
+		p, _ := phys(r)
+		a.MovMemReg32(RSI, r, p)
+	}
 	a.XorRegReg(RAX, RAX)
 	a.MovMemReg(RDI, POffPC, RAX)
 	a.Label("fin")

@@ -21,6 +21,67 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	colReg := [MaxProgCols]Reg64{X5, X6, X7, X8}
 
 	a := NewArm()
+	// IR registers live in the column registers this program does not read,
+	// X15-X17 and X19-X25 (allocProgRegs); X9-X14 are scratch, the text
+	// scans' included. The callee-saved X19-X25 bind a C caller only; under
+	// the ABI0 trampoline every one of them is the kernel's
+	// (trampoline_arm64.s). X26 (Go's closure context) is left alone, as are
+	// X18, X27 and X28.
+	pool := append(append([]Reg64(nil), colReg[nCols:]...), X15, X16, X17, X19, X20, X21, X22, X23, X24, X25)
+	pa := allocProgRegs(insns, len(pool))
+	phys := func(r int) (Reg64, bool) {
+		if k := pa.at(r); k >= 0 {
+			return pool[k], true
+		}
+		return 0, false
+	}
+	// val is a register holding r's value: its own, or scratch loaded.
+	val := func(r int, scratch Reg64) Reg64 {
+		if p, ok := phys(r); ok {
+			return p
+		}
+		a.LdrImm(scratch, X1, r*8)
+		return scratch
+	}
+	// into puts r's value in dst, which the caller then changes.
+	into := func(dst Reg64, r int) {
+		if p, ok := phys(r); ok {
+			a.MovReg(dst, p)
+			return
+		}
+		a.LdrImm(dst, X1, r*8)
+	}
+	// dst is where to compute r: its own register, or scratch; fin then
+	// stores scratch to the file.
+	dst := func(r int, scratch Reg64) Reg64 {
+		if p, ok := phys(r); ok {
+			return p
+		}
+		return scratch
+	}
+	fin := func(r int, d Reg64) {
+		if _, ok := phys(r); !ok {
+			a.StrImm(d, X1, r*8)
+		}
+	}
+	set := func(r int, src Reg64) {
+		if p, ok := phys(r); ok {
+			if p != src {
+				a.MovReg(p, src)
+			}
+			return
+		}
+		a.StrImm(src, X1, r*8)
+	}
+	inc := func(r int) {
+		if p, ok := phys(r); ok {
+			a.AddImm(p, p, 1)
+			return
+		}
+		a.LdrImm(X9, X1, r*8)
+		a.AddImm(X9, X9, 1)
+		a.StrImm(X9, X1, r*8)
+	}
 	a.LdrImm(X1, X0, POffRegs)
 	a.LdrImm(X2, X0, POffN)
 	a.MovImm16(X3, 0)
@@ -35,6 +96,10 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	}
 	for c := 0; c < nCols; c++ {
 		a.LdrImm(colReg[c], X0, POffCol+c*8)
+	}
+	for _, r := range pa.load {
+		p, _ := phys(r)
+		a.LdrImm(p, X1, r*8)
 	}
 	a.Cbz(X2, "done")
 	// The index counts up from -n to 0, so one ADD advances every column read
@@ -66,65 +131,61 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		a.Label(progLabel(idx))
 		switch in.Op {
 		case POpLoadCol:
-			a.LdrRegIdx(X9, colReg[in.B], X2)
-			a.StrImm(X9, X1, in.A*8)
+			d := dst(in.A, X9)
+			a.LdrRegIdx(d, colReg[in.B], X2)
+			fin(in.A, d)
 		case POpLoadReg:
-			a.LdrImm(X9, X1, in.B*8)
-			a.StrImm(X9, X1, in.A*8)
+			set(in.A, val(in.B, X9))
 		case POpCmp:
-			a.LdrImm(X9, X1, in.B*8)
-			a.LdrImm(X10, X1, in.C*8)
-			a.Cmp(X9, X10)
-			a.Cset(X11, in.Cond)
-			a.StrImm(X11, X1, in.A*8)
+			a.Cmp(val(in.B, X9), val(in.C, X10))
+			d := dst(in.A, X11)
+			a.Cset(d, in.Cond)
+			fin(in.A, d)
 		case POpAnd, POpOr:
-			a.LdrImm(X9, X1, in.B*8)
-			a.LdrImm(X10, X1, in.C*8)
+			x, y, d := val(in.B, X9), val(in.C, X10), dst(in.A, X9)
 			if in.Op == POpAnd {
-				a.AndReg(X9, X9, X10)
+				a.AndReg(d, x, y)
 			} else {
-				a.OrrReg(X9, X9, X10)
+				a.OrrReg(d, x, y)
 			}
-			a.StrImm(X9, X1, in.A*8)
+			fin(in.A, d)
 		case POpSkipIfZero:
-			a.LdrImm(X9, X1, in.A*8)
-			a.Cbz(X9, "next")
+			a.Cbz(val(in.A, X9), "next")
 		case POpCmpSkip, POpCmpJump:
+			x := X9
 			if in.BCol {
 				a.LdrRegIdx(X9, colReg[in.B], X2)
 			} else {
-				a.LdrImm(X9, X1, in.B*8)
+				x = val(in.B, X9)
 			}
-			a.LdrImm(X10, X1, in.C*8)
-			a.Cmp(X9, X10)
+			a.Cmp(x, val(in.C, X10))
 			if in.Op == POpCmpSkip {
 				a.Bcond(in.Cond.Negate(), "next")
 			} else {
 				a.Bcond(in.Cond, progTarget(in.A, len(insns)))
 			}
 		case POpSetConst:
-			a.MovImm64(X9, int64(in.B))
-			a.StrImm(X9, X1, in.A*8)
+			d := dst(in.A, X9)
+			a.MovImm64(d, int64(in.B))
+			fin(in.A, d)
 		case POpJump:
 			a.B(progTarget(in.A, len(insns)))
 		case POpJumpIfZero:
-			a.LdrImm(X9, X1, in.B*8)
-			a.Cbz(X9, progTarget(in.A, len(insns)))
+			a.Cbz(val(in.B, X9), progTarget(in.A, len(insns)))
 		case POpJumpIfNotZero:
-			a.LdrImm(X9, X1, in.B*8)
-			a.Cbnz(X9, progTarget(in.A, len(insns)))
+			a.Cbnz(val(in.B, X9), progTarget(in.A, len(insns)))
 		case POpNot:
-			a.LdrImm(X9, X1, in.B*8)
-			a.Cmp(X9, xzr)
-			a.Cset(X10, CondE)
-			a.StrImm(X10, X1, in.A*8)
+			a.Cmp(val(in.B, X9), xzr)
+			d := dst(in.A, X10)
+			a.Cset(d, CondE)
+			fin(in.A, d)
 		case POpRem:
 			// SDIV does not trap, and MSUB then gives C's truncating remainder,
 			// 0 for a divisor of -1 included; only a zero divisor (SQL NULL) is
 			// flagged, for the caller to decline.
 			nz, st := "rn"+itoa(idx), "rs"+itoa(idx)
-			a.LdrImm(X9, X1, in.B*8)
-			a.LdrImm(X10, X1, in.C*8)
+			into(X9, in.B)
+			into(X10, in.C)
 			a.Cbnz(X10, nz)
 			a.MovImm16(X11, 1)
 			a.OrrReg(X4, X4, X11)
@@ -133,9 +194,9 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.Sdiv(X11, X9, X10)
 			a.Msub(X9, X11, X10, X9)
 			a.Label(st)
-			a.StrImm(X9, X1, in.A*8)
+			set(in.A, X9)
 		case POpAbs:
-			a.LdrImm(X9, X1, in.B*8)
+			into(X9, in.B)
 			a.MovImm64(X11, math.MinInt64)
 			a.Cmp(X9, X11)
 			a.Cset(X11, CondE)
@@ -143,7 +204,7 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.NegReg(X10, X9)
 			a.Cmp(X9, xzr)
 			a.Csel(X9, X10, X9, CondL)
-			a.StrImm(X9, X1, in.A*8)
+			set(in.A, X9)
 		case POpTextLen:
 			emitTextLenArm64(a, in, colReg[in.B], progTarget(in.C, len(insns)), idx)
 		case POpTextMatch:
@@ -158,28 +219,27 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.B("fin")
 			a.Label(svcLabel(in.A))
 		case POpAdd, POpSub, POpMul:
-			a.LdrImm(X9, X1, in.B*8)
-			a.LdrImm(X10, X1, in.C*8)
+			x, y, d := val(in.B, X9), val(in.C, X10), dst(in.A, X9)
 			switch in.Op {
 			case POpAdd:
-				a.AddsReg(X9, X9, X10)
+				a.AddsReg(d, x, y)
 			case POpSub:
-				a.SubsReg(X9, X9, X10)
+				a.SubsReg(d, x, y)
 			default:
 				// AArch64 has no flag-setting multiply. SMULH gives the high 64
 				// bits; the product overflowed exactly when they are not the
 				// sign extension of the low half, which is what this compares.
-				a.Smulh(X11, X9, X10)
-				a.Mul(X9, X9, X10)
-				a.CmpAsr63(X11, X9)
+				a.Smulh(X11, x, y)
+				a.Mul(d, x, y)
+				a.CmpAsr63(X11, d)
 				a.Cset(X10, CondNE)
 				a.OrrReg(X4, X4, X10)
-				a.StrImm(X9, X1, in.A*8)
+				fin(in.A, d)
 				continue
 			}
 			a.CsetOverflow(X10)
 			a.OrrReg(X4, X4, X10)
-			a.StrImm(X9, X1, in.A*8)
+			fin(in.A, d)
 		case POpAccCount:
 			a.AddImm(X3, X3, 1)
 		case POpEmitRow:
@@ -189,26 +249,21 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.StrImm(X2, X9, 0)
 			a.AddImm(X3, X3, 1)
 		case POpAccMin, POpAccMax:
-			a.LdrImm(X9, X1, in.A*8)
-			a.Cmp(X3, X9)
+			x := val(in.A, X9)
+			a.Cmp(X3, x)
 			cond := CondG // min: acc > v, so take v
 			if in.Op == POpAccMax {
 				cond = CondL
 			}
-			a.Csel(X3, X9, X3, cond)
-			a.LdrImm(X10, X1, in.B*8)
-			a.AddImm(X10, X10, 1)
-			a.StrImm(X10, X1, in.B*8)
+			a.Csel(X3, x, X3, cond)
+			inc(in.B)
 		case POpAccSum:
-			a.LdrImm(X9, X1, in.A*8)
-			a.AddsReg(X3, X3, X9)
+			a.AddsReg(X3, X3, val(in.A, X9))
 			// CSET reads the flags ADDS just set; OR-ing into X4 keeps the
 			// answer sticky for the whole loop without a branch.
 			a.CsetOverflow(X10)
 			a.OrrReg(X4, X4, X10)
-			a.LdrImm(X9, X1, in.B*8)
-			a.AddImm(X9, X9, 1)
-			a.StrImm(X9, X1, in.B*8)
+			inc(in.B)
 		default:
 			return nil, fmt.Errorf("jit: unknown program opcode %d", in.Op)
 		}
@@ -218,6 +273,10 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	a.Cbnz(X2, "loop")
 
 	a.Label("done")
+	for _, r := range pa.store {
+		p, _ := phys(r)
+		a.StrImm(p, X1, r*8)
+	}
 	a.MovImm16(X9, 0)
 	a.StrImm(X9, X0, POffPC)
 	a.Label("fin")
