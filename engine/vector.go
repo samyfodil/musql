@@ -198,6 +198,27 @@ func parseVectorBlob(b []byte, lenient bool) (vector, error) {
 
 // parseVectorText reads '[1, 2, 3]' into a float32 or float64 vector.
 // Whitespace is dropped everywhere, inside a number too, as libSQL drops it.
+// vecTextClass classifies a byte of a vector's text for parseVectorText's
+// scan: the end of a component (',' ']' or a NUL), a space (sqlIsSpace), or
+// anything else -- one table load per byte rather than a chain of compares.
+var vecTextClass = func() (t [256]byte) {
+	for c := range 256 {
+		switch {
+		case c == ',' || c == ']' || c == 0:
+			t[c] = vecClassEnd
+		case sqlIsSpace(byte(c)):
+			t[c] = vecClassSpace
+		}
+	}
+	return t
+}()
+
+const (
+	vecClassOther = iota
+	vecClassEnd
+	vecClassSpace
+)
+
 func parseVectorText(s []byte, t vecType) (vector, error) {
 	i := 0
 	skip := func() {
@@ -214,7 +235,8 @@ func parseVectorText(s []byte, t vecType) (vector, error) {
 	if t == vecF64 {
 		w = 8
 	}
-	var data []byte
+	// Sized for one component per comma, so the appends below never regrow it.
+	data := make([]byte, 0, (bytes.Count(s, []byte{','})+1)*w)
 	n := 0
 	// One number per pass: its span runs to the next ',' or ']' (or a NUL,
 	// where C's string ends), found in one scan and parsed in place. Only a
@@ -226,19 +248,20 @@ func parseVectorText(s []byte, t vecType) (vector, error) {
 		e, lo, hi, inner, gap := i, -1, -1, false, false
 		for ; e < len(s); e++ {
 			c := s[e]
-			if c == ',' || c == ']' || c == 0 {
-				break
-			}
-			if sqlIsSpace(c) {
-				gap = lo >= 0
+			cls := vecTextClass[c]
+			if cls == vecClassOther {
+				if lo < 0 {
+					lo = e
+				}
+				inner = inner || gap
+				gap = false
+				hi = e + 1
 				continue
 			}
-			if lo < 0 {
-				lo = e
+			if cls == vecClassEnd {
+				break
 			}
-			inner = inner || gap
-			gap = false
-			hi = e + 1
+			gap = lo >= 0 // a space
 		}
 		var num []byte
 		if lo >= 0 {

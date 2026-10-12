@@ -176,11 +176,32 @@ func sqliteFp2Convert10(m uint64, e, n int) (uint64, int) {
 	return h >> uint(-(e + sqlitePwr10to2(p) + 1)), -p
 }
 
+// exactPow10 is 10^0 .. 10^22, each exactly representable as a double.
+var exactPow10 = [23]float64{1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10,
+	1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22}
+
 // sqliteFp10Convert2 is sqlite3Fp10Convert2 (util.c:780): the double nearest
 // d*10^p, d != 0, by Russ Cox's fpfmt method against powerOfTen's 96-bit
 // table -- the conversion sqlite3AtoF (json_funcs.go's sqliteAtoF) and
 // FpDecode's round-trip test both use.
 func sqliteFp10Convert2(d uint64, p int) float64 {
+	// CLINGER'S FAST PATH: a significand below 2^53 and a power of ten up to
+	// 10^22 are both exact doubles, so one IEEE multiply or divide is the
+	// correctly rounded d*10^p -- the double this function is defined to
+	// return, which is what the general method below computes too. Parsing
+	// a 384-float vector's text spent most of its time here otherwise.
+	if d < 1<<53 && p >= -22 && p <= 22 {
+		if p >= 0 {
+			return float64(d) * exactPow10[p]
+		}
+		return float64(d) / exactPow10[-p]
+	}
+	return fp10ConvertGeneral(d, p)
+}
+
+// fp10ConvertGeneral is sqliteFp10Convert2 for every d and p, the fast path
+// aside.
+func fp10ConvertGeneral(d uint64, p int) float64 {
 	if p < powersOf10First {
 		return 0
 	}
