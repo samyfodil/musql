@@ -2536,7 +2536,7 @@ func (db *DB) mainReadTxnOf(sqlText string) mainReadTxn {
 		}
 		return mainReadTxnUnknown
 	}
-	if mainReadTxnTempSensitiveVerb[verb] {
+	if mainReadTxnTempSensitiveVerb(verb) {
 		if db.holdsAnyTempObject() {
 			return mainReadTxnUnknown
 		}
@@ -2545,13 +2545,18 @@ func (db *DB) mainReadTxnOf(sqlText string) mainReadTxn {
 	return mainReadTxnUnknown
 }
 
-// mainReadTxnTempSensitiveVerb is the set of leading verbs whose classification
-// turns on whether this session holds a TEMP object -- mainReadTxnOf's DML/DDL
-// case. It is a named set rather than a switch case because that question has to
-// be asked TWICE, before and after the statement: see mainReadTxnAfter.
-var mainReadTxnTempSensitiveVerb = map[string]bool{
-	"INSERT": true, "REPLACE": true, "UPDATE": true, "DELETE": true,
-	"CREATE": true, "DROP": true, "ALTER": true, "VACUUM": true, "ANALYZE": true,
+// mainReadTxnTempSensitiveVerb reports whether verb is a leading verb whose
+// classification turns on whether this session holds a TEMP object --
+// mainReadTxnOf's DML/DDL case. It is a named function rather than a switch
+// case because that question has to be asked TWICE, before and after the
+// statement: see mainReadTxnAfter. (A switch, not a map: it is asked for every
+// statement, and a map hashed the verb each time.)
+func mainReadTxnTempSensitiveVerb(verb string) bool {
+	switch verb {
+	case "INSERT", "REPLACE", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "VACUUM", "ANALYZE":
+		return true
+	}
+	return false
 }
 
 // mainReadTxnAfter re-asks the TEMP question after the statement ran: the
@@ -2563,7 +2568,7 @@ func (db *DB) mainReadTxnAfter(sqlText string, k mainReadTxn) mainReadTxn {
 	if k != mainReadTxnYes || !db.holdsAnyTempObject() {
 		return k
 	}
-	if verb, ok := db.leadingVerb(strings.TrimSpace(sqlText)); ok && mainReadTxnTempSensitiveVerb[verb] {
+	if verb, ok := db.leadingVerb(strings.TrimSpace(sqlText)); ok && mainReadTxnTempSensitiveVerb(verb) {
 		return mainReadTxnUnknown
 	}
 	return k

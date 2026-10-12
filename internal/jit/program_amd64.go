@@ -104,12 +104,61 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	a.NegReg(RCX)
 	emitProgResume(a, insns)
 
+	padNops(a, loopAlign)
 	a.Label("loop")
+	ps, pred := progPredicated(insns)
 	// One label per IR instruction, so a lowered OpIf/OpIfNot/OpGoto becomes an
 	// ordinary branch. Without these the IR could only express a straight line
 	// of predicates -- which is exactly the limit the fixed kernels had.
 	for idx, in := range insns {
 		a.Label(progLabel(idx))
+		if pred && idx >= ps {
+			// The predicated row (progPredicated): R10 is 1 while every filter
+			// so far passed -- SETcc for the first, then a CMOV of zero for
+			// each failing one -- and the accumulators apply it.
+			switch in.Op {
+			case POpCmpSkip:
+				x := RAX
+				if in.BCol {
+					a.MovRegMemIdx(RAX, colReg[in.B], RCX)
+				} else {
+					x = val(in.B, RAX)
+				}
+				y := val(in.C, RDX)
+				if idx == ps {
+					a.XorRegReg(R10, R10) // before the compare: XOR sets the flags
+					a.CmpRegReg(x, y)
+					a.Setcc(in.Cond, R10)
+				} else {
+					a.CmpRegReg(x, y)
+					a.MovRegImm64(RDX, 0) // MOV leaves the flags alone
+					a.Cmovcc(in.Cond.Negate(), R10, RDX)
+				}
+			case POpLoadCol:
+				if p, ok := phys(in.A); ok {
+					a.MovRegMemIdx(p, colReg[in.B], RCX)
+					break
+				}
+				a.MovRegMemIdx(RAX, colReg[in.B], RCX)
+				a.MovMemReg32(RSI, in.A, RAX)
+			case POpAccCount:
+				a.AddRegReg(R8, R10)
+			case POpAccSum:
+				x := val(in.A, RAX)
+				a.MovRegReg(RDX, R10)
+				a.NegReg(RDX)
+				a.AndRegReg(RDX, x)
+				a.AddRegRegOverflow(R8, RDX, R9)
+				if p, ok := phys(in.B); ok {
+					a.AddRegReg(p, R10)
+				} else {
+					a.MovRegMem32(RDX, RSI, in.B)
+					a.AddRegReg(RDX, R10)
+					a.MovMemReg32(RSI, in.B, RDX)
+				}
+			}
+			continue
+		}
 		switch in.Op {
 		case POpLoadCol:
 			if p, ok := phys(in.A); ok {

@@ -96,8 +96,14 @@ func compileVMJIT(prog *Program) *vmJIT {
 	entry := make([]bool, len(prog.Insns))
 	native := 0
 	scannable := scannableCursors(prog.Insns, prog.NCursors)
+	// Whether the program has a pair the fusion pass works on, noted as it is
+	// lowered (jit.VFusable), so a program with none skips the pass.
+	fusable := false
 	for pc := range prog.Insns {
 		vp[pc] = lowerVM(&prog.Insns[pc], prog.NReg)
+		if pc > 0 && !fusable && jit.VFusable(vp[pc-1], vp[pc]) {
+			fusable = true
+		}
 		// A column of any cursor is read natively (a cursor native code cannot
 		// walk is read from a copy of its current row); only a cursor that
 		// materializes its rows is walked natively.
@@ -132,7 +138,7 @@ func compileVMJIT(prog *Program) *vmJIT {
 	if entries == 0 {
 		return nil
 	}
-	b, err := jit.EmitVM(vp, prog.NReg, valueLayout)
+	b, err := jit.EmitVMFused(vp, prog.NReg, valueLayout, entry, fusable)
 	if err != nil {
 		return nil
 	}
@@ -244,6 +250,7 @@ func firstCursor(vp []jit.VInsn, pc int) int {
 
 var (
 	vmArith = map[OpCode]jit.VOp{OpAdd: jit.VAdd, OpSubtract: jit.VSub, OpMultiply: jit.VMul,
+		OpDivide: jit.VDiv, OpRemainder: jit.VRem,
 		OpBitAnd: jit.VAnd, OpBitOr: jit.VOr, OpShiftLeft: jit.VShl, OpShiftRight: jit.VShr}
 	vmCond = map[OpCode]jit.Cond{OpEq: jit.CondE, OpNe: jit.CondNE, OpLt: jit.CondL,
 		OpLe: jit.CondLE, OpGt: jit.CondG, OpGe: jit.CondGE}
@@ -331,7 +338,9 @@ func lowerVM(in *Instruction, nReg int) jit.VInsn {
 		if ok(in.P1, in.P2) {
 			return jit.VInsn{Op: jit.VCopy, A: in.P1, B: in.P2}
 		}
-	case OpAdd, OpSubtract, OpMultiply, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight:
+	case OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight:
+		// Divide and Remainder: intArith's integer arm, for a divisor native
+		// code checks is neither 0 nor -1.
 		if ok(in.P1, in.P2, in.P3) {
 			return jit.VInsn{Op: vmArith[in.Op], A: in.P1, B: in.P2, C: in.P3}
 		}
@@ -370,6 +379,11 @@ func lowerVM(in *Instruction, nReg int) jit.VInsn {
 	case OpNegative:
 		if ok(in.P1, in.P2) {
 			return jit.VInsn{Op: jit.VNeg, A: in.P1, C: in.P2}
+		}
+	case OpNot:
+		// An INTEGER's NOT is boolValue(!isTruthy): 1 for 0, else 0.
+		if ok(in.P1, in.P2) {
+			return jit.VInsn{Op: jit.VNot, A: in.P1, C: in.P2}
 		}
 	case OpColumn:
 		// Native code reads a cursor's column from its row list; whether the

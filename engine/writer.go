@@ -476,6 +476,14 @@ type DB struct {
 	lastVerbText string
 	lastVerb     string
 	lastVerbOK   bool
+	// lastTempOpenText/lastTempOpen memoize r35aStatementOpensTempDatabase
+	// the same way (r35aNoteTempDatabaseOpen): a pure function of the text,
+	// asked again for every execution of a prepared statement.
+	lastTempOpenText string
+	lastTempOpen     bool
+	// lastWritePlanText/lastWritePlan are cachedWriteProgram's most recent hit.
+	lastWritePlanText string
+	lastWritePlan     *Program
 
 	// stmtDepth is how many top-level ExecArgs statements are on this session's
 	// stack. It exists so the two walIndexState hooks fire ONCE per statement:

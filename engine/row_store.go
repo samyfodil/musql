@@ -148,9 +148,14 @@ func (s *rowStore) put(rowid uint64, vals []Value) {
 		// the row itself is wanted only by an index or the undo log kept
 		// here. Reading it back regardless was a second fetch of every row an
 		// UPDATE writes, the first being the cursor's own.
-		if len(s.eqIdx) > 0 || len(s.uqIdx) > 0 || s.logging {
+		switch {
+		case s.ubKnown && rowidLess(s.ub, rowid):
+			// Past the upper bound nothing is there (see has): a row appended
+			// after the last one is new without a search of the segments, which
+			// was half of what storing it cost.
+		case len(s.eqIdx) > 0 || len(s.uqIdx) > 0 || s.logging:
 			old, haveOld = s.segGet(rowid)
-		} else {
+		default:
 			haveOld = s.segHas(rowid)
 		}
 		if !haveOld {

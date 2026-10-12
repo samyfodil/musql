@@ -126,9 +126,56 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		a.B("done")
 	}
 
+	padArm(a, loopAlign)
 	a.Label("loop")
+	ps, pred := progPredicated(insns)
+	var prev Cond
 	for idx, in := range insns {
 		a.Label(progLabel(idx))
+		if pred && idx >= ps {
+			// The predicated row (progPredicated): the filters' conjunction
+			// in the flags through CCMP, then 1 or 0 in X12 and its mask in
+			// X13, which the accumulators apply.
+			switch in.Op {
+			case POpCmpSkip:
+				x := X9
+				if in.BCol {
+					a.LdrRegIdx(X9, colReg[in.B], X2)
+				} else {
+					x = val(in.B, X9)
+				}
+				y := val(in.C, X10)
+				if idx == ps {
+					a.Cmp(x, y)
+				} else {
+					a.Ccmp(x, y, nzcvFalseFor(in.Cond), prev)
+				}
+				prev = in.Cond
+				if insns[idx+1].Op != POpCmpSkip {
+					a.Cset(X12, in.Cond)
+					a.NegReg(X13, X12)
+				}
+			case POpLoadCol:
+				d := dst(in.A, X9)
+				a.LdrRegIdx(d, colReg[in.B], X2)
+				fin(in.A, d)
+			case POpAccCount:
+				a.AddReg(X3, X3, X12)
+			case POpAccSum:
+				a.AndReg(X11, val(in.A, X9), X13)
+				a.AddsReg(X3, X3, X11)
+				a.CsetOverflow(X10)
+				a.OrrReg(X4, X4, X10)
+				if p, ok := phys(in.B); ok {
+					a.AddReg(p, p, X12)
+				} else {
+					a.LdrImm(X9, X1, in.B*8)
+					a.AddReg(X9, X9, X12)
+					a.StrImm(X9, X1, in.B*8)
+				}
+			}
+			continue
+		}
 		switch in.Op {
 		case POpLoadCol:
 			d := dst(in.A, X9)

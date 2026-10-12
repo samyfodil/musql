@@ -307,7 +307,10 @@ func (db *DB) r35aNoteTempDatabaseOpen(sqlText string) {
 	if db.tempDatabaseOpened {
 		return
 	}
-	if r35aStatementOpensTempDatabase(sqlText) {
+	if sqlText != db.lastTempOpenText || sqlText == "" {
+		db.lastTempOpenText, db.lastTempOpen = sqlText, r35aStatementOpensTempDatabase(sqlText)
+	}
+	if db.lastTempOpen {
 		db.tempDatabaseOpened = true
 	}
 }
