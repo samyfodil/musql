@@ -331,7 +331,7 @@ func (w *vec1W) insertBase(rowidV Value, vec []byte, bucket int, meta []Value) (
 		rowid = r
 	} else {
 		rowid = valueToInt64Trunc(rowidV)
-		if _, exists, err := w.sh.get("_base", rowid); err != nil {
+		if exists, err := w.sh.has("_base", rowid); err != nil {
 			return 0, err
 		} else if exists {
 			// vec1 leaves no message of its own: the statement reports the bare

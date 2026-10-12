@@ -79,6 +79,15 @@ func (s *vec1DBShadow) get(suffix string, rowid int64) ([]Value, bool, error) {
 	return v, ok, nil
 }
 
+// has reports whether the table holds rowid, reading nothing back.
+func (s *vec1DBShadow) has(suffix string, rowid int64) (bool, error) {
+	tbl, err := s.table(suffix)
+	if err != nil {
+		return false, err
+	}
+	return tbl.rows.has(uint64(rowid)), nil
+}
+
 func (s *vec1DBShadow) scan(suffix string, fn func(int64, []Value) (bool, error)) error {
 	tbl, err := s.table(suffix)
 	if err != nil {
