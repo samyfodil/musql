@@ -803,15 +803,39 @@ func (sh *fkStmtShape) assigns(name string) bool {
 	return false
 }
 
-// childModified is fkChildIsModified: an UPDATE assigns one of fk's child
-// columns (or, for the rowid alias, the rowid). A self-reference is always
-// consulted.
+// childModified is sqlite3FkCheck's test for one of tbl's own keys: an UPDATE
+// consults it only when it assigns one of its columns, except that a
+// self-reference is always consulted.
 func (sh *fkStmtShape) childModified(fk *fkConstraint, tbl *tableMeta) bool {
 	if !sh.update || equalFoldName(fk.parentName, tbl.name) {
 		return true
 	}
+	return sh.childAssigned(fk, tbl)
+}
+
+// childAssigned is fkChildIsModified: an UPDATE assigns one of fk's child
+// columns (or, for the rowid alias, the rowid).
+func (sh *fkStmtShape) childAssigned(fk *fkConstraint, tbl *tableMeta) bool {
 	for _, c := range fk.fromCols {
 		if sh.assigns(c) || sh.assignsRowid(tbl, c) {
+			return true
+		}
+	}
+	return false
+}
+
+// updateRequiresFK is sqlite3FkRequired for an UPDATE: it assigns a column of one
+// of tbl's own keys or of a key that points at tbl. When it does, update.c asks
+// sqlite3FkOldmask, which locates the parent index of EVERY key pointing at tbl
+// -- assigned or not -- and raises a mismatch.
+func (db *DB) updateRequiresFK(tbl *tableMeta, sh *fkStmtShape) bool {
+	for _, fk := range db.fkOf(tbl) {
+		if sh.childAssigned(fk, tbl) {
+			return true
+		}
+	}
+	for _, fk := range db.fkNamingParent(tbl) {
+		if sh.parentModified(fk, tbl) {
 			return true
 		}
 	}
@@ -928,12 +952,12 @@ func (db *DB) fkRequireResolvable(tbl *tableMeta, reach fkReach, shape *fkStmtSh
 			switch {
 			case shape.insert && (multi || fk.deferred || db.deferFKs):
 				return fk.resolveErr
-			case shape.insert && shape.upsert && db.conflictPossible(tbl, shape) && (&fkStmtShape{update: true, assigned: shape.assigned}).parentModified(fk, tbl):
-				// ...and the DO UPDATE is coded as an UPDATE, which looks only when
-				// its SET list assigns a column of the key, and only on a table
+			case shape.insert && shape.upsert && db.conflictPossible(tbl, shape) && db.updateRequiresFK(tbl, &fkStmtShape{update: true, assigned: shape.assigned}):
+				// ...and the DO UPDATE is coded as an UPDATE, which asks for the keys
+				// only when its SET list assigns a column of one, and only on a table
 				// that has a constraint a conflict could come from.
 				return fk.resolveErr
-			case shape.update && shape.parentModified(fk, tbl):
+			case shape.update && db.updateRequiresFK(tbl, shape):
 				return fk.resolveErr
 			case !shape.insert && !shape.update:
 				return fk.resolveErr

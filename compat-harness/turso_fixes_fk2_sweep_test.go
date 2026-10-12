@@ -37,5 +37,19 @@ func TestFKMismatchUpdateGatingSweep(t *testing.T) {
 			}
 		}
 	}
+	// A table that is both a child of a good key and the parent of a mismatched
+	// one: assigning a column of its own key makes update.c ask for EVERY key
+	// pointing at it (sqlite3FkOldmask), the mismatched one included.
+	for _, ref := range []string{"p2", "p2(f)", "p2(e)"} {
+		for _, op := range []string{
+			"UPDATE p2 SET e=5", "UPDATE p2 SET e=1", "UPDATE p2 SET f=5", "UPDATE p2 SET e=1, f=2", "UPDATE p2 SET rowid=9",
+			"UPDATE OR REPLACE p2 SET e=1", "DELETE FROM p2", "INSERT INTO p2 VALUES(1,2),(1,3)", "INSERT INTO p2 VALUES(1,2)",
+			"INSERT INTO p2 VALUES(1,2) ON CONFLICT DO UPDATE SET e=1", "UPDATE p2 SET e=NULL WHERE f=3",
+		} {
+			cases = append(cases, []string{"PRAGMA foreign_keys=ON", "CREATE TABLE p1(a INTEGER PRIMARY KEY, b, c, UNIQUE(b,c))",
+				"CREATE TABLE p2(e REFERENCES p1, f)", "CREATE TABLE c3(g REFERENCES " + ref + ")",
+				"INSERT INTO p1 VALUES(1,2,3)", "INSERT INTO p2 VALUES(1,2)", "INSERT INTO p2 VALUES(NULL,3)", op, "SELECT count(*) FROM p2"})
+		}
+	}
 	sweepAll(t, cases)
 }
