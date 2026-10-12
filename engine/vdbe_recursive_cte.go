@@ -195,20 +195,24 @@ func (p *ReadOnlyPager) compileRecursiveCTE(name string, b *cteBinding, cols []c
 	}
 	savedSelf := b.selfRef
 	b.selfRef = &recSelfRef{cols: cols, spec: spec, expansionDepth: len(p.cteExpansion)}
+	p.cteSelfRefLive++
 	arms := make([]*Program, 0, len(rs.recursiveArms))
 	for _, arm := range rs.recursiveArms {
 		prog, aerr := p.compileRecursiveCTEPart(arm)
 		if aerr != nil {
 			b.selfRef = savedSelf
+			p.cteSelfRefLive--
 			return nil, aerr
 		}
 		if len(prog.ColNames) != nCol {
 			b.selfRef = savedSelf
+			p.cteSelfRefLive--
 			return nil, fmt.Errorf("%w: engine: recursive table %s: SELECTs to the left and right of UNION do not have the same number of result columns (%d vs %d)", errVDBESemantic, b.name, nCol, len(prog.ColNames))
 		}
 		arms = append(arms, prog)
 	}
 	b.selfRef = savedSelf
+	p.cteSelfRefLive--
 
 	c := &compiler{pager: p}
 	regCur := c.allocN(nCol)

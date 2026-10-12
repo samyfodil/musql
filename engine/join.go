@@ -204,9 +204,13 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 			var cols []columnInfo
 			var crows [][]Value
 			var cerr error
-			// Under the schema-only retry (resolveFromSchemaOnly) a plain CTE is
-			// resolved by the same compile-only path: its columns, never its rows.
-			if cteBind.recursive != nil || p.derivedSchemaOnly {
+			// Under the schema-only retry (resolveFromSchemaOnly), and for a caller
+			// that wants columns only (derivedSelectScope), a plain CTE is resolved
+			// by the same compile-only path: its columns, never its rows. Running
+			// the rows there made a chain of N CTEs, each reading the one before,
+			// cost 2^N: every level ran the level below once for its rows and once
+			// more for its column metadata.
+			if cteBind.recursive != nil || p.derivedSchemaOnly || p.fromColumnsOnly {
 				cols, cerr = p.cteSchemaCols(it.Table, cteBind)
 			} else {
 				cols, crows, cerr = p.resolveCTERows(it.Table, cteBind, params)

@@ -1958,6 +1958,9 @@ func (p *ReadOnlyPager) cteSchemaCols(name string, b *cteBinding) ([]columnInfo,
 		// reference the guard below would report. See cteBinding.multiSelfRef.
 		return nil, semanticf("multiple references to recursive table: %s", name)
 	}
+	if b.schemaCols != nil {
+		return b.schemaCols, nil
+	}
 	for _, seen := range p.cteExpansion {
 		if seen.b == b {
 			// A genuine C-SQLite rejection (C SQLite raises the identical
@@ -2015,6 +2018,9 @@ func (p *ReadOnlyPager) cteSchemaCols(name string, b *cteBinding) ([]columnInfo,
 	cols, _, err := applyCTEColNames(name, b.colNames, cols, nil)
 	if err != nil {
 		return nil, semanticf("%v", err)
+	}
+	if p.cteSelfRefLive == 0 {
+		b.schemaCols = cols
 	}
 	return cols, nil
 }

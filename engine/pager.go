@@ -99,6 +99,12 @@ type ReadOnlyPager struct {
 	//	// cycle (with1.test). pushCTEScope builds a fresh binding per frame.
 	cteExpansion []cteExpansionFrame
 
+	// cteSelfRefLive counts the recursive CTEs whose selfRef is bound right
+	// now (compileRecursiveCTE, recursiveCTECollations). While one is, a CTE
+	// body's columns can be derived from that stand-in row, so cteSchemaCols
+	// does not memoize them.
+	cteSelfRefLive int
+
 	// fromBodyDepth counts the view, CTE and FROM-subquery bodies being
 	// compiled on the current call path (enterFromBody) -- the one context in
 	// which an unusable INDEXED BY partial index is a decline and not C's

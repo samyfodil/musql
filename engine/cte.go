@@ -102,6 +102,13 @@ type cteBinding struct {
 	// "y IN (WITH ss(x) AS (VALUES(7) UNION ALL SELECT x+7 FROM ss WHERE
 	// x<49) SELECT x FROM ss)" failed with "no such table: ss".
 	frame map[string]*cteBinding
+
+	// schemaCols memoizes cteSchemaCols. A body's columns are a function of
+	// the binding alone -- it resolves in its defining scope -- so they are
+	// derived once per statement. Without it each reference re-derived the
+	// whole chain below it, and a 15-deep "c1 AS (SELECT v FROM c0), c2 AS
+	// (SELECT v FROM c1), ..." took minutes (C resolves each CTE once).
+	schemaCols []columnInfo
 }
 
 // recursiveCTEShape is a CTE's body decomposed into its "initial" part
@@ -413,7 +420,8 @@ func recursiveRowFootprint(row []Value) int64 {
 func (p *ReadOnlyPager) recursiveCTECollations(b *cteBinding, cols []columnInfo) []string {
 	saved := b.selfRef
 	b.selfRef = &recSelfRef{cols: cols, expansionDepth: -1}
-	defer func() { b.selfRef = saved }()
+	p.cteSelfRefLive++
+	defer func() { b.selfRef = saved; p.cteSelfRefLive-- }()
 	return compoundColumnCollations(p.resolveAllArmOutputs(b.core), len(cols))
 }
 
