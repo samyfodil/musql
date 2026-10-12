@@ -1039,7 +1039,7 @@ func (db *DB) segmentReadPager() (*ReadOnlyPager, error) { return db.segmentPage
 //
 // left 1,3,5 where C leaves 1 (also delete.test, update.test, delete4.test).
 //
-// ponytail: every loaded table is copied up front. Copy-on-write would copy
+// A deliberate simplification: every loaded table is copied up front. Copy-on-write would copy
 // only written tables but needs the frozen pager's lifetime to be explicit;
 // writeSubqueryPager's call site (vdbe_write.go) is where to make it lazier.
 func (db *DB) segmentSnapshotPager() (*ReadOnlyPager, error) { return db.segmentPager(true) }

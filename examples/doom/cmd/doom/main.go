@@ -75,7 +75,7 @@ func main() {
 				for i := range 9 {
 					v := engine.Value{Typ: engine.Int}
 					if i < len(evs) {
-						v.I = evs[i] // ponytail: past 9 events in one frame, the rest drop
+						v.I = evs[i] // A deliberate simplification: past 9 events in one frame, the rest drop
 					}
 					st.Bind(i+2, v)
 				}

@@ -53,7 +53,7 @@ type compiler struct {
 	// block once (upsert.c:325), so its OP_Once fires once per statement, while
 	// emitUpsertTail runs per unrolled tuple. A slot count, not a high-water mark,
 	// since a later tuple's VALUES may allocate slots first. Keyed by ON CONFLICT
-	// clause. ponytail: C codes a clause once per constraint it covers
+	// clause. A deliberate simplification: C codes a clause once per constraint it covers
 	// (insert.c:2363, 2589), so a target-less DO UPDATE hitting two constraints gets
 	// two OP_Onces there and shares one here.
 	upsertOnceSub map[int]onceSlots
@@ -330,7 +330,7 @@ type compiler struct {
 	//
 	// Write statements: INSERT values at 0; UPDATE/DELETE WHERE inside the loop;
 	// trigger programs start from the firing statement's value (trigger.c:1288),
-	// which is 0 everywhere this engine fires them. ponytail: a DELETE's
+	// which is 0 everywhere this engine fires them. A deliberate simplification: a DELETE's
 	// ONEPASS_SINGLE row would seed a body plan at 1, not 0; both sit under the
 	// "nRow < 3" automatic-index gate, so no plan differs. Carry the firing plan's
 	// nRowOut into the trigger compile if that stops holding.

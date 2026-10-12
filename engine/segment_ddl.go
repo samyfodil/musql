@@ -247,7 +247,7 @@ func (n *Session) rewriteFile() error {
 // which assumes a loaded store (fts3StoreSegment on an unloaded one was a nil
 // dereference in TestVirtualTableRowsSurviveAReopen).
 //
-// ponytail: a database with a virtual table keeps the old in-memory behavior;
+// A deliberate simplification: a database with a virtual table keeps the old in-memory behavior;
 // keep its shadow tables loaded and re-base the rest if that ever matters.
 func (n *Session) rebase(open func(string) (*ReadOnlyPager, error)) {
 	db := n.DB
@@ -528,7 +528,7 @@ func (db *DB) segmentFileContentsOf(temp bool, w *segFileWriter) ([]ConvertedTab
 // existing rows as SHORT, i.e. the new column's DEFAULT, as C reads a record
 // written before the edit.
 //
-// ponytail: only edits the catalog can SAY are written -- sql text, a name, an
+// A deliberate simplification: only edits the catalog can SAY are written -- sql text, a name, an
 // index/view/trigger's tbl_name, a deleted row, an inserted storage-less row. The
 // rest (a type change, a table's tbl_name apart from its name, a NULL text column,
 // an inserted row naming storage) is what C persists as a CORRUPT catalog, whose
@@ -576,7 +576,7 @@ func (db *DB) applyCatalogEditsForWrite(tables []ConvertedTable, cat ConvertedCa
 		}
 		if e.set[0] != nil {
 			if t, ok := text(e.set[0]); !ok || t != curType {
-				continue // unrepresentable: see the ponytail note above
+				continue // unrepresentable: see the simplification note above
 			}
 		}
 		name, sqlText := key.name, ""
@@ -703,7 +703,7 @@ func detachRowsFromMapping(t *tableMeta) {
 	// rewriting its rows -- they would land in its overlay with the base still
 	// on the mapping about to be closed. It becomes an owned in-memory store,
 	// which is what every table was before that store existed.
-	// ponytail: a full load, paid only by a table whose catalog entry a rewrite
+	// A deliberate simplification: a full load, paid only by a table whose catalog entry a rewrite
 	// changes; rebasing it onto the new file would avoid it.
 	if t.rows.seg != nil {
 		m := map[uint64][]Value{}

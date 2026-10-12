@@ -11,7 +11,7 @@
 // COMMIT (and Close) commits every open session, main last. C SQLite makes a
 // multi-file transaction atomic with a master journal; this does not write one.
 //
-// ponytail: a crash between two files' commits leaves one committed and the
+// A deliberate simplification: a crash between two files' commits leaves one committed and the
 // other not. Each file stays consistent on its own, so this is a cross-file
 // atomicity ceiling only for transactions writing more than one database. The
 // upgrade path is a master journal: write the member list, fsync, commit each
@@ -1513,7 +1513,7 @@ func (db *DB) attachedCommitRefresh(reserved map[*attachedDB]bool) {
 // and Close before main's own commit, so main moves last (see the file doc for
 // the atomicity ceiling).
 //
-// ponytail: a session whose Close fails is dropped (ad.wdb is cleared first)
+// A deliberate simplification: a session whose Close fails is dropped (ad.wdb is cleared first)
 // and cannot be committed again, while commitTxn leaves the transaction open
 // and a retried COMMIT would report success having lost those writes. Lock
 // conflicts are refused earlier (attachedCommitLockCheck); this only remains

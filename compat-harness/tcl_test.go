@@ -1537,7 +1537,7 @@ func tclCompileOptionsBuildIdentity(stmt string) bool {
 	// statement projecting neither (a bare "SELECT 1 FROM ... WHERE 0") yields
 	// a build-independent answer this engine is expected to produce.
 	//
-	// ponytail: syntactic, so "count(*) ... WHERE 0" is still booked out of
+	// A deliberate simplification: syntactic, so "count(*) ... WHERE 0" is still booked out of
 	// scope although it answers 0 everywhere. No corpus statement has that
 	// shape; telling them apart needs the predicate's value, not its spelling.
 	return tclCompileOptionsProjectedRe.MatchString(stmt)

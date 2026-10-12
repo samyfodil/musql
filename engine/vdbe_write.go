@@ -1224,7 +1224,7 @@ func (c *compiler) emitUpsertTail(db *DB, tbl *tableMeta, stmt *insertStmt, plan
 		}
 	}
 	if nUpdate > 1 && stmt.returning != nil && slices.ContainsFunc(stmt.returning, func(r SelectColumn) bool { return containsSubquery(r.Expr) }) {
-		// ponytail: each DO UPDATE is its own RETURNING code site with its own
+		// A deliberate simplification: each DO UPDATE is its own RETURNING code site with its own
 		// OP_Once in C, and the once groups here are per arm KIND, not per arm.
 		return nil, fmt.Errorf("%w: RETURNING subquery over more than one DO UPDATE clause", errVDBEUnsupported)
 	}
