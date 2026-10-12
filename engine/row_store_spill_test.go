@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/samyfodil/musql/internal/mmapfile"
 )
 
 // TestRowSpillAnswersAsMemory runs one statement sequence on two sessions, one
@@ -103,6 +105,9 @@ func TestRowSpillAnswersAsMemory(t *testing.T) {
 	// Both spill formats: records, and segments a commit can copy as they are
 	// (spillRun), which must answer exactly as the rows they hold.
 	for _, segs := range []bool{false, true} {
+		if segs && !mmapfile.CanMapAt {
+			continue // segments spill only where the platform maps (js does not)
+		}
 		saved := spillSegments
 		spillSegments = segs
 		SpilledRowsForTest()
