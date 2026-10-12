@@ -1648,6 +1648,11 @@ type trigCompileCtx struct {
 	// victim delete sets it, to OE_Replace (insert.c:2339, 2613).
 	orconf    conflictAction
 	orconfSet bool
+	// keepOrderBy keeps a bare SELECT step's ORDER BY: sqlite3Select drops it for
+	// SRT_Discard before resolving names, but the ALTER TABLE re-prepare
+	// (renameResolveTrigger) resolves the whole step -- see
+	// DB.keepBodyOrderBy.
+	keepOrderBy bool
 }
 
 // resolveTriggerParam resolves a NEW.col/OLD.col reference to an OpParam read.
