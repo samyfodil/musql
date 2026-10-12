@@ -2507,16 +2507,12 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 	}
 
 	if x.Qualifier != "" {
-		qualMiss := false
 		for i, s := range scopes {
 			if !equalFoldName(s.name, x.Qualifier) {
 				continue
 			}
 			if spanHidesName(&s.tableScope) {
-				if x.Schema != "" {
-					return 0, 0, false, false, fb, semanticf("engine: no such column: %s.%s.%s", x.Schema, x.Qualifier, x.Name)
-				}
-				return 0, 0, false, false, fb, semanticf("engine: no such column: %s.%s", x.Qualifier, x.Name)
+				continue // its span never matches; the qualifier names nothing here
 			}
 			// x.Schema named a specific database: a scope of the SAME bare
 			// name but a DIFFERENT database is not a candidate for THIS
@@ -2555,7 +2551,6 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 				// A later item of this name declares a real column of it, which
 				// wins over this one's implicit rowid (resolve.c:471, rowid
 				// candidates only while no real column matched).
-				qualMiss = true
 				continue
 			}
 			if isRowidAliasName(x.Name) && !s.noRowid {
@@ -2593,7 +2588,6 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 			// A later FROM item of the same name may have the column: lookupName
 			// tries every item the qualifier names (resolve.c:410-450), as when
 			// "UPDATE t AS x ... FROM s AS x" reads x.v from t and x.w from s.
-			qualMiss = true
 		}
 		// No FROM item here is named the qualifier; it may be a join group's alias
 		// (tableScope.groupAlias, tkt3935.test 3). Only reached when nothing matched by
@@ -2612,20 +2606,12 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 			}
 			return s.cursor, idx + s.colBase, false, true, fb, nil
 		}
-		if qualMiss {
-			// resolve.c:785-796 builds the message from the parts the reference was
-			// WRITTEN with: "%s.%s.%s" when a schema was named, "%s.%s" with a table,
-			// "%s" bare. Dropping the qualifier here made "SELECT t.nosuch FROM t"
-			// report "no such column: nosuch" where 3.53.3 reports
-			// "no such column: t.nosuch" -- and as an errVDBEUnsupported it arrived
-			// wrapped in "VDBE-only: ... (no fallback)" too, where C rejects it at
-			// prepare like any other unresolved name.
-			if x.Schema != "" {
-				return 0, 0, false, false, fb, semanticf("engine: no such column: %s.%s.%s", x.Schema, x.Qualifier, x.Name)
-			}
-			return 0, 0, false, false, fb, semanticf("engine: no such column: %s.%s", x.Qualifier, x.Name)
-		}
-		return 0, 0, false, false, fb, nil // no table here matches the qualifier: try outer
+		// Nothing here has the column, whether or not an item is named the
+		// qualifier: lookupName's cnt stays 0 and it moves to the enclosing
+		// NameContext (resolve.c:410-450, 800), so "(SELECT same.x FROM (...) AS
+		// same) FROM (SELECT 7 AS x) AS same" reads the outer same.x. The caller
+		// reports "no such column: same.x" once no level has it.
+		return 0, 0, false, false, fb, nil
 	}
 
 	foundCursor, foundIdx := -1, -1

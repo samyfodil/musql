@@ -436,13 +436,12 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 	}
 	for c := ctx; c != nil; c = c.outer {
 		if qualifier != "" {
-			qualMiss := false
 			for i, ts := range c.tables {
 				if !equalFoldName(ts.name, qualifier) {
 					continue
 				}
 				if spanHidesName(&ts) {
-					return nil, 0, nil, -1, fmt.Errorf("engine: no such column: %s.%s", qualifier, name)
+					continue // its span never matches (resolveInScopes)
 				}
 				if colIdx, ok := ts.colIndex[lname]; ok {
 					// An UNALIASED SELF-JOIN exposing this column through BOTH
@@ -473,8 +472,7 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 					return c, foundOffset + foundIdx, foundCol, -1, nil
 				}
 				if isRowidAliasName(lname) && laterScopeHasColumn(len(c.tables)-i-1, func(k int) *tableScope { return &c.tables[i+1+k] }, qualifier, lname) {
-					qualMiss = true // a later item's real column wins (resolveInScopes)
-					continue
+					continue // a later item's real column wins (resolveInScopes)
 				}
 				if isRowidAliasName(lname) && !ts.noRowid {
 					// Two FROM items share this qualifier (an unaliased self-join, or
@@ -498,7 +496,6 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 					return c, ts.offset + ts.groupRowidRel, groupRowidColumnInfo, -1, nil
 				}
 				// A later item of the same name may have it (resolveInScopes).
-				qualMiss = true
 			}
 			// No FROM item is named the qualifier; it may be a join group's alias
 			// (tableScope.groupAlias), naming every member. Reached only after the
@@ -515,9 +512,8 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 				}
 				return c, foundOffset + foundIdx, foundCol, -1, nil
 			}
-			if qualMiss {
-				return nil, 0, nil, -1, fmt.Errorf("engine: no such column: %s.%s", qualifier, name)
-			}
+			// Nothing at this level has it: try the enclosing one
+			// (resolveInScopes); the error below reports it once none does.
 			continue
 		}
 		foundIdx, foundOffset := -1, -1
