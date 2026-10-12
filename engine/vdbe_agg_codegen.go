@@ -321,8 +321,11 @@ func compileScanAggregate(c *compiler, stmt *SelectStmt, srcs []joinSource, scop
 	// Finalize + evaluate every output item into the result registers. This
 	// always runs (even when LIMIT 0 / OFFSET>=1 will suppress the row), so any
 	// evaluation error still surfaces.
-	for i := range outCols {
-		c.emit(Instruction{Op: OpAggResult, P1: resultBase + i, P3: -1, P4: &aggResultInfo{plan: plan, set: aggSetOut, idx: i}})
+	if !c.isExistsBody(stmt) {
+		// See isExistsBody: the output list of an EXISTS is never evaluated.
+		for i := range outCols {
+			c.emit(Instruction{Op: OpAggResult, P1: resultBase + i, P3: -1, P4: &aggResultInfo{plan: plan, set: aggSetOut, idx: i}})
+		}
 	}
 	skipRow := (stmt.Offset != nil && *stmt.Offset >= 1) || (stmt.Limit != nil && *stmt.Limit == 0)
 	// HAVING gates the one row, evaluated AFTER the outputs so an evaluation
@@ -2181,8 +2184,11 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// It is emitted twice (at a boundary, and for the final group),
 	// self-contained each time.
 	emitGroup := func() {
-		for i := 0; i < nOut; i++ {
-			c.emit(Instruction{Op: OpAggResult, P1: outBase + i, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetOut, idx: i}})
+		if !c.isExistsBody(stmt) {
+			// See isExistsBody: the output list of an EXISTS is never evaluated.
+			for i := 0; i < nOut; i++ {
+				c.emit(Instruction{Op: OpAggResult, P1: outBase + i, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetOut, idx: i}})
+			}
 		}
 		var skipJumps []int
 		if gp.havingPlan != nil {
@@ -2472,8 +2478,11 @@ func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp
 	sortJump := c.emit(Instruction{Op: OpHashAggSort})
 	drainLoop := c.here()
 	c.emit(Instruction{Op: OpHashAggData, P2: curKeyRec})
-	for i := 0; i < nOut; i++ {
-		c.emit(Instruction{Op: OpAggResult, P1: outBase + i, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetOut, idx: i}})
+	if !c.isExistsBody(stmt) {
+		// See isExistsBody: the output list of an EXISTS is never evaluated.
+		for i := 0; i < nOut; i++ {
+			c.emit(Instruction{Op: OpAggResult, P1: outBase + i, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetOut, idx: i}})
+		}
 	}
 	var skipJumps []int
 	if gp.havingPlan != nil {
@@ -2728,8 +2737,11 @@ func compileNoFromAggregate(pager *ReadOnlyPager, stmt *SelectStmt, outer *compi
 		c.patch(whereJump, c.here())
 	}
 
-	for i := range outCols {
-		c.emit(Instruction{Op: OpAggResult, P1: resultBase + i, P3: -1, P4: &aggResultInfo{plan: plan, set: aggSetOut, idx: i}})
+	if !c.isExistsBody(stmt) {
+		// See isExistsBody: the output list of an EXISTS is never evaluated.
+		for i := range outCols {
+			c.emit(Instruction{Op: OpAggResult, P1: resultBase + i, P3: -1, P4: &aggResultInfo{plan: plan, set: aggSetOut, idx: i}})
+		}
 	}
 	skipRow := (stmt.Offset != nil && *stmt.Offset >= 1) || (stmt.Limit != nil && *stmt.Limit == 0)
 	if !skipRow {

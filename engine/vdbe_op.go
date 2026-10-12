@@ -675,6 +675,15 @@ const (
 	OpGosub
 	OpReturn
 
+	// OpIfEmpty P1, P2: jump to P2 when cursor P1's whole row source is empty
+	// (OP_IfEmpty, vdbe.c). where.c codes it for a third or later inner-join
+	// table before the loops open, and an inner full scan's OP_Rewind jumps to
+	// the outermost loop's end (pLevel->addrHalt), not its own: an empty inner
+	// table ends the join. Here it follows that Rewind too, so it decides only
+	// for a cursor with no seek, filter or stream that could have narrowed what
+	// the Rewind saw, and falls through when it cannot tell.
+	OpIfEmpty
+
 	// OpJIT never appears in a compiled program. vdbe_jit.go puts it, in a
 	// COPY of the program that only run() dispatches on, at each pc where the
 	// VDBE enters the program's native code -- so an instruction with no
@@ -873,6 +882,11 @@ type subCacheEntry struct {
 // non-zero only for a foreign-qualified view or vtab; a CTE is always 0.
 type derivedSource struct {
 	prog *Program
+
+	// lazy defers the rows from OpOpenDerived to the cursor's first rewind
+	// (vdbeCursor.fill): set for a FROM item emitJoinLoops opens, whose loop
+	// is where C materializes it. Every other opener reads the rows at once.
+	lazy bool
 
 	// keepSubtype is joinSource.keepSubtype: the columns whose subtype the
 	// cursor leaves in place (openDerivedCursor).

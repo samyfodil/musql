@@ -1147,7 +1147,12 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 			resolved.Limit = &n
 			resolved.LimitParam = nil
 		}
-		if stmt.OffsetParam != nil {
+		if resolved.Limit != nil && *resolved.Limit == 0 {
+			// computeLimitRegisters leaves for the end on a LIMIT of 0 before
+			// it codes the OFFSET, which is therefore never evaluated.
+			resolved.Offset, resolved.OffsetParam = nil, nil
+		}
+		if resolved.OffsetParam != nil {
 			n, ferr := foldLimitOffsetExpr(p, limitOffsetPseudoRowRefs(stmt.OffsetParam, outer), params)
 			if ferr != nil {
 				return nil, nil, ferr

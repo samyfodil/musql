@@ -150,6 +150,18 @@ type vdbeCursor struct {
 	segSrcCols       []segColPlan  // segSrc.cols, hoisted out of the read path
 	streamErrPending error
 
+	// fill, when non-nil, produces this derived, CTE or virtual-table cursor's
+	// rows on its first rewind rather than at OpOpenDerived. sqlite3WhereBegin
+	// codes a materialization at the top of the loop of the level it belongs to
+	// (the OP_Gosub to addrFillSub, under OP_Once), so a subquery joined after
+	// an empty table, or behind a false constant WHERE term, never runs -- an
+	// error its body would raise is not raised. keepSubtype is the derived
+	// cursor's flattenedSubtypeKeep (see openDerivedCursor); clearSubtypes is
+	// false for a virtual table, whose cursor keeps them.
+	fill          func() ([][]Value, []int64, error)
+	fillKeep      []bool
+	clearSubtypes bool
+
 	// sub, when non-nil, makes this a DERIVED-table cursor whose rows come from
 	// a co-routine (openStreamCursor, vdbe_stream.go) rather than a
 	// materialized row list: each advance resumes the source program for one
@@ -423,9 +435,31 @@ func (cur *vdbeCursor) startSegSource(src *segRowSource) {
 	cur.rowidNull = false
 }
 
+// openFillCursor is a cursor whose rows fill produces on its first rewind; see
+// vdbeCursor.fill. Until then it is unmaterialized, which is what makes a
+// RIGHT JOIN sweep over a level the main pass never reached rewind it first.
+func openFillCursor(tbl *resolvedTable, fill func() ([][]Value, []int64, error), clearSubtypes bool, keep []bool) *vdbeCursor {
+	return &vdbeCursor{tbl: tbl, fill: fill, clearSubtypes: clearSubtypes, fillKeep: keep, colMask: allColumns, pos: -1}
+}
+
 func (cur *vdbeCursor) rewind() error {
 	if cur.sub != nil {
 		return cur.rewindStream()
+	}
+	if cur.fill != nil {
+		fill := cur.fill
+		cur.fill = nil
+		rows, rowids, err := fill()
+		if err != nil {
+			return err
+		}
+		if cur.clearSubtypes {
+			for _, row := range rows {
+				clearDerivedSubtypes(row, cur.fillKeep)
+			}
+		}
+		m := openMaterializedCursor(cur.tbl, rows, rowids)
+		cur.rows, cur.rowids, cur.materialized = m.rows, m.rowids, true
 	}
 	// A columnar view of this table, when one is attached, is served through
 	// ScanTable (segment_read.go) -- so the streaming b-tree cursor is declined

@@ -20,6 +20,7 @@
 package engine
 
 import (
+	"math"
 	"sort"
 )
 
@@ -53,12 +54,34 @@ type compoundProgram struct {
 	collations []string
 	limit      *int64
 	offset     *int64
+	// seqFrom is the first arm of the UNION ALL run that ends the chain with
+	// no ORDER BY: multiSelect (select.c) codes those arms one after another,
+	// each under the LIMIT counter the earlier ones left, so an arm is never
+	// started once the LIMIT is used up. The arms before it are one merge
+	// (multiSelectByMerge), which this port runs in full. len(arms) when an
+	// ORDER BY makes the whole compound a merge.
+	seqFrom int
 	// correlated is true when any ARM bound a column of a query enclosing the
 	// compound (compileCompound threads its caller's compile scope into every
 	// arm). It becomes the wrapper Program's Correlated flag, which is what
 	// makes the caller re-run the whole compound per enclosing row instead of
 	// caching one materialization -- see compileSubProgramCompound.
 	correlated bool
+}
+
+// compoundSeqFrom is compoundProgram.seqFrom for stmt: the first arm after the
+// last operator other than UNION ALL, or every arm with none, or no arm at all
+// under an ORDER BY.
+func compoundSeqFrom(stmt *SelectStmt) int {
+	if len(stmt.OrderBy) != 0 {
+		return len(stmt.Compound) + 1
+	}
+	for j := len(stmt.Compound) - 1; j >= 0; j-- {
+		if stmt.Compound[j].Op != "UNION ALL" {
+			return j + 2
+		}
+	}
+	return 0
 }
 
 // compileCompound compiles stmt (non-empty Compound) into a compoundProgram.
@@ -98,7 +121,26 @@ func compileCompound(pager *ReadOnlyPager, stmt *SelectStmt, outer *compiler) (*
 		defer func() { pager.r41ArmsHeld-- }()
 	}
 
-	firstProg, err := compileSubProgram(pager, &firstCore, outer)
+	seqFrom := compoundSeqFrom(stmt)
+	// The body of an EXISTS: sqlite3CodeSubselect hands sqlite3Select an
+	// SRT_Exists destination, which multiSelect passes on to each arm it codes
+	// one after another, so selectInnerLoop evaluates none of their result
+	// lists and IgnorableDistinct drops their DISTINCT. A merged arm writes to a
+	// co-routine and is evaluated as usual.
+	existsBody := outer != nil && outer.existsStmt == stmt
+	compileArm := func(i int, arm *SelectStmt) (*Program, error) {
+		if !existsBody || i < seqFrom {
+			return compileSubProgram(pager, arm, outer)
+		}
+		cp := *arm
+		cp.Distinct = false
+		saved := outer.existsStmt
+		outer.existsStmt = &cp
+		defer func() { outer.existsStmt = saved }()
+		return compileSubProgram(pager, &cp, outer)
+	}
+
+	firstProg, err := compileArm(0, &firstCore)
 	if err != nil {
 		return nil, err
 	}
@@ -122,11 +164,21 @@ func compileCompound(pager *ReadOnlyPager, stmt *SelectStmt, outer *compiler) (*
 		orderBy:    stmt.OrderBy,
 		limit:      stmt.Limit,
 		offset:     stmt.Offset,
+		seqFrom:    seqFrom,
+	}
+	if existsBody && stmt.LimitParam == nil {
+		// sqlite3CodeSubselect's LIMIT for an EXISTS: 1 when there is none,
+		// else "X<>0", which is 0 for a LIMIT 0 and 1 for any other.
+		one := int64(1)
+		if stmt.Limit != nil && *stmt.Limit == 0 {
+			one = 0
+		}
+		cp.limit = &one
 	}
 	cp.arms = append(cp.arms, firstProg)
 
 	for i, arm := range stmt.Compound {
-		armProg, aerr := compileSubProgram(pager, arm.Stmt, outer)
+		armProg, aerr := compileArm(i+1, arm.Stmt)
 		if aerr != nil {
 			return nil, aerr
 		}
@@ -308,29 +360,50 @@ func (cp *compoundProgram) execOuter(pager *ReadOnlyPager, outer *evalCtx, param
 // so without it an arm in a trigger body found an empty NEW/OLD. nil for
 // ordinary callers.
 func (cp *compoundProgram) execFrom(pager *ReadOnlyPager, params []Value, parent *vdbe, outer *evalCtx, from *vdbe) (cols []string, rows [][]Value, err error) {
-	runArm := func(arm *Program) ([][]Value, error) {
+	runArm := func(arm *Program, maxRows int) ([][]Value, error) {
 		if parent != nil {
-			return arm.execWithParentOn(parent, pager)
+			return arm.execWithParentRun(parent, pager, false, maxRows)
 		}
-		return arm.execOuterTrig(pager, outer, params, from)
+		return arm.execOuterTrigCap(pager, outer, params, from, maxRows)
 	}
 	cols = cp.arms[0].ColNames
 
-	rows, err = runArm(cp.arms[0])
-	if err != nil {
-		return nil, nil, err
+	// computeLimitRegisters: a LIMIT of 0 leaves before any arm runs, and a
+	// positive one bounds the rows the sequential arms may still produce
+	// (OP_OffsetLimit's LIMIT+OFFSET).
+	need := -1
+	if cp.limit != nil {
+		switch lim := *cp.limit; {
+		case lim == 0:
+			return cols, nil, nil
+		case lim > 0:
+			need = int(min(lim, math.MaxInt32))
+			if cp.offset != nil && *cp.offset > 0 {
+				need += int(min(*cp.offset, math.MaxInt32))
+			}
+		}
 	}
 
-	for i, op := range cp.ops {
-		armRows, aerr := runArm(cp.arms[i+1])
+	for i, arm := range cp.arms {
+		capRows := 0
+		if i >= cp.seqFrom && need >= 0 {
+			if capRows = need - len(rows); capRows <= 0 {
+				break
+			}
+		}
+		armRows, aerr := runArm(arm, capRows)
 		if aerr != nil {
 			return nil, nil, aerr
+		}
+		if i == 0 {
+			rows = armRows
+			continue
 		}
 		// cp.collations[i] is column i's collating sequence (compile-time
 		// resolved from the first arm's own output -- compoundColumnCollations,
 		// sql_compound.go), consulted by combineCompound's own dedup
 		// row-equality.
-		rows, err = combineCompound(op, rows, armRows, cp.collations, pager.encoding())
+		rows, err = combineCompound(cp.ops[i-1], rows, armRows, cp.collations, pager.encoding())
 		if err != nil {
 			return nil, nil, err
 		}

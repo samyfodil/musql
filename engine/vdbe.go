@@ -242,6 +242,11 @@ type vdbe struct {
 	// row instead of a copy: all EXISTS asks is whether there is one.
 	firstRow bool
 
+	// maxRows, when positive, stops the run once it has produced that many
+	// result rows: a UNION ALL arm under a LIMIT the earlier arms have nearly
+	// used up (compoundProgram.execFrom).
+	maxRows int
+
 	// accumChecked/accumulates memoize whether this machine's program holds an
 	// opcode that gathers every row before producing any (programAccumulates),
 	// which disqualifies its outermost derived source from streaming.
@@ -776,10 +781,17 @@ func (prog *Program) execOuter(pager *ReadOnlyPager, outer *evalCtx, params []Va
 // trigger row from -- see execTrig. from is nil for every ordinary run, which
 // is byte-for-byte execOuter's old behaviour.
 func (prog *Program) execOuterTrig(pager *ReadOnlyPager, outer *evalCtx, params []Value, from *vdbe) (rows [][]Value, err error) {
+	return prog.execOuterTrigCap(pager, outer, params, from, 0)
+}
+
+// execOuterTrigCap is execOuterTrig stopping after maxRows result rows when
+// maxRows is positive (vdbe.maxRows).
+func (prog *Program) execOuterTrigCap(pager *ReadOnlyPager, outer *evalCtx, params []Value, from *vdbe, maxRows int) (rows [][]Value, err error) {
 	if prog.Compound != nil {
 		return prog.execCompoundBody(pager, outer, params, from)
 	}
 	m := prog.newMachine(pager, outer, params, from)
+	m.maxRows = maxRows
 	// Restore the WITH-clause scope this Program was compiled under, for the
 	// span of its whole run -- see Program.CTEScopeSnapshot's doc comment. A
 	// no-op (nil snapshot) for every Program compiled with no WITH clause in
@@ -863,16 +875,16 @@ func (prog *Program) execWithParentFirst(parent *vdbe) ([][]Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	return prog.execWithParentRun(parent, pager, true)
+	return prog.execWithParentRun(parent, pager, true, 0)
 }
 
 // execWithParentOn is execWithParent over an explicit pager: the parent's own
 // for every ordinary body, the fresh image liveLower built for a live one.
 func (prog *Program) execWithParentOn(parent *vdbe, pager *ReadOnlyPager) (rows [][]Value, err error) {
-	return prog.execWithParentRun(parent, pager, false)
+	return prog.execWithParentRun(parent, pager, false, 0)
 }
 
-func (prog *Program) execWithParentRun(parent *vdbe, pager *ReadOnlyPager, firstRow bool) (rows [][]Value, err error) {
+func (prog *Program) execWithParentRun(parent *vdbe, pager *ReadOnlyPager, firstRow bool, maxRows int) (rows [][]Value, err error) {
 	if prog.Compound != nil {
 		// A compound has no machine of its own -- its arms ARE the frames --
 		// so the parent is handed to each arm directly rather than wrapped in
@@ -901,6 +913,7 @@ func (prog *Program) execWithParentRun(parent *vdbe, pager *ReadOnlyPager, first
 	m.subCache = reuseSubCache(m.subCache, prog.NSubCache)
 	m.pager, m.params, m.parent, m.outer = pager, parent.params, parent, outerCtx
 	m.firstRow = firstRow
+	m.maxRows = maxRows
 	// The four pseudo-rows travel down here exactly as they do in
 	// execOuterTrig above, and for the identical reason: OpParam reads them off
 	// the RUNNING machine, not off a frame, so a sub-program invoked through
@@ -961,7 +974,7 @@ func (prog *Program) outerCtxUnread() bool {
 	unread := true
 	for i := range prog.Insns {
 		switch prog.Insns[i].Op {
-		case OpInit, OpOpenRead, OpRewind, OpNext, OpClose, OpHalt, OpGoto,
+		case OpInit, OpOpenRead, OpRewind, OpNext, OpIfEmpty, OpClose, OpHalt, OpGoto,
 			OpColumn, OpRowid, OpOuterColumn, OpOuterRowid,
 			OpInteger, OpVariable, OpNull, OpString8, OpReal, OpSCopy, OpCopy,
 			OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull,
@@ -1237,6 +1250,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			row := make([]Value, op.P2)
 			copy(row, m.regs[op.P1:op.P1+op.P2])
 			rows = append(rows, row)
+			if m.maxRows > 0 && len(rows) >= m.maxRows {
+				return rows, nil
+			}
 			if m.yield {
 				// OP_Yield: hand this row to the consumer and resume after it.
 				m.resumePC = pc + 1
@@ -1761,11 +1777,15 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 					m.cursors[op.P1] = openMaterializedCursor(ds.tbl, rows, rowids)
 					break
 				}
-				rows, rowids, verr := m.runVtabOnce(op.P2, ds, dsPager)
-				if verr != nil {
-					return nil, verr
+				slot := op.P2
+				m.cursors[op.P1] = openFillCursor(ds.tbl, func() ([][]Value, []int64, error) {
+					return m.runVtabOnce(slot, ds, dsPager)
+				}, false, nil)
+				if !ds.lazy {
+					if ferr := m.cursors[op.P1].rewind(); ferr != nil {
+						return nil, ferr
+					}
 				}
-				m.cursors[op.P1] = openMaterializedCursor(ds.tbl, rows, rowids)
 				break
 			}
 			if ds.recSelf != nil {
@@ -1777,11 +1797,16 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				break
 			}
 			if ds.cte != nil {
-				rows, cerr := m.runCTEOnce(op.P2, ds, dsPager)
-				if cerr != nil {
-					return nil, cerr
+				slot := op.P2
+				m.cursors[op.P1] = openFillCursor(ds.tbl, func() ([][]Value, []int64, error) {
+					rows, err := m.runCTEOnce(slot, ds, dsPager)
+					return rows, nil, err
+				}, true, ds.keepSubtype)
+				if !ds.lazy {
+					if ferr := m.cursors[op.P1].rewind(); ferr != nil {
+						return nil, ferr
+					}
 				}
-				m.cursors[op.P1] = openDerivedCursor(ds.tbl, rows, ds.keepSubtype)
 				break
 			}
 			srcPager := ds.pager
@@ -1792,6 +1817,25 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				// A co-routine rather than a materialization: see subStream
 				// (vdbe_stream.go) and derivedSource.stream.
 				m.cursors[op.P1] = openStreamCursor(ds.tbl, m.newSubStream(ds, srcPager))
+				break
+			}
+			if ds.upfrom == nil && ds.viewUpfrom == nil && (!ds.prog.Correlated || srcPager == m.pager) {
+				// Materialized on the first rewind, at the top of its own loop
+				// (vdbeCursor.fill).
+				slot, prog := op.P2, ds.prog
+				m.cursors[op.P1] = openFillCursor(ds.tbl, func() ([][]Value, []int64, error) {
+					if !prog.Correlated {
+						rows, err := m.runSubOnce(slot, prog, srcPager)
+						return rows, nil, err
+					}
+					rows, err := prog.execWithParent(m)
+					return rows, nil, err
+				}, true, ds.keepSubtype)
+				if !ds.lazy {
+					if ferr := m.cursors[op.P1].rewind(); ferr != nil {
+						return nil, ferr
+					}
+				}
 				break
 			}
 			var rows [][]Value
@@ -1845,6 +1889,24 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				break
 			}
 			m.cursors[op.P1] = openDerivedCursor(ds.tbl, rows, ds.keepSubtype)
+
+		case OpIfEmpty:
+			cur := m.cursors[op.P1]
+			if cur == nil || cur.rowStore != nil || cur.sub != nil || cur.streamable || cur.seekConfigured ||
+				cur.idxSeekConfigured || cur.seekReseek || cur.segFilter != nil {
+				break
+			}
+			cur.params = m.params
+			if rerr := cur.rewind(); rerr != nil {
+				return nil, rerr
+			}
+			if !cur.advance() {
+				if cur.streamErrPending != nil {
+					return nil, cur.streamErrPending
+				}
+				pc = op.P2
+				continue
+			}
 
 		case OpRewind:
 			cur := m.cursors[op.P1]
