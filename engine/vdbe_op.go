@@ -114,7 +114,7 @@ const (
 	// OP_Affinity/OP_RealAffinity -- distinct from the comparison-time,
 	// non-mutating coercion the comparison opcodes apply via their P5 affinity
 	// byte. OpCast likewise mutates r[P1] in place (SQLite's OP_Cast).
-	OpAffinity     // P1, P4(affinity): r[P1] = applyAffinity(r[P1], P4).
+	OpAffinity     // P1, P4(affinity): r[P1] = applyAffinity(r[P1], P4). With P4 a []affinity, r[P1+i] takes P4[i] for each of P2.
 	OpRealAffinity // P1: if r[P1] is an integer, convert it to REAL in place.
 	OpCast         // P1, P4(string type): r[P1] = CAST(r[P1] AS P4).
 

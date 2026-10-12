@@ -155,6 +155,13 @@ type Conn struct {
 	// bounded because a connection issues finitely many DISTINCT statements
 	// (database/sql prepares and reuses them). See plainDML.
 	plainStmts map[string]bool
+	// lastPlainText/lastPlain are plainDML's answer for the statement asked
+	// about last: a prepared statement run in a loop asks five times a call,
+	// and comparing the same string is a pointer compare where the map hashes
+	// the whole text each time. The same holds for lastTempText/lastTemp,
+	// engine.StatementOpensTempDatabase's answer.
+	lastPlainText, lastTempText string
+	lastPlain, lastTemp         bool
 
 	// timeDeclType and loc are the DSN opt-in for mattn/go-sqlite3's one type
 	// coercion: "?_time_decltype=1" makes a result column whose DECLARED type is
@@ -795,7 +802,16 @@ func (c *Conn) execArgs(sqlText string, args []engine.Value) (driver.Result, err
 	if derr := c.deferFKPragmaGuard(sqlText); derr != nil {
 		return nil, derr
 	}
+	// The rest in execArgsBody, so this function has few returns and its one
+	// defer is compiled inline: the runtime's deferred-call bookkeeping was a
+	// measurable share of a prepared INSERT's time.
 	defer c.deferFKPragmaApply(sqlText)
+	return c.execArgsBody(sqlText, args)
+}
+
+// execArgsBody is execArgs once the session is held and the
+// defer_foreign_keys guard has passed.
+func (c *Conn) execArgsBody(sqlText string, args []engine.Value) (driver.Result, error) {
 	if serr := c.schemaCorruptRefuses(sqlText); serr != nil {
 		return nil, serr
 	}
@@ -803,7 +819,7 @@ func (c *Conn) execArgs(sqlText string, args []engine.Value) (driver.Result, err
 	// and database/sql routes a row-less caller here whatever the SQL is -- so
 	// this path notices it too. See queryArgs' identical note and
 	// Conn.tempOpened.
-	if !c.tempOpened && engine.StatementOpensTempDatabase(sqlText) {
+	if !c.tempOpened && c.opensTempDatabase(sqlText) {
 		c.tempOpened = true
 	}
 	// "EXPLAIN <stmt>" describes a statement's program and runs nothing, so it
@@ -2694,15 +2710,29 @@ func (t *Tx) rollbackImpl() error {
 // classifiable is "not plain", which just runs the checks; only the verdict is
 // cached, since the handlers execute when they match.
 func (c *Conn) plainDML(sqlText string) bool {
-	if plain, ok := c.plainStmts[sqlText]; ok {
-		return plain
+	if sqlText == c.lastPlainText && sqlText != "" {
+		return c.lastPlain
 	}
-	plain := isPlainDMLText(sqlText)
-	if c.plainStmts == nil {
-		c.plainStmts = make(map[string]bool)
+	plain, ok := c.plainStmts[sqlText]
+	if !ok {
+		plain = isPlainDMLText(sqlText)
+		if c.plainStmts == nil {
+			c.plainStmts = make(map[string]bool)
+		}
+		c.plainStmts[sqlText] = plain
 	}
-	c.plainStmts[sqlText] = plain
+	c.lastPlainText, c.lastPlain = sqlText, plain
 	return plain
+}
+
+// opensTempDatabase is engine.StatementOpensTempDatabase, remembered for the
+// statement asked about last: a pure function of the text.
+func (c *Conn) opensTempDatabase(sqlText string) bool {
+	if sqlText == c.lastTempText && sqlText != "" {
+		return c.lastTemp
+	}
+	c.lastTempText, c.lastTemp = sqlText, engine.StatementOpensTempDatabase(sqlText)
+	return c.lastTemp
 }
 
 // isPlainDMLText decides plainDML's question from the statement's FIRST WORD

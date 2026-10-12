@@ -2118,6 +2118,16 @@ func (db *DB) ExecArgs(sqlText string, args []Value) (rowsAffected int64, lastIn
 			db.journalDDL(sqlText, logMark)
 		}
 	}()
+	// One return here and the statement's own in execArgsBody: a function
+	// whose returns times defers stays small gets its defers compiled inline,
+	// and this one runs for every statement -- the runtime's deferred-call
+	// bookkeeping was a twentieth of a prepared INSERT's time.
+	rowsAffected, lastInsertID, err = db.execArgsBody(sqlText, args)
+	return rowsAffected, lastInsertID, err
+}
+
+// execArgsBody is ExecArgs after its outermost bookkeeping.
+func (db *DB) execArgsBody(sqlText string, args []Value) (rowsAffected int64, lastInsertID int64, err error) {
 	// "EXPLAIN <stmt>" runs nothing and belongs on the query side; like
 	// sqlite3_exec, step the description and discard it (explain.go). The
 	// driver routes EXPLAIN itself, but engine-direct callers (the corpus)

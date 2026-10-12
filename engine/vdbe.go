@@ -1487,6 +1487,15 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			m.regs[op.P2] = bitNotValueUnary(m.regs[op.P1])
 
 		case OpAffinity:
+			if affs, ok := op.P4.([]affinity); ok {
+				// The range form: r[P1+i] takes affs[i] (P2 of them).
+				for i, aff := range affs {
+					if r := op.P1 + i; !affinityIsIdentity(m.regs[r].Typ, aff) {
+						m.regs[r] = applyAffinityToValue(m.regs[r], aff)
+					}
+				}
+				break
+			}
 			if aff := op.P4.(affinity); !affinityIsIdentity(m.regs[op.P1].Typ, aff) {
 				m.regs[op.P1] = applyAffinityToValue(m.regs[op.P1], aff)
 			}

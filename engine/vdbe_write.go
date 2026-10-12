@@ -350,8 +350,16 @@ func (db *DB) cachedWriteProgram(sqlText string) (*Program, error) {
 		db.writePlanCookie, db.writePlanTxGen = db.schemaGen, db.txGen
 		db.writePlanStat1 = db.planStats()
 		db.writePlanReverse = reverse
+		db.lastWritePlanText, db.lastWritePlan = "", nil
+	}
+	// The statement run last, again -- a prepared INSERT in a loop -- is the
+	// same string, which compares without hashing it. Only a program the map
+	// holds is remembered, so the cache's own invalidation above covers it.
+	if db.lastWritePlan != nil && sqlText == db.lastWritePlanText {
+		return db.lastWritePlan, nil
 	}
 	if p, ok := db.writePlans[sqlText]; ok {
+		db.lastWritePlanText, db.lastWritePlan = sqlText, p
 		return p, nil
 	}
 	p, err := db.compileWrite(sqlText)
@@ -479,6 +487,14 @@ func (db *DB) runWrite(prog *Program, args []Value) (rowsAffected int64, err err
 	m.recChunk, m.recChunkSize = db.writeRecChunk, db.writeRecChunkSize
 	db.writeRecChunk, db.writeRecChunkSize = nil, 0
 	defer func() { db.writeRecChunk, db.writeRecChunkSize = m.recChunk, m.recChunkSize }()
+	// One return, for the same reason as ExecArgs': these three defers and the
+	// statement's two in runWriteBody are then all compiled inline.
+	rowsAffected, err = db.runWriteBody(prog, args, m, wc)
+	return rowsAffected, err
+}
+
+// runWriteBody is runWrite once the machine and statement context are taken.
+func (db *DB) runWriteBody(prog *Program, args []Value, m *vdbe, wc *writeCtx) (rowsAffected int64, err error) {
 	m.sorters = make([]*vdbeSorter, prog.NSorters)
 	m.distinctSets = make([]*vdbeDistinctSet, prog.NDistinct)
 	m.subCache = make([]subCacheEntry, prog.NSubCache)
@@ -1134,11 +1150,23 @@ func (db *DB) compileInsertStmt(stmt *insertStmt, trig *trigCompileCtx) (*Progra
 		base := c.allocN(len(tbl.cols))
 		regOf := make([]int, len(rowExprs))
 		for i, re := range rowExprs {
+			at := c.here()
 			r, cerr := c.compileExpr(re)
 			if cerr != nil {
 				return nil, cerr
 			}
 			regOf[i] = r
+			// A bare parameter is read straight into its column's register, as
+			// C codes it (sqlite3ExprCodeTarget's target): the copy
+			// emitInsertRowBody would make from a register of its own, and the
+			// NULL it would clear the column with first, go. Only when exactly
+			// one column takes the value; the register is fresh (ParamExpr's
+			// compile allocates one), so nothing else reads it.
+			if col := soleColumnOf(slotOf, i); col >= 0 && c.here() == at+1 &&
+				c.insns[at].Op == OpVariable && c.insns[at].P2 == r && !tbl.cols[col].IsGenerated() {
+				c.insns[at].P2 = base + col
+				regOf[i] = base + col
+			}
 		}
 		var rowPlans []*triggerFirePlan  // per-row plan copies whose skipAddr = this row's end
 		var rowInsertPlans []*insertPlan // ditto for OpInsert's OE_Ignore jump
@@ -4647,7 +4675,8 @@ func (c *compiler) emitUpdateNotNull(tbl *tableMeta, stmt *updateStmt, colIdx []
 // emitInsertRowBody emits the per-row instruction sequence shared by the VALUES
 // and SELECT sources: place the row's values into their column slots, apply
 // affinity, enforce NOT NULL and CHECK, choose the rowid, and store the record.
-// regOf[i] is the register holding source value i.
+// regOf[i] is the register holding source value i -- which may be its column's
+// own register, base+col, when the value was computed there.
 func (c *compiler) emitInsertRowBody(db *DB, tbl *tableMeta, stmt *insertStmt, plan *insertPlan, slotOf []int, rowidSlot int, regOf []int, base, rowidReg, recReg int, tail func() error) error {
 	// skips collects every "this row is IGNOREd, skip it" jump; they are patched
 	// to the instruction right after OpInsert (the next VALUES tuple, or the
@@ -4662,10 +4691,16 @@ func (c *compiler) emitInsertRowBody(db *DB, tbl *tableMeta, stmt *insertStmt, p
 	replaceSubstituted := false
 
 	for i := range tbl.cols {
+		// A column given a value needs no NULL first: the copy below
+		// overwrites it, with nothing reading it in between, or the value was
+		// computed into the column's register already.
+		if i < len(slotOf) && slotOf[i] >= 0 {
+			continue
+		}
 		c.emit(Instruction{Op: OpNull, P2: base + i})
 	}
 	for col, srcIdx := range slotOf {
-		if srcIdx >= 0 {
+		if srcIdx >= 0 && regOf[srcIdx] != base+col {
 			c.emit(Instruction{Op: OpSCopy, P1: regOf[srcIdx], P2: base + col})
 		}
 	}
@@ -4693,8 +4728,17 @@ func (c *compiler) emitInsertRowBody(db *DB, tbl *tableMeta, stmt *insertStmt, p
 			c.emit(Instruction{Op: OpSCopy, P1: reg, P2: base + i})
 		}
 	}
-	for i, col := range tbl.cols {
-		c.emit(Instruction{Op: OpAffinity, P1: base + i, P4: col.Aff})
+	// One instruction for the row's columns, as C's OP_Affinity takes its
+	// affinity string (sqlite3TableAffinity): a dispatch a column was most of
+	// what each cost, the value usually being of its column's type already.
+	if len(tbl.cols) == 1 {
+		c.emit(Instruction{Op: OpAffinity, P1: base, P4: tbl.cols[0].Aff})
+	} else if len(tbl.cols) > 1 {
+		affs := make([]affinity, len(tbl.cols))
+		for i, col := range tbl.cols {
+			affs[i] = col.Aff
+		}
+		c.emit(Instruction{Op: OpAffinity, P1: base, P2: len(affs), P4: affs})
 	}
 	// Generated columns are derived once the supplied values are in place and
 	// affinity-coerced, and BEFORE the NOT NULL / CHECK enforcement and
@@ -4952,4 +4996,20 @@ func (wc *writeCtx) undoDrop(tbl *tableMeta, rid uint64) {
 // oldVals back at oldRid.
 func (wc *writeCtx) undoMove(tbl *tableMeta, newRid, oldRid uint64, oldVals []Value) {
 	wc.journalAppend(undoEntry{tbl: tbl, dropRid: newRid, drop: true, putRid: oldRid, putVals: oldVals, put: true})
+}
+
+// soleColumnOf is the one column slotOf maps to source value i, or -1 when none
+// or several do.
+func soleColumnOf(slotOf []int, i int) int {
+	col := -1
+	for j, src := range slotOf {
+		if src != i {
+			continue
+		}
+		if col >= 0 {
+			return -1
+		}
+		col = j
+	}
+	return col
 }
