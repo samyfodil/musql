@@ -56,7 +56,7 @@ import (
 // expression (update.c:258-262), over sqlite3SrcListDup(pTabList) with the
 // statement's WHERE (update.c:222-223). compileViewUpdateFromSource builds the
 // same shape by hand and must never build a different join.
-func buildUpdateFromSelect(stmt *updateStmt, tbl *tableMeta) (*SelectStmt, int, error) {
+func buildUpdateFromSelect(stmt *updateStmt, tbl *tableMeta, lookup func(FromItem) updateFromSource) (*SelectStmt, int, error) {
 	// An "AS alias" on the target renames it for this synthetic SELECT too --
 	// the user's own WHERE/SET expressions were written against the alias
 	// (see parseWriteTargetSuffix, write_update_delete.go), so the FROM item
@@ -106,6 +106,7 @@ func buildUpdateFromSelect(stmt *updateStmt, tbl *tableMeta) (*SelectStmt, int, 
 	// ambiguous when the rewrite names its columns, so C rejects the statement
 	// even though a plain SELECT over the same list is fine.
 	seenNames := map[string]bool{}
+	pinKey := false
 	for _, it := range from {
 		name := it.Alias
 		if name == "" && it.Subquery == nil {
@@ -116,7 +117,15 @@ func buildUpdateFromSelect(stmt *updateStmt, tbl *tableMeta) (*SelectStmt, int, 
 		}
 		folded := r33sFoldIdent(name)
 		if seenNames[folded] {
-			return nil, 0, semanticf("engine: ambiguous column name: %s", name)
+			if lookup == nil {
+				return nil, 0, semanticf("engine: ambiguous column name: %s", name)
+			}
+			if err := updateFromDupError(stmt, tbl, targetName, lookup); err != nil {
+				return nil, 0, err
+			}
+			// Legal (a different table under the target's alias): the target's
+			// key is read by position, as its name no longer singles it out.
+			pinKey = true
 		}
 		seenNames[folded] = true
 	}
@@ -125,6 +134,13 @@ func buildUpdateFromSelect(stmt *updateStmt, tbl *tableMeta) (*SelectStmt, int, 
 	// data WHERE a=k" names the CTE as a FROM SOURCE (upfrom2.test 1.x.1), so
 	// the CTE definitions ride on the synthetic SELECT, which is where
 	// execSelect pushes them (query.go).
+	if pinKey {
+		for i := range keyCols {
+			ce := keyCols[i].(ColumnExpr)
+			ce.Qualifier, ce.UsingPinned, ce.UsingPinnedItem = "", true, len(from)-1
+			cols[i].Expr = ce
+		}
+	}
 	joinCTEs, cerr := writeJoinCTEs(stmt.ctes, tbl.name, stmt.table, stmt.sets, stmt.where)
 	if cerr != nil {
 		return nil, 0, cerr

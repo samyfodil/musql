@@ -2500,6 +2500,7 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 	}
 
 	if x.Qualifier != "" {
+		qualMiss := false
 		for i, s := range scopes {
 			if !equalFoldName(s.name, x.Qualifier) {
 				continue
@@ -2575,6 +2576,12 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 			if isRowidAliasName(x.Name) && s.groupMemberRowid {
 				return 0, 0, false, false, fb, fmt.Errorf("%w: %s of a member of a nested parenthesized join group", errVDBEUnsupported, x.Name)
 			}
+			// A later FROM item of the same name may have the column: lookupName
+			// tries every item the qualifier names (resolve.c:410-450), as when
+			// "UPDATE t AS x ... FROM s AS x" reads x.v from t and x.w from s.
+			qualMiss = true
+		}
+		if qualMiss {
 			// resolve.c:785-796 builds the message from the parts the reference was
 			// WRITTEN with: "%s.%s.%s" when a schema was named, "%s.%s" with a table,
 			// "%s" bare. Dropping the qualifier here made "SELECT t.nosuch FROM t"

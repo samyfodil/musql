@@ -412,6 +412,9 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 		ts := ctx.tables[ce.UsingPinnedItem]
 		colIdx, ok := ts.colIndex[lname]
 		if !ok {
+			if isRowidAliasName(lname) && !ts.noRowid {
+				return ctx, 0, rowidColumnInfo, ce.UsingPinnedItem, nil
+			}
 			return nil, 0, nil, -1, fmt.Errorf("engine: no such column: %s", name)
 		}
 		foundOffset, foundIdx := ts.offset, colIdx
@@ -423,6 +426,7 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 	}
 	for c := ctx; c != nil; c = c.outer {
 		if qualifier != "" {
+			qualMiss := false
 			for i, ts := range c.tables {
 				if !equalFoldName(ts.name, qualifier) {
 					continue
@@ -479,6 +483,10 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 					}
 					return c, ts.offset + ts.groupRowidRel, groupRowidColumnInfo, -1, nil
 				}
+				// A later item of the same name may have it (resolveInScopes).
+				qualMiss = true
+			}
+			if qualMiss {
 				return nil, 0, nil, -1, fmt.Errorf("engine: no such column: %s.%s", qualifier, name)
 			}
 			// No FROM item is named the qualifier; it may be a join group's alias

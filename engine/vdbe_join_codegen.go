@@ -2449,8 +2449,13 @@ func (p *ReadOnlyPager) finishGroupSource(c *compiler, state *joinDesugarState, 
 	// reference from OUTSIDE the group must consult, exactly like an
 	// ordinary item's tableScope.coalesced.
 	memberScopes[0].coalesced = hidden
-	for k := 1; k < len(memberScopes); k++ {
-		memberScopes[k].usingSkip = hidden
+	for k := range memberScopes {
+		if k > 0 {
+			memberScopes[k].usingSkip = hidden
+		}
+		// The join kinds the members had inside the group belong to its own
+		// level; resolveJoinSources stamps the group's own on member 0.
+		memberScopes[k].joinRight, memberScopes[k].joinFull = false, false
 	}
 
 	// Members reached through a nested connector carry that nested group's alias
