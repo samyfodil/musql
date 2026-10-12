@@ -500,6 +500,7 @@ func (db *DB) runWriteBody(prog *Program, args []Value, m *vdbe, wc *writeCtx) (
 	m.subCache = make([]subCacheEntry, prog.NSubCache)
 	m.params = args
 	m.wctx = wc
+	m.jx = prog.writeJIT()
 	m.pager = prog.WritePager // subqueries read this snapshot (nil if none)
 	if prog.FreshWritePager {
 		// A cached program's subqueries read the image as it is now, as a
