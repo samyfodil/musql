@@ -37,9 +37,9 @@ func TestMatchPrepareTimeVsPerRow(t *testing.T) {
 			`SELECT * FROM plain WHERE a MATCH b`, false},
 		{"a select-list MATCH over no rows", []string{`CREATE TABLE plain(a,b)`},
 			`SELECT a MATCH 'x' FROM plain`, false},
-		// LIMIT 0 short-circuits in C but not in this engine
-		{"limit 0 short-circuits in C only", []string{`CREATE TABLE plain(a,b)`, `INSERT INTO plain VALUES(1,'x')`},
-			`SELECT * FROM plain WHERE a MATCH 'x' LIMIT 0`, true},
+		// LIMIT 0 leaves the select before any WHERE term runs, in C and here
+		{"limit 0 short-circuits", []string{`CREATE TABLE plain(a,b)`, `INSERT INTO plain VALUES(1,'x')`},
+			`SELECT * FROM plain WHERE a MATCH 'x' LIMIT 0`, false},
 	}
 	for ci, tc := range cases {
 		ci, tc := ci, tc
