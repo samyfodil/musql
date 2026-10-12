@@ -219,6 +219,81 @@ const (
 	vecClassSpace
 )
 
+// vecFastAtoF is sqliteAtoF for the numbers a vector's text is made of -- an
+// optional sign, digits with at most one '.', an optional exponent of at most
+// four digits, nothing else -- with at most 18 significant digits, which
+// sqliteAtoF accumulates without the truncation it applies past 19: both then
+// hand sqliteFp10Convert2 the same exact value, and so get the same double.
+// false for anything else, which sqliteAtoF then parses as before.
+func vecFastAtoF(num []byte) (float64, bool) {
+	i, neg := 0, false
+	if i < len(num) && (num[i] == '-' || num[i] == '+') {
+		neg = num[i] == '-'
+		i++
+	}
+	var d uint64
+	p, sig, digits := 0, 0, 0
+	dot := false
+	for ; i < len(num); i++ {
+		c := num[i]
+		if c == '.' {
+			if dot {
+				return 0, false
+			}
+			dot = true
+			continue
+		}
+		if c < '0' || c > '9' {
+			break
+		}
+		digits++
+		if d != 0 || c != '0' {
+			if sig++; sig > 18 {
+				return 0, false
+			}
+		}
+		d = d*10 + uint64(c-'0')
+		if dot {
+			p--
+		}
+	}
+	if digits == 0 {
+		return 0, false
+	}
+	if i < len(num) {
+		if c := num[i]; c != 'e' && c != 'E' {
+			return 0, false
+		}
+		i++
+		esign := 1
+		if i < len(num) && (num[i] == '-' || num[i] == '+') {
+			if num[i] == '-' {
+				esign = -1
+			}
+			i++
+		}
+		exp, ed := 0, 0
+		for ; i < len(num) && num[i] >= '0' && num[i] <= '9'; i++ {
+			if ed++; ed > 4 {
+				return 0, false
+			}
+			exp = exp*10 + int(num[i]-'0')
+		}
+		if ed == 0 || i != len(num) {
+			return 0, false
+		}
+		p += esign * exp
+	}
+	var r float64
+	if d != 0 {
+		r = sqliteFp10Convert2(d, p)
+	}
+	if neg {
+		r = -r
+	}
+	return r, true
+}
+
 func parseVectorText(s []byte, t vecType) (vector, error) {
 	i := 0
 	skip := func() {
@@ -283,7 +358,11 @@ func parseVectorText(s []byte, t vecType) (vector, error) {
 		if e == len(s) || s[e] == 0 || (s[e] == ']' && n == 0 && len(num) == 0) {
 			break // unterminated (reported below), or '[]'
 		}
-		x, rc := sqliteAtoF(num)
+		x, ok := vecFastAtoF(num)
+		rc := int32(1)
+		if !ok {
+			x, rc = sqliteAtoF(num)
+		}
 		if rc <= 0 {
 			return vector{}, vecErr("vector: invalid float at position %d: '%s'", n, num)
 		}
