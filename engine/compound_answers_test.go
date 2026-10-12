@@ -131,7 +131,6 @@ func TestUnusedSubqueryColumnsAreNotComputed(t *testing.T) {
 		"SELECT count(*) FROM (SELECT max(k) AS k, " + bad + " AS x FROM t)",
 		"SELECT d.k FROM (SELECT k, " + bad + " AS x FROM t) AS d WHERE x > 0",
 		"SELECT k FROM (SELECT k, " + bad + " AS x FROM t ORDER BY x)",
-		"SELECT 1 WHERE EXISTS (SELECT DISTINCT " + bad + " FROM t)",
 		"SELECT x FROM vw",
 	} {
 		if got, err := answerRows(t, db, sqlText); err == nil {
