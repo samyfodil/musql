@@ -119,7 +119,7 @@ func hitTargetKey(tbl *tableMeta, hit conflictHit) string {
 // row first, so there is no exclude parameter.
 func findRowConflicts(db *DB, tbl *tableMeta, candidateRowid uint64, candidateFull []Value) []conflictHit {
 	var hits []conflictHit
-	if _, exists := tbl.rows.get(candidateRowid); exists {
+	if tbl.rows.has(candidateRowid) { // existence only: no row decoded
 		hits = append(hits, conflictHit{rowid: candidateRowid, target: []string{"rowid"}})
 	}
 	// db.indexes is append-only, so it holds a table's indexes oldest

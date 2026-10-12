@@ -368,6 +368,12 @@ func (s *rowStore) has(rowid uint64) bool {
 	if _, ok := s.m[rowid]; ok {
 		return true
 	}
+	// Past the largest rowid, when that is known, nothing is there: an
+	// INSERT's rowid-conflict probe with the next rowid answers without a
+	// segment search.
+	if s.maxKnown && rowidLess(s.max, rowid) {
+		return false
+	}
 	if s.seg == nil || s.baseGone || s.gone[rowid] {
 		return false
 	}
