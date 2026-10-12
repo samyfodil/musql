@@ -2724,14 +2724,40 @@ func isASCIISpace(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\r' || c == '\n'
 }
 
-// containsFold is a case-insensitive strings.Contains for an ASCII needle.
+// containsFold is a case-insensitive strings.Contains for an ASCII needle
+// whose first byte is an upper-case letter. Candidates are found with
+// IndexByte, which scans a block at a time, for each case of the first byte:
+// a byte-at-a-time loop cost 4 ns a byte, and a statement can be megabytes
+// of literal text.
 func containsFold(hay, needle string) bool {
-	if len(needle) > len(hay) {
-		return false
+	if len(needle) == 0 {
+		return true
 	}
-	for i := 0; i+len(needle) <= len(hay); i++ {
+	up, lo := needle[0], needle[0]|0x20
+	// The next position of each case at or after i, -1 for none left; each is
+	// searched again only once i has passed it, so the scan stays linear.
+	next := func(c byte, from int) int {
+		if k := strings.IndexByte(hay[from:], c); k >= 0 {
+			return from + k
+		}
+		return -1
+	}
+	u, l := next(up, 0), next(lo, 0)
+	for {
+		var i int
+		switch {
+		case u < 0 && l < 0:
+			return false
+		case u < 0 || (l >= 0 && l < u):
+			i = l
+		default:
+			i = u
+		}
+		if i+len(needle) > len(hay) {
+			return false
+		}
 		match := true
-		for j := 0; j < len(needle); j++ {
+		for j := 1; j < len(needle); j++ {
 			c := hay[i+j]
 			if c >= 'a' && c <= 'z' {
 				c -= 32
@@ -2744,8 +2770,12 @@ func containsFold(hay, needle string) bool {
 		if match {
 			return true
 		}
+		if i == u {
+			u = next(up, i+1)
+		} else {
+			l = next(lo, i+1)
+		}
 	}
-	return false
 }
 
 // finishAutocommit commits or discards one autocommit session given the
