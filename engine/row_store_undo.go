@@ -65,6 +65,7 @@ func (s *rowStore) undoTo(mark int) {
 		case u.segClear:
 			s.m, s.gone, s.baseGone, s.n, s.nKnown = u.prior, u.priorGone, u.priorBaseGone, u.priorN, u.priorNKnown
 			s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false
+			s.ubKnown = false
 			s.overValid, s.memBytes = false, 0 // the prior map's in-memory share is not known
 			s.unspilt = nil
 			s.rangeKnown = false
@@ -73,6 +74,7 @@ func (s *rowStore) undoTo(mark int) {
 		case u.prior != nil:
 			s.m = u.prior
 			s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false
+			s.ubKnown = false
 			s.overValid, s.memBytes = false, 0 // the prior map's in-memory share is not known
 			s.unspilt = nil
 			s.rangeKnown = false

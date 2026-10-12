@@ -25,6 +25,15 @@ type rowStore struct {
 	max      uint64
 	maxKnown bool
 
+	// ub is an UPPER BOUND on every rowid the store holds, while ubKnown:
+	// raised by every put, left alone by a drop (still a bound), and dropped
+	// only where rows can come back without a put (clear, an undo that
+	// restores a whole map). has() answers "past ub" without a lookup --
+	// an INSERT's rowid-conflict probe for rows appended in order, a map
+	// lookup per row that otherwise missed every time.
+	ub      uint64
+	ubKnown bool
+
 	// rangeMax caches the largest rowid in [rangeLo, rangeHi) for per-range
 	// rowid allocation (replication's per-site ranges).
 	rangeLo, rangeHi, rangeMax uint64
@@ -174,6 +183,9 @@ func (s *rowStore) put(rowid uint64, vals []Value) {
 	if s.maxKnown && rowidLess(s.max, rowid) {
 		s.max = rowid
 	}
+	if s.ubKnown && rowidLess(s.ub, rowid) {
+		s.ub = rowid
+	}
 	if s.rangeKnown && rowid >= s.rangeLo && rowid < s.rangeHi && (!s.rangeHas || rowid > s.rangeMax) {
 		s.rangeMax, s.rangeHas = rowid, true
 	}
@@ -196,6 +208,7 @@ func (s *rowStore) clear() int64 {
 		}
 		s.m, s.gone, s.baseGone, s.n, s.nKnown = map[uint64][]Value{}, nil, true, 0, true
 		s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false
+		s.ubKnown = false
 		s.overValid, s.memBytes, s.unspilt = false, 0, nil
 		s.rangeKnown = false
 		s.invalidateEqIndexes()
@@ -209,6 +222,7 @@ func (s *rowStore) clear() int64 {
 	}
 	s.m = map[uint64][]Value{}
 	s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false
+	s.ubKnown = false
 	s.overValid, s.memBytes, s.unspilt = false, 0, nil
 	s.rangeKnown = false
 	s.invalidateEqIndexes()

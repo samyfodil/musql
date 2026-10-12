@@ -448,11 +448,16 @@ func (s *rowStore) segMaxRowid() (uint64, bool) {
 		}
 	}
 	if !s.baseGone {
-		s.seg.walkRowids(func(rid uint64) bool {
-			if !s.gone[rid] && (!found || rowidLess(max, rid)) {
+		// From the top down: the first base rowid not deleted is the base's
+		// largest, so this stops there instead of walking every row.
+		s.seg.walkRowidsDesc(func(rid uint64) bool {
+			if s.gone[rid] {
+				return true
+			}
+			if !found || rowidLess(max, rid) {
 				max, found = rid, true
 			}
-			return true
+			return false
 		})
 	}
 	return max, found

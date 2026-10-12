@@ -368,10 +368,15 @@ func (s *rowStore) has(rowid uint64) bool {
 	if _, ok := s.m[rowid]; ok {
 		return true
 	}
-	// Past the largest rowid, when that is known, nothing is there: an
-	// INSERT's rowid-conflict probe with the next rowid answers without a
-	// segment search.
-	if s.maxKnown && rowidLess(s.max, rowid) {
+	// Past the upper bound (rowStore.ub), nothing is there: an INSERT's
+	// rowid-conflict probe for a row appended in order answers without a
+	// lookup. The bound is taken once, then kept by put.
+	if !s.ubKnown {
+		if mx, ok := s.maxRowid(); ok {
+			s.ub, s.ubKnown = mx, true
+		}
+	}
+	if s.ubKnown && rowidLess(s.ub, rowid) {
 		return false
 	}
 	if s.seg == nil || s.baseGone || s.gone[rowid] {
