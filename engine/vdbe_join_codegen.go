@@ -603,7 +603,7 @@ func resolveJoinSources(p *ReadOnlyPager, c *compiler, items []FromItem) ([]join
 		// (buildScopes) and query.go's resolvedTable.withoutRowid doc
 		// comment: a WITHOUT ROWID table has no rowid/oid/_rowid_
 		// pseudo-column at all.
-		ts := tableScope{name: name, tableName: tableName, cols: tbl.cols, colIndex: buildColIndex(tbl.cols), offset: offset, coalesced: hidden, nestedNonLeading: it.NestedNonLeading, noRowid: tbl.withoutRowid}
+		ts := tableScope{name: name, tableName: tableName, cols: tbl.cols, colIndex: buildColIndex(tbl.cols), offset: offset, coalesced: hidden, nestedNonLeading: it.NestedNonLeading, noRowid: tbl.withoutRowid, nestFromDepth: it.NestFromWrapDepth}
 		thisSrc := joinSource{
 			tbl:          tbl,
 			scope:        compileScope{tableScope: ts, cursor: cursor},
@@ -2312,7 +2312,10 @@ func (p *ReadOnlyPager) finishGroupSource(c *compiler, state *joinDesugarState, 
 	rowidAt := make([]int, len(subC.scopes)) // index in the group row, 0 = none
 	var rowidCols []columnInfo
 	for i, sc := range subC.scopes {
-		if sc.noRowid {
+		// Only the statement's own items and those one rebuilt layer down
+		// expose a rowid: an SF_NestedFrom list does not re-expose a nested
+		// one's ENAME_ROWID entries (select.c ~6228).
+		if sc.noRowid || sc.nestFromDepth > 1 || gl == 0 || sc.groupRowidUnknown {
 			continue
 		}
 		spell := ""
@@ -2379,12 +2382,15 @@ func (p *ReadOnlyPager) finishGroupSource(c *compiler, state *joinDesugarState, 
 			ts.groupMemberRowid = false
 		}
 		ts.groupRowidRel, ts.groupRowidName = 0, ""
+		if gl == 0 {
+			ts.groupRowidUnknown = true
+		}
 		if it.GroupRebuildID != 0 {
 			ts.rebuiltLayers++
 		}
 		if rowidAt[k] > 0 {
 			ts.groupRowidRel = rowidAt[k] - colBases[k]
-			if it.GroupRebuildID == 0 {
+			if ts.nestFromDepth == 0 {
 				// C splices this group flat: the member is an ordinary table.
 				ts.groupRowidName = "rowid"
 				for _, c := range ts.cols {

@@ -202,6 +202,7 @@ func checkUpdateFromUsingAmbiguity(items []FromItem, srcs []joinSource, absToSrc
 		return nil
 	}
 	var from []int // the FROM sources, the target excluded
+	var fromItems []FromItem
 	hasTarget := false
 	for i, it := range items {
 		k, ok := absToSrcs[i]
@@ -213,17 +214,25 @@ func checkUpdateFromUsingAmbiguity(items []FromItem, srcs []joinSource, absToSrc
 			continue
 		}
 		from = append(from, k)
+		fromItems = append(fromItems, it)
 	}
 	if !hasTarget || len(from) < 2 {
 		return nil
 	}
-	for _, k := range from {
-		for lname := range srcs[k].scope.coalesced {
-			declaring, merged := 0, 0
-			name := lname
-			if ci, ok := srcs[k].scope.colIndex[lname]; ok {
-				name = srcs[k].scope.cols[ci].Name
+	for fi, k := range from {
+		// In the rebuilt list's order: each USING (or NATURAL's synthesized
+		// list, the right table's columns in order) as written.
+		names := fromItems[fi].Using
+		if len(names) == 0 {
+			for _, c := range srcs[k].scope.cols {
+				if _, ok := srcs[k].scope.coalesced[r33sFoldIdent(c.Name)]; ok {
+					names = append(names, c.Name)
+				}
 			}
+		}
+		for _, name := range names {
+			lname := r33sFoldIdent(name)
+			declaring, merged := 0, 0
 			for _, j := range from {
 				if _, ok := srcs[j].scope.colIndex[lname]; ok {
 					declaring++

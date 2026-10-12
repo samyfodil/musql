@@ -2573,7 +2573,7 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 				}
 				return s.cursor, s.colBase + s.groupRowidRel, false, true, fb, nil
 			}
-			if isRowidAliasName(x.Name) && s.groupMemberRowid {
+			if isRowidAliasName(x.Name) && (s.groupMemberRowid || s.groupRowidUnknown) {
 				return 0, 0, false, false, fb, fmt.Errorf("%w: %s of a member of a nested parenthesized join group", errVDBEUnsupported, x.Name)
 			}
 			// A later FROM item of the same name may have the column: lookupName
@@ -2620,9 +2620,15 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 	var memberRowidScope compileScope
 	var foundScope compileScope
 	ambiguous, restarted := false, false
+	unknownRowid := false
 	for _, s := range scopes {
 		if spanHidesName(&s.tableScope) {
 			continue // its span never matches (spanHidesName)
+		}
+		if s.groupRowidUnknown && isRowidAliasName(lname) {
+			if _, real := s.colIndex[lname]; !real {
+				unknownRowid = true
+			}
 		}
 		if idx, ok := s.colIndex[lname]; ok {
 			_, hidden := s.coalesced[lname]
@@ -2663,6 +2669,9 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 			}
 			foundRowidCursor = s.cursor
 		}
+	}
+	if unknownRowid && foundCursor == -1 {
+		return 0, 0, false, false, fb, fmt.Errorf("%w: %s with a member of a re-wrapped parenthesized join group in scope", errVDBEUnsupported, x.Name)
 	}
 	if ambiguous {
 		return 0, 0, false, false, fb, fmt.Errorf("engine: ambiguous column name: %s", x.Name)

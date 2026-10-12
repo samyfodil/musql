@@ -209,6 +209,16 @@ type tableScope struct {
 	// resolves id to c.id.
 	joinRight, joinFull bool
 
+	// groupRowidUnknown marks a member of a group re-wrapped in further
+	// parentheses (FromItem.NestedGroupSpan): how many rebuilt layers enclose
+	// it is not tracked through the re-wrap, so whether C exposes its rowid is
+	// unknown and a rowid reference that could reach it declines.
+	groupRowidUnknown bool
+
+	// nestFromDepth is FromItem.NestFromWrapDepth for a plain table item: how
+	// many rebuilt (SF_NestedFrom) layers enclose it in the statement.
+	nestFromDepth int
+
 	// rebuiltLayers counts the materialized parenthesized groups C rebuilds
 	// (GroupRebuildID) this member sits inside, innermost first.
 	rebuiltLayers int

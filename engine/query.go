@@ -2487,6 +2487,9 @@ func groupMemberRowidScope(scopes []tableScope, ce ColumnExpr) *tableScope {
 		if _, real := ts.colIndex[lname]; real {
 			return nil
 		}
+		if ts.groupRowidUnknown && ce.Qualifier != "" {
+			return ts // groupRowidName is "": the naming declines
+		}
 		if !ts.noRowid {
 			if ce.Qualifier == "" {
 				return nil // a second, ordinary candidate
