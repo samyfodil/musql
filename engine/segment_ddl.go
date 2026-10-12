@@ -144,15 +144,19 @@ func (n *Session) rewriteFile() error {
 			return ErrDiskFull
 		}
 	}
-	if serr := syncSegFile(tmpPath); serr != nil {
-		n.endCtr--
-		return serr
+	if !db.inMemory { // see commitSync: nothing of an in-memory database outlives it
+		if serr := syncSegFile(tmpPath); serr != nil {
+			n.endCtr--
+			return serr
+		}
 	}
 	if rerr := os.Rename(tmpPath, n.segPath); rerr != nil {
 		n.endCtr--
 		return rerr
 	}
-	syncDir(n.segPath)
+	if !db.inMemory {
+		syncDir(n.segPath)
+	}
 	// A direct-path load's segments are in the file now. Its table's row store
 	// holds none of them, which is right only once rebase below has pointed the
 	// session at this file; until then they are kept, for the fallback after it.
@@ -167,7 +171,9 @@ func (n *Session) rewriteFile() error {
 	if rerr := os.Remove(segDeltaPath(n.segPath)); rerr != nil && !os.IsNotExist(rerr) {
 		return rerr
 	}
-	syncDir(n.segPath)
+	if !db.inMemory {
+		syncDir(n.segPath)
+	}
 
 	// The file's identity moved, so the session's pairing and its append point
 	// both start again from it.

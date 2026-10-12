@@ -466,7 +466,10 @@ func (n *Session) Commit() (bool, error) {
 // otherwise -- C's own choice (sqlite3PagerSetFlags, pager.c:3686-3690).
 func (n *Session) commitSync() syncMode {
 	switch {
-	case n.NoSyncOnCommit:
+	case n.NoSyncOnCommit, n.DB.inMemory:
+		// An in-memory database's file is this connection's alone and gone
+		// with it, so a crash takes the database whether the bytes reached
+		// the disk or not: C writes a ":memory:" database nowhere at all.
 		return syncNone
 	case n.pragmaState.FullFsync():
 		return syncFull
