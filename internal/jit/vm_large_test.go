@@ -16,7 +16,7 @@ func TestEmitVMLargeProgram(t *testing.T) {
 	}
 	prog[n-1] = VInsn{Op: VCmpJump, A: 0, B: 1, T: n / 2, Cond: CondL} // a far backward jump
 	prog[10] = VInsn{Op: VCmpJump, A: 0, B: 1, T: n - 2, Cond: CondL}  // a far forward one
-	lay := ValueLayout{Size: 32, OffTyp: 0, OffI: 8, OffF: 16, OffS: 24, TypNull: 5, TypInt: 1}
+	lay := ValueLayout{Size: 48, OffTyp: 0, OffI: 8, OffF: 16, OffS: 24, TypNull: 5, TypInt: 1}
 	b, err := EmitVM(prog, 3, lay)
 	if !Available {
 		return

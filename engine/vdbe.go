@@ -28,8 +28,14 @@ type vdbe struct {
 	regs         []Value
 	jx           *vmJIT        // native code for the program run() is given, when it has some
 	jcur         []jit.VCursor // native code's view of the cursors it names, filled at each entry
+	// jargs is the argument block of every entry into native code: kept on the
+	// machine and only its live fields set per entry, because zeroing a fresh
+	// one -- most of it the segment JIT's -- was a measurable share of a short
+	// entry.
+	jargs jit.ProgArgs
 	jsnap        []jitSnap     // the copies of the rows of cursors it can read but not walk
 	jitEnters    int           // entries into jx, which the fuel test counts
+	jitRows      int           // result rows native code copied out, which the pointer tests count
 	cursors      []*vdbeCursor
 	recRegs      [][]Value
 	sorters      []*vdbeSorter
@@ -1167,8 +1173,31 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			if jitScore {
 				jitScoreEnter()
 			}
-			pc = jx.enter(m, pc)
-			jitSkip = pc
+			next, n := jx.enter(m, pc, &rows)
+			pc = next
+			if n < 0 {
+				jitSkip = pc
+				continue
+			}
+			// Native code ran an OpResultRow of n registers (the one before
+			// pc) and copied the row where enter said; what is left of that
+			// opcode's body is handing it over, as its case below does.
+			m.jitRows++
+			if m.yieldReuse && len(rows) == 0 {
+				m.yieldRow = m.yieldRow[:n]
+				m.yieldRows = append(m.yieldRows[:0], m.yieldRow)
+				m.resumePC = pc
+				return m.yieldRows, nil
+			}
+			row := []Value{}
+			if n > 0 {
+				row = m.recAlloc(n) // the n Values at the head of the chunk, which hold the row
+			}
+			rows = append(rows, row)
+			if m.yield {
+				m.resumePC = pc
+				return rows, nil
+			}
 			continue
 
 		case OpInit:

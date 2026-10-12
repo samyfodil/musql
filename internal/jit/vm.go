@@ -18,10 +18,13 @@ import "unsafe"
 //     exactly as it was, and the VDBE runs the instruction with its full
 //     semantics. Native code therefore implements only the INTEGER arm of each
 //     opcode, the one the VDBE itself tests first.
-//   - Native code writes only the non-pointer words of a Value, and only into
-//     a Value whose S is nil. Writing S would need the GC's write barrier,
-//     which generated code cannot call; a destination holding a string or blob
-//     exits instead, and the VDBE's ordinary assignment clears it.
+//   - A store that writes or overwrites a string or blob pointer (a copy of a
+//     TEXT value, an integer stored over one) is made natively only while the
+//     GC's write barrier is off, which the prologue reads once per entry
+//     (wb.go). While it is on, the instruction exits before it writes
+//     anything, and the VDBE's ordinary assignment makes the store, barrier
+//     and all. A store of an integer, a NULL or a REAL over a register known
+//     to hold no pointer needs no test.
 //   - Every backward jump, and every OP_Return, spends one unit of fuel. When
 //     it runs out the code exits at the jump's target. Generated code cannot be
 //     preempted, so this is what bounds the time between two returns to Go.
@@ -36,7 +39,9 @@ const (
 	VGoto
 	// VInt: r[A] = integer Imm.
 	VInt
-	// VCopy: r[B] = r[A], a shallow copy of a Value with no string or blob.
+	// VCopy: r[B] = r[A]. With Imm == 0 (OP_Copy, which copies a string's
+	// bytes) only a Value with no string or blob; with Imm != 0 (OP_SCopy, a
+	// shallow copy) any Value, its pointer shared.
 	VCopy
 	// VAdd, VSub, VMul: r[C] = r[B] op r[A], integers, exiting on overflow.
 	VAdd
@@ -93,13 +98,24 @@ const (
 	// when that is Imm.
 	VNotBr
 	// VFused: the second half of the fused instruction at the pc before. It
-	// emits nothing; native code never enters or jumps to it.
+	// emits nothing in the run, and nothing jumps to it; an entry at it runs
+	// the test it was (VFusedTest) in a block of its own.
 	VFused
+	// VResultRow: OP_ResultRow of the B registers from A. Native code copies
+	// them (a shallow copy, pointers shared) into the engine's row buffer
+	// (ProgArgs.RowBuf) when it has room and the write barrier is off. A
+	// machine that hands each row over returns to Go with Yield set and PC the
+	// next pc, and resumes native code there; one that gathers its rows goes
+	// on natively, the row's header written into its list (RowsBuf). Anything
+	// else exits at the pc.
+	VResultRow
 )
 
 // VInsn is one instruction of a VM program: the one at its index's pc.
 type VInsn struct {
-	Op      VOp
+	Op VOp
+	// A VFused keeps the operands of the test it was (A, C, T and Imm of a
+	// VIf), so an entry at its pc can run that test alone.
 	A, B, C int
 	T       int
 	Imm     int64

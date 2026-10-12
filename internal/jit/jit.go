@@ -307,6 +307,29 @@ type ProgArgs struct {
 	// Cur is EmitVM's cursor table (VCursor), one entry per cursor number the
 	// program's native instructions name.
 	Cur *VCursor
+	// WB is EmitVM's copy of the runtime's write-barrier flag, which the
+	// prologue reads at every entry (wb.go). Non-zero: native code makes no
+	// store of a string or blob pointer, and exits instead.
+	WB int64
+	// A native OP_ResultRow (VResultRow) copies its row into the RowCap
+	// Values at RowBuf; RowCap -1 means the engine wants the VDBE to run it.
+	//
+	// With RowsBuf nil it copies one row to RowBuf's head and returns to Go:
+	// Yield is the row's width plus one, and PC the pc after it.
+	//
+	// With RowsBuf non-nil the engine gathers rows, and native code goes on
+	// after each one: it copies the row to RowBuf past the RowUsed Values
+	// already used, writes the row's slice header at RowsBuf past the Yield
+	// headers already written (RowsCap of them fit), adds the width to RowUsed
+	// and one to Yield, and runs the next pc. Out of room it exits at the
+	// OP_ResultRow. The engine takes the rows over after the call, wherever it
+	// ended.
+	RowBuf  *int64
+	RowCap  int64
+	RowUsed int64
+	RowsBuf *int64
+	RowsCap int64
+	Yield   int64
 }
 
 // Byte offsets of ProgArgs' fields, asserted by TestProgArgsLayout.
@@ -322,6 +345,13 @@ const (
 	POffHeap     = POffRow + 8
 	POffHeapLen  = POffHeap + MaxProgCols*8
 	POffCur      = POffHeapLen + MaxProgCols*8
+	POffWB       = POffCur + 8
+	POffRowBuf   = POffWB + 8
+	POffRowCap   = POffRowBuf + 8
+	POffRowUsed  = POffRowCap + 8
+	POffRowsBuf  = POffRowUsed + 8
+	POffRowsCap  = POffRowsBuf + 8
+	POffYield    = POffRowsCap + 8
 )
 
 // progHasService reports whether a program can stop for a service, and so
