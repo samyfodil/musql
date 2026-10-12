@@ -750,6 +750,11 @@ func compileSubProgram(pager *ReadOnlyPager, stmt *SelectStmt, outer *compiler) 
 		pop := pager.pushCTEScope(stmt.CTEs)
 		defer pop()
 	}
+	// A subquery body's own FROM subqueries lose the result columns it never
+	// names, as sqlite3Select does before coding them (select.c:8038).
+	if pager != nil && len(stmt.From) != 0 {
+		stmt = pager.nullUnusedSubqueryColumns(stmt)
+	}
 	// A subquery body is a SELECT like any other to sqlite3Select: its own FROM
 	// clause is flattened (flattenSubquery, select.c:4290) and pushed down into
 	// (pushDownWhereTerms, select.c:5134) exactly as the top-level statement's
@@ -1261,6 +1266,13 @@ func (c *compiler) compileExistsSubquery(x ExistsExpr) (int, error) {
 	prog, err := c.liveSubSelect(x.Stmt)
 	if err != nil {
 		return 0, err
+	}
+	// The compile above has reported every unknown name; the result list is
+	// then dead code to EXISTS (existsBlankedStmt).
+	if blanked := existsBlankedStmt(x.Stmt); blanked != nil {
+		if prog2, err2 := c.liveSubSelect(blanked); err2 == nil {
+			prog = prog2
+		}
 	}
 	if c.pager == nil && c.liveDB == nil && prog.NCursors != 0 {
 		// compileScalarSubquery's belt-and-braces, for the same reason.
