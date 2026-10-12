@@ -747,7 +747,7 @@ func stmtCountsChanges(sqlText string) bool {
 }
 
 func (db *DB) compileWriteProgram(sqlText string) (*Program, error) {
-	toks, err := lex(sqlText)
+	toks, err := lexWriteText(sqlText)
 	if err != nil {
 		return nil, err
 	}

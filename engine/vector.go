@@ -29,6 +29,7 @@ import (
 	"math"
 	"math/bits"
 	"strconv"
+	"sync/atomic"
 )
 
 // vecType is a vector's component type, numbered as libSQL's type byte.
@@ -301,6 +302,158 @@ func vecFastAtoF(num []byte) (float64, bool) {
 var vecSlowComponentsForTest bool // every component the general way
 
 func vecFastComponent(s []byte, i int) (x float64, e int, ok bool) {
+	if x, e, ok = vecPlainComponent(s, i); ok {
+		return x, e, true
+	}
+	if x, e, ok = vecTightComponent(s, i); ok {
+		return x, e, true
+	}
+	return vecSpacedComponent(s, i)
+}
+
+// vecNotDigits has the high bit of every byte of w that is not an ASCII digit.
+func vecNotDigits(w uint64) uint64 {
+	t := w ^ 0x3030303030303030 // a digit becomes 0..9
+	return ((t&0x7f7f7f7f7f7f7f7f + 0x7676767676767676) | t) & 0x8080808080808080
+}
+
+// vecDigits8 is the value of the n (1..7) leading digits of the little-endian
+// word w, whose bytes past them are anything: shifted so those digits end the
+// word, with zeros in front, the eight bytes are then one number.
+func vecDigits8(w uint64, n int) uint64 {
+	v := (w ^ 0x3030303030303030) << (uint(8-n) * 8)
+	v = v*10 + v>>8
+	v = ((v&0x000000FF000000FF)*0x000F424000000064 + (v>>16&0x000000FF000000FF)*0x0000271000000001) >> 32
+	return v & 0xffffffff
+}
+
+// vecPlainComponent is vecTightComponent for the commonest text of a float,
+// "[-]I[.F]" with one to seven digits in each part, which it reads eight bytes
+// at a time instead of one: a digit run's end is found by a bit test rather
+// than by a branch that mispredicts once per number. It builds the same
+// significand and power of ten, so the same double; anything else -- an
+// exponent, a longer part, a space, the end of the text near -- returns false
+// and is read by vecTightComponent from i.
+func vecPlainComponent(s []byte, i int) (x float64, e int, ok bool) {
+	j := i
+	if len(s)-j < 24 {
+		return 0, 0, false
+	}
+	// The sign without a branch: half the numbers of a vector are negative, so a
+	// test on it mispredicts about every other number.
+	neg := (uint32(s[j]^'-') - 1) >> 31 // 1 for '-', else 0
+	j += int(neg)
+	nd := vecNotDigits(binary.LittleEndian.Uint64(s[j:]))
+	if nd == 0 {
+		return 0, 0, false
+	}
+	n1 := bits.TrailingZeros64(nd) >> 3
+	if n1 == 0 {
+		return 0, 0, false
+	}
+	d := vecDigits8(binary.LittleEndian.Uint64(s[j:]), n1)
+	j += n1
+	p := 0
+	if s[j] == '.' {
+		j++
+		nd = vecNotDigits(binary.LittleEndian.Uint64(s[j:]))
+		if nd == 0 {
+			return 0, 0, false
+		}
+		n2 := bits.TrailingZeros64(nd) >> 3
+		if n2 == 0 {
+			return 0, 0, false
+		}
+		d = d*exactPow10Int[n2] + vecDigits8(binary.LittleEndian.Uint64(s[j:]), n2)
+		p = -n2
+		j += n2
+	}
+	if s[j] != ',' && s[j] != ']' {
+		return 0, 0, false
+	}
+	var r float64
+	if d != 0 {
+		r = sqliteFp10Convert2(d, p)
+	}
+	// -r, as the sign bit: also -0 for a zero.
+	return math.Float64frombits(math.Float64bits(r) | uint64(neg)<<63), j, true
+}
+
+var exactPow10Int = [8]uint64{1, 10, 100, 1000, 10000, 100000, 1000000, 10000000}
+
+// vecTightComponent is the component with no space anywhere: a number right at
+// i, ended by ',' or ']'. It reads the digits once, as it finds them, where
+// vecSpacedComponent finds the end of the span and then reads the span again;
+// the number is vecFastAtoF's (the same acceptance, the same value from the same
+// significand and exponent). false hands the component, from i, to
+// vecSpacedComponent.
+func vecTightComponent(s []byte, i int) (x float64, e int, ok bool) {
+	j, neg := i, false
+	if j < len(s) && (s[j] == '-' || s[j] == '+') {
+		neg = s[j] == '-'
+		j++
+	}
+	// Digits go straight into d with no per-digit bookkeeping: at most 18 of
+	// them cannot overflow it and are at most 18 significant ones, which is all
+	// vecFastAtoF takes. A longer run (leading zeros included) goes the other way.
+	start := j
+	var d uint64
+	dotAt := -1
+	for ; j < len(s); j++ {
+		c := s[j] - '0'
+		if c <= 9 {
+			d = d*10 + uint64(c)
+			continue
+		}
+		if s[j] == '.' && dotAt < 0 {
+			dotAt = j
+			continue
+		}
+		break
+	}
+	nd, p := j-start, 0
+	if dotAt >= 0 {
+		nd--
+		p = dotAt + 1 - j // minus the digits after the point
+	}
+	if nd <= 0 || nd > 18 || j >= len(s) || j-i > vecMaxFloatSz+1 {
+		return 0, 0, false
+	}
+	if c := s[j]; c == 'e' || c == 'E' {
+		j++
+		esign := 1
+		if j < len(s) && (s[j] == '-' || s[j] == '+') {
+			if s[j] == '-' {
+				esign = -1
+			}
+			j++
+		}
+		exp, ed := 0, 0
+		for ; j < len(s) && s[j]-'0' <= 9; j++ {
+			if ed++; ed > 4 {
+				return 0, 0, false
+			}
+			exp = exp*10 + int(s[j]-'0')
+		}
+		if ed == 0 || j >= len(s) || j-i > vecMaxFloatSz+1 {
+			return 0, 0, false
+		}
+		p += esign * exp
+	}
+	if s[j] != ',' && s[j] != ']' {
+		return 0, 0, false
+	}
+	var r float64
+	if d != 0 {
+		r = sqliteFp10Convert2(d, p)
+	}
+	if neg {
+		r = -r
+	}
+	return r, j, true
+}
+
+func vecSpacedComponent(s []byte, i int) (x float64, e int, ok bool) {
 	for i < len(s) && vecTextClass[s[i]] == vecClassSpace {
 		i++
 	}
@@ -319,6 +472,94 @@ func vecFastComponent(s []byte, i int) (x float64, e int, ok bool) {
 	return x, i, ok
 }
 
+// vecParallelMin is the length of text, from the first component, below which
+// vecParallelComponents is not tried: under it the goroutines cost more than
+// they save. A chunk is at least half of it.
+const vecParallelMin = 4096
+
+var vecParallelOffForTest bool
+
+// vecParallelComponents parses the components of a vector's text, s[i:] being
+// what follows the '[', on up to vecWorkers goroutines, each taking the stretch
+// between two commas that a chunk boundary falls on. It answers only for the
+// plain shape every component of which vecFastComponent takes -- all ended by
+// ',' but the last, ended by ']' -- and gives the components' bytes, their
+// count, and the index of the ']'. false for anything else (a short text, one
+// worker, a component of another shape, a ']' or a count that does not fit, more
+// components than a vector holds): the caller then parses the text itself, so
+// every malformed text meets the same code, and the same error, as before.
+func vecParallelComponents(s []byte, i, w int) (data []byte, n, end int, ok bool) {
+	k := min(vecWorkers, (len(s)-i)/(vecParallelMin/2))
+	if k < 2 || vecParallelOffForTest || vecSlowComponentsForTest {
+		return nil, 0, 0, false
+	}
+	bounds := make([]int, 1, k+1) // where each chunk starts: i, then after a ','
+	bounds[0] = i
+	for c := 1; c < k; c++ {
+		target := i + (len(s)-i)*c/k
+		if target <= bounds[len(bounds)-1] {
+			continue
+		}
+		q := bytes.IndexByte(s[target:], ',')
+		if q < 0 {
+			break
+		}
+		bounds = append(bounds, target+q+1)
+	}
+	nch := len(bounds)
+	if nch < 2 {
+		return nil, 0, 0, false
+	}
+	// first[c] is the index of chunk c's first component: the commas before it.
+	first := make([]int, nch+1)
+	for c := range nch {
+		stop := len(s)
+		if c+1 < nch {
+			stop = bounds[c+1]
+		}
+		first[c+1] = first[c] + bytes.Count(s[bounds[c]:stop], []byte{','})
+	}
+	total := first[nch] + 1 // the last component ends at ']', not ','
+	if total > vecMaxDims {
+		return nil, 0, 0, false
+	}
+	data = make([]byte, total*w)
+	put := func(idx int, x float64) {
+		if w == 4 {
+			binary.LittleEndian.PutUint32(data[idx*4:], math.Float32bits(float32(x)))
+		} else {
+			binary.LittleEndian.PutUint64(data[idx*8:], math.Float64bits(x))
+		}
+	}
+	var closing atomic.Int64
+	closing.Store(-1)
+	good := segEachOn(vecWorkers, nch, func(c int) bool {
+		pos := bounds[c]
+		for idx := first[c]; idx < first[c+1]; idx++ {
+			x, e, fine := vecFastComponent(s, pos)
+			if !fine || s[e] != ',' {
+				return false
+			}
+			put(idx, x)
+			pos = e + 1
+		}
+		if c+1 < nch {
+			return pos == bounds[c+1]
+		}
+		x, e, fine := vecFastComponent(s, pos)
+		if !fine || s[e] != ']' {
+			return false
+		}
+		put(total-1, x)
+		closing.Store(int64(e))
+		return true
+	})
+	if !good || closing.Load() < 0 {
+		return nil, 0, 0, false
+	}
+	return data, total, int(closing.Load()), true
+}
+
 func parseVectorText(s []byte, t vecType) (vector, error) {
 	i := 0
 	skip := func() {
@@ -335,14 +576,23 @@ func parseVectorText(s []byte, t vecType) (vector, error) {
 	if t == vecF64 {
 		w = 8
 	}
-	// Sized for one component per comma, so the appends below never regrow it.
-	data := make([]byte, 0, (bytes.Count(s, []byte{','})+1)*w)
+	// A long text of plain numbers is parsed on several goroutines; anything
+	// else about it sends the whole text through the loop below instead, so the
+	// loop stays the one place that decides what a text means.
+	var data []byte
 	n := 0
+	par := false
+	if d, cnt, e, ok := vecParallelComponents(s, i, w); ok {
+		data, n, i, par = d, cnt, e, true
+	} else {
+		// Sized for one component per comma, so the appends below never regrow it.
+		data = make([]byte, 0, (bytes.Count(s, []byte{','})+1)*w)
+	}
 	// One number per pass: its span runs to the next ',' or ']' (or a NUL,
 	// where C's string ends), found in one scan and parsed in place. Only a
 	// number with whitespace inside it -- which libSQL drops, so "1 2" is 12
 	// -- is copied to strip it.
-	for {
+	for !par {
 		// The common component first, in one pass: spaces, a number
 		// vecFastAtoF takes, spaces, then ',' or ']'. Anything else -- a space
 		// inside the number, a NUL, an empty component, a long one -- goes

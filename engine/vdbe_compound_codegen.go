@@ -61,6 +61,27 @@ type compoundProgram struct {
 	correlated bool
 }
 
+// streamable reports whether the compound is a plain UNION ALL chain that can
+// run as consecutive co-routines (streamsDerived): every operator UNION ALL, no
+// compound-level ORDER BY/LIMIT/OFFSET, and arms that are uncorrelated,
+// ordinary programs.
+func (cp *compoundProgram) streamable() bool {
+	if cp.correlated || len(cp.orderBy) != 0 || cp.limit != nil || cp.offset != nil {
+		return false
+	}
+	for _, op := range cp.ops {
+		if op != "UNION ALL" {
+			return false
+		}
+	}
+	for _, arm := range cp.arms {
+		if arm == nil || arm.Compound != nil || arm.Correlated || arm.LiveSource != nil {
+			return false
+		}
+	}
+	return true
+}
+
 // compileCompound compiles stmt (non-empty Compound) into a compoundProgram.
 // Arms are grouped left to right -- stmt's own arm with
 // Compound/OrderBy/Limit/Offset stripped, then each CompoundArm -- as SQLite

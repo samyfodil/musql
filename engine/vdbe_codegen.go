@@ -755,6 +755,11 @@ func compileSubProgram(pager *ReadOnlyPager, stmt *SelectStmt, outer *compiler) 
 	// (pushDownWhereTerms, select.c:5134) exactly as the top-level statement's
 	// is in execSelect. See flatten_projection.go and pushdown_where.go.
 	if pager != nil && pager.r41ArmsHeld == 0 && len(stmt.Compound) == 0 && len(stmt.From) != 0 {
+		if f := pager.countUnionAll(stmt); f != nil {
+			stmt = f
+		}
+	}
+	if pager != nil && pager.r41ArmsHeld == 0 && len(stmt.Compound) == 0 && len(stmt.From) != 0 {
 		stmt = pager.r41FlattenProjection(stmt)
 		if len(stmt.Compound) == 0 {
 			stmt = pager.r41PushDown(stmt)

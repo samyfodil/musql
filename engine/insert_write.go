@@ -16,6 +16,7 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"sync/atomic"
 )
 
 // insertStmt is a parsed "INSERT INTO table [(cols)] VALUES (...), ..." or
@@ -115,10 +116,18 @@ type upsertClause struct {
 
 // parseInsertStmt parses sqlText as a single INSERT statement.
 func parseInsertStmt(sqlText string) (*insertStmt, error) {
+	if e := insertParseHandoff.Load(); e != nil && e.sql == sqlText && insertParseHandoff.CompareAndSwap(e, nil) {
+		return e.stmt, nil
+	}
 	toks, err := lex(sqlText)
 	if err != nil {
 		return nil, err
 	}
+	return parseInsertStmtToks(sqlText, toks)
+}
+
+// parseInsertStmtToks is parseInsertStmt over the tokens of sqlText already lexed.
+func parseInsertStmtToks(sqlText string, toks []token) (*insertStmt, error) {
 	p := newParser(sqlText, toks)
 	stmt, err := parseInsertStmtTokens(p, false)
 	if err != nil {
@@ -132,6 +141,28 @@ func parseInsertStmt(sqlText string) (*insertStmt, error) {
 	}
 	stmt.params = p.params.info()
 	return stmt, nil
+}
+
+// insertParseHandoff carries the INSERT that ParseParamInfo parsed (at prepare)
+// to the compile of the same text, so a statement of megabytes of literal rows
+// is parsed once rather than twice. It is keyed by the statement's text, never
+// a counter, and taken by the first parseInsertStmt of that text: the taker
+// owns the tree, as if it had parsed it, so nothing is shared.
+var insertParseHandoff atomic.Pointer[insertParseEntry]
+
+type insertParseEntry struct {
+	sql  string
+	toks []token // sql's tokens, read-only: compileWriteProgram's dispatch reads them too
+	stmt *insertStmt
+}
+
+// lexWriteText is lex(sqlText), reusing the tokens ParseParamInfo lexed for the
+// same text when it left them in insertParseHandoff.
+func lexWriteText(sqlText string) ([]token, error) {
+	if e := insertParseHandoff.Load(); e != nil && e.sql == sqlText {
+		return e.toks, nil
+	}
+	return lex(sqlText)
 }
 
 // parseInsertStmtTokens parses an INSERT off p, stopping after its last token
@@ -2281,10 +2312,11 @@ func parseParamInfo(sqlText string) (ParamInfo, error) {
 		}
 		return stmt.Params, nil
 	case "INSERT", "REPLACE": // see Exec's identical "REPLACE INTO" case above
-		stmt, err := parseInsertStmt(trimmed)
+		stmt, err := parseInsertStmtToks(trimmed, toks)
 		if err != nil {
 			return ParamInfo{}, err
 		}
+		insertParseHandoff.Store(&insertParseEntry{sql: trimmed, toks: toks, stmt: stmt})
 		return stmt.params, nil
 	case "UPDATE":
 		stmt, err := parseUpdateStmt(trimmed)

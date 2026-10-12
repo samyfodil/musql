@@ -472,18 +472,18 @@ func (c *Conn) prepareContextImpl(ctx context.Context, query string) (driver.Stm
 // splitter is worth running. A false positive costs one lex; a false negative
 // is impossible, since every separator is a literal ";" byte.
 func mayBeScript(query string) bool {
-	for i := 0; i < len(query); i++ {
-		if query[i] != ';' {
-			continue
-		}
-		for j := i + 1; j < len(query); j++ {
-			switch query[j] {
-			case ' ', '\t', '\r', '\n', ';':
-			default:
-				return true
-			}
-		}
+	// IndexByte scans a block at a time: a statement can be megabytes of
+	// literal text with no ';' in it at all.
+	i := strings.IndexByte(query, ';')
+	if i < 0 {
 		return false
+	}
+	for j := i + 1; j < len(query); j++ {
+		switch query[j] {
+		case ' ', '\t', '\r', '\n', ';':
+		default:
+			return true
+		}
 	}
 	return false
 }
