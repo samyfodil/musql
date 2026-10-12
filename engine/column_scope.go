@@ -472,6 +472,10 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 					}
 					return c, foundOffset + foundIdx, foundCol, -1, nil
 				}
+				if isRowidAliasName(lname) && laterScopeHasColumn(len(c.tables)-i-1, func(k int) *tableScope { return &c.tables[i+1+k] }, qualifier, lname) {
+					qualMiss = true // a later item's real column wins (resolveInScopes)
+					continue
+				}
 				if isRowidAliasName(lname) && !ts.noRowid {
 					// Two FROM items share this qualifier (an unaliased self-join, or
 					// one alias written twice), both offering a rowid that coalescing
@@ -954,4 +958,19 @@ func groupAliasColumn(n int, scope func(int) *tableScope, alias, name string) (i
 		}
 	}
 	return 0, 0, "", false
+}
+
+// laterScopeHasColumn reports whether one of the n scopes scope(0..n-1) is
+// named qualifier and declares the column lname.
+func laterScopeHasColumn(n int, scope func(int) *tableScope, qualifier, lname string) bool {
+	for k := 0; k < n; k++ {
+		ts := scope(k)
+		if !equalFoldName(ts.name, qualifier) {
+			continue
+		}
+		if _, ok := ts.colIndex[lname]; ok {
+			return true
+		}
+	}
+	return false
 }

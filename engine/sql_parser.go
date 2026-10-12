@@ -1724,7 +1724,10 @@ func checkFlattenSafe(elems []FromItem, leading bool) {
 	if len(elems) <= 1 {
 		return
 	}
-	if elems[0].HasGroupAlias || elems[0].On != nil || elems[0].Using != nil {
+	// NATURAL too: it is an outward join constraint like USING, computed
+	// against the whole group's columns, so a flattened span would match the
+	// first member alone ("a NATURAL JOIN (b JOIN c ON ...)").
+	if elems[0].HasGroupAlias || elems[0].On != nil || elems[0].Using != nil || elems[0].Natural {
 		elems[0].GroupLen = len(elems)
 		return
 	}

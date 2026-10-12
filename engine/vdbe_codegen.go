@@ -2551,6 +2551,13 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 				}
 				return s.cursor, idx + s.colBase, false, true, fb, nil
 			}
+			if isRowidAliasName(x.Name) && laterScopeHasColumn(len(scopes)-i-1, func(k int) *tableScope { return &scopes[i+1+k].tableScope }, x.Qualifier, lname) {
+				// A later item of this name declares a real column of it, which
+				// wins over this one's implicit rowid (resolve.c:471, rowid
+				// candidates only while no real column matched).
+				qualMiss = true
+				continue
+			}
 			if isRowidAliasName(x.Name) && !s.noRowid {
 				// Mirrors resolveColumnEx's identical rule: two
 				// FROM items sharing this qualifier both offer the pseudo-rowid,
