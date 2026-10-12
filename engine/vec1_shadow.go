@@ -107,6 +107,22 @@ func (s *vec1DBShadow) put(suffix string, rowid int64, vals []Value) error {
 	if had {
 		old = append([]Value(nil), old...)
 	}
+	return s.putOver(tbl, rowid, vals, old, had)
+}
+
+// putOld is put for a caller that has just read the row it replaces: old is
+// that row, a copy of its own, and had whether there was one. Reading it
+// back again here copied a vector the caller had already copied.
+func (s *vec1DBShadow) putOld(suffix string, rowid int64, vals, old []Value, had bool) error {
+	tbl, err := s.table(suffix)
+	if err != nil {
+		return err
+	}
+	return s.putOver(tbl, rowid, vals, old, had)
+}
+
+// putOver stores vals over old (had: there was a row) and logs the change.
+func (s *vec1DBShadow) putOver(tbl *tableMeta, rowid int64, vals, old []Value, had bool) error {
 	tbl.putRow(uint64(rowid), vals)
 	if had {
 		s.db.noteRowUpdate(tbl, uint64(rowid), uint64(rowid), old, vals)

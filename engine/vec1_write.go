@@ -688,7 +688,9 @@ func (w *vec1W) updateBaseVector(rowid int64, v Value) error {
 		nrow = append(nrow, Value{Typ: Null})
 	}
 	nrow[1] = v
-	return w.sh.put("_base", rowid, nrow)
+	// The old row as put would have read it back: its Values copied, their
+	// bytes shared -- a stored row is never edited in place.
+	return w.sh.putOld("_base", rowid, nrow, append([]Value(nil), row...), true)
 }
 
 // rebuildIndex is vec1RebuildIndex: %_idx and %_meta emptied and rebuilt from
