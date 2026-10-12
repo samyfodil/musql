@@ -6,6 +6,7 @@ package engine
 import (
 	"fmt"
 	"math"
+	"math/bits"
 	"slices"
 )
 
@@ -290,6 +291,26 @@ var intSerialWidths = []struct {
 	{1, 1}, {2, 2}, {3, 3}, {4, 4}, {5, 6}, {6, 8},
 }
 
+// intSerial is the first of intSerialWidths that holds i, found from the
+// bits i needs as a signed number rather than by trying each width in turn:
+// every record a write encodes measures and encodes each integer column.
+func intSerial(i int64) (serialType uint64, width int) {
+	need := bits.Len64(uint64(i^(i>>63))) + 1 // magnitude bits, plus the sign
+	switch {
+	case need <= 8:
+		return 1, 1
+	case need <= 16:
+		return 2, 2
+	case need <= 24:
+		return 3, 3
+	case need <= 32:
+		return 4, 4
+	case need <= 48:
+		return 5, 6
+	}
+	return 6, 8
+}
+
 // fitsSignedWidth reports whether i fits in the two's-complement range of an
 // n-byte signed integer (n one of 1,2,3,4,6,8).
 func fitsSignedWidth(i int64, n int) bool {
@@ -315,12 +336,8 @@ func serialTypeOf(v Value) uint64 {
 		case 1:
 			return 9
 		}
-		for _, w := range intSerialWidths {
-			if fitsSignedWidth(v.I, w.bytes) {
-				return w.serialType
-			}
-		}
-		return 6 // unreachable: every int64 fits in 8 bytes
+		st, _ := intSerial(v.I)
+		return st
 	case Float:
 		return 7
 	case Text:
@@ -361,15 +378,11 @@ func appendValueBody(dst []byte, v Value) []byte {
 			return dst // serial types 8 and 9 carry the value in the header
 		}
 		u := uint64(v.I)
-		for _, w := range intSerialWidths {
-			if fitsSignedWidth(v.I, w.bytes) {
-				for k := w.bytes - 1; k >= 0; k-- {
-					dst = append(dst, byte(u>>uint(8*k)))
-				}
-				return dst
-			}
+		_, width := intSerial(v.I)
+		for k := width - 1; k >= 0; k-- {
+			dst = append(dst, byte(u>>uint(8*k)))
 		}
-		return dst // unreachable, see serialTypeOf
+		return dst
 	case Float:
 		bits := math.Float64bits(v.F)
 		for k := 0; k < 8; k++ {

@@ -725,18 +725,26 @@ func (st *segDeltaState) applyBatch(body []byte) error {
 // kill. false, having applied nothing, when a put reads its row from a store
 // while it is written (SegDeltaRecord.src): the caller decodes the batch.
 func (st *segDeltaState) applyRecs(recs []SegDeltaRecord) bool {
+	total := 0
 	for i := range recs {
 		if !recs[i].Kill && recs[i].src != nil {
 			return false
 		}
+		total += len(recs[i].Vals)
 	}
+	// Every row's values from one allocation, not one per row; each capped so
+	// no row can grow into the next.
+	slab := make([]Value, total)
+	var live map[int64][]Value
+	liveTable := -1
 	for i := range recs {
 		r := &recs[i]
 		if r.Kill {
 			st.kill(r.Table, r.Rowid)
 			continue
 		}
-		vals := make([]Value, len(r.Vals))
+		vals := slab[:len(r.Vals):len(r.Vals)]
+		slab = slab[len(r.Vals):]
 		for c, v := range r.Vals {
 			switch v.Typ {
 			case Int:
@@ -753,7 +761,17 @@ func (st *segDeltaState) applyRecs(recs []SegDeltaRecord) bool {
 				vals[c] = Value{Typ: Null}
 			}
 		}
-		st.put(r.Table, r.Rowid, vals)
+		// put, with the table's map looked up once per run of its rows.
+		if r.Table != liveTable || live == nil {
+			if st.live[r.Table] == nil {
+				st.live[r.Table] = make(map[int64][]Value, len(recs)-i)
+			}
+			live, liveTable = st.live[r.Table], r.Table
+		}
+		live[r.Rowid] = vals
+		if d := st.dead[r.Table]; len(d) > 0 {
+			delete(d, r.Rowid)
+		}
 	}
 	return true
 }
