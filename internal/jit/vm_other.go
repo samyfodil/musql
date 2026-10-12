@@ -4,7 +4,7 @@ package jit
 
 import "fmt"
 
-// EmitVM runs the VDBE on unsupported platforms.
-func EmitVM(prog []VInsn, nReg int, lay ValueLayout) ([]byte, error) {
+// emitVM runs the VDBE on unsupported platforms.
+func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache bool) ([]byte, error) {
 	return nil, fmt.Errorf("jit: no VM emitter for this architecture")
 }

@@ -32,6 +32,42 @@ type segRows struct {
 	rp   *ReadOnlyPager
 	root uint32
 	tbl  *tableMeta
+
+	// memo keeps rows get decoded, by rowid, for the next get of the same one:
+	// an UPDATE reads each row it writes twice -- its cursor, then the store
+	// again just before writing (opUpdateRow, for what a BEFORE trigger may
+	// have changed) -- and decoding a row from its segment was most of the
+	// cost of the second read. Committed rows change only with the source or
+	// its delta (a commit of this session replays its batch into the delta in
+	// place), so the memo is emptied whenever either has moved since it was
+	// filled. Made only once a store has done memoAfter gets, so a table read
+	// a few rows at a time costs nothing.
+	memoMu      sync.Mutex
+	memo        []segRowMemo
+	memoGets    int
+	memoSrc     *segSource
+	memoDelta   *segDeltaState
+	memoBatches int
+}
+
+// segRowMemo is one memo slot.
+type segRowMemo struct {
+	rid uint64
+	row []Value
+}
+
+const (
+	memoSlots = 1 << 14
+	memoAfter = 256
+)
+
+// memoKey is what the memo's rows were decoded from.
+func (b *segRows) memoKey() (*segSource, *segDeltaState, int) {
+	src := b.rp.segs
+	if src == nil || src.delta == nil {
+		return src, nil, 0
+	}
+	return src, src.delta, src.delta.batches
 }
 
 // newSegRowStore is the row store over a table's committed rows.
@@ -48,6 +84,20 @@ func newSegRowStoreAt(rp *ReadOnlyPager, root uint32, tbl *tableMeta) *rowStore 
 // get is rid's committed row, normalized exactly as a table load normalizes it
 // (fullStoredRow: full width, generated columns computed).
 func (b *segRows) get(rid uint64) ([]Value, bool) {
+	b.memoMu.Lock()
+	src, delta, batches := b.memoKey()
+	if b.memo != nil && (src != b.memoSrc || delta != b.memoDelta || batches != b.memoBatches) {
+		clear(b.memo)
+	}
+	b.memoSrc, b.memoDelta, b.memoBatches = src, delta, batches
+	if b.memo != nil {
+		if e := &b.memo[rid%memoSlots]; e.row != nil && e.rid == rid {
+			row := e.row
+			b.memoMu.Unlock()
+			return row, true
+		}
+	}
+	b.memoMu.Unlock()
 	vals, found, served := b.rp.SeekRowidSegments(b.root, int64(rid))
 	if !served || !found {
 		return nil, false
@@ -56,6 +106,16 @@ func (b *segRows) get(rid uint64) ([]Value, bool) {
 	if err != nil {
 		return nil, false
 	}
+	b.memoMu.Lock()
+	if b.memo == nil {
+		if b.memoGets++; b.memoGets > memoAfter {
+			b.memo = make([]segRowMemo, memoSlots)
+		}
+	}
+	if b.memo != nil && src == b.memoSrc && delta == b.memoDelta && batches == b.memoBatches {
+		b.memo[rid%memoSlots] = segRowMemo{rid, row}
+	}
+	b.memoMu.Unlock()
 	return row, true
 }
 
@@ -219,6 +279,17 @@ func (b *segRows) walkRowids(yield func(uint64) bool) {
 }
 
 // segGet is get over the overlay and the base.
+// segHas is whether segGet would find rid, without reading the row.
+func (s *rowStore) segHas(rid uint64) bool {
+	if _, ok := s.m[rid]; ok {
+		return true
+	}
+	if s.baseGone || s.gone[rid] {
+		return false
+	}
+	return s.seg.has(rid)
+}
+
 func (s *rowStore) segGet(rid uint64) ([]Value, bool) {
 	if vals, ok := s.m[rid]; ok {
 		return s.resolve(vals), true
@@ -283,16 +354,28 @@ func (s *rowStore) segEachSorted(yield func(uint64, []Value) bool) {
 	s.segEachSortedOver(s.seg.walk, yield)
 }
 
+// segEachSortedRaw is segEachSorted handing out the overlay's rows as m holds
+// them, a spilled row as its sentinel.
+func (s *rowStore) segEachSortedRaw(yield func(uint64, []Value) bool) {
+	s.segEachSortedOverWith(s.seg.walk, func(v []Value) []Value { return v }, yield)
+}
+
 // segEachSortedOver is segEachSorted over the base rows walk hands it, which
 // may be a subset (segRows.walkFiltered): every overlay row still goes out.
 func (s *rowStore) segEachSortedOver(walk func(func(uint64, []Value) bool), yield func(uint64, []Value) bool) {
+	s.segEachSortedOverWith(walk, s.resolve, yield)
+}
+
+// segEachSortedOverWith is segEachSortedOver reading each overlay row through
+// resolve.
+func (s *rowStore) segEachSortedOverWith(walk func(func(uint64, []Value) bool), resolve func([]Value) []Value, yield func(uint64, []Value) bool) {
 	over := s.overlaySorted()
 	oi := 0
 	stop := false
 	if !s.baseGone {
 		walk(func(rid uint64, vals []Value) bool {
 			for oi < len(over) && rowidLess(over[oi], rid) {
-				if v, ok := s.m[over[oi]]; ok && !yield(over[oi], s.resolve(v)) {
+				if v, ok := s.m[over[oi]]; ok && !yield(over[oi], resolve(v)) {
 					stop = true
 					return false
 				}
@@ -315,7 +398,7 @@ func (s *rowStore) segEachSortedOver(walk func(func(uint64, []Value) bool), yiel
 		return
 	}
 	for ; oi < len(over); oi++ {
-		if v, ok := s.m[over[oi]]; ok && !yield(over[oi], s.resolve(v)) {
+		if v, ok := s.m[over[oi]]; ok && !yield(over[oi], resolve(v)) {
 			return
 		}
 	}
@@ -365,11 +448,16 @@ func (s *rowStore) segMaxRowid() (uint64, bool) {
 		}
 	}
 	if !s.baseGone {
-		s.seg.walkRowids(func(rid uint64) bool {
-			if !s.gone[rid] && (!found || rowidLess(max, rid)) {
+		// From the top down: the first base rowid not deleted is the base's
+		// largest, so this stops there instead of walking every row.
+		s.seg.walkRowidsDesc(func(rid uint64) bool {
+			if s.gone[rid] {
+				return true
+			}
+			if !found || rowidLess(max, rid) {
 				max, found = rid, true
 			}
-			return true
+			return false
 		})
 	}
 	return max, found

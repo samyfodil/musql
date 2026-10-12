@@ -16,6 +16,11 @@ type Stmt struct {
 	sqlText string
 	info    engine.ParamInfo
 	isQuery bool
+	// argBuf is the bound-argument slice an Exec of this statement reuses (see
+	// execContextImpl): one []engine.Value per call is 280 bytes of every
+	// prepared INSERT in a loop. database/sql serialises calls on a driver
+	// statement under its connection's lock, so a call never overlaps another.
+	argBuf []engine.Value
 	// script is the individual statements of a ";"-separated SCRIPT, non-nil
 	// only for multi-statement text. Such a Stmt is Exec-only.
 	script []string
@@ -68,7 +73,20 @@ func (s *Stmt) execContextImpl(ctx context.Context, args []driver.NamedValue) (d
 	if s.script != nil {
 		return s.execScript(ctx)
 	}
-	eargs, err := bindArgs(s.info, args)
+	// An Exec that is not a query and returns no rows binds into the statement's
+	// own buffer: nothing keeps the slice after execArgs returns (the engine
+	// copies each Value into a register or a row; the bytes it keeps are
+	// driverValueToEngine's per-call copies), and it is cleared below, so a
+	// retained reference reads zeroes rather than the next call's arguments.
+	reuse := !s.isQuery && s.conn.plainDML(s.sqlText)
+	var eargs []engine.Value
+	var err error
+	if reuse {
+		eargs, err = bindArgsInto(s.argBuf, s.info, args)
+		s.argBuf = eargs
+	} else {
+		eargs, err = bindArgs(s.info, args)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +111,13 @@ func (s *Stmt) execContextImpl(ctx context.Context, args []driver.NamedValue) (d
 		}
 		return &execResult{rowsAffected: ra, lastInsertID: s.conn.lastInsertRowid}, nil
 	}
-	if _, err := s.conn.execArgs(s.sqlText, eargs); err != nil {
+	s.conn.resultDiscarded = true
+	_, err = s.conn.execArgs(s.sqlText, eargs)
+	s.conn.resultDiscarded = false
+	if reuse {
+		clear(eargs)
+	}
+	if err != nil {
 		return nil, err
 	}
 	// RowsAffected is the connection's current change count from sqlite3_changes(),
@@ -127,7 +151,18 @@ func valuesToNamed(args []driver.Value) []driver.NamedValue {
 // Positional args bind by Ordinal; named args resolve via info.ParamNames,
 // trying all three of SQLite's sigils (":name", "@name", "$name").
 func bindArgs(info engine.ParamInfo, args []driver.NamedValue) ([]engine.Value, error) {
-	out := make([]engine.Value, info.NumParams)
+	return bindArgsInto(nil, info, args)
+}
+
+// bindArgsInto is bindArgs over buf's storage when it is large enough. buf
+// must be all zero: an unbound parameter is NULL.
+func bindArgsInto(buf []engine.Value, info engine.ParamInfo, args []driver.NamedValue) ([]engine.Value, error) {
+	var out []engine.Value
+	if cap(buf) >= info.NumParams {
+		out = buf[:info.NumParams]
+	} else {
+		out = make([]engine.Value, info.NumParams)
+	}
 	for _, nv := range args {
 		v, err := driverValueToEngine(nv.Value)
 		if err != nil {

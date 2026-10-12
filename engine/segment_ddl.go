@@ -144,15 +144,19 @@ func (n *Session) rewriteFile() error {
 			return ErrDiskFull
 		}
 	}
-	if serr := syncSegFile(tmpPath); serr != nil {
-		n.endCtr--
-		return serr
+	if !db.inMemory { // see commitSync: nothing of an in-memory database outlives it
+		if serr := syncSegFile(tmpPath); serr != nil {
+			n.endCtr--
+			return serr
+		}
 	}
 	if rerr := os.Rename(tmpPath, n.segPath); rerr != nil {
 		n.endCtr--
 		return rerr
 	}
-	syncDir(n.segPath)
+	if !db.inMemory {
+		syncDir(n.segPath)
+	}
 	// A direct-path load's segments are in the file now. Its table's row store
 	// holds none of them, which is right only once rebase below has pointed the
 	// session at this file; until then they are kept, for the fallback after it.
@@ -167,7 +171,9 @@ func (n *Session) rewriteFile() error {
 	if rerr := os.Remove(segDeltaPath(n.segPath)); rerr != nil && !os.IsNotExist(rerr) {
 		return rerr
 	}
-	syncDir(n.segPath)
+	if !db.inMemory {
+		syncDir(n.segPath)
+	}
 
 	// The file's identity moved, so the session's pairing and its append point
 	// both start again from it.
@@ -182,7 +188,7 @@ func (n *Session) rewriteFile() error {
 	f.Close()
 	// Every row is now IN the segments, so the changes that produced them must not
 	// also be appended as a delta batch.
-	n.TakeRowChanges()
+	n.changeLog.reset()
 	// AND THE CATALOG IS NOW WRITTEN, which is what stops the next commit rewriting
 	// the file again. Losing this line made every commit take the rewrite path: the
 	// fingerprint never matched, so an ordinary INSERT rewrote the whole file, and
@@ -227,18 +233,25 @@ func (n *Session) rewriteFile() error {
 // took 0.5ms. Once the file IS the session's view -- every row the session
 // holds has just been written to it -- reading back from it loses nothing.
 //
-// Skipped inside a transaction (a savepoint's snapshot shares these stores),
-// while a table aliases another's storage (the alias shares its owner's store
-// object, which unloading both would split), and while there is a virtual
+// Skipped inside an engine transaction (a savepoint's snapshot shares these
+// stores) -- but not for a DRIVER-held one (DB.heldTransaction): that one is
+// committing right now, and its engine BEGIN, if any, was committed first
+// (commitHeldSession), so no snapshot is left. Skipping it too left every
+// table a driver transaction loaded in memory for the connection's life, with
+// no index to seek: "SELECT * FROM t WHERE sec = ?" after a 100,000-row
+// BEGIN...COMMIT sorted the whole table per query, 150 ms against C's 17 us.
+//
+// Also skipped while a table aliases another's storage (the alias shares its
+// owner's store object, which unloading both would split), and while there is a virtual
 // table: fts3/fts4/fts5 and rtree write their shadow tables through putRow,
 // which assumes a loaded store (fts3StoreSegment on an unloaded one was a nil
 // dereference in TestVirtualTableRowsSurviveAReopen).
 //
-// ponytail: a database with a virtual table keeps the old in-memory behavior;
+// A deliberate simplification: a database with a virtual table keeps the old in-memory behavior;
 // keep its shadow tables loaded and re-base the rest if that ever matters.
 func (n *Session) rebase(open func(string) (*ReadOnlyPager, error)) {
 	db := n.DB
-	if db.inTransaction() || len(db.vtabs) > 0 {
+	if db.txActive || len(db.vtabs) > 0 {
 		return
 	}
 	for _, t := range db.tables {
@@ -296,6 +309,20 @@ func (db *DB) segmentFileContentsOf(temp bool, w *segFileWriter) ([]ConvertedTab
 		if err := db.ensureTableLoaded(t); err != nil {
 			return nil, ConvertedCatalog{}, fmt.Errorf("engine: DDL: loading %s: %w", t.name, err)
 		}
+	}
+
+	// THE LARGEST SPILL BECOMES THE FILE (segFileWriter.adoptSpill): the
+	// segments of it this rewrite keeps are then already written. Its other
+	// segments, should later writes have broken them up, are dead space in the
+	// file until its next rewrite -- the space C's freelist would hold.
+	var big *spillFile
+	for _, t := range db.tables {
+		if t.isTemp == temp && t.rows != nil && t.rows.spill.adoptable() && (big == nil || t.rows.spill.at > big.at) {
+			big = t.rows.spill
+		}
+	}
+	if big != nil {
+		w.adoptSpill(big)
 	}
 
 	var tables []ConvertedTable
@@ -369,12 +396,18 @@ func (db *DB) segmentFileContentsOf(temp bool, w *segFileWriter) ([]ConvertedTab
 		// ONE SEGMENT IN HAND at a time (segCutter): the rows are read in rowid
 		// order and cut as they fill, so a table this session spilled
 		// (row_store_spill.go) is read back a segment at a time, not whole.
-		cut := &segCutter{cols: colInfos, what: t.name, emit: func(raw []byte) error { return w.addSegment(ti, raw) }}
+		// addSegment is done with a segment's bytes when it returns: it copies
+		// them or writes them out.
+		cut := &segCutter{cols: colInfos, what: t.name, reuse: true, emit: func(raw []byte) error { return w.addSegment(ti, raw) }}
+		run := spillRun{st: t.rows, cut: cut, nCols: len(colInfos), emit: func(sg *spillSeg) error { return w.addSpilled(ti, sg) }}
 		var cerr error
-		t.rows.eachSortedUntil(func(rid uint64, vals []Value) bool {
-			cerr = cut.add(rid, vals)
+		t.rows.eachSortedRaw(func(rid uint64, vals []Value) bool {
+			cerr = run.add(rid, vals)
 			return cerr == nil
 		})
+		if cerr == nil {
+			cerr = run.end()
+		}
 		if cerr == nil {
 			cerr = cut.flush()
 		}
@@ -495,7 +528,7 @@ func (db *DB) segmentFileContentsOf(temp bool, w *segFileWriter) ([]ConvertedTab
 // existing rows as SHORT, i.e. the new column's DEFAULT, as C reads a record
 // written before the edit.
 //
-// ponytail: only edits the catalog can SAY are written -- sql text, a name, an
+// A deliberate simplification: only edits the catalog can SAY are written -- sql text, a name, an
 // index/view/trigger's tbl_name, a deleted row, an inserted storage-less row. The
 // rest (a type change, a table's tbl_name apart from its name, a NULL text column,
 // an inserted row naming storage) is what C persists as a CORRUPT catalog, whose
@@ -543,7 +576,7 @@ func (db *DB) applyCatalogEditsForWrite(tables []ConvertedTable, cat ConvertedCa
 		}
 		if e.set[0] != nil {
 			if t, ok := text(e.set[0]); !ok || t != curType {
-				continue // unrepresentable: see the ponytail note above
+				continue // unrepresentable: see the simplification note above
 			}
 		}
 		name, sqlText := key.name, ""
@@ -670,7 +703,7 @@ func detachRowsFromMapping(t *tableMeta) {
 	// rewriting its rows -- they would land in its overlay with the base still
 	// on the mapping about to be closed. It becomes an owned in-memory store,
 	// which is what every table was before that store existed.
-	// ponytail: a full load, paid only by a table whose catalog entry a rewrite
+	// A deliberate simplification: a full load, paid only by a table whose catalog entry a rewrite
 	// changes; rebasing it onto the new file would avoid it.
 	if t.rows.seg != nil {
 		m := map[uint64][]Value{}
@@ -783,4 +816,65 @@ func pristineSegments(t *tableMeta) ([]*segment, bool) {
 		}
 	}
 	return segs, true
+}
+
+// spillRun feeds a table's rows, in rowid order and as its store holds them,
+// to a segCutter -- except where a run of them is exactly a segment the store
+// spilled (row_store_spill.go): every row of it, in its order, with no other
+// row between and the table's column count. Those rows are that segment's
+// bytes already, the bytes building them again would produce, so the segment
+// goes out as it is and the rows are never read back. A run that breaks
+// partway goes to the cutter row by row, as it would have without the spill.
+// spillSegsCopied counts spilled segments a commit copied as they were, so a
+// test can tell the copy ran.
+var spillSegsCopied int64
+
+type spillRun struct {
+	st    *rowStore
+	cut   *segCutter
+	nCols int
+	emit  func(sg *spillSeg) error
+
+	sg      *spillSeg // the segment the pending rows are a prefix of, or nil
+	rowids  []uint64
+	pending [][]Value // the run's sentinels, resolved only if it breaks
+}
+
+func (r *spillRun) add(rid uint64, vals []Value) error {
+	sg, i := r.st.spilledSegRow(vals)
+	if r.sg != nil && (sg != r.sg || i != len(r.rowids)) {
+		if err := r.end(); err != nil {
+			return err
+		}
+	}
+	if sg != nil && r.sg == nil && i == 0 && len(sg.seg.cols) == r.nCols {
+		r.sg = sg
+	}
+	if r.sg == nil {
+		return r.cut.add(rid, r.st.resolve(vals))
+	}
+	r.rowids = append(r.rowids, rid)
+	r.pending = append(r.pending, vals)
+	if len(r.rowids) < r.sg.seg.nRows {
+		return nil
+	}
+	// The whole segment: what is cut so far goes out first, then it.
+	if err := r.cut.flush(); err != nil {
+		return err
+	}
+	done := r.sg
+	r.sg, r.rowids, r.pending = nil, r.rowids[:0], r.pending[:0]
+	spillSegsCopied++
+	return r.emit(done)
+}
+
+// end sends a broken run's rows to the cutter.
+func (r *spillRun) end() error {
+	for k, rid := range r.rowids {
+		if err := r.cut.add(rid, r.st.resolve(r.pending[k])); err != nil {
+			return err
+		}
+	}
+	r.sg, r.rowids, r.pending = nil, r.rowids[:0], r.pending[:0]
+	return nil
 }

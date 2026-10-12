@@ -18,7 +18,7 @@ func insertProgramArmable(insns []Instruction, tbl *tableMeta, plan *insertPlan,
 			OpFunction, OpLike, OpGlob, OpClearSubtype, OpMakeRecord, OpHaltError, OpHaltIfNull,
 			OpMustBeInt, OpTypeCheck:
 			switch in.P4.(type) {
-			case nil, string, int64, float64, int, []byte, affinity, *typeCheckPlan:
+			case nil, string, int64, float64, int, []byte, affinity, []affinity, *typeCheckPlan:
 			default:
 				return false
 			}

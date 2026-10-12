@@ -43,6 +43,10 @@ type vdbeCursor struct {
 	// because every reader of rowVals copies out of it (readColumn, and
 	// fullRow's callers) before the cursor moves.
 	lazyNorm bool
+	// writeHint is how many rows a write statement is about to change through
+	// this cursor, when the seek that built it says (OpRewind reserves that much
+	// journal); zero otherwise.
+	writeHint int
 	normBuf  []Value
 
 	// rowStore, when non-nil, marks this as a WRITE-path cursor over a table's
@@ -491,15 +495,29 @@ func (cur *vdbeCursor) rewind() error {
 			// It refuses a column holding anything but integers and NULLs, and
 			// only an integer probe can use it; either falls to the walk.
 			if cur.idxSeekConfigured && !tbl.withoutRowid && tbl.rows != nil && cur.idxSeekProbe.Typ == Int {
-				if hits, ok := tbl.rows.eqRowids(cur.idxSeekCol, cur.idxSeekProbe.I); ok {
+				hits, ok := tbl.rows.segEqRowids(cur.idxSeekCol, cur.idxSeekProbe.I)
+				if !ok {
+					hits, ok = tbl.rows.eqRowids(cur.idxSeekCol, cur.idxSeekProbe.I)
+				}
+				if ok {
 					writeIndexSeeksServed.Add(1)
 					cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
+					// The stored rows are kept as they are and fixed up as each
+					// becomes current (lazyNorm), as materializeRowStore does, rather
+					// than copied here: a tenth of a table is thousands of rows.
+					lazy := rowStoreNormalizesLazily(tbl)
+					ncols := len(tbl.cols)
 					for _, rid := range hits {
 						if vals, found := tbl.rows.get(rid); found {
-							cur.rows = append(cur.rows, normalizeRow(tbl.name, tbl.cols, tbl.ipkIndex, rid, vals))
+							if !lazy || len(vals) != ncols {
+								vals = normalizeRow(tbl.name, tbl.cols, tbl.ipkIndex, rid, vals)
+							}
+							cur.rows = append(cur.rows, vals)
 							cur.rowids = append(cur.rowids, rid)
 						}
 					}
+					cur.lazyNorm = lazy
+					cur.writeHint = len(cur.rows)
 					if !slices.IsSorted(cur.rowids) { // the short rows come unioned at the end
 						sortRowsByRowid(cur)
 					}
@@ -987,16 +1005,7 @@ func (cur *vdbeCursor) materializeRowStore() {
 	// no REAL-affinity column, no row can ever need a copy, so the arena below
 	// would be pure waste. Generated columns take normalizeRow's widening path
 	// and are left to it entirely.
-	genCols := hasGeneratedCols(tbl.cols)
-	canNormalize := tbl.ipkIndex >= 0
-	if !canNormalize {
-		for _, c := range tbl.cols {
-			if c.Aff == affReal {
-				canNormalize = true
-				break
-			}
-		}
-	}
+	lazy := rowStoreNormalizesLazily(tbl)
 
 	// The store's rows are shared and must stay untouched, so the fix-up is
 	// DEFERRED to the moment each row becomes current (lazyNorm, advance): the
@@ -1004,7 +1013,6 @@ func (cur *vdbeCursor) materializeRowStore() {
 	// is never edited in place. This used to copy every row of the table into an
 	// arena up front -- 33% of every byte a 10,000-row UPDATE over 100,000 rows
 	// allocated, for an IPK slot a column read could answer from the rowid.
-	lazy := !genCols && canNormalize
 	for i, rid := range rowids {
 		vals := rows[i]
 		if lazy && len(vals) == ncols {
@@ -1026,6 +1034,25 @@ func (cur *vdbeCursor) materializeRowStore() {
 	if tbl.withoutRowid {
 		cur.orderByWithoutRowidPKOf(tbl)
 	}
+}
+
+// rowStoreNormalizesLazily reports whether a write cursor may hold tbl's stored
+// rows as they are and fix them up as each becomes current (lazyNorm): the table
+// has a column the fix-up applies to (an INTEGER PRIMARY KEY or a REAL one) and
+// no generated column, whose rows normalizeRow may widen.
+func rowStoreNormalizesLazily(tbl *tableMeta) bool {
+	if hasGeneratedCols(tbl.cols) {
+		return false
+	}
+	if tbl.ipkIndex >= 0 {
+		return true
+	}
+	for _, c := range tbl.cols {
+		if c.Aff == affReal {
+			return true
+		}
+	}
+	return false
 }
 
 // materializeRowStoreOrderHookForTest, when non-nil, is called with the row

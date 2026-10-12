@@ -307,7 +307,10 @@ func (db *DB) r35aNoteTempDatabaseOpen(sqlText string) {
 	if db.tempDatabaseOpened {
 		return
 	}
-	if r35aStatementOpensTempDatabase(sqlText) {
+	if sqlText != db.lastTempOpenText || sqlText == "" {
+		db.lastTempOpenText, db.lastTempOpen = sqlText, r35aStatementOpensTempDatabase(sqlText)
+	}
+	if db.lastTempOpen {
 		db.tempDatabaseOpened = true
 	}
 }
@@ -455,7 +458,30 @@ func r35aContainsFold(s, sub string) bool {
 	if len(sub) == 0 || len(s) < len(sub) {
 		return len(sub) == 0
 	}
-	for i := 0; i+len(sub) <= len(s); i++ {
+	// Candidates are the positions of sub's first byte in either case, found a
+	// block at a time: a statement can be megabytes of literal text, and a
+	// byte-at-a-time compare cost most of what a 150 KB vector INSERT spent
+	// here. Each candidate is still checked in full.
+	c0, alt := sub[0], sub[0]
+	if c0 >= 'a' && c0 <= 'z' {
+		alt = c0 - 'a' + 'A'
+	}
+	last := len(s) - len(sub) + 1 // candidate positions are [0, last)
+	for i := 0; i < last; i++ {
+		k := strings.IndexByte(s[i:last], c0)
+		end := last
+		if k >= 0 {
+			end = i + k
+		}
+		if alt != c0 {
+			if k2 := strings.IndexByte(s[i:end], alt); k2 >= 0 {
+				k, end = k2, i+k2
+			}
+		}
+		if k < 0 && end == last {
+			return false
+		}
+		i = end
 		j := 0
 		for ; j < len(sub); j++ {
 			if asciiLowerByte(s[i+j]) != sub[j] {

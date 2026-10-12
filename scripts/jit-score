@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# The JIT lowering score: how much of the TCL corpus the JIT reaches, and how
+# deep. Runs the corpus sweep twice in a jitscore build -- with the JIT and
+# without -- and prints reach, depth, the per-kind breakdown and the worklist
+# of opcodes still interpreted (compat-harness/jitscore).
+#
+#   scripts/jit-score              # the whole corpus
+#   scripts/jit-score '[a-c]' t    # only those chunks, as scripts/sweep takes them
+#
+# JITSCORE_DIR keeps the raw per-statement records (default: a temp dir);
+# JITSCORE_TAGS adds build tags (sqlite_fts5). An ordinary build counts
+# nothing: the counters exist only under -tags jitscore.
+set -u
+root=$(cd "$(dirname "$0")/.." && pwd)
+out=${JITSCORE_DIR:-$(mktemp -d)}
+tags=jitscore${JITSCORE_TAGS:+,$JITSCORE_TAGS}
+mkdir -p "$out" && rm -rf "$out/on" "$out/off"
+echo "jit-score: records in $out"
+JITSCORE_OUT=$out/on SWEEP_TAGS=$tags SWEEP_LOG=$out/log-on \
+  "$root/scripts/sweep" "$@" >"$out/sweep-on.txt" 2>&1
+JITSCORE_OUT=$out/off MUSQL_JIT=0 SWEEP_TAGS=$tags SWEEP_LOG=$out/log-off \
+  "$root/scripts/sweep" "$@" >"$out/sweep-off.txt" 2>&1
+cd "$root/compat-harness" && go run ./jitscore "$out/on" "$out/off"

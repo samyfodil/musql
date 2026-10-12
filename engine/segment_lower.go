@@ -16,7 +16,11 @@ import (
 // segLowered is a loop body compiled to the program JIT's IR, plus what the
 // caller must put in the register file before each run.
 type segLowered struct {
-	insns   []jit.ProgInsn
+	insns []jit.ProgInsn
+	// fusable is set as insns is built, when a step is appended right after
+	// one jit.Fusable pairs it with: EmitProgram's fusion pass runs only for
+	// a program that has such a pair, and costs nothing for one that has not.
+	fusable bool
 	cols    []int  // table column index for each column slot the program reads
 	nullCol []bool // parallel to cols: fill this slot from the NULL INDICATOR, not the value
 	consts  []int  // register slot for each constant, parallel to constVals
@@ -118,6 +122,17 @@ func segNullTestedOnly(body []Instruction) map[int]bool {
 		}
 	}
 	return out
+}
+
+// add appends steps to the program, noting a fusable pair (segLowered.fusable)
+// with one comparison against the step before each.
+func (l *segLowered) add(ins ...jit.ProgInsn) {
+	for _, in := range ins {
+		if n := len(l.insns); n > 0 && jit.Fusable(l.insns[n-1], in) {
+			l.fusable = true
+		}
+		l.insns = append(l.insns, in)
+	}
 }
 
 // clone copies a lowered body so several aggregates can share it, each
@@ -254,7 +269,7 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 					// A null test of a native LIKE's result: never NULL, so
 					// IsNull is never taken and NotNull always is.
 					if t.Op == OpNotNull {
-						out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpJump, A: t.P2 - base})
+						out.add(jit.ProgInsn{Op: jit.POpJump, A: t.P2 - base})
 					}
 					continue
 				}
@@ -273,13 +288,13 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 					flag := blocks[bi].flag
 					note(flag)
 					at := len(out.insns)
-					out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpTextMatch, A: flag, B: slot, C: jit.ProgNextRow,
+					out.add(jit.ProgInsn{Op: jit.POpTextMatch, A: flag, B: slot, C: jit.ProgNextRow,
 						Pat: lk.pat, Mode: lk.mode, Fold: textFold})
 					if lk.invert {
-						out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpNot, A: flag, B: flag})
+						out.add(jit.ProgInsn{Op: jit.POpNot, A: flag, B: flag})
 					}
 					j := len(out.insns)
-					out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpJump})
+					out.add(jit.ProgInsn{Op: jit.POpJump})
 					// over the POpService to the flag's POpJumpIfNotZero
 					irJumps = append(irJumps, [2]int{j, j + 2})
 					_ = at
@@ -297,16 +312,16 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 					out.textCol = append(out.textCol, true)
 					note(dst)
 					at := len(out.insns)
-					out.insns = append(out.insns,
+					out.add(
 						jit.ProgInsn{Op: jit.POpTextLen, A: dst, B: slot, C: at + 2},
 						jit.ProgInsn{Op: jit.POpJump})
 					irJumps = append(irJumps, [2]int{at + 1, at + 3})
 				}
 				out.blockIR = append(out.blockIR, len(out.insns))
-				out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpService, A: bi})
+				out.add(jit.ProgInsn{Op: jit.POpService, A: bi})
 				if blk := blocks[bi]; blk.flag >= 0 {
 					last := blk.insns[len(blk.insns)-1]
-					out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpJumpIfNotZero, A: last.P2 - base, B: blk.flag})
+					out.add(jit.ProgInsn{Op: jit.POpJumpIfNotZero, A: last.P2 - base, B: blk.flag})
 				}
 			}
 			continue
@@ -335,10 +350,10 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 				out.nullCol = append(out.nullCol, asNull)
 			}
 			note(in.P3)
-			out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpLoadCol, A: in.P3, B: slot})
+			out.add(jit.ProgInsn{Op: jit.POpLoadCol, A: in.P3, B: slot})
 		case OpInteger:
 			note(in.P2)
-			out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpSetConst, A: in.P2, B: in.P1})
+			out.add(jit.ProgInsn{Op: jit.POpSetConst, A: in.P2, B: in.P1})
 		case OpVariable:
 			// The value is not known until the statement runs, so the caller
 			// writes it into this register and the program just reads it. That
@@ -359,7 +374,7 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 			if store {
 				// "r[P3] <op> r[P1] -> r[P2]".
 				note(in.P2)
-				out.insns = append(out.insns, jit.ProgInsn{
+				out.add(jit.ProgInsn{
 					Op: jit.POpCmp, A: in.P2, B: in.P3, C: in.P1, Cond: cond})
 				break
 			}
@@ -368,7 +383,7 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 			// these, which is why treating every comparison as a store would
 			// not merely miss the shape -- it would answer it wrongly.
 			scratch := scratchReg
-			out.insns = append(out.insns,
+			out.add(
 				jit.ProgInsn{Op: jit.POpCmp, A: scratch, B: in.P3, C: in.P1, Cond: cond},
 				jit.ProgInsn{Op: jit.POpJumpIfNotZero, A: in.P2 - base, B: scratch})
 		case OpIfNot, OpIf:
@@ -376,14 +391,14 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 			if in.Op == OpIf {
 				op = jit.POpJumpIfNotZero
 			}
-			out.insns = append(out.insns, jit.ProgInsn{
+			out.add(jit.ProgInsn{
 				Op: op, A: in.P2 - base, B: in.P1})
 		case OpGoto:
-			out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpJump, A: in.P2 - base})
+			out.add(jit.ProgInsn{Op: jit.POpJump, A: in.P2 - base})
 		case OpIsNull:
 			if nullOnly[in.P1] {
 				// A REAL test, over the indicator block: jump when it is 1.
-				out.insns = append(out.insns, jit.ProgInsn{
+				out.add(jit.ProgInsn{
 					Op: jit.POpJumpIfNotZero, A: in.P2 - base, B: in.P1})
 				break
 			}
@@ -392,7 +407,7 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 		case OpNotNull:
 			if nullOnly[in.P1] {
 				// The mirror: jump when the indicator is 0.
-				out.insns = append(out.insns, jit.ProgInsn{
+				out.add(jit.ProgInsn{
 					Op: jit.POpJumpIfZero, A: in.P2 - base, B: in.P1})
 				break
 			}
@@ -401,10 +416,10 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 			// lowering it as an unconditional jump is what admits
 			// "k IN (1,3,5)" -- the equality tests it guards are the real work
 			// and they are already lowerable.
-			out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpJump, A: in.P2 - base})
+			out.add(jit.ProgInsn{Op: jit.POpJump, A: in.P2 - base})
 		case OpNot:
 			note(in.P2)
-			out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpNot, A: in.P2, B: in.P1})
+			out.add(jit.ProgInsn{Op: jit.POpNot, A: in.P2, B: in.P1})
 		case OpAdd, OpSubtract, OpMultiply, OpRemainder:
 			// The VDBE's arithmetic is "r[P3] = r[P2] <op> r[P1]" -- the RIGHT
 			// operand is P1 (vdbe_op.go's own note), which is why the operands
@@ -422,7 +437,7 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 				pop = jit.POpMul
 			}
 			note(in.P3)
-			out.insns = append(out.insns, jit.ProgInsn{Op: pop, A: in.P3, B: in.P2, C: in.P1})
+			out.add(jit.ProgInsn{Op: pop, A: in.P3, B: in.P2, C: in.P1})
 		case OpFunction:
 			// The builtin abs() of one argument, which over an int64 is |x|;
 			// abs(MinInt64) is SQLite's overflow error, which POpAbs flags so
@@ -431,7 +446,7 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 				return nil, false
 			}
 			note(in.P3)
-			out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpAbs, A: in.P3, B: in.P1})
+			out.add(jit.ProgInsn{Op: jit.POpAbs, A: in.P3, B: in.P1})
 		case OpNegative:
 			// -v as 0 - v. OpNegative's own doc note says a subtraction is NOT
 			// equivalent because it does not preserve IEEE negative zero -- and
@@ -441,7 +456,7 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 			// 0 - MinInt64, which declines the whole program to the VDBE.
 			note(scratchReg)
 			note(in.P2)
-			out.insns = append(out.insns,
+			out.add(
 				jit.ProgInsn{Op: jit.POpSetConst, A: scratchReg, B: 0},
 				jit.ProgInsn{Op: jit.POpSub, A: in.P2, B: scratchReg, C: in.P1})
 		case OpBitAnd, OpBitOr:
@@ -458,17 +473,17 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 				pop = jit.POpOr
 			}
 			note(in.P3)
-			out.insns = append(out.insns, jit.ProgInsn{Op: pop, A: in.P3, B: in.P2, C: in.P1})
+			out.add(jit.ProgInsn{Op: pop, A: in.P3, B: in.P2, C: in.P1})
 		case OpNull:
 			// A marker, proven unreachable below or the body is refused. It
 			// writes the lowering's scratch register, never a register the
 			// program reads.
 			note(scratchReg)
 			nullMarks = append(nullMarks, len(out.insns))
-			out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpSetConst, A: scratchReg, B: 0})
+			out.add(jit.ProgInsn{Op: jit.POpSetConst, A: scratchReg, B: 0})
 		case OpSCopy:
 			note(in.P2)
-			out.insns = append(out.insns, jit.ProgInsn{Op: jit.POpLoadReg, A: in.P2, B: in.P1})
+			out.add(jit.ProgInsn{Op: jit.POpLoadReg, A: in.P2, B: in.P1})
 		default:
 			return nil, false
 		}

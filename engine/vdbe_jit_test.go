@@ -51,7 +51,15 @@ func TestVMJITDifferential(t *testing.T) {
 		for i := range body {
 			pc := start + i
 			fwd := pc + 1 + rng.Intn(end-pc) // forward only, up to the ResultRow
-			switch rng.Intn(15) {
+			switch rng.Intn(19) {
+			case 15:
+				add([]OpCode{OpIsNull, OpNotNull}[rng.Intn(2)], r(), fwd, 0, nil, 0)
+			case 16:
+				add(OpNegative, r(), r(), 0, nil, 0)
+			case 17:
+				add(OpNull, 0, r(), 0, nil, 0)
+			case 18:
+				add(OpNegative, r(), r(), 0, nil, 0)
 			case 0:
 				add(OpInteger, int(ints[rng.Intn(5)]), r(), 0, nil, 0)
 			case 1:

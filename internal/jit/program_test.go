@@ -25,6 +25,7 @@ func TestProgArgsLayout(t *testing.T) {
 		{"Overflow", unsafe.Offsetof(p.Overflow), POffOverflow},
 		{"Sel", unsafe.Offsetof(p.Sel), POffSel},
 		{"PC", unsafe.Offsetof(p.PC), POffPC},
+		{"Cur", unsafe.Offsetof(p.Cur), POffCur},
 	} {
 		if c.got != c.want {
 			t.Errorf("ProgArgs.%s is at %d, generated code reads %d", c.name, c.got, c.want)
