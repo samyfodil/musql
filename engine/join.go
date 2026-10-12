@@ -1673,15 +1673,21 @@ func desugarJoinItem(state *joinDesugarState, idx int, it FromItem, name string,
 
 	var names []string
 	if it.Natural {
-		rightHas := make(map[string]bool, len(cols))
-		for _, c := range cols {
-			rightHas[r33sFoldIdent(c.Name)] = true
-		}
-		seen := make(map[string]bool, len(state.visible))
+		// sqlite3ProcessJoin synthesizes the USING list from the RIGHT table's
+		// columns, in its order and spelling, keeping each that some table on
+		// the left has (select.c:540-556).
+		leftHas := make(map[string]bool, len(state.visible))
 		for _, vc := range state.visible {
-			lname := r33sFoldIdent(vc.name)
-			if rightHas[lname] && !seen[lname] {
-				names = append(names, vc.name)
+			leftHas[r33sFoldIdent(vc.name)] = true
+		}
+		seen := make(map[string]bool, len(cols))
+		for _, c := range cols {
+			if c.Hidden {
+				continue
+			}
+			lname := r33sFoldIdent(c.Name)
+			if leftHas[lname] && !seen[lname] {
+				names = append(names, c.Name)
 				seen[lname] = true
 			}
 		}

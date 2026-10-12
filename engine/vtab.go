@@ -563,7 +563,36 @@ func (p *ReadOnlyPager) resolveVtabModuleForItem(it FromItem) (VtabModule, []str
 		}
 		m, ok := lookupVtabModule(it.Table)
 		if !ok {
-			return nil, nil, fmt.Errorf("engine: no such table-valued function: %s()", it.Table)
+			// A CTE or an ordinary table called with arguments. withExpand and
+			// selectExpander refuse it as "'%s' is not a function"
+			// (cannotBeFunction, select.c:5591), except a recursive CTE's own
+			// reference in its recursive arm, bound before that check: its
+			// arguments reach sqlite3WhereTabFuncArgs, which finds no hidden
+			// column for them (whereexpr.c:1921).
+			if _, _, isVtab, verr := p.createdVtabDef(it.Table); verr != nil || isVtab {
+				// A virtual table whose call this engine does not serve (an
+				// fts5 shape fts5RewriteTableFunc declines): C would call it.
+				return nil, nil, fmt.Errorf("engine: no such table-valued function: %s()", it.Table)
+			}
+			if it.Schema == "" {
+				if b, isCTE := p.lookupCTE(it.Table); isCTE {
+					if b.selfRef != nil {
+						return nil, nil, semanticf("engine: too many arguments on %s() - max 0", b.name)
+					}
+					return nil, nil, semanticf("engine: '%s' is not a function", it.Table)
+				}
+			}
+			if _, terr := p.resolveTableIn(fromItemScope(it), it.Table); terr == nil {
+				return nil, nil, semanticf("engine: '%s' is not a function", it.Table)
+			}
+			if _, isView, verr := p.resolveViewByNameIn(fromItemScope(it), it.Table); verr == nil && isView {
+				return nil, nil, semanticf("engine: '%s' is not a function", it.Table)
+			}
+			// Nothing of the name: sqlite3LocateTableItem's "no such table".
+			if it.Schema != "" {
+				return nil, nil, semanticf("engine: no such table: %s.%s", it.Schema, it.Table)
+			}
+			return nil, nil, semanticf("engine: no such table: %s", it.Table)
 		}
 		return m, nil, nil
 	}

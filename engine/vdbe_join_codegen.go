@@ -813,19 +813,24 @@ func groupJoinCommonNames(it FromItem, left []*tableScope, right *tableScope) []
 	if !it.Natural {
 		return nil
 	}
-	has := make(map[string]bool, len(right.cols))
-	for _, c := range right.cols {
-		has[r33sFoldIdent(c.Name)] = true
+	// The synthesized USING list: the right table's columns, in its order and
+	// spelling, that some table on the left has (sqlite3ProcessJoin).
+	has := map[string]bool{}
+	for _, ts := range left {
+		for _, c := range ts.cols {
+			has[r33sFoldIdent(c.Name)] = true
+		}
 	}
 	var out []string
 	seen := map[string]bool{}
-	for _, ts := range left {
-		for _, c := range ts.cols {
-			l := r33sFoldIdent(c.Name)
-			if has[l] && !seen[l] {
-				seen[l] = true
-				out = append(out, c.Name)
-			}
+	for _, c := range right.cols {
+		if c.Hidden {
+			continue
+		}
+		l := r33sFoldIdent(c.Name)
+		if has[l] && !seen[l] {
+			seen[l] = true
+			out = append(out, c.Name)
 		}
 	}
 	return out
@@ -1182,7 +1187,7 @@ func checkOneRebuiltGroup(members []FromItem, scopes map[int]compileScope, base 
 		// the one coalesced column already leads. Two distinct coalesced names produce
 		// an extra column (zz,x,y,y:1,p,r), so they decline. Stacking USING on the same
 		// name matches.
-		if len(coalesced) > 1 {
+		if len(coalesced) > 1 && members[0].GroupRebuildStarred {
 			return fmt.Errorf("%w: parenthesized join group coalescing %s in a position SQLite rebuilds the column list for (two distinct coalesced names add a copy this engine has no column for, and the second name is then ambiguous)", errVDBEUnsupported, strings.Join(coalesced, ","))
 		}
 		first := ""

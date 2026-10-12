@@ -225,7 +225,11 @@ func (p *ReadOnlyPager) compileRecursiveCTE(name string, b *cteBinding, cols []c
 		if len(prog.ColNames) != nCol {
 			b.selfRef = savedSelf
 			p.cteSelfRefLive--
-			return nil, fmt.Errorf("%w: engine: recursive table %s: SELECTs to the left and right of UNION do not have the same number of result columns (%d vs %d)", errVDBESemantic, b.name, nCol, len(prog.ColNames))
+			op := "UNION"
+			if rs.unionAll {
+				op = "UNION ALL"
+			}
+			return nil, semanticf("engine: SELECTs to the left and right of %s do not have the same number of result columns", op)
 		}
 		arms = append(arms, prog)
 	}
