@@ -53,7 +53,7 @@ type compiler struct {
 	// block once (upsert.c:325), so its OP_Once fires once per statement, while
 	// emitUpsertTail runs per unrolled tuple. A slot count, not a high-water mark,
 	// since a later tuple's VALUES may allocate slots first. Keyed by ON CONFLICT
-	// clause. ponytail: C codes a clause once per constraint it covers
+	// clause. A deliberate simplification: C codes a clause once per constraint it covers
 	// (insert.c:2363, 2589), so a target-less DO UPDATE hitting two constraints gets
 	// two OP_Onces there and shares one here.
 	upsertOnceSub map[int]onceSlots
@@ -362,7 +362,7 @@ type compiler struct {
 	//
 	// Write statements: INSERT values at 0; UPDATE/DELETE WHERE inside the loop;
 	// trigger programs start from the firing statement's value (trigger.c:1288),
-	// which is 0 everywhere this engine fires them. ponytail: a DELETE's
+	// which is 0 everywhere this engine fires them. A deliberate simplification: a DELETE's
 	// ONEPASS_SINGLE row would seed a body plan at 1, not 0; both sit under the
 	// "nRow < 3" automatic-index gate, so no plan differs. Carry the firing plan's
 	// nRowOut into the trigger compile if that stops holding.
@@ -791,10 +791,20 @@ func compileSubProgram(pager *ReadOnlyPager, stmt *SelectStmt, outer *compiler) 
 		pop := pager.pushCTEScope(stmt.CTEs)
 		defer pop()
 	}
+	// A subquery body's own FROM subqueries lose the result columns it never
+	// names, as sqlite3Select does before coding them (select.c:8038).
+	if pager != nil && len(stmt.From) != 0 {
+		stmt = pager.nullUnusedSubqueryColumns(stmt)
+	}
 	// A subquery body is a SELECT like any other to sqlite3Select: its own FROM
 	// clause is flattened (flattenSubquery, select.c:4290) and pushed down into
 	// (pushDownWhereTerms, select.c:5134) exactly as the top-level statement's
 	// is in execSelect. See flatten_projection.go and pushdown_where.go.
+	if pager != nil && outer == nil && pager.r41ArmsHeld == 0 && len(stmt.Compound) == 0 && len(stmt.From) != 0 {
+		if f := pager.countUnionAll(stmt); f != nil {
+			stmt = f
+		}
+	}
 	if pager != nil && pager.r41ArmsHeld == 0 && len(stmt.Compound) == 0 && len(stmt.From) != 0 {
 		stmt = pager.r41FlattenProjection(stmt)
 		if len(stmt.Compound) == 0 {
@@ -1324,6 +1334,13 @@ func (c *compiler) compileExistsSubquery(x ExistsExpr, top bool) (int, error) {
 	c.existsJoin, c.existsStmt, c.existsAt = savedExistsJoin, savedExistsStmt, savedExistsAt
 	if err != nil {
 		return 0, err
+	}
+	// The compile above has reported every unknown name; the result list is
+	// then dead code to EXISTS (existsBlankedStmt).
+	if blanked := existsBlankedStmt(x.Stmt); blanked != nil {
+		if prog2, err2 := c.liveSubSelect(blanked); err2 == nil {
+			prog = prog2
+		}
 	}
 	if c.pager == nil && c.liveDB == nil && prog.NCursors != 0 {
 		// compileScalarSubquery's belt-and-braces, for the same reason.

@@ -50,7 +50,7 @@ func (p *ReadOnlyPager) selectDeclTypes(stmt *SelectStmt, depth int) ([]string, 
 	nested := p.declTypeNestedSelects(stmt.From)
 	types := make([]string, len(outCols))
 	for i, oc := range outCols {
-		t, found := p.viewColumnDeclType(scopes, oc.expr, 0)
+		t, found := p.viewColumnDeclType(scopes, nil, oc.expr, 0)
 		if !found {
 			t = p.declTypeThroughNested(scopes, nested, oc.expr, depth)
 		}
@@ -90,6 +90,19 @@ func (p *ReadOnlyPager) declTypeNestedSelects(from []FromItem) map[string]*Selec
 				add(declTypeBareKey, it.Subquery)
 			}
 		case it.Table != "":
+			// A CTE is a subquery in the FROM too (its Table has pSelect set),
+			// and shadows a same-named view.
+			if b, ok := p.lookupCTE(it.Table); ok && it.Schema == "" {
+				if b.core != nil && b.recursive == nil && b.selfRef == nil {
+					name := it.Alias
+					if name == "" {
+						name = it.Table
+					}
+					add(name, b.core)
+					add(declTypeBareKey, b.core)
+				}
+				continue
+			}
 			if v, ok := p.r37cViewBody(it); ok && v != nil {
 				name := it.Alias
 				if name == "" {

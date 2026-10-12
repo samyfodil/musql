@@ -50,11 +50,19 @@ type vec1W struct {
 
 func (db *DB) vec1Writing(vm *vtabMeta, st *vec1Store) *vec1W {
 	c := db.vec1Conn()
+	// The writer of the last statement, while nothing it names has changed:
+	// built per statement, it was a map lookup and a key string per row of a
+	// prepared single-row INSERT. It holds no state of its own.
+	if w := vm.vec1w; w != nil && w.db == db && w.st == st && w.name == vm.name && vm.vec1wConn == c && vm.vec1wGen == c.gen {
+		return w
+	}
 	schema := "main"
 	if vm.isTemp {
 		schema = "temp"
 	}
-	return &vec1W{db: db, sh: db.vec1Shadow(createScope(vm.isTemp), vm.name), t: c.tab(schema, vm.name), st: st, name: vm.name, nMeta: st.nMeta}
+	w := &vec1W{db: db, sh: db.vec1Shadow(createScope(vm.isTemp), vm.name), t: c.tab(schema, vm.name), st: st, name: vm.name, nMeta: st.nMeta}
+	vm.vec1w, vm.vec1wConn, vm.vec1wGen = w, c, c.gen
+	return w
 }
 
 // begin is xBegin (vec1BeginMethod): the config loaded once per transaction.
@@ -331,7 +339,7 @@ func (w *vec1W) insertBase(rowidV Value, vec []byte, bucket int, meta []Value) (
 		rowid = r
 	} else {
 		rowid = valueToInt64Trunc(rowidV)
-		if _, exists, err := w.sh.get("_base", rowid); err != nil {
+		if exists, err := w.sh.has("_base", rowid); err != nil {
 			return 0, err
 		} else if exists {
 			// vec1 leaves no message of its own: the statement reports the bare
@@ -343,6 +351,8 @@ func (w *vec1W) insertBase(rowidV Value, vec []byte, bucket int, meta []Value) (
 	row[0] = Value{Typ: Null}
 	if w.t.mod.isFlat() {
 		row[1] = Value{Typ: Int, I: int64(bucket)}
+	} else if w.db.argsOwned {
+		row[1] = Value{Typ: Blob, S: vec} // the caller handed it over (DB.ExecArgsOwned)
 	} else {
 		row[1] = Value{Typ: Blob, S: append([]byte(nil), vec...)}
 	}
@@ -686,7 +696,9 @@ func (w *vec1W) updateBaseVector(rowid int64, v Value) error {
 		nrow = append(nrow, Value{Typ: Null})
 	}
 	nrow[1] = v
-	return w.sh.put("_base", rowid, nrow)
+	// The old row as put would have read it back: its Values copied, their
+	// bytes shared -- a stored row is never edited in place.
+	return w.sh.putOld("_base", rowid, nrow, append([]Value(nil), row...), true)
 }
 
 // rebuildIndex is vec1RebuildIndex: %_idx and %_meta emptied and rebuilt from

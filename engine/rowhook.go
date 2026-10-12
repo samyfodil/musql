@@ -53,36 +53,45 @@ func (db *DB) RowChangeCaptureEnabled() bool { return db.captureFull }
 func (db *DB) enableDeltaRowCapture() { db.captureChanges = true }
 
 // PeekRowChanges returns the changes recorded so far without clearing them.
-func (db *DB) PeekRowChanges() []RowChange { return db.changeLog }
+//
+// The slice is a copy, in one piece; the log itself is chunked (changelog.go).
+func (db *DB) PeekRowChanges() []RowChange { return db.changeLog.flat(0) }
 
 // TakeRowChanges returns and clears the changes recorded so far.
 func (db *DB) TakeRowChanges() []RowChange {
-	out := db.changeLog
-	db.changeLog = nil
+	out := db.changeLog.flat(0)
+	db.changeLog.reset()
 	return out
 }
 
-// recycleChangeLog gives a log taken by TakeRowChanges back as the next
-// statement's empty one, cleared so it pins no row. Only when nothing has been
-// logged since and capture is delta-only: under full capture a consumer may
-// still hold the changes.
-func (db *DB) recycleChangeLog(log []RowChange) {
-	if db.captureFull || db.changeLog != nil || cap(log) == 0 || cap(log) > 1<<14 {
+// takeChangeLog hands the log to a commit, which reads it with all() and gives
+// it back with recycleChangeLog. The session starts a fresh, empty one.
+func (db *DB) takeChangeLog() *changeLog {
+	l := new(changeLog)
+	*l, db.changeLog = db.changeLog, changeLog{}
+	return l
+}
+
+// recycleChangeLog gives a log taken by takeChangeLog back as the session's
+// empty one, cleared so it pins no row. Only when nothing has been logged since
+// and capture is delta-only: under full capture a consumer may still hold the
+// changes. Its chunks are kept (changeLog.reset), so a transaction of up to
+// 65,536 rows logs without allocating.
+func (db *DB) recycleChangeLog(log *changeLog) {
+	if db.captureFull || db.changeLog.n != 0 {
 		return
 	}
-	clear(log)
-	db.changeLog = log[:0]
+	log.reset()
+	db.changeLog = *log
 }
 
 // changeMark returns a point in the change log to truncate back to (see
 // truncateChanges), for a caller about to apply rows it may later undo.
-func (db *DB) changeMark() int { return len(db.changeLog) }
+func (db *DB) changeMark() int { return db.changeLog.len() }
 
 // truncateChanges drops every change recorded since mark.
 func (db *DB) truncateChanges(mark int) {
-	if mark <= len(db.changeLog) {
-		db.changeLog = db.changeLog[:mark]
-	}
+	db.changeLog.truncate(mark)
 }
 
 // noteRowChange records one mutation, if capture is on.
@@ -106,15 +115,7 @@ func (db *DB) noteRowChange(tbl *tableMeta, kind RowChangeKind, rowid uint64, ol
 			logged = nil
 		}
 	}
-	// Grow changeLog by doubling to reduce allocations.
-	if len(db.changeLog) == cap(db.changeLog) {
-		n := 2 * cap(db.changeLog)
-		if n == 0 {
-			n = 8
-		}
-		db.changeLog = append(make([]RowChange, 0, n), db.changeLog...)
-	}
-	db.changeLog = append(db.changeLog, RowChange{
+	db.changeLog.push(RowChange{
 		Table: tbl.name,
 		Temp:  tbl.isTemp,
 		Cols:  cols,
@@ -135,8 +136,14 @@ func (db *DB) journalDDL(sqlText string, mark int) {
 	if _, ddl := StatementTargetSchema(sqlText); !ddl {
 		return
 	}
-	mark = min(mark, len(db.changeLog))
-	db.changeLog = slices.Insert(db.changeLog, mark, RowChange{Kind: RowSchema, SQL: sqlText})
+	// Rare (a DDL statement under full capture), so the log is rebuilt around
+	// the new entry rather than made to support insertion.
+	mark = min(mark, db.changeLog.len())
+	flat := slices.Insert(db.changeLog.flat(0), mark, RowChange{Kind: RowSchema, SQL: sqlText})
+	db.changeLog.reset()
+	for _, c := range flat {
+		db.changeLog.push(c)
+	}
 }
 
 // MovedFrom is the rowid an UPDATE moved this row off, and whether it moved.
@@ -148,7 +155,7 @@ func (db *DB) noteRowUpdate(tbl *tableMeta, oldRowid, newRowid uint64, old, new 
 	if !db.captureChanges || oldRowid == newRowid {
 		return
 	}
-	c := &db.changeLog[len(db.changeLog)-1]
+	c := db.changeLog.last()
 	c.movedFrom, c.moved = int64(oldRowid), true
 	if db.captureFull {
 		c.Old = copyHookRow(tbl, oldRowid, old) // its IPK is the OLD rowid
@@ -174,4 +181,4 @@ func copyHookRow(tbl *tableMeta, rowid uint64, vals []Value) []Value {
 }
 
 // HasUncommittedChanges reports whether this session has uncommitted changes.
-func (db *DB) HasUncommittedChanges() bool { return len(db.changeLog) > 0 }
+func (db *DB) HasUncommittedChanges() bool { return db.changeLog.len() > 0 }

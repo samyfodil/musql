@@ -137,7 +137,7 @@ func existsJoinSource(p *ReadOnlyPager, sub *SelectStmt, name string) (joinSourc
 	plain := false
 	for i := range rows {
 		if scope.accepts(rows[i].Temp) && rows[i].Type == "table" && equalFoldName(rows[i].Name, it.Table) {
-			// ponytail: a TEMP table would need its own catalog's statistics
+			// A deliberate simplification: a TEMP table would need its own catalog's statistics
 			// (joinSource.dbIdx); declined until one shows up.
 			plain = !rows[i].Temp && !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(rows[i].SQL)), "CREATE VIRTUAL")
 		}

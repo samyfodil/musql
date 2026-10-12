@@ -3170,7 +3170,7 @@ func (db *DB) renameColumn(tbl *tableMeta, oldName, newName string, newQuoted bo
 // temp-schema pass meant for main tables (alter.c:667-672), which re-resolves
 // the renamed text against the not-yet-reloaded schema and fails on the first
 // object ("error in view tv: no such column: z"). Objects go in creation order.
-// ponytail: the column is named by the first byte the rename changed, which
+// A deliberate simplification: the column is named by the first byte the rename changed, which
 // matched C's first failure in every probed shape; a statement resolved out of
 // text order could name another reference.
 func (db *DB) tempRenameColumnSecondPass(savedTriggers map[*triggerMeta]triggerMeta, oldViewSQL map[*viewMeta]string) error {

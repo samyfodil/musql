@@ -11,9 +11,11 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 	"sync/atomic"
 	"unsafe"
+
+	"github.com/samyfodil/musql/internal/jit"
 )
 
 // vdbe holds one execution's mutable state: the register file, the open
@@ -24,8 +26,16 @@ import (
 // executions.
 type vdbe struct {
 	regs         []Value
-	jx           *vmJIT // native code for the program run() is given, when it has some
-	jitEnters    int    // entries into jx, which the fuel test counts
+	jx           *vmJIT        // native code for the program run() is given, when it has some
+	jcur         []jit.VCursor // native code's view of the cursors it names, filled at each entry
+	// jargs is the argument block of every entry into native code: kept on the
+	// machine and only its live fields set per entry, because zeroing a fresh
+	// one -- most of it the segment JIT's -- was a measurable share of a short
+	// entry.
+	jargs jit.ProgArgs
+	jsnap        []jitSnap     // the copies of the rows of cursors it can read but not walk
+	jitEnters    int           // entries into jx, which the fuel test counts
+	jitRows      int           // result rows native code copied out, which the pointer tests count
 	cursors      []*vdbeCursor
 	recRegs      [][]Value
 	sorters      []*vdbeSorter
@@ -575,8 +585,61 @@ func autoIndexOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) 
 	for i := range perm {
 		perm[i] = i
 	}
-	sort.SliceStable(perm, func(x, y int) bool {
-		a, b := perm[x], perm[y]
+	// Every key value an integer -- an INTEGER column's, and the rowid --
+	// compares as one, under any collating sequence: the keys are copied out
+	// flat once and compared as int64s, not fetched as Values per comparison.
+	nk := len(key.cols)
+	flat := make([]int64, 0, len(perm)*nk)
+	for i := range perm {
+		for _, kc := range key.cols {
+			v := at(i, kc)
+			if v.Typ != Int {
+				flat = nil
+				break
+			}
+			flat = append(flat, v.I)
+		}
+		if flat == nil {
+			break
+		}
+	}
+	// Stable by the last comparison, on the rows' original positions, which
+	// makes the order total: an unstable sort then gives exactly the stable
+	// one's permutation, in O(n log n) where sort.SliceStable's in-place
+	// merges took most of a 100,000-row scan's time.
+	if flat != nil {
+		slices.SortFunc(perm, func(a, b int) int {
+			ka, kb := flat[a*nk:a*nk+nk], flat[b*nk:b*nk+nk]
+			for k := range ka {
+				if ka[k] != kb[k] {
+					c := 1
+					if ka[k] < kb[k] {
+						c = -1
+					}
+					if k < len(key.desc) && key.desc[k] {
+						return -c // a DESC column, as below
+					}
+					return c
+				}
+			}
+			return a - b
+		})
+	} else {
+		autoIndexSortValues(perm, key, at, enc)
+	}
+	rows := make([][]Value, len(perm))
+	rowids := make([]uint64, len(perm))
+	for i, p := range perm {
+		rows[i], rowids[i] = cur.rows[p], cur.rowids[p]
+	}
+	cur.rows, cur.rowids = rows, rowids
+}
+
+// autoIndexSortValues is autoIndexOrderCursor's sort over keys that are not
+// all integers: each comparison fetches the values and compares them under
+// their columns' collating sequences.
+func autoIndexSortValues(perm []int, key *autoIndexKey, at func(i, kc int) Value, enc TextEncoding) {
+	slices.SortFunc(perm, func(a, b int) int {
 		for k, kc := range key.cols {
 			c := compareValuesCollatedEnc(at(a, kc), at(b, kc), key.colls[k], enc)
 			if c != 0 {
@@ -585,19 +648,13 @@ func autoIndexOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) 
 					// walk visits its values from largest to smallest. NULLs,
 					// which sort first ascending, therefore come LAST here --
 					// which is exactly what negating the comparison gives.
-					return c > 0
+					return -c
 				}
-				return c < 0
+				return c
 			}
 		}
-		return false
+		return a - b
 	})
-	rows := make([][]Value, len(perm))
-	rowids := make([]uint64, len(perm))
-	for i, p := range perm {
-		rows[i], rowids[i] = cur.rows[p], cur.rowids[p]
-	}
-	cur.rows, cur.rowids = rows, rowids
 }
 
 // rowSubCmpColumn compares ONE column position of a row-value comparison under
@@ -1099,9 +1156,19 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 		code = jx.marked
 	}
 	jitSkip := -1
+	if jitScore {
+		native := 0
+		if jx != nil {
+			native = jx.native
+		}
+		jitScoreProgram(len(insns), native)
+	}
 	for pc < len(insns) {
 		op := &code[pc]
 	dispatch:
+		if jitScore && op.Op != OpJIT {
+			jitScoreStep(op.Op)
+		}
 		switch op.Op {
 		case OpJIT:
 			if pc == jitSkip {
@@ -1109,9 +1176,41 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				op = &insns[pc]
 				goto dispatch
 			}
+			// An entry whose first cursor native code could not use would only
+			// pay for the call and exit at that instruction.
+			if g := jx.gate[pc]; g >= 0 && (int(g) >= len(m.cursors) || m.cursors[g] == nil) {
+				op = &insns[pc]
+				goto dispatch
+			}
 			m.jitEnters++
-			pc = jx.enter(m.regs, pc)
-			jitSkip = pc
+			if jitScore {
+				jitScoreEnter()
+			}
+			next, n := jx.enter(m, pc, &rows)
+			pc = next
+			if n < 0 {
+				jitSkip = pc
+				continue
+			}
+			// Native code ran an OpResultRow of n registers (the one before
+			// pc) and copied the row where enter said; what is left of that
+			// opcode's body is handing it over, as its case below does.
+			m.jitRows++
+			if m.yieldReuse && len(rows) == 0 {
+				m.yieldRow = m.yieldRow[:n]
+				m.yieldRows = append(m.yieldRows[:0], m.yieldRow)
+				m.resumePC = pc
+				return m.yieldRows, nil
+			}
+			row := []Value{}
+			if n > 0 {
+				row = m.recAlloc(n) // the n Values at the head of the chunk, which hold the row
+			}
+			rows = append(rows, row)
+			if m.yield {
+				m.resumePC = pc
+				return rows, nil
+			}
 			continue
 
 		case OpInit:
@@ -1247,7 +1346,14 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				m.resumePC = pc + 1
 				return m.yieldRows, nil
 			}
-			row := make([]Value, op.P2)
+			// From the record arena, not one allocation a row: a derived table or a
+			// compound arm hands tens of thousands of these to its consumer, who
+			// keeps them. A row's capacity ends at its last value (recAlloc), so
+			// an append to it cannot reach its neighbour.
+			row := []Value{}
+			if op.P2 > 0 {
+				row = m.recAlloc(op.P2)
+			}
 			copy(row, m.regs[op.P1:op.P1+op.P2])
 			rows = append(rows, row)
 			if m.maxRows > 0 && len(rows) >= m.maxRows {
@@ -1426,6 +1532,15 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			m.regs[op.P2] = bitNotValueUnary(m.regs[op.P1])
 
 		case OpAffinity:
+			if affs, ok := op.P4.([]affinity); ok {
+				// The range form: r[P1+i] takes affs[i] (P2 of them).
+				for i, aff := range affs {
+					if r := op.P1 + i; !affinityIsIdentity(m.regs[r].Typ, aff) {
+						m.regs[r] = applyAffinityToValue(m.regs[r], aff)
+					}
+				}
+				break
+			}
 			if aff := op.P4.(affinity); !affinityIsIdentity(m.regs[op.P1].Typ, aff) {
 				m.regs[op.P1] = applyAffinityToValue(m.regs[op.P1], aff)
 			}
@@ -1920,6 +2035,10 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			cur.params = m.params
 			if rerr := cur.rewind(); rerr != nil {
 				return nil, rerr
+			}
+			if cur.writeHint > 0 && m.wctx != nil {
+				m.wctx.journal = slices.Grow(m.wctx.journalSlice(), cur.writeHint)
+				cur.writeHint = 0
 			}
 			if !cur.advance() {
 				if cur.streamErrPending != nil {

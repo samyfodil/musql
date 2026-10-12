@@ -234,6 +234,58 @@ func countOfViewArmIsAggregate(arm *SelectStmt) bool {
 // A failure of any kind refuses the rewrite rather than being reported, so the
 // ordinary compile raises whatever message it always raised.
 func countOfViewProbeResolves(p *ReadOnlyPager, arms []*SelectStmt, outer *compiler, rowOuter *evalCtx) bool {
+	// An aggregate call written in a deleted arm still counts: C resolves the
+	// whole statement first, so a call whose argument names an enclosing
+	// query's column has already made THAT query an aggregate (NC_HasAgg,
+	// resolve.c:1355-1361) by the time the arm's list is replaced -- one row,
+	// not one per row of the enclosing FROM. Compiling each arm as the
+	// subquery it is lets the compile report such a call to its owner
+	// (hoistAggregatesOutward), which recompiles as an aggregate query. A
+	// context that cannot take a hoist (a trigger body, a register-backed row
+	// scope) refuses the rewrite when an arm holds one.
+	if rowOuter != nil || enclosingTriggerCtx(outer) != nil {
+		for _, arm := range arms {
+			for _, c := range arm.Columns {
+				if containsAggregate(c.Expr) {
+					return false
+				}
+			}
+		}
+		return countOfViewProbeNames(p, arms, outer, rowOuter)
+	}
+	for i, arm := range arms {
+		probe := arm
+		if i == 0 && len(arm.Compound) != 0 {
+			// The first arm of a compound is the compound itself in this AST;
+			// compileCompound compiles a private copy that names it, and so
+			// does this.
+			cp := *arm
+			cp.Compound = nil
+			cp.r35dCompoundOf = arm
+			probe = &cp
+		}
+		if _, err := compileSubProgram(p, probe, outer); err != nil {
+			// A call recorded for an owner makes it recompile as an aggregate
+			// query; refuse here so that recompile sees the arm as written.
+			for oc := outer; oc != nil; oc = oc.outer {
+				if oc.hoist != nil && len(oc.hoist.specs) > 0 {
+					return false
+				}
+			}
+			// Otherwise no query can take the call (its owner holds it outside
+			// its select list): C deletes the arm before that matters, as
+			// aggnested.test's dbsqlfuzz statement shows, so only the names
+			// the arm resolves are left to check.
+			return countOfViewProbeNames(p, arms, outer, rowOuter)
+		}
+	}
+	return true
+}
+
+// countOfViewProbeNames is the name-resolution half of the probe alone: every
+// expression compiled at the arm's own level (FROM-less, against the
+// enclosing chain), with each aggregate call replaced by its own arguments.
+func countOfViewProbeNames(p *ReadOnlyPager, arms []*SelectStmt, outer *compiler, rowOuter *evalCtx) bool {
 	var cols []SelectColumn
 	for _, arm := range arms {
 		for _, c := range arm.Columns {

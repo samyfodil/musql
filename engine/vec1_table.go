@@ -304,6 +304,9 @@ type Vec1Connection struct {
 	nThread int
 	nProbe  float64
 	tabs    map[string]*vec1Tab
+	// gen moves whenever a table's state is dropped (forget), so a writer
+	// kept from before knows its vec1Tab may be gone (vtabMeta.vec1w).
+	gen uint64
 }
 
 // NewVec1Connection is a connection's vec1 state, as initExtension sets it.
@@ -360,6 +363,7 @@ func (c *Vec1Connection) forget(schema, name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.tabs, vec1TabKey(schema, name))
+	c.gen++
 }
 
 // vec1NoModel is the model of a table never given one.

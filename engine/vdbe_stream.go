@@ -51,6 +51,13 @@ type subStream struct {
 	done    bool
 	started bool
 	keep    []bool // derivedSource.keepSubtype
+
+	// A UNION ALL chain streams as one co-routine per arm, run back to back:
+	// rest holds the arms not yet started, and parent/pager what newMachine
+	// needs to start the next one. nil for any other source.
+	rest   []*Program
+	parent *vdbe
+	pager  *ReadOnlyPager
 }
 
 // streamsDerived reports whether OpOpenDerived should open ds as a co-routine
@@ -63,6 +70,15 @@ type subStream struct {
 // fresh image), and the UPDATE ... FROM destinations, which post-process the
 // whole row set.
 func (m *vdbe) streamsDerived(ds *derivedSource, insns []Instruction) bool {
+	if ds.prog != nil && ds.prog.Compound != nil {
+		// A UNION ALL chain concatenates its arms and nothing more, so a
+		// co-routine over the arms in order yields what combineCompound would
+		// have built, without holding the rows. It is read at most once (the
+		// outermost source), and only by a read: a write machine would
+		// interleave its own writes with the arms' scans.
+		return (ds.stream == streamIfYielding || ds.stream == streamCoroutine) && m.wctx == nil && ds.upfrom == nil && ds.viewUpfrom == nil &&
+			ds.prog.Compound.streamable()
+	}
 	if ds.stream == streamNever || ds.prog == nil || ds.prog.Correlated || ds.prog.Compound != nil ||
 		ds.prog.LiveSource != nil || ds.upfrom != nil || ds.viewUpfrom != nil {
 		return false
@@ -85,7 +101,12 @@ func (m *vdbe) streamsDerived(ds *derivedSource, insns []Instruction) bool {
 // pseudo-rows), marked to yield. A streamAlways source starts a new sink; any
 // other shares this machine's.
 func (m *vdbe) newSubStream(ds *derivedSource, pager *ReadOnlyPager) *subStream {
-	child := ds.prog.newMachine(pager, nil, m.params, m)
+	prog := ds.prog
+	var rest []*Program
+	if cp := prog.Compound; cp != nil {
+		prog, rest = cp.arms[0], cp.arms[1:]
+	}
+	child := prog.newMachine(pager, nil, m.params, m)
 	child.yield, child.yieldReuse = true, true
 	child.sink = m.sink
 	if ds.stream == streamAlways {
@@ -97,7 +118,7 @@ func (m *vdbe) newSubStream(ds *derivedSource, pager *ReadOnlyPager) *subStream 
 			child.sink.bounded = true
 		}
 	}
-	return &subStream{m: child, prog: ds.prog, keep: ds.keepSubtype}
+	return &subStream{m: child, prog: prog, keep: ds.keepSubtype, rest: rest, parent: m, pager: pager}
 }
 
 // next returns the co-routine's next row, resuming it when nothing is
@@ -114,7 +135,19 @@ func (s *subStream) next() (row []Value, ok bool, err error) {
 		}
 		s.buf = rows
 		if s.m.done {
-			s.done = true
+			if len(s.rest) == 0 {
+				s.done = true
+			} else {
+				// The next arm starts on the resume after this one's last row
+				// has been handed out. This arm's machine is not pooled: the
+				// row just returned may still live in its yield buffer.
+				prog := s.rest[0]
+				s.rest = s.rest[1:]
+				child := prog.newMachine(s.pager, nil, s.parent.params, s.parent)
+				child.yield, child.yieldReuse = true, true
+				child.sink = s.parent.sink
+				s.m, s.prog = child, prog
+			}
 		}
 	}
 	row = s.buf[0]
