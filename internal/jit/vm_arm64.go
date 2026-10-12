@@ -80,7 +80,9 @@ func emitVMArm(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cac
 			if e.cache && e.heads[pc] {
 				padArm(a, loopAlign)
 			}
-		} else if e.cache && (pc < len(entry) && entry[pc] || vmFusedEntry(prog, entry, pc-1)) {
+		} else if e.cache && pc < len(entry) && entry[pc] && in.Op != VFused {
+			// (An entry at a fused pair's second pc has a block of its own,
+			// below; the run goes through the pair knowing what it knew.)
 			e.entryPoint(pc)
 		}
 		a.Label(vmBlock(pc))
@@ -105,8 +107,8 @@ func emitVMArm(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cac
 	a.Label("end")
 	e.exitAt(n)
 	e.island("")
-	// An entry at a fused pair's second pc runs its test alone, then rejoins
-	// the run after the pair through that pc's entry stub.
+	// An entry at a fused pair's second pc runs its test alone, then goes on
+	// at the next pc as on amd64 (vm_amd64.go).
 	for pc, in := range prog {
 		if !vmFusedEntry(prog, entry, pc) {
 			continue
@@ -128,8 +130,10 @@ func emitVMArm(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cac
 			a.B("end")
 		case vmRunStart(prog, bound, pc+1):
 			e.jmpBlock(pc, pc+1)
-		default:
+		case pc+1 < len(entry) && entry[pc+1]:
 			a.B(fmt.Sprintf("n%d", pc+1))
+		default:
+			a.B(e.stub(pc + 1))
 		}
 		if (len(a.buf)-islandAt)*4 >= islandBytes {
 			e.island("")
@@ -908,13 +912,20 @@ func (e *vmEmitArm) column(pc int, in VInsn) {
 	// A string or blob is copied with its pointer, as on amd64.
 	e.skips++
 	plain := fmt.Sprintf("s%d.col", e.skips)
-	e.ldrAt(X11, row, vb+L.OffS)
+	// The destination's first: a far register's load goes through X11.
 	if !e.know.noS[in.C] {
 		e.ldr(X12, in.C, L.OffS)
+		e.ldrAt(X11, row, vb+L.OffS)
 		a.OrrReg(X11, X11, X12)
+	} else {
+		e.ldrAt(X11, row, vb+L.OffS)
 	}
 	a.Cbz(X11, plain)
 	e.branchWB(pc)
+	for _, f := range []int{L.OffS, L.OffS + 8, L.OffS + 16} {
+		e.ldrAt(X12, row, vb+f)
+		e.str(X12, in.C, f)
+	}
 	a.Label(plain)
 	val := X9
 	if u := e.nextUse(in.C, pc); u >= 0 {
@@ -926,10 +937,8 @@ func (e *vmEmitArm) column(pc int, in VInsn) {
 	e.str(X12, in.C, 0)
 	e.ldrAt(val, row, vb+L.OffI)
 	e.str(val, in.C, L.OffI)
-	for _, f := range []int{L.OffF, L.OffS, L.OffS + 8, L.OffS + 16} {
-		e.ldrAt(X12, row, vb+f)
-		e.str(X12, in.C, f)
-	}
+	e.ldrAt(X12, row, vb+L.OffF)
+	e.str(X12, in.C, L.OffF)
 	for k, m := range e.holds {
 		if m == val && k != ^in.A {
 			delete(e.holds, k)
@@ -950,15 +959,22 @@ func (e *vmEmitArm) copyAny(pc int, in VInsn) {
 	}
 	e.skips++
 	plain := fmt.Sprintf("s%d.cp", e.skips)
-	e.ldr(X11, in.A, L.OffS)
+	// B's first: a far register's load goes through X11.
 	if !e.know.noS[in.B] {
 		e.ldr(X12, in.B, L.OffS)
+	}
+	e.ldr(X11, in.A, L.OffS)
+	if !e.know.noS[in.B] {
 		a.OrrReg(X11, X11, X12)
 	}
 	a.Cbz(X11, plain)
 	e.branchWB(pc)
+	for _, f := range []int{L.OffS, L.OffS + 8, L.OffS + 16} {
+		e.ldr(X9, in.A, f)
+		e.str(X9, in.B, f)
+	}
 	a.Label(plain)
-	for f := 0; f < L.Size; f += 8 {
+	for _, f := range []int{0, L.OffI, L.OffF} {
 		e.ldr(X9, in.A, f)
 		e.str(X9, in.B, f)
 	}

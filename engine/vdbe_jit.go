@@ -605,7 +605,10 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 		}
 		if !m.yield {
 			if cap(*rows) == len(*rows) {
-				*rows = slices.Grow(*rows, max(16, len(*rows)))
+				// Grown as append would grow it, so a subquery that returns one
+				// row allocates for one; native code gathers rows only as far as
+				// the capacity goes, and the VDBE's append past it grows the next.
+				*rows = slices.Grow(*rows, 1)
 			}
 			spare := (*rows)[len(*rows):cap(*rows)]
 			args.RowsBuf, args.RowsCap = (*int64)(unsafe.Pointer(unsafe.SliceData(spare))), int64(len(spare))

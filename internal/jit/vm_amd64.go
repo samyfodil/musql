@@ -76,7 +76,9 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 		if vmRunStart(prog, bound, pc) {
 			e.forget()
 			e.alignLoopHead(pc)
-		} else if e.cache && (pc < len(entry) && entry[pc] || vmFusedEntry(prog, entry, pc-1)) {
+		} else if e.cache && pc < len(entry) && entry[pc] && in.Op != VFused {
+			// (An entry at a fused pair's second pc has a block of its own,
+			// below; the run goes through the pair knowing what it knew.)
 			e.entryPoint(pc)
 		}
 		e.blockOff[pc] = len(a.buf)
@@ -92,8 +94,12 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 	// Running off the last block is running off the program.
 	e.exitAt(n)
 
-	// An entry at a fused pair's second pc runs its test alone, then rejoins
-	// the run after the pair through that pc's entry stub.
+	// An entry at a fused pair's second pc runs its test alone, then goes on
+	// at the next pc: into its block where a run starts, through its entry
+	// stub where it has one, and otherwise by exiting there. An entry stub of
+	// its own would cut down what the run knows at that pc (entryPoint), which
+	// the fused path -- the one that runs -- would pay for on every pass.
+	// This path runs only after the VDBE ran the comparison itself.
 	fusedOff := map[int]int{}
 	for pc, in := range prog {
 		if !vmFusedEntry(prog, entry, pc) {
@@ -115,11 +121,17 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 			e.jmpStub(n)
 		case vmRunStart(prog, bound, pc+1):
 			e.jmpBlock(pc, pc+1)
-		default:
+		case pc+1 < len(entry) && entry[pc+1]:
 			a.emit(0xE9)
 			e.fix = append(e.fix, vmFix{at: len(a.buf), pc: pc + 1, entry: true})
 			a.emit(0, 0, 0, 0)
+		default:
+			e.jmpStub(pc + 1)
 		}
+	}
+
+	for _, c := range e.cold {
+		c()
 	}
 
 	entryOff := map[int]int{}
@@ -204,6 +216,26 @@ type vmEmit struct {
 	// zeroS is the destinations of the instruction being emitted whose string
 	// or blob pointer its store must clear (destNoS).
 	zeroS map[int]bool
+	// cold is the code of the paths a block branches out to and back from
+	// (coldPath), emitted after the blocks.
+	cold []func()
+}
+
+// coldPath branches, when the flags say NE, to body emitted out of line, which
+// then jumps back here: a path that runs only when a string or blob is in
+// play costs the hot one a branch not taken. body sees the machine state of
+// this point; it may exit, and must leave every register but RDX as it found
+// it.
+func (e *vmEmit) coldPath(body func()) {
+	n := len(e.cold)
+	in, back := fmt.Sprintf("c%d", n), fmt.Sprintf("c%d.back", n)
+	e.a.Jcc(CondNE, in)
+	e.a.Label(back)
+	e.cold = append(e.cold, func() {
+		e.a.Label(in)
+		body()
+		e.a.Jmp(back)
+	})
 }
 
 // vmEntryStub is an entry into the middle of a run: the registers to check
@@ -344,6 +376,8 @@ func (e *vmEmit) clearS(reg int) {
 		return
 	}
 	delete(e.zeroS, reg)
+	// Plain MOVs, not a test of the pointer first: a store may sit between a
+	// compare and the branch on its flags (VCmpBr).
 	for k := range 3 {
 		e.a.MovMemDImm(RSI, e.d(reg, e.lay.OffS+8*k), 0)
 	}
@@ -363,12 +397,8 @@ func (e *vmEmit) destNoS(pc, r int) {
 	if e.know.noS[r] || e.zeroS[r] {
 		return
 	}
-	a := e.a
-	a.CmpMemDImm8(RSI, e.d(r, e.lay.OffS), 0)
-	skip := len(a.buf)
-	a.emit(0x0F, 0x80|byte(CondE), 0, 0, 0, 0)
-	e.jccWB(pc)
-	patch(a.buf, skip+2, len(a.buf))
+	e.a.CmpMemDImm8(RSI, e.d(r, e.lay.OffS), 0)
+	e.coldPath(func() { e.jccWB(pc) })
 	e.zeroS[r] = true
 }
 
@@ -911,16 +941,22 @@ func (e *vmEmit) column(pc int, in VInsn) {
 	// A string or blob is copied with its pointer (OP_Column's own copy is a
 	// shallow one): a plain store with the write barrier off. With it on, a
 	// pointer read or overwritten exits.
+	// When neither the column nor the destination holds one, the S words
+	// are nil in both and only the other three are copied.
 	a.MovRegMemD(RDX, row, vb+int32(L.OffS))
 	if !e.know.noS[in.C] {
 		a.AluRegMemD(AluOr, RDX, RSI, e.d(in.C, L.OffS))
 	} else {
 		a.TestRegReg(RDX, RDX)
 	}
-	skip := len(a.buf)
-	a.emit(0x0F, 0x80|byte(CondE), 0, 0, 0, 0)
-	e.jccWB(pc)
-	patch(a.buf, skip+2, len(a.buf))
+	dst := e.d(in.C, 0)
+	e.coldPath(func() {
+		e.jccWB(pc)
+		for _, off := range []int{L.OffS, L.OffS + 8, L.OffS + 16} {
+			a.MovRegMemD(RDX, row, vb+int32(off))
+			a.MovMemDReg(RSI, dst+int32(off), RDX)
+		}
+	})
 	val := RDX
 	if u := e.nextUse(in.C, pc); u >= 0 {
 		if m, ok := e.alloc(pc, u, false); ok {
@@ -931,10 +967,8 @@ func (e *vmEmit) column(pc int, in VInsn) {
 	a.MovMemDReg(RSI, e.d(in.C, 0), RDX)
 	a.MovRegMemD(val, row, vb+int32(L.OffI))
 	a.MovMemDReg(RSI, e.d(in.C, L.OffI), val)
-	for _, off := range []int{L.OffF, L.OffS, L.OffS + 8, L.OffS + 16} {
-		a.MovRegMemD(RDX, row, vb+int32(off))
-		a.MovMemDReg(RSI, e.d(in.C, off), RDX)
-	}
+	a.MovRegMemD(RDX, row, vb+int32(L.OffF))
+	a.MovMemDReg(RSI, e.d(in.C, L.OffF), RDX)
 	for k, m := range e.holds {
 		if m == val && k != ^in.A {
 			delete(e.holds, k)
@@ -961,11 +995,15 @@ func (e *vmEmit) copyAny(pc int, in VInsn) {
 	} else {
 		a.TestRegReg(RAX, RAX)
 	}
-	skip := len(a.buf)
-	a.emit(0x0F, 0x80|byte(CondE), 0, 0, 0, 0)
-	e.jccWB(pc)
-	patch(a.buf, skip+2, len(a.buf))
-	for off := 0; off < L.Size; off += 8 {
+	src, dst := e.d(in.A, 0), e.d(in.B, 0)
+	e.coldPath(func() {
+		e.jccWB(pc)
+		for _, off := range []int{L.OffS, L.OffS + 8, L.OffS + 16} {
+			a.MovRegMemD(RDX, RSI, src+int32(off))
+			a.MovMemDReg(RSI, dst+int32(off), RDX)
+		}
+	})
+	for _, off := range []int{0, L.OffI, L.OffF} {
 		a.MovRegMemD(RAX, RSI, e.d(in.A, off))
 		a.MovMemDReg(RSI, e.d(in.B, off), RAX)
 	}

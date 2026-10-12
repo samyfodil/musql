@@ -249,3 +249,41 @@ func TestVMFusedPairEntry(t *testing.T) {
 		t.Fatalf("the pair was not fused: the test checks nothing")
 	}
 }
+
+// TestVMPointerStoresFar: the pointer stores on registers too far for an
+// immediate offset (arm64 reaches 32KB, 682 registers), where a load or store
+// goes through a scratch register of its own.
+func TestVMPointerStoresFar(t *testing.T) {
+	if !Available {
+		t.Skip("no JIT on this platform")
+	}
+	noGC(t)
+	const base = 3000
+	text, other := []byte("far"), []byte("x")
+	regs := make([]tvalue, base+8)
+	regs[base] = tvalue{Typ: tvText, S: text}
+	regs[base+1] = tvalue{Typ: tvText, S: other}
+	regs[base+2] = tvalue{Typ: tvText, S: other}
+	regs[base+3] = tvalue{Typ: tvText, S: other}
+	rows := [][]tvalue{{{Typ: tvText, S: text}}}
+	cur := VCursor{Rows: unsafe.Pointer(unsafe.SliceData(rows)), N: 1, Pos: 0, Last: -1, Ok: 1, Mask: ^uint64(0)}
+	prog := []VInsn{
+		{Op: VCopy, A: base, B: base + 1, Imm: 1}, // text over text
+		{Op: VColumn, A: 0, B: 0, C: base + 2},    // a text column over text
+		{Op: VInt, A: base + 3, Imm: 7},           // an integer over text
+		{Op: VExit},
+	}
+	args := ProgArgs{Cur: &cur}
+	runVM(t, prog, nil, regs, &args, 0)
+	if args.PC != 3 {
+		t.Fatalf("stopped at %d", args.PC)
+	}
+	for _, r := range []int{base + 1, base + 2} {
+		if regs[r].Typ != tvText || &regs[r].S[0] != &text[0] || len(regs[r].S) != 3 {
+			t.Fatalf("r%d = %+v", r, regs[r])
+		}
+	}
+	if regs[base+3].Typ != tvInt || regs[base+3].I != 7 || regs[base+3].S != nil || cap(regs[base+3].S) != 0 {
+		t.Fatalf("r%d = %+v", base+3, regs[base+3])
+	}
+}

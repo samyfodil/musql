@@ -291,13 +291,24 @@ func (e *vmEmitWasm) clearS(reg int) {
 	}
 }
 
-// pointerWB fails when the i64 on the stack (a pointer, or two OR'ed) is
-// non-zero and the write barrier is on.
-func (e *vmEmitWasm) pointerWB() {
-	e.w.op(opI64Eqz)
-	e.w.op(opI32Eqz)
-	e.w.Get(e.wb)
-	e.w.op(opI32And)
+// pointerWords copies a Value word by word (copy(f) for each word f), given
+// on the stack the OR of the source's and the destination's string pointers:
+// when it is non-zero, it exits at pc with the write barrier on, and copies
+// the S words with it off; the other three words either way.
+func (e *vmEmitWasm) pointerWords(pc int, copy func(f int)) {
+	w, L := e.w, e.lay
+	w.op(opI64Eqz)
+	w.op(opI32Eqz)
+	e.openIf()
+	w.Get(e.wb)
+	e.exitIf(pc)
+	for _, f := range []int{L.OffS, L.OffS + 8, L.OffS + 16} {
+		copy(f)
+	}
+	e.closeIf()
+	for _, f := range []int{0, L.OffI, L.OffF} {
+		copy(f)
+	}
 }
 
 // forgetReg records that r[reg] changed other than by storeInt.
@@ -690,14 +701,12 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 			e.loadI64(in.C, L.OffS)
 			w.op(opI64Or)
 		}
-		e.pointerWB()
-		e.exitIf(pc)
-		for f := 0; f < L.Size; f += 8 {
+		e.pointerWords(pc, func(f int) {
 			w.Get(e.regs)
 			w.Get(e.valp)
 			w.LoadI64(vb + uint32(f))
 			w.StoreI64(e.addr(in.C, f))
-		}
+		})
 		e.know.wroteAny(in.C, false)
 	case VResultRow:
 		e.resultRow(pc, in)
@@ -776,13 +785,11 @@ func (e *vmEmitWasm) copyAny(pc int, in VInsn) {
 		e.loadI64(in.B, L.OffS)
 		w.op(opI64Or)
 	}
-	e.pointerWB()
-	e.exitIf(pc)
-	for f := 0; f < L.Size; f += 8 {
+	e.pointerWords(pc, func(f int) {
 		w.Get(e.regs)
 		e.loadI64(in.A, f)
 		w.StoreI64(e.addr(in.B, f))
-	}
+	})
 	isInt := e.know.isInt[in.A]
 	e.know.wroteAny(in.B, false)
 	if isInt {
