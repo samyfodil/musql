@@ -719,6 +719,45 @@ func (st *segDeltaState) applyBatch(body []byte) error {
 	return nil
 }
 
+// applyRecs applies a batch's records as applyBatch would apply the batch
+// written from them: each put's row exactly as decodeRecord reads it back --
+// the type and that type's one field, every other field zero -- and each
+// kill. false, having applied nothing, when a put reads its row from a store
+// while it is written (SegDeltaRecord.src): the caller decodes the batch.
+func (st *segDeltaState) applyRecs(recs []SegDeltaRecord) bool {
+	for i := range recs {
+		if !recs[i].Kill && recs[i].src != nil {
+			return false
+		}
+	}
+	for i := range recs {
+		r := &recs[i]
+		if r.Kill {
+			st.kill(r.Table, r.Rowid)
+			continue
+		}
+		vals := make([]Value, len(r.Vals))
+		for c, v := range r.Vals {
+			switch v.Typ {
+			case Int:
+				vals[c] = Value{Typ: Int, I: v.I}
+			case Float:
+				vals[c] = Value{Typ: Float, F: v.F}
+			case Text, Blob:
+				b := v.S[:len(v.S):len(v.S)]
+				if b == nil {
+					b = []byte{} // decodeRecord's empty value is a non-nil slice
+				}
+				vals[c] = Value{Typ: v.Typ, S: b}
+			default:
+				vals[c] = Value{Typ: Null}
+			}
+		}
+		st.put(r.Table, r.Rowid, vals)
+	}
+	return true
+}
+
 func (st *segDeltaState) put(table int, rowid int64, vals []Value) {
 	if st.live[table] == nil {
 		st.live[table] = map[int64][]Value{}

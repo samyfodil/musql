@@ -645,7 +645,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 	}
 	n.seenStat = n.pairStamp()
 	n.clearWrittenSinceCommit()
-	if !wasCurrent || !n.extendCommittedColumns(n.appendAt.lastBatch) {
+	if !wasCurrent || !n.extendCommittedColumns(n.appendAt.lastBatch, recs) {
 		n.noteCommittedColumnsStale()
 	}
 	n.appendAt.lastBatch = nil
@@ -665,18 +665,26 @@ func (n *Session) commitMainLocked() (bool, error) {
 // marks it stale, so a view not marked stale is the file as of this session's
 // previous commit. The caller passes wasCurrent too. false leaves the caller
 // to mark it stale: no view, a stale one, or a batch too big to have been kept.
-func (n *Session) extendCommittedColumns(batch []byte) bool {
+func (n *Session) extendCommittedColumns(batch []byte, recs []SegDeltaRecord) bool {
 	db := n.DB
 	cols := db.segColumns
-	if batch == nil || cols == nil || db.segColumnsStale || cols.segs == nil {
+	if cols == nil || db.segColumnsStale || cols.segs == nil {
 		return false
 	}
 	st := cols.segs.delta
 	if st == nil {
 		st = &segDeltaState{live: map[int]map[int64][]Value{}, dead: map[int]map[int64]bool{}, version: segDeltaVersion}
 	}
-	if err := st.applyBatch(batch); err != nil {
-		return false
+	// From the records the batch was written from, when every put carries its
+	// values: the rows decoding the batch would give back, without decoding
+	// it -- a 20,000-row commit spent most of its extension there.
+	if !st.applyRecs(recs) {
+		if batch == nil {
+			return false
+		}
+		if err := st.applyBatch(batch); err != nil {
+			return false
+		}
 	}
 	st.endCtr, st.endPages = n.endCtr, n.endPages
 	st.batches++
