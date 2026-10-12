@@ -11,7 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 	"sync/atomic"
 	"unsafe"
 )
@@ -570,8 +570,61 @@ func autoIndexOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) 
 	for i := range perm {
 		perm[i] = i
 	}
-	sort.SliceStable(perm, func(x, y int) bool {
-		a, b := perm[x], perm[y]
+	// Every key value an integer -- an INTEGER column's, and the rowid --
+	// compares as one, under any collating sequence: the keys are copied out
+	// flat once and compared as int64s, not fetched as Values per comparison.
+	nk := len(key.cols)
+	flat := make([]int64, 0, len(perm)*nk)
+	for i := range perm {
+		for _, kc := range key.cols {
+			v := at(i, kc)
+			if v.Typ != Int {
+				flat = nil
+				break
+			}
+			flat = append(flat, v.I)
+		}
+		if flat == nil {
+			break
+		}
+	}
+	// Stable by the last comparison, on the rows' original positions, which
+	// makes the order total: an unstable sort then gives exactly the stable
+	// one's permutation, in O(n log n) where sort.SliceStable's in-place
+	// merges took most of a 100,000-row scan's time.
+	if flat != nil {
+		slices.SortFunc(perm, func(a, b int) int {
+			ka, kb := flat[a*nk:a*nk+nk], flat[b*nk:b*nk+nk]
+			for k := range ka {
+				if ka[k] != kb[k] {
+					c := 1
+					if ka[k] < kb[k] {
+						c = -1
+					}
+					if k < len(key.desc) && key.desc[k] {
+						return -c // a DESC column, as below
+					}
+					return c
+				}
+			}
+			return a - b
+		})
+	} else {
+		autoIndexSortValues(perm, key, at, enc)
+	}
+	rows := make([][]Value, len(perm))
+	rowids := make([]uint64, len(perm))
+	for i, p := range perm {
+		rows[i], rowids[i] = cur.rows[p], cur.rowids[p]
+	}
+	cur.rows, cur.rowids = rows, rowids
+}
+
+// autoIndexSortValues is autoIndexOrderCursor's sort over keys that are not
+// all integers: each comparison fetches the values and compares them under
+// their columns' collating sequences.
+func autoIndexSortValues(perm []int, key *autoIndexKey, at func(i, kc int) Value, enc TextEncoding) {
+	slices.SortFunc(perm, func(a, b int) int {
 		for k, kc := range key.cols {
 			c := compareValuesCollatedEnc(at(a, kc), at(b, kc), key.colls[k], enc)
 			if c != 0 {
@@ -580,19 +633,13 @@ func autoIndexOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) 
 					// walk visits its values from largest to smallest. NULLs,
 					// which sort first ascending, therefore come LAST here --
 					// which is exactly what negating the comparison gives.
-					return c > 0
+					return -c
 				}
-				return c < 0
+				return c
 			}
 		}
-		return false
+		return a - b
 	})
-	rows := make([][]Value, len(perm))
-	rowids := make([]uint64, len(perm))
-	for i, p := range perm {
-		rows[i], rowids[i] = cur.rows[p], cur.rowids[p]
-	}
-	cur.rows, cur.rowids = rows, rowids
 }
 
 // rowSubCmpColumn compares ONE column position of a row-value comparison under
