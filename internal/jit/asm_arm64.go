@@ -503,6 +503,8 @@ func (a *Arm) BcondRaw(code uint32, label string) {
 const (
 	armVS = 0x6 // signed overflow
 	armHI = 0x8 // unsigned higher
+	armHS = 0x2 // unsigned higher or same
+	armLS = 0x9 // unsigned lower or same
 )
 
 // Sdiv emits SDIV Xd, Xn, Xm. It does not trap: a zero divisor gives 0 and

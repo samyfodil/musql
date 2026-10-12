@@ -144,6 +144,26 @@ func (e *vmEmitArm) str(rt Reg64, r, f int) {
 	}
 }
 
+// ldrAt/strAt are ldr/str over a plain base register: a displacement an
+// immediate cannot reach goes through X13.
+func (e *vmEmitArm) ldrAt(rt, base Reg64, off int) {
+	if off%8 == 0 && off/8 < 4096 {
+		e.a.LdrImm(rt, base, off)
+		return
+	}
+	e.a.MovImm64(X13, int64(off))
+	e.a.LdrReg(rt, base, X13)
+}
+
+func (e *vmEmitArm) strAt(rt, base Reg64, off int) {
+	if off%8 == 0 && off/8 < 4096 {
+		e.a.StrImm(rt, base, off)
+		return
+	}
+	e.a.MovImm64(X13, int64(off))
+	e.a.StrReg(rt, base, X13)
+}
+
 func (e *vmEmitArm) ldrb(rt Reg64, r, f int) {
 	if o := e.off(r, f); o < 4096 {
 		e.a.LdrbImm(rt, X1, o)
@@ -285,6 +305,35 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		e.ldr(X10, in.A, L.OffI)
 		a.Cmp(X9, X10)
 		e.jccBlock(in.Cond, pc, in.T)
+	case VCmpSet:
+		e.guardInt(pc, in.B)
+		e.guardInt(pc, in.A)
+		e.guardNoS(pc, in.C)
+		e.ldr(X9, in.B, L.OffI)
+		e.ldr(X10, in.A, L.OffI)
+		a.Cmp(X9, X10)
+		a.Cset(X9, in.Cond)
+		e.writeInt(in.C, X9)
+	case VNullJump:
+		e.ldrb(X9, in.A, L.OffTyp)
+		a.CmpImm(X9, uint32(L.TypNull))
+		if in.Imm != 0 {
+			e.jccBlock(CondE, pc, in.T)
+		} else {
+			e.jccBlock(CondNE, pc, in.T)
+		}
+	case VNull:
+		e.guardNoS(pc, in.C)
+		e.str(xzr, in.C, 0)
+		e.str(xzr, in.C, L.OffI)
+		e.str(xzr, in.C, L.OffF)
+	case VNeg:
+		e.guardInt(pc, in.A)
+		e.guardNoS(pc, in.C)
+		e.ldr(X10, in.A, L.OffI)
+		a.SubsReg(X9, xzr, X10)
+		a.BcondRaw(armVS, e.stub(pc)) // -MinInt64 is the VDBE's
+		e.writeInt(in.C, X9)
 	case VIf:
 		// An INTEGER jumps on its truth; a NULL jumps when C says so; anything
 		// else is the VDBE's.
@@ -324,6 +373,74 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		e.exitpc = true
 		a.Bcond(CondE, e.exitpcLabel())
 		a.B("dispatch")
+	case VColumn:
+		// See vm_amd64.go's VColumn: the same steps, on X9..X12.
+		cb := in.A * VCursorSize
+		vb := in.B * L.Size
+		a.LdrImm(X9, X0, POffCur)
+		e.ldrAt(X10, X9, cb+VCursorOffOk)
+		a.Cbz(X10, e.stub(pc))
+		e.ldrAt(X10, X9, cb+VCursorOffMask) // the column must be one the engine made readable
+		a.LsrImm(X10, X10, uint32(in.B))
+		a.AndImmLow(X10, X10, 1)
+		a.Cbz(X10, e.stub(pc))
+		e.ldrAt(X10, X9, cb+VCursorOffPos)
+		e.ldrAt(X11, X9, cb+VCursorOffN)
+		a.Cmp(X10, X11)
+		a.BcondRaw(armHS, e.stub(pc)) // unsigned: a position before the first row is huge
+		a.MovImm64(X11, sliceHeaderSize)
+		a.Mul(X10, X10, X11)
+		e.ldrAt(X11, X9, cb+VCursorOffRows)
+		a.AddReg(X10, X11, X10)
+		a.LdrImm(X11, X10, 8) // the row's length
+		a.MovImm64(X12, int64(in.B))
+		a.Cmp(X11, X12)
+		a.BcondRaw(armLS, e.stub(pc)) // a row narrower than the column: the VDBE's
+		a.LdrImm(X10, X10, 0)         // the row's first Value
+		e.ldrAt(X11, X10, vb+L.OffS)
+		a.Cbnz(X11, e.stub(pc))
+		e.guardNoS(pc, in.C)
+		for _, f := range []int{0, L.OffI, L.OffF} {
+			e.ldrAt(X9, X10, vb+f)
+			e.str(X9, in.C, f)
+		}
+	case VRewind:
+		cb := in.A * VCursorSize
+		e.skips++
+		nonEmpty := fmt.Sprintf("s%d.rows", e.skips)
+		a.LdrImm(X9, X0, POffCur)
+		e.ldrAt(X10, X9, cb+VCursorOffOk)
+		a.Cbz(X10, e.stub(pc))
+		e.ldrAt(X10, X9, cb+VCursorOffRew)
+		a.Cbz(X10, e.stub(pc))
+		e.strAt(xzr, X9, cb+VCursorOffPos)
+		a.MovImm16(X11, 1)
+		e.strAt(X11, X9, cb+VCursorOffDirty)
+		e.ldrAt(X10, X9, cb+VCursorOffN)
+		a.Cbnz(X10, nonEmpty)
+		e.jmpBlock(pc, in.T) // no rows
+		a.Label(nonEmpty)
+		e.strAt(xzr, X9, cb+VCursorOffLast)
+	case VNext:
+		cb := in.A * VCursorSize
+		e.skips++
+		done := fmt.Sprintf("s%d.done", e.skips)
+		a.LdrImm(X9, X0, POffCur)
+		e.ldrAt(X10, X9, cb+VCursorOffOk)
+		a.Cbz(X10, e.stub(pc))
+		e.ldrAt(X10, X9, cb+VCursorOffAdv)
+		a.Cbz(X10, e.stub(pc))
+		e.ldrAt(X10, X9, cb+VCursorOffPos)
+		a.AddImm(X10, X10, 1)
+		e.strAt(X10, X9, cb+VCursorOffPos)
+		a.MovImm16(X11, 1)
+		e.strAt(X11, X9, cb+VCursorOffDirty)
+		e.ldrAt(X11, X9, cb+VCursorOffN)
+		a.Cmp(X10, X11)
+		a.BcondRaw(armHS, done) // off the end: fall through
+		e.strAt(X10, X9, cb+VCursorOffLast)
+		e.jmpBlock(pc, in.T)
+		a.Label(done)
 	default:
 		return fmt.Errorf("unknown VM op %d", in.Op)
 	}

@@ -2,7 +2,10 @@
 
 package jit
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+)
 
 const (
 	opReturn    byte = 0x0F
@@ -10,6 +13,9 @@ const (
 	opI32Load8U byte = 0x2D
 	opI32Ne     byte = 0x47
 	opI64GtU    byte = 0x56
+	opI32Eq     byte = 0x46
+	opI64LeU    byte = 0x58
+	opI64GeU    byte = 0x5A
 	opI64Shl    byte = 0x86
 	opI64ShrS   byte = 0x87
 	opIf        byte = 0x04
@@ -44,6 +50,14 @@ func EmitVM(prog []VInsn, nReg int, lay ValueLayout) ([]byte, error) {
 	w := e.w
 	e.regs, e.pc, e.fuel = w.Local(wI32), w.Local(wI32), w.Local(wI64)
 	e.t1, e.t2, e.t3, e.ovf = w.Local(wI64), w.Local(wI64), w.Local(wI64), w.Local(wI64)
+	for _, in := range prog {
+		if in.Op == VColumn || in.Op == VNext || in.Op == VRewind {
+			e.curs, e.rowp, e.valp = w.Local(wI32), w.Local(wI32), w.Local(wI32)
+			w.LoadPtr(POffCur)
+			w.Set(e.curs)
+			break
+		}
+	}
 
 	w.LoadPtr(POffRegs)
 	w.Set(e.regs)
@@ -90,8 +104,9 @@ type vmEmitWasm struct {
 	regs, pc         uint32
 	fuel, t1, t2, t3 uint32
 	ovf              uint32
-	cur              int // the pc whose code is being emitted
-	extra            int // if-blocks opened inside it
+	curs, rowp, valp uint32 // the cursor table, a row's header, its first Value (when the program has cursor ops)
+	cur              int    // the pc whose code is being emitted
+	extra            int    // if-blocks opened inside it
 }
 
 // Within pc's code the enclosing blocks are those of pc+1 .. n-1, then the
@@ -301,6 +316,43 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		e.loadI64(in.A, L.OffI)
 		w.op(scalarCmp(in.Cond))
 		e.jumpIf(in.T)
+	case VCmpSet:
+		e.guards(pc, notInt(in.B), notInt(in.A), hasS(in.C))
+		e.loadI64(in.B, L.OffI)
+		e.loadI64(in.A, L.OffI)
+		w.op(scalarCmp(in.Cond))
+		w.op(opI64ExtendI32U)
+		w.Set(e.t1)
+		e.writeInt(in.C, e.t1)
+	case VNullJump:
+		e.loadTyp(in.A)
+		w.I32(int32(L.TypNull))
+		if in.Imm != 0 {
+			w.op(opI32Eq)
+		} else {
+			w.op(opI32Ne)
+		}
+		e.jumpIf(in.T)
+	case VNull:
+		e.guards(pc, hasS(in.C))
+		for _, f := range []int{0, L.OffI, L.OffF} {
+			w.Get(e.regs)
+			w.I64(0)
+			w.StoreI64(e.addr(in.C, f))
+		}
+	case VNeg:
+		e.guards(pc, notInt(in.A), hasS(in.C))
+		e.loadI64(in.A, L.OffI)
+		w.Set(e.t2)
+		w.Get(e.t2)
+		w.I64(math.MinInt64)
+		w.op(opI64Eq)
+		e.exitIf(pc) // -MinInt64 is the VDBE's
+		w.I64(0)
+		w.Get(e.t2)
+		w.op(opI64Sub)
+		w.Set(e.t1)
+		e.writeInt(in.C, e.t1)
 	case VIf:
 		// An INTEGER jumps on its truth; a NULL jumps when C says so; anything
 		// else is the VDBE's.
@@ -343,6 +395,116 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 			w.I32(1)
 			w.op(opI32Add)
 		}, -1)
+	case VColumn:
+		// See vm_amd64.go's VColumn: the same steps.
+		cb := uint32(in.A * VCursorSize)
+		vb := uint32(in.B * L.Size)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffOk)
+		w.op(opI64Eqz)
+		e.exitIf(pc)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffMask) // the column must be one the engine made readable
+		w.I64(int64(1) << uint(in.B))
+		w.op(opI64And)
+		w.op(opI64Eqz)
+		e.exitIf(pc)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffPos)
+		w.Set(e.t1)
+		w.Get(e.t1)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffN)
+		w.op(opI64GeU) // unsigned: a position before the first row is huge
+		e.exitIf(pc)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffRows)
+		w.op(opI32WrapI64)
+		w.Get(e.t1)
+		w.op(opI32WrapI64)
+		w.I32(sliceHeaderSize)
+		w.op(opI32Mul)
+		w.op(opI32Add)
+		w.Set(e.rowp)
+		w.Get(e.rowp)
+		w.LoadI64(8) // the row's length
+		w.I64(int64(in.B))
+		w.op(opI64LeU) // a row narrower than the column: the VDBE's
+		e.exitIf(pc)
+		w.Get(e.rowp)
+		w.LoadI64(0)
+		w.op(opI32WrapI64)
+		w.Set(e.valp)
+		w.Get(e.valp)
+		w.LoadI64(vb + uint32(L.OffS))
+		w.op(opI64Eqz)
+		w.op(opI32Eqz)
+		e.exitIf(pc)
+		e.guards(pc, hasS(in.C))
+		for _, f := range []int{0, L.OffI, L.OffF} {
+			w.Get(e.regs)
+			w.Get(e.valp)
+			w.LoadI64(vb + uint32(f))
+			w.StoreI64(e.addr(in.C, f))
+		}
+	case VRewind:
+		cb := uint32(in.A * VCursorSize)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffOk)
+		w.op(opI64Eqz)
+		e.exitIf(pc)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffRew)
+		w.op(opI64Eqz)
+		e.exitIf(pc)
+		w.Get(e.curs)
+		w.I64(0)
+		w.StoreI64(cb + VCursorOffPos)
+		w.Get(e.curs)
+		w.I64(1)
+		w.StoreI64(cb + VCursorOffDirty)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffN)
+		w.op(opI64Eqz)
+		e.openIf() // no rows
+		e.jump(in.T)
+		w.op(opElse)
+		w.Get(e.curs)
+		w.I64(0)
+		w.StoreI64(cb + VCursorOffLast)
+		e.closeIf()
+	case VNext:
+		cb := uint32(in.A * VCursorSize)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffOk)
+		w.op(opI64Eqz)
+		e.exitIf(pc)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffAdv)
+		w.op(opI64Eqz)
+		e.exitIf(pc)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffPos)
+		w.I64(1)
+		w.op(opI64Add)
+		w.Set(e.t1)
+		w.Get(e.curs)
+		w.Get(e.t1)
+		w.StoreI64(cb + VCursorOffPos)
+		w.Get(e.curs)
+		w.I64(1)
+		w.StoreI64(cb + VCursorOffDirty)
+		w.Get(e.t1)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffN)
+		w.op(opI64GeU)
+		w.op(opI32Eqz) // still on a row
+		e.openIf()
+		w.Get(e.curs)
+		w.Get(e.t1)
+		w.StoreI64(cb + VCursorOffLast)
+		e.jump(in.T)
+		e.closeIf()
 	default:
 		return fmt.Errorf("unknown VM op %d", in.Op)
 	}

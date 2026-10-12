@@ -304,6 +304,9 @@ type ProgArgs struct {
 	// HeapLen is each heap's length: a 16-byte load is taken only where it
 	// ends inside the heap, so reading past a short cell never leaves it.
 	HeapLen [MaxProgCols]int64
+	// Cur is EmitVM's cursor table (VCursor), one entry per cursor number the
+	// program's native instructions name.
+	Cur *VCursor
 }
 
 // Byte offsets of ProgArgs' fields, asserted by TestProgArgsLayout.
@@ -318,6 +321,7 @@ const (
 	POffRow      = POffPC + 8
 	POffHeap     = POffRow + 8
 	POffHeapLen  = POffHeap + MaxProgCols*8
+	POffCur      = POffHeapLen + MaxProgCols*8
 )
 
 // progHasService reports whether a program can stop for a service, and so

@@ -5,7 +5,11 @@ package jit
 import "fmt"
 
 // condAbove is x86's unsigned "above" (JA), for range checks that fold negatives.
-const condAbove Cond = 0x7
+const (
+	condAbove   Cond = 0x7
+	condAboveEq Cond = 0x3 // JAE: unsigned >=
+	condBelowEq Cond = 0x6 // JBE: unsigned <=
+)
 
 // EmitVM compiles a whole VDBE program; see vm.go for the contract.
 //
@@ -229,6 +233,34 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		a.MovRegMemD(RAX, RSI, e.d(in.B, L.OffI))
 		a.AluRegMemD(AluCmp, RAX, RSI, e.d(in.A, L.OffI))
 		e.jccBlock(in.Cond, pc, in.T)
+	case VCmpSet:
+		e.guardInt(pc, in.B)
+		e.guardInt(pc, in.A)
+		e.guardNoS(pc, in.C)
+		a.XorRegReg(RDX, RDX) // before the compare: it clears the flags
+		a.MovRegMemD(RAX, RSI, e.d(in.B, L.OffI))
+		a.AluRegMemD(AluCmp, RAX, RSI, e.d(in.A, L.OffI))
+		a.Setcc(in.Cond, RDX)
+		e.writeInt(in.C, RDX)
+	case VNullJump:
+		a.CmpMemDByte(RSI, e.d(in.A, L.OffTyp), L.TypNull)
+		if in.Imm != 0 {
+			e.jccBlock(CondE, pc, in.T)
+		} else {
+			e.jccBlock(CondNE, pc, in.T)
+		}
+	case VNull:
+		e.guardNoS(pc, in.C)
+		a.MovMemDImm(RSI, e.d(in.C, 0), int32(L.TypNull))
+		a.MovMemDImm(RSI, e.d(in.C, L.OffI), 0)
+		a.MovMemDImm(RSI, e.d(in.C, L.OffF), 0)
+	case VNeg:
+		e.guardInt(pc, in.A)
+		e.guardNoS(pc, in.C)
+		a.MovRegMemD(RAX, RSI, e.d(in.A, L.OffI))
+		a.NegReg(RAX)
+		e.jccStub(condOverflow, pc) // -MinInt64 is the VDBE's
+		e.writeInt(in.C, RAX)
 	case VIf:
 		// An INTEGER jumps on its truth; a NULL jumps when C says so; anything
 		// else is the VDBE's.
@@ -264,6 +296,69 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		a.DecReg(R8)
 		a.Jcc(CondE, "exitrcx")
 		a.Jmp("dispatch")
+	case VColumn:
+		// The cursor's current row's column B, copied word for word when the
+		// value holds no string or blob (see VCursor for what native code may
+		// assume of a cursor). R9/R10/RDX are scratch.
+		cb := int32(in.A * VCursorSize)
+		vb := int32(in.B) * int32(L.Size)
+		a.MovRegMemD(RAX, RDI, POffCur)
+		a.CmpMemDImm8(RAX, cb+VCursorOffOk, 0)
+		e.jccStub(CondE, pc)
+		a.MovRegMemD(RDX, RAX, cb+VCursorOffMask) // the column must be one the engine made readable
+		a.MovRegImm64(R10, int64(1)<<uint(in.B))
+		a.TestRegReg(RDX, R10)
+		e.jccStub(CondE, pc)
+		a.MovRegMemD(RDX, RAX, cb+VCursorOffPos)
+		a.AluRegMemD(AluCmp, RDX, RAX, cb+VCursorOffN)
+		e.jccStub(condAboveEq, pc) // unsigned: a position before the first row is huge
+		a.MovRegImm64(R9, sliceHeaderSize)
+		a.ImulRegReg(RDX, R9)
+		a.MovRegMemD(R9, RAX, cb+VCursorOffRows)
+		a.AddRegReg(R9, RDX)
+		a.MovRegMemD(R10, R9, 8) // the row's length
+		a.CmpRegImm32(R10, int32(in.B))
+		e.jccStub(condBelowEq, pc) // a row narrower than the column: the VDBE's
+		a.MovRegMemD(R9, R9, 0)    // the row's first Value
+		a.CmpMemDImm8(R9, vb+int32(L.OffS), 0)
+		e.jccStub(CondNE, pc)
+		e.guardNoS(pc, in.C)
+		for _, off := range []int{0, L.OffI, L.OffF} {
+			a.MovRegMemD(RDX, R9, vb+int32(off))
+			a.MovMemDReg(RSI, e.d(in.C, off), RDX)
+		}
+	case VRewind:
+		cb := int32(in.A * VCursorSize)
+		a.MovRegMemD(RAX, RDI, POffCur)
+		a.CmpMemDImm8(RAX, cb+VCursorOffOk, 0)
+		e.jccStub(CondE, pc)
+		a.CmpMemDImm8(RAX, cb+VCursorOffRew, 0)
+		e.jccStub(CondE, pc)
+		a.MovMemDImm(RAX, cb+VCursorOffPos, 0)
+		a.MovMemDImm(RAX, cb+VCursorOffDirty, 1)
+		a.CmpMemDImm8(RAX, cb+VCursorOffN, 0)
+		nonEmpty := len(a.buf)
+		a.emit(0x0F, 0x80|byte(CondNE), 0, 0, 0, 0)
+		e.jmpBlock(pc, in.T) // no rows
+		patch(a.buf, nonEmpty+2, len(a.buf))
+		a.MovMemDImm(RAX, cb+VCursorOffLast, 0)
+	case VNext:
+		cb := int32(in.A * VCursorSize)
+		a.MovRegMemD(RAX, RDI, POffCur)
+		a.CmpMemDImm8(RAX, cb+VCursorOffOk, 0)
+		e.jccStub(CondE, pc)
+		a.CmpMemDImm8(RAX, cb+VCursorOffAdv, 0)
+		e.jccStub(CondE, pc)
+		a.MovRegMemD(RDX, RAX, cb+VCursorOffPos)
+		a.IncReg(RDX)
+		a.MovMemDReg(RAX, cb+VCursorOffPos, RDX)
+		a.MovMemDImm(RAX, cb+VCursorOffDirty, 1)
+		a.AluRegMemD(AluCmp, RDX, RAX, cb+VCursorOffN)
+		done := len(a.buf)
+		a.emit(0x0F, 0x80|byte(condAboveEq), 0, 0, 0, 0) // off the end: fall through
+		a.MovMemDReg(RAX, cb+VCursorOffLast, RDX)
+		e.jmpBlock(pc, in.T)
+		patch(a.buf, done+2, len(a.buf))
 	default:
 		return fmt.Errorf("unknown VM op %d", in.Op)
 	}

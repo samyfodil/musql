@@ -14,6 +14,8 @@ import (
 	"slices"
 	"sync/atomic"
 	"unsafe"
+
+	"github.com/samyfodil/musql/internal/jit"
 )
 
 // vdbe holds one execution's mutable state: the register file, the open
@@ -24,8 +26,10 @@ import (
 // executions.
 type vdbe struct {
 	regs         []Value
-	jx           *vmJIT // native code for the program run() is given, when it has some
-	jitEnters    int    // entries into jx, which the fuel test counts
+	jx           *vmJIT        // native code for the program run() is given, when it has some
+	jcur         []jit.VCursor // native code's view of the cursors it names, filled at each entry
+	jsnap        []jitSnap     // the copies of the rows of cursors it can read but not walk
+	jitEnters    int           // entries into jx, which the fuel test counts
 	cursors      []*vdbeCursor
 	recRegs      [][]Value
 	sorters      []*vdbeSorter
@@ -1153,11 +1157,17 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				op = &insns[pc]
 				goto dispatch
 			}
+			// An entry whose first cursor native code could not use would only
+			// pay for the call and exit at that instruction.
+			if g := jx.gate[pc]; g >= 0 && (int(g) >= len(m.cursors) || m.cursors[g] == nil) {
+				op = &insns[pc]
+				goto dispatch
+			}
 			m.jitEnters++
 			if jitScore {
 				jitScoreEnter()
 			}
-			pc = jx.enter(m.regs, pc)
+			pc = jx.enter(m, pc)
 			jitSkip = pc
 			continue
 
