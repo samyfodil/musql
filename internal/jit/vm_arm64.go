@@ -194,11 +194,17 @@ func padArm(a *Arm, align int) {
 // island emits the exit stubs requested since the last island, after a branch
 // over them to next ("" when nothing falls through).
 func (e *vmEmitArm) island(next string) {
-	if len(e.stubs) == 0 && !e.exitpc {
+	if len(e.stubs) == 0 && !e.exitpc && len(e.cold) == 0 {
 		return
 	}
 	if next != "" {
 		e.a.B(next)
+	}
+	// The cold paths first: they may ask for stubs, which go in this island.
+	cold := e.cold
+	e.cold = nil
+	for _, c := range cold {
+		c()
 	}
 	for pc := range e.stubs {
 		e.a.Label(e.stubLabel(pc))
@@ -235,6 +241,21 @@ type vmEmitArm struct {
 	fusedStub map[int]string // a VFused pc's exit stub or entry block, which the table points at
 	entries   []vmEntryStubArm
 	zeroS     map[int]bool // vmEmit.zeroS
+	cold      []func()     // vmEmit.cold, emitted in the next island
+}
+
+// coldPath is vm_amd64.go's: when reg is non-zero, branch to body, emitted in
+// the next island (within a conditional branch's reach), which jumps back.
+func (e *vmEmitArm) coldPath(reg Reg64, body func()) {
+	e.skips++
+	in, back := fmt.Sprintf("c%d", e.skips), fmt.Sprintf("c%d.back", e.skips)
+	e.a.Cbnz(reg, in)
+	e.a.Label(back)
+	e.cold = append(e.cold, func() {
+		e.a.Label(in)
+		body()
+		e.a.B(back)
+	})
 }
 
 // vmEntryStubArm is vm_amd64.go's vmEntryStub.
@@ -398,9 +419,15 @@ func (e *vmEmitArm) clearS(reg int) {
 		return
 	}
 	delete(e.zeroS, reg)
+	// Only when there is a pointer (vm_amd64.go's clearS); CBZ sets no flags.
+	e.skips++
+	skip := fmt.Sprintf("s%d.cs", e.skips)
+	e.ldr(X12, reg, e.lay.OffS)
+	e.a.Cbz(X12, skip)
 	for k := range 3 {
 		e.str(xzr, reg, e.lay.OffS+8*k)
 	}
+	e.a.Label(skip)
 }
 
 // branchWB exits at pc when the GC's write barrier is on (wb.go). X12.
@@ -413,12 +440,8 @@ func (e *vmEmitArm) destNoS(pc, r int) {
 	if e.know.noS[r] || e.zeroS[r] {
 		return
 	}
-	e.skips++
-	skip := fmt.Sprintf("s%d.nos", e.skips)
 	e.ldr(X12, r, e.lay.OffS)
-	e.a.Cbz(X12, skip)
-	e.branchWB(pc)
-	e.a.Label(skip)
+	e.coldPath(X12, func() { e.branchWB(pc) })
 	e.zeroS[r] = true
 }
 
@@ -910,8 +933,6 @@ func (e *vmEmitArm) column(pc int, in VInsn) {
 		a.LdrImm(row, X10, 0) // the row's first Value
 	}
 	// A string or blob is copied with its pointer, as on amd64.
-	e.skips++
-	plain := fmt.Sprintf("s%d.col", e.skips)
 	// The destination's first: a far register's load goes through X11.
 	if !e.know.noS[in.C] {
 		e.ldr(X12, in.C, L.OffS)
@@ -920,13 +941,13 @@ func (e *vmEmitArm) column(pc int, in VInsn) {
 	} else {
 		e.ldrAt(X11, row, vb+L.OffS)
 	}
-	a.Cbz(X11, plain)
-	e.branchWB(pc)
-	for _, f := range []int{L.OffS, L.OffS + 8, L.OffS + 16} {
-		e.ldrAt(X12, row, vb+f)
-		e.str(X12, in.C, f)
-	}
-	a.Label(plain)
+	e.coldPath(X11, func() {
+		e.branchWB(pc)
+		for _, f := range []int{L.OffS, L.OffS + 8, L.OffS + 16} {
+			e.ldrAt(X12, row, vb+f)
+			e.str(X12, in.C, f)
+		}
+	})
 	val := X9
 	if u := e.nextUse(in.C, pc); u >= 0 {
 		if m, ok := e.alloc(pc, u); ok {
@@ -957,8 +978,6 @@ func (e *vmEmitArm) copyAny(pc int, in VInsn) {
 	if in.A == in.B {
 		return // a copy onto itself changes nothing
 	}
-	e.skips++
-	plain := fmt.Sprintf("s%d.cp", e.skips)
 	// B's first: a far register's load goes through X11.
 	if !e.know.noS[in.B] {
 		e.ldr(X12, in.B, L.OffS)
@@ -967,13 +986,13 @@ func (e *vmEmitArm) copyAny(pc int, in VInsn) {
 	if !e.know.noS[in.B] {
 		a.OrrReg(X11, X11, X12)
 	}
-	a.Cbz(X11, plain)
-	e.branchWB(pc)
-	for _, f := range []int{L.OffS, L.OffS + 8, L.OffS + 16} {
-		e.ldr(X9, in.A, f)
-		e.str(X9, in.B, f)
-	}
-	a.Label(plain)
+	e.coldPath(X11, func() {
+		e.branchWB(pc)
+		for _, f := range []int{L.OffS, L.OffS + 8, L.OffS + 16} {
+			e.ldr(X9, in.A, f)
+			e.str(X9, in.B, f)
+		}
+	})
 	for _, f := range []int{0, L.OffI, L.OffF} {
 		e.ldr(X9, in.A, f)
 		e.str(X9, in.B, f)

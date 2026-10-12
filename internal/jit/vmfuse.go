@@ -479,3 +479,49 @@ var loopAlign = 64
 func vmFusedEntry(prog []VInsn, entry []bool, pc int) bool {
 	return pc >= 0 && pc < len(prog) && pc < len(entry) && entry[pc] && prog[pc].Op == VFused
 }
+
+// VReachesResultRow marks the pcs from which native code can reach a
+// VResultRow without leaving native code: what an entry must hand a row buffer
+// to. A VReturn may go back to any Gosub, so it reaches one when any is
+// reached from the pc after a Gosub.
+func VReachesResultRow(prog []VInsn) []bool {
+	n := len(prog)
+	reach := make([]bool, n)
+	for changed := true; changed; {
+		changed = false
+		retReach := false
+		for pc, in := range prog {
+			if in.Op == VGosub && pc+1 < n && reach[pc+1] {
+				retReach = true
+			}
+		}
+		for pc := n - 1; pc >= 0; pc-- {
+			if reach[pc] {
+				continue
+			}
+			in := prog[pc]
+			r := false
+			switch in.Op {
+			case VResultRow:
+				r = true
+			case VExit:
+			case VReturn:
+				r = retReach
+			default:
+				st := vmStepOf(in, pc)
+				if st.fall && pc+1 < n && reach[pc+1] {
+					r = true
+				}
+				for _, t := range st.targets {
+					if t >= 0 && t < n && reach[t] {
+						r = true
+					}
+				}
+			}
+			if r {
+				reach[pc], changed = true, true
+			}
+		}
+	}
+	return reach
+}

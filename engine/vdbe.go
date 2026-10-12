@@ -28,6 +28,11 @@ type vdbe struct {
 	regs         []Value
 	jx           *vmJIT        // native code for the program run() is given, when it has some
 	jcur         []jit.VCursor // native code's view of the cursors it names, filled at each entry
+	// jargs is the argument block of every entry into native code: kept on the
+	// machine and only its live fields set per entry, because zeroing a fresh
+	// one -- most of it the segment JIT's -- was a measurable share of a short
+	// entry.
+	jargs jit.ProgArgs
 	jsnap        []jitSnap     // the copies of the rows of cursors it can read but not walk
 	jitEnters    int           // entries into jx, which the fuel test counts
 	jitRows      int           // result rows native code copied out, which the pointer tests count

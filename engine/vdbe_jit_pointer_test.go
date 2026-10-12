@@ -323,6 +323,13 @@ func TestVMJITGCStress(t *testing.T) {
 	if !vmJITEnabled {
 		t.Skip("JIT not enabled on this platform")
 	}
+	if runtime.GOOS == "js" {
+		// One thread: a collector looping beside the workload is the
+		// workload's own thread, and the run takes the better part of an hour
+		// to prove what one thread already guarantees -- no collection starts
+		// while a kernel runs. The barrier-on path is the forced-flag tests'.
+		t.Skip("js/wasm has one thread; nothing runs beside a kernel")
+	}
 	rounds := 6
 	if testing.Short() {
 		rounds = 2

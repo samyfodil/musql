@@ -21,7 +21,10 @@ type vmJIT struct {
 	entry  []bool        // the pcs the VDBE enters native code at
 	marked []Instruction // the program with OpJIT at each entry: what run() dispatches on
 	native int           // how many of its instructions have native code (the JIT score's static share)
-	rows   bool          // whether native code runs an OpResultRow
+	// rows[pc] is whether native code entered at pc can reach an
+	// OpResultRow (jit.VReachesResultRow): the entries that need a row
+	// buffer. nil when it reaches none from anywhere.
+	rows []bool
 
 	// curs is the cursor numbers the native code reads or advances (VColumn,
 	// VNext), and nCurs the table size it indexes (the largest + 1). gate[pc]
@@ -188,7 +191,9 @@ func compileVMJIT(prog *Program) *vmJIT {
 		}
 	}
 	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg, entry: entry, marked: marked, native: native}
-	jx.rows = slices.ContainsFunc(vp, func(in jit.VInsn) bool { return in.Op == jit.VResultRow })
+	if slices.ContainsFunc(vp, func(in jit.VInsn) bool { return in.Op == jit.VResultRow }) {
+		jx.rows = jit.VReachesResultRow(vp)
+	}
 	jx.gate = make([]int16, len(vp))
 	jx.fill = make([][]curCols, len(vp))
 	seen := map[int]bool{}
@@ -586,9 +591,11 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 	if len(regs) < jx.nReg || jx.nReg == 0 {
 		return pc, -1
 	}
-	args := jit.ProgArgs{Regs: (*int64)(unsafe.Pointer(&regs[0])), PC: int64(pc), RowCap: -1}
+	args := &m.jargs
+	args.Regs, args.PC, args.Cur = (*int64)(unsafe.Pointer(&regs[0])), int64(pc), nil
+	args.RowBuf, args.RowCap, args.RowUsed, args.RowsBuf, args.RowsCap, args.Yield = nil, -1, 0, nil, 0, 0
 	switch {
-	case !jx.rows || m.firstRow:
+	case jx.rows == nil || !jx.rows[pc] || m.firstRow:
 		// No OpResultRow native code runs; or the VDBE's stops the run with an
 		// empty row.
 	case m.yieldReuse && len(*rows) == 0:
@@ -668,7 +675,7 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 		}
 		args.Cur = &m.jcur[0]
 	}
-	jx.code.Call2(&args)
+	jx.code.Call2(args)
 	if jx.nCurs > 0 {
 		for _, c := range jx.curs {
 			jc := &m.jcur[c]

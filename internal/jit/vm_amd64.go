@@ -376,11 +376,20 @@ func (e *vmEmit) clearS(reg int) {
 		return
 	}
 	delete(e.zeroS, reg)
-	// Plain MOVs, not a test of the pointer first: a store may sit between a
-	// compare and the branch on its flags (VCmpBr).
+	// Only when there is a pointer: three stores on every write cost the
+	// integer loops that never see one ~8%. The test must leave the flags
+	// alone -- a store may sit between a compare and the branch on it
+	// (VCmpBr) -- so it is JRCXZ, which reads RCX and no flags. RCX holds the
+	// pc only at an entry or an OP_Return, and a shift's count only before
+	// its result is stored.
+	a := e.a
+	a.MovRegMemD(RCX, RSI, e.d(reg, e.lay.OffS))
+	a.emit(0xE3, 0) // jrcxz past the stores
+	at := len(a.buf)
 	for k := range 3 {
-		e.a.MovMemDImm(RSI, e.d(reg, e.lay.OffS+8*k), 0)
+		a.MovMemDImm(RSI, e.d(reg, e.lay.OffS+8*k), 0)
 	}
+	a.buf[at-1] = byte(len(a.buf) - at)
 }
 
 // jccWB exits at pc when the GC's write barrier is on (wb.go).

@@ -284,11 +284,17 @@ func (e *vmEmitWasm) clearS(reg int) {
 		return
 	}
 	delete(e.zeroS, reg)
+	// Only when there is a pointer (vm_amd64.go's clearS).
+	e.loadI64(reg, e.lay.OffS)
+	e.w.op(opI64Eqz)
+	e.w.op(opI32Eqz)
+	e.openIf()
 	for k := range 3 {
 		e.w.Get(e.regs)
 		e.w.I64(0)
 		e.w.StoreI64(e.addr(reg, e.lay.OffS+8*k))
 	}
+	e.closeIf()
 }
 
 // pointerWords copies a Value word by word (copy(f) for each word f), given
