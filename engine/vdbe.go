@@ -1304,7 +1304,14 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				m.resumePC = pc + 1
 				return m.yieldRows, nil
 			}
-			row := make([]Value, op.P2)
+			// From the record arena, not one allocation a row: a derived table or a
+			// compound arm hands tens of thousands of these to its consumer, who
+			// keeps them. A row's capacity ends at its last value (recAlloc), so
+			// an append to it cannot reach its neighbour.
+			row := []Value{}
+			if op.P2 > 0 {
+				row = m.recAlloc(op.P2)
+			}
 			copy(row, m.regs[op.P1:op.P1+op.P2])
 			rows = append(rows, row)
 			if m.yield {
