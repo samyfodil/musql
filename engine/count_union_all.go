@@ -16,6 +16,11 @@ import "strings"
 // select.c), so an arm whose column would raise an error nobody sees raises
 // none here.
 //
+// Only for a select with nothing around it (the callers pass none that has an
+// enclosing query): an arm's aggregate over a column of an enclosing query is
+// associated outward by checkAggregateAssociation, and wrapping the arm in one
+// more select moves where that association is made.
+//
 // It returns nil, leaving stmt alone, for anything else: another select
 // list, a WHERE, GROUP BY, DISTINCT, ORDER BY or LIMIT on either side, a join,
 // a WITH, a VALUES arm, any operator but UNION ALL, and arms whose column

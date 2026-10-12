@@ -1204,8 +1204,10 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 		return p.execNoFrom(stmt, outer, params)
 	}
 	// count(*) over a UNION ALL is the sum of its arms' counts (count_union_all.go).
-	if f := p.countUnionAll(stmt); f != nil {
-		return p.execNoFrom(f, outer, params)
+	if outer == nil {
+		if f := p.countUnionAll(stmt); f != nil {
+			return p.execNoFrom(f, outer, params)
+		}
 	}
 
 	// C flattens a FROM subquery into its parent before planning, so the parent's

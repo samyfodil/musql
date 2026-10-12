@@ -754,7 +754,7 @@ func compileSubProgram(pager *ReadOnlyPager, stmt *SelectStmt, outer *compiler) 
 	// clause is flattened (flattenSubquery, select.c:4290) and pushed down into
 	// (pushDownWhereTerms, select.c:5134) exactly as the top-level statement's
 	// is in execSelect. See flatten_projection.go and pushdown_where.go.
-	if pager != nil && pager.r41ArmsHeld == 0 && len(stmt.Compound) == 0 && len(stmt.From) != 0 {
+	if pager != nil && outer == nil && pager.r41ArmsHeld == 0 && len(stmt.Compound) == 0 && len(stmt.From) != 0 {
 		if f := pager.countUnionAll(stmt); f != nil {
 			stmt = f
 		}

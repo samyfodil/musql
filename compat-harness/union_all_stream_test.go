@@ -82,6 +82,7 @@ func TestUnionAllStreamedDerived(t *testing.T) {
 		`SELECT id, (SELECT count(*) FROM (SELECT k FROM t WHERE k < t2.k UNION ALL SELECT k FROM t WHERE k > t2.k)) FROM t t2 ORDER BY id`,
 	}
 	multi := [][]string{
+		{`CREATE TABLE t0(c0)`, `CREATE TABLE t1(c1, c3)`, `INSERT INTO t0 VALUES (1)`, `INSERT INTO t1 VALUES (2, 3), (4, 3)`, `SELECT * FROM t0 WHERE EXISTS (SELECT 1 FROM t1 GROUP BY c3 HAVING (SELECT count(*) FROM (SELECT 1 UNION ALL SELECT sum(DISTINCT c1)))) BETWEEN 1 AND 1`},
 		{`CREATE VIEW vv AS SELECT count(*) AS c FROM (SELECT k FROM t UNION ALL SELECT k FROM t)`, `SELECT c FROM vv`, `SELECT * FROM vv`},
 		{`CREATE VIEW vw AS SELECT count(*) FROM (SELECT k FROM t UNION ALL SELECT v FROM t)`, `SELECT * FROM vw`},
 		{`CREATE TABLE ctas AS SELECT count(*) FROM (SELECT k FROM t UNION ALL SELECT k FROM t)`, `SELECT sql FROM sqlite_schema WHERE name = 'ctas'`, `SELECT * FROM ctas`},
