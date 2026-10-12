@@ -2485,6 +2485,10 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 		s := scopes[x.UsingPinnedItem]
 		idx, ok := s.colIndex[lname]
 		if !ok {
+			// A materialized group's stored member rowid (resolveGroupSource).
+			if isRowidAliasName(lname) && !s.noRowid {
+				return s.cursor, 0, true, true, fb, nil
+			}
 			return 0, 0, false, false, fb, fmt.Errorf("%w: no such column: %s", errVDBEUnsupported, x.Name)
 		}
 		if x.UsingRepr {
@@ -2499,6 +2503,12 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 		for i, s := range scopes {
 			if !equalFoldName(s.name, x.Qualifier) {
 				continue
+			}
+			if spanHidesName(&s.tableScope) {
+				if x.Schema != "" {
+					return 0, 0, false, false, fb, semanticf("engine: no such column: %s.%s.%s", x.Schema, x.Qualifier, x.Name)
+				}
+				return 0, 0, false, false, fb, semanticf("engine: no such column: %s.%s", x.Qualifier, x.Name)
 			}
 			// x.Schema named a specific database: a scope of the SAME bare
 			// name but a DIFFERENT database is not a candidate for THIS
@@ -2551,6 +2561,20 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 				}
 				return s.cursor, 0, true, true, fb, nil
 			}
+			if isRowidAliasName(x.Name) && s.groupRowidRel > 0 {
+				// A group member's rowid, stored in the group row
+				// (tableScope.groupRowidRel); two such scopes sharing the
+				// qualifier are ambiguous as above.
+				for _, other := range scopes[i+1:] {
+					if equalFoldName(other.name, x.Qualifier) && (!other.noRowid || other.groupMemberRowid) {
+						return 0, 0, false, false, fb, fmt.Errorf("engine: ambiguous column name: %s.%s", x.Qualifier, x.Name)
+					}
+				}
+				return s.cursor, s.colBase + s.groupRowidRel, false, true, fb, nil
+			}
+			if isRowidAliasName(x.Name) && s.groupMemberRowid {
+				return 0, 0, false, false, fb, fmt.Errorf("%w: %s of a member of a nested parenthesized join group", errVDBEUnsupported, x.Name)
+			}
 			// resolve.c:785-796 builds the message from the parts the reference was
 			// WRITTEN with: "%s.%s.%s" when a schema was named, "%s.%s" with a table,
 			// "%s" bare. Dropping the qualifier here made "SELECT t.nosuch FROM t"
@@ -2590,20 +2614,37 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 	foundCursor, foundIdx := -1, -1
 	foundRowidCursor := -1
 	memberRowid := false
+	var memberRowidScope compileScope
 	var foundScope compileScope
+	ambiguous, restarted := false, false
 	for _, s := range scopes {
+		if spanHidesName(&s.tableScope) {
+			continue // its span never matches (spanHidesName)
+		}
 		if idx, ok := s.colIndex[lname]; ok {
-			if s.coalesced != nil {
-				if _, hidden := s.coalesced[lname]; hidden {
-					// USING/NATURAL right-hand duplicate -- see
-					// resolveColumn's identical rule: doesn't
-					// count as a match here at all, so it can never trigger
-					// "ambiguous column name" against its own representative.
-					continue
+			_, hidden := s.coalesced[lname]
+			if _, skip := s.usingSkip[lname]; skip {
+				hidden = true
+			}
+			if hidden {
+				// USING/NATURAL right-hand duplicate -- see
+				// resolveColumn's identical rule: doesn't
+				// count as a match here at all, so it can never trigger
+				// "ambiguous column name" against its own representative.
+				// A RIGHT JOIN's restarts the count (tableScope.joinRight);
+				// that matters here only once the left side is ambiguous.
+				if ambiguous && s.joinRight {
+					ambiguous, restarted = false, true
+					foundCursor, foundIdx = s.cursor, idx+s.colBase
+					foundScope = s
+				} else if restarted && s.joinFull {
+					return 0, 0, false, false, fb, fmt.Errorf("%w: %s merged by a FULL JOIN after a RIGHT JOIN that cleared an ambiguity", errVDBEUnsupported, x.Name)
 				}
+				continue
 			}
 			if foundCursor != -1 || foundRowidCursor != -1 {
-				return 0, 0, false, false, fb, fmt.Errorf("engine: ambiguous column name: %s", x.Name)
+				ambiguous = true
+				continue
 			}
 			foundCursor, foundIdx = s.cursor, idx+s.colBase
 			foundScope = s
@@ -2614,14 +2655,23 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 				return 0, 0, false, false, fb, fmt.Errorf("engine: ambiguous column name: %s", x.Name)
 			}
 			if s.noRowid {
-				memberRowid = true
+				memberRowid, memberRowidScope = true, s
 				continue
 			}
 			foundRowidCursor = s.cursor
 		}
 	}
+	if ambiguous {
+		return 0, 0, false, false, fb, fmt.Errorf("engine: ambiguous column name: %s", x.Name)
+	}
+	if restarted {
+		return foundCursor, foundIdx, false, true, fb, nil
+	}
 	if memberRowid {
 		// The one candidate is a group member's rowid (tableScope.groupMemberRowid).
+		if memberRowidScope.groupRowidRel > 0 {
+			return memberRowidScope.cursor, memberRowidScope.colBase + memberRowidScope.groupRowidRel, false, true, fb, nil
+		}
 		return 0, 0, false, false, fb, fmt.Errorf("%w: %s of a member of a parenthesized join group", errVDBEUnsupported, x.Name)
 	}
 	if foundRowidCursor != -1 {

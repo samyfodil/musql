@@ -930,6 +930,12 @@ func (db *DB) createTableAsSelect(name string, isTemp bool, sel *SelectStmt, ifN
 	// (needed for an ordinary join execution, not for this): harmless here,
 	// just extra work pager.execSelect's own later call redoes properly.
 	var scopes []tableScope
+	// The SELECT's own WITH names FROM sources: "CREATE TABLE t AS WITH c(x)
+	// AS (...) SELECT x FROM c". execSelect pushes it for the run; the schema
+	// pass needs it too.
+	if len(sel.CTEs) > 0 {
+		defer pager.pushCTEScope(sel.CTEs)()
+	}
 	if len(sel.From) > 0 {
 		jts, _, ferr := pager.resolveFrom(sel.From, nil)
 		if ferr != nil {

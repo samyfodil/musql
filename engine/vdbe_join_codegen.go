@@ -54,6 +54,10 @@ type joinSource struct {
 	// no-op, planner barrier -- see that field's doc comment and where_plan.go.
 	cross bool
 
+	// groupRowids is how many member rowids a materialized group stores after
+	// its member columns (tableScope.groupRowidRel); tbl.cols lists them last.
+	groupRowids int
+
 	// updateTarget is FromItem.UpdateTarget: this source is the synthetic,
 	// comma-joined stand-in update_from.go/view_trigger.go append LAST for
 	// UPDATE...FROM's own target table (or an INSTEAD OF UPDATE trigger's
@@ -642,6 +646,17 @@ func resolveJoinSources(p *ReadOnlyPager, c *compiler, items []FromItem) ([]join
 	if err := checkOnReferencesRight(items, srcs, absToSrcs); err != nil {
 		return nil, err
 	}
+	markStarBare(items, srcs, absToSrcs)
+	for i, it := range items {
+		if k, ok := absToSrcs[i]; ok {
+			srcs[k].scope.joinRight = it.Join == JoinRight
+			srcs[k].scope.joinFull = it.Join == JoinFull
+			if len(srcs[k].memberScopes) > 0 {
+				srcs[k].memberScopes[0].joinRight = srcs[k].scope.joinRight
+				srcs[k].memberScopes[0].joinFull = srcs[k].scope.joinFull
+			}
+		}
+	}
 	if err := checkRebuiltJoinGroups(items, itemScopes(items, absToSrcs, srcs), c.groupSpanRecursion); err != nil {
 		return nil, err
 	}
@@ -720,9 +735,17 @@ func annotateMaterializedGroupColNames(members []FromItem, ms []compileScope) {
 func nestedColNamesInto(members []FromItem, scopes []*tableScope) {
 	var names []string
 	start := make([]int, len(members))
+	rowidPos := make([]int, len(members))
+	usingPos := map[string]int{}
 	for k, ts := range scopes {
+		rowidPos[k] = -1
 		if k+1 < len(members) {
-			names = append(names, groupJoinCommonNames(members[k+1], scopes[:k+1], scopes[k+1])...)
+			for _, n := range groupJoinCommonNames(members[k+1], scopes[:k+1], scopes[k+1]) {
+				if _, seen := usingPos[r33sFoldIdent(n)]; !seen {
+					usingPos[r33sFoldIdent(n)] = len(names)
+				}
+				names = append(names, n)
+			}
 		}
 		start[k] = len(names)
 		for _, col := range ts.cols {
@@ -733,13 +756,27 @@ func nestedColNamesInto(members []FromItem, scopes []*tableScope) {
 			}
 			names = append(names, col.Name)
 		}
-		if !ts.noRowid {
+		if !ts.noRowid || ts.groupMemberRowid {
 			if alias := rowidAliasCandidate(ts.cols); alias != "" {
+				rowidPos[k] = len(names)
 				names = append(names, alias)
 			}
 		}
 	}
-	uniq, _ := r32mUniqueColumnNames(names)
+	uniq, uniqOK := r32mUniqueColumnNames(names)
+	var usingNames map[string]string
+	if uniqOK && len(usingPos) > 0 {
+		usingNames = make(map[string]string, len(usingPos))
+		for ln, at := range usingPos {
+			usingNames[ln] = uniq[at]
+		}
+	}
+	for k, ts := range scopes {
+		if ts.groupRowidRel > 0 && rowidPos[k] >= 0 && uniqOK {
+			ts.groupRowidName = uniq[rowidPos[k]]
+		}
+		ts.usingEntryNames = usingNames
+	}
 	common := map[string]bool{}
 	for k := range members {
 		if k+1 < len(members) {
@@ -1876,7 +1913,11 @@ func (p *ReadOnlyPager) resolveCTESource(c *compiler, state *joinDesugarState, i
 		}
 	}
 
-	cols, err := p.cteSchemaCols(cteName, b)
+	var recOuter *compiler
+	if b.recursive != nil {
+		recOuter = derivedOuterBarrier(c)
+	}
+	cols, err := p.cteSchemaColsIn(cteName, b, recOuter)
 	if err != nil {
 		return joinSource{}, err
 	}
@@ -1894,9 +1935,14 @@ func (p *ReadOnlyPager) resolveCTESource(c *compiler, state *joinDesugarState, i
 	}
 	var queue *Program
 	if b.recursive != nil {
-		queue, err = p.compileRecursiveCTE(cteName, b, cols, outerCap)
+		queue, err = p.compileRecursiveCTE(cteName, b, cols, outerCap, recOuter)
 		if err != nil {
 			return joinSource{}, err
+		}
+		if queue.Correlated {
+			// The recursion reads the enclosing row, so c's program re-runs
+			// it per row too (resolveCorrelatedCTESource's propagation).
+			c.correlated = true
 		}
 	}
 	name := it.Alias
@@ -1962,6 +2008,13 @@ func (p *ReadOnlyPager) resolveRecursiveSelfSource(c *compiler, state *joinDesug
 // reference: %s"); the recognized recursive self-reference is short-circuited
 // by b.selfRef first.
 func (p *ReadOnlyPager) cteSchemaCols(name string, b *cteBinding) ([]columnInfo, error) {
+	return p.cteSchemaColsIn(name, b, nil)
+}
+
+// cteSchemaColsIn is cteSchemaCols compiling the body under outer, the
+// enclosing query a recursive CTE's seed may correlate with
+// (compileRecursiveCTE).
+func (p *ReadOnlyPager) cteSchemaColsIn(name string, b *cteBinding, outer *compiler) ([]columnInfo, error) {
 	if b.selfRef != nil {
 		return b.selfRef.cols, nil
 	}
@@ -2015,7 +2068,7 @@ func (p *ReadOnlyPager) cteSchemaCols(name string, b *cteBinding) ([]columnInfo,
 		target = &schemaOnly
 	}
 	leave := p.enterFromBody()
-	prog, perr := compileSubProgram(p, target, nil)
+	prog, perr := compileSubProgram(p, target, outer)
 	leave()
 	if perr != nil {
 		return nil, perr // already wrapped errVDBEUnsupported/errVDBESemantic
@@ -2248,6 +2301,29 @@ func (p *ReadOnlyPager) finishGroupSource(c *compiler, state *joinDesugarState, 
 			outCols = append(outCols, outputColumn{name: col.Name, expr: ColumnExpr{Name: col.Name, UsingPinned: true, UsingPinnedItem: i}})
 		}
 	}
+	// Then each direct member's rowid, which C exposes through the group
+	// (tableScope.groupMemberRowid) and this row must carry to answer "a.rowid".
+	nMemberCols := len(outCols)
+	rowidAt := make([]int, len(subC.scopes)) // index in the group row, 0 = none
+	var rowidCols []columnInfo
+	for i, sc := range subC.scopes {
+		if sc.noRowid {
+			continue
+		}
+		spell := ""
+		for _, opt := range [3]string{"rowid", "_rowid_", "oid"} {
+			if _, real := sc.colIndex[opt]; !real {
+				spell = opt
+				break
+			}
+		}
+		if spell == "" {
+			continue
+		}
+		rowidAt[i] = len(outCols)
+		outCols = append(outCols, outputColumn{name: spell, expr: ColumnExpr{Name: spell, UsingPinned: true, UsingPinnedItem: i}})
+		rowidCols = append(rowidCols, columnInfo{Name: spell, Aff: affInteger})
+	}
 	for _, oc := range outCols {
 		if err := checkExprSupported(oc.expr); err != nil {
 			return joinSource{}, declineOrSemantic(err)
@@ -2262,6 +2338,10 @@ func (p *ReadOnlyPager) finishGroupSource(c *compiler, state *joinDesugarState, 
 	for _, sc := range subC.scopes {
 		allCols = append(allCols, sc.cols...)
 	}
+	if len(allCols) != nMemberCols {
+		return joinSource{}, fmt.Errorf("%w: parenthesized join group row layout", errVDBEUnsupported)
+	}
+	allCols = append(allCols, rowidCols...)
 	groupTbl := &resolvedTable{cols: allCols, ipkIndex: -1}
 	cursor := c.allocCursor()
 	slot := c.allocSub()
@@ -2284,7 +2364,32 @@ func (p *ReadOnlyPager) finishGroupSource(c *compiler, state *joinDesugarState, 
 		ts := sc.tableScope
 		// A direct member keeps its rowid as a C-visible candidate; a nested
 		// group's members were already forced, and C does not re-expose them.
-		ts.groupMemberRowid = !ts.noRowid
+		// A member of a nested group was materialized there: its stored rowid
+		// is not in this row. C re-exposes it only when this group is spliced
+		// flat (an SF_NestedFrom list skips a nested one's ENAME_ROWID entries,
+		// select.c ~6228), so it stays a candidate then, unreadable here.
+		if rowidAt[k] > 0 {
+			ts.groupMemberRowid = true
+		} else if !ts.noRowid || it.GroupRebuildID != 0 {
+			ts.groupMemberRowid = false
+		}
+		ts.groupRowidRel, ts.groupRowidName = 0, ""
+		if it.GroupRebuildID != 0 {
+			ts.rebuiltLayers++
+		}
+		if rowidAt[k] > 0 {
+			ts.groupRowidRel = rowidAt[k] - colBases[k]
+			if it.GroupRebuildID == 0 {
+				// C splices this group flat: the member is an ordinary table.
+				ts.groupRowidName = "rowid"
+				for _, c := range ts.cols {
+					if c.IsRowidAlias {
+						ts.groupRowidName = c.Name
+						break
+					}
+				}
+			}
+		}
 		ts.noRowid = true
 		// Re-address a member's coalesce fallback onto this group's cursor: an owner's
 		// address is {cursor, colBases[ownerIdx] + its local column}. A nested group's
@@ -2344,6 +2449,9 @@ func (p *ReadOnlyPager) finishGroupSource(c *compiler, state *joinDesugarState, 
 	// reference from OUTSIDE the group must consult, exactly like an
 	// ordinary item's tableScope.coalesced.
 	memberScopes[0].coalesced = hidden
+	for k := 1; k < len(memberScopes); k++ {
+		memberScopes[k].usingSkip = hidden
+	}
 
 	// Members reached through a nested connector carry that nested group's alias
 	// (x), which is not visible outside this group: "no such column: x.a", while
@@ -2368,6 +2476,7 @@ func (p *ReadOnlyPager) finishGroupSource(c *compiler, state *joinDesugarState, 
 		derived:      prog,
 		derivedSlot:  slot,
 		memberScopes: memberScopes,
+		groupRowids:  len(rowidCols),
 	}, nil
 }
 
@@ -2408,7 +2517,7 @@ func (p *ReadOnlyPager) resolveNestedGroupConnectorCols(span []FromItem) ([]colu
 	if err != nil {
 		return nil, err
 	}
-	return gs.tbl.cols, nil
+	return gs.tbl.cols[:len(gs.tbl.cols)-gs.groupRowids], nil
 }
 
 // compileGroupBody compiles a join group's resolved internal sources into a
@@ -3131,4 +3240,35 @@ func markRecursiveSelfNullExtension(c *compiler, srcs []joinSource, plan joinPla
 func (c *compiler) emitRecursiveSelfReposition(cur int) {
 	j := c.emit(Instruction{Op: OpRewind, P1: cur})
 	c.patch(j, c.here())
+}
+
+// markStarBare computes tableScope.starBare for every plain item of this
+// level: the names it would expand bare under "X.*".
+func markStarBare(items []FromItem, srcs []joinSource, absToSrcs map[int]int) {
+	lastRight := -1
+	for i, it := range items {
+		if _, ok := absToSrcs[i]; ok && (it.Join == JoinRight || it.Join == JoinFull) {
+			lastRight = i
+		}
+	}
+	for i := range items {
+		k, ok := absToSrcs[i]
+		// Inside a group C rebuilds, "X.*" goes through the rebuilt list,
+		// whose own expansion qualified every column (SF_NestedFrom).
+		if !ok || len(srcs[k].memberScopes) > 0 || items[i].NestedNonLeading || items[i].NestFromWrapDepth > 0 {
+			continue
+		}
+		bare := map[string]bool{}
+		if i < lastRight {
+			for j := i + 1; j < len(items); j++ {
+				if kj, ok := absToSrcs[j]; ok {
+					for n := range srcs[kj].scope.coalesced {
+						bare[n] = true
+					}
+				}
+			}
+		}
+		srcs[k].scope.starBare = bare
+		srcs[k].scope.starBareSet = true
+	}
 }

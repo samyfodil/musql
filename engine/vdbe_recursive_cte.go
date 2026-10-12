@@ -126,7 +126,15 @@ type recCurrentRow struct {
 // while it compiles, b.selfRef makes that FROM item a one-row source over the
 // current row (resolveRecursiveSelfSource). SQLite compiles it the same way:
 // the recursive table is bound to iCurrent (select.c:2821-2825).
-func (p *ReadOnlyPager) compileRecursiveCTE(name string, b *cteBinding, cols []columnInfo, outerCapPlus1 int64) (*Program, error) {
+func (p *ReadOnlyPager) compileRecursiveCTE(name string, b *cteBinding, cols []columnInfo, outerCapPlus1 int64, outer *compiler) (*Program, error) {
+	// The queue program's own compiler, made first so the setup query and the
+	// recursive arms compile beneath it: a recursion inside a subquery may read
+	// the enclosing row ("(WITH RECURSIVE r(x) AS (VALUES(1) UNION ALL SELECT
+	// x+1 FROM r WHERE x < t.n) SELECT ...) FROM t"). An arm runs in a machine
+	// whose parent is the queue's, and the queue's parent is the statement's
+	// (execWithParent), so outer stands for the statement's frame with its own
+	// FROM hidden (derivedOuterBarrier), exactly as for a correlated CTE.
+	c := &compiler{pager: p, outer: outer}
 	rs := b.recursive
 	if b.multiSelfRef {
 		// select.c:5786-5792 -- see cteBinding.multiSelfRef. Checked before the
@@ -150,6 +158,11 @@ func (p *ReadOnlyPager) compileRecursiveCTE(name string, b *cteBinding, cols []c
 	// cteSchemaCols compiled the setup query in, and the one resolveCTERows ran
 	// it in; see enterCTEBodyScope.
 	defer p.enterCTEBodyScope(name, b)()
+	// The body's own WITH covers every arm, recursive ones included
+	// (select.c:5808 hands pSel->pWith to the recursive walk).
+	if len(b.core.CTEs) > 0 {
+		defer p.pushCTEScope(b.core.CTEs)()
+	}
 
 	nCol := len(cols)
 	spec := &recQueueSpec{name: b.name, nCol: nCol, unionAll: rs.unionAll}
@@ -194,7 +207,7 @@ func (p *ReadOnlyPager) compileRecursiveCTE(name string, b *cteBinding, cols []c
 		}
 	}
 
-	seed, err := p.compileRecursiveCTEPart(rs.initial)
+	seed, err := p.compileRecursiveCTEPart(rs.initial, c)
 	if err != nil {
 		return nil, err
 	}
@@ -203,7 +216,7 @@ func (p *ReadOnlyPager) compileRecursiveCTE(name string, b *cteBinding, cols []c
 	p.cteSelfRefLive++
 	arms := make([]*Program, 0, len(rs.recursiveArms))
 	for _, arm := range rs.recursiveArms {
-		prog, aerr := p.compileRecursiveCTEPart(arm)
+		prog, aerr := p.compileRecursiveCTEPart(arm, c)
 		if aerr != nil {
 			b.selfRef = savedSelf
 			p.cteSelfRefLive--
@@ -219,7 +232,6 @@ func (p *ReadOnlyPager) compileRecursiveCTE(name string, b *cteBinding, cols []c
 	b.selfRef = savedSelf
 	p.cteSelfRefLive--
 
-	c := &compiler{pager: p}
 	regCur := c.allocN(nCol)
 	var toBreak []int
 	if spec.hasLimit && spec.limit == 0 {
@@ -249,13 +261,15 @@ func (p *ReadOnlyPager) compileRecursiveCTE(name string, b *cteBinding, cols []c
 		names[i] = cols[i].Name
 	}
 	prog := &Program{
+		Correlated:       c.correlated,
 		Insns:            c.insns,
 		NReg:             c.nReg,
 		NResultCol:       nCol,
 		ColNames:         names,
 		CTEScopeSnapshot: p.snapshotCTEScopes(),
 	}
-	if !recInlineOffForTest {
+	if !recInlineOffForTest && !prog.Correlated {
+		// An inlined arm would read the enclosing row one frame nearer.
 		recInlinePeephole(prog)
 	}
 	return prog, nil
@@ -269,7 +283,7 @@ var recInlineOffForTest bool
 // recursive CTE. It applies what execSelect applied to the same SELECT when the
 // recursion ran it at run time -- the per-statement guards and the flattening
 // pre-pass -- and nothing else, so the compiled plan is that path's plan.
-func (p *ReadOnlyPager) compileRecursiveCTEPart(stmt *SelectStmt) (*Program, error) {
+func (p *ReadOnlyPager) compileRecursiveCTEPart(stmt *SelectStmt, queue *compiler) (*Program, error) {
 	if err := p.validateSelectSchemaQualifiers(stmt); err != nil {
 		return nil, fmt.Errorf("%w: %v", errVDBESemantic, err)
 	}
@@ -285,7 +299,10 @@ func (p *ReadOnlyPager) compileRecursiveCTEPart(stmt *SelectStmt) (*Program, err
 	case len(stmt.From) > 0:
 		stmt = p.r37cFlattenTransparent(stmt)
 	}
-	return compileSubProgram(p, stmt, nil)
+	if queue.outer == nil {
+		return compileSubProgram(p, stmt, nil)
+	}
+	return compileSubProgram(p, stmt, queue)
 }
 
 // recQueue is one execution's queue state for a recursive CTE: select.c's
@@ -475,7 +492,15 @@ func (m *vdbe) recQueueFill(op *Instruction) error {
 	if q == nil || !ok || prog == nil {
 		return fmt.Errorf("vdbe: recursive CTE queue step with no open queue")
 	}
-	rows, err := prog.execTrig(m.pager, m.params, m)
+	var rows [][]Value
+	var err error
+	if prog.Correlated {
+		// An arm reading the enclosing row runs with this machine as its
+		// parent frame (compileRecursiveCTE); the current row travels as recCur.
+		rows, err = prog.execWithParentOn(m, m.pager)
+	} else {
+		rows, err = prog.execTrig(m.pager, m.params, m)
+	}
 	if err != nil {
 		return err
 	}

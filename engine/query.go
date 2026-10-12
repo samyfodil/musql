@@ -1860,7 +1860,7 @@ func expandSelectList(sel []SelectColumn, scopes []tableScope, mode colNameMode)
 				// this statement's own scopes only: "SELECT (SELECT t1.* FROM t2) FROM t1" is
 				// "no such table: t1".
 				ts, ok := findTableScope(scopes, sc.StarQualifier)
-				if !ok {
+				if !ok || spanHidesName(ts) {
 					return nil, fmt.Errorf("engine: no such table: %s", sc.StarQualifier)
 				}
 				// A qualified star matching several FROM items (an unaliased self-join) expands
@@ -1868,6 +1868,13 @@ func expandSelectList(sel []SelectColumn, scopes []tableScope, mode colNameMode)
 				// columns); findTableScope takes the first only, so decline.
 				if n := countScopesNamed(scopes, ts.name); n > 1 {
 					return nil, fmt.Errorf("engine: unsupported: %q.* names %d FROM items (C SQLite expands every one of them)", ts.name, n)
+				}
+				// Two SF_NestedFrom layers deep, C re-expands the table's entries
+				// under the inner layer's names, which the outer layer then does
+				// not resolve ("ambiguous column name: id", "no such column:
+				// id:1" over "((pa a JOIN pb b ON ...) AS g1 JOIN pc ...) AS g").
+				if ts.rebuiltLayers >= 2 {
+					return nil, fmt.Errorf("engine: unsupported: %q.* through two rebuilt parenthesized join groups", ts.name)
 				}
 				for ci, c := range ts.cols {
 					// A virtual-table HIDDEN column (columnInfo.Hidden) is
@@ -1891,14 +1898,18 @@ func expandSelectList(sel []SelectColumn, scopes []tableScope, mode colNameMode)
 					//	  -> 3     the COALESCE'd column   (group is leading)
 					//	SELECT t1.* FROM t4, (t1 RIGHT JOIN t2 USING(a))
 					//	  -> NULL  t1's raw storage        (group is a subquery)
-					if !ts.nestedNonLeading && ts.coalesceFallback != nil {
-						if _, hasFallback := ts.coalesceFallback[r33sFoldIdent(c.Name)]; hasFallback {
-							if longNames {
-								return nil, fmt.Errorf("engine: unsupported: PRAGMA full_column_names naming of a USING/NATURAL-coalesced '*' column %q", c.Name)
-							}
-							out = append(out, outputColumn{expr: ColumnExpr{Name: c.Name}, name: c.Name})
-							continue
+					bare := false
+					if ts.starBareSet {
+						bare = ts.starBare[r33sFoldIdent(c.Name)]
+					} else if !ts.nestedNonLeading && ts.coalesceFallback != nil {
+						_, bare = ts.coalesceFallback[r33sFoldIdent(c.Name)]
+					}
+					if bare {
+						if longNames {
+							return nil, fmt.Errorf("engine: unsupported: PRAGMA full_column_names naming of a USING/NATURAL-coalesced '*' column %q", c.Name)
 						}
+						out = append(out, outputColumn{expr: ColumnExpr{Name: c.Name}, name: c.Name})
+						continue
 					}
 					nm, nerr := starName(*ts, c.Name)
 					if nerr != nil {
@@ -2139,6 +2150,12 @@ func findTableScope(scopes []tableScope, qualifier string) (*tableScope, bool) {
 // named deterministically (FromItem.NestFromWrapDepth; see
 // annotateNestedRowidNames).
 func columnRefNameParts(scopes []tableScope, ce ColumnExpr) (qualifier, display string, ok bool, err error) {
+	if ts := groupMemberRowidScope(scopes, ce); ts != nil {
+		if ts.groupRowidName == "" {
+			return "", "", false, fmt.Errorf("engine: unsupported: %s of a member of a parenthesized join group SQLite rebuilds (its name in the rebuilt column list is not reproduced)", ce.Name)
+		}
+		return ts.tableName, ts.groupRowidName, true, nil
+	}
 	ctx := &evalCtx{tables: scopes}
 	foundCtx, idx, col, rowidTableIdx, rerr := resolveColumn(ctx, ce.Qualifier, ce.Name)
 	if rerr != nil || foundCtx == nil {
@@ -2187,6 +2204,11 @@ func columnRefNameParts(scopes []tableScope, ce ColumnExpr) (qualifier, display 
 			// ":N" suffix and all (tableScope.nestedColNames).
 			if ts.nestedColNames != nil && ce.Qualifier != "" && !equalFoldName(ce.Qualifier, ts.groupAlias) {
 				return ts.tableName, ts.nestedColNames[idx-ts.offset], true, nil
+			}
+			if ce.Qualifier == "" {
+				if n, ok := ts.usingEntryNames[r33sFoldIdent(ce.Name)]; ok {
+					return ts.tableName, n, true, nil
+				}
 			}
 			return ts.tableName, col.Name, true, nil
 		}
@@ -2432,4 +2454,38 @@ func detachResultRows(rows [][]Value) [][]Value {
 		}
 	}
 	return rows
+}
+
+// groupMemberRowidScope returns the parenthesized group member whose stored
+// rowid ce names (tableScope.groupRowidRel), or nil: qualified by the member's
+// own name, or unqualified with that member the only rowid candidate and no
+// real column of the name anywhere.
+func groupMemberRowidScope(scopes []tableScope, ce ColumnExpr) *tableScope {
+	lname := r33sFoldIdent(ce.Name)
+	if !isRowidAliasName(lname) {
+		return nil
+	}
+	var found *tableScope
+	for i := range scopes {
+		ts := &scopes[i]
+		if ce.Qualifier != "" && !equalFoldName(ts.name, ce.Qualifier) {
+			continue
+		}
+		if _, real := ts.colIndex[lname]; real {
+			return nil
+		}
+		if !ts.noRowid {
+			if ce.Qualifier == "" {
+				return nil // a second, ordinary candidate
+			}
+			continue
+		}
+		if ts.groupRowidRel > 0 {
+			if found != nil {
+				return nil
+			}
+			found = ts
+		}
+	}
+	return found
 }

@@ -620,6 +620,7 @@ func detectRecursiveShape(name string, core *SelectStmt) *recursiveCTEShape {
 	}
 
 	initial := &SelectStmt{
+		CTEs:     core.CTEs,
 		Columns:  core.Columns,
 		Distinct: core.Distinct,
 		From:     core.From,
