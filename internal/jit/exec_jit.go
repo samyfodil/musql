@@ -24,6 +24,9 @@ func (c *Code) Call(args *Args) {
 	if c.entry == nil {
 		panic("jit: Call on closed code")
 	}
+	if scoreCalls {
+		noteCall()
+	}
 	callKernel(c.entry, args)
 	runtime.KeepAlive(c)
 	runtime.KeepAlive(args)
@@ -38,6 +41,9 @@ func (c *Code) Call(args *Args) {
 func (c *Code) Call2(args *ProgArgs) {
 	if c.entry == nil {
 		panic("jit: Call2 on closed code")
+	}
+	if scoreCalls {
+		noteCall()
 	}
 	callProgram(c.entry, args)
 	runtime.KeepAlive(c)

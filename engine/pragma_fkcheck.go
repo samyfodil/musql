@@ -240,7 +240,7 @@ func (p *ReadOnlyPager) pragmaForeignKeyCheckTable(scope schemaScope, tableName 
 	if err != nil {
 		return nil, nil, err
 	}
-	// ponytail: O(child rows x parent rows x foreign keys) -- a full parent
+	// A deliberate simplification: O(child rows x parent rows x foreign keys) -- a full parent
 	// scan per candidate, not the index SEEK C SQLite performs. Fine for
 	// the fixtures this pragma is exercised on; the upgrade path is
 	// index_seek_candidates.go's secondaryIndexSeekCandidates, which already

@@ -3,13 +3,17 @@
 // Unsupported platforms read the file instead (correct, slower, never wrong).
 package mmapfile
 
-import "os"
+import (
+	"os"
+	"sync"
+)
 
 // File is a mapped (or, on a platform without mapping, a loaded) file.
 type File struct {
 	data   []byte
 	mapped bool
 	f      *os.File
+	ahead  sync.Once
 }
 
 // Data returns the file's bytes (read-only until Close).
@@ -29,4 +33,15 @@ func (f *File) Len() int {
 		return 0
 	}
 	return len(f.data)
+}
+
+// ReadAhead asks, once per mapping, for the whole file to be read into memory
+// ahead of its first touch, where the platform needs asking (see the darwin
+// readAhead); elsewhere it does nothing. A hint: the bytes read the same
+// either way.
+func (f *File) ReadAhead() {
+	if f == nil || !f.mapped {
+		return
+	}
+	f.ahead.Do(func() { readAhead(f.data) })
 }

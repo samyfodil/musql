@@ -115,7 +115,7 @@ func segAttachRowFilter(in []Instruction, at, cursor int) bool {
 	if low == nil || predEnd < 0 {
 		return false // no WHERE this models: every row is a candidate anyway
 	}
-	low.insns = append(low.insns, jit.ProgInsn{Op: jit.POpEmitRow})
+	low.add(jit.ProgInsn{Op: jit.POpEmitRow})
 	in[at].P4 = &segRowFilter{low: low}
 	return true
 }

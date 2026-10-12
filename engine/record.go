@@ -4,8 +4,10 @@
 package engine
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math"
+	"math/bits"
 	"slices"
 )
 
@@ -290,6 +292,26 @@ var intSerialWidths = []struct {
 	{1, 1}, {2, 2}, {3, 3}, {4, 4}, {5, 6}, {6, 8},
 }
 
+// intSerial is the first of intSerialWidths that holds i, found from the
+// bits i needs as a signed number rather than by trying each width in turn:
+// every record a write encodes measures and encodes each integer column.
+func intSerial(i int64) (serialType uint64, width int) {
+	need := bits.Len64(uint64(i^(i>>63))) + 1 // magnitude bits, plus the sign
+	switch {
+	case need <= 8:
+		return 1, 1
+	case need <= 16:
+		return 2, 2
+	case need <= 24:
+		return 3, 3
+	case need <= 32:
+		return 4, 4
+	case need <= 48:
+		return 5, 6
+	}
+	return 6, 8
+}
+
 // fitsSignedWidth reports whether i fits in the two's-complement range of an
 // n-byte signed integer (n one of 1,2,3,4,6,8).
 func fitsSignedWidth(i int64, n int) bool {
@@ -315,12 +337,8 @@ func serialTypeOf(v Value) uint64 {
 		case 1:
 			return 9
 		}
-		for _, w := range intSerialWidths {
-			if fitsSignedWidth(v.I, w.bytes) {
-				return w.serialType
-			}
-		}
-		return 6 // unreachable: every int64 fits in 8 bytes
+		st, _ := intSerial(v.I)
+		return st
 	case Float:
 		return 7
 	case Text:
@@ -361,15 +379,11 @@ func appendValueBody(dst []byte, v Value) []byte {
 			return dst // serial types 8 and 9 carry the value in the header
 		}
 		u := uint64(v.I)
-		for _, w := range intSerialWidths {
-			if fitsSignedWidth(v.I, w.bytes) {
-				for k := w.bytes - 1; k >= 0; k-- {
-					dst = append(dst, byte(u>>uint(8*k)))
-				}
-				return dst
-			}
+		_, width := intSerial(v.I)
+		for k := width - 1; k >= 0; k-- {
+			dst = append(dst, byte(u>>uint(8*k)))
 		}
-		return dst // unreachable, see serialTypeOf
+		return dst
 	case Float:
 		bits := math.Float64bits(v.F)
 		for k := 0; k < 8; k++ {
@@ -407,24 +421,60 @@ func encodeRecord(vals []Value) []byte { return appendRecord(nil, vals) }
 // recordSize is len(appendRecord(nil, vals)), computed without encoding.
 func recordSize(vals []Value) int {
 	bodyLen, typesLen := 0, 0
-	for _, v := range vals {
-		st := serialTypeOf(v)
+	for i := range vals {
+		st := serialTypeOfPtr(&vals[i])
 		bodyLen += serialBodyLen(st)
 		typesLen += varintLen(st)
 	}
+	return recordHeaderLen(typesLen) + bodyLen
+}
+
+// recordHeaderLen is the length of a record header whose serial types take
+// typesLen bytes: they, plus the varint giving the header's own length, which
+// counts itself.
+func recordHeaderLen(typesLen int) int {
 	hdrLen := 1 + typesLen
 	for {
 		n := varintLen(uint64(hdrLen))
 		if n == hdrLen-typesLen {
-			break
+			return hdrLen
 		}
 		hdrLen = n + typesLen
 	}
-	return hdrLen + bodyLen
+}
+
+// serialTypeOfPtr is serialTypeOf over a pointer, for the encoders' loops: a
+// Value is 48 bytes, and each call copied one.
+func serialTypeOfPtr(v *Value) uint64 {
+	switch v.Typ {
+	case Null:
+		return 0
+	case Int:
+		switch v.I {
+		case 0:
+			return 8
+		case 1:
+			return 9
+		}
+		st, _ := intSerial(v.I)
+		return st
+	case Float:
+		return 7
+	case Text:
+		return uint64(13 + 2*len(v.S))
+	case Blob:
+		return uint64(12 + 2*len(v.S))
+	default:
+		panic(fmt.Sprintf("engine: serialTypeOf: invalid ValueType %d", v.Typ))
+	}
 }
 
 // appendRecord appends encodeRecord onto the end of dst, which it grows once to
 // the exact size. Multiple records into one buffer pay no allocation per record.
+//
+// It writes the record in place rather than appending a byte at a time: every
+// commit encodes every row it writes through here, and per-byte appends of each
+// integer were most of what that cost.
 func appendRecord(dst []byte, vals []Value) []byte {
 	// serialTypes come off the stack for the common handful-of-columns case.
 	var stackTypes [smallRecordCols]uint64
@@ -436,32 +486,46 @@ func appendRecord(dst []byte, vals []Value) []byte {
 	}
 	bodyLen := 0
 	typesLen := 0
-	for i, v := range vals {
-		st := serialTypeOf(v)
+	for i := range vals {
+		st := serialTypeOfPtr(&vals[i])
 		serialTypes[i] = st
 		bodyLen += serialBodyLen(st)
 		typesLen += varintLen(st)
 	}
+	hdrLen := recordHeaderLen(typesLen)
 
-	hdrLen := 1 + typesLen
-	for {
-		n := varintLen(uint64(hdrLen))
-		if n == hdrLen-typesLen {
-			break
-		}
-		hdrLen = n + typesLen
-	}
-
-	buf := slices.Grow(dst, hdrLen+bodyLen)
-	var tmp [9]byte
-	n := putVarint(tmp[:], uint64(hdrLen))
-	buf = append(buf, tmp[:n]...)
+	at := len(dst)
+	buf := slices.Grow(dst, hdrLen+bodyLen)[:at+hdrLen+bodyLen]
+	b := buf[at:]
+	p := putVarint(b, uint64(hdrLen))
 	for _, st := range serialTypes {
-		n = putVarint(tmp[:], st)
-		buf = append(buf, tmp[:n]...)
+		if st <= 0x7f {
+			b[p] = byte(st)
+			p++
+		} else {
+			p += putVarint(b[p:], st)
+		}
 	}
-	for _, v := range vals {
-		buf = appendValueBody(buf, v)
+	for i := range vals {
+		v := &vals[i]
+		switch v.Typ {
+		case Int:
+			st := serialTypes[i]
+			if st < 1 || st > 6 {
+				continue // 8 and 9 carry the value in the header
+			}
+			w := serialIntSize[st]
+			u := uint64(v.I)
+			for k := 0; k < w; k++ {
+				b[p+k] = byte(u >> uint(8*(w-1-k)))
+			}
+			p += w
+		case Float:
+			binary.BigEndian.PutUint64(b[p:p+8], math.Float64bits(v.F))
+			p += 8
+		case Text, Blob:
+			p += copy(b[p:], v.S)
+		}
 	}
 	return buf
 }

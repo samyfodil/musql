@@ -10,8 +10,9 @@ import (
 type Option func(*config)
 
 type config struct {
-	noJIT   bool
-	workers int
+	noJIT    bool
+	noFusion bool
+	workers  int
 }
 
 // WithWorkers lets a columnar scan or aggregate split its segments across n
@@ -24,6 +25,11 @@ func WithWorkers(n int) Option { return func(c *config) { c.workers = n } }
 // WithoutJIT turns off all generated machine code: the segment filter kernels
 // and the whole-program JIT. Queries then run on the plain VDBE.
 func WithoutJIT() Option { return func(c *config) { c.noJIT = true } }
+
+// WithoutFusion turns off the JIT's fusion pass (internal/jit's Fuse): each
+// IR step of a compiled program is then emitted on its own, as before fusion
+// existed. For comparing the two; the answers are the same either way.
+func WithoutFusion() Option { return func(c *config) { c.noFusion = true } }
 
 // Configure sets process-wide engine behavior; options not given take their
 // defaults (the JIT is on where the platform has an emitter, amd64 and arm64).
@@ -41,4 +47,5 @@ func Configure(opts ...Option) {
 		vecWorkers = c.workers
 	}
 	vmJITEnabled = jitEnabled
+	jit.SetFusion(!c.noFusion)
 }

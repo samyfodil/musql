@@ -392,6 +392,14 @@ func (n *Session) ExecArgs(sql string, args []Value) (int64, int64, error) {
 	return n.DB.ExecArgs(sql, args)
 }
 
+// ExecArgsOwned is ExecArgs handing args' bytes over (DB.ExecArgsOwned).
+func (n *Session) ExecArgsOwned(sql string, args []Value) (int64, int64, error) {
+	if n.closed {
+		return 0, 0, fmt.Errorf("engine: write session is closed")
+	}
+	return n.DB.ExecArgsOwned(sql, args)
+}
+
 // Commit appends everything executed since the last Commit as ONE delta batch
 // and fsyncs it. That batch's trailer is the commit point.
 //
@@ -458,7 +466,10 @@ func (n *Session) Commit() (bool, error) {
 // otherwise -- C's own choice (sqlite3PagerSetFlags, pager.c:3686-3690).
 func (n *Session) commitSync() syncMode {
 	switch {
-	case n.NoSyncOnCommit:
+	case n.NoSyncOnCommit, n.DB.inMemory:
+		// An in-memory database's file is this connection's alone and gone
+		// with it, so a crash takes the database whether the bytes reached
+		// the disk or not: C writes a ":memory:" database nowhere at all.
 		return syncNone
 	case n.pragmaState.FullFsync():
 		return syncFull
@@ -541,7 +552,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 			return false, rerr
 		}
 	}
-	changes := n.TakeRowChanges()
+	changes := n.takeChangeLog()
 	// Handed back for the next statement once this commit is done with it, so
 	// the log does not regrow from nothing every statement. Not under full
 	// capture, whose changes may be held past the commit.
@@ -557,11 +568,11 @@ func (n *Session) commitMainLocked() (bool, error) {
 		n.noteCommittedColumnsStale()
 		return true, nil
 	}
-	if len(changes) == 0 {
+	if changes.len() == 0 {
 		return false, nil
 	}
 	// CONSUMING, when nothing else reads the log -- see segDeltaRecordsInto.
-	recs, err := segDeltaRecordsInto(n.recBuf, changes, n.effectiveTableIndex(), n.ipkOf, n.storeOf(false))
+	recs, err := segDeltaRecordsInto(n.recBuf, changes.len(), changes.all(), n.effectiveTableIndex(), n.ipkOf, n.storeOf(false))
 	// Kept for the next commit, and emptied on the way out so it pins no row.
 	// Only [0:len) was written: every commit clears what it wrote, and an
 	// error returns nil, dropping the buffer. Clearing the whole capacity cost
@@ -634,7 +645,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 	}
 	n.seenStat = n.pairStamp()
 	n.clearWrittenSinceCommit()
-	if !wasCurrent || !n.extendCommittedColumns(n.appendAt.lastBatch) {
+	if !wasCurrent || !n.extendCommittedColumns(n.appendAt.lastBatch, recs) {
 		n.noteCommittedColumnsStale()
 	}
 	n.appendAt.lastBatch = nil
@@ -654,18 +665,26 @@ func (n *Session) commitMainLocked() (bool, error) {
 // marks it stale, so a view not marked stale is the file as of this session's
 // previous commit. The caller passes wasCurrent too. false leaves the caller
 // to mark it stale: no view, a stale one, or a batch too big to have been kept.
-func (n *Session) extendCommittedColumns(batch []byte) bool {
+func (n *Session) extendCommittedColumns(batch []byte, recs []SegDeltaRecord) bool {
 	db := n.DB
 	cols := db.segColumns
-	if batch == nil || cols == nil || db.segColumnsStale || cols.segs == nil {
+	if cols == nil || db.segColumnsStale || cols.segs == nil {
 		return false
 	}
 	st := cols.segs.delta
 	if st == nil {
 		st = &segDeltaState{live: map[int]map[int64][]Value{}, dead: map[int]map[int64]bool{}, version: segDeltaVersion}
 	}
-	if err := st.applyBatch(batch); err != nil {
-		return false
+	// From the records the batch was written from, when every put carries its
+	// values: the rows decoding the batch would give back, without decoding
+	// it -- a 20,000-row commit spent most of its extension there.
+	if !st.applyRecs(recs) {
+		if batch == nil {
+			return false
+		}
+		if err := st.applyBatch(batch); err != nil {
+			return false
+		}
 	}
 	st.endCtr, st.endPages = n.endCtr, n.endPages
 	st.batches++
@@ -704,16 +723,21 @@ func (n *Session) deltaAppendExceeds(recs []SegDeltaRecord) bool {
 // noting no RowChange. Committing only the log lost their data ("CREATE VIRTUAL
 // TABLE v USING fts5(c); INSERT INTO v VALUES('apple')" reopened empty).
 //
-// ponytail: the answer is the whole-file rewrite. Turning shadow rows into
+// A deliberate simplification: the answer is the whole-file rewrite. Turning shadow rows into
 // records needs the pre-mutation rowid set the wholesale rewrite discards, so
 // the vtab layer would have to record its own writes; do that if vtab-heavy
 // write loads matter.
-func (db *DB) mutatedOutsideChangeLog(changes []RowChange) bool {
-	described := make(map[string]bool, len(changes))
-	for _, c := range changes {
-		if !c.Temp {
-			described[strings.ToLower(c.Table)] = true
+func (db *DB) mutatedOutsideChangeLog(changes *changeLog) bool {
+	described := map[string]bool{}
+	last := ""
+	for c := range changes.all() {
+		// A commit's changes come in runs of one table: fold each name once
+		// per run, not once per row.
+		if c.Temp || c.Table == last {
+			continue
 		}
+		described[strings.ToLower(c.Table)] = true
+		last = c.Table
 	}
 	for _, t := range db.tables {
 		if t.isTemp || !t.rowsWrittenSinceCommit || t.rows == nil {
@@ -1015,7 +1039,7 @@ func (db *DB) segmentReadPager() (*ReadOnlyPager, error) { return db.segmentPage
 //
 // left 1,3,5 where C leaves 1 (also delete.test, update.test, delete4.test).
 //
-// ponytail: every loaded table is copied up front. Copy-on-write would copy
+// A deliberate simplification: every loaded table is copied up front. Copy-on-write would copy
 // only written tables but needs the frozen pager's lifetime to be explicit;
 // writeSubqueryPager's call site (vdbe_write.go) is where to make it lazier.
 func (db *DB) segmentSnapshotPager() (*ReadOnlyPager, error) { return db.segmentPager(true) }
@@ -1370,7 +1394,7 @@ func compactionDueAfter(st [2]fileStamp, recs []SegDeltaRecord) bool {
 	if !st[0].there {
 		return false
 	}
-	return st[1].size+segDeltaBatchBytes(recs) > compactionThreshold(st[0].size)
+	return segDeltaBatchBytesExceed(recs, compactionThreshold(st[0].size)-st[1].size)
 }
 
 func (n *Session) compactIfWorthIt() {

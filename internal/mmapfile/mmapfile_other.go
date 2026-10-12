@@ -2,7 +2,10 @@
 
 package mmapfile
 
-import "os"
+import (
+	"errors"
+	"os"
+)
 
 // Open reads path instead of mapping: on Windows a mapped (or merely open) file
 // cannot be replaced by the rename every rewrite publishes with.
@@ -22,4 +25,13 @@ func (f *File) Close() error {
 	}
 	f.data = nil
 	return nil
+}
+
+// CanMapAt reports whether MapAt maps: not on this platform.
+const CanMapAt = false
+
+// MapAt fails here: a platform without mapping has no range of a file to
+// hand out without reading it.
+func MapAt(f *os.File, off int64, n int) (*File, error) {
+	return nil, errors.New("mmapfile: no mapping on this platform")
 }

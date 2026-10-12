@@ -1060,7 +1060,7 @@ func (db *DB) fkDrain(st *fkStmtState) error {
 	}
 	st.draining = true
 	defer func() { st.draining = false }()
-	// ponytail: the event queue is bounded only by the schema's own cascade
+	// A deliberate simplification: the event queue is bounded only by the schema's own cascade
 	// structure. A cycle terminates because each pass removes or NULLs rows,
 	// but a pathological schema could still grow it without bound, and a
 	// runaway is a hang rather than a wrong answer -- so it is capped and

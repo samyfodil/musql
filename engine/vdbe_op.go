@@ -114,7 +114,7 @@ const (
 	// OP_Affinity/OP_RealAffinity -- distinct from the comparison-time,
 	// non-mutating coercion the comparison opcodes apply via their P5 affinity
 	// byte. OpCast likewise mutates r[P1] in place (SQLite's OP_Cast).
-	OpAffinity     // P1, P4(affinity): r[P1] = applyAffinity(r[P1], P4).
+	OpAffinity     // P1, P4(affinity): r[P1] = applyAffinity(r[P1], P4). With P4 a []affinity, r[P1+i] takes P4[i] for each of P2.
 	OpRealAffinity // P1: if r[P1] is an integer, convert it to REAL in place.
 	OpCast         // P1, P4(string type): r[P1] = CAST(r[P1] AS P4).
 
@@ -1050,6 +1050,10 @@ type Program struct {
 	// against them as vmJIT is, since a Program copied by value can be handed
 	// different instructions.
 	outerCtx unsafe.Pointer
+	// writeLoop caches writeLoops' answer for a write program: 0 not yet
+	// asked, 1 no, 2 yes. A stale answer (a copy given other instructions)
+	// costs only speed.
+	writeLoop  int32
 	NReg       int      // registers to allocate (r[0..NReg-1]).
 	NCursors   int      // table cursors to allocate (cursors[0..NCursors-1]); 0 for a cursor-free (FROM-less) program.
 	NRecRegs   int      // record registers to allocate (rr[0..NRecRegs-1]); 0 for a program with no ORDER BY (see the sorter opcodes above).

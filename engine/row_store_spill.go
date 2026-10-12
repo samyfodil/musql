@@ -4,6 +4,8 @@ import (
 	"os"
 	"runtime"
 	"slices"
+
+	"github.com/samyfodil/musql/internal/mmapfile"
 )
 
 // Row store spilling: rows a transaction wrote, persisted once they outgrow memory.
@@ -46,34 +48,129 @@ var spilledRows int64
 // SpilledRowsForTest reads and clears spilledRows.
 func SpilledRowsForTest() int64 { n := spilledRows; spilledRows = 0; return n }
 
-// valueSpilled is a sentinel row's only Value type: I is the record's offset in
-// the spill file, F its length. It never leaves the store -- resolve replaces
-// it before any caller sees a row.
-const valueSpilled ValueType = 0xF0
+// valueSpilled is a record sentinel's Value type: I is the record's offset in
+// the spill file, F its length. valueSpilledSeg is a segment sentinel's: I is
+// the spill segment's index (spillFile.segs), F the row's position in it.
+// Neither leaves the store -- resolve replaces it before any caller sees a row.
+const (
+	valueSpilled    ValueType = 0xF0
+	valueSpilledSeg ValueType = 0xF1
+)
 
-// spillFile is one append-only file of records, shared by a store and its
-// clones.
+// spillFile is one append-only file of records, or of segments, shared by a
+// store and its clones.
+//
+// Where the platform maps a range of a file (mmapfile.CanMapAt) a spill writes
+// SEGMENTS, the same bytes a commit's rewrite would build from those rows, and
+// maps each one back: a read of a spilled row is a segment row read, and a
+// commit that finds a spilled segment's rows still exactly that segment's
+// copies its bytes rather than reading the rows back and building them again
+// (spillRun, segment_ddl.go). Elsewhere it writes records.
+//
+// A spill file of segments can BECOME the database file a commit rewrites to
+// (segFileWriter.adoptSpill): its first page is left free for the header, the
+// segments the commit keeps are already where they belong, and the rest of the
+// file is appended to it. Then the transaction's rows are written once, as C
+// SQLite's are, not spilled and then copied.
 type spillFile struct {
-	f  *os.File
-	at int64
+	f    *os.File
+	at   int64
+	segs []*spillSeg
+	res  *spillMaps // what the cleanup releases: the file's segment mappings
+
+	// anon is a file with no name yet that linkAnon can name (linux), name
+	// the name of one that has one; a file with neither was unlinked at
+	// creation and cannot be adopted.
+	anon bool
+	name string
+	// adopted is set once the file became a database file. It takes no more
+	// spills, which would grow that file: the next goes to a new file
+	// (reopen), and the segments already spilled stay where they are.
+	adopted bool
 }
 
-// newSpillFile creates the file in the system temp directory, unlinked at once
-// where the platform allows it, so a crash leaves nothing behind.
+// spillSeg is one segment in a spill file, mapped, and where it is.
+type spillSeg struct {
+	seg *segment
+	m   *mmapfile.File
+	f   *os.File // the file it is in, at off
+	off int64
+}
+
+// spillMaps is what a spill file's cleanup releases, apart from the spillFile
+// so the cleanup can: its mappings, its files, and the names it still owns.
+type spillMaps struct {
+	ms    []*mmapfile.File
+	files []*os.File
+	names map[string]bool
+}
+
+// adoptable reports whether the file can become a database file.
+func (sf *spillFile) adoptable() bool {
+	return sf != nil && !sf.adopted && len(sf.segs) > 0 && (sf.anon || sf.name != "")
+}
+
+// nameAs gives the file the name dst, replacing dst: what adopting it as a
+// database file ends with.
+func (sf *spillFile) nameAs(dst string) error {
+	if sf.anon {
+		return linkAnon(sf.f, dst)
+	}
+	if err := os.Rename(sf.name, dst); err != nil {
+		return err
+	}
+	delete(sf.res.names, sf.name) // the cleanup must not remove the database
+	sf.name = ""
+	return nil
+}
+
+// openFile starts the file spills are written to: the first, or the next
+// after one was adopted. A spill of segments leaves its first page for a header.
+func (sf *spillFile) openFile() error {
+	if f, ok := newAnonFile(os.TempDir()); ok && spillSegments {
+		sf.f, sf.anon, sf.name = f, true, ""
+	} else {
+		f, err := os.CreateTemp("", "musql-spill-*")
+		if err != nil {
+			return err
+		}
+		sf.f, sf.anon, sf.name = f, false, ""
+		if spillSegments || os.Remove(f.Name()) != nil {
+			sf.name = f.Name()
+			sf.res.names[sf.name] = true
+		}
+	}
+	sf.res.files = append(sf.res.files, sf.f)
+	sf.at = 0
+	sf.adopted = false
+	return nil
+}
+
+// spillSegments is whether spills write segments (see spillFile). A variable
+// so a test can run the record path where the platform maps.
+var spillSegments = mmapfile.CanMapAt
+
+// newSpillFile creates the file in the system temp directory. Where the
+// platform has unnamed files (linux) it is one, so a crash leaves nothing
+// behind and a commit can still name it. Elsewhere, a file of segments keeps
+// its name, which adopting it needs, until the cleanup removes it; a file of
+// records is unlinked at once where the platform allows it.
 func newSpillFile() (*spillFile, error) {
-	f, err := os.CreateTemp("", "musql-spill-*")
-	if err != nil {
+	sf := &spillFile{res: &spillMaps{names: map[string]bool{}}}
+	if err := sf.openFile(); err != nil {
 		return nil, err
 	}
-	name := f.Name()
-	unlinked := os.Remove(name) == nil
-	sf := &spillFile{f: f}
-	runtime.AddCleanup(sf, func(f *os.File) {
-		f.Close()
-		if !unlinked {
-			os.Remove(f.Name())
+	runtime.AddCleanup(sf, func(res *spillMaps) {
+		for _, m := range res.ms {
+			m.Close()
 		}
-	}, f)
+		for _, f := range res.files {
+			f.Close()
+		}
+		for name := range res.names {
+			os.Remove(name)
+		}
+	}, sf.res)
 	return sf, nil
 }
 
@@ -88,7 +185,29 @@ func rowMemSize(vals []Value) int64 {
 }
 
 // isSpilled reports whether a row in m is a sentinel.
-func isSpilled(vals []Value) bool { return len(vals) == 1 && vals[0].Typ == valueSpilled }
+func isSpilled(vals []Value) bool {
+	return len(vals) == 1 && (vals[0].Typ == valueSpilled || vals[0].Typ == valueSpilledSeg)
+}
+
+// spilledSegRow is a segment sentinel's segment and row, or nil.
+func (s *rowStore) spilledSegRow(vals []Value) (*spillSeg, int) {
+	if len(vals) != 1 || vals[0].Typ != valueSpilledSeg {
+		return nil, 0
+	}
+	return s.spill.segs[vals[0].I], int(vals[0].F)
+}
+
+// segRowOwned is row i of a spill segment, its bytes copied out of the
+// mapping: a row handed to a caller may outlive the spill file.
+func segRowOwned(sg *spillSeg, i int) []Value {
+	row := sg.seg.rowAt(i)
+	for c := range row {
+		if row[c].S != nil {
+			row[c].S = append([]byte(nil), row[c].S...)
+		}
+	}
+	return row
+}
 
 // resolve is a row of m as its caller may see it: a sentinel read back from the
 // spill file, anything else as it is.
@@ -100,6 +219,9 @@ func isSpilled(vals []Value) bool { return len(vals) == 1 && vals[0].Typ == valu
 func (s *rowStore) resolve(vals []Value) []Value {
 	if !isSpilled(vals) {
 		return vals
+	}
+	if sg, i := s.spilledSegRow(vals); sg != nil {
+		return segRowOwned(sg, i)
 	}
 	off, n := vals[0].I, int(vals[0].F)
 	buf := make([]byte, n)
@@ -129,6 +251,9 @@ const spillWindow = 1 << 20
 func (r *spillReader) resolve(s *rowStore, vals []Value) []Value {
 	if !isSpilled(vals) {
 		return vals
+	}
+	if sg, i := s.spilledSegRow(vals); sg != nil {
+		return segRowOwned(sg, i)
 	}
 	off, n := vals[0].I, int64(vals[0].F)
 	if off < r.off || off+n > r.off+int64(len(r.buf)) {
@@ -169,6 +294,14 @@ func (s *rowStore) noteWritten(rowid uint64, vals []Value) {
 // stay in memory until a later put pushes the store over again; correct, only
 // not as small as it could be.
 func (s *rowStore) spillOut() {
+	if s.spill != nil && s.spill.adopted {
+		// That file is a database file now: spills go on in another, and the
+		// segments already spilled stay where they are.
+		if s.spill.openFile() != nil {
+			s.memBytes = 0 // do not retry on every put
+			return
+		}
+	}
 	if s.spill == nil {
 		sf, err := newSpillFile()
 		if err != nil {
@@ -178,6 +311,12 @@ func (s *rowStore) spillOut() {
 		s.spill = sf
 	}
 	sf := s.spill
+	if spillSegments {
+		if s.spillOutSegments() {
+			s.memBytes, s.unspilt = 0, s.unspilt[:0]
+		}
+		return
+	}
 	const chunk = 1 << 20
 	var buf []byte
 	start := sf.at
@@ -229,6 +368,17 @@ func (s *rowStore) has(rowid uint64) bool {
 	if _, ok := s.m[rowid]; ok {
 		return true
 	}
+	// Past the upper bound (rowStore.ub), nothing is there: an INSERT's
+	// rowid-conflict probe for a row appended in order answers without a
+	// lookup. The bound is taken once, then kept by put.
+	if !s.ubKnown {
+		if mx, ok := s.maxRowid(); ok {
+			s.ub, s.ubKnown = mx, true
+		}
+	}
+	if s.ubKnown && rowidLess(s.ub, rowid) {
+		return false
+	}
 	if s.seg == nil || s.baseGone || s.gone[rowid] {
 		return false
 	}
@@ -239,8 +389,15 @@ func (s *rowStore) has(rowid uint64) bool {
 // NULL (the rowid carries it) -- what appendRecordOf appends. A spilled row's
 // is its spill record's, which was encoded from the same stored row.
 func (s *rowStore) recordLen(rowid uint64, ipk int) int {
-	if vals, ok := s.m[rowid]; ok && isSpilled(vals) {
+	if vals, ok := s.m[rowid]; ok && isSpilled(vals) && vals[0].Typ == valueSpilled {
 		return int(vals[0].F)
+	}
+	if vals, ok := s.m[rowid]; ok {
+		// A segment-spilled row is measured where it is mapped: nothing that
+		// outlives this call keeps it, so its bytes need no copy.
+		if sg, i := s.spilledSegRow(vals); sg != nil {
+			return recordSize(storedIPKNull(sg.seg.rowAt(i), ipk))
+		}
 	}
 	vals, _ := s.get(rowid)
 	return recordSize(storedIPKNull(vals, ipk))
@@ -249,7 +406,7 @@ func (s *rowStore) recordLen(rowid uint64, ipk int) int {
 // appendRecordOf appends rowid's row as a stored record: a spilled row's bytes
 // exactly as the spill file holds them, any other row encoded.
 func (s *rowStore) appendRecordOf(dst []byte, rowid uint64, ipk int) []byte {
-	if vals, ok := s.m[rowid]; ok && isSpilled(vals) {
+	if vals, ok := s.m[rowid]; ok && isSpilled(vals) && vals[0].Typ == valueSpilled {
 		off, n := vals[0].I, int(vals[0].F)
 		dst = slices.Grow(dst, n)
 		at := len(dst)
@@ -258,6 +415,11 @@ func (s *rowStore) appendRecordOf(dst []byte, rowid uint64, ipk int) []byte {
 			panic("engine: reading a spilled row back: " + err.Error()) // see resolve
 		}
 		return dst
+	}
+	if vals, ok := s.m[rowid]; ok {
+		if sg, i := s.spilledSegRow(vals); sg != nil {
+			return appendRecord(dst, storedIPKNull(sg.seg.rowAt(i), ipk)) // encoded at once: no copy needed
+		}
 	}
 	vals, _ := s.get(rowid)
 	return appendRecord(dst, storedIPKNull(vals, ipk))
@@ -272,4 +434,72 @@ func storedIPKNull(vals []Value, ipk int) []Value {
 		vals[ipk] = Value{Typ: Null}
 	}
 	return vals
+}
+
+// spillOutSegments is spillOut writing segments: the rows put since the last
+// spill, in rowid order, cut as a commit would cut them (segCutter), each
+// segment written at a page boundary and mapped back, and a segment sentinel
+// left for each row. It reports false, leaving every row it has not yet
+// replaced in memory, when a write or a mapping fails.
+func (s *rowStore) spillOutSegments() bool {
+	sf := s.spill
+	rowids := make([]uint64, 0, len(s.unspilt))
+	nCols := 0
+	for _, rowid := range s.unspilt {
+		if vals, ok := s.m[rowid]; ok && !isSpilled(vals) {
+			rowids = append(rowids, rowid)
+			nCols = max(nCols, len(vals))
+		}
+	}
+	if len(rowids) == 0 {
+		return true
+	}
+	radixSortRowids(rowids)
+	rowids = slices.Compact(rowids) // a key put twice
+	if nCols == 0 {
+		return false // rows of no columns are not a segment; keep them
+	}
+	page := int64(os.Getpagesize())
+	sf.at = max(sf.at, page) // the first page is a header's, should the file become a database file
+	ok := true
+	start := 0
+	cut := &segCutter{cols: make([]columnInfo, nCols), what: "a spill", reuse: true, emit: func(raw []byte) error {
+		at := (sf.at + page - 1) / page * page
+		if _, err := sf.f.WriteAt(raw, at); err != nil {
+			return err
+		}
+		m, err := mmapfile.MapAt(sf.f, at, len(raw))
+		if err != nil {
+			return err
+		}
+		seg, err := openSegment(m.Data())
+		if err != nil {
+			m.Close()
+			return err
+		}
+		sf.at = at + int64(len(raw))
+		sf.res.ms = append(sf.res.ms, m)
+		idx := int64(len(sf.segs))
+		sf.segs = append(sf.segs, &spillSeg{seg: seg, m: m, f: sf.f, off: at})
+		// One allocation for the segment's sentinels, each row a one-Value
+		// window of it (capped, so nothing appends into a neighbour).
+		sent := make([]Value, seg.nRows)
+		for i := range sent {
+			sent[i] = Value{Typ: valueSpilledSeg, I: idx, F: float64(i)}
+			s.m[rowids[start+i]] = sent[i : i+1 : i+1]
+		}
+		start += seg.nRows
+		spilledRows += int64(seg.nRows)
+		return nil
+	}}
+	for _, rowid := range rowids {
+		if cut.add(rowid, s.m[rowid]) != nil {
+			ok = false
+			break
+		}
+	}
+	if ok && cut.flush() != nil {
+		ok = false
+	}
+	return ok
 }

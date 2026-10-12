@@ -1203,6 +1203,13 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 	if len(stmt.From) == 0 {
 		return p.execNoFrom(stmt, outer, params)
 	}
+	stmt = p.nullUnusedSubqueryColumns(stmt)
+	// count(*) over a UNION ALL is the sum of its arms' counts (count_union_all.go).
+	if outer == nil {
+		if f := p.countUnionAll(stmt); f != nil {
+			return p.execNoFrom(f, outer, params)
+		}
+	}
 
 	// C flattens a FROM subquery into its parent before planning, so the parent's
 	// WHERE can drive an index and rows arrive in index order; materializing it

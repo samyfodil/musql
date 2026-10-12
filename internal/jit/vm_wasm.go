@@ -2,7 +2,11 @@
 
 package jit
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+	"slices"
+)
 
 const (
 	opReturn    byte = 0x0F
@@ -10,6 +14,9 @@ const (
 	opI32Load8U byte = 0x2D
 	opI32Ne     byte = 0x47
 	opI64GtU    byte = 0x56
+	opI32Eq     byte = 0x46
+	opI64LeU    byte = 0x58
+	opI64GeU    byte = 0x5A
 	opI64Shl    byte = 0x86
 	opI64ShrS   byte = 0x87
 	opIf        byte = 0x04
@@ -32,18 +39,65 @@ const MaxVMWasmBytes = 6 << 20
 // goes back through the table; a backward jump or an OP_Return sets pc,
 // spends fuel and re-enters the dispatch. An exit stores the pc to resume at
 // and returns.
-func EmitVM(prog []VInsn, nReg int, lay ValueLayout) ([]byte, error) {
-	if lay.OffTyp != 0 || lay.OffI != 8 || lay.OffF != 16 {
+//
+// bound and cache are as on amd64 (vm_amd64.go's emitVM). On wasm the cache is
+// what the emitter knows (vmKnow): the engine running the module keeps values
+// in machine registers itself, so a guard or a full write known to be
+// redundant is what there is to skip.
+func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache bool) ([]byte, error) {
+	// No entry stubs here: an entry starts a run, like a jump target. So a
+	// fused pair whose second pc is an entry is unfused again -- the store of
+	// the comparison made, the test its own instruction -- which is what an
+	// entry there needs and costs the run nothing it could keep anyway.
+	if entry != nil && slices.ContainsFunc(prog, func(in VInsn) bool { return in.Op == VFused }) {
+		prog = slices.Clone(prog)
+		for pc := 1; pc < len(prog); pc++ {
+			if !vmFusedEntry(prog, entry, pc) {
+				continue
+			}
+			f := prog[pc-1]
+			op := VCmpSet
+			if f.Op == VNotBr {
+				op = VNot
+			}
+			prog[pc-1] = VInsn{Op: op, A: f.A, B: f.B, C: f.C, Cond: f.Cond}
+			prog[pc] = VFusedTest(prog[pc])
+		}
+	}
+	if bound != nil && entry != nil {
+		b := append([]bool(nil), bound...)
+		for pc := range min(len(entry), len(b)) {
+			b[pc] = b[pc] || entry[pc]
+		}
+		bound = b
+	}
+	if lay.OffTyp != 0 || lay.OffI != 8 || lay.OffF != 16 || lay.Size != lay.OffS+24 {
 		return nil, fmt.Errorf("jit: unexpected Value layout %+v", lay)
 	}
 	n := len(prog)
 	if int64(nReg)*int64(lay.Size) > 1<<30 {
 		return nil, fmt.Errorf("jit: %d registers", nReg)
 	}
-	e := &vmEmitWasm{w: &Wasm{}, lay: lay, n: n}
+	e := &vmEmitWasm{w: &Wasm{}, lay: lay, n: n, prog: prog, bound: bound, cache: cache && bound != nil, know: newVMKnow(),
+		zeroS: map[int]bool{}}
 	w := e.w
 	e.regs, e.pc, e.fuel = w.Local(wI32), w.Local(wI32), w.Local(wI64)
 	e.t1, e.t2, e.t3, e.ovf = w.Local(wI64), w.Local(wI64), w.Local(wI64), w.Local(wI64)
+	e.wb, e.rb = w.Local(wI32), w.Local(wI32)
+	// The write-barrier flag, read once: it cannot change before this call
+	// returns (wb.go).
+	w.I32(int32(wbFlagAddr))
+	w.op(opI32Load8U)
+	w.memarg(0, 0)
+	w.Set(e.wb)
+	for _, in := range prog {
+		if in.Op == VColumn || in.Op == VNext || in.Op == VRewind {
+			e.curs, e.rowp, e.valp = w.Local(wI32), w.Local(wI32), w.Local(wI32)
+			w.LoadPtr(POffCur)
+			w.Set(e.curs)
+			break
+		}
+	}
 
 	w.LoadPtr(POffRegs)
 	w.Set(e.regs)
@@ -55,27 +109,42 @@ func EmitVM(prog []VInsn, nReg int, lay ValueLayout) ([]byte, error) {
 	w.Set(e.fuel)
 
 	w.op(opLoop, opVoid)  // dispatch
+	w.op(opBlock, opVoid) // "fused": exits at the pc local
 	w.op(opBlock, opVoid) // "end": falls into the exit at n
 	for range n {
 		w.op(opBlock, opVoid)
 	}
-	// br_table: pc k -> depth k (block k, innermost is 0); anything else ->
-	// depth n, the end block.
+	// br_table: pc k -> depth k (block k, innermost is 0); a VFused pc, which
+	// native code never enters, -> depth n+1, the exit at that pc; anything
+	// else -> depth n, the end block.
 	w.Get(e.pc)
 	w.op(opBrTable)
 	w.body = uleb(w.body, uint64(n))
 	for k := range n {
-		w.body = uleb(w.body, uint64(k))
+		if prog[k].Op == VFused {
+			w.body = uleb(w.body, uint64(n+1))
+		} else {
+			w.body = uleb(w.body, uint64(k))
+		}
 	}
 	w.body = uleb(w.body, uint64(n))
 	for pc, in := range prog {
 		w.op(opEnd) // block pc ends: its code follows
+		if vmRunStart(prog, bound, pc) || !e.cache {
+			e.know.reset()
+		}
 		if err := e.insn(pc, in); err != nil {
 			return nil, fmt.Errorf("jit: pc %d: %w", pc, err)
 		}
 	}
 	w.op(opEnd) // the end block
 	e.exitAt(n)
+	w.op(opEnd) // the fused block
+	w.Get(0)
+	w.Get(e.pc)
+	w.op(opI64ExtendI32U)
+	w.StoreI64(POffPC)
+	w.op(opReturn)
 	w.op(opEnd) // dispatch loop
 	if len(w.body) > MaxVMWasmBytes {
 		return nil, fmt.Errorf("jit: program too large for wasm (%d instructions, %d bytes)", n, len(w.body))
@@ -90,15 +159,25 @@ type vmEmitWasm struct {
 	regs, pc         uint32
 	fuel, t1, t2, t3 uint32
 	ovf              uint32
-	cur              int // the pc whose code is being emitted
-	extra            int // if-blocks opened inside it
+	curs, rowp, valp uint32 // the cursor table, a row's header, its first Value (when the program has cursor ops)
+	cur              int    // the pc whose code is being emitted
+	extra            int    // if-blocks opened inside it
+
+	prog  []VInsn
+	bound []bool
+	cache bool
+	know  *vmKnow
+	// wb is the write-barrier flag the prologue read; rb a row buffer's
+	// address (VResultRow). zeroS is vmEmit.zeroS.
+	wb, rb uint32
+	zeroS  map[int]bool
 }
 
 // Within pc's code the enclosing blocks are those of pc+1 .. n-1, then the
-// end block, then the dispatch loop.
+// end block, the fused block, then the dispatch loop.
 // Every if opened inside it adds one more.
 func (e *vmEmitWasm) depthToBlock(t int) uint32 { return uint32(t - e.cur - 1 + e.extra) }
-func (e *vmEmitWasm) depthDispatch() uint32     { return uint32(e.n - e.cur + e.extra) }
+func (e *vmEmitWasm) depthDispatch() uint32     { return uint32(e.n - e.cur + 1 + e.extra) }
 
 func (e *vmEmitWasm) addr(r, f int) uint32 { return uint32(r*e.lay.Size + f) }
 
@@ -149,13 +228,117 @@ func hasS(reg int) guard {
 }
 
 func (e *vmEmitWasm) guards(pc int, gs ...guard) {
-	for i, g := range gs {
+	k := 0
+	for _, g := range gs {
+		if g == nil {
+			continue
+		}
 		g(e)
-		if i > 0 {
+		if k > 0 {
 			e.w.op(opI32Or)
 		}
+		k++
 	}
+	if k > 0 {
+		e.exitIf(pc)
+	}
+}
+
+// isInt and noS are notInt and hasS, or nil when what they check is known
+// (and from here on, it is).
+func (e *vmEmitWasm) isInt(reg int) guard {
+	if e.know.isInt[reg] {
+		return nil
+	}
+	e.know.isInt[reg] = true
+	return notInt(reg)
+}
+
+func (e *vmEmitWasm) noS(reg int) guard {
+	if e.know.noS[reg] {
+		return nil
+	}
+	e.know.noS[reg] = true
+	return hasS(reg)
+}
+
+// dstNoS readies an instruction's destination to be overwritten (vm_amd64.go's
+// destNoS): it fails when r[reg] holds a string or blob and the write barrier
+// is on, and with it off the store clears the pointer. nil when its store is
+// Dead or r[reg] is known to hold no pointer.
+func (e *vmEmitWasm) dstNoS(in VInsn, reg int) guard {
+	if in.Dead || e.know.noS[reg] || e.zeroS[reg] {
+		return nil
+	}
+	e.zeroS[reg] = true
+	return func(e *vmEmitWasm) {
+		hasS(reg)(e)
+		e.w.Get(e.wb)
+		e.w.op(opI32And)
+	}
+}
+
+// clearS clears r[reg]'s string or blob when dstNoS said the store must.
+func (e *vmEmitWasm) clearS(reg int) {
+	if !e.zeroS[reg] {
+		return
+	}
+	delete(e.zeroS, reg)
+	// Only when there is a pointer (vm_amd64.go's clearS).
+	e.loadI64(reg, e.lay.OffS)
+	e.w.op(opI64Eqz)
+	e.w.op(opI32Eqz)
+	e.openIf()
+	for k := range 3 {
+		e.w.Get(e.regs)
+		e.w.I64(0)
+		e.w.StoreI64(e.addr(reg, e.lay.OffS+8*k))
+	}
+	e.closeIf()
+}
+
+// pointerWords copies a Value word by word (copy(f) for each word f), given
+// on the stack the OR of the source's and the destination's string pointers:
+// when it is non-zero, it exits at pc with the write barrier on, and copies
+// the S words with it off; the other three words either way.
+func (e *vmEmitWasm) pointerWords(pc int, copy func(f int)) {
+	w, L := e.w, e.lay
+	w.op(opI64Eqz)
+	w.op(opI32Eqz)
+	e.openIf()
+	w.Get(e.wb)
 	e.exitIf(pc)
+	for _, f := range []int{L.OffS, L.OffS + 8, L.OffS + 16} {
+		copy(f)
+	}
+	e.closeIf()
+	for _, f := range []int{0, L.OffI, L.OffF} {
+		copy(f)
+	}
+}
+
+// forgetReg records that r[reg] changed other than by storeInt.
+func (e *vmEmitWasm) forgetReg(reg int) {
+	delete(e.know.isInt, reg)
+	delete(e.know.canon, reg)
+	delete(e.know.noS, reg)
+}
+
+// storeInt is writeInt for in's destination: nothing for a Dead store, only
+// the I word over an integer native code wrote.
+func (e *vmEmitWasm) storeInt(in VInsn, reg int, src uint32) {
+	if in.Dead {
+		e.forgetReg(reg)
+		return
+	}
+	if e.know.canon[reg] {
+		e.w.Get(e.regs)
+		e.w.Get(src)
+		e.w.StoreI64(e.addr(reg, e.lay.OffI))
+	} else {
+		e.writeInt(reg, src)
+	}
+	e.know.wroteInt(reg)
 }
 
 // writeInt makes r[reg] the INTEGER on top of the stack (in local src).
@@ -170,6 +353,7 @@ func (e *vmEmitWasm) writeInt(reg int, src uint32) {
 	w.Get(e.regs)
 	w.I64(0)
 	w.StoreI64(e.addr(reg, e.lay.OffF))
+	e.clearS(reg)
 }
 
 // jump goes to target unconditionally: a br for a forward block, the
@@ -230,25 +414,54 @@ func (e *vmEmitWasm) closeIf() { e.w.op(opEnd); e.extra-- }
 func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 	w, L := e.w, e.lay
 	e.cur, e.extra = pc, 0
+	clear(e.zeroS)
 	switch in.Op {
 	case VExit:
 		e.exitAt(pc)
+	case VFused:
+		// The instruction before is this one too.
 	case VGoto:
 		e.jump(in.T)
 	case VInt:
-		e.guards(pc, hasS(in.A))
+		if in.Dead {
+			e.forgetReg(in.A)
+			break
+		}
+		e.guards(pc, e.dstNoS(in, in.A))
 		w.I64(in.Imm)
 		w.Set(e.t1)
-		e.writeInt(in.A, e.t1)
+		e.storeInt(in, in.A, e.t1)
 	case VCopy:
-		e.guards(pc, hasS(in.A), hasS(in.B))
+		if in.Dead {
+			e.forgetReg(in.B)
+			break
+		}
+		if in.Imm != 0 && !e.know.noS[in.A] {
+			e.copyAny(pc, in)
+			break
+		}
+		e.guards(pc, e.noS(in.A), e.dstNoS(in, in.B))
+		if e.know.canon[in.A] && in.A != in.B {
+			e.loadI64(in.A, L.OffI)
+			w.Set(e.t1)
+			e.storeInt(VInsn{}, in.B, e.t1)
+			break
+		}
 		for _, f := range []int{0, L.OffI, L.OffF} {
 			w.Get(e.regs)
 			e.loadI64(in.A, f)
 			w.StoreI64(e.addr(in.B, f))
 		}
+		e.clearS(in.B)
+		if in.A != in.B {
+			isInt := e.know.isInt[in.A]
+			e.know.wroteAny(in.B, true)
+			if isInt {
+				e.know.isInt[in.B] = true
+			}
+		}
 	case VAdd, VSub, VMul, VAnd, VOr:
-		e.guards(pc, notInt(in.B), notInt(in.A), hasS(in.C))
+		e.guards(pc, e.isInt(in.B), e.isInt(in.A), e.dstNoS(in, in.C))
 		e.loadI64(in.B, L.OffI)
 		w.Set(e.t1)
 		e.loadI64(in.A, L.OffI)
@@ -277,9 +490,9 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 			w.Get(e.t3)
 			w.Set(e.t1)
 		}
-		e.writeInt(in.C, e.t1)
+		e.storeInt(in, in.C, e.t1)
 	case VShl, VShr:
-		e.guards(pc, notInt(in.B), notInt(in.A), hasS(in.C))
+		e.guards(pc, e.isInt(in.B), e.isInt(in.A), e.dstNoS(in, in.C))
 		e.loadI64(in.A, L.OffI)
 		w.Set(e.t2)
 		w.Get(e.t2)
@@ -294,14 +507,118 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 			w.op(opI64ShrS)
 		}
 		w.Set(e.t1)
-		e.writeInt(in.C, e.t1)
+		e.storeInt(in, in.C, e.t1)
+	case VDiv, VRem:
+		e.guards(pc, e.isInt(in.B), e.isInt(in.A), e.dstNoS(in, in.C))
+		e.loadI64(in.A, L.OffI)
+		w.Set(e.t2)
+		// A divisor of 0 (NULL) or -1 (the one overflow, and a trap) is the
+		// VDBE's.
+		w.Get(e.t2)
+		w.op(opI64Eqz)
+		w.Get(e.t2)
+		w.I64(-1)
+		w.op(opI64Eq)
+		w.op(opI32Or)
+		e.exitIf(pc)
+		e.loadI64(in.B, L.OffI)
+		w.Get(e.t2)
+		if in.Op == VDiv {
+			w.op(opI64DivS)
+		} else {
+			w.op(opI64RemS)
+		}
+		w.Set(e.t1)
+		e.storeInt(in, in.C, e.t1)
 	case VCmpJump:
-		e.guards(pc, notInt(in.B), notInt(in.A))
+		e.guards(pc, e.isInt(in.B), e.isInt(in.A))
 		e.loadI64(in.B, L.OffI)
 		e.loadI64(in.A, L.OffI)
 		w.op(scalarCmp(in.Cond))
 		e.jumpIf(in.T)
+	case VCmpSet, VCmpBr:
+		e.guards(pc, e.isInt(in.B), e.isInt(in.A), e.dstNoS(in, in.C))
+		e.loadI64(in.B, L.OffI)
+		e.loadI64(in.A, L.OffI)
+		w.op(scalarCmp(in.Cond))
+		w.op(opI64ExtendI32U)
+		w.Set(e.t1)
+		e.storeInt(in, in.C, e.t1)
+		if in.Op == VCmpBr {
+			w.Get(e.t1)
+			w.op(opI64Eqz)
+			if in.Imm != 0 {
+				w.op(opI32Eqz) // jump when 1
+			}
+			e.jumpIf(in.T)
+		}
+	case VNot, VNotBr:
+		e.guards(pc, e.isInt(in.A), e.dstNoS(in, in.C))
+		e.loadI64(in.A, L.OffI)
+		w.op(opI64Eqz)
+		w.op(opI64ExtendI32U)
+		w.Set(e.t1)
+		e.storeInt(in, in.C, e.t1)
+		if in.Op == VNotBr {
+			w.Get(e.t1)
+			w.op(opI64Eqz)
+			if in.Imm != 0 {
+				w.op(opI32Eqz)
+			}
+			e.jumpIf(in.T)
+		}
+	case VNullJump:
+		if e.know.isInt[in.A] {
+			// An INTEGER is not NULL.
+			if in.Imm == 0 {
+				e.jump(in.T)
+			}
+			break
+		}
+		e.loadTyp(in.A)
+		w.I32(int32(L.TypNull))
+		if in.Imm != 0 {
+			w.op(opI32Eq)
+		} else {
+			w.op(opI32Ne)
+		}
+		e.jumpIf(in.T)
+	case VNull:
+		if in.Dead {
+			e.forgetReg(in.C)
+			break
+		}
+		e.guards(pc, e.dstNoS(in, in.C))
+		for _, f := range []int{0, L.OffI, L.OffF} {
+			w.Get(e.regs)
+			w.I64(0)
+			w.StoreI64(e.addr(in.C, f))
+		}
+		e.clearS(in.C)
+		e.know.wroteAny(in.C, true)
+	case VNeg:
+		e.guards(pc, e.isInt(in.A), e.dstNoS(in, in.C))
+		e.loadI64(in.A, L.OffI)
+		w.Set(e.t2)
+		w.Get(e.t2)
+		w.I64(math.MinInt64)
+		w.op(opI64Eq)
+		e.exitIf(pc) // -MinInt64 is the VDBE's
+		w.I64(0)
+		w.Get(e.t2)
+		w.op(opI64Sub)
+		w.Set(e.t1)
+		e.storeInt(in, in.C, e.t1)
 	case VIf:
+		if e.know.isInt[in.A] {
+			e.loadI64(in.A, L.OffI)
+			w.op(opI64Eqz)
+			if in.Imm != 0 {
+				w.op(opI32Eqz) // jump when non-zero
+			}
+			e.jumpIf(in.T)
+			break
+		}
 		// An INTEGER jumps on its truth; a NULL jumps when C says so; anything
 		// else is the VDBE's.
 		e.loadTyp(in.A)
@@ -324,13 +641,13 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		e.jumpIf(in.T)
 		e.closeIf()
 	case VGosub:
-		e.guards(pc, hasS(in.A))
+		e.guards(pc, e.dstNoS(VInsn{}, in.A))
 		w.I64(int64(pc))
 		w.Set(e.t1)
 		e.writeInt(in.A, e.t1)
 		e.jump(in.T)
 	case VReturn:
-		e.guards(pc, notInt(in.A))
+		e.guards(pc, e.isInt(in.A))
 		e.loadI64(in.A, L.OffI)
 		w.Set(e.t1)
 		w.Get(e.t1)
@@ -343,8 +660,264 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 			w.I32(1)
 			w.op(opI32Add)
 		}, -1)
+	case VColumn:
+		// See vm_amd64.go's VColumn: the same steps.
+		cb := uint32(in.A * VCursorSize)
+		vb := uint32(in.B * L.Size)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffOk)
+		w.op(opI64Eqz)
+		e.exitIf(pc)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffMask) // the column must be one the engine made readable
+		w.I64(int64(1) << uint(in.B))
+		w.op(opI64And)
+		w.op(opI64Eqz)
+		e.exitIf(pc)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffPos)
+		w.Set(e.t1)
+		w.Get(e.t1)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffN)
+		w.op(opI64GeU) // unsigned: a position before the first row is huge
+		e.exitIf(pc)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffRows)
+		w.op(opI32WrapI64)
+		w.Get(e.t1)
+		w.op(opI32WrapI64)
+		w.I32(sliceHeaderSize)
+		w.op(opI32Mul)
+		w.op(opI32Add)
+		w.Set(e.rowp)
+		w.Get(e.rowp)
+		w.LoadI64(8) // the row's length
+		w.I64(int64(in.B))
+		w.op(opI64LeU) // a row narrower than the column: the VDBE's
+		e.exitIf(pc)
+		w.Get(e.rowp)
+		w.LoadI64(0)
+		w.op(opI32WrapI64)
+		w.Set(e.valp)
+		// A string or blob is copied with its pointer, as on amd64.
+		w.Get(e.valp)
+		w.LoadI64(vb + uint32(L.OffS))
+		if !e.know.noS[in.C] {
+			e.loadI64(in.C, L.OffS)
+			w.op(opI64Or)
+		}
+		e.pointerWords(pc, func(f int) {
+			w.Get(e.regs)
+			w.Get(e.valp)
+			w.LoadI64(vb + uint32(f))
+			w.StoreI64(e.addr(in.C, f))
+		})
+		e.know.wroteAny(in.C, false)
+	case VResultRow:
+		e.resultRow(pc, in)
+	case VRewind:
+		cb := uint32(in.A * VCursorSize)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffOk)
+		w.op(opI64Eqz)
+		e.exitIf(pc)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffRew)
+		w.op(opI64Eqz)
+		e.exitIf(pc)
+		w.Get(e.curs)
+		w.I64(0)
+		w.StoreI64(cb + VCursorOffPos)
+		w.Get(e.curs)
+		w.I64(1)
+		w.StoreI64(cb + VCursorOffDirty)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffN)
+		w.op(opI64Eqz)
+		e.openIf() // no rows
+		e.jump(in.T)
+		w.op(opElse)
+		w.Get(e.curs)
+		w.I64(0)
+		w.StoreI64(cb + VCursorOffLast)
+		e.closeIf()
+	case VNext:
+		cb := uint32(in.A * VCursorSize)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffOk)
+		w.op(opI64Eqz)
+		e.exitIf(pc)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffAdv)
+		w.op(opI64Eqz)
+		e.exitIf(pc)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffPos)
+		w.I64(1)
+		w.op(opI64Add)
+		w.Set(e.t1)
+		w.Get(e.curs)
+		w.Get(e.t1)
+		w.StoreI64(cb + VCursorOffPos)
+		w.Get(e.curs)
+		w.I64(1)
+		w.StoreI64(cb + VCursorOffDirty)
+		w.Get(e.t1)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffN)
+		w.op(opI64GeU)
+		w.op(opI32Eqz) // still on a row
+		e.openIf()
+		w.Get(e.curs)
+		w.Get(e.t1)
+		w.StoreI64(cb + VCursorOffLast)
+		e.jump(in.T)
+		e.closeIf()
 	default:
 		return fmt.Errorf("unknown VM op %d", in.Op)
 	}
 	return nil
+}
+
+// copyAny is vm_amd64.go's: VCopy of any Value, its pointer shared.
+func (e *vmEmitWasm) copyAny(pc int, in VInsn) {
+	w, L := e.w, e.lay
+	if in.A == in.B {
+		return // a copy onto itself changes nothing
+	}
+	e.loadI64(in.A, L.OffS)
+	if !e.know.noS[in.B] {
+		e.loadI64(in.B, L.OffS)
+		w.op(opI64Or)
+	}
+	e.pointerWords(pc, func(f int) {
+		w.Get(e.regs)
+		e.loadI64(in.A, f)
+		w.StoreI64(e.addr(in.B, f))
+	})
+	isInt := e.know.isInt[in.A]
+	e.know.wroteAny(in.B, false)
+	if isInt {
+		e.know.isInt[in.B] = true
+	}
+}
+
+// vmWasmRowMax bounds the registers a VResultRow copies, unrolled, on wasm; a
+// wider row exits to the VDBE.
+const vmWasmRowMax = 32
+
+// resultRow is vm_amd64.go's: the row handed over or gathered.
+func (e *vmEmitWasm) resultRow(pc int, in VInsn) {
+	w, L := e.w, e.lay
+	if in.B > vmWasmRowMax {
+		e.exitAt(pc)
+		return
+	}
+	w.Get(e.wb)
+	e.exitIf(pc)
+	w.Get(0)
+	w.LoadI64(POffRowsBuf)
+	w.op(opI64Eqz)
+	e.openIf()
+	// One row, handed over.
+	w.Get(0)
+	w.LoadI64(POffRowCap)
+	w.I64(int64(in.B))
+	w.op(opI64LtS)
+	e.exitIf(pc)
+	if in.B > 0 {
+		w.Get(0)
+		w.LoadI64(POffRowBuf)
+		w.op(opI32WrapI64)
+		w.Set(e.rb)
+		e.copyRow(in)
+	}
+	w.Get(0)
+	w.I64(int64(in.B + 1))
+	w.StoreI64(POffYield)
+	w.Get(0)
+	w.I64(int64(pc + 1))
+	w.StoreI64(POffPC)
+	w.op(opReturn)
+	e.closeIf()
+
+	// Rows gathered; an empty row is the VDBE's.
+	if in.B == 0 {
+		e.exitAt(pc)
+		return
+	}
+	w.Get(0)
+	w.LoadI64(POffYield)
+	w.Set(e.t1)
+	w.Get(0)
+	w.LoadI64(POffRowUsed)
+	w.Set(e.t2)
+	w.Get(e.t1)
+	w.Get(0)
+	w.LoadI64(POffRowsCap)
+	w.op(opI64LtS)
+	w.op(opI32Eqz) // no header left
+	w.Get(0)
+	w.LoadI64(POffRowCap)
+	w.Get(e.t2)
+	w.op(opI64Sub)
+	w.I64(int64(in.B))
+	w.op(opI64LtS) // too few Values left
+	w.op(opI32Or)
+	e.exitIf(pc)
+	// The header at RowsBuf + Yield*24: {the row, B, B}.
+	w.Get(0)
+	w.LoadI64(POffRowsBuf)
+	w.Get(e.t1)
+	w.I64(sliceHeaderSize)
+	w.op(opI64Mul)
+	w.op(opI64Add)
+	w.op(opI32WrapI64)
+	w.Set(e.rb)
+	w.Get(e.rb)
+	w.Get(0)
+	w.LoadI64(POffRowBuf)
+	w.Get(e.t2)
+	w.I64(int64(L.Size))
+	w.op(opI64Mul)
+	w.op(opI64Add)
+	w.StoreI64(0)
+	for _, off := range []uint32{8, 16} {
+		w.Get(e.rb)
+		w.I64(int64(in.B))
+		w.StoreI64(off)
+	}
+	w.Get(0)
+	w.Get(e.t1)
+	w.I64(1)
+	w.op(opI64Add)
+	w.StoreI64(POffYield)
+	w.Get(0)
+	w.Get(e.t2)
+	w.I64(int64(in.B))
+	w.op(opI64Add)
+	w.StoreI64(POffRowUsed)
+	// The row itself.
+	w.Get(0)
+	w.LoadI64(POffRowBuf)
+	w.Get(e.t2)
+	w.I64(int64(L.Size))
+	w.op(opI64Mul)
+	w.op(opI64Add)
+	w.op(opI32WrapI64)
+	w.Set(e.rb)
+	e.copyRow(in)
+	// Falls into the next pc's code, which starts a run.
+}
+
+// copyRow copies the B registers from A, unrolled, to the address in rb.
+func (e *vmEmitWasm) copyRow(in VInsn) {
+	w, L := e.w, e.lay
+	for k := 0; k < in.B*L.Size; k += 8 {
+		w.Get(e.rb)
+		w.Get(e.regs)
+		w.LoadI64(e.addr(in.A, k))
+		w.StoreI64(uint32(k))
+	}
 }

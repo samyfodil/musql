@@ -1037,7 +1037,7 @@ func (p *ReadOnlyPager) materializeFts5External(it FromItem, name string, cols [
 // returns zero rows and a scan errors. That is the rule implemented: an index
 // with no documents makes a MATCH select nothing.
 //
-// ponytail: a non-empty index still declines. C answers a rowid-only
+// A deliberate simplification: a non-empty index still declines. C answers a rowid-only
 // projection there; serving it needs a projection-aware row source.
 //
 // Deliberately narrow otherwise:

@@ -784,7 +784,7 @@ func compileIndexExprs(tbl *tableMeta, idx *indexMeta) (whereProg *selfRowExpr, 
 // fails the statement. A UNIQUE one is already evaluated by its conflict
 // check.
 //
-// ponytail: compiles the index's programs per row; cache them per statement
+// A deliberate simplification: compiles the index's programs per row; cache them per statement
 // if a bulk write into an expression-indexed table ever shows up in a profile.
 func (db *DB) checkIndexExprsForRow(tbl *tableMeta, rowid uint64, vals []Value) error {
 	for _, idx := range db.indexes {

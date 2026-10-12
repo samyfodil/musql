@@ -226,6 +226,13 @@ func formatP4(in Instruction) string {
 		if v, ok := in.P4.(affinity); ok {
 			return affinityName(v)
 		}
+		if vs, ok := in.P4.([]affinity); ok {
+			names := make([]string, len(vs))
+			for i, v := range vs {
+				names[i] = affinityName(v)
+			}
+			return strings.Join(names, ",")
+		}
 	case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
 		if v, ok := in.P4.(string); ok {
 			return "(" + v + ")"
@@ -311,6 +318,9 @@ func disasmComment(prog *Program, addr int, in Instruction) string {
 	case OpCast:
 		return fmt.Sprintf("r[%d]=CAST(r[%d] AS %v)", in.P1, in.P1, in.P4)
 	case OpAffinity:
+		if in.P2 > 1 {
+			return fmt.Sprintf("affinity(r[%d..%d])", in.P1, in.P1+in.P2-1)
+		}
 		return fmt.Sprintf("affinity(r[%d])", in.P1)
 	case OpRealAffinity:
 		return fmt.Sprintf("realaffinity(r[%d])", in.P1)

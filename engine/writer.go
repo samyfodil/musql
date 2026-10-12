@@ -32,6 +32,10 @@ import (
 type DB struct {
 	path string
 
+	// argsOwned is set for an ExecArgsOwned call: the bound arguments' bytes
+	// are the engine's, so a row may keep them without a copy.
+	argsOwned bool
+
 	pageSize uint32
 	// usable is the USABLE page size: pageSize, since this format reserves no
 	// bytes per page. fts3 sizes its leaves from it, as C does from the pager's.
@@ -472,6 +476,14 @@ type DB struct {
 	lastVerbText string
 	lastVerb     string
 	lastVerbOK   bool
+	// lastTempOpenText/lastTempOpen memoize r35aStatementOpensTempDatabase
+	// the same way (r35aNoteTempDatabaseOpen): a pure function of the text,
+	// asked again for every execution of a prepared statement.
+	lastTempOpenText string
+	lastTempOpen     bool
+	// lastWritePlanText/lastWritePlan are cachedWriteProgram's most recent hit.
+	lastWritePlanText string
+	lastWritePlan     *Program
 
 	// stmtDepth is how many top-level ExecArgs statements are on this session's
 	// stack. It exists so the two walIndexState hooks fire ONCE per statement:
@@ -535,6 +547,12 @@ type DB struct {
 	// push its undo onto the same statement journal.
 	activeWC *writeCtx
 
+	// wcFree is the one writeCtx runWrite keeps from a finished statement for
+	// the next, so a prepared single-row INSERT run in a loop does not allocate
+	// 300 bytes of statement state per row. See getWriteCtx for what may and
+	// may not be kept.
+	wcFree *writeCtx
+
 	// writeRecChunk / writeRecChunkSize carry a write program's record arena
 	// (vdbe.recAlloc) from one execution to the next, so a prepared single-row
 	// INSERT run in a loop carves its stored rows from shared chunks instead of
@@ -552,7 +570,7 @@ type DB struct {
 	// commitsEachStatement: the caller commits after every autocommit
 	// statement (SetCommitsEachStatement).
 	commitsEachStatement bool
-	changeLog            []RowChange
+	changeLog            changeLog
 
 	// segments is the read side of a SEGMENT session (segment_write.go): the
 	// pager whose ScanTable serves segments with the delta merged. Non-nil only

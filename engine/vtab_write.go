@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"unsafe"
 )
 
 // vtabConstraintErr marks a vtabStore write error as SQLITE_CONSTRAINT-class,
@@ -139,6 +140,15 @@ type writableVtabModule interface {
 
 // vtabColumnInfos builds the columnInfo slice (for WHERE/SET evaluation and the
 // read path) from a store's declared VtabColumns.
+func (vm *vtabMeta) columnInfos() []columnInfo {
+	cols := vm.store.vtabColumns()
+	if vm.colInfos == nil || len(cols) != len(vm.colInfosOf) || unsafe.SliceData(cols) != unsafe.SliceData(vm.colInfosOf) {
+		vm.colInfos, vm.colInfosOf = vtabColumnInfos(cols), cols
+	}
+	return vm.colInfos
+}
+
+// vtabColumnInfos builds the columnInfo slice for cols.
 func vtabColumnInfos(cols []VtabColumn) []columnInfo {
 	out := make([]columnInfo, len(cols))
 	for i, c := range cols {
@@ -601,7 +611,7 @@ func (db *DB) insertIntoVtab(vm *vtabMeta, stmt *insertStmt, pre [][]Value, preW
 	if vm.store == nil {
 		return 0, fmt.Errorf("engine: table %s may not be modified (virtual table is read-only)", stmt.table)
 	}
-	cols := vtabColumnInfos(vm.store.vtabColumns())
+	cols := vm.columnInfos()
 	var vplan *vtabReturningPlan
 	if stmt.returning != nil {
 		// INSERT OR IGNORE ... RETURNING is served: a vtab's OP_VUpdate has no

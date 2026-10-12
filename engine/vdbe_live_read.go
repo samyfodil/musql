@@ -442,7 +442,7 @@ func liveOuter(prog *Program) *compiler {
 // both lowerings. compileUpdateStmt hands it out only where nothing but a WITH
 // (pushed by both lowerings) could otherwise resolve: no trigger context.
 //
-// ponytail: an image per row, so a self-correlated UPDATE of n rows builds n
+// A deliberate simplification: an image per row, so a self-correlated UPDATE of n rows builds n
 // images. Cache the image on a row-store write generation if that ever shows up.
 type liveRowCtx struct {
 	tbl       *tableMeta

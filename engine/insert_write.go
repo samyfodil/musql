@@ -16,6 +16,7 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"sync/atomic"
 )
 
 // insertStmt is a parsed "INSERT INTO table [(cols)] VALUES (...), ..." or
@@ -115,10 +116,18 @@ type upsertClause struct {
 
 // parseInsertStmt parses sqlText as a single INSERT statement.
 func parseInsertStmt(sqlText string) (*insertStmt, error) {
+	if e := insertParseHandoff.Load(); e != nil && e.sql == sqlText && insertParseHandoff.CompareAndSwap(e, nil) {
+		return e.stmt, nil
+	}
 	toks, err := lex(sqlText)
 	if err != nil {
 		return nil, err
 	}
+	return parseInsertStmtToks(sqlText, toks)
+}
+
+// parseInsertStmtToks is parseInsertStmt over the tokens of sqlText already lexed.
+func parseInsertStmtToks(sqlText string, toks []token) (*insertStmt, error) {
 	p := newParser(sqlText, toks)
 	stmt, err := parseInsertStmtTokens(p, false)
 	if err != nil {
@@ -132,6 +141,28 @@ func parseInsertStmt(sqlText string) (*insertStmt, error) {
 	}
 	stmt.params = p.params.info()
 	return stmt, nil
+}
+
+// insertParseHandoff carries the INSERT that ParseParamInfo parsed (at prepare)
+// to the compile of the same text, so a statement of megabytes of literal rows
+// is parsed once rather than twice. It is keyed by the statement's text, never
+// a counter, and taken by the first parseInsertStmt of that text: the taker
+// owns the tree, as if it had parsed it, so nothing is shared.
+var insertParseHandoff atomic.Pointer[insertParseEntry]
+
+type insertParseEntry struct {
+	sql  string
+	toks []token // sql's tokens, read-only: compileWriteProgram's dispatch reads them too
+	stmt *insertStmt
+}
+
+// lexWriteText is lex(sqlText), reusing the tokens ParseParamInfo lexed for the
+// same text when it left them in insertParseHandoff.
+func lexWriteText(sqlText string) ([]token, error) {
+	if e := insertParseHandoff.Load(); e != nil && e.sql == sqlText {
+		return e.toks, nil
+	}
+	return lex(sqlText)
 }
 
 // parseInsertStmtTokens parses an INSERT off p, stopping after its last token
@@ -2087,6 +2118,17 @@ func unsupportedStatementErr(trimmed string) error {
 	return fmt.Errorf("engine: unsupported statement (this write path only supports CREATE TABLE/VIEW/TRIGGER, CREATE/DROP INDEX, DROP TABLE/VIEW/TRIGGER, INSERT, UPDATE, DELETE, ATTACH/DETACH, BEGIN/COMMIT/END/ROLLBACK, and SAVEPOINT/RELEASE/ROLLBACK TO): %q", trimmed)
 }
 
+// ExecArgsOwned is ExecArgs for a caller that hands args' byte slices over:
+// it never reads or writes them again, so a row may keep them rather than a
+// copy. The driver's arguments are copies it made for the call
+// (database/sql's contract), so it passes them this way.
+func (db *DB) ExecArgsOwned(sqlText string, args []Value) (rowsAffected int64, lastInsertID int64, err error) {
+	saved := db.argsOwned
+	db.argsOwned = true
+	defer func() { db.argsOwned = saved }()
+	return db.ExecArgs(sqlText, args)
+}
+
 // ExecArgs is Exec with bound parameters: args[i] binds parameter i+1. It
 // returns rows affected and this *DB's last_insert_rowid after the statement
 // (only INSERT changes it, as with sqlite3_last_insert_rowid()).
@@ -2096,9 +2138,9 @@ func (db *DB) ExecArgs(sqlText string, args []Value) (rowsAffected int64, lastIn
 	// (parse.y:44-51 -- see incompleteIfAtEOF).
 	defer func() { err = incompleteIfAtEOF(err) }()
 	if CommitOrderHookForTest != nil {
-		db.lastExecSQL, db.lastExecArgs = sqlText, args
+		db.lastExecSQL, db.lastExecArgs = sqlText, append([]Value(nil), args...)
 	}
-	logMark := len(db.changeLog)
+	logMark := db.changeLog.len()
 	defer func() {
 		if perr := db.takeDeferredErr(); perr != nil && err == nil {
 			err = perr
@@ -2107,6 +2149,16 @@ func (db *DB) ExecArgs(sqlText string, args []Value) (rowsAffected int64, lastIn
 			db.journalDDL(sqlText, logMark)
 		}
 	}()
+	// One return here and the statement's own in execArgsBody: a function
+	// whose returns times defers stays small gets its defers compiled inline,
+	// and this one runs for every statement -- the runtime's deferred-call
+	// bookkeeping was a twentieth of a prepared INSERT's time.
+	rowsAffected, lastInsertID, err = db.execArgsBody(sqlText, args)
+	return rowsAffected, lastInsertID, err
+}
+
+// execArgsBody is ExecArgs after its outermost bookkeeping.
+func (db *DB) execArgsBody(sqlText string, args []Value) (rowsAffected int64, lastInsertID int64, err error) {
 	// "EXPLAIN <stmt>" runs nothing and belongs on the query side; like
 	// sqlite3_exec, step the description and discard it (explain.go). The
 	// driver routes EXPLAIN itself, but engine-direct callers (the corpus)
@@ -2270,10 +2322,11 @@ func parseParamInfo(sqlText string) (ParamInfo, error) {
 		}
 		return stmt.Params, nil
 	case "INSERT", "REPLACE": // see Exec's identical "REPLACE INTO" case above
-		stmt, err := parseInsertStmt(trimmed)
+		stmt, err := parseInsertStmtToks(trimmed, toks)
 		if err != nil {
 			return ParamInfo{}, err
 		}
+		insertParseHandoff.Store(&insertParseEntry{sql: trimmed, toks: toks, stmt: stmt})
 		return stmt.params, nil
 	case "UPDATE":
 		stmt, err := parseUpdateStmt(trimmed)
