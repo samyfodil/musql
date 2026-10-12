@@ -15,3 +15,8 @@ The format is described by `testing/sqltest/docs/dsl-spec.md` in that
 repository. `turso_sqltests_test.go` parses it and runs every test against
 musql and C SQLite (the oracle); Turso's recorded `expect` blocks are only
 compared against C SQLite to report where they disagree.
+
+Divergences from C that are understood and deferred are listed, with a dated
+reason, in `turso_sqltests_known_data_test.go`; `TURSO_SQLTESTS_REPORT=<file>`
+makes the gate write every divergence and every disagreement with Turso's
+expectations there.

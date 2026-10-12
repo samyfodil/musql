@@ -165,6 +165,11 @@ both.
   against C SQLite. `pass` is a full output match; `unsupported` is a separate
   bucket.
 
+- `TestTursoSqltests`: Turso's `.sqltest` corpus (`compat-harness/testdata/turso-sqltests`),
+  every test and matrix expansion run on both engines. A divergence fails unless
+  `turso_sqltests_known_data_test.go` lists it with a dated reason; an entry that no longer
+  diverges fails the whole-corpus run. It takes about ten minutes, so put it on a server.
+
 To prioritise work, classify divergences (statement kind × which engine
 errored, and the compiler's decline reason) rather than guess.
 
