@@ -29,7 +29,8 @@ import (
 	"math"
 	"math/bits"
 	"strconv"
-	"sync/atomic"
+	"strings"
+	"sync"
 )
 
 // vecType is a vector's component type, numbered as libSQL's type byte.
@@ -472,95 +473,125 @@ func vecSpacedComponent(s []byte, i int) (x float64, e int, ok bool) {
 	return x, i, ok
 }
 
-// vecParallelMin is the length of text, from the first component, below which
-// vecParallelComponents is not tried: under it the goroutines cost more than
-// they save. A chunk is at least half of it.
-const vecParallelMin = 4096
+// A vector INSERT carries its vectors as text, one vector('[...]') call per row,
+// and reading a float costs more than anything else the statement does. The
+// statement's literals are known when it is compiled, so vecPrefetch reads them
+// then, on every core, and leaves the results here for the calls that come:
+// parseVectorText takes its answer from the table when the text is in it. The
+// answer is the one it would have computed, from the same code; a text that is
+// not there, or whose parse failed, is read at the call, and a failure is
+// reported there, at its row, in statement order.
+//
+// An entry is taken by the first call that uses it, so the table empties as the
+// statement runs. A new prefetch replaces the table, so what a statement that
+// never ran left behind lives until the next.
+var vecMemo struct {
+	sync.Mutex
+	m [2]map[string][]byte // by component width: float32, float64
+}
 
-var vecParallelOffForTest bool
+func vecMemoSlot(t vecType) int {
+	if t == vecF64 {
+		return 1
+	}
+	return 0
+}
 
-// vecParallelComponents parses the components of a vector's text, s[i:] being
-// what follows the '[', on up to vecWorkers goroutines, each taking the stretch
-// between two commas that a chunk boundary falls on. It answers only for the
-// plain shape every component of which vecFastComponent takes -- all ended by
-// ',' but the last, ended by ']' -- and gives the components' bytes, their
-// count, and the index of the ']'. false for anything else (a short text, one
-// worker, a component of another shape, a ']' or a count that does not fit, more
-// components than a vector holds): the caller then parses the text itself, so
-// every malformed text meets the same code, and the same error, as before.
-func vecParallelComponents(s []byte, i, w int) (data []byte, n, end int, ok bool) {
-	k := min(vecWorkers, (len(s)-i)/(vecParallelMin/2))
-	if k < 2 || vecParallelOffForTest || vecSlowComponentsForTest {
-		return nil, 0, 0, false
+// vecMemoTake returns the components of s parsed ahead as type t, removing them.
+func vecMemoTake(s []byte, t vecType) ([]byte, bool) {
+	vecMemo.Lock()
+	defer vecMemo.Unlock()
+	m := vecMemo.m[vecMemoSlot(t)]
+	if len(m) == 0 {
+		return nil, false
 	}
-	bounds := make([]int, 1, k+1) // where each chunk starts: i, then after a ','
-	bounds[0] = i
-	for c := 1; c < k; c++ {
-		target := i + (len(s)-i)*c/k
-		if target <= bounds[len(bounds)-1] {
-			continue
-		}
-		q := bytes.IndexByte(s[target:], ',')
-		if q < 0 {
-			break
-		}
-		bounds = append(bounds, target+q+1)
+	d, ok := m[string(s)]
+	if ok {
+		delete(m, string(s))
 	}
-	nch := len(bounds)
-	if nch < 2 {
-		return nil, 0, 0, false
+	return d, ok
+}
+
+// vecPrefetchMin is the least text, in bytes, that a prefetch is worth the
+// goroutines' wake-up for.
+const (
+	vecPrefetchMin      = 32 << 10
+	vecPrefetchMax      = 64 << 20 // the most text one statement may prefetch
+	vecPrefetchPerTask  = 8        // texts a worker takes at a time
+	vecPrefetchMinTexts = 16
+)
+
+// vecPrefetch parses texts (the vectors of one statement, all as type t) across
+// vecWorkers goroutines and publishes the ones that parse. It does nothing for
+// a few small texts or a single worker.
+func vecPrefetch(texts [][]byte, t vecType) {
+	total := 0
+	for _, s := range texts {
+		total += len(s)
 	}
-	// first[c] is the index of chunk c's first component: the commas before it.
-	first := make([]int, nch+1)
-	for c := range nch {
-		stop := len(s)
-		if c+1 < nch {
-			stop = bounds[c+1]
-		}
-		first[c+1] = first[c] + bytes.Count(s[bounds[c]:stop], []byte{','})
+	if vecWorkers < 2 || len(texts) < vecPrefetchMinTexts || total < vecPrefetchMin || total > vecPrefetchMax || vecSlowComponentsForTest {
+		return
 	}
-	total := first[nch] + 1 // the last component ends at ']', not ','
-	if total > vecMaxDims {
-		return nil, 0, 0, false
-	}
-	data = make([]byte, total*w)
-	put := func(idx int, x float64) {
-		if w == 4 {
-			binary.LittleEndian.PutUint32(data[idx*4:], math.Float32bits(float32(x)))
-		} else {
-			binary.LittleEndian.PutUint64(data[idx*8:], math.Float64bits(x))
-		}
-	}
-	var closing atomic.Int64
-	closing.Store(-1)
-	good := segEachOn(vecWorkers, nch, func(c int) bool {
-		pos := bounds[c]
-		for idx := first[c]; idx < first[c+1]; idx++ {
-			x, e, fine := vecFastComponent(s, pos)
-			if !fine || s[e] != ',' {
-				return false
+	data := make([][]byte, len(texts))
+	segEachOn(vecWorkers, (len(texts)+vecPrefetchPerTask-1)/vecPrefetchPerTask, func(j int) bool {
+		for i := j * vecPrefetchPerTask; i < min(len(texts), (j+1)*vecPrefetchPerTask); i++ {
+			if v, err := parseVectorTextRaw(texts[i], t); err == nil {
+				data[i] = v.data
 			}
-			put(idx, x)
-			pos = e + 1
 		}
-		if c+1 < nch {
-			return pos == bounds[c+1]
-		}
-		x, e, fine := vecFastComponent(s, pos)
-		if !fine || s[e] != ']' {
-			return false
-		}
-		put(total-1, x)
-		closing.Store(int64(e))
 		return true
 	})
-	if !good || closing.Load() < 0 {
-		return nil, 0, 0, false
+	m := make(map[string][]byte, len(texts))
+	for i, d := range data {
+		if d != nil {
+			m[string(texts[i])] = d
+		}
 	}
-	return data, total, int(closing.Load()), true
+	vecMemo.Lock()
+	vecMemo.m[vecMemoSlot(t)] = m
+	vecMemo.Unlock()
+}
+
+// vecPrefetchRows prefetches the vector literals of an INSERT's VALUES rows: a
+// vector(), vector32() or vector64() call whose one argument is a text literal,
+// as a row writes it.
+func vecPrefetchRows(rows [][]Expr) {
+	var f32, f64 [][]byte
+	for _, row := range rows {
+		for _, e := range row {
+			fn, ok := e.(FuncExpr)
+			if !ok || len(fn.Args) != 1 || fn.Star || fn.Distinct || fn.Over != nil || fn.Filter != nil {
+				continue
+			}
+			lit, ok := fn.Args[0].(LiteralExpr)
+			if !ok || lit.Val.Typ != Text {
+				continue
+			}
+			switch strings.ToLower(fn.Name) {
+			case "vector", "vector32":
+				f32 = append(f32, lit.Val.S)
+			case "vector64":
+				f64 = append(f64, lit.Val.S)
+			}
+		}
+	}
+	vecPrefetch(f32, vecF32)
+	vecPrefetch(f64, vecF64)
 }
 
 func parseVectorText(s []byte, t vecType) (vector, error) {
+	if d, ok := vecMemoTake(s, t); ok {
+		w := 4
+		if t == vecF64 {
+			w = 8
+		}
+		return vector{typ: t, dims: len(d) / w, data: d}, nil
+	}
+	return parseVectorTextRaw(s, t)
+}
+
+// parseVectorTextRaw is parseVectorText without the table of texts read ahead.
+func parseVectorTextRaw(s []byte, t vecType) (vector, error) {
 	i := 0
 	skip := func() {
 		for i < len(s) && sqlIsSpace(s[i]) {
@@ -576,23 +607,14 @@ func parseVectorText(s []byte, t vecType) (vector, error) {
 	if t == vecF64 {
 		w = 8
 	}
-	// A long text of plain numbers is parsed on several goroutines; anything
-	// else about it sends the whole text through the loop below instead, so the
-	// loop stays the one place that decides what a text means.
-	var data []byte
+	// Sized for one component per comma, so the appends below never regrow it.
+	data := make([]byte, 0, (bytes.Count(s, []byte{','})+1)*w)
 	n := 0
-	par := false
-	if d, cnt, e, ok := vecParallelComponents(s, i, w); ok {
-		data, n, i, par = d, cnt, e, true
-	} else {
-		// Sized for one component per comma, so the appends below never regrow it.
-		data = make([]byte, 0, (bytes.Count(s, []byte{','})+1)*w)
-	}
 	// One number per pass: its span runs to the next ',' or ']' (or a NUL,
 	// where C's string ends), found in one scan and parsed in place. Only a
 	// number with whitespace inside it -- which libSQL drops, so "1 2" is 12
 	// -- is copied to strip it.
-	for !par {
+	for {
 		// The common component first, in one pass: spaces, a number
 		// vecFastAtoF takes, spaces, then ',' or ']'. Anything else -- a space
 		// inside the number, a NUL, an empty component, a long one -- goes

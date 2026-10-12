@@ -921,6 +921,8 @@ func (db *DB) compileInsertWrite(sqlText string) (*Program, error) {
 }
 
 func (db *DB) compileInsertStmt(stmt *insertStmt, trig *trigCompileCtx) (*Program, error) {
+	// The statement's vector literals are read ahead, on every core (vecPrefetch).
+	vecPrefetchRows(stmt.rows)
 	// A database-qualified target ("INSERT INTO main.t ..."). The qualifier
 	// PICKS A CATALOG; it is not a capability gate: delete.c:31-46
 	// sqlite3SrcListLookup is the one routine INSERT (insert.c:963), UPDATE
