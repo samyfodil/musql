@@ -1851,6 +1851,13 @@ func (p *parser) parseFromElement(leading bool) ([]FromItem, error) {
 			// unchanged, keeping its inner alias. Anywhere else it is rebuilt carrying only
 			// the outer alias, so "SELECT x.c FROM ta JOIN (tb AS x) ON 1" is "no such
 			// column: x.c".
+			// The rebuild copies the name, database, subquery and table-function
+			// arguments but not the INDEXED BY / NOT INDEXED hint, so 3.53.3
+			// drops it there, a missing index included (parse.y:783-807; Turso's
+			// suite cites sqlite.org/bugs/info/09c09c8e1c207ef5).
+			if hasAlias || !leading {
+				inner[0].IndexedBy, inner[0].NotIndexed = "", false
+			}
 			switch {
 			case hasAlias:
 				inner[0].Alias = alias

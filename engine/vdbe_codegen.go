@@ -2581,6 +2581,23 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 			// "UPDATE t AS x ... FROM s AS x" reads x.v from t and x.w from s.
 			qualMiss = true
 		}
+		// No FROM item here is named the qualifier; it may be a join group's alias
+		// (tableScope.groupAlias, tkt3935.test 3). Only reached when nothing matched by
+		// name, so it can only turn "no such column" into an answer. Members of an
+		// aliased group share no column names.
+		//
+		// Only the group's own internal coalesce applies, never an enclosing RIGHT/FULL
+		// join's: C filters a qualified name to the one SrcItem with that alias
+		// (resolve.c:424), so cnt stays 1 and the coalesce rewrite (guarded by
+		// cnt!=1, resolve.c:761) never fires. An outer RIGHT JOIN null-extends the
+		// group as a whole, so "j.a" reads NULL.
+		if gi, idx, gln, ok := groupAliasColumn(len(scopes), func(i int) *tableScope { return &scopes[i].tableScope }, x.Qualifier, x.Name); ok {
+			s := scopes[gi]
+			if owners := s.resolvedFallback[gln]; len(owners) > 0 {
+				fb = coalesceFallbackRef{owners: owners, has: true}
+			}
+			return s.cursor, idx + s.colBase, false, true, fb, nil
+		}
 		if qualMiss {
 			// resolve.c:785-796 builds the message from the parts the reference was
 			// WRITTEN with: "%s.%s.%s" when a schema was named, "%s.%s" with a table,
@@ -2593,27 +2610,6 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 				return 0, 0, false, false, fb, semanticf("engine: no such column: %s.%s.%s", x.Schema, x.Qualifier, x.Name)
 			}
 			return 0, 0, false, false, fb, semanticf("engine: no such column: %s.%s", x.Qualifier, x.Name)
-		}
-		// No FROM item here is named the qualifier; it may be a join group's alias
-		// (tableScope.groupAlias, tkt3935.test 3). Only reached when nothing matched by
-		// name, so it can only turn "no such column" into an answer. Members of an
-		// aliased group share no column names.
-		//
-		// Only the group's own internal coalesce applies, never an enclosing RIGHT/FULL
-		// join's: C filters a qualified name to the one SrcItem with that alias
-		// (resolve.c:424), so cnt stays 1 and the coalesce rewrite (guarded by
-		// cnt!=1, resolve.c:761) never fires. An outer RIGHT JOIN null-extends the
-		// group as a whole, so "j.a" reads NULL.
-		for _, s := range scopes {
-			if !equalFoldName(s.groupAlias, x.Qualifier) {
-				continue
-			}
-			if idx, ok := s.colIndex[lname]; ok {
-				if owners := s.resolvedFallback[lname]; len(owners) > 0 {
-					fb = coalesceFallbackRef{owners: owners, has: true}
-				}
-				return s.cursor, idx + s.colBase, false, true, fb, nil
-			}
 		}
 		return 0, 0, false, false, fb, nil // no table here matches the qualifier: try outer
 	}

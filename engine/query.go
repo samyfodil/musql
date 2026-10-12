@@ -1861,7 +1861,7 @@ func expandSelectList(sel []SelectColumn, scopes []tableScope, mode colNameMode)
 				// "no such table: t1".
 				ts, ok := findTableScope(scopes, sc.StarQualifier)
 				if !ok || spanHidesName(ts) {
-					return nil, fmt.Errorf("engine: no such table: %s", sc.StarQualifier)
+					return nil, semanticf("engine: no such table: %s", sc.StarQualifier)
 				}
 				// A qualified star matching several FROM items (an unaliased self-join) expands
 				// all of them in C ("SELECT tt.*" over "tt JOIN tt USING(a,b,c)" gives six
@@ -2150,6 +2150,19 @@ func findTableScope(scopes []tableScope, qualifier string) (*tableScope, bool) {
 // named deterministically (FromItem.NestFromWrapDepth; see
 // annotateNestedRowidNames).
 func columnRefNameParts(scopes []tableScope, ce ColumnExpr) (qualifier, display string, ok bool, err error) {
+	if ce.Qualifier != "" && ce.Schema == "" {
+		// A group alias names the group's rebuilt list (groupAliasColumn); the
+		// result column takes that list's name for the entry.
+		if _, direct := findTableScope(scopes, ce.Qualifier); !direct {
+			if gi, c, ln, ok := groupAliasColumn(len(scopes), func(i int) *tableScope { return &scopes[i] }, ce.Qualifier, ce.Name); ok && scopes[gi].nestedColNames != nil {
+				ts := scopes[gi]
+				if n, isUsing := ts.usingEntryNames[ln]; isUsing && equalFoldName(n, ce.Name) {
+					return ts.tableName, n, true, nil
+				}
+				return ts.tableName, ts.nestedColNames[c], true, nil
+			}
+		}
+	}
 	if ts := groupMemberRowidScope(scopes, ce); ts != nil {
 		if ts.groupRowidName == "" {
 			return "", "", false, fmt.Errorf("engine: unsupported: %s of a member of a parenthesized join group SQLite rebuilds (its name in the rebuilt column list is not reproduced)", ce.Name)

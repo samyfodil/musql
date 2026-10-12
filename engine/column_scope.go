@@ -486,27 +486,23 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 				// A later item of the same name may have it (resolveInScopes).
 				qualMiss = true
 			}
-			if qualMiss {
-				return nil, 0, nil, -1, fmt.Errorf("engine: no such column: %s.%s", qualifier, name)
-			}
 			// No FROM item is named the qualifier; it may be a join group's alias
 			// (tableScope.groupAlias), naming every member. Reached only after the
 			// name loop failed, so it can only turn "no such column" into an
 			// answer. A group-alias read applies the group's coalesce fallback,
 			// as C resolves it against the group's rebuilt column list, whose
 			// entry for a coalesced name is the coalesce() (see resolveInScopes).
-			for _, ts := range c.tables {
-				if !equalFoldName(ts.groupAlias, qualifier) {
-					continue
+			if gi, colIdx, gln, ok := groupAliasColumn(len(c.tables), func(i int) *tableScope { return &c.tables[i] }, qualifier, name); ok {
+				ts := c.tables[gi]
+				foundOffset, foundIdx := ts.offset, colIdx
+				foundCol := &ts.cols[colIdx]
+				if ts.coalesceFallback != nil {
+					foundOffset, foundIdx, foundCol = resolveCoalesceChain(c.vals, c.tables, gln, foundOffset, foundIdx, foundCol, ts.coalesceFallback[gln], math.MaxInt, true)
 				}
-				if colIdx, ok := ts.colIndex[lname]; ok {
-					foundOffset, foundIdx := ts.offset, colIdx
-					foundCol := &ts.cols[colIdx]
-					if ts.coalesceFallback != nil {
-						foundOffset, foundIdx, foundCol = resolveCoalesceChain(c.vals, c.tables, lname, foundOffset, foundIdx, foundCol, ts.coalesceFallback[lname], math.MaxInt, true)
-					}
-					return c, foundOffset + foundIdx, foundCol, -1, nil
-				}
+				return c, foundOffset + foundIdx, foundCol, -1, nil
+			}
+			if qualMiss {
+				return nil, 0, nil, -1, fmt.Errorf("engine: no such column: %s.%s", qualifier, name)
 			}
 			continue
 		}
@@ -874,4 +870,69 @@ func isMaterializedRef(ctx *evalCtx, e Expr) bool {
 // table: dot.table" and "\"dot.table\".c" is "no such column".
 func spanHidesName(ts *tableScope) bool {
 	return (ts.rebuiltLayers > 0 || ts.nestedNonLeading) && strings.Contains(ts.name, ".")
+}
+
+// groupAliasColumn resolves "alias.name" against the members of the
+// parenthesized group aliased alias (scope(i) yields member i's tableScope, n
+// of them). C resolves it against the group's REBUILT column list, so where
+// that list's names are known (tableScope.nestedColNames) they decide: a
+// USING entry's name (usingEntryNames) is the merged column, read from the
+// first member holding it, and any other name is the member column carrying
+// it ("g.\"x:1\"" is the second x). ln is the name to read the merged
+// column's coalesce chain under. Without the names, the first member holding
+// the column answers, as before them.
+func groupAliasColumn(n int, scope func(int) *tableScope, alias, name string) (idx, col int, ln string, found bool) {
+	named := false
+	for i := 0; i < n; i++ {
+		if ts := scope(i); equalFoldName(ts.groupAlias, alias) && ts.nestedColNames != nil {
+			named = true
+			break
+		}
+	}
+	lname := r33sFoldIdent(name)
+	if !named {
+		for i := 0; i < n; i++ {
+			ts := scope(i)
+			if !equalFoldName(ts.groupAlias, alias) {
+				continue
+			}
+			if c, ok := ts.colIndex[lname]; ok {
+				return i, c, lname, true
+			}
+		}
+		return 0, 0, "", false
+	}
+	for i := 0; i < n; i++ {
+		ts := scope(i)
+		if !equalFoldName(ts.groupAlias, alias) {
+			continue
+		}
+		for u, entry := range ts.usingEntryNames {
+			if !equalFoldName(entry, name) {
+				continue
+			}
+			for k := 0; k < n; k++ {
+				m := scope(k)
+				if !equalFoldName(m.groupAlias, alias) {
+					continue
+				}
+				if c, ok := m.colIndex[u]; ok {
+					return k, c, u, true
+				}
+			}
+		}
+		break
+	}
+	for i := 0; i < n; i++ {
+		ts := scope(i)
+		if !equalFoldName(ts.groupAlias, alias) {
+			continue
+		}
+		for c, nm := range ts.nestedColNames {
+			if equalFoldName(nm, name) {
+				return i, c, r33sFoldIdent(ts.cols[c].Name), true
+			}
+		}
+	}
+	return 0, 0, "", false
 }
