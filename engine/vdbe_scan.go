@@ -362,19 +362,11 @@ func compileScanAttempt(p *ReadOnlyPager, stmt *SelectStmt, outer *compiler, row
 	if len(stmt.GroupBy) != 0 {
 		// GROUP BY over a materialized join group works: resolveJoinSources
 		// rebases members' scopes into the join's flat row space, so a group
-		// not placed first no longer overwrites earlier sources' slots.
-		//
-		// One exception: a key resolving to a USING/NATURAL column coalesced by
-		// a RIGHT/FULL JOIN inside the group, whose key record would read the
-		// member's raw (NULL) column: "SELECT id FROM (t4 RIGHT JOIN t5
-		// USING(id)) LEFT JOIN t1 USING(id) GROUP BY id" (C: 0,3,4,5,9;
-		// joink_r27_coalesce_chain_test.go). Qualified keys and keys resolving
-		// outside the group are fine, so this checks the resolved scope.
-		for _, g := range stmt.GroupBy {
-			if groupKeyNeedsGroupCoalesce(scopes, srcs, g) {
-				return nil, fmt.Errorf("%w: GROUP BY a USING/NATURAL column that a RIGHT/FULL JOIN inside a parenthesized join group coalesces (the key record would read the member's raw NULL)", errVDBEUnsupported)
-			}
-		}
+		// not placed first no longer overwrites earlier sources' slots. A key
+		// naming a column a RIGHT/FULL JOIN inside the group coalesces is read
+		// as the coalesce (refIsRightJoinCoalesced): "SELECT id FROM (t4 RIGHT
+		// JOIN t5 USING(id)) LEFT JOIN t1 USING(id) GROUP BY id" (C: 0,3,4,5,9;
+		// joink_r27_coalesce_chain_test.go).
 		if hasWindow {
 			return compileScanGroupedWindow(p, stmt, srcs, scopes, outer)
 		}
@@ -1103,58 +1095,6 @@ func literalIntInstr(v int64, reg int) Instruction {
 		return Instruction{Op: OpInteger, P1: int(v), P2: reg}
 	}
 	return Instruction{Op: OpInt64, P2: reg, P4: v}
-}
-
-// groupKeyNeedsGroupCoalesce reports whether e is an unqualified column whose
-// representative scope (the first FROM item exposing the name) is a member of
-// a materialized join group and takes its value from a RIGHT/FULL coalesce
-// chain (tableScope.coalesceFallback). Unqualified, because a qualified
-// reference reads its raw column in C too ("GROUP BY t5.id"). The
-// representative rather than resolveColumn's index, because a coalesce
-// fallback redirects that index out of range (columnRefNameParts). A group
-// member, because "t1 LEFT JOIN (t4 RIGHT JOIN t5 USING(id)) USING(id) GROUP
-// BY id" reads t1.id and is correct.
-func groupKeyNeedsGroupCoalesce(scopes []tableScope, srcs []joinSource, e Expr) bool {
-	ce, ok := e.(ColumnExpr)
-	if !ok || ce.Qualifier != "" || ce.Schema != "" {
-		return false
-	}
-	lname := r33sFoldIdent(ce.Name)
-	rep := -1
-	for i := range scopes {
-		if _, has := scopes[i].colIndex[lname]; !has {
-			continue
-		}
-		if _, hidden := scopes[i].coalesced[lname]; hidden {
-			continue // a later USING/NATURAL copy: never the representative
-		}
-		rep = i
-		break
-	}
-	if rep < 0 {
-		return false
-	}
-	for _, src := range srcs {
-		if len(src.memberScopes) == 0 {
-			continue
-		}
-		base := src.scope.offset
-		if scopes[rep].offset < base || scopes[rep].offset >= base+len(src.tbl.cols) {
-			continue // the representative is not in THIS group
-		}
-		// Asked of the MEMBER SCOPES, not of the []tableScope handed in: a
-		// materialized group's member carries its fallback RESOLVED into
-		// concrete {cursor,colIdx} owners (compileScope.resolvedFallback) and
-		// tableScopesOf drops that field along with the cursor, so the raw
-		// coalesceFallback this would otherwise test is empty there. Both are
-		// checked, since a member reached some other way still has the raw one.
-		for _, ms := range src.memberScopes {
-			if len(ms.resolvedFallback[lname]) > 0 || len(ms.coalesceFallback[lname]) > 0 {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // firstRowDependsOnOrder reports whether another arrival order of rows could

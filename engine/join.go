@@ -1488,6 +1488,23 @@ type joinDesugarState struct {
 	// shape: a FROM clause whose names are all distinct keeps exactly its
 	// prior behavior, checks included.
 	sharedName bool
+
+	// sawRightJoin records that this FROM level has a RIGHT or FULL join so
+	// far, and pendingAmbiguous the first USING/NATURAL column that more than
+	// one earlier item still exposes (not merged by its own USING). C tags the
+	// whole level JT_LTORJ when ANY of its joins is RIGHT/FULL
+	// (sqlite3SrcListShiftJoinType) and then rejects such a column in every
+	// USING of the level, wherever it sits relative to the RIGHT JOIN, as
+	// "ambiguous reference to %s in USING()" (sqlite3ProcessJoin,
+	// select.c:600-622). Without a RIGHT/FULL join anywhere it is accepted,
+	// bound to the leftmost table.
+	sawRightJoin     bool
+	pendingAmbiguous string
+}
+
+// ambiguousUsing is C's "ambiguous reference to %s in USING()".
+func ambiguousUsing(n string) error {
+	return semanticf("engine: ambiguous reference to %s in USING()", n)
 }
 
 // recordScope stores item idx's scope name and NestedNonLeading flag at
@@ -1633,6 +1650,12 @@ type visibleCol struct {
 // the NULL-extended side of the join that introduced it.
 func desugarJoinItem(state *joinDesugarState, idx int, it FromItem, name string, cols []columnInfo) (onExpr Expr, hidden map[string]int, err error) {
 	state.recordScope(idx, name, it.NestedNonLeading)
+	if it.Join == JoinRight || it.Join == JoinFull {
+		state.sawRightJoin = true
+		if state.pendingAmbiguous != "" {
+			return nil, nil, ambiguousUsing(state.pendingAmbiguous)
+		}
+	}
 
 	if !it.Natural && it.Using == nil {
 		if err := state.expose(idx, cols, nil); err != nil {
@@ -1700,9 +1723,9 @@ func desugarJoinItem(state *joinDesugarState, idx int, it FromItem, name string,
 		// exposing the name, with no ambiguity check; both NATURAL synthesis
 		// (select.c:544) and USING (select.c:583) use it. C's only USING
 		// ambiguity error, "ambiguous reference to %s in USING()"
-		// (select.c:619), fires inside a RIGHT/FULL join's multi-left coalesce
-		// (JT_LTORJ, select.c:600), so the check here is scoped to it.Join's
-		// own RIGHT/FULL.
+		// (select.c:619), fires inside the multi-left coalesce C builds when
+		// the level has any RIGHT/FULL join (JT_LTORJ, select.c:600), so the
+		// check here is scoped to that (joinDesugarState.sawRightJoin).
 		repr, ambiguous := -1, false
 		for _, vc := range state.visible {
 			if equalFoldName(vc.name, n) {
@@ -1720,8 +1743,13 @@ func desugarJoinItem(state *joinDesugarState, idx int, it FromItem, name string,
 			// fallback)".
 			return nil, nil, semanticf("engine: cannot join using column %s - column not present in both tables", n)
 		}
-		if ambiguous && (it.Join == JoinRight || it.Join == JoinFull) {
-			return nil, nil, fmt.Errorf("engine: ambiguous column name in NATURAL/USING join: %s", n)
+		if ambiguous {
+			if state.sawRightJoin {
+				return nil, nil, ambiguousUsing(n)
+			}
+			if state.pendingAmbiguous == "" {
+				state.pendingAmbiguous = n
+			}
 		}
 		hidden[lname] = repr
 
