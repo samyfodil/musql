@@ -13,6 +13,7 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/samyfodil/musql/internal/mmapfile"
@@ -262,6 +263,32 @@ type vec1Query struct {
 	// Scratch the scan reuses from bucket to bucket: a distance table (one
 	// table is live at a time) and a list's block sums.
 	lutBuf, sums []float32
+	scratch      *vec1Scratch // where those two came from, and go back to
+}
+
+// vec1Scratch is the buffers a search reuses from query to query: it takes a
+// distance table of tens of kilobytes and a list's block sums every time.
+type vec1Scratch struct{ lut, sums []float32 }
+
+var vec1ScratchPool sync.Pool
+
+// takeScratch gives qy a distance table and sums buffer from earlier queries.
+func (qy *vec1Query) takeScratch() {
+	s, _ := vec1ScratchPool.Get().(*vec1Scratch)
+	if s == nil {
+		s = &vec1Scratch{}
+	}
+	qy.scratch, qy.lutBuf, qy.sums = s, s.lut, s.sums
+}
+
+// releaseScratch returns what takeScratch gave, grown as the search needed.
+// Nothing the search produced aliases it: the rows it returns are copies.
+func (qy *vec1Query) releaseScratch() {
+	if s := qy.scratch; s != nil {
+		s.lut, s.sums = qy.lutBuf, qy.sums
+		qy.scratch, qy.lutBuf, qy.sums = nil, nil, nil
+		vec1ScratchPool.Put(s)
+	}
 }
 
 // interpretNProbe is vec1InterpretNProbe.
@@ -304,6 +331,7 @@ func (q *vec1Read) setup(in *vec1KnnInput) (*vec1Query, error) {
 	nSpace := max(nElem, t.tmpLen())
 	raw := vec1BlobOf(in.query)
 	qy := &vec1Query{k: math.MinInt64, nProbe: vec1InterpretNProbe(t.mod.nBucket(), q.conn.nProbe)}
+	qy.takeScratch()
 	qy.vector = make([]float32, nSpace)
 	if nElem != 0 {
 		if len(raw) != 4*nElem {
@@ -410,6 +438,7 @@ func (q *vec1Read) knn(in *vec1KnnInput) (*vec1Out, error) {
 	if qy == nil {
 		return q.sqlOut, nil
 	}
+	defer qy.releaseScratch()
 	return q.knnRows(qy)
 }
 

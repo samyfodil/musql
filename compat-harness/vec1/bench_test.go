@@ -207,6 +207,9 @@ func TestVec1Bench(t *testing.T) {
 			stop := profile("query")
 			var ru0 syscall.Rusage
 			syscall.Getrusage(syscall.RUSAGE_SELF, &ru0)
+			var ms0 runtime.MemStats
+			runtime.ReadMemStats(&ms0)
+			var lats []time.Duration
 			// One warm-up, then each query once.
 			for qi := -1; qi < len(queries); qi++ {
 				qv := queries[max(qi, 0)]
@@ -234,6 +237,7 @@ func TestVec1Bench(t *testing.T) {
 					continue
 				}
 				rs.lat = append(rs.lat, el)
+				lats = append(lats, el)
 				if len(got) > 10 {
 					got = got[:10]
 				}
@@ -252,6 +256,26 @@ func TestVec1Bench(t *testing.T) {
 			var ru1 syscall.Rusage
 			syscall.Getrusage(syscall.RUSAGE_SELF, &ru1)
 			t.Logf("%s %s queries: minor faults %d, major faults %d, in-blocks %d", c.name, eng, ru1.Minflt-ru0.Minflt, ru1.Majflt-ru0.Majflt, ru1.Inblock-ru0.Inblock)
+			var ms1 runtime.MemStats
+			runtime.ReadMemStats(&ms1)
+			// The slowest queries and where in the run they fell: a pause the
+			// collector took shows as a few slow queries together.
+			slow := make([]int, len(lats))
+			for i := range slow {
+				slow[i] = i
+			}
+			sort.Slice(slow, func(a, b int) bool { return lats[slow[a]] > lats[slow[b]] })
+			var worst []string
+			for _, i := range slow[:min(6, len(slow))] {
+				worst = append(worst, fmt.Sprintf("#%d %v", i, lats[i].Round(time.Microsecond)))
+			}
+			var first []string
+			for _, l := range lats[:min(30, len(lats))] {
+				first = append(first, fmt.Sprint(l.Round(10*time.Microsecond)))
+			}
+			t.Logf("%s %s first queries: %s", c.name, eng, strings.Join(first, " "))
+			t.Logf("%s %s queries: %d collections, %v paused, %d KB and %d allocations a query (heap %d MB); slowest %s", c.name, eng, ms1.NumGC-ms0.NumGC, time.Duration(ms1.PauseTotalNs-ms0.PauseTotalNs),
+				(ms1.TotalAlloc-ms0.TotalAlloc)/1024/uint64(len(lats)), (ms1.Mallocs-ms0.Mallocs)/uint64(len(lats)), ms1.HeapAlloc>>20, strings.Join(worst, ", "))
 			rs.recall = float64(hits) / float64(10*len(queries))
 			res[eng] = rs
 			db.Close()

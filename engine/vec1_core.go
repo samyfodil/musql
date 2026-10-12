@@ -81,6 +81,18 @@ func vec1Floats(b []byte) []float32 {
 	return out
 }
 
+// vec1FloatsView is vec1Floats for a caller that only reads the floats: where b
+// is 4-byte aligned they alias it, with no copy. A distance function called for
+// each candidate of a reranked search converted both of its arguments to fresh
+// slices -- 3 KB a candidate, most of what a query allocated.
+func vec1FloatsView(b []byte) []float32 {
+	n := len(b) / 4
+	if n == 0 || uintptr(unsafe.Pointer(unsafe.SliceData(b)))&3 != 0 {
+		return vec1Floats(b)
+	}
+	return unsafe.Slice((*float32)(unsafe.Pointer(unsafe.SliceData(b))), n)
+}
+
 // vec1FloatBytes is the blob holding v.
 func vec1FloatBytes(v []float32) []byte {
 	if len(v) == 0 {
