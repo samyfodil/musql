@@ -728,11 +728,16 @@ func (n *Session) deltaAppendExceeds(recs []SegDeltaRecord) bool {
 // the vtab layer would have to record its own writes; do that if vtab-heavy
 // write loads matter.
 func (db *DB) mutatedOutsideChangeLog(changes []RowChange) bool {
-	described := make(map[string]bool, len(changes))
+	described := map[string]bool{}
+	last := ""
 	for _, c := range changes {
-		if !c.Temp {
-			described[strings.ToLower(c.Table)] = true
+		// A commit's changes come in runs of one table: fold each name once
+		// per run, not once per row.
+		if c.Temp || c.Table == last {
+			continue
 		}
+		described[strings.ToLower(c.Table)] = true
+		last = c.Table
 	}
 	for _, t := range db.tables {
 		if t.isTemp || !t.rowsWrittenSinceCommit || t.rows == nil {
