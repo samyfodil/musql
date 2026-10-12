@@ -38,7 +38,20 @@ const MaxVMWasmBytes = 6 << 20
 // goes back through the table; a backward jump or an OP_Return sets pc,
 // spends fuel and re-enters the dispatch. An exit stores the pc to resume at
 // and returns.
-func EmitVM(prog []VInsn, nReg int, lay ValueLayout) ([]byte, error) {
+//
+// bound and cache are as on amd64 (vm_amd64.go's emitVM). On wasm the cache is
+// what the emitter knows (vmKnow): the engine running the module keeps values
+// in machine registers itself, so a guard or a full write known to be
+// redundant is what there is to skip.
+func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache bool) ([]byte, error) {
+	// No entry stubs here: an entry starts a run, like a jump target.
+	if bound != nil && entry != nil {
+		b := append([]bool(nil), bound...)
+		for pc := range min(len(entry), len(b)) {
+			b[pc] = b[pc] || entry[pc]
+		}
+		bound = b
+	}
 	if lay.OffTyp != 0 || lay.OffI != 8 || lay.OffF != 16 {
 		return nil, fmt.Errorf("jit: unexpected Value layout %+v", lay)
 	}
@@ -46,7 +59,7 @@ func EmitVM(prog []VInsn, nReg int, lay ValueLayout) ([]byte, error) {
 	if int64(nReg)*int64(lay.Size) > 1<<30 {
 		return nil, fmt.Errorf("jit: %d registers", nReg)
 	}
-	e := &vmEmitWasm{w: &Wasm{}, lay: lay, n: n}
+	e := &vmEmitWasm{w: &Wasm{}, lay: lay, n: n, prog: prog, bound: bound, cache: cache && bound != nil, know: newVMKnow()}
 	w := e.w
 	e.regs, e.pc, e.fuel = w.Local(wI32), w.Local(wI32), w.Local(wI64)
 	e.t1, e.t2, e.t3, e.ovf = w.Local(wI64), w.Local(wI64), w.Local(wI64), w.Local(wI64)
@@ -69,27 +82,42 @@ func EmitVM(prog []VInsn, nReg int, lay ValueLayout) ([]byte, error) {
 	w.Set(e.fuel)
 
 	w.op(opLoop, opVoid)  // dispatch
+	w.op(opBlock, opVoid) // "fused": exits at the pc local
 	w.op(opBlock, opVoid) // "end": falls into the exit at n
 	for range n {
 		w.op(opBlock, opVoid)
 	}
-	// br_table: pc k -> depth k (block k, innermost is 0); anything else ->
-	// depth n, the end block.
+	// br_table: pc k -> depth k (block k, innermost is 0); a VFused pc, which
+	// native code never enters, -> depth n+1, the exit at that pc; anything
+	// else -> depth n, the end block.
 	w.Get(e.pc)
 	w.op(opBrTable)
 	w.body = uleb(w.body, uint64(n))
 	for k := range n {
-		w.body = uleb(w.body, uint64(k))
+		if prog[k].Op == VFused {
+			w.body = uleb(w.body, uint64(n+1))
+		} else {
+			w.body = uleb(w.body, uint64(k))
+		}
 	}
 	w.body = uleb(w.body, uint64(n))
 	for pc, in := range prog {
 		w.op(opEnd) // block pc ends: its code follows
+		if vmRunStart(prog, bound, pc) || !e.cache {
+			e.know.reset()
+		}
 		if err := e.insn(pc, in); err != nil {
 			return nil, fmt.Errorf("jit: pc %d: %w", pc, err)
 		}
 	}
 	w.op(opEnd) // the end block
 	e.exitAt(n)
+	w.op(opEnd) // the fused block
+	w.Get(0)
+	w.Get(e.pc)
+	w.op(opI64ExtendI32U)
+	w.StoreI64(POffPC)
+	w.op(opReturn)
 	w.op(opEnd) // dispatch loop
 	if len(w.body) > MaxVMWasmBytes {
 		return nil, fmt.Errorf("jit: program too large for wasm (%d instructions, %d bytes)", n, len(w.body))
@@ -107,13 +135,18 @@ type vmEmitWasm struct {
 	curs, rowp, valp uint32 // the cursor table, a row's header, its first Value (when the program has cursor ops)
 	cur              int    // the pc whose code is being emitted
 	extra            int    // if-blocks opened inside it
+
+	prog  []VInsn
+	bound []bool
+	cache bool
+	know  *vmKnow
 }
 
 // Within pc's code the enclosing blocks are those of pc+1 .. n-1, then the
-// end block, then the dispatch loop.
+// end block, the fused block, then the dispatch loop.
 // Every if opened inside it adds one more.
 func (e *vmEmitWasm) depthToBlock(t int) uint32 { return uint32(t - e.cur - 1 + e.extra) }
-func (e *vmEmitWasm) depthDispatch() uint32     { return uint32(e.n - e.cur + e.extra) }
+func (e *vmEmitWasm) depthDispatch() uint32     { return uint32(e.n - e.cur + 1 + e.extra) }
 
 func (e *vmEmitWasm) addr(r, f int) uint32 { return uint32(r*e.lay.Size + f) }
 
@@ -164,13 +197,70 @@ func hasS(reg int) guard {
 }
 
 func (e *vmEmitWasm) guards(pc int, gs ...guard) {
-	for i, g := range gs {
+	k := 0
+	for _, g := range gs {
+		if g == nil {
+			continue
+		}
 		g(e)
-		if i > 0 {
+		if k > 0 {
 			e.w.op(opI32Or)
 		}
+		k++
 	}
-	e.exitIf(pc)
+	if k > 0 {
+		e.exitIf(pc)
+	}
+}
+
+// isInt and noS are notInt and hasS, or nil when what they check is known
+// (and from here on, it is).
+func (e *vmEmitWasm) isInt(reg int) guard {
+	if e.know.isInt[reg] {
+		return nil
+	}
+	e.know.isInt[reg] = true
+	return notInt(reg)
+}
+
+func (e *vmEmitWasm) noS(reg int) guard {
+	if e.know.noS[reg] {
+		return nil
+	}
+	e.know.noS[reg] = true
+	return hasS(reg)
+}
+
+// dstNoS is noS for an instruction's destination, nil when its store is Dead.
+func (e *vmEmitWasm) dstNoS(in VInsn, reg int) guard {
+	if in.Dead {
+		return nil
+	}
+	return e.noS(reg)
+}
+
+// forgetReg records that r[reg] changed other than by storeInt.
+func (e *vmEmitWasm) forgetReg(reg int) {
+	delete(e.know.isInt, reg)
+	delete(e.know.canon, reg)
+	delete(e.know.noS, reg)
+}
+
+// storeInt is writeInt for in's destination: nothing for a Dead store, only
+// the I word over an integer native code wrote.
+func (e *vmEmitWasm) storeInt(in VInsn, reg int, src uint32) {
+	if in.Dead {
+		e.forgetReg(reg)
+		return
+	}
+	if e.know.canon[reg] {
+		e.w.Get(e.regs)
+		e.w.Get(src)
+		e.w.StoreI64(e.addr(reg, e.lay.OffI))
+	} else {
+		e.writeInt(reg, src)
+	}
+	e.know.wroteInt(reg)
 }
 
 // writeInt makes r[reg] the INTEGER on top of the stack (in local src).
@@ -248,22 +338,45 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 	switch in.Op {
 	case VExit:
 		e.exitAt(pc)
+	case VFused:
+		// The instruction before is this one too.
 	case VGoto:
 		e.jump(in.T)
 	case VInt:
-		e.guards(pc, hasS(in.A))
+		if in.Dead {
+			e.forgetReg(in.A)
+			break
+		}
+		e.guards(pc, e.noS(in.A))
 		w.I64(in.Imm)
 		w.Set(e.t1)
-		e.writeInt(in.A, e.t1)
+		e.storeInt(in, in.A, e.t1)
 	case VCopy:
-		e.guards(pc, hasS(in.A), hasS(in.B))
+		if in.Dead {
+			e.forgetReg(in.B)
+			break
+		}
+		e.guards(pc, e.noS(in.A), e.noS(in.B))
+		if e.know.canon[in.A] && in.A != in.B {
+			e.loadI64(in.A, L.OffI)
+			w.Set(e.t1)
+			e.storeInt(VInsn{}, in.B, e.t1)
+			break
+		}
 		for _, f := range []int{0, L.OffI, L.OffF} {
 			w.Get(e.regs)
 			e.loadI64(in.A, f)
 			w.StoreI64(e.addr(in.B, f))
 		}
+		if in.A != in.B {
+			isInt := e.know.isInt[in.A]
+			e.know.wroteAny(in.B)
+			if isInt {
+				e.know.isInt[in.B] = true
+			}
+		}
 	case VAdd, VSub, VMul, VAnd, VOr:
-		e.guards(pc, notInt(in.B), notInt(in.A), hasS(in.C))
+		e.guards(pc, e.isInt(in.B), e.isInt(in.A), e.dstNoS(in, in.C))
 		e.loadI64(in.B, L.OffI)
 		w.Set(e.t1)
 		e.loadI64(in.A, L.OffI)
@@ -292,9 +405,9 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 			w.Get(e.t3)
 			w.Set(e.t1)
 		}
-		e.writeInt(in.C, e.t1)
+		e.storeInt(in, in.C, e.t1)
 	case VShl, VShr:
-		e.guards(pc, notInt(in.B), notInt(in.A), hasS(in.C))
+		e.guards(pc, e.isInt(in.B), e.isInt(in.A), e.dstNoS(in, in.C))
 		e.loadI64(in.A, L.OffI)
 		w.Set(e.t2)
 		w.Get(e.t2)
@@ -309,22 +422,74 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 			w.op(opI64ShrS)
 		}
 		w.Set(e.t1)
-		e.writeInt(in.C, e.t1)
+		e.storeInt(in, in.C, e.t1)
+	case VDiv, VRem:
+		e.guards(pc, e.isInt(in.B), e.isInt(in.A), e.dstNoS(in, in.C))
+		e.loadI64(in.A, L.OffI)
+		w.Set(e.t2)
+		// A divisor of 0 (NULL) or -1 (the one overflow, and a trap) is the
+		// VDBE's.
+		w.Get(e.t2)
+		w.op(opI64Eqz)
+		w.Get(e.t2)
+		w.I64(-1)
+		w.op(opI64Eq)
+		w.op(opI32Or)
+		e.exitIf(pc)
+		e.loadI64(in.B, L.OffI)
+		w.Get(e.t2)
+		if in.Op == VDiv {
+			w.op(opI64DivS)
+		} else {
+			w.op(opI64RemS)
+		}
+		w.Set(e.t1)
+		e.storeInt(in, in.C, e.t1)
 	case VCmpJump:
-		e.guards(pc, notInt(in.B), notInt(in.A))
+		e.guards(pc, e.isInt(in.B), e.isInt(in.A))
 		e.loadI64(in.B, L.OffI)
 		e.loadI64(in.A, L.OffI)
 		w.op(scalarCmp(in.Cond))
 		e.jumpIf(in.T)
-	case VCmpSet:
-		e.guards(pc, notInt(in.B), notInt(in.A), hasS(in.C))
+	case VCmpSet, VCmpBr:
+		e.guards(pc, e.isInt(in.B), e.isInt(in.A), e.dstNoS(in, in.C))
 		e.loadI64(in.B, L.OffI)
 		e.loadI64(in.A, L.OffI)
 		w.op(scalarCmp(in.Cond))
 		w.op(opI64ExtendI32U)
 		w.Set(e.t1)
-		e.writeInt(in.C, e.t1)
+		e.storeInt(in, in.C, e.t1)
+		if in.Op == VCmpBr {
+			w.Get(e.t1)
+			w.op(opI64Eqz)
+			if in.Imm != 0 {
+				w.op(opI32Eqz) // jump when 1
+			}
+			e.jumpIf(in.T)
+		}
+	case VNot, VNotBr:
+		e.guards(pc, e.isInt(in.A), e.dstNoS(in, in.C))
+		e.loadI64(in.A, L.OffI)
+		w.op(opI64Eqz)
+		w.op(opI64ExtendI32U)
+		w.Set(e.t1)
+		e.storeInt(in, in.C, e.t1)
+		if in.Op == VNotBr {
+			w.Get(e.t1)
+			w.op(opI64Eqz)
+			if in.Imm != 0 {
+				w.op(opI32Eqz)
+			}
+			e.jumpIf(in.T)
+		}
 	case VNullJump:
+		if e.know.isInt[in.A] {
+			// An INTEGER is not NULL.
+			if in.Imm == 0 {
+				e.jump(in.T)
+			}
+			break
+		}
 		e.loadTyp(in.A)
 		w.I32(int32(L.TypNull))
 		if in.Imm != 0 {
@@ -334,14 +499,19 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		}
 		e.jumpIf(in.T)
 	case VNull:
-		e.guards(pc, hasS(in.C))
+		if in.Dead {
+			e.forgetReg(in.C)
+			break
+		}
+		e.guards(pc, e.noS(in.C))
 		for _, f := range []int{0, L.OffI, L.OffF} {
 			w.Get(e.regs)
 			w.I64(0)
 			w.StoreI64(e.addr(in.C, f))
 		}
+		e.know.wroteAny(in.C)
 	case VNeg:
-		e.guards(pc, notInt(in.A), hasS(in.C))
+		e.guards(pc, e.isInt(in.A), e.dstNoS(in, in.C))
 		e.loadI64(in.A, L.OffI)
 		w.Set(e.t2)
 		w.Get(e.t2)
@@ -352,8 +522,17 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		w.Get(e.t2)
 		w.op(opI64Sub)
 		w.Set(e.t1)
-		e.writeInt(in.C, e.t1)
+		e.storeInt(in, in.C, e.t1)
 	case VIf:
+		if e.know.isInt[in.A] {
+			e.loadI64(in.A, L.OffI)
+			w.op(opI64Eqz)
+			if in.Imm != 0 {
+				w.op(opI32Eqz) // jump when non-zero
+			}
+			e.jumpIf(in.T)
+			break
+		}
 		// An INTEGER jumps on its truth; a NULL jumps when C says so; anything
 		// else is the VDBE's.
 		e.loadTyp(in.A)
@@ -376,13 +555,13 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		e.jumpIf(in.T)
 		e.closeIf()
 	case VGosub:
-		e.guards(pc, hasS(in.A))
+		e.guards(pc, e.noS(in.A))
 		w.I64(int64(pc))
 		w.Set(e.t1)
 		e.writeInt(in.A, e.t1)
 		e.jump(in.T)
 	case VReturn:
-		e.guards(pc, notInt(in.A))
+		e.guards(pc, e.isInt(in.A))
 		e.loadI64(in.A, L.OffI)
 		w.Set(e.t1)
 		w.Get(e.t1)
@@ -440,13 +619,14 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		w.op(opI64Eqz)
 		w.op(opI32Eqz)
 		e.exitIf(pc)
-		e.guards(pc, hasS(in.C))
+		e.guards(pc, e.noS(in.C))
 		for _, f := range []int{0, L.OffI, L.OffF} {
 			w.Get(e.regs)
 			w.Get(e.valp)
 			w.LoadI64(vb + uint32(f))
 			w.StoreI64(e.addr(in.C, f))
 		}
+		e.know.wroteAny(in.C)
 	case VRewind:
 		cb := uint32(in.A * VCursorSize)
 		w.Get(e.curs)

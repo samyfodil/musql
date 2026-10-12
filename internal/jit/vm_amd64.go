@@ -2,7 +2,10 @@
 
 package jit
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 // condAbove is x86's unsigned "above" (JA), for range checks that fold negatives.
 const (
@@ -11,17 +14,31 @@ const (
 	condBelowEq Cond = 0x6 // JBE: unsigned <=
 )
 
-// EmitVM compiles a whole VDBE program; see vm.go for the contract.
+// vmPool is the machine registers a fused program keeps values in between
+// steps (vmfuse.go): RBX, R12, R13 and R15 are saved by the trampoline, and
+// R11 is free. R12 cannot be a base (its encoding is RSP's, which needs a
+// SIB byte memD does not write), so it holds values only, never a row.
+var vmPool = []Reg{RBX, R11, R13, R15, R12}
+
+// emitVM compiles a whole VDBE program; see vm.go for the contract.
 //
 // Registers: RDI *ProgArgs, RSI the register file, R8 fuel, RCX the pc at an
-// entry or an OP_Return, RAX/RDX scratch. Nothing else is touched, so the
-// trampoline's saves are more than enough.
+// entry or an OP_Return, RAX/RDX/R9/R10 scratch, vmPool the values a fused
+// program keeps in machine registers.
 //
 // Layout: a prologue that loads the entry pc and falls into the dispatcher;
 // one block per pc, in pc order, so a fall-through is simply the next block;
 // the exit stubs, out of line; and the dispatch table, one int32 per pc (and
 // one for the pc past the end) giving its block's offset from the table.
-func EmitVM(prog []VInsn, nReg int, lay ValueLayout) ([]byte, error) {
+//
+// bound (VMBoundaries) is nil for a program entered at any pc; cache is
+// whether the emitter keeps what it knows from one step to the next within a
+// straight run (vmKnow) -- the fused emission. Without it every step reads
+// and checks its operands from the file, as it always did.
+//
+// entry marks the pcs the engine enters at; one that bound does not mark is
+// entered through an entry stub (vmfuse.go), which the dispatch table points at.
+func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache bool) ([]byte, error) {
 	if lay.OffTyp != 0 || lay.OffI != 8 || lay.OffF != 16 {
 		// writeInt stores the type as the whole first word -- type, subtype and
 		// padding together -- so the type must lead it.
@@ -31,7 +48,9 @@ func EmitVM(prog []VInsn, nReg int, lay ValueLayout) ([]byte, error) {
 	if int64(nReg)*int64(lay.Size) > 1<<30 || n > 1<<28 {
 		return nil, fmt.Errorf("jit: program too large (%d instructions, %d registers)", n, nReg)
 	}
-	e := &vmEmit{a: NewAsm(), lay: lay, n: n, stubs: map[int]bool{}}
+	e := &vmEmit{a: NewAsm(), lay: lay, n: n, stubs: map[int]bool{}, prog: prog, bound: bound,
+		cache: cache && bound != nil, know: newVMKnow(), holds: map[int]Reg{}, pinned: map[Reg]bool{}}
+	e.heads = vmLoopHeads(prog)
 	a := e.a
 
 	a.MovRegMem(RSI, RDI, POffRegs)
@@ -48,16 +67,48 @@ func EmitVM(prog []VInsn, nReg int, lay ValueLayout) ([]byte, error) {
 
 	e.blockOff = make([]int, n)
 	for pc, in := range prog {
+		if vmRunStart(prog, bound, pc) {
+			e.forget()
+			e.alignLoopHead(pc)
+		} else if e.cache && pc < len(entry) && entry[pc] {
+			e.entryPoint(pc)
+		}
 		e.blockOff[pc] = len(a.buf)
+		clear(e.pinned)
 		if err := e.insn(pc, in); err != nil {
 			return nil, fmt.Errorf("jit: pc %d: %w", pc, err)
+		}
+		if !e.cache {
+			e.forget()
 		}
 	}
 	// Running off the last block is running off the program.
 	e.exitAt(n)
 
+	entryOff := map[int]int{}
+	for _, en := range e.entries {
+		entryOff[en.pc] = len(a.buf)
+		for _, r := range en.ints {
+			e.guardInt(en.pc, r)
+		}
+		for _, r := range en.noS {
+			e.guardNoS(en.pc, r)
+		}
+		for _, h := range en.holds {
+			a.MovRegMemD(h.m, RSI, e.d(h.r, lay.OffI))
+		}
+		a.emit(0xE9)
+		e.fix = append(e.fix, vmFix{at: len(a.buf), pc: en.pc})
+		a.emit(0, 0, 0, 0)
+	}
+
 	stubOff := map[int]int{}
 	e.stubs[n] = true
+	for pc, in := range prog {
+		if in.Op == VFused {
+			e.stubs[pc] = true // never entered; should anything dispatch there, the VDBE runs it
+		}
+	}
 	for k := range e.stubs {
 		stubOff[k] = len(a.buf)
 		e.exitAt(k)
@@ -68,6 +119,11 @@ func EmitVM(prog []VInsn, nReg int, lay ValueLayout) ([]byte, error) {
 		off := stubOff[n]
 		if pc < n {
 			off = e.blockOff[pc]
+			if prog[pc].Op == VFused {
+				off = stubOff[pc]
+			} else if o, ok := entryOff[pc]; ok {
+				off = o
+			}
 		}
 		a.emit32(uint32(int32(off - tab)))
 	}
@@ -91,6 +147,49 @@ type vmEmit struct {
 	blockOff []int
 	fix      []vmFix
 	stubs    map[int]bool
+
+	prog  []VInsn
+	bound []bool
+	cache bool
+	know  *vmKnow
+	// holds maps a VDBE register (>= 0) to the machine register holding its I
+	// word, and a cursor c (as ^c) to the one holding its current row's first
+	// Value. pinned is what the instruction being emitted is using.
+	holds  map[int]Reg
+	pinned map[Reg]bool
+	heads  []bool // vmLoopHeads
+	// entries are the entry stubs to emit after the blocks.
+	entries []vmEntryStub
+}
+
+// vmEntryStub is an entry into the middle of a run: the registers to check
+// and the ones to load into machine registers.
+type vmEntryStub struct {
+	pc        int
+	ints, noS []int
+	holds     []vmHold
+}
+
+type vmHold struct {
+	r int
+	m Reg
+}
+
+// entryPoint makes pc, inside a run, an entry: what the run knows there is
+// cut down to what a stub can check, and the stub is noted.
+func (e *vmEmit) entryPoint(pc int) {
+	keep := vmEntryKeep(e.prog, e.bound, pc)
+	st := vmEntryStub{pc: pc}
+	st.ints, st.noS = e.know.pruneForEntry(keep)
+	for k, m := range e.holds {
+		if k < 0 || !keep[k] || !e.know.isInt[k] {
+			delete(e.holds, k)
+			continue
+		}
+		st.holds = append(st.holds, vmHold{k, m})
+	}
+	slices.SortFunc(st.holds, func(x, y vmHold) int { return x.r - y.r })
+	e.entries = append(e.entries, st)
 }
 
 // vmFix is a rel32 to patch: to pc's block, or to the stub that exits at pc.
@@ -101,6 +200,17 @@ type vmFix struct {
 }
 
 func (e *vmEmit) d(r, off int) int32 { return int32(r*e.lay.Size + off) }
+
+// alignLoopHead pads to a 32-byte boundary before a block a backward branch
+// targets: a loop's head then starts a fetch block, and the loop body's
+// decoded lines do not shift with whatever code precedes it. The padding is
+// one multi-byte NOP run, executed only by a fall into the head.
+func (e *vmEmit) alignLoopHead(pc int) {
+	if !e.cache || !e.heads[pc] {
+		return
+	}
+	padNops(e.a, 32)
+}
 
 // exitAt returns to Go asking the VDBE to run pc.
 func (e *vmEmit) exitAt(pc int) {
@@ -174,75 +284,359 @@ func (e *vmEmit) writeInt(reg int, src Reg) {
 	e.a.MovMemDImm(RSI, e.d(reg, e.lay.OffF), 0)
 }
 
+// ---- what the emitter keeps between steps (fused emission only) -------------
+
+// forget drops everything known: a run starts.
+func (e *vmEmit) forget() {
+	e.know.reset()
+	clear(e.holds)
+}
+
+// unmap forgets which machine register holds key.
+func (e *vmEmit) unmap(key int) { delete(e.holds, key) }
+
+// clobber records that native code changed r[r] other than by storeInt.
+func (e *vmEmit) clobber(r int) {
+	e.unmap(r)
+	delete(e.know.isInt, r)
+	delete(e.know.canon, r)
+	delete(e.know.noS, r)
+}
+
+func (e *vmEmit) nextUse(key, pc int) int { return vmEmitNextUse(e.prog, e.bound, key, pc) }
+
+// alloc returns a pool register for a value wanted again at pc want, taking
+// one from whatever the pool holds that is wanted furthest away (or never)
+// when none is free; ok is false when every candidate is wanted sooner, or in
+// use by this instruction. noBase excludes the register that cannot be a base.
+func (e *vmEmit) alloc(pc, want int, noBase bool) (Reg, bool) {
+	if !e.cache {
+		return 0, false
+	}
+	far := map[Reg]int{} // for each pool register in use, when it is next wanted
+	for k, m := range e.holds {
+		u := e.nextUse(k, pc)
+		if u < 0 {
+			u = 1 << 30
+		}
+		far[m] = max(far[m], u)
+	}
+	var best Reg
+	bestAt := -1
+	for _, m := range vmPool {
+		if e.pinned[m] || (noBase && m == R12) {
+			continue
+		}
+		at, used := far[m]
+		if !used {
+			best, bestAt = m, 1<<31
+			break
+		}
+		if at > bestAt {
+			best, bestAt = m, at
+		}
+	}
+	if bestAt < 0 || bestAt <= want {
+		return 0, false
+	}
+	for k, m := range e.holds {
+		if m == best {
+			delete(e.holds, k)
+		}
+	}
+	e.pinned[best] = true
+	return best, true
+}
+
+// src makes sure r[r] is an INTEGER (exiting at pc otherwise, unless that is
+// known) and returns a register holding its value: the one already holding
+// it, a pool register it is loaded into when wanted again, or scratch.
+func (e *vmEmit) src(pc, r int, scratch Reg) Reg {
+	if !e.know.isInt[r] {
+		e.guardInt(pc, r)
+		e.know.isInt[r] = true
+	}
+	if m, ok := e.holds[r]; ok {
+		e.pinned[m] = true
+		return m
+	}
+	if u := e.nextUse(r, pc); u >= 0 {
+		if m, ok := e.alloc(pc, u, false); ok {
+			e.a.MovRegMemD(m, RSI, e.d(r, e.lay.OffI))
+			e.holds[r] = m
+			return m
+		}
+	}
+	e.a.MovRegMemD(scratch, RSI, e.d(r, e.lay.OffI))
+	return scratch
+}
+
+// needNoS exits at pc unless r[r] holds no string or blob, unless known.
+func (e *vmEmit) needNoS(pc, r int) {
+	if !e.know.noS[r] {
+		e.guardNoS(pc, r)
+		e.know.noS[r] = true
+	}
+}
+
+// dest is the register to compute r's new value in: a pool register when the
+// run reads r again, else scratch.
+func (e *vmEmit) dest(pc, r int, scratch Reg) Reg {
+	if u := e.nextUse(r, pc); u >= 0 {
+		if m, ok := e.alloc(pc, u, false); ok {
+			return m
+		}
+	}
+	return scratch
+}
+
+// inPlace is the register holding r's value when the instruction at pc may
+// overwrite it: no later step of the run reads it (or any register sharing
+// it), so the result can be computed there. Otherwise ok is false.
+func (e *vmEmit) inPlace(pc, r int) (Reg, bool) {
+	m, ok := e.holds[r]
+	if !ok {
+		return 0, false
+	}
+	for k, mk := range e.holds {
+		if mk == m && e.nextUse(k, pc) >= 0 {
+			return 0, false
+		}
+	}
+	return m, true
+}
+
+// storeInt makes r[r] the INTEGER in m and records it: only the I word when r
+// is known to hold an integer Value native code wrote. A Dead store is not
+// made at all. Every guard of the instruction has run.
+func (e *vmEmit) storeInt(pc int, in VInsn, r int, m Reg) {
+	for k, mk := range e.holds {
+		if mk == m {
+			delete(e.holds, k) // m now holds r's new value
+		}
+	}
+	if in.Dead {
+		e.clobber(r)
+		return
+	}
+	if e.know.canon[r] {
+		e.a.MovMemDReg(RSI, e.d(r, e.lay.OffI), m)
+	} else {
+		e.writeInt(r, m)
+	}
+	e.unmap(r)
+	e.know.wroteInt(r)
+	if !e.cache {
+		return
+	}
+	if isPool(m) {
+		e.holds[r] = m
+	}
+}
+
+func isPool(m Reg) bool {
+	for _, p := range vmPool {
+		if p == m {
+			return true
+		}
+	}
+	return false
+}
+
+// operand2 loads the two integer operands of r[c] = r[b] op r[a]: x holds
+// r[b] in a register the result may be computed in, y holds r[a].
+func (e *vmEmit) operand2(pc int, in VInsn) (x, y Reg) {
+	y = e.src(pc, in.A, RDX)
+	bm := e.src(pc, in.B, RAX)
+	if !in.Dead {
+		e.needNoS(pc, in.C)
+	}
+	if bm == RAX {
+		return RAX, y
+	}
+	if m, ok := e.inPlace(pc, in.B); ok && m == bm && in.A != in.B {
+		return m, y
+	}
+	x = e.dest(pc, in.C, RAX)
+	e.a.MovRegReg(x, bm)
+	return x, y
+}
+
 func (e *vmEmit) insn(pc int, in VInsn) error {
 	a, L := e.a, e.lay
 	switch in.Op {
 	case VExit:
 		e.exitAt(pc)
+	case VFused:
+		// The instruction before is this one too.
 	case VGoto:
 		e.jmpBlock(pc, in.T)
 	case VInt:
-		e.guardNoS(pc, in.A)
-		a.MovRegImm64(RAX, in.Imm)
-		e.writeInt(in.A, RAX)
+		if in.Dead {
+			e.clobber(in.A)
+			break
+		}
+		e.needNoS(pc, in.A)
+		m := e.dest(pc, in.A, RAX)
+		a.MovRegImm64(m, in.Imm)
+		e.storeInt(pc, in, in.A, m)
 	case VCopy:
-		e.guardNoS(pc, in.A)
-		e.guardNoS(pc, in.B)
+		if in.Dead {
+			e.clobber(in.B)
+			break
+		}
+		e.needNoS(pc, in.A)
+		e.needNoS(pc, in.B)
+		if e.know.canon[in.A] && in.A != in.B {
+			// An integer native code wrote: the copy is one, coalesced with
+			// the source's register when it has one.
+			m := e.src(pc, in.A, RAX)
+			if e.know.canon[in.B] {
+				a.MovMemDReg(RSI, e.d(in.B, L.OffI), m)
+			} else {
+				e.writeInt(in.B, m)
+			}
+			e.unmap(in.B)
+			e.know.wroteInt(in.B)
+			if isPool(m) {
+				e.holds[in.B] = m
+			}
+			break
+		}
 		for _, off := range []int{0, L.OffI, L.OffF} {
 			a.MovRegMemD(RAX, RSI, e.d(in.A, off))
 			a.MovMemDReg(RSI, e.d(in.B, off), RAX)
 		}
+		if in.A != in.B {
+			isInt := e.know.isInt[in.A]
+			e.unmap(in.B)
+			e.know.wroteAny(in.B)
+			if isInt {
+				e.know.isInt[in.B] = true
+			}
+			if m, ok := e.holds[in.A]; ok {
+				e.holds[in.B] = m
+			}
+		}
 	case VAdd, VSub, VMul, VAnd, VOr:
-		e.guardInt(pc, in.B)
-		e.guardInt(pc, in.A)
-		e.guardNoS(pc, in.C)
-		a.MovRegMemD(RAX, RSI, e.d(in.B, L.OffI))
-		op := AluOr
+		x, y := e.operand2(pc, in)
 		switch in.Op {
 		case VAdd:
-			op = AluAdd
+			a.AddRegReg(x, y)
 		case VSub:
-			op = AluSub
+			a.SubRegReg(x, y)
 		case VMul:
-			op = AluImul
+			a.ImulRegReg(x, y)
 		case VAnd:
-			op = AluAnd
+			a.AndRegReg(x, y)
+		default:
+			a.OrRegReg(x, y)
 		}
-		a.AluRegMemD(op, RAX, RSI, e.d(in.A, L.OffI))
 		if in.Op == VAdd || in.Op == VSub || in.Op == VMul {
 			e.jccStub(condOverflow, pc)
 		}
-		e.writeInt(in.C, RAX)
+		e.storeInt(pc, in, in.C, x)
 	case VShl, VShr:
-		e.guardInt(pc, in.B)
-		e.guardInt(pc, in.A)
-		e.guardNoS(pc, in.C)
-		a.MovRegMemD(RCX, RSI, e.d(in.A, L.OffI))
+		sh := e.src(pc, in.A, RCX)
+		if sh != RCX {
+			a.MovRegReg(RCX, sh)
+		}
 		a.CmpRegImm32(RCX, 63)
 		e.jccStub(condAbove, pc) // unsigned: a negative amount is huge
-		a.MovRegMemD(RAX, RSI, e.d(in.B, L.OffI))
+		x, _ := e.operand2(pc, in)
 		if in.Op == VShl {
-			a.ShlRegCL(RAX)
+			a.ShlRegCL(x)
 		} else {
-			a.SarRegCL(RAX)
+			a.SarRegCL(x)
 		}
-		e.writeInt(in.C, RAX)
+		e.storeInt(pc, in, in.C, x)
+	case VDiv, VRem:
+		y := e.src(pc, in.A, R9)
+		bm := e.src(pc, in.B, RAX)
+		if !in.Dead {
+			e.needNoS(pc, in.C)
+		}
+		// A divisor of 0 (NULL) or -1 (the one overflow) is the VDBE's.
+		a.CmpRegImm32(y, 0)
+		e.jccStub(CondE, pc)
+		a.CmpRegImm32(y, -1)
+		e.jccStub(CondE, pc)
+		if bm != RAX {
+			a.MovRegReg(RAX, bm)
+		}
+		a.Cqo()
+		a.IdivReg(y)
+		res := RAX
+		if in.Op == VRem {
+			res = RDX
+		}
+		if m := e.dest(pc, in.C, res); m != res {
+			a.MovRegReg(m, res)
+			res = m
+		}
+		e.storeInt(pc, in, in.C, res)
 	case VCmpJump:
-		e.guardInt(pc, in.B)
-		e.guardInt(pc, in.A)
-		a.MovRegMemD(RAX, RSI, e.d(in.B, L.OffI))
-		a.AluRegMemD(AluCmp, RAX, RSI, e.d(in.A, L.OffI))
+		x := e.src(pc, in.B, RAX)
+		y := e.src(pc, in.A, RDX)
+		a.CmpRegReg(x, y)
 		e.jccBlock(in.Cond, pc, in.T)
-	case VCmpSet:
-		e.guardInt(pc, in.B)
-		e.guardInt(pc, in.A)
-		e.guardNoS(pc, in.C)
-		a.XorRegReg(RDX, RDX) // before the compare: it clears the flags
-		a.MovRegMemD(RAX, RSI, e.d(in.B, L.OffI))
-		a.AluRegMemD(AluCmp, RAX, RSI, e.d(in.A, L.OffI))
-		a.Setcc(in.Cond, RDX)
-		e.writeInt(in.C, RDX)
+	case VCmpSet, VCmpBr:
+		x := e.src(pc, in.B, RAX)
+		y := e.src(pc, in.A, RDX)
+		if !in.Dead {
+			e.needNoS(pc, in.C)
+			a.MovRegImm64(R10, 0) // before the compare: a xor would clear the flags after it
+		}
+		a.CmpRegReg(x, y)
+		if !in.Dead {
+			a.Setcc(in.Cond, R10)
+			m := e.dest(pc, in.C, R10)
+			if m != R10 {
+				a.MovRegReg(m, R10)
+			}
+			e.storeInt(pc, in, in.C, m) // MOVs leave the flags alone
+		} else {
+			e.clobber(in.C)
+		}
+		if in.Op == VCmpBr {
+			c := in.Cond
+			if in.Imm == 0 {
+				c = c.Negate()
+			}
+			e.jccBlock(c, pc, in.T)
+		}
+	case VNot, VNotBr:
+		x := e.src(pc, in.A, RAX)
+		if !in.Dead {
+			e.needNoS(pc, in.C)
+			a.MovRegImm64(R10, 0)
+		}
+		a.TestRegReg(x, x)
+		if !in.Dead {
+			a.Setcc(CondE, R10)
+			m := e.dest(pc, in.C, R10)
+			if m != R10 {
+				a.MovRegReg(m, R10)
+			}
+			e.storeInt(pc, in, in.C, m)
+		} else {
+			e.clobber(in.C)
+		}
+		if in.Op == VNotBr {
+			c := CondE // the NOT is 1: the operand was 0
+			if in.Imm == 0 {
+				c = CondNE
+			}
+			e.jccBlock(c, pc, in.T)
+		}
 	case VNullJump:
+		if e.know.isInt[in.A] {
+			// An INTEGER is not NULL.
+			if in.Imm == 0 {
+				e.jmpBlock(pc, in.T)
+			}
+			break
+		}
 		a.CmpMemDByte(RSI, e.d(in.A, L.OffTyp), L.TypNull)
 		if in.Imm != 0 {
 			e.jccBlock(CondE, pc, in.T)
@@ -250,18 +644,44 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 			e.jccBlock(CondNE, pc, in.T)
 		}
 	case VNull:
-		e.guardNoS(pc, in.C)
+		if in.Dead {
+			e.clobber(in.C)
+			break
+		}
+		e.needNoS(pc, in.C)
 		a.MovMemDImm(RSI, e.d(in.C, 0), int32(L.TypNull))
 		a.MovMemDImm(RSI, e.d(in.C, L.OffI), 0)
 		a.MovMemDImm(RSI, e.d(in.C, L.OffF), 0)
+		e.unmap(in.C)
+		e.know.wroteAny(in.C)
 	case VNeg:
-		e.guardInt(pc, in.A)
-		e.guardNoS(pc, in.C)
-		a.MovRegMemD(RAX, RSI, e.d(in.A, L.OffI))
-		a.NegReg(RAX)
+		am := e.src(pc, in.A, RAX)
+		if !in.Dead {
+			e.needNoS(pc, in.C)
+		}
+		x := RAX
+		if m, ok := e.inPlace(pc, in.A); ok && m == am {
+			x = m
+		} else {
+			x = e.dest(pc, in.C, RAX)
+			if x != am {
+				a.MovRegReg(x, am)
+			}
+		}
+		a.NegReg(x)
 		e.jccStub(condOverflow, pc) // -MinInt64 is the VDBE's
-		e.writeInt(in.C, RAX)
+		e.storeInt(pc, in, in.C, x)
 	case VIf:
+		if e.know.isInt[in.A] {
+			x := e.src(pc, in.A, RAX)
+			a.TestRegReg(x, x)
+			if in.Imm != 0 {
+				e.jccBlock(CondNE, pc, in.T)
+			} else {
+				e.jccBlock(CondE, pc, in.T)
+			}
+			break
+		}
 		// An INTEGER jumps on its truth; a NULL jumps when C says so; anything
 		// else is the VDBE's.
 		a.CmpMemDByte(RSI, e.d(in.A, L.OffTyp), L.TypInt)
@@ -282,8 +702,9 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 			e.jmpBlock(pc, in.T)
 		}
 		patch(a.buf, done+1, len(a.buf))
+		// Falling past here, r[A] was an integer or a NULL.
 	case VGosub:
-		e.guardNoS(pc, in.A)
+		e.needNoS(pc, in.A)
 		a.MovRegImm64(RAX, int64(pc))
 		e.writeInt(in.A, RAX)
 		e.jmpBlock(pc, in.T)
@@ -297,37 +718,13 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		a.Jcc(CondE, "exitrcx")
 		a.Jmp("dispatch")
 	case VColumn:
-		// The cursor's current row's column B, copied word for word when the
-		// value holds no string or blob (see VCursor for what native code may
-		// assume of a cursor). R9/R10/RDX are scratch.
-		cb := int32(in.A * VCursorSize)
-		vb := int32(in.B) * int32(L.Size)
-		a.MovRegMemD(RAX, RDI, POffCur)
-		a.CmpMemDImm8(RAX, cb+VCursorOffOk, 0)
-		e.jccStub(CondE, pc)
-		a.MovRegMemD(RDX, RAX, cb+VCursorOffMask) // the column must be one the engine made readable
-		a.MovRegImm64(R10, int64(1)<<uint(in.B))
-		a.TestRegReg(RDX, R10)
-		e.jccStub(CondE, pc)
-		a.MovRegMemD(RDX, RAX, cb+VCursorOffPos)
-		a.AluRegMemD(AluCmp, RDX, RAX, cb+VCursorOffN)
-		e.jccStub(condAboveEq, pc) // unsigned: a position before the first row is huge
-		a.MovRegImm64(R9, sliceHeaderSize)
-		a.ImulRegReg(RDX, R9)
-		a.MovRegMemD(R9, RAX, cb+VCursorOffRows)
-		a.AddRegReg(R9, RDX)
-		a.MovRegMemD(R10, R9, 8) // the row's length
-		a.CmpRegImm32(R10, int32(in.B))
-		e.jccStub(condBelowEq, pc) // a row narrower than the column: the VDBE's
-		a.MovRegMemD(R9, R9, 0)    // the row's first Value
-		a.CmpMemDImm8(R9, vb+int32(L.OffS), 0)
-		e.jccStub(CondNE, pc)
-		e.guardNoS(pc, in.C)
-		for _, off := range []int{0, L.OffI, L.OffF} {
-			a.MovRegMemD(RDX, R9, vb+int32(off))
-			a.MovMemDReg(RSI, e.d(in.C, off), RDX)
+		if in.Dead {
+			e.clobber(in.C)
+			break
 		}
+		e.column(pc, in)
 	case VRewind:
+		e.unmap(^in.A)
 		cb := int32(in.A * VCursorSize)
 		a.MovRegMemD(RAX, RDI, POffCur)
 		a.CmpMemDImm8(RAX, cb+VCursorOffOk, 0)
@@ -343,6 +740,7 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		patch(a.buf, nonEmpty+2, len(a.buf))
 		a.MovMemDImm(RAX, cb+VCursorOffLast, 0)
 	case VNext:
+		e.unmap(^in.A)
 		cb := int32(in.A * VCursorSize)
 		a.MovRegMemD(RAX, RDI, POffCur)
 		a.CmpMemDImm8(RAX, cb+VCursorOffOk, 0)
@@ -365,8 +763,105 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 	return nil
 }
 
+// column is VColumn: r[C] = column B of cursor A's current row. R9/R10/RDX
+// are scratch.
+//
+// The cursor's checks -- usable, positioned on a row, the row wide enough, the
+// column readable -- are made by the first VColumn of the cursor in a run for
+// every column the run reads from it before anything moves it, and the row's
+// address is kept in a pool register for the rest; a later VColumn of the same
+// cursor only checks its own value for a string. When one of those checks
+// fails, native code exits at the FIRST VColumn, before anything of the run
+// past it has run, which the VDBE then runs itself.
+func (e *vmEmit) column(pc int, in VInsn) {
+	a, L := e.a, e.lay
+	cb := int32(in.A * VCursorSize)
+	vb := int32(in.B) * int32(L.Size)
+	row, have := e.holds[^in.A]
+	if have {
+		e.pinned[row] = true
+	} else {
+		mask, maxCol := uint64(1)<<uint(in.B), in.B
+		if e.cache {
+			mask, maxCol = vmRunColumns(e.prog, e.bound, pc, mask, maxCol)
+		}
+		a.MovRegMemD(RAX, RDI, POffCur)
+		a.CmpMemDImm8(RAX, cb+VCursorOffOk, 0)
+		e.jccStub(CondE, pc)
+		a.MovRegMemD(RDX, RAX, cb+VCursorOffMask) // the columns must be ones the engine made readable
+		a.MovRegImm64(R10, int64(mask))
+		a.AndRegReg(RDX, R10)
+		a.CmpRegReg(RDX, R10)
+		e.jccStub(CondNE, pc)
+		a.MovRegMemD(RDX, RAX, cb+VCursorOffPos)
+		a.AluRegMemD(AluCmp, RDX, RAX, cb+VCursorOffN)
+		e.jccStub(condAboveEq, pc) // unsigned: a position before the first row is huge
+		a.MovRegImm64(R9, sliceHeaderSize)
+		a.ImulRegReg(RDX, R9)
+		a.MovRegMemD(R9, RAX, cb+VCursorOffRows)
+		a.AddRegReg(R9, RDX)
+		a.MovRegMemD(R10, R9, 8) // the row's length
+		a.CmpRegImm32(R10, int32(maxCol))
+		e.jccStub(condBelowEq, pc) // a row narrower than the column: the VDBE's
+		row = R9
+		if u := e.nextUse(^in.A, pc); u >= 0 {
+			if m, ok := e.alloc(pc, u, true); ok {
+				row = m
+				e.holds[^in.A] = m
+			}
+		}
+		a.MovRegMemD(row, R9, 0) // the row's first Value
+	}
+	a.CmpMemDImm8(row, vb+int32(L.OffS), 0)
+	e.jccStub(CondNE, pc)
+	e.needNoS(pc, in.C)
+	val := RDX
+	if u := e.nextUse(in.C, pc); u >= 0 {
+		if m, ok := e.alloc(pc, u, false); ok {
+			val = m
+		}
+	}
+	a.MovRegMemD(RDX, row, vb)
+	a.MovMemDReg(RSI, e.d(in.C, 0), RDX)
+	a.MovRegMemD(val, row, vb+int32(L.OffI))
+	a.MovMemDReg(RSI, e.d(in.C, L.OffI), val)
+	a.MovRegMemD(RDX, row, vb+int32(L.OffF))
+	a.MovMemDReg(RSI, e.d(in.C, L.OffF), RDX)
+	for k, m := range e.holds {
+		if m == val && k != ^in.A {
+			delete(e.holds, k)
+		}
+	}
+	e.unmap(in.C)
+	e.know.wroteAny(in.C)
+	if val != RDX {
+		e.holds[in.C] = val // its I word; whether it is an INTEGER is still to be checked
+	}
+}
+
 // patch writes the rel32 at buf[at:] so it lands on target.
 func patch(buf []byte, at, target int) {
 	rel := int32(target - (at + 4))
 	buf[at], buf[at+1], buf[at+2], buf[at+3] = byte(rel), byte(rel>>8), byte(rel>>16), byte(rel>>24)
+}
+
+// padNops pads a's code to a multiple of align with the recommended
+// multi-byte NOPs, the fewest instructions that fill the gap.
+func padNops(a *Asm, align int) {
+	nops := [][]byte{
+		{0x90},
+		{0x66, 0x90},
+		{0x0F, 0x1F, 0x00},
+		{0x0F, 0x1F, 0x40, 0x00},
+		{0x0F, 0x1F, 0x44, 0x00, 0x00},
+		{0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00},
+		{0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00},
+		{0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00},
+		{0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00},
+	}
+	for gap := (align - len(a.buf)%align) % align; gap > 0; {
+		k := min(gap, len(nops))
+		a.emit(nops[k-1]...)
+		gap -= k
+	}
 }

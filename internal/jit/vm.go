@@ -79,6 +79,22 @@ const (
 	// VNext: advance cursor A one row and jump to T if it is on one; fall
 	// through when it ran off the end. A cursor that is not usable exits.
 	VNext
+	// VDiv, VRem: r[C] = r[B] / r[A] or r[B] % r[A], integers (truncating), for
+	// a divisor other than 0 and -1 (which exit: NULL, and the one overflow).
+	VDiv
+	VRem
+	// VNot: r[C] = 1 if r[A] is the integer 0, 0 for any other integer.
+	VNot
+	// VCmpBr is a VCmpSet at its pc fused with the VIf at the next that tests
+	// its result: compare r[B] Cond r[A], store the 0 or 1 in r[C] unless Dead,
+	// and jump to T when the result is Imm. The next pc is VFused.
+	VCmpBr
+	// VNotBr is a VNot fused the same way: r[C] = !r[A] unless Dead, jump to T
+	// when that is Imm.
+	VNotBr
+	// VFused: the second half of the fused instruction at the pc before. It
+	// emits nothing; native code never enters or jumps to it.
+	VFused
 )
 
 // VInsn is one instruction of a VM program: the one at its index's pc.
@@ -88,6 +104,9 @@ type VInsn struct {
 	T       int
 	Imm     int64
 	Cond    Cond
+	// Dead: no instruction reads the register this one writes before it is
+	// written again (the fusion pass's liveness), so its store may be skipped.
+	Dead bool
 }
 
 // VCursor is native code's view of one materialized cursor: the rows the
