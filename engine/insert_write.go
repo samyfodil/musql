@@ -84,6 +84,9 @@ type insertStmt struct {
 // update silently.
 type upsertClause struct {
 	targetCols []string
+	// targetQuals parallels targetCols: the "schema." / "table." qualifiers
+	// written before each target column (nil entries when unqualified).
+	targetQuals [][]string
 	// targetCollations parallels targetCols: an explicit "COLLATE name" on
 	// that target column, or "". C's conflict target is a sortlist
 	// (parse.y:1100); this engine accepts the "column [COLLATE name]
@@ -128,7 +131,7 @@ func parseInsertStmt(sqlText string) (*insertStmt, error) {
 		p.next()
 	}
 	if p.peek().kind != tkEOF {
-		return nil, fmt.Errorf("engine: INSERT: unexpected trailing input near %q", p.tokenDesc(p.peek()))
+		return nil, fmt.Errorf("engine: near %q: syntax error", p.tokenDesc(p.peek()))
 	}
 	stmt.params = p.params.info()
 	return stmt, nil
@@ -418,11 +421,21 @@ func parseUpsertClause(p *parser) (*upsertClause, error) {
 			// target stays declined.
 			save := p.pos
 			ct := p.peek()
+			// "[[schema.]table.]column": the target is resolved like any
+			// expression (upsert.c:119), so the table must be the INSERT's own
+			// (validated against it in emitUpsertTail).
+			var quals []string
+			for p.peek().kind == tkIdent && p.peekAt(1).kind == tkPunct && p.peekAt(1).text == "." && len(quals) < 2 {
+				quals = append(quals, p.peek().text)
+				p.next()
+				p.next()
+			}
 			cname, collate, _, ok := tryParseSimpleIndexColumn(p)
 			if !ok {
 				p.pos = save
 				return nil, fmt.Errorf("engine: INSERT: expected column name in ON CONFLICT target, got %q", p.tokenDesc(ct))
 			}
+			up.targetQuals = append(up.targetQuals, quals)
 			up.targetCols = append(up.targetCols, cname)
 			up.targetCollations = append(up.targetCollations, collate)
 			if p.peekIsPunct(",") {
@@ -902,23 +915,32 @@ func checkStrictColumnTypes(tbl *tableMeta, full []Value) error {
 		if st == strictColAny || full[i].Typ == Null {
 			continue
 		}
-		want := Null
-		switch st {
-		case strictColBlob:
-			want = Blob
-		case strictColInt, strictColInteger:
-			want = Int
-		case strictColReal:
-			want = Float
-		case strictColText:
-			want = Text
-		}
-		if full[i].Typ != want {
+		if !strictValueFits(st, full[i]) {
 			return &strictTypeError{msg: fmt.Sprintf("cannot store %s value in %s column %s.%s",
 				strictValueTypeName(full[i].Typ), st, tbl.name, c.Name)}
 		}
 	}
 	return nil
+}
+
+// strictValueFits reports whether v, after affinity, is storable in a STRICT
+// column of type st (NULL always is).
+func strictValueFits(st strictColType, v Value) bool {
+	if st == strictColAny || v.Typ == Null {
+		return true
+	}
+	want := Null
+	switch st {
+	case strictColBlob:
+		want = Blob
+	case strictColInt, strictColInteger:
+		want = Int
+	case strictColReal:
+		want = Float
+	case strictColText:
+		want = Text
+	}
+	return v.Typ == want
 }
 
 // strictTypeError is checkStrictColumnTypes' own error type. It carries no
@@ -1798,7 +1820,7 @@ func validateFromTablesExist(pager *ReadOnlyPager, items []FromItem) error {
 			if isEponymousVtabName(it.Table) {
 				continue
 			}
-			return err
+			return relabelMissingTable(it, err)
 		}
 	}
 	return nil
@@ -2068,6 +2090,15 @@ func (db *DB) Exec(sqlText string) error {
 	return err
 }
 
+// statementStartWords are the keywords a statement can begin with in C's
+// grammar (parse.y's cmd and cmdx rules).
+var statementStartWords = map[string]bool{
+	"ALTER": true, "ANALYZE": true, "ATTACH": true, "BEGIN": true, "COMMIT": true, "CREATE": true,
+	"DELETE": true, "DETACH": true, "DROP": true, "END": true, "EXPLAIN": true, "INSERT": true,
+	"PRAGMA": true, "REINDEX": true, "RELEASE": true, "REPLACE": true, "ROLLBACK": true,
+	"SAVEPOINT": true, "SELECT": true, "UPDATE": true, "VACUUM": true, "VALUES": true, "WITH": true,
+}
+
 // unsupportedStatementErr is the one "this write path does not run that"
 // error. It is raised at COMPILE time, by the write compiler's own dispatch
 // tail (compileWriteProgram, vdbe_write.go), for every verb it has no case
@@ -2083,6 +2114,11 @@ func unsupportedStatementErr(trimmed string) error {
 				return perr
 			}
 		}
+	}
+	// A first token that begins no statement at all is a syntax error AT that
+	// token (parse.y's cmd grammar), the way a shell's ".schema" reaches C.
+	if toks, lerr := lex(trimmed); lerr == nil && len(toks) > 0 && toks[0].kind != tkEOF && !statementStartWords[strings.ToUpper(toks[0].text)] {
+		return fmt.Errorf("engine: near %q: syntax error", toks[0].text)
 	}
 	return fmt.Errorf("engine: unsupported statement (this write path only supports CREATE TABLE/VIEW/TRIGGER, CREATE/DROP INDEX, DROP TABLE/VIEW/TRIGGER, INSERT, UPDATE, DELETE, ATTACH/DETACH, BEGIN/COMMIT/END/ROLLBACK, and SAVEPOINT/RELEASE/ROLLBACK TO): %q", trimmed)
 }

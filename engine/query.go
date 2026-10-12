@@ -301,6 +301,11 @@ func (p *ReadOnlyPager) hintedIndexRow(name, table string, scope schemaScope) (*
 type outputColumn struct {
 	expr Expr
 	name string
+	// aliased: the name was written with AS. Only such a name is what
+	// resolveAsName matches an ORDER BY term against (resolve.c's ENAME_NAME);
+	// an implicit name ("SELECT a ... ORDER BY a") is resolved as an ordinary
+	// expression.
+	aliased bool
 }
 
 // Query parses and executes a single read-only SELECT statement (see the
@@ -595,7 +600,7 @@ func (p *ReadOnlyPager) execNoFrom(stmt *SelectStmt, outer *evalCtx, params []Va
 		// wrapping it in "not compilable to bytecode ... (no fallback)" both
 		// buried the real diagnosis and put text in front of it that real
 		// SQLite has no counterpart for. See subquery_validate.go.
-		if errors.Is(verr, errVDBESemantic) {
+		if errors.Is(verr, errVDBESemantic) || isAmbiguousNameErr(verr) {
 		return nil, nil, verr
 		}
 		if verr != nil {
@@ -619,7 +624,7 @@ func (p *ReadOnlyPager) execNoFrom(stmt *SelectStmt, outer *evalCtx, params []Va
 	// wrapping it in "not compilable to bytecode ... (no fallback)" both
 	// buried the real diagnosis and put text in front of it that real
 	// SQLite has no counterpart for. See subquery_validate.go.
-	if errors.Is(verr, errVDBESemantic) {
+	if errors.Is(verr, errVDBESemantic) || isAmbiguousNameErr(verr) {
 	return nil, nil, verr
 	}
 	if verr != nil {
@@ -1192,7 +1197,7 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 		// wrapping it in "not compilable to bytecode ... (no fallback)" both
 		// buried the real diagnosis and put text in front of it that real
 		// SQLite has no counterpart for. See subquery_validate.go.
-		if errors.Is(verr, errVDBESemantic) {
+		if errors.Is(verr, errVDBESemantic) || isAmbiguousNameErr(verr) {
 		return nil, nil, verr
 		}
 		if verr != nil {
@@ -1241,13 +1246,20 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 	// wrapping it in "not compilable to bytecode ... (no fallback)" both
 	// buried the real diagnosis and put text in front of it that real
 	// SQLite has no counterpart for. See subquery_validate.go.
-	if errors.Is(verr, errVDBESemantic) {
+	if errors.Is(verr, errVDBESemantic) || isAmbiguousNameErr(verr) {
 	return nil, nil, verr
 	}
 	if verr != nil {
 		return nil, nil, fmt.Errorf("engine: VDBE-only: %w (no fallback)", verr)
 	}
 	return nil, nil, fmt.Errorf("engine: VDBE-only: statement not compilable to bytecode (no fallback)")
+}
+
+// isAmbiguousNameErr reports the resolver's "ambiguous column name"
+// (resolve.c:784), which scope lookups return unwrapped. It is the statement's
+// own error, so the VDBE-only wrappers must not bury it.
+func isAmbiguousNameErr(err error) bool {
+	return err != nil && strings.HasPrefix(err.Error(), "engine: ambiguous column name: ")
 }
 
 // normalizeRow turns a raw decoded record into the values SQL sees: it puts the
@@ -2034,7 +2046,7 @@ func expandSelectList(sel []SelectColumn, scopes []tableScope, mode colNameMode)
 				}
 			}
 		}
-		out = append(out, outputColumn{expr: sc.Expr, name: name})
+		out = append(out, outputColumn{expr: sc.Expr, name: name, aliased: sc.HasAlias})
 	}
 	return out, nil
 }

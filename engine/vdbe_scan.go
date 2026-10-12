@@ -482,7 +482,9 @@ func compileScanPlain(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols 
 	unproven := !c.planNRowOK && aggSourcesArePlainTables(srcs) && !joinHasRightOuter(srcs) && (stmt.Limit != nil || stmt.Offset != nil ||
 		stmt.LimitParam != nil || stmt.OffsetParam != nil || c.outer != nil) &&
 		!anchorPlanOrderProvable(c.pager, c, srcs, tableScopesOf(srcs), stmt)
-	if unproven && (stmt.Limit != nil || stmt.Offset != nil || stmt.LimitParam != nil || stmt.OffsetParam != nil) {
+	// LIMIT 0 keeps no row whatever order they arrive in.
+	limitZero := stmt.Limit != nil && *stmt.Limit == 0
+	if unproven && !limitZero && (stmt.Limit != nil || stmt.Offset != nil || stmt.LimitParam != nil || stmt.OffsetParam != nil) {
 		return nil, fmt.Errorf("%w: LIMIT/OFFSET with no ORDER BY over rows whose arrival order is not provably C SQLite's (see anchorPlanOrderProvable)", errVDBEUnsupported)
 	}
 	defer func() {

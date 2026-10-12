@@ -716,6 +716,17 @@ func (db *DB) compileWriteProgram(sqlText string) (*Program, error) {
 	if len(toks) == 0 || toks[0].kind == tkEOF {
 		return compileNoopWrite(), nil
 	}
+	// ...and so is a lone ";" (parse.y's "ecmd ::= SEMI"), however many.
+	onlySemis := true
+	for _, t := range toks {
+		if t.kind != tkEOF && !(t.kind == tkPunct && t.text == ";") {
+			onlySemis = false
+			break
+		}
+	}
+	if onlySemis {
+		return compileNoopWrite(), nil
+	}
 	if toks[0].kind != tkIdent {
 		return nil, unsupportedStatementErr(strings.TrimSpace(sqlText))
 	}
@@ -807,6 +818,9 @@ func (db *DB) compileWriteProgram(sqlText string) (*Program, error) {
 		// token, "incomplete input" when the statement just ended (parse.y:
 		// 44-51). See txnStmtSyntaxErr.
 		if serr := txnStmtSyntaxErr(toks); serr != nil {
+			return nil, serr
+		}
+		if serr := txnWholeStmtSyntaxErr(strings.TrimSpace(sqlText), toks); serr != nil {
 			return nil, serr
 		}
 	}
@@ -935,7 +949,7 @@ func (db *DB) compileInsertStmt(stmt *insertStmt, trig *trigCompileCtx) (*Progra
 		if trig != nil {
 			return nil, fmt.Errorf("%w: no such table: %s", errVDBEUnsupported, stmt.table)
 		}
-		return nil, semanticf("engine: no such table: %s", stmt.table)
+		return nil, semanticf("engine: no such table: %s", qualifiedTableName(stmt.schema, stmt.table))
 	}
 	// See table_load.go's package doc comment: this compile-time target
 	// resolution is one of the choke points that must load tbl before the
@@ -1208,6 +1222,9 @@ func (c *compiler) emitUpsertTail(db *DB, tbl *tableMeta, stmt *insertStmt, plan
 	var keys []string
 	nUpdate := 0
 	for up := stmt.upsert; up != nil; up = up.next {
+		if err := validateUpsertTargetQualifiers(stmt, tbl, up); err != nil {
+			return nil, err
+		}
 		if err := validateUpsertTarget(db, tbl, up.targetCols, up.targetCollations, up.targetWhere); err != nil {
 			return nil, declineOrSemantic(err)
 		}
@@ -2404,7 +2421,7 @@ func (db *DB) compileDeleteStmt(stmt *deleteStmt, trig *trigCompileCtx) (*Progra
 		if trig != nil {
 			return nil, fmt.Errorf("%w: no such table: %s", errVDBEUnsupported, stmt.table)
 		}
-		return nil, semanticf("engine: no such table: %s", stmt.table)
+		return nil, semanticf("engine: no such table: %s", qualifiedTableName(stmt.schema, stmt.table))
 	}
 	// See table_load.go's package doc comment.
 	if err := db.ensureTableLoaded(tbl); err != nil {
@@ -2650,7 +2667,7 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 		if trig != nil {
 			return nil, fmt.Errorf("%w: no such table: %s", errVDBEUnsupported, stmt.table)
 		}
-		return nil, semanticf("engine: no such table: %s", stmt.table)
+		return nil, semanticf("engine: no such table: %s", qualifiedTableName(stmt.schema, stmt.table))
 	}
 	// See table_load.go's package doc comment.
 	if err := db.ensureTableLoaded(tbl); err != nil {
@@ -3055,7 +3072,22 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 	// Re-derive generated columns from the NEW values before CHECK, so a CHECK over
 	// a generated column sees the new value.
 	if hasGeneratedCols(tbl.cols) {
+		// A SET of the rowid alias leaves its slot NULL (the rowid register
+		// carries the value); a generated column reading it must see the new
+		// rowid, as it does through opUpdateRow's own recompute.
+		ipkSet := false
+		if tbl.ipkIndex >= 0 {
+			for _, idx := range colIdx {
+				ipkSet = ipkSet || idx == tbl.ipkIndex
+			}
+		}
+		if ipkSet {
+			c.emit(Instruction{Op: OpSCopy, P1: rowidReg, P2: rowBase + tbl.ipkIndex})
+		}
 		c.emit(Instruction{Op: OpComputeGenerated, P1: rowBase, P4: tbl})
+		if ipkSet {
+			c.emit(Instruction{Op: OpNull, P2: rowBase + tbl.ipkIndex}) // stored NULL again
+		}
 	}
 	// STRICT type check over the full post-SET row, after OpComputeGenerated, so a
 	// generated column's new value is checked (C type-checks a VIRTUAL generated
@@ -4561,7 +4593,15 @@ func (db *DB) compileInsertSelectWrite(stmt *insertStmt, tbl *tableMeta, colIdx 
 // (insert.c:2007): REPLACE substitutes the DEFAULT and re-checks as ABORT,
 // IGNORE jumps to ignoreDest, anything else halts.
 func (c *compiler) emitUpdateNotNull(tbl *tableMeta, stmt *updateStmt, colIdx []int, rowBase int, skips *[]int) error {
-	for _, idx := range colIdx {
+	// A generated column is recomputed from the SET columns it reads, so its
+	// NOT NULL is checked too (sqlite3Update marks it changed, update.c:~600).
+	checked := slices.Clone(colIdx)
+	for i, col := range tbl.cols {
+		if col.IsGenerated() && col.NotNull && !slices.Contains(checked, i) {
+			checked = append(checked, i)
+		}
+	}
+	for _, idx := range checked {
 		if idx == noColumnRowidTarget || idx == tbl.ipkIndex || !tbl.cols[idx].NotNull {
 			continue
 		}

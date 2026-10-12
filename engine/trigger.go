@@ -1002,6 +1002,8 @@ func (db *DB) resolveCreateTriggerAttachedTarget(stmt *parsedCreateTrigger) (*at
 		if ad := db.firstAttachedTable(stmt.table); ad != nil {
 			return ad, nil
 		}
+		// The TEMP/MAIN/attached search leaves the name unqualified (build.c:373).
+		return nil, fmt.Errorf("engine: no such table: %s", stmt.table)
 	}
 	return nil, fmt.Errorf("engine: no such table: main.%s", stmt.table)
 }

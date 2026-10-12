@@ -3862,6 +3862,11 @@ func orderIsGroupKeyAscending(stmt *SelectStmt, gp *groupByPlan) bool {
 		if !exprEqual(ot.Expr, gp.groupExprs[i]) {
 			return false
 		}
+		// A bare name that is a result alias sorts by the aliased column
+		// (resolveAsName), not by the group key of the same spelling.
+		if colRef, ok := ot.Expr.(ColumnExpr); ok && colRef.Qualifier == "" && findOutputColByName(gp.outCols, colRef.Name) >= 0 {
+			return false
+		}
 	}
 	return true
 }

@@ -319,7 +319,7 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 						rows = vrows
 						rowids = vrowids
 					} else {
-						return nil, nil, terr // preserve the original "no such table" error
+						return nil, nil, relabelMissingTable(it, terr) // the original "no such table" error
 					}
 				} else {
 					if it.IndexedBy != "" {
@@ -570,21 +570,26 @@ type derivedSelectScope struct {
 }
 
 func (p *ReadOnlyPager) derivedSelectScope(sub *SelectStmt, n int) derivedSelectScope {
-	if sub == nil || len(sub.From) == 0 {
+	if sub == nil {
 		return derivedSelectScope{}
 	}
-	// Only the tables' columns are read from here on, never their rows: a
-	// base table's are left unloaded. Loading them made every compile of
-	// "... WHERE id = (SELECT max(id) FROM t)" read all of t to learn one
-	// column's affinity, and a write statement compiles every time.
-	saved := p.fromColumnsOnly
-	p.fromColumnsOnly = true
-	jts, _, err := p.resolveFrom(sub.From, nil)
-	p.fromColumnsOnly = saved
-	if err != nil {
-		return derivedSelectScope{}
+	// A FROM-less body ("SELECT 1 AS x") has no tables: its columns are all
+	// computed expressions with no affinity, which the empty scope classifies.
+	var scopes []tableScope
+	if len(sub.From) > 0 {
+		// Only the tables' columns are read from here on, never their rows: a
+		// base table's are left unloaded. Loading them made every compile of
+		// "... WHERE id = (SELECT max(id) FROM t)" read all of t to learn one
+		// column's affinity, and a write statement compiles every time.
+		saved := p.fromColumnsOnly
+		p.fromColumnsOnly = true
+		jts, _, err := p.resolveFrom(sub.From, nil)
+		p.fromColumnsOnly = saved
+		if err != nil {
+			return derivedSelectScope{}
+		}
+		scopes = buildScopes(jts)
 	}
-	scopes := buildScopes(jts)
 	outCols, err := expandSelectList(sub.Columns, scopes, defaultColNameMode)
 	if err != nil || len(outCols) != n {
 		return derivedSelectScope{}

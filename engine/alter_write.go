@@ -3391,7 +3391,7 @@ func parseAddColumnDefaultValue(p *parser) (val Value, ok bool, err error) {
 		switch termTok.kind {
 		case tkNumber:
 			p.next()
-			v, nerr := literalNumber(sign + termTok.text)
+			v, nerr := signedLiteralNumber(sign, termTok.text)
 			if nerr != nil {
 				return Value{}, false, nerr
 			}
@@ -3930,12 +3930,39 @@ func (db *DB) addColumn(tbl *tableMeta, def *addColumnDef) error {
 	// temporary tableMeta and checkTableChecks (the same evaluator INSERT/UPDATE
 	// use). ignore_check_constraints applies here as in C, where ADD COLUMN runs
 	// quick_check, one of the flag's enforcement sites.
-	if len(checks) > 0 && tbl.rows.len() > 0 {
-		tmpTbl := addColumnCheckTable(tbl, col, checks)
-		for rowid, vals := range tbl.rows.all() {
-			full := append(append([]Value(nil), vals...), fillVal)
-			if cerr := db.checkTableChecks(tmpTbl, tbl.name, rowid, full); cerr != nil {
-				return fmt.Errorf("engine: ALTER TABLE ADD COLUMN: %w", cerr)
+	//
+	// C runs the same quick_check over the altered table for three findings, each
+	// raised with a fixed message (alter.c): a CHECK, a NOT NULL, and a STRICT
+	// column whose DEFAULT does not fit its type.
+	if tbl.rows.len() > 0 {
+		if tbl.strict && !def.hasGenerated {
+			if st, ok := strictColTypeOf(col.DeclType); ok && !strictValueFits(st, fillVal) {
+				return fmt.Errorf("engine: type mismatch on DEFAULT")
+			}
+		}
+		newCols := append(slices.Clone(tbl.cols), col)
+		notNullGen := def.hasGenerated && col.NotNull
+		if len(checks) > 0 || notNullGen {
+			tmpTbl := addColumnCheckTable(tbl, col, checks)
+			for rowid, vals := range tbl.rows.all() {
+				full := append(append([]Value(nil), vals...), fillVal)
+				if hasGeneratedCols(newCols) {
+					if gerr := computeGeneratedInto(tbl.name, newCols, full); gerr != nil {
+						return gerr
+					}
+				}
+				if notNullGen && full[len(full)-1].Typ == Null {
+					return fmt.Errorf("engine: NOT NULL constraint failed")
+				}
+				if len(checks) > 0 {
+					if cerr := db.checkTableChecks(tmpTbl, tbl.name, rowid, full); cerr != nil {
+						if strings.HasPrefix(cerr.Error(), "CHECK constraint failed") {
+							// The quick_check RAISE carries no expression.
+							return fmt.Errorf("engine: CHECK constraint failed")
+						}
+						return fmt.Errorf("engine: ALTER TABLE ADD COLUMN: %w", cerr)
+					}
+				}
 			}
 		}
 	}
@@ -4039,6 +4066,17 @@ func (db *DB) dropColumn(tbl *tableMeta, colName string) error {
 	dropName := tbl.cols[dropIdx].Name
 	if tbl.ipkIndex == dropIdx {
 		return fmt.Errorf("engine: cannot drop PRIMARY KEY column: %q", dropName)
+	}
+	// The schema reload that follows rejects a table left with generated columns
+	// only (build.c: "must have at least one non-generated column").
+	left := false
+	for i, c := range tbl.cols {
+		if i != dropIdx && !c.IsGenerated() {
+			left = true
+		}
+	}
+	if !left && !tbl.cols[dropIdx].IsGenerated() {
+		return fmt.Errorf("engine: error in table %s after drop column: must have at least one non-generated column", tbl.name)
 	}
 
 	_, _, specs, perr := parseCreateTableColumnsAndAutoIndexes(tbl.sql, tbl.withoutRowid)

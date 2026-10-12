@@ -1253,7 +1253,23 @@ func (c *compiler) compileExistsSubquery(x ExistsExpr) (int, error) {
 	if c.pager == nil && c.liveDB == nil && !selectNeedsNoRowSource(x.Stmt) {
 		return 0, fmt.Errorf("%w: EXISTS subquery outside a cursor-driven scope", errVDBEUnsupported)
 	}
-	prog, err := c.liveSubSelect(x.Stmt)
+	// sqlite3Select (select.c:7640): an EXISTS destination "ignores" DISTINCT and
+	// ORDER BY, so both are dropped before the query is prepared -- the ORDER BY
+	// terms are never evaluated, and a LIMIT/OFFSET counts the plain rows.
+	// Names in the dropped ORDER BY still resolve first (the outer statement's
+	// name resolution has already walked into the subquery), so the full query
+	// is compiled once for its diagnostics.
+	stmt := x.Stmt
+	if stmt != nil && len(stmt.Compound) == 0 && (stmt.Distinct || len(stmt.OrderBy) > 0) {
+		if _, err := c.liveSubSelect(stmt); err != nil {
+			return 0, err
+		}
+		cp := *stmt
+		cp.Distinct = false
+		cp.OrderBy = nil
+		stmt = &cp
+	}
+	prog, err := c.liveSubSelect(stmt)
 	if err != nil {
 		return 0, err
 	}
@@ -1302,7 +1318,7 @@ func (c *compiler) compileExpr(e Expr) (int, error) {
 			// reached here -- the choke point every expression compile
 			// funnels through -- for real: raise it now, mirroring codeInteger
 			// (expr.c:4330) being called only from sqlite3ExprCodeTarget.
-			return 0, errors.New(x.deferredErr)
+			return 0, semanticf("%s", x.deferredErr)
 		}
 		return c.compileLiteral(x.Val), nil
 
@@ -1321,6 +1337,13 @@ func (c *compiler) compileExpr(e Expr) (int, error) {
 		return c.compileIsNull(x)
 
 	case BetweenExpr:
+		// BETWEEN takes scalar operands: a row value on any side is "row value
+		// misused" (expr.c:5617).
+		for _, operand := range []Expr{x.X, x.Lo, x.Hi} {
+			if _, isRow := operand.(RowExpr); isRow {
+				return 0, semanticf("engine: row value misused")
+			}
+		}
 		return c.compileBetween(x)
 
 	case LikeExpr:
@@ -1423,6 +1446,12 @@ func (c *compiler) compileExpr(e Expr) (int, error) {
 		}
 		c.emit(Instruction{Op: OpRaise, P1: int(x.Action), P2: msgReg})
 		return dst, nil
+
+	case RowExpr:
+		// The forms that take a row value (a vector comparison, IN) consume
+		// theirs before this, so one reaching the scalar compiler stands where
+		// a single value is required (expr.c:5617).
+		return 0, semanticf("engine: row value misused")
 
 	default:
 		return 0, fmt.Errorf("%w: expression %T", errVDBEUnsupported, e)
@@ -1533,6 +1562,13 @@ func (c *compiler) fillAffCtx(ctx *evalCtx) *evalCtx {
 	// excludedPseudoRowCols).
 	for _, rs := range c.regScopes {
 		if rs.scope != nil && !rs.mirrorsCursorScope {
+			// An UPDATE's CHECK reads the new row from registers while the
+			// target's own cursor scope is also in view: a second copy of the
+			// same table makes an unqualified column "ambiguous" here and
+			// loses its affinity (CHECK(val > 5) over a TEXT column).
+			if ctxHasSameTable(ctx.tables, rs.scope) {
+				continue
+			}
 			ctx.tables = append(ctx.tables, *rs.scope)
 		}
 	}
@@ -3245,6 +3281,30 @@ func (c *compiler) compileIn(x InExpr) (int, error) {
 	if x.Sub != nil {
 		return c.compileInSubquery(x)
 	}
+	// A row value on the left reaches here only when desugarRowIn declined it;
+	// a list element of another width is C's own error (expr.c:3541), and
+	// anything else is a row-value list this compiler does not lower.
+	if rv, isRow := x.X.(RowExpr); isRow {
+		for _, el := range x.List {
+			n := 1
+			if er, ok := el.(RowExpr); ok {
+				n = len(er.Elems)
+			}
+			if n != len(rv.Elems) {
+				plural := "s"
+				if n == 1 {
+					plural = ""
+				}
+				return 0, semanticf("engine: IN(...) element has %d term%s - expected %d", n, plural, len(rv.Elems))
+			}
+		}
+		return 0, fmt.Errorf("%w: a row-value IN list whose elements cannot be desugared", errVDBEUnsupported)
+	}
+	for _, el := range x.List {
+		if _, isRow := el.(RowExpr); isRow {
+			return 0, semanticf("engine: row value misused")
+		}
+	}
 	xReg, err := c.compileExpr(x.X)
 	if err != nil {
 		return 0, err
@@ -3734,7 +3794,7 @@ func (c *compiler) compileFunc(x FuncExpr) (int, error) {
 			// arguments to function changes()" -- verified directly), so it is
 			// errVDBESemantic: surfacing it is the statement's real error, not
 			// a decline.
-			return 0, semanticf("wrong number of arguments to function %s()", x.Name)
+			return 0, semanticf("wrong number of arguments to function %s()", x.callName())
 		}
 		d := c.alloc()
 		c.emit(Instruction{Op: OpConnState, P3: d, P4: x.Name})
@@ -3757,7 +3817,7 @@ func (c *compiler) compileFunc(x FuncExpr) (int, error) {
 			// errVDBESemantic so it propagates (see compileColumn's "no such column").
 			return 0, semanticf("engine: no such function: %s", x.Name)
 		}
-		if err := misuseOfFuncErrAt(x.Name, x.Over != nil, true); err != nil {
+		if err := misuseOfFuncErrAt(x.callName(), x.Over != nil, true); err != nil {
 			return 0, err
 		}
 		return 0, fmt.Errorf("%w: function %s()", errVDBEUnsupported, x.Name)
@@ -3778,7 +3838,7 @@ func (c *compiler) compileFunc(x FuncExpr) (int, error) {
 			// compilable to bytecode ... (no fallback)", so "SELECT abs(1,2)"
 			// read as an engine limitation where 3.53.3 says plainly
 			// "wrong number of arguments to function abs()".
-			return 0, semanticf("wrong number of arguments to function %s()", x.Name)
+			return 0, semanticf("wrong number of arguments to function %s()", x.callName())
 		}
 	}
 	// FILTER on a non-aggregate is refused by resolve.c (:1297-1299, "FILTER may not

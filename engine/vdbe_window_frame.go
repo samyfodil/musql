@@ -689,8 +689,11 @@ func (m *vdbe) windowNtile(plan *windowPlan, call windowCall, ci int, part []int
 	if err != nil {
 		return err
 	}
-	n, ok := frameIntValue(v)
-	if !ok || n < 1 {
+	// ntileStepFunc reads N with sqlite3_value_int64 (window.c): a REAL
+	// truncates, TEXT and BLOB read their integer prefix, NULL is 0.
+	n64 := castValueEnc(v, "INTEGER", m.encoding())
+	n := n64.I
+	if n64.Typ != Int || n < 1 {
 		return fmt.Errorf("engine: argument of ntile must be a positive integer")
 	}
 	np := int64(len(part))
@@ -730,19 +733,29 @@ func (m *vdbe) windowLeadLag(plan *windowPlan, call windowCall, ci int, part []i
 		// offset -- and "lag(a,1,a*100)" answers 100 for the first row
 		// (verified directly).
 		off := int64(1)
+		offOK := true
 		if len(call.args) > 1 {
 			v, err := m.windowOperand(plan, batch[ri], call.argCol(1))
 			if err != nil {
 				return err
 			}
-			n, ok := frameIntValue(v)
-			if !ok {
-				return fmt.Errorf("engine: second argument to %s must be an integer", call.name)
+			// C adds or subtracts the offset from the rowid and SEEKS the
+			// result (window.c:1969-1980): a NULL or a fractional offset finds
+			// no row, so the default answers, and a non-numeric one is read as
+			// a number by the arithmetic.
+			switch v.Typ {
+			case Null:
+				offOK = false
+			case Text, Blob:
+				v = castValueEnc(v, "NUMERIC", m.encoding())
+				fallthrough
+			default:
+				n, ok := frameIntValue(v)
+				off, offOK = n, ok
 			}
-			off = n
 		}
 		j := int64(k) + dir*off
-		if j >= 0 && j < int64(len(part)) {
+		if offOK && j >= 0 && j < int64(len(part)) {
 			src := part[j]
 			v, err := m.windowOperand(plan, batch[src], call.argCol(0))
 			if err != nil {
@@ -784,7 +797,12 @@ func (m *vdbe) windowFrameValue(plan *windowPlan, call windowCall, ci int, part 
 			if err != nil {
 				return err
 			}
-			n, ok := frameIntValue(v)
+			// windowCheckValue's OP_MustBeInt: NUMERIC affinity first, then it
+			// must be integral.
+			n, ok := int64(0), false
+			if num, nok := frameOffsetNumeric(v); nok {
+				n, ok = frameIntValue(num)
+			}
 			if !ok || n < 1 {
 				return fmt.Errorf("engine: second argument to nth_value must be a positive integer")
 			}
