@@ -1,6 +1,9 @@
 package jit
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+	"time"
+)
 
 // FUSION: the pass every program goes through on its way to an emitter.
 //
@@ -43,13 +46,95 @@ func SetFusion(on bool) { fusionOff.Store(!on) }
 // cache of emitted programs is keyed by.
 func Fusing() bool { return !fusionOff.Load() }
 
-// progFused is insns as EmitProgram compiles them: fused, unless fusion is
-// off.
-func progFused(insns []ProgInsn) []ProgInsn {
-	if fusionOff.Load() {
-		return insns
+// PAY FOR USE. The pass runs only on a program that has a pair it can merge,
+// and the caller knows whether it has one at no cost: it builds the program a
+// step at a time, so it compares each step with the one before as it appends
+// it (Fusable), and hands the answer to EmitProgramFlagged. A program with no
+// such pair -- a single comparison feeding an accumulate, a bare count --
+// goes straight to the emitter, paying neither the liveness pass nor the
+// copy.
+
+// Fusable reports whether next, appended right after prev, makes a pair the
+// fusion pass works on: a comparison and the test of its result, a column
+// load and the comparison reading it, or a step and a copy of what it wrote.
+func Fusable(prev, next ProgInsn) bool {
+	switch prev.Op {
+	case POpCmp:
+		switch next.Op {
+		case POpSkipIfZero:
+			return next.A == prev.A
+		case POpJumpIfZero, POpJumpIfNotZero:
+			return next.B == prev.A
+		}
+	case POpLoadCol:
+		if (next.Op == POpCmp || next.Op == POpCmpSkip || next.Op == POpCmpJump) &&
+			!next.BCol && (next.B == prev.A || next.C == prev.A) {
+			return true
+		}
 	}
-	return Fuse(insns)
+	// A copy of the value just produced: the VDBE's OpSCopy after an
+	// OpColumn, which the lowering keeps step for step -- often a copy
+	// nothing reads, which the pass drops.
+	if next.Op == POpLoadReg {
+		for _, r := range stepOf(prev).defs {
+			if r == next.B {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// AnyFusable is the Fusable flag for a program built without one: every
+// adjacent pair, checked once.
+func AnyFusable(insns []ProgInsn) bool {
+	for i := 1; i < len(insns); i++ {
+		if Fusable(insns[i-1], insns[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// EmitProgram compiles insns into a native row loop: EmitProgramFlagged, with
+// the flag found by looking at every adjacent pair.
+func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
+	return EmitProgramFlagged(insns, nCols, AnyFusable(insns))
+}
+
+// EmitProgramFlagged compiles insns into a native row loop, through the fusion
+// pass when fusable says the program has a pair it merges (and fusion is on).
+func EmitProgramFlagged(insns []ProgInsn, nCols int, fusable bool) ([]byte, error) {
+	progsEmitted.Add(1)
+	if (fusable || fuseAll.Load()) && !fusionOff.Load() {
+		start := time.Now()
+		n := len(insns)
+		insns = Fuse(insns)
+		fuseNanos.Add(int64(time.Since(start)))
+		progsFused.Add(1)
+		if !fusable && len(insns) != n {
+			progsMissed.Add(1) // only under SetFuseAllForTest: the gate would have skipped a change
+		}
+	}
+	return emitProgram(insns, nCols)
+}
+
+// fuseAll runs the pass on every program, flagged or not (SetFuseAllForTest).
+var fuseAll atomic.Bool
+
+// SetFuseAllForTest makes every program go through the fusion pass, as
+// before the Fusable gate, so a test can measure what the gate saves.
+func SetFuseAllForTest(on bool) { fuseAll.Store(on) }
+
+// The pass's own accounting, for measuring what it costs and how often it
+// runs (FusionStatsForTest).
+var progsEmitted, progsFused, progsMissed, fuseNanos atomic.Int64
+
+// FusionStatsForTest reads and clears how many programs were emitted, how
+// many of them went through the fusion pass, the time it took, and -- under
+// SetFuseAllForTest -- how many unflagged programs the pass still changed.
+func FusionStatsForTest() (emitted, fused, missed int64, spent time.Duration) {
+	return progsEmitted.Swap(0), progsFused.Swap(0), progsMissed.Swap(0), time.Duration(fuseNanos.Swap(0))
 }
 
 // progStep is one instruction's contract.
@@ -247,11 +332,14 @@ func Fuse(insns []ProgInsn) []ProgInsn {
 	out := append([]ProgInsn(nil), insns...)
 	for {
 		next, changed := fuseOnce(out)
-		if !changed {
+		out = next
+		// Again only if this pass left a pair to merge: a comparison it fused
+		// whose column load it could not fold in the same pass, say. A pass
+		// that merged everything it found is the last.
+		if !changed || !AnyFusable(out) {
 			fusedSteps.Add(int64(len(insns) - len(out)))
 			return out
 		}
-		out = next
 	}
 }
 
@@ -294,6 +382,21 @@ func fuseOnce(insns []ProgInsn) ([]ProgInsn, bool) {
 				fused, ok = ProgInsn{Op: POpCmpJump, A: j.A, B: in.B, C: in.C, Cond: in.Cond.Negate()}, true
 			}
 			if ok {
+				// The column load right before, feeding only this comparison,
+				// folds in now rather than on another pass: it is dead after
+				// the test (its liveness is unchanged by the merge), and the
+				// comparison is no jump target.
+				if i > 0 && keep[i-1] && !tgt[i] && work[i-1].Op == POpLoadCol && dead(i+1, work[i-1].A) {
+					ld := work[i-1]
+					switch {
+					case fused.B == ld.A && fused.C != ld.A:
+						fused.B, fused.BCol = ld.B, true
+						keep[i-1] = false
+					case fused.C == ld.A && fused.B != ld.A:
+						fused.B, fused.C, fused.BCol, fused.Cond = ld.B, fused.B, true, reverseCond(fused.Cond)
+						keep[i-1] = false
+					}
+				}
 				work[i], keep[i+1], changed = fused, false, true
 				i++
 				continue

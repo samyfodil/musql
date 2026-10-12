@@ -36,8 +36,7 @@ const (
 // reads the counts POpAccSum and friends leave there. The row index counts
 // from -n up to 0 like the native loops, so the POpEmitRow selection means
 // the same thing on every architecture.
-func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
-	insns = progFused(insns)
+func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	if nCols > MaxProgCols {
 		return nil, fmt.Errorf("jit: %d column blocks, max %d", nCols, MaxProgCols)
 	}

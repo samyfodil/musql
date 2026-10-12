@@ -9,8 +9,7 @@ import (
 
 // EmitProgram compiles an instruction list into a native row loop. The loop
 // is emitted once per program; the body is whatever the instruction list says.
-func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
-	insns = progFused(insns)
+func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	if nCols > MaxProgCols {
 		return nil, fmt.Errorf("jit: %d column blocks, max %d", nCols, MaxProgCols)
 	}

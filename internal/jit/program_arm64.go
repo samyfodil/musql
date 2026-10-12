@@ -9,8 +9,7 @@ import (
 
 // EmitProgram compiles an instruction list into a native row loop (arm64 version).
 // Separate from program_amd64.go because the architectures differ at instruction level.
-func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
-	insns = progFused(insns)
+func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	if nCols > MaxProgCols {
 		return nil, fmt.Errorf("jit: %d column blocks, max %d", nCols, MaxProgCols)
 	}

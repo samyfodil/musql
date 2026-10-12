@@ -35,7 +35,7 @@ func segProgKernel(low *segLowered) *jit.Code {
 		}
 		return c.(*jit.Code)
 	}
-	code, err := jit.EmitProgram(low.insns, len(low.cols))
+	code, err := jit.EmitProgramFlagged(low.insns, len(low.cols), low.fusable)
 	if err != nil {
 		segProgCache.Store(key, (*jit.Code)(nil))
 		return nil
