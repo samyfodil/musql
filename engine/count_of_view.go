@@ -265,7 +265,18 @@ func countOfViewProbeResolves(p *ReadOnlyPager, arms []*SelectStmt, outer *compi
 			probe = &cp
 		}
 		if _, err := compileSubProgram(p, probe, outer); err != nil {
-			return false
+			// A call recorded for an owner makes it recompile as an aggregate
+			// query; refuse here so that recompile sees the arm as written.
+			for oc := outer; oc != nil; oc = oc.outer {
+				if oc.hoist != nil && len(oc.hoist.specs) > 0 {
+					return false
+				}
+			}
+			// Otherwise no query can take the call (its owner holds it outside
+			// its select list): C deletes the arm before that matters, as
+			// aggnested.test's dbsqlfuzz statement shows, so only the names
+			// the arm resolves are left to check.
+			return countOfViewProbeNames(p, arms, outer, rowOuter)
 		}
 	}
 	return true

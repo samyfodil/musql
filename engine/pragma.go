@@ -3305,7 +3305,7 @@ func (p *ReadOnlyPager) pragmaTableInfo(scope schemaScope, tableName string, ext
 					// engine's hidden-column sets are not verified against
 					// the oracle's for every module). Declined rather than
 					// silently answering the table_info-shaped subset.
-					return nil, nil, fmt.Errorf("engine: unsupported PRAGMA table_xinfo on eponymous virtual table %s", tableName)
+					return nil, nil, fmt.Errorf("%w: PRAGMA table_xinfo on eponymous virtual table %s", errVDBEUnsupported, tableName)
 				}
 				rows = [][]Value{}
 				cid := 0
