@@ -231,6 +231,21 @@ type compiler struct {
 	// to pick the per-field comparison or the general vector comparison.
 	inWhereConjunct bool
 
+	// existsJoin is set while the select of an EXISTS is compiled that C's
+	// existsToJoin would turn into a join, which is how emitJoinLoops tells it
+	// from any other subquery (where_const_terms.go).
+	existsJoin bool
+
+	// existsStmt is the select of the EXISTS being compiled, which
+	// compileScanPlain tells apart from every other body by pointer: C's
+	// selectInnerLoop does not evaluate the result list of an SRT_Exists
+	// destination (select.c, the "eDest!=SRT_Exists" arm).
+	existsStmt *SelectStmt
+
+	// noAndOrSimplify turns off simplifiedAndOr: an outer join's ON terms carry
+	// EP_OuterON, which ExprAlwaysTrue/False refuse to look through.
+	noAndOrSimplify bool
+
 	// correlated records that this compiler's program (or a subquery nested
 	// within it) bound at least one column of an ENCLOSING scope -- set by
 	// compileColumn when it resolves a reference to an outer compiler, for every
@@ -479,6 +494,7 @@ func compileSelectNoFromTrig(pager *ReadOnlyPager, stmt *SelectStmt, outer *comp
 	if len(stmt.From) != 0 || len(stmt.Compound) != 0 {
 		return nil, fmt.Errorf("%w: not a plain FROM-less SELECT", errVDBEUnsupported)
 	}
+	isExistsBody := outer != nil && outer.existsStmt == stmt
 	// A FROM-less GROUP BY is validated and then dropped, as in C (one row is one
 	// group; see validateNoFromGroupBy). Needed here too because a subquery body
 	// (a CTE core, scalar/EXISTS/IN) reaches this compiler with the clause attached
@@ -607,9 +623,15 @@ func compileSelectNoFromTrig(pager *ReadOnlyPager, stmt *SelectStmt, outer *comp
 	}
 
 	for i, oc := range outCols {
+		mark := c.here()
 		reg, err := c.compileExpr(oc.expr)
 		if err != nil {
 			return nil, err
+		}
+		if isExistsBody {
+			// Resolved, never evaluated: see compileScanPlain.
+			c.insns = c.insns[:mark]
+			continue
 		}
 		c.emit(Instruction{Op: OpSCopy, P1: reg, P2: resultBase + i})
 	}
@@ -647,14 +669,16 @@ func compileSelectNoFromTrig(pager *ReadOnlyPager, stmt *SelectStmt, outer *comp
 	for i, oc := range outCols {
 		cols[i] = oc.name
 	}
-	return &Program{
+	prog := &Program{
 		Insns:      c.insns,
 		NReg:       c.nReg,
 		NSubCache:  c.nSub,
 		NResultCol: len(outCols),
 		ColNames:   cols,
 		Correlated: c.correlated,
-	}, nil
+	}
+	skipLimitZeroBody(stmt, prog)
+	return prog, nil
 }
 
 // validateNoFromGroupByCompile is validateNoFromGroupBy's compile-time
@@ -1257,13 +1281,30 @@ func (c *compiler) compileScalarSubquery(x SubqueryExpr) (int, error) {
 // the rows' values), then an OpExists producing 1/0 (NOT inverting) into a
 // fresh register. Uncorrelated: run once and cached; correlated
 // (prog.Correlated): re-run per evaluation (p5Correlated, no cache slot).
-func (c *compiler) compileExistsSubquery(x ExistsExpr) (int, error) {
+func (c *compiler) compileExistsSubquery(x ExistsExpr, top bool) (int, error) {
 	// A FROM-less body needs no pager, exactly as compileScalarSubquery's
 	// does: "ATTACH EXISTS(SELECT 'x') AS zz" attaches in 3.53.3.
 	if c.pager == nil && c.liveDB == nil && !selectNeedsNoRowSource(x.Stmt) {
 		return 0, fmt.Errorf("%w: EXISTS subquery outside a cursor-driven scope", errVDBEUnsupported)
 	}
-	prog, err := c.liveSubSelect(x.Stmt)
+	// sqlite3Select drops an EXISTS body's DISTINCT and ORDER BY (IgnorableDistinct,
+	// select.c "tag-select-0100"), but only after the outer statement's name
+	// resolution has seen them: a bad ORDER BY name is still an error.
+	body := x.Stmt
+	if len(body.Compound) == 0 && (body.Distinct || len(body.OrderBy) > 0) {
+		if len(body.OrderBy) > 0 {
+			if _, err := c.liveSubSelect(body); err != nil {
+				return 0, err
+			}
+		}
+		cp := *body
+		cp.Distinct, cp.OrderBy = false, nil
+		body = &cp
+	}
+	savedExistsJoin, savedExistsStmt := c.existsJoin, c.existsStmt
+	c.existsJoin, c.existsStmt = top && !x.Not && existsJoinable(body), body
+	prog, err := c.liveSubSelect(body)
+	c.existsJoin, c.existsStmt = savedExistsJoin, savedExistsStmt
 	if err != nil {
 		return 0, err
 	}
@@ -1383,7 +1424,7 @@ func (c *compiler) compileExpr(e Expr) (int, error) {
 		return c.compileScalarSubquery(x)
 
 	case ExistsExpr:
-		return c.compileExistsSubquery(x)
+		return c.compileExistsSubquery(x, top)
 
 	case CollateExpr:
 		// COLLATE never changes the value, only which collation a consumer picks, and
@@ -2641,7 +2682,7 @@ func (c *compiler) compileUnary(x UnaryExpr) (int, error) {
 			// EXISTS is never NULL, so its NOT is OpExists's own P3 flag: no
 			// separate OpNot, and an inlined body just writes the other constant.
 			e.Not = !e.Not
-			return c.compileExistsSubquery(e)
+			return c.compileExistsSubquery(e, false)
 		}
 		r, err := c.compileExpr(x.X)
 		if err != nil {
@@ -2705,10 +2746,25 @@ var cmpOpcode = map[string]OpCode{
 // choice (compileRowSubCompare); every other operator ignores it.
 func (c *compiler) compileBinary(x BinaryExpr, top bool) (int, error) {
 	switch x.Op {
-	case "AND":
-		return c.compileAndOr(x.L, x.R, true, top)
-	case "OR":
-		return c.compileAndOr(x.L, x.R, false, top)
+	case "AND", "OR":
+		if !c.noAndOrSimplify {
+			if alt, changed := simplifiedAndOr(x); changed {
+				c.inWhereConjunct = top
+				r, err := c.compileExpr(alt)
+				if err != nil {
+					return 0, err
+				}
+				if exprIsBoolean(alt) {
+					return r, nil
+				}
+				// OP_And r1,r1,target (expr.c:4898): the arm's value as 0, 1 or NULL.
+				t, d := c.alloc(), c.alloc()
+				c.emit(Instruction{Op: OpNot, P1: r, P2: t})
+				c.emit(Instruction{Op: OpNot, P1: t, P2: d})
+				return d, nil
+			}
+		}
+		return c.compileAndOr(x.L, x.R, x.Op == "AND", top)
 	}
 
 	if opc, ok := arithOpcode[x.Op]; ok {
