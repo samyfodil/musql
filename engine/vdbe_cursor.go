@@ -47,7 +47,11 @@ type vdbeCursor struct {
 	// this cursor, when the seek that built it says (OpRewind reserves that much
 	// journal); zero otherwise.
 	writeHint int
-	normBuf  []Value
+	normBuf   []Value
+	// jitLazyMask is jitCursorMask's columns of a lazyNorm row read as stored,
+	// worked out on the first entry that asks (jitLazyMaskOK).
+	jitLazyMask   uint64
+	jitLazyMaskOK bool
 
 	// rowStore, when non-nil, marks this as a WRITE-path cursor over a table's
 	// in-memory logical rows (openRowStoreCursor, vdbe_write.go) rather than

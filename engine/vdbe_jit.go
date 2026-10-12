@@ -21,6 +21,7 @@ type vmJIT struct {
 	entry  []bool        // the pcs the VDBE enters native code at
 	marked []Instruction // the program with OpJIT at each entry: what run() dispatches on
 	native int           // how many of its instructions have native code (the JIT score's static share)
+	rows   bool          // whether native code runs an OpResultRow
 
 	// curs is the cursor numbers the native code reads or advances (VColumn,
 	// VNext), and nCurs the table size it indexes (the largest + 1). gate[pc]
@@ -75,6 +76,29 @@ func (prog *Program) jitCode() *vmJIT {
 	return jx
 }
 
+// writeJIT is jitCode for a top-level write program (runWrite), which is
+// compiled only when it loops over a cursor (an OpNext): an UPDATE's or a
+// DELETE's scan, or an INSERT ... SELECT's. A one-row INSERT ... VALUES would
+// pay a compile and a mapping for each statement text and run each native
+// instruction once.
+func (prog *Program) writeJIT() *vmJIT {
+	switch atomic.LoadInt32(&prog.writeLoop) {
+	case 1:
+		return nil
+	case 0:
+		loops := slices.ContainsFunc(prog.Insns, func(in Instruction) bool { return in.Op == OpNext })
+		v := int32(1)
+		if loops {
+			v = 2
+		}
+		atomic.StoreInt32(&prog.writeLoop, v)
+		if !loops {
+			return nil
+		}
+	}
+	return prog.jitCode()
+}
+
 var valueLayout = jit.ValueLayout{
 	Size:    int(unsafe.Sizeof(Value{})),
 	OffTyp:  int(unsafe.Offsetof(Value{}.Typ)),
@@ -95,7 +119,7 @@ func compileVMJIT(prog *Program) *vmJIT {
 	vp := make([]jit.VInsn, len(prog.Insns))
 	entry := make([]bool, len(prog.Insns))
 	native := 0
-	scannable := scannableCursors(prog.Insns, prog.NCursors)
+	rewindable, walkable := scannableCursors(prog.Insns, prog.NCursors)
 	// Whether the program has a pair the fusion pass works on, noted as it is
 	// lowered (jit.VFusable), so a program with none skips the pass.
 	fusable := false
@@ -109,7 +133,9 @@ func compileVMJIT(prog *Program) *vmJIT {
 		// materializes its rows is walked natively.
 		if c := vp[pc]; !vmJITCursorOps && (c.Op == jit.VColumn || c.Op == jit.VNext || c.Op == jit.VRewind) {
 			vp[pc] = jit.VInsn{Op: jit.VExit}
-		} else if (c.Op == jit.VNext || c.Op == jit.VRewind) && (c.A >= len(scannable) || !scannable[c.A]) {
+		} else if c.Op == jit.VRewind && (c.A >= len(rewindable) || !rewindable[c.A]) {
+			vp[pc] = jit.VInsn{Op: jit.VExit}
+		} else if c.Op == jit.VNext && (c.A >= len(walkable) || !walkable[c.A]) {
 			vp[pc] = jit.VInsn{Op: jit.VExit}
 		}
 		if vp[pc].Op != jit.VExit {
@@ -135,6 +161,15 @@ func compileVMJIT(prog *Program) *vmJIT {
 			entries++
 		}
 	}
+	// A Goto whose target is entered is entered too: the VDBE reaches one
+	// after running an instruction native code exited at, and entering at it
+	// is entering at its target one dispatch sooner.
+	for pc, in := range vp {
+		if in.Op == jit.VGoto && !entry[pc] && in.T >= 0 && in.T < len(entry) && entry[in.T] {
+			entry[pc] = true
+			entries++
+		}
+	}
 	if entries == 0 {
 		return nil
 	}
@@ -153,6 +188,7 @@ func compileVMJIT(prog *Program) *vmJIT {
 		}
 	}
 	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg, entry: entry, marked: marked, native: native}
+	jx.rows = slices.ContainsFunc(vp, func(in jit.VInsn) bool { return in.Op == jit.VResultRow })
 	jx.gate = make([]int16, len(vp))
 	jx.fill = make([][]curCols, len(vp))
 	seen := map[int]bool{}
@@ -174,24 +210,27 @@ func compileVMJIT(prog *Program) *vmJIT {
 	return jx
 }
 
-// scannableCursors marks the cursor numbers native code may read: every
-// instruction that opens the cursor opens a materializing kind -- a table read
-// that is not a streamed scan (OpOpenRead, P5 bit 0) or a derived source. A
-// write-path cursor (OpOpenWrite), whose current row can differ from the row
-// list it was built from, never is; neither is a cursor nothing opens.
-func scannableCursors(insns []Instruction, nCursors int) []bool {
-	ok := make([]bool, nCursors)
+// scannableCursors marks the cursor numbers native code may rewind and the
+// ones it may advance: every instruction that opens the cursor opens a
+// materializing kind. A table read that is not a streamed scan (OpOpenRead, P5
+// bit 0) and a derived source are both. A write-path cursor (OpOpenWrite) may
+// be advanced -- its OP_Next is advance() over its frozen row list, which the
+// engine replays after the call (enter) -- but not rewound, which rebuilds
+// the list. A cursor nothing opens is neither.
+func scannableCursors(insns []Instruction, nCursors int) (rewind, next []bool) {
+	rewind, next = make([]bool, nCursors), make([]bool, nCursors)
 	opened := make([]bool, nCursors)
 	for i := range insns {
 		in := &insns[i]
-		var scan bool
+		var rew, adv bool
 		switch in.Op {
 		case OpOpenRead:
-			scan = in.P5&1 == 0
+			rew = in.P5&1 == 0
+			adv = rew
 		case OpOpenDerived:
-			scan = true
+			rew, adv = true, true
 		case OpOpenWrite:
-			scan = false
+			rew, adv = false, true
 		default:
 			continue
 		}
@@ -199,12 +238,13 @@ func scannableCursors(insns []Instruction, nCursors int) []bool {
 			continue
 		}
 		if !opened[in.P1] {
-			opened[in.P1], ok[in.P1] = true, scan
-		} else if !scan {
-			ok[in.P1] = false
+			opened[in.P1], rewind[in.P1], next[in.P1] = true, rew, adv
+			continue
 		}
+		rewind[in.P1] = rewind[in.P1] && rew
+		next[in.P1] = next[in.P1] && adv
 	}
-	return ok
+	return rewind, next
 }
 
 // fillColumns is the columns of each cursor the VColumn instructions on the
@@ -217,6 +257,8 @@ func fillColumns(vp []jit.VInsn, pc int) []curCols {
 		case jit.VGoto:
 			pc = in.T
 			continue
+		case jit.VResultRow:
+			return out // native code returns to Go there
 		case jit.VColumn:
 			i := slices.IndexFunc(out, func(cc curCols) bool { return cc.cursor == in.A })
 			if i < 0 {
@@ -242,6 +284,8 @@ func firstCursor(vp []jit.VInsn, pc int) int {
 			continue
 		case jit.VColumn, jit.VNext, jit.VRewind:
 			return vp[pc].A
+		case jit.VResultRow:
+			return -1
 		}
 		pc++
 	}
@@ -300,6 +344,8 @@ func nativeRun(vp []jit.VInsn, pc, limit int) (w int, cursor bool) {
 		case jit.VColumn, jit.VNext, jit.VRewind:
 			w += 2
 			cursor = true
+		case jit.VResultRow:
+			return w + 2, cursor // native code returns to Go there
 		default:
 			w += 2
 		}
@@ -332,11 +378,22 @@ func lowerVM(in *Instruction, nReg int) jit.VInsn {
 		if v, isInt := in.P4.(int64); isInt && ok(in.P2) {
 			return jit.VInsn{Op: jit.VInt, A: in.P2, Imm: v}
 		}
-	case OpSCopy, OpCopy:
-		// copyValue differs from a plain copy only for a string or blob, which
-		// the native copy refuses.
+	case OpSCopy:
+		// A shallow copy of any Value: a string's pointer is shared.
+		if ok(in.P1, in.P2) {
+			return jit.VInsn{Op: jit.VCopy, A: in.P1, B: in.P2, Imm: 1}
+		}
+	case OpCopy:
+		// copyValue differs from a plain copy only for a string or blob, whose
+		// bytes it copies; native code refuses those.
 		if ok(in.P1, in.P2) {
 			return jit.VInsn{Op: jit.VCopy, A: in.P1, B: in.P2}
+		}
+	case OpResultRow:
+		// OpResultRow's copy of the row; the engine hands it over (run's
+		// OpJIT case).
+		if in.P2 >= 0 && in.P1 >= 0 && in.P1+in.P2 <= nReg {
+			return jit.VInsn{Op: jit.VResultRow, A: in.P1, B: in.P2}
 		}
 	case OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight:
 		// Divide and Remainder: intArith's integer arm, for a divisor native
@@ -345,6 +402,12 @@ func lowerVM(in *Instruction, nReg int) jit.VInsn {
 			return jit.VInsn{Op: vmArith[in.Op], A: in.P1, B: in.P2, C: in.P3}
 		}
 	case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
+		// A comparison under TEXT affinity is one of text values -- a TEXT
+		// column against a string -- which native code would only enter to
+		// exit from. The VDBE answers it from the start.
+		if affinity(in.P5&p5AffMask) == affText {
+			break
+		}
 		// Two INTEGERs answer before NULL handling, affinity or collation
 		// (compareOp's first arm, vdbe.c:2288), so P4 and P5 matter only for
 		// the store-the-result form, which stays the VDBE's.
@@ -417,17 +480,64 @@ func lowerVM(in *Instruction, nReg int) jit.VInsn {
 
 // vmJITCursorSyncs counts the entries after which native code had advanced a
 // cursor and the engine brought the cursor up to date -- what a test reads to
-// know the cursor instructions really ran natively.
-var vmJITCursorSyncs atomic.Int64
+// know the cursor instructions really ran natively -- and
+// vmJITWriteCursorSyncs those of a write-path cursor (native OP_Next over an
+// UPDATE's or DELETE's row list). Counted only while vmJITCountSyncs, which a
+// test sets: two locked adds an entry were a measurable share of a short one.
+var (
+	vmJITCursorSyncs, vmJITWriteCursorSyncs atomic.Int64
+	vmJITCountSyncs                         bool
+)
 
-// jitCursorOK reports whether native code may read and advance cur right now:
-// a materialized row list whose current row is rows[pos] -- no streamed or
-// segment source, no write-path cursor (whose row can be refreshed apart from
-// the list), no NULL row, no lazily normalized rows, no masked row.
+// jitCursorOK reports whether native code may advance cur right now: a
+// materialized row list advance() walks by position -- no streamed or segment
+// source, no NULL row, no masked row. A write-path cursor qualifies: its
+// OP_Next is the same walk of its frozen list, and the engine replays what
+// advance() does with the row after the call (enter).
 func jitCursorOK(cur *vdbeCursor) bool {
 	return cur != nil && cur.materialized && cur.sub == nil && cur.segSrc == nil && cur.segCur == nil &&
-		cur.rowStore == nil && !cur.lazyNorm && cur.rowRaw == nil && !cur.rowidNull &&
+		cur.rowRaw == nil && !cur.rowidNull &&
 		cur.streamErrPending == nil && len(cur.rows) >= len(cur.rowids)
+}
+
+// jitCursorMask is the columns native code may read from cur's row list:
+// those where rows[pos] holds what OpColumn reads, now and after any advance.
+//
+// A row store's rows kept as stored (lazyNorm) differ from what advance()
+// makes current in two places only, normalizeRowInto's: the INTEGER PRIMARY
+// KEY's slot and the REAL-affinity columns. Every other column reads the same
+// from the stored row. And a write-path cursor's current row is the list's
+// only until reseekRowStore refreshes it apart from the list; then it has
+// none.
+func jitCursorMask(cur *vdbeCursor) uint64 {
+	mask := ^uint64(0)
+	if cur.lazyNorm {
+		if !cur.jitLazyMaskOK {
+			tbl := cur.rowStore
+			if tbl.ipkIndex >= 0 && tbl.ipkIndex < 64 {
+				mask &^= 1 << uint(tbl.ipkIndex)
+			}
+			for i, c := range tbl.cols[:min(len(tbl.cols), 64)] {
+				if c.Aff == affReal {
+					mask &^= 1 << uint(i)
+				}
+			}
+			cur.jitLazyMask, cur.jitLazyMaskOK = mask, true
+		}
+		mask = cur.jitLazyMask
+	}
+	if cur.rowStore == nil || cur.pos < 0 || cur.pos >= len(cur.rowids) {
+		return mask
+	}
+	if sameRow(cur.rowVals, cur.rows[cur.pos]) || cur.lazyNorm && sameRow(cur.rowVals, cur.normBuf) {
+		return mask
+	}
+	return 0
+}
+
+// sameRow reports whether a and b are the same row: one array, one length.
+func sameRow(a, b []Value) bool {
+	return len(a) == len(b) && len(a) > 0 && &a[0] == &b[0]
 }
 
 // jitSnap is the one-row list a cursor native code can read but not walk is
@@ -460,12 +570,47 @@ func jitReadColumn(cur *vdbeCursor, i int, dst *Value) bool {
 }
 
 // enter runs native code from pc and returns the pc the VDBE runs next.
-func (jx *vmJIT) enter(m *vdbe, pc int) int {
+//
+// rows is run's list of result rows. A machine that gathers them (no yield)
+// lets native code append to it: each OpResultRow's row is carved from
+// m.recChunk, as recAlloc would, and its header written into the list's spare
+// capacity; enter takes both over after the call. n is then -1.
+//
+// A machine that hands each row over gets at most one row per call: n is
+// then its width, copied into m.yieldRow's array when the machine reuses it
+// (and rows is empty), else to the head of m.recChunk, and pc is the one after
+// the OpResultRow. The caller hands it over (run's OpJIT case). n is -1 when
+// native code ran no OpResultRow.
+func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 	regs := m.regs
 	if len(regs) < jx.nReg || jx.nReg == 0 {
-		return pc
+		return pc, -1
 	}
-	args := jit.ProgArgs{Regs: (*int64)(unsafe.Pointer(&regs[0])), PC: int64(pc)}
+	args := jit.ProgArgs{Regs: (*int64)(unsafe.Pointer(&regs[0])), PC: int64(pc), RowCap: -1}
+	switch {
+	case !jx.rows || m.firstRow:
+		// No OpResultRow native code runs; or the VDBE's stops the run with an
+		// empty row.
+	case m.yieldReuse && len(*rows) == 0:
+		if c := cap(m.yieldRow); c > 0 {
+			args.RowBuf, args.RowCap = (*int64)(unsafe.Pointer(unsafe.SliceData(m.yieldRow[:c]))), int64(c)
+		} else {
+			args.RowCap = 0
+		}
+	default:
+		if c := len(m.recChunk); c > 0 {
+			args.RowBuf, args.RowCap = (*int64)(unsafe.Pointer(&m.recChunk[0])), int64(c)
+		} else {
+			args.RowCap = 0
+		}
+		if !m.yield {
+			if cap(*rows) == len(*rows) {
+				*rows = slices.Grow(*rows, max(16, len(*rows)))
+			}
+			spare := (*rows)[len(*rows):cap(*rows)]
+			args.RowsBuf, args.RowsCap = (*int64)(unsafe.Pointer(unsafe.SliceData(spare))), int64(len(spare))
+		}
+	}
 	if jx.nCurs > 0 {
 		if len(m.jcur) < jx.nCurs {
 			m.jcur = make([]jit.VCursor, jx.nCurs)
@@ -480,9 +625,12 @@ func (jx *vmJIT) enter(m *vdbe, pc int) int {
 			cur := m.cursors[c]
 			if jitCursorOK(cur) {
 				jc.Rows = unsafe.Pointer(unsafe.SliceData(cur.rows))
-				jc.N, jc.Pos, jc.Ok, jc.Adv, jc.Mask = int64(len(cur.rowids)), int64(cur.pos), 1, 1, ^uint64(0)
-				if !cur.seekReseek {
-					jc.Rewind = 1 // a re-seeking cursor rebuilds its rows at every rewind
+				jc.N, jc.Pos, jc.Ok, jc.Adv = int64(len(cur.rowids)), int64(cur.pos), 1, 1
+				jc.Mask = jitCursorMask(cur)
+				if !cur.seekReseek && cur.rowStore == nil {
+					// A re-seeking cursor rebuilds its rows at every rewind, and
+					// so does a write-path one.
+					jc.Rewind = 1
 				}
 				continue
 			}
@@ -530,16 +678,36 @@ func (jx *vmJIT) enter(m *vdbe, pc int) int {
 				// current row, rowid and the rest follow it here, as advance()
 				// would have left them. Past the end advance leaves the last row
 				// current, and so does this (Last).
-				vmJITCursorSyncs.Add(1)
 				cur := m.cursors[c]
+				if vmJITCountSyncs {
+					vmJITCursorSyncs.Add(1)
+					if cur.rowStore != nil {
+						vmJITWriteCursorSyncs.Add(1)
+					}
+				}
 				cur.pos = int(jc.Pos)
 				if jc.Last >= 0 {
 					cur.rowid = cur.rowids[jc.Last]
 					cur.rowVals = cur.rows[jc.Last]
+					if cur.lazyNorm {
+						cur.rowVals = cur.normalizeStored(cur.rowVals)
+					}
 					cur.rowRaw = nil
 				}
 			}
 		}
 	}
-	return int(args.PC)
+	if args.Yield > 0 {
+		if args.RowsBuf != nil {
+			// The rows native code gathered: their headers are in the list's
+			// spare capacity, their Values the chunk's first RowUsed.
+			k := int(args.Yield)
+			*rows = (*rows)[:len(*rows)+k]
+			m.recChunk = m.recChunk[args.RowUsed:]
+			m.jitRows += k
+			return int(args.PC), -1
+		}
+		return int(args.PC), int(args.Yield) - 1
+	}
+	return int(args.PC), -1
 }

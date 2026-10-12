@@ -86,9 +86,11 @@ func vmStepOf(in VInsn, pc int) progStep {
 	case VRewind, VNext:
 		s.targets = []int{in.T}
 	case VFused:
-		// Part of the instruction before; reached by nothing.
+		// Part of the instruction before. An entry at it (VFusedTest) comes
+		// from the VDBE, which keeps every register in the file.
 	default:
-		// VExit, VReturn: VDBE code, or a jump anywhere.
+		// VExit, VReturn, VResultRow: VDBE code, a jump anywhere, or a return
+		// to Go.
 		s.useAll = true
 	}
 	return s
@@ -176,9 +178,10 @@ func VMBoundaries(prog []VInsn, entry []bool) []bool {
 // FuseVM is the fusion pass over a VM program: pairs fused and dead stores
 // marked, as the top of this file describes. hard marks the pcs control
 // reaches by a jump or a return (VMBoundaries with no entries); no pair spans
-// one. An entry the engine wanted at a pair's second pc is given up -- after
-// the VDBE runs a comparison itself, it runs the test too -- and cleared in
-// entry. The result has one instruction per pc, like prog.
+// one. An entry the engine wanted at a pair's second pc is kept: the emitters
+// give it a block of its own that runs the test unfused (VFusedTest) and
+// rejoins the run after the pair. The result has one instruction per pc, like
+// prog.
 func FuseVM(prog []VInsn, nReg int, hard, entry []bool) []VInsn {
 	n := len(prog)
 	out := append([]VInsn(nil), prog...)
@@ -204,10 +207,9 @@ func FuseVM(prog []VInsn, nReg int, hard, entry []bool) []VInsn {
 		// The test's NULL arm (C) cannot matter: the fused compare or NOT
 		// has an INTEGER result whenever it runs natively.
 		out[pc] = VInsn{Op: op, A: in.A, B: in.B, C: in.C, Cond: in.Cond, T: nx.T, Imm: nx.Imm, Dead: dead(pc+1, in.C)}
-		out[pc+1] = VInsn{Op: VFused}
-		if pc+1 < len(entry) {
-			entry[pc+1] = false
-		}
+		// The second half keeps its test, so an entry there -- the VDBE ran
+		// the comparison itself and comes back for the test -- runs it alone.
+		out[pc+1] = VInsn{Op: VFused, A: nx.A, C: nx.C, T: nx.T, Imm: nx.Imm}
 		vmFusedPairs.Add(1)
 		pc++
 	}
@@ -289,11 +291,16 @@ func (k *vmKnow) reset() {
 func (k *vmKnow) wroteInt(r int) { k.isInt[r], k.noS[r], k.canon[r] = true, true, true }
 
 // wroteAny records that native code wrote r a value of unknown type (a copy
-// of a column or a register), which never holds a string.
-func (k *vmKnow) wroteAny(r int) {
+// of a column or a register, a NULL); noS is whether it is known to hold no
+// string or blob.
+func (k *vmKnow) wroteAny(r int, noS bool) {
 	delete(k.isInt, r)
 	delete(k.canon, r)
-	k.noS[r] = true
+	if noS {
+		k.noS[r] = true
+	} else {
+		delete(k.noS, r)
+	}
 }
 
 // vmRunStart reports whether pc starts a new straight run: a boundary, or the
@@ -306,7 +313,13 @@ func vmRunStart(prog []VInsn, bound []bool, pc int) bool {
 	if prev.Op == VFused {
 		return false
 	}
-	return !vmStepOf(prev, pc-1).fall || prev.Op == VExit || prev.Op == VReturn
+	return !vmStepOf(prev, pc-1).fall || prev.Op == VExit || prev.Op == VReturn || prev.Op == VResultRow
+}
+
+// VFusedTest is the test a VFused pc was before its pair was fused: what an
+// entry at that pc runs.
+func VFusedTest(in VInsn) VInsn {
+	return VInsn{Op: VIf, A: in.A, C: in.C, T: in.T, Imm: in.Imm}
 }
 
 // vmNextUse is the first pc at or after from, within the straight run, that
@@ -357,7 +370,7 @@ func vmEmitNextUse(prog []VInsn, bound []bool, key, pc int) int {
 				return q
 			case (in.Op == VNext || in.Op == VRewind) && in.A == c:
 				return -1
-			case in.Op == VExit || in.Op == VReturn:
+			case in.Op == VExit || in.Op == VReturn || in.Op == VResultRow:
 				return -1
 			}
 			continue
@@ -460,3 +473,9 @@ func (k *vmKnow) pruneForEntry(keep map[int]bool) (ints, noS []int) {
 // code then sits in the same fetch blocks whatever precedes it.
 // 0 or 1 turns it off, for a benchmark to compare.
 var loopAlign = 64
+
+// vmFusedEntry reports whether pc is the second pc of a fused pair that the
+// engine enters at: an entry that runs the pair's test alone (VFusedTest).
+func vmFusedEntry(prog []VInsn, entry []bool, pc int) bool {
+	return pc >= 0 && pc < len(prog) && pc < len(entry) && entry[pc] && prog[pc].Op == VFused
+}

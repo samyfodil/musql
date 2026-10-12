@@ -16,6 +16,7 @@ import (
 // a different answer here.
 func TestVMJITCursorDifferential(t *testing.T) {
 	lowEntryThreshold(t)
+	countSyncs(t)
 	if !vmJITEnabled {
 		t.Skip("JIT not enabled on this platform")
 	}

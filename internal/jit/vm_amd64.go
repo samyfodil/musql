@@ -39,7 +39,7 @@ var vmPool = []Reg{RBX, R11, R13, R15, R12}
 // entry marks the pcs the engine enters at; one that bound does not mark is
 // entered through an entry stub (vmfuse.go), which the dispatch table points at.
 func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache bool) ([]byte, error) {
-	if lay.OffTyp != 0 || lay.OffI != 8 || lay.OffF != 16 {
+	if lay.OffTyp != 0 || lay.OffI != 8 || lay.OffF != 16 || lay.Size != lay.OffS+24 {
 		// writeInt stores the type as the whole first word -- type, subtype and
 		// padding together -- so the type must lead it.
 		return nil, fmt.Errorf("jit: unexpected Value layout %+v", lay)
@@ -49,13 +49,19 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 		return nil, fmt.Errorf("jit: program too large (%d instructions, %d registers)", n, nReg)
 	}
 	e := &vmEmit{a: NewAsm(), lay: lay, n: n, stubs: map[int]bool{}, prog: prog, bound: bound,
-		cache: cache && bound != nil, know: newVMKnow(), holds: map[int]Reg{}, pinned: map[Reg]bool{}}
+		cache: cache && bound != nil, know: newVMKnow(), holds: map[int]Reg{}, pinned: map[Reg]bool{},
+		zeroS: map[int]bool{}}
 	e.heads = vmLoopHeads(prog)
 	a := e.a
 
 	a.MovRegMem(RSI, RDI, POffRegs)
 	a.MovRegMemD(RCX, RDI, POffPC)
 	a.MovRegImm64(R8, VMFuel)
+	// The write-barrier flag, read once: it cannot change before this call
+	// returns (wb.go). Only its low byte is tested.
+	a.MovRegImm64(RAX, int64(wbFlagAddr))
+	a.MovRegMemD(RAX, RAX, 0)
+	a.MovMemDReg(RDI, POffWB, RAX)
 	a.Label("dispatch")
 	a.LeaRIP(RAX, "table")
 	a.MovsxdRegMemIdx4(RDX, RAX, RCX)
@@ -70,11 +76,12 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 		if vmRunStart(prog, bound, pc) {
 			e.forget()
 			e.alignLoopHead(pc)
-		} else if e.cache && pc < len(entry) && entry[pc] {
+		} else if e.cache && (pc < len(entry) && entry[pc] || vmFusedEntry(prog, entry, pc-1)) {
 			e.entryPoint(pc)
 		}
 		e.blockOff[pc] = len(a.buf)
 		clear(e.pinned)
+		clear(e.zeroS)
 		if err := e.insn(pc, in); err != nil {
 			return nil, fmt.Errorf("jit: pc %d: %w", pc, err)
 		}
@@ -84,6 +91,36 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 	}
 	// Running off the last block is running off the program.
 	e.exitAt(n)
+
+	// An entry at a fused pair's second pc runs its test alone, then rejoins
+	// the run after the pair through that pc's entry stub.
+	fusedOff := map[int]int{}
+	for pc, in := range prog {
+		if !vmFusedEntry(prog, entry, pc) {
+			continue
+		}
+		fusedOff[pc] = len(a.buf)
+		e.forget()
+		clear(e.pinned)
+		clear(e.zeroS)
+		cache := e.cache
+		e.cache = false
+		if err := e.insn(pc, VFusedTest(in)); err != nil {
+			return nil, fmt.Errorf("jit: pc %d: %w", pc, err)
+		}
+		e.cache = cache
+		e.forget()
+		switch {
+		case pc+1 >= n:
+			e.jmpStub(n)
+		case vmRunStart(prog, bound, pc+1):
+			e.jmpBlock(pc, pc+1)
+		default:
+			a.emit(0xE9)
+			e.fix = append(e.fix, vmFix{at: len(a.buf), pc: pc + 1, entry: true})
+			a.emit(0, 0, 0, 0)
+		}
+	}
 
 	entryOff := map[int]int{}
 	for _, en := range e.entries {
@@ -119,7 +156,9 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 		off := stubOff[n]
 		if pc < n {
 			off = e.blockOff[pc]
-			if prog[pc].Op == VFused {
+			if o, ok := fusedOff[pc]; ok {
+				off = o
+			} else if prog[pc].Op == VFused {
 				off = stubOff[pc]
 			} else if o, ok := entryOff[pc]; ok {
 				off = o
@@ -131,6 +170,8 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 		var target int
 		if f.stub {
 			target = stubOff[f.pc]
+		} else if f.entry {
+			target = entryOff[f.pc]
 		} else {
 			target = e.blockOff[f.pc]
 		}
@@ -160,6 +201,9 @@ type vmEmit struct {
 	heads  []bool // vmLoopHeads
 	// entries are the entry stubs to emit after the blocks.
 	entries []vmEntryStub
+	// zeroS is the destinations of the instruction being emitted whose string
+	// or blob pointer its store must clear (destNoS).
+	zeroS map[int]bool
 }
 
 // vmEntryStub is an entry into the middle of a run: the registers to check
@@ -192,11 +236,13 @@ func (e *vmEmit) entryPoint(pc int) {
 	e.entries = append(e.entries, st)
 }
 
-// vmFix is a rel32 to patch: to pc's block, or to the stub that exits at pc.
+// vmFix is a rel32 to patch: to pc's block, to the stub that exits at pc, or
+// to pc's entry stub.
 type vmFix struct {
-	at   int
-	pc   int
-	stub bool
+	at    int
+	pc    int
+	stub  bool
+	entry bool
 }
 
 func (e *vmEmit) d(r, off int) int32 { return int32(r*e.lay.Size + off) }
@@ -288,6 +334,42 @@ func (e *vmEmit) writeInt(reg int, src Reg) {
 	e.a.MovMemDImm(RSI, e.d(reg, 0), int32(e.lay.TypInt))
 	e.a.MovMemDReg(RSI, e.d(reg, e.lay.OffI), src)
 	e.a.MovMemDImm(RSI, e.d(reg, e.lay.OffF), 0)
+	e.clearS(reg)
+}
+
+// clearS clears r[reg]'s string or blob -- pointer, length and capacity --
+// when destNoS said the store must.
+func (e *vmEmit) clearS(reg int) {
+	if !e.zeroS[reg] {
+		return
+	}
+	delete(e.zeroS, reg)
+	for k := range 3 {
+		e.a.MovMemDImm(RSI, e.d(reg, e.lay.OffS+8*k), 0)
+	}
+}
+
+// jccWB exits at pc when the GC's write barrier is on (wb.go).
+func (e *vmEmit) jccWB(pc int) {
+	e.a.CmpMemDByte(RDI, POffWB, 0)
+	e.jccStub(CondNE, pc)
+}
+
+// destNoS readies r[r] to be overwritten by the instruction at pc: when it
+// may hold a string or blob, native code exits there if the write barrier is
+// on, and otherwise the store clears the pointer (zeroS) -- a plain store,
+// which is all Go's own code makes with the barrier off.
+func (e *vmEmit) destNoS(pc, r int) {
+	if e.know.noS[r] || e.zeroS[r] {
+		return
+	}
+	a := e.a
+	a.CmpMemDImm8(RSI, e.d(r, e.lay.OffS), 0)
+	skip := len(a.buf)
+	a.emit(0x0F, 0x80|byte(CondE), 0, 0, 0, 0)
+	e.jccWB(pc)
+	patch(a.buf, skip+2, len(a.buf))
+	e.zeroS[r] = true
 }
 
 // ---- what the emitter keeps between steps (fused emission only) -------------
@@ -455,7 +537,7 @@ func (e *vmEmit) operand2(pc int, in VInsn) (x, y Reg) {
 	y = e.src(pc, in.A, RDX)
 	bm := e.src(pc, in.B, RAX)
 	if !in.Dead {
-		e.needNoS(pc, in.C)
+		e.destNoS(pc, in.C)
 	}
 	if bm == RAX {
 		return RAX, y
@@ -482,7 +564,7 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 			e.clobber(in.A)
 			break
 		}
-		e.needNoS(pc, in.A)
+		e.destNoS(pc, in.A)
 		m := e.dest(pc, in.A, RAX)
 		a.MovRegImm64(m, in.Imm)
 		e.storeInt(pc, in, in.A, m)
@@ -491,8 +573,12 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 			e.clobber(in.B)
 			break
 		}
+		if in.Imm != 0 && !e.know.noS[in.A] {
+			e.copyAny(pc, in)
+			break
+		}
 		e.needNoS(pc, in.A)
-		e.needNoS(pc, in.B)
+		e.destNoS(pc, in.B)
 		if e.know.canon[in.A] && in.A != in.B {
 			// An integer native code wrote: the copy is one, coalesced with
 			// the source's register when it has one.
@@ -513,10 +599,11 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 			a.MovRegMemD(RAX, RSI, e.d(in.A, off))
 			a.MovMemDReg(RSI, e.d(in.B, off), RAX)
 		}
+		e.clearS(in.B)
 		if in.A != in.B {
 			isInt := e.know.isInt[in.A]
 			e.unmap(in.B)
-			e.know.wroteAny(in.B)
+			e.know.wroteAny(in.B, true)
 			if isInt {
 				e.know.isInt[in.B] = true
 			}
@@ -560,7 +647,7 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		y := e.src(pc, in.A, R9)
 		bm := e.src(pc, in.B, RAX)
 		if !in.Dead {
-			e.needNoS(pc, in.C)
+			e.destNoS(pc, in.C)
 		}
 		// A divisor of 0 (NULL) or -1 (the one overflow) is the VDBE's.
 		a.CmpRegImm32(y, 0)
@@ -590,7 +677,7 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		x := e.src(pc, in.B, RAX)
 		y := e.src(pc, in.A, RDX)
 		if !in.Dead {
-			e.needNoS(pc, in.C)
+			e.destNoS(pc, in.C)
 			a.MovRegImm64(R10, 0) // before the compare: a xor would clear the flags after it
 		}
 		a.CmpRegReg(x, y)
@@ -614,7 +701,7 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 	case VNot, VNotBr:
 		x := e.src(pc, in.A, RAX)
 		if !in.Dead {
-			e.needNoS(pc, in.C)
+			e.destNoS(pc, in.C)
 			a.MovRegImm64(R10, 0)
 		}
 		a.TestRegReg(x, x)
@@ -654,16 +741,17 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 			e.clobber(in.C)
 			break
 		}
-		e.needNoS(pc, in.C)
+		e.destNoS(pc, in.C)
 		a.MovMemDImm(RSI, e.d(in.C, 0), int32(L.TypNull))
 		a.MovMemDImm(RSI, e.d(in.C, L.OffI), 0)
 		a.MovMemDImm(RSI, e.d(in.C, L.OffF), 0)
+		e.clearS(in.C)
 		e.unmap(in.C)
-		e.know.wroteAny(in.C)
+		e.know.wroteAny(in.C, true)
 	case VNeg:
 		am := e.src(pc, in.A, RAX)
 		if !in.Dead {
-			e.needNoS(pc, in.C)
+			e.destNoS(pc, in.C)
 		}
 		x := RAX
 		if m, ok := e.inPlace(pc, in.A); ok && m == am {
@@ -710,7 +798,7 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		patch(a.buf, done+1, len(a.buf))
 		// Falling past here, r[A] was an integer or a NULL.
 	case VGosub:
-		e.needNoS(pc, in.A)
+		e.destNoS(pc, in.A)
 		a.MovRegImm64(RAX, int64(pc))
 		e.writeInt(in.A, RAX)
 		e.jmpBlock(pc, in.T)
@@ -729,6 +817,8 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 			break
 		}
 		e.column(pc, in)
+	case VResultRow:
+		e.resultRow(pc, in)
 	case VRewind:
 		e.unmap(^in.A)
 		cb := int32(in.A * VCursorSize)
@@ -818,9 +908,19 @@ func (e *vmEmit) column(pc int, in VInsn) {
 		}
 		a.MovRegMemD(row, R9, 0) // the row's first Value
 	}
-	a.CmpMemDImm8(row, vb+int32(L.OffS), 0)
-	e.jccStub(CondNE, pc)
-	e.needNoS(pc, in.C)
+	// A string or blob is copied with its pointer (OP_Column's own copy is a
+	// shallow one): a plain store with the write barrier off. With it on, a
+	// pointer read or overwritten exits.
+	a.MovRegMemD(RDX, row, vb+int32(L.OffS))
+	if !e.know.noS[in.C] {
+		a.AluRegMemD(AluOr, RDX, RSI, e.d(in.C, L.OffS))
+	} else {
+		a.TestRegReg(RDX, RDX)
+	}
+	skip := len(a.buf)
+	a.emit(0x0F, 0x80|byte(CondE), 0, 0, 0, 0)
+	e.jccWB(pc)
+	patch(a.buf, skip+2, len(a.buf))
 	val := RDX
 	if u := e.nextUse(in.C, pc); u >= 0 {
 		if m, ok := e.alloc(pc, u, false); ok {
@@ -831,18 +931,129 @@ func (e *vmEmit) column(pc int, in VInsn) {
 	a.MovMemDReg(RSI, e.d(in.C, 0), RDX)
 	a.MovRegMemD(val, row, vb+int32(L.OffI))
 	a.MovMemDReg(RSI, e.d(in.C, L.OffI), val)
-	a.MovRegMemD(RDX, row, vb+int32(L.OffF))
-	a.MovMemDReg(RSI, e.d(in.C, L.OffF), RDX)
+	for _, off := range []int{L.OffF, L.OffS, L.OffS + 8, L.OffS + 16} {
+		a.MovRegMemD(RDX, row, vb+int32(off))
+		a.MovMemDReg(RSI, e.d(in.C, off), RDX)
+	}
 	for k, m := range e.holds {
 		if m == val && k != ^in.A {
 			delete(e.holds, k)
 		}
 	}
 	e.unmap(in.C)
-	e.know.wroteAny(in.C)
+	e.know.wroteAny(in.C, false)
 	if val != RDX {
 		e.holds[in.C] = val // its I word; whether it is an INTEGER is still to be checked
 	}
+}
+
+// copyAny is VCopy of any Value (OP_SCopy): all six words, the string or blob
+// pointer shared. A pointer read or overwritten needs the write barrier off;
+// with it on, the copy exits.
+func (e *vmEmit) copyAny(pc int, in VInsn) {
+	a, L := e.a, e.lay
+	if in.A == in.B {
+		return // a copy onto itself changes nothing
+	}
+	a.MovRegMemD(RAX, RSI, e.d(in.A, L.OffS))
+	if !e.know.noS[in.B] {
+		a.AluRegMemD(AluOr, RAX, RSI, e.d(in.B, L.OffS))
+	} else {
+		a.TestRegReg(RAX, RAX)
+	}
+	skip := len(a.buf)
+	a.emit(0x0F, 0x80|byte(CondE), 0, 0, 0, 0)
+	e.jccWB(pc)
+	patch(a.buf, skip+2, len(a.buf))
+	for off := 0; off < L.Size; off += 8 {
+		a.MovRegMemD(RAX, RSI, e.d(in.A, off))
+		a.MovMemDReg(RSI, e.d(in.B, off), RAX)
+	}
+	isInt := e.know.isInt[in.A]
+	e.unmap(in.B)
+	e.know.wroteAny(in.B, false)
+	if isInt {
+		e.know.isInt[in.B] = true
+	}
+	if m, ok := e.holds[in.A]; ok {
+		e.holds[in.B] = m
+	}
+}
+
+// resultRow is VResultRow (vm.go; ProgArgs.RowBuf has the protocol). With
+// too little room, RowCap -1, or the write barrier on, it exits at pc. RCX,
+// R9 and R10 are scratch: nothing is kept across it (vmRunStart).
+func (e *vmEmit) resultRow(pc int, in VInsn) {
+	a, L := e.a, e.lay
+	e.jccWB(pc)
+	a.MovRegMemD(RDX, RDI, POffRowsBuf)
+	a.TestRegReg(RDX, RDX)
+	gather := fmt.Sprintf("rg%d", pc)
+	a.Jcc(CondNE, gather)
+
+	// One row, handed over: copy it to RowBuf's head and return.
+	a.MovRegMemD(RAX, RDI, POffRowCap)
+	a.CmpRegImm32(RAX, int32(in.B))
+	e.jccStub(CondL, pc)
+	if in.B > 0 {
+		a.MovRegMemD(R10, RDI, POffRowBuf)
+		e.copyRow(pc, in)
+	}
+	a.MovMemDImm(RDI, POffYield, int32(in.B+1))
+	a.MovMemDImm(RDI, POffPC, int32(pc+1))
+	a.Ret()
+
+	// Rows gathered: copy this one past the Values used, write its header
+	// past the headers written, and go on. An empty row is the VDBE's: its
+	// header would point past the buffer.
+	a.Label(gather)
+	if in.B == 0 {
+		e.jmpStub(pc)
+		return
+	}
+	a.MovRegMemD(RAX, RDI, POffYield)
+	a.AluRegMemD(AluCmp, RAX, RDI, POffRowsCap)
+	e.jccStub(CondGE, pc)
+	a.MovRegMemD(R9, RDI, POffRowUsed)
+	a.MovRegMemD(RCX, RDI, POffRowCap)
+	a.SubRegReg(RCX, R9)
+	a.CmpRegImm32(RCX, int32(in.B))
+	e.jccStub(CondL, pc)
+	// R10 = RowBuf + RowUsed*Size, the row's first Value.
+	a.MovRegImm64(R10, int64(L.Size))
+	a.ImulRegReg(R10, R9)
+	a.AluRegMemD(AluAdd, R10, RDI, POffRowBuf)
+	// The header at RowsBuf + Yield*24: {R10, B, B}.
+	a.MovRegImm64(RCX, sliceHeaderSize)
+	a.ImulRegReg(RCX, RAX)
+	a.AddRegReg(RDX, RCX)
+	a.MovMemDReg(RDX, 0, R10)
+	a.MovMemDImm(RDX, 8, int32(in.B))
+	a.MovMemDImm(RDX, 16, int32(in.B))
+	a.IncReg(RAX)
+	a.MovMemDReg(RDI, POffYield, RAX)
+	a.MovRegImm64(RAX, int64(in.B))
+	a.AddRegReg(R9, RAX)
+	a.MovMemDReg(RDI, POffRowUsed, R9)
+	e.copyRow(pc, in)
+	// Falls into the next pc's block, which starts a run.
+}
+
+// copyRow copies the B registers from A, word by word, to R10 onward. RAX,
+// RCX, R9 and R10 are scratch.
+func (e *vmEmit) copyRow(pc int, in VInsn) {
+	a, L := e.a, e.lay
+	a.MovRegImm64(R9, int64(e.d(in.A, 0)))
+	a.AddRegReg(R9, RSI)
+	a.MovRegImm64(RCX, int64(in.B*L.Size/8))
+	loop := fmt.Sprintf("rr%d.%d", pc, len(a.buf))
+	a.Label(loop)
+	a.MovRegMemD(RAX, R9, 0)
+	a.MovMemDReg(R10, 0, RAX)
+	a.AddRegImm8(R9, 8)
+	a.AddRegImm8(R10, 8)
+	a.DecReg(RCX)
+	a.Jcc(CondNE, loop)
 }
 
 // patch writes the rel32 at buf[at:] so it lands on target.
