@@ -2247,6 +2247,11 @@ func (p *ReadOnlyPager) finishGroupSource(c *compiler, state *joinDesugarState, 
 	if name == "" {
 		name = it.Table
 	}
+	if (it.Natural || it.Using != nil) && gl > 1 {
+		if err := p.checkGroupConnectorUsing(state, items[i:i+gl], tbl.cols); err != nil {
+			return joinSource{}, err
+		}
+	}
 	onExpr, hidden, derr := desugarJoinItem(state, i, it, name, tbl.cols)
 	if derr != nil {
 		return joinSource{}, declineOrSemantic(derr)
@@ -3287,4 +3292,49 @@ func markStarBare(items []FromItem, srcs []joinSource, absToSrcs map[int]int) {
 		srcs[k].scope.starBare = bare
 		srcs[k].scope.starBareSet = true
 	}
+}
+
+// checkGroupConnectorUsing declines a USING/NATURAL join to a parenthesized
+// group whose common columns C takes from members past the first. C joins
+// against the group's whole column list (sqlite3ProcessJoin looks the name up
+// in the group subquery's table): "pa NATURAL JOIN (pb NATURAL JOIN pc)" joins
+// on pc's v as well, and "USING(v)" finds it there. This engine addresses the
+// group's side through its first member (desugarJoinItem over connectorCols),
+// which would join on fewer columns, so such a join declines.
+func (p *ReadOnlyPager) checkGroupConnectorUsing(state *joinDesugarState, span []FromItem, connectorCols []columnInfo) error {
+	inConnector := make(map[string]bool, len(connectorCols))
+	for _, c := range connectorCols {
+		inConnector[r33sFoldIdent(c.Name)] = true
+	}
+	inLeft := make(map[string]bool, len(state.visible))
+	for _, vc := range state.visible {
+		inLeft[r33sFoldIdent(vc.name)] = true
+	}
+	own := make([]FromItem, len(span))
+	copy(own, span)
+	own[0].Join, own[0].On, own[0].Using, own[0].Natural = JoinCross, nil, nil, false
+	cols, err := p.resolveNestedGroupConnectorCols(own)
+	if err != nil {
+		return err
+	}
+	var names []string
+	if span[0].Natural {
+		for _, c := range cols {
+			if !c.Hidden && inLeft[r33sFoldIdent(c.Name)] {
+				names = append(names, c.Name)
+			}
+		}
+	} else {
+		names = span[0].Using
+	}
+	inGroup := make(map[string]bool, len(cols))
+	for _, c := range cols {
+		inGroup[r33sFoldIdent(c.Name)] = true
+	}
+	for _, n := range names {
+		if ln := r33sFoldIdent(n); inGroup[ln] && !inConnector[ln] {
+			return fmt.Errorf("%w: USING/NATURAL join to a parenthesized group on %s, which a member past the first supplies", errVDBEUnsupported, n)
+		}
+	}
+	return nil
 }
