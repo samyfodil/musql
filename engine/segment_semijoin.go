@@ -64,7 +64,7 @@ func segParseSemiGroup(in []Instruction, pc, limit, cursor, nextAt int) (segPlan
 	if test.Op == OpIf && test.P2 > pc+1 && test.P2 < limit {
 		for j := pc + 2; j < test.P2; j++ {
 			switch in[j].Op {
-			case OpIf, OpInteger, OpOpenRead, OpIfEmpty:
+			case OpIfEmpty:
 			default:
 				return no, 0, false
 			}

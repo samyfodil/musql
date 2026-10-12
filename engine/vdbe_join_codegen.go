@@ -2785,10 +2785,7 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 	if halt != nil {
 		for _, pos := range c.existsPos {
 			if pos.src != nil {
-				// Opened at the first test only (compileExistsSubquery);
-				// pos.flag says whether that has happened.
-				pos.cursor, pos.flag = c.allocCursor(), c.alloc()
-				c.emit(Instruction{Op: OpInteger, P1: 0, P2: pos.flag})
+				pos.cursor = c.allocCursor() // opened by its OpIfEmpty
 			}
 		}
 	}

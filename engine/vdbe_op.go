@@ -681,7 +681,9 @@ const (
 	// the outermost loop's end (pLevel->addrHalt), not its own: an empty inner
 	// table ends the join. Here it follows that Rewind too, so it decides only
 	// for a cursor with no seek, filter or stream that could have narrowed what
-	// the Rewind saw, and falls through when it cannot tell.
+	// the Rewind saw, and falls through when it cannot tell. With a P4
+	// (*resolvedTable) it first opens cursor P1 on that table, in database
+	// P3, unless it already is.
 	OpIfEmpty
 
 	// OpJIT never appears in a compiled program. vdbe_jit.go puts it, in a

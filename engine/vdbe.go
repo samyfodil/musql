@@ -2006,8 +2006,22 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			m.cursors[op.P1] = openDerivedCursor(ds.tbl, rows, ds.keepSubtype)
 
 		case OpIfEmpty:
+			if op.P1 < 0 || op.P1 >= len(m.cursors) {
+				break // not a cursor of this program: no answer, so no jump
+			}
+			if tbl, ok := op.P4.(*resolvedTable); ok && tbl != nil {
+				// A table no loop of this program reads: opened here, the
+				// first time (compileExistsSubquery).
+				if cur := m.cursors[op.P1]; cur == nil || cur.tbl != tbl {
+					rp, perr := m.dbPager(op.P3)
+					if perr != nil {
+						return nil, perr
+					}
+					m.cursors[op.P1] = m.openCursorInto(op.P1, rp, tbl)
+				}
+			}
 			cur := m.cursors[op.P1]
-			if cur == nil || cur.rowStore != nil || cur.sub != nil || cur.streamable || cur.seekConfigured ||
+			if cur == nil || (cur.tbl == nil && cur.fill == nil) || cur.rowStore != nil || cur.sub != nil || cur.streamable || cur.seekConfigured ||
 				cur.idxSeekConfigured || cur.seekReseek || cur.segFilter != nil {
 				break
 			}

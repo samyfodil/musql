@@ -1360,16 +1360,11 @@ func (c *compiler) compileExistsSubquery(x ExistsExpr, top bool) (int, error) {
 		if h := c.joinHalt; h != nil && h.off == 0 && c.joinLevelNow >= 0 && c.joinLevelNow < len(h.lv) {
 			// Its level reached, an empty EXISTS table ends the join
 			// (existsJoinPos.src).
-			// The table cannot change while the join runs, so it is opened and
-			// tested once, at the first test that finds no row.
+			// OpIfEmpty opens the table itself the first time (its P4).
 			skip := c.emit(Instruction{Op: OpIf, P1: d})
-			done := c.emit(Instruction{Op: OpIf, P1: pos.flag})
-			c.emit(Instruction{Op: OpInteger, P1: 1, P2: pos.flag})
-			c.emit(Instruction{Op: OpOpenRead, P1: pos.cursor, P2: int(pos.src.tbl.root), P3: pos.src.dbIdx, P4: pos.src.tbl})
 			lv := h.lv[c.joinLevelNow]
-			h.patches[lv] = append(h.patches[lv], c.emit(Instruction{Op: OpIfEmpty, P1: pos.cursor}))
+			h.patches[lv] = append(h.patches[lv], c.emit(Instruction{Op: OpIfEmpty, P1: pos.cursor, P3: pos.src.dbIdx, P4: pos.src.tbl}))
 			c.patch(skip, c.here())
-			c.patch(done, c.here())
 		}
 	}
 	return d, nil

@@ -347,8 +347,8 @@ type existsJoinPos struct {
 	// any inner table -- constructAutomaticIndex's Rewind leaves the same
 	// way). cursor is the enclosing program's own read of it, opened by
 	// emitJoinLoops to tell; -1 until then.
-	src          *joinSource
-	cursor, flag int
+	src    *joinSource
+	cursor int
 }
 
 // before reports whether conjunct cj of the EXISTS's WHERE is coded at a level
