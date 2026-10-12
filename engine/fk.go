@@ -928,9 +928,10 @@ func (db *DB) fkRequireResolvable(tbl *tableMeta, reach fkReach, shape *fkStmtSh
 			switch {
 			case shape.insert && (multi || fk.deferred || db.deferFKs):
 				return fk.resolveErr
-			case shape.insert && shape.upsert && (&fkStmtShape{update: true, assigned: shape.assigned}).parentModified(fk, tbl):
+			case shape.insert && shape.upsert && db.conflictPossible(tbl, shape) && (&fkStmtShape{update: true, assigned: shape.assigned}).parentModified(fk, tbl):
 				// ...and the DO UPDATE is coded as an UPDATE, which looks only when
-				// its SET list assigns a column of the key.
+				// its SET list assigns a column of the key, and only on a table
+				// that has a constraint a conflict could come from.
 				return fk.resolveErr
 			case shape.update && shape.parentModified(fk, tbl):
 				return fk.resolveErr
