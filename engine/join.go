@@ -1508,6 +1508,12 @@ type joinDesugarState struct {
 	// bound to the leftmost table.
 	sawRightJoin     bool
 	pendingAmbiguous string
+
+	// rightQual, while a parenthesized group's outward USING/NATURAL is
+	// desugared, names the member that supplies each common column the
+	// group's first member lacks (checkGroupConnectorUsing): the condition
+	// reads it there, as C reads the group's rebuilt list.
+	rightQual map[string]string
 }
 
 // ambiguousUsing is C's "ambiguous reference to %s in USING()".
@@ -1788,7 +1794,9 @@ func desugarJoinItem(state *joinDesugarState, idx int, it FromItem, name string,
 			lref.UsingPinned, lref.UsingPinnedItem = true, repr
 		}
 		rref := ColumnExpr{Qualifier: name, Name: n}
-		if state.firstScopeNamed(name) != idx {
+		if q, ok := state.rightQual[lname]; ok {
+			rref.Qualifier = q
+		} else if state.firstScopeNamed(name) != idx {
 			state.sharedName = state.sharedName || name != ""
 			rref.Qualifier = ""
 			rref.UsingPinned, rref.UsingPinnedItem = true, idx

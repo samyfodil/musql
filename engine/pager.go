@@ -105,6 +105,10 @@ type ReadOnlyPager struct {
 	// does not memoize them.
 	cteSelfRefLive int
 
+	// lastThrowawayGroup is the source resolveNestedGroupConnectorCols last
+	// built, for checkGroupConnectorUsing to read its member scopes.
+	lastThrowawayGroup *joinSource
+
 	// fromBodyDepth counts the view, CTE and FROM-subquery bodies being
 	// compiled on the current call path (enterFromBody) -- the one context in
 	// which an unusable INDEXED BY partial index is a decline and not C's

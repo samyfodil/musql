@@ -2247,12 +2247,19 @@ func (p *ReadOnlyPager) finishGroupSource(c *compiler, state *joinDesugarState, 
 	if name == "" {
 		name = it.Table
 	}
+	desugarCols := tbl.cols
 	if (it.Natural || it.Using != nil) && gl > 1 {
-		if err := p.checkGroupConnectorUsing(state, items[i:i+gl], tbl.cols); err != nil {
+		cols, rightQual, err := p.checkGroupConnectorUsing(state, items[i:i+gl], tbl.cols)
+		if err != nil {
 			return joinSource{}, err
 		}
+		if rightQual != nil {
+			desugarCols = cols
+			state.rightQual = rightQual
+		}
 	}
-	onExpr, hidden, derr := desugarJoinItem(state, i, it, name, tbl.cols)
+	onExpr, hidden, derr := desugarJoinItem(state, i, it, name, desugarCols)
+	state.rightQual = nil
 	if derr != nil {
 		return joinSource{}, declineOrSemantic(derr)
 	}
@@ -2538,6 +2545,7 @@ func (p *ReadOnlyPager) resolveNestedGroupConnectorCols(span []FromItem) ([]colu
 	if err != nil {
 		return nil, err
 	}
+	p.lastThrowawayGroup = &gs
 	return gs.tbl.cols[:len(gs.tbl.cols)-gs.groupRowids], nil
 }
 
@@ -3294,14 +3302,20 @@ func markStarBare(items []FromItem, srcs []joinSource, absToSrcs map[int]int) {
 	}
 }
 
-// checkGroupConnectorUsing declines a USING/NATURAL join to a parenthesized
+// checkGroupConnectorUsing handles a USING/NATURAL join to a parenthesized
 // group whose common columns C takes from members past the first. C joins
 // against the group's whole column list (sqlite3ProcessJoin looks the name up
 // in the group subquery's table): "pa NATURAL JOIN (pb NATURAL JOIN pc)" joins
-// on pc's v as well, and "USING(v)" finds it there. This engine addresses the
-// group's side through its first member (desugarJoinItem over connectorCols),
-// which would join on fewer columns, so such a join declines.
-func (p *ReadOnlyPager) checkGroupConnectorUsing(state *joinDesugarState, span []FromItem, connectorCols []columnInfo) error {
+// on pc's v as well, and "USING(v)" finds it there. The desugared condition
+// reads such a column from its member (rightQual), and the columns returned
+// are the first member's plus the first occurrence of every other name.
+//
+// It declines where that is not enough: a "*" over the group (the rebuilt
+// list's order and entries), a RIGHT/FULL connector (its coalesce reads the
+// first member), a column some USING inside the group merges, or a member a
+// name cannot single out. nil rightQual means the first member supplies every
+// common column and nothing changes.
+func (p *ReadOnlyPager) checkGroupConnectorUsing(state *joinDesugarState, span []FromItem, connectorCols []columnInfo) ([]columnInfo, map[string]string, error) {
 	inConnector := make(map[string]bool, len(connectorCols))
 	for _, c := range connectorCols {
 		inConnector[r33sFoldIdent(c.Name)] = true
@@ -3313,28 +3327,86 @@ func (p *ReadOnlyPager) checkGroupConnectorUsing(state *joinDesugarState, span [
 	own := make([]FromItem, len(span))
 	copy(own, span)
 	own[0].Join, own[0].On, own[0].Using, own[0].Natural = JoinCross, nil, nil, false
-	cols, err := p.resolveNestedGroupConnectorCols(own)
-	if err != nil {
-		return err
+	p.lastThrowawayGroup = nil
+	if _, err := p.resolveNestedGroupConnectorCols(own); err != nil {
+		return nil, nil, err
+	}
+	gs := p.lastThrowawayGroup
+	p.lastThrowawayGroup = nil
+	if gs == nil || len(gs.memberScopes) == 0 {
+		return nil, nil, fmt.Errorf("%w: USING/NATURAL join to a parenthesized group whose members are not resolved", errVDBEUnsupported)
+	}
+	// The first occurrence of each name across the members, in member order.
+	type owner struct {
+		member int
+		col    columnInfo
+	}
+	first := map[string]owner{}
+	var order []string
+	for k, ms := range gs.memberScopes {
+		for _, c := range ms.cols {
+			ln := r33sFoldIdent(c.Name)
+			if _, seen := first[ln]; !seen {
+				first[ln] = owner{member: k, col: c}
+				order = append(order, ln)
+			}
+		}
 	}
 	var names []string
 	if span[0].Natural {
-		for _, c := range cols {
-			if !c.Hidden && inLeft[r33sFoldIdent(c.Name)] {
+		for _, ln := range order {
+			if c := first[ln].col; !c.Hidden && inLeft[ln] {
 				names = append(names, c.Name)
 			}
 		}
 	} else {
 		names = span[0].Using
 	}
-	inGroup := make(map[string]bool, len(cols))
-	for _, c := range cols {
-		inGroup[r33sFoldIdent(c.Name)] = true
-	}
+	var rightQual map[string]string
 	for _, n := range names {
-		if ln := r33sFoldIdent(n); inGroup[ln] && !inConnector[ln] {
-			return fmt.Errorf("%w: USING/NATURAL join to a parenthesized group on %s, which a member past the first supplies", errVDBEUnsupported, n)
+		ln := r33sFoldIdent(n)
+		o, inGroup := first[ln]
+		if !inGroup || inConnector[ln] {
+			continue
+		}
+		ms := gs.memberScopes[o.member]
+		decline := func(why string) error {
+			return fmt.Errorf("%w: USING/NATURAL join to a parenthesized group on %s, which a member past the first supplies (%s)", errVDBEUnsupported, n, why)
+		}
+		switch {
+		case span[0].GroupRebuildStarred:
+			return nil, nil, decline("a \"*\" expands the group")
+		case span[0].Join == JoinRight || span[0].Join == JoinFull:
+			return nil, nil, decline("a RIGHT/FULL connector")
+		case ms.name == "":
+			return nil, nil, decline("an unnamed member")
+		}
+		for k, other := range gs.memberScopes {
+			if _, merged := other.coalesced[ln]; merged {
+				return nil, nil, decline("merged by a USING inside the group")
+			}
+			if k != o.member && equalFoldName(other.name, ms.name) {
+				return nil, nil, decline("a member name the group repeats")
+			}
+		}
+		for _, sn := range state.scopeNames {
+			if equalFoldName(sn, ms.name) {
+				return nil, nil, decline("a member name the FROM repeats")
+			}
+		}
+		if rightQual == nil {
+			rightQual = map[string]string{}
+		}
+		rightQual[ln] = ms.name
+	}
+	if rightQual == nil {
+		return nil, nil, nil
+	}
+	cols := append([]columnInfo(nil), connectorCols...)
+	for _, ln := range order {
+		if o := first[ln]; !inConnector[ln] && o.member > 0 {
+			cols = append(cols, o.col)
 		}
 	}
-	return nil
+	return cols, rightQual, nil
 }
