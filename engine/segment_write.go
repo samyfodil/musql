@@ -723,7 +723,7 @@ func (n *Session) deltaAppendExceeds(recs []SegDeltaRecord) bool {
 // noting no RowChange. Committing only the log lost their data ("CREATE VIRTUAL
 // TABLE v USING fts5(c); INSERT INTO v VALUES('apple')" reopened empty).
 //
-// ponytail: the answer is the whole-file rewrite. Turning shadow rows into
+// A deliberate simplification: the answer is the whole-file rewrite. Turning shadow rows into
 // records needs the pre-mutation rowid set the wholesale rewrite discards, so
 // the vtab layer would have to record its own writes; do that if vtab-heavy
 // write loads matter.
