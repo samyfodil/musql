@@ -539,6 +539,12 @@ type DB struct {
 	// push its undo onto the same statement journal.
 	activeWC *writeCtx
 
+	// wcFree is the one writeCtx runWrite keeps from a finished statement for
+	// the next, so a prepared single-row INSERT run in a loop does not allocate
+	// 300 bytes of statement state per row. See getWriteCtx for what may and
+	// may not be kept.
+	wcFree *writeCtx
+
 	// writeRecChunk / writeRecChunkSize carry a write program's record arena
 	// (vdbe.recAlloc) from one execution to the next, so a prepared single-row
 	// INSERT run in a loop carves its stored rows from shared chunks instead of
@@ -556,7 +562,7 @@ type DB struct {
 	// commitsEachStatement: the caller commits after every autocommit
 	// statement (SetCommitsEachStatement).
 	commitsEachStatement bool
-	changeLog            []RowChange
+	changeLog            changeLog
 
 	// segments is the read side of a SEGMENT session (segment_write.go): the
 	// pager whose ScanTable serves segments with the delta merged. Non-nil only

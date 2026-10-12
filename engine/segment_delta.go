@@ -730,10 +730,12 @@ func (st *segDeltaState) applyRecs(recs []SegDeltaRecord) bool {
 		if !recs[i].Kill && recs[i].src != nil {
 			return false
 		}
-		total += len(recs[i].Vals)
+		if !recs[i].Kill && !canonicalDeltaRow(recs[i].Vals) {
+			total += len(recs[i].Vals)
+		}
 	}
-	// Every row's values from one allocation, not one per row; each capped so
-	// no row can grow into the next.
+	// The values of every row that needs rebuilding from one allocation, not
+	// one per row; each capped so no row can grow into the next.
 	slab := make([]Value, total)
 	var live map[int64][]Value
 	liveTable := -1
@@ -743,22 +745,29 @@ func (st *segDeltaState) applyRecs(recs []SegDeltaRecord) bool {
 			st.kill(r.Table, r.Rowid)
 			continue
 		}
-		vals := slab[:len(r.Vals):len(r.Vals)]
-		slab = slab[len(r.Vals):]
-		for c, v := range r.Vals {
-			switch v.Typ {
-			case Int:
-				vals[c] = Value{Typ: Int, I: v.I}
-			case Float:
-				vals[c] = Value{Typ: Float, F: v.F}
-			case Text, Blob:
-				b := v.S[:len(v.S):len(v.S)]
-				if b == nil {
-					b = []byte{} // decodeRecord's empty value is a non-nil slice
+		var vals []Value
+		if canonicalDeltaRow(r.Vals) {
+			// Already what the rebuild below would produce, and a store's row is
+			// never edited in place: the view shares it.
+			vals = r.Vals[:len(r.Vals):len(r.Vals)]
+		} else {
+			vals = slab[:len(r.Vals):len(r.Vals)]
+			slab = slab[len(r.Vals):]
+			for c, v := range r.Vals {
+				switch v.Typ {
+				case Int:
+					vals[c] = Value{Typ: Int, I: v.I}
+				case Float:
+					vals[c] = Value{Typ: Float, F: v.F}
+				case Text, Blob:
+					b := v.S[:len(v.S):len(v.S)]
+					if b == nil {
+						b = []byte{} // decodeRecord's empty value is a non-nil slice
+					}
+					vals[c] = Value{Typ: v.Typ, S: b}
+				default:
+					vals[c] = Value{Typ: Null}
 				}
-				vals[c] = Value{Typ: v.Typ, S: b}
-			default:
-				vals[c] = Value{Typ: Null}
 			}
 		}
 		// put, with the table's map looked up once per run of its rows.
@@ -771,6 +780,39 @@ func (st *segDeltaState) applyRecs(recs []SegDeltaRecord) bool {
 		live[r.Rowid] = vals
 		if d := st.dead[r.Table]; len(d) > 0 {
 			delete(d, r.Rowid)
+		}
+	}
+	return true
+}
+
+// canonicalDeltaRow reports whether vals is already in the form a replayed
+// record decodes to: every value only the fields its type uses, and a TEXT or
+// BLOB a non-nil slice with no spare capacity.
+func canonicalDeltaRow(vals []Value) bool {
+	for i := range vals {
+		v := &vals[i]
+		if v.Subtype != 0 {
+			return false
+		}
+		switch v.Typ {
+		case Int:
+			if v.F != 0 || v.S != nil {
+				return false
+			}
+		case Float:
+			if v.I != 0 || v.S != nil {
+				return false
+			}
+		case Text, Blob:
+			if v.I != 0 || v.F != 0 || v.S == nil || cap(v.S) != len(v.S) {
+				return false
+			}
+		case Null:
+			if v.I != 0 || v.F != 0 || v.S != nil {
+				return false
+			}
+		default:
+			return false
 		}
 	}
 	return true

@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"iter"
 	"maps"
+	"math"
 	"slices"
 )
 
@@ -63,6 +64,10 @@ type rowStore struct {
 	// rollback replays it backwards to that offset. See row_store_undo.go.
 	undo    []rsUndo
 	logging bool
+	// undoSealed is the log's length when a snapshot last took an offset into
+	// it (startUndo): an entry before it is one a rollback may stop short of, so
+	// a later put never extends it into a run.
+	undoSealed int
 
 	// spill holds the rows this store let go of, and memBytes counts the bytes of
 	// rows it still holds in m -- see row_store_spill.go.
@@ -163,7 +168,12 @@ func (s *rowStore) put(rowid uint64, vals []Value) {
 		}
 	}
 	if s.logging {
-		s.undo = append(s.undo, rsUndo{rowid: rowid, old: old, had: haveOld})
+		if l := len(s.undo) - 1; !haveOld && l >= s.undoSealed && l >= 0 && s.undo[l].clr == nil && !s.undo[l].had &&
+			s.undo[l].run < math.MaxUint32 && s.undo[l].rowid+uint64(s.undo[l].run)+1 == rowid {
+			s.undo[l].run++ // the next new rowid after the last entry's run
+		} else {
+			s.undo = append(s.undo, rsUndo{rowid: rowid, old: old, had: haveOld})
+		}
 	}
 	n0 := len(s.m)
 	s.m[rowid] = vals
@@ -204,7 +214,7 @@ func (s *rowStore) clear() int64 {
 	if s.seg != nil {
 		n := int64(s.segLen())
 		if s.logging {
-			s.undo = append(s.undo, rsUndo{prior: s.m, priorGone: s.gone, priorBaseGone: s.baseGone, priorN: s.n, priorNKnown: s.nKnown, segClear: true})
+			s.undo = append(s.undo, rsUndo{clr: &rsClear{prior: s.m, priorGone: s.gone, priorBaseGone: s.baseGone, priorN: s.n, priorNKnown: s.nKnown, segClear: true}})
 		}
 		s.m, s.gone, s.baseGone, s.n, s.nKnown = map[uint64][]Value{}, nil, true, 0, true
 		s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false
@@ -218,7 +228,7 @@ func (s *rowStore) clear() int64 {
 	n := int64(len(s.m))
 	if s.logging {
 		// The whole map is set aside, not copied: nothing writes it again.
-		s.undo = append(s.undo, rsUndo{prior: s.m})
+		s.undo = append(s.undo, rsUndo{clr: &rsClear{prior: s.m}})
 	}
 	s.m = map[uint64][]Value{}
 	s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false

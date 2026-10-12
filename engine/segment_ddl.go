@@ -188,7 +188,7 @@ func (n *Session) rewriteFile() error {
 	f.Close()
 	// Every row is now IN the segments, so the changes that produced them must not
 	// also be appended as a delta batch.
-	n.TakeRowChanges()
+	n.changeLog.reset()
 	// AND THE CATALOG IS NOW WRITTEN, which is what stops the next commit rewriting
 	// the file again. Losing this line made every commit take the rewrite path: the
 	// fingerprint never matched, so an ordinary INSERT rewrote the whole file, and

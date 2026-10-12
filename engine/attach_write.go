@@ -463,12 +463,12 @@ func (db *DB) attachedOriginatingFireInsert(trs []*triggerMeta, w *DB, name stri
 func attachedRowCapture(w *DB) func() []RowChange {
 	// FULL capture for the span: attachedOriginatingFireRows fires triggers
 	// against the OLD/NEW images recorded here, and the light form records no OLD.
-	saved, savedFull, mark := w.captureChanges, w.captureFull, len(w.changeLog)
+	saved, savedFull, mark := w.captureChanges, w.captureFull, w.changeLog.len()
 	w.captureChanges, w.captureFull = true, true
 	return func() []RowChange {
-		rows := append([]RowChange(nil), w.changeLog[mark:]...)
+		rows := w.changeLog.flat(mark)
 		if !saved {
-			w.changeLog = w.changeLog[:mark]
+			w.changeLog.truncate(mark)
 			w.captureChanges = false
 		}
 		w.captureFull = savedFull

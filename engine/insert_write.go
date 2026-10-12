@@ -2107,9 +2107,9 @@ func (db *DB) ExecArgs(sqlText string, args []Value) (rowsAffected int64, lastIn
 	// (parse.y:44-51 -- see incompleteIfAtEOF).
 	defer func() { err = incompleteIfAtEOF(err) }()
 	if CommitOrderHookForTest != nil {
-		db.lastExecSQL, db.lastExecArgs = sqlText, args
+		db.lastExecSQL, db.lastExecArgs = sqlText, append([]Value(nil), args...)
 	}
-	logMark := len(db.changeLog)
+	logMark := db.changeLog.len()
 	defer func() {
 		if perr := db.takeDeferredErr(); perr != nil && err == nil {
 			err = perr

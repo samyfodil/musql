@@ -552,7 +552,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 			return false, rerr
 		}
 	}
-	changes := n.TakeRowChanges()
+	changes := n.takeChangeLog()
 	// Handed back for the next statement once this commit is done with it, so
 	// the log does not regrow from nothing every statement. Not under full
 	// capture, whose changes may be held past the commit.
@@ -568,11 +568,11 @@ func (n *Session) commitMainLocked() (bool, error) {
 		n.noteCommittedColumnsStale()
 		return true, nil
 	}
-	if len(changes) == 0 {
+	if changes.len() == 0 {
 		return false, nil
 	}
 	// CONSUMING, when nothing else reads the log -- see segDeltaRecordsInto.
-	recs, err := segDeltaRecordsInto(n.recBuf, changes, n.effectiveTableIndex(), n.ipkOf, n.storeOf(false))
+	recs, err := segDeltaRecordsInto(n.recBuf, changes.len(), changes.all(), n.effectiveTableIndex(), n.ipkOf, n.storeOf(false))
 	// Kept for the next commit, and emptied on the way out so it pins no row.
 	// Only [0:len) was written: every commit clears what it wrote, and an
 	// error returns nil, dropping the buffer. Clearing the whole capacity cost
@@ -727,10 +727,10 @@ func (n *Session) deltaAppendExceeds(recs []SegDeltaRecord) bool {
 // records needs the pre-mutation rowid set the wholesale rewrite discards, so
 // the vtab layer would have to record its own writes; do that if vtab-heavy
 // write loads matter.
-func (db *DB) mutatedOutsideChangeLog(changes []RowChange) bool {
+func (db *DB) mutatedOutsideChangeLog(changes *changeLog) bool {
 	described := map[string]bool{}
 	last := ""
-	for _, c := range changes {
+	for c := range changes.all() {
 		// A commit's changes come in runs of one table: fold each name once
 		// per run, not once per row.
 		if c.Temp || c.Table == last {

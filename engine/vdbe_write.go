@@ -461,7 +461,10 @@ func (db *DB) execReturningViaVM(sqlText string, args []Value) (cols []string, r
 // runWrite executes a compiled write Program on a fresh VM carrying this *DB
 // write handle, returning the rows-affected count the terminal opcode records.
 func (db *DB) runWrite(prog *Program, args []Value) (rowsAffected int64, err error) {
-	wc := &writeCtx{db: db, changeMark: db.changeMark()}
+	wc := db.getWriteCtx()
+	// Registered first, so it runs after every deferred call below that still
+	// reads wc.
+	defer db.putWriteCtx(wc)
 	// FROM THE PROGRAM'S POOL, not fresh: a prepared INSERT run in a loop is the
 	// shape this exists for, and the machine plus its register file was 30% of
 	// everything such a loop allocated. See getMachine for what may be reused.
@@ -538,6 +541,46 @@ func (db *DB) runWrite(prog *Program, args []Value) (rowsAffected int64, err err
 		return 0, ferr
 	}
 	return int64(wc.rowsAffected), nil
+}
+
+// getWriteCtx returns the statement state for a write run on db: the one the
+// last runWrite released when there is one, otherwise a fresh one.
+//
+// A writeCtx is referenced from exactly three places -- a VM's wctx (a pooled
+// machine is scrubbed of it by putMachine), db.activeWC and db.vec1Wctx (both
+// restored when the statement that set them ends) -- and from the closures and
+// journal entries it holds itself. None outlives runWrite, which is the only
+// caller that recycles one. A nested statement (a trigger body, an FK action)
+// finds the slot empty and allocates its own.
+func (db *DB) getWriteCtx() *writeCtx {
+	wc := db.wcFree
+	if wc == nil {
+		return &writeCtx{db: db, changeMark: db.changeMark()}
+	}
+	db.wcFree = nil
+	wc.changeMark = db.changeMark()
+	return wc
+}
+
+// putWriteCtx scrubs wc and keeps it for the next statement. The whole struct
+// is rebuilt from a literal, so a field added later is zero by default rather
+// than left over from the last statement; only the journal's storage is kept,
+// emptied so it pins no row.
+func (db *DB) putWriteCtx(wc *writeCtx) {
+	j := wc.journal
+	if cap(j) > 1024 {
+		// A statement that journalled thousands of entries should not leave
+		// them pinned by the session.
+		j = nil
+	} else {
+		clear(j[:cap(j)])
+		j = j[:0]
+	}
+	*wc = writeCtx{db: db}
+	if j != nil {
+		wc.journal = j
+	}
+	db.wcFree = wc
 }
 
 // unwindFKViolation undoes a statement whose end-of-statement immediate FK
@@ -4873,10 +4916,15 @@ func (e *undoEntry) run() {
 }
 
 func (wc *writeCtx) journalAppend(e undoEntry) {
+	wc.journal = append(wc.journalSlice(), e)
+}
+
+// journalSlice is the journal, started over the inline buffer when it has none.
+func (wc *writeCtx) journalSlice() []undoEntry {
 	if wc.journal == nil {
 		wc.journal = wc.journalBuf[:0]
 	}
-	wc.journal = append(wc.journal, e)
+	return wc.journal
 }
 
 // undoFn journals an arbitrary undo step.

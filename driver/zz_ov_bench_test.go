@@ -1,10 +1,12 @@
 package driver_test
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"testing"
 
 	_ "github.com/samyfodil/musql/driver"
@@ -26,7 +28,7 @@ func BenchmarkPreparedPointLookup(b *testing.B) {
 	q.QueryRow(1).Scan(&v)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := q.QueryRow(int64(i%100000)+1).Scan(&v); err != nil {
+		if err := q.QueryRow(int64(i%100000) + 1).Scan(&v); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -90,9 +92,11 @@ func BenchmarkBulkUpdate(b *testing.B) {
 		b.StopTimer()
 		db, dir := ovSeedK(b, 100000)
 		b.StartTimer()
-		if _, err := db.Exec(`UPDATE t SET v = v + 1 WHERE k = ?`, 3); err != nil {
-			b.Fatal(err)
-		}
+		pprof.Do(context.Background(), pprof.Labels("phase", "update"), func(context.Context) {
+			if _, err := db.Exec(`UPDATE t SET v = v + 1 WHERE k = ?`, 3); err != nil {
+				b.Fatal(err)
+			}
+		})
 		b.StopTimer()
 		db.Close()
 		os.RemoveAll(dir)

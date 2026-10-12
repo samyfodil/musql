@@ -1919,6 +1919,10 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			if rerr := cur.rewind(); rerr != nil {
 				return nil, rerr
 			}
+			if cur.writeHint > 0 && m.wctx != nil {
+				m.wctx.journal = slices.Grow(m.wctx.journalSlice(), cur.writeHint)
+				cur.writeHint = 0
+			}
 			if !cur.advance() {
 				if cur.streamErrPending != nil {
 					return nil, cur.streamErrPending

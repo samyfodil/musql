@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"iter"
 	"fmt"
 	"slices"
 )
@@ -40,8 +41,8 @@ import (
 // The records reference the store's rows and copy nothing, so the caller must
 // clear the buffer once the batch is appended, or it pins those rows until the
 // next commit.
-func segDeltaRecordsInto(dst []SegDeltaRecord, changes []RowChange, tableIndex map[string]int, ipkOf map[string]int, storeOf func(table string) *rowStore) ([]SegDeltaRecord, error) {
-	out := slices.Grow(dst[:0], len(changes))
+func segDeltaRecordsInto(dst []SegDeltaRecord, n int, changes iter.Seq[*RowChange], tableIndex map[string]int, ipkOf map[string]int, storeOf func(table string) *rowStore) ([]SegDeltaRecord, error) {
+	out := slices.Grow(dst[:0], n)
 	emit := func(ti int, table string, rowid int64) {
 		if k := len(out) - 1; k >= 0 && out[k].Table == ti && out[k].Rowid == rowid {
 			return // the same row twice in a row
@@ -79,7 +80,7 @@ func segDeltaRecordsInto(dst []SegDeltaRecord, changes []RowChange, tableIndex m
 		lastOK    bool
 		lastIPK   = -1
 	)
-	for _, ch := range changes {
+	for ch := range changes {
 		if ch.Temp {
 			// A TEMP table is session-private and never persisted, so its rows have
 			// no place in the delta -- and letting one through is worse than losing

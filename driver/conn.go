@@ -27,6 +27,11 @@ import (
 // which is what gives a transaction read-your-writes. An ATTACHed database's
 // file gets a held session of its own (ndbs, sessionFor).
 type Conn struct {
+	// resultDiscarded is set by a caller of execArgs that ignores its Result
+	// (Stmt.ExecContext builds its own), so the held-transaction path can hand
+	// back the shared discardedResult instead of allocating one per statement.
+	resultDiscarded bool
+
 	path string
 	// paramInfo caches engine.ParseParamInfo by SQL text. database/sql prepares
 	// on every QueryRow, and parsing just to count parameters was a fifth of a
@@ -1006,6 +1011,9 @@ func (c *Conn) execArgs(sqlText string, args []engine.Value) (driver.Result, err
 		// doc comment -- so the Conn-level mirror is read back here too.
 		c.writableSchema = c.tx.WritableSchema()
 		c.noteConnState(c.tx)
+		if c.resultDiscarded {
+			return discardedResult, nil
+		}
 		return &execResult{rowsAffected: n, lastInsertID: c.lastInsertRowid}, nil
 	}
 

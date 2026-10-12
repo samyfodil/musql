@@ -26,6 +26,17 @@ type rsUndo struct {
 	rowid uint64
 	old   []Value
 	had   bool
+	// run extends a !had entry over the rowids after rowid: a run of INSERTs of
+	// consecutive new rowids, the shape of a bulk load, is one entry, not one
+	// per row. It undoes newest first, like separate entries.
+	run uint32
+	// clr is set only by a clear, which is rare; keeping its fields behind a
+	// pointer halves the size of the entry every other put and drop appends.
+	clr *rsClear
+}
+
+// rsClear is what a clear set aside.
+type rsClear struct {
 	prior map[uint64][]Value
 	// segClear marks a clear of a segment-backed store (row_store_seg.go), which set
 	// aside its overlay, its tombstones and the visibility of its whole base.
@@ -47,6 +58,7 @@ func (s *rowStore) startUndo() int {
 		s.logging = true
 		s.undo = s.undo[:0]
 	}
+	s.undoSealed = len(s.undo)
 	return len(s.undo)
 }
 
@@ -62,8 +74,8 @@ func (s *rowStore) undoTo(mark int) {
 	for i := len(s.undo) - 1; i >= mark; i-- {
 		u := s.undo[i]
 		switch {
-		case u.segClear:
-			s.m, s.gone, s.baseGone, s.n, s.nKnown = u.prior, u.priorGone, u.priorBaseGone, u.priorN, u.priorNKnown
+		case u.clr != nil && u.clr.segClear:
+			s.m, s.gone, s.baseGone, s.n, s.nKnown = u.clr.prior, u.clr.priorGone, u.clr.priorBaseGone, u.clr.priorN, u.clr.priorNKnown
 			s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false
 			s.ubKnown = false
 			s.overValid, s.memBytes = false, 0 // the prior map's in-memory share is not known
@@ -71,8 +83,8 @@ func (s *rowStore) undoTo(mark int) {
 			s.rangeKnown = false
 			s.invalidateEqIndexes()
 			s.uqIdx = nil
-		case u.prior != nil:
-			s.m = u.prior
+		case u.clr != nil && u.clr.prior != nil:
+			s.m = u.clr.prior
 			s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false
 			s.ubKnown = false
 			s.overValid, s.memBytes = false, 0 // the prior map's in-memory share is not known
@@ -83,7 +95,9 @@ func (s *rowStore) undoTo(mark int) {
 		case u.had:
 			s.put(u.rowid, u.old)
 		default:
-			s.drop(u.rowid)
+			for k := uint64(u.run) + 1; k > 0; k-- {
+				s.drop(u.rowid + k - 1)
+			}
 		}
 	}
 	clear(s.undo[mark:])
@@ -98,5 +112,5 @@ func (s *rowStore) stopUndo() {
 	}
 	s.logging = false
 	clear(s.undo)
-	s.undo = nil
+	s.undo, s.undoSealed = nil, 0
 }
