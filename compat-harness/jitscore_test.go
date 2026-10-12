@@ -76,6 +76,13 @@ func tclJSWrite() error {
 		fmt.Fprintln(w, r)
 	}
 	tclJSMu.Unlock()
+	// What the programs this process compiled looked like, one line.
+	ps := engine.JitProgramStats()
+	fmt.Fprintf(w, "#kernels\t%d\t%d\t%d\t%d\t%d\t%d\t%d", ps.Programs, ps.IRIn, ps.IROut, ps.CodeBytes, ps.Allocated, ps.Spilled, ps.Coalesced)
+	for _, r := range ps.Runs {
+		fmt.Fprintf(w, "\t%d", r)
+	}
+	fmt.Fprintln(w)
 	if err := w.Flush(); err != nil {
 		f.Close()
 		return err

@@ -118,6 +118,8 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 // pass when fusable says the program has a pair it merges (and fusion is on).
 func EmitProgramFlagged(insns []ProgInsn, nCols int, fusable bool) ([]byte, error) {
 	progsEmitted.Add(1)
+	progCount.Add(1)
+	progIRIn.Add(int64(len(insns)))
 	if (fusable || fuseAll.Load()) && !fusionOff.Load() {
 		start := time.Now()
 		n := len(insns)
@@ -128,7 +130,10 @@ func EmitProgramFlagged(insns []ProgInsn, nCols int, fusable bool) ([]byte, erro
 			progsMissed.Add(1) // only under SetFuseAllForTest: the gate would have skipped a change
 		}
 	}
-	return emitProgram(insns, nCols)
+	progIROut.Add(int64(len(insns)))
+	code, err := emitProgram(insns, nCols)
+	progCodeBytes.Add(int64(len(code)))
+	return code, err
 }
 
 // fuseAll runs the pass on every program, flagged or not (SetFuseAllForTest).
@@ -141,6 +146,35 @@ func SetFuseAllForTest(on bool) { fuseAll.Store(on) }
 // The pass's own accounting, for measuring what it costs and how often it
 // runs (FusionStatsForTest).
 var progsEmitted, progsFused, progsMissed, fuseNanos atomic.Int64
+
+// What the emitted programs look like (ProgramStatsForTest): IR steps in and
+// out of the fusion pass, bytes of machine code, and the lengths of the runs
+// fused -- how many IR steps each merge took into one.
+var progCount, progIRIn, progIROut, progCodeBytes atomic.Int64
+var progRuns [maxRunBucket + 1]atomic.Int64
+
+const maxRunBucket = 16
+
+func noteRun(n int) { progRuns[min(n, maxRunBucket)].Add(1) }
+
+// ProgramStats is ProgramStatsForTest's answer.
+type ProgramStats struct {
+	Programs, IRIn, IROut, CodeBytes int64
+	Allocated, Spilled, Coalesced    int64
+	Runs                             [maxRunBucket + 1]int64 // [n]: runs of n steps fused into one; [16]: 16 or more
+}
+
+// ProgramStatsForTest reads and clears the counts behind ProgramStats.
+func ProgramStatsForTest() ProgramStats {
+	st := ProgramStats{
+		Programs: progCount.Swap(0), IRIn: progIRIn.Swap(0), IROut: progIROut.Swap(0), CodeBytes: progCodeBytes.Swap(0),
+	}
+	st.Allocated, st.Spilled, st.Coalesced = RegAllocStatsForTest()
+	for i := range progRuns {
+		st.Runs[i] = progRuns[i].Swap(0)
+	}
+	return st
+}
 
 // FusionStatsForTest reads and clears how many programs were emitted, how
 // many of them went through the fusion pass, the time it took, and -- under
@@ -418,6 +452,11 @@ func fuseOnce(insns []ProgInsn) ([]ProgInsn, bool) {
 						keep[i-1] = false
 					}
 				}
+				run := 2
+				if fused.BCol {
+					run = 3 // the load folded in
+				}
+				noteRun(run)
 				work[i], keep[i+1], changed = fused, false, true
 				i++
 				continue
@@ -780,6 +819,7 @@ func fuseConds(insns []ProgInsn) ([]ProgInsn, bool) {
 		for i, in := range out {
 			work[k+i], keep[k+i] = in, true
 		}
+		noteRun(j - k + 1)
 		changed = true
 	}
 	if !changed {

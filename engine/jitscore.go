@@ -29,3 +29,9 @@ func JitScoreTake() JitScoreStat {
 	}
 	return jitScoreTake(jit.KernelCallsForTest())
 }
+
+// JitProgramStats reads and clears what the compiled programs emitted since
+// the last call looked like: IR steps in and out of fusion, machine code
+// bytes, registers the allocator placed and left in the file, copies it
+// coalesced away, and the lengths of the runs fused (jit.ProgramStats).
+func JitProgramStats() jit.ProgramStats { return jit.ProgramStatsForTest() }

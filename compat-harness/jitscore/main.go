@@ -22,6 +22,11 @@ import (
 	"strings"
 )
 
+// kernels sums the "#kernels" lines: programs, IR steps in and out of
+// fusion, code bytes, registers allocated, left in the file, copies
+// coalesced, then fused runs by length 0..16.
+var kernels [7 + 17]int64
+
 type rec struct {
 	kind                           string
 	steps, enters, calls, nat, all int64
@@ -44,6 +49,15 @@ func load(dir string) (map[string]rec, error) {
 		sc.Buffer(make([]byte, 1<<20), 1<<24)
 		for sc.Scan() {
 			p := strings.Split(sc.Text(), "\t")
+			if p[0] == "#kernels" {
+				for i, v := range p[1:] {
+					if i < len(kernels) {
+						n, _ := strconv.ParseInt(v, 10, 64)
+						kernels[i] += n
+					}
+				}
+				continue
+			}
 			if len(p) < 8 {
 				continue
 			}
@@ -82,6 +96,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	kOn := kernels
 	off, err := load(os.Args[2])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -191,6 +206,27 @@ func main() {
 		ws = append(ws, opw{op, n})
 	}
 	sort.Slice(ws, func(i, j int) bool { return ws[i].n > ws[j].n })
+	if progs := kOn[0]; progs > 0 {
+		f := func(x int64) float64 { return float64(x) / float64(progs) }
+		fmt.Printf("\ncompiled programs: %d; per program: %.1f IR steps in, %.1f after fusion, %d bytes of code\n",
+			progs, f(kOn[1]), f(kOn[2]), kOn[3]/progs)
+		fmt.Printf("registers: %d in machine registers, %d left in the file (%.2f per program), %d copies coalesced\n",
+			kOn[4], kOn[5], f(kOn[5]), kOn[6])
+		var runs int64
+		for _, n := range kOn[7:] {
+			runs += n
+		}
+		fmt.Printf("fused runs by length (IR steps merged into one), %d runs\n", runs)
+		for l, n := range kOn[7:] {
+			if n > 0 {
+				lbl := strconv.Itoa(l)
+				if l == 16 {
+					lbl = "16+"
+				}
+				fmt.Printf("  %-4s %8d  %5.1f%%\n", lbl, n, 100*float64(n)/float64(max(runs, 1)))
+			}
+		}
+	}
 	fmt.Println("\nworklist: the opcodes still interpreted with the JIT on, by instructions executed")
 	for i, w := range ws {
 		if i == 20 {
