@@ -58,7 +58,7 @@ type segRowMemo struct {
 
 const (
 	memoSlots = 1 << 14
-	memoAfter = 4096
+	memoAfter = 256
 )
 
 // memoKey is what the memo's rows were decoded from.

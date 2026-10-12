@@ -102,14 +102,26 @@ type SegDeltaRecord struct {
 	// KEY column, written NULL (the rowid carries it), or -1.
 	src *rowStore
 	ipk int
+
+	// size is recordLen plus one, once measured: a commit measures every put
+	// to decide whether it rewrites the file (compactionDueAfter) and again
+	// to lay the batch out (writeSegDeltaBatch).
+	size int
 }
 
 // recordLen is the length of the put's record.
 func (r *SegDeltaRecord) recordLen() int {
-	if r.src != nil {
-		return r.src.recordLen(uint64(r.Rowid), r.ipk)
+	if r.size > 0 {
+		return r.size - 1
 	}
-	return recordSize(r.Vals)
+	var n int
+	if r.src != nil {
+		n = r.src.recordLen(uint64(r.Rowid), r.ipk)
+	} else {
+		n = recordSize(r.Vals)
+	}
+	r.size = n + 1
+	return n
 }
 
 // appendRecordTo appends the put's record to dst.
