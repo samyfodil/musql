@@ -294,6 +294,31 @@ func vecFastAtoF(num []byte) (float64, bool) {
 	return r, true
 }
 
+// vecFastComponent parses the component of a vector's text starting at i
+// when it is the common shape: optional spaces, a number vecFastAtoF
+// takes, optional spaces, and ',' or ']' at e. false for anything else,
+// which parseVectorText's general scan then handles exactly as before.
+var vecSlowComponentsForTest bool // every component the general way
+
+func vecFastComponent(s []byte, i int) (x float64, e int, ok bool) {
+	for i < len(s) && vecTextClass[s[i]] == vecClassSpace {
+		i++
+	}
+	lo := i
+	for i < len(s) && vecTextClass[s[i]] == vecClassOther {
+		i++
+	}
+	hi := i
+	for i < len(s) && vecTextClass[s[i]] == vecClassSpace {
+		i++
+	}
+	if i == len(s) || (s[i] != ',' && s[i] != ']') || hi == lo || hi-lo > vecMaxFloatSz+1 {
+		return 0, 0, false
+	}
+	x, ok = vecFastAtoF(s[lo:hi])
+	return x, i, ok
+}
+
 func parseVectorText(s []byte, t vecType) (vector, error) {
 	i := 0
 	skip := func() {
@@ -318,6 +343,27 @@ func parseVectorText(s []byte, t vecType) (vector, error) {
 	// number with whitespace inside it -- which libSQL drops, so "1 2" is 12
 	// -- is copied to strip it.
 	for {
+		// The common component first, in one pass: spaces, a number
+		// vecFastAtoF takes, spaces, then ',' or ']'. Anything else -- a space
+		// inside the number, a NUL, an empty component, a long one -- goes
+		// the general way below, from the same position.
+		if x, e, ok := vecFastComponent(s, i); ok && !vecSlowComponentsForTest {
+			if n >= vecMaxDims {
+				return vector{}, vecErr("vector: max size exceeded %d", vecMaxDims)
+			}
+			if w == 4 {
+				data = binary.LittleEndian.AppendUint32(data, math.Float32bits(float32(x)))
+			} else {
+				data = binary.LittleEndian.AppendUint64(data, math.Float64bits(x))
+			}
+			n++
+			i = e
+			if s[e] == ']' {
+				break
+			}
+			i = e + 1
+			continue
+		}
 		// e is the terminator; [lo, hi) the span from the first non-space to
 		// the last; inner whether a space falls between them.
 		e, lo, hi, inner, gap := i, -1, -1, false, false
