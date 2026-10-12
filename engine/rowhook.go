@@ -65,9 +65,12 @@ func (db *DB) TakeRowChanges() []RowChange {
 // recycleChangeLog gives a log taken by TakeRowChanges back as the next
 // statement's empty one, cleared so it pins no row. Only when nothing has been
 // logged since and capture is delta-only: under full capture a consumer may
-// still hold the changes.
+// still hold the changes. Kept up to 65,536 entries (about 9 MB): a
+// transaction of tens of thousands of rows otherwise grew its log from
+// nothing every time, copying it at each doubling -- 80% of noteRowChange's
+// time in a 20,000-row INSERT transaction. Clearing costs what was used.
 func (db *DB) recycleChangeLog(log []RowChange) {
-	if db.captureFull || db.changeLog != nil || cap(log) == 0 || cap(log) > 1<<14 {
+	if db.captureFull || db.changeLog != nil || cap(log) == 0 || cap(log) > 1<<16 {
 		return
 	}
 	clear(log)
