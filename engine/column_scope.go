@@ -522,6 +522,7 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 		var foundRightAt map[string]int
 		foundRowidTable := -1
 		memberRowid := -1
+		rowidCands := 0
 		ambiguous, restarted := false, false
 		for i, ts := range c.tables {
 			if ts.unqualifiedHidden || spanHidesName(&ts) {
@@ -549,7 +550,7 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 					}
 					continue
 				}
-				if foundIdx != -1 || foundRowidTable != -1 {
+				if foundIdx != -1 {
 					ambiguous = true
 					continue
 				}
@@ -560,8 +561,10 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 				continue
 			}
 			if isRowidAliasName(lname) && (!ts.noRowid || ts.groupMemberRowid) {
-				if foundIdx != -1 || foundRowidTable != -1 || memberRowid != -1 {
-					return nil, 0, nil, -1, fmt.Errorf("engine: ambiguous column name: %s", name)
+				// Counted only if no real column wins (resolveInScopes).
+				rowidCands++
+				if rowidCands > 1 {
+					continue
 				}
 				if ts.noRowid {
 					memberRowid = i
@@ -569,6 +572,12 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 				}
 				foundRowidTable = i
 			}
+		}
+		if foundIdx == -1 && rowidCands > 1 {
+			return nil, 0, nil, -1, fmt.Errorf("engine: ambiguous column name: %s", name)
+		}
+		if foundIdx != -1 {
+			foundRowidTable, memberRowid = -1, -1
 		}
 		if ambiguous {
 			return nil, 0, nil, -1, fmt.Errorf("engine: ambiguous column name: %s", name)

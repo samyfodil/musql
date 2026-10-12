@@ -535,11 +535,12 @@ func (p *ReadOnlyPager) checkDerivedJoinSupported(items []FromItem) error {
 	}
 	hasDerived := false
 	for _, it := range items {
-		// fromItemIsDerived (view.go) itself now treats a NestedGroupSpan
-		// connector as derived -- conservatively, regardless of what its own
-		// nested span actually contains -- so this scan does not need to
-		// look inside it separately.
-		if p.fromItemIsDerived(it) {
+		// Only a source a pin addresses: an UNALIASED derived table has no
+		// scope name (ColumnExpr.UsingPinned), and a NestedGroupSpan
+		// connector wraps a span this check never inspects. An aliased
+		// derived table, a view or a CTE is addressed by its name like any
+		// table (a repeated name is checkSelfJoinGroupSupported's).
+		if it.NestedGroupSpan != nil || (it.Subquery != nil && it.Alias == "") {
 			hasDerived = true
 			break
 		}

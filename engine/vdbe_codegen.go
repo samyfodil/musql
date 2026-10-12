@@ -2621,6 +2621,7 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 	var foundScope compileScope
 	ambiguous, restarted := false, false
 	unknownRowid := false
+	rowidCands := 0
 	for _, s := range scopes {
 		if spanHidesName(&s.tableScope) {
 			continue // its span never matches (spanHidesName)
@@ -2651,7 +2652,7 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 				}
 				continue
 			}
-			if foundCursor != -1 || foundRowidCursor != -1 {
+			if foundCursor != -1 {
 				ambiguous = true
 				continue
 			}
@@ -2659,9 +2660,13 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 			foundScope = s
 			continue
 		}
+		// A rowid candidate counts only if no table has a real column of the
+		// name (resolve.c:471, "0==cnt && VisibleRowid"): a declared "rowid"
+		// anywhere wins over every implicit one.
 		if isRowidAliasName(x.Name) && (!s.noRowid || s.groupMemberRowid) {
-			if foundCursor != -1 || foundRowidCursor != -1 || memberRowid {
-				return 0, 0, false, false, fb, fmt.Errorf("engine: ambiguous column name: %s", x.Name)
+			rowidCands++
+			if rowidCands > 1 {
+				continue
 			}
 			if s.noRowid {
 				memberRowid, memberRowidScope = true, s
@@ -2669,6 +2674,9 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 			}
 			foundRowidCursor = s.cursor
 		}
+	}
+	if foundCursor == -1 && rowidCands > 1 {
+		return 0, 0, false, false, fb, fmt.Errorf("engine: ambiguous column name: %s", x.Name)
 	}
 	if unknownRowid && foundCursor == -1 {
 		return 0, 0, false, false, fb, fmt.Errorf("%w: %s with a member of a re-wrapped parenthesized join group in scope", errVDBEUnsupported, x.Name)
@@ -2678,6 +2686,9 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 	}
 	if restarted {
 		return foundCursor, foundIdx, false, true, fb, nil
+	}
+	if foundCursor != -1 {
+		memberRowid, foundRowidCursor = false, -1
 	}
 	if memberRowid {
 		// The one candidate is a group member's rowid (tableScope.groupMemberRowid).

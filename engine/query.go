@@ -2215,13 +2215,17 @@ func columnRefNameParts(scopes []tableScope, ce ColumnExpr) (qualifier, display 
 			// A member of an aliased parenthesized join group, named through
 			// the member itself: the group's rebuilt column list names it,
 			// ":N" suffix and all (tableScope.nestedColNames).
-			if ts.nestedColNames != nil && ce.Qualifier != "" && !equalFoldName(ce.Qualifier, ts.groupAlias) {
-				return ts.tableName, ts.nestedColNames[idx-ts.offset], true, nil
-			}
 			if ce.Qualifier == "" {
 				if n, ok := ts.usingEntryNames[r33sFoldIdent(ce.Name)]; ok {
 					return ts.tableName, n, true, nil
 				}
+			}
+			// Unqualified or through the member's own name, the reference
+			// resolves to the rebuilt list's entry and takes its name: a
+			// declared "_rowid_" after two implicit _ROWID_ entries is
+			// "_rowid_:2".
+			if ts.nestedColNames != nil && (ce.Qualifier == "" || !equalFoldName(ce.Qualifier, ts.groupAlias)) {
+				return ts.tableName, ts.nestedColNames[idx-ts.offset], true, nil
 			}
 			return ts.tableName, col.Name, true, nil
 		}
