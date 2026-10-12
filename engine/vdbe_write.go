@@ -2576,11 +2576,15 @@ func (db *DB) compileDeleteStmt(stmt *deleteStmt, trig *trigCompileCtx) (*Progra
 	if !emitWriteRowidSeekHint(c, tbl, 0, stmt.where) {
 		emitWriteIndexSeekHint(c, tbl, 0, stmt.where)
 	}
+	loopWhere, constJumps, cerr := c.emitWriteConstTerms(stmt.where)
+	if cerr != nil {
+		return nil, cerr
+	}
 	rewind := c.emit(Instruction{Op: OpRewind, P1: 0})
 	loopTop := c.here()
 
 	whereJump := -1
-	if stmt.where != nil {
+	if loopWhere != nil {
 		// stmt.where is this DELETE's own top-level WHERE clause -- delete.c:526
 		// feeds it to sqlite3WhereBegin exactly as a SELECT's WHERE is, so it is
 		// the same WhereClause tag-20220128a's "pWC->op==TK_AND" guard sees. See
@@ -2591,7 +2595,7 @@ func (db *DB) compileDeleteStmt(stmt *deleteStmt, trig *trigCompileCtx) (*Progra
 		// cursor as its live outer source. See vdbe_write_rowlive.go for the
 		// same delete.c:526 citation read the other way round.
 		undoRowLive := c.whereSpan()
-		wReg, werr := c.compileExpr(stmt.where)
+		wReg, werr := c.compileExpr(loopWhere)
 		undoRowLive()
 		if werr != nil {
 			return nil, werr
@@ -2673,6 +2677,9 @@ func (db *DB) compileDeleteStmt(stmt *deleteStmt, trig *trigCompileCtx) (*Progra
 	}
 	c.emit(Instruction{Op: OpNext, P1: 0, P2: loopTop})
 	c.patch(rewind, c.here())
+	for _, j := range constJumps {
+		c.patch(j, c.here())
+	}
 	c.emit(Instruction{Op: OpHalt})
 
 	return &Program{Insns: c.insns, NReg: c.nReg, NCursors: c.nCursor, NSubCache: c.nSub, WritePager: writePager, FreshWritePager: freshPager, ColNames: colNames}, nil
@@ -2974,6 +2981,14 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 			c.nQueryLoopKnown = false // no plan to say which
 		}
 	}
+	var loopWhere Expr
+	var constJumps []int
+	if !upfrom {
+		var cerr error
+		if loopWhere, constJumps, cerr = c.emitWriteConstTerms(stmt.where); cerr != nil {
+			return nil, cerr
+		}
+	}
 	rewind := c.emit(Instruction{Op: OpRewind, P1: scanCur})
 	loopTop := c.here()
 	if upfrom {
@@ -2990,7 +3005,7 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 	// update.c:642's "if( nChangeFrom==0 && sqlite3ResolveExprNames(&sNC,
 	// pWhere) )" is where the C stops resolving it against the target at all.
 	whereJump := -1
-	if stmt.where != nil && !upfrom {
+	if loopWhere != nil {
 		// stmt.where is this UPDATE's own top-level WHERE clause -- update.c:742/
 		// 1273 feeds it to sqlite3WhereBegin exactly as a SELECT's WHERE is, so it
 		// is the same WhereClause tag-20220128a's "pWC->op==TK_AND" guard sees.
@@ -3000,7 +3015,7 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 		// 0 standing on the candidate row, so a CORRELATED subquery beneath it
 		// may read that cursor. See vdbe_write_rowlive.go.
 		undoRowLive := c.whereSpan()
-		wReg, werr := c.compileExpr(stmt.where)
+		wReg, werr := c.compileExpr(loopWhere)
 		undoRowLive()
 		if werr != nil {
 			return nil, werr
@@ -3261,6 +3276,9 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 	plan.skipAddr = nextAddr // OpUpdateRow's own OE_Ignore jump
 	c.emit(Instruction{Op: OpNext, P1: scanCur, P2: loopTop})
 	c.patch(rewind, c.here())
+	for _, j := range constJumps {
+		c.patch(j, c.here())
+	}
 	c.emit(Instruction{Op: OpHalt})
 
 	if upfrom {
