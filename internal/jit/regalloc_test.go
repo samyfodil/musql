@@ -1,3 +1,5 @@
+//go:build ((amd64 || arm64) && (unix || windows)) || js
+
 package jit
 
 import "testing"
