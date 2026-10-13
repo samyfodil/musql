@@ -417,7 +417,14 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 			continue
 		}
 		if len(stmt.From) != len(srcs) {
-			volatile = true // checked below, once the FROM list is known to line up
+			// A parenthesized join's members are items of their own here:
+			// any of them whose body is not deterministic is one this does
+			// not place.
+			for _, it := range stmt.From {
+				if body, _, _, ok := p.cSubqueryBody(it); ok && p.cVolatile(body) {
+					volatile = true
+				}
+			}
 			break
 		}
 		if body, _, _, ok := p.cSubqueryBody(stmt.From[i]); ok && p.cVolatile(body) {
