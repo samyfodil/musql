@@ -245,6 +245,28 @@ func TxBulkRowsForTest() int64 { return txBulkRows.Swap(0) }
 // commit is a COMMIT, which reads no rows and leaves every load to the file
 // rewrite that follows it.
 func (prog *Program) txAppendTarget() (tbl *tableMeta, commit bool) {
+	// Asked before every statement while a load is armed, so the answer is
+	// kept, against the instructions it was taken from (a Program copied by
+	// value may carry others).
+	if c := prog.txAppend; c != nil && len(prog.Insns) > 0 && c.first == &prog.Insns[0] {
+		return c.tbl, c.commit
+	}
+	tbl, commit = prog.txAppendTargetOf()
+	if len(prog.Insns) > 0 {
+		prog.txAppend = &txAppendVerdict{first: &prog.Insns[0], tbl: tbl, commit: commit}
+	}
+	return tbl, commit
+}
+
+// txAppendVerdict is txAppendTarget's kept answer for the instructions
+// starting at first.
+type txAppendVerdict struct {
+	first  *Instruction
+	tbl    *tableMeta
+	commit bool
+}
+
+func (prog *Program) txAppendTargetOf() (tbl *tableMeta, commit bool) {
 	if len(prog.Insns) <= 3 {
 		for i := range prog.Insns {
 			if in := &prog.Insns[i]; in.Op == OpTxn {
@@ -289,7 +311,7 @@ func (db *DB) dropTxBulks() {
 // journalled to that statement, so a failure still takes them back. A drain
 // that cannot complete leaves the error for the statement (pendingLoadErr).
 func (db *DB) drainTxBulks(keep *tableMeta) {
-	if len(db.txBulks) == 0 {
+	if len(db.txBulks) == 0 || (len(db.txBulks) == 1 && db.txBulks[0] == keep) {
 		return
 	}
 	for _, t := range slices.Clone(db.txBulks) {
