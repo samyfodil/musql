@@ -605,13 +605,17 @@ func segDeltaBatchBytesExceed(recs []SegDeltaRecord, limit int64) bool {
 		if n > limit {
 			return true
 		}
-		n += 13
+		n += segDeltaMinRecord
 		if !recs[i].Kill {
 			n += 4 + int64(recs[i].recordLen())
 		}
 	}
 	return n > limit
 }
+
+// segDeltaMinRecord is the smallest a delta record can be: a kill's header,
+// which a put's record only adds to.
+const segDeltaMinRecord = 13
 
 // syncMode is how a commit makes its batch durable.
 type syncMode int

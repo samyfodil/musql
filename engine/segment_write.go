@@ -571,6 +571,24 @@ func (n *Session) commitMainLocked() (bool, error) {
 	if changes.len() == 0 {
 		return false, nil
 	}
+	// A BULK LOAD TOO BIG FOR THE DELTA, known before its records are built:
+	// every record is at least segDeltaMinRecord bytes, so a log of this many
+	// changes takes the delta past the compaction threshold whatever the rows
+	// hold, and the rewrite below would follow. Building the records only to
+	// measure them was 10% of a 10M-row load. Same order as below: a stale image
+	// is refused before anything is written.
+	if !compactionOffForTest && lockedStamp[0].there && n.maxSize == 0 &&
+		int64(changes.len())*segDeltaMinRecord > compactionThreshold(lockedStamp[0].size)-lockedStamp[1].size {
+		if n.loadedCtr != n.endCtr || n.loadedPages != n.endPages {
+			return false, fmt.Errorf("%w: another connection committed while this transaction was open", ErrBusy)
+		}
+		if err := n.rewriteFile(); err != nil {
+			return false, err
+		}
+		n.clearWrittenSinceCommit()
+		n.noteCommittedColumnsStale()
+		return true, nil
+	}
 	// CONSUMING, when nothing else reads the log -- see segDeltaRecordsInto.
 	recs, err := segDeltaRecordsInto(n.recBuf, changes.len(), changes.all(), n.effectiveTableIndex(), n.ipkOf, n.storeOf(false))
 	// Kept for the next commit, and emptied on the way out so it pins no row.
