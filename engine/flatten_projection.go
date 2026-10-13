@@ -185,6 +185,16 @@ func (p *ReadOnlyPager) r41FlattenItem(stmt *SelectStmt, i int, expand bool) (*S
 		cp.OrderBy = nil
 		body = &cp
 	}
+	if it.Join == JoinLeft {
+		// isOuterJoin (select.c:4371-4381): a body of one table, a parent
+		// that is not DISTINCT. The parent WHERE must be empty here, since
+		// OUTER JOIN STRENGTH REDUCTION (tag-select-0220) runs first in C and
+		// a WHERE could turn the join into an inner one.
+		if !p.cVolatile(body) || len(body.Compound) != 0 || stmt.Distinct || stmt.Where != nil ||
+			len(it.Using) != 0 || it.Natural {
+			return nil, false
+		}
+	}
 	if len(body.Compound) != 0 {
 		return p.r41FlattenCompound(stmt, i, it, body)
 	}
@@ -195,16 +205,6 @@ func (p *ReadOnlyPager) r41FlattenItem(stmt *SelectStmt, i int, expand bool) (*S
 		// (select.c:7869-7876: SF_ComplexResult, a function or subquery anywhere
 		// in the result list, select.c:6342).
 		if len(stmt.OrderBy) != 0 || selectIsAggregateQuery(stmt) || i != 0 || r41ComplexResult(stmt) {
-			return nil, false
-		}
-	}
-	if it.Join == JoinLeft {
-		// isOuterJoin (select.c:4371-4381): a body of one table, a parent
-		// that is not DISTINCT. The parent WHERE must be empty here, since
-		// OUTER JOIN STRENGTH REDUCTION (tag-select-0220) runs first in C and
-		// a WHERE could turn the join into an inner one.
-		if !p.cVolatile(body) || len(body.Compound) != 0 || stmt.Distinct || stmt.Where != nil ||
-			len(it.Using) != 0 || it.Natural {
 			return nil, false
 		}
 	}
