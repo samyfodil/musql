@@ -39,6 +39,14 @@ import (
 // writer staged the segments in a scratch file and copied them in after the
 // directory -- every rewrite wrote its whole database twice.
 //
+// Version 6 keeps version 5's file layout and lets a SEGMENT leave out what it
+// can derive: consecutive rowids, a width block of full rows, and a TEXT or
+// BLOB column's 8-byte cells, replaced by 4-byte heap bounds; its TEXT and
+// BLOB indexes keep only 3-byte row positions (segment.go, buildSegmentInto;
+// segment_index_ondisk.go, segIdxCodecBytesPerm). A segment says which in its
+// own flags, so a version 6 file may hold version 5 segments -- a verbatim
+// compaction copies them -- and the reader takes either.
+//
 // segFileVersion is the format this build writes, and segFileMinVersion the
 // oldest it reads: a file is readable from every build after the one that
 // wrote it. A change to what a reader sees takes a new version, and the reader
@@ -50,7 +58,7 @@ import (
 // segFileMinVersion drops files people may have; it needs a converter first.
 const (
 	segFileMagic      = "MQSF"
-	segFileVersion    = 5
+	segFileVersion    = 6
 	segFileMinVersion = 4
 	segFileHdrSize    = 24 // version 4's header, and the fields every version starts with
 	segFileHdrSizeV5  = 32 // version 5's: those, and the directory's offset

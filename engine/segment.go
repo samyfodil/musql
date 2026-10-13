@@ -15,9 +15,13 @@ import (
 //
 //	header             40 bytes
 //	column directory   16 bytes per column
-//	rowid block        8*nRows, the keys these rows are stored under
-//	width block        2*nRows, how many columns each row actually STORED
-//	blocks             8*nRows each, 8-byte aligned, in column order
+//	rowid block        8*nRows, the keys these rows are stored under; only the
+//	                   first, 8 bytes, when they are consecutive (segFlagDenseRowids)
+//	width block        2*nRows, how many columns each row actually STORED; absent
+//	                   when every row stored all of them (segFlagFullWidth)
+//	blocks             8*nRows each, 8-byte aligned, in column order -- or, for a
+//	                   TEXT or BLOB column marked segCellBounds, nRows+1 uint32
+//	                   heap boundaries, its values being laid out one after another
 //	NULL bitmaps       ceil(nRows/8) each, only for columns that have NULLs
 //	heap               TEXT and BLOB bytes, referenced by (offset,length) pairs
 //	exceptions         the values that did not fit their column's physical type
@@ -41,6 +45,22 @@ const (
 // make build_all_targets, therefore byte-swaps and keeps a correct slower path.
 const segFlagLittleEndian = 1 << 0
 
+// segFlagDenseRowids and segFlagFullWidth say a block was left out because it
+// held nothing a reader could not derive (buildSegmentInto). Neither is ever set
+// in a segment of a file older than version 6, and a flag this build does not
+// know refuses the segment rather than misreading it.
+const (
+	segFlagDenseRowids = 1 << 1
+	segFlagFullWidth   = 1 << 2
+	segFlagsKnown      = segFlagLittleEndian | segFlagDenseRowids | segFlagFullWidth
+)
+
+// segCellBounds, in a column directory entry's second byte, marks a TEXT or
+// BLOB column stored as heap boundaries: row i's value starts at bound i
+// (4-aligned first, for a BLOB) and ends at bound i+1. Zero is the 8-byte
+// (offset, length) cell every other column and every older file has.
+const segCellBounds = 1
+
 // segLittleEndian reports whether this machine's byte order matches the
 // format's, which is what decides whether a block can be reinterpreted as a Go
 // slice or has to be read a value at a time.
@@ -51,6 +71,7 @@ var segLittleEndian = func() bool {
 
 type segColumn struct {
 	phys     PhysicalType
+	bounds   bool // segCellBounds: the block is nRows+1 uint32 heap boundaries
 	blockOff uint32
 	nullOff  uint32 // 0 when the column has no NULL
 	// idxOff is this column's on-disk equality index, 0 when it has none. It
@@ -68,7 +89,17 @@ type segment struct {
 	heap     []byte
 	rowidOff uint32
 	widthOff uint32
-	exc      map[uint64]Value // row*nCols+col -> the value that did not fit
+	// dense is segFlagDenseRowids: row i's rowid is firstRowid+i.
+	dense      bool
+	firstRowid uint64
+	// fullWidth is segFlagFullWidth: every row stored every column.
+	fullWidth bool
+	exc       map[uint64]Value // row*nCols+col -> the value that did not fit
+
+	// Lazily built 8-byte (offset, length) cells of a segCellBounds column, for
+	// the readers that take a column's cells whole (BytesColumn).
+	cellMu    eqCountMu
+	cellCache map[int][]uint64
 
 	// diskIdx is this segment's equality indexes, read out of the FILE: a view
 	// over the mapped bytes, opened once per column and holding no data of its
@@ -102,6 +133,9 @@ type segment struct {
 // entry points at, and it decides the b-tree order a round trip has to
 // reproduce byte for byte.
 func (s *segment) Rowid(i int) uint64 {
+	if s.dense {
+		return s.firstRowid + uint64(i)
+	}
 	return binary.LittleEndian.Uint64(s.buf[int(s.rowidOff)+i*segCellWidth:])
 }
 
@@ -110,6 +144,9 @@ func (s *segment) Rowid(i int) uint64 {
 // short, and its missing columns read as the column DEFAULT rather than NULL.
 // A scan must hand back exactly this many, as a b-tree walk does.
 func (s *segment) Width(i int) int {
+	if s.fullWidth {
+		return len(s.cols)
+	}
 	return int(binary.LittleEndian.Uint16(s.buf[int(s.widthOff)+i*2:]))
 }
 
@@ -171,11 +208,55 @@ func buildSegmentInto(dst []byte, cols []columnInfo, rowids []uint64, rows [][]V
 		}
 	}
 
-	// The heap's exact size, so it is one allocation rather than a doubling
-	// series of discarded buffers.
-	heapLen := 0
+	// THREE THINGS A SEGMENT LEAVES OUT when it can (segment file version 6),
+	// each recorded so a reader knows:
+	//
+	//   - the rowid block, when the rowids are consecutive -- what a load or a
+	//     rewrite of one leaves: one 8-byte first rowid instead of 8 per row;
+	//   - the width block, when every row stored every column: 2 bytes a row;
+	//   - half of a TEXT or BLOB column's block: its values are laid out in the
+	//     heap one COLUMN after another, so a value ends where the next row's
+	//     begins and nRows+1 uint32 boundaries describe them all, where an 8-byte
+	//     (offset, length) cell per row did.
+	//
+	// Measured on a 10M-row table of one short TEXT column, these and the
+	// TEXT index's packed positions (segment_index_ondisk.go) took the file from
+	// 47 to 20 bytes a row; C SQLite's b-tree holds the same rows in 23.
+	dense := true
+	for i := 1; i < nRows && dense; i++ {
+		dense = rowids[i] == rowids[0]+uint64(i)
+	}
+	fullWidth := true
 	for _, r := range rows {
-		for c := 0; c < nCols && c < len(r); c++ {
+		if len(r) < nCols {
+			fullWidth = false
+			break
+		}
+	}
+	off32 := make([]bool, nCols)
+	for c := range phys {
+		off32[c] = phys[c] == PhysText || phys[c] == PhysBlob
+	}
+
+	// Each column's cells, in memory: the 8-byte cells the indexes are built
+	// from (a TEXT cell is its (offset, length) pair), written to the file as
+	// they are or, for TEXT and BLOB, as boundaries.
+	cells := make([][]uint64, nCols)
+	for c := range cells {
+		if phys[c] != PhysNull {
+			cells[c] = make([]uint64, nRows)
+		}
+	}
+	// The heap's exact size, column after column, so it is one allocation.
+	heapLen := 0
+	for c := 0; c < nCols; c++ {
+		if !off32[c] {
+			continue
+		}
+		for _, r := range rows {
+			if c >= len(r) {
+				continue
+			}
 			if v := r[c]; phys[c] == PhysText && v.Typ == Text {
 				heapLen += len(v.S)
 			} else if phys[c] == PhysBlob && v.Typ == Blob {
@@ -186,75 +267,83 @@ func buildSegmentInto(dst []byte, cols []columnInfo, rowids []uint64, rows [][]V
 
 	nullBytes := (nRows + 7) / 8
 	rowidOff := segAlign8(segHeaderSize + nCols*segColDirSize)
-	widthOff := rowidOff + nRows*segCellWidth
-	blocksOff := segAlign8(widthOff + nRows*2)
-
-	var (
-		body    []byte
-		colDir  = make([]segColumn, nCols)
-		nulls   = make([][]byte, nCols)
-		heap    []byte
-		excRows []uint32
-		excCols []uint32
-		excVals []Value
-	)
+	rowidBytes := nRows * segCellWidth
+	if dense {
+		rowidBytes = segCellWidth
+	}
+	widthOff, widthBytes := rowidOff+rowidBytes, nRows*2
+	if fullWidth {
+		widthBytes = 0
+	}
+	blocksOff := segAlign8(widthOff + widthBytes)
+	if fullWidth {
+		widthOff = 0
+	}
+	colDir := make([]segColumn, nCols)
 	off := blocksOff
 	for c := 0; c < nCols; c++ {
 		colDir[c].phys = phys[c]
-		if phys[c] == PhysNull {
-			colDir[c].blockOff = 0
-		} else {
+		switch {
+		case phys[c] == PhysNull:
+		case off32[c]:
+			colDir[c].blockOff = uint32(off)
+			off += segAlign8(4 * (nRows + 1))
+		default:
 			colDir[c].blockOff = uint32(off)
 			off += nRows * segCellWidth
 		}
-		nulls[c] = make([]byte, nullBytes)
 	}
-	blockBytes := off - blocksOff
-	body = make([]byte, blockBytes)
-	// THE HEAP IS WRITTEN WHERE IT ENDS UP: its offset is known before a value
-	// is placed -- the blocks and NULL bitmaps before it have fixed sizes -- so
-	// the output is allocated now and the payload copied into it once, rather
-	// than into a heap of its own and then again into the output. The capacity
-	// covers the exception list's and the indexes' worst case too, so neither
-	// regrows it; an exception list larger than its estimate only costs a copy.
-	heapOff := blocksOff + blockBytes
+	blockEnd := off
+	heapOff := blockEnd
 	idxSlack := 0
 	for c := 0; c < nCols; c++ {
 		if census[c].Null != 0 {
 			heapOff += nullBytes
 		} else if phys[c] != PhysNull {
-			idxSlack += 8 + segIdxHdr + 16*nRows + 8
+			idxSlack += 8 + segIdxHdr + 4*nRows + 8
 		}
 	}
 	heapOff = segAlign8(heapOff)
+	// THE HEAP IS WRITTEN WHERE IT ENDS UP: its offset is known before a value
+	// is placed, so the output is allocated now and the payload copied into it
+	// once. The capacity covers the exception list's and the indexes' worst
+	// case too.
 	var out []byte
 	if want := heapOff + heapLen + 64 + idxSlack; cap(dst) >= want {
-		out = dst[:blocksOff]
+		out = dst[:blockEnd]
 		clear(out)
 	} else {
-		out = make([]byte, blocksOff, want)
+		out = make([]byte, blockEnd, want)
 	}
-	heap = out[heapOff:heapOff:heapOff+heapLen]
+	heap := out[heapOff : heapOff : heapOff+heapLen]
 
-	put := func(c, i int, x uint64) {
-		base := int(colDir[c].blockOff) - blocksOff + i*segCellWidth
-		binary.LittleEndian.PutUint64(body[base:], x)
-	}
-	for i, r := range rows {
-		for c := 0; c < nCols; c++ {
+	var (
+		nulls   = make([][]byte, nCols)
+		excRows []uint32
+		excCols []uint32
+		excVals []Value
+	)
+	for c := 0; c < nCols; c++ {
+		if census[c].Null != 0 {
+			nulls[c] = make([]byte, nullBytes)
+		}
+		var ends []byte
+		if off32[c] {
+			ends = out[colDir[c].blockOff:]
+			binary.LittleEndian.PutUint32(ends, uint32(len(heap)))
+		}
+		for i, r := range rows {
 			v := Value{Typ: Null}
 			if c < len(r) {
 				v = r[c]
 			}
-			if v.Typ == Null {
-				nulls[c][i/8] |= 1 << uint(i%8)
-				continue
-			}
 			switch {
+			case v.Typ == Null:
+				nulls[c][i/8] |= 1 << uint(i%8)
 			case phys[c] == PhysInt64 && v.Typ == Int:
-				put(c, i, uint64(v.I))
+				cells[c][i] = uint64(v.I)
 			case phys[c] == PhysFloat64 && v.Typ == Float:
-				put(c, i, floatBits(v.F))
+				cells[c][i] = floatBits(v.F)
 			case (phys[c] == PhysText && v.Typ == Text) || (phys[c] == PhysBlob && v.Typ == Blob):
 				if phys[c] == PhysBlob {
 					for len(heap) < segAlignBlob(len(heap)) {
@@ -263,7 +352,7 @@ func buildSegmentInto(dst []byte, cols []columnInfo, rowids []uint64, rows [][]V
 				}
 				o := uint32(len(heap))
 				heap = append(heap, v.S...)
-				put(c, i, uint64(o)|uint64(len(v.S))<<32)
+				cells[c][i] = uint64(o) | uint64(len(v.S))<<32
 			default:
 				// Did not fit: the value goes to the side list and its cell is
 				// left zero. The NULL bit stays CLEAR, so a reader that finds a
@@ -272,14 +361,22 @@ func buildSegmentInto(dst []byte, cols []columnInfo, rowids []uint64, rows [][]V
 				excCols = append(excCols, uint32(c))
 				excVals = append(excVals, v)
 			}
+			if ends != nil {
+				// Where this row's value ends: where the next one starts, but for
+				// a BLOB's 4-byte alignment, which the reader re-derives.
+				binary.LittleEndian.PutUint32(ends[4*(i+1):], uint32(len(heap)))
+			}
+		}
+		if !off32[c] && cells[c] != nil {
+			base := int(colDir[c].blockOff)
+			for i, x := range cells[c] {
+				binary.LittleEndian.PutUint64(out[base+i*segCellWidth:], x)
+			}
 		}
 	}
 
-	// THE EXCEPTION LIST AND THE EQUALITY INDEXES are built before the output,
-	// from body and heap, so the output is ONE allocation of its exact size. They
-	// used to be appended past a capacity sized without them, and each overflow
-	// copied the whole segment, payload included: compacting a delta of 10 KB
-	// blobs allocated 8x its size in buildSegment, most of a 5 GB peak.
+	// THE EXCEPTION LIST AND THE EQUALITY INDEXES are built before the rest of
+	// the output, so it is ONE allocation of its exact size.
 	var excBuf []byte
 	excBuf = binary.LittleEndian.AppendUint32(excBuf, uint32(len(excVals)))
 	for k, v := range excVals {
@@ -297,11 +394,9 @@ func buildSegmentInto(dst []byte, cols []columnInfo, rowids []uint64, rows [][]V
 	//
 	// A column qualifies when every one of its values is a non-NULL fixed-width
 	// cell: no NULL bitmap and no exception (a value that did not fit). EVERY
-	// FIXED-WIDTH PHYSICAL TYPE, not just the integer one: a TEXT or BLOB cell is
-	// a packed (heapOffset, length) uint64 and a float is its bits, so all three
-	// are the same 8-byte lane and only the ORDER differs, which is what the
-	// codec names. Restricting this to PhysInt64 left TEXT, REAL and BLOB with no
-	// index at all, measured against C SQLite at 5360x, 7973x and 7760x.
+	// PHYSICAL TYPE, not just the integer one: restricting this to PhysInt64
+	// left TEXT, REAL and BLOB with no index at all, measured against C SQLite
+	// at 5360x, 7973x and 7760x.
 	excCol := make([]bool, nCols)
 	for _, c := range excCols {
 		if int(c) < nCols {
@@ -313,20 +408,16 @@ func buildSegmentInto(dst []byte, cols []columnInfo, rowids []uint64, rows [][]V
 		if census[c].Null != 0 || excCol[c] || nRows == 0 || phys[c] == PhysNull {
 			continue
 		}
-		base := int(colDir[c].blockOff) - blocksOff
-		cells := make([]int64, nRows)
-		for i := 0; i < nRows; i++ {
-			cells[i] = int64(binary.LittleEndian.Uint64(body[base+i*segCellWidth:]))
-		}
+		vals := unsafe.Slice((*int64)(unsafe.Pointer(unsafe.SliceData(cells[c]))), nRows)
 		var blk []byte
 		var ok bool
 		switch phys[c] {
 		case PhysInt64:
-			blk, ok = buildSegColumnIndex(cells)
+			blk, ok = buildSegColumnIndex(vals)
 		case PhysText, PhysBlob:
-			blk, ok = buildSegColumnIndexBytes(cells, heap) // the cells address the heap
+			blk, ok = buildSegColumnIndexBytesPerm(vals, heap) // the cells address the heap
 		case PhysFloat64:
-			blk, ok = buildSegColumnIndexFloat(cells)
+			blk, ok = buildSegColumnIndexFloat(vals)
 		}
 		if ok {
 			idx[c] = blk
@@ -334,10 +425,8 @@ func buildSegmentInto(dst []byte, cols []columnInfo, rowids []uint64, rows [][]V
 	}
 
 	// The layout after the blocks: NULL bitmaps, the heap, the exception list,
-	// then each index 8-ALIGNED, so the record's own int64 value array lands
-	// 8-aligned too (its header is 16 bytes) -- a little-endian host can then
-	// reinterpret rather than decode.
-	size := blocksOff + len(body)
+	// then each index 8-ALIGNED.
+	size := blockEnd
 	for c := 0; c < nCols; c++ {
 		if census[c].Null != 0 {
 			size += nullBytes
@@ -352,19 +441,22 @@ func buildSegmentInto(dst []byte, cols []columnInfo, rowids []uint64, rows [][]V
 	if cap(out) < size {
 		out = slices.Grow(out, size-len(out))
 	}
-	for i, rid := range rowids {
-		binary.LittleEndian.PutUint64(out[rowidOff+i*segCellWidth:], uint64(rid))
-		// How many columns this row actually STORED. A row written before an
-		// ALTER TABLE ADD COLUMN is short, and the reader pads it with the
-		// COLUMN DEFAULTS (padStoredRow), not with NULL -- so a segment that
-		// forgot the width would turn a defaulted column into a NULL one.
-		w := len(rows[i])
-		if w > nCols {
-			w = nCols
+	if dense {
+		binary.LittleEndian.PutUint64(out[rowidOff:], rowids[0])
+	} else {
+		for i, rid := range rowids {
+			binary.LittleEndian.PutUint64(out[rowidOff+i*segCellWidth:], rid)
 		}
-		binary.LittleEndian.PutUint16(out[widthOff+i*2:], uint16(w))
 	}
-	out = append(out, body...)
+	if !fullWidth {
+		for i := range rowids {
+			// How many columns this row actually STORED. A row written before an
+			// ALTER TABLE ADD COLUMN is short, and the reader pads it with the
+			// COLUMN DEFAULTS (padStoredRow), not with NULL -- so a segment that
+			// forgot the width would turn a defaulted column into a NULL one.
+			binary.LittleEndian.PutUint16(out[widthOff+i*2:], uint16(min(len(rows[i]), nCols)))
+		}
+	}
 	for c := 0; c < nCols; c++ {
 		if census[c].Null == 0 {
 			continue
@@ -396,8 +488,15 @@ func buildSegmentInto(dst []byte, cols []columnInfo, rowids []uint64, rows [][]V
 		out = append(out, idx[c]...)
 	}
 
+	flags := uint32(segFlagLittleEndian)
+	if dense {
+		flags |= segFlagDenseRowids
+	}
+	if fullWidth {
+		flags |= segFlagFullWidth
+	}
 	copy(out[0:], segMagic)
-	binary.LittleEndian.PutUint32(out[4:], segFlagLittleEndian)
+	binary.LittleEndian.PutUint32(out[4:], flags)
 	binary.LittleEndian.PutUint32(out[8:], uint32(nRows))
 	binary.LittleEndian.PutUint32(out[12:], uint32(nCols))
 	binary.LittleEndian.PutUint32(out[16:], uint32(heapOff))
@@ -409,6 +508,9 @@ func buildSegmentInto(dst []byte, cols []columnInfo, rowids []uint64, rows [][]V
 	for c := 0; c < nCols; c++ {
 		d := segHeaderSize + c*segColDirSize
 		out[d] = byte(colDir[c].phys)
+		if off32[c] {
+			out[d+1] = segCellBounds
+		}
 		binary.LittleEndian.PutUint32(out[d+4:], colDir[c].blockOff)
 		binary.LittleEndian.PutUint32(out[d+8:], colDir[c].nullOff)
 		binary.LittleEndian.PutUint32(out[d+12:], colDir[c].idxOff)
@@ -428,9 +530,14 @@ func openSegment(buf []byte) (*segment, error) {
 	if len(buf) < segHeaderSize || string(buf[:4]) != segMagic {
 		return nil, fmt.Errorf("segment: not a segment")
 	}
-	if binary.LittleEndian.Uint32(buf[4:])&segFlagLittleEndian == 0 {
+	flags := binary.LittleEndian.Uint32(buf[4:])
+	if flags&segFlagLittleEndian == 0 {
 		return nil, fmt.Errorf("segment: unknown byte order")
 	}
+	if flags&^segFlagsKnown != 0 {
+		return nil, fmt.Errorf("segment: unknown flags %#x", flags)
+	}
+	dense, fullWidth := flags&segFlagDenseRowids != 0, flags&segFlagFullWidth != 0
 	nRows := int(binary.LittleEndian.Uint32(buf[8:]))
 	nCols := int(binary.LittleEndian.Uint32(buf[12:]))
 	heapOff := binary.LittleEndian.Uint32(buf[16:])
@@ -445,24 +552,40 @@ func openSegment(buf []byte) (*segment, error) {
 	if int(heapOff)+int(heapLen) > len(buf) || int(excOff)+int(excLen) > len(buf) {
 		return nil, fmt.Errorf("segment: heap or exception list overruns the buffer")
 	}
-	if int(rowidOff)+nRows*segCellWidth > len(buf) || rowidOff%segCellWidth != 0 {
+	rowidBytes := nRows * segCellWidth
+	if dense {
+		rowidBytes = segCellWidth
+	}
+	if int(rowidOff)+rowidBytes > len(buf) || rowidOff%segCellWidth != 0 {
 		return nil, fmt.Errorf("segment: rowid block is unaligned or overruns")
 	}
-	if int(widthOff)+nRows*2 > len(buf) {
+	if !fullWidth && int(widthOff)+nRows*2 > len(buf) {
 		return nil, fmt.Errorf("segment: width block overruns")
 	}
 	s := &segment{buf: buf, nRows: nRows, cols: make([]segColumn, nCols),
-		heap: buf[heapOff : heapOff+heapLen], rowidOff: rowidOff, widthOff: widthOff}
+		heap: buf[heapOff : heapOff+heapLen], rowidOff: rowidOff, widthOff: widthOff,
+		dense: dense, fullWidth: fullWidth}
+	if dense {
+		s.firstRowid = binary.LittleEndian.Uint64(buf[rowidOff:])
+	}
 	nullBytes := (nRows + 7) / 8
 	for c := 0; c < nCols; c++ {
 		d := segHeaderSize + c*segColDirSize
 		col := segColumn{
 			phys:     PhysicalType(buf[d]),
+			bounds:   buf[d+1] == segCellBounds,
 			blockOff: binary.LittleEndian.Uint32(buf[d+4:]),
 			nullOff:  binary.LittleEndian.Uint32(buf[d+8:]),
 			idxOff:   binary.LittleEndian.Uint32(buf[d+12:]),
 		}
-		if col.phys.Width() != 0 {
+		switch {
+		case buf[d+1] > segCellBounds, col.bounds && col.phys != PhysText && col.phys != PhysBlob:
+			return nil, fmt.Errorf("segment: column %d has an unknown cell format %d", c, buf[d+1])
+		case col.bounds:
+			if int(col.blockOff)+4*(nRows+1) > len(buf) || col.blockOff%segCellWidth != 0 {
+				return nil, fmt.Errorf("segment: column %d block is unaligned or overruns", c)
+			}
+		case col.phys.Width() != 0:
 			if int(col.blockOff)+nRows*segCellWidth > len(buf) || col.blockOff%segCellWidth != 0 {
 				return nil, fmt.Errorf("segment: column %d block is unaligned or overruns", c)
 			}
@@ -593,6 +716,10 @@ func (s *segment) BytesColumn(c int) (cells []uint64, heap []byte, ok bool) {
 	if s.cols[c].nullOff != 0 || s.hasException(c) {
 		return nil, nil, false
 	}
+	if s.cols[c].bounds {
+		cells, ok := s.boundsCells(c)
+		return cells, s.heap, ok
+	}
 	off := int(s.cols[c].blockOff)
 	if off == 0 || uintptr(unsafe.Pointer(&s.buf[off]))%8 != 0 {
 		return nil, nil, false
@@ -623,7 +750,82 @@ func (s *segment) BytesColumnNulls(c int) (cells []uint64, heap []byte, nulls []
 		}
 		nulls = s.buf[n : n+(s.nRows+7)/8]
 	}
+	if s.cols[c].bounds {
+		cells, ok := s.boundsCells(c)
+		return cells, s.heap, nulls, ok
+	}
 	return unsafe.Slice((*uint64)(unsafe.Pointer(&s.buf[off])), s.nRows), s.heap, nulls, true
+}
+
+// boundCell is row i's (offset, length) cell in a segCellBounds column, or false
+// for bounds that do not describe heap bytes -- a damaged file, which reads as a
+// decline, never a slice out of range. A NULL or exception row stores nothing:
+// its two bounds are equal, and it reads as an empty value at that offset.
+func (s *segment) boundCell(c, i int) (uint64, bool) {
+	b := s.buf[int(s.cols[c].blockOff)+4*i:]
+	from, to := binary.LittleEndian.Uint32(b), binary.LittleEndian.Uint32(b[4:])
+	if from == to {
+		if int(to) > len(s.heap) {
+			return 0, false
+		}
+		return uint64(to), true
+	}
+	if s.cols[c].phys == PhysBlob {
+		from = uint32(segAlignBlob(int(from)))
+	}
+	if from > to || int(to) > len(s.heap) {
+		return 0, false
+	}
+	return uint64(from) | uint64(to-from)<<32, true
+}
+
+// cellBytes is row i's TEXT or BLOB bytes in column c, read where they are; false
+// when the cell names no heap bytes. NULL and exception rows are the caller's
+// to exclude (an index is built only over a column with neither).
+func (s *segment) cellBytes(c, i int) ([]byte, bool) {
+	if i < 0 || i >= s.nRows {
+		return nil, false
+	}
+	var raw uint64
+	if s.cols[c].bounds {
+		x, ok := s.boundCell(c, i)
+		if !ok {
+			return nil, false
+		}
+		raw = x
+	} else {
+		raw = binary.LittleEndian.Uint64(s.buf[int(s.cols[c].blockOff)+i*segCellWidth:])
+	}
+	o, n := uint32(raw), uint32(raw>>32)
+	if int(o)+int(n) > len(s.heap) {
+		return nil, false
+	}
+	return s.heap[o : o+n : o+n], true
+}
+
+// boundsCells is a segCellBounds column's cells as the 8-byte (offset, length)
+// pairs BytesColumn hands out, built once per column and kept: 8 bytes a row
+// of memory, paid only by a reader that wants the column whole.
+func (s *segment) boundsCells(c int) ([]uint64, bool) {
+	s.cellMu.Lock()
+	defer s.cellMu.Unlock()
+	if cells, seen := s.cellCache[c]; seen {
+		return cells, cells != nil
+	}
+	if s.cellCache == nil {
+		s.cellCache = map[int][]uint64{}
+	}
+	cells := make([]uint64, s.nRows)
+	for i := range cells {
+		x, ok := s.boundCell(c, i)
+		if !ok {
+			s.cellCache[c] = nil
+			return nil, false
+		}
+		cells[i] = x
+	}
+	s.cellCache[c] = cells
+	return cells, true
 }
 
 // Value is the general accessor: the value of column c in row i, whatever it
@@ -643,7 +845,16 @@ func (s *segment) Value(c, i int) Value {
 	if col.phys.Width() == 0 {
 		return Value{Typ: Null}
 	}
-	raw := binary.LittleEndian.Uint64(s.buf[int(col.blockOff)+i*segCellWidth:])
+	var raw uint64
+	if col.bounds {
+		x, ok := s.boundCell(c, i)
+		if !ok {
+			return Value{Typ: Null}
+		}
+		raw = x
+	} else {
+		raw = binary.LittleEndian.Uint64(s.buf[int(col.blockOff)+i*segCellWidth:])
+	}
 	switch col.phys {
 	case PhysInt64:
 		return Value{Typ: Int, I: int64(raw)}

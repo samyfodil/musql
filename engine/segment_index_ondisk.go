@@ -69,7 +69,14 @@ const (
 	// makes negatives sort above positives, and -0.0 and +0.0 have different
 	// bits but compare equal.
 	segIdxCodecFloat = 3
-	segIdxHdr           = 16 // version, codec, nVals, nRows, byteLen
+	// segIdxCodecBytesPerm is a TEXT or BLOB index with no value array: only the
+	// row positions, ordered by (bytes, position), each in 3 bytes -- a segment
+	// holds at most 2^24 rows. The values are read where they already are, in
+	// the column, so a lookup's binary search compares the probe with the row
+	// each position names. 3 bytes a row where the postings layout costs 16 or
+	// more for a high-cardinality column, which is what a TEXT key usually is.
+	segIdxCodecBytesPerm = 4
+	segIdxHdr            = 16 // version, codec, nVals, nRows, byteLen
 )
 
 // segIdxTooLarge caps what a single column's index may cost. A segment holds up
@@ -119,6 +126,53 @@ func buildSegColumnIndexFloat(cells []int64) ([]byte, bool) {
 // cells are the raw packed (heapOffset, length) uint64s; heap is the segment's
 // own byte arena, so a comparison reads the mapped bytes and copies nothing.
 func buildSegColumnIndexBytes(cells []int64, heap []byte) ([]byte, bool) {
+	order, compare, ok := bytesIndexOrder(cells, heap)
+	if !ok {
+		return nil, false
+	}
+	return buildSegColumnIndexOrdered(cells, segIdxCodecBytes, compare, order)
+}
+
+// buildSegColumnIndexBytesPerm is buildSegColumnIndexBytes in the
+// segIdxCodecBytesPerm layout, which is what a segment writes.
+func buildSegColumnIndexBytesPerm(cells []int64, heap []byte) ([]byte, bool) {
+	n := len(cells)
+	if n == 0 || n > 1<<24 {
+		return nil, false
+	}
+	order, compare, ok := bytesIndexOrder(cells, heap)
+	if !ok {
+		return nil, false
+	}
+	nVals := 1
+	for i := 1; i < n; i++ {
+		if compare(cells[order[i]], cells[order[i-1]]) != 0 {
+			nVals++
+		}
+	}
+	size := segIdxHdr + 3*n
+	if size > segIdxTooLarge {
+		return nil, false
+	}
+	out := make([]byte, size)
+	binary.LittleEndian.PutUint16(out, segIdxVersion)
+	binary.LittleEndian.PutUint16(out[2:], segIdxCodecBytesPerm)
+	binary.LittleEndian.PutUint32(out[4:], uint32(nVals))
+	binary.LittleEndian.PutUint32(out[8:], uint32(n))
+	binary.LittleEndian.PutUint32(out[12:], uint32(size))
+	for i, p := range order {
+		putUint24(out[segIdxHdr+3*i:], uint32(p))
+	}
+	return out, true
+}
+
+func putUint24(b []byte, v uint32) { b[0], b[1], b[2] = byte(v), byte(v>>8), byte(v>>16) }
+
+func uint24(b []byte) uint32 { return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 }
+
+// bytesIndexOrder is the positions of cells ordered by (bytes, position), and
+// the comparator that ordered them; false for a cell that names no heap bytes.
+func bytesIndexOrder(cells []int64, heap []byte) ([]int32, func(a, b int64) int, bool) {
 	at := func(c int64) []byte {
 		o, n := uint32(uint64(c)), uint32(uint64(c)>>32)
 		if int(o)+int(n) > len(heap) {
@@ -128,7 +182,7 @@ func buildSegColumnIndexBytes(cells []int64, heap []byte) ([]byte, bool) {
 	}
 	for _, c := range cells {
 		if at(c) == nil {
-			return nil, false // a cell that does not describe heap bytes
+			return nil, nil, false // a cell that does not describe heap bytes
 		}
 	}
 	compare := func(a, b int64) int { return bytes.Compare(at(a), at(b)) }
@@ -161,7 +215,7 @@ func buildSegColumnIndexBytes(cells []int64, heap []byte) ([]byte, bool) {
 		}
 		lo = hi
 	}
-	return buildSegColumnIndexOrdered(cells, segIdxCodecBytes, compare, order)
+	return order, compare, true
 }
 
 // radixOrderInt64 returns the positions of vals ordered by (value, position):
@@ -278,8 +332,11 @@ type segDiskIndex struct {
 	nRows  int
 	vals   []byte // nVals * 8
 	starts []byte // (nVals+1) * 4
-	posts  []byte // nRows * 4
+	posts  []byte // nRows * 4, or nRows * 3 for segIdxCodecBytesPerm
 	heap   []byte // the segment's byte arena, for segIdxCodecBytes
+	// rowBytes is the column's value at a row position, for
+	// segIdxCodecBytesPerm, whose record holds no values of its own.
+	rowBytes func(pos int) ([]byte, bool)
 }
 
 // bytesAt is the heap bytes a packed (heapOffset, length) cell names.
@@ -295,7 +352,7 @@ func (x *segDiskIndex) bytesAt(i int) []byte {
 // openSegColumnIndex validates one index record against the segment it belongs
 // to. false for anything that does not check out -- which sends the caller to the
 // scan, the one answer that is always right.
-func openSegColumnIndex(buf []byte, off uint32, nRows int, heap []byte) (*segDiskIndex, bool) {
+func openSegColumnIndex(buf []byte, off uint32, nRows int, heap []byte, rowBytes func(int) ([]byte, bool)) (*segDiskIndex, bool) {
 	if off == 0 || off%8 != 0 || int(off)+segIdxHdr > len(buf) {
 		return nil, false
 	}
@@ -305,7 +362,7 @@ func openSegColumnIndex(buf []byte, off uint32, nRows int, heap []byte) (*segDis
 	}
 	codec := binary.LittleEndian.Uint16(b[2:])
 	switch codec {
-	case segIdxCodecPostings, segIdxCodecBytes, segIdxCodecFloat:
+	case segIdxCodecPostings, segIdxCodecBytes, segIdxCodecFloat, segIdxCodecBytesPerm:
 	default:
 		return nil, false // a codec this build does not implement
 	}
@@ -314,6 +371,9 @@ func openSegColumnIndex(buf []byte, off uint32, nRows int, heap []byte) (*segDis
 	byteLen := int(binary.LittleEndian.Uint32(b[12:]))
 	if claimRows != nRows || nVals <= 0 || nVals > nRows {
 		return nil, false
+	}
+	if codec == segIdxCodecBytesPerm {
+		return openSegColumnIndexPerm(b, nVals, nRows, byteLen, rowBytes)
 	}
 	need := segIdxHdr + nVals*8 + (nVals+1)*4 + nRows*4
 	// byteLen bounds THIS record, so a damaged one cannot reach into the next.
@@ -371,6 +431,74 @@ func openSegColumnIndex(buf []byte, off uint32, nRows int, heap []byte) (*segDis
 		}
 	}
 	return idx, true
+}
+
+// openSegColumnIndexPerm validates a segIdxCodecBytesPerm record, b from its
+// header on: every position in range and named once, ordered by (bytes,
+// position), with nVals distinct values. The column's own values are what is
+// checked, read through rowBytes, so a record that does not order THIS column
+// declines rather than answering for it.
+func openSegColumnIndexPerm(b []byte, nVals, nRows, byteLen int, rowBytes func(int) ([]byte, bool)) (*segDiskIndex, bool) {
+	need := segIdxHdr + 3*nRows
+	if rowBytes == nil || nRows > 1<<24 || byteLen < need || byteLen > len(b) {
+		return nil, false
+	}
+	posts := b[segIdxHdr:need]
+	seen := make([]uint64, (nRows+63)/64)
+	distinct := 0
+	var prev []byte
+	prevPos := -1
+	for k := 0; k < nRows; k++ {
+		p := int(uint24(posts[3*k:]))
+		if p >= nRows || seen[p/64]&(1<<uint(p%64)) != 0 {
+			return nil, false
+		}
+		seen[p/64] |= 1 << uint(p%64)
+		cur, ok := rowBytes(p)
+		if !ok {
+			return nil, false
+		}
+		if k == 0 {
+			distinct = 1
+		} else {
+			switch c := bytes.Compare(prev, cur); {
+			case c > 0:
+				return nil, false
+			case c < 0:
+				distinct++
+			case p < prevPos:
+				return nil, false // equal values keep position order
+			}
+		}
+		prev, prevPos = cur, p
+	}
+	if distinct != nVals {
+		return nil, false
+	}
+	return &segDiskIndex{codec: segIdxCodecBytesPerm, nVals: nVals, nRows: nRows, posts: posts, rowBytes: rowBytes}, true
+}
+
+// rowsForBytesPerm is rowsForBytes over a segIdxCodecBytesPerm record: the run
+// of positions whose row holds probe, which the (bytes, position) order makes
+// contiguous and ascending.
+func (x *segDiskIndex) rowsForBytesPerm(probe []byte, dst []int32) ([]int32, bool) {
+	at := func(k int) []byte {
+		v, _ := x.rowBytes(int(uint24(x.posts[3*k:]))) // validated at open
+		return v
+	}
+	lo, hi := 0, x.nRows
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if bytes.Compare(at(mid), probe) < 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	for k := lo; k < x.nRows && bytes.Equal(at(k), probe); k++ {
+		dst = append(dst, int32(uint24(x.posts[3*k:])))
+	}
+	return dst, true
 }
 
 // compareAt orders two entries under this index's own codec.
@@ -435,6 +563,9 @@ func (x *segDiskIndex) rowsForFloat(probe float64, dst []int32) ([]int32, bool) 
 
 // rowsForBytes is rowsFor for a TEXT or BLOB probe.
 func (x *segDiskIndex) rowsForBytes(probe []byte, dst []int32) ([]int32, bool) {
+	if x.codec == segIdxCodecBytesPerm {
+		return x.rowsForBytesPerm(probe, dst)
+	}
 	if x.codec != segIdxCodecBytes {
 		return dst, false
 	}

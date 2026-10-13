@@ -23,11 +23,11 @@ import (
 // format version is added, into a directory of its own, leaving the old one.
 
 // formatFixtureDir is the fixture the current format writes.
-const formatFixtureDir = "testdata/format/v5"
+const formatFixtureDir = "testdata/format/v6"
 
 // formatVersionWritten is the segment file version a rewrite writes: a
 // fixture of any older version is written back as this one by its VACUUM.
-const formatVersionWritten = 5
+const formatVersionWritten = 6
 
 // formatFixtureSetup builds the fixture: every storage class and NULL, a
 // rowid alias and a WITHOUT ROWID table, indexes plain, expression and
