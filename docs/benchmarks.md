@@ -119,6 +119,67 @@ Point lookups are DuckDB's weak spot and C SQLite's strength.
 
 Run with `MUSQL_WORKERS=4` for the four-worker column.
 
+## Bulk load and point reads
+
+`bench/pointread` measures what an application does with a key-value table,
+through `database/sql` for both engines: one transaction inserting 10M rows
+(`k INTEGER PRIMARY KEY, v TEXT`, values like `value-1234567`) through a
+prepared statement, then 12 goroutines each reading 50,000 random keys with
+`SELECT v FROM kv WHERE k = ?`, every value checked. C SQLite is mattn/go-sqlite3.
+Disk is the database and its sidecar files, measured with the connection open.
+
+**Apple M4** (arm64, macOS)
+
+| Metric | musql | C SQLite | musql / C |
+| --- | ---: | ---: | ---: |
+| Load, 10M rows | 4.52 s | 4.99 s | 0.90 |
+| Read avg | 10.5 µs | 28.9 µs | 0.36 |
+| Read p50 | 3.5 µs | 17.2 µs | 0.21 |
+| Read p99 | 101 µs | 273 µs | 0.37 |
+| Read max | 5.9 ms | 32.1 ms | 0.18 |
+| Disk | 190.9 MiB | 218.2 MiB | 0.87 |
+
+**Intel Xeon D-2123IT** (amd64, Linux, a shared server)
+
+| Metric | musql | C SQLite | musql / C |
+| --- | ---: | ---: | ---: |
+| Load, 10M rows | 19.2 s | 22.3 s | 0.86 |
+| Read avg | 18.7 µs | 55.4 µs | 0.34 |
+| Read p50 | 8.8 µs | 32.5 µs | 0.27 |
+| Read p99 | 265 µs | 227 µs | 1.17 |
+| Read max | 8.6 ms | 21.0 ms | 0.41 |
+| Disk | 190.9 MiB | 218.2 MiB | 0.87 |
+
+The x86 machine is shared and was at a load of 7-9 on its 8 cores; there
+musql's p99 came out at 0.98x, 1.16x and 1.17x C's over three runs. That tail
+is not the engine's read: twelve readers on eight cores contend on
+`database/sql`'s own pool lock (`DB.conn` and `putConn`, 12% of the read
+phase's CPU, much of it spinning), which a read 3.5x faster than C's takes
+3.5x as often. With the GC off it is about even; the M4, idle, has it at 0.37x.
+
+Before the work that brought these, musql took 2.2x C's time to load, lost on
+p99 and max, and wrote 2.1x C's bytes. What changed:
+
+- **Load.** A transaction's inserts into an empty table build segments
+  directly (engine/insert_bulk_direct.go) instead of going through the row
+  store, the change log and the spill file and being rebuilt at COMMIT.
+- **Disk** (47 to 20 bytes a row). Segment file version 6 keeps consecutive
+  rowids as one, drops the width block of full rows, stores a TEXT column as
+  4-byte heap bounds instead of 8-byte cells, and keeps 3-byte row positions
+  in the TEXT equality index instead of a value, a prefix sum and a position.
+- **Reads and their tail.** Each statement's freshness check stamped two
+  files, a stat and an fstat that twelve readers queued on in the kernel; it
+  now reads a word the writers keep in the lock file. All connections share
+  one mapping of the file, so a page faults once and not once per connection.
+  A new connection's first read no longer maps the file twice, and a closing
+  connection that had only read no longer takes the exclusive commit lock,
+  which made every connection opening at that moment sleep a lock-poll
+  interval.
+
+`bench/pointread/run` runs a short version (1M rows) and fails if musql
+loses on load, avg, p50, p99 or disk; CI runs it, and
+`POINTREAD_FULL=1 bench/pointread/run` is the full size.
+
 ## Notes
 
 - The Go bridge costs C SQLite microseconds per statement: point lookups take

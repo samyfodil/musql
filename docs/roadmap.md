@@ -204,6 +204,25 @@ SQLite's SQL, as Hrana is libSQL's protocol over it. Tested the way the Turso
 client job tests Hrana: real `psql`, pgx, node-postgres and psycopg against
 `musqld` in CI.
 
+## Bulk load and point reads (bench/pointread)
+
+musql beats C SQLite on every metric of `bench/pointread` on the M4, and on
+all but p99 on the shared x86 server, where twelve readers contend on
+`database/sql`'s pool lock (docs/benchmarks.md); CI fails if a gated metric
+loses at the short size. What is left of the margins:
+
+- A cold connection still parses every segment of the file for itself, about
+  0.5 ms at 10M rows; twelve opening at once is a read's maximum. The mapping
+  is shared now (segment_file_share.go); the parsed segments could be too.
+- A point read allocates about 1.2 KB, half of it the per-statement read
+  pager (600 bytes); on 12 readers the GC that pays for it is a third of p99
+  on the M4 (GOGC=off: 107 to 74 us) and a sixth on the x86 server. A pager
+  reused across a session's statements would halve it, once nothing is shown
+  to keep a statement's pager past the statement.
+- A transaction's load (segBulkLoad.inTx) arms only on an empty table. A
+  table with rows could append past its largest rowid the same way.
+- Per loaded INSERT, the machine reset (putMachine) is 5-7% of the time.
+
 ## Write path in the browser
 
 Single-row writes in wasm run at 20-25 us under Node; in the browser race,
