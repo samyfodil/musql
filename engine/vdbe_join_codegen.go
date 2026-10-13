@@ -582,7 +582,7 @@ func resolveJoinSources(p *ReadOnlyPager, c *compiler, items []FromItem) ([]join
 			}
 			// resolveTable's error is normally a genuine "no such table", so it is
 			// errVDBESemantic and reaches the user as the statement's error.
-			return nil, semanticf("%v", terr)
+			return nil, semanticf("%v", relabelMissingTable(it, terr))
 		}
 		name := it.Alias
 		if name == "" {
@@ -2154,7 +2154,7 @@ func (p *ReadOnlyPager) resolveGroupSource(c *compiler, state *joinDesugarState,
 			// (resolveJoinSources): a genuine "no such table" must PROPAGATE
 			// (errVDBESemantic), never be masked behind the generic
 			// "not compilable to bytecode" fallback message.
-			return joinSource{}, semanticf("%v", terr)
+			return joinSource{}, semanticf("%v", relabelMissingTable(it, terr))
 		}
 	}
 	return p.finishGroupSource(c, state, i, items, it, gl, tbl)

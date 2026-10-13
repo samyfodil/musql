@@ -1,5 +1,7 @@
 package engine
 
+import "errors"
+
 // The bodies of opcodes that two executors run: the VDBE's run loop, and the
 // service blocks a compiled kernel hands back to Go (segment_service.go). One
 // implementation each, so the two cannot drift.
@@ -34,6 +36,9 @@ func (m *vdbe) opFunction(op *Instruction) error {
 // opLike is OP_Like: r[P2] = r[P1] [NOT] LIKE r[P3] [ESCAPE r[P4]].
 func (m *vdbe) opLike(op *Instruction) error {
 	x, pat := m.regs[op.P1], m.regs[op.P3]
+	if likePatternTooLong(pat) {
+		return errLikePatternTooComplex
+	}
 	escReg, _ := op.P4.(int)
 	var (
 		esc     rune
@@ -72,8 +77,11 @@ func (m *vdbe) opLike(op *Instruction) error {
 }
 
 // opGlob is OP_Glob: r[P2] = r[P1] [NOT] GLOB r[P3].
-func (m *vdbe) opGlob(op *Instruction) {
+func (m *vdbe) opGlob(op *Instruction) error {
 	x, pat := m.regs[op.P1], m.regs[op.P3]
+	if likePatternTooLong(pat) {
+		return errLikePatternTooComplex
+	}
 	if x.Typ == Null || pat.Typ == Null {
 		m.regs[op.P2] = Value{Typ: Null}
 	} else {
@@ -83,4 +91,14 @@ func (m *vdbe) opGlob(op *Instruction) {
 		}
 		m.regs[op.P2] = boolValue(matched)
 	}
+	return nil
+}
+
+// errLikePatternTooComplex is likeFunc's answer for a pattern past
+// SQLITE_LIMIT_LIKE_PATTERN_LENGTH (func.c), checked before any NULL rule.
+var errLikePatternTooComplex = errors.New("engine: LIKE or GLOB pattern too complex")
+
+// likePatternTooLong applies that limit (the default, 50000 bytes).
+func likePatternTooLong(pat Value) bool {
+	return pat.Typ != Null && len(valueToText(pat)) > 50000
 }

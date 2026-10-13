@@ -101,6 +101,25 @@ func buildUpdateFromSelect(stmt *updateStmt, tbl *tableMeta) (*SelectStmt, int, 
 	// (expr.c:1913 copies zDatabase). Without it, pass one resolved the temp
 	// t and pass two wrote that rowid into main's t.
 	from = append(from, FromItem{Table: tbl.name, Schema: stmt.schema, Alias: stmt.alias, UpdateTarget: true})
+	// The FROM list and the target share one name space: a name written twice
+	// (an unaliased table listed twice, or one alias on two sources) is
+	// ambiguous when the rewrite names its columns, so C rejects the statement
+	// even though a plain SELECT over the same list is fine.
+	seenNames := map[string]bool{}
+	for _, it := range from {
+		name := it.Alias
+		if name == "" && it.Subquery == nil {
+			name = it.Table
+		}
+		if name == "" {
+			continue
+		}
+		folded := r33sFoldIdent(name)
+		if seenNames[folded] {
+			return nil, 0, semanticf("engine: ambiguous column name: %s", name)
+		}
+		seenNames[folded] = true
+	}
 	// A leading "WITH ..." belongs to the join, not just to the statement's own
 	// subqueries: "WITH data(k,v) AS (VALUES(1,'ten')) UPDATE t1 SET b=v FROM
 	// data WHERE a=k" names the CTE as a FROM SOURCE (upfrom2.test 1.x.1), so

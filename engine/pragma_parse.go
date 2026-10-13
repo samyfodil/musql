@@ -439,6 +439,8 @@ func parsePragmaTableDef(createSQL string) (*pragmaTableDef, error) {
 			}
 			switch kwTok.upper() {
 			case "PRIMARY":
+				// "PRIMARY KEY(x AUTOINCREMENT)" names the column x alone.
+				rest, _ = stripPKConstraintAutoincrement(rest)
 				names, pkDesc, pkColl := extractParenIdentListFull(rest)
 				if len(names) == 0 {
 					continue
