@@ -28,3 +28,5 @@ it. The full-size run is heavy (several GB of RAM, about 0.5 GB of disk); run it
 on a server.
 
 Profiling: `-cpuprofile file` covers the whole run, `-trace file` the read phase.
+`-conn` gives each reader its own `*sql.Conn`, taken and warmed before timing,
+so the timed reads never enter `database/sql`'s pool or its lock.

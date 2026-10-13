@@ -11,6 +11,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"flag"
@@ -53,6 +54,7 @@ func main() {
 	cpuProfile := flag.String("cpuprofile", "", "write a CPU profile of the whole run to this file")
 	traceOut := flag.String("trace", "", "write a runtime/trace of the read phase to this file")
 	slowest := flag.Int("slowest", 0, "print the n slowest reads, with their reader and position")
+	perConn := flag.Bool("conn", false, "give each reader its own *sql.Conn, taken and warmed before timing, instead of the shared *sql.DB's pool")
 	journal := flag.String("journal", "", "PRAGMA journal_mode to set before loading (default: the engine's)")
 	flag.Parse()
 	if *cpuProfile != "" {
@@ -109,7 +111,9 @@ func main() {
 		}
 	}
 	faults0 := minorFaults()
-	lat, err := readAll(db, *rows, *workers, *reads)
+	readStart := time.Now()
+	lat, err := readAll(db, *rows, *workers, *reads, *perConn)
+	readWall := time.Since(readStart)
 	faults := minorFaults() - faults0
 	if *traceOut != "" {
 		trace.Stop()
@@ -148,6 +152,7 @@ func main() {
 
 	printReport(r)
 	fmt.Printf("  faults %d minor page faults during the reads\n", faults)
+	fmt.Printf("  rate   %.0f reads/s\n", float64(r.Reads)/readWall.Seconds())
 	if *jsonOut != "" {
 		b, err := json.MarshalIndent(r, "", "  ")
 		if err != nil {
@@ -193,9 +198,32 @@ func loadTable(db *sql.DB, n int) (time.Duration, error) {
 
 // readAll runs perWorker random point reads on each of workers goroutines and
 // returns every read's latency. A wrong or missing value is an error.
-func readAll(db *sql.DB, rows, workers, perWorker int) ([]time.Duration, error) {
+func readAll(db *sql.DB, rows, workers, perWorker int, perConn bool) ([]time.Duration, error) {
 	lat := make([]time.Duration, workers*perWorker)
 	errs := make([]error, workers)
+	// -conn: each reader holds its own connection, taken from the pool and
+	// warmed with one read before any timing, so the timed loop never enters
+	// the pool -- or its lock.
+	type rowQuerier interface {
+		QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	}
+	queriers := make([]rowQuerier, workers)
+	for w := range workers {
+		queriers[w] = db
+		if !perConn {
+			continue
+		}
+		c, err := db.Conn(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		defer c.Close()
+		var v string
+		if err := c.QueryRowContext(context.Background(), "SELECT v FROM kv WHERE k = ?", 1).Scan(&v); err != nil {
+			return nil, err
+		}
+		queriers[w] = c
+	}
 	var wg sync.WaitGroup
 	for w := range workers {
 		wg.Go(func() {
@@ -205,7 +233,7 @@ func readAll(db *sql.DB, rows, workers, perWorker int) ([]time.Duration, error) 
 				k := rng.IntN(rows) + 1
 				var v string
 				t := time.Now()
-				err := db.QueryRow("SELECT v FROM kv WHERE k = ?", k).Scan(&v)
+				err := queriers[w].QueryRowContext(context.Background(), "SELECT v FROM kv WHERE k = ?", k).Scan(&v)
 				mine[i] = time.Since(t)
 				if err != nil {
 					errs[w] = fmt.Errorf("read %d: %w", k, err)
