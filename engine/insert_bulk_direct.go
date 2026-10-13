@@ -64,7 +64,18 @@ type segBulkLoad struct {
 	// rows is how many rows it holds: what a statement's mark counts.
 	rows int
 	db   *DB // for inTx's undo, which a journal entry runs without one
+	// segBytes is the built segments' size, which a load inside a transaction
+	// holds in memory until COMMIT: past txBulkMaxBytes it hands its rows to
+	// the row store, whose spill keeps a transaction's memory bounded.
+	segBytes int
 }
+
+// txBulkMaxBytes bounds the segments a transaction's load holds in memory. A
+// variable so a test can make every load overflow.
+var txBulkMaxBytes = 1 << 30
+
+// SetTxBulkMaxBytesForTest sets txBulkMaxBytes and returns the old value.
+func SetTxBulkMaxBytesForTest(n int) int { old := txBulkMaxBytes; txBulkMaxBytes = n; return old }
 
 // txAppendArmable reports whether plan may write through a load armed inside a
 // transaction: an INSERT ... SELECT the autocommit load takes, or an INSERT ...
@@ -152,6 +163,7 @@ func (m *vdbe) bulkLoadInTx(plan *insertPlan) *segBulkLoad {
 		copy(cols, tbl.cols)
 		bl.cut = segCutter{cols: cols, what: tbl.name, emit: func(raw []byte) error {
 			bl.segs = append(bl.segs, raw)
+			bl.segBytes += len(raw)
 			return nil
 		}}
 		tbl.bulk = bl
@@ -197,7 +209,7 @@ func (bl *segBulkLoad) truncateTo(tbl *tableMeta, n int) {
 		rowids, rows = append(rowids, rid), append(rows, vals)
 		return true
 	})
-	bl.segs, bl.rows = nil, 0
+	bl.segs, bl.rows, bl.segBytes = nil, 0, 0
 	clear(bl.cut.rows)
 	bl.cut.rowids, bl.cut.rows, bl.cut.bytes = bl.cut.rowids[:0], bl.cut.rows[:0], 0
 	for i, rid := range rowids {
@@ -369,6 +381,11 @@ func (m *vdbe) bulkStore(bl *segBulkLoad, tbl *tableMeta, rowid uint64, full []V
 	m.wctx.db.lastInsertRowid = int64(rowid)
 	if bl.inTx {
 		txBulkRows.Add(1)
+		if bl.segBytes > txBulkMaxBytes {
+			// Too big to hold until COMMIT: the rows go to the row store, this
+			// statement's journalled to it, and the statement carries on there.
+			m.wctx.db.drainTxBulks(nil)
+		}
 	}
 	tbl.rowsWrittenSinceCommit = true
 	return true, nil

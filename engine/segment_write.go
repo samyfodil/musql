@@ -166,7 +166,15 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 	var tableIndex map[string]int
 	var ipkOf map[string]int
 	var rootEdits []ConvertedRootEdit
+	var stamp [2]fileStamp
 	if lerr := withSegmentReadLockWait(segPath, wait, func() error {
+		// The pair's stamp, taken under the same lock as the read and before it,
+		// so it describes no newer a file than the rows: the first statement's
+		// freshness check (RefreshIfStale) then answers from it, where a zero
+		// stamp sent every new connection to map and replay the pair a second
+		// time -- most of a cold first read, and with twelve connections opening
+		// at once, a queue on the process's mmap lock.
+		stamp = [2]fileStamp{stampOf(segPath), stampOf(segDeltaPath(segPath))}
 		f, st, rerr := readSegmentPairUnlocked(segPath)
 		if rerr != nil {
 			return rerr
@@ -221,6 +229,7 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 		baseCtr: baseCtr, basePages: basePages,
 		endCtr: endCtr, endPages: endPages,
 		loadedCtr: endCtr, loadedPages: endPages, // the state just read
+		seenStat: stamp,
 
 		tableIndex: tableIndex, ipkOf: ipkOf,
 	}
@@ -452,13 +461,33 @@ func (n *Session) Commit() (bool, error) {
 		n.applyLocks()
 	} else if n.DB != nil && n.segLockFile != nil {
 		err = commit()
-	} else {
+	} else if !n.nothingToCommit() {
 		err = n.withCommitLock(commit)
 	}
 	if !n.InTransaction() {
 		n.EndWriteTxn() // the transaction a BEGIN IMMEDIATE opened is over
 	}
 	return wrote, err
+}
+
+// nothingToCommit reports, without the commit lock, that a commit would write
+// nothing: no row, catalog, VACUUM or TEMP change is pending. Every connection
+// that only read commits on Close, and taking the EXCLUSIVE commit lock for it
+// made a connection opening at that moment -- whose read lock conflicts --
+// sleep a whole poll interval (acquireLock): 12 connections closing and
+// opening at once ran first reads of 10-20ms.
+func (n *Session) nothingToCommit() bool {
+	db := n.DB
+	if db == nil || n.segmentVacuumPending || db.changeLog.len() != 0 || len(db.txBulks) != 0 ||
+		db.tempPair != nil || db.holdsAnyTempObject() {
+		return false
+	}
+	for _, t := range db.tables {
+		if t.rowsWrittenSinceCommit {
+			return false
+		}
+	}
+	return !n.catalogMoved()
 }
 
 // commitSync is how this session's commits reach the disk: not at all under

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/samyfodil/musql/engine"
 )
@@ -255,6 +256,23 @@ func TestTxBulkLoad(t *testing.T) {
 		}
 	})
 
+	t.Run("a load too big to hold goes on in the row store", func(t *testing.T) {
+		old := engine.SetTxBulkMaxBytesForTest(1)
+		defer engine.SetTxBulkMaxBytesForTest(old)
+		db, _ := open(t)
+		tx, _ := db.Begin()
+		load(t, tx, 1, big) // the first built segment overflows the bound
+		if got := state(t, tx); got != want(span(1, big)...) {
+			t.Fatalf("inside: %s", got)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		if got := state(t, db); got != want(span(1, big)...) {
+			t.Fatalf("after commit: %s", got)
+		}
+	})
+
 	t.Run("last_insert_rowid after an autocommit load", func(t *testing.T) {
 		// The autocommit direct-path load (INSERT ... SELECT into an empty
 		// table) left last_insert_rowid() where it was; C answers the last row.
@@ -293,4 +311,41 @@ func TestTxBulkLoad(t *testing.T) {
 			t.Fatalf("%s", got)
 		}
 	})
+}
+
+// A connection that only read has nothing to commit when it closes, and must
+// not take the commit lock to find that out: held EXCLUSIVE, it made every
+// connection opening meanwhile wait out a lock poll, and against another
+// connection's write transaction the close waited the whole busy timeout.
+func TestReadOnlyCloseTakesNoLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.musq")
+	writer, err := sql.Open(DriverName, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	writer.SetMaxOpenConns(1)
+	if _, err := writer.Exec("CREATE TABLE t(x); INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := sql.Open(DriverName, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var x int
+	if err := reader.QueryRow("SELECT x FROM t").Scan(&x); err != nil || x != 1 {
+		t.Fatalf("%d %v", x, err)
+	}
+	// BEGIN EXCLUSIVE holds the lock a commit takes until it ends.
+	if _, err := writer.Exec("BEGIN EXCLUSIVE"); err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Exec("ROLLBACK")
+	start := time.Now()
+	if err := reader.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("closing a connection that only read took %v", d)
+	}
 }

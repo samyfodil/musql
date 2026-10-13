@@ -52,6 +52,8 @@ func main() {
 	jsonOut := flag.String("json", "", "also write the report as JSON to this file")
 	cpuProfile := flag.String("cpuprofile", "", "write a CPU profile of the whole run to this file")
 	traceOut := flag.String("trace", "", "write a runtime/trace of the read phase to this file")
+	slowest := flag.Int("slowest", 0, "print the n slowest reads, with their reader and position")
+	journal := flag.String("journal", "", "PRAGMA journal_mode to set before loading (default: the engine's)")
 	flag.Parse()
 	if *cpuProfile != "" {
 		f, err := os.Create(*cpuProfile)
@@ -85,6 +87,11 @@ func main() {
 	db.SetMaxOpenConns(*workers)
 	db.SetMaxIdleConns(*workers)
 
+	if *journal != "" {
+		if _, err := db.Exec("PRAGMA journal_mode=" + *journal); err != nil {
+			fail(err)
+		}
+	}
 	r := report{Engine: engine, Rows: *rows, Reads: *workers * *reads}
 	load, err := loadTable(db, *rows)
 	if err != nil {
@@ -107,6 +114,9 @@ func main() {
 	}
 	if err != nil {
 		fail(err)
+	}
+	if *slowest > 0 {
+		printSlowest(lat, *reads, *slowest)
 	}
 	slices.Sort(lat)
 	var sum time.Duration
@@ -212,6 +222,19 @@ func readAll(db *sql.DB, rows, workers, perWorker int) ([]time.Duration, error) 
 		}
 	}
 	return lat, nil
+}
+
+// printSlowest prints the n slowest reads: which reader made each and how far
+// into its run, which tells a cold first read from a pause in the middle.
+func printSlowest(lat []time.Duration, perWorker, n int) {
+	idx := make([]int, len(lat))
+	for i := range idx {
+		idx[i] = i
+	}
+	slices.SortFunc(idx, func(a, b int) int { return int(lat[b] - lat[a]) })
+	for _, i := range idx[:min(n, len(idx))] {
+		fmt.Printf("  slow   %v  reader %d, read %d\n", lat[i], i/perWorker, i%perWorker)
+	}
 }
 
 func printReport(r report) {
