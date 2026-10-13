@@ -1977,6 +1977,20 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			if ds.cte != nil {
 				slot := op.P2
+				// A reference counted at compile time as the CTE's only one
+				// may have been joined by later ones (nUse counts every
+				// reference in the statement, select.c:5767): two or more
+				// without AS NOT MATERIALIZED make C materialize it instead
+				// (fromClauseTermCanBeCoroutine's (2b)).
+				if b := ds.cte.binding; ds.rerun && (b.m10d == cteM10dNo || b.nUse < 2) {
+					cur := openFillCursor(ds.tbl, func() ([][]Value, []int64, error) {
+						_, rows, err := dsPager.resolveCTERows(ds.cte.name, ds.cte.binding, m.params)
+						return rows, nil, err
+					}, true, ds.keepSubtype)
+					cur.refillEach = true
+					m.cursors[op.P1] = cur
+					break
+				}
 				m.cursors[op.P1] = openFillCursor(ds.tbl, func() ([][]Value, []int64, error) {
 					rows, err := m.runCTEOnce(slot, ds, dsPager)
 					return rows, nil, err
@@ -1996,6 +2010,26 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				// A co-routine rather than a materialization: see subStream
 				// (vdbe_stream.go) and derivedSource.stream.
 				m.cursors[op.P1] = openStreamCursor(ds.tbl, m.newSubStream(ds, srcPager))
+				break
+			}
+			if ds.rerun && ds.upfrom == nil && ds.viewUpfrom == nil && srcPager == m.pager {
+				// A co-routine in an inner loop: the body runs at every rewind,
+				// never from the run-once cache (derivedSource.rerun).
+				prog := ds.prog
+				cur := openFillCursor(ds.tbl, func() ([][]Value, []int64, error) {
+					if !prog.Correlated {
+						lp, lpager, lerr := m.liveLower(prog, srcPager)
+						if lerr != nil {
+							return nil, nil, lerr
+						}
+						rows, err := lp.execTrig(lpager, m.params, m)
+						return rows, nil, err
+					}
+					rows, err := prog.execWithParent(m)
+					return rows, nil, err
+				}, true, ds.keepSubtype)
+				cur.refillEach = true
+				m.cursors[op.P1] = cur
 				break
 			}
 			if ds.upfrom == nil && ds.viewUpfrom == nil && (!ds.prog.Correlated || srcPager == m.pager) {

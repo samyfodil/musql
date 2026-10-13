@@ -169,6 +169,21 @@ func markWherePlanEligibility(p *ReadOnlyPager, c *compiler, srcs []joinSource, 
 // statement-shape declines that do not depend on the WHERE clause. Split out so
 // markWherePlanEligibility can stash colUsed after them and before the plan.
 func wherePlanMultiTableSources(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt *SelectStmt) bool {
+	return wherePlanMultiTableSourcesWith(p, c, srcs, stmt, nil)
+}
+
+// wherePlanDerivedItem is what the planner knows of a FROM-clause subquery it
+// is allowed to place (markCoroutineReruns): the row estimate sqlite3Select
+// leaves in pItem->pSTab->nRowLogEst (select.c:8068, :8127) and whether the
+// subquery is correlated.
+type wherePlanDerivedItem struct {
+	nRow       logEst
+	correlated bool
+	subOB      []whereSubOB
+	coroutine  bool
+}
+
+func wherePlanMultiTableSourcesWith(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt *SelectStmt, der map[int]wherePlanDerivedItem) bool {
 	if len(srcs) < 2 || len(srcs) > 64 {
 		// 64 is BMS: sqlite3WhereBegin refuses a longer FROM clause outright.
 		// See wherePlanOrder.
@@ -196,6 +211,12 @@ func wherePlanMultiTableSources(p *ReadOnlyPager, c *compiler, srcs []joinSource
 	}
 	for i := range srcs {
 		s := &srcs[i]
+		if _, ok := der[i]; ok {
+			if (s.derived == nil && s.cteItem == nil) || s.rightOuter || s.tbl == nil || len(s.tbl.cols) >= 63 {
+				return false
+			}
+			continue
+		}
 		// Every virtual-table source is excluded from this solver. For an fts MATCH
 		// correlated to another item, C forces the vtab after that item through costs
 		// (where.c:4390; fts3.c:1636's 1e50; fts5_main.c:657's SQLITE_CONSTRAINT). With
@@ -233,10 +254,18 @@ func wherePlanMultiTableSources(p *ReadOnlyPager, c *compiler, srcs []joinSource
 // nRow is wherePlanResult.nRow for the whole multi-table plan, meaningless
 // when ok is false. See wherePlanOrder's identical return.
 func wherePlanMultiTableOrder(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt *SelectStmt) ([]int, []*autoIndexKey, logEst, bool) {
+	return wherePlanMultiTableOrderWith(p, c, srcs, stmt, nil, nil)
+}
+
+// wherePlanMultiTableOrderWith is wherePlanMultiTableOrder with the subqueries
+// in der admitted as items, and autoLevels (when non-nil) told which levels an
+// automatic index won.
+func wherePlanMultiTableOrderWith(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt *SelectStmt,
+	der map[int]wherePlanDerivedItem, autoLevels *[]bool) ([]int, []*autoIndexKey, logEst, bool) {
 	if p == nil || c == nil || stmt == nil {
 		return nil, nil, 0, false
 	}
-	if !wherePlanMultiTableSources(p, c, srcs, stmt) {
+	if !wherePlanMultiTableSourcesWith(p, c, srcs, stmt, der) {
 		return nil, nil, 0, false
 	}
 	// The IN shapes sqlite3FindInIndex resolves to something other than an
@@ -316,13 +345,35 @@ func wherePlanMultiTableOrder(p *ReadOnlyPager, c *compiler, srcs []joinSource, 
 	if !ok {
 		return nil, nil, 0, false
 	}
-	sortCtl, ok := wherePlanSortCtlFor(jts, scopes, stmt)
+	sortCtl, ok := wherePlanSortCtlForOpt(jts, scopes, stmt, der != nil)
 	if !ok {
 		return nil, nil, 0, false
 	}
 
 	items := make([]whereItem, len(srcs))
 	for i := range srcs {
+		if d, ok := der[i]; ok {
+			// A subquery's table (sqlite3ResultSetOfSelect): no index but the
+			// fake sPk, szTabRow 1 ("any non-zero value works", select.c:2432),
+			// nRowLogEst the subquery's nSelectRow.
+			items[i] = whereItem{
+				outer: jts[i].left || jts[i].rightOuter, cross: srcs[i].cross, fromExists: scopes[i].fromExists,
+				cols: srcs[i].tbl.cols, tabName: "\x00subquery" + itoaSmall(i),
+				colUsedOK: colUsedOK, ipkIndex: -1, szTabRow: 1,
+				idxs: []whereIndexInfo{{
+					name: "sqlite_rowid", aiColumn: []int{xnRowid}, azColl: []string{"BINARY"},
+					aSortOrder: []bool{false}, nKeyCol: 1, aiRowLogEst: []logEst{d.nRow, 0},
+					szIdxRow: 3, onError: true, ipk: true,
+				}},
+				nRowLogEst: d.nRow, nRowLogEstSet: true,
+				ephemeral: true, correlated: d.correlated,
+				subOB: d.subOB, coroutine: d.coroutine,
+			}
+			if colUsedOK {
+				items[i].colUsed = colUsed[i]
+			}
+			continue
+		}
 		// stmt, not nil: a pure expression index is source-generic, and a partial index
 		// is chained with its condition, whereUsablePartialIndex checking it against the
 		// terms (ON clauses included), as in C (where_plan_partial.go).
@@ -359,7 +410,7 @@ func wherePlanMultiTableOrder(p *ReadOnlyPager, c *compiler, srcs []joinSource, 
 	in := wherePlanInput{
 		items: items, terms: terms, sort: sortCtl,
 		noAutoIndex: !p.AutomaticIndex(), nQueryLoop: c.nQueryLoop,
-		reverseOrder: p.ReverseUnorderedSelects(),
+		reverseOrder: p.ReverseUnorderedSelects(), autoLevels: autoLevels,
 	}
 	var order []int
 	var keys []*autoIndexKey
@@ -579,9 +630,6 @@ func wherePlanSingleTableIndexOrder(p *ReadOnlyPager, c *compiler, srcs []joinSo
 		return nil, 0, false
 	}
 	colUsed, colUsedOK := wherePlanColUsed(p, c, jts, scopes, srcs, stmt)
-	if !colUsedOK {
-		return nil, 0, false
-	}
 	// whereLoopAddBtree chains a table's real indexes onto its fake sPk only
 	// when "pSrc->fg.notIndexed==0", so NOT INDEXED leaves the rowid scan as the
 	// only candidate -- which is still a CHOICE once there is an ORDER BY, since
@@ -590,6 +638,18 @@ func wherePlanSingleTableIndexOrder(p *ReadOnlyPager, c *compiler, srcs []joinSo
 		stmt.From[0].IndexedBy, stmt.From[0].NotIndexed, stmt)
 	if !ok || len(idxs) == 0 {
 		return nil, 0, false
+	}
+	// colUsed is read only to ask whether a REAL index covers the statement
+	// (whereLoopAddBtree's "m = pSrc->colUsed & pProbe->colNotIdxed"); a table
+	// whose chain is the fake sPk alone never asks, so an inexact colUsed is
+	// no reason to decline it. A WITHOUT ROWID table's one index is covering
+	// unconditionally, but this arm does not take those.
+	if !colUsedOK && (len(idxs) != 1 || !idxs[0].ipk) {
+		return nil, 0, false
+	}
+	usedBits := uint64(0)
+	if colUsedOK {
+		usedBits = colUsed[0]
 	}
 	nRowLogEst, szTabRow := wherePlanItemStats(p, s.tbl, idxs, szTabRow)
 	sortCtl, ok := wherePlanSortCtlFor(jts, scopes, stmt)
@@ -611,7 +671,7 @@ func wherePlanSingleTableIndexOrder(p *ReadOnlyPager, c *compiler, srcs []joinSo
 	in := wherePlanInput{
 		items: []whereItem{{
 			cols: s.tbl.cols, tabName: r33sFoldIdent(s.tbl.name),
-			colUsed: colUsed[0], colUsedOK: true,
+			colUsed: usedBits, colUsedOK: true,
 			ipkIndex: s.tbl.ipkIndex, szTabRow: szTabRow, idxs: idxs,
 			nRowLogEst: nRowLogEst, nRowLogEstSet: true,
 			indexedBy: stmt.From[0].IndexedBy != "", notIndexed: stmt.From[0].NotIndexed,
@@ -677,6 +737,7 @@ func wherePlanSeedInvariant(in wherePlanInput, solve func(wherePlanInput) (*auto
 func wherePlanSeedInvariantOrder(in wherePlanInput) ([]int, []*autoIndexKey, bool) {
 	var order []int
 	var keys []*autoIndexKey
+	var auto []bool
 	in.loops = &whereLoopCache{}
 	for seed := logEst(48); seed >= -600; seed-- {
 		in.nQueryLoop = seed
@@ -686,9 +747,15 @@ func wherePlanSeedInvariantOrder(in wherePlanInput) ([]int, []*autoIndexKey, boo
 		}
 		if seed == 48 {
 			order, keys = o, k
+			if in.autoLevels != nil {
+				auto = *in.autoLevels
+			}
 			continue
 		}
 		if !slices.Equal(o, order) || len(k) != len(keys) {
+			return nil, nil, false
+		}
+		if in.autoLevels != nil && !slices.Equal(*in.autoLevels, auto) {
 			return nil, nil, false
 		}
 		for i := range k {
@@ -776,6 +843,17 @@ func wherePlanSingleTableSolve(in wherePlanInput, stmt *SelectStmt, idxs []where
 // and pDistinct); a parameter LIMIT/OFFSET; the DISTINCT-to-GROUP-BY rewrite
 // (select.c:8180); an ORDER BY / GROUP BY term not resolvable as resolve.c does.
 func wherePlanSortCtlFor(jts []joinedTable, scopes []tableScope, stmt *SelectStmt) (*whereSortCtl, bool) {
+	return wherePlanSortCtlForOpt(jts, scopes, stmt, false)
+}
+
+// wherePlanSortCtlForOpt is wherePlanSortCtlFor; aggDistinctJoin additionally
+// follows a DISTINCT aggregate over a join (markCoroutineReruns' planner): in
+// the whole-table arm (select.c:8851-8865) one aggregate call that is DISTINCT,
+// with no column showing through (nAccumulator 0), hands sqlite3WhereBegin its
+// argument as pResultSet with WHERE_WANT_DISTINCT, which becomes pOrderBy under
+// WHERE_DISTINCTBY (where.c:7045-7051); any other shape hands it nothing. In
+// the GROUP BY arm pOrderBy is the GROUP BY whatever the DISTINCT.
+func wherePlanSortCtlForOpt(jts []joinedTable, scopes []tableScope, stmt *SelectStmt, aggDistinctJoin bool) (*whereSortCtl, bool) {
 	if stmt.LimitParam != nil || stmt.OffsetParam != nil {
 		return nil, false
 	}
@@ -812,8 +890,24 @@ func wherePlanSortCtlFor(jts []joinedTable, scopes []tableScope, stmt *SelectStm
 		// pOrderBy (where.c:5971); and WHERE_AGG_DISTINCT's effect needs two or more
 		// levels (where.c:7172). So that case proceeds (distinctagg.test stmt17). The
 		// whole-table arm and joins stay declined.
-		if len(stmt.GroupBy) == 0 || len(jts) != 1 {
+		if !aggDistinctJoin && (len(stmt.GroupBy) == 0 || len(jts) != 1) {
 			return nil, false
+		}
+		if aggDistinctJoin && len(stmt.GroupBy) == 0 {
+			arg, single, ok := wherePlanWholeTableDistinctArg(stmt)
+			if !ok {
+				return nil, false
+			}
+			if single {
+				t, ok := wherePlanSortTermFromResolved(jts, scopes, arg, false, false)
+				if !ok {
+					return nil, false
+				}
+				ctl.ob = append(ctl.ob, t)
+				ctl.wantDistinct = true
+				ctl.distinctCandidate = true
+			}
+			return ctl, true
 		}
 	}
 
@@ -969,9 +1063,25 @@ func wherePlanSortTermFromResolved(jts []joinedTable, scopes []tableScope, resol
 		}
 		t.uses |= whereMask(1) << uint(i)
 	}
-	t.isConst = t.uses == 0 && wherePlanExprIsConstant(resolved)
+	hasSub := containsSubquery(resolved)
+	if hasSub {
+		// sqlite3WhereExprUsage reaches into a subquery for the names it
+		// takes from this FROM clause (exprSelectUsage), and
+		// sqlite3ExprIsConstant refuses any subquery outright
+		// (sqlite3SelectWalkFail, expr.c:2623).
+		sm, ok := wherePlanSubqueryUsage(jts, scopes, resolved)
+		if !ok {
+			return t, false
+		}
+		t.uses |= sm
+	}
+	t.isConst = !hasSub && t.uses == 0 && wherePlanExprIsConstant(resolved)
 
-	if t.uses == 0 && !t.isConst {
+	if t.uses == 0 && !t.isConst && !exprCallsNondeterministicFunc(resolved) && !hasSub {
+		// A call to random() or randomblob() is what sqlite3ExprIsConstant
+		// certainly refuses (they carry no SQLITE_FUNC_CONSTANT), so such a
+		// term is exactly the non-constant one this leaves it as.
+		//
 		// A term that names no table and that this cannot PROVE constant --
 		// a function call, chiefly. sqlite3ExprIsConstant may well accept it
 		// (EP_ConstFunc), in which case the last block of
@@ -981,6 +1091,7 @@ func wherePlanSortTermFromResolved(jts []joinedTable, scopes []tableScope, resol
 		return t, false
 	}
 
+	_, t.bare = resolved.(ColumnExpr)
 	bare := whereSkipCollate(resolved)
 	if ce, ok := bare.(ColumnExpr); ok {
 		tab, col, found := wherePlanColumnRef(jts, scopes, ce)
@@ -1114,6 +1225,68 @@ func wherePlanHasDistinctAgg(stmt *SelectStmt) bool {
 	}
 	walk(stmt.Having)
 	return found
+}
+
+// wherePlanWholeTableDistinctArg is tag-select-0822's pDistinct: single is
+// true, with the argument, when the statement's one aggregate call (after
+// analyzeAggregate's deduplication) is DISTINCT with one argument and no column
+// is referenced outside an aggregate call. ok is false for a shape this does
+// not follow: a DISTINCT min()/max(), or an argument list not of one term.
+func wherePlanWholeTableDistinctArg(stmt *SelectStmt) (arg Expr, single, ok bool) {
+	if !wherePlanSingleDistinctAgg(stmt) {
+		return nil, false, true
+	}
+	var call *FuncExpr
+	bare := false
+	var walk func(Expr, bool)
+	walk = func(e Expr, inAgg bool) {
+		if e == nil {
+			return
+		}
+		switch x := e.(type) {
+		case FuncExpr:
+			if isAggregateCall(x) {
+				if call == nil {
+					cp := x
+					call = &cp
+				}
+				inAgg = true
+			}
+		case ColumnExpr:
+			if !inAgg {
+				bare = true
+			}
+		case SubqueryExpr, ExistsExpr:
+			return
+		}
+		wherePlanWalkChildren(e, func(ch Expr) { walk(ch, inAgg) })
+	}
+	for _, sc := range stmt.Columns {
+		if sc.Star {
+			bare = true
+			continue
+		}
+		walk(sc.Expr, false)
+	}
+	walk(stmt.Having, false)
+	for _, ot := range stmt.OrderBy {
+		walk(ot.Expr, false)
+	}
+	if call == nil {
+		return nil, false, false
+	}
+	switch r33sFoldIdent(call.Name) {
+	case "min", "max":
+		return nil, false, false
+	}
+	args := call.walkArgs()
+	if len(args) != 1 || call.Filter != nil {
+		return nil, false, false
+	}
+	if bare {
+		return nil, false, true
+	}
+	return args[0], true, true
 }
 
 // wherePlanSingleDistinctAgg reports C's exact precondition for the GROUP BY
