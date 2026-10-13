@@ -199,6 +199,7 @@ func TestRenameColumnOrderByBesideStarSweep(t *testing.T) {
 		"SELECT * FROM oth, src ORDER BY b",
 		"SELECT * FROM oth ORDER BY z",
 		"SELECT * FROM src ORDER BY c1",
+		"DELETE FROM oth WHERE q IN (SELECT * FROM src ORDER BY b)",
 	} {
 		for _, temp := range []string{"", "TEMP "} {
 			cases = append(cases, []string{"CREATE TEMP TABLE drv(n)", "CREATE TABLE src(c1, c2, b)", "CREATE TABLE oth(q, z)",
@@ -206,6 +207,10 @@ func TestRenameColumnOrderByBesideStarSweep(t *testing.T) {
 				"ALTER TABLE src RENAME COLUMN b TO bb", "ALTER TABLE oth RENAME COLUMN z TO zz",
 				"SELECT sql FROM sqlite_temp_master WHERE type = 'trigger'", "SELECT sql FROM sqlite_master WHERE type = 'trigger'"})
 		}
+	}
+	for _, view := range []string{"SELECT * FROM src ORDER BY b", "SELECT c1 FROM src WHERE c1 IN (SELECT * FROM src ORDER BY b)"} {
+		cases = append(cases, []string{"CREATE TABLE src(c1, c2, b)", "CREATE TABLE oth(b, z)", "CREATE VIEW v AS " + view,
+			"ALTER TABLE src RENAME COLUMN b TO bb", "SELECT sql FROM sqlite_master WHERE name = 'v'"})
 	}
 	sweepAll(t, cases)
 }

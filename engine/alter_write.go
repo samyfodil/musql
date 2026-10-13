@@ -11,6 +11,7 @@ package engine
 
 import (
 	"cmp"
+	"errors"
 	"fmt"
 	"math"
 	"regexp"
@@ -1797,6 +1798,9 @@ func applyTriggerRename(affected []*triggerMeta, oldName string, repl identRepl,
 			skips.starHas = columnRenameStarHas(ownerTable, oldName, hasCol)
 		}
 		newSQL, rerr := rewriteIdentInSQL(tr.sql, oldName, repl, skips, extra...)
+		if errors.Is(rerr, errRenameStarOrphan) {
+			return fmt.Errorf("engine: error in trigger %s after rename: no such column: %s", tr.name, oldName)
+		}
 		if rerr != nil {
 			return rerr
 		}
@@ -2176,23 +2180,32 @@ type r33rSkips struct {
 	// FROM tables expands to a column spelling the old name, as the schema
 	// stood BEFORE the rename; ok is false when it cannot tell. nil leaves an
 	// ORDER BY term beside a "*" undecided (orderByAliasSpans).
-	starHas func(tables []string) (has, ok bool)
+	starHas func(tables []string) (has, ownerOnly, ok bool)
 }
+
+// errRenameStarOrphan is rewriteIdentInSQL's report that an ORDER BY term it
+// left bound to a "*"-expanded column names a column only the renamed table
+// supplied, so the rewritten statement no longer resolves -- C's re-parse
+// (renameTestSchema) fails it "after rename: no such column: <name>".
+var errRenameStarOrphan = errors.New("ORDER BY term bound to a renamed *-expanded column")
 
 // columnRenameStarHas is r33rSkips.starHas for renaming ownerTable's oldName:
 // ownerTable carried the name before the rename, every other table answers
 // through hasCol, and a name hasCol cannot enumerate (a view, a CTE) is unknown.
-func columnRenameStarHas(ownerTable, oldName string, hasCol func(table, col string) bool) func([]string) (bool, bool) {
-	return func(tables []string) (has, ok bool) {
+func columnRenameStarHas(ownerTable, oldName string, hasCol func(table, col string) bool) func([]string) (bool, bool, bool) {
+	return func(tables []string) (has, ownerOnly, ok bool) {
+		others := false
 		for _, t := range tables {
 			if hasCol(t, "\x00") {
-				return false, false
+				return false, false, false
 			}
-			if equalFoldName(t, ownerTable) || hasCol(t, oldName) {
+			if equalFoldName(t, ownerTable) {
 				has = true
+			} else if hasCol(t, oldName) {
+				has, others = true, true
 			}
 		}
-		return has, true
+		return has, has && !others, true
 	}
 }
 
@@ -2213,7 +2226,11 @@ func rewriteIdentInSQL(sqlText, oldName string, repl identRepl, skips r33rSkips,
 	var aliased []byteSpan
 	if !repl.isTable {
 		var unsure bool
-		aliased, unsure = orderByAliasSpans(toks, oldName, skips.starHas)
+		var orphan bool
+		aliased, unsure, orphan = orderByAliasSpans(toks, oldName, skips.starHas)
+		if orphan {
+			return "", errRenameStarOrphan
+		}
 		if unsure {
 			return "", fmt.Errorf("%w: ALTER TABLE RENAME COLUMN: an ORDER BY term %q beside a * in the select list may name an expanded result column, which C binds before any table column and so leaves alone; the rewrite cannot tell without expanding the star", errVDBEUnsupported, oldName)
 		}
@@ -2255,7 +2272,7 @@ func rewriteIdentInSQL(sqlText, oldName string, repl identRepl, skips r33rSkips,
 //
 // leaves "ORDER BY b" bound to the expanded column, and the renamed trigger
 // then fails its re-parse: "no such column: b".
-func orderByAliasSpans(toks []token, name string, starHas func(tables []string) (has, ok bool)) (out []byteSpan, unsure bool) {
+func orderByAliasSpans(toks []token, name string, starHas func(tables []string) (has, ownerOnly, ok bool)) (out []byteSpan, unsure, orphan bool) {
 	isKw := func(t token, kw string) bool { return t.kind == tkIdent && !t.quoted && t.upper() == kw }
 	depthAt := make([]int, len(toks)+1)
 	d := 0
@@ -2284,7 +2301,7 @@ func orderByAliasSpans(toks []token, name string, starHas func(tables []string) 
 		if sel < 0 {
 			continue
 		}
-		aliased, star, qualStar, from := false, false, false, -1
+		aliased, star, qualStar, from, starOrphan := false, false, false, -1, false
 		for j := sel + 1; j < i && !aliased; j++ {
 			if depthAt[j] < dep {
 				break
@@ -2316,8 +2333,9 @@ func orderByAliasSpans(toks []token, name string, starHas func(tables []string) 
 		// alias would: it binds to the expanded column when one spells the name.
 		if star && !aliased && !qualStar && starHas != nil && from >= 0 {
 			if names, _, sok := r45ScanFlatFromClause(toks[from:i]); sok && len(names) > 0 {
-				if has, hok := starHas(names); hok {
+				if has, ownerOnly, hok := starHas(names); hok {
 					star, aliased = false, has
+					starOrphan = ownerOnly
 				}
 			}
 		}
@@ -2367,12 +2385,15 @@ func orderByAliasSpans(toks []token, name string, starHas func(tables []string) 
 			}
 			if end && aliased {
 				out = append(out, byteSpan{t.Start, t.End})
+				if starOrphan {
+					orphan = true
+				}
 			} else if end {
 				unsure = true
 			}
 		}
 	}
-	return out, unsure
+	return out, unsure, orphan
 }
 
 // isCallNameToken reports whether toks[i] is followed by "(", i.e. names a
@@ -3050,6 +3071,9 @@ func applyViewRename(affected []*viewMeta, oldName string, repl identRepl, verb 
 			skips.starHas = columnRenameStarHas(ownerTable, oldName, hasCol)
 		}
 		newSQL, rerr := rewriteIdentInSQL(v.sql, oldName, repl, skips, extra...)
+		if errors.Is(rerr, errRenameStarOrphan) {
+			return fmt.Errorf("engine: error in view %s after rename: no such column: %s", v.name, oldName)
+		}
 		if rerr != nil {
 			return rerr
 		}
