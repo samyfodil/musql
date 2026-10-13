@@ -1,13 +1,17 @@
 package driver
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+
+	"github.com/samyfodil/musql/engine"
 )
 
 // A transaction's load builds each full segment on a goroutine of its own
@@ -105,21 +109,74 @@ func TestTxBulkLoadAsyncBuild(t *testing.T) {
 		}
 	})
 	t.Run("close mid-load", func(t *testing.T) {
+		// Through a *sql.Conn, not a *sql.Tx: database/sql's DB.Close does not
+		// close a connection an unfinished Tx still holds, so the driver's Close
+		// -- the path under test -- would never run, and the connection's files
+		// would stay open by database/sql's design. Here the connection goes
+		// back to the pool with the engine's transaction open and the load's
+		// build in flight, and DB.Close closes it.
 		db, path := setup(t)
-		tx, _ := db.Begin()
-		asyncLoad(t, tx, 1, 10)
-		if err := tx.Commit(); err != nil {
+		// Committed data in another table: a load arms only on an empty one.
+		if _, err := db.Exec("CREATE TABLE pre(x); INSERT INTO pre VALUES (1), (2), (3)"); err != nil {
 			t.Fatal(err)
 		}
-		tx, _ = db.Begin()
-		asyncLoad(t, tx, 11, asyncRows)
-		db.Close() // the transaction is never ended
+		ctx := context.Background()
+		c, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		engine.TxBulkRowsForTest()
+		if _, err := c.ExecContext(ctx, "BEGIN"); err != nil {
+			t.Fatal(err)
+		}
+		st, err := c.PrepareContext(ctx, "INSERT INTO kv VALUES (?, ?)")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for k := 1; k <= asyncRows; k++ {
+			if _, err := st.Exec(k, fmt.Sprint("v", k)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		st.Close()
+		if n := engine.TxBulkRowsForTest(); n == 0 {
+			t.Fatal("the load did not take the direct path; nothing was in flight")
+		}
+		c.Close()
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		// Every descriptor the connection had on the database's files is gone
+		// -- what Windows needs before it lets the files be removed.
+		if open := openFilesUnder(filepath.Dir(path)); len(open) > 0 {
+			t.Fatalf("still open after Close: %v", open)
+		}
 		db2 := asyncDB(t, path)
 		defer db2.Close()
-		if n, sum := asyncCount(t, db2); n != 10 || sum != 55 {
-			t.Fatalf("reopened: %d rows sum %d, want the 10 committed", n, sum)
+		if n, _ := asyncCount(t, db2); n != 0 {
+			t.Fatalf("reopened: %d rows of a load never committed", n)
+		}
+		var pre int
+		if err := db2.QueryRow("SELECT count(*) FROM pre").Scan(&pre); err != nil || pre != 3 {
+			t.Fatalf("reopened: pre has %d rows (%v), want the 3 committed", pre, err)
 		}
 	})
+}
+
+// openFilesUnder lists this process's open descriptors on files in dir, where
+// /proc says (Linux); nil elsewhere.
+func openFilesUnder(dir string) []string {
+	fds, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, fd := range fds {
+		if target, err := os.Readlink(filepath.Join("/proc/self/fd", fd.Name())); err == nil && strings.HasPrefix(target, dir+string(filepath.Separator)) {
+			out = append(out, target)
+		}
+	}
+	return out
 }
 
 // The process dies with a segment build in flight: the reopened file holds
@@ -135,8 +192,24 @@ func TestTxBulkLoadAsyncCrash(t *testing.T) {
 		if err := tx.Commit(); err != nil {
 			t.Fatal(err)
 		}
+		// The load in flight goes into an empty table: one with rows does not arm.
+		if _, err := db.Exec("CREATE TABLE kv2(k INTEGER PRIMARY KEY, v TEXT NOT NULL)"); err != nil {
+			t.Fatal(err)
+		}
+		engine.TxBulkRowsForTest()
 		tx, _ = db.Begin()
-		asyncLoad(t, tx, 1001, asyncRows)
+		st, err := tx.Prepare("INSERT INTO kv2 VALUES (?, ?)")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for k := 1; k <= asyncRows; k++ {
+			if _, err := st.Exec(k, "x"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if engine.TxBulkRowsForTest() == 0 {
+			os.Exit(4) // the load never took the direct path
+		}
 		os.Exit(3) // no rollback, no close: a build may be running
 	}
 	if runtime.GOOS == "js" || runtime.GOOS == "wasip1" {
@@ -153,6 +226,10 @@ func TestTxBulkLoadAsyncCrash(t *testing.T) {
 	defer db.Close()
 	if n, sum := asyncCount(t, db); n != 1000 || sum != 500500 {
 		t.Fatalf("reopened after the crash: %d rows sum %d, want the 1000 committed", n, sum)
+	}
+	var n2 int
+	if err := db.QueryRow("SELECT count(*) FROM kv2").Scan(&n2); err != nil || n2 != 0 {
+		t.Fatalf("kv2 after the crash: %d rows (%v), want none", n2, err)
 	}
 	var ic string
 	if err := db.QueryRow("PRAGMA integrity_check").Scan(&ic); err != nil || ic != "ok" {
