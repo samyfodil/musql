@@ -133,9 +133,13 @@ func buildUpdateFromSelect(stmt *updateStmt, tbl *tableMeta, lookup func(FromIte
 	// the CTE definitions ride on the synthetic SELECT, which is where
 	// execSelect pushes them (query.go).
 	if pinKey {
+		target := 0 // updateFromItems puts it first or last
+		if !from[0].UpdateTarget {
+			target = len(from) - 1
+		}
 		for i := range keyCols {
 			ce := keyCols[i].(ColumnExpr)
-			ce.Qualifier, ce.UsingPinned, ce.UsingPinnedItem = "", true, len(from)-1
+			ce.Qualifier, ce.UsingPinned, ce.UsingPinnedItem = "", true, target
 			cols[i].Expr = ce
 		}
 	}
