@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -1124,7 +1125,7 @@ func (db *DB) segmentPager(freeze bool) (*ReadOnlyPager, error) {
 	p := newReadOnlyPager()
 	// The schema this session can name, and the handle its committed column
 	// blocks come from. Both are inputs to the source below AND to its cache key.
-	rows := db.segmentSchemaRows()
+	rows := db.segmentSchemaRowsShared()
 	cols := db.committedColumns()
 	// ONE fingerprint per statement, shared by the two things that want one: the
 	// read source's cache key below, and the plan cache's validity check later
@@ -1192,7 +1193,51 @@ func (db *DB) segmentPager(freeze bool) (*ReadOnlyPager, error) {
 // not the other would make an UPDATE of sqlite_schema edit a row no reader can
 // see, or miss one it can.
 func (db *DB) segmentSchemaRows() []SchemaRow {
-	rows := make([]SchemaRow, 0, len(db.tables)+len(db.indexes)+len(db.views)+len(db.triggers)+len(db.vtabs))
+	return db.renderSchemaRows(nil, nil, nil)
+}
+
+// segmentSchemaRowsShared is segmentSchemaRows for the read pager, which renders
+// it once per statement: the rows of the last render when THIS render, done
+// into scratch, is the same, element for element -- the key is the whole
+// input, not a generation counter (cachedSchemaSegment's lesson). They are
+// shared by every pager since and so are never written: capacity is length, so
+// an append copies, and no read path edits a pager's rows in place. A point
+// read's rendering, sorting and ranking were a quarter of what it allocated.
+func (db *DB) segmentSchemaRowsShared() []SchemaRow {
+	m := &db.schemaRowsMemo
+	m.scratch, m.seqScratch = m.scratch[:0], m.seqScratch[:0]
+	db.renderSchemaRows(&m.scratch, &m.seqScratch, nil)
+	if m.out != nil && slices.Equal(m.scratch, m.raw) && slices.Equal(m.seqScratch, m.seqs) {
+		return m.out
+	}
+	raw, seqs := slices.Clone(m.scratch), slices.Clone(m.seqScratch)
+	out := db.renderSchemaRows(nil, nil, &raw)
+	m.raw, m.seqs, m.out = raw, seqs, out[:len(out):len(out)]
+	clear(m.scratch)
+	return m.out
+}
+
+// schemaRowsMemo is segmentSchemaRowsShared's last render: raw, the rows as
+// rendered and before sorting, seqs their creation sequence, and out the sorted
+// rows handed out. scratch and seqScratch are the next render's buffers.
+type schemaRowsMemo struct {
+	raw, out, scratch []SchemaRow
+	seqs, seqScratch  []uint64
+}
+
+// renderSchemaRows renders the catalog's rows and creation sequences. Into
+// *rowsInto and *seqsInto when given, stopping there; otherwise it sorts and
+// returns them -- from *rendered when given, already rendered.
+func (db *DB) renderSchemaRows(rowsInto *[]SchemaRow, seqsInto *[]uint64, rendered *[]SchemaRow) []SchemaRow {
+	if rendered != nil {
+		return db.sortSchemaRows(*rendered)
+	}
+	var rows []SchemaRow
+	if rowsInto != nil {
+		rows = *rowsInto
+	} else {
+		rows = make([]SchemaRow, 0, len(db.tables)+len(db.indexes)+len(db.views)+len(db.triggers)+len(db.vtabs))
+	}
 	for _, t := range db.tables {
 		// TEMP tables INCLUDED, unlike the file rewrite which must exclude them:
 		// a temp table is session-private and never persisted, but it is very much
@@ -1236,6 +1281,16 @@ func (db *DB) segmentSchemaRows() []SchemaRow {
 		rows = append(rows, SchemaRow{Type: "trigger", Name: g.name, TblName: g.table,
 			SQL: g.sql, Temp: g.isTemp, Rowid: int64(g.schemaSeq)})
 	}
+	if rowsInto != nil {
+		*rowsInto = rows
+		*seqsInto = db.appendSchemaSeqs(*seqsInto)
+		return nil
+	}
+	return db.sortSchemaRows(rows)
+}
+
+// sortSchemaRows puts rendered rows in creation order.
+func (db *DB) sortSchemaRows(rows []SchemaRow) []SchemaRow {
 	// ...and then into CREATION order, which is C's: sqlite_schema is read in
 	// rowid order and every CREATE appends. Grouped by kind, "SELECT
 	// group_concat(name) FROM sqlite_schema" answered "a,b,c,sqlite_autoindex_a_1,bi"
@@ -1245,7 +1300,17 @@ func (db *DB) segmentSchemaRows() []SchemaRow {
 	// (nextSchemaSeq), so the two sequences say nothing about each other, and a
 	// TEMP object sorted in among main's made a first-match lookup of
 	// "main.trial" find the TEMP "trial".
-	seqs := make([]uint64, 0, len(rows))
+	ranks := catalogRanks(db.appendSchemaSeqs(make([]uint64, 0, len(rows))))
+	keys := make([]catalogOrderKey, len(ranks))
+	for i, r := range ranks {
+		keys[i] = catalogOrderKey{rank: r}
+	}
+	return sortCatalogRows(rows, keys)
+}
+
+// appendSchemaSeqs appends each rendered row's creation sequence, in the order
+// renderSchemaRows renders them.
+func (db *DB) appendSchemaSeqs(seqs []uint64) []uint64 {
 	seqOf := func(temp bool, seq uint64) uint64 {
 		if temp {
 			return seq | 1<<62
@@ -1270,12 +1335,7 @@ func (db *DB) segmentSchemaRows() []SchemaRow {
 	for _, g := range db.triggers {
 		seqs = append(seqs, seqOf(g.isTemp, g.schemaSeq))
 	}
-	ranks := catalogRanks(seqs)
-	keys := make([]catalogOrderKey, len(ranks))
-	for i, r := range ranks {
-		keys[i] = catalogOrderKey{rank: r}
-	}
-	return sortCatalogRows(rows, keys)
+	return seqs
 }
 
 // Insert, Update and Delete run one statement and return the row count
