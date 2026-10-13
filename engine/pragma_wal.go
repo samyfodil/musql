@@ -156,7 +156,8 @@ func (db *DB) WalCheckpointPragma(stmt *PragmaStmt) ([]string, [][]Value, error)
 // sqlite3Atoi's own behavior.
 func (db *DB) walAutoCheckpointPragma(stmt *PragmaStmt) ([]string, [][]Value, error) {
 	if stmt.HasValue {
-		n, err := strconv.Atoi(strings.TrimSpace(stmt.ValueText))
+		n64, err := strconv.ParseInt(strings.TrimSpace(stmt.ValueText), 10, 32) // sqlite3Atoi: out of int32 range reads as 0
+		n := int(n64)
 		if err != nil {
 			n = 0
 		}

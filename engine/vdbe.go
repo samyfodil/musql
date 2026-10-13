@@ -1571,7 +1571,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 
 		case OpGlob:
-			m.opGlob(op)
+			if gerr := m.opGlob(op); gerr != nil {
+				return nil, gerr
+			}
 
 		case OpMatch:
 			info := op.P4.(*matchCompileInfo)
@@ -2580,7 +2582,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			// cannot be an integer.
 			if v := applyAffinityToValue(m.regs[op.P1], affInteger); v.Typ == Int {
 				m.regs[op.P1] = v
-			} else if v.Typ == Float && v.F == float64(int64(v.F)) {
+			} else if v.Typ == Float && v.F == float64(int64(v.F)) && v.F != -9223372036854775808.0 { // sqlite3VdbeIntegerAffinity: ix>SMALLEST_INT64
 				m.regs[op.P1] = Value{Typ: Int, I: int64(v.F)}
 			} else if op.P2 != 0 {
 				pc = op.P2

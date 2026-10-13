@@ -99,6 +99,9 @@ func ParseAttachStmt(sqlText string) (path, name string, ok bool, err error) {
 	if err != nil {
 		return "", "", true, err
 	}
+	if p.peekIsPunct(";") { // parse.y's "ecmd ::= cmdx SEMI"
+		p.next()
+	}
 	if p.peek().kind != tkEOF {
 		return "", "", true, fmt.Errorf("engine: ATTACH: trailing tokens (a KEY clause is not supported)")
 	}
@@ -416,6 +419,9 @@ func ParseDetachStmt(sqlText string) (name string, ok bool, err error) {
 	name, err = attachSchemaName(nt)
 	if err != nil {
 		return "", true, err
+	}
+	if p.peekIsPunct(";") { // parse.y's "ecmd ::= cmdx SEMI"
+		p.next()
 	}
 	if p.peek().kind != tkEOF {
 		return "", true, fmt.Errorf("engine: DETACH: trailing tokens")

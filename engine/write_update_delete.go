@@ -152,7 +152,7 @@ func parseDeleteStmt(sqlText string) (*deleteStmt, error) {
 		p.next()
 	}
 	if p.peek().kind != tkEOF {
-		return nil, fmt.Errorf("engine: DELETE: unexpected trailing input near %q", p.tokenDesc(p.peek()))
+		return nil, fmt.Errorf("engine: near %q: syntax error", p.tokenDesc(p.peek()))
 	}
 	stmt.params = p.params.info()
 	return stmt, nil
@@ -337,7 +337,7 @@ func parseUpdateStmt(sqlText string) (*updateStmt, error) {
 		p.next()
 	}
 	if p.peek().kind != tkEOF {
-		return nil, fmt.Errorf("engine: UPDATE: unexpected trailing input near %q", p.tokenDesc(p.peek()))
+		return nil, fmt.Errorf("engine: near %q: syntax error", p.tokenDesc(p.peek()))
 	}
 	stmt.params = p.params.info()
 	return stmt, nil

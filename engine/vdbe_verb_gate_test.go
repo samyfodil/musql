@@ -146,14 +146,13 @@ func TestControlVerbErrorTextAndState(t *testing.T) {
 		// A savepoint verb whose NAME is missing ENDS at end of input, and every
 		// syntax error there is "incomplete input" (parse.y:44-51) -- verified
 		// against 3.53.3, which says exactly that for both of these. The other
-		// malformed spellings below still fall through to the shared
-		// "unsupported statement" text (C reports `near "X": syntax error` for
-		// those too; BEGIN/COMMIT's optional-name grammar is not walked yet).
+		// malformed spellings below are `near "X": syntax error` too, as in C,
+		// including BEGIN/COMMIT's optional-name grammar.
 		{"savepoint with no name", []step{{`SAVEPOINT`, "engine: incomplete input", false, 0}}},
 		{"release with no name", []step{{`RELEASE`, "engine: incomplete input", false, 0}}},
-		{"begin with trailing garbage", []step{{`BEGIN garbage`, unsupportedText + `"BEGIN garbage"`, false, 0}}},
-		{"transaction name that is a number", []step{{`BEGIN TRANSACTION 123`, unsupportedText + `"BEGIN TRANSACTION 123"`, false, 0}}},
-		{"commit with an unqualified name", []step{{`COMMIT foo`, unsupportedText + `"COMMIT foo"`, false, 0}}},
+		{"begin with trailing garbage", []step{{`BEGIN garbage`, `engine: near "garbage": syntax error`, false, 0}}},
+		{"transaction name that is a number", []step{{`BEGIN TRANSACTION 123`, `engine: near "123": syntax error`, false, 0}}},
+		{"commit with an unqualified name", []step{{`COMMIT foo`, `engine: near "foo": syntax error`, false, 0}}},
 
 		{"detach of an unknown alias", []step{{`DETACH nosuch`, "engine: no such database: nosuch", false, 0}}},
 		{"detach of main", []step{{`DETACH DATABASE main`, "engine: cannot detach database main", false, 0}}},
@@ -183,8 +182,10 @@ func TestControlVerbErrorTextAndState(t *testing.T) {
 		{"explain is answered, not dispatched", []step{{`EXPLAIN SELECT 1`, "", false, 0}}},
 		{"explain query plan likewise", []step{{`EXPLAIN QUERY PLAN SELECT 1`, "", false, 0}}},
 		{"a select is not a write", []step{{`SELECT 1`, unsupportedText + `"SELECT 1"`, false, 0}}},
-		{"a statement that is only punctuation", []step{{`;`, unsupportedText + `";"`, false, 0}}},
-		{"a statement that is only a number", []step{{`123`, unsupportedText + `"123"`, false, 0}}},
+		// A lone ";" is the empty statement (parse.y "ecmd ::= SEMI"); a number
+		// starts no statement, so it is a syntax error at that token.
+		{"a statement that is only punctuation", []step{{`;`, "", false, 0}}},
+		{"a statement that is only a number", []step{{`123`, `engine: near "123": syntax error`, false, 0}}},
 
 		// Whitespace/comments only: a NO-OP, not an error -- C SQLite
 		// prepares such input as a NULL statement.

@@ -1628,7 +1628,7 @@ func rewriteGroupExpr(e Expr, groupExprs []Expr, groupAffs []affinity, groupColl
 		// allowed, as checkExprSupported allows it, with its arity check.
 		if isConnStateFunc(r33sFoldIdent(x.Name)) {
 			if len(x.Args) != 0 {
-				return nil, fmt.Errorf("engine: wrong number of arguments to function %s()", x.Name)
+				return nil, fmt.Errorf("engine: wrong number of arguments to function %s()", x.callName())
 			}
 			return FuncExpr{Name: x.Name}, nil
 		}
@@ -1638,7 +1638,7 @@ func rewriteGroupExpr(e Expr, groupExprs []Expr, groupAffs []affinity, groupColl
 			// for one ("SELECT sum(sum(a)) FROM t"). That is C's own
 			// prepare-time "misuse of %s function" (resolve.c:1265-1277), not
 			// a function this engine lacks.
-			if err := misuseOfFuncErr(x.Name, x.Over != nil); err != nil {
+			if err := misuseOfFuncErr(x.callName(), x.Over != nil); err != nil {
 				return nil, err
 			}
 			return nil, fmt.Errorf("engine: unsupported function %s()", x.Name)
@@ -2118,8 +2118,9 @@ func (p *ReadOnlyPager) planGroupByStmt(stmt *SelectStmt, scopes []tableScope, o
 	// that output expression itself contains an aggregate.
 	groupExprs := make([]Expr, len(stmt.GroupBy))
 	for i, ge := range stmt.GroupBy {
-		if lit, ok := ge.(LiteralExpr); ok && lit.Val.Typ == Int {
-			n := lit.Val.I
+		// "GROUP BY 1 COLLATE NOCASE" is still the ordinal, grouped under the
+		// written collation, as ORDER BY's is (stripOrderCollate).
+		if n, ok := orderByOrdinal(stripOrderCollate(ge)); ok {
 			if n < 1 || int(n) > len(outCols) {
 				// C's own wording, ordinal and all: "%r GROUP BY term out of
 				// range - should be between 1 and %d" (select.c's
@@ -2132,6 +2133,9 @@ func (p *ReadOnlyPager) planGroupByStmt(stmt *SelectStmt, scopes []tableScope, o
 			resolved := outCols[n-1].expr
 			if containsAggregate(resolved) {
 				return nil, fmt.Errorf("engine: unsupported: GROUP BY ordinal %d refers to an aggregate output column", n)
+			}
+			if ce, isCollate := ge.(CollateExpr); isCollate {
+				resolved = CollateExpr{X: resolved, Name: ce.Name}
 			}
 			groupExprs[i] = resolved
 			continue
@@ -2364,12 +2368,12 @@ func cloneAggTemplates(templates []*aggItem) []*aggItem {
 }
 
 // findOutputColByName returns the index of the first output column whose
-// name (its alias, or default name -- see expandSelectList) case-insensitively
-// matches name, or -1 if none match. Used only for the ORDER BY result-column
-// alias fallback above.
+// explicit alias case-insensitively matches name, or -1 if none match
+// (resolveAsName, resolve.c, tests eEName==ENAME_NAME). Used only for the
+// ORDER BY result-column alias fallback above.
 func findOutputColByName(outCols []outputColumn, name string) int {
 	for i, oc := range outCols {
-		if equalFoldName(oc.name, name) {
+		if oc.aliased && equalFoldName(oc.name, name) {
 			return i
 		}
 	}
