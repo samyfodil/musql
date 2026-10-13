@@ -26,17 +26,26 @@ func TestVec1Convert(t *testing.T) {
 			mustExec(t, db, "INSERT INTO v(rowid, vector, m0, m1) VALUES(?, ?, ?, ?)", i+1, vecBlob(v), metaValue(i, 0), metaValue(i, 3))
 		}
 	}
-	queriesOf := func(db *sql.DB) string {
+	queriesOf := func(db *sql.DB) []result {
 		t.Helper()
-		var out string
+		var out []result
 		for _, q := range queries {
 			qb := vecBlob(q)
-			out += render(db, "SELECT rowid, distance, m0, m1 FROM v(?, 8)", qb)
-			out += render(db, "SELECT rowid, distance FROM v(?, 8) WHERE m0 = 2", qb)
+			out = append(out, query(db, "SELECT rowid, distance, m0, m1 FROM v(?, 8)", qb))
+			out = append(out, query(db, "SELECT rowid, distance FROM v(?, 8) WHERE m0 = 2", qb))
 		}
-		out += render(db, "SELECT id, bucket, first, last, hex(val) FROM v_idx ORDER BY id")
-		out += render(db, "PRAGMA integrity_check")
+		out = append(out, query(db, "SELECT id, bucket, first, last, hex(val) FROM v_idx ORDER BY id"))
+		out = append(out, query(db, "PRAGMA integrity_check"))
 		return out
+	}
+	// compare is the first mismatch between two engines' answers, or "".
+	compare := func(got, want []result) string {
+		for i := range want {
+			if !equalResults(got[i], want[i]) {
+				return clip(got[i].String()) + "--- against\n" + clip(want[i].String())
+			}
+		}
+		return ""
 	}
 
 	// C to musql.
@@ -58,8 +67,8 @@ func TestVec1Convert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := queriesOf(m); got != want {
-		t.Fatalf("imported:\n--- musql\n%s--- C\n%s", clip(got), clip(want))
+	if d := compare(queriesOf(m), want); d != "" {
+		t.Fatalf("imported, musql then C:\n%s", d)
 	}
 	m.Close()
 
@@ -83,7 +92,7 @@ func TestVec1Convert(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c2.Close()
-	if got := queriesOf(c2); got != want {
-		t.Fatalf("exported:\n--- C\n%s--- musql\n%s", clip(got), clip(want))
+	if d := compare(queriesOf(c2), want); d != "" {
+		t.Fatalf("exported, C then musql:\n%s", d)
 	}
 }
