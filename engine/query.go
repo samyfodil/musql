@@ -1880,7 +1880,9 @@ func expandSelectList(sel []SelectColumn, scopes []tableScope, mode colNameMode)
 				// under the inner layer's names, which the outer layer then does
 				// not resolve ("ambiguous column name: id", "no such column:
 				// id:1" over "((pa a JOIN pb b ON ...) AS g1 JOIN pc ...) AS g").
-				if ts.rebuiltLayers >= 2 {
+				// Unaliased layers resolve, under the ":N" names already
+				// carried (selectD.test 14-15).
+				if ts.rebuiltLayers >= 2 && ts.groupAlias != "" {
 					return nil, fmt.Errorf("engine: unsupported: %q.* through two rebuilt parenthesized join groups", ts.name)
 				}
 				for ci, c := range ts.cols {
