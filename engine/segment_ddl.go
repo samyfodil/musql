@@ -41,6 +41,13 @@ import (
 // CreateFile creates an empty segment database at path, replacing anything
 // already there.
 func CreateFile(path string) error {
+	// Every change to the pair is announced in the lock file's change word
+	// (segment_change.go), so a reader's freshness check can skip the stamps.
+	endChange, cerr := segChangeBegin(path)
+	if cerr != nil {
+		return cerr
+	}
+	defer endChange()
 	// A delta beside the old file describes rows that are about to stop existing.
 	if err := os.Remove(segDeltaPath(path)); err != nil && !os.IsNotExist(err) {
 		return err
@@ -69,6 +76,13 @@ func Create(path string) (*Session, error) {
 // directory entry to come from.
 func (n *Session) rewriteFile() error {
 	db := n.DB
+	// Every change to the pair is announced in the lock file's change word
+	// (segment_change.go), so a reader's freshness check can skip the stamps.
+	endChange, cerr := segChangeBegin(n.segPath)
+	if cerr != nil {
+		return cerr
+	}
+	defer endChange()
 	// NOTHING ANOTHER WRITER COMMITTED MAY BE LOST, and nothing of THIS session's
 	// transaction may land before the rename does.
 	//
@@ -196,6 +210,7 @@ func (n *Session) rewriteFile() error {
 	// wrote it EMPTY.
 	n.catalogAtLastWrite = n.catalogFingerprint()
 	n.seenStat = n.pairStamp()
+	n.changeable = true // this build wrote the file, in its own version
 	for _, t := range db.tables {
 		t.inFile = !t.isTemp // every main table is the file's now
 	}

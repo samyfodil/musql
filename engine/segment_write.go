@@ -85,6 +85,16 @@ type Session struct {
 
 	// segStat and deltaStat stamp the segment file and its delta (pairStamp).
 	segStat, deltaStat heldStamp
+	// change is the lock file's change word, mapped, and changeSeen the even
+	// value it held at the last full check that found the session current
+	// (RefreshIfStale, segment_change.go). nil where it cannot be trusted.
+	change       *changeWord
+	changeSeen   uint64
+	changeSeenOK bool
+	// changeable is "the file is a version the word may be trusted on", kept
+	// so a session that opened before any word was written can map it later
+	// (mapChangeWordLate).
+	changeable bool
 
 	recBuf []SegDeltaRecord // the delta records of a commit, reused (segDeltaRecordsInto)
 
@@ -167,6 +177,8 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 	var ipkOf map[string]int
 	var rootEdits []ConvertedRootEdit
 	var stamp [2]fileStamp
+	var change *changeWord
+	changeable := false
 	if lerr := withSegmentReadLockWait(segPath, wait, func() error {
 		// The pair's stamp, taken under the same lock as the read and before it,
 		// so it describes no newer a file than the rows: the first statement's
@@ -178,6 +190,12 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 		f, st, rerr := readSegmentPairUnlocked(segPath)
 		if rerr != nil {
 			return rerr
+		}
+		// The change word, mapped under the same lock: trusted only on a file
+		// this format wrote, since an older build may write an older file
+		// without keeping it (segment_change.go).
+		if changeable = f.version >= changeWordVersion; changeable {
+			change = mapChangeWord(segPath)
 		}
 		tableIndex, ipkOf = SegmentFileTableIndex(f)
 		rootEdits = append([]ConvertedRootEdit(nil), f.Catalog().RootEdits...)
@@ -196,6 +214,7 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 	schema, scerr := src.Schema()
 	if scerr != nil {
 		src.Close()
+		change.close()
 		return nil, scerr
 	}
 	db := &DB{
@@ -217,6 +236,7 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 	db.captureGuard = src.meta.captureGuard // see ConvertedCatalog.CaptureGuard
 	if lerr := db.loadSchemaObjects(src, schema, "OpenWrite", false); lerr != nil {
 		src.Close()
+		change.close()
 		return nil, lerr
 	}
 	// Opening the schema loads its statistics (sqlite3InitOne ->
@@ -229,13 +249,16 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 		baseCtr: baseCtr, basePages: basePages,
 		endCtr: endCtr, endPages: endPages,
 		loadedCtr: endCtr, loadedPages: endPages, // the state just read
-		seenStat: stamp,
+		seenStat:   stamp,
+		change:     change,
+		changeable: changeable,
 
 		tableIndex: tableIndex, ipkOf: ipkOf,
 	}
 	if len(rootEdits) > 0 {
 		if rerr := db.replayRootEdits(rootEdits); rerr != nil {
 			src.Close()
+			change.close()
 			return nil, rerr
 		}
 	}
@@ -434,6 +457,7 @@ func (n *Session) Commit() (bool, error) {
 		wrote, cerr = n.commitLocked()
 		if cerr == nil && wrote {
 			n.compactIfWorthIt()
+			n.mapChangeWordLate()
 		}
 		return cerr
 	}
@@ -840,6 +864,8 @@ func (n *Session) Close() error {
 	n.releaseCommitLock()
 	n.segStat.release()
 	n.deltaStat.release()
+	n.change.close()
+	n.change = nil
 	n.closed = true
 	n.dropTempFileIfUnclaimed() // C's temp database is OPEN_DELETEONCLOSE
 	n.DB.closed = true
@@ -1463,6 +1489,7 @@ func (n *Session) compactIfWorthIt() {
 	if !did || cerr != nil {
 		return
 	}
+	n.changeable = true // this build wrote the file, in its own version
 	// The file this session extends was rewritten, so re-read its identity
 	// before appending. Otherwise every later delta header names the old
 	// file ("segment delta was built for counter 2 pages 1; this file is
@@ -1641,8 +1668,20 @@ func (n *Session) RefreshIfStale() (bool, error) {
 		// write, and the caller has not asked to commit yet.
 		return false, nil
 	}
+	// THE CHANGE WORD FIRST (segment_change.go): the even value seen at the last
+	// full check, still there, means no change has begun since -- no stamp
+	// needed. It is read before the stamps, so a change that begins after it
+	// moves it and is caught by the next statement.
+	word, wordOK := uint64(0), false
+	if n.change != nil {
+		word, wordOK = n.change.load(), true
+		if n.changeSeenOK && word == n.changeSeen {
+			return false, nil
+		}
+	}
 	now := n.pairStamp()
 	if now == n.seenStat {
+		n.noteChangeSeen(word, wordOK)
 		return false, nil // nothing has touched either file
 	}
 	var ctr, pages uint32
@@ -1658,9 +1697,31 @@ func (n *Session) RefreshIfStale() (bool, error) {
 		// Touched but not MOVED -- our own append, or a stat granularity artefact.
 		// Record the stamp so the cheap check answers next time.
 		n.seenStat = now
+		n.noteChangeSeen(word, wordOK)
 		return false, nil
 	}
-	return true, n.reopen(false)
+	if rerr := n.reopen(false); rerr != nil {
+		return true, rerr
+	}
+	n.noteChangeSeen(word, wordOK && n.change != nil)
+	return true, nil
+}
+
+// mapChangeWordLate maps the change word for a session that opened before any
+// was written -- the connection that created the database, say -- once its own
+// commit has written one.
+func (n *Session) mapChangeWordLate() {
+	if n.change == nil && n.changeable {
+		n.change = mapChangeWord(n.segPath)
+	}
+}
+
+// noteChangeSeen records the change word read before a full check that found
+// the session current, so the next statement can trust it -- only an EVEN one:
+// an odd word is a change still in progress, or one whose writer died, and the
+// state the check saw may not be its last.
+func (n *Session) noteChangeSeen(word uint64, ok bool) {
+	n.changeSeen, n.changeSeenOK = word, ok && word&1 == 0
 }
 
 // adoptConnSettingsFrom carries a connection's PRAGMA settings from old (the DB
@@ -1752,6 +1813,9 @@ func (n *Session) reopen(afterFailedCommit bool) error {
 	n.appendAt.release()
 	n.catalogAtLastWrite = fresh.catalogAtLastWrite
 	n.seenStat = stamp
+	// The rebuilt file may be another version: its own word mapping, or none.
+	n.change.close()
+	n.change, n.changeSeenOK, n.changeable = fresh.change, false, fresh.changeable
 	if old != nil {
 		old.Close()
 	}

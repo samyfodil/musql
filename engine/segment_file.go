@@ -76,6 +76,8 @@ type SegmentFile struct {
 	// than answering from it. See errSegmentsStale.
 	srcChangeCounter uint32
 	srcPageCount     uint32
+	// version is the format version the file was written in.
+	version uint32
 
 	// catalog is every index, view and trigger, and every AUTOINCREMENT counter.
 	// Without it the file holds rows and no schema, which is why a round trip
@@ -150,6 +152,13 @@ func (f *SegmentFile) Close() error {
 // already in memory; a caller producing them one at a time streams them in
 // instead (CompactSegmentFile).
 func WriteSegmentFileWithCatalog(path string, tables []ConvertedTable, cat ConvertedCatalog, srcChangeCounter, srcPageCount uint32) error {
+	// Every change to the pair is announced in the lock file's change word
+	// (segment_change.go), so a reader's freshness check can skip the stamps.
+	endChange, cerr := segChangeBegin(path)
+	if cerr != nil {
+		return cerr
+	}
+	defer endChange()
 	w, err := newSegFileWriter(filepath.Dir(path))
 	if err != nil {
 		return err
@@ -508,7 +517,7 @@ func OpenSegmentFile(path string) (*SegmentFile, error) {
 		m.Close()
 		return nil, fmt.Errorf("segment file: header says %d tables, directory says %d", nTables, got)
 	}
-	f := &SegmentFile{m: m,
+	f := &SegmentFile{m: m, version: binary.LittleEndian.Uint32(buf[4:]),
 		srcChangeCounter: binary.LittleEndian.Uint32(buf[16:]),
 		srcPageCount:     binary.LittleEndian.Uint32(buf[20:])}
 	for i := 0; i < nTables; i++ {

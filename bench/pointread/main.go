@@ -108,7 +108,9 @@ func main() {
 			fail(err)
 		}
 	}
+	faults0 := minorFaults()
 	lat, err := readAll(db, *rows, *workers, *reads)
+	faults := minorFaults() - faults0
 	if *traceOut != "" {
 		trace.Stop()
 	}
@@ -145,6 +147,7 @@ func main() {
 	}
 
 	printReport(r)
+	fmt.Printf("  faults %d minor page faults during the reads\n", faults)
 	if *jsonOut != "" {
 		b, err := json.MarshalIndent(r, "", "  ")
 		if err != nil {

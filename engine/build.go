@@ -174,6 +174,13 @@ func (b *Builder) Finish() error {
 		b.cat.JournalWAL = 1
 	}
 	ctr, pages := max(m.ChangeCounter, 1), max(m.PageCount, 1)
+	// Every change to the pair is announced in the lock file's change word
+	// (segment_change.go), so a reader's freshness check can skip the stamps.
+	endChange, cerr := segChangeBegin(b.path)
+	if cerr != nil {
+		return cerr
+	}
+	defer endChange()
 	return b.w.finish(b.path, b.tables, b.cat, ctr, pages)
 }
 

@@ -275,6 +275,11 @@ type SegDeltaAppendState struct {
 	// handle stops another process renaming or deleting the file.
 	f  *os.File
 	fi os.FileInfo
+	// lockF is the lock file held open for the change word (segment_change.go):
+	// two stores a commit, which an open and a close each would have doubled
+	// the cost of. Never renamed, so nothing to re-verify; not kept on Windows,
+	// for f's reason.
+	lockF *os.File
 
 	// lastBatch is the records of the batch the last append wrote, when it fit
 	// in one chunk; nil otherwise. Session.commitMainLocked applies it to the
@@ -287,6 +292,9 @@ func (c *SegDeltaAppendState) release() {
 	if c.f != nil {
 		c.f.Close()
 	}
+	if c.lockF != nil {
+		c.lockF.Close()
+	}
 	*c = SegDeltaAppendState{}
 }
 
@@ -295,6 +303,20 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 	if len(recs) == 0 {
 		return nil
 	}
+	// Every change to the pair is announced in the lock file's change word
+	// (segment_change.go), so a reader's freshness check can skip the stamps.
+	if carry != nil && carry.lockF == nil && runtime.GOOS != "windows" {
+		carry.lockF, _ = openSegmentLockFile(segPath) // nil: stored by path below
+	}
+	var lockF *os.File
+	if carry != nil {
+		lockF = carry.lockF
+	}
+	endChange, cerr := segChangeBeginOn(segPath, lockF)
+	if cerr != nil {
+		return cerr
+	}
+	defer endChange()
 	path := segDeltaPath(segPath)
 	// The held descriptor answers for the path while its file is still linked
 	// (fstat: no lookup, no allocation); otherwise the path is stat'ed.
