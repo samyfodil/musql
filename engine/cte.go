@@ -52,6 +52,10 @@ type cteBinding struct {
 	// stops the flattener (r38cExpandCTERef, flatten_limit_r35c.go).
 	m10d CTEMaterialization
 
+	// inView is CTEDef.InView: references to this CTE never count as a
+	// self-join of one another (cteRefPlacementOf).
+	inView bool
+
 	// nUse is how many FROM items reference this CTE in the statement
 	// (CteUse.nUse, select.c:5767). C materializes the body once, for every
 	// reference to share, when the CTE is AS MATERIALIZED or is referenced twice
@@ -159,6 +163,7 @@ func newCTEBinding(def CTEDef, scopeDepth int) *cteBinding {
 		colNames:   def.ColNames,
 		core:       def.Select,
 		m10d:       def.Materialized,
+		inView:     def.InView,
 		recursive:  detectRecursiveShape(def.Name, def.Select),
 		multiSelfRef: recursiveArmHasMultipleSelfRefs(def.Name, def.Select),
 		scopeDepth: scopeDepth,

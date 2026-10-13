@@ -10,10 +10,9 @@ import (
 // only the comparison is printed, so the answer is the same on every run.
 func TestSharedCTEBodySweep(t *testing.T) {
 	var cases [][]string
-	// AS NOT MATERIALIZED is left out: a volatile FROM-less body referenced twice
-	// is declined (vdbe.runCTEOnce), because C shares it between the two items of a
-	// join and not between separate subqueries.
-	for _, hint := range []string{"", "MATERIALIZED "} {
+	// AS NOT MATERIALIZED shares the body between the two items of a join and not
+	// between separate subqueries (TestCTEShareRuleSweep).
+	for _, hint := range []string{"", "MATERIALIZED ", "NOT MATERIALIZED "} {
 		for _, q := range []string{
 			"SELECT (SELECT r FROM t) = (SELECT r FROM t)",
 			"SELECT a.r = b.r FROM t a, t b",

@@ -1253,6 +1253,11 @@ type CTEDef struct {
 	// into the query reading it and keeps the pre-flattening answer. See
 	// CTEMaterialization (cte.go) and r38cExpandCTERef (flatten_limit_r35c.go).
 	Materialized CTEMaterialization
+	// InView marks a CTE defined somewhere inside a stored view's body. C
+	// renumbers every SELECT it copies out of a view (selectExpander,
+	// select.c:5986), so two references to such a CTE never match each other
+	// in isSelfJoinView (select.c:7092).
+	InView bool
 }
 
 // callName is the spelling a diagnostic echoes: %#T prints the call's token as
