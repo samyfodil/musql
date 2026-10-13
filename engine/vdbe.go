@@ -393,16 +393,28 @@ func (m *vdbe) runCTEOnce(slot int, ds *derivedSource, pager *ReadOnlyPager) ([]
 		return e.rows, nil
 	}
 	b := ds.cte.binding
-	// A FROM-less body that is not deterministic, written AS NOT MATERIALIZED and
-	// referenced twice, is evaluated once for the two items of one join but once
-	// per subquery otherwise (measured against C: "... FROM t a, t b" compares
-	// equal, "(SELECT r FROM t) = (SELECT r FROM t)" does not). Which of the two
-	// a reference is in is not known here, so neither is guessed.
-	if b.m10d == cteM10dNo && b.nUse >= 2 && len(b.core.From) == 0 && len(b.core.Compound) == 0 && selectCallsNondeterministicFunc(b.core) {
-		return nil, fmt.Errorf("%w: CTE %s is AS NOT MATERIALIZED, not deterministic and referenced %d times", errVDBEUnsupported, ds.cte.name, b.nUse)
+	// C's choice per reference (sqlite3Select, select.c:8055): a co-routine runs
+	// the body afresh; otherwise the first uncorrelated materialization is
+	// published in CteUse and every later non-co-routine reference reuses it.
+	// AS MATERIALIZED, or two references without NOT MATERIALIZED, rule out the
+	// co-routine for all of them (b.sharedBody). For AS NOT MATERIALIZED the
+	// FROM list decides (cteRefPlacementOf), so "FROM t a, t b" shares one run
+	// while "(SELECT r FROM t) = (SELECT r FROM t)" runs it twice. Only a body
+	// that is not deterministic can tell the two apart, so only that one is
+	// declined when the placement is unknown.
+	shared := b.sharedBody()
+	if b.m10d == cteM10dNo && b.nUse >= 2 {
+		switch ds.cte.placement {
+		case cteRefMaterialized:
+			shared = true
+		case cteRefUnknown:
+			if selectCallsNondeterministicFunc(b.core) {
+				return nil, fmt.Errorf("%w: CTE %s is AS NOT MATERIALIZED, not deterministic and referenced %d times from a FROM clause whose coding is not known", errVDBEUnsupported, ds.cte.name, b.nUse)
+			}
+		}
 	}
 	root := m.stmtRoot()
-	if b.sharedBody() {
+	if shared {
 		if rows, ok := root.cteRows[b]; ok {
 			e.rows, e.done = rows, true
 			return rows, nil
@@ -412,7 +424,7 @@ func (m *vdbe) runCTEOnce(slot int, ds *derivedSource, pager *ReadOnlyPager) ([]
 	if err != nil {
 		return nil, err
 	}
-	if b.sharedBody() {
+	if shared {
 		if root.cteRows == nil {
 			root.cteRows = map[*cteBinding][][]Value{}
 		}
