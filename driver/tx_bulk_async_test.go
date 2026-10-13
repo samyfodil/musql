@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -137,6 +138,9 @@ func TestTxBulkLoadAsyncCrash(t *testing.T) {
 		tx, _ = db.Begin()
 		asyncLoad(t, tx, 1001, asyncRows)
 		os.Exit(3) // no rollback, no close: a build may be running
+	}
+	if runtime.GOOS == "js" || runtime.GOOS == "wasip1" {
+		t.Skip("no second process to kill here")
 	}
 	path := filepath.Join(t.TempDir(), "c.musq")
 	cmd := exec.Command(os.Args[0], "-test.run=^TestTxBulkLoadAsyncCrash$", "-test.count=1")
