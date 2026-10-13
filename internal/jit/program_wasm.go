@@ -32,21 +32,22 @@ const (
 // target is innermost; a jump from i to j is a br out of the blocks between
 // them. A backward jump is declined, and the VDBE answers.
 //
-// Registers stay in the memory file, as on the native emitters: the caller
-// reads the counts POpAccSum and friends leave there. The row index counts
+// Registers live in locals where allocProgRegs places them and in the
+// memory file otherwise; the counts POpAccSum and friends leave are written
+// back to the file at the end, where the caller reads them. The row index counts
 // from -n up to 0 like the native loops, so the POpEmitRow selection means
 // the same thing on every architecture.
-func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
+func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	if nCols > MaxProgCols {
 		return nil, fmt.Errorf("jit: %d column blocks, max %d", nCols, MaxProgCols)
 	}
 	n := len(insns)
 	for i, in := range insns {
-		if (in.Op == POpLoadCol || in.Op == POpTextLen || in.Op == POpTextMatch) && (in.B < 0 || in.B >= nCols) {
+		if (in.Op == POpLoadCol || in.Op == POpTextLen || in.Op == POpTextMatch || in.BCol) && (in.B < 0 || in.B >= nCols) {
 			return nil, fmt.Errorf("jit: column %d out of range", in.B)
 		}
 		switch in.Op {
-		case POpJump, POpJumpIfZero, POpJumpIfNotZero:
+		case POpJump, POpJumpIfZero, POpJumpIfNotZero, POpCmpJump:
 			if in.A != ProgNextRow && in.A <= i {
 				return nil, fmt.Errorf("jit: backward jump at %d", i)
 			}
@@ -91,9 +92,46 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	w.Set(idx)
 
 	reg := func(r int) uint32 { return uint32(r * 8) }
-	loadReg := func(r int) { w.Get(regs); w.LoadI64(reg(r)) }
+	// IR registers live in locals (allocProgRegs), sharing one where their
+	// intervals do not overlap; the rest, in the memory file.
+	pa := allocProgRegs(insns, wasmRegLocals)
+	var slotLocal [wasmRegLocals]uint32
+	for r := range pa.slot {
+		if k := pa.at(r); k >= 0 && slotLocal[k] == 0 {
+			slotLocal[k] = w.Local(wI64)
+		}
+	}
+	local := func(r int) (uint32, bool) {
+		if k := pa.at(r); k >= 0 {
+			return slotLocal[k], true
+		}
+		return 0, false
+	}
+	loadReg := func(r int) {
+		if l, ok := local(r); ok {
+			w.Get(l)
+			return
+		}
+		w.Get(regs)
+		w.LoadI64(reg(r))
+	}
 	// storeReg stores the i64 that pushVal pushes into r[r].
-	storeReg := func(r int, pushVal func()) { w.Get(regs); pushVal(); w.StoreI64(reg(r)) }
+	storeReg := func(r int, pushVal func()) {
+		if l, ok := local(r); ok {
+			pushVal()
+			w.Set(l)
+			return
+		}
+		w.Get(regs)
+		pushVal()
+		w.StoreI64(reg(r))
+	}
+	for _, r := range pa.load {
+		l, _ := local(r)
+		w.Get(regs)
+		w.LoadI64(reg(r))
+		w.Set(l)
+	}
 	bool64 := func() { w.op(opI64ExtendI32U) }
 
 	w.op(opBlock, opVoid) // $done
@@ -190,6 +228,26 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			loadReg(in.A)
 			w.op(opI64Eqz)
 			w.BrIf(depthTo(i, ProgNextRow))
+		case POpCmpSkip, POpCmpJump:
+			if in.BCol {
+				w.Get(colEnd[in.B])
+				w.Get(idx)
+				w.op(opI32WrapI64)
+				w.I32(3)
+				w.op(opI32Shl)
+				w.op(opI32Add)
+				w.LoadI64(0)
+			} else {
+				loadReg(in.B)
+			}
+			loadReg(in.C)
+			if in.Op == POpCmpSkip {
+				w.op(scalarCmp(in.Cond.Negate()))
+				w.BrIf(depthTo(i, ProgNextRow))
+			} else {
+				w.op(scalarCmp(in.Cond))
+				w.BrIf(depthTo(i, in.A))
+			}
 		case POpSetConst:
 			storeReg(in.A, func() { w.I64(int64(in.B)) })
 		case POpJump:
@@ -334,6 +392,12 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	w.I64(0)
 	w.StoreI64(POffPC)
 	w.op(opEnd) // $done
+	for _, r := range pa.store {
+		l, _ := local(r)
+		w.Get(regs)
+		w.Get(l)
+		w.StoreI64(reg(r))
+	}
 
 	w.LoadPtr(POffOut)
 	w.Get(acc)
@@ -343,6 +407,11 @@ func EmitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	w.StoreI64(0)
 	return w.Module(), nil
 }
+
+// wasmRegLocals is how many locals a program's registers may take. A local
+// is not a machine register, but the engine compiling the module keeps
+// locals in registers where it can, and a load from the file it cannot.
+const wasmRegLocals = 24
 
 // emitCheckedArith sets dst = a op b with wrapping arithmetic and ORs 1 into
 // ovf when the signed result overflowed, the sticky flag the native emitters

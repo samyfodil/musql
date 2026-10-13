@@ -18,7 +18,7 @@ func TestCheckNamedValueMatchesDefault(t *testing.T) {
 	n := 7
 	for _, v := range []any{
 		nil, int64(-3), 2.5, true, "s", []byte("b"), ts,
-		int(math.MinInt64), int(-5), int32(math.MaxInt32), int16(-9), int8(127),
+		int(math.MinInt), int(-5), int32(math.MaxInt32), int16(-9), int8(127),
 		float32(0.1), float32(math.Inf(1)),
 		uint(3), uint64(math.MaxUint64), namedInt(4), &n,
 	} {

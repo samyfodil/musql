@@ -16,28 +16,36 @@ import (
 // ones: a program is a few hundred bytes and the same statement recompiles to
 // the identical IR every time.
 
-var segProgCache sync.Map // *segLowered -> *jit.Code
+var segProgCache sync.Map // segProgKey -> *jit.Code
+
+// segProgKey is a lowered body and whether it was emitted fused
+// (WithoutFusion): the same body emits differently either way.
+type segProgKey struct {
+	low   *segLowered
+	fused bool
+}
 
 // segProgKernel returns the machine code for this lowered body, emitting it on
 // first use. nil when the platform or the program declines.
 func segProgKernel(low *segLowered) *jit.Code {
-	if c, ok := segProgCache.Load(low); ok {
+	key := segProgKey{low, jit.Fusing()}
+	if c, ok := segProgCache.Load(key); ok {
 		if c == nil {
 			return nil
 		}
 		return c.(*jit.Code)
 	}
-	code, err := jit.EmitProgram(low.insns, len(low.cols))
+	code, err := jit.EmitProgramFlagged(low.insns, len(low.cols), low.fusable)
 	if err != nil {
-		segProgCache.Store(low, (*jit.Code)(nil))
+		segProgCache.Store(key, (*jit.Code)(nil))
 		return nil
 	}
 	k, err := jit.Map(code)
 	if err != nil {
-		segProgCache.Store(low, (*jit.Code)(nil))
+		segProgCache.Store(key, (*jit.Code)(nil))
 		return nil
 	}
-	actual, _ := segProgCache.LoadOrStore(low, k)
+	actual, _ := segProgCache.LoadOrStore(key, k)
 	if got := actual.(*jit.Code); got != k {
 		k.Close()
 		return got

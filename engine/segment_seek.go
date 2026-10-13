@@ -2,7 +2,6 @@ package engine
 
 import (
 	"slices"
-	"sort"
 	"sync/atomic"
 )
 
@@ -51,12 +50,29 @@ func (src *segSource) seekRowid(rootPage uint32, rid int64) (vals []Value, found
 // rowid array, or false.
 func (s *segment) findRowid(rid int64) (int, bool) {
 	// Bound first to skip segments outside this one's rowid range.
-	if s.nRows == 0 || rid < int64(s.Rowid(0)) || rid > int64(s.Rowid(s.nRows-1)) {
+	if s.nRows == 0 {
 		return 0, false
 	}
-	i := sort.Search(s.nRows, func(i int) bool { return int64(s.Rowid(i)) >= rid })
-	if i < s.nRows && int64(s.Rowid(i)) == rid {
-		return i, true
+	first, last := int64(s.Rowid(0)), int64(s.Rowid(s.nRows-1))
+	if rid < first || rid > last {
+		return 0, false
+	}
+	// A segment of consecutive rowids -- what a load or a rewrite of one
+	// leaves -- holds rid at rid-first: one probe, not a search.
+	if g := rid - first; g < int64(s.nRows) && int64(s.Rowid(int(g))) == rid {
+		return int(g), true
+	}
+	lo, hi := 0, s.nRows
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if int64(s.Rowid(mid)) < rid {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo < s.nRows && int64(s.Rowid(lo)) == rid {
+		return lo, true
 	}
 	return 0, false
 }

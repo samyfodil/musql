@@ -43,16 +43,10 @@ func (db *DB) tempInFile() bool { return db.tempStore != 2 }
 // main's in order, and returns them -- the temp commit's input.
 func (db *DB) takeTempChanges() []RowChange {
 	var temp []RowChange
-	kept := db.changeLog[:0]
-	for _, ch := range db.changeLog {
-		if ch.Temp {
-			ch.Temp = false // a record of the TEMP file names its table plainly
-			temp = append(temp, ch)
-			continue
-		}
-		kept = append(kept, ch)
-	}
-	db.changeLog = kept
+	db.changeLog.compact(func(ch *RowChange) bool { return !ch.Temp }, func(ch RowChange) {
+		ch.Temp = false // a record of the TEMP file names its table plainly
+		temp = append(temp, ch)
+	})
 	return temp
 }
 
@@ -104,7 +98,7 @@ func (db *DB) commitTempFile(changes []RowChange) error {
 	if tp == nil || tp.fp != fp || db.tempMutatedOutsideChangeLog(changes) {
 		return db.rewriteTempFile(fp)
 	}
-	recs, err := segDeltaRecordsInto(nil, changes, tp.tableIndex, tp.ipkOf, db.storeOf(true))
+	recs, err := segDeltaRecordsInto(nil, len(changes), ptrSeq(changes), tp.tableIndex, tp.ipkOf, db.storeOf(true))
 	if err != nil || len(recs) == 0 {
 		return err
 	}

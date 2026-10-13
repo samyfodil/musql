@@ -29,6 +29,8 @@ import (
 	"math"
 	"math/bits"
 	"strconv"
+	"strings"
+	"sync"
 )
 
 // vecType is a vector's component type, numbered as libSQL's type byte.
@@ -198,7 +200,398 @@ func parseVectorBlob(b []byte, lenient bool) (vector, error) {
 
 // parseVectorText reads '[1, 2, 3]' into a float32 or float64 vector.
 // Whitespace is dropped everywhere, inside a number too, as libSQL drops it.
+// vecTextClass classifies a byte of a vector's text for parseVectorText's
+// scan: the end of a component (',' ']' or a NUL), a space (sqlIsSpace), or
+// anything else -- one table load per byte rather than a chain of compares.
+var vecTextClass = func() (t [256]byte) {
+	for c := range 256 {
+		switch {
+		case c == ',' || c == ']' || c == 0:
+			t[c] = vecClassEnd
+		case sqlIsSpace(byte(c)):
+			t[c] = vecClassSpace
+		}
+	}
+	return t
+}()
+
+const (
+	vecClassOther = iota
+	vecClassEnd
+	vecClassSpace
+)
+
+// vecFastAtoF is sqliteAtoF for the numbers a vector's text is made of -- an
+// optional sign, digits with at most one '.', an optional exponent of at most
+// four digits, nothing else -- with at most 18 significant digits, which
+// sqliteAtoF accumulates without the truncation it applies past 19: both then
+// hand sqliteFp10Convert2 the same exact value, and so get the same double.
+// false for anything else, which sqliteAtoF then parses as before.
+func vecFastAtoF(num []byte) (float64, bool) {
+	i, neg := 0, false
+	if i < len(num) && (num[i] == '-' || num[i] == '+') {
+		neg = num[i] == '-'
+		i++
+	}
+	var d uint64
+	p, sig, digits := 0, 0, 0
+	dot := false
+	for ; i < len(num); i++ {
+		c := num[i]
+		if c == '.' {
+			if dot {
+				return 0, false
+			}
+			dot = true
+			continue
+		}
+		if c < '0' || c > '9' {
+			break
+		}
+		digits++
+		if d != 0 || c != '0' {
+			if sig++; sig > 18 {
+				return 0, false
+			}
+		}
+		d = d*10 + uint64(c-'0')
+		if dot {
+			p--
+		}
+	}
+	if digits == 0 {
+		return 0, false
+	}
+	if i < len(num) {
+		if c := num[i]; c != 'e' && c != 'E' {
+			return 0, false
+		}
+		i++
+		esign := 1
+		if i < len(num) && (num[i] == '-' || num[i] == '+') {
+			if num[i] == '-' {
+				esign = -1
+			}
+			i++
+		}
+		exp, ed := 0, 0
+		for ; i < len(num) && num[i] >= '0' && num[i] <= '9'; i++ {
+			if ed++; ed > 4 {
+				return 0, false
+			}
+			exp = exp*10 + int(num[i]-'0')
+		}
+		if ed == 0 || i != len(num) {
+			return 0, false
+		}
+		p += esign * exp
+	}
+	var r float64
+	if d != 0 {
+		r = sqliteFp10Convert2(d, p)
+	}
+	if neg {
+		r = -r
+	}
+	return r, true
+}
+
+// vecFastComponent parses the component of a vector's text starting at i
+// when it is the common shape: optional spaces, a number vecFastAtoF
+// takes, optional spaces, and ',' or ']' at e. false for anything else,
+// which parseVectorText's general scan then handles exactly as before.
+var vecSlowComponentsForTest bool // every component the general way
+
+func vecFastComponent(s []byte, i int) (x float64, e int, ok bool) {
+	if x, e, ok = vecPlainComponent(s, i); ok {
+		return x, e, true
+	}
+	if x, e, ok = vecTightComponent(s, i); ok {
+		return x, e, true
+	}
+	return vecSpacedComponent(s, i)
+}
+
+// vecNotDigits has the high bit of every byte of w that is not an ASCII digit.
+func vecNotDigits(w uint64) uint64 {
+	t := w ^ 0x3030303030303030 // a digit becomes 0..9
+	return ((t&0x7f7f7f7f7f7f7f7f + 0x7676767676767676) | t) & 0x8080808080808080
+}
+
+// vecDigits8 is the value of the n (1..7) leading digits of the little-endian
+// word w, whose bytes past them are anything: shifted so those digits end the
+// word, with zeros in front, the eight bytes are then one number.
+func vecDigits8(w uint64, n int) uint64 {
+	v := (w ^ 0x3030303030303030) << (uint(8-n) * 8)
+	v = v*10 + v>>8
+	v = ((v&0x000000FF000000FF)*0x000F424000000064 + (v>>16&0x000000FF000000FF)*0x0000271000000001) >> 32
+	return v & 0xffffffff
+}
+
+// vecPlainComponent is vecTightComponent for the commonest text of a float,
+// "[-]I[.F]" with one to seven digits in each part, which it reads eight bytes
+// at a time instead of one: a digit run's end is found by a bit test rather
+// than by a branch that mispredicts once per number. It builds the same
+// significand and power of ten, so the same double; anything else -- an
+// exponent, a longer part, a space, the end of the text near -- returns false
+// and is read by vecTightComponent from i.
+func vecPlainComponent(s []byte, i int) (x float64, e int, ok bool) {
+	j := i
+	if len(s)-j < 24 {
+		return 0, 0, false
+	}
+	// The sign without a branch: half the numbers of a vector are negative, so a
+	// test on it mispredicts about every other number.
+	neg := (uint32(s[j]^'-') - 1) >> 31 // 1 for '-', else 0
+	j += int(neg)
+	nd := vecNotDigits(binary.LittleEndian.Uint64(s[j:]))
+	if nd == 0 {
+		return 0, 0, false
+	}
+	n1 := bits.TrailingZeros64(nd) >> 3
+	if n1 == 0 {
+		return 0, 0, false
+	}
+	d := vecDigits8(binary.LittleEndian.Uint64(s[j:]), n1)
+	j += n1
+	p := 0
+	if s[j] == '.' {
+		j++
+		nd = vecNotDigits(binary.LittleEndian.Uint64(s[j:]))
+		if nd == 0 {
+			return 0, 0, false
+		}
+		n2 := bits.TrailingZeros64(nd) >> 3
+		if n2 == 0 {
+			return 0, 0, false
+		}
+		d = d*exactPow10Int[n2] + vecDigits8(binary.LittleEndian.Uint64(s[j:]), n2)
+		p = -n2
+		j += n2
+	}
+	if s[j] != ',' && s[j] != ']' {
+		return 0, 0, false
+	}
+	var r float64
+	if d != 0 {
+		r = sqliteFp10Convert2(d, p)
+	}
+	// -r, as the sign bit: also -0 for a zero.
+	return math.Float64frombits(math.Float64bits(r) | uint64(neg)<<63), j, true
+}
+
+var exactPow10Int = [8]uint64{1, 10, 100, 1000, 10000, 100000, 1000000, 10000000}
+
+// vecTightComponent is the component with no space anywhere: a number right at
+// i, ended by ',' or ']'. It reads the digits once, as it finds them, where
+// vecSpacedComponent finds the end of the span and then reads the span again;
+// the number is vecFastAtoF's (the same acceptance, the same value from the same
+// significand and exponent). false hands the component, from i, to
+// vecSpacedComponent.
+func vecTightComponent(s []byte, i int) (x float64, e int, ok bool) {
+	j, neg := i, false
+	if j < len(s) && (s[j] == '-' || s[j] == '+') {
+		neg = s[j] == '-'
+		j++
+	}
+	// Digits go straight into d with no per-digit bookkeeping: at most 18 of
+	// them cannot overflow it and are at most 18 significant ones, which is all
+	// vecFastAtoF takes. A longer run (leading zeros included) goes the other way.
+	start := j
+	var d uint64
+	dotAt := -1
+	for ; j < len(s); j++ {
+		c := s[j] - '0'
+		if c <= 9 {
+			d = d*10 + uint64(c)
+			continue
+		}
+		if s[j] == '.' && dotAt < 0 {
+			dotAt = j
+			continue
+		}
+		break
+	}
+	nd, p := j-start, 0
+	if dotAt >= 0 {
+		nd--
+		p = dotAt + 1 - j // minus the digits after the point
+	}
+	if nd <= 0 || nd > 18 || j >= len(s) || j-i > vecMaxFloatSz+1 {
+		return 0, 0, false
+	}
+	if c := s[j]; c == 'e' || c == 'E' {
+		j++
+		esign := 1
+		if j < len(s) && (s[j] == '-' || s[j] == '+') {
+			if s[j] == '-' {
+				esign = -1
+			}
+			j++
+		}
+		exp, ed := 0, 0
+		for ; j < len(s) && s[j]-'0' <= 9; j++ {
+			if ed++; ed > 4 {
+				return 0, 0, false
+			}
+			exp = exp*10 + int(s[j]-'0')
+		}
+		if ed == 0 || j >= len(s) || j-i > vecMaxFloatSz+1 {
+			return 0, 0, false
+		}
+		p += esign * exp
+	}
+	if s[j] != ',' && s[j] != ']' {
+		return 0, 0, false
+	}
+	var r float64
+	if d != 0 {
+		r = sqliteFp10Convert2(d, p)
+	}
+	if neg {
+		r = -r
+	}
+	return r, j, true
+}
+
+func vecSpacedComponent(s []byte, i int) (x float64, e int, ok bool) {
+	for i < len(s) && vecTextClass[s[i]] == vecClassSpace {
+		i++
+	}
+	lo := i
+	for i < len(s) && vecTextClass[s[i]] == vecClassOther {
+		i++
+	}
+	hi := i
+	for i < len(s) && vecTextClass[s[i]] == vecClassSpace {
+		i++
+	}
+	if i == len(s) || (s[i] != ',' && s[i] != ']') || hi == lo || hi-lo > vecMaxFloatSz+1 {
+		return 0, 0, false
+	}
+	x, ok = vecFastAtoF(s[lo:hi])
+	return x, i, ok
+}
+
+// A vector INSERT carries its vectors as text, one vector('[...]') call per row,
+// and reading a float costs more than anything else the statement does. The
+// statement's literals are known when it is compiled, so vecPrefetch reads them
+// then, on every core, and leaves the results here for the calls that come:
+// parseVectorText takes its answer from the table when the text is in it. The
+// answer is the one it would have computed, from the same code; a text that is
+// not there, or whose parse failed, is read at the call, and a failure is
+// reported there, at its row, in statement order.
+//
+// An entry is taken by the first call that uses it, so the table empties as the
+// statement runs. A new prefetch replaces the table, so what a statement that
+// never ran left behind lives until the next.
+var vecMemo struct {
+	sync.Mutex
+	m [2]map[string][]byte // by component width: float32, float64
+}
+
+func vecMemoSlot(t vecType) int {
+	if t == vecF64 {
+		return 1
+	}
+	return 0
+}
+
+// vecMemoTake returns the components of s parsed ahead as type t, removing them.
+func vecMemoTake(s []byte, t vecType) ([]byte, bool) {
+	vecMemo.Lock()
+	defer vecMemo.Unlock()
+	m := vecMemo.m[vecMemoSlot(t)]
+	if len(m) == 0 {
+		return nil, false
+	}
+	d, ok := m[string(s)]
+	if ok {
+		delete(m, string(s))
+	}
+	return d, ok
+}
+
+// vecPrefetchMin is the least text, in bytes, that a prefetch is worth the
+// goroutines' wake-up for.
+const (
+	vecPrefetchMin      = 32 << 10
+	vecPrefetchMax      = 64 << 20 // the most text one statement may prefetch
+	vecPrefetchPerTask  = 8        // texts a worker takes at a time
+	vecPrefetchMinTexts = 16
+)
+
+// vecPrefetch parses texts (the vectors of one statement, all as type t) across
+// vecWorkers goroutines and publishes the ones that parse. It does nothing for
+// a few small texts or a single worker.
+func vecPrefetch(texts [][]byte, t vecType) {
+	total := 0
+	for _, s := range texts {
+		total += len(s)
+	}
+	if vecWorkers < 2 || len(texts) < vecPrefetchMinTexts || total < vecPrefetchMin || total > vecPrefetchMax || vecSlowComponentsForTest {
+		return
+	}
+	data := make([][]byte, len(texts))
+	segEachOn(vecWorkers, (len(texts)+vecPrefetchPerTask-1)/vecPrefetchPerTask, func(j int) bool {
+		for i := j * vecPrefetchPerTask; i < min(len(texts), (j+1)*vecPrefetchPerTask); i++ {
+			if v, err := parseVectorTextRaw(texts[i], t); err == nil {
+				data[i] = v.data
+			}
+		}
+		return true
+	})
+	m := make(map[string][]byte, len(texts))
+	for i, d := range data {
+		if d != nil {
+			m[string(texts[i])] = d
+		}
+	}
+	vecMemo.Lock()
+	vecMemo.m[vecMemoSlot(t)] = m
+	vecMemo.Unlock()
+}
+
+// vecPrefetchRows prefetches the vector literals of an INSERT's VALUES rows: a
+// vector(), vector32() or vector64() call whose one argument is a text literal,
+// as a row writes it.
+func vecPrefetchRows(rows [][]Expr) {
+	var f32, f64 [][]byte
+	for _, row := range rows {
+		for _, e := range row {
+			fn, ok := e.(FuncExpr)
+			if !ok || len(fn.Args) != 1 || fn.Star || fn.Distinct || fn.Over != nil || fn.Filter != nil {
+				continue
+			}
+			lit, ok := fn.Args[0].(LiteralExpr)
+			if !ok || lit.Val.Typ != Text {
+				continue
+			}
+			switch strings.ToLower(fn.Name) {
+			case "vector", "vector32":
+				f32 = append(f32, lit.Val.S)
+			case "vector64":
+				f64 = append(f64, lit.Val.S)
+			}
+		}
+	}
+	vecPrefetch(f32, vecF32)
+	vecPrefetch(f64, vecF64)
+}
+
 func parseVectorText(s []byte, t vecType) (vector, error) {
+	if d, ok := vecMemoTake(s, t); ok {
+		w := 4
+		if t == vecF64 {
+			w = 8
+		}
+		return vector{typ: t, dims: len(d) / w, data: d}, nil
+	}
+	return parseVectorTextRaw(s, t)
+}
+
+// parseVectorTextRaw is parseVectorText without the table of texts read ahead.
+func parseVectorTextRaw(s []byte, t vecType) (vector, error) {
 	i := 0
 	skip := func() {
 		for i < len(s) && sqlIsSpace(s[i]) {
@@ -214,31 +607,54 @@ func parseVectorText(s []byte, t vecType) (vector, error) {
 	if t == vecF64 {
 		w = 8
 	}
-	var data []byte
+	// Sized for one component per comma, so the appends below never regrow it.
+	data := make([]byte, 0, (bytes.Count(s, []byte{','})+1)*w)
 	n := 0
 	// One number per pass: its span runs to the next ',' or ']' (or a NUL,
 	// where C's string ends), found in one scan and parsed in place. Only a
 	// number with whitespace inside it -- which libSQL drops, so "1 2" is 12
 	// -- is copied to strip it.
 	for {
+		// The common component first, in one pass: spaces, a number
+		// vecFastAtoF takes, spaces, then ',' or ']'. Anything else -- a space
+		// inside the number, a NUL, an empty component, a long one -- goes
+		// the general way below, from the same position.
+		if x, e, ok := vecFastComponent(s, i); ok && !vecSlowComponentsForTest {
+			if n >= vecMaxDims {
+				return vector{}, vecErr("vector: max size exceeded %d", vecMaxDims)
+			}
+			if w == 4 {
+				data = binary.LittleEndian.AppendUint32(data, math.Float32bits(float32(x)))
+			} else {
+				data = binary.LittleEndian.AppendUint64(data, math.Float64bits(x))
+			}
+			n++
+			i = e
+			if s[e] == ']' {
+				break
+			}
+			i = e + 1
+			continue
+		}
 		// e is the terminator; [lo, hi) the span from the first non-space to
 		// the last; inner whether a space falls between them.
 		e, lo, hi, inner, gap := i, -1, -1, false, false
 		for ; e < len(s); e++ {
 			c := s[e]
-			if c == ',' || c == ']' || c == 0 {
-				break
-			}
-			if sqlIsSpace(c) {
-				gap = lo >= 0
+			cls := vecTextClass[c]
+			if cls == vecClassOther {
+				if lo < 0 {
+					lo = e
+				}
+				inner = inner || gap
+				gap = false
+				hi = e + 1
 				continue
 			}
-			if lo < 0 {
-				lo = e
+			if cls == vecClassEnd {
+				break
 			}
-			inner = inner || gap
-			gap = false
-			hi = e + 1
+			gap = lo >= 0 // a space
 		}
 		var num []byte
 		if lo >= 0 {
@@ -260,7 +676,11 @@ func parseVectorText(s []byte, t vecType) (vector, error) {
 		if e == len(s) || s[e] == 0 || (s[e] == ']' && n == 0 && len(num) == 0) {
 			break // unterminated (reported below), or '[]'
 		}
-		x, rc := sqliteAtoF(num)
+		x, ok := vecFastAtoF(num)
+		rc := int32(1)
+		if !ok {
+			x, rc = sqliteAtoF(num)
+		}
 		if rc <= 0 {
 			return vector{}, vecErr("vector: invalid float at position %d: '%s'", n, num)
 		}

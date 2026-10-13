@@ -247,8 +247,9 @@ func TestR39DFts5MatchPlacement(t *testing.T) {
 		"scan (whereLoopAddOr, where.c:4814 -- a bare rowid RANGE costs 2250000 against the full scan's " +
 		"3000000). Closing it means costing the branches, not widening the shape blindly."
 	r39dGap(t, edb, cdb, `SELECT rowid FROM t WHERE t MATCH 'alpha' OR rowid>1`, cost)
-	r39dGap(t, edb, cdb, `SELECT rowid FROM t WHERE t MATCH 'alpha' OR 1`,
-		"C SQLite folds the always-true branch away before the planner ever sees the MATCH.")
+	// Closed by sqlite3ExprSimplifiedAndOr (simplifiedAndOr) and the literal
+	// LIMIT 0 exit (skipLimitZeroBody): both now agree with C SQLite.
+	r39dAgree(t, edb, cdb, `SELECT rowid FROM t WHERE t MATCH 'alpha' OR 1`)
 	r39dGap(t, edb, cdb, `SELECT rowid FROM t WHERE t MATCH 'nohit' AND NOT (t MATCH 'beta')`,
 		"fts5MatchBindings is keyed per SCOPE, so one bad placement refuses every MATCH on that table; "+
 			"C SQLite's index lookup selects nothing here and never evaluates the NOT. Closing it needs a "+
@@ -256,6 +257,5 @@ func TestR39DFts5MatchPlacement(t *testing.T) {
 	r39dGap(t, edb, cdb, `SELECT rowid FROM t WHERE NOT (t MATCH 'beta') AND rowid=99`,
 		"this engine tests WHERE conjuncts in source order, so the refusal fires before rowid=99 can select "+
 			"nothing; the same statement with the conjuncts swapped already agrees (it is in the list above).")
-	r39dGap(t, edb, cdb, `SELECT rowid FROM t WHERE NOT (t MATCH 'alpha') LIMIT 0`,
-		"LIMIT 0 does not skip the row loop here, so the per-row refusal fires before the limit is applied.")
+	r39dAgree(t, edb, cdb, `SELECT rowid FROM t WHERE NOT (t MATCH 'alpha') LIMIT 0`)
 }

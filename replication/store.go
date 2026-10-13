@@ -600,7 +600,7 @@ func (s *Store) rowidHighs(ctx context.Context, lo, hi uint64) (map[string]uint6
 // first site it saw per range and refuses the other's ops, whatever key they
 // touch.
 //
-// ponytail: containment, not convergence -- two nodes that saw the two sites in
+// A deliberate simplification: containment, not convergence -- two nodes that saw the two sites in
 // different orders admit different ones, and the refused site's ops never land
 // there. The odds are ~n^2/2^31 for n sites; route ranges through the op log if
 // that is ever hit.

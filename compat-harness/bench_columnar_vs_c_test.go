@@ -241,7 +241,7 @@ func TestBenchColumnarVsC(t *testing.T) {
 		{"EXISTS correlated", "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.id = t.bid AND b.id < ?)",
 			func(rng *rand.Rand) []any { return []any{1 + rng.Intn(1000)} }, false},
 		{"UNION ALL compound", "SELECT count(*) FROM (SELECT k FROM t WHERE k < 3 UNION ALL SELECT k FROM t WHERE k > 7)",
-			func(rng *rand.Rand) []any { return nil }, false},
+			func(rng *rand.Rand) []any { return nil }, true},
 		// Pagination, which an OFFSET keeps off the bounded-heap fast path.
 		{"paginate OFFSET", "SELECT id, v FROM t ORDER BY v DESC, id DESC LIMIT 20 OFFSET 1000",
 			func(rng *rand.Rand) []any { return nil }, false},

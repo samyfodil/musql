@@ -61,3 +61,20 @@ func (f *File) Close() error {
 	}
 	return err
 }
+
+// CanMapAt reports whether MapAt maps (true here) or always fails.
+const CanMapAt = true
+
+// MapAt maps n bytes of the open file f read-only, from off, which must be a
+// multiple of the page size. The mapping does not own f: Close unmaps it and
+// leaves f open.
+func MapAt(f *os.File, off int64, n int) (*File, error) {
+	if n == 0 {
+		return &File{}, nil
+	}
+	data, err := unix.Mmap(int(f.Fd()), off, n, unix.PROT_READ, unix.MAP_SHARED)
+	if err != nil {
+		return nil, fmt.Errorf("mmapfile: mapping %d bytes at %d: %w", n, off, err)
+	}
+	return &File{data: data, mapped: true}, nil
+}

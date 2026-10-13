@@ -929,6 +929,9 @@ func (db *DB) createTableAsSelect(name string, isTemp bool, sel *SelectStmt, ifN
 	// even though resolveFrom (join.go) also loads every joined table's rows
 	// (needed for an ordinary join execution, not for this): harmless here,
 	// just extra work pager.execSelect's own later call redoes properly.
+	// resolveFrom below runs a derived table's rows, so the columns the SELECT
+	// never names are blanked first, as sqlite3Select does before coding it.
+	sel = pager.nullUnusedSubqueryColumns(sel)
 	var scopes []tableScope
 	if len(sel.From) > 0 {
 		jts, _, ferr := pager.resolveFrom(sel.From, nil)

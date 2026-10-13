@@ -1032,7 +1032,7 @@ func (m *vdbe) windowAggregate(plan *windowPlan, call windowCall, ci int, part [
 	// accumulator -- cannot express every aggregate's removal step, and a frame
 	// that moves BACKWARD (an EXCLUDE hole, a "<N> FOLLOWING" start) has no
 	// removal step to make.
-	// ponytail: O(n^2) per partition, revisit if window queries get hot.
+	// A deliberate simplification: O(n^2) per partition, revisit if window queries get hot.
 	for k := range part {
 		acc := cloneAggTemplates([]*aggItem{tmpl})[0]
 		for j := spans[k].lo; j < spans[k].hi; j++ {

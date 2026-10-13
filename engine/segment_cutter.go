@@ -62,6 +62,13 @@ type segCutter struct {
 	rowids []uint64
 	rows   [][]Value
 	bytes  int64
+
+	// reuse builds each segment in the previous one's memory: for an emit
+	// that has finished with a segment's bytes when it returns (one that
+	// writes them out), so a long load allocates one segment's worth, not the
+	// table's.
+	reuse bool
+	buf   []byte
 }
 
 // add appends one row, cutting a segment when it fills one.
@@ -80,12 +87,19 @@ func (c *segCutter) flush() error {
 	if len(c.rows) == 0 {
 		return nil
 	}
-	raw, err := buildSegment(c.cols, c.rowids, c.rows)
+	var dst []byte
+	if c.reuse {
+		dst = c.buf
+	}
+	raw, err := buildSegmentInto(dst, c.cols, c.rowids, c.rows)
 	if err != nil {
 		return fmt.Errorf("building a segment of %s: %w", c.what, err)
 	}
 	clear(c.rows) // let the rows go before the next segment's arrive
 	c.rowids, c.rows, c.bytes = c.rowids[:0], c.rows[:0], 0
+	if c.reuse {
+		c.buf = raw
+	}
 	return c.emit(raw)
 }
 

@@ -81,6 +81,18 @@ func vec1Floats(b []byte) []float32 {
 	return out
 }
 
+// vec1FloatsView is vec1Floats for a caller that only reads the floats: where b
+// is 4-byte aligned they alias it, with no copy. A distance function called for
+// each candidate of a reranked search converted both of its arguments to fresh
+// slices -- 3 KB a candidate, most of what a query allocated.
+func vec1FloatsView(b []byte) []float32 {
+	n := len(b) / 4
+	if n == 0 || uintptr(unsafe.Pointer(unsafe.SliceData(b)))&3 != 0 {
+		return vec1Floats(b)
+	}
+	return unsafe.Slice((*float32)(unsafe.Pointer(unsafe.SliceData(b))), n)
+}
+
 // vec1FloatBytes is the blob holding v.
 func vec1FloatBytes(v []float32) []byte {
 	if len(v) == 0 {
@@ -91,8 +103,27 @@ func vec1FloatBytes(v []float32) []byte {
 
 // vec1NonFinite reports whether some element is NaN or infinite
 // (vec1VectorIsNonFinite: every exponent bit set).
+//
+// Two elements a 64-bit word: each 32-bit lane masked to its exponent and
+// XORed with all-ones-exponent is zero exactly for a non-finite element, and
+// a masked lane is below 2^31, so the classic has-a-zero-lane test is exact:
+// a zero lane's decrement sets its top bit, a nonzero one's cannot (a borrow
+// into the high lane comes only from a zero low lane, already a hit).
 func vec1NonFinite(b []byte) bool {
-	for i := 0; i+4 <= len(b); i += 4 {
+	const exp2 = 0x7F8000007F800000
+	const one2, top2 = 0x0000000100000001, 0x8000000080000000
+	i := 0
+	for w := b; len(w) >= 32; w = w[32:] {
+		x0 := vec1Native.Uint64(w[0:8])&exp2 ^ exp2
+		x1 := vec1Native.Uint64(w[8:16])&exp2 ^ exp2
+		x2 := vec1Native.Uint64(w[16:24])&exp2 ^ exp2
+		x3 := vec1Native.Uint64(w[24:32])&exp2 ^ exp2
+		if ((x0-one2)&^x0|(x1-one2)&^x1|(x2-one2)&^x2|(x3-one2)&^x3)&top2 != 0 {
+			return true
+		}
+		i += 32
+	}
+	for ; i+4 <= len(b); i += 4 {
 		if vec1Native.Uint32(b[i:])&0x7F800000 == 0x7F800000 {
 			return true
 		}

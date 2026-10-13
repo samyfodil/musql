@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/samyfodil/musql/internal/mmapfile"
 )
 
 // TestRowSpillAnswersAsMemory runs one statement sequence on two sessions, one
@@ -42,6 +44,12 @@ func TestRowSpillAnswersAsMemory(t *testing.T) {
 		`ROLLBACK`,
 		`INSERT INTO t SELECT id + 5000, u || 'y', v, b FROM t WHERE v > 8`,
 		`UPDATE t SET v = -v WHERE id > 5000`,
+		// A catalog change makes the commit rewrite the file, and the rows the
+		// INSERT spilled in order are then copied as the segments they are.
+		`BEGIN`,
+		`CREATE TABLE t3(x)`,
+		`INSERT INTO t SELECT id + 9000, u || 'z', v, b FROM t`,
+		`COMMIT`,
 	)
 	dump := func(t *testing.T, n *Session) string {
 		t.Helper()
@@ -94,17 +102,34 @@ func TestRowSpillAnswersAsMemory(t *testing.T) {
 		return each, dump(t, r)
 	}
 	memEach, memReopen := run(t, 1<<62)
-	SpilledRowsForTest()
-	spillEach, spillReopen := run(t, 16<<10)
-	if SpilledRowsForTest() == 0 {
-		t.Fatal("nothing spilled -- this test proves nothing")
-	}
-	for i := range memEach {
-		if memEach[i] != spillEach[i] {
-			t.Fatalf("step %d differs\n  memory: %.300s\n  spill:  %.300s", i, memEach[i], spillEach[i])
+	// Both spill formats: records, and segments a commit can copy as they are
+	// (spillRun), which must answer exactly as the rows they hold.
+	for _, segs := range []bool{false, true} {
+		if segs && !mmapfile.CanMapAt {
+			continue // segments spill only where the platform maps (js does not)
 		}
-	}
-	if memReopen != spillReopen {
-		t.Fatalf("after the reopen\n  memory: %.300s\n  spill:  %.300s", memReopen, spillReopen)
+		saved := spillSegments
+		spillSegments = segs
+		SpilledRowsForTest()
+		spillSegsCopied, spillsAdopted = 0, 0
+		spillEach, spillReopen := run(t, 16<<10)
+		spillSegments = saved
+		if SpilledRowsForTest() == 0 {
+			t.Fatal("nothing spilled -- this test proves nothing")
+		}
+		if segs && spillSegments && spillSegsCopied == 0 {
+			t.Fatal("no spilled segment was copied -- the copy went untested")
+		}
+		if segs && spillSegments && spillsAdopted == 0 {
+			t.Fatal("no spill file became the database file -- adopting one went untested")
+		}
+		for i := range memEach {
+			if memEach[i] != spillEach[i] {
+				t.Fatalf("segments %v: step %d differs\n  memory: %.300s\n  spill:  %.300s", segs, i, memEach[i], spillEach[i])
+			}
+		}
+		if memReopen != spillReopen {
+			t.Fatalf("segments %v: after the reopen\n  memory: %.300s\n  spill:  %.300s", segs, memReopen, spillReopen)
+		}
 	}
 }
