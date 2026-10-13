@@ -21,6 +21,12 @@ type Stmt struct {
 	// prepared INSERT in a loop. database/sql serialises calls on a driver
 	// statement under its connection's lock, so a call never overlaps another.
 	argBuf []engine.Value
+	// bytesArena is where the reuse path's TEXT and BLOB argument copies are
+	// carved (copyArgBytes): one allocation per many rows instead of one per
+	// argument. A carved slice is capped at its own length, so nothing appended
+	// to it can reach a neighbour, and the chunk is never rewritten -- a row
+	// that keeps an argument's bytes keeps them as they were bound.
+	bytesArena []byte
 	// script is the individual statements of a ";"-separated SCRIPT, non-nil
 	// only for multi-statement text. Such a Stmt is Exec-only.
 	script []string
@@ -82,7 +88,7 @@ func (s *Stmt) execContextImpl(ctx context.Context, args []driver.NamedValue) (d
 	var eargs []engine.Value
 	var err error
 	if reuse {
-		eargs, err = bindArgsInto(s.argBuf, s.info, args)
+		eargs, err = bindArgsInto(s.argBuf, s.info, args, &s.bytesArena)
 		s.argBuf = eargs
 	} else {
 		eargs, err = bindArgs(s.info, args)
@@ -151,12 +157,12 @@ func valuesToNamed(args []driver.Value) []driver.NamedValue {
 // Positional args bind by Ordinal; named args resolve via info.ParamNames,
 // trying all three of SQLite's sigils (":name", "@name", "$name").
 func bindArgs(info engine.ParamInfo, args []driver.NamedValue) ([]engine.Value, error) {
-	return bindArgsInto(nil, info, args)
+	return bindArgsInto(nil, info, args, nil)
 }
 
 // bindArgsInto is bindArgs over buf's storage when it is large enough. buf
 // must be all zero: an unbound parameter is NULL.
-func bindArgsInto(buf []engine.Value, info engine.ParamInfo, args []driver.NamedValue) ([]engine.Value, error) {
+func bindArgsInto(buf []engine.Value, info engine.ParamInfo, args []driver.NamedValue, arena *[]byte) ([]engine.Value, error) {
 	var out []engine.Value
 	if cap(buf) >= info.NumParams {
 		out = buf[:info.NumParams]
@@ -164,7 +170,20 @@ func bindArgsInto(buf []engine.Value, info engine.ParamInfo, args []driver.Named
 		out = make([]engine.Value, info.NumParams)
 	}
 	for _, nv := range args {
-		v, err := driverValueToEngine(nv.Value)
+		var v engine.Value
+		var err error
+		switch x := nv.Value.(type) {
+		case string:
+			v = engine.Value{Typ: engine.Text, S: copyArgBytes(arena, x)}
+		case []byte:
+			if len(x) == 0 {
+				v, err = driverValueToEngine(x) // nil S, as that copy leaves it
+				break
+			}
+			v = engine.Value{Typ: engine.Blob, S: copyArgBytes(arena, x)}
+		default:
+			v, err = driverValueToEngine(nv.Value)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -324,4 +343,30 @@ func (s *Stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (drive
 func (s *Stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
 	v, err := s.queryContextImpl(ctx, args)
 	return v, parityErr(err)
+}
+
+// argArenaChunk is the size of one bytesArena chunk; argArenaMax the largest
+// argument carved from one rather than allocated on its own, so a long value
+// cannot pin a chunk's worth of short ones (or the reverse).
+const (
+	argArenaChunk = 32 << 10
+	argArenaMax   = 1 << 10
+)
+
+// copyArgBytes copies b into a fresh slice of its own: carved from *arena when
+// there is one and b is short, allocated otherwise. For a string the result is
+// driverValueToEngine's copy, a non-nil empty slice included.
+func copyArgBytes[T string | []byte](arena *[]byte, b T) []byte {
+	n := len(b)
+	if arena == nil || n > argArenaMax {
+		return append(make([]byte, 0, n), b...)
+	}
+	a := *arena
+	if cap(a)-len(a) < n {
+		a = make([]byte, 0, argArenaChunk)
+	}
+	l := len(a)
+	a = append(a, b...)
+	*arena = a
+	return a[l : l+n : l+n]
 }
