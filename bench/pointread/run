@@ -17,6 +17,6 @@ trap 'rm -rf "$work"' EXIT
 CGO_ENABLED=1 go build -tags mattn -o "$work/c-sqlite" .
 go build -tags musql -o "$work/musql" .
 go build -o "$work/check" ./check
-"$work/c-sqlite" "${args[@]}" -dir "$work" -json "$work/c-sqlite.json"
-"$work/musql" "${args[@]}" -dir "$work" -json "$work/musql.json"
+"$work/c-sqlite" ${args[@]+"${args[@]}"} -dir "$work" -json "$work/c-sqlite.json"
+"$work/musql" ${args[@]+"${args[@]}"} -dir "$work" -json "$work/musql.json"
 "$work/check" "$work/musql.json" "$work/c-sqlite.json"
