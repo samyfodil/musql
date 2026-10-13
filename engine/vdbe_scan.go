@@ -245,6 +245,8 @@ func compileScanAttempt(p *ReadOnlyPager, stmt *SelectStmt, outer *compiler, row
 	// same time; every dispatch below reaches the planner through these same
 	// srcs. See markWherePlanEligibility for what it rules out and why.
 	markWherePlanEligibility(p, c, srcs, stmt)
+	planExistsJoinTerms(p, c, srcs, stmt)
+	markCTECoroutine(stmt, srcs)
 	// An INDEXED BY partial index this WHERE does not imply leaves the table
 	// no loop, and C refuses the statement (where_plan_indexed_by.go). A
 	// decline is returned now; the error waits for the compile to finish.
@@ -732,6 +734,11 @@ func compileScanPlain(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols 
 		c.emit(Instruction{Op: OpResultRow, P1: resultBase, P2: len(outCols)})
 		if haveLimit {
 			c.emit(Instruction{Op: OpSubtract, P1: oneReg, P2: limitReg, P3: limitReg})
+			// OP_DecrJumpZero (selectInnerLoop): the row that uses the LIMIT
+			// up leaves at once, before the loops step to another -- a
+			// co-routine FROM item is not asked for a row it would then fail
+			// to make.
+			limExhausted = append(limExhausted, c.emit(Instruction{Op: OpIfNot, P1: limitReg}))
 		}
 
 		bodyEnd := c.here()

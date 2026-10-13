@@ -40,7 +40,7 @@ import (
 // common case -- SQLite's documented "X [NOT] IN <table-name>" form, which
 // the parser desugars to "X IN (SELECT * FROM <table-name>)" (see
 // parseInRHS, sql_parser.go).
-func (p *ReadOnlyPager) tryVDBENoFrom(stmt *SelectStmt, outer *evalCtx, params []Value) (cols []string, rows [][]Value, handled bool, err error) {
+func (p *ReadOnlyPager) tryVDBENoFrom(stmt *SelectStmt, outer *evalCtx, params []Value, cacheKey string) (cols []string, rows [][]Value, handled bool, err error) {
 	prog, cerr := compileSelectNoFromRow(p, stmt, outer)
 	if cerr != nil {
 		if errors.Is(cerr, errVDBESemantic) {
@@ -65,6 +65,7 @@ func (p *ReadOnlyPager) tryVDBENoFrom(stmt *SelectStmt, outer *evalCtx, params [
 	// ()) FROM t1" is 3|2 in C SQLite and was "no such column: a" here, with
 	// no aggregate in the subquery body at all. Found by round twenty-four's
 	// window stream, which verified the fix and could not land it.
+	p.cachePlan(cacheKey, prog)
 	rows, err = prog.execOuter(p, outer, params)
 	return prog.ColNames, rows, true, err
 }

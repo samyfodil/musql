@@ -56,15 +56,36 @@ func segParseSemiGroup(in []Instruction, pc, limit, cursor, nextAt int) (segPlan
 	// "Gosub; Not dest -> d; IfNot d".
 	call, test := in[pc], in[pc+1]
 	width, parentNot := 2, false
-	if test.Op == OpNot && pc+2 < limit {
+	// The empty-table exit an EXISTS-to-JOIN level gets ("If dest -> past;
+	// IfEmpty B"; compileExistsSubquery) changes no count: an empty inner
+	// table fails every row either way, and the blocks raise no error the
+	// loops it would stop could raise.
+	halt := 0
+	if test.Op == OpIf && test.P2 > pc+1 && test.P2 < limit {
+		for j := pc + 2; j < test.P2; j++ {
+			switch in[j].Op {
+			case OpIfEmpty:
+			default:
+				return no, 0, false
+			}
+		}
+		halt = test.P2 - pc - 1
+		dest := test.P1
+		test = in[test.P2]
+		if test.P1 != dest {
+			return no, 0, false
+		}
+	}
+	if test.Op == OpNot && pc+halt+2 < limit {
 		notOp := test
-		test = in[pc+2]
+		test = in[pc+halt+2]
 		if test.Op != OpIfNot || test.P1 != notOp.P2 {
 			return no, 0, false
 		}
 		test.P1 = notOp.P1 // the subroutine's own result register
 		width, parentNot = 3, true
 	}
+	width += halt
 	if call.Op != OpGosub || test.Op != OpIfNot || test.P2 != nextAt || test.P3 != 1 {
 		return no, 0, false
 	}
