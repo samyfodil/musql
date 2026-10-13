@@ -439,6 +439,9 @@ func resolveJoinSources(p *ReadOnlyPager, c *compiler, items []FromItem) ([]join
 				if cerr != nil {
 					return nil, cerr
 				}
+				if cs.cteItem != nil {
+					cs.cteItem.placement = p.cteRefPlacementOf(c, items, i, cteBind)
+				}
 				// A MATERIALIZED CTE is an optimization fence (select.c:7797).
 				if cteBind.recursive == nil && cteBind.m10d != cteM10dYes {
 					cs.keepSubtype = flattenedSubtypeKeep(c.flatOuter, items, i, cteBind.core, len(cs.tbl.cols))
@@ -1737,6 +1740,127 @@ type cteRef struct {
 	// being expanded (SQLite's iCurrent pseudo-cursor, select.c:2733). nil for
 	// every other CTE reference.
 	recSelf *recQueueSpec
+
+	// placement is how C codes this reference when its CTE is AS NOT
+	// MATERIALIZED and referenced twice or more (cteRefPlacementOf); runCTEOnce
+	// reads it only then.
+	placement cteRefPlacement
+}
+
+// cteRefPlacement is fromClauseTermCanBeCoroutine's answer (select.c:7266) for
+// one CTE reference, from the FROM list it sits in.
+type cteRefPlacement int8
+
+const (
+	// cteRefUnknown: the FROM list holds something whose own coding in C this
+	// package cannot be sure of (a join group, a view or derived table C may
+	// flatten), so neither answer is guessed.
+	cteRefUnknown cteRefPlacement = iota
+	// cteRefCoroutine: C codes the body as a co-routine for this item alone, run
+	// afresh for it.
+	cteRefCoroutine
+	// cteRefMaterialized: C materializes the body. An uncorrelated
+	// materialization is published in CteUse.addrM9e (select.c:8134) and every
+	// later non-co-routine reference reuses it, so all of them share one run
+	// per statement (select.c:8076).
+	cteRefMaterialized
+)
+
+// cteRefPlacementOf ports fromClauseTermCanBeCoroutine's FROM-list rules for
+// items[i], a reference to b. Rules (2a)/(2b) (the hint and nUse) are applied
+// by runCTEOnce, once every reference has been counted.
+func (p *ReadOnlyPager) cteRefPlacementOf(c *compiler, items []FromItem, i int, b *cteBinding) cteRefPlacement {
+	if c.groupSpanRecursion {
+		return cteRefUnknown
+	}
+	sameCTE := func(it FromItem) bool {
+		if it.Schema != "" || it.TableFunc || it.Subquery != nil || it.GroupLen > 0 || it.NestedGroupSpan != nil {
+			return false
+		}
+		ob, ok := p.lookupCTE(it.Table)
+		return ok && ob == b
+	}
+	updateFrom := false
+	for _, it := range items {
+		if it.GroupLen > 0 || it.NestedGroupSpan != nil {
+			return cteRefUnknown
+		}
+		// (3): a RIGHT JOIN anywhere marks the first item JT_LTORJ
+		// (sqlite3SrcListShiftJoinType).
+		if it.Join == JoinRight || it.Join == JoinFull {
+			return cteRefMaterialized
+		}
+		updateFrom = updateFrom || it.UpdateTarget
+	}
+	// (5): a later item that is the same CTE (isSelfJoinView). Inside a view
+	// every copy of the body has its own selId, so none matches.
+	if !b.inView {
+		for _, it := range items[i+1:] {
+			if sameCTE(it) {
+				return cteRefMaterialized
+			}
+		}
+	}
+	// (1c-iii): UPDATE ... FROM. C puts the target first, so a CTE is never
+	// item 0 there (update.c, updateFromSelect).
+	if updateFrom {
+		return cteRefMaterialized
+	}
+	if i == 0 { // (1a), (1b)
+		return cteRefCoroutine
+	}
+	for k := i; ; {
+		it := items[k]
+		if it.Join == JoinLeft || it.Join == JoinRight || it.Join == JoinFull || it.CrossKeyword { // (1c-ii)
+			return cteRefMaterialized
+		}
+		if k == 0 {
+			break
+		}
+		k--
+		// (1c-i): an earlier subquery item. Only one C never flattens is known to
+		// be one: this CTE, or a FROM-less body (flattener restriction (7)).
+		prev := items[k]
+		switch {
+		case prev.TableFunc:
+		case sameCTE(prev):
+			return cteRefMaterialized
+		case prev.Subquery != nil:
+			if selectIsFromless(prev.Subquery) {
+				return cteRefMaterialized
+			}
+			return cteRefUnknown
+		case prev.Schema == "" && prev.GroupLen == 0:
+			if ob, ok := p.lookupCTE(prev.Table); ok {
+				if selectIsFromless(ob.core) {
+					return cteRefMaterialized
+				}
+				return cteRefUnknown
+			}
+			if _, ok, verr := p.resolveViewByNameIn(fromItemScope(prev), prev.Table); verr != nil || ok {
+				return cteRefUnknown
+			}
+		default:
+			if _, ok, verr := p.resolveViewByNameIn(fromItemScope(prev), prev.Table); verr != nil || ok {
+				return cteRefUnknown
+			}
+		}
+	}
+	return cteRefCoroutine
+}
+
+// selectIsFromless reports a SELECT with no FROM in any arm, which C's flattener
+// never flattens (restriction (7)).
+func selectIsFromless(s *SelectStmt) bool {
+	if s == nil || len(s.From) != 0 {
+		return false
+	}
+	for _, a := range s.Compound {
+		if a.Stmt == nil || len(a.Stmt.From) != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // resolveCorrelatedCTESource resolves a non-recursive CTE reference as a
