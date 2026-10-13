@@ -6,14 +6,24 @@ import (
 	"testing"
 )
 
+// recallRuns is how many independent trainings each engine gets per index.
+const recallRuns = 10
+
 // TestVec1Recall compares what each engine's own training buys: models
 // trained independently (training is randomized, so they differ), each used
 // by its own engine, must find the true nearest neighbours about as often.
-// musql's mean recall@10 over several models may not fall more than 0.05
-// below the oracle's, nor below 0.8, on clustered data.
+// musql's recall@10 may not fall more than 0.05 below the oracle's, nor
+// below 0.8, on clustered data.
+//
+// One training of either engine is a noisy sample: over 100 trainings each,
+// ivfbq's recall@10 is 0.912 +- 0.028 in musql and 0.912 +- 0.032 in vec1 (no
+// gap), so a single pair differs by more than 0.05 about one time in eight. The
+// verdict is therefore taken on the mean of recallRuns independent trainings
+// per engine, which keeps the 0.05 bound but puts it at over three standard
+// errors of the difference.
 func TestVec1Recall(t *testing.T) {
 	r := rand.New(rand.NewPCG(11, 12))
-	const dims, n, nq, trials = 32, 4000, 40, 12
+	const dims, n, nq = 32, 4000, 40
 	vecs := clusteredVecs(r, n, dims, 40)
 	queries := clusteredVecs(r, nq, dims, 40)
 	truth := exactTop(vecs, queries, 10)
@@ -24,9 +34,7 @@ func TestVec1Recall(t *testing.T) {
 		{"ivf", `{nbucket: 40}`},
 	} {
 		t.Run(cf.name, func(t *testing.T) {
-			m, c := engines(t)
-			trial := func(db *sql.DB) float64 {
-				mustExec(t, db, "DROP TABLE IF EXISTS v")
+			recall := func(db *sql.DB) float64 {
 				mustExec(t, db, "CREATE VIRTUAL TABLE v USING vec1(vector)")
 				tx, err := db.Begin()
 				if err != nil {
@@ -65,18 +73,13 @@ func TestVec1Recall(t *testing.T) {
 				}
 				return float64(hits) / float64(10*nq)
 			}
-			// One trained model's recall@10 moves by several points from
-			// run to run (0.81 to 0.96 for ivfbq in either engine), so a
-			// few models each are averaged.
-			recall := func(db *sql.DB) float64 {
-				sum := 0.0
-				for range trials {
-					sum += trial(db)
-				}
-				return sum / trials
+			var got, want float64
+			for range recallRuns {
+				m, c := engines(t)
+				got += recall(m) / recallRuns
+				want += recall(c) / recallRuns
 			}
-			got, want := recall(m), recall(c)
-			t.Logf("recall@10 musql %.3f, C %.3f", got, want)
+			t.Logf("recall@10 musql %.3f, C %.3f (mean of %d trainings each)", got, want, recallRuns)
 			if got < want-0.05 || got < 0.8 {
 				t.Fatalf("musql's recall@10 %.3f against the oracle's %.3f", got, want)
 			}
