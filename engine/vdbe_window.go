@@ -1652,6 +1652,17 @@ func compileScanWindow(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 	if projErr != nil {
 		return nil, projErr
 	}
+	if c.isExistsBody(stmt) {
+		// See isExistsBody: the list is resolved (just above) and never
+		// evaluated. The window functions themselves still run, in the
+		// sub-select sqlite3WindowRewrite moved them into.
+		for i := range plan.outs {
+			plan.projExprs[i] = LiteralExpr{Val: Value{Typ: Null}}
+		}
+		if proj, projErr = compileWindowProjection(c, plan); projErr != nil {
+			return nil, projErr
+		}
+	}
 	plan.proj = proj
 
 	initAddr := c.emit(Instruction{Op: OpInit})

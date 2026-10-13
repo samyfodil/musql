@@ -115,14 +115,16 @@ func (db *DB) compileViewUpdateFromSource(stmt *updateStmt, vm *viewMeta, viewCo
 	for _, a := range stmt.sets {
 		cols = append(cols, SelectColumn{Expr: a.expr})
 	}
-	from := make([]FromItem, 0, len(stmt.from)+1)
-	from = append(from, stmt.from...)
 	// Schema is the statement's own qualifier, carried for the reason
 	// buildUpdateFromSelect's identical line records in full (update_from.go,
 	// citing update.c:222/228/230 and expr.c:1913): without it pass one
 	// resolves the view name temp-first and joins against a TEMP view of the
 	// same name while the write target is MAIN's.
-	from = append(from, FromItem{Table: vm.name, Schema: stmt.schema, Alias: stmt.alias, UpdateTarget: true})
+	//
+	// Joined last, not first as updateFromItems puts a table: a view is a
+	// subquery to C, materialized, and the planner then orders it after the
+	// FROM's items (upfrom2.test 3.1 fires its triggers in the FROM's order).
+	from := append(append(make([]FromItem, 0, len(stmt.from)+1), stmt.from...), FromItem{Table: vm.name, Schema: stmt.schema, Alias: stmt.alias, UpdateTarget: true})
 	joinCTEs, jerr := writeJoinCTEs(stmt.ctes, vm.name, stmt.table, stmt.sets, stmt.where)
 	if jerr != nil {
 		// writeJoinCTEs' own errors are prepare-time diagnostics, carried out

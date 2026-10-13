@@ -15,6 +15,7 @@ import (
 var opNames = [numOpCodes]string{
 	OpGosub:                "Gosub",
 	OpReturn:               "Return",
+	OpIfEmpty:              "IfEmpty",
 	OpJIT:                  "JIT",
 	OpInit:                 "Init",
 	OpSegOrderLimit:        "SegOrderLimit",

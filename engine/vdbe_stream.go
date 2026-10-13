@@ -22,6 +22,10 @@ const (
 	// derived source of a FROM clause (emitJoinLoops). A top-level read never
 	// yields, so it never streams.
 	streamIfYielding
+	// streamCoroutine runs the source as a co-routine wherever it opens, and
+	// shares the opening machine's sink: a recursive CTE that is the first
+	// item of a FROM clause, which C codes as one (markCTECoroutine).
+	streamCoroutine
 )
 
 // streamSink is the INSERT a chain of co-routines ultimately feeds. It is
@@ -72,14 +76,14 @@ func (m *vdbe) streamsDerived(ds *derivedSource, insns []Instruction) bool {
 		// have built, without holding the rows. It is read at most once (the
 		// outermost source), and only by a read: a write machine would
 		// interleave its own writes with the arms' scans.
-		return ds.stream == streamIfYielding && m.wctx == nil && ds.upfrom == nil && ds.viewUpfrom == nil &&
+		return (ds.stream == streamIfYielding || ds.stream == streamCoroutine) && m.wctx == nil && ds.upfrom == nil && ds.viewUpfrom == nil &&
 			ds.prog.Compound.streamable()
 	}
 	if ds.stream == streamNever || ds.prog == nil || ds.prog.Correlated || ds.prog.Compound != nil ||
 		ds.prog.LiveSource != nil || ds.upfrom != nil || ds.viewUpfrom != nil {
 		return false
 	}
-	if ds.stream == streamAlways {
+	if ds.stream == streamAlways || ds.stream == streamCoroutine {
 		return true
 	}
 	if !m.yield {
@@ -328,4 +332,54 @@ func aggPlanReadsTable(plan *aggPlan, target string, seen map[*Program]bool) boo
 		}
 	}
 	return false
+}
+
+// markCTECoroutine sets joinSource.cteCoroutine on the first FROM item of stmt
+// when it is a recursive CTE C would run as a co-routine: defined by stmt's own
+// WITH, not AS MATERIALIZED, and named once in the whole statement, its own
+// body aside (fromClauseTermCanBeCoroutine's (2a)/(2b); nUse counts the
+// references to it). A RIGHT JOIN anywhere stops it, as (3) does.
+func markCTECoroutine(stmt *SelectStmt, srcs []joinSource) {
+	if stmt == nil || len(srcs) == 0 {
+		return
+	}
+	for _, s := range srcs {
+		if s.rightOuter || s.updateTarget {
+			return
+		}
+	}
+	if s0 := srcs[0]; s0.derived != nil {
+		// A subquery or view: a co-routine unless the same view is joined
+		// again (isSelfJoinView, (5)).
+		for _, s := range srcs[1:] {
+			if s0.tbl != nil && s.tbl != nil && s0.tbl.name != "" && equalFoldName(s.tbl.name, s0.tbl.name) {
+				return
+			}
+		}
+		srcs[0].cteCoroutine = true
+		return
+	}
+	if srcs[0].cteItem == nil || srcs[0].cteItem.queue == nil {
+		return
+	}
+	name := srcs[0].cteItem.name
+	own := -1
+	for i, cte := range stmt.CTEs {
+		if equalFoldName(cte.Name, name) {
+			own = i
+		}
+	}
+	if own < 0 || stmt.CTEs[own].Materialized == cteM10dYes {
+		return
+	}
+	rest := *stmt
+	rest.CTEs = append(append([]CTEDef(nil), stmt.CTEs[:own]...), stmt.CTEs[own+1:]...)
+	uses := 0
+	selectTreeMentionsTable(&rest, func(it FromItem) bool {
+		if it.Schema == "" && equalFoldName(it.Table, name) {
+			uses++
+		}
+		return false
+	})
+	srcs[0].cteCoroutine = uses == 1
 }
