@@ -118,7 +118,7 @@ func compileScanGroupedWindow(p *ReadOnlyPager, stmt *SelectStmt, baseSrcs []joi
 		if herr != nil {
 			return nil, herr
 		}
-		winCols[i] = outputColumn{expr: e, name: oc.name}
+		winCols[i] = outputColumn{expr: e, name: oc.name, aliased: oc.aliased}
 	}
 
 	// ORDER BY. An ordinal ("ORDER BY 2") and a bare name matching an output

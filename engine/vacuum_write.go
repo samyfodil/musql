@@ -89,6 +89,10 @@ func (db *DB) execReindex(sqlText string) error {
 	}
 
 	if p.peek().kind == tkIdent {
+		// A reserved word cannot be the target name (parse.y: nmnum is an id).
+		if t := p.peek(); !t.quoted && nonIdentifierKeywords[t.upper()] {
+			return fmt.Errorf("engine: near %q: syntax error", t.text)
+		}
 		first := p.next().text
 		if p.peekIsPunct(".") {
 			p.next()

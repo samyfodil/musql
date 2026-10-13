@@ -230,12 +230,12 @@ func (db *DB) CreateTable(createSQL string) error {
 	// statement with no rows at all) -- checked first, before any of the
 	// ordinary column-list parsing below, which doesn't understand "AS" at
 	// all and would otherwise misparse or reject it.
-	ctasName, ctasTemp, ctasSel, isCTAS, err := tryParseCreateTableAsSelect(createSQL)
+	ctasName, ctasTemp, ctasSel, ctasIfNotExists, isCTAS, err := tryParseCreateTableAsSelect(createSQL)
 	if err != nil {
 		return err
 	}
 	if isCTAS {
-		return db.createTableAsSelect(ctasName, ctasTemp, ctasSel)
+		return db.createTableAsSelect(ctasName, ctasTemp, ctasSel, ctasIfNotExists)
 	}
 
 	name, isTemp, ifNotExists, err := parseCreateTableName(createSQL)
@@ -836,30 +836,30 @@ func parseCreateTableNamePrefix(p *parser) (string, bool, error) {
 // a "CREATE TABLE name (cols) AS SELECT ..." form, if written, is left for
 // the ordinary column-list parser below to reject on its own terms, exactly
 // like C SQLite does.
-func tryParseCreateTableAsSelect(createSQL string) (name string, isTemp bool, stmt *SelectStmt, ok bool, err error) {
+func tryParseCreateTableAsSelect(createSQL string) (name string, isTemp bool, stmt *SelectStmt, ifNotExists, ok bool, err error) {
 	toks, err := lex(createSQL)
 	if err != nil {
-		return "", false, nil, false, err
+		return "", false, nil, false, false, err
 	}
 	p := newParser(createSQL, toks)
 	name, isTemp, err = parseCreateTableNamePrefix(p)
 	if err != nil {
-		return "", false, nil, false, err
+		return "", false, nil, false, false, err
 	}
 	if !p.consumeKeyword("AS") {
-		return "", false, nil, false, nil
+		return "", false, nil, false, false, nil
 	}
 	sel, err := p.parseSelectStmt()
 	if err != nil {
-		return "", false, nil, false, err
+		return "", false, nil, false, false, err
 	}
 	if p.peekIsPunct(";") {
 		p.next()
 	}
 	if p.peek().kind != tkEOF {
-		return "", false, nil, false, fmt.Errorf("engine: CREATE TABLE ... AS SELECT: unexpected trailing input near %q", p.tokenDesc(p.peek()))
+		return "", false, nil, false, false, fmt.Errorf("engine: CREATE TABLE ... AS SELECT: unexpected trailing input near %q", p.tokenDesc(p.peek()))
 	}
-	return name, isTemp, sel, true, nil
+	return name, isTemp, sel, p.sawIfNotExists, true, nil
 }
 
 // createTableAsSelect implements CREATE TABLE t AS SELECT ...: t's columns are
@@ -870,12 +870,15 @@ func tryParseCreateTableAsSelect(createSQL string) (name string, isTemp bool, st
 // no PRIMARY KEY/UNIQUE/NOT NULL/DEFAULT, as in C, even when copying an INTEGER
 // PRIMARY KEY. It is filled by running the SELECT (execSelect) and feeding each
 // row through insertRowFromValues.
-func (db *DB) createTableAsSelect(name string, isTemp bool, sel *SelectStmt) error {
+func (db *DB) createTableAsSelect(name string, isTemp bool, sel *SelectStmt, ifNotExists bool) error {
 	if err := db.checkReservedObjectName(name); err != nil {
 		return err
 	}
 	scope := createScope(isTemp)
 	if db.findTableMetaIn(scope, name) != nil {
+		if ifNotExists {
+			return nil // sqlite3StartTable: IF NOT EXISTS over an existing table makes no table and runs no SELECT
+		}
 		return fmt.Errorf("engine: table %s already exists", name)
 	}
 	if db.findViewMetaIn(scope, name) != nil {

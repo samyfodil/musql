@@ -1378,8 +1378,19 @@ func compileScanWindow(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 		if err := checkWindowFrame(call.spec); err != nil {
 			return nil, semanticf("%v", err)
 		}
+		if call.filter != nil && isWindowFunctionName(call.name) {
+			// sqlite3WindowUpdate (window.c:689): only an aggregate takes a FILTER.
+			return nil, semanticf("engine: FILTER clause may only be used with aggregate window functions")
+		}
 		if !isWindowFunctionName(call.name) {
 			if !isAggregateCall(call.funcExpr()) {
+				// window.c:689-ish: a function that is neither is refused by name.
+				if supportedFuncs[call.name] {
+					return nil, semanticf("engine: %s() may not be used as a window function", call.name)
+				}
+				if unknownFunctionName(call.name) {
+					return nil, semanticf("engine: no such function: %s", call.name)
+				}
 				return nil, fmt.Errorf("%w: window function %s()", errVDBEUnsupported, call.name)
 			}
 		}
@@ -1512,6 +1523,17 @@ func compileScanWindow(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 	proj, projErr := compileWindowProjection(c, plan)
 	if projErr != nil {
 		return nil, projErr
+	}
+	if c.isExistsBody(stmt) {
+		// See isExistsBody: the list is resolved (just above) and never
+		// evaluated. The window functions themselves still run, in the
+		// sub-select sqlite3WindowRewrite moved them into.
+		for i := range plan.outs {
+			plan.projExprs[i] = LiteralExpr{Val: Value{Typ: Null}}
+		}
+		if proj, projErr = compileWindowProjection(c, plan); projErr != nil {
+			return nil, projErr
+		}
 	}
 	plan.proj = proj
 

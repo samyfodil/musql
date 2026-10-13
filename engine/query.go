@@ -301,6 +301,11 @@ func (p *ReadOnlyPager) hintedIndexRow(name, table string, scope schemaScope) (*
 type outputColumn struct {
 	expr Expr
 	name string
+	// aliased: the name was written with AS. Only such a name is what
+	// resolveAsName matches an ORDER BY term against (resolve.c's ENAME_NAME);
+	// an implicit name ("SELECT a ... ORDER BY a") is resolved as an ordinary
+	// expression.
+	aliased bool
 }
 
 // Query parses and executes a single read-only SELECT statement (see the
@@ -563,6 +568,14 @@ func (p *ReadOnlyPager) cachePlan(sqlText string, prog *Program) {
 // evaluated over one synthetic row. An aggregate list compiles via
 // compileNoFromAggregate, a window query via compileNoFromWindow.
 func (p *ReadOnlyPager) execNoFrom(stmt *SelectStmt, outer *evalCtx, params []Value) (cols []string, rows [][]Value, err error) {
+	return p.execNoFromKeyed(stmt, outer, params, "")
+}
+
+// execNoFromKeyed is execNoFrom for a statement that is a rewrite of a top-level
+// read's text: cacheKey, the input text (as in execSelect), memoizes the
+// compiled Program so a repeat of the text skips the rewrite and the
+// compile. Empty for every other caller.
+func (p *ReadOnlyPager) execNoFromKeyed(stmt *SelectStmt, outer *evalCtx, params []Value, cacheKey string) (cols []string, rows [][]Value, err error) {
 	if len(stmt.GroupBy) > 0 {
 		trimmed, gerr := p.validateNoFromGroupBy(stmt, outer, params)
 		if gerr != nil {
@@ -595,7 +608,7 @@ func (p *ReadOnlyPager) execNoFrom(stmt *SelectStmt, outer *evalCtx, params []Va
 		// wrapping it in "not compilable to bytecode ... (no fallback)" both
 		// buried the real diagnosis and put text in front of it that real
 		// SQLite has no counterpart for. See subquery_validate.go.
-		if errors.Is(verr, errVDBESemantic) {
+		if errors.Is(verr, errVDBESemantic) || isAmbiguousNameErr(verr) {
 		return nil, nil, verr
 		}
 		if verr != nil {
@@ -609,7 +622,7 @@ func (p *ReadOnlyPager) execNoFrom(stmt *SelectStmt, outer *evalCtx, params []Va
 	// execNoFromRowMode, which has been removed. The error
 	// names the gap so the conformance gate surfaces exactly what the compiler
 	// still owes.
-	cols, rows, handled, verr := p.tryVDBENoFrom(stmt, outer, params)
+	cols, rows, handled, verr := p.tryVDBENoFrom(stmt, outer, params, cacheKey)
 	if handled {
 		return cols, rows, verr
 	}
@@ -619,7 +632,7 @@ func (p *ReadOnlyPager) execNoFrom(stmt *SelectStmt, outer *evalCtx, params []Va
 	// wrapping it in "not compilable to bytecode ... (no fallback)" both
 	// buried the real diagnosis and put text in front of it that real
 	// SQLite has no counterpart for. See subquery_validate.go.
-	if errors.Is(verr, errVDBESemantic) {
+	if errors.Is(verr, errVDBESemantic) || isAmbiguousNameErr(verr) {
 	return nil, nil, verr
 	}
 	if verr != nil {
@@ -1147,7 +1160,12 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 			resolved.Limit = &n
 			resolved.LimitParam = nil
 		}
-		if stmt.OffsetParam != nil {
+		if resolved.Limit != nil && *resolved.Limit == 0 {
+			// computeLimitRegisters leaves for the end on a LIMIT of 0 before
+			// it codes the OFFSET, which is therefore never evaluated.
+			resolved.Offset, resolved.OffsetParam = nil, nil
+		}
+		if resolved.OffsetParam != nil {
 			n, ferr := foldLimitOffsetExpr(p, limitOffsetPseudoRowRefs(stmt.OffsetParam, outer), params)
 			if ferr != nil {
 				return nil, nil, ferr
@@ -1192,7 +1210,7 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 		// wrapping it in "not compilable to bytecode ... (no fallback)" both
 		// buried the real diagnosis and put text in front of it that real
 		// SQLite has no counterpart for. See subquery_validate.go.
-		if errors.Is(verr, errVDBESemantic) {
+		if errors.Is(verr, errVDBESemantic) || isAmbiguousNameErr(verr) {
 		return nil, nil, verr
 		}
 		if verr != nil {
@@ -1207,7 +1225,7 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 	// count(*) over a UNION ALL is the sum of its arms' counts (count_union_all.go).
 	if outer == nil {
 		if f := p.countUnionAll(stmt); f != nil {
-			return p.execNoFrom(f, outer, params)
+			return p.execNoFromKeyed(f, outer, params, cacheKey)
 		}
 	}
 
@@ -1248,13 +1266,20 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 	// wrapping it in "not compilable to bytecode ... (no fallback)" both
 	// buried the real diagnosis and put text in front of it that real
 	// SQLite has no counterpart for. See subquery_validate.go.
-	if errors.Is(verr, errVDBESemantic) {
+	if errors.Is(verr, errVDBESemantic) || isAmbiguousNameErr(verr) {
 	return nil, nil, verr
 	}
 	if verr != nil {
 		return nil, nil, fmt.Errorf("engine: VDBE-only: %w (no fallback)", verr)
 	}
 	return nil, nil, fmt.Errorf("engine: VDBE-only: statement not compilable to bytecode (no fallback)")
+}
+
+// isAmbiguousNameErr reports the resolver's "ambiguous column name"
+// (resolve.c:784), which scope lookups return unwrapped. It is the statement's
+// own error, so the VDBE-only wrappers must not bury it.
+func isAmbiguousNameErr(err error) bool {
+	return err != nil && strings.HasPrefix(err.Error(), "engine: ambiguous column name: ")
 }
 
 // normalizeRow turns a raw decoded record into the values SQL sees: it puts the
@@ -2041,7 +2066,7 @@ func expandSelectList(sel []SelectColumn, scopes []tableScope, mode colNameMode)
 				}
 			}
 		}
-		out = append(out, outputColumn{expr: sc.Expr, name: name})
+		out = append(out, outputColumn{expr: sc.Expr, name: name, aliased: sc.HasAlias})
 	}
 	return out, nil
 }

@@ -91,8 +91,6 @@ func buildUpdateFromSelect(stmt *updateStmt, tbl *tableMeta) (*SelectStmt, int, 
 	//	  -- m1's unmatched row still updates its t5 row, with v NULL
 	//	UPDATE t5 SET b=y, c=v FROM m1 LEFT JOIN m2 ON (u=t5.a) WHERE x=a
 	//	  -- "no such column: t5.a"
-	from := make([]FromItem, 0, len(stmt.from)+1)
-	from = append(from, stmt.from...)
 	//
 	// Schema is the statement's own qualifier, so "UPDATE main.t ... FROM m"
 	// joins main's t even when a temp t exists. updateFromSelect dups the
@@ -100,7 +98,26 @@ func buildUpdateFromSelect(stmt *updateStmt, tbl *tableMeta) (*SelectStmt, int, 
 	// cursor (update.c:228, 230), so its name and database survive
 	// (expr.c:1913 copies zDatabase). Without it, pass one resolved the temp
 	// t and pass two wrote that rowid into main's t.
-	from = append(from, FromItem{Table: tbl.name, Schema: stmt.schema, Alias: stmt.alias, UpdateTarget: true})
+	from := updateFromItems(stmt.from, FromItem{Table: tbl.name, Schema: stmt.schema, Alias: stmt.alias, UpdateTarget: true})
+	// The FROM list and the target share one name space: a name written twice
+	// (an unaliased table listed twice, or one alias on two sources) is
+	// ambiguous when the rewrite names its columns, so C rejects the statement
+	// even though a plain SELECT over the same list is fine.
+	seenNames := map[string]bool{}
+	for _, it := range from {
+		name := it.Alias
+		if name == "" && it.Subquery == nil {
+			name = it.Table
+		}
+		if name == "" {
+			continue
+		}
+		folded := r33sFoldIdent(name)
+		if seenNames[folded] {
+			return nil, 0, semanticf("engine: ambiguous column name: %s", name)
+		}
+		seenNames[folded] = true
+	}
 	// A leading "WITH ..." belongs to the join, not just to the statement's own
 	// subqueries: "WITH data(k,v) AS (VALUES(1,'ten')) UPDATE t1 SET b=v FROM
 	// data WHERE a=k" names the CTE as a FROM SOURCE (upfrom2.test 1.x.1), so
@@ -111,6 +128,32 @@ func buildUpdateFromSelect(stmt *updateStmt, tbl *tableMeta) (*SelectStmt, int, 
 		return nil, 0, cerr
 	}
 	return &SelectStmt{CTEs: joinCTEs, Columns: cols, From: from, Where: stmt.where}, len(keyCols), nil
+}
+
+// updateFromItems is the FROM clause of pass one: the target and the
+// statement's FROM items. The parser puts the target first
+// (sqlite3SrcListAppendList in the UPDATE rule of parse.y), wrapping a FROM of
+// two or more items into one subquery first, which the flattener dissolves
+// again when the items are plain comma or inner joins. That first place is
+// kept for a single FROM item and for such joins: it is where the join order
+// the planner chooses from starts, and so decides which loop a term with no
+// table reference is coded in. A FROM with a join constraint, an outer join or
+// a parenthesized group keeps the target last, which is how this port stands
+// in for the subquery wrapper: its ON clauses cannot see the target and its
+// outer joins never null-extend it.
+func updateFromItems(from []FromItem, target FromItem) []FromItem {
+	out := make([]FromItem, 0, len(from)+1)
+	first := true
+	for _, it := range from {
+		if (it.Join != JoinCross && it.Join != JoinInner) || it.On != nil || len(it.Using) != 0 || it.Natural ||
+			it.GroupLen != 0 || it.NestedGroupID != 0 {
+			first = false
+		}
+	}
+	if first {
+		return append(append(out, target), from...)
+	}
+	return append(append(out, from...), target)
 }
 
 // writeJoinCTEs returns the leading WITH definitions to put in scope for an

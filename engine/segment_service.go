@@ -356,7 +356,9 @@ func (r *segSvcRunner) run(b *segSvcBlock, s *segment, row int, regs []int64) bo
 				return false
 			}
 		case OpGlob:
-			m.opGlob(op)
+			if m.opGlob(op) != nil {
+				return false
+			}
 		case OpConcat:
 			w[op.P3] = concatValuesEnc(w[op.P2], w[op.P1], m.encoding())
 		case OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder:

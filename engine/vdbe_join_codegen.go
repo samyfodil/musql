@@ -61,6 +61,11 @@ type joinSource struct {
 	// view). See that field's doc comment.
 	updateTarget bool
 
+	// cteCoroutine marks the first FROM item as a recursive CTE C runs as a
+	// co-routine (fromClauseTermCanBeCoroutine, select.c): used once in the
+	// statement, not MATERIALIZED. Set by markCTECoroutine.
+	cteCoroutine bool
+
 	// flattened is FromItem.flattened: this table came up out of a view, CTE or
 	// FROM-subquery body, and its OpOpenRead carries P5 bit 2.
 	flattened bool
@@ -582,7 +587,7 @@ func resolveJoinSources(p *ReadOnlyPager, c *compiler, items []FromItem) ([]join
 			}
 			// resolveTable's error is normally a genuine "no such table", so it is
 			// errVDBESemantic and reaches the user as the statement's error.
-			return nil, semanticf("%v", terr)
+			return nil, semanticf("%v", relabelMissingTable(it, terr))
 		}
 		name := it.Alias
 		if name == "" {
@@ -2154,7 +2159,7 @@ func (p *ReadOnlyPager) resolveGroupSource(c *compiler, state *joinDesugarState,
 			// (resolveJoinSources): a genuine "no such table" must PROPAGATE
 			// (errVDBESemantic), never be masked behind the generic
 			// "not compilable to bytecode" fallback message.
-			return joinSource{}, semanticf("%v", terr)
+			return joinSource{}, semanticf("%v", relabelMissingTable(it, terr))
 		}
 	}
 	return p.finishGroupSource(c, state, i, items, it, gl, tbl)
@@ -2620,9 +2625,12 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 	}
 	for i, s := range srcs {
 		if s.derived != nil {
-			ds := &derivedSource{prog: s.derived, tbl: s.tbl, dbIdx: s.dbIdx, keepSubtype: s.keepSubtype}
+			ds := &derivedSource{prog: s.derived, tbl: s.tbl, dbIdx: s.dbIdx, keepSubtype: s.keepSubtype, lazy: true}
 			if i == streamDerived {
 				ds.stream = streamIfYielding
+				if s.cteCoroutine {
+					ds.stream = streamCoroutine // see the CTE case below
+				}
 			}
 			c.emit(Instruction{Op: OpOpenDerived, P1: s.scope.cursor, P2: s.derivedSlot, P4: ds})
 			continue
@@ -2645,7 +2653,7 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 			// is folded at RUN time, and that is the only channel by which
 			// "json_each(NEW.x)" in a trigger body can reach the firing row.
 			// See derivedSource.vtabTrig (vdbe_op.go).
-			c.emit(Instruction{Op: OpOpenDerived, P1: s.scope.cursor, P2: s.derivedSlot, P4: &derivedSource{vtab: s.vtabItem, vtabTrig: c.trig, tbl: s.tbl, dbIdx: s.dbIdx}})
+			c.emit(Instruction{Op: OpOpenDerived, P1: s.scope.cursor, P2: s.derivedSlot, P4: &derivedSource{vtab: s.vtabItem, vtabTrig: c.trig, tbl: s.tbl, dbIdx: s.dbIdx, lazy: true}})
 			continue
 		}
 		if s.cteItem != nil {
@@ -2657,6 +2665,22 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 				ds = &derivedSource{prog: s.cteItem.queue, tbl: s.tbl, dbIdx: s.dbIdx}
 				if i == streamDerived {
 					ds.stream = streamIfYielding
+					if s.cteCoroutine {
+						// A co-routine in C whatever reads it: its rows are made
+						// as the outer loop asks, so a loop that leaves early
+						// -- an empty inner table, a LIMIT -- leaves the rest
+						// of the recursion unrun.
+						ds.stream = streamCoroutine
+					}
+				}
+			}
+			ds.lazy = true
+			for j := 0; j < i; j++ {
+				if o := srcs[j].cteItem; o != nil && o.binding == s.cteItem.binding && s.cteItem.recSelf == nil {
+					// A second use of a CTE in one FROM clause materializes
+					// it where sqlite3Select codes the item (the OP_Gosub to
+					// addrM9e), before any loop, not when its loop is reached.
+					ds.lazy = false
 				}
 			}
 			c.emit(Instruction{Op: OpOpenDerived, P1: s.scope.cursor, P2: s.derivedSlot, P4: ds})
@@ -2711,18 +2735,43 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 	// error one is raised for an empty table too (where_const_terms.go).
 	consts := plan.consts
 	if c.outer != nil && c.outer.existsJoin {
-		// The select of an EXISTS that C turns into a join: its terms that
-		// name only the enclosing query are tested per outer row there, not
-		// at the start of this subquery.
-		if len(plan.outerConsts) > 0 && len(plan.buckets) > 0 {
-			plan.buckets = slices.Clone(plan.buckets)
-			plan.buckets[0] = append(slices.Clone(plan.buckets[0]), plan.outerConsts...)
-		} else {
-			consts = append(slices.Clone(consts), plan.outerConsts...)
+		// The select of an EXISTS that C turns into a join: a term naming only
+		// the enclosing query, or a FROM-less sub-select, is coded at an
+		// enclosing level there. Outside this table's level it runs before
+		// the loop, once per enclosing row; at or inside it, in the loop
+		// (existsJoinPos).
+		pos := c.outer.existsAt
+		pre := slices.Clone(consts)
+		var inLoop []Expr
+		for _, cj := range plan.outerConsts {
+			if pos.before(cj) {
+				pre = append(pre, cj)
+			} else {
+				inLoop = append(inLoop, cj)
+			}
 		}
+		if len(plan.buckets) > 0 {
+			subScopes := tableScopesOf(srcs)
+			var keep []Expr
+			for _, cj := range plan.buckets[0] {
+				if levelZeroConstTerm(cj, subScopes, false) && pos.before(cj) {
+					pre = append(pre, cj)
+				} else {
+					keep = append(keep, cj)
+				}
+			}
+			plan.buckets = slices.Clone(plan.buckets)
+			plan.buckets[0] = append(keep, inLoop...)
+		} else {
+			pre = append(pre, inLoop...)
+		}
+		consts = pre
 	} else {
 		consts = append(slices.Clone(consts), plan.outerConsts...)
 	}
+	// The constant terms of each EXISTS existsToJoin folds into this SELECT,
+	// coded with its own (planExistsJoinTerms).
+	consts = append(consts, c.existsHoist...)
 	var constJumps []int
 	for _, cj := range consts {
 		c.inWhereConjunct = true
@@ -2732,7 +2781,29 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 		}
 		constJumps = append(constJumps, c.emit(Instruction{Op: OpIfNot, P1: reg, P3: 1}))
 	}
-	if err := c.emitJoinLevel(srcs, plan, 0, body); err != nil {
+	halt := planJoinHalt(srcs, plan)
+	if halt != nil {
+		for _, pos := range c.existsPos {
+			if pos.src != nil {
+				pos.cursor = c.allocCursor() // opened by its OpIfEmpty
+			}
+		}
+	}
+	if halt != nil {
+		// sqlite3WhereBegin's open loop: a third or later inner-join table that
+		// is empty skips every loop before the first one opens.
+		for level := 2; level < len(srcs); level++ {
+			s := srcs[plan.execOrder[level]]
+			if halt.lv[level] == 0 && halt.tableOpen[level] {
+				constJumps = append(constJumps, c.emit(Instruction{Op: OpIfEmpty, P1: s.scope.cursor}))
+			}
+		}
+	}
+	savedHalt := c.joinHalt
+	c.joinHalt = halt
+	err := c.emitJoinLevel(srcs, plan, 0, body)
+	c.joinHalt = savedHalt
+	if err != nil {
 		return err
 	}
 	// RIGHT/FULL second passes, one per rightOuter source in FROM order (execOrder
@@ -2842,6 +2913,7 @@ func (c *compiler) emitMultiOrGroups(plan joinPlan, level, cur int) error {
 func (c *compiler) emitJoinLevel(srcs []joinSource, plan joinPlan, level int, body func() error) error {
 	order := plan.execOrder
 	if level == len(srcs) {
+		c.joinLevelNow = level - 1
 		return body()
 	}
 	origIdx := order[level]
@@ -2957,6 +3029,7 @@ func (c *compiler) emitJoinLevel(srcs []joinSource, plan joinPlan, level int, bo
 			// false/NULL) already ensures it never runs unless ON passed.
 			c.emit(Instruction{Op: OpRightJoinMark, P1: cur})
 		}
+		c.joinLevelNow = level
 		bucketJumps, err := emitBucket()
 		if err != nil {
 			return err
@@ -2971,7 +3044,19 @@ func (c *compiler) emitJoinLevel(srcs []joinSource, plan joinPlan, level int, bo
 		for _, j := range bucketJumps {
 			c.patch(j, nextAddr) // pushed-down WHERE false/NULL -> this table's next row
 		}
-		c.patch(rewindJump, c.here()) // empty -> past this level's own Next, contributing nothing
+		if h := c.joinHalt; h != nil && h.off == 0 && h.fullScan[level] && h.lv[level] != level {
+			// An empty inner full scan leaves for the loop end its addrHalt
+			// names, ending every loop out to there (wherecode.c, OP_Rewind
+			// to pLevel->addrHalt). OpIfEmpty confirms the Rewind saw the
+			// whole table rather than a narrowed part of it.
+			skip := c.emit(Instruction{Op: OpGoto})
+			c.patch(rewindJump, c.here())
+			h.patches[h.lv[level]] = append(h.patches[h.lv[level]], c.emit(Instruction{Op: OpIfEmpty, P1: cur}))
+			c.patch(skip, c.here())
+		} else {
+			c.patch(rewindJump, c.here()) // empty -> past this level's own Next, contributing nothing
+		}
+		c.patchJoinHalt(level)
 		return nil
 	}
 
@@ -3016,12 +3101,88 @@ func (c *compiler) emitJoinLevel(srcs []joinSource, plan joinPlan, level int, bo
 		c.patch(onJump, nextAddr)
 	}
 	c.patch(rewindJump, c.here()) // empty right table -> straight to the match check below, flag still 0
+	c.patchJoinHalt(level)
 
 	skipNull := c.emit(Instruction{Op: OpIf, P1: matchReg}) // matched at least once -> skip NULL-extension
 	c.emit(Instruction{Op: OpNullRow, P1: cur})
-	if err := c.emitJoinLevel(srcs, plan, level+1, body); err != nil {
+	// The NULL-extended pass below re-enters the inner levels with no match
+	// flag to set again, so an empty inner table there may not leave for this
+	// level's loop end, which would extend the row once more: it ends its own.
+	if c.joinHalt != nil {
+		c.joinHalt.off++
+	}
+	err := c.emitJoinLevel(srcs, plan, level+1, body)
+	if c.joinHalt != nil {
+		c.joinHalt.off--
+	}
+	if err != nil {
 		return err
 	}
 	c.patch(skipNull, c.here())
 	return nil
+}
+
+// joinHalt is pLevel->addrHalt for one emitJoinLoops: lv[L] is the level whose
+// loop end an empty inner full scan at level L leaves for (where.c, the open
+// loop of sqlite3WhereBegin) -- its own for the outermost level and for a LEFT
+// JOIN's right side, else the level before it's. patches collects those jumps
+// until that level's end is known.
+type joinHalt struct {
+	lv        []int
+	fullScan  []bool // the level's loop is a full scan of the whole row source
+	tableOpen []bool // the level is a table C opens with OP_OpenRead
+	patches   [][]int
+	off       int // inside a LEFT JOIN's NULL-extended pass
+}
+
+// planJoinHalt is joinHalt for srcs under plan, or nil when no level would use
+// it: a single source, a RIGHT or FULL JOIN (whose levels C chains differently),
+// or a parenthesized join group.
+func planJoinHalt(srcs []joinSource, plan joinPlan) *joinHalt {
+	if len(srcs) < 1 || groupPresent(srcs) {
+		return nil
+	}
+	for _, s := range srcs {
+		if s.rightOuter {
+			return nil
+		}
+	}
+	plainKey := func(k *autoIndexKey) bool { return k == nil || len(k.cols) == 0 && k.multiOr == nil && k.root == 0 }
+	h := &joinHalt{lv: make([]int, len(srcs)), fullScan: make([]bool, len(srcs)), tableOpen: make([]bool, len(srcs)), patches: make([][]int, len(srcs))}
+	for level, idx := range plan.execOrder {
+		s := srcs[idx]
+		if level > 0 && !s.left {
+			h.lv[level] = h.lv[level-1]
+		} else {
+			h.lv[level] = level
+		}
+		var auto *autoIndexKey
+		if level < len(plan.autoIdxKeys) {
+			auto = plan.autoIdxKeys[level]
+		}
+		noSeek := s.joinSeekKeyExpr == nil && s.joinIdxSeek == nil && s.seekKeyExpr == nil && s.idxSeek == nil &&
+			plainKey(auto) && plainKey(s.idxOrderKey)
+		h.fullScan[level] = noSeek && s.vtabItem == nil && (s.cteItem == nil || s.cteItem.recSelf == nil)
+		// C opens the table itself, and so tests it, unless a covering index
+		// stands in for it (WHERE_IDX_ONLY), which only a real index can be.
+		noRealIndex := s.joinIdxSeek == nil && s.idxSeek == nil &&
+			(s.idxOrderKey == nil || s.idxOrderKey.root == 0 && s.idxOrderKey.multiOr == nil) &&
+			(auto == nil || auto.root == 0 && auto.multiOr == nil)
+		h.tableOpen[level] = noRealIndex && s.derived == nil && s.vtabItem == nil && s.cteItem == nil &&
+			s.catalogScope == scopeAny && !s.left && !s.updateTarget
+	}
+	return h
+}
+
+// patchJoinHalt points the jumps that leave for level's loop end at the
+// current address, which is that end.
+func (c *compiler) patchJoinHalt(level int) {
+	h := c.joinHalt
+	if h == nil || level >= len(h.patches) {
+		return
+	}
+	for _, j := range h.patches[level] {
+		c.patch(j, c.here())
+	}
+	h.patches[level] = nil
 }

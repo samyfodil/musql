@@ -90,6 +90,18 @@ func resolveOrderKeys(stmt *SelectStmt, outCols []outputColumn) ([]orderKeySrc, 
 				continue
 			}
 		}
+		// This is the non-aggregate scan: an aggregate call in its ORDER BY is
+		// coded by expr.c:5340 as "misuse of aggregate: f()".
+		var misuse error
+		walkExprShallow(ot.Expr, func(fc FuncExpr) bool {
+			if isAggregateCall(fc) {
+				misuse = misuseOfFuncErrAt(fc.callName(), false, true)
+			}
+			return misuse == nil
+		})
+		if misuse != nil {
+			return nil, misuse
+		}
 		if err := checkExprSupported(ot.Expr); err != nil {
 			return nil, declineOrSemantic(err)
 		}

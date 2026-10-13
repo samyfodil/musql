@@ -2197,7 +2197,11 @@ func (p *parser) parseOr() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
+	chain := 0
 	for p.consumeKeyword("OR") {
+		if chain++; chain >= maxExprDepth {
+			return nil, errExprTreeTooLarge
+		}
 		r, err := p.parseAnd()
 		if err != nil {
 			return nil, err
@@ -2206,6 +2210,13 @@ func (p *parser) parseOr() (Expr, error) {
 	}
 	return l, nil
 }
+
+// maxExprDepth is SQLITE_MAX_EXPR_DEPTH's default. A chain of n operands of
+// one left-associative operator is a tree of height n, so the n-th operand past
+// the limit is C's "Expression tree is too large" (expr.c: sqlite3ExprCheckHeight).
+const maxExprDepth = 1000
+
+var errExprTreeTooLarge = errors.New("engine: Expression tree is too large (maximum depth 1000)")
 
 // parseAnd implements AND, which binds tighter than OR but looser than
 // unary NOT: each AND operand is parsed via parseNotLevel (rather than
@@ -2217,7 +2228,11 @@ func (p *parser) parseAnd() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
+	chain := 0
 	for p.consumeKeyword("AND") {
+		if chain++; chain >= maxExprDepth {
+			return nil, errExprTreeTooLarge
+		}
 		r, err := p.parseNotLevel()
 		if err != nil {
 			return nil, err
@@ -3857,6 +3872,17 @@ func (p *parser) parseUnary() (Expr, error) {
 					return LiteralExpr{Val: Value{Typ: Int, I: math.MinInt64}}, nil
 				}
 			}
+			// codeInteger (expr.c): a hex literal that negates to SMALLEST_INT64
+			// is "hex literal too big: -0x..." when the expression is
+			// code-generated; the value folded by sqlite3ValueFromExpr (an
+			// ALTER ... ADD COLUMN default) is the REAL 2**63.
+			if t := p.peek(); t.kind == tkNumber && len(t.text) > 2 && (t.text[1] == 'x' || t.text[1] == 'X') {
+				if u, err := strconv.ParseUint(t.text[2:], 16, 64); err == nil && u == uint64(math.MaxInt64)+1 {
+					p.next()
+					return LiteralExpr{Val: Value{Typ: Float, F: -float64(math.MinInt64)},
+						deferredErr: fmt.Sprintf("engine: %s: -%s", errHexLiteralTooBig, t.text)}, nil
+				}
+			}
 		}
 		x, err := p.parseUnary()
 		if err != nil {
@@ -4637,6 +4663,24 @@ func literalNumber(text string) (Value, error) {
 	return Value{Typ: Float, F: f}, nil
 }
 
+// signedLiteralNumber is literalNumber of a number token under a unary sign, as
+// sqlite3ValueFromExpr folds it. A hex literal is read as its 64-bit pattern
+// first and then negated; negating the smallest integer promotes it to the REAL
+// 2**63 (vdbemem.c).
+func signedLiteralNumber(sign, text string) (Value, error) {
+	if len(text) > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X') {
+		v, err := literalNumber(text)
+		if err != nil || sign != "-" {
+			return v, err
+		}
+		if v.I == math.MinInt64 {
+			return Value{Typ: Float, F: -float64(math.MinInt64)}, nil
+		}
+		return Value{Typ: Int, I: -v.I}, nil
+	}
+	return literalNumber(sign + text)
+}
+
 // ---- CREATE TABLE column-info parsing ----
 
 // affinity is one of SQLite's five type affinities, per
@@ -5383,6 +5427,10 @@ doneSegments:
 				continue
 			}
 			if seg[j].kind == tkIdent && seg[j].upper() == "AS" {
+				if hasGenerated {
+					// "c AS (a+1) AS (a+2)": the column takes one generated clause.
+					return nil, nil, nil, fmt.Errorf("engine: error in generated column %q", name)
+				}
 				gc, closeIdx, gerr := parseCheckClauseStructural(createSQL, seg, j)
 				if gerr != nil {
 					return nil, nil, nil, fmt.Errorf("engine: CREATE TABLE: column %s: %v", name, gerr)
@@ -5446,6 +5494,14 @@ doneSegments:
 						j++
 					}
 				}
+				// Only another column constraint can follow the clause; a type
+				// token after it ("b AS (a) WAT") is not in C's grammar.
+				if j < len(seg) {
+					nx := seg[j]
+					if !(nx.kind == tkIdent && (colConstraintStart[nx.upper()] || nx.upper() == "DEFERRABLE")) {
+						return nil, nil, nil, fmt.Errorf("engine: error in generated column %q", name)
+					}
+				}
 				continue
 			}
 			// A column-level "CONSTRAINT name" names the following constraint (usually
@@ -5479,6 +5535,9 @@ doneSegments:
 				continue
 			}
 			if seg[j].kind == tkIdent && seg[j].upper() == "PRIMARY" {
+				if isColPK {
+					primaryKeyCount++ // "a PRIMARY KEY PRIMARY KEY": counted once more, so the table has two
+				}
 				isColPK = true
 				k := j + 1
 				if k < len(seg) && seg[k].kind == tkIdent && seg[k].upper() == "KEY" {
