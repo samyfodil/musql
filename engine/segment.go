@@ -3,7 +3,9 @@ package engine
 import (
 	"encoding/binary"
 	"fmt"
+	"runtime"
 	"slices"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -95,6 +97,12 @@ type segment struct {
 	// fullWidth is segFlagFullWidth: every row stored every column.
 	fullWidth bool
 	exc       map[uint64]Value // row*nCols+col -> the value that did not fit
+
+	// cells is the 8-byte cells built from segCellBounds columns, kept while
+	// the process-wide budget allows (boundsCells).
+	cellMu    eqCountMu
+	cells     map[int][]uint64
+	cellsHeld *atomic.Int64 // what this segment holds against the budget
 
 	// diskIdx is this segment's equality indexes, read out of the FILE: a view
 	// over the mapped bytes, opened once per column and holding no data of its
@@ -799,12 +807,20 @@ func (s *segment) cellBytes(c, i int) ([]byte, bool) {
 }
 
 // boundsCells is a segCellBounds column's cells as the 8-byte (offset, length)
-// pairs BytesColumn hands out, built for the caller and not kept. Keeping them
-// would put back in memory the 8 bytes a row the file saved -- per connection,
-// since each maps the file and opens its own segments -- for a scan's sake;
-// building them is a pass over the bounds, which the scan reading the column
-// makes anyway.
+// pairs BytesColumn hands out.
+//
+// KEPT, UNDER A BUDGET. Built per call, a LIKE over 100k rows of TEXT lost a
+// third of its speed to building them; kept without a bound, they put back in
+// the heap the 8 bytes a row the file saved -- per connection, since each maps
+// the file and opens its own segments. So they are kept while every segment's
+// kept cells together stay under boundsCellsBudget, and built per call past
+// it; a segment's share is handed back when it is collected.
 func (s *segment) boundsCells(c int) ([]uint64, bool) {
+	s.cellMu.Lock()
+	defer s.cellMu.Unlock()
+	if cells, ok := s.cells[c]; ok {
+		return cells, true
+	}
 	cells := make([]uint64, s.nRows)
 	for i := range cells {
 		x, ok := s.boundCell(c, i)
@@ -813,8 +829,27 @@ func (s *segment) boundsCells(c int) ([]uint64, bool) {
 		}
 		cells[i] = x
 	}
+	size := int64(8 * len(cells))
+	if boundsCellsHeld.Add(size) > boundsCellsBudget {
+		boundsCellsHeld.Add(-size)
+		return cells, true
+	}
+	if s.cells == nil {
+		s.cells = map[int][]uint64{}
+		held := new(atomic.Int64)
+		s.cellsHeld = held
+		runtime.AddCleanup(s, func(h *atomic.Int64) { boundsCellsHeld.Add(-h.Load()) }, held)
+	}
+	s.cells[c] = cells
+	s.cellsHeld.Add(size)
 	return cells, true
 }
+
+// boundsCellsHeld is what every segment's kept bounds cells weigh, against
+// boundsCellsBudget.
+var boundsCellsHeld atomic.Int64
+
+const boundsCellsBudget = 256 << 20
 
 // Value is the general accessor: the value of column c in row i, whatever it
 // took to store it. Correct for every column and every physical type, and the
