@@ -39,6 +39,8 @@ func BenchmarkVMJITQueries(b *testing.B) {
 		{"vdbe/case-proj", "SELECT sum(CASE WHEN v % 3 = 0 THEN v ELSE sec END) FROM t WHERE k <> 3"},
 		{"vdbe/arith-proj", "SELECT max(v*k - sec), min(v + sec*2 - bid) FROM t"},
 		{"vdbe/point", "SELECT sec FROM t WHERE id = 4242"},
+		{"vdbe/nested-loop", "SELECT count(*) FROM (SELECT v, k FROM t WHERE id <= 400) a, (SELECT v, k FROM t WHERE id <= 400) b WHERE a.v > b.v AND a.k = b.k"},
+		{"vdbe/nested-loop-text", "SELECT count(*) FROM (SELECT payload, k FROM t WHERE id <= 400) a, (SELECT payload, k FROM t WHERE id <= 400) b WHERE a.payload = b.payload AND a.k < b.k"},
 		{"vdbe/join", "SELECT count(*) FROM t JOIN t AS u ON u.id = t.bid WHERE t.sec < 2000 AND u.k > t.k"},
 	} {
 		b.Run(q.name, func(b *testing.B) {

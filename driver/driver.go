@@ -227,7 +227,7 @@ func splitDSN(dsn string) string {
 		dsn = dsn[:i]
 	}
 	// A "file:" URI DSN names the same file its bare-path spelling does --
-	// C SQLite accepts both, and DSNs are commonly written in the URI form. ponytail: the scheme is stripped, not parsed;
+	// C SQLite accepts both, and DSNs are commonly written in the URI form. A deliberate simplification: the scheme is stripped, not parsed;
 	// no host/authority or percent-decoding (nobody passes those here).
 	return strings.TrimPrefix(dsn, "file:")
 }

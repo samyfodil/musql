@@ -33,49 +33,86 @@ func engines(t testing.TB) (musql, oracle *sql.DB) {
 	return m, c
 }
 
-// render is one statement's outcome, so two engines compare equal exactly
-// when they agree: every column's type and value (a REAL by its bits), or the
+// cell is one value of a result as render prints it; f is the value of a
+// REAL, whose bits the text carries.
+type cell struct {
+	s   string
+	f   float64
+	isF bool
+}
+
+// result is one statement's outcome: the column names, the rows, and the
+// error that ended it, if any.
+type result struct {
+	cols []string
+	rows [][]cell
+	err  string // "error: ...\n", or empty
+}
+
+// String is the result as text, so two engines compare equal exactly when
+// they agree: every column's type and value (a REAL by its bits), or the
 // error text.
-func render(db *sql.DB, q string, args ...any) string {
+func (r result) String() string {
+	var out strings.Builder
+	for _, row := range r.rows {
+		for i, c := range row {
+			if i > 0 {
+				out.WriteString("|")
+			}
+			out.WriteString(c.s)
+		}
+		out.WriteString("\n")
+	}
+	out.WriteString(r.err)
+	return out.String()
+}
+
+// query runs q and collects its outcome.
+func query(db *sql.DB, q string, args ...any) result {
+	var res result
 	rows, err := db.Query(q, args...)
 	if err != nil {
-		return "error: " + errText(err) + "\n"
+		res.err = "error: " + errText(err) + "\n"
+		return res
 	}
 	defer rows.Close()
-	cols, _ := rows.Columns()
-	var out strings.Builder
+	res.cols, _ = rows.Columns()
 	for rows.Next() {
-		vals := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
+		vals := make([]any, len(res.cols))
+		ptrs := make([]any, len(res.cols))
 		for i := range vals {
 			ptrs[i] = &vals[i]
 		}
 		if err := rows.Scan(ptrs...); err != nil {
-			return "error: " + errText(err) + "\n"
+			res.err = "error: " + errText(err) + "\n"
+			return res
 		}
+		row := make([]cell, len(vals))
 		for i, v := range vals {
-			if i > 0 {
-				out.WriteString("|")
-			}
 			switch x := v.(type) {
 			case []byte:
-				fmt.Fprintf(&out, "x'%x'", x)
+				row[i].s = fmt.Sprintf("x'%x'", x)
 			case float64:
-				fmt.Fprintf(&out, "%v(%x)", x, math.Float64bits(x))
+				row[i] = cell{s: fmt.Sprintf("%v(%x)", x, math.Float64bits(x)), f: x, isF: true}
 			case nil:
-				out.WriteString("NULL")
+				row[i].s = "NULL"
 			case string:
-				fmt.Fprintf(&out, "'%s'", x)
+				row[i].s = fmt.Sprintf("'%s'", x)
 			default:
-				fmt.Fprintf(&out, "%v", x)
+				row[i].s = fmt.Sprintf("%v", x)
 			}
 		}
-		out.WriteString("\n")
+		res.rows = append(res.rows, row)
 	}
 	if err := rows.Err(); err != nil {
-		out.WriteString("error: " + errText(err) + "\n")
+		res.err = "error: " + errText(err) + "\n"
 	}
-	return out.String()
+	return res
+}
+
+// render is one statement's outcome as text.
+func render(db *sql.DB, q string, args ...any) string {
+	return query(db, q, args...).String()
 }
 
 // errText is an error's message as both engines word it.

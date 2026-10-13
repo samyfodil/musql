@@ -60,7 +60,7 @@ func callVec1Func(name string, args []Value) (Value, bool, error) {
 		if len(a.S) != len(b.S) || len(a.S)%4 != 0 || a.Typ != Blob || b.Typ != Blob {
 			return Value{}, true, fmt.Errorf("%s: bad arguments", name)
 		}
-		x, y := vec1Floats(a.S), vec1Floats(b.S)
+		x, y := vec1FloatsView(a.S), vec1FloatsView(b.S)
 		if name == "vec1_l2_distance" {
 			return Value{Typ: Float, F: vec1L2(x, y)}, true, nil
 		}

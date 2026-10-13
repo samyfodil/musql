@@ -444,7 +444,7 @@ func integrityCheckViolationExpr(checks []checkConstraint) string {
 // logical value; they agree on every mask here -- a REAL column C stores as an
 // integer record passes REAL's mask, which admits INT.
 //
-// ponytail: a SHORT row (written before the column existed) takes C's p4, the
+// A deliberate simplification: a SHORT row (written before the column existed) takes C's p4, the
 // DEFAULT's type; a column with a DEFAULT is not judged here -- a missed finding
 // on that one shape, never an extra one.
 func integrityColumnFinding(table string, c columnInfo, strict bool, vals []Value, j int) string {

@@ -642,7 +642,7 @@ func wherePlanSingleTableIndexOrder(p *ReadOnlyPager, c *compiler, srcs []joinSo
 // wherePlanSeedInvariant runs solve for every seed-path row count C could plan
 // with (MIN(nQueryLoop, 48), down to where costs saturate below -600) and returns
 // the key only if every run agrees, including winner flags and the absence of a
-// multi-OR winner. nRow is 0. ponytail: 649 solves over one cached loop set, about
+// multi-OR winner. nRow is 0. A deliberate simplification: 649 solves over one cached loop set, about
 // 0.3ms per scan, once per prepared statement; bound the range by the loops' own
 // costs if that shows up.
 func wherePlanSeedInvariant(in wherePlanInput, solve func(wherePlanInput) (*autoIndexKey, logEst, bool)) (*autoIndexKey, logEst, bool) {

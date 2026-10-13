@@ -600,7 +600,7 @@ func (p *ReadOnlyPager) derivedSelectScope(sub *SelectStmt, n int) derivedSelect
 	if err != nil || len(outCols) != n {
 		return derivedSelectScope{}
 	}
-	return derivedSelectScope{ctx: &evalCtx{tables: scopes}, outCols: outCols, ok: true}
+	return derivedSelectScope{ctx: &evalCtx{tables: scopes, pager: p}, outCols: outCols, ok: true}
 }
 
 // derivedColumnInfos builds a derived table's []columnInfo from its subquery's
@@ -1178,6 +1178,10 @@ func armColClassify(ctx *evalCtx, e Expr) (aff affinity, stop bool, dt int, ok b
 		if col, isCol := e.(ColumnExpr); isCol && a == affNone {
 			if _, _, ci, _, err := resolveColumn(ctx, col.Qualifier, col.Name); err == nil && ci != nil && ci.NoAffinity {
 				stop = false
+			} else if err != nil && col.Qualifier == "" && col.FallbackLiteral != nil {
+				// A double-quoted name that no column answers is the string
+				// literal C rewrites it to (resolve.c:719-745).
+				return affNone, false, 0x02, true
 			}
 		}
 		d := 0x07
@@ -2301,6 +2305,14 @@ type joinPlan struct {
 	buckets     [][]Expr
 	deferred    []Expr
 	autoIdxKeys []*autoIndexKey
+	// consts are the conjuncts coded once before any loop opens, whatever the
+	// tables hold (where_const_terms.go).
+	//
+	// outerConsts are those that read an enclosing query's column: C codes them
+	// the same way, except for the select inside an EXISTS that existsToJoin
+	// turns into a join, where they are tested per outer row. emitJoinLoops
+	// decides which.
+	consts, outerConsts []Expr
 }
 
 // planJoinPushdown computes the binding order and assigns each top-level WHERE
@@ -2314,11 +2326,14 @@ func planJoinPushdown(where Expr, jts []joinedTable, scopes []tableScope) joinPl
 		// could hide a match; a group is one atomic relation that no per-item
 		// level can test against. Conservative, but correct.
 		order, keys := computeExecOrder(jts, scopes, where)
+		consts, outerConsts, rest := splitConstWhereTerms(splitTopLevelAnd(where), scopes, hasGroups(jts))
 		return joinPlan{
 			execOrder:   order,
 			buckets:     make([][]Expr, len(jts)),
-			deferred:    splitTopLevelAnd(where),
+			deferred:    rest,
 			autoIdxKeys: keys,
+			consts:      consts,
+			outerConsts: outerConsts,
 		}
 	}
 
@@ -2351,6 +2366,14 @@ func planJoinPushdown(where Expr, jts []joinedTable, scopes []tableScope) joinPl
 
 	plan := joinPlan{execOrder: execOrder, buckets: make([][]Expr, len(jts)), autoIdxKeys: autoIdxKeys}
 	for _, cj := range conjuncts {
+		if hoist, outer := constWhereTerm(cj, scopes, false); hoist {
+			if outer {
+				plan.outerConsts = append(plan.outerConsts, cj)
+			} else {
+				plan.consts = append(plan.consts, cj)
+			}
+			continue
+		}
 		refs := map[int]bool{}
 		collectTableRefs(cj, scopes, refs)
 		origMax := -1
@@ -2359,7 +2382,7 @@ func planJoinPushdown(where Expr, jts []joinedTable, scopes []tableScope) joinPl
 				origMax = idx
 			}
 		}
-		forceLast := mentionsSubquery(cj)
+		forceLast := mentionsSubquery(cj) && !levelZeroConstTerm(cj, scopes, false)
 		checkIdx := origMax
 		if forceLast && checkIdx < len(jts)-1 {
 			checkIdx = len(jts) - 1

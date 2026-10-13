@@ -138,5 +138,8 @@ type execResult struct {
 
 var _ driver.Result = (*execResult)(nil)
 
+// discardedResult stands in for a Result nobody reads; see Conn.resultDiscarded.
+var discardedResult driver.Result = &execResult{}
+
 func (r *execResult) LastInsertId() (int64, error) { return r.lastInsertID, nil }
 func (r *execResult) RowsAffected() (int64, error) { return r.rowsAffected, nil }

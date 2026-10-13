@@ -29,6 +29,14 @@ const (
 	X15
 	X16
 	X17
+	x18 // the platform register: never used (trampoline_arm64.s)
+	X19
+	X20
+	X21
+	X22
+	X23
+	X24
+	X25
 )
 
 // xzr is the zero register, which shares encoding 31 with the stack pointer.
@@ -495,6 +503,8 @@ func (a *Arm) BcondRaw(code uint32, label string) {
 const (
 	armVS = 0x6 // signed overflow
 	armHI = 0x8 // unsigned higher
+	armHS = 0x2 // unsigned higher or same
+	armLS = 0x9 // unsigned lower or same
 )
 
 // Sdiv emits SDIV Xd, Xn, Xm. It does not trap: a zero divisor gives 0 and

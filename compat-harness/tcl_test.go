@@ -1092,7 +1092,9 @@ func tclSafeExecArgs(godb *engine.Session, stmt string) (execErr error, panicked
 			panicVal = r
 		}
 	}()
+	tclJSBegin()
 	_, _, execErr = godb.ExecArgs(stmt, nil)
+	tclJSEnd(stmt)
 	return
 }
 
@@ -1114,7 +1116,9 @@ func tclSafeGoQuery(godb *engine.Session, stmt string) (cols []string, rows [][]
 		return
 	}
 	defer pager.Close()
+	tclJSBegin()
 	c, v, err := pager.QueryArgs(stmt, nil)
+	tclJSEnd(stmt)
 	if err != nil {
 		queryErr = err
 		return
@@ -1533,7 +1537,7 @@ func tclCompileOptionsBuildIdentity(stmt string) bool {
 	// statement projecting neither (a bare "SELECT 1 FROM ... WHERE 0") yields
 	// a build-independent answer this engine is expected to produce.
 	//
-	// ponytail: syntactic, so "count(*) ... WHERE 0" is still booked out of
+	// A deliberate simplification: syntactic, so "count(*) ... WHERE 0" is still booked out of
 	// scope although it answers 0 everywhere. No corpus statement has that
 	// shape; telling them apart needs the predicate's value, not its spelling.
 	return tclCompileOptionsProjectedRe.MatchString(stmt)
@@ -2564,6 +2568,7 @@ func runTCLSegment(t *testing.T, label string, stmts []string, histogram map[str
 	file, _, _ := strings.Cut(label, "#")
 
 	for i, stmt := range stmts {
+		tclJSKey = fmt.Sprintf("%s|%d", label, i)
 		if noPageCeiling && tclFillsToPageCeiling[file] == stmt {
 			tally.outOfScope++
 			tclNoteOOS(t, "fillsToDeclinedPageCeiling", label, i, stmt)
@@ -3017,6 +3022,11 @@ var tclKnownWrong = map[string]int{}
 // metrics that are expected to grow as the engine gains features; PANIC==0 and
 // "no wrong beyond tclKnownWrong" are the hard gates.
 func TestTCLCorpus(t *testing.T) {
+	defer func() {
+		if err := tclJSWrite(); err != nil {
+			t.Errorf("writing the JIT score: %v", err)
+		}
+	}()
 	files := tclAllFiles(t)
 	if len(files) == 0 {
 		t.Skip("no .test files found under " + tclCorpusDir)

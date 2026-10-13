@@ -38,7 +38,7 @@
 // read. C instead appends a segment per flush and merges later; the two agree
 // on what the index means, not on how many segments it took.
 //
-// ponytail: rebuild-all is O(index) per write statement. The upgrade path is
+// A deliberate simplification: rebuild-all is O(index) per write statement. The upgrade path is
 // appending a level-0 segment per statement and merging, i.e. fts5's own
 // scheduler -- worth doing only once a workload measures it.
 //

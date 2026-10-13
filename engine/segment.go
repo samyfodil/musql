@@ -3,6 +3,7 @@ package engine
 import (
 	"encoding/binary"
 	"fmt"
+	"slices"
 	"unsafe"
 )
 
@@ -117,6 +118,13 @@ func (s *segment) Width(i int) int {
 // (written before an ALTER TABLE ADD COLUMN) contributes NULL for the columns
 // it predates, which is what reading it back through the b-tree yields.
 func buildSegment(cols []columnInfo, rowids []uint64, rows [][]Value) ([]byte, error) {
+	return buildSegmentInto(nil, cols, rowids, rows)
+}
+
+// buildSegmentInto is buildSegment building into dst's memory when it is
+// large enough, for a caller that is done with the previous segment by the
+// time it builds the next (segCutter.reuse).
+func buildSegmentInto(dst []byte, cols []columnInfo, rowids []uint64, rows [][]Value) ([]byte, error) {
 	nRows, nCols := len(rows), len(cols)
 	if len(rowids) != nRows {
 		return nil, fmt.Errorf("segment: %d rowids for %d rows", len(rowids), nRows)
@@ -203,7 +211,30 @@ func buildSegment(cols []columnInfo, rowids []uint64, rows [][]Value) ([]byte, e
 	}
 	blockBytes := off - blocksOff
 	body = make([]byte, blockBytes)
-	heap = make([]byte, 0, heapLen)
+	// THE HEAP IS WRITTEN WHERE IT ENDS UP: its offset is known before a value
+	// is placed -- the blocks and NULL bitmaps before it have fixed sizes -- so
+	// the output is allocated now and the payload copied into it once, rather
+	// than into a heap of its own and then again into the output. The capacity
+	// covers the exception list's and the indexes' worst case too, so neither
+	// regrows it; an exception list larger than its estimate only costs a copy.
+	heapOff := blocksOff + blockBytes
+	idxSlack := 0
+	for c := 0; c < nCols; c++ {
+		if census[c].Null != 0 {
+			heapOff += nullBytes
+		} else if phys[c] != PhysNull {
+			idxSlack += 8 + segIdxHdr + 16*nRows + 8
+		}
+	}
+	heapOff = segAlign8(heapOff)
+	var out []byte
+	if want := heapOff + heapLen + 64 + idxSlack; cap(dst) >= want {
+		out = dst[:blocksOff]
+		clear(out)
+	} else {
+		out = make([]byte, blocksOff, want)
+	}
+	heap = out[heapOff:heapOff:heapOff+heapLen]
 
 	put := func(c, i int, x uint64) {
 		base := int(colDir[c].blockOff) - blocksOff + i*segCellWidth
@@ -318,7 +349,9 @@ func buildSegment(cols []columnInfo, rowids []uint64, rows [][]Value) ([]byte, e
 			size = segAlign8(size) + len(idx[c])
 		}
 	}
-	out := make([]byte, blocksOff, size)
+	if cap(out) < size {
+		out = slices.Grow(out, size-len(out))
+	}
 	for i, rid := range rowids {
 		binary.LittleEndian.PutUint64(out[rowidOff+i*segCellWidth:], uint64(rid))
 		// How many columns this row actually STORED. A row written before an
@@ -342,8 +375,14 @@ func buildSegment(cols []columnInfo, rowids []uint64, rows [][]Value) ([]byte, e
 	for len(out)%8 != 0 { // the heap starts aligned, so its aligned cells are
 		out = append(out, 0)
 	}
-	heapOff := uint32(len(out))
-	out = append(out, heap...)
+	if len(out) != heapOff {
+		return nil, fmt.Errorf("segment: heap at %d, laid out at %d", len(out), heapOff)
+	}
+	if len(heap) > 0 && unsafe.SliceData(heap) == unsafe.SliceData(out[heapOff:cap(out)]) {
+		out = out[:heapOff+len(heap)] // already in place
+	} else {
+		out = append(out, heap...)
+	}
 	excOff := uint32(len(out))
 	out = append(out, excBuf...)
 	for c := 0; c < nCols; c++ {
@@ -361,7 +400,7 @@ func buildSegment(cols []columnInfo, rowids []uint64, rows [][]Value) ([]byte, e
 	binary.LittleEndian.PutUint32(out[4:], segFlagLittleEndian)
 	binary.LittleEndian.PutUint32(out[8:], uint32(nRows))
 	binary.LittleEndian.PutUint32(out[12:], uint32(nCols))
-	binary.LittleEndian.PutUint32(out[16:], heapOff)
+	binary.LittleEndian.PutUint32(out[16:], uint32(heapOff))
 	binary.LittleEndian.PutUint32(out[20:], uint32(len(heap)))
 	binary.LittleEndian.PutUint32(out[24:], excOff)
 	binary.LittleEndian.PutUint32(out[28:], uint32(len(excBuf)))

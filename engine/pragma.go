@@ -921,6 +921,19 @@ func (db *DB) execPragma(sqlText string) error {
 		// copy then comes out at the requested size. Record it so execVacuumInto
 		// can build the copy at that size -- notePageSizeRequest (writer.go)
 		// owns the rule and the oracle evidence.
+		// ...and table_info/table_xinfo discard their rows, but naming a view's
+		// columns resolves its body, so a broken view (unknown or ambiguous name,
+		// missing table) fails the PRAGMA in C. Keep only that diagnosis; what
+		// this engine merely declines stays the accepted no-op it was.
+		if stmt.Name == "table_info" || stmt.Name == "table_xinfo" {
+			p, err := db.SnapshotPager()
+			if err != nil {
+				return err
+			}
+			if _, _, err = p.queryPragmaStmt(stmt); err != nil && !errors.Is(err, errVDBEUnsupported) {
+				return err
+			}
+		}
 		if stmt.Name == "page_size" && stmt.HasValue {
 			db.notePageSizeRequest(stmt.ValueText)
 			// The page size a database was created at is a catalog field
@@ -2528,7 +2541,7 @@ func (db *DB) mainReadTxnOf(sqlText string) mainReadTxn {
 		}
 		return mainReadTxnUnknown
 	}
-	if mainReadTxnTempSensitiveVerb[verb] {
+	if mainReadTxnTempSensitiveVerb(verb) {
 		if db.holdsAnyTempObject() {
 			return mainReadTxnUnknown
 		}
@@ -2537,13 +2550,18 @@ func (db *DB) mainReadTxnOf(sqlText string) mainReadTxn {
 	return mainReadTxnUnknown
 }
 
-// mainReadTxnTempSensitiveVerb is the set of leading verbs whose classification
-// turns on whether this session holds a TEMP object -- mainReadTxnOf's DML/DDL
-// case. It is a named set rather than a switch case because that question has to
-// be asked TWICE, before and after the statement: see mainReadTxnAfter.
-var mainReadTxnTempSensitiveVerb = map[string]bool{
-	"INSERT": true, "REPLACE": true, "UPDATE": true, "DELETE": true,
-	"CREATE": true, "DROP": true, "ALTER": true, "VACUUM": true, "ANALYZE": true,
+// mainReadTxnTempSensitiveVerb reports whether verb is a leading verb whose
+// classification turns on whether this session holds a TEMP object --
+// mainReadTxnOf's DML/DDL case. It is a named function rather than a switch
+// case because that question has to be asked TWICE, before and after the
+// statement: see mainReadTxnAfter. (A switch, not a map: it is asked for every
+// statement, and a map hashed the verb each time.)
+func mainReadTxnTempSensitiveVerb(verb string) bool {
+	switch verb {
+	case "INSERT", "REPLACE", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "VACUUM", "ANALYZE":
+		return true
+	}
+	return false
 }
 
 // mainReadTxnAfter re-asks the TEMP question after the statement ran: the
@@ -2555,7 +2573,7 @@ func (db *DB) mainReadTxnAfter(sqlText string, k mainReadTxn) mainReadTxn {
 	if k != mainReadTxnYes || !db.holdsAnyTempObject() {
 		return k
 	}
-	if verb, ok := db.leadingVerb(strings.TrimSpace(sqlText)); ok && mainReadTxnTempSensitiveVerb[verb] {
+	if verb, ok := db.leadingVerb(strings.TrimSpace(sqlText)); ok && mainReadTxnTempSensitiveVerb(verb) {
 		return mainReadTxnUnknown
 	}
 	return k
@@ -3297,7 +3315,7 @@ func (p *ReadOnlyPager) pragmaTableInfo(scope schemaScope, tableName string, ext
 					// engine's hidden-column sets are not verified against
 					// the oracle's for every module). Declined rather than
 					// silently answering the table_info-shaped subset.
-					return nil, nil, fmt.Errorf("engine: unsupported PRAGMA table_xinfo on eponymous virtual table %s", tableName)
+					return nil, nil, fmt.Errorf("%w: PRAGMA table_xinfo on eponymous virtual table %s", errVDBEUnsupported, tableName)
 				}
 				rows = [][]Value{}
 				cid := 0
@@ -3522,7 +3540,17 @@ func (p *ReadOnlyPager) pragmaViewInfo(vr *SchemaRow, extended bool) (cols []str
 	if err := p.checkTrustedSchemaSelect(vr.Temp, sel); err != nil {
 		return nil, nil, err
 	}
-	scopes, serr := p.subqueryScopes(sel.From)
+	// The view's own WITH clause is in scope for naming its columns, as it is
+	// for sqlite3SelectPrep in sqlite3ViewGetColumnNames.
+	defer p.pushSubqueryCTEs(sel)()
+	// C resolves the whole body first (sqlite3SelectPrep), so an ambiguous or
+	// unknown name anywhere in it fails the PRAGMA; the metadata walk below
+	// only looks at the select list. A body this engine cannot compile is left
+	// to that walk.
+	if _, cerr := compileSubProgram(p, sel, nil); cerr != nil && !errors.Is(cerr, errVDBEUnsupported) {
+		return nil, nil, cerr
+	}
+	scopes, serr := p.subqueryAnalysisScopes(sel.From)
 	if serr != nil {
 		return nil, nil, fmt.Errorf("%w: PRAGMA table_info over view %s: %v", errVDBEUnsupported, vr.Name, serr)
 	}
@@ -3543,9 +3571,30 @@ func (p *ReadOnlyPager) pragmaViewInfo(vr *SchemaRow, extended bool) (cols []str
 		return nil, nil, fmt.Errorf("%w: PRAGMA table_info over view %s: %v", errVDBEUnsupported, vr.Name, oerr)
 	}
 	if pcv.colNames != nil && len(pcv.colNames) != len(outCols) {
-		// C SQLite rejects such a view at CREATE time, so this is defensive.
-		return nil, nil, fmt.Errorf("engine: PRAGMA table_info: view %s has %d columns but its SELECT produces %d",
-			vr.Name, len(pcv.colNames), len(outCols))
+		// The body is resolved all the same, but a "(col, ...)" list of the wrong
+		// length only names the columns: sqlite3ViewGetColumnNames types them
+		// (sqlite3SubqueryColumnTypes) only when the counts agree (build.c:3171).
+		// Using the view is what reports the mismatch, not naming its columns.
+		names, namesOK := r32mUniqueColumnNames(pcv.colNames)
+		if !namesOK {
+			return nil, nil, fmt.Errorf("%w: PRAGMA table_info over view %s: a column name is repeated six or more times (SQLite names the sixth from sqlite3_randomness)", errVDBEUnsupported, vr.Name)
+		}
+		rows = [][]Value{}
+		for i, name := range names {
+			row := []Value{
+				{Typ: Int, I: int64(i)},
+				{Typ: Text, S: []byte(name)},
+				{Typ: Text, S: []byte("")},
+				{Typ: Int, I: 0},
+				{Typ: Null},
+				{Typ: Int, I: 0},
+			}
+			if extended {
+				row = append(row, Value{Typ: Int, I: 0})
+			}
+			rows = append(rows, row)
+		}
+		return cols, rows, nil
 	}
 	// A COMPOUND view's per-column type is folded across every arm; a simple
 	// one's is just its own expression's. Both then run the same declared-type
@@ -3579,14 +3628,15 @@ func (p *ReadOnlyPager) pragmaViewInfo(vr *SchemaRow, extended bool) (cols []str
 		// sqlite3_randomness, so there is nothing to match.
 		return nil, nil, fmt.Errorf("%w: PRAGMA table_info over view %s: a result-column name is repeated six or more times (SQLite names the sixth from sqlite3_randomness)", errVDBEUnsupported, vr.Name)
 	}
+	nested := p.declTypeNestedSelects(sel.From)
 	rows = [][]Value{}
 	for i, oc := range outCols {
 		name := uniqNames[i]
 		typ := ""
 		if folded != nil {
-			typ = p.viewColumnTypeName(scopes, oc.expr, folded[i])
+			typ = p.viewColumnTypeName(scopes, nested, oc.expr, folded[i])
 		} else {
-			typ = p.pragmaViewColumnType(scopes, oc.expr)
+			typ = p.pragmaViewColumnType(scopes, nested, oc.expr)
 		}
 		row := []Value{
 			{Typ: Int, I: int64(i)},
@@ -3616,10 +3666,10 @@ func (p *ReadOnlyPager) pragmaViewInfo(vr *SchemaRow, extended bool) (cols []str
 // columnTypeImpl has two cases: a column reference (its declared type, or
 // INTEGER for rowid) and a subquery (recurse into its first result). Anything
 // else, including CAST and COLLATE, falls to the affinity name.
-func (p *ReadOnlyPager) pragmaViewColumnType(scopes []tableScope, e Expr) string {
+func (p *ReadOnlyPager) pragmaViewColumnType(scopes []tableScope, nested map[string]*SelectStmt, e Expr) string {
 	ctx := &evalCtx{tables: scopes, pager: p}
 	aff, blob := viewColumnAffinity(ctx, e)
-	return p.viewColumnTypeName(scopes, e, compoundColumnType{aff: aff, blob: blob})
+	return p.viewColumnTypeName(scopes, nested, e, compoundColumnType{aff: aff, blob: blob})
 }
 
 // viewColumnTypeName is sqlite3SubqueryColumnTypes' declared-type tail alone,
@@ -3627,12 +3677,12 @@ func (p *ReadOnlyPager) pragmaViewColumnType(scopes []tableScope, e Expr) string
 // computes t across every arm and reuses this, since the tail itself is the
 // same code in SQLite -- "zType = columnType(A0[i])" always names the LEFTMOST
 // arm's expression, in the leftmost arm's own FROM scope.
-func (p *ReadOnlyPager) viewColumnTypeName(scopes []tableScope, arm0 Expr, t compoundColumnType) string {
+func (p *ReadOnlyPager) viewColumnTypeName(scopes []tableScope, nested map[string]*SelectStmt, arm0 Expr, t compoundColumnType) string {
 	if !t.flexnum {
 		// SQLITE_AFF_FLEXNUM is 0x46, which sqlite3AffinityType can never
 		// return, so a FLEXNUM column always fails this test and always ends
 		// up reported as "NUM".
-		if zType, ok := p.viewColumnDeclType(scopes, arm0, 0); ok {
+		if zType, ok := p.viewColumnDeclType(scopes, nested, arm0, 0); ok {
 			// sqlite3AffinityType never returns AFF_NONE either, so a declared
 			// type can only agree with an expression whose own affinity is
 			// real -- or, where this package's affNone stands for AFF_BLOB,
@@ -3695,7 +3745,7 @@ func viewColumnAffinity(ctx *evalCtx, e Expr) (affinity, bool) {
 // SQLite recovers for one result expression, and whether it found one at all.
 // depth bounds the TK_SELECT recursion, which is otherwise unbounded on a
 // mutually-referencing schema.
-func (p *ReadOnlyPager) viewColumnDeclType(scopes []tableScope, e Expr, depth int) (string, bool) {
+func (p *ReadOnlyPager) viewColumnDeclType(scopes []tableScope, nested map[string]*SelectStmt, e Expr, depth int) (string, bool) {
 	if depth > 8 {
 		return "", false
 	}
@@ -3730,6 +3780,14 @@ func (p *ReadOnlyPager) viewColumnDeclType(scopes []tableScope, e Expr, depth in
 			}
 			declared := strings.TrimSpace(ts.cols[idx].DeclType)
 			if declared == "" {
+				// A column of a subquery or view in the FROM carries no declared
+				// type of its own: columnTypeImpl recurses into that SELECT's
+				// matching result expression (select.c:1954).
+				if sel := nestedSelectFor(scopes, nested, ts); sel != nil {
+					if inner, ok := p.selectDeclTypes(sel, depth+1); ok && idx < len(inner) && inner[idx] != "" {
+						return inner[idx], true
+					}
+				}
 				return "", false // sqlite3ColumnType's zDflt is 0 here
 			}
 			if canon, isStd := pragmaStdTypeNames[strings.ToUpper(declared)]; isStd {
@@ -3759,7 +3817,8 @@ func (p *ReadOnlyPager) viewColumnDeclType(scopes []tableScope, e Expr, depth in
 			}
 			core = core.Compound[n-1].Stmt
 		}
-		subScopes, err := p.subqueryScopes(core.From)
+		defer p.pushSubqueryCTEs(core)()
+		subScopes, err := p.subqueryAnalysisScopes(core.From)
 		if err != nil {
 			return "", false
 		}
@@ -3767,10 +3826,23 @@ func (p *ReadOnlyPager) viewColumnDeclType(scopes []tableScope, e Expr, depth in
 		if oerr != nil || len(outCols) == 0 {
 			return "", false
 		}
-		return p.viewColumnDeclType(subScopes, outCols[0].expr, depth+1)
+		return p.viewColumnDeclType(subScopes, p.declTypeNestedSelects(core.From), outCols[0].expr, depth+1)
 	default:
 		return "", false
 	}
+}
+
+// nestedSelectFor is the SELECT behind a scope that is a subquery or view in
+// the FROM (declTypeNestedSelects' map), or nil for a real table. An unaliased
+// derived table is keyed bare, which names it only when it is the sole scope.
+func nestedSelectFor(scopes []tableScope, nested map[string]*SelectStmt, ts tableScope) *SelectStmt {
+	if sel, ok := nested[r33sFoldIdent(ts.name)]; ok {
+		return sel
+	}
+	if len(scopes) == 1 {
+		return nested[declTypeBareKey]
+	}
+	return nil
 }
 
 // isRowidRefIn reports whether x is a bare (or singly-qualified) rowid/oid/
