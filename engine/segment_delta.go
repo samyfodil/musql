@@ -887,8 +887,34 @@ func (p *ReadOnlyPager) segCleanFor(rootPage uint32) bool {
 	if p == nil || p.segs == nil {
 		return false
 	}
-	_, _, clean := p.segs.overlayFor(rootPage)
-	return clean
+	return p.segs.cleanFor(rootPage)
+}
+
+// cleanFor is overlayFor's clean answer without building the overlay, which
+// sorts every delta row: asked once per point read, that made a lookup O(delta).
+func (src *segSource) cleanFor(rootPage uint32) bool {
+	if src.delta == nil {
+		return true
+	}
+	ti, ok := src.tableOf[rootPage]
+	return !ok || src.delta.emptyFor(ti)
+}
+
+// deltaTouches reports whether the delta puts or kills rowid rid of the table at
+// rootPage: when it does not, the segments' copy of that one row is the answer
+// even though the table as a whole is not clean.
+func (src *segSource) deltaTouches(rootPage uint32, rid int64) bool {
+	if src.delta == nil {
+		return false
+	}
+	ti, ok := src.tableOf[rootPage]
+	if !ok || src.delta.emptyFor(ti) {
+		return false
+	}
+	if _, live := src.delta.live[ti][rid]; live {
+		return true
+	}
+	return src.delta.dead[ti][rid]
 }
 
 // readFileIfExists reads a file, treating absence as empty rather than an error --
