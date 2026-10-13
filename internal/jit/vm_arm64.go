@@ -38,7 +38,7 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 const islandBytes = 256 << 10
 
 func emitVMArm(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache, far bool) ([]byte, error) {
-	if lay.OffTyp != 0 || lay.OffI != 8 || lay.OffF != 16 {
+	if lay.OffTyp != 0 || lay.OffI != 8 || lay.OffF != 16 || lay.Size != lay.OffS+24 {
 		// writeInt stores the type as the whole first word -- type, subtype and
 		// padding together -- so the type must lead it.
 		return nil, fmt.Errorf("jit: unexpected Value layout %+v", lay)
@@ -49,13 +49,18 @@ func emitVMArm(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cac
 	}
 	e := &vmEmitArm{a: NewArm(), lay: lay, n: n, stubs: map[int]bool{}, far: far,
 		prog: prog, bound: bound, cache: cache && bound != nil, know: newVMKnow(),
-		holds: map[int]Reg64{}, pinned: map[Reg64]bool{}, fusedStub: map[int]string{}}
+		holds: map[int]Reg64{}, pinned: map[Reg64]bool{}, fusedStub: map[int]string{}, zeroS: map[int]bool{}}
 	e.heads = vmLoopHeads(prog)
 	a := e.a
 
 	a.LdrImm(X1, X0, POffRegs)
 	a.LdrImm(X3, X0, POffPC)
 	a.MovImm64(X2, VMFuel)
+	// The write-barrier flag, read once: it cannot change before this call
+	// returns (wb.go).
+	a.MovImm64(X9, int64(wbFlagAddr))
+	a.LdrbImm(X9, X9, 0)
+	a.StrImm(X9, X0, POffWB)
 	a.Label("dispatch")
 	a.Adr(X9, "tabrel")
 	a.LdrImm(X10, X9, 0) // the table's offset from tabrel
@@ -75,12 +80,15 @@ func emitVMArm(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cac
 			if e.cache && e.heads[pc] {
 				padArm(a, loopAlign)
 			}
-		} else if e.cache && pc < len(entry) && entry[pc] {
+		} else if e.cache && pc < len(entry) && entry[pc] && in.Op != VFused {
+			// (An entry at a fused pair's second pc has a block of its own,
+			// below; the run goes through the pair knowing what it knew.)
 			e.entryPoint(pc)
 		}
 		a.Label(vmBlock(pc))
 		clear(e.pinned)
-		if in.Op == VFused {
+		clear(e.zeroS)
+		if in.Op == VFused && !vmFusedEntry(prog, entry, pc) {
 			// Never entered; should anything dispatch here, the VDBE runs it.
 			e.fusedStub[pc] = e.stub(pc)
 		}
@@ -99,6 +107,39 @@ func emitVMArm(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cac
 	a.Label("end")
 	e.exitAt(n)
 	e.island("")
+	// An entry at a fused pair's second pc runs its test alone, then goes on
+	// at the next pc as on amd64 (vm_amd64.go).
+	for pc, in := range prog {
+		if !vmFusedEntry(prog, entry, pc) {
+			continue
+		}
+		e.fusedStub[pc] = fmt.Sprintf("f%d", pc)
+		a.Label(e.fusedStub[pc])
+		e.forget()
+		clear(e.pinned)
+		clear(e.zeroS)
+		cache := e.cache
+		e.cache = false
+		if err := e.insn(pc, VFusedTest(in)); err != nil {
+			return nil, fmt.Errorf("jit: pc %d: %w", pc, err)
+		}
+		e.cache = cache
+		e.forget()
+		switch {
+		case pc+1 >= n:
+			a.B("end")
+		case vmRunStart(prog, bound, pc+1):
+			e.jmpBlock(pc, pc+1)
+		case pc+1 < len(entry) && entry[pc+1]:
+			a.B(fmt.Sprintf("n%d", pc+1))
+		default:
+			a.B(e.stub(pc + 1))
+		}
+		if (len(a.buf)-islandAt)*4 >= islandBytes {
+			e.island("")
+			islandAt = len(a.buf)
+		}
+	}
 	for _, en := range e.entries {
 		a.Label(fmt.Sprintf("n%d", en.pc))
 		for _, r := range en.ints {
@@ -153,11 +194,17 @@ func padArm(a *Arm, align int) {
 // island emits the exit stubs requested since the last island, after a branch
 // over them to next ("" when nothing falls through).
 func (e *vmEmitArm) island(next string) {
-	if len(e.stubs) == 0 && !e.exitpc {
+	if len(e.stubs) == 0 && !e.exitpc && len(e.cold) == 0 {
 		return
 	}
 	if next != "" {
 		e.a.B(next)
+	}
+	// The cold paths first: they may ask for stubs, which go in this island.
+	cold := e.cold
+	e.cold = nil
+	for _, c := range cold {
+		c()
 	}
 	for pc := range e.stubs {
 		e.a.Label(e.stubLabel(pc))
@@ -191,8 +238,24 @@ type vmEmitArm struct {
 	holds     map[int]Reg64 // see vmEmit.holds
 	pinned    map[Reg64]bool
 	heads     []bool
-	fusedStub map[int]string // a VFused pc's exit stub, which the table points at
+	fusedStub map[int]string // a VFused pc's exit stub or entry block, which the table points at
 	entries   []vmEntryStubArm
+	zeroS     map[int]bool // vmEmit.zeroS
+	cold      []func()     // vmEmit.cold, emitted in the next island
+}
+
+// coldPath is vm_amd64.go's: when reg is non-zero, branch to body, emitted in
+// the next island (within a conditional branch's reach), which jumps back.
+func (e *vmEmitArm) coldPath(reg Reg64, body func()) {
+	e.skips++
+	in, back := fmt.Sprintf("c%d", e.skips), fmt.Sprintf("c%d.back", e.skips)
+	e.a.Cbnz(reg, in)
+	e.a.Label(back)
+	e.cold = append(e.cold, func() {
+		e.a.Label(in)
+		body()
+		e.a.B(back)
+	})
 }
 
 // vmEntryStubArm is vm_amd64.go's vmEntryStub.
@@ -347,6 +410,39 @@ func (e *vmEmitArm) writeInt(reg int, src Reg64) {
 	e.str(X12, reg, 0)
 	e.str(src, reg, e.lay.OffI)
 	e.str(xzr, reg, e.lay.OffF)
+	e.clearS(reg)
+}
+
+// clearS, branchWB and destNoS are vm_amd64.go's.
+func (e *vmEmitArm) clearS(reg int) {
+	if !e.zeroS[reg] {
+		return
+	}
+	delete(e.zeroS, reg)
+	// Only when there is a pointer (vm_amd64.go's clearS); CBZ sets no flags.
+	e.skips++
+	skip := fmt.Sprintf("s%d.cs", e.skips)
+	e.ldr(X12, reg, e.lay.OffS)
+	e.a.Cbz(X12, skip)
+	for k := range 3 {
+		e.str(xzr, reg, e.lay.OffS+8*k)
+	}
+	e.a.Label(skip)
+}
+
+// branchWB exits at pc when the GC's write barrier is on (wb.go). X12.
+func (e *vmEmitArm) branchWB(pc int) {
+	e.a.LdrImm(X12, X0, POffWB)
+	e.a.Cbnz(X12, e.stub(pc))
+}
+
+func (e *vmEmitArm) destNoS(pc, r int) {
+	if e.know.noS[r] || e.zeroS[r] {
+		return
+	}
+	e.ldr(X12, r, e.lay.OffS)
+	e.coldPath(X12, func() { e.branchWB(pc) })
+	e.zeroS[r] = true
 }
 
 // ---- what the emitter keeps between steps: vm_amd64.go's, on arm64 ---------
@@ -499,7 +595,7 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 			e.clobber(in.A)
 			break
 		}
-		e.needNoS(pc, in.A)
+		e.destNoS(pc, in.A)
 		m := e.dest(pc, in.A, X10)
 		a.MovImm64(m, in.Imm)
 		e.storeInt(in, in.A, m)
@@ -508,8 +604,12 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 			e.clobber(in.B)
 			break
 		}
+		if in.Imm != 0 && !e.know.noS[in.A] {
+			e.copyAny(pc, in)
+			break
+		}
 		e.needNoS(pc, in.A)
-		e.needNoS(pc, in.B)
+		e.destNoS(pc, in.B)
 		if e.know.canon[in.A] && in.A != in.B {
 			m := e.src(pc, in.A, X10)
 			if e.know.canon[in.B] {
@@ -528,10 +628,11 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 			e.ldr(X9, in.A, f)
 			e.str(X9, in.B, f)
 		}
+		e.clearS(in.B)
 		if in.A != in.B {
 			isInt := e.know.isInt[in.A]
 			e.unmap(in.B)
-			e.know.wroteAny(in.B)
+			e.know.wroteAny(in.B, true)
 			if isInt {
 				e.know.isInt[in.B] = true
 			}
@@ -543,7 +644,7 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		y := e.src(pc, in.A, X10)
 		b := e.src(pc, in.B, X9)
 		if !in.Dead {
-			e.needNoS(pc, in.C)
+			e.destNoS(pc, in.C)
 		}
 		x := X9
 		if m, ok := e.inPlace(pc, in.B); ok && m == b && in.A != in.B {
@@ -577,7 +678,7 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		a.BcondRaw(armHI, e.stub(pc)) // unsigned: a negative amount is huge
 		b := e.src(pc, in.B, X9)
 		if !in.Dead {
-			e.needNoS(pc, in.C)
+			e.destNoS(pc, in.C)
 		}
 		x := e.dest(pc, in.C, X9)
 		if in.Op == VShl {
@@ -590,7 +691,7 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		y := e.src(pc, in.A, X10)
 		b := e.src(pc, in.B, X9)
 		if !in.Dead {
-			e.needNoS(pc, in.C)
+			e.destNoS(pc, in.C)
 		}
 		// A divisor of 0 (NULL) or -1 (the one overflow) is the VDBE's.
 		a.Cbz(y, e.stub(pc))
@@ -614,7 +715,7 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		x := e.src(pc, in.B, X9)
 		y := e.src(pc, in.A, X10)
 		if !in.Dead {
-			e.needNoS(pc, in.C)
+			e.destNoS(pc, in.C)
 		}
 		a.Cmp(x, y)
 		if !in.Dead {
@@ -634,7 +735,7 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 	case VNot, VNotBr:
 		x := e.src(pc, in.A, X9)
 		if !in.Dead {
-			e.needNoS(pc, in.C)
+			e.destNoS(pc, in.C)
 		}
 		a.CmpImm(x, 0)
 		if !in.Dead {
@@ -670,16 +771,17 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 			e.clobber(in.C)
 			break
 		}
-		e.needNoS(pc, in.C)
+		e.destNoS(pc, in.C)
 		e.str(xzr, in.C, 0)
 		e.str(xzr, in.C, L.OffI)
 		e.str(xzr, in.C, L.OffF)
+		e.clearS(in.C)
 		e.unmap(in.C)
-		e.know.wroteAny(in.C)
+		e.know.wroteAny(in.C, true)
 	case VNeg:
 		y := e.src(pc, in.A, X10)
 		if !in.Dead {
-			e.needNoS(pc, in.C)
+			e.destNoS(pc, in.C)
 		}
 		x := X9
 		if m, ok := e.inPlace(pc, in.A); ok && m == y {
@@ -724,7 +826,7 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		}
 		a.Label(done)
 	case VGosub:
-		e.needNoS(pc, in.A)
+		e.destNoS(pc, in.A)
 		a.MovImm64(X10, int64(pc))
 		e.writeInt(in.A, X10)
 		e.jmpBlock(pc, in.T)
@@ -741,6 +843,8 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		a.B("dispatch")
 	case VColumn:
 		e.column(pc, in)
+	case VResultRow:
+		e.resultRow(pc, in)
 	case VRewind:
 		e.unmap(^in.A)
 		cb := in.A * VCursorSize
@@ -828,9 +932,22 @@ func (e *vmEmitArm) column(pc int, in VInsn) {
 		}
 		a.LdrImm(row, X10, 0) // the row's first Value
 	}
-	e.ldrAt(X11, row, vb+L.OffS)
-	a.Cbnz(X11, e.stub(pc))
-	e.needNoS(pc, in.C)
+	// A string or blob is copied with its pointer, as on amd64.
+	// The destination's first: a far register's load goes through X11.
+	if !e.know.noS[in.C] {
+		e.ldr(X12, in.C, L.OffS)
+		e.ldrAt(X11, row, vb+L.OffS)
+		a.OrrReg(X11, X11, X12)
+	} else {
+		e.ldrAt(X11, row, vb+L.OffS)
+	}
+	e.coldPath(X11, func() {
+		e.branchWB(pc)
+		for _, f := range []int{L.OffS, L.OffS + 8, L.OffS + 16} {
+			e.ldrAt(X12, row, vb+f)
+			e.str(X12, in.C, f)
+		}
+	})
 	val := X9
 	if u := e.nextUse(in.C, pc); u >= 0 {
 		if m, ok := e.alloc(pc, u); ok {
@@ -849,8 +966,121 @@ func (e *vmEmitArm) column(pc int, in VInsn) {
 		}
 	}
 	e.unmap(in.C)
-	e.know.wroteAny(in.C)
+	e.know.wroteAny(in.C, false)
 	if val != X9 {
 		e.holds[in.C] = val
 	}
+}
+
+// copyAny is vm_amd64.go's: VCopy of any Value, its pointer shared.
+func (e *vmEmitArm) copyAny(pc int, in VInsn) {
+	a, L := e.a, e.lay
+	if in.A == in.B {
+		return // a copy onto itself changes nothing
+	}
+	// B's first: a far register's load goes through X11.
+	if !e.know.noS[in.B] {
+		e.ldr(X12, in.B, L.OffS)
+	}
+	e.ldr(X11, in.A, L.OffS)
+	if !e.know.noS[in.B] {
+		a.OrrReg(X11, X11, X12)
+	}
+	e.coldPath(X11, func() {
+		e.branchWB(pc)
+		for _, f := range []int{L.OffS, L.OffS + 8, L.OffS + 16} {
+			e.ldr(X9, in.A, f)
+			e.str(X9, in.B, f)
+		}
+	})
+	for _, f := range []int{0, L.OffI, L.OffF} {
+		e.ldr(X9, in.A, f)
+		e.str(X9, in.B, f)
+	}
+	isInt := e.know.isInt[in.A]
+	e.unmap(in.B)
+	e.know.wroteAny(in.B, false)
+	if isInt {
+		e.know.isInt[in.B] = true
+	}
+	if m, ok := e.holds[in.A]; ok {
+		e.holds[in.B] = m
+	}
+}
+
+// resultRow is vm_amd64.go's. X9-X13 are scratch: nothing is kept across it.
+func (e *vmEmitArm) resultRow(pc int, in VInsn) {
+	a, L := e.a, e.lay
+	e.branchWB(pc)
+	e.skips++
+	gather := fmt.Sprintf("s%d.rg", e.skips)
+	a.LdrImm(X9, X0, POffRowsBuf)
+	a.Cbnz(X9, gather)
+
+	// One row, handed over.
+	a.LdrImm(X10, X0, POffRowCap)
+	a.MovImm64(X11, int64(in.B))
+	a.Cmp(X10, X11)
+	a.Bcond(CondL, e.stub(pc))
+	if in.B > 0 {
+		a.LdrImm(X10, X0, POffRowBuf)
+		e.copyRow(in, X10)
+	}
+	a.MovImm64(X12, int64(in.B+1))
+	a.StrImm(X12, X0, POffYield)
+	a.MovImm64(X12, int64(pc+1))
+	a.StrImm(X12, X0, POffPC)
+	a.Ret()
+
+	// Rows gathered; an empty row is the VDBE's.
+	a.Label(gather)
+	if in.B == 0 {
+		a.B(e.stub(pc))
+		return
+	}
+	a.LdrImm(X10, X0, POffYield)
+	a.LdrImm(X11, X0, POffRowsCap)
+	a.Cmp(X10, X11)
+	a.Bcond(CondGE, e.stub(pc))
+	a.LdrImm(X11, X0, POffRowUsed)
+	a.LdrImm(X12, X0, POffRowCap)
+	a.SubsReg(X12, X12, X11)
+	a.MovImm64(X13, int64(in.B))
+	a.Cmp(X12, X13)
+	a.Bcond(CondL, e.stub(pc))
+	a.MovImm64(X12, int64(L.Size))
+	a.Mul(X12, X11, X12)
+	a.LdrImm(X13, X0, POffRowBuf)
+	a.AddReg(X13, X13, X12) // the row's first Value
+	a.MovImm64(X12, sliceHeaderSize)
+	a.Mul(X12, X10, X12)
+	a.AddReg(X9, X9, X12) // its header
+	a.StrImm(X13, X9, 0)
+	a.MovImm64(X12, int64(in.B))
+	a.StrImm(X12, X9, 8)
+	a.StrImm(X12, X9, 16)
+	a.AddImm(X10, X10, 1)
+	a.StrImm(X10, X0, POffYield)
+	a.AddReg(X11, X11, X12)
+	a.StrImm(X11, X0, POffRowUsed)
+	e.copyRow(in, X13)
+	// Falls into the next pc's block, which starts a run.
+}
+
+// copyRow copies the B registers from A, word by word, to dst onward. X9,
+// X11 and X12 are scratch.
+func (e *vmEmitArm) copyRow(in VInsn, dst Reg64) {
+	a, L := e.a, e.lay
+	a.MovImm64(X9, int64(e.off(in.A, 0)))
+	a.AddReg(X9, X1, X9)
+	a.MovImm64(X11, int64(in.B*L.Size/8))
+	e.skips++
+	loop := fmt.Sprintf("s%d.rr", e.skips)
+	a.Label(loop)
+	a.LdrImm(X12, X9, 0)
+	a.StrImm(X12, dst, 0)
+	a.AddImm(X9, X9, 8)
+	a.AddImm(dst, dst, 8)
+	a.SubsImm(X11, X11, 1)
+	a.Bcond(CondNE, loop)
 }

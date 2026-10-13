@@ -5,6 +5,7 @@ package jit
 import (
 	"fmt"
 	"math"
+	"slices"
 )
 
 const (
@@ -44,7 +45,25 @@ const MaxVMWasmBytes = 6 << 20
 // in machine registers itself, so a guard or a full write known to be
 // redundant is what there is to skip.
 func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache bool) ([]byte, error) {
-	// No entry stubs here: an entry starts a run, like a jump target.
+	// No entry stubs here: an entry starts a run, like a jump target. So a
+	// fused pair whose second pc is an entry is unfused again -- the store of
+	// the comparison made, the test its own instruction -- which is what an
+	// entry there needs and costs the run nothing it could keep anyway.
+	if entry != nil && slices.ContainsFunc(prog, func(in VInsn) bool { return in.Op == VFused }) {
+		prog = slices.Clone(prog)
+		for pc := 1; pc < len(prog); pc++ {
+			if !vmFusedEntry(prog, entry, pc) {
+				continue
+			}
+			f := prog[pc-1]
+			op := VCmpSet
+			if f.Op == VNotBr {
+				op = VNot
+			}
+			prog[pc-1] = VInsn{Op: op, A: f.A, B: f.B, C: f.C, Cond: f.Cond}
+			prog[pc] = VFusedTest(prog[pc])
+		}
+	}
 	if bound != nil && entry != nil {
 		b := append([]bool(nil), bound...)
 		for pc := range min(len(entry), len(b)) {
@@ -52,17 +71,25 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 		}
 		bound = b
 	}
-	if lay.OffTyp != 0 || lay.OffI != 8 || lay.OffF != 16 {
+	if lay.OffTyp != 0 || lay.OffI != 8 || lay.OffF != 16 || lay.Size != lay.OffS+24 {
 		return nil, fmt.Errorf("jit: unexpected Value layout %+v", lay)
 	}
 	n := len(prog)
 	if int64(nReg)*int64(lay.Size) > 1<<30 {
 		return nil, fmt.Errorf("jit: %d registers", nReg)
 	}
-	e := &vmEmitWasm{w: &Wasm{}, lay: lay, n: n, prog: prog, bound: bound, cache: cache && bound != nil, know: newVMKnow()}
+	e := &vmEmitWasm{w: &Wasm{}, lay: lay, n: n, prog: prog, bound: bound, cache: cache && bound != nil, know: newVMKnow(),
+		zeroS: map[int]bool{}}
 	w := e.w
 	e.regs, e.pc, e.fuel = w.Local(wI32), w.Local(wI32), w.Local(wI64)
 	e.t1, e.t2, e.t3, e.ovf = w.Local(wI64), w.Local(wI64), w.Local(wI64), w.Local(wI64)
+	e.wb, e.rb = w.Local(wI32), w.Local(wI32)
+	// The write-barrier flag, read once: it cannot change before this call
+	// returns (wb.go).
+	w.I32(int32(wbFlagAddr))
+	w.op(opI32Load8U)
+	w.memarg(0, 0)
+	w.Set(e.wb)
 	for _, in := range prog {
 		if in.Op == VColumn || in.Op == VNext || in.Op == VRewind {
 			e.curs, e.rowp, e.valp = w.Local(wI32), w.Local(wI32), w.Local(wI32)
@@ -140,6 +167,10 @@ type vmEmitWasm struct {
 	bound []bool
 	cache bool
 	know  *vmKnow
+	// wb is the write-barrier flag the prologue read; rb a row buffer's
+	// address (VResultRow). zeroS is vmEmit.zeroS.
+	wb, rb uint32
+	zeroS  map[int]bool
 }
 
 // Within pc's code the enclosing blocks are those of pc+1 .. n-1, then the
@@ -231,12 +262,59 @@ func (e *vmEmitWasm) noS(reg int) guard {
 	return hasS(reg)
 }
 
-// dstNoS is noS for an instruction's destination, nil when its store is Dead.
+// dstNoS readies an instruction's destination to be overwritten (vm_amd64.go's
+// destNoS): it fails when r[reg] holds a string or blob and the write barrier
+// is on, and with it off the store clears the pointer. nil when its store is
+// Dead or r[reg] is known to hold no pointer.
 func (e *vmEmitWasm) dstNoS(in VInsn, reg int) guard {
-	if in.Dead {
+	if in.Dead || e.know.noS[reg] || e.zeroS[reg] {
 		return nil
 	}
-	return e.noS(reg)
+	e.zeroS[reg] = true
+	return func(e *vmEmitWasm) {
+		hasS(reg)(e)
+		e.w.Get(e.wb)
+		e.w.op(opI32And)
+	}
+}
+
+// clearS clears r[reg]'s string or blob when dstNoS said the store must.
+func (e *vmEmitWasm) clearS(reg int) {
+	if !e.zeroS[reg] {
+		return
+	}
+	delete(e.zeroS, reg)
+	// Only when there is a pointer (vm_amd64.go's clearS).
+	e.loadI64(reg, e.lay.OffS)
+	e.w.op(opI64Eqz)
+	e.w.op(opI32Eqz)
+	e.openIf()
+	for k := range 3 {
+		e.w.Get(e.regs)
+		e.w.I64(0)
+		e.w.StoreI64(e.addr(reg, e.lay.OffS+8*k))
+	}
+	e.closeIf()
+}
+
+// pointerWords copies a Value word by word (copy(f) for each word f), given
+// on the stack the OR of the source's and the destination's string pointers:
+// when it is non-zero, it exits at pc with the write barrier on, and copies
+// the S words with it off; the other three words either way.
+func (e *vmEmitWasm) pointerWords(pc int, copy func(f int)) {
+	w, L := e.w, e.lay
+	w.op(opI64Eqz)
+	w.op(opI32Eqz)
+	e.openIf()
+	w.Get(e.wb)
+	e.exitIf(pc)
+	for _, f := range []int{L.OffS, L.OffS + 8, L.OffS + 16} {
+		copy(f)
+	}
+	e.closeIf()
+	for _, f := range []int{0, L.OffI, L.OffF} {
+		copy(f)
+	}
 }
 
 // forgetReg records that r[reg] changed other than by storeInt.
@@ -275,6 +353,7 @@ func (e *vmEmitWasm) writeInt(reg int, src uint32) {
 	w.Get(e.regs)
 	w.I64(0)
 	w.StoreI64(e.addr(reg, e.lay.OffF))
+	e.clearS(reg)
 }
 
 // jump goes to target unconditionally: a br for a forward block, the
@@ -335,6 +414,7 @@ func (e *vmEmitWasm) closeIf() { e.w.op(opEnd); e.extra-- }
 func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 	w, L := e.w, e.lay
 	e.cur, e.extra = pc, 0
+	clear(e.zeroS)
 	switch in.Op {
 	case VExit:
 		e.exitAt(pc)
@@ -347,7 +427,7 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 			e.forgetReg(in.A)
 			break
 		}
-		e.guards(pc, e.noS(in.A))
+		e.guards(pc, e.dstNoS(in, in.A))
 		w.I64(in.Imm)
 		w.Set(e.t1)
 		e.storeInt(in, in.A, e.t1)
@@ -356,7 +436,11 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 			e.forgetReg(in.B)
 			break
 		}
-		e.guards(pc, e.noS(in.A), e.noS(in.B))
+		if in.Imm != 0 && !e.know.noS[in.A] {
+			e.copyAny(pc, in)
+			break
+		}
+		e.guards(pc, e.noS(in.A), e.dstNoS(in, in.B))
 		if e.know.canon[in.A] && in.A != in.B {
 			e.loadI64(in.A, L.OffI)
 			w.Set(e.t1)
@@ -368,9 +452,10 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 			e.loadI64(in.A, f)
 			w.StoreI64(e.addr(in.B, f))
 		}
+		e.clearS(in.B)
 		if in.A != in.B {
 			isInt := e.know.isInt[in.A]
-			e.know.wroteAny(in.B)
+			e.know.wroteAny(in.B, true)
 			if isInt {
 				e.know.isInt[in.B] = true
 			}
@@ -503,13 +588,14 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 			e.forgetReg(in.C)
 			break
 		}
-		e.guards(pc, e.noS(in.C))
+		e.guards(pc, e.dstNoS(in, in.C))
 		for _, f := range []int{0, L.OffI, L.OffF} {
 			w.Get(e.regs)
 			w.I64(0)
 			w.StoreI64(e.addr(in.C, f))
 		}
-		e.know.wroteAny(in.C)
+		e.clearS(in.C)
+		e.know.wroteAny(in.C, true)
 	case VNeg:
 		e.guards(pc, e.isInt(in.A), e.dstNoS(in, in.C))
 		e.loadI64(in.A, L.OffI)
@@ -555,7 +641,7 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		e.jumpIf(in.T)
 		e.closeIf()
 	case VGosub:
-		e.guards(pc, e.noS(in.A))
+		e.guards(pc, e.dstNoS(VInsn{}, in.A))
 		w.I64(int64(pc))
 		w.Set(e.t1)
 		e.writeInt(in.A, e.t1)
@@ -614,19 +700,22 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		w.LoadI64(0)
 		w.op(opI32WrapI64)
 		w.Set(e.valp)
+		// A string or blob is copied with its pointer, as on amd64.
 		w.Get(e.valp)
 		w.LoadI64(vb + uint32(L.OffS))
-		w.op(opI64Eqz)
-		w.op(opI32Eqz)
-		e.exitIf(pc)
-		e.guards(pc, e.noS(in.C))
-		for _, f := range []int{0, L.OffI, L.OffF} {
+		if !e.know.noS[in.C] {
+			e.loadI64(in.C, L.OffS)
+			w.op(opI64Or)
+		}
+		e.pointerWords(pc, func(f int) {
 			w.Get(e.regs)
 			w.Get(e.valp)
 			w.LoadI64(vb + uint32(f))
 			w.StoreI64(e.addr(in.C, f))
-		}
-		e.know.wroteAny(in.C)
+		})
+		e.know.wroteAny(in.C, false)
+	case VResultRow:
+		e.resultRow(pc, in)
 	case VRewind:
 		cb := uint32(in.A * VCursorSize)
 		w.Get(e.curs)
@@ -689,4 +778,146 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		return fmt.Errorf("unknown VM op %d", in.Op)
 	}
 	return nil
+}
+
+// copyAny is vm_amd64.go's: VCopy of any Value, its pointer shared.
+func (e *vmEmitWasm) copyAny(pc int, in VInsn) {
+	w, L := e.w, e.lay
+	if in.A == in.B {
+		return // a copy onto itself changes nothing
+	}
+	e.loadI64(in.A, L.OffS)
+	if !e.know.noS[in.B] {
+		e.loadI64(in.B, L.OffS)
+		w.op(opI64Or)
+	}
+	e.pointerWords(pc, func(f int) {
+		w.Get(e.regs)
+		e.loadI64(in.A, f)
+		w.StoreI64(e.addr(in.B, f))
+	})
+	isInt := e.know.isInt[in.A]
+	e.know.wroteAny(in.B, false)
+	if isInt {
+		e.know.isInt[in.B] = true
+	}
+}
+
+// vmWasmRowMax bounds the registers a VResultRow copies, unrolled, on wasm; a
+// wider row exits to the VDBE.
+const vmWasmRowMax = 32
+
+// resultRow is vm_amd64.go's: the row handed over or gathered.
+func (e *vmEmitWasm) resultRow(pc int, in VInsn) {
+	w, L := e.w, e.lay
+	if in.B > vmWasmRowMax {
+		e.exitAt(pc)
+		return
+	}
+	w.Get(e.wb)
+	e.exitIf(pc)
+	w.Get(0)
+	w.LoadI64(POffRowsBuf)
+	w.op(opI64Eqz)
+	e.openIf()
+	// One row, handed over.
+	w.Get(0)
+	w.LoadI64(POffRowCap)
+	w.I64(int64(in.B))
+	w.op(opI64LtS)
+	e.exitIf(pc)
+	if in.B > 0 {
+		w.Get(0)
+		w.LoadI64(POffRowBuf)
+		w.op(opI32WrapI64)
+		w.Set(e.rb)
+		e.copyRow(in)
+	}
+	w.Get(0)
+	w.I64(int64(in.B + 1))
+	w.StoreI64(POffYield)
+	w.Get(0)
+	w.I64(int64(pc + 1))
+	w.StoreI64(POffPC)
+	w.op(opReturn)
+	e.closeIf()
+
+	// Rows gathered; an empty row is the VDBE's.
+	if in.B == 0 {
+		e.exitAt(pc)
+		return
+	}
+	w.Get(0)
+	w.LoadI64(POffYield)
+	w.Set(e.t1)
+	w.Get(0)
+	w.LoadI64(POffRowUsed)
+	w.Set(e.t2)
+	w.Get(e.t1)
+	w.Get(0)
+	w.LoadI64(POffRowsCap)
+	w.op(opI64LtS)
+	w.op(opI32Eqz) // no header left
+	w.Get(0)
+	w.LoadI64(POffRowCap)
+	w.Get(e.t2)
+	w.op(opI64Sub)
+	w.I64(int64(in.B))
+	w.op(opI64LtS) // too few Values left
+	w.op(opI32Or)
+	e.exitIf(pc)
+	// The header at RowsBuf + Yield*24: {the row, B, B}.
+	w.Get(0)
+	w.LoadI64(POffRowsBuf)
+	w.Get(e.t1)
+	w.I64(sliceHeaderSize)
+	w.op(opI64Mul)
+	w.op(opI64Add)
+	w.op(opI32WrapI64)
+	w.Set(e.rb)
+	w.Get(e.rb)
+	w.Get(0)
+	w.LoadI64(POffRowBuf)
+	w.Get(e.t2)
+	w.I64(int64(L.Size))
+	w.op(opI64Mul)
+	w.op(opI64Add)
+	w.StoreI64(0)
+	for _, off := range []uint32{8, 16} {
+		w.Get(e.rb)
+		w.I64(int64(in.B))
+		w.StoreI64(off)
+	}
+	w.Get(0)
+	w.Get(e.t1)
+	w.I64(1)
+	w.op(opI64Add)
+	w.StoreI64(POffYield)
+	w.Get(0)
+	w.Get(e.t2)
+	w.I64(int64(in.B))
+	w.op(opI64Add)
+	w.StoreI64(POffRowUsed)
+	// The row itself.
+	w.Get(0)
+	w.LoadI64(POffRowBuf)
+	w.Get(e.t2)
+	w.I64(int64(L.Size))
+	w.op(opI64Mul)
+	w.op(opI64Add)
+	w.op(opI32WrapI64)
+	w.Set(e.rb)
+	e.copyRow(in)
+	// Falls into the next pc's code, which starts a run.
+}
+
+// copyRow copies the B registers from A, unrolled, to the address in rb.
+func (e *vmEmitWasm) copyRow(in VInsn) {
+	w, L := e.w, e.lay
+	for k := 0; k < in.B*L.Size; k += 8 {
+		w.Get(e.rb)
+		w.Get(e.regs)
+		w.LoadI64(e.addr(in.A, k))
+		w.StoreI64(uint32(k))
+	}
 }

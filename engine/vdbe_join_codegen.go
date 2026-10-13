@@ -24,6 +24,7 @@ package engine
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -279,10 +280,13 @@ func identityOrder(n int) []int {
 // Both are optimizations, so this is never wrong.
 func buildJoinPlan(srcs []joinSource, where Expr) joinPlan {
 	if groupPresent(srcs) {
+		consts, outerConsts, rest := splitConstWhereTerms(splitTopLevelAnd(where), tableScopesOf(srcs), true)
 		return joinPlan{
-			execOrder: identityOrder(len(srcs)),
-			buckets:   make([][]Expr, len(srcs)),
-			deferred:  splitTopLevelAnd(where),
+			execOrder:   identityOrder(len(srcs)),
+			buckets:     make([][]Expr, len(srcs)),
+			deferred:    rest,
+			consts:      consts,
+			outerConsts: outerConsts,
 		}
 	}
 	return joinPushdownPlan(srcs, tableScopesOf(srcs), where)
@@ -2702,6 +2706,32 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 		}
 		c.emit(Instruction{Op: OpAutoIndexOrder, P1: srcs[plan.execOrder[level]].scope.cursor, P4: key})
 	}
+	// The constant WHERE terms, once, before the first loop: a false or NULL
+	// one leaves every loop (and RIGHT/FULL sweep) without scanning, and an
+	// error one is raised for an empty table too (where_const_terms.go).
+	consts := plan.consts
+	if c.outer != nil && c.outer.existsJoin {
+		// The select of an EXISTS that C turns into a join: its terms that
+		// name only the enclosing query are tested per outer row there, not
+		// at the start of this subquery.
+		if len(plan.outerConsts) > 0 && len(plan.buckets) > 0 {
+			plan.buckets = slices.Clone(plan.buckets)
+			plan.buckets[0] = append(slices.Clone(plan.buckets[0]), plan.outerConsts...)
+		} else {
+			consts = append(slices.Clone(consts), plan.outerConsts...)
+		}
+	} else {
+		consts = append(slices.Clone(consts), plan.outerConsts...)
+	}
+	var constJumps []int
+	for _, cj := range consts {
+		c.inWhereConjunct = true
+		reg, err := c.compileExpr(cj)
+		if err != nil {
+			return err
+		}
+		constJumps = append(constJumps, c.emit(Instruction{Op: OpIfNot, P1: reg, P3: 1}))
+	}
 	if err := c.emitJoinLevel(srcs, plan, 0, body); err != nil {
 		return err
 	}
@@ -2717,6 +2747,9 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 				return err
 			}
 		}
+	}
+	for _, j := range constJumps {
+		c.patch(j, c.here())
 	}
 	for i := len(srcs) - 1; i >= 0; i-- {
 		c.emit(Instruction{Op: OpClose, P1: srcs[i].scope.cursor})
@@ -2841,6 +2874,9 @@ func (c *compiler) emitJoinLevel(srcs []joinSource, plan joinPlan, level int, bo
 			defer func() { c.hoist.narrowed = false }()
 		}
 		defer func() { c.scopes = saved }()
+		savedNoSimplify := c.noAndOrSimplify
+		c.noAndOrSimplify = true
+		defer func() { c.noAndOrSimplify = savedNoSimplify }()
 		// An outer join's ON is still a top-level WHERE AND-conjunct in C's sense:
 		// sqlite3ProcessJoin ANDs every ON into the WHERE (select.c:655) before the
 		// vector-equality rewrite runs (where.c:6941, 6990). So it compiles with

@@ -80,7 +80,10 @@ func TestSegmentConcurrentWritersLoseNothing(t *testing.T) {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
-			db, oerr := sql.Open(DriverName, path) // its own pool, like a separate process
+			// Its own pool, like a separate process. Four writers contend for one
+			// lock, and a slow runner (Windows CI) can keep one waiting past the
+			// default 5s busy timeout; the test is about lost rows, not waiting.
+			db, oerr := sql.Open(DriverName, "file:"+path+"?_pragma=busy_timeout(60000)")
 			if oerr != nil {
 				errs <- oerr
 				return

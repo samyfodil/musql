@@ -3,9 +3,21 @@
 package jit
 
 import (
+	"runtime"
+	"runtime/debug"
 	"testing"
 	"unsafe"
 )
+
+// noGC holds the collector off for the rest of t, after one collection: the
+// write barrier is then off, deterministically, and native code takes its
+// fast path for every pointer store.
+func noGC(t *testing.T) {
+	t.Helper()
+	old := debug.SetGCPercent(-1)
+	runtime.GC()
+	t.Cleanup(func() { debug.SetGCPercent(old) })
+}
 
 // tvalue is a Value as the engine lays it out (48 bytes: the type and subtype
 // in the first word, then I, F and the S slice header).
@@ -129,7 +141,6 @@ func TestVMCursorColumnAndNext(t *testing.T) {
 		}
 	})
 	t.Run("what exits leaves the registers alone", func(t *testing.T) {
-		text := []byte("abc")
 		cases := []struct {
 			name string
 			rows [][]tvalue
@@ -137,7 +148,6 @@ func TestVMCursorColumnAndNext(t *testing.T) {
 			ok   int64
 			col  int
 		}{
-			{"a text value", [][]tvalue{{{Typ: tvText, S: text}}}, 0, 1, 0},
 			{"a column past the row", [][]tvalue{{{Typ: tvInt}}}, 0, 1, 1},
 			{"before the first row", [][]tvalue{{{Typ: tvInt}}}, -1, 1, 0},
 			{"past the last row", [][]tvalue{{{Typ: tvInt}}}, 1, 1, 0},
@@ -177,16 +187,55 @@ func TestVMCursorColumnAndNext(t *testing.T) {
 			t.Fatalf("pc %d pos %d dirty %d, want the cursor untouched at pc 0", pc, cur.Pos, cur.Dirty)
 		}
 	})
-	t.Run("a destination holding a string is not written", func(t *testing.T) {
-		rows := newRows(1)
+	t.Run("a text value is copied with its pointer", func(t *testing.T) {
+		noGC(t)
+		text := []byte("abc")
+		rows := [][]tvalue{{{Typ: tvText, Sub: 74, S: text}}}
 		regs := newRegs()
-		regs[0] = tvalue{Typ: tvText, S: []byte("x")}
-		cur := cursor(rows, 0)
-		if pc := runVMCursor(t, []VInsn{{Op: VColumn, A: 0, B: 0, C: 0}, {Op: VExit}}, regs, rows, cur, 0); pc != 0 {
+		regs[0] = tvalue{Typ: tvInt, I: 7}
+		if pc := runVMCursor(t, []VInsn{{Op: VColumn, A: 0, B: 0, C: 0}, {Op: VExit}}, regs, rows, cursor(rows, 0), 0); pc != 1 {
 			t.Fatalf("pc %d", pc)
 		}
-		if string(regs[0].S) != "x" {
+		if regs[0].Typ != tvText || regs[0].Sub != 74 || regs[0].I != 0 || len(regs[0].S) != 3 || cap(regs[0].S) != cap(text) || &regs[0].S[0] != &text[0] {
 			t.Fatalf("r0 = %+v", regs[0])
+		}
+	})
+	t.Run("a destination holding a string is overwritten whole", func(t *testing.T) {
+		noGC(t)
+		rows := newRows(2)
+		regs := newRegs()
+		regs[0] = tvalue{Typ: tvText, S: []byte("x")}
+		if pc := runVMCursor(t, []VInsn{{Op: VColumn, A: 0, B: 1, C: 0}, {Op: VExit}}, regs, rows, cursor(rows, 1), 0); pc != 1 {
+			t.Fatalf("pc %d", pc)
+		}
+		if regs[0].Typ != tvInt || regs[0].I != 10 || regs[0].S != nil || cap(regs[0].S) != 0 {
+			t.Fatalf("r0 = %+v", regs[0])
+		}
+	})
+	t.Run("with the write barrier on, a pointer read or overwritten exits", func(t *testing.T) {
+		defer ForceWriteBarrierOnForTest()()
+		text := []byte("abc")
+		for _, c := range []struct {
+			name string
+			dst  tvalue
+			src  tvalue
+		}{
+			{"a text column", tvalue{Typ: tvInt, I: 7}, tvalue{Typ: tvText, S: text}},
+			{"over a text register", tvalue{Typ: tvText, S: []byte("x")}, tvalue{Typ: tvInt, I: 3}},
+		} {
+			rows := [][]tvalue{{c.src}}
+			regs := newRegs()
+			regs[0] = c.dst
+			pc := runVMCursor(t, []VInsn{{Op: VColumn, A: 0, B: 0, C: 0}, {Op: VExit}}, regs, rows, cursor(rows, 0), 0)
+			if pc != 0 || regs[0].Typ != c.dst.Typ || regs[0].I != c.dst.I || string(regs[0].S) != string(c.dst.S) {
+				t.Errorf("%s: pc %d, r0 = %+v", c.name, pc, regs[0])
+			}
+		}
+		// Integers over integers need no barrier, and run.
+		rows := newRows(3)
+		regs := newRegs()
+		if pc := runVMCursor(t, prog, regs, rows, cursor(rows, 0), 0); pc != 5 || regs[2].I != 33 {
+			t.Fatalf("an integer scan with the barrier on: pc %d sum %d", pc, regs[2].I)
 		}
 	})
 	t.Run("next from before the first row", func(t *testing.T) {

@@ -256,6 +256,12 @@ func TestVMJITFuel(t *testing.T) {
 	}
 }
 
+// countSyncs counts cursor syncs (vmJITCursorSyncs) for the rest of t.
+func countSyncs(t *testing.T) {
+	vmJITCountSyncs = true
+	t.Cleanup(func() { vmJITCountSyncs = false })
+}
+
 // lowEntryThreshold enters native code wherever there is any, as on amd64 and
 // arm64: these tests check what the emitted code computes, and on js/wasm the
 // platform's higher threshold would leave most of their programs on the VDBE.
