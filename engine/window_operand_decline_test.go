@@ -44,8 +44,10 @@ func TestWindowUnlowerableOperandDeclines(t *testing.T) {
 			t.Errorf("%s: compiled, but an operand the compiler cannot lower must be an error", sql)
 			continue
 		}
-		if !errors.Is(cerr, errVDBEUnsupported) {
-			t.Errorf("%s: declined with %v, want errVDBEUnsupported", sql, cerr)
+		// A window call inside a window call's argument is not a capability gap but
+		// C's own rejection (resolve.c:1265).
+		if !errors.Is(cerr, errVDBEUnsupported) && !strings.Contains(cerr.Error(), "misuse of window function") {
+			t.Errorf("%s: declined with %v, want errVDBEUnsupported or misuse of window function", sql, cerr)
 		}
 	}
 }

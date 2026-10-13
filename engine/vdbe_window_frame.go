@@ -755,7 +755,20 @@ func (m *vdbe) windowLeadLag(plan *windowPlan, call windowCall, ci int, part []i
 			}
 		}
 		j := int64(k) + dir*off
-		if offOK && j >= 0 && j < int64(len(part)) {
+		// lag()'s frame is ROWS UNBOUNDED PRECEDING AND CURRENT ROW (sqlite3WindowUpdate),
+		// so C returns row k while it has buffered only the rows through k+1 (the
+		// input row whose arrival returns it); the last row is returned at the
+		// flush, with every row buffered. A lag() whose offset is negative looks
+		// AHEAD, and finds only what is buffered:
+		//
+		//	lag(x,-1) over x=1..5 -> 2 3 4 5 NULL;  lag(x,-3) -> NULL throughout
+		//
+		// lead()'s frame is UNBOUNDED on both sides, so all of it is buffered.
+		visible := int64(len(part)) - 1
+		if call.name == "lag" && int64(k)+1 < visible {
+			visible = int64(k) + 1
+		}
+		if offOK && j >= 0 && j <= visible {
 			src := part[j]
 			v, err := m.windowOperand(plan, batch[src], call.argCol(0))
 			if err != nil {

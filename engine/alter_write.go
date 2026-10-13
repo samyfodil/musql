@@ -12,8 +12,10 @@ package engine
 import (
 	"cmp"
 	"fmt"
+	"math"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -1895,6 +1897,13 @@ func (db *DB) renameTriggerColumnReferences(tbl *tableMeta, oldName string, repl
 				return fmt.Errorf("engine: unsupported: ALTER TABLE RENAME COLUMN: renaming %s.%s, which trigger %s references THROUGH a derived table that outputs a column of the same name, is not supported by this write path (the reference resolves to the SUBQUERY's column, which C SQLite leaves alone, and the trigger-body rewrite could not tell the two apart)", tbl.name, oldName, tr.name)
 			}
 		}
+		// The same rebinding inside a subquery of an expression: a WHEN clause, a
+		// VALUES tuple, an UPDATE's SET or WHERE, a DELETE's WHERE.
+		for _, e := range r34vTriggerExprs(tr) {
+			if anchorSubqueryWalk(e, func(sub *SelectStmt) bool { return r34vDerivedRebindsColumn(sub, oldName) }) {
+				return fmt.Errorf("engine: unsupported: ALTER TABLE RENAME COLUMN: renaming %s.%s, which a subquery of trigger %s references THROUGH a derived table that outputs a column of the same name, is not supported by this write path (the reference resolves to the SUBQUERY's column, which C SQLite leaves alone, and the trigger-body rewrite could not tell the two apart)", tbl.name, oldName, tr.name)
+			}
+		}
 	}
 	return applyTriggerRename(affected, oldName, repl, false, "ALTER TABLE RENAME COLUMN", tbl.name, db.tableHasColumn)
 }
@@ -1912,6 +1921,38 @@ func r34vTriggerSelects(tr *triggerMeta) []*SelectStmt {
 		}
 		if ins := tr.body[i].insert; ins != nil && ins.selectStmt != nil {
 			out = append(out, ins.selectStmt)
+		}
+	}
+	return out
+}
+
+// r34vTriggerExprs returns the expressions a trigger holds outside its SELECT
+// steps: the WHEN clause and the VALUES, SET and WHERE expressions of its
+// DML steps.
+func r34vTriggerExprs(tr *triggerMeta) []Expr {
+	var out []Expr
+	add := func(e Expr) {
+		if e != nil {
+			out = append(out, e)
+		}
+	}
+	add(tr.when)
+	for _, bs := range tr.body {
+		if st := bs.insert; st != nil {
+			for _, row := range st.rows {
+				for _, e := range row {
+					add(e)
+				}
+			}
+		}
+		if st := bs.update; st != nil {
+			for _, a := range st.sets {
+				add(a.expr)
+			}
+			add(st.where)
+		}
+		if st := bs.delete; st != nil {
+			add(st.where)
 		}
 	}
 	return out
@@ -2146,10 +2187,18 @@ func rewriteIdentInSQL(sqlText, oldName string, repl identRepl, skips r33rSkips,
 	// The left operand of an empty "IN ()" is unmapped at parse time and so is
 	// never rewritten -- see this file's "IN () wrinkle" section.
 	exempt, _ := emptyInSpans(sqlText)
+	var aliased []byteSpan
+	if !repl.isTable {
+		var unsure bool
+		aliased, unsure = orderByAliasSpans(toks, oldName)
+		if unsure {
+			return "", fmt.Errorf("%w: ALTER TABLE RENAME COLUMN: an ORDER BY term %q beside a * in the select list may name an expanded result column, which C binds before any table column and so leaves alone; the rewrite cannot tell without expanding the star", errVDBEUnsupported, oldName)
+		}
+	}
 	var edits []textEdit
 	for i, t := range toks {
 		if t.kind == tkIdent && equalFoldName(t.text, oldName) &&
-			!spansContain(exempt, t.Start) && !spansContain(skips.spans, t.Start) &&
+			!spansContain(exempt, t.Start) && !spansContain(skips.spans, t.Start) && !spansContain(aliased, t.Start) &&
 			!isCallNameToken(toks, i, repl.isTable) && !r33rAfterAS(toks, i) &&
 			!(!repl.isTable && r33rQualifierToken(toks, i)) &&
 			!(!repl.isTable && r34vBoundNameToken(toks, i)) &&
@@ -2161,6 +2210,124 @@ func rewriteIdentInSQL(sqlText, oldName string, repl identRepl, skips r33rSkips,
 		edits = append(edits, textEdit{t.Start, t.End, repl.at(sqlText, t)})
 	}
 	return applyEdits(sqlText, edits), nil
+}
+
+// orderByAliasSpans locates the ORDER BY terms that are the bare identifier name
+// while their SELECT's result list aliases a column "AS name". C binds such a
+// term to the result column (resolveAsName, resolve.c) before any table column,
+// so no TK_COLUMN is produced and a column rename leaves it alone:
+//
+//	INSERT INTO log SELECT a AS b FROM src ORDER BY b;   -- RENAME src.b TO c
+//
+// keeps "ORDER BY b" and the rows stay ordered by the alias. Only ORDER BY is
+// alias-first; GROUP BY and WHERE prefer a table column.
+//
+// A "*" (or "t.*") in the select list names every column of its sources, and the
+// expansion's names are matched the same way; without the schema that cannot be
+// decided, so unsure reports an ORDER BY term of that name beside one.
+func orderByAliasSpans(toks []token, name string) (out []byteSpan, unsure bool) {
+	isKw := func(t token, kw string) bool { return t.kind == tkIdent && !t.quoted && t.upper() == kw }
+	depthAt := make([]int, len(toks)+1)
+	d := 0
+	for i, t := range toks {
+		depthAt[i] = d
+		if t.kind == tkPunct && t.text == "(" {
+			d++
+		} else if t.kind == tkPunct && t.text == ")" {
+			d--
+		}
+	}
+	depthAt[len(toks)] = d
+	for i := 0; i+1 < len(toks); i++ {
+		if !isKw(toks[i], "ORDER") || !isKw(toks[i+1], "BY") {
+			continue
+		}
+		dep := depthAt[i]
+		// The SELECT this ORDER BY ends: the nearest SELECT at this depth.
+		sel := -1
+		for j := i - 1; j >= 0 && depthAt[j] >= dep; j-- {
+			if depthAt[j] == dep && isKw(toks[j], "SELECT") {
+				sel = j
+				break
+			}
+		}
+		if sel < 0 {
+			continue
+		}
+		aliased, star := false, false
+		for j := sel + 1; j < i && !aliased; j++ {
+			if depthAt[j] < dep {
+				break
+			}
+			if depthAt[j] == dep && toks[j].kind == tkIdent && !toks[j].quoted {
+				switch toks[j].upper() {
+				case "FROM", "WHERE", "GROUP", "HAVING", "WINDOW":
+					j = i
+					continue
+				}
+			}
+			if depthAt[j] == dep && toks[j].kind == tkPunct && toks[j].text == "*" &&
+				(j == sel+1 || isKw(toks[j-1], "DISTINCT") || isKw(toks[j-1], "ALL") ||
+					(toks[j-1].kind == tkPunct && (toks[j-1].text == "," || toks[j-1].text == "."))) {
+				star = true
+			}
+			if depthAt[j] == dep && isKw(toks[j], "AS") && j+1 < i &&
+				toks[j+1].kind == tkIdent && equalFoldName(toks[j+1].text, name) {
+				aliased = true
+			}
+		}
+		if !aliased && !star {
+			continue
+		}
+		termStart := true
+		for j := i + 2; j < len(toks) && depthAt[j] >= dep; j++ {
+			if depthAt[j] != dep {
+				termStart = false
+				continue
+			}
+			t := toks[j]
+			if t.kind == tkPunct && t.text == "," {
+				termStart = true
+				continue
+			}
+			if t.kind == tkIdent && !t.quoted {
+				switch t.upper() {
+				case "LIMIT", "UNION", "INTERSECT", "EXCEPT", "OFFSET":
+					j = len(toks)
+					continue
+				}
+			}
+			if t.kind == tkPunct && t.text == ";" {
+				break
+			}
+			if !termStart {
+				continue
+			}
+			termStart = false
+			if t.kind != tkIdent || !equalFoldName(t.text, name) {
+				continue
+			}
+			end := j+1 >= len(toks) || depthAt[j+1] < dep || toks[j+1].kind == tkEOF
+			if !end {
+				n := toks[j+1]
+				switch {
+				case n.kind == tkPunct && (n.text == "," || n.text == ";" || n.text == ")"):
+					end = true
+				case n.kind == tkIdent && !n.quoted:
+					switch n.upper() {
+					case "ASC", "DESC", "COLLATE", "NULLS", "LIMIT", "UNION", "INTERSECT", "EXCEPT", "OFFSET":
+						end = true
+					}
+				}
+			}
+			if end && aliased {
+				out = append(out, byteSpan{t.Start, t.End})
+			} else if end {
+				unsure = true
+			}
+		}
+	}
+	return out, unsure
 }
 
 // isCallNameToken reports whether toks[i] is followed by "(", i.e. names a
@@ -2743,6 +2910,12 @@ func (db *DB) checkViewColumnRenameSafe(tbl *tableMeta, oldName, newName, verb s
 		}
 	}
 	for _, v := range affected {
+		// A reference that binds to a derived table's own column is not rewritten
+		// (alter.c:1022) while the subquery's inner one is, so the view no longer
+		// resolves; r34vDerivedRebindsColumn is the trigger cascade's test for it.
+		if r34vDerivedRebindsColumn(v.selectStmt, oldName) {
+			return nil, fmt.Errorf("engine: unsupported: %s: renaming %s.%s, which view %s references THROUGH a derived table that outputs a column of the same name, is not supported by this write path (the reference resolves to the SUBQUERY's column, which C SQLite leaves alone, and the view-body rewrite could not tell the two apart)", verb, tbl.name, oldName, v.name)
+		}
 		if emptyInBlocks(v.sql, oldName) {
 			return nil, fmt.Errorf("engine: unsupported: %s: renaming %s.%s, which view %s names inside the left operand of an empty IN() list whose extent this write path could not pin down (see this file's emptyInSpans)", verb, tbl.name, oldName, v.name)
 		}
@@ -3077,6 +3250,12 @@ func (db *DB) renameColumn(tbl *tableMeta, oldName, newName string, newQuoted bo
 	for _, tr := range db.triggers {
 		savedTriggers[tr] = *tr
 	}
+	// The views too: the post-rename re-prepare can still refuse the ALTER after
+	// applyViewRename has rewritten them.
+	savedViews := make(map[*viewMeta]viewMeta, len(db.views))
+	for _, v := range db.views {
+		savedViews[v] = *v
+	}
 	// Every CHILD table's stored text is about to be rewritten too (its
 	// "REFERENCES <this table>(<cols>)" list), so it joins the undo set for
 	// exactly the reason the triggers above did.
@@ -3101,6 +3280,9 @@ func (db *DB) renameColumn(tbl *tableMeta, oldName, newName string, newQuoted bo
 		}
 		for tr, snap := range savedTriggers {
 			*tr = snap
+		}
+		for v, snap := range savedViews {
+			*v = snap
 		}
 		// ... and so must the quotefix pass that ran before any of it.
 		quoteUndo.restore()
@@ -3153,7 +3335,11 @@ func (db *DB) renameColumn(tbl *tableMeta, oldName, newName string, newQuoted bo
 	// renameTestSchema(...,"after rename",1) (alter.c:676) -- the VIEW-trigger
 	// half of it, which only the REWRITTEN schema can answer. See
 	// r33rTriggersResolveAfter.
-	if verr := db.r33rTriggersResolveAfter(tbl, "after rename"); verr != nil {
+	verr = db.r33rTriggersResolveAfter(tbl, "after rename")
+	if verr == nil {
+		verr = db.schemaObjectsResolveCompiled(tbl, "after rename")
+	}
+	if verr != nil {
 		if rerr := rollback(); rerr != nil {
 			return rerr
 		}
@@ -3528,12 +3714,26 @@ func parseAddColumnDef(p *parser) (*addColumnDef, error) {
 		case "REFERENCES":
 			def.hasReferences = true
 			p.next()
+			parent := ""
 			if p.peek().kind == tkIdent {
+				parent = p.peek().text
 				p.next()
 			}
 			if p.peekIsPunct("(") {
+				first := p.pos
 				if err := skipParenGroup(p); err != nil {
 					return nil, err
+				}
+				// A column constraint's parent key is one column (sqlite3CreateForeignKey:
+				// "foreign key on %s should reference only one column of table %T").
+				inner := p.toks[first+1 : p.pos-1]
+				if len(inner) == 0 {
+					return nil, fmt.Errorf("engine: near \")\": syntax error")
+				}
+				for _, it := range inner {
+					if it.kind == tkPunct && it.text == "," {
+						return nil, fmt.Errorf("engine: foreign key on %s should reference only one column of table %s", def.name, parent)
+					}
 				}
 			}
 			for {
@@ -3922,6 +4122,16 @@ func (db *DB) addColumn(tbl *tableMeta, def *addColumnDef) error {
 		}
 	}
 
+	// A DEFAULT that negates the hex literal 0x8000000000000000 folds to the REAL
+	// 2**63 (sqlite3ValueFromExpr), which is what the rows already in the table
+	// read, but code-generating it for an INSERT is "hex literal too big"
+	// (codeInteger): keep the clause as a deferred default whose evaluation raises
+	// that, ahead of the folded value.
+	if lit, ok := defaultNegatesHexMinInt(def.rawText); ok && def.hasDefault {
+		col.DefaultDeferred = LiteralExpr{Val: Value{Typ: Float, F: -float64(math.MinInt64)},
+			deferredErr: fmt.Sprintf("engine: %s: -%s", errHexLiteralTooBig, lit)}
+	}
+
 	fillVal := Value{Typ: Null}
 	if def.hasDefault && def.defaultIsBareLiteral {
 		fillVal = applyAffinityToValue(def.defaultValue, col.Aff)
@@ -4232,7 +4442,19 @@ func (db *DB) dropColumn(tbl *tableMeta, colName string) error {
 	// the schema-text/column-list edits that decide a view's column set and
 	// before the row rewrite below, because that rewrite is the first
 	// irreversible step: everything above it is restorable by hand.
-	if verr := db.r33rTriggersResolveAfter(tbl, "after drop column"); verr != nil {
+	// The same pass re-parses the table text itself: a table-level
+	// FOREIGN KEY(col) naming the dropped column no longer parses.
+	var verr error
+	if _, _, _, perr := parseCreateTableColumnsAndAutoIndexes(tbl.sql, tbl.withoutRowid); perr != nil {
+		verr = fmt.Errorf("engine: error in table %s after drop column: %s", tbl.name, strings.TrimPrefix(perr.Error(), "engine: "))
+	}
+	if verr == nil {
+		verr = db.r33rTriggersResolveAfter(tbl, "after drop column")
+	}
+	if verr == nil {
+		verr = db.schemaObjectsResolveCompiled(tbl, "after drop column")
+	}
+	if verr != nil {
 		tbl.sql, tbl.cols, tbl.ipkIndex = savedSQL, savedCols, savedIpk
 		if rerr := refreshTableChecks(tbl); rerr != nil {
 			return rerr
@@ -4806,6 +5028,11 @@ func (db *DB) checkSchemaObjectsResolve(tbl *tableMeta) error {
 			}
 		}
 		if n := missing(names, tr.isTemp); n != "" {
+			// A TEMP trigger's names are not pinned to a schema at CREATE, so C
+			// reports the bare name.
+			if tr.isTemp {
+				return fmt.Errorf("engine: error in trigger %s: no such table: %s", tr.name, n)
+			}
 			return fmt.Errorf("engine: error in trigger %s: no such table: %s.%s", tr.name, schema, n)
 		}
 		// The re-parse resolves columns too, so a trigger naming a missing column fails
@@ -4829,10 +5056,13 @@ func (db *DB) checkSchemaObjectsResolve(tbl *tableMeta) error {
 		var names []string
 		collectSelectTables(v.selectStmt, &names)
 		if n := missing(names, v.isTemp); n != "" {
+			if v.isTemp {
+				return fmt.Errorf("engine: error in view %s: no such table: %s", v.name, n)
+			}
 			return fmt.Errorf("engine: error in view %s: no such table: %s.%s", v.name, schema, n)
 		}
 	}
-	return nil
+	return db.schemaObjectsResolveCompiled(tbl, "")
 }
 
 // r33rTriggersResolveAfter is the post-cascade half of renameTestSchema
@@ -4910,6 +5140,115 @@ func (db *DB) r33rTriggersResolveAfter(tbl *tableMeta, when string) error {
 		}
 	}
 	return nil
+}
+
+// schemaObjectsResolveCompiled is renameTestSchema's prepare of every trigger and
+// view (alter.c:2050): each is compiled against the schema as it stands, and the
+// first (in creation order) that no longer resolves fails the ALTER with "error
+// in <kind> <name> <when>: <message>". when is "" for the pass before the
+// rewrite, "after rename" / "after drop column" for the pass after it.
+// checkSchemaObjectsResolve and r33rTriggersResolveAfter answer the shapes their
+// hand-written validators cover; this one asks the compiler, so a name buried in
+// a subquery, a table alias or an UPDATE ... FROM is found the same way. Only
+// "no such column" and a circular view are promoted: any other complaint is this
+// engine's own decline, not C's reason.
+func (db *DB) schemaObjectsResolveCompiled(tbl *tableMeta, when string) error {
+	if db.writableSchema {
+		return nil
+	}
+	suffix := ""
+	if when != "" {
+		suffix = " " + when
+	}
+	// A name the compiler could not find may arrive wrapped in a decline of the
+	// statement that contained it ("vdbe: unsupported: engine: no such column:
+	// b"); the resolution failure is still C's reason.
+	promote := func(err error) (string, bool) {
+		if err == nil {
+			return "", false
+		}
+		msg := err.Error()
+		msg = strings.TrimSuffix(msg, " (no fallback)")
+		if i := strings.LastIndex(msg, "engine: "); i >= 0 {
+			msg = msg[i+len("engine: "):]
+		}
+		if strings.HasPrefix(msg, "no such column: ") || strings.HasSuffix(msg, " is circularly defined") {
+			return msg, true
+		}
+		return "", false
+	}
+	db.keepBodyOrderBy = true
+	defer func() { db.keepBodyOrderBy = false }()
+	var firstSeq uint64
+	var first error
+	note := func(seq uint64, err error) {
+		if first == nil || seq < firstSeq {
+			firstSeq, first = seq, err
+		}
+	}
+	for _, tr := range db.triggers {
+		if tr.tableAttachName != "" || tr.insteadOf || alterSkipsCatalog(tbl.isTemp, tr.isTemp) {
+			continue
+		}
+		trTbl := db.findTableMetaIn(createScope(tr.tableIsTemp), tr.table)
+		if trTbl == nil {
+			continue
+		}
+		_, err := db.compileTriggerFirePlanFor(trTbl, tr.event, newTriggerPrgMemo(), conflictAbort, false, []*triggerMeta{db.withResolvableSetTargets(tr)})
+		if msg, ok := promote(err); ok {
+			note(tr.schemaSeq, fmt.Errorf("engine: error in trigger %s%s: %s", tr.name, suffix, msg))
+		}
+	}
+	var pager *ReadOnlyPager
+	for _, v := range db.views {
+		if alterSkipsCatalog(tbl.isTemp, v.isTemp) {
+			continue
+		}
+		if pager == nil {
+			p, perr := db.SnapshotPager()
+			if perr != nil {
+				return perr
+			}
+			pager = p
+		}
+		catalog := "main"
+		if v.isTemp {
+			catalog = "temp"
+		}
+		// The view's own SELECT, not the view: C prepares the body without marking
+		// the view as being expanded, so a cycle is reported at the other view
+		// ('error in view v2: view v1 is circularly defined').
+		q := fmt.Sprintf("SELECT * FROM %s.%s LIMIT 0", catalog, quoteIdent(v.name))
+		if body := viewBodyText(v.sql); body != "" {
+			q = "SELECT * FROM (" + body + ") LIMIT 0"
+		}
+		_, _, err := pager.Query(q)
+		if msg, ok := promote(err); ok {
+			note(v.schemaSeq, fmt.Errorf("engine: error in view %s%s: %s", v.name, suffix, msg))
+		}
+	}
+	return first
+}
+
+// viewBodyText is the SELECT of a stored CREATE VIEW text: everything after the
+// first unquoted AS ( when it cannot be located).
+func viewBodyText(createSQL string) string {
+	toks, err := lex(createSQL)
+	if err != nil {
+		return ""
+	}
+	depth := 0
+	for _, t := range toks {
+		switch {
+		case t.kind == tkPunct && t.text == "(":
+			depth++
+		case t.kind == tkPunct && t.text == ")":
+			depth--
+		case depth == 0 && t.kind == tkIdent && !t.quoted && t.upper() == "AS":
+			return strings.TrimRight(strings.TrimSpace(createSQL[t.End:]), ";")
+		}
+	}
+	return ""
 }
 
 // collectSelectTables appends every FROM-clause table name
@@ -6846,4 +7185,78 @@ func renamedColumnAsWritten(viewSQL, tableName, oldName, newName string) string 
 		return tableName + "." + newName
 	}
 	return newName
+}
+
+// defaultNegatesHexMinInt reports a DEFAULT clause in an ADD COLUMN definition
+// that is "-0x8000000000000000" (optionally parenthesized), and the hex literal
+// as written.
+func defaultNegatesHexMinInt(rawText string) (string, bool) {
+	toks, err := lex(rawText)
+	if err != nil {
+		return "", false
+	}
+	for i, t := range toks {
+		if t.kind != tkIdent || t.quoted || t.upper() != "DEFAULT" {
+			continue
+		}
+		j := i + 1
+		if j < len(toks) && toks[j].kind == tkPunct && toks[j].text == "(" {
+			j++
+		}
+		if j+1 < len(toks) && toks[j].kind == tkPunct && toks[j].text == "-" {
+			n := toks[j+1]
+			if n.kind == tkNumber && len(n.text) > 2 && (n.text[1] == 'x' || n.text[1] == 'X') {
+				if u, perr := strconv.ParseUint(n.text[2:], 16, 64); perr == nil && u == uint64(math.MaxInt64)+1 {
+					return n.text, true
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+// withResolvableSetTargets returns tr with every UPDATE step's SET target that no
+// longer names a column of the table pointed at an existing column: renameResolveTrigger
+// resolves the right-hand sides but never the targets, whose names C checks only
+// when the trigger fires ("UPDATE t1 SET m = 'x'" survives DROP COLUMN m).
+func (db *DB) withResolvableSetTargets(tr *triggerMeta) *triggerMeta {
+	var out *triggerMeta
+	for i, bs := range tr.body {
+		if bs.update == nil {
+			continue
+		}
+		t := db.findTableMeta(bs.update.table)
+		if t == nil || len(t.cols) == 0 {
+			continue
+		}
+		var sets []assignment
+		for j, a := range bs.update.sets {
+			if tableHasColumnOrRowid(t, a.col) {
+				continue
+			}
+			if sets == nil {
+				sets = append([]assignment(nil), bs.update.sets...)
+			}
+			sets[j].col = t.cols[0].Name
+		}
+		if sets == nil {
+			continue
+		}
+		if out == nil {
+			cp := *tr
+			cp.body = append([]triggerBodyStmt(nil), tr.body...)
+			out = &cp
+		}
+		u := *bs.update
+		u.sets = sets
+		out.body[i].update = &u
+	}
+	if out == nil {
+		return tr
+	}
+	return out
+}
+
+func tableHasColumnOrRowid(t *tableMeta, name string) bool {
+	return columnIndexByName(t.cols, name) >= 0 || isRowidAliasName(r33sFoldIdent(name))
 }

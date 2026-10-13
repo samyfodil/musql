@@ -137,7 +137,10 @@ type fkConstraint struct {
 	child      *tableMeta
 	childIdx   []int  // indices into child.cols, one per FK column
 	parentName string // as written in the child's CREATE TABLE text
-	parent     *tableMeta
+	// fromCols/toCols are the key columns as written (toCols nil: the parent's
+	// PRIMARY KEY); kept for an unresolvable key, whose indices are unset.
+	fromCols, toCols []string
+	parent           *tableMeta
 	// parentIdx indexes parent.cols, one per key column; the sentinel -1
 	// means "the parent's rowid" (a foreign key onto an INTEGER PRIMARY KEY,
 	// which C SQLite seeks with OP_SeekRowid and which therefore can never
@@ -185,6 +188,8 @@ type fkEvent struct {
 	old  []Value
 	new  []Value
 	mask []bool
+	// newRowid is the rowid new was stored under.
+	newRowid uint64
 	// parent is the PARENT-side work for this mutation, resolved AT THE MOMENT
 	// it happened rather than at the end of the statement. That timing is
 	// load-bearing for two rules: RESTRICT fails on the child rows that exist
@@ -438,6 +443,8 @@ func (db *DB) resolveFK(child *tableMeta, def *pragmaTableDef, fk pragmaFK) *fkC
 	c := &fkConstraint{
 		child:      child,
 		parentName: fk.toTable,
+		fromCols:   fk.fromCols,
+		toCols:     fk.toCols,
 		onDelete:   fk.onDelete,
 		onUpdate:   fk.onUpdate,
 		deferred:   fk.deferred,
@@ -648,7 +655,7 @@ func (db *DB) fkCheckTargets(prog *Program) error {
 		return nil
 	}
 	for _, tbl := range prog.FKTargets {
-		if err := db.fkRequireResolvable(tbl, prog.FKReach); err != nil {
+		if err := db.fkRequireResolvable(tbl, prog.FKReach, prog.FKShape); err != nil {
 			return err
 		}
 	}
@@ -665,8 +672,10 @@ func (db *DB) fkCheckTargets(prog *Program) error {
 type fkReach uint8
 
 const (
-	fkReachDelete fkReach = 1 << iota // the statement can delete a parent key: ON DELETE actions
-	fkReachUpdate                     // the statement can change one: ON UPDATE actions
+	fkReachDelete     fkReach = 1 << iota // the statement can delete a parent key: ON DELETE actions
+	fkReachUpdate                         // the statement can change one: ON UPDATE actions
+	fkReachInsert                         // an INSERT: sqlite3FkCheck still locates the parent index of a DEFERRED key
+	fkReachMultiWrite                     // an INSERT with Parse.isMultiWrite: it locates every key's parent index
 )
 
 // fkStatementReach maps a lexed write statement to the actions it can set off:
@@ -685,12 +694,12 @@ func fkStatementReach(kw string, toks []token, verbAt int) fkReach {
 	case "UPDATE":
 		return fkReachUpdate
 	case "REPLACE":
-		return fkReachDelete
+		return fkReachDelete | fkReachInsert
 	case "INSERT":
 	default:
 		return 0
 	}
-	var r fkReach
+	r := fkReachInsert
 	// "OR REPLACE" can only be the two tokens after the verb
 	// (parse.y:1114, 492, 495). Scanning for an OR/REPLACE pair matched
 	// "... OR replace(a,'x','y')" (replace is a function) and widened the
@@ -702,11 +711,31 @@ func fkStatementReach(kw string, toks []token, verbAt int) fkReach {
 		// C SQLite then compiles.
 		r |= fkReachDelete
 	}
+	// sqlite3BeginWriteOperation(pParse, pSelect || pTrigger, iDb) makes an
+	// INSERT ... SELECT, and a multi-row VALUES (a compound SELECT in C), a
+	// multi-write statement; so does a trigger on the table (fkRequireResolvable).
+	depth, inValues := 0, false
 	for i := verbAt + 1; i < len(toks); i++ {
-		if toks[i].kind != tkIdent {
+		switch {
+		case toks[i].kind == tkPunct && toks[i].text == "(":
+			depth++
+		case toks[i].kind == tkPunct && toks[i].text == ")":
+			depth--
+		case toks[i].kind == tkPunct && toks[i].text == "," && depth == 0 && inValues:
+			r |= fkReachMultiWrite
+		}
+		if toks[i].kind != tkIdent || toks[i].quoted {
 			continue
 		}
 		switch toks[i].upper() {
+		case "VALUES":
+			if depth == 0 {
+				inValues = true
+			}
+		case "SELECT":
+			if depth == 0 {
+				r |= fkReachMultiWrite
+			}
 		case "DO":
 			// "ON CONFLICT ... DO UPDATE": an upsert can change a parent key.
 			if i+1 < len(toks) && toks[i+1].kind == tkIdent && toks[i+1].upper() == "UPDATE" {
@@ -717,11 +746,166 @@ func fkStatementReach(kw string, toks []token, verbAt int) fkReach {
 	return r
 }
 
+// fkStmtShape is what a write statement assigns, as sqlite3FkCheck sees it:
+// which columns an UPDATE (or an upsert's DO UPDATE) sets, which an INSERT
+// lists, whether it is a multi-write statement. nil means "unknown": the
+// caller then keeps the conservative reading.
+type fkStmtShape struct {
+	update   bool // an UPDATE: assigned is its SET list (aChange)
+	insert   bool
+	assigned []string // columns the SET list (or DO UPDATE SET) assigns
+	insCols  []string // an INSERT's column list; nil: every column
+	multi    bool     // INSERT ... SELECT or a multi-row VALUES (pSelect in C)
+	replace  bool     // the INSERT resolves conflicts by REPLACE
+	upsert   bool     // the INSERT carries ON CONFLICT ... DO UPDATE
+}
+
+// fkShapeOf parses the statement once more for the facts the resolution check
+// needs; a statement that does not parse here has no shape.
+func fkShapeOf(kw, sqlText string) *fkStmtShape {
+	switch kw {
+	case "UPDATE":
+		st, err := parseUpdateStmt(sqlText)
+		if err != nil || len(st.from) > 0 {
+			return nil
+		}
+		sh := &fkStmtShape{update: true}
+		for _, a := range st.sets {
+			sh.assigned = append(sh.assigned, a.col)
+		}
+		return sh
+	case "INSERT", "REPLACE":
+		st, err := parseInsertStmt(sqlText)
+		if err != nil {
+			return nil
+		}
+		sh := &fkStmtShape{insert: true, insCols: st.cols, multi: st.selectStmt != nil || len(st.rows) > 1,
+			replace: st.orAction == conflictReplace}
+		if st.upsert != nil && !st.upsert.doNothing {
+			sh.upsert = true
+			for _, a := range st.upsert.sets {
+				sh.assigned = append(sh.assigned, a.col)
+			}
+		}
+		return sh
+	case "DELETE":
+		return &fkStmtShape{}
+	}
+	return nil
+}
+
+func (sh *fkStmtShape) assigns(name string) bool {
+	for _, a := range sh.assigned {
+		if equalFoldName(a, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// childModified is sqlite3FkCheck's test for one of tbl's own keys: an UPDATE
+// consults it only when it assigns one of its columns, except that a
+// self-reference is always consulted.
+func (sh *fkStmtShape) childModified(fk *fkConstraint, tbl *tableMeta) bool {
+	if !sh.update || equalFoldName(fk.parentName, tbl.name) {
+		return true
+	}
+	return sh.childAssigned(fk, tbl)
+}
+
+// childAssigned is fkChildIsModified: an UPDATE assigns one of fk's child
+// columns (or, for the rowid alias, the rowid).
+func (sh *fkStmtShape) childAssigned(fk *fkConstraint, tbl *tableMeta) bool {
+	for _, c := range fk.fromCols {
+		if sh.assigns(c) || sh.assignsRowid(tbl, c) {
+			return true
+		}
+	}
+	return false
+}
+
+// updateRequiresFK is sqlite3FkRequired for an UPDATE: it assigns a column of one
+// of tbl's own keys or of a key that points at tbl. When it does, update.c asks
+// sqlite3FkOldmask, which locates the parent index of EVERY key pointing at tbl
+// -- assigned or not -- and raises a mismatch.
+func (db *DB) updateRequiresFK(tbl *tableMeta, sh *fkStmtShape) bool {
+	for _, fk := range db.fkOf(tbl) {
+		if sh.childAssigned(fk, tbl) {
+			return true
+		}
+	}
+	for _, fk := range db.fkNamingParent(tbl) {
+		if sh.parentModified(fk, tbl) {
+			return true
+		}
+	}
+	return false
+}
+
+// assignsRowid reports a SET of the rowid when col is tbl's rowid alias.
+func (sh *fkStmtShape) assignsRowid(tbl *tableMeta, col string) bool {
+	if tbl.ipkIndex < 0 || !equalFoldName(tbl.cols[tbl.ipkIndex].Name, col) {
+		return false
+	}
+	return sh.assigns("rowid") || sh.assigns("oid") || sh.assigns("_rowid_")
+}
+
+// parentModified is fkParentIsModified: an UPDATE assigns a column of fk's
+// parent key, which without a column list is the PRIMARY KEY.
+func (sh *fkStmtShape) parentModified(fk *fkConstraint, tbl *tableMeta) bool {
+	if !sh.update {
+		return true
+	}
+	keys := fk.toCols
+	if len(keys) == 0 {
+		def, err := parsePragmaTableDef(tbl.sql)
+		if err != nil {
+			return true
+		}
+		if def.rowidAlias != "" {
+			keys = []string{def.rowidAlias}
+		} else {
+			keys = pragmaPrimaryKeyColumns(def)
+		}
+	}
+	for _, c := range keys {
+		if sh.assigns(c) || sh.assignsRowid(tbl, c) {
+			return true
+		}
+	}
+	return false
+}
+
+// conflictPossible reports whether an INSERT into tbl codes any
+// uniqueness-conflict resolution at all: the rowid when the statement supplies
+// it, a WITHOUT ROWID primary key, or a unique index. An INSERT OR REPLACE of
+// a table with none never deletes anything, so no victim-delete foreign key
+// code is generated for it.
+func (db *DB) conflictPossible(tbl *tableMeta, sh *fkStmtShape) bool {
+	if tbl.withoutRowid {
+		return true
+	}
+	if tbl.ipkIndex >= 0 && (sh.insCols == nil || slices.ContainsFunc(sh.insCols, func(c string) bool {
+		return equalFoldName(c, tbl.cols[tbl.ipkIndex].Name)
+	})) {
+		return true
+	}
+	for _, ix := range db.indexes {
+		if ix.unique && indexBelongsTo(ix, tbl) {
+			return true
+		}
+	}
+	return false
+}
+
 // fkRequireResolvable reports the error a DML statement on tbl must raise
 // before running, walking as far as the statement's reach allows.
 //
 // Level 0, tbl's own keys, raises C's error unconditionally (a code-generation
-// failure for any DML on the child).
+// failure for any DML on the child) -- except that an UPDATE consults a key
+// only when it assigns one of its columns (sqlite3FkCheck's fkChildIsModified
+// and fkParentIsModified), and an INSERT consults a parent's immediate keys
+// only when it is a multi-write statement.
 //
 // Deeper keys are reached through actions: C compiles an action as a program on
 // the child, which resolves every key pointing at it, so a mismatch two hops
@@ -734,19 +918,60 @@ func fkStatementReach(kw string, toks []token, verbAt int) fkReach {
 //
 // Those are declined rather than raised: whether C raises depends on exactly
 // which action programs it generates, which this approximates from the verb.
-func (db *DB) fkRequireResolvable(tbl *tableMeta, reach fkReach) error {
+func (db *DB) fkRequireResolvable(tbl *tableMeta, reach fkReach, shape *fkStmtShape) error {
 	if !db.fkEnforce || tbl == nil {
 		return nil
 	}
 	for _, fk := range db.fkOf(tbl) {
 		if fk.resolveErr != nil {
-			return fk.resolveErr
+			if shape == nil || shape.childModified(fk, tbl) {
+				return fk.resolveErr
+			}
+			continue
 		}
 		if fk.deferred && db.fkDeferredUnmodelled() {
 			return fkDeferredDeclined(fk)
 		}
 	}
-	if reach == 0 {
+	levelZeroDecided := false
+	triggers := len(db.matchingTriggers(tbl.name, tbl.isTemp, triggerInsert, triggerBefore)) > 0 ||
+		len(db.matchingTriggers(tbl.name, tbl.isTemp, triggerInsert, triggerAfter)) > 0
+	if shape != nil {
+		levelZeroDecided = true
+		// sqlite3FkCheck skips a parent's IMMEDIATE keys for a single-row insert
+		// ("cannot cause an immediate foreign key violation"), and only then; a
+		// multi-write insert (a trigger on the table counts, and so does a
+		// REPLACE that can delete) and every deferred key locate the parent index
+		// and raise a mismatch.
+		replaces := shape.replace && db.conflictPossible(tbl, shape)
+		multi := shape.multi || replaces || triggers
+		for _, fk := range db.fkNamingParent(tbl) {
+			if fk.resolveErr == nil {
+				continue
+			}
+			switch {
+			case shape.insert && (multi || fk.deferred || db.deferFKs):
+				return fk.resolveErr
+			case shape.insert && shape.upsert && db.conflictPossible(tbl, shape) && db.updateRequiresFK(tbl, &fkStmtShape{update: true, assigned: shape.assigned}):
+				// ...and the DO UPDATE is coded as an UPDATE, which asks for the keys
+				// only when its SET list assigns a column of one, and only on a table
+				// that has a constraint a conflict could come from.
+				return fk.resolveErr
+			case shape.update && db.updateRequiresFK(tbl, shape):
+				return fk.resolveErr
+			case !shape.insert && !shape.update:
+				return fk.resolveErr
+			}
+		}
+	} else if reach&fkReachInsert != 0 {
+		multi := reach&fkReachMultiWrite != 0 || triggers
+		for _, fk := range db.fkNamingParent(tbl) {
+			if fk.resolveErr != nil && (multi || fk.deferred) {
+				return fk.resolveErr
+			}
+		}
+	}
+	if reach&(fkReachDelete|fkReachUpdate) == 0 {
 		return nil
 	}
 	seen := map[*tableMeta]fkReach{tbl: reach}
@@ -757,6 +982,9 @@ func (db *DB) fkRequireResolvable(tbl *tableMeta, reach fkReach) error {
 		at := seen[u]
 		for _, fk := range db.fkNamingParent(u) {
 			if fk.resolveErr != nil {
+				if levelZeroDecided && u == tbl {
+					continue // level 0, decided above from the statement's shape
+				}
 				return fmt.Errorf("%w: %v -- reached from this statement through a foreign key action, where C SQLite raises it only for the action programs the statement actually generates",
 					errVDBEUnsupported, fk.resolveErr)
 			}
@@ -831,9 +1059,10 @@ func (db *DB) fkRowMutated(tbl *tableMeta, oldRowid, newRowid uint64, old, new [
 		return
 	}
 	ev := fkEvent{
-		tbl: tbl,
-		old: copyHookRow(tbl, oldRowid, old),
-		new: copyHookRow(tbl, newRowid, new),
+		tbl:      tbl,
+		newRowid: newRowid,
+		old:      copyHookRow(tbl, oldRowid, old),
+		new:      copyHookRow(tbl, newRowid, new),
 		// A GENERATED column counts as assigned when its generator reads a
 		// column the SET list assigned -- see fkWidenGeneratedMask.
 		mask: fkWidenGeneratedMask(tbl, mask),
@@ -1156,12 +1385,36 @@ func (db *DB) fkChildSide(st *fkStmtState, ev fkEvent) error {
 			}
 		}
 		if ev.new != nil {
-			if key, ok := fkKeyOf(fk.childIdx, ev.new); ok && !db.fkParentHasKey(fk, key) {
+			if key, ok := fkKeyOf(fk.childIdx, ev.new); ok && !db.fkParentHasKeyFor(fk, ev, key) {
 				*counter++
 			}
 		}
 	}
 	return nil
+}
+
+// fkParentHasKeyFor is fkParentHasKey for the new image of ev. C checks an
+// INSERT before the row is stored, so a self-referencing key finds itself only
+// through fkLookupParent's "row matches itself" test, which compares the raw
+// values with no affinity and no collation (OP_Ne with neither); otherwise the
+// lookup sees the table without the new row.
+func (db *DB) fkParentHasKeyFor(fk *fkConstraint, ev fkEvent, key []Value) bool {
+	if ev.old != nil || fk.parent != fk.child || fk.parentIdx[0] < 0 {
+		return db.fkParentHasKey(fk, key)
+	}
+	self := true
+	for i, pi := range fk.parentIdx {
+		pv := ev.new[pi]
+		if pv.Typ == Null || compareValuesCollatedEnc(key[i], pv, "BINARY", db.encoding()) != 0 {
+			self = false
+			break
+		}
+	}
+	if self {
+		return true
+	}
+	rid := ev.newRowid
+	return db.fkParentHasKeyExcept(fk, key, &rid)
 }
 
 // fkParentSide applies one mutation's parent-side work: it counts the child
@@ -1231,7 +1484,14 @@ func (db *DB) fkParentSide(st *fkStmtState, ev fkEvent) error {
 		// COMMIT" fails, and inserting the missing PARENT row after that
 		// failed COMMIT makes the very next COMMIT succeed -- while inserting
 		// an UNRELATED parent key does not.
-		if w.newKey != nil && w.newKids > 0 && db.fkMayDecrement(st, fk) {
+		//
+		// A key the mutation left as it was brings nothing into existence: C scans
+		// the old key's children (+1) before the update and the new key's (-1)
+		// after it, and the pair cancels exactly (update.c:1049, :1093). Taking
+		// only the -1 let a no-op UPDATE OR REPLACE of a parent clear an
+		// unrelated violation.
+		unchanged := w.oldKey != nil && fkKeysEqualOrNil(fk, w.oldKey, w.newKey, db.encoding())
+		if w.newKey != nil && w.newKids > 0 && !unchanged && db.fkMayDecrement(st, fk) {
 			*counter -= w.newKids
 			if *counter < 0 {
 				*counter = 0
@@ -1356,6 +1616,11 @@ func fkKeysEqual(fk *fkConstraint, a, b []Value, enc TextEncoding) bool {
 // the row store, each candidate re-checked by fkParentRowMatches, and only an
 // unnarrowable key scans.
 func (db *DB) fkParentHasKey(fk *fkConstraint, key []Value) bool {
+	return db.fkParentHasKeyExcept(fk, key, nil)
+}
+
+// fkParentHasKeyExcept is fkParentHasKey ignoring the parent row skip names.
+func (db *DB) fkParentHasKeyExcept(fk *fkConstraint, key []Value, skip *uint64) bool {
 	// See table_load.go's package doc comment, and db.pendingLoadErr's own doc
 	// comment for why a load failure here is recorded rather than returned:
 	// fk.parent is a DIFFERENT table than the statement's own DML target, the
@@ -1372,6 +1637,9 @@ func (db *DB) fkParentHasKey(fk *fkConstraint, key []Value) bool {
 	}
 	if cands, ok := db.fkParentCandidates(fk, probe); ok {
 		for _, rid := range cands {
+			if skip != nil && rid == *skip {
+				continue
+			}
 			if prow, have := fk.parent.rows.get(rid); have && fkParentRowMatches(fk, rid, prow, probe, db.encoding()) {
 				return true
 			}
@@ -1379,6 +1647,9 @@ func (db *DB) fkParentHasKey(fk *fkConstraint, key []Value) bool {
 		return false
 	}
 	for rid, prow := range fk.parent.rows.all() {
+		if skip != nil && rid == *skip {
+			continue
+		}
 		if fkParentRowMatches(fk, rid, prow, probe, db.encoding()) {
 			return true
 		}
@@ -1935,6 +2206,26 @@ func (db *DB) fkBeforeDropTable(tbl *tableMeta) error {
 				if err := db.fkApplyAction(fk, kids, fk.onDelete, nil); err != nil {
 					return err
 				}
+				if fk.onDelete != fkSetDefault {
+					break
+				}
+				// The implicit delete empties the parent, and the rewritten
+				// children are checked against it as it is (fkSuppressChild
+				// keeps the drain from doing so after the table is gone). Each
+				// parent row's SET DEFAULT leaves a child on a default key that
+				// no row of the emptied parent can hold, so a non-NULL default
+				// is one violation per child (MATCH SIMPLE: a NULL component
+				// satisfies the key).
+				def := make([]Value, len(fk.childIdx))
+				for i, ci := range fk.childIdx {
+					def[i] = fkColumnDefault(fk.child.cols[ci])
+				}
+				if _, full := fkKeyOf(identityIdx(len(def)), def); full {
+					if !(fk.deferred || db.deferFKs) {
+						return fkErrViolation()
+					}
+					*db.fkCounterFor(db.fkStmt, fk) += len(kids)
+				}
 			default: // NO ACTION / RESTRICT
 				action := fk.onDelete
 				if action == fkRestrict && db.fkRestrictDisabled() {
@@ -1981,3 +2272,12 @@ func (p *ReadOnlyPager) DeferForeignKeys() bool { return p != nil && p.deferFKs 
 
 // SetDeferForeignKeys stamps the connection's flag onto this snapshot.
 func (p *ReadOnlyPager) SetDeferForeignKeys(on bool) { p.deferFKs = on }
+
+// identityIdx is 0..n-1, for fkKeyOf over a row that is already the key.
+func identityIdx(n int) []int {
+	idx := make([]int, n)
+	for i := range idx {
+		idx[i] = i
+	}
+	return idx
+}

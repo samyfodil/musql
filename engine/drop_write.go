@@ -178,7 +178,16 @@ func (db *DB) DropTable(sqlText string) error {
 			// actions and fails if a child would be orphaned. See
 			// fkBeforeDropTable for the verified rules (including that the
 			// parent's OWN delete triggers do NOT fire).
-			if err := db.fkBeforeDropTable(tbl); err != nil {
+			deferredBefore, deferredImmBefore := db.fkDeferred, db.fkDeferredImm
+			err := db.fkBeforeDropTable(tbl)
+			if err == nil && !db.transactionHasACommitCheck() && db.fkDeferred+db.fkDeferredImm != 0 {
+				// Autocommit: the DROP is its own transaction, so a deferred
+				// violation its implicit delete leaves fails it here
+				// (sqlite3VdbeHalt checks the counters), before the table goes.
+				err = fkErrViolation()
+			}
+			if err != nil {
+				db.fkDeferred, db.fkDeferredImm = deferredBefore, deferredImmBefore
 				return err
 			}
 			if tbl.autoIncrement {

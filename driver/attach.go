@@ -42,6 +42,32 @@ type attachedDB struct {
 	name  string // the attach schema name (case preserved; matched case-insensitively)
 	path  string // backing file the engine opens for this database
 	isMem bool   // true for ATTACH ':memory:' -- path is a private temp file, deleted on DETACH/Close
+
+	// touchedInTxn marks a database the open transaction has read or written: C
+	// refuses to DETACH it until the transaction ends ("database aux is locked").
+	// Set by route when a statement in a held transaction names the database,
+	// cleared when the transaction ends (clearTouched).
+	touchedInTxn bool
+}
+
+// markTouched records that the held transaction used the attachment whose
+// schema name is schema ("" is main, which is never detachable anyway).
+func (c *Conn) markTouched(schema string) {
+	if c.tx == nil || schema == "" {
+		return
+	}
+	for _, a := range c.attached {
+		if r33sIdentEq(a.name, schema) {
+			a.touchedInTxn = true
+		}
+	}
+}
+
+// clearTouched ends every attachment's hold: the transaction is over.
+func (c *Conn) clearTouched() {
+	for _, a := range c.attached {
+		a.touchedInTxn = false
+	}
 }
 
 // handleAttachDetach intercepts an "ATTACH ... AS name" / "DETACH name"
@@ -212,6 +238,9 @@ func (c *Conn) detach(name string) error {
 	}
 	for i, a := range c.attached {
 		if r33sIdentEq(a.name, name) {
+			if c.tx != nil && a.touchedInTxn {
+				return fmt.Errorf("driver: database %s is locked", name)
+			}
 			c.attached = append(c.attached[:i], c.attached[i+1:]...)
 			if a.isMem {
 				// An in-memory database ends here: its session first (which
@@ -319,6 +348,9 @@ func (c *Conn) route(sqlText string) (path, schema, execSQL string, err error) {
 		}
 	}
 
+	for _, tg := range targets {
+		c.markTouched(tg.schema)
+	}
 	switch len(targets) {
 	case 0:
 		path, schema = c.path, "" // no resolvable base table (e.g. a CTE-only or FROM-less query): main

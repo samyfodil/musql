@@ -37,7 +37,9 @@ func TestFkStatementReachReadsTheConflictClauseAtItsGrammarPosition(t *testing.T
 				t.Fatalf("lex: %v", err)
 			}
 			kw, verbAt := writeDispatchKeywordAt(tc.sql, toks)
-			got := fkStatementReach(kw, toks, verbAt)
+			// Only the action-reach bits are this test's subject; fkReachInsert and
+			// fkReachMultiWrite describe the parent-side check of an INSERT itself.
+			got := fkStatementReach(kw, toks, verbAt) &^ (fkReachInsert | fkReachMultiWrite)
 			if got != tc.want {
 				t.Errorf("fkStatementReach(%q) = %v, want %v", tc.sql, got, tc.want)
 			}

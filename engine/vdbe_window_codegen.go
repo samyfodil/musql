@@ -198,7 +198,9 @@ func emitWindowOperands(c *compiler, opBase int, opExprs []Expr, plan *windowPla
 			}
 			// Every operand reaching here must lower: aggItem.rowValue fails at
 			// run time on an unfilled register, so decline at compile time.
-			return fmt.Errorf("%w: window operand: %v", errVDBEUnsupported, err)
+			// (A rejection C makes itself -- no such function, no such column -- is
+			// kept as that error, not worded as a decline.)
+			return declineOrSemantic(err)
 		}
 		c.emit(Instruction{Op: OpSCopy, P1: r, P2: opBase + i})
 	}
