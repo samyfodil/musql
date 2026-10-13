@@ -165,7 +165,7 @@ func (m *vdbe) bulkLoadInTx(plan *insertPlan) *segBulkLoad {
 			bl.segs = append(bl.segs, raw)
 			bl.segBytes += len(raw)
 			return nil
-		}}
+		}, async: true}
 		tbl.bulk = bl
 		db.txBulks = append(db.txBulks, tbl)
 	}
@@ -180,6 +180,10 @@ func (m *vdbe) bulkLoadInTx(plan *insertPlan) *segBulkLoad {
 func (bl *segBulkLoad) truncateTo(tbl *tableMeta, n int) {
 	db := bl.db
 	if tbl.bulk != bl || bl.rows <= n {
+		return
+	}
+	if err := bl.cut.wait(); err != nil { // the segment in flight is rows we keep or cut
+		db.pendingLoadErr = err
 		return
 	}
 	if n == 0 {
@@ -227,6 +231,9 @@ func (bl *segBulkLoad) truncateTo(tbl *tableMeta, n int) {
 // eachRow walks the load's rows in order, built segments first, until fn
 // returns false.
 func (bl *segBulkLoad) eachRow(fn func(rid uint64, vals []Value) bool) {
+	if err := bl.cut.wait(); err != nil && bl.db != nil {
+		bl.db.pendingLoadErr = err
+	}
 	for _, raw := range bl.segs {
 		s, err := openSegment(raw)
 		if err != nil {
@@ -420,7 +427,7 @@ func (m *vdbe) bulkDrain(bl *segBulkLoad, tbl *tableMeta) error {
 // bulkSegments finishes t's direct-path load for the file rewrite: its
 // segments, in rowid order.
 func (t *tableMeta) bulkSegments() ([][]byte, error) {
-	if err := t.bulk.cut.flush(); err != nil {
+	if err := t.bulk.cut.finish(); err != nil {
 		return nil, err
 	}
 	return t.bulk.segs, nil
