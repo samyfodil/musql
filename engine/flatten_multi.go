@@ -21,6 +21,11 @@ func (p *ReadOnlyPager) r41FlattenMultiItem(stmt *SelectStmt, i int, expand bool
 	it := stmt.From[i]
 	var body *SelectStmt
 	var colNames []string
+	// Where the body's own FROM names resolve: here, for an inline subquery;
+	// in its definition's scope, for a CTE (owner); against the schema alone,
+	// for a view (isView).
+	var owner *cteBinding
+	isView := false
 	switch {
 	case it.Subquery != nil:
 		body = it.Subquery
@@ -32,8 +37,9 @@ func (p *ReadOnlyPager) r41FlattenMultiItem(stmt *SelectStmt, i int, expand bool
 				b.scopeDepth != len(p.cteScopes) {
 				return nil, false
 			}
-			body, colNames = b.core, b.colNames
+			body, colNames, owner = b.core, b.colNames, b
 		} else {
+			isView = true
 			pcv, ok := p.r37cViewBody(it)
 			if !ok {
 				return nil, false
@@ -41,7 +47,7 @@ func (p *ReadOnlyPager) r41FlattenMultiItem(stmt *SelectStmt, i int, expand bool
 			body, colNames = pcv.selectStmt, pcv.colNames
 		}
 	}
-	if body == nil || !selectCallsNondeterministicFunc(body) || it.Join != JoinInner && it.Join != JoinCross ||
+	if body == nil || !p.cVolatile(body) || it.Join != JoinInner && it.Join != JoinCross ||
 		len(it.Using) != 0 || it.Natural || it.IndexedBy != "" || it.NotIndexed {
 		return nil, false
 	}
@@ -145,14 +151,49 @@ func (p *ReadOnlyPager) r41FlattenMultiItem(stmt *SelectStmt, i int, expand bool
 				cols = names
 				break
 			}
-			if _, vis := p.lookupCTE(b.Table); vis && b.Schema == "" {
-				return nil, false // which definition it names depends on where it sits
+			if here, vis := p.lookupCTE(b.Table); vis && b.Schema == "" {
+				// Moved into the parent, the name binds to the parent's
+				// definition; it must be the one it bound to in the body.
+				if isView {
+					return nil, false
+				}
+				if owner != nil {
+					var there *cteBinding
+					func() {
+						defer p.enterCTEBodyScope(it.Table, owner)()
+						there, _ = p.lookupCTE(b.Table)
+					}()
+					if there != here {
+						return nil, false
+					}
+				}
+				if here.core == nil || here.recursive != nil || here.selfRef != nil {
+					return nil, false
+				}
+				names, ok := r36dDerivedNames(p, here.core, here.colNames, nil, 1)
+				if !ok {
+					return nil, false
+				}
+				cols = names
+				break
 			}
 			cb := b
 			cb.On = nil
 			tbl, ok := p.r37cOrdinaryBase(cb)
 			if !ok {
-				return nil, false
+				// A view: its name binds against the schema from the parent
+				// as it did from the body (no CTE in scope shadows it, checked
+				// above), and its columns are its body's.
+				pcv, isV, verr := p.resolveViewByNameIn(fromItemScope(b), b.Table)
+				if verr != nil || !isV || pcv == nil {
+					return nil, false
+				}
+				names, ok := r36dDerivedNames(p, pcv.selectStmt, pcv.colNames, nil, 1)
+				if !ok {
+					return nil, false
+				}
+				cols = names
+				break
 			}
 			cols = map[string]bool{}
 			for _, c := range tbl.cols {
@@ -300,7 +341,10 @@ func (p *ReadOnlyPager) r41FlattenMultiItem(stmt *SelectStmt, i int, expand bool
 			b.On = on
 		}
 		b.Alias = itemAlias[k]
-		b.flattened = b.Subquery == nil && bodyCTE[r33sFoldIdent(b.Table)] == nil
+		cb := b
+		cb.On = nil
+		_, isBase := p.r37cOrdinaryBase(cb)
+		b.flattened = b.Subquery == nil && isBase
 		moved[k] = b
 	}
 	a := &r41ArmFlat{f: f, where: bodyWhere, p: p, multi: moved}

@@ -83,6 +83,7 @@ func TestCoroutineRerunShapes(t *testing.T) {
 		"CREATE TABLE w(k INTEGER PRIMARY KEY, v) WITHOUT ROWID", "INSERT INTO w VALUES(1,1),(2,2)",
 		"CREATE TABLE ix(a, c)", "CREATE INDEX ixa ON ix(a)", "INSERT INTO ix VALUES(1,1),(2,2),(3,3)",
 		"CREATE VIEW v AS SELECT random() AS r FROM (SELECT 1) GROUP BY 1",
+		"CREATE VIEW v2 AS SELECT r FROM v",
 		"CREATE VIEW vw AS WITH t AS NOT MATERIALIZED (SELECT random() AS r) SELECT a.r = b.r AS e, a.r AS ar, b.r AS br FROM t a, t b",
 	)
 	for i, q := range []string{
@@ -125,6 +126,12 @@ func TestCoroutineRerunShapes(t *testing.T) {
 		"SELECT count(*) FROM x, v v1, v v2 WHERE v1.r = v2.r",
 		"SELECT v1.r = v2.r FROM v v1, v v2",
 		"SELECT count(DISTINCT r) FROM x LEFT JOIN v",
+		"SELECT count(DISTINCT r) FROM x, (SELECT r FROM v) AS t",
+		"SELECT count(DISTINCT r) FROM x, v2",
+		"WITH a AS (SELECT random() AS r FROM (SELECT 1) GROUP BY 1), b AS (SELECT r FROM a) SELECT count(DISTINCT r) FROM x, b",
+		"WITH a AS (SELECT random() AS r FROM (SELECT 1) GROUP BY 1), b AS (SELECT r FROM a) SELECT count(DISTINCT r) FROM b, x",
+		"WITH a AS (SELECT random() AS r FROM y), b AS (SELECT r FROM a) SELECT count(DISTINCT r) FROM x, b",
+		"WITH a AS (SELECT random() AS r FROM y), b AS (SELECT r + 0 AS r FROM a) SELECT count(DISTINCT r) FROM x, b",
 		"SELECT e FROM x, vw",
 		"SELECT count(DISTINCT ar), count(DISTINCT br) FROM x, vw",
 		"SELECT count(*) FROM vw, x WHERE e",

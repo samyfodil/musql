@@ -420,7 +420,7 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 			volatile = true // checked below, once the FROM list is known to line up
 			break
 		}
-		if body, _, _, ok := p.cSubqueryBody(stmt.From[i]); ok && selectCallsNondeterministicFunc(body) {
+		if body, _, _, ok := p.cSubqueryBody(stmt.From[i]); ok && p.cVolatile(body) {
 			volatile = true
 		}
 	}
@@ -488,7 +488,7 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 		// An item 0 that a CROSS JOIN (or nothing) follows is the outer loop
 		// whatever it costs: run once, as here.
 		forcedOuter := i == 0 && (len(items) == 1 || items[1].CrossKeyword)
-		if co && !forcedOuter && selectCallsNondeterministicFunc(body) {
+		if co && !forcedOuter && p.cVolatile(body) {
 			rerun[i] = true
 		}
 	}
@@ -509,14 +509,17 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 			prog = p.cteBodyProgram(c, items[i].Table, sq.cte)
 		}
 		compile := func(s *SelectStmt) *Program {
-			if sq.cte != nil {
-				defer p.enterCTEBodyScope(items[i].Table, sq.cte)()
-			}
-			sp, err := compileSubProgram(p, s, c.outer)
-			if err != nil {
-				return nil
-			}
-			return sp
+			var prog *Program
+			p.keepingCTEUses(func() {
+				if sq.cte != nil {
+					defer p.enterCTEBodyScope(items[i].Table, sq.cte)()
+				}
+				sp, err := compileSubProgram(p, s, c.outer)
+				if err == nil {
+					prog = sp
+				}
+			})
+			return prog
 		}
 		est, eok := cSelectRowEst(sq.body, prog, compile, c.nQueryLoop, c.outer == nil || c.nQueryLoopKnown)
 		if sq.cte != nil && !sq.co {
@@ -604,12 +607,36 @@ func (p *ReadOnlyPager) cteBodyProgram(c *compiler, name string, b *cteBinding) 
 			return nil
 		}
 	}
-	defer p.enterCTEBodyScope(name, b)()
-	prog, err := compileSubProgram(p, b.core, c.outer)
-	if err != nil {
-		return nil
-	}
+	var prog *Program
+	p.keepingCTEUses(func() {
+		defer p.enterCTEBodyScope(name, b)()
+		sp, err := compileSubProgram(p, b.core, c.outer)
+		if err == nil {
+			prog = sp
+		}
+	})
 	return prog
+}
+
+// keepingCTEUses runs fn, a compile made only to read an estimate off, and
+// then puts back every in-scope CTE's reference count (cteBinding.nUse):
+// resolveCTESource counts each FROM item it resolves, and a reference this
+// compile resolved is not one the statement holds.
+func (p *ReadOnlyPager) keepingCTEUses(fn func()) {
+	saved := map[*cteBinding]int{}
+	for _, frame := range p.cteScopes {
+		for _, b := range frame {
+			if b != nil {
+				saved[b] = b.nUse
+			}
+		}
+	}
+	defer func() {
+		for b, n := range saved {
+			b.nUse = n
+		}
+	}()
+	fn()
 }
 
 // cOrderByAllResultCols is flattenSubquery's restriction (18) test: every
@@ -1058,17 +1085,24 @@ func (p *ReadOnlyPager) cFlattenKeepsAnswer(body *SelectStmt) bool {
 			return false
 		}
 		if it.Subquery != nil {
-			if selectCallsNondeterministicFunc(it.Subquery) {
+			if p.cVolatile(it.Subquery) {
 				return false
 			}
 			continue
 		}
-		if it.TableFunc || it.Schema != "" {
+		if it.TableFunc {
+			continue
+		}
+		if it.Schema != "" {
+			// Never a CTE; a view's body is followed like any subquery's.
+			if sb, _, _, ok := p.cSubqueryBody(it); ok && p.cVolatile(sb) {
+				return false
+			}
 			continue
 		}
 		name := r33sFoldIdent(it.Table)
 		if d, ok := defs[name]; ok {
-			if !selectCallsNondeterministicFunc(d.Select) {
+			if !p.cVolatile(d.Select) {
 				continue
 			}
 			if d.Materialized == cteM10dYes || (d.Materialized != cteM10dNo && uses[name] >= 2) {
@@ -1076,9 +1110,109 @@ func (p *ReadOnlyPager) cFlattenKeepsAnswer(body *SelectStmt) bool {
 			}
 			return false
 		}
-		if sb, _, _, ok := p.cSubqueryBody(it); ok && selectCallsNondeterministicFunc(sb) {
+		if sb, _, _, ok := p.cSubqueryBody(it); ok && p.cVolatile(sb) {
 			return false
 		}
 	}
 	return true
+}
+
+// cVolatile is selectCallsNondeterministicFunc that also follows FROM items
+// naming a CTE in scope or a view into their bodies, which C has expanded into
+// subqueries by the time it decides anything: "WITH a AS (SELECT random() ...),
+// b AS (SELECT r FROM a) ... FROM x, b" runs a's body wherever b's runs.
+func (p *ReadOnlyPager) cVolatile(s *SelectStmt) bool {
+	return p.cVolatileDepth(s, map[string]bool{}, 0)
+}
+
+func (p *ReadOnlyPager) cVolatileDepth(s *SelectStmt, seen map[string]bool, depth int) bool {
+	if s == nil {
+		return false
+	}
+	if selectCallsNondeterministicFunc(s) {
+		return true
+	}
+	if depth > 8 || p == nil {
+		return false
+	}
+	for _, name := range selectFromNames(s) {
+		key := r33sFoldIdent(name)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if b, ok := p.lookupCTE(name); ok && b.core != nil {
+			if p.cVolatileDepth(b.core, seen, depth+1) {
+				return true
+			}
+			continue
+		}
+		if pcv, ok, err := p.resolveViewByNameIn(scopeAny, name); err == nil && ok && pcv != nil {
+			if p.cVolatileDepth(pcv.selectStmt, seen, depth+1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// selectFromNames is every unqualified table name a FROM item anywhere in s's
+// tree spells: its FROM clauses, compound arms, WITH bodies and the subqueries
+// of its expressions.
+func selectFromNames(s *SelectStmt) []string {
+	var out []string
+	var walkSel func(*SelectStmt)
+	var walkExpr func(Expr)
+	walkExpr = func(e Expr) {
+		if e == nil {
+			return
+		}
+		switch x := e.(type) {
+		case SubqueryExpr:
+			walkSel(x.Stmt)
+			return
+		case ExistsExpr:
+			walkSel(x.Stmt)
+			return
+		case InExpr:
+			if x.Sub != nil {
+				walkSel(x.Sub)
+			}
+		}
+		wherePlanWalkChildren(e, walkExpr)
+	}
+	walkSel = func(s *SelectStmt) {
+		if s == nil {
+			return
+		}
+		for _, d := range s.CTEs {
+			walkSel(d.Select)
+		}
+		for _, it := range s.From {
+			if it.Subquery != nil {
+				walkSel(it.Subquery)
+			} else if it.Table != "" && !it.TableFunc {
+				out = append(out, it.Table)
+			}
+			walkExpr(it.On)
+		}
+		for _, c := range s.Columns {
+			if !c.Star {
+				walkExpr(c.Expr)
+			}
+		}
+		walkExpr(s.Where)
+		walkExpr(s.Having)
+		for _, g := range s.GroupBy {
+			walkExpr(g)
+		}
+		for _, ot := range s.OrderBy {
+			walkExpr(ot.Expr)
+		}
+		for _, a := range s.Compound {
+			walkSel(a.Stmt)
+		}
+	}
+	walkSel(s)
+	return out
 }

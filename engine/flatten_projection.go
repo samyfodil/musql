@@ -203,7 +203,7 @@ func (p *ReadOnlyPager) r41FlattenItem(stmt *SelectStmt, i int, expand bool) (*S
 		// that is not DISTINCT. The parent WHERE must be empty here, since
 		// OUTER JOIN STRENGTH REDUCTION (tag-select-0220) runs first in C and
 		// a WHERE could turn the join into an inner one.
-		if !selectCallsNondeterministicFunc(body) || len(body.Compound) != 0 || stmt.Distinct || stmt.Where != nil ||
+		if !p.cVolatile(body) || len(body.Compound) != 0 || stmt.Distinct || stmt.Where != nil ||
 			len(it.Using) != 0 || it.Natural {
 			return nil, false
 		}
