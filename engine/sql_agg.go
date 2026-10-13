@@ -1370,7 +1370,7 @@ func (it *aggItem) finalize() (Value, error) {
 		// integer overflow (verified against the reference engine: the
 		// same all-integer, overflowing input that makes sum() raise
 		// "integer overflow" makes total() return a plain REAL).
-		return Value{Typ: Float, F: it.sumFloat()}, nil
+		return resultDouble(it.sumFloat()), nil
 
 	case aggAvg:
 		if it.cnt == 0 {
@@ -1380,7 +1380,7 @@ func (it *aggItem) finalize() (Value, error) {
 		// (unused-by-avg) integer running sum overflowed -- verified
 		// against the reference engine: avg() never raises sum()'s
 		// "integer overflow" error.
-		return Value{Typ: Float, F: it.sumFloat() / float64(it.cnt)}, nil
+		return resultDouble(it.sumFloat() / float64(it.cnt)), nil
 
 	case aggMin, aggMax:
 		if !it.haveBest {
@@ -1406,6 +1406,15 @@ func (it *aggItem) finalize() (Value, error) {
 	return Value{}, fmt.Errorf("engine: internal: unknown aggregate kind %d", it.kind)
 }
 
+// resultDouble is sqlite3_result_double: sqlite3VdbeMemSetDouble stores a NaN
+// as NULL (vdbemem.c), so sum/avg/total over +Inf and -Inf answer NULL.
+func resultDouble(f float64) Value {
+	if math.IsNaN(f) {
+		return Value{Typ: Null}
+	}
+	return Value{Typ: Float, F: f}
+}
+
 // finalizeSum implements sum()'s result:
 //
 //   - no non-NULL inputs: NULL.
@@ -1424,7 +1433,7 @@ func finalizeSum(it *aggItem) (Value, error) {
 		if it.sumOverflow {
 			return Value{}, fmt.Errorf("engine: integer overflow")
 		}
-		return Value{Typ: Float, F: it.kbnTotal()}, nil
+		return resultDouble(it.kbnTotal()), nil
 	}
 	return Value{Typ: Int, I: it.iSum}, nil
 }

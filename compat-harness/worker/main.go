@@ -21,6 +21,18 @@ type stmtResult struct {
 	Kind string     `json:"kind"`           // "rows" | "ok" | "error"
 	Cols []string   `json:"cols,omitempty"` // for Kind=="rows"
 	Rows [][]string `json:"rows,omitempty"` // normalized cell values
+	Err  string     `json:"err,omitempty"`  // error text, only when COMPAT_ERRTEXT=1
+}
+
+// errText is set by the harness for the gates that compare error wording; the
+// default differ leaves it off so error text stays out of its comparison.
+var errText = os.Getenv("COMPAT_ERRTEXT") == "1"
+
+func errResult(err error) stmtResult {
+	if errText {
+		return stmtResult{Kind: "error", Err: err.Error()}
+	}
+	return stmtResult{Kind: "error"}
 }
 
 func main() {
@@ -61,10 +73,18 @@ func main() {
 func runOne(db *sql.DB, sqlText string) stmtResult {
 	rows, err := db.Query(sqlText)
 	if err != nil {
+		if errText {
+			// The gates that compare error wording run each statement exactly
+			// once. Re-running a failed one is not harmless: after an ON
+			// CONFLICT ROLLBACK the transaction is gone and the second run
+			// succeeds, where C SQLite (which reports the error from the rows,
+			// not from Query) never runs it twice.
+			return errResult(err)
+		}
 		// Not a query (or a real error). Try Exec to distinguish DDL/DML that
 		// returns no rows from an actual error.
 		if _, eerr := db.Exec(sqlText); eerr != nil {
-			return stmtResult{Kind: "error"}
+			return errResult(err)
 		}
 		return stmtResult{Kind: "ok"}
 	}
@@ -72,7 +92,7 @@ func runOne(db *sql.DB, sqlText string) stmtResult {
 
 	cols, err := rows.Columns()
 	if err != nil {
-		return stmtResult{Kind: "error"}
+		return errResult(err)
 	}
 	res := stmtResult{Kind: "rows", Cols: cols}
 	for rows.Next() {
@@ -82,7 +102,7 @@ func runOne(db *sql.DB, sqlText string) stmtResult {
 			ptrs[i] = &cells[i]
 		}
 		if err := rows.Scan(ptrs...); err != nil {
-			return stmtResult{Kind: "error"}
+			return errResult(err)
 		}
 		norm := make([]string, len(cols))
 		for i, c := range cells {
@@ -91,7 +111,7 @@ func runOne(db *sql.DB, sqlText string) stmtResult {
 		res.Rows = append(res.Rows, norm)
 	}
 	if err := rows.Err(); err != nil {
-		return stmtResult{Kind: "error"}
+		return errResult(err)
 	}
 	return res
 }

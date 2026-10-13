@@ -393,6 +393,11 @@ func ParsePragma(sqlText string) (*PragmaStmt, error) {
 		}
 		i++
 	}
+	// parse.y's "ecmd ::= cmdx SEMI": the statement's own terminator is part
+	// of the statement, as it is for SELECT (ParseSelect takes one too).
+	if i < len(toks) && toks[i].kind == tkPunct && toks[i].text == ";" {
+		i++
+	}
 	if !(i < len(toks) && toks[i].kind == tkEOF) {
 		return nil, fmt.Errorf("engine: PRAGMA %s: unexpected trailing input", stmt.Name)
 	}

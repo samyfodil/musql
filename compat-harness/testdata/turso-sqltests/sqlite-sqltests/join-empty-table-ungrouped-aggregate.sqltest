@@ -1,0 +1,102 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/5233
+#
+# A JOIN with an ON clause and an ungrouped aggregate panicked when the left
+# table was empty: the autoindex cursor for the join is opened inside the loop
+# body (in a Once block), so when Rewind skips the loop entirely the cursor is
+# never opened, but the post-loop aggregation path still tried to read a
+# non-aggregate column from it via Column, panicking with "cursor id N is
+# None".
+
+setup empty-table {
+    CREATE TABLE t(x);
+}
+
+@setup empty-table
+test left-join-empty-table-ungrouped-aggregate {
+    SELECT b.x, COUNT(*) FROM t a LEFT JOIN t b ON a.x=b.x;
+}
+expect {
+    |0
+}
+
+@setup empty-table
+test inner-join-empty-table-ungrouped-aggregate {
+    SELECT b.x, COUNT(*) FROM t a JOIN t b ON a.x=b.x;
+}
+expect {
+    |0
+}
+
+setup empty-table-with-default {
+    CREATE TABLE t(x);
+    ALTER TABLE t ADD COLUMN y DEFAULT 99;
+}
+
+# This fails if ColumnRange doesn't check for NullRow.
+@setup empty-table-with-default
+test inner-join-empty-table-ungrouped-aggregate-column-range {
+    SELECT b.x, b.y, COUNT(*) FROM t a JOIN t b ON a.x=b.x;
+}
+expect {
+    ||0
+}
+
+# RowId (not just Column) must also read NULL from the never-opened cursor.
+@setup empty-table
+test inner-join-empty-table-ungrouped-aggregate-rowid {
+    SELECT a.rowid, b.rowid, COUNT(*) FROM t a JOIN t b ON a.x=b.x;
+}
+expect {
+    ||0
+}
+
+setup populated-table {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1),(2);
+}
+
+# Non-empty table but the WHERE clause filters out every row, so the join
+# body (and the autoindex cursor open) is still skipped.
+@setup populated-table
+test inner-join-filtered-out-ungrouped-aggregate {
+    SELECT b.x, COUNT(*) FROM t a JOIN t b ON a.x=b.x WHERE a.x > 5;
+}
+expect {
+    |0
+}
+
+# Control: with matching rows the non-aggregate column comes from a real row.
+@setup populated-table
+test inner-join-populated-ungrouped-aggregate {
+    SELECT b.x, COUNT(*) FROM t a JOIN t b ON a.x=b.x;
+}
+expect {
+    1|2
+}
+
+# An automatic index built over an empty table must stay empty. The build loop
+# used to jump into its own body when Rewind found no rows, so it inserted one
+# record of NULL columns. A seek on the NULL key from `k.w IS NULL` then found
+# that record and produced a row from the empty table.
+setup empty-autoindex-source {
+    CREATE TABLE p(id INT);
+    CREATE TABLE k(w, t);
+    INSERT INTO p VALUES (1);
+}
+
+@setup empty-autoindex-source
+test autoindex-over-empty-table-adds-no-rows {
+    SELECT 'row' FROM p JOIN k ON p.id IS NOT k.t WHERE k.w IS NULL;
+}
+expect {
+}
+
+@setup empty-autoindex-source
+test autoindex-over-empty-table-null-key-seek {
+    SELECT count(*) FROM p JOIN k ON p.id != k.t WHERE k.w IS NULL;
+}
+expect {
+    0
+}

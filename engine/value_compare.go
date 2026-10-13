@@ -203,23 +203,28 @@ func collatedTextCompareEnc(collation string, a, b []byte, enc TextEncoding) int
 // multi-byte UTF-8 text because every UTF-8 continuation/lead byte for a
 // non-ASCII rune is >= 0x80, well outside the 'A'-'Z' fold range.
 func nocaseCompare(a, b []byte) int {
+	// nocaseCollatingFunc (main.c:1096) over sqlite3StrNICmp (util.c:435): the
+	// walk stops at a NUL byte of the LEFT operand, so "a\0b" and "A\0c" are
+	// equal up to their (equal) lengths; a tie is then broken by length.
 	n := len(a)
 	if len(b) < n {
 		n = len(b)
 	}
+	r := 0
 	for i := 0; i < n; i++ {
-		ca, cb := asciiLowerByte(a[i]), asciiLowerByte(b[i])
-		if ca != cb {
-			if ca < cb {
-				return -1
-			}
-			return 1
+		la, lb := asciiLowerByte(a[i]), asciiLowerByte(b[i])
+		if a[i] == 0 || la != lb {
+			r = int(la) - int(lb)
+			break
 		}
 	}
+	if r == 0 {
+		r = len(a) - len(b)
+	}
 	switch {
-	case len(a) < len(b):
+	case r < 0:
 		return -1
-	case len(a) > len(b):
+	case r > 0:
 		return 1
 	}
 	return 0

@@ -77,6 +77,17 @@ func checkExprSupported(e Expr) error {
 		// itself a group aggregate.
 		return nil
 	case FuncExpr:
+		if inner, nested := windowCallInside(x); nested {
+			// A window function cannot be an argument of an aggregate or of
+			// another window function, nor sit in its FILTER, PARTITION BY or
+			// ORDER BY (resolve.c:1265-1277).
+			return semanticf("engine: misuse of window function %s()", inner.callName())
+		}
+		if x.Over != nil && x.Filter != nil && isWindowFunctionName(r33sFoldIdent(x.Name)) {
+			// sqlite3WindowUpdate (window.c:689): only an aggregate used as a
+			// window function takes a FILTER.
+			return semanticf("engine: FILTER clause may only be used with aggregate window functions")
+		}
 		if x.Star && len(x.Args) != 0 {
 			// A lone "*" is a legal spelling of an EMPTY argument list for any
 			// function (SQLite sets EP_Star and passes zero arguments; the
@@ -113,7 +124,7 @@ func checkExprSupported(e Expr) error {
 			// from its arguments, and takes none. C SQLite rejects a call
 			// with any at prepare time, in this wording.
 			if len(x.Args) != 0 {
-				return semanticf("engine: wrong number of arguments to function %s()", x.Name)
+				return semanticf("engine: wrong number of arguments to function %s()", x.callName())
 			}
 			return nil
 		}
@@ -124,12 +135,12 @@ func checkExprSupported(e Expr) error {
 			// entries -- see fts5_locale.go for why an unconditional entry
 			// would be a wrong answer in the default (no-fts5) build.
 			if len(x.Args) < lo || len(x.Args) > hi {
-				return semanticf("engine: wrong number of arguments to function %s()", x.Name)
+				return semanticf("engine: wrong number of arguments to function %s()", x.callName())
 			}
 			return checkExprsSupported(x.Args...)
 		}
 		if !supportedFuncs[r33sFoldIdent(x.Name)] {
-			return unknownOrUnsupportedFuncErr(x.Name)
+			return unknownOrUnsupportedFuncErr(x.callName())
 		}
 		// A wrong ARGUMENT COUNT is a prepare-time rejection C SQLite makes
 		// too, so it is errVDBESemantic (semanticf) and not a decline: it is
@@ -156,7 +167,7 @@ func checkExprSupported(e Expr) error {
 		if min, max, ok := funcArity(r33sFoldIdent(x.Name)); ok {
 			n := len(x.Args)
 			if n < min || (max >= 0 && n > max) {
-				return semanticf("engine: wrong number of arguments to function %s()", x.Name)
+				return semanticf("engine: wrong number of arguments to function %s()", x.callName())
 			}
 		}
 		if equalFoldName(x.Name, "likelihood") && len(x.Args) == 2 {

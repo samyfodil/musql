@@ -54,7 +54,23 @@ func levelZeroConstTerm(e Expr, scopes []tableScope, noColumns bool) bool {
 	return ok && sub
 }
 
+// constSubTerm reports whether every sub-select in e is a FROM-less one over
+// constants, whatever else e names: such a sub-select uses no table
+// (prereqAll 0, no TERM_VARSELECT), so where.c codes the term at the level of
+// the tables it names outside them, like any other.
+func constSubTerm(e Expr, scopes []tableScope) bool {
+	ok, _, sub := constTermWalkCols(e, scopes, false, true, true)
+	return ok && sub
+}
+
 func constTermWalk(e Expr, scopes []tableScope, noColumns, allowSub bool) (hoist, outer, sawSub bool) {
+	return constTermWalkCols(e, scopes, noColumns, allowSub, false)
+}
+
+// constTermWalkCols is constTermWalk; anyColumn accepts every column outside a
+// sub-select.
+func constTermWalkCols(e Expr, scopes []tableScope, noColumns, allowSub, anyColumn bool) (hoist, outer, sawSub bool) {
+	inSub := 0
 	var ok func(Expr) bool
 	ok = func(e Expr) bool {
 		switch x := e.(type) {
@@ -64,11 +80,18 @@ func constTermWalk(e Expr, scopes []tableScope, noColumns, allowSub bool) (hoist
 			return true
 		case SubqueryExpr:
 			sawSub = true
+			inSub++
+			defer func() { inSub-- }()
 			return allowSub && constSelect(x.Stmt, ok)
 		case ExistsExpr:
 			sawSub = true
+			inSub++
+			defer func() { inSub-- }()
 			return allowSub && constSelect(x.Stmt, ok)
 		case ColumnExpr:
+			if anyColumn {
+				return inSub == 0
+			}
 			// "X IS TRUE" carries the keyword as a name (desugarIsBool); with no
 			// column of that name in scope it is the constant, not an outer reference.
 			if kw := r33sFoldIdent(x.Name); x.Qualifier == "" && (kw == "true" || kw == "false") && !noColumns && columnIsOuterOnly(x, scopes) {
@@ -294,4 +317,153 @@ func existsJoinable(sel *SelectStmt) bool {
 	return len(sel.From) == 1 && sel.From[0].Subquery == nil && !sel.From[0].TableFunc &&
 		len(sel.Compound) == 0 && sel.Limit == nil && sel.LimitParam == nil &&
 		sel.Offset == nil && sel.OffsetParam == nil && !selectIsAggregateQuery(sel)
+}
+
+// isExistsBody reports whether stmt is the select of the EXISTS this compiler
+// is the body of. selectInnerLoop codes no result list for an SRT_Exists
+// destination (select.c, the "eDest!=SRT_Exists" arm), including an aggregate
+// query's, whose aggregates still step and whose HAVING still runs.
+func (c *compiler) isExistsBody(stmt *SelectStmt) bool {
+	return c.outer != nil && c.outer.existsStmt == stmt
+}
+
+// existsJoinPos is where existsToJoin (select.c) puts the table of one EXISTS
+// in the enclosing SELECT's join: level is its nesting level, and levels[i] is
+// that of the enclosing FROM clause's source i, whose scopes are scopes.
+//
+// This port runs the EXISTS as a subquery per enclosing row, so a term of its
+// WHERE that where.c would code at an enclosing level -- one naming only
+// enclosing tables, or a FROM-less sub-select (prereqAll 0, coded at the
+// outermost level) -- is tested before the subquery's loop when that level is
+// outside the EXISTS table's, and inside it otherwise.
+type existsJoinPos struct {
+	level  int
+	scopes []tableScope
+	levels []int
+
+	// src is the EXISTS table as the planned join holds it, when its loop is
+	// an inner full scan or an automatic index: an empty table there ends
+	// the whole join the first time its level is reached (addrHalt, as for
+	// any inner table -- constructAutomaticIndex's Rewind leaves the same
+	// way). cursor is the enclosing program's own read of it, opened by
+	// emitJoinLoops to tell; -1 until then.
+	src    *joinSource
+	cursor int
+}
+
+// before reports whether conjunct cj of the EXISTS's WHERE is coded at a level
+// outside the EXISTS table's.
+func (p *existsJoinPos) before(cj Expr) bool {
+	if p == nil {
+		return false
+	}
+	at := 0
+	refs := map[int]bool{}
+	collectTableRefs(cj, p.scopes, refs)
+	for r := range refs {
+		if r < len(p.levels) && p.levels[r] > at {
+			at = p.levels[r]
+		}
+	}
+	return at < p.level
+}
+
+// planExistsJoinTerms records, for the SELECT c compiles over srcs, what
+// existsToJoin does to each EXISTS it converts: where its table sits in the
+// join (existsJoinPos, from the planned order, or else from the rule that keeps
+// it right of every table its terms name, where.c's fromExists prerequisites),
+// and the constant terms of its WHERE, which sqlite3WhereBegin then codes
+// before the enclosing loops open like any other: an EXISTS over a table the
+// enclosing query never reaches still raises their error.
+func planExistsJoinTerms(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt *SelectStmt) {
+	c.existsPos, c.existsHoist = nil, nil
+	var subs []*SelectStmt
+	var levelOf []int
+	if ej := c.existsJoinPlan; ej != nil {
+		subs = ej.exists
+		levelOf = make([]int, len(ej.srcs))
+		for level, iTab := range ej.order {
+			if iTab < len(levelOf) {
+				levelOf[iTab] = level
+			}
+		}
+	} else {
+		subs = existsToJoinSubs(p, c, srcs, stmt)
+	}
+	if len(subs) == 0 {
+		return
+	}
+	orig := tableScopesOf(srcs)
+	c.existsPos = make(map[*SelectStmt]*existsJoinPos, len(subs))
+	for k, sub := range subs {
+		cjs := splitTopLevelAnd(sub.Where)
+		pos := &existsJoinPos{scopes: orig}
+		pos.cursor = -1
+		if levelOf != nil {
+			pos.level, pos.levels = levelOf[len(srcs)+k], levelOf[:len(srcs)]
+			ej := c.existsJoinPlan
+			var key *autoIndexKey
+			if pos.level < len(ej.keys) {
+				key = ej.keys[pos.level]
+			}
+			if x := &ej.srcs[len(srcs)+k]; pos.level > 0 && x.tbl != nil && x.derived == nil && x.vtabItem == nil &&
+				x.cteItem == nil && (key == nil || key.root == 0 && key.multiOr == nil) {
+				pos.src = x
+			}
+		} else {
+			// No plan: the enclosing tables in FROM order, and the EXISTS
+			// table outermost unless a term naming it also names one of them.
+			pos.levels = make([]int, len(srcs))
+			for i := range pos.levels {
+				pos.levels[i] = i
+			}
+			for _, cj := range cjs {
+				if hoist, _ := constWhereTerm(cj, orig, false); hoist {
+					continue // names no column of the EXISTS table
+				}
+				refs := map[int]bool{}
+				collectTableRefs(cj, orig, refs)
+				if len(refs) > 0 {
+					pos.level = len(srcs) + k
+					break
+				}
+			}
+		}
+		c.existsPos[sub] = pos
+		for _, cj := range cjs {
+			if hoist, outer := constWhereTerm(cj, orig, false); hoist && !outer {
+				c.existsHoist = append(c.existsHoist, cj)
+			}
+		}
+	}
+}
+
+// existsToJoinSubs is the EXISTS selects existsToJoin converts in stmt, by the
+// test wherePlanExistsToJoin applies, for when the planner could not follow
+// the rewrite.
+func existsToJoinSubs(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt *SelectStmt) []*SelectStmt {
+	if p == nil || c == nil || c.onePassPlan || stmt == nil || stmt.Where == nil ||
+		stmt.Offset != nil || stmt.OffsetParam != nil {
+		return nil
+	}
+	var subs []*SelectStmt
+	var walk func(Expr)
+	walk = func(e Expr) {
+		switch x := e.(type) {
+		case BinaryExpr:
+			if equalFoldName(x.Op, "AND") {
+				walk(x.L)
+				walk(x.R)
+			}
+		case ExistsExpr:
+			if !x.Not && existsToJoinCandidate(x.Stmt) {
+				subs = append(subs, x.Stmt)
+			}
+		}
+	}
+	walk(stmt.Where)
+	if len(srcs)+len(subs) >= 64 {
+		return nil
+	}
+	return subs
 }

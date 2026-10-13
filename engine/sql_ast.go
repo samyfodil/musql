@@ -1250,3 +1250,12 @@ type CTEDef struct {
 	// CTEMaterialization (cte.go) and r38cExpandCTERef (flatten_limit_r35c.go).
 	Materialized CTEMaterialization
 }
+
+// callName is the spelling a diagnostic echoes: %#T prints the call's token as
+// written.
+func (f FuncExpr) callName() string {
+	if f.NameAsWritten != "" {
+		return f.NameAsWritten
+	}
+	return f.Name
+}

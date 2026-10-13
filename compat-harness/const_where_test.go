@@ -31,13 +31,17 @@ func TestConstWhereIssueShapes(t *testing.T) {
 }
 
 // constWhereKnownOpen are shapes whose divergence is not the constant term
-// itself. Both need a sub-select term (coded in the first loop by where.c, not
-// hoisted) to land in the same loop as in C: the first is C's EXISTS-to-JOIN
-// turning the subquery's table into one more loop, the second is the join order
-// of an UPDATE ... FROM's first pass, which is not planned here.
+// itself, left for later work. Both are an EXISTS that existsToJoin turns into
+// a join, run here as a subquery per enclosing row:
+//
+//   - the first has a sub-select in its WHERE, which the planner port cannot
+//     follow (existsJoinSource), so the EXISTS table's empty-table exit
+//     (addrHalt) that ends C's join after the first row is not known;
+//   - in the second C puts the EXISTS table outermost and codes the term in
+//     its loop, which this port cannot reach when the enclosing table is empty.
 var constWhereKnownOpen = map[string]bool{
-	`SELECT k FROM t WHERE EXISTS (SELECT 1 FROM e x WHERE x.k = t.k AND (SELECT abs(-9223372036854775807-1)) > 0)`: true,
-	`UPDATE u SET v = 0 FROM e x WHERE u.k = x.k AND (SELECT abs(-9223372036854775807-1)) > 0`:                      true,
+	`SELECT k FROM t WHERE EXISTS (SELECT 1 FROM e x WHERE x.k = t.k AND CASE WHEN t.k = 2 THEN (SELECT abs(-9223372036854775807-1)) > 0 ELSE 1 END)`: true,
+	`SELECT k FROM e o WHERE EXISTS (SELECT 1 FROM t WHERE (SELECT abs(-9223372036854775807-1)) > 0)`:                                                 true,
 }
 
 // TestConstWhereCrossProduct is the sweep: constant terms (error, true, false,
@@ -113,6 +117,46 @@ func TestConstWhereCrossProduct(t *testing.T) {
 		`INSERT INTO e SELECT k FROM %[1]s WHERE %[2]s UNION SELECT k FROM u WHERE %[2]s`,
 		`WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 3 AND (%[2]s)) SELECT n, (SELECT count(*) FROM %[1]s) FROM r`,
 		`DELETE FROM u WHERE %[2]s AND EXISTS (SELECT 1 FROM %[1]s)`,
+		// existsToJoin: a sub-select term runs in the enclosing table's loop,
+		// an outer-only one at its level, and a constant one before every loop.
+		`SELECT k FROM t WHERE EXISTS (SELECT 1 FROM %[1]s x WHERE x.k = t.k AND (SELECT %[2]s))`,
+		`SELECT k FROM t WHERE EXISTS (SELECT 1 FROM %[1]s x WHERE x.k = t.k AND CASE WHEN t.k = 2 THEN %[2]s ELSE 1 END)`,
+		`SELECT k FROM t WHERE EXISTS (SELECT 1 FROM %[1]s x WHERE (SELECT %[2]s))`,
+		`SELECT k FROM e o WHERE EXISTS (SELECT 1 FROM %[1]s WHERE %[2]s)`,
+		`SELECT k FROM e o WHERE EXISTS (SELECT 1 FROM %[1]s x WHERE x.k = o.k AND %[2]s)`,
+		// UPDATE ... FROM's first pass is a SELECT with the target first.
+		`UPDATE u SET v = 0 FROM %[1]s x WHERE (SELECT %[2]s)`,
+		`UPDATE u SET v = 0 FROM t y, %[1]s x WHERE u.k = x.k AND (SELECT %[2]s)`,
+		`UPDATE u SET v = 0 FROM %[1]s x, t y WHERE u.k = x.k AND (SELECT %[2]s)`,
+		// An EXISTS evaluates no result list, aggregate, grouped, windowed or
+		// in a UNION ALL arm, and stops at its first row.
+		`SELECT EXISTS (SELECT count(*), %[2]s FROM %[1]s)`,
+		`SELECT EXISTS (SELECT k, %[2]s FROM %[1]s GROUP BY k)`,
+		`SELECT EXISTS (SELECT k, row_number() OVER (), %[2]s FROM %[1]s)`,
+		`SELECT EXISTS (SELECT %[2]s FROM %[1]s UNION ALL SELECT 1)`,
+		`SELECT EXISTS (SELECT 1 FROM %[1]s UNION ALL SELECT %[2]s)`,
+		`SELECT EXISTS (SELECT 1 FROM %[1]s UNION SELECT %[2]s)`,
+		`SELECT EXISTS (SELECT k FROM %[1]s UNION ALL SELECT %[2]s ORDER BY 1)`,
+		// A compound's LIMIT is counted across its UNION ALL arms, and 0 runs none.
+		`SELECT %[2]s FROM %[1]s UNION ALL SELECT 1 LIMIT 0`,
+		`SELECT k FROM %[1]s UNION SELECT k FROM t WHERE %[2]s LIMIT 0`,
+		`SELECT 1 UNION ALL SELECT %[2]s FROM %[1]s LIMIT 1`,
+		`SELECT k FROM %[1]s UNION ALL SELECT %[2]s LIMIT 1`,
+		`SELECT * FROM (SELECT DISTINCT CASE WHEN k = 2 THEN %[2]s END FROM %[1]s) LIMIT 1`,
+		`SELECT k FROM %[1]s UNION SELECT 7 UNION ALL SELECT %[2]s LIMIT 2`,
+		`SELECT * FROM (SELECT k FROM %[1]s UNION ALL SELECT %[2]s LIMIT 1)`,
+		`SELECT k FROM %[1]s LIMIT 0 OFFSET (%[2]s)`,
+		// A materialization runs when its loop is reached; an empty inner
+		// table ends the join.
+		`WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 3 AND (%[2]s)) SELECT * FROM r, %[1]s`,
+		`WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 3 AND (%[2]s)) SELECT * FROM %[1]s, r`,
+		`SELECT * FROM %[1]s a, (SELECT DISTINCT k FROM t WHERE %[2]s)`,
+		`WITH c AS MATERIALIZED (SELECT k FROM t WHERE %[2]s) SELECT * FROM %[1]s a, c`,
+		`SELECT * FROM %[1]s a, json_each('[1,2]') WHERE %[2]s`,
+		`SELECT * FROM t, %[1]s x WHERE CASE WHEN t.k = 2 THEN %[2]s ELSE 1 END ORDER BY 1, 2`,
+		`SELECT * FROM t, u, %[1]s x WHERE CASE WHEN t.k = 2 THEN %[2]s ELSE 1 END ORDER BY 1, 2, 3, 4`,
+		`SELECT * FROM t LEFT JOIN u ON 1, %[1]s x WHERE CASE WHEN t.k = 2 THEN %[2]s ELSE 1 END`,
+		`SELECT count(*) FROM t, %[1]s x, u WHERE CASE WHEN u.k = 2 THEN %[2]s ELSE 1 END`,
 	}
 	n, total := 0, 0
 	for _, tab := range []string{"e", "t"} {
@@ -213,8 +257,11 @@ func TestConstWhereParameters(t *testing.T) {
 
 // An EXISTS only asks whether a row arrives, so selectInnerLoop never evaluates
 // its result list (select.c, the eDest!=SRT_Exists arm) and sqlite3Select drops
-// its DISTINCT and ORDER BY first. Names in the list are still resolved. Left
-// open: the same for an aggregate list and for a UNION ALL arm.
+// its DISTINCT and ORDER BY first. Names in the list are still resolved. The
+// same holds for an aggregate or windowed list, whose aggregates still step,
+// and for each UNION ALL arm multiSelect codes in turn under the EXISTS's
+// LIMIT 1; a merged arm (UNION, INTERSECT, EXCEPT) is a co-routine and is
+// evaluated.
 func TestConstWhereExistsResultList(t *testing.T) {
 	ovf := `abs(-9223372036854775807-1)`
 	differ(t, "EXISTS does not evaluate its result list", append(append([]string{}, constWhereSetup...),
@@ -230,6 +277,17 @@ func TestConstWhereExistsResultList(t *testing.T) {
 		`SELECT EXISTS(SELECT 1 FROM t ORDER BY nosuchcol)`,
 		`SELECT EXISTS(SELECT * FROM t, u)`,
 		`SELECT EXISTS(SELECT (SELECT `+ovf+`) FROM t)`,
+		`SELECT EXISTS(SELECT count(*), `+ovf+` FROM t)`,
+		`SELECT EXISTS(SELECT sum(`+ovf+`) FROM t)`,
+		`SELECT EXISTS(SELECT k, `+ovf+` FROM t GROUP BY k)`,
+		`SELECT EXISTS(SELECT k FROM t GROUP BY k HAVING `+ovf+` > 0)`,
+		`SELECT EXISTS(SELECT k, row_number() OVER (), `+ovf+` FROM t)`,
+		`SELECT k FROM t WHERE EXISTS(SELECT count(*), `+ovf+` FROM u WHERE u.k = t.k)`,
+		`SELECT EXISTS(SELECT `+ovf+` FROM t UNION ALL SELECT 1)`,
+		`SELECT EXISTS(SELECT 1 UNION ALL SELECT `+ovf+` FROM t)`,
+		`SELECT EXISTS(SELECT 1 UNION SELECT `+ovf+` FROM t)`,
+		`SELECT EXISTS(SELECT `+ovf+` FROM t UNION ALL SELECT 1 ORDER BY 1)`,
+		`SELECT EXISTS(SELECT 1 FROM e UNION ALL SELECT `+ovf+` FROM t LIMIT 5)`,
 	))
 }
 
@@ -250,5 +308,22 @@ func TestConstWhereLimitZero(t *testing.T) {
 		`SELECT k FROM t WHERE `+ovf+`>0 LIMIT 1 OFFSET 5`,
 		`SELECT * FROM (SELECT k FROM t WHERE `+ovf+`>0 LIMIT 0)`,
 		`SELECT k FROM t WHERE nosuchcol > 0 LIMIT 0`,
+		// A compound: no arm runs (multiSelect), and a UNION ALL arm is not
+		// started once the arms before it used the LIMIT up.
+		`SELECT `+ovf+` UNION ALL SELECT 1 LIMIT 0`,
+		`SELECT 1 UNION SELECT `+ovf+` LIMIT 0`,
+		`SELECT k FROM t INTERSECT SELECT `+ovf+` FROM t LIMIT 0`,
+		`SELECT k FROM t EXCEPT SELECT `+ovf+` FROM t ORDER BY 1 LIMIT 0`,
+		`SELECT * FROM (SELECT `+ovf+` UNION ALL SELECT 1 LIMIT 0)`,
+		`SELECT 1 IN (SELECT `+ovf+` UNION ALL SELECT 1 LIMIT 0)`,
+		`SELECT 1 UNION ALL SELECT `+ovf+` LIMIT 1`,
+		`SELECT CASE WHEN k = 2 THEN `+ovf+` END FROM t UNION ALL SELECT 1 LIMIT 1`,
+		`SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT `+ovf+` LIMIT 1 OFFSET 1`,
+		`SELECT 1 UNION SELECT 2 UNION ALL SELECT `+ovf+` LIMIT 2`,
+		// Nor is the OFFSET, coded after the LIMIT's jump.
+		`SELECT k FROM t LIMIT 0 OFFSET `+ovf,
+		`SELECT k FROM t LIMIT 0 OFFSET 'x'`,
+		`SELECT (SELECT k FROM t LIMIT 0 OFFSET `+ovf+`)`,
+		`SELECT 1 UNION ALL SELECT 2 LIMIT 0 OFFSET `+ovf,
 	))
 }

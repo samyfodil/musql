@@ -477,7 +477,16 @@ func (db *DB) CreateIndex(sqlText string) error {
 	if err := db.checkReservedObjectName(stmt.name); err != nil {
 		return err
 	}
-	if existing := db.findIndexMetaIn(stmt.scope, stmt.name); existing != nil {
+	// An unqualified index name lands in the schema of the table it indexes
+	// (sqlite3CreateIndex: iDb = sqlite3SchemaToIndex(pTab->pSchema)), so
+	// "dup_idx" may exist in main and be created again for a TEMP table.
+	nameScope := stmt.scope
+	if nameScope == scopeAny {
+		if t := db.findTableMetaIn(scopeAny, stmt.table); t != nil {
+			nameScope = createScope(t.isTemp)
+		}
+	}
+	if existing := db.findIndexMetaIn(nameScope, stmt.name); existing != nil {
 		if stmt.ifNotExi {
 			return nil
 		}
@@ -487,7 +496,7 @@ func (db *DB) CreateIndex(sqlText string) error {
 	// collision with either of the first two as "there is already a table
 	// named X" (a view counts as a table here) -- verified directly, and
 	// NOT suppressed by IF NOT EXISTS, which only covers index-vs-index.
-	if db.findTableMetaIn(stmt.scope, stmt.name) != nil || db.findViewMetaIn(stmt.scope, stmt.name) != nil {
+	if db.findTableMetaIn(nameScope, stmt.name) != nil || db.findViewMetaIn(nameScope, stmt.name) != nil {
 		return fmt.Errorf("engine: there is already a table named %s", stmt.name)
 	}
 	// SQLite's own internal tables may not be indexed, whatever they are and
