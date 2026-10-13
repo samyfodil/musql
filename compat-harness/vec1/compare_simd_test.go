@@ -127,14 +127,59 @@ func equalResults(got, want result) bool {
 		for j < n && wantClose(want.rows[j-1][dist], want.rows[j][dist]) {
 			j++
 		}
+		ok := false
 		if j == i+1 {
-			if !rowEqual(got.rows[i], want.rows[i]) {
-				return false
-			}
-		} else if !sameRows(got.rows[i:j], want.rows[i:j], isDist, rowEqual) {
+			ok = rowEqual(got.rows[i], want.rows[i])
+		} else {
+			ok = sameRows(got.rows[i:j], want.rows[i:j], isDist, rowEqual)
+		}
+		// The results end where K or a LIMIT cuts them, which can fall inside
+		// a tie: of several rows at one distance, each engine keeps the ones
+		// it ranks first. The last rows may then be other rows of that tie.
+		if !ok && j == n && cutTie(got.rows[i:], want.rows[i:], dist, isDist) {
+			ok = true
+		}
+		if !ok {
 			return false
 		}
 		i = j
+	}
+	return true
+}
+
+// cutTie says the rows of got that want lacks (and the other way round) are
+// all within tolerance of the last distance of want, so that the two answers
+// differ only in which tied rows the cut kept.
+func cutTie(got, want [][]cell, dist int, isDist []bool) bool {
+	key := func(r []cell) string {
+		var sb strings.Builder
+		for i, c := range r {
+			if !isDist[i] {
+				sb.WriteString(c.s)
+				sb.WriteByte('|')
+			}
+		}
+		return sb.String()
+	}
+	in := map[string]bool{}
+	for _, r := range want {
+		in[key(r)] = true
+	}
+	last := want[len(want)-1][dist]
+	for _, r := range got {
+		if !in[key(r)] && !wantClose(r[dist], last) {
+			return false
+		}
+	}
+	// And the same the other way round.
+	in = map[string]bool{}
+	for _, r := range got {
+		in[key(r)] = true
+	}
+	for _, r := range want {
+		if !in[key(r)] && !wantClose(r[dist], last) {
+			return false
+		}
 	}
 	return true
 }
