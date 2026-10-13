@@ -119,7 +119,11 @@ func (prog *Program) putMachine(m *vdbe) {
 		clear(jsnap[i].row[:cap(jsnap[i].row)])
 		jsnap[i] = jitSnap{row: jsnap[i].row[:0]}
 	}
-	*m = vdbe{regs: regs, cursors: cursors, recRegs: recRegs, subCache: sub[:0], jcur: jcur, jsnap: jsnap}
+	// Zeroed in place, then the kept slices put back: the same machine as the
+	// composite literal this was, without building that 1 KB literal and
+	// copying it over -- most of what returning a machine cost per statement.
+	*m = vdbe{}
+	m.regs, m.cursors, m.recRegs, m.subCache, m.jcur, m.jsnap = regs, cursors, recRegs, sub[:0], jcur, jsnap
 	vdbeMachines.Put(m)
 }
 

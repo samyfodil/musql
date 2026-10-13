@@ -607,7 +607,8 @@ func (db *DB) putWriteCtx(wc *writeCtx) {
 		clear(j[:cap(j)])
 		j = j[:0]
 	}
-	*wc = writeCtx{db: db}
+	*wc = writeCtx{} // zeroed in place: building the literal and copying it cost as much again
+	wc.db = db
 	if j != nil {
 		wc.journal = j
 	}
