@@ -287,6 +287,15 @@ func (db *DB) r35aNoteTempDatabaseOpen(sqlText string) {
 	if db == nil {
 		return
 	}
+	db.r35aNoteTempDatabaseOpenGiven(sqlText, db.holdsAnyTempObject())
+}
+
+// r35aNoteTempDatabaseOpenGiven is r35aNoteTempDatabaseOpen for a caller that
+// already knows holdsAnyTempObject's answer for this statement.
+func (db *DB) r35aNoteTempDatabaseOpenGiven(sqlText string, temp bool) {
+	if db == nil {
+		return
+	}
 	// ...and, in the same pass, whether the temp database has ever held an
 	// object, which its page_count turns on (r35aEmptyTempPragmaResult).
 	// Reading it off the schema before each statement catches every route
@@ -298,10 +307,10 @@ func (db *DB) r35aNoteTempDatabaseOpen(sqlText string) {
 	// driven from the read paths and CREATE TEMP TABLE reaches neither.
 	// Gated on !tempDatabaseOpened so sessions that never touch temp do not
 	// walk the schema per statement.
-	if !db.tempDatabaseOpened && db.holdsAnyTempObject() {
+	if !db.tempDatabaseOpened && temp {
 		db.tempDatabaseOpened = true
 	}
-	if db.tempDatabaseOpened && !db.tempDatabaseHeldObject && db.holdsAnyTempObject() {
+	if db.tempDatabaseOpened && !db.tempDatabaseHeldObject && temp {
 		db.tempDatabaseHeldObject = true
 	}
 	if db.tempDatabaseOpened {

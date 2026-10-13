@@ -253,7 +253,7 @@ func TestSegDiskIndexRefusesACorruptRecord(t *testing.T) {
 	if off == 0 {
 		t.Fatal("no index was built, so this test proves nothing")
 	}
-	if _, ok := openSegColumnIndex(good, off, n, sg.heap); !ok {
+	if _, ok := openSegColumnIndex(good, off, n, sg.heap, nil); !ok {
 		t.Fatal("the UNDAMAGED record is refused, so every case below would pass vacuously")
 	}
 
@@ -293,7 +293,7 @@ func TestSegDiskIndexRefusesACorruptRecord(t *testing.T) {
 					t.Errorf("%s: PANICKED (%v) -- a malformed file must be declined, never panic", tc.name, r)
 				}
 			}()
-			if _, ok := openSegColumnIndex(bad, off, n, sg.heap); ok {
+			if _, ok := openSegColumnIndex(bad, off, n, sg.heap, nil); ok {
 				t.Errorf("%s: accepted", tc.name)
 			}
 		}()

@@ -1,0 +1,98 @@
+SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY name
+string(table) | string(boxes) | string(boxes) | string(CREATE VIRTUAL TABLE boxes USING rtree(id, x0, x1, y0, y1))
+string(table) | string(boxes_node) | string(boxes_node) | string(CREATE TABLE "boxes_node"(nodeno INTEGER PRIMARY KEY,data))
+string(table) | string(boxes_parent) | string(boxes_parent) | string(CREATE TABLE "boxes_parent"(nodeno INTEGER PRIMARY KEY,parentnode))
+string(table) | string(boxes_rowid) | string(boxes_rowid) | string(CREATE TABLE "boxes_rowid"(rowid INTEGER PRIMARY KEY,nodeno))
+string(table) | string(docs4) | string(docs4) | string(CREATE VIRTUAL TABLE docs4 USING fts4(title, body))
+string(table) | string(docs4_content) | string(docs4_content) | string(CREATE TABLE 'docs4_content'(docid INTEGER PRIMARY KEY, 'c0title', 'c1body'))
+string(table) | string(docs4_docsize) | string(docs4_docsize) | string(CREATE TABLE 'docs4_docsize'(docid INTEGER PRIMARY KEY, size BLOB))
+string(table) | string(docs4_segdir) | string(docs4_segdir) | string(CREATE TABLE 'docs4_segdir'(level INTEGER,idx INTEGER,start_block INTEGER,leaves_end_block INTEGER,end_block INTEGER,root BLOB,PRIMARY KEY(level, idx)))
+string(table) | string(docs4_segments) | string(docs4_segments) | string(CREATE TABLE 'docs4_segments'(blockid INTEGER PRIMARY KEY, block BLOB))
+string(table) | string(docs4_stat) | string(docs4_stat) | string(CREATE TABLE 'docs4_stat'(id INTEGER PRIMARY KEY, value BLOB))
+string(table) | string(docs5) | string(docs5) | string(CREATE VIRTUAL TABLE docs5 USING fts5(title, body))
+string(table) | string(docs5_config) | string(docs5_config) | string(CREATE TABLE 'docs5_config'(k PRIMARY KEY, v) WITHOUT ROWID)
+string(table) | string(docs5_content) | string(docs5_content) | string(CREATE TABLE 'docs5_content'(id INTEGER PRIMARY KEY, c0, c1))
+string(table) | string(docs5_data) | string(docs5_data) | string(CREATE TABLE 'docs5_data'(id INTEGER PRIMARY KEY, block BLOB))
+string(table) | string(docs5_docsize) | string(docs5_docsize) | string(CREATE TABLE 'docs5_docsize'(id INTEGER PRIMARY KEY, sz BLOB))
+string(table) | string(docs5_idx) | string(docs5_idx) | string(CREATE TABLE 'docs5_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID)
+string(table) | string(emb) | string(emb) | string(CREATE TABLE emb(id INTEGER PRIMARY KEY, e F32_BLOB(4)))
+string(index) | string(emb_i) | string(emb) | string(CREATE INDEX emb_i ON emb(libsql_vector_idx(e)))
+string(table) | string(kinds) | string(kinds) | string(CREATE TABLE kinds(id INTEGER PRIMARY KEY, i INT, r REAL, t TEXT, b BLOB, n NUMERIC, any))
+string(index) | string(kinds_expr) | string(kinds) | string(CREATE INDEX kinds_expr ON kinds(i + 1) WHERE i IS NOT NULL)
+string(index) | string(kinds_t) | string(kinds) | string(CREATE INDEX kinds_t ON kinds(t COLLATE NOCASE DESC))
+string(view) | string(kinds_v) | string(kinds_v) | string(CREATE VIEW kinds_v AS SELECT id, typeof(i) AS ti, length(b) AS lb FROM kinds)
+string(table) | string(log) | string(log) | string(CREATE TABLE log(msg TEXT))
+string(table) | string(seq) | string(seq) | string(CREATE TABLE seq(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT UNIQUE))
+string(trigger) | string(seq_log) | string(seq) | string(CREATE TRIGGER seq_log AFTER INSERT ON seq BEGIN INSERT INTO log VALUES ('added ' || new.v); END)
+string(index) | string(sqlite_autoindex_docs4_segdir_1) | string(docs4_segdir) | <nil>(<nil>)
+string(index) | string(sqlite_autoindex_seq_1) | string(seq) | <nil>(<nil>)
+string(table) | string(sqlite_sequence) | string(sqlite_sequence) | string(CREATE TABLE sqlite_sequence(name,seq))
+string(table) | string(wr) | string(wr) | string(CREATE TABLE wr(a TEXT, b INT, c, PRIMARY KEY (a, b)) WITHOUT ROWID)
+
+SELECT id, i, typeof(i), r, typeof(r), t, quote(b), n, typeof(n), quote(any) FROM kinds ORDER BY id
+int64(1) | int64(42) | string(integer) | float64(1.5) | string(real) | string(TEXT) | string(X'00FF10') | int64(12) | string(integer) | string(NULL)
+int64(3) | <nil>(<nil>) | string(null) | <nil>(<nil>) | string(null) | <nil>(<nil>) | string(NULL) | <nil>(<nil>) | string(null) | string('mixed')
+int64(4) | int64(9223372036854775807) | string(integer) | float64(1e+308) | string(real) | string(é ünïcode ✓) | string(X'00000000') | int64(1000) | string(integer) | string(X'01')
+int64(5) | int64(5) | string(integer) | float64(5.5) | string(real) | string(after) | string(X'05') | int64(5) | string(integer) | string(5)
+
+SELECT id, t FROM kinds ORDER BY t COLLATE NOCASE DESC
+int64(4) | string(é ünïcode ✓)
+int64(1) | string(TEXT)
+int64(5) | string(after)
+int64(3) | <nil>(<nil>)
+
+SELECT i + 1 FROM kinds WHERE i + 1 > 0 ORDER BY 1
+int64(6)
+int64(43)
+float64(9.223372036854776e+18)
+
+SELECT * FROM wr ORDER BY a, b
+string(x) | int64(1) | string(one)
+string(x) | int64(2) | string(two)
+string(y) | int64(1) | <nil>(<nil>)
+string(z) | int64(9) | string(nine)
+
+SELECT * FROM seq ORDER BY id
+int64(1) | string(a)
+int64(2) | string(b)
+int64(4) | string(d)
+
+SELECT name, seq FROM sqlite_sequence
+string(seq) | int64(4)
+
+SELECT * FROM log
+string(added d)
+
+SELECT * FROM kinds_v ORDER BY id
+int64(1) | string(integer) | int64(3)
+int64(3) | string(null) | <nil>(<nil>)
+int64(4) | string(integer) | int64(4)
+int64(5) | string(integer) | int64(1)
+
+SELECT id, vector_extract(e) FROM emb WHERE e IS NOT NULL ORDER BY id
+int64(1) | string([1,0,0,0])
+int64(2) | string([0,1,0,0])
+int64(3) | string([1,1,0,0])
+int64(5) | string([0,0,1,0])
+
+SELECT id FROM vector_top_k('emb_i', vector('[1,0.1,0,0]'), 3)
+int64(1)
+int64(3)
+int64(2)
+
+SELECT title FROM docs4 WHERE docs4 MATCH 'quick'
+string(first)
+
+SELECT title FROM docs5 WHERE docs5 MATCH 'quick' ORDER BY rank
+string(third)
+string(first)
+
+SELECT id FROM boxes WHERE x0 < 2 AND x1 > 0.5
+int64(1)
+
+PRAGMA user_version
+int64(7)
+
+PRAGMA integrity_check
+string(ok)
+

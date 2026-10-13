@@ -74,7 +74,10 @@ func (s *segment) diskIndexFor(col int) (*segDiskIndex, bool) {
 	case PhysFloat64:
 		want = segIdxCodecFloat
 	}
-	x, ok := openSegColumnIndex(s.buf, s.cols[col].idxOff, s.nRows, s.heap)
+	x, ok := openSegColumnIndex(s.buf, s.cols[col].idxOff, s.nRows, s.heap, func(i int) ([]byte, bool) { return s.cellBytes(col, i) })
+	if ok && want == segIdxCodecBytes && x.codec == segIdxCodecBytesPerm {
+		want = x.codec // the same question, in the packed layout
+	}
 	if ok && x.codec != want {
 		// The codec must match what the COLUMN is, not merely be one this build
 		// implements: an int64 index over a TEXT block would compare heap

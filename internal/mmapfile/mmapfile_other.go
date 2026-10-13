@@ -4,6 +4,7 @@ package mmapfile
 
 import (
 	"errors"
+	"io"
 	"os"
 )
 
@@ -13,6 +14,20 @@ import (
 func Open(path string) (*File, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
+		return nil, err
+	}
+	return &File{data: data}, nil
+}
+
+// OpenFile is Open over a file already open, which it reads and closes.
+func OpenFile(f *os.File) (*File, error) {
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	data := make([]byte, fi.Size())
+	if _, err := io.ReadFull(f, data); err != nil {
 		return nil, err
 	}
 	return &File{data: data}, nil

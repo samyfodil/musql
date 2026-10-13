@@ -1,4 +1,4 @@
-.PHONY: all build_all_targets clean test harness vet
+.PHONY: all build_all_targets clean test harness vet bench-pointread
 
 all: vet test
 
@@ -16,6 +16,7 @@ vet:
 	go vet ./...
 	cd hrana && go vet ./...
 	cd examples/libp2p && go vet ./...
+	cd bench/pointread && go vet -tags musql ./... && CGO_ENABLED=1 go vet -tags mattn .
 
 test:
 	go test ./...
@@ -63,6 +64,11 @@ check-no-stray-dbs:
 # Differential tests against real C SQLite (CGo, separate nested module).
 harness:
 	cd compat-harness && go test ./...
+
+# Bulk load + point reads vs C SQLite (bench/pointread, its own CGo module). The
+# short run; POINTREAD_FULL=1 for 10M rows. Fails if musql loses a gated metric.
+bench-pointread:
+	bench/pointread/run
 
 clean:
 	rm -f log-* cpu.test mem.test *.out go.work*

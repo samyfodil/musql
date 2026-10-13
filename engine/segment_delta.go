@@ -275,6 +275,11 @@ type SegDeltaAppendState struct {
 	// handle stops another process renaming or deleting the file.
 	f  *os.File
 	fi os.FileInfo
+	// lockF is the lock file held open for the change word (segment_change.go):
+	// two stores a commit, which an open and a close each would have doubled
+	// the cost of. Never renamed, so nothing to re-verify; not kept on Windows,
+	// for f's reason.
+	lockF *os.File
 
 	// lastBatch is the records of the batch the last append wrote, when it fit
 	// in one chunk; nil otherwise. Session.commitMainLocked applies it to the
@@ -287,6 +292,9 @@ func (c *SegDeltaAppendState) release() {
 	if c.f != nil {
 		c.f.Close()
 	}
+	if c.lockF != nil {
+		c.lockF.Close()
+	}
 	*c = SegDeltaAppendState{}
 }
 
@@ -295,6 +303,20 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 	if len(recs) == 0 {
 		return nil
 	}
+	// Every change to the pair is announced in the lock file's change word
+	// (segment_change.go), so a reader's freshness check can skip the stamps.
+	if carry != nil && carry.lockF == nil && runtime.GOOS != "windows" {
+		carry.lockF, _ = openSegmentLockFile(segPath) // nil: stored by path below
+	}
+	var lockF *os.File
+	if carry != nil {
+		lockF = carry.lockF
+	}
+	endChange, cerr := segChangeBeginOn(segPath, lockF)
+	if cerr != nil {
+		return cerr
+	}
+	defer endChange()
 	path := segDeltaPath(segPath)
 	// The held descriptor answers for the path while its file is still linked
 	// (fstat: no lookup, no allocation); otherwise the path is stat'ed.
@@ -605,13 +627,17 @@ func segDeltaBatchBytesExceed(recs []SegDeltaRecord, limit int64) bool {
 		if n > limit {
 			return true
 		}
-		n += 13
+		n += segDeltaMinRecord
 		if !recs[i].Kill {
 			n += 4 + int64(recs[i].recordLen())
 		}
 	}
 	return n > limit
 }
+
+// segDeltaMinRecord is the smallest a delta record can be: a kill's header,
+// which a put's record only adds to.
+const segDeltaMinRecord = 13
 
 // syncMode is how a commit makes its batch durable.
 type syncMode int
@@ -887,8 +913,34 @@ func (p *ReadOnlyPager) segCleanFor(rootPage uint32) bool {
 	if p == nil || p.segs == nil {
 		return false
 	}
-	_, _, clean := p.segs.overlayFor(rootPage)
-	return clean
+	return p.segs.cleanFor(rootPage)
+}
+
+// cleanFor is overlayFor's clean answer without building the overlay, which
+// sorts every delta row: asked once per point read, that made a lookup O(delta).
+func (src *segSource) cleanFor(rootPage uint32) bool {
+	if src.delta == nil {
+		return true
+	}
+	ti, ok := src.tableOf[rootPage]
+	return !ok || src.delta.emptyFor(ti)
+}
+
+// deltaTouches reports whether the delta puts or kills rowid rid of the table at
+// rootPage: when it does not, the segments' copy of that one row is the answer
+// even though the table as a whole is not clean.
+func (src *segSource) deltaTouches(rootPage uint32, rid int64) bool {
+	if src.delta == nil {
+		return false
+	}
+	ti, ok := src.tableOf[rootPage]
+	if !ok || src.delta.emptyFor(ti) {
+		return false
+	}
+	if _, live := src.delta.live[ti][rid]; live {
+		return true
+	}
+	return src.delta.dead[ti][rid]
 }
 
 // readFileIfExists reads a file, treating absence as empty rather than an error --

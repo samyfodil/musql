@@ -96,6 +96,10 @@ type parser struct {
 	// view's SELECT is always re-parsed out of sqlite_schema (see valuesFold).
 	schemaBody bool
 
+	// viewBody is set while parsing a stored view's SELECT: every CTE it defines
+	// is marked CTEDef.InView.
+	viewBody bool
+
 	// r32nDQRecord records the byte span of each unqualified double-quoted column
 	// reference in ColumnExpr.R32NDQSpan, offset by r32nDQBase so a sliced
 	// sub-expression still reports offsets into the whole CREATE text. Set only by
@@ -394,7 +398,7 @@ func (p *parser) parseWithClause() ([]CTEDef, error) {
 			return nil, fmt.Errorf("engine: WITH: expected CTE name, got %q", p.tokenDesc(t))
 		}
 		p.next()
-		def := CTEDef{Name: t.text}
+		def := CTEDef{Name: t.text, InView: p.viewBody}
 
 		if p.peekIsPunct("(") {
 			p.next()

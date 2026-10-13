@@ -2506,12 +2506,28 @@ func (db *DB) mainReadTxnOf(sqlText string) mainReadTxn {
 	// C SQLite's PARSER would have done with the text, so noting it here --
 	// before any classification, and whether or not the statement then succeeds
 	// -- is exactly the right moment.
-	db.r35aNoteTempDatabaseOpen(sqlText)
-	trimmed := strings.TrimSpace(sqlText)
-	verb, ok := db.leadingVerb(trimmed)
+	//
+	// The temp question is asked once here and the answer used twice: neither
+	// the note below nor the verb's classification changes the schema.
+	temp := db.holdsAnyTempObject()
+	db.r35aNoteTempDatabaseOpenGiven(sqlText, temp)
+	// The verb of the RAW text, memoized on it: trimming first, every time,
+	// was a scan of the statement for an answer the text alone decides.
+	if sqlText != db.lastVerbRaw || sqlText == "" {
+		v, k := db.leadingVerb(strings.TrimSpace(sqlText))
+		db.lastVerbRaw, db.lastVerbRawVerb, db.lastVerbRawOK = sqlText, v, k
+	}
+	verb, ok := db.lastVerbRawVerb, db.lastVerbRawOK
 	if !ok {
 		return mainReadTxnUnknown
 	}
+	if mainReadTxnTempSensitiveVerb(verb) {
+		if temp {
+			return mainReadTxnUnknown
+		}
+		return mainReadTxnYes
+	}
+	trimmed := strings.TrimSpace(sqlText)
 	switch verb {
 	case "SELECT":
 		return db.mainReadTxnOfSelect(trimmed)
@@ -2540,12 +2556,6 @@ func (db *DB) mainReadTxnOf(sqlText string) mainReadTxn {
 			return mainReadTxnNo
 		}
 		return mainReadTxnUnknown
-	}
-	if mainReadTxnTempSensitiveVerb(verb) {
-		if db.holdsAnyTempObject() {
-			return mainReadTxnUnknown
-		}
-		return mainReadTxnYes
 	}
 	return mainReadTxnUnknown
 }

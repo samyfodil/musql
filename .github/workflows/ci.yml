@@ -116,6 +116,18 @@ jobs:
           go build ./...
           go test ./... -count=1 -timeout 10m
 
+  pointread:
+    name: bulk load + point reads vs C SQLite (nested module)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: "short run; one *sql.Conn per reader, gated on load, avg/p50/p99, disk; shared *sql.DB reported"
+        run: bench/pointread/run
+
   turso:
     name: Turso client against musqld (nested module)
     runs-on: ubuntu-latest
