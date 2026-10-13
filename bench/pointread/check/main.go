@@ -3,6 +3,7 @@
 // on disk.
 //
 //	go run ./check musql.json c-sqlite.json
+//	go run ./check -report musql.json c-sqlite.json   # print, never fail
 //
 // The other percentiles and max are printed but not gated: max is one sample,
 // and on a shared CI machine one scheduler hiccup decides it for either engine.
@@ -45,11 +46,16 @@ func load(path string) report {
 }
 
 func main() {
-	if len(os.Args) != 3 {
-		fmt.Fprintln(os.Stderr, "usage: check musql.json c-sqlite.json")
+	args := os.Args[1:]
+	report := len(args) > 0 && args[0] == "-report"
+	if report {
+		args = args[1:]
+	}
+	if len(args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: check [-report] musql.json c-sqlite.json")
 		os.Exit(2)
 	}
-	m, c := load(os.Args[1]), load(os.Args[2])
+	m, c := load(args[0]), load(args[1])
 	if m.Rows != c.Rows || m.Reads != c.Reads {
 		fmt.Fprintf(os.Stderr, "the runs differ in size: %d/%d vs %d/%d rows/reads\n", m.Rows, m.Reads, c.Rows, c.Reads)
 		os.Exit(2)
@@ -78,12 +84,16 @@ func main() {
 		note := ""
 		if x.m > x.c {
 			note = "  (worse, not gated)"
-			if x.gated {
+			if x.gated && !report {
 				note = "  WORSE"
 				failed = true
 			}
 		}
 		fmt.Printf("%-6s %14s %14s %6.2fx%s\n", x.name, x.show(x.m), x.show(x.c), float64(x.m)/float64(x.c), note)
+	}
+	if report {
+		fmt.Println("reported only: this run is not gated")
+		return
 	}
 	if failed {
 		fmt.Println("FAIL: musql is worse than C SQLite on a gated metric")
