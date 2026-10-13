@@ -2482,7 +2482,10 @@ func (p *ReadOnlyPager) finishGroupSource(c *compiler, state *joinDesugarState, 
 		}
 		// The join kinds the members had inside the group belong to its own
 		// level; resolveJoinSources stamps the group's own on member 0.
+		// So does a RIGHT JOIN restart point: it indexes the group's own
+		// coalesce chain, which resolvedFallback already carries.
 		memberScopes[k].joinRight, memberScopes[k].joinFull = false, false
+		memberScopes[k].coalesceRightAt = nil
 	}
 
 	// Members reached through a nested connector carry that nested group's alias
