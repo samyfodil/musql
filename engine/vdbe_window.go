@@ -1069,7 +1069,7 @@ func (m *vdbe) windowAggregate(plan *windowPlan, call windowCall, ci int, part [
 	// that moves BACKWARD (an EXCLUDE hole, a "<N> FOLLOWING" start) has no
 	// removal step to make. The frames C inverts rows out of are the exception
 	// (windowIncrementalAggregate).
-	// ponytail: O(n^2) per partition, revisit if window queries get hot.
+	// A deliberate simplification: O(n^2) per partition, revisit if window queries get hot.
 	for k := range part {
 		acc := cloneAggTemplates([]*aggItem{tmpl})[0]
 		for j := spans[k].lo; j < spans[k].hi; j++ {

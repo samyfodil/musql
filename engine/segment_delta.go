@@ -102,14 +102,26 @@ type SegDeltaRecord struct {
 	// KEY column, written NULL (the rowid carries it), or -1.
 	src *rowStore
 	ipk int
+
+	// size is recordLen plus one, once measured: a commit measures every put
+	// to decide whether it rewrites the file (compactionDueAfter) and again
+	// to lay the batch out (writeSegDeltaBatch).
+	size int
 }
 
 // recordLen is the length of the put's record.
 func (r *SegDeltaRecord) recordLen() int {
-	if r.src != nil {
-		return r.src.recordLen(uint64(r.Rowid), r.ipk)
+	if r.size > 0 {
+		return r.size - 1
 	}
-	return recordSize(r.Vals)
+	var n int
+	if r.src != nil {
+		n = r.src.recordLen(uint64(r.Rowid), r.ipk)
+	} else {
+		n = recordSize(r.Vals)
+	}
+	r.size = n + 1
+	return n
 }
 
 // appendRecordTo appends the put's record to dst.
@@ -584,6 +596,23 @@ func segDeltaBatchBytes(recs []SegDeltaRecord) int64 {
 	return n
 }
 
+// segDeltaBatchBytesExceed is segDeltaBatchBytes(recs) > limit, measuring
+// only until the answer is known: a bulk load's batch is far past the limit
+// long before its last record, and measuring a record can mean encoding it.
+func segDeltaBatchBytesExceed(recs []SegDeltaRecord, limit int64) bool {
+	n := int64(8 + segDeltaTrailerSz)
+	for i := range recs {
+		if n > limit {
+			return true
+		}
+		n += 13
+		if !recs[i].Kill {
+			n += 4 + int64(recs[i].recordLen())
+		}
+	}
+	return n > limit
+}
+
 // syncMode is how a commit makes its batch durable.
 type syncMode int
 
@@ -688,6 +717,105 @@ func (st *segDeltaState) applyBatch(body []byte) error {
 		}
 	}
 	return nil
+}
+
+// applyRecs applies a batch's records as applyBatch would apply the batch
+// written from them: each put's row exactly as decodeRecord reads it back --
+// the type and that type's one field, every other field zero -- and each
+// kill. false, having applied nothing, when a put reads its row from a store
+// while it is written (SegDeltaRecord.src): the caller decodes the batch.
+func (st *segDeltaState) applyRecs(recs []SegDeltaRecord) bool {
+	total := 0
+	for i := range recs {
+		if !recs[i].Kill && recs[i].src != nil {
+			return false
+		}
+		if !recs[i].Kill && !canonicalDeltaRow(recs[i].Vals) {
+			total += len(recs[i].Vals)
+		}
+	}
+	// The values of every row that needs rebuilding from one allocation, not
+	// one per row; each capped so no row can grow into the next.
+	slab := make([]Value, total)
+	var live map[int64][]Value
+	liveTable := -1
+	for i := range recs {
+		r := &recs[i]
+		if r.Kill {
+			st.kill(r.Table, r.Rowid)
+			continue
+		}
+		var vals []Value
+		if canonicalDeltaRow(r.Vals) {
+			// Already what the rebuild below would produce, and a store's row is
+			// never edited in place: the view shares it.
+			vals = r.Vals[:len(r.Vals):len(r.Vals)]
+		} else {
+			vals = slab[:len(r.Vals):len(r.Vals)]
+			slab = slab[len(r.Vals):]
+			for c, v := range r.Vals {
+				switch v.Typ {
+				case Int:
+					vals[c] = Value{Typ: Int, I: v.I}
+				case Float:
+					vals[c] = Value{Typ: Float, F: v.F}
+				case Text, Blob:
+					b := v.S[:len(v.S):len(v.S)]
+					if b == nil {
+						b = []byte{} // decodeRecord's empty value is a non-nil slice
+					}
+					vals[c] = Value{Typ: v.Typ, S: b}
+				default:
+					vals[c] = Value{Typ: Null}
+				}
+			}
+		}
+		// put, with the table's map looked up once per run of its rows.
+		if r.Table != liveTable || live == nil {
+			if st.live[r.Table] == nil {
+				st.live[r.Table] = make(map[int64][]Value, len(recs)-i)
+			}
+			live, liveTable = st.live[r.Table], r.Table
+		}
+		live[r.Rowid] = vals
+		if d := st.dead[r.Table]; len(d) > 0 {
+			delete(d, r.Rowid)
+		}
+	}
+	return true
+}
+
+// canonicalDeltaRow reports whether vals is already in the form a replayed
+// record decodes to: every value only the fields its type uses, and a TEXT or
+// BLOB a non-nil slice with no spare capacity.
+func canonicalDeltaRow(vals []Value) bool {
+	for i := range vals {
+		v := &vals[i]
+		if v.Subtype != 0 {
+			return false
+		}
+		switch v.Typ {
+		case Int:
+			if v.F != 0 || v.S != nil {
+				return false
+			}
+		case Float:
+			if v.I != 0 || v.S != nil {
+				return false
+			}
+		case Text, Blob:
+			if v.I != 0 || v.F != 0 || v.S == nil || cap(v.S) != len(v.S) {
+				return false
+			}
+		case Null:
+			if v.I != 0 || v.F != 0 || v.S != nil {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (st *segDeltaState) put(table int, rowid int64, vals []Value) {

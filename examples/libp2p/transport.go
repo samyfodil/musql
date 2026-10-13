@@ -132,7 +132,7 @@ func (t *Transport) Close() error {
 	// The topic goes with the router. Its stream handlers stay on the host after
 	// it stops, and would make the next New on h refuse it.
 	//
-	// ponytail: removes them by protocol id, so a router the application started
+	// A deliberate simplification: removes them by protocol id, so a router the application started
 	// on h AFTER this one (which New could not refuse) loses its handlers too.
 	for _, id := range pubsub.GossipSubDefaultProtocols {
 		t.host.RemoveStreamHandler(id)
@@ -156,7 +156,7 @@ func (t *Transport) Peers() []replication.PeerID {
 // GetOps answer stops at maxResponse bytes (at least one op), and at
 // maxOpsPerResponse ops whatever limit the caller asked for.
 //
-// ponytail: one op is sent whole, so a row bigger than maxResponse cannot sync;
+// A deliberate simplification: one op is sent whole, so a row bigger than maxResponse cannot sync;
 // it is logged where it is served. Stream ops in chunks if rows get that big.
 const (
 	maxRequest        = 4 << 20

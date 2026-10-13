@@ -116,8 +116,23 @@ func compileSelectScanRow(p *ReadOnlyPager, stmt *SelectStmt, outer *compiler, r
 		if !segPeepholesOffForTest {
 			segRowFilterPeephole(prog)
 		}
+		skipLimitZeroBody(stmt, prog)
 	}
 	return prog, err
+}
+
+// skipLimitZeroBody makes a select with a literal LIMIT 0 do nothing at run
+// time. computeLimitRegisters (select.c:2531) jumps to the end of the select
+// before sqlite3WhereBegin, so no WHERE term, aggregate or sorter is ever run:
+// an error one of them would raise is not raised. Names are resolved by now,
+// so every compile-time error was already reported. A compound select, whose
+// program is its arms', is left alone.
+func skipLimitZeroBody(stmt *SelectStmt, prog *Program) {
+	if stmt.Limit == nil || *stmt.Limit != 0 || prog == nil || prog.Compound != nil || len(prog.Insns) < 2 ||
+		prog.Insns[0].Op != OpInit || prog.Insns[len(prog.Insns)-1].Op != OpHalt {
+		return
+	}
+	prog.Insns[0].P2 = len(prog.Insns) - 1
 }
 
 // compileScanAttempt is one pass of the above: box collects the aggregates an
@@ -626,6 +641,11 @@ func compileScanPlain(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols 
 	//
 	// hung (C: a1|b1, a1|b5, a2|b0).
 	var limExhausted []int
+	if haveLimit {
+		// computeLimitRegisters (select.c:2531) leaves for the end of the select
+		// at once on a LIMIT of 0, before any WHERE term or table is touched.
+		limExhausted = append(limExhausted, c.emit(Instruction{Op: OpIfNot, P1: limitReg}))
+	}
 
 	body := func() error {
 		// WHERE: a false/NULL result skips this combination entirely --
@@ -693,10 +713,18 @@ func compileScanPlain(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols 
 		}
 
 		if !stmt.Distinct {
+			// The body of an EXISTS only asks whether a row arrives: C resolves the
+			// result list (a bad name is still an error) and never evaluates it.
+			skipList := c.outer != nil && c.outer.existsStmt == stmt
 			for i, oc := range outCols {
+				mark := c.here()
 				reg, cerr := c.compileExpr(oc.expr)
 				if cerr != nil {
 					return cerr
+				}
+				if skipList {
+					c.insns = c.insns[:mark]
+					continue
 				}
 				c.emit(Instruction{Op: OpSCopy, P1: reg, P2: resultBase + i})
 			}

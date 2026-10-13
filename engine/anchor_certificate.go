@@ -181,7 +181,7 @@ func anchorKeysIdentical(a, b []Value) bool {
 // (where.c:5225-5233) and a subquery's own ORDER BY being matched
 // (wherePathMatchSubqueryOB, where.c:5275-5281).
 //
-// ponytail: a whole-schema word search for DESC, VIRTUAL and ORDER. It only
+// A deliberate simplification: a whole-schema word search for DESC, VIRTUAL and ORDER. It only
 // over-declines (a column named "desc", an ORDER BY in an unrelated view);
 // reading each index's key directions through wherePlanIndexList would narrow
 // it if a real workload hits that.

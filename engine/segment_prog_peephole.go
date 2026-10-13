@@ -185,13 +185,13 @@ func segProgPeephole(prog *Program) bool {
 			// with a NULL bitmap or an exception, so every value the program
 			// sees is non-NULL and countStep (func.c:1970) steps on every one.
 			low.nRegs--
-			low.insns = append(low.insns, jit.ProgInsn{Op: jit.POpAccCount})
+			low.add(jit.ProgInsn{Op: jit.POpAccCount})
 		case aggMin:
-			low.insns = append(low.insns, jit.ProgInsn{Op: jit.POpAccMin, A: argReg, B: rowsReg})
+			low.add(jit.ProgInsn{Op: jit.POpAccMin, A: argReg, B: rowsReg})
 		case aggMax:
-			low.insns = append(low.insns, jit.ProgInsn{Op: jit.POpAccMax, A: argReg, B: rowsReg})
+			low.add(jit.ProgInsn{Op: jit.POpAccMax, A: argReg, B: rowsReg})
 		default:
-			low.insns = append(low.insns, jit.ProgInsn{Op: jit.POpAccSum, A: argReg, B: rowsReg})
+			low.add(jit.ProgInsn{Op: jit.POpAccSum, A: argReg, B: rowsReg})
 		}
 		if tv := low.textVar; tv != nil {
 			// The same accumulate, on the same registers, in the text variant;
@@ -203,7 +203,7 @@ func segProgPeephole(prog *Program) bool {
 				tv.sumReg, tv.rowsReg = low.sumReg, acc.B
 			}
 			tv.agg = low.agg
-			tv.insns = append(tv.insns, acc)
+			tv.add(acc)
 		}
 		lows = append(lows, low)
 	}

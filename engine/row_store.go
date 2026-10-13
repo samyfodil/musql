@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"iter"
 	"maps"
+	"math"
 	"slices"
 )
 
@@ -24,6 +25,15 @@ type rowStore struct {
 	// to match SQLite's rowid reuse behavior.
 	max      uint64
 	maxKnown bool
+
+	// ub is an UPPER BOUND on every rowid the store holds, while ubKnown:
+	// raised by every put, left alone by a drop (still a bound), and dropped
+	// only where rows can come back without a put (clear, an undo that
+	// restores a whole map). has() answers "past ub" without a lookup --
+	// an INSERT's rowid-conflict probe for rows appended in order, a map
+	// lookup per row that otherwise missed every time.
+	ub      uint64
+	ubKnown bool
 
 	// rangeMax caches the largest rowid in [rangeLo, rangeHi) for per-range
 	// rowid allocation (replication's per-site ranges).
@@ -54,6 +64,10 @@ type rowStore struct {
 	// rollback replays it backwards to that offset. See row_store_undo.go.
 	undo    []rsUndo
 	logging bool
+	// undoSealed is the log's length when a snapshot last took an offset into
+	// it (startUndo): an entry before it is one a rollback may stop short of, so
+	// a later put never extends it into a run.
+	undoSealed int
 
 	// spill holds the rows this store let go of, and memBytes counts the bytes of
 	// rows it still holds in m -- see row_store_spill.go.
@@ -129,9 +143,21 @@ func (s *rowStore) put(rowid uint64, vals []Value) {
 	var old []Value
 	haveOld := false
 	if s.seg != nil {
-		// The old row is the MERGED view's, and it is always needed: the
-		// visible count moves only when the rowid was not already a row.
-		old, haveOld = s.segGet(rowid)
+		// The MERGED view's old row, or only whether there is one: the
+		// visible count moves only when the rowid was not already a row, and
+		// the row itself is wanted only by an index or the undo log kept
+		// here. Reading it back regardless was a second fetch of every row an
+		// UPDATE writes, the first being the cursor's own.
+		switch {
+		case s.ubKnown && rowidLess(s.ub, rowid):
+			// Past the upper bound nothing is there (see has): a row appended
+			// after the last one is new without a search of the segments, which
+			// was half of what storing it cost.
+		case len(s.eqIdx) > 0 || len(s.uqIdx) > 0 || s.logging:
+			old, haveOld = s.segGet(rowid)
+		default:
+			haveOld = s.segHas(rowid)
+		}
 		if !haveOld {
 			s.sorted, s.sortedValid = nil, false
 			if s.nKnown {
@@ -147,7 +173,12 @@ func (s *rowStore) put(rowid uint64, vals []Value) {
 		}
 	}
 	if s.logging {
-		s.undo = append(s.undo, rsUndo{rowid: rowid, old: old, had: haveOld})
+		if l := len(s.undo) - 1; !haveOld && l >= s.undoSealed && l >= 0 && s.undo[l].clr == nil && !s.undo[l].had &&
+			s.undo[l].run < math.MaxUint32 && s.undo[l].rowid+uint64(s.undo[l].run)+1 == rowid {
+			s.undo[l].run++ // the next new rowid after the last entry's run
+		} else {
+			s.undo = append(s.undo, rsUndo{rowid: rowid, old: old, had: haveOld})
+		}
 	}
 	n0 := len(s.m)
 	s.m[rowid] = vals
@@ -167,6 +198,9 @@ func (s *rowStore) put(rowid uint64, vals []Value) {
 	if s.maxKnown && rowidLess(s.max, rowid) {
 		s.max = rowid
 	}
+	if s.ubKnown && rowidLess(s.ub, rowid) {
+		s.ub = rowid
+	}
 	if s.rangeKnown && rowid >= s.rangeLo && rowid < s.rangeHi && (!s.rangeHas || rowid > s.rangeMax) {
 		s.rangeMax, s.rangeHas = rowid, true
 	}
@@ -185,10 +219,11 @@ func (s *rowStore) clear() int64 {
 	if s.seg != nil {
 		n := int64(s.segLen())
 		if s.logging {
-			s.undo = append(s.undo, rsUndo{prior: s.m, priorGone: s.gone, priorBaseGone: s.baseGone, priorN: s.n, priorNKnown: s.nKnown, segClear: true})
+			s.undo = append(s.undo, rsUndo{clr: &rsClear{prior: s.m, priorGone: s.gone, priorBaseGone: s.baseGone, priorN: s.n, priorNKnown: s.nKnown, segClear: true}})
 		}
 		s.m, s.gone, s.baseGone, s.n, s.nKnown = map[uint64][]Value{}, nil, true, 0, true
 		s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false
+		s.ubKnown = false
 		s.overValid, s.memBytes, s.unspilt = false, 0, nil
 		s.rangeKnown = false
 		s.invalidateEqIndexes()
@@ -198,10 +233,11 @@ func (s *rowStore) clear() int64 {
 	n := int64(len(s.m))
 	if s.logging {
 		// The whole map is set aside, not copied: nothing writes it again.
-		s.undo = append(s.undo, rsUndo{prior: s.m})
+		s.undo = append(s.undo, rsUndo{clr: &rsClear{prior: s.m}})
 	}
 	s.m = map[uint64][]Value{}
 	s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false
+	s.ubKnown = false
 	s.overValid, s.memBytes, s.unspilt = false, 0, nil
 	s.rangeKnown = false
 	s.invalidateEqIndexes()
@@ -363,6 +399,23 @@ func (s *rowStore) eachSortedUntil(yield func(rowid uint64, vals []Value) bool) 
 		var rd spillReader
 		for _, rowid := range s.sortedRowids() {
 			if !yield(rowid, rd.resolve(s, s.m[rowid])) {
+				return
+			}
+		}
+	}
+}
+
+// eachSortedRaw is eachSortedUntil handing out rows as m holds them: a
+// spilled row as its sentinel, for a caller that can use one as it is
+// (segment_ddl.go's spillRun).
+func (s *rowStore) eachSortedRaw(yield func(rowid uint64, vals []Value) bool) {
+	switch {
+	case s == nil:
+	case s.seg != nil:
+		s.segEachSortedRaw(yield)
+	default:
+		for _, rowid := range s.sortedRowids() {
+			if !yield(rowid, s.m[rowid]) {
 				return
 			}
 		}

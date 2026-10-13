@@ -176,7 +176,7 @@ func (db *DB) updateOnePassOrder(tbl *tableMeta, stmt *updateStmt, trig *trigCom
 // gives every row 20, the first row's count, where a live read gives
 // 20,20,20,19,19,19,...
 //
-// ponytail: one FROM table. A join inside the subquery can put the automatic
+// A deliberate simplification: one FROM table. A join inside the subquery can put the automatic
 // index on one table and read another live, which one image cannot express.
 //
 // outer is the compiler sel's correlated references resolve against, carrying

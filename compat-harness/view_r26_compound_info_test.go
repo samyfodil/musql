@@ -83,15 +83,15 @@ func TestCompoundViewInfo(t *testing.T) {
 	}
 }
 
-// TestCompoundViewInfoDeclined pins the ONE family this still declines rather
-// than answers: a view whose LEFTMOST arm reads from a derived table, another
-// view or a CTE. Resolving arm 0's column through it is what columnType would
-// have to do, and columnTypeImpl's TK_COLUMN branch takes the RIGHTMOST arm of
-// whatever subquery it lands in (pSubq->pSelect is the top of the pPrior
-// chain) while sqlite3SubqueryColumnTypes itself walks to the LEFTMOST -- so a
-// view's own reported type and the type an outer compound derives from it
-// legitimately disagree, and getting that direction wrong is a wrong answer,
-// not a gap. The oracle's answers, for whoever lifts this:
+// TestCompoundViewInfoThroughNestedSources: a view whose LEFTMOST arm reads
+// from a derived table, another view or a CTE. Resolving arm 0's column through
+// it is what columnType does, and columnTypeImpl's TK_COLUMN branch takes the
+// RIGHTMOST arm of whatever subquery it lands in (pSubq->pSelect is the top of
+// the pPrior chain) while sqlite3SubqueryColumnTypes itself walks to the
+// LEFTMOST -- so a view's own reported type and the type an outer compound
+// derives from it legitimately disagree. This engine used to decline these
+// rather than guess a direction; it now resolves them (declTypeNestedSelects)
+// and every answer is compared with the oracle's, among them:
 //
 //	CREATE VIEW vtxt AS SELECT g AS y FROM t2 UNION ALL SELECT b FROM t1;
 //	  vtxt.y                                          -> "VARCHAR(9)"
@@ -99,11 +99,7 @@ func TestCompoundViewInfo(t *testing.T) {
 //	  v.y                                             -> "TEXT"
 //	CREATE VIEW v AS SELECT * FROM (SELECT a FROM t1 UNION ALL SELECT g FROM t2)
 //	                 UNION ALL SELECT b FROM t1;  v.a -> "BLOB"
-//
-// The gate is on the SIDE this engine is on: the oracle must still ANSWER and
-// this engine must still DECLINE. A merge that starts serving these will fail
-// here rather than silently ship whichever direction it guessed.
-func TestCompoundViewInfoDeclined(t *testing.T) {
+func TestCompoundViewInfoThroughNestedSources(t *testing.T) {
 	for _, c := range []struct{ setup, body string }{
 		{"", `SELECT * FROM (SELECT a FROM t1 UNION ALL SELECT g FROM t2) UNION ALL SELECT b FROM t1`},
 		{`CREATE VIEW vtxt AS SELECT g AS y FROM t2 UNION ALL SELECT b FROM t1`, `SELECT y FROM vtxt UNION ALL SELECT b FROM t1`},
@@ -116,17 +112,9 @@ func TestCompoundViewInfoDeclined(t *testing.T) {
 		if c.setup != "" {
 			stmts = append(stmts, c.setup)
 		}
-		stmts = append(stmts, `CREATE VIEW v AS `+c.body, `SELECT * FROM pragma_table_info('v')`)
-		last := len(stmts) - 1
-		cgo := run(t, "cgo", stmts)
-		mus := run(t, "musql", stmts)
-		if cgo[last]["kind"] != "rows" {
-			t.Errorf("[%s] the oracle no longer answers PRAGMA table_info: %v", c.body, cgo[last])
-		}
-		if mus[last]["kind"] != "error" {
-			t.Errorf("[%s] this engine now ANSWERS a shape it declined; move it into TestCompoundViewInfo and assert the type: %v",
-				c.body, mus[last])
-		}
+		stmts = append(stmts, `CREATE VIEW v AS `+c.body)
+		stmts = append(stmts, cviProbe()...)
+		differ(t, c.body, stmts)
 	}
 }
 

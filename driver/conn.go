@@ -27,6 +27,11 @@ import (
 // which is what gives a transaction read-your-writes. An ATTACHed database's
 // file gets a held session of its own (ndbs, sessionFor).
 type Conn struct {
+	// resultDiscarded is set by a caller of execArgs that ignores its Result
+	// (Stmt.ExecContext builds its own), so the held-transaction path can hand
+	// back the shared discardedResult instead of allocating one per statement.
+	resultDiscarded bool
+
 	path string
 	// paramInfo caches engine.ParseParamInfo by SQL text. database/sql prepares
 	// on every QueryRow, and parsing just to count parameters was a fifth of a
@@ -150,6 +155,13 @@ type Conn struct {
 	// bounded because a connection issues finitely many DISTINCT statements
 	// (database/sql prepares and reuses them). See plainDML.
 	plainStmts map[string]bool
+	// lastPlainText/lastPlain are plainDML's answer for the statement asked
+	// about last: a prepared statement run in a loop asks five times a call,
+	// and comparing the same string is a pointer compare where the map hashes
+	// the whole text each time. The same holds for lastTempText/lastTemp,
+	// engine.StatementOpensTempDatabase's answer.
+	lastPlainText, lastTempText string
+	lastPlain, lastTemp         bool
 
 	// timeDeclType and loc are the DSN opt-in for mattn/go-sqlite3's one type
 	// coercion: "?_time_decltype=1" makes a result column whose DECLARED type is
@@ -467,18 +479,18 @@ func (c *Conn) prepareContextImpl(ctx context.Context, query string) (driver.Stm
 // splitter is worth running. A false positive costs one lex; a false negative
 // is impossible, since every separator is a literal ";" byte.
 func mayBeScript(query string) bool {
-	for i := 0; i < len(query); i++ {
-		if query[i] != ';' {
-			continue
-		}
-		for j := i + 1; j < len(query); j++ {
-			switch query[j] {
-			case ' ', '\t', '\r', '\n', ';':
-			default:
-				return true
-			}
-		}
+	// IndexByte scans a block at a time: a statement can be megabytes of
+	// literal text with no ';' in it at all.
+	i := strings.IndexByte(query, ';')
+	if i < 0 {
 		return false
+	}
+	for j := i + 1; j < len(query); j++ {
+		switch query[j] {
+		case ' ', '\t', '\r', '\n', ';':
+		default:
+			return true
+		}
 	}
 	return false
 }
@@ -791,7 +803,16 @@ func (c *Conn) execArgs(sqlText string, args []engine.Value) (driver.Result, err
 	if derr := c.deferFKPragmaGuard(sqlText); derr != nil {
 		return nil, derr
 	}
+	// The rest in execArgsBody, so this function has few returns and its one
+	// defer is compiled inline: the runtime's deferred-call bookkeeping was a
+	// measurable share of a prepared INSERT's time.
 	defer c.deferFKPragmaApply(sqlText)
+	return c.execArgsBody(sqlText, args)
+}
+
+// execArgsBody is execArgs once the session is held and the
+// defer_foreign_keys guard has passed.
+func (c *Conn) execArgsBody(sqlText string, args []engine.Value) (driver.Result, error) {
 	if serr := c.schemaCorruptRefuses(sqlText); serr != nil {
 		return nil, serr
 	}
@@ -799,7 +820,7 @@ func (c *Conn) execArgs(sqlText string, args []engine.Value) (driver.Result, err
 	// and database/sql routes a row-less caller here whatever the SQL is -- so
 	// this path notices it too. See queryArgs' identical note and
 	// Conn.tempOpened.
-	if !c.tempOpened && engine.StatementOpensTempDatabase(sqlText) {
+	if !c.tempOpened && c.opensTempDatabase(sqlText) {
 		c.tempOpened = true
 	}
 	// "EXPLAIN <stmt>" describes a statement's program and runs nothing, so it
@@ -970,7 +991,7 @@ func (c *Conn) execArgs(sqlText string, args []engine.Value) (driver.Result, err
 		if aerr != nil {
 			return nil, aerr
 		}
-		n, _, err := c.tx.ExecArgs(sqlText, args)
+		n, _, err := c.tx.ExecArgsOwned(sqlText, args) // args are this call's copies (driverValueToEngine)
 		release()
 
 		// Read the counters back unconditionally, as the autocommit path does: a
@@ -1007,6 +1028,9 @@ func (c *Conn) execArgs(sqlText string, args []engine.Value) (driver.Result, err
 		// doc comment -- so the Conn-level mirror is read back here too.
 		c.writableSchema = c.tx.WritableSchema()
 		c.noteConnState(c.tx)
+		if c.resultDiscarded {
+			return discardedResult, nil
+		}
 		return &execResult{rowsAffected: n, lastInsertID: c.lastInsertRowid}, nil
 	}
 
@@ -1034,7 +1058,7 @@ func (c *Conn) execArgs(sqlText string, args []engine.Value) (driver.Result, err
 			}
 			defer release()
 		}
-		n, _, err = db.ExecArgs(sqlText, args)
+		n, _, err = db.ExecArgsOwned(sqlText, args) // args are this call's copies (driverValueToEngine)
 		// A "PRAGMA auto_vacuum = MODE" the session accepted leaves its
 		// DEFERRED request there, and the session is about to be thrown away --
 		// see Conn.autoVacuumPendingPlus1 -- and, for the same reason, the
@@ -2700,15 +2724,29 @@ func (t *Tx) rollbackImpl() error {
 // classifiable is "not plain", which just runs the checks; only the verdict is
 // cached, since the handlers execute when they match.
 func (c *Conn) plainDML(sqlText string) bool {
-	if plain, ok := c.plainStmts[sqlText]; ok {
-		return plain
+	if sqlText == c.lastPlainText && sqlText != "" {
+		return c.lastPlain
 	}
-	plain := isPlainDMLText(sqlText)
-	if c.plainStmts == nil {
-		c.plainStmts = make(map[string]bool)
+	plain, ok := c.plainStmts[sqlText]
+	if !ok {
+		plain = isPlainDMLText(sqlText)
+		if c.plainStmts == nil {
+			c.plainStmts = make(map[string]bool)
+		}
+		c.plainStmts[sqlText] = plain
 	}
-	c.plainStmts[sqlText] = plain
+	c.lastPlainText, c.lastPlain = sqlText, plain
 	return plain
+}
+
+// opensTempDatabase is engine.StatementOpensTempDatabase, remembered for the
+// statement asked about last: a pure function of the text.
+func (c *Conn) opensTempDatabase(sqlText string) bool {
+	if sqlText == c.lastTempText && sqlText != "" {
+		return c.lastTemp
+	}
+	c.lastTempText, c.lastTemp = sqlText, engine.StatementOpensTempDatabase(sqlText)
+	return c.lastTemp
 }
 
 // isPlainDMLText decides plainDML's question from the statement's FIRST WORD
@@ -2738,14 +2776,40 @@ func isASCIISpace(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\r' || c == '\n'
 }
 
-// containsFold is a case-insensitive strings.Contains for an ASCII needle.
+// containsFold is a case-insensitive strings.Contains for an ASCII needle
+// whose first byte is an upper-case letter. Candidates are found with
+// IndexByte, which scans a block at a time, for each case of the first byte:
+// a byte-at-a-time loop cost 4 ns a byte, and a statement can be megabytes
+// of literal text.
 func containsFold(hay, needle string) bool {
-	if len(needle) > len(hay) {
-		return false
+	if len(needle) == 0 {
+		return true
 	}
-	for i := 0; i+len(needle) <= len(hay); i++ {
+	up, lo := needle[0], needle[0]|0x20
+	// The next position of each case at or after i, -1 for none left; each is
+	// searched again only once i has passed it, so the scan stays linear.
+	next := func(c byte, from int) int {
+		if k := strings.IndexByte(hay[from:], c); k >= 0 {
+			return from + k
+		}
+		return -1
+	}
+	u, l := next(up, 0), next(lo, 0)
+	for {
+		var i int
+		switch {
+		case u < 0 && l < 0:
+			return false
+		case u < 0 || (l >= 0 && l < u):
+			i = l
+		default:
+			i = u
+		}
+		if i+len(needle) > len(hay) {
+			return false
+		}
 		match := true
-		for j := 0; j < len(needle); j++ {
+		for j := 1; j < len(needle); j++ {
 			c := hay[i+j]
 			if c >= 'a' && c <= 'z' {
 				c -= 32
@@ -2758,8 +2822,12 @@ func containsFold(hay, needle string) bool {
 		if match {
 			return true
 		}
+		if i == u {
+			u = next(up, i+1)
+		} else {
+			l = next(lo, i+1)
+		}
 	}
-	return false
 }
 
 // finishAutocommit commits or discards one autocommit session given the

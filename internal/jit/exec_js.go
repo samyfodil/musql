@@ -52,6 +52,9 @@ func Map(code []byte) (*Code, error) {
 // Call runs the kernel once over args. Every pointer it follows is reachable
 // from args, which stays alive across the call.
 func (c *Code) Call(args *Args) {
+	if scoreCalls {
+		noteCall()
+	}
 	callKernel(c.slot, unsafe.Pointer(args))
 	runtime.KeepAlive(args)
 }
@@ -63,6 +66,9 @@ func (c *Code) Close() error { return nil }
 
 // Call2 runs a program emitted by EmitProgram.
 func (c *Code) Call2(args *ProgArgs) {
+	if scoreCalls {
+		noteCall()
+	}
 	callKernel(c.slot, unsafe.Pointer(args))
 	runtime.KeepAlive(args)
 }

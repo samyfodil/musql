@@ -88,7 +88,7 @@ func (c *Clock) Merge(remote HLC) HLC {
 		// physical == now, strictly greater than both stored clocks.
 		logical = 0
 	}
-	// ponytail: 16-bit logical wraps after 65535 events in one frozen ms; a
+	// A deliberate simplification: 16-bit logical wraps after 65535 events in one frozen ms; a
 	// real wall clock advances long before that. Widen the split if ever hit.
 
 	c.last = HLC((physical << 16) | uint64(logical))

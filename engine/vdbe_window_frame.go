@@ -544,7 +544,7 @@ func (r rangeKeys) bound(b rangeBound, k int, peers windowFrameSpan, isStart boo
 
 // offsetBound resolves an "<N> PRECEDING/FOLLOWING" RANGE bound by scanning for
 // the first (start) or one-past-last (end) row whose key passes the bound's
-// test against key[k]. ponytail: a linear scan per row, O(n^2) per partition
+// test against key[k]. A deliberate simplification: a linear scan per row, O(n^2) per partition
 // like the accumulator; binary search if window queries get hot.
 //
 // Which side the offset is added to is observable. C always shifts the value on

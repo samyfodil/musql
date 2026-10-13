@@ -938,7 +938,7 @@ func (p *ReadOnlyPager) materializeFts3Ascending(it FromItem, name string, cols 
 	// it in xFilter (fts3.c:3399-3404), rows or none. A MATCH prepares it only
 	// in fts3CursorSeek, for a row whose content a column actually reads --
 	// never, when the select list reads no column (fts3ContentUnneeded).
-	// ponytail: a MATCH that reads content prepares here once %_content has a
+	// A deliberate simplification: a MATCH that reads content prepares here once %_content has a
 	// row, where C waits for a MATCHING one; the difference is an error where
 	// C answers no rows.
 	var codec *fts3ContentCodec

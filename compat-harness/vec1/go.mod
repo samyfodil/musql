@@ -13,4 +13,4 @@ require (
 	github.com/samyfodil/musql v0.0.0-00010101000000-000000000000
 )
 
-require golang.org/x/sys v0.46.0 // indirect
+require golang.org/x/sys v0.46.0

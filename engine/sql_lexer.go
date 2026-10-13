@@ -7,6 +7,7 @@ package engine
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 )
 
 // tokKind identifies the lexical category of a token.
@@ -97,7 +98,42 @@ func lexQuoted(s string, j int, closer byte, double bool) (string, int, bool) {
 	}
 }
 
+// lexLast is the tokens of the last long text lexed. A statement of megabytes
+// of literals is lexed once to find out what it is, once more to count its
+// parameters, and again to compile it, each time for the same text; its tokens
+// are read, never changed, so the three share one. Keyed by the text. The
+// slice is handed out with no spare capacity, so an append to it is a copy.
+var lexLast atomic.Pointer[lexEntry]
+
+type lexEntry struct {
+	sql  string
+	toks []token
+}
+
+// lexShareMin and lexShareMax bound the texts lex remembers: under the first
+// a lex is cheaper than the comparison, over the second the tokens are not
+// worth holding on to.
+const (
+	lexShareMin = 16 << 10
+	lexShareMax = 16 << 20
+)
+
 func lex(s string) ([]token, error) {
+	if len(s) < lexShareMin || len(s) > lexShareMax {
+		return lexUncached(s)
+	}
+	if e := lexLast.Load(); e != nil && e.sql == s {
+		return e.toks[:len(e.toks):len(e.toks)], nil
+	}
+	toks, err := lexUncached(s)
+	if err != nil {
+		return toks, err
+	}
+	lexLast.Store(&lexEntry{sql: s, toks: toks[:len(toks):len(toks)]})
+	return toks[:len(toks):len(toks)], nil
+}
+
+func lexUncached(s string) ([]token, error) {
 	// Pre-sized for typical SQL token density, capped: a statement made of
 	// long literals (rows of vector('[...]')) has far fewer tokens than its
 	// length suggests, and an uncapped guess zeroed megabytes per statement.

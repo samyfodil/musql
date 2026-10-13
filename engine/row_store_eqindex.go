@@ -84,6 +84,50 @@ func (s *rowStore) eqRowids(col int, v int64) ([]uint64, bool) {
 	return out, true
 }
 
+// segEqRowids is a write's equality candidates for col = v on a store over
+// segments, ascending: the committed rows the segments' own column index
+// names (and the delta's, which segIndexRowids cannot see), less those this
+// store has written over or deleted, plus every row it has written whose
+// column could equal v. A superset -- the WHERE is tested again on each row
+// -- so a value the index cannot judge is a candidate rather than a refusal.
+//
+// It is what keeps a held connection's writes off eqIndexFor's walk: that
+// builds an index of the whole table from rows read back one by one, and a
+// compaction -- which rebases the store -- threw it away, so the UPDATE after
+// every compaction paid the walk again.
+func (s *rowStore) segEqRowids(col int, v int64) ([]uint64, bool) {
+	if s == nil || s.seg == nil || s.spill != nil || s.seg.rp == nil || s.seg.rp.segs == nil {
+		return nil, false
+	}
+	base := s.seg.rp.segs
+	segs, ok := base.byRoot[s.seg.root]
+	if !ok {
+		return nil, false
+	}
+	hits, ok := segIndexRowids(segs, col, Value{Typ: Int, I: v})
+	if !ok {
+		return nil, false
+	}
+	hits = base.withDeltaRowids(s.seg.root, hits)
+	out := make([]uint64, 0, len(hits))
+	if !s.baseGone {
+		for _, r := range hits {
+			rid := uint64(r)
+			if _, over := s.m[rid]; over || s.gone[rid] {
+				continue
+			}
+			out = append(out, rid)
+		}
+	}
+	for rid, vals := range s.m {
+		if col >= len(vals) || vals[col].Typ != Int || vals[col].I == v {
+			out = append(out, rid)
+		}
+	}
+	radixSortRowids(out)
+	return slices.Compact(out), true
+}
+
 // eqIndexFor builds col's index on first use and caches it.
 func (s *rowStore) eqIndexFor(col int) (*rsEqIndex, bool) {
 	if s.eqIdx != nil {
@@ -145,6 +189,13 @@ func (s *rowStore) noteWrite(rowid uint64, old, neu []Value) {
 		if idx == nil {
 			continue // a column already refused; nothing to keep current
 		}
+		if old != nil && neu != nil && sameEqPlace(old, neu, col) {
+			// An UPDATE that left this column alone: the row stays in the list
+			// it is in. Taking it out and putting it back is a shift of the
+			// list each way -- "UPDATE t SET v = v + 1 WHERE k = ?" over a
+			// tenth of 120,000 rows spent most of its time doing exactly that.
+			continue
+		}
 		if old != nil {
 			if !idx.removeRow(col, rowid, old) {
 				s.eqIdx[col] = nil // could not be described exactly: rebuild later
@@ -156,6 +207,21 @@ func (s *rowStore) noteWrite(rowid uint64, old, neu []Value) {
 				s.eqIdx[col] = nil
 			}
 		}
+	}
+}
+
+// sameEqPlace reports whether old and neu put a row in the same list of
+// column col's index: both short of the column, both NULL, or the same
+// integer. Any other value is one the index refuses, which is decided by
+// removeRow and addRow as before.
+func sameEqPlace(old, neu []Value, col int) bool {
+	switch {
+	case col >= len(old) || col >= len(neu):
+		return col >= len(old) && col >= len(neu)
+	case old[col].Typ == Int && neu[col].Typ == Int:
+		return old[col].I == neu[col].I
+	default:
+		return old[col].Typ == Null && neu[col].Typ == Null
 	}
 }
 
@@ -212,7 +278,17 @@ func removeSorted(a *[]uint64, rowid uint64) bool {
 	if !found {
 		return false
 	}
-	*a = append((*a)[:i], (*a)[i+1:]...)
+	// The ends cost nothing to cut: a statement deleting rows in rowid
+	// order takes each from the front of its list, which shifting the rest
+	// down made quadratic in the list's length.
+	switch i {
+	case 0:
+		*a = (*a)[1:]
+	case len(*a) - 1:
+		*a = (*a)[:i]
+	default:
+		*a = append((*a)[:i], (*a)[i+1:]...)
+	}
 	return true
 }
 
