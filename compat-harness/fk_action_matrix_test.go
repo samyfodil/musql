@@ -95,11 +95,10 @@ func TestFKActionMatrix(t *testing.T) {
 		// AFTER DELETE runs. fk_action_child_triggers_test.go carries the full
 		// fourteen shapes; this row keeps the matrix's own coverage of it.
 		//
-		// What the matrix now declines instead is the one ORDERING shape: C codes
-		// an action's own NESTED actions ahead of the row's AFTER trigger
-		// (sqlite3GenerateRowDelete emits sqlite3FkActions before the AFTER
-		// block), so a chain interleaves depth-first where this engine drains one
-		// level at a time.
+		// The ORDERING shape below agrees too: C codes an action's own NESTED
+		// actions ahead of the row's AFTER trigger (sqlite3GenerateRowDelete
+		// emits sqlite3FkActions before the AFTER block), and fkApplyAction drains
+		// them there.
 		tc{"fk cascade CHAIN with a trigger at each level", []string{
 			`PRAGMA foreign_keys=ON`,
 			`CREATE TABLE p(k INTEGER PRIMARY KEY)`,
@@ -110,7 +109,7 @@ func TestFKActionMatrix(t *testing.T) {
 			`CREATE TRIGGER tgg AFTER DELETE ON g BEGIN INSERT INTO log VALUES('g'||old.h); END`,
 			`INSERT INTO p VALUES(1)`, `INSERT INTO c VALUES(1)`, `INSERT INTO g VALUES(1)`,
 			`DELETE FROM p`,
-		}, `SELECT (SELECT count(*) FROM c), (SELECT group_concat(m) FROM log)`, true},
+		}, `SELECT (SELECT count(*) FROM c), (SELECT group_concat(m) FROM log)`, false},
 	)
 	for _, c := range cases {
 		var out [2]string

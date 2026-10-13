@@ -1985,7 +1985,7 @@ func (db *DB) checkTriggerBodyTables(trs []*triggerMeta) error {
 				// (trigger.c:346; build.c:3032). Same rule as
 				// checkSchemaObjectsResolve (alter_write.go); only a base TABLE
 				// counts. trigger1.test 10.10.
-				if tr.isTemp && db.firstAttachedTable(name) != nil {
+				if tr.isTemp && db.attachedTableAnywhere(name) {
 					continue
 				}
 				return fmt.Errorf("engine: no such table: %s.%s", schema, name)

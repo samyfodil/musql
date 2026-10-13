@@ -53,6 +53,11 @@ func (p *ReadOnlyPager) subqueryScopes(from []FromItem) ([]tableScope, error) {
 		if it.Table == "" {
 			return nil, fmt.Errorf("%w: subquery over a derived table", errVDBEUnsupported)
 		}
+		// A USING/NATURAL join shows each common column once to "*", which these
+		// bare scopes cannot say; subqueryAnalysisScopes resolves it fully.
+		if it.Natural || it.Using != nil {
+			return nil, fmt.Errorf("%w: subquery FROM with a USING or NATURAL join", errVDBEUnsupported)
+		}
 		// Resolve the owning pager as resolveJoinSources does (itemOwner): p
 		// for a local name, or the attachment owning a foreign-qualified name
 		// or an unqualified name that lives only there -- otherwise "id IN
@@ -200,7 +205,7 @@ func (p *ReadOnlyPager) subqueryAnalysisScopes(from []FromItem) ([]tableScope, e
 // own FROM scope. A missing table surfaces as errVDBESemantic (via
 // subqueryScopes); an un-analyzable select list yields errVDBEUnsupported.
 func (p *ReadOnlyPager) armColumnCount(stmt *SelectStmt) (int, error) {
-	scopes, err := p.subqueryScopes(stmt.From)
+	scopes, err := p.subqueryAnalysisScopes(stmt.From)
 	if err != nil {
 		return 0, err
 	}

@@ -40,6 +40,11 @@ type Conn struct {
 	paramInfo map[string]engine.ParamInfo
 	tx        *engine.DB // non-nil while a transaction (BeginTx) is open on this Conn
 
+	// txAux are the ATTACHed databases' held sessions the open transaction has
+	// written, each with an engine transaction of its own. They commit and roll
+	// back with tx; see Conn.auxTxnDB.
+	txAux []*engine.DB
+
 	// ndb is this connection's HELD segment session -- one for the connection's
 	// whole life, which is what this format allows and the SQLite format
 	// did not. See driver/session.go for the model and what it declines.
@@ -530,6 +535,7 @@ func (c *Conn) Close() error {
 	if c.tx != nil {
 		db := c.tx
 		c.tx, c.txSavepoint = nil, ""
+		c.discardAux()
 		return c.discardSession(db)
 	}
 	return nil
@@ -980,10 +986,11 @@ func (c *Conn) execArgsBody(sqlText string, args []engine.Value) (driver.Result,
 	}
 	sqlText = execSQL
 
+	if c.tx != nil && targetPath != c.path {
+		return c.execAuxTxn(targetPath, targetSchema, sqlText, args)
+	}
 	if c.tx != nil {
-		// route guarantees targetPath == c.path here (an attached target inside
-		// a transaction was declined above), so the held main session applies.
-		// The attachments are wired on as read snapshots for this one statement
+		// The held main session. The attachments are wired on as read snapshots for this one statement
 		// (withAttachedReaders): a statement route calls main-only can still
 		// READ an attachment -- an object-scoped pragma's own lookup, a view or
 		// trigger body's qualified reference -- and used to see zero rows.
@@ -1012,9 +1019,7 @@ func (c *Conn) execArgsBody(sqlText string, args []engine.Value) (driver.Result,
 			// C SQLite. Every other error leaves the held session intact
 			// (the failing statement's own changes already reverted in-memory).
 			if engine.ErrorRollsBackTransaction(err) {
-				db := c.tx
-				c.tx, c.txSavepoint = nil, ""
-				c.discardSession(db)
+				c.abandonTxn()
 			}
 			return nil, err
 		}
@@ -1052,6 +1057,17 @@ func (c *Conn) execArgsBody(sqlText string, args []engine.Value) (driver.Result,
 		// route sent to an attachment already runs against its owning file.
 		if targetPath == c.path {
 			release, aerr := c.withAttachedReaders(db)
+			if aerr != nil {
+				c.discardSession(db)
+				return aerr
+			}
+			defer release()
+		} else {
+			// An attachment's session reaches main and the other attachments
+			// too: a TEMP trigger on one of its tables, or one an ALTER of it
+			// re-checks, resolves its body across TEMP, MAIN and every
+			// attachment (sqlite3FindTable).
+			release, aerr := c.wireTxnReaders(db, targetPath)
 			if aerr != nil {
 				c.discardSession(db)
 				return aerr
@@ -1097,6 +1113,39 @@ func (c *Conn) execArgsBody(sqlText string, args []engine.Value) (driver.Result,
 	// SQLite's sqlite3_last_insert_rowid(). ExecArgs' own last-insert-id return
 	// is that same value, so it is no longer read here.
 	return &execResult{rowsAffected: n, lastInsertID: c.lastInsertRowid}, nil
+}
+
+// execAuxTxn runs one write to an ATTACHed database inside the open
+// transaction, on that database's held session (auxTxnDB). No commit: the
+// session commits with the transaction.
+func (c *Conn) execAuxTxn(path, schema, sqlText string, args []engine.Value) (driver.Result, error) {
+	db, err := c.auxTxnDB(path, schema)
+	if err != nil {
+		return nil, err
+	}
+	release, err := c.wireTxnReaders(db, path)
+	if err != nil {
+		return nil, err
+	}
+	n, _, err := db.ExecArgsOwned(sqlText, args)
+	release()
+	c.noteConnState(db)
+	if err != nil {
+		if engine.ErrorRollsBackTransaction(err) {
+			c.abandonTxn()
+		}
+		return nil, err
+	}
+	return &execResult{rowsAffected: n, lastInsertID: c.lastInsertRowid}, nil
+}
+
+// abandonTxn rolls the whole transaction back -- main and every joined
+// attachment -- as a RAISE(ROLLBACK) does in C.
+func (c *Conn) abandonTxn() {
+	db := c.tx
+	c.tx, c.txSavepoint = nil, ""
+	c.discardAux()
+	c.discardSession(db)
 }
 
 // zeroRowSetterPragmas lists the pragmas whose assignment form returns an empty
@@ -2313,6 +2362,26 @@ func (c *Conn) queryArgs(sqlText string, args []engine.Value) (driver.Rows, erro
 // discards rather than committing a partial write) -- the exact
 // mirror of execArgs's own model, but returning rows instead of a count.
 func (c *Conn) queryReturningArgs(sqlText string, args []engine.Value, targetPath, targetSchema string) (driver.Rows, error) {
+	if c.tx != nil && targetPath != c.path {
+		db, err := c.auxTxnDB(targetPath, targetSchema) // see execAuxTxn
+		if err != nil {
+			return nil, err
+		}
+		release, err := c.wireTxnReaders(db, targetPath)
+		if err != nil {
+			return nil, err
+		}
+		cols, rows, err := db.ExecReturningArgs(sqlText, args)
+		release()
+		c.noteConnState(db)
+		if err != nil {
+			if engine.ErrorRollsBackTransaction(err) {
+				c.abandonTxn()
+			}
+			return nil, err
+		}
+		return &Rows{cols: cols, rows: rows}, nil
+	}
 	if c.tx != nil {
 		release, aerr := c.withAttachedReaders(c.tx) // see execArgs' identical wiring
 		if aerr != nil {
@@ -2560,6 +2629,9 @@ func (c *Conn) execTxnStmt(kind engine.TxnKind) (driver.Result, error) {
 		if err := db.CheckDeferredForeignKeys(); err != nil {
 			return nil, err // the transaction stays OPEN, as C SQLite's does
 		}
+		if err := c.checkAuxDeferredFKs(); err != nil {
+			return nil, err
+		}
 		c.tx, c.txSavepoint = nil, ""
 		// The outermost COMMIT clears "PRAGMA defer_foreign_keys" -- see Tx's
 		// commitImpl, which does the same for the Go-level path. Only here, after
@@ -2573,6 +2645,10 @@ func (c *Conn) execTxnStmt(kind engine.TxnKind) (driver.Result, error) {
 		// so committing without this dropped every row written under the
 		// savepoint -- "SAVEPOINT c; INSERT; COMMIT" stored nothing.
 		if err := c.commitEngineTxn(db); err != nil {
+			c.discardAux()
+			return nil, err
+		}
+		if err := c.commitAux(db); err != nil {
 			return nil, err
 		}
 		if err := c.commitSession(db); err != nil {
@@ -2588,6 +2664,7 @@ func (c *Conn) execTxnStmt(kind engine.TxnKind) (driver.Result, error) {
 		c.deferFKs = false // as at COMMIT; sqlite3RollbackAll, main.c:1530-1532
 		// Likewise a plain ROLLBACK: "SAVEPOINT d; INSERT; ROLLBACK" discards
 		// the row in C SQLite, savepoint stack and all.
+		c.discardAux()
 		if err := c.discardSession(db); err != nil {
 			return nil, err
 		}
@@ -2643,6 +2720,13 @@ func (c *Conn) execSavepointStmt(kind engine.SavepointKind, name, sqlText string
 	if err := c.tx.Exec(sqlText); err != nil {
 		return nil, err
 	}
+	// Every joined attachment keeps the same savepoint stack as main, so a
+	// ROLLBACK TO undoes its writes too (auxTxnDB).
+	for _, db := range c.txAux {
+		if err := db.Exec(sqlText); err != nil {
+			return nil, err
+		}
+	}
 	// Did that statement end the transaction the savepoint started? Ask the
 	// ENGINE rather than compare names: RELEASE frees the INNERMOST savepoint
 	// of the given name, so with "SAVEPOINT sp0; SAVEPOINT sp0; ... RELEASE
@@ -2662,7 +2746,13 @@ func (c *Conn) execSavepointStmt(kind engine.SavepointKind, name, sqlText string
 		if err := db.CheckDeferredForeignKeys(); err != nil {
 			return nil, err
 		}
+		if err := c.checkAuxDeferredFKs(); err != nil {
+			return nil, err
+		}
 		c.tx, c.txSavepoint = nil, ""
+		if err := c.commitAux(db); err != nil {
+			return nil, err
+		}
 		if err := c.commitSession(db); err != nil {
 			return nil, err
 		}
@@ -2693,6 +2783,9 @@ func (t *Tx) commitImpl() error {
 	if err := db.CheckDeferredForeignKeys(); err != nil {
 		return err
 	}
+	if err := t.conn.checkAuxDeferredFKs(); err != nil {
+		return err
+	}
 	t.conn.tx = nil
 	t.conn.clearTouched()
 	// The OUTERMOST commit clears "PRAGMA defer_foreign_keys" (and the deferred
@@ -2701,6 +2794,9 @@ func (t *Tx) commitImpl() error {
 	// carried copy is cleared here too. A SAVEPOINT / RELEASE / ROLLBACK TO does
 	// NOT clear it and does not come through this method. See Conn.deferFKs.
 	t.conn.deferFKs = false
+	if err := t.conn.commitAux(db); err != nil {
+		return err
+	}
 	return t.conn.commitSession(db)
 }
 
@@ -2715,6 +2811,7 @@ func (t *Tx) rollbackImpl() error {
 	t.conn.tx = nil
 	t.conn.clearTouched()
 	t.conn.deferFKs = false // as at COMMIT; sqlite3RollbackAll, main.c:1530-1532
+	t.conn.discardAux()
 	return t.conn.discardSession(db)
 }
 

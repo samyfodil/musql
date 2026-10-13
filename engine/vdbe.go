@@ -132,6 +132,10 @@ type vdbe struct {
 	// once by OpWindowFinal (vdbe_window.go). nil for a program with no
 	// window function.
 	windowBatch [][]Value
+	// windowLazyErr holds, per windowBatch row, an error C raises only when
+	// that row is returned by the window code (an invalid nth_value N), for
+	// windowFinal to raise if the row is reached.
+	windowLazyErr map[int]error
 
 	// hashAgg is the live hash-aggregate state for a GROUP BY program compiled
 	// by the hash fast path (compileScanGroupByHash, vdbe_agg_codegen.go;

@@ -19,13 +19,6 @@ func init() {
 		"aggregate-filter-in-subquery-grouped.sqltest::memory::having-filter-in-subquery-no-from",
 		"aggregate-filter-in-subquery-grouped.sqltest::memory::having-filter-in-subquery-no-from-match",
 	)
-	tsKnownGroup("2026-10-12: ALTER TABLE RENAME COLUMN: a temp trigger over an attached database and two correlated-view shapes whose column also exists in another table are declined, and an ORDER BY term beside a * in a temp trigger's EXISTS (C binds it to the expanded column and so leaves it unrenamed, failing the re-prepare) is declined instead of reported",
-		"alter_table.sqltest::memory::alter-table-rename-column-temp-trigger-attached-cross-table",
-		"alter_table.sqltest::memory::alter-table-rename-column-view-correlated-outer-shadow",
-		"alter_table.sqltest::memory::alter-table-rename-column-view-correlated-outer-shadow-nested",
-		"alter_table.sqltest::memory::temp-trigger-attached-read-cross-table",
-		"alter_table.sqltest::memory::alter-table-rename-column-temp-trigger-exists-result-expr-error",
-	)
 	tsKnownGroup("2026-10-12: CHECK diagnostics: wording for aggregates, bound parameters and quoted expression names (C echoes the token), ALTER ADD COLUMN wrappers, and an INSERT ... SELECT rowid check that musql reports where C stores",
 		"check_constraint.sqltest::memory::check_constraint_insert_select_validates_destination_rowid",
 		"check_constraint.sqltest::memory::check_constraint_aggregate_function",
@@ -38,10 +31,6 @@ func init() {
 		"check_constraint.sqltest::memory::check_constraint_rename_column_to_keyword_violation",
 		"check_constraint.sqltest::memory::check_constraint_rename_table_qualified_ref_still_enforced",
 	)
-	tsKnownGroup("2026-10-12: a write to an attached in-memory database inside a transaction is declined (each statement must reference a single database), so the DETACH checks that follow it cannot be reached",
-		"detach/transaction.sqltest::memory::detach-fails-with-active-write-transaction",
-		"detach/transaction.sqltest::memory::detach-succeeds-after-commit",
-	)
 	tsKnownGroup("2026-10-12: parenthesized join groups, RIGHT/FULL JOIN merged USING columns and rowid names through aliased groups: C 3.53.3's resolution rules (\"ambiguous reference to x in USING()\", group aliases, null-row expressions) are only partly ported, so musql declines, words the error differently, or for some shapes answers where C rejects",
 		"expression-index-outer-join.sqltest::*",
 		"joins/left_join_null_index_bug.sqltest::memory::range-seek-after-each-null-extension[l-left-join-m-join-p-using-seed-on-m-seed-l-seed][join-r-indexed-by-r-value-on-m-u-r-value]",
@@ -50,9 +39,6 @@ func init() {
 		"parenthesized-joins.sqltest::*",
 		"right-full-join-sqlite.sqltest::*",
 		"joins/left_join_null_index_bug.sqltest::memory::range-seek-after-each-null-extension[l-left-join-m-join-p-using-seed-on-m-seed-l-seed][left-join-rk-on-rk-id-m-rowid]",
-	)
-	tsKnownGroup("2026-10-12: foreign keys: a cascade whose child has an AFTER trigger and an onward action is declined (C codes the onward action ahead of the AFTER trigger)",
-		"foreign_keys.sqltest::memory::fk-cascade-trigger-cascade",
 	)
 	tsKnownGroup("2026-10-12: generated columns: GLOB in a generated expression is declined, ALTER/CHECK/DEFAULT diagnostics are worded differently, window-function misuse text, and the oracle's driver returns a REAL generated column as an integer",
 		"gencol.sqltest::memory::gencol_glob_in_expression",
@@ -178,12 +164,6 @@ func init() {
 		"views.sqltest::memory::view-mutual-circle-detection",
 		"views.sqltest::memory::view-self-circle-detection",
 		"views.sqltest::memory::view-star-using-derives-merged-columns",
-	)
-	tsKnownGroup("2026-10-12: a window function inside an UPDATE's WHERE subquery over a triple self-join USING chain is declined",
-		"window-selfjoin-reset-sorter.sqltest::memory::window-over-triple-selfjoin-update",
-	)
-	tsKnownGroup("2026-10-12: nth_value(): C evaluates N lazily, so a late invalid N does not fail a LIMITed query; musql validates every row",
-		"window/nth_value.sqltest::memory::nth-value-limit-stops-before-late-invalid-n",
 	)
 	tsKnownGroup("2026-10-12: an aggregate over an outer column inside a subquery is \"misuse of aggregate\" in C; musql reports a name-resolution decline",
 		"aggregate-of-outer-column.sqltest::memory::outer-aggregate-in-a-table-function-argument-is-an-error",

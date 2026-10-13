@@ -621,35 +621,11 @@ var foreignKeyDeclinedCases = []struct {
 	stmt  string
 	want  string
 }{
-	{
-		// "action-would-fire-a-child-trigger" was here and is CLOSED: in C an
-		// action IS a trigger program (fkActionTrigger, fkey.c), so its implicit
-		// DELETE/UPDATE is ordinary and the child's own triggers run.
-		// fkApplyAction fires them now, through firePlanForRow -- see
-		// compat-harness/fk_action_child_triggers_test.go, whose fourteen shapes
-		// were measured against 3.53.3 first.
-		//
-		// The ORDERING half is what remains, and it is a different case: C codes
-		// an action's own NESTED actions ahead of the row's AFTER trigger
-		// (sqlite3GenerateRowDelete emits sqlite3FkActions before the AFTER
-		// block), so a CHAIN interleaves depth-first where this engine drains one
-		// level at a time. Final state identical; the trigger bodies' view of it
-		// not.
-		name: "action-chain-whose-nested-action-must-precede-an-AFTER-trigger",
-		setup: []string{
-			`PRAGMA foreign_keys=ON`,
-			`CREATE TABLE p(id INTEGER PRIMARY KEY)`,
-			`CREATE TABLE c(y INTEGER PRIMARY KEY REFERENCES p ON DELETE CASCADE)`,
-			`CREATE TABLE g(z REFERENCES c ON DELETE CASCADE)`,
-			`CREATE TABLE log(m)`,
-			`CREATE TRIGGER tc AFTER DELETE ON c BEGIN INSERT INTO log VALUES('c'); END`,
-			`INSERT INTO p VALUES(1)`,
-			`INSERT INTO c VALUES(1)`,
-			`INSERT INTO g VALUES(1)`,
-		},
-		stmt: `DELETE FROM p`,
-		want: "onward action",
-	},
+	// "action-would-fire-a-child-trigger" and its ordering half,
+	// "action-chain-whose-nested-action-must-precede-an-AFTER-trigger", are
+	// CLOSED: an action fires the child's own triggers, and drains the row's
+	// nested actions ahead of its AFTER trigger as C does (fkApplyAction). See
+	// compat-harness/fk_action_child_triggers_test.go.
 	{
 		// Only a trigger whose BODY NO LONGER COMPILES is declined -- a healthy
 		// one is accepted and does not fire, which is why the case that used to

@@ -479,6 +479,7 @@ func sameWindowSpec(a, b *WindowSpec) bool {
 
 func (m *vdbe) windowFinal(plan *windowPlan) ([][]Value, error) {
 	batch := m.windowBatch
+	m.windowLazyErr = nil
 	n := len(batch)
 	vals := make([][]Value, n) // vals[row][call]
 	for i := range vals {
@@ -527,6 +528,12 @@ func (m *vdbe) windowFinal(plan *windowPlan) ([][]Value, error) {
 		rows = append(rows, outRow{out: o, order: ok, seq: i})
 	}
 
+	// windowLazyErr needs the rows in the order the window code returned
+	// them, ahead of the dedup below, which compacts rows in place.
+	var returned []outRow
+	if len(m.windowLazyErr) > 0 {
+		returned = append(returned, rows...)
+	}
 	if plan.distinct {
 		kept := rows[:0]
 		for _, r := range rows {
@@ -570,11 +577,92 @@ func (m *vdbe) windowFinal(plan *windowPlan) ([][]Value, error) {
 	}
 
 	start, end := limitOffsetRange(len(rows), plan.limit, plan.offset)
+	if len(m.windowLazyErr) > 0 {
+		// The rows C's window code returned: all of them when a sorter or a
+		// DISTINCT follows it, else only those up to the LIMIT (OFFSET rows
+		// included -- they are returned, then skipped).
+		reached := returned
+		if windowOuterOrderDropped(plan) {
+			// Up to the row that fills the LIMIT: under DISTINCT, the
+			// end-th row the dedup kept.
+			n := 0
+			var kept [][]Value
+			for i, r := range returned {
+				if n >= end {
+					reached = returned[:i]
+					break
+				}
+				if plan.distinct && slices.ContainsFunc(kept, func(k []Value) bool {
+					return keysEqualGrouping(k, r.out, plan.distinctColls, m.encoding())
+				}) {
+					continue
+				}
+				kept = append(kept, r.out)
+				n++
+			}
+		}
+		for _, r := range reached {
+			if err := m.windowLazyErr[r.seq]; err != nil {
+				return nil, err
+			}
+		}
+	}
 	out := make([][]Value, 0, end-start)
 	for _, r := range rows[start:end] {
 		out = append(out, r.out)
 	}
 	return out, nil
+}
+
+// windowOuterOrderDropped reports whether C runs this query without a sorter
+// after the window code, so its rows leave in the window's own order and a
+// LIMIT stops the window code early: there is no outer ORDER BY, or
+// sqlite3WindowRewrite dropped it as a prefix of the window's PARTITION BY +
+// ORDER BY (window.c:1003-1013, sqlite3ExprListCompare). Only for a single
+// window: C opens more than one for specs that differ, frames included.
+// Anything it cannot prove answers false, which reaches every row.
+func windowOuterOrderDropped(plan *windowPlan) bool {
+	if len(plan.calls) == 0 || len(plan.orderExprs) == 0 {
+		return len(plan.orderExprs) == 0
+	}
+	spec := plan.calls[0].spec
+	if spec == nil {
+		return false
+	}
+	for _, c := range plan.calls[1:] {
+		if c.spec != spec && !reflect.DeepEqual(c.spec, spec) {
+			return false
+		}
+	}
+	type key struct {
+		e     Expr
+		desc  bool
+		nulls NullsOrder
+	}
+	var sortKeys []key
+	for _, e := range spec.PartitionBy {
+		sortKeys = append(sortKeys, key{e: e})
+	}
+	for _, t := range spec.OrderBy {
+		sortKeys = append(sortKeys, key{e: t.Expr, desc: t.Desc, nulls: t.Nulls})
+	}
+	if len(plan.orderTerms) != len(plan.orderExprs) || len(plan.orderTerms) > len(sortKeys) {
+		return false
+	}
+	for i, t := range plan.orderTerms {
+		e := t.Expr
+		if plan.orderOrdinal[i] >= 0 {
+			if plan.orderOrdinal[i] >= len(plan.outs) {
+				return false
+			}
+			e = plan.outs[plan.orderOrdinal[i]]
+		}
+		k := sortKeys[i]
+		if t.Desc != k.desc || t.Nulls != k.nulls || !reflect.DeepEqual(e, k.e) {
+			return false
+		}
+	}
+	return true
 }
 
 // orderTermExprs pulls the expressions out of a window spec's ORDER BY terms.

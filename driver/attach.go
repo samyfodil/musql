@@ -32,6 +32,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/samyfodil/musql/engine"
@@ -369,28 +370,161 @@ func (c *Conn) route(sqlText string) (path, schema, execSQL string, err error) {
 			path, schema = c.path, ""
 			break
 		}
+		// A cross-database WRITE inside one writes only its target (refs[0]),
+		// which joins the transaction (auxTxnDB, or main's own session) with
+		// every other database wired on as a reader of the transaction's state.
+		if c.tx != nil && understood && len(refs) > 0 {
+			path, schema = c.ownerOf(refs[0])
+			break
+		}
 		return "", "", "", errCrossDB
 	}
 
-	// A transaction is a single held engine session on the main file; it cannot
-	// span an attached database's separate file/commit. A WRITE to one
-	// mid-transaction is declined rather than risking a non-atomic result --
-	// there is no super-journal here.
-	//
-	// A READ is not that. queryArgs' held-transaction branch already wires
+	// A READ inside a transaction runs on main's session. queryArgs' held-transaction branch already wires
 	// every attachment onto the transaction's own snapshot as a read pager
 	// (withAttachedReaders) and the engine routes each FROM item to the file
 	// that owns it, which is exactly how an UNQUALIFIED read of the same
 	// table already resolves inside a transaction. Declining it meant
 	// "BEGIN; SELECT count(*) FROM aux.t" -- a statement C SQLite answers
 	// -- was an error, and so was every qualified read in between.
-	if c.tx != nil && path != c.path {
-		if !isSelectStmt(sqlText) {
-			return "", "", "", errCrossDB
-		}
+	//
+	// A WRITE whose every reference is that one attachment joins the
+	// transaction through the attachment's own held session (auxTxnDB), which
+	// commits and rolls back with main's.
+	if c.tx != nil && path != c.path && isSelectStmt(sqlText) {
 		path, schema = c.path, ""
 	}
 	return path, schema, execSQL, nil
+}
+
+// auxTxnDB is the held session of the ATTACHed database at path, joined to the
+// open transaction: on first use it gets an engine BEGIN of its own and the
+// savepoints already open on main, so ROLLBACK and ROLLBACK TO undo its writes
+// as C's do (sqlite3BtreeBeginTrans per written Btree, savepoints opened on
+// every one, vdbe.c OP_Savepoint).
+//
+// COMMIT commits each of these, then main (commitAux). C makes that atomic
+// across files with a super-journal; this does not write one. That is a
+// deliberate simplification with a known ceiling: a crash between two files'
+// commits leaves one committed and the other not, each file still consistent on
+// its own, and only for a transaction that wrote more than one file-backed
+// database (an in-memory attachment has nothing to recover). The upgrade path is
+// the engine's own note in engine/attach_write.go: write the member list, fsync,
+// commit each member, delete it, and consult it on recovery.
+func (c *Conn) auxTxnDB(path, schema string) (*engine.DB, error) {
+	for _, db := range c.txAux {
+		if nw := c.sessionOwning(db); nw != nil && c.ndbs[path] == nw {
+			return db, nil
+		}
+	}
+	db, err := c.openWriteOrCreatePath(path)
+	if err != nil {
+		return nil, err
+	}
+	db.SetLocalSchema(schema)
+	if err := db.Exec(`BEGIN`); err != nil {
+		return nil, err
+	}
+	for _, sp := range c.tx.SavepointNames() {
+		if err := db.Exec(`SAVEPOINT "` + strings.ReplaceAll(sp, `"`, `""`) + `"`); err != nil {
+			db.Exec(`ROLLBACK`) // the session joined nothing yet; its BEGIN goes
+			return nil, err
+		}
+	}
+	db.MarkHeldTransaction()
+	db.MarkDeferredFKCommitter()
+	c.txAux = append(c.txAux, db)
+	return db, nil
+}
+
+// wireTxnReaders wires main (as "main") and every OTHER attachment onto db, a
+// joined attachment's session, as readers of the transaction's own state for
+// one statement -- crossDBExec's wiring, from the held sessions, so a write
+// into one database reads the uncommitted rows of the others.
+func (c *Conn) wireTxnReaders(db *engine.DB, selfPath string) (release func(), err error) {
+	var opened []*engine.ReadOnlyPager
+	closeAll := func() {
+		for _, p := range opened {
+			p.Close()
+		}
+	}
+	var dbs []engine.AttachedDatabase
+	add := func(path, name string) error {
+		nw, err := c.sessionFor(path)
+		if err != nil {
+			return err
+		}
+		rp, err := nw.ReadPager()
+		if err != nil {
+			return err
+		}
+		rp.SetLocalSchema(name)
+		rp.SetInMemory(c.memBacked(path))
+		c.stampConnState(rp)
+		opened = append(opened, rp)
+		dbs = append(dbs, engine.AttachedDatabase{Name: name, Pager: rp, Path: path, InMemory: c.memBacked(path)})
+		return nil
+	}
+	if err := add(c.path, "main"); err != nil {
+		closeAll()
+		return nil, err
+	}
+	for _, a := range c.attached {
+		if a.path == selfPath {
+			continue
+		}
+		if err := add(a.path, a.name); err != nil {
+			closeAll()
+			return nil, err
+		}
+	}
+	db.SetAttachedDatabases(dbs)
+	return func() {
+		db.SetAttachedReaders(nil, nil)
+		closeAll()
+	}, nil
+}
+
+// checkAuxDeferredFKs runs COMMIT's deferred foreign-key check on every joined
+// attachment, ahead of anything being committed: a violation in any database
+// leaves the whole transaction open (vdbe.c's sqlite3VdbeCheckFk counts across
+// the connection).
+func (c *Conn) checkAuxDeferredFKs() error {
+	for _, db := range c.txAux {
+		if err := db.CheckDeferredForeignKeys(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// commitAux commits every joined attachment and forgets them. When one fails
+// the rest are rolled back, and so is main (the caller's db, not yet
+// committed): the transaction ends whole rather than half-applied.
+func (c *Conn) commitAux(mainDB *engine.DB) error {
+	aux := c.txAux
+	c.txAux = nil
+	for i, db := range aux {
+		if err := c.commitSession(db); err != nil {
+			for _, rest := range aux[i+1:] {
+				c.discardSession(rest)
+			}
+			if mainDB != nil {
+				c.discardSession(mainDB)
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// discardAux rolls back every joined attachment and forgets them.
+func (c *Conn) discardAux() {
+	aux := c.txAux
+	c.txAux = nil
+	for _, db := range aux {
+		c.discardSession(db)
+	}
 }
 
 // openCrossDBReaders opens a read-only ReadOnlyPager over the main file
@@ -705,6 +839,25 @@ func (c *Conn) dbForSchema(name string) (path, schema string, ok bool) {
 // dbHasTable reports whether the database file at path contains an ordinary
 // table named tbl (case-insensitive). A missing or empty file has no tables.
 func (c *Conn) dbHasTable(path, tbl string) bool {
+	// Inside a transaction the held session's own catalog is the truth: a table
+	// it created or dropped is not in the file yet, and resolving against the
+	// file sent "BEGIN; CREATE TABLE t2(..); INSERT INTO t2 .." to an
+	// attachment's committed t2.
+	if c.tx != nil {
+		nw := c.ndbs[path]
+		if path == c.path {
+			nw = c.ndb
+		}
+		if nw != nil && nw.InTransaction() {
+			if rp, err := nw.ReadPager(); err == nil {
+				names, nerr := rp.TableNames()
+				rp.Close()
+				if nerr == nil {
+					return slices.ContainsFunc(names, func(n string) bool { return r33sIdentEq(n, tbl) })
+				}
+			}
+		}
+	}
 	fi, err := os.Stat(path)
 	if err != nil || fi.Size() == 0 {
 		return false
