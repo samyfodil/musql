@@ -818,6 +818,7 @@ func (db *DB) compileWriteProgram(sqlText string) (*Program, error) {
 			if tbl := db.findTableMetaIn(writeTargetScope(fkSchema), fkTable); tbl != nil {
 				prog.FKTargets = []*tableMeta{tbl}
 				prog.FKReach = fkStatementReach(kw, toks, verbAt)
+				prog.FKShape = fkShapeOf(kw, sqlText)
 			}
 		}
 		return prog, err
@@ -4774,9 +4775,12 @@ func (c *compiler) emitInsertRowBody(db *DB, tbl *tableMeta, stmt *insertStmt, p
 			continue
 		}
 		switch {
-		case col.DefaultKnown:
+		case col.DefaultKnown && col.DefaultDeferred == nil:
 			c.emit(Instruction{Op: OpSCopy, P1: c.compileLiteral(col.DefaultValue), P2: base + i})
 		case col.DefaultDeferred != nil:
+			// (An ADD COLUMN DEFAULT of -0x8000000000000000 carries both a folded
+			// value, for the rows already stored, and the clause itself, which
+			// cannot be code-generated: see addColumn.)
 			// A clock-reading DEFAULT (columnInfo.DefaultDeferred), COMPILED
 			// rather than folded to a literal here: C SQLite evaluates a
 			// DEFAULT per INSERT, and a literal would freeze the reading into

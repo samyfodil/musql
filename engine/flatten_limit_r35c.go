@@ -628,6 +628,16 @@ func (p *ReadOnlyPager) r37cExpandViewRef(it FromItem) (FromItem, bool) {
 	if !ok {
 		return FromItem{}, false
 	}
+	// Resolving the body's own FROM below can name this view again ("CREATE VIEW
+	// v AS SELECT * FROM v"): a view being expanded is not expanded twice, and the
+	// reference is left to the guarded path, which reports the cycle.
+	for _, seen := range p.viewExpansion {
+		if equalFoldName(seen, it.Table) {
+			return FromItem{}, false
+		}
+	}
+	p.viewExpansion = append(p.viewExpansion, it.Table)
+	defer func() { p.viewExpansion = p.viewExpansion[:len(p.viewExpansion)-1] }()
 	body := pcv.selectStmt
 	if len(body.Columns) == 0 {
 		return FromItem{}, false

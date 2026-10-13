@@ -52,6 +52,14 @@ type cteBinding struct {
 	// stops the flattener (r38cExpandCTERef, flatten_limit_r35c.go).
 	m10d CTEMaterialization
 
+	// nUse is how many FROM items reference this CTE in the statement
+	// (CteUse.nUse, select.c:5767). C materializes the body once, for every
+	// reference to share, when the CTE is AS MATERIALIZED or is referenced twice
+	// or more without AS NOT MATERIALIZED (select.c:7276, :8018), which is
+	// observable for a body that is not deterministic: "WITH t AS (SELECT
+	// random() AS r) SELECT (SELECT r FROM t) = (SELECT r FROM t)" is 1.
+	nUse int
+
 	// recursive is non-nil iff core matches the one recursive shape this
 	// package recognizes (detectRecursiveShape) -- a compound whose TRAILING
 	// arms, one or more of them and all joined by the same UNION or UNION ALL,
@@ -280,6 +288,12 @@ func (p *ReadOnlyPager) snapshotCTEScopes() []map[string]*cteBinding {
 // cteSchemaCols, so reaching here with one is an internal error. p.cteExpansion
 // (view.go's viewExpansion analogue) rejects a reference cycle as "circular
 // reference: %s".
+// sharedBody reports whether every reference to b reads one execution of its
+// body (see cteBinding.nUse).
+func (b *cteBinding) sharedBody() bool {
+	return b.m10d == cteM10dYes || (b.m10d == cteM10dAny && b.nUse >= 2)
+}
+
 func (p *ReadOnlyPager) resolveCTERows(name string, b *cteBinding, params []Value) ([]columnInfo, [][]Value, error) {
 	if b.recursive != nil {
 		return nil, nil, fmt.Errorf("engine: internal: recursive CTE %s reached the run-time materializer", name)

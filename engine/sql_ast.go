@@ -408,7 +408,11 @@ type WindowFrame struct {
 // referencing spec inherits the base's PARTITION BY (and ORDER BY/frame when
 // it doesn't supply its own) -- see resolveWindowSpec (sql_window.go).
 type WindowSpec struct {
-	Ref         string
+	Ref string
+	// Bare marks "OVER win", the unparenthesized spelling: it takes the named
+	// window whole, frame included, where "OVER (win ...)" refines it under
+	// sqlite3WindowChain's rules (sqlite3WindowUpdate, window.c:659).
+	Bare        bool
 	PartitionBy []Expr
 	OrderBy     []OrderTerm
 	Frame       *WindowFrame

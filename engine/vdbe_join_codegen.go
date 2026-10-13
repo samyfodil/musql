@@ -1914,6 +1914,8 @@ func (p *ReadOnlyPager) resolveCTESource(c *compiler, state *joinDesugarState, i
 		return p.resolveRecursiveSelfSource(c, state, i, it, b, sr, offset)
 	}
 
+	b.nUse++
+
 	// A non-recursive CTE whose body binds an enclosing query's column ("SELECT x
 	// FROM t1 WHERE EXISTS (WITH t2(a) AS (VALUES(x)) SELECT * FROM t2 WHERE a>7)")
 	// is resolved like a correlated derived table (resolveCorrelatedCTESource).

@@ -841,6 +841,11 @@ func (p *parser) parseSelectCore() (*SelectStmt, error) {
 			}
 			break
 		}
+		chained, err := chainNamedWindows(stmt.Windows)
+		if err != nil {
+			return nil, err
+		}
+		stmt.Windows = chained
 	}
 
 	return stmt, nil
@@ -914,7 +919,7 @@ func (p *parser) parseWindowSpec() (*WindowSpec, error) {
 		if nt.kind != tkIdent {
 			return nil, fmt.Errorf("engine: expected window name or ( after OVER")
 		}
-		return &WindowSpec{Ref: nt.text}, nil
+		return &WindowSpec{Ref: nt.text, Bare: true}, nil
 	}
 	p.next() // "("
 	spec := &WindowSpec{}

@@ -408,6 +408,10 @@ type DB struct {
 	// child-side-exempt; see fkRowMutated.
 	fkSuppressChild bool
 
+	// keepBodyOrderBy is set while schemaObjectsResolveCompiled compiles trigger
+	// bodies: a bare SELECT step keeps its ORDER BY, so a name in it is resolved.
+	keepBodyOrderBy bool
+
 	// textEncoding is this database's TEXT encoding (header byte 56): UTF8, or
 	// UTF16LE/UTF16BE once "PRAGMA encoding" has switched a still-empty database
 	// (pragma.go). It is a property of the FILE, stored in its catalog. Text is held

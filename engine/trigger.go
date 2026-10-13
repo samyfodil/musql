@@ -1078,7 +1078,7 @@ func triggerOldNewScopes(tbl *tableMeta, event triggerEventKind) (oldTS, newTS t
 	hasNew := event == triggerUpdate || event == triggerInsert
 
 	if hasOld {
-		oldTS = tableScope{name: "old", cols: tbl.cols, colIndex: buildColIndex(tbl.cols), offset: 0, unqualifiedHidden: true}
+		oldTS = tableScope{name: "old", cols: tbl.cols, colIndex: buildColIndex(tbl.cols), offset: 0, unqualifiedHidden: true, noRowid: tbl.withoutRowid}
 	} else {
 		oldTS = tableScope{name: "old", colIndex: map[string]int{}, noRowid: true, unqualifiedHidden: true}
 	}
@@ -1087,7 +1087,7 @@ func triggerOldNewScopes(tbl *tableMeta, event triggerEventKind) (oldTS, newTS t
 		newOffset = len(tbl.cols)
 	}
 	if hasNew {
-		newTS = tableScope{name: "new", cols: tbl.cols, colIndex: buildColIndex(tbl.cols), offset: newOffset, unqualifiedHidden: true}
+		newTS = tableScope{name: "new", cols: tbl.cols, colIndex: buildColIndex(tbl.cols), offset: newOffset, unqualifiedHidden: true, noRowid: tbl.withoutRowid}
 	} else {
 		newTS = tableScope{name: "new", colIndex: map[string]int{}, noRowid: true, unqualifiedHidden: true}
 	}
@@ -1670,6 +1670,13 @@ func (db *DB) validateSimpleBodySelectEager(sel *SelectStmt, outer *evalCtx, ord
 			if orderTermNamesOutputColumn(ot.Expr, sel.Columns, outCols) {
 				continue
 			}
+			// A compound's ORDER BY is matched against each arm's result names in
+			// turn, leftmost first (resolveCompoundOrderBy), so an alias on a later
+			// arm names the term. An arm with a star may expand to it: skipping
+			// the check can only accept more.
+			if cx, ok := ot.Expr.(ColumnExpr); ok && cx.Qualifier == "" && cx.Schema == "" && compoundArmNames(sel, cx.Name) {
+				continue
+			}
 			if err := validateColumnRefs(ot.Expr, planCtx); err != nil {
 				return err
 			}
@@ -2160,4 +2167,21 @@ func declineTriggerWhenSubqueryCollation(tbl *tableMeta, tr *triggerMeta) error 
 		}
 	}
 	return nil
+}
+
+// compoundArmNames reports whether some arm after the first of sel's compound
+// has a result column that an ORDER BY term spelling name can bind to: an explicit
+// alias, or a star (whose expansion is not known here).
+func compoundArmNames(sel *SelectStmt, name string) bool {
+	for _, arm := range sel.Compound {
+		for _, c := range arm.Stmt.Columns {
+			if c.Star || (c.HasAlias && equalFoldName(c.Alias, name)) {
+				return true
+			}
+		}
+		if compoundArmNames(arm.Stmt, name) {
+			return true
+		}
+	}
+	return false
 }
