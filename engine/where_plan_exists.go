@@ -42,6 +42,12 @@ type wherePlanExistsJoin struct {
 	// clause the way C does: sqlite3ProcessJoin folded those in first.
 	base Expr
 	subs []Expr
+	// exists are the converted EXISTS selects, in FROM order after nOrig, and
+	// order is the planned nesting (wherePlanExistsOrder), source indexes
+	// outermost first; nil until planned.
+	exists []*SelectStmt
+	order  []int
+	keys   []*autoIndexKey // per level of order
 }
 
 // wherePlanExistsToJoin reports applies == false when existsToJoin would
@@ -80,7 +86,7 @@ func wherePlanExistsToJoin(p *ReadOnlyPager, c *compiler, srcs []joinSource, stm
 	}
 	stmt2 := *stmt
 	stmt2.From = append([]FromItem(nil), stmt.From...)
-	ej = &wherePlanExistsJoin{srcs: append([]joinSource(nil), srcs...), stmt: &stmt2, nOrig: len(srcs)}
+	ej = &wherePlanExistsJoin{srcs: append([]joinSource(nil), srcs...), stmt: &stmt2, nOrig: len(srcs), exists: exists}
 	for k, sub := range exists {
 		name := fmt.Sprintf("%s%d", existsScopePrefix, k)
 		src, fi, subWhere, sok := existsJoinSource(p, sub, name)
@@ -347,6 +353,7 @@ func wherePlanExistsOrder(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, ej *w
 			return nil, nil, 0, false
 		}
 	}
+	ej.order, ej.keys = order, all
 	keys, levels = make([]*autoIndexKey, ej.nOrig), make([]int, ej.nOrig)
 	next := 0
 	for level, iTab := range order {
