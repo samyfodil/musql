@@ -568,6 +568,14 @@ func (p *ReadOnlyPager) cachePlan(sqlText string, prog *Program) {
 // evaluated over one synthetic row. An aggregate list compiles via
 // compileNoFromAggregate, a window query via compileNoFromWindow.
 func (p *ReadOnlyPager) execNoFrom(stmt *SelectStmt, outer *evalCtx, params []Value) (cols []string, rows [][]Value, err error) {
+	return p.execNoFromKeyed(stmt, outer, params, "")
+}
+
+// execNoFromKeyed is execNoFrom for a statement that is a rewrite of a top-level
+// read's text: cacheKey, the input text (as in execSelect), memoizes the
+// compiled Program so a repeat of the text skips the rewrite and the
+// compile. Empty for every other caller.
+func (p *ReadOnlyPager) execNoFromKeyed(stmt *SelectStmt, outer *evalCtx, params []Value, cacheKey string) (cols []string, rows [][]Value, err error) {
 	if len(stmt.GroupBy) > 0 {
 		trimmed, gerr := p.validateNoFromGroupBy(stmt, outer, params)
 		if gerr != nil {
@@ -614,7 +622,7 @@ func (p *ReadOnlyPager) execNoFrom(stmt *SelectStmt, outer *evalCtx, params []Va
 	// execNoFromRowMode, which has been removed. The error
 	// names the gap so the conformance gate surfaces exactly what the compiler
 	// still owes.
-	cols, rows, handled, verr := p.tryVDBENoFrom(stmt, outer, params)
+	cols, rows, handled, verr := p.tryVDBENoFrom(stmt, outer, params, cacheKey)
 	if handled {
 		return cols, rows, verr
 	}
@@ -1152,7 +1160,12 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 			resolved.Limit = &n
 			resolved.LimitParam = nil
 		}
-		if stmt.OffsetParam != nil {
+		if resolved.Limit != nil && *resolved.Limit == 0 {
+			// computeLimitRegisters leaves for the end on a LIMIT of 0 before
+			// it codes the OFFSET, which is therefore never evaluated.
+			resolved.Offset, resolved.OffsetParam = nil, nil
+		}
+		if resolved.OffsetParam != nil {
 			n, ferr := foldLimitOffsetExpr(p, limitOffsetPseudoRowRefs(stmt.OffsetParam, outer), params)
 			if ferr != nil {
 				return nil, nil, ferr
@@ -1212,7 +1225,7 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 	// count(*) over a UNION ALL is the sum of its arms' counts (count_union_all.go).
 	if outer == nil {
 		if f := p.countUnionAll(stmt); f != nil {
-			return p.execNoFrom(f, outer, params)
+			return p.execNoFromKeyed(f, outer, params, cacheKey)
 		}
 	}
 

@@ -248,9 +248,26 @@ type compiler struct {
 	// destination (select.c, the "eDest!=SRT_Exists" arm).
 	existsStmt *SelectStmt
 
+	// existsJoinPlan is the planned existsToJoin rewrite of this compiler's
+	// SELECT (markWherePlanExistsEligibility), nil when there is none or the
+	// planner declined it. existsPos maps each converted EXISTS select to where
+	// its table sits in that join, existsHoist holds the constant terms of
+	// their WHEREs, and existsAt is the entry for the EXISTS being compiled
+	// (where_const_terms.go).
+	existsJoinPlan *wherePlanExistsJoin
+	existsPos      map[*SelectStmt]*existsJoinPos
+	existsHoist    []Expr
+	existsAt       *existsJoinPos
+
 	// noAndOrSimplify turns off simplifiedAndOr: an outer join's ON terms carry
 	// EP_OuterON, which ExprAlwaysTrue/False refuse to look through.
 	noAndOrSimplify bool
+
+	// joinHalt is the running emitJoinLoops' addrHalt chain (joinHalt,
+	// vdbe_join_codegen.go), nil outside one.
+	joinHalt *joinHalt
+	// joinLevelNow is the level whose terms emitJoinLevel is compiling.
+	joinLevelNow int
 
 	// correlated records that this compiler's program (or a subquery nested
 	// within it) bound at least one column of an ENCLOSING scope -- set by
@@ -987,6 +1004,10 @@ func resolveSubProgramLimitOffset(pager *ReadOnlyPager, stmt *SelectStmt) (resto
 			stmt.LimitParam = nil
 		}
 	}
+	if stmt.Limit != nil && *stmt.Limit == 0 && stmt.OffsetParam != nil {
+		// A LIMIT of 0 leaves before the OFFSET is coded (computeLimitRegisters).
+		stmt.OffsetParam = nil
+	}
 	if stmt.OffsetParam != nil {
 		n, folded, ferr := fold(stmt.OffsetParam)
 		if ferr != nil {
@@ -1296,21 +1317,27 @@ func (c *compiler) compileExistsSubquery(x ExistsExpr, top bool) (int, error) {
 	// sqlite3Select drops an EXISTS body's DISTINCT and ORDER BY (IgnorableDistinct,
 	// select.c "tag-select-0100"), but only after the outer statement's name
 	// resolution has seen them: a bad ORDER BY name is still an error.
+	//
+	// For a compound the ORDER BY is the whole compound's, and the DISTINCT
+	// dropped is the arms' own (compileCompound).
 	body := x.Stmt
-	if len(body.Compound) == 0 && (body.Distinct || len(body.OrderBy) > 0) {
+	if body != nil && ((len(body.Compound) == 0 && body.Distinct) || len(body.OrderBy) > 0) {
 		if len(body.OrderBy) > 0 {
 			if _, err := c.liveSubSelect(body); err != nil {
 				return 0, err
 			}
 		}
 		cp := *body
-		cp.Distinct, cp.OrderBy = false, nil
+		cp.OrderBy = nil
+		if len(body.Compound) == 0 {
+			cp.Distinct = false
+		}
 		body = &cp
 	}
-	savedExistsJoin, savedExistsStmt := c.existsJoin, c.existsStmt
-	c.existsJoin, c.existsStmt = top && !x.Not && existsJoinable(body), body
+	savedExistsJoin, savedExistsStmt, savedExistsAt := c.existsJoin, c.existsStmt, c.existsAt
+	c.existsJoin, c.existsStmt, c.existsAt = top && !x.Not && existsJoinable(body), body, c.existsPos[x.Stmt]
 	prog, err := c.liveSubSelect(body)
-	c.existsJoin, c.existsStmt = savedExistsJoin, savedExistsStmt
+	c.existsJoin, c.existsStmt, c.existsAt = savedExistsJoin, savedExistsStmt, savedExistsAt
 	if err != nil {
 		return 0, err
 	}
@@ -1334,6 +1361,17 @@ func (c *compiler) compileExistsSubquery(x ExistsExpr, top bool) (int, error) {
 		c.emit(Instruction{Op: OpExists, P1: d, P3: not, P4: prog, P5: p5Correlated})
 	} else {
 		c.emit(Instruction{Op: OpExists, P1: d, P2: c.allocSub(), P3: not, P4: prog})
+	}
+	if pos := c.existsPos[x.Stmt]; pos != nil && pos.cursor >= 0 && top && !x.Not {
+		if h := c.joinHalt; h != nil && h.off == 0 && c.joinLevelNow >= 0 && c.joinLevelNow < len(h.lv) {
+			// Its level reached, an empty EXISTS table ends the join
+			// (existsJoinPos.src).
+			// OpIfEmpty opens the table itself the first time (its P4).
+			skip := c.emit(Instruction{Op: OpIf, P1: d})
+			lv := h.lv[c.joinLevelNow]
+			h.patches[lv] = append(h.patches[lv], c.emit(Instruction{Op: OpIfEmpty, P1: pos.cursor, P3: pos.src.dbIdx, P4: pos.src.tbl}))
+			c.patch(skip, c.here())
+		}
 	}
 	return d, nil
 }

@@ -72,7 +72,7 @@ func existsInlinable(sub *Program) bool {
 // pass knows: the whitelist relocate implements, operand by operand.
 func existsInlineOperands(in Instruction) bool {
 	switch in.Op {
-	case OpInit, OpOpenRead, OpRewind, OpNext, OpClose, OpHalt, OpGoto,
+	case OpInit, OpOpenRead, OpRewind, OpNext, OpIfEmpty, OpClose, OpHalt, OpGoto,
 		OpColumn, OpRowid, OpOuterColumn, OpOuterRowid,
 		OpInteger, OpVariable, OpNull, OpString8, OpReal, OpSCopy, OpCopy,
 		OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull,
@@ -122,7 +122,7 @@ func existsInline(prog *Program, at int, sub *Program) {
 			r = Instruction{Op: OpGoto, P2: found}
 		case OpOpenRead, OpClose, OpAutoIndexOrder:
 			r.P1 = cur(in.P1)
-		case OpRewind, OpNext:
+		case OpRewind, OpNext, OpIfEmpty:
 			r.P1, r.P2 = cur(in.P1), jump(in.P2)
 		case OpColumn:
 			r.P1, r.P3 = cur(in.P1), reg(in.P3)

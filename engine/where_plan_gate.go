@@ -473,6 +473,7 @@ func markWherePlanExistsEligibility(p *ReadOnlyPager, c *compiler, srcs []joinSo
 	if !ok {
 		return
 	}
+	c.existsJoinPlan = ej
 	c.planNRow, c.planNRowOK = nRow, c.outer == nil || c.nQueryLoopKnown
 	if len(srcs) == 1 {
 		srcs[0].idxOrderKey = keys[0]

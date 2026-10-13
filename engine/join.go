@@ -2382,7 +2382,7 @@ func planJoinPushdown(where Expr, jts []joinedTable, scopes []tableScope) joinPl
 				origMax = idx
 			}
 		}
-		forceLast := mentionsSubquery(cj) && !levelZeroConstTerm(cj, scopes, false)
+		forceLast := mentionsSubquery(cj) && !levelZeroConstTerm(cj, scopes, false) && !constSubTerm(cj, scopes)
 		checkIdx := origMax
 		if forceLast && checkIdx < len(jts)-1 {
 			checkIdx = len(jts) - 1
