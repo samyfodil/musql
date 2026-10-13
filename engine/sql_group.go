@@ -1336,10 +1336,16 @@ func joinHasCoalescedColumns(scopes []tableScope) bool {
 // first-row key register, and which side supplies it is decided per row; an
 // anchor placeholder would freeze that choice (joink_r27 coalesce-chain shapes).
 // Asked of every scope; a spurious true keeps the first-row answer.
+//
+// Key presence, not a non-empty owner list: a member of a materialized
+// parenthesized join group keeps the key with no owners once its chain is
+// re-addressed onto the group's cursor (resolveGroupSpan's marker), and
+// "(pa a RIGHT JOIN pb b USING(id)) AS g ... GROUP BY g.id" read a.id's raw
+// NULL for b's unmatched rows when only owners counted.
 func refIsRightJoinCoalesced(scopes []tableScope, ce ColumnExpr) bool {
 	lname := r33sFoldIdent(ce.Name)
 	for i := range scopes {
-		if len(scopes[i].coalesceFallback[lname]) > 0 {
+		if _, ok := scopes[i].coalesceFallback[lname]; ok {
 			return true
 		}
 	}

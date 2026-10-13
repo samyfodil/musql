@@ -180,6 +180,13 @@ var naturalSelfJoinCorpus = []joinCase{
 	{"SELECT * FROM ss1 NATURAL JOIN ss1 WHERE a > 1 ORDER BY a, b", true},
 	{"SELECT * FROM ss1 NATURAL JOIN ss1 ORDER BY a DESC, b", true},
 
+	// --- two DIFFERENT tables under one shared alias: "*" names the later
+	// item's extra column too (declined until the turso-joins work). ---
+	{"SELECT * FROM ss1 AS x NATURAL JOIN ss2 AS x", false},
+	{"SELECT * FROM ss1 AS x JOIN ss2 AS x USING(a)", false},
+	{"SELECT * FROM ss1 NATURAL JOIN ss2 AS ss1", false},
+	{"SELECT * FROM ss2 AS ss1 NATURAL JOIN ss1", false},
+
 	// --- CTE referenced twice (only reachable through QueryArgs, which binds
 	// WITH) ---
 	{"WITH cte(a,b) AS (SELECT a,b FROM ss1) SELECT * FROM cte NATURAL JOIN cte", false},
@@ -514,18 +521,6 @@ func TestNaturalSelfJoinDeclined(t *testing.T) {
 		// six statements moved into naturalSelfJoinCorpus, where they now
 		// agree with C SQLite cell for cell.)
 
-		// Two DIFFERENT tables under one shared alias, where the later one
-		// exposes a column the earlier lacks. The join itself is computed
-		// correctly (see the count(*) spellings in the parity corpus), but
-		// "*" expansion names each surviving column by its scope NAME, which
-		// reaches only the first item -- so this engine reports "no such
-		// column: c" for a query SQLite answers. A genuine self-join can never
-		// hit it (identical column sets), and neither can an ordinary
-		// distinct-name FROM clause.
-		"SELECT * FROM ss1 AS x NATURAL JOIN ss2 AS x",
-		"SELECT * FROM ss1 AS x JOIN ss2 AS x USING(a)",
-		"SELECT * FROM ss1 NATURAL JOIN ss2 AS ss1",
-		"SELECT * FROM ss2 AS ss1 NATURAL JOIN ss1",
 	} {
 		if _, _, cErr := cgoSelect(t, cdb, sqlText, nil); cErr != nil {
 			t.Fatalf("[%s] expected C SQLite to ANSWER this (the point of the decline), got %v", sqlText, cErr)

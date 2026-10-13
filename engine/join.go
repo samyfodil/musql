@@ -65,6 +65,7 @@ type joinedTable struct {
 	// RIGHT/FULL target whose USING/NATURAL chose this table as representative
 	// appends its index, in FROM order (installCoalesceFallback).
 	coalesceFallback map[string][]int
+	coalesceRightAt  map[string]int // tableScope.coalesceRightAt
 
 	// derived is true for a derived table (FromItem.Subquery): tbl is a
 	// synthetic *resolvedTable with only the output columns, and its scope
@@ -204,9 +205,13 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 			var cols []columnInfo
 			var crows [][]Value
 			var cerr error
-			// Under the schema-only retry (resolveFromSchemaOnly) a plain CTE is
-			// resolved by the same compile-only path: its columns, never its rows.
-			if cteBind.recursive != nil || p.derivedSchemaOnly {
+			// Under the schema-only retry (resolveFromSchemaOnly), and for a caller
+			// that wants columns only (derivedSelectScope), a plain CTE is resolved
+			// by the same compile-only path: its columns, never its rows. Running
+			// the rows there made a chain of N CTEs, each reading the one before,
+			// cost 2^N: every level ran the level below once for its rows and once
+			// more for its column metadata.
+			if cteBind.recursive != nil || p.derivedSchemaOnly || p.fromColumnsOnly {
 				cols, cerr = p.cteSchemaCols(it.Table, cteBind)
 			} else {
 				cols, crows, cerr = p.resolveCTERows(it.Table, cteBind, params)
@@ -530,11 +535,12 @@ func (p *ReadOnlyPager) checkDerivedJoinSupported(items []FromItem) error {
 	}
 	hasDerived := false
 	for _, it := range items {
-		// fromItemIsDerived (view.go) itself now treats a NestedGroupSpan
-		// connector as derived -- conservatively, regardless of what its own
-		// nested span actually contains -- so this scan does not need to
-		// look inside it separately.
-		if p.fromItemIsDerived(it) {
+		// Only a source a pin addresses: an UNALIASED derived table has no
+		// scope name (ColumnExpr.UsingPinned), and a NestedGroupSpan
+		// connector wraps a span this check never inspects. An aliased
+		// derived table, a view or a CTE is addressed by its name like any
+		// table (a repeated name is checkSelfJoinGroupSupported's).
+		if it.NestedGroupSpan != nil || (it.Subquery != nil && it.Alias == "") {
 			hasDerived = true
 			break
 		}
@@ -1281,6 +1287,12 @@ func installCoalesceFallback(jts []joinedTable, idx int, kind JoinKind, hidden m
 			jts[repr].coalesceFallback = make(map[string][]int, len(hidden))
 		}
 		jts[repr].coalesceFallback[lname] = append(jts[repr].coalesceFallback[lname], idx)
+		if kind == JoinRight {
+			if jts[repr].coalesceRightAt == nil {
+				jts[repr].coalesceRightAt = make(map[string]int, len(hidden))
+			}
+			jts[repr].coalesceRightAt[lname] = len(jts[repr].coalesceFallback[lname])
+		}
 	}
 	return nil
 }
@@ -1464,7 +1476,7 @@ func buildScopes(jts []joinedTable) []tableScope {
 		// doc comment, query.go): C SQLite errors "no such column:
 		// rowid"/"oid"/"_rowid_" against one just like it does for a
 		// derived table, verified directly.
-		scopes[i] = tableScope{name: jt.name, tableName: jt.tableName, cols: jt.tbl.cols, colIndex: buildColIndex(jt.tbl.cols), offset: jt.offset, coalesced: jt.coalesced, coalesceFallback: jt.coalesceFallback, noRowid: jt.derived || jt.tbl.withoutRowid, nestedNonLeading: jt.nestedNonLeading}
+		scopes[i] = tableScope{name: jt.name, tableName: jt.tableName, cols: jt.tbl.cols, colIndex: buildColIndex(jt.tbl.cols), offset: jt.offset, coalesced: jt.coalesced, coalesceFallback: jt.coalesceFallback, coalesceRightAt: jt.coalesceRightAt, noRowid: jt.derived || jt.tbl.withoutRowid, nestedNonLeading: jt.nestedNonLeading}
 	}
 	return scopes
 }
@@ -1488,6 +1500,29 @@ type joinDesugarState struct {
 	// shape: a FROM clause whose names are all distinct keeps exactly its
 	// prior behavior, checks included.
 	sharedName bool
+
+	// sawRightJoin records that this FROM level has a RIGHT or FULL join so
+	// far, and pendingAmbiguous the first USING/NATURAL column that more than
+	// one earlier item still exposes (not merged by its own USING). C tags the
+	// whole level JT_LTORJ when ANY of its joins is RIGHT/FULL
+	// (sqlite3SrcListShiftJoinType) and then rejects such a column in every
+	// USING of the level, wherever it sits relative to the RIGHT JOIN, as
+	// "ambiguous reference to %s in USING()" (sqlite3ProcessJoin,
+	// select.c:600-622). Without a RIGHT/FULL join anywhere it is accepted,
+	// bound to the leftmost table.
+	sawRightJoin     bool
+	pendingAmbiguous string
+
+	// rightQual, while a parenthesized group's outward USING/NATURAL is
+	// desugared, names the member that supplies each common column the
+	// group's first member lacks (checkGroupConnectorUsing): the condition
+	// reads it there, as C reads the group's rebuilt list.
+	rightQual map[string]string
+}
+
+// ambiguousUsing is C's "ambiguous reference to %s in USING()".
+func ambiguousUsing(n string) error {
+	return semanticf("engine: ambiguous reference to %s in USING()", n)
 }
 
 // recordScope stores item idx's scope name and NestedNonLeading flag at
@@ -1633,6 +1668,12 @@ type visibleCol struct {
 // the NULL-extended side of the join that introduced it.
 func desugarJoinItem(state *joinDesugarState, idx int, it FromItem, name string, cols []columnInfo) (onExpr Expr, hidden map[string]int, err error) {
 	state.recordScope(idx, name, it.NestedNonLeading)
+	if it.Join == JoinRight || it.Join == JoinFull {
+		state.sawRightJoin = true
+		if state.pendingAmbiguous != "" {
+			return nil, nil, ambiguousUsing(state.pendingAmbiguous)
+		}
+	}
 
 	if !it.Natural && it.Using == nil {
 		if err := state.expose(idx, cols, nil); err != nil {
@@ -1643,15 +1684,21 @@ func desugarJoinItem(state *joinDesugarState, idx int, it FromItem, name string,
 
 	var names []string
 	if it.Natural {
-		rightHas := make(map[string]bool, len(cols))
-		for _, c := range cols {
-			rightHas[r33sFoldIdent(c.Name)] = true
-		}
-		seen := make(map[string]bool, len(state.visible))
+		// sqlite3ProcessJoin synthesizes the USING list from the RIGHT table's
+		// columns, in its order and spelling, keeping each that some table on
+		// the left has (select.c:540-556).
+		leftHas := make(map[string]bool, len(state.visible))
 		for _, vc := range state.visible {
-			lname := r33sFoldIdent(vc.name)
-			if rightHas[lname] && !seen[lname] {
-				names = append(names, vc.name)
+			leftHas[r33sFoldIdent(vc.name)] = true
+		}
+		seen := make(map[string]bool, len(cols))
+		for _, c := range cols {
+			if c.Hidden {
+				continue
+			}
+			lname := r33sFoldIdent(c.Name)
+			if leftHas[lname] && !seen[lname] {
+				names = append(names, c.Name)
 				seen[lname] = true
 			}
 		}
@@ -1700,9 +1747,9 @@ func desugarJoinItem(state *joinDesugarState, idx int, it FromItem, name string,
 		// exposing the name, with no ambiguity check; both NATURAL synthesis
 		// (select.c:544) and USING (select.c:583) use it. C's only USING
 		// ambiguity error, "ambiguous reference to %s in USING()"
-		// (select.c:619), fires inside a RIGHT/FULL join's multi-left coalesce
-		// (JT_LTORJ, select.c:600), so the check here is scoped to it.Join's
-		// own RIGHT/FULL.
+		// (select.c:619), fires inside the multi-left coalesce C builds when
+		// the level has any RIGHT/FULL join (JT_LTORJ, select.c:600), so the
+		// check here is scoped to that (joinDesugarState.sawRightJoin).
 		repr, ambiguous := -1, false
 		for _, vc := range state.visible {
 			if equalFoldName(vc.name, n) {
@@ -1720,8 +1767,13 @@ func desugarJoinItem(state *joinDesugarState, idx int, it FromItem, name string,
 			// fallback)".
 			return nil, nil, semanticf("engine: cannot join using column %s - column not present in both tables", n)
 		}
-		if ambiguous && (it.Join == JoinRight || it.Join == JoinFull) {
-			return nil, nil, fmt.Errorf("engine: ambiguous column name in NATURAL/USING join: %s", n)
+		if ambiguous {
+			if state.sawRightJoin {
+				return nil, nil, ambiguousUsing(n)
+			}
+			if state.pendingAmbiguous == "" {
+				state.pendingAmbiguous = n
+			}
 		}
 		hidden[lname] = repr
 
@@ -1746,7 +1798,9 @@ func desugarJoinItem(state *joinDesugarState, idx int, it FromItem, name string,
 			lref.UsingPinned, lref.UsingPinnedItem = true, repr
 		}
 		rref := ColumnExpr{Qualifier: name, Name: n}
-		if state.firstScopeNamed(name) != idx {
+		if q, ok := state.rightQual[lname]; ok {
+			rref.Qualifier = q
+		} else if state.firstScopeNamed(name) != idx {
 			state.sharedName = state.sharedName || name != ""
 			rref.Qualifier = ""
 			rref.UsingPinned, rref.UsingPinnedItem = true, idx

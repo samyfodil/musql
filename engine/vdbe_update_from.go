@@ -177,7 +177,7 @@ func (db *DB) compileUpdateFromSource(stmt *updateStmt, tbl *tableMeta, trig *tr
 		// alternative is calling identifyTargetRow with nothing to look up.
 		return nil, nil, fmt.Errorf("%w: UPDATE ... FROM against a WITHOUT ROWID table with no resolved PRIMARY KEY", errVDBEUnsupported)
 	}
-	sel, nkey, serr := buildUpdateFromSelect(stmt, tbl)
+	sel, nkey, serr := buildUpdateFromSelect(stmt, tbl, db.updateFromSourceLookup(stmt.ctes))
 	if serr != nil {
 		// writeJoinCTEs' own errors are prepare-time diagnostics
 		// (update_from.go); wrapping keeps their text verbatim.
