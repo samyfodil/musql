@@ -96,11 +96,6 @@ type segment struct {
 	fullWidth bool
 	exc       map[uint64]Value // row*nCols+col -> the value that did not fit
 
-	// Lazily built 8-byte (offset, length) cells of a segCellBounds column, for
-	// the readers that take a column's cells whole (BytesColumn).
-	cellMu    eqCountMu
-	cellCache map[int][]uint64
-
 	// diskIdx is this segment's equality indexes, read out of the FILE: a view
 	// over the mapped bytes, opened once per column and holding no data of its
 	// own. There is no in-memory alternative, deliberately -- see
@@ -804,27 +799,20 @@ func (s *segment) cellBytes(c, i int) ([]byte, bool) {
 }
 
 // boundsCells is a segCellBounds column's cells as the 8-byte (offset, length)
-// pairs BytesColumn hands out, built once per column and kept: 8 bytes a row
-// of memory, paid only by a reader that wants the column whole.
+// pairs BytesColumn hands out, built for the caller and not kept. Keeping them
+// would put back in memory the 8 bytes a row the file saved -- per connection,
+// since each maps the file and opens its own segments -- for a scan's sake;
+// building them is a pass over the bounds, which the scan reading the column
+// makes anyway.
 func (s *segment) boundsCells(c int) ([]uint64, bool) {
-	s.cellMu.Lock()
-	defer s.cellMu.Unlock()
-	if cells, seen := s.cellCache[c]; seen {
-		return cells, cells != nil
-	}
-	if s.cellCache == nil {
-		s.cellCache = map[int][]uint64{}
-	}
 	cells := make([]uint64, s.nRows)
 	for i := range cells {
 		x, ok := s.boundCell(c, i)
 		if !ok {
-			s.cellCache[c] = nil
 			return nil, false
 		}
 		cells[i] = x
 	}
-	s.cellCache[c] = cells
 	return cells, true
 }
 
