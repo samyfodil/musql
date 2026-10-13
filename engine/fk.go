@@ -1919,8 +1919,14 @@ func (db *DB) fkApplyAction(fk *fkConstraint, kids []uint64, action string, newP
 		// WHERE id=1" fires gc 100, ch 10, gc 101, ch 11; and a trigger on gc
 		// counting ch sees ch 11 still there when gc 100 goes. The drain takes
 		// the events this row's write recorded.
-		if err := db.fkDrain(db.fkStmt); err != nil {
-			return err
+		//
+		// Not inside DROP TABLE's own pass (fkSuppressChild): its events are
+		// recorded with the child side suppressed and must be drained after
+		// the pass, when a cascade's grandchild rows account normally.
+		if !db.fkSuppressChild {
+			if err := db.fkDrain(db.fkStmt); err != nil {
+				return err
+			}
 		}
 		if err := fire(afterPlan, next, old, rid); err != nil {
 			return err
