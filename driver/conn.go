@@ -845,7 +845,8 @@ func (c *Conn) execArgsBody(sqlText string, args []engine.Value) (driver.Result,
 	//
 	// An EXPLAIN cannot change the file, the attached set or the transaction
 	// state, so the warm read pager stays valid across one.
-	if engine.IsExplainStatement(sqlText) {
+	// (Plain DML leads with its own verb, never EXPLAIN: isPlainDMLText.)
+	if !c.plainDML(sqlText) && engine.IsExplainStatement(sqlText) {
 		rows, err := c.queryArgs(sqlText, args)
 		if err != nil {
 			return nil, err

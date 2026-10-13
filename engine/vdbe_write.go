@@ -490,11 +490,11 @@ func (db *DB) runWrite(prog *Program, args []Value) (rowsAffected int64, err err
 			db.drainTxBulks(keep)
 		}
 	}
-	m := prog.getMachine()
+	m := prog.getMachineFrom(&db.spareMachine)
 	// RELEASED LAST, not first: defers run LIFO, and every defer registered below
 	// this line still reads m. Registering the release here is what puts it after
 	// all of them.
-	defer prog.putMachine(m)
+	defer prog.putMachineTo(m, &db.spareMachine)
 	// Carry the session's record arena chunk across executions so a run of
 	// single-row INSERTs shares allocations. Taken, not shared: a nested write
 	// starts its own chunk.
