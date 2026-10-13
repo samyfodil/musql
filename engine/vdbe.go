@@ -2156,8 +2156,13 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpMakeRecord:
 			rec := m.recAlloc(op.P2)
+			owned := m.wctx != nil && m.wctx.db.argsOwned
 			for i := 0; i < op.P2; i++ {
-				rec[i] = copyValue(m.regs[op.P1+i])
+				if v := m.regs[op.P1+i]; owned && m.isOwnedParam(v) {
+					rec[i] = v // ExecArgsOwned: the caller handed these bytes over
+				} else {
+					rec[i] = copyValue(v)
+				}
 			}
 			m.recRegs[op.P3] = rec
 
@@ -2966,6 +2971,23 @@ func (m *vdbe) fkDrain() error {
 		return nil
 	}
 	return m.wctx.db.fkDrain(m.wctx.db.fkStmt)
+}
+
+// isOwnedParam reports whether v's bytes are exactly one bound parameter's,
+// which an ExecArgsOwned caller handed over: a record may keep them as they
+// are instead of copying, as the driver's arguments are copies made for the
+// call that nothing reads or writes again. Anything else -- a value computed,
+// a slice of a parameter -- is copied as before.
+func (m *vdbe) isOwnedParam(v Value) bool {
+	if len(v.S) == 0 {
+		return false
+	}
+	for i := range m.params {
+		if p := m.params[i].S; len(p) == len(v.S) && &p[0] == &v.S[0] {
+			return true
+		}
+	}
+	return false
 }
 
 func copyValue(v Value) Value {
