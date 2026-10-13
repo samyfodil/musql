@@ -217,6 +217,7 @@ func (n *Session) rewriteFile() error {
 	for _, t := range bulked {
 		t.bulk = nil
 	}
+	db.txBulks = db.txBulks[:0]
 	return nil
 }
 

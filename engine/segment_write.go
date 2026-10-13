@@ -1064,6 +1064,8 @@ func (db *DB) segmentSnapshotPager() (*ReadOnlyPager, error) { return db.segment
 
 // segmentPager builds the read pager over this session's rows, live or frozen.
 func (db *DB) segmentPager(freeze bool) (*ReadOnlyPager, error) {
+	// A read sees a transaction's direct-path loads as the rows they hold.
+	db.drainTxBulks(nil)
 	p := newReadOnlyPager()
 	// The schema this session can name, and the handle its committed column
 	// blocks come from. Both are inputs to the source below AND to its cache key.
