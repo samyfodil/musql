@@ -846,7 +846,7 @@ func (db *DB) execDetach(trimmed string) error {
 	// Inside a transaction C refuses to detach a database the transaction
 	// touched, reads included ("database aux is locked"); see
 	// attachedDB.touchedInTxn.
-	if ad := db.attachedNamed(name); db.txActive && ad != nil && ad.touchedInTxn {
+	if ad := db.attachedNamed(name); (db.inTransaction() || len(db.savepoints) > 0) && ad != nil && ad.touchedInTxn {
 		return fmt.Errorf("engine: database %s is locked", name)
 	}
 	for i, a := range db.attached {

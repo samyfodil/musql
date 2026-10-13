@@ -375,6 +375,9 @@ func compileScanAttempt(p *ReadOnlyPager, stmt *SelectStmt, outer *compiler, row
 	// several scopes over one cursor. count(*), sums and max() over "u JOIN (t
 	// JOIN w USING(a))" and the ON, comma, LEFT-inner and leading-group
 	// spellings match C.
+	if err := windowMisuseErr(stmt); err != nil {
+		return nil, err
+	}
 	hasWindow := selectHasWindow(stmt) || orderByHasWindow(stmt)
 	if len(stmt.GroupBy) != 0 {
 		// GROUP BY over a materialized join group works: resolveJoinSources

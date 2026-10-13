@@ -108,59 +108,96 @@ func walkExprShallow(e Expr, visit func(FuncExpr) bool) bool {
 	}
 }
 
+// chainNamedWindows is sqlite3WindowChain applied to a WINDOW clause as the
+// grammar builds it (windowdefn_list, parse.y): each definition after the FIRST
+// resolves its base name against the definitions written BEFORE it, the latest
+// of a repeated name winning, and the first definition's base is never looked
+// at, so a forward reference is silently dropped:
+//
+//	WINDOW w2 AS (w3 ORDER BY v), w3 AS (PARTITION BY g)   -- w2 is just ORDER BY v
+//	WINDOW w1 AS (PARTITION BY g), w2 AS (nope ORDER BY v) -- no such window: nope
+//
+// The errors are "no such window: %s" and "cannot override %s of window: %s"
+// for a PARTITION BY of its own, an ORDER BY when the base has one, or a base
+// that spells out a frame (even though this definition names none). The result
+// holds the effective spec of every definition (the base's PARTITION BY and
+// ORDER BY, the definition's own frame) with Ref cleared.
+func chainNamedWindows(windows []NamedWindow) ([]NamedWindow, error) {
+	out := make([]NamedWindow, len(windows))
+	for i, nw := range windows {
+		out[i] = nw
+		spec := nw.Spec
+		if spec == nil || spec.Ref == "" {
+			continue
+		}
+		if i == 0 {
+			cp := *spec
+			cp.Ref, cp.Bare = "", false
+			out[i].Spec = &cp
+			continue
+		}
+		eff, err := refineWindow(spec, out[:i])
+		if err != nil {
+			return nil, err
+		}
+		out[i].Spec = eff
+	}
+	return out, nil
+}
+
+// findWindowDef is windowFind: the latest definition of name.
+func findWindowDef(windows []NamedWindow, name string) *WindowSpec {
+	for i := len(windows) - 1; i >= 0; i-- {
+		if equalFoldName(windows[i].Name, name) {
+			return windows[i].Spec
+		}
+	}
+	return nil
+}
+
+// refineWindow is sqlite3WindowChain for a spec that names a base window.
+func refineWindow(spec *WindowSpec, windows []NamedWindow) (*WindowSpec, error) {
+	base := findWindowDef(windows, spec.Ref)
+	if base == nil {
+		return nil, fmt.Errorf("engine: no such window: %s", spec.Ref)
+	}
+	switch {
+	case len(spec.PartitionBy) > 0:
+		return nil, fmt.Errorf("engine: cannot override PARTITION clause of window: %s", spec.Ref)
+	case len(spec.OrderBy) > 0 && len(base.OrderBy) > 0:
+		return nil, fmt.Errorf("engine: cannot override ORDER BY clause of window: %s", spec.Ref)
+	case base.Frame != nil:
+		return nil, fmt.Errorf("engine: cannot override frame specification of window: %s", spec.Ref)
+	}
+	out := &WindowSpec{PartitionBy: base.PartitionBy, OrderBy: base.OrderBy, Frame: spec.Frame}
+	if len(spec.OrderBy) > 0 {
+		out.OrderBy = spec.OrderBy
+	}
+	return out, nil
+}
+
 // resolveWindowSpec resolves a window specification's base-window REFERENCE
-// (WindowSpec.Ref) against the statement's "WINDOW <name> AS (...)" clause,
-// returning the effective spec. Both spellings of a reference go through it:
-// the bare "OVER win", and "OVER (win ORDER BY ...)" which refines a base.
+// (WindowSpec.Ref) against the statement's WINDOW clause (already chained by
+// chainNamedWindows), returning the effective spec. The two spellings differ,
+// as sqlite3WindowUpdate has them:
 //
-// The inheritance and override rules, each verified directly against
-// mattn/go-sqlite3:
+//	OVER win          the named window whole, its frame included
+//	OVER (win ...)    sqlite3WindowChain's refinement: the base's PARTITION BY,
+//	                  the reference's ORDER BY or else the base's, the
+//	                  reference's own frame; a PARTITION BY of its own, a second
+//	                  ORDER BY, or a base that spells out a frame is an error
 //
-//	WINDOW w AS (PARTITION BY a%2)   +  OVER (w ORDER BY a)
-//	        -> the base's PARTITION BY, the reference's ORDER BY
-//	WINDOW w AS (ORDER BY a)         +  OVER (w ROWS 1 PRECEDING)
-//	        -> the base's ORDER BY, the reference's FRAME
-//	WINDOW w AS (ORDER BY a), w2 AS (w ROWS 1 PRECEDING) + OVER w2
-//	        -> a named window may itself reference another (same answer)
-//
-// and the three errors, with SQLite's own wording: "no such window: %s",
-// "cannot override PARTITION clause of window: %s" (a reference may NEVER
-// supply its own PARTITION BY), and "cannot override ORDER BY clause of
-// window: %s" (only when the base already has one).
+// The latest definition of a repeated name wins in both.
 func resolveWindowSpec(spec *WindowSpec, windows []NamedWindow, depth int) (*WindowSpec, error) {
 	if spec == nil || spec.Ref == "" {
 		return spec, nil
 	}
-	if depth > len(windows)+1 {
-		// A cycle ("WINDOW w AS (w)"): bounded rather than recursed forever.
-		return nil, fmt.Errorf("engine: circular reference: %s", spec.Ref)
-	}
-	var base *WindowSpec
-	for _, nw := range windows {
-		if equalFoldName(nw.Name, spec.Ref) {
-			base = nw.Spec
-			break
+	if spec.Bare {
+		base := findWindowDef(windows, spec.Ref)
+		if base == nil {
+			return nil, fmt.Errorf("engine: no such window: %s", spec.Ref)
 		}
+		return &WindowSpec{PartitionBy: base.PartitionBy, OrderBy: base.OrderBy, Frame: base.Frame}, nil
 	}
-	if base == nil {
-		return nil, fmt.Errorf("engine: no such window: %s", spec.Ref)
-	}
-	base, err := resolveWindowSpec(base, windows, depth+1)
-	if err != nil {
-		return nil, err
-	}
-	if len(spec.PartitionBy) > 0 {
-		return nil, fmt.Errorf("engine: cannot override PARTITION clause of window: %s", spec.Ref)
-	}
-	if len(spec.OrderBy) > 0 && len(base.OrderBy) > 0 {
-		return nil, fmt.Errorf("engine: cannot override ORDER BY clause of window: %s", spec.Ref)
-	}
-	out := &WindowSpec{PartitionBy: base.PartitionBy, OrderBy: base.OrderBy, Frame: base.Frame}
-	if len(spec.OrderBy) > 0 {
-		out.OrderBy = spec.OrderBy
-	}
-	if spec.Frame != nil {
-		out.Frame = spec.Frame
-	}
-	return out, nil
+	return refineWindow(spec, windows)
 }

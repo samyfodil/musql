@@ -5,6 +5,7 @@ package engine
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -122,7 +123,8 @@ func TestWindowStepArgsRefusedShapes(t *testing.T) {
 	if cerr == nil {
 		t.Fatal("a nested window call in a SUBTYPE argument must not compile -- it would drop the OVER")
 	}
-	if !errors.Is(cerr, errVDBEUnsupported) {
-		t.Errorf("declined with %v, want errVDBEUnsupported", cerr)
+	// C rejects it outright (resolve.c:1265): misuse of window function abs().
+	if !errors.Is(cerr, errVDBEUnsupported) && !strings.Contains(cerr.Error(), "misuse of window function") {
+		t.Errorf("declined with %v, want errVDBEUnsupported or misuse of window function", cerr)
 	}
 }

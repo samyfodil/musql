@@ -210,7 +210,7 @@ func (db *DB) compileTriggerFirePlanFor(tbl *tableMeta, event triggerEventKind, 
 	}
 	hasNew := event == triggerInsert || event == triggerUpdate
 	hasOld := event == triggerDelete || event == triggerUpdate
-	trig := &trigCompileCtx{cols: tbl.cols, hasNew: hasNew, hasOld: hasOld, memo: memo, orconf: orconf, orconfSet: orconfSet}
+	trig := &trigCompileCtx{cols: tbl.cols, noRowid: tbl.withoutRowid, hasNew: hasNew, hasOld: hasOld, memo: memo, orconf: orconf, orconfSet: orconfSet, keepOrderBy: db.keepBodyOrderBy}
 	plan := &triggerFirePlan{nCols: len(tbl.cols), hasNew: hasNew, hasOld: hasOld}
 	for _, tr := range trs {
 		key := triggerPrgKey{tr: tr, orconf: orconf, orconfSet: orconfSet}
@@ -254,7 +254,13 @@ func (db *DB) compileTriggerFirePlanFor(tbl *tableMeta, event triggerEventKind, 
 // IN/row-value emitters need before compiling the subquery (compileIn; nil would
 // panic). A subquery-free WHEN compiles as before.
 func (db *DB) compileTriggerGuard(when Expr, trig *trigCompileCtx) (*Program, error) {
-	c := &compiler{trig: trig, nQueryLoopKnown: true} // coded in the trigger program: see compiler.nQueryLoop
+	own := localSchemaOr(db.localSchema)
+	if trig.isTemp {
+		own = "temp"
+	}
+	// ownSchema decides a schema-qualified reference ("WHEN main.t.b > 0") the way
+	// a write does: it names no pseudo-row, so it is "no such column", not a decline.
+	c := &compiler{trig: trig, ownSchema: own, nQueryLoopKnown: true} // coded in the trigger program: see compiler.nQueryLoop
 	if containsSubquery(when) {
 		// storedBodyPager, not writeSubqueryPager: a WHEN clause is part of the
 		// stored body and binds inside the trigger's own database.
@@ -509,9 +515,11 @@ func (db *DB) compileTriggerBodyStmtInner(bs triggerBodyStmt, trig *trigCompileC
 // NEW./OLD. reference, a vtab source) returns an error and declines.
 func (db *DB) compileTriggerBodyDiscardSelect(sel *SelectStmt, trig *trigCompileCtx) (*Program, error) {
 	run := sel
-	if len(sel.OrderBy) != 0 || sel.Distinct {
+	if (len(sel.OrderBy) != 0 && !trig.keepOrderBy) || sel.Distinct {
 		cp := *sel
-		cp.OrderBy = nil
+		if !trig.keepOrderBy {
+			cp.OrderBy = nil
+		}
 		cp.Distinct = false
 		run = &cp
 	}

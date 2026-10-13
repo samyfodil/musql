@@ -64,6 +64,14 @@ type vdbe struct {
 	// the OpOuterColumn opcode doc comment (vdbe_op.go).
 	parent *vdbe
 
+	// cteRows holds the rows of each CTE body that every reference shares,
+	// filled by the first one to run (runCTEOnce). Read and written on the
+	// outermost machine only.
+	cteRows map[*cteBinding][][]Value
+	// cteRoot is the machine of the statement this uncorrelated sub-program
+	// belongs to (newMachine); nil on the statement's own machine.
+	cteRoot *vdbe
+
 	// aggAccs is the live per-group accumulator state for the aggregate / GROUP
 	// BY opcodes (vdbe_agg.go): (re)initialized by OpAggReset, advanced by
 	// OpAggStep, read by OpAggResult. nil for a program with no aggregates.
@@ -356,18 +364,59 @@ func (m *vdbe) runVtabOnce(slot int, ds *derivedSource, pager *ReadOnlyPager) ([
 	return rows, rowids, nil
 }
 
+// stmtRoot is the outermost machine of the statement m is part of: the one
+// execution state shared by every sub-program (a CTE body's rows, for one) lives
+// on.
+func (m *vdbe) stmtRoot() *vdbe {
+	for {
+		switch {
+		case m.cteRoot != nil:
+			return m.cteRoot
+		case m.parent != nil:
+			m = m.parent
+		default:
+			return m
+		}
+	}
+}
+
 // runCTEOnce is runSubOnce for an ordinary CTE row source (resolveCTESource):
 // resolveCTERows is called directly, with m.params, at execution time. A
 // recursive CTE never reaches here; it opens a compiled queue program. A CTE
 // exposes no rowid (openDerivedCursor).
+//
+// A body every reference shares (cteBinding.sharedBody) runs once per statement
+// execution, on the outermost machine, whichever reference reaches it first.
 func (m *vdbe) runCTEOnce(slot int, ds *derivedSource, pager *ReadOnlyPager) ([][]Value, error) {
 	e := &m.subCache[slot]
 	if e.done {
 		return e.rows, nil
 	}
-	_, rows, err := pager.resolveCTERows(ds.cte.name, ds.cte.binding, m.params)
+	b := ds.cte.binding
+	// A FROM-less body that is not deterministic, written AS NOT MATERIALIZED and
+	// referenced twice, is evaluated once for the two items of one join but once
+	// per subquery otherwise (measured against C: "... FROM t a, t b" compares
+	// equal, "(SELECT r FROM t) = (SELECT r FROM t)" does not). Which of the two
+	// a reference is in is not known here, so neither is guessed.
+	if b.m10d == cteM10dNo && b.nUse >= 2 && len(b.core.From) == 0 && len(b.core.Compound) == 0 && selectCallsNondeterministicFunc(b.core) {
+		return nil, fmt.Errorf("%w: CTE %s is AS NOT MATERIALIZED, not deterministic and referenced %d times", errVDBEUnsupported, ds.cte.name, b.nUse)
+	}
+	root := m.stmtRoot()
+	if b.sharedBody() {
+		if rows, ok := root.cteRows[b]; ok {
+			e.rows, e.done = rows, true
+			return rows, nil
+		}
+	}
+	_, rows, err := pager.resolveCTERows(ds.cte.name, b, m.params)
 	if err != nil {
 		return nil, err
+	}
+	if b.sharedBody() {
+		if root.cteRows == nil {
+			root.cteRows = map[*cteBinding][][]Value{}
+		}
+		root.cteRows[b] = rows
 	}
 	e.rows = rows
 	e.done = true
@@ -891,6 +940,7 @@ func (prog *Program) newMachine(pager *ReadOnlyPager, outer *evalCtx, params []V
 	m.params = params
 	m.outer = outer
 	if from != nil {
+		m.cteRoot = from.stmtRoot()
 		m.trigOld, m.trigNew = from.trigOld, from.trigNew
 		m.trigOldRowid, m.trigNewRowid = from.trigOldRowid, from.trigNewRowid
 		// The upsert "excluded" row and the RETURNING affected row travel the

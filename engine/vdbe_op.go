@@ -1132,6 +1132,10 @@ type Program struct {
 	// statement's verb.
 	FKReach fkReach
 
+	// FKShape is what the statement assigns, for the same check; nil when
+	// unknown.
+	FKShape *fkStmtShape
+
 	// Correlated marks a sub-Program that references at least one outer-scope
 	// column (it emitted an OpOuterColumn/OpOuterRowid, or transitively
 	// contains a subquery that references a scope outer to THIS one). The

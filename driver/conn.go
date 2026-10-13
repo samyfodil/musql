@@ -584,6 +584,7 @@ func (c *Conn) beginTxImpl(ctx context.Context, opts driver.TxOptions) (driver.T
 	db.MarkHeldTransaction()
 	db.MarkDeferredFKCommitter() // commitHeldSession runs the COMMIT check
 	c.tx = db
+	c.clearTouched()
 	return &Tx{conn: c}, nil
 }
 
@@ -2518,7 +2519,8 @@ func (c *Conn) execTxnStmt(kind engine.TxnKind) (driver.Result, error) {
 		// refreshes the session, so the transaction starts from a state no other
 		// connection can move until it ends (engine's Session.BeginWriteTxn). In
 		// WAL mode C's EXCLUSIVE is IMMEDIATE: readers are never locked out.
-		if write, excl := engine.BeginTxnLock(c.stmtText); write {
+		write, excl := engine.BeginTxnLock(c.stmtText)
+		if write {
 			nw, err := c.session()
 			if err != nil {
 				return nil, err
@@ -2554,6 +2556,15 @@ func (c *Conn) execTxnStmt(kind engine.TxnKind) (driver.Result, error) {
 		db.MarkHeldTransaction()     // see BeginTx's identical call
 		db.MarkDeferredFKCommitter() // ...and its identical promise
 		c.tx = db
+		c.clearTouched()
+		if write {
+			// BEGIN IMMEDIATE / EXCLUSIVE starts a write transaction on every
+			// database attached at that moment (sqlite3BeginTransaction), so
+			// none of them can be detached until it ends.
+			for _, a := range c.attached {
+				a.touchedInTxn = true
+			}
+		}
 		return &execResult{lastInsertID: c.lastInsertRowid}, nil
 	case engine.TxnCommit:
 		if c.tx == nil {
@@ -2640,6 +2651,7 @@ func (c *Conn) execSavepointStmt(kind engine.SavepointKind, name, sqlText string
 		}
 		db.MarkHeldTransaction() // see execTxnStmt's identical call
 		c.tx = db
+		c.clearTouched()
 		c.txSavepoint = name
 	}
 	if err := c.tx.Exec(sqlText); err != nil {
@@ -2696,6 +2708,7 @@ func (t *Tx) commitImpl() error {
 		return err
 	}
 	t.conn.tx = nil
+	t.conn.clearTouched()
 	// The OUTERMOST commit clears "PRAGMA defer_foreign_keys" (and the deferred
 	// counters with it -- sqlite3VdbeHalt's own clear, vdbeaux.c:3432-3434). The
 	// engine does that on the session, which is about to be thrown away, so the
@@ -2714,6 +2727,7 @@ func (t *Tx) rollbackImpl() error {
 		return errors.New("driver: Rollback: no transaction is open on this connection")
 	}
 	t.conn.tx = nil
+	t.conn.clearTouched()
 	t.conn.deferFKs = false // as at COMMIT; sqlite3RollbackAll, main.c:1530-1532
 	return t.conn.discardSession(db)
 }

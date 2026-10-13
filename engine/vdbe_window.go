@@ -33,6 +33,7 @@ import (
 // windowResultExpr placeholder left behind by rewriteWindowCalls reads.
 type windowCall struct {
 	name     string // lower-cased function name
+	written  string // the name as spelled, which diagnostics echo
 	args     []Expr
 	distinct bool
 	star     bool // "count(*) OVER (...)" -- carried so planAggregateCall sees aggCountStar
@@ -204,7 +205,7 @@ func rewriteWindowCalls(e Expr, calls *[]windowCall) Expr {
 		if x.Over != nil {
 			idx := len(*calls)
 			*calls = append(*calls, windowCall{
-				name: r33sFoldIdent(x.Name), args: x.Args, distinct: x.Distinct, star: x.Star, filter: x.Filter, spec: x.Over,
+				name: r33sFoldIdent(x.Name), written: x.callName(), args: x.Args, distinct: x.Distinct, star: x.Star, filter: x.Filter, spec: x.Over,
 			})
 			return windowResultExpr{idx: idx}
 		}
@@ -844,7 +845,7 @@ var windowBuiltinArity = map[string][2]int{
 // percent_rank(a) and cume_dist(a), all of which take NONE (windowerr.test).
 // A function not listed here is an ordinary aggregate used as a window
 // function, whose own arity check lives with the aggregate.
-func checkWindowFuncArity(name string, nArgs int) error {
+func checkWindowFuncArity(name, written string, nArgs int) error {
 	rng, ok := windowBuiltinArity[name]
 	if !ok {
 		return nil
@@ -852,7 +853,10 @@ func checkWindowFuncArity(name string, nArgs int) error {
 	if nArgs >= rng[0] && nArgs <= rng[1] {
 		return nil
 	}
-	return fmt.Errorf("engine: wrong number of arguments to function %s()", name)
+	if written == "" {
+		written = name
+	}
+	return fmt.Errorf("engine: wrong number of arguments to function %s()", written)
 }
 
 // clearWindowCallSubtype drops the JSON subtype from a window call's results:
@@ -877,7 +881,7 @@ func clearWindowCallSubtype(name string, ci int, parts [][]int, vals [][]Value) 
 // parts is this call's LEVEL's partitioning (computeWindowLevels): every call
 // sharing one specification shares one partition/order pass.
 func (m *vdbe) computeWindowCall(plan *windowPlan, call windowCall, ci int, parts [][]int, batch [][]Value, vals [][]Value, peerAmbiguous bool) error {
-	if err := checkWindowFuncArity(call.name, len(call.args)); err != nil {
+	if err := checkWindowFuncArity(call.name, call.written, len(call.args)); err != nil {
 		return err
 	}
 	// The PEER-ORDER guard's decline half: this call reads a row's POSITION
@@ -1027,11 +1031,44 @@ func (m *vdbe) windowAggregate(plan *windowPlan, call windowCall, ci int, part [
 		stepPM = call.stepArgs.machine(m)
 		stampWindowStepArgRegs(tmpl, plan, call)
 	}
+	// regsFor is one row's argument registers for a step (or an inverse), or
+	// skip when its FILTER rules it out before any argument is coded.
+	regsFor := func(ri int) (regs []Value, skip bool, err error) {
+		regs = plan.operandVals(batch[ri])
+		if stepPM != nil {
+			// C's windowAggStep tests the BUFFERED filter column first and
+			// its OP_IfNot jumps past the whole argument coding
+			// (window.c:1694-1696, landed at window.c:1758), so a
+			// filtered-out row never evaluates the argument list. Skipping
+			// the row entirely is the same thing: aggItem.step reads the
+			// very same column and would skip it too.
+			if call.filterCol >= 0 {
+				fv, ferr := m.windowOperand(plan, batch[ri], call.filterCol)
+				if ferr != nil {
+					return nil, false, ferr
+				}
+				if !isTruthy(fv) {
+					return nil, true, nil
+				}
+			}
+			av, aerr := call.stepArgs.run(stepPM, batch[ri], nil)
+			if aerr != nil {
+				return nil, false, aerr
+			}
+			stepRegs = append(append(stepRegs[:0], regs...), av...)
+			regs = stepRegs
+		}
+		return regs, false, nil
+	}
+	if windowIncrementalEligible(call, tmpl, spans) {
+		return m.windowIncrementalAggregate(plan, call, ci, part, spans, batch, vals, tmpl, regsFor)
+	}
 	// Recomputing the accumulator per row is O(n^2) in a partition; acceptable
 	// here (and always correct), since the alternative -- an incremental
 	// accumulator -- cannot express every aggregate's removal step, and a frame
 	// that moves BACKWARD (an EXCLUDE hole, a "<N> FOLLOWING" start) has no
-	// removal step to make.
+	// removal step to make. The frames C inverts rows out of are the exception
+	// (windowIncrementalAggregate).
 	// A deliberate simplification: O(n^2) per partition, revisit if window queries get hot.
 	for k := range part {
 		acc := cloneAggTemplates([]*aggItem{tmpl})[0]
@@ -1040,29 +1077,12 @@ func (m *vdbe) windowAggregate(plan *windowPlan, call windowCall, ci int, part [
 				continue
 			}
 			ri := part[j]
-			regs := plan.operandVals(batch[ri])
-			if stepPM != nil {
-				// C's windowAggStep tests the BUFFERED filter column first and
-				// its OP_IfNot jumps past the whole argument coding
-				// (window.c:1694-1696, landed at window.c:1758), so a
-				// filtered-out row never evaluates the argument list. Skipping
-				// the row entirely is the same thing: aggItem.step reads the
-				// very same column and would skip it too.
-				if call.filterCol >= 0 {
-					fv, ferr := m.windowOperand(plan, batch[ri], call.filterCol)
-					if ferr != nil {
-						return ferr
-					}
-					if !isTruthy(fv) {
-						continue
-					}
-				}
-				av, aerr := call.stepArgs.run(stepPM, batch[ri], nil)
-				if aerr != nil {
-					return aerr
-				}
-				stepRegs = append(append(stepRegs[:0], regs...), av...)
-				regs = stepRegs
+			regs, skip, rerr := regsFor(ri)
+			if rerr != nil {
+				return rerr
+			}
+			if skip {
+				continue
 			}
 			ctx := plan.windowRowCtx(m, batch[ri], vals[ri])
 			if err := acc.step(ctx, regs); err != nil {
@@ -1076,6 +1096,114 @@ func (m *vdbe) windowAggregate(plan *windowPlan, call windowCall, ci int, part [
 		vals[part[k]][ci] = v
 	}
 	return nil
+}
+
+// windowIncrementalAggregate runs a moving-frame aggregate as C does: one
+// accumulator for the partition, rows stepped in as the frame's end passes them
+// and inverted out as its start does, the row read after each move.
+func (m *vdbe) windowIncrementalAggregate(plan *windowPlan, call windowCall, ci int, part []int, spans []windowFrameSpan, batch, vals [][]Value, tmpl *aggItem, regsFor func(int) ([]Value, bool, error)) error {
+	acc := cloneAggTemplates([]*aggItem{tmpl})[0]
+	var gc groupConcatWindow
+	stepRow := func(ri int) error {
+		regs, skip, err := regsFor(ri)
+		if err != nil || skip {
+			return err
+		}
+		ctx := plan.windowRowCtx(m, batch[ri], vals[ri])
+		if tmpl.kind != aggGroupConcat {
+			return acc.step(ctx, regs)
+		}
+		txt, sep, ok, err := m.groupConcatTerm(acc, ctx, regs)
+		if err != nil || !ok {
+			return err
+		}
+		gc.step(txt, sep, tmpl.sepExpr != nil)
+		return nil
+	}
+	inverseRow := func(ri int) error {
+		regs, skip, err := regsFor(ri)
+		if err != nil || skip {
+			return err
+		}
+		ctx := plan.windowRowCtx(m, batch[ri], vals[ri])
+		if tmpl.kind != aggGroupConcat {
+			return acc.inverse(ctx, regs)
+		}
+		txt, _, ok, err := m.groupConcatTerm(acc, ctx, regs)
+		if err != nil || !ok {
+			return err
+		}
+		gc.inverse(txt)
+		return nil
+	}
+	stepsFirst := windowStepsBeforeInverses(call.spec.Frame)
+	stepped, inversed := 0, 0
+	steps := func(upTo int) error {
+		for ; stepped < upTo; stepped++ {
+			if err := stepRow(part[stepped]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	// A row is inverted only after it was stepped: a frame that starts beyond
+	// what has entered yet (FOLLOWING starts) waits for the step to come first.
+	invs := func(upTo int) error {
+		for ; inversed < upTo && inversed < stepped; inversed++ {
+			if err := inverseRow(part[inversed]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for k := range part {
+		sp := spans[k]
+		var err error
+		if stepsFirst {
+			if err = steps(sp.hi); err == nil {
+				err = invs(sp.lo)
+			}
+		} else if err = invs(sp.lo); err == nil {
+			if err = steps(sp.hi); err == nil {
+				err = invs(sp.lo)
+			}
+		}
+		if err != nil {
+			return err
+		}
+		if tmpl.kind == aggGroupConcat {
+			vals[part[k]][ci] = gc.value()
+			continue
+		}
+		v, ferr := acc.finalize()
+		if ferr != nil {
+			return ferr
+		}
+		vals[part[k]][ci] = v
+	}
+	return nil
+}
+
+// groupConcatTerm is a group_concat() row's text and separator as step coerces
+// them; ok is false for a row that contributes nothing.
+func (m *vdbe) groupConcatTerm(acc *aggItem, ctx *evalCtx, regs []Value) (txt, sep string, ok bool, err error) {
+	skip, v, sepVal, err := acc.windowOperands(ctx, regs)
+	if err != nil || skip {
+		return "", "", false, err
+	}
+	v, err = coerceUTF16BlobValue("group_concat", v, ctx.encoding())
+	if err != nil {
+		return "", "", false, err
+	}
+	sep = ","
+	if acc.sepExpr != nil {
+		sv, serr := coerceUTF16BlobValue("group_concat", sepVal, ctx.encoding())
+		if serr != nil {
+			return "", "", false, serr
+		}
+		sep = valueToText(sv)
+	}
+	return valueToText(v), sep, true, nil
 }
 
 // stampWindowAggRegs points an aggregate window call's accumulator at the batch
