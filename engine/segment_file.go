@@ -69,6 +69,11 @@ type SegmentFile struct {
 	m      *mmapfile.File
 	tables []SegmentFileTable
 
+	// shared is the process-wide mapping this handle is one of
+	// (segment_file_share.go), and closed whether this handle let go of it.
+	shared *sharedSegFile
+	closed bool
+
 	// srcChangeCounter and srcPageCount are the source database's, as it stood
 	// when this file was written. A segment file is DERIVED data, and derived
 	// data that has silently fallen behind its source is not slow, it is
@@ -137,12 +142,17 @@ func (f *SegmentFile) Tables() []SegmentFileTable { return f.tables }
 // Mapped reports whether the bytes came from a mapping rather than a read.
 func (f *SegmentFile) Mapped() bool { return f != nil && f.m.Mapped() }
 
-// Close releases the mapping.
+// Close releases the mapping -- this handle's hold on it, when the mapping is
+// shared (segment_file_share.go). Safe to call more than once.
 func (f *SegmentFile) Close() error {
-	if f == nil {
+	if f == nil || f.closed {
 		return nil
 	}
+	f.closed = true
 	f.tables = nil
+	if f.shared != nil {
+		return f.shared.release()
+	}
 	return f.m.Close()
 }
 
@@ -479,10 +489,31 @@ func segAlign8Int64(n int64) int64 { return (n + 7) &^ 7 }
 // OpenSegmentFile maps a segment file. The segments it hands back alias the
 // mapping, so they cost nothing to open and are invalid after Close.
 func OpenSegmentFile(path string) (*SegmentFile, error) {
-	m, err := mmapfile.Open(path)
+	fd, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
+	key, keyed := segFileKeyOf(fd)
+	if keyed {
+		if f := sharedSegFileFor(key); f != nil {
+			fd.Close()
+			return f, nil
+		}
+	}
+	m, err := mmapfile.OpenFile(fd)
+	if err != nil {
+		return nil, err
+	}
+	f, err := parseSegmentFile(m)
+	if err != nil || !keyed || !m.Mapped() {
+		return f, err
+	}
+	return shareSegFile(key, f), nil
+}
+
+// parseSegmentFile reads the header and directory of a mapped segment file,
+// closing the mapping when it is not one.
+func parseSegmentFile(m *mmapfile.File) (*SegmentFile, error) {
 	buf := m.Data()
 	if len(buf) < segFileHdrSize || string(buf[:4]) != segFileMagic {
 		m.Close()
