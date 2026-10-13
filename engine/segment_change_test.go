@@ -3,6 +3,8 @@ package engine
 import (
 	"path/filepath"
 	"testing"
+
+	"github.com/samyfodil/musql/internal/mmapfile"
 )
 
 // A held session trusts the lock file's change word between statements
@@ -27,7 +29,9 @@ func TestChangeWordSeesEveryChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.Close()
-	if b.change == nil {
+	// Where files are read rather than mapped there is no word to trust, and
+	// every check is a full one; the counts below must hold either way.
+	if b.change == nil && mmapfile.CanMapAt {
 		t.Fatal("no change word mapped on a version-6 file")
 	}
 	count := func(s *Session) int64 {
@@ -45,7 +49,7 @@ func TestChangeWordSeesEveryChange(t *testing.T) {
 		t.Fatalf("count %d", n)
 	}
 	count(b) // a second statement with nothing changed: the word answers
-	if !b.changeSeenOK {
+	if b.change != nil && !b.changeSeenOK {
 		t.Fatal("the session did not record the word after a full check")
 	}
 	n := int64(0)
