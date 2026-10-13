@@ -193,10 +193,31 @@ func bytesIndexOrder(cells []int64, heap []byte) ([]int32, func(a, b int64) int,
 	// BINARY order wherever two prefixes differ, and a tie is settled by the
 	// full comparison (a shorter value padded with zeros ties its zero-extended
 	// neighbour here and sorts first there). Positions break the rest.
+	//
+	// THE PREFIX STARTS PAST WHAT EVERY VALUE SHARES. Keys with a common head
+	// -- "value-1", "value-2", ... -- tied on their first 8 bytes all at once and
+	// fell through to the comparison sort; every value starting with the same
+	// lcp bytes, ordering by what follows them is ordering by the whole value.
+	lcp := 0
+	if len(cells) > 0 {
+		first := at(cells[0])
+		lcp = len(first)
+		for _, c := range cells[1:] {
+			v := at(c)
+			n := min(lcp, len(v))
+			i := 0
+			for i < n && v[i] == first[i] {
+				i++
+			}
+			if lcp = i; lcp == 0 {
+				break
+			}
+		}
+	}
 	prefix := make([]int64, len(cells))
 	for i, c := range cells {
 		var k [8]byte
-		copy(k[:], at(c))
+		copy(k[:], at(c)[lcp:])
 		prefix[i] = int64(binary.BigEndian.Uint64(k[:]) ^ 1<<63) // radixOrderInt64 orders signed
 	}
 	order := radixOrderInt64(prefix)

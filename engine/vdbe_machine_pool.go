@@ -111,7 +111,15 @@ func (prog *Program) putMachine(m *vdbe) {
 	// so no cached row is kept alive by the pool.
 	sub := m.subCache[:cap(m.subCache)]
 	clear(sub)
-	*m = vdbe{regs: regs, cursors: cursors, recRegs: recRegs, subCache: sub[:0]}
+	// The JIT's cursor views and row copies too (vmJIT.enter), scrubbed: they
+	// were three allocations of every point read a native program ran.
+	jcur, jsnap := m.jcur, m.jsnap
+	clear(jcur)
+	for i := range jsnap {
+		clear(jsnap[i].row[:cap(jsnap[i].row)])
+		jsnap[i] = jitSnap{row: jsnap[i].row[:0]}
+	}
+	*m = vdbe{regs: regs, cursors: cursors, recRegs: recRegs, subCache: sub[:0], jcur: jcur, jsnap: jsnap}
 	vdbeMachines.Put(m)
 }
 
