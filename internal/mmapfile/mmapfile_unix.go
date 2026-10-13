@@ -19,6 +19,13 @@ func Open(path string) (*File, error) {
 	if err != nil {
 		return nil, err
 	}
+	return OpenFile(f)
+}
+
+// OpenFile is Open over a file already open, which it takes over: the caller
+// that needs to know WHICH file it mapped (by its inode) opens it first.
+func OpenFile(f *os.File) (*File, error) {
+	path := f.Name()
 	fi, err := f.Stat()
 	if err != nil {
 		f.Close()

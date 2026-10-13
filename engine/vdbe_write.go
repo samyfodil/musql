@@ -53,6 +53,9 @@ type writeCtx struct {
 	// direct-path load (bulkLoadFor), and the table it is loading.
 	bulkChecked bool
 	bulkTbl     *tableMeta
+	// bulkMark is how many rows bulkTbl's transaction load held when this
+	// statement first wrote through it (insert_bulk_direct.go).
+	bulkMark int
 
 	rowsAffected int // affected-row count, incremented by the storage opcodes; returned by runWrite
 
@@ -111,6 +114,9 @@ type insertPlan struct {
 	// co-routine and whose program does nothing but build and store rows
 	// (insertProgramArmable). The run-time half checks the table and session.
 	appendArmable bool
+	// valuesArmable is appendArmable's INSERT ... VALUES counterpart, which
+	// only a load inside a transaction takes (segBulkLoad.inTx).
+	valuesArmable bool
 
 	// action / explicitOr are the conflict resolution for THIS insert: the
 	// statement's OR-clause (conflictAbort/false for a plain INSERT), applied
@@ -476,11 +482,19 @@ func (db *DB) runWrite(prog *Program, args []Value) (rowsAffected int64, err err
 	// FROM THE PROGRAM'S POOL, not fresh: a prepared INSERT run in a loop is the
 	// shape this exists for, and the machine plus its register file was 30% of
 	// everything such a loop allocated. See getMachine for what may be reused.
-	m := prog.getMachine()
+	// A transaction's direct-path loads (insert_bulk_direct.go) are drained
+	// before any statement that could read their tables: all but the one this
+	// program appends to, if it is such an INSERT.
+	if len(db.txBulks) > 0 {
+		if keep, commit := prog.txAppendTarget(); !commit {
+			db.drainTxBulks(keep)
+		}
+	}
+	m := prog.getMachineFrom(&db.spareMachine)
 	// RELEASED LAST, not first: defers run LIFO, and every defer registered below
 	// this line still reads m. Registering the release here is what puts it after
 	// all of them.
-	defer prog.putMachine(m)
+	defer prog.putMachineTo(m, &db.spareMachine)
 	// Carry the session's record arena chunk across executions so a run of
 	// single-row INSERTs shares allocations. Taken, not shared: a nested write
 	// starts its own chunk.
@@ -593,7 +607,8 @@ func (db *DB) putWriteCtx(wc *writeCtx) {
 		clear(j[:cap(j)])
 		j = j[:0]
 	}
-	*wc = writeCtx{db: db}
+	*wc = writeCtx{} // zeroed in place: building the literal and copying it cost as much again
+	wc.db = db
 	if j != nil {
 		wc.journal = j
 	}
@@ -1164,6 +1179,7 @@ func (db *DB) compileInsertStmt(stmt *insertStmt, trig *trigCompileCtx) (*Progra
 	recReg := c.allocRec()  // record register, consumed by OpInsert before the next OpMakeRecord
 	rowidReg := c.allocN(1) // rowid register for OpInsert's P3
 	var colNames []string
+	var allInsertPlans []*insertPlan
 	for _, rowExprs := range rows {
 		base := c.allocN(len(tbl.cols))
 		regOf := make([]int, len(rowExprs))
@@ -1262,6 +1278,7 @@ func (db *DB) compileInsertStmt(stmt *insertStmt, trig *trigCompileCtx) (*Progra
 		for _, rp := range rowPlans {
 			rp.skipAddr = c.here() // RAISE(IGNORE) abandons this row -> its end
 		}
+		allInsertPlans = append(allInsertPlans, rowInsertPlans...)
 		for _, ip := range rowInsertPlans {
 			// The same label emitInsertRowBody patched its own OE_Ignore skips
 			// to (nothing is emitted between the two), which is SQLite's single
@@ -1271,6 +1288,14 @@ func (db *DB) compileInsertStmt(stmt *insertStmt, trig *trigCompileCtx) (*Progra
 		}
 	}
 	c.emit(Instruction{Op: OpHalt})
+	// The compile-time half of a transaction's direct-path load: the program
+	// only builds and stores rows (insert_bulk_direct.go).
+	if stmt.upsert == nil && stmt.returning == nil && beforePlan == nil && firePlan == nil &&
+		insertProgramArmable(c.insns, tbl, nil, nil, -1) {
+		for _, ip := range allInsertPlans {
+			ip.valuesArmable = true
+		}
+	}
 
 	// NSubCache sizes the run-once subquery slots (too short panics). WritePager
 	// is the frozen snapshot those subqueries read, and it also stops
@@ -5007,11 +5032,19 @@ type undoEntry struct {
 	// entry drops: an INSERT of rowids n, n+1, n+2 ... into one table is one
 	// entry, not one per row.
 	dropMore uint64
+	// bulk, when set, is a transaction's direct-path load on tbl, cut back to
+	// its first bulkTo rows (segBulkLoad.truncateTo).
+	bulk   *segBulkLoad
+	bulkTo int
 }
 
 func (e *undoEntry) run() {
 	if e.fn != nil {
 		e.fn()
+		return
+	}
+	if e.bulk != nil {
+		e.bulk.truncateTo(e.tbl, e.bulkTo)
 		return
 	}
 	if e.drop {

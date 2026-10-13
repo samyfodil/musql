@@ -399,6 +399,8 @@ var (
 	_ driver.ConnPrepareContext = (*Conn)(nil)
 	_ driver.ConnBeginTx        = (*Conn)(nil)
 	_ driver.NamedValueChecker  = (*Conn)(nil)
+	_ driver.QueryerContext     = (*Conn)(nil)
+	_ driver.ExecerContext      = (*Conn)(nil)
 )
 
 // CheckNamedValue converts bound arguments that need no conversion without
@@ -433,6 +435,16 @@ func (c *Conn) prepareImpl(query string) (driver.Stmt, error) {
 // statement" error to Exec/Query time) -- see ParseParamInfo's own doc
 // comment.
 func (c *Conn) prepareContextImpl(ctx context.Context, query string) (driver.Stmt, error) {
+	st := &Stmt{}
+	if err := c.prepareInto(query, st); err != nil {
+		return nil, err
+	}
+	return st, nil
+}
+
+// prepareInto is prepareContextImpl filling st, which the unprepared
+// QueryContext and ExecContext below keep off the heap where they can.
+func (c *Conn) prepareInto(query string, st *Stmt) error {
 	// A ";"-separated SCRIPT has to be recognised BEFORE ParseParamInfo, not
 	// after it fails: that function parses one statement and reports "no
 	// parameters" for a leading CREATE without ever looking at the trailing
@@ -444,7 +456,8 @@ func (c *Conn) prepareContextImpl(ctx context.Context, query string) (driver.Stm
 	if mayBeScript(query) {
 		if stmts, serr := engine.SplitStatements(query); serr == nil {
 			if len(stmts) > 1 {
-				return &Stmt{conn: c, sqlText: query, script: stmts}, nil
+				*st = Stmt{conn: c, sqlText: query, script: stmts}
+				return nil
 			}
 			// Exactly one statement, but the text around it held separators --
 			// a leading ";", a doubled ";;", a trailing one. C SQLite treats
@@ -467,9 +480,10 @@ func (c *Conn) prepareContextImpl(ctx context.Context, query string) (driver.Stm
 		}
 	}
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return &Stmt{conn: c, sqlText: query, info: info, isQuery: isSelectStmt(query)}, nil
+	*st = Stmt{conn: c, sqlText: query, info: info, isQuery: isSelectStmt(query)}
+	return nil
 }
 
 // mayBeScript reports whether query MIGHT hold more than one statement: a ";"
@@ -831,7 +845,8 @@ func (c *Conn) execArgsBody(sqlText string, args []engine.Value) (driver.Result,
 	//
 	// An EXPLAIN cannot change the file, the attached set or the transaction
 	// state, so the warm read pager stays valid across one.
-	if engine.IsExplainStatement(sqlText) {
+	// (Plain DML leads with its own verb, never EXPLAIN: isPlainDMLText.)
+	if !c.plainDML(sqlText) && engine.IsExplainStatement(sqlText) {
 		rows, err := c.queryArgs(sqlText, args)
 		if err != nil {
 			return nil, err
@@ -2918,6 +2933,36 @@ func (c *Conn) Prepare(query string) (driver.Stmt, error) {
 func (c *Conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
 	v, err := c.prepareContextImpl(ctx, query)
 	return v, parityErr(err)
+}
+
+// QueryContext implements driver.QueryerContext, so an unprepared db.Query or
+// db.QueryRow runs here instead of database/sql preparing a driver statement,
+// running it and closing it: the same prepare and the same statement path,
+// without the statement object and the round trips around it. database/sql
+// checks the argument count only against a prepared statement's NumInput, so
+// it is checked here, with its message.
+func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	var st Stmt
+	if err := c.prepareInto(query, &st); err != nil {
+		return nil, parityErr(err)
+	}
+	if want := st.NumInput(); len(args) != want {
+		return nil, fmt.Errorf("sql: expected %d arguments, got %d", want, len(args))
+	}
+	return st.QueryContext(ctx, args)
+}
+
+// ExecContext implements driver.ExecerContext: QueryContext's shortcut for an
+// unprepared db.Exec.
+func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	var st Stmt
+	if err := c.prepareInto(query, &st); err != nil {
+		return nil, parityErr(err)
+	}
+	if want := st.NumInput(); len(args) != want {
+		return nil, fmt.Errorf("sql: expected %d arguments, got %d", want, len(args))
+	}
+	return st.ExecContext(ctx, args)
 }
 
 // Begin normalizes its error for parity with C SQLite -- see parityErr

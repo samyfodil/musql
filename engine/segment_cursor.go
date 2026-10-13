@@ -257,12 +257,16 @@ func (p *ReadOnlyPager) segPointSeek(cur *vdbeCursor, rid int64, into *segRowSou
 			return nil, true
 		}
 		base := rows.seg
-		if base.rp == nil || base.rp.segs == nil || base.rp.segs.isLive(base.root) || !base.rp.segCleanFor(base.root) {
+		// A point read needs only ITS row untouched by the delta, not the whole
+		// table: a whole-table check here sorted the delta once per lookup.
+		if base.rp == nil || base.rp.segs == nil || base.rp.segs.isLive(base.root) || base.rp.segs.deltaTouches(base.root, rid) {
 			return nil, false
 		}
 		segs = base.rp.segs.byRoot[base.root]
 	} else {
-		if !p.segCleanFor(cur.tbl.root) {
+		// Declined (to seekRowid, which has the delta's maps in front) only when
+		// the delta holds this rowid.
+		if p.segs.deltaTouches(cur.tbl.root, rid) {
 			return nil, false
 		}
 		segs = p.segs.byRoot[cur.tbl.root]

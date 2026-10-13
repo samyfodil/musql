@@ -238,6 +238,10 @@ func (db *DB) captureSnapshot() *txSnapshot {
 // captureSnapshotWith is captureSnapshot with the per-table clone supplied, so
 // captureSharedSnapshot can share row stores through the same code.
 func (db *DB) captureSnapshotWith(cloneTable func(*tableMeta) *tableMeta) *txSnapshot {
+	// A snapshot never sits on top of a transaction's direct-path load: the
+	// rows go to the row store first, so restoring any later snapshot can drop
+	// whatever load was armed since (restoreSnapshot).
+	db.drainTxBulks(nil)
 	snap := &txSnapshot{
 		schemaCookie:  db.schemaCookie,
 		userVersion:   db.userVersion,
@@ -349,6 +353,9 @@ func cloneSnapshot(snap *txSnapshot) *txSnapshot {
 // restoreSnapshot swaps db's mutable logical state back to snap wholesale --
 // ROLLBACK's implementation.
 func (db *DB) restoreSnapshot(snap *txSnapshot) {
+	// Every load still armed was armed after snap was taken (captureSnapshotWith
+	// drained the ones before), so all of its rows are undone with it.
+	db.dropTxBulks()
 	if snap == nil {
 		// captureSnapshot (this file) returns nil, instead of a snapshot that
 		// is silently missing some table's true content, when

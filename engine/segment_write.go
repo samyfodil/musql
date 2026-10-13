@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -85,6 +86,16 @@ type Session struct {
 
 	// segStat and deltaStat stamp the segment file and its delta (pairStamp).
 	segStat, deltaStat heldStamp
+	// change is the lock file's change word, mapped, and changeSeen the even
+	// value it held at the last full check that found the session current
+	// (RefreshIfStale, segment_change.go). nil where it cannot be trusted.
+	change       *changeWord
+	changeSeen   uint64
+	changeSeenOK bool
+	// changeable is "the file is a version the word may be trusted on", kept
+	// so a session that opened before any word was written can map it later
+	// (mapChangeWordLate).
+	changeable bool
 
 	recBuf []SegDeltaRecord // the delta records of a commit, reused (segDeltaRecordsInto)
 
@@ -166,10 +177,26 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 	var tableIndex map[string]int
 	var ipkOf map[string]int
 	var rootEdits []ConvertedRootEdit
+	var stamp [2]fileStamp
+	var change *changeWord
+	changeable := false
 	if lerr := withSegmentReadLockWait(segPath, wait, func() error {
+		// The pair's stamp, taken under the same lock as the read and before it,
+		// so it describes no newer a file than the rows: the first statement's
+		// freshness check (RefreshIfStale) then answers from it, where a zero
+		// stamp sent every new connection to map and replay the pair a second
+		// time -- most of a cold first read, and with twelve connections opening
+		// at once, a queue on the process's mmap lock.
+		stamp = [2]fileStamp{stampOf(segPath), stampOf(segDeltaPath(segPath))}
 		f, st, rerr := readSegmentPairUnlocked(segPath)
 		if rerr != nil {
 			return rerr
+		}
+		// The change word, mapped under the same lock: trusted only on a file
+		// this format wrote, since an older build may write an older file
+		// without keeping it (segment_change.go).
+		if changeable = f.version >= changeWordVersion; changeable {
+			change = mapChangeWord(segPath)
 		}
 		tableIndex, ipkOf = SegmentFileTableIndex(f)
 		rootEdits = append([]ConvertedRootEdit(nil), f.Catalog().RootEdits...)
@@ -188,6 +215,7 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 	schema, scerr := src.Schema()
 	if scerr != nil {
 		src.Close()
+		change.close()
 		return nil, scerr
 	}
 	db := &DB{
@@ -209,6 +237,7 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 	db.captureGuard = src.meta.captureGuard // see ConvertedCatalog.CaptureGuard
 	if lerr := db.loadSchemaObjects(src, schema, "OpenWrite", false); lerr != nil {
 		src.Close()
+		change.close()
 		return nil, lerr
 	}
 	// Opening the schema loads its statistics (sqlite3InitOne ->
@@ -221,12 +250,16 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 		baseCtr: baseCtr, basePages: basePages,
 		endCtr: endCtr, endPages: endPages,
 		loadedCtr: endCtr, loadedPages: endPages, // the state just read
+		seenStat:   stamp,
+		change:     change,
+		changeable: changeable,
 
 		tableIndex: tableIndex, ipkOf: ipkOf,
 	}
 	if len(rootEdits) > 0 {
 		if rerr := db.replayRootEdits(rootEdits); rerr != nil {
 			src.Close()
+			change.close()
 			return nil, rerr
 		}
 	}
@@ -425,6 +458,7 @@ func (n *Session) Commit() (bool, error) {
 		wrote, cerr = n.commitLocked()
 		if cerr == nil && wrote {
 			n.compactIfWorthIt()
+			n.mapChangeWordLate()
 		}
 		return cerr
 	}
@@ -452,13 +486,33 @@ func (n *Session) Commit() (bool, error) {
 		n.applyLocks()
 	} else if n.DB != nil && n.segLockFile != nil {
 		err = commit()
-	} else {
+	} else if !n.nothingToCommit() {
 		err = n.withCommitLock(commit)
 	}
 	if !n.InTransaction() {
 		n.EndWriteTxn() // the transaction a BEGIN IMMEDIATE opened is over
 	}
 	return wrote, err
+}
+
+// nothingToCommit reports, without the commit lock, that a commit would write
+// nothing: no row, catalog, VACUUM or TEMP change is pending. Every connection
+// that only read commits on Close, and taking the EXCLUSIVE commit lock for it
+// made a connection opening at that moment -- whose read lock conflicts --
+// sleep a whole poll interval (acquireLock): 12 connections closing and
+// opening at once ran first reads of 10-20ms.
+func (n *Session) nothingToCommit() bool {
+	db := n.DB
+	if db == nil || n.segmentVacuumPending || db.changeLog.len() != 0 || len(db.txBulks) != 0 ||
+		db.tempPair != nil || db.holdsAnyTempObject() {
+		return false
+	}
+	for _, t := range db.tables {
+		if t.rowsWrittenSinceCommit {
+			return false
+		}
+	}
+	return !n.catalogMoved()
 }
 
 // commitSync is how this session's commits reach the disk: not at all under
@@ -570,6 +624,24 @@ func (n *Session) commitMainLocked() (bool, error) {
 	}
 	if changes.len() == 0 {
 		return false, nil
+	}
+	// A BULK LOAD TOO BIG FOR THE DELTA, known before its records are built:
+	// every record is at least segDeltaMinRecord bytes, so a log of this many
+	// changes takes the delta past the compaction threshold whatever the rows
+	// hold, and the rewrite below would follow. Building the records only to
+	// measure them was 10% of a 10M-row load. Same order as below: a stale image
+	// is refused before anything is written.
+	if !compactionOffForTest && lockedStamp[0].there && n.maxSize == 0 &&
+		int64(changes.len())*segDeltaMinRecord > compactionThreshold(lockedStamp[0].size)-lockedStamp[1].size {
+		if n.loadedCtr != n.endCtr || n.loadedPages != n.endPages {
+			return false, fmt.Errorf("%w: another connection committed while this transaction was open", ErrBusy)
+		}
+		if err := n.rewriteFile(); err != nil {
+			return false, err
+		}
+		n.clearWrittenSinceCommit()
+		n.noteCommittedColumnsStale()
+		return true, nil
 	}
 	// CONSUMING, when nothing else reads the log -- see segDeltaRecordsInto.
 	recs, err := segDeltaRecordsInto(n.recBuf, changes.len(), changes.all(), n.effectiveTableIndex(), n.ipkOf, n.storeOf(false))
@@ -793,6 +865,8 @@ func (n *Session) Close() error {
 	n.releaseCommitLock()
 	n.segStat.release()
 	n.deltaStat.release()
+	n.change.close()
+	n.change = nil
 	n.closed = true
 	n.dropTempFileIfUnclaimed() // C's temp database is OPEN_DELETEONCLOSE
 	n.DB.closed = true
@@ -1046,10 +1120,12 @@ func (db *DB) segmentSnapshotPager() (*ReadOnlyPager, error) { return db.segment
 
 // segmentPager builds the read pager over this session's rows, live or frozen.
 func (db *DB) segmentPager(freeze bool) (*ReadOnlyPager, error) {
+	// A read sees a transaction's direct-path loads as the rows they hold.
+	db.drainTxBulks(nil)
 	p := newReadOnlyPager()
 	// The schema this session can name, and the handle its committed column
 	// blocks come from. Both are inputs to the source below AND to its cache key.
-	rows := db.segmentSchemaRows()
+	rows := db.segmentSchemaRowsShared()
 	cols := db.committedColumns()
 	// ONE fingerprint per statement, shared by the two things that want one: the
 	// read source's cache key below, and the plan cache's validity check later
@@ -1117,7 +1193,51 @@ func (db *DB) segmentPager(freeze bool) (*ReadOnlyPager, error) {
 // not the other would make an UPDATE of sqlite_schema edit a row no reader can
 // see, or miss one it can.
 func (db *DB) segmentSchemaRows() []SchemaRow {
-	rows := make([]SchemaRow, 0, len(db.tables)+len(db.indexes)+len(db.views)+len(db.triggers)+len(db.vtabs))
+	return db.renderSchemaRows(nil, nil, nil)
+}
+
+// segmentSchemaRowsShared is segmentSchemaRows for the read pager, which renders
+// it once per statement: the rows of the last render when THIS render, done
+// into scratch, is the same, element for element -- the key is the whole
+// input, not a generation counter (cachedSchemaSegment's lesson). They are
+// shared by every pager since and so are never written: capacity is length, so
+// an append copies, and no read path edits a pager's rows in place. A point
+// read's rendering, sorting and ranking were a quarter of what it allocated.
+func (db *DB) segmentSchemaRowsShared() []SchemaRow {
+	m := &db.schemaRowsMemo
+	m.scratch, m.seqScratch = m.scratch[:0], m.seqScratch[:0]
+	db.renderSchemaRows(&m.scratch, &m.seqScratch, nil)
+	if m.out != nil && slices.Equal(m.scratch, m.raw) && slices.Equal(m.seqScratch, m.seqs) {
+		return m.out
+	}
+	raw, seqs := slices.Clone(m.scratch), slices.Clone(m.seqScratch)
+	out := db.renderSchemaRows(nil, nil, &raw)
+	m.raw, m.seqs, m.out = raw, seqs, out[:len(out):len(out)]
+	clear(m.scratch)
+	return m.out
+}
+
+// schemaRowsMemo is segmentSchemaRowsShared's last render: raw, the rows as
+// rendered and before sorting, seqs their creation sequence, and out the sorted
+// rows handed out. scratch and seqScratch are the next render's buffers.
+type schemaRowsMemo struct {
+	raw, out, scratch []SchemaRow
+	seqs, seqScratch  []uint64
+}
+
+// renderSchemaRows renders the catalog's rows and creation sequences. Into
+// *rowsInto and *seqsInto when given, stopping there; otherwise it sorts and
+// returns them -- from *rendered when given, already rendered.
+func (db *DB) renderSchemaRows(rowsInto *[]SchemaRow, seqsInto *[]uint64, rendered *[]SchemaRow) []SchemaRow {
+	if rendered != nil {
+		return db.sortSchemaRows(*rendered)
+	}
+	var rows []SchemaRow
+	if rowsInto != nil {
+		rows = *rowsInto
+	} else {
+		rows = make([]SchemaRow, 0, len(db.tables)+len(db.indexes)+len(db.views)+len(db.triggers)+len(db.vtabs))
+	}
 	for _, t := range db.tables {
 		// TEMP tables INCLUDED, unlike the file rewrite which must exclude them:
 		// a temp table is session-private and never persisted, but it is very much
@@ -1161,6 +1281,16 @@ func (db *DB) segmentSchemaRows() []SchemaRow {
 		rows = append(rows, SchemaRow{Type: "trigger", Name: g.name, TblName: g.table,
 			SQL: g.sql, Temp: g.isTemp, Rowid: int64(g.schemaSeq)})
 	}
+	if rowsInto != nil {
+		*rowsInto = rows
+		*seqsInto = db.appendSchemaSeqs(*seqsInto)
+		return nil
+	}
+	return db.sortSchemaRows(rows)
+}
+
+// sortSchemaRows puts rendered rows in creation order.
+func (db *DB) sortSchemaRows(rows []SchemaRow) []SchemaRow {
 	// ...and then into CREATION order, which is C's: sqlite_schema is read in
 	// rowid order and every CREATE appends. Grouped by kind, "SELECT
 	// group_concat(name) FROM sqlite_schema" answered "a,b,c,sqlite_autoindex_a_1,bi"
@@ -1170,7 +1300,17 @@ func (db *DB) segmentSchemaRows() []SchemaRow {
 	// (nextSchemaSeq), so the two sequences say nothing about each other, and a
 	// TEMP object sorted in among main's made a first-match lookup of
 	// "main.trial" find the TEMP "trial".
-	seqs := make([]uint64, 0, len(rows))
+	ranks := catalogRanks(db.appendSchemaSeqs(make([]uint64, 0, len(rows))))
+	keys := make([]catalogOrderKey, len(ranks))
+	for i, r := range ranks {
+		keys[i] = catalogOrderKey{rank: r}
+	}
+	return sortCatalogRows(rows, keys)
+}
+
+// appendSchemaSeqs appends each rendered row's creation sequence, in the order
+// renderSchemaRows renders them.
+func (db *DB) appendSchemaSeqs(seqs []uint64) []uint64 {
 	seqOf := func(temp bool, seq uint64) uint64 {
 		if temp {
 			return seq | 1<<62
@@ -1195,12 +1335,7 @@ func (db *DB) segmentSchemaRows() []SchemaRow {
 	for _, g := range db.triggers {
 		seqs = append(seqs, seqOf(g.isTemp, g.schemaSeq))
 	}
-	ranks := catalogRanks(seqs)
-	keys := make([]catalogOrderKey, len(ranks))
-	for i, r := range ranks {
-		keys[i] = catalogOrderKey{rank: r}
-	}
-	return sortCatalogRows(rows, keys)
+	return seqs
 }
 
 // Insert, Update and Delete run one statement and return the row count
@@ -1414,6 +1549,7 @@ func (n *Session) compactIfWorthIt() {
 	if !did || cerr != nil {
 		return
 	}
+	n.changeable = true // this build wrote the file, in its own version
 	// The file this session extends was rewritten, so re-read its identity
 	// before appending. Otherwise every later delta header names the old
 	// file ("segment delta was built for counter 2 pages 1; this file is
@@ -1592,8 +1728,20 @@ func (n *Session) RefreshIfStale() (bool, error) {
 		// write, and the caller has not asked to commit yet.
 		return false, nil
 	}
+	// THE CHANGE WORD FIRST (segment_change.go): the even value seen at the last
+	// full check, still there, means no change has begun since -- no stamp
+	// needed. It is read before the stamps, so a change that begins after it
+	// moves it and is caught by the next statement.
+	word, wordOK := uint64(0), false
+	if n.change != nil {
+		word, wordOK = n.change.load(), true
+		if n.changeSeenOK && word == n.changeSeen {
+			return false, nil
+		}
+	}
 	now := n.pairStamp()
 	if now == n.seenStat {
+		n.noteChangeSeen(word, wordOK)
 		return false, nil // nothing has touched either file
 	}
 	var ctr, pages uint32
@@ -1609,9 +1757,31 @@ func (n *Session) RefreshIfStale() (bool, error) {
 		// Touched but not MOVED -- our own append, or a stat granularity artefact.
 		// Record the stamp so the cheap check answers next time.
 		n.seenStat = now
+		n.noteChangeSeen(word, wordOK)
 		return false, nil
 	}
-	return true, n.reopen(false)
+	if rerr := n.reopen(false); rerr != nil {
+		return true, rerr
+	}
+	n.noteChangeSeen(word, wordOK && n.change != nil)
+	return true, nil
+}
+
+// mapChangeWordLate maps the change word for a session that opened before any
+// was written -- the connection that created the database, say -- once its own
+// commit has written one.
+func (n *Session) mapChangeWordLate() {
+	if n.change == nil && n.changeable {
+		n.change = mapChangeWord(n.segPath)
+	}
+}
+
+// noteChangeSeen records the change word read before a full check that found
+// the session current, so the next statement can trust it -- only an EVEN one:
+// an odd word is a change still in progress, or one whose writer died, and the
+// state the check saw may not be its last.
+func (n *Session) noteChangeSeen(word uint64, ok bool) {
+	n.changeSeen, n.changeSeenOK = word, ok && word&1 == 0
 }
 
 // adoptConnSettingsFrom carries a connection's PRAGMA settings from old (the DB
@@ -1703,6 +1873,9 @@ func (n *Session) reopen(afterFailedCommit bool) error {
 	n.appendAt.release()
 	n.catalogAtLastWrite = fresh.catalogAtLastWrite
 	n.seenStat = stamp
+	// The rebuilt file may be another version: its own word mapping, or none.
+	n.change.close()
+	n.change, n.changeSeenOK, n.changeable = fresh.change, false, fresh.changeable
 	if old != nil {
 		old.Close()
 	}

@@ -27,8 +27,19 @@ import "sync"
 //     literal, so a field added later is zero by default rather than stale by
 //     default. That is deliberate: the failure mode of forgetting one is a
 //     wrong answer, and this makes forgetting the SAFE direction.
-func (prog *Program) getMachine() *vdbe {
-	m, _ := vdbeMachines.Get().(*vdbe)
+func (prog *Program) getMachine() *vdbe { return prog.getMachineFrom(nil) }
+
+// getMachineFrom is getMachine taking *spare first when it holds a machine: a
+// session's own slot, which a statement loop reuses without the pool's
+// per-processor bookkeeping. The slot is emptied, so a nested run (a trigger
+// body) goes to the pool.
+func (prog *Program) getMachineFrom(spare **vdbe) *vdbe {
+	var m *vdbe
+	if spare != nil && *spare != nil {
+		m, *spare = *spare, nil
+	} else {
+		m, _ = vdbeMachines.Get().(*vdbe)
+	}
 	if m == nil {
 		m = &vdbe{}
 	}
@@ -94,7 +105,11 @@ func (m *vdbe) cursorShell(slot int) *vdbeCursor {
 // The scrub is also the TEST: anything that wrongly retained a register file
 // reads zeroes afterwards, which the corpus and the harness see as a wrong
 // answer rather than as an intermittent one.
-func (prog *Program) putMachine(m *vdbe) {
+func (prog *Program) putMachine(m *vdbe) { prog.putMachineTo(m, nil) }
+
+// putMachineTo is putMachine into *spare when that slot is empty, else the pool.
+// The machine is scrubbed the same way either way.
+func (prog *Program) putMachineTo(m *vdbe, spare **vdbe) {
 	regs, cursors, recRegs := m.regs, m.cursors, m.recRegs[:cap(m.recRegs)]
 	clear(regs)
 	clear(recRegs)
@@ -111,7 +126,23 @@ func (prog *Program) putMachine(m *vdbe) {
 	// so no cached row is kept alive by the pool.
 	sub := m.subCache[:cap(m.subCache)]
 	clear(sub)
-	*m = vdbe{regs: regs, cursors: cursors, recRegs: recRegs, subCache: sub[:0]}
+	// The JIT's cursor views and row copies too (vmJIT.enter), scrubbed: they
+	// were three allocations of every point read a native program ran.
+	jcur, jsnap := m.jcur, m.jsnap
+	clear(jcur)
+	for i := range jsnap {
+		clear(jsnap[i].row[:cap(jsnap[i].row)])
+		jsnap[i] = jitSnap{row: jsnap[i].row[:0]}
+	}
+	// Zeroed in place, then the kept slices put back: the same machine as the
+	// composite literal this was, without building that 1 KB literal and
+	// copying it over -- most of what returning a machine cost per statement.
+	*m = vdbe{}
+	m.regs, m.cursors, m.recRegs, m.subCache, m.jcur, m.jsnap = regs, cursors, recRegs, sub[:0], jcur, jsnap
+	if spare != nil && *spare == nil {
+		*spare = m
+		return
+	}
 	vdbeMachines.Put(m)
 }
 
