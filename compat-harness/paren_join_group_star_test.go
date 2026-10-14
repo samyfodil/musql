@@ -186,13 +186,8 @@ func TestParenJoinGroupStarAmbiguousDecline(t *testing.T) {
 		`SELECT * FROM t3, (t1 RIGHT JOIN t2 USING(a))`,
 		`SELECT * FROM t3 JOIN (t1 RIGHT JOIN t2 USING(a)) ON t3.d=b`,
 	} {
-		stmts := append(append([]string{}, pjgSetup...), q)
-		if res := run(t, "cgo", stmts); res[len(res)-1]["kind"] != "rows" {
-			t.Errorf("oracle no longer answers %q: %v -- this decline may now be correct", q, res[len(res)-1])
-		}
-		if res := run(t, "musql", stmts); res[len(res)-1]["kind"] != "error" {
-			t.Errorf("%q now ANSWERS in musql (%v) -- it must be right, not merely answered; "+
-				"check the coalesced column against the oracle before deleting this case", q, res[len(res)-1])
-		}
+		// The parenthesized-join binder (engine/nested_from_bind.go) serves
+		// these now, coalesced column included; they must be C's answer.
+		differ(t, q, append(append([]string{}, pjgSetup...), q))
 	}
 }

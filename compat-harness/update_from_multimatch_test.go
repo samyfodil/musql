@@ -1,6 +1,5 @@
-// This file tests that UPDATE ... FROM with multiple matches per target row
-// is properly declined (result depends on query plan, not deterministic).
-// Single-match joins must still work exactly.
+// This file tests UPDATE ... FROM with multiple matches per target row, whose
+// result follows the query plan. Single-match joins must still work exactly.
 package compat
 
 import (
@@ -44,25 +43,30 @@ func ufmRun(t *testing.T, driver, dsn string, extra []string) string {
 	return fmt.Sprintf("(1,%d)(2,%d)", a, b)
 }
 
-// TestUpdateFromMultiMatchStaysDeclined is the two-sided pin.
-func TestUpdateFromMultiMatchStaysDeclined(t *testing.T) {
+// TestUpdateFromMultiMatchFollowsThePlan: a multi-match UPDATE ... FROM keeps
+// the last matching row in C's plan order (OP_Insert into the rowid-keyed
+// ephemeral table overwrites), so the answer depends on the plan. Where the
+// engine answers it must be C's answer under every physical configuration --
+// a different index or ANALYZE picks a different plan in both; where the plan
+// is not one the ported planner decides, it declines.
+func TestUpdateFromMultiMatchFollowsThePlan(t *testing.T) {
 	for _, c := range []struct {
 		name  string
 		extra []string
 	}{
 		{"plain", nil},
 		{"index-src-k", []string{`CREATE INDEX sk ON src(k)`}},
+		{"index-src-k-desc-v", []string{`CREATE INDEX skv ON src(k, v DESC)`}},
 		{"covering-index-analyzed", []string{`CREATE UNIQUE INDEX skv ON src(k,v)`, `ANALYZE`}},
 	} {
 		dir := t.TempDir()
-		if got := ufmRun(t, "sqlite3", filepath.Join(dir, "cgo.db"), c.extra); got == "ERR" {
-			t.Errorf("[%s] the oracle now REJECTS a multi-match UPDATE ... FROM -- this pin is obsolete", c.name)
+		want := ufmRun(t, "sqlite3", filepath.Join(dir, "cgo.db"), c.extra)
+		if want == "ERR" {
+			t.Errorf("[%s] the oracle rejects a multi-match UPDATE ... FROM", c.name)
+			continue
 		}
-		if got := ufmRun(t, "sqlite", filepath.Join(dir, "musql.db"), c.extra); got != "ERR" {
-			t.Errorf("[%s] musql now ANSWERS a multi-match UPDATE ... FROM (%s). "+
-				"That is only correct if SQLite's choice has become plan-independent -- "+
-				"re-measure it across ANALYZE and index configurations before keeping this.",
-				c.name, got)
+		if got := ufmRun(t, "sqlite", filepath.Join(dir, "musql.db"), c.extra); got != "ERR" && got != want {
+			t.Errorf("[%s] musql keeps %s where C SQLite keeps %s", c.name, got, want)
 		}
 	}
 }

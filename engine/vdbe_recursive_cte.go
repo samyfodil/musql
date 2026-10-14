@@ -142,6 +142,9 @@ func (p *ReadOnlyPager) compileRecursiveCTE(name string, b *cteBinding, cols []c
 		// select.c:5802's separate "circular reference" for it.
 		return nil, semanticf("engine: multiple references to recursive table: %s", name)
 	}
+	if rs.orderErr != nil {
+		return nil, rs.orderErr
+	}
 	// generateWithRecursiveQuery (select.c:2690) refuses a window function in
 	// the recursive SELECT it is handed, the compound's last arm.
 	if last := rs.recursiveArms[len(rs.recursiveArms)-1]; last != nil && (selectHasWindow(last) || orderByHasWindow(last)) {
@@ -191,6 +194,20 @@ func (p *ReadOnlyPager) compileRecursiveCTE(name string, b *cteBinding, cols []c
 			term: OrderTerm{Desc: rs.orderTerms[i].Desc, Nulls: rs.orderTerms[i].Nulls},
 			coll: coll,
 		})
+	}
+	if rs.limitExpr != nil {
+		n, ferr := foldLimitOffsetExpr(p, rs.limitExpr, nil)
+		if ferr != nil {
+			return nil, ferr
+		}
+		spec.hasLimit, spec.limit = true, n
+	}
+	if rs.offsetExpr != nil {
+		n, ferr := foldLimitOffsetExpr(p, rs.offsetExpr, nil)
+		if ferr != nil {
+			return nil, ferr
+		}
+		spec.offset = n
 	}
 	if rs.limit != nil {
 		spec.hasLimit, spec.limit = true, *rs.limit

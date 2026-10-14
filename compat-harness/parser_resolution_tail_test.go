@@ -298,13 +298,14 @@ func TestParenJoinGroupAliasDeclines(t *testing.T) {
 	// where the same group unaliased is a,b,g, and "SELECT ta.b" through it
 	// comes back named "b:1". No separate guard is needed for these -- USING
 	// and NATURAL only coalesce a name BOTH sides carry, which is a repeat by
-	// definition, so the check above already declines every one of them.
+	// definition. The parenthesized-join binder (engine/nested_from_bind.go)
+	// ports that front-move, so these are served now and must be C's answer.
 	for _, q := range []string{
 		`SELECT * FROM (ta JOIN td USING(b)) AS g`,
 		`SELECT * FROM (ta NATURAL JOIN td) AS g`,
 		`SELECT * FROM (ta NATURAL LEFT JOIN td NATURAL JOIN te) AS qq FULL JOIN tc ON true`,
 	} {
-		h.mustDecline(q)
+		h.mustAgree(q)
 	}
 	h.mustAgree(`SELECT g.a FROM (ta JOIN td USING(b)) AS g`)
 	h.mustAgree(`SELECT ta.b, td.b, g.b FROM (ta JOIN td USING(b)) AS g`)

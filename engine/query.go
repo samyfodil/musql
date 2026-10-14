@@ -1125,6 +1125,13 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 	if err := p.fts5SpecialQueryGuard(stmt); err != nil {
 		return nil, nil, err
 	}
+	// Names reached through a parenthesized join group resolve as C's
+	// SF_NestedFrom subquery makes them (nested_from_bind.go).
+	bound, berr := p.nfBindSelect(stmt, outer == nil)
+	if berr != nil {
+		return nil, nil, berr
+	}
+	stmt = bound
 	// Push this statement's WITH CTEs onto p.cteScopes for the length of this call,
 	// so everything reached while it runs (its FROM, compound arms, nested
 	// subqueries) sees them; see ReadOnlyPager.cteScopes. Done before the VDBE
@@ -2037,7 +2044,12 @@ func expandSelectList(sel []SelectColumn, scopes []tableScope, mode colNameMode)
 			if mode.subqueryCols {
 				nameExpr = skipCollateAndLikely(nameExpr)
 			}
-			if colRef, ok := nameExpr.(ColumnExpr); ok {
+			if sc.cName != "" {
+				// The name C gives it, decided where the reference was
+				// resolved through a parenthesized join group
+				// (nested_from_bind.go).
+				name = sc.cName
+			} else if colRef, ok := nameExpr.(ColumnExpr); ok {
 				qualifier, display, isCol, rerr := columnRefNameParts(scopes, colRef)
 				if rerr != nil {
 					return nil, rerr

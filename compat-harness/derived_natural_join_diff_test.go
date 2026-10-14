@@ -524,11 +524,14 @@ func TestDerivedNaturalJoinDeclined(t *testing.T) {
 		// makes this atomic now too, same as an internal outer join always
 		// did.
 	} {
-		if _, _, cErr := cgoSelect(t, cdb, sqlText, nil); cErr != nil {
-			t.Fatalf("[%s] expected C SQLite to ANSWER this (the point of the decline), got %v", sqlText, cErr)
+		cCols, cRows, cErr := cgoSelect(t, cdb, sqlText, nil)
+		if cErr != nil {
+			t.Fatalf("[%s] expected C SQLite to ANSWER this, got %v", sqlText, cErr)
 		}
-		if _, _, err := p.QueryArgs(sqlText, nil); err == nil {
-			t.Errorf("[%s] expected a clean decline, got an answer -- verify it against C SQLite and move it to the parity corpus", sqlText)
+		// The parenthesized-join binder (engine/nested_from_bind.go) serves
+		// these now; an answer must be C's, a decline is still clean.
+		if eCols, eVals, err := p.QueryArgs(sqlText, nil); err == nil {
+			servedMatchesC(t, sqlText, eCols, engineRowsToStrings(eVals), cCols, cRows)
 		}
 	}
 }

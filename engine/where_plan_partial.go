@@ -769,8 +769,9 @@ func pcxPartialOK(e *pcx) bool {
 // whereUsablePartialIndex checks if a partial index is usable with the terms in the WhereClause.
 func (b *wherePlanIdxBuild) whereUsablePartialIndex(iTab int, pw *pcx) tri {
 	it := &b.items[iTab]
-	// "if( jointype & JT_LTORJ ) return 0": the gate declines a RIGHT JOIN,
-	// the only source of that flag, before this file runs.
+	if it.ltorj {
+		return triNo // "if( jointype & JT_LTORJ ) return 0"
+	}
 	if pw.op == pcxAnd {
 		l := b.whereUsablePartialIndex(iTab, pw.l)
 		if l == triNo {

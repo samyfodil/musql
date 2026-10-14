@@ -131,6 +131,19 @@ type ColumnExpr struct {
 	// (unqualifiedColumnNotFoundErr).
 	FallbackLiteral *Value
 
+	// nfSelf, set only while nested_from_bind.go resolves a "*" it expanded,
+	// is the FROM item the qualifier names when that item has no name a
+	// reference could spell (C's "(subquery-N)"). Never set on a tree the
+	// rest of the engine sees.
+	nfSelf *nfItem
+
+	// coalesceOf, when set, makes this reference C's coalesce() of a FULL
+	// JOIN's USING column: this column, then each of these in order
+	// (lookupName's pFJMatch, resolve.c). Its affinity is this column's, as
+	// SQLITE_AFF_DEFER gives the coalesce its first argument's. Set by
+	// nested_from_bind.go, every reference qualified.
+	coalesceOf *[]ColumnExpr
+
 	// R32NDQSpan is the byte span of this reference's bare double-quoted name
 	// token (quotes included) in the parsed text; zero otherwise, and recorded
 	// only while parser.r32nDQRecord is on, which only the renameFixQuotes port
@@ -651,7 +664,15 @@ type SelectColumn struct {
 	// text (misc1.test: "CREATE TABLE t19 AS SELECT 1, 2 AS '', 3" has a middle
 	// column named "").
 	HasAlias bool
-	Text     string // verbatim source text of Expr, for default column naming (only used when !HasAlias)
+
+	// cName, when set, is the name C gives this unaliased result column
+	// (nested_from_bind.go); it decides the column's name only, never what an
+	// ORDER BY or WHERE name resolves to. nfStar marks a column a "*" was
+	// expanded into there.
+	cName  string
+	nfStar bool
+
+	Text string // verbatim source text of Expr, for default column naming (only used when !HasAlias)
 	// RawText is the verbatim source-text SPAN of Expr exactly as typed
 	// (whitespace between tokens preserved, qualifier NOT stripped) --
 	// UNLIKE Text, which for a bare ColumnExpr is reduced to just the
@@ -761,6 +782,11 @@ const (
 // C); nil means "always matches" (desugarJoinItem, emitJoinLevel).
 type FromItem struct {
 	Table string
+
+	// cID names this table, subquery or table-function item in its
+	// statement's C-shaped FROM tree (SelectStmt.cFrom); 0 for an item the
+	// parser did not create as one (a re-wrapped group's stand-in).
+	cID int
 
 	// Schema, if non-empty, is the database-qualifier written in front of the
 	// table name ("main"/"temp"/an ATTACHed database name) -- e.g. "main" for
@@ -1180,6 +1206,16 @@ type SelectStmt struct {
 	// uses (resolveFrom, cte.go), except a recursive CTE (detectRecursiveShape),
 	// which compiles to a queue program (compileRecursiveCTE).
 	CTEs []CTEDef
+
+	// cFrom is the FROM clause as C's parser builds its SrcList (parse.y's
+	// seltablist): spliced, unwrapped or wrapped into SF_NestedFrom
+	// subqueries, each leaf naming its FromItem by cID. nil when the
+	// statement was not parsed with one (a FROM built in code). See
+	// nested_from.go.
+	cFrom []cSrcNode
+
+	// nfBound marks a tree nested_from_bind.go has already rewritten.
+	nfBound bool
 
 	// r35dCompoundOf is set only on the copy compileCompound makes to compile a
 	// compound's first arm, pointing at the compound. The aggregate hoist

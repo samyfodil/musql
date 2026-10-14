@@ -113,6 +113,10 @@ type whereIndexInfo struct {
 	// whereLoopAddBtreeIndex needs -- see where_plan_exprindex_cover.go's
 	// package comment for the exact scope.
 	exprs []Expr
+	// exprProgs is parallel to exprs: each XN_EXPR key column compiled against
+	// the table's own row, so a walk of this index can be put in its key order
+	// (autoIndexKey.exprs, autoIndexOrderCursor). nil for a plain-column entry.
+	exprProgs []*selfRowExpr
 }
 
 // xnRowid is where.c's XN_ROWID: the aiColumn[] entry standing for the rowid.
@@ -552,7 +556,20 @@ func wherePlanIndexChain(p *ReadOnlyPager, tbl *resolvedTable, tableName, indexe
 				if k < len(exprs) {
 					e = exprs[k]
 				}
+				// The key the index stores is the expression over the table's
+				// own row (sqlite3ExprCodeCopy under iSelfTab, insert.c:2433),
+				// which is the order a walk of the b-tree visits. One that does
+				// not compile leaves the order unknown, so the chain is not
+				// reproduced.
+				prog := compileSelfRowExpr(tableScope{name: tableName, cols: tbl.cols, colIndex: buildColIndex(tbl.cols), noRowid: tbl.withoutRowid}, e, false, pureCtxIndex)
+				if e == nil || prog.prog == nil {
+					return nil, 0, false
+				}
 				idx.exprs = append(idx.exprs, e)
+				for len(idx.exprProgs) < len(idx.exprs)-1 {
+					idx.exprProgs = append(idx.exprProgs, nil)
+				}
+				idx.exprProgs = append(idx.exprProgs, prog)
 				continue
 			}
 			ci, ok := colIndexOf(cn)
@@ -1219,7 +1236,7 @@ func (b *wherePlanIdxBuild) addBtreeIndex(iTab int, idx *whereIndexInfo, st wher
 			// source": it only ever comes in with its lower (below).
 			continue
 		}
-		if it.outer && !constraintCompatibleWithOuterJoin(t, iTab) {
+		if (it.outer || it.ltorj) && !constraintCompatibleWithOuterJoin(t, iTab) {
 			continue
 		}
 		cur := st
@@ -1406,7 +1423,7 @@ func (b *wherePlanIdxBuild) addBtree(iTab int, mPrereq whereMask) {
 	// recursive subquery, and the right table of a RIGHT JOIN -- are unreachable
 	// under the gate, and WHERE_OR_SUBCLAUSE arrives as noAutoIndex from
 	// wherePlanMultiOrOrder.
-	if b.orSet == nil && !b.noAutoIndex && !it.indexedBy && !it.notIndexed && !it.correlated {
+	if b.orSet == nil && !b.noAutoIndex && !it.indexedBy && !it.notIndexed && !it.right && !it.correlated {
 		rLogSize := estLog(rSize)
 		for i := range b.terms {
 			t := &b.terms[i]
@@ -1539,11 +1556,16 @@ func (b *wherePlanIdxBuild) addBtree(iTab int, mPrereq whereMask) {
 				if it.fromExists {
 					scan.nOut = 0 // where.c:4286
 				}
-				b.insertLoop(whereIdxLoop{
-					iTab: iTab, maskSelf: maskSelf, prereq: mPrereq,
-					rRun: rRun, nOut: scan.nOut, idx: idx,
-					idxOnly: st.idxOnly, indexed: true, sortIdx: st.sortIdx,
-				})
+				// "Do not do an SCAN of a index-on-expression in a RIGHT JOIN"
+				// (where.c:4280): the right-join sweep could find its cursor
+				// on the wrong row.
+				if !(it.right && idxHasExpr(idx)) {
+					b.insertLoop(whereIdxLoop{
+						iTab: iTab, maskSelf: maskSelf, prereq: mPrereq,
+						rRun: rRun, nOut: scan.nOut, idx: idx,
+						idxOnly: st.idxOnly, indexed: true, sortIdx: st.sortIdx,
+					})
+				}
 			}
 		}
 		st.nOut = rSize
@@ -1564,19 +1586,21 @@ func (b *wherePlanIdxBuild) addBtree(iTab int, mPrereq whereMask) {
 func (b *wherePlanIdxBuild) addAll() {
 	var mPrereq, mPrior whereMask
 	hasRightCrossJoin := false
+	firstPastRJ := false
 	b.planLimit = wherePlannerLimit
 	for iTab := range b.items {
 		b.planLimit += wherePlannerLimitIncr
 		it := &b.items[iTab]
 		maskSelf := whereMask(1) << uint(iTab)
 		switch {
-		case it.outer || it.cross:
-			if it.cross {
-				// JT_LTORJ is the other flag that sets this; RIGHT/FULL joins
-				// are declined before this file runs.
+		case firstPastRJ || it.outer || it.cross || it.ltorj:
+			if it.cross || it.ltorj {
 				hasRightCrossJoin = true
 			}
 			mPrereq |= mPrior
+			// bFirstPastRJ: the right operand of a RIGHT JOIN may not be
+			// swapped with anything further right either.
+			firstPastRJ = it.right
 		case it.fromExists:
 			// where.c:4992: "joins that result from the EXISTS-to-JOIN
 			// optimization should not be moved to the left of any of their
@@ -3018,6 +3042,17 @@ func (b *wherePlanIdxBuild) whereIdxFindDistinctCol(idx *whereIndexInfo, j int, 
 		// -1) never matches an index naming that column. Reproduced as-is.
 		if ob[i].col >= 0 && ob[i].col == idx.aiColumn[j] &&
 			equalFoldName(ob[i].coll, idx.azColl[j]) {
+			return true
+		}
+	}
+	return false
+}
+
+// idxHasExpr reports whether an index has an expression key column
+// (pProbe->aColExpr non-null).
+func idxHasExpr(idx *whereIndexInfo) bool {
+	for _, e := range idx.exprs {
+		if e != nil {
 			return true
 		}
 	}

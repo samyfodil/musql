@@ -151,6 +151,11 @@ func markWherePlanEligibility(p *ReadOnlyPager, c *compiler, srcs []joinSource, 
 		k.level = level
 		srcs[iTab].idxOrderKey = k
 	}
+	for level, iTab := range order {
+		if keys[level] != nil && keys[level].rjSweep != nil {
+			srcs[iTab].rjSweepKey = keys[level].rjSweep
+		}
+	}
 	for i := range srcs {
 		srcs[i].wherePlanOK = true
 		srcs[i].noAutoIndex = noAutoIdx
@@ -184,6 +189,9 @@ type wherePlanDerivedItem struct {
 }
 
 func wherePlanMultiTableSourcesWith(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt *SelectStmt, der map[int]wherePlanDerivedItem) bool {
+	if r := rightJoinItem(srcs); r == -2 || (r >= 0 && !rightJoinPlannable(srcs, stmt)) {
+		return false
+	}
 	if len(srcs) < 2 || len(srcs) > 64 {
 		// 64 is BMS: sqlite3WhereBegin refuses a longer FROM clause outright.
 		// See wherePlanOrder.
@@ -229,7 +237,7 @@ func wherePlanMultiTableSourcesWith(p *ReadOnlyPager, c *compiler, srcs []joinSo
 		// index), whose order is the PK walk this engine already does.
 		if s.derived != nil || s.vtabItem != nil || s.cteItem != nil ||
 			s.catalogScope != scopeAny ||
-			s.rightOuter || s.tbl == nil || (s.dbIdx != 0 && !p.dbIdxIsTemp(s.dbIdx)) {
+			s.tbl == nil || (s.dbIdx != 0 && !p.dbIdxIsTemp(s.dbIdx)) {
 			return false
 		}
 		// colUsed folds every column at or past bit 63 onto that one bit
@@ -396,6 +404,7 @@ func wherePlanMultiTableOrderWith(p *ReadOnlyPager, c *compiler, srcs []joinSour
 		}
 		items[i] = whereItem{
 			outer: jts[i].left || jts[i].rightOuter, cross: srcs[i].cross, fromExists: scopes[i].fromExists,
+			right: srcs[i].rightOuter, ltorj: i < rightJoinItem(srcs),
 			cols: srcs[i].tbl.cols, tabName: r33sFoldIdent(srcs[i].tbl.name),
 			colUsedOK: colUsedOK, noRowid: srcs[i].tbl.withoutRowid,
 			ipkIndex: srcs[i].tbl.ipkIndex, szTabRow: szTabRow, idxs: idxs,
@@ -440,6 +449,33 @@ func wherePlanMultiTableOrderWith(p *ReadOnlyPager, c *compiler, srcs []joinSour
 			}
 			keys[i] = whereReversedScanKey(keys[i])
 		}
+	}
+	// A RIGHT/FULL join's unmatched rows come from a sweep with a plan of its
+	// own, carried on its level's key; without it the order is not decided.
+	if rj := rightJoinItem(srcs); rj >= 0 {
+		for level, iTab := range order {
+			if iTab != level {
+				return nil, nil, 0, false // C keeps FROM order across the join
+			}
+			if iTab == rj && keys[level] != nil && keys[level].multiOr != nil {
+				// A WHERE_MULTI_OR loop re-sorts the operand per outer row,
+				// which the matched marks the sweep reads do not follow.
+				return nil, nil, 0, false
+			}
+		}
+		sweep, sok := rightJoinSweepKey(p, srcs, stmt, rj, items[rj].colUsed, colUsedOK)
+		if !sok {
+			return nil, nil, 0, false
+		}
+		if sweep == nil {
+			// The rowid scan, spelled out: the main loop may have put the rows
+			// in another order.
+			sweep = &autoIndexKey{cols: []int{xnRowid}, colls: []string{"BINARY"}, desc: []bool{false}}
+		}
+		if keys[rj] == nil {
+			keys[rj] = &autoIndexKey{}
+		}
+		keys[rj].rjSweep = sweep
 	}
 	return order, keys, planNRow, true
 }
@@ -2041,7 +2077,6 @@ func wherePlanIndexesProvablyInert(p *ReadOnlyPager, c *compiler, srcs []joinSou
 // it prices the fake sPk exactly as it does any other index -- so the decline
 // went with it.
 
-
 // colUsedBitsFor is sqlite3ExprColUsed (resolve.c:176-198): the colUsed bits for
 // one reference to column col. An ordinary column gives its own bit; a generated
 // column floods every bit of the table (resolve.c:171-174), keyed on the column
@@ -2486,5 +2521,71 @@ func onClausesStayInScope(jts []joinedTable, scopes []tableScope, order []int) b
 	return true
 }
 
+// rightJoinItem is the index of the one RIGHT or FULL join item in srcs, -1
+// for none, -2 for several.
+func rightJoinItem(srcs []joinSource) int {
+	r := -1
+	for i := range srcs {
+		if srcs[i].rightOuter {
+			if r >= 0 {
+				return -2
+			}
+			r = i
+		}
+	}
+	return r
+}
 
+// rightJoinPlannable reports whether the ported planner may decide a FROM
+// clause holding a RIGHT or FULL join. The shape is the one whose plan this
+// port follows end to end: one RIGHT/FULL item, no WHERE and no INNER join ON
+// (so select.c's outer-join simplification has nothing to reduce, and the
+// unmatched-row sweep plans its table with no terms -- see
+// rightJoinSweepKey).
+func rightJoinPlannable(srcs []joinSource, stmt *SelectStmt) bool {
+	r := rightJoinItem(srcs)
+	if r < 0 || stmt == nil || stmt.Where != nil {
+		return false
+	}
+	for i := range srcs {
+		if srcs[i].on != nil && !srcs[i].left && !srcs[i].rightOuter {
+			return false
+		}
+		if srcs[i].tbl == nil || srcs[i].tbl.withoutRowid {
+			return false
+		}
+		// Base tables only: a subquery item (markCoroutineReruns) has no
+		// index chain for the sweep's own plan to walk.
+		if srcs[i].derived != nil || srcs[i].cteItem != nil || srcs[i].vtabItem != nil {
+			return false
+		}
+	}
+	return true
+}
 
+// rightJoinSweepKey plans the unmatched-row sweep of srcs[r], the RIGHT/FULL
+// join item: sqlite3WhereRightJoinLoop runs a WhereBegin of its own over that
+// table alone, with WHERE_RIGHT_JOIN (no automatic index) and the WHERE terms
+// reading only tables already NULL-extended, of which rightJoinPlannable
+// admits none. The key is the order its loop visits the table in; nil is the
+// rowid scan.
+func rightJoinSweepKey(p *ReadOnlyPager, srcs []joinSource, stmt *SelectStmt, r int, colUsed uint64, colUsedOK bool) (*autoIndexKey, bool) {
+	s := &srcs[r]
+	idxs, szTabRow, iok := wherePlanPartialIndexList(p, s.tbl, s.scope.tableName,
+		stmt.From[r].IndexedBy, stmt.From[r].NotIndexed, stmt)
+	if !iok || len(idxs) == 0 || (!colUsedOK && len(idxs) > 1) {
+		return nil, false
+	}
+	nRowLogEst, szTabRow := wherePlanItemStats(p.forDB(s.dbIdx), s.tbl, idxs, szTabRow)
+	it := whereItem{
+		cols: s.tbl.cols, tabName: r33sFoldIdent(s.tbl.name),
+		colUsedOK: colUsedOK, colUsed: colUsed, noRowid: s.tbl.withoutRowid,
+		ipkIndex: s.tbl.ipkIndex, szTabRow: szTabRow, idxs: idxs,
+		nRowLogEst: nRowLogEst, nRowLogEstSet: true,
+		indexedBy: stmt.From[r].IndexedBy != "", notIndexed: stmt.From[r].NotIndexed,
+	}
+	key, _, ok := wherePlanSingleIndexKey(wherePlanInput{
+		items: []whereItem{it}, sort: &whereSortCtl{}, noAutoIndex: true,
+	}, false)
+	return key, ok
+}
