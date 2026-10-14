@@ -226,9 +226,6 @@ func init() {
 	tsKnownGroup("2026-10-12: a column reached through four nested parenthesized USING groups is named \"a\" where C names it from each rebuilt list (\"a:1\", \"a:3\" and, past the fifth repeat, a random suffix); the values agree",
 		"parenthesized-joins.sqltest::memory::qualified-columns-pass-through-several-parenthesized-joins",
 	)
-	tsKnownGroup("2026-10-12: a random() view inside an uncorrelated parenthesized RIGHT/FULL join group of a correlated subquery: C materializes the group once for the statement, musql re-runs it per outer row, so the random values differ",
-		"right-full-join-sqlite.sqltest::memory::uncorrelated-parenthesized-full-join-materializes-once",
-	)
 	tsKnownGroup("2026-10-12: foreign keys: a cascade whose child has an AFTER trigger and an onward action is declined (C codes the onward action ahead of the AFTER trigger)",
 		"foreign_keys.sqltest::memory::fk-cascade-trigger-cascade",
 	)

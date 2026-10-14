@@ -934,6 +934,15 @@ type derivedSource struct {
 	// pop, and each recursive step runs on a fresh machine anyway.
 	recSelf *recQueueSpec
 
+	// stmtOnce makes prog's rows a once-per-STATEMENT materialization, shared
+	// by every run of the program holding this source (vdbe.stmtOnceRows): the
+	// OP_Once around an uncorrelated materialized subquery (select.c, "if(
+	// pItem->fg.isCorrelated==0 ) onceAddr = OP_Once") belongs to the whole
+	// statement's VM, so a correlated subquery run once per outer row still
+	// materializes it the first time only. See emitJoinLoops for where it is
+	// set.
+	stmtOnce bool
+
 	// stream says whether prog may run as a CO-ROUTINE feeding this cursor one
 	// row at a time instead of being materialized first (streamsDerived,
 	// vdbe_stream.go). streamNever, the zero value, is every source's behaviour

@@ -116,6 +116,10 @@ type joinSource struct {
 	// cursor (vdbe_cursor.go). tbl is synthetic, with the output columns only.
 	derived     *Program
 	derivedSlot int
+	// derivedNoFrom is set for a subquery or view body with an arm that has no
+	// FROM clause, which C's flattener never absorbs (flattenSubquery
+	// restrictions (7) and (17c)).
+	derivedNoFrom bool
 
 	// keepSubtype, for a subquery, view or CTE source, is the result columns
 	// whose subtype crosses into this query (flattenedSubtypeKeep); nil
@@ -1366,11 +1370,28 @@ func (p *ReadOnlyPager) resolveDerivedSource(c *compiler, state *joinDesugarStat
 		on:                           onExpr,
 		derived:                      prog,
 		derivedSlot:                  slot,
+		derivedNoFrom:                selectHasFromlessArm(it.Subquery),
 		derivedOrderProvable:         orderProvable,
 		derivedOrderNeedsOuterSafety: needsOuterSafety,
 	}, nil
 }
 
+// selectHasFromlessArm reports whether s, or any arm of its compound, has no
+// FROM clause.
+func selectHasFromlessArm(s *SelectStmt) bool {
+	if s == nil {
+		return false
+	}
+	if len(s.From) == 0 {
+		return true
+	}
+	for _, a := range s.Compound {
+		if a.Stmt == nil || len(a.Stmt.From) == 0 {
+			return true
+		}
+	}
+	return false
+}
 
 // fromlessArmOrderProvable reports whether arm has no FROM and no aggregate, so
 // it yields at most one row: there is no scan to order and nothing for an
@@ -1762,6 +1783,7 @@ func (p *ReadOnlyPager) resolveViewSource(c *compiler, state *joinDesugarState, 
 		on:                           onExpr,
 		derived:                      prog,
 		derivedSlot:                  slot,
+		derivedNoFrom:                pcv != nil && selectHasFromlessArm(pcv.selectStmt),
 		derivedOrderProvable:         orderProvable,
 		derivedOrderNeedsOuterSafety: needsOuterSafety,
 	}, nil
@@ -2727,6 +2749,27 @@ func compileGroupBody(subC *compiler, spanSrcs []joinSource, outCols []outputCol
 	}, nil
 }
 
+// groupBodyMaterializesOnce reports whether s, a subquery or view inside a
+// parenthesized join group's body, is one C materializes once for the whole
+// statement. The group is C's SF_NestedFrom subquery, a select of its own over
+// the members. A RIGHT or FULL join among them sets JT_LTORJ on its first
+// item, and with no WHERE of its own nothing simplifies that join away, so no
+// member can be a co-routine (fromClauseTermCanBeCoroutine (3)). A body with a
+// FROM-less arm is never flattened, so it is materialized, under OP_Once when
+// it is not correlated: once per statement, however often the select around
+// the group runs.
+func groupBodyMaterializesOnce(c *compiler, srcs []joinSource, s joinSource) bool {
+	if c == nil || !c.groupSpanRecursion || s.derived == nil || s.derived.Correlated || !s.derivedNoFrom || len(s.memberScopes) > 0 {
+		return false
+	}
+	for _, o := range srcs[1:] {
+		if o.rightOuter {
+			return true
+		}
+	}
+	return false
+}
+
 // onsOfSources extracts srcs' effective join conditions (each already
 // desugared from USING/NATURAL, if applicable, by resolveJoinSources) in FROM
 // order -- the []Expr shape checkFromSupported (join.go) takes, mirroring
@@ -2919,7 +2962,9 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 	for i, s := range srcs {
 		if s.derived != nil {
 			ds := &derivedSource{prog: s.derived, tbl: s.tbl, dbIdx: s.dbIdx, keepSubtype: s.keepSubtype, lazy: true}
-			if i == streamDerived {
+			if groupBodyMaterializesOnce(c, srcs, s) {
+				ds.stmtOnce = true
+			} else if i == streamDerived {
 				ds.stream = streamIfYielding
 				if s.cteCoroutine {
 					ds.stream = streamCoroutine // see the CTE case below

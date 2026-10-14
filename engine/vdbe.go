@@ -68,6 +68,9 @@ type vdbe struct {
 	// filled by the first one to run (runCTEOnce). Read and written on the
 	// outermost machine only.
 	cteRows map[*cteBinding][][]Value
+	// stmtOnceRows holds the rows of each derivedSource.stmtOnce body, by
+	// program, on the statement's root machine (stmtRoot).
+	stmtOnceRows map[*Program][][]Value
 	// cteRoot is the machine of the statement this uncorrelated sub-program
 	// belongs to (newMachine); nil on the statement's own machine.
 	cteRoot *vdbe
@@ -336,6 +339,25 @@ func (m *vdbe) runSubOnce(slot int, prog *Program, pager *ReadOnlyPager) ([][]Va
 	}
 	e.rows = rows
 	e.done = true
+	return rows, nil
+}
+
+// runStmtOnce is runSubOnce for a derivedSource.stmtOnce body: its rows are
+// kept on the statement's root machine, so every run of the program holding
+// the source reads the first one's.
+func (m *vdbe) runStmtOnce(slot int, prog *Program, pager *ReadOnlyPager) ([][]Value, error) {
+	root := m.stmtRoot()
+	if rows, ok := root.stmtOnceRows[prog]; ok {
+		return rows, nil
+	}
+	rows, err := m.runSubOnce(slot, prog, pager)
+	if err != nil {
+		return nil, err
+	}
+	if root.stmtOnceRows == nil {
+		root.stmtOnceRows = map[*Program][][]Value{}
+	}
+	root.stmtOnceRows[prog] = rows
 	return rows, nil
 }
 
@@ -2049,6 +2071,10 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				// (vdbeCursor.fill).
 				slot, prog := op.P2, ds.prog
 				m.cursors[op.P1] = openFillCursor(ds.tbl, func() ([][]Value, []int64, error) {
+					if ds.stmtOnce {
+						rows, err := m.runStmtOnce(slot, prog, srcPager)
+						return rows, nil, err
+					}
 					if !prog.Correlated {
 						rows, err := m.runSubOnce(slot, prog, srcPager)
 						return rows, nil, err
