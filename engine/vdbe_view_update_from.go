@@ -299,6 +299,7 @@ func (db *DB) compileViewUpdateFromStmt(stmt *updateStmt, vm *viewMeta, trig *tr
 	c.emit(Instruction{Op: OpFireTriggers, P1: newBase, P2: rowidReg, P3: oldBase, P4: &fp})
 	// The NEW block is the RETURNING image, as in compileViewUpdateStmt --
 	// before skipAddr, so RAISE(IGNORE) takes the returned row with it.
+	c.retWith = declineReturningWith(stmt.ctes)
 	colNames, rerr := c.emitViewReturning(db, vm, viewCols, stmt.returning, newBase, returningSitePerRow)
 	if rerr != nil {
 		return nil, rerr

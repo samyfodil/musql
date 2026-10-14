@@ -74,6 +74,9 @@ func (db *DB) compileLiveSubProgram(sel *SelectStmt, trig *trigCompileCtx, ret *
 	if outer != nil {
 		outer.nQueryLoop, outer.nQueryLoopKnown = nQueryLoop, nqlKnown
 	}
+	if ret != nil && len(ret.ctes) > 0 {
+		defer pager.pushCTEScope(ret.ctes)()
+	}
 	prog, err := compileSubProgram(pager, sel, outer)
 	if err != nil {
 		return nil, err
@@ -231,6 +234,10 @@ func (m *vdbe) liveLower(prog *Program, pager *ReadOnlyPager) (*Program, *ReadOn
 		// The UPDATE's own WITH clause, pushed exactly as compileUpdateStmt
 		// pushed it for the first lowering.
 		defer live.pushCTEScope(prog.LiveRow.ctes)()
+	} else if prog.LiveRet != nil && len(prog.LiveRet.ctes) > 0 {
+		// The RETURNING statement's WITH clause, as compileLiveSubProgram
+		// pushed it.
+		defer live.pushCTEScope(prog.LiveRet.ctes)()
 	}
 	sub, err := compileSubProgram(live, prog.LiveSource, liveOuter(prog))
 	if err != nil {
@@ -256,6 +263,11 @@ func (m *vdbe) liveLower(prog *Program, pager *ReadOnlyPager) (*Program, *ReadOn
 // ordinary frozen route otherwise. Every subquery emitter goes through it so
 // there is exactly one place the two routes are chosen between.
 func (c *compiler) liveSubSelect(sel *SelectStmt) (*Program, error) {
+	if c.retWith != nil && c.retRow != nil && c.liveDB != nil {
+		if prog, done, err := c.returningWithSubSelect(sel); done {
+			return prog, err
+		}
+	}
 	if c.liveDB != nil && c.inWhere && c.liveRow == nil {
 		return c.liveWhereSubSelect(sel)
 	}

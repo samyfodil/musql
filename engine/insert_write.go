@@ -54,6 +54,10 @@ type insertStmt struct {
 	//
 	// logs 1, not the real table's count.
 	ctes []CTEDef
+	// leadingWith: selectStmt.CTEs is a WITH written before INSERT, which C
+	// scopes to the whole statement (its RETURNING included), not one the
+	// SELECT brought.
+	leadingWith bool
 
 	// orAction is the resolution algorithm named by an "INSERT OR ..."
 	// clause (or REPLACE INTO's implied conflictReplace), or the default
@@ -291,6 +295,7 @@ func parseInsertStmtTokens(p *parser, allowExprValues bool) (*insertStmt, error)
 		// merge them.
 		if len(sel.CTEs) == 0 {
 			sel.CTEs = leadingCTEs
+			stmt.leadingWith = len(leadingCTEs) > 0
 		}
 		stmt.selectStmt = sel
 	} else if p.peekIsKeyword("DEFAULT") {
@@ -388,6 +393,7 @@ func parseInsertStmtTokens(p *parser, allowExprValues bool) (*insertStmt, error)
 			}
 			if len(sel.CTEs) == 0 {
 				sel.CTEs = leadingCTEs
+				stmt.leadingWith = len(leadingCTEs) > 0
 			}
 			stmt.rows = nil
 			stmt.selectStmt = sel
