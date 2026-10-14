@@ -1117,7 +1117,11 @@ func (p *parser) parseValuesSelectCore() (*SelectStmt, error) {
 			}
 			col := SelectColumn{Expr: e, Alias: fmt.Sprintf("column%d", len(cols)+1), HasAlias: true}
 			inner, _ := skipCollateOnly(e)
-			if ce, ok := inner.(ColumnExpr); ok {
+			// Only a double-quoted name that can fall back to a string: one
+			// that may bind an outer column keeps "columnN", since naming it
+			// after itself lets the body resolve the reference to its own
+			// result column (with2.test).
+			if ce, ok := inner.(ColumnExpr); ok && ce.Qualifier == "" && ce.FallbackLiteral != nil && ce.FallbackLiteral.Typ == Text {
 				col.valuesIdent = ce.Name
 			}
 			cols = append(cols, col)
