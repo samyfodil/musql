@@ -2250,6 +2250,17 @@ func (p *ReadOnlyPager) cteSchemaColsIn(name string, b *cteBinding, outer *compi
 	if err != nil {
 		return nil, semanticf("%v", err)
 	}
+	if b.recursive != nil {
+		// The setup query alone named the columns; the whole compound decides
+		// their affinity.
+		affs := p.recursiveCTEAffinities(b, cols)
+		withAff := make([]columnInfo, len(cols))
+		for i, col := range cols {
+			col.Aff = affs[i]
+			withAff[i] = col
+		}
+		cols = withAff
+	}
 	if p.cteSelfRefLive == 0 {
 		b.schemaCols = cols
 	}
@@ -2325,7 +2336,14 @@ func (p *ReadOnlyPager) resolveGroupSource(c *compiler, state *joinDesugarState,
 		return joinSource{}, fmt.Errorf("%w: virtual table as a parenthesized join group's connector", errVDBEUnsupported)
 	}
 	if it.Subquery != nil {
-		return joinSource{}, fmt.Errorf("%w: derived table as a parenthesized join group's connector", errVDBEUnsupported)
+		// A subquery connector: its columns are its result's, learned by
+		// resolving it alone, as a throwaway pass like the view branch
+		// below. The internal span recursion resolves it for real.
+		cols, cerr := p.groupConnectorCols(c, it)
+		if cerr != nil {
+			return joinSource{}, cerr
+		}
+		return p.finishGroupSource(c, state, i, items, it, gl, &resolvedTable{cols: cols, ipkIndex: -1})
 	}
 	// A connector that is itself a materialized nested group (FromItem.NestedGroupSpan,
 	// x in "((t1 JOIN t2) AS x JOIN t2x ON x.b=t2x.b) AS y") has no table; its
@@ -2391,6 +2409,24 @@ func (p *ReadOnlyPager) resolveGroupSource(c *compiler, state *joinDesugarState,
 		}
 	}
 	return p.finishGroupSource(c, state, i, items, it, gl, tbl)
+}
+
+// groupConnectorCols resolves a group's connector on its own, detached from
+// its joins, for its columns, and puts back what resolving it counted.
+func (p *ReadOnlyPager) groupConnectorCols(c *compiler, it FromItem) ([]columnInfo, error) {
+	probe := it
+	probe.Join, probe.On, probe.Using, probe.Natural, probe.CrossKeyword = JoinCross, nil, nil, false, false
+	probe.GroupLen, probe.GroupAlias, probe.HasGroupAlias, probe.GroupRebuildID = 0, "", false, 0
+	restore := p.nfSnapshotCounts()
+	srcs, err := resolveJoinSources(p, &compiler{pager: p, outer: c.outer, rowOuter: c.rowOuter}, []FromItem{probe})
+	restore()
+	if err != nil {
+		return nil, err
+	}
+	if len(srcs) != 1 || srcs[0].tbl == nil || len(srcs[0].memberScopes) > 0 {
+		return nil, fmt.Errorf("%w: parenthesized join group connector of this kind", errVDBEUnsupported)
+	}
+	return srcs[0].tbl.cols, nil
 }
 
 // finishGroupSource is resolveGroupSource's connector-independent half: given

@@ -448,7 +448,7 @@ func parseUpdateStmtTokens(p *parser) (*updateStmt, error) {
 		// join shape a SELECT accepts is accepted here too. Execution
 		// (update_from.go) declines the genuinely-nondeterministic multi-match
 		// shape; see that file's doc comment.
-		items, err := p.parseFromClause(false)
+		items, _, err := p.parseFromClause(false)
 		if err != nil {
 			return nil, err
 		}

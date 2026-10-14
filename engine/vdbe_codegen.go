@@ -790,6 +790,11 @@ func enclosingTriggerCtx(outer *compiler) *trigCompileCtx {
 // compileSelectScan. Program.Correlated tells the caller whether to run it once
 // or per evaluation. An unservable body or correlation is errVDBEUnsupported.
 func compileSubProgram(pager *ReadOnlyPager, stmt *SelectStmt, outer *compiler) (*Program, error) {
+	bound, berr := pager.nfBindSelect(stmt, false)
+	if berr != nil {
+		return nil, berr
+	}
+	stmt = bound
 	// A subquery body may carry its own WITH clause; push its CTEs for the length
 	// of its compile, since a CTE FROM item binds at compile time
 	// (resolveCTESource).
@@ -2561,6 +2566,28 @@ func coalesceOwnersCombined(scopes []compileScope, s compileScope, lname string,
 // and "aux1.t4.a" bind to the right one of two scopes named t4. nil is safe;
 // with no schema it is never consulted.
 func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) (cursor, colIdx int, isRowid, found bool, fb coalesceFallbackRef, hard error) {
+	if x.coalesceOf != nil {
+		// C's coalesce() of a FULL JOIN's USING column: the first column,
+		// then each other one in order, all at this level.
+		first := x
+		first.coalesceOf = nil
+		cursor, colIdx, isRowid, found, _, hard = resolveInScopes(scopes, first, pager)
+		if !found || hard != nil || isRowid {
+			return cursor, colIdx, isRowid, found, fb, hard
+		}
+		for _, o := range *x.coalesceOf {
+			oc, oi, orow, ofound, _, oerr := resolveInScopes(scopes, o, pager)
+			if oerr != nil {
+				return 0, 0, false, false, fb, oerr
+			}
+			if !ofound || orow {
+				return 0, 0, false, false, fb, fmt.Errorf("%w: a FULL JOIN USING column whose operands are not all at one level", errVDBEUnsupported)
+			}
+			fb.owners = append(fb.owners, coalesceOwner{cursor: oc, colIdx: oi})
+		}
+		fb.has = len(fb.owners) > 0
+		return cursor, colIdx, false, true, fb, nil
+	}
 	lname := r33sFoldIdent(x.Name)
 	wantDBIdx, filterByDB := dbIdxForSchema(pager, x.Schema)
 
