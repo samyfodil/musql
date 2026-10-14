@@ -166,15 +166,24 @@ func TestR25AliasedJoinGroupFrontMove(t *testing.T) {
 		}
 	}
 
-	// Engine must still decline aliased spellings with "*".
+	// The aliased spellings with "*" are served now (the parenthesized-join
+	// binder, engine/nested_from_bind.go, ports the front-move) and must be
+	// C's answer, column order included.
 	for _, q := range []string{
 		`SELECT * FROM (ta JOIN td USING(b)) AS g`,
 		`SELECT * FROM (ta NATURAL JOIN td) AS g`,
 		`SELECT * FROM (ta NATURAL LEFT JOIN td NATURAL JOIN te) AS qq FULL JOIN tc ON true`,
 	} {
-		if _, _, eerr := p.QueryArgs(q, nil); eerr == nil {
-			t.Errorf("[%s] engine ANSWERED it; SQLite moves the coalesced column to the front, so answering in FROM order is a wrong answer", q)
+		cCols, cRows, cerr := cgoSelect(t, cdb, q, nil)
+		if cerr != nil {
+			t.Fatalf("[%s] oracle: %v", q, cerr)
 		}
+		eCols, eVals, eerr := p.QueryArgs(q, nil)
+		if eerr != nil {
+			t.Errorf("[%s] engine declined: %v", q, eerr)
+			continue
+		}
+		servedMatchesC(t, q, eCols, engineRowsToStrings(eVals), cCols, cRows)
 	}
 	// Queries without "*" shouldn't decline; coalesced column is not observable.
 	if _, _, eerr := p.QueryArgs(`SELECT g.a FROM (ta JOIN td USING(b)) AS g`, nil); eerr != nil {
