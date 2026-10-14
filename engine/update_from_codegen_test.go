@@ -371,12 +371,13 @@ func TestUpdateFromCompiledAnswers(t *testing.T) {
 			`WITH data(k,v) AS (VALUES(3,'thirty'),(1,'ten')) UPDATE t1 SET z=v FROM data WHERE x=k`,
 			`SELECT s FROM log`, []string{"one->ten", "three->thirty"}, ""},
 
-		// The ambiguous multi-match DECLINE, and the identical-tuple case that
-		// is NOT ambiguous (setValueTuplesEqual).
+		// A target row several FROM rows match takes the last one in plan
+		// order, as C's SRT_Upfrom overwrite does, and the identical-tuple case
+		// (setValueTuplesEqual).
 		{"multimatch-differs", []string{`CREATE TABLE t(k,v)`, `CREATE TABLE m(k,nv)`,
 			`INSERT INTO t VALUES(1,'a')`, `INSERT INTO m VALUES(1,'X'),(1,'Y')`},
 			`UPDATE t SET v=m.nv FROM m WHERE m.k=t.k`, `SELECT k,v FROM t`,
-			[]string{"1,a"}, "matched more than one FROM row"},
+			[]string{"1,Y"}, ""},
 		{"multimatch-identical", []string{`CREATE TABLE t(k,v)`, `CREATE TABLE m(k,nv)`,
 			`INSERT INTO t VALUES(1,'a')`, `INSERT INTO m VALUES(1,'X'),(1,'X')`},
 			`UPDATE t SET v=m.nv FROM m WHERE m.k=t.k`, `SELECT k,v FROM t`,
