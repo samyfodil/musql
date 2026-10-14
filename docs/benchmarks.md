@@ -178,35 +178,31 @@ p99 and max, and wrote 2.1x C's bytes. What changed:
 
 `bench/pointread/run` runs a short version (1M rows) and fails if musql
 loses on load, avg, p50, p99 or disk; CI runs it, and
-`POINTREAD_FULL=1 bench/pointread/run` is the full size. The gated run gives
-each reader its own `*sql.Conn` in both engines; the tables above, and the
-upstream shape, read through one shared `*sql.DB`, which `run` still reports.
+`POINTREAD_FULL=1 bench/pointread/run` is the full size. It gates two ways of
+reading, in both engines: every reader through one shared `*sql.DB` (the tables
+above, and the upstream shape), and each reader with its own `*sql.Conn`.
 
-Why the gate retains a connection per reader: with more readers than cores, the shared `*sql.DB` measures the pool, not
-the engine. Every `QueryRow` takes `database/sql`'s pool lock twice (`DB.conn`
+The shared `*sql.DB` was ungated until the driver's read gate
+(`driver/read_gate.go`). With more readers than cores it measured the pool, not
+the engine: every `QueryRow` takes `database/sql`'s pool lock twice (`DB.conn`
 and `putConn`), and `sync.Mutex.Unlock` does not hand the processor to the
-waiter it wakes: the waiter sits runnable while the goroutine that released the
-lock keeps running, and a musql read never blocks or makes a system call, so it
-keeps running until it is preempted or next blocks. A C read is a cgo call, and
-a cgo call that runs past ~20 us gives its processor to the next runnable
-goroutine, which is what keeps C's tail short there. On .10 pinned to 4 cores
-(`taskset -c 0-3`, `GOMAXPROCS=4`, the short run, 3 runs each):
+waiter it wakes. The waiter sat runnable while the goroutine that released the
+lock kept running, and a musql read never blocks or makes a system call, so it
+kept running until it next parked on that lock; a trace put 60% of the reads
+over 300 µs on such a wait. A C read is a cgo call, which gives its processor
+away when it runs long, and that kept C's tail short. The gate lets at most
+GOMAXPROCS pooled reads run at once and parks the rest on itself instead of
+leaving them runnable, so a reader that finds the pool lock held spins instead
+of parking and the waiting comes in rare, long turns. On .10 pinned to 4 cores
+(`taskset -c 4-7`, `GOMAXPROCS=4`, the short run, 3 runs each):
 
 | readers | mode | engine | reads/s | p50 | p99 | p99.9 |
 | --- | --- | --- | ---: | ---: | ---: | ---: |
-| 12 | shared `*sql.DB` | musql | 403-430k | 6.2 µs | 327-407 µs | 3.6-4.0 ms |
-| 12 | shared `*sql.DB` | C | 163-164k | 19.1 µs | 62-74 µs | 15.1-15.3 ms |
-| 12 | `*sql.Conn` per reader | musql | 385-455k | 5.2 µs | 32-36 µs | 3.9-5.0 ms |
-| 12 | `*sql.Conn` per reader | C | 164-169k | 17.1 µs | 48-52 µs | 14.6-15.1 ms |
-| 4 | shared `*sql.DB` | musql | 330-348k | 6.2 µs | 30-34 µs | 0.74-0.96 ms |
-| 4 | shared `*sql.DB` | C | 117-121k | 23.2 µs | 72-84 µs | 2.8-2.9 ms |
-
-A trace of the shared 12-reader run puts 60% of the reads over 300 µs on a
-block in `DB.conn` or `DB.putConn` that lasted about 2 µs, followed by about
-580 µs runnable while four other readers held the cores. So the gate times one
-retained `*sql.Conn` per reader (`-conn`) for both engines, and the shared run
-is still printed, ungated, beside it.
-
+| 12 | shared `*sql.DB` | musql, no gate | 545-597k | 4.2-4.4 µs | 414-441 µs | 1.8-2.3 ms |
+| 12 | shared `*sql.DB` | musql | 533-584k | 4.2-4.4 µs | 23-26 µs | 0.47-0.68 ms |
+| 12 | shared `*sql.DB` | C | 181-187k | 17.2-17.5 µs | 44-53 µs | 13.3-14.5 ms |
+| 12 | `*sql.Conn` per reader | musql | 677-700k | 3.2 µs | 22-25 µs | 2.6-2.8 ms |
+| 12 | `*sql.Conn` per reader | C | 183-186k | 16.2-16.4 µs | 43-46 µs | 12.2-13.5 ms |
 
 ## Notes
 
