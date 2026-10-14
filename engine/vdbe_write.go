@@ -3814,6 +3814,9 @@ func (m *vdbe) storeResolvingConflicts(plan *insertPlan, rowid uint64, full []Va
 	}
 	if bl := m.bulkLoadFor(plan); bl != nil {
 		stored, err := m.bulkStore(bl, tbl, rowid, full)
+		if stored && err == nil {
+			m.recGiveBack(full) // the load's cutter copied it (segCutter.own)
+		}
 		if err != nil || stored {
 			return stored, err
 		}
