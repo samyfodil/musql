@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/samyfodil/musql/engine"
@@ -31,6 +32,19 @@ type Conn struct {
 	// (Stmt.ExecContext builds its own), so the held-transaction path can hand
 	// back the shared discardedResult instead of allocating one per statement.
 	resultDiscarded bool
+
+	// The read gate's per-connection state (read_gate.go). pooledCheckout is
+	// set by ResetSession when database/sql hands this connection out of its
+	// pool. lease is whether the connection holds a slot and is in a statement
+	// with it; leaseSince is when it got the slot and leaseExit when its last
+	// gated statement ended. waitSince is when its reader started waiting for a
+	// slot (0 when it is not waiting), and gateCh is where it is handed one.
+	pooledCheckout bool
+	lease          atomic.Int32
+	leaseExit      atomic.Int64
+	leaseSince     int64
+	waitSince      int64
+	gateCh         chan bool
 
 	path string
 	// paramInfo caches engine.ParseParamInfo by SQL text. database/sql prepares
@@ -514,6 +528,7 @@ func mayBeScript(query string) bool {
 // Commit/Rollback, e.g. because it abandoned the *sql.Tx), discards it rather
 // than committing it.
 func (c *Conn) Close() error {
+	c.closeLease() // a read-gate slot this connection holds goes to a reader that can use it
 	// THE HELD SESSIONS -- main's and every ATTACHed database's -- are released
 	// here, and nothing did that before: closeSessions' predecessor existed
 	// and had no caller, so every connection left its segment mapping and its lock
@@ -2290,6 +2305,11 @@ func (c *Conn) queryArgs(sqlText string, args []engine.Value) (driver.Rows, erro
 		sdb, serr := c.sessionDB()
 		if serr != nil {
 			return nil, serr
+		}
+		// A read on a connection fresh from the pool runs inside the read gate
+		// (read_gate.go), which is what keeps a shared *sql.DB's tail short.
+		if g := c.enterReadGate(); g != nil {
+			defer g.leave(c)
 		}
 		pager, err := c.readPagerStamped(c.ndb)
 		if err != nil {

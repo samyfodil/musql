@@ -5,10 +5,8 @@
 #   bench/pointread/run                 # short: 1M rows, 12 x 20k reads, a few minutes
 #   POINTREAD_FULL=1 bench/pointread/run  # full: 10M rows, 12 x 50k reads
 #
-# The gated run gives each reader its own *sql.Conn (-conn), for both engines.
-# The same reads through one shared *sql.DB are reported too, ungated: with
-# more readers than cores, database/sql's pool lock and Go's scheduling set
-# that p99, not the engine (see README.md).
+# Both ways of reading are gated, for both engines: every reader through one
+# shared *sql.DB, and each reader with its own *sql.Conn (-conn).
 #
 # Full scale is heavy (minutes, GBs of RAM, ~0.5 GB of disk): run it on a server.
 set -euo pipefail
@@ -32,7 +30,9 @@ for mode in conn shared; do
 		"$work/$eng" ${args[@]+"${args[@]}"} ${flag[@]+"${flag[@]}"} -dir "$work/$mode-$eng" -json "$work/$mode-$eng.json"
 	done
 done
-echo "== shared *sql.DB (reported, not gated)"
-"$work/check" -report "$work/shared-musql.json" "$work/shared-c-sqlite.json"
-echo "== one *sql.Conn per reader (gated)"
-"$work/check" "$work/conn-musql.json" "$work/conn-c-sqlite.json"
+status=0
+echo "== shared *sql.DB"
+"$work/check" "$work/shared-musql.json" "$work/shared-c-sqlite.json" || status=1
+echo "== one *sql.Conn per reader"
+"$work/check" "$work/conn-musql.json" "$work/conn-c-sqlite.json" || status=1
+exit $status
