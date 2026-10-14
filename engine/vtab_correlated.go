@@ -97,12 +97,22 @@ func annotateVtabCorrelations(c *compiler, srcs []joinSource, plan joinPlan) {
 	if c == nil || len(plan.execOrder) != len(srcs) {
 		return
 	}
+	// A RIGHT/FULL JOIN's unmatched-row sweep needs the inner side's whole row
+	// set marked -- see this file's doc comment -- unless that side is itself
+	// a table-valued function whose arguments read the left side. C then
+	// builds the function's rows again for the sweep, with the left side
+	// NULL-extended (sqlite3WhereRightJoinLoop), and matches by rowid; such a
+	// source, when it is the statement's one RIGHT/FULL operand, is driven
+	// that way (rightJoinCorr).
+	rightTVF := -1
 	for i := range srcs {
-		if srcs[i].rightOuter {
-			// A RIGHT/FULL JOIN's unmatched-row sweep needs the inner side's
-			// whole row set marked -- see this file's doc comment.
+		if !srcs[i].rightOuter {
+			continue
+		}
+		if rightTVF >= 0 || srcs[i].vtabItem == nil || !srcs[i].vtabItem.TableFunc || !srcs[i].vtabDrivesBestIndex {
 			return
 		}
+		rightTVF = i
 	}
 	order := plan.execOrder
 	for level := 0; level < len(order); level++ {
@@ -132,6 +142,15 @@ func annotateVtabCorrelations(c *compiler, srcs []joinSource, plan joinPlan) {
 					terms = append(terms, vtabCorrTerm{arg: ai + 1, col: hidden[ai], op: VtabEQ, rhs: arg})
 				}
 			}
+		}
+		if origIdx == rightTVF {
+			if level > 0 && len(terms) > 0 {
+				srcs[origIdx].vtabCorr = terms
+			}
+			continue
+		}
+		if rightTVF >= 0 {
+			continue
 		}
 		if level == 0 || s.left {
 			if len(terms) > 0 {
@@ -163,6 +182,14 @@ func annotateVtabCorrelations(c *compiler, srcs []joinSource, plan joinPlan) {
 // constant, which folds standalone as before (foldVtabInputValue). Both leave
 // the argument on that fold, which refuses what it cannot answer.
 func tvfArgIsLateral(c *compiler, arg Expr, allowed map[int]bool) bool {
+	// A scalar subquery with no FROM of its own ("(SELECT t.json)") reads
+	// nothing but enclosing rows, so its result expression is what is lateral
+	// or not. The argument still compiles as the subquery.
+	if sq, ok := arg.(SubqueryExpr); ok && sq.Stmt != nil && len(sq.Stmt.From) == 0 && len(sq.Stmt.Compound) == 0 &&
+		len(sq.Stmt.CTEs) == 0 && len(sq.Stmt.Columns) == 1 && !sq.Stmt.Columns[0].Star && sq.Stmt.Where == nil &&
+		len(sq.Stmt.GroupBy) == 0 && sq.Stmt.Having == nil && sq.Stmt.Limit == nil && sq.Stmt.LimitParam == nil {
+		arg = sq.Stmt.Columns[0].Expr
+	}
 	if !walkExprShallow(arg, func(fc FuncExpr) bool {
 		return fc.Over == nil && fc.Filter == nil && len(fc.OrderBy) == 0 && !isAggregateCall(fc)
 	}) {
@@ -224,6 +251,6 @@ func (c *compiler) emitVtabCorrelatedOpen(srcs []joinSource, order []int, level 
 		terms[i] = t
 	}
 	c.emit(Instruction{Op: OpOpenDerived, P1: s.scope.cursor, P2: s.derivedSlot,
-		P4: &derivedSource{vtab: s.vtabItem, vtabTrig: c.trig, vtabCorr: terms, tbl: s.tbl, dbIdx: s.dbIdx}})
+		P4: &derivedSource{vtab: s.vtabItem, vtabTrig: c.trig, vtabCorr: terms, tbl: s.tbl, dbIdx: s.dbIdx, rightJoin: s.rightOuter}})
 	return nil
 }

@@ -126,6 +126,14 @@ type joinSource struct {
 	// cursor (vdbe_cursor.go). tbl is synthetic, with the output columns only.
 	derived     *Program
 	derivedSlot int
+	// rjSweepKey, set when the ported planner decided a RIGHT/FULL join
+	// (markWherePlanEligibility), is the order the unmatched-row sweep visits
+	// this item's rows in (rightJoinSweepKey).
+	rjSweepKey *autoIndexKey
+	// derivedNoFrom is set for a subquery or view body with an arm that has no
+	// FROM clause, which C's flattener never absorbs (flattenSubquery
+	// restrictions (7) and (17c)).
+	derivedNoFrom bool
 
 	// keepSubtype, for a subquery, view or CTE source, is the result columns
 	// whose subtype crosses into this query (flattenedSubtypeKeep); nil
@@ -823,7 +831,6 @@ func nestedColNamesInto(members []FromItem, scopes []*tableScope) {
 	}
 }
 
-
 // groupJoinCommonNames is the column names the join between members k and k+1
 // makes common: USING's list, or for NATURAL every name k+1 shares with any
 // member to its left (select.c:379). selectExpander adds one entry per name
@@ -1376,11 +1383,28 @@ func (p *ReadOnlyPager) resolveDerivedSource(c *compiler, state *joinDesugarStat
 		on:                           onExpr,
 		derived:                      prog,
 		derivedSlot:                  slot,
+		derivedNoFrom:                selectHasFromlessArm(it.Subquery),
 		derivedOrderProvable:         orderProvable,
 		derivedOrderNeedsOuterSafety: needsOuterSafety,
 	}, nil
 }
 
+// selectHasFromlessArm reports whether s, or any arm of its compound, has no
+// FROM clause.
+func selectHasFromlessArm(s *SelectStmt) bool {
+	if s == nil {
+		return false
+	}
+	if len(s.From) == 0 {
+		return true
+	}
+	for _, a := range s.Compound {
+		if a.Stmt == nil || len(a.Stmt.From) == 0 {
+			return true
+		}
+	}
+	return false
+}
 
 // fromlessArmOrderProvable reports whether arm has no FROM and no aggregate, so
 // it yields at most one row: there is no scan to order and nothing for an
@@ -1772,6 +1796,7 @@ func (p *ReadOnlyPager) resolveViewSource(c *compiler, state *joinDesugarState, 
 		on:                           onExpr,
 		derived:                      prog,
 		derivedSlot:                  slot,
+		derivedNoFrom:                pcv != nil && selectHasFromlessArm(pcv.selectStmt),
 		derivedOrderProvable:         orderProvable,
 		derivedOrderNeedsOuterSafety: needsOuterSafety,
 	}, nil
@@ -2158,6 +2183,17 @@ func (p *ReadOnlyPager) cteSchemaColsIn(name string, b *cteBinding, outer *compi
 	if err != nil {
 		return nil, semanticf("%v", err)
 	}
+	if b.recursive != nil {
+		// The setup query alone named the columns; the whole compound decides
+		// their affinity.
+		affs := p.recursiveCTEAffinities(b, cols)
+		withAff := make([]columnInfo, len(cols))
+		for i, col := range cols {
+			col.Aff = affs[i]
+			withAff[i] = col
+		}
+		cols = withAff
+	}
 	if p.cteSelfRefLive == 0 {
 		b.schemaCols = cols
 	}
@@ -2233,7 +2269,14 @@ func (p *ReadOnlyPager) resolveGroupSource(c *compiler, state *joinDesugarState,
 		return joinSource{}, fmt.Errorf("%w: virtual table as a parenthesized join group's connector", errVDBEUnsupported)
 	}
 	if it.Subquery != nil {
-		return joinSource{}, fmt.Errorf("%w: derived table as a parenthesized join group's connector", errVDBEUnsupported)
+		// A subquery connector: its columns are its result's, learned by
+		// resolving it alone, as a throwaway pass like the view branch
+		// below. The internal span recursion resolves it for real.
+		cols, cerr := p.groupConnectorCols(c, it)
+		if cerr != nil {
+			return joinSource{}, cerr
+		}
+		return p.finishGroupSource(c, state, i, items, it, gl, &resolvedTable{cols: cols, ipkIndex: -1})
 	}
 	// A connector that is itself a materialized nested group (FromItem.NestedGroupSpan,
 	// x in "((t1 JOIN t2) AS x JOIN t2x ON x.b=t2x.b) AS y") has no table; its
@@ -2301,6 +2344,24 @@ func (p *ReadOnlyPager) resolveGroupSource(c *compiler, state *joinDesugarState,
 	return p.finishGroupSource(c, state, i, items, it, gl, tbl)
 }
 
+// groupConnectorCols resolves a group's connector on its own, detached from
+// its joins, for its columns, and puts back what resolving it counted.
+func (p *ReadOnlyPager) groupConnectorCols(c *compiler, it FromItem) ([]columnInfo, error) {
+	probe := it
+	probe.Join, probe.On, probe.Using, probe.Natural, probe.CrossKeyword = JoinCross, nil, nil, false, false
+	probe.GroupLen, probe.GroupAlias, probe.HasGroupAlias, probe.GroupRebuildID = 0, "", false, 0
+	restore := p.nfSnapshotCounts()
+	srcs, err := resolveJoinSources(p, &compiler{pager: p, outer: c.outer, rowOuter: c.rowOuter}, []FromItem{probe})
+	restore()
+	if err != nil {
+		return nil, err
+	}
+	if len(srcs) != 1 || srcs[0].tbl == nil || len(srcs[0].memberScopes) > 0 {
+		return nil, fmt.Errorf("%w: parenthesized join group connector of this kind", errVDBEUnsupported)
+	}
+	return srcs[0].tbl.cols, nil
+}
+
 // finishGroupSource is resolveGroupSource's connector-independent half: given
 // the connector's columns (table, view or nested group), it desugars the
 // outward attachment, resolves the group's internal span recursively, and builds
@@ -2352,7 +2413,10 @@ func (p *ReadOnlyPager) finishGroupSource(c *compiler, state *joinDesugarState, 
 	// (span[0], above), so checkRebuiltJoinGroups' front-move census inside
 	// it has no way to prove a mismatch unobservable -- see the field's own
 	// doc comment (vdbe_codegen.go) and checkOneRebuiltGroup's (this file).
-	subC := &compiler{pager: p, groupSpanRecursion: true}
+	// The group is C's SF_NestedFrom subquery, whose names see the query
+	// enclosing c but not c's own FROM, as any FROM subquery's do: an ON inside
+	// it may read a correlated subquery's outer row.
+	subC := &compiler{pager: p, groupSpanRecursion: true, outer: derivedOuterBarrier(c)}
 	spanSrcs, serr := resolveJoinSources(p, subC, span)
 	if serr != nil {
 		return joinSource{}, serr
@@ -2417,6 +2481,10 @@ func (p *ReadOnlyPager) finishGroupSource(c *compiler, state *joinDesugarState, 
 	prog, perr := compileGroupBody(subC, spanSrcs, outCols)
 	if perr != nil {
 		return joinSource{}, perr
+	}
+	if prog.Correlated {
+		// As resolveDerivedSource: c reads its outer row through the group.
+		c.correlated = true
 	}
 
 	allCols := make([]columnInfo, 0, len(outCols))
@@ -2657,6 +2725,27 @@ func compileGroupBody(subC *compiler, spanSrcs []joinSource, outCols []outputCol
 	}, nil
 }
 
+// groupBodyMaterializesOnce reports whether s, a subquery or view inside a
+// parenthesized join group's body, is one C materializes once for the whole
+// statement. The group is C's SF_NestedFrom subquery, a select of its own over
+// the members. A RIGHT or FULL join among them sets JT_LTORJ on its first
+// item, and with no WHERE of its own nothing simplifies that join away, so no
+// member can be a co-routine (fromClauseTermCanBeCoroutine (3)). A body with a
+// FROM-less arm is never flattened, so it is materialized, under OP_Once when
+// it is not correlated: once per statement, however often the select around
+// the group runs.
+func groupBodyMaterializesOnce(c *compiler, srcs []joinSource, s joinSource) bool {
+	if c == nil || !c.groupSpanRecursion || s.derived == nil || s.derived.Correlated || !s.derivedNoFrom || len(s.memberScopes) > 0 {
+		return false
+	}
+	for _, o := range srcs[1:] {
+		if o.rightOuter {
+			return true
+		}
+	}
+	return false
+}
+
 // onsOfSources extracts srcs' effective join conditions (each already
 // desugared from USING/NATURAL, if applicable, by resolveJoinSources) in FROM
 // order -- the []Expr shape checkFromSupported (join.go) takes, mirroring
@@ -2849,7 +2938,11 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 	for i, s := range srcs {
 		if s.derived != nil {
 			ds := &derivedSource{prog: s.derived, tbl: s.tbl, dbIdx: s.dbIdx, keepSubtype: s.keepSubtype, lazy: true, rerun: s.coroutineRerun}
-			if i == streamDerived {
+			if groupBodyMaterializesOnce(c, srcs, s) {
+				// A RIGHT/FULL group member is never a co-routine
+				// (fromClauseTermCanBeCoroutine), so C materializes it once.
+				ds.stmtOnce, ds.rerun = true, false
+			} else if i == streamDerived {
 				ds.stream = streamIfYielding
 				if s.cteCoroutine {
 					ds.stream = streamCoroutine // see the CTE case below
@@ -3075,6 +3168,23 @@ func (c *compiler) emitRightOuterSweep(srcs []joinSource, plan joinPlan, order [
 			}
 		}
 		others = append(others, srcs[order[i]].scope.cursor)
+	}
+	if s := srcs[order[level]]; len(s.vtabCorr) > 0 {
+		// A table-valued function reading the left side: C builds its rows
+		// again for the sweep with that side NULL-extended
+		// (sqlite3WhereRightJoinLoop), and the rows it matched are known by
+		// rowid.
+		for _, oc := range others {
+			c.emit(Instruction{Op: OpNullRow, P1: oc})
+		}
+		if err := c.emitVtabCorrelatedOpen(srcs, order, level, s); err != nil {
+			return err
+		}
+	}
+	if k := srcs[order[level]].rjSweepKey; k != nil {
+		// The sweep visits the table in the order its own plan walks it
+		// (rightJoinSweepKey), which need not be the main loop's.
+		c.emit(Instruction{Op: OpRightJoinSweepOrder, P1: cur, P4: k})
 	}
 	rewindJump := c.emit(Instruction{Op: OpRightJoinSweepRewind, P1: cur, P4: others})
 	loopAddr := c.here()

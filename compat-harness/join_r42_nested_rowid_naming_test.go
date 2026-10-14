@@ -101,14 +101,20 @@ func TestR42NestedRowidNamingDeclines(t *testing.T) {
 		{`SELECT q3.rowid FROM q1 JOIN ((q2 JOIN q3) JOIN q4)`, false},
 		{`SELECT q4.rowid FROM q1 JOIN ((q2 JOIN q3) JOIN q4)`, false},
 	} {
-		declined, _, oracleErr, detail := cmp(tc.q)
+		declined, agrees, oracleErr, detail := cmp(tc.q)
 		if (oracleErr != nil) != tc.oracleErrs {
 			t.Errorf("[%s] the ORACLE changed: oracleErrs=%v, want %v (err=%v) -- re-measure before trusting the decline",
 				tc.q, oracleErr != nil, tc.oracleErrs, oracleErr)
 			continue
 		}
-		if !declined {
-			t.Errorf("[%s] the engine ANSWERED it; this shape needs a SQLite \":N\"-style suffix (or, for a 2-layer nesting, isn't resolvable at all) that this engine does not attempt to reproduce (%s)", tc.q, detail)
+		// The parenthesized-join binder (engine/nested_from_bind.go) ports
+		// C's ":N" naming, so the one-layer shapes are served now; an answer
+		// must be C's, and where C refuses the engine must refuse too.
+		if tc.oracleErrs && !declined {
+			t.Errorf("[%s] the engine ANSWERED a statement C SQLite rejects (%s)", tc.q, detail)
+		}
+		if !tc.oracleErrs && !declined && !agrees {
+			t.Errorf("[%s] answered but DIVERGES from C SQLite: %s", tc.q, detail)
 		}
 	}
 }

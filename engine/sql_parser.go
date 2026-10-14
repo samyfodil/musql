@@ -54,6 +54,11 @@ type parser struct {
 	// their own FROM list, never the enclosing one).
 	groupRebuildSeq int
 
+	// cLeafSeq hands out FromItem.cID: one per table, subquery or
+	// table-function item, so the FROM tree C's parser would build
+	// (SelectStmt.cFrom) can name its leaves.
+	cLeafSeq int
+
 	// allowUnknownCollation suppresses parseCollate's rejection of an unimplemented
 	// collation name; unknownCollations counts the ones let through. Set only by
 	// parseSelectAllowingInertCollation (collate_inert.go), which keeps the result
@@ -773,11 +778,12 @@ func (p *parser) parseSelectCore() (*SelectStmt, error) {
 		// statement's FromParenthesized, and vice-versa.
 		savedParen, savedNested := p.fromParen, p.fromNestedParen
 		p.fromParen, p.fromNestedParen = false, false
-		items, err := p.parseFromClause(true) // the statement's own FROM clause always starts leading
+		items, nodes, err := p.parseFromClause(true) // the statement's own FROM clause always starts leading
 		if err != nil {
 			return nil, err
 		}
 		stmt.From = items
+		stmt.cFrom = nodes
 		markRebuiltGroupStars(stmt.Columns, stmt.From)
 		stmt.FromParenthesized = p.fromParen
 		stmt.FromNestedParenJoin = p.fromNestedParen
@@ -1642,10 +1648,10 @@ func (p *parser) peekLeadingJoinConstraint() (kw string, ok bool) {
 // Parenthesized subtrees with outer joins are kept atomic (checkFlattenSafe).
 // leading is true only for a FROM clause's own first element; it feeds
 // FromItem.NestedNonLeading and nothing else.
-func (p *parser) parseFromClause(leading bool) ([]FromItem, error) {
-	first, err := p.parseFromElement(leading)
+func (p *parser) parseFromClause(leading bool) ([]FromItem, []cSrcNode, error) {
+	first, nodes, err := p.parseFromElement(leading)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// The first element has an ON/USING slot too (parse.y's seltablist, empty
 	// stl_prefix), and the parser shifts an adjacent ON into it; sqlite3ProcessJoin
@@ -1656,7 +1662,7 @@ func (p *parser) parseFromClause(leading bool) ([]FromItem, error) {
 	// to every table-reference list, including parenthesized groups and
 	// UPDATE ... FROM.
 	if kw, isCon := p.peekLeadingJoinConstraint(); isCon {
-		return nil, fmt.Errorf("engine: a JOIN clause is required before %s", kw)
+		return nil, nil, fmt.Errorf("engine: a JOIN clause is required before %s", kw)
 	}
 	checkFlattenSafe(first, leading)
 	items := first
@@ -1664,17 +1670,18 @@ func (p *parser) parseFromClause(leading bool) ([]FromItem, error) {
 	for {
 		if p.peekIsPunct(",") {
 			p.next()
-			elems, err := p.parseFromElement(false) // reached via ",": never leading
+			elems, elemNodes, err := p.parseFromElement(false) // reached via ",": never leading
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			elems[0].Join = JoinCross
 			// A comma join takes ON/USING too ("FROM t1, t2 ON t1.b=t2.b" equals
 			// "t1 JOIN t2 ON ..."); in "FROM t1, t2, t3 ON ..." it binds to the last comma,
 			// which parsing it against the element just read reproduces.
 			if err := p.parseJoinConstraint(&elems[0], JoinCross, false); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
+			nodes = append(nodes, elemNodes[0].joined(elems[0]))
 			checkFlattenSafe(elems, false)
 			items = append(items, elems...)
 			continue
@@ -1682,15 +1689,15 @@ func (p *parser) parseFromClause(leading bool) ([]FromItem, error) {
 
 		kind, natural, matched, err := p.tryParseJoinKind()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if !matched {
 			break
 		}
 
-		elems, err := p.parseFromElement(false) // reached via a join operator: never leading
+		elems, elemNodes, err := p.parseFromElement(false) // reached via a join operator: never leading
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		item := &elems[0]
 		item.Join = kind
@@ -1702,13 +1709,14 @@ func (p *parser) parseFromClause(leading bool) ([]FromItem, error) {
 		item.CrossKeyword = kind == JoinCross
 
 		if err := p.parseJoinConstraint(item, kind, natural); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
+		nodes = append(nodes, elemNodes[0].joined(*item))
 		checkFlattenSafe(elems, false)
 		items = append(items, elems...)
 	}
-	return items, nil
+	return items, nodes, nil
 }
 
 // checkFlattenSafe validates a FROM element flattened from a parenthesized join
@@ -1772,7 +1780,7 @@ func checkFlattenSafe(elems []FromItem, leading bool) {
 //
 // leading is passed from parseFromClause. When false and the element is a
 // subtree, every resulting item is marked NestedNonLeading.
-func (p *parser) parseFromElement(leading bool) ([]FromItem, error) {
+func (p *parser) parseFromElement(leading bool) ([]FromItem, []cSrcNode, error) {
 	if p.peekIsPunct("(") {
 		p.fromParen = true
 		// A derived table's body is a full select-statement: "(SELECT ...)",
@@ -1787,9 +1795,9 @@ func (p *parser) parseFromElement(leading bool) ([]FromItem, error) {
 		if next.kind == tkIdent && (next.upper() == "SELECT" || next.upper() == "WITH" || next.upper() == "VALUES") {
 			item, err := p.parseDerivedTable()
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			return []FromItem{item}, nil
+			return []FromItem{item}, []cSrcNode{{leaf: item.cID}}, nil
 		}
 		// Parenthesized join subtree: "( <table-ref-list> )". A paren-join
 		// opened while already inside one is a NESTED parenthesized join --
@@ -1805,18 +1813,20 @@ func (p *parser) parseFromElement(leading bool) ([]FromItem, error) {
 		// outer leading double-counted a splicing inner paren ("q1 JOIN ((q2 JOIN q3)
 		// JOIN q4)" has one SF_NestedFrom layer). NestedNonLeading and GroupRebuildID
 		// are stamped over the whole flattened content below either way.
-		inner, err := p.parseFromClause(true)
+		inner, innerNodes, err := p.parseFromClause(true)
 		p.parenJoinDepth--
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if err := p.expectPunct(")"); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if !leading {
+		if !leading && (len(inner) > 1 || inner[0].NestedGroupSpan != nil) {
 			// Reached via a comma or join operator: mark every resolved item (at any
 			// depth) NestedNonLeading, and give the whole group one ID, overwriting nested
-			// ones so the outermost group wins (FromItem.NestedGroupID).
+			// ones so the outermost group wins (FromItem.NestedGroupID). One table in
+			// parentheses is that table again in C (parse.y's nSrc==1 branch), not a
+			// subquery, so it is left an ordinary item.
 			p.nestedGroupSeq++
 			for i := range inner {
 				inner[i].NestedNonLeading = true
@@ -1839,9 +1849,22 @@ func (p *parser) parseFromElement(leading bool) ([]FromItem, error) {
 			opaque := FromItem{Alias: inner[0].GroupAlias, NestedGroupSpan: append([]FromItem(nil), inner[:innerLen]...)}
 			inner = append([]FromItem{opaque}, inner[innerLen:]...)
 		}
+		// An aliased group later in the paren is collapsed the same way; the
+		// stand-in takes over how the group joins what precedes it.
+		for k := 1; k < len(inner); k++ {
+			if inner[k].GroupAlias == "" || inner[k].GroupLen <= 0 || k+inner[k].GroupLen > len(inner) {
+				continue
+			}
+			innerLen := inner[k].GroupLen
+			span := append([]FromItem(nil), inner[k:k+innerLen]...)
+			opaque := FromItem{Alias: span[0].GroupAlias, NestedGroupSpan: span,
+				Join: span[0].Join, On: span[0].On, Using: span[0].Using, Natural: span[0].Natural, CrossKeyword: span[0].CrossKeyword}
+			span[0].Join, span[0].On, span[0].Using, span[0].Natural, span[0].CrossKeyword = JoinCross, nil, nil, false, false
+			inner = append(append(inner[:k:k], opaque), inner[k+innerLen:]...)
+		}
 		for i := range inner {
 			if inner[i].GroupAlias != "" {
-				return nil, fmt.Errorf("engine: unsupported: parenthesized join group alias %q re-wrapped in further parentheses", inner[i].GroupAlias)
+				return nil, nil, fmt.Errorf("engine: unsupported: parenthesized join group alias %q re-wrapped in further parentheses", inner[i].GroupAlias)
 			}
 		}
 		// "( <one table-ref> ) [AS] alias" moves the alias onto that element (parse.y's
@@ -1856,8 +1879,9 @@ func (p *parser) parseFromElement(leading bool) ([]FromItem, error) {
 		// non-leading position, triggers the rebuild).
 		alias, hasAlias, aerr := p.tryParseFromAlias()
 		if aerr != nil {
-			return nil, aerr
+			return nil, nil, aerr
 		}
+		nodes := cParenNodes(innerNodes, leading, alias, hasAlias)
 		if len(inner) == 1 {
 			// parse.y:777-816: a leading one-element term with no alias is spliced in
 			// unchanged, keeping its inner alias. Anywhere else it is rebuilt carrying only
@@ -1882,7 +1906,7 @@ func (p *parser) parseFromElement(leading bool) ([]FromItem, error) {
 					inner[0].NestedGroupSpan[i].GroupAlias = ""
 				}
 			}
-			return inner, nil
+			return inner, nodes, nil
 		}
 		if hasAlias || !leading {
 			// Rule 115 splices a group in flat only when it is leading AND
@@ -1907,13 +1931,13 @@ func (p *parser) parseFromElement(leading bool) ([]FromItem, error) {
 				inner[i].GroupAlias = alias
 			}
 		}
-		return inner, nil
+		return inner, nodes, nil
 	}
 	item, err := p.parseTableRef()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return []FromItem{item}, nil
+	return []FromItem{item}, []cSrcNode{{leaf: item.cID}}, nil
 }
 
 // parseDerivedTable parses a derived table: "( SELECT ... )" followed by an
@@ -1934,7 +1958,8 @@ func (p *parser) parseDerivedTable() (FromItem, error) {
 	if err := p.expectPunct(")"); err != nil {
 		return FromItem{}, err
 	}
-	item := FromItem{Subquery: sub}
+	p.cLeafSeq++
+	item := FromItem{Subquery: sub, cID: p.cLeafSeq}
 	alias, ok, err := p.tryParseFromAlias()
 	if err != nil {
 		return FromItem{}, err
@@ -2112,7 +2137,8 @@ func (p *parser) parseTableRef() (FromItem, error) {
 	if !ok {
 		return FromItem{}, fmt.Errorf("engine: expected table name, got %q", p.tokenDesc(tbl))
 	}
-	item := FromItem{Table: tblName}
+	p.cLeafSeq++
+	item := FromItem{Table: tblName, cID: p.cLeafSeq}
 	// An optional database qualifier: "schema.table" (e.g. "main.t", "aux.t").
 	// The first identifier becomes the Schema; the identifier after the dot is
 	// the actual table name. resolveFrom (join.go) validates the qualifier

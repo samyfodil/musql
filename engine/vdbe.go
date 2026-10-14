@@ -68,6 +68,12 @@ type vdbe struct {
 	// filled by the first one to run (runCTEOnce). Read and written on the
 	// outermost machine only.
 	cteRows map[*cteBinding][][]Value
+	// stmtOnceRows holds the rows of each derivedSource.stmtOnce body, by
+	// program, on the statement's root machine (stmtRoot).
+	stmtOnceRows map[*Program][][]Value
+	// rjMatched holds, per cursor, the rowids a correlated RIGHT/FULL JOIN
+	// operand matched (derivedSource.rightJoin), across its rebuilds.
+	rjMatched map[int]map[uint64]bool
 	// cteRoot is the machine of the statement this uncorrelated sub-program
 	// belongs to (newMachine); nil on the statement's own machine.
 	cteRoot *vdbe
@@ -340,6 +346,25 @@ func (m *vdbe) runSubOnce(slot int, prog *Program, pager *ReadOnlyPager) ([][]Va
 	}
 	e.rows = rows
 	e.done = true
+	return rows, nil
+}
+
+// runStmtOnce is runSubOnce for a derivedSource.stmtOnce body: its rows are
+// kept on the statement's root machine, so every run of the program holding
+// the source reads the first one's.
+func (m *vdbe) runStmtOnce(slot int, prog *Program, pager *ReadOnlyPager) ([][]Value, error) {
+	root := m.stmtRoot()
+	if rows, ok := root.stmtOnceRows[prog]; ok {
+		return rows, nil
+	}
+	rows, err := m.runSubOnce(slot, prog, pager)
+	if err != nil {
+		return nil, err
+	}
+	if root.stmtOnceRows == nil {
+		root.stmtOnceRows = map[*Program][][]Value{}
+	}
+	root.stmtOnceRows[prog] = rows
 	return rows, nil
 }
 
@@ -635,16 +660,9 @@ func autoIndexOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) 
 	if key == nil || len(key.cols) == 0 || len(cur.rowids) != len(cur.rows) || len(cur.rows) < 2 {
 		return
 	}
-	at := func(i, kc int) Value {
-		if kc < 0 {
-			// The trailing XN_ROWID column. Compared as the signed integer
-			// OpRowid reports, which is how the b-tree orders it.
-			return Value{Typ: Int, I: int64(cur.rowids[i])}
-		}
-		if row := cur.rows[i]; kc < len(row) {
-			return row[kc]
-		}
-		return Value{Typ: Null}
+	at, ok := autoIndexKeyValues(cur, key)
+	if !ok {
+		return
 	}
 	perm := make([]int, len(cur.rows))
 	for i := range perm {
@@ -656,8 +674,8 @@ func autoIndexOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) 
 	nk := len(key.cols)
 	flat := make([]int64, 0, len(perm)*nk)
 	for i := range perm {
-		for _, kc := range key.cols {
-			v := at(i, kc)
+		for k := range key.cols {
+			v := at(i, k)
 			if v.Typ != Int {
 				flat = nil
 				break
@@ -700,13 +718,103 @@ func autoIndexOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) 
 	cur.rows, cur.rowids = rows, rowids
 }
 
+// autoIndexKeyValues returns the value of key column k for the cursor's row i:
+// the row's column, the rowid for the trailing XN_ROWID column, or for an
+// XN_EXPR column the index expression computed from that row, which is what the
+// index stores and so what its walk is ordered by. Expression values are
+// computed once per row up front. ok is false when an expression key column has
+// no program or fails on a row: the walk's order is then unknown, and the
+// cursor is left as it is.
+func autoIndexKeyValues(cur *vdbeCursor, key *autoIndexKey) (at func(i, k int) Value, ok bool) {
+	var exprVals [][]Value // [k][row], only for xnExpr positions
+	for k, kc := range key.cols {
+		if kc != xnExpr {
+			continue
+		}
+		if k >= len(key.exprs) || key.exprs[k] == nil || cur.tbl == nil {
+			return nil, false
+		}
+		if exprVals == nil {
+			exprVals = make([][]Value, len(key.cols))
+		}
+		scope := tableScope{name: cur.tbl.name, cols: cur.tbl.cols, colIndex: buildColIndex(cur.tbl.cols), noRowid: cur.tbl.withoutRowid}
+		vals := make([]Value, len(cur.rows))
+		for i, row := range cur.rows {
+			if len(row) < len(cur.tbl.cols) {
+				padded := make([]Value, len(cur.tbl.cols))
+				copy(padded, row)
+				row = padded
+			}
+			ctx := &evalCtx{tables: []tableScope{scope}, vals: row, rowids: []Value{{Typ: Int, I: int64(cur.rowids[i])}}, pager: cur.pager, params: cur.params}
+			v, err := key.exprs[k].eval(ctx)
+			if err != nil {
+				return nil, false
+			}
+			vals[i] = v
+		}
+		exprVals[k] = vals
+	}
+	return func(i, k int) Value {
+		kc := key.cols[k]
+		if kc == xnExpr {
+			return exprVals[k][i]
+		}
+		if kc < 0 {
+			// The trailing XN_ROWID column. Compared as the signed integer
+			// OpRowid reports, which is how the b-tree orders it.
+			return Value{Typ: Int, I: int64(cur.rowids[i])}
+		}
+		if row := cur.rows[i]; kc < len(row) {
+			return row[kc]
+		}
+		return Value{Typ: Null}
+	}, true
+}
+
+// sweepOrderCursor is autoIndexOrderCursor for a RIGHT/FULL join operand
+// before its unmatched-row sweep: the rows move into key order together with
+// the matched marks the main loop left on them. false when the key cannot be
+// computed.
+func sweepOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) bool {
+	cur.normalizeRowsNow()
+	if len(cur.rowids) != len(cur.rows) {
+		return false
+	}
+	if len(cur.rows) < 2 {
+		return true
+	}
+	at, ok := autoIndexKeyValues(cur, key)
+	if !ok {
+		return false
+	}
+	perm := make([]int, len(cur.rows))
+	for i := range perm {
+		perm[i] = i
+	}
+	autoIndexSortValues(perm, key, at, enc)
+	rows := make([][]Value, len(perm))
+	rowids := make([]uint64, len(perm))
+	var matched []bool
+	if cur.matched != nil {
+		matched = make([]bool, len(perm))
+	}
+	for i, p := range perm {
+		rows[i], rowids[i] = cur.rows[p], cur.rowids[p]
+		if matched != nil && p < len(cur.matched) {
+			matched[i] = cur.matched[p]
+		}
+	}
+	cur.rows, cur.rowids, cur.matched = rows, rowids, matched
+	return true
+}
+
 // autoIndexSortValues is autoIndexOrderCursor's sort over keys that are not
 // all integers: each comparison fetches the values and compares them under
 // their columns' collating sequences.
-func autoIndexSortValues(perm []int, key *autoIndexKey, at func(i, kc int) Value, enc TextEncoding) {
+func autoIndexSortValues(perm []int, key *autoIndexKey, at func(i, k int) Value, enc TextEncoding) {
 	slices.SortFunc(perm, func(a, b int) int {
-		for k, kc := range key.cols {
-			c := compareValuesCollatedEnc(at(a, kc), at(b, kc), key.colls[k], enc)
+		for k := range key.cols {
+			c := compareValuesCollatedEnc(at(a, k), at(b, k), key.colls[k], enc)
 			if c != 0 {
 				if k < len(key.desc) && key.desc[k] {
 					// A DESC key column: the b-tree stores it reversed, so the
@@ -1958,6 +2066,15 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 						return nil, verr
 					}
 					m.cursors[op.P1] = openMaterializedCursor(ds.tbl, rows, rowids)
+					if ds.rightJoin {
+						m.cursors[op.P1].rjByRowid = true
+						if m.rjMatched == nil {
+							m.rjMatched = map[int]map[uint64]bool{}
+						}
+						if m.rjMatched[op.P1] == nil {
+							m.rjMatched[op.P1] = map[uint64]bool{}
+						}
+					}
 					break
 				}
 				slot := op.P2
@@ -2041,6 +2158,10 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				// (vdbeCursor.fill).
 				slot, prog := op.P2, ds.prog
 				m.cursors[op.P1] = openFillCursor(ds.tbl, func() ([][]Value, []int64, error) {
+					if ds.stmtOnce {
+						rows, err := m.runStmtOnce(slot, prog, srcPager)
+						return rows, nil, err
+					}
 					if !prog.Correlated {
 						rows, err := m.runSubOnce(slot, prog, srcPager)
 						return rows, nil, err
@@ -2221,7 +2342,23 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			m.cursors[op.P1].nullRow()
 
 		case OpRightJoinMark:
-			m.cursors[op.P1].markMatched()
+			if cur := m.cursors[op.P1]; cur.rjByRowid {
+				m.rjMatched[op.P1][cur.rowid] = true
+			} else {
+				cur.markMatched()
+			}
+
+		case OpRightJoinSweepOrder:
+			cur := m.cursors[op.P1]
+			if !cur.materialized {
+				if rerr := cur.rewind(); rerr != nil {
+					return nil, rerr
+				}
+			}
+			cur.params = m.params
+			if !sweepOrderCursor(cur, op.P4.(*autoIndexKey), m.encoding()) {
+				return nil, fmt.Errorf("vdbe: the RIGHT JOIN sweep order could not be computed")
+			}
 
 		case OpRightJoinSweepRewind:
 			cur := m.cursors[op.P1]
@@ -2233,7 +2370,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 					return nil, rerr
 				}
 			}
-			if !cur.sweepUnmatchedFrom(0) {
+			if !cur.sweepUnmatchedFrom(0, m.rjMatched[op.P1]) {
 				pc = op.P2
 				continue
 			}
@@ -2243,7 +2380,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpRightJoinSweepNext:
 			cur := m.cursors[op.P1]
-			if cur.sweepUnmatchedFrom(cur.pos + 1) {
+			if cur.sweepUnmatchedFrom(cur.pos+1, m.rjMatched[op.P1]) {
 				for _, oc := range op.P4.([]int) {
 					m.cursors[oc].nullRow()
 				}

@@ -138,14 +138,17 @@ func TestR26RebuiltGroupDeclines(t *testing.T) {
 		// is what checkOneRebuiltGroup keys this distinction on now.
 		// TestR28NNestedFromQualifiedStar pins both directions.
 	} {
-		declined, _, oracleErr, detail := cmp(tc.q)
+		declined, agrees, oracleErr, detail := cmp(tc.q)
 		if (oracleErr != nil) != tc.oracleErrs {
 			t.Errorf("[%s] the ORACLE changed: oracleErrs=%v, want %v (err=%v) -- re-measure before trusting the decline",
 				tc.q, oracleErr != nil, tc.oracleErrs, oracleErr)
 			continue
 		}
-		if !declined {
-			t.Errorf("[%s] the engine ANSWERED it; SQLite rebuilds this group's column list and this engine emits FROM order (%s)", tc.q, detail)
+		// The parenthesized-join binder (engine/nested_from_bind.go) rebuilds
+		// the group's column list as C does, so these are served now; an
+		// answer must be C's, a decline is still clean.
+		if !declined && !agrees {
+			t.Errorf("[%s] answered but DIVERGES from C SQLite: %s", tc.q, detail)
 		}
 	}
 }

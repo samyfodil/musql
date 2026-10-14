@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 )
 
 // distinctCollations returns the collation DISTINCT dedups each output column
@@ -90,6 +91,11 @@ func compileSelectScanRow(p *ReadOnlyPager, stmt *SelectStmt, outer *compiler, r
 	if err != nil && len(box.specs) > 0 {
 		prog, err = compileScanAttempt(p, stmt, outer, rowOuter, &hoistBox{}, box.specs)
 	}
+	if err != nil {
+		if nerr := p.resultListNameError(stmt, outer, rowOuter); nerr != nil {
+			err = nerr
+		}
+	}
 	if err == nil {
 		// The JIT peepholes over the finished program (segment_peephole.go), each
 		// leaving it untouched when it does not match. They read different
@@ -119,6 +125,31 @@ func compileSelectScanRow(p *ReadOnlyPager, stmt *SelectStmt, outer *compiler, r
 		skipLimitZeroBody(stmt, prog)
 	}
 	return prog, err
+}
+
+// resultListNameError is the error C reports for stmt when its result list
+// names a column that does not resolve: resolveSelectStep resolves the result
+// list before HAVING, WHERE, GROUP BY and ORDER BY, so that name is the one
+// reported, wherever else another one fails. It compiles the result list over
+// the same FROM on its own, as a throwaway, and returns its name error, or nil.
+// Called only once the statement has failed.
+func (p *ReadOnlyPager) resultListNameError(stmt *SelectStmt, outer *compiler, rowOuter *evalCtx) error {
+	if p == nil || len(stmt.Compound) > 0 || len(stmt.From) == 0 ||
+		(stmt.Where == nil && len(stmt.GroupBy) == 0 && stmt.Having == nil && len(stmt.OrderBy) == 0) {
+		return nil
+	}
+	s := *stmt
+	s.Where, s.GroupBy, s.Having, s.OrderBy = nil, nil, nil, nil
+	restore := p.nfSnapshotCounts()
+	_, err := compileScanAttempt(p, &s, outer, rowOuter, &hoistBox{}, nil)
+	restore()
+	if err == nil || errors.Is(err, errVDBEUnsupported) {
+		return nil
+	}
+	if msg := err.Error(); strings.Contains(msg, "no such column:") || strings.Contains(msg, "ambiguous column name:") {
+		return err
+	}
+	return nil
 }
 
 // skipLimitZeroBody makes a select with a literal LIMIT 0 do nothing at run
@@ -253,6 +284,14 @@ func compileScanAttempt(p *ReadOnlyPager, stmt *SelectStmt, outer *compiler, row
 	shareSelfJoinViews(p, c, srcs, stmt)
 	if err := markCoroutineReruns(p, c, srcs, stmt); err != nil {
 		return nil, err
+	}
+	if len(stmt.GroupBy) == 0 && !stmt.Distinct && len(stmt.OrderBy) == 0 && stmt.Having == nil &&
+		!selectIsAggregateQuery(stmt) && !selectHasWindow(stmt) && wherePlanIndexOrderDecided(p, c, srcs, stmt) {
+		defer func() {
+			if err == nil && prog != nil {
+				prog.orderDecided = true
+			}
+		}()
 	}
 	planExistsJoinTerms(p, c, srcs, stmt)
 	markCTECoroutine(stmt, srcs)

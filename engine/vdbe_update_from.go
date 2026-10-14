@@ -96,6 +96,10 @@ type upfromDest struct {
 	// row: 1 (its rowid) for an ordinary table, len(pkIndex.colIdx) for a
 	// WITHOUT ROWID one. See buildUpdateFromSelect.
 	nkey int
+	// lastWins: pass one's rows come in C's plan order (Program.orderDecided)
+	// into a rowid-keyed ephemeral table, so of several rows matching one
+	// target row the last is kept, as OP_Insert overwrites.
+	lastWins bool
 }
 
 // collapseUpfromRows turns pass one's join rows into the ephemeral table pass
@@ -126,6 +130,10 @@ func collapseUpfromRows(d *upfromDest, rows [][]Value) ([]int64, [][]Value, erro
 		}
 		setVals := row[d.nkey:]
 		if i, dup := at[rowid]; dup {
+			if d.lastWins {
+				vals[i] = setVals
+				continue
+			}
 			if !setValueTuplesEqual(vals[i], setVals) {
 				return nil, nil, fmt.Errorf("engine: UPDATE %s: a target row matched more than one FROM row; UPDATE ... FROM with an ambiguous (multi-match) join is not supported by this write path (C SQLite's choice of matching row is undefined)", d.displayName)
 			}
@@ -238,7 +246,19 @@ func (db *DB) compileUpdateFromSource(stmt *updateStmt, tbl *tableMeta, trig *tr
 		prog:   prog,
 		tbl:    &resolvedTable{cols: srcCols, ipkIndex: -1},
 		pager:  pager,
-		upfrom: &upfromDest{tbl: tbl, displayName: stmt.table, nkey: nkey},
+		upfrom: &upfromDest{tbl: tbl, displayName: stmt.table, nkey: nkey, lastWins: upfromLastWins(sel, prog, tbl)},
 	}
 	return src, progPager, nil
+}
+
+// upfromLastWins reports whether pass one's rows come in C's order, so the
+// last of several matching one target row is the one C keeps. C's SrcList is
+// the target, then the FROM clause (wrapped in an SF_NestedFrom subquery when
+// it has two or more items, which the flattener splices back): the engine's
+// list is the same only where it puts the target first (updateFromItems), and
+// then only a plan the ported planner decided (Program.orderDecided) is C's. A
+// WITHOUT ROWID target's ephemeral table is an index keeping every distinct
+// row, which is not modelled.
+func upfromLastWins(sel *SelectStmt, prog *Program, tbl *tableMeta) bool {
+	return prog.orderDecided && !tbl.withoutRowid && len(sel.From) > 0 && sel.From[0].UpdateTarget
 }

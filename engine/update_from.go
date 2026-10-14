@@ -98,7 +98,10 @@ func buildUpdateFromSelect(stmt *updateStmt, tbl *tableMeta, lookup func(FromIte
 	// cursor (update.c:228, 230), so its name and database survive
 	// (expr.c:1913 copies zDatabase). Without it, pass one resolved the temp
 	// t and pass two wrote that rowid into main's t.
-	from := updateFromItems(stmt.from, FromItem{Table: tbl.name, Schema: stmt.schema, Alias: stmt.alias, UpdateTarget: true})
+	// The target keeps its INDEXED BY / NOT INDEXED hint: updateFromSelect's
+	// sqlite3SrcListDup copies it, and it decides pass one's plan.
+	from := updateFromItems(stmt.from, FromItem{Table: tbl.name, Schema: stmt.schema, Alias: stmt.alias, UpdateTarget: true,
+		IndexedBy: stmt.indexedBy, NotIndexed: stmt.notIndexed})
 	// The FROM list and the target share one name space: a name written twice
 	// (an unaliased table listed twice, or one alias on two sources) is
 	// ambiguous when the rewrite names its columns, so C rejects the statement

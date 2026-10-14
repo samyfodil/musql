@@ -19,7 +19,8 @@ func TestAutoIndexOrderIntKeysAsValues(t *testing.T) {
 			cur.rowids = append(cur.rowids, uint64(rng.Intn(50)))
 		}
 		key := &autoIndexKey{cols: []int{0, 1, -1}, colls: []string{"BINARY", "BINARY", "BINARY"}, desc: []bool{false, rng.Intn(2) == 0, false}}
-		at := func(i, kc int) Value {
+		at := func(i, k int) Value {
+			kc := key.cols[k]
 			if kc < 0 {
 				return Value{Typ: Int, I: int64(cur.rowids[i])}
 			}

@@ -224,6 +224,10 @@ const (
 	// more with that side NULL-extended. A subsequent OpRewind on the same
 	// cursor clears this state (see vdbeCursor.rewind).
 	OpNullRow
+	// OpRightJoinSweepOrder: P1: cursor, P4 (*autoIndexKey): puts a RIGHT/FULL
+	// join operand's rows, with their matched marks, into the order its
+	// unmatched-row sweep visits them (rightJoinSweepKey).
+	OpRightJoinSweepOrder
 
 	// RIGHT/FULL JOIN (emitRightOuterSweep, vdbe_join_codegen.go; semantics in
 	// join.go's package doc): an ordinary nested loop in FROM order yielding
@@ -930,6 +934,10 @@ type derivedSource struct {
 	// inside the loop). Emitted only by emitVtabCorrelatedOpen; nil everywhere
 	// else. See vtab_correlated.go.
 	vtabCorr []vtabCorrTerm
+	// rightJoin marks a correlated source that is a RIGHT/FULL JOIN's
+	// operand: its matches are recorded by rowid (vdbe.rjMatched), since its
+	// rows are built again per outer row and once more for the sweep.
+	rightJoin bool
 
 	cte   *cteRef
 	tbl   *resolvedTable
@@ -940,6 +948,15 @@ type derivedSource struct {
 	// regCurrent (select.c:2733). No subCache slot: the row changes with every
 	// pop, and each recursive step runs on a fresh machine anyway.
 	recSelf *recQueueSpec
+
+	// stmtOnce makes prog's rows a once-per-STATEMENT materialization, shared
+	// by every run of the program holding this source (vdbe.stmtOnceRows): the
+	// OP_Once around an uncorrelated materialized subquery (select.c, "if(
+	// pItem->fg.isCorrelated==0 ) onceAddr = OP_Once") belongs to the whole
+	// statement's VM, so a correlated subquery run once per outer row still
+	// materializes it the first time only. See emitJoinLoops for where it is
+	// set.
+	stmtOnce bool
 
 	// stream says whether prog may run as a CO-ROUTINE feeding this cursor one
 	// row at a time instead of being materialized first (streamsDerived,
@@ -1067,6 +1084,12 @@ type Instruction struct {
 // register-file size it needs and the number of result columns each
 // OpResultRow emits.
 type Program struct {
+	// orderDecided: the program is a plain join whose loop order the ported
+	// planner decided, so its rows come out in C's plan order
+	// (compileScanAttempt). UPDATE ... FROM reads it to keep the last of
+	// several rows matching one target row, as C's OP_Insert does.
+	orderDecided bool
+
 	Insns      []Instruction
 	vmJIT      unsafe.Pointer // *vmJIT: the native code jitCode compiled for Insns, or noVMJIT
 	// outerCtx is *outerCtxVerdict: outerCtxUnread's answer for Insns, checked

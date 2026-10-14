@@ -262,6 +262,9 @@ func isCoalescedColumnRef(ctx *evalCtx, e Expr) bool {
 	if !ok || ctx == nil {
 		return false
 	}
+	if ce.coalesceOf != nil {
+		return true
+	}
 	if ce.Qualifier != "" && !ce.UsingRepr {
 		return false
 	}

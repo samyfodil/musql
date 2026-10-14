@@ -83,15 +83,31 @@ func indexedByNoSolution(c *compiler, srcs []joinSource, partial []Expr, where E
 // compileScanAttempt once its FROM clause has resolved.
 func selectIndexedByNoSolution(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt *SelectStmt) error {
 	var partial []Expr
+	// srcOf[i] is the source FROM item i resolved into, or -1 for a member of
+	// a parenthesized join group, which the group's one source stands for.
+	srcOf := make([]int, len(stmt.From))
+	for i, k := 0, 0; i < len(stmt.From); k++ {
+		srcOf[i] = k
+		n := 1
+		if stmt.From[i].GroupLen > 0 {
+			n = stmt.From[i].GroupLen
+			srcOf[i] = -1
+		}
+		for j := i + 1; j < i+n && j < len(stmt.From); j++ {
+			srcOf[j] = -1
+		}
+		i += n
+	}
 	for i := range stmt.From {
 		it := stmt.From[i]
 		if it.IndexedBy == "" {
 			continue
 		}
-		if len(srcs) != len(stmt.From) {
+		si := srcOf[i]
+		if si < 0 || si >= len(srcs) {
 			return declineIndexedByPartial()
 		}
-		rp := p.forDB(srcs[i].dbIdx)
+		rp := p.forDB(srcs[si].dbIdx)
 		if rp == nil {
 			return declineIndexedByPartial()
 		}
@@ -105,11 +121,15 @@ func selectIndexedByNoSolution(p *ReadOnlyPager, c *compiler, srcs []joinSource,
 		if perr != nil {
 			return declineIndexedByPartial()
 		}
-		if srcs[i].rightOuter && rightJoinExprIndexUnusable(ix, srcs, stmt.Where) {
+		if srcs[si].rightOuter && rightJoinExprIndexUnusable(ix, srcs, stmt.Where) {
 			return errNoQuerySolution()
 		}
 		if ix.where == nil {
 			continue
+		}
+		if len(srcs) != len(stmt.From) {
+			// The partial-index test below indexes sources by FROM position.
+			return declineIndexedByPartial()
 		}
 		if partial == nil {
 			partial = make([]Expr, len(stmt.From))

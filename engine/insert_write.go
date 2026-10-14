@@ -1733,7 +1733,7 @@ func (db *DB) insertRowFromValues(tbl *tableMeta, displayName string, colsGiven 
 	}
 
 	if _, exists := tbl.rows.get(rowid); exists {
-		return 0, fmt.Errorf("engine: INSERT into %s: UNIQUE constraint failed: duplicate rowid %d", displayName, int64(rowid))
+		return 0, fmt.Errorf("engine: INSERT into %s: UNIQUE constraint failed: %s", displayName, rowidConstraintName(tbl))
 	}
 	tbl.putRow(rowid, full)
 	db.noteRowChange(tbl, RowInsert, rowid, nil, full)
@@ -2387,4 +2387,13 @@ func parseParamInfo(sqlText string) (ParamInfo, error) {
 		return stmt.params, nil
 	}
 	return ParamInfo{}, nil
+}
+
+// rowidConstraintName is what sqlite3RowidConstraint names in a rowid
+// conflict: the table's INTEGER PRIMARY KEY column, or its rowid.
+func rowidConstraintName(tbl *tableMeta) string {
+	if tbl.ipkIndex >= 0 && tbl.ipkIndex < len(tbl.cols) {
+		return tbl.name + "." + tbl.cols[tbl.ipkIndex].Name
+	}
+	return tbl.name + ".rowid"
 }

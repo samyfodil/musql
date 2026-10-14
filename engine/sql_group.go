@@ -2138,7 +2138,10 @@ func (p *ReadOnlyPager) planGroupByStmt(stmt *SelectStmt, scopes []tableScope, o
 			}
 			resolved := outCols[n-1].expr
 			if containsAggregate(resolved) {
-				return nil, fmt.Errorf("engine: unsupported: GROUP BY ordinal %d refers to an aggregate output column", n)
+				// sqlite3ResolveOrderGroupBy copies the result expression into
+				// the term, and resolveSelectStep then refuses any GROUP BY
+				// term holding an aggregate (resolve.c).
+				return nil, semanticf("engine: aggregate functions are not allowed in the GROUP BY clause")
 			}
 			if ce, isCollate := ge.(CollateExpr); isCollate {
 				resolved = CollateExpr{X: resolved, Name: ce.Name}
@@ -2147,7 +2150,7 @@ func (p *ReadOnlyPager) planGroupByStmt(stmt *SelectStmt, scopes []tableScope, o
 			continue
 		}
 		if containsAggregate(ge) {
-			return nil, fmt.Errorf("engine: unsupported: aggregate function in GROUP BY")
+			return nil, semanticf("engine: aggregate functions are not allowed in the GROUP BY clause")
 		}
 		if err := checkExprSupported(ge); err != nil {
 			return nil, err

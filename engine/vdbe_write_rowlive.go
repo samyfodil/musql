@@ -265,15 +265,43 @@ func (db *DB) updateEveryIndexForcesTwoPass(tbl *tableMeta, stmt *updateStmt, co
 	return true
 }
 
-func updateKeyForcesTwoPass(key *autoIndexKey, colIdx []int, nCols int) bool {
+func updateKeyForcesTwoPass(key *autoIndexKey, colIdx []int, cols []columnInfo) bool {
 	if key.multiOr != nil {
 		return true
 	}
 	// A key naming any column is an index's (autoIndexKey.root is not set on
 	// this path); the reversed rowid scan's key is the rowid alone (-1), which
 	// maskHasAny skips -- that scan reads the table b-tree, iCur == iDataCur.
-	mask, _ := updateSetMask(colIdx, nCols, -1)
-	return maskHasAny(mask, key.cols)
+	mask, chngRowid := updateSetMask(colIdx, len(cols), -1)
+	if maskHasAny(mask, key.cols) {
+		return true
+	}
+	// An expression key column counts when its expression reads a column the
+	// SET assigns (sqlite3ExprReferencesUpdatedColumn, update.c), or the rowid
+	// while the SET changes it.
+	for _, x := range key.exprs {
+		if x == nil {
+			continue
+		}
+		hit := false
+		forEachColumnRef(x.expr, func(ce ColumnExpr) {
+			for i, c := range cols {
+				if equalFoldName(c.Name, ce.Name) {
+					if mask[i] {
+						hit = true
+					}
+					return
+				}
+			}
+			if chngRowid && isRowidAliasName(ce.Name) {
+				hit = true
+			}
+		})
+		if hit {
+			return true
+		}
+	}
+	return false
 }
 
 // updateSetMask is the columns an UPDATE's SET list assigns, and whether it

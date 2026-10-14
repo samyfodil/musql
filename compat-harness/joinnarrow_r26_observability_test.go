@@ -141,14 +141,17 @@ func TestR26RebuiltListNeedsAStar(t *testing.T) {
 		`SELECT * FROM tc, (td JOIN tb3 USING(b))`,
 	}
 
+	// The parenthesized-join binder (engine/nested_from_bind.go) rebuilds the
+	// group's column list as C does, so the starred shapes are served now; an
+	// answer must be C's, a decline is still clean.
 	for _, q := range starred {
-		eCols, _, eErr, cCols, _, cErr := cmp(q)
+		eCols, eRows, eErr, cCols, cRows, cErr := cmp(q)
 		if cErr != nil {
-			t.Errorf("[%s] the ORACLE now rejects it: %v -- re-measure before trusting the decline", q, cErr)
+			t.Errorf("[%s] the ORACLE now rejects it: %v -- re-measure", q, cErr)
 			continue
 		}
 		if eErr == nil {
-			t.Errorf("[%s] the engine ANSWERED it; SQLite rebuilds this group's column list (oracle cols=%v, engine cols=%v)", q, cCols, eCols)
+			servedMatchesC(t, q, eCols, eRows, cCols, cRows)
 		}
 	}
 	for _, q := range unstarred {
@@ -259,13 +262,14 @@ func TestR26FrontMoveUnobservableExemption(t *testing.T) {
 	for _, q := range []string{
 		`SELECT * FROM k1 NATURAL LEFT JOIN (k2 JOIN k3 ON 1=1 NATURAL JOIN k4)`,
 	} {
-		eCols, eRows, eErr, cCols, _, cErr := stillDeclined(q)
+		eCols, eRows, eErr, cCols, cRows, cErr := stillDeclined(q)
 		if cErr != nil {
 			t.Errorf("[%s] the ORACLE now rejects it: %v -- re-measure", q, cErr)
 			continue
 		}
+		// Served by the parenthesized-join binder now; it must be C's answer.
 		if eErr == nil {
-			t.Errorf("[%s] the engine ANSWERED it; the coalescing connector is not the group's first, so the front-move is NOT provably unobservable (oracle cols=%v, engine cols=%v, engine rows=%v)", q, cCols, eCols, eRows)
+			servedMatchesC(t, q, eCols, eRows, cCols, cRows)
 		}
 	}
 
