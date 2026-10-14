@@ -5327,7 +5327,16 @@ func (db *DB) schemaObjectsResolveCompiled(tbl *tableMeta, when string) error {
 			q = "SELECT * FROM (" + body + ") LIMIT 0"
 		}
 		_, _, err := pager.Query(q)
-		if msg, ok := promote(err); ok {
+		msg, ok := promote(err)
+		if !ok && err != nil {
+			// A view whose body is already ambiguous fails C's re-parse
+			// too: "error in view v: ambiguous column name: b".
+			m := err.Error()
+			if i := strings.LastIndex(m, "ambiguous column name: "); i >= 0 {
+				msg, ok = strings.TrimSuffix(m[i:], " (no fallback)"), true
+			}
+		}
+		if ok {
 			note(v.schemaSeq, fmt.Errorf("engine: error in view %s%s: %s", v.name, suffix, msg))
 		}
 	}

@@ -50,7 +50,11 @@ func (p *ReadOnlyPager) pragmaTableList(scope schemaScope, stmt *PragmaStmt) (co
 		}
 		rows = [][]Value{}
 		for _, r := range all {
-			if len(r) > 1 && r[1].Typ == Text && equalFoldName(string(r[1].S), stmt.ValueText) {
+			// The catalog rows are keyed sqlite_master/sqlite_temp_master
+			// in C's table hash (the alias path above), so their displayed
+			// names find nothing: table_list('sqlite_schema') is empty.
+			if len(r) > 1 && r[1].Typ == Text && equalFoldName(string(r[1].S), stmt.ValueText) &&
+				!equalFoldName(stmt.ValueText, "sqlite_schema") && !equalFoldName(stmt.ValueText, "sqlite_temp_schema") {
 				rows = append(rows, r)
 			}
 		}
