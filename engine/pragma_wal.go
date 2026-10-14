@@ -7,7 +7,6 @@ package engine
 import (
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 )
 
@@ -156,15 +155,7 @@ func (db *DB) WalCheckpointPragma(stmt *PragmaStmt) ([]string, [][]Value, error)
 // sqlite3Atoi's own behavior.
 func (db *DB) walAutoCheckpointPragma(stmt *PragmaStmt) ([]string, [][]Value, error) {
 	if stmt.HasValue {
-		n64, err := strconv.ParseInt(strings.TrimSpace(stmt.ValueText), 10, 32) // sqlite3Atoi: out of int32 range reads as 0
-		n := int(n64)
-		if err != nil {
-			n = 0
-		}
-		if n < 0 {
-			n = 0
-		}
-		db.walAutoCheckpoint = n
+		db.walAutoCheckpoint = max(PragmaAtoi(stmt.ValueText), 0)
 	}
 	return []string{"wal_autocheckpoint"}, [][]Value{{{Typ: Int, I: int64(db.walAutoCheckpoint)}}}, nil
 }

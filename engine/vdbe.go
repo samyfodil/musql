@@ -2398,7 +2398,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				if v := m.regs[op.P1+i]; owned && m.isOwnedParam(v) {
 					rec[i] = v // ExecArgsOwned: the caller handed these bytes over
 				} else {
-					rec[i] = copyValue(v)
+					rec[i] = recordValue(copyValue(v))
 				}
 			}
 			m.recRegs[op.P3] = rec
@@ -2616,7 +2616,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			row := m.segRows[m.segRow]
 			m.segRow++
 			for i := 0; i < op.P3 && i < len(row); i++ {
-				m.regs[op.P1+i] = row[i]
+				// These rows stand in for a sorter's (OpSegOrderLimit), so
+				// they read back as a record would (recordValue).
+				m.regs[op.P1+i] = recordValue(row[i])
 			}
 
 		case OpAggStep:

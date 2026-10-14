@@ -460,6 +460,7 @@ func (p *parser) parseWithClause() ([]CTEDef, error) {
 		if err := p.expectPunct(")"); err != nil {
 			return nil, err
 		}
+		nameValuesColumnsPreResolve(sel)
 		def.Select = sel
 
 		for _, existing := range defs {
@@ -1114,7 +1115,16 @@ func (p *parser) parseValuesSelectCore() (*SelectStmt, error) {
 			if err != nil {
 				return nil, err
 			}
-			cols = append(cols, SelectColumn{Expr: e, Alias: fmt.Sprintf("column%d", len(cols)+1), HasAlias: true})
+			col := SelectColumn{Expr: e, Alias: fmt.Sprintf("column%d", len(cols)+1), HasAlias: true}
+			inner, _ := skipCollateOnly(e)
+			// Only a double-quoted name that can fall back to a string: one
+			// that may bind an outer column keeps "columnN", since naming it
+			// after itself lets the body resolve the reference to its own
+			// result column (with2.test).
+			if ce, ok := inner.(ColumnExpr); ok && ce.Qualifier == "" && ce.FallbackLiteral != nil && ce.FallbackLiteral.Typ == Text {
+				col.valuesIdent = ce.Name
+			}
+			cols = append(cols, col)
 			if p.peekIsPunct(",") {
 				p.next()
 				continue
@@ -1164,6 +1174,26 @@ func (p *parser) parseValuesSelectCore() (*SelectStmt, error) {
 		first.ValuesFold = p.multiValuesFold(first, constant)
 	}
 	return first, nil
+}
+
+// nameValuesColumnsPreResolve gives the leftmost VALUES row of a derived
+// table's or CTE's body the names sqlite3ColumnsFromExprList gives it there:
+// selectExpander names a FROM item's columns before the body is resolved, so
+// an identifier item is still TK_ID and names its column after the token
+// (select.c, sqlite3ColumnsFromExprList), where a top-level VALUES, or a
+// view's body (named after resolution, sqlite3ResultSetOfSelect), keeps
+// "columnN". A double-quoted string that falls back to a literal is such an
+// identifier: "SELECT * FROM (VALUES(\"a\")) WHERE a='a'" finds its row.
+func nameValuesColumnsPreResolve(sel *SelectStmt) {
+	if sel == nil {
+		return
+	}
+	for i := range sel.Columns {
+		c := &sel.Columns[i]
+		if c.valuesIdent != "" && c.Alias == "column"+strconv.Itoa(i+1) {
+			c.Alias = c.valuesIdent
+		}
+	}
 }
 
 // multiValuesFold decides which of sqlite3MultiValues' two methods SQLite uses
@@ -1359,7 +1389,16 @@ func (p *parser) parseSelectList() ([]SelectColumn, error) {
 			if err != nil {
 				return nil, err
 			}
-			text := strings.TrimSpace(p.src[p.toks[start].Start:p.toks[p.pos-1].End])
+			// C takes the span up to the START of the lookahead token
+			// (parse.y's scanpt), so a comment between the expression and
+			// the next real token -- a trailing "-- note" included -- is
+			// part of the column's name; only whitespace is trimmed
+			// (sqlite3DbSpanDup).
+			end := p.toks[p.pos-1].End
+			if next := p.peek(); next.Start >= end && next.Start <= len(p.src) {
+				end = next.Start
+			}
+			text := strings.TrimSpace(p.src[p.toks[start].Start:end])
 			alias := ""
 			hasAlias := false
 			if p.consumeKeyword("AS") {
@@ -1958,6 +1997,7 @@ func (p *parser) parseDerivedTable() (FromItem, error) {
 	if err := p.expectPunct(")"); err != nil {
 		return FromItem{}, err
 	}
+	nameValuesColumnsPreResolve(sub)
 	p.cLeafSeq++
 	item := FromItem{Subquery: sub, cID: p.cLeafSeq}
 	alias, ok, err := p.tryParseFromAlias()

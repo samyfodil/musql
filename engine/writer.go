@@ -56,6 +56,10 @@ type DB struct {
 	vtabs    []*vtabMeta    // every virtual table registered this session (via CreateVirtualTable, or recovered by OpenWrite), in creation/schema order; see vtab.go
 	triggers []*triggerMeta // every trigger registered this session (via CreateTrigger, or recovered by OpenWrite), in creation order; see trigger.go
 
+	// tempTrigPeak is the most TEMP triggers C's temp trigger hash has held
+	// since it was last empty; see noteTempTriggerCreated.
+	tempTrigPeak int
+
 	//	// foreignTempTriggers holds triggerMeta pointers owned by a different
 	//	// session -- the originating connection that delegated a write here
 	//	// (attachedWriteSession) -- for TEMP triggers bound to this database's

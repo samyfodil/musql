@@ -795,6 +795,15 @@ func tsRunCase(t *testing.T, rel string, tf *tsFile, db tsDB, c tsCase, matrix, 
 			t.Skip("oracle lacks generate_series")
 		}
 	}
+	// Named as a string, generate_series raises nothing in the oracle:
+	// "pragma_table_info('generate_series')" is simply no rows there, while a
+	// build with the module (musql's, Turso's) lists its columns.
+	for _, s := range stmts {
+		if strings.Contains(strings.ToLower(s), "'generate_series'") {
+			st.skip("the oracle build lacks generate_series (ext/misc/series.c)")
+			t.Skip("oracle lacks generate_series")
+		}
+	}
 
 	for _, r := range cr.res {
 		if strings.HasPrefix(r.Err, "no such table: btree_dump") || strings.HasPrefix(r.Err, "no such function: turso_") {

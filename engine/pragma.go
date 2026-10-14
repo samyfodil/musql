@@ -1562,8 +1562,10 @@ func (p *ReadOnlyPager) queryPragmaStmt(stmt *PragmaStmt) (cols []string, rows [
 	// main first, as C does; when the object is not here, the pragma runs against its
 	// owner. "Not here", not "empty answer" (pragmaObjectOwner, attach_write.go).
 	// Covers both PRAGMA and the pragma_*() table-valued forms.
+	// table_list is not routed: it lists the name in EVERY database
+	// (pragmaTableList).
 	if stmt.Schema == "" && stmt.HasValue && pragmaReadsSchema(stmt.Name) &&
-		!isMasterSchemaCatalogAlias(stmt.ValueText) {
+		stmt.Name != "table_list" && !isMasterSchemaCatalogAlias(stmt.ValueText) {
 		// sqlite_master / sqlite_temp_master name a catalog every pager answers to, so
 		// they are not routed; pragmaTableListOne tags them main / temp. Everything else
 		// resolves temp first, C's order for an unqualified name (build.c:352).
@@ -1918,6 +1920,13 @@ func (p *ReadOnlyPager) SetWritableSchema(v bool) { p.writableSchema = v }
 // pragma has (it means OFF plus a schema reload).
 func PragmaWritableSchemaValue(text string) (on, isReset bool) {
 	return writableSchemaValue(text)
+}
+
+// PragmaAtoi is sqlite3Atoi, the parse pragma.c gives an integer setter such
+// as wal_autocheckpoint: sqlite3GetInt32, which stops at the first non-digit
+// and yields 0 for a value outside 32 bits.
+func PragmaAtoi(text string) int {
+	return int(pragmaGetInt32(text))
 }
 
 // SetWalAutoCheckpoint records this connection's "PRAGMA wal_autocheckpoint"
@@ -4089,9 +4098,10 @@ func (p *ReadOnlyPager) pragmaIndexInfo(scope schemaScope, idxName string, exten
 	//     reports "nocase" and "ON t(c)" reports "RtRiM". Quoting the key name
 	//     changes nothing ("ON t(\"b\")" still reports "nocase");
 	//   - otherwise "BINARY";
-	//   - and an EXPRESSION key is ALWAYS "BINARY", even when it writes its own
-	//     COLLATE: "ON t(a+1 COLLATE NoCase)" reports "BINARY" (which is what
-	//     index_write.go's own expression-key comment already recorded).
+	//   - and an EXPRESSION key is "BINARY" unless the whole entry is a
+	//     COLLATE: "ON t(a+1 COLLATE NoCase)" is a+(1 COLLATE NoCase) and
+	//     reports "BINARY", while "ON t((a+1) COLLATE NoCase)" reports
+	//     "NoCase" (build.c tests the item's own op for TK_COLLATE).
 	//
 	// An AUTOMATIC index's key carries its constraint's own COLLATE just as a
 	// CREATE INDEX key does: C's sqlite3AddPrimaryKey hands the constraint's
@@ -4100,6 +4110,9 @@ func (p *ReadOnlyPager) pragmaIndexInfo(scope schemaScope, idxName string, exten
 	// "PRIMARY KEY(a, b COLLATE NOCASE)" reports NOCASE for b, and enforces it.
 	collOf := func(kc pragmaIndexCol) string {
 		if kc.name == "" {
+			if kc.coll != "" {
+				return kc.coll // the expression's own top-level COLLATE
+			}
 			return "BINARY"
 		}
 		if kc.coll != "" {
