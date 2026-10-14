@@ -51,18 +51,10 @@ func init() {
 		"right-full-join-sqlite.sqltest::memory::aggregates-windows-and-limits[right-join][coalesce-a-k-b-k-as-key-count-total-a-v-total-b-v][order-by-1-2]",
 		"right-full-join-sqlite.sqltest::memory::aggregates-windows-and-limits[right-join][distinct-a-k-is-null-b-k-is-null][group-by-1-order-by-1]",
 	)
-	tsKnownGroup("2026-10-12: UPDATE ... FROM where a target row matches several FROM rows: C keeps the last match in its join order, which this write path does not reproduce, so it declines",
-		"update-from.sqltest::memory::update-from-duplicate-match-keeps-set-columns-consistent",
-		"update-from.sqltest::memory::update-from-duplicate-match-updates-once",
-		"update-from.sqltest::memory::update-from-indexed-by-target-hint-is-preserved",
-	)
 	tsKnownGroup("2026-10-12: UPDATE ... FROM ... RETURNING with a subquery over the statement's CTE is declined (the RETURNING subquery cannot see the WITH clause)",
 		"update-from.sqltest::memory::update-from-returning-reuses-cte-snapshot-after-trigger-mutation",
 		"update-from.sqltest::memory::update-from-returning-reuses-row-cte-snapshot-after-trigger-mutation",
 		"update-from.sqltest::memory::update-from-returning-subquery-can-see-cte",
-	)
-	tsKnownGroup("2026-10-12: a rowid conflict is worded \"UNIQUE constraint failed: duplicate rowid N\" instead of naming the INTEGER PRIMARY KEY column",
-		"update-from.sqltest::memory::update-from-rowid-mutation-conflict",
 	)
 	tsKnownGroup("2026-10-12: foreign keys: a cascade whose child has an AFTER trigger and an onward action is declined (C codes the onward action ahead of the AFTER trigger)",
 		"foreign_keys.sqltest::memory::fk-cascade-trigger-cascade",
