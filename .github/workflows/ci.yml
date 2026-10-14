@@ -125,7 +125,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: "short run; one *sql.Conn per reader, gated on load, avg/p50/p99, disk; shared *sql.DB reported"
+      - name: "short run; shared *sql.DB and one *sql.Conn per reader, each gated on load, avg/p50/p99, disk"
         run: bench/pointread/run
 
   turso:
