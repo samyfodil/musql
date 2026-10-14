@@ -246,6 +246,7 @@ func (p *ReadOnlyPager) r41FlattenMultiItem(stmt *SelectStmt, i int, expand bool
 		return ColumnExpr{Qualifier: found, Name: ce.Name}, true
 	}
 	f := &r41Flat{
+		p:       p,
 		dName:   it.Alias,
 		byName:  map[string]int{},
 		base:    map[string]string{},

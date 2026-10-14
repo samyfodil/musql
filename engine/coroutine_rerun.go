@@ -499,13 +499,20 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 			rerun[i] = true
 		}
 	}
-	if len(rerun) == 0 {
-		return nil
+	// With nothing to re-run the materialization already gives C's rows, and
+	// C's plan is still taken when it is followed, so the order rows arrive
+	// in is C's too (cPlanDecided); where it is not, nothing is declined.
+	optional := len(rerun) == 0
+	giveUp := func(why string) error {
+		if optional {
+			return nil
+		}
+		return decline(why)
 	}
 	if len(flatKept) != 0 {
 		// C's FROM clause holds that body's tables where this one holds the
 		// subquery, so its loop order is not this FROM clause's.
-		return decline("beside a subquery C flattens")
+		return giveUp("beside a subquery C flattens")
 	}
 	der := map[int]wherePlanDerivedItem{}
 	for i, sq := range subs {
@@ -557,33 +564,29 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 			}
 		}
 		if !eok {
-			return decline("whose row estimate, or a neighbour's, is not followed")
+			return giveUp("whose row estimate, or a neighbour's, is not followed")
 		}
 		subOB, sok := cSubqueryOrderBy(stmt, items, i, sq.body, sq.cte)
 		if !sok {
-			return decline("beside a subquery whose ORDER BY is not followed")
+			return giveUp("beside a subquery whose ORDER BY is not followed")
 		}
 		der[i] = wherePlanDerivedItem{nRow: est, correlated: prog != nil && prog.Correlated, subOB: subOB, coroutine: sq.co}
 	}
 	var auto []bool
 	order, keys, planNRow, ok := wherePlanMultiTableOrderWith(p, c, srcs, stmt, der, &auto)
 	if !ok || len(auto) != len(order) {
-		return decline("in a join whose loop order is not followed")
+		return giveUp("in a join whose loop order is not followed")
 	}
-	needed := false
 	for level, iTab := range order {
 		if rerun[iTab] && level > 0 && !auto[level] {
 			srcs[iTab].coroutineRerun = true
-			needed = true
 		}
 	}
-	if !needed {
-		// Outermost, or filled once into an automatic index: one run, which is
-		// what the materialization already does.
-		return nil
-	}
 	// The loops outside each re-run co-routine must be C's, so the whole plan
-	// is: the same hand-off markWherePlanEligibility makes.
+	// is: the same hand-off markWherePlanEligibility makes. It is taken even
+	// where nothing re-runs (outermost, or filled once into an automatic
+	// index), since it is C's plan either way, and an aggregate reading the
+	// arrival order can rely on it (cPlanDecided).
 	c.planNRow, c.planNRowOK = planNRow, c.outer == nil || c.nQueryLoopKnown
 	noAutoIdx := !p.AutomaticIndex()
 	for level, iTab := range order {
@@ -596,6 +599,7 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 	}
 	for i := range srcs {
 		srcs[i].wherePlanOK = true
+		srcs[i].cPlanDecided = true
 		srcs[i].noAutoIndex = noAutoIdx
 		if srcs[i].on != nil && !srcs[i].left && !srcs[i].rightOuter {
 			srcs[i].onToWhere = true

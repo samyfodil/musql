@@ -2928,7 +2928,7 @@ func groupEmissionOrderProvable(p *ReadOnlyPager, c *compiler, srcs []joinSource
 	if c != nil && c.outer == nil && groupEmissionAscendingEverywhere(p, srcs, len(gp.groupExprs)) {
 		return true
 	}
-	return !groupingCouldArriveOrdered(p, srcs, scopes, gp)
+	return !groupingCouldArriveOrdered(p, srcs, scopes, gp, stmt)
 }
 
 // groupingCouldArriveOrdered: could any access path deliver the grouping without
@@ -2936,9 +2936,12 @@ func groupEmissionOrderProvable(p *ReadOnlyPager, c *compiler, srcs []joinSource
 // ignores pinned columns, direction and key column order (a GROUP BY match is
 // "not as strict", where.c:5138), and asks only whether some index holds every
 // GROUP BY column.
-func groupingCouldArriveOrdered(p *ReadOnlyPager, srcs []joinSource, scopes []tableScope, gp *groupByPlan) bool {
+func groupingCouldArriveOrdered(p *ReadOnlyPager, srcs []joinSource, scopes []tableScope, gp *groupByPlan, stmt *SelectStmt) bool {
+	if p != nil && len(srcs) > 1 {
+		return !groupTermUnorderable(p, srcs, scopes, gp, stmt)
+	}
 	if p == nil || len(srcs) != 1 || srcs[0].tbl == nil {
-		return true // a join's nesting decides this, and is not decided here
+		return true
 	}
 	tbl := srcs[0].tbl
 	cols := make([]int, 0, len(gp.groupExprs))
@@ -2997,6 +3000,76 @@ func groupingCouldArriveOrdered(p *ReadOnlyPager, srcs []joinSource, scopes []ta
 	return false
 }
 
+// groupTermUnorderable reports, for a join, a GROUP BY term no plan can
+// deliver in order, so C codes the sorter (groupBySort==1) whatever the loop
+// nesting. wherePathSatisfiesOrderBy satisfies a term only through a loop's
+// index or rowid order, an == or IS constraint on it (also one against an
+// outer loop's column), or a loop returning one row (where.c:5160-5340). A
+// plain column of an ordinary rowid table with no INTEGER PRIMARY KEY and no
+// index at all, named by no WHERE or ON term and with no rowid named there
+// either, has none of those: the table has no index, automatic or declared,
+// that holds the column, and no one-row loop. Every other shape answers false.
+func groupTermUnorderable(p *ReadOnlyPager, srcs []joinSource, scopes []tableScope, gp *groupByPlan, stmt *SelectStmt) bool {
+	if stmt == nil || len(scopes) != len(srcs) || len(stmt.From) != len(srcs) {
+		return false
+	}
+	if r37cExprMayReferenceRowid(stmt.Where) {
+		return false
+	}
+	for _, it := range stmt.From {
+		if r37cExprMayReferenceRowid(it.On) || len(it.Using) != 0 || it.Natural {
+			return false
+		}
+	}
+	jts := make([]joinedTable, len(srcs))
+	for i := range srcs {
+		jts[i] = joinedTable{tbl: srcs[i].tbl}
+	}
+	for _, ge := range gp.groupExprs {
+		ce, ok := ge.(ColumnExpr)
+		if !ok {
+			continue
+		}
+		tab, col, ok := wherePlanColumnRef(jts, scopes, ce)
+		if !ok {
+			continue
+		}
+		s := srcs[tab]
+		tbl := s.tbl
+		if tbl == nil || tbl.name == "" || s.derived != nil || s.cteItem != nil || s.vtabItem != nil ||
+			tbl.withoutRowid || tbl.ipkIndex >= 0 || col < 0 || col >= len(tbl.cols) {
+			continue
+		}
+		owner := p.forDB(s.dbIdx)
+		if owner == nil {
+			continue
+		}
+		idxs, _, ok := wherePlanIndexList(owner, tbl, tbl.name, "", false, nil) // groupTermUnorderable: only asks whether any index exists
+		if !ok {
+			continue
+		}
+		indexed := false
+		for _, ix := range idxs {
+			if !ix.ipk {
+				indexed = true
+			}
+		}
+		if indexed {
+			continue
+		}
+		name := tbl.cols[col].Name
+		probe := &SelectStmt{Where: stmt.Where}
+		for _, it := range stmt.From {
+			probe.From = append(probe.From, FromItem{On: it.On})
+		}
+		if !r41WalkStmt(probe, func(x ColumnExpr) bool { return !equalFoldName(x.Name, name) }, func(string) bool { return true }) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 // keyColumnOf is build.c's "if( iColumn==pTable->iPKey ) iColumn = XN_ROWID"
 // applied to one index-key column number, so an INTEGER PRIMARY KEY column and
 // an explicit rowid reference compare as the same thing.
@@ -3026,7 +3099,7 @@ func groupPlanRefs(gp *groupByPlan) ([]*aggItem, []Expr) {
 // an index or nest joins differently. Checked: the access path per table
 // (anchorNoIndexInPlay) and the join nesting (anchorLoopOrderProvable).
 func anchorPlanOrderProvable(p *ReadOnlyPager, c *compiler, srcs []joinSource, scopes []tableScope, stmt *SelectStmt) bool {
-	if wherePlanIndexOrderDecided(p, c, srcs, stmt) {
+	if cPlanDecidedAll(srcs) || wherePlanIndexOrderDecided(p, c, srcs, stmt) {
 		return true
 	}
 	// anchorNoIndexInPlay is a proxy; an index that yields no WhereLoop leaves the
@@ -3641,6 +3714,9 @@ func anchorPinnedTables(srcs []joinSource, scopes []tableScope, groupExprs []Exp
 // model.
 func aggPlanOrderProvable(p *ReadOnlyPager, c *compiler, srcs []joinSource,
 	scopes []tableScope, stmt *SelectStmt) bool {
+	if cPlanDecidedAll(srcs) {
+		return true
+	}
 	if !anchorLoopOrderProvable(srcs, scopes, stmt.Where) {
 		return false
 	}
@@ -3648,6 +3724,17 @@ func aggPlanOrderProvable(p *ReadOnlyPager, c *compiler, srcs []joinSource,
 		return true
 	}
 	return anchorPlanOrderProvable(p, c, srcs, scopes, stmt)
+}
+
+// cPlanDecidedAll reports a FROM clause whose whole plan markCoroutineReruns
+// handed to the executor (joinSource.cPlanDecided).
+func cPlanDecidedAll(srcs []joinSource) bool {
+	for i := range srcs {
+		if !srcs[i].cPlanDecided {
+			return false
+		}
+	}
+	return len(srcs) > 1
 }
 
 // aggSourcesArePlainTables reports a FROM clause of base tables only -- the
