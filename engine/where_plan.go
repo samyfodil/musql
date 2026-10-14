@@ -96,6 +96,25 @@ type whereItem struct {
 	// builds unconditionally, without asking whether the index is covering or
 	// narrower than the table row.
 	noRowid bool
+	// ephemeral is a FROM-clause subquery's or view's table (TF_Ephemeral),
+	// whose automatic index is priced 25 below the row count instead of 28
+	// above it (where.c:4097-4102). correlated is SrcItem.fg.isCorrelated,
+	// which builds no automatic index at all (where.c:4071).
+	ephemeral  bool
+	correlated bool
+	// subOB is a subquery's own ORDER BY as its full-scan loop carries it
+	// (pNew->u.btree.pOrderBy, where.c:4180), which wherePathMatchSubqueryOB
+	// matches against the statement's; coroutine is WHERE_COROUTINE, which
+	// cannot be run backwards.
+	subOB     []whereSubOB
+	coroutine bool
+}
+
+// whereSubOB is one term of a subquery's ORDER BY: col is iOrderByCol-1, the
+// result column it is (-1 when it is none), and desc/bigNull its sortFlags.
+type whereSubOB struct {
+	col           int
+	desc, bigNull bool
 }
 
 // whereDefaultRowLogEst is build.c's pTable->nRowLogEst for a table with no
@@ -159,6 +178,9 @@ type wherePlanInput struct {
 	// no ORDER BY, and so each of which is reversed under the pragma whatever the
 	// outer statement's ORDER BY says.
 	reverseOrder bool
+	// autoLevels, when non-nil, receives whether each level's winning loop is
+	// an automatic index (WHERE_AUTO_INDEX), by level.
+	autoLevels *[]bool
 }
 
 type whereLoopCache struct {
@@ -216,6 +238,13 @@ func wherePlanOrder(in wherePlanInput) (order []int, keys []*autoIndexKey, nRow 
 	keys = make([]*autoIndexKey, n)
 	for level, li := range path.loops {
 		order[level] = b.loops[li].iTab
+	}
+	if in.autoLevels != nil {
+		auto := make([]bool, n)
+		for level, li := range path.loops {
+			auto[level] = b.loops[li].autoIdx
+		}
+		*in.autoLevels = auto
 	}
 	for level, li := range path.loops {
 		l := &b.loops[li]
@@ -1359,8 +1388,23 @@ func wherePlanSubqueryUsage(jts []joinedTable, scopes []tableScope, e Expr) (whe
 		}
 		return true
 	}
+	// The CTEs in scope where e is compiled: a subquery naming one reads its
+	// body's columns, as resolveFrom would bind it.
+	var cteDefs map[string]*CTEDef
+	for _, frame := range p.cteScopes {
+		for key, b := range frame {
+			if cteDefs == nil {
+				cteDefs = map[string]*CTEDef{}
+			}
+			if b == nil || b.recursive != nil || b.selfRef != nil || b.core == nil {
+				cteDefs[key] = nil
+				continue
+			}
+			cteDefs[key] = &CTEDef{Name: b.name, ColNames: b.colNames, Select: b.core, Materialized: b.m10d}
+		}
+	}
 	sub := func(inner *SelectStmt) bool {
-		if !r36dSubColUsed(p, inner, nil, nil, 0, mark) {
+		if !r36dSubColUsed(p, inner, nil, cteDefs, 0, mark) {
 			ok = false
 			return false
 		}

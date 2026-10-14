@@ -44,13 +44,6 @@ func TestCTEShareRuleSweep(t *testing.T) {
 		for _, body := range []string{fromless,"SELECT random() AS r FROM (SELECT 1) GROUP BY 1"} {
 			w := "WITH t AS " + hint + "(" + body + ") "
 			for _, q := range queries {
-				if body != fromless && q == "SELECT count(DISTINCT r) FROM x, t" {
-					// A co-routine C places as an INNER loop is re-run per outer
-					// row (OP_InitCoroutine in wherecode.c), which this engine
-					// does not follow yet; that is not the sharing rule tested
-					// here.
-					continue
-				}
 				cases = append(cases, append(append([]string(nil), pre...), w+q))
 			}
 			cases = append(cases,

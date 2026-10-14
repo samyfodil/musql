@@ -637,9 +637,10 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 				jc.Rows = unsafe.Pointer(unsafe.SliceData(cur.rows))
 				jc.N, jc.Pos, jc.Ok, jc.Adv = int64(len(cur.rowids)), int64(cur.pos), 1, 1
 				jc.Mask = jitCursorMask(cur)
-				if !cur.seekReseek && cur.rowStore == nil {
+				if !cur.seekReseek && cur.rowStore == nil && !cur.refillEach {
 					// A re-seeking cursor rebuilds its rows at every rewind, and
-					// so does a write-path one.
+					// so do a write-path one and an inner co-routine
+					// (derivedSource.rerun).
 					jc.Rewind = 1
 				}
 				continue

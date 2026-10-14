@@ -173,6 +173,11 @@ type vdbeCursor struct {
 	fill          func() ([][]Value, []int64, error)
 	fillKeep      []bool
 	clearSubtypes bool
+	// refillEach keeps fill after it runs, so every rewind produces the rows
+	// afresh: a co-routine C codes as an INNER loop, whose OP_InitCoroutine
+	// sits inside the loop (wherecode.c:1550) and restarts the body each time
+	// the loop is entered. Set by OpOpenDerived for derivedSource.rerun.
+	refillEach bool
 
 	// sub, when non-nil, makes this a DERIVED-table cursor whose rows come from
 	// a co-routine (openStreamCursor, vdbe_stream.go) rather than a
@@ -460,7 +465,9 @@ func (cur *vdbeCursor) rewind() error {
 	}
 	if cur.fill != nil {
 		fill := cur.fill
-		cur.fill = nil
+		if !cur.refillEach {
+			cur.fill = nil
+		}
 		rows, rowids, err := fill()
 		if err != nil {
 			return err

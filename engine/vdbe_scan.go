@@ -219,6 +219,11 @@ func compileScanAttempt(p *ReadOnlyPager, stmt *SelectStmt, outer *compiler, row
 	c := &compiler{pager: p, outer: outer, rowOuter: rowOuter, hoist: box, hoisted: hoisted,
 		trig: enclosingTriggerCtx(outer)}
 	c.nQueryLoop, c.nQueryLoopKnown = inheritedNQueryLoop(outer)
+	defer func() {
+		if prog != nil {
+			prog.planNRow, prog.planNRowOK = c.planNRow, c.planNRowOK
+		}
+	}()
 	c.fts3Conjuncts, c.fts3Elsewhere = fts3LangidContext(stmt)
 	// A recursive CTE consumed only through a LIMIT can stop early. SQLite runs
 	// it as a co-routine feeding the outer query (generateWithRecursiveQuery,
@@ -276,6 +281,10 @@ func compileScanAttempt(p *ReadOnlyPager, stmt *SelectStmt, outer *compiler, row
 	// same time; every dispatch below reaches the planner through these same
 	// srcs. See markWherePlanEligibility for what it rules out and why.
 	markWherePlanEligibility(p, c, srcs, stmt)
+	shareSelfJoinViews(p, c, srcs, stmt)
+	if err := markCoroutineReruns(p, c, srcs, stmt); err != nil {
+		return nil, err
+	}
 	if len(stmt.GroupBy) == 0 && !stmt.Distinct && len(stmt.OrderBy) == 0 && stmt.Having == nil &&
 		!selectIsAggregateQuery(stmt) && !selectHasWindow(stmt) && wherePlanIndexOrderDecided(p, c, srcs, stmt) {
 		defer func() {

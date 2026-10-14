@@ -894,6 +894,13 @@ type derivedSource struct {
 	// is where C materializes it. Every other opener reads the rows at once.
 	lazy bool
 
+	// rerun makes the cursor run the body afresh at every rewind instead of
+	// once per execution: C codes this item as a co-routine and its planner
+	// put it in an INNER loop, so OP_InitCoroutine restarts it for each outer
+	// row (wherecode.c:1550). Set by markCoroutineReruns, only for a body that
+	// is not deterministic -- for any other the rows are the same each time.
+	rerun bool
+
 	// keepSubtype is joinSource.keepSubtype: the columns whose subtype the
 	// cursor leaves in place (openDerivedCursor).
 	keepSubtype []bool
@@ -1109,6 +1116,13 @@ type Program struct {
 	// row in another order.
 	OrderUnproven bool
 	ColNames   []string // result column names, in order.
+
+	// planNRow is pWInfo->nRowOut of this program's own FROM clause, as the
+	// ported planner priced it, and planNRowOK says it did. A FROM-clause
+	// subquery's nSelectRow is built from it (cSelectRowEst), and that is the
+	// row estimate the enclosing query's planner gives the subquery's item.
+	planNRow   logEst
+	planNRowOK bool
 
 	// WritePager, when non-nil, is the snapshot a WRITE program's subqueries
 	// read against (a plain read program has none -- it runs against the VM's

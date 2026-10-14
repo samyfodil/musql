@@ -11,6 +11,7 @@ package engine
 
 import (
 	"cmp"
+	"errors"
 	"fmt"
 	"math"
 	"regexp"
@@ -1794,8 +1795,12 @@ func applyTriggerRename(affected []*triggerMeta, oldName string, repl identRepl,
 			if others, ok := r45TriggerColumnRenameSkips(tr, ownerTable, oldName, hasCol); ok {
 				skips.spans = append(skips.spans, others...)
 			}
+			skips.starHas = columnRenameStarHas(ownerTable, oldName, hasCol)
 		}
 		newSQL, rerr := rewriteIdentInSQL(tr.sql, oldName, repl, skips, extra...)
+		if errors.Is(rerr, errRenameStarOrphan) {
+			return fmt.Errorf("engine: error in trigger %s after rename: no such column: %s", tr.name, oldName)
+		}
 		if rerr != nil {
 			return rerr
 		}
@@ -2171,6 +2176,37 @@ type r33rSkips struct {
 	// list, which C's view rename does not walk (alter.c:1584): the declared names
 	// keep the old spelling.
 	spans []byteSpan
+	// starHas, for a COLUMN rename, answers whether a bare "*" over the named
+	// FROM tables expands to a column spelling the old name, as the schema
+	// stood BEFORE the rename; ok is false when it cannot tell. nil leaves an
+	// ORDER BY term beside a "*" undecided (orderByAliasSpans).
+	starHas func(tables []string) (has, ownerOnly, ok bool)
+}
+
+// errRenameStarOrphan is rewriteIdentInSQL's report that an ORDER BY term it
+// left bound to a "*"-expanded column names a column only the renamed table
+// supplied, so the rewritten statement no longer resolves -- C's re-parse
+// (renameTestSchema) fails it "after rename: no such column: <name>".
+var errRenameStarOrphan = errors.New("ORDER BY term bound to a renamed *-expanded column")
+
+// columnRenameStarHas is r33rSkips.starHas for renaming ownerTable's oldName:
+// ownerTable carried the name before the rename, every other table answers
+// through hasCol, and a name hasCol cannot enumerate (a view, a CTE) is unknown.
+func columnRenameStarHas(ownerTable, oldName string, hasCol func(table, col string) bool) func([]string) (bool, bool, bool) {
+	return func(tables []string) (has, ownerOnly, ok bool) {
+		others := false
+		for _, t := range tables {
+			if hasCol(t, "\x00") {
+				return false, false, false
+			}
+			if equalFoldName(t, ownerTable) {
+				has = true
+			} else if hasCol(t, oldName) {
+				has, others = true, true
+			}
+		}
+		return has, has && !others, true
+	}
 }
 
 // rewriteIdentInSQL replaces every identifier token spelling oldName with repl,
@@ -2190,7 +2226,11 @@ func rewriteIdentInSQL(sqlText, oldName string, repl identRepl, skips r33rSkips,
 	var aliased []byteSpan
 	if !repl.isTable {
 		var unsure bool
-		aliased, unsure = orderByAliasSpans(toks, oldName)
+		var orphan bool
+		aliased, unsure, orphan = orderByAliasSpans(toks, oldName, skips.starHas)
+		if orphan {
+			return "", errRenameStarOrphan
+		}
 		if unsure {
 			return "", fmt.Errorf("%w: ALTER TABLE RENAME COLUMN: an ORDER BY term %q beside a * in the select list may name an expanded result column, which C binds before any table column and so leaves alone; the rewrite cannot tell without expanding the star", errVDBEUnsupported, oldName)
 		}
@@ -2223,9 +2263,16 @@ func rewriteIdentInSQL(sqlText, oldName string, repl identRepl, skips r33rSkips,
 // alias-first; GROUP BY and WHERE prefer a table column.
 //
 // A "*" (or "t.*") in the select list names every column of its sources, and the
-// expansion's names are matched the same way; without the schema that cannot be
-// decided, so unsure reports an ORDER BY term of that name beside one.
-func orderByAliasSpans(toks []token, name string) (out []byteSpan, unsure bool) {
+// expansion's names are matched the same way: starHas, given the SELECT's FROM
+// tables, says whether a bare "*" produces the name. Without it -- or for a
+// qualified "t.*", or a FROM clause it cannot read -- unsure reports an ORDER BY
+// term of that name beside one. So with src(c1, c2, b),
+//
+//	SELECT * FROM src ORDER BY b      -- RENAME src.b TO bb
+//
+// leaves "ORDER BY b" bound to the expanded column, and the renamed trigger
+// then fails its re-parse: "no such column: b".
+func orderByAliasSpans(toks []token, name string, starHas func(tables []string) (has, ownerOnly, ok bool)) (out []byteSpan, unsure, orphan bool) {
 	isKw := func(t token, kw string) bool { return t.kind == tkIdent && !t.quoted && t.upper() == kw }
 	depthAt := make([]int, len(toks)+1)
 	d := 0
@@ -2254,7 +2301,7 @@ func orderByAliasSpans(toks []token, name string) (out []byteSpan, unsure bool) 
 		if sel < 0 {
 			continue
 		}
-		aliased, star := false, false
+		aliased, star, qualStar, from, starOrphan := false, false, false, -1, false
 		for j := sel + 1; j < i && !aliased; j++ {
 			if depthAt[j] < dep {
 				break
@@ -2262,6 +2309,9 @@ func orderByAliasSpans(toks []token, name string) (out []byteSpan, unsure bool) 
 			if depthAt[j] == dep && toks[j].kind == tkIdent && !toks[j].quoted {
 				switch toks[j].upper() {
 				case "FROM", "WHERE", "GROUP", "HAVING", "WINDOW":
+					if toks[j].upper() == "FROM" {
+						from = j
+					}
 					j = i
 					continue
 				}
@@ -2270,10 +2320,23 @@ func orderByAliasSpans(toks []token, name string) (out []byteSpan, unsure bool) 
 				(j == sel+1 || isKw(toks[j-1], "DISTINCT") || isKw(toks[j-1], "ALL") ||
 					(toks[j-1].kind == tkPunct && (toks[j-1].text == "," || toks[j-1].text == "."))) {
 				star = true
+				if toks[j-1].kind == tkPunct && toks[j-1].text == "." {
+					qualStar = true
+				}
 			}
 			if depthAt[j] == dep && isKw(toks[j], "AS") && j+1 < i &&
 				toks[j+1].kind == tkIdent && equalFoldName(toks[j+1].text, name) {
 				aliased = true
+			}
+		}
+		// A bare "*" whose expansion the schema can name decides the term as an
+		// alias would: it binds to the expanded column when one spells the name.
+		if star && !aliased && !qualStar && starHas != nil && from >= 0 {
+			if names, _, sok := r45ScanFlatFromClause(toks[from:i]); sok && len(names) > 0 {
+				if has, ownerOnly, hok := starHas(names); hok {
+					star, aliased = false, has
+					starOrphan = ownerOnly
+				}
 			}
 		}
 		if !aliased && !star {
@@ -2322,12 +2385,15 @@ func orderByAliasSpans(toks []token, name string) (out []byteSpan, unsure bool) 
 			}
 			if end && aliased {
 				out = append(out, byteSpan{t.Start, t.End})
+				if starOrphan {
+					orphan = true
+				}
 			} else if end {
 				unsure = true
 			}
 		}
 	}
-	return out, unsure
+	return out, unsure, orphan
 }
 
 // isCallNameToken reports whether toks[i] is followed by "(", i.e. names a
@@ -3001,7 +3067,13 @@ func applyViewRename(affected []*viewMeta, oldName string, repl identRepl, verb 
 			// these are recoverable for every affected view, or declined.
 			skips.spans = append(skips.spans, tableRefs...)
 		}
+		if !repl.isTable && ownerTable != "" && hasCol != nil {
+			skips.starHas = columnRenameStarHas(ownerTable, oldName, hasCol)
+		}
 		newSQL, rerr := rewriteIdentInSQL(v.sql, oldName, repl, skips, extra...)
+		if errors.Is(rerr, errRenameStarOrphan) {
+			return fmt.Errorf("engine: error in view %s after rename: no such column: %s", v.name, oldName)
+		}
 		if rerr != nil {
 			return rerr
 		}
@@ -5001,7 +5073,7 @@ func (db *DB) checkSchemaObjectsResolve(tbl *tableMeta) error {
 			// table: main.<vtab>" -- verified against 3.53.3, which accepts it
 			// and rewrites the trigger.
 			if db.findTableMeta(n) == nil && db.findViewMeta(n) == nil && db.findVtabMeta(n) == nil {
-				if allowAttached && db.firstAttachedTable(n) != nil {
+				if allowAttached && db.attachedTableAnywhere(n) {
 					continue
 				}
 				return n
@@ -6808,6 +6880,20 @@ func r45TriggerWalk(tr *triggerMeta, name string, quals, aliases bool) int {
 // schema knowledge. "SELECT t.a FROM t JOIN o ON t.a=o.a" renaming t.a becomes
 // "SELECT t.q FROM t JOIN o ON t.q=o.a".
 func r45ViewColumnRenameSkips(sqlText, tblName, oldName string, hasCol func(table, col string) bool) (skips []byteSpan, ok bool) {
+	if skips, ok := r45FlatViewColumnRenameSkips(sqlText, tblName, oldName, hasCol); ok {
+		return skips, true
+	}
+	// applyViewRename asks after tblName's column has already been renamed, and
+	// checkViewColumnRenameSafe before: tblName carries oldName for both.
+	carries := func(table, col string) bool {
+		return (equalFoldName(table, tblName) && equalFoldName(col, oldName)) || hasCol(table, col)
+	}
+	return nestedViewColumnRenameSkips(sqlText, tblName, oldName, carries)
+}
+
+// r45FlatViewColumnRenameSkips is r45ViewColumnRenameSkips for a body of one
+// SELECT with no nesting.
+func r45FlatViewColumnRenameSkips(sqlText, tblName, oldName string, hasCol func(table, col string) bool) (skips []byteSpan, ok bool) {
 	stmt, perr := parseCreateViewStmt(sqlText)
 	if perr != nil || stmt == nil || stmt.selectStmt == nil {
 		return nil, false
@@ -6893,6 +6979,327 @@ func r45ViewColumnRenameSkips(sqlText, tblName, oldName string, hasCol func(tabl
 	return skips, true
 }
 
+
+// nestedViewColumnRenameSkips is r45ViewColumnRenameSkips for a body whose
+// SELECTs nest (subqueries in its expressions), resolving each reference the
+// way C's resolver does (lookupName, resolve.c): a qualified one by the
+// innermost FROM item answering to its qualifier, a bare one by the innermost
+// SELECT whose FROM tables carry the column -- exactly one of them, or the
+// reference was ambiguous and C would not have accepted the view -- moving
+// outward through the enclosing SELECTs when none does. So in
+//
+//	SELECT u.b FROM u WHERE EXISTS (SELECT 1 FROM t WHERE b = 1)
+//
+// the inner b is t's and the outer u.b is u's. ok is false for anything it
+// does not model: a WITH, a compound, VALUES, a FROM item that is not a base
+// table (a derived table, a table function, a join group, a view), a USING
+// list, a result-column alias spelling the name, a name after AS or COLLATE (an
+// alias, a CAST type, a collation), or a column list on the view itself.
+func nestedViewColumnRenameSkips(sqlText, tblName, oldName string, hasCol func(table, col string) bool) (skips []byteSpan, ok bool) {
+	stmt, perr := parseCreateViewStmt(sqlText)
+	if perr != nil || stmt == nil || stmt.selectStmt == nil {
+		return nil, false
+	}
+	parsedAlias := selectAliasesName(stmt.selectStmt, oldName)
+	toks, lerr := lex(sqlText)
+	if lerr != nil {
+		return nil, false
+	}
+	isKw := func(t token, words ...string) bool {
+		if t.kind != tkIdent || t.quoted {
+			return false
+		}
+		u := t.upper()
+		for _, w := range words {
+			if u == w {
+				return true
+			}
+		}
+		return false
+	}
+	isPunct := func(t token, p string) bool { return t.kind == tkPunct && t.text == p }
+	// The body starts at the first SELECT; the CREATE VIEW header before it
+	// names no column.
+	first := -1
+	for i, t := range toks {
+		if isPunct(t, "(") {
+			return nil, false // "CREATE VIEW v(x, y) AS ...": not modelled
+		}
+		if isKw(t, "SELECT") {
+			first = i
+			break
+		}
+	}
+	if first < 0 {
+		return nil, false
+	}
+	// endOf is where the SELECT at i ends: the token where the paren depth
+	// falls below its own, or the end of the statement.
+	endOf := func(i int) int {
+		depth := 0
+		for j := i; j < len(toks); j++ {
+			t := toks[j]
+			if t.kind == tkEOF {
+				return j
+			}
+			if isPunct(t, "(") {
+				depth++
+			} else if isPunct(t, ")") {
+				if depth == 0 {
+					return j
+				}
+				depth--
+			}
+		}
+		return len(toks)
+	}
+	type fromItem struct{ table, alias string }
+	type scope struct {
+		start, end int // the SELECT's token range [start, end)
+		parent     int // the enclosing SELECT's index in scopes, -1 for none
+		from       []fromItem
+		// aliased: the select list names a result column oldName, which a
+		// bare reference that no table of this SELECT answers binds to
+		// before any enclosing SELECT's tables (lookupName's NC_UEList step,
+		// resolve.c), and which ORDER BY binds to first.
+		aliased bool
+	}
+	foundAlias := false
+	var scopes []scope
+	nameSkip := map[int]bool{} // FROM-item names and aliases: never a column
+	for i := first; i < len(toks); i++ {
+		if isKw(toks[i], "WITH", "UNION", "EXCEPT", "INTERSECT", "VALUES") {
+			return nil, false
+		}
+		if !isKw(toks[i], "SELECT") {
+			continue
+		}
+		sc := scope{start: i, end: endOf(i), parent: -1}
+		for k := len(scopes) - 1; k >= 0; k-- {
+			if scopes[k].start < i && i < scopes[k].end {
+				sc.parent = k
+				break
+			}
+		}
+		// This SELECT's own FROM keyword, at its own paren depth, and the
+		// result-column aliases before it: "AS name", or a bare "expr name"
+		// ending a result column.
+		depth := 0
+		j := i + 1
+		for ; j < sc.end; j++ {
+			if isPunct(toks[j], "(") {
+				depth++
+			} else if isPunct(toks[j], ")") {
+				depth--
+			} else if depth == 0 && isKw(toks[j], "FROM") {
+				break
+			} else if depth == 0 && toks[j].kind == tkIdent && equalFoldName(toks[j].text, oldName) && j > i+1 {
+				prev := toks[j-1]
+				endsCol := j+1 >= sc.end || isPunct(toks[j+1], ",") || isKw(toks[j+1], "FROM") || toks[j+1].kind == tkEOF
+				if isKw(prev, "AS") || (endsCol && (isPunct(prev, ")") || prev.kind == tkString || prev.kind == tkNumber ||
+					(prev.kind == tkIdent && !isKw(prev, "SELECT", "DISTINCT", "ALL", "AND", "OR", "NOT", "IS", "IN", "LIKE", "GLOB", "THEN", "ELSE", "WHEN", "CASE", "BETWEEN", "ESCAPE", "COLLATE")))) {
+					sc.aliased = true
+					foundAlias = true
+					nameSkip[j] = true
+				}
+			}
+		}
+		expectName := true
+		for j++; j < sc.end; j++ {
+			t := toks[j]
+			if isKw(t, "WHERE", "GROUP", "ORDER", "LIMIT", "HAVING", "WINDOW") {
+				break
+			}
+			switch {
+			case isPunct(t, "("):
+				return nil, false // a derived table, table function or join group
+			case isPunct(t, ","), isKw(t, "JOIN"):
+				expectName = true
+				continue
+			case isKw(t, "NATURAL", "LEFT", "RIGHT", "FULL", "INNER", "CROSS", "OUTER", "AS"):
+				continue
+			case isKw(t, "USING", "INDEXED", "NOT"):
+				return nil, false
+			case isKw(t, "ON"):
+				// The ON expression runs to the next join keyword, comma or clause;
+				// its names are this scope's column references, scanned below, and
+				// its SELECTs are scopes of their own.
+				for j+1 < sc.end && !isPunct(toks[j+1], ",") && !isKw(toks[j+1], "JOIN", "NATURAL", "LEFT", "RIGHT", "FULL", "INNER", "CROSS", "WHERE", "GROUP", "ORDER", "LIMIT", "HAVING", "WINDOW") {
+					j++
+					if isPunct(toks[j], "(") {
+						if j = endOf(j + 1); j >= sc.end {
+							return nil, false
+						}
+					}
+				}
+				continue
+			}
+			if !isNameToken(t) {
+				return nil, false
+			}
+			if expectName {
+				if j+2 < sc.end && isPunct(toks[j+1], ".") && isNameToken(toks[j+2]) {
+					nameSkip[j] = true // the schema qualifier
+					j += 2
+					t = toks[j]
+				}
+				nm := t.text
+				if t.kind == tkString {
+					nm = t.str
+				}
+				// A name whose columns hasCol cannot enumerate (a view, a CTE)
+				// answers true for any column; such a FROM item is not modelled.
+				if hasCol(nm, "\x00") {
+					return nil, false
+				}
+				sc.from = append(sc.from, fromItem{table: nm})
+				nameSkip[j] = true
+				expectName = false
+				continue
+			}
+			if len(sc.from) == 0 || sc.from[len(sc.from)-1].alias != "" {
+				return nil, false
+			}
+			al := t.text
+			if t.kind == tkString {
+				al = t.str
+			}
+			sc.from[len(sc.from)-1].alias = al
+			nameSkip[j] = true
+		}
+		scopes = append(scopes, sc)
+	}
+	if parsedAlias != foundAlias {
+		return nil, false // the parser sees an alias the token scan does not, or the reverse
+	}
+	innermost := func(i int) int {
+		for k := len(scopes) - 1; k >= 0; k-- {
+			if scopes[k].start < i && i < scopes[k].end {
+				return k
+			}
+		}
+		return -1
+	}
+	for i := first; i < len(toks); i++ {
+		t := toks[i]
+		if t.kind != tkIdent || !equalFoldName(t.text, oldName) {
+			continue
+		}
+		if nameSkip[i] {
+			skips = append(skips, byteSpan{t.Start, t.End})
+			continue
+		}
+		if i+1 < len(toks) && isPunct(toks[i+1], ".") {
+			continue // a qualifier; rewriteIdentInSQL already leaves it alone
+		}
+		if i > 0 && isKw(toks[i-1], "AS", "COLLATE") {
+			return nil, false
+		}
+
+		if i+1 < len(toks) && isPunct(toks[i+1], "(") {
+			return nil, false // a function name
+		}
+		k := innermost(i)
+		if k < 0 {
+			return nil, false
+		}
+		owner := ""
+		if i >= 2 && isPunct(toks[i-1], ".") && isNameToken(toks[i-2]) {
+			if i >= 4 && isPunct(toks[i-3], ".") {
+				return nil, false // schema.table.column
+			}
+			q := toks[i-2].text
+			if toks[i-2].kind == tkString {
+				q = toks[i-2].str
+			}
+			for ; k >= 0 && owner == ""; k = scopes[k].parent {
+				for _, f := range scopes[k].from {
+					key := f.table
+					if f.alias != "" {
+						key = f.alias
+					}
+					if equalFoldName(key, q) {
+						owner = f.table
+						break
+					}
+				}
+			}
+		} else {
+			if scopes[k].aliased {
+				return nil, false // ORDER BY binds the alias first
+			}
+			for ; k >= 0 && owner == ""; k = scopes[k].parent {
+				n := 0
+				for _, f := range scopes[k].from {
+					if hasCol(f.table, oldName) {
+						n++
+						owner = f.table
+					}
+				}
+				if n > 1 {
+					return nil, false
+				}
+				if n == 0 && scopes[k].aliased {
+					return nil, false // the reference may be the alias
+				}
+			}
+		}
+		if owner == "" {
+			return nil, false
+		}
+		if !equalFoldName(owner, tblName) {
+			skips = append(skips, byteSpan{t.Start, t.End})
+		}
+	}
+	return skips, true
+}
+
+// selectAliasesName reports whether any result column of s, or of a SELECT
+// nested in it, is aliased to name: a bare reference can bind to the alias
+// ahead of every table column.
+func selectAliasesName(s *SelectStmt, name string) bool {
+	found := false
+	var sel func(s *SelectStmt)
+	var expr func(e Expr)
+	expr = func(e Expr) {
+		switch x := e.(type) {
+		case nil:
+			return
+		case SubqueryExpr:
+			sel(x.Stmt)
+		case ExistsExpr:
+			sel(x.Stmt)
+		case InExpr:
+			sel(x.Sub)
+		}
+		walkExprOperands(e, expr)
+	}
+	sel = func(s *SelectStmt) {
+		if s == nil || found {
+			return
+		}
+		for _, c := range s.Columns {
+			if c.HasAlias && equalFoldName(c.Alias, name) {
+				found = true
+			}
+			expr(c.Expr)
+		}
+		for _, it := range s.From {
+			sel(it.Subquery)
+			expr(it.On)
+		}
+		expr(s.Where)
+		expr(s.Having)
+		for _, g := range s.GroupBy {
+			expr(g)
+		}
+		for _, o := range s.OrderBy {
+			expr(o.Expr)
+		}
+	}
+	sel(s)
+	return found
+}
 
 // tableHasColumn reports whether the named table has that column. A name whose
 // columns cannot be enumerated (view, CTE, table function) answers true, since
