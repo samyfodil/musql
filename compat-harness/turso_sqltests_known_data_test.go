@@ -5,12 +5,10 @@ package compat
 // deferred; see tsKnownEntry.
 
 func init() {
-	tsKnownGroup("2026-10-12: CTE corners: WITH ... RETURNING (SELECT ... FROM cte) is declined",
-		"cte.sqltest::memory::cte-delete-returning-subquery",
+	tsKnownGroup("2026-10-14: CTE corners: INSERT ... RETURNING (SELECT ... FROM cte) is declined (this parser merges a leading WITH into the INSERT's SELECT, so the RETURNING scope cannot be told apart)",
 		"cte.sqltest::memory::cte-insert-returning-multi-subquery",
 		"cte.sqltest::memory::cte-insert-returning-subquery",
 		"cte.sqltest::memory::cte-insert-values-and-returning-subquery",
-		"cte.sqltest::memory::cte-update-returning-subquery",
 	)
 	tsKnownGroup("2026-10-12: GROUP BY without FROM combined with HAVING is declined",
 		"aggregate-filter-in-subquery-grouped.sqltest::memory::having-filter-in-subquery-no-from",
@@ -27,11 +25,6 @@ func init() {
 		"check_constraint.sqltest::memory::check_constraint_error_dequotes_leading_quoted_token",
 		"check_constraint.sqltest::memory::check_constraint_rename_column_to_keyword_violation",
 		"check_constraint.sqltest::memory::check_constraint_rename_table_qualified_ref_still_enforced",
-	)
-	tsKnownGroup("2026-10-12: UPDATE ... FROM ... RETURNING with a subquery over the statement's CTE is declined (the RETURNING subquery cannot see the WITH clause)",
-		"update-from.sqltest::memory::update-from-returning-reuses-cte-snapshot-after-trigger-mutation",
-		"update-from.sqltest::memory::update-from-returning-reuses-row-cte-snapshot-after-trigger-mutation",
-		"update-from.sqltest::memory::update-from-returning-subquery-can-see-cte",
 	)
 	tsKnownGroup("2026-10-12: generated columns: GLOB in a generated expression is declined, ALTER/CHECK/DEFAULT diagnostics are worded differently, window-function misuse text, and the oracle's driver returns a REAL generated column as an integer",
 		"gencol.sqltest::memory::gencol_glob_in_expression",
@@ -99,7 +92,6 @@ func init() {
 		"strict.sqltest::memory::strict-insert-select-any-to-blob-rejects-xfer",
 	)
 	tsKnownGroup("2026-10-12: subquery corners: a correlated scalar subquery in GROUP BY over a join and exists() inside an aggregate are declined, and a row value in an aggregate argument or HAVING is worded differently",
-		"subquery/memory.sqltest::memory::subquery-correlated-in-group-by-with-join",
 		"subquery/memory.sqltest::memory::subquery-exists-false-in-aggregate",
 		"subquery/memory.sqltest::memory::subquery-vector-in-aggregate-arg",
 		"subquery/memory.sqltest::memory::subquery-vector-in-having",
@@ -141,9 +133,6 @@ func init() {
 		"upsert-expr-index.sqltest::memory::upsert-expr-index-no-conflict",
 	)
 	tsKnownGroup("2026-10-12: views: a circular definition is reported through the VDBE-only wrapper, and pragma_table_info over views built from USING/NATURAL/CTE stars lists different columns or is declined",
-		"views.sqltest::memory::view-star-expands-the-columns-of-other-views",
-		"views.sqltest::memory::view-star-natural-join-with-derived-table",
-		"views.sqltest::memory::view-star-using-with-cte",
 		"views.sqltest::memory::view-mutual-circle-detection",
 		"views.sqltest::memory::view-self-circle-detection",
 	)

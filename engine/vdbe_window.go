@@ -658,11 +658,66 @@ func windowOuterOrderDropped(plan *windowPlan) bool {
 			e = plan.outs[plan.orderOrdinal[i]]
 		}
 		k := sortKeys[i]
-		if t.Desc != k.desc || t.Nulls != k.nulls || !reflect.DeepEqual(e, k.e) {
+		if t.Desc != k.desc || t.Nulls != k.nulls || !plan.sameSortKey(e, k.e) {
 			return false
 		}
 	}
 	return true
+}
+
+// sameSortKey is sqlite3ExprCompare (expr.c) between an outer ORDER BY term
+// and a window sort key, both resolved: two column references are the same
+// when they name one column of one FROM item, however each is spelled (the
+// TK_COLUMN arm compares iTable and iColumn, not the written qualifier), so
+// "ORDER BY w.id" repeats "OVER (ORDER BY id)" over FROM w. Anything else is
+// compared as written.
+func (plan *windowPlan) sameSortKey(a, b Expr) bool {
+	if reflect.DeepEqual(a, b) {
+		return true
+	}
+	ca, okA := a.(ColumnExpr)
+	cb, okB := b.(ColumnExpr)
+	if !okA || !okB {
+		return false
+	}
+	sa, ia, okA := plan.columnIdentity(ca)
+	sb, ib, okB := plan.columnIdentity(cb)
+	return okA && okB && sa == sb && ia == ib
+}
+
+// columnIdentity resolves a plain column reference against the window
+// query's FROM items: the item and the column it names. ok is false for
+// anything it does not settle -- a rowid, a USING column, a name two items
+// carry, a qualifier naming another database -- which answers "not the same".
+func (plan *windowPlan) columnIdentity(c ColumnExpr) (scope, col int, ok bool) {
+	if !reflect.DeepEqual(c, ColumnExpr{Schema: c.Schema, Qualifier: c.Qualifier, Name: c.Name}) {
+		return 0, 0, false
+	}
+	if c.Schema != "" && (c.Qualifier == "" || !equalFoldName(c.Schema, "main")) {
+		return 0, 0, false
+	}
+	scope = -1
+	for i := range plan.scopes {
+		s := &plan.scopes[i]
+		if s.unqualifiedHidden || len(s.coalesced) != 0 || len(s.coalesceFallback) != 0 {
+			return 0, 0, false
+		}
+		if c.Qualifier != "" && !equalFoldName(s.name, c.Qualifier) {
+			continue
+		}
+		if c.Schema != "" && s.dbIdx != 0 {
+			return 0, 0, false
+		}
+		j, has := s.colIndex[r33sFoldIdent(c.Name)]
+		if !has {
+			continue
+		}
+		if scope >= 0 {
+			return 0, 0, false
+		}
+		scope, col = i, j
+	}
+	return scope, col, scope >= 0
 }
 
 // orderTermExprs pulls the expressions out of a window spec's ORDER BY terms.

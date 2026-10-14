@@ -1973,6 +1973,19 @@ func r34vTriggerExprs(tr *triggerMeta) []Expr {
 // Declining reproduces that refusal; where the outer select does not reference
 // name, the rewrite is right.
 func r34vDerivedRebindsColumn(sel *SelectStmt, name string) bool {
+	return r34vDerivedRebindsColumnBy(sel, name, true)
+}
+
+// viewColumnRenameAttributable reports whether r45ViewColumnRenameSkips
+// attributes every reference to oldName in v.
+func viewColumnRenameAttributable(v *viewMeta, tblName, oldName string, hasCol func(table, col string) bool) bool {
+	_, ok := r45ViewColumnRenameSkips(v.sql, tblName, oldName, hasCol)
+	return ok
+}
+
+// r34vDerivedRebindsColumnBy is r34vDerivedRebindsColumn, counting a derived
+// table's column named by an alias only when aliased is true.
+func r34vDerivedRebindsColumnBy(sel *SelectStmt, name string, aliased bool) bool {
 	if sel == nil {
 		return false
 	}
@@ -1987,7 +2000,7 @@ func r34vDerivedRebindsColumn(sel *SelectStmt, name string) bool {
 				if !equalFoldName(cte.Name, it.Table) {
 					continue
 				}
-				if r34vCTEOutputsColumn(cte, name) && r34vSelectRefsColumn(sel, name) {
+				if r34vCTEOutputsColumnBy(cte, name, aliased) && r34vSelectRefsColumn(sel, name) {
 					return true
 				}
 			}
@@ -1996,20 +2009,20 @@ func r34vDerivedRebindsColumn(sel *SelectStmt, name string) bool {
 		if it.Subquery == nil {
 			continue
 		}
-		if r34vSubqueryOutputsColumn(it.Subquery, name) && r34vSelectRefsColumn(sel, name) {
+		if r34vSubqueryOutputsColumnBy(it.Subquery, name, aliased) && r34vSelectRefsColumn(sel, name) {
 			return true
 		}
-		if r34vDerivedRebindsColumn(it.Subquery, name) {
+		if r34vDerivedRebindsColumnBy(it.Subquery, name, aliased) {
 			return true
 		}
 	}
 	for _, arm := range sel.Compound {
-		if r34vDerivedRebindsColumn(arm.Stmt, name) {
+		if r34vDerivedRebindsColumnBy(arm.Stmt, name, aliased) {
 			return true
 		}
 	}
 	for _, cte := range sel.CTEs {
-		if r34vDerivedRebindsColumn(cte.Select, name) {
+		if r34vDerivedRebindsColumnBy(cte.Select, name, aliased) {
 			return true
 		}
 	}
@@ -2020,7 +2033,16 @@ func r34vDerivedRebindsColumn(sel *SelectStmt, name string) bool {
 // name: its explicit "(col, ...)" rename list decides on its own when present,
 // otherwise its body's own result columns do.
 func r34vCTEOutputsColumn(cte CTEDef, name string) bool {
+	return r34vCTEOutputsColumnBy(cte, name, true)
+}
+
+// r34vCTEOutputsColumnBy is r34vCTEOutputsColumn, counting a column the CTE
+// names by its rename list or an alias only when aliased is true.
+func r34vCTEOutputsColumnBy(cte CTEDef, name string, aliased bool) bool {
 	if cte.ColNames != nil {
+		if !aliased {
+			return false
+		}
 		for _, c := range cte.ColNames {
 			if equalFoldName(c, name) {
 				return true
@@ -2028,13 +2050,19 @@ func r34vCTEOutputsColumn(cte CTEDef, name string) bool {
 		}
 		return false
 	}
-	return r34vSubqueryOutputsColumn(cte.Select, name)
+	return r34vSubqueryOutputsColumnBy(cte.Select, name, aliased)
 }
 
 // r34vSubqueryOutputsColumn reports whether sub's result columns can include
 // one named name: an explicit "AS name", a bare "name" reference, or a "*"
 // (whose expansion this static pass cannot see, so it answers yes).
 func r34vSubqueryOutputsColumn(sub *SelectStmt, name string) bool {
+	return r34vSubqueryOutputsColumnBy(sub, name, true)
+}
+
+// r34vSubqueryOutputsColumnBy is r34vSubqueryOutputsColumn, counting an
+// "AS name" column only when aliased is true.
+func r34vSubqueryOutputsColumnBy(sub *SelectStmt, name string, aliased bool) bool {
 	if sub == nil {
 		return false
 	}
@@ -2043,7 +2071,7 @@ func r34vSubqueryOutputsColumn(sub *SelectStmt, name string) bool {
 		case c.Star:
 			return true
 		case c.HasAlias:
-			if equalFoldName(c.Alias, name) {
+			if aliased && equalFoldName(c.Alias, name) {
 				return true
 			}
 		default:
@@ -2979,7 +3007,11 @@ func (db *DB) checkViewColumnRenameSafe(tbl *tableMeta, oldName, newName, verb s
 		// A reference that binds to a derived table's own column is not rewritten
 		// (alter.c:1022) while the subquery's inner one is, so the view no longer
 		// resolves; r34vDerivedRebindsColumn is the trigger cascade's test for it.
-		if r34vDerivedRebindsColumn(v.selectStmt, oldName) {
+		// A column the derived table names with an alias keeps its name, so
+		// the reference still binds: the rename goes ahead, leaving it, once
+		// r45ViewColumnRenameSkips attributes every reference.
+		if r34vDerivedRebindsColumn(v.selectStmt, oldName) &&
+			(r34vDerivedRebindsColumnBy(v.selectStmt, oldName, false) || !viewColumnRenameAttributable(v, tbl.name, oldName, db.tableHasColumn)) {
 			return nil, fmt.Errorf("engine: unsupported: %s: renaming %s.%s, which view %s references THROUGH a derived table that outputs a column of the same name, is not supported by this write path (the reference resolves to the SUBQUERY's column, which C SQLite leaves alone, and the view-body rewrite could not tell the two apart)", verb, tbl.name, oldName, v.name)
 		}
 		if emptyInBlocks(v.sql, oldName) {
@@ -6949,6 +6981,10 @@ func r45FlatViewColumnRenameSkips(sqlText, tblName, oldName string, hasCol func(
 	for _, r := range refs {
 		isRef[r] = true
 	}
+	// An ORDER BY term bound to a result column -- an alias, or a "*"
+	// expansion -- names no table column, so who carries the name does not
+	// matter; rewriteIdentInSQL leaves it, or reports the expansion orphaned.
+	resultBound, _, _ := orderByAliasSpans(toks, oldName, columnRenameStarHas(tblName, oldName, hasCol))
 	for i, t := range toks {
 		if t.kind != tkIdent || !equalFoldName(t.text, oldName) {
 			continue
@@ -6967,6 +7003,9 @@ func r45FlatViewColumnRenameSkips(sqlText, tblName, oldName string, hasCol func(
 				return nil, false // a qualifier naming no FROM item of this body
 			}
 		} else {
+			if spansContain(resultBound, t.Start) {
+				continue
+			}
 			if carriers != 1 {
 				return nil, false // bare and ambiguous: needs real resolution
 			}
@@ -7053,7 +7092,24 @@ func nestedViewColumnRenameSkips(sqlText, tblName, oldName string, hasCol func(t
 		}
 		return len(toks)
 	}
-	type fromItem struct{ table, alias string }
+	// A derived table's item has no table; cols are its result names, each
+	// one an alias (a bare column reference spelling the name is not
+	// modelled, as renaming it would change the name the item exposes).
+	type fromItem struct {
+		table, alias string
+		derived      bool
+		cols         map[string]bool
+	}
+	carries := func(f fromItem) bool {
+		if f.derived {
+			return f.cols[r33sFoldIdent(oldName)]
+		}
+		return hasCol(f.table, oldName)
+	}
+	// derivedParent: a derived table's SELECT resolves outside the SELECT
+	// whose FROM holds it, in that SELECT's own enclosing scope
+	// (sqlite3ResolveSelectNames' pOuterNC, resolve.c).
+	derivedParent := map[int]int{}
 	type scope struct {
 		start, end int // the SELECT's token range [start, end)
 		parent     int // the enclosing SELECT's index in scopes, -1 for none
@@ -7063,6 +7119,11 @@ func nestedViewColumnRenameSkips(sqlText, tblName, oldName string, hasCol func(t
 		// before any enclosing SELECT's tables (lookupName's NC_UEList step,
 		// resolve.c), and which ORDER BY binds to first.
 		aliased bool
+		// groupAt is where this SELECT's own GROUP BY or ORDER BY begins (end
+		// when it has neither): a term there is matched against the result
+		// aliases first (resolveOrderGroupBy's resolveAsName, resolve.c);
+		// before it, a table column wins.
+		groupAt int
 	}
 	foundAlias := false
 	var scopes []scope
@@ -7080,6 +7141,9 @@ func nestedViewColumnRenameSkips(sqlText, tblName, oldName string, hasCol func(t
 				sc.parent = k
 				break
 			}
+		}
+		if p, ok := derivedParent[i]; ok {
+			sc.parent = p
 		}
 		// This SELECT's own FROM keyword, at its own paren depth, and the
 		// result-column aliases before it: "AS name", or a bare "expr name"
@@ -7105,14 +7169,41 @@ func nestedViewColumnRenameSkips(sqlText, tblName, oldName string, hasCol func(t
 			}
 		}
 		expectName := true
+		sc.groupAt = sc.end
 		for j++; j < sc.end; j++ {
 			t := toks[j]
 			if isKw(t, "WHERE", "GROUP", "ORDER", "LIMIT", "HAVING", "WINDOW") {
+				d := 0
+				for g := j; g < sc.end; g++ {
+					if isPunct(toks[g], "(") {
+						d++
+					} else if isPunct(toks[g], ")") {
+						d--
+					} else if d == 0 && isKw(toks[g], "GROUP", "ORDER") {
+						sc.groupAt = g
+						break
+					}
+				}
 				break
 			}
 			switch {
+			case isPunct(t, "(") && expectName && j+1 < sc.end && isKw(toks[j+1], "SELECT"):
+				// A derived table: its result names, read off its select list.
+				end := endOf(j + 1)
+				if end >= sc.end {
+					return nil, false
+				}
+				cols, cok := derivedResultNames(toks[j+2:end], oldName)
+				if !cok {
+					return nil, false
+				}
+				sc.from = append(sc.from, fromItem{derived: true, cols: cols})
+				derivedParent[j+1] = sc.parent
+				expectName = false
+				j = end
+				continue
 			case isPunct(t, "("):
-				return nil, false // a derived table, table function or join group
+				return nil, false // a table function or join group
 			case isPunct(t, ","), isKw(t, "JOIN"):
 				expectName = true
 				continue
@@ -7218,22 +7309,28 @@ func nestedViewColumnRenameSkips(sqlText, tblName, oldName string, hasCol func(t
 					if f.alias != "" {
 						key = f.alias
 					}
-					if equalFoldName(key, q) {
+					if key != "" && equalFoldName(key, q) {
 						owner = f.table
+						if f.derived {
+							owner = "\x00derived"
+						}
 						break
 					}
 				}
 			}
 		} else {
-			if scopes[k].aliased {
+			if scopes[k].aliased && i > scopes[k].groupAt {
 				return nil, false // ORDER BY binds the alias first
 			}
 			for ; k >= 0 && owner == ""; k = scopes[k].parent {
 				n := 0
 				for _, f := range scopes[k].from {
-					if hasCol(f.table, oldName) {
+					if carries(f) {
 						n++
 						owner = f.table
+						if f.derived {
+							owner = "\x00derived"
+						}
 					}
 				}
 				if n > 1 {
@@ -7252,6 +7349,79 @@ func nestedViewColumnRenameSkips(sqlText, tblName, oldName string, hasCol func(t
 		}
 	}
 	return skips, true
+}
+
+// derivedResultNames reads a derived table's result names off the tokens of
+// its SELECT (after the keyword, up to its closing parenthesis): each column's
+// alias, a bare or qualified column reference's name, or nothing for any other
+// expression (C names it by its text, which cannot be a bare name). ok is false
+// for a "*", for a column spelling name without an alias -- renaming the
+// column it reads would rename what the item exposes -- and for anything the
+// scan does not follow.
+func derivedResultNames(toks []token, name string) (cols map[string]bool, ok bool) {
+	isKw := func(t token, w string) bool { return t.kind == tkIdent && !t.quoted && t.upper() == w }
+	cols = map[string]bool{}
+	depth, start := 0, 0
+	if len(toks) > 0 && (isKw(toks[0], "DISTINCT") || isKw(toks[0], "ALL")) {
+		start = 1
+	}
+	end := len(toks)
+	var parts [][]token
+	for j := start; j < len(toks); j++ {
+		t := toks[j]
+		switch {
+		case t.kind == tkPunct && t.text == "(":
+			depth++
+		case t.kind == tkPunct && t.text == ")":
+			depth--
+		case depth == 0 && t.kind == tkPunct && t.text == ",":
+			parts = append(parts, toks[start:j])
+			start = j + 1
+		case depth == 0 && isKw(t, "FROM"):
+			end = j
+		}
+		if end != len(toks) {
+			break
+		}
+	}
+	parts = append(parts, toks[start:end])
+	for _, cs := range parts {
+		n := len(cs)
+		if n == 0 {
+			return nil, false
+		}
+		for _, t := range cs {
+			if t.kind == tkPunct && t.text == "*" && n <= 3 {
+				return nil, false
+			}
+		}
+		last := cs[n-1]
+		switch {
+		case n == 1 && isNameToken(last):
+			if equalFoldName(last.text, name) {
+				return nil, false
+			}
+			cols[r33sFoldIdent(last.text)] = true
+		case n == 3 && isNameToken(cs[0]) && cs[1].kind == tkPunct && cs[1].text == "." && isNameToken(last):
+			if equalFoldName(last.text, name) {
+				return nil, false
+			}
+			cols[r33sFoldIdent(last.text)] = true
+		case n >= 3 && isKw(cs[n-2], "AS") && isNameToken(last):
+			al := last.text
+			if last.kind == tkString {
+				al = last.str
+			}
+			cols[r33sFoldIdent(al)] = true
+		default:
+			// An expression, or one aliased without AS, which this scan does
+			// not tell apart.
+			if isNameToken(last) && equalFoldName(last.text, name) {
+				return nil, false
+			}
+		}
+	}
+	return cols, true
 }
 
 // selectAliasesName reports whether any result column of s, or of a SELECT
@@ -7373,6 +7543,9 @@ func r45TriggerColumnRenameSkips(tr *triggerMeta, tblName, oldName string, hasCo
 	}
 	ownName, hasOwn := triggerOwnNameSpan(tr.sql)
 	ofLo, ofHi := r45TriggerUpdateOfRange(toks)
+	// See r45FlatViewColumnRenameSkips: an ORDER BY term bound to a result
+	// column names no table column.
+	resultBound, _, _ := orderByAliasSpans(toks, oldName, columnRenameStarHas(tblName, oldName, hasCol))
 	for i, t := range toks {
 		if t.kind != tkIdent || !equalFoldName(t.text, oldName) {
 			continue
@@ -7402,6 +7575,9 @@ func r45TriggerColumnRenameSkips(tr *triggerMeta, tblName, oldName string, hasCo
 				return nil, false
 			}
 		} else {
+			if spansContain(resultBound, t.Start) {
+				continue
+			}
 			if len(carriers) != 1 {
 				return nil, false
 			}
