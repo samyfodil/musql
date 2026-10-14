@@ -28,6 +28,12 @@ func combineCompound(op CompoundOp, left, right [][]Value, collations []string, 
 		out = append(out, right...)
 		return out, nil
 
+	case "UNION", "INTERSECT", "EXCEPT":
+		// Each side goes through C's ephemeral b-tree as a record.
+		recordRows(left)
+		recordRows(right)
+	}
+	switch op {
 	case "UNION":
 		return sortCompoundRows(unionMerge(dedupRows(left, collations, enc), dedupRows(right, collations, enc), collations, enc), collations, enc), nil
 
@@ -51,6 +57,16 @@ func combineCompound(op CompoundOp, left, right [][]Value, collations []string, 
 
 	default:
 		return nil, fmt.Errorf("engine: unsupported compound operator %q", op)
+	}
+}
+
+// recordRows rewrites rows in place as a record would hand them back
+// (recordValue).
+func recordRows(rows [][]Value) {
+	for _, r := range rows {
+		for i := range r {
+			r[i] = recordValue(r[i])
+		}
 	}
 }
 

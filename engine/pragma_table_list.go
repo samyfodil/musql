@@ -39,6 +39,27 @@ func (p *ReadOnlyPager) pragmaTableList(scope schemaScope, stmt *PragmaStmt) (co
 	if !stmt.HasValue {
 		return p.pragmaTableListAll(scope)
 	}
+	if stmt.Schema == "" && p.pragmaTableListIsPrimary() && !isMasterSchemaCatalogAlias(stmt.ValueText) {
+		// Unqualified, C walks EVERY database and lists each one's table of
+		// that name (pragma.c, PragTyp_TABLE_LIST: only zDb narrows the
+		// loop), so a TEMP table does not hide main's: both rows, in database
+		// order, which is the whole listing's order.
+		_, all, aerr := p.pragmaTableListAll(scopeAny)
+		if aerr != nil {
+			return nil, nil, aerr
+		}
+		rows = [][]Value{}
+		for _, r := range all {
+			// The catalog rows are keyed sqlite_master/sqlite_temp_master
+			// in C's table hash (the alias path above), so their displayed
+			// names find nothing: table_list('sqlite_schema') is empty.
+			if len(r) > 1 && r[1].Typ == Text && equalFoldName(string(r[1].S), stmt.ValueText) &&
+				!equalFoldName(stmt.ValueText, "sqlite_schema") && !equalFoldName(stmt.ValueText, "sqlite_temp_schema") {
+				rows = append(rows, r)
+			}
+		}
+		return cols, rows, nil
+	}
 	if stmt.Schema == "" {
 		// scopeAny, not scopeMain: the owner may be the TEMP database
 		// (temp_store.go), whose every row is a temp row -- and an ATTACHed

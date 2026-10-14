@@ -684,6 +684,13 @@ type SelectColumn struct {
 	// Text / the declared column name is used instead -- see
 	// expandSelectList, query.go), so it does not affect default naming.
 	RawText string
+	// valuesIdent is, for a VALUES column whose expression is an identifier
+	// (COLLATE peeled), that identifier as written. A derived table or CTE
+	// names its columns before resolution (selectExpander), when the item is
+	// still TK_ID, so sqlite3ColumnsFromExprList names the column after the
+	// token rather than "columnN": "SELECT * FROM (VALUES(\"x\"))" has a column
+	// "x". See nameValuesColumnsPreResolve.
+	valuesIdent string
 }
 
 // NullsOrder selects where NULLs sort within an ORDER BY term, overriding

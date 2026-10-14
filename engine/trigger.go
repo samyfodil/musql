@@ -213,13 +213,9 @@ type triggerMeta struct {
 //
 // See triggerMeta.tableAttachName for why it must be empty to match here.
 func (db *DB) matchingTriggers(table string, tableIsTemp bool, event triggerEventKind, timing triggerTiming) []*triggerMeta {
-	var out []*triggerMeta
-	for i := len(db.triggers) - 1; i >= 0; i-- {
-		tr := db.triggers[i]
-		if !tr.insteadOf && tr.event == event && tr.timing == timing && tr.tableAttachName == "" && tr.tableIsTemp == tableIsTemp && equalFoldName(tr.table, table) {
-			out = append(out, tr)
-		}
-	}
+	out := db.orderedTriggers(tableIsTemp, func(tr *triggerMeta) bool {
+		return !tr.insteadOf && tr.event == event && tr.timing == timing && tr.tableAttachName == "" && tr.tableIsTemp == tableIsTemp && equalFoldName(tr.table, table)
+	})
 	// foreignTempTriggers (writer.go) are matched without the
 	// tableAttachName/tableIsTemp checks, after this session's own matches.
 	// That ordering between local and foreign triggers for the same
@@ -241,14 +237,72 @@ func (db *DB) matchingTriggers(table string, tableIsTemp bool, event triggerEven
 // filter. See triggerMeta.tableAttachName for why it must be empty to match
 // here.
 func (db *DB) matchingInsteadOfTriggers(view string, viewIsTemp bool, event triggerEventKind) []*triggerMeta {
+	return db.orderedTriggers(viewIsTemp, func(tr *triggerMeta) bool {
+		return tr.insteadOf && tr.event == event && tr.tableAttachName == "" && tr.tableIsTemp == viewIsTemp && equalFoldName(tr.table, view)
+	})
+}
+
+// orderedTriggers is sqlite3TriggerList (trigger.c): the triggers keep return
+// true for, in the order C fires them. A table's own list, pTab->pTrigger, is
+// built by prepending, so its triggers fire newest first. Onto that list C
+// then prepends every TEMP trigger on the (non-temp) table, walking the temp
+// schema's trigger hash; while that hash has never grown buckets (fewer than
+// five temp triggers since it was last empty, hash.c's rehash threshold) the
+// walk is newest first, so the TEMP triggers end up first and OLDEST first.
+// Past that the walk follows bucket order, which checkTempTriggerOrder
+// declines.
+func (db *DB) orderedTriggers(tableIsTemp bool, keep func(*triggerMeta) bool) []*triggerMeta {
 	var out []*triggerMeta
+	if !tableIsTemp {
+		for _, tr := range db.triggers {
+			if tr.isTemp && keep(tr) {
+				out = append(out, tr)
+			}
+		}
+	}
 	for i := len(db.triggers) - 1; i >= 0; i-- {
 		tr := db.triggers[i]
-		if tr.insteadOf && tr.event == event && tr.tableAttachName == "" && tr.tableIsTemp == viewIsTemp && equalFoldName(tr.table, view) {
+		if (tableIsTemp || !tr.isTemp) && keep(tr) {
 			out = append(out, tr)
 		}
 	}
 	return out
+}
+
+// noteTempTriggerCreated records the temp trigger hash's size before a TEMP
+// trigger is added to it: C's hash is cleared when it empties and grows
+// buckets once it holds five (hash.c, sqlite3HashInsert), and only the
+// bucket-free walk has an order orderedTriggers reproduces.
+func (db *DB) noteTempTriggerCreated() {
+	n := 0
+	for _, tr := range db.triggers {
+		if tr.isTemp {
+			n++
+		}
+	}
+	if n == 0 {
+		db.tempTrigPeak = 0
+	}
+	db.tempTrigPeak = max(db.tempTrigPeak, n+1)
+}
+
+// checkTempTriggerOrder declines a firing whose order depends on the bucket
+// order of C's temp trigger hash: two or more TEMP triggers on a non-temp
+// table, once that hash may have grown buckets (see orderedTriggers).
+func (db *DB) checkTempTriggerOrder(trs []*triggerMeta) error {
+	if db.tempTrigPeak < 5 {
+		return nil
+	}
+	n := 0
+	for _, tr := range trs {
+		if tr.isTemp && !tr.tableIsTemp {
+			n++
+		}
+	}
+	if n >= 2 {
+		return fmt.Errorf("%w: %d TEMP triggers on one table fire in the order of C's temp trigger hash buckets, which this engine does not model", errVDBEUnsupported, n)
+	}
+	return nil
 }
 
 // tableHasTriggers reports whether table has ANY trigger (BEFORE or AFTER)
@@ -951,6 +1005,9 @@ func (db *DB) CreateTrigger(sqlText string) error {
 		targetName = tbl.name
 	case viewName != "":
 		targetName = viewName
+	}
+	if isTemp {
+		db.noteTempTriggerCreated()
 	}
 	db.triggers = append(db.triggers, &triggerMeta{
 		schemaSeq:       db.nextSchemaSeq(isTemp),
@@ -2019,6 +2076,9 @@ func triggerTargetScope(nameScope, tableScope schemaScope) schemaScope {
 // error is raised when the triggering statement is about to fire, as in C. A
 // TEMP trigger reaching a temp table is fine.
 func (db *DB) checkTriggerTempScope(trs []*triggerMeta) error {
+	if err := db.checkTempTriggerOrder(trs); err != nil {
+		return err
+	}
 	tempTables := make(map[string]bool)
 	for _, t := range db.tables {
 		if t.isTemp {

@@ -290,6 +290,26 @@ func r32nParseCreateIndexStmt(sqlText string, recordDQ bool) (*parsedCreateIndex
 			if !p.consumeKeyword("ASC") {
 				exprDesc = p.consumeKeyword("DESC")
 			}
+			// Parentheses make no node in C's parser, so sqlite3StringToId
+			// (build.c) turns "((('z')))" into the identifier z just as it
+			// does a bare 'z': a plain column, or "no such column: z".
+			name, coll, ok := indexKeyStringToID(e)
+			if !ok {
+				name, coll, ok = indexKeyCollatedColumn(e)
+			}
+			if ok {
+				stmt.cols = append(stmt.cols, name)
+				stmt.collate = append(stmt.collate, strings.ToUpper(coll))
+				stmt.desc = append(stmt.desc, exprDesc)
+				stmt.dquoted = append(stmt.dquoted, false)
+				stmt.r32nDQSpan = append(stmt.r32nDQSpan, byteSpan{})
+				stmt.exprs = append(stmt.exprs, nil)
+				if p.peekIsPunct(",") {
+					p.next()
+					continue
+				}
+				break
+			}
 			stmt.cols = append(stmt.cols, "")
 			stmt.collate = append(stmt.collate, "")
 			stmt.desc = append(stmt.desc, exprDesc)
@@ -1548,4 +1568,88 @@ func indexEntryForNewRow(tbl *tableMeta, idx *indexMeta, rowid uint64, vals []Va
 	}
 	rec = append(rec, Value{Typ: Int, I: int64(rowid)})
 	return rec
+}
+
+// indexKeyStringToID is sqlite3StringToId (build.c) for a key entry the
+// expression path parsed: a text literal, or a COLLATE over one, is the
+// identifier it spells. Only a collation the plain-column path knows is
+// carried over; any other stays an expression so its own error is reported.
+// The collation is returned as written.
+func indexKeyStringToID(e Expr) (name, collate string, ok bool) {
+	if c, isColl := e.(CollateExpr); isColl {
+		if !knownCollations[asciiFold(c.Name, false)] {
+			return "", "", false
+		}
+		lit, isLit := c.X.(LiteralExpr)
+		if !isLit || lit.Val.Typ != Text || lit.aff != affNone || lit.materialized {
+			return "", "", false
+		}
+		return string(lit.Val.S), c.Name, true
+	}
+	lit, isLit := e.(LiteralExpr)
+	if !isLit || lit.Val.Typ != Text || lit.aff != affNone || lit.materialized {
+		return "", "", false
+	}
+	return string(lit.Val.S), "", true
+}
+
+// indexKeyCollatedColumn recognizes a key entry that sqlite3CreateIndex makes
+// a plain column although the simple-entry parser does not: COLLATEs stacked
+// over a bare column name, "((a COLLATE NOCASE) COLLATE RTRIM)".
+// sqlite3ExprSkipCollate peels every COLLATE and finds TK_COLUMN, so it is no
+// expression index, and its collation is the OUTERMOST one (the item's own
+// TK_COLLATE). Every collation must be one the plain path knows; a
+// double-quoted name, which may still become a string, is left alone. The
+// collation is returned as written.
+func indexKeyCollatedColumn(e Expr) (name, collate string, ok bool) {
+	outer, isColl := e.(CollateExpr)
+	if !isColl {
+		return "", "", false
+	}
+	for x := e; ; {
+		switch c := x.(type) {
+		case CollateExpr:
+			if !knownCollations[asciiFold(c.Name, false)] {
+				return "", "", false
+			}
+			x = c.X
+			continue
+		case ColumnExpr:
+			if c.Qualifier != "" || c.FallbackLiteral != nil || c.Name == "" {
+				return "", "", false
+			}
+			return c.Name, outer.Name, true
+		}
+		return "", "", false
+	}
+}
+
+// indexKeyEntryAsColumn parses one key-list entry's text (ASC/DESC already
+// cut) and reports the plain column sqlite3CreateIndex makes of it when the
+// simple-entry form does not cover it: see indexKeyStringToID and
+// indexKeyCollatedColumn. For an entry that stays an expression, name is ""
+// and collate is the entry's own top-level COLLATE, which is the key's
+// collation in C as for a column (build.c, the pListItem->pExpr->op==
+// TK_COLLATE test): "ON t((a+1) COLLATE rtrim)" is an rtrim key. The
+// collation is as written.
+func indexKeyEntryAsColumn(text string) (name, collate string, ok bool) {
+	toks, err := lex(text)
+	if err != nil {
+		return "", "", false
+	}
+	p := newParser(text, toks)
+	e, err := p.parseExpr()
+	if err != nil || p.peek().kind != tkEOF {
+		return "", "", false
+	}
+	if name, collate, ok = indexKeyStringToID(e); ok {
+		return name, collate, true
+	}
+	if name, collate, ok = indexKeyCollatedColumn(e); ok {
+		return name, collate, true
+	}
+	if c, isColl := e.(CollateExpr); isColl {
+		return "", c.Name, false
+	}
+	return "", "", false
 }
