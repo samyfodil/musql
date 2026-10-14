@@ -223,9 +223,6 @@ func init() {
 	tsKnownGroup("2026-10-12: a rowid conflict is worded \"UNIQUE constraint failed: duplicate rowid N\" instead of naming the INTEGER PRIMARY KEY column",
 		"update-from.sqltest::memory::update-from-rowid-mutation-conflict",
 	)
-	tsKnownGroup("2026-10-12: rows tied under ORDER BY come out in another order: C scans r through the forced expression index r_all (coalesce(b,7) order), musql in rowid order; the row sets agree",
-		"expression-index-outer-join.sqltest::memory::null-row-expression-in-subqueries[select-l-x-coalesce-s-d-1-coalesce-r-b-7-from-l-left-join-s-on-s-a-l-x-left-join-r-indexed-by-r-all-on-r-a-s-a]",
-	)
 	tsKnownGroup("2026-10-12: a column reached through four nested parenthesized USING groups is named \"a\" where C names it from each rebuilt list (\"a:1\", \"a:3\" and, past the fifth repeat, a random suffix); the values agree",
 		"parenthesized-joins.sqltest::memory::qualified-columns-pass-through-several-parenthesized-joins",
 	)

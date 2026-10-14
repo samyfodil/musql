@@ -284,6 +284,17 @@ func wherePlanIndexOrderKey(idx *whereIndexInfo, rev bool) *autoIndexKey {
 		desc:  append([]bool(nil), idx.aSortOrder...),
 		root:  idx.root,
 	}
+	for j, c := range idx.aiColumn {
+		if c != xnExpr {
+			continue
+		}
+		if k.exprs == nil {
+			k.exprs = make([]*selfRowExpr, len(idx.aiColumn))
+		}
+		if j < len(idx.exprProgs) {
+			k.exprs[j] = idx.exprProgs[j]
+		}
+	}
 	if rev {
 		for i := range k.desc {
 			k.desc[i] = !k.desc[i]
@@ -389,6 +400,12 @@ type autoIndexKey struct {
 	cols  []int
 	colls []string
 	desc  []bool
+
+	// exprs is parallel to cols for a real index with expression key columns:
+	// where cols[k] is xnExpr, exprs[k] computes that key column from the row.
+	// nil when no key column is an expression. A key with an xnExpr column and
+	// no program here is never built (wherePlanIndexChain declines the chain).
+	exprs []*selfRowExpr
 
 	// multiOr, when set, replaces the whole cols/colls/desc key: the winning loop
 	// is a WHERE_MULTI_OR union of one sub-scan per disjunct, whose order is a

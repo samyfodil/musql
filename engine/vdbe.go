@@ -631,16 +631,9 @@ func autoIndexOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) 
 	if key == nil || len(key.cols) == 0 || len(cur.rowids) != len(cur.rows) || len(cur.rows) < 2 {
 		return
 	}
-	at := func(i, kc int) Value {
-		if kc < 0 {
-			// The trailing XN_ROWID column. Compared as the signed integer
-			// OpRowid reports, which is how the b-tree orders it.
-			return Value{Typ: Int, I: int64(cur.rowids[i])}
-		}
-		if row := cur.rows[i]; kc < len(row) {
-			return row[kc]
-		}
-		return Value{Typ: Null}
+	at, ok := autoIndexKeyValues(cur, key)
+	if !ok {
+		return
 	}
 	perm := make([]int, len(cur.rows))
 	for i := range perm {
@@ -652,8 +645,8 @@ func autoIndexOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) 
 	nk := len(key.cols)
 	flat := make([]int64, 0, len(perm)*nk)
 	for i := range perm {
-		for _, kc := range key.cols {
-			v := at(i, kc)
+		for k := range key.cols {
+			v := at(i, k)
 			if v.Typ != Int {
 				flat = nil
 				break
@@ -696,13 +689,66 @@ func autoIndexOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) 
 	cur.rows, cur.rowids = rows, rowids
 }
 
+// autoIndexKeyValues returns the value of key column k for the cursor's row i:
+// the row's column, the rowid for the trailing XN_ROWID column, or for an
+// XN_EXPR column the index expression computed from that row, which is what the
+// index stores and so what its walk is ordered by. Expression values are
+// computed once per row up front. ok is false when an expression key column has
+// no program or fails on a row: the walk's order is then unknown, and the
+// cursor is left as it is.
+func autoIndexKeyValues(cur *vdbeCursor, key *autoIndexKey) (at func(i, k int) Value, ok bool) {
+	var exprVals [][]Value // [k][row], only for xnExpr positions
+	for k, kc := range key.cols {
+		if kc != xnExpr {
+			continue
+		}
+		if k >= len(key.exprs) || key.exprs[k] == nil || cur.tbl == nil {
+			return nil, false
+		}
+		if exprVals == nil {
+			exprVals = make([][]Value, len(key.cols))
+		}
+		scope := tableScope{name: cur.tbl.name, cols: cur.tbl.cols, colIndex: buildColIndex(cur.tbl.cols), noRowid: cur.tbl.withoutRowid}
+		vals := make([]Value, len(cur.rows))
+		for i, row := range cur.rows {
+			if len(row) < len(cur.tbl.cols) {
+				padded := make([]Value, len(cur.tbl.cols))
+				copy(padded, row)
+				row = padded
+			}
+			ctx := &evalCtx{tables: []tableScope{scope}, vals: row, rowids: []Value{{Typ: Int, I: int64(cur.rowids[i])}}, pager: cur.pager, params: cur.params}
+			v, err := key.exprs[k].eval(ctx)
+			if err != nil {
+				return nil, false
+			}
+			vals[i] = v
+		}
+		exprVals[k] = vals
+	}
+	return func(i, k int) Value {
+		kc := key.cols[k]
+		if kc == xnExpr {
+			return exprVals[k][i]
+		}
+		if kc < 0 {
+			// The trailing XN_ROWID column. Compared as the signed integer
+			// OpRowid reports, which is how the b-tree orders it.
+			return Value{Typ: Int, I: int64(cur.rowids[i])}
+		}
+		if row := cur.rows[i]; kc < len(row) {
+			return row[kc]
+		}
+		return Value{Typ: Null}
+	}, true
+}
+
 // autoIndexSortValues is autoIndexOrderCursor's sort over keys that are not
 // all integers: each comparison fetches the values and compares them under
 // their columns' collating sequences.
-func autoIndexSortValues(perm []int, key *autoIndexKey, at func(i, kc int) Value, enc TextEncoding) {
+func autoIndexSortValues(perm []int, key *autoIndexKey, at func(i, k int) Value, enc TextEncoding) {
 	slices.SortFunc(perm, func(a, b int) int {
-		for k, kc := range key.cols {
-			c := compareValuesCollatedEnc(at(a, kc), at(b, kc), key.colls[k], enc)
+		for k := range key.cols {
+			c := compareValuesCollatedEnc(at(a, k), at(b, k), key.colls[k], enc)
 			if c != 0 {
 				if k < len(key.desc) && key.desc[k] {
 					// A DESC key column: the b-tree stores it reversed, so the

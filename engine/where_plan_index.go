@@ -113,6 +113,10 @@ type whereIndexInfo struct {
 	// whereLoopAddBtreeIndex needs -- see where_plan_exprindex_cover.go's
 	// package comment for the exact scope.
 	exprs []Expr
+	// exprProgs is parallel to exprs: each XN_EXPR key column compiled against
+	// the table's own row, so a walk of this index can be put in its key order
+	// (autoIndexKey.exprs, autoIndexOrderCursor). nil for a plain-column entry.
+	exprProgs []*selfRowExpr
 }
 
 // xnRowid is where.c's XN_ROWID: the aiColumn[] entry standing for the rowid.
@@ -552,7 +556,20 @@ func wherePlanIndexChain(p *ReadOnlyPager, tbl *resolvedTable, tableName, indexe
 				if k < len(exprs) {
 					e = exprs[k]
 				}
+				// The key the index stores is the expression over the table's
+				// own row (sqlite3ExprCodeCopy under iSelfTab, insert.c:2433),
+				// which is the order a walk of the b-tree visits. One that does
+				// not compile leaves the order unknown, so the chain is not
+				// reproduced.
+				prog := compileSelfRowExpr(tableScope{name: tableName, cols: tbl.cols, colIndex: buildColIndex(tbl.cols), noRowid: tbl.withoutRowid}, e, false, pureCtxIndex)
+				if e == nil || prog.prog == nil {
+					return nil, 0, false
+				}
 				idx.exprs = append(idx.exprs, e)
+				for len(idx.exprProgs) < len(idx.exprs)-1 {
+					idx.exprProgs = append(idx.exprProgs, nil)
+				}
+				idx.exprProgs = append(idx.exprProgs, prog)
 				continue
 			}
 			ci, ok := colIndexOf(cn)

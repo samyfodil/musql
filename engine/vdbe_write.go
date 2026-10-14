@@ -2998,7 +2998,7 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 		if !neverOnePass {
 			key, nRow, oneRow, ok = db.updateOnePassOrder(tbl, stmt, trig)
 		}
-		forced := key != nil && updateKeyForcesTwoPass(key, colIdx, len(tbl.cols))
+		forced := key != nil && updateKeyForcesTwoPass(key, colIdx, tbl.cols)
 		if setSub && !orderLive {
 			if neverOnePass || db.updateEveryIndexForcesTwoPass(tbl, stmt, colIdx) {
 				orderLive = true // two passes, or no plan that is not rowid order

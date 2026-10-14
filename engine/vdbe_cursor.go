@@ -709,14 +709,16 @@ func multiOrOrderCursor(cur *vdbeCursor, mo *multiOrOrder, enc TextEncoding) {
 	for i := range perm {
 		perm[i] = i
 	}
-	at := func(i, kc int) Value {
-		if kc < 0 {
-			return Value{Typ: Int, I: int64(cur.rowids[i])}
+	ats := make([]func(i, k int) Value, len(mo.keys))
+	for g, key := range mo.keys {
+		if key == nil {
+			continue
 		}
-		if row := cur.rows[i]; kc < len(row) {
-			return row[kc]
+		at, ok := autoIndexKeyValues(cur, key)
+		if !ok {
+			return
 		}
-		return Value{Typ: Null}
+		ats[g] = at
 	}
 	slices.SortStableFunc(perm, func(x, y int) int {
 		if grp[x] != grp[y] {
@@ -729,8 +731,9 @@ func multiOrOrderCursor(cur *vdbeCursor, mo *multiOrOrder, enc TextEncoding) {
 		if key == nil {
 			return 0 // that sub-scan is the ascending-rowid table scan
 		}
-		for k, kc := range key.cols {
-			c := compareValuesCollatedEnc(at(x, kc), at(y, kc), key.colls[k], enc)
+		at := ats[grp[x]]
+		for k := range key.cols {
+			c := compareValuesCollatedEnc(at(x, k), at(y, k), key.colls[k], enc)
 			if c == 0 {
 				continue
 			}
@@ -770,14 +773,16 @@ func multiOrSortTagged(cur *vdbeCursor, mo *multiOrOrder, enc TextEncoding) erro
 	for i := range perm {
 		perm[i] = i
 	}
-	at := func(i, kc int) Value {
-		if kc < 0 {
-			return Value{Typ: Int, I: int64(cur.rowids[i])}
+	ats := make([]func(i, k int) Value, len(mo.keys))
+	for g, key := range mo.keys {
+		if key == nil {
+			continue
 		}
-		if row := cur.rows[i]; kc < len(row) {
-			return row[kc]
+		at, ok := autoIndexKeyValues(cur, key)
+		if !ok {
+			return fmt.Errorf("vdbe: OpMultiOrSort over an expression key it cannot compute")
 		}
-		return Value{Typ: Null}
+		ats[g] = at
 	}
 	byRowid := func(x, y int) int {
 		return cmp.Compare(int64(cur.rowids[x]), int64(cur.rowids[y]))
@@ -790,8 +795,9 @@ func multiOrSortTagged(cur *vdbeCursor, mo *multiOrOrder, enc TextEncoding) erro
 			return byRowid(x, y)
 		}
 		key := mo.keys[grp[x]]
-		for k, kc := range key.cols {
-			c := compareValuesCollatedEnc(at(x, kc), at(y, kc), key.colls[k], enc)
+		at := ats[grp[x]]
+		for k := range key.cols {
+			c := compareValuesCollatedEnc(at(x, k), at(y, k), key.colls[k], enc)
 			if c == 0 {
 				continue
 			}
