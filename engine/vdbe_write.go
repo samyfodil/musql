@@ -4046,7 +4046,7 @@ func (m *vdbe) opUpdateRow(op *Instruction) (int, error) {
 		if newRowid != oldRowid {
 			if _, exists := tbl.rows.get(newRowid); exists {
 				tbl.putRow(oldRowid, oldVals) // this row is not applied at all
-				return -1, fmt.Errorf("engine: UPDATE %s: UNIQUE constraint failed: duplicate rowid %d", plan.displayName, int64(newRowid))
+				return -1, fmt.Errorf("engine: UPDATE %s: UNIQUE constraint failed: %s", plan.displayName, rowidConstraintName(tbl))
 			}
 		}
 		tbl.putRow(newRowid, full)
@@ -4232,7 +4232,7 @@ func (m *vdbe) opUpsertStore(op *Instruction) error {
 	if newRowid != oldRowid {
 		if _, exists := tbl.rows.get(newRowid); exists {
 			tbl.putRow(oldRowid, oldVals)
-			return fmt.Errorf("engine: INSERT into %s: UNIQUE constraint failed: duplicate rowid %d", plan.displayName, int64(newRowid))
+			return fmt.Errorf("engine: INSERT into %s: UNIQUE constraint failed: %s", plan.displayName, rowidConstraintName(tbl))
 		}
 	}
 	tbl.putRow(newRowid, full)

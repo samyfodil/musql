@@ -39,18 +39,6 @@ func init() {
 		"detach/transaction.sqltest::memory::detach-fails-with-active-write-transaction",
 		"detach/transaction.sqltest::memory::detach-succeeds-after-commit",
 	)
-	tsKnownGroup("2026-10-12: INDEXED BY a partial index after a parenthesized join: C proves the index usable from the join's ON terms, which this engine does not decide there, so it declines",
-		"joins/left_join_null_index_bug.sqltest::memory::range-seek-after-each-null-extension[l-left-join-m-join-p-using-seed-on-m-seed-l-seed][join-r-indexed-by-r-value-on-m-u-r-value]",
-		"joins/left_join_null_index_bug.sqltest::memory::range-seek-after-each-null-extension[l-left-join-m-join-p-using-seed-on-m-seed-l-seed][left-join-r-indexed-by-r-value-on-m-k-r-value]",
-		"joins/left_join_null_index_bug.sqltest::memory::range-seek-after-each-null-extension[l-left-join-m-join-p-using-seed-on-m-seed-l-seed][left-join-r-indexed-by-r-value-on-r-value-between-m-id-and-m-u]",
-	)
-	tsKnownGroup("2026-10-12: recursive CTEs: LIMIT/OFFSET written as an expression and an ORDER BY on a qualified expression are not compiled into the recursion's queue, so the CTE falls back to the non-recursive path and is reported circular",
-		"recursive-cte.sqltest::memory::recursive-cte-expression-limit-and-offset",
-		"recursive-cte.sqltest::memory::recursive-cte-order-qualified-expression",
-	)
-	tsKnownGroup("2026-10-12: recursive CTEs: an unbounded recursion stopped only by a LIMIT outside the CTE is evaluated eagerly and hits the engine's row cap",
-		"recursive-cte.sqltest::memory::recursive-cte-self-reference-has-no-affinity",
-	)
 	tsKnownGroup("2026-10-12: RIGHT/FULL JOIN aggregates: a bare column in a GROUP BY whose anchor row depends on a scan order this engine cannot prove C's declines",
 		"right-full-join-sqlite.sqltest::memory::aggregates-windows-and-limits[full-join][a-id-b-id-row-number-over-order-by-a-id-b-id][group-by-1-order-by-1]",
 		"right-full-join-sqlite.sqltest::memory::aggregates-windows-and-limits[full-join][a-id-b-id-sum-b-v-over-partition-by-a-k-is-null-order-by-a-id-b-id][group-by-1-order-by-1]",
@@ -62,9 +50,6 @@ func init() {
 		"right-full-join-sqlite.sqltest::memory::aggregates-windows-and-limits[right-join][coalesce-a-k-b-k-as-key-count-total-a-v-total-b-v][order-by-1-2-limit-3-offset-1]",
 		"right-full-join-sqlite.sqltest::memory::aggregates-windows-and-limits[right-join][coalesce-a-k-b-k-as-key-count-total-a-v-total-b-v][order-by-1-2]",
 		"right-full-join-sqlite.sqltest::memory::aggregates-windows-and-limits[right-join][distinct-a-k-is-null-b-k-is-null][group-by-1-order-by-1]",
-	)
-	tsKnownGroup("2026-10-12: a parenthesized RIGHT/FULL join group in a subquery whose ON reads the enclosing row is declined (the group is materialized without that row)",
-		"right-full-join-sqlite.sqltest::memory::correlated-parenthesized-full-join-materialization",
 	)
 	tsKnownGroup("2026-10-12: a table-valued function on the right of a RIGHT JOIN whose argument is a subquery reading the left table is declined (C rebuilds it as a correlated argument)",
 		"right-full-join-sqlite.sqltest::memory::right-join-rebuilds-subquery-in-table-function-argument",
@@ -79,10 +64,6 @@ func init() {
 		"update-from.sqltest::memory::update-from-returning-reuses-cte-snapshot-after-trigger-mutation",
 		"update-from.sqltest::memory::update-from-returning-reuses-row-cte-snapshot-after-trigger-mutation",
 		"update-from.sqltest::memory::update-from-returning-subquery-can-see-cte",
-	)
-	tsKnownGroup("2026-10-12: recursive CTEs: an ORDER BY expression that matches no result column is C's \"1st ORDER BY term does not match any column in the result set\" (resolveCompoundOrderBy); musql declines the shape as circular",
-		"recursive-cte.sqltest::memory::recursive-cte-order-expression-must-match-output",
-		"recursive-cte.sqltest::memory::recursive-cte-order-qualified-non-result-column-errors",
 	)
 	tsKnownGroup("2026-10-12: a rowid conflict is worded \"UNIQUE constraint failed: duplicate rowid N\" instead of naming the INTEGER PRIMARY KEY column",
 		"update-from.sqltest::memory::update-from-rowid-mutation-conflict",
