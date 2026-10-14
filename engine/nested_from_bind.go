@@ -801,6 +801,12 @@ func (b *nfBinder) probeLeaf(it *nfItem, leaf *FromItem) bool {
 			it.ipk = i
 		}
 	}
+	if _, ok := fts3ScopeInfo(p, &ts); ok && ts.tableName != "" {
+		// fts3/fts4 declare a hidden column named for the table after the
+		// user columns (fts3DeclareVtab), which a MATCH's left side names.
+		it.cols = append(it.cols, nfCol{name: ts.tableName, hidden: true})
+		it.colls = append(it.colls, "")
+	}
 	it.visRow = !ts.noRowid && (it.kind == nfLeafTable || it.kind == nfLeafVtab)
 	return true
 }
