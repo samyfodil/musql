@@ -1406,7 +1406,7 @@ func (b *wherePlanIdxBuild) addBtree(iTab int, mPrereq whereMask) {
 	// recursive subquery, and the right table of a RIGHT JOIN -- are unreachable
 	// under the gate, and WHERE_OR_SUBCLAUSE arrives as noAutoIndex from
 	// wherePlanMultiOrOrder.
-	if b.orSet == nil && !b.noAutoIndex && !it.indexedBy && !it.notIndexed {
+	if b.orSet == nil && !b.noAutoIndex && !it.indexedBy && !it.notIndexed && !it.correlated {
 		rLogSize := estLog(rSize)
 		for i := range b.terms {
 			t := &b.terms[i]
@@ -1421,10 +1421,17 @@ func (b *wherePlanIdxBuild) addBtree(iTab int, mPrereq whereMask) {
 			// each lookup is then assumed to yield 20 rows (LogEst 43), more
 			// than the usual guess of 10 because how selective the index turns
 			// out to be is unknown.
+			rSetup := rLogSize + rSize + 28
+			if it.ephemeral {
+				rSetup = rLogSize + rSize - 25
+				if rSetup < 0 {
+					rSetup = 0
+				}
+			}
 			b.insertLoop(whereIdxLoop{
 				iTab: iTab, maskSelf: maskSelf,
 				prereq:  mPrereq | t.prereqRight,
-				rSetup:  rLogSize + rSize + 28,
+				rSetup:  rSetup,
 				nOut:    43,
 				rRun:    logEstAdd(rLogSize, 43),
 				autoIdx: true,
@@ -1695,6 +1702,9 @@ type whereSortTerm struct {
 	// "mark off any other ORDER BY terms" block consults.
 	uses    whereMask
 	isConst bool
+	// bare is "pOBExpr->op==TK_COLUMN" on the term as written: no COLLATE or
+	// likely() around the column (wherePathMatchSubqueryOB's limitation 1).
+	bare bool
 }
 
 // whereSortCtl is pWInfo->pOrderBy plus the wctrlFlags bits that decide what
@@ -1898,6 +1908,16 @@ func (b *wherePlanIdxBuild) wherePathSatisfiesOrderBy(
 				// "this path satisfies no ORDER BY term".
 				return 0, revMask
 			}
+			if l.idx.ipk && b.items[iTab].subOB != nil {
+				// A subquery's rows arrive in its own ORDER BY
+				// (wherePathMatchSubqueryOB): what that satisfies is marked off,
+				// and the loop is then neither matched by column nor
+				// order-distinct.
+				if b.wherePathMatchSubqueryOB(l, iLoop, ob, groupBy, &revMask, &obSat) {
+					nColumn = 0
+					isOrderDistinct = false
+				}
+			}
 			if !l.idx.ipk {
 				if l.idx.unordered {
 					return 0, revMask // "|| pIndex->bUnordered ){ return 0;"
@@ -2058,6 +2078,53 @@ func (b *wherePlanIdxBuild) wherePathSatisfiesOrderBy(
 		return 0, revMask
 	}
 	return -1, revMask
+}
+
+// wherePathMatchSubqueryOB ports where.c:5078: how many ORDER BY terms, from
+// the first unsatisfied one on, the subquery loop l delivers by its own ORDER
+// BY, each a bare column of it naming the same result column, in the same
+// NULLS placement, and -- except for a GROUP BY -- in a consistent direction,
+// which a co-routine cannot reverse.
+func (b *wherePlanIdxBuild) wherePathMatchSubqueryOB(l *whereIdxLoop, iLoop int, ob []whereSortTerm,
+	groupBy bool, revMask *whereMask, obSat *uint64) bool {
+	it := &b.items[l.iTab]
+	sub := it.subOB
+	iOB := 0
+	for iOB < len(ob) && *obSat&(uint64(1)<<uint(iOB)) != 0 {
+		iOB++
+	}
+	rev := false
+	jSub := 0
+	for ; jSub < len(sub) && iOB < len(ob); jSub, iOB = jSub+1, iOB+1 {
+		if sub[jSub].col < 0 {
+			break
+		}
+		t := &ob[iOB]
+		if !t.bare || t.tab != l.iTab || t.col != sub[jSub].col {
+			break
+		}
+		if !groupBy {
+			if sub[jSub].bigNull != t.bigNull {
+				break
+			}
+			revIdx := sub[jSub].desc
+			if jSub > 0 {
+				if (rev != revIdx) != t.desc {
+					break
+				}
+			} else {
+				rev = revIdx != t.desc
+				if rev {
+					if it.coroutine {
+						break // "Cannot run a co-routine in reverse order"
+					}
+					*revMask |= whereMask(1) << uint(iLoop)
+				}
+			}
+		}
+		*obSat |= uint64(1) << uint(iOB)
+	}
+	return jSub > 0
 }
 
 // whereSortingCost ports the where.c routine of that name: the cost of sorting

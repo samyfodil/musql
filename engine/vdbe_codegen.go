@@ -812,7 +812,13 @@ func compileSubProgram(pager *ReadOnlyPager, stmt *SelectStmt, outer *compiler) 
 		}
 	}
 	if pager != nil && pager.r41ArmsHeld == 0 && len(stmt.Compound) == 0 && len(stmt.From) != 0 {
+		nCTE := len(stmt.CTEs)
 		stmt = pager.r41FlattenProjection(stmt)
+		if len(stmt.CTEs) > nCTE {
+			// A WITH that came up with a flattened body (r41FlattenMultiItem).
+			pop := pager.pushCTEScope(stmt.CTEs[nCTE:])
+			defer pop()
+		}
 		if len(stmt.Compound) == 0 {
 			stmt = pager.r41PushDown(stmt)
 		}

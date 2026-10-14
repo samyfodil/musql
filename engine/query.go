@@ -1238,7 +1238,13 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 	// ...and a body that is a PROJECTION of one ordinary table, which needs
 	// flattenSubquery's substitution of every parent reference (substExpr,
 	// select.c:3797). See flatten_projection.go.
+	nCTE := len(stmt.CTEs)
 	stmt = p.r41FlattenProjection(stmt)
+	if len(stmt.CTEs) > nCTE {
+		// A WITH that came up with a flattened body (r41FlattenMultiItem).
+		pop := p.pushCTEScope(stmt.CTEs[nCTE:])
+		defer pop()
+	}
 	if len(stmt.Compound) > 0 {
 		// A UNION ALL body flattened the parent into a compound
 		// (r41FlattenCompound), which the compound dispatch above runs. Its WITH

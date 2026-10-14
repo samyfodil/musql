@@ -255,7 +255,15 @@ func r36dDerivedNames(p *ReadOnlyPager, sel *SelectStmt, declared []string,
 		default:
 			ce, isCol := sc.Expr.(ColumnExpr)
 			if !isCol {
-				return nil, false
+				// Any other expression is named by its source-text span
+				// (ENAME_SPAN, sqlite3DbSpanDup), which RawText is. A clash
+				// renamed "x:1" still leaves a column named x here, so the
+				// set of names a reference can find is the same.
+				if sc.RawText == "" {
+					return nil, false
+				}
+				out[r33sFoldIdent(sc.RawText)] = true
+				continue
 			}
 			out[r33sFoldIdent(ce.Name)] = true
 		}

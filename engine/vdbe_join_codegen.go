@@ -70,6 +70,16 @@ type joinSource struct {
 	// statement, not MATERIALIZED. Set by markCTECoroutine.
 	cteCoroutine bool
 
+	// coroutineRerun marks a subquery C codes as a co-routine in an inner loop
+	// over a body that is not deterministic: its cursor runs the body again at
+	// every rewind (derivedSource.rerun). Set by markCoroutineReruns.
+	coroutineRerun bool
+
+	// selfJoinShared marks a view named twice in one FROM clause whose
+	// references read one materialization (shareSelfJoinViews): it is never
+	// run as a co-routine, since the shared rows are a run-once slot's.
+	selfJoinShared bool
+
 	// flattened is FromItem.flattened: this table came up out of a view, CTE or
 	// FROM-subquery body, and its OpOpenRead carries P5 bit 2.
 	flattened bool
@@ -1827,100 +1837,20 @@ const (
 )
 
 // cteRefPlacementOf ports fromClauseTermCanBeCoroutine's FROM-list rules for
-// items[i], a reference to b. Rules (2a)/(2b) (the hint and nUse) are applied
-// by runCTEOnce, once every reference has been counted.
+// items[i], a reference to b, on the FROM list C's flattener leaves
+// (cteRefPlacementIn). Rules (2a)/(2b) (the hint and nUse) are applied by
+// runCTEOnce, once every reference has been counted. c.flatOuter is the SELECT
+// being resolved; inside a parenthesized join's own resolution
+// (groupSpanRecursion) the enclosing one decides instead.
 func (p *ReadOnlyPager) cteRefPlacementOf(c *compiler, items []FromItem, i int, b *cteBinding) cteRefPlacement {
 	if c.groupSpanRecursion {
 		return cteRefUnknown
 	}
-	sameCTE := func(it FromItem) bool {
-		if it.Schema != "" || it.TableFunc || it.Subquery != nil || it.GroupLen > 0 || it.NestedGroupSpan != nil {
-			return false
-		}
-		ob, ok := p.lookupCTE(it.Table)
-		return ok && ob == b
+	parent := c.flatOuter
+	if parent == nil || len(parent.From) != len(items) {
+		return cteRefUnknown
 	}
-	updateFrom := false
-	for _, it := range items {
-		if it.GroupLen > 0 || it.NestedGroupSpan != nil {
-			return cteRefUnknown
-		}
-		// (3): a RIGHT JOIN anywhere marks the first item JT_LTORJ
-		// (sqlite3SrcListShiftJoinType).
-		if it.Join == JoinRight || it.Join == JoinFull {
-			return cteRefMaterialized
-		}
-		updateFrom = updateFrom || it.UpdateTarget
-	}
-	// (5): a later item that is the same CTE (isSelfJoinView). Inside a view
-	// every copy of the body has its own selId, so none matches.
-	if !b.inView {
-		for _, it := range items[i+1:] {
-			if sameCTE(it) {
-				return cteRefMaterialized
-			}
-		}
-	}
-	// (1c-iii): UPDATE ... FROM. C puts the target first, so a CTE is never
-	// item 0 there (update.c, updateFromSelect).
-	if updateFrom {
-		return cteRefMaterialized
-	}
-	if i == 0 { // (1a), (1b)
-		return cteRefCoroutine
-	}
-	for k := i; ; {
-		it := items[k]
-		if it.Join == JoinLeft || it.Join == JoinRight || it.Join == JoinFull || it.CrossKeyword { // (1c-ii)
-			return cteRefMaterialized
-		}
-		if k == 0 {
-			break
-		}
-		k--
-		// (1c-i): an earlier subquery item. Only one C never flattens is known to
-		// be one: this CTE, or a FROM-less body (flattener restriction (7)).
-		prev := items[k]
-		switch {
-		case prev.TableFunc:
-		case sameCTE(prev):
-			return cteRefMaterialized
-		case prev.Subquery != nil:
-			if selectIsFromless(prev.Subquery) {
-				return cteRefMaterialized
-			}
-			return cteRefUnknown
-		case prev.Schema == "" && prev.GroupLen == 0:
-			if ob, ok := p.lookupCTE(prev.Table); ok {
-				if selectIsFromless(ob.core) {
-					return cteRefMaterialized
-				}
-				return cteRefUnknown
-			}
-			if _, ok, verr := p.resolveViewByNameIn(fromItemScope(prev), prev.Table); verr != nil || ok {
-				return cteRefUnknown
-			}
-		default:
-			if _, ok, verr := p.resolveViewByNameIn(fromItemScope(prev), prev.Table); verr != nil || ok {
-				return cteRefUnknown
-			}
-		}
-	}
-	return cteRefCoroutine
-}
-
-// selectIsFromless reports a SELECT with no FROM in any arm, which C's flattener
-// never flattens (restriction (7)).
-func selectIsFromless(s *SelectStmt) bool {
-	if s == nil || len(s.From) != 0 {
-		return false
-	}
-	for _, a := range s.Compound {
-		if a.Stmt == nil || len(a.Stmt.From) != 0 {
-			return false
-		}
-	}
-	return true
+	return p.cteRefPlacementIn(parent, items, i, b)
 }
 
 // resolveCorrelatedCTESource resolves a non-recursive CTE reference as a
@@ -2911,14 +2841,14 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 	if len(plan.execOrder) > 0 {
 		o := plan.execOrder[0]
 		s := srcs[o]
-		if (s.derived != nil || (s.cteItem != nil && s.cteItem.queue != nil)) && !s.rightOuter &&
+		if (s.derived != nil || (s.cteItem != nil && s.cteItem.queue != nil)) && !s.rightOuter && !s.selfJoinShared &&
 			(len(plan.autoIdxKeys) == 0 || plan.autoIdxKeys[0] == nil) {
 			streamDerived = o
 		}
 	}
 	for i, s := range srcs {
 		if s.derived != nil {
-			ds := &derivedSource{prog: s.derived, tbl: s.tbl, dbIdx: s.dbIdx, keepSubtype: s.keepSubtype, lazy: true}
+			ds := &derivedSource{prog: s.derived, tbl: s.tbl, dbIdx: s.dbIdx, keepSubtype: s.keepSubtype, lazy: true, rerun: s.coroutineRerun}
 			if i == streamDerived {
 				ds.stream = streamIfYielding
 				if s.cteCoroutine {
@@ -2968,6 +2898,7 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 				}
 			}
 			ds.lazy = true
+			ds.rerun = s.coroutineRerun && s.cteItem.queue == nil && s.cteItem.recSelf == nil
 			for j := 0; j < i; j++ {
 				if o := srcs[j].cteItem; o != nil && o.binding == s.cteItem.binding && s.cteItem.recSelf == nil {
 					// A second use of a CTE in one FROM clause materializes
