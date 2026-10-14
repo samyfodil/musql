@@ -1211,7 +1211,9 @@ func wherePlanSelectListExprs(stmt *SelectStmt, jts []joinedTable, scopes []tabl
 				exprs = append(exprs, ColumnExpr{
 					Qualifier: scopes[j].name, Name: jts[j].tbl.cols[i].Name,
 				})
-				alias = append(alias, "")
+				// selectExpander gives each expanded column ENAME_NAME, so
+				// resolveAsName matches it like an AS alias (outputColumn.aliased).
+				alias = append(alias, jts[j].tbl.cols[i].Name)
 			}
 		}
 	}

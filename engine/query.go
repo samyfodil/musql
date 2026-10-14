@@ -301,10 +301,11 @@ func (p *ReadOnlyPager) hintedIndexRow(name, table string, scope schemaScope) (*
 type outputColumn struct {
 	expr Expr
 	name string
-	// aliased: the name was written with AS. Only such a name is what
-	// resolveAsName matches an ORDER BY term against (resolve.c's ENAME_NAME);
-	// an implicit name ("SELECT a ... ORDER BY a") is resolved as an ordinary
-	// expression.
+	// aliased: the name is C's ENAME_NAME, the only kind resolveAsName
+	// matches an ORDER BY term against: one written with AS, or a column a
+	// "*" expanded to (selectExpander sets ENAME_NAME on each). An implicit
+	// name ("SELECT a ... ORDER BY a") is resolved as an ordinary expression,
+	// so "SELECT *, 1 AS b FROM t ORDER BY b" sorts by t.b, the first b.
 	aliased bool
 }
 
@@ -1943,7 +1944,7 @@ func expandSelectList(sel []SelectColumn, scopes []tableScope, mode colNameMode)
 						if longNames {
 							return nil, fmt.Errorf("engine: unsupported: PRAGMA full_column_names naming of a USING/NATURAL-coalesced '*' column %q", c.Name)
 						}
-						out = append(out, outputColumn{expr: ColumnExpr{Name: c.Name}, name: c.Name})
+						out = append(out, outputColumn{expr: ColumnExpr{Name: c.Name}, name: c.Name, aliased: true})
 						continue
 					}
 					nm, nerr := starName(*ts, c.Name)
@@ -1956,7 +1957,7 @@ func expandSelectList(sel []SelectColumn, scopes []tableScope, mode colNameMode)
 					if !longNames && ts.nestedColNames != nil && ci < len(ts.nestedColNames) {
 						nm = ts.nestedColNames[ci]
 					}
-					out = append(out, outputColumn{expr: ColumnExpr{Qualifier: ts.name, Name: c.Name}, name: nm})
+					out = append(out, outputColumn{expr: ColumnExpr{Qualifier: ts.name, Name: c.Name}, name: nm, aliased: true})
 				}
 				continue
 			}
@@ -1993,7 +1994,7 @@ func expandSelectList(sel []SelectColumn, scopes []tableScope, mode colNameMode)
 								// than risk a wrong qualified name.
 								return nil, fmt.Errorf("engine: unsupported: PRAGMA full_column_names naming of a USING/NATURAL-coalesced '*' column %q", c.Name)
 							}
-							out = append(out, outputColumn{expr: ColumnExpr{Name: c.Name}, name: c.Name})
+							out = append(out, outputColumn{expr: ColumnExpr{Name: c.Name}, name: c.Name, aliased: true})
 							continue
 						}
 					}
@@ -2018,11 +2019,11 @@ func expandSelectList(sel []SelectColumn, scopes []tableScope, mode colNameMode)
 					if ts.name == "" || starQualifierAmbiguousAcrossDB(scopes, si) {
 						out = append(out, outputColumn{
 							expr: ColumnExpr{Name: c.Name, UsingPinned: true, UsingPinnedItem: si},
-							name: nm,
+							name: nm, aliased: true,
 						})
 						continue
 					}
-					out = append(out, outputColumn{expr: ColumnExpr{Qualifier: ts.name, Name: c.Name}, name: nm})
+					out = append(out, outputColumn{expr: ColumnExpr{Qualifier: ts.name, Name: c.Name}, name: nm, aliased: true})
 				}
 			}
 			continue
