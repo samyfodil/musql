@@ -31,6 +31,14 @@ type whereItem struct {
 	// outer is JT_OUTER: the item is a LEFT, RIGHT or FULL join target. Such
 	// an item may never be lifted above anything to its left.
 	outer bool
+	// right is JT_RIGHT: the item is a RIGHT or FULL join target. Nothing to
+	// its right may be lifted above it either (whereLoopAddAll's
+	// bFirstPastRJ), and it gets no automatic index.
+	right bool
+	// ltorj is JT_LTORJ: the item is left of a RIGHT or FULL join. It is a
+	// reorder barrier, only its own ON terms may drive its loops
+	// (constraintCompatibleWithOuterJoin), and no partial index is usable on it.
+	ltorj bool
 	// fromExists is SrcItem.fg.fromExists: the item existsToJoin moved out of
 	// a WHERE EXISTS (where_plan_exists.go). Its loops report nOut 0, it never
 	// skip-scans, and it is never placed left of a table its terms name.
@@ -244,7 +252,13 @@ func wherePlanOrder(in wherePlanInput) (order []int, keys []*autoIndexKey, nRow 
 	// A nil level becomes the empty key, which readers take as the rowid
 	// scan; only the flag has to survive. whereReversedScanKey, the one
 	// reader that tells nil from empty, runs only without ORDER BY.
-	if in.sort != nil && in.sort.groupBy && in.sort.nOrderBy() > 0 &&
+	rightJoin := false
+	for i := range in.items {
+		rightJoin = rightJoin || in.items[i].right
+	}
+	// "The nature of RIGHT JOIN processing is such that it messes up the
+	// output order", so with one nothing is taken as sorted (where.c:7419).
+	if in.sort != nil && in.sort.groupBy && in.sort.nOrderBy() > 0 && !rightJoin &&
 		int(path.isOrdered) == in.sort.nOrderBy() {
 		for level := range keys {
 			if keys[level] == nil {
@@ -314,7 +328,7 @@ func termCanDriveIndex(t *whereIdxTerm, it whereItem, iTab int, notReady whereMa
 	if t.op&(woEq|woIs) == 0 {
 		return false
 	}
-	if it.outer && !constraintCompatibleWithOuterJoin(t, iTab) {
+	if (it.outer || it.ltorj) && !constraintCompatibleWithOuterJoin(t, iTab) {
 		return false
 	}
 	if t.prereqRight&notReady != 0 {
@@ -400,6 +414,10 @@ type autoIndexKey struct {
 	cols  []int
 	colls []string
 	desc  []bool
+
+	// rjSweep, on a RIGHT/FULL join operand's key, is the order its
+	// unmatched-row sweep visits the table in (rightJoinSweepKey).
+	rjSweep *autoIndexKey
 
 	// exprs is parallel to cols for a real index with expression key columns:
 	// where cols[k] is xnExpr, exprs[k] computes that key column from the row.

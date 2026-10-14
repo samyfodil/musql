@@ -1236,7 +1236,7 @@ func (b *wherePlanIdxBuild) addBtreeIndex(iTab int, idx *whereIndexInfo, st wher
 			// source": it only ever comes in with its lower (below).
 			continue
 		}
-		if it.outer && !constraintCompatibleWithOuterJoin(t, iTab) {
+		if (it.outer || it.ltorj) && !constraintCompatibleWithOuterJoin(t, iTab) {
 			continue
 		}
 		cur := st
@@ -1423,7 +1423,7 @@ func (b *wherePlanIdxBuild) addBtree(iTab int, mPrereq whereMask) {
 	// recursive subquery, and the right table of a RIGHT JOIN -- are unreachable
 	// under the gate, and WHERE_OR_SUBCLAUSE arrives as noAutoIndex from
 	// wherePlanMultiOrOrder.
-	if b.orSet == nil && !b.noAutoIndex && !it.indexedBy && !it.notIndexed {
+	if b.orSet == nil && !b.noAutoIndex && !it.indexedBy && !it.notIndexed && !it.right {
 		rLogSize := estLog(rSize)
 		for i := range b.terms {
 			t := &b.terms[i]
@@ -1549,11 +1549,16 @@ func (b *wherePlanIdxBuild) addBtree(iTab int, mPrereq whereMask) {
 				if it.fromExists {
 					scan.nOut = 0 // where.c:4286
 				}
-				b.insertLoop(whereIdxLoop{
-					iTab: iTab, maskSelf: maskSelf, prereq: mPrereq,
-					rRun: rRun, nOut: scan.nOut, idx: idx,
-					idxOnly: st.idxOnly, indexed: true, sortIdx: st.sortIdx,
-				})
+				// "Do not do an SCAN of a index-on-expression in a RIGHT JOIN"
+				// (where.c:4280): the right-join sweep could find its cursor
+				// on the wrong row.
+				if !(it.right && idxHasExpr(idx)) {
+					b.insertLoop(whereIdxLoop{
+						iTab: iTab, maskSelf: maskSelf, prereq: mPrereq,
+						rRun: rRun, nOut: scan.nOut, idx: idx,
+						idxOnly: st.idxOnly, indexed: true, sortIdx: st.sortIdx,
+					})
+				}
 			}
 		}
 		st.nOut = rSize
@@ -1574,19 +1579,21 @@ func (b *wherePlanIdxBuild) addBtree(iTab int, mPrereq whereMask) {
 func (b *wherePlanIdxBuild) addAll() {
 	var mPrereq, mPrior whereMask
 	hasRightCrossJoin := false
+	firstPastRJ := false
 	b.planLimit = wherePlannerLimit
 	for iTab := range b.items {
 		b.planLimit += wherePlannerLimitIncr
 		it := &b.items[iTab]
 		maskSelf := whereMask(1) << uint(iTab)
 		switch {
-		case it.outer || it.cross:
-			if it.cross {
-				// JT_LTORJ is the other flag that sets this; RIGHT/FULL joins
-				// are declined before this file runs.
+		case firstPastRJ || it.outer || it.cross || it.ltorj:
+			if it.cross || it.ltorj {
 				hasRightCrossJoin = true
 			}
 			mPrereq |= mPrior
+			// bFirstPastRJ: the right operand of a RIGHT JOIN may not be
+			// swapped with anything further right either.
+			firstPastRJ = it.right
 		case it.fromExists:
 			// where.c:4992: "joins that result from the EXISTS-to-JOIN
 			// optimization should not be moved to the left of any of their
@@ -2968,6 +2975,17 @@ func (b *wherePlanIdxBuild) whereIdxFindDistinctCol(idx *whereIndexInfo, j int, 
 		// -1) never matches an index naming that column. Reproduced as-is.
 		if ob[i].col >= 0 && ob[i].col == idx.aiColumn[j] &&
 			equalFoldName(ob[i].coll, idx.azColl[j]) {
+			return true
+		}
+	}
+	return false
+}
+
+// idxHasExpr reports whether an index has an expression key column
+// (pProbe->aColExpr non-null).
+func idxHasExpr(idx *whereIndexInfo) bool {
+	for _, e := range idx.exprs {
+		if e != nil {
 			return true
 		}
 	}

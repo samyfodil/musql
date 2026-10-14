@@ -224,6 +224,10 @@ const (
 	// more with that side NULL-extended. A subsequent OpRewind on the same
 	// cursor clears this state (see vdbeCursor.rewind).
 	OpNullRow
+	// OpRightJoinSweepOrder: P1: cursor, P4 (*autoIndexKey): puts a RIGHT/FULL
+	// join operand's rows, with their matched marks, into the order its
+	// unmatched-row sweep visits them (rightJoinSweepKey).
+	OpRightJoinSweepOrder
 
 	// RIGHT/FULL JOIN (emitRightOuterSweep, vdbe_join_codegen.go; semantics in
 	// join.go's package doc): an ordinary nested loop in FROM order yielding

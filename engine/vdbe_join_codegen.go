@@ -116,6 +116,10 @@ type joinSource struct {
 	// cursor (vdbe_cursor.go). tbl is synthetic, with the output columns only.
 	derived     *Program
 	derivedSlot int
+	// rjSweepKey, set when the ported planner decided a RIGHT/FULL join
+	// (markWherePlanEligibility), is the order the unmatched-row sweep visits
+	// this item's rows in (rightJoinSweepKey).
+	rjSweepKey *autoIndexKey
 	// derivedNoFrom is set for a subquery or view body with an arm that has no
 	// FROM clause, which C's flattener never absorbs (flattenSubquery
 	// restrictions (7) and (17c)).
@@ -816,7 +820,6 @@ func nestedColNamesInto(members []FromItem, scopes []*tableScope) {
 		ts.nestedStarNames = star
 	}
 }
-
 
 // groupJoinCommonNames is the column names the join between members k and k+1
 // makes common: USING's list, or for NATURAL every name k+1 shares with any
@@ -3244,6 +3247,11 @@ func (c *compiler) emitRightOuterSweep(srcs []joinSource, plan joinPlan, order [
 		if err := c.emitVtabCorrelatedOpen(srcs, order, level, s); err != nil {
 			return err
 		}
+	}
+	if k := srcs[order[level]].rjSweepKey; k != nil {
+		// The sweep visits the table in the order its own plan walks it
+		// (rightJoinSweepKey), which need not be the main loop's.
+		c.emit(Instruction{Op: OpRightJoinSweepOrder, P1: cur, P4: k})
 	}
 	rewindJump := c.emit(Instruction{Op: OpRightJoinSweepRewind, P1: cur, P4: others})
 	loopAddr := c.here()

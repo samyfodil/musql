@@ -39,18 +39,6 @@ func init() {
 		"detach/transaction.sqltest::memory::detach-fails-with-active-write-transaction",
 		"detach/transaction.sqltest::memory::detach-succeeds-after-commit",
 	)
-	tsKnownGroup("2026-10-12: RIGHT/FULL JOIN aggregates: a bare column in a GROUP BY whose anchor row depends on a scan order this engine cannot prove C's declines",
-		"right-full-join-sqlite.sqltest::memory::aggregates-windows-and-limits[full-join][a-id-b-id-row-number-over-order-by-a-id-b-id][group-by-1-order-by-1]",
-		"right-full-join-sqlite.sqltest::memory::aggregates-windows-and-limits[full-join][a-id-b-id-sum-b-v-over-partition-by-a-k-is-null-order-by-a-id-b-id][group-by-1-order-by-1]",
-		"right-full-join-sqlite.sqltest::memory::aggregates-windows-and-limits[full-join][coalesce-a-k-b-k-as-key-count-total-a-v-total-b-v][order-by-1-2-limit-3-offset-1]",
-		"right-full-join-sqlite.sqltest::memory::aggregates-windows-and-limits[full-join][coalesce-a-k-b-k-as-key-count-total-a-v-total-b-v][order-by-1-2]",
-		"right-full-join-sqlite.sqltest::memory::aggregates-windows-and-limits[full-join][distinct-a-k-is-null-b-k-is-null][group-by-1-order-by-1]",
-		"right-full-join-sqlite.sqltest::memory::aggregates-windows-and-limits[right-join][a-id-b-id-row-number-over-order-by-a-id-b-id][group-by-1-order-by-1]",
-		"right-full-join-sqlite.sqltest::memory::aggregates-windows-and-limits[right-join][a-id-b-id-sum-b-v-over-partition-by-a-k-is-null-order-by-a-id-b-id][group-by-1-order-by-1]",
-		"right-full-join-sqlite.sqltest::memory::aggregates-windows-and-limits[right-join][coalesce-a-k-b-k-as-key-count-total-a-v-total-b-v][order-by-1-2-limit-3-offset-1]",
-		"right-full-join-sqlite.sqltest::memory::aggregates-windows-and-limits[right-join][coalesce-a-k-b-k-as-key-count-total-a-v-total-b-v][order-by-1-2]",
-		"right-full-join-sqlite.sqltest::memory::aggregates-windows-and-limits[right-join][distinct-a-k-is-null-b-k-is-null][group-by-1-order-by-1]",
-	)
 	tsKnownGroup("2026-10-12: UPDATE ... FROM ... RETURNING with a subquery over the statement's CTE is declined (the RETURNING subquery cannot see the WITH clause)",
 		"update-from.sqltest::memory::update-from-returning-reuses-cte-snapshot-after-trigger-mutation",
 		"update-from.sqltest::memory::update-from-returning-reuses-row-cte-snapshot-after-trigger-mutation",

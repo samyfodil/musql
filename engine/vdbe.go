@@ -767,6 +767,43 @@ func autoIndexKeyValues(cur *vdbeCursor, key *autoIndexKey) (at func(i, k int) V
 	}, true
 }
 
+// sweepOrderCursor is autoIndexOrderCursor for a RIGHT/FULL join operand
+// before its unmatched-row sweep: the rows move into key order together with
+// the matched marks the main loop left on them. false when the key cannot be
+// computed.
+func sweepOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) bool {
+	cur.normalizeRowsNow()
+	if len(cur.rowids) != len(cur.rows) {
+		return false
+	}
+	if len(cur.rows) < 2 {
+		return true
+	}
+	at, ok := autoIndexKeyValues(cur, key)
+	if !ok {
+		return false
+	}
+	perm := make([]int, len(cur.rows))
+	for i := range perm {
+		perm[i] = i
+	}
+	autoIndexSortValues(perm, key, at, enc)
+	rows := make([][]Value, len(perm))
+	rowids := make([]uint64, len(perm))
+	var matched []bool
+	if cur.matched != nil {
+		matched = make([]bool, len(perm))
+	}
+	for i, p := range perm {
+		rows[i], rowids[i] = cur.rows[p], cur.rowids[p]
+		if matched != nil && p < len(cur.matched) {
+			matched[i] = cur.matched[p]
+		}
+	}
+	cur.rows, cur.rowids, cur.matched = rows, rowids, matched
+	return true
+}
+
 // autoIndexSortValues is autoIndexOrderCursor's sort over keys that are not
 // all integers: each comparison fetches the values and compares them under
 // their columns' collating sequences.
@@ -2271,6 +2308,18 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				m.rjMatched[op.P1][cur.rowid] = true
 			} else {
 				cur.markMatched()
+			}
+
+		case OpRightJoinSweepOrder:
+			cur := m.cursors[op.P1]
+			if !cur.materialized {
+				if rerr := cur.rewind(); rerr != nil {
+					return nil, rerr
+				}
+			}
+			cur.params = m.params
+			if !sweepOrderCursor(cur, op.P4.(*autoIndexKey), m.encoding()) {
+				return nil, fmt.Errorf("vdbe: the RIGHT JOIN sweep order could not be computed")
 			}
 
 		case OpRightJoinSweepRewind:

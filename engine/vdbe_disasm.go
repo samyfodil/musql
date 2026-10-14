@@ -87,6 +87,7 @@ var opNames = [numOpCodes]string{
 	OpRightJoinMark:        "RightJoinMark",
 	OpRightJoinSweepRewind: "RJSweepRewind",
 	OpRightJoinSweepNext:   "RJSweepNext",
+	OpRightJoinSweepOrder:  "RJSweepOrder",
 	OpOuterColumn:          "OuterColumn",
 	OpOuterRowid:           "OuterRowid",
 	OpSorterOpen:           "SorterOpen",
@@ -380,6 +381,8 @@ func disasmComment(prog *Program, addr int, in Instruction) string {
 		return fmt.Sprintf("cursor(%d): mark current row matched (RIGHT/FULL JOIN)", in.P1)
 	case OpRightJoinSweepRewind:
 		return fmt.Sprintf("cursor(%d): sweep first unmatched row; if none goto %d", in.P1, in.P2)
+	case OpRightJoinSweepOrder:
+		return fmt.Sprintf("cursor(%d): order rows for the RIGHT/FULL JOIN sweep", in.P1)
 	case OpRightJoinSweepNext:
 		return fmt.Sprintf("cursor(%d): sweep next unmatched row; if found goto %d", in.P1, in.P2)
 	case OpSorterOpen:

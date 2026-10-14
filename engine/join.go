@@ -30,6 +30,7 @@ package engine
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 )
 
@@ -2074,6 +2075,14 @@ func computeExecOrder(jts []joinedTable, scopes []tableScope, where Expr) ([]int
 	order := make([]int, len(jts))
 	for i := range order {
 		order[i] = i
+	}
+	if hasRightOuter(jts) && !hasGroups(jts) {
+		// A RIGHT/FULL JOIN keeps FROM order (whereLoopAddAll's barriers). When
+		// the ported planner decided it, each level's access order is its key.
+		if planned, keys, ok := sqliteExecOrder(jts, scopes, where); ok && slices.Equal(planned, order) {
+			return order, keys
+		}
+		return order, nil
 	}
 	if hasRightOuter(jts) || hasGroups(jts) {
 		// Never reorder with a RIGHT/FULL JOIN (C's row order there is FROM
