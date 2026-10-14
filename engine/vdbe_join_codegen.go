@@ -3233,6 +3233,18 @@ func (c *compiler) emitRightOuterSweep(srcs []joinSource, plan joinPlan, order [
 		}
 		others = append(others, srcs[order[i]].scope.cursor)
 	}
+	if s := srcs[order[level]]; len(s.vtabCorr) > 0 {
+		// A table-valued function reading the left side: C builds its rows
+		// again for the sweep with that side NULL-extended
+		// (sqlite3WhereRightJoinLoop), and the rows it matched are known by
+		// rowid.
+		for _, oc := range others {
+			c.emit(Instruction{Op: OpNullRow, P1: oc})
+		}
+		if err := c.emitVtabCorrelatedOpen(srcs, order, level, s); err != nil {
+			return err
+		}
+	}
 	rewindJump := c.emit(Instruction{Op: OpRightJoinSweepRewind, P1: cur, P4: others})
 	loopAddr := c.here()
 	if err := c.emitJoinLevel(srcs, plan, level+1, body); err != nil {

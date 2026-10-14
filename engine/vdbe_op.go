@@ -923,6 +923,10 @@ type derivedSource struct {
 	// inside the loop). Emitted only by emitVtabCorrelatedOpen; nil everywhere
 	// else. See vtab_correlated.go.
 	vtabCorr []vtabCorrTerm
+	// rightJoin marks a correlated source that is a RIGHT/FULL JOIN's
+	// operand: its matches are recorded by rowid (vdbe.rjMatched), since its
+	// rows are built again per outer row and once more for the sweep.
+	rightJoin bool
 
 	cte   *cteRef
 	tbl   *resolvedTable

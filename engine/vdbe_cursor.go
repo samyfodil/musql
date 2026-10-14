@@ -24,6 +24,10 @@ import (
 // below); OpNullRow puts it into the synthetic all-NULL state a LEFT JOIN's
 // unmatched row needs; OpClose releases its materialized rows.
 type vdbeCursor struct {
+	// rjByRowid marks a correlated RIGHT/FULL JOIN operand, whose matches are
+	// kept by rowid on the machine (vdbe.rjMatched) rather than in matched.
+	rjByRowid bool
+
 	// params is the running statement's bound parameters, set by OpRewind and
 	// OpAutoIndexOrder. multiOrOrderCursor needs them: a WHERE disjunct can carry
 	// a parameter, and evaluating it against nil params answered NULL, putting
@@ -963,12 +967,19 @@ func (cur *vdbeCursor) markMatched() {
 // correctly "unmatched"). OpRightJoinSweepRewind (start==0) and
 // OpRightJoinSweepNext (start==cur.pos+1) are this method's only two
 // callers (vdbe.go).
-func (cur *vdbeCursor) sweepUnmatchedFrom(start int) bool {
+//
+// byRowid, for a cursor matched by rowid (vdbeCursor.rjByRowid), is the set of
+// rowids its main pass matched, which decides instead of the bits.
+func (cur *vdbeCursor) sweepUnmatchedFrom(start int, byRowid map[uint64]bool) bool {
 	if cur.matched == nil {
 		cur.matched = make([]bool, len(cur.rows))
 	}
 	for i := start; i < len(cur.rows); i++ {
-		if !cur.matched[i] {
+		matched := cur.matched[i]
+		if cur.rjByRowid {
+			matched = byRowid[cur.rowids[i]]
+		}
+		if !matched {
 			cur.pos = i
 			cur.rowid = cur.rowids[i]
 			cur.rowVals = cur.rows[i]

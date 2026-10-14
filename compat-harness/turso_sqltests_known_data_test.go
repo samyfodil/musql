@@ -51,10 +51,6 @@ func init() {
 		"right-full-join-sqlite.sqltest::memory::aggregates-windows-and-limits[right-join][coalesce-a-k-b-k-as-key-count-total-a-v-total-b-v][order-by-1-2]",
 		"right-full-join-sqlite.sqltest::memory::aggregates-windows-and-limits[right-join][distinct-a-k-is-null-b-k-is-null][group-by-1-order-by-1]",
 	)
-	tsKnownGroup("2026-10-12: a table-valued function on the right of a RIGHT JOIN whose argument is a subquery reading the left table is declined (C rebuilds it as a correlated argument)",
-		"right-full-join-sqlite.sqltest::memory::right-join-rebuilds-subquery-in-table-function-argument",
-		"right-full-join-sqlite.sqltest::memory::right-join-rebuilds-table-function-argument-from-left-source",
-	)
 	tsKnownGroup("2026-10-12: UPDATE ... FROM where a target row matches several FROM rows: C keeps the last match in its join order, which this write path does not reproduce, so it declines",
 		"update-from.sqltest::memory::update-from-duplicate-match-keeps-set-columns-consistent",
 		"update-from.sqltest::memory::update-from-duplicate-match-updates-once",

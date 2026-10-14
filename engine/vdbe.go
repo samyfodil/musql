@@ -71,6 +71,9 @@ type vdbe struct {
 	// stmtOnceRows holds the rows of each derivedSource.stmtOnce body, by
 	// program, on the statement's root machine (stmtRoot).
 	stmtOnceRows map[*Program][][]Value
+	// rjMatched holds, per cursor, the rowids a correlated RIGHT/FULL JOIN
+	// operand matched (derivedSource.rightJoin), across its rebuilds.
+	rjMatched map[int]map[uint64]bool
 	// cteRoot is the machine of the statement this uncorrelated sub-program
 	// belongs to (newMachine); nil on the statement's own machine.
 	cteRoot *vdbe
@@ -2022,6 +2025,15 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 						return nil, verr
 					}
 					m.cursors[op.P1] = openMaterializedCursor(ds.tbl, rows, rowids)
+					if ds.rightJoin {
+						m.cursors[op.P1].rjByRowid = true
+						if m.rjMatched == nil {
+							m.rjMatched = map[int]map[uint64]bool{}
+						}
+						if m.rjMatched[op.P1] == nil {
+							m.rjMatched[op.P1] = map[uint64]bool{}
+						}
+					}
 					break
 				}
 				slot := op.P2
@@ -2255,7 +2267,11 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			m.cursors[op.P1].nullRow()
 
 		case OpRightJoinMark:
-			m.cursors[op.P1].markMatched()
+			if cur := m.cursors[op.P1]; cur.rjByRowid {
+				m.rjMatched[op.P1][cur.rowid] = true
+			} else {
+				cur.markMatched()
+			}
 
 		case OpRightJoinSweepRewind:
 			cur := m.cursors[op.P1]
@@ -2267,7 +2283,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 					return nil, rerr
 				}
 			}
-			if !cur.sweepUnmatchedFrom(0) {
+			if !cur.sweepUnmatchedFrom(0, m.rjMatched[op.P1]) {
 				pc = op.P2
 				continue
 			}
@@ -2277,7 +2293,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpRightJoinSweepNext:
 			cur := m.cursors[op.P1]
-			if cur.sweepUnmatchedFrom(cur.pos + 1) {
+			if cur.sweepUnmatchedFrom(cur.pos+1, m.rjMatched[op.P1]) {
 				for _, oc := range op.P4.([]int) {
 					m.cursors[oc].nullRow()
 				}
