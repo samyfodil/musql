@@ -855,6 +855,13 @@ func selectForeignSchema(sel *SelectStmt, local string, allowTemp bool) string {
 			return s
 		}
 	}
+	// sqlite3FixSelect walks LIMIT and OFFSET too: "LIMIT (SELECT n FROM
+	// aux.t)" in a trigger body is the same error.
+	for _, e := range []Expr{sel.LimitParam, sel.OffsetParam} {
+		if s := exprForeignSchema(e, local, allowTemp); s != "" {
+			return s
+		}
+	}
 	for _, arm := range sel.Compound {
 		if s := selectForeignSchema(arm.Stmt, local, allowTemp); s != "" {
 			return s
@@ -988,7 +995,8 @@ func selectHasParam(sel *SelectStmt) bool {
 			return true
 		}
 	}
-	if sel.LimitParam != nil || sel.OffsetParam != nil {
+	// LIMIT/OFFSET hold any expression ("LIMIT 1+1"), not only a "?".
+	if exprHasParam(sel.LimitParam) || exprHasParam(sel.OffsetParam) {
 		return true
 	}
 	for _, arm := range sel.Compound {

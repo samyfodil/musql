@@ -431,6 +431,9 @@ func (cp *compoundProgram) execFrom(pager *ReadOnlyPager, params []Value, parent
 	}
 
 	if len(cp.orderBy) > 0 {
+		// C sorts each arm through a sorter (multiSelectOrderBy), whose
+		// records hand values back as recordValue does.
+		recordRows(rows)
 		// keyIdx/keyColl were resolved once at compile time (cp.orderByIdx/
 		// cp.orderByColl); exec never re-resolves -- an expression term needs
 		// the arm's select-list expressions, which only compileCompound had.

@@ -1280,11 +1280,8 @@ func (c *Conn) rememberWalAutoCheckpoint(sqlText string) {
 	if err != nil || stmt == nil || stmt.Name != "wal_autocheckpoint" || !stmt.HasValue {
 		return
 	}
-	n, cerr := strconv.Atoi(strings.TrimSpace(stmt.ValueText))
-	if cerr != nil || n < 0 {
-		n = 0
-	}
-	c.walAutoCheckpointPlus1 = n + 1
+	// sqlite3Atoi: a value outside 32 bits reads as 0, like a negative one.
+	c.walAutoCheckpointPlus1 = max(engine.PragmaAtoi(stmt.ValueText), 0) + 1
 }
 
 // isWalCheckpointPragma reports whether sqlText is "PRAGMA

@@ -2467,7 +2467,17 @@ func computeGeneratedInto(tblName string, cols []columnInfo, row []Value) error 
 		if err != nil {
 			return fmt.Errorf("engine: table %s: generated column %s: %w", tblName, c.Name, err)
 		}
-		row[i] = applyAffinityToValue(v, c.Aff)
+		v = applyAffinityToValue(v, c.Aff)
+		// sqlite3ExprCodeGeneratedColumn codes the expression then
+		// OP_Affinity, whose REAL branch leaves an integral value a
+		// MEM_IntReal. A STORED column is read back through OP_Column and
+		// OP_RealAffinity, a plain REAL, so only a VIRTUAL one keeps the flag.
+		if c.Aff == affReal && !c.GeneratedStored && v.Typ == Float {
+			if _, ok := intRealOf(v.F); ok {
+				v.intReal = true
+			}
+		}
+		row[i] = v
 		return nil
 	}
 	for i := range cols {

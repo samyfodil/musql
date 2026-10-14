@@ -945,6 +945,15 @@ func parsePragmaIndexColumns(sqlText string) (names []string, descs []bool, coll
 			}
 		}
 		name, coll := indexKeyColumnName(seg)
+		if name == "" {
+			body := seg
+			for len(body) > 1 && body[len(body)-1].kind == tkIdent &&
+				(body[len(body)-1].upper() == "ASC" || body[len(body)-1].upper() == "DESC") {
+				body = body[:len(body)-1]
+			}
+			name, coll, _ = indexKeyEntryAsColumn(sqlText[body[0].Start:body[len(body)-1].End])
+
+		}
 		names = append(names, name)
 		descs = append(descs, desc)
 		colls = append(colls, coll)

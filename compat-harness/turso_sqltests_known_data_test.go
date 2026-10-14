@@ -48,7 +48,6 @@ func init() {
 		"gencol.sqltest::memory::gencol_error_window_function",
 		"gencol.sqltest::memory::gencol_issue7058_alter_add_default_on_gencol",
 		"gencol.sqltest::memory::gencol_issue7072_upsert_expression_does_not_match_gencol_index",
-		"gencol.sqltest::memory::gencol_intreal_typeof",
 	)
 	tsKnownGroup("2026-10-12: INSERT corners: an AUTOINCREMENT-less rowid overflow picks random rowids (musql reports a unique violation), STRICT multi-statement text, and PRIMARY KEY conflict wording",
 		"insert.sqltest::memory::rowid-overflow-random-generation",
@@ -57,8 +56,6 @@ func init() {
 	)
 	tsKnownGroup("2026-10-12: PRAGMA surface: max_page_count has no meaning on this format (declined by design), pragma_* table-valued functions for pragmas musql does not expose as functions, page_size / wal_checkpoint / user_version on an attached or temp database, and pragma_table_list rows",
 		"integrity_check/memory.sqltest::memory::integrity-check-qualified-empty-attached-database",
-		"pragma/default.sqltest::default-no-rowidalias::pragma-table-xinfo-vtable",
-		"pragma/default.sqltest::default::pragma-table-xinfo-vtable",
 		"pragma/memory.sqltest::memory::pragma-function-update-journal-mode",
 		"pragma/memory.sqltest::memory::pragma-max-page-count-clamping-with-data",
 		"pragma/memory.sqltest::memory::pragma-max-page-count-default",
@@ -73,9 +70,6 @@ func init() {
 		"temp_tables.sqltest::memory::pragma-temp-page-size-independent-of-main",
 		"temp_tables.sqltest::memory::pragma-temp-wal-checkpoint-without-temp-db-matches-sqlite",
 		"pragma/synchronous.sqltest::memory::pragma-synchronous-tvf-too-many-arguments",
-		"pragma/memory.sqltest::memory::pragma-table-info-vtable",
-		"pragma/memory.sqltest::memory::pragma-wal-autocheckpoint-value-above-int-range-reads-back-as-zero",
-		"pragma/table_list.sqltest::memory::pragma-table-list-unqualified-includes-main-and-temp-matches",
 	)
 	tsKnownGroup("2026-10-12: NOT BETWEEN with a subquery bound and an ORDER BY/OFFSET inside is declined",
 		"not_between.sqltest::memory::not-between-subquery-bound-orderby-offset",
@@ -93,7 +87,6 @@ func init() {
 	tsKnownGroup("2026-10-12: REINDEX on an attached database, an INDEXED BY a partial index, and index_xinfo for an expression index with an outer COLLATE",
 		"reindex.sqltest::memory::reindex-attached-qualified-targets",
 		"reindex.sqltest::memory::reindex-table-with-multiple-index-types",
-		"reindex.sqltest::memory::reindex-expression-index-outer-collate-target",
 	)
 	tsKnownGroup("2026-10-12: INSERT ... SELECT into a STRICT BLOB column from an ANY column: C's transfer optimisation stores the value, musql checks the type",
 		"strict.sqltest::memory::strict-insert-select-any-to-blob-rejects-xfer",
@@ -119,7 +112,6 @@ func init() {
 		"trigger.sqltest::memory::trigger-returning-update-rejected",
 		"trigger_attach_regression.sqltest::memory::trigger-doubly-qualified-expr-runtime-error",
 		"trigger_attach_regression.sqltest::memory::trigger-doubly-qualified-when-runtime-error",
-		"trigger_attach_regression.sqltest::memory::trigger-cross-db-limit-subquery",
 	)
 	tsKnownGroup("2026-10-12: correlated EXISTS whose inequality compares a json_extract() value is declined",
 		"unnest-correlated.sqltest::memory::correlated-exists-inequality-expression-errors[exists][json-extract-i-json-value-o-limit-value][and-i-value-o-wanted]",
@@ -167,7 +159,6 @@ func init() {
 	tsKnownGroup("2026-10-12: CREATE INDEX: a parenthesised string in the key list is a missing column in C, and the non-deterministic-function diagnostics are worded differently",
 		"create_index.sqltest::memory::create-index-sqlite-source-id",
 		"create_index.sqltest::memory::create-index-sqlite-version",
-		"create_index.sqltest::memory::create-index-parenthesized-string-no-such-column",
 	)
 	tsKnownGroup("2026-10-12: NATURAL JOIN with ON/USING diagnostic wording and RIGHT then FULL JOIN USING values",
 		"join/memory.sqltest::memory::join-3-1",
@@ -184,13 +175,10 @@ func init() {
 	tsKnownGroup("2026-10-12: SELECT corners: a trailing -- comment is part of C's result column name, doubly qualified column errors are hidden behind LIMIT 0 planning, SELECT * with no FROM in a subquery",
 		"select/default.sqltest::default-no-rowidalias::select-star-subquery",
 		"select/default.sqltest::default::select-star-subquery",
-		"select/default.sqltest::default-no-rowidalias::select_negative_infinite_float",
-		"select/default.sqltest::default::select_negative_infinite_float",
 	)
 	tsKnownGroup("2026-10-12: SELECT corners: a double-quoted name in VALUES names the column in C, the self-join ambiguity names the schema-qualified column, and the bound-parameter count error wording",
 		"select/memory.sqltest::memory::ambiguous-self-join",
 		"select/memory.sqltest::memory::where-variable-predicate",
-		"select/memory.sqltest::memory::select-double-quotes-values",
 	)
 	tsKnownGroup("2026-10-12: REGEXP is reported as \"no such function: regexp\" (lower case) where C echoes REGEXP",
 		"simple-count-optimization.sqltest::memory::simple-count-regexp-invalid-pattern-correctness",
@@ -203,11 +191,5 @@ func init() {
 	)
 	tsKnownGroup("2026-10-12: C 3.53.3 planner bug (Turso's own @skip-if sqlite documents it): GROUP BY sort elision swallows the outer ORDER BY direction when a CTE supplies pre-ordered rows; musql returns the ordered result",
 		"subquery/cte_materialization_adversarial.sqltest::memory::sort-elision-group-by-opposite-dir",
-	)
-	tsKnownGroup("2026-10-12: TEMP triggers fire before main-schema triggers, in creation order; musql fires the TEMP triggers in reverse creation order",
-		"temp-trigger-fires-before-main.sqltest::memory::temp-triggers-fire-first-in-creation-order",
-	)
-	tsKnownGroup("2026-10-12: a double-quoted name in VALUES names the result column in C",
-		"values.sqltest::memory::values-double-quotes-subquery",
 	)
 }

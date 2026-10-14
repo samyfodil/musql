@@ -32,9 +32,43 @@ type Value struct {
 	// functions that don't explicitly read it. Declared here, after Typ, to fit
 	// in its padding without growing Value's size.
 	Subtype uint8
+	// intReal marks a Float that C holds as MEM_IntReal: an integral value
+	// under REAL affinity, kept as an integer that "really wants to be REAL"
+	// (vdbe.c, OP_Affinity). It reads as a REAL everywhere, but a record
+	// stores it as an integer and nothing applies REAL affinity on the way
+	// back out of a sorter or an ephemeral table, so it leaves one as an
+	// INTEGER (see recordValue). Only a VIRTUAL generated column of REAL
+	// affinity makes one (computeGeneratedInto). Like Subtype it rides in
+	// Typ's padding and propagates by copy.
+	intReal bool
 	I       int64
 	F       float64
 	S       []byte
+}
+
+// recordValue is v as a record holds it: OP_MakeRecord serializes a
+// MEM_IntReal as an integer (vdbe.c), so it is read back as one.
+func recordValue(v Value) Value {
+	if v.intReal && v.Typ == Float {
+		if i, ok := intRealOf(v.F); ok {
+			return Value{Typ: Int, I: i}
+		}
+	}
+	return v
+}
+
+// intRealOf reports whether f is a value OP_Affinity's REAL branch keeps as a
+// MEM_IntReal: integral (sqlite3VdbeIntegerAffinity) and within six bytes,
+// the range vdbe.c tests before setting the flag.
+func intRealOf(f float64) (int64, bool) {
+	if f != f || f < -140737488355328 || f > 140737488355327 {
+		return 0, false
+	}
+	i := int64(f)
+	if float64(i) != f {
+		return 0, false
+	}
+	return i, true
 }
 
 // smallRecordCols bounds the on-stack serial-type array; records larger than
