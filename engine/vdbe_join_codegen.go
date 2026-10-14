@@ -2480,7 +2480,10 @@ func (p *ReadOnlyPager) finishGroupSource(c *compiler, state *joinDesugarState, 
 	// (span[0], above), so checkRebuiltJoinGroups' front-move census inside
 	// it has no way to prove a mismatch unobservable -- see the field's own
 	// doc comment (vdbe_codegen.go) and checkOneRebuiltGroup's (this file).
-	subC := &compiler{pager: p, groupSpanRecursion: true}
+	// The group is C's SF_NestedFrom subquery, whose names see the query
+	// enclosing c but not c's own FROM, as any FROM subquery's do: an ON inside
+	// it may read a correlated subquery's outer row.
+	subC := &compiler{pager: p, groupSpanRecursion: true, outer: derivedOuterBarrier(c)}
 	spanSrcs, serr := resolveJoinSources(p, subC, span)
 	if serr != nil {
 		return joinSource{}, serr
@@ -2545,6 +2548,10 @@ func (p *ReadOnlyPager) finishGroupSource(c *compiler, state *joinDesugarState, 
 	prog, perr := compileGroupBody(subC, spanSrcs, outCols)
 	if perr != nil {
 		return joinSource{}, perr
+	}
+	if prog.Correlated {
+		// As resolveDerivedSource: c reads its outer row through the group.
+		c.correlated = true
 	}
 
 	allCols := make([]columnInfo, 0, len(outCols))
