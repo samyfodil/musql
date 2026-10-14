@@ -160,6 +160,7 @@ func parseCreateViewStmt(sqlText string) (*parsedCreateView, error) {
 	// this body is typed. That is sqlite3MultiValues' condition (b); see
 	// valuesFold (sql_ast.go) for the measurement that pins it.
 	p.schemaBody = true
+	p.viewBody = true
 	if !p.consumeKeyword("CREATE") {
 		return nil, fmt.Errorf("engine: CREATE VIEW: expected CREATE, got %q", p.tokenDesc(p.peek()))
 	}

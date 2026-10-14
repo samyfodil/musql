@@ -27,7 +27,8 @@ func insertProgramArmable(insns []Instruction, tbl *tableMeta, plan *insertPlan,
 				return false
 			}
 		case OpInsert:
-			if p, ok := in.P4.(*insertPlan); !ok || p != plan || in.P1 != 0 {
+			// A VALUES program (plan nil) carries a copy of its plan per row.
+			if p, ok := in.P4.(*insertPlan); !ok || (plan != nil && p != plan) || p.tbl != tbl || in.P1 != 0 {
 				return false
 			}
 		case OpOpenWrite:
@@ -35,11 +36,11 @@ func insertProgramArmable(insns []Instruction, tbl *tableMeta, plan *insertPlan,
 				return false
 			}
 		case OpOpenDerived:
-			if d, ok := in.P4.(*derivedSource); !ok || d != src || in.P1 != srcCursor {
+			if d, ok := in.P4.(*derivedSource); !ok || src == nil || d != src || in.P1 != srcCursor {
 				return false
 			}
 		case OpRewind, OpNext, OpColumn:
-			if in.P1 != srcCursor {
+			if srcCursor < 0 || in.P1 != srcCursor {
 				return false
 			}
 		default:

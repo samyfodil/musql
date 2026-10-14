@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -65,8 +66,13 @@ func TestSegOrderLimitBytesMatchesOracle(t *testing.T) {
 		}
 	}
 	mq.Close()
-	if did, err := engine.CompactSegmentFile(mqPath); err != nil || !did {
+	// A load inside a transaction now writes segments at COMMIT
+	// (engine/insert_bulk_direct.go), leaving no delta to compact; what
+	// matters is that none is left.
+	if did, err := engine.CompactSegmentFile(mqPath); err != nil {
 		t.Fatalf("compacting: did=%v err=%v", did, err)
+	} else if _, serr := os.Stat(mqPath + ".delta"); !did && serr == nil {
+		t.Fatal("compacting did nothing and a delta is still there")
 	}
 	if mq, err = sql.Open(driver.DriverName, mqPath); err != nil {
 		t.Fatal(err)

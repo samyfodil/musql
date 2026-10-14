@@ -1586,6 +1586,9 @@ func wherePlanColumnRef(jts []joinedTable, scopes []tableScope, e Expr) (int, in
 			if _, hidden := scopes[i].coalesced[lname]; hidden {
 				continue
 			}
+			if _, skip := scopes[i].usingSkip[lname]; skip {
+				continue
+			}
 		}
 		if ci, hit := scopes[i].colIndex[lname]; hit {
 			found++

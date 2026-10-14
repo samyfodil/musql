@@ -119,6 +119,91 @@ Point lookups are DuckDB's weak spot and C SQLite's strength.
 
 Run with `MUSQL_WORKERS=4` for the four-worker column.
 
+## Bulk load and point reads
+
+`bench/pointread` measures what an application does with a key-value table,
+through `database/sql` for both engines: one transaction inserting 10M rows
+(`k INTEGER PRIMARY KEY, v TEXT`, values like `value-1234567`) through a
+prepared statement, then 12 goroutines each reading 50,000 random keys with
+`SELECT v FROM kv WHERE k = ?`, every value checked. C SQLite is mattn/go-sqlite3.
+Disk is the database and its sidecar files, measured with the connection open.
+
+**Apple M4** (arm64, macOS)
+
+| Metric | musql | C SQLite | musql / C |
+| --- | ---: | ---: | ---: |
+| Load, 10M rows | 4.52 s | 4.99 s | 0.90 |
+| Read avg | 10.5 µs | 28.9 µs | 0.36 |
+| Read p50 | 3.5 µs | 17.2 µs | 0.21 |
+| Read p99 | 101 µs | 273 µs | 0.37 |
+| Read max | 5.9 ms | 32.1 ms | 0.18 |
+| Disk | 190.9 MiB | 218.2 MiB | 0.87 |
+
+**Intel Xeon D-2123IT** (amd64, Linux, a shared server)
+
+| Metric | musql | C SQLite | musql / C |
+| --- | ---: | ---: | ---: |
+| Load, 10M rows | 19.2 s | 22.3 s | 0.86 |
+| Read avg | 18.7 µs | 55.4 µs | 0.34 |
+| Read p50 | 8.8 µs | 32.5 µs | 0.27 |
+| Read p99 | 265 µs | 227 µs | 1.17 |
+| Read max | 8.6 ms | 21.0 ms | 0.41 |
+| Disk | 190.9 MiB | 218.2 MiB | 0.87 |
+
+The x86 machine is shared and was at a load of 7-9 on its 8 cores; there
+musql's p99 came out at 0.98x, 1.16x and 1.17x C's over three runs. That tail
+is not the engine's read: twelve readers on eight cores contend on
+`database/sql`'s own pool lock (`DB.conn` and `putConn`, 12% of the read
+phase's CPU, much of it spinning), which a read 3.5x faster than C's takes
+3.5x as often. With the GC off it is about even; the M4, idle, has it at 0.37x.
+
+Before the work that brought these, musql took 2.2x C's time to load, lost on
+p99 and max, and wrote 2.1x C's bytes. What changed:
+
+- **Load.** A transaction's inserts into an empty table build segments
+  directly (engine/insert_bulk_direct.go) instead of going through the row
+  store, the change log and the spill file and being rebuilt at COMMIT.
+- **Disk** (47 to 20 bytes a row). Segment file version 6 keeps consecutive
+  rowids as one, drops the width block of full rows, stores a TEXT column as
+  4-byte heap bounds instead of 8-byte cells, and keeps 3-byte row positions
+  in the TEXT equality index instead of a value, a prefix sum and a position.
+- **Reads and their tail.** Each statement's freshness check stamped two
+  files, a stat and an fstat that twelve readers queued on in the kernel; it
+  now reads a word the writers keep in the lock file. All connections share
+  one mapping of the file, so a page faults once and not once per connection.
+  A new connection's first read no longer maps the file twice, and a closing
+  connection that had only read no longer takes the exclusive commit lock,
+  which made every connection opening at that moment sleep a lock-poll
+  interval.
+
+`bench/pointread/run` runs a short version (1M rows) and fails if musql
+loses on load, avg, p50, p99 or disk; CI runs it, and
+`POINTREAD_FULL=1 bench/pointread/run` is the full size. It gates two ways of
+reading, in both engines: every reader through one shared `*sql.DB` (the tables
+above, and the upstream shape), and each reader with its own `*sql.Conn`.
+
+The shared `*sql.DB` was ungated until the driver's read gate
+(`driver/read_gate.go`). With more readers than cores it measured the pool, not
+the engine: every `QueryRow` takes `database/sql`'s pool lock twice (`DB.conn`
+and `putConn`), and `sync.Mutex.Unlock` does not hand the processor to the
+waiter it wakes. The waiter sat runnable while the goroutine that released the
+lock kept running, and a musql read never blocks or makes a system call, so it
+kept running until it next parked on that lock; a trace put 60% of the reads
+over 300 µs on such a wait. A C read is a cgo call, which gives its processor
+away when it runs long, and that kept C's tail short. The gate lets at most
+GOMAXPROCS pooled reads run at once and parks the rest on itself instead of
+leaving them runnable, so a reader that finds the pool lock held spins instead
+of parking and the waiting comes in rare, long turns. On .10 pinned to 4 cores
+(`taskset -c 4-7`, `GOMAXPROCS=4`, the short run, 3 runs each):
+
+| readers | mode | engine | reads/s | p50 | p99 | p99.9 |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| 12 | shared `*sql.DB` | musql, no gate | 545-597k | 4.2-4.4 µs | 414-441 µs | 1.8-2.3 ms |
+| 12 | shared `*sql.DB` | musql | 533-584k | 4.2-4.4 µs | 23-26 µs | 0.47-0.68 ms |
+| 12 | shared `*sql.DB` | C | 181-187k | 17.2-17.5 µs | 44-53 µs | 13.3-14.5 ms |
+| 12 | `*sql.Conn` per reader | musql | 677-700k | 3.2 µs | 22-25 µs | 2.6-2.8 ms |
+| 12 | `*sql.Conn` per reader | C | 183-186k | 16.2-16.4 µs | 43-46 µs | 12.2-13.5 ms |
+
 ## Notes
 
 - The Go bridge costs C SQLite microseconds per statement: point lookups take

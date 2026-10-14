@@ -39,6 +39,14 @@ import (
 // writer staged the segments in a scratch file and copied them in after the
 // directory -- every rewrite wrote its whole database twice.
 //
+// Version 6 keeps version 5's file layout and lets a SEGMENT leave out what it
+// can derive: consecutive rowids, a width block of full rows, and a TEXT or
+// BLOB column's 8-byte cells, replaced by 4-byte heap bounds; its TEXT and
+// BLOB indexes keep only 3-byte row positions (segment.go, buildSegmentInto;
+// segment_index_ondisk.go, segIdxCodecBytesPerm). A segment says which in its
+// own flags, so a version 6 file may hold version 5 segments -- a verbatim
+// compaction copies them -- and the reader takes either.
+//
 // segFileVersion is the format this build writes, and segFileMinVersion the
 // oldest it reads: a file is readable from every build after the one that
 // wrote it. A change to what a reader sees takes a new version, and the reader
@@ -50,7 +58,7 @@ import (
 // segFileMinVersion drops files people may have; it needs a converter first.
 const (
 	segFileMagic      = "MQSF"
-	segFileVersion    = 5
+	segFileVersion    = 6
 	segFileMinVersion = 4
 	segFileHdrSize    = 24 // version 4's header, and the fields every version starts with
 	segFileHdrSizeV5  = 32 // version 5's: those, and the directory's offset
@@ -61,6 +69,11 @@ type SegmentFile struct {
 	m      *mmapfile.File
 	tables []SegmentFileTable
 
+	// shared is the process-wide mapping this handle is one of
+	// (segment_file_share.go), and closed whether this handle let go of it.
+	shared *sharedSegFile
+	closed bool
+
 	// srcChangeCounter and srcPageCount are the source database's, as it stood
 	// when this file was written. A segment file is DERIVED data, and derived
 	// data that has silently fallen behind its source is not slow, it is
@@ -68,6 +81,8 @@ type SegmentFile struct {
 	// than answering from it. See errSegmentsStale.
 	srcChangeCounter uint32
 	srcPageCount     uint32
+	// version is the format version the file was written in.
+	version uint32
 
 	// catalog is every index, view and trigger, and every AUTOINCREMENT counter.
 	// Without it the file holds rows and no schema, which is why a round trip
@@ -127,12 +142,17 @@ func (f *SegmentFile) Tables() []SegmentFileTable { return f.tables }
 // Mapped reports whether the bytes came from a mapping rather than a read.
 func (f *SegmentFile) Mapped() bool { return f != nil && f.m.Mapped() }
 
-// Close releases the mapping.
+// Close releases the mapping -- this handle's hold on it, when the mapping is
+// shared (segment_file_share.go). Safe to call more than once.
 func (f *SegmentFile) Close() error {
-	if f == nil {
+	if f == nil || f.closed {
 		return nil
 	}
+	f.closed = true
 	f.tables = nil
+	if f.shared != nil {
+		return f.shared.release()
+	}
 	return f.m.Close()
 }
 
@@ -142,6 +162,13 @@ func (f *SegmentFile) Close() error {
 // already in memory; a caller producing them one at a time streams them in
 // instead (CompactSegmentFile).
 func WriteSegmentFileWithCatalog(path string, tables []ConvertedTable, cat ConvertedCatalog, srcChangeCounter, srcPageCount uint32) error {
+	// Every change to the pair is announced in the lock file's change word
+	// (segment_change.go), so a reader's freshness check can skip the stamps.
+	endChange, cerr := segChangeBegin(path)
+	if cerr != nil {
+		return cerr
+	}
+	defer endChange()
 	w, err := newSegFileWriter(filepath.Dir(path))
 	if err != nil {
 		return err
@@ -462,10 +489,31 @@ func segAlign8Int64(n int64) int64 { return (n + 7) &^ 7 }
 // OpenSegmentFile maps a segment file. The segments it hands back alias the
 // mapping, so they cost nothing to open and are invalid after Close.
 func OpenSegmentFile(path string) (*SegmentFile, error) {
-	m, err := mmapfile.Open(path)
+	fd, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
+	key, keyed := segFileKeyOf(fd)
+	if keyed {
+		if f := sharedSegFileFor(key); f != nil {
+			fd.Close()
+			return f, nil
+		}
+	}
+	m, err := mmapfile.OpenFile(fd)
+	if err != nil {
+		return nil, err
+	}
+	f, err := parseSegmentFile(m)
+	if err != nil || !keyed || !m.Mapped() {
+		return f, err
+	}
+	return shareSegFile(key, f), nil
+}
+
+// parseSegmentFile reads the header and directory of a mapped segment file,
+// closing the mapping when it is not one.
+func parseSegmentFile(m *mmapfile.File) (*SegmentFile, error) {
 	buf := m.Data()
 	if len(buf) < segFileHdrSize || string(buf[:4]) != segFileMagic {
 		m.Close()
@@ -500,7 +548,7 @@ func OpenSegmentFile(path string) (*SegmentFile, error) {
 		m.Close()
 		return nil, fmt.Errorf("segment file: header says %d tables, directory says %d", nTables, got)
 	}
-	f := &SegmentFile{m: m,
+	f := &SegmentFile{m: m, version: binary.LittleEndian.Uint32(buf[4:]),
 		srcChangeCounter: binary.LittleEndian.Uint32(buf[16:]),
 		srcPageCount:     binary.LittleEndian.Uint32(buf[20:])}
 	for i := 0; i < nTables; i++ {

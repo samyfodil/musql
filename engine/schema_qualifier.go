@@ -368,7 +368,10 @@ func (p *ReadOnlyPager) columnQualifierCatalogMismatch(x ColumnExpr, from []From
 			return nil, false
 		}
 		if it.Subquery != nil || it.Table == "" {
-			return nil, false // a derived table belongs to no catalog
+			// A derived table belongs to no catalog, so no schema qualifier
+			// names it: its Table has no pSchema, and lookupName skips an item
+			// whose pSchema is not the named database's (resolve.c:405-407).
+			return notFound, true
 		}
 		// Unqualified item: it lives wherever its own name resolves. A TEMP
 		// qualifier is asked of the TEMP database, which is where temp objects

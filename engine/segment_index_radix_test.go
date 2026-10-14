@@ -51,13 +51,26 @@ func TestRadixOrderInt64MatchesComparisonSort(t *testing.T) {
 // TestBytesIndexPrefixOrderMatchesComparisonSort checks the bytes index's
 // prefix radix against a plain sort by (bytes, position), over values built
 // to tie on the 8-byte prefix: equal values, zero-padded short ones, and
-// long ones differing only past the prefix.
+// long ones differing only past the prefix -- and the same values again behind
+// a head they all share, which the radix skips (bytesIndexOrder's lcp), one of
+// them being the head alone.
 func TestBytesIndexPrefixOrderMatchesComparisonSort(t *testing.T) {
-	vals := [][]byte{
+	base := [][]byte{
 		{}, {0}, {0, 0}, {1}, {1, 0}, []byte("abcdefgh"), []byte("abcdefgh"),
 		[]byte("abcdefghZ"), []byte("abcdefghA"), []byte("abcdefg"), []byte("abcdefg\x00"),
 		{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1}, {0x80}, {0x7f}, []byte("abcdefghA"),
 	}
+	var headed [][]byte
+	for _, v := range base {
+		headed = append(headed, append([]byte("value-"), v...))
+	}
+	for _, vals := range [][][]byte{base, headed} {
+		checkBytesIndexOrder(t, vals)
+	}
+}
+
+func checkBytesIndexOrder(t *testing.T, vals [][]byte) {
+	t.Helper()
 	var heap []byte
 	var cells []int64
 	for _, v := range vals {

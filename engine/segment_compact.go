@@ -39,6 +39,13 @@ import (
 // It reports whether anything was done: a missing or empty delta is not an error
 // and not work.
 func CompactSegmentFile(segPath string) (bool, error) {
+	// Every change to the pair is announced in the lock file's change word
+	// (segment_change.go), so a reader's freshness check can skip the stamps.
+	endChange, cerr := segChangeBegin(segPath)
+	if cerr != nil {
+		return false, cerr
+	}
+	defer endChange()
 	f, err := OpenSegmentFile(segPath)
 	if err != nil {
 		return false, err

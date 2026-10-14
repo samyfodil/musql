@@ -113,17 +113,10 @@ func TestR42NestedRowidNamingDeclines(t *testing.T) {
 	}
 }
 
-// TestR42NestedRowidNamingLeadingAliasedUnaffected pins that a LEADING but
-// ALIASED group's rowid reference -- which FromItem.NestFromWrapDepth ALSO
-// marks (it fires on "hasAlias || !leading", not the narrower
-// FromItem.NestedNonLeading's plain "!leading") -- is untouched by this
-// round: it already declined, via a wholly separate, earlier
-// reference-resolution path (not columnRefNameParts' at all), before this
-// round existed, and still does. Verified directly against mattn/go-sqlite3
-// 3.53.3 that the oracle DOES answer it ("_ROWID_:1" for the second member,
-// colliding with the first's own "_ROWID_") -- so this is a real, intentional
-// (if unmeasured-in-the-corpus) over-decline, pinned here so a future change
-// to the upstream resolution path doesn't silently start serving it wrong.
+// TestR42NestedRowidNamingLeadingAliasedUnaffected: a LEADING but ALIASED
+// group's member rowid. It used to decline; the group-rowid storage from the
+// turso-joins work serves it, and it must agree with C SQLite cell for cell,
+// names included ("_ROWID_" then "_ROWID_:1").
 func TestR42NestedRowidNamingLeadingAliasedUnaffected(t *testing.T) {
 	cmp := r26Pair(t, []string{
 		`CREATE TABLE r1(x)`,
@@ -136,13 +129,13 @@ func TestR42NestedRowidNamingLeadingAliasedUnaffected(t *testing.T) {
 		{`SELECT r1.rowid FROM (r1 JOIN r2) AS g`, false},
 		{`SELECT r2.rowid FROM (r1 JOIN r2) AS g`, false},
 	} {
-		declined, _, oracleErr, _ := cmp(tc.q)
+		declined, agrees, oracleErr, detail := cmp(tc.q)
 		if (oracleErr != nil) != tc.oracleErrs {
 			t.Errorf("[%s] the ORACLE changed: oracleErrs=%v, want %v -- re-measure", tc.q, oracleErr != nil, tc.oracleErrs)
 			continue
 		}
-		if !declined {
-			t.Errorf("[%s] the engine now ANSWERS a leading-but-aliased group's rowid reference -- if that's from a NEW, deliberate fix, this pin needs updating with the verified name; if not, something upstream of columnRefNameParts changed unexpectedly", tc.q)
+		if declined || !agrees {
+			t.Errorf("[%s] declined=%v agrees=%v: %s", tc.q, declined, agrees, detail)
 		}
 	}
 }

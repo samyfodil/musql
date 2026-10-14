@@ -574,7 +574,20 @@ type DB struct {
 	// commitsEachStatement: the caller commits after every autocommit
 	// statement (SetCommitsEachStatement).
 	commitsEachStatement bool
-	changeLog            changeLog
+	// txBulks is every table with a direct-path load armed inside the open
+	// transaction (segBulkLoad.inTx), which anything else that reads drains.
+	txBulks []*tableMeta
+	// spareMachine is a scrubbed VDBE machine runWrite keeps for the session's
+	// next statement (getMachineFrom); nil while one is running.
+	spareMachine *vdbe
+	// lastVerbRaw is mainReadTxnOf's raw statement text, and lastVerbRawVerb /
+	// lastVerbRawOK its leading verb: a memo keyed on the text itself.
+	lastVerbRaw     string
+	lastVerbRawVerb string
+	lastVerbRawOK   bool
+	// schemaRowsMemo is segmentSchemaRowsShared's last render.
+	schemaRowsMemo schemaRowsMemo
+	changeLog      changeLog
 
 	// segments is the read side of a SEGMENT session (segment_write.go): the
 	// pager whose ScanTable serves segments with the delta merged. Non-nil only

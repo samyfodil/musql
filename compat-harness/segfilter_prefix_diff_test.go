@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -79,8 +80,13 @@ func TestSegFilterPrefixMatchesOracle(t *testing.T) {
 	// segment cell, and so never a prefix. A first version of this test passed
 	// with the prefix's tie handling deliberately broken, for exactly that reason.
 	mq.Close()
-	if did, err := engine.CompactSegmentFile(mqPath); err != nil || !did {
+	// A load inside a transaction now writes segments at COMMIT
+	// (engine/insert_bulk_direct.go), leaving no delta to compact; what
+	// matters is that none is left.
+	if did, err := engine.CompactSegmentFile(mqPath); err != nil {
 		t.Fatalf("compacting: did=%v err=%v", did, err)
+	} else if _, serr := os.Stat(mqPath + ".delta"); !did && serr == nil {
+		t.Fatal("compacting did nothing and a delta is still there")
 	}
 	if mq, err = sql.Open(driver.DriverName, mqPath); err != nil {
 		t.Fatal(err)

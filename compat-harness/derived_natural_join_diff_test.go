@@ -239,6 +239,10 @@ var derivedNaturalJoinCorpus = []joinCase{
 	{"SELECT * FROM (dj1 NATURAL RIGHT JOIN (SELECT a, c FROM dj2) AS d)", false},
 	{"SELECT * FROM (dj1 FULL JOIN (SELECT a, c FROM dj2) AS d USING(a))", false},
 	{"SELECT * FROM (dj1 RIGHT JOIN (SELECT a, p FROM ddis, dj2 WHERE p=a) USING(a))", false}, // multi-table derived body
+	// Answered since the turso-joins work, verified cell for cell.
+	{"SELECT * FROM (dj1 LEFT JOIN ddis ON dj1.a=ddis.p) NATURAL JOIN (SELECT a, c FROM dj2) AS d", false},
+	{"SELECT * FROM ddis JOIN (dj1 NATURAL JOIN (SELECT a, c FROM dj2) AS d) ON ddis.p = dj1.a", false},
+	{"SELECT * FROM dj1 JOIN (dj2 NATURAL JOIN (SELECT a, p FROM ddis, dj2 WHERE p=a) AS d) USING(a)", false},
 }
 
 // TestDerivedNaturalJoinParity is the hard gate: every corpus statement must
@@ -491,13 +495,10 @@ func TestDerivedNaturalJoinDeclined(t *testing.T) {
 		// narrow safe carve-out for a group that is the FROM clause's SOLE
 		// top-level item with no nested sub-group of its own (see the parity
 		// corpus above) -- these remain declined because they fall OUTSIDE
-		// that carve-out: the first two put the derived table OUTSIDE the
-		// group entirely (an ordinary sibling attached via NATURAL JOIN, not
-		// itself inside the parens), so lifting the decline there is
-		// unverified territory; the third and fourth put a base table BEFORE
-		// the group at the top level, which is also outside the carve-out.
+		// that carve-out: an unaliased derived sibling outside the group, and
+		// a base table BEFORE the group at the top level. (Their aliased
+		// spellings are served now and live in the parity corpus.)
 		"SELECT * FROM (dj1 LEFT JOIN ddis ON dj1.a=ddis.p) NATURAL JOIN (SELECT a, c FROM dj2)",
-		"SELECT * FROM (dj1 LEFT JOIN ddis ON dj1.a=ddis.p) NATURAL JOIN (SELECT a, c FROM dj2) AS d",
 		"SELECT * FROM dm1 JOIN (dj1 LEFT JOIN (SELECT a, c FROM dj2) USING(a)) USING(a)",
 		// A derived table as the group's own CONNECTOR (its first/leading
 		// member) is a SEPARATE decline, unrelated to
@@ -522,8 +523,6 @@ func TestDerivedNaturalJoinDeclined(t *testing.T) {
 		// explicit ON/USING -- checkFlattenSafe's outward-attachment fix
 		// makes this atomic now too, same as an internal outer join always
 		// did.
-		"SELECT * FROM ddis JOIN (dj1 NATURAL JOIN (SELECT a, c FROM dj2) AS d) ON ddis.p = dj1.a",
-		"SELECT * FROM dj1 JOIN (dj2 NATURAL JOIN (SELECT a, p FROM ddis, dj2 WHERE p=a) AS d) USING(a)",
 	} {
 		if _, _, cErr := cgoSelect(t, cdb, sqlText, nil); cErr != nil {
 			t.Fatalf("[%s] expected C SQLite to ANSWER this (the point of the decline), got %v", sqlText, cErr)
