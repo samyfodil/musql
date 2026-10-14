@@ -591,6 +591,17 @@ func (db *DB) EndHeldTransaction() { db.heldTransaction, db.deferredFKCommitter 
 // commit one a forwarded SAVEPOINT started, or its rows are dropped.
 func (db *DB) HasActiveTransaction() bool { return db.txActive }
 
+// SavepointNames lists the open savepoints, outermost first. A driver that
+// joins a second database's session to a transaction already under way replays
+// them onto it, so a later ROLLBACK TO undoes that database's writes too.
+func (db *DB) SavepointNames() []string {
+	names := make([]string, len(db.savepoints))
+	for i, sp := range db.savepoints {
+		names[i] = sp.name
+	}
+	return names
+}
+
 // commitTxn implements COMMIT/END: it stops tracking the transaction and keeps
 // every mutation; Session.Commit writes the state next. An outstanding deferred
 // foreign key violation refuses the commit and leaves the transaction open, as
