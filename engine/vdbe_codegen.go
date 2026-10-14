@@ -110,6 +110,10 @@ type compiler struct {
 	// lifetimes apart there. See returningSubqueryLifetimes.
 	retForcePerRow bool
 
+	// retWith is the statement's leading WITH clause as its RETURNING
+	// subqueries see it (returning_with.go); nil without one.
+	retWith *returningWith
+
 	// regScopes is a stack of REGISTER-backed row scopes: a column reference is
 	// resolved against these (a register per column, plus a rowid register)
 	// BEFORE the cursor scopes. This is how SQLite compiles a CHECK constraint,
@@ -802,6 +806,7 @@ func compileSubProgram(pager *ReadOnlyPager, stmt *SelectStmt, outer *compiler) 
 	if pager != nil && len(stmt.From) != 0 {
 		stmt = pager.nullUnusedSubqueryColumns(stmt)
 	}
+	stmt = nthValueReachOwn(stmt)
 	// A subquery body is a SELECT like any other to sqlite3Select: its own FROM
 	// clause is flattened (flattenSubquery, select.c:4290) and pushed down into
 	// (pushDownWhereTerms, select.c:5134) exactly as the top-level statement's
@@ -1280,7 +1285,9 @@ func (c *compiler) compileScalarSubquery(x SubqueryExpr) (int, error) {
 	if c.pager == nil && c.liveDB == nil && !selectNeedsNoRowSource(x.Stmt) {
 		return 0, fmt.Errorf("%w: scalar subquery outside a cursor-driven scope", errVDBEUnsupported)
 	}
-	prog, err := c.liveSubSelect(x.Stmt)
+	// C codes a scalar subquery with LIMIT 1 (sqlite3CodeSubselect), which a
+	// window select's nth_value check follows (nthValueReach).
+	prog, err := c.liveSubSelect(nthValueReach(x.Stmt, 1))
 	if err != nil {
 		return 0, err
 	}
@@ -1339,6 +1346,11 @@ func (c *compiler) compileExistsSubquery(x ExistsExpr, top bool) (int, error) {
 			cp.Distinct = false
 		}
 		body = &cp
+	}
+	if !(top && !x.Not && existsJoinable(body)) {
+		// EXISTS reads one row (sqlite3CodeSubselect's LIMIT 1); see
+		// nthValueReach.
+		body = nthValueReach(body, 1)
 	}
 	savedExistsJoin, savedExistsStmt, savedExistsAt := c.existsJoin, c.existsStmt, c.existsAt
 	c.existsJoin, c.existsStmt, c.existsAt = top && !x.Not && existsJoinable(body), body, c.existsPos[x.Stmt]
@@ -1856,6 +1868,9 @@ type retRowCompileCtx struct {
 	cols      []columnInfo
 	tableName string
 	noRowid   bool
+	// ctes is the statement's WITH clause, pushed for both lowerings of a
+	// live RETURNING subquery (returning_with.go).
+	ctes []CTEDef
 }
 
 // emitReturningParam resolves a reference to the RETURNING clause's affected

@@ -300,6 +300,7 @@ func (db *DB) compileViewInsertStmt(stmt *insertStmt, vm *viewMeta, trig *trigCo
 		// emitViewReturning.
 		// returningSiteOnce: an UNROLLED VALUES list, emitted once per tuple --
 		// the table path's own site for that shape.
+		c.retWith = declineReturningWith(insertStmtCTEs(stmt))
 		names, rerr := c.emitViewReturning(db, vm, viewCols, stmt.returning, base, returningSiteOnce)
 		if rerr != nil {
 			return nil, rerr
@@ -391,6 +392,7 @@ func (db *DB) emitViewInsertSelect(c *compiler, stmt *insertStmt, vm *viewMeta, 
 	// site -- and the same shape -- the table path's "INSERT ... SELECT ...
 	// RETURNING" uses. Emitted before skipAddr so a body's RAISE(IGNORE) takes
 	// the returned row with it, exactly as in the VALUES spelling.
+	c.retWith = declineReturningWith(insertStmtCTEs(stmt))
 	colNames, rerr := c.emitViewReturning(db, vm, viewCols, stmt.returning, base, returningSitePerRow)
 	if rerr != nil {
 		return nil, rerr
@@ -956,6 +958,7 @@ func (db *DB) compileViewDeleteStmt(stmt *deleteStmt, vm *viewMeta, trig *trigCo
 	// returningSitePerRow: this emitter is a SCAN, one block run per row --
 	// the same site the table path's UPDATE/DELETE use, and the same
 	// once-vs-per-row subquery lifetime rule then applies unchanged.
+	c.retWith = declineReturningWith(stmt.ctes)
 	colNames, rerr := c.emitViewReturning(db, vm, sc.viewCols, stmt.returning, sc.oldBase, returningSitePerRow)
 	if rerr != nil {
 		return nil, rerr
@@ -1131,6 +1134,7 @@ func (db *DB) compileViewUpdateStmt(stmt *updateStmt, vm *viewMeta, trig *trigCo
 	// The NEW block, affinity already applied (the OpAffinity pass above), is
 	// this verb's RETURNING image. Before skipAddr, so RAISE(IGNORE) takes the
 	// returned row with it. See emitViewReturning.
+	c.retWith = declineReturningWith(stmt.ctes)
 	colNames, rerr := c.emitViewReturning(db, vm, sc.viewCols, stmt.returning, newBase, returningSitePerRow)
 	if rerr != nil {
 		return nil, rerr

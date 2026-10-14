@@ -1122,6 +1122,7 @@ func (db *DB) compileInsertStmt(stmt *insertStmt, trig *trigCompileCtx) (*Progra
 	// engine fires (compiler.nQueryLoop). An INSERT ... SELECT's SELECT is a
 	// statement of its own and balances its own loops.
 	c := &compiler{trig: trig, ownSchema: db.targetSchemaName(tbl), nQueryLoopKnown: true}
+	c.retWith = insertReturningWith(stmt)
 	// A VALUES subquery reads a frozen pre-statement snapshot: C wraps an
 	// uncorrelated subquery in OP_Once (expr.c:3889), so every tuple of a
 	// multi-row VALUES sees the pre-statement image. A reference to the target
@@ -1937,6 +1938,12 @@ func (c *compiler) emitReturning(db *DB, tbl *tableMeta, ret []SelectColumn, row
 			}
 			c.pager = sp
 		}
+		if w := c.retWith; w != nil && !w.declineNames {
+			// The statement's WITH clause, for this block's subqueries
+			// (returning_with.go).
+			c.retRow.ctes = w.ctes
+			defer c.pager.pushCTEScope(w.ctes)()
+		}
 	}
 	// The cache slots this block is about to allocate, so a per-row block can
 	// clear them at its own top. Emitted BEFORE the expressions and patched
@@ -2587,6 +2594,11 @@ func (db *DB) compileDeleteStmt(stmt *deleteStmt, trig *trigCompileCtx) (*Progra
 	// nQueryLoop 0 outside the loop; the WHERE span, and for an UPDATE the
 	// one-pass kind, say what it is inside (whereSpan, update.c:804).
 	c.nQueryLoopKnown = true
+	if len(stmt.ctes) > 0 && stmt.returning != nil {
+		rest := &SelectStmt{Where: stmt.where}
+		c.retWith = &returningWith{ctes: stmt.ctes, returning: stmt.returning,
+			mentions: func(match func(FromItem) bool) { selectTreeMentionsTable(rest, match) }}
+	}
 	var writePager *ReadOnlyPager
 	freshPager := false
 	if containsSubquery(stmt.where) {
@@ -2902,6 +2914,14 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 	// nQueryLoop 0 outside the loop; the WHERE span, and for an UPDATE the
 	// one-pass kind, say what it is inside (whereSpan, update.c:804).
 	c.nQueryLoopKnown = true
+	if len(stmt.ctes) > 0 && stmt.returning != nil {
+		rest := &SelectStmt{From: stmt.from, Where: stmt.where}
+		for _, a := range stmt.sets {
+			rest.Columns = append(rest.Columns, SelectColumn{Expr: a.expr})
+		}
+		c.retWith = &returningWith{ctes: stmt.ctes, upd: stmt, updTbl: tbl, returning: stmt.returning,
+			mentions: func(match func(FromItem) bool) { selectTreeMentionsTable(rest, match) }}
+	}
 	var writePager *ReadOnlyPager
 	freshPager := false
 	if hasSubquery {
@@ -4519,6 +4539,7 @@ func (db *DB) compileInsertSelectWrite(stmt *insertStmt, tbl *tableMeta, colIdx 
 	}
 
 	c := &compiler{}
+	c.retWith = insertReturningWith(stmt)
 	initAddr := c.emit(Instruction{Op: OpInit})
 	c.patch(initAddr, 1)
 	c.emit(Instruction{Op: OpOpenWrite, P1: 0, P4: tbl})
