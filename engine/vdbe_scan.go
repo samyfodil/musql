@@ -276,6 +276,14 @@ func compileScanAttempt(p *ReadOnlyPager, stmt *SelectStmt, outer *compiler, row
 	// same time; every dispatch below reaches the planner through these same
 	// srcs. See markWherePlanEligibility for what it rules out and why.
 	markWherePlanEligibility(p, c, srcs, stmt)
+	if len(stmt.GroupBy) == 0 && !stmt.Distinct && len(stmt.OrderBy) == 0 && stmt.Having == nil &&
+		!selectIsAggregateQuery(stmt) && !selectHasWindow(stmt) && wherePlanIndexOrderDecided(p, c, srcs, stmt) {
+		defer func() {
+			if err == nil && prog != nil {
+				prog.orderDecided = true
+			}
+		}()
+	}
 	planExistsJoinTerms(p, c, srcs, stmt)
 	markCTECoroutine(stmt, srcs)
 	// An INDEXED BY partial index this WHERE does not imply leaves the table

@@ -1073,6 +1073,12 @@ type Instruction struct {
 // register-file size it needs and the number of result columns each
 // OpResultRow emits.
 type Program struct {
+	// orderDecided: the program is a plain join whose loop order the ported
+	// planner decided, so its rows come out in C's plan order
+	// (compileScanAttempt). UPDATE ... FROM reads it to keep the last of
+	// several rows matching one target row, as C's OP_Insert does.
+	orderDecided bool
+
 	Insns      []Instruction
 	vmJIT      unsafe.Pointer // *vmJIT: the native code jitCode compiled for Insns, or noVMJIT
 	// outerCtx is *outerCtxVerdict: outerCtxUnread's answer for Insns, checked
