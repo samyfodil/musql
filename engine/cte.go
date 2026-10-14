@@ -155,6 +155,10 @@ type recursiveCTEShape struct {
 	orderCols  []int
 	orderTerms []OrderTerm
 	orderColl  []string
+	// orderErr is C's error for an ORDER BY term matching no result column
+	// in any arm (resolveCompoundOrderBy); the shape is otherwise complete,
+	// and compiling it reports this instead.
+	orderErr error
 
 	// limit/offset are a LIMIT written inside the CTE, which bounds the
 	// RECURSION's own output. Verified directly: the 10-row walk above
@@ -163,6 +167,10 @@ type recursiveCTEShape struct {
 	// and 5 still appear. nil when none was written.
 	limit  *int64
 	offset *int64
+	// limitExpr/offsetExpr are a LIMIT/OFFSET written as an expression with no
+	// bound parameter ("LIMIT 2 + 3"), folded where the queue is compiled,
+	// as C codes it into the counter register before the recursion starts.
+	limitExpr, offsetExpr Expr
 }
 
 // newCTEBinding builds def's cteBinding, precomputing its recursive shape
@@ -423,6 +431,27 @@ func recursiveRowFootprint(row []Value) int64 {
 	return n
 }
 
+// recursiveCTEAffinities is each output column's affinity for a recursive
+// CTE's table: sqlite3SubqueryColumnTypes over the whole compound, the setup
+// query's affinity demoted to none where a recursive arm can yield the other
+// kind of value (compoundColumnAffinity). The recursive arm reads its queue
+// row through that same table (resolveFromTermToCte shares pTab with the CTE's
+// FROM item), so "SELECT a FROM t(a INT) UNION ALL SELECT '2' FROM c WHERE
+// x < 3" compares '2' with 3 under no affinity and stops after one step. Run
+// with b.selfRef set to cols, as recursiveCTECollations is.
+func (p *ReadOnlyPager) recursiveCTEAffinities(b *cteBinding, cols []columnInfo) []affinity {
+	saved := b.selfRef
+	b.selfRef = &recSelfRef{cols: cols, expansionDepth: -1}
+	p.cteSelfRefLive++
+	defer func() { b.selfRef = saved; p.cteSelfRefLive-- }()
+	arms := p.resolveAllArmOutputs(b.core)
+	out := make([]affinity, len(cols))
+	for i := range cols {
+		out[i] = compoundColumnAffinity(arms, i)
+	}
+	return out
+}
+
 // recursiveCTECollations resolves the collation a UNION recursive CTE's dedup
 // uses per output column. The body is a compound, and C keys the dedup
 // ephemeral with the compound's collation (multiSelectCollSeq: leftmost arm
@@ -501,6 +530,71 @@ func recursiveOrderColumn(e Expr, core *SelectStmt, nOut int) (idx int, collatio
 		}
 	}
 	return -1, ""
+}
+
+// recursiveOrderExprColumn is resolveOrderByTermToExprList for a term that is
+// neither an ordinal nor a result name: walking the arms first to last, the
+// term resolved in that arm's FROM is compared with each of its result
+// expressions (sqlite3ExprCompare), and the first equal one is the column. A
+// term naming no column of an arm's FROM resolves to nothing there.
+//
+// Equality is decided structurally, with each column reference read through
+// the arm's one FROM item: a reference whose qualifier names another item
+// matches nothing in that arm. It returns -1 when no arm matches, and -2 when
+// an arm's FROM holds more than one item, which this does not decide.
+func recursiveOrderExprColumn(e Expr, core *SelectStmt, nOut int) int {
+	term := stripOrderCollate(e)
+	arms := []*SelectStmt{core}
+	for _, a := range core.Compound {
+		arms = append(arms, a.Stmt)
+	}
+	for _, arm := range arms {
+		if arm == nil {
+			continue
+		}
+		name := ""
+		switch len(arm.From) {
+		case 0:
+		case 1:
+			it := arm.From[0]
+			if it.Subquery != nil || it.TableFunc || it.GroupLen > 0 || it.NestedGroupSpan != nil {
+				return -2
+			}
+			name = it.Alias
+			if name == "" {
+				name = it.Table
+			}
+		default:
+			return -2
+		}
+		if !qualifiersName(term, name) {
+			continue
+		}
+		for i, c := range arm.Columns {
+			if i >= nOut {
+				break
+			}
+			if c.Star {
+				return -2
+			}
+			if qualifiersName(c.Expr, name) && exprEqualIgnoringQualifier(term, stripOrderCollate(c.Expr)) {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// qualifiersName reports whether every column reference in e (outside a
+// subquery) is unqualified or qualified by name. A subquery is not compared.
+func qualifiersName(e Expr, name string) bool {
+	ok := true
+	forEachColumnRef(e, func(ce ColumnExpr) {
+		if ce.Schema != "" || (ce.Qualifier != "" && (name == "" || !equalFoldName(ce.Qualifier, name))) {
+			ok = false
+		}
+	})
+	return ok && !containsSubquery(e)
 }
 
 // recursiveArmHasMultipleSelfRefs reports select.c:5786-5792's shape: an arm
@@ -613,7 +707,7 @@ func detectRecursiveShape(name string, core *SelectStmt) *recursiveCTEShape {
 		}
 	}
 	lastArm := recursiveArms[len(recursiveArms)-1]
-	if core.LimitParam != nil || core.OffsetParam != nil {
+	if exprHasParam(core.LimitParam) || exprHasParam(core.OffsetParam) {
 		return nil
 	}
 	// An ORDER BY inside the CTE selects the recursion's queue discipline
@@ -629,10 +723,16 @@ func detectRecursiveShape(name string, core *SelectStmt) *recursiveCTEShape {
 	nOut := len(core.Columns)
 	orderCols := make([]int, 0, len(orderBy))
 	orderColl := make([]string, 0, len(orderBy))
-	for _, ot := range orderBy {
+	var orderErr error
+	for k, ot := range orderBy {
 		idx, coll := recursiveOrderColumn(ot.Expr, core, nOut)
 		if idx < 0 {
-			return nil
+			switch idx = recursiveOrderExprColumn(ot.Expr, core, nOut); {
+			case idx == -1 && orderErr == nil:
+				orderErr = semanticf("engine: %s ORDER BY term does not match any column in the result set", ordinalWord(k+1))
+			case idx < -1:
+				return nil
+			}
 		}
 		orderCols = append(orderCols, idx)
 		orderColl = append(orderColl, coll)
@@ -653,7 +753,8 @@ func detectRecursiveShape(name string, core *SelectStmt) *recursiveCTEShape {
 	}
 
 	limit, offset := core.Limit, core.Offset
-	if limit == nil && offset == nil {
+	limitExpr, offsetExpr := core.LimitParam, core.OffsetParam
+	if limit == nil && offset == nil && limitExpr == nil && offsetExpr == nil {
 		limit, offset = lastArm.Limit, lastArm.Offset
 	}
 	return &recursiveCTEShape{
@@ -663,8 +764,11 @@ func detectRecursiveShape(name string, core *SelectStmt) *recursiveCTEShape {
 		orderCols:     orderCols,
 		orderTerms:    orderBy,
 		orderColl:     orderColl,
+		orderErr:      orderErr,
 		limit:         limit,
 		offset:        offset,
+		limitExpr:     limitExpr,
+		offsetExpr:    offsetExpr,
 	}
 }
 
