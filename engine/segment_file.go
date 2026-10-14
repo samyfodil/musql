@@ -203,7 +203,7 @@ func WriteSegmentFileWithCatalog(path string, tables []ConvertedTable, cat Conve
 // suite 8% -- and the scratch file only takes over past that.
 type segFileWriter struct {
 	dir     string
-	scratch *os.File // nil while the segments fit in mem
+	scratch *os.File     // nil while the segments fit in mem
 	mem     []segMemPart // the segments so far, each where the scratch would hold it
 	at      int64
 	segs    [][][2]int64 // per table: each segment's (offset, length) in mem or the scratch
@@ -259,7 +259,9 @@ func newSegFileWriter(dir string) (*segFileWriter, error) {
 }
 
 // addSegment appends one of table ti's segments, in order.
-func (w *segFileWriter) addSegment(ti int, raw []byte) error { return w.addSegmentBytes(ti, raw, false) }
+func (w *segFileWriter) addSegment(ti int, raw []byte) error {
+	return w.addSegmentBytes(ti, raw, false)
+}
 
 // addSegmentOwned is addSegment for bytes nothing will change or unmap before
 // finish: held as they are rather than copied. A direct-path load's segments
