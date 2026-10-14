@@ -238,6 +238,10 @@ func (db *DB) captureSnapshot() *txSnapshot {
 // captureSnapshotWith is captureSnapshot with the per-table clone supplied, so
 // captureSharedSnapshot can share row stores through the same code.
 func (db *DB) captureSnapshotWith(cloneTable func(*tableMeta) *tableMeta) *txSnapshot {
+	// A snapshot never sits on top of a transaction's direct-path load: the
+	// rows go to the row store first, so restoring any later snapshot can drop
+	// whatever load was armed since (restoreSnapshot).
+	db.drainTxBulks(nil)
 	snap := &txSnapshot{
 		schemaCookie:  db.schemaCookie,
 		userVersion:   db.userVersion,
@@ -349,6 +353,9 @@ func cloneSnapshot(snap *txSnapshot) *txSnapshot {
 // restoreSnapshot swaps db's mutable logical state back to snap wholesale --
 // ROLLBACK's implementation.
 func (db *DB) restoreSnapshot(snap *txSnapshot) {
+	// Every load still armed was armed after snap was taken (captureSnapshotWith
+	// drained the ones before), so all of its rows are undone with it.
+	db.dropTxBulks()
 	if snap == nil {
 		// captureSnapshot (this file) returns nil, instead of a snapshot that
 		// is silently missing some table's true content, when
@@ -583,6 +590,17 @@ func (db *DB) EndHeldTransaction() { db.heldTransaction, db.deferredFKCommitter 
 // transaction as abandoned, so a driver committing a held session must first
 // commit one a forwarded SAVEPOINT started, or its rows are dropped.
 func (db *DB) HasActiveTransaction() bool { return db.txActive }
+
+// SavepointNames lists the open savepoints, outermost first. A driver that
+// joins a second database's session to a transaction already under way replays
+// them onto it, so a later ROLLBACK TO undoes that database's writes too.
+func (db *DB) SavepointNames() []string {
+	names := make([]string, len(db.savepoints))
+	for i, sp := range db.savepoints {
+		names[i] = sp.name
+	}
+	return names
+}
 
 // commitTxn implements COMMIT/END: it stops tracking the transaction and keeps
 // every mutation; Session.Commit writes the state next. An outstanding deferred

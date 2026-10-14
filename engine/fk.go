@@ -236,11 +236,12 @@ type fkStmtState struct {
 	// by the drain after that row's write opcode (fkDrain) rather than thrown
 	// from the mutation site, which has no error return on every path.
 	restrict bool
-	// next is how far fkDrain has processed events, and draining guards it
-	// against itself: an action it applies records more events, which the same
-	// loop picks up rather than a nested one.
-	next     int
-	draining bool
+	// next is how far fkDrain has claimed events. An event is claimed before it
+	// is processed, so a drain reached from inside that processing -- an action's
+	// own row write, or a write in a trigger an action fired -- takes only the
+	// events recorded since, depth-first, as C runs an action's nested actions
+	// inside the action's own trigger program.
+	next int
 	// deferredBefore/deferredImmBefore are the transaction's deferred counters
 	// when the statement began -- C's p->nStmtDefCons/nStmtDefImmCons -- put
 	// back when the statement is rolled back (writeCtx.rollback), because a
@@ -1284,11 +1285,9 @@ func (db *DB) fkStatementPass(st *fkStmtState) error {
 // logs 1,2,3. Only the immediate counter's verdict waits for statement end
 // (fkStatementPass), as C checks at OP_Halt (sqlite3VdbeCheckFkImmediate).
 func (db *DB) fkDrain(st *fkStmtState) error {
-	if st == nil || st.draining {
+	if st == nil {
 		return nil
 	}
-	st.draining = true
-	defer func() { st.draining = false }()
 	// A deliberate simplification: the event queue is bounded only by the schema's own cascade
 	// structure. A cycle terminates because each pass removes or NULLs rows,
 	// but a pathological schema could still grow it without bound, and a
@@ -1298,11 +1297,12 @@ func (db *DB) fkDrain(st *fkStmtState) error {
 	if st.restrict {
 		return fkErrViolation()
 	}
-	for ; st.next < len(st.events); st.next++ {
+	for st.next < len(st.events) {
 		if st.next >= maxEvents {
 			return fmt.Errorf("%w: foreign key actions did not converge within %d row mutations", errVDBEUnsupported, maxEvents)
 		}
 		ev := st.events[st.next]
+		st.next++
 		if err := db.fkParentSide(st, ev); err != nil {
 			return err
 		}
@@ -1438,6 +1438,19 @@ func (db *DB) fkParentSide(st *fkStmtState, ev fkEvent) error {
 		// Verified: "UPDATE p SET id=id", "UPDATE p SET id=1" (the value it
 		// already had) and "UPDATE p SET v='b'" all leave an ON UPDATE SET NULL
 		// child alone.
+		// C runs an action as a trigger program (fkActionTrigger) for every
+		// parent row whose key moved, children or not, and OP_Program refuses
+		// the frame past SQLITE_MAX_TRIGGER_DEPTH: a cascade chain 1001 rows
+		// deep is "too many levels of trigger recursion".
+		if w.oldKey != nil && !fkKeysEqualOrNil(fk, w.oldKey, w.newKey, db.encoding()) {
+			action := fk.onDelete
+			if ev.new != nil {
+				action = fk.onUpdate
+			}
+			if fkActionPerformsDML(action) && db.activeWC != nil && len(db.activeWC.fireState().active) >= maxTriggerDepth {
+				return fmt.Errorf("engine: too many levels of trigger recursion")
+			}
+		}
 		if w.oldKey != nil && !fkKeysEqualOrNil(fk, w.oldKey, w.newKey, db.encoding()) && len(w.oldKids) > 0 {
 			*counter += len(w.oldKids)
 			action := fk.onDelete
@@ -1821,33 +1834,6 @@ func (db *DB) fkApplyAction(fk *fkConstraint, kids []uint64, action string, newP
 			return perr
 		}
 	}
-	// One ordering is declined: C codes an action's nested actions before
-	// the row's AFTER trigger (sqlite3GenerateRowDelete: sqlite3FkActions,
-	// then the AFTER sqlite3CodeRowTrigger), so cascade chains interleave
-	// depth-first. With par -> ch -> gc each carrying an AFTER DELETE
-	// trigger, "DELETE FROM par WHERE id=1":
-	//
-	//	oracle   gc 100, ch 10, gc 101, ch 11     depth-first per child row
-	//	here     ch 10, ch 11, gc 100, gc 101     this level, then the next
-	//
-	// The final state matches but the bodies' view does not. Fixing it needs
-	// the nested level drained inline between the write and its AFTER fire.
-	if afterPlan != nil {
-		reach := fkReachDelete
-		if !isDelete {
-			reach = fkReachUpdate
-		}
-		for _, nested := range db.fkNamingParent(child) {
-			act := nested.onDelete
-			if reach == fkReachUpdate {
-				act = nested.onUpdate
-			}
-			if fkActionPerformsDML(act) {
-				return fmt.Errorf("%w: foreign key action %s on %s has an AFTER trigger and its own onward action to %s -- C SQLite runs the onward action BEFORE that trigger (sqlite3GenerateRowDelete codes sqlite3FkActions ahead of the AFTER block), which this engine drains one level at a time",
-					errVDBEUnsupported, action, child.name, nested.child.name)
-			}
-		}
-	}
 	fire := func(plan *triggerFirePlan, newRow, oldRow []Value, rid uint64) error {
 		if plan == nil {
 			return nil
@@ -1859,6 +1845,15 @@ func (db *DB) fkApplyAction(fk *fkConstraint, kids []uint64, action string, newP
 			nrid = uint64(newRow[child.ipkIndex].I)
 		}
 		return (&vdbe{wctx: db.activeWC}).firePlanForRow(plan, newRow, int64(nrid), oldRow, int64(rid))
+	}
+	// The action is a trigger program of its own (fkActionTrigger), one frame
+	// deep for everything it fires, nested actions included; see
+	// fkParentSide's depth check. A nil entry never matches a trigger's
+	// identity in triggerEnter.
+	if db.activeWC != nil {
+		fs := db.activeWC.fireState()
+		fs.active = append(fs.active, nil)
+		defer fs.leave()
 	}
 	if (beforePlan != nil || afterPlan != nil) && db.activeWC == nil {
 		// firePlanForRow reads wctx unconditionally, and a nil one is a PANIC,
@@ -1915,6 +1910,23 @@ func (db *DB) fkApplyAction(fk *fkConstraint, kids []uint64, action string, newP
 			db.fkDeleteChildRow(child, rid, stored, old)
 		} else if err := db.fkStoreChildRow(child, fk.childIdx, rid, stored, old, next); err != nil {
 			return err
+		}
+		// C codes a row's nested actions right after its write and ahead of
+		// its AFTER trigger (sqlite3GenerateRowDelete and sqlite3Update both
+		// run sqlite3FkActions before the AFTER sqlite3CodeRowTrigger), so
+		// cascade chains run depth-first, one child row at a time. With par ->
+		// ch -> gc each carrying an AFTER DELETE trigger, "DELETE FROM par
+		// WHERE id=1" fires gc 100, ch 10, gc 101, ch 11; and a trigger on gc
+		// counting ch sees ch 11 still there when gc 100 goes. The drain takes
+		// the events this row's write recorded.
+		//
+		// Not inside DROP TABLE's own pass (fkSuppressChild): its events are
+		// recorded with the child side suppressed and must be drained after
+		// the pass, when a cascade's grandchild rows account normally.
+		if !db.fkSuppressChild {
+			if err := db.fkDrain(db.fkStmt); err != nil {
+				return err
+			}
 		}
 		if err := fire(afterPlan, next, old, rid); err != nil {
 			return err

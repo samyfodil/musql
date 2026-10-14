@@ -15,6 +15,7 @@ package engine
 import (
 	"fmt"
 	"math"
+	"strings"
 )
 
 // tableScope is one joined table's column namespace within a single evalCtx:
@@ -113,6 +114,17 @@ type tableScope struct {
 	// other join shapes.
 	coalesceFallback map[string][]int
 
+	// coalesceRightAt is, per name, one more than the position in
+	// coalesceFallback[name] of the last owner joined by a plain RIGHT JOIN
+	// (0: none). An unqualified reference is resolved by lookupName, which
+	// for a RIGHT JOIN's USING column drops every earlier match and keeps the
+	// right-hand table's (resolve.c, "A RIGHT JOIN. Use the right-most
+	// table"), while FULL JOIN extends a coalesce: so the read starts at that
+	// owner, not at the representative, and "SELECT x FROM a RIGHT JOIN b
+	// USING(x)" is b.x, with b.x's own type and affinity. The USING
+	// conditions themselves keep the whole coalesce (sqlite3ProcessJoin).
+	coalesceRightAt map[string]int
+
 	// unqualifiedHidden marks a scope reachable only through an explicit
 	// qualifier: the UPSERT "excluded" scope, and a trigger's OLD/NEW. C's grammar
 	// makes "excluded" reachable only as "excluded.col"; a bare "col" resolves
@@ -141,6 +153,75 @@ type tableScope struct {
 	// matches SQLite's rebuilt list. "" means decline (columnRefNameParts): deeper
 	// nesting, an aliased group, or a name collision C would ":N"-suffix.
 	nestedRowidDisplayName string
+
+	// groupMemberRowid marks a member of a MATERIALIZED parenthesized join group
+	// (resolveGroupSource forces noRowid on every member) whose own table has a
+	// rowid C still exposes: an SF_NestedFrom subquery lists an ENAME_ROWID
+	// entry for each direct member with a visible rowid (selectExpander), and
+	// an unqualified rowid counts each such entry as a candidate (resolve.c's
+	// cntTab), so "pc JOIN (pa JOIN pb USING(id)) AS g ... rowid" is
+	// "ambiguous column name: rowid". This engine cannot read it through the
+	// group, so it only counts.
+	groupMemberRowid bool
+
+	// groupRowidRel locates that rowid in the materialized group row: the
+	// group stores each such member's rowid after every member column
+	// (resolveGroupSource), at the member's own offset plus groupRowidRel. 0
+	// when not stored. groupRowidName is the name C gives a reference to it:
+	// the rebuilt SF_NestedFrom list's name for the entry ("_ROWID_", ":N"
+	// suffixed among the list's names; nestedColNamesInto), or for a group C
+	// splices flat the table's own (its INTEGER PRIMARY KEY's name, else
+	// "rowid"). "" declines the naming.
+	groupRowidRel  int
+	groupRowidName string
+
+	// starBare, set by resolveJoinSources for an item of its own level, is
+	// the set of this item's columns a "X.*" expands to a BARE name rather
+	// than "X.col": selectExpander does so when the item is left of a RIGHT or
+	// FULL join (JT_LTORJ) and the name is in the USING of some later item
+	// (inAnyUsingClause, select.c:6253-6258), so the column reads what an
+	// unqualified reference reads (a coalesce, or the RIGHT JOIN's column).
+	// starBareSet tells an empty set from one never computed (a group member).
+	starBare    map[string]bool
+	starBareSet bool
+
+	// usingEntryNames maps a rebuilt group's USING/NATURAL common name to the
+	// name of the bare entry selectExpander puts in the rebuilt list for it
+	// (select.c ~6193): its spelling in the USING clause, ":N" suffixed with
+	// the rest. An unqualified reference resolves to that entry (bUsingTerm),
+	// so it is named by it: "... (l LEFT JOIN r USING(ID))" names "id" "ID".
+	usingEntryNames map[string]string
+
+	// usingSkip names the columns an unqualified lookup skips in this scope
+	// because the item it belongs to joined with USING/NATURAL on them. For a
+	// plain item that is coalesced; for a parenthesized group joined USING(x)
+	// lookupName tests the GROUP's USING list against every entry of its
+	// rebuilt list (resolve.c:369-386), so every member's x is skipped, not
+	// only the first member's: "pa JOIN (pb JOIN pc ON ...) USING(id)" reads
+	// id from pa where c.id would otherwise make it ambiguous.
+	usingSkip map[string]int
+
+	// joinRight/joinFull: this item is the right-hand side of a RIGHT (not
+	// FULL) or a FULL JOIN. lookupName restarts its match count at a RIGHT
+	// JOIN item whose USING names the column ("A RIGHT JOIN. Use the
+	// right-most table"), which also clears an ambiguity among the tables
+	// to its left: "(pa a JOIN pb b ON ...) AS g RIGHT JOIN pc c USING(id)"
+	// resolves id to c.id.
+	joinRight, joinFull bool
+
+	// groupRowidUnknown marks a member of a group re-wrapped in further
+	// parentheses (FromItem.NestedGroupSpan): how many rebuilt layers enclose
+	// it is not tracked through the re-wrap, so whether C exposes its rowid is
+	// unknown and a rowid reference that could reach it declines.
+	groupRowidUnknown bool
+
+	// nestFromDepth is FromItem.NestFromWrapDepth for a plain table item: how
+	// many rebuilt (SF_NestedFrom) layers enclose it in the statement.
+	nestFromDepth int
+
+	// rebuiltLayers counts the materialized parenthesized groups C rebuilds
+	// (GroupRebuildID) this member sits inside, innermost first.
+	rebuiltLayers int
 
 	// nestedColNames, parallel to cols, is each column's name in an ALIASED
 	// parenthesized join group's rebuilt column list, where duplicates carry
@@ -291,6 +372,10 @@ func isRowidAliasName(name string) bool {
 // expansion or any other real-column enumeration.
 var rowidColumnInfo = &columnInfo{Name: "rowid", Aff: affInteger, IsRowidAlias: true}
 
+// groupRowidColumnInfo is a parenthesized group member's rowid read out of the
+// group row (tableScope.groupRowidRel): an ordinary INTEGER value there.
+var groupRowidColumnInfo = &columnInfo{Name: "rowid", Aff: affInteger}
+
 // resolveColumn finds the scope and (offset-adjusted) vals index a
 // ColumnExpr(qualifier, name) resolves to, walking ctx, ctx.outer, ...
 // outward. Unqualified: within one scope it must match exactly one table (more
@@ -337,6 +422,9 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 		ts := ctx.tables[ce.UsingPinnedItem]
 		colIdx, ok := ts.colIndex[lname]
 		if !ok {
+			if isRowidAliasName(lname) && !ts.noRowid {
+				return ctx, 0, rowidColumnInfo, ce.UsingPinnedItem, nil
+			}
 			return nil, 0, nil, -1, fmt.Errorf("engine: no such column: %s", name)
 		}
 		foundOffset, foundIdx := ts.offset, colIdx
@@ -351,6 +439,9 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 			for i, ts := range c.tables {
 				if !equalFoldName(ts.name, qualifier) {
 					continue
+				}
+				if spanHidesName(&ts) {
+					continue // its span never matches (resolveInScopes)
 				}
 				if colIdx, ok := ts.colIndex[lname]; ok {
 					// An UNALIASED SELF-JOIN exposing this column through BOTH
@@ -380,6 +471,9 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 					}
 					return c, foundOffset + foundIdx, foundCol, -1, nil
 				}
+				if isRowidAliasName(lname) && laterScopeHasColumn(len(c.tables)-i-1, func(k int) *tableScope { return &c.tables[i+1+k] }, qualifier, lname) {
+					continue // a later item's real column wins (resolveInScopes)
+				}
 				if isRowidAliasName(lname) && !ts.noRowid {
 					// Two FROM items share this qualifier (an unaliased self-join, or
 					// one alias written twice), both offering a rowid that coalescing
@@ -393,7 +487,15 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 					}
 					return c, 0, rowidColumnInfo, i, nil
 				}
-				return nil, 0, nil, -1, fmt.Errorf("engine: no such column: %s.%s", qualifier, name)
+				if isRowidAliasName(lname) && ts.groupRowidRel > 0 {
+					for _, other := range c.tables[i+1:] {
+						if equalFoldName(other.name, qualifier) && (!other.noRowid || other.groupMemberRowid) {
+							return nil, 0, nil, -1, fmt.Errorf("engine: ambiguous column name: %s.%s", qualifier, name)
+						}
+					}
+					return c, ts.offset + ts.groupRowidRel, groupRowidColumnInfo, -1, nil
+				}
+				// A later item of the same name may have it (resolveInScopes).
 			}
 			// No FROM item is named the qualifier; it may be a join group's alias
 			// (tableScope.groupAlias), naming every member. Reached only after the
@@ -401,57 +503,98 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 			// answer. A group-alias read applies the group's coalesce fallback,
 			// as C resolves it against the group's rebuilt column list, whose
 			// entry for a coalesced name is the coalesce() (see resolveInScopes).
-			for _, ts := range c.tables {
-				if !equalFoldName(ts.groupAlias, qualifier) {
-					continue
+			if gi, colIdx, gln, ok := groupAliasColumn(len(c.tables), func(i int) *tableScope { return &c.tables[i] }, qualifier, name); ok {
+				ts := c.tables[gi]
+				foundOffset, foundIdx := ts.offset, colIdx
+				foundCol := &ts.cols[colIdx]
+				if ts.coalesceFallback != nil {
+					foundOffset, foundIdx, foundCol = resolveCoalesceChain(c.vals, c.tables, gln, foundOffset, foundIdx, foundCol, ts.coalesceFallback[gln], math.MaxInt, true)
 				}
-				if colIdx, ok := ts.colIndex[lname]; ok {
-					foundOffset, foundIdx := ts.offset, colIdx
-					foundCol := &ts.cols[colIdx]
-					if ts.coalesceFallback != nil {
-						foundOffset, foundIdx, foundCol = resolveCoalesceChain(c.vals, c.tables, lname, foundOffset, foundIdx, foundCol, ts.coalesceFallback[lname], math.MaxInt, true)
-					}
-					return c, foundOffset + foundIdx, foundCol, -1, nil
-				}
+				return c, foundOffset + foundIdx, foundCol, -1, nil
 			}
+			// Nothing at this level has it: try the enclosing one
+			// (resolveInScopes); the error below reports it once none does.
 			continue
 		}
 		foundIdx, foundOffset := -1, -1
 		var foundCol *columnInfo
 		var foundFallback map[string][]int
+		var foundRightAt map[string]int
 		foundRowidTable := -1
+		memberRowid := -1
+		rowidCands := 0
+		ambiguous, restarted := false, false
 		for i, ts := range c.tables {
-			if ts.unqualifiedHidden {
+			if ts.unqualifiedHidden || spanHidesName(&ts) {
 				continue
 			}
 			if colIdx, ok := ts.colIndex[lname]; ok {
-				if ts.coalesced != nil {
-					if _, hidden := ts.coalesced[lname]; hidden {
-						// A USING/NATURAL right-hand duplicate: this table's
-						// own copy doesn't count as a (candidate-for-
-						// ambiguity) match at all -- the representative
-						// table's own entry (found elsewhere in this same
-						// loop) is what resolves the name instead.
-						continue
-					}
+				_, hidden := ts.coalesced[lname]
+				if _, skip := ts.usingSkip[lname]; skip {
+					hidden = true
 				}
-				if foundIdx != -1 || foundRowidTable != -1 {
-					return nil, 0, nil, -1, fmt.Errorf("engine: ambiguous column name: %s", name)
+				if hidden {
+					// A USING/NATURAL right-hand duplicate: this table's
+					// own copy doesn't count as a (candidate-for-
+					// ambiguity) match at all -- the representative
+					// table's own entry (found elsewhere in this same
+					// loop) is what resolves the name instead. A RIGHT
+					// JOIN's restarts the count (resolveInScopes).
+					if ambiguous && ts.joinRight {
+						ambiguous, restarted = false, true
+						foundIdx, foundOffset = colIdx, ts.offset
+						foundCol = &ts.cols[colIdx]
+						foundFallback, foundRightAt = nil, nil
+					} else if restarted && ts.joinFull {
+						return nil, 0, nil, -1, fmt.Errorf("engine: unsupported: %s merged by a FULL JOIN after a RIGHT JOIN that cleared an ambiguity", name)
+					}
+					continue
+				}
+				if foundIdx != -1 {
+					ambiguous = true
+					continue
 				}
 				foundIdx, foundOffset = colIdx, ts.offset
 				foundCol = &ts.cols[colIdx]
 				foundFallback = ts.coalesceFallback
+				foundRightAt = ts.coalesceRightAt
 				continue
 			}
-			if isRowidAliasName(lname) && !ts.noRowid {
-				if foundIdx != -1 || foundRowidTable != -1 {
-					return nil, 0, nil, -1, fmt.Errorf("engine: ambiguous column name: %s", name)
+			if isRowidAliasName(lname) && (!ts.noRowid || ts.groupMemberRowid) {
+				// Counted only if no real column wins (resolveInScopes).
+				rowidCands++
+				if rowidCands > 1 {
+					continue
+				}
+				if ts.noRowid {
+					memberRowid = i
+					continue
 				}
 				foundRowidTable = i
 			}
 		}
+		if foundIdx == -1 && rowidCands > 1 {
+			return nil, 0, nil, -1, fmt.Errorf("engine: ambiguous column name: %s", name)
+		}
+		if foundIdx != -1 {
+			foundRowidTable, memberRowid = -1, -1
+		}
+		if ambiguous {
+			return nil, 0, nil, -1, fmt.Errorf("engine: ambiguous column name: %s", name)
+		}
+		if restarted {
+			return c, foundOffset + foundIdx, foundCol, -1, nil
+		}
 		if foundRowidTable != -1 {
 			return c, 0, rowidColumnInfo, foundRowidTable, nil
+		}
+		if memberRowid != -1 && foundIdx == -1 {
+			// A parenthesized group member's rowid (tableScope.groupRowidRel).
+			ts := c.tables[memberRowid]
+			if ts.groupRowidRel == 0 {
+				return nil, 0, nil, -1, fmt.Errorf("engine: unsupported: %s of a member of a parenthesized join group", name)
+			}
+			return c, ts.offset + ts.groupRowidRel, groupRowidColumnInfo, -1, nil
 		}
 		if foundIdx != -1 {
 			// RIGHT/FULL JOIN coalesce fallback (tableScope.coalesceFallback's
@@ -461,7 +604,16 @@ func resolveColumnEx(ctx *evalCtx, ce ColumnExpr) (foundCtx *evalCtx, idx int, c
 			// (representative, fallback[0], fallback[1], ...), computed fresh
 			// per row (never a static, compile-time-only choice).
 			if foundFallback != nil {
-				foundOffset, foundIdx, foundCol = resolveCoalesceChain(c.vals, c.tables, lname, foundOffset, foundIdx, foundCol, foundFallback[lname], math.MaxInt, true)
+				chain := foundFallback[lname]
+				// A RIGHT JOIN owner restarts the match (tableScope.coalesceRightAt).
+				if at := foundRightAt[lname]; at > 0 && at <= len(chain) && chain[at-1] >= 0 && chain[at-1] < len(c.tables) {
+					owner := c.tables[chain[at-1]]
+					if oc, ok := owner.colIndex[lname]; ok {
+						foundOffset, foundIdx, foundCol = owner.offset, oc, &owner.cols[oc]
+						chain = chain[at:]
+					}
+				}
+				foundOffset, foundIdx, foundCol = resolveCoalesceChain(c.vals, c.tables, lname, foundOffset, foundIdx, foundCol, chain, math.MaxInt, true)
 			}
 			return c, foundOffset + foundIdx, foundCol, -1, nil
 		}
@@ -727,4 +879,94 @@ func isMaterializedRef(ctx *evalCtx, e Expr) bool {
 	default:
 		return false
 	}
+}
+
+// spanHidesName reports whether a qualifier naming ts cannot reach it: inside
+// a parenthesized group C rebuilds, a member is matched by the span
+// "db.table.column" its rebuilt list records, which sqlite3MatchEName splits
+// at the first dots (resolve.c:137-150) -- so a table name or alias that
+// itself contains "." never matches there: "\"dot.table\".*" is "no such
+// table: dot.table" and "\"dot.table\".c" is "no such column".
+func spanHidesName(ts *tableScope) bool {
+	return (ts.rebuiltLayers > 0 || ts.nestedNonLeading) && strings.Contains(ts.name, ".")
+}
+
+// groupAliasColumn resolves "alias.name" against the members of the
+// parenthesized group aliased alias (scope(i) yields member i's tableScope, n
+// of them). C resolves it against the group's REBUILT column list, so where
+// that list's names are known (tableScope.nestedColNames) they decide: a
+// USING entry's name (usingEntryNames) is the merged column, read from the
+// first member holding it, and any other name is the member column carrying
+// it ("g.\"x:1\"" is the second x). ln is the name to read the merged
+// column's coalesce chain under. Without the names, the first member holding
+// the column answers, as before them.
+func groupAliasColumn(n int, scope func(int) *tableScope, alias, name string) (idx, col int, ln string, found bool) {
+	named := false
+	for i := 0; i < n; i++ {
+		if ts := scope(i); equalFoldName(ts.groupAlias, alias) && ts.nestedColNames != nil {
+			named = true
+			break
+		}
+	}
+	lname := r33sFoldIdent(name)
+	if !named {
+		for i := 0; i < n; i++ {
+			ts := scope(i)
+			if !equalFoldName(ts.groupAlias, alias) {
+				continue
+			}
+			if c, ok := ts.colIndex[lname]; ok {
+				return i, c, lname, true
+			}
+		}
+		return 0, 0, "", false
+	}
+	for i := 0; i < n; i++ {
+		ts := scope(i)
+		if !equalFoldName(ts.groupAlias, alias) {
+			continue
+		}
+		for u, entry := range ts.usingEntryNames {
+			if !equalFoldName(entry, name) {
+				continue
+			}
+			for k := 0; k < n; k++ {
+				m := scope(k)
+				if !equalFoldName(m.groupAlias, alias) {
+					continue
+				}
+				if c, ok := m.colIndex[u]; ok {
+					return k, c, u, true
+				}
+			}
+		}
+		break
+	}
+	for i := 0; i < n; i++ {
+		ts := scope(i)
+		if !equalFoldName(ts.groupAlias, alias) {
+			continue
+		}
+		for c, nm := range ts.nestedColNames {
+			if equalFoldName(nm, name) {
+				return i, c, r33sFoldIdent(ts.cols[c].Name), true
+			}
+		}
+	}
+	return 0, 0, "", false
+}
+
+// laterScopeHasColumn reports whether one of the n scopes scope(0..n-1) is
+// named qualifier and declares the column lname.
+func laterScopeHasColumn(n int, scope func(int) *tableScope, qualifier, lname string) bool {
+	for k := 0; k < n; k++ {
+		ts := scope(k)
+		if !equalFoldName(ts.name, qualifier) {
+			continue
+		}
+		if _, ok := ts.colIndex[lname]; ok {
+			return true
+		}
+	}
+	return false
 }

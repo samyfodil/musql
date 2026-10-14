@@ -2506,12 +2506,28 @@ func (db *DB) mainReadTxnOf(sqlText string) mainReadTxn {
 	// C SQLite's PARSER would have done with the text, so noting it here --
 	// before any classification, and whether or not the statement then succeeds
 	// -- is exactly the right moment.
-	db.r35aNoteTempDatabaseOpen(sqlText)
-	trimmed := strings.TrimSpace(sqlText)
-	verb, ok := db.leadingVerb(trimmed)
+	//
+	// The temp question is asked once here and the answer used twice: neither
+	// the note below nor the verb's classification changes the schema.
+	temp := db.holdsAnyTempObject()
+	db.r35aNoteTempDatabaseOpenGiven(sqlText, temp)
+	// The verb of the RAW text, memoized on it: trimming first, every time,
+	// was a scan of the statement for an answer the text alone decides.
+	if sqlText != db.lastVerbRaw || sqlText == "" {
+		v, k := db.leadingVerb(strings.TrimSpace(sqlText))
+		db.lastVerbRaw, db.lastVerbRawVerb, db.lastVerbRawOK = sqlText, v, k
+	}
+	verb, ok := db.lastVerbRawVerb, db.lastVerbRawOK
 	if !ok {
 		return mainReadTxnUnknown
 	}
+	if mainReadTxnTempSensitiveVerb(verb) {
+		if temp {
+			return mainReadTxnUnknown
+		}
+		return mainReadTxnYes
+	}
+	trimmed := strings.TrimSpace(sqlText)
 	switch verb {
 	case "SELECT":
 		return db.mainReadTxnOfSelect(trimmed)
@@ -2540,12 +2556,6 @@ func (db *DB) mainReadTxnOf(sqlText string) mainReadTxn {
 			return mainReadTxnNo
 		}
 		return mainReadTxnUnknown
-	}
-	if mainReadTxnTempSensitiveVerb(verb) {
-		if db.holdsAnyTempObject() {
-			return mainReadTxnUnknown
-		}
-		return mainReadTxnYes
 	}
 	return mainReadTxnUnknown
 }
@@ -3554,6 +3564,16 @@ func (p *ReadOnlyPager) pragmaViewInfo(vr *SchemaRow, extended bool) (cols []str
 	if serr != nil {
 		return nil, nil, fmt.Errorf("%w: PRAGMA table_info over view %s: %v", errVDBEUnsupported, vr.Name, serr)
 	}
+	// A USING/NATURAL join merges columns (one "*" entry, a coalesce or the
+	// RIGHT JOIN's own column for a bare name), which only the desugaring
+	// resolver records; subqueryScopes lists every table's columns raw.
+	if fromHasUsingJoin(sel.From) {
+		jts, jerr := p.resolveFromSchemaOnly(sel.From)
+		if jerr != nil {
+			return nil, nil, fmt.Errorf("%w: PRAGMA table_info over view %s: %v", errVDBEUnsupported, vr.Name, jerr)
+		}
+		scopes = buildScopes(jts)
+	}
 	mode := p.colNameMode()
 	mode.subqueryCols = true // a view's columns are sqlite3ColumnsFromExprList's, not a result set's
 	outCols, oerr := expandSelectList(sel.Columns, scopes, mode)
@@ -3741,13 +3761,32 @@ func (p *ReadOnlyPager) viewColumnDeclType(scopes []tableScope, nested map[strin
 	}
 	switch x := e.(type) {
 	case ColumnExpr:
+		lname := r33sFoldIdent(x.Name)
 		for _, ts := range scopes {
 			if x.Qualifier != "" && !equalFoldName(ts.name, x.Qualifier) {
 				continue
 			}
-			idx, ok := ts.colIndex[r33sFoldIdent(x.Name)]
+			idx, ok := ts.colIndex[lname]
 			if !ok || idx >= len(ts.cols) {
 				continue
+			}
+			if x.Qualifier == "" {
+				if _, hidden := ts.coalesced[lname]; hidden {
+					continue // the USING/NATURAL representative names it
+				}
+				// A RIGHT/FULL JOIN's merged column: lookupName makes it the
+				// RIGHT JOIN's own column (tableScope.coalesceRightAt) or a
+				// coalesce(), whose columnType is none.
+				if chain := ts.coalesceFallback[lname]; len(chain) > 0 {
+					at := ts.coalesceRightAt[lname]
+					if at == 0 || at != len(chain) || chain[at-1] < 0 || chain[at-1] >= len(scopes) {
+						return "", false
+					}
+					ts = scopes[chain[at-1]]
+					if idx, ok = ts.colIndex[lname]; !ok || idx >= len(ts.cols) {
+						return "", false
+					}
+				}
 			}
 			declared := strings.TrimSpace(ts.cols[idx].DeclType)
 			if declared == "" {
@@ -4536,4 +4575,14 @@ func PragmaValueSpellingError(sqlText string) error {
 		return nil
 	}
 	return pragmaValueSpellingSupported(stmt)
+}
+
+// fromHasUsingJoin reports whether any FROM item joins with USING or NATURAL.
+func fromHasUsingJoin(from []FromItem) bool {
+	for _, it := range from {
+		if it.Natural || it.Using != nil {
+			return true
+		}
+	}
+	return false
 }

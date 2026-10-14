@@ -23,6 +23,12 @@ import (
 type onceSlots struct{ base, count int }
 
 type compiler struct {
+	// recSelfKeepsRow maps the cursor of a recursive CTE's self-reference to
+	// whether an outer join's NULL extension of it keeps the current queue row
+	// (C's pseudo-cursor; emitNullExtend). Set by emitJoinLoops; a cursor
+	// missing from it could not be decided and declines.
+	recSelfKeepsRow map[int]bool
+
 	// pureFuncP5 is stamped onto every OpFunction this compiler emits: real
 	// SQLite's OP_PureFunc, naming the schema expression being compiled when
 	// there is one (pureCtxCheck / pureCtxGenerated / pureCtxIndex). Zero for
@@ -2315,18 +2321,25 @@ func (c *compiler) compileColumn(x ColumnExpr) (int, error) {
 				// result phase or a write's RETURNING is refused here.
 				return 0, fmt.Errorf("%w: correlated reference %q to a non-row-live outer scope", errVDBEUnsupported, x.Name)
 			}
-			if fb.has {
-				// A RIGHT/FULL JOIN's coalesced column referenced from an
-				// outer/correlated scope: OpOuterColumn has no coalesce-aware
-				// counterpart (emitColumnReadCoalesce's OpNotNull/OpColumn
-				// chain only ever targets THIS frame's own cursors) -- a
-				// genuinely rare combination not worth that codegen
-				// complexity; decline cleanly (no fallback exists) instead of
-				// risking reading the wrong (uncoalesced) side.
-				return 0, fmt.Errorf("%w: RIGHT/FULL JOIN coalesced column %q referenced from an outer/correlated scope", errVDBEUnsupported, x.Name)
-			}
 			for p := c; p != oc; p = p.outer {
 				p.correlated = true
+			}
+			if fb.has {
+				// A RIGHT/FULL JOIN's coalesced column read from a correlated
+				// subquery: emitColumnReadCoalesce's chain, every arm an
+				// OpOuterColumn into the same enclosing frame (the owners are
+				// that frame's own cursors).
+				r := c.emitColumnRead(cursor, colIdx, false, level)
+				skips := make([]int, 0, len(fb.owners))
+				for _, o := range fb.owners {
+					skips = append(skips, c.emit(Instruction{Op: OpNotNull, P1: r}))
+					c.emit(Instruction{Op: OpSCopy, P1: c.emitColumnRead(o.cursor, o.colIdx, false, level), P2: r})
+				}
+				end := c.here()
+				for _, j := range skips {
+					c.patch(j, end)
+				}
+				return r, nil
 			}
 			return c.emitColumnRead(cursor, colIdx, isRowid, level), nil
 		}
@@ -2570,6 +2583,10 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 		s := scopes[x.UsingPinnedItem]
 		idx, ok := s.colIndex[lname]
 		if !ok {
+			// A materialized group's stored member rowid (resolveGroupSource).
+			if isRowidAliasName(lname) && !s.noRowid {
+				return s.cursor, 0, true, true, fb, nil
+			}
 			return 0, 0, false, false, fb, fmt.Errorf("%w: no such column: %s", errVDBEUnsupported, x.Name)
 		}
 		if x.UsingRepr {
@@ -2584,6 +2601,9 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 		for i, s := range scopes {
 			if !equalFoldName(s.name, x.Qualifier) {
 				continue
+			}
+			if spanHidesName(&s.tableScope) {
+				continue // its span never matches; the qualifier names nothing here
 			}
 			// x.Schema named a specific database: a scope of the SAME bare
 			// name but a DIFFERENT database is not a candidate for THIS
@@ -2618,6 +2638,12 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 				}
 				return s.cursor, idx + s.colBase, false, true, fb, nil
 			}
+			if isRowidAliasName(x.Name) && laterScopeHasColumn(len(scopes)-i-1, func(k int) *tableScope { return &scopes[i+1+k].tableScope }, x.Qualifier, lname) {
+				// A later item of this name declares a real column of it, which
+				// wins over this one's implicit rowid (resolve.c:471, rowid
+				// candidates only while no real column matched).
+				continue
+			}
 			if isRowidAliasName(x.Name) && !s.noRowid {
 				// Mirrors resolveColumnEx's identical rule: two
 				// FROM items sharing this qualifier both offer the pseudo-rowid,
@@ -2636,17 +2662,23 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 				}
 				return s.cursor, 0, true, true, fb, nil
 			}
-			// resolve.c:785-796 builds the message from the parts the reference was
-			// WRITTEN with: "%s.%s.%s" when a schema was named, "%s.%s" with a table,
-			// "%s" bare. Dropping the qualifier here made "SELECT t.nosuch FROM t"
-			// report "no such column: nosuch" where 3.53.3 reports
-			// "no such column: t.nosuch" -- and as an errVDBEUnsupported it arrived
-			// wrapped in "VDBE-only: ... (no fallback)" too, where C rejects it at
-			// prepare like any other unresolved name.
-			if x.Schema != "" {
-				return 0, 0, false, false, fb, semanticf("engine: no such column: %s.%s.%s", x.Schema, x.Qualifier, x.Name)
+			if isRowidAliasName(x.Name) && s.groupRowidRel > 0 {
+				// A group member's rowid, stored in the group row
+				// (tableScope.groupRowidRel); two such scopes sharing the
+				// qualifier are ambiguous as above.
+				for _, other := range scopes[i+1:] {
+					if equalFoldName(other.name, x.Qualifier) && (!other.noRowid || other.groupMemberRowid) {
+						return 0, 0, false, false, fb, fmt.Errorf("engine: ambiguous column name: %s.%s", x.Qualifier, x.Name)
+					}
+				}
+				return s.cursor, s.colBase + s.groupRowidRel, false, true, fb, nil
 			}
-			return 0, 0, false, false, fb, semanticf("engine: no such column: %s.%s", x.Qualifier, x.Name)
+			if isRowidAliasName(x.Name) && (s.groupMemberRowid || s.groupRowidUnknown) {
+				return 0, 0, false, false, fb, fmt.Errorf("%w: %s of a member of a nested parenthesized join group", errVDBEUnsupported, x.Name)
+			}
+			// A later FROM item of the same name may have the column: lookupName
+			// tries every item the qualifier names (resolve.c:410-450), as when
+			// "UPDATE t AS x ... FROM s AS x" reads x.v from t and x.w from s.
 		}
 		// No FROM item here is named the qualifier; it may be a join group's alias
 		// (tableScope.groupAlias, tkt3935.test 3). Only reached when nothing matched by
@@ -2658,47 +2690,103 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 		// (resolve.c:424), so cnt stays 1 and the coalesce rewrite (guarded by
 		// cnt!=1, resolve.c:761) never fires. An outer RIGHT JOIN null-extends the
 		// group as a whole, so "j.a" reads NULL.
-		for _, s := range scopes {
-			if !equalFoldName(s.groupAlias, x.Qualifier) {
-				continue
+		if gi, idx, gln, ok := groupAliasColumn(len(scopes), func(i int) *tableScope { return &scopes[i].tableScope }, x.Qualifier, x.Name); ok {
+			s := scopes[gi]
+			if owners := s.resolvedFallback[gln]; len(owners) > 0 {
+				fb = coalesceFallbackRef{owners: owners, has: true}
 			}
-			if idx, ok := s.colIndex[lname]; ok {
-				if owners := s.resolvedFallback[lname]; len(owners) > 0 {
-					fb = coalesceFallbackRef{owners: owners, has: true}
-				}
-				return s.cursor, idx + s.colBase, false, true, fb, nil
-			}
+			return s.cursor, idx + s.colBase, false, true, fb, nil
 		}
-		return 0, 0, false, false, fb, nil // no table here matches the qualifier: try outer
+		// Nothing here has the column, whether or not an item is named the
+		// qualifier: lookupName's cnt stays 0 and it moves to the enclosing
+		// NameContext (resolve.c:410-450, 800), so "(SELECT same.x FROM (...) AS
+		// same) FROM (SELECT 7 AS x) AS same" reads the outer same.x. The caller
+		// reports "no such column: same.x" once no level has it.
+		return 0, 0, false, false, fb, nil
 	}
 
 	foundCursor, foundIdx := -1, -1
 	foundRowidCursor := -1
+	memberRowid := false
+	var memberRowidScope compileScope
 	var foundScope compileScope
+	ambiguous, restarted := false, false
+	unknownRowid := false
+	rowidCands := 0
 	for _, s := range scopes {
-		if idx, ok := s.colIndex[lname]; ok {
-			if s.coalesced != nil {
-				if _, hidden := s.coalesced[lname]; hidden {
-					// USING/NATURAL right-hand duplicate -- see
-					// resolveColumn's identical rule: doesn't
-					// count as a match here at all, so it can never trigger
-					// "ambiguous column name" against its own representative.
-					continue
-				}
+		if spanHidesName(&s.tableScope) {
+			continue // its span never matches (spanHidesName)
+		}
+		if s.groupRowidUnknown && isRowidAliasName(lname) {
+			if _, real := s.colIndex[lname]; !real {
+				unknownRowid = true
 			}
-			if foundCursor != -1 || foundRowidCursor != -1 {
-				return 0, 0, false, false, fb, fmt.Errorf("engine: ambiguous column name: %s", x.Name)
+		}
+		if idx, ok := s.colIndex[lname]; ok {
+			_, hidden := s.coalesced[lname]
+			if _, skip := s.usingSkip[lname]; skip {
+				hidden = true
+			}
+			if hidden {
+				// USING/NATURAL right-hand duplicate -- see
+				// resolveColumn's identical rule: doesn't
+				// count as a match here at all, so it can never trigger
+				// "ambiguous column name" against its own representative.
+				// A RIGHT JOIN's restarts the count (tableScope.joinRight);
+				// that matters here only once the left side is ambiguous.
+				if ambiguous && s.joinRight {
+					ambiguous, restarted = false, true
+					foundCursor, foundIdx = s.cursor, idx+s.colBase
+					foundScope = s
+				} else if restarted && s.joinFull {
+					return 0, 0, false, false, fb, fmt.Errorf("%w: %s merged by a FULL JOIN after a RIGHT JOIN that cleared an ambiguity", errVDBEUnsupported, x.Name)
+				}
+				continue
+			}
+			if foundCursor != -1 {
+				ambiguous = true
+				continue
 			}
 			foundCursor, foundIdx = s.cursor, idx+s.colBase
 			foundScope = s
 			continue
 		}
-		if isRowidAliasName(x.Name) && !s.noRowid {
-			if foundCursor != -1 || foundRowidCursor != -1 {
-				return 0, 0, false, false, fb, fmt.Errorf("engine: ambiguous column name: %s", x.Name)
+		// A rowid candidate counts only if no table has a real column of the
+		// name (resolve.c:471, "0==cnt && VisibleRowid"): a declared "rowid"
+		// anywhere wins over every implicit one.
+		if isRowidAliasName(x.Name) && (!s.noRowid || s.groupMemberRowid) {
+			rowidCands++
+			if rowidCands > 1 {
+				continue
+			}
+			if s.noRowid {
+				memberRowid, memberRowidScope = true, s
+				continue
 			}
 			foundRowidCursor = s.cursor
 		}
+	}
+	if foundCursor == -1 && rowidCands > 1 {
+		return 0, 0, false, false, fb, fmt.Errorf("engine: ambiguous column name: %s", x.Name)
+	}
+	if unknownRowid && foundCursor == -1 {
+		return 0, 0, false, false, fb, fmt.Errorf("%w: %s with a member of a re-wrapped parenthesized join group in scope", errVDBEUnsupported, x.Name)
+	}
+	if ambiguous {
+		return 0, 0, false, false, fb, fmt.Errorf("engine: ambiguous column name: %s", x.Name)
+	}
+	if restarted {
+		return foundCursor, foundIdx, false, true, fb, nil
+	}
+	if foundCursor != -1 {
+		memberRowid, foundRowidCursor = false, -1
+	}
+	if memberRowid {
+		// The one candidate is a group member's rowid (tableScope.groupMemberRowid).
+		if memberRowidScope.groupRowidRel > 0 {
+			return memberRowidScope.cursor, memberRowidScope.colBase + memberRowidScope.groupRowidRel, false, true, fb, nil
+		}
+		return 0, 0, false, false, fb, fmt.Errorf("%w: %s of a member of a parenthesized join group", errVDBEUnsupported, x.Name)
 	}
 	if foundRowidCursor != -1 {
 		return foundRowidCursor, 0, true, true, fb, nil
@@ -2708,6 +2796,17 @@ func resolveInScopes(scopes []compileScope, x ColumnExpr, pager *ReadOnlyPager) 
 		// comments: a materialized parenthesized join GROUP member's
 		// ALREADY-resolved owner pairs come FIRST, then whatever this level's
 		// own []int/scopes-indexed fallback names.
+		// A RIGHT JOIN owner restarts the match (tableScope.coalesceRightAt):
+		// the read is that owner's column, then the FULL owners after it.
+		if chain := foundScope.coalesceFallback[lname]; foundScope.coalesceRightAt[lname] > 0 && foundScope.coalesceRightAt[lname] <= len(chain) {
+			owners := coalesceOwnersFor(scopes, chain[foundScope.coalesceRightAt[lname]-1:], lname, math.MaxInt)
+			if len(owners) > 0 {
+				if len(owners) > 1 {
+					fb = coalesceFallbackRef{owners: owners[1:], has: true}
+				}
+				return owners[0].cursor, owners[0].colIdx, false, true, fb, nil
+			}
+		}
 		if owners := coalesceOwnersCombined(scopes, foundScope, lname, math.MaxInt); len(owners) > 0 {
 			fb = coalesceFallbackRef{owners: owners, has: true}
 		}

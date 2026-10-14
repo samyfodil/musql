@@ -1659,6 +1659,9 @@ type wherePlanNonNullWalk struct {
 	jts    []joinedTable
 	scopes []tableScope
 	iTab   int
+	// coalesceIsFunc makes an unqualified name a RIGHT/FULL JOIN coalesces
+	// prune, as the coalesce() lookupName builds for it does (TK_FUNCTION).
+	coalesceIsFunc bool
 }
 
 // walk reports whether the walk sets eCode -- i.e. whether e forces some column
@@ -1670,6 +1673,9 @@ func (w wherePlanNonNullWalk) walk(e Expr) bool {
 	both := func(a, b Expr) bool { return w.walk(a) && w.walk(b) }
 	switch x := e.(type) {
 	case ColumnExpr:
+		if w.coalesceIsFunc && x.Qualifier == "" && refIsRightJoinCoalesced(w.scopes, x) {
+			return false
+		}
 		tab, _, ok := wherePlanColumnRef(w.jts, w.scopes, x)
 		return ok && tab == w.iTab
 

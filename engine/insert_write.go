@@ -2159,10 +2159,13 @@ func unsupportedStatementErr(trimmed string) error {
 // copy. The driver's arguments are copies it made for the call
 // (database/sql's contract), so it passes them this way.
 func (db *DB) ExecArgsOwned(sqlText string, args []Value) (rowsAffected int64, lastInsertID int64, err error) {
+	// Restored without a defer: nothing between here and the return recovers a
+	// panic, so a deferred restore bought nothing but its per-statement cost.
 	saved := db.argsOwned
 	db.argsOwned = true
-	defer func() { db.argsOwned = saved }()
-	return db.ExecArgs(sqlText, args)
+	rowsAffected, lastInsertID, err = db.ExecArgs(sqlText, args)
+	db.argsOwned = saved
+	return rowsAffected, lastInsertID, err
 }
 
 // ExecArgs is Exec with bound parameters: args[i] binds parameter i+1. It

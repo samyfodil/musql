@@ -20,6 +20,7 @@ package engine
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -993,6 +994,26 @@ func (db *DB) firstAttachedTable(name string) *attachedDB {
 		}
 	}
 	return nil
+}
+
+// attachedTableAnywhere reports whether some other database of the connection
+// holds a base table named name: an engine-direct attachment
+// (firstAttachedTable), or one the driver wired on as a reader
+// (SetAttachedDatabases) -- main among them when this session is an
+// attachment's own.
+func (db *DB) attachedTableAnywhere(name string) bool {
+	if db.firstAttachedTable(name) != nil {
+		return true
+	}
+	for _, ar := range db.attachedReaders {
+		if ar.pager == nil {
+			continue
+		}
+		if names, err := ar.pager.TableNames(); err == nil && slices.ContainsFunc(names, func(n string) bool { return equalFoldName(n, name) }) {
+			return true
+		}
+	}
+	return false
 }
 
 // attachedTargetQualifier finds a write statement's target database qualifier

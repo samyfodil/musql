@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/samyfodil/musql/engine"
@@ -32,6 +33,19 @@ type Conn struct {
 	// back the shared discardedResult instead of allocating one per statement.
 	resultDiscarded bool
 
+	// The read gate's per-connection state (read_gate.go). pooledCheckout is
+	// set by ResetSession when database/sql hands this connection out of its
+	// pool. lease is whether the connection holds a slot and is in a statement
+	// with it; leaseSince is when it got the slot and leaseExit when its last
+	// gated statement ended. waitSince is when its reader started waiting for a
+	// slot (0 when it is not waiting), and gateCh is where it is handed one.
+	pooledCheckout bool
+	lease          atomic.Int32
+	leaseExit      atomic.Int64
+	leaseSince     int64
+	waitSince      int64
+	gateCh         chan bool
+
 	path string
 	// paramInfo caches engine.ParseParamInfo by SQL text. database/sql prepares
 	// on every QueryRow, and parsing just to count parameters was a fifth of a
@@ -39,6 +53,11 @@ type Conn struct {
 	// read afterwards, so it is shared; the cache is dropped when it fills.
 	paramInfo map[string]engine.ParamInfo
 	tx        *engine.DB // non-nil while a transaction (BeginTx) is open on this Conn
+
+	// txAux are the ATTACHed databases' held sessions the open transaction has
+	// written, each with an engine transaction of its own. They commit and roll
+	// back with tx; see Conn.auxTxnDB.
+	txAux []*engine.DB
 
 	// ndb is this connection's HELD segment session -- one for the connection's
 	// whole life, which is what this format allows and the SQLite format
@@ -399,6 +418,8 @@ var (
 	_ driver.ConnPrepareContext = (*Conn)(nil)
 	_ driver.ConnBeginTx        = (*Conn)(nil)
 	_ driver.NamedValueChecker  = (*Conn)(nil)
+	_ driver.QueryerContext     = (*Conn)(nil)
+	_ driver.ExecerContext      = (*Conn)(nil)
 )
 
 // CheckNamedValue converts bound arguments that need no conversion without
@@ -433,6 +454,16 @@ func (c *Conn) prepareImpl(query string) (driver.Stmt, error) {
 // statement" error to Exec/Query time) -- see ParseParamInfo's own doc
 // comment.
 func (c *Conn) prepareContextImpl(ctx context.Context, query string) (driver.Stmt, error) {
+	st := &Stmt{}
+	if err := c.prepareInto(query, st); err != nil {
+		return nil, err
+	}
+	return st, nil
+}
+
+// prepareInto is prepareContextImpl filling st, which the unprepared
+// QueryContext and ExecContext below keep off the heap where they can.
+func (c *Conn) prepareInto(query string, st *Stmt) error {
 	// A ";"-separated SCRIPT has to be recognised BEFORE ParseParamInfo, not
 	// after it fails: that function parses one statement and reports "no
 	// parameters" for a leading CREATE without ever looking at the trailing
@@ -444,7 +475,8 @@ func (c *Conn) prepareContextImpl(ctx context.Context, query string) (driver.Stm
 	if mayBeScript(query) {
 		if stmts, serr := engine.SplitStatements(query); serr == nil {
 			if len(stmts) > 1 {
-				return &Stmt{conn: c, sqlText: query, script: stmts}, nil
+				*st = Stmt{conn: c, sqlText: query, script: stmts}
+				return nil
 			}
 			// Exactly one statement, but the text around it held separators --
 			// a leading ";", a doubled ";;", a trailing one. C SQLite treats
@@ -467,9 +499,10 @@ func (c *Conn) prepareContextImpl(ctx context.Context, query string) (driver.Stm
 		}
 	}
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return &Stmt{conn: c, sqlText: query, info: info, isQuery: isSelectStmt(query)}, nil
+	*st = Stmt{conn: c, sqlText: query, info: info, isQuery: isSelectStmt(query)}
+	return nil
 }
 
 // mayBeScript reports whether query MIGHT hold more than one statement: a ";"
@@ -500,6 +533,7 @@ func mayBeScript(query string) bool {
 // Commit/Rollback, e.g. because it abandoned the *sql.Tx), discards it rather
 // than committing it.
 func (c *Conn) Close() error {
+	c.closeLease() // a read-gate slot this connection holds goes to a reader that can use it
 	// THE HELD SESSIONS -- main's and every ATTACHed database's -- are released
 	// here, and nothing did that before: closeSessions' predecessor existed
 	// and had no caller, so every connection left its segment mapping and its lock
@@ -530,6 +564,7 @@ func (c *Conn) Close() error {
 	if c.tx != nil {
 		db := c.tx
 		c.tx, c.txSavepoint = nil, ""
+		c.discardAux()
 		return c.discardSession(db)
 	}
 	return nil
@@ -831,7 +866,8 @@ func (c *Conn) execArgsBody(sqlText string, args []engine.Value) (driver.Result,
 	//
 	// An EXPLAIN cannot change the file, the attached set or the transaction
 	// state, so the warm read pager stays valid across one.
-	if engine.IsExplainStatement(sqlText) {
+	// (Plain DML leads with its own verb, never EXPLAIN: isPlainDMLText.)
+	if !c.plainDML(sqlText) && engine.IsExplainStatement(sqlText) {
 		rows, err := c.queryArgs(sqlText, args)
 		if err != nil {
 			return nil, err
@@ -980,10 +1016,11 @@ func (c *Conn) execArgsBody(sqlText string, args []engine.Value) (driver.Result,
 	}
 	sqlText = execSQL
 
+	if c.tx != nil && targetPath != c.path {
+		return c.execAuxTxn(targetPath, targetSchema, sqlText, args)
+	}
 	if c.tx != nil {
-		// route guarantees targetPath == c.path here (an attached target inside
-		// a transaction was declined above), so the held main session applies.
-		// The attachments are wired on as read snapshots for this one statement
+		// The held main session. The attachments are wired on as read snapshots for this one statement
 		// (withAttachedReaders): a statement route calls main-only can still
 		// READ an attachment -- an object-scoped pragma's own lookup, a view or
 		// trigger body's qualified reference -- and used to see zero rows.
@@ -1012,9 +1049,7 @@ func (c *Conn) execArgsBody(sqlText string, args []engine.Value) (driver.Result,
 			// C SQLite. Every other error leaves the held session intact
 			// (the failing statement's own changes already reverted in-memory).
 			if engine.ErrorRollsBackTransaction(err) {
-				db := c.tx
-				c.tx, c.txSavepoint = nil, ""
-				c.discardSession(db)
+				c.abandonTxn()
 			}
 			return nil, err
 		}
@@ -1052,6 +1087,17 @@ func (c *Conn) execArgsBody(sqlText string, args []engine.Value) (driver.Result,
 		// route sent to an attachment already runs against its owning file.
 		if targetPath == c.path {
 			release, aerr := c.withAttachedReaders(db)
+			if aerr != nil {
+				c.discardSession(db)
+				return aerr
+			}
+			defer release()
+		} else {
+			// An attachment's session reaches main and the other attachments
+			// too: a TEMP trigger on one of its tables, or one an ALTER of it
+			// re-checks, resolves its body across TEMP, MAIN and every
+			// attachment (sqlite3FindTable).
+			release, aerr := c.wireTxnReaders(db, targetPath)
 			if aerr != nil {
 				c.discardSession(db)
 				return aerr
@@ -1097,6 +1143,39 @@ func (c *Conn) execArgsBody(sqlText string, args []engine.Value) (driver.Result,
 	// SQLite's sqlite3_last_insert_rowid(). ExecArgs' own last-insert-id return
 	// is that same value, so it is no longer read here.
 	return &execResult{rowsAffected: n, lastInsertID: c.lastInsertRowid}, nil
+}
+
+// execAuxTxn runs one write to an ATTACHed database inside the open
+// transaction, on that database's held session (auxTxnDB). No commit: the
+// session commits with the transaction.
+func (c *Conn) execAuxTxn(path, schema, sqlText string, args []engine.Value) (driver.Result, error) {
+	db, err := c.auxTxnDB(path, schema)
+	if err != nil {
+		return nil, err
+	}
+	release, err := c.wireTxnReaders(db, path)
+	if err != nil {
+		return nil, err
+	}
+	n, _, err := db.ExecArgsOwned(sqlText, args)
+	release()
+	c.noteConnState(db)
+	if err != nil {
+		if engine.ErrorRollsBackTransaction(err) {
+			c.abandonTxn()
+		}
+		return nil, err
+	}
+	return &execResult{rowsAffected: n, lastInsertID: c.lastInsertRowid}, nil
+}
+
+// abandonTxn rolls the whole transaction back -- main and every joined
+// attachment -- as a RAISE(ROLLBACK) does in C.
+func (c *Conn) abandonTxn() {
+	db := c.tx
+	c.tx, c.txSavepoint = nil, ""
+	c.discardAux()
+	c.discardSession(db)
 }
 
 // zeroRowSetterPragmas lists the pragmas whose assignment form returns an empty
@@ -2276,6 +2355,11 @@ func (c *Conn) queryArgs(sqlText string, args []engine.Value) (driver.Rows, erro
 		if serr != nil {
 			return nil, serr
 		}
+		// A read on a connection fresh from the pool runs inside the read gate
+		// (read_gate.go), which is what keeps a shared *sql.DB's tail short.
+		if g := c.enterReadGate(); g != nil {
+			defer g.leave(c)
+		}
 		pager, err := c.readPagerStamped(c.ndb)
 		if err != nil {
 			return nil, err
@@ -2313,6 +2397,26 @@ func (c *Conn) queryArgs(sqlText string, args []engine.Value) (driver.Rows, erro
 // discards rather than committing a partial write) -- the exact
 // mirror of execArgs's own model, but returning rows instead of a count.
 func (c *Conn) queryReturningArgs(sqlText string, args []engine.Value, targetPath, targetSchema string) (driver.Rows, error) {
+	if c.tx != nil && targetPath != c.path {
+		db, err := c.auxTxnDB(targetPath, targetSchema) // see execAuxTxn
+		if err != nil {
+			return nil, err
+		}
+		release, err := c.wireTxnReaders(db, targetPath)
+		if err != nil {
+			return nil, err
+		}
+		cols, rows, err := db.ExecReturningArgs(sqlText, args)
+		release()
+		c.noteConnState(db)
+		if err != nil {
+			if engine.ErrorRollsBackTransaction(err) {
+				c.abandonTxn()
+			}
+			return nil, err
+		}
+		return &Rows{cols: cols, rows: rows}, nil
+	}
 	if c.tx != nil {
 		release, aerr := c.withAttachedReaders(c.tx) // see execArgs' identical wiring
 		if aerr != nil {
@@ -2560,6 +2664,9 @@ func (c *Conn) execTxnStmt(kind engine.TxnKind) (driver.Result, error) {
 		if err := db.CheckDeferredForeignKeys(); err != nil {
 			return nil, err // the transaction stays OPEN, as C SQLite's does
 		}
+		if err := c.checkAuxDeferredFKs(); err != nil {
+			return nil, err
+		}
 		c.tx, c.txSavepoint = nil, ""
 		// The outermost COMMIT clears "PRAGMA defer_foreign_keys" -- see Tx's
 		// commitImpl, which does the same for the Go-level path. Only here, after
@@ -2573,6 +2680,10 @@ func (c *Conn) execTxnStmt(kind engine.TxnKind) (driver.Result, error) {
 		// so committing without this dropped every row written under the
 		// savepoint -- "SAVEPOINT c; INSERT; COMMIT" stored nothing.
 		if err := c.commitEngineTxn(db); err != nil {
+			c.discardAux()
+			return nil, err
+		}
+		if err := c.commitAux(db); err != nil {
 			return nil, err
 		}
 		if err := c.commitSession(db); err != nil {
@@ -2588,6 +2699,7 @@ func (c *Conn) execTxnStmt(kind engine.TxnKind) (driver.Result, error) {
 		c.deferFKs = false // as at COMMIT; sqlite3RollbackAll, main.c:1530-1532
 		// Likewise a plain ROLLBACK: "SAVEPOINT d; INSERT; ROLLBACK" discards
 		// the row in C SQLite, savepoint stack and all.
+		c.discardAux()
 		if err := c.discardSession(db); err != nil {
 			return nil, err
 		}
@@ -2643,6 +2755,13 @@ func (c *Conn) execSavepointStmt(kind engine.SavepointKind, name, sqlText string
 	if err := c.tx.Exec(sqlText); err != nil {
 		return nil, err
 	}
+	// Every joined attachment keeps the same savepoint stack as main, so a
+	// ROLLBACK TO undoes its writes too (auxTxnDB).
+	for _, db := range c.txAux {
+		if err := db.Exec(sqlText); err != nil {
+			return nil, err
+		}
+	}
 	// Did that statement end the transaction the savepoint started? Ask the
 	// ENGINE rather than compare names: RELEASE frees the INNERMOST savepoint
 	// of the given name, so with "SAVEPOINT sp0; SAVEPOINT sp0; ... RELEASE
@@ -2662,7 +2781,13 @@ func (c *Conn) execSavepointStmt(kind engine.SavepointKind, name, sqlText string
 		if err := db.CheckDeferredForeignKeys(); err != nil {
 			return nil, err
 		}
+		if err := c.checkAuxDeferredFKs(); err != nil {
+			return nil, err
+		}
 		c.tx, c.txSavepoint = nil, ""
+		if err := c.commitAux(db); err != nil {
+			return nil, err
+		}
 		if err := c.commitSession(db); err != nil {
 			return nil, err
 		}
@@ -2693,6 +2818,9 @@ func (t *Tx) commitImpl() error {
 	if err := db.CheckDeferredForeignKeys(); err != nil {
 		return err
 	}
+	if err := t.conn.checkAuxDeferredFKs(); err != nil {
+		return err
+	}
 	t.conn.tx = nil
 	t.conn.clearTouched()
 	// The OUTERMOST commit clears "PRAGMA defer_foreign_keys" (and the deferred
@@ -2701,6 +2829,9 @@ func (t *Tx) commitImpl() error {
 	// carried copy is cleared here too. A SAVEPOINT / RELEASE / ROLLBACK TO does
 	// NOT clear it and does not come through this method. See Conn.deferFKs.
 	t.conn.deferFKs = false
+	if err := t.conn.commitAux(db); err != nil {
+		return err
+	}
 	return t.conn.commitSession(db)
 }
 
@@ -2715,6 +2846,7 @@ func (t *Tx) rollbackImpl() error {
 	t.conn.tx = nil
 	t.conn.clearTouched()
 	t.conn.deferFKs = false // as at COMMIT; sqlite3RollbackAll, main.c:1530-1532
+	t.conn.discardAux()
 	return t.conn.discardSession(db)
 }
 
@@ -2918,6 +3050,36 @@ func (c *Conn) Prepare(query string) (driver.Stmt, error) {
 func (c *Conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
 	v, err := c.prepareContextImpl(ctx, query)
 	return v, parityErr(err)
+}
+
+// QueryContext implements driver.QueryerContext, so an unprepared db.Query or
+// db.QueryRow runs here instead of database/sql preparing a driver statement,
+// running it and closing it: the same prepare and the same statement path,
+// without the statement object and the round trips around it. database/sql
+// checks the argument count only against a prepared statement's NumInput, so
+// it is checked here, with its message.
+func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	var st Stmt
+	if err := c.prepareInto(query, &st); err != nil {
+		return nil, parityErr(err)
+	}
+	if want := st.NumInput(); len(args) != want {
+		return nil, fmt.Errorf("sql: expected %d arguments, got %d", want, len(args))
+	}
+	return st.QueryContext(ctx, args)
+}
+
+// ExecContext implements driver.ExecerContext: QueryContext's shortcut for an
+// unprepared db.Exec.
+func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	var st Stmt
+	if err := c.prepareInto(query, &st); err != nil {
+		return nil, parityErr(err)
+	}
+	if want := st.NumInput(); len(args) != want {
+		return nil, fmt.Errorf("sql: expected %d arguments, got %d", want, len(args))
+	}
+	return st.ExecContext(ctx, args)
 }
 
 // Begin normalizes its error for parity with C SQLite -- see parityErr

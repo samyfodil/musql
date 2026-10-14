@@ -420,6 +420,11 @@ func (db *DB) execVacuumInto(p *parser, schema string) error {
 	// a page count (segment_ddl.go). The copy is a database of its own, so it
 	// starts at the beginning of its own history rather than inheriting this
 	// one's.
+	endChange, cerr := segChangeBegin(path) // see segment_change.go
+	if cerr != nil {
+		return cerr
+	}
+	defer endChange()
 	if werr := w.finish(path, tables, cat, 1, 1); werr != nil {
 		return werr
 	}

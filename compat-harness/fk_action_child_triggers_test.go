@@ -20,12 +20,10 @@ func TestForeignKeyActionFiresChildTriggers(t *testing.T) {
 		`INSERT INTO par VALUES(1,'P1'),(2,'P2')`,
 		`INSERT INTO ch VALUES(10,1,'c10'),(11,1,'c11'),(12,2,'c12')`,
 	}
-	// The one ORDERING shape that stays declined: C codes an action's own nested
-	// actions BEFORE the row's AFTER trigger (sqlite3GenerateRowDelete emits
-	// sqlite3FkActions ahead of the AFTER block), so a CHAIN of cascades
-	// interleaves depth-first -- gc 100, ch 10, gc 101, ch 11 -- where this
-	// engine drains one level at a time. The final state is identical; the
-	// trigger bodies' view of it is not.
+	// The CHAIN shape is C's ordering: an action's own nested actions run BEFORE
+	// the row's AFTER trigger (sqlite3GenerateRowDelete emits sqlite3FkActions
+	// ahead of the AFTER block), so a chain of cascades interleaves depth-first
+	// -- gc 100, ch 10, gc 101, ch 11.
 	for _, tc := range []struct {
 		name          string
 		trigs, run    []string
@@ -67,7 +65,7 @@ func TestForeignKeyActionFiresChildTriggers(t *testing.T) {
 			`INSERT INTO gc VALUES(100,10),(101,11)`,
 			`CREATE TRIGGER adc AFTER DELETE ON ch BEGIN INSERT INTO log(what,a,b) VALUES('ch', OLD.id, NULL); END`,
 			`CREATE TRIGGER adg AFTER DELETE ON gc BEGIN INSERT INTO log(what,a,b) VALUES('gc', OLD.id, OLD.cid); END`},
-			[]string{`DELETE FROM par WHERE id=1`, `SELECT count(*) FROM gc`}, true},
+			[]string{`DELETE FROM par WHERE id=1`, `SELECT count(*) FROM gc`}, false},
 		{"UPDATE OF gate: a trigger naming a column the action does not write", []string{
 			`CREATE TRIGGER aun AFTER UPDATE OF note ON ch BEGIN INSERT INTO log(what,a,b) VALUES('note', OLD.id, NULL); END`,
 			`CREATE TRIGGER aup AFTER UPDATE OF pid ON ch BEGIN INSERT INTO log(what,a,b) VALUES('pid', OLD.id, NEW.pid); END`},

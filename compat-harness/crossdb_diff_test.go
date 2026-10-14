@@ -347,16 +347,20 @@ func TestCrossDBDML(t *testing.T) {
 		queryBothConn(t, pureC, mattnC, "after insert-into-attached", "SELECT id,v FROM aux.sink ORDER BY id")
 	}
 
-	// Cross-database write in transaction: musql declines (no atomic commit across files).
-	ctx := context.Background()
-	tx, err := pureC.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatalf("pure BeginTx: %v", err)
+	// Cross-database writes inside a transaction: each joins it, reads see the
+	// transaction's own rows, and ROLLBACK undoes every database's writes.
+	execBothConn(t, pureC, mattnC, "begin", "BEGIN")
+	if execDMLBoth(t, pureC, mattnC, "cross-db insert-select in txn",
+		"INSERT INTO dst (id,v,s) SELECT id+500, v, s FROM aux.src") {
+		queryBothConn(t, pureC, mattnC, "in txn", "SELECT id,v,s FROM dst ORDER BY id")
 	}
-	if _, err := tx.ExecContext(ctx, "INSERT INTO dst (id,v,s) SELECT id+500, v, s FROM aux.src"); err == nil {
-		t.Errorf("cross-db write inside a transaction: musql should DECLINE (no cross-file atomicity), but it applied the write")
+	if execDMLBoth(t, pureC, mattnC, "attached write in txn",
+		"INSERT INTO aux.sink (id,v) SELECT id+900, v FROM main.dst WHERE id > 500") {
+		queryBothConn(t, pureC, mattnC, "sink in txn", "SELECT id,v FROM aux.sink ORDER BY id")
 	}
-	_ = tx.Rollback()
+	execBothConn(t, pureC, mattnC, "rollback", "ROLLBACK")
+	queryBothConn(t, pureC, mattnC, "dst after rollback", "SELECT id,v,s FROM dst ORDER BY id")
+	queryBothConn(t, pureC, mattnC, "sink after rollback", "SELECT id,v FROM aux.sink ORDER BY id")
 }
 
 // TestCrossDBDMLFuzz fuzzes cross-database DML operations.

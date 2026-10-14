@@ -58,6 +58,17 @@ func frameRowIncluded(f windowFrameSpan, frame *WindowFrame, k, j int) bool {
 	return true
 }
 
+// frameHasIncludedRow reports whether row k's frame keeps any row once its
+// EXCLUDE clause has removed what it names.
+func frameHasIncludedRow(f windowFrameSpan, frame *WindowFrame, k int) bool {
+	for j := f.lo; j < f.hi; j++ {
+		if frameRowIncluded(f, frame, k, j) {
+			return true
+		}
+	}
+	return false
+}
+
 // checkWindowFrame validates a frame at compile time with C's wording:
 //
 //   - bounds order UNBOUNDED PRECEDING < N PRECEDING < CURRENT ROW < N
@@ -817,7 +828,24 @@ func (m *vdbe) windowFrameValue(plan *windowPlan, call windowCall, ci int, part 
 				n, ok = frameIntValue(num)
 			}
 			if !ok || n < 1 {
-				return fmt.Errorf("engine: second argument to nth_value must be a positive integer")
+				// The check belongs to the row being RETURNED, not to the
+				// partition: C reads N off the current row in windowReturnOneRow
+				// (windowCheckValue), so a row a LIMIT never reaches cannot fail
+				// the query -- windowFinal decides which rows were reached. Under
+				// an EXCLUDE clause C steps nth_value over each frame row instead
+				// (windowFullScan), so an empty frame never runs the check.
+				if call.spec != nil && call.spec.Frame != nil && call.spec.Frame.Exclude && !frameHasIncludedRow(spans[k], call.spec.Frame, k) {
+					vals[ri][ci] = Value{Typ: Null}
+					continue
+				}
+				if m.windowLazyErr == nil {
+					m.windowLazyErr = map[int]error{}
+				}
+				if _, seen := m.windowLazyErr[ri]; !seen {
+					m.windowLazyErr[ri] = fmt.Errorf("engine: second argument to nth_value must be a positive integer")
+				}
+				vals[ri][ci] = Value{Typ: Null}
+				continue
 			}
 			nth = n
 		}

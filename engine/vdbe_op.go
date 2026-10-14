@@ -1077,6 +1077,8 @@ type Program struct {
 	// asked, 1 no, 2 yes. A stale answer (a copy given other instructions)
 	// costs only speed.
 	writeLoop  int32
+	// txAppend is txAppendTarget's answer (insert_bulk_direct.go), kept.
+	txAppend *txAppendVerdict
 	NReg       int      // registers to allocate (r[0..NReg-1]).
 	NCursors   int      // table cursors to allocate (cursors[0..NCursors-1]); 0 for a cursor-free (FROM-less) program.
 	NRecRegs   int      // record registers to allocate (rr[0..NRecRegs-1]); 0 for a program with no ORDER BY (see the sorter opcodes above).

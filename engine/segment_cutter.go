@@ -69,6 +69,42 @@ type segCutter struct {
 	// table's.
 	reuse bool
 	buf   []byte
+
+	// async builds each full segment on a goroutine of its own while rows go
+	// on arriving -- a transaction's load (insert_bulk_direct.go), whose build
+	// otherwise stalled the statement loop once per segment. One build at a
+	// time is in flight; wait emits it, so segments still arrive in order.
+	async   bool
+	pending *segBuild
+}
+
+// segBuild is an async segment build in flight.
+type segBuild struct {
+	done chan struct{}
+	raw  []byte
+	err  error
+}
+
+// wait finishes the build in flight, if any, and emits it.
+func (c *segCutter) wait() error {
+	b := c.pending
+	if b == nil {
+		return nil
+	}
+	<-b.done
+	c.pending = nil
+	if b.err != nil {
+		return b.err
+	}
+	return c.emit(b.raw)
+}
+
+// finish builds and emits every pending row: flush, then wait.
+func (c *segCutter) finish() error {
+	if err := c.flush(); err != nil {
+		return err
+	}
+	return c.wait()
 }
 
 // add appends one row, cutting a segment when it fills one.
@@ -85,6 +121,25 @@ func (c *segCutter) add(rowid uint64, vals []Value) error {
 // flush builds whatever rows are pending into a segment.
 func (c *segCutter) flush() error {
 	if len(c.rows) == 0 {
+		return nil
+	}
+	if c.async {
+		if err := c.wait(); err != nil {
+			return err
+		}
+		// The rows go to the build, and the next segment's into new slices.
+		b := &segBuild{done: make(chan struct{})}
+		cols, what, rowids, rows := c.cols, c.what, c.rowids, c.rows
+		c.rowids, c.rows, c.bytes = make([]uint64, 0, len(rowids)), make([][]Value, 0, len(rows)), 0
+		go func() {
+			defer close(b.done)
+			raw, err := buildSegmentInto(nil, cols, rowids, rows)
+			if err != nil {
+				err = fmt.Errorf("building a segment of %s: %w", what, err)
+			}
+			b.raw, b.err = raw, err
+		}()
+		c.pending = b
 		return nil
 	}
 	var dst []byte

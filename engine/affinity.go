@@ -109,6 +109,16 @@ func comparisonAffinity(ctx *evalCtx, lexpr, rexpr Expr) affinity {
 	la := exprAffinity(ctx, lexpr)
 	ra := exprAffinity(ctx, rexpr)
 	switch {
+	case isNumericAffinity(la) && isNumericAffinity(ra):
+		// sqlite3CompareAffinity gives NUMERIC whenever either side is numeric.
+		// Two numeric COLUMNS need none (their stored values already carry
+		// it), but a RIGHT/FULL JOIN's merged USING column is a coalesce that
+		// may read another table's TEXT: "t1(id INTEGER) RIGHT JOIN t2(id
+		// TEXT) USING(id) JOIN t3(id INTEGER) USING(id)" must compare '01'
+		// with 1 numerically.
+		if isCoalescedColumnRef(ctx, lexpr) || isCoalescedColumnRef(ctx, rexpr) {
+			return affNumeric
+		}
 	case isNumericAffinity(la) && !isNumericAffinity(ra):
 		return affNumeric
 	case isNumericAffinity(ra) && !isNumericAffinity(la):
@@ -242,4 +252,18 @@ func foldAlreadyNumeric(v Value, aff affinity, foldFn func(float64) (int64, bool
 	default:
 		return v
 	}
+}
+
+// isCoalescedColumnRef reports whether e reads a RIGHT/FULL JOIN's merged USING
+// column through its coalesce: a desugared USING condition's representative,
+// or an unqualified reference to the name.
+func isCoalescedColumnRef(ctx *evalCtx, e Expr) bool {
+	ce, ok := e.(ColumnExpr)
+	if !ok || ctx == nil {
+		return false
+	}
+	if ce.Qualifier != "" && !ce.UsingRepr {
+		return false
+	}
+	return refIsRightJoinCoalesced(ctx.tables, ce)
 }

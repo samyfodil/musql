@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -81,6 +82,12 @@ func TestWorkloadWritesOnlyThisFormat(t *testing.T) {
 				return err
 			}
 			b, rerr := os.ReadFile(path)
+			// The lock sidecar holds no data: its locks are on bytes 0 and 1, and
+			// its one stored value, the change word, sits a page in
+			// (engine/segment_change.go).
+			if strings.HasSuffix(path, ".lock") && len(b) <= 4096+8 && !bytes.ContainsFunc(b[:min(4096, len(b))], func(r rune) bool { return r != 0 }) {
+				return nil
+			}
 			if rerr == nil && len(b) > 0 && !bytes.HasPrefix(b, []byte("MQSF")) && !bytes.HasPrefix(b, []byte("MQSD")) {
 				t.Errorf("a file of another format on disk: %s (% x)", path, b[:min(16, len(b))])
 			}

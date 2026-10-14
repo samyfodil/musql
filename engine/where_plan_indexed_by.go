@@ -105,6 +105,9 @@ func selectIndexedByNoSolution(p *ReadOnlyPager, c *compiler, srcs []joinSource,
 		if perr != nil {
 			return declineIndexedByPartial()
 		}
+		if srcs[i].rightOuter && rightJoinExprIndexUnusable(ix, srcs, stmt.Where) {
+			return errNoQuerySolution()
+		}
 		if ix.where == nil {
 			continue
 		}
@@ -167,4 +170,54 @@ func (db *DB) writeIndexedByNoSolution(tbl *tableMeta, schema, alias, indexedBy 
 func (p *ReadOnlyPager) enterFromBody() func() {
 	p.fromBodyDepth++
 	return func() { p.fromBodyDepth-- }
+}
+
+// rightJoinExprIndexUnusable: whereLoopAddBtree never offers a full scan of an
+// index with an expression column for the right table of a RIGHT or FULL JOIN
+// (where.c:4280, its cursor may be mispositioned in the no-match loop), so an
+// INDEXED BY naming one leaves that table a loop only if some term can drive
+// the index's leading column. With none, "no query solution":
+//
+//	SELECT * FROM t1 RIGHT JOIN t2 INDEXED BY t2_expr ON t1.a=t2.b    -- error
+//	SELECT * FROM t1 RIGHT JOIN t2 INDEXED BY t2_expr ON t1.a=t2.b+0  -- answers
+//
+// A comparison, IN or BETWEEN on the leading key keeps the ordinary path.
+func rightJoinExprIndexUnusable(ix *parsedCreateIndex, srcs []joinSource, where Expr) bool {
+	hasExpr := false
+	for _, e := range ix.exprs {
+		if e != nil {
+			hasExpr = true
+		}
+	}
+	if !hasExpr || len(ix.cols) == 0 {
+		return false
+	}
+	var lead Expr = ColumnExpr{Name: ix.cols[0]}
+	if len(ix.exprs) > 0 && ix.exprs[0] != nil {
+		lead = ix.exprs[0]
+	}
+	terms := whereSplitTopAnd(where)
+	for i := range srcs {
+		terms = append(terms, whereSplitTopAnd(srcs[i].on)...)
+	}
+	for _, t := range terms {
+		switch x := t.(type) {
+		case BinaryExpr:
+			switch x.Op {
+			case "=", "==", "<", "<=", ">", ">=", "IS":
+				if exprEqualIgnoringQualifier(x.L, lead) || exprEqualIgnoringQualifier(x.R, lead) {
+					return false
+				}
+			}
+		case InExpr:
+			if exprEqualIgnoringQualifier(x.X, lead) {
+				return false
+			}
+		case BetweenExpr:
+			if exprEqualIgnoringQualifier(x.X, lead) {
+				return false
+			}
+		}
+	}
+	return true
 }

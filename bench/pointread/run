@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Load N rows, then time random point reads, for musql and for C SQLite, and
+# fail unless musql wins on load time, avg/p50/p99 latency and disk size.
+#
+#   bench/pointread/run                 # short: 1M rows, 12 x 20k reads, a few minutes
+#   POINTREAD_FULL=1 bench/pointread/run  # full: 10M rows, 12 x 50k reads
+#
+# Both ways of reading are gated, for both engines: every reader through one
+# shared *sql.DB, and each reader with its own *sql.Conn (-conn).
+#
+# Full scale is heavy (minutes, GBs of RAM, ~0.5 GB of disk): run it on a server.
+set -euo pipefail
+cd "$(dirname "$0")"
+args=()
+if [ -z "${POINTREAD_FULL:-}" ]; then
+	args=(-rows "${POINTREAD_ROWS:-1000000}" -reads "${POINTREAD_READS:-20000}")
+fi
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+CGO_ENABLED=1 go build -tags mattn -o "$work/c-sqlite" .
+go build -tags musql -o "$work/musql" .
+go build -o "$work/check" ./check
+for mode in conn shared; do
+	flag=()
+	if [ "$mode" = conn ]; then
+		flag=(-conn)
+	fi
+	for eng in c-sqlite musql; do
+		mkdir -p "$work/$mode-$eng"
+		"$work/$eng" ${args[@]+"${args[@]}"} ${flag[@]+"${flag[@]}"} -dir "$work/$mode-$eng" -json "$work/$mode-$eng.json"
+	done
+done
+status=0
+echo "== shared *sql.DB"
+"$work/check" "$work/shared-musql.json" "$work/shared-c-sqlite.json" || status=1
+echo "== one *sql.Conn per reader"
+"$work/check" "$work/conn-musql.json" "$work/conn-c-sqlite.json" || status=1
+exit $status
