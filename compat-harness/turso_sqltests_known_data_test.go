@@ -178,7 +178,7 @@ func init() {
 		"upsert.sqltest::memory::upsert-invalid-target-expression",
 		"upsert.sqltest::memory::upsert-update-causes-second-unique-violation",
 	)
-	tsKnownGroup("2026-10-12: C 3.53.3 planner bug (Turso's own @skip-if sqlite documents it): GROUP BY sort elision swallows the outer ORDER BY direction when a CTE supplies pre-ordered rows; musql returns the ordered result",
+	tsKnownCBug("2026-10-12: C 3.53.3 planner bug (Turso's own @skip-if sqlite documents it): GROUP BY sort elision swallows the outer ORDER BY direction when a CTE supplies pre-ordered rows; musql returns the ordered result",
 		"subquery/cte_materialization_adversarial.sqltest::memory::sort-elision-group-by-opposite-dir",
 	)
 }
