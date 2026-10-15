@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"math"
 	"slices"
+	"sync"
+	"unsafe"
 )
 
 // AN EQUALITY INDEX THAT LIVES IN THE FILE, not in the Go heap.
@@ -214,7 +216,9 @@ func bytesIndexOrder(cells []int64, heap []byte) ([]int32, func(a, b int64) int,
 			}
 		}
 	}
-	prefix := make([]int64, len(cells))
+	pp := getScratchU64(len(cells))
+	defer scratchU64.Put(pp)
+	prefix := unsafe.Slice((*int64)(unsafe.Pointer(unsafe.SliceData(*pp))), len(cells))
 	for i, c := range cells {
 		var k [8]byte
 		copy(k[:], at(c)[lcp:])
@@ -244,9 +248,27 @@ func bytesIndexOrder(cells []int64, heap []byte) ([]int32, func(a, b int64) int,
 // and the positions start ascending, so ties come out in position order. A pass
 // whose byte every key shares moves nothing and is skipped, so clustered values
 // cost fewer passes.
+// scratchU64 holds the work arrays an index build sorts in, which it lets go
+// as it returns: a load builds one index per column per segment, and they were
+// a sixth of what it allocated.
+var scratchU64 sync.Pool // *[]uint64
+
+// getScratchU64 is n uint64s from scratchU64, contents unspecified.
+func getScratchU64(n int) *[]uint64 {
+	if p, ok := scratchU64.Get().(*[]uint64); ok && cap(*p) >= n {
+		*p = (*p)[:n]
+		return p
+	}
+	s := make([]uint64, n)
+	return &s
+}
+
 func radixOrderInt64(vals []int64) []int32 {
 	n := len(vals)
-	keys, tk := make([]uint64, n), make([]uint64, n)
+	kp, tp := getScratchU64(n), getScratchU64(n)
+	defer scratchU64.Put(kp)
+	defer scratchU64.Put(tp)
+	keys, tk := *kp, *tp
 	order, to := make([]int32, n), make([]int32, n)
 	for i, v := range vals {
 		keys[i] = uint64(v) ^ 1<<63

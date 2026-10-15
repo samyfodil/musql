@@ -1,6 +1,9 @@
 package engine
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 // ConvertedTable is one table in columnar form, with the schema text it was
 // created from so it can be rebuilt exactly.
@@ -76,6 +79,23 @@ type segCutter struct {
 	// time is in flight; wait emits it, so segments still arrive in order.
 	async   bool
 	pending *segBuild
+
+	// own copies each row's values into storage the cutter keeps (flat) rather
+	// than holding the caller's slice, and reuses that storage, and the rowid
+	// and row lists, segment after segment: a load's rows then cost no
+	// allocation of their own, and the caller may reuse its slice once add
+	// returns. Only for a caller that hands over no row it reads again.
+	own  bool
+	flat []Value
+	// free is the storage of the last async build, back for the next segment.
+	free *segRowsBuf
+}
+
+// segRowsBuf is one segment's row storage: what an own cutter recycles.
+type segRowsBuf struct {
+	rowids []uint64
+	rows   [][]Value
+	flat   []Value
 }
 
 // segBuild is an async segment build in flight.
@@ -83,6 +103,9 @@ type segBuild struct {
 	done chan struct{}
 	raw  []byte
 	err  error
+	// rows is the build's input, the cutter's again once the build is done
+	// (own cutters only).
+	rows *segRowsBuf
 }
 
 // wait finishes the build in flight, if any, and emits it.
@@ -93,6 +116,11 @@ func (c *segCutter) wait() error {
 	}
 	<-b.done
 	c.pending = nil
+	if r := b.rows; r != nil {
+		clear(r.rows) // the rows' text belongs to the segment now; pin none of it
+		clear(r.flat)
+		c.free = &segRowsBuf{rowids: r.rowids[:0], rows: r.rows[:0], flat: r.flat[:0]}
+	}
 	if b.err != nil {
 		return b.err
 	}
@@ -109,6 +137,21 @@ func (c *segCutter) finish() error {
 
 // add appends one row, cutting a segment when it fills one.
 func (c *segCutter) add(rowid uint64, vals []Value) error {
+	if c.own {
+		if len(c.flat)+len(vals) > cap(c.flat) {
+			// A new array, twice the last: the rows so far stay in the old one,
+			// which they keep alive, so nothing is copied. The last array is
+			// the one reused, and soon holds a whole segment.
+			c.flat = make([]Value, 0, max(2*cap(c.flat), 1024*len(vals), len(vals)))
+		}
+		at := len(c.flat)
+		c.flat = append(c.flat, vals...)
+		vals = c.flat[at:len(c.flat):len(c.flat)]
+		if len(c.rows) == cap(c.rows) {
+			c.rows = slices.Grow(c.rows, max(len(c.rows), 1024))
+			c.rowids = slices.Grow(c.rowids, cap(c.rows)-len(c.rowids))
+		}
+	}
 	c.rowids = append(c.rowids, rowid)
 	c.rows = append(c.rows, vals)
 	c.bytes += rowMemSize(vals)
@@ -130,7 +173,17 @@ func (c *segCutter) flush() error {
 		// The rows go to the build, and the next segment's into new slices.
 		b := &segBuild{done: make(chan struct{})}
 		cols, what, rowids, rows := c.cols, c.what, c.rowids, c.rows
-		c.rowids, c.rows, c.bytes = make([]uint64, 0, len(rowids)), make([][]Value, 0, len(rows)), 0
+		if c.own {
+			b.rows = &segRowsBuf{rowids: rowids, rows: rows, flat: c.flat}
+			if f := c.free; f != nil {
+				c.rowids, c.rows, c.flat, c.free = f.rowids, f.rows, f.flat, nil
+			} else {
+				c.rowids, c.rows, c.flat = make([]uint64, 0, len(rowids)), make([][]Value, 0, len(rows)), make([]Value, 0, cap(c.flat))
+			}
+			c.bytes = 0
+		} else {
+			c.rowids, c.rows, c.bytes = make([]uint64, 0, len(rowids)), make([][]Value, 0, len(rows)), 0
+		}
 		go func() {
 			defer close(b.done)
 			raw, err := buildSegmentInto(nil, cols, rowids, rows)
@@ -152,6 +205,10 @@ func (c *segCutter) flush() error {
 	}
 	clear(c.rows) // let the rows go before the next segment's arrive
 	c.rowids, c.rows, c.bytes = c.rowids[:0], c.rows[:0], 0
+	if c.own {
+		clear(c.flat)
+		c.flat = c.flat[:0]
+	}
 	if c.reuse {
 		c.buf = raw
 	}

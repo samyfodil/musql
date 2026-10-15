@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -202,8 +203,8 @@ func WriteSegmentFileWithCatalog(path string, tables []ConvertedTable, cat Conve
 // suite 8% -- and the scratch file only takes over past that.
 type segFileWriter struct {
 	dir     string
-	scratch *os.File // nil while the segments fit in mem
-	mem     []byte   // the segments so far, laid out as the scratch would hold them
+	scratch *os.File     // nil while the segments fit in mem
+	mem     []segMemPart // the segments so far, each where the scratch would hold it
 	at      int64
 	segs    [][][2]int64 // per table: each segment's (offset, length) in mem or the scratch
 
@@ -211,6 +212,14 @@ type segFileWriter struct {
 	// this writer completes is that one, so it is neither closed nor removed
 	// here, and its segments that the new file keeps are not written again.
 	spill *spillFile
+}
+
+// segMemPart is one segment a writer holds in memory, at its offset from the
+// end of the file header. Held whole rather than appended to one buffer: a
+// buffer that grows to 16 MB copies what it holds every time it does.
+type segMemPart struct {
+	at  int64
+	raw []byte
 }
 
 // spillsAdopted counts spill files a rewrite made its file, for a test.
@@ -251,6 +260,17 @@ func newSegFileWriter(dir string) (*segFileWriter, error) {
 
 // addSegment appends one of table ti's segments, in order.
 func (w *segFileWriter) addSegment(ti int, raw []byte) error {
+	return w.addSegmentBytes(ti, raw, false)
+}
+
+// addSegmentOwned is addSegment for bytes nothing will change or unmap before
+// finish: held as they are rather than copied. A direct-path load's segments
+// (insert_bulk_direct.go), built in memory of their own, are.
+func (w *segFileWriter) addSegmentOwned(ti int, raw []byte) error {
+	return w.addSegmentBytes(ti, raw, true)
+}
+
+func (w *segFileWriter) addSegmentBytes(ti int, raw []byte, owned bool) error {
 	for len(w.segs) <= ti {
 		w.segs = append(w.segs, nil)
 	}
@@ -263,10 +283,12 @@ func (w *segFileWriter) addSegment(ti int, raw []byte) error {
 		if err != nil {
 			return err
 		}
-		if _, err := f.WriteAt(w.mem, segFileHdrSizeV5); err != nil {
-			f.Close()
-			os.Remove(f.Name())
-			return err
+		for _, p := range w.mem {
+			if _, err := f.WriteAt(p.raw, segFileHdrSizeV5+p.at); err != nil {
+				f.Close()
+				os.Remove(f.Name())
+				return err
+			}
 		}
 		w.scratch, w.mem = f, nil
 	}
@@ -275,10 +297,10 @@ func (w *segFileWriter) addSegment(ti int, raw []byte) error {
 			return err
 		}
 	} else {
-		for int64(len(w.mem)) < at {
-			w.mem = append(w.mem, 0)
+		if !owned {
+			raw = bytes.Clone(raw)
 		}
-		w.mem = append(w.mem, raw...)
+		w.mem = append(w.mem, segMemPart{at: at, raw: raw})
 	}
 	w.segs[ti] = append(w.segs[ti], [2]int64{at, int64(len(raw))})
 	w.at = at + int64(len(raw))
@@ -431,7 +453,9 @@ func (w *segFileWriter) finish(path string, tables []ConvertedTable, cat Convert
 	}
 	img := make([]byte, dirOff+int64(len(dir)))
 	copy(img, head)
-	copy(img[base:], w.mem)
+	for _, p := range w.mem {
+		copy(img[base+p.at:], p.raw)
+	}
 	copy(img[dirOff:], dir)
 	if _, err := out.WriteAt(img, 0); err != nil {
 		out.Close()
