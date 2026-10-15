@@ -39,7 +39,11 @@ import (
 //
 // It reports whether anything was done: a missing or empty delta is not an error
 // and not work.
-func CompactSegmentFile(segPath string) (bool, error) {
+func CompactSegmentFile(segPath string) (bool, error) { return compactSegmentFile(segPath, false) }
+
+// compactSegmentFile is CompactSegmentFile, leaving a written-ahead delta tail
+// behind when tail is set (segment_delta_tail.go).
+func compactSegmentFile(segPath string, tail bool) (bool, error) {
 	// Every change to the pair is announced in the lock file's change word
 	// (segment_change.go), so a reader's freshness check can skip the stamps.
 	endChange, cerr := segChangeBegin(segPath)
@@ -127,6 +131,12 @@ func CompactSegmentFile(segPath string) (bool, error) {
 		return false, rerr
 	}
 	syncDir(segPath)
+	// Already durable: a tail that fails to write leaves no delta, as before.
+	if tail {
+		if fi, serr := os.Stat(segPath); serr == nil {
+			writeDeltaTail(segPath, st.endCtr, st.endPages, deltaTailSize(fi.Size()))
+		}
+	}
 	return true, nil
 }
 

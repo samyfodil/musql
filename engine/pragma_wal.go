@@ -5,6 +5,7 @@
 package engine
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"strings"
@@ -29,10 +30,21 @@ func walCheckpointDecline(mode string) error {
 }
 
 // segLogNonEmpty reports whether the database at path has a delta holding any
-// record -- a log a checkpoint would have something to fold.
+// record -- a log a checkpoint would have something to fold. Its first batch's
+// length says so: a header followed by zeros is a written-ahead tail and no
+// log (segment_delta_tail.go). Only the low 4 bytes are read, which a version
+// 1 and a version 2 length prefix both begin with.
 func segLogNonEmpty(path string) bool {
-	fi, err := os.Stat(path + segDeltaSuffix)
-	return err == nil && fi.Size() > int64(segDeltaHdrSize)
+	f, err := os.Open(path + segDeltaSuffix)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	var b [4]byte
+	if _, err := f.ReadAt(b[:], segDeltaHdrSize); err != nil {
+		return false
+	}
+	return binary.LittleEndian.Uint32(b[:]) != 0
 }
 
 // walCheckpointRows returns PRAGMA wal_checkpoint's answer: three INTEGER

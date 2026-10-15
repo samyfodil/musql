@@ -88,10 +88,7 @@ func TestSegmentDeltaRejectsATornTail(t *testing.T) {
 	good := renderT(t, segPath)
 
 	deltaPath := segDeltaPath(segPath)
-	data, err := os.ReadFile(deltaPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	data := deltaLogical(t, segPath) // the batches, without a written-ahead tail
 	baseCtr, basePages, err := SegmentFileBase(segPath)
 	if err != nil {
 		t.Fatal(err)

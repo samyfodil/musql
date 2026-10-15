@@ -190,6 +190,16 @@ func (n *Session) rewriteFile() error {
 	if !db.inMemory {
 		syncDir(n.segPath)
 	}
+	// The next commit's batch goes into space written now, off its path
+	// (segment_delta_tail.go). Not under max_size, which counts the file's
+	// bytes, tail included. The rewrite is already durable: a tail that fails
+	// to write leaves no delta, and the next commit creates one as before.
+	n.deltaEnd = segDeltaHdrSize
+	if !db.inMemory && n.maxSize == 0 && deltaTailWanted {
+		if st, serr := os.Stat(n.segPath); serr == nil {
+			writeDeltaTail(n.segPath, n.endCtr, n.endPages, deltaTailSize(st.Size()))
+		}
+	}
 
 	// The file's identity moved, so the session's pairing and its append point
 	// both start again from it.

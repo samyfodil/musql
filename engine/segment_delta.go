@@ -223,13 +223,18 @@ func segDeltaPath(segPath string) string { return segPath + segDeltaSuffix }
 // writeSegDeltaHeader creates an empty delta for the segment file identified by
 // (baseCtr, basePages).
 func writeSegDeltaHeader(path string, baseCtr, basePages uint32) error {
+	return os.WriteFile(path, segDeltaHeader(baseCtr, basePages), 0o644)
+}
+
+// segDeltaHeader is a delta's header for the segment file at (baseCtr, basePages).
+func segDeltaHeader(baseCtr, basePages uint32) []byte {
 	hdr := make([]byte, segDeltaHdrSize)
 	copy(hdr[0:4], segDeltaMagic)
 	binary.LittleEndian.PutUint32(hdr[4:], segDeltaVersion)
 	binary.LittleEndian.PutUint32(hdr[8:], baseCtr)
 	binary.LittleEndian.PutUint32(hdr[12:], basePages)
 	binary.LittleEndian.PutUint64(hdr[24:], segDeltaChecksum(hdr[:24], 0))
-	return os.WriteFile(path, hdr, 0o644)
+	return hdr
 }
 
 // segDeltaChecksum is the running checksum, seeded from the previous value. It
@@ -412,7 +417,13 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 	// append time rather than at the next open, and what it buys is a commit that
 	// does not re-read its own history.
 	var st *segDeltaState
-	if carry != nil && carry.known && carry.offset > int64(segDeltaHdrSize) && exists && fileSize == carry.offset {
+	//
+	// A WRITTEN-AHEAD TAIL (writeDeltaTail) leaves the file's size where it was,
+	// so the size check above cannot see another writer's batch inside it. What
+	// does: no batch is empty, so the 8 bytes at the carried offset -- where the
+	// next batch's length prefix would go -- are zero only while nobody has
+	// appended there. Every append leaves them zero after its own batch.
+	if carry != nil && carry.known && carry.offset > int64(segDeltaHdrSize) && exists && fileSize >= carry.offset {
 		vf := f
 		if vf == nil {
 			vf, _ = os.Open(path)
@@ -421,9 +432,10 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 			}
 		}
 		if vf != nil {
-			var tail [8]byte
-			_, rerr := fsio.ReadAt(vf, tail[:], carry.offset-8)
-			if rerr == nil && binary.LittleEndian.Uint64(tail[:]) == carry.cksum {
+			var tail [16]byte
+			n := min(fileSize-carry.offset, 8)
+			_, rerr := fsio.ReadAt(vf, tail[:8+n], carry.offset-8)
+			if rerr == nil && binary.LittleEndian.Uint64(tail[:8]) == carry.cksum && binary.LittleEndian.Uint64(tail[8:]) == 0 {
 				st = &segDeltaState{bytes: carry.offset, cksum: carry.cksum,
 					endCtr: endCtr, endPages: endPages, version: carry.version}
 			}
@@ -473,10 +485,14 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 	if werr != nil {
 		return werr
 	}
-	// A torn tail past where this batch started is cut off. When the file
-	// ended exactly there, nothing lies past the batch and the call is skipped.
-	if !exists || fileSize != st.bytes {
-		if err := f.Truncate(end); err != nil {
+	// WHAT LIES PAST THE BATCH must not read as one: a torn earlier append, or
+	// the written-ahead tail. The tail is zeros already, and zeros end the log
+	// (replaySegDelta); a torn append is overwritten with zeros here, up to 8
+	// bytes -- the next length prefix, which is all a replay or the next append's
+	// check reads. The file is never cut back, so a tail written ahead stays.
+	if end < fileSize {
+		var zero [8]byte
+		if _, err := fsio.WriteAt(f, zero[:min(fileSize-end, 8)], end); err != nil {
 			return err
 		}
 	}
@@ -488,8 +504,20 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 	// marker and a torn tail is excluded on replay), it is just not yet on the
 	// platter, so a power loss can lose the last commits. syncFull is C's
 	// "PRAGMA fullfsync" (fsyncFile).
+	//
+	// fdatasync, not fsync, where the platform has one: a batch written into the
+	// tail changes no metadata a read needs, and fsync would also commit the
+	// mtime -- a filesystem journal commit, which is most of what a growing
+	// append costs (measured on ext4: 10.7 ms growing, 2.8 ms into written
+	// bytes, for 600 KB). Growth still syncs the size: fdatasync covers it.
 	if sync != syncNone {
-		if err := fsyncFile(f, sync == syncFull); err != nil {
+		var err error
+		if sync == syncFull {
+			err = fsyncFile(f, true)
+		} else {
+			err = datasyncFile(f)
+		}
+		if err != nil {
 			return err
 		}
 		// A DELTA THIS APPEND CREATED is reachable only through its directory

@@ -50,9 +50,10 @@ func TestSegmentDeltaOrphanBatchNotResurrectedByNextCommit(t *testing.T) {
 	// (The baseline is DDL, which rewrites the file, so there may be no delta
 	// yet: absent reads as empty.)
 	deltaPath := segDeltaPath(path)
-	before, err := os.ReadFile(deltaPath)
-	if err != nil && !os.IsNotExist(err) {
-		t.Fatal(err)
+	// The batches only: a rewrite leaves a written-ahead tail of zeros.
+	var before []byte
+	if _, err := os.Stat(deltaPath); err == nil {
+		before = deltaLogical(t, path)
 	}
 	n, err = OpenWrite(path)
 	if err != nil {
@@ -62,14 +63,18 @@ func TestSegmentDeltaOrphanBatchNotResurrectedByNextCommit(t *testing.T) {
 	if err := n.Close(); err != nil {
 		t.Fatal(err)
 	}
-	after, err := os.ReadFile(deltaPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	after := deltaLogical(t, path)
 	if len(after) <= len(before)+segDeltaTrailerSz {
 		t.Fatalf("the UPDATE did not append a batch to the delta (%d -> %d bytes); the fixture needs one to orphan", len(before), len(after))
 	}
-	if err := os.WriteFile(deltaPath, after[:len(after)-segDeltaTrailerSz], 0o644); err != nil {
+	// Its trailer zeroed in place, which is how a torn append into a
+	// written-ahead tail leaves it; the file keeps its length.
+	whole, err := os.ReadFile(deltaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clear(whole[len(after)-segDeltaTrailerSz : len(after)])
+	if err := os.WriteFile(deltaPath, whole, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if got := read(); got != "base1;base2;" {
