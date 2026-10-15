@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/samyfodil/musql/internal/fsio"
 	"github.com/samyfodil/musql/internal/mmapfile"
 )
 
@@ -441,7 +442,7 @@ func (w *segFileWriter) finish(path string, tables []ConvertedTable, cat Convert
 			return err
 		}
 		w.scratch = nil
-		if err := os.Rename(f.Name(), path); err != nil {
+		if err := fsio.Rename(f.Name(), path); err != nil { // see fsio.Rename
 			os.Remove(f.Name())
 			return err
 		}

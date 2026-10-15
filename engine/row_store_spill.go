@@ -5,6 +5,7 @@ import (
 	"runtime"
 	"slices"
 
+	"github.com/samyfodil/musql/internal/fsio"
 	"github.com/samyfodil/musql/internal/mmapfile"
 )
 
@@ -116,7 +117,7 @@ func (sf *spillFile) nameAs(dst string) error {
 	if sf.anon {
 		return linkAnon(sf.f, dst)
 	}
-	if err := os.Rename(sf.name, dst); err != nil {
+	if err := fsio.Rename(sf.name, dst); err != nil { // see fsio.Rename
 		return err
 	}
 	delete(sf.res.names, sf.name) // the cleanup must not remove the database

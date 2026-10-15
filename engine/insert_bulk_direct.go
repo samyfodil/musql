@@ -147,6 +147,12 @@ func (m *vdbe) bulkLoadFor(plan *insertPlan) *segBulkLoad {
 func (m *vdbe) bulkLoadInTx(plan *insertPlan) *segBulkLoad {
 	wc := m.wctx
 	db, tbl := wc.db, plan.tbl
+	// A table with rows and no load is the ordinary path whatever else holds:
+	// asked first, because a batch INSERT into a loaded table asks once a row
+	// and bulkTxOK walks every index.
+	if tbl.bulk == nil && tbl.rows != nil && tbl.rows.len() != 0 {
+		return nil
+	}
 	if !plan.txAppendArmable() || !bulkTxOK(db, tbl) {
 		return nil
 	}
