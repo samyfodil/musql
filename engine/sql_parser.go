@@ -1787,17 +1787,21 @@ func checkFlattenSafe(elems []FromItem, leading bool) {
 		elems[0].GroupLen = len(elems)
 		return
 	}
+	// A leading, unaliased group is spliced in flat (rule 115's "pSrc==0"
+	// arm): it is the FROM clause's own prefix, and joins associate to the
+	// left, so "(t0 LEFT JOIN t1 ON ...) JOIN t2" is "t0 LEFT JOIN t1 ON ...
+	// JOIN t2" to C, outer join or not.
+	if leading {
+		return
+	}
 	// A non-leading group containing USING/NATURAL is atomic too: the coalesce
 	// representative is the first earlier item with the column
 	// (tableAndColumnIndex, select.c:379), and flattening would let it escape the
-	// group ("u JOIN (t JOIN w USING(a))" would bind u to w). A leading group has
-	// nothing before it.
-	if !leading {
-		for i := 1; i < len(elems); i++ {
-			if elems[i].Natural || len(elems[i].Using) != 0 {
-				elems[0].GroupLen = len(elems)
-				return
-			}
+	// group ("u JOIN (t JOIN w USING(a))" would bind u to w).
+	for i := 1; i < len(elems); i++ {
+		if elems[i].Natural || len(elems[i].Using) != 0 {
+			elems[0].GroupLen = len(elems)
+			return
 		}
 	}
 	for i := range elems {

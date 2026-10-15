@@ -153,6 +153,9 @@ type r41Flat struct {
 	// an expression column's copy reads NULL on the NULL row (TK_IF_NULL_ROW),
 	// tested through this name of the base table's rowid.
 	outerRowid string
+
+	// p reads the names a subquery's own FROM clause binds (subqueryUntouched).
+	p *ReadOnlyPager
 }
 
 func (p *ReadOnlyPager) r41FlattenItem(stmt *SelectStmt, i int, expand bool) (*SelectStmt, bool) {
@@ -187,10 +190,14 @@ func (p *ReadOnlyPager) r41FlattenItem(stmt *SelectStmt, i int, expand bool) (*S
 	}
 	if it.Join == JoinLeft {
 		// isOuterJoin (select.c:4371-4381): a body of one table, a parent
-		// that is not DISTINCT. The parent WHERE must be empty here, since
-		// OUTER JOIN STRENGTH REDUCTION (tag-select-0220) runs first in C and
-		// a WHERE could turn the join into an inner one.
-		if !p.cVolatile(body) || len(body.Compound) != 0 || stmt.Distinct || stmt.Where != nil ||
+		// that is not DISTINCT. A parent WHERE may first turn the join into an
+		// inner one (OUTER JOIN STRENGTH REDUCTION, tag-select-0220), and C
+		// then flattens it as an inner join; flattening it as an outer one
+		// here gives the same rows: the WHERE that would have reduced it
+		// rejects every NULL row, and the compiler reduces the flattened join
+		// itself (wherePlanReduceOuterJoins). An expression column's copy
+		// reads its value on every row that is not a NULL row either way.
+		if !p.cVolatile(body) || len(body.Compound) != 0 || stmt.Distinct ||
 			len(it.Using) != 0 || it.Natural {
 			return nil, false
 		}
@@ -280,6 +287,7 @@ func (p *ReadOnlyPager) r41Arm(stmt *SelectStmt, i int, it FromItem, body *Selec
 		return nil, false
 	}
 	f := &r41Flat{
+		p:       p,
 		dName:   it.Alias,
 		byName:  map[string]int{},
 		base:    map[string]string{},
@@ -803,6 +811,11 @@ func r41ComplexResult(stmt *SelectStmt) bool {
 // r41Walk visits every node of e, and reports false if e holds a node it does
 // not descend into (a subquery, RAISE(), or a kind it does not know).
 func r41Walk(e Expr, visit func(Expr)) bool {
+	return r41WalkQ(e, visit, nil)
+}
+
+// r41WalkQ is r41Walk that steps over, as known, a subquery subOK accepts.
+func r41WalkQ(e Expr, visit func(Expr), subOK func(*SelectStmt) bool) bool {
 	known := true
 	var walk func(Expr)
 	walk = func(e Expr) {
@@ -820,13 +833,21 @@ func r41Walk(e Expr, visit func(Expr)) bool {
 		case IsNullExpr:
 			walk(x.X)
 		case InExpr:
-			if x.Sub != nil {
+			if x.Sub != nil && (subOK == nil || !subOK(x.Sub)) {
 				known = false
 				return
 			}
 			walk(x.X)
 			for _, a := range x.List {
 				walk(a)
+			}
+		case SubqueryExpr:
+			if subOK == nil || !subOK(x.Stmt) {
+				known = false
+			}
+		case ExistsExpr:
+			if subOK == nil || !subOK(x.Stmt) {
+				known = false
 			}
 		case BetweenExpr:
 			walk(x.X)
@@ -970,8 +991,66 @@ func (f *r41Flat) parentRef(ce ColumnExpr) (Expr, bool) {
 // let through only when no name in it could bind to the derived table or to a
 // column the flattened base table newly exposes, and it is then left exactly
 // as written.
+//
+// A name the subquery's own FROM clause binds is its own whatever it spells:
+// SQLite resolves the innermost scope first (lookupName, resolve.c), and the
+// flatten changes nothing inside the subquery. The scopes are read only where
+// every item's names are known (r41ItemNames) and the subquery defines no CTE
+// of its own; a FROM-clause subquery sees no sibling of its own select, so its
+// scope does not reach past itself.
 func (f *r41Flat) subqueryUntouched(s *SelectStmt) bool {
-	return r41WalkStmt(s, func(ce ColumnExpr) bool {
+	type local struct {
+		quals, cols map[string]bool
+		known       bool // every name the scope binds is in quals/cols
+		opaque      bool // a FROM-clause subquery: the scopes outside it are not its own
+	}
+	var stack []local
+	enter := func(s *SelectStmt, fromItem bool) func() {
+		sc := local{quals: map[string]bool{}, cols: map[string]bool{}, known: f.p != nil && len(s.CTEs) == 0, opaque: fromItem}
+		for _, it := range s.From {
+			if !sc.known {
+				break
+			}
+			if it.TableFunc || it.GroupLen != 0 || len(it.NestedGroupSpan) != 0 || it.GroupAlias != "" {
+				sc.known = false
+				break
+			}
+			name, cols, ok := f.p.r41ItemNames(it)
+			if !ok || name == "" {
+				sc.known = false
+				break
+			}
+			sc.quals[r33sFoldIdent(name)] = true
+			for _, c := range cols {
+				sc.cols[r33sFoldIdent(c)] = true
+			}
+		}
+		stack = append(stack, sc)
+		return func() { stack = stack[:len(stack)-1] }
+	}
+	bound := func(ce ColumnExpr) bool {
+		for k := len(stack) - 1; k >= 0; k-- {
+			sc := stack[k]
+			if !sc.known {
+				return false
+			}
+			if ce.Qualifier != "" {
+				if ce.Schema == "" && sc.quals[r33sFoldIdent(ce.Qualifier)] {
+					return true
+				}
+			} else if sc.cols[r33sFoldIdent(ce.Name)] {
+				return true
+			}
+			if sc.opaque {
+				return false
+			}
+		}
+		return false
+	}
+	return r41WalkStmtE(s, func(ce ColumnExpr) bool {
+		if bound(ce) {
+			return true
+		}
 		if ce.Qualifier != "" {
 			return !(f.dName != "" && equalFoldName(ce.Qualifier, f.dName)) &&
 				!equalFoldName(ce.Qualifier, f.alias)
@@ -982,7 +1061,7 @@ func (f *r41Flat) subqueryUntouched(s *SelectStmt) bool {
 		return !isBase && !isDerived
 	}, func(q string) bool {
 		return !(f.dName != "" && equalFoldName(q, f.dName)) && !equalFoldName(q, f.alias)
-	})
+	}, enter, false)
 }
 
 func r41Has(m map[string]Expr, k string) bool {
@@ -1281,13 +1360,29 @@ func (p *ReadOnlyPager) r41ItemNames(o FromItem) (string, []string, bool) {
 // s, subqueries and CTE bodies included, and reports false when a visit does
 // or when s holds a node it does not know.
 func r41WalkStmt(s *SelectStmt, col func(ColumnExpr) bool, star func(string) bool) bool {
+	return r41WalkStmtE(s, col, star, nil, false)
+}
+
+// r41WalkStmtE is r41WalkStmt that calls enter, when set, on every SELECT it
+// walks before anything in it (fromItem: it is a FROM-clause subquery), and
+// the function enter returns once that SELECT is done.
+func r41WalkStmtE(s *SelectStmt, col func(ColumnExpr) bool, star func(string) bool,
+	enter func(s *SelectStmt, fromItem bool) func(), fromItem bool) bool {
 	if s == nil {
 		return true
+	}
+	if enter != nil {
+		defer enter(s, fromItem)()
 	}
 	ok := true
 	var expr func(Expr)
 	stmt := func(s *SelectStmt) {
-		if ok && !r41WalkStmt(s, col, star) {
+		if ok && !r41WalkStmtE(s, col, star, enter, false) {
+			ok = false
+		}
+	}
+	fromStmt := func(s *SelectStmt) {
+		if ok && !r41WalkStmtE(s, col, star, enter, true) {
 			ok = false
 		}
 	}
@@ -1358,7 +1453,7 @@ func r41WalkStmt(s *SelectStmt, col func(ColumnExpr) bool, star func(string) boo
 		for _, a := range it.TableFuncArgs {
 			expr(a)
 		}
-		stmt(it.Subquery)
+		fromStmt(it.Subquery)
 	}
 	expr(s.Where)
 	for _, g := range s.GroupBy {
@@ -1446,7 +1541,9 @@ func (f *r41Flat) exprColCompared(stmt *SelectStmt, binaryColl func(Expr) bool) 
 		}
 	}
 	walk := func(e Expr) {
-		if e != nil && !r41Walk(e, visit) {
+		// A subquery that names nothing of the derived table holds no such
+		// reference; the flatten leaves it as it is (subqueryUntouched).
+		if e != nil && !r41WalkQ(e, visit, f.subqueryUntouched) {
 			// A node the walk does not enter could hold one.
 			found = true
 		}
@@ -1567,12 +1664,13 @@ func (f *r41Flat) wrapComparedLeft(stmt *SelectStmt, binaryColl func(Expr) bool)
 			}
 		}
 		// A node not rebuilt here: refused if it holds a comparison to wrap.
+		// A subquery naming nothing of the derived table holds none.
 		hit := false
-		if !r41Walk(e, func(n Expr) {
+		if !r41WalkQ(e, func(n Expr) {
 			if b, isBin := n.(BinaryExpr); isBin && needs(b) {
 				hit = true
 			}
-		}) || hit {
+		}, f.subqueryUntouched) || hit {
 			ok = false
 		}
 		return e

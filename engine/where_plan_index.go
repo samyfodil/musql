@@ -790,6 +790,10 @@ type whereIdxTerm struct {
 	likeInfix bool
 	likeSz    int
 	likeOpt   bool
+	// vtabArg is the "hidden = argument" term sqlite3WhereTabFuncArgs adds for
+	// a table-valued function's argument (whereexpr.c), which the module's
+	// plan consumes (argvIndex) and so is in its loop's aLTerm.
+	vtabArg bool
 	// inRefuse is wherePlanInRhsRefuse: an "x IN (SELECT ...)" whose IN loop
 	// visits a row set the WHERE does not describe, refused by plan() only in
 	// a winning loop that uses it.
@@ -1613,6 +1617,21 @@ func (b *wherePlanIdxBuild) addAll() {
 		case !hasRightCrossJoin:
 			mPrereq = 0
 		}
+		if it.vtab {
+			// whereLoopAddVirtual: a module whose plan uses only constraints
+			// of no other item answers one loop (where.c:4730's mBest==0).
+			// The gate leaves no OR term this item could take (wherePlanVtabItem).
+			lt := []int(nil)
+			for ti := range b.terms {
+				if b.terms[ti].vtabArg && b.terms[ti].cursor == iTab {
+					lt = append(lt, ti)
+				}
+			}
+			b.insertLoop(whereIdxLoop{iTab: iTab, maskSelf: maskSelf, prereq: mPrereq,
+				rRun: it.vtabRun, nOut: it.vtabOut, lTerm: lt})
+			mPrior |= maskSelf
+			continue
+		}
 		b.addBtree(iTab, mPrereq)
 		// "rc = whereLoopAddOr(pBuilder, mPrereq, mUnusable)" (where.c:5021), the
 		// third and last access-method family, run for every item right after its
@@ -1876,6 +1895,12 @@ func (b *wherePlanIdxBuild) wherePathSatisfiesOrderBy(
 			l = &b.loops[last]
 		}
 		iTab := l.iTab
+		if b.items[iTab].vtab {
+			// WHERE_VIRTUALTABLE (where.c:5225): a module that consumed no
+			// ORDER BY ends the walk, and no later term may be matched.
+			isOrderDistinct = false
+			break
+		}
 
 		// Mark off any ORDER BY term X that is a column of this loop's table for
 		// which the WHERE clause holds "X IS NULL" or "X = <expr over outer

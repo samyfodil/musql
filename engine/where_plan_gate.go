@@ -225,7 +225,15 @@ func wherePlanMultiTableSourcesWith(p *ReadOnlyPager, c *compiler, srcs []joinSo
 			}
 			continue
 		}
-		// Every virtual-table source is excluded from this solver. For an fts MATCH
+		if der != nil && s.vtabItem != nil {
+			// A subquery-admitting plan (markCoroutineReruns) takes a module
+			// whose xBestIndex is ported: wherePlanVtabItem.
+			if _, ok := wherePlanVtabItem(p, *s); ok {
+				continue
+			}
+			return false
+		}
+		// Every other virtual-table source is excluded from this solver. For an fts MATCH
 		// correlated to another item, C forces the vtab after that item through costs
 		// (where.c:4390; fts3.c:1636's 1e50; fts5_main.c:657's SQLITE_CONSTRAINT). With
 		// exactly two items that is the whole question, handled outside this solver by
@@ -360,6 +368,42 @@ func wherePlanMultiTableOrderWith(p *ReadOnlyPager, c *compiler, srcs []joinSour
 
 	items := make([]whereItem, len(srcs))
 	for i := range srcs {
+		if der != nil && srcs[i].vtabItem != nil {
+			hidden, ok := wherePlanVtabItem(p, srcs[i])
+			if !ok || srcs[i].left || srcs[i].rightOuter {
+				return nil, nil, 0, false
+			}
+			mask := whereMask(1) << uint(i)
+			for ti := range terms {
+				t := &terms[ti]
+				if t.orInfo != nil && t.orInfo.indexable&mask != 0 {
+					// whereLoopAddOr over a virtual table is not followed.
+					return nil, nil, 0, false
+				}
+				if t.cursor == i && (t.column == hidden[0] || t.column == hidden[1]) {
+					// A WHERE constraint on the module's hidden input is one
+					// more xBestIndex constraint; not followed.
+					return nil, nil, 0, false
+				}
+			}
+			// sqlite3WhereTabFuncArgs: "hidden = argument" for each argument,
+			// in order (whereexpr.c). The module's plan uses all of them
+			// (jsonEachBestIndex: argvIndex 1 and 2), each of no other item.
+			for k := range srcs[i].vtabItem.TableFuncArgs {
+				terms = append(terms, whereIdxTerm{op: woEq, cursor: i, column: hidden[k], rCursor: -1, rColumn: -1,
+					prereqAll: mask, parent: -1, virt: true, vtabArg: true, truthProb: 1})
+			}
+			// jsonEachBestIndex with the JSON argument: estimatedCost 1.0
+			// (sqlite3LogEstFromDouble: 0), estimatedRows left at 25
+			// (whereLoopAddVirtualOne's default, sqlite3LogEst(25) = 46).
+			items[i] = whereItem{
+				cross: srcs[i].cross, fromExists: scopes[i].fromExists,
+				cols: srcs[i].tbl.cols, tabName: "\x00vtab" + itoaSmall(i),
+				colUsedOK: colUsedOK, ipkIndex: -1, szTabRow: 1,
+				vtab: true, vtabRun: 0, vtabOut: 46,
+			}
+			continue
+		}
 		if d, ok := der[i]; ok {
 			// A subquery's table (sqlite3ResultSetOfSelect): no index but the
 			// fake sPk, szTabRow 1 ("any non-zero value works", select.c:2432),
@@ -2590,4 +2634,48 @@ func rightJoinSweepKey(p *ReadOnlyPager, srcs []joinSource, stmt *SelectStmt, r 
 		items: []whereItem{it}, sort: &whereSortCtl{}, noAutoIndex: true,
 	}, false)
 	return key, ok
+}
+
+// wherePlanVtabItem admits a virtual-table source to the ported solver when its
+// module's xBestIndex is ported: json_each and json_tree, called with one or
+// two arguments that name no column at all (so each argument's term has no
+// prerequisite and the first call, all constraints usable, settles the plan).
+// hidden is the module's JSON and ROOT column numbers.
+func wherePlanVtabItem(p *ReadOnlyPager, s joinSource) (hidden [2]int, ok bool) {
+	it := s.vtabItem
+	if p == nil || it == nil || s.tbl == nil || !it.TableFunc || len(it.TableFuncArgs) == 0 || len(it.TableFuncArgs) > 2 ||
+		len(s.tbl.cols) >= 63 {
+		return hidden, false
+	}
+	mod, _, err := p.resolveVtabModuleForItem(*it)
+	if err != nil {
+		return hidden, false
+	}
+	jm, isJSON := mod.(jsonEachModule)
+	if !isJSON || (jm.name != "json_each" && jm.name != "json_tree") {
+		return hidden, false
+	}
+	hidden = [2]int{-1, -1}
+	for ci, c := range s.tbl.cols {
+		switch {
+		case c.Hidden && equalFoldName(c.Name, "json"):
+			hidden[0] = ci
+		case c.Hidden && equalFoldName(c.Name, "root"):
+			hidden[1] = ci
+		}
+	}
+	if hidden[0] < 0 || hidden[1] < 0 {
+		return hidden, false
+	}
+	for _, a := range it.TableFuncArgs {
+		names := false
+		if !r41Walk(a, func(e Expr) {
+			if _, isCol := e.(ColumnExpr); isCol {
+				names = true
+			}
+		}) || names {
+			return hidden, false
+		}
+	}
+	return hidden, true
 }

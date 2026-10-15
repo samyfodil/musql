@@ -108,6 +108,11 @@ type whereItem struct {
 	// cannot be run backwards.
 	subOB     []whereSubOB
 	coroutine bool
+	// vtab is a virtual table (IsVirtual): its one loop is what its module's
+	// xBestIndex answered, whereLoopAddVirtualOne's rRun and nOut (where.c:4516),
+	// in place of every b-tree loop. See wherePlanVtabItem.
+	vtab             bool
+	vtabRun, vtabOut logEst
 }
 
 // whereSubOB is one term of a subquery's ORDER BY: col is iOrderByCol-1, the
@@ -221,8 +226,19 @@ func wherePlanOrder(in wherePlanInput) (order []int, keys []*autoIndexKey, nRow 
 		return nil, nil, 0, false
 	}
 	for i := range in.items {
-		if in.items[i].cols == nil || len(in.items[i].idxs) == 0 {
+		if in.items[i].cols == nil || (len(in.items[i].idxs) == 0 && !in.items[i].vtab) {
 			return nil, nil, 0, false
+		}
+		if in.items[i].vtab && in.sort != nil {
+			// wherePathSatisfiesOrderBy's WHERE_VIRTUALTABLE arm reads the
+			// module's orderByConsumed. jsonEachBestIndex consumes only an
+			// ORDER BY of its own rowid, ascending (json.c:5486), which is
+			// not modelled; every other one it leaves unconsumed.
+			for _, t := range in.sort.ob {
+				if t.tab == i && t.col == xnRowid {
+					return nil, nil, 0, false
+				}
+			}
 		}
 	}
 	b := &wherePlanIdxBuild{

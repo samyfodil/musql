@@ -74,6 +74,11 @@ type joinSource struct {
 	// over a body that is not deterministic: its cursor runs the body again at
 	// every rewind (derivedSource.rerun). Set by markCoroutineReruns.
 	coroutineRerun bool
+	// cPlanDecided marks every source of a FROM clause whose whole plan
+	// markCoroutineReruns took from the ported planner with its subqueries
+	// admitted (wherePlanMultiTableOrderWith): the loop order and each level's
+	// access path are C's, so the order rows arrive in is too.
+	cPlanDecided bool
 
 	// selfJoinShared marks a view named twice in one FROM clause whose
 	// references read one materialization (shareSelfJoinViews): it is never
