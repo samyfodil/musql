@@ -591,6 +591,11 @@ type DB struct {
 	lastVerbRaw     string
 	lastVerbRawVerb string
 	lastVerbRawOK   bool
+	// laneText is the text plainWriteLane judged last, and laneDML its verdict.
+	laneText string
+	laneDML  bool
+	// trimIn is the text tryVDBEWrite trimmed last, and trimOut the result.
+	trimIn, trimOut string
 	// schemaRowsMemo is segmentSchemaRowsShared's last render.
 	schemaRowsMemo schemaRowsMemo
 	changeLog      changeLog

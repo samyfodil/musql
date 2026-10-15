@@ -2195,7 +2195,11 @@ func (db *DB) ExecArgsOwned(sqlText string, args []Value) (rowsAffected int64, l
 	// panic, so a deferred restore bought nothing but its per-statement cost.
 	saved := db.argsOwned
 	db.argsOwned = true
-	rowsAffected, lastInsertID, err = db.ExecArgs(sqlText, args)
+	if db.plainWriteLane(sqlText) { // ExecArgs' own first step
+		rowsAffected, lastInsertID, err = db.execPlainWrite(sqlText, args)
+	} else {
+		rowsAffected, lastInsertID, err = db.execArgsFull(sqlText, args)
+	}
 	db.argsOwned = saved
 	return rowsAffected, lastInsertID, err
 }
@@ -2221,15 +2225,20 @@ func (db *DB) plainWriteLane(sqlText string) bool {
 		db.wsSchemaCorruptObj != "" || db.deferFKAutocommitActive() || len(db.attached) != 0 {
 		return false
 	}
-	f := stmtTextFlagsFor(sqlText)
-	if !f.verbOK || f.isExplain {
-		return false
+	// The verdict on the text, for the text asked about last: a load asks about
+	// one string per row.
+	if sqlText != db.laneText || sqlText == "" {
+		f := stmtTextFlagsFor(sqlText)
+		dml := false
+		if f.verbOK && !f.isExplain {
+			switch f.verb {
+			case "INSERT", "REPLACE", "UPDATE", "DELETE":
+				dml = true
+			}
+		}
+		db.laneText, db.laneDML = sqlText, dml
 	}
-	switch f.verb {
-	case "INSERT", "REPLACE", "UPDATE", "DELETE":
-		return true
-	}
-	return false
+	return db.laneDML
 }
 
 // execPlainWrite is execArgsFull for a statement plainWriteLane admitted: the
@@ -2240,7 +2249,14 @@ func (db *DB) plainWriteLane(sqlText string) bool {
 // ATTACHed database (none), and journalDDL (not DDL).
 func (db *DB) execPlainWrite(sqlText string, args []Value) (rowsAffected int64, lastInsertID int64, err error) {
 	db.schemaSeqReserved = [2]uint64{} // see nextSchemaSeq
-	kind := db.mainReadTxnOf(sqlText)
+	// The kind is read only in WAL mode (the notes below); outside it what
+	// mainReadTxnOf does that matters is its temp-database note.
+	kind := mainReadTxnUnknown
+	if db.inWALMode() {
+		kind = db.mainReadTxnOf(sqlText)
+	} else {
+		db.r35aNoteTempDatabaseOpenGiven(sqlText, db.holdsAnyTempObject())
+	}
 	db.stmtDepth++
 	db.noteTransactionMayHaveDirtiedMain(sqlText)
 	rowsAffected, lastInsertID, err = db.tryVDBEWrite(sqlText, args)
@@ -2257,7 +2273,7 @@ func (db *DB) execPlainWrite(sqlText string, args []Value) (rowsAffected int64, 
 	// anywhere above, so running them inline is running them in order.
 	db.deferFKAutocommitApply(sqlText, true) // a RAISE(ROLLBACK) can end the transaction
 	k := mainReadTxnUnknown
-	if err == nil {
+	if err == nil && db.inWALMode() { // outside WAL mode neither note below looks at k
 		k = db.mainReadTxnAfter(sqlText, kind)
 	}
 	if k == mainReadTxnUnknown {

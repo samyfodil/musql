@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/samyfodil/musql/internal/fsio"
 )
 
 // CREATING a segment database, and changing its SCHEMA.
@@ -164,7 +166,7 @@ func (n *Session) rewriteFile() error {
 			return serr
 		}
 	}
-	if rerr := os.Rename(tmpPath, n.segPath); rerr != nil {
+	if rerr := fsio.Rename(tmpPath, n.segPath); rerr != nil { // see fsio.Rename
 		n.endCtr--
 		return rerr
 	}
