@@ -860,23 +860,38 @@ func (c *Conn) execPlainInTx(sqlText string, args []engine.Value) (driver.Result
 	if serr := c.ensureSession(); serr != nil {
 		return nil, serr
 	}
-	// The apply half runs whatever the outcome: a RAISE(ROLLBACK) closes the
-	// transaction, after which it is no longer a no-op.
-	defer c.deferFKPragmaApply(sqlText)
-	if c.tx == nil || len(c.attached) != 0 {
-		// ensureSession changed what the lane assumed: execArgs' own way.
+	if c.tx == nil || len(c.attached) != 0 || c.temp != nil {
+		// ensureSession changed what the lane assumed, or there is a TEMP
+		// database to wire on: execArgs' own way.
+		defer c.deferFKPragmaApply(sqlText)
 		if derr := c.deferFKPragmaGuard(sqlText); derr != nil {
 			return nil, derr
 		}
 		return c.execArgsBody(sqlText, args)
 	}
+	// deferFKPragmaApply is not called: it acts only on a PRAGMA
+	// (engine.DeferFKPragmaClears), and plain DML is never one.
 	if serr := c.schemaCorruptRefuses(sqlText); serr != nil {
 		return nil, serr
 	}
 	if !c.tempOpened && c.opensTempDatabase(sqlText) { // see execArgsBody
 		c.tempOpened = true
 	}
-	return c.execHeldTxn(sqlText, args)
+	// execHeldTxn with nothing to wire on, and without its read-backs: the
+	// auto_vacuum request, the journal modes, temp_store and writable_schema
+	// are set by PRAGMAs, which plain DML is not.
+	n, _, err := c.tx.ExecArgsOwned(sqlText, args)
+	c.noteConnState(c.tx)
+	if err != nil {
+		if engine.ErrorRollsBackTransaction(err) { // see execHeldTxn
+			c.abandonTxn()
+		}
+		return nil, err
+	}
+	if c.resultDiscarded {
+		return discardedResult, nil
+	}
+	return &execResult{rowsAffected: n, lastInsertID: c.lastInsertRowid}, nil
 }
 
 // execArgsBody is execArgs once the session is held and the
@@ -1140,12 +1155,20 @@ func (c *Conn) execHeldTxn(sqlText string, args []engine.Value) (driver.Result, 
 	// (withAttachedReaders): a statement route calls main-only can still
 	// READ an attachment -- an object-scoped pragma's own lookup, a view or
 	// trigger body's qualified reference -- and used to see zero rows.
-	release, aerr := c.withAttachedReaders(c.tx)
-	if aerr != nil {
-		return nil, aerr
+	var n int64
+	var err error
+	if len(c.attached) == 0 && c.temp == nil {
+		// withAttachedReaders' own no-op case, without the call and its release:
+		// a load runs one statement per row through here.
+		n, _, err = c.tx.ExecArgsOwned(sqlText, args) // args are this call's copies (driverValueToEngine)
+	} else {
+		release, aerr := c.withAttachedReaders(c.tx)
+		if aerr != nil {
+			return nil, aerr
+		}
+		n, _, err = c.tx.ExecArgsOwned(sqlText, args)
+		release()
 	}
-	n, _, err := c.tx.ExecArgsOwned(sqlText, args) // args are this call's copies (driverValueToEngine)
-	release()
 
 	// Read the counters back unconditionally, as the autocommit path does: a
 	// halted statement still publishes them. Reading only on success left
@@ -1178,7 +1201,6 @@ func (c *Conn) execHeldTxn(sqlText string, args []engine.Value) (driver.Result, 
 	// through writableSchemaPragma's setter -- see engine.WritableSchema's
 	// doc comment -- so the Conn-level mirror is read back here too.
 	c.writableSchema = c.tx.WritableSchema()
-	c.noteConnState(c.tx)
 	if c.resultDiscarded {
 		return discardedResult, nil
 	}

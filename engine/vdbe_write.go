@@ -385,7 +385,12 @@ func (db *DB) cachedWriteProgram(sqlText string) (*Program, error) {
 // failure is the statement's own error. Returns rows affected and
 // last_insert_rowid, matching ExecArgs.
 func (db *DB) tryVDBEWrite(sqlText string, args []Value) (rowsAffected, lastInsertID int64, err error) {
-	prog, cerr := db.cachedWriteProgram(strings.TrimSpace(sqlText))
+	// The trimmed text of the text trimmed last: a prepared statement brings
+	// the same string every time.
+	if sqlText != db.trimIn || sqlText == "" {
+		db.trimIn, db.trimOut = sqlText, strings.TrimSpace(sqlText)
+	}
+	prog, cerr := db.cachedWriteProgram(db.trimOut)
 	if cerr != nil {
 		// A parse/lex error, or the statement's verb is one this write path
 		// does not run at all (unsupportedStatementErr, compileWriteProgram's
@@ -611,7 +616,9 @@ func (db *DB) putWriteCtx(wc *writeCtx) {
 		// them pinned by the session.
 		j = nil
 	} else {
-		clear(j[:cap(j)])
+		// Only what this statement wrote: the journal is only ever appended
+		// to, and the last put cleared the rest of its capacity.
+		clear(j)
 		j = j[:0]
 	}
 	*wc = writeCtx{} // zeroed in place: building the literal and copying it cost as much again
