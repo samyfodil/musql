@@ -5,11 +5,6 @@ package compat
 // deferred; see tsKnownEntry.
 
 func init() {
-	tsKnownGroup("2026-10-14: CTE corners: INSERT ... RETURNING (SELECT ... FROM cte) is declined (this parser merges a leading WITH into the INSERT's SELECT, so the RETURNING scope cannot be told apart)",
-		"cte.sqltest::memory::cte-insert-returning-multi-subquery",
-		"cte.sqltest::memory::cte-insert-returning-subquery",
-		"cte.sqltest::memory::cte-insert-values-and-returning-subquery",
-	)
 	tsKnownGroup("2026-10-12: GROUP BY without FROM combined with HAVING is declined",
 		"aggregate-filter-in-subquery-grouped.sqltest::memory::having-filter-in-subquery-no-from",
 		"aggregate-filter-in-subquery-grouped.sqltest::memory::having-filter-in-subquery-no-from-match",
@@ -45,7 +40,6 @@ func init() {
 	tsKnownGroup("2026-10-12: INSERT corners: an AUTOINCREMENT-less rowid overflow picks random rowids (musql reports a unique violation), STRICT multi-statement text, and PRIMARY KEY conflict wording",
 		"insert.sqltest::memory::rowid-overflow-random-generation",
 		"insert.sqltest::memory::strict-int-vs-integer-pk",
-		"insert.sqltest::memory::strict-update-pk-constraint",
 	)
 	tsKnownGroup("2026-10-12: PRAGMA surface: max_page_count has no meaning on this format (declined by design), pragma_* table-valued functions for pragmas musql does not expose as functions, page_size / wal_checkpoint / user_version on an attached or temp database, and pragma_table_list rows",
 		"integrity_check/memory.sqltest::memory::integrity-check-qualified-empty-attached-database",
@@ -113,9 +107,6 @@ func init() {
 		"update.sqltest::memory::row-values-from-subquery-star",
 		"update.sqltest::memory::row-values-from-volatile-subquery-project-same-row",
 		"update.sqltest::memory::row-values-from-subquery-star-width-mismatch",
-		"update.sqltest::memory::update_primary_key_constraint_error",
-		"update.sqltest::memory::update_primary_key_constraint_error_2",
-		"update.sqltest::memory::update_primary_key_constraint_error_3",
 	)
 	tsKnownGroup("2026-10-12: UPSERT conflict targets that are expressions (ON CONFLICT(lower(x))) are declined",
 		"upsert-expr-index.sqltest::memory::upsert-expr-index-basic",
