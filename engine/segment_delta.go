@@ -329,6 +329,7 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 	}
 	var fi os.FileInfo
 	var err error
+	created := false
 	if !held {
 		fi, err = os.Stat(path)
 		if err == nil {
@@ -342,6 +343,7 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 		if werr := writeSegDeltaHeader(path, baseCtr, basePages); werr != nil {
 			return werr
 		}
+		created = true
 		if carry != nil {
 			carry.known = false // the file is new; derive below
 		}
@@ -490,12 +492,23 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 		if err := fsyncFile(f, sync == syncFull); err != nil {
 			return err
 		}
+		// A DELTA THIS APPEND CREATED is reachable only through its directory
+		// entry, and fsyncing the file does not make the entry durable: a power
+		// loss could drop the whole file, and with it a commit already reported.
+		// C fsyncs the directory after creating a rollback journal for the same
+		// reason (unixSync's dirsync, os_unix.c).
+		if created {
+			syncDeltaDir(segPath)
+		}
 	}
 	if carry != nil {
 		carry.offset, carry.cksum, carry.version, carry.known = end, cksum, st.version, true
 	}
 	return nil
 }
+
+// syncDeltaDir is syncDir, as a variable so a test can see the call.
+var syncDeltaDir = syncDir
 
 // segDeltaChunk is how much of a batch is encoded before it is written: the
 // commit holds this much, not the batch.
@@ -686,6 +699,13 @@ func replaySegDelta(data []byte, baseCtr, basePages uint32) (*segDeltaState, err
 			n = int64(binary.LittleEndian.Uint32(data[off:]))
 		} else {
 			n = int64(binary.LittleEndian.Uint64(data[off:]))
+		}
+		// A ZERO LENGTH ENDS THE LOG. No batch is empty (an append with no
+		// records writes nothing), so a zero prefix is never history: it is the
+		// unwritten tail of a delta whose space was written ahead of its batches.
+		// Said here rather than left to the checksum, which zeros merely fail.
+		if n == 0 {
+			break
 		}
 		end := off + w + n + segDeltaTrailerSz
 		if n < 0 || end < off || end > int64(len(data)) {
