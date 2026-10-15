@@ -81,23 +81,70 @@ func TestReturningWithCTESweep(t *testing.T) {
 	sweepAll(t, cases)
 }
 
-// TestReturningWithCTEDeclines holds the RETURNING-over-WITH shapes still
-// declined: the moment C fills a materialization another part of the statement
-// shares, other than UPDATE ... FROM's single FROM item, is not followed, nor
-// is a materialized CTE read per row beside a live table.
-func TestReturningWithCTEDeclines(t *testing.T) {
-	for i, q := range []string{
+// TestReturningWithCTEMaterialized: the RETURNING-over-WITH shapes whose CTE
+// is materialized somewhere else in the statement -- a co-routine at a later
+// FROM item of the subquery (fromClauseTermCanBeCoroutine's (1c)), a
+// materialization the WHERE fills while it is scanned before the first change
+// (a RETURNING keeps the statement off the one-pass path), one UPDATE ...
+// FROM's pass one fills with its WHERE terms pushed down, a LIMIT body that
+// flattens nowhere -- and an INSERT whose SELECT brings a WITH of its own
+// beside the statement's.
+func TestReturningWithCTEMaterialized(t *testing.T) {
+	var cases [][]string
+	for _, q := range []string{
 		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) UPDATE t SET v = 8 RETURNING id, (SELECT x.tot FROM s, c AS x WHERE x.id = s.id AND s.id = t.id)",
+		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) UPDATE t SET v = 8 RETURNING id, (SELECT x.tot FROM s JOIN c AS x ON x.id = s.id WHERE s.id = t.id)",
+		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) DELETE FROM t WHERE id < 3 RETURNING id, (SELECT x.tot FROM s, c AS x WHERE x.id = s.id AND s.id = t.id)",
 		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) DELETE FROM t WHERE id IN (SELECT id FROM c) RETURNING id, (SELECT tot FROM c WHERE c.id = t.id)",
+		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) DELETE FROM t WHERE id > 0 AND id IN (SELECT id FROM c) RETURNING id, (SELECT max(tot) FROM c)",
+		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) UPDATE t SET v = 4 WHERE id IN (SELECT id FROM c) RETURNING id, (SELECT tot FROM c WHERE c.id = t.id)",
+		"WITH c(id, tot) AS (SELECT id, bump FROM s) DELETE FROM t WHERE id IN (SELECT id FROM c) RETURNING id, (SELECT tot FROM c WHERE c.id = t.id)",
 		"WITH c(x) AS (SELECT count(*) FROM t) INSERT INTO t VALUES((SELECT x FROM c), 0), (6, 0) RETURNING id, (SELECT x FROM c)",
 		"INSERT INTO t WITH c(x) AS (SELECT 1) SELECT 9, 9 RETURNING (SELECT x FROM c)",
-		// Whether pass one flattens a CTE with a LIMIT is not decided.
 		"WITH c(id, tot) AS (SELECT id, bump FROM s LIMIT 5) UPDATE t SET v = 1 FROM c WHERE c.id = t.id RETURNING id, (SELECT tot FROM c WHERE c.id = t.id)",
-		// Pass one pushed "c.id = 1" into the materialization RETURNING shares.
 		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) UPDATE t SET v = c.tot FROM c WHERE t.id > 0 AND c.id = 1 RETURNING id, v, (SELECT tot FROM c WHERE c.id = t.id)",
+		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) UPDATE t SET v = c.tot FROM c WHERE t.id = c.id AND c.id >= 2 RETURNING id, v, (SELECT tot FROM c WHERE c.id = t.id)",
+		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) UPDATE t SET v = c.tot FROM c WHERE c.id = 2 AND t.id = c.id RETURNING id, v, (SELECT count(*) FROM c)",
+		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) UPDATE t SET v = c.tot FROM c WHERE t.id = c.id AND tot > 1 RETURNING id, v, (SELECT max(tot) FROM c)",
+		// Subqueries of the WHERE that do, or do not, leave a materialization.
+		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) DELETE FROM t WHERE EXISTS (SELECT 1 FROM c WHERE c.id = t.id) RETURNING id, (SELECT tot FROM c WHERE c.id = t.id)",
+		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) DELETE FROM t WHERE (SELECT tot FROM c WHERE c.id = t.id) > 0 RETURNING id, (SELECT tot FROM c WHERE c.id = t.id)",
+		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) DELETE FROM t WHERE id IN (SELECT id FROM c WHERE c.id = t.id) RETURNING id, (SELECT tot FROM c WHERE c.id = t.id)",
+		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) DELETE FROM t WHERE EXISTS (SELECT 1 FROM c WHERE c.id = 2) RETURNING id, (SELECT tot FROM c WHERE c.id = t.id)",
+		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) UPDATE t SET v = 1 WHERE EXISTS (SELECT 1 FROM c WHERE c.id = t.id) RETURNING id, (SELECT tot FROM c WHERE c.id = t.id)",
+		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) UPDATE t SET v = 4 WHERE id = 1 OR id IN (SELECT id FROM c) RETURNING id, (SELECT tot FROM c WHERE c.id = t.id)",
+		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) UPDATE t SET v = 4 WHERE id < 10 OR id IN (SELECT id FROM c) RETURNING id, (SELECT tot FROM c WHERE c.id = t.id)",
+		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) UPDATE t SET v = 4 WHERE id > 1 OR id IN (SELECT id FROM c) RETURNING id, (SELECT tot FROM c WHERE c.id = t.id)",
+		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) UPDATE t SET v = 4 WHERE id IN (SELECT id FROM c) OR id = 1 RETURNING id, (SELECT tot FROM c WHERE c.id = t.id)",
+		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) DELETE FROM t WHERE (SELECT max(tot) FROM c) > 0 RETURNING id, (SELECT tot FROM c WHERE c.id = t.id)",
+		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) UPDATE t SET v = 1 WHERE (SELECT count(*) FROM c) = 3 AND id IN (SELECT id FROM c) RETURNING id, (SELECT tot FROM c WHERE c.id = t.id)",
+		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) UPDATE t SET v = 1 WHERE NOT EXISTS (SELECT 1 FROM c WHERE c.id = t.id + 5) RETURNING id, (SELECT max(tot) FROM c)",
+		"WITH c(id, tot) AS (SELECT id, bump FROM s) DELETE FROM t WHERE EXISTS (SELECT 1 FROM c WHERE c.id = t.id) RETURNING id, (SELECT tot FROM c WHERE c.id = t.id)",
+		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) DELETE FROM t WHERE id NOT IN (SELECT id + 10 FROM c) RETURNING id, (SELECT tot FROM c WHERE c.id = t.id)",
+		"WITH c(id, tot) AS MATERIALIZED (SELECT id, bump FROM s) DELETE FROM t WHERE EXISTS (SELECT 1 FROM c WHERE c.id = t.id) RETURNING id, (SELECT tot FROM c WHERE c.id = t.id)",
+		"WITH c(id, tot) AS (SELECT id, sum(bump) FROM s GROUP BY id) DELETE FROM t WHERE id IN (SELECT id FROM c WHERE tot > 0) AND EXISTS (SELECT 1 FROM c WHERE c.id = t.id) RETURNING id, (SELECT tot FROM c WHERE c.id = t.id)",
+		// An INSERT's SELECT reading the CTE once (a co-routine), or more.
+		"WITH c(x) AS (SELECT count(*) FROM t) INSERT INTO t WITH d(y) AS (SELECT x FROM c) SELECT 13 + y, y FROM d RETURNING id, (SELECT x FROM c)",
+		"WITH c(x) AS (SELECT count(*) FROM t) INSERT INTO t SELECT 13 + x, x FROM c RETURNING id, (SELECT x FROM c)",
+		"WITH c(x) AS (SELECT count(*) FROM t) INSERT INTO t WITH d(y) AS (SELECT x FROM c UNION ALL SELECT x + 10 FROM c) SELECT 13 + y, y FROM d RETURNING id, (SELECT x FROM c)",
+		"WITH c(x) AS (SELECT count(*) FROM t) INSERT INTO t SELECT 13 + x, x FROM s, c WHERE s.id = 1 RETURNING id, (SELECT x FROM c)",
+		"WITH c(x) AS (SELECT count(*) FROM t) INSERT INTO t SELECT 13 + x, x FROM c, s WHERE s.id = 1 RETURNING id, (SELECT x FROM c)",
+		"WITH c(x) AS (SELECT count(*) FROM t) INSERT INTO t SELECT 13 + a.x, b.x FROM c AS a, c AS b RETURNING id, (SELECT x FROM c)",
+		"WITH c(x) AS MATERIALIZED (SELECT count(*) FROM t) INSERT INTO t SELECT 13 + x, x FROM c RETURNING id, (SELECT x FROM c)",
+		"WITH c(x) AS (SELECT id FROM t) INSERT INTO t SELECT x + 20, x FROM c RETURNING id, (SELECT count(*) FROM c)",
+		"WITH c(x) AS (SELECT DISTINCT id FROM t) INSERT INTO t SELECT x + 20, x FROM c WHERE x IN (SELECT x FROM c) RETURNING id, (SELECT count(*) FROM c)",
+		"WITH c(x) AS (SELECT count(*) FROM t) INSERT INTO t SELECT 13 + x, x FROM c WHERE x IN (SELECT x FROM c) RETURNING id, (SELECT x FROM c)",
+		"WITH c(x) AS (SELECT count(*) FROM t) INSERT INTO t SELECT 40 + id, x FROM s, c RETURNING id, (SELECT x FROM c)",
+		// A SELECT's own WITH beside the statement's.
+		"WITH c(x) AS (SELECT 5) INSERT INTO t WITH d(y) AS (SELECT 2) SELECT 11, y FROM d RETURNING (SELECT x FROM c)",
+		"WITH c(x) AS (SELECT 5) INSERT INTO t WITH c(x) AS (SELECT 2) SELECT 12, x FROM c RETURNING (SELECT x FROM c)",
+		"WITH c(x) AS (SELECT count(*) FROM t) INSERT INTO t WITH d(y) AS (SELECT 1 UNION ALL SELECT 2) SELECT 30 + y, y FROM d RETURNING id, (SELECT x FROM c)",
+		"WITH c(x) AS (SELECT 7) INSERT INTO t WITH d(y) AS (SELECT 3) SELECT 40, y FROM d ORDER BY 1 LIMIT 1 RETURNING *",
+		"WITH c(x) AS (SELECT 7) INSERT INTO t(id, v) WITH d(y) AS (SELECT x + 1 FROM c) SELECT 50, y FROM d RETURNING id, v",
 	} {
-		differAllowingDeclines(t, fmt.Sprintf("decline-%d", i), append(append([]string(nil), returningWithPre...), q))
+		cases = append(cases, append(append([]string(nil), returningWithPre...), q, "SELECT * FROM t ORDER BY id", "SELECT * FROM s ORDER BY id"))
 	}
+	sweepAll(t, cases)
 }
 
 // TestNthValueReaderReachSweep: a window select read through a FROM clause
@@ -143,19 +190,59 @@ func TestNthValueReaderReachSweep(t *testing.T) {
 	sweepAll(t, cases)
 }
 
-// TestNthValueReaderReachDeclines: readers whose row count is not fixed by
-// their text -- a WHERE, a join, a CTE -- still take every row.
-func TestNthValueReaderReachDeclines(t *testing.T) {
+// TestNthValueReaderReachTail: readers whose row count is not fixed by their
+// text -- a WHERE, a DISTINCT, a join, a CTE -- stop where C's reader of the
+// co-routine stops, and meet an invalid nth_value N only on the row that
+// carries it (windowPlan.tail).
+func TestNthValueReaderReachTail(t *testing.T) {
 	pre := []string{"CREATE TABLE w(id INTEGER PRIMARY KEY, v TEXT, n, g)",
 		"INSERT INTO w VALUES(1,'first',1,'a'),(2,'second',2,'b'),(3,'doom',0,'a'),(4,'x','2','b')"}
-	for i, q := range []string{
+	var cases [][]string
+	for _, q := range []string{
 		"SELECT id FROM (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) WHERE id < 3 LIMIT 2",
 		"SELECT x.id FROM w AS x, (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) AS y WHERE x.id = y.id LIMIT 1",
 		"SELECT DISTINCT id FROM (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) LIMIT 2",
 		"WITH c AS (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) SELECT id FROM c LIMIT 2",
+		"SELECT id FROM (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) WHERE id > 3 LIMIT 2",
+		"SELECT id FROM (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) WHERE id <> 2 LIMIT 2",
+		"SELECT x.id FROM (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) AS y, w AS x WHERE x.id = y.id LIMIT 1",
+		"SELECT x.id FROM w AS x, (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) AS y WHERE x.id = y.id LIMIT 3",
+		"SELECT x.id FROM w AS x, (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) AS y WHERE x.id = y.id + 1 LIMIT 1",
+		"SELECT x.id, y.id FROM w AS x, (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) AS y LIMIT 2",
+		"SELECT y.id FROM w AS x, (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) AS y WHERE x.v = 'second' AND x.id = y.id LIMIT 1",
+		"SELECT count(*) FROM (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) WHERE id < 3",
+		"SELECT id FROM (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) WHERE id < 3 ORDER BY id LIMIT 2",
+		"SELECT id FROM (SELECT id, nth_value(v, n) OVER (PARTITION BY g ORDER BY id) AS nv FROM w) WHERE g = 'b' LIMIT 2",
+		"SELECT id FROM (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) WHERE 0",
+		"SELECT id FROM (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) WHERE id < 3 LIMIT 0",
+		"SELECT id FROM (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) WHERE id < 3 LIMIT 1 OFFSET 1",
+		"SELECT id FROM (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) WHERE id < 3 LIMIT 2 OFFSET 1",
+		"SELECT id FROM (SELECT id, nth_value(v, n) OVER (ORDER BY id DESC) AS nv FROM w) WHERE id > 2 LIMIT 2",
+		"SELECT nv FROM (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) WHERE id < 3 LIMIT 2",
+		"WITH c AS (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) SELECT id FROM c WHERE id < 3 LIMIT 2",
+		"WITH c AS (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) SELECT id FROM c WHERE id < 3 AND EXISTS (SELECT 1 FROM c) LIMIT 2",
+		"WITH c AS MATERIALIZED (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) SELECT id FROM c WHERE id < 3 LIMIT 2",
+		"SELECT DISTINCT n FROM (SELECT id, n, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) LIMIT 2",
+		"SELECT DISTINCT n FROM (SELECT id, n, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) WHERE id <> 1 LIMIT 2",
+		"SELECT id FROM (SELECT id, nth_value(v, n) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS nv FROM w) WHERE id < 3 LIMIT 2",
+		"SELECT id FROM (SELECT DISTINCT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) WHERE id < 3 LIMIT 2",
+		"SELECT id FROM (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w LIMIT 3) WHERE id < 3 LIMIT 2",
+		"SELECT id FROM (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w ORDER BY id DESC) WHERE id < 3 LIMIT 2",
+		"SELECT (SELECT id FROM (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) WHERE id < 3 LIMIT 1)",
+		"SELECT id FROM (SELECT id, nth_value(v, n) OVER (ORDER BY id) AS nv FROM w) WHERE id IN (1, 2) LIMIT 2",
+		// A WHERE term over the PARTITION BY column, pushed into the window
+		// select (pushDownWhereTerms (6c)).
+		"SELECT id FROM (SELECT id, g, nth_value(v, n) OVER (PARTITION BY g ORDER BY id) AS nv FROM w) WHERE g = 'b' LIMIT 2",
+		"SELECT id, nv FROM (SELECT id, g, nth_value(v, n) OVER (PARTITION BY g ORDER BY id) AS nv FROM w) WHERE g = 'b'",
+		"SELECT id FROM (SELECT id, g, nth_value(v, n) OVER (PARTITION BY g ORDER BY id) AS nv FROM w) WHERE g <> 'a' AND id > 0",
+		"SELECT id FROM (SELECT id, g AS k, nth_value(v, n) OVER (PARTITION BY g) AS nv FROM w) WHERE k = 'b'",
+		"SELECT id FROM (SELECT id, g, nth_value(v, n) OVER (PARTITION BY g ORDER BY id), nth_value(v, 1) OVER (ORDER BY id) FROM w) WHERE g = 'b'",
+		"SELECT id FROM (SELECT id, g, nth_value(v, n) OVER (PARTITION BY g ORDER BY id) AS nv FROM w) WHERE g = 'b' OR id = 2",
+		"SELECT id FROM (SELECT id, g, nth_value(v, n) OVER (PARTITION BY g ORDER BY id) AS nv FROM w) AS q WHERE q.g = 'b' LIMIT 1",
 	} {
-		differAllowingDeclines(t, fmt.Sprintf("decline-%d", i), append(append([]string(nil), pre...), q))
+		cases = append(cases, append(append([]string(nil), pre...), q))
 	}
+	sweepAll(t, cases)
 }
 
 // TestRenameColumnStarCollisionSweep: an ORDER BY term beside a bare "*"

@@ -13,6 +13,7 @@ package engine
 
 import (
 	"cmp"
+	"errors"
 	"fmt"
 	"slices"
 )
@@ -375,8 +376,25 @@ func openDerivedCursor(tbl *resolvedTable, rows [][]Value, keep []bool) *vdbeCur
 	// this clearing lives here and not in openMaterializedCursor.
 	for _, row := range rows {
 		clearDerivedSubtypes(row, keep)
+		derivedRealAffinity(row, tbl)
 	}
 	return openMaterializedCursor(tbl, rows, nil)
+}
+
+// derivedRealAffinity applies a derived row source's REAL column affinity to
+// row: a subquery's table is read like any other, and sqlite3ColumnDefault
+// follows OP_Column on a REAL column with OP_RealAffinity, so an integer that
+// came back out of a sorter or a record as one -- a MEM_IntReal value written
+// as an integer (recordValue) -- reads as the REAL it was.
+func derivedRealAffinity(row []Value, tbl *resolvedTable) {
+	if tbl == nil {
+		return
+	}
+	for i := range row {
+		if i < len(tbl.cols) && tbl.cols[i].Aff == affReal && !tbl.cols[i].noRealRead && row[i].Typ == Int {
+			row[i] = Value{Typ: Float, F: float64(row[i].I), Subtype: row[i].Subtype}
+		}
+	}
 }
 
 // clearDerivedSubtypes clears the subtype of every column of row that keep
@@ -469,12 +487,21 @@ func (cur *vdbeCursor) rewind() error {
 			cur.fill = nil
 		}
 		rows, rowids, err := fill()
+		var tail error
+		var te *windowTailErr
+		if errors.As(err, &te) {
+			// The rows the reader meets before the window select's error,
+			// which it meets on asking for the next (windowTailErr).
+			rows, rowids, tail, err = te.rows, nil, te.err, nil
+		}
 		if err != nil {
 			return err
 		}
+		cur.streamErrPending = tail
 		if cur.clearSubtypes {
 			for _, row := range rows {
 				clearDerivedSubtypes(row, cur.fillKeep)
+				derivedRealAffinity(row, cur.tbl)
 			}
 		}
 		m := openMaterializedCursor(cur.tbl, rows, rowids)

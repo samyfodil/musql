@@ -736,6 +736,7 @@ func (db *DB) DropTempObjects() bool {
 		}
 	}
 	db.triggers = triggers
+	db.tempTrigHash = tempTrigHash{}
 	vtabs := db.vtabs[:0]
 	for _, vt := range db.vtabs {
 		if !vt.isTemp {

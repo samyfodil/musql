@@ -1193,6 +1193,20 @@ func nameValuesColumnsPreResolve(sel *SelectStmt) {
 		if c.valuesIdent != "" && c.Alias == "column"+strconv.Itoa(i+1) {
 			c.Alias = c.valuesIdent
 		}
+		// Any other unaliased item that is an identifier, or a dotted name,
+		// is named after its last token as written, whatever it then resolves
+		// to: "SELECT * FROM (SELECT ABC FROM t)" over t(abc) has a column
+		// "ABC", and over a t with no such column, "SELECT * FROM (SELECT
+		// \"xyz\" FROM t)" one named xyz. The name only (cName), never what a
+		// name resolves to.
+		if !c.Star && !c.HasAlias && c.cName == "" && sel.ValuesArms == 0 {
+			// Only COLLATE is peeled: likely() is still a TK_FUNCTION before
+			// resolution marks it.
+			inner, _ := skipCollateOnly(c.Expr)
+			if ce, ok := inner.(ColumnExpr); ok && ce.Name != "" {
+				c.cName = ce.Name
+			}
+		}
 	}
 }
 
@@ -4861,6 +4875,10 @@ type columnInfo struct {
 	Name     string
 	DeclType string
 	Aff      affinity
+	// noRealRead marks a derived column whose affinity is not REAL to C
+	// though Aff says so (a compound's SQLITE_AFF_FLEXNUM), or not known to
+	// be: reading it applies no OP_RealAffinity (derivedRealAffinity).
+	noRealRead bool
 	// Hidden marks a virtual-table HIDDEN column (vtab.go): one that is a real,
 	// name-resolvable column (usable in WHERE and in an explicit select-list
 	// reference, and carried in every materialized row) but omitted from a

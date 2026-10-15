@@ -920,6 +920,8 @@ func (db *DB) wsRollbackReloadWouldSucceed() bool {
 // Not removeTableAndIndexes: that bumps the schema cookie, which a reload does
 // not.
 func (db *DB) wsReloadVanishObject(name string) {
+	// A reload of the schema this does not follow for the temp trigger hash.
+	db.tempTrigHash.unknown = true
 	for i, t := range db.tables {
 		if equalFoldName(t.name, name) {
 			db.tables = append(db.tables[:i], db.tables[i+1:]...)

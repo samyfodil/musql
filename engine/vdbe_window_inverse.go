@@ -15,8 +15,10 @@ package engine
 // row.
 
 import (
+	"bytes"
 	"fmt"
 	"math"
+	"strconv"
 )
 
 // inverse is sumInverse / countInverse (func.c:1962, 2084): take one row back
@@ -213,4 +215,93 @@ func windowIncrementalEligible(call windowCall, tmpl *aggItem, spans []windowFra
 func windowStepsBeforeInverses(fr *WindowFrame) bool {
 	return fr.Mode == FrameRange &&
 		((fr.Start.Type == FramePreceding && fr.End.Type == FramePreceding) || fr.Start.Type == FrameFollowing)
+}
+
+// windowRunningEligible reports whether windowAggregate can keep one running
+// accumulator for the partition: a frame fixed at the partition's first row
+// whose end only moves forward, no EXCLUDE clause, and an aggregate whose value
+// can be read without ending it (aggItem.finalize leaves count, sum, total,
+// avg, min and max as they were), with nothing about the row order in doubt.
+// It steps the rows in the order the per-row rescan does, so the values are
+// the rescan's.
+func windowRunningEligible(call windowCall, tmpl *aggItem, spans []windowFrameSpan) bool {
+	fr := call.spec.Frame
+	if fr != nil && fr.Exclude {
+		return false
+	}
+	switch tmpl.kind {
+	case aggSum, aggTotal, aggAvg, aggCount, aggCountStar, aggMin, aggMax:
+	default:
+		return false
+	}
+	if tmpl.distinct || tmpl.orderBy != nil || tmpl.orderStrict || tmpl.minMaxLastWins {
+		return false
+	}
+	for k, sp := range spans {
+		if sp.lo != 0 || sp.hi > len(spans) || (k > 0 && sp.hi < spans[k-1].hi) {
+			return false
+		}
+	}
+	return true
+}
+
+// windowPartitionKey spells k, a PARTITION BY key, as a string two keys share
+// exactly when keysEqualCollated holds for them under colls: a numeric value
+// by its exact number (an integral REAL is its integer, as compareIntFloat
+// has it), a text by its bytes under NOCASE's ASCII fold or RTRIM's trailing
+// spaces, a blob by its bytes. ok is false where that equality is not a plain
+// byte equality: a UTF-16 database's comparison, or a NOCASE text holding a
+// NUL (sqlite3StrNICmp stops there).
+func windowPartitionKey(k []Value, colls []string, enc TextEncoding) (string, bool) {
+	if isUTF16(enc) {
+		return "", false
+	}
+	var b []byte
+	for i, v := range k {
+		switch v.Typ {
+		case Null:
+			b = append(b, 'N')
+		case Int:
+			b = append(b, 'I')
+			b = strconv.AppendInt(b, v.I, 10)
+		case Float:
+			f := v.F
+			if f == math.Trunc(f) && f >= -9223372036854775808 && f < 9223372036854775808 {
+				b = append(b, 'I')
+				b = strconv.AppendInt(b, int64(f), 10)
+			} else {
+				b = append(b, 'F')
+				b = strconv.AppendUint(b, math.Float64bits(f), 16)
+			}
+		case Text:
+			s := v.S
+			coll := atOrEmpty(colls, i)
+			switch {
+			case asciiEqualFold(coll, "NOCASE"):
+				if bytes.IndexByte(s, 0) >= 0 {
+					return "", false
+				}
+				folded := make([]byte, len(s))
+				for j, c := range s {
+					folded[j] = asciiLowerByte(c)
+				}
+				s = folded
+			case asciiEqualFold(coll, "RTRIM"):
+				s = rtrimTrailingSpaces(s)
+			}
+			b = append(b, 'T')
+			b = strconv.AppendInt(b, int64(len(s)), 10)
+			b = append(b, ':')
+			b = append(b, s...)
+		case Blob:
+			b = append(b, 'B')
+			b = strconv.AppendInt(b, int64(len(v.S)), 10)
+			b = append(b, ':')
+			b = append(b, v.S...)
+		default:
+			return "", false
+		}
+		b = append(b, ';')
+	}
+	return string(b), true
 }

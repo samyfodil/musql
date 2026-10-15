@@ -341,6 +341,8 @@ func (db *DB) removeView(v *viewMeta) {
 		// never cascade into this one's DROP.
 		if tr.tableAttachName != "" || !equalFoldName(tr.table, v.name) || tr.tableIsTemp != v.isTemp {
 			keptTr = append(keptTr, tr)
+		} else if tr.isTemp {
+			db.tempTrigHash.remove(tr.name)
 		}
 	}
 	db.triggers = keptTr

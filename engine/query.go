@@ -1231,6 +1231,7 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 	}
 	stmt = p.nullUnusedSubqueryColumns(stmt)
 	stmt = nthValueReachOwn(stmt)
+	stmt = p.nthValueTail(stmt)
 	// count(*) over a UNION ALL is the sum of its arms' counts (count_union_all.go).
 	if outer == nil {
 		if f := p.countUnionAll(stmt); f != nil {

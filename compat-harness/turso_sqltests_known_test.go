@@ -15,12 +15,25 @@ type tsKnownEntry struct {
 	pattern string
 	reason  string
 	hits    atomic.Int64
+	// cBug marks C SQLite 3.53.3 as the one that is wrong (tsKnownCBug):
+	// musql's answer, which must be Turso's recorded one, is not a
+	// divergence.
+	cBug bool
 }
 
 // tsKnownDivergences is the list, filled by turso_sqltests_known_data_test.go.
 // Every wrong answer on it is here on purpose: the fix is larger than this
 // change, or C SQLite itself is the odd one out.
 var tsKnownDivergences = []*tsKnownEntry{}
+
+// tsKnownCBug registers patterns where C SQLite answers wrong and musql
+// answers right: a test matching one passes only while musql satisfies
+// Turso's expect block, and is counted as "c-bug", not as a divergence.
+func tsKnownCBug(reason string, patterns ...string) {
+	for _, p := range patterns {
+		tsKnownDivergences = append(tsKnownDivergences, &tsKnownEntry{pattern: p, reason: reason, cBug: true})
+	}
+}
 
 // tsKnownGroup registers patterns that share one dated reason.
 func tsKnownGroup(reason string, patterns ...string) {

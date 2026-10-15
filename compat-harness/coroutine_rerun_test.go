@@ -241,28 +241,72 @@ func TestCoroutineRerunJoinShapes(t *testing.T) {
 	}
 }
 
-// TestCoroutineRerunDeclines holds the shapes this engine still declines
-// rather than answers, each for a C behaviour not followed here (see the
-// comment on each). A decline is allowed; any answer must be C's.
-func TestCoroutineRerunDeclines(t *testing.T) {
-	pre := append([]string(nil), coroutineRerunPre...)
+// TestCoroutineRerunFlattenShapes are the volatile bodies C flattens into a
+// parent that once declined: substExpr's copy compared under its own implicit
+// collating sequence (BINARY, or the NULL row's TK_IF_NULL_ROW beside a LEFT
+// JOIN) and as an IN operand, a table-valued function beside the flattened
+// body or reading a column of another item, a subquery of the parent naming
+// the derived table (substSelect), and a DISTINCT aggregate beside another
+// aggregate over plain tables, which hands the planner no distinct flags.
+// n declares NOCASE, so the copy's BINARY decides where a bare expression
+// would take n's sequence.
+func TestCoroutineRerunFlattenShapes(t *testing.T) {
+	pre := append(append([]string(nil), coroutineRerunPre...),
+		"CREATE TABLE n(s TEXT COLLATE NOCASE)", "INSERT INTO n VALUES('A'),('b')",
+		"CREATE TABLE xd(a)", "INSERT INTO xd VALUES(3),(1),(2)",
+		"CREATE TABLE ix(a, c)", "CREATE INDEX ixa ON ix(a)", "INSERT INTO ix VALUES(3,1),(1,2),(2,3)",
+	)
 	for i, q := range []string{
-		// The NULL row's copy of an expression column, compared: the copy's
-		// own collation and affinity (substExpr) are not spelled here.
+		// The NULL row's copy, compared.
 		"SELECT count(*) FROM x LEFT JOIN (SELECT random() AS r, b FROM y) t ON t.b = x.a WHERE r = r",
-		// The flattener does not take a parent beside a table-valued function.
-		"SELECT count(DISTINCT r) FROM x, json_each('[1,2]') j, (SELECT random() AS r FROM y) AS t",
-		// A table-valued function argument naming a column: its "hidden =
-		// argument" term is a column equality whose commuted copy is not followed.
-		"SELECT count(DISTINCT r) FROM x, json_each(x.a) j, (SELECT random() AS r FROM (SELECT 1) GROUP BY 1) AS t",
-		// A subquery naming the derived table: substSelect's reach into it.
-		"SELECT count(DISTINCT r) FROM x, (SELECT random() AS r FROM y) t WHERE (SELECT count(*) FROM y WHERE b < t.r) >= 0",
-		// An expression column as an IN operand: the copy's collation.
+		"SELECT count(*) FROM x LEFT JOIN (SELECT random() AS r, b FROM y) t ON t.b = x.a WHERE r IS NULL OR r <> 5",
+		"SELECT count(*) FROM x LEFT JOIN (SELECT random() AS r, b FROM y) t ON t.b = x.a WHERE r IN (1,2) OR r IS NULL",
+		"SELECT count(*) FROM x LEFT JOIN (SELECT random() AS r, b FROM y) t ON t.b = x.a WHERE (r, 1) = (r, 1)",
+		"SELECT count(*) FROM x LEFT JOIN (SELECT random() AS r, CAST(b AS TEXT) AS k, b FROM y) t ON t.b = x.a WHERE k = 1",
+		"SELECT count(*) FROM x LEFT JOIN (SELECT random() AS r, CAST(b AS TEXT) AS k, b FROM y) t ON t.b = x.a WHERE CAST(k AS INT) = 1",
+		"SELECT count(*) FROM n LEFT JOIN (SELECT random() AS r, 'a' || b AS k, b FROM y) t ON t.b = 1 WHERE k = s",
+		"SELECT a, h IS NULL FROM x LEFT JOIN (SELECT 'A' || random() AS h, b FROM y) t ON t.b = x.a WHERE h BETWEEN 'a' AND 'z' OR h IS NULL ORDER BY a",
+		// The copy as an operand of IN, BETWEEN, CASE and under CAST.
 		"SELECT count(DISTINCT r) FROM x, (SELECT random() AS r FROM y) t WHERE r NOT IN (SELECT b FROM y)",
-		// A DISTINCT aggregate beside group_concat over plain tables: the
-		// ported planner does not take the join (WHERE_WANT_DISTINCT).
+		"SELECT count(*) FROM n, (SELECT hex(randomblob(1)) || 'a' AS h, 'B' AS k FROM y) WHERE k IN (SELECT s FROM n)",
+		"SELECT count(*) FROM n, (SELECT random() AS r, 'B' AS k FROM y) WHERE k IN (SELECT s COLLATE BINARY FROM n)",
+		"SELECT count(*) FROM n, (SELECT random() AS r, 'B' AS k FROM y) WHERE k BETWEEN s AND 'c'",
+		"SELECT count(*) FROM n, (SELECT random() AS r, 'B' AS k FROM y) WHERE k BETWEEN s AND 'c' COLLATE BINARY",
+		"SELECT count(*) FROM n, (SELECT random() AS r, 'B' AS k FROM y) WHERE CASE k WHEN s THEN 1 END",
+		"SELECT count(*) FROM n, (SELECT random() AS r, 'B' AS k FROM y) WHERE CAST(k AS TEXT) = s",
+		"SELECT count(*) FROM n, (SELECT random() AS r, 'B' AS k FROM y) WHERE s = k",
+		// A table-valued function beside the flattened body.
+		"SELECT count(DISTINCT r) FROM x, json_each('[1,2]') j, (SELECT random() AS r FROM y) AS t",
+		"SELECT count(DISTINCT r), count(*) FROM json_each('[1,2]') j, (SELECT random() AS r, b FROM y) AS t WHERE j.value = t.b",
+		"SELECT count(DISTINCT r) FROM x, (SELECT random() AS r, b FROM y) AS t, json_each('[1,2,3]') j WHERE j.value > t.b",
+		"SELECT count(*) FROM (SELECT random() AS r, b FROM y) AS t, json_each(json_array(t.b, 5)) j",
+		"SELECT b, value FROM (SELECT random() AS r, b FROM y) AS t, json_each(json_array(t.b, 5)) j ORDER BY 1, 2",
+		"SELECT key, value FROM (SELECT random() AS r, b FROM y) AS t, json_each(json_array(t.b, 5)) j WHERE key = 0 ORDER BY 1, 2",
+		`SELECT count(DISTINCT r) FROM json_tree('{"a":[1,2]}') j, (SELECT random() AS r FROM y) AS t`,
+		// A table-valued function reading another item's column.
+		"SELECT count(DISTINCT r) FROM x, json_each(x.a) j, (SELECT random() AS r FROM (SELECT 1) GROUP BY 1) AS t",
+		"SELECT count(DISTINCT r) FROM x, json_each(json_array(x.a, x.a)) j, (SELECT random() AS r FROM (SELECT 1) GROUP BY 1) AS t",
+		"SELECT count(DISTINCT r) FROM x, y, json_each(json_array(x.a, y.b)) j, (SELECT random() AS r FROM (SELECT 1) GROUP BY 1) AS t",
+		"SELECT count(DISTINCT r), group_concat(a) FROM x, json_each(x.a) j, (SELECT random() AS r FROM (SELECT 1) GROUP BY 1) AS t",
+		"SELECT count(DISTINCT r) FROM (SELECT random() AS r FROM (SELECT 1) GROUP BY 1) AS t, x, json_each(x.a) j",
+		"SELECT count(DISTINCT r) FROM x, json_each(x.a) j, (SELECT random() AS r, b FROM y GROUP BY b) AS t WHERE t.b = j.value",
+		// A subquery of the parent naming the derived table.
+		"SELECT count(DISTINCT r) FROM x, (SELECT random() AS r FROM y) t WHERE (SELECT count(*) FROM y WHERE b < t.r) >= 0",
+		"SELECT count(DISTINCT r) FROM x, (SELECT random() AS r, b FROM y) t WHERE (SELECT count(*) FROM y WHERE y.b = t.b) = 1",
+		"SELECT count(DISTINCT r) FROM x, (SELECT random() AS r, b FROM y) t WHERE EXISTS (SELECT 1 FROM y AS q WHERE q.b = b)",
+		"SELECT a, (SELECT b FROM y WHERE b = t.k) FROM x, (SELECT random() AS r, b AS k FROM y) t ORDER BY 1, 2",
+		"SELECT count(*) FROM x, (SELECT random() AS r, b FROM y) t WHERE (SELECT count(*) FROM y WHERE b < t.r) >= 0 AND a IN (SELECT t.b)",
+		"SELECT count(*) FROM n, (SELECT random() AS r, 'B' AS k FROM y) t WHERE EXISTS (SELECT 1 FROM n AS m WHERE t.k = m.s)",
+		"SELECT count(*) FROM n, (SELECT random() AS r, 'B' AS k FROM y) t WHERE EXISTS (SELECT 1 FROM n AS m WHERE m.s = t.k)",
+		// A DISTINCT aggregate beside another aggregate, over plain tables.
 		"SELECT a, count(DISTINCT b), group_concat(b) FROM x, y GROUP BY a",
+		"SELECT a, count(DISTINCT b), group_concat(b) FROM xd, y GROUP BY a",
+		"SELECT b, count(DISTINCT a), group_concat(a) FROM xd, y GROUP BY b",
+		"SELECT a, count(DISTINCT b), group_concat(b) FROM ix, y GROUP BY a",
+		"SELECT c, count(DISTINCT b), group_concat(b, '|') FROM ix, y WHERE b < 3 GROUP BY c ORDER BY c DESC",
+		"SELECT a, sum(DISTINCT b), group_concat(b) FROM xd JOIN y ON a >= b GROUP BY a",
+		"SELECT a, count(DISTINCT b), count(DISTINCT b) FROM xd, y GROUP BY a",
 	} {
-		differAllowingDeclines(t, fmt.Sprintf("decline-%d", i), append(append([]string(nil), pre...), q))
+		differ(t, fmt.Sprintf("flatten-%d", i), append(append([]string(nil), pre...), q))
 	}
 }

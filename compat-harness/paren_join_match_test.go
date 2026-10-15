@@ -41,11 +41,23 @@ func TestParenJoinLeadingMatch(t *testing.T) {
 		differ(t, fmt.Sprintf("leading-%d", i), append(append([]string(nil), pre...), s))
 	}
 	// A group that does not lead, or is aliased, is an SF_NestedFrom subquery
-	// in C; the MATCH inside it is still refused here.
+	// in C: flattened into an inner join, its MATCH an ordinary fts
+	// constraint again; the right operand of an outer join, a subquery of
+	// its own.
 	for i, s := range []string{
 		"SELECT * FROM r JOIN (q LEFT JOIN t10 ON t10 MATCH q.term) ON 1",
 		"SELECT * FROM (q LEFT JOIN t10 ON t10 MATCH q.term) AS g",
+		"SELECT g.term, g.c FROM (q LEFT JOIN t10 ON t10 MATCH q.term) AS g ORDER BY 1, 2",
+		"SELECT * FROM r, (q LEFT JOIN t10 ON t10 MATCH q.term) ORDER BY 1, 2, 3",
+		"SELECT * FROM r JOIN (q LEFT JOIN t10 ON t10 MATCH q.term) ON t10.c IS NULL",
+		"SELECT * FROM r JOIN (q JOIN t10 ON t10 MATCH q.term) AS g ON g.term = 'one' ORDER BY 1, 2, 3",
+		"SELECT * FROM r LEFT JOIN (q LEFT JOIN t10 ON t10 MATCH q.term) ON r.k = 1",
+		"SELECT * FROM r LEFT JOIN (q JOIN t10 ON t10 MATCH q.term) ON r.k = 1",
+		"SELECT * FROM r LEFT JOIN (q JOIN t10 ON t10 MATCH q.term) AS g ON r.k = 1",
+		"SELECT r.k, g.term, t10.rowid FROM r LEFT JOIN (q JOIN t10 ON t10 MATCH q.term) AS g ON r.k = 1 ORDER BY 1, 2, 3",
+		"SELECT k, (SELECT count(*) FROM q AS z WHERE z.term = g.term) FROM r LEFT JOIN (q JOIN t10 ON t10 MATCH q.term) AS g ON r.k = g.rowid ORDER BY 1, 2",
+		"SELECT count(*) FROM r LEFT JOIN (q LEFT JOIN t10 ON t10 MATCH q.term) ON r.k = 1 WHERE c IS NULL",
 	} {
-		differAllowingDeclines(t, fmt.Sprintf("nested-%d", i), append(append([]string(nil), pre...), s))
+		differ(t, fmt.Sprintf("nested-%d", i), append(append([]string(nil), pre...), s))
 	}
 }

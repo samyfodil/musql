@@ -122,10 +122,10 @@ func (p *ReadOnlyPager) cFlattensBody(parent *SelectStmt, items []FromItem, i in
 		return false, true
 	}
 	// (15) needs to know whether parent is an arm of a compound; it only
-	// matters with a LIMIT, which (8) refuses in a join anyway.
-	if subLimit && len(items) == 1 && !isAgg {
-		return false, false
-	}
+	// matters with a LIMIT, which (8) refuses in a join anyway. Every
+	// restriction refuses alike, so it is asked only once none of the others
+	// has.
+	unknown15 := subLimit && len(items) == 1 && !isAgg
 	if len(last.From) == 0 { // (7)
 		return false, true
 	}
@@ -189,6 +189,9 @@ func (p *ReadOnlyPager) cFlattensBody(parent *SelectStmt, items []FromItem, i in
 		if p.r41CompoundNotFlattened(parent, arms) {
 			return false, true
 		}
+		return false, false
+	}
+	if unknown15 {
 		return false, false
 	}
 	return true, true
@@ -431,7 +434,15 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 			volatile = true
 		}
 	}
-	if !volatile {
+	// A window select whose reader meets an nth_value error only on reaching
+	// its row (nthValueTail) needs the reader's loops to be C's too.
+	anyTail := false
+	for i := range srcs {
+		if srcs[i].nthTail {
+			anyTail = true
+		}
+	}
+	if !volatile && !anyTail {
 		return nil
 	}
 	decline := func(why string) error {
@@ -491,6 +502,10 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 		if !certain {
 			return decline("whose co-routine placement is not followed")
 		}
+		if srcs[i].nthTail && !co {
+			// Materialized in C, whose window code then returns every row.
+			return decline("a window select C materializes, read up to an nth_value error")
+		}
 		subs[i] = subq{body: body, cte: cte, co: co}
 		// An item 0 that a CROSS JOIN (or nothing) follows is the outer loop
 		// whatever it costs: run once, as here.
@@ -502,7 +517,7 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 	// With nothing to re-run the materialization already gives C's rows, and
 	// C's plan is still taken when it is followed, so the order rows arrive
 	// in is C's too (cPlanDecided); where it is not, nothing is declined.
-	optional := len(rerun) == 0
+	optional := len(rerun) == 0 && !anyTail
 	giveUp := func(why string) error {
 		if optional {
 			return nil
@@ -580,6 +595,11 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 	for level, iTab := range order {
 		if rerun[iTab] && level > 0 && !auto[level] {
 			srcs[iTab].coroutineRerun = true
+		}
+		if srcs[iTab].nthTail && level > 0 && auto[level] {
+			// An automatic index is built from every row; this one reads them
+			// whole, without meeting the error at their end.
+			return decline("a window select read through an automatic index, up to an nth_value error")
 		}
 	}
 	// The loops outside each re-run co-routine must be C's, so the whole plan

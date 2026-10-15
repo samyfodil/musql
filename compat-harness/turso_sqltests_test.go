@@ -132,7 +132,7 @@ func (s *tsStats) report(t *testing.T) {
 	defer s.mu.Unlock()
 	var b strings.Builder
 	fmt.Fprintf(&b, "Turso sqltests: %d ran, %d agree with C", s.counts["ran"], s.counts["pass"])
-	for _, k := range []string{"wrong", "decline", "error-text", "row-order", "crash", "export", "known", "known-wrong", "known-decline", "known-error-text", "known-row-order", "known-crash"} {
+	for _, k := range []string{"wrong", "decline", "error-text", "row-order", "crash", "export", "c-bug", "known", "known-wrong", "known-decline", "known-error-text", "known-row-order", "known-crash"} {
 		if s.counts[k] > 0 {
 			fmt.Fprintf(&b, ", %d %s", s.counts[k], k)
 		}
@@ -855,9 +855,23 @@ func tsRunCase(t *testing.T, rel string, tf *tsFile, db tsDB, c tsCase, matrix, 
 	class, detail, _ := strings.Cut(verdict, ": ")
 	// Where musql satisfies Turso's recorded expectation and C does not, C
 	// 3.53.3 is the odd one out; say so in the report.
-	if c.expect != nil && !matrix && mr.crash == "" && nTest <= len(mr.res) && nSetup <= nTest &&
-		db.kind != tsDBDefault && db.kind != tsDBDefaultNoRowid && tsTursoVerdict(c.expect, mr.res[nSetup:nTest]) == "" {
+	musqlRight := c.expect != nil && !matrix && mr.crash == "" && nTest <= len(mr.res) && nSetup <= nTest &&
+		db.kind != tsDBDefault && db.kind != tsDBDefaultNoRowid && tsTursoVerdict(c.expect, mr.res[nSetup:nTest]) == ""
+	if musqlRight {
 		detail += "\n    (musql satisfies Turso's expect block)"
+	}
+	if e := tsKnownFor(key); e != nil && e.cBug {
+		// A recorded C SQLite bug: musql keeps the right answer, which is
+		// Turso's expectation, and that is checked rather than skipped.
+		if !musqlRight {
+			t.Errorf("recorded C SQLite bug (%s), but musql does not give Turso's expected answer either\n  %s", e.reason, detail)
+			return
+		}
+		st.add("c-bug")
+		st.mu.Lock()
+		st.details = append(st.details, fmt.Sprintf("[c-bug] %s\n    %s", key, detail))
+		st.mu.Unlock()
+		return
 	}
 	st.add(class)
 	st.mu.Lock()

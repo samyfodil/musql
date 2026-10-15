@@ -1065,8 +1065,11 @@ func (db *DB) AlterTable(sqlText string) error {
 	if err == nil {
 		// Every ALTER TABLE ends by reloading the whole schema
 		// (renameReloadSchema, alter.c), and sqlite3InitOne loads the
-		// statistics again with it -- into objects built afresh.
+		// statistics again with it -- into objects built afresh. The temp
+		// schema is reloaded too (renameReloadSchema's second
+		// OP_ParseSchema), and with it the temp trigger hash.
 		db.loadAnalysisFresh()
+		db.rebuildTempTrigHash()
 	}
 	return err
 }
