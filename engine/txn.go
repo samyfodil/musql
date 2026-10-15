@@ -72,6 +72,11 @@ type txSnapshot struct {
 	vtabs        []*vtabMeta
 	triggers     []*triggerMeta
 	schemaCookie uint32
+	// schemaGen and tempTrigHash: a span that changed no schema leaves C's
+	// temp trigger hash as it was; undoing one that did reloads it
+	// (rebuildTempTrigHash).
+	schemaGen    uint32
+	tempTrigHash tempTrigHash
 	userVersion  uint32
 	// applicationID is saved for the same reason userVersion is: C SQLite
 	// writes it through an ordinary write transaction, so a ROLLBACK puts it
@@ -244,6 +249,8 @@ func (db *DB) captureSnapshotWith(cloneTable func(*tableMeta) *tableMeta) *txSna
 	db.drainTxBulks(nil)
 	snap := &txSnapshot{
 		schemaCookie:  db.schemaCookie,
+		schemaGen:     db.schemaGen,
+		tempTrigHash:  db.tempTrigHash.clone(),
 		userVersion:   db.userVersion,
 		applicationID: db.applicationID,
 		captureGuard:  db.captureGuard,
@@ -398,6 +405,14 @@ func (db *DB) restoreSnapshot(snap *txSnapshot) {
 	db.views = snap.views
 	db.vtabs = snap.vtabs
 	db.triggers = snap.triggers
+	if db.schemaGen != snap.schemaGen {
+		// Undoing a schema change resets the temp schema too
+		// (sqlite3ResetAllSchemasOfConnection), which is reloaded in
+		// sqlite_temp_master's rowid order.
+		db.rebuildTempTrigHash()
+	} else {
+		db.tempTrigHash = snap.tempTrigHash.clone()
+	}
 	db.schemaCookie = snap.schemaCookie
 	db.userVersion = snap.userVersion
 	db.applicationID = snap.applicationID

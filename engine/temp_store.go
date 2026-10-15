@@ -119,7 +119,8 @@ type TempDatabase struct {
 	hdr      *tempDB
 	opened   bool
 	held     bool
-	trigPeak int // DB.tempTrigPeak
+	trigPeak int          // DB.tempTrigPeak
+	trigHash tempTrigHash // DB.tempTrigHash
 }
 
 // TempDatabase is the connection's TEMP database as this session last
@@ -157,7 +158,7 @@ func (db *DB) publishTemp() {
 
 // tempContents fills t from this session's temp objects and header.
 func (db *DB) tempContents(t *TempDatabase) {
-	*t = TempDatabase{version: t.version, pair: db.tempPair, hdr: db.temp, opened: db.tempDatabaseOpened, held: db.tempDatabaseHeldObject, trigPeak: db.tempTrigPeak}
+	*t = TempDatabase{version: t.version, pair: db.tempPair, hdr: db.temp, opened: db.tempDatabaseOpened, held: db.tempDatabaseHeldObject, trigPeak: db.tempTrigPeak, trigHash: db.tempTrigHash.clone()}
 	for _, x := range db.tables {
 		if x.isTemp {
 			t.tables = append(t.tables, x)
@@ -212,6 +213,7 @@ func (db *DB) installTemp(t *TempDatabase) {
 	db.tempDatabaseOpened = db.tempDatabaseOpened || t.opened
 	db.tempDatabaseHeldObject = db.tempDatabaseHeldObject || t.held
 	db.tempTrigPeak = max(db.tempTrigPeak, t.trigPeak)
+	db.tempTrigHash = t.trigHash.clone()
 }
 
 // dropTempFromLists removes every TEMP object from the session's schema lists,

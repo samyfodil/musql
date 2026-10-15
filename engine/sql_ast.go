@@ -1223,6 +1223,9 @@ type SelectStmt struct {
 
 	// nfBound marks a tree nested_from_bind.go has already rewritten.
 	nfBound bool
+	// nthTail marks a window select read as a co-routine by a reader that may
+	// stop before its end (nthValueTail): see windowPlan.tail.
+	nthTail bool
 
 	// r35dCompoundOf is set only on the copy compileCompound makes to compile a
 	// compound's first arm, pointing at the compound. The aggregate hoist

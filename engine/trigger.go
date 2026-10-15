@@ -249,14 +249,18 @@ func (db *DB) matchingInsteadOfTriggers(view string, viewIsTemp bool, event trig
 // schema's trigger hash; while that hash has never grown buckets (fewer than
 // five temp triggers since it was last empty, hash.c's rehash threshold) the
 // walk is newest first, so the TEMP triggers end up first and OLDEST first.
-// Past that the walk follows bucket order, which checkTempTriggerOrder
-// declines.
+// Past that the walk follows bucket order, which tempTrigHash reproduces;
+// where it does not know the hash, checkTempTriggerOrder declines.
 func (db *DB) orderedTriggers(tableIsTemp bool, keep func(*triggerMeta) bool) []*triggerMeta {
 	var out []*triggerMeta
 	if !tableIsTemp {
-		for _, tr := range db.triggers {
-			if tr.isTemp && keep(tr) {
-				out = append(out, tr)
+		if temps, ok := db.tempTrigOrder(keep); ok {
+			out = temps
+		} else {
+			for _, tr := range db.triggers {
+				if tr.isTemp && keep(tr) {
+					out = append(out, tr)
+				}
 			}
 		}
 	}
@@ -291,6 +295,10 @@ func (db *DB) noteTempTriggerCreated() {
 // table, once that hash may have grown buckets (see orderedTriggers).
 func (db *DB) checkTempTriggerOrder(trs []*triggerMeta) error {
 	if db.tempTrigPeak < 5 {
+		return nil
+	}
+	if _, known := db.tempTrigOrder(func(*triggerMeta) bool { return false }); known {
+		// The hash is followed (tempTrigHash): orderedTriggers walked it.
 		return nil
 	}
 	n := 0
@@ -1008,6 +1016,7 @@ func (db *DB) CreateTrigger(sqlText string) error {
 	}
 	if isTemp {
 		db.noteTempTriggerCreated()
+		db.tempTrigHash.insert(stmt.name)
 	}
 	db.triggers = append(db.triggers, &triggerMeta{
 		schemaSeq:       db.nextSchemaSeq(isTemp),
@@ -1071,6 +1080,9 @@ func (db *DB) removeTrigger(tr *triggerMeta) {
 	for i, x := range db.triggers {
 		if x == tr {
 			db.triggers = append(db.triggers[:i], db.triggers[i+1:]...)
+			if tr.isTemp {
+				db.tempTrigHash.remove(tr.name)
+			}
 			break
 		}
 	}

@@ -647,6 +647,8 @@ func (db *DB) removeAttachedTargetTriggers(trs []*triggerMeta) {
 		}
 		if !drop {
 			kept = append(kept, tr)
+		} else if tr.isTemp {
+			db.tempTrigHash.remove(tr.name)
 		}
 	}
 	db.triggers = kept

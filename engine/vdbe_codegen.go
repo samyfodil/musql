@@ -812,6 +812,7 @@ func compileSubProgram(pager *ReadOnlyPager, stmt *SelectStmt, outer *compiler) 
 		stmt = pager.nullUnusedSubqueryColumns(stmt)
 	}
 	stmt = nthValueReachOwn(stmt)
+	stmt = pager.nthValueTail(stmt)
 	// A subquery body is a SELECT like any other to sqlite3Select: its own FROM
 	// clause is flattened (flattenSubquery, select.c:4290) and pushed down into
 	// (pushDownWhereTerms, select.c:5134) exactly as the top-level statement's

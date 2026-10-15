@@ -386,12 +386,25 @@ func wherePlanMultiTableOrderWith(p *ReadOnlyPager, c *compiler, srcs []joinSour
 					return nil, nil, 0, false
 				}
 			}
-			// sqlite3WhereTabFuncArgs: "hidden = argument" for each argument,
+			// sqlite3WhereTabFuncArgs: "hidden = +argument" for each argument,
 			// in order (whereexpr.c). The module's plan uses all of them
-			// (jsonEachBestIndex: argvIndex 1 and 2), each of no other item.
-			for k := range srcs[i].vtabItem.TableFuncArgs {
+			// (jsonEachBestIndex: argvIndex 1 and 2). An argument naming a
+			// column of another item has that item in its prereqRight (the
+			// unary plus keeps exprAnalyze from making a commuted copy), and
+			// jsonEachBestIndex rejects a plan where it is not usable, so
+			// whereLoopAddVirtual's only loop requires it.
+			for k, a := range srcs[i].vtabItem.TableFuncArgs {
+				refs := map[int]bool{}
+				collectTableRefs(a, scopes, refs)
+				var right whereMask
+				for r := range refs {
+					if r == i {
+						return nil, nil, 0, false
+					}
+					right |= whereMask(1) << uint(r)
+				}
 				terms = append(terms, whereIdxTerm{op: woEq, cursor: i, column: hidden[k], rCursor: -1, rColumn: -1,
-					prereqAll: mask, parent: -1, virt: true, vtabArg: true, truthProb: 1})
+					prereqAll: mask | right, prereqRight: right, parent: -1, virt: true, vtabArg: true, truthProb: 1})
 			}
 			// jsonEachBestIndex with the JSON argument: estimatedCost 1.0
 			// (sqlite3LogEstFromDouble: 0), estimatedRows left at 25
@@ -962,7 +975,10 @@ func wherePlanSortCtlForOpt(jts []joinedTable, scopes []tableScope, stmt *Select
 			isAgg = true
 		}
 	}
-	if isAgg && wherePlanHasDistinctAgg(stmt) {
+	// In the GROUP BY arm the flags come only with ONE aggregate call that is
+	// DISTINCT (select.c:8482); beside any other call each DISTINCT one keeps
+	// its own ephemeral table and the planner sees a plain GROUP BY.
+	if isAgg && wherePlanHasDistinctAgg(stmt) && (len(stmt.GroupBy) == 0 || wherePlanSingleDistinctAgg(stmt)) {
 		// A DISTINCT aggregate argument adds WHERE_WANT_DISTINCT|WHERE_AGG_DISTINCT and a
 		// pDistinct (select.c:8492, 8864). With one FROM item and a real GROUP BY it does
 		// not affect path selection: pOrderBy is the GROUP BY (select.c:8531), so the
@@ -2668,12 +2684,10 @@ func wherePlanVtabItem(p *ReadOnlyPager, s joinSource) (hidden [2]int, ok bool) 
 		return hidden, false
 	}
 	for _, a := range it.TableFuncArgs {
-		names := false
-		if !r41Walk(a, func(e Expr) {
-			if _, isCol := e.(ColumnExpr); isCol {
-				names = true
-			}
-		}) || names {
+		// An argument naming a column of another item makes that item a
+		// prerequisite of the module's only plan (vtabArgPrereq); a subquery
+		// or a node the walk does not know is not followed.
+		if !r41Walk(a, func(Expr) {}) {
 			return hidden, false
 		}
 	}

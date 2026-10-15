@@ -208,6 +208,7 @@ func (cur *vdbeCursor) advanceStream() bool {
 	// A column read out of a derived row carries no subtype, unless flattening
 	// keeps it -- see openDerivedCursor.
 	clearDerivedSubtypes(row, cur.sub.keep)
+	derivedRealAffinity(row, cur.tbl)
 	cur.pos++
 	cur.rowid = 0
 	cur.rowVals = row

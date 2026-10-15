@@ -23,7 +23,230 @@ func r41SequentialCompound(stmt *SelectStmt) bool {
 // parent FROM and substitutes references, letting the parent's WHERE/ORDER BY drive
 // the plan (select.c:3797). Declines on naming conflicts or subqueries.
 func (p *ReadOnlyPager) r41FlattenProjection(stmt *SelectStmt) *SelectStmt {
-	return p.r41Flatten(stmt, true)
+	return p.r41Flatten(spliceMatchGroups(stmt), true)
+}
+
+// spliceMatchGroups splices in flat a parenthesized join group holding an fts
+// MATCH in its own ON clause, where C flattens the group. An aliased or
+// non-leading group is an SF_NestedFrom subquery "SELECT * FROM <group>" to
+// C (parse.y), and flattenSubquery takes it into an inner join like any
+// subquery: restriction (3a) bars only an outer join's right operand, and
+// (27a) a first member that is a RIGHT JOIN's left operand. Once
+// nested_from_bind.go has bound every name in the statement to a member by a
+// synthetic alias (nfBound), the group's scope has done its work, and the
+// spliced FROM clause is the one C plans; the group's own ON becomes its first
+// member's, an inner join's ON, which is a WHERE term to C. Only a group
+// holding a MATCH is taken: there the group's own cursor cannot read the fts
+// table's rowid, so the MATCH is otherwise refused.
+func spliceMatchGroups(stmt *SelectStmt) *SelectStmt {
+	if stmt == nil || !stmt.nfBound || len(stmt.Windows) != 0 || selectHasWindow(stmt) {
+		return stmt
+	}
+	out := stmt
+	for i := 0; i < len(out.From); i++ {
+		gl := out.From[i].GroupLen
+		if gl <= 1 {
+			continue
+		}
+		if i+gl > len(out.From) {
+			return out
+		}
+		if !matchGroupSplicable(out.From[i : i+gl]) {
+			if s, ok := matchGroupAsSubquery(out, i, gl); ok {
+				out = s
+				continue
+			}
+			i += gl - 1
+			continue
+		}
+		cp := *out
+		cp.From = append([]FromItem(nil), out.From...)
+		for k := i; k < i+gl; k++ {
+			m := &cp.From[k]
+			m.GroupLen, m.GroupAlias, m.HasGroupAlias, m.GroupRebuildID = 0, "", false, 0
+			m.NestFromWrapDepth, m.NestedNonLeading, m.NestedGroupID = 0, false, 0
+		}
+		out = &cp
+		i += gl - 1
+	}
+	return out
+}
+
+// matchGroupAsSubquery is the group at stmt.From[i:i+gl] as C runs it when it
+// does not flatten it, the right operand of an outer join (restriction (3a)):
+// the subquery "SELECT ... FROM <group>" under a synthetic alias, every
+// reference to a member outside the group now one of its result columns. The
+// members' synthetic aliases are unique in the statement (nfBound), so a
+// reference is rewritten wherever it is, subqueries included. false for any
+// other group, or a reference this does not rewrite.
+func matchGroupAsSubquery(stmt *SelectStmt, i, gl int) (*SelectStmt, bool) {
+	g := stmt.From[i : i+gl]
+	if g[0].Join != JoinLeft || len(g[0].Using) != 0 || g[0].Natural {
+		return nil, false
+	}
+	inner := append([]FromItem(nil), g...)
+	inner[0].Join, inner[0].On, inner[0].CrossKeyword = JoinInner, nil, false
+	if !matchGroupSplicable(inner) {
+		return nil, false
+	}
+	for k := range inner {
+		m := &inner[k]
+		m.GroupLen, m.GroupAlias, m.HasGroupAlias, m.GroupRebuildID = 0, "", false, 0
+		m.NestFromWrapDepth, m.NestedNonLeading, m.NestedGroupID = 0, false, 0
+	}
+	synth := map[string]bool{}
+	for _, m := range g {
+		if !isNFSynthAlias(m.Alias) {
+			return nil, false
+		}
+		synth[m.Alias] = true
+	}
+	alias := ""
+	for n := 1; ; n++ {
+		alias = fmt.Sprintf("%sgroup%d", nfMarker, n)
+		taken := false
+		for _, it := range stmt.From {
+			if it.Alias == alias {
+				taken = true
+			}
+		}
+		if !taken {
+			break
+		}
+	}
+	body := &SelectStmt{nfBound: true}
+	cols := map[string]string{}
+	ref := func(ce ColumnExpr) (Expr, bool) {
+		if !synth[ce.Qualifier] {
+			return ce, true
+		}
+		if ce.Schema != "" || ce.coalesceOf != nil || ce.nfSelf != nil {
+			return nil, false
+		}
+		key := ce.Qualifier + "\x00" + strings.ToLower(ce.Name)
+		name, ok := cols[key]
+		if !ok {
+			name = fmt.Sprintf("%sc%d", nfMarker, len(cols)+1)
+			cols[key] = name
+			body.Columns = append(body.Columns, SelectColumn{Expr: ColumnExpr{Qualifier: ce.Qualifier, Name: ce.Name},
+				Alias: name, HasAlias: true, Text: name, RawText: name})
+		}
+		return ColumnExpr{Qualifier: alias, Name: name}, true
+	}
+	var rwSel func(s *SelectStmt) (*SelectStmt, bool)
+	rw := func(e Expr) (Expr, bool) { return r41RewriteS(e, ref, rwSel) }
+	rwSel = func(s *SelectStmt) (*SelectStmt, bool) {
+		if s == nil {
+			return nil, true
+		}
+		if len(s.CTEs) != 0 || len(s.Windows) != 0 {
+			return nil, false
+		}
+		out := *s
+		ok := true
+		one := func(e Expr) Expr {
+			if !ok || e == nil {
+				return e
+			}
+			n, eok := rw(e)
+			ok = ok && eok
+			return n
+		}
+		out.Columns = make([]SelectColumn, len(s.Columns))
+		for k, c := range s.Columns {
+			if c.Star {
+				if c.StarQualifier != "" && synth[c.StarQualifier] {
+					return nil, false
+				}
+			} else {
+				c.Expr = one(c.Expr)
+			}
+			out.Columns[k] = c
+		}
+		out.From = append([]FromItem(nil), s.From...)
+		for k := range out.From {
+			out.From[k].On = one(out.From[k].On)
+			if out.From[k].TableFuncArgs != nil {
+				args := make([]Expr, len(out.From[k].TableFuncArgs))
+				for j, a := range out.From[k].TableFuncArgs {
+					args[j] = one(a)
+				}
+				out.From[k].TableFuncArgs = args
+			}
+			if out.From[k].Subquery != nil && ok {
+				q, qok := rwSel(out.From[k].Subquery)
+				ok = ok && qok
+				out.From[k].Subquery = q
+			}
+		}
+		out.Where, out.Having = one(s.Where), one(s.Having)
+		if s.GroupBy != nil {
+			out.GroupBy = make([]Expr, len(s.GroupBy))
+			for k, e := range s.GroupBy {
+				out.GroupBy[k] = one(e)
+			}
+		}
+		if s.OrderBy != nil {
+			out.OrderBy = make([]OrderTerm, len(s.OrderBy))
+			for k, ot := range s.OrderBy {
+				ot.Expr = one(ot.Expr)
+				out.OrderBy[k] = ot
+			}
+		}
+		out.LimitParam, out.OffsetParam = one(s.LimitParam), one(s.OffsetParam)
+		if s.Compound != nil {
+			out.Compound = make([]CompoundArm, len(s.Compound))
+			for k, a := range s.Compound {
+				if ok {
+					q, qok := rwSel(a.Stmt)
+					ok = ok && qok
+					a.Stmt = q
+				}
+				out.Compound[k] = a
+			}
+		}
+		return &out, ok
+	}
+	// The statement without the group's members, which the subquery keeps.
+	outer := *stmt
+	outer.From = append(append(append([]FromItem(nil), stmt.From[:i]...),
+		FromItem{Alias: alias, Join: g[0].Join, On: g[0].On}), stmt.From[i+gl:]...)
+	rewritten, ok := rwSel(&outer)
+	if !ok || len(stmt.CTEs) != 0 {
+		return nil, false
+	}
+	if len(body.Columns) == 0 {
+		body.Columns = []SelectColumn{{Expr: LiteralExpr{Val: Value{Typ: Int, I: 1}}, Alias: nfMarker + "c0", HasAlias: true}}
+	}
+	body.From = inner
+	rewritten.From[i].Subquery = body
+	return rewritten, true
+}
+
+// matchGroupSplicable reports a group spliceMatchGroups takes: joined by an
+// inner join, its members ordinary items with no group of their own and no
+// RIGHT or FULL join, and some member's ON holding a MATCH.
+func matchGroupSplicable(g []FromItem) bool {
+	if (g[0].Join != JoinInner && g[0].Join != JoinCross) || len(g[0].Using) != 0 || g[0].Natural {
+		return false
+	}
+	match := false
+	for k, m := range g {
+		if m.NestedGroupSpan != nil || (k > 0 && m.GroupLen != 0) || m.Join == JoinRight || m.Join == JoinFull {
+			return false
+		}
+		if k == 0 || m.On == nil {
+			continue
+		}
+		if !r41Walk(m.On, func(e Expr) {
+			if _, ok := e.(MatchExpr); ok {
+				match = true
+			}
+		}) {
+			return false
+		}
+	}
+	return match
 }
 
 // r41Flatten repeats the single-item flatten until nothing more merges, which
@@ -95,7 +318,14 @@ func r41ParentOK(stmt *SelectStmt) bool {
 		if it.Join != JoinCross && it.Join != JoinInner {
 			return false
 		}
-		if len(it.Using) != 0 || it.Natural || it.TableFunc || len(it.TableFuncArgs) != 0 ||
+		// A table-valued function sits beside the flattened subquery as any
+		// table does (its arguments are substituted like an ON clause,
+		// substSelect's pFuncArg arm); only one whose columns r41ItemNames
+		// reads.
+		if (it.TableFunc || len(it.TableFuncArgs) != 0) && r41TVFColumns(it) == nil {
+			return false
+		}
+		if len(it.Using) != 0 || it.Natural ||
 			it.GroupLen != 0 || it.GroupAlias != "" || it.HasGroupAlias || it.GroupRebuildID != 0 ||
 			it.NestFromWrapDepth != 0 || len(it.NestedGroupSpan) != 0 || it.NestedNonLeading ||
 			it.NestedGroupID != 0 || it.UpdateTarget {
@@ -385,8 +615,11 @@ func (p *ReadOnlyPager) r41Arm(stmt *SelectStmt, i int, it FromItem, body *Selec
 		}
 		dc := r41DerivedCol{base: e.(ColumnExpr).Name}
 		dc.name = dc.base
-		if c.HasAlias {
+		switch {
+		case c.HasAlias:
 			dc.name = c.Alias
+		case c.cName != "":
+			dc.name = c.cName // named before resolution (nameValuesColumnsPreResolve)
 		}
 		f.cols = append(f.cols, dc)
 	}
@@ -570,7 +803,7 @@ func (a *r41ArmFlat) parent(stmt *SelectStmt, i int, it FromItem) (*SelectStmt, 
 	}
 	f.aliasExpr, f.aliasOn = map[string]Expr{}, false
 	sub := func(ce ColumnExpr) (Expr, bool) { return f.parentRef(ce) }
-	rewrite := func(e Expr) (Expr, bool) { return r41RewriteQ(e, sub, f.subqueryUntouched) }
+	rewrite := func(e Expr) (Expr, bool) { return r41RewriteS(e, sub, f.substSub) }
 	out := *stmt
 	out.Columns = nil
 	for _, c := range stmt.Columns {
@@ -618,6 +851,17 @@ func (a *r41ArmFlat) parent(stmt *SelectStmt, i int, it FromItem) (*SelectStmt, 
 	}
 	out.From = append([]FromItem(nil), stmt.From...)
 	for j := range out.From {
+		if len(out.From[j].TableFuncArgs) != 0 {
+			args := make([]Expr, len(out.From[j].TableFuncArgs))
+			for k, a := range out.From[j].TableFuncArgs {
+				na, ok := rewrite(a)
+				if !ok {
+					return nil, false
+				}
+				args[k] = na
+			}
+			out.From[j].TableFuncArgs = args
+		}
 		if out.From[j].On == nil {
 			continue
 		}
@@ -986,27 +1230,137 @@ func (f *r41Flat) parentRef(ce ColumnExpr) (Expr, bool) {
 	return ce, true
 }
 
-// subqueryUntouched is substSelect's reach into a subquery of the parent
-// (select.c:3914), which this rewrite does not reproduce -- so a subquery is
-// let through only when no name in it could bind to the derived table or to a
-// column the flattened base table newly exposes, and it is then left exactly
-// as written.
+// subqueryUntouched reports whether substSub takes s.
+func (f *r41Flat) subqueryUntouched(s *SelectStmt) bool {
+	_, ok := f.substSub(s)
+	return ok
+}
+
+// r41Scope is the names one SELECT's FROM clause binds, for substSub.
+type r41Scope struct {
+	quals, cols map[string]bool
+	known       bool // every name the scope binds is in quals/cols
+	opaque      bool // a FROM-clause subquery: the scopes outside it are not its own
+}
+
+// substSub is substSelect's reach into a subquery of the parent
+// (select.c:3914): s with every reference to the derived table replaced by
+// its copy, as substExpr replaces one in the parent. false when a name in s
+// could bind otherwise than read here -- to a column the flattened base
+// table newly exposes, through a scope whose names are not all known, or to
+// a result alias of the parent -- or when a copy lands where its implicit
+// collating sequence would decide (copyColl), which is spelled only in the
+// parent's own clauses.
 //
 // A name the subquery's own FROM clause binds is its own whatever it spells:
-// SQLite resolves the innermost scope first (lookupName, resolve.c), and the
-// flatten changes nothing inside the subquery. The scopes are read only where
-// every item's names are known (r41ItemNames) and the subquery defines no CTE
-// of its own; a FROM-clause subquery sees no sibling of its own select, so its
-// scope does not reach past itself.
-func (f *r41Flat) subqueryUntouched(s *SelectStmt) bool {
-	type local struct {
-		quals, cols map[string]bool
-		known       bool // every name the scope binds is in quals/cols
-		opaque      bool // a FROM-clause subquery: the scopes outside it are not its own
+// SQLite resolves the innermost scope first (lookupName, resolve.c). The
+// scopes are read only where every item's names are known (r41ItemNames) and
+// the subquery defines no CTE of its own; a FROM-clause subquery sees no
+// sibling of its own select, so a name it does not bind itself is not
+// followed further out.
+func (f *r41Flat) substSub(s *SelectStmt) (*SelectStmt, bool) {
+	var stack []r41Scope
+	// bound is 1 when a scope of s binds ce, 0 when none does, -1 when that
+	// is not known.
+	bound := func(ce ColumnExpr) int {
+		for k := len(stack) - 1; k >= 0; k-- {
+			sc := stack[k]
+			if !sc.known || ce.Schema != "" {
+				return -1
+			}
+			if ce.Qualifier != "" {
+				if sc.quals[r33sFoldIdent(ce.Qualifier)] {
+					return 1
+				}
+			} else if sc.cols[r33sFoldIdent(ce.Name)] {
+				return 1
+			}
+			if sc.opaque {
+				return -1
+			}
+		}
+		return 0
 	}
-	var stack []local
-	enter := func(s *SelectStmt, fromItem bool) func() {
-		sc := local{quals: map[string]bool{}, cols: map[string]bool{}, known: f.p != nil && len(s.CTEs) == 0, opaque: fromItem}
+	aliasShadowed := func() bool {
+		for _, sc := range stack {
+			if sc.quals[r33sFoldIdent(f.alias)] {
+				return true
+			}
+		}
+		return false
+	}
+	col := func(ce ColumnExpr) (Expr, bool) {
+		if ce.UsingRepr || ce.UsingPinned {
+			return nil, false
+		}
+		l := r33sFoldIdent(ce.Name)
+		_, isBase := f.base[l]
+		k, isDerived := f.byName[l]
+		qualDerived := ce.Qualifier != "" && f.dName != "" && equalFoldName(ce.Qualifier, f.dName)
+		qualAlias := ce.Qualifier != "" && equalFoldName(ce.Qualifier, f.alias)
+		mentions := qualDerived || qualAlias || (ce.Qualifier == "" && (isBase || isDerived || f.aliases[l]))
+		switch bound(ce) {
+		case 1:
+			return ce, true
+		case -1:
+			return ce, !mentions
+		}
+		if !mentions {
+			return ce, true
+		}
+		if qualAlias && !qualDerived {
+			return nil, false // the invented name would newly resolve
+		}
+		if !isDerived || (ce.Qualifier == "" && f.others[l]) {
+			return nil, false
+		}
+		if aliasShadowed() {
+			return nil, false // the copy's own references would bind inside
+		}
+		return f.colExpr(k), true
+	}
+	// innerBinary is binaryColl for an operand inside s, whose columns are
+	// not looked up: only one naming no column is known.
+	innerBinary := func(e Expr) bool {
+		for {
+			switch x := e.(type) {
+			case CastExpr:
+				e = x.X
+				continue
+			case UnaryExpr:
+				if x.Op == "+" {
+					e = x.X
+					continue
+				}
+			}
+			break
+		}
+		_, isCol := e.(ColumnExpr)
+		return !isCol
+	}
+	var walk func(s *SelectStmt, fromItem bool) (*SelectStmt, bool)
+	expr := func(e Expr) (Expr, bool) {
+		if e == nil {
+			return nil, true
+		}
+		ok := true
+		if !r41WalkQ(e, func(n Expr) {
+			if w, d := f.copyColl(n, innerBinary); w || d {
+				ok = false
+			}
+		}, func(*SelectStmt) bool { return true }) || !ok {
+			return e, false
+		}
+		return r41RewriteS(e, col, func(q *SelectStmt) (*SelectStmt, bool) { return walk(q, false) })
+	}
+	walk = func(s *SelectStmt, fromItem bool) (*SelectStmt, bool) {
+		if s == nil {
+			return nil, true
+		}
+		if len(s.CTEs) != 0 || len(s.Windows) != 0 {
+			return s, false
+		}
+		sc := r41Scope{quals: map[string]bool{}, cols: map[string]bool{}, known: f.p != nil, opaque: fromItem}
 		for _, it := range s.From {
 			if !sc.known {
 				break
@@ -1026,42 +1380,88 @@ func (f *r41Flat) subqueryUntouched(s *SelectStmt) bool {
 			}
 		}
 		stack = append(stack, sc)
-		return func() { stack = stack[:len(stack)-1] }
-	}
-	bound := func(ce ColumnExpr) bool {
-		for k := len(stack) - 1; k >= 0; k-- {
-			sc := stack[k]
-			if !sc.known {
-				return false
+		defer func() { stack = stack[:len(stack)-1] }()
+		out := *s
+		ok := true
+		one := func(e Expr) Expr {
+			if !ok {
+				return e
 			}
-			if ce.Qualifier != "" {
-				if ce.Schema == "" && sc.quals[r33sFoldIdent(ce.Qualifier)] {
-					return true
+			n, eok := expr(e)
+			if !eok {
+				ok = false
+			}
+			return n
+		}
+		out.Columns = make([]SelectColumn, len(s.Columns))
+		for k, c := range s.Columns {
+			if c.Star {
+				if c.StarQualifier != "" && !sc.quals[r33sFoldIdent(c.StarQualifier)] &&
+					((f.dName != "" && equalFoldName(c.StarQualifier, f.dName)) || equalFoldName(c.StarQualifier, f.alias)) {
+					return s, false
 				}
-			} else if sc.cols[r33sFoldIdent(ce.Name)] {
-				return true
+			} else {
+				c.Expr = one(c.Expr)
 			}
-			if sc.opaque {
-				return false
+			out.Columns[k] = c
+		}
+		out.From = append([]FromItem(nil), s.From...)
+		for k := range out.From {
+			out.From[k].On = one(out.From[k].On)
+			if len(out.From[k].TableFuncArgs) != 0 {
+				args := make([]Expr, len(out.From[k].TableFuncArgs))
+				for j, a := range out.From[k].TableFuncArgs {
+					args[j] = one(a)
+				}
+				out.From[k].TableFuncArgs = args
+			}
+			if out.From[k].Subquery != nil && ok {
+				q, qok := walk(out.From[k].Subquery, true)
+				if !qok {
+					ok = false
+				}
+				out.From[k].Subquery = q
 			}
 		}
-		return false
+		out.Where = one(s.Where)
+		if s.GroupBy != nil {
+			out.GroupBy = make([]Expr, len(s.GroupBy))
+			for k, g := range s.GroupBy {
+				out.GroupBy[k] = one(g)
+			}
+		}
+		out.Having = one(s.Having)
+		if s.OrderBy != nil {
+			out.OrderBy = make([]OrderTerm, len(s.OrderBy))
+			for k, ot := range s.OrderBy {
+				ot.Expr = one(ot.Expr)
+				out.OrderBy[k] = ot
+			}
+		}
+		out.LimitParam, out.OffsetParam = one(s.LimitParam), one(s.OffsetParam)
+		if s.Compound != nil {
+			out.Compound = make([]CompoundArm, len(s.Compound))
+			for k, a := range s.Compound {
+				if ok {
+					// An arm is a select of its own beside this one, not
+					// inside it.
+					stack = stack[:len(stack)-1]
+					q, qok := walk(a.Stmt, fromItem)
+					stack = append(stack, sc)
+					if !qok {
+						ok = false
+					}
+					a.Stmt = q
+				}
+				out.Compound[k] = a
+			}
+		}
+		if !ok {
+			return s, false
+		}
+		return &out, true
 	}
-	return r41WalkStmtE(s, func(ce ColumnExpr) bool {
-		if bound(ce) {
-			return true
-		}
-		if ce.Qualifier != "" {
-			return !(f.dName != "" && equalFoldName(ce.Qualifier, f.dName)) &&
-				!equalFoldName(ce.Qualifier, f.alias)
-		}
-		l := r33sFoldIdent(ce.Name)
-		_, isBase := f.base[l]
-		_, isDerived := f.byName[l]
-		return !isBase && !isDerived
-	}, func(q string) bool {
-		return !(f.dName != "" && equalFoldName(q, f.dName)) && !equalFoldName(q, f.alias)
-	}, enter, false)
+	return walk(s, false)
 }
 
 func r41Has(m map[string]Expr, k string) bool {
@@ -1092,7 +1492,29 @@ func r41Rewrite(e Expr, fn func(ColumnExpr) (Expr, bool)) (Expr, bool) {
 // r41RewriteQ is r41Rewrite that lets a subquery through, unchanged, whenever
 // subOK accepts it.
 func r41RewriteQ(e Expr, fn func(ColumnExpr) (Expr, bool), subOK func(*SelectStmt) bool) (Expr, bool) {
+	var subRW func(*SelectStmt) (*SelectStmt, bool)
+	if subOK != nil {
+		subRW = func(s *SelectStmt) (*SelectStmt, bool) { return s, subOK(s) }
+	}
+	return r41RewriteS(e, fn, subRW)
+}
+
+// r41RewriteS is r41Rewrite that puts subRW's answer in place of every
+// subquery, or fails when subRW is nil or refuses one.
+func r41RewriteS(e Expr, fn func(ColumnExpr) (Expr, bool), subRW func(*SelectStmt) (*SelectStmt, bool)) (Expr, bool) {
 	var ok = true
+	sub := func(s *SelectStmt) *SelectStmt {
+		if subRW == nil {
+			ok = false
+			return s
+		}
+		n, sok := subRW(s)
+		if !sok {
+			ok = false
+			return s
+		}
+		return n
+	}
 	var rw func(Expr) Expr
 	list := func(es []Expr) []Expr {
 		if es == nil {
@@ -1128,22 +1550,17 @@ func r41RewriteQ(e Expr, fn func(ColumnExpr) (Expr, bool), subOK func(*SelectStm
 			x.X = rw(x.X)
 			return x
 		case InExpr:
-			if x.Sub != nil && (subOK == nil || !subOK(x.Sub)) {
-				ok = false
-				return e
+			if x.Sub != nil {
+				x.Sub = sub(x.Sub)
 			}
 			x.X, x.List = rw(x.X), list(x.List)
 			return x
 		case SubqueryExpr:
-			if subOK == nil || !subOK(x.Stmt) {
-				ok = false
-			}
-			return e
+			x.Stmt = sub(x.Stmt)
+			return x
 		case ExistsExpr:
-			if subOK == nil || !subOK(x.Stmt) {
-				ok = false
-			}
-			return e
+			x.Stmt = sub(x.Stmt)
+			return x
 		case BetweenExpr:
 			x.X, x.Lo, x.Hi = rw(x.X), rw(x.Lo), rw(x.Hi)
 			return x
@@ -1312,6 +1729,10 @@ func (p *ReadOnlyPager) r41ItemNames(o FromItem) (string, []string, bool) {
 		if name == "" {
 			name = o.Table
 		}
+		if o.TableFunc || len(o.TableFuncArgs) != 0 {
+			cols := r41TVFColumns(o)
+			return name, cols, cols != nil
+		}
 		b := o
 		b.On = nil
 		if t, ok := p.r37cOrdinaryBase(b); ok {
@@ -1354,6 +1775,31 @@ func (p *ReadOnlyPager) r41ItemNames(o FromItem) (string, []string, bool) {
 		}
 	}
 	return name, cols, true
+}
+
+// r41TVFColumns is every column name, hidden ones included, of a
+// table-valued function item whose module r41 reads (json_each and its kin),
+// or nil.
+func r41TVFColumns(o FromItem) []string {
+	if o.Schema != "" || o.Subquery != nil {
+		return nil
+	}
+	mod, ok := lookupVtabModule(o.Table)
+	if !ok {
+		return nil
+	}
+	if _, isJSON := mod.(jsonEachModule); !isJSON {
+		return nil
+	}
+	cols, _, err := mod.Connect(nil)
+	if err != nil {
+		return nil
+	}
+	out := make([]string, len(cols))
+	for k, c := range cols {
+		out[k] = c.Name
+	}
+	return out
 }
 
 // r41WalkStmt visits every column reference and every qualified "*" anywhere in
@@ -1487,65 +1933,28 @@ func (f *r41Flat) hasExprCol() bool {
 }
 
 // exprColCompared reports a reference to an expression column of the derived
-// table that is a direct operand of a comparison. substExpr gives the copy the
+// table that is an operand of a comparison. substExpr gives the copy the
 // column's own implicit collating sequence (an un-flagged COLLATE, BINARY for
 // an expression that has none), which a comparison then prefers over the other
 // operand's -- a node this AST has no spelling for. Everywhere else the copy
 // and the bare expression collate alike, BINARY being the default.
 //
-// wrap reports a comparison whose left operand is such a reference and whose
-// right operand would hand the bare copy a sequence other than BINARY:
+// wrap reports a comparison where the copy's sequence decides and the bare
+// expression would take another operand's sequence instead:
 // wrapComparedLeft spells the copy's BINARY out there. decline reports one
 // this does not follow at all.
 func (f *r41Flat) exprColCompared(stmt *SelectStmt, binaryColl func(Expr) bool) (decline, wrap bool) {
-	isExprCol := f.isExprColRef
-	found := false
 	visit := func(e Expr) {
-		switch x := e.(type) {
-		case BinaryExpr:
-			switch strings.ToUpper(x.Op) {
-			case "=", "==", "<", "<=", ">", ">=", "!=", "<>", "IS", "IS NOT":
-				// sqlite3BinaryCompareCollSeq (expr.c:430): with no explicit
-				// COLLATE the left operand's sequence wins, else the right's.
-				// The copy's implicit BINARY on the LEFT therefore wins where
-				// the bare expression (no sequence) would defer to the right
-				// operand's; that is a difference only when the right one is
-				// not BINARY. On the right it never changes the answer.
-				if isExprCol(x.L) && !isExprCol(x.R) && !binaryColl(x.R) {
-					wrap = true
-				}
-				// The NULL-row CASE has no implicit collation or affinity of
-				// the copy's own to bring to a comparison; not followed.
-				if f.outerRowid != "" && (isExprCol(x.L) || isExprCol(x.R)) {
-					found = true
-				}
-			}
-		case InExpr:
-			found = found || isExprCol(x.X)
-			for _, it := range x.List {
-				found = found || isExprCol(it)
-			}
-		case BetweenExpr:
-			found = found || isExprCol(x.X) || isExprCol(x.Lo) || isExprCol(x.Hi)
-		case LikeExpr:
-			found = found || isExprCol(x.X) || isExprCol(x.Pattern)
-		case GlobExpr:
-			found = found || isExprCol(x.X) || isExprCol(x.Pattern)
-		case CaseExpr:
-			if x.Base != nil {
-				found = found || isExprCol(x.Base)
-				for _, w := range x.Whens {
-					found = found || isExprCol(w.When)
-				}
-			}
-		}
+		w, d := f.copyColl(e, binaryColl)
+		wrap = wrap || w
+		decline = decline || d
 	}
 	walk := func(e Expr) {
 		// A subquery that names nothing of the derived table holds no such
 		// reference; the flatten leaves it as it is (subqueryUntouched).
 		if e != nil && !r41WalkQ(e, visit, f.subqueryUntouched) {
 			// A node the walk does not enter could hold one.
-			found = true
+			decline = true
 		}
 	}
 	for _, c := range stmt.Columns {
@@ -1557,6 +1966,9 @@ func (f *r41Flat) exprColCompared(stmt *SelectStmt, binaryColl func(Expr) bool) 
 	walk(stmt.Having)
 	for _, it := range stmt.From {
 		walk(it.On)
+		for _, a := range it.TableFuncArgs {
+			walk(a)
+		}
 	}
 	for _, g := range stmt.GroupBy {
 		walk(g)
@@ -1564,12 +1976,172 @@ func (f *r41Flat) exprColCompared(stmt *SelectStmt, binaryColl func(Expr) bool) 
 	for _, ot := range stmt.OrderBy {
 		walk(ot.Expr)
 	}
-	return found, wrap
+	return decline, wrap
+}
+
+// copyColl is exprColCompared for one node: wrap when the operand whose
+// sequence the node's comparisons take first is a copy, the bare expression
+// would defer to another operand's sequence there, and that sequence is not
+// BINARY; decline for a shape that is not followed.
+//
+// The operand that decides is the comparison's left one (sqlite3BinaryCompareCollSeq,
+// expr.c:430: an explicit COLLATE on either side first, then the left
+// operand's sequence, then the right's), BETWEEN's X (coded as two comparisons
+// with X on the left), a CASE's base (compared with each WHEN on the right),
+// and IN's X: a list takes X's sequence alone (sqlite3CodeRhsOfIN), a
+// subquery compares X with its result column as a comparison does. The copy's
+// sequence carries no EP_Collate, so an explicit COLLATE on another operand
+// still beats it; binaryColl answers true for one.
+func (f *r41Flat) copyColl(e Expr, binaryColl func(Expr) bool) (wrap, decline bool) {
+	isRef := f.isExprColRef
+	var x Expr
+	var others []Expr
+	switch n := e.(type) {
+	case BinaryExpr:
+		switch strings.ToUpper(n.Op) {
+		case "=", "==", "<", "<=", ">", ">=", "!=", "<>", "IS", "IS NOT":
+		default:
+			return false, false
+		}
+		x, others = n.L, []Expr{n.R}
+	case BetweenExpr:
+		x, others = n.X, []Expr{n.Lo, n.Hi}
+	case CaseExpr:
+		if n.Base == nil {
+			return false, false
+		}
+		x = n.Base
+		for _, w := range n.Whens {
+			others = append(others, w.When)
+		}
+	case InExpr:
+		x, others = n.X, n.List
+	default:
+		return false, false
+	}
+	operands := append([]Expr{x}, others...)
+	for _, o := range operands {
+		// A row value compares element by element, each with its own
+		// sequence; not followed.
+		if r, ok := o.(RowExpr); ok {
+			for _, el := range r.Elems {
+				if isRef(el) {
+					return false, true
+				}
+			}
+		}
+		// The NULL row's copy is TK_IF_NULL_ROW, which sqlite3ExprAffinity
+		// looks through to the expression's own affinity; the CASE spelling
+		// here has none, so it stands in only for an expression that has
+		// none either.
+		if f.outerRowid != "" && isRef(o) && f.refMayHaveAffinity(o) {
+			return false, true
+		}
+	}
+	if !isRef(x) {
+		return false, false
+	}
+	if in, ok := e.(InExpr); ok {
+		if in.Sub == nil {
+			return true, false
+		}
+		// A result column with an explicit COLLATE beats the copy's
+		// sequence and would lose to the spelled one.
+		for _, arm := range append([]*SelectStmt{in.Sub}, compoundArmStmts(in.Sub)...) {
+			for _, c := range arm.Columns {
+				if c.Star || exprHasCollate(c.Expr) {
+					return false, true
+				}
+			}
+		}
+		return true, false
+	}
+	need, explicit := false, false
+	for _, o := range others {
+		if isRef(o) {
+			continue
+		}
+		if !binaryColl(o) {
+			need = true
+		}
+		if exprHasCollate(o) {
+			explicit = true
+		}
+	}
+	if need && explicit {
+		// One operand's explicit COLLATE beats the copy and another's
+		// declared sequence loses to it: one spelling cannot say both.
+		return false, true
+	}
+	return need, false
+}
+
+// exprHasCollate reports a COLLATE anywhere in e (EP_Collate propagates up
+// from it), or a node r41Walk does not know.
+func exprHasCollate(e Expr) bool {
+	found := false
+	if !r41Walk(e, func(n Expr) {
+		if _, ok := n.(CollateExpr); ok {
+			found = true
+		}
+	}) {
+		return true
+	}
+	return found
+}
+
+// refMayHaveAffinity reports whether the expression column o refers to
+// (through unary plus) may carry an affinity of its own: a column, a CAST, a
+// scalar subquery, under any COLLATE. A CAST over the reference brings its
+// own and is answered false.
+func (f *r41Flat) refMayHaveAffinity(o Expr) bool {
+	for {
+		if u, ok := o.(UnaryExpr); ok && u.Op == "+" {
+			o = u.X
+			continue
+		}
+		break
+	}
+	ce, ok := o.(ColumnExpr)
+	if !ok {
+		return false
+	}
+	k, ok := f.byName[r33sFoldIdent(ce.Name)]
+	if !ok {
+		return true
+	}
+	x := f.cols[k].expr
+	for {
+		if c, ok := x.(CollateExpr); ok {
+			x = c.X
+			continue
+		}
+		break
+	}
+	switch x.(type) {
+	case ColumnExpr, CastExpr, SubqueryExpr:
+		return true
+	}
+	return false
 }
 
 // isExprColRef reports a parent reference to an expression column of the
-// derived table.
+// derived table, also under CAST or unary plus, which sqlite3ExprCollSeq looks
+// through to the copy's sequence.
 func (f *r41Flat) isExprColRef(e Expr) bool {
+	for {
+		switch x := e.(type) {
+		case CastExpr:
+			e = x.X
+			continue
+		case UnaryExpr:
+			if x.Op == "+" {
+				e = x.X
+				continue
+			}
+		}
+		break
+	}
 	ce, ok := e.(ColumnExpr)
 	if !ok {
 		return false
@@ -1581,20 +2153,18 @@ func (f *r41Flat) isExprColRef(e Expr) bool {
 	return ok && f.cols[k].expr != nil && !f.cols[k].colRef
 }
 
-// wrapComparedLeft returns stmt with every comparison exprColCompared flagged
-// for wrap given an explicit COLLATE BINARY on its left operand. That is the
-// copy's implicit BINARY (substExpr, select.c:3858-3866), and spelled
-// explicitly it decides the comparison the same way, since the right operand
-// carries no explicit COLLATE there (binaryColl answers true for one). false
-// for a clause holding such a comparison inside a node this does not rebuild.
+// wrapComparedLeft returns stmt with every operand copyColl flagged for wrap
+// given an explicit COLLATE BINARY. That is the copy's implicit BINARY
+// (substExpr, select.c:3858-3866), and spelled explicitly it decides the
+// comparison the same way, since no other operand carries an explicit COLLATE
+// there (copyColl declines that). false for a clause holding such a node
+// inside one this does not rebuild.
 func (f *r41Flat) wrapComparedLeft(stmt *SelectStmt, binaryColl func(Expr) bool) (*SelectStmt, bool) {
-	needs := func(x BinaryExpr) bool {
-		switch strings.ToUpper(x.Op) {
-		case "=", "==", "<", "<=", ">", ">=", "!=", "<>", "IS", "IS NOT":
-			return f.isExprColRef(x.L) && !f.isExprColRef(x.R) && !binaryColl(x.R)
-		}
-		return false
+	needs := func(e Expr) bool {
+		w, _ := f.copyColl(e, binaryColl)
+		return w
 	}
+	wrapped := func(e Expr) Expr { return CollateExpr{X: e, Name: "BINARY"} }
 	ok := true
 	var rw func(Expr) Expr
 	list := func(es []Expr) []Expr {
@@ -1611,14 +2181,14 @@ func (f *r41Flat) wrapComparedLeft(stmt *SelectStmt, binaryColl func(Expr) bool)
 		if !ok || e == nil {
 			return e
 		}
+		wrap := needs(e)
 		switch x := e.(type) {
 		case LiteralExpr, ParamExpr, ColumnExpr:
 			return e
 		case BinaryExpr:
-			wrapL := needs(x)
 			x.L, x.R = rw(x.L), rw(x.R)
-			if wrapL {
-				x.L = CollateExpr{X: x.L, Name: "BINARY"}
+			if wrap {
+				x.L = wrapped(x.L)
 			}
 			return x
 		case UnaryExpr:
@@ -1634,10 +2204,19 @@ func (f *r41Flat) wrapComparedLeft(stmt *SelectStmt, binaryColl func(Expr) bool)
 			x.X = rw(x.X)
 			return x
 		case InExpr:
+			if x.Sub != nil && !f.subqueryUntouched(x.Sub) {
+				break
+			}
 			x.X, x.List = rw(x.X), list(x.List)
+			if wrap {
+				x.X = wrapped(x.X)
+			}
 			return x
 		case BetweenExpr:
 			x.X, x.Lo, x.Hi = rw(x.X), rw(x.Lo), rw(x.Hi)
+			if wrap {
+				x.X = wrapped(x.X)
+			}
 			return x
 		case LikeExpr:
 			x.X, x.Pattern, x.Escape = rw(x.X), rw(x.Pattern), rw(x.Escape)
@@ -1655,6 +2234,9 @@ func (f *r41Flat) wrapComparedLeft(stmt *SelectStmt, binaryColl func(Expr) bool)
 				whens[k] = WhenClause{When: rw(w.When), Then: rw(w.Then)}
 			}
 			x.Whens = whens
+			if wrap {
+				x.Base = wrapped(x.Base)
+			}
 			return x
 		case FuncExpr:
 			if len(x.OrderBy) == 0 && x.Over == nil {
@@ -1663,11 +2245,11 @@ func (f *r41Flat) wrapComparedLeft(stmt *SelectStmt, binaryColl func(Expr) bool)
 				return x
 			}
 		}
-		// A node not rebuilt here: refused if it holds a comparison to wrap.
-		// A subquery naming nothing of the derived table holds none.
+		// A node not rebuilt here: refused if it holds a node to wrap. A
+		// subquery naming nothing of the derived table holds none.
 		hit := false
 		if !r41WalkQ(e, func(n Expr) {
-			if b, isBin := n.(BinaryExpr); isBin && needs(b) {
+			if needs(n) {
 				hit = true
 			}
 		}, f.subqueryUntouched) || hit {
@@ -1687,6 +2269,7 @@ func (f *r41Flat) wrapComparedLeft(stmt *SelectStmt, binaryColl func(Expr) bool)
 	out.From = append([]FromItem(nil), stmt.From...)
 	for k := range out.From {
 		out.From[k].On = rw(out.From[k].On)
+		out.From[k].TableFuncArgs = list(out.From[k].TableFuncArgs)
 	}
 	out.GroupBy = list(stmt.GroupBy)
 	if stmt.OrderBy != nil {
