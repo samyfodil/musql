@@ -2292,8 +2292,10 @@ func columnRefNameParts(scopes []tableScope, ce ColumnExpr) (qualifier, display 
 // the fast bail-out every conversion below takes first, so a schema with no
 // generated column pays nothing.
 func hasGeneratedCols(cols []columnInfo) bool {
-	for _, c := range cols {
-		if c.IsGenerated() {
+	// By index: a columnInfo is a few hundred bytes, and ranging by value
+	// copied each one, for every row a write stored.
+	for i := range cols {
+		if cols[i].GeneratedExpr != "" {
 			return true
 		}
 	}
@@ -2304,8 +2306,8 @@ func hasGeneratedCols(cols []columnInfo) bool {
 // i.e. whether the record is narrower than the column list at all. A table
 // whose generated columns are all STORED needs no slot remapping.
 func hasVirtualCols(cols []columnInfo) bool {
-	for _, c := range cols {
-		if c.IsGenerated() && !c.GeneratedStored {
+	for i := range cols { // by index, as hasGeneratedCols
+		if cols[i].GeneratedExpr != "" && !cols[i].GeneratedStored {
 			return true
 		}
 	}

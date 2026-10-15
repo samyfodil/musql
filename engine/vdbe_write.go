@@ -509,9 +509,16 @@ func (db *DB) runWrite(prog *Program, args []Value) (rowsAffected int64, err err
 
 // runWriteBody is runWrite once the machine and statement context are taken.
 func (db *DB) runWriteBody(prog *Program, args []Value, m *vdbe, wc *writeCtx) (rowsAffected int64, err error) {
-	m.sorters = make([]*vdbeSorter, prog.NSorters)
-	m.distinctSets = make([]*vdbeDistinctSet, prog.NDistinct)
-	m.subCache = make([]subCacheEntry, prog.NSubCache)
+	// Only what the program uses: a prepared INSERT has none of the three, and
+	// making three empty slices was a call apiece per row of a load.
+	m.sorters, m.distinctSets = nil, nil
+	if prog.NSorters > 0 {
+		m.sorters = make([]*vdbeSorter, prog.NSorters)
+	}
+	if prog.NDistinct > 0 {
+		m.distinctSets = make([]*vdbeDistinctSet, prog.NDistinct)
+	}
+	m.subCache = reuseSubCache(m.subCache, prog.NSubCache)
 	m.params = args
 	m.wctx = wc
 	m.jx = prog.writeJIT()
@@ -3814,6 +3821,9 @@ func (m *vdbe) storeResolvingConflicts(plan *insertPlan, rowid uint64, full []Va
 	}
 	if bl := m.bulkLoadFor(plan); bl != nil {
 		stored, err := m.bulkStore(bl, tbl, rowid, full)
+		if stored && err == nil {
+			m.recGiveBack(full) // the load's cutter copied it (segCutter.own)
+		}
 		if err != nil || stored {
 			return stored, err
 		}

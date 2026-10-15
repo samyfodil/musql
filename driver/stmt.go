@@ -30,6 +30,19 @@ type Stmt struct {
 	// script is the individual statements of a ";"-separated SCRIPT, non-nil
 	// only for multi-statement text. Such a Stmt is Exec-only.
 	script []string
+	// results is where an Exec's Result is carved (newResult), as bytesArena
+	// is for its arguments: one allocation per many rows. A Result is never
+	// rewritten -- a full chunk is left to the Results that point into it.
+	results []execResult
+}
+
+// newResult is a Result of its own for one Exec, from s.results.
+func (s *Stmt) newResult(rowsAffected, lastInsertID int64) *execResult {
+	if len(s.results) == cap(s.results) {
+		s.results = make([]execResult, 0, 64)
+	}
+	s.results = append(s.results, execResult{rowsAffected: rowsAffected, lastInsertID: lastInsertID})
+	return &s.results[len(s.results)-1]
 }
 
 var (
@@ -128,7 +141,7 @@ func (s *Stmt) execContextImpl(ctx context.Context, args []driver.NamedValue) (d
 	}
 	// RowsAffected is the connection's current change count from sqlite3_changes(),
 	// which reflects the last statement that actually modified rows.
-	return &execResult{rowsAffected: s.conn.changes, lastInsertID: s.conn.lastInsertRowid}, nil
+	return s.newResult(s.conn.changes, s.conn.lastInsertRowid), nil
 }
 
 // QueryContext implements driver.StmtQueryContext.
@@ -173,6 +186,10 @@ func bindArgsInto(buf []engine.Value, info engine.ParamInfo, args []driver.Named
 		var v engine.Value
 		var err error
 		switch x := nv.Value.(type) {
+		case int64: // the integers first: driverValueToEngine's switch reaches int fourth
+			v = engine.Value{Typ: engine.Int, I: x}
+		case int:
+			v = engine.Value{Typ: engine.Int, I: int64(x)}
 		case string:
 			v = engine.Value{Typ: engine.Text, S: copyArgBytes(arena, x)}
 		case []byte:

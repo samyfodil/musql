@@ -382,7 +382,7 @@ func (db *DB) segmentFileContentsOf(temp bool, w *segFileWriter) ([]ConvertedTab
 				if berr != nil {
 					break
 				}
-				berr = w.addSegment(ti, raw)
+				berr = w.addSegmentOwned(ti, raw)
 			}
 			if berr != nil {
 				return nil, ConvertedCatalog{}, fmt.Errorf("engine: DDL: %w", berr)

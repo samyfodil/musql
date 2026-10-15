@@ -3271,6 +3271,22 @@ func (m *vdbe) recAlloc(n int) []Value {
 	return out
 }
 
+// recGiveBack returns rec, the record recAlloc carved last, to the arena: for a
+// caller that copied it and keeps no reference (a direct-path load's own
+// cutter, insert_bulk_direct.go), so a load's every row reuses one record's
+// memory instead of carving another. Anything but the last carve is left alone.
+func (m *vdbe) recGiveBack(rec []Value) {
+	n := len(rec)
+	if n == 0 || cap(rec) != n || len(m.recChunk) == 0 {
+		return
+	}
+	end := unsafe.Add(unsafe.Pointer(unsafe.SliceData(rec)), uintptr(n)*unsafe.Sizeof(Value{}))
+	if end != unsafe.Pointer(unsafe.SliceData(m.recChunk)) {
+		return
+	}
+	m.recChunk = unsafe.Slice(unsafe.SliceData(rec), n+len(m.recChunk))
+}
+
 // reuseSubCache is a cleared sub-cache of n entries in s's storage when it is
 // big enough: a pooled machine keeps its slice, and a recursive CTE runs its
 // step program on one per row, so allocating it each time was one allocation

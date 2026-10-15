@@ -820,6 +820,9 @@ func (c *Conn) ensureFileExistsPath(path string) error {
 func (c *Conn) execArgs(sqlText string, args []engine.Value) (driver.Result, error) {
 	c.refreshedThisStmt = false // a new statement is a new freshness boundary
 	c.stmtText = sqlText
+	if c.tx != nil && len(c.attached) == 0 && c.plainDML(sqlText) {
+		return c.execPlainInTx(sqlText, args)
+	}
 	if _, handled, perr := c.busyTimeoutPragmaEarly(sqlText); handled {
 		return &execResult{lastInsertID: c.lastInsertRowid}, perr
 	}
@@ -843,6 +846,37 @@ func (c *Conn) execArgs(sqlText string, args []engine.Value) (driver.Result, err
 	// measurable share of a prepared INSERT's time.
 	defer c.deferFKPragmaApply(sqlText)
 	return c.execArgsBody(sqlText, args)
+}
+
+// execPlainInTx is execArgs for plain DML (plainDML) inside the held
+// transaction with nothing attached: a prepared INSERT run once per row of a
+// load. It takes the same steps, less those that cannot apply -- the two
+// PRAGMA interceptions and execArgsBody's EXPLAIN, PRAGMA and transaction
+// statement handling (plain DML is none of them), the defer_foreign_keys guard
+// (a no-op while a transaction is open) and routing (nothing is attached, so
+// main, unchanged). The checks and their calls were a tenth of the load's
+// per-row time.
+func (c *Conn) execPlainInTx(sqlText string, args []engine.Value) (driver.Result, error) {
+	if serr := c.ensureSession(); serr != nil {
+		return nil, serr
+	}
+	// The apply half runs whatever the outcome: a RAISE(ROLLBACK) closes the
+	// transaction, after which it is no longer a no-op.
+	defer c.deferFKPragmaApply(sqlText)
+	if c.tx == nil || len(c.attached) != 0 {
+		// ensureSession changed what the lane assumed: execArgs' own way.
+		if derr := c.deferFKPragmaGuard(sqlText); derr != nil {
+			return nil, derr
+		}
+		return c.execArgsBody(sqlText, args)
+	}
+	if serr := c.schemaCorruptRefuses(sqlText); serr != nil {
+		return nil, serr
+	}
+	if !c.tempOpened && c.opensTempDatabase(sqlText) { // see execArgsBody
+		c.tempOpened = true
+	}
+	return c.execHeldTxn(sqlText, args)
 }
 
 // execArgsBody is execArgs once the session is held and the
@@ -1020,53 +1054,7 @@ func (c *Conn) execArgsBody(sqlText string, args []engine.Value) (driver.Result,
 		return c.execAuxTxn(targetPath, targetSchema, sqlText, args)
 	}
 	if c.tx != nil {
-		// The held main session. The attachments are wired on as read snapshots for this one statement
-		// (withAttachedReaders): a statement route calls main-only can still
-		// READ an attachment -- an object-scoped pragma's own lookup, a view or
-		// trigger body's qualified reference -- and used to see zero rows.
-		release, aerr := c.withAttachedReaders(c.tx)
-		if aerr != nil {
-			return nil, aerr
-		}
-		n, _, err := c.tx.ExecArgsOwned(sqlText, args) // args are this call's copies (driverValueToEngine)
-		release()
-
-		// Read the counters back unconditionally, as the autocommit path does: a
-		// halted statement still publishes them. Reading only on success left
-		// the Conn's copy stale until COMMIT replaced the session:
-		//
-		//	BEGIN; INSERT OR FAIL INTO t VALUES(...4 rows, the 3rd violating...);
-		//	SELECT changes(), total_changes()   -- (2,3) both engines
-		//	COMMIT;
-		//	SELECT changes(), total_changes()   -- (2,3)
-		c.noteConnState(c.tx)
-		if err != nil {
-			// A RAISE(ROLLBACK) trigger error unwinds the WHOLE transaction.
-			// Since this driver models the transaction as the held c.tx engine
-			// session (the engine's own txActive is not set here), discard that
-			// session so the transaction is fully rolled back -- a subsequent
-			// COMMIT then correctly reports "no transaction is active", matching
-			// C SQLite. Every other error leaves the held session intact
-			// (the failing statement's own changes already reverted in-memory).
-			if engine.ErrorRollsBackTransaction(err) {
-				c.abandonTxn()
-			}
-			return nil, err
-		}
-		c.autoVacuumPendingPlus1 = c.tx.AutoVacuumPending() // see Conn.autoVacuumPendingPlus1
-		c.journalMode = c.tx.JournalMode()                  // see Conn.journalMode
-		c.tempStore = c.tx.TempStore()                      // see Conn.tempStore
-		c.tempJournalMode = c.tx.TempJournalMode()          // see Conn.tempJournalMode
-		// A "writable_schema=RESET" that writableSchemaReload actually applies
-		// (engine/schema_write_direct.go) flips c.tx's own flag without going
-		// through writableSchemaPragma's setter -- see engine.WritableSchema's
-		// doc comment -- so the Conn-level mirror is read back here too.
-		c.writableSchema = c.tx.WritableSchema()
-		c.noteConnState(c.tx)
-		if c.resultDiscarded {
-			return discardedResult, nil
-		}
-		return &execResult{rowsAffected: n, lastInsertID: c.lastInsertRowid}, nil
+		return c.execHeldTxn(sqlText, args)
 	}
 
 	var n int64
@@ -1142,6 +1130,58 @@ func (c *Conn) execArgsBody(sqlText string, args []engine.Value) (driver.Result,
 	// UPDATE/DELETE -- hands the same value straight back, exactly like real
 	// SQLite's sqlite3_last_insert_rowid(). ExecArgs' own last-insert-id return
 	// is that same value, so it is no longer read here.
+	return &execResult{rowsAffected: n, lastInsertID: c.lastInsertRowid}, nil
+}
+
+// execHeldTxn runs one statement routed to main on the held transaction's
+// session.
+func (c *Conn) execHeldTxn(sqlText string, args []engine.Value) (driver.Result, error) {
+	// The held main session. The attachments are wired on as read snapshots for this one statement
+	// (withAttachedReaders): a statement route calls main-only can still
+	// READ an attachment -- an object-scoped pragma's own lookup, a view or
+	// trigger body's qualified reference -- and used to see zero rows.
+	release, aerr := c.withAttachedReaders(c.tx)
+	if aerr != nil {
+		return nil, aerr
+	}
+	n, _, err := c.tx.ExecArgsOwned(sqlText, args) // args are this call's copies (driverValueToEngine)
+	release()
+
+	// Read the counters back unconditionally, as the autocommit path does: a
+	// halted statement still publishes them. Reading only on success left
+	// the Conn's copy stale until COMMIT replaced the session:
+	//
+	//	BEGIN; INSERT OR FAIL INTO t VALUES(...4 rows, the 3rd violating...);
+	//	SELECT changes(), total_changes()   -- (2,3) both engines
+	//	COMMIT;
+	//	SELECT changes(), total_changes()   -- (2,3)
+	c.noteConnState(c.tx)
+	if err != nil {
+		// A RAISE(ROLLBACK) trigger error unwinds the WHOLE transaction.
+		// Since this driver models the transaction as the held c.tx engine
+		// session (the engine's own txActive is not set here), discard that
+		// session so the transaction is fully rolled back -- a subsequent
+		// COMMIT then correctly reports "no transaction is active", matching
+		// C SQLite. Every other error leaves the held session intact
+		// (the failing statement's own changes already reverted in-memory).
+		if engine.ErrorRollsBackTransaction(err) {
+			c.abandonTxn()
+		}
+		return nil, err
+	}
+	c.autoVacuumPendingPlus1 = c.tx.AutoVacuumPending() // see Conn.autoVacuumPendingPlus1
+	c.journalMode = c.tx.JournalMode()                  // see Conn.journalMode
+	c.tempStore = c.tx.TempStore()                      // see Conn.tempStore
+	c.tempJournalMode = c.tx.TempJournalMode()          // see Conn.tempJournalMode
+	// A "writable_schema=RESET" that writableSchemaReload actually applies
+	// (engine/schema_write_direct.go) flips c.tx's own flag without going
+	// through writableSchemaPragma's setter -- see engine.WritableSchema's
+	// doc comment -- so the Conn-level mirror is read back here too.
+	c.writableSchema = c.tx.WritableSchema()
+	c.noteConnState(c.tx)
+	if c.resultDiscarded {
+		return discardedResult, nil
+	}
 	return &execResult{rowsAffected: n, lastInsertID: c.lastInsertRowid}, nil
 }
 

@@ -2204,6 +2204,75 @@ func (db *DB) ExecArgsOwned(sqlText string, args []Value) (rowsAffected int64, l
 // returns rows affected and this *DB's last_insert_rowid after the statement
 // (only INSERT changes it, as with sqlite3_last_insert_rowid()).
 func (db *DB) ExecArgs(sqlText string, args []Value) (rowsAffected int64, lastInsertID int64, err error) {
+	if db.plainWriteLane(sqlText) {
+		return db.execPlainWrite(sqlText, args)
+	}
+	return db.execArgsFull(sqlText, args)
+}
+
+// plainWriteLane reports whether sqlText may take execPlainWrite: a top-level
+// INSERT, REPLACE, UPDATE or DELETE on a session where every statement guard
+// of execArgsBody that such a statement could trip is off. A prepared INSERT
+// run once per row of a load is the shape: the guards are each a bool read
+// once the state allows, but their calls, the defers that order them and the
+// statement-text lookups each repeats were a fifth of a bulk load's time.
+func (db *DB) plainWriteLane(sqlText string) bool {
+	if CommitOrderHookForTest != nil || db.stmtDepth != 0 || db.queryOnly || db.writeLock != "" ||
+		db.wsSchemaCorruptObj != "" || db.deferFKAutocommitActive() || len(db.attached) != 0 {
+		return false
+	}
+	f := stmtTextFlagsFor(sqlText)
+	if !f.verbOK || f.isExplain {
+		return false
+	}
+	switch f.verb {
+	case "INSERT", "REPLACE", "UPDATE", "DELETE":
+		return true
+	}
+	return false
+}
+
+// execPlainWrite is execArgsFull for a statement plainWriteLane admitted: the
+// same steps in the same order, less the guards it established are no-ops --
+// EXPLAIN (the verb is DML), query_only and a failed schema load (both off),
+// defer_foreign_keys' autocommit window (closed, and a DML statement cannot
+// open it: the statement after it is asked again, as ever), routing to an
+// ATTACHed database (none), and journalDDL (not DDL).
+func (db *DB) execPlainWrite(sqlText string, args []Value) (rowsAffected int64, lastInsertID int64, err error) {
+	db.schemaSeqReserved = [2]uint64{} // see nextSchemaSeq
+	kind := db.mainReadTxnOf(sqlText)
+	db.stmtDepth++
+	db.noteTransactionMayHaveDirtiedMain(sqlText)
+	rowsAffected, lastInsertID, err = db.tryVDBEWrite(sqlText, args)
+	if err == nil {
+		db.noteTransactionDirtiedMain(sqlText, rowsAffected)
+	}
+	db.fts3TxnMaybeTaint(sqlText) // the statement may have started an fts3 segment
+	if err == nil && db.pendingLoadErr != nil {
+		err = db.pendingLoadErr
+		db.pendingLoadErr = nil
+	}
+	db.stmtDepth--
+	// execArgsBody's deferred tail, then ExecArgs': no panic is recovered
+	// anywhere above, so running them inline is running them in order.
+	db.deferFKAutocommitApply(sqlText, true) // a RAISE(ROLLBACK) can end the transaction
+	k := mainReadTxnUnknown
+	if err == nil {
+		k = db.mainReadTxnAfter(sqlText, kind)
+	}
+	if k == mainReadTxnUnknown {
+		db.noteWalIndexOpaque()
+	} else {
+		db.noteWalIndexStatement(k)
+	}
+	if perr := db.takeDeferredErr(); perr != nil && err == nil {
+		err = perr
+	}
+	return rowsAffected, lastInsertID, incompleteIfAtEOF(err)
+}
+
+// execArgsFull is ExecArgs for every statement execPlainWrite does not take.
+func (db *DB) execArgsFull(sqlText string, args []Value) (rowsAffected int64, lastInsertID int64, err error) {
 	// Deferred FIRST so it runs LAST: a parse error raised at end of input is
 	// "incomplete input", whatever the grammar was in the middle of
 	// (parse.y:44-51 -- see incompleteIfAtEOF).
