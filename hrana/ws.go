@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 
@@ -62,12 +64,39 @@ type wsCursor struct {
 	err      *pb.Error
 }
 
+func isSafeOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	originHost := u.Hostname()
+	reqHost := r.Host
+	if h, _, err := net.SplitHostPort(reqHost); err == nil {
+		reqHost = h
+	}
+	if strings.EqualFold(originHost, reqHost) {
+		return true
+	}
+	if originHost == "localhost" || originHost == "127.0.0.1" || originHost == "::1" {
+		return true
+	}
+	return false
+}
+
 func (s *Server) serveWS(w http.ResponseWriter, r *http.Request) {
 	if !s.track() {
 		http.Error(w, `{"message":"server is closing"}`, http.StatusServiceUnavailable)
 		return
 	}
 	defer s.ws.Done()
+	if s.authToken == "" && !isSafeOrigin(r) {
+		http.Error(w, `{"message":"forbidden: cross-origin websocket connection without auth token"}`, http.StatusForbidden)
+		return
+	}
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: wsSubprotocols, InsecureSkipVerify: true})
 	if err != nil {
 		return

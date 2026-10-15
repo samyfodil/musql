@@ -1,6 +1,7 @@
 package hrana
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"net"
 	"net/http"
@@ -16,9 +17,10 @@ import (
 // (<db>.<host>): "app.example.com" serves <dir>/app.musq. Hrana itself has no
 // way to select a database, so the address is the selector.
 type Multi struct {
-	dir    string
-	create bool
-	opts   []Option
+	dir       string
+	create    bool
+	opts      []Option
+	authToken string
 
 	mu  sync.Mutex
 	dbs map[string]*multiDB
@@ -34,7 +36,13 @@ var dbName = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
 // NewMulti serves the databases in dir. With create, a name that has no file
 // yet gets a new empty database; without it, such a request is a 404.
 func NewMulti(dir string, create bool, opts ...Option) *Multi {
-	return &Multi{dir: dir, create: create, opts: opts, dbs: map[string]*multiDB{}}
+	m := &Multi{dir: dir, create: create, opts: opts, dbs: map[string]*multiDB{}}
+	dummy := &Server{}
+	for _, o := range opts {
+		o(dummy)
+	}
+	m.authToken = dummy.authToken
+	return m
 }
 
 // Close closes every open database.
@@ -70,6 +78,14 @@ func (m *Multi) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !dbName.MatchString(name) {
 		http.Error(w, `{"message":"no database in the host name; use <db>.<host>"}`, http.StatusNotFound)
 		return
+	}
+	if m.authToken != "" && !isWebSocket(r) {
+		auth := r.Header.Get("Authorization")
+		tok, ok := strings.CutPrefix(auth, "Bearer ")
+		if !ok || subtle.ConstantTimeCompare([]byte(tok), []byte(m.authToken)) != 1 {
+			http.Error(w, `{"message":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
 	}
 	srv, err := m.server(name)
 	if err != nil {
