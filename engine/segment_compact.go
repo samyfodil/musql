@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sync/atomic"
 
+	"github.com/samyfodil/musql/internal/fsio"
 	"github.com/samyfodil/musql/internal/mmapfile"
 )
 
@@ -117,7 +118,7 @@ func CompactSegmentFile(segPath string) (bool, error) {
 	if serr := syncSegFile(tmpPath); serr != nil {
 		return false, serr
 	}
-	if rerr := os.Rename(tmpPath, segPath); rerr != nil {
+	if rerr := fsio.Rename(tmpPath, segPath); rerr != nil { // see fsio.Rename
 		return false, rerr
 	}
 	syncDir(segPath)

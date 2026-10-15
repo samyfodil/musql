@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/samyfodil/musql/internal/fsio"
 )
 
 // THE TEMP DATABASE'S FILE.
@@ -149,7 +151,7 @@ func (db *DB) rewriteTempFile(fp string) error {
 		tp.fp = ""
 		return fmt.Errorf("engine: TEMP database: %w", werr)
 	}
-	if rerr := os.Rename(tmp, tp.path); rerr != nil {
+	if rerr := fsio.Rename(tmp, tp.path); rerr != nil { // see fsio.Rename
 		os.Remove(tmp)
 		tp.fp = ""
 		return fmt.Errorf("engine: TEMP database: %w", rerr)
