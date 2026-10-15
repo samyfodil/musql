@@ -58,6 +58,10 @@ type insertStmt struct {
 	// scopes to the whole statement (its RETURNING included), not one the
 	// SELECT brought.
 	leadingWith bool
+	// ownCTEs, when set, is the SELECT's own WITH clause beside a leading
+	// one (wrapLeadingWith): a name it defines is not the leading clause's
+	// anywhere in the SELECT.
+	ownCTEs []CTEDef
 
 	// orAction is the resolution algorithm named by an "INSERT OR ..."
 	// clause (or REPLACE INTO's implied conflictReplace), or the default
@@ -178,6 +182,25 @@ func lexWriteText(sqlText string) ([]token, error) {
 // points, except allowExprValues: a trigger body's INSERT (true) skips the
 // top-level parse-time aggregate decline, since its VALUES need NEW./OLD.
 // references and have a row context.
+// wrapLeadingWith is sel, a SELECT with a WITH clause of its own, under the
+// statement's leading WITH: "WITH <leading> SELECT * FROM (<sel>)". The
+// leading clause is the whole statement's (parse.y's sqlite3WithPush), so it
+// is RETURNING's too (leadingWith); sel's own clause is searched first
+// (searchWith walks pParse->pWith innermost-out), so a name it defines is
+// its own wherever sel says it (ownCTEs).
+func (p *parser) wrapLeadingWith(stmt *insertStmt, leading []CTEDef, sel *SelectStmt) *SelectStmt {
+	p.cLeafSeq++
+	item := FromItem{Subquery: sel, cID: p.cLeafSeq}
+	stmt.leadingWith = true
+	stmt.ownCTEs = sel.CTEs
+	return &SelectStmt{
+		CTEs:    leading,
+		Columns: []SelectColumn{{Star: true}},
+		From:    []FromItem{item},
+		cFrom:   []cSrcNode{{leaf: item.cID}},
+	}
+}
+
 func parseInsertStmtTokens(p *parser, allowExprValues bool) (*insertStmt, error) {
 	stmt := &insertStmt{}
 
@@ -288,14 +311,15 @@ func parseInsertStmtTokens(p *parser, allowExprValues bool) (*insertStmt, error)
 			return nil, err
 		}
 		// A WITH clause written BEFORE the INSERT keyword (leadingCTEs) has
-		// nothing of its own to attach to, so it is attached here -- but only
-		// when the select did not bring its own list, which now it can. The
-		// two spellings are mutually exclusive in SQLite's grammar (a leading
-		// WITH is consumed by the outer statement), so this never has to
-		// merge them.
+		// nothing of its own to attach to, so it is attached here. A select
+		// that brings its own WITH as well sees both, its own innermost
+		// (sqlite3WithPush scopes the leading one to the whole statement):
+		// wrapLeadingWith.
 		if len(sel.CTEs) == 0 {
 			sel.CTEs = leadingCTEs
 			stmt.leadingWith = len(leadingCTEs) > 0
+		} else if len(leadingCTEs) > 0 {
+			sel = p.wrapLeadingWith(stmt, leadingCTEs, sel)
 		}
 		stmt.selectStmt = sel
 	} else if p.peekIsKeyword("DEFAULT") {
@@ -394,6 +418,8 @@ func parseInsertStmtTokens(p *parser, allowExprValues bool) (*insertStmt, error)
 			if len(sel.CTEs) == 0 {
 				sel.CTEs = leadingCTEs
 				stmt.leadingWith = len(leadingCTEs) > 0
+			} else if len(leadingCTEs) > 0 {
+				sel = p.wrapLeadingWith(stmt, leadingCTEs, sel)
 			}
 			stmt.rows = nil
 			stmt.selectStmt = sel

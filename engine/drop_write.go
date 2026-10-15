@@ -375,6 +375,8 @@ func (db *DB) removeTableAndIndexes(tbl *tableMeta) {
 		// other's.
 		if tr.tableAttachName != "" || !equalFoldName(tr.table, tbl.name) || tr.tableIsTemp != tbl.isTemp {
 			keptTr = append(keptTr, tr)
+		} else if tr.isTemp {
+			db.tempTrigHash.remove(tr.name)
 		}
 	}
 	db.triggers = keptTr

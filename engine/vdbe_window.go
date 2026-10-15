@@ -95,6 +95,11 @@ func (w windowCall) argCol(j int) int   { return atCol(w.argCols, j) }
 // windowPlan is the OpWindowFinal P4 payload: everything needed to turn the
 // collected batch into the query's result rows.
 type windowPlan struct {
+	// tail: the select is a co-routine of a reader that may stop before its
+	// end (SelectStmt.nthTail), so an nth_value check failing on a row the
+	// window code returns is the reader's error on reaching that row
+	// (windowTailErr), not the select's.
+	tail    bool
 	scopes  []tableScope
 	nCols   int // width of the [cols..] block in each batch entry
 	nRowids int // number of trailing rowid slots (one per joined table)
@@ -477,6 +482,18 @@ func sameWindowSpec(a, b *WindowSpec) bool {
 	return true
 }
 
+// windowTailErr is a window select's error that its reader meets only after
+// the rows before it: windowFinal returns it for a windowPlan.tail select, and
+// a cursor over the select's rows raises err when asked for the row after the
+// last of rows (vdbeCursor.streamErrPending). Anything else reads it as err.
+type windowTailErr struct {
+	rows [][]Value
+	err  error
+}
+
+func (e *windowTailErr) Error() string { return e.err.Error() }
+func (e *windowTailErr) Unwrap() error { return e.err }
+
 func (m *vdbe) windowFinal(plan *windowPlan) ([][]Value, error) {
 	batch := m.windowBatch
 	m.windowLazyErr = nil
@@ -577,6 +594,31 @@ func (m *vdbe) windowFinal(plan *windowPlan) ([][]Value, error) {
 	}
 
 	start, end := limitOffsetRange(len(rows), plan.limit, plan.offset)
+	if len(m.windowLazyErr) > 0 && plan.tail && windowOuterOrderDropped(plan) {
+		// A co-routine of its reader (windowPlan.tail): the rows before the
+		// first one whose check fails reach the reader, and the reader meets
+		// the error only when it asks for that one.
+		var kept [][]Value
+		var out [][]Value
+		for _, r := range returned {
+			if len(kept) >= end {
+				return out, nil
+			}
+			if err := m.windowLazyErr[r.seq]; err != nil {
+				return nil, &windowTailErr{rows: out, err: err}
+			}
+			if plan.distinct && slices.ContainsFunc(kept, func(k []Value) bool {
+				return keysEqualGrouping(k, r.out, plan.distinctColls, m.encoding())
+			}) {
+				continue
+			}
+			kept = append(kept, r.out)
+			if len(kept) > start {
+				out = append(out, r.out)
+			}
+		}
+		return out, nil
+	}
 	if len(m.windowLazyErr) > 0 {
 		// The rows C's window code returned: all of them when a sorter or a
 		// DISTINCT follows it, else only those up to the LIMIT (OFFSET rows
@@ -841,16 +883,42 @@ func (m *vdbe) partitionAndOrder(plan *windowPlan, lvl windowCall, batch [][]Val
 	partColls := m.windowKeyCollations(plan, spec.PartitionBy, batch, vals)
 	var parts [][]int
 	var partKeys [][]Value
-	for _, i := range order {
+	// byKey finds a partition by a string equal exactly where
+	// keysEqualCollated is (windowPartitionKey), so a FROM clause of many
+	// partitions is not compared against each one in turn. One key it cannot
+	// spell sends every row back to the comparison.
+	byKey := map[string]int{}
+	pks := make([][]Value, len(order))
+	strKeys := make([]string, len(order))
+	for n, i := range order {
 		pk, err := keyOf(i, spec.PartitionBy, lvl.partCols)
 		if err != nil {
 			return nil, err
 		}
+		pks[n] = pk
+		if byKey != nil {
+			key, ok := windowPartitionKey(pk, partColls, m.encoding())
+			if !ok {
+				byKey = nil
+			}
+			strKeys[n] = key
+		}
+	}
+	for n, i := range order {
+		pk := pks[n]
 		found := -1
-		for j, existing := range partKeys {
-			if keysEqualCollated(existing, pk, partColls, m.encoding()) {
+		if byKey != nil {
+			if j, seen := byKey[strKeys[n]]; seen {
 				found = j
-				break
+			} else {
+				byKey[strKeys[n]] = len(parts)
+			}
+		} else {
+			for j, existing := range partKeys {
+				if keysEqualCollated(existing, pk, partColls, m.encoding()) {
+					found = j
+					break
+				}
 			}
 		}
 		if found < 0 {
@@ -1205,6 +1273,35 @@ func (m *vdbe) windowAggregate(plan *windowPlan, call windowCall, ci int, part [
 	}
 	if windowIncrementalEligible(call, tmpl, spans) {
 		return m.windowIncrementalAggregate(plan, call, ci, part, spans, batch, vals, tmpl, regsFor)
+	}
+	if windowRunningEligible(call, tmpl, spans) {
+		// A frame that starts at UNBOUNDED PRECEDING only ever grows: C steps
+		// each row in once as the frame's end passes it and reads the
+		// accumulator's value (OP_AggValue) for every row it returns
+		// (window.c), so one accumulator serves the whole partition.
+		acc := cloneAggTemplates([]*aggItem{tmpl})[0]
+		stepped := 0
+		for k := range part {
+			for ; stepped < spans[k].hi; stepped++ {
+				ri := part[stepped]
+				regs, skip, rerr := regsFor(ri)
+				if rerr != nil {
+					return rerr
+				}
+				if skip {
+					continue
+				}
+				if err := acc.step(plan.windowRowCtx(m, batch[ri], vals[ri]), regs); err != nil {
+					return err
+				}
+			}
+			v, err := acc.finalize()
+			if err != nil {
+				return err
+			}
+			vals[part[k]][ci] = v
+		}
+		return nil
 	}
 	// Recomputing the accumulator per row is O(n^2) in a partition; acceptable
 	// here (and always correct), since the alternative -- an incremental
@@ -1587,6 +1684,7 @@ func compileScanWindow(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 	}
 
 	plan := &windowPlan{
+		tail:     stmt.nthTail,
 		scopes:   scopes,
 		nCols:    totalCols(srcs),
 		nRowids:  len(srcs),

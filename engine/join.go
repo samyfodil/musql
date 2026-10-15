@@ -628,16 +628,23 @@ func (p *ReadOnlyPager) derivedColumnInfos(sub *SelectStmt, names []string) []co
 	// computed expression followed by a column is not either. The leftmost arm
 	// alone (derivedColumnComputed) answered both wrong: "a IN c" over
 	// "c(x) AS (SELECT 123 UNION SELECT b FROM x2)" (view.test 31.1).
+	// A REAL column is read with OP_RealAffinity after it (derivedRealAffinity);
+	// SQLITE_AFF_FLEXNUM is not REAL, and a compound this does not fold is
+	// not known to be.
+	noReal := make([]bool, len(names))
 	if sub != nil && len(sub.Compound) > 0 {
-		if types, ok := p.compoundColumnTypes(sub, false); ok && len(types) == len(names) {
-			for i, t := range types {
-				computed[i] = t.aff == affNone && !t.blob
+		types, ok := p.compoundColumnTypes(sub, false)
+		ok = ok && len(types) == len(names)
+		for i := range names {
+			noReal[i] = !ok || types[i].flexnum
+			if ok {
+				computed[i] = types[i].aff == affNone && !types[i].blob
 			}
 		}
 	}
 	cols := make([]columnInfo, len(names))
 	for i := range names {
-		cols[i] = columnInfo{Name: names[i], Aff: affs[i], Collation: colls[i], NoAffinity: computed[i]}
+		cols[i] = columnInfo{Name: names[i], Aff: affs[i], Collation: colls[i], NoAffinity: computed[i], noRealRead: noReal[i]}
 	}
 	return cols
 }

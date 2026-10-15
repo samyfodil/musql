@@ -1621,13 +1621,19 @@ func (b *wherePlanIdxBuild) addAll() {
 			// whereLoopAddVirtual: a module whose plan uses only constraints
 			// of no other item answers one loop (where.c:4730's mBest==0).
 			// The gate leaves no OR term this item could take (wherePlanVtabItem).
+			// An argument naming another item makes that item a prerequisite
+			// (whereLoopAddVirtualOne: "pNew->prereq |= pTerm->prereqRight");
+			// with it unusable the module answers SQLITE_CONSTRAINT, so that
+			// is the only loop.
 			lt := []int(nil)
+			prereq := mPrereq
 			for ti := range b.terms {
 				if b.terms[ti].vtabArg && b.terms[ti].cursor == iTab {
 					lt = append(lt, ti)
+					prereq |= b.terms[ti].prereqRight
 				}
 			}
-			b.insertLoop(whereIdxLoop{iTab: iTab, maskSelf: maskSelf, prereq: mPrereq,
+			b.insertLoop(whereIdxLoop{iTab: iTab, maskSelf: maskSelf, prereq: prereq,
 				rRun: it.vtabRun, nOut: it.vtabOut, lTerm: lt})
 			mPrior |= maskSelf
 			continue

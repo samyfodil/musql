@@ -2596,7 +2596,7 @@ func (db *DB) compileDeleteStmt(stmt *deleteStmt, trig *trigCompileCtx) (*Progra
 	c.nQueryLoopKnown = true
 	if len(stmt.ctes) > 0 && stmt.returning != nil {
 		rest := &SelectStmt{Where: stmt.where}
-		c.retWith = &returningWith{ctes: stmt.ctes, returning: stmt.returning,
+		c.retWith = &returningWith{ctes: stmt.ctes, returning: stmt.returning, where: stmt.where,
 			mentions: func(match func(FromItem) bool) { selectTreeMentionsTable(rest, match) }}
 	}
 	var writePager *ReadOnlyPager
@@ -2919,7 +2919,7 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 		for _, a := range stmt.sets {
 			rest.Columns = append(rest.Columns, SelectColumn{Expr: a.expr})
 		}
-		c.retWith = &returningWith{ctes: stmt.ctes, upd: stmt, updTbl: tbl, returning: stmt.returning,
+		c.retWith = &returningWith{ctes: stmt.ctes, upd: stmt, updTbl: tbl, returning: stmt.returning, where: stmt.where,
 			mentions: func(match func(FromItem) bool) { selectTreeMentionsTable(rest, match) }}
 	}
 	var writePager *ReadOnlyPager

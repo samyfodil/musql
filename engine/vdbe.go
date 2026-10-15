@@ -1828,6 +1828,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 		case OpWindowFinal:
 			extra, werr := m.windowFinal(op.P4.(*windowPlan))
 			if werr != nil {
+				if te, ok := werr.(*windowTailErr); ok {
+					return nil, &windowTailErr{rows: append(rows, te.rows...), err: te.err}
+				}
 				return nil, werr
 			}
 			rows = append(rows, extra...)

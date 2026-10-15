@@ -99,3 +99,180 @@ func selectCallsNthValue(sel *SelectStmt) bool {
 	}
 	return found
 }
+
+// nthValueTail marks the window select a reader with one FROM item reads, so
+// that the reader meets an invalid nth_value N only on the row that carries it
+// (windowPlan.tail). C codes that item as a co-routine (select.c:7266, (1a))
+// and its window code checks N on the row it returns (windowReturnOneRow), so
+// a reader that stops early -- a LIMIT reached through a WHERE or a DISTINCT,
+// counts no text fixes -- never sees the rows past its stop:
+//
+//	SELECT id FROM (SELECT id, nth_value(v, n) OVER (ORDER BY id) FROM w)
+//	WHERE id < 3 LIMIT 2
+//
+// answers over a w whose third row has n = 0. The reader here walks the
+// materialized rows in the same order and stops where C's does; an aggregate,
+// GROUP BY or window function in the reader is left alone, as is a CTE C
+// would materialize (referenced again, or AS MATERIALIZED).
+func (p *ReadOnlyPager) nthValueTail(sel *SelectStmt) *SelectStmt {
+	if p == nil || sel == nil || len(sel.From) == 0 || len(sel.Compound) != 0 || len(sel.GroupBy) != 0 ||
+		sel.Having != nil || cHasWindow(sel) || cSelectIsAggregate(sel) || sel.FromNestedParenJoin {
+		return sel
+	}
+	if len(sel.From) > 1 {
+		// In a join, a derived window select C codes as a co-routine; the
+		// loops around it must then be C's (markCoroutineReruns).
+		var out *SelectStmt
+		for i, it := range sel.From {
+			body := it.Subquery
+			if body == nil || body.nthTail || len(body.Compound) != 0 || !selectCallsNthValue(body) ||
+				it.GroupLen != 0 || it.NestedGroupID != 0 || len(it.NestedGroupSpan) != 0 {
+				continue
+			}
+			if co, certain := p.cCoroutineVerdict(sel, sel.From, i, nil); !co || !certain {
+				continue
+			}
+			if out == nil {
+				cp := *sel
+				cp.From = append([]FromItem(nil), sel.From...)
+				out = &cp
+			}
+			nb := *body
+			nb.nthTail = true
+			out.From[i].Subquery = &nb
+		}
+		if out == nil {
+			return sel
+		}
+		return out
+	}
+	it := sel.From[0]
+	if it.On != nil || len(it.Using) != 0 || it.Natural || it.TableFunc || it.GroupLen != 0 ||
+		it.NestedGroupID != 0 || len(it.NestedGroupSpan) != 0 {
+		return sel
+	}
+	if it.Subquery == nil {
+		// A CTE this statement defines and names only here: nUse 1, a
+		// co-routine like a subquery.
+		defined := false
+		for _, d := range sel.CTEs {
+			if equalFoldName(d.Name, it.Table) {
+				defined = d.Materialized != cteM10dYes
+			}
+		}
+		if !defined || it.Schema != "" || countMentions(sel, func(o FromItem) bool {
+			return o.Schema == "" && !o.TableFunc && equalFoldName(o.Table, it.Table)
+		}) != 1 {
+			return sel
+		}
+		ex, ok := p.r38cExpandCTERef(it)
+		if !ok {
+			return sel
+		}
+		it = ex
+	}
+	body := it.Subquery
+	if body == nil || body.nthTail || len(body.Compound) != 0 || !selectCallsNthValue(body) {
+		return sel
+	}
+	nb := *nthTailPushDown(sel, it, body)
+	nb.nthTail = true
+	it.Subquery = &nb
+	cp := *sel
+	cp.From = []FromItem{it}
+	return &cp
+}
+
+// nthTailPushDown is pushDownWhereTerms (select.c:5134) into the window select
+// it reads, for a reader nthValueTail marks: a WHERE term of the reader over
+// columns every window of the body partitions by is copied into the body's
+// WHERE (restriction (6c) allows exactly that), so the partitions it rules out
+// are never returned -- and never meet an nth_value check. The reader keeps
+// the term too. Only bare columns, with no function or subquery, are copied.
+func nthTailPushDown(sel *SelectStmt, it FromItem, body *SelectStmt) *SelectStmt {
+	if sel.Where == nil || body.Limit != nil || body.LimitParam != nil || body.Offset != nil || body.OffsetParam != nil ||
+		len(body.Compound) != 0 || len(body.Windows) != 0 || len(body.GroupBy) != 0 || cSelectIsAggregate(body) {
+		return body
+	}
+	var specs []*WindowSpec
+	ok := true
+	collect := func(fc FuncExpr) bool {
+		if fc.Over != nil {
+			if fc.Over.Ref != "" {
+				ok = false
+			}
+			specs = append(specs, fc.Over)
+		}
+		return true
+	}
+	for _, c := range body.Columns {
+		if c.Star {
+			return body
+		}
+		walkExprShallow(c.Expr, collect)
+	}
+	for _, o := range body.OrderBy {
+		walkExprShallow(o.Expr, collect)
+	}
+	if !ok || len(specs) == 0 {
+		return body
+	}
+	partitioned := func(e Expr) bool {
+		for _, sp := range specs {
+			found := false
+			for _, p := range sp.PartitionBy {
+				if exprEqual(p, e) {
+					found = true
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+		return true
+	}
+	colFor := func(ce ColumnExpr) (Expr, bool) {
+		if ce.Schema != "" || (ce.Qualifier != "" && !equalFoldName(ce.Qualifier, it.Alias)) {
+			return nil, false
+		}
+		for _, c := range body.Columns {
+			name := c.Alias
+			if !c.HasAlias {
+				name = c.cName
+				if bc, isCol := c.Expr.(ColumnExpr); isCol && name == "" {
+					name = bc.Name
+				}
+			}
+			if equalFoldName(name, ce.Name) {
+				bc, isCol := c.Expr.(ColumnExpr)
+				if !isCol || !partitioned(bc) {
+					return nil, false
+				}
+				return bc, true
+			}
+		}
+		return nil, false
+	}
+	var pushed []Expr
+	for _, t := range splitTopLevelAnd(sel.Where) {
+		plain := true
+		if !r41Walk(t, func(e Expr) {
+			switch e.(type) {
+			case FuncExpr, LikeExpr, GlobExpr, MatchExpr:
+				plain = false
+			}
+		}) || !plain {
+			continue
+		}
+		rw, rok := r41Rewrite(t, colFor)
+		if rok {
+			pushed = append(pushed, rw)
+		}
+	}
+	if len(pushed) == 0 {
+		return body
+	}
+	nb := *body
+	nb.Where = r41AndOnto(nb.Where, pushed)
+	return &nb
+}

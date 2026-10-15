@@ -37,6 +37,11 @@ import (
 // tables/vals -- see vdbe_agg.go), and how it's joined onto the sources
 // before it.
 type joinSource struct {
+	// nthTail: the derived body is a window select whose reader meets its
+	// error only on the row that raises it (SelectStmt.nthTail); its rows
+	// are materialized, never streamed, so the error can wait at their end.
+	nthTail bool
+
 	tbl   *resolvedTable
 	scope compileScope
 	left  bool // LEFT JOIN: needs match-flag + NullRow handling (see this file's package doc comment)
@@ -1391,6 +1396,7 @@ func (p *ReadOnlyPager) resolveDerivedSource(c *compiler, state *joinDesugarStat
 		derivedNoFrom:                selectHasFromlessArm(it.Subquery),
 		derivedOrderProvable:         orderProvable,
 		derivedOrderNeedsOuterSafety: needsOuterSafety,
+		nthTail:                      it.Subquery.nthTail,
 	}, nil
 }
 
@@ -2947,7 +2953,7 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 				// A RIGHT/FULL group member is never a co-routine
 				// (fromClauseTermCanBeCoroutine), so C materializes it once.
 				ds.stmtOnce, ds.rerun = true, false
-			} else if i == streamDerived {
+			} else if i == streamDerived && !s.nthTail {
 				ds.stream = streamIfYielding
 				if s.cteCoroutine {
 					ds.stream = streamCoroutine // see the CTE case below

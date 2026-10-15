@@ -59,6 +59,8 @@ type DB struct {
 	// tempTrigPeak is the most TEMP triggers C's temp trigger hash has held
 	// since it was last empty; see noteTempTriggerCreated.
 	tempTrigPeak int
+	// tempTrigHash is C's temp schema trigger hash (temp_trigger_hash.go).
+	tempTrigHash tempTrigHash
 
 	//	// foreignTempTriggers holds triggerMeta pointers owned by a different
 	//	// session -- the originating connection that delegated a write here
