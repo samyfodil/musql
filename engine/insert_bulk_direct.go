@@ -135,7 +135,7 @@ func (m *vdbe) bulkLoadFor(plan *insertPlan) *segBulkLoad {
 	bl.cut = segCutter{cols: cols, what: tbl.name, emit: func(raw []byte) error {
 		bl.segs = append(bl.segs, raw)
 		return nil
-	}}
+	}, own: true}
 	tbl.bulk, wc.bulkTbl = bl, tbl
 	wc.undoFn(func() { tbl.bulk = nil }) // a failed statement keeps none of it
 	return bl
@@ -165,7 +165,7 @@ func (m *vdbe) bulkLoadInTx(plan *insertPlan) *segBulkLoad {
 			bl.segs = append(bl.segs, raw)
 			bl.segBytes += len(raw)
 			return nil
-		}, async: true}
+		}, async: true, own: true}
 		tbl.bulk = bl
 		db.txBulks = append(db.txBulks, tbl)
 	}
@@ -216,6 +216,7 @@ func (bl *segBulkLoad) truncateTo(tbl *tableMeta, n int) {
 	bl.segs, bl.rows, bl.segBytes = nil, 0, 0
 	clear(bl.cut.rows)
 	bl.cut.rowids, bl.cut.rows, bl.cut.bytes = bl.cut.rowids[:0], bl.cut.rows[:0], 0
+	bl.cut.flat = nil // rows may still point into it: the re-added ones get storage of their own
 	for i, rid := range rowids {
 		// A cut here only builds a segment of rows already validated once;
 		// it can fail only as the first build could have.
