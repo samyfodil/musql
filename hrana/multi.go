@@ -1,6 +1,7 @@
 package hrana
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"net"
 	"net/http"
@@ -18,7 +19,7 @@ import (
 type Multi struct {
 	dir    string
 	create bool
-	opts   []Option
+	config // for Multi's own auth check and for each database's Server
 
 	mu  sync.Mutex
 	dbs map[string]*multiDB
@@ -34,7 +35,7 @@ var dbName = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
 // NewMulti serves the databases in dir. With create, a name that has no file
 // yet gets a new empty database; without it, such a request is a 404.
 func NewMulti(dir string, create bool, opts ...Option) *Multi {
-	return &Multi{dir: dir, create: create, opts: opts, dbs: map[string]*multiDB{}}
+	return &Multi{dir: dir, create: create, config: newConfig(opts), dbs: map[string]*multiDB{}}
 }
 
 // Close closes every open database.
@@ -71,7 +72,16 @@ func (m *Multi) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"message":"no database in the host name; use <db>.<host>"}`, http.StatusNotFound)
 		return
 	}
-	srv, err := m.server(name)
+	// A request must be authorized before it can open, let alone create, a
+	// database file. A WebSocket client authenticates in its hello message,
+	// after the upgrade, so without a valid header it may only reach a
+	// database that already exists; creating one takes an authorized request.
+	authed := m.authToken == "" || bearerOK(r, m.authToken)
+	if !authed && !isWebSocket(r) {
+		http.Error(w, `{"message":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	srv, err := m.server(name, authed)
 	if err != nil {
 		http.Error(w, `{"message":"no such database"}`, http.StatusNotFound)
 		return
@@ -79,14 +89,22 @@ func (m *Multi) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	srv.ServeHTTP(w, r)
 }
 
-func (m *Multi) server(name string) (*Server, error) {
+// bearerOK reports whether r carries "Authorization: Bearer <token>".
+func bearerOK(r *http.Request, token string) bool {
+	tok, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	return ok && subtle.ConstantTimeCompare([]byte(tok), []byte(token)) == 1
+}
+
+// server is name's server. With create, a name with no file yet gets a new
+// empty database; create is false for a request not yet authorized.
+func (m *Multi) server(name string, create bool) (*Server, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if d, ok := m.dbs[name]; ok {
 		return d.srv, nil
 	}
 	path := filepath.Join(m.dir, name+".musq")
-	if !m.create {
+	if !m.create || !create {
 		if _, err := os.Stat(path); err != nil {
 			return nil, err
 		}
@@ -99,7 +117,7 @@ func (m *Multi) server(name string) (*Server, error) {
 		db.Close()
 		return nil, err
 	}
-	d := &multiDB{db: db, srv: NewServer(db, m.opts...)}
+	d := &multiDB{db: db, srv: newServer(db, m.config)}
 	m.dbs[name] = d
 	return d.srv, nil
 }

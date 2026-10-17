@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -25,9 +24,8 @@ import (
 // Server serves Hrana over HTTP (versions 2 and 3, JSON and Protobuf) for one
 // musql database.
 type Server struct {
-	db        *sql.DB
-	authToken string
-	idle      time.Duration
+	db *sql.DB
+	config
 
 	mu      sync.Mutex
 	streams map[string]*httpStream // by current baton
@@ -46,24 +44,40 @@ type httpStream struct {
 	lastUsed time.Time
 }
 
-// Option configures a Server.
-type Option func(*Server)
+// config is what the options set. A Server and a Multi each hold one, so a
+// Multi knows the token before any database's Server exists.
+type config struct {
+	authToken string
+	idle      time.Duration
+}
+
+func newConfig(opts []Option) config {
+	c := config{idle: 10 * time.Second}
+	for _, o := range opts {
+		o(&c)
+	}
+	return c
+}
+
+// Option configures a Server or a Multi.
+type Option func(*config)
 
 // WithAuthToken requires "Authorization: Bearer <token>" on every request.
 // Without it the server accepts any client.
-func WithAuthToken(token string) Option { return func(s *Server) { s.authToken = token } }
+func WithAuthToken(token string) Option { return func(c *config) { c.authToken = token } }
 
 // WithIdleTimeout closes a stream after d without a request (default 10s): an
 // HTTP client that stops without closing its stream leaves no other signal.
-func WithIdleTimeout(d time.Duration) Option { return func(s *Server) { s.idle = d } }
+func WithIdleTimeout(d time.Duration) Option { return func(c *config) { c.idle = d } }
 
 // NewServer serves db, which must be opened with the musql driver.
 func NewServer(db *sql.DB, opts ...Option) *Server {
-	s := &Server{db: db, idle: 10 * time.Second, streams: map[string]*httpStream{}}
+	return newServer(db, newConfig(opts))
+}
+
+func newServer(db *sql.DB, cfg config) *Server {
+	s := &Server{db: db, config: cfg, streams: map[string]*httpStream{}}
 	s.base, s.cancel = context.WithCancel(context.Background())
-	for _, o := range opts {
-		o(s)
-	}
 	return s
 }
 
@@ -100,13 +114,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveWS(w, r)
 		return
 	}
-	if s.authToken != "" {
-		auth := r.Header.Get("Authorization")
-		tok, ok := strings.CutPrefix(auth, "Bearer ")
-		if !ok || subtle.ConstantTimeCompare([]byte(tok), []byte(s.authToken)) != 1 {
-			http.Error(w, `{"message":"unauthorized"}`, http.StatusUnauthorized)
-			return
-		}
+	if s.authToken != "" && !bearerOK(r, s.authToken) {
+		http.Error(w, `{"message":"unauthorized"}`, http.StatusUnauthorized)
+		return
 	}
 	path := strings.Trim(r.URL.Path, "/")
 	switch {
@@ -189,7 +199,11 @@ func (s *Server) reap() {
 	}
 }
 
+const maxHTTPRequestBody = 64 << 20 // 64 MB
+
 func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, protobuf bool) {
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, maxHTTPRequestBody)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeHTTPError(w, http.StatusBadRequest, err, protobuf)
@@ -303,6 +317,8 @@ func (hs *httpStream) handle(ctx context.Context, rq *pbhttp.StreamRequest) (res
 
 // cursor runs a batch and streams its result entries.
 func (s *Server) cursor(w http.ResponseWriter, r *http.Request, protobuf bool) {
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, maxHTTPRequestBody)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeHTTPError(w, http.StatusBadRequest, err, protobuf)
@@ -370,6 +386,10 @@ func writeDelimited(w io.Writer, m proto.Message) {
 }
 
 func writeHTTPError(w http.ResponseWriter, status int, err error, protobuf bool) {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		status = http.StatusRequestEntityTooLarge
+	}
 	e := toError(err)
 	var pe protocolError
 	if !errors.As(err, &pe) && status == http.StatusBadRequest {

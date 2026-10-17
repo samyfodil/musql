@@ -60,5 +60,11 @@ func main() {
 		h = srv
 		log.Printf("musqld: serving %s on %s", *dbPath, *listen)
 	}
-	log.Fatal(http.ListenAndServe(*listen, h))
+	server := &http.Server{
+		Addr:              *listen,
+		Handler:           h,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	log.Fatal(server.ListenAndServe())
 }

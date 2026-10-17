@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 
@@ -62,12 +64,51 @@ type wsCursor struct {
 	err      *pb.Error
 }
 
+// isSafeOrigin reports whether a browser's WebSocket request comes from the
+// server's own origin. Without an auth token anything that can reach the
+// server can use it, so a page on another site must not be able to make the
+// visitor's browser do so (cross-site WebSocket hijacking). A request with no
+// Origin is not from a browser page.
+func isSafeOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	originHost := u.Hostname()
+	reqHost := r.Host
+	if h, _, err := net.SplitHostPort(reqHost); err == nil {
+		reqHost = h
+	}
+	if strings.EqualFold(originHost, reqHost) {
+		return true
+	}
+	// A page on another local port may reach a server on loopback, which is
+	// how local development works; a remote server never trusts a local page.
+	return isLoopback(originHost) && isLoopback(reqHost)
+}
+
+func isLoopback(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func (s *Server) serveWS(w http.ResponseWriter, r *http.Request) {
 	if !s.track() {
 		http.Error(w, `{"message":"server is closing"}`, http.StatusServiceUnavailable)
 		return
 	}
 	defer s.ws.Done()
+	if s.authToken == "" && !isSafeOrigin(r) {
+		http.Error(w, `{"message":"forbidden: cross-origin websocket connection without auth token"}`, http.StatusForbidden)
+		return
+	}
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: wsSubprotocols, InsecureSkipVerify: true})
 	if err != nil {
 		return
