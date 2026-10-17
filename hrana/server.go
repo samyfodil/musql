@@ -72,7 +72,11 @@ func WithIdleTimeout(d time.Duration) Option { return func(c *config) { c.idle =
 
 // NewServer serves db, which must be opened with the musql driver.
 func NewServer(db *sql.DB, opts ...Option) *Server {
-	s := &Server{db: db, config: newConfig(opts), streams: map[string]*httpStream{}}
+	return newServer(db, newConfig(opts))
+}
+
+func newServer(db *sql.DB, cfg config) *Server {
+	s := &Server{db: db, config: cfg, streams: map[string]*httpStream{}}
 	s.base, s.cancel = context.WithCancel(context.Background())
 	return s
 }
