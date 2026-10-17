@@ -28,10 +28,11 @@ import (
 const deltaTailWanted = runtime.GOOS != "js"
 
 // deltaTailSize is how much is written ahead for a segment file of segSize
-// bytes: an eighth of it, which keeps the tail under half the compaction
-// threshold (a quarter of the file), so the policy is never pushed by it.
+// bytes: a sixteenth of it, well under the compaction threshold (a quarter of
+// the file), so the policy is never pushed by it. An eighth fit the same
+// commits but cost 12% more disk than the file it served.
 func deltaTailSize(segSize int64) int64 {
-	t := min(max(segSize/8, 16<<10), 8<<20)
+	t := min(max(segSize/16, 16<<10), 8<<20)
 	return (t + 4095) &^ 4095
 }
 

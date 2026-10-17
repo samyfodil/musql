@@ -79,7 +79,7 @@ func compactSegmentFile(segPath string, tail bool) (bool, error) {
 		// recorded state, so it cannot simply be deleted: rewriting the segment
 		// file at the new state is what makes removing it safe.
 		if st.endCtr == baseCtr && st.endPages == basePages {
-			return false, os.Remove(deltaPath)
+			return false, fsio.Remove(deltaPath)
 		}
 	}
 
@@ -127,7 +127,7 @@ func compactSegmentFile(segPath string, tail bool) (bool, error) {
 	}
 	syncDir(segPath)
 	// Only now: before the rename the delta is the only record of these rows.
-	if rerr := os.Remove(deltaPath); rerr != nil && !os.IsNotExist(rerr) {
+	if rerr := fsio.Remove(deltaPath); rerr != nil && !os.IsNotExist(rerr) {
 		return false, rerr
 	}
 	syncDir(segPath)

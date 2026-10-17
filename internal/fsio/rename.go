@@ -39,3 +39,11 @@ func renameWith(rename func(string, string) error, from, to string, limit time.D
 // renameRetryable is platformRenameRetryable, a variable so a test can run the
 // retry loop on a platform whose renames never need it.
 var renameRetryable = platformRenameRetryable
+
+// Remove is os.Remove with Rename's retry, for the same reason: on Windows a
+// file another connection has open for a moment cannot be removed during that
+// moment ("being used by another process"). A delta that always exists after
+// a rewrite is open far more often than one that only exists after a commit.
+func Remove(name string) error {
+	return renameWith(func(from, _ string) error { return os.Remove(from) }, name, "", renameRetryFor, time.Sleep)
+}
