@@ -2,7 +2,10 @@ package engine
 
 import (
 	"bytes"
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"slices"
 	"strconv"
@@ -10,6 +13,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/samyfodil/musql/internal/fsio"
 	"github.com/samyfodil/musql/internal/fsstamp"
 )
 
@@ -116,6 +120,12 @@ type Session struct {
 	// and quadratic over a run of them. That cost is not hypothetical: it made a
 	// two-node CRDT convergence test time out.
 	seenStat [2]fileStamp
+	// deltaEnd is where this session's view of the delta ends: the byte the next
+	// batch would start at. pairStamp probes the delta there, because a batch
+	// written into a written-ahead tail moves neither the size nor, within the
+	// filesystem's timestamp granularity, the mtime (segment_delta_tail.go).
+	// 0 when unknown, which makes every stamp distrusted.
+	deltaEnd int64
 
 	// NoSyncOnCommit drops the fsync from every commit, which is the durability
 	// contract C SQLite's WAL runs at by DEFAULT (synchronous=NORMAL): the batch
@@ -178,6 +188,7 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 	var ipkOf map[string]int
 	var rootEdits []ConvertedRootEdit
 	var stamp [2]fileStamp
+	var deltaEnd int64
 	var change *changeWord
 	changeable := false
 	if lerr := withSegmentReadLockWait(segPath, wait, func() error {
@@ -201,7 +212,8 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 		tableIndex, ipkOf = SegmentFileTableIndex(f)
 		rootEdits = append([]ConvertedRootEdit(nil), f.Catalog().RootEdits...)
 		baseCtr, basePages = f.srcChangeCounter, f.srcPageCount
-		endCtr, endPages = st.endCtr, st.endPages    // the replay's own result, not a second read
+		endCtr, endPages = st.endCtr, st.endPages // the replay's own result, not a second read
+		deltaEnd = st.bytes
 		p, perr := buildSegmentPager(segPath, f, st) // takes ownership of f
 		if perr != nil {
 			return perr
@@ -251,6 +263,7 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 		endCtr: endCtr, endPages: endPages,
 		loadedCtr: endCtr, loadedPages: endPages, // the state just read
 		seenStat:   stamp,
+		deltaEnd:   deltaEnd,
 		change:     change,
 		changeable: changeable,
 
@@ -601,7 +614,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 	// stamp until this commit writes: the compaction check below reuses it
 	// rather than stat'ing both files again.
 	lockedStamp := n.pairStamp()
-	if lockedStamp != n.seenStat {
+	if !n.sameStamp(lockedStamp) {
 		if rerr := n.refreshPairIdentity(); rerr != nil {
 			return false, rerr
 		}
@@ -632,7 +645,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 	// measure them was 10% of a 10M-row load. Same order as below: a stale image
 	// is refused before anything is written.
 	if !compactionOffForTest && lockedStamp[0].there && n.maxSize == 0 &&
-		int64(changes.len())*segDeltaMinRecord > compactionThreshold(lockedStamp[0].size)-lockedStamp[1].size {
+		int64(changes.len())*segDeltaMinRecord > compactionThreshold(lockedStamp[0].size)-n.deltaLogicalSize(lockedStamp[1]) {
 		if n.loadedCtr != n.endCtr || n.loadedPages != n.endPages {
 			return false, fmt.Errorf("%w: another connection committed while this transaction was open", ErrBusy)
 		}
@@ -690,7 +703,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 	// own compaction check (compactIfWorthIt) rewrites at, appending it first
 	// only writes the rows twice -- once into the delta, once more into the
 	// file the compaction then builds. Rewrite now, once.
-	if !compactionOffForTest && compactionDueAfter(lockedStamp, recs) {
+	if !compactionOffForTest && compactionDueAfter(lockedStamp[0], n.deltaLogicalSize(lockedStamp[1]), recs) {
 		if err := n.rewriteFile(); err != nil {
 			return false, err
 		}
@@ -715,6 +728,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 	if wasCurrent {
 		n.loadedCtr, n.loadedPages = n.endCtr, n.endPages
 	}
+	n.deltaEnd = n.appendAt.offset
 	n.seenStat = n.pairStamp()
 	n.clearWrittenSinceCommit()
 	if !wasCurrent || !n.extendCommittedColumns(n.appendAt.lastBatch, recs) {
@@ -1067,10 +1081,10 @@ func (n *Session) CompactIfLargerThan(nBytes int64) (bool, error) {
 // compactIfLargerThanAt is CompactIfLargerThan given the pair's stamp, for a
 // caller that holds a current one.
 func (n *Session) compactIfLargerThanAt(pair [2]fileStamp, nBytes int64) (bool, error) {
-	if st := pair[1]; !st.there || st.size < nBytes {
+	if st := pair[1]; !st.there || n.deltaLogicalSize(st) < nBytes {
 		return false, nil
 	}
-	did, cerr := CompactSegmentFile(n.segPath)
+	did, cerr := compactSegmentFile(n.segPath, !n.DB.inMemory && n.maxSize == 0 && deltaTailWanted)
 	if did {
 		// The blocks moved, so the columnar read handle has to be rebuilt before
 		// the next fast path reads one (DB.segColumns).
@@ -1525,11 +1539,27 @@ func compactionThreshold(segSize int64) int64 {
 // compactionDueAfter reports whether appending recs would take the delta past
 // compactionThreshold, so the compaction after the commit would rewrite the
 // file anyway.
-func compactionDueAfter(st [2]fileStamp, recs []SegDeltaRecord) bool {
-	if !st[0].there {
+func compactionDueAfter(seg fileStamp, deltaSize int64, recs []SegDeltaRecord) bool {
+	if !seg.there {
 		return false
 	}
-	return segDeltaBatchBytesExceed(recs, compactionThreshold(st[0].size)-st[1].size)
+	return segDeltaBatchBytesExceed(recs, compactionThreshold(seg.size)-deltaSize)
+}
+
+// deltaLogicalSize is how much of the delta stamped d holds batches: its size,
+// less a written-ahead tail (segment_delta_tail.go), which the compaction
+// policy must not count -- it is space, not log. It trusts deltaEnd, which is
+// this session's last view: after another writer's append that view is short,
+// and a compaction comes a commit later than it might, which costs nothing
+// but time.
+func (n *Session) deltaLogicalSize(d fileStamp) int64 {
+	if !d.there {
+		return 0
+	}
+	if n.deltaEnd >= segDeltaHdrSize && n.deltaEnd < d.size {
+		return n.deltaEnd
+	}
+	return d.size
 }
 
 func (n *Session) compactIfWorthIt() {
@@ -1559,6 +1589,7 @@ func (n *Session) compactIfWorthIt() {
 		return
 	}
 	n.loadedCtr, n.loadedPages = n.endCtr, n.endPages
+	n.deltaEnd = segDeltaHdrSize // a written-ahead tail, or no delta at all
 	// ...and this session must not treat its OWN compaction as another
 	// connection's commit: RefreshIfStale compares the file's stat pair, which a
 	// compaction moves, and reopening would throw away a view that is still
@@ -1635,6 +1666,11 @@ type fileStamp struct {
 	size  int64
 	mtime int64
 	there bool
+	// next is the delta's 8 bytes at the session's deltaEnd, where another
+	// writer's batch would begin (pairStamp); bad is "they could not be read,
+	// or deltaEnd is unknown", and a bad stamp never matches.
+	next uint64
+	bad  bool
 }
 
 func stampOf(path string) fileStamp {
@@ -1652,7 +1688,16 @@ func (n *Session) pairStamp() [2]fileStamp {
 		n.segStat.release()
 		n.deltaStat.release()
 	}
-	return [2]fileStamp{n.segStat.stamp(n.segPath), n.deltaStat.stamp(n.deltaPath)}
+	d := n.deltaStat.stamp(n.deltaPath)
+	if d.there && d.size > n.deltaEnd {
+		d.next, d.bad = n.deltaStat.probe(n.deltaPath, n.deltaEnd)
+	}
+	return [2]fileStamp{n.segStat.stamp(n.segPath), d}
+}
+
+// sameStamp reports whether s says nothing has touched the pair since seenStat.
+func (n *Session) sameStamp(s [2]fileStamp) bool {
+	return s == n.seenStat && !s[1].bad
 }
 
 // heldStamp stamps a file through a descriptor held open for the purpose. A
@@ -1687,6 +1732,28 @@ func (h *heldStamp) stamp(path string) fileStamp {
 		}
 	}
 	return st
+}
+
+// probe reads the 8 bytes at off -- fewer at the end of the file -- through
+// the held descriptor where there is one. bad is true when they could not be
+// read or off is not a place a batch can begin.
+func (h *heldStamp) probe(path string, off int64) (v uint64, bad bool) {
+	if off < segDeltaHdrSize {
+		return 0, true
+	}
+	f := h.f
+	if f == nil {
+		var err error
+		if f, err = os.Open(path); err != nil {
+			return 0, true
+		}
+		defer f.Close()
+	}
+	var b [8]byte
+	if k, err := fsio.ReadAt(f, b[:], off); k == 0 || (err != nil && k < len(b) && !errors.Is(err, io.EOF)) {
+		return 0, true
+	}
+	return binary.LittleEndian.Uint64(b[:]), false
 }
 
 func (h *heldStamp) release() {
@@ -1740,7 +1807,7 @@ func (n *Session) RefreshIfStale() (bool, error) {
 		}
 	}
 	now := n.pairStamp()
-	if now == n.seenStat {
+	if n.sameStamp(now) {
 		n.noteChangeSeen(word, wordOK)
 		return false, nil // nothing has touched either file
 	}
@@ -1873,6 +1940,7 @@ func (n *Session) reopen(afterFailedCommit bool) error {
 	n.appendAt.release()
 	n.catalogAtLastWrite = fresh.catalogAtLastWrite
 	n.seenStat = stamp
+	n.deltaEnd = fresh.deltaEnd
 	// The rebuilt file may be another version: its own word mapping, or none.
 	n.change.close()
 	n.change, n.changeSeenOK, n.changeable = fresh.change, false, fresh.changeable

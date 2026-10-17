@@ -509,12 +509,14 @@ func (p *ReadOnlyPager) segFilePages() uint32 {
 		ps = 4096
 	}
 	var total int64
-	for _, path := range []string{p.mainPath, segDeltaPath(p.mainPath)} {
-		if path == "" {
-			continue
-		}
-		if st, err := os.Stat(path); err == nil {
+	if p.mainPath != "" {
+		if st, err := os.Stat(p.mainPath); err == nil {
 			total += st.Size()
+		}
+		// The delta's batches, not its file: a written-ahead tail is space,
+		// not data (segment_delta_tail.go).
+		if d := p.segs.delta; d != nil && d.bytes > segDeltaHdrSize {
+			total += d.bytes
 		}
 	}
 	return uint32((total + ps - 1) / ps)

@@ -12,10 +12,7 @@ func TestSegmentDeltaZeroTailEndsTheLog(t *testing.T) {
 	segPath := deltaFixture(t, 6, `UPDATE t SET k = 42 WHERE id = 20`)
 	good := renderT(t, segPath)
 	deltaPath := segDeltaPath(segPath)
-	data, err := os.ReadFile(deltaPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	data := deltaLogical(t, segPath)
 	baseCtr, basePages, err := SegmentFileBase(segPath)
 	if err != nil {
 		t.Fatal(err)
@@ -58,10 +55,7 @@ func TestSegmentDeltaZeroTailEndsTheLog(t *testing.T) {
 // would replay as a commit and move the counter.
 func TestSegmentDeltaEmptyBatchIsNotHistory(t *testing.T) {
 	segPath := deltaFixture(t, 6, `UPDATE t SET k = 42 WHERE id = 20`)
-	data, err := os.ReadFile(segDeltaPath(segPath))
-	if err != nil {
-		t.Fatal(err)
-	}
+	data := deltaLogical(t, segPath)
 	baseCtr, basePages, err := SegmentFileBase(segPath)
 	if err != nil {
 		t.Fatal(err)
@@ -87,14 +81,15 @@ func TestSegmentDeltaEmptyBatchIsNotHistory(t *testing.T) {
 // TestSegmentDeltaCreateSyncsDirectory: the commit that creates the delta
 // makes its directory entry durable; later appends need not.
 func TestSegmentDeltaCreateSyncsDirectory(t *testing.T) {
+	segPath := deltaFixture(t, 6)
+	// The VACUUM left a written-ahead tail; without one, the commit creates it.
+	if err := os.Remove(segDeltaPath(segPath)); err != nil {
+		t.Fatal(err)
+	}
 	var calls int
 	orig := syncDeltaDir
 	syncDeltaDir = func(p string) error { calls++; return orig(p) }
 	defer func() { syncDeltaDir = orig }()
-	segPath := deltaFixture(t, 6)
-	if _, err := os.Stat(segDeltaPath(segPath)); !os.IsNotExist(err) {
-		t.Fatalf("fixture already has a delta: %v", err)
-	}
 	execDB(t, segPath, `UPDATE t SET k = 1 WHERE id = 20`)
 	if calls != 1 {
 		t.Fatalf("creating the delta synced its directory %d times, want 1", calls)
@@ -103,4 +98,23 @@ func TestSegmentDeltaCreateSyncsDirectory(t *testing.T) {
 	if calls != 1 {
 		t.Errorf("an append to an existing delta synced the directory (%d calls)", calls)
 	}
+}
+
+// deltaLogical is segPath's delta up to the end of its last batch: the file,
+// less any written-ahead tail.
+func deltaLogical(t *testing.T, segPath string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(segDeltaPath(segPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseCtr, basePages, err := SegmentFileBase(segPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := replaySegDelta(data, baseCtr, basePages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data[:st.bytes]
 }

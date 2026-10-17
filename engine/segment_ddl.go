@@ -51,7 +51,7 @@ func CreateFile(path string) error {
 	}
 	defer endChange()
 	// A delta beside the old file describes rows that are about to stop existing.
-	if err := os.Remove(segDeltaPath(path)); err != nil && !os.IsNotExist(err) {
+	if err := fsio.Remove(segDeltaPath(path)); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	// Counter 1, pages 1: a state, not a page count. A segment file has no pages;
@@ -184,11 +184,21 @@ func (n *Session) rewriteFile() error {
 	}
 	// The delta is gone: its rows are in the segments now, and its records named
 	// table indexes the new directory may not use.
-	if rerr := os.Remove(segDeltaPath(n.segPath)); rerr != nil && !os.IsNotExist(rerr) {
+	if rerr := fsio.Remove(segDeltaPath(n.segPath)); rerr != nil && !os.IsNotExist(rerr) {
 		return rerr
 	}
 	if !db.inMemory {
 		syncDir(n.segPath)
+	}
+	// The next commit's batch goes into space written now, off its path
+	// (segment_delta_tail.go). Not under max_size, which counts the file's
+	// bytes, tail included. The rewrite is already durable: a tail that fails
+	// to write leaves no delta, and the next commit creates one as before.
+	n.deltaEnd = segDeltaHdrSize
+	if !db.inMemory && n.maxSize == 0 && deltaTailWanted {
+		if st, serr := os.Stat(n.segPath); serr == nil {
+			writeDeltaTail(n.segPath, n.endCtr, n.endPages, deltaTailSize(st.Size()))
+		}
 	}
 
 	// The file's identity moved, so the session's pairing and its append point

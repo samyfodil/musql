@@ -66,6 +66,22 @@ func TestRenameReplaces(t *testing.T) {
 	}
 }
 
+func TestRemoveRemovesAndReportsMissing(t *testing.T) {
+	name := filepath.Join(t.TempDir(), "db.delta")
+	if err := os.WriteFile(name, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Remove(name); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(name); !os.IsNotExist(err) {
+		t.Fatalf("still there: %v", err)
+	}
+	if err := Remove(name); !os.IsNotExist(err) {
+		t.Fatalf("a missing file: %v", err)
+	}
+}
+
 // renameRetryableFor makes err, and only err, retryable until the returned
 // func restores the platform's verdict.
 func renameRetryableFor(err error) func() {
