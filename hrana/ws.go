@@ -64,6 +64,11 @@ type wsCursor struct {
 	err      *pb.Error
 }
 
+// isSafeOrigin reports whether a browser's WebSocket request comes from the
+// server's own origin. Without an auth token anything that can reach the
+// server can use it, so a page on another site must not be able to make the
+// visitor's browser do so (cross-site WebSocket hijacking). A request with no
+// Origin is not from a browser page.
 func isSafeOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
@@ -81,10 +86,17 @@ func isSafeOrigin(r *http.Request) bool {
 	if strings.EqualFold(originHost, reqHost) {
 		return true
 	}
-	if originHost == "localhost" || originHost == "127.0.0.1" || originHost == "::1" {
+	// A page on another local port may reach a server on loopback, which is
+	// how local development works; a remote server never trusts a local page.
+	return isLoopback(originHost) && isLoopback(reqHost)
+}
+
+func isLoopback(host string) bool {
+	if strings.EqualFold(host, "localhost") {
 		return true
 	}
-	return false
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (s *Server) serveWS(w http.ResponseWriter, r *http.Request) {

@@ -5,7 +5,6 @@ package jit
 import (
 	"fmt"
 	"runtime"
-	"sync"
 	"syscall"
 	"unsafe"
 )
@@ -32,7 +31,6 @@ const (
 
 // Code is a mapped, executable kernel.
 type Code struct {
-	mu    sync.Mutex
 	addr  uintptr
 	entry *byte
 	Size  int
@@ -65,8 +63,6 @@ func Map(code []byte) (*Code, error) {
 // Close frees the code. Calling it while a kernel runs is a crash, so the caller
 // owns that ordering.
 func (c *Code) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.addr == 0 {
 		return nil
 	}

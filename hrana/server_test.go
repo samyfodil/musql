@@ -372,3 +372,54 @@ func TestMultiRoutesByHost(t *testing.T) {
 		t.Fatalf("an unknown database without -create: %d", resp.StatusCode)
 	}
 }
+
+// An unauthorized request never creates a database file, over HTTP or over a
+// WebSocket, whose client authenticates only after the upgrade.
+func TestMultiCreatesOnlyWhenAuthorized(t *testing.T) {
+	dir := t.TempDir()
+	m := NewMulti(dir, true, WithAuthToken("s3cret"))
+	defer m.Close()
+	hs := httptest.NewServer(m)
+	defer hs.Close()
+	do := func(host, token string, ws bool) int {
+		req, _ := http.NewRequest(http.MethodPost, hs.URL+"/v3/pipeline", strings.NewReader(`{"baton":null,"requests":[{"type":"execute","stmt":{"sql":"CREATE TABLE t(x)"}}]}`))
+		if ws {
+			req, _ = http.NewRequest(http.MethodGet, hs.URL+"/", nil)
+			req.Header.Set("Connection", "Upgrade")
+			req.Header.Set("Upgrade", "websocket")
+			req.Header.Set("Sec-WebSocket-Version", "13")
+			req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+		}
+		req.Host = host
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	exists := func(name string) bool {
+		_, err := os.Stat(filepath.Join(dir, name+".musq"))
+		return err == nil
+	}
+	if code := do("a.db.test", "", false); code != http.StatusUnauthorized || exists("a") {
+		t.Fatalf("unauthorized HTTP: %d, created=%v", code, exists("a"))
+	}
+	if code := do("b.db.test", "wrong", false); code != http.StatusUnauthorized || exists("b") {
+		t.Fatalf("wrong token: %d, created=%v", code, exists("b"))
+	}
+	if code := do("c.db.test", "", true); code != http.StatusNotFound || exists("c") {
+		t.Fatalf("unauthorized WebSocket: %d, created=%v", code, exists("c"))
+	}
+	if code := do("d.db.test", "s3cret", false); code != http.StatusOK || !exists("d") {
+		t.Fatalf("authorized HTTP: %d, created=%v", code, exists("d"))
+	}
+	// An existing database still takes the upgrade; its client authenticates
+	// in the hello message.
+	if code := do("d.db.test", "", true); code != http.StatusSwitchingProtocols {
+		t.Fatalf("WebSocket to an existing database: %d", code)
+	}
+}

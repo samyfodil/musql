@@ -79,15 +79,16 @@ func (m *Multi) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"message":"no database in the host name; use <db>.<host>"}`, http.StatusNotFound)
 		return
 	}
-	if m.authToken != "" && !isWebSocket(r) {
-		auth := r.Header.Get("Authorization")
-		tok, ok := strings.CutPrefix(auth, "Bearer ")
-		if !ok || subtle.ConstantTimeCompare([]byte(tok), []byte(m.authToken)) != 1 {
-			http.Error(w, `{"message":"unauthorized"}`, http.StatusUnauthorized)
-			return
-		}
+	// A request must be authorized before it can open, let alone create, a
+	// database file. A WebSocket client authenticates in its hello message,
+	// after the upgrade, so without a valid header it may only reach a
+	// database that already exists; creating one takes an authorized request.
+	authed := m.authToken == "" || bearerOK(r, m.authToken)
+	if !authed && !isWebSocket(r) {
+		http.Error(w, `{"message":"unauthorized"}`, http.StatusUnauthorized)
+		return
 	}
-	srv, err := m.server(name)
+	srv, err := m.server(name, authed)
 	if err != nil {
 		http.Error(w, `{"message":"no such database"}`, http.StatusNotFound)
 		return
@@ -95,14 +96,22 @@ func (m *Multi) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	srv.ServeHTTP(w, r)
 }
 
-func (m *Multi) server(name string) (*Server, error) {
+// bearerOK reports whether r carries "Authorization: Bearer <token>".
+func bearerOK(r *http.Request, token string) bool {
+	tok, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	return ok && subtle.ConstantTimeCompare([]byte(tok), []byte(token)) == 1
+}
+
+// server is name's server. With create, a name with no file yet gets a new
+// empty database; create is false for a request not yet authorized.
+func (m *Multi) server(name string, create bool) (*Server, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if d, ok := m.dbs[name]; ok {
 		return d.srv, nil
 	}
 	path := filepath.Join(m.dir, name+".musq")
-	if !m.create {
+	if !m.create || !create {
 		if _, err := os.Stat(path); err != nil {
 			return nil, err
 		}

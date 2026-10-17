@@ -5,14 +5,12 @@ package jit
 import (
 	"fmt"
 	"runtime"
-	"sync"
 
 	"golang.org/x/sys/unix"
 )
 
 // Code is a mapped, executable kernel.
 type Code struct {
-	mu    sync.Mutex
 	page  []byte
 	entry *byte
 	Size  int
@@ -47,8 +45,6 @@ func Map(code []byte) (*Code, error) {
 // Close unmaps the code. Calling it while a kernel runs is a segfault, so the
 // caller owns that ordering.
 func (c *Code) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.page == nil {
 		return nil
 	}
