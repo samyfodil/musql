@@ -189,7 +189,11 @@ func (s *Server) reap() {
 	}
 }
 
+const maxHTTPRequestBody = 64 << 20 // 64 MB
+
 func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, protobuf bool) {
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, maxHTTPRequestBody)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeHTTPError(w, http.StatusBadRequest, err, protobuf)
@@ -303,6 +307,8 @@ func (hs *httpStream) handle(ctx context.Context, rq *pbhttp.StreamRequest) (res
 
 // cursor runs a batch and streams its result entries.
 func (s *Server) cursor(w http.ResponseWriter, r *http.Request, protobuf bool) {
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, maxHTTPRequestBody)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeHTTPError(w, http.StatusBadRequest, err, protobuf)
@@ -370,6 +376,10 @@ func writeDelimited(w io.Writer, m proto.Message) {
 }
 
 func writeHTTPError(w http.ResponseWriter, status int, err error, protobuf bool) {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		status = http.StatusRequestEntityTooLarge
+	}
 	e := toError(err)
 	var pe protocolError
 	if !errors.As(err, &pe) && status == http.StatusBadRequest {
