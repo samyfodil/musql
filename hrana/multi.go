@@ -17,10 +17,10 @@ import (
 // (<db>.<host>): "app.example.com" serves <dir>/app.musq. Hrana itself has no
 // way to select a database, so the address is the selector.
 type Multi struct {
-	dir       string
-	create    bool
-	opts      []Option
-	authToken string
+	dir    string
+	create bool
+	opts   []Option // for each database's Server
+	config
 
 	mu  sync.Mutex
 	dbs map[string]*multiDB
@@ -36,13 +36,7 @@ var dbName = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
 // NewMulti serves the databases in dir. With create, a name that has no file
 // yet gets a new empty database; without it, such a request is a 404.
 func NewMulti(dir string, create bool, opts ...Option) *Multi {
-	m := &Multi{dir: dir, create: create, opts: opts, dbs: map[string]*multiDB{}}
-	dummy := &Server{}
-	for _, o := range opts {
-		o(dummy)
-	}
-	m.authToken = dummy.authToken
-	return m
+	return &Multi{dir: dir, create: create, opts: opts, config: newConfig(opts), dbs: map[string]*multiDB{}}
 }
 
 // Close closes every open database.
