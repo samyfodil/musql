@@ -4010,6 +4010,22 @@ func (m *vdbe) updateRow(op *Instruction, full []Value, newRowid uint64, inPlace
 	plan := op.P4.(*updatePlan)
 	tbl := plan.tbl
 	oldRowid := m.cursors[op.P1].rowid
+	if inPlace && newRowid == oldRowid {
+		// Everything below that the row could still need: what made it in
+		// place (updateInPlaceOK, a rowid that stays) rules out a generated
+		// column, a UNIQUE, expression or vector index's check, an FK and a
+		// conflict action, and full is already the stored row, its INTEGER
+		// PRIMARY KEY slot the stored NULL.
+		if perr := m.wctx.pinViolation(tbl); perr != nil {
+			return -1, perr
+		}
+		tbl.putRowOver(newRowid, full, full)
+		m.wctx.undoBase(tbl, oldRowid)
+		m.wctx.db.noteRowUpdate(tbl, oldRowid, newRowid, full, full) // capture log (rowhook.go); no full capture here
+		m.wctx.db.notePatch(tbl, newRowid, plan.setCol)
+		m.wctx.rowsAffected++
+		return -1, nil
+	}
 	// A BEFORE trigger may have updated this row after the cursor read it, so
 	// columns the statement does not assign are re-read from the store (ticket
 	// e25d9ea771, triggerC.test 10.3). Done before computeGeneratedInto. Read once;
