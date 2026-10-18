@@ -63,6 +63,10 @@ type vdbeCursor struct {
 	// over a b-tree. Its rows are built on the first rewind and not before --
 	// see rewind, and materializeRowStore for why that matters.
 	rowStore *tableMeta
+	// rowsFrom and rowsSwaps are the store the rows were taken from and its
+	// swap count then, for storedRow.
+	rowsFrom  *rowStore
+	rowsSwaps uint32
 	// writeOrder, on a row-store cursor, is the order C's ONE-PASS UPDATE loop
 	// visits the table in (DB.updateOnePassOrder), applied to the frozen rows
 	// every time they are materialized. Set by OpAutoIndexOrder.
@@ -551,6 +555,7 @@ func (cur *vdbeCursor) rewind() error {
 			// cur.tbl is nil here (openRowStoreCursor sets only rowStore), so every field
 			// comes from the store's own metadata.
 			tbl := cur.rowStore
+			cur.rowsFrom = nil // set again only where rows are the store's own (storedRow)
 			if cur.seekConfigured && !tbl.withoutRowid && tbl.rows != nil {
 				rid := uint64(cur.seekKey)
 				cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
@@ -593,6 +598,7 @@ func (cur *vdbeCursor) rewind() error {
 						}
 					}
 					cur.lazyNorm = lazy
+					cur.rowsFrom, cur.rowsSwaps = tbl.rows, tbl.rows.swaps
 					cur.writeHint = len(cur.rows)
 					if !slices.IsSorted(cur.rowids) { // the short rows come unioned at the end
 						sortRowsByRowid(cur)
@@ -1113,6 +1119,10 @@ func (cur *vdbeCursor) materializeRowStore() {
 		rows[i] = normalizeRow(tbl.name, tbl.cols, tbl.ipkIndex, rid, vals)
 	}
 	cur.rowids, cur.rows, cur.materialized, cur.lazyNorm = rowids, rows, true, lazy
+	cur.rowsFrom, cur.rowsSwaps = tbl.rows, 0
+	if tbl.rows != nil {
+		cur.rowsSwaps = tbl.rows.swaps
+	}
 	// A WITHOUT ROWID TABLE IS ITS PRIMARY KEY INDEX, and this store is keyed by a
 	// synthetic id, so eachSorted just handed over WRITE order. The read path has
 	// the same correction (see rewind's own note) and the WRITE path needs it for a
@@ -1123,6 +1133,22 @@ func (cur *vdbeCursor) materializeRowStore() {
 	if tbl.withoutRowid {
 		cur.orderByWithoutRowidPKOf(tbl)
 	}
+}
+
+// storedRow is the current row as the store handed it to this cursor, with
+// the store's swap count then, for rowStore.rowSeen; nil when the cursor holds
+// no such row for rowid -- not materialized from st, or the row it holds is a
+// normalized copy rather than the store's own.
+func (cur *vdbeCursor) storedRow(st *rowStore, rowid uint64) ([]Value, uint32) {
+	if cur.rowStore == nil || st == nil || cur.rowsFrom != st || !cur.lazyNorm ||
+		cur.pos < 0 || cur.pos >= len(cur.rows) || cur.pos >= len(cur.rowids) || cur.rowids[cur.pos] != rowid {
+		return nil, 0
+	}
+	row := cur.rows[cur.pos]
+	if len(row) != len(cur.rowStore.cols) {
+		return nil, 0 // normalized when materialized: not the stored slice
+	}
+	return row, cur.rowsSwaps
 }
 
 // rowStoreNormalizesLazily reports whether a write cursor may hold tbl's stored

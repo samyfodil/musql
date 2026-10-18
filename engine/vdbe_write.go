@@ -3962,7 +3962,8 @@ func (m *vdbe) opUpdateRow(op *Instruction) (int, error) {
 	// columns the statement does not assign are re-read from the store (ticket
 	// e25d9ea771, triggerC.test 10.3). Done before computeGeneratedInto. Read once;
 	// the restore arms below reuse it.
-	oldVals := tbl.rows.row(oldRowid)
+	seen, swaps := m.cursors[op.P1].storedRow(tbl.rows, oldRowid)
+	oldVals := tbl.rows.rowSeen(oldRowid, seen, swaps)
 	if oldVals != nil && plan.setCol != nil {
 		for i := range full {
 			if i < len(oldVals) && i < len(plan.setCol) && !plan.setCol[i] {

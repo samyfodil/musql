@@ -21,6 +21,11 @@ type rowStore struct {
 	n        int
 	nKnown   bool
 
+	// swaps counts replacements of m as a whole (clear, and an undo that
+	// restores a prior map): the one way a row leaves m without a gone mark.
+	// rowSeen relies on it.
+	swaps uint32
+
 	// max caches the largest rowid for nextRowidForTable. Cleared on drop
 	// to match SQLite's rowid reuse behavior.
 	max      uint64
@@ -102,6 +107,25 @@ func (s *rowStore) get(rowid uint64) ([]Value, bool) {
 func (s *rowStore) row(rowid uint64) []Value {
 	vals, _ := s.get(rowid)
 	return vals
+}
+
+// rowSeen is row(rowid) for a caller already holding seen, the row this store
+// handed out for rowid when m had been swapped swaps times (a write cursor's
+// own row): seen itself when the store provably still holds that row, so it is
+// not decoded from its segment a second time.
+//
+// Provably: rowid is not in m, not dropped, and in the base, and m has not
+// been replaced since. A row leaves m only by a drop, which marks a base rowid
+// gone, or by a swap; so seen was the base row then, and the base does not
+// change under a session. Anything else reads the store as row() does.
+func (s *rowStore) rowSeen(rowid uint64, seen []Value, swaps uint32) []Value {
+	if seen == nil || s.seg == nil || s.swaps != swaps || s.baseGone || s.gone[rowid] {
+		return s.row(rowid)
+	}
+	if _, over := s.m[rowid]; over || !s.seg.has(rowid) {
+		return s.row(rowid)
+	}
+	return seen
 }
 
 func (s *rowStore) len() int {
@@ -222,6 +246,7 @@ func (s *rowStore) clear() int64 {
 			s.undo = append(s.undo, rsUndo{clr: &rsClear{prior: s.m, priorGone: s.gone, priorBaseGone: s.baseGone, priorN: s.n, priorNKnown: s.nKnown, segClear: true}})
 		}
 		s.m, s.gone, s.baseGone, s.n, s.nKnown = map[uint64][]Value{}, nil, true, 0, true
+		s.swaps++
 		s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false
 		s.ubKnown = false
 		s.overValid, s.memBytes, s.unspilt = false, 0, nil
@@ -236,6 +261,7 @@ func (s *rowStore) clear() int64 {
 		s.undo = append(s.undo, rsUndo{clr: &rsClear{prior: s.m}})
 	}
 	s.m = map[uint64][]Value{}
+	s.swaps++
 	s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false
 	s.ubKnown = false
 	s.overValid, s.memBytes, s.unspilt = false, 0, nil
