@@ -1177,6 +1177,22 @@ func (cur *vdbeCursor) storedRow(st *rowStore, rowid uint64) ([]Value, uint32, u
 	return row, cur.rowsSwaps, cur.rowsWrites, origin
 }
 
+// storedColumn is column c of the cursor's current row as OP_Column reads it:
+// the row its position names, normalized as advance makes it current.
+func (cur *vdbeCursor) storedColumn(c int) Value {
+	if cur.pos < 0 || cur.pos >= len(cur.rows) {
+		return Value{Typ: Null}
+	}
+	row := cur.rows[cur.pos]
+	if cur.lazyNorm {
+		row = cur.normalizeStored(row)
+	}
+	if c >= len(row) {
+		return Value{Typ: Null}
+	}
+	return row[c]
+}
+
 // rowStoreNormalizesLazily reports whether a write cursor may hold tbl's stored
 // rows as they are and fix them up as each becomes current (lazyNorm): the table
 // has a column the fix-up applies to (an INTEGER PRIMARY KEY or a REAL one) and

@@ -1098,6 +1098,20 @@ func (e *vmEmitArm) resultRow(pc int, in VInsn) {
 // X11 and X12 are scratch.
 func (e *vmEmitArm) copyRow(in VInsn, dst Reg64) {
 	a, L := e.a, e.lay
+	if in.Skip != 0 {
+		// Only the registers kept, each a Value's words, unrolled; dst is
+		// left where it was.
+		for i := 0; i < in.B; i++ {
+			if in.Skip&(1<<uint(i)) != 0 {
+				continue
+			}
+			for w := 0; w < L.Size; w += 8 {
+				e.ldr(X12, in.A+i, w)
+				a.StrImm(X12, dst, i*L.Size+w)
+			}
+		}
+		return
+	}
 	a.MovImm64(X9, int64(e.off(in.A, 0)))
 	a.AddReg(X9, X1, X9)
 	a.MovImm64(X11, int64(in.B*L.Size/8))

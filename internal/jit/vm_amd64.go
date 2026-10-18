@@ -1117,6 +1117,19 @@ func (e *vmEmit) resultRow(pc int, in VInsn) {
 // RCX, R9 and R10 are scratch.
 func (e *vmEmit) copyRow(pc int, in VInsn) {
 	a, L := e.a, e.lay
+	if in.Skip != 0 {
+		// Only the registers kept, each a Value's words, unrolled.
+		for i := 0; i < in.B; i++ {
+			if in.Skip&(1<<uint(i)) != 0 {
+				continue
+			}
+			for w := 0; w < L.Size; w += 8 {
+				a.MovRegMemD(RAX, RSI, e.d(in.A+i, w))
+				a.MovMemDReg(R10, int32(i*L.Size+w), RAX)
+			}
+		}
+		return
+	}
 	a.MovRegImm64(R9, int64(e.d(in.A, 0)))
 	a.AddRegReg(R9, RSI)
 	a.MovRegImm64(RCX, int64(in.B*L.Size/8))

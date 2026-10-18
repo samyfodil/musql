@@ -951,6 +951,9 @@ func (e *vmEmitWasm) resultRow(pc int, in VInsn) {
 func (e *vmEmitWasm) copyRow(in VInsn) {
 	w, L := e.w, e.lay
 	for k := 0; k < in.B*L.Size; k += 8 {
+		if in.Skip&(1<<uint(k/L.Size)) != 0 {
+			continue // a register the row leaves out
+		}
 		w.Get(e.rb)
 		w.Get(e.regs)
 		w.LoadI64(e.addr(in.A, k))

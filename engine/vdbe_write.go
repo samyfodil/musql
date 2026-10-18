@@ -4038,13 +4038,26 @@ func (m *vdbe) updateRow(op *Instruction, full []Value, newRowid uint64, inPlace
 	seen, swaps, writes, origin := cur.storedRow(tbl.rows, oldRowid)
 	oldVals := tbl.rows.rowSeen(oldRowid, seen, swaps, writes, origin)
 	if plan.setCol != nil {
+		// Registers a gathered record left out (gatherSkip) may never have
+		// been loaded: such a column comes from the cursor's row instead,
+		// which is what loading it would have read. Defensive: a skipped
+		// column not taken from the stored row needs a stored row shorter
+		// than the table, which reading pads, or a row gone mid-statement,
+		// which nothing in a program gatherSkip accepts can do.
+		var skip uint64
+		if jx := m.jx; jx != nil && jx.updPlan == plan {
+			skip = jx.updSkip
+		}
 		for i := range full {
 			if i >= len(plan.setCol) || plan.setCol[i] {
 				continue
 			}
-			if i < len(oldVals) {
+			switch {
+			case i < len(oldVals):
 				full[i] = oldVals[i]
-			} else {
+			case i < 64 && skip&(1<<uint(i)) != 0:
+				full[i] = recordValue(copyValue(m.cursors[op.P1].storedColumn(i)))
+			default:
 				full[i] = recordValue(copyValue(full[i])) // borrowed by OpMakeRecord (recBorrow)
 			}
 		}

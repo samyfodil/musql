@@ -130,6 +130,12 @@ type VInsn struct {
 	// Dead: no instruction reads the register this one writes before it is
 	// written again (the fusion pass's liveness), so its store may be skipped.
 	Dead bool
+	// Skip, on a VResultRow that gathers (an UPDATE's records), is the
+	// registers A+i (bit i) it does not copy: their slots in the row are left
+	// as they were, and nothing here reads them, so the instructions that set
+	// them may be dead. The engine sets it only where it does not read those
+	// slots and does not need those registers.
+	Skip uint64
 }
 
 // VCursor is native code's view of one materialized cursor: the rows the

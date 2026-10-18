@@ -87,6 +87,18 @@ func vmStepOf(in VInsn, pc int) progStep {
 		s.defs = []int{in.C}
 	case VRewind, VNext:
 		s.targets = []int{in.T}
+	case VResultRow:
+		if in.Skip == 0 {
+			s.useAll = true // VDBE code reads the row, or a return to Go
+			break
+		}
+		// A gathered row that leaves some registers out (Skip) reads only
+		// the others, and goes on to the next pc.
+		for i := 0; i < in.B; i++ {
+			if in.Skip&(1<<uint(i)) == 0 {
+				s.uses = append(s.uses, in.A+i)
+			}
+		}
 	case VFused:
 		// Part of the instruction before. An entry at it (VFusedTest) comes
 		// from the VDBE, which keeps every register in the file.

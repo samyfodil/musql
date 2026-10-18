@@ -45,6 +45,12 @@ type vmJIT struct {
 	// VDBE applies them as soon as the call returns (vdbe.applyGathered).
 	updAt int
 
+	// updSkip is the gathered record's Skip (gatherSkip): the columns whose
+	// registers may be stale when the record is made, which updateRow then
+	// reads from the cursor's row instead.
+	updSkip uint64
+	updPlan *updatePlan // that OP_UpdateRow's
+
 	// params is how many of the nReg registers, the last ones, hold the bound
 	// parameters (Program.jitParams); enter fills them.
 	params int
@@ -256,6 +262,10 @@ func compileVMJIT(prog *Program) *vmJIT {
 		}
 	}
 	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams, params: nParams, entry: entry, marked: marked, native: native, updAt: updAt}
+	if updAt >= 0 {
+		jx.updSkip = vp[updAt-1].Skip
+		jx.updPlan, _ = prog.Insns[updAt].P4.(*updatePlan)
+	}
 	if slices.ContainsFunc(vp, func(in jit.VInsn) bool { return in.Op == jit.VResultRow }) {
 		jx.rows = jit.VReachesResultRow(vp)
 	}
@@ -353,9 +363,75 @@ func gatherUpdate(prog *Program, vp []jit.VInsn) int {
 		return -1
 	}
 	mr := &prog.Insns[at-1]
-	vp[at-1] = jit.VInsn{Op: jit.VResultRow, A: mr.P1, B: mr.P2 + 1}
+	vp[at-1] = jit.VInsn{Op: jit.VResultRow, A: mr.P1, B: mr.P2 + 1, Skip: gatherSkip(prog, at)}
 	vp[at] = jit.VInsn{Op: jit.VGoto, T: at + 1}
 	return at
+}
+
+// gatherSkip is the registers a gathered UPDATE record may leave out
+// (VInsn.Skip): the columns the UPDATE does not assign, which applyGathered
+// never reads from a gathered row -- updateRow takes them from the stored row,
+// or from the cursor's own (updSkip). Leaving them out lets the JIT drop the
+// OP_Column that loads each, when nothing else reads it.
+//
+// Only in a program made of the plain instructions listed here, none of which
+// names such a register except the OP_Column that loads it and the record
+// itself: then a register left stale (its OP_Column dropped) is read by
+// nothing but the record, which takes the column from elsewhere. Anything
+// else -- a trigger, a constraint's substitution, a function's argument run
+// -- keeps them all.
+func gatherSkip(prog *Program, at int) uint64 {
+	mr := &prog.Insns[at-1]
+	borrow, _ := mr.P4.(recBorrow)
+	if len(borrow) == 0 || len(borrow) > 63 {
+		return 0
+	}
+	var skip uint64
+	for c, b := range borrow {
+		if b && c < mr.P2 {
+			skip |= 1 << uint(c)
+		}
+	}
+	isSkipped := func(r int) bool {
+		i := r - mr.P1
+		return i >= 0 && i < mr.P2 && skip&(1<<uint(i)) != 0
+	}
+	for pc := range prog.Insns {
+		if pc == at || pc == at-1 {
+			continue
+		}
+		in := &prog.Insns[pc]
+		// Which of P1..P3 name registers; where unsure, all three, which
+		// can only cost the skip.
+		regs := [3]bool{true, true, true}
+		switch in.Op {
+		case OpColumn, OpRowid:
+			// They read a cursor, not a register, and the one that loads a
+			// skipped register is what may be dropped.
+			continue
+		case OpInit, OpGoto, OpOpenWrite, OpRewind, OpNext, OpHalt:
+			continue // cursors, jump targets and constants only
+		case OpIf, OpIfNot, OpIsNull, OpNotNull:
+			regs = [3]bool{true, false, false} // P2 is the jump target
+		case OpAffinity:
+			if _, one := in.P4.(affinity); !one {
+				return 0 // a run of registers
+			}
+			regs = [3]bool{true, false, false}
+		case OpVariable, OpSeekIndexHint, OpSeekRowidHint, OpInteger, OpInt64, OpNull, OpSCopy, OpCopy,
+			OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight,
+			OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpNot, OpNegative:
+			if in.Op == OpNull && in.P3 > in.P2 {
+				return 0 // a run of registers
+			}
+		default:
+			return 0
+		}
+		if regs[0] && isSkipped(in.P1) || regs[1] && isSkipped(in.P2) || regs[2] && isSkipped(in.P3) {
+			return 0
+		}
+	}
+	return skip
 }
 
 // scannableCursors marks the cursor numbers native code may rewind and the
