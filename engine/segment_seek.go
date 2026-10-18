@@ -77,6 +77,40 @@ func (s *segment) findRowid(rid int64) (int, bool) {
 	return 0, false
 }
 
+// findRowidFrom is findRowid for a rowid known not to be before position from:
+// it gallops forward from there, so rowids read in ascending order cost a few
+// probes each rather than a search of the whole segment. The position it
+// returns on a miss is where rid would be, for the next call to start from.
+func (s *segment) findRowidFrom(rid int64, from int) (int, bool) {
+	if from <= 0 || from >= s.nRows || int64(s.Rowid(from)) > rid {
+		i, hit := s.findRowid(rid)
+		return i, hit
+	}
+	// The run of consecutive rowids a load leaves: one probe.
+	if d := rid - int64(s.Rowid(from)); d < int64(s.nRows-from) {
+		if g := from + int(d); int64(s.Rowid(g)) == rid {
+			return g, true
+		}
+	}
+	lo, step := from, 1
+	hi := lo + step
+	for hi < s.nRows && int64(s.Rowid(hi)) < rid {
+		lo = hi
+		step *= 2
+		hi = lo + step
+	}
+	hi = min(hi+1, s.nRows)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if int64(s.Rowid(mid)) < rid {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo, lo < s.nRows && int64(s.Rowid(lo)) == rid
+}
+
 // rowAt materializes one row with Width columns (short rows from ALTER ADD COLUMN).
 func (s *segment) rowAt(i int) []Value {
 	w := s.Width(i)

@@ -135,6 +135,9 @@ type segRun struct {
 	si    int
 	prev  int64
 	arena []Value
+	// at is the position in segs[si] the last rowid was found at or would
+	// be: the rowids come ascending, so the next one is searched from there.
+	at int
 }
 
 func (b *segRows) run() segRun {
@@ -180,17 +183,18 @@ func (r *segRun) get(rid uint64) ([]Value, bool) {
 		}
 	}
 	if at < r.prev {
-		r.si = 0
+		r.si, r.at = 0, 0
 	}
 	r.prev = at
 	for r.si < len(r.segs) && at > int64(r.segs[r.si].Rowid(r.segs[r.si].nRows-1)) {
-		r.si++
+		r.si, r.at = r.si+1, 0
 	}
 	if r.si == len(r.segs) {
 		return nil, false
 	}
 	sg := r.segs[r.si]
-	i, hit := sg.findRowid(at)
+	i, hit := sg.findRowidFrom(at, r.at)
+	r.at = i
 	if !hit {
 		return nil, false
 	}
