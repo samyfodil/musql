@@ -15,6 +15,10 @@ import (
 // whose rows have not been loaded. Row slices are never edited in place.
 type rowStore struct {
 	m map[uint64][]Value
+	// mPeak is the most rows m has held since it was made, or the room
+	// reserve made it with: a map never gives back its room, so a reserve
+	// that fits under it need not rebuild m. Zero whenever m is replaced.
+	mPeak int
 
 	// seg is a table's committed rows from the segment file and delta,
 	// never loaded whole. m holds rows written since; gone tracks dropped rowids.
@@ -386,6 +390,7 @@ func (s *rowStore) putHeld(rowid uint64, vals, held []Value) {
 	s.m[rowid] = vals
 	if len(s.m) != n0 {
 		s.overValid = false
+		s.mPeak = max(s.mPeak, len(s.m))
 	}
 	s.noteWritten(rowid, vals)
 	if !haveOld {
@@ -424,6 +429,7 @@ func (s *rowStore) clear() int64 {
 			s.undo = append(s.undo, rsUndo{clr: &rsClear{prior: s.m, priorGone: s.gone, priorBaseGone: s.baseGone, priorN: s.n, priorNKnown: s.nKnown, segClear: true}})
 		}
 		s.m, s.gone, s.baseGone, s.n, s.nKnown = map[uint64][]Value{}, nil, true, 0, true
+		s.mPeak = 0
 		s.swaps++
 		s.writes++
 		s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false
@@ -439,7 +445,7 @@ func (s *rowStore) clear() int64 {
 		// The whole map is set aside, not copied: nothing writes it again.
 		s.undo = append(s.undo, rsUndo{clr: &rsClear{prior: s.m}})
 	}
-	s.m = map[uint64][]Value{}
+	s.m, s.mPeak = map[uint64][]Value{}, 0
 	s.swaps++
 	s.writes++
 	s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false
@@ -659,6 +665,7 @@ func (s *rowStore) clone(owner *tableMeta) *rowStore {
 	// let its appends overwrite this store's entries.
 	cp.undo, cp.logging = nil, false
 	cp.m = maps.Clone(s.m)
+	cp.mPeak = len(cp.m)
 	cp.gone = maps.Clone(s.gone) // the overlay is the copy; the base is shared and read-only
 	return &cp
 }
@@ -764,13 +771,13 @@ func fullStoredRowOf(name string, cols []columnInfo, ipkIndex int, rowid uint64,
 // already is rebuilt at the size, which costs a copy of those few.
 func (s *rowStore) reserve(n int) {
 	switch {
-	case s == nil || n <= 0:
+	case s == nil || n <= 0 || s.mPeak >= len(s.m)+n:
 	case len(s.m) == 0:
-		s.m = make(map[uint64][]Value, n)
+		s.m, s.mPeak = make(map[uint64][]Value, n), n
 	case n >= 1024 && len(s.m) < n/4:
 		m := make(map[uint64][]Value, len(s.m)+n)
 		maps.Copy(m, s.m)
-		s.m = m
+		s.m, s.mPeak = m, len(s.m)+n
 	}
 }
 

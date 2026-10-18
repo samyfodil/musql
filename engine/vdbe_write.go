@@ -4167,11 +4167,13 @@ func (m *vdbe) updateRow(op *Instruction, full []Value, newRowid uint64, inPlace
 			tbl.putRow(newRowid, full)
 		} else if oldVals != nil {
 			// Nothing has written the store since oldVals was read from it.
-			synced := tbl.rows != nil && tbl.rows.writes == writes && origin == seenBase
+			// Whichever row this was (committed or the overlay's), if the
+			// store's count is still the cursor's, the one write since is
+			// this row's own, and the cursor's rowids are distinct: its rows
+			// still to come are untouched.
+			synced := tbl.rows != nil && seen != nil && tbl.rows.writes == writes
 			tbl.putRowOver(newRowid, full, oldVals)
 			if synced {
-				// The one write since is this row's own, and the cursor's
-				// rowids are distinct: its rows still to come are untouched.
 				cur.rowsWrites = tbl.rows.writes
 			}
 		} else {
