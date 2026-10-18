@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"sync"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -9,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"sync"
 	"time"
 	"unsafe"
 
