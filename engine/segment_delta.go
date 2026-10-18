@@ -846,27 +846,59 @@ func segDeltaBatchBytes(recs []SegDeltaRecord) int64 {
 	return n
 }
 
-// segDeltaBatchBytesExceed is segDeltaBatchBytes(recs) > limit, measuring
-// only until the answer is known: a bulk load's batch is far past the limit
-// long before its last record, and measuring a record can mean encoding it.
+// segDeltaBatchBytesExceed reports whether the batch recs would make in a
+// current (version-5) delta is over limit, measuring only until the answer is
+// known: a bulk load's batch is far past the limit long before its last
+// record, and measuring a record can mean encoding it. A patched put counts as
+// its patch record, which is what such a delta takes (an older delta takes the
+// whole row, and compacts a little later than it might). The compaction policy
+// is its only caller.
 func segDeltaBatchBytesExceed(recs []SegDeltaRecord, limit int64) bool {
 	// Most batches are far from the limit: an upper bound from each value's
 	// type and length settles that without measuring a record.
-	if bound, ok := segDeltaBatchBound(recs); ok && bound <= limit {
+	bound := int64(8 + segDeltaTrailerSz)
+	for i := range recs {
+		r := &recs[i]
+		switch {
+		case r.Seg != nil:
+			bound += segDeltaSegHdr + 7 + int64(len(r.Seg))
+		case r.Kill:
+			bound += segDeltaMinRecord
+		case r.src != nil:
+			bound = limit + 1 // nothing to bound it by: measure below
+		case r.patched(segDeltaVersion):
+			bound += segDeltaMinRecord + 4 + 10 // the count and a column, at most
+			for c, set := range r.patch {
+				if set {
+					bound += 3 + int64(recordBound(r.Vals[c:c+1]))
+				}
+			}
+		default:
+			bound += segDeltaMinRecord + 4 + int64(recordBound(r.Vals))
+		}
+		if bound > limit {
+			break
+		}
+	}
+	if bound <= limit {
 		return false
 	}
+	var scratch []Value
 	n := int64(8 + segDeltaTrailerSz)
 	for i := range recs {
 		if n > limit {
 			return true
 		}
-		if recs[i].Seg != nil {
-			n += segDeltaSegHdr + 7 + int64(len(recs[i].Seg))
-			continue
-		}
-		n += segDeltaMinRecord
-		if !recs[i].Kill {
-			n += 4 + int64(recs[i].recordLen())
+		r := &recs[i]
+		switch {
+		case r.Seg != nil:
+			n += segDeltaSegHdr + 7 + int64(len(r.Seg))
+		case r.Kill:
+			n += segDeltaMinRecord
+		case r.patched(segDeltaVersion):
+			n += segDeltaMinRecord + 4 + int64(r.patchLen(&scratch))
+		default:
+			n += segDeltaMinRecord + 4 + int64(r.recordLen())
 		}
 	}
 	return n > limit
