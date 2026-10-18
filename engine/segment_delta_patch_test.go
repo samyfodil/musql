@@ -172,8 +172,11 @@ func TestUpdatePatchesReplay(t *testing.T) {
 	if m != nil {
 		m.Close()
 	}
-	if patches == 0 {
-		t.Fatal("the UPDATEs wrote no patch record: the test reaches nothing")
+	// Every row an UPDATE reads from the file's segments goes in place: 300
+	// per statement among the first 3,000 rows, not just its first row (which
+	// is all that did while the cursor lost track of its own writes).
+	if patches < 1000 {
+		t.Fatalf("the UPDATEs wrote %d patch records, want at least 1,000", patches)
 	}
 
 	check := func(label string) {

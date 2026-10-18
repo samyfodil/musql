@@ -4020,6 +4020,10 @@ func (m *vdbe) updateRow(op *Instruction, full []Value, newRowid uint64, inPlace
 			return -1, perr
 		}
 		tbl.putRowOver(newRowid, full, full)
+		// The one write since the cursor's rows were known to be the
+		// store's is this row's own (inPlace held that), as in the
+		// general path below.
+		m.cursors[op.P1].rowsWrites = tbl.rows.writes
 		m.wctx.undoBase(tbl, oldRowid)
 		m.wctx.db.noteRowUpdate(tbl, oldRowid, newRowid, full, full) // capture log (rowhook.go); no full capture here
 		m.wctx.db.notePatch(tbl, newRowid, plan.setCol)
