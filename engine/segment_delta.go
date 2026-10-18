@@ -622,7 +622,16 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, version uint32, recs
 	}
 	// Sized to the batch when it is smaller than a chunk: a one-row commit
 	// allocated (and zeroed) the whole megabyte.
-	buf := make([]byte, 0, min(n+lenWidth+segDeltaTrailerSz, segDeltaChunk+64))
+	// A batch of a chunk or more takes a pooled chunk: an UPDATE of thousands
+	// of rows allocated a fresh megabyte at every commit.
+	var buf []byte
+	if want := n + lenWidth + segDeltaTrailerSz; want < segDeltaChunk {
+		buf = make([]byte, 0, want)
+	} else {
+		pb := segDeltaChunkPool.Get().(*[]byte)
+		defer segDeltaChunkPool.Put(pb)
+		buf = (*pb)[:0]
+	}
 	if lenWidth == 4 {
 		buf = binary.LittleEndian.AppendUint32(buf, uint32(n))
 	} else {
@@ -717,6 +726,14 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, version uint32, recs
 	}
 	return at + int64(len(buf)), cksum, nil
 }
+
+// segDeltaChunkPool holds writeSegDeltaBatch's chunk buffers. A batch flushes
+// one once it reaches segDeltaChunk; a single record bigger than that grows a
+// copy, which is dropped, and the pool keeps the chunk it handed out.
+var segDeltaChunkPool = sync.Pool{New: func() any {
+	b := make([]byte, 0, segDeltaChunk+64)
+	return &b
+}}
 
 // segDeltaBatchBytes is the most writeSegDeltaBatch appends for recs: the wider
 // length prefix, every record as it measures them, and the trailer.

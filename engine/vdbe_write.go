@@ -616,9 +616,10 @@ func (db *DB) getWriteCtx() *writeCtx {
 // emptied so it pins no row.
 func (db *DB) putWriteCtx(wc *writeCtx) {
 	j := wc.journal
-	if cap(j) > 1024 {
-		// A statement that journalled thousands of entries should not leave
-		// them pinned by the session.
+	if cap(j) > 1<<14 {
+		// A statement that journalled tens of thousands of entries should not
+		// leave their storage held by the session. Below that it is kept,
+		// cleared: an UPDATE of thousands of rows regrew it every statement.
 		j = nil
 	} else {
 		// Only what this statement wrote: the journal is only ever appended
@@ -3967,12 +3968,15 @@ func (m *vdbe) opDelete(op *Instruction) error {
 // statement. Returns a jump target, or -1: an IGNORE resolution leaves the row
 // and jumps to plan.skipAddr.
 func (m *vdbe) opUpdateRow(op *Instruction) (int, error) {
-	return m.updateRow(op, m.recRegs[op.P2], uint64(m.regs[op.P3].I))
+	return m.updateRow(op, m.recRegs[op.P2], uint64(m.regs[op.P3].I), false)
 }
 
 // updateRow is OP_UpdateRow's body for the record full and new rowid
-// newRowid, with the cursor on the row being updated.
-func (m *vdbe) updateRow(op *Instruction, full []Value, newRowid uint64) (int, error) {
+// newRowid, with the cursor on the row being updated. inPlace says full is
+// the cursor's own decoded copy of the committed row, written over with the
+// new values (applyGathered): the old values are gone, and a rollback reads
+// the committed row again instead (undoBase).
+func (m *vdbe) updateRow(op *Instruction, full []Value, newRowid uint64, inPlace bool) (int, error) {
 	plan := op.P4.(*updatePlan)
 	tbl := plan.tbl
 	oldRowid := m.cursors[op.P1].rowid
@@ -3991,7 +3995,7 @@ func (m *vdbe) updateRow(op *Instruction, full []Value, newRowid uint64) (int, e
 			if i < len(oldVals) {
 				full[i] = oldVals[i]
 			} else {
-				full[i] = copyValue(full[i]) // borrowed by OpMakeRecord (recBorrow)
+				full[i] = recordValue(copyValue(full[i])) // borrowed by OpMakeRecord (recBorrow)
 			}
 		}
 	}
@@ -4140,7 +4144,11 @@ func (m *vdbe) updateRow(op *Instruction, full []Value, newRowid uint64) (int, e
 		tbl.putRow(oldRowid, oldVals)
 		return -1, err
 	}
-	m.wctx.undoMove(tbl, newRowid, oldRowid, oldVals)
+	if inPlace {
+		m.wctx.undoBase(tbl, oldRowid)
+	} else {
+		m.wctx.undoMove(tbl, newRowid, oldRowid, oldVals)
+	}
 	m.wctx.db.noteRowUpdate(tbl, oldRowid, newRowid, oldVals, full)             // capture log (rowhook.go)
 	m.wctx.db.fkRowMutated(tbl, oldRowid, newRowid, oldVals, full, plan.setCol) // fkColMask of colIdx, built once
 	m.wctx.rowsAffected++
@@ -4161,9 +4169,12 @@ func unassigned(setCol []bool) recBorrow {
 // the registers of the OpMakeRecord mr before it, then the rowid. It puts the
 // cursor on each row's own position while it does, and back where native code
 // left it after.
-func (m *vdbe) applyGathered(mr, upd *Instruction, rows [][]Value) error {
+//
+// allInPlace reports that every row went into its cursor's copy of the old row
+// (updateRow's inPlace), so none is held where native code gathered it.
+func (m *vdbe) applyGathered(mr, upd *Instruction, rows [][]Value) (allInPlace bool, err error) {
 	if len(rows) == 0 {
-		return nil
+		return true, nil
 	}
 	cur := m.cursors[upd.P1]
 	pos, rowid := cur.pos, cur.rowid
@@ -4183,27 +4194,70 @@ func (m *vdbe) applyGathered(mr, upd *Instruction, rows [][]Value) error {
 			i--
 		}
 		if rid.Typ != Int || i < 0 {
-			return fmt.Errorf("engine: internal: a gathered UPDATE row is not one its cursor visited")
+			return false, fmt.Errorf("engine: internal: a gathered UPDATE row is not one its cursor visited")
 		}
 		at[k] = i
 		i--
 	}
 	borrow, _ := mr.P4.(recBorrow)
 	owned := m.wctx != nil && m.wctx.db.argsOwned
+	plan := upd.P4.(*updatePlan)
+	inPlaceOK := m.wctx.db.updateInPlaceOK(plan.tbl)
+	allInPlace = true
 	for k, row := range rows {
 		full := row[:mr.P2:mr.P2]
 		for c := range full {
-			full[c] = m.recordOf(full[c], c < len(borrow) && borrow[c], owned)
+			// A borrowed column is left as gathered: updateRow replaces it
+			// from the stored row, or copies it, as it does OpMakeRecord's.
+			if c >= len(borrow) || !borrow[c] {
+				full[c] = m.recordOf(full[c], false, owned)
+			}
 		}
 		cur.pos, cur.rowid = at[k], cur.rowids[at[k]]
-		if _, err := m.updateRow(upd, full, uint64(row[mr.P2].I)); err != nil {
-			return err
+		inPlace := false
+		if st := plan.tbl.rows; inPlaceOK && st.inPlaceOK() {
+			// The cursor's copy of the committed row, which nothing else
+			// holds and the store still has as this row (rowSeen's shortcut):
+			// the new values go into it, so the row costs one copy, not two.
+			seen, swaps, writes, origin := cur.storedRow(st, cur.rowid)
+			if origin == seenBase && seen != nil && st.writes == writes && st.swaps == swaps && len(seen) == len(full) {
+				for c, set := range plan.setCol {
+					if set {
+						seen[c] = full[c]
+					}
+				}
+				full, inPlace = seen, true
+			}
+		}
+		allInPlace = allInPlace && inPlace
+		if _, err := m.updateRow(upd, full, uint64(row[mr.P2].I), inPlace); err != nil {
+			return false, err
 		}
 		if err := m.fkDrain(); err != nil { // as OpUpdateRow's case does
-			return err
+			return false, err
 		}
 	}
-	return nil
+	return allInPlace, nil
+}
+
+// updateInPlaceOK reports whether an UPDATE of tbl may write a row's new
+// values over its old ones (applyGathered): nothing that runs after the row is
+// stored needs the old values. A UNIQUE, expression, partial or vector index's
+// check, and an FK, each read them or put them back; full capture copies them;
+// a generated column is computed into the row.
+func (db *DB) updateInPlaceOK(tbl *tableMeta) bool {
+	if db.captureFull || hasGeneratedCols(tbl.cols) || tbl.rows == nil {
+		return false
+	}
+	if db.fkStmt != nil && !db.fkSchemaOf().empty && (len(db.fkOf(tbl)) > 0 || len(db.fkReferencing(tbl)) > 0) {
+		return false
+	}
+	for _, idx := range db.indexes {
+		if indexBelongsTo(idx, tbl) && (idx.unique || idx.exprOrPartial || idx.vec != nil) {
+			return false
+		}
+	}
+	return true
 }
 
 // opUpsertFind implements OP_UpsertFind (see the opcode doc). It probes the
@@ -5161,6 +5215,9 @@ type undoEntry struct {
 	putRid    uint64
 	putVals   []Value
 	drop, put bool
+	// putBase: the row put back is putRid's committed row, read again from the
+	// store's committed rows (undoBase).
+	putBase bool
 	// dropMore is how many further consecutive rowids, after dropRid, this
 	// entry drops: an INSERT of rowids n, n+1, n+2 ... into one table is one
 	// entry, not one per row.
@@ -5186,7 +5243,14 @@ func (e *undoEntry) run() {
 		}
 	}
 	if e.put {
-		e.tbl.putRow(e.putRid, e.putVals)
+		vals := e.putVals
+		if e.putBase {
+			if vals = e.tbl.rows.committedRow(e.putRid); vals == nil {
+				e.tbl.dropRow(e.putRid) // no committed row to restore: none was there
+				return
+			}
+		}
+		e.tbl.putRow(e.putRid, vals)
 	}
 }
 
@@ -5221,6 +5285,12 @@ func (wc *writeCtx) undoDrop(tbl *tableMeta, rid uint64) {
 		}
 	}
 	wc.journalAppend(undoEntry{tbl: tbl, dropRid: rid, drop: true})
+}
+
+// undoBase journals putting rid's committed row back, for an update that wrote
+// its new values over the only copy of the old ones (updateRow's inPlace).
+func (wc *writeCtx) undoBase(tbl *tableMeta, rid uint64) {
+	wc.journalAppend(undoEntry{tbl: tbl, putRid: rid, put: true, putBase: true})
 }
 
 // undoMove journals an update's inverse: drop the row at newRid, then put

@@ -15,7 +15,10 @@ import (
 // violation after many rows were gathered, which must undo them all, a text
 // parameter stored into many rows, triggers that run between gathered rows
 // and read what earlier rows stored, a foreign key, and a transaction with a
-// savepoint rolled back.
+// savepoint rolled back, and one rolled back whole. Outside a transaction, and with no index or key that
+// reads the old row, the new values are written over the cursor's copy of the
+// old row (applyGathered's in place); a CHECK that fails after many such rows
+// must put every one of them back.
 func TestUpdateGatheredRowsMatchesC(t *testing.T) {
 	const n = 1500
 	cases := []struct {
@@ -32,7 +35,7 @@ func TestUpdateGatheredRowsMatchesC(t *testing.T) {
 			`UPDATE t SET v = v + 1 WHERE k = ?`, []any{3}, false},
 		{"overflow", []string{`UPDATE t SET v = 9223372036854775807 WHERE id % 50 = 0`}, `UPDATE t SET v = v + 1 WHERE k = ?`, []any{0}, false},
 		{"unique violation late", []string{`CREATE UNIQUE INDEX tu ON t(u)`},
-			`UPDATE t SET u = u + 1 WHERE k = ?`, []any{3}, true},
+			`UPDATE t SET u = CASE WHEN id = 1403 THEN 2 ELSE u + 1 END WHERE k = ?`, []any{3}, true}, // id 1's u
 		{"after trigger reads earlier rows", []string{
 			`CREATE TABLE log(id INTEGER, s INTEGER)`,
 			`CREATE TRIGGER tr AFTER UPDATE ON t WHEN new.id % 100 = 3 BEGIN INSERT INTO log SELECT new.id, sum(v) FROM t; END`},
@@ -43,14 +46,27 @@ func TestUpdateGatheredRowsMatchesC(t *testing.T) {
 		{"foreign key", []string{`PRAGMA foreign_keys = ON`, `CREATE TABLE p(id INTEGER PRIMARY KEY)`, `INSERT INTO p SELECT id FROM t`,
 			`CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id))`, `INSERT INTO c SELECT id, id FROM t WHERE id % 7 = 0`},
 			`UPDATE c SET pid = pid + ? WHERE id > 0`, []any{0}, false},
+		{"check fails late", nil, `UPDATE t SET v = v + ? WHERE k = ?`, []any{15, 3}, true}, // only from id 1493 on
+		{"not null fails late", nil, `UPDATE t SET v = CASE WHEN id = 1403 THEN NULL ELSE v + ? END WHERE k = ?`, []any{1, 3}, true},
+	}
+	// The table, where a case needs its own.
+	ddls := map[string]string{
+		"check fails late":    `CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, v INTEGER CHECK (v < 1505), w TEXT, u INTEGER)`,
+		"not null fails late": `CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, v INTEGER NOT NULL, w TEXT, u INTEGER)`,
 	}
 	for ci, tc := range cases {
-		for _, inTx := range []bool{false, true} {
-			name := fmt.Sprintf("%s/tx=%v", tc.name, inTx)
-			pureDB, mattnDB, _, _ := openPair(t, fmt.Sprintf("gather%d_%v", ci, inTx))
+		// tx: 0 autocommit, 1 a transaction committed, 2 one rolled back.
+		for tx := range 3 {
+			inTx := tx > 0
+			name := fmt.Sprintf("%s/tx=%d", tc.name, tx)
+			pureDB, mattnDB, _, _ := openPair(t, fmt.Sprintf("gather%d_%d", ci, tx))
 			pureDB.SetMaxOpenConns(1)
 			mattnDB.SetMaxOpenConns(1)
-			execBoth(t, pureDB, mattnDB, name, `CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, w TEXT, u INTEGER)`)
+			ddl := ddls[tc.name]
+			if ddl == "" {
+				ddl = `CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, w TEXT, u INTEGER)`
+			}
+			execBoth(t, pureDB, mattnDB, name, ddl)
 			execBoth(t, pureDB, mattnDB, name, fmt.Sprintf(`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i < %d) INSERT INTO t SELECT i, i %% 10, i, 'w' || i, i * 2 FROM c`, n))
 			for _, s := range tc.pre {
 				execBoth(t, pureDB, mattnDB, name, s)
@@ -63,15 +79,18 @@ func TestUpdateGatheredRowsMatchesC(t *testing.T) {
 			if tc.fail {
 				_, perr := pureDB.Exec(tc.upd, tc.args...)
 				_, merr := mattnDB.Exec(tc.upd, tc.args...)
-				if (perr == nil) != (merr == nil) {
-					t.Fatalf("%s: musql error %v, C error %v", name, perr, merr)
+				if perr == nil || merr == nil {
+					t.Fatalf("%s: musql error %v, C error %v; both must fail", name, perr, merr)
 				}
 			} else {
 				execBoth(t, pureDB, mattnDB, name, tc.upd, tc.args...)
 				queryBoth(t, pureDB, mattnDB, name, `SELECT changes()`)
 			}
-			if inTx {
+			switch tx {
+			case 1:
 				execBoth(t, pureDB, mattnDB, name, `COMMIT`)
+			case 2:
+				execBoth(t, pureDB, mattnDB, name, `ROLLBACK`)
 			}
 			queryBoth(t, pureDB, mattnDB, name, `SELECT * FROM t ORDER BY id`)
 			if tc.name == "after trigger reads earlier rows" {

@@ -167,19 +167,22 @@ func (b *segRows) run() segRun {
 	return r
 }
 
-func (r *segRun) get(rid uint64) ([]Value, bool) {
+// get is rid's committed row. The third result is whether the row was decoded
+// for this call into the run's own arena, so that nothing else holds it.
+func (r *segRun) get(rid uint64) ([]Value, bool, bool) {
 	if !r.ok {
-		return r.b.get(rid)
+		vals, ok := r.b.get(rid)
+		return vals, ok, false
 	}
 	at := int64(rid)
 	if r.delta {
 		// As seekRowid: the log's PUT beats the segment's copy, a KILL removes it.
 		if v, live := r.src.delta.live[r.ti][at]; live {
 			row, err := fullStoredRow(r.b.tbl, rid, v)
-			return row, err == nil
+			return row, err == nil, false
 		}
 		if r.src.delta.dead[r.ti][at] {
-			return nil, false
+			return nil, false, false
 		}
 	}
 	if at < r.prev {
@@ -190,13 +193,13 @@ func (r *segRun) get(rid uint64) ([]Value, bool) {
 		r.si, r.at = r.si+1, 0
 	}
 	if r.si == len(r.segs) {
-		return nil, false
+		return nil, false, false
 	}
 	sg := r.segs[r.si]
 	i, hit := sg.findRowidFrom(at, r.at)
 	r.at = i
 	if !hit {
-		return nil, false
+		return nil, false, false
 	}
 	nCols := len(sg.cols)
 	w := sg.Width(i)
@@ -212,7 +215,7 @@ func (r *segRun) get(rid uint64) ([]Value, bool) {
 		row[c] = sg.Value(c, i)
 	}
 	full, err := fullStoredRow(r.b.tbl, rid, row)
-	return full, err == nil
+	return full, err == nil, true
 }
 
 // has reports whether rid has a committed row, without decoding it.

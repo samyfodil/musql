@@ -114,8 +114,10 @@ func (s *rowStore) row(rowid uint64) []Value {
 
 // eachOf calls fn with the row of each of rowids the store holds, in the
 // order given: get for each, with a segment-backed store's committed rows read
-// as one run (segRun). base is whether the row came from those committed rows
-// rather than the overlay, for rowSeen.
+// as one run (segRun). base is whether the row came from those committed rows,
+// decoded for this call so that nothing else holds it, rather than from the
+// overlay or a read others share: for rowSeen, which a false base only costs
+// its shortcut, and for an UPDATE that stores its new row into it.
 func (s *rowStore) eachOf(rowids []uint64, fn func(rid uint64, vals []Value, base bool)) {
 	if s == nil {
 		return
@@ -137,8 +139,8 @@ func (s *rowStore) eachOf(rowids []uint64, fn func(rid uint64, vals []Value, bas
 		if s.baseGone || s.gone[rid] {
 			continue
 		}
-		if vals, ok := run.get(rid); ok {
-			fn(rid, vals, true)
+		if vals, ok, owned := run.get(rid); ok {
+			fn(rid, vals, owned)
 		}
 	}
 }
@@ -179,6 +181,24 @@ const (
 	seenBase
 	seenOverlay
 )
+
+// inPlaceOK reports whether the store may take an UPDATE's new row written over
+// the old one (applyGathered): it keeps no copy of an old row -- no undo log,
+// no equality or conflict index -- that would then show the new values.
+func (s *rowStore) inPlaceOK() bool {
+	return s != nil && s.seg != nil && !s.logging && len(s.eqIdx) == 0 && len(s.uqIdx) == 0
+}
+
+// committedRow is rowid's committed row, as the store's committed rows (not
+// its overlay) hold it, or nil: what an update that wrote over its only copy of
+// the old row puts back on a rollback (undoBase).
+func (s *rowStore) committedRow(rowid uint64) []Value {
+	if s == nil || s.seg == nil {
+		return nil
+	}
+	vals, _ := s.seg.get(rowid)
+	return vals
+}
 
 func (s *rowStore) len() int {
 	if s == nil {

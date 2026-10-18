@@ -1361,12 +1361,14 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				jitScoreEnter()
 			}
 			before := len(rows)
+			var chunk []Value
 			if jx.updAt >= 0 {
 				// Room for a batch of records, so native code goes on past
 				// many rows before it hands them over (gatherUpdate).
 				const batch = 256
 				rows = slices.Grow(rows, batch)
 				m.recRoom(batch * (insns[jx.updAt-1].P2 + 1))
+				chunk = m.recChunk
 			}
 			next, n := jx.enter(m, pc, &rows)
 			pc = next
@@ -1378,8 +1380,15 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				if n >= 0 {
 					gathered = append(gathered, m.recAlloc(n))
 				}
-				if err := m.applyGathered(&insns[jx.updAt-1], &insns[jx.updAt], gathered); err != nil {
+				allInPlace, err := m.applyGathered(&insns[jx.updAt-1], &insns[jx.updAt], gathered)
+				if err != nil {
 					return nil, err
+				}
+				if allInPlace && n < 0 {
+					// Every row went into its cursor's copy of the old one, so
+					// nothing holds what native code gathered: the next batch
+					// gathers into the same memory.
+					m.recChunk = chunk
 				}
 				clear(rows[before:])
 				rows = rows[:before]
