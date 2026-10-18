@@ -113,7 +113,7 @@ func (s *rowStore) segEqRowids(col int, v int64) ([]uint64, bool) {
 	if !s.baseGone {
 		for _, r := range hits {
 			rid := uint64(r)
-			if _, over := s.m[rid]; over || s.gone[rid] {
+			if _, over := s.m[rid]; over || s.isGone(rid) {
 				continue
 			}
 			out = append(out, rid)

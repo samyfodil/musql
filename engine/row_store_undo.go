@@ -75,7 +75,7 @@ func (s *rowStore) undoTo(mark int) {
 		u := s.undo[i]
 		switch {
 		case u.clr != nil && u.clr.segClear:
-			s.m, s.gone, s.baseGone, s.n, s.nKnown = u.clr.prior, u.clr.priorGone, u.clr.priorBaseGone, u.clr.priorN, u.clr.priorNKnown
+			s.m, s.gone, s.goneBits, s.baseGone, s.n, s.nKnown = u.clr.prior, u.clr.priorGone, nil, u.clr.priorBaseGone, u.clr.priorN, u.clr.priorNKnown
 			s.mPeak = 0
 			s.swaps++
 			s.writes++

@@ -383,7 +383,7 @@ func (s *rowStore) segHas(rid uint64) bool {
 	if _, ok := s.m[rid]; ok {
 		return true
 	}
-	if s.baseGone || s.gone[rid] {
+	if s.baseGone || s.isGone(rid) {
 		return false
 	}
 	return s.seg.has(rid)
@@ -393,7 +393,7 @@ func (s *rowStore) segGet(rid uint64) ([]Value, bool) {
 	if vals, ok := s.m[rid]; ok {
 		return s.resolve(vals), true
 	}
-	if s.baseGone || s.gone[rid] {
+	if s.baseGone || s.isGone(rid) {
 		return nil, false
 	}
 	return s.seg.get(rid)
@@ -406,7 +406,7 @@ func (s *rowStore) segLen() int {
 		n := 0
 		if !s.baseGone {
 			s.seg.walkRowids(func(rid uint64) bool {
-				if _, over := s.m[rid]; !over && !s.gone[rid] {
+				if _, over := s.m[rid]; !over && !s.isGone(rid) {
 					n++
 				}
 				return true
@@ -425,7 +425,7 @@ func (s *rowStore) segAll(yield func(uint64, []Value) bool) {
 	if !s.baseGone {
 		stop := false
 		s.seg.walk(func(rid uint64, vals []Value) bool {
-			if _, o := s.m[rid]; o || s.gone[rid] || s.baseGone {
+			if _, o := s.m[rid]; o || s.isGone(rid) || s.baseGone {
 				return true
 			}
 			if !yield(rid, vals) {

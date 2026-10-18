@@ -22,8 +22,11 @@ type rowStore struct {
 
 	// seg is a table's committed rows from the segment file and delta,
 	// never loaded whole. m holds rows written since; gone tracks dropped rowids.
-	seg      *segRows
-	gone     map[uint64]bool
+	seg  *segRows
+	gone map[uint64]bool
+	// goneBits is gone as bits (rowidBits), for isGone: kept beside a gone
+	// map this store started, nil once gone is replaced whole.
+	goneBits *rowidBits
 	baseGone bool
 	n        int
 	nKnown   bool
@@ -150,7 +153,7 @@ func (s *rowStore) eachOf(rowids []uint64, notGone bool, fn func(rid uint64, val
 			fn(rid, s.resolve(vals), false)
 			continue
 		}
-		if !notGone && (s.baseGone || s.gone[rid]) {
+		if !notGone && (s.baseGone || s.isGone(rid)) {
 			continue
 		}
 		if vals, ok, owned := run.get(rid); ok {
@@ -182,7 +185,7 @@ func (s *rowStore) eachOfParallel(rowids []uint64, notGone bool, fn func(rid uin
 				over = map[uint64][]Value{}
 			}
 			over[rid] = vals
-		} else if notGone || !s.baseGone && !s.gone[rid] {
+		} else if notGone || !s.baseGone && !s.isGone(rid) {
 			base = append(base, rid)
 		}
 	}
@@ -254,7 +257,7 @@ func (s *rowStore) rowSeen(rowid uint64, seen []Value, swaps uint32, writes uint
 	if seen != nil && origin == seenBase && s.writes == writes && s.swaps == swaps && s.seg != nil {
 		return seen
 	}
-	if seen == nil || origin == seenOverlay || s.seg == nil || s.swaps != swaps || s.baseGone || s.gone[rowid] {
+	if seen == nil || origin == seenOverlay || s.seg == nil || s.swaps != swaps || s.baseGone || s.isGone(rowid) {
 		return s.row(rowid)
 	}
 	if _, over := s.m[rowid]; over || origin == seenUnknown && !s.seg.has(rowid) {
@@ -288,6 +291,14 @@ func (s *rowStore) committedRow(rowid uint64) []Value {
 	}
 	vals, _ := s.seg.get(rowid)
 	return vals
+}
+
+// isGone is gone[rid], answered from goneBits when they rule it out.
+func (s *rowStore) isGone(rid uint64) bool {
+	if len(s.gone) == 0 || !s.goneBits.has(int64(rid)) {
+		return false
+	}
+	return s.gone[rid]
 }
 
 func (s *rowStore) len() int {
@@ -367,6 +378,7 @@ func (s *rowStore) putHeld(rowid uint64, vals, held []Value) {
 			// A held row is a row the store holds, and a dropped rowid holds
 			// none: only an unheld rowid can be in the dropped set.
 			delete(s.gone, rowid)
+			s.goneBits.del(int64(rowid))
 		}
 	} else if held != nil {
 		old, haveOld = held, true
@@ -428,7 +440,7 @@ func (s *rowStore) clear() int64 {
 		if s.logging {
 			s.undo = append(s.undo, rsUndo{clr: &rsClear{prior: s.m, priorGone: s.gone, priorBaseGone: s.baseGone, priorN: s.n, priorNKnown: s.nKnown, segClear: true}})
 		}
-		s.m, s.gone, s.baseGone, s.n, s.nKnown = map[uint64][]Value{}, nil, true, 0, true
+		s.m, s.gone, s.goneBits, s.baseGone, s.n, s.nKnown = map[uint64][]Value{}, nil, nil, true, 0, true
 		s.mPeak = 0
 		s.swaps++
 		s.writes++
@@ -479,9 +491,12 @@ func (s *rowStore) drop(rowid uint64) {
 		delete(s.m, rowid)
 		if !s.baseGone && s.seg.has(rowid) {
 			if s.gone == nil {
-				s.gone = map[uint64]bool{}
+				s.gone, s.goneBits = map[uint64]bool{}, &rowidBits{}
 			}
 			s.gone[rowid] = true
+			if s.goneBits != nil {
+				s.goneBits.add(int64(rowid))
+			}
 		}
 		if s.nKnown {
 			s.n--
@@ -667,6 +682,7 @@ func (s *rowStore) clone(owner *tableMeta) *rowStore {
 	cp.m = maps.Clone(s.m)
 	cp.mPeak = len(cp.m)
 	cp.gone = maps.Clone(s.gone) // the overlay is the copy; the base is shared and read-only
+	cp.goneBits = nil            // this store's own; the copy reads its map
 	return &cp
 }
 
