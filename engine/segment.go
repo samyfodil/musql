@@ -106,8 +106,8 @@ type segment struct {
 
 	// diskIdx is this segment's equality indexes, read out of the FILE: a view
 	// over the mapped bytes, opened once per column and holding no data of its
-	// own. There is no in-memory alternative, deliberately -- see
-	// segment_eqindex.go.
+	// own -- or, for a segment written without them, the same record built
+	// on first use (segment_eqindex.go).
 	eqMu    eqCountMu
 	diskIdx map[int]*segDiskIndex
 

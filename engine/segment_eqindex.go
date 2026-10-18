@@ -1,6 +1,9 @@
 package engine
 
-import "sync"
+import (
+	"sync"
+	"unsafe"
+)
 
 // An equality index over one columnar column: which rows hold a value,
 // and how many. The implementation lives in segment_index_ondisk.go.
@@ -39,7 +42,7 @@ func (s *segment) segEqualityRows(col int, v int64) ([]int32, bool) {
 // diskIndexFor is this column's on-disk index, opened once and remembered. The
 // view it returns points into the segment's mapped bytes and copies nothing.
 func (s *segment) diskIndexFor(col int) (*segDiskIndex, bool) {
-	if col < 0 || col >= len(s.cols) || s.cols[col].idxOff == 0 {
+	if col < 0 || col >= len(s.cols) {
 		return nil, false
 	}
 	// THE READER CHECKS WHAT THE INDEX CLAIMS TO DESCRIBE, rather than trusting
@@ -74,7 +77,23 @@ func (s *segment) diskIndexFor(col int) (*segDiskIndex, bool) {
 	case PhysFloat64:
 		want = segIdxCodecFloat
 	}
-	x, ok := openSegColumnIndex(s.buf, s.cols[col].idxOff, s.nRows, s.heap, func(i int) ([]byte, bool) { return s.cellBytes(col, i) })
+	buf, off := s.buf, s.cols[col].idxOff
+	if off == 0 {
+		// A segment written without its indexes -- an append load streams
+		// its rows into one and skips them, which is most of what made the
+		// load cheaper than C's -- gets the same record built on first use, in
+		// memory, and opened through the same validation below. Only a column
+		// someone seeks pays for it, once per segment; the next compaction
+		// writes it into the file like any other.
+		blk, ok := s.buildColumnIndex(col)
+		if !ok {
+			s.diskIdx[col] = nil
+			return nil, false
+		}
+		buf, off = make([]byte, 8+len(blk)), 8 // 8-aligned, as in a file
+		copy(buf[8:], blk)
+	}
+	x, ok := openSegColumnIndex(buf, off, s.nRows, s.heap, func(i int) ([]byte, bool) { return s.cellBytes(col, i) })
 	if ok && want == segIdxCodecBytes && x.codec == segIdxCodecBytesPerm {
 		want = x.codec // the same question, in the packed layout
 	}
@@ -90,6 +109,41 @@ func (s *segment) diskIndexFor(col int) (*segDiskIndex, bool) {
 	}
 	s.diskIdx[col] = x
 	return x, true
+}
+
+// buildColumnIndex lays out col's index record exactly as buildSegmentWith
+// would have written it into the file, from the column's cells in place.
+// false when the column has no flat cell block to read (the caller has
+// already refused NULLs and exceptions), a row is short, or the record would
+// be too large.
+func (s *segment) buildColumnIndex(col int) ([]byte, bool) {
+	// A short row reads as the column's DEFAULT whatever its cell holds. The
+	// writer counts it a NULL, so its column has a bitmap and never gets here;
+	// this refuses a file that says otherwise. Every append-load segment is
+	// full width.
+	if !s.fullWidth || s.nRows == 0 {
+		return nil, false
+	}
+	switch s.cols[col].phys {
+	case PhysInt64:
+		vals, ok := s.Int64Column(col)
+		if !ok {
+			return nil, false
+		}
+		return buildSegColumnIndex(vals)
+	case PhysFloat64:
+		vals, ok := s.Float64Column(col)
+		if !ok {
+			return nil, false
+		}
+		return buildSegColumnIndexFloat(unsafe.Slice((*int64)(unsafe.Pointer(unsafe.SliceData(vals))), len(vals)))
+	default:
+		cells, heap, ok := s.BytesColumn(col)
+		if !ok {
+			return nil, false
+		}
+		return buildSegColumnIndexBytesPerm(unsafe.Slice((*int64)(unsafe.Pointer(unsafe.SliceData(cells))), len(cells)), heap)
+	}
 }
 
 // segEqualityRowsBytes is segEqualityRows for a TEXT or BLOB probe, compared
