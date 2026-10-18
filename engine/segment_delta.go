@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"sync"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -190,6 +191,11 @@ type segDeltaState struct {
 	// them after the file's own segments. They alias the mapping when there is
 	// one, exactly as live's rows do.
 	segs map[int][]*segment
+
+	// posMu guards posCache, namedPositions' kept answer for one table (see
+	// segment_delta_merge.go): a statement's parallel scans share this state.
+	posMu    sync.Mutex
+	posCache *namedPosCache
 }
 
 // release unmaps the delta this state's rows alias. Safe on nil and twice.

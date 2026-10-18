@@ -123,6 +123,16 @@ func TestAppendLoadSegmentsMatchC(t *testing.T) {
 	load("crossing the arming threshold", span(8001, 8600), nil, "commit")
 	engine.SetAppendArmAfterForTest(old)
 
+	// Rounds of 7b/7c's shape -- a bulk UPDATE of a tenth, then a bulk DELETE of
+	// it -- with the same queries after each: every batch must invalidate what
+	// the reads kept of the previous one (the delta's resolved positions).
+	for k := 0; k < 5; k++ {
+		execBoth(t, pureDB, mattnDB, "bulk update", `UPDATE t SET v = v + 1 WHERE k = ?`, k)
+		battery(t, pureDB, mattnDB, fmt.Sprintf("after bulk update k=%d", k))
+		execBoth(t, pureDB, mattnDB, "bulk delete", `DELETE FROM t WHERE k = ?`, k)
+		battery(t, pureDB, mattnDB, fmt.Sprintf("after bulk delete k=%d", k))
+	}
+
 	// A fresh connection and a reopen read the segment records from the file.
 	pureDB.Close()
 	mattnDB.Close()
@@ -154,6 +164,9 @@ func battery(t *testing.T, pureDB, mattnDB *sql.DB, label string) {
 		`SELECT count(*), sum(length(b)) FROM t WHERE b IS NOT NULL`,
 		`SELECT id FROM t WHERE v < 0 ORDER BY id`,
 		`SELECT count(*) FROM t WHERE f IS NULL`,
+		`SELECT count(*) FROM t WHERE v > 4000`,
+		`SELECT sum(v) FROM t WHERE v > 4000`,
+		`SELECT id, v FROM t ORDER BY v DESC LIMIT 20`,
 		`PRAGMA integrity_check`,
 	} {
 		queryBoth(t, pureDB, mattnDB, label, q)
