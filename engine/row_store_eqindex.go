@@ -124,6 +124,10 @@ func (s *rowStore) segEqRowids(col int, v int64) ([]uint64, bool) {
 			out = append(out, rid)
 		}
 	}
+	// Ascending already unless the overlay added any (hits came sorted).
+	if strictlyAscending(out) {
+		return out, true
+	}
 	radixSortRowids(out)
 	return slices.Compact(out), true
 }

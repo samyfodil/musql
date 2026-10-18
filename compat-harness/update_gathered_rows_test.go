@@ -118,3 +118,38 @@ func TestUpdateGatheredRowsMatchesC(t *testing.T) {
 		}
 	}
 }
+
+// TestUpdateLargeSeekMatchesC: an UPDATE whose equality seek finds thousands
+// of rows reads their committed copies on several cores (engine's
+// eachOfParallel), mixed with rows the overlay holds and rows already
+// deleted, and must still visit, store and commit every one as C does.
+func TestUpdateLargeSeekMatchesC(t *testing.T) {
+	for _, inTx := range []bool{false, true} {
+		name := fmt.Sprintf("large/tx=%v", inTx)
+		pureDB, mattnDB, purePath, _ := openPair(t, fmt.Sprintf("large_%v", inTx))
+		pureDB.SetMaxOpenConns(1)
+		mattnDB.SetMaxOpenConns(1)
+		execBoth(t, pureDB, mattnDB, name, `CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, w TEXT)`)
+		execBoth(t, pureDB, mattnDB, name, `WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i < 60000) INSERT INTO t SELECT i, i % 10, i, 'w' || i FROM c`)
+		execBoth(t, pureDB, mattnDB, name, `VACUUM`)
+		if inTx {
+			execBoth(t, pureDB, mattnDB, name, `BEGIN`)
+		}
+		execBoth(t, pureDB, mattnDB, name, `DELETE FROM t WHERE id % 13 = 0`)
+		execBoth(t, pureDB, mattnDB, name, `UPDATE t SET w = 'o' || id WHERE id % 11 = 0`)
+		execBoth(t, pureDB, mattnDB, name, `UPDATE t SET v = v + ? WHERE k = ?`, 5, 3)
+		queryBoth(t, pureDB, mattnDB, name, `SELECT changes()`)
+		execBoth(t, pureDB, mattnDB, name, `UPDATE t SET v = v * 2, w = w || 'x' WHERE k = ?`, 3)
+		if inTx {
+			execBoth(t, pureDB, mattnDB, name, `COMMIT`)
+		}
+		queryBoth(t, pureDB, mattnDB, name, `SELECT * FROM t ORDER BY id`)
+		pureDB.Close()
+		reopened, err := sql.Open(driver.DriverName, purePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		queryBoth(t, reopened, mattnDB, name+"/reopened", `SELECT * FROM t ORDER BY id`)
+		reopened.Close()
+	}
+}

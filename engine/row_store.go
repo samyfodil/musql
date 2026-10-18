@@ -5,7 +5,9 @@ import (
 	"iter"
 	"maps"
 	"math"
+	"runtime"
 	"slices"
+	"sync"
 )
 
 // rowStore is one table's rows, keyed by rowid. A nil *rowStore is a table
@@ -118,7 +120,10 @@ func (s *rowStore) row(rowid uint64) []Value {
 // decoded for this call so that nothing else holds it, rather than from the
 // overlay or a read others share: for rowSeen, which a false base only costs
 // its shortcut, and for an UPDATE that stores its new row into it.
-func (s *rowStore) eachOf(rowids []uint64, fn func(rid uint64, vals []Value, base bool)) {
+//
+// notGone says the caller already knows no rowid the overlay does not hold
+// was deleted (segEqRowids filtered them), so that is not looked up again.
+func (s *rowStore) eachOf(rowids []uint64, notGone bool, fn func(rid uint64, vals []Value, base bool)) {
 	if s == nil {
 		return
 	}
@@ -131,16 +136,83 @@ func (s *rowStore) eachOf(rowids []uint64, fn func(rid uint64, vals []Value, bas
 		return
 	}
 	run := s.seg.run()
+	if run.ok && len(rowids) >= eachOfParallelMin && runtime.GOMAXPROCS(0) > 1 && !hasGeneratedCols(s.seg.tbl.cols) {
+		s.eachOfParallel(rowids, notGone, fn)
+		return
+	}
 	for _, rid := range rowids {
 		if vals, ok := s.m[rid]; ok {
 			fn(rid, s.resolve(vals), false)
 			continue
 		}
-		if s.baseGone || s.gone[rid] {
+		if !notGone && (s.baseGone || s.gone[rid]) {
 			continue
 		}
 		if vals, ok, owned := run.get(rid); ok {
 			fn(rid, vals, owned)
+		}
+	}
+}
+
+// eachOfParallelMin is how many rowids make eachOf decode the committed rows
+// on several cores: decoding is most of what reading thousands of them costs
+// (a bulk UPDATE's seek), and below this the goroutines cost more than they
+// save.
+const eachOfParallelMin = 4096
+
+// eachOfParallel is eachOf with the committed rows decoded by several
+// goroutines first, each through a run of its own over its share of them --
+// a run's arena is its own, so every row is still decoded for this call alone
+// -- and fn then called for every row in the order given, on this goroutine.
+// The decoding only reads: segments, the delta, the table's columns. A table
+// with generated columns, which decoding computes, is left to eachOf.
+func (s *rowStore) eachOfParallel(rowids []uint64, notGone bool, fn func(rid uint64, vals []Value, base bool)) {
+	// Which rows are the overlay's (kept, so they are not looked up twice),
+	// which are gone, which are to be read.
+	base := make([]uint64, 0, len(rowids))
+	var over map[uint64][]Value
+	for _, rid := range rowids {
+		if vals, in := s.m[rid]; in {
+			if over == nil {
+				over = map[uint64][]Value{}
+			}
+			over[rid] = vals
+		} else if notGone || !s.baseGone && !s.gone[rid] {
+			base = append(base, rid)
+		}
+	}
+	out := make([][]Value, len(base))
+	state := make([]uint8, len(base)) // 0 no row, 1 a row, 2 a row decoded for this call
+	workers := min(runtime.GOMAXPROCS(0), len(base)/(eachOfParallelMin/4), 8)
+	var wg sync.WaitGroup
+	for w := range max(workers, 1) {
+		lo, hi := w*len(base)/max(workers, 1), (w+1)*len(base)/max(workers, 1)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			run := s.seg.run()
+			for j := lo; j < hi; j++ {
+				if vals, ok, owned := run.get(base[j]); ok {
+					out[j], state[j] = vals, 1
+					if owned {
+						state[j] = 2
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	b := 0
+	for _, rid := range rowids {
+		if vals, in := over[rid]; in {
+			fn(rid, s.resolve(vals), false)
+			continue
+		}
+		if b < len(base) && base[b] == rid {
+			if state[b] != 0 {
+				fn(rid, out[b], state[b] == 2)
+			}
+			b++
 		}
 	}
 }

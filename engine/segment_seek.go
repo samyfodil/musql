@@ -278,8 +278,23 @@ func (src *segSource) withDeltaRowids(rootPage uint32, rowids []int64) []int64 {
 			}
 		}
 	}
+	// The segments' hits come ascending and distinct, segment after segment;
+	// only the log's rowids can put them out of order.
+	if strictlyAscending(rowids) {
+		return rowids
+	}
 	slices.Sort(rowids)
 	return slices.Compact(rowids)
+}
+
+// strictlyAscending reports whether every rowid is above the one before it.
+func strictlyAscending[T int64 | uint64](rowids []T) bool {
+	for i := 1; i < len(rowids); i++ {
+		if rowids[i] <= rowids[i-1] {
+			return false
+		}
+	}
+	return true
 }
 
 // SeekIndexRowidsSegments answers a leading-column equality seek from this

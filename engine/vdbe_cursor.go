@@ -584,6 +584,7 @@ func (cur *vdbeCursor) rewind() error {
 			// only an integer probe can use it; either falls to the walk.
 			if cur.idxSeekConfigured && !tbl.withoutRowid && tbl.rows != nil && cur.idxSeekProbe.Typ == Int {
 				hits, ok := tbl.rows.segEqRowids(cur.idxSeekCol, cur.idxSeekProbe.I)
+				fromSeg := ok
 				if !ok {
 					hits, ok = tbl.rows.eqRowids(cur.idxSeekCol, cur.idxSeekProbe.I)
 				}
@@ -596,7 +597,9 @@ func (cur *vdbeCursor) rewind() error {
 					lazy := rowStoreNormalizesLazily(tbl)
 					ncols := len(tbl.cols)
 					base := make([]uint64, (len(hits)+63)/64)
-					tbl.rows.eachOf(hits, func(rid uint64, vals []Value, fromBase bool) {
+					// segEqRowids filtered out the deleted rows; eqRowids's come
+					// from the store's own index and are all rows.
+					tbl.rows.eachOf(hits, fromSeg, func(rid uint64, vals []Value, fromBase bool) {
 						if !lazy || len(vals) != ncols {
 							vals = normalizeRow(tbl.name, tbl.cols, tbl.ipkIndex, rid, vals)
 						}
