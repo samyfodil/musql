@@ -3962,8 +3962,8 @@ func (m *vdbe) opUpdateRow(op *Instruction) (int, error) {
 	// columns the statement does not assign are re-read from the store (ticket
 	// e25d9ea771, triggerC.test 10.3). Done before computeGeneratedInto. Read once;
 	// the restore arms below reuse it.
-	seen, swaps := m.cursors[op.P1].storedRow(tbl.rows, oldRowid)
-	oldVals := tbl.rows.rowSeen(oldRowid, seen, swaps)
+	seen, swaps, origin := m.cursors[op.P1].storedRow(tbl.rows, oldRowid)
+	oldVals := tbl.rows.rowSeen(oldRowid, seen, swaps, origin)
 	if oldVals != nil && plan.setCol != nil {
 		for i := range full {
 			if i < len(oldVals) && i < len(plan.setCol) && !plan.setCol[i] {
@@ -4086,8 +4086,13 @@ func (m *vdbe) opUpdateRow(op *Instruction) (int, error) {
 				tbl.putRow(oldRowid, oldVals) // this row is not applied at all
 				return -1, fmt.Errorf("engine: UPDATE %s: UNIQUE constraint failed: %s", plan.displayName, rowidConstraintName(tbl))
 			}
+			tbl.putRow(newRowid, full)
+		} else if oldVals != nil {
+			// Nothing has written the store since oldVals was read from it.
+			tbl.putRowOver(newRowid, full, oldVals)
+		} else {
+			tbl.putRow(newRowid, full)
 		}
-		tbl.putRow(newRowid, full)
 	}
 	// The plain UNIQUE check runs after this row is stored, so a violation means
 	// the write never counted: put the row back unjournaled. Under

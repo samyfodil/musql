@@ -149,6 +149,13 @@ func (t *tableMeta) putRow(rowid uint64, vals []Value) {
 	t.rowsMutatedThisSession, t.rowsWrittenSinceCommit = true, true
 }
 
+// putRowOver is putRow over held, the row the table holds for rowid now
+// (rowStore.putOver).
+func (t *tableMeta) putRowOver(rowid uint64, vals, held []Value) {
+	t.rows.putOver(rowid, storedValues(vals), held)
+	t.rowsMutatedThisSession, t.rowsWrittenSinceCommit = true, true
+}
+
 // storedValues is vals with every subtype dropped: storage has no place for
 // one (OP_MakeRecord writes no subtype), but the row store keeps the Value
 // struct, so the subtype survived and was visible:

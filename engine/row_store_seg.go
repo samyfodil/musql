@@ -119,6 +119,98 @@ func (b *segRows) get(rid uint64) ([]Value, bool) {
 	return row, true
 }
 
+// segRun reads the committed rows of a run of rowids, in the order a seek's
+// candidates come: what get answers for each, with the segment found by moving
+// forward rather than searched per row and the rows carved from shared chunks
+// rather than allocated one at a time. Rowids out of order restart the walk.
+// Anything get would answer from elsewhere -- a session's live rows, a table
+// not loaded yet, segments not in ascending disjoint order -- goes to get.
+type segRun struct {
+	b     *segRows
+	src   *segSource
+	segs  []*segment
+	ti    int
+	delta bool
+	ok    bool
+	si    int
+	prev  int64
+	arena []Value
+}
+
+func (b *segRows) run() segRun {
+	r := segRun{b: b}
+	src := b.rp.segs
+	if src == nil || src.unloaded[b.root] {
+		return r
+	}
+	if _, live := src.live[b.root]; live {
+		return r
+	}
+	segs, ok := src.byRoot[b.root]
+	if !ok {
+		return r
+	}
+	for i, sg := range segs {
+		if sg.nRows == 0 || i > 0 && int64(segs[i-1].Rowid(segs[i-1].nRows-1)) >= int64(sg.Rowid(0)) {
+			return r
+		}
+	}
+	r.src, r.segs, r.ok = src, segs, true
+	if src.delta != nil {
+		if ti, known := src.tableOf[b.root]; known && !src.delta.emptyFor(ti) {
+			r.ti, r.delta = ti, true
+		}
+	}
+	return r
+}
+
+func (r *segRun) get(rid uint64) ([]Value, bool) {
+	if !r.ok {
+		return r.b.get(rid)
+	}
+	at := int64(rid)
+	if r.delta {
+		// As seekRowid: the log's PUT beats the segment's copy, a KILL removes it.
+		if v, live := r.src.delta.live[r.ti][at]; live {
+			row, err := fullStoredRow(r.b.tbl, rid, v)
+			return row, err == nil
+		}
+		if r.src.delta.dead[r.ti][at] {
+			return nil, false
+		}
+	}
+	if at < r.prev {
+		r.si = 0
+	}
+	r.prev = at
+	for r.si < len(r.segs) && at > int64(r.segs[r.si].Rowid(r.segs[r.si].nRows-1)) {
+		r.si++
+	}
+	if r.si == len(r.segs) {
+		return nil, false
+	}
+	sg := r.segs[r.si]
+	i, hit := sg.findRowid(at)
+	if !hit {
+		return nil, false
+	}
+	nCols := len(sg.cols)
+	w := sg.Width(i)
+	if w > nCols {
+		w = nCols
+	}
+	if len(r.arena) < w {
+		r.arena = make([]Value, max(512*nCols, w))
+	}
+	row := r.arena[:w:w]
+	r.arena = r.arena[w:]
+	for c := range w {
+		row[c] = sg.Value(c, i)
+	}
+	full, err := fullStoredRow(r.b.tbl, rid, row)
+	return full, err == nil
+}
+
 // has reports whether rid has a committed row, without decoding it.
 func (b *segRows) has(rid uint64) bool {
 	src := b.rp.segs

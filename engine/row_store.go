@@ -109,24 +109,66 @@ func (s *rowStore) row(rowid uint64) []Value {
 	return vals
 }
 
+// eachOf calls fn with the row of each of rowids the store holds, in the
+// order given: get for each, with a segment-backed store's committed rows read
+// as one run (segRun). base is whether the row came from those committed rows
+// rather than the overlay, for rowSeen.
+func (s *rowStore) eachOf(rowids []uint64, fn func(rid uint64, vals []Value, base bool)) {
+	if s == nil {
+		return
+	}
+	if s.seg == nil {
+		for _, rid := range rowids {
+			if vals, ok := s.get(rid); ok {
+				fn(rid, vals, false)
+			}
+		}
+		return
+	}
+	run := s.seg.run()
+	for _, rid := range rowids {
+		if vals, ok := s.m[rid]; ok {
+			fn(rid, s.resolve(vals), false)
+			continue
+		}
+		if s.baseGone || s.gone[rid] {
+			continue
+		}
+		if vals, ok := run.get(rid); ok {
+			fn(rid, vals, true)
+		}
+	}
+}
+
 // rowSeen is row(rowid) for a caller already holding seen, the row this store
 // handed out for rowid when m had been swapped swaps times (a write cursor's
 // own row): seen itself when the store provably still holds that row, so it is
-// not decoded from its segment a second time.
+// not decoded from its segment a second time. origin says where seen came
+// from: seenBase the committed rows, seenOverlay m, seenUnknown either.
 //
-// Provably: rowid is not in m, not dropped, and in the base, and m has not
-// been replaced since. A row leaves m only by a drop, which marks a base rowid
-// gone, or by a swap; so seen was the base row then, and the base does not
-// change under a session. Anything else reads the store as row() does.
-func (s *rowStore) rowSeen(rowid uint64, seen []Value, swaps uint32) []Value {
-	if seen == nil || s.seg == nil || s.swaps != swaps || s.baseGone || s.gone[rowid] {
+// Provably: seen was the base row, and rowid is still in neither m nor the
+// dropped set, and m has not been replaced since -- the base does not change
+// under a session. Where seen came from unknown, it was the base row exactly
+// when the base has rowid: a row leaves m only by a drop, which marks a base
+// rowid gone, or by a swap. Anything else reads the store as row() does.
+func (s *rowStore) rowSeen(rowid uint64, seen []Value, swaps uint32, origin seenOrigin) []Value {
+	if seen == nil || origin == seenOverlay || s.seg == nil || s.swaps != swaps || s.baseGone || s.gone[rowid] {
 		return s.row(rowid)
 	}
-	if _, over := s.m[rowid]; over || !s.seg.has(rowid) {
+	if _, over := s.m[rowid]; over || origin == seenUnknown && !s.seg.has(rowid) {
 		return s.row(rowid)
 	}
 	return seen
 }
+
+// seenOrigin is where a row handed to rowSeen came from.
+type seenOrigin uint8
+
+const (
+	seenUnknown seenOrigin = iota
+	seenBase
+	seenOverlay
+)
 
 func (s *rowStore) len() int {
 	if s == nil {
@@ -160,6 +202,17 @@ func (s *rowStore) all() iter.Seq2[uint64, []Value] {
 }
 
 func (s *rowStore) put(rowid uint64, vals []Value) {
+	s.putHeld(rowid, vals, nil)
+}
+
+// putOver is put for a caller holding held, the row the store holds for
+// rowid right now (an UPDATE's own old row): it is the old row, so put does
+// not look it up again.
+func (s *rowStore) putOver(rowid uint64, vals, held []Value) {
+	s.putHeld(rowid, vals, held)
+}
+
+func (s *rowStore) putHeld(rowid uint64, vals, held []Value) {
 	// The OLD row, for the two things that need it: the sorted-order cache (only
 	// while it is valid) and the equality indexes (only for columns one has been
 	// built for). Both are conditional, so an unqueried store on a bulk load does
@@ -173,6 +226,8 @@ func (s *rowStore) put(rowid uint64, vals []Value) {
 		// here. Reading it back regardless was a second fetch of every row an
 		// UPDATE writes, the first being the cursor's own.
 		switch {
+		case held != nil:
+			old, haveOld = held, true
 		case s.ubKnown && rowidLess(s.ub, rowid):
 			// Past the upper bound nothing is there (see has): a row appended
 			// after the last one is new without a search of the segments, which
@@ -189,6 +244,8 @@ func (s *rowStore) put(rowid uint64, vals []Value) {
 			}
 		}
 		delete(s.gone, rowid)
+	} else if held != nil {
+		old, haveOld = held, true
 	} else if s.sortedValid || len(s.eqIdx) > 0 || len(s.uqIdx) > 0 || s.logging {
 		old, haveOld = s.m[rowid]
 		old = s.resolve(old)
