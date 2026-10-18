@@ -135,6 +135,29 @@ func (f *SegmentFile) RootOf(ti int) uint32 {
 	return uint32(segRootBase + ti)
 }
 
+// committedRows is a delta replay's view of the file's own rows
+// (segDeltaState.base): table ti's row at rowid, each table's segments opened
+// the first time it is asked for. The rows alias the file's mapping.
+func (f *SegmentFile) committedRows() func(ti int, rowid int64) ([]Value, bool) {
+	opened := map[int][]*segment{}
+	return func(ti int, rowid int64) ([]Value, bool) {
+		if ti < 0 || ti >= len(f.tables) {
+			return nil, false
+		}
+		segs, ok := opened[ti]
+		if !ok {
+			segs, _ = f.tables[ti].openSegments() // a table that will not open has no row to find
+			opened[ti] = segs
+		}
+		for _, sg := range segs {
+			if i, hit := sg.findRowid(rowid); hit {
+				return sg.rowAt(i), true
+			}
+		}
+		return nil, false
+	}
+}
+
 // Segments is the number of segments this table was written as.
 func (t SegmentFileTable) Segments() int { return len(t.segs) }
 

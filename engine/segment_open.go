@@ -231,7 +231,7 @@ func readSegmentPairUnlocked(path string) (*SegmentFile, *segDeltaState, error) 
 		f.Close()
 		return nil, nil, derr
 	}
-	st, rerr := replaySegDelta(data, f.srcChangeCounter, f.srcPageCount)
+	st, rerr := replaySegDelta(data, f.srcChangeCounter, f.srcPageCount, f.committedRows())
 	if rerr != nil {
 		f.Close()
 		if m != nil {

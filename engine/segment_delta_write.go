@@ -121,7 +121,9 @@ func segDeltaRecordsInto(dst []SegDeltaRecord, n int, changes iter.Seq[*RowChang
 				}
 			}
 			if ch.New != nil {
-				out = append(out, SegDeltaRecord{Table: ti, Rowid: ch.Rowid, Vals: storedIPKNull(ch.New, lastIPK)})
+				// An update of the committed row in place goes in as the
+				// columns it changed (SegDeltaRecord.patch).
+				out = append(out, SegDeltaRecord{Table: ti, Rowid: ch.Rowid, Vals: storedIPKNull(ch.New, lastIPK), patch: ch.set})
 				continue
 			}
 			emit(ti, ch.Table, ch.Rowid)
@@ -201,7 +203,7 @@ func segmentFileStateUnlocked(segPath string) (endCtr, endPages uint32, err erro
 	if m != nil {
 		defer m.Close()
 	}
-	st, serr := replaySegDelta(data, base, basePages)
+	st, serr := replaySegDelta(data, base, basePages, nil) // where it ends only
 	if serr != nil {
 		return 0, 0, serr
 	}

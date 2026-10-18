@@ -45,7 +45,7 @@ func TestSegDeltaBatchStreamsAndReplays(t *testing.T) {
 		if int64(len(data)) != end {
 			t.Fatalf("v%d: file is %d bytes, batch claims to end at %d", version, len(data), end)
 		}
-		st, err := replaySegDelta(data, 5, 6)
+		st, err := replaySegDelta(data, 5, 6, nil)
 		if err != nil {
 			t.Fatalf("v%d replay: %v", version, err)
 		}

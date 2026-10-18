@@ -1,8 +1,11 @@
 package compat
 
 import (
+	"database/sql"
 	"fmt"
 	"testing"
+
+	"github.com/samyfodil/musql/driver"
 )
 
 // TestUpdateGatheredRowsMatchesC: an UPDATE's native code gathers each row's
@@ -18,7 +21,8 @@ import (
 // savepoint rolled back, and one rolled back whole. Outside a transaction, and with no index or key that
 // reads the old row, the new values are written over the cursor's copy of the
 // old row (applyGathered's in place); a CHECK that fails after many such rows
-// must put every one of them back.
+// must put every one of them back. Such rows are committed as patches of
+// their committed row, so the table is compared again after a fresh open.
 func TestUpdateGatheredRowsMatchesC(t *testing.T) {
 	const n = 1500
 	cases := []struct {
@@ -59,7 +63,7 @@ func TestUpdateGatheredRowsMatchesC(t *testing.T) {
 		for tx := range 3 {
 			inTx := tx > 0
 			name := fmt.Sprintf("%s/tx=%d", tc.name, tx)
-			pureDB, mattnDB, _, _ := openPair(t, fmt.Sprintf("gather%d_%d", ci, tx))
+			pureDB, mattnDB, purePath, _ := openPair(t, fmt.Sprintf("gather%d_%d", ci, tx))
 			pureDB.SetMaxOpenConns(1)
 			mattnDB.SetMaxOpenConns(1)
 			ddl := ddls[tc.name]
@@ -68,6 +72,9 @@ func TestUpdateGatheredRowsMatchesC(t *testing.T) {
 			}
 			execBoth(t, pureDB, mattnDB, name, ddl)
 			execBoth(t, pureDB, mattnDB, name, fmt.Sprintf(`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i < %d) INSERT INTO t SELECT i, i %% 10, i, 'w' || i, i * 2 FROM c`, n))
+			// Every row into the file's segments: only a committed row the
+			// cursor decodes from them is written in place.
+			execBoth(t, pureDB, mattnDB, name, `VACUUM`)
 			for _, s := range tc.pre {
 				execBoth(t, pureDB, mattnDB, name, s)
 			}
@@ -99,6 +106,15 @@ func TestUpdateGatheredRowsMatchesC(t *testing.T) {
 			if tc.name == "foreign key" {
 				queryBoth(t, pureDB, mattnDB, name, `SELECT * FROM c ORDER BY id`)
 			}
+			// What a fresh open reads back: rows updated in place are written
+			// as patches of their committed row, which the open replays.
+			pureDB.Close()
+			reopened, err := sql.Open(driver.DriverName, purePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			queryBoth(t, reopened, mattnDB, name+"/reopened", `SELECT * FROM t ORDER BY id`)
+			reopened.Close()
 		}
 	}
 }

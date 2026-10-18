@@ -3968,7 +3968,37 @@ func (m *vdbe) opDelete(op *Instruction) error {
 // statement. Returns a jump target, or -1: an IGNORE resolution leaves the row
 // and jumps to plan.skipAddr.
 func (m *vdbe) opUpdateRow(op *Instruction) (int, error) {
-	return m.updateRow(op, m.recRegs[op.P2], uint64(m.regs[op.P3].I), false)
+	full := m.recRegs[op.P2]
+	plan := op.P4.(*updatePlan)
+	inPlace := false
+	if plan.gather && m.wctx.db.updateInPlaceOK(plan.tbl) {
+		full, inPlace = m.inPlace(plan, m.cursors[op.P1], full)
+	}
+	return m.updateRow(op, full, uint64(m.regs[op.P3].I), inPlace)
+}
+
+// inPlace is the row an UPDATE of the cursor's current row stores when the
+// new values can go into the cursor's own copy of the committed row (see
+// updateRow's inPlace): that copy, with the columns plan assigns taken from
+// full, and true; full itself and false otherwise. The table must already be
+// one updateInPlaceOK allows, and plan one whose rowid stays (plan.gather).
+func (m *vdbe) inPlace(plan *updatePlan, cur *vdbeCursor, full []Value) ([]Value, bool) {
+	st := plan.tbl.rows
+	if !st.inPlaceOK() {
+		return full, false
+	}
+	// The cursor's copy of the committed row, which nothing else holds and
+	// the store still has as this row (rowSeen's shortcut).
+	seen, swaps, writes, origin := cur.storedRow(st, cur.rowid)
+	if origin != seenBase || seen == nil || st.writes != writes || st.swaps != swaps || len(seen) != len(full) {
+		return full, false
+	}
+	for c, set := range plan.setCol {
+		if set {
+			seen[c] = full[c]
+		}
+	}
+	return seen, true
 }
 
 // updateRow is OP_UpdateRow's body for the record full and new rowid
@@ -4149,7 +4179,10 @@ func (m *vdbe) updateRow(op *Instruction, full []Value, newRowid uint64, inPlace
 	} else {
 		m.wctx.undoMove(tbl, newRowid, oldRowid, oldVals)
 	}
-	m.wctx.db.noteRowUpdate(tbl, oldRowid, newRowid, oldVals, full)             // capture log (rowhook.go)
+	m.wctx.db.noteRowUpdate(tbl, oldRowid, newRowid, oldVals, full) // capture log (rowhook.go)
+	if inPlace {
+		m.wctx.db.notePatch(tbl, newRowid, plan.setCol)
+	}
 	m.wctx.db.fkRowMutated(tbl, oldRowid, newRowid, oldVals, full, plan.setCol) // fkColMask of colIdx, built once
 	m.wctx.rowsAffected++
 	return -1, nil
@@ -4222,19 +4255,10 @@ func (m *vdbe) applyGathered(mr, upd *Instruction, rows [][]Value) (allInPlace b
 		}
 		cur.pos, cur.rowid = at[k], cur.rowids[at[k]]
 		inPlace := false
-		if st := plan.tbl.rows; inPlaceOK && st.inPlaceOK() {
-			// The cursor's copy of the committed row, which nothing else
-			// holds and the store still has as this row (rowSeen's shortcut):
-			// the new values go into it, so the row costs one copy, not two.
-			seen, swaps, writes, origin := cur.storedRow(st, cur.rowid)
-			if origin == seenBase && seen != nil && st.writes == writes && st.swaps == swaps && len(seen) == len(full) {
-				for c, set := range plan.setCol {
-					if set {
-						seen[c] = full[c]
-					}
-				}
-				full, inPlace = seen, true
-			}
+		if inPlaceOK {
+			// The new values go into the cursor's copy of the old row, so the
+			// row costs one copy, not two.
+			full, inPlace = m.inPlace(plan, cur, full)
 		}
 		allInPlace = allInPlace && inPlace
 		if _, err := m.updateRow(upd, full, uint64(row[mr.P2].I), inPlace); err != nil {
