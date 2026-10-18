@@ -796,9 +796,14 @@ func (n *Session) extendCommittedColumns(batch []byte, recs []SegDeltaRecord) bo
 	// QUEUED, not applied, when every record carries its row: nothing may read
 	// the view before the next commit, or ever (a run of writes with no
 	// columnar read between them), and committedColumns applies the queue
-	// when something does. Bounded, so a long run of writes applies it as it
-	// goes.
-	if deferrable(recs) && len(db.colsPending)+len(recs) <= colsPendingMax {
+	// when something does. A run of writes that outgrows the queue leaves the
+	// view stale instead (false): the queue's rows are let go, every later
+	// commit skips this until the view is read, and that read rebuilds it
+	// from the file, as a commit too big to keep always made it.
+	if deferrable(recs) {
+		if len(db.colsPending)+len(recs) > colsPendingMax {
+			return false
+		}
 		for i := range recs {
 			r := &recs[i]
 			db.colsPending = append(db.colsPending, pendingRec{table: int32(r.Table), kill: r.Kill, patch: r.patch != nil, rowid: r.Rowid, vals: r.Vals})
@@ -2000,8 +2005,9 @@ type pendingRec struct {
 	vals  []Value
 }
 
-// colsPendingMax is how many queued records the committed view may lag by.
-const colsPendingMax = 1 << 16
+// colsPendingMax is how many queued records the committed view may lag by,
+// about one bulk statement's: past it the view goes stale instead.
+const colsPendingMax = 1 << 14
 
 // deferrable reports whether recs can be queued for the committed view: every
 // put carries its row (no segment, no row read from a spilled store).
