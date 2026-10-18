@@ -18,6 +18,9 @@ import (
 // in the middle of a load, a rowid below a deleted one, and a reopen -- must
 // leave the SAME connection answering every query as C SQLite does.
 func TestAppendLoadSegmentsMatchC(t *testing.T) {
+	// Armed from the first qualifying statement, so every step below takes
+	// the path; the last load before the reopen uses the real threshold.
+	defer engine.SetAppendArmAfterForTest(engine.SetAppendArmAfterForTest(1))
 	pureDB, mattnDB, purePath, mattnPath := openPair(t, "appendload")
 	pureDB.SetMaxOpenConns(1)
 	mattnDB.SetMaxOpenConns(1)
@@ -116,6 +119,9 @@ func TestAppendLoadSegmentsMatchC(t *testing.T) {
 	battery(t, pureDB, mattnDB, "after updating and deleting appended rows")
 	load("out of order", []int{5002, 5001, 5003}, nil, "commit")
 	load("append after all that", span(6001, 7000), nil, "commit")
+	old := engine.SetAppendArmAfterForTest(256)
+	load("crossing the arming threshold", span(8001, 8600), nil, "commit")
+	engine.SetAppendArmAfterForTest(old)
 
 	// A fresh connection and a reopen read the segment records from the file.
 	pureDB.Close()
@@ -142,7 +148,7 @@ func battery(t *testing.T, pureDB, mattnDB *sql.DB, label string) {
 		`SELECT id, v, payload FROM t WHERE sec = 7 ORDER BY id`,
 		`SELECT count(*) FROM t WHERE sec BETWEEN 100 AND 300 AND k = 3`,
 		`SELECT * FROM t ORDER BY id DESC LIMIT 7`,
-		`SELECT * FROM t WHERE id IN (1990, 1993, 2001, 2500, 3105, 4400, 4500, 5001, 6500, 7499)`,
+		`SELECT * FROM t WHERE id IN (1990, 1993, 2001, 2500, 3105, 4400, 4500, 5001, 6500, 7499, 8001, 8256, 8257, 8600)`,
 		`SELECT count(*) FROM t WHERE payload LIKE 'p1%'`,
 		`SELECT typeof(payload), count(*) FROM t GROUP BY 1 ORDER BY 1`,
 		`SELECT count(*), sum(length(b)) FROM t WHERE b IS NOT NULL`,

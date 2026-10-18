@@ -871,6 +871,7 @@ func (db *DB) mutatedOutsideChangeLog(changes *changeLog) bool {
 // clearWrittenSinceCommit resets the per-commit half of the written flag, for
 // every table this commit has just made durable.
 func (db *DB) clearWrittenSinceCommit() {
+	db.appendSeen = nil
 	for _, t := range db.tables {
 		if !t.isTemp { // the TEMP file's commit clears its own (temp_file.go)
 			t.rowsWrittenSinceCommit = false

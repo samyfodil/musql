@@ -583,6 +583,12 @@ type DB struct {
 	// txBulks is every table with a direct-path load armed inside the open
 	// transaction (segBulkLoad.inTx), which anything else that reads drains.
 	txBulks []*tableMeta
+	// appendSeen counts, per table, this transaction's INSERT statements an
+	// append load could have taken (insert_append_delta.go): one arms only
+	// from the appendArmAfter-th on, so a transaction of a few rows keeps the
+	// ordinary path -- and the file does not gain a segment for each such
+	// commit. Emptied at every commit and rollback.
+	appendSeen map[*tableMeta]int
 	// spareMachine is a scrubbed VDBE machine runWrite keeps for the session's
 	// next statement (getMachineFrom); nil while one is running.
 	spareMachine *vdbe

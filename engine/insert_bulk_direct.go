@@ -162,7 +162,10 @@ func (m *vdbe) bulkLoadInTx(plan *insertPlan) *segBulkLoad {
 	case bl != nil && !bl.inTx:
 		return nil
 	case bl == nil && tbl.rows != nil && !tbl.rows.isEmpty():
-		if !bulkTxOK(db, tbl) {
+		if db.appendSeen == nil {
+			db.appendSeen = map[*tableMeta]int{}
+		}
+		if db.appendSeen[tbl]++; db.appendSeen[tbl] < appendArmAfter || !bulkTxOK(db, tbl) {
 			return nil
 		}
 		bl = db.armAppendLoad(tbl)
@@ -207,7 +210,7 @@ func (bl *segBulkLoad) truncateTo(tbl *tableMeta, n int) {
 			db.dropTxBulk(tbl)
 			return
 		}
-		bl.last = bl.stream.rowids[n-1]
+		bl.last = bl.stream.rowids.at(n - 1)
 		return
 	}
 	if err := bl.cut.wait(); err != nil { // the segment in flight is rows we keep or cut
@@ -351,6 +354,7 @@ func (db *DB) dropTxBulk(tbl *tableMeta) {
 // dropTxBulks forgets every transaction load: a rollback to a snapshot taken
 // before any of them was armed.
 func (db *DB) dropTxBulks() {
+	db.appendSeen = nil
 	for _, t := range db.txBulks {
 		t.bulk = nil
 	}

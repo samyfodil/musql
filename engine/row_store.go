@@ -570,10 +570,8 @@ func (s *rowStore) isEmpty() bool {
 	if s.seg == nil || s.nKnown {
 		return s.len() == 0
 	}
-	empty := true
-	for range s.all() {
-		empty = false
-		break
-	}
-	return empty
+	// The largest rowid is kept current by put and drop once known, and found
+	// from the top of the base without decoding a row.
+	_, any := s.maxRowid()
+	return !any
 }

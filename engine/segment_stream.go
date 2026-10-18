@@ -19,16 +19,48 @@ import (
 // be full width (an append load's are: the VM builds every column).
 type segStream struct {
 	nCols  int
-	rowids []uint64
+	rowids chunked[uint64]
 	cols   []streamCol
 }
 
 type streamCol struct {
-	typ    []byte   // the Value's type, streamIntReal set for an intReal Float
-	cell   []uint64 // INTEGER bits, REAL bits, or a payload's offset | length<<32
-	heap   []byte   // TEXT and BLOB payloads, in row order
+	typ    chunked[byte]   // the Value's type, streamIntReal set for an intReal Float
+	cell   chunked[uint64] // INTEGER bits, REAL bits, or a payload's offset | length<<32
+	heap   []byte          // TEXT and BLOB payloads, in row order
 	census ColumnTypeCensus
 }
+
+// chunked is a growing array in fixed chunks that are never copied: a stream
+// allocates what it holds, where a slice grown by doubling allocated (and
+// zeroed) about twice that, and copied it along the way.
+type chunked[T any] struct {
+	c [][]T
+	n int
+}
+
+const (
+	streamChunkShift = 12
+	streamChunk      = 1 << streamChunkShift
+)
+
+func (k *chunked[T]) push(v T) {
+	if k.n>>streamChunkShift == len(k.c) {
+		k.c = append(k.c, make([]T, streamChunk))
+	}
+	k.c[k.n>>streamChunkShift][k.n&(streamChunk-1)] = v
+	k.n++
+}
+
+func (k *chunked[T]) at(i int) T { return k.c[i>>streamChunkShift][i&(streamChunk-1)] }
+
+func (k *chunked[T]) truncate(n int) {
+	if n < k.n {
+		k.n = n
+	}
+}
+
+// capBytes is the memory k holds, elemSize bytes an element.
+func (k *chunked[T]) capBytes(elemSize int) int { return len(k.c) * streamChunk * elemSize }
 
 const streamIntReal = 0x80
 
@@ -42,7 +74,7 @@ func (s *segStream) add(rowid uint64, vals []Value) bool {
 	if len(vals) != s.nCols {
 		return false
 	}
-	s.rowids = append(s.rowids, rowid)
+	s.rowids.push(rowid)
 	for c := range s.cols {
 		col := &s.cols[c]
 		v := &vals[c]
@@ -69,24 +101,24 @@ func (s *segStream) add(rowid uint64, vals []Value) bool {
 			cell = uint64(len(col.heap)) | uint64(len(v.S))<<32
 			col.heap = append(col.heap, v.S...)
 		}
-		col.typ = append(col.typ, t)
-		col.cell = append(col.cell, cell)
+		col.typ.push(t)
+		col.cell.push(cell)
 	}
 	return true
 }
 
-func (s *segStream) rows() int { return len(s.rowids) }
+func (s *segStream) rows() int { return s.rowids.n }
 
 // truncate keeps the first n rows.
 func (s *segStream) truncate(n int) {
-	if n >= len(s.rowids) {
+	if n >= s.rowids.n {
 		return
 	}
 	for c := range s.cols {
 		col := &s.cols[c]
 		heapEnd := len(col.heap)
-		for i := n; i < len(col.typ); i++ {
-			switch ValueType(col.typ[i] &^ streamIntReal) {
+		for i := n; i < col.typ.n; i++ {
+			switch ValueType(col.typ.at(i) &^ streamIntReal) {
 			case Null:
 				col.census.Null--
 			case Int:
@@ -94,31 +126,34 @@ func (s *segStream) truncate(n int) {
 			case Float:
 				col.census.Real--
 			case Text, Blob:
-				if ValueType(col.typ[i]) == Text {
+				if ValueType(col.typ.at(i)) == Text {
 					col.census.Text--
 				} else {
 					col.census.Blob--
 				}
-				heapEnd = min(heapEnd, int(uint32(col.cell[i])))
+				heapEnd = min(heapEnd, int(uint32(col.cell.at(i))))
 			}
 		}
-		col.typ, col.cell, col.heap = col.typ[:n], col.cell[:n], col.heap[:heapEnd]
+		col.typ.truncate(n)
+		col.cell.truncate(n)
+		col.heap = col.heap[:heapEnd]
 	}
-	s.rowids = s.rowids[:n]
+	s.rowids.truncate(n)
 }
 
 // value is row i's value in column c, its payload aliasing the stream.
 func (col *streamCol) value(i int) Value {
-	t := col.typ[i]
+	t := col.typ.at(i)
+	cell := col.cell.at(i)
 	v := Value{Typ: ValueType(t &^ streamIntReal)}
 	switch v.Typ {
 	case Int:
-		v.I = int64(col.cell[i])
+		v.I = int64(cell)
 	case Float:
-		v.F = bitsFloat(col.cell[i])
+		v.F = bitsFloat(cell)
 		v.intReal = t&streamIntReal != 0
 	case Text, Blob:
-		off, n := uint32(col.cell[i]), uint32(col.cell[i]>>32)
+		off, n := uint32(cell), uint32(cell>>32)
 		v.S = col.heap[off : off+n : off+n]
 	}
 	return v
@@ -126,7 +161,7 @@ func (col *streamCol) value(i int) Value {
 
 // finish lays the rows out as a segment.
 func (s *segStream) finish() ([]byte, error) {
-	nRows, nCols := len(s.rowids), s.nCols
+	nRows, nCols := s.rowids.n, s.nCols
 	if nRows == 0 || nCols == 0 {
 		return nil, fmt.Errorf("segment: %d rows x %d columns is not a segment", nRows, nCols)
 	}
@@ -144,7 +179,7 @@ func (s *segStream) finish() ([]byte, error) {
 	}
 	dense := true
 	for i := 1; i < nRows && dense; i++ {
-		dense = s.rowids[i] == s.rowids[0]+uint64(i)
+		dense = s.rowids.at(i) == s.rowids.at(0)+uint64(i)
 	}
 
 	// The heap's size, column after column: a column whose values all fit its
@@ -159,11 +194,11 @@ func (s *segStream) finish() ([]byte, error) {
 		if phys[c] == PhysBlob {
 			want = Blob
 		}
-		for i := range col.typ {
-			if ValueType(col.typ[i]) != want {
+		for i := 0; i < col.typ.n; i++ {
+			if ValueType(col.typ.at(i)) != want {
 				continue
 			}
-			n := int(col.cell[i] >> 32)
+			n := int(col.cell.at(i) >> 32)
 			if want == Blob {
 				heapLen = segAlignBlob(heapLen) + n
 			} else {
@@ -220,19 +255,20 @@ func (s *segStream) finish() ([]byte, error) {
 		}
 		base := int(colDir[c].blockOff)
 		for i := 0; i < nRows; i++ {
-			t := ValueType(col.typ[i] &^ streamIntReal)
+			t := ValueType(col.typ.at(i) &^ streamIntReal)
+			cell := col.cell.at(i)
 			switch {
 			case t == Null:
 				nulls[c][i/8] |= 1 << uint(i%8)
 			case phys[c] == PhysInt64 && t == Int, phys[c] == PhysFloat64 && t == Float:
-				binary.LittleEndian.PutUint64(out[base+i*segCellWidth:], col.cell[i])
+				binary.LittleEndian.PutUint64(out[base+i*segCellWidth:], cell)
 			case phys[c] == PhysText && t == Text, phys[c] == PhysBlob && t == Blob:
 				if t == Blob {
 					for len(heap) < segAlignBlob(len(heap)) {
 						heap = append(heap, 0)
 					}
 				}
-				o, n := uint32(col.cell[i]), uint32(col.cell[i]>>32)
+				o, n := uint32(cell), uint32(cell>>32)
 				heap = append(heap, col.heap[o:o+n]...)
 			default:
 				rec := encodeRecordEnc([]Value{col.value(i)}, UTF8)
@@ -250,10 +286,10 @@ func (s *segStream) finish() ([]byte, error) {
 	binary.LittleEndian.PutUint32(excBuf, uint32(nExc))
 
 	if dense {
-		binary.LittleEndian.PutUint64(out[rowidOff:], s.rowids[0])
+		binary.LittleEndian.PutUint64(out[rowidOff:], s.rowids.at(0))
 	} else {
-		for i, rid := range s.rowids {
-			binary.LittleEndian.PutUint64(out[rowidOff+i*segCellWidth:], rid)
+		for i := 0; i < s.rowids.n; i++ {
+			binary.LittleEndian.PutUint64(out[rowidOff+i*segCellWidth:], s.rowids.at(i))
 		}
 	}
 	for c := 0; c < nCols; c++ {

@@ -36,6 +36,9 @@ func TestSegStreamMatchesBuildSegment(t *testing.T) {
 	for trial := 0; trial < 300; trial++ {
 		nCols := 1 + rng.Intn(6)
 		nRows := 1 + rng.Intn(300)
+		if trial%20 == 0 {
+			nRows = streamChunk - 2 + rng.Intn(2*streamChunk+5) // across chunk boundaries
+		}
 		cols := make([]columnInfo, nCols)
 		// Each column mostly one kind, sometimes NULLs, sometimes strays.
 		main := make([]int, nCols)

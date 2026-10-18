@@ -3,7 +3,6 @@ package engine
 import (
 	"maps"
 	"slices"
-	"unsafe"
 )
 
 // AN APPEND LOAD INTO A TABLE THAT HAS ROWS. A transaction's load
@@ -21,6 +20,14 @@ import (
 // with no pointers in it), and the commit writes that segment as one delta
 // record (segDeltaSeg) -- no map entry, no log entry, no per-row undo, no
 // per-row record.
+
+// appendArmAfter is how many qualifying INSERT statements a transaction runs
+// into a table before an append load takes the rest (DB.appendSeen). A
+// variable so a test can arm on the first.
+var appendArmAfter = 256
+
+// SetAppendArmAfterForTest sets appendArmAfter and returns the old value.
+func SetAppendArmAfterForTest(n int) int { old := appendArmAfter; appendArmAfter = n; return old }
 
 // armAppendLoad arms a load for an INSERT into tbl, which has rows: its first
 // row must come past every rowid tbl has held (bulkStore checks every row
@@ -96,7 +103,7 @@ func (n *Session) appendLoadRecords() ([]SegDeltaRecord, []*tableMeta, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		out = append(out, SegDeltaRecord{Table: ti[t.name], Rowid: int64(bl.stream.rowids[0]), Seg: raw})
+		out = append(out, SegDeltaRecord{Table: ti[t.name], Rowid: int64(bl.stream.rowids.at(0)), Seg: raw})
 		tables = append(tables, t)
 	}
 	return out, tables, nil
@@ -190,7 +197,8 @@ func (t *tableMeta) hasAppendLoad() bool { return t.bulk != nil && t.bulk.stream
 // eachRow yields the stream's rows in order until fn returns false, each a
 // []Value of its own whose payloads alias the stream.
 func (s *segStream) eachRow(fn func(rowid uint64, vals []Value) bool) {
-	for i, rid := range s.rowids {
+	for i := 0; i < s.rowids.n; i++ {
+		rid := s.rowids.at(i)
 		row := make([]Value, s.nCols)
 		for c := range s.cols {
 			row[c] = s.cols[c].value(i)
@@ -203,9 +211,9 @@ func (s *segStream) eachRow(fn func(rowid uint64, vals []Value) bool) {
 
 // memBytes is what the stream holds, for the transaction's memory bound.
 func (s *segStream) memBytes() int {
-	n := len(s.rowids) * 8
+	n := s.rowids.capBytes(8)
 	for c := range s.cols {
-		n += len(s.cols[c].typ) + len(s.cols[c].cell)*int(unsafe.Sizeof(uint64(0))) + len(s.cols[c].heap)
+		n += s.cols[c].typ.capBytes(1) + s.cols[c].cell.capBytes(8) + cap(s.cols[c].heap)
 	}
 	return n
 }
