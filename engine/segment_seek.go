@@ -234,6 +234,7 @@ func segIndexRowids(segs []*segment, col int, probe Value) ([]int64, bool) {
 		if !have {
 			return nil, false // this column is not indexable; scan instead
 		}
+		out = slices.Grow(out, len(pos))
 		for _, i := range pos {
 			out = append(out, int64(sg.Rowid(int(i))))
 		}

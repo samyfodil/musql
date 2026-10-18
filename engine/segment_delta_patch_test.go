@@ -53,7 +53,7 @@ func TestSegDeltaPatchRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, _, err = writeSegDeltaBatch(f, segDeltaHdrSize, segDeltaChecksum(version, hdr[:24], 0), version, recs, 9, 10, nil)
+		_, _, err = writeSegDeltaBatch(f, segDeltaHdrSize, segDeltaChecksum(version, hdr[:24], 0), version, recs, 9, 10, nil, nil)
 		f.Close()
 		if err != nil {
 			t.Fatalf("v%d: %v", version, err)
@@ -247,7 +247,7 @@ func TestSegDeltaBatchBoundCovers(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			end, _, err := writeSegDeltaBatch(f, 0, 0, version, recs, 1, 1, nil)
+			end, _, err := writeSegDeltaBatch(f, 0, 0, version, recs, 1, 1, nil, nil)
 			f.Close()
 			if err != nil {
 				t.Fatal(err)

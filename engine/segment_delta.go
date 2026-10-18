@@ -399,6 +399,9 @@ type SegDeltaAppendState struct {
 	// in one chunk; nil otherwise. Session.commitMainLocked applies it to the
 	// committed read view instead of re-reading the whole pair.
 	lastBatch []byte
+	// buf is the buffer the session's commits encode their batches into
+	// (writeSegDeltaBatch's encBuf), kept from one to the next.
+	buf []byte
 }
 
 // release closes the held delta, if any, and forgets the append point.
@@ -593,7 +596,11 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 	if carry != nil {
 		keep = &carry.lastBatch
 	}
-	end, cksum, werr := writeSegDeltaBatch(f, st.bytes, st.cksum, st.version, recs, endCtr, endPages, keep)
+	var encBuf *[]byte
+	if carry != nil {
+		encBuf = &carry.buf
+	}
+	end, cksum, werr := writeSegDeltaBatch(f, st.bytes, st.cksum, st.version, recs, endCtr, endPages, keep, encBuf)
 	if werr != nil {
 		return werr
 	}
@@ -664,7 +671,10 @@ const segDeltaChunk = 1 << 20
 // that first byte, so the total is computed first (recordSize), and every
 // record's encoding is checked against its prediction: a mismatch fails the
 // commit rather than writing a batch whose length lies.
-func writeSegDeltaBatch(f *os.File, off int64, seed uint64, version uint32, recs []SegDeltaRecord, endCtr, endPages uint32, keep *[]byte) (end int64, cksum uint64, err error) {
+//
+// encBuf, when not nil, is a buffer to encode into, which the batch hands
+// back for the next.
+func writeSegDeltaBatch(f *os.File, off int64, seed uint64, version uint32, recs []SegDeltaRecord, endCtr, endPages uint32, keep, encBuf *[]byte) (end int64, cksum uint64, err error) {
 	lenWidth := segDeltaLenWidth(version)
 	var n int64
 	var scratch []Value // a patch record's values, gathered (patchValues)
@@ -696,15 +706,25 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, version uint32, recs
 	}
 	// Sized to the batch when it is smaller than a chunk: a one-row commit
 	// allocated (and zeroed) the whole megabyte.
-	// A batch of a chunk or more takes a pooled chunk: an UPDATE of thousands
-	// of rows allocated a fresh megabyte at every commit.
+	// The buffer the session keeps for its commits (SegDeltaAppendState.buf),
+	// when one is given: a pool's was dropped at every GC, so an UPDATE of
+	// thousands of rows allocated a fresh one about every commit.
+	want := min(n+lenWidth+segDeltaTrailerSz, segDeltaChunk+64)
 	var buf []byte
-	if want := n + lenWidth + segDeltaTrailerSz; want < segDeltaChunk {
+	switch {
+	case encBuf != nil && int64(cap(*encBuf)) >= want:
+		buf = (*encBuf)[:0]
+	case want < segDeltaChunk:
 		buf = make([]byte, 0, want)
-	} else {
-		pb := segDeltaChunkPool.Get().(*[]byte)
-		defer segDeltaChunkPool.Put(pb)
-		buf = (*pb)[:0]
+	default:
+		buf = make([]byte, 0, segDeltaChunk+64)
+	}
+	if encBuf != nil {
+		defer func() {
+			if cap(buf) <= segDeltaChunk+64 {
+				*encBuf = buf[:0]
+			}
+		}()
 	}
 	if lenWidth == 4 {
 		buf = binary.LittleEndian.AppendUint32(buf, uint32(n))
@@ -808,14 +828,6 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, version uint32, recs
 	}
 	return at + int64(len(buf)), cksum, nil
 }
-
-// segDeltaChunkPool holds writeSegDeltaBatch's chunk buffers. A batch flushes
-// one once it reaches segDeltaChunk; a single record bigger than that grows a
-// copy, which is dropped, and the pool keeps the chunk it handed out.
-var segDeltaChunkPool = sync.Pool{New: func() any {
-	b := make([]byte, 0, segDeltaChunk+64)
-	return &b
-}}
 
 // segDeltaBatchBytes is the most writeSegDeltaBatch appends for recs: the wider
 // length prefix, every record as it measures them, and the trailer.

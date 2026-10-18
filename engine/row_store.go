@@ -191,6 +191,9 @@ func (s *rowStore) eachOfParallel(rowids []uint64, notGone bool, fn func(rid uin
 		go func() {
 			defer wg.Done()
 			run := s.seg.run()
+			// Its share's rows in one arena, sized for them: the run's own
+			// chunks would leave each worker's last one mostly unused.
+			run.arena = make([]Value, (hi-lo)*len(s.seg.tbl.cols))
 			for j := lo; j < hi; j++ {
 				if vals, ok, owned := run.get(base[j]); ok {
 					out[j], state[j] = vals, 1
