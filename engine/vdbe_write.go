@@ -4296,6 +4296,15 @@ func (m *vdbe) applyGathered(mr, upd *Instruction, rows [][]Value) error {
 			// row costs one copy, not two.
 			full, inPlace = m.inPlace(plan, cur, full)
 		}
+		if inPlace && uint64(row[mr.P2].I) == cur.rowid {
+			// Stored with the rest of its run (storeInPlace): nothing reads
+			// the store before then, and each row is its own rowid's.
+			m.runRids, m.runRows = append(m.runRids, cur.rowid), append(m.runRows, full)
+			continue
+		}
+		if err := m.storeInPlace(plan, cur); err != nil {
+			return err
+		}
 		if !inPlace {
 			full = m.keepRow(full)
 		}
@@ -4306,7 +4315,38 @@ func (m *vdbe) applyGathered(mr, upd *Instruction, rows [][]Value) error {
 			return err
 		}
 	}
-	return nil
+	return m.storeInPlace(plan, cur)
+}
+
+// storeInPlace stores the run of rows applyGathered wrote in place (runRids,
+// runRows), as updateRow's inPlace path stores each, with what the run's
+// rows share done once: the pin check, the cursor's note of the store's
+// write count, the journal's rowids, the count of rows changed.
+func (m *vdbe) storeInPlace(plan *updatePlan, cur *vdbeCursor) error {
+	rids, rows := m.runRids, m.runRows
+	if len(rids) == 0 {
+		return nil
+	}
+	m.runRids, m.runRows = rids[:0], rows[:0]
+	defer clear(rows)
+	tbl := plan.tbl
+	if perr := m.wctx.pinViolation(tbl); perr != nil {
+		return perr
+	}
+	for i, rid := range rids {
+		tbl.putRowOver(rid, rows[i], rows[i])
+	}
+	// The writes since the cursor's rows were known to be the store's are
+	// the run's own, one per rowid (inPlace held that for each).
+	cur.rowsWrites = tbl.rows.writes
+	m.wctx.undoBaseRun(tbl, rids)
+	db := m.wctx.db
+	for i, rid := range rids {
+		db.noteRowUpdate(tbl, rid, rid, rows[i], rows[i]) // capture log (rowhook.go); no full capture here
+		db.notePatch(tbl, rid, plan.setCol)
+	}
+	m.wctx.rowsAffected += len(rids)
+	return m.fkDrain() // as OpUpdateRow's case does
 }
 
 // keepRow is a copy of row in memory of its own, carved from a chunk the
@@ -5381,13 +5421,18 @@ func (wc *writeCtx) undoDrop(tbl *tableMeta, rid uint64) {
 // runs do: each rowid is put back from its own committed row, so the order
 // within the list does not matter.
 func (wc *writeCtx) undoBase(tbl *tableMeta, rid uint64) {
+	wc.undoBaseRun(tbl, []uint64{rid})
+}
+
+// undoBaseRun is undoBase for each of rids.
+func (wc *writeCtx) undoBaseRun(tbl *tableMeta, rids []uint64) {
 	if n := len(wc.journal); n > 0 {
 		if l := &wc.journal[n-1]; l.putBase && l.tbl == tbl {
-			l.baseRids = append(l.baseRids, rid)
+			l.baseRids = append(l.baseRids, rids...)
 			return
 		}
 	}
-	wc.journalAppend(undoEntry{tbl: tbl, put: true, putBase: true, baseRids: []uint64{rid}})
+	wc.journalAppend(undoEntry{tbl: tbl, put: true, putBase: true, baseRids: append([]uint64(nil), rids...)})
 }
 
 // undoMove journals an update's inverse: drop the row at newRid, then put

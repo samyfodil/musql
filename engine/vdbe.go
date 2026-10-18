@@ -131,6 +131,10 @@ type vdbe struct {
 	// are stored as their own copy.
 	gatherChunk []Value
 	keptChunk   []Value
+	// runRids and runRows are the run of rows applyGathered has written in
+	// place and storeInPlace has yet to store.
+	runRids []uint64
+	runRows [][]Value
 
 	// groupBatch is the collected-entries batch for a GROUP BY + DISTINCT
 	// query's OpGroupBatchAppend/OpGroupBatchFinal opcodes (vdbe_group_
