@@ -33,6 +33,10 @@ func TestUpdateReusesCursorRowMatchesC(t *testing.T) {
 			`CREATE TRIGGER tr AFTER UPDATE OF v ON t BEGIN DELETE FROM t WHERE id = new.id + 10; END`}},
 		{"after trigger deletes and re-inserts a later row", []string{
 			`CREATE TRIGGER tr AFTER UPDATE OF v ON t BEGIN DELETE FROM t WHERE id = new.id + 10; INSERT INTO t VALUES(new.id + 10, 3, 5, 'again', new.id + 1000); END`}},
+		// Rows stored before the column existed are shorter than the table, so
+		// the added column's value comes from the record OpMakeRecord borrowed.
+		{"rows shorter than the table", []string{
+			`ALTER TABLE t ADD COLUMN z TEXT DEFAULT 'zz'`, `UPDATE t SET z = 'set' || id WHERE id % 3 = 0`}},
 		{"after trigger clears the table", []string{
 			`CREATE TRIGGER tr AFTER UPDATE OF v ON t WHEN new.id = 13 BEGIN DELETE FROM t; INSERT INTO t VALUES(23, 3, 1, 'back', 0); END`}},
 	}

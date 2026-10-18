@@ -2397,8 +2397,11 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 		case OpMakeRecord:
 			rec := m.recAlloc(op.P2)
 			owned := m.wctx != nil && m.wctx.db.argsOwned
+			borrow, _ := op.P4.(recBorrow)
 			for i := 0; i < op.P2; i++ {
-				if v := m.regs[op.P1+i]; owned && m.isOwnedParam(v) {
+				if v := m.regs[op.P1+i]; i < len(borrow) && borrow[i] {
+					rec[i] = recordValue(v)
+				} else if owned && m.isOwnedParam(v) {
 					rec[i] = v // ExecArgsOwned: the caller handed these bytes over
 				} else {
 					rec[i] = recordValue(copyValue(v))
@@ -3231,6 +3234,13 @@ func (m *vdbe) isOwnedParam(v Value) bool {
 	}
 	return false
 }
+
+// recBorrow is an OpMakeRecord's P4 when the OpUpdateRow right after it
+// replaces some of the record's values: true at each column the record takes
+// from its register as is, without the deep copy, since opUpdateRow overwrites
+// it from the stored row or copies it itself (the columns the UPDATE does not
+// assign).
+type recBorrow []bool
 
 func copyValue(v Value) Value {
 	if v.S != nil {

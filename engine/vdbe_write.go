@@ -3318,7 +3318,10 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 	}
 	skips = append(skips, checkSkips...)
 	recReg := c.allocRec()
-	c.emit(Instruction{Op: OpMakeRecord, P1: rowBase, P2: len(tbl.cols), P3: recReg})
+	// P4 marks the columns this UPDATE does not assign: opUpdateRow, run next,
+	// replaces them from the stored row, so the record only borrows them and
+	// opUpdateRow copies any it keeps.
+	c.emit(Instruction{Op: OpMakeRecord, P1: rowBase, P2: len(tbl.cols), P3: recReg, P4: unassigned(plan.setCol)})
 	c.emit(Instruction{Op: OpUpdateRow, P1: 0, P2: recReg, P3: rowidReg, P4: plan})
 	// RETURNING FIRST among the AFTER programs -- see compileInsertStmt's row
 	// tail for the C (trigger.c:68-78 prepends the synthetic trigger) and for
@@ -3964,10 +3967,15 @@ func (m *vdbe) opUpdateRow(op *Instruction) (int, error) {
 	// the restore arms below reuse it.
 	seen, swaps, origin := m.cursors[op.P1].storedRow(tbl.rows, oldRowid)
 	oldVals := tbl.rows.rowSeen(oldRowid, seen, swaps, origin)
-	if oldVals != nil && plan.setCol != nil {
+	if plan.setCol != nil {
 		for i := range full {
-			if i < len(oldVals) && i < len(plan.setCol) && !plan.setCol[i] {
+			if i >= len(plan.setCol) || plan.setCol[i] {
+				continue
+			}
+			if i < len(oldVals) {
 				full[i] = oldVals[i]
+			} else {
+				full[i] = copyValue(full[i]) // borrowed by OpMakeRecord (recBorrow)
 			}
 		}
 	}
@@ -4115,6 +4123,15 @@ func (m *vdbe) opUpdateRow(op *Instruction) (int, error) {
 	m.wctx.db.fkRowMutated(tbl, oldRowid, newRowid, oldVals, full, fkColMask(len(tbl.cols), plan.colIdx))
 	m.wctx.rowsAffected++
 	return -1, nil
+}
+
+// unassigned is the recBorrow of an UPDATE whose assigned columns are setCol.
+func unassigned(setCol []bool) recBorrow {
+	b := make(recBorrow, len(setCol))
+	for i, set := range setCol {
+		b[i] = !set
+	}
+	return b
 }
 
 // opUpsertFind implements OP_UpsertFind (see the opcode doc). It probes the
