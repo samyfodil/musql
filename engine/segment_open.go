@@ -290,6 +290,11 @@ func buildSegmentPager(path string, f *SegmentFile, st *segDeltaState) (*ReadOnl
 			return nil, serr
 		}
 		root := f.RootOf(ti)
+		// Segments the delta carried (segDeltaSeg) come after the file's own:
+		// their rowids are above every earlier one.
+		if extra := st.segs[ti]; len(extra) > 0 {
+			segs = append(segs[:len(segs):len(segs)], extra...) // never into the file list's spare capacity
+		}
 		src.byRoot[root] = segs
 		src.tableOf[root] = ti
 		rows = append(rows, SchemaRow{

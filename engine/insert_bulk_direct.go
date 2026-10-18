@@ -68,6 +68,10 @@ type segBulkLoad struct {
 	// holds in memory until COMMIT: past txBulkMaxBytes it hands its rows to
 	// the row store, whose spill keeps a transaction's memory bounded.
 	segBytes int
+	// stream, when set, is an append load into a table that has rows: its
+	// rows stream into the segment the commit writes as one delta record
+	// (insert_append_delta.go), and cut is unused.
+	stream *segStream
 }
 
 // txBulkMaxBytes bounds the segments a transaction's load holds in memory. A
@@ -150,18 +154,26 @@ func (m *vdbe) bulkLoadInTx(plan *insertPlan) *segBulkLoad {
 	// A table with rows and no load is the ordinary path whatever else holds:
 	// asked first, because a batch INSERT into a loaded table asks once a row
 	// and bulkTxOK walks every index.
-	if tbl.bulk == nil && tbl.rows != nil && tbl.rows.len() != 0 {
-		return nil
-	}
-	if !plan.txAppendArmable() || !bulkTxOK(db, tbl) {
+	if !plan.txAppendArmable() {
 		return nil
 	}
 	bl := tbl.bulk
 	switch {
 	case bl != nil && !bl.inTx:
 		return nil
+	case bl == nil && tbl.rows != nil && !tbl.rows.isEmpty():
+		if !bulkTxOK(db, tbl) {
+			return nil
+		}
+		bl = db.armAppendLoad(tbl)
+		if bl == nil {
+			return nil
+		}
 	case bl == nil:
-		if tbl.rows.len() != 0 {
+		if !bulkTxOK(db, tbl) {
+			return nil
+		}
+		if !tbl.rows.isEmpty() {
 			return nil
 		}
 		bl = &segBulkLoad{inTx: true, db: db}
@@ -186,6 +198,16 @@ func (m *vdbe) bulkLoadInTx(plan *insertPlan) *segBulkLoad {
 func (bl *segBulkLoad) truncateTo(tbl *tableMeta, n int) {
 	db := bl.db
 	if tbl.bulk != bl || bl.rows <= n {
+		return
+	}
+	if bl.stream != nil {
+		bl.stream.truncate(n)
+		bl.rows = n
+		if n == 0 {
+			db.dropTxBulk(tbl)
+			return
+		}
+		bl.last = bl.stream.rowids[n-1]
 		return
 	}
 	if err := bl.cut.wait(); err != nil { // the segment in flight is rows we keep or cut
@@ -238,6 +260,10 @@ func (bl *segBulkLoad) truncateTo(tbl *tableMeta, n int) {
 // eachRow walks the load's rows in order, built segments first, until fn
 // returns false.
 func (bl *segBulkLoad) eachRow(fn func(rid uint64, vals []Value) bool) {
+	if bl.stream != nil {
+		bl.stream.eachRow(fn)
+		return
+	}
 	if err := bl.cut.wait(); err != nil && bl.db != nil {
 		bl.db.pendingLoadErr = err
 	}
@@ -384,7 +410,14 @@ func (m *vdbe) bulkStore(bl *segBulkLoad, tbl *tableMeta, rowid uint64, full []V
 	if tbl.ipkIndex >= 0 {
 		full[tbl.ipkIndex] = Value{Typ: Null} // stored NULL; the rowid carries the value
 	}
-	if err := bl.cut.add(rowid, full); err != nil {
+	if bl.stream != nil {
+		if !bl.stream.add(rowid, full) {
+			// Not full width: the load's rows go to the row store and this one
+			// the ordinary way, as for a row out of order.
+			m.wctx.db.drainTxBulks(nil)
+			return false, nil
+		}
+	} else if err := bl.cut.add(rowid, full); err != nil {
 		return false, err
 	}
 	bl.last, bl.any = rowid, true
@@ -395,6 +428,9 @@ func (m *vdbe) bulkStore(bl *segBulkLoad, tbl *tableMeta, rowid uint64, full []V
 	m.wctx.db.lastInsertRowid = int64(rowid)
 	if bl.inTx {
 		txBulkRows.Add(1)
+		if bl.stream != nil {
+			bl.segBytes = bl.stream.memBytes()
+		}
 		if bl.segBytes > txBulkMaxBytes {
 			// Too big to hold until COMMIT: the rows go to the row store, this
 			// statement's journalled to it, and the statement carries on there.

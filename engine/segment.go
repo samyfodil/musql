@@ -165,6 +165,14 @@ func buildSegment(cols []columnInfo, rowids []uint64, rows [][]Value) ([]byte, e
 // large enough, for a caller that is done with the previous segment by the
 // time it builds the next (segCutter.reuse).
 func buildSegmentInto(dst []byte, cols []columnInfo, rowids []uint64, rows [][]Value) ([]byte, error) {
+	return buildSegmentWith(dst, cols, rowids, rows, true)
+}
+
+// buildSegmentWith is buildSegmentInto, leaving the equality indexes out when
+// indexes is false: every column then reads as having none, which a reader
+// answers by scanning the column (segStream builds the same bytes, column by
+// column, for an append load -- see segment_stream.go).
+func buildSegmentWith(dst []byte, cols []columnInfo, rowids []uint64, rows [][]Value, indexes bool) ([]byte, error) {
 	nRows, nCols := len(rows), len(cols)
 	if len(rowids) != nRows {
 		return nil, fmt.Errorf("segment: %d rowids for %d rows", len(rowids), nRows)
@@ -302,7 +310,7 @@ func buildSegmentInto(dst []byte, cols []columnInfo, rowids []uint64, rows [][]V
 	for c := 0; c < nCols; c++ {
 		if census[c].Null != 0 {
 			heapOff += nullBytes
-		} else if phys[c] != PhysNull {
+		} else if phys[c] != PhysNull && indexes {
 			idxSlack += 8 + segIdxHdr + 4*nRows + 8
 		}
 	}
@@ -408,7 +416,7 @@ func buildSegmentInto(dst []byte, cols []columnInfo, rowids []uint64, rows [][]V
 	}
 	idx := make([][]byte, nCols)
 	for c := 0; c < nCols; c++ {
-		if census[c].Null != 0 || excCol[c] || nRows == 0 || phys[c] == PhysNull {
+		if !indexes || census[c].Null != 0 || excCol[c] || nRows == 0 || phys[c] == PhysNull {
 			continue
 		}
 		vals := unsafe.Slice((*int64)(unsafe.Pointer(unsafe.SliceData(cells[c]))), nRows)

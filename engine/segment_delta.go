@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"sort"
 	"time"
+	"unsafe"
 
 	"github.com/samyfodil/musql/internal/fsio"
 	"github.com/samyfodil/musql/internal/fsstamp"
@@ -63,12 +64,14 @@ import (
 // order a b-tree walk produces and every caller of a scan already depends on it.
 
 const (
-	segDeltaMagic     = "MQSD"
+	segDeltaMagic = "MQSD"
 	// segDeltaVersion 2 widened a batch's length prefix from 4 bytes to 8: one
 	// commit is one batch (its trailer is the commit marker), so a commit of 4 GiB
 	// or more wrapped the length. A version-1 delta is still read and appended to
-	// with its 4-byte prefix; every new delta is version 2.
-	segDeltaVersion   = 2
+	// with its 4-byte prefix. Version 3 adds the segment record
+	// (segDeltaSeg); its batches are otherwise version 2's. Every new delta is
+	// version 3.
+	segDeltaVersion   = 3
 	segDeltaHdrSize   = 32
 	segDeltaSuffix    = ".delta"
 	segDeltaTrailerSz = 16 // endCtr + endPages + cksum
@@ -79,10 +82,23 @@ const (
 var errDeltaNotForThisFile = errors.New("engine: segment delta was built against a different segment file")
 
 // Record kinds. A tombstone carries no values.
+//
+// A segment record (version 3) carries a whole segment of one table's rows,
+// every rowid above any the table had before it (insert_append_delta.go), so it
+// conflicts with no earlier record: kind, table index, first rowid, the
+// segment's length, a pad byte count p, p zero bytes so the segment starts
+// 8-aligned in the file, then the segment as buildSegment lays it out.
 const (
 	segDeltaPut  = 1
 	segDeltaKill = 2
+	segDeltaSeg  = 3
 )
+
+// segDeltaSegHdr is a segment record's bytes before its padding.
+const segDeltaSegHdr = 13 + 4 + 1
+
+// segDeltaSegPad is the padding a segment record at file offset pos needs.
+func segDeltaSegPad(pos int64) int64 { return (8 - (pos+segDeltaSegHdr)%8) % 8 }
 
 // SegDeltaRecord is one row mutation, as the delta stores it.
 //
@@ -94,6 +110,9 @@ type SegDeltaRecord struct {
 	Rowid int64
 	Kill  bool
 	Vals  []Value
+	// Seg, when set, makes this a segment record (segDeltaSeg): Rowid is its
+	// first rowid, Vals is unused.
+	Seg []byte
 
 	// src, when set, is the row store the put's row is read from WHILE the batch
 	// is written, instead of Vals: a commit then holds one row at a time rather
@@ -165,6 +184,12 @@ type segDeltaState struct {
 	// appending meanwhile: a replay references only complete batches, and a writer
 	// writes and truncates only past the last complete one.
 	mapping *mmapfile.File
+
+	// segs is each table's segments that segment records carried, in log
+	// order, every rowid above any earlier record's: buildSegmentPager reads
+	// them after the file's own segments. They alias the mapping when there is
+	// one, exactly as live's rows do.
+	segs map[int][]*segment
 }
 
 // release unmaps the delta this state's rows alias. Safe on nil and twice.
@@ -252,7 +277,6 @@ func segDeltaChecksum(b []byte, seed uint64) uint64 {
 	}
 	return h
 }
-
 
 // SegDeltaAppendState is where the last append left off: the byte offset the next
 // batch starts at and the running checksum it chains from.
@@ -477,6 +501,9 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 	//
 	// At st.bytes, not at the file's end: a previous torn append is OVERWRITTEN
 	// rather than kept, exactly as a WAL writer overwrites an aborted tail.
+	if st.version < 3 && hasSegRecord(recs) {
+		return errDeltaPredatesSegments
+	}
 	var keep *[]byte
 	if carry != nil {
 		keep = &carry.lastBatch
@@ -563,6 +590,10 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs
 	sizes = sizes[:len(recs)]
 	for i := range recs {
 		r := &recs[i]
+		if r.Seg != nil {
+			n += segDeltaSegHdr + segDeltaSegPad(off+lenWidth+n) + int64(len(r.Seg))
+			continue
+		}
 		n += 13
 		if !r.Kill {
 			sizes[i] = int32(r.recordLen())
@@ -593,6 +624,30 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs
 	written := int64(0)
 	for i := range recs {
 		r := &recs[i]
+		if r.Seg != nil {
+			var hdr [segDeltaSegHdr]byte
+			hdr[0] = segDeltaSeg
+			binary.LittleEndian.PutUint32(hdr[1:], uint32(r.Table))
+			binary.LittleEndian.PutUint64(hdr[5:], uint64(r.Rowid))
+			binary.LittleEndian.PutUint32(hdr[13:], uint32(len(r.Seg)))
+			pad := segDeltaSegPad(off + lenWidth + written)
+			hdr[17] = byte(pad)
+			buf = append(buf, hdr[:]...)
+			var zeros [8]byte
+			buf = append(buf, zeros[:pad]...)
+			written += segDeltaSegHdr + pad
+			// The segment goes out as it is, not copied into buf.
+			if err := flush(); err != nil {
+				return 0, 0, err
+			}
+			cksum = segDeltaChecksum(r.Seg, cksum)
+			if _, err := fsio.WriteAt(f, r.Seg, at); err != nil {
+				return 0, 0, err
+			}
+			at += int64(len(r.Seg))
+			written += int64(len(r.Seg))
+			continue
+		}
 		var hdr [13]byte
 		if r.Kill {
 			hdr[0] = segDeltaKill
@@ -651,6 +706,10 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs
 func segDeltaBatchBytes(recs []SegDeltaRecord) int64 {
 	n := int64(8 + segDeltaTrailerSz)
 	for i := range recs {
+		if recs[i].Seg != nil {
+			n += segDeltaSegHdr + 7 + int64(len(recs[i].Seg)) // at most 7 pad bytes
+			continue
+		}
 		n += 13
 		if !recs[i].Kill {
 			n += 4 + int64(recs[i].recordLen())
@@ -667,6 +726,10 @@ func segDeltaBatchBytesExceed(recs []SegDeltaRecord, limit int64) bool {
 	for i := range recs {
 		if n > limit {
 			return true
+		}
+		if recs[i].Seg != nil {
+			n += segDeltaSegHdr + 7 + int64(len(recs[i].Seg))
+			continue
 		}
 		n += segDeltaMinRecord
 		if !recs[i].Kill {
@@ -707,8 +770,8 @@ func replaySegDelta(data []byte, baseCtr, basePages uint32) (*segDeltaState, err
 		return nil, fmt.Errorf("engine: segment delta: bad magic %q", data[0:4])
 	}
 	st.version = binary.LittleEndian.Uint32(data[4:])
-	if st.version != 1 && st.version != segDeltaVersion {
-		return nil, fmt.Errorf("engine: segment delta: version %d, want 1 or %d", st.version, segDeltaVersion)
+	if st.version < 1 || st.version > segDeltaVersion {
+		return nil, fmt.Errorf("engine: segment delta: version %d, want 1 to %d", st.version, segDeltaVersion)
 	}
 	if binary.LittleEndian.Uint64(data[24:]) != segDeltaChecksum(data[:24], 0) {
 		return nil, fmt.Errorf("engine: segment delta: header checksum fails")
@@ -769,6 +832,20 @@ func (st *segDeltaState) applyBatch(body []byte) error {
 		rowid := int64(binary.LittleEndian.Uint64(body[off+5:]))
 		off += 13
 		switch kind {
+		case segDeltaSeg:
+			if off+5 > len(body) {
+				return fmt.Errorf("engine: segment delta: segment length runs past the batch")
+			}
+			n := int(binary.LittleEndian.Uint32(body[off:]))
+			pad := int(body[off+4])
+			off += 5 + pad
+			if pad > 7 || n <= 0 || off+n > len(body) {
+				return fmt.Errorf("engine: segment delta: segment runs past the batch")
+			}
+			if err := st.addSegment(table, body[off:off+n]); err != nil {
+				return err
+			}
+			off += n
 		case segDeltaKill:
 			st.kill(table, rowid)
 		case segDeltaPut:
@@ -801,7 +878,7 @@ func (st *segDeltaState) applyBatch(body []byte) error {
 func (st *segDeltaState) applyRecs(recs []SegDeltaRecord) bool {
 	total := 0
 	for i := range recs {
-		if !recs[i].Kill && recs[i].src != nil {
+		if recs[i].Seg != nil || (!recs[i].Kill && recs[i].src != nil) {
 			return false
 		}
 		if !recs[i].Kill && !canonicalDeltaRow(recs[i].Vals) {
@@ -1130,3 +1207,43 @@ func segmentLockBusy(err error, kind string) error {
 	return fmt.Errorf("%w: another connection holds the %s (%s)", ErrBusy, SegmentLockBusyFragment, kind)
 }
 
+// addSegment takes a segment record's bytes as one of table's segments. A
+// segment's int64 blocks are read in place, so bytes that are not 8-aligned in
+// memory (a batch replayed from a heap copy, not the mapped file) are copied to
+// memory that is.
+func (st *segDeltaState) addSegment(table int, raw []byte) error {
+	if uintptr(unsafe.Pointer(unsafe.SliceData(raw)))%8 != 0 {
+		raw = alignedCopy(raw)
+	}
+	sg, err := openSegment(raw)
+	if err != nil {
+		return fmt.Errorf("engine: segment delta: segment record: %w", err)
+	}
+	if st.segs == nil {
+		st.segs = map[int][]*segment{}
+	}
+	st.segs[table] = append(st.segs[table], sg)
+	return nil
+}
+
+// alignedCopy is b in 8-aligned memory of its own.
+func alignedCopy(b []byte) []byte {
+	words := make([]uint64, (len(b)+7)/8)
+	out := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(words))), len(b))
+	copy(out, b)
+	return out
+}
+
+// errDeltaPredatesSegments refuses a segment record for a delta older than
+// version 3, which an older reader would fail on: the caller rewrites the file
+// instead, which leaves a version-3 delta behind.
+var errDeltaPredatesSegments = errors.New("engine: segment delta: version predates segment records")
+
+func hasSegRecord(recs []SegDeltaRecord) bool {
+	for i := range recs {
+		if recs[i].Seg != nil {
+			return true
+		}
+	}
+	return false
+}

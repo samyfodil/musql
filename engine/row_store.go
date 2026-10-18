@@ -550,3 +550,30 @@ func fullStoredRowOf(name string, cols []columnInfo, ipkIndex int, rowid uint64,
 	}
 	return row, nil
 }
+
+// reserve makes room in an empty overlay for n rows about to be put, so a
+// post-commit settle of n appended rows (insert_append_delta.go) does not grow
+// the map a step at a time.
+func (s *rowStore) reserve(n int) {
+	if s != nil && len(s.m) == 0 && n > 0 {
+		s.m = make(map[uint64][]Value, n)
+	}
+}
+
+// isEmpty reports whether the store holds no row, without counting them: a
+// segment-backed store's first count walks every base rowid, and a caller
+// that only asks "any?" stops at the first.
+func (s *rowStore) isEmpty() bool {
+	if s == nil {
+		return true
+	}
+	if s.seg == nil || s.nKnown {
+		return s.len() == 0
+	}
+	empty := true
+	for range s.all() {
+		empty = false
+		break
+	}
+	return empty
+}

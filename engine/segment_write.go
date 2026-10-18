@@ -627,6 +627,12 @@ func (n *Session) commitMainLocked() (bool, error) {
 	// A ROW WRITE THE CHANGE LOG DOES NOT DESCRIBE cannot become a delta record,
 	// and appending the log and stopping LOSES it. Fall back to the whole-file
 	// rewrite, which writes every table's live rows and so cannot miss one.
+	// An append load's rows (insert_append_delta.go): one segment record per
+	// table, written after the log's records in the same batch.
+	segRecs, segTables, serr := n.appendLoadRecords()
+	if serr != nil {
+		return false, serr
+	}
 	if n.mutatedOutsideChangeLog(changes) {
 		if err := n.rewriteFile(); err != nil {
 			return false, err
@@ -635,7 +641,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 		n.noteCommittedColumnsStale()
 		return true, nil
 	}
-	if changes.len() == 0 {
+	if changes.len() == 0 && len(segRecs) == 0 {
 		return false, nil
 	}
 	// A BULK LOAD TOO BIG FOR THE DELTA, known before its records are built:
@@ -645,7 +651,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 	// measure them was 10% of a 10M-row load. Same order as below: a stale image
 	// is refused before anything is written.
 	if !compactionOffForTest && lockedStamp[0].there && n.maxSize == 0 &&
-		int64(changes.len())*segDeltaMinRecord > compactionThreshold(lockedStamp[0].size)-n.deltaLogicalSize(lockedStamp[1]) {
+		int64(changes.len())*segDeltaMinRecord+segDeltaBatchBytes(segRecs) > compactionThreshold(lockedStamp[0].size)-n.deltaLogicalSize(lockedStamp[1]) {
 		if n.loadedCtr != n.endCtr || n.loadedPages != n.endPages {
 			return false, fmt.Errorf("%w: another connection committed while this transaction was open", ErrBusy)
 		}
@@ -674,6 +680,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	recs = append(recs, segRecs...)
 	if len(recs) == 0 {
 		// Every change was to a table this file does not hold -- a TEMP table,
 		// say. Nothing to append, and nothing lost.
@@ -721,8 +728,19 @@ func (n *Session) commitMainLocked() (bool, error) {
 	}
 	wasCurrent := n.loadedCtr == n.endCtr && n.loadedPages == n.endPages
 	n.endCtr++
-	if aerr := appendSegmentDeltaAt(n.segPath, n.baseCtr, n.basePages, recs, n.endCtr, n.endPages, &n.appendAt, n.commitSync()); aerr != nil {
+	aerr := appendSegmentDeltaAt(n.segPath, n.baseCtr, n.basePages, recs, n.endCtr, n.endPages, &n.appendAt, n.commitSync())
+	if aerr != nil {
 		n.endCtr-- // the append failed, so the state did not move
+		if errors.Is(aerr, errDeltaPredatesSegments) {
+			// A delta older than segment records: the rewrite takes the load's
+			// rows from the row store and leaves a version-3 delta behind.
+			if err := n.rewriteFile(); err != nil {
+				return false, err
+			}
+			n.clearWrittenSinceCommit()
+			n.noteCommittedColumnsStale()
+			return true, nil
+		}
 		return false, aerr
 	}
 	if wasCurrent {
@@ -731,8 +749,22 @@ func (n *Session) commitMainLocked() (bool, error) {
 	n.deltaEnd = n.appendAt.offset
 	n.seenStat = n.pairStamp()
 	n.clearWrittenSinceCommit()
-	if !wasCurrent || !n.extendCommittedColumns(n.appendAt.lastBatch, recs) {
+	// The log's records extend the columnar view as before; the segments are
+	// published to it whole, below. The batch is only the log's records when
+	// no segment went out with them.
+	batch, logRecs := n.appendAt.lastBatch, recs[:len(recs)-len(segRecs)]
+	if len(segRecs) > 0 {
+		batch = nil
+	}
+	if !wasCurrent || !n.extendCommittedColumns(batch, logRecs) {
 		n.noteCommittedColumnsStale()
+	}
+	if len(segRecs) > 0 {
+		// The load's rows are the file's now, as segments: both read views
+		// take them as such.
+		if err := n.publishAppendLoads(segTables, segRecs); err != nil {
+			return true, err
+		}
 	}
 	n.appendAt.lastBatch = nil
 	return true, nil
@@ -826,7 +858,7 @@ func (db *DB) mutatedOutsideChangeLog(changes *changeLog) bool {
 		last = c.Table
 	}
 	for _, t := range db.tables {
-		if t.isTemp || !t.rowsWrittenSinceCommit || t.rows == nil {
+		if t.isTemp || !t.rowsWrittenSinceCommit || t.rows == nil || t.hasAppendLoad() {
 			continue
 		}
 		if !described[strings.ToLower(t.name)] {

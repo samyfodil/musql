@@ -78,6 +78,9 @@ func Create(path string) (*Session, error) {
 // directory entry to come from.
 func (n *Session) rewriteFile() error {
 	db := n.DB
+	// An append load's rows (insert_append_delta.go) are entries for a delta
+	// this rewrite replaces: into the row store, which the rewrite writes from.
+	db.settleAppendLoads(true)
 	// Every change to the pair is announced in the lock file's change word
 	// (segment_change.go), so a reader's freshness check can skip the stamps.
 	endChange, cerr := segChangeBegin(n.segPath)
