@@ -4202,6 +4202,11 @@ func (m *vdbe) applyGathered(mr, upd *Instruction, rows [][]Value) (allInPlace b
 	borrow, _ := mr.P4.(recBorrow)
 	owned := m.wctx != nil && m.wctx.db.argsOwned
 	plan := upd.P4.(*updatePlan)
+	if cur.idxSeekConfigured {
+		// An equality seek's rows all match, so the rest of them are about
+		// to be stored: an empty overlay is sized once, not grown.
+		plan.tbl.rows.reserve(len(cur.rowids) - at[0])
+	}
 	inPlaceOK := m.wctx.db.updateInPlaceOK(plan.tbl)
 	allInPlace = true
 	for k, row := range rows {
@@ -4209,8 +4214,10 @@ func (m *vdbe) applyGathered(mr, upd *Instruction, rows [][]Value) (allInPlace b
 		for c := range full {
 			// A borrowed column is left as gathered: updateRow replaces it
 			// from the stored row, or copies it, as it does OpMakeRecord's.
-			if c >= len(borrow) || !borrow[c] {
-				full[c] = m.recordOf(full[c], false, owned)
+			// recordOf leaves a value with no bytes and no REAL to fold as
+			// it is: an integer, the common case, is not passed through it.
+			if v := &full[c]; (c >= len(borrow) || !borrow[c]) && (v.S != nil || v.intReal) {
+				*v = m.recordOf(*v, false, owned)
 			}
 		}
 		cur.pos, cur.rowid = at[k], cur.rowids[at[k]]
