@@ -772,8 +772,14 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 			args.RowCap = 0
 		}
 	default:
-		if c := len(m.recChunk); c > 0 {
-			args.RowBuf, args.RowCap = (*int64)(unsafe.Pointer(&m.recChunk[0])), int64(c)
+		// An UPDATE's gathered rows (gatherUpdate) go to a buffer of their
+		// own, which the VDBE stores out of and reuses (vdbe.gatherChunk).
+		buf := m.recChunk
+		if jx.updAt >= 0 {
+			buf = m.gatherChunk
+		}
+		if c := len(buf); c > 0 {
+			args.RowBuf, args.RowCap = (*int64)(unsafe.Pointer(&buf[0])), int64(c)
 		} else {
 			args.RowCap = 0
 		}
@@ -889,7 +895,9 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 			// spare capacity, their Values the chunk's first RowUsed.
 			k := int(args.Yield)
 			*rows = (*rows)[:len(*rows)+k]
-			m.recChunk = m.recChunk[args.RowUsed:]
+			if jx.updAt < 0 {
+				m.recChunk = m.recChunk[args.RowUsed:]
+			}
 			m.jitRows += k
 			return int(args.PC), -1
 		}

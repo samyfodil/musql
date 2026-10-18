@@ -125,6 +125,12 @@ type vdbe struct {
 	// the size the last chunk was cut to -- see recAlloc.
 	recChunk     []Value
 	recChunkSize int
+	// gatherChunk is where native code gathers an UPDATE's rows
+	// (gatherUpdate), every batch into the same memory: nothing is stored
+	// there (applyGathered). keptChunk is keepRow's arena, for the rows that
+	// are stored as their own copy.
+	gatherChunk []Value
+	keptChunk   []Value
 
 	// groupBatch is the collected-entries batch for a GROUP BY + DISTINCT
 	// query's OpGroupBatchAppend/OpGroupBatchFinal opcodes (vdbe_group_
@@ -1361,14 +1367,14 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				jitScoreEnter()
 			}
 			before := len(rows)
-			var chunk []Value
 			if jx.updAt >= 0 {
 				// Room for a batch of records, so native code goes on past
 				// many rows before it hands them over (gatherUpdate).
 				const batch = 256
 				rows = slices.Grow(rows, batch)
-				m.recRoom(batch * (insns[jx.updAt-1].P2 + 1))
-				chunk = m.recChunk
+				if n := batch * (insns[jx.updAt-1].P2 + 1); len(m.gatherChunk) < n {
+					m.gatherChunk = make([]Value, n)
+				}
 			}
 			next, n := jx.enter(m, pc, &rows)
 			pc = next
@@ -1378,17 +1384,13 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				// is in the chunk's head, as the case below takes it.
 				gathered := rows[before:]
 				if n >= 0 {
-					gathered = append(gathered, m.recAlloc(n))
+					gathered = append(gathered, m.gatherChunk[:n:n]) // handed over alone, at its head
 				}
-				allInPlace, err := m.applyGathered(&insns[jx.updAt-1], &insns[jx.updAt], gathered)
-				if err != nil {
+				// Nothing holds what native code gathered once it is stored
+				// (applyGathered), so the next batch gathers into the same
+				// memory.
+				if err := m.applyGathered(&insns[jx.updAt-1], &insns[jx.updAt], gathered); err != nil {
 					return nil, err
-				}
-				if allInPlace && n < 0 {
-					// Every row went into its cursor's copy of the old one, so
-					// nothing holds what native code gathered: the next batch
-					// gathers into the same memory.
-					m.recChunk = chunk
 				}
 				clear(rows[before:])
 				rows = rows[:before]
@@ -3323,14 +3325,6 @@ func (m *vdbe) recAlloc(n int) []Value {
 	out := m.recChunk[:n:n]
 	m.recChunk = m.recChunk[n:]
 	return out
-}
-
-// recRoom makes the arena hold at least n Values, starting a chunk of n when
-// it does not: for native code that gathers records into it (gatherUpdate).
-func (m *vdbe) recRoom(n int) {
-	if len(m.recChunk) < n {
-		m.recChunk = make([]Value, n)
-	}
 }
 
 // recGiveBack returns rec, the record recAlloc carved last, to the arena: for a

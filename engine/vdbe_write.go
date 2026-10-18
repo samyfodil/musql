@@ -4223,11 +4223,12 @@ func unassigned(setCol []bool) recBorrow {
 // cursor on each row's own position while it does, and back where native code
 // left it after.
 //
-// allInPlace reports that every row went into its cursor's copy of the old row
-// (updateRow's inPlace), so none is held where native code gathered it.
-func (m *vdbe) applyGathered(mr, upd *Instruction, rows [][]Value) (allInPlace bool, err error) {
+// No row is stored where native code gathered it: one that does not go into
+// its cursor's copy of the old row (updateRow's inPlace) is copied out first
+// (keepRow), so the next batch gathers into the same memory.
+func (m *vdbe) applyGathered(mr, upd *Instruction, rows [][]Value) error {
 	if len(rows) == 0 {
-		return true, nil
+		return nil
 	}
 	cur := m.cursors[upd.P1]
 	pos, rowid := cur.pos, cur.rowid
@@ -4247,7 +4248,7 @@ func (m *vdbe) applyGathered(mr, upd *Instruction, rows [][]Value) (allInPlace b
 			i--
 		}
 		if rid.Typ != Int || i < 0 {
-			return false, fmt.Errorf("engine: internal: a gathered UPDATE row is not one its cursor visited")
+			return fmt.Errorf("engine: internal: a gathered UPDATE row is not one its cursor visited")
 		}
 		at[k] = i
 		i--
@@ -4261,7 +4262,6 @@ func (m *vdbe) applyGathered(mr, upd *Instruction, rows [][]Value) (allInPlace b
 		plan.tbl.rows.reserve(len(cur.rowids) - at[0])
 	}
 	inPlaceOK := m.wctx.db.updateInPlaceOK(plan.tbl)
-	allInPlace = true
 	for k, row := range rows {
 		full := row[:mr.P2:mr.P2]
 		for c := range full {
@@ -4280,15 +4280,30 @@ func (m *vdbe) applyGathered(mr, upd *Instruction, rows [][]Value) (allInPlace b
 			// row costs one copy, not two.
 			full, inPlace = m.inPlace(plan, cur, full)
 		}
-		allInPlace = allInPlace && inPlace
+		if !inPlace {
+			full = m.keepRow(full)
+		}
 		if _, err := m.updateRow(upd, full, uint64(row[mr.P2].I), inPlace); err != nil {
-			return false, err
+			return err
 		}
 		if err := m.fkDrain(); err != nil { // as OpUpdateRow's case does
-			return false, err
+			return err
 		}
 	}
-	return allInPlace, nil
+	return nil
+}
+
+// keepRow is a copy of row in memory of its own, carved from a chunk the
+// machine keeps for it as recAlloc does.
+func (m *vdbe) keepRow(row []Value) []Value {
+	n := len(row)
+	if len(m.keptChunk) < n {
+		m.keptChunk = make([]Value, max(256, n))
+	}
+	out := m.keptChunk[:n:n]
+	m.keptChunk = m.keptChunk[n:]
+	copy(out, row)
+	return out
 }
 
 // updateInPlaceOK reports whether an UPDATE of tbl may write a row's new
