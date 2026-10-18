@@ -73,6 +73,8 @@ func vmStepOf(in VInsn, pc int) progStep {
 		s.uses, s.defs, s.targets = []int{in.A}, []int{in.C}, []int{in.T}
 	case VNullJump, VIf:
 		s.uses, s.targets = []int{in.A}, []int{in.T}
+	case VIntGuard:
+		s.uses = []int{in.A}
 	case VNull:
 		s.defs = []int{in.C}
 	case VNeg, VNot:
@@ -81,7 +83,7 @@ func vmStepOf(in VInsn, pc int) progStep {
 		// The subroutine's VReturn (which reads everything) comes back to
 		// pc+1; the return address is a def.
 		s.defs, s.fall, s.targets = []int{in.A}, false, []int{in.T}
-	case VColumn:
+	case VColumn, VRowid:
 		s.defs = []int{in.C}
 	case VRewind, VNext:
 		s.targets = []int{in.T}

@@ -858,6 +858,33 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		e.column(pc, in)
 	case VResultRow:
 		e.resultRow(pc, in)
+	case VIntGuard:
+		if !e.know.isInt[in.A] {
+			e.guardInt(pc, in.A)
+			e.know.isInt[in.A] = true
+		}
+	case VRowid:
+		if in.Dead {
+			e.clobber(in.C)
+			break
+		}
+		e.destNoS(pc, in.C)
+		cb := int32(in.A * VCursorSize)
+		a.MovRegMemD(RAX, RDI, POffCur)
+		a.CmpMemDImm8(RAX, cb+VCursorOffOk, 0)
+		e.jccStub(CondE, pc)
+		a.MovRegMemD(RDX, RAX, cb+VCursorOffRids)
+		a.TestRegReg(RDX, RDX)
+		e.jccStub(CondE, pc)
+		a.MovRegMemD(R9, RAX, cb+VCursorOffPos)
+		a.AluRegMemD(AluCmp, R9, RAX, cb+VCursorOffN)
+		e.jccStub(condAboveEq, pc) // unsigned: a position before the first row is huge
+		a.MovRegImm64(R10, 8)
+		a.ImulRegReg(R9, R10)
+		a.AddRegReg(RDX, R9)
+		m := e.dest(pc, in.C, RAX)
+		a.MovRegMemD(m, RDX, 0)
+		e.storeInt(pc, in, in.C, m)
 	case VRewind:
 		e.unmap(^in.A)
 		cb := int32(in.A * VCursorSize)

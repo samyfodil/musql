@@ -192,6 +192,11 @@ type updatePlan struct {
 	// UPDATE program only.
 	setCol []bool
 
+	// gather: the rowid register OpUpdateRow reads is the scan cursor's own
+	// rowid, which the statement never assigns, so the native code may gather
+	// this row's record and let the engine apply it later (vmJIT.updAt).
+	gather bool
+
 	// rowRegs is the row image's register block, which opUpsertReload refills
 	// after BEFORE triggers, as update.c:1002-1017 does for regNew. The constraint
 	// checks, the AFTER UPDATE program's NEW.* and RETURNING all read it. Set only
@@ -2976,9 +2981,15 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 		conflictAware: conflictAware, action: stmt.orAction, explicitOr: stmt.explicitOr,
 		replaceDelBefore: delBefore, replaceDelAfter: delAfter}
 	plan.setCol = make([]bool, len(tbl.cols))
+	// Not under a conflict action: an IGNORE skips the rest of the row's body,
+	// which may already have run up to the next instruction the VDBE runs.
+	plan.gather = !upfrom && !conflictAware
 	for _, idx := range colIdx {
 		if idx >= 0 && idx < len(plan.setCol) {
 			plan.setCol[idx] = true
+		}
+		if idx == noColumnRowidTarget || idx == tbl.ipkIndex {
+			plan.gather = false
 		}
 	}
 
@@ -3956,11 +3967,15 @@ func (m *vdbe) opDelete(op *Instruction) error {
 // statement. Returns a jump target, or -1: an IGNORE resolution leaves the row
 // and jumps to plan.skipAddr.
 func (m *vdbe) opUpdateRow(op *Instruction) (int, error) {
+	return m.updateRow(op, m.recRegs[op.P2], uint64(m.regs[op.P3].I))
+}
+
+// updateRow is OP_UpdateRow's body for the record full and new rowid
+// newRowid, with the cursor on the row being updated.
+func (m *vdbe) updateRow(op *Instruction, full []Value, newRowid uint64) (int, error) {
 	plan := op.P4.(*updatePlan)
 	tbl := plan.tbl
 	oldRowid := m.cursors[op.P1].rowid
-	newRowid := uint64(m.regs[op.P3].I)
-	full := m.recRegs[op.P2]
 	// A BEFORE trigger may have updated this row after the cursor read it, so
 	// columns the statement does not assign are re-read from the store (ticket
 	// e25d9ea771, triggerC.test 10.3). Done before computeGeneratedInto. Read once;
@@ -4139,6 +4154,56 @@ func unassigned(setCol []bool) recBorrow {
 		b[i] = !set
 	}
 	return b
+}
+
+// applyGathered stores the rows native code gathered for the OpUpdateRow upd
+// (gatherUpdate), in order, as upd would have stored each one: every row is
+// the registers of the OpMakeRecord mr before it, then the rowid. It puts the
+// cursor on each row's own position while it does, and back where native code
+// left it after.
+func (m *vdbe) applyGathered(mr, upd *Instruction, rows [][]Value) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	cur := m.cursors[upd.P1]
+	pos, rowid := cur.pos, cur.rowid
+	defer func() { cur.pos, cur.rowid = pos, rowid }()
+	// Where each row is: the cursor's rows are visited in order, and the
+	// gathered ones are the last of those it has passed that the loop wrote.
+	var atBuf [64]int
+	at := atBuf[:0]
+	if len(rows) > len(atBuf) {
+		at = make([]int, 0, len(rows))
+	}
+	at = at[:len(rows)]
+	i := min(cur.pos, len(cur.rowids)-1)
+	for k := len(rows) - 1; k >= 0; k-- {
+		rid := rows[k][mr.P2]
+		for rid.Typ == Int && i >= 0 && cur.rowids[i] != uint64(rid.I) {
+			i--
+		}
+		if rid.Typ != Int || i < 0 {
+			return fmt.Errorf("engine: internal: a gathered UPDATE row is not one its cursor visited")
+		}
+		at[k] = i
+		i--
+	}
+	borrow, _ := mr.P4.(recBorrow)
+	owned := m.wctx != nil && m.wctx.db.argsOwned
+	for k, row := range rows {
+		full := row[:mr.P2:mr.P2]
+		for c := range full {
+			full[c] = m.recordOf(full[c], c < len(borrow) && borrow[c], owned)
+		}
+		cur.pos, cur.rowid = at[k], cur.rowids[at[k]]
+		if _, err := m.updateRow(upd, full, uint64(row[mr.P2].I)); err != nil {
+			return err
+		}
+		if err := m.fkDrain(); err != nil { // as OpUpdateRow's case does
+			return err
+		}
+	}
+	return nil
 }
 
 // opUpsertFind implements OP_UpsertFind (see the opcode doc). It probes the

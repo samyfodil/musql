@@ -1360,8 +1360,36 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			if jitScore {
 				jitScoreEnter()
 			}
+			before := len(rows)
+			if jx.updAt >= 0 {
+				// Room for a batch of records, so native code goes on past
+				// many rows before it hands them over (gatherUpdate).
+				const batch = 256
+				rows = slices.Grow(rows, batch)
+				m.recRoom(batch * (insns[jx.updAt-1].P2 + 1))
+			}
 			next, n := jx.enter(m, pc, &rows)
 			pc = next
+			if jx.updAt >= 0 {
+				// The rows are an UPDATE's records (gatherUpdate), stored now,
+				// before the VDBE runs anything. A row handed over alone (n)
+				// is in the chunk's head, as the case below takes it.
+				gathered := rows[before:]
+				if n >= 0 {
+					gathered = append(gathered, m.recAlloc(n))
+				}
+				if err := m.applyGathered(&insns[jx.updAt-1], &insns[jx.updAt], gathered); err != nil {
+					return nil, err
+				}
+				clear(rows[before:])
+				rows = rows[:before]
+				if n >= 0 {
+					// Handed over alone, it stopped at the OpUpdateRow, which
+					// it has now done: on past it, as native code jumps.
+					pc = jx.updAt + 1
+					continue
+				}
+			}
 			if n < 0 {
 				jitSkip = pc
 				continue
@@ -2399,13 +2427,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			owned := m.wctx != nil && m.wctx.db.argsOwned
 			borrow, _ := op.P4.(recBorrow)
 			for i := 0; i < op.P2; i++ {
-				if v := m.regs[op.P1+i]; i < len(borrow) && borrow[i] {
-					rec[i] = recordValue(v)
-				} else if owned && m.isOwnedParam(v) {
-					rec[i] = v // ExecArgsOwned: the caller handed these bytes over
-				} else {
-					rec[i] = recordValue(copyValue(v))
-				}
+				rec[i] = m.recordOf(m.regs[op.P1+i], i < len(borrow) && borrow[i], owned)
 			}
 			m.recRegs[op.P3] = rec
 
@@ -3235,6 +3257,19 @@ func (m *vdbe) isOwnedParam(v Value) bool {
 	return false
 }
 
+// recordOf is v as OpMakeRecord stores it: borrowed (recBorrow) as it is, a
+// parameter the caller handed over (ExecArgsOwned) as it is, anything else
+// deep-copied so it survives the register.
+func (m *vdbe) recordOf(v Value, borrowed, owned bool) Value {
+	switch {
+	case borrowed:
+		return recordValue(v)
+	case owned && m.isOwnedParam(v):
+		return v
+	}
+	return recordValue(copyValue(v))
+}
+
 // recBorrow is an OpMakeRecord's P4 when the OpUpdateRow right after it
 // replaces some of the record's values: true at each column the record takes
 // from its register as is, without the deep copy, since opUpdateRow overwrites
@@ -3279,6 +3314,14 @@ func (m *vdbe) recAlloc(n int) []Value {
 	out := m.recChunk[:n:n]
 	m.recChunk = m.recChunk[n:]
 	return out
+}
+
+// recRoom makes the arena hold at least n Values, starting a chunk of n when
+// it does not: for native code that gathers records into it (gatherUpdate).
+func (m *vdbe) recRoom(n int) {
+	if len(m.recChunk) < n {
+		m.recChunk = make([]Value, n)
+	}
 }
 
 // recGiveBack returns rec, the record recAlloc carved last, to the arena: for a

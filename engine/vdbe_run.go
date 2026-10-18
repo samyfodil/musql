@@ -387,12 +387,7 @@ func (p *selfRowExpr) eval(ctx *evalCtx) (Value, error) {
 	if m == nil {
 		m = &vdbe{}
 	}
-	if cap(m.regs) < q.prog.NReg {
-		m.regs = make([]Value, q.prog.NReg)
-	} else {
-		m.regs = m.regs[:q.prog.NReg]
-		clear(m.regs) // a stale value must never be readable as a register
-	}
+	m.regs = q.prog.regFile(m.regs, false) // a stale value must never be readable as a register
 	// The run-once cache slots a FROM-less subquery in this expression takes
 	// (compileSelfRowExpr serves nSub; every other counter still declines).
 	// Sized and CLEARED per evaluation rather than kept, for the two reasons

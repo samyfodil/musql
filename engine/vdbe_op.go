@@ -1100,6 +1100,9 @@ type Program struct {
 	// asked, 1 no, 2 yes. A stale answer (a copy given other instructions)
 	// costs only speed.
 	writeLoop  int32
+	// paramRegs caches jitParams: 0 not yet counted, else the count plus one.
+	// A stale count only costs a machine its native code (vmJIT.enter).
+	paramRegs int32
 	// txAppend is txAppendTarget's answer (insert_bulk_direct.go), kept.
 	txAppend *txAppendVerdict
 	NReg       int      // registers to allocate (r[0..NReg-1]).

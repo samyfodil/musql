@@ -845,6 +845,33 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		e.column(pc, in)
 	case VResultRow:
 		e.resultRow(pc, in)
+	case VIntGuard:
+		if !e.know.isInt[in.A] {
+			e.guardInt(pc, in.A)
+			e.know.isInt[in.A] = true
+		}
+	case VRowid:
+		if in.Dead {
+			e.clobber(in.C)
+			break
+		}
+		e.destNoS(pc, in.C)
+		cb := in.A * VCursorSize
+		a.LdrImm(X9, X0, POffCur)
+		e.ldrAt(X10, X9, cb+VCursorOffOk)
+		a.Cbz(X10, e.stub(pc))
+		e.ldrAt(X11, X9, cb+VCursorOffRids)
+		a.Cbz(X11, e.stub(pc))
+		e.ldrAt(X10, X9, cb+VCursorOffPos)
+		e.ldrAt(X12, X9, cb+VCursorOffN)
+		a.Cmp(X10, X12)
+		a.BcondRaw(armHS, e.stub(pc)) // unsigned: a position before the first row is huge
+		a.MovImm64(X12, 8)
+		a.Mul(X10, X10, X12)
+		a.AddReg(X10, X11, X10)
+		m := e.dest(pc, in.C, X10)
+		a.LdrImm(m, X10, 0)
+		e.storeInt(in, in.C, m)
 	case VRewind:
 		e.unmap(^in.A)
 		cb := in.A * VCursorSize
