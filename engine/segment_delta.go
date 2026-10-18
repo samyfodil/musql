@@ -838,6 +838,11 @@ func segDeltaBatchBytes(recs []SegDeltaRecord) int64 {
 // only until the answer is known: a bulk load's batch is far past the limit
 // long before its last record, and measuring a record can mean encoding it.
 func segDeltaBatchBytesExceed(recs []SegDeltaRecord, limit int64) bool {
+	// Most batches are far from the limit: an upper bound from each value's
+	// type and length settles that without measuring a record.
+	if bound, ok := segDeltaBatchBound(recs); ok && bound <= limit {
+		return false
+	}
 	n := int64(8 + segDeltaTrailerSz)
 	for i := range recs {
 		if n > limit {
@@ -853,6 +858,28 @@ func segDeltaBatchBytesExceed(recs []SegDeltaRecord, limit int64) bool {
 		}
 	}
 	return n > limit
+}
+
+// segDeltaBatchBound is at least the bytes a batch of recs takes in any
+// version, from each value's type and length alone; false when a record has
+// no values to bound (a segment, or a row read from a spilled store while the
+// batch is written).
+func segDeltaBatchBound(recs []SegDeltaRecord) (int64, bool) {
+	n := int64(8 + segDeltaTrailerSz)
+	for i := range recs {
+		r := &recs[i]
+		if r.Seg != nil || !r.Kill && r.src != nil {
+			return 0, false
+		}
+		n += 13
+		if !r.Kill {
+			// A patch record's body is its count, the columns and a record of
+			// some of the values: within the whole row's bound plus a varint
+			// per column.
+			n += 4 + int64(recordBound(r.Vals)+10*len(r.Vals))
+		}
+	}
+	return n, true
 }
 
 // segDeltaMinRecord is the smallest a delta record can be: a kill's header,

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -204,4 +205,56 @@ func TestUpdatePatchesReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	check("after a compaction")
+}
+
+// TestSegDeltaBatchBoundCovers: segDeltaBatchBound, which settles a
+// compaction check without measuring records, is never below the bytes a
+// batch actually takes, patch records included.
+func TestSegDeltaBatchBoundCovers(t *testing.T) {
+	rng := rand.New(rand.NewSource(5))
+	for trial := 0; trial < 200; trial++ {
+		var recs []SegDeltaRecord
+		for i := 0; i < 1+rng.Intn(40); i++ {
+			r := SegDeltaRecord{Table: rng.Intn(3), Rowid: rng.Int63() - rng.Int63(), Kill: rng.Intn(5) == 0}
+			if !r.Kill {
+				r.Vals = make([]Value, 1+rng.Intn(6))
+				for c := range r.Vals {
+					switch rng.Intn(4) {
+					case 0:
+						r.Vals[c] = Value{Typ: Int, I: rng.Int63() - rng.Int63()}
+					case 1:
+						r.Vals[c] = Value{Typ: Float, F: rng.Float64()}
+					case 2:
+						r.Vals[c] = Value{Typ: Text, S: make([]byte, rng.Intn(300))}
+					}
+				}
+				if rng.Intn(2) == 0 {
+					r.patch = make([]bool, len(r.Vals))
+					for c := range r.patch {
+						r.patch[c] = rng.Intn(2) == 0
+					}
+					r.patch[rng.Intn(len(r.patch))] = true
+				}
+			}
+			recs = append(recs, r)
+		}
+		bound, ok := segDeltaBatchBound(recs)
+		if !ok {
+			t.Fatal("no bound for plain records")
+		}
+		for _, version := range []uint32{1, 4, 5} {
+			f, err := os.Create(filepath.Join(t.TempDir(), "d"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			end, _, err := writeSegDeltaBatch(f, 0, 0, version, recs, 1, 1, nil)
+			f.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if end > bound {
+				t.Fatalf("trial %d v%d: batch takes %d bytes, bound says at most %d", trial, version, end, bound)
+			}
+		}
+	}
 }

@@ -744,12 +744,19 @@ func fullStoredRowOf(name string, cols []columnInfo, ipkIndex int, rowid uint64,
 	return row, nil
 }
 
-// reserve makes room in an empty overlay for n rows about to be put, so a
-// post-commit settle of n appended rows (insert_append_delta.go) does not grow
-// the map a step at a time.
+// reserve makes room in the overlay for n rows about to be put, so a
+// post-commit settle of n appended rows (insert_append_delta.go) or a bulk
+// UPDATE does not grow the map a step at a time. An overlay holding a few rows
+// already is rebuilt at the size, which costs a copy of those few.
 func (s *rowStore) reserve(n int) {
-	if s != nil && len(s.m) == 0 && n > 0 {
+	switch {
+	case s == nil || n <= 0:
+	case len(s.m) == 0:
 		s.m = make(map[uint64][]Value, n)
+	case n >= 1024 && len(s.m) < n/4:
+		m := make(map[uint64][]Value, len(s.m)+n)
+		maps.Copy(m, s.m)
+		s.m = m
 	}
 }
 

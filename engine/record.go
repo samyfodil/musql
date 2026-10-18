@@ -463,6 +463,23 @@ func recordSize(vals []Value) int {
 	return recordHeaderLen(typesLen) + bodyLen
 }
 
+// recordBound is at least recordSize(vals), from each value's type and length
+// alone: every serial type at its widest varint, an integer or float at eight
+// bytes.
+func recordBound(vals []Value) int {
+	n := 9 // the header's own length
+	for i := range vals {
+		n += 9
+		switch vals[i].Typ {
+		case Int, Float:
+			n += 8
+		case Text, Blob:
+			n += len(vals[i].S)
+		}
+	}
+	return n
+}
+
 // recordHeaderLen is the length of a record header whose serial types take
 // typesLen bytes: they, plus the varint giving the header's own length, which
 // counts itself.
