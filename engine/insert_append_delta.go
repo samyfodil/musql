@@ -139,6 +139,9 @@ func (n *Session) publishAppendLoads(tables []*tableMeta, recs []SegDeltaRecord)
 		})
 	}
 	if cols := db.segColumns; cols != nil && !db.segColumnsStale && cols.segs != nil {
+		if cols.segs.delta != nil {
+			db.flushColsPending(cols.segs.delta) // in commit order, before the new segments
+		}
 		ti := n.effectiveTableIndex()
 		cols.segs = withAppendedSegments(cols.segs, tables, segs, func(t *tableMeta) (uint32, bool) {
 			want, ok := ti[t.name]

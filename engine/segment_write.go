@@ -793,10 +793,17 @@ func (n *Session) extendCommittedColumns(batch []byte, recs []SegDeltaRecord) bo
 	if st == nil {
 		st = &segDeltaState{live: map[int]map[int64][]Value{}, dead: map[int]map[int64]bool{}, version: segDeltaVersion}
 	}
-	// From the records the batch was written from, when every put carries its
-	// values: the rows decoding the batch would give back, without decoding
-	// it -- a 20,000-row commit spent most of its extension there.
-	if !st.applyRecs(recs) {
+	// QUEUED, not applied, when every record carries its row: nothing may read
+	// the view before the next commit, or ever (a run of writes with no
+	// columnar read between them), and committedColumns applies the queue
+	// when something does. Bounded, so a long run of writes applies it as it
+	// goes.
+	if deferrable(recs) && len(db.colsPending)+len(recs) <= colsPendingMax {
+		for i := range recs {
+			r := &recs[i]
+			db.colsPending = append(db.colsPending, pendingRec{table: int32(r.Table), kill: r.Kill, patch: r.patch != nil, rowid: r.Rowid, vals: r.Vals})
+		}
+	} else if db.flushColsPending(st); !st.applyRecs(recs) {
 		if batch == nil {
 			return false
 		}
@@ -1983,6 +1990,53 @@ func (n *Session) reopen(afterFailedCommit bool) error {
 	return nil
 }
 
+// pendingRec is one record of a commit queued for the committed view
+// (extendCommittedColumns): a put of vals, or a kill.
+type pendingRec struct {
+	table int32
+	kill  bool
+	patch bool // the put was a patch (SegDeltaRecord.patch): see applyRecs
+	rowid int64
+	vals  []Value
+}
+
+// colsPendingMax is how many queued records the committed view may lag by.
+const colsPendingMax = 1 << 16
+
+// deferrable reports whether recs can be queued for the committed view: every
+// put carries its row (no segment, no row read from a spilled store).
+func deferrable(recs []SegDeltaRecord) bool {
+	for i := range recs {
+		if recs[i].Seg != nil || !recs[i].Kill && recs[i].src != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// flushColsPending applies the queued records to st, the committed view's
+// delta, in the order they were committed.
+func (db *DB) flushColsPending(st *segDeltaState) {
+	if len(db.colsPending) == 0 {
+		return
+	}
+	recs := make([]SegDeltaRecord, len(db.colsPending))
+	for i, p := range db.colsPending {
+		recs[i] = SegDeltaRecord{Table: int(p.table), Rowid: p.rowid, Kill: p.kill, Vals: p.vals}
+		if p.patch {
+			recs[i].patch = []bool{} // marks it a patch for applyRecs; its columns do not matter there
+		}
+	}
+	st.applyRecs(recs)
+	db.dropColsPending()
+}
+
+// dropColsPending empties the queue, so it holds no row.
+func (db *DB) dropColsPending() {
+	clear(db.colsPending)
+	db.colsPending = db.colsPending[:0]
+}
+
 // committedColumns is the COMMITTED-state read handle the columnar fast paths get
 // their blocks from, rebuilt on the first call after a commit marked it stale.
 //
@@ -1991,8 +2045,12 @@ func (n *Session) reopen(afterFailedCommit bool) error {
 // re-opened costs speed and never correctness.
 func (db *DB) committedColumns() *ReadOnlyPager {
 	if db.segColumns != nil && !db.segColumnsStale {
+		if len(db.colsPending) > 0 && db.segColumns.segs != nil && db.segColumns.segs.delta != nil {
+			db.flushColsPending(db.segColumns.segs.delta)
+		}
 		return db.segColumns
 	}
+	db.dropColsPending() // the view is read again from the file, which has them
 	p, err := openSegmentsUnlocked(db.path)
 	if err != nil {
 		// Leave whatever is cached alone rather than dropping it: a stale handle
@@ -2013,6 +2071,7 @@ func (db *DB) committedColumns() *ReadOnlyPager {
 // closed connection left that mapping -- and the file's disk space, the whole
 // database for a ":memory:" one -- behind until the process exited.
 func (db *DB) releaseCommittedColumns() {
+	db.dropColsPending()
 	if db.segColumns != nil {
 		db.segColumns.Close()
 		db.segColumns = nil
@@ -2023,6 +2082,7 @@ func (db *DB) releaseCommittedColumns() {
 // every commit, of either kind, because either kind moves what is committed.
 func (db *DB) noteCommittedColumnsStale() {
 	db.segColumnsStale = true
+	db.dropColsPending() // a rebuild reads the file, which has them
 	// ...and the catalog-corruption verdict, whose key this is the second half of.
 	db.schemaCorruptGen++
 }

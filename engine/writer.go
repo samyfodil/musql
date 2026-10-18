@@ -632,6 +632,9 @@ type DB struct {
 	//	// commit marks it stale, so the commit path never pays the re-open.
 	segColumns      *ReadOnlyPager
 	segColumnsStale bool
+	// colsPending is records committed but not yet applied to segColumns'
+	// delta (extendCommittedColumns); committedColumns applies them.
+	colsPending []pendingRec
 
 	//	// schemaCorrupt caches schemaLoadCorruptRefuses' verdict, which runs on
 	//	// every non-PRAGMA statement and otherwise re-scans every catalog --
