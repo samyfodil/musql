@@ -68,7 +68,7 @@ func TestSegmentDeltaEmptyBatchIsNotHistory(t *testing.T) {
 	b := make([]byte, w+8)
 	binary.LittleEndian.PutUint32(b[w:], st.endCtr+1)
 	binary.LittleEndian.PutUint32(b[w+4:], st.endPages)
-	b = binary.LittleEndian.AppendUint64(b, segDeltaChecksum(b, st.cksum))
+	b = binary.LittleEndian.AppendUint64(b, segDeltaChecksum(st.version, b, st.cksum))
 	st2, err := replaySegDelta(append(append([]byte(nil), data...), b...), baseCtr, basePages)
 	if err != nil {
 		t.Fatal(err)

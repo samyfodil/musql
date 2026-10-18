@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"math"
 	"os"
 	"runtime"
@@ -70,9 +71,9 @@ const (
 	// commit is one batch (its trailer is the commit marker), so a commit of 4 GiB
 	// or more wrapped the length. A version-1 delta is still read and appended to
 	// with its 4-byte prefix. Version 3 adds the segment record
-	// (segDeltaSeg); its batches are otherwise version 2's. Every new delta is
-	// version 3.
-	segDeltaVersion   = 3
+	// (segDeltaSeg); its batches are otherwise version 2's. Version 4 changes
+	// only the checksum (segDeltaChecksum). Every new delta is version 4.
+	segDeltaVersion   = 4
 	segDeltaHdrSize   = 32
 	segDeltaSuffix    = ".delta"
 	segDeltaTrailerSz = 16 // endCtr + endPages + cksum
@@ -264,15 +265,22 @@ func segDeltaHeader(baseCtr, basePages uint32) []byte {
 	binary.LittleEndian.PutUint32(hdr[4:], segDeltaVersion)
 	binary.LittleEndian.PutUint32(hdr[8:], baseCtr)
 	binary.LittleEndian.PutUint32(hdr[12:], basePages)
-	binary.LittleEndian.PutUint64(hdr[24:], segDeltaChecksum(hdr[:24], 0))
+	binary.LittleEndian.PutUint64(hdr[24:], segDeltaChecksum(segDeltaVersion, hdr[:24], 0))
 	return hdr
 }
 
-// segDeltaChecksum is the running checksum, seeded from the previous value. It
-// is the FNV-1a 64 mixing step over 8-byte groups, chosen because it is a dozen
-// lines and this file does not need a cryptographic hash -- it needs to notice a
-// torn append, and it needs the value to depend on every preceding byte.
-func segDeltaChecksum(b []byte, seed uint64) uint64 {
+// segDeltaChecksum is the running checksum of a version-v delta, seeded from
+// the previous value. It needs to notice a torn append, and it needs the value
+// to depend on every preceding byte; it does not need to be cryptographic.
+//
+// Version 4 is CRC-32C, which the CPU computes many bytes at a time. Versions 1
+// to 3 are FNV-1a 64 a byte at a time, one dependent multiply per byte: a few
+// percent of an UPDATE of thousands of rows, and of every replay. Both are
+// chained across calls, so a batch summed in pieces sums as it would whole.
+func segDeltaChecksum(v uint32, b []byte, seed uint64) uint64 {
+	if v >= 4 {
+		return uint64(crc32.Update(uint32(seed), segDeltaCRC, b))
+	}
 	h := seed
 	if h == 0 {
 		h = 14695981039346656037
@@ -283,6 +291,8 @@ func segDeltaChecksum(b []byte, seed uint64) uint64 {
 	}
 	return h
 }
+
+var segDeltaCRC = crc32.MakeTable(crc32.Castagnoli)
 
 // SegDeltaAppendState is where the last append left off: the byte offset the next
 // batch starts at and the running checksum it chains from.
@@ -514,7 +524,7 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 	if carry != nil {
 		keep = &carry.lastBatch
 	}
-	end, cksum, werr := writeSegDeltaBatch(f, st.bytes, st.cksum, segDeltaLenWidth(st.version), recs, endCtr, endPages, keep)
+	end, cksum, werr := writeSegDeltaBatch(f, st.bytes, st.cksum, st.version, recs, endCtr, endPages, keep)
 	if werr != nil {
 		return werr
 	}
@@ -585,7 +595,8 @@ const segDeltaChunk = 1 << 20
 // that first byte, so the total is computed first (recordSize), and every
 // record's encoding is checked against its prediction: a mismatch fails the
 // commit rather than writing a batch whose length lies.
-func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs []SegDeltaRecord, endCtr, endPages uint32, keep *[]byte) (end int64, cksum uint64, err error) {
+func writeSegDeltaBatch(f *os.File, off int64, seed uint64, version uint32, recs []SegDeltaRecord, endCtr, endPages uint32, keep *[]byte) (end int64, cksum uint64, err error) {
+	lenWidth := segDeltaLenWidth(version)
 	var n int64
 	// Each put's record length, measured once; on the stack for a small batch.
 	var sizesBuf [16]int32
@@ -619,7 +630,7 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs
 	}
 	at, cksum := off, seed
 	flush := func() error {
-		cksum = segDeltaChecksum(buf, cksum)
+		cksum = segDeltaChecksum(version, buf, cksum)
 		if _, err := fsio.WriteAt(f, buf, at); err != nil {
 			return err
 		}
@@ -646,7 +657,7 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs
 			if err := flush(); err != nil {
 				return 0, 0, err
 			}
-			cksum = segDeltaChecksum(r.Seg, cksum)
+			cksum = segDeltaChecksum(version, r.Seg, cksum)
 			if _, err := fsio.WriteAt(f, r.Seg, at); err != nil {
 				return 0, 0, err
 			}
@@ -699,7 +710,7 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs
 	buf = append(buf, tr[:8]...)
 	// The checksum covers everything before it, so it is known once the last
 	// chunk is summed, and goes out in the same write: one call, not two.
-	cksum = segDeltaChecksum(buf, cksum)
+	cksum = segDeltaChecksum(version, buf, cksum)
 	buf = binary.LittleEndian.AppendUint64(buf, cksum)
 	if _, err := fsio.WriteAt(f, buf, at); err != nil {
 		return 0, 0, err
@@ -779,14 +790,14 @@ func replaySegDelta(data []byte, baseCtr, basePages uint32) (*segDeltaState, err
 	if st.version < 1 || st.version > segDeltaVersion {
 		return nil, fmt.Errorf("engine: segment delta: version %d, want 1 to %d", st.version, segDeltaVersion)
 	}
-	if binary.LittleEndian.Uint64(data[24:]) != segDeltaChecksum(data[:24], 0) {
+	if binary.LittleEndian.Uint64(data[24:]) != segDeltaChecksum(st.version, data[:24], 0) {
 		return nil, fmt.Errorf("engine: segment delta: header checksum fails")
 	}
 	if c, p := binary.LittleEndian.Uint32(data[8:]), binary.LittleEndian.Uint32(data[12:]); c != baseCtr || p != basePages {
 		return nil, fmt.Errorf("%w (delta was built for counter %d pages %d; this file is counter %d pages %d)",
 			errDeltaNotForThisFile, c, p, baseCtr, basePages)
 	}
-	st.cksum = segDeltaChecksum(data[:24], 0)
+	st.cksum = segDeltaChecksum(st.version, data[:24], 0)
 
 	w := segDeltaLenWidth(st.version)
 	off := int64(segDeltaHdrSize)
@@ -810,7 +821,7 @@ func replaySegDelta(data []byte, baseCtr, basePages uint32) (*segDeltaState, err
 		}
 		batch := data[off:end]
 		want := binary.LittleEndian.Uint64(batch[len(batch)-8:])
-		if segDeltaChecksum(batch[:len(batch)-8], st.cksum) != want {
+		if segDeltaChecksum(st.version, batch[:len(batch)-8], st.cksum) != want {
 			break // torn or corrupt: this batch and everything after it is not history
 		}
 		if err := st.applyBatch(batch[w : w+n]); err != nil {
