@@ -1191,7 +1191,10 @@ func (st *segDeltaState) applyRecs(recs []SegDeltaRecord) bool {
 			live, liveTable = st.live[r.Table], r.Table
 		}
 		live[r.Rowid] = vals
-		if d := st.dead[r.Table]; len(d) > 0 {
+		// A patched put was a committed row neither put nor killed by the log
+		// when its UPDATE read it, outside any transaction, so it is in no
+		// dead set: only another put can be.
+		if d := st.dead[r.Table]; len(d) > 0 && r.patch == nil {
 			delete(d, r.Rowid)
 		}
 	}
