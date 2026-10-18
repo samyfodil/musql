@@ -71,6 +71,9 @@ type vdbeCursor struct {
 	// rowsBase were last known to be its rows: at the rewind, and again after
 	// each write of the UPDATE's own (opUpdateRow), for storedRow.
 	rowsWrites uint64
+	// overlaySized says a gathered UPDATE has sized the store's overlay for
+	// this rewind's rows already (applyGathered).
+	overlaySized bool
 	// rowsBase, when not nil, is bit i set where rows[i] came from the
 	// store's committed rows rather than its overlay (rowStore.eachOf).
 	rowsBase []uint64
@@ -612,6 +615,7 @@ func (cur *vdbeCursor) rewind() error {
 					})
 					cur.lazyNorm = lazy
 					cur.rowsFrom, cur.rowsSwaps, cur.rowsWrites = tbl.rows, tbl.rows.swaps, tbl.rows.writes
+					cur.overlaySized = false
 					cur.writeHint = len(cur.rows)
 					if !slices.IsSorted(cur.rowids) { // the short rows come unioned at the end
 						sortRowsByRowid(cur)

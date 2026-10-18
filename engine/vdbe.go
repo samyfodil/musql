@@ -2316,7 +2316,12 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				return nil, rerr
 			}
 			if cur.writeHint > 0 && m.wctx != nil {
-				m.wctx.journal = slices.Grow(m.wctx.journalSlice(), cur.writeHint)
+				// With room to spare (within what putWriteCtx keeps): the next
+				// statement of about this size then reuses it rather than
+				// regrowing it for a few more rows.
+				if j := m.wctx.journalSlice(); cap(j)-len(j) < cur.writeHint {
+					m.wctx.journal = slices.Grow(j, min(cur.writeHint+cur.writeHint/4, max(cur.writeHint, 1<<14-len(j))))
+				}
 				cur.writeHint = 0
 			}
 			if !cur.advance() {
