@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 )
 
 // rowStore is one table's rows, keyed by rowid. A nil *rowStore is a table
@@ -161,7 +162,7 @@ func (s *rowStore) eachOf(rowids []uint64, notGone bool, fn func(rid uint64, val
 const eachOfParallelMin = 4096
 
 // eachOfParallel is eachOf with the committed rows decoded by several
-// goroutines first, each through a run of its own over its share of them --
+// goroutines first, each through a run of its own over the pieces it takes --
 // a run's arena is its own, so every row is still decoded for this call alone
 // -- and fn then called for every row in the order given, on this goroutine.
 // The decoding only reads: segments, the delta, the table's columns. A table
@@ -183,18 +184,19 @@ func (s *rowStore) eachOfParallel(rowids []uint64, notGone bool, fn func(rid uin
 	}
 	out := make([][]Value, len(base))
 	state := make([]uint8, len(base)) // 0 no row, 1 a row, 2 a row decoded for this call
-	workers := min(runtime.GOMAXPROCS(0), len(base)/(eachOfParallelMin/4), 8)
-	var wg sync.WaitGroup
-	for w := range max(workers, 1) {
-		lo, hi := w*len(base)/max(workers, 1), (w+1)*len(base)/max(workers, 1)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			run := s.seg.run()
-			// Its share's rows in one arena, sized for them: the run's own
-			// chunks would leave each worker's last one mostly unused.
-			run.arena = make([]Value, (hi-lo)*len(s.seg.tbl.cols))
-			for j := lo; j < hi; j++ {
+	// In pieces taken from a counter, by this goroutine as well as its
+	// helpers: a helper the scheduler starts late (every core busy) then
+	// takes fewer pieces rather than holding up the rest.
+	const piece = 512
+	var next atomic.Int64
+	decode := func() {
+		run := s.seg.run()
+		for {
+			lo := int(next.Add(piece)) - piece
+			if lo >= len(base) {
+				return
+			}
+			for j := lo; j < min(lo+piece, len(base)); j++ {
 				if vals, ok, owned := run.get(base[j]); ok {
 					out[j], state[j] = vals, 1
 					if owned {
@@ -202,8 +204,17 @@ func (s *rowStore) eachOfParallel(rowids []uint64, notGone bool, fn func(rid uin
 					}
 				}
 			}
+		}
+	}
+	var wg sync.WaitGroup
+	for range min(runtime.GOMAXPROCS(0)-1, len(base)/piece-1, 7) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			decode()
 		}()
 	}
+	decode()
 	wg.Wait()
 	b := 0
 	for _, rid := range rowids {
