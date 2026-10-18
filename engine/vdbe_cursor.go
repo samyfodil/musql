@@ -585,7 +585,7 @@ func (cur *vdbeCursor) rewind() error {
 				}
 				if ok {
 					writeIndexSeeksServed.Add(1)
-					cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
+					cur.rowids, cur.rows = slices.Grow(cur.rowids[:0], len(hits)), slices.Grow(cur.rows[:0], len(hits))
 					// The stored rows are kept as they are and fixed up as each
 					// becomes current (lazyNorm), as materializeRowStore does, rather
 					// than copied here: a tenth of a table is thousands of rows.

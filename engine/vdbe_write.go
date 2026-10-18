@@ -4120,7 +4120,7 @@ func (m *vdbe) opUpdateRow(op *Instruction) (int, error) {
 	}
 	m.wctx.undoMove(tbl, newRowid, oldRowid, oldVals)
 	m.wctx.db.noteRowUpdate(tbl, oldRowid, newRowid, oldVals, full) // capture log (rowhook.go)
-	m.wctx.db.fkRowMutated(tbl, oldRowid, newRowid, oldVals, full, fkColMask(len(tbl.cols), plan.colIdx))
+	m.wctx.db.fkRowMutated(tbl, oldRowid, newRowid, oldVals, full, plan.setCol) // fkColMask of colIdx, built once
 	m.wctx.rowsAffected++
 	return -1, nil
 }
