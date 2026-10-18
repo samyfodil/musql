@@ -67,6 +67,10 @@ type vdbeCursor struct {
 	// swap count then, for storedRow.
 	rowsFrom  *rowStore
 	rowsSwaps uint32
+	// rowsWrites is the store's write count when the rows marked base in
+	// rowsBase were last known to be its rows: at the rewind, and again after
+	// each write of the UPDATE's own (opUpdateRow), for storedRow.
+	rowsWrites uint64
 	// rowsBase, when not nil, is bit i set where rows[i] came from the
 	// store's committed rows rather than its overlay (rowStore.eachOf).
 	rowsBase []uint64
@@ -604,7 +608,7 @@ func (cur *vdbeCursor) rewind() error {
 						cur.rowids = append(cur.rowids, rid)
 					})
 					cur.lazyNorm = lazy
-					cur.rowsFrom, cur.rowsSwaps = tbl.rows, tbl.rows.swaps
+					cur.rowsFrom, cur.rowsSwaps, cur.rowsWrites = tbl.rows, tbl.rows.swaps, tbl.rows.writes
 					cur.writeHint = len(cur.rows)
 					if !slices.IsSorted(cur.rowids) { // the short rows come unioned at the end
 						sortRowsByRowid(cur)
@@ -1144,17 +1148,17 @@ func (cur *vdbeCursor) materializeRowStore() {
 }
 
 // storedRow is the current row as the store handed it to this cursor, with
-// the store's swap count then, for rowStore.rowSeen; nil when the cursor holds
+// the store's swap and write counts then, for rowStore.rowSeen; nil when the cursor holds
 // no such row for rowid -- not materialized from st, or the row it holds is a
 // normalized copy rather than the store's own.
-func (cur *vdbeCursor) storedRow(st *rowStore, rowid uint64) ([]Value, uint32, seenOrigin) {
+func (cur *vdbeCursor) storedRow(st *rowStore, rowid uint64) ([]Value, uint32, uint64, seenOrigin) {
 	if cur.rowStore == nil || st == nil || cur.rowsFrom != st || !cur.lazyNorm ||
 		cur.pos < 0 || cur.pos >= len(cur.rows) || cur.pos >= len(cur.rowids) || cur.rowids[cur.pos] != rowid {
-		return nil, 0, seenUnknown
+		return nil, 0, 0, seenUnknown
 	}
 	row := cur.rows[cur.pos]
 	if len(row) != len(cur.rowStore.cols) {
-		return nil, 0, seenUnknown // normalized when materialized: not the stored slice
+		return nil, 0, 0, seenUnknown // normalized when materialized: not the stored slice
 	}
 	origin := seenUnknown
 	if cur.rowsBase != nil {
@@ -1163,7 +1167,7 @@ func (cur *vdbeCursor) storedRow(st *rowStore, rowid uint64) ([]Value, uint32, s
 			origin = seenBase
 		}
 	}
-	return row, cur.rowsSwaps, origin
+	return row, cur.rowsSwaps, cur.rowsWrites, origin
 }
 
 // rowStoreNormalizesLazily reports whether a write cursor may hold tbl's stored

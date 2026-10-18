@@ -25,6 +25,9 @@ type rowStore struct {
 	// restores a prior map): the one way a row leaves m without a gone mark.
 	// rowSeen relies on it.
 	swaps uint32
+	// writes counts every put, drop and swap: while it has not moved, no row
+	// has entered or left m or the dropped set. rowSeen relies on it.
+	writes uint64
 
 	// max caches the largest rowid for nextRowidForTable. Cleared on drop
 	// to match SQLite's rowid reuse behavior.
@@ -151,7 +154,14 @@ func (s *rowStore) eachOf(rowids []uint64, fn func(rid uint64, vals []Value, bas
 // under a session. Where seen came from unknown, it was the base row exactly
 // when the base has rowid: a row leaves m only by a drop, which marks a base
 // rowid gone, or by a swap. Anything else reads the store as row() does.
-func (s *rowStore) rowSeen(rowid uint64, seen []Value, swaps uint32, origin seenOrigin) []Value {
+//
+// writes is the store's write count when seen was known to be the base row
+// still: if nothing has written the store since, a base row is still the
+// store's row with no lookup at all.
+func (s *rowStore) rowSeen(rowid uint64, seen []Value, swaps uint32, writes uint64, origin seenOrigin) []Value {
+	if seen != nil && origin == seenBase && s.writes == writes && s.swaps == swaps && s.seg != nil {
+		return seen
+	}
 	if seen == nil || origin == seenOverlay || s.seg == nil || s.swaps != swaps || s.baseGone || s.gone[rowid] {
 		return s.row(rowid)
 	}
@@ -243,7 +253,11 @@ func (s *rowStore) putHeld(rowid uint64, vals, held []Value) {
 				s.n++
 			}
 		}
-		delete(s.gone, rowid)
+		if held == nil {
+			// A held row is a row the store holds, and a dropped rowid holds
+			// none: only an unheld rowid can be in the dropped set.
+			delete(s.gone, rowid)
+		}
 	} else if held != nil {
 		old, haveOld = held, true
 	} else if s.sortedValid || len(s.eqIdx) > 0 || len(s.uqIdx) > 0 || s.logging {
@@ -262,6 +276,7 @@ func (s *rowStore) putHeld(rowid uint64, vals, held []Value) {
 		}
 	}
 	n0 := len(s.m)
+	s.writes++
 	s.m[rowid] = vals
 	if len(s.m) != n0 {
 		s.overValid = false
@@ -304,6 +319,7 @@ func (s *rowStore) clear() int64 {
 		}
 		s.m, s.gone, s.baseGone, s.n, s.nKnown = map[uint64][]Value{}, nil, true, 0, true
 		s.swaps++
+		s.writes++
 		s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false
 		s.ubKnown = false
 		s.overValid, s.memBytes, s.unspilt = false, 0, nil
@@ -319,6 +335,7 @@ func (s *rowStore) clear() int64 {
 	}
 	s.m = map[uint64][]Value{}
 	s.swaps++
+	s.writes++
 	s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false
 	s.ubKnown = false
 	s.overValid, s.memBytes, s.unspilt = false, 0, nil
@@ -329,6 +346,7 @@ func (s *rowStore) clear() int64 {
 }
 
 func (s *rowStore) drop(rowid uint64) {
+	s.writes++
 	// Unconditional, including for a rowid the store does not hold: clearing
 	// is always safe, and gating it on a lookup would cost the delete's own
 	// map probe twice over.

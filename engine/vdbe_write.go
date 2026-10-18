@@ -3965,8 +3965,9 @@ func (m *vdbe) opUpdateRow(op *Instruction) (int, error) {
 	// columns the statement does not assign are re-read from the store (ticket
 	// e25d9ea771, triggerC.test 10.3). Done before computeGeneratedInto. Read once;
 	// the restore arms below reuse it.
-	seen, swaps, origin := m.cursors[op.P1].storedRow(tbl.rows, oldRowid)
-	oldVals := tbl.rows.rowSeen(oldRowid, seen, swaps, origin)
+	cur := m.cursors[op.P1]
+	seen, swaps, writes, origin := cur.storedRow(tbl.rows, oldRowid)
+	oldVals := tbl.rows.rowSeen(oldRowid, seen, swaps, writes, origin)
 	if plan.setCol != nil {
 		for i := range full {
 			if i >= len(plan.setCol) || plan.setCol[i] {
@@ -4097,7 +4098,13 @@ func (m *vdbe) opUpdateRow(op *Instruction) (int, error) {
 			tbl.putRow(newRowid, full)
 		} else if oldVals != nil {
 			// Nothing has written the store since oldVals was read from it.
+			synced := tbl.rows != nil && tbl.rows.writes == writes && origin == seenBase
 			tbl.putRowOver(newRowid, full, oldVals)
+			if synced {
+				// The one write since is this row's own, and the cursor's
+				// rowids are distinct: its rows still to come are untouched.
+				cur.rowsWrites = tbl.rows.writes
+			}
 		} else {
 			tbl.putRow(newRowid, full)
 		}
@@ -4119,7 +4126,7 @@ func (m *vdbe) opUpdateRow(op *Instruction) (int, error) {
 		return -1, err
 	}
 	m.wctx.undoMove(tbl, newRowid, oldRowid, oldVals)
-	m.wctx.db.noteRowUpdate(tbl, oldRowid, newRowid, oldVals, full) // capture log (rowhook.go)
+	m.wctx.db.noteRowUpdate(tbl, oldRowid, newRowid, oldVals, full)             // capture log (rowhook.go)
 	m.wctx.db.fkRowMutated(tbl, oldRowid, newRowid, oldVals, full, plan.setCol) // fkColMask of colIdx, built once
 	m.wctx.rowsAffected++
 	return -1, nil
