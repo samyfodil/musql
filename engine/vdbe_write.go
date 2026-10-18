@@ -5284,9 +5284,11 @@ type undoEntry struct {
 	putRid    uint64
 	putVals   []Value
 	drop, put bool
-	// putBase: the row put back is putRid's committed row, read again from the
-	// store's committed rows (undoBase).
-	putBase bool
+	// putBase: the rows put back are committed rows, read again from the
+	// store's committed rows (undoBase): putRid's, and every rowid in
+	// baseRids, which consecutive in-place writes to one table share.
+	putBase  bool
+	baseRids []uint64
 	// dropMore is how many further consecutive rowids, after dropRid, this
 	// entry drops: an INSERT of rowids n, n+1, n+2 ... into one table is one
 	// entry, not one per row.
@@ -5312,14 +5314,17 @@ func (e *undoEntry) run() {
 		}
 	}
 	if e.put {
-		vals := e.putVals
 		if e.putBase {
-			if vals = e.tbl.rows.committedRow(e.putRid); vals == nil {
-				e.tbl.dropRow(e.putRid) // no committed row to restore: none was there
-				return
+			for _, rid := range e.baseRids {
+				if vals := e.tbl.rows.committedRow(rid); vals != nil {
+					e.tbl.putRow(rid, vals)
+				} else {
+					e.tbl.dropRow(rid) // no committed row to restore: none was there
+				}
 			}
+			return
 		}
-		e.tbl.putRow(e.putRid, vals)
+		e.tbl.putRow(e.putRid, e.putVals)
 	}
 }
 
@@ -5358,8 +5363,18 @@ func (wc *writeCtx) undoDrop(tbl *tableMeta, rid uint64) {
 
 // undoBase journals putting rid's committed row back, for an update that wrote
 // its new values over the only copy of the old ones (updateRow's inPlace).
+//
+// Consecutive ones on one table extend the last entry's list, as undoDrop's
+// runs do: each rowid is put back from its own committed row, so the order
+// within the list does not matter.
 func (wc *writeCtx) undoBase(tbl *tableMeta, rid uint64) {
-	wc.journalAppend(undoEntry{tbl: tbl, putRid: rid, put: true, putBase: true})
+	if n := len(wc.journal); n > 0 {
+		if l := &wc.journal[n-1]; l.putBase && l.tbl == tbl {
+			l.baseRids = append(l.baseRids, rid)
+			return
+		}
+	}
+	wc.journalAppend(undoEntry{tbl: tbl, put: true, putBase: true, baseRids: []uint64{rid}})
 }
 
 // undoMove journals an update's inverse: drop the row at newRid, then put
