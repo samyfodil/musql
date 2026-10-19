@@ -152,19 +152,14 @@ export async function fillMissing(tbl, e, progress = () => {}) {
 	return done;
 }
 
-/**
- * An fts5 query matching any word of s, as a SQL string literal, or "" when s
- * has none. Every word is letters, digits and '_' inside double quotes, so the
- * literal needs no escaping. A literal, not a parameter: this engine ranks
- * (ORDER BY rank) only a MATCH on a literal.
- */
+/** An fts5 query matching any word of s, or "" when s has none. */
 // STOP is the English words too common to rank by: matching "and" or "the"
 // would lift nearly every row.
 const STOP = new Set("a an and are as at be but by for from has have in into is it its of on or that the their this to was were will with what which who how".split(" "));
 
-function anyWordLiteral(s) {
+function anyWord(s) {
 	const words = (s.match(/[\p{L}\p{N}_]+/gu) ?? []).filter((w) => !STOP.has(w.toLowerCase()));
-	return words.length ? `'${words.map((w) => `"${w}"`).join(" OR ")}'` : "";
+	return words.map((w) => `"${w}"`).join(" OR ");
 }
 
 /**
@@ -178,11 +173,11 @@ export async function search(tbl, e, text, keywords) {
 	const blob = vectorBlob(q);
 	const t = ident(tbl);
 	const v = ident(e.vec);
-	const words = keywords && e.fts ? anyWordLiteral(text) : "";
+	const words = keywords && e.fts ? anyWord(text) : "";
 	if (words) {
 		const f = ident(e.fts);
 		const m = await query(`SELECT rowid FROM ${t} WHERE ${v} IS NOT NULL ORDER BY vector_distance_cos(${v}, ?) LIMIT 50`, [blob]);
-		const k = await query(`SELECT rowid FROM ${f} WHERE ${f} MATCH ${words} ORDER BY rank LIMIT 50`);
+		const k = await query(`SELECT rowid FROM ${f} WHERE ${f} MATCH ? ORDER BY rank LIMIT 50`, [words]);
 		// Reciprocal rank fusion: each list adds 1/(60 + rank) to a row's score.
 		const score = new Map();
 		for (const list of [m.rows, k.rows]) list.forEach(([id], i) => score.set(id, (score.get(id) ?? 0) + 1 / (61 + i)));
