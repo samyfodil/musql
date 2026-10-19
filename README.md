@@ -262,11 +262,25 @@ one thread unless noted, on a 4-core amd64 server
 | `vector_top_k`, 100k random vectors | **15.2 ms, exact** | 33.3 ms, recall 6/10 |
 | Brute-force KNN, 100k rows, cosine | 209 ms (60 ms on 4 cores) | 264 ms |
 | Brute-force KNN, 100k rows, L2 | 215 ms (61 ms on 4 cores) | 216 ms |
-| Insert 2,000 vectors as text | 255 ms | **188 ms** |
+| Insert 2,000 vectors as text | 186–194 ms | 174–186 ms |
 
 libSQL's index answers from a DiskANN graph and can miss neighbours;
 musql's default index returns the exact top 10 and is still faster here.
-Inserting vectors as text is slower than libSQL today.
+
+`vec1` against C SQLite with vec1 built for speed (AVX2/FMA), 100,000
+clustered vectors of 384 dimensions, one thread, mean of 200 queries, on an
+amd64 Xeon D ([benchmark](compat-harness/vec1/bench_test.go)):
+
+| Index | musql query | C SQLite query | recall@10 (musql / C) | musql train + build | C train + build |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| flat | **25.0 ms** | 72.5 ms | 1.000 / 1.000 | 0.8 s | 0.9 s |
+| ivf | **8.5 ms** | 19.3 ms | 1.000 / 1.000 | 2.8 s | 3.8 s |
+| ivfpq | **1.30 ms** | 1.86 ms | 0.999 / 0.999 | 12.1 s | 16.5 s |
+| ivfopq | **0.99 ms** | 1.30 ms | 0.990 / 0.993 | 60.1 s | 71.5 s |
+| ivfbq | **0.98 ms** | 1.33 ms | 0.994 / 0.996 | 2.7 s | 3.5 s |
+
+Inserting the 100,000 rows takes about the same time in both (0.59–0.63 s
+for musql, 0.52–0.64 s for C).
 
 ## Serve it to Turso and libSQL clients
 
