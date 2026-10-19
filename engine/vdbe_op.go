@@ -1172,9 +1172,10 @@ type Program struct {
 	// statement's verb.
 	FKReach fkReach
 
-	// FKShape is what the statement assigns, for the same check; nil when
-	// unknown.
-	FKShape *fkStmtShape
+	// FKShape is what the statement assigns, for the same check, parsed from
+	// the statement's text when the check first needs it: a statement with
+	// foreign keys off never does, and its text can be megabytes of literals.
+	FKShape *fkShapeLazy
 
 	// Correlated marks a sub-Program that references at least one outer-scope
 	// column (it emitted an OpOuterColumn/OpOuterRowid, or transitively

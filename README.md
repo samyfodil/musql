@@ -28,13 +28,16 @@ data, or replicate a database across nodes that need to work independently.
   with vectorized filter kernels on supported CPUs.
 - **Familiar SQL.** Joins, window functions, triggers, JSON, full-text search,
   and R-tree indexes are part of the engine.
+- **Vector search.** libSQL's vector functions, column types and
+  `libsql_vector_idx` / `vector_top_k`, plus SQLite's `vec1` extension.
 - **SQLite import and export.** Move databases between SQLite and musql's
   `.musq` format with `musql-convert`.
 - **Replication over your own network.** Choose CRDT replication for independent
   writers, or leader mode with optional consensus integration.
 
 [Get started](#get-started) · [Performance](#performance) ·
-[SQLite compatibility](#sqlite-compatibility) · [Replication](#replicate-a-database) ·
+[SQLite compatibility](#sqlite-compatibility) · [Vectors](#vector-search) ·
+[Replication](#replicate-a-database) ·
 [How it works](#how-it-works) · [DOOM](#yes-it-runs-doom) ·
 [Development](#development)
 
@@ -134,6 +137,19 @@ SQLite by a large multiple on scans. Per-machine timings, the 1M-row runs, the
 multithreaded comparison with DuckDB and the cost of calling C from Go are in
 [docs/benchmarks.md](docs/benchmarks.md).
 
+Writes, through `database/sql` against C SQLite through `mattn/go-sqlite3`
+([`TestBenchVsC`](compat-harness/bench_vs_c_test.go), best of 5 rounds,
+amd64 Xeon D). Lower is better; under 1.0× means musql is faster:
+
+| Write workload | musql time ÷ C SQLite time |
+| --- | ---: |
+| Batch `INSERT`, per row | 0.82–0.97× |
+| Bulk `UPDATE ... WHERE k = ?`, per statement | 0.95–0.98× |
+| Bulk `DELETE`, per statement | 0.30–0.33× |
+
+A bulk `UPDATE` runs its loop as native code, writes rows in place, and
+records each changed row as a patch of its changed columns in the delta.
+
 The current engine uses segment storage with a writable delta. Its
 [comparison harness](compat-harness/bench_columnar_vs_c_test.go) measures both
 musql's direct engine and `database/sql` paths, alongside C SQLite and Turso.
@@ -211,6 +227,60 @@ By default, musql returns stored values without that conversion. `_loc=auto`
 uses `time.Local`; a named time zone can be supplied instead. The
 [driver compatibility notes](docs/swap-readiness.md#the-one-driver-level-difference-and-the-flag-that-closes-it)
 describe the conversion rules.
+
+## Vector search
+
+musql speaks libSQL's vector SQL: `vector()`, `vector32()` and the other
+constructors, `vector_extract()`, `vector_distance_cos()` and
+`vector_distance_l2()`, the `F32_BLOB(n)` family of column types, and
+libSQL's index and search:
+
+```sql
+CREATE TABLE docs(id INTEGER PRIMARY KEY, emb F32_BLOB(384));
+CREATE INDEX docs_emb ON docs(libsql_vector_idx(emb));
+SELECT id FROM vector_top_k('docs_emb', vector(?), 10);
+```
+
+Vectors use libSQL's byte layout, and distances match libSQL's to the bit.
+An index with no options searches **exactly**: it ranks every row, with JIT kernels where it can, by
+its true distance, so recall is always 10/10. From 100,000 rows, or when
+any of libSQL's graph options is given, it walks an approximate graph built
+in the background, and searches exactly until that graph is ready.
+
+SQLite's own vector extension, [`vec1`](https://sqlite.org/vec1), is also
+built in (`CREATE VIRTUAL TABLE t USING vec1(...)`). Its tables are ordinary
+tables, so a database holding one converts to and from C SQLite like any
+other.
+
+Against libSQL through its Go driver, 384-dimension float32 vectors, top 10,
+one thread unless noted, on a 4-core amd64 server
+([benchmarks](compat-harness/libsql/bench_test.go)):
+
+| Workload | musql | libSQL |
+| --- | ---: | ---: |
+| `vector_top_k`, 100k clustered vectors | **4.1 ms, exact** | 27.5 ms, recall 10/10 |
+| `vector_top_k`, 100k random vectors | **15.2 ms, exact** | 33.3 ms, recall 6/10 |
+| Brute-force KNN, 100k rows, cosine | 209 ms (60 ms on 4 cores) | 264 ms |
+| Brute-force KNN, 100k rows, L2 | 215 ms (61 ms on 4 cores) | 216 ms |
+| Insert 2,000 vectors as text | **125–134 ms** | 173–185 ms |
+
+libSQL's index answers from a DiskANN graph and can miss neighbours;
+musql's default index returns the exact top 10 and is still faster here.
+
+`vec1` against C SQLite with vec1 built for speed (AVX2/FMA), 100,000
+clustered vectors of 384 dimensions, one thread, mean of 200 queries, on an
+amd64 Xeon D ([benchmark](compat-harness/vec1/bench_test.go)):
+
+| Index | musql query | C SQLite query | recall@10 (musql / C) | musql train + build | C train + build |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| flat | **25.0 ms** | 72.5 ms | 1.000 / 1.000 | 0.8 s | 0.9 s |
+| ivf | **8.5 ms** | 19.3 ms | 1.000 / 1.000 | 2.8 s | 3.8 s |
+| ivfpq | **1.30 ms** | 1.86 ms | 0.999 / 0.999 | 12.1 s | 16.5 s |
+| ivfopq | **0.99 ms** | 1.30 ms | 0.990 / 0.993 | 60.1 s | 71.5 s |
+| ivfbq | **0.98 ms** | 1.33 ms | 0.994 / 0.996 | 2.7 s | 3.5 s |
+
+Inserting the 100,000 rows takes about the same time in both (0.59–0.63 s
+for musql, 0.52–0.64 s for C).
 
 ## Serve it to Turso and libSQL clients
 

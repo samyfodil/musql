@@ -2478,6 +2478,7 @@ func parseParamInfo(sqlText string) (ParamInfo, error) {
 		}
 		return stmt.Params, nil
 	case "INSERT", "REPLACE": // see Exec's identical "REPLACE INTO" case above
+		vecPrefetchTokens(toks) // its vectors parse while the statement does
 		stmt, err := parseInsertStmtToks(trimmed, toks)
 		if err != nil {
 			return ParamInfo{}, err

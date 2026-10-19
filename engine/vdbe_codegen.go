@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"unsafe"
 )
 
 // compiler accumulates a Program under construction. scopes is empty for a
@@ -2873,7 +2874,10 @@ func (c *compiler) compileLiteral(v Value) int {
 	case Float:
 		c.emit(Instruction{Op: OpReal, P2: r, P4: v.F})
 	case Text:
-		c.emit(Instruction{Op: OpString8, P2: r, P4: string(v.S)})
+		// The program shares the literal's bytes, the parser's own copy of
+		// them, which nothing writes: a statement of long literals (vectors as
+		// text) otherwise copies every one of them again here.
+		c.emit(Instruction{Op: OpString8, P2: r, P4: unsafe.String(unsafe.SliceData(v.S), len(v.S))})
 	case Blob:
 		c.emit(Instruction{Op: OpBlob, P2: r, P4: append([]byte(nil), v.S...)})
 	default:

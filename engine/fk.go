@@ -100,6 +100,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // The ON DELETE / ON UPDATE actions, spelled as parseFKAction canonicalizes
@@ -656,7 +657,7 @@ func (db *DB) fkCheckTargets(prog *Program) error {
 		return nil
 	}
 	for _, tbl := range prog.FKTargets {
-		if err := db.fkRequireResolvable(tbl, prog.FKReach, prog.FKShape); err != nil {
+		if err := db.fkRequireResolvable(tbl, prog.FKReach, prog.FKShape.get()); err != nil {
 			return err
 		}
 	}
@@ -763,6 +764,25 @@ type fkStmtShape struct {
 
 // fkShapeOf parses the statement once more for the facts the resolution check
 // needs; a statement that does not parse here has no shape.
+// fkShapeLazy is fkShapeOf(kw, sql), computed once, when first asked for.
+type fkShapeLazy struct {
+	kw, sql string
+	once    sync.Once
+	shape   *fkStmtShape
+}
+
+// get is the shape; nil when unknown, as from fkShapeOf, or for a nil l.
+func (l *fkShapeLazy) get() *fkStmtShape {
+	if l == nil {
+		return nil
+	}
+	l.once.Do(func() {
+		l.shape = fkShapeOf(l.kw, l.sql)
+		l.sql = ""
+	})
+	return l.shape
+}
+
 func fkShapeOf(kw, sqlText string) *fkStmtShape {
 	switch kw {
 	case "UPDATE":

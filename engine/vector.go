@@ -31,6 +31,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"unsafe"
 )
 
 // vecType is a vector's component type, numbered as libSQL's type byte.
@@ -76,6 +78,9 @@ type vector struct {
 	dims         int
 	data         []byte
 	alpha, shift float32
+	// owned is data held by nothing else (parsed from text), which blob may
+	// then hand over instead of copying.
+	owned bool
 }
 
 func vecErr(format string, a ...any) error {
@@ -497,6 +502,14 @@ func vecMemoSlot(t vecType) int {
 	return 0
 }
 
+// vecMemoHas reports whether the table holds s parsed as type t.
+func vecMemoHas(s []byte, t vecType) bool {
+	vecMemo.Lock()
+	defer vecMemo.Unlock()
+	_, ok := vecMemo.m[vecMemoSlot(t)][string(s)]
+	return ok
+}
+
 // vecMemoTake returns the components of s parsed ahead as type t, removing them.
 func vecMemoTake(s []byte, t vecType) ([]byte, bool) {
 	vecMemo.Lock()
@@ -544,12 +557,56 @@ func vecPrefetch(texts [][]byte, t vecType) {
 	m := make(map[string][]byte, len(texts))
 	for i, d := range data {
 		if d != nil {
-			m[string(texts[i])] = d
+			// The key shares the literal's bytes: the statement's own, which
+			// nothing writes, and the table is replaced by the next prefetch.
+			m[unsafe.String(unsafe.SliceData(texts[i]), len(texts[i]))] = d
 		}
 	}
 	vecMemo.Lock()
 	vecMemo.m[vecMemoSlot(t)] = m
 	vecMemo.Unlock()
+}
+
+// vecAhead is the prefetch vecPrefetchTokens last started: done is closed once
+// it has published its table. Whoever might take from the table waits for it
+// first, so a text it holds is not parsed twice.
+var vecAhead atomic.Pointer[chan struct{}]
+
+// vecAheadWait waits for the prefetch vecPrefetchTokens last started.
+func vecAheadWait() {
+	if d := vecAhead.Load(); d != nil {
+		<-*d
+	}
+}
+
+// vecPrefetchTokens starts the prefetch of a statement's vector('...') and
+// vector32('...') literals from its tokens, on goroutines of its own, so the
+// components parse while the statement does; vecPrefetchRows, at compile,
+// finds them done. Same table, same answers: only when the work happens moves.
+func vecPrefetchTokens(toks []token) {
+	var texts [][]byte
+	total := 0
+	for i := 0; i+3 < len(toks); i++ {
+		t := &toks[i]
+		if t.kind != tkIdent || t.quoted || !(strings.EqualFold(t.text, "vector") || strings.EqualFold(t.text, "vector32")) {
+			continue
+		}
+		if a, l, b := &toks[i+1], &toks[i+2], &toks[i+3]; a.kind != tkPunct || a.text != "(" || l.kind != tkString || b.kind != tkPunct || b.text != ")" || l.str == "" {
+			continue
+		}
+		s := toks[i+2].str
+		texts = append(texts, unsafe.Slice(unsafe.StringData(s), len(s))) // read only
+		total += len(s)
+	}
+	if vecWorkers < 2 || len(texts) < vecPrefetchMinTexts || total < vecPrefetchMin || total > vecPrefetchMax {
+		return
+	}
+	done := make(chan struct{})
+	vecAhead.Store(&done)
+	go func() {
+		defer close(done)
+		vecPrefetch(texts, vecF32)
+	}()
 }
 
 // vecPrefetchRows prefetches the vector literals of an INSERT's VALUES rows: a
@@ -575,17 +632,24 @@ func vecPrefetchRows(rows [][]Expr) {
 			}
 		}
 	}
+	// Started from the tokens already (vecPrefetchTokens): done, unless another
+	// statement's prefetch has replaced the table since.
+	vecAheadWait()
+	if len(f32) > 0 && vecMemoHas(f32[0], vecF32) {
+		f32 = nil
+	}
 	vecPrefetch(f32, vecF32)
 	vecPrefetch(f64, vecF64)
 }
 
 func parseVectorText(s []byte, t vecType) (vector, error) {
+	vecAheadWait()
 	if d, ok := vecMemoTake(s, t); ok {
 		w := 4
 		if t == vecF64 {
 			w = 8
 		}
-		return vector{typ: t, dims: len(d) / w, data: d}, nil
+		return vector{typ: t, dims: len(d) / w, data: d, owned: true}, nil
 	}
 	return parseVectorTextRaw(s, t)
 }
@@ -707,7 +771,7 @@ func parseVectorTextRaw(s []byte, t vecType) (vector, error) {
 	if i < len(s) && s[i] != 0 {
 		return vector{}, vecErr("vector: non-space symbols after closing ']' are forbidden")
 	}
-	return vector{typ: t, dims: n, data: data}, nil
+	return vector{typ: t, dims: n, data: data, owned: true}, nil
 }
 
 // ---- components --------------------------------------------------------------
@@ -910,6 +974,9 @@ func (v vector) blob() []byte {
 		b = binary.LittleEndian.AppendUint32(b, math.Float32bits(v.alpha))
 		b = binary.LittleEndian.AppendUint32(b, math.Float32bits(v.shift))
 		return append(b, 0, byte(align4(v.dims)-v.dims), byte(vecF8))
+	}
+	if v.owned && v.typ == vecF32 {
+		return v.data
 	}
 	b := append([]byte(nil), v.data...)
 	switch v.typ {
