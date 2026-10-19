@@ -312,8 +312,10 @@ func compileScanAggregate(c *compiler, stmt *SelectStmt, srcs []joinSource, scop
 	// row-live.
 	savedRowLive, savedOrderFree := c.rowLive, c.rowOrderFree
 	c.rowLive = true
-	c.rowOrderFree = !usesGroupBare && !subRead && !anyOrderSensitive(allAggs)
-	plan.rowFree = !usesGroupBare && !subRead && plan.anchorCheck == nil && !anyAggOrderBy(allAggs)
+	// A bare column in HAVING reads the anchor row as one in the select list
+	// does, but usesGroupBare counts only the select list: so no HAVING at all.
+	c.rowOrderFree = !usesGroupBare && !subRead && stmt.Having == nil && !anyOrderSensitive(allAggs)
+	plan.rowFree = !usesGroupBare && !subRead && stmt.Having == nil && plan.anchorCheck == nil && !anyAggOrderBy(allAggs)
 	err := aggLoopNQueryLoop(c, savedNQueryLoopKnown, func() error { return emitJoinLoops(c, srcs, jplan, body) })
 	c.rowLive, c.rowOrderFree = savedRowLive, savedOrderFree
 	if err != nil {
