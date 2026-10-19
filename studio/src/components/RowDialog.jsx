@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 
-/** The new-row form. onClose(values) on Insert, onClose(null) otherwise. */
+/**
+ * The new-row form. onClose(values) on Insert, onClose(null) otherwise; each
+ * value is the field's text, which the caller stores by the column's type.
+ */
 export default function RowDialog({ name, cols, onClose }) {
 	const ref = useRef(null);
 	const [values, setValues] = useState(() => Object.fromEntries(cols.map((c) => [c.name, ""])));
@@ -14,7 +17,7 @@ export default function RowDialog({ name, cols, onClose }) {
 				}}
 			>
 				<h2>New row in {name}</h2>
-				<p className="dim small">Leave a field empty for the column's default.</p>
+				<p className="dim small">Leave a field empty for the column's default. A number in single quotes, '42', is stored as text.</p>
 				<div className="fields">
 					{cols.map((c, i) => (
 						<label key={c.name} className="field">

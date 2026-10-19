@@ -1,28 +1,32 @@
 // Text embeddings for semantic search, in a worker of their own so a model
-// download or a large batch never stalls the database worker. The model is
-// all-MiniLM-L6-v2 (384 dimensions, quantized): fetched from the Hugging Face
-// hub on first use and cached by the browser after that.
+// download or a large batch never stalls the database worker. Each model is
+// fetched from the Hugging Face hub on first use (quantized) and cached by the
+// browser after that; several can be loaded at once.
 import { pipeline } from "@huggingface/transformers";
 
-const MODEL = "Xenova/all-MiniLM-L6-v2";
-let extractor;
+const extractors = new Map();
 
-function load() {
-	extractor ??= pipeline("feature-extraction", MODEL, {
-		dtype: "q8",
-		progress_callback: (p) => {
-			if (p.status === "progress") postMessage({ progress: { file: p.file, loaded: p.loaded, total: p.total } });
-		},
-	});
-	return extractor;
+function load(model) {
+	if (!extractors.has(model)) {
+		extractors.set(
+			model,
+			pipeline("feature-extraction", model, {
+				dtype: "q8",
+				progress_callback: (p) => {
+					if (p.status === "progress") postMessage({ progress: { model, file: p.file, loaded: p.loaded, total: p.total } });
+				},
+			}),
+		);
+	}
+	return extractors.get(model);
 }
 
-// embed answers {id, texts} with one Float32Array of texts.length * 384
-// components, each row mean-pooled and normalized.
-onmessage = async ({ data: { id, texts } }) => {
+// embed answers {id, model, pooling, texts} with one Float32Array of
+// texts.length * dims components, each row pooled and normalized.
+onmessage = async ({ data: { id, model, pooling, texts } }) => {
 	try {
-		const run = await load();
-		const out = await run(texts, { pooling: "mean", normalize: true });
+		const run = await load(model);
+		const out = await run(texts, { pooling, normalize: true });
 		const data = out.data instanceof Float32Array ? out.data : Float32Array.from(out.data);
 		postMessage({ id, data, dims: out.dims.at(-1) }, [data.buffer]);
 	} catch (e) {
