@@ -853,7 +853,7 @@ func (db *DB) compileWriteProgram(sqlText string) (*Program, error) {
 			if tbl := db.findTableMetaIn(writeTargetScope(fkSchema), fkTable); tbl != nil {
 				prog.FKTargets = []*tableMeta{tbl}
 				prog.FKReach = fkStatementReach(kw, toks, verbAt)
-				prog.FKShape = fkShapeOf(kw, sqlText)
+				prog.FKShape = &fkShapeLazy{kw: kw, sql: sqlText}
 			}
 		}
 		return prog, err

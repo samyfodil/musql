@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unsafe"
 )
 
 // vecType is a vector's component type, numbered as libSQL's type byte.
@@ -76,6 +77,9 @@ type vector struct {
 	dims         int
 	data         []byte
 	alpha, shift float32
+	// owned is data held by nothing else (parsed from text), which blob may
+	// then hand over instead of copying.
+	owned bool
 }
 
 func vecErr(format string, a ...any) error {
@@ -544,7 +548,9 @@ func vecPrefetch(texts [][]byte, t vecType) {
 	m := make(map[string][]byte, len(texts))
 	for i, d := range data {
 		if d != nil {
-			m[string(texts[i])] = d
+			// The key shares the literal's bytes: the statement's own, which
+			// nothing writes, and the table is replaced by the next prefetch.
+			m[unsafe.String(unsafe.SliceData(texts[i]), len(texts[i]))] = d
 		}
 	}
 	vecMemo.Lock()
@@ -585,7 +591,7 @@ func parseVectorText(s []byte, t vecType) (vector, error) {
 		if t == vecF64 {
 			w = 8
 		}
-		return vector{typ: t, dims: len(d) / w, data: d}, nil
+		return vector{typ: t, dims: len(d) / w, data: d, owned: true}, nil
 	}
 	return parseVectorTextRaw(s, t)
 }
@@ -707,7 +713,7 @@ func parseVectorTextRaw(s []byte, t vecType) (vector, error) {
 	if i < len(s) && s[i] != 0 {
 		return vector{}, vecErr("vector: non-space symbols after closing ']' are forbidden")
 	}
-	return vector{typ: t, dims: n, data: data}, nil
+	return vector{typ: t, dims: n, data: data, owned: true}, nil
 }
 
 // ---- components --------------------------------------------------------------
@@ -910,6 +916,9 @@ func (v vector) blob() []byte {
 		b = binary.LittleEndian.AppendUint32(b, math.Float32bits(v.alpha))
 		b = binary.LittleEndian.AppendUint32(b, math.Float32bits(v.shift))
 		return append(b, 0, byte(align4(v.dims)-v.dims), byte(vecF8))
+	}
+	if v.owned && v.typ == vecF32 {
+		return v.data
 	}
 	b := append([]byte(nil), v.data...)
 	switch v.typ {
