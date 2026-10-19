@@ -10,9 +10,12 @@
 //
 //	musql_open(pathLen)              -> handle > 0, or -(n+1): an n-byte {"error"} in the outbuf
 //	musql_close(handle)
-//	musql_query(handle, sqlLen, argsLen) -> outLen: {"columns","rows"} or {"error"}
+//	musql_query(handle, sqlLen, argsLen) -> outLen: {"columns","types","rows"} or {"error"}
 //	musql_exec(handle, sqlLen, argsLen)  -> outLen: {"changes","lastInsertRowid"} or {"error"}
 //	musql_convert(toSQLite, srcLen, dstLen) -> outLen: {} or {"error"}
+//	musql_split(sqlLen)              -> outLen: {"statements"} or {"error"}
+//
+// A query's types are its columns' declared types, "" where a column has none.
 //
 // An argument is a tag byte then its value: 0 NULL, 1 int64 (8 bytes LE),
 // 2 float64 (8 bytes LE), 3 text and 4 blob (a 4-byte LE length, then the
@@ -21,6 +24,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
@@ -33,6 +37,7 @@ import (
 
 	sqlite "github.com/samyfodil/musql/convert/sqlite"
 	"github.com/samyfodil/musql/driver"
+	"github.com/samyfodil/musql/engine"
 )
 
 type conn struct {
@@ -81,6 +86,18 @@ func musqlOpen(pathLen uint32) int32 {
 	// One connection: the statements of one handle run in order, as a
 	// SQLite connection's do, and see each other's writes.
 	db.SetMaxOpenConns(1)
+	// Results carry declared types (driver.Conn.ReportDeclTypes): a page tells a
+	// vector column from any other BLOB by its F32_BLOB(n). The one connection
+	// stays in the pool, and the setting with it.
+	if cn, cerr := db.Conn(context.Background()); cerr == nil {
+		cn.Raw(func(dc any) error {
+			if c, ok := dc.(*driver.Conn); ok {
+				c.ReportDeclTypes(true)
+			}
+			return nil
+		})
+		cn.Close()
+	}
 	nextID++
 	conns[nextID] = &conn{db: db, stmts: map[string]*sql.Stmt{}}
 	return nextID
@@ -102,9 +119,9 @@ func musqlQuery(h int32, sqlLen, argsLen uint32) uint32 {
 	c, q, args, err := request(h, sqlLen, argsLen)
 	if err == nil {
 		var rows [][]any
-		var cols []string
-		if rows, cols, err = c.query(q, args); err == nil {
-			outBuf = appendRows(outBuf[:0], cols, rows)
+		var cols, types []string
+		if rows, cols, types, err = c.query(q, args); err == nil {
+			outBuf = appendRows(outBuf[:0], cols, types, rows)
 			return uint32(len(outBuf))
 		}
 	}
@@ -174,21 +191,27 @@ func request(h int32, sqlLen, argsLen uint32) (*conn, string, []any, error) {
 }
 
 // query runs q through its cached prepared statement and reads every row.
-func (c *conn) query(q string, args []any) ([][]any, []string, error) {
+func (c *conn) query(q string, args []any) ([][]any, []string, []string, error) {
 	st := c.stmts[q]
 	if st == nil {
 		var err error
 		if st, err = c.db.Prepare(q); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		c.stmts[q] = st
 	}
 	rows, err := st.Query(args...)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer rows.Close()
 	cols, _ := rows.Columns()
+	types := make([]string, len(cols))
+	if cts, terr := rows.ColumnTypes(); terr == nil {
+		for i, ct := range cts {
+			types[i] = ct.DatabaseTypeName()
+		}
+	}
 	var out [][]any
 	for rows.Next() {
 		vals := make([]any, len(cols))
@@ -197,11 +220,11 @@ func (c *conn) query(q string, args []any) ([][]any, []string, error) {
 			ptrs[i] = &vals[i]
 		}
 		if err := rows.Scan(ptrs...); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		out = append(out, vals)
 	}
-	return out, cols, rows.Err()
+	return out, cols, types, rows.Err()
 }
 
 var errArg = errors.New("musql: malformed argument buffer")
@@ -247,15 +270,10 @@ func decodeArgs(b []byte) ([]any, error) {
 	return out, nil
 }
 
-func appendRows(b []byte, cols []string, rows [][]any) []byte {
-	b = append(b, `{"columns":[`...)
-	for i, c := range cols {
-		if i > 0 {
-			b = append(b, ',')
-		}
-		b = appendString(b, c)
-	}
-	b = append(b, `],"rows":[`...)
+func appendRows(b []byte, cols, types []string, rows [][]any) []byte {
+	b = appendStrings(append(b, `{"columns":`...), cols)
+	b = appendStrings(append(b, `,"types":`...), types)
+	b = append(b, `,"rows":[`...)
 	for i, r := range rows {
 		if i > 0 {
 			b = append(b, ',')
@@ -270,6 +288,32 @@ func appendRows(b []byte, cols []string, rows [][]any) []byte {
 		b = append(b, ']')
 	}
 	return append(b, "]}"...)
+}
+
+// appendStrings writes ss as a JSON array of strings.
+func appendStrings(b []byte, ss []string) []byte {
+	b = append(b, '[')
+	for i, s := range ss {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		b = appendString(b, s)
+	}
+	return append(b, ']')
+}
+
+// musql_split splits the inbuf's first sqlLen bytes into its statements, as
+// the engine does (a trigger body is one statement with the CREATE TRIGGER).
+//
+//go:wasmexport musql_split
+func musqlSplit(sqlLen uint32) uint32 {
+	stmts, err := engine.SplitStatements(string(inBuf[:sqlLen]))
+	if err != nil {
+		outBuf = appendError(outBuf[:0], err)
+		return uint32(len(outBuf))
+	}
+	outBuf = append(appendStrings(append(outBuf[:0], `{"statements":`...), stmts), '}')
+	return uint32(len(outBuf))
 }
 
 func appendError(b []byte, err error) []byte {
