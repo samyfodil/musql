@@ -262,7 +262,7 @@ one thread unless noted, on a 4-core amd64 server
 | `vector_top_k`, 100k random vectors | **15.2 ms, exact** | 33.3 ms, recall 6/10 |
 | Brute-force KNN, 100k rows, cosine | 209 ms (60 ms on 4 cores) | 264 ms |
 | Brute-force KNN, 100k rows, L2 | 215 ms (61 ms on 4 cores) | 216 ms |
-| Insert 2,000 vectors as text | 186–194 ms | 174–186 ms |
+| Insert 2,000 vectors as text | 190–201 ms | **175–179 ms** |
 
 libSQL's index answers from a DiskANN graph and can miss neighbours;
 musql's default index returns the exact top 10 and is still faster here.
