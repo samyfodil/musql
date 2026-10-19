@@ -715,6 +715,9 @@ type indexSeekHint struct {
 	// leadingCol is the TABLE column the index leads on -- what a SEGMENT seek
 	// needs in place of an index b-tree. See indexSeekPlan.leadingCol.
 	leadingCol int
+	// index is the index's name, which EXPLAIN QUERY PLAN prints: a segment
+	// table's index has no root to look it up by.
+	index string
 }
 
 // multiOrOrder is the autoIndexKey variant OpAutoIndexOrder applies when the

@@ -399,6 +399,9 @@ func appendString(b []byte, s string) []byte {
 }
 
 func main() {
+	// fts5 is opt-in in the engine (RegisterFTS5) only so the default test
+	// oracle, built without it, agrees; a page has every module.
+	engine.RegisterFTS5()
 	// The package waits on this before its first call: the runtime is up and
 	// the exports may be called.
 	if ready := js.Global().Get("__musqlReady"); ready.Type() == js.TypeFunction {

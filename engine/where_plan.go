@@ -342,6 +342,7 @@ func wherePlanIndexOrderKey(idx *whereIndexInfo, rev bool) *autoIndexKey {
 		colls: append([]string(nil), idx.azColl...),
 		desc:  append([]bool(nil), idx.aSortOrder...),
 		root:  idx.root,
+		index: idx.name,
 	}
 	for j, c := range idx.aiColumn {
 		if c != xnExpr {
@@ -491,6 +492,10 @@ type autoIndexKey struct {
 	// so annotateJoinSeeks (vdbe_join_seek.go) can tell whether the correlated
 	// seek it is about to install walks the very index the planner chose.
 	root uint32
+	// index names that real index. A segment table's index has root 0 (the
+	// format keeps its SQL, not a b-tree), so for one the name is what tells
+	// it from an automatic index, which has neither.
+	index string
 
 	// nEq and groupsSorted are the real-index path's answers to select.c's GROUP
 	// BY codegen, which cannot re-derive them.

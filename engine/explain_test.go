@@ -51,17 +51,8 @@ func TestExplainQueryPlanText(t *testing.T) {
 	}{
 		{`EXPLAIN QUERY PLAN SELECT a FROM t WHERE a=1`, []string{"SEARCH t USING INTEGER PRIMARY KEY (rowid=?)"}},
 		{`EXPLAIN QUERY PLAN SELECT * FROM t`, []string{"SCAN t"}},
-		// SCAN, NOT "SEARCH t USING INDEX i1 (b=?)", and the difference is the
-		// FORMAT rather than the plan text being wrong. C SQLite searches; so did
-		// this engine when these fixtures were SQLite files. A segment database
-		// carries an index's SQL and not its DATA (segment_open.go), so there is
-		// nothing to seek and the read visits every row and applies the WHERE --
-		// same rows, and EXPLAIN QUERY PLAN says what actually happens rather than
-		// what a different format would have done. Index data in the format is a
-		// later, measurement-driven addition; when it lands, these two expectations
-		// go back to SEARCH and this comment goes away.
-		{`EXPLAIN QUERY PLAN SELECT * FROM t WHERE b=3`, []string{"SCAN t"}},
-		{`EXPLAIN QUERY PLAN SELECT * FROM t, u WHERE t.b=u.x`, []string{"SCAN u", "SCAN t"}},
+		{`EXPLAIN QUERY PLAN SELECT * FROM t WHERE b=3`, []string{"SEARCH t USING INDEX i1 (b=?)"}},
+		{`EXPLAIN QUERY PLAN SELECT * FROM t, u WHERE t.b=u.x`, []string{"SCAN u", "SEARCH t USING INDEX i1 (b=?)"}},
 		{`EXPLAIN QUERY PLAN SELECT 1`, []string{"SCAN CONSTANT ROW"}},
 		{`EXPLAIN QUERY PLAN VALUES(1)`, []string{"SCAN CONSTANT ROW"}},
 		{`EXPLAIN QUERY PLAN VALUES(1),(2)`, []string{"SCAN 2-ROW VALUES CLAUSE"}},
@@ -281,9 +272,7 @@ func TestExplainQueryPlanCompound(t *testing.T) {
 			"4|1|UNION ALL", "5|4|SCAN u", "6|1|UNION ALL", "7|6|SCAN t",
 		}},
 		{`EXPLAIN QUERY PLAN SELECT a FROM t WHERE b=3 UNION ALL SELECT 1`, []string{
-			// SCAN rather than SEARCH for the format's reason -- see
-			// TestExplainQueryPlanText's own note on the same two shapes.
-			"1|0|COMPOUND QUERY", "2|1|LEFT-MOST SUBQUERY", "3|2|SCAN t",
+			"1|0|COMPOUND QUERY", "2|1|LEFT-MOST SUBQUERY", "3|2|SEARCH t USING INDEX i1 (b=?)",
 			"4|1|UNION ALL", "5|4|SCAN CONSTANT ROW",
 		}},
 	} {

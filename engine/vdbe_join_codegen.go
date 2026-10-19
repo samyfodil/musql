@@ -3043,7 +3043,7 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 				return kerr
 			}
 			c.emit(Instruction{Op: OpSeekIndexHint, P1: s.scope.cursor, P2: keyReg,
-				P4: &indexSeekHint{root: s.idxSeek.root, aff: s.idxSeek.aff, coll: s.idxSeek.coll, leadingCol: s.idxSeek.leadingCol}})
+				P4: &indexSeekHint{root: s.idxSeek.root, aff: s.idxSeek.aff, coll: s.idxSeek.coll, leadingCol: s.idxSeek.leadingCol, index: s.idxSeek.index}})
 		}
 	}
 	// The transient automatic index: C builds it once per run under OP_Once, from
