@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -501,6 +502,14 @@ func vecMemoSlot(t vecType) int {
 	return 0
 }
 
+// vecMemoHas reports whether the table holds s parsed as type t.
+func vecMemoHas(s []byte, t vecType) bool {
+	vecMemo.Lock()
+	defer vecMemo.Unlock()
+	_, ok := vecMemo.m[vecMemoSlot(t)][string(s)]
+	return ok
+}
+
 // vecMemoTake returns the components of s parsed ahead as type t, removing them.
 func vecMemoTake(s []byte, t vecType) ([]byte, bool) {
 	vecMemo.Lock()
@@ -558,6 +567,48 @@ func vecPrefetch(texts [][]byte, t vecType) {
 	vecMemo.Unlock()
 }
 
+// vecAhead is the prefetch vecPrefetchTokens last started: done is closed once
+// it has published its table. Whoever might take from the table waits for it
+// first, so a text it holds is not parsed twice.
+var vecAhead atomic.Pointer[chan struct{}]
+
+// vecAheadWait waits for the prefetch vecPrefetchTokens last started.
+func vecAheadWait() {
+	if d := vecAhead.Load(); d != nil {
+		<-*d
+	}
+}
+
+// vecPrefetchTokens starts the prefetch of a statement's vector('...') and
+// vector32('...') literals from its tokens, on goroutines of its own, so the
+// components parse while the statement does; vecPrefetchRows, at compile,
+// finds them done. Same table, same answers: only when the work happens moves.
+func vecPrefetchTokens(toks []token) {
+	var texts [][]byte
+	total := 0
+	for i := 0; i+3 < len(toks); i++ {
+		t := &toks[i]
+		if t.kind != tkIdent || t.quoted || !(strings.EqualFold(t.text, "vector") || strings.EqualFold(t.text, "vector32")) {
+			continue
+		}
+		if a, l, b := &toks[i+1], &toks[i+2], &toks[i+3]; a.kind != tkPunct || a.text != "(" || l.kind != tkString || b.kind != tkPunct || b.text != ")" || l.str == "" {
+			continue
+		}
+		s := toks[i+2].str
+		texts = append(texts, unsafe.Slice(unsafe.StringData(s), len(s))) // read only
+		total += len(s)
+	}
+	if vecWorkers < 2 || len(texts) < vecPrefetchMinTexts || total < vecPrefetchMin || total > vecPrefetchMax {
+		return
+	}
+	done := make(chan struct{})
+	vecAhead.Store(&done)
+	go func() {
+		defer close(done)
+		vecPrefetch(texts, vecF32)
+	}()
+}
+
 // vecPrefetchRows prefetches the vector literals of an INSERT's VALUES rows: a
 // vector(), vector32() or vector64() call whose one argument is a text literal,
 // as a row writes it.
@@ -581,11 +632,18 @@ func vecPrefetchRows(rows [][]Expr) {
 			}
 		}
 	}
+	// Started from the tokens already (vecPrefetchTokens): done, unless another
+	// statement's prefetch has replaced the table since.
+	vecAheadWait()
+	if len(f32) > 0 && vecMemoHas(f32[0], vecF32) {
+		f32 = nil
+	}
 	vecPrefetch(f32, vecF32)
 	vecPrefetch(f64, vecF64)
 }
 
 func parseVectorText(s []byte, t vecType) (vector, error) {
+	vecAheadWait()
 	if d, ok := vecMemoTake(s, t); ok {
 		w := 4
 		if t == vecF64 {
