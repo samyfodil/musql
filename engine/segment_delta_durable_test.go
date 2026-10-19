@@ -21,7 +21,7 @@ func TestSegmentDeltaZeroTailEndsTheLog(t *testing.T) {
 	if err := os.WriteFile(deltaPath, tailed, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	st, err := replaySegDelta(tailed, baseCtr, basePages)
+	st, err := replaySegDelta(tailed, baseCtr, basePages, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +41,7 @@ func TestSegmentDeltaZeroTailEndsTheLog(t *testing.T) {
 	// A half-written batch inside the zeros is torn, like any other.
 	torn := append(append([]byte(nil), data...), 0x40, 0, 0, 0, 0, 0, 0, 0, 0xde, 0xad)
 	torn = append(torn, make([]byte, 4096)...)
-	st2, err := replaySegDelta(torn, baseCtr, basePages)
+	st2, err := replaySegDelta(torn, baseCtr, basePages, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func TestSegmentDeltaEmptyBatchIsNotHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := replaySegDelta(data, baseCtr, basePages)
+	st, err := replaySegDelta(data, baseCtr, basePages, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,8 +68,8 @@ func TestSegmentDeltaEmptyBatchIsNotHistory(t *testing.T) {
 	b := make([]byte, w+8)
 	binary.LittleEndian.PutUint32(b[w:], st.endCtr+1)
 	binary.LittleEndian.PutUint32(b[w+4:], st.endPages)
-	b = binary.LittleEndian.AppendUint64(b, segDeltaChecksum(b, st.cksum))
-	st2, err := replaySegDelta(append(append([]byte(nil), data...), b...), baseCtr, basePages)
+	b = binary.LittleEndian.AppendUint64(b, segDeltaChecksum(st.version, b, st.cksum))
+	st2, err := replaySegDelta(append(append([]byte(nil), data...), b...), baseCtr, basePages, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +112,7 @@ func deltaLogical(t *testing.T, segPath string) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := replaySegDelta(data, baseCtr, basePages)
+	st, err := replaySegDelta(data, baseCtr, basePages, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

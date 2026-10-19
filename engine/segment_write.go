@@ -627,6 +627,12 @@ func (n *Session) commitMainLocked() (bool, error) {
 	// A ROW WRITE THE CHANGE LOG DOES NOT DESCRIBE cannot become a delta record,
 	// and appending the log and stopping LOSES it. Fall back to the whole-file
 	// rewrite, which writes every table's live rows and so cannot miss one.
+	// An append load's rows (insert_append_delta.go): one segment record per
+	// table, written after the log's records in the same batch.
+	segRecs, segTables, serr := n.appendLoadRecords()
+	if serr != nil {
+		return false, serr
+	}
 	if n.mutatedOutsideChangeLog(changes) {
 		if err := n.rewriteFile(); err != nil {
 			return false, err
@@ -635,7 +641,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 		n.noteCommittedColumnsStale()
 		return true, nil
 	}
-	if changes.len() == 0 {
+	if changes.len() == 0 && len(segRecs) == 0 {
 		return false, nil
 	}
 	// A BULK LOAD TOO BIG FOR THE DELTA, known before its records are built:
@@ -645,7 +651,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 	// measure them was 10% of a 10M-row load. Same order as below: a stale image
 	// is refused before anything is written.
 	if !compactionOffForTest && lockedStamp[0].there && n.maxSize == 0 &&
-		int64(changes.len())*segDeltaMinRecord > compactionThreshold(lockedStamp[0].size)-n.deltaLogicalSize(lockedStamp[1]) {
+		int64(changes.len())*segDeltaMinRecord+segDeltaBatchBytes(segRecs) > compactionThreshold(lockedStamp[0].size)-n.deltaLogicalSize(lockedStamp[1]) {
 		if n.loadedCtr != n.endCtr || n.loadedPages != n.endPages {
 			return false, fmt.Errorf("%w: another connection committed while this transaction was open", ErrBusy)
 		}
@@ -674,6 +680,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	recs = append(recs, segRecs...)
 	if len(recs) == 0 {
 		// Every change was to a table this file does not hold -- a TEMP table,
 		// say. Nothing to append, and nothing lost.
@@ -721,8 +728,19 @@ func (n *Session) commitMainLocked() (bool, error) {
 	}
 	wasCurrent := n.loadedCtr == n.endCtr && n.loadedPages == n.endPages
 	n.endCtr++
-	if aerr := appendSegmentDeltaAt(n.segPath, n.baseCtr, n.basePages, recs, n.endCtr, n.endPages, &n.appendAt, n.commitSync()); aerr != nil {
+	aerr := appendSegmentDeltaAt(n.segPath, n.baseCtr, n.basePages, recs, n.endCtr, n.endPages, &n.appendAt, n.commitSync())
+	if aerr != nil {
 		n.endCtr-- // the append failed, so the state did not move
+		if errors.Is(aerr, errDeltaPredatesSegments) {
+			// A delta older than segment records: the rewrite takes the load's
+			// rows from the row store and leaves a version-3 delta behind.
+			if err := n.rewriteFile(); err != nil {
+				return false, err
+			}
+			n.clearWrittenSinceCommit()
+			n.noteCommittedColumnsStale()
+			return true, nil
+		}
 		return false, aerr
 	}
 	if wasCurrent {
@@ -731,8 +749,22 @@ func (n *Session) commitMainLocked() (bool, error) {
 	n.deltaEnd = n.appendAt.offset
 	n.seenStat = n.pairStamp()
 	n.clearWrittenSinceCommit()
-	if !wasCurrent || !n.extendCommittedColumns(n.appendAt.lastBatch, recs) {
+	// The log's records extend the columnar view as before; the segments are
+	// published to it whole, below. The batch is only the log's records when
+	// no segment went out with them.
+	batch, logRecs := n.appendAt.lastBatch, recs[:len(recs)-len(segRecs)]
+	if len(segRecs) > 0 {
+		batch = nil
+	}
+	if !wasCurrent || !n.extendCommittedColumns(batch, logRecs) {
 		n.noteCommittedColumnsStale()
+	}
+	if len(segRecs) > 0 {
+		// The load's rows are the file's now, as segments: both read views
+		// take them as such.
+		if err := n.publishAppendLoads(segTables, segRecs); err != nil {
+			return true, err
+		}
 	}
 	n.appendAt.lastBatch = nil
 	return true, nil
@@ -761,10 +793,22 @@ func (n *Session) extendCommittedColumns(batch []byte, recs []SegDeltaRecord) bo
 	if st == nil {
 		st = &segDeltaState{live: map[int]map[int64][]Value{}, dead: map[int]map[int64]bool{}, version: segDeltaVersion}
 	}
-	// From the records the batch was written from, when every put carries its
-	// values: the rows decoding the batch would give back, without decoding
-	// it -- a 20,000-row commit spent most of its extension there.
-	if !st.applyRecs(recs) {
+	// QUEUED, not applied, when every record carries its row: nothing may read
+	// the view before the next commit, or ever (a run of writes with no
+	// columnar read between them), and committedColumns applies the queue
+	// when something does. A run of writes that outgrows the queue leaves the
+	// view stale instead (false): the queue's rows are let go, every later
+	// commit skips this until the view is read, and that read rebuilds it
+	// from the file, as a commit too big to keep always made it.
+	if deferrable(recs) {
+		if len(db.colsPending)+len(recs) > colsPendingMax {
+			return false
+		}
+		for i := range recs {
+			r := &recs[i]
+			db.colsPending = append(db.colsPending, pendingRec{table: int32(r.Table), kill: r.Kill, patch: r.patch != nil, rowid: r.Rowid, vals: r.Vals})
+		}
+	} else if db.flushColsPending(st); !st.applyRecs(recs) {
 		if batch == nil {
 			return false
 		}
@@ -826,7 +870,7 @@ func (db *DB) mutatedOutsideChangeLog(changes *changeLog) bool {
 		last = c.Table
 	}
 	for _, t := range db.tables {
-		if t.isTemp || !t.rowsWrittenSinceCommit || t.rows == nil {
+		if t.isTemp || !t.rowsWrittenSinceCommit || t.rows == nil || t.hasAppendLoad() {
 			continue
 		}
 		if !described[strings.ToLower(t.name)] {
@@ -839,6 +883,7 @@ func (db *DB) mutatedOutsideChangeLog(changes *changeLog) bool {
 // clearWrittenSinceCommit resets the per-commit half of the written flag, for
 // every table this commit has just made durable.
 func (db *DB) clearWrittenSinceCommit() {
+	db.appendSeen = nil
 	for _, t := range db.tables {
 		if !t.isTemp { // the TEMP file's commit clears its own (temp_file.go)
 			t.rowsWrittenSinceCommit = false
@@ -1950,6 +1995,54 @@ func (n *Session) reopen(afterFailedCommit bool) error {
 	return nil
 }
 
+// pendingRec is one record of a commit queued for the committed view
+// (extendCommittedColumns): a put of vals, or a kill.
+type pendingRec struct {
+	table int32
+	kill  bool
+	patch bool // the put was a patch (SegDeltaRecord.patch): see applyRecs
+	rowid int64
+	vals  []Value
+}
+
+// colsPendingMax is how many queued records the committed view may lag by,
+// about one bulk statement's: past it the view goes stale instead.
+const colsPendingMax = 1 << 14
+
+// deferrable reports whether recs can be queued for the committed view: every
+// put carries its row (no segment, no row read from a spilled store).
+func deferrable(recs []SegDeltaRecord) bool {
+	for i := range recs {
+		if recs[i].Seg != nil || !recs[i].Kill && recs[i].src != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// flushColsPending applies the queued records to st, the committed view's
+// delta, in the order they were committed.
+func (db *DB) flushColsPending(st *segDeltaState) {
+	if len(db.colsPending) == 0 {
+		return
+	}
+	recs := make([]SegDeltaRecord, len(db.colsPending))
+	for i, p := range db.colsPending {
+		recs[i] = SegDeltaRecord{Table: int(p.table), Rowid: p.rowid, Kill: p.kill, Vals: p.vals}
+		if p.patch {
+			recs[i].patch = []bool{} // marks it a patch for applyRecs; its columns do not matter there
+		}
+	}
+	st.applyRecs(recs)
+	db.dropColsPending()
+}
+
+// dropColsPending empties the queue, so it holds no row.
+func (db *DB) dropColsPending() {
+	clear(db.colsPending)
+	db.colsPending = db.colsPending[:0]
+}
+
 // committedColumns is the COMMITTED-state read handle the columnar fast paths get
 // their blocks from, rebuilt on the first call after a commit marked it stale.
 //
@@ -1958,8 +2051,12 @@ func (n *Session) reopen(afterFailedCommit bool) error {
 // re-opened costs speed and never correctness.
 func (db *DB) committedColumns() *ReadOnlyPager {
 	if db.segColumns != nil && !db.segColumnsStale {
+		if len(db.colsPending) > 0 && db.segColumns.segs != nil && db.segColumns.segs.delta != nil {
+			db.flushColsPending(db.segColumns.segs.delta)
+		}
 		return db.segColumns
 	}
+	db.dropColsPending() // the view is read again from the file, which has them
 	p, err := openSegmentsUnlocked(db.path)
 	if err != nil {
 		// Leave whatever is cached alone rather than dropping it: a stale handle
@@ -1980,6 +2077,7 @@ func (db *DB) committedColumns() *ReadOnlyPager {
 // closed connection left that mapping -- and the file's disk space, the whole
 // database for a ":memory:" one -- behind until the process exited.
 func (db *DB) releaseCommittedColumns() {
+	db.dropColsPending()
 	if db.segColumns != nil {
 		db.segColumns.Close()
 		db.segColumns = nil
@@ -1990,6 +2088,7 @@ func (db *DB) releaseCommittedColumns() {
 // every commit, of either kind, because either kind moves what is committed.
 func (db *DB) noteCommittedColumnsStale() {
 	db.segColumnsStale = true
+	db.dropColsPending() // a rebuild reads the file, which has them
 	// ...and the catalog-corruption verdict, whose key this is the second half of.
 	db.schemaCorruptGen++
 }

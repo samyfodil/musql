@@ -33,6 +33,10 @@ type RowChange struct {
 	New   []Value
 	SQL   string // RowSchema only
 
+	// set, on an UPDATE that wrote the committed row in place (notePatch), is
+	// the columns it assigned: the delta records only those (segDeltaPatch).
+	set []bool
+
 	// movedFrom is the rowid an UPDATE moved this row from (when moved is true).
 	movedFrom int64
 	moved     bool
@@ -159,6 +163,18 @@ func (db *DB) noteRowUpdate(tbl *tableMeta, oldRowid, newRowid uint64, old, new 
 	c.movedFrom, c.moved = int64(oldRowid), true
 	if db.captureFull {
 		c.Old = copyHookRow(tbl, oldRowid, old) // its IPK is the OLD rowid
+	}
+}
+
+// notePatch marks the change just logged, tbl's update of rowid, as one
+// whose new row is its committed row with only the columns set changed: the
+// commit writes those alone (segDeltaPatch).
+func (db *DB) notePatch(tbl *tableMeta, rowid uint64, set []bool) {
+	if !db.captureChanges || db.captureFull || db.changeLog.len() == 0 {
+		return
+	}
+	if c := db.changeLog.last(); c.Kind == RowUpdate && c.Table == tbl.name && c.Temp == tbl.isTemp && c.Rowid == int64(rowid) && !c.moved && c.New != nil {
+		c.set = set
 	}
 }
 

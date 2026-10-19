@@ -548,12 +548,7 @@ func (m *vdbe) aggItemVM(prog *Program) *vdbe {
 	vm.trigOldRowid, vm.trigNewRowid = m.trigOldRowid, m.trigNewRowid
 	vm.trigExcluded, vm.trigExcludedRowid = m.trigExcluded, m.trigExcludedRowid
 	vm.trigReturn, vm.trigReturnRowid = m.trigReturn, m.trigReturnRowid
-	if cap(vm.regs) < prog.NReg {
-		vm.regs = make([]Value, prog.NReg)
-	} else {
-		vm.regs = vm.regs[:prog.NReg]
-		clear(vm.regs)
-	}
+	vm.regs = prog.regFile(vm.regs, false)
 	// The run-once cache slots an UNCORRELATED body in this item takes. Sized
 	// and CLEARED per acquisition rather than kept: the slot numbering belongs
 	// to ONE item's program and this machine is shared by every item of every

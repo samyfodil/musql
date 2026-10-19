@@ -109,6 +109,13 @@ const (
 	// on natively, the row's header written into its list (RowsBuf). Anything
 	// else exits at the pc.
 	VResultRow
+	// VIntGuard: go on when r[A] is an INTEGER, exit at the pc otherwise. It
+	// changes nothing: the engine lowers an OP_Affinity that is the identity on
+	// an INTEGER to it, so only any other value needs the VDBE.
+	VIntGuard
+	// VRowid: r[C] = the rowid of cursor A's current row, from its rowid list
+	// (VCursor.Rowids); a cursor with none, or past its rows, exits.
+	VRowid
 )
 
 // VInsn is one instruction of a VM program: the one at its index's pc.
@@ -123,6 +130,12 @@ type VInsn struct {
 	// Dead: no instruction reads the register this one writes before it is
 	// written again (the fusion pass's liveness), so its store may be skipped.
 	Dead bool
+	// Skip, on a VResultRow that gathers (an UPDATE's records), is the
+	// registers A+i (bit i) it does not copy: their slots in the row are left
+	// as they were, and nothing here reads them, so the instructions that set
+	// them may be dead. The engine sets it only where it does not read those
+	// slots and does not need those registers.
+	Skip uint64
 }
 
 // VCursor is native code's view of one materialized cursor: the rows the
@@ -155,10 +168,13 @@ type VCursor struct {
 	// column outside it exits. A materialized cursor has them all. A copied
 	// row has only the columns the engine decoded for this entry.
 	Mask uint64
+	// Rowids is the first element of the cursor's []uint64 of rowids, one per
+	// row, or nil: VRowid exits.
+	Rowids unsafe.Pointer
 }
 
 const (
-	VCursorSize     = 72
+	VCursorSize     = 80
 	VCursorOffRows  = 0
 	VCursorOffN     = 8
 	VCursorOffPos   = 16
@@ -168,6 +184,7 @@ const (
 	VCursorOffRew   = 48
 	VCursorOffAdv   = 56
 	VCursorOffMask  = 64
+	VCursorOffRids  = 72
 	// sliceHeaderSize is the size of a []Value header in the rows array.
 	sliceHeaderSize = 24
 )

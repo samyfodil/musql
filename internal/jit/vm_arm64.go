@@ -845,6 +845,33 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		e.column(pc, in)
 	case VResultRow:
 		e.resultRow(pc, in)
+	case VIntGuard:
+		if !e.know.isInt[in.A] {
+			e.guardInt(pc, in.A)
+			e.know.isInt[in.A] = true
+		}
+	case VRowid:
+		if in.Dead {
+			e.clobber(in.C)
+			break
+		}
+		e.destNoS(pc, in.C)
+		cb := in.A * VCursorSize
+		a.LdrImm(X9, X0, POffCur)
+		e.ldrAt(X10, X9, cb+VCursorOffOk)
+		a.Cbz(X10, e.stub(pc))
+		e.ldrAt(X11, X9, cb+VCursorOffRids)
+		a.Cbz(X11, e.stub(pc))
+		e.ldrAt(X10, X9, cb+VCursorOffPos)
+		e.ldrAt(X12, X9, cb+VCursorOffN)
+		a.Cmp(X10, X12)
+		a.BcondRaw(armHS, e.stub(pc)) // unsigned: a position before the first row is huge
+		a.MovImm64(X12, 8)
+		a.Mul(X10, X10, X12)
+		a.AddReg(X10, X11, X10)
+		m := e.dest(pc, in.C, X10)
+		a.LdrImm(m, X10, 0)
+		e.storeInt(in, in.C, m)
 	case VRewind:
 		e.unmap(^in.A)
 		cb := in.A * VCursorSize
@@ -1071,6 +1098,20 @@ func (e *vmEmitArm) resultRow(pc int, in VInsn) {
 // X11 and X12 are scratch.
 func (e *vmEmitArm) copyRow(in VInsn, dst Reg64) {
 	a, L := e.a, e.lay
+	if in.Skip != 0 {
+		// Only the registers kept, each a Value's words, unrolled; dst is
+		// left where it was.
+		for i := 0; i < in.B; i++ {
+			if in.Skip&(1<<uint(i)) != 0 {
+				continue
+			}
+			for w := 0; w < L.Size; w += 8 {
+				e.ldr(X12, in.A+i, w)
+				a.StrImm(X12, dst, i*L.Size+w)
+			}
+		}
+		return
+	}
 	a.MovImm64(X9, int64(e.off(in.A, 0)))
 	a.AddReg(X9, X1, X9)
 	a.MovImm64(X11, int64(in.B*L.Size/8))

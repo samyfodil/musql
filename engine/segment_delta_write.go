@@ -1,9 +1,8 @@
 package engine
 
 import (
-	"iter"
 	"fmt"
-	"slices"
+	"iter"
 )
 
 // Turning a commit's row changes into delta records -- the writer's side of
@@ -42,7 +41,13 @@ import (
 // clear the buffer once the batch is appended, or it pins those rows until the
 // next commit.
 func segDeltaRecordsInto(dst []SegDeltaRecord, n int, changes iter.Seq[*RowChange], tableIndex map[string]int, ipkOf map[string]int, storeOf func(table string) *rowStore) ([]SegDeltaRecord, error) {
-	out := slices.Grow(dst[:0], n)
+	// With room to spare: commits of about the same size, an UPDATE run again,
+	// otherwise regrow a buffer only just too small every time. Session.recBuf
+	// keeps up to 1<<14.
+	out := dst[:0]
+	if cap(out) < n {
+		out = make([]SegDeltaRecord, 0, max(n, min(n+n/4, 1<<14)))
+	}
 	emit := func(ti int, table string, rowid int64) {
 		if k := len(out) - 1; k >= 0 && out[k].Table == ti && out[k].Rowid == rowid {
 			return // the same row twice in a row
@@ -116,7 +121,9 @@ func segDeltaRecordsInto(dst []SegDeltaRecord, n int, changes iter.Seq[*RowChang
 				}
 			}
 			if ch.New != nil {
-				out = append(out, SegDeltaRecord{Table: ti, Rowid: ch.Rowid, Vals: storedIPKNull(ch.New, lastIPK)})
+				// An update of the committed row in place goes in as the
+				// columns it changed (SegDeltaRecord.patch).
+				out = append(out, SegDeltaRecord{Table: ti, Rowid: ch.Rowid, Vals: storedIPKNull(ch.New, lastIPK), patch: ch.set})
 				continue
 			}
 			emit(ti, ch.Table, ch.Rowid)
@@ -196,7 +203,7 @@ func segmentFileStateUnlocked(segPath string) (endCtr, endPages uint32, err erro
 	if m != nil {
 		defer m.Close()
 	}
-	st, serr := replaySegDelta(data, base, basePages)
+	st, serr := replaySegDelta(data, base, basePages, nil) // where it ends only
 	if serr != nil {
 		return 0, 0, serr
 	}

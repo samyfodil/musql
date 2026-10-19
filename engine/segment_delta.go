@@ -4,11 +4,14 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"math"
 	"os"
 	"runtime"
 	"sort"
+	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/samyfodil/musql/internal/fsio"
 	"github.com/samyfodil/musql/internal/fsstamp"
@@ -63,12 +66,15 @@ import (
 // order a b-tree walk produces and every caller of a scan already depends on it.
 
 const (
-	segDeltaMagic     = "MQSD"
+	segDeltaMagic = "MQSD"
 	// segDeltaVersion 2 widened a batch's length prefix from 4 bytes to 8: one
 	// commit is one batch (its trailer is the commit marker), so a commit of 4 GiB
 	// or more wrapped the length. A version-1 delta is still read and appended to
-	// with its 4-byte prefix; every new delta is version 2.
-	segDeltaVersion   = 2
+	// with its 4-byte prefix. Version 3 adds the segment record
+	// (segDeltaSeg); its batches are otherwise version 2's. Version 4 changes
+	// only the checksum (segDeltaChecksum). Version 5 adds the patch record
+	// (segDeltaPatch). Every new delta is version 5.
+	segDeltaVersion   = 5
 	segDeltaHdrSize   = 32
 	segDeltaSuffix    = ".delta"
 	segDeltaTrailerSz = 16 // endCtr + endPages + cksum
@@ -79,10 +85,32 @@ const (
 var errDeltaNotForThisFile = errors.New("engine: segment delta was built against a different segment file")
 
 // Record kinds. A tombstone carries no values.
+//
+// A segment record (version 3) carries a whole segment of one table's rows,
+// every rowid above any the table had before it (insert_append_delta.go), so it
+// conflicts with no earlier record: kind, table index, first rowid, the
+// segment's length, a pad byte count p, p zero bytes so the segment starts
+// 8-aligned in the file, then the segment as buildSegment lays it out.
+//
+// A patch record (version 5) is a put of some columns only, over the row the
+// log holds for the rowid or, failing that, the committed row: kind, table
+// index, rowid, the body's length, then the body -- how many columns, each
+// column's index (uvarints), and their values as one record (encodeRecord).
+// It is written only over a committed row of the table's full width (an
+// UPDATE's row written in place, SegDeltaRecord.patch), so the row it lands
+// on always has every column it names.
 const (
-	segDeltaPut  = 1
-	segDeltaKill = 2
+	segDeltaPut   = 1
+	segDeltaKill  = 2
+	segDeltaSeg   = 3
+	segDeltaPatch = 4
 )
+
+// segDeltaSegHdr is a segment record's bytes before its padding.
+const segDeltaSegHdr = 13 + 4 + 1
+
+// segDeltaSegPad is the padding a segment record at file offset pos needs.
+func segDeltaSegPad(pos int64) int64 { return (8 - (pos+segDeltaSegHdr)%8) % 8 }
 
 // SegDeltaRecord is one row mutation, as the delta stores it.
 //
@@ -94,6 +122,13 @@ type SegDeltaRecord struct {
 	Rowid int64
 	Kill  bool
 	Vals  []Value
+	// Seg, when set, makes this a segment record (segDeltaSeg): Rowid is its
+	// first rowid, Vals is unused.
+	Seg []byte
+
+	// patch, when set on a put, is the columns the put changed (true) over the
+	// committed row: a version-5 delta writes only those (segDeltaPatch).
+	patch []bool
 
 	// src, when set, is the row store the put's row is read from WHILE the batch
 	// is written, instead of Vals: a commit then holds one row at a time rather
@@ -122,6 +157,54 @@ func (r *SegDeltaRecord) recordLen() int {
 	}
 	r.size = n + 1
 	return n
+}
+
+// patched reports whether a version-v delta writes this put as a patch record
+// (segDeltaPatch) rather than its whole row.
+func (r *SegDeltaRecord) patched(v uint32) bool {
+	return v >= 5 && r.patch != nil && !r.Kill && r.src == nil && r.Seg == nil && len(r.patch) == len(r.Vals)
+}
+
+// patchValues is the values a patch record carries, in column order, in
+// scratch's storage, and how many bytes the column list before them takes.
+func (r *SegDeltaRecord) patchValues(scratch *[]Value) ([]Value, int) {
+	vals := (*scratch)[:0]
+	n := 0
+	for c, set := range r.patch {
+		if set {
+			vals = append(vals, r.Vals[c])
+			n += uvarintLen(uint64(c))
+		}
+	}
+	*scratch = vals
+	return vals, n + uvarintLen(uint64(len(vals)))
+}
+
+// uvarintLen is how many bytes binary.AppendUvarint writes for x.
+func uvarintLen(x uint64) int {
+	n := 1
+	for ; x >= 0x80; x >>= 7 {
+		n++
+	}
+	return n
+}
+
+// patchLen is the length of the put's patch record body.
+func (r *SegDeltaRecord) patchLen(scratch *[]Value) int {
+	vals, head := r.patchValues(scratch)
+	return head + recordSize(vals)
+}
+
+// appendPatchTo appends the put's patch record body to dst.
+func (r *SegDeltaRecord) appendPatchTo(dst []byte, scratch *[]Value) []byte {
+	vals, _ := r.patchValues(scratch)
+	dst = binary.AppendUvarint(dst, uint64(len(vals)))
+	for c, set := range r.patch {
+		if set {
+			dst = binary.AppendUvarint(dst, uint64(c))
+		}
+	}
+	return appendRecord(dst, vals)
 }
 
 // appendRecordTo appends the put's record to dst.
@@ -165,6 +248,24 @@ type segDeltaState struct {
 	// appending meanwhile: a replay references only complete batches, and a writer
 	// writes and truncates only past the last complete one.
 	mapping *mmapfile.File
+
+	// base, when set, is the committed row of table ti at rowid as the segment
+	// file holds it: what a patch record lands on when the log holds no row
+	// for its rowid. A replay that wants only where the log ends
+	// (countersOnly) has none and skips patches.
+	base         func(ti int, rowid int64) ([]Value, bool)
+	countersOnly bool
+
+	// segs is each table's segments that segment records carried, in log
+	// order, every rowid above any earlier record's: buildSegmentPager reads
+	// them after the file's own segments. They alias the mapping when there is
+	// one, exactly as live's rows do.
+	segs map[int][]*segment
+
+	// posMu guards posCache, namedPositions' kept answer for one table (see
+	// segment_delta_merge.go): a statement's parallel scans share this state.
+	posMu    sync.Mutex
+	posCache *namedPosCache
 }
 
 // release unmaps the delta this state's rows alias. Safe on nil and twice.
@@ -233,15 +334,22 @@ func segDeltaHeader(baseCtr, basePages uint32) []byte {
 	binary.LittleEndian.PutUint32(hdr[4:], segDeltaVersion)
 	binary.LittleEndian.PutUint32(hdr[8:], baseCtr)
 	binary.LittleEndian.PutUint32(hdr[12:], basePages)
-	binary.LittleEndian.PutUint64(hdr[24:], segDeltaChecksum(hdr[:24], 0))
+	binary.LittleEndian.PutUint64(hdr[24:], segDeltaChecksum(segDeltaVersion, hdr[:24], 0))
 	return hdr
 }
 
-// segDeltaChecksum is the running checksum, seeded from the previous value. It
-// is the FNV-1a 64 mixing step over 8-byte groups, chosen because it is a dozen
-// lines and this file does not need a cryptographic hash -- it needs to notice a
-// torn append, and it needs the value to depend on every preceding byte.
-func segDeltaChecksum(b []byte, seed uint64) uint64 {
+// segDeltaChecksum is the running checksum of a version-v delta, seeded from
+// the previous value. It needs to notice a torn append, and it needs the value
+// to depend on every preceding byte; it does not need to be cryptographic.
+//
+// Version 4 is CRC-32C, which the CPU computes many bytes at a time. Versions 1
+// to 3 are FNV-1a 64 a byte at a time, one dependent multiply per byte: a few
+// percent of an UPDATE of thousands of rows, and of every replay. Both are
+// chained across calls, so a batch summed in pieces sums as it would whole.
+func segDeltaChecksum(v uint32, b []byte, seed uint64) uint64 {
+	if v >= 4 {
+		return uint64(crc32.Update(uint32(seed), segDeltaCRC, b))
+	}
 	h := seed
 	if h == 0 {
 		h = 14695981039346656037
@@ -253,6 +361,7 @@ func segDeltaChecksum(b []byte, seed uint64) uint64 {
 	return h
 }
 
+var segDeltaCRC = crc32.MakeTable(crc32.Castagnoli)
 
 // SegDeltaAppendState is where the last append left off: the byte offset the next
 // batch starts at and the running checksum it chains from.
@@ -290,6 +399,9 @@ type SegDeltaAppendState struct {
 	// in one chunk; nil otherwise. Session.commitMainLocked applies it to the
 	// committed read view instead of re-reading the whole pair.
 	lastBatch []byte
+	// buf is the buffer the session's commits encode their batches into
+	// (writeSegDeltaBatch's encBuf), kept from one to the next.
+	buf []byte
 }
 
 // release closes the held delta, if any, and forgets the append point.
@@ -448,7 +560,7 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 			return rerr
 		}
 		var serr error
-		st, serr = replaySegDelta(data, baseCtr, basePages)
+		st, serr = replaySegDelta(data, baseCtr, basePages, nil) // where it ends only
 		if m != nil {
 			defer m.Close()
 		}
@@ -477,11 +589,18 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 	//
 	// At st.bytes, not at the file's end: a previous torn append is OVERWRITTEN
 	// rather than kept, exactly as a WAL writer overwrites an aborted tail.
+	if st.version < 3 && hasSegRecord(recs) {
+		return errDeltaPredatesSegments
+	}
 	var keep *[]byte
 	if carry != nil {
 		keep = &carry.lastBatch
 	}
-	end, cksum, werr := writeSegDeltaBatch(f, st.bytes, st.cksum, segDeltaLenWidth(st.version), recs, endCtr, endPages, keep)
+	var encBuf *[]byte
+	if carry != nil {
+		encBuf = &carry.buf
+	}
+	end, cksum, werr := writeSegDeltaBatch(f, st.bytes, st.cksum, st.version, recs, endCtr, endPages, keep, encBuf)
 	if werr != nil {
 		return werr
 	}
@@ -552,8 +671,13 @@ const segDeltaChunk = 1 << 20
 // that first byte, so the total is computed first (recordSize), and every
 // record's encoding is checked against its prediction: a mismatch fails the
 // commit rather than writing a batch whose length lies.
-func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs []SegDeltaRecord, endCtr, endPages uint32, keep *[]byte) (end int64, cksum uint64, err error) {
+//
+// encBuf, when not nil, is a buffer to encode into, which the batch hands
+// back for the next.
+func writeSegDeltaBatch(f *os.File, off int64, seed uint64, version uint32, recs []SegDeltaRecord, endCtr, endPages uint32, keep, encBuf *[]byte) (end int64, cksum uint64, err error) {
+	lenWidth := segDeltaLenWidth(version)
 	var n int64
+	var scratch []Value // a patch record's values, gathered (patchValues)
 	// Each put's record length, measured once; on the stack for a small batch.
 	var sizesBuf [16]int32
 	sizes := sizesBuf[:0]
@@ -563,8 +687,16 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs
 	sizes = sizes[:len(recs)]
 	for i := range recs {
 		r := &recs[i]
+		if r.Seg != nil {
+			n += segDeltaSegHdr + segDeltaSegPad(off+lenWidth+n) + int64(len(r.Seg))
+			continue
+		}
 		n += 13
-		if !r.Kill {
+		switch {
+		case r.patched(version):
+			sizes[i] = int32(r.patchLen(&scratch))
+			n += 4 + int64(sizes[i])
+		case !r.Kill:
 			sizes[i] = int32(r.recordLen())
 			n += 4 + int64(sizes[i])
 		}
@@ -574,7 +706,26 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs
 	}
 	// Sized to the batch when it is smaller than a chunk: a one-row commit
 	// allocated (and zeroed) the whole megabyte.
-	buf := make([]byte, 0, min(n+lenWidth+segDeltaTrailerSz, segDeltaChunk+64))
+	// The buffer the session keeps for its commits (SegDeltaAppendState.buf),
+	// when one is given: a pool's was dropped at every GC, so an UPDATE of
+	// thousands of rows allocated a fresh one about every commit.
+	want := min(n+lenWidth+segDeltaTrailerSz, segDeltaChunk+64)
+	var buf []byte
+	switch {
+	case encBuf != nil && int64(cap(*encBuf)) >= want:
+		buf = (*encBuf)[:0]
+	case want < segDeltaChunk:
+		buf = make([]byte, 0, want)
+	default:
+		buf = make([]byte, 0, segDeltaChunk+64)
+	}
+	if encBuf != nil {
+		defer func() {
+			if cap(buf) <= segDeltaChunk+64 {
+				*encBuf = buf[:0]
+			}
+		}()
+	}
 	if lenWidth == 4 {
 		buf = binary.LittleEndian.AppendUint32(buf, uint32(n))
 	} else {
@@ -582,7 +733,7 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs
 	}
 	at, cksum := off, seed
 	flush := func() error {
-		cksum = segDeltaChecksum(buf, cksum)
+		cksum = segDeltaChecksum(version, buf, cksum)
 		if _, err := fsio.WriteAt(f, buf, at); err != nil {
 			return err
 		}
@@ -593,10 +744,38 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs
 	written := int64(0)
 	for i := range recs {
 		r := &recs[i]
+		if r.Seg != nil {
+			var hdr [segDeltaSegHdr]byte
+			hdr[0] = segDeltaSeg
+			binary.LittleEndian.PutUint32(hdr[1:], uint32(r.Table))
+			binary.LittleEndian.PutUint64(hdr[5:], uint64(r.Rowid))
+			binary.LittleEndian.PutUint32(hdr[13:], uint32(len(r.Seg)))
+			pad := segDeltaSegPad(off + lenWidth + written)
+			hdr[17] = byte(pad)
+			buf = append(buf, hdr[:]...)
+			var zeros [8]byte
+			buf = append(buf, zeros[:pad]...)
+			written += segDeltaSegHdr + pad
+			// The segment goes out as it is, not copied into buf.
+			if err := flush(); err != nil {
+				return 0, 0, err
+			}
+			cksum = segDeltaChecksum(version, r.Seg, cksum)
+			if _, err := fsio.WriteAt(f, r.Seg, at); err != nil {
+				return 0, 0, err
+			}
+			at += int64(len(r.Seg))
+			written += int64(len(r.Seg))
+			continue
+		}
 		var hdr [13]byte
-		if r.Kill {
+		patched := r.patched(version)
+		switch {
+		case r.Kill:
 			hdr[0] = segDeltaKill
-		} else {
+		case patched:
+			hdr[0] = segDeltaPatch
+		default:
 			hdr[0] = segDeltaPut
 		}
 		binary.LittleEndian.PutUint32(hdr[1:], uint32(r.Table))
@@ -607,7 +786,11 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs
 			want := int(sizes[i])
 			buf = binary.LittleEndian.AppendUint32(buf, uint32(want))
 			before := len(buf)
-			buf = r.appendRecordTo(buf)
+			if patched {
+				buf = r.appendPatchTo(buf, &scratch)
+			} else {
+				buf = r.appendRecordTo(buf)
+			}
 			if got := len(buf) - before; got != want {
 				return 0, 0, fmt.Errorf("engine: segment delta: row %d encoded to %d bytes where %d were predicted", r.Rowid, got, want)
 			}
@@ -638,7 +821,7 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs
 	buf = append(buf, tr[:8]...)
 	// The checksum covers everything before it, so it is known once the last
 	// chunk is summed, and goes out in the same write: one call, not two.
-	cksum = segDeltaChecksum(buf, cksum)
+	cksum = segDeltaChecksum(version, buf, cksum)
 	buf = binary.LittleEndian.AppendUint64(buf, cksum)
 	if _, err := fsio.WriteAt(f, buf, at); err != nil {
 		return 0, 0, err
@@ -651,6 +834,10 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, lenWidth int64, recs
 func segDeltaBatchBytes(recs []SegDeltaRecord) int64 {
 	n := int64(8 + segDeltaTrailerSz)
 	for i := range recs {
+		if recs[i].Seg != nil {
+			n += segDeltaSegHdr + 7 + int64(len(recs[i].Seg)) // at most 7 pad bytes
+			continue
+		}
 		n += 13
 		if !recs[i].Kill {
 			n += 4 + int64(recs[i].recordLen())
@@ -659,21 +846,84 @@ func segDeltaBatchBytes(recs []SegDeltaRecord) int64 {
 	return n
 }
 
-// segDeltaBatchBytesExceed is segDeltaBatchBytes(recs) > limit, measuring
-// only until the answer is known: a bulk load's batch is far past the limit
-// long before its last record, and measuring a record can mean encoding it.
+// segDeltaBatchBytesExceed reports whether the batch recs would make in a
+// current (version-5) delta is over limit, measuring only until the answer is
+// known: a bulk load's batch is far past the limit long before its last
+// record, and measuring a record can mean encoding it. A patched put counts as
+// its patch record, which is what such a delta takes (an older delta takes the
+// whole row, and compacts a little later than it might). The compaction policy
+// is its only caller.
 func segDeltaBatchBytesExceed(recs []SegDeltaRecord, limit int64) bool {
+	// Most batches are far from the limit: an upper bound from each value's
+	// type and length settles that without measuring a record.
+	bound := int64(8 + segDeltaTrailerSz)
+	for i := range recs {
+		r := &recs[i]
+		switch {
+		case r.Seg != nil:
+			bound += segDeltaSegHdr + 7 + int64(len(r.Seg))
+		case r.Kill:
+			bound += segDeltaMinRecord
+		case r.src != nil:
+			bound = limit + 1 // nothing to bound it by: measure below
+		case r.patched(segDeltaVersion):
+			bound += segDeltaMinRecord + 4 + 10 // the count and a column, at most
+			for c, set := range r.patch {
+				if set {
+					bound += 3 + int64(recordBound(r.Vals[c:c+1]))
+				}
+			}
+		default:
+			bound += segDeltaMinRecord + 4 + int64(recordBound(r.Vals))
+		}
+		if bound > limit {
+			break
+		}
+	}
+	if bound <= limit {
+		return false
+	}
+	var scratch []Value
 	n := int64(8 + segDeltaTrailerSz)
 	for i := range recs {
 		if n > limit {
 			return true
 		}
-		n += segDeltaMinRecord
-		if !recs[i].Kill {
-			n += 4 + int64(recs[i].recordLen())
+		r := &recs[i]
+		switch {
+		case r.Seg != nil:
+			n += segDeltaSegHdr + 7 + int64(len(r.Seg))
+		case r.Kill:
+			n += segDeltaMinRecord
+		case r.patched(segDeltaVersion):
+			n += segDeltaMinRecord + 4 + int64(r.patchLen(&scratch))
+		default:
+			n += segDeltaMinRecord + 4 + int64(r.recordLen())
 		}
 	}
 	return n > limit
+}
+
+// segDeltaBatchBound is at least the bytes a batch of recs takes in any
+// version, from each value's type and length alone; false when a record has
+// no values to bound (a segment, or a row read from a spilled store while the
+// batch is written).
+func segDeltaBatchBound(recs []SegDeltaRecord) (int64, bool) {
+	n := int64(8 + segDeltaTrailerSz)
+	for i := range recs {
+		r := &recs[i]
+		if r.Seg != nil || !r.Kill && r.src != nil {
+			return 0, false
+		}
+		n += 13
+		if !r.Kill {
+			// A patch record's body is its count, the columns and a record of
+			// some of the values: within the whole row's bound plus a varint
+			// per column.
+			n += 4 + int64(recordBound(r.Vals)+10*len(r.Vals))
+		}
+	}
+	return n, true
 }
 
 // segDeltaMinRecord is the smallest a delta record can be: a kill's header,
@@ -692,13 +942,19 @@ const (
 // replaySegDelta walks a delta's complete batches and returns the overlay they
 // describe. It stops at the first batch that is truncated or whose checksum
 // fails, so a torn tail is ignored rather than half-applied.
-func replaySegDelta(data []byte, baseCtr, basePages uint32) (*segDeltaState, error) {
+//
+// base is the segment file's committed rows, for patch records
+// (segDeltaState.base); nil for a caller that wants only where the log ends
+// and what its checksum is, which then leaves the rows patches touch out.
+func replaySegDelta(data []byte, baseCtr, basePages uint32, base func(ti int, rowid int64) ([]Value, bool)) (*segDeltaState, error) {
 	st := &segDeltaState{
-		live:     map[int]map[int64][]Value{},
-		dead:     map[int]map[int64]bool{},
-		endCtr:   baseCtr,
-		endPages: basePages,
-		bytes:    segDeltaHdrSize,
+		live:         map[int]map[int64][]Value{},
+		dead:         map[int]map[int64]bool{},
+		endCtr:       baseCtr,
+		endPages:     basePages,
+		bytes:        segDeltaHdrSize,
+		base:         base,
+		countersOnly: base == nil,
 	}
 	if len(data) < segDeltaHdrSize {
 		return st, nil // absent or empty: the segment file stands alone
@@ -707,17 +963,17 @@ func replaySegDelta(data []byte, baseCtr, basePages uint32) (*segDeltaState, err
 		return nil, fmt.Errorf("engine: segment delta: bad magic %q", data[0:4])
 	}
 	st.version = binary.LittleEndian.Uint32(data[4:])
-	if st.version != 1 && st.version != segDeltaVersion {
-		return nil, fmt.Errorf("engine: segment delta: version %d, want 1 or %d", st.version, segDeltaVersion)
+	if st.version < 1 || st.version > segDeltaVersion {
+		return nil, fmt.Errorf("engine: segment delta: version %d, want 1 to %d", st.version, segDeltaVersion)
 	}
-	if binary.LittleEndian.Uint64(data[24:]) != segDeltaChecksum(data[:24], 0) {
+	if binary.LittleEndian.Uint64(data[24:]) != segDeltaChecksum(st.version, data[:24], 0) {
 		return nil, fmt.Errorf("engine: segment delta: header checksum fails")
 	}
 	if c, p := binary.LittleEndian.Uint32(data[8:]), binary.LittleEndian.Uint32(data[12:]); c != baseCtr || p != basePages {
 		return nil, fmt.Errorf("%w (delta was built for counter %d pages %d; this file is counter %d pages %d)",
 			errDeltaNotForThisFile, c, p, baseCtr, basePages)
 	}
-	st.cksum = segDeltaChecksum(data[:24], 0)
+	st.cksum = segDeltaChecksum(st.version, data[:24], 0)
 
 	w := segDeltaLenWidth(st.version)
 	off := int64(segDeltaHdrSize)
@@ -741,7 +997,7 @@ func replaySegDelta(data []byte, baseCtr, basePages uint32) (*segDeltaState, err
 		}
 		batch := data[off:end]
 		want := binary.LittleEndian.Uint64(batch[len(batch)-8:])
-		if segDeltaChecksum(batch[:len(batch)-8], st.cksum) != want {
+		if segDeltaChecksum(st.version, batch[:len(batch)-8], st.cksum) != want {
 			break // torn or corrupt: this batch and everything after it is not history
 		}
 		if err := st.applyBatch(batch[w : w+n]); err != nil {
@@ -769,6 +1025,20 @@ func (st *segDeltaState) applyBatch(body []byte) error {
 		rowid := int64(binary.LittleEndian.Uint64(body[off+5:]))
 		off += 13
 		switch kind {
+		case segDeltaSeg:
+			if off+5 > len(body) {
+				return fmt.Errorf("engine: segment delta: segment length runs past the batch")
+			}
+			n := int(binary.LittleEndian.Uint32(body[off:]))
+			pad := int(body[off+4])
+			off += 5 + pad
+			if pad > 7 || n <= 0 || off+n > len(body) {
+				return fmt.Errorf("engine: segment delta: segment runs past the batch")
+			}
+			if err := st.addSegment(table, body[off:off+n]); err != nil {
+				return err
+			}
+			off += n
 		case segDeltaKill:
 			st.kill(table, rowid)
 		case segDeltaPut:
@@ -786,11 +1056,80 @@ func (st *segDeltaState) applyBatch(body []byte) error {
 			}
 			off += n
 			st.put(table, rowid, vals)
+		case segDeltaPatch:
+			if off+4 > len(body) {
+				return fmt.Errorf("engine: segment delta: patch length runs past the batch")
+			}
+			n := int(binary.LittleEndian.Uint32(body[off:]))
+			off += 4
+			if n < 0 || off+n > len(body) {
+				return fmt.Errorf("engine: segment delta: patch runs past the batch")
+			}
+			if err := st.applyPatch(table, rowid, body[off:off+n]); err != nil {
+				return err
+			}
+			off += n
 		default:
 			return fmt.Errorf("engine: segment delta: unknown record kind %d", kind)
 		}
 	}
 	return nil
+}
+
+// applyPatch applies a patch record's body (segDeltaPatch) to rowid's row: the
+// log's, else the committed row (the delta's own segments, then the file's).
+func (st *segDeltaState) applyPatch(table int, rowid int64, body []byte) error {
+	k, w := binary.Uvarint(body)
+	if w <= 0 || k == 0 || k > uint64(len(body)) {
+		return fmt.Errorf("engine: segment delta: patch of row %d: bad column count", rowid)
+	}
+	cols := make([]int, k)
+	p := w
+	for i := range cols {
+		c, w := binary.Uvarint(body[p:])
+		if w <= 0 || c > 1<<16 {
+			return fmt.Errorf("engine: segment delta: patch of row %d: bad column", rowid)
+		}
+		cols[i], p = int(c), p+w
+	}
+	vals, err := decodeRecord(body[p:])
+	if err != nil || len(vals) != len(cols) {
+		return fmt.Errorf("engine: segment delta: decoding patch of row %d: %v", rowid, err)
+	}
+	if st.countersOnly {
+		return nil // only where the log ends is wanted; the row is not
+	}
+	row, ok := st.live[table][rowid]
+	if !ok && !st.dead[table][rowid] {
+		row, ok = st.committedRow(table, rowid)
+	}
+	if !ok {
+		return fmt.Errorf("engine: segment delta: patch of row %d, which has no row to patch", rowid)
+	}
+	out := make([]Value, len(row))
+	copy(out, row)
+	for i, c := range cols {
+		if c >= len(out) {
+			return fmt.Errorf("engine: segment delta: patch of row %d names column %d of %d", rowid, c, len(out))
+		}
+		out[c] = vals[i]
+	}
+	st.put(table, rowid, out)
+	return nil
+}
+
+// committedRow is rowid's row in the segments the log itself carried, else in
+// the segment file (base).
+func (st *segDeltaState) committedRow(table int, rowid int64) ([]Value, bool) {
+	for _, sg := range st.segs[table] {
+		if i, hit := sg.findRowid(rowid); hit {
+			return sg.rowAt(i), true
+		}
+	}
+	if st.base == nil {
+		return nil, false
+	}
+	return st.base(table, rowid)
 }
 
 // applyRecs applies a batch's records as applyBatch would apply the batch
@@ -801,7 +1140,7 @@ func (st *segDeltaState) applyBatch(body []byte) error {
 func (st *segDeltaState) applyRecs(recs []SegDeltaRecord) bool {
 	total := 0
 	for i := range recs {
-		if !recs[i].Kill && recs[i].src != nil {
+		if recs[i].Seg != nil || (!recs[i].Kill && recs[i].src != nil) {
 			return false
 		}
 		if !recs[i].Kill && !canonicalDeltaRow(recs[i].Vals) {
@@ -852,7 +1191,10 @@ func (st *segDeltaState) applyRecs(recs []SegDeltaRecord) bool {
 			live, liveTable = st.live[r.Table], r.Table
 		}
 		live[r.Rowid] = vals
-		if d := st.dead[r.Table]; len(d) > 0 {
+		// A patched put was a committed row neither put nor killed by the log
+		// when its UPDATE read it, outside any transaction, so it is in no
+		// dead set: only another put can be.
+		if d := st.dead[r.Table]; len(d) > 0 && r.patch == nil {
 			delete(d, r.Rowid)
 		}
 	}
@@ -1130,3 +1472,43 @@ func segmentLockBusy(err error, kind string) error {
 	return fmt.Errorf("%w: another connection holds the %s (%s)", ErrBusy, SegmentLockBusyFragment, kind)
 }
 
+// addSegment takes a segment record's bytes as one of table's segments. A
+// segment's int64 blocks are read in place, so bytes that are not 8-aligned in
+// memory (a batch replayed from a heap copy, not the mapped file) are copied to
+// memory that is.
+func (st *segDeltaState) addSegment(table int, raw []byte) error {
+	if uintptr(unsafe.Pointer(unsafe.SliceData(raw)))%8 != 0 {
+		raw = alignedCopy(raw)
+	}
+	sg, err := openSegment(raw)
+	if err != nil {
+		return fmt.Errorf("engine: segment delta: segment record: %w", err)
+	}
+	if st.segs == nil {
+		st.segs = map[int][]*segment{}
+	}
+	st.segs[table] = append(st.segs[table], sg)
+	return nil
+}
+
+// alignedCopy is b in 8-aligned memory of its own.
+func alignedCopy(b []byte) []byte {
+	words := make([]uint64, (len(b)+7)/8)
+	out := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(words))), len(b))
+	copy(out, b)
+	return out
+}
+
+// errDeltaPredatesSegments refuses a segment record for a delta older than
+// version 3, which an older reader would fail on: the caller rewrites the file
+// instead, which leaves a version-3 delta behind.
+var errDeltaPredatesSegments = errors.New("engine: segment delta: version predates segment records")
+
+func hasSegRecord(recs []SegDeltaRecord) bool {
+	for i := range recs {
+		if recs[i].Seg != nil {
+			return true
+		}
+	}
+	return false
+}

@@ -39,6 +39,21 @@ type vmJIT struct {
 	// engine copies out of a cursor it cannot hand over as a row list. Nil
 	// for a pc with none.
 	fill [][]curCols
+
+	// updAt is the pc of the OpUpdateRow whose record native code gathers
+	// (gatherUpdate), or -1. Its rows are the ones a call hands back, and the
+	// VDBE applies them as soon as the call returns (vdbe.applyGathered).
+	updAt int
+
+	// updSkip is the gathered record's Skip (gatherSkip): the columns whose
+	// registers may be stale when the record is made, which updateRow then
+	// reads from the cursor's row instead.
+	updSkip uint64
+	updPlan *updatePlan // that OP_UpdateRow's
+
+	// params is how many of the nReg registers, the last ones, hold the bound
+	// parameters (Program.jitParams); enter fills them.
+	params int
 }
 
 // curCols is one cursor's columns an entry reads.
@@ -77,6 +92,40 @@ func (prog *Program) jitCode() *vmJIT {
 	}
 	atomic.StorePointer(&prog.vmJIT, unsafe.Pointer(jx))
 	return jx
+}
+
+// maxJITParams bounds the parameters native code reads from registers of
+// their own (jitParams); an OpVariable of a later one exits.
+const maxJITParams = 32
+
+// jitParams is how many registers past NReg a machine running prog keeps for
+// its parameters: native code reads OpVariable's value from there, which
+// vmJIT.enter fills from the bound parameters at every entry.
+func (prog *Program) jitParams() int {
+	if n := atomic.LoadInt32(&prog.paramRegs); n > 0 {
+		return int(n - 1)
+	}
+	n := 0
+	for i := range prog.Insns {
+		if in := &prog.Insns[i]; in.Op == OpVariable && in.P1 <= maxJITParams {
+			n = max(n, in.P1)
+		}
+	}
+	atomic.StoreInt32(&prog.paramRegs, int32(n+1))
+	return n
+}
+
+// regFile is regs as prog's register file: NReg long, with room past that for
+// jitParams. keep says regs' old values may stay; otherwise they are cleared.
+func (prog *Program) regFile(regs []Value, keep bool) []Value {
+	if want := prog.NReg + prog.jitParams(); cap(regs) < want {
+		return make([]Value, prog.NReg, want)
+	}
+	regs = regs[:prog.NReg]
+	if !keep {
+		clear(regs)
+	}
+	return regs
 }
 
 // writeJIT is jitCode for a top-level write program (runWrite), which is
@@ -126,15 +175,26 @@ func compileVMJIT(prog *Program) *vmJIT {
 	// Whether the program has a pair the fusion pass works on, noted as it is
 	// lowered (jit.VFusable), so a program with none skips the pass.
 	fusable := false
+	nParams := prog.jitParams()
+	ipk := writeCursorIPK(prog)
 	for pc := range prog.Insns {
 		vp[pc] = lowerVM(&prog.Insns[pc], prog.NReg)
+		switch in := &prog.Insns[pc]; {
+		case in.Op == OpVariable && in.P1 >= 1 && in.P1 <= nParams && in.P2 >= 0 && in.P2 < prog.NReg:
+			// A shallow copy of the parameter, from the register past NReg
+			// that enter fills with it (jitParams).
+			vp[pc] = jit.VInsn{Op: jit.VCopy, A: prog.NReg + in.P1 - 1, B: in.P2, Imm: 1}
+		case vp[pc].Op == jit.VColumn && vp[pc].A < len(ipk) && ipk[vp[pc].A] == vp[pc].B:
+			// A rowid table's INTEGER PRIMARY KEY reads as the rowid.
+			vp[pc] = jit.VInsn{Op: jit.VRowid, A: vp[pc].A, C: vp[pc].C}
+		}
 		if pc > 0 && !fusable && jit.VFusable(vp[pc-1], vp[pc]) {
 			fusable = true
 		}
 		// A column of any cursor is read natively (a cursor native code cannot
 		// walk is read from a copy of its current row); only a cursor that
 		// materializes its rows is walked natively.
-		if c := vp[pc]; !vmJITCursorOps && (c.Op == jit.VColumn || c.Op == jit.VNext || c.Op == jit.VRewind) {
+		if c := vp[pc]; !vmJITCursorOps && (c.Op == jit.VColumn || c.Op == jit.VRowid || c.Op == jit.VNext || c.Op == jit.VRewind) {
 			vp[pc] = jit.VInsn{Op: jit.VExit}
 		} else if c.Op == jit.VRewind && (c.A >= len(rewindable) || !rewindable[c.A]) {
 			vp[pc] = jit.VInsn{Op: jit.VExit}
@@ -145,6 +205,11 @@ func compileVMJIT(prog *Program) *vmJIT {
 			entry[pc] = true
 			native++
 		}
+	}
+	updAt := gatherUpdate(prog, vp)
+	if updAt >= 0 {
+		entry[updAt-1] = true
+		native++
 	}
 	if native == 0 {
 		return nil
@@ -173,10 +238,16 @@ func compileVMJIT(prog *Program) *vmJIT {
 			entries++
 		}
 	}
+	if updAt >= 0 && entry[updAt] {
+		// Never at the OpUpdateRow: the VDBE reaches it only having run the
+		// OpMakeRecord itself, and the jump past it would drop that record.
+		entry[updAt] = false
+		entries--
+	}
 	if entries == 0 {
 		return nil
 	}
-	b, err := jit.EmitVMFused(vp, prog.NReg, valueLayout, entry, fusable)
+	b, err := jit.EmitVMFused(vp, prog.NReg+nParams, valueLayout, entry, fusable)
 	if err != nil {
 		return nil
 	}
@@ -190,7 +261,11 @@ func compileVMJIT(prog *Program) *vmJIT {
 			marked[pc].Op = OpJIT
 		}
 	}
-	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg, entry: entry, marked: marked, native: native}
+	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams, params: nParams, entry: entry, marked: marked, native: native, updAt: updAt}
+	if updAt >= 0 {
+		jx.updSkip = vp[updAt-1].Skip
+		jx.updPlan, _ = prog.Insns[updAt].P4.(*updatePlan)
+	}
 	if slices.ContainsFunc(vp, func(in jit.VInsn) bool { return in.Op == jit.VResultRow }) {
 		jx.rows = jit.VReachesResultRow(vp)
 	}
@@ -206,13 +281,157 @@ func compileVMJIT(prog *Program) *vmJIT {
 		jx.fill[pc] = fillColumns(vp, pc)
 	}
 	for _, in := range vp {
-		if (in.Op == jit.VColumn || in.Op == jit.VNext || in.Op == jit.VRewind) && !seen[in.A] {
+		if (in.Op == jit.VColumn || in.Op == jit.VRowid || in.Op == jit.VNext || in.Op == jit.VRewind) && !seen[in.A] {
 			seen[in.A] = true
 			jx.curs = append(jx.curs, in.A)
 			jx.nCurs = max(jx.nCurs, in.A+1)
 		}
 	}
 	return jx
+}
+
+// writeCursorIPK is, per cursor number, the INTEGER PRIMARY KEY column of the
+// rowid table the cursor reads, or -1: only for a cursor every open of which
+// is an OpOpenWrite, whose rows are a row store's and whose IPK slot reads as
+// the row's rowid.
+func writeCursorIPK(prog *Program) []int {
+	ipk := make([]int, prog.NCursors)
+	for i := range ipk {
+		ipk[i] = -2 // not opened yet
+	}
+	for i := range prog.Insns {
+		in := &prog.Insns[i]
+		if !isCursorOpen(in.Op) || in.P1 < 0 || in.P1 >= len(ipk) {
+			continue
+		}
+		col := -1
+		if tbl, ok := in.P4.(*tableMeta); ok && in.Op == OpOpenWrite && !tbl.withoutRowid && tbl.ipkIndex >= 0 {
+			col = tbl.ipkIndex
+		}
+		if ipk[in.P1] != -2 && ipk[in.P1] != col {
+			col = -1
+		}
+		ipk[in.P1] = col
+	}
+	for i := range ipk {
+		ipk[i] = max(ipk[i], -1)
+	}
+	return ipk
+}
+
+// isCursorOpen reports whether op opens a table cursor (its P1).
+func isCursorOpen(op OpCode) bool {
+	return op == OpOpenRead || op == OpOpenDerived || op == OpOpenWrite
+}
+
+// gatherUpdate lowers an UPDATE's OpMakeRecord and the OpUpdateRow right after
+// it so that native code does not return to the VDBE for every row: the record
+// becomes a gathered OP_ResultRow of its registers and the rowid register
+// after them, and the OpUpdateRow a jump past itself. It returns that
+// OpUpdateRow's pc, or -1 when prog has no such pair.
+//
+// The VDBE applies the gathered rows, in order, as soon as the call returns
+// and before it runs anything else (vdbe.applyGathered), so every instruction
+// the VDBE runs still sees each row stored that the program would have stored
+// by then. Native code itself reads no row store, only its cursors' frozen
+// rows and registers, which storing a row does not change.
+//
+// Only an UPDATE whose plan allows it (updatePlan.gather: the rowid register
+// is the cursor's rowid, so a gathered row names the row it updates), and
+// only in a program with no OP_ResultRow of its own, whose rows would be
+// mixed with these.
+func gatherUpdate(prog *Program, vp []jit.VInsn) int {
+	at := -1
+	for pc := range prog.Insns {
+		in := &prog.Insns[pc]
+		switch in.Op {
+		case OpResultRow:
+			return -1
+		case OpUpdateRow:
+			plan, _ := in.P4.(*updatePlan)
+			if pc == 0 || plan == nil || !plan.gather || at >= 0 {
+				return -1
+			}
+			mr := &prog.Insns[pc-1]
+			if mr.Op != OpMakeRecord || mr.P3 != in.P2 || in.P3 != mr.P1+mr.P2 || mr.P1 < 0 || in.P3 >= prog.NReg {
+				return -1
+			}
+			at = pc
+		}
+	}
+	if at < 0 || at+1 >= len(prog.Insns) {
+		return -1
+	}
+	mr := &prog.Insns[at-1]
+	vp[at-1] = jit.VInsn{Op: jit.VResultRow, A: mr.P1, B: mr.P2 + 1, Skip: gatherSkip(prog, at)}
+	vp[at] = jit.VInsn{Op: jit.VGoto, T: at + 1}
+	return at
+}
+
+// gatherSkip is the registers a gathered UPDATE record may leave out
+// (VInsn.Skip): the columns the UPDATE does not assign, which applyGathered
+// never reads from a gathered row -- updateRow takes them from the stored row,
+// or from the cursor's own (updSkip). Leaving them out lets the JIT drop the
+// OP_Column that loads each, when nothing else reads it.
+//
+// Only in a program made of the plain instructions listed here, none of which
+// names such a register except the OP_Column that loads it and the record
+// itself: then a register left stale (its OP_Column dropped) is read by
+// nothing but the record, which takes the column from elsewhere. Anything
+// else -- a trigger, a constraint's substitution, a function's argument run
+// -- keeps them all.
+func gatherSkip(prog *Program, at int) uint64 {
+	mr := &prog.Insns[at-1]
+	borrow, _ := mr.P4.(recBorrow)
+	if len(borrow) == 0 || len(borrow) > 63 {
+		return 0
+	}
+	var skip uint64
+	for c, b := range borrow {
+		if b && c < mr.P2 {
+			skip |= 1 << uint(c)
+		}
+	}
+	isSkipped := func(r int) bool {
+		i := r - mr.P1
+		return i >= 0 && i < mr.P2 && skip&(1<<uint(i)) != 0
+	}
+	for pc := range prog.Insns {
+		if pc == at || pc == at-1 {
+			continue
+		}
+		in := &prog.Insns[pc]
+		// Which of P1..P3 name registers; where unsure, all three, which
+		// can only cost the skip.
+		regs := [3]bool{true, true, true}
+		switch in.Op {
+		case OpColumn, OpRowid:
+			// They read a cursor, not a register, and the one that loads a
+			// skipped register is what may be dropped.
+			continue
+		case OpInit, OpGoto, OpOpenWrite, OpRewind, OpNext, OpHalt:
+			continue // cursors, jump targets and constants only
+		case OpIf, OpIfNot, OpIsNull, OpNotNull:
+			regs = [3]bool{true, false, false} // P2 is the jump target
+		case OpAffinity:
+			if _, one := in.P4.(affinity); !one {
+				return 0 // a run of registers
+			}
+			regs = [3]bool{true, false, false}
+		case OpVariable, OpSeekIndexHint, OpSeekRowidHint, OpInteger, OpInt64, OpNull, OpSCopy, OpCopy,
+			OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight,
+			OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpNot, OpNegative:
+			if in.Op == OpNull && in.P3 > in.P2 {
+				return 0 // a run of registers
+			}
+		default:
+			return 0
+		}
+		if regs[0] && isSkipped(in.P1) || regs[1] && isSkipped(in.P2) || regs[2] && isSkipped(in.P3) {
+			return 0
+		}
+	}
+	return skip
 }
 
 // scannableCursors marks the cursor numbers native code may rewind and the
@@ -287,7 +506,7 @@ func firstCursor(vp []jit.VInsn, pc int) int {
 		case jit.VGoto:
 			pc = vp[pc].T
 			continue
-		case jit.VColumn, jit.VNext, jit.VRewind:
+		case jit.VColumn, jit.VRowid, jit.VNext, jit.VRewind:
 			return vp[pc].A
 		case jit.VResultRow:
 			return -1
@@ -346,7 +565,7 @@ func nativeRun(vp []jit.VInsn, pc, limit int) (w int, cursor bool) {
 			continue
 		case jit.VCopy, jit.VInt:
 			w++
-		case jit.VColumn, jit.VNext, jit.VRewind:
+		case jit.VColumn, jit.VRowid, jit.VNext, jit.VRewind:
 			w += 2
 			cursor = true
 		case jit.VResultRow:
@@ -453,6 +672,22 @@ func lowerVM(in *Instruction, nReg int) jit.VInsn {
 		if ok(in.P1, in.P2) {
 			return jit.VInsn{Op: jit.VNot, A: in.P1, C: in.P2}
 		}
+	case OpAffinity:
+		// The identity on an INTEGER (affinityIsIdentity): native code goes on
+		// past one and leaves any other value to the VDBE.
+		aff, one := in.P4.(affinity)
+		if affs, ok := in.P4.([]affinity); ok && len(affs) == 1 {
+			aff, one = affs[0], true
+		}
+		if one && (aff == affInteger || aff == affNumeric) && ok(in.P1) {
+			return jit.VInsn{Op: jit.VIntGuard, A: in.P1}
+		}
+		return exit
+	case OpRowid:
+		if ok(in.P2) && in.P1 >= 0 {
+			return jit.VInsn{Op: jit.VRowid, A: in.P1, C: in.P2}
+		}
+		return exit
 	case OpColumn:
 		// Native code reads a cursor's column from its row list; whether the
 		// cursor is one it may (scannableCursors) is checked by the caller, and
@@ -588,10 +823,18 @@ func jitReadColumn(cur *vdbeCursor, i int, dst *Value) bool {
 // native code ran no OpResultRow.
 func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 	regs := m.regs
-	if len(regs) < jx.nReg || jx.nReg == 0 {
+	if cap(regs) < jx.nReg || jx.nReg == 0 {
 		return pc, -1
 	}
 	args := &m.jargs
+	if jx.params > 0 {
+		// The bound parameters, where native code's OpVariable reads them.
+		regs = regs[:jx.nReg]
+		base := jx.nReg - jx.params
+		for i := range jx.params {
+			regs[base+i] = paramAt(m.params, i+1)
+		}
+	}
 	args.Regs, args.PC, args.Cur = (*int64)(unsafe.Pointer(&regs[0])), int64(pc), nil
 	args.RowBuf, args.RowCap, args.RowUsed, args.RowsBuf, args.RowsCap, args.Yield = nil, -1, 0, nil, 0, 0
 	switch {
@@ -605,8 +848,14 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 			args.RowCap = 0
 		}
 	default:
-		if c := len(m.recChunk); c > 0 {
-			args.RowBuf, args.RowCap = (*int64)(unsafe.Pointer(&m.recChunk[0])), int64(c)
+		// An UPDATE's gathered rows (gatherUpdate) go to a buffer of their
+		// own, which the VDBE stores out of and reuses (vdbe.gatherChunk).
+		buf := m.recChunk
+		if jx.updAt >= 0 {
+			buf = m.gatherChunk
+		}
+		if c := len(buf); c > 0 {
+			args.RowBuf, args.RowCap = (*int64)(unsafe.Pointer(&buf[0])), int64(c)
 		} else {
 			args.RowCap = 0
 		}
@@ -635,6 +884,14 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 			cur := m.cursors[c]
 			if jitCursorOK(cur) {
 				jc.Rows = unsafe.Pointer(unsafe.SliceData(cur.rows))
+				// The rowid list is the cursor's rowid only while its position
+				// says so: a seek that sets the rowid apart from the list (the
+				// UPDATE ... FROM target's, a WITHOUT ROWID key's) leaves pos
+				// where it was. Out of the list VRowid exits anyway, and a
+				// native advance keeps the two together.
+				if p := cur.pos; len(cur.rowids) > 0 && (p < 0 || p >= len(cur.rowids) || cur.rowids[p] == cur.rowid) {
+					jc.Rowids = unsafe.Pointer(unsafe.SliceData(cur.rowids))
+				}
 				jc.N, jc.Pos, jc.Ok, jc.Adv = int64(len(cur.rowids)), int64(cur.pos), 1, 1
 				jc.Mask = jitCursorMask(cur)
 				if !cur.seekReseek && cur.rowStore == nil && !cur.refillEach {
@@ -714,7 +971,9 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 			// spare capacity, their Values the chunk's first RowUsed.
 			k := int(args.Yield)
 			*rows = (*rows)[:len(*rows)+k]
-			m.recChunk = m.recChunk[args.RowUsed:]
+			if jx.updAt < 0 {
+				m.recChunk = m.recChunk[args.RowUsed:]
+			}
 			m.jitRows += k
 			return int(args.PC), -1
 		}

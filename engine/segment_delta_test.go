@@ -98,7 +98,7 @@ func TestSegmentDeltaRejectsATornTail(t *testing.T) {
 	if werr := os.WriteFile(deltaPath, torn, 0o644); werr != nil {
 		t.Fatal(werr)
 	}
-	st, rerr := replaySegDelta(torn, baseCtr, basePages)
+	st, rerr := replaySegDelta(torn, baseCtr, basePages, nil)
 	if rerr != nil {
 		t.Fatalf("a torn tail should be ignored, not an error: %v", rerr)
 	}
@@ -112,7 +112,7 @@ func TestSegmentDeltaRejectsATornTail(t *testing.T) {
 	// And a corrupted CHECKSUM inside a complete batch is excluded the same way.
 	bad := append([]byte(nil), data...)
 	bad[len(bad)-1] ^= 0xff
-	st2, rerr2 := replaySegDelta(bad, baseCtr, basePages)
+	st2, rerr2 := replaySegDelta(bad, baseCtr, basePages, nil)
 	if rerr2 != nil {
 		t.Fatalf("a bad checksum should be ignored, not an error: %v", rerr2)
 	}

@@ -73,6 +73,8 @@ func vmStepOf(in VInsn, pc int) progStep {
 		s.uses, s.defs, s.targets = []int{in.A}, []int{in.C}, []int{in.T}
 	case VNullJump, VIf:
 		s.uses, s.targets = []int{in.A}, []int{in.T}
+	case VIntGuard:
+		s.uses = []int{in.A}
 	case VNull:
 		s.defs = []int{in.C}
 	case VNeg, VNot:
@@ -81,10 +83,22 @@ func vmStepOf(in VInsn, pc int) progStep {
 		// The subroutine's VReturn (which reads everything) comes back to
 		// pc+1; the return address is a def.
 		s.defs, s.fall, s.targets = []int{in.A}, false, []int{in.T}
-	case VColumn:
+	case VColumn, VRowid:
 		s.defs = []int{in.C}
 	case VRewind, VNext:
 		s.targets = []int{in.T}
+	case VResultRow:
+		if in.Skip == 0 {
+			s.useAll = true // VDBE code reads the row, or a return to Go
+			break
+		}
+		// A gathered row that leaves some registers out (Skip) reads only
+		// the others, and goes on to the next pc.
+		for i := 0; i < in.B; i++ {
+			if in.Skip&(1<<uint(i)) == 0 {
+				s.uses = append(s.uses, in.A+i)
+			}
+		}
 	case VFused:
 		// Part of the instruction before. An entry at it (VFusedTest) comes
 		// from the VDBE, which keeps every register in the file.

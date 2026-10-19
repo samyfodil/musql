@@ -63,6 +63,20 @@ type vdbeCursor struct {
 	// over a b-tree. Its rows are built on the first rewind and not before --
 	// see rewind, and materializeRowStore for why that matters.
 	rowStore *tableMeta
+	// rowsFrom and rowsSwaps are the store the rows were taken from and its
+	// swap count then, for storedRow.
+	rowsFrom  *rowStore
+	rowsSwaps uint32
+	// rowsWrites is the store's write count when the rows marked base in
+	// rowsBase were last known to be its rows: at the rewind, and again after
+	// each write of the UPDATE's own (opUpdateRow), for storedRow.
+	rowsWrites uint64
+	// overlaySized says a gathered UPDATE has sized the store's overlay for
+	// this rewind's rows already (applyGathered).
+	overlaySized bool
+	// rowsBase, when not nil, is bit i set where rows[i] came from the
+	// store's committed rows rather than its overlay (rowStore.eachOf).
+	rowsBase []uint64
 	// writeOrder, on a row-store cursor, is the order C's ONE-PASS UPDATE loop
 	// visits the table in (DB.updateOnePassOrder), applied to the frozen rows
 	// every time they are materialized. Set by OpAutoIndexOrder.
@@ -551,6 +565,7 @@ func (cur *vdbeCursor) rewind() error {
 			// cur.tbl is nil here (openRowStoreCursor sets only rowStore), so every field
 			// comes from the store's own metadata.
 			tbl := cur.rowStore
+			cur.rowsFrom, cur.rowsBase = nil, nil // set again only where rows are the store's own (storedRow)
 			if cur.seekConfigured && !tbl.withoutRowid && tbl.rows != nil {
 				rid := uint64(cur.seekKey)
 				cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
@@ -572,30 +587,40 @@ func (cur *vdbeCursor) rewind() error {
 			// only an integer probe can use it; either falls to the walk.
 			if cur.idxSeekConfigured && !tbl.withoutRowid && tbl.rows != nil && cur.idxSeekProbe.Typ == Int {
 				hits, ok := tbl.rows.segEqRowids(cur.idxSeekCol, cur.idxSeekProbe.I)
+				fromSeg := ok
 				if !ok {
 					hits, ok = tbl.rows.eqRowids(cur.idxSeekCol, cur.idxSeekProbe.I)
 				}
 				if ok {
 					writeIndexSeeksServed.Add(1)
-					cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
+					cur.rowids, cur.rows = slices.Grow(cur.rowids[:0], len(hits)), slices.Grow(cur.rows[:0], len(hits))
 					// The stored rows are kept as they are and fixed up as each
 					// becomes current (lazyNorm), as materializeRowStore does, rather
 					// than copied here: a tenth of a table is thousands of rows.
 					lazy := rowStoreNormalizesLazily(tbl)
 					ncols := len(tbl.cols)
-					for _, rid := range hits {
-						if vals, found := tbl.rows.get(rid); found {
-							if !lazy || len(vals) != ncols {
-								vals = normalizeRow(tbl.name, tbl.cols, tbl.ipkIndex, rid, vals)
-							}
-							cur.rows = append(cur.rows, vals)
-							cur.rowids = append(cur.rowids, rid)
+					base := make([]uint64, (len(hits)+63)/64)
+					// segEqRowids filtered out the deleted rows; eqRowids's come
+					// from the store's own index and are all rows.
+					tbl.rows.eachOf(hits, fromSeg, func(rid uint64, vals []Value, fromBase bool) {
+						if !lazy || len(vals) != ncols {
+							vals = normalizeRow(tbl.name, tbl.cols, tbl.ipkIndex, rid, vals)
 						}
-					}
+						if fromBase {
+							i := len(cur.rows)
+							base[i/64] |= 1 << (i % 64)
+						}
+						cur.rows = append(cur.rows, vals)
+						cur.rowids = append(cur.rowids, rid)
+					})
 					cur.lazyNorm = lazy
+					cur.rowsFrom, cur.rowsSwaps, cur.rowsWrites = tbl.rows, tbl.rows.swaps, tbl.rows.writes
+					cur.overlaySized = false
 					cur.writeHint = len(cur.rows)
 					if !slices.IsSorted(cur.rowids) { // the short rows come unioned at the end
 						sortRowsByRowid(cur)
+					} else {
+						cur.rowsBase = base // positions still those eachOf saw
 					}
 					cur.materialized = true
 					cur.pos = -1
@@ -1113,6 +1138,10 @@ func (cur *vdbeCursor) materializeRowStore() {
 		rows[i] = normalizeRow(tbl.name, tbl.cols, tbl.ipkIndex, rid, vals)
 	}
 	cur.rowids, cur.rows, cur.materialized, cur.lazyNorm = rowids, rows, true, lazy
+	cur.rowsFrom, cur.rowsSwaps = tbl.rows, 0
+	if tbl.rows != nil {
+		cur.rowsSwaps = tbl.rows.swaps
+	}
 	// A WITHOUT ROWID TABLE IS ITS PRIMARY KEY INDEX, and this store is keyed by a
 	// synthetic id, so eachSorted just handed over WRITE order. The read path has
 	// the same correction (see rewind's own note) and the WRITE path needs it for a
@@ -1123,6 +1152,45 @@ func (cur *vdbeCursor) materializeRowStore() {
 	if tbl.withoutRowid {
 		cur.orderByWithoutRowidPKOf(tbl)
 	}
+}
+
+// storedRow is the current row as the store handed it to this cursor, with
+// the store's swap and write counts then, for rowStore.rowSeen; nil when the cursor holds
+// no such row for rowid -- not materialized from st, or the row it holds is a
+// normalized copy rather than the store's own.
+func (cur *vdbeCursor) storedRow(st *rowStore, rowid uint64) ([]Value, uint32, uint64, seenOrigin) {
+	if cur.rowStore == nil || st == nil || cur.rowsFrom != st || !cur.lazyNorm ||
+		cur.pos < 0 || cur.pos >= len(cur.rows) || cur.pos >= len(cur.rowids) || cur.rowids[cur.pos] != rowid {
+		return nil, 0, 0, seenUnknown
+	}
+	row := cur.rows[cur.pos]
+	if len(row) != len(cur.rowStore.cols) {
+		return nil, 0, 0, seenUnknown // normalized when materialized: not the stored slice
+	}
+	origin := seenUnknown
+	if cur.rowsBase != nil {
+		origin = seenOverlay
+		if cur.rowsBase[cur.pos/64]&(1<<(cur.pos%64)) != 0 {
+			origin = seenBase
+		}
+	}
+	return row, cur.rowsSwaps, cur.rowsWrites, origin
+}
+
+// storedColumn is column c of the cursor's current row as OP_Column reads it:
+// the row its position names, normalized as advance makes it current.
+func (cur *vdbeCursor) storedColumn(c int) Value {
+	if cur.pos < 0 || cur.pos >= len(cur.rows) {
+		return Value{Typ: Null}
+	}
+	row := cur.rows[cur.pos]
+	if cur.lazyNorm {
+		row = cur.normalizeStored(row)
+	}
+	if c >= len(row) {
+		return Value{Typ: Null}
+	}
+	return row[c]
 }
 
 // rowStoreNormalizesLazily reports whether a write cursor may hold tbl's stored
@@ -1248,6 +1316,7 @@ func (cur *vdbeCursor) applyWriteOrder() {
 	if cur.writeOrder == nil || !cur.materialized {
 		return
 	}
+	cur.rowsBase = nil // positional, and the rows are about to move
 	enc := UTF8
 	if cur.pager != nil {
 		enc = cur.pager.encoding()

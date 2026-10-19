@@ -68,7 +68,7 @@ func compactSegmentFile(segPath string, tail bool) (bool, error) {
 		return false, derr
 	}
 	defer dm.Close()
-	st, rerr := replaySegDelta(dm.Data(), baseCtr, basePages)
+	st, rerr := replaySegDelta(dm.Data(), baseCtr, basePages, f.committedRows())
 	if rerr != nil {
 		f.Close()
 		return false, rerr

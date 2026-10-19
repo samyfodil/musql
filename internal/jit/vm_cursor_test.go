@@ -53,6 +53,7 @@ func TestVCursorLayout(t *testing.T) {
 		{"Rewind", unsafe.Offsetof(c.Rewind), VCursorOffRew},
 		{"Adv", unsafe.Offsetof(c.Adv), VCursorOffAdv},
 		{"Mask", unsafe.Offsetof(c.Mask), VCursorOffMask},
+		{"Rowids", unsafe.Offsetof(c.Rowids), VCursorOffRids},
 	} {
 		if f.got != f.want {
 			t.Errorf("VCursor %s is %d, generated code uses %d", f.name, f.got, f.want)
@@ -301,4 +302,57 @@ func TestVMCursorColumnAndNext(t *testing.T) {
 			t.Fatalf("re-seeking: pc %d pos %d dirty %d, want the cursor untouched at pc 0", pc, cur.Pos, cur.Dirty)
 		}
 	})
+}
+
+// TestVMRowidAndIntGuard: VRowid reads the current row's rowid from the
+// cursor's list and exits where the list is missing or the cursor is off its
+// rows; VIntGuard goes on past an INTEGER and exits at anything else.
+func TestVMRowidAndIntGuard(t *testing.T) {
+	if !Available {
+		t.Skip("no JIT on this platform")
+	}
+	rows := [][]tvalue{{{Typ: tvNull}}, {{Typ: tvNull}}, {{Typ: tvNull}}}
+	rowids := []uint64{5, 9, 1 << 40}
+	cursor := func(pos int64) *VCursor {
+		return &VCursor{Rows: unsafe.Pointer(unsafe.SliceData(rows)), N: 3, Pos: pos, Last: -1, Ok: 1, Adv: 1, Mask: ^uint64(0),
+			Rowids: unsafe.Pointer(unsafe.SliceData(rowids))}
+	}
+	rowid := []VInsn{{Op: VRowid, A: 0, C: 0}, {Op: VExit}}
+	for pos, want := range rowids {
+		regs := make([]tvalue, 2)
+		regs[0] = tvalue{Typ: tvReal, F: 1.5}
+		if pc := runVMCursor(t, rowid, regs, rows, cursor(int64(pos)), 0); pc != 1 || regs[0].Typ != tvInt || regs[0].I != int64(want) || regs[0].F != 0 {
+			t.Errorf("row %d: pc %d, r0 = %+v, want the INTEGER %d", pos, pc, regs[0], want)
+		}
+	}
+	for _, c := range []struct {
+		name string
+		cur  *VCursor
+	}{
+		{"no rowid list", func() *VCursor { c := cursor(0); c.Rowids = nil; return c }()},
+		{"before the first row", cursor(-1)},
+		{"past the last row", cursor(3)},
+		{"a cursor native code may not read", func() *VCursor { c := cursor(0); c.Ok = 0; return c }()},
+	} {
+		regs := make([]tvalue, 2)
+		regs[0] = tvalue{Typ: tvInt, I: 7}
+		if pc := runVMCursor(t, rowid, regs, rows, c.cur, 0); pc != 0 || regs[0].I != 7 {
+			t.Errorf("%s: pc %d, r0 = %+v, want an exit with r0 untouched", c.name, pc, regs[0])
+		}
+	}
+	guard := []VInsn{{Op: VIntGuard, A: 0}, {Op: VInt, A: 1, Imm: 1}, {Op: VExit}}
+	for _, c := range []struct {
+		v      tvalue
+		wantPC int
+	}{
+		{tvalue{Typ: tvInt, I: 3}, 2},
+		{tvalue{Typ: tvNull}, 0},
+		{tvalue{Typ: tvReal, F: 3}, 0},
+	} {
+		regs := make([]tvalue, 2)
+		regs[0] = c.v
+		if pc := runVMCursor(t, guard, regs, rows, cursor(0), 0); pc != c.wantPC || regs[0].Typ != c.v.Typ || regs[0].I != c.v.I || regs[0].F != c.v.F {
+			t.Errorf("guard on %+v: pc %d, want %d with the register untouched", c.v, pc, c.wantPC)
+		}
+	}
 }

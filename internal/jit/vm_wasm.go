@@ -716,6 +716,42 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		e.know.wroteAny(in.C, false)
 	case VResultRow:
 		e.resultRow(pc, in)
+	case VIntGuard:
+		e.guards(pc, e.isInt(in.A))
+	case VRowid:
+		if in.Dead {
+			e.forgetReg(in.C)
+			break
+		}
+		e.guards(pc, e.dstNoS(in, in.C))
+		cb := uint32(in.A * VCursorSize)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffOk)
+		w.op(opI64Eqz)
+		e.exitIf(pc)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffRids)
+		w.op(opI64Eqz)
+		e.exitIf(pc)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffPos)
+		w.Set(e.t1)
+		w.Get(e.t1)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffN)
+		w.op(opI64GeU) // unsigned: a position before the first row is huge
+		e.exitIf(pc)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffRids)
+		w.op(opI32WrapI64)
+		w.Get(e.t1)
+		w.op(opI32WrapI64)
+		w.I32(8)
+		w.op(opI32Mul)
+		w.op(opI32Add)
+		w.LoadI64(0)
+		w.Set(e.t1)
+		e.storeInt(in, in.C, e.t1)
 	case VRewind:
 		cb := uint32(in.A * VCursorSize)
 		w.Get(e.curs)
@@ -915,6 +951,9 @@ func (e *vmEmitWasm) resultRow(pc int, in VInsn) {
 func (e *vmEmitWasm) copyRow(in VInsn) {
 	w, L := e.w, e.lay
 	for k := 0; k < in.B*L.Size; k += 8 {
+		if in.Skip&(1<<uint(k/L.Size)) != 0 {
+			continue // a register the row leaves out
+		}
 		w.Get(e.rb)
 		w.Get(e.regs)
 		w.LoadI64(e.addr(in.A, k))

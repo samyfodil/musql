@@ -43,11 +43,7 @@ func (prog *Program) getMachineFrom(spare **vdbe) *vdbe {
 	if m == nil {
 		m = &vdbe{}
 	}
-	if cap(m.regs) < prog.NReg {
-		m.regs = make([]Value, prog.NReg)
-	} else {
-		m.regs = m.regs[:prog.NReg]
-	}
+	m.regs = prog.regFile(m.regs, true)
 	if cap(m.recRegs) < prog.NRecRegs {
 		m.recRegs = make([][]Value, prog.NRecRegs)
 	} else {

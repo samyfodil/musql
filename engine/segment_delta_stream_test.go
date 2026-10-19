@@ -9,9 +9,11 @@ import (
 )
 
 // TestSegDeltaBatchStreamsAndReplays writes one batch far larger than a chunk
-// (writeSegDeltaBatch) and replays it, in both length-prefix widths: version 2,
-// which every new delta is, and version 1, which an existing delta still is and
-// must keep being appended to with its 4-byte prefix.
+// (writeSegDeltaBatch) and replays it, in every version an existing delta can
+// be and so must keep being appended to: version 1's 4-byte length prefix,
+// versions 2 and 3's FNV checksum, and version 4's CRC-32C, which every new
+// delta is. A batch is summed a chunk at a time, so this is also the test that
+// the checksum chains across chunks as it would over the whole batch.
 func TestSegDeltaBatchStreamsAndReplays(t *testing.T) {
 	blob := bytes.Repeat([]byte{0xAB}, 3000)
 	var recs []SegDeltaRecord
@@ -19,14 +21,14 @@ func TestSegDeltaBatchStreamsAndReplays(t *testing.T) {
 		recs = append(recs, SegDeltaRecord{Table: 0, Rowid: i, Vals: []Value{{Typ: Int, I: i}, {Typ: Blob, S: blob}}})
 	}
 	recs = append(recs, SegDeltaRecord{Table: 0, Rowid: 7, Kill: true})
-	for _, version := range []uint32{1, 2} {
+	for _, version := range []uint32{1, 2, 3, 4} {
 		path := filepath.Join(t.TempDir(), "d.delta")
 		hdr := make([]byte, segDeltaHdrSize)
 		copy(hdr[0:4], segDeltaMagic)
 		binary.LittleEndian.PutUint32(hdr[4:], version)
 		binary.LittleEndian.PutUint32(hdr[8:], 5)
 		binary.LittleEndian.PutUint32(hdr[12:], 6)
-		binary.LittleEndian.PutUint64(hdr[24:], segDeltaChecksum(hdr[:24], 0))
+		binary.LittleEndian.PutUint64(hdr[24:], segDeltaChecksum(version, hdr[:24], 0))
 		if err := os.WriteFile(path, hdr, 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -34,7 +36,7 @@ func TestSegDeltaBatchStreamsAndReplays(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		end, _, err := writeSegDeltaBatch(f, segDeltaHdrSize, segDeltaChecksum(hdr[:24], 0), segDeltaLenWidth(version), recs, 9, 10, nil)
+		end, _, err := writeSegDeltaBatch(f, segDeltaHdrSize, segDeltaChecksum(version, hdr[:24], 0), version, recs, 9, 10, nil, nil)
 		f.Close()
 		if err != nil {
 			t.Fatalf("v%d: %v", version, err)
@@ -43,7 +45,7 @@ func TestSegDeltaBatchStreamsAndReplays(t *testing.T) {
 		if int64(len(data)) != end {
 			t.Fatalf("v%d: file is %d bytes, batch claims to end at %d", version, len(data), end)
 		}
-		st, err := replaySegDelta(data, 5, 6)
+		st, err := replaySegDelta(data, 5, 6, nil)
 		if err != nil {
 			t.Fatalf("v%d replay: %v", version, err)
 		}

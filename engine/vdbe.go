@@ -125,6 +125,16 @@ type vdbe struct {
 	// the size the last chunk was cut to -- see recAlloc.
 	recChunk     []Value
 	recChunkSize int
+	// gatherChunk is where native code gathers an UPDATE's rows
+	// (gatherUpdate), every batch into the same memory: nothing is stored
+	// there (applyGathered). keptChunk is keepRow's arena, for the rows that
+	// are stored as their own copy.
+	gatherChunk []Value
+	keptChunk   []Value
+	// runRids and runRows are the run of rows applyGathered has written in
+	// place and storeInPlace has yet to store.
+	runRids []uint64
+	runRows [][]Value
 
 	// groupBatch is the collected-entries batch for a GROUP BY + DISTINCT
 	// query's OpGroupBatchAppend/OpGroupBatchFinal opcodes (vdbe_group_
@@ -1360,8 +1370,41 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			if jitScore {
 				jitScoreEnter()
 			}
+			before := len(rows)
+			if jx.updAt >= 0 {
+				// Room for a batch of records, so native code goes on past
+				// many rows before it hands them over (gatherUpdate).
+				const batch = 256
+				rows = slices.Grow(rows, batch)
+				if n := batch * (insns[jx.updAt-1].P2 + 1); len(m.gatherChunk) < n {
+					m.gatherChunk = make([]Value, n)
+				}
+			}
 			next, n := jx.enter(m, pc, &rows)
 			pc = next
+			if jx.updAt >= 0 {
+				// The rows are an UPDATE's records (gatherUpdate), stored now,
+				// before the VDBE runs anything. A row handed over alone (n)
+				// is in the chunk's head, as the case below takes it.
+				gathered := rows[before:]
+				if n >= 0 {
+					gathered = append(gathered, m.gatherChunk[:n:n]) // handed over alone, at its head
+				}
+				// Nothing holds what native code gathered once it is stored
+				// (applyGathered), so the next batch gathers into the same
+				// memory.
+				if err := m.applyGathered(&insns[jx.updAt-1], &insns[jx.updAt], gathered); err != nil {
+					return nil, err
+				}
+				clear(rows[before:])
+				rows = rows[:before]
+				if n >= 0 {
+					// Handed over alone, it stopped at the OpUpdateRow, which
+					// it has now done: on past it, as native code jumps.
+					pc = jx.updAt + 1
+					continue
+				}
+			}
 			if n < 0 {
 				jitSkip = pc
 				continue
@@ -2277,7 +2320,12 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				return nil, rerr
 			}
 			if cur.writeHint > 0 && m.wctx != nil {
-				m.wctx.journal = slices.Grow(m.wctx.journalSlice(), cur.writeHint)
+				// With room to spare (within what putWriteCtx keeps): the next
+				// statement of about this size then reuses it rather than
+				// regrowing it for a few more rows.
+				if j := m.wctx.journalSlice(); cap(j)-len(j) < cur.writeHint {
+					m.wctx.journal = slices.Grow(j, min(cur.writeHint+cur.writeHint/4, max(cur.writeHint, 1<<14-len(j))))
+				}
 				cur.writeHint = 0
 			}
 			if !cur.advance() {
@@ -2397,12 +2445,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 		case OpMakeRecord:
 			rec := m.recAlloc(op.P2)
 			owned := m.wctx != nil && m.wctx.db.argsOwned
+			borrow, _ := op.P4.(recBorrow)
 			for i := 0; i < op.P2; i++ {
-				if v := m.regs[op.P1+i]; owned && m.isOwnedParam(v) {
-					rec[i] = v // ExecArgsOwned: the caller handed these bytes over
-				} else {
-					rec[i] = recordValue(copyValue(v))
-				}
+				rec[i] = m.recordOf(m.regs[op.P1+i], i < len(borrow) && borrow[i], owned)
 			}
 			m.recRegs[op.P3] = rec
 
@@ -3231,6 +3276,26 @@ func (m *vdbe) isOwnedParam(v Value) bool {
 	}
 	return false
 }
+
+// recordOf is v as OpMakeRecord stores it: borrowed (recBorrow) as it is, a
+// parameter the caller handed over (ExecArgsOwned) as it is, anything else
+// deep-copied so it survives the register.
+func (m *vdbe) recordOf(v Value, borrowed, owned bool) Value {
+	switch {
+	case borrowed:
+		return recordValue(v)
+	case owned && m.isOwnedParam(v):
+		return v
+	}
+	return recordValue(copyValue(v))
+}
+
+// recBorrow is an OpMakeRecord's P4 when the OpUpdateRow right after it
+// replaces some of the record's values: true at each column the record takes
+// from its register as is, without the deep copy, since opUpdateRow overwrites
+// it from the stored row or copies it itself (the columns the UPDATE does not
+// assign).
+type recBorrow []bool
 
 func copyValue(v Value) Value {
 	if v.S != nil {

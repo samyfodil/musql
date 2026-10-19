@@ -142,3 +142,37 @@ func TestSegmentFindRowidBounds(t *testing.T) {
 		}
 	}
 }
+
+// TestSegmentFindRowidFrom: the ascending search agrees with findRowid for
+// every rowid in and around a segment with gaps and runs, from every place a
+// previous search could have left off -- before, at and past the answer.
+func TestSegmentFindRowidFrom(t *testing.T) {
+	cols := []columnInfo{{Name: "a"}}
+	var rowids []uint64
+	for r := uint64(1); r < 400; r++ {
+		if r%7 != 0 && (r < 100 || r > 130) { // gaps, and a hole in the middle
+			rowids = append(rowids, r)
+		}
+	}
+	rows := make([][]Value, len(rowids))
+	for i := range rows {
+		rows[i] = []Value{{Typ: Int, I: int64(i)}}
+	}
+	buf, err := buildSegment(cols, rowids, rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sg, err := openSegment(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rid := int64(-1); rid <= 401; rid++ {
+		want, wantHit := sg.findRowid(rid)
+		for from := -1; from <= sg.nRows; from++ {
+			got, hit := sg.findRowidFrom(rid, from)
+			if hit != wantHit || (hit && got != want) {
+				t.Fatalf("findRowidFrom(%d, %d) = (%d,%v), findRowid says (%d,%v)", rid, from, got, hit, want, wantHit)
+			}
+		}
+	}
+}

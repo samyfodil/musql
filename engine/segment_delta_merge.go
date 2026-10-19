@@ -27,24 +27,21 @@ func (src *segSource) segDeltaCorrection(rootPage uint32, segs []*segment, preds
 	// there. Both maps are walked, because a live rowid that ALSO exists in a
 	// segment is counted twice otherwise: once by the segments and once by the
 	// add below.
-	for _, m := range []map[int64]bool{dead} {
-		for rid := range m {
-			matched, ok := segRowMatches(segs, rid, preds)
+	//
+	// By POSITION, resolved once per delta and kept (namedPositions), and tested
+	// on the predicates' own cells: finding each rowid and decoding its whole
+	// row again on every query was 15 ms a count once half a table had been
+	// deleted.
+	pos := src.delta.namedPositions(ti, segs)
+	for si, sg := range segs {
+		for _, i := range pos[si] {
+			matched, ok := segPosMatches(sg, i, preds)
 			if !ok {
 				return 0, 0, false
 			}
 			if matched {
 				sub++
 			}
-		}
-	}
-	for rid := range live {
-		matched, ok := segRowMatches(segs, rid, preds)
-		if !ok {
-			return 0, 0, false
-		}
-		if matched {
-			sub++
 		}
 	}
 	// ADD: the log's own live rows, tested as ROWS rather than through a column
@@ -61,18 +58,27 @@ func (src *segSource) segDeltaCorrection(rootPage uint32, segs []*segment, preds
 	return sub, add, true
 }
 
-// segRowMatches reports whether the row stored under rid IN THE SEGMENTS
-// satisfies preds. A rowid no segment holds matches nothing, which is not a
-// refusal: a row the log added has no segment copy to subtract.
-func segRowMatches(segs []*segment, rid int64, preds []segPred) (matched, served bool) {
-	for _, s := range segs {
-		i, hit := s.findRowid(rid)
-		if !hit {
-			continue
-		}
-		return rowMatchesPreds(s.rowAt(i), preds)
+// segPosMatches is rowMatchesPreds for the row at position i of sg, reading
+// only the predicates' columns. A segment of short rows (written before an ADD
+// COLUMN) reads its row whole, so a column past a row's width is refused
+// exactly as rowMatchesPreds refuses it.
+func segPosMatches(sg *segment, i int, preds []segPred) (matched, served bool) {
+	if !sg.fullWidth {
+		return rowMatchesPreds(sg.rowAt(i), preds)
 	}
-	return false, true
+	for _, pr := range preds {
+		if pr.Col < 0 || pr.Col >= len(sg.cols) {
+			return false, false
+		}
+		v := sg.Value(pr.Col, i)
+		if v.Typ == Null || pr.Val.Typ == Null {
+			return false, true
+		}
+		if !pr.Op.satisfied(compareValues(v, pr.Val)) {
+			return false, true
+		}
+	}
+	return true, true
 }
 
 // rowMatchesPreds evaluates preds against one materialized row, using the SAME
@@ -129,14 +135,32 @@ func (src *segSource) segDeltaSkips(rootPage uint32, segs []*segment) (skips [][
 	if len(live) == 0 && len(dead) == 0 {
 		return skips, nil, true
 	}
+	// Shared with every other caller of this delta: read, never written.
+	return src.delta.namedPositions(ti, segs), live, true
+}
+
+// namedPositions is, per segment of segs, the sorted positions of the rows the
+// log names for table ti -- superseded (live) or removed (dead) -- each in the
+// first segment holding it; a rowid no segment holds (a row the log added)
+// has none. Resolving them is a binary search per rowid, so the answer is kept
+// until the log or the segment list changes: a query after a bulk DELETE paid
+// it for every one of tens of thousands of rowids, every time.
+func (st *segDeltaState) namedPositions(ti int, segs []*segment) [][]int {
+	live, dead := st.live[ti], st.dead[ti]
+	st.posMu.Lock()
+	defer st.posMu.Unlock()
+	if c := st.posCache; c != nil && c.ti == ti && c.batches == st.batches &&
+		c.nLive == len(live) && c.nDead == len(dead) && slices.Equal(c.segs, segs) {
+		return c.pos
+	}
+	pos := make([][]int, len(segs))
 	mark := func(rid int64) {
-		for si, s := range segs {
-			if i, hit := s.findRowid(rid); hit {
-				skips[si] = append(skips[si], i)
+		for si, sg := range segs {
+			if i, hit := sg.findRowid(rid); hit {
+				pos[si] = append(pos[si], i)
 				return
 			}
 		}
-		// No segment holds it: a row the log ADDED, with nothing to skip.
 	}
 	for rid := range live {
 		mark(rid)
@@ -144,10 +168,20 @@ func (src *segSource) segDeltaSkips(rootPage uint32, segs []*segment) (skips [][
 	for rid := range dead {
 		mark(rid)
 	}
-	for si := range skips {
-		slices.Sort(skips[si])
+	for si := range pos {
+		slices.Sort(pos[si])
 	}
-	return skips, live, true
+	st.posCache = &namedPosCache{ti: ti, batches: st.batches, nLive: len(live), nDead: len(dead), segs: slices.Clone(segs), pos: pos}
+	return pos
+}
+
+// namedPosCache is namedPositions' kept answer and what it was computed from.
+type namedPosCache struct {
+	ti           int
+	batches      int
+	nLive, nDead int
+	segs         []*segment
+	pos          [][]int
 }
 
 // segDeltaSum is the delta's correction to a filtered sum: the matching
@@ -211,21 +245,17 @@ func (src *segSource) segDeltaSumCorrection(rootPage uint32, segs []*segment, pr
 	}
 	// SUBTRACT the segment copy of every rowid the log names: superseded or
 	// removed, the segments counted it and the merged scan does not.
-	sub := func(rid int64) bool {
-		for _, s := range segs {
-			if i, hit := s.findRowid(rid); hit {
-				return take(s.rowAt(i), &dc.subSum, &dc.subN)
+	// By the positions namedPositions keeps, as segDeltaCorrection does.
+	pos := src.delta.namedPositions(ti, segs)
+	for si, sg := range segs {
+		for _, i := range pos[si] {
+			if !take(sg.rowAt(i), &dc.subSum, &dc.subN) {
+				return dc, false
 			}
 		}
-		return true
 	}
-	for rid := range dead {
-		if !sub(rid) {
-			return dc, false
-		}
-	}
-	for rid, vals := range live {
-		if !sub(rid) || !take(vals, &dc.addSum, &dc.addN) {
+	for _, vals := range live {
+		if !take(vals, &dc.addSum, &dc.addN) {
 			return dc, false
 		}
 	}

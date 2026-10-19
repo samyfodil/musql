@@ -75,7 +75,10 @@ func (s *rowStore) undoTo(mark int) {
 		u := s.undo[i]
 		switch {
 		case u.clr != nil && u.clr.segClear:
-			s.m, s.gone, s.baseGone, s.n, s.nKnown = u.clr.prior, u.clr.priorGone, u.clr.priorBaseGone, u.clr.priorN, u.clr.priorNKnown
+			s.m, s.gone, s.goneBits, s.baseGone, s.n, s.nKnown = u.clr.prior, u.clr.priorGone, nil, u.clr.priorBaseGone, u.clr.priorN, u.clr.priorNKnown
+			s.mPeak = 0
+			s.swaps++
+			s.writes++
 			s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false
 			s.ubKnown = false
 			s.overValid, s.memBytes = false, 0 // the prior map's in-memory share is not known
@@ -84,7 +87,9 @@ func (s *rowStore) undoTo(mark int) {
 			s.invalidateEqIndexes()
 			s.uqIdx = nil
 		case u.clr != nil && u.clr.prior != nil:
-			s.m = u.clr.prior
+			s.m, s.mPeak = u.clr.prior, 0
+			s.swaps++
+			s.writes++
 			s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false
 			s.ubKnown = false
 			s.overValid, s.memBytes = false, 0 // the prior map's in-memory share is not known

@@ -192,6 +192,11 @@ type updatePlan struct {
 	// UPDATE program only.
 	setCol []bool
 
+	// gather: the rowid register OpUpdateRow reads is the scan cursor's own
+	// rowid, which the statement never assigns, so the native code may gather
+	// this row's record and let the engine apply it later (vmJIT.updAt).
+	gather bool
+
 	// rowRegs is the row image's register block, which opUpsertReload refills
 	// after BEFORE triggers, as update.c:1002-1017 does for regNew. The constraint
 	// checks, the AFTER UPDATE program's NEW.* and RETURNING all read it. Set only
@@ -611,9 +616,10 @@ func (db *DB) getWriteCtx() *writeCtx {
 // emptied so it pins no row.
 func (db *DB) putWriteCtx(wc *writeCtx) {
 	j := wc.journal
-	if cap(j) > 1024 {
-		// A statement that journalled thousands of entries should not leave
-		// them pinned by the session.
+	if cap(j) > 1<<14 {
+		// A statement that journalled tens of thousands of entries should not
+		// leave their storage held by the session. Below that it is kept,
+		// cleared: an UPDATE of thousands of rows regrew it every statement.
 		j = nil
 	} else {
 		// Only what this statement wrote: the journal is only ever appended
@@ -2976,9 +2982,15 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 		conflictAware: conflictAware, action: stmt.orAction, explicitOr: stmt.explicitOr,
 		replaceDelBefore: delBefore, replaceDelAfter: delAfter}
 	plan.setCol = make([]bool, len(tbl.cols))
+	// Not under a conflict action: an IGNORE skips the rest of the row's body,
+	// which may already have run up to the next instruction the VDBE runs.
+	plan.gather = !upfrom && !conflictAware
 	for _, idx := range colIdx {
 		if idx >= 0 && idx < len(plan.setCol) {
 			plan.setCol[idx] = true
+		}
+		if idx == noColumnRowidTarget || idx == tbl.ipkIndex {
+			plan.gather = false
 		}
 	}
 
@@ -3318,7 +3330,10 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 	}
 	skips = append(skips, checkSkips...)
 	recReg := c.allocRec()
-	c.emit(Instruction{Op: OpMakeRecord, P1: rowBase, P2: len(tbl.cols), P3: recReg})
+	// P4 marks the columns this UPDATE does not assign: opUpdateRow, run next,
+	// replaces them from the stored row, so the record only borrows them and
+	// opUpdateRow copies any it keeps.
+	c.emit(Instruction{Op: OpMakeRecord, P1: rowBase, P2: len(tbl.cols), P3: recReg, P4: unassigned(plan.setCol)})
 	c.emit(Instruction{Op: OpUpdateRow, P1: 0, P2: recReg, P3: rowidReg, P4: plan})
 	// RETURNING FIRST among the AFTER programs -- see compileInsertStmt's row
 	// tail for the C (trigger.c:68-78 prepends the synthetic trigger) and for
@@ -3953,20 +3968,97 @@ func (m *vdbe) opDelete(op *Instruction) error {
 // statement. Returns a jump target, or -1: an IGNORE resolution leaves the row
 // and jumps to plan.skipAddr.
 func (m *vdbe) opUpdateRow(op *Instruction) (int, error) {
+	full := m.recRegs[op.P2]
+	plan := op.P4.(*updatePlan)
+	inPlace := false
+	if plan.gather && m.wctx.db.updateInPlaceOK(plan.tbl) {
+		full, inPlace = m.inPlace(plan, m.cursors[op.P1], full)
+	}
+	return m.updateRow(op, full, uint64(m.regs[op.P3].I), inPlace)
+}
+
+// inPlace is the row an UPDATE of the cursor's current row stores when the
+// new values can go into the cursor's own copy of the committed row (see
+// updateRow's inPlace): that copy, with the columns plan assigns taken from
+// full, and true; full itself and false otherwise. The table must already be
+// one updateInPlaceOK allows, and plan one whose rowid stays (plan.gather).
+func (m *vdbe) inPlace(plan *updatePlan, cur *vdbeCursor, full []Value) ([]Value, bool) {
+	st := plan.tbl.rows
+	if !st.inPlaceOK() {
+		return full, false
+	}
+	// The cursor's copy of the committed row, which nothing else holds and
+	// the store still has as this row (rowSeen's shortcut).
+	seen, swaps, writes, origin := cur.storedRow(st, cur.rowid)
+	if origin != seenBase || seen == nil || st.writes != writes || st.swaps != swaps || len(seen) != len(full) {
+		return full, false
+	}
+	for c, set := range plan.setCol {
+		if set {
+			seen[c] = full[c]
+		}
+	}
+	return seen, true
+}
+
+// updateRow is OP_UpdateRow's body for the record full and new rowid
+// newRowid, with the cursor on the row being updated. inPlace says full is
+// the cursor's own decoded copy of the committed row, written over with the
+// new values (applyGathered): the old values are gone, and a rollback reads
+// the committed row again instead (undoBase).
+func (m *vdbe) updateRow(op *Instruction, full []Value, newRowid uint64, inPlace bool) (int, error) {
 	plan := op.P4.(*updatePlan)
 	tbl := plan.tbl
 	oldRowid := m.cursors[op.P1].rowid
-	newRowid := uint64(m.regs[op.P3].I)
-	full := m.recRegs[op.P2]
+	if inPlace && newRowid == oldRowid {
+		// Everything below that the row could still need: what made it in
+		// place (updateInPlaceOK, a rowid that stays) rules out a generated
+		// column, a UNIQUE, expression or vector index's check, an FK and a
+		// conflict action, and full is already the stored row, its INTEGER
+		// PRIMARY KEY slot the stored NULL.
+		if perr := m.wctx.pinViolation(tbl); perr != nil {
+			return -1, perr
+		}
+		tbl.putRowOver(newRowid, full, full)
+		// The one write since the cursor's rows were known to be the
+		// store's is this row's own (inPlace held that), as in the
+		// general path below.
+		m.cursors[op.P1].rowsWrites = tbl.rows.writes
+		m.wctx.undoBase(tbl, oldRowid)
+		m.wctx.db.noteRowUpdate(tbl, oldRowid, newRowid, full, full) // capture log (rowhook.go); no full capture here
+		m.wctx.db.notePatch(tbl, newRowid, plan.setCol)
+		m.wctx.rowsAffected++
+		return -1, nil
+	}
 	// A BEFORE trigger may have updated this row after the cursor read it, so
 	// columns the statement does not assign are re-read from the store (ticket
 	// e25d9ea771, triggerC.test 10.3). Done before computeGeneratedInto. Read once;
 	// the restore arms below reuse it.
-	oldVals := tbl.rows.row(oldRowid)
-	if oldVals != nil && plan.setCol != nil {
+	cur := m.cursors[op.P1]
+	seen, swaps, writes, origin := cur.storedRow(tbl.rows, oldRowid)
+	oldVals := tbl.rows.rowSeen(oldRowid, seen, swaps, writes, origin)
+	if plan.setCol != nil {
+		// Registers a gathered record left out (gatherSkip) may never have
+		// been loaded: such a column comes from the cursor's row instead,
+		// which is what loading it would have read. Defensive: a skipped
+		// column not taken from the stored row needs a stored row shorter
+		// than the table, which reading pads, or a row gone mid-statement,
+		// which nothing in a program gatherSkip accepts can do.
+		var skip uint64
+		if jx := m.jx; jx != nil && jx.updPlan == plan {
+			skip = jx.updSkip
+		}
 		for i := range full {
-			if i < len(oldVals) && i < len(plan.setCol) && !plan.setCol[i] {
+			if i >= len(plan.setCol) || plan.setCol[i] {
+				continue
+			}
+			switch {
+			case i < len(oldVals):
 				full[i] = oldVals[i]
+			case i < 64 && skip&(1<<uint(i)) != 0:
+				full[i] = recordValue(copyValue(m.cursors[op.P1].storedColumn(i)))
+			default:
+				full[i] = recordValue(copyValue(full[i])) // borrowed by OpMakeRecord (recBorrow)
 			}
 		}
 	}
@@ -4085,8 +4177,21 @@ func (m *vdbe) opUpdateRow(op *Instruction) (int, error) {
 				tbl.putRow(oldRowid, oldVals) // this row is not applied at all
 				return -1, fmt.Errorf("engine: UPDATE %s: UNIQUE constraint failed: %s", plan.displayName, rowidConstraintName(tbl))
 			}
+			tbl.putRow(newRowid, full)
+		} else if oldVals != nil {
+			// Nothing has written the store since oldVals was read from it.
+			// Whichever row this was (committed or the overlay's), if the
+			// store's count is still the cursor's, the one write since is
+			// this row's own, and the cursor's rowids are distinct: its rows
+			// still to come are untouched.
+			synced := tbl.rows != nil && seen != nil && tbl.rows.writes == writes
+			tbl.putRowOver(newRowid, full, oldVals)
+			if synced {
+				cur.rowsWrites = tbl.rows.writes
+			}
+		} else {
+			tbl.putRow(newRowid, full)
 		}
-		tbl.putRow(newRowid, full)
 	}
 	// The plain UNIQUE check runs after this row is stored, so a violation means
 	// the write never counted: put the row back unjournaled. Under
@@ -4104,11 +4209,177 @@ func (m *vdbe) opUpdateRow(op *Instruction) (int, error) {
 		tbl.putRow(oldRowid, oldVals)
 		return -1, err
 	}
-	m.wctx.undoMove(tbl, newRowid, oldRowid, oldVals)
+	if inPlace {
+		m.wctx.undoBase(tbl, oldRowid)
+	} else {
+		m.wctx.undoMove(tbl, newRowid, oldRowid, oldVals)
+	}
 	m.wctx.db.noteRowUpdate(tbl, oldRowid, newRowid, oldVals, full) // capture log (rowhook.go)
-	m.wctx.db.fkRowMutated(tbl, oldRowid, newRowid, oldVals, full, fkColMask(len(tbl.cols), plan.colIdx))
+	if inPlace {
+		m.wctx.db.notePatch(tbl, newRowid, plan.setCol)
+	}
+	m.wctx.db.fkRowMutated(tbl, oldRowid, newRowid, oldVals, full, plan.setCol) // fkColMask of colIdx, built once
 	m.wctx.rowsAffected++
 	return -1, nil
+}
+
+// unassigned is the recBorrow of an UPDATE whose assigned columns are setCol.
+func unassigned(setCol []bool) recBorrow {
+	b := make(recBorrow, len(setCol))
+	for i, set := range setCol {
+		b[i] = !set
+	}
+	return b
+}
+
+// applyGathered stores the rows native code gathered for the OpUpdateRow upd
+// (gatherUpdate), in order, as upd would have stored each one: every row is
+// the registers of the OpMakeRecord mr before it, then the rowid. It puts the
+// cursor on each row's own position while it does, and back where native code
+// left it after.
+//
+// No row is stored where native code gathered it: one that does not go into
+// its cursor's copy of the old row (updateRow's inPlace) is copied out first
+// (keepRow), so the next batch gathers into the same memory.
+func (m *vdbe) applyGathered(mr, upd *Instruction, rows [][]Value) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	cur := m.cursors[upd.P1]
+	pos, rowid := cur.pos, cur.rowid
+	defer func() { cur.pos, cur.rowid = pos, rowid }()
+	// Where each row is: the cursor's rows are visited in order, and the
+	// gathered ones are the last of those it has passed that the loop wrote.
+	var atBuf [64]int
+	at := atBuf[:0]
+	if len(rows) > len(atBuf) {
+		at = make([]int, 0, len(rows))
+	}
+	at = at[:len(rows)]
+	i := min(cur.pos, len(cur.rowids)-1)
+	for k := len(rows) - 1; k >= 0; k-- {
+		rid := rows[k][mr.P2]
+		for rid.Typ == Int && i >= 0 && cur.rowids[i] != uint64(rid.I) {
+			i--
+		}
+		if rid.Typ != Int || i < 0 {
+			return fmt.Errorf("engine: internal: a gathered UPDATE row is not one its cursor visited")
+		}
+		at[k] = i
+		i--
+	}
+	borrow, _ := mr.P4.(recBorrow)
+	owned := m.wctx != nil && m.wctx.db.argsOwned
+	plan := upd.P4.(*updatePlan)
+	if cur.idxSeekConfigured && !cur.overlaySized {
+		// An equality seek's rows all match, so the rest of them are about
+		// to be stored: the overlay is sized for them once, not grown.
+		cur.overlaySized = true
+		plan.tbl.rows.reserve(len(cur.rowids) - at[0])
+	}
+	inPlaceOK := m.wctx.db.updateInPlaceOK(plan.tbl)
+	for k, row := range rows {
+		full := row[:mr.P2:mr.P2]
+		for c := range full {
+			// A borrowed column is left as gathered: updateRow replaces it
+			// from the stored row, or copies it, as it does OpMakeRecord's.
+			// recordOf leaves a value with no bytes and no REAL to fold as
+			// it is: an integer, the common case, is not passed through it.
+			if v := &full[c]; (c >= len(borrow) || !borrow[c]) && (v.S != nil || v.intReal) {
+				*v = m.recordOf(*v, false, owned)
+			}
+		}
+		cur.pos, cur.rowid = at[k], cur.rowids[at[k]]
+		inPlace := false
+		if inPlaceOK {
+			// The new values go into the cursor's copy of the old row, so the
+			// row costs one copy, not two.
+			full, inPlace = m.inPlace(plan, cur, full)
+		}
+		if inPlace && uint64(row[mr.P2].I) == cur.rowid {
+			// Stored with the rest of its run (storeInPlace): nothing reads
+			// the store before then, and each row is its own rowid's.
+			m.runRids, m.runRows = append(m.runRids, cur.rowid), append(m.runRows, full)
+			continue
+		}
+		if err := m.storeInPlace(plan, cur); err != nil {
+			return err
+		}
+		if !inPlace {
+			full = m.keepRow(full)
+		}
+		if _, err := m.updateRow(upd, full, uint64(row[mr.P2].I), inPlace); err != nil {
+			return err
+		}
+		if err := m.fkDrain(); err != nil { // as OpUpdateRow's case does
+			return err
+		}
+	}
+	return m.storeInPlace(plan, cur)
+}
+
+// storeInPlace stores the run of rows applyGathered wrote in place (runRids,
+// runRows), as updateRow's inPlace path stores each, with what the run's
+// rows share done once: the pin check, the cursor's note of the store's
+// write count, the journal's rowids, the count of rows changed.
+func (m *vdbe) storeInPlace(plan *updatePlan, cur *vdbeCursor) error {
+	rids, rows := m.runRids, m.runRows
+	if len(rids) == 0 {
+		return nil
+	}
+	m.runRids, m.runRows = rids[:0], rows[:0]
+	defer clear(rows)
+	tbl := plan.tbl
+	if perr := m.wctx.pinViolation(tbl); perr != nil {
+		return perr
+	}
+	for i, rid := range rids {
+		tbl.putRowOver(rid, rows[i], rows[i])
+	}
+	// The writes since the cursor's rows were known to be the store's are
+	// the run's own, one per rowid (inPlace held that for each).
+	cur.rowsWrites = tbl.rows.writes
+	m.wctx.undoBaseRun(tbl, rids)
+	db := m.wctx.db
+	for i, rid := range rids {
+		db.noteRowUpdate(tbl, rid, rid, rows[i], rows[i]) // capture log (rowhook.go); no full capture here
+		db.notePatch(tbl, rid, plan.setCol)
+	}
+	m.wctx.rowsAffected += len(rids)
+	return m.fkDrain() // as OpUpdateRow's case does
+}
+
+// keepRow is a copy of row in memory of its own, carved from a chunk the
+// machine keeps for it as recAlloc does.
+func (m *vdbe) keepRow(row []Value) []Value {
+	n := len(row)
+	if len(m.keptChunk) < n {
+		m.keptChunk = make([]Value, max(256, n))
+	}
+	out := m.keptChunk[:n:n]
+	m.keptChunk = m.keptChunk[n:]
+	copy(out, row)
+	return out
+}
+
+// updateInPlaceOK reports whether an UPDATE of tbl may write a row's new
+// values over its old ones (applyGathered): nothing that runs after the row is
+// stored needs the old values. A UNIQUE, expression, partial or vector index's
+// check, and an FK, each read them or put them back; full capture copies them;
+// a generated column is computed into the row.
+func (db *DB) updateInPlaceOK(tbl *tableMeta) bool {
+	if db.captureFull || hasGeneratedCols(tbl.cols) || tbl.rows == nil {
+		return false
+	}
+	if db.fkStmt != nil && !db.fkSchemaOf().empty && (len(db.fkOf(tbl)) > 0 || len(db.fkReferencing(tbl)) > 0) {
+		return false
+	}
+	for _, idx := range db.indexes {
+		if indexBelongsTo(idx, tbl) && (idx.unique || idx.exprOrPartial || idx.vec != nil) {
+			return false
+		}
+	}
+	return true
 }
 
 // opUpsertFind implements OP_UpsertFind (see the opcode doc). It probes the
@@ -5066,6 +5337,11 @@ type undoEntry struct {
 	putRid    uint64
 	putVals   []Value
 	drop, put bool
+	// putBase: the rows put back are committed rows, read again from the
+	// store's committed rows (undoBase): putRid's, and every rowid in
+	// baseRids, which consecutive in-place writes to one table share.
+	putBase  bool
+	baseRids []uint64
 	// dropMore is how many further consecutive rowids, after dropRid, this
 	// entry drops: an INSERT of rowids n, n+1, n+2 ... into one table is one
 	// entry, not one per row.
@@ -5091,6 +5367,16 @@ func (e *undoEntry) run() {
 		}
 	}
 	if e.put {
+		if e.putBase {
+			for _, rid := range e.baseRids {
+				if vals := e.tbl.rows.committedRow(rid); vals != nil {
+					e.tbl.putRow(rid, vals)
+				} else {
+					e.tbl.dropRow(rid) // no committed row to restore: none was there
+				}
+			}
+			return
+		}
 		e.tbl.putRow(e.putRid, e.putVals)
 	}
 }
@@ -5126,6 +5412,27 @@ func (wc *writeCtx) undoDrop(tbl *tableMeta, rid uint64) {
 		}
 	}
 	wc.journalAppend(undoEntry{tbl: tbl, dropRid: rid, drop: true})
+}
+
+// undoBase journals putting rid's committed row back, for an update that wrote
+// its new values over the only copy of the old ones (updateRow's inPlace).
+//
+// Consecutive ones on one table extend the last entry's list, as undoDrop's
+// runs do: each rowid is put back from its own committed row, so the order
+// within the list does not matter.
+func (wc *writeCtx) undoBase(tbl *tableMeta, rid uint64) {
+	wc.undoBaseRun(tbl, []uint64{rid})
+}
+
+// undoBaseRun is undoBase for each of rids.
+func (wc *writeCtx) undoBaseRun(tbl *tableMeta, rids []uint64) {
+	if n := len(wc.journal); n > 0 {
+		if l := &wc.journal[n-1]; l.putBase && l.tbl == tbl {
+			l.baseRids = append(l.baseRids, rids...)
+			return
+		}
+	}
+	wc.journalAppend(undoEntry{tbl: tbl, put: true, putBase: true, baseRids: append([]uint64(nil), rids...)})
 }
 
 // undoMove journals an update's inverse: drop the row at newRid, then put

@@ -145,7 +145,7 @@ func TestCarriedAppendPointRejectsAnotherWritersBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := replaySegDelta(data, baseCtr, basePages)
+	st, err := replaySegDelta(data, baseCtr, basePages, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
