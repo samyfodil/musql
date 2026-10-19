@@ -25,17 +25,17 @@ import (
 // used per run; registers, cursors, and sorters are not shared across
 // executions.
 type vdbe struct {
-	regs         []Value
-	jx           *vmJIT        // native code for the program run() is given, when it has some
-	jcur         []jit.VCursor // native code's view of the cursors it names, filled at each entry
+	regs []Value
+	jx   *vmJIT        // native code for the program run() is given, when it has some
+	jcur []jit.VCursor // native code's view of the cursors it names, filled at each entry
 	// jargs is the argument block of every entry into native code: kept on the
 	// machine and only its live fields set per entry, because zeroing a fresh
 	// one -- most of it the segment JIT's -- was a measurable share of a short
 	// entry.
-	jargs jit.ProgArgs
-	jsnap        []jitSnap     // the copies of the rows of cursors it can read but not walk
-	jitEnters    int           // entries into jx, which the fuel test counts
-	jitRows      int           // result rows native code copied out, which the pointer tests count
+	jargs        jit.ProgArgs
+	jsnap        []jitSnap // the copies of the rows of cursors it can read but not walk
+	jitEnters    int       // entries into jx, which the fuel test counts
+	jitRows      int       // result rows native code copied out, which the pointer tests count
 	cursors      []*vdbeCursor
 	recRegs      [][]Value
 	sorters      []*vdbeSorter
@@ -94,6 +94,10 @@ type vdbe struct {
 	// see its doc comment for why reuse is safe here.
 	aggRowBuf   []Value
 	aggRowidBuf []Value
+	// aggNullRow is the row a rowFree step (aggPlan.rowFree) hands on in place
+	// of a gathered one: all NULL, at least as wide as any plan's, never
+	// written. The anchor copies it and nothing reads that.
+	aggNullRow []Value
 	// A POINTER, not the struct: an evalCtx is 304 bytes, a third of this whole
 	// machine, and only the aggregate opcodes ever touch it. Inline it and every
 	// point lookup pays for a field it never reads -- and a machine is allocated
@@ -1261,6 +1265,9 @@ func (m *vdbe) outerFrame(levels int) *vdbe {
 func cursorColumnMasks(insns []Instruction, ncursors int) []columnMask {
 	for i := range insns {
 		if readsWholeCursorRows(insns[i].Op) {
+			if p, ok := insns[i].P4.(*aggPlan); ok && insns[i].Op == OpAggStep && p.rowFree {
+				continue // gathers no row (aggPlan.rowFree)
+			}
 			return nil
 		}
 	}
@@ -2443,6 +2450,12 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			m.sorters[op.P1] = newSorter(op.P4.(*sorterKeyInfo), m.encoding())
 
 		case OpMakeRecord:
+			if _, view := op.P4.(recView); view {
+				// The registers themselves, read before any of them is written
+				// again (see recView): no copy, no allocation.
+				m.recRegs[op.P3] = m.regs[op.P1 : op.P1+op.P2 : op.P1+op.P2]
+				break
+			}
 			rec := m.recAlloc(op.P2)
 			owned := m.wctx != nil && m.wctx.db.argsOwned
 			borrow, _ := op.P4.(recBorrow)
@@ -2672,7 +2685,14 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 		case OpAggStep:
 			plan := op.P4.(*aggPlan)
 			var row, rowids []Value
-			if op.P3 == 0 { // source: plan.cursors (one or more joined table cursors)
+			if op.P3 == 0 && plan.rowFree {
+				// Nothing reads the row (aggPlan.rowFree): the steps read their
+				// registers.
+				if n := plan.nCols + len(plan.scopes); len(m.aggNullRow) < n {
+					m.aggNullRow = make([]Value, n)
+				}
+				row, rowids = m.aggNullRow[:plan.nCols:plan.nCols], m.aggNullRow[plan.nCols:plan.nCols+len(plan.scopes)]
+			} else if op.P3 == 0 { // source: plan.cursors (one or more joined table cursors)
 				var gerr error
 				row, rowids, gerr = m.gatherCursorRow(plan)
 				if gerr != nil {
@@ -3296,6 +3316,13 @@ func (m *vdbe) recordOf(v Value, borrowed, owned bool) Value {
 // it from the stored row or copies it itself (the columns the UPDATE does not
 // assign).
 type recBorrow []bool
+
+// recView is an OpMakeRecord's P4 when the record is the register range
+// itself rather than a copy: a streamed GROUP BY row (compileScanGroupBy),
+// which the drain subroutine reads before the scan loads the next row into
+// those registers, and which nothing keeps past that. Anything that could
+// keep the record -- a sorter, a bare column's anchor row -- takes a copy.
+type recView struct{}
 
 func copyValue(v Value) Value {
 	if v.S != nil {

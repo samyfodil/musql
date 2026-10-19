@@ -310,10 +310,12 @@ func compileScanAggregate(c *compiler, stmt *SelectStmt, srcs []joinSource, scop
 	// subquery in the WHERE or grouping keys may read them (rowLive), as in
 	// compileScanPlain (e_fkey.test). Restored afterwards: the result phase is not
 	// row-live.
-	savedRowLive := c.rowLive
+	savedRowLive, savedOrderFree := c.rowLive, c.rowOrderFree
 	c.rowLive = true
+	c.rowOrderFree = !usesGroupBare && !subRead && !anyOrderSensitive(allAggs)
+	plan.rowFree = !usesGroupBare && !subRead && plan.anchorCheck == nil && !anyAggOrderBy(allAggs)
 	err := aggLoopNQueryLoop(c, savedNQueryLoopKnown, func() error { return emitJoinLoops(c, srcs, jplan, body) })
-	c.rowLive = savedRowLive
+	c.rowLive, c.rowOrderFree = savedRowLive, savedOrderFree
 	if err != nil {
 		return nil, err
 	}
@@ -2043,6 +2045,27 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// (aggRowSplit's [cols.., rowids..] block, then the sequence number).
 	groupValPayloadOff := nCols + len(srcs) + 1
 
+	// STREAMED: when the groups arrive in scan order (scanOrderGroups) and
+	// nothing sorts the finished groups, sorter1 only buffers rows to hand them
+	// back in the order they went in. C's groupBySort==0 arm runs the group
+	// logic in the loop instead (select.c:8560): so does this, calling the drain
+	// body below as a subroutine on each row's record, with no sorter at all.
+	// The drain's setup runs before the scan (jumped to and back), since the
+	// subroutine runs inside it.
+	stream := scanOrderGroups && !hasOrder && !useDistinctBatch
+	// A streamed record is read by the subroutine before the scan loads the
+	// next row, and nothing keeps it: the group's anchor row, which bare
+	// columns and select-list subqueries read, is a copy magnetWalk takes
+	// when the anchor moves (cloneValues), and the group key is its own
+	// record. So it is the registers themselves (recView), with nothing
+	// copied or allocated per row.
+	viewRec := stream
+	var gosubs []int
+	subRet := -1
+	if stream {
+		subRet = c.alloc()
+	}
+
 	// Predicate pushdown: see compileScanPlain (vdbe_scan.go). buckets prune at
 	// their join level; this body tests only the deferred residue. (`plan` is
 	// the aggregate plan here, so the pushdown plan is jplan.)
@@ -2052,6 +2075,11 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// unaffected.
 	annotateJoinSeeks(c, srcs, jplan)
 	deferredWhere := andConjuncts(jplan.deferred)
+
+	// Which table columns the record has to carry: what the drain, a bare
+	// column or a subquery reading the anchor can read. The rest are not
+	// loaded, and their registers, written by nothing else, stay NULL.
+	needCols := groupByNeededCols(c, stmt, srcs, scopes, nCols)
 
 	body := func() error {
 		whereJump := -1
@@ -2084,6 +2112,9 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 		}
 		for _, s := range srcs {
 			for j := 0; j < len(s.tbl.cols); j++ {
+				if needCols != nil && !needCols[s.scope.offset+j] {
+					continue
+				}
 				c.emit(Instruction{Op: OpColumn, P1: s.scope.cursor, P2: j, P3: colBase + s.scope.offset + j})
 			}
 		}
@@ -2094,8 +2125,23 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 		// counter for the next row that reaches here.
 		c.emit(Instruction{Op: OpSCopy, P1: seqCounterReg, P2: seqSlot})
 		c.emit(Instruction{Op: OpAdd, P1: seqOneReg, P2: seqCounterReg, P3: seqCounterReg})
-		c.emit(Instruction{Op: OpMakeRecord, P1: recBase, P2: recWidth, P3: recReg})
-		c.emit(Instruction{Op: OpSorterInsert, P1: sorter1, P2: recReg})
+		if stream && aggRowCanCarrySubtype(srcs) {
+			// What OpSorterData's P3 does on the way out of the sorter: the
+			// [cols..] block loses its JSON subtype, as a grouped row does in C.
+			for i := 0; i < nCols; i++ {
+				c.emit(Instruction{Op: OpClearSubtype, P1: colBase + i})
+			}
+		}
+		if viewRec {
+			c.emit(Instruction{Op: OpMakeRecord, P1: recBase, P2: recWidth, P3: recReg, P4: recView{}})
+		} else {
+			c.emit(Instruction{Op: OpMakeRecord, P1: recBase, P2: recWidth, P3: recReg})
+		}
+		if stream {
+			gosubs = append(gosubs, c.emit(Instruction{Op: OpGosub, P1: subRet}))
+		} else {
+			c.emit(Instruction{Op: OpSorterInsert, P1: sorter1, P2: recReg})
+		}
 
 		if whereJump >= 0 {
 			c.patch(whereJump, c.here())
@@ -2108,14 +2154,27 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// row-live.
 	savedRowLive := c.rowLive
 	c.rowLive = true
+	gotoSetup, scanStart := -1, -1
+	if stream {
+		gotoSetup = c.emit(Instruction{Op: OpGoto})
+		scanStart = c.here()
+	}
 	err := aggLoopNQueryLoop(c, savedNQueryLoopKnown, func() error { return emitJoinLoops(c, srcs, jplan, body) })
 	c.rowLive = savedRowLive
 	if err != nil {
 		return nil, err
 	}
+	afterScan := -1
+	if stream {
+		afterScan = c.emit(Instruction{Op: OpGoto}) // the scan is done: the final group
+		c.patch(gotoSetup, c.here())
+	}
 
 	// Drain-phase registers.
-	rowRec := c.allocRec()    // sorter1 payload: [cols.., rowids.., seq, groupVals..]
+	rowRec := c.allocRec() // sorter1 payload: [cols.., rowids.., seq, groupVals..]
+	if stream {
+		rowRec = recReg // the scan's own record: the subroutine reads it in place
+	}
 	rowKeyRec := c.allocRec() // this row's group key, read back out of rowRec
 	drainKeyBase := c.allocN(nGroup)
 	curKeyRec := c.allocRec() // the current group's key
@@ -2248,14 +2307,25 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 		}
 	}
 
-	sortJump := c.emit(Instruction{Op: OpSorterSort, P1: sorter1})
-	c.emit(Instruction{Op: OpInteger, P1: 0, P2: haveGroupReg})
-	drainLoop := c.here()
-	// P3 == nCols: the [cols..] block drops its JSON subtype on the way out, as a
-	// grouped row does in C (serialized sorter record). Done once per row at the
-	// leaves, so drain-lowered expressions may generate or consume subtypes freely.
-	// The hash path does the same per register (OpClearSubtype).
-	c.emit(Instruction{Op: OpSorterData, P1: sorter1, P2: rowRec, P3: nCols})
+	sortJump, drainLoop := -1, -1
+	if stream {
+		// The rest of the setup, then back to the scan; the subroutine follows.
+		c.emit(Instruction{Op: OpInteger, P1: 0, P2: haveGroupReg})
+		c.emit(Instruction{Op: OpGoto, P2: scanStart})
+		subStart := c.here()
+		for _, g := range gosubs {
+			c.insns[g].P2 = subStart
+		}
+	} else {
+		sortJump = c.emit(Instruction{Op: OpSorterSort, P1: sorter1})
+		c.emit(Instruction{Op: OpInteger, P1: 0, P2: haveGroupReg})
+		drainLoop = c.here()
+		// P3 == nCols: the [cols..] block drops its JSON subtype on the way out, as a
+		// grouped row does in C (serialized sorter record). Done once per row at the
+		// leaves, so drain-lowered expressions may generate or consume subtypes freely.
+		// The hash path does the same per register (OpClearSubtype).
+		c.emit(Instruction{Op: OpSorterData, P1: sorter1, P2: rowRec, P3: nCols})
+	}
 	// This row's group key, READ from the record the scan body already put it
 	// in -- select.c:8657's "OP_Column sortPTab, j, iBMem+j", one column read
 	// per GROUP BY term, then packed into the record OpGroupSame/OpRecCopy
@@ -2330,14 +2400,21 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	} else if err := emitDrainStepsWithoutRow(c, plan, emitDrainStep); err != nil {
 		return nil, err
 	}
-	c.emit(Instruction{Op: OpSorterNext, P1: sorter1, P2: drainLoop})
+	if stream {
+		c.emit(Instruction{Op: OpReturn, P1: subRet})
+		c.patch(afterScan, c.here())
+	} else {
+		c.emit(Instruction{Op: OpSorterNext, P1: sorter1, P2: drainLoop})
+	}
 
 	// After the drain: emit the final group (unless there were no rows at all).
 	jNoLast := c.emit(Instruction{Op: OpIfNot, P1: haveGroupReg})
 	emitGroup()
 	afterGroups := c.here()
 	c.patch(jNoLast, afterGroups)
-	c.patch(sortJump, afterGroups) // empty sorter1 -> zero groups -> here
+	if sortJump >= 0 {
+		c.patch(sortJump, afterGroups) // empty sorter1 -> zero groups -> here
+	}
 
 	switch {
 	case useDistinctBatch:
@@ -3770,6 +3847,77 @@ func armOrderSensitive(orderProvable bool, aggs []*aggItem) {
 
 // anyOrderSensitive is armOrderSensitive's question on its own, asked BEFORE the
 // proof is computed so a query that needs no proof does not pay for one.
+// groupByNeededCols is the [cols..] slots of a GROUP BY's row record that
+// anything after the scan can read: every column named in the select list,
+// HAVING and ORDER BY -- aggregate arguments and bare columns alike, the
+// latter read from the group's anchor row -- resolved as the drain resolves
+// them (aggDrainRow.slotFor). nil, meaning every column, for "*", any
+// subquery (which may read any column through the anchor), and any reference
+// it cannot place.
+func groupByNeededCols(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes []tableScope, nCols int) []bool {
+	d := newAggDrainRow(c, -1, srcs, scopes, nCols)
+	if d == nil {
+		return nil
+	}
+	ok := true
+	var walk func(e Expr)
+	walk = func(e Expr) {
+		if !ok || e == nil {
+			return
+		}
+		switch x := e.(type) {
+		case ColumnExpr:
+			if slot := d.slotFor(c, x); slot >= 0 {
+				d.need[slot] = true
+				return
+			}
+			slots := d.coalesceSlots(c, x)
+			if slots == nil {
+				ok = false
+				return
+			}
+			for _, sl := range slots {
+				d.need[sl] = true
+			}
+			return
+		case SubqueryExpr, ExistsExpr:
+			ok = false
+			return
+		case InExpr:
+			if x.Sub != nil {
+				ok = false
+				return
+			}
+		}
+		walkExprOperands(e, walk)
+	}
+	for _, sc := range stmt.Columns {
+		if sc.Star {
+			return nil
+		}
+		walk(sc.Expr)
+	}
+	walk(stmt.Having)
+	for _, ot := range stmt.OrderBy {
+		walk(ot.Expr)
+	}
+	if !ok {
+		return nil
+	}
+	return d.need[:nCols]
+}
+
+// anyAggOrderBy reports whether any aggregate has its own ORDER BY, whose
+// buffering reads the step's evaluation context.
+func anyAggOrderBy(aggs []*aggItem) bool {
+	for _, a := range aggs {
+		if a != nil && a.orderBy != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func anyOrderSensitive(aggs []*aggItem) bool {
 	for _, a := range aggs {
 		if a != nil && a.orderSensitive() {

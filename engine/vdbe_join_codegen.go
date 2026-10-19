@@ -2926,10 +2926,11 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 		// (automaticSeekCandidates) -- instead of materializing the table.
 		if s.derived == nil && s.vtabItem == nil && s.cteItem == nil && s.catalogScope == scopeAny &&
 			!s.rightOuter && !s.tbl.withoutRowid &&
-			(len(plan.autoIdxKeys) == 0 || plan.autoIdxKeys[0] == nil) {
+			(len(plan.autoIdxKeys) == 0 || plan.autoIdxKeys[0] == nil || c.rowOrderFree) {
 			// A level carrying an index-order key must MATERIALIZE: the key is
 			// a permutation of the whole row set, which a one-row-at-a-time
-			// b-tree pull has nothing to permute. See OpAutoIndexOrder.
+			// b-tree pull has nothing to permute. See OpAutoIndexOrder. Not when
+			// no order can show (compiler.rowOrderFree): the key is not applied.
 			streamOuter = o
 		}
 	}
@@ -3051,9 +3052,19 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 	// rows before any loop. Never for execOrder[0] (nRow 0 fails "nRow < 3"). See
 	// OpAutoIndexOrder and autoIndexKey.
 	for level, key := range plan.autoIdxKeys {
+		if c.rowOrderFree {
+			break
+		}
 		if key == nil || key.multiOr != nil && key.multiOr.passes != nil {
 			// A multi-table WHERE_MULTI_OR level is ordered inside its own loop,
 			// once per outer row: see emitMultiOrGroups.
+			continue
+		}
+		if s := &srcs[plan.execOrder[level]]; s.joinIdxSeek != nil || s.joinSeekKeyExpr != nil {
+			// A correlated seek re-reads its rows on every rewind, in an order
+			// annotateJoinSeeks proved is this key's (joinSeekReproducesKey).
+			// Ordering the whole table here, before the cursor knew it would
+			// seek, read and sorted every row of it to no effect.
 			continue
 		}
 		c.emit(Instruction{Op: OpAutoIndexOrder, P1: srcs[plan.execOrder[level]].scope.cursor, P4: key})

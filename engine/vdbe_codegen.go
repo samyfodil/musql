@@ -24,6 +24,14 @@ import (
 type onceSlots struct{ base, count int }
 
 type compiler struct {
+	// rowOrderFree is set by compileScanAggregate around its loops when no part
+	// of the result can depend on the order the rows arrive in -- every
+	// aggregate a count, no bare column, nothing reading the anchor row -- so
+	// emitJoinLoops skips the OpAutoIndexOrder sorts that reproduce C's visit
+	// order: they read and sort every row of a table for an answer no order
+	// can change.
+	rowOrderFree bool
+
 	// recSelfKeepsRow maps the cursor of a recursive CTE's self-reference to
 	// whether an outer join's NULL extension of it keeps the current queue row
 	// (C's pseudo-cursor; emitNullExtend). Set by emitJoinLoops; a cursor
