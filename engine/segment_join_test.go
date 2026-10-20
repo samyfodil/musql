@@ -94,3 +94,66 @@ func TestSegJoinSessionFollowsWrites(t *testing.T) {
 		}
 	}
 }
+
+// TestSegJoinMultiOrMatchesLoop holds the join kernel to the loop over a
+// MULTI_OR inner level, whose rows the loop orders per outer row by the
+// first OR term each satisfies, then that term's index: answers whose order
+// shows it -- group_concat, a bare column, ORDER BY ... LIMIT ties -- must
+// match exactly, with the kernel answering.
+func TestSegJoinMultiOrMatchesLoop(t *testing.T) {
+	setup := []string{
+		`CREATE TABLE a(id INTEGER PRIMARY KEY, z INTEGER, s TEXT)`,
+		`CREATE TABLE b(id INTEGER PRIMARY KEY, k INTEGER, x INTEGER, y INTEGER, w TEXT)`,
+		`CREATE INDEX b_x ON b(x)`, `CREATE INDEX b_y ON b(y DESC)`,
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 40) INSERT INTO a SELECT i, i % 9, CASE i % 3 WHEN 0 THEN 'p' ELSE 'q' END FROM n`,
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 6000) INSERT INTO b SELECT i, i % 41, (i * 7) % 13, (i * 11) % 17, 'w' || (i % 5) FROM n`,
+		`DELETE FROM b WHERE id % 97 = 0`,
+		`ANALYZE`,
+	}
+	queries := []string{
+		`SELECT a.id, group_concat(b.id) FROM a JOIN b ON b.k = a.id WHERE b.x = 1 OR b.y = a.z GROUP BY a.id`,
+		`SELECT a.id, group_concat(b.id), b.w FROM a JOIN b ON b.k = a.id WHERE b.x = 1 OR b.y = a.z GROUP BY a.id`,
+		`SELECT a.id, json_group_array(b.y) FROM a JOIN b ON b.k = a.id WHERE b.y = a.z OR b.x = 4 GROUP BY a.id`,
+		`SELECT a.id, b.id FROM a JOIN b ON b.k = a.id WHERE b.x = 1 OR b.y = a.z ORDER BY a.id LIMIT 30`,
+		`SELECT count(*), group_concat(b.id, ',') FROM a JOIN b ON b.k = a.id WHERE b.x = 3 OR b.y = a.z`,
+		// Range terms: each pass's rows in its index's order, b_y descending.
+		`SELECT a.id, group_concat(b.id) FROM a JOIN b ON b.k = a.id WHERE b.x = 1 OR b.y BETWEEN a.z AND a.z + 1 GROUP BY a.id`,
+		`SELECT a.id, group_concat(b.id) FROM a JOIN b ON b.k = a.id WHERE b.x IN (1, 2) OR b.y = a.z GROUP BY a.id`,
+		`SELECT a.s, b.id, count(*) FROM a JOIN b ON b.k = a.id WHERE b.x = 2 OR b.y = a.z GROUP BY a.s`,
+		`SELECT a.id, b.id, b.x FROM a JOIN b ON b.k = a.id WHERE b.x = 1 OR b.y = a.z ORDER BY a.z LIMIT 7`,
+		`SELECT a.id, b.id FROM a JOIN b ON b.k = a.id WHERE b.y = a.z OR b.x = a.z ORDER BY b.w DESC LIMIT 9 OFFSET 2`,
+		`SELECT a.z, json_group_array(b.id) FROM a JOIN b ON b.k = a.id WHERE (b.x = 1 OR b.y = a.z) AND b.id > 100 GROUP BY a.z`,
+	}
+	run := func(off bool) []string {
+		segPeepholesOffForTest = off
+		defer func() { segPeepholesOffForTest = false }()
+		db, err := OpenOrCreate(filepath.Join(t.TempDir(), "m.musq"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		for _, s := range setup {
+			if _, _, err := db.ExecArgs(s, nil); err != nil {
+				t.Fatalf("%s: %v", s, err)
+			}
+			db.CommitIfAutocommit()
+		}
+		var out []string
+		for _, q := range queries {
+			_, rows, err := db.Query(q, nil)
+			out = append(out, fmt.Sprint(rows, err))
+		}
+		return out
+	}
+	SegJoinHitsForTest()
+	want := run(true)
+	got := run(false)
+	if SegJoinHitsForTest() == 0 {
+		t.Fatal("the join kernel answered nothing")
+	}
+	for i := range want {
+		if want[i] != got[i] {
+			t.Errorf("%s:\n  loop   %.300s\n  kernel %.300s", queries[i], want[i], got[i])
+		}
+	}
+}

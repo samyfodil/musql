@@ -41,6 +41,10 @@ type segJoinLoop struct {
 	// function), whose row is skipped unless the value is true.
 	preds   [][]segPlanPred
 	filters [][]segJoinArg
+	// crosses is each level's terms over it and earlier levels, true or the
+	// row is skipped; tags its MULTI_OR order, nil for none.
+	crosses [][]*segJoinExpr
+	tags    []*segJoinTags
 	// head is the first instruction after the opens -- the prologue's, or the
 	// first Rewind -- where a guard goes, before anything reads a table.
 	head    int
@@ -119,6 +123,7 @@ func (l *segJoinLoop) add(cursor, rewind int) bool {
 	l.levelOf[cursor] = len(l.cursors)
 	l.cursors = append(l.cursors, cursor)
 	l.rewinds = append(l.rewinds, rewind)
+	l.tags = append(l.tags, nil)
 	return true
 }
 
@@ -141,20 +146,26 @@ func (l *segJoinLoop) levelPreds(in []Instruction, pc, limit int) (int, bool) {
 	}
 	var preds []segPlanPred
 	var filters []segJoinArg
+	var crosses []*segJoinExpr
 	for {
 		more, end, ok := segParsePredBlock(in, pc, limit, cursor, next)
 		if !ok {
 			return 0, false
 		}
 		preds, pc = append(preds, more...), end
-		f, end, ok := segJoinFilter(in, pc, limit, lv, l.levelOf, next)
+		if f, end, ok := segJoinFilter(in, pc, limit, lv, l.levelOf, next); ok {
+			filters, pc = append(filters, f), end
+			continue
+		}
+		x, end, ok := segJoinCrossFilter(in, pc, limit, l.levelOf, lv, next)
 		if !ok {
 			break
 		}
-		filters, pc = append(filters, f), end
+		crosses, pc = append(crosses, x), end
 	}
 	l.preds = append(l.preds, preds)
 	l.filters = append(l.filters, filters)
+	l.crosses = append(l.crosses, crosses)
 	return pc, true
 }
 
@@ -180,10 +191,19 @@ func (l *segJoinLoop) level(in []Instruction, pc int) (int, bool) {
 		flag = in[pc].P2
 		pc++
 	}
+	// A MULTI_OR level's order, tagged per outer row before its Rewind.
+	tags, pc, ok := parseSegJoinTags(in, pc, l.levelOf)
+	if !ok {
+		return 0, false
+	}
 	if pc+4 >= len(in) || in[pc].Op != OpRewind || !l.add(in[pc].P1, pc) {
 		return 0, false
 	}
 	self := l.levelOf[in[pc].P1]
+	if tags != nil && (tags.cursor != in[pc].P1 || flag >= 0) {
+		return 0, false
+	}
+	l.tags[self] = tags
 	next := -1
 	for i, ins := range in {
 		if ins.Op == OpNext && ins.P1 == l.cursors[self] && ins.P2 == l.rewinds[self]+1 {
@@ -196,7 +216,7 @@ func (l *segJoinLoop) level(in []Instruction, pc int) (int, bool) {
 	// level, columns or expressions over them. The level's own terms come
 	// first, and a term can be an equality too: each candidate is tried
 	// in turn, the first that parses whole taking it.
-	eqAt, preds0, filters0 := -1, len(l.preds), len(l.filters)
+	eqAt, preds0, filters0, crosses0 := -1, len(l.preds), len(l.filters), len(l.crosses)
 	var x, y segJoinArg
 	for p := pc + 1; p+1 < len(in) && eqAt < 0; p++ {
 		e, sk := in[p], in[p+1]
@@ -204,7 +224,7 @@ func (l *segJoinLoop) level(in []Instruction, pc int) (int, bool) {
 			!(sk.P3 == 1 && sk.P2 == next || flag >= 0 && sk.P3 == 0) || !segJoinEqOK(e) {
 			continue
 		}
-		l.preds, l.filters = l.preds[:preds0], l.filters[:filters0]
+		l.preds, l.filters, l.crosses = l.preds[:preds0], l.filters[:filters0], l.crosses[:crosses0]
 		end, ok := l.levelPreds(in, pc+1, p)
 		if !ok {
 			continue
@@ -229,6 +249,9 @@ func (l *segJoinLoop) level(in []Instruction, pc int) (int, bool) {
 	}
 	if eqAt < 0 {
 		return 0, false
+	}
+	if flag >= 0 && len(l.crosses[self]) != 0 {
+		return 0, false // an ON term over other levels decides the NULL row
 	}
 	eq, skip := in[eqAt], in[eqAt+1]
 	tree := flag >= 0 && skip.P3 == 0
@@ -275,7 +298,8 @@ func (l *segJoinLoop) nullLevels(in []Instruction, pc, end, o int) bool {
 	c := &segJoinLoop{opened: l.opened, levelOf: map[int]int{}, ifNots: map[int]int{}, flags: map[int]int{},
 		outers:  l.outers & (1<<(o+1) - 1),
 		cursors: slices.Clone(l.cursors[:o+1]), rewinds: slices.Clone(l.rewinds[:o+1]),
-		preds: slices.Clone(l.preds[:o+1]), filters: slices.Clone(l.filters[:o+1]), edges: slices.Clone(l.edges[:o])}
+		preds: slices.Clone(l.preds[:o+1]), filters: slices.Clone(l.filters[:o+1]), edges: slices.Clone(l.edges[:o]),
+		crosses: slices.Clone(l.crosses[:o+1]), tags: slices.Clone(l.tags[:o+1])}
 	for i, cur := range c.cursors {
 		c.levelOf[cur] = i
 	}
@@ -292,6 +316,7 @@ func (l *segJoinLoop) nullLevels(in []Instruction, pc, end, o int) bool {
 		e, ce := l.edges[i-1], c.edges[i-1]
 		if c.cursors[i] != l.cursors[i] || !reflect.DeepEqual(l.preds[i], c.preds[i]) ||
 			!slices.EqualFunc(l.filters[i], c.filters[i], segJoinSameSrc) ||
+			!slices.EqualFunc(l.crosses[i], c.crosses[i], segJoinSameExpr) || !segJoinSameTags(l.tags[i], c.tags[i]) ||
 			e.a != ce.a || e.b != ce.b || !segJoinSameSrc(e.aArg, ce.aArg) || !segJoinSameSrc(e.bArg, ce.bArg) {
 			return false
 		}
@@ -314,6 +339,14 @@ func (l *segJoinLoop) nullLevels(in []Instruction, pc, end, o int) bool {
 	}
 	l.nullBodies = append(l.nullBodies, c.nullBodies...)
 	return true
+}
+
+// segJoinSameTags reports whether two MULTI_OR orders are the same.
+func segJoinSameTags(a, b *segJoinTags) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.cursor == b.cursor && a.order == b.order && slices.EqualFunc(a.passes, b.passes, segJoinSameExpr)
 }
 
 // segJoinSameSrc reports whether two registers' sources are the same value:
@@ -449,7 +482,7 @@ func segJoinPeephole(prog *Program) bool {
 
 	// The guard takes the place of the first instruction after the opens and
 	// runs it when it declines, so no address moves.
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outers, args: args, agg: plan, seg: step.P2, orders: l.orders}
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2, orders: l.orders}
 	at := len(in)
 	out := append([]Instruction(nil), in...)
 	out[l.head] = Instruction{Op: OpGoto, P2: at}
@@ -716,7 +749,7 @@ func segJoinGroupPeephole(prog *Program) bool {
 	}
 	seqAt := fullOf(seqReg)
 
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outers, args: args, agg: plan, seg: step.P2,
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2,
 		grouped: true, key: key, loads: loads, orders: l.orders}
 	out := append([]Instruction(nil), in...)
 	guard := len(out)
@@ -1383,7 +1416,7 @@ func segJoinHashPeephole(prog *Program) bool {
 			}
 		}
 	}
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outers, args: args, agg: plan, seg: step.P2,
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2,
 		grouped: true, key: key, orders: l.orders}
 	key.reg = keyReg
 	jp.key = key
@@ -1458,7 +1491,7 @@ func segJoinTopPeephole(prog *Program) bool {
 			order = append(order, a)
 		}
 	}
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outers, agg: nil, orders: l.orders,
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, agg: nil, orders: l.orders,
 		loads: loads, order: order, keys: ki}
 	out := append([]Instruction(nil), in...)
 	guard := len(out)
@@ -1659,4 +1692,126 @@ body:
 	}
 	b.end = pc
 	return b, true
+}
+
+// segJoinTags is a MULTI_OR level's order as the loop builds it per outer
+// row: each row of cursor tagged with the first of passes it satisfies
+// (len(passes) for none), then ordered by (tag, that pass's index key,
+// rowid) -- order.keys -- by OpMultiOrSort.
+type segJoinTags struct {
+	cursor int
+	passes []*segJoinExpr
+	order  *multiOrOrder
+}
+
+// segJoinSafeRun reports whether in[from:to] is a run the kernel may evaluate
+// on any joined row the loop meets: operations that cannot raise an error --
+// the loop runs them on rows the kernel skips, where an error would be the
+// statement's answer -- reading columns of the levels in levelOf up to
+// maxLv, or of cursor self, with every jump forward and inside the run or to
+// its end.
+func segJoinSafeRun(in []Instruction, from, to int, levelOf map[int]int, maxLv, self int) bool {
+	if from >= to {
+		return false
+	}
+	for j := from; j < to; j++ {
+		ins := in[j]
+		switch ins.Op {
+		case OpColumn, OpRowid:
+			if lv, ok := levelOf[ins.P1]; !(ok && lv <= maxLv || ins.P1 == self) {
+				return false
+			}
+		case OpInteger, OpInt64, OpReal, OpString8, OpNull, OpVariable, OpCopy, OpSCopy, OpNot,
+			OpConcat, OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder:
+		case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull, OpGoto:
+			if segJoinIsJump(ins) && (ins.P2 <= j || ins.P2 > to) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// segJoinRun is in[from:to] as an expression into out.
+func segJoinRun(in []Instruction, from, to, out int) *segJoinExpr {
+	e := &segJoinExpr{out: out, insns: slices.Clone(in[from:to])}
+	for j := from; j < to; j++ {
+		e.pcs = append(e.pcs, j)
+	}
+	return e
+}
+
+// segJoinCrossFilter reads a term at pc over level lv and the levels before
+// it: a safe run (segJoinSafeRun) computing a register, then an IfNot that
+// skips the row to next unless it is true. It returns the run and the
+// address after the IfNot.
+func segJoinCrossFilter(in []Instruction, pc, limit int, levelOf map[int]int, lv, next int) (*segJoinExpr, int, bool) {
+	for i := pc + 1; i < limit; i++ {
+		ins := in[i]
+		if ins.Op != OpIfNot || ins.P2 != next || ins.P3 != 1 {
+			continue
+		}
+		if !segJoinSafeRun(in, pc, i, levelOf, lv, -1) {
+			return nil, 0, false
+		}
+		return segJoinRun(in, pc, i, ins.P1), i + 1, true
+	}
+	return nil, 0, false
+}
+
+// parseSegJoinTags reads, at pc, the block a MULTI_OR level runs before its
+// Rewind (emitMultiOrGroups):
+//
+//	Rewind cur -> done
+//	top: Integer 0 g; <pass 0>; If -> tag; ...; Integer n g
+//	tag: MultiOrTag cur g; Next cur -> top
+//	done: MultiOrSort cur
+//
+// It returns nil and pc when there is none, else the tags and the address
+// after the block.
+func parseSegJoinTags(in []Instruction, pc int, levelOf map[int]int) (*segJoinTags, int, bool) {
+	if pc >= len(in) || in[pc].Op != OpRewind {
+		return nil, pc, true
+	}
+	cur, done := in[pc].P1, in[pc].P2
+	if done <= pc || done >= len(in) || in[done].Op != OpMultiOrSort || in[done].P1 != cur {
+		return nil, pc, true
+	}
+	mo, ok := in[done].P4.(*multiOrOrder)
+	tag := done - 2
+	if !ok || mo == nil || len(mo.passes) == 0 || len(mo.keys) != len(mo.passes) || tag <= pc ||
+		in[tag].Op != OpMultiOrTag || in[tag].P1 != cur || in[tag+1].Op != OpNext || in[tag+1].P1 != cur || in[tag+1].P2 != pc+1 {
+		return nil, 0, false
+	}
+	if _, entered := levelOf[cur]; entered {
+		return nil, 0, false
+	}
+	g := in[tag].P2
+	t := &segJoinTags{cursor: cur, order: mo}
+	q := pc + 1
+	for i := 0; ; i++ {
+		if q >= tag || in[q].Op != OpInteger || in[q].P1 != i || in[q].P2 != g {
+			return nil, 0, false
+		}
+		q++
+		if i == len(mo.passes) {
+			break
+		}
+		e := q
+		for e < tag && !(in[e].Op == OpIf && in[e].P2 == tag) {
+			e++
+		}
+		// A NULL pass is not satisfied: the If does not jump on it.
+		if e >= tag || in[e].P3 != 0 || !segJoinSafeRun(in, q, e, levelOf, len(levelOf)-1, cur) {
+			return nil, 0, false
+		}
+		t.passes = append(t.passes, segJoinRun(in, q, e, in[e].P1))
+		q = e + 1
+	}
+	if q != tag {
+		return nil, 0, false
+	}
+	return t, done + 1, true
 }

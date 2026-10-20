@@ -56,6 +56,11 @@ type segJoinPlan struct {
 	grouped bool
 	key     segJoinArg
 	loads   []segJoinArg
+	// crosses is each level's terms over it and the levels before it, true
+	// or the joined row is skipped; tags each level's MULTI_OR order, nil
+	// for none.
+	crosses [][]*segJoinExpr
+	tags    []*segJoinTags
 	// orders is the loop's AutoIndexOrders: a level visiting its rows in an
 	// index's order rather than rowid order.
 	orders []segJoinOrder
@@ -806,11 +811,121 @@ type segJoinWalk struct {
 	// nullExprs is each expression's value on the optional level's NULL row.
 	nullExprs map[*segJoinExpr]Value
 
+	// crosses and tags are plan's; levelOf maps a cursor to its level, for
+	// a run over several; tagKeys, per tagged level, each pass's index key
+	// per row of the level's table. failed is set when a run could not be
+	// evaluated: whatever the walk produced is then not the loop's.
+	crosses [][]*segJoinExpr
+	tags    []*segJoinTags
+	levelOf map[int]int
+	tagKeys [][]func(i, k int) Value
+	vm      *vdbe
+	failed  bool
+
 	// order0 is the first level's rows in the order the loop visits them,
 	// nil for rowid order; rank, per level, each row's place in the order
 	// the loop visits that level's rows, nil for rowid order.
 	order0 []int32
 	rank   [][]int32
+}
+
+// segJoinScratch is a cursor like cur holding t's rows in rowid order, each
+// as the cursor reads it (t.value), for the cursor's own ordering code to run
+// on as it runs on the real one.
+func segJoinScratch(t *segJoinTable, cur *vdbeCursor, m *vdbe) *vdbeCursor {
+	ncol := len(t.tbl.cols)
+	rows := make([][]Value, t.n)
+	rowids := make([]uint64, t.n)
+	for r := range t.n {
+		row := make([]Value, ncol)
+		for c := range ncol {
+			row[c] = t.value(int32(r), c)
+		}
+		rows[r], rowids[r] = row, uint64(t.rowids[r])
+	}
+	return &vdbeCursor{tbl: cur.tbl, pager: cur.pager, params: m.params, rows: rows, rowids: rowids}
+}
+
+// eval is run e's value on the joined row at.
+func (w *segJoinWalk) eval(e *segJoinExpr, at []int32) (Value, bool) {
+	column := func(op *Instruction) Value {
+		lv := w.levelOf[op.P1]
+		return w.tabs[lv].value(at[lv], op.P2)
+	}
+	rowid := func(op *Instruction) Value {
+		lv := w.levelOf[op.P1]
+		if at[lv] < 0 {
+			return Value{}
+		}
+		return Value{Typ: Int, I: w.tabs[lv].rowids[at[lv]]}
+	}
+	v, ok := segJoinEvalRow(w.vm, e, column, rowid)
+	if !ok {
+		w.failed = true
+	}
+	return v, ok
+}
+
+// keep reports whether the joined row at, through level i, passes level i's
+// terms over several levels.
+func (w *segJoinWalk) keep(i int, at []int32) bool {
+	if w.crosses == nil {
+		return true
+	}
+	for _, e := range w.crosses[i] {
+		v, ok := w.eval(e, at)
+		if !ok || !isTruthy(v) {
+			return false
+		}
+	}
+	return true
+}
+
+// tagOf is the pass level i's row at[i] files under for the outer row in at:
+// the first it satisfies, else one past the last.
+func (w *segJoinWalk) tagOf(i int, at []int32) int {
+	tg := w.tags[i]
+	for g, e := range tg.passes {
+		v, ok := w.eval(e, at)
+		if !ok {
+			return len(tg.passes)
+		}
+		if v.Typ != Null && isTruthy(v) {
+			return g
+		}
+	}
+	return len(tg.passes)
+}
+
+// tagCmp orders level i's rows x and y under the outer row in at as
+// multiOrSortTagged does: by pass, then that pass's key, then rowid.
+func (w *segJoinWalk) tagCmp(i int, at []int32, x, y int32) int {
+	tg, t := w.tags[i], w.tabs[i]
+	save := at[i]
+	at[i] = x
+	gx := w.tagOf(i, at)
+	at[i] = y
+	gy := w.tagOf(i, at)
+	at[i] = save
+	if gx != gy {
+		return gx - gy
+	}
+	byRowid := cmp.Compare(t.rowids[x], t.rowids[y])
+	if gx >= len(tg.order.keys) || tg.order.keys[gx] == nil {
+		return byRowid
+	}
+	key, kv := tg.order.keys[gx], w.tagKeys[i][gx]
+	for k := range key.cols {
+		c := compareValuesCollatedEnc(kv(int(x), k), kv(int(y), k), key.colls[k], w.m.encoding())
+		if c == 0 {
+			continue
+		}
+		if k < len(key.desc) && key.desc[k] {
+			return -c
+		}
+		return c
+	}
+	return byRowid
 }
 
 // segJoinOrderEncoding is the encoding OpAutoIndexOrder compares cur's text
@@ -833,17 +948,7 @@ func segJoinCursorOrder(t *segJoinTable, cur *vdbeCursor, key *autoIndexKey, m *
 	if t.tbl == nil || key.multiOr != nil && key.multiOr.passes != nil {
 		return nil, false
 	}
-	ncol := len(t.tbl.cols)
-	rows := make([][]Value, t.n)
-	rowids := make([]uint64, t.n)
-	for r := range t.n {
-		row := make([]Value, ncol)
-		for c := range ncol {
-			row[c] = t.value(int32(r), c)
-		}
-		rows[r], rowids[r] = row, uint64(t.rowids[r])
-	}
-	sc := &vdbeCursor{tbl: cur.tbl, pager: cur.pager, params: m.params, rows: rows, rowids: rowids}
+	sc := segJoinScratch(t, cur, m)
 	autoIndexOrderCursor(sc, key, segJoinOrderEncoding(cur, m))
 	t.index()
 	perm := make([]int, t.n)
@@ -866,6 +971,9 @@ func (w *segJoinWalk) opt(i int) bool { return w.optional>>i&1 != 0 }
 func (w *segJoinWalk) before(a, b []int32) bool {
 	for i := range a {
 		if a[i] != b[i] {
+			if w.tags != nil && w.tags[i] != nil && a[i] >= 0 && b[i] >= 0 {
+				return w.tagCmp(i, slices.Clone(a), a[i], b[i]) < 0
+			}
 			if w.rank != nil && w.rank[i] != nil && a[i] >= 0 && b[i] >= 0 {
 				return w.rank[i][a[i]] < w.rank[i][b[i]]
 			}
@@ -944,7 +1052,7 @@ func (w *segJoinWalk) exprValues(a segJoinArg) ([]Value, bool) {
 	out := make([]Value, n)
 	for r := range n {
 		row = int32(r)
-		v, ok := segJoinEvalRow(&vm, a.expr, column, t.value(row, -1))
+		v, ok := segJoinEvalRow(&vm, a.expr, column, func(*Instruction) Value { return t.value(row, -1) })
 		if !ok {
 			return nil, false
 		}
@@ -970,13 +1078,13 @@ func (w *segJoinWalk) exprValues(a segJoinArg) ([]Value, bool) {
 }
 
 // segJoinEvalRow runs e once on vm's registers, its columns read by column
-// and its rowid rowid, and returns its value.
-func segJoinEvalRow(vm *vdbe, e *segJoinExpr, column func(*Instruction) Value, rowid Value) (Value, bool) {
+// and its rowids by rowid, and returns its value.
+func segJoinEvalRow(vm *vdbe, e *segJoinExpr, column, rowid func(*Instruction) Value) (Value, bool) {
 	for k := 0; k < len(e.insns); {
 		op := &e.insns[k]
 		switch {
 		case op.Op == OpRowid:
-			vm.regs[op.P2] = rowid
+			vm.regs[op.P2] = rowid(op)
 		case op.Op == OpGoto:
 			k = e.at(op.P2)
 			continue
@@ -1007,7 +1115,8 @@ func (w *segJoinWalk) nullRowValue(a segJoinArg) (Value, bool) {
 	vm := *w.m
 	vm.regs = make([]Value, len(w.m.regs))
 	vm.fnArgBuf, vm.likePlan = nil, nil
-	v, ok := segJoinEvalRow(&vm, a.expr, func(*Instruction) Value { return Value{} }, Value{})
+	none := func(*Instruction) Value { return Value{} }
+	v, ok := segJoinEvalRow(&vm, a.expr, none, none)
 	if !ok {
 		return Value{}, false
 	}
@@ -1127,6 +1236,39 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 			return nil, false
 		}
 		w.tabs[i] = t
+	}
+	w.crosses, w.tags, w.levelOf = plan.crosses, plan.tags, map[int]int{}
+	for i, c := range plan.cursors {
+		w.levelOf[c] = i
+	}
+	vm := *m
+	vm.regs = make([]Value, len(m.regs))
+	vm.fnArgBuf, vm.likePlan = nil, nil
+	w.vm = &vm
+	for i, tg := range plan.tags {
+		if tg == nil {
+			continue
+		}
+		// The first level has no outer row to tag it by.
+		if i == 0 || tg.cursor != plan.cursors[i] {
+			return nil, false
+		}
+		sc := segJoinScratch(w.tabs[i], m.cursors[tg.cursor], m)
+		if w.tagKeys == nil {
+			w.tagKeys = make([][]func(i, k int) Value, k)
+		}
+		w.tagKeys[i] = make([]func(i, k int) Value, len(tg.order.keys))
+		for g, key := range tg.order.keys {
+			if key == nil {
+				continue
+			}
+			// OpMultiOrSort fails on a key it cannot compute for some row.
+			at, ok := autoIndexKeyValues(sc, key)
+			if !ok || len(key.colls) < len(key.cols) {
+				return nil, false
+			}
+			w.tagKeys[i][g] = at
+		}
 	}
 	// The index orders the loop applies -- as OpAutoIndexOrder does: not to a
 	// cursor it streams or re-seeks -- the first level's by the same sort,
@@ -1304,11 +1446,19 @@ func (w *segJoinWalk) each(at []int32, fn func() bool) bool {
 				continue
 			}
 			at[0] = r
+			if !w.keep(0, at) {
+				continue
+			}
 			for i := 1; i < k; i++ {
 				l := &w.link[i]
 				found := int32(-1)
 				if from := at[l.from]; from >= 0 {
 					found = l.one[from]
+				}
+				if found >= 0 && w.crosses != nil && len(w.crosses[i]) != 0 {
+					if at[i] = found; !w.keep(i, at) {
+						found = -1
+					}
 				}
 				if found < 0 || w.pass[i] != nil && !w.pass[i][found] {
 					if !w.opt(i) {
@@ -1338,7 +1488,7 @@ func (w *segJoinWalk) each(at []int32, fn func() bool) bool {
 				}
 				if pass == nil || pass[r] {
 					at[0] = r
-					if !visit(1) {
+					if w.keep(0, at) && !visit(1) {
 						return false
 					}
 				}
@@ -1350,18 +1500,34 @@ func (w *segJoinWalk) each(at []int32, fn func() bool) bool {
 		if from := at[l.from]; from >= 0 {
 			if l.one != nil {
 				if r := l.one[from]; r >= 0 && (pass == nil || pass[r]) {
-					matched, at[i] = true, r
-					if !visit(i + 1) {
-						return false
+					if at[i] = r; w.keep(i, at) {
+						matched = true
+						if !visit(i + 1) {
+							return false
+						}
 					}
 				}
 			} else if l.nulls == nil || !l.nulls[from] {
 				// A NULL key equals nothing; any other, the rows holding it.
 				key := l.keys[from]
 				lo, _ := slices.BinarySearch(l.sorted, key)
-				for j := lo; j < len(l.sorted) && l.sorted[j] == key; j++ {
-					if r := l.rows[j]; pass == nil || pass[r] {
-						matched, at[i] = true, r
+				hi := lo
+				for hi < len(l.sorted) && l.sorted[hi] == key {
+					hi++
+				}
+				rows := l.rows[lo:hi]
+				if w.tags != nil && w.tags[i] != nil {
+					// A MULTI_OR level: its rows in the order the loop puts
+					// them in for this outer row.
+					rows = slices.Clone(rows)
+					slices.SortStableFunc(rows, func(x, y int32) int { return w.tagCmp(i, at, x, y) })
+				}
+				for _, r := range rows {
+					if pass == nil || pass[r] {
+						if at[i] = r; !w.keep(i, at) {
+							continue
+						}
+						matched = true
 						if !visit(i + 1) {
 							return false
 						}
@@ -1596,7 +1762,14 @@ type segJoinGroup struct {
 
 // segJoinGroupsOf builds plan's groups, or reports false. A plan with no
 // GROUP BY has one group, or none when nothing joins.
-func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (*segJoinGroups, bool) {
+func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (gs *segJoinGroups, ok bool) {
+	defer func() {
+		// A run the walk could not evaluate: what it produced is not the
+		// loop's.
+		if ok && gs != nil && gs.w != nil && gs.w.failed {
+			gs, ok = nil, false
+		}
+	}()
 	w, ok := m.openSegJoin(plan)
 	if !ok {
 		return nil, false
@@ -2029,7 +2202,14 @@ func (gs *segJoinGroups) gather(g *segJoinGroup, row, rowids []Value) bool {
 // holding exactly the rows every joined row would have: the rows it keeps
 // are these, and among equal keys it keeps the earliest inserted, whose
 // order is the loop's. Each is a group of one row, which OpSegJoinNext loads.
-func (m *vdbe) segJoinTopOf(plan *segJoinPlan) (*segJoinGroups, bool) {
+func (m *vdbe) segJoinTopOf(plan *segJoinPlan) (gs *segJoinGroups, ok bool) {
+	defer func() {
+		// A run the walk could not evaluate: what it produced is not the
+		// loop's.
+		if ok && gs != nil && gs.w != nil && gs.w.failed {
+			gs, ok = nil, false
+		}
+	}()
 	ki := plan.keys
 	if ki == nil || ki.bound <= 0 || ki.nKey != len(plan.order) {
 		return nil, false
@@ -2105,7 +2285,7 @@ func (m *vdbe) segJoinTopOf(plan *segJoinPlan) (*segJoinGroups, bool) {
 		}
 		return true
 	})
-	gs := &segJoinGroups{w: w, plan: plan}
+	gs = &segJoinGroups{w: w, plan: plan}
 	if len(heap) == 0 {
 		return gs, true
 	}

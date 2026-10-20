@@ -111,6 +111,10 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 		setup = append(setup, fmt.Sprintf(`UPDATE f SET v = v + 1 WHERE id %% %d = 0`, 2+r.Intn(5)))
 	}
 	vacuum := r.Intn(2) == 0
+	if r.Intn(3) == 0 {
+		// Statistics, under which the planner may take a MULTI_OR level.
+		setup = append(setup, `ANALYZE`)
+	}
 
 	queries := make([]string, 0, 60)
 	aggs := []string{"count(*)", "count(f.v)", "sum(f.v)", "total(f.w)", "avg(f.v)", "min(f.v)", "max(f.v)",
@@ -157,7 +161,9 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 		"WHERE f.v > 50 OR f.s = 'a'", "WHERE CASE WHEN f.w > 0 THEN 1 END",
 		"WHERE f.v IN (1, 2, 3, 40)", "WHERE d2.x IN (1, 2) AND f.s IN ('a', 'b')", "WHERE f.v NOT IN (1, 2, NULL)",
 		"WHERE f.v IN (5, NULL)", "WHERE f.s NOT IN ('B', '')", "WHERE d2.x > 1", "WHERE d2.x BETWEEN 0 AND 5 AND f.v > 0",
-		"WHERE d2.x * 2 - d2.y > 1", "WHERE d2.x = 1 OR d2.y > 3", "WHERE d2.x IN (2, 3) OR d2.y < 0"}
+		"WHERE d2.x * 2 - d2.y > 1", "WHERE d2.x = 1 OR d2.y > 3", "WHERE d2.x IN (2, 3) OR d2.y < 0",
+		"WHERE f.v > d2.x", "WHERE f.w < d2.y OR f.s = 'a'", "WHERE d2.x = 1 OR d2.y = f.w", "WHERE d2.x = f.v % 5 OR d2.y > 3",
+		"WHERE coalesce(f.v, d2.x) > 2", "WHERE CASE WHEN f.v > d2.x THEN f.w ELSE d2.y END > 0"}
 	for range 50 {
 		join := joins[r.Intn(len(joins))]
 		hasD1 := strings.Contains(join, "d1 ")
@@ -195,7 +201,8 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 	for range 10 {
 		join := joins[r.Intn(len(joins))]
 		keys := []string{"f.v", "f.v DESC", "d2.x", "f.w DESC", "f.s", "d2.id DESC, f.id", "f.v % 9 DESC", "length(f.s), f.id", "coalesce(d2.x, 7), f.id", "d2.y DESC, f.id DESC", "d2.x IS NULL, f.v"}
-		topWheres := []string{"", "", "WHERE d2.x * 2 - d2.y > 1", "WHERE d2.x = 1 OR d2.y > 3", "WHERE d2.x > 1"}
+		topWheres := []string{"", "", "WHERE d2.x * 2 - d2.y > 1", "WHERE d2.x = 1 OR d2.y > 3", "WHERE d2.x > 1",
+			"WHERE d2.x = 1 OR d2.y = f.w", "WHERE f.v > d2.x"}
 		queries = append(queries, fmt.Sprintf("SELECT f.id, d2.id, f.v %s %s ORDER BY %s LIMIT %d OFFSET %d",
 			join, topWheres[r.Intn(len(topWheres))], keys[r.Intn(len(keys))], 1+r.Intn(12), r.Intn(4)))
 	}
