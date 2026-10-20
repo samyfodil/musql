@@ -115,21 +115,21 @@ its direct engine API.
 
 | Query | musql | vs C SQLite | vs Turso | vs DuckDB |
 | --- | ---: | ---: | ---: | ---: |
-| Filtered count, one predicate | 21 µs | **300× faster** | 970× faster | 29× faster |
-| Filtered count, two predicates | 73 µs | **95× faster** | 380× faster | 10× faster |
-| Rowid lookup | 3 µs | **4× faster** | 17× faster | 130× faster |
-| Secondary-index equality | 1 µs | **9× faster** | 37× faster | 280× faster |
-| Indexed equi-join | 8 µs | **2× faster** | 10× faster | 100× faster |
-| Sum over a filter | 49 µs | **130× faster** | 500× faster | 15× faster |
-| Grouped aggregate | 418 µs | **95× faster** | 260× faster | 3× faster |
-| `ORDER BY v DESC LIMIT 20` | 345 µs | **25× faster** | 270× faster | 3× faster |
-| Grouped `min`/`max` | 1.0 ms | **42× faster** | 120× faster | 1.4× faster |
-| `OR` predicate | 747 µs | **9× faster** | 33× faster | 3× faster |
-| `IN` list | 1.6 ms | **7× faster** | 20× faster | 1.7× faster |
+| Filtered count, one predicate | 40 µs | **142× faster** | 475× faster | 15× faster |
+| Filtered count, two predicates | 76 µs | **86× faster** | 310× faster | 10× faster |
+| Rowid lookup | 1 µs | **9× faster** | 32× faster | 290× faster |
+| Secondary-index equality | 2 µs | **4× faster** | 23× faster | 170× faster |
+| Indexed equi-join | 7 µs | **2× faster** | 11× faster | 98× faster |
+| Sum over a filter | 32 µs | **190× faster** | 700× faster | 21× faster |
+| Grouped aggregate | 543 µs | **71× faster** | 190× faster | 2.4× faster |
+| `ORDER BY v DESC LIMIT 20` | 330 µs | **24× faster** | 260× faster | 2.8× faster |
+| Grouped `min`/`max` | 1.03 ms | **39× faster** | 100× faster | 1.3× faster |
+| `OR` predicate | 506 µs | **13× faster** | 51× faster | 4.7× faster |
+| `IN` list | 1.08 ms | **10× faster** | 25× faster | 2.3× faster |
 
 Scans and aggregates run as JIT-compiled code over musql's columnar format, and
 the multiples hold or grow at 1,000,000 rows. Through `database/sql`, a point
-lookup costs about as much as native C SQLite (12 µs here) rather than 4× less.
+lookup costs about 5 µs, still 2× less than native C SQLite.
 DuckDB is an analytical engine and not SQLite-compatible; with its default
 thread count it is faster on some of these, and `engine.WithWorkers(n)` lets
 musql split scans across goroutines too. Without the JIT, musql loses to C
