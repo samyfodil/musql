@@ -118,7 +118,8 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 	}
 	groups := []string{"", "GROUP BY d2.id", "GROUP BY f.d2_id", "GROUP BY d2.x", "GROUP BY d1.id", "GROUP BY d1.b", "GROUP BY f.s",
 		"GROUP BY d2.x / 2", "GROUP BY upper(f.s)", "GROUP BY f.v % 5"}
-	wheres := []string{"", "WHERE f.v > 10", "WHERE d2.x <= 3 AND f.w > 0", "WHERE f.id % 2 = 0", "WHERE d1.a <> 2", "WHERE f.v >= ?"}
+	wheres := []string{"", "WHERE f.v > 10", "WHERE d2.x <= 3 AND f.w > 0", "WHERE f.id % 2 = 0", "WHERE d1.a <> 2", "WHERE f.v >= ?",
+		"WHERE f.s LIKE 'b%'", "WHERE abs(f.v) > 3 AND length(f.s) = 1", "WHERE d2.y", "WHERE f.v + d2.x > 4", "WHERE coalesce(f.w, 1) > 0"}
 	for range 50 {
 		join := joins[r.Intn(len(joins))]
 		hasD1 := strings.Contains(join, "d1 ")

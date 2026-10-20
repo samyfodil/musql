@@ -36,8 +36,11 @@ type segJoinLoop struct {
 	ifEmpty []int
 	sorted  bool // an AutoIndexOrder reorders some level
 	// preds is each level's own WHERE terms, tested right after its Rewind:
-	// a column against a constant, which skip the level's row.
-	preds [][]segPlanPred
+	// a column against a constant, which skip the level's row. filters are
+	// the level's other terms: an expression over its columns (a LIKE, a
+	// function), whose row is skipped unless the value is true.
+	preds   [][]segPlanPred
+	filters [][]segJoinArg
 	// head is the first instruction after the opens -- the prologue's, or the
 	// first Rewind -- where a guard goes, before anything reads a table.
 	head    int
@@ -118,12 +121,23 @@ func parseSegJoinLoop(in []Instruction, open int) (*segJoinLoop, bool) {
 		if next < 0 {
 			return 0, false
 		}
-		preds, end, ok := segParsePredBlock(in, pc, limit, cursor, next)
-		if !ok {
-			return 0, false
+		var preds []segPlanPred
+		var filters []segJoinArg
+		for {
+			more, end, ok := segParsePredBlock(in, pc, limit, cursor, next)
+			if !ok {
+				return 0, false
+			}
+			preds, pc = append(preds, more...), end
+			f, end, ok := segJoinFilter(in, pc, limit, lv, l.levelOf, next)
+			if !ok {
+				break
+			}
+			filters, pc = append(filters, f), end
 		}
 		l.preds = append(l.preds, preds)
-		return end, true
+		l.filters = append(l.filters, filters)
+		return pc, true
 	}
 	if pc, ok = levelPreds(pc, len(in)); !ok {
 		return nil, false
@@ -336,7 +350,7 @@ func segJoinPeephole(prog *Program) bool {
 
 	// The guard takes the place of the first instruction after the opens and
 	// runs it when it declines, so no address moves.
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, optional: l.outer, args: args, agg: plan, seg: step.P2, sorted: l.sorted}
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outer, args: args, agg: plan, seg: step.P2, sorted: l.sorted}
 	at := len(in)
 	out := append([]Instruction(nil), in...)
 	out[l.head] = Instruction{Op: OpGoto, P2: at}
@@ -597,7 +611,7 @@ func segJoinGroupPeephole(prog *Program) bool {
 	}
 	seqAt := fullOf(seqReg)
 
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, optional: l.outer, args: args, agg: plan, seg: step.P2,
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outer, args: args, agg: plan, seg: step.P2,
 		grouped: true, key: key, loads: loads, sorted: l.sorted}
 	out := append([]Instruction(nil), in...)
 	guard := len(out)
@@ -875,6 +889,28 @@ func segJoinSameInsn(a, b Instruction) bool {
 	return ta == reflect.TypeOf(b.P4) && ta.Comparable() && a.P4 == b.P4
 }
 
+// segJoinFilter reads a term at pc that segParsePredBlock does not: a run of
+// instructions a segJoinTrace follows, over level lv's columns, ending in an
+// IfNot that skips the row to next when the value is false or NULL. It
+// returns the value's source and the address after the IfNot.
+func segJoinFilter(in []Instruction, pc, limit, lv int, levelOf map[int]int, next int) (segJoinArg, int, bool) {
+	tr := newSegJoinTrace(in, levelOf)
+	for i := pc; i < limit; i++ {
+		ins := in[i]
+		if ins.Op == OpIfNot {
+			src, ok := tr.src[ins.P1]
+			if !ok || i == pc || ins.P2 != next || ins.P3 != 1 || src.level != lv && src.level >= 0 {
+				return segJoinArg{}, 0, false
+			}
+			return src, i + 1, true
+		}
+		if ins.Op == OpColumn && levelOf[ins.P1] != lv || !tr.step(i) {
+			return segJoinArg{}, 0, false
+		}
+	}
+	return segJoinArg{}, 0, false
+}
+
 // segJoinIsRecheck reports whether a join's recheck starts at pc: two column
 // reads and their equality's skip.
 func segJoinIsRecheck(in []Instruction, pc int) bool {
@@ -1004,7 +1040,7 @@ func segJoinHashPeephole(prog *Program) bool {
 			}
 		}
 	}
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, optional: l.outer, args: args, agg: plan, seg: step.P2,
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outer, args: args, agg: plan, seg: step.P2,
 		grouped: true, key: key, sorted: l.sorted}
 	key.reg = keyReg
 	jp.key = key
@@ -1103,7 +1139,7 @@ body:
 			order = append(order, a)
 		}
 	}
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, optional: l.outer, agg: nil,
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outer, agg: nil,
 		loads: loads, order: order, keys: ki}
 	out := append([]Instruction(nil), in...)
 	guard := len(out)

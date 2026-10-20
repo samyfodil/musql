@@ -114,6 +114,11 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT t.id FROM albums al LEFT JOIN tracks t ON t.album_id = al.id ORDER BY t.plays LIMIT 5`, false},
 		// DISTINCT over INTEGER arguments.
 		{`SELECT count(DISTINCT t.album_id), count(*), sum(DISTINCT t.seconds % 7) FROM tracks t JOIN albums al ON al.id = t.album_id`, true},
+		// Terms that are expressions: a LIKE, a function, a column as a truth.
+		{`SELECT al.id, count(*) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.id LIKE '1%' AND abs(t.plays) > 10000 GROUP BY al.id`, true},
+		{`SELECT count(*), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.rating AND al.year % 3 = 1`, true},
+		{`SELECT g.tag, count(*) FROM tracks t JOIN tags g ON g.id = t.album_id WHERE g.tag LIKE 'r%' GROUP BY g.tag`, true},
+		{`SELECT count(*) FROM tracks t JOIN tags g ON g.id = t.album_id WHERE g.ci GLOB '[rR]*' OR g.tag IS NULL`, false},
 		// Expressions over one table's columns, computed once per row of it.
 		{`SELECT al.id, sum(t.seconds * t.plays), max(t.seconds - 100), count(t.seconds / 7) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
 		{`SELECT al.year / 10, count(*), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.year / 10`, true},

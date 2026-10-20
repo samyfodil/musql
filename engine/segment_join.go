@@ -42,6 +42,7 @@ type segJoinPlan struct {
 	cursors []int           // per level, outermost first
 	edges   []segJoinEdge   // the equalities joining the levels
 	preds   [][]segPlanPred // per level, its own WHERE terms
+	filters [][]segJoinArg  // per level, its other terms: true or the row is skipped
 	// optional is the level a LEFT JOIN makes optional -- the innermost --
 	// or -1: an outer row nothing there matches still joins, with that
 	// level's row all NULL.
@@ -992,6 +993,33 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 			return nil, false
 		}
 		w.pass[i] = w.tabs[i].passing(preds, resolved)
+	}
+	for i, fs := range plan.filters {
+		for _, f := range fs {
+			if w.pass[i] == nil {
+				w.pass[i] = make([]bool, w.tabs[i].n)
+				for r := range w.pass[i] {
+					w.pass[i][r] = true
+				}
+			}
+			// The term's value per row, true as the loop's IfNot reads it:
+			// not NULL, and true.
+			var vals []Value
+			if f.expr != nil {
+				f.level = i
+				var ok bool
+				if vals, ok = w.exprValues(f); !ok {
+					return nil, false
+				}
+			} else {
+				vals = w.tabs[i].values(f.col)
+			}
+			for r, v := range vals {
+				if w.pass[i][r] && (v.Typ == Null || !isTruthy(v)) {
+					w.pass[i][r] = false
+				}
+			}
+		}
 	}
 	for _, i := range w.order[1:] {
 		keys, nulls, ok := w.tabs[w.parent[i]].keyCol(parentCol[i])
