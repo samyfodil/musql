@@ -90,7 +90,7 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 		}
 		return fmt.Sprintf("%d.%d", r.Intn(40)-10, r.Intn(4)*25)
 	}
-	words := []string{"'a'", "'B'", "'b'", "'c'", "NULL", "''"}
+	words := []string{"'a'", "'B'", "'b'", "'c'", "NULL", "''", "'A '", "char(97, 0, 98)", "char(65, 0, 99)", "'ä'", "'Ä'"}
 	n1, n2, nf := 3+r.Intn(12), 5+r.Intn(30), 20+r.Intn(400)
 	var d1ids, d2ids []int
 	for i := range n1 {
@@ -164,7 +164,7 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 		"FROM f LEFT JOIN d2 ON d2.id = f.d2_id + 0 LEFT JOIN d1 ON d1.id = coalesce(d2.d1_id, f.d1_id)",
 	}
 	groups := []string{"", "GROUP BY d2.id", "GROUP BY f.d2_id", "GROUP BY d2.x", "GROUP BY d1.id", "GROUP BY d1.b", "GROUP BY f.s",
-		"GROUP BY d2.x / 2", "GROUP BY f.v % 3 + d2.x", "GROUP BY upper(f.s)", "GROUP BY f.v % 5", "GROUP BY CASE WHEN f.v > 0 THEN 1 ELSE 2 END"}
+		"GROUP BY d2.x / 2", "GROUP BY f.v % 3 + d2.x", "GROUP BY f.s COLLATE NOCASE", "GROUP BY f.s || ' ' COLLATE RTRIM", "GROUP BY d1.b COLLATE NOCASE", "GROUP BY upper(f.s)", "GROUP BY f.v % 5", "GROUP BY CASE WHEN f.v > 0 THEN 1 ELSE 2 END"}
 	wheres := []string{"", "WHERE f.v > 10", "WHERE d2.x <= 3 AND f.w > 0", "WHERE f.id % 2 = 0", "WHERE d1.a <> 2", "WHERE f.v >= ?",
 		"WHERE f.s LIKE 'b%'", "WHERE abs(f.v) > 3 AND length(f.s) = 1", "WHERE d2.y", "WHERE f.v + d2.x > 4", "WHERE coalesce(f.w, 1) > 0",
 		"WHERE f.v > 50 OR f.s = 'a'", "WHERE CASE WHEN f.w > 0 THEN 1 END",

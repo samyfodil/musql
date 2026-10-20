@@ -157,3 +157,57 @@ func TestSegJoinMultiOrMatchesLoop(t *testing.T) {
 		}
 	}
 }
+
+// TestSegJoinCollatedGroupsMatchLoop holds the join kernel's GROUP BY under
+// NOCASE and RTRIM to the loop: text that differs only in ASCII case, in
+// trailing spaces, past a NUL (where NOCASE stops comparing) or in non-ASCII
+// letters it does not fold; each group's first row read by a bare column.
+func TestSegJoinCollatedGroupsMatchLoop(t *testing.T) {
+	setup := []string{
+		`CREATE TABLE k(id INTEGER PRIMARY KEY, s TEXT, c TEXT COLLATE NOCASE, r TEXT COLLATE RTRIM)`,
+		`CREATE TABLE v(id INTEGER PRIMARY KEY, k_id INTEGER, n INTEGER)`,
+		`INSERT INTO k VALUES (1, 'ab', 'ab', 'ab'), (2, 'AB', 'AB', 'ab '), (3, 'aB ', 'aB ', 'ab  '),
+			(4, char(97, 0, 98), char(97, 0, 98), char(97, 0, 98)), (5, char(65, 0, 99), char(65, 0, 99), char(97, 0, 98, 32)),
+			(6, 'ä', 'ä', 'ä'), (7, 'Ä', 'Ä', 'Ä'), (8, NULL, NULL, NULL), (9, 1, 1, 1), (10, '1', '1', '1 '),
+			(11, 'abc', 'ABC', 'abc'), (12, 'a]b', 'A]B', 'a]b'), (13, char(97, 0, 98, 99), char(65, 0, 98, 99), 'ab   ')`,
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 300) INSERT INTO v SELECT i, 1 + i % 13, i * 7 % 23 FROM n`,
+	}
+	queries := []string{
+		`SELECT k.s COLLATE NOCASE, count(*), sum(v.n), k.id FROM k JOIN v ON v.k_id = k.id GROUP BY k.s COLLATE NOCASE`,
+		`SELECT k.c, count(*), group_concat(v.id), k.s FROM k JOIN v ON v.k_id = k.id GROUP BY k.c`,
+		`SELECT k.r, count(*), sum(v.n), k.id, group_concat(v.id) FROM k JOIN v ON v.k_id = k.id GROUP BY k.r`,
+		`SELECT k.s COLLATE RTRIM, count(*), group_concat(k.id) FROM v JOIN k ON k.id = v.k_id GROUP BY k.s COLLATE RTRIM ORDER BY 2 DESC, 1`,
+		`SELECT k.c, count(*) FROM v JOIN k ON k.id = v.k_id GROUP BY k.c HAVING count(*) > 20`,
+	}
+	run := func(off bool) []string {
+		segPeepholesOffForTest = off
+		defer func() { segPeepholesOffForTest = false }()
+		db, err := OpenOrCreate(filepath.Join(t.TempDir(), "c.musq"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		for _, s := range setup {
+			if _, _, err := db.ExecArgs(s, nil); err != nil {
+				t.Fatalf("%s: %v", s, err)
+			}
+			db.CommitIfAutocommit()
+		}
+		var out []string
+		for _, q := range queries {
+			SegJoinHitsForTest()
+			_, rows, err := db.Query(q, nil)
+			if !off && SegJoinHitsForTest() == 0 {
+				t.Errorf("not served by the join kernel: %s", q)
+			}
+			out = append(out, fmt.Sprint(rows, err))
+		}
+		return out
+	}
+	want, got := run(true), run(false)
+	for i := range want {
+		if want[i] != got[i] {
+			t.Errorf("%s:\n  loop   %.300s\n  kernel %.300s", queries[i], want[i], got[i])
+		}
+	}
+}

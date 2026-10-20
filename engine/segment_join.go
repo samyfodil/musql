@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"cmp"
 	"fmt"
 	"math"
@@ -61,6 +62,9 @@ type segJoinPlan struct {
 	// for none.
 	crosses [][]*segJoinExpr
 	tags    []*segJoinTags
+	// keyColl is the GROUP BY key's collation when it is not BINARY:
+	// NOCASE or RTRIM.
+	keyColl string
 	// segs is every segment of agg the body steps, seg first; nil for seg
 	// alone.
 	segs []int
@@ -84,6 +88,33 @@ func (p *segJoinPlan) allSegs() []int {
 
 // steps reports whether the body steps segment seg.
 func (p *segJoinPlan) steps(seg int) bool { return slices.Contains(p.allSegs(), seg) }
+
+// segJoinCollKey is key, one value, as values equal exactly when it equals
+// another under coll: for TEXT under NOCASE, its ASCII-lowered bytes up to
+// and with its first NUL, where nocaseCompare stops, and its length, which
+// breaks the tie; under RTRIM, its bytes without trailing spaces. Any other
+// value, and any value under BINARY, is itself.
+func segJoinCollKey(key []Value, coll string) []Value {
+	v := key[0]
+	if coll == "" || v.Typ != Text {
+		return key
+	}
+	b := v.S
+	switch coll {
+	case "NOCASE":
+		if i := bytes.IndexByte(b, 0); i >= 0 {
+			b = b[:i+1]
+		}
+		f := make([]byte, len(b))
+		for i, c := range b {
+			f[i] = asciiLowerByte(c)
+		}
+		return []Value{{Typ: Text, S: f}, {Typ: Int, I: int64(len(v.S))}}
+	case "RTRIM":
+		return []Value{{Typ: Text, S: rtrimTrailingSpaces(b)}}
+	}
+	return key
+}
 
 // segJoinOrder is an AutoIndexOrder: cursor's rows visited in key's order.
 type segJoinOrder struct {
@@ -1833,8 +1864,12 @@ func (m *vdbe) segJoinGroupsWith(plan *segJoinPlan, replayInts bool) (gs *segJoi
 		}
 		// A key on the optional level is NULL in its NULL rows, which only the
 		// canonical bytes can say.
-		if keys, ok = w.ints(plan.key); !ok || w.opt(keyLv) {
+		if keys, ok = w.ints(plan.key); !ok || w.opt(keyLv) || plan.keyColl != "" {
 			keys, byValue = nil, true
+		}
+		// NOCASE folds bytes, which for UTF-16 text is not its letters.
+		if plan.keyColl != "" && m.encoding() != UTF8 {
+			return nil, false, false
 		}
 	}
 	byKey := map[int64]int{}
@@ -1859,7 +1894,7 @@ func (m *vdbe) segJoinGroupsWith(plan *segJoinPlan, replayInts bool) (gs *segJoi
 		var seen bool
 		if byValue {
 			one[0] = w.value(plan.key, at)
-			buf = hashAggKeyBytes(buf[:0], one)
+			buf = hashAggKeyBytes(buf[:0], segJoinCollKey(one, plan.keyColl))
 			gi, seen = byBytes[string(buf)]
 			if !seen {
 				byBytes[string(buf)] = len(groups)

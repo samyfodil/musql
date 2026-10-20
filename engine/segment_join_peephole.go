@@ -765,6 +765,7 @@ func segJoinGroupPeephole(prog *Program) bool {
 	}
 	// The one GROUP BY key: the record the drain compares groups by.
 	var key segJoinArg
+	keyColl := ""
 	found := false
 	for i := closeAt; i < stepAt; i++ {
 		if ins := in[i]; ins.Op == OpMakeRecord && ins.P2 == 1 && i > 0 && in[i-1].Op == OpRecordColumn &&
@@ -782,11 +783,18 @@ func segJoinGroupPeephole(prog *Program) bool {
 			compared := false
 			for _, g := range in {
 				if g.Op == OpGroupSame && g.P1 == ins.P3 {
-					// Its keys' collations, nil when BINARY: the only one the
-					// kernel groups by.
+					// Its key's collation, nil when BINARY: the kernel groups
+					// by BINARY, NOCASE and RTRIM.
 					colls, _ := g.P4.([]string)
+					if len(colls) > 1 {
+						return false
+					}
 					for _, c := range colls {
-						if c != "" && !strings.EqualFold(c, "BINARY") {
+						switch {
+						case c == "" || strings.EqualFold(c, "BINARY"):
+						case strings.EqualFold(c, "NOCASE"), strings.EqualFold(c, "RTRIM"):
+							keyColl = strings.ToUpper(c)
+						default:
 							return false
 						}
 					}
@@ -805,7 +813,7 @@ func segJoinGroupPeephole(prog *Program) bool {
 	seqAt := fullOf(seqReg)
 
 	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2,
-		segs: segs, grouped: true, key: key, loads: loads, orders: l.orders}
+		segs: segs, grouped: true, key: key, keyColl: keyColl, loads: loads, orders: l.orders}
 	out := append([]Instruction(nil), in...)
 	guard := len(out)
 	out[l.head] = Instruction{Op: OpGoto, P2: guard}
