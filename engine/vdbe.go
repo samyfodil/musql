@@ -93,6 +93,7 @@ type vdbe struct {
 	// aggRowBuf/aggRowidBuf are gatherCursorRow's reusable per-row buffers --
 	// see its doc comment for why reuse is safe here.
 	aggRowBuf   []Value
+	unpackBuf   []Value // OpSorterData's expanded row (recUnpack)
 	aggRowidBuf []Value
 	// aggNullRow is the row a rowFree step (aggPlan.rowFree) hands on in place
 	// of a gathered one: all NULL, at least as wide as any plan's, never
@@ -2487,6 +2488,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpSorterData:
 			row := m.sorters[op.P1].data()
+			if u, ok := op.P4.(*recUnpack); ok {
+				row = u.expand(row, &m.unpackBuf)
+			}
 			if n := min(op.P3, len(row)); n > 0 {
 				// P3: this record round-trip LOSES the JSON subtype on its
 				// leading n values -- see OpSorterData's own doc comment.
@@ -3328,6 +3332,27 @@ type recBorrow []bool
 // those registers, and which nothing keeps past that. Anything that could
 // keep the record -- a sorter, a bare column's anchor row -- takes a copy.
 type recView struct{}
+
+// recUnpack is an OpSorterData's P4 when the sorted record carries only some
+// of a GROUP BY's [cols..] block, packed: at[i] is the column the record's
+// i-th value belongs at. The rest of the record ([rowids.., seq, groupVals..])
+// follows them. expand lays the row out in full, the columns no one reads
+// NULL, in a buffer the machine reuses: like a streamed row's (recView), the
+// drain reads it before the next and keeps nothing of it but copies.
+type recUnpack struct {
+	at    []int
+	nCols int
+}
+
+func (u *recUnpack) expand(row []Value, buf *[]Value) []Value {
+	n := u.nCols + len(row) - len(u.at)
+	out := growValues(buf, n)
+	for i, k := range u.at {
+		out[k] = row[i]
+	}
+	copy(out[u.nCols:], row[len(u.at):])
+	return out
+}
 
 func copyValue(v Value) Value {
 	if v.S != nil {

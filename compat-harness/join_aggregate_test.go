@@ -57,6 +57,16 @@ func TestJoinAggregatesMatchC(t *testing.T) {
 		`SELECT al.id, count(*) FROM albums al LEFT JOIN tracks t ON t.album_id = al.id GROUP BY al.id`,
 		`SELECT al.id, json_group_array(t.id) FROM albums al JOIN tracks t ON t.album_id = al.id AND t.id < 200 GROUP BY al.id`,
 		`SELECT d.k, count(*) FROM (SELECT json('[1]') AS j, album_id AS k FROM tracks) d JOIN albums al ON al.id = d.k GROUP BY d.k`,
+		// Groups that do not arrive in scan order go through the sorter, whose
+		// record carries only the columns read after the scan.
+		`SELECT ar.name, sum(t.plays), ar.country FROM artists ar JOIN albums al ON al.artist_id = ar.id JOIN tracks t ON t.album_id = al.id GROUP BY ar.id`,
+		`SELECT t.album_id, al.title, count(*), t.title FROM tracks t JOIN albums al ON al.id = t.album_id GROUP BY al.year`,
+		`SELECT al.year, max(t.seconds), t.id, al.id FROM tracks t JOIN albums al ON al.id = t.album_id GROUP BY al.year ORDER BY 2 DESC, 1`,
+		`SELECT t.rating, count(*), min(al.title) FROM tracks t JOIN albums al ON al.id = t.album_id GROUP BY t.rating`,
+		`SELECT CASE WHEN t.id % 2 = 0 THEN t.seconds % 7 ELSE (t.seconds % 7) * 1.0 END AS k, count(*) FROM tracks t JOIN albums al ON al.id = t.album_id GROUP BY k`,
+		`SELECT al.title, group_concat(t.id), count(*) FROM tracks t JOIN albums al ON al.id = t.album_id AND t.id < 300 GROUP BY al.title HAVING count(*) > 2`,
+		`SELECT al.year % 5, sum(t.plays) FROM tracks t JOIN albums al ON al.id = t.album_id GROUP BY 1 DESC`,
+		`SELECT al.artist_id, json_group_array(json(t.id)), al.year FROM tracks t JOIN albums al ON al.id = t.album_id AND t.id < 120 GROUP BY al.artist_id`,
 	}
 
 	dir := t.TempDir()

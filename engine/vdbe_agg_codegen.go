@@ -2027,8 +2027,40 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// STARTS at colBase instead, so the payload is again the whole of it and the
 	// drain's own offsets are untouched; the group keys are then neither stored
 	// nor computed, exactly as select.c leaves them out of the un-sorted arm.
+	stream := scanOrderGroups && !hasOrder && !useDistinctBatch
+
+	// Which table columns the record has to carry: what the drain, a bare
+	// column or a subquery reading the anchor can read. The rest are not
+	// loaded, and their registers, written by nothing else, stay NULL.
+	needCols := groupByNeededCols(c, stmt, srcs, scopes, nCols)
+
+	// A sorted record carries only those columns, packed (colSlot), and
+	// OpSorterData puts each back at its place in a row of nCols (recUnpack):
+	// every row of the scan is copied into the sorter and the sort moves it,
+	// so a join's record, as wide as all its tables, was most of the cost.
+	colSlot := func(k int) int { return k }
+	nColSlots := nCols
+	var unpack *recUnpack
+	if !stream && !useDistinctBatch && needCols != nil {
+		var at []int
+		for k, need := range needCols {
+			if need {
+				at = append(at, k)
+			}
+		}
+		if len(at) < nCols {
+			slot := make([]int, nCols)
+			for i, k := range at {
+				slot[k] = i
+			}
+			colSlot = func(k int) int { return slot[k] }
+			nColSlots = len(at)
+			unpack = &recUnpack{at: at, nCols: nCols}
+		}
+	}
+
 	keyBase := c.allocN(nSortKey)
-	colBase := c.allocN(nCols)
+	colBase := c.allocN(nColSlots)
 	rowidBase := c.allocN(len(srcs))
 	seqSlot := c.alloc()
 	// groupValBase stores the group key again as trailing payload so the drain reads
@@ -2038,10 +2070,10 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// layout ([cols.., rowids.., seq, groupVals..]) is the same.
 	groupValBase := c.allocN(nGroup)
 	recReg := c.allocRec()
-	recBase, recWidth := keyBase, nSortKey+nCols+len(srcs)+1+nGroup
+	recBase, recWidth := keyBase, nSortKey+nColSlots+len(srcs)+1+nGroup
 	if nSortKey == 0 {
 		recBase = colBase
-		recWidth = nCols + len(srcs) + 1 + nGroup
+		recWidth = nColSlots + len(srcs) + 1 + nGroup
 	}
 	// Where groupValBase's columns land in the PAYLOAD the drain reads
 	// (aggRowSplit's [cols.., rowids..] block, then the sequence number).
@@ -2054,7 +2086,6 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// body below as a subroutine on each row's record, with no sorter at all.
 	// The drain's setup runs before the scan (jumped to and back), since the
 	// subroutine runs inside it.
-	stream := scanOrderGroups && !hasOrder && !useDistinctBatch
 	// A streamed record is read by the subroutine before the scan loads the
 	// next row, and nothing keeps it: the group's anchor row, which bare
 	// columns and select-list subqueries read, is a copy magnetWalk takes
@@ -2077,11 +2108,6 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// unaffected.
 	annotateJoinSeeks(c, srcs, jplan)
 	deferredWhere := andConjuncts(jplan.deferred)
-
-	// Which table columns the record has to carry: what the drain, a bare
-	// column or a subquery reading the anchor can read. The rest are not
-	// loaded, and their registers, written by nothing else, stay NULL.
-	needCols := groupByNeededCols(c, stmt, srcs, scopes, nCols)
 
 	body := func() error {
 		whereJump := -1
@@ -2117,7 +2143,7 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 				if needCols != nil && !needCols[s.scope.offset+j] {
 					continue
 				}
-				c.emit(Instruction{Op: OpColumn, P1: s.scope.cursor, P2: j, P3: colBase + s.scope.offset + j})
+				c.emit(Instruction{Op: OpColumn, P1: s.scope.cursor, P2: j, P3: colBase + colSlot(s.scope.offset+j)})
 			}
 		}
 		for i, s := range srcs {
@@ -2326,7 +2352,11 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 		// grouped row does in C (serialized sorter record). Done once per row at the
 		// leaves, so drain-lowered expressions may generate or consume subtypes freely.
 		// The hash path does the same per register (OpClearSubtype).
-		c.emit(Instruction{Op: OpSorterData, P1: sorter1, P2: rowRec, P3: nCols})
+		data := Instruction{Op: OpSorterData, P1: sorter1, P2: rowRec, P3: nCols}
+		if unpack != nil {
+			data.P4 = unpack
+		}
+		c.emit(data)
 	}
 	// This row's group key, READ from the record the scan body already put it
 	// in -- select.c:8657's "OP_Column sortPTab, j, iBMem+j", one column read
