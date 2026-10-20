@@ -149,11 +149,10 @@ func (l *segJoinLoop) levelPreds(in []Instruction, pc, limit int) (int, bool) {
 	var filters []segJoinArg
 	var crosses []*segJoinExpr
 	for {
-		more, end, ok := segParsePredBlock(in, pc, limit, cursor, next)
-		if !ok {
-			return 0, false
+		// A run the comparisons do not read is the filters' to read.
+		if more, end, ok := segParsePredBlock(in, pc, limit, cursor, next); ok {
+			preds, pc = append(preds, more...), end
 		}
-		preds, pc = append(preds, more...), end
 		if f, end, ok := segJoinFilter(in, pc, limit, lv, l.levelOf, next); ok {
 			filters, pc = append(filters, f), end
 			continue
@@ -1388,7 +1387,7 @@ func segJoinJumpsP2(op OpCode) bool {
 func segJoinTraceable(op OpCode) bool {
 	switch op {
 	case OpRecordColumn, OpSCopy, OpCopy, OpInteger, OpInt64, OpReal, OpString8, OpNull, OpVariable,
-		OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpConcat, OpNot, OpFunction,
+		OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpConcat, OpNot, OpFunction, OpNegative, OpBitNot, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight,
 		OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
 		return true
 	}
@@ -1606,8 +1605,10 @@ func segJoinOperandKinds(in Instruction) (k [3]int, ok bool) {
 		return [3]int{c, c, r}, true
 	case OpRowid, OpInteger, OpInt64, OpReal, OpString8, OpNull, OpVariable:
 		return [3]int{c, r, c}, true
-	case OpSCopy, OpCopy, OpNot:
+	case OpSCopy, OpCopy, OpNot, OpNegative, OpBitNot:
 		return [3]int{r, r, c}, true
+	case OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight:
+		return [3]int{r, r, r}, true
 	case OpFunction:
 		return [3]int{r, c, r}, true // P2 arguments from P1: renamed as a run
 	case OpLike, OpGlob, OpConcat, OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder:
@@ -1797,7 +1798,8 @@ func segJoinSafeRun(in []Instruction, from, to int, levelOf map[int]int, maxLv, 
 				return false
 			}
 		case OpInteger, OpInt64, OpReal, OpString8, OpNull, OpVariable, OpCopy, OpSCopy, OpNot,
-			OpConcat, OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder:
+			OpConcat, OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder,
+			OpNegative, OpBitNot, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight:
 		case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull, OpGoto:
 			if segJoinIsJump(ins) && (ins.P2 <= j || ins.P2 > to) {
 				return false

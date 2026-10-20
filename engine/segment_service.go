@@ -46,8 +46,10 @@ func segInsnRegs(in Instruction) (reads, writes []int, jump, ok bool) {
 		return nil, []int{in.P3}, false, true
 	case OpInteger, OpInt64, OpReal, OpString8, OpNull, OpVariable:
 		return nil, []int{in.P2}, false, true
-	case OpSCopy, OpCopy, OpNot:
+	case OpSCopy, OpCopy, OpNot, OpNegative, OpBitNot:
 		return []int{in.P1}, []int{in.P2}, false, true
+	case OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight:
+		return []int{in.P1, in.P2}, []int{in.P3}, false, true
 	case OpFunction:
 		r := make([]int, in.P2)
 		for i := range r {
@@ -371,6 +373,12 @@ func (m *vdbe) segEvalInsn(op *Instruction, column func(*Instruction) Value) (ta
 		w[op.P2] = copyValue(w[op.P1])
 	case OpSCopy:
 		w[op.P2] = w[op.P1]
+	case OpNegative:
+		w[op.P2] = negateValueUnary(w[op.P1])
+	case OpBitNot:
+		w[op.P2] = bitNotValueUnary(w[op.P1])
+	case OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight:
+		w[op.P3] = bitwiseBinaryValue(bitwiseOpName[op.Op], w[op.P2], w[op.P1])
 	case OpNot:
 		if v := w[op.P1]; v.Typ == Null {
 			w[op.P2] = Value{Typ: Null}

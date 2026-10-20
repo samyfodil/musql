@@ -126,7 +126,8 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 		"group_concat(f.s)", "group_concat(f.v, '-')", "min(f.s)", "max(f.w)", "json_group_array(f.v)",
 		"count(DISTINCT f.s)", "group_concat(DISTINCT f.s)", "group_concat(f.id ORDER BY f.w DESC)", "max(d1.b)",
 		"count(*) FILTER (WHERE f.v > 3)", "sum(f.v) FILTER (WHERE f.s = 'a')", "avg(f.w) FILTER (WHERE d2.x IS NOT NULL)",
-		"group_concat(f.s, '|' ORDER BY f.v, f.id)", "json_group_array(f.v ORDER BY f.id DESC)"}
+		"group_concat(f.s, '|' ORDER BY f.v, f.id)", "json_group_array(f.v ORDER BY f.id DESC)",
+		"sum(-f.v)", "sum(f.v & 7)", "max(~f.v)", "sum(f.v << 2 | 1)", "sum(CASE WHEN f.v > 0 THEN -f.v ELSE f.v >> 1 END)"}
 	joins := []string{
 		"FROM f JOIN d2 ON d2.id = f.d2_id",
 		"FROM d2 JOIN f ON f.d2_id = d2.id",
@@ -163,7 +164,7 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 		"WHERE f.v IN (5, NULL)", "WHERE f.s NOT IN ('B', '')", "WHERE d2.x > 1", "WHERE d2.x BETWEEN 0 AND 5 AND f.v > 0",
 		"WHERE d2.x * 2 - d2.y > 1", "WHERE d2.x = 1 OR d2.y > 3", "WHERE d2.x IN (2, 3) OR d2.y < 0",
 		"WHERE f.v > d2.x", "WHERE f.w < d2.y OR f.s = 'a'", "WHERE d2.x = 1 OR d2.y = f.w", "WHERE d2.x = f.v % 5 OR d2.y > 3",
-		"WHERE coalesce(f.v, d2.x) > 2", "WHERE CASE WHEN f.v > d2.x THEN f.w ELSE d2.y END > 0"}
+		"WHERE coalesce(f.v, d2.x) > 2", "WHERE -f.v < 3 AND f.v & 1 = 0", "WHERE f.v BETWEEN 5 AND 60", "WHERE CASE WHEN f.v > d2.x THEN f.w ELSE d2.y END > 0"}
 	for range 50 {
 		join := joins[r.Intn(len(joins))]
 		hasD1 := strings.Contains(join, "d1 ")
