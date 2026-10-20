@@ -1,5 +1,7 @@
 package engine
 
+import "strings"
+
 // The recognisers for an aggregate over an inner join of plain table loops
 // (segment_join.go). Each leaves the loop in place behind a guard that
 // declines at run time for anything the blocks cannot answer.
@@ -482,7 +484,17 @@ body:
 			}
 			compared := false
 			for _, g := range in {
-				compared = compared || g.Op == OpGroupSame && g.P1 == ins.P3
+				if g.Op == OpGroupSame && g.P1 == ins.P3 {
+					// Its keys' collations, nil when BINARY: the only one the
+					// kernel groups by.
+					colls, _ := g.P4.([]string)
+					for _, c := range colls {
+						if c != "" && !strings.EqualFold(c, "BINARY") {
+							return false
+						}
+					}
+					compared = true
+				}
 			}
 			if !compared {
 				return false

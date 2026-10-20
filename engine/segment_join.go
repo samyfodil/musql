@@ -853,26 +853,47 @@ func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (*segJoinGroups, bool) {
 	if !ok {
 		return nil, false
 	}
+	// The groups, by an INTEGER key's value, or by any other key's canonical
+	// bytes: the encoding hashed GROUP BY keys by, equal exactly when the
+	// keys compare equal under BINARY (the recognisers admit no other
+	// collation).
 	var keys []int64
+	var keyTab *segJoinTable
 	if plan.grouped {
 		if keys, ok = w.tabs[plan.key.level].col(plan.key.col); !ok {
-			return nil, false
+			keyTab = w.tabs[plan.key.level]
 		}
 	}
 	byKey := map[int64]int{}
+	byBytes := map[string]int{}
+	var buf []byte
+	one := make([]Value, 1)
 	var groups []segJoinGroup
 	k := len(plan.cursors)
 	at := make([]int32, k)
 	if !w.each(at, func() bool {
-		var key int64
-		if keys != nil {
-			key = keys[at[plan.key.level]]
+		var gi int
+		var seen bool
+		if keyTab != nil {
+			one[0] = keyTab.value(at[plan.key.level], plan.key.col)
+			buf = hashAggKeyBytes(buf[:0], one)
+			gi, seen = byBytes[string(buf)]
+			if !seen {
+				byBytes[string(buf)] = len(groups)
+			}
+		} else {
+			var key int64
+			if keys != nil {
+				key = keys[at[plan.key.level]]
+			}
+			gi, seen = byKey[key]
+			if !seen {
+				byKey[key] = len(groups)
+			}
 		}
-		gi, seen := byKey[key]
 		switch {
 		case !seen:
 			gi = len(groups)
-			byKey[key] = gi
 			groups = append(groups, segJoinGroup{sums: newSegJoinSums(len(args.ints)), first: slices.Clone(at)})
 		case args.floats:
 			// The replay is in the order rows arrive here, which must be the

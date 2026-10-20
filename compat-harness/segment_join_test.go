@@ -33,6 +33,9 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		`CREATE TABLE wide(id INTEGER PRIMARY KEY, album_id INTEGER NOT NULL, v INTEGER NOT NULL, r REAL NOT NULL)`,
 		`INSERT INTO wide VALUES (1, 1, 2305843009213693952, 1e16), (2, 1, 2305843009213693952, 1.0), (3, 1, -2305843009213693952, -1e16),
 			(4, 2, 3, 0.1), (5, 2, 5, 0.2), (6, 3, 7, 0.3), (7, 2, 1, 0.7), (8, 1, 2, 3.5), (9, 4, 4, 2)`,
+		`CREATE TABLE tags(id INTEGER PRIMARY KEY, album_id INTEGER NOT NULL, tag, ci TEXT COLLATE NOCASE)`,
+		`INSERT INTO tags VALUES (1, 1, 'rock', 'Rock'), (2, 2, 'Rock', 'rock'), (3, 3, 1, 'x'), (4, 4, '1', 'X'), (5, 5, NULL, NULL),
+			(6, 6, 1.0, 'y'), (7, 7, x'01', 'Y'), (8, 8, NULL, 'z'), (9, 9, 'rock', 'ROCK'), (10, 10, 2.5, 'q')`,
 		`CREATE TABLE w2(id INTEGER PRIMARY KEY, album_id INTEGER NOT NULL, r REAL NOT NULL)`,
 		`INSERT INTO w2 VALUES (1, 7, 1e16), (2, 1, 1.0), (3, 7, -1e16), (4, 1, 0.1)`,
 	}
@@ -63,7 +66,12 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT al.id, sum(t.plays) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id LIMIT 4 OFFSET 3`, true},
 		{`SELECT al.year, sum(t.plays) AS s FROM tracks t JOIN albums al ON al.id = t.album_id GROUP BY al.year ORDER BY s DESC`, true},
 		{`SELECT al.id, count(*) + max(t.seconds), (SELECT name FROM artists WHERE id = al.artist_id) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
-		{`SELECT ar.name, count(*) FROM artists ar JOIN albums al ON al.artist_id = ar.id JOIN tracks t ON t.album_id = al.id GROUP BY ar.name`, false},
+		{`SELECT ar.name, count(*) FROM artists ar JOIN albums al ON al.artist_id = ar.id JOIN tracks t ON t.album_id = al.id GROUP BY ar.name`, true},
+		// Keys that are not integers group by their value, BINARY only.
+		{`SELECT g.tag, count(*), sum(t.seconds) FROM tags g JOIN tracks t ON t.album_id = g.id GROUP BY g.tag`, true},
+		{`SELECT g.tag COLLATE NOCASE, count(*) FROM tags g JOIN tracks t ON t.album_id = g.id GROUP BY g.tag COLLATE NOCASE`, false},
+		{`SELECT g.ci, count(*) FROM tags g JOIN tracks t ON t.album_id = g.id GROUP BY g.ci`, false},
+		{`SELECT g.tag, count(*) FROM tracks t JOIN tags g ON g.id = t.album_id GROUP BY g.tag ORDER BY 2 DESC, 1`, true},
 		{`SELECT al.id, max(t.plays), t.id FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, false},
 		{`SELECT al.id, sum(t.rating) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
 		{`SELECT al.id, group_concat(t.id) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, false},
