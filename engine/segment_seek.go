@@ -2,6 +2,7 @@ package engine
 
 import (
 	"slices"
+	"strings"
 	"sync/atomic"
 )
 
@@ -166,6 +167,25 @@ func (src *segSource) seekIndexRowids(rootPage uint32, col int, probe Value) (ro
 	// candidates are safe. Answering such a table by a scan made every TEXT,
 	// REAL and BLOB equality on a table merely loaded a full scan: 33 ms a
 	// lookup at 100k rows, against 2.8 us.
+	//
+	// When the store's own rows are most of the table (a table loaded in this
+	// session), its equality index -- incremental, and over every live row --
+	// names exactly the matches; the snapshot path would add every row the
+	// store holds to every seek, and a join seeking once per outer row read the
+	// whole table each time.
+	if probe.Typ == Int && rows.prefersEqIndex(col) {
+		if hits, ok := rows.eqRowids(col, probe.I); ok {
+			out := make([]int64, len(hits))
+			for i, r := range hits {
+				out[i] = int64(r)
+			}
+			if !strictlyAscending(out) {
+				slices.Sort(out) // a short row (ALTER ADD COLUMN) is appended after the hits
+				out = slices.Compact(out)
+			}
+			return out, true
+		}
+	}
 	if out, ok := rows.snapshotIndexRowids(col, probe); ok {
 		return out, true
 	}
@@ -201,10 +221,57 @@ func (s *rowStore) snapshotIndexRowids(col int, probe Value) ([]int64, bool) {
 	if !ok {
 		return nil, false
 	}
-	for rid := range s.m {
-		out = append(out, int64(rid))
+	// Every row the store has written whose value could equal the probe: the
+	// candidates stay a superset, but a row that certainly differs is not
+	// fetched and re-tested once per seek.
+	for rid, vals := range s.m {
+		if col >= len(vals) || !certainlyUnequal(vals[col], probe) {
+			out = append(out, int64(rid))
+		}
 	}
 	return base.withDeltaRowids(s.seg.root, out), true
+}
+
+// certainlyUnequal reports whether a stored value can match an equality probe
+// under no collation or affinity the comparison might use: a NULL, two
+// different integers, two different floats, or two texts that differ even with
+// case folded and trailing spaces trimmed (so BINARY, NOCASE and RTRIM all
+// agree). Anything else, such as an integer against a float or a text, may be
+// equal and is kept.
+func certainlyUnequal(v, probe Value) bool {
+	switch {
+	case v.Typ == Null || probe.Typ == Null:
+		return true
+	case v.Typ == Int && probe.Typ == Int:
+		return v.I != probe.I
+	case v.Typ == Float && probe.Typ == Float:
+		return v.F != probe.F
+	case v.Typ == Text && probe.Typ == Text:
+		return !strings.EqualFold(strings.TrimRight(string(v.S), " "), strings.TrimRight(string(probe.S), " "))
+	}
+	return false
+}
+
+// prefersEqIndex reports whether an equality seek on col is better answered
+// by the store's own equality index (eqRowids) than by its base segments'
+// index plus its written rows: when that index is built already, or the
+// written rows are most of the table, so building it costs about what one
+// seek through the snapshot would.
+func (s *rowStore) prefersEqIndex(col int) bool {
+	if s == nil || s.spill != nil {
+		return false
+	}
+	if idx, have := s.eqIdx[col]; have {
+		return idx != nil
+	}
+	if s.seg == nil || s.seg.rp == nil || s.seg.rp.segs == nil {
+		return true
+	}
+	base := 0
+	for _, sg := range s.seg.rp.segs.byRoot[s.seg.root] {
+		base += sg.nRows
+	}
+	return len(s.m) >= base
 }
 
 // segIndexSeeksServed counts index seeks the segments answered, for tests.

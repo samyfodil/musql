@@ -31,6 +31,8 @@ const ops = {
 		return res;
 	},
 	run: (sql, params = []) => db.run(sql, ...params),
+	// split splits a script into statements as the engine does.
+	split: (sql) => db.split(sql),
 	exportMusql: () => db.export(),
 	exportSQLite: () => db.exportSQLite(),
 };

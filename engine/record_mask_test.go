@@ -738,11 +738,15 @@ func TestMaskFiresForARealProjectionScan(t *testing.T) {
 		t.Fatalf("a whole-row projection should widen to allColumns, got %#x", uint64(m))
 	}
 
-	// An aggregate reads whole rows through gatherCursorRow, so the derivation
-	// declines outright -- W4/W5 of the benchmark suite are exactly this, and
-	// are honestly NOT sped up by this stage.
-	if m, _ = maskFor("SELECT count(*) FROM t WHERE a > 1"); m != allColumns {
-		t.Fatalf("an aggregate scan must decline to mask, got %#x", uint64(m))
+	// An aggregate whose steps read no row (aggPlan.rowFree: no bare column,
+	// no HAVING, nothing reading the anchor) gathers none, so its scan masks
+	// to what the WHERE and the arguments name...
+	if m, _ = maskFor("SELECT count(*) FROM t WHERE a > 1"); m != 1<<1 {
+		t.Fatalf("a row-free aggregate scan should mask to {1}, got %#x", uint64(m))
+	}
+	// ...and one that reads the anchor row gathers it whole, and declines.
+	if m, _ = maskFor("SELECT count(*) FROM t HAVING a > 1"); m != allColumns {
+		t.Fatalf("an aggregate reading its anchor row must decline to mask, got %#x", uint64(m))
 	}
 	if m, _ = maskFor("SELECT a, count(*) FROM t GROUP BY a"); m != allColumns {
 		t.Fatalf("a GROUP BY scan must decline to mask, got %#x", uint64(m))

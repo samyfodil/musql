@@ -46,8 +46,10 @@ func segInsnRegs(in Instruction) (reads, writes []int, jump, ok bool) {
 		return nil, []int{in.P3}, false, true
 	case OpInteger, OpInt64, OpReal, OpString8, OpNull, OpVariable:
 		return nil, []int{in.P2}, false, true
-	case OpSCopy, OpCopy, OpNot:
+	case OpSCopy, OpCopy, OpNot, OpNegative, OpBitNot:
 		return []int{in.P1}, []int{in.P2}, false, true
+	case OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight:
+		return []int{in.P1, in.P2}, []int{in.P3}, false, true
 	case OpFunction:
 		r := make([]int, in.P2)
 		for i := range r {
@@ -318,70 +320,13 @@ func (r *segSvcRunner) run(b *segSvcBlock, s *segment, row int, regs []int64) bo
 		w[x] = Value{Typ: Int, I: regs[x]}
 	}
 	m := &r.vm
+	column := func(op *Instruction) Value {
+		width := min(s.Width(row), len(r.plans))
+		return segColumnValue(r.plans, s, row, width, s.Rowid(row), op.P2)
+	}
 	for k := range b.insns {
-		op := &b.insns[k]
-		taken := false
-		switch op.Op {
-		case OpColumn:
-			width := min(s.Width(row), len(r.plans))
-			w[op.P3] = segColumnValue(r.plans, s, row, width, s.Rowid(row), op.P2)
-		case OpInteger:
-			w[op.P2] = Value{Typ: Int, I: int64(op.P1)}
-		case OpInt64:
-			w[op.P2] = Value{Typ: Int, I: op.P4.(int64)}
-		case OpReal:
-			w[op.P2] = Value{Typ: Float, F: op.P4.(float64)}
-		case OpString8:
-			w[op.P2] = Value{Typ: Text, S: []byte(op.P4.(string))}
-		case OpNull:
-			w[op.P2] = Value{Typ: Null}
-		case OpVariable:
-			w[op.P2] = paramAt(m.params, op.P1)
-		case OpCopy:
-			w[op.P2] = copyValue(w[op.P1])
-		case OpSCopy:
-			w[op.P2] = w[op.P1]
-		case OpNot:
-			if v := w[op.P1]; v.Typ == Null {
-				w[op.P2] = Value{Typ: Null}
-			} else {
-				w[op.P2] = boolValue(!isTruthy(v))
-			}
-		case OpFunction:
-			if m.opFunction(op) != nil {
-				return false
-			}
-		case OpLike:
-			if m.opLike(op) != nil {
-				return false
-			}
-		case OpGlob:
-			if m.opGlob(op) != nil {
-				return false
-			}
-		case OpConcat:
-			w[op.P3] = concatValuesEnc(w[op.P2], w[op.P1], m.encoding())
-		case OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder:
-			if v, ok := intArith(op.Op, w[op.P2], w[op.P1]); ok {
-				w[op.P3] = v
-				break
-			}
-			v, err := evalArith(arithOpName(op.Op), w[op.P2], w[op.P1])
-			if err != nil {
-				return false
-			}
-			w[op.P3] = v
-		case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
-			taken, _ = m.compareOp(op)
-		case OpIf:
-			taken = m.jumpIf(op.P1, op.P3, true)
-		case OpIfNot:
-			taken = m.jumpIf(op.P1, op.P3, false)
-		case OpIsNull:
-			taken = w[op.P1].Typ == Null
-		case OpNotNull:
-			taken = w[op.P1].Typ != Null
-		default:
+		taken, ok := m.segEvalInsn(&b.insns[k], column)
+		if !ok {
 			return false
 		}
 		if b.flag >= 0 && k == len(b.insns)-1 {
@@ -399,6 +344,85 @@ func (r *segSvcRunner) run(b *segSvcBlock, s *segment, row int, regs []int64) bo
 		regs[x] = v.I
 	}
 	return true
+}
+
+// segEvalInsn runs one instruction of a service block, or of an expression
+// the join kernel computes (segment_join.go), on m's registers -- the window
+// -- with the VDBE's own code for each opcode. column reads an OpColumn's
+// value from wherever the caller's row is. taken is whether an instruction
+// that may jump would; ok is false for an opcode it does not run, or an
+// error, which the VDBE will raise when it runs the statement itself.
+func (m *vdbe) segEvalInsn(op *Instruction, column func(*Instruction) Value) (taken, ok bool) {
+	w := m.regs
+	switch op.Op {
+	case OpColumn:
+		w[op.P3] = column(op)
+	case OpInteger:
+		w[op.P2] = Value{Typ: Int, I: int64(op.P1)}
+	case OpInt64:
+		w[op.P2] = Value{Typ: Int, I: op.P4.(int64)}
+	case OpReal:
+		w[op.P2] = Value{Typ: Float, F: op.P4.(float64)}
+	case OpString8:
+		w[op.P2] = Value{Typ: Text, S: []byte(op.P4.(string))}
+	case OpNull:
+		w[op.P2] = Value{Typ: Null}
+	case OpVariable:
+		w[op.P2] = paramAt(m.params, op.P1)
+	case OpCopy:
+		w[op.P2] = copyValue(w[op.P1])
+	case OpSCopy:
+		w[op.P2] = w[op.P1]
+	case OpNegative:
+		w[op.P2] = negateValueUnary(w[op.P1])
+	case OpBitNot:
+		w[op.P2] = bitNotValueUnary(w[op.P1])
+	case OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight:
+		w[op.P3] = bitwiseBinaryValue(bitwiseOpName[op.Op], w[op.P2], w[op.P1])
+	case OpNot:
+		if v := w[op.P1]; v.Typ == Null {
+			w[op.P2] = Value{Typ: Null}
+		} else {
+			w[op.P2] = boolValue(!isTruthy(v))
+		}
+	case OpFunction:
+		if m.opFunction(op) != nil {
+			return false, false
+		}
+	case OpLike:
+		if m.opLike(op) != nil {
+			return false, false
+		}
+	case OpGlob:
+		if m.opGlob(op) != nil {
+			return false, false
+		}
+	case OpConcat:
+		w[op.P3] = concatValuesEnc(w[op.P2], w[op.P1], m.encoding())
+	case OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder:
+		if v, ok := intArith(op.Op, w[op.P2], w[op.P1]); ok {
+			w[op.P3] = v
+			break
+		}
+		v, err := evalArith(arithOpName(op.Op), w[op.P2], w[op.P1])
+		if err != nil {
+			return false, false
+		}
+		w[op.P3] = v
+	case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
+		taken, _ = m.compareOp(op)
+	case OpIf:
+		taken = m.jumpIf(op.P1, op.P3, true)
+	case OpIfNot:
+		taken = m.jumpIf(op.P1, op.P3, false)
+	case OpIsNull:
+		taken = w[op.P1].Typ == Null
+	case OpNotNull:
+		taken = w[op.P1].Typ != Null
+	default:
+		return false, false
+	}
+	return taken, true
 }
 
 // segCallKernel runs kern to completion, performing each service it stops

@@ -119,18 +119,21 @@ func annotateJoinSeeks(c *compiler, srcs []joinSource, plan joinPlan) {
 			}
 			sp = c.pager.attachedReaders[s.dbIdx-1].pager
 		}
-		var wantRoot uint32
+		var want *autoIndexKey
 		if planKey != nil {
-			wantRoot = planKey.root
-			if wantRoot == 0 {
-				continue // a transient automatic index, or a REVERSED rowid scan
+			// A real index has a root, or, on a segment table (whose indexes are
+			// SQL only), a name. A key with neither is a transient automatic
+			// index or a REVERSED rowid scan.
+			if planKey.root == 0 && (planKey.index == "" || !sp.ScannedFromSegments(s.tbl.root)) {
+				continue
 			}
+			want = planKey
 		}
-		p, ok := findJoinIndexSeek(c, sp, s, outer, eqs, wantRoot)
+		p, ok := findJoinIndexSeek(c, sp, s, outer, eqs, want)
 		if !ok {
 			continue
 		}
-		if planKey != nil && !joinSeekReproducesKey(sp, s.tbl, p.root, planKey) {
+		if planKey != nil && !joinSeekReproducesKey(sp, s.tbl, p.root, p.index, planKey) {
 			continue
 		}
 		srcs[origIdx].joinIdxSeek = p
@@ -144,8 +147,12 @@ func annotateJoinSeeks(c *compiler, srcs []joinSource, plan joinPlan) {
 // caller drops the seek and the planner's key wins. It re-derives the index's
 // key from its schema text (no automatic index, no rival index with the same
 // leading column) and compares it with key column for column.
-func joinSeekReproducesKey(sp *ReadOnlyPager, tbl *resolvedTable, root uint32, key *autoIndexKey) bool {
-	if sp == nil || tbl == nil || key == nil || root == 0 || key.root != root {
+func joinSeekReproducesKey(sp *ReadOnlyPager, tbl *resolvedTable, root uint32, name string, key *autoIndexKey) bool {
+	if sp == nil || tbl == nil || key == nil || key.root != root {
+		return false
+	}
+	// A segment table's index (root 0) is found by name, and only there.
+	if root == 0 && (name == "" || !equalFoldName(name, key.index) || !sp.ScannedFromSegments(tbl.root)) {
 		return false
 	}
 	rows, err := sp.Schema()
@@ -154,8 +161,9 @@ func joinSeekReproducesKey(sp *ReadOnlyPager, tbl *resolvedTable, root uint32, k
 	}
 	var chosen *SchemaRow
 	for i := range rows {
-		if rows[i].Type == "index" && rows[i].RootPage == root && rows[i].SQL != "" {
-			chosen = &rows[i]
+		r := &rows[i]
+		if r.Type == "index" && r.SQL != "" && (root != 0 && r.RootPage == root || root == 0 && r.RootPage == 0 && equalFoldName(r.Name, name) && equalFoldName(r.TblName, tbl.name)) {
+			chosen = r
 			break
 		}
 	}
@@ -169,7 +177,7 @@ func joinSeekReproducesKey(sp *ReadOnlyPager, tbl *resolvedTable, root uint32, k
 	}
 	for i := range rows {
 		r := &rows[i]
-		if r.Type != "index" || r.RootPage == chosen.RootPage || r.SQL == "" ||
+		if r.Type != "index" || r == chosen || r.SQL == "" ||
 			r.Temp != chosen.Temp || !equalFoldName(r.TblName, chosen.TblName) {
 			continue
 		}
@@ -183,6 +191,14 @@ func joinSeekReproducesKey(sp *ReadOnlyPager, tbl *resolvedTable, root uint32, k
 	}
 	n := len(stmt.cols)
 	if len(key.cols) != n+1 || len(key.colls) != n+1 || len(key.desc) != n+1 {
+		return false
+	}
+	// A segment seek (root 0) answers from the column's equality index, which
+	// hands each key's rows over in rowid order: the index's own order only
+	// when the index has one column, the equality pinning it. A longer key
+	// orders a key's rows by its later columns first, which only a walk of
+	// that index gives.
+	if root == 0 && n != 1 {
 		return false
 	}
 	for j, name := range stmt.cols {
@@ -248,7 +264,7 @@ func findJoinRowidSeek(c *compiler, s joinSource, outer map[int]bool, eqs []Expr
 // visit order. Without colUsed this cannot answer covering, so when two
 // indexes lead with the same column the order is not reproduced
 // (joinSeekReproducesKey).
-func findJoinIndexSeek(c *compiler, sp *ReadOnlyPager, s joinSource, outer map[int]bool, eqs []Expr, wantRoot uint32) (*indexSeekPlan, bool) {
+func findJoinIndexSeek(c *compiler, sp *ReadOnlyPager, s joinSource, outer map[int]bool, eqs []Expr, want *autoIndexKey) (*indexSeekPlan, bool) {
 	if s.notIndexed {
 		return nil, false // NOT INDEXED takes every secondary index away (where.c:4070)
 	}
@@ -256,12 +272,13 @@ func findJoinIndexSeek(c *compiler, sp *ReadOnlyPager, s joinSource, outer map[i
 	if err != nil || len(cands) == 0 {
 		return nil, false
 	}
-	if wantRoot != 0 {
+	if want != nil {
 		// The ported planner already decided WHICH index this level walks, so
-		// the "first candidate wins" rule below is replaced by its verdict.
+		// the "first candidate wins" rule below is replaced by its verdict: by
+		// root, or by name for a segment table's (root 0) index.
 		kept := cands[:0]
 		for _, cd := range cands {
-			if cd.root == wantRoot {
+			if want.root != 0 && cd.root == want.root || want.root == 0 && equalFoldName(cd.name, want.index) {
 				kept = append(kept, cd)
 			}
 		}
@@ -312,7 +329,7 @@ func joinIndexPlanFor(c *compiler, s joinSource, cands []indexSeekCandidate, col
 		if !seekAffinitySafe(aff, s.tbl.cols[colIdx].Aff) {
 			return nil, false
 		}
-		return &indexSeekPlan{root: cd.root, keyExpr: keyExpr, aff: aff, coll: cd.coll, leadingCol: cd.leadingCol}, true
+		return &indexSeekPlan{root: cd.root, keyExpr: keyExpr, aff: aff, coll: cd.coll, leadingCol: cd.leadingCol, index: cd.name}, true
 	}
 	return nil, false
 }
@@ -446,6 +463,6 @@ func (c *compiler) emitJoinSeekHint(srcs []joinSource, order []int, level int, s
 		return err
 	}
 	c.emit(Instruction{Op: OpSeekIndexHint, P1: cur, P2: keyReg, P3: 1,
-		P4: &indexSeekHint{root: s.joinIdxSeek.root, aff: s.joinIdxSeek.aff, coll: s.joinIdxSeek.coll, leadingCol: s.joinIdxSeek.leadingCol}})
+		P4: &indexSeekHint{root: s.joinIdxSeek.root, aff: s.joinIdxSeek.aff, coll: s.joinIdxSeek.coll, leadingCol: s.joinIdxSeek.leadingCol, index: s.joinIdxSeek.index}})
 	return nil
 }

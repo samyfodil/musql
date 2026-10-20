@@ -413,6 +413,40 @@ const (
 
 	OpSegHashAgg
 
+	// OpSegJoinAgg answers an aggregate over an inner join from the tables'
+	// column blocks (segment_join.go), filling the accumulators the loop would
+	// have. P2: jump target (the loop's Closes), taken only when it serves.
+	// P4(*segJoinPlan).
+	OpSegJoinAgg
+	// OpSegJoinGroups builds a GROUP BY's groups over a join from the column
+	// blocks (segment_join.go). P2: jump target (the group loop), taken only
+	// when it serves. P4(*segJoinPlan).
+	OpSegJoinGroups
+	// OpSegJoinNext loads the next group's first joined row into the registers
+	// the loop body reads, or jumps to P2 when there is none. P4(*segJoinPlan).
+	OpSegJoinNext
+	// OpSegJoinRest adds to the accumulators just stepped with a group's first
+	// row the group's other rows; the group is the one whose scan sequence
+	// number is rr[P1][P2]. Nothing when OpSegJoinGroups did not serve.
+	// P4(*segJoinPlan).
+	OpSegJoinRest
+	// OpSegJoinVolatile is a volatile call (random()) in the body's copy the
+	// join kernel runs for a candidate or group row (OpSegJoinNext's last):
+	// it reads the value the kernel's walk got from that call on that row,
+	// so the call is made once per joined row, in the loop's order. With none
+	// kept -- random() only -- or the kernel not serving, it makes the call.
+	// P4(*segJoinVolatileCall).
+	OpSegJoinVolatile
+	// OpSegJoinHash fills a hashed GROUP BY's buckets over a join from the
+	// column blocks. P2: jump target (the Closes before the drain), taken only
+	// when it serves. P4(*segJoinPlan).
+	OpSegJoinHash
+	// OpSegJoinTop finds an ORDER BY ... LIMIT's candidate rows over a join
+	// from the column blocks, for OpSegJoinNext to hand the loop body. P2:
+	// jump target (that hand-off), taken only when it serves.
+	// P4(*segJoinPlan).
+	OpSegJoinTop
+
 	OpHashAggData // P2: destination record register rr[P2]. Copies the CURRENT bucket's group-key tuple into rr[P2] and makes that bucket's accumulators the live set (m.aggAccs), so a following OpAggResult finalizes THIS group.
 	OpHashAggNext // P2: jump target. Advances to the next bucket in sorted order; if one exists, jump to P2 (the drain loop's top, exactly like OpSorterNext); otherwise fall through (the drain is exhausted).
 
@@ -715,6 +749,9 @@ type indexSeekHint struct {
 	// leadingCol is the TABLE column the index leads on -- what a SEGMENT seek
 	// needs in place of an index b-tree. See indexSeekPlan.leadingCol.
 	leadingCol int
+	// index is the index's name, which EXPLAIN QUERY PLAN prints: a segment
+	// table's index has no root to look it up by.
+	index string
 }
 
 // multiOrOrder is the autoIndexKey variant OpAutoIndexOrder applies when the

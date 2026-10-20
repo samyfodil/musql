@@ -1,0 +1,297 @@
+package engine
+
+import (
+	"fmt"
+	"path/filepath"
+	"sync"
+	"testing"
+)
+
+// TestSegJoinSessionFollowsWrites runs join aggregates between writes on one
+// held session, where the join kernel reads the session's own store and keeps
+// its reading between statements -- extending it when the only writes were
+// appends -- and holds every answer to the same session's with the kernel's
+// recognisers off. A write that is not an append, followed by one that is,
+// before the next read, is the case an extension must refuse.
+func TestSegJoinSessionFollowsWrites(t *testing.T) {
+	setup := []string{
+		`CREATE TABLE albums(id INTEGER PRIMARY KEY, year INTEGER NOT NULL, tag TEXT)`,
+		`CREATE TABLE tracks(id INTEGER PRIMARY KEY, album_id INTEGER NOT NULL, seconds INTEGER NOT NULL, rating REAL NOT NULL)`,
+		`CREATE INDEX tracks_album ON tracks(album_id)`,
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 20) INSERT INTO albums SELECT i, 1990 + i % 3, CASE i % 3 WHEN 0 THEN 'abc' WHEN 1 THEN 'ABC' ELSE 'xyz' END FROM n`,
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 500) INSERT INTO tracks SELECT i, 1 + i % 21, 60 + i % 90, (i % 5) / 4.0 FROM n`,
+	}
+	queries := []string{
+		`SELECT count(*), sum(t.seconds), total(t.rating) FROM albums al JOIN tracks t ON t.album_id = al.id`,
+		`SELECT al.id, count(*), sum(t.seconds), avg(t.rating) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`,
+		`SELECT al.year, max(t.seconds), count(*) FROM tracks t JOIN albums al ON al.id = t.album_id GROUP BY al.year`,
+		`SELECT al.year, count(*) FROM tracks t JOIN albums al ON al.id = t.album_id WHERE al.tag LIKE 'a%' GROUP BY al.year`,
+	}
+	writes := [][]string{
+		{`INSERT INTO tracks(album_id, seconds, rating) VALUES (3, 1000, 0.5)`},
+		{`INSERT INTO tracks(album_id, seconds, rating) VALUES (4, 7, 0.25)`, `INSERT INTO tracks(album_id, seconds, rating) VALUES (5, 9, 1)`},
+		{`UPDATE tracks SET seconds = seconds * 2 WHERE album_id = 6`, `INSERT INTO tracks(album_id, seconds, rating) VALUES (6, 19, 0.5)`},
+		{`DELETE FROM tracks WHERE id = 5`, `INSERT INTO tracks(album_id, seconds, rating) VALUES (6, 23, 0.5)`},
+		{`INSERT INTO tracks(id, album_id, seconds, rating) VALUES (-3, 2, 5, 0.5)`, `INSERT INTO tracks(album_id, seconds, rating) VALUES (2, 6, 0.5)`},
+		{`UPDATE albums SET year = 1 WHERE id = 2`, `INSERT INTO tracks(album_id, seconds, rating) VALUES (2, 8, 0.5)`},
+		{`INSERT INTO tracks(album_id, seconds, rating) VALUES (9, 1, 0.125)`},
+		// Rewriting a row this session appended keeps the overlay sorted; only
+		// the count of writes that were not appends tells.
+		{`UPDATE tracks SET seconds = 77777 WHERE id = (SELECT max(id) FROM tracks)`, `INSERT INTO tracks(album_id, seconds, rating) VALUES (9, 2, 0.25)`},
+		{`DELETE FROM albums WHERE id = 9`},
+		{`INSERT INTO tracks(album_id, seconds, rating) VALUES (10, 2, 0.5)`},
+		// A LIKE's answer follows the setting, not only the rows.
+		{`PRAGMA case_sensitive_like = 1`},
+		{`PRAGMA case_sensitive_like = 0`},
+	}
+	run := func(off bool) []string {
+		segPeepholesOffForTest = off
+		defer func() { segPeepholesOffForTest = false }()
+		db, err := OpenOrCreate(filepath.Join(t.TempDir(), "j.musq"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		exec := func(s string) {
+			if _, _, err := db.ExecArgs(s, nil); err != nil {
+				t.Fatalf("%s: %v", s, err)
+			}
+		}
+		for _, s := range setup {
+			exec(s)
+		}
+		db.CommitIfAutocommit()
+		exec("BEGIN")
+		var out []string
+		read := func() {
+			for _, q := range queries {
+				_, rows, err := db.Query(q, nil)
+				out = append(out, fmt.Sprint(rows, err))
+			}
+		}
+		read()
+		for _, w := range writes {
+			for _, s := range w {
+				exec(s)
+			}
+			read()
+		}
+		exec("COMMIT")
+		read()
+		return out
+	}
+	SegJoinHitsForTest()
+	want := run(true)
+	if SegJoinHitsForTest() != 0 {
+		t.Fatal("the reference run used the join kernel")
+	}
+	got := run(false)
+	if SegJoinHitsForTest() == 0 {
+		t.Fatal("the join kernel answered nothing")
+	}
+	for i := range want {
+		if want[i] != got[i] {
+			t.Errorf("read %d (query %d):\n  loop   %.300s\n  kernel %.300s", i, i%len(queries), want[i], got[i])
+		}
+	}
+}
+
+// TestSegJoinMultiOrMatchesLoop holds the join kernel to the loop over a
+// MULTI_OR inner level, whose rows the loop orders per outer row by the
+// first OR term each satisfies, then that term's index: answers whose order
+// shows it -- group_concat, a bare column, ORDER BY ... LIMIT ties -- must
+// match exactly, with the kernel answering.
+func TestSegJoinMultiOrMatchesLoop(t *testing.T) {
+	setup := []string{
+		`CREATE TABLE a(id INTEGER PRIMARY KEY, z INTEGER, s TEXT)`,
+		`CREATE TABLE b(id INTEGER PRIMARY KEY, k INTEGER, x INTEGER, y INTEGER, w TEXT)`,
+		`CREATE INDEX b_x ON b(x)`, `CREATE INDEX b_y ON b(y DESC)`,
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 40) INSERT INTO a SELECT i, i % 9, CASE i % 3 WHEN 0 THEN 'p' ELSE 'q' END FROM n`,
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 6000) INSERT INTO b SELECT i, i % 41, (i * 7) % 13, (i * 11) % 17, 'w' || (i % 5) FROM n`,
+		`DELETE FROM b WHERE id % 97 = 0`,
+		`ANALYZE`,
+	}
+	queries := []string{
+		`SELECT a.id, group_concat(b.id) FROM a JOIN b ON b.k = a.id WHERE b.x = 1 OR b.y = a.z GROUP BY a.id`,
+		`SELECT a.id, group_concat(b.id), b.w FROM a JOIN b ON b.k = a.id WHERE b.x = 1 OR b.y = a.z GROUP BY a.id`,
+		`SELECT a.id, json_group_array(b.y) FROM a JOIN b ON b.k = a.id WHERE b.y = a.z OR b.x = 4 GROUP BY a.id`,
+		`SELECT a.id, b.id FROM a JOIN b ON b.k = a.id WHERE b.x = 1 OR b.y = a.z ORDER BY a.id LIMIT 30`,
+		`SELECT count(*), group_concat(b.id, ',') FROM a JOIN b ON b.k = a.id WHERE b.x = 3 OR b.y = a.z`,
+		// Range terms: each pass's rows in its index's order, b_y descending.
+		`SELECT a.id, group_concat(b.id) FROM a JOIN b ON b.k = a.id WHERE b.x = 1 OR b.y BETWEEN a.z AND a.z + 1 GROUP BY a.id`,
+		`SELECT a.id, group_concat(b.id) FROM a JOIN b ON b.k = a.id WHERE b.x IN (1, 2) OR b.y = a.z GROUP BY a.id`,
+		`SELECT a.s, b.id, count(*) FROM a JOIN b ON b.k = a.id WHERE b.x = 2 OR b.y = a.z GROUP BY a.s`,
+		`SELECT a.id, b.id, b.x FROM a JOIN b ON b.k = a.id WHERE b.x = 1 OR b.y = a.z ORDER BY a.z LIMIT 7`,
+		`SELECT a.id, b.id FROM a JOIN b ON b.k = a.id WHERE b.y = a.z OR b.x = a.z ORDER BY b.w DESC LIMIT 9 OFFSET 2`,
+		`SELECT a.z, json_group_array(b.id) FROM a JOIN b ON b.k = a.id WHERE (b.x = 1 OR b.y = a.z) AND b.id > 100 GROUP BY a.z`,
+	}
+	run := func(off bool) []string {
+		segPeepholesOffForTest = off
+		defer func() { segPeepholesOffForTest = false }()
+		db, err := OpenOrCreate(filepath.Join(t.TempDir(), "m.musq"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		for _, s := range setup {
+			if _, _, err := db.ExecArgs(s, nil); err != nil {
+				t.Fatalf("%s: %v", s, err)
+			}
+			db.CommitIfAutocommit()
+		}
+		var out []string
+		for _, q := range queries {
+			_, rows, err := db.Query(q, nil)
+			out = append(out, fmt.Sprint(rows, err))
+		}
+		return out
+	}
+	SegJoinHitsForTest()
+	want := run(true)
+	got := run(false)
+	if SegJoinHitsForTest() == 0 {
+		t.Fatal("the join kernel answered nothing")
+	}
+	for i := range want {
+		if want[i] != got[i] {
+			t.Errorf("%s:\n  loop   %.300s ... %s\n  kernel %.300s ... %s", queries[i], want[i], want[i][max(0, len(want[i])-12):], got[i], got[i][max(0, len(got[i])-12):])
+		}
+	}
+}
+
+// TestSegJoinCollatedGroupsMatchLoop holds the join kernel's GROUP BY under
+// NOCASE and RTRIM to the loop: text that differs only in ASCII case, in
+// trailing spaces, past a NUL (where NOCASE stops comparing) or in non-ASCII
+// letters it does not fold; each group's first row read by a bare column.
+func TestSegJoinCollatedGroupsMatchLoop(t *testing.T) {
+	setup := []string{
+		`CREATE TABLE k(id INTEGER PRIMARY KEY, s TEXT, c TEXT COLLATE NOCASE, r TEXT COLLATE RTRIM)`,
+		`CREATE TABLE v(id INTEGER PRIMARY KEY, k_id INTEGER, n INTEGER)`,
+		`INSERT INTO k VALUES (1, 'ab', 'ab', 'ab'), (2, 'AB', 'AB', 'ab '), (3, 'aB ', 'aB ', 'ab  '),
+			(4, char(97, 0, 98), char(97, 0, 98), char(97, 0, 98)), (5, char(65, 0, 99), char(65, 0, 99), char(97, 0, 98, 32)),
+			(6, 'ä', 'ä', 'ä'), (7, 'Ä', 'Ä', 'Ä'), (8, NULL, NULL, NULL), (9, 1, 1, 1), (10, '1', '1', '1 '),
+			(11, 'abc', 'ABC', 'abc'), (12, 'a]b', 'A]B', 'a]b'), (13, char(97, 0, 98, 99), char(65, 0, 98, 99), 'ab   ')`,
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 300) INSERT INTO v SELECT i, 1 + i % 13, i * 7 % 23 FROM n`,
+	}
+	queries := []string{
+		`SELECT k.s COLLATE NOCASE, count(*), sum(v.n), k.id FROM k JOIN v ON v.k_id = k.id GROUP BY k.s COLLATE NOCASE`,
+		`SELECT k.c, count(*), group_concat(v.id), k.s FROM k JOIN v ON v.k_id = k.id GROUP BY k.c`,
+		`SELECT k.r, count(*), sum(v.n), k.id, group_concat(v.id) FROM k JOIN v ON v.k_id = k.id GROUP BY k.r`,
+		`SELECT k.s COLLATE RTRIM, count(*), group_concat(k.id) FROM v JOIN k ON k.id = v.k_id GROUP BY k.s COLLATE RTRIM ORDER BY 2 DESC, 1`,
+		`SELECT k.c, count(*) FROM v JOIN k ON k.id = v.k_id GROUP BY k.c HAVING count(*) > 20`,
+	}
+	run := func(off bool) []string {
+		segPeepholesOffForTest = off
+		defer func() { segPeepholesOffForTest = false }()
+		db, err := OpenOrCreate(filepath.Join(t.TempDir(), "c.musq"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		for _, s := range setup {
+			if _, _, err := db.ExecArgs(s, nil); err != nil {
+				t.Fatalf("%s: %v", s, err)
+			}
+			db.CommitIfAutocommit()
+		}
+		var out []string
+		for _, q := range queries {
+			SegJoinHitsForTest()
+			_, rows, err := db.Query(q, nil)
+			if !off && SegJoinHitsForTest() == 0 {
+				t.Errorf("not served by the join kernel: %s", q)
+			}
+			out = append(out, fmt.Sprint(rows, err))
+		}
+		return out
+	}
+	want, got := run(true), run(false)
+	for i := range want {
+		if want[i] != got[i] {
+			t.Errorf("%s:\n  loop   %.300s ... %s\n  kernel %.300s ... %s", queries[i], want[i], want[i][max(0, len(want[i])-12):], got[i], got[i][max(0, len(got[i])-12):])
+		}
+	}
+}
+
+// segJoinTicks is tick(): a function that is not a function of its
+// arguments, counting its calls, so an answer shows how often and in what
+// order a statement called it.
+var (
+	segJoinTicks    int64
+	segJoinTickOnce sync.Once
+)
+
+// TestSegJoinVolatileMatchesLoop holds the join kernel to the loop on
+// aggregates over a volatile function, which the loop calls once per joined
+// row it steps, in its order: the kernel must call it exactly so -- once
+// per joined row, never once per table row or twice for a row it reads
+// again -- which tick()'s counts make visible.
+func TestSegJoinVolatileMatchesLoop(t *testing.T) {
+	segJoinTickOnce.Do(func() {
+		if err := RegisterFunction(ScalarFunction{Name: "segjoin_tick", NArg: -1, Fn: func([]Value) (Value, error) {
+			segJoinTicks++
+			return Value{Typ: Int, I: segJoinTicks}, nil
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	setup := []string{
+		`CREATE TABLE a(id INTEGER PRIMARY KEY, g INTEGER)`,
+		`CREATE TABLE b(id INTEGER PRIMARY KEY, a_id INTEGER, v INTEGER)`,
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 30) INSERT INTO a SELECT i, i % 4 FROM n`,
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 200) INSERT INTO b SELECT i, 1 + i % 37, i * 7 % 23 FROM n`,
+	}
+	queries := []string{
+		`SELECT count(*), group_concat(segjoin_tick()), sum(b.v) FROM a JOIN b ON b.a_id = a.id`,
+		`SELECT a.id, group_concat(segjoin_tick() * 10 + b.v), count(*) FROM a JOIN b ON b.a_id = a.id GROUP BY a.id`,
+		`SELECT a.g, sum(segjoin_tick()), group_concat(b.id) FROM a JOIN b ON b.a_id = a.id GROUP BY a.g`,
+		`SELECT a.id, group_concat(segjoin_tick(b.v)) FROM a LEFT JOIN b ON b.a_id = a.id AND b.v > 5 GROUP BY a.id`,
+		`SELECT max(b.v), group_concat(segjoin_tick()), b.id FROM a JOIN b ON b.a_id = a.id`,
+		`SELECT a.g, total(segjoin_tick() + b.v), max(b.v), b.id FROM b JOIN a ON a.id = b.a_id GROUP BY a.g`,
+		// Two calls per row, interleaved as the loop makes them.
+		`SELECT a.g, group_concat(segjoin_tick()), group_concat(segjoin_tick(b.v) * 2) FROM b JOIN a ON a.id = b.a_id GROUP BY a.g`,
+		`SELECT a.id, group_concat(segjoin_tick()), sum(segjoin_tick()) FROM a JOIN b ON b.a_id = a.id GROUP BY a.id`,
+		`SELECT group_concat(segjoin_tick()), group_concat(segjoin_tick() + segjoin_tick()) FROM a JOIN b ON b.a_id = a.id`,
+		`SELECT a.g, group_concat(segjoin_tick()), group_concat(segjoin_tick(b.v)), max(b.v), b.id FROM b JOIN a ON a.id = b.a_id GROUP BY a.g`,
+		`SELECT a.id, group_concat(segjoin_tick() || '-' || b.v), sum(segjoin_tick()) FROM a LEFT JOIN b ON b.a_id = a.id GROUP BY a.id`,
+		// ORDER BY ... LIMIT: the loop computes the record on every joined row.
+		`SELECT b.id, segjoin_tick() FROM a JOIN b ON b.a_id = a.id ORDER BY b.v, b.id LIMIT 7`,
+		`SELECT b.id, b.v FROM a JOIN b ON b.a_id = a.id ORDER BY segjoin_tick() % 7, b.id LIMIT 5`,
+		`SELECT a.id, b.id, segjoin_tick(b.v) FROM a LEFT JOIN b ON b.a_id = a.id AND b.v > 9 ORDER BY a.g DESC, b.id LIMIT 9`,
+		// random() in a WHERE term: a value of the joined row.
+		`SELECT count(*), sum(b.v) FROM a JOIN b ON b.a_id = a.id WHERE random() % 2 = 0 OR b.v >= 0`,
+		`SELECT a.g, count(*) FROM a JOIN b ON b.a_id = a.id WHERE b.v + random() * 0 > 3 GROUP BY a.g`,
+	}
+	run := func(off bool) []string {
+		segPeepholesOffForTest = off
+		defer func() { segPeepholesOffForTest = false }()
+		db, err := OpenOrCreate(filepath.Join(t.TempDir(), "v.musq"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		for _, s := range setup {
+			if _, _, err := db.ExecArgs(s, nil); err != nil {
+				t.Fatalf("%s: %v", s, err)
+			}
+			db.CommitIfAutocommit()
+		}
+		var out []string
+		for _, q := range queries {
+			segJoinTicks = 0
+			SegJoinHitsForTest()
+			_, rows, err := db.Query(q, nil)
+			if !off && SegJoinHitsForTest() == 0 {
+				t.Errorf("not served by the join kernel: %s", q)
+			}
+			out = append(out, fmt.Sprint(rows, err, segJoinTicks))
+		}
+		return out
+	}
+	want, got := run(true), run(false)
+	for i := range want {
+		if want[i] != got[i] {
+			t.Errorf("%s:\n  loop   %.300s ... %s\n  kernel %.300s ... %s", queries[i], want[i], want[i][max(0, len(want[i])-12):], got[i], got[i][max(0, len(got[i])-12):])
+		}
+	}
+}

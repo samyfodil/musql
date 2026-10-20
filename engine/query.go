@@ -1106,6 +1106,13 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 	if err := p.schemaCatalogQueryGuard(stmt); err != nil {
 		return nil, nil, err
 	}
+	// "... ORDER BY rank ... WHERE t MATCH ?": the bound query, folded in for
+	// this run and so not cached, as a folded LIMIT is (fts5_match_param.go).
+	if outer == nil {
+		if folded, ok := fts5FoldMatchParams(stmt, params); ok {
+			stmt, cacheKey = folded, ""
+		}
+	}
 	if err := p.fts5SegmentShadowQueryGuard(stmt); err != nil {
 		return nil, nil, err
 	}

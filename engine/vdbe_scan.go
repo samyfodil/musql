@@ -110,7 +110,7 @@ func compileSelectScanRow(p *ReadOnlyPager, stmt *SelectStmt, outer *compiler, r
 			existsInlinePeephole(prog)
 		}
 		if !segPeepholesOffForTest && !segPeephole(prog) && !segVectorPeephole(prog) && !segOrderPeephole(prog) &&
-			!segGroupPeephole(prog) && !segDistinctPeephole(prog) {
+			!segGroupPeephole(prog) && !segDistinctPeephole(prog) && !segJoinPeephole(prog) && !segJoinGroupPeephole(prog) && !segJoinHashPeephole(prog) && !segJoinTopPeephole(prog) {
 			segProgPeephole(prog)
 		}
 		// And the ROW recogniser, which is not one of the alternatives above:
@@ -985,6 +985,8 @@ type indexSeekPlan struct {
 	// is no index b-tree on our format, so the seek is answered from that column's
 	// posting list. See segment_seek.go.
 	leadingCol int
+	// index is the index's name (indexSeekCandidate.name).
+	index string
 }
 
 // detectIndexSeekKey looks for a WHERE conjunct "<indexed-col> = <const>" a
@@ -1146,6 +1148,7 @@ func planForColumn(c *compiler, cands []indexSeekCandidate, colIdx int, colExpr,
 			aff:        comparisonAffinity(c.affCtx(), colExpr, keyExpr),
 			coll:       cd.coll,
 			leadingCol: cd.leadingCol,
+			index:      cd.name,
 		}, true
 	}
 	return nil, false

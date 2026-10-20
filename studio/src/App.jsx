@@ -1,10 +1,38 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from "react";
 import { call, ident, query, ready, rows } from "./db.js";
 import { fmt } from "./values.js";
 import { Studio } from "./studio.js";
 import TableView from "./components/TableView.jsx";
-import QueryView from "./components/QueryView.jsx";
+import { ImportDialog, NewTableDialog } from "./components/Dialogs.jsx";
 import { SAMPLE } from "./sample.js";
+import { saved, unsave } from "./library.js";
+import { isStudioTable } from "./vectors.js";
+
+// The editor (CodeMirror) loads with the first query tab, not with the page.
+const QueryView = lazy(() => import("./components/QueryView.jsx"));
+
+// The tables a virtual table keeps its data in, by module: listed only on
+// request, as the sqlite3 shell's .tables leaves them out too.
+const SHADOW = {
+	fts5: ["data", "idx", "content", "docsize", "config"],
+	fts4: ["content", "segments", "segdir", "docsize", "stat"],
+	fts3: ["content", "segments", "segdir", "docsize", "stat"],
+	rtree: ["node", "parent", "rowid"],
+	rtree_i32: ["node", "parent", "rowid"],
+	vec1: ["config", "base", "idx", "model", "meta", "idx_idx"],
+};
+
+/** The names of schema's internal objects: shadow tables, their indexes, and the studio's own. */
+function internalNames(schema) {
+	const out = new Set();
+	for (const o of schema) {
+		const m = /^\s*CREATE\s+VIRTUAL\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?\S+\s+USING\s+(\w+)/i.exec(o.sql ?? "");
+		for (const sfx of SHADOW[m?.[1]?.toLowerCase()] ?? []) out.add(`${o.name}_${sfx}`);
+		if (isStudioTable(o.name) || /^musql_studio_/.test(o.name)) out.add(o.name);
+	}
+	for (const o of schema) if (out.has(o.tbl_name) && o.type !== "table") out.add(o.name);
+	return out;
+}
 
 const ICON = { table: "▦", view: "◇", index: "⋮", trigger: "ϟ", query: "›_" };
 const GROUP = { table: "Tables", view: "Views", index: "Indexes", trigger: "Triggers" };
@@ -36,6 +64,16 @@ export default function App() {
 	const [msg, setMsg] = useState({ text: "Starting…" });
 	const [dragging, setDragging] = useState(false);
 	const [menu, setMenu] = useState(false);
+	const [showInternal, setShowInternal] = useState(false);
+	const [library, setLibrary] = useState(saved);
+	const [dialog, setDialog] = useState(null); // "table" | "import" | {import: file} | null
+	const [sideOpen, setSideOpen] = useState(false); // the sidebar, on a narrow screen
+
+	useEffect(() => {
+		const on = () => setLibrary(saved());
+		addEventListener("musql-library", on);
+		return () => removeEventListener("musql-library", on);
+	}, []);
 
 	const status = useCallback((text, err) => setMsg({ text, err }), []);
 
@@ -91,7 +129,8 @@ export default function App() {
 		});
 	}
 	const openTable = (name, mode = "data") => openTab({ kind: "table", table: name, title: name, mode });
-	const openQuery = (text = "") => openTab({ kind: "query", title: `Query ${++querySeq}`, text });
+	const openQuery = (text = "", title = `Query ${++querySeq}`) => openTab({ kind: "query", title, text });
+	const retitle = (id, title) => setTabs((ts) => ts.map((t) => (t.id === id ? { ...t, title } : t)));
 
 	function closeTab(id) {
 		setTabs((ts) => {
@@ -126,7 +165,13 @@ export default function App() {
 	}
 
 	async function openFile(file) {
-		if (file) await openDatabase(file.name, new Uint8Array(await file.arrayBuffer()));
+		if (!file) return;
+		if (/\.(csv|tsv|json)$/i.test(file.name)) {
+			if (!dbName) await openDatabase("untitled.musq");
+			setDialog({ import: file });
+			return;
+		}
+		await openDatabase(file.name, new Uint8Array(await file.arrayBuffer()));
 	}
 
 	async function exportAs(kind) {
@@ -170,11 +215,13 @@ export default function App() {
 	const ctx = { schema, columnsOf, status, changed, dark };
 	const activeTab = tabs.find((t) => t.id === active);
 	const f = filter.trim().toLowerCase();
+	const internal = useMemo(() => internalNames(schema), [schema]);
+	const hidden = showInternal ? 0 : schema.filter((o) => internal.has(o.name)).length;
 
 	return (
 		<Studio.Provider value={ctx}>
 			<div
-				className="shell"
+				className={`shell${sideOpen ? " sideopen" : ""}`}
 				onDragEnter={(e) => e.dataTransfer.types.includes("Files") && setDragging(true)}
 				onDragOver={(e) => e.preventDefault()}
 				onDrop={(e) => {
@@ -184,6 +231,7 @@ export default function App() {
 				}}
 			>
 				<header className="bar">
+					<button className="menubtn ghost" title="Tables and saved queries" onClick={(e) => { e.stopPropagation(); setSideOpen(!sideOpen); }}>☰</button>
 					<div className="brand"><span className="logo">μ</span>musql <span className="dim">studio</span></div>
 					<div className="dbname">{dbName ?? "no database"}{dirty && <span className="dot" title="Changed since it was opened or exported" />}</div>
 					<div className="actions">
@@ -206,12 +254,16 @@ export default function App() {
 				</header>
 
 				<div className="layout">
-					<aside className="side">
+					<aside className="side" onClick={(e) => e.target.closest("button.item, .item .name") && setSideOpen(false)}>
 						<input className="filter" type="search" placeholder="Filter tables…" spellCheck={false} value={filter} onChange={(e) => setFilter(e.target.value)} />
-						<button className="newquery" disabled={!dbName} onClick={() => openQuery()}>＋ New query</button>
+						<div className="sidebtns">
+							<button className="newquery" disabled={!dbName} onClick={() => openQuery()}>＋ Query</button>
+							<button className="newquery" disabled={!dbName} onClick={() => setDialog("table")}>＋ Table</button>
+							<button className="newquery" disabled={!dbName} title="Import a CSV or JSON file into a table" onClick={() => setDialog("import")}>Import…</button>
+						</div>
 						<nav>
 							{["table", "view", "index", "trigger"].map((type) => {
-								const items = schema.filter((o) => o.type === type && (!f || o.name.toLowerCase().includes(f)));
+								const items = schema.filter((o) => o.type === type && (showInternal || !internal.has(o.name)) && (!f || o.name.toLowerCase().includes(f)));
 								if (!items.length) return null;
 								return (
 									<div className="group" key={type}>
@@ -235,6 +287,24 @@ export default function App() {
 								);
 							})}
 							{dbName && !schema.length && <p className="dim small pad">No tables yet. Write some SQL in a query tab.</p>}
+							{(hidden > 0 || showInternal) && (
+								<button className="link small pad" onClick={() => setShowInternal(!showInternal)}>
+									{showInternal ? "Hide internal tables" : `Show ${hidden} internal table${hidden === 1 ? "" : "s"}`}
+								</button>
+							)}
+							{library.length > 0 && (
+								<div className="group">
+									<h3>Saved queries<span>{library.length}</span></h3>
+									{library.filter((q) => !f || q.name.toLowerCase().includes(f)).map((q) => (
+										<div key={q.name} className="item saved">
+											<button className="name" title={q.sql} onClick={() => openQuery(q.sql, q.name)}>
+												<span className="ic">{ICON.query}</span>{q.name}
+											</button>
+											<button className="x" title="Forget this saved query" onClick={() => confirm(`Forget the saved query “${q.name}”?`) && unsave(q.name)}>×</button>
+										</div>
+									))}
+								</div>
+							)}
 						</nav>
 					</aside>
 
@@ -251,7 +321,13 @@ export default function App() {
 						<div className="panes">
 							{tabs.map((t) => (
 								<div key={t.id} className="pane" hidden={t.id !== active}>
-									{t.kind === "table" ? <TableView name={t.table} mode={t.mode} /> : <QueryView initial={t.text} />}
+									{t.kind === "table" ? (
+										<TableView name={t.table} mode={t.mode} />
+									) : (
+										<Suspense fallback={<p className="dim pad">Loading the editor…</p>}>
+											<QueryView initial={t.text} title={t.title} onTitle={(title) => retitle(t.id, title)} />
+										</Suspense>
+									)}
 								</div>
 							))}
 							{!tabs.length && (
@@ -274,6 +350,26 @@ export default function App() {
 					<span className={msg.err ? "err" : ""}>{msg.text}</span>
 					<span className="dim">musql · WebAssembly + JIT, in a worker</span>
 				</footer>
+
+				{dialog === "table" && (
+					<NewTableDialog status={status} onClose={(name) => {
+						setDialog(null);
+						if (name) {
+							changed();
+							openTable(name, "structure");
+							status(`Created ${name}.`);
+						}
+					}} />
+				)}
+				{(dialog === "import" || dialog?.import) && (
+					<ImportDialog file={dialog?.import} status={status} tables={schema.filter((o) => o.type === "table").map((o) => o.name)} onClose={(name) => {
+						setDialog(null);
+						if (name) {
+							changed();
+							openTable(name);
+						}
+					}} />
+				)}
 
 				{dragging && (
 					<div className="drop" onDragLeave={(e) => e.currentTarget === e.target && setDragging(false)}>

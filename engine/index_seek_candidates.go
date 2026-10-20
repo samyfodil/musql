@@ -18,6 +18,7 @@ import (
 // SeekIndexRowidsSegments and detectIndexSeekKey).
 type indexSeekCandidate struct {
 	root       uint32
+	name       string // the index's own name: a segment table's indexes all have root 0
 	leadingCol int
 	coll       string
 }
@@ -157,7 +158,7 @@ func (p *ReadOnlyPager) secondaryIndexSeekCandidates(tableName string, tableRoot
 		if !equalFoldName(idxColl, whereColl) {
 			continue // index ordered by a collation the comparison doesn't use -- unsafe
 		}
-		out = append(out, indexSeekCandidate{root: r.RootPage, leadingCol: colIdx, coll: whereColl})
+		out = append(out, indexSeekCandidate{root: r.RootPage, name: r.Name, leadingCol: colIdx, coll: whereColl})
 	}
 	return out, nil
 }

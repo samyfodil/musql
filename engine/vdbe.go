@@ -25,17 +25,17 @@ import (
 // used per run; registers, cursors, and sorters are not shared across
 // executions.
 type vdbe struct {
-	regs         []Value
-	jx           *vmJIT        // native code for the program run() is given, when it has some
-	jcur         []jit.VCursor // native code's view of the cursors it names, filled at each entry
+	regs []Value
+	jx   *vmJIT        // native code for the program run() is given, when it has some
+	jcur []jit.VCursor // native code's view of the cursors it names, filled at each entry
 	// jargs is the argument block of every entry into native code: kept on the
 	// machine and only its live fields set per entry, because zeroing a fresh
 	// one -- most of it the segment JIT's -- was a measurable share of a short
 	// entry.
-	jargs jit.ProgArgs
-	jsnap        []jitSnap     // the copies of the rows of cursors it can read but not walk
-	jitEnters    int           // entries into jx, which the fuel test counts
-	jitRows      int           // result rows native code copied out, which the pointer tests count
+	jargs        jit.ProgArgs
+	jsnap        []jitSnap // the copies of the rows of cursors it can read but not walk
+	jitEnters    int       // entries into jx, which the fuel test counts
+	jitRows      int       // result rows native code copied out, which the pointer tests count
 	cursors      []*vdbeCursor
 	recRegs      [][]Value
 	sorters      []*vdbeSorter
@@ -93,7 +93,13 @@ type vdbe struct {
 	// aggRowBuf/aggRowidBuf are gatherCursorRow's reusable per-row buffers --
 	// see its doc comment for why reuse is safe here.
 	aggRowBuf   []Value
+	unpackBuf   []Value        // OpSorterData's expanded row (recUnpack)
+	segJoin     *segJoinGroups // OpSegJoinGroups' groups, nil when it declined
 	aggRowidBuf []Value
+	// aggNullRow is the row a rowFree step (aggPlan.rowFree) hands on in place
+	// of a gathered one: all NULL, at least as wide as any plan's, never
+	// written. The anchor copies it and nothing reads that.
+	aggNullRow []Value
 	// A POINTER, not the struct: an evalCtx is 304 bytes, a third of this whole
 	// machine, and only the aggregate opcodes ever touch it. Inline it and every
 	// point lookup pays for a field it never reads -- and a machine is allocated
@@ -1261,6 +1267,9 @@ func (m *vdbe) outerFrame(levels int) *vdbe {
 func cursorColumnMasks(insns []Instruction, ncursors int) []columnMask {
 	for i := range insns {
 		if readsWholeCursorRows(insns[i].Op) {
+			if p, ok := insns[i].P4.(*aggPlan); ok && insns[i].Op == OpAggStep && p.rowFree {
+				continue // gathers no row (aggPlan.rowFree)
+			}
 			return nil
 		}
 	}
@@ -1363,6 +1372,11 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			// An entry whose first cursor native code could not use would only
 			// pay for the call and exit at that instruction.
 			if g := jx.gate[pc]; g >= 0 && (int(g) >= len(m.cursors) || m.cursors[g] == nil) {
+				op = &insns[pc]
+				goto dispatch
+			}
+			// Nor one that would copy a row out for too little native work.
+			if jx.light != nil && jx.light[pc] && jx.copies(m, pc) {
 				op = &insns[pc]
 				goto dispatch
 			}
@@ -2443,6 +2457,12 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			m.sorters[op.P1] = newSorter(op.P4.(*sorterKeyInfo), m.encoding())
 
 		case OpMakeRecord:
+			if _, view := op.P4.(recView); view {
+				// The registers themselves, read before any of them is written
+				// again (see recView): no copy, no allocation.
+				m.recRegs[op.P3] = m.regs[op.P1 : op.P1+op.P2 : op.P1+op.P2]
+				break
+			}
 			rec := m.recAlloc(op.P2)
 			owned := m.wctx != nil && m.wctx.db.argsOwned
 			borrow, _ := op.P4.(recBorrow)
@@ -2469,6 +2489,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpSorterData:
 			row := m.sorters[op.P1].data()
+			if u, ok := op.P4.(*recUnpack); ok {
+				row = u.expand(row, &m.unpackBuf)
+			}
 			if n := min(op.P3, len(row)); n > 0 {
 				// P3: this record round-trip LOSES the JSON subtype on its
 				// leading n values -- see OpSorterData's own doc comment.
@@ -2640,6 +2663,103 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			segFilterDeclined.Add(1)
 
+		case OpSegJoinAgg:
+			jp, okPlan := op.P4.(*segJoinPlan)
+			if !okPlan {
+				return nil, fmt.Errorf("vdbe: OpSegJoinAgg without a plan")
+			}
+			served, jerr := m.segJoinAggregate(jp)
+			if jerr != nil {
+				return nil, jerr
+			}
+			if served {
+				segFilterServed.Add(1)
+				pc = op.P2
+				continue
+			}
+			segFilterDeclined.Add(1)
+
+		case OpSegJoinGroups:
+			jp, okPlan := op.P4.(*segJoinPlan)
+			if !okPlan {
+				return nil, fmt.Errorf("vdbe: OpSegJoinGroups without a plan")
+			}
+			m.segJoin = nil
+			if gs, served := m.segJoinGroupsOf(jp); served {
+				m.segJoin = gs
+				segJoinHits.Add(1)
+				segFilterServed.Add(1)
+				pc = op.P2
+				continue
+			}
+			segFilterDeclined.Add(1)
+
+		case OpSegJoinVolatile:
+			call, okCall := op.P4.(*segJoinVolatileCall)
+			if !okCall {
+				return nil, fmt.Errorf("vdbe: OpSegJoinVolatile without its call")
+			}
+			if gs := m.segJoin; gs != nil && gs.plan == call.plan && gs.next > 0 {
+				if v, kept := gs.w.called(call.pc, gs.groups[gs.next-1].first); kept {
+					m.regs[call.fn.P3] = v
+					break
+				}
+			}
+			if ferr := m.opFunction(&call.fn); ferr != nil {
+				return nil, ferr
+			}
+
+		case OpSegJoinHash:
+			jp, okPlan := op.P4.(*segJoinPlan)
+			if !okPlan {
+				return nil, fmt.Errorf("vdbe: OpSegJoinHash without a plan")
+			}
+			served, jerr := m.segJoinHashAgg(jp)
+			if jerr != nil {
+				return nil, jerr
+			}
+			if served {
+				segFilterServed.Add(1)
+				pc = op.P2
+				continue
+			}
+			segFilterDeclined.Add(1)
+
+		case OpSegJoinTop:
+			jp, okPlan := op.P4.(*segJoinPlan)
+			if !okPlan {
+				return nil, fmt.Errorf("vdbe: OpSegJoinTop without a plan")
+			}
+			m.segJoin = nil
+			if gs, served := m.segJoinTopOf(jp); served {
+				m.segJoin = gs
+				segJoinHits.Add(1)
+				segFilterServed.Add(1)
+				pc = op.P2
+				continue
+			}
+			segFilterDeclined.Add(1)
+
+		case OpSegJoinNext:
+			gs := m.segJoin
+			if gs == nil || gs.plan != op.P4 || gs.next >= len(gs.groups) {
+				pc = op.P2
+				continue
+			}
+			gs.load(m, &gs.groups[gs.next])
+			gs.next++
+
+		case OpSegJoinRest:
+			if gs := m.segJoin; gs != nil && gs.plan == op.P4 {
+				if seq := m.recRegs[op.P1][op.P2]; seq.Typ == Int && seq.I >= 0 && seq.I < int64(len(gs.groups)) {
+					if rerr := gs.rest(m, &gs.groups[seq.I]); rerr != nil {
+						return nil, rerr
+					}
+				} else {
+					return nil, fmt.Errorf("vdbe: OpSegJoinRest without its group")
+				}
+			}
+
 		case OpSegHashAgg:
 			gplan, okPlan := op.P4.(*segGroupPlan)
 			if !okPlan || m.pager == nil {
@@ -2672,7 +2792,14 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 		case OpAggStep:
 			plan := op.P4.(*aggPlan)
 			var row, rowids []Value
-			if op.P3 == 0 { // source: plan.cursors (one or more joined table cursors)
+			if op.P3 == 0 && plan.rowFree {
+				// Nothing reads the row (aggPlan.rowFree): the steps read their
+				// registers.
+				if n := plan.nCols + len(plan.scopes); len(m.aggNullRow) < n {
+					m.aggNullRow = make([]Value, n)
+				}
+				row, rowids = m.aggNullRow[:plan.nCols:plan.nCols], m.aggNullRow[plan.nCols:plan.nCols+len(plan.scopes)]
+			} else if op.P3 == 0 { // source: plan.cursors (one or more joined table cursors)
 				var gerr error
 				row, rowids, gerr = m.gatherCursorRow(plan)
 				if gerr != nil {
@@ -3296,6 +3423,34 @@ func (m *vdbe) recordOf(v Value, borrowed, owned bool) Value {
 // it from the stored row or copies it itself (the columns the UPDATE does not
 // assign).
 type recBorrow []bool
+
+// recView is an OpMakeRecord's P4 when the record is the register range
+// itself rather than a copy: a streamed GROUP BY row (compileScanGroupBy),
+// which the drain subroutine reads before the scan loads the next row into
+// those registers, and which nothing keeps past that. Anything that could
+// keep the record -- a sorter, a bare column's anchor row -- takes a copy.
+type recView struct{}
+
+// recUnpack is an OpSorterData's P4 when the sorted record carries only some
+// of a GROUP BY's [cols..] block, packed: at[i] is the column the record's
+// i-th value belongs at. The rest of the record ([rowids.., seq, groupVals..])
+// follows them. expand lays the row out in full, the columns no one reads
+// NULL, in a buffer the machine reuses: like a streamed row's (recView), the
+// drain reads it before the next and keeps nothing of it but copies.
+type recUnpack struct {
+	at    []int
+	nCols int
+}
+
+func (u *recUnpack) expand(row []Value, buf *[]Value) []Value {
+	n := u.nCols + len(row) - len(u.at)
+	out := growValues(buf, n)
+	for i, k := range u.at {
+		out[k] = row[i]
+	}
+	copy(out[u.nCols:], row[len(u.at):])
+	return out
+}
 
 func copyValue(v Value) Value {
 	if v.S != nil {

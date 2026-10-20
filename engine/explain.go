@@ -401,6 +401,7 @@ type explainScan struct {
 	name     string
 	rowidKey bool   // an OpSeekRowidHint reached this cursor
 	idxRoot  uint32 // an OpSeekIndexHint's index root, 0 for none
+	idxName  string // its index's name: a segment table's index has root 0
 	write    bool   // opened by OpOpenWrite: a DML target, scanned only if rewound
 	order    int    // rank in nested-loop order: the address of this cursor's OpRewind
 }
@@ -433,7 +434,7 @@ func (p *ReadOnlyPager) explainPlanDetails(prog *Program) []string {
 		case OpSeekIndexHint:
 			if s, ok := byCursor[in.P1]; ok && s != nil {
 				if h, ok := in.P4.(*indexSeekHint); ok {
-					s.idxRoot = h.root
+					s.idxRoot, s.idxName = h.root, h.index
 				}
 			}
 		}
@@ -468,8 +469,8 @@ func (p *ReadOnlyPager) explainPlanDetails(prog *Program) []string {
 		switch {
 		case s.rowidKey:
 			out = append(out, "SEARCH "+name+" USING INTEGER PRIMARY KEY (rowid=?)")
-		case s.idxRoot != 0:
-			idx, col := p.explainIndexAt(s.idxRoot)
+		case s.idxRoot != 0 || s.idxName != "":
+			idx, col := p.explainIndexAt(s.idxRoot, s.idxName)
 			if idx == "" {
 				out = append(out, "SCAN "+name)
 				continue
@@ -525,14 +526,15 @@ func explainSourceName(p4 any) string {
 // CREATE INDEX text, which is what secondaryIndexSeekCandidates read to choose
 // it in the first place; an index it cannot name declines to "SCAN" rather than
 // print a plan line naming nothing.
-func (p *ReadOnlyPager) explainIndexAt(root uint32) (name, col string) {
+func (p *ReadOnlyPager) explainIndexAt(root uint32, byName string) (name, col string) {
 	rows, err := p.Schema()
 	if err != nil {
 		return "", ""
 	}
 	for i := range rows {
 		r := &rows[i]
-		if r.Type != "index" || r.RootPage != root || r.SQL == "" {
+		// A segment table's index has root 0 and is known by its name.
+		if r.Type != "index" || r.SQL == "" || r.RootPage != root || root == 0 && !equalFoldName(r.Name, byName) {
 			continue
 		}
 		stmt, perr := parseCreateIndexStmt(r.SQL)

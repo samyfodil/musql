@@ -1,23 +1,25 @@
 import { useEffect, useRef, useState } from "react";
-import { show } from "../values.js";
+import { isVectorColumn, show } from "../values.js";
 
 /**
  * A result grid. Every prop past columns and rows is optional:
- *   types       column -> declared type, shown in the header
+ *   types       column -> declared type, shown in the header; a vector type
+ *               shows its column's values as vectors
  *   sort/desc   the sorted column, and onSort(column) to change it
  *   picked      the selected row indexes, and onPick(i) to toggle one
- *   onEdit      (i, column, value) => Promise; makes cells editable by double-click
+ *   onEdit      (i, column, text) => Promise; makes cells editable by double-click
  *   start       the number of the first row
  */
 export default function Grid({ columns, rows, types, sort, desc, onSort, picked, onPick, onEdit, start = 0 }) {
 	const [editing, setEditing] = useState(null); // [row, col]
+	const vector = columns.map((c) => isVectorColumn(c, types?.[c]));
 	return (
 		<table className="grid">
 			<thead>
 				<tr>
 					<th className="rn">#</th>
-					{columns.map((c) => (
-						<th key={c} className={sort === c ? "sorted" : ""} onClick={onSort && (() => onSort(c))}>
+					{columns.map((c, j) => (
+						<th key={j} className={sort === c ? "sorted" : ""} onClick={onSort && (() => onSort(c))}>
 							{c}
 							{types?.[c] && <span className="type">{types[c]}</span>}
 							{sort === c && (desc ? " ↓" : " ↑")}
@@ -36,7 +38,7 @@ export default function Grid({ columns, rows, types, sort, desc, onSort, picked,
 									setEditing(null);
 								}} />
 							) : (
-								<Cell key={j} v={v} onDoubleClick={onEdit && (() => setEditing([i, j]))} />
+								<Cell key={j} v={v} vector={vector[j]} onDoubleClick={onEdit && (() => setEditing([i, j]))} />
 							),
 						)}
 					</tr>
@@ -46,17 +48,18 @@ export default function Grid({ columns, rows, types, sort, desc, onSort, picked,
 	);
 }
 
-function Cell({ v, onDoubleClick }) {
-	const { text, cls } = show(v);
+function Cell({ v, vector, onDoubleClick }) {
+	const { text, cls, title } = show(v, vector);
 	return (
-		<td className={cls} title={typeof v === "string" && v.length > 40 ? v.slice(0, 2000) : undefined} onDoubleClick={onDoubleClick}>
+		<td className={cls} title={title} onDoubleClick={onDoubleClick}>
 			{text}
 		</td>
 	);
 }
 
 // EditCell: Enter saves, Escape cancels, Ctrl/Cmd+Backspace sets NULL, and
-// leaving the cell saves.
+// leaving the cell saves. The text is stored by the column's type
+// (values.js typed): '…' in single quotes is always text.
 function EditCell({ value, onDone }) {
 	const ref = useRef(null);
 	const done = useRef(false);
@@ -77,6 +80,7 @@ function EditCell({ value, onDone }) {
 				defaultValue={orig ?? ""}
 				spellCheck={false}
 				placeholder="NULL"
+				title="Enter saves · Esc cancels · ⌘/Ctrl+Backspace sets NULL · '…' keeps a number as text"
 				onKeyDown={(e) => {
 					if (e.key === "Enter") finish(true, e.currentTarget.value);
 					else if (e.key === "Escape") finish(false);

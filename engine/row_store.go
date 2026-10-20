@@ -38,6 +38,12 @@ type rowStore struct {
 	// writes counts every put, drop and swap: while it has not moved, no row
 	// has entered or left m or the dropped set. rowSeen relies on it.
 	writes uint64
+	// reshapes counts the writes that were not appends: a put past every
+	// rowid the sorted overlay holds while it is valid (put) does not move
+	// it. While it stands still, the overlay has only grown at its end, which
+	// is what lets the join kernel extend its reading of the store
+	// (segJoinTableOf) rather than read it again.
+	reshapes uint64
 
 	// max caches the largest rowid for nextRowidForTable. Cleared on drop
 	// to match SQLite's rowid reuse behavior.
@@ -67,6 +73,11 @@ type rowStore struct {
 	// signed order, merged with segments in ordered walks.
 	over      []uint64
 	overValid bool
+
+	// joinTable is the join kernel's reading of this store's rows
+	// (segJoinTableOf), stamped with the write counters it was read at.
+	// segJoinCacheMu guards it.
+	joinTable *segJoinTable
 
 	// eqIdx is the lazily built per-column equality index, nil until a seek asks
 	// for one and thrown away whole by any mutation. See row_store_eqindex.go.
@@ -401,8 +412,17 @@ func (s *rowStore) putHeld(rowid uint64, vals, held []Value) {
 	s.writes++
 	s.m[rowid] = vals
 	if len(s.m) != n0 {
-		s.overValid = false
+		// A rowid past every one the overlay holds -- an append, the common
+		// insert -- keeps it sorted; anything else sorts it again.
+		if s.overValid && len(s.over) == n0 && (n0 == 0 || rowidLess(s.over[n0-1], rowid)) {
+			s.over = append(s.over, rowid)
+		} else {
+			s.overValid = false
+			s.reshapes++
+		}
 		s.mPeak = max(s.mPeak, len(s.m))
+	} else {
+		s.reshapes++
 	}
 	s.noteWritten(rowid, vals)
 	if !haveOld {
@@ -444,6 +464,7 @@ func (s *rowStore) clear() int64 {
 		s.mPeak = 0
 		s.swaps++
 		s.writes++
+		s.reshapes++
 		s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false
 		s.ubKnown = false
 		s.overValid, s.memBytes, s.unspilt = false, 0, nil
@@ -460,6 +481,7 @@ func (s *rowStore) clear() int64 {
 	s.m, s.mPeak = map[uint64][]Value{}, 0
 	s.swaps++
 	s.writes++
+	s.reshapes++
 	s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false
 	s.ubKnown = false
 	s.overValid, s.memBytes, s.unspilt = false, 0, nil
@@ -471,6 +493,7 @@ func (s *rowStore) clear() int64 {
 
 func (s *rowStore) drop(rowid uint64) {
 	s.writes++
+	s.reshapes++
 	// Unconditional, including for a rowid the store does not hold: clearing
 	// is always safe, and gating it on a lookup would cost the delete's own
 	// map probe twice over.
@@ -683,6 +706,9 @@ func (s *rowStore) clone(owner *tableMeta) *rowStore {
 	cp.mPeak = len(cp.m)
 	cp.gone = maps.Clone(s.gone) // the overlay is the copy; the base is shared and read-only
 	cp.goneBits = nil            // this store's own; the copy reads its map
+	// The sorted overlay is appended to in place (put), so the copy keeps none
+	// of its backing array.
+	cp.over, cp.overValid = nil, false
 	return &cp
 }
 

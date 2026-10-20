@@ -31,9 +31,16 @@ import "fmt"
 // (compileScanGroupBy / compileScanGroupByHash) and the drain reads them from the
 // sorter record (select.c:8657).
 type aggPlan struct {
-	scopes     []tableScope
-	nCols      int         // total column count across every joined table -- the [cols..] block width; len(scopes) rowid slots immediately follow it in the [cols.., rowids..] layout (see aggRowSplit)
-	cursors    []int       // parallel to scopes: the cursor number backing each scope, for the ROWID half of gatherCursorRow
+	// rowFree is set when no step reads the scanned row itself: every
+	// argument is lowered to a register, and nothing keeps or checks an anchor
+	// row (no bare column, no subquery reading it, no anchor certificate, no
+	// aggregate ORDER BY). OpAggStep then gathers no row, and the cursors
+	// decode only the columns the program names (cursorColumnMasks).
+	rowFree bool
+
+	scopes  []tableScope
+	nCols   int   // total column count across every joined table -- the [cols..] block width; len(scopes) rowid slots immediately follow it in the [cols.., rowids..] layout (see aggRowSplit)
+	cursors []int // parallel to scopes: the cursor number backing each scope, for the ROWID half of gatherCursorRow
 	// gathers is one entry per PHYSICAL row source, which is NOT the same as
 	// one per scope: a materialized parenthesized join GROUP is several leaf
 	// SCOPES (one per member, for name resolution) sharing ONE cursor whose
@@ -41,7 +48,7 @@ type aggPlan struct {
 	// member, each at the member's own offset, would write past the group's
 	// extent and misplace every value after the first -- so the row copy is
 	// driven by this list and the rowids by cursors/scopes above.
-	gathers []aggGather
+	gathers    []aggGather
 	outPlans   []*itemPlan // one per select-list output column
 	havingPlan *itemPlan   // nil when there is no HAVING clause
 	orderPlans []orderPlan // GROUP BY ORDER BY terms; empty for whole-table or unordered

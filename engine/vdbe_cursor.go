@@ -167,9 +167,11 @@ type vdbeCursor struct {
 	// segment rather than in a decoded record: readColumn fetches one column
 	// from it, and rowVals holds nothing anyone may read.
 	segSrc *segRowSource
-	// pointSrc is the source a rowid point seek positions (segPointSeek),
-	// held here so a seek per outer row allocates none.
-	pointSrc         segRowSource
+	// pointSrc is the source a rowid or index seek positions (segPointSeek,
+	// segListSeek), held here so a seek per outer row allocates none.
+	pointSrc segRowSource
+	// seekSlab backs an index seek's fixed-up rows, reused by a reseek.
+	seekSlab         []Value
 	segCur           *segment
 	segRow           int
 	segFilter        *segRowFilter // the compiled pre-filter from OpRewind's P4
@@ -682,14 +684,44 @@ func (cur *vdbeCursor) rewind() error {
 			if served {
 				segIndexSeeksServed.Add(1)
 				cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
+				// Only for a correlated seek, which nothing reorders: a seek
+				// that materializes once may have its rows permuted in place
+				// (OpAutoIndexOrder) or tagged by position (OpMultiOrTag).
+				if cur.seekReseek {
+					if src, served := cur.pager.segListSeek(cur, rowids, &cur.pointSrc); served {
+						// Positioned, not built, as a rowid seek is above.
+						cur.segSrc, cur.segCur, cur.segSrcCols = src, nil, src.cols
+						cur.streamErrPending = nil
+						cur.pos = -1
+						cur.rowidNull = false
+						return nil
+					}
+				}
 				shared := cur.pager.ServesLiveRows(cur.tbl.root)
+				// A reseek's rows replace the last seek's, so the copies a fix-up
+				// needs are carved from one buffer the cursor keeps rather than
+				// allocated per row: an INTEGER PRIMARY KEY, stored NULL, needs
+				// one on every row.
+				slab := cur.seekSlab[:0]
+				plain := shared && !cur.hasGeneratedCols()
 				for _, rid := range rowids {
 					raw, found, ok := cur.pager.SeekRowidSegments(cur.tbl.root, rid)
 					if !ok || !found {
 						continue
 					}
 					cur.rowids = append(cur.rowids, uint64(rid))
+					if plain && len(raw) == len(cur.tbl.cols) && rowNeedsNormalize(cur.tbl.cols, cur.tbl.ipkIndex, raw) {
+						at := len(slab)
+						slab = append(slab, raw...)
+						row := slab[at:len(slab):len(slab)]
+						normalizeRowInto(row, cur.tbl.cols, cur.tbl.ipkIndex, uint64(rid))
+						cur.rows = append(cur.rows, row)
+						continue
+					}
 					cur.rows = append(cur.rows, cur.normalizeFrom(shared, uint64(rid), raw))
+				}
+				if cur.seekReseek {
+					cur.seekSlab = slab
 				}
 				cur.materialized = true
 				cur.pos = -1

@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -141,5 +142,33 @@ func TestJoinSeekResultNeutral(t *testing.T) {
 				t.Fatalf("join-seek changed the result:\n seek=%v\n scan=%v", seekRows, scanRows)
 			}
 		})
+	}
+}
+
+// TestJoinSeekEngagesOnSegments: on our own format an index is SQL only (its
+// root page is 0), and the correlated seek has to be planned and taken anyway,
+// served from the column's own equality index -- or every join through a
+// secondary index scans the whole inner table once per outer row (an album to
+// tracks join ran 60x slower than C SQLite). EXPLAIN QUERY PLAN says which
+// happened, and names the index as C does. TestJoinSeekResultNeutral holds the
+// answers to those of the full scan.
+func TestJoinSeekEngagesOnSegments(t *testing.T) {
+	p := buildJoinSeekTestDB(t)
+	for sql, want := range map[string]string{
+		`SELECT count(*) FROM o CROSS JOIN i ON i.fk = o.k`:               "SEARCH i USING INDEX ifk (fk=?)",
+		`SELECT o.id, i.id FROM o CROSS JOIN i ON i.tag = o.tag`:          "SEARCH i USING INDEX itag (tag=?)",
+		`SELECT o.id, count(*) FROM o JOIN i ON i.fk = o.k GROUP BY o.id`: "SEARCH i USING INDEX ifk (fk=?)",
+	} {
+		_, rows, err := p.QueryArgs("EXPLAIN QUERY PLAN "+sql, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		var plan []string
+		for _, r := range rows {
+			plan = append(plan, string(r[3].S))
+		}
+		if !slices.Contains(plan, want) {
+			t.Errorf("%s: plan %q, want a %q line", sql, plan, want)
+		}
 	}
 }

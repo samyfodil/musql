@@ -182,9 +182,27 @@ class Database {
 		return this;
 	}
 
-	/** Returns { columns, rows }, each row an array in column order. */
+	/**
+	 * Returns { columns, types, rows }: each row an array in column order, and
+	 * types each column's declared type ("" where it has none).
+	 */
 	query(sql, ...params) {
 		return this.#call("musql_query", sql, params);
+	}
+
+	/**
+	 * Splits a script into its statements, as the engine does: a semicolon in a
+	 * string, a comment or a trigger body ends nothing.
+	 */
+	split(sql) {
+		const x = this.#x;
+		const s = enc.encode(sql);
+		new Uint8Array(x.mem.buffer).set(s, x.musql_inbuf(s.length));
+		const len = x.musql_split(s.length);
+		const out = x.musql_outbuf();
+		const res = JSON.parse(dec.decode(new Uint8Array(x.mem.buffer).subarray(out, out + len)));
+		if (res.error !== undefined) throw new Error(res.error);
+		return res.statements;
 	}
 
 	/** Returns every row as an object keyed by column name. */

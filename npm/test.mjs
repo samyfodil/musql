@@ -15,7 +15,15 @@ assert.deepEqual(db.get("SELECT name, n, f, b FROM t WHERE id = ?", 1), {
 });
 assert.deepEqual(db.get("SELECT name, n FROM t WHERE id = 2"), { name: "grace\u0000é", n: 2n ** 62n });
 assert.deepEqual(db.get("SELECT name, n FROM t WHERE id = 3"), { name: null, n: 1 });
-assert.deepEqual(db.query("SELECT count(*), sum(n) FROM t WHERE n < 100"), { columns: ["count(*)", "sum(n)"], rows: [[2, 43]] });
+assert.deepEqual(db.query("SELECT count(*), sum(n) FROM t WHERE n < 100"), { columns: ["count(*)", "sum(n)"], types: ["", ""], rows: [[2, 43]] });
+// A column's declared type comes with it: a page tells a vector from a BLOB.
+db.exec("CREATE TABLE vt(id INTEGER PRIMARY KEY, e F32_BLOB(3))");
+assert.deepEqual(db.query("SELECT id, e, id + 1 AS n FROM vt").types, ["INTEGER", "F32_BLOB(3)", ""]);
+// A script splits as the engine does: a ';' in a string or a trigger body ends nothing.
+assert.deepEqual(
+	db.split("SELECT 'a;b'; CREATE TRIGGER tg AFTER INSERT ON t BEGIN SELECT 1; SELECT 2; END; -- note\n;  SELECT 3"),
+	["SELECT 'a;b'", "CREATE TRIGGER tg AFTER INSERT ON t BEGIN SELECT 1; SELECT 2; END", "SELECT 3"],
+);
 assert.deepEqual(db.all("SELECT id FROM t ORDER BY id"), [{ id: 1 }, { id: 2 }, { id: 3 }]);
 assert.equal(db.get("SELECT 1 WHERE 0"), undefined);
 
