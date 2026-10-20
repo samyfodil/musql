@@ -3,7 +3,11 @@
 // site does the sorting, as all sites use orderTermLess.
 package engine
 
-import "sort"
+import (
+	"cmp"
+	"slices"
+	"sort"
+)
 
 // sorterKeyInfo describes an ORDER BY key: number of key columns, DESC flags,
 // NULLS placement, and collations per column.
@@ -182,11 +186,41 @@ func (s *vdbeSorter) sort() bool {
 	// explicit seq tie-break is what keeps ties byte-identical to a full stable
 	// sort of the whole input. seq is in insertion order for the unbounded path,
 	// so this matches the previous sort.SliceStable there too.
-	sort.Slice(s.entries, func(i, j int) bool {
-		return s.entryBefore(s.entries[i], s.entries[j])
-	})
+	if s.intKeys() {
+		// Every key an INTEGER, which orders the same under any collation and
+		// NULLS placement: compared directly rather than through
+		// orderTermLess, which was most of a GROUP BY's sort.
+		desc := s.keyInfo.desc
+		slices.SortFunc(s.entries, func(a, b sorterEntry) int {
+			for k := range a.key {
+				if c := cmp.Compare(a.key[k].I, b.key[k].I); c != 0 {
+					if desc[k] {
+						return -c
+					}
+					return c
+				}
+			}
+			return cmp.Compare(a.seq, b.seq)
+		})
+	} else {
+		sort.Slice(s.entries, func(i, j int) bool {
+			return s.entryBefore(s.entries[i], s.entries[j])
+		})
+	}
 	s.pos = 0
 	return len(s.entries) > 0
+}
+
+// intKeys reports whether every key column of every entry is an INTEGER.
+func (s *vdbeSorter) intKeys() bool {
+	for _, e := range s.entries {
+		for _, v := range e.key {
+			if v.Typ != Int {
+				return false
+			}
+		}
+	}
+	return s.keyInfo.nKey > 0
 }
 
 // data returns the current (post-sort) entry's payload columns.
