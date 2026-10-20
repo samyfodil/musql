@@ -210,6 +210,13 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 		}
 		queries = append(queries, q)
 	}
+	// Bare columns beside a min() or max(): the row the extreme came from.
+	for range 6 {
+		join := joins[r.Intn(len(joins))]
+		ext := []string{"max(f.v)", "min(f.w)", "max(DISTINCT f.v)", "min(f.v) FILTER (WHERE f.w > 0)", "max(d2.x), min(f.v)", "count(*)"}[r.Intn(6)]
+		g := []string{"", " GROUP BY d2.x", " GROUP BY f.s"}[r.Intn(3)]
+		queries = append(queries, "SELECT "+ext+", f.id, d2.y, f.s "+join+g)
+	}
 	for range 10 {
 		join := joins[r.Intn(len(joins))]
 		keys := []string{"f.v", "f.v DESC", "f.v + d2.x, f.id", "coalesce(d2.y, f.w) DESC, f.id", "d2.x", "f.w DESC", "f.s", "d2.id DESC, f.id", "f.v % 9 DESC", "length(f.s), f.id", "coalesce(d2.x, 7), f.id", "d2.y DESC, f.id DESC", "d2.x IS NULL, f.v"}

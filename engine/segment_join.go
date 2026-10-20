@@ -62,6 +62,10 @@ type segJoinPlan struct {
 	// for none.
 	crosses [][]*segJoinExpr
 	tags    []*segJoinTags
+	// fullStep: every joined row goes through the aggregate's own step with
+	// its whole row (segJoinFullStep), rather than the kernel adding its
+	// arguments.
+	fullStep bool
 	// keyColl is the GROUP BY key's collation when it is not BINARY:
 	// NOCASE or RTRIM.
 	keyColl string
@@ -1751,7 +1755,7 @@ func segJoinArgsOf(plan *segJoinPlan, w *segJoinWalk, replayInts bool) (*segJoin
 			args.distinct = append(args.distinct, args.argOf[it.rowRegs[aggExprArg]-1])
 		}
 	}
-	args.keep = args.keep || args.floats
+	args.keep = args.keep || args.floats || plan.fullStep
 	// A DISTINCT over integers needs only which of its level's rows took
 	// part, not how often or in what order -- when there is one group. Many
 	// keep their rows.
@@ -1977,6 +1981,9 @@ func (gs *segJoinGroups) loadArgs(m *vdbe, g *segJoinGroup) {
 // rest adds group g's other rows to the accumulators its first row was just
 // stepped into.
 func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) error {
+	if gs.plan.fullStep {
+		return gs.restFull(m, g)
+	}
 	args, s := gs.args, g.sums
 	k := len(gs.plan.cursors)
 	// An aggregate that replays: the group's rows after the first, in the
@@ -2182,6 +2189,46 @@ func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) error {
 	return replayErr
 }
 
+// restFull steps group g's rows after the first, in the loop's order,
+// through the aggregate's own step, each with its arguments in their
+// registers and its whole row: as the loop steps them.
+func (gs *segJoinGroups) restFull(m *vdbe, g *segJoinGroup) error {
+	k := len(gs.plan.cursors)
+	nr := gs.plan.agg.nCols + len(gs.plan.agg.scopes)
+	buf := make([]Value, nr)
+	row, rowids := buf[:gs.plan.agg.nCols:gs.plan.agg.nCols], buf[gs.plan.agg.nCols:nr]
+	skipped := false
+	for r := 0; r < len(g.rows); r += k {
+		at := g.rows[r : r+k]
+		if !skipped && slices.Equal(at, g.first) {
+			skipped = true // the row already stepped
+			continue
+		}
+		if err := gs.stepRow(m, at, row, rowids); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// stepRow steps joined row at through every segment the body steps, with
+// its arguments in their registers and its whole row gathered into row and
+// rowids.
+func (gs *segJoinGroups) stepRow(m *vdbe, at []int32, row, rowids []Value) error {
+	for _, a := range gs.plan.args {
+		m.regs[a.reg] = gs.w.value(a, at)
+	}
+	if !gs.gatherAt(at, row, rowids) {
+		return fmt.Errorf("vdbe: the join kernel over a cursor outside its join")
+	}
+	for _, seg := range gs.plan.allSegs() {
+		if err := m.aggStep(m.aggRowCtx(gs.plan.agg, row, rowids), seg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // segJoinAggregate answers the plan's whole-join aggregate, or reports false
 // having changed nothing. An error is the step's own, which the loop would
 // have met.
@@ -2198,6 +2245,17 @@ func (m *vdbe) segJoinAggregate(plan *segJoinPlan) (bool, error) {
 	}
 	// Step the first joined row through the shared code, then add the rest.
 	g := &gs.groups[0]
+	if plan.fullStep {
+		nr := plan.agg.nCols + len(plan.agg.scopes)
+		buf := make([]Value, nr)
+		if err := gs.stepRow(m, g.first, buf[:plan.agg.nCols:plan.agg.nCols], buf[plan.agg.nCols:nr]); err != nil {
+			return false, err
+		}
+		if err := gs.rest(m, g); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
 	gs.loadArgs(m, g)
 	nr := plan.agg.nCols + len(plan.agg.scopes)
 	if len(m.aggNullRow) < nr {
@@ -2252,6 +2310,11 @@ func (m *vdbe) segJoinHashAgg(plan *segJoinPlan) (bool, error) {
 // gather is gatherCursorRow over group g's first joined row: the row and the
 // rowids the loop's step would have read with its cursors on it.
 func (gs *segJoinGroups) gather(g *segJoinGroup, row, rowids []Value) bool {
+	return gs.gatherAt(g.first, row, rowids)
+}
+
+// gatherAt is gatherCursorRow over joined row at.
+func (gs *segJoinGroups) gatherAt(at []int32, row, rowids []Value) bool {
 	level := func(cursor int) int { return slices.Index(gs.plan.cursors, cursor) }
 	for _, ga := range gs.plan.agg.gathers {
 		lv := level(ga.cursor)
@@ -2259,7 +2322,7 @@ func (gs *segJoinGroups) gather(g *segJoinGroup, row, rowids []Value) bool {
 			return false
 		}
 		for c := range min(ga.n, len(gs.w.tabs[lv].tbl.cols)) {
-			row[ga.offset+c] = gs.w.tabs[lv].value(g.first[lv], c)
+			row[ga.offset+c] = gs.w.tabs[lv].value(at[lv], c)
 		}
 	}
 	for i, cur := range gs.plan.agg.cursors {
@@ -2269,10 +2332,10 @@ func (gs *segJoinGroups) gather(g *segJoinGroup, row, rowids []Value) bool {
 			rowids[i] = Value{Typ: Null}
 		case lv < 0:
 			return false
-		case g.first[lv] < 0:
+		case at[lv] < 0:
 			rowids[i] = Value{} // the optional level's NULL row
 		default:
-			rowids[i] = Value{Typ: Int, I: gs.w.tabs[lv].rowids[g.first[lv]]}
+			rowids[i] = Value{Typ: Int, I: gs.w.tabs[lv].rowids[at[lv]]}
 		}
 	}
 	return true

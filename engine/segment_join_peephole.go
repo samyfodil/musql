@@ -461,8 +461,7 @@ func segJoinPeephole(prog *Program) bool {
 	pc := body.last()
 	step := in[body.at[0]]
 	plan, ok := step.P4.(*aggPlan)
-	if !ok || step.P3 != 0 || plan == nil || plan.anchorCheck != nil ||
-		len(plan.orderPlans) != 0 || !aggPlanReadsOnlyLoweredColsExceptOrder(plan) {
+	if !ok || step.P3 != 0 || plan == nil || len(plan.orderPlans) != 0 {
 		return false
 	}
 	args, ok := segJoinStepArgs(plan, body)
@@ -496,7 +495,8 @@ func segJoinPeephole(prog *Program) bool {
 
 	// The guard takes the place of the first instruction after the opens and
 	// runs it when it declines, so no address moves.
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2, segs: body.segs, orders: l.orders}
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2, segs: body.segs, orders: l.orders,
+		fullStep: segJoinFullStep(plan)}
 	at := len(in)
 	out := append([]Instruction(nil), in...)
 	out[l.head] = Instruction{Op: OpGoto, P2: at}
@@ -577,11 +577,7 @@ func segJoinGroupPeephole(prog *Program) bool {
 	step := in[stepAt]
 	rowRec := step.P1
 	plan, ok := step.P4.(*aggPlan)
-	if !ok || plan == nil || plan.anchorCheck != nil {
-		return false
-	}
-	// A min()/max() picks the row a bare column reads; the first row is not it.
-	if plan.magnet != nil && len(plan.magnet.sites) > 0 && !aggPlanReadsOnlyLoweredColsExceptOrder(plan) {
+	if !ok || plan == nil {
 		return false
 	}
 
@@ -813,7 +809,7 @@ func segJoinGroupPeephole(prog *Program) bool {
 	seqAt := fullOf(seqReg)
 
 	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2,
-		segs: segs, grouped: true, key: key, keyColl: keyColl, loads: loads, orders: l.orders}
+		segs: segs, grouped: true, key: key, keyColl: keyColl, loads: loads, orders: l.orders, fullStep: segJoinFullStep(plan)}
 	out := append([]Instruction(nil), in...)
 	guard := len(out)
 	out[l.head] = Instruction{Op: OpGoto, P2: guard}
@@ -837,6 +833,14 @@ func segJoinGroupPeephole(prog *Program) bool {
 		Instruction{Op: OpGoto, P2: last + 1})
 	prog.Insns = out
 	return true
+}
+
+// segJoinFullStep reports whether every joined row must go through the
+// aggregate's own step with its whole row: a min() or max() that picks the
+// row bare columns read, an anchor certificate, or any read of the row that
+// is not an aggregate's argument.
+func segJoinFullStep(plan *aggPlan) bool {
+	return plan.magnet != nil && len(plan.magnet.sites) > 0 || plan.anchorCheck != nil || !aggPlanReadsOnlyLoweredColsExceptOrder(plan)
 }
 
 // segJoinStepArgs is the source of each aggregate's argument register.
@@ -1502,7 +1506,7 @@ func segJoinHashPeephole(prog *Program) bool {
 	}
 	step := in[body.at[0]]
 	plan, ok := step.P4.(*aggPlan)
-	if !ok || plan == nil || plan.anchorCheck != nil || !aggPlanReadsOnlyLoweredColsExceptOrder(plan) {
+	if !ok || plan == nil {
 		return false
 	}
 	key, ok := writer[keyReg]
@@ -1534,7 +1538,7 @@ func segJoinHashPeephole(prog *Program) bool {
 		}
 	}
 	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2, segs: body.segs,
-		grouped: true, key: key, orders: l.orders}
+		grouped: true, key: key, orders: l.orders, fullStep: segJoinFullStep(plan)}
 	key.reg = keyReg
 	jp.key = key
 	out := append([]Instruction(nil), in...)
