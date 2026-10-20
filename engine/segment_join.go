@@ -1027,6 +1027,9 @@ func (w *segJoinWalk) lv(a segJoinArg) int {
 // raise, or an opcode an expression may not hold. A constant is computed
 // once.
 func (w *segJoinWalk) exprValues(a segJoinArg) ([]Value, bool) {
+	if a.level == segJoinMulti {
+		return nil, false // computed on a joined row, by value
+	}
 	if v, ok := w.exprs[a.expr]; ok {
 		return v, v != nil
 	}
@@ -1221,6 +1224,10 @@ func (w *segJoinWalk) floats(a segJoinArg) ([]float64, bool) {
 
 // value is a's value in joined row at.
 func (w *segJoinWalk) value(a segJoinArg, at []int32) Value {
+	if a.level == segJoinMulti {
+		v, _ := w.eval(a.expr, at) // a failure marks the walk failed
+		return v
+	}
 	lv := w.lv(a)
 	if a.expr == nil {
 		return w.tabs[lv].value(at[lv], a.col)
@@ -2239,8 +2246,8 @@ func (m *vdbe) segJoinTopOf(plan *segJoinPlan) (gs *segJoinGroups, ok bool) {
 	// Every key computable on every row, the NULL row included: value
 	// reads NULL for one that is not.
 	for _, o := range plan.order {
-		if o.expr == nil {
-			continue
+		if o.expr == nil || o.level == segJoinMulti {
+			continue // a joined row's value fails the walk if it fails
 		}
 		if _, ok := w.exprValues(o); !ok {
 			return nil, false

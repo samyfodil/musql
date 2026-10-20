@@ -127,7 +127,7 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 		"count(DISTINCT f.s)", "group_concat(DISTINCT f.s)", "group_concat(f.id ORDER BY f.w DESC)", "max(d1.b)",
 		"count(*) FILTER (WHERE f.v > 3)", "sum(f.v) FILTER (WHERE f.s = 'a')", "avg(f.w) FILTER (WHERE d2.x IS NOT NULL)",
 		"group_concat(f.s, '|' ORDER BY f.v, f.id)", "json_group_array(f.v ORDER BY f.id DESC)",
-		"sum(-f.v)", "sum(f.v & 7)", "max(~f.v)", "sum(f.v << 2 | 1)", "sum(CASE WHEN f.v > 0 THEN -f.v ELSE f.v >> 1 END)"}
+		"sum(-f.v)", "sum(f.v * d2.x)", "total(f.w + d2.y)", "group_concat(f.s || d2.x)", "max(coalesce(d2.x, f.v))", "sum(f.v & 7)", "max(~f.v)", "sum(f.v << 2 | 1)", "sum(CASE WHEN f.v > 0 THEN -f.v ELSE f.v >> 1 END)"}
 	joins := []string{
 		"FROM f JOIN d2 ON d2.id = f.d2_id",
 		"FROM d2 JOIN f ON f.d2_id = d2.id",
@@ -156,7 +156,7 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 		"FROM f LEFT JOIN d2 ON d2.id = f.d2_id + 0 LEFT JOIN d1 ON d1.id = coalesce(d2.d1_id, f.d1_id)",
 	}
 	groups := []string{"", "GROUP BY d2.id", "GROUP BY f.d2_id", "GROUP BY d2.x", "GROUP BY d1.id", "GROUP BY d1.b", "GROUP BY f.s",
-		"GROUP BY d2.x / 2", "GROUP BY upper(f.s)", "GROUP BY f.v % 5", "GROUP BY CASE WHEN f.v > 0 THEN 1 ELSE 2 END"}
+		"GROUP BY d2.x / 2", "GROUP BY f.v % 3 + d2.x", "GROUP BY upper(f.s)", "GROUP BY f.v % 5", "GROUP BY CASE WHEN f.v > 0 THEN 1 ELSE 2 END"}
 	wheres := []string{"", "WHERE f.v > 10", "WHERE d2.x <= 3 AND f.w > 0", "WHERE f.id % 2 = 0", "WHERE d1.a <> 2", "WHERE f.v >= ?",
 		"WHERE f.s LIKE 'b%'", "WHERE abs(f.v) > 3 AND length(f.s) = 1", "WHERE d2.y", "WHERE f.v + d2.x > 4", "WHERE coalesce(f.w, 1) > 0",
 		"WHERE f.v > 50 OR f.s = 'a'", "WHERE CASE WHEN f.w > 0 THEN 1 END",
@@ -204,7 +204,7 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 	}
 	for range 10 {
 		join := joins[r.Intn(len(joins))]
-		keys := []string{"f.v", "f.v DESC", "d2.x", "f.w DESC", "f.s", "d2.id DESC, f.id", "f.v % 9 DESC", "length(f.s), f.id", "coalesce(d2.x, 7), f.id", "d2.y DESC, f.id DESC", "d2.x IS NULL, f.v"}
+		keys := []string{"f.v", "f.v DESC", "f.v + d2.x, f.id", "coalesce(d2.y, f.w) DESC, f.id", "d2.x", "f.w DESC", "f.s", "d2.id DESC, f.id", "f.v % 9 DESC", "length(f.s), f.id", "coalesce(d2.x, 7), f.id", "d2.y DESC, f.id DESC", "d2.x IS NULL, f.v"}
 		topWheres := []string{"", "", "WHERE d2.x * 2 - d2.y > 1", "WHERE d2.x = 1 OR d2.y > 3", "WHERE d2.x > 1",
 			"WHERE d2.x = 1 OR d2.y = f.w", "WHERE f.v > d2.x"}
 		queries = append(queries, fmt.Sprintf("SELECT f.id, d2.id, f.v %s %s ORDER BY %s LIMIT %d OFFSET %d",

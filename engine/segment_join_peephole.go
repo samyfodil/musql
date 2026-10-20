@@ -943,12 +943,7 @@ func (tr *segJoinTrace) step(pc int) bool {
 		if !ok {
 			return false
 		}
-		if src.level >= 0 {
-			if level >= 0 && level != src.level {
-				return false
-			}
-			level = src.level
-		}
+		level = segJoinMix(level, src.level)
 		deps = append(deps, tr.deps[r]...)
 	}
 	deps = append(deps, pc)
@@ -1011,6 +1006,22 @@ func (tr *segJoinTrace) writtenOnEveryPath(pc, end, r int) bool {
 	return in[end-pc] == 1
 }
 
+// segJoinMulti is the level of a value over several levels: computed on a
+// joined row, not once per row of one table.
+const segJoinMulti = -2
+
+// segJoinMix is the level of a value over one of level and one of src, -1
+// being a constant's.
+func segJoinMix(level, src int) int {
+	switch {
+	case src == -1 || src == level:
+		return level
+	case level == -1:
+		return src
+	}
+	return segJoinMulti
+}
+
 // segJoinIsJump reports whether ins may jump: a test, a comparison that
 // jumps rather than stores, a Goto.
 func segJoinIsJump(ins Instruction) bool {
@@ -1069,10 +1080,10 @@ func (tr *segJoinTrace) region(pc, limit int) (int, bool) {
 		switch ins.Op {
 		case OpColumn, OpRowid:
 			lv, _, ok := segJoinColRead(ins, tr.levelOf)
-			if !ok || level >= 0 && lv != level {
+			if !ok {
 				return 0, false
 			}
-			level, writes = lv, []int{segJoinColDest(ins)}
+			level, writes = segJoinMix(level, lv), []int{segJoinColDest(ins)}
 		default:
 			var ok bool
 			if reads, writes, _, ok = segInsnRegs(ins); !ok {
@@ -1092,12 +1103,7 @@ func (tr *segJoinTrace) region(pc, limit int) (int, bool) {
 				}
 				continue
 			}
-			if src.level >= 0 {
-				if level >= 0 && level != src.level {
-					return 0, false
-				}
-				level = src.level
-			}
+			level = segJoinMix(level, src.level)
 			deps = append(deps, tr.deps[r]...)
 		}
 		for _, w := range writes {
@@ -1117,12 +1123,7 @@ func (tr *segJoinTrace) region(pc, limit int) (int, bool) {
 	var partial []int
 	for _, o := range outs {
 		if src, ok := tr.src[o]; ok {
-			if src.level >= 0 {
-				if level >= 0 && level != src.level {
-					return 0, false
-				}
-				level = src.level
-			}
+			level = segJoinMix(level, src.level)
 			deps = append(deps, tr.deps[o]...)
 		} else if !tr.writtenOnEveryPath(pc, end, o) {
 			partial = append(partial, o)
@@ -1354,7 +1355,7 @@ func segJoinFilter(in []Instruction, pc, limit, lv int, levelOf map[int]int, nex
 		}
 		if ins.Op == OpIfNot {
 			src, ok := tr.src[ins.P1]
-			if !ok || i == pc || ins.P2 != next || ins.P3 != 1 || src.level != lv && src.level >= 0 {
+			if !ok || i == pc || ins.P2 != next || ins.P3 != 1 || src.level != lv && src.level != -1 {
 				return segJoinArg{}, 0, false
 			}
 			return src, i + 1, true
