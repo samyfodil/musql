@@ -42,9 +42,13 @@ type segJoinPlan struct {
 	cursors []int           // per level, outermost first
 	edges   []segJoinEdge   // the equalities joining the levels
 	preds   [][]segPlanPred // per level, its own WHERE terms
-	args    []segJoinArg    // the aggregate argument registers and their columns
-	agg     *aggPlan
-	seg     int // the AggStep segment selector (OpAggStep's P2)
+	// optional is the level a LEFT JOIN makes optional -- the innermost --
+	// or -1: an outer row nothing there matches still joins, with that
+	// level's row all NULL.
+	optional int
+	args     []segJoinArg // the aggregate argument registers and their columns
+	agg      *aggPlan
+	seg      int // the AggStep segment selector (OpAggStep's P2)
 
 	// A GROUP BY's: the column its one key reads, and the registers the loop
 	// body loads for the row it hands the drain (OpSegJoinNext fills them).
@@ -553,6 +557,9 @@ func (t *segJoinTable) fcol(c int) ([]float64, bool) {
 
 // value is column c (-1 the rowid) of row r, as the cursor reads it.
 func (t *segJoinTable) value(r int32, c int) Value {
+	if r < 0 {
+		return Value{} // an optional level's NULL row
+	}
 	if c < 0 {
 		return Value{Typ: Int, I: t.rowids[r]}
 	}
@@ -615,6 +622,9 @@ type segJoinWalk struct {
 	// pass[i][r] is whether level i's row r satisfies the level's own WHERE
 	// terms; nil when it has none.
 	pass [][]bool
+	// optional is plan.optional: a level whose row is -1, all NULL, where
+	// nothing there matched.
+	optional int
 }
 
 // openSegJoin opens plan's join, or reports false.
@@ -683,6 +693,19 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 			return nil, false // not connected to the fact
 		}
 	}
+	// A LEFT JOIN's optional level is the innermost. Reached from its
+	// parent, it must be a leaf, so that a NULL row reaches no further; the
+	// one the other levels are reached from, it is the fact of a join of
+	// two, whose outer rows nothing matched are found after the walk.
+	w.optional = plan.optional
+	if o := plan.optional; o >= 0 {
+		if o != k-1 {
+			return nil, false
+		}
+		if o == w.fact && k != 2 || o != w.fact && slices.Contains(w.parent, o) {
+			return nil, false
+		}
+	}
 	w.pass = make([][]bool, k)
 	for i, preds := range plan.preds {
 		if len(preds) == 0 {
@@ -716,6 +739,14 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 func (w *segJoinWalk) each(at []int32, fn func() bool) bool {
 	rest := w.order[1:]
 	pass := w.pass
+	opt := w.optional
+	// The outer rows something matched, when the optional level is the fact.
+	var outer int
+	var matched []bool
+	if opt >= 0 && opt == w.fact {
+		outer = 1 - opt
+		matched = make([]bool, w.tabs[outer].n)
+	}
 rows:
 	for f := range w.tabs[w.fact].n {
 		if p := pass[w.fact]; p != nil && !p[f] {
@@ -725,12 +756,27 @@ rows:
 		for _, i := range rest {
 			r := w.slot[i][at[w.parent[i]]]
 			if r < 0 || pass[i] != nil && !pass[i][r] {
+				if i == opt {
+					at[i] = -1 // nothing matched: the row is all NULL
+					continue
+				}
 				continue rows
 			}
 			at[i] = r
 		}
+		if matched != nil {
+			matched[at[outer]] = true
+		}
 		if !fn() {
 			return false
+		}
+	}
+	for r, m := range matched {
+		if !m && (pass[outer] == nil || pass[outer][r]) {
+			at[outer], at[opt] = int32(r), -1
+			if !fn() {
+				return false
+			}
 		}
 	}
 	return true
@@ -772,6 +818,7 @@ func (t *segJoinTable) passing(preds []segPlanPred, resolved []segPred) []bool {
 // segJoinSums is what a group's rows add up to, per integer argument.
 type segJoinSums struct {
 	n    int64
+	nn   []int64 // per argument, the rows where it is not NULL
 	sums []int64
 	abs  []uint64 // sum of |v|: no partial sum, in any order, can pass it
 	mins []int64
@@ -781,7 +828,7 @@ type segJoinSums struct {
 }
 
 func newSegJoinSums(na int) *segJoinSums {
-	s := &segJoinSums{sums: make([]int64, na), abs: make([]uint64, na), mins: make([]int64, na), maxs: make([]int64, na),
+	s := &segJoinSums{nn: make([]int64, na), sums: make([]int64, na), abs: make([]uint64, na), mins: make([]int64, na), maxs: make([]int64, na),
 		tops: make([]uint64, na), ors: make([]uint64, na)}
 	for a := range na {
 		s.mins[a], s.maxs[a] = math.MaxInt64, math.MinInt64
@@ -794,10 +841,15 @@ func newSegJoinSums(na int) *segJoinSums {
 func (s *segJoinSums) add(args *segJoinArgs, at []int32) bool {
 	s.n++
 	for a, vals := range args.ints {
+		r := at[args.levels[a]]
+		if r < 0 {
+			continue // an optional level's NULL row
+		}
+		s.nn[a]++
 		if vals == nil {
 			continue
 		}
-		v := vals[at[args.levels[a]]]
+		v := vals[r]
 		s.sums[a] += v
 		s.mins[a], s.maxs[a] = min(s.mins[a], v), max(s.maxs[a], v)
 		u := uint64(v)
@@ -928,8 +980,10 @@ func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (*segJoinGroups, bool) {
 	var keys []int64
 	var keyTab *segJoinTable
 	if plan.grouped {
-		if keys, ok = w.tabs[plan.key.level].col(plan.key.col); !ok {
-			keyTab = w.tabs[plan.key.level]
+		// A key on the optional level is NULL in its NULL rows, which only the
+		// canonical bytes can say.
+		if keys, ok = w.tabs[plan.key.level].col(plan.key.col); !ok || plan.key.level == w.optional {
+			keys, keyTab = nil, w.tabs[plan.key.level]
 		}
 	}
 	byKey := map[int64]int{}
@@ -1021,6 +1075,14 @@ func (gs *segJoinGroups) loadArgs(m *vdbe, g *segJoinGroup) {
 func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) {
 	args, s := gs.args, g.sums
 	k := len(gs.plan.cursors)
+	// firstNN is 1 when the row already stepped holds argument a, 0 when it
+	// is that row's NULL.
+	firstNN := func(a int) int64 {
+		if g.first[args.levels[a]] < 0 {
+			return 0
+		}
+		return 1
+	}
 	rest := func(it *aggItem) {
 		if it.kind == aggCountStar {
 			it.cnt += s.n - 1
@@ -1058,9 +1120,15 @@ func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) {
 			for _, v := range it.seen {
 				mark(v.I)
 			}
-			first := ints[g.first[lv]]
+			var first int64
+			if g.first[lv] >= 0 {
+				first = ints[g.first[lv]]
+			}
 			skipped := false
 			for r := 0; r < len(g.rows); r += k {
+				if g.rows[r+lv] < 0 {
+					continue // NULL: no value
+				}
 				v := ints[g.rows[r+lv]]
 				if !skipped && v == first && slices.Equal(g.rows[r:r+k], g.first) {
 					skipped = true // the row already stepped
@@ -1083,11 +1151,14 @@ func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) {
 		}
 		if fl := args.flts[a]; fl != nil {
 			if it.kind == aggCount {
-				it.cnt += s.n - 1
+				it.cnt += s.nn[a] - firstNN(a)
 				return
 			}
 			// The rows after the first, through what step does with each.
 			for r := k; r < len(g.rows); r += k {
+				if g.rows[r+args.levels[a]] < 0 {
+					continue // NULL: no value
+				}
 				f := fl[g.rows[r+args.levels[a]]]
 				it.cnt++
 				if it.orderStrict {
@@ -1099,10 +1170,14 @@ func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) {
 		}
 		switch it.kind {
 		case aggCount:
-			it.cnt += s.n - 1
+			it.cnt += s.nn[a] - firstNN(a)
 		case aggSum, aggTotal, aggAvg:
-			it.cnt += s.n - 1
-			it.iSum += s.sums[a] - args.ints[a][g.first[args.levels[a]]]
+			it.cnt += s.nn[a] - firstNN(a)
+			if fr := g.first[args.levels[a]]; fr >= 0 {
+				it.iSum += s.sums[a] - args.ints[a][fr]
+			} else {
+				it.iSum += s.sums[a]
+			}
 			if it.orderStrict && s.ors[a] != 0 {
 				// What sumWatch over every value would have kept: the
 				// largest magnitude and the smallest power of two dividing
@@ -1110,10 +1185,14 @@ func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) {
 				it.sumWatch(true, int64(s.tops[a]), 0)
 				it.sumWatch(true, int64(1)<<bits.TrailingZeros64(s.ors[a]), 0)
 			}
-		case aggMin:
-			it.best = Value{Typ: Int, I: s.mins[a]}
-		case aggMax:
-			it.best = Value{Typ: Int, I: s.maxs[a]}
+		case aggMin, aggMax:
+			if s.nn[a] == 0 {
+				return
+			}
+			it.best, it.haveBest = Value{Typ: Int, I: s.mins[a]}, true
+			if it.kind == aggMax {
+				it.best.I = s.maxs[a]
+			}
 		}
 	}
 	accs := m.aggAccs
@@ -1215,6 +1294,8 @@ func (gs *segJoinGroups) gather(g *segJoinGroup, row, rowids []Value) bool {
 			rowids[i] = Value{Typ: Null}
 		case lv < 0:
 			return false
+		case g.first[lv] < 0:
+			rowids[i] = Value{} // the optional level's NULL row
 		default:
 			rowids[i] = Value{Typ: Int, I: gs.w.tabs[lv].rowids[g.first[lv]]}
 		}

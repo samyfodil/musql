@@ -1,6 +1,10 @@
 package engine
 
-import "strings"
+import (
+	"reflect"
+	"slices"
+	"strings"
+)
 
 // The recognisers for an aggregate over an inner join of plain table loops
 // (segment_join.go). Each leaves the loop in place behind a guard that
@@ -39,12 +43,19 @@ type segJoinLoop struct {
 	head    int
 	rewind0 int
 	body    int // the first instruction of the body
+	// outer is the level a LEFT JOIN makes optional, or -1: only the
+	// innermost may be. Its match flag is register flag; tail sets nullBody
+	// to the copy of the body the loop runs, after a NullRow, for an outer
+	// row nothing matched.
+	outer    int
+	flag     int
+	nullBody [2]int
 }
 
 // parseSegJoinLoop reads the loop's head from the first OpenRead at open:
 // the opens, the prologue, the levels and their rechecks, up to the body.
 func parseSegJoinLoop(in []Instruction, open int) (*segJoinLoop, bool) {
-	l := &segJoinLoop{opened: map[int]bool{}, levelOf: map[int]int{}, ifNots: map[int]int{}}
+	l := &segJoinLoop{opened: map[int]bool{}, levelOf: map[int]int{}, ifNots: map[int]int{}, outer: -1}
 	pc := open
 	var ok bool
 	for pc < len(in) && in[pc].Op == OpOpenRead {
@@ -118,13 +129,27 @@ func parseSegJoinLoop(in []Instruction, open int) (*segJoinLoop, bool) {
 		return nil, false
 	}
 	for len(l.cursors) < k {
-		if pc+2 < len(in) && in[pc].Op == OpColumn &&
+		// The seek's key and hint, before the Rewind (and a LEFT JOIN's flag).
+		rewindAt := pc + 2
+		if rewindAt+1 < len(in) && in[rewindAt].Op == OpInteger && in[rewindAt].P1 == 0 {
+			rewindAt++
+		}
+		if rewindAt < len(in) && in[pc].Op == OpColumn &&
 			(in[pc+1].Op == OpSeekRowidHint || in[pc+1].Op == OpSeekIndexHint) &&
-			in[pc+1].P2 == in[pc].P3 && in[pc+1].P3 == 1 && in[pc+2].Op == OpRewind && in[pc+2].P1 == in[pc+1].P1 {
+			in[pc+1].P2 == in[pc].P3 && in[pc+1].P3 == 1 && in[rewindAt].Op == OpRewind && in[rewindAt].P1 == in[pc+1].P1 {
 			if _, ok := l.levelOf[in[pc].P1]; !ok {
 				return nil, false // the key comes from a level not entered yet
 			}
 			pc += 2
+		}
+		// A LEFT JOIN's level clears its match flag before its Rewind.
+		flag := -1
+		if pc+1 < len(in) && in[pc].Op == OpInteger && in[pc].P1 == 0 && in[pc+1].Op == OpRewind {
+			if len(l.cursors) != k-1 {
+				return nil, false // only the innermost level
+			}
+			flag = in[pc].P2
+			pc++
 		}
 		if pc+4 >= len(in) || in[pc].Op != OpRewind || !add(in[pc].P1, pc) {
 			return nil, false
@@ -157,6 +182,14 @@ func parseSegJoinLoop(in []Instruction, open int) (*segJoinLoop, bool) {
 		l.edges = append(l.edges, segJoinEdge{a: la, aCol: aCol, b: lb, bCol: bCol})
 		l.ifNots[pc+4] = self
 		pc += 5
+		if flag >= 0 {
+			// ...and sets it once a row matched.
+			if pc >= len(in) || in[pc].Op != OpInteger || in[pc].P1 != 1 || in[pc].P2 != flag {
+				return nil, false
+			}
+			l.outer, l.flag = self, flag
+			pc++
+		}
 	}
 	l.body = pc
 	return l, true
@@ -167,6 +200,7 @@ func parseSegJoinLoop(in []Instruction, open int) (*segJoinLoop, bool) {
 // then the Closes. It returns the first Close and the address after them.
 func (l *segJoinLoop) tail(in []Instruction, pc int) (closeAt, after int, ok bool) {
 	k := len(l.cursors)
+	innerEnd := -1 // where the innermost level's Rewind goes when it has no rows
 	for i := k - 1; i >= 0; i-- {
 		if pc >= len(in) || in[pc].Op != OpNext || in[pc].P1 != l.cursors[i] {
 			return 0, 0, false
@@ -175,7 +209,7 @@ func (l *segJoinLoop) tail(in []Instruction, pc int) (closeAt, after int, ok boo
 		if in[pc].P2 != l.rewinds[i]+1 {
 			return 0, 0, false
 		}
-		if i+1 < k && in[l.rewinds[i+1]].P2 != pc {
+		if i+1 < k && in[l.rewinds[i+1]].P2 != innerEnd {
 			return 0, 0, false
 		}
 		for at, lv := range l.ifNots {
@@ -184,6 +218,22 @@ func (l *segJoinLoop) tail(in []Instruction, pc int) (closeAt, after int, ok boo
 			}
 		}
 		pc++
+		innerEnd = pc
+		if i == l.outer {
+			// The LEFT JOIN's row for an outer row nothing matched: skipped
+			// when the flag is set, else a NullRow and the body again, up to
+			// the outer level's Next.
+			if pc+1 >= len(in) || in[pc].Op != OpIf || in[pc].P1 != l.flag ||
+				in[pc+1].Op != OpNullRow || in[pc+1].P1 != l.cursors[i] {
+				return 0, 0, false
+			}
+			end := in[pc].P2
+			if end <= pc+2 || end >= len(in) || in[end].Op != OpNext {
+				return 0, 0, false
+			}
+			l.nullBody = [2]int{pc + 2, end}
+			pc = end
+		}
 	}
 	closeAt = pc
 	if in[l.rewind0].P2 != closeAt {
@@ -224,30 +274,8 @@ func segJoinPeephole(prog *Program) bool {
 	if !ok {
 		return false
 	}
-	pc := l.body
-	var args []segJoinArg
-	loaded := map[int]segJoinArg{}
-	for pc < len(in) && in[pc].Op != OpAggStep {
-		switch in[pc].Op {
-		case OpColumn, OpRowid:
-			lv, c, ok := segJoinColRead(in[pc], l.levelOf)
-			if !ok {
-				return false
-			}
-			loaded[segJoinColDest(in[pc])] = segJoinArg{reg: segJoinColDest(in[pc]), level: lv, col: c}
-		case OpSCopy:
-			src, ok := loaded[in[pc].P1]
-			if !ok {
-				return false
-			}
-			src.reg = in[pc].P2
-			args = append(args, src)
-		default:
-			return false
-		}
-		pc++
-	}
-	if pc >= len(in) {
+	args, pc, ok := parseSegJoinStepBody(in, l.body, len(in), l.levelOf)
+	if !ok {
 		return false
 	}
 	step := in[pc]
@@ -259,6 +287,13 @@ func segJoinPeephole(prog *Program) bool {
 	closeAt, pc, ok := l.tail(in, pc+1)
 	if !ok {
 		return false
+	}
+	if l.outer >= 0 {
+		// The LEFT JOIN's null row: the same arguments, the same step.
+		nargs, end, ok := parseSegJoinStepBody(in, l.nullBody[0], l.nullBody[1], l.levelOf)
+		if !ok || end+1 != l.nullBody[1] || !segJoinSameInsn(in[end], step) || !slices.Equal(nargs, args) {
+			return false
+		}
 	}
 	for pc < len(in) && in[pc].Op == OpAggResult {
 		if segAggPlanOf(in[pc]) != plan {
@@ -272,7 +307,7 @@ func segJoinPeephole(prog *Program) bool {
 
 	// The guard takes the place of the first instruction after the opens and
 	// runs it when it declines, so no address moves.
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, args: args, agg: plan, seg: step.P2, sorted: l.sorted}
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, optional: l.outer, args: args, agg: plan, seg: step.P2, sorted: l.sorted}
 	at := len(in)
 	out := append([]Instruction(nil), in...)
 	out[l.head] = Instruction{Op: OpGoto, P2: at}
@@ -315,59 +350,23 @@ func segJoinGroupPeephole(prog *Program) bool {
 
 	// The body: column loads and copies, the scan sequence counter, the record,
 	// and its hand-off.
-	var loads []segJoinArg
-	var copies []Instruction
-	writer := map[int]segJoinArg{} // register -> the column it holds
-	seqReg, rec := -1, -1
-	var mk Instruction
-	pc := l.body
-body:
-	for ; pc < len(in); pc++ {
-		ins := in[pc]
-		switch ins.Op {
-		case OpColumn, OpRowid:
-			lv, c, ok := segJoinColRead(ins, l.levelOf)
-			if !ok {
-				return false
-			}
-			a := segJoinArg{reg: segJoinColDest(ins), level: lv, col: c}
-			loads = append(loads, a)
-			writer[a.reg] = a
-			continue
-		case OpSCopy:
-			if src, ok := writer[ins.P1]; ok {
-				writer[ins.P2] = segJoinArg{reg: ins.P2, level: src.level, col: src.col}
-			} else if pc+1 < len(in) && in[pc+1].Op == OpAdd && in[pc+1].P2 == ins.P1 && in[pc+1].P3 == ins.P1 && seqReg < 0 {
-				seqReg = ins.P2 // the sequence number, then the counter's increment
-			} else {
-				return false
-			}
-		case OpAdd:
-			if seqReg < 0 || in[pc-1].Op != OpSCopy || in[pc-1].P2 != seqReg {
-				return false
-			}
-		case OpClearSubtype:
-		case OpMakeRecord:
-			if rec >= 0 {
-				return false
-			}
-			rec, mk = ins.P3, ins
-		case OpGosub, OpSorterInsert:
-		default:
-			return false
-		}
-		copies = append(copies, ins)
-		if ins.Op == OpGosub || ins.Op == OpSorterInsert {
-			break body
-		}
-	}
-	if pc >= len(in) || rec < 0 || seqReg < 0 {
+	b, pc, ok := parseSegJoinRowBody(in, l.body, len(in), l.levelOf)
+	if !ok {
 		return false
 	}
+	loads, copies, writer, seqReg, rec, mk := b.loads, b.copies, b.writer, b.seqReg, b.rec, b.mk
 	hand := in[pc]
 	closeAt, _, ok := l.tail(in, pc+1)
 	if !ok {
 		return false
+	}
+	if l.outer >= 0 {
+		// The LEFT JOIN's null row goes through a copy of the body that
+		// must build the same row from the same columns.
+		nb, end, ok := parseSegJoinRowBody(in, l.nullBody[0], l.nullBody[1], l.levelOf)
+		if !ok || end+1 != l.nullBody[1] || !b.same(nb) || !segJoinSameInsn(in[end], hand) {
+			return false
+		}
 	}
 
 	// The drain's one step, over the row the body built.
@@ -549,7 +548,7 @@ body:
 	}
 	seqAt := fullOf(seqReg)
 
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, args: args, agg: plan, seg: step.P2,
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, optional: l.outer, args: args, agg: plan, seg: step.P2,
 		grouped: true, key: key, loads: loads, sorted: l.sorted}
 	out := append([]Instruction(nil), in...)
 	guard := len(out)
@@ -572,6 +571,159 @@ body:
 		Instruction{Op: OpGoto, P2: stepAt + 1})
 	prog.Insns = out
 	return true
+}
+
+// parseSegJoinStepBody reads a body of argument loads -- a column read and
+// its copy into the argument's register -- up to its OpAggStep, returning the
+// arguments and the step's address.
+func parseSegJoinStepBody(in []Instruction, pc, limit int, levelOf map[int]int) ([]segJoinArg, int, bool) {
+	var args []segJoinArg
+	loaded := map[int]segJoinArg{}
+	for ; pc < limit && in[pc].Op != OpAggStep; pc++ {
+		switch in[pc].Op {
+		case OpColumn, OpRowid:
+			lv, c, ok := segJoinColRead(in[pc], levelOf)
+			if !ok {
+				return nil, 0, false
+			}
+			r := segJoinColDest(in[pc])
+			loaded[r] = segJoinArg{reg: r, level: lv, col: c}
+		case OpSCopy:
+			src, ok := loaded[in[pc].P1]
+			if !ok {
+				return nil, 0, false
+			}
+			src.reg = in[pc].P2
+			args = append(args, src)
+		default:
+			return nil, 0, false
+		}
+	}
+	return args, pc, pc < limit
+}
+
+// parseSegJoinHashBody reads a hashed GROUP BY's body: column loads and
+// copies, the key's record, up to its OpHashAggStep, returning the column
+// each register holds, the key record and register, and the step's address.
+func parseSegJoinHashBody(in []Instruction, pc, limit int, levelOf map[int]int) (writer map[int]segJoinArg, keyRec, keyReg, step int, ok bool) {
+	writer = map[int]segJoinArg{}
+	keyRec, keyReg = -1, -1
+	for ; pc < limit && in[pc].Op != OpHashAggStep; pc++ {
+		ins := in[pc]
+		switch ins.Op {
+		case OpColumn, OpRowid:
+			lv, c, ok := segJoinColRead(ins, levelOf)
+			if !ok {
+				return nil, 0, 0, 0, false
+			}
+			r := segJoinColDest(ins)
+			writer[r] = segJoinArg{reg: r, level: lv, col: c}
+		case OpSCopy:
+			src, ok := writer[ins.P1]
+			if !ok {
+				return nil, 0, 0, 0, false
+			}
+			writer[ins.P2] = segJoinArg{reg: ins.P2, level: src.level, col: src.col}
+		case OpMakeRecord:
+			if keyRec >= 0 || ins.P2 != 1 {
+				return nil, 0, 0, 0, false
+			}
+			keyRec, keyReg = ins.P3, ins.P1
+		default:
+			return nil, 0, 0, 0, false
+		}
+	}
+	return writer, keyRec, keyReg, pc, pc < limit && keyRec >= 0
+}
+
+// segJoinRowBody is a loop body that builds a row and hands it on: the
+// columns it loads, its other instructions, the column each register holds,
+// the scan sequence number's register, and the record.
+type segJoinRowBody struct {
+	loads  []segJoinArg
+	copies []Instruction
+	writer map[int]segJoinArg
+	seqReg int
+	rec    int
+	mk     Instruction
+}
+
+// parseSegJoinRowBody reads a body from pc up to its hand-off (a Gosub or a
+// SorterInsert), returning the hand-off's address.
+func parseSegJoinRowBody(in []Instruction, pc, limit int, levelOf map[int]int) (*segJoinRowBody, int, bool) {
+	b := &segJoinRowBody{writer: map[int]segJoinArg{}, seqReg: -1, rec: -1}
+	for ; pc < limit; pc++ {
+		ins := in[pc]
+		switch ins.Op {
+		case OpColumn, OpRowid:
+			lv, c, ok := segJoinColRead(ins, levelOf)
+			if !ok {
+				return nil, 0, false
+			}
+			a := segJoinArg{reg: segJoinColDest(ins), level: lv, col: c}
+			b.loads = append(b.loads, a)
+			b.writer[a.reg] = a
+			continue
+		case OpSCopy:
+			if src, ok := b.writer[ins.P1]; ok {
+				b.writer[ins.P2] = segJoinArg{reg: ins.P2, level: src.level, col: src.col}
+			} else if pc+1 < limit && in[pc+1].Op == OpAdd && in[pc+1].P2 == ins.P1 && in[pc+1].P3 == ins.P1 && b.seqReg < 0 {
+				b.seqReg = ins.P2 // the sequence number, then the counter's increment
+			} else {
+				return nil, 0, false
+			}
+		case OpAdd:
+			if b.seqReg < 0 || in[pc-1].Op != OpSCopy || in[pc-1].P2 != b.seqReg {
+				return nil, 0, false
+			}
+		case OpClearSubtype:
+		case OpMakeRecord:
+			if b.rec >= 0 {
+				return nil, 0, false
+			}
+			b.rec, b.mk = ins.P3, ins
+		case OpGosub, OpSorterInsert:
+			b.copies = append(b.copies, ins)
+			if b.rec < 0 || b.seqReg < 0 {
+				return nil, 0, false
+			}
+			return b, pc, true
+		default:
+			return nil, 0, false
+		}
+		b.copies = append(b.copies, ins)
+	}
+	return nil, 0, false
+}
+
+// same reports whether body o builds the row b does: the same record over
+// the same registers, each holding the same column, the same sequence
+// number. The scratch registers a column passes through may differ.
+func (b *segJoinRowBody) same(o *segJoinRowBody) bool {
+	if b.seqReg != o.seqReg || b.rec != o.rec || !segJoinSameInsn(b.mk, o.mk) {
+		return false
+	}
+	for r := b.mk.P1; r < b.mk.P1+b.mk.P2; r++ {
+		x, okx := b.writer[r]
+		y, oky := o.writer[r]
+		if okx != oky || x.level != y.level || x.col != y.col {
+			return false
+		}
+	}
+	return true
+}
+
+// segJoinSameInsn reports whether two instructions are the same operation:
+// opcode, operands and payload.
+func segJoinSameInsn(a, b Instruction) bool {
+	if a.Op != b.Op || a.P1 != b.P1 || a.P2 != b.P2 || a.P3 != b.P3 || a.P5 != b.P5 {
+		return false
+	}
+	if a.P4 == nil || b.P4 == nil {
+		return a.P4 == nil && b.P4 == nil
+	}
+	ta := reflect.TypeOf(a.P4)
+	return ta == reflect.TypeOf(b.P4) && ta.Comparable() && a.P4 == b.P4
 }
 
 // segJoinIsRecheck reports whether a join's recheck starts at pc: two column
@@ -634,33 +786,9 @@ func segJoinHashPeephole(prog *Program) bool {
 	if !ok {
 		return false
 	}
-	writer := map[int]segJoinArg{}
-	keyRec, keyReg := -1, -1
-	pc := l.body
-	for ; pc < len(in) && in[pc].Op != OpHashAggStep; pc++ {
-		ins := in[pc]
-		switch ins.Op {
-		case OpColumn, OpRowid:
-			lv, c, ok := segJoinColRead(ins, l.levelOf)
-			if !ok {
-				return false
-			}
-			r := segJoinColDest(ins)
-			writer[r] = segJoinArg{reg: r, level: lv, col: c}
-		case OpSCopy:
-			src, ok := writer[ins.P1]
-			if !ok {
-				return false
-			}
-			writer[ins.P2] = segJoinArg{reg: ins.P2, level: src.level, col: src.col}
-		case OpMakeRecord:
-			if keyRec >= 0 || ins.P2 != 1 {
-				return false
-			}
-			keyRec, keyReg = ins.P3, ins.P1
-		default:
-			return false
-		}
+	writer, keyRec, keyReg, pc, ok := parseSegJoinHashBody(in, l.body, len(in), l.levelOf)
+	if !ok {
+		return false
 	}
 	if pc >= len(in) || keyRec < 0 || in[pc].P1 != keyRec {
 		return false
@@ -690,7 +818,23 @@ func segJoinHashPeephole(prog *Program) bool {
 	if !ok || after >= len(in) || in[after].Op != OpHashAggSort {
 		return false
 	}
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, args: args, agg: plan, seg: step.P2,
+	if l.outer >= 0 {
+		// The LEFT JOIN's null row: the same key and arguments, the same step.
+		nw, nrec, nkey, end, ok := parseSegJoinHashBody(in, l.nullBody[0], l.nullBody[1], l.levelOf)
+		if !ok || end+1 != l.nullBody[1] || nrec != keyRec || nkey != keyReg || !segJoinSameInsn(in[end], step) {
+			return false
+		}
+		regs := []int{keyReg}
+		for _, a := range args {
+			regs = append(regs, a.reg)
+		}
+		for _, r := range regs {
+			if x, y := writer[r], nw[r]; x.level != y.level || x.col != y.col {
+				return false
+			}
+		}
+	}
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, optional: l.outer, args: args, agg: plan, seg: step.P2,
 		grouped: true, key: key, sorted: l.sorted}
 	key.reg = keyReg
 	jp.key = key
