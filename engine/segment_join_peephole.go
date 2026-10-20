@@ -66,19 +66,32 @@ func parseSegJoinLoop(in []Instruction, open int) (*segJoinLoop, bool) {
 	l := &segJoinLoop{opened: map[int]bool{}, levelOf: map[int]int{}, ifNots: map[int]int{}, flags: map[int]int{}}
 	pc := open
 	var ok bool
-	for pc < len(in) && in[pc].Op == OpOpenRead {
-		l.opened[in[pc].P1] = true
-		pc++
+	for pc < len(in) {
+		if in[pc].Op == OpOpenRead {
+			if l.opened[in[pc].P1] {
+				return nil, false
+			}
+			l.opened[in[pc].P1] = true
+			pc++
+		} else if end := segJoinSeekHint(in, pc, l.opened); end > pc {
+			pc = end
+		} else {
+			break
+		}
 	}
 	k := len(l.opened)
-	if k < 2 || k > 64 || pc-open != k {
+	if k < 2 || k > 64 {
 		return nil, false
 	}
 	l.head = pc
 	// A prologue the answer does not depend on: an order for a level to visit
 	// its rows in (whether a caller can ignore it is its own call), and a test
 	// that skips the loop for an empty table, which joins no rows either way.
-	for pc < len(in) && (in[pc].Op == OpAutoIndexOrder || in[pc].Op == OpIfEmpty) {
+	for pc < len(in) && (in[pc].Op == OpAutoIndexOrder || in[pc].Op == OpIfEmpty || segJoinSeekHint(in, pc, l.opened) > pc) {
+		if end := segJoinSeekHint(in, pc, l.opened); end > pc {
+			pc = end
+			continue
+		}
 		if !l.opened[in[pc].P1] {
 			return nil, false
 		}
@@ -1004,6 +1017,27 @@ func (tr *segJoinTrace) writtenOnEveryPath(pc, end, r int) bool {
 		}
 	}
 	return in[end-pc] == 1
+}
+
+// segJoinSeekHint is the address after a seek hint at pc for an opened
+// cursor that seeks once (OpSeekIndexHint P3 0) -- constants into registers,
+// then the hint -- or pc when there is none. The cursor then holds, in rowid
+// order, a superset of the rows its terms pass, which the loop tests again:
+// the kernel, testing every row, visits the same ones in the same order.
+func segJoinSeekHint(in []Instruction, pc int, opened map[int]bool) int {
+	i := pc
+	for i < len(in) {
+		switch in[i].Op {
+		case OpInteger, OpInt64, OpReal, OpString8, OpNull, OpVariable:
+			i++
+			continue
+		}
+		break
+	}
+	if i == pc || i >= len(in) || in[i].Op != OpSeekIndexHint || in[i].P3 != 0 || !opened[in[i].P1] {
+		return pc
+	}
+	return i + 1
 }
 
 // segJoinMulti is the level of a value over several levels: computed on a

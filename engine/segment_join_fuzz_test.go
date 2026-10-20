@@ -45,6 +45,10 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 	if r.Intn(2) == 0 {
 		setup = append(setup, `CREATE INDEX d2_d1 ON d2(d1_id)`)
 	}
+	if r.Intn(2) == 0 {
+		// Indexes an equality on a level can seek once, as a hint.
+		setup = append(setup, `CREATE INDEX f_v ON f(v)`, `CREATE INDEX f_s ON f(s COLLATE NOCASE)`)
+	}
 	// An index the outer level can be scanned by, so the loop visits it in
 	// the index's order rather than by rowid.
 	switch r.Intn(5) {
@@ -164,7 +168,7 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 		"WHERE f.v IN (5, NULL)", "WHERE f.s NOT IN ('B', '')", "WHERE d2.x > 1", "WHERE d2.x BETWEEN 0 AND 5 AND f.v > 0",
 		"WHERE d2.x * 2 - d2.y > 1", "WHERE d2.x = 1 OR d2.y > 3", "WHERE d2.x IN (2, 3) OR d2.y < 0",
 		"WHERE f.v > d2.x", "WHERE f.w < d2.y OR f.s = 'a'", "WHERE d2.x = 1 OR d2.y = f.w", "WHERE d2.x = f.v % 5 OR d2.y > 3",
-		"WHERE coalesce(f.v, d2.x) > 2", "WHERE -f.v < 3 AND f.v & 1 = 0", "WHERE f.v BETWEEN 5 AND 60", "WHERE CASE WHEN f.v > d2.x THEN f.w ELSE d2.y END > 0"}
+		"WHERE coalesce(f.v, d2.x) > 2", "WHERE -f.v < 3 AND f.v & 1 = 0", "WHERE f.v BETWEEN 5 AND 60", "WHERE f.v = 7", "WHERE f.s = 'b' COLLATE NOCASE", "WHERE d2.x = 2 AND f.v = 3", "WHERE CASE WHEN f.v > d2.x THEN f.w ELSE d2.y END > 0"}
 	for range 50 {
 		join := joins[r.Intn(len(joins))]
 		hasD1 := strings.Contains(join, "d1 ")
