@@ -1082,11 +1082,50 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 	return w, true
 }
 
+// flat reports whether every level after the first is found by a rowid.
+func (w *segJoinWalk) flat() bool {
+	for i := 1; i < len(w.link); i++ {
+		if w.link[i].one == nil {
+			return false
+		}
+	}
+	return true
+}
+
 // each calls fn once per joined row, in the loop's order, with at holding
 // each level's row (-1 for the optional level's NULL row); fn returning false
 // stops the walk, and each reports whether it ran to the end.
 func (w *segJoinWalk) each(at []int32, fn func() bool) bool {
 	k := len(w.tabs)
+	if w.flat() {
+		// Every later level found by a rowid: at most one row each, so the
+		// nest is a pass over the first level's rows.
+	rows:
+		for r := range w.tabs[0].n {
+			if p := w.pass[0]; p != nil && !p[r] {
+				continue
+			}
+			at[0] = int32(r)
+			for i := 1; i < k; i++ {
+				l := &w.link[i]
+				found := int32(-1)
+				if from := at[l.from]; from >= 0 {
+					found = l.one[from]
+				}
+				if found < 0 || w.pass[i] != nil && !w.pass[i][found] {
+					if i != w.optional {
+						continue rows
+					}
+					found = -1 // nothing matched: the row is all NULL
+				}
+				at[i] = found
+			}
+			if !fn() {
+				return false
+			}
+		}
+		return true
+	}
 	var visit func(i int) bool
 	visit = func(i int) bool {
 		if i == k {
@@ -1229,9 +1268,11 @@ type segJoinArgs struct {
 	nulls  [][]bool    // the rows where an argument is NULL; nil for none
 	levels []int
 	argOf  map[int]int // the step's argument register -> its index
-	plan   *segJoinPlan
-	w      *segJoinWalk
-	floats bool
+	// distinct is the arguments a DISTINCT count or sum of integers reads.
+	distinct []int
+	plan     *segJoinPlan
+	w        *segJoinWalk
+	floats   bool
 	// keep: a group keeps its joined rows, which a REAL argument replays in
 	// order and a DISTINCT one dedupes.
 	keep bool
@@ -1279,15 +1320,20 @@ func segJoinArgsOf(plan *segJoinPlan, w *segJoinWalk) (*segJoinArgs, bool) {
 		if args.replays(it) {
 			args.keep = true
 			orderMatters = orderMatters || it.orderSensitive()
-		}
-		if it.distinct {
-			args.keep = true
+		} else if it.distinct {
+			args.distinct = append(args.distinct, args.argOf[it.rowRegs[aggExprArg]-1])
 		}
 	}
 	if orderMatters && plan.sorted {
 		return nil, false // the rows replay in the loop's order, unknown here
 	}
 	args.keep = args.keep || args.floats
+	// A DISTINCT over integers needs only which of its level's rows took
+	// part, not how often or in what order -- when there is one group. Many
+	// keep their rows.
+	if len(args.distinct) > 0 && plan.grouped {
+		args.keep = true
+	}
 	return args, true
 }
 
@@ -1338,6 +1384,10 @@ type segJoinGroup struct {
 	// rows is every joined row of the group, k levels each, in the loop's
 	// order: kept when a REAL argument is replayed.
 	rows []int32
+	// took, per level a DISTINCT argument is read from, marks the level's
+	// rows some joined row of the group held: kept instead of rows by a
+	// whole-join aggregate.
+	took [][]bool
 }
 
 // loopBefore reports whether joined row a comes before b in the loop's order:
@@ -1439,6 +1489,20 @@ func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (*segJoinGroups, bool) {
 		g := &groups[gi]
 		if args.keep {
 			g.rows = append(g.rows, at...)
+		} else if len(args.distinct) > 0 {
+			if g.took == nil {
+				g.took = make([][]bool, k)
+				for _, a := range args.distinct {
+					if lv := args.levels[a]; g.took[lv] == nil {
+						g.took[lv] = make([]bool, w.tabs[lv].n)
+					}
+				}
+			}
+			for _, a := range args.distinct {
+				if lv := args.levels[a]; at[lv] >= 0 {
+					g.took[lv][at[lv]] = true
+				}
+			}
 		}
 		return g.sums.add(args, at)
 	}) {
@@ -1556,6 +1620,28 @@ func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) error {
 			}
 			for _, v := range it.seen {
 				mark(v.I)
+			}
+			if g.took != nil && g.took[lv] != nil {
+				took := g.took[lv]
+				// Each value of a row that took part: the first row's is
+				// already seen.
+				for r, t := range took {
+					if !t || null(a, int32(r)) {
+						continue
+					}
+					if v := ints[r]; !has(v) {
+						mark(v)
+						it.seen = append(it.seen, Value{Typ: Int, I: v})
+						it.cnt++
+						if it.kind != aggCount {
+							if it.orderStrict {
+								it.sumWatch(true, v, 0)
+							}
+							it.sumStep(true, v, float64(v))
+						}
+					}
+				}
+				return
 			}
 			var first int64
 			if !null(a, g.first[lv]) {
