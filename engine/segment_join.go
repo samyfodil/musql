@@ -43,10 +43,10 @@ type segJoinPlan struct {
 	edges   []segJoinEdge   // the equalities joining the levels
 	preds   [][]segPlanPred // per level, its own WHERE terms
 	filters [][]segJoinArg  // per level, its other terms: true or the row is skipped
-	// optional is the level a LEFT JOIN makes optional -- the innermost --
-	// or -1: an outer row nothing there matches still joins, with that
-	// level's row all NULL.
-	optional int
+	// optional has bit i set for a level a LEFT JOIN makes optional: an
+	// outer row nothing there matches still joins, with that level's row all
+	// NULL.
+	optional uint64
 	args     []segJoinArg // the aggregate argument registers and their columns
 	agg      *aggPlan
 	seg      int // the AggStep segment selector (OpAggStep's P2)
@@ -797,9 +797,9 @@ type segJoinWalk struct {
 	// pass[i][r] is whether level i's row r satisfies the level's own WHERE
 	// terms; nil when it has none.
 	pass [][]bool
-	// optional is plan.optional: a level whose row is -1, all NULL, where
-	// nothing there matched.
-	optional int
+	// optional is plan.optional: the levels whose row is -1, all NULL,
+	// where nothing there matched.
+	optional uint64
 
 	m     *vdbe
 	exprs map[*segJoinExpr][]Value // each expression's value per row
@@ -812,6 +812,9 @@ type segJoinWalk struct {
 	order0 []int32
 	rank   [][]int32
 }
+
+// opt reports whether level i is optional.
+func (w *segJoinWalk) opt(i int) bool { return w.optional>>i&1 != 0 }
 
 // before reports whether joined row a comes before b in the loop's order:
 // level by level, each row by its place in the order the loop visits that
@@ -1254,7 +1257,7 @@ func (w *segJoinWalk) each(at []int32, fn func() bool) bool {
 					found = l.one[from]
 				}
 				if found < 0 || w.pass[i] != nil && !w.pass[i][found] {
-					if i != w.optional {
+					if !w.opt(i) {
 						continue rows
 					}
 					found = -1 // nothing matched: the row is all NULL
@@ -1312,7 +1315,7 @@ func (w *segJoinWalk) each(at []int32, fn func() bool) bool {
 				}
 			}
 		}
-		if !matched && i == w.optional {
+		if !matched && w.opt(i) {
 			at[i] = -1 // nothing matched: the row is all NULL
 			return visit(i + 1)
 		}
@@ -1432,7 +1435,7 @@ func segJoinArgsOf(plan *segJoinPlan, w *segJoinWalk) (*segJoinArgs, bool) {
 	for a, arg := range plan.args {
 		// An expression over the optional level's NULL row need not be NULL
 		// (coalesce): such an argument declines.
-		if arg.expr != nil && w.lv(arg) == w.optional {
+		if arg.expr != nil && w.opt(w.lv(arg)) {
 			return nil, false
 		}
 		args.levels[a] = w.lv(arg)
@@ -1549,12 +1552,12 @@ func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (*segJoinGroups, bool) {
 	byValue := false
 	keyLv := w.lv(plan.key)
 	if plan.grouped {
-		if plan.key.expr != nil && keyLv == w.optional {
+		if plan.key.expr != nil && w.opt(keyLv) {
 			return nil, false // see segJoinArgsOf
 		}
 		// A key on the optional level is NULL in its NULL rows, which only the
 		// canonical bytes can say.
-		if keys, ok = w.ints(plan.key); !ok || keyLv == w.optional {
+		if keys, ok = w.ints(plan.key); !ok || w.opt(keyLv) {
 			keys, byValue = nil, true
 		}
 	}
@@ -1980,7 +1983,7 @@ func (m *vdbe) segJoinTopOf(plan *segJoinPlan) (*segJoinGroups, bool) {
 		if _, ok := w.exprValues(o); !ok {
 			return nil, false
 		}
-		if _, ok := w.nullRowValue(o); !ok && w.lv(o) == w.optional {
+		if _, ok := w.nullRowValue(o); !ok && w.opt(w.lv(o)) {
 			return nil, false
 		}
 	}
@@ -2064,7 +2067,7 @@ func segJoinTopNumeric(w *segJoinWalk, plan *segJoinPlan) (*segJoinGroups, bool)
 	}
 	o := plan.order[0]
 	vals, ok := w.ints(o)
-	if !ok || w.lv(o) == w.optional {
+	if !ok || w.opt(w.lv(o)) {
 		return nil, false
 	}
 	// Ordered descending, the smallest key is the largest value.

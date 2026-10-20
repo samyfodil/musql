@@ -46,19 +46,19 @@ type segJoinLoop struct {
 	head    int
 	rewind0 int
 	body    int // the first instruction of the body
-	// outer is the level a LEFT JOIN makes optional, or -1: only the
-	// innermost may be. Its match flag is register flag; tail sets nullBody
-	// to the copy of the body the loop runs, after a NullRow, for an outer
-	// row nothing matched.
-	outer    int
-	flag     int
-	nullBody [2]int
+	// outers has bit i set for a level a LEFT JOIN makes optional, whose
+	// match flag is register flags[i]. nullBodies is every copy of the body
+	// the loop runs for a null row -- its first instruction and the address
+	// after its last -- each read by tail.
+	outers     uint64
+	flags      map[int]int
+	nullBodies [][2]int
 }
 
 // parseSegJoinLoop reads the loop's head from the first OpenRead at open:
 // the opens, the prologue, the levels and their rechecks, up to the body.
 func parseSegJoinLoop(in []Instruction, open int) (*segJoinLoop, bool) {
-	l := &segJoinLoop{opened: map[int]bool{}, levelOf: map[int]int{}, ifNots: map[int]int{}, outer: -1}
+	l := &segJoinLoop{opened: map[int]bool{}, levelOf: map[int]int{}, ifNots: map[int]int{}, flags: map[int]int{}}
 	pc := open
 	var ok bool
 	for pc < len(in) && in[pc].Op == OpOpenRead {
@@ -66,7 +66,7 @@ func parseSegJoinLoop(in []Instruction, open int) (*segJoinLoop, bool) {
 		pc++
 	}
 	k := len(l.opened)
-	if k < 2 || pc-open != k {
+	if k < 2 || k > 64 || pc-open != k {
 		return nil, false
 	}
 	l.head = pc
@@ -177,9 +177,6 @@ func (l *segJoinLoop) level(in []Instruction, pc int) (int, bool) {
 	// A LEFT JOIN's level clears its match flag before its Rewind.
 	flag := -1
 	if pc+1 < len(in) && in[pc].Op == OpInteger && in[pc].P1 == 0 && in[pc+1].Op == OpRewind {
-		if l.outer >= 0 {
-			return 0, false // one LEFT JOIN
-		}
 		flag = in[pc].P2
 		pc++
 	}
@@ -261,20 +258,22 @@ func (l *segJoinLoop) level(in []Instruction, pc int) (int, bool) {
 		if pc >= len(in) || in[pc].Op != OpInteger || in[pc].P1 != 1 || in[pc].P2 != flag {
 			return 0, false
 		}
-		l.outer, l.flag = self, flag
+		l.outers |= 1 << self
+		l.flags[self] = flag
 		pc++
 	}
 	return pc, true
 }
 
-// nullLevels reads the levels after the LEFT JOIN's that its null row's
+// nullLevels reads the levels after LEFT JOIN level o that its null row's
 // copy, from pc to end, enters again. They must read as the loop's own do --
-// the same links, the same terms over columns -- with a Next chain of their
-// own that leaves at end. It returns the copy's body: its first instruction,
-// and the address of its innermost Next.
-func (l *segJoinLoop) nullLevels(in []Instruction, pc, end int) ([2]int, bool) {
-	o, k := l.outer, len(l.cursors)
-	c := &segJoinLoop{opened: l.opened, levelOf: map[int]int{}, ifNots: map[int]int{}, outer: o,
+// the same links, the same terms, the same LEFT JOINs -- with a Next chain of
+// their own, null rows' copies included, that leaves at end. Every copy of
+// the body in it goes to l.nullBodies.
+func (l *segJoinLoop) nullLevels(in []Instruction, pc, end, o int) bool {
+	k := len(l.cursors)
+	c := &segJoinLoop{opened: l.opened, levelOf: map[int]int{}, ifNots: map[int]int{}, flags: map[int]int{},
+		outers:  l.outers & (1<<(o+1) - 1),
 		cursors: slices.Clone(l.cursors[:o+1]), rewinds: slices.Clone(l.rewinds[:o+1]),
 		preds: slices.Clone(l.preds[:o+1]), filters: slices.Clone(l.filters[:o+1]), edges: slices.Clone(l.edges[:o])}
 	for i, cur := range c.cursors {
@@ -283,19 +282,21 @@ func (l *segJoinLoop) nullLevels(in []Instruction, pc, end int) ([2]int, bool) {
 	for len(c.cursors) < k {
 		var ok bool
 		if pc, ok = c.level(in, pc); !ok || pc > end {
-			return [2]int{}, false
+			return false
 		}
+	}
+	if c.outers != l.outers {
+		return false
 	}
 	for i := o + 1; i < k; i++ {
 		e, ce := l.edges[i-1], c.edges[i-1]
-		if c.cursors[i] != l.cursors[i] || len(l.filters[i]) != 0 || len(c.filters[i]) != 0 ||
-			!reflect.DeepEqual(l.preds[i], c.preds[i]) || !segJoinSameLink(e, ce) {
-			return [2]int{}, false
+		if c.cursors[i] != l.cursors[i] || !reflect.DeepEqual(l.preds[i], c.preds[i]) ||
+			!slices.EqualFunc(l.filters[i], c.filters[i], segJoinSameSrc) ||
+			e.a != ce.a || e.b != ce.b || !segJoinSameSrc(e.aArg, ce.aArg) || !segJoinSameSrc(e.bArg, ce.bArg) {
+			return false
 		}
 	}
-	// The copy's body, then its Next chain, innermost first, each back to its
-	// level, its Rewinds and skips landing as the loop's do, the outermost
-	// leaving at end.
+	// The copy's body, up to its innermost Next, then its Next chain.
 	at := -1
 	for i := pc; i < end; i++ {
 		if in[i].Op == OpNext && in[i].P1 == c.cursors[k-1] && in[i].P2 == c.rewinds[k-1]+1 {
@@ -304,92 +305,74 @@ func (l *segJoinLoop) nullLevels(in []Instruction, pc, end int) ([2]int, bool) {
 		}
 	}
 	if at < 0 {
-		return [2]int{}, false
+		return false
 	}
-	q, innerEnd := at, -1
-	for i := k - 1; i > o; i-- {
-		if q >= end || in[q].Op != OpNext || in[q].P1 != c.cursors[i] || in[q].P2 != c.rewinds[i]+1 {
-			return [2]int{}, false
-		}
-		if i+1 < k && in[c.rewinds[i+1]].P2 != innerEnd {
-			return [2]int{}, false
-		}
-		for skip, lv := range c.ifNots {
-			if lv == i && in[skip].P2 != q {
-				return [2]int{}, false
-			}
-		}
-		q++
-		innerEnd = q
+	l.nullBodies = append(l.nullBodies, [2]int{pc, at})
+	q, ok := c.chain(in, at, o+1)
+	if !ok || q != end {
+		return false
 	}
-	if q != end || in[c.rewinds[o+1]].P2 != end {
-		return [2]int{}, false
-	}
-	return [2]int{pc, at}, true
+	l.nullBodies = append(l.nullBodies, c.nullBodies...)
+	return true
 }
 
-// segJoinSameLink reports whether two edges join the same columns of the
-// same levels.
-func segJoinSameLink(a, b segJoinEdge) bool {
-	same := func(x, y segJoinArg) bool {
-		return x.expr == nil && y.expr == nil && x.guard == 0 && y.guard == 0 && x.level == y.level && x.col == y.col
-	}
-	return a.a == b.a && a.b == b.b && same(a.aArg, b.aArg) && same(a.bArg, b.bArg)
+// segJoinSameSrc reports whether two registers' sources are the same value:
+// the same column of the same level, or the same expression.
+func segJoinSameSrc(x, y segJoinArg) bool {
+	return x.level == y.level && x.col == y.col && x.guard == y.guard && segJoinSameExpr(x.expr, y.expr)
 }
 
-// tail checks the Next chain at pc, innermost first, each back to its level's
-// body, with every skip and empty-level jump landing on the right one, and
-// then the Closes. It returns the first Close and the address after them.
-func (l *segJoinLoop) tail(in []Instruction, pc int) (closeAt, after int, ok bool) {
+// chain checks the Next chain at pc, from the innermost level down to level
+// lo, each back to its level's body, with every skip and empty-level jump
+// landing on the right one, and each LEFT JOIN's null row: skipped when its
+// flag is set, else a NullRow and a copy of the levels after it and the body,
+// up to the next outer level's Next. It returns the address after level lo's.
+func (l *segJoinLoop) chain(in []Instruction, pc, lo int) (int, bool) {
 	k := len(l.cursors)
-	innerEnd := -1 // where the innermost level's Rewind goes when it has no rows
-	for i := k - 1; i >= 0; i-- {
-		if pc >= len(in) || in[pc].Op != OpNext || in[pc].P1 != l.cursors[i] {
-			return 0, 0, false
-		}
+	for i := k - 1; i >= lo; i-- {
 		// A level's Next goes back to just after its Rewind.
-		if in[pc].P2 != l.rewinds[i]+1 {
-			return 0, 0, false
-		}
-		if i+1 < k && in[l.rewinds[i+1]].P2 != innerEnd {
-			return 0, 0, false
+		if pc >= len(in) || in[pc].Op != OpNext || in[pc].P1 != l.cursors[i] || in[pc].P2 != l.rewinds[i]+1 {
+			return 0, false
 		}
 		for at, lv := range l.ifNots {
 			if lv == i && in[at].P2 != pc {
-				return 0, 0, false
+				return 0, false
 			}
 		}
 		pc++
-		innerEnd = pc
-		if i == l.outer {
-			// The LEFT JOIN's row for an outer row nothing matched: skipped
-			// when the flag is set, else a NullRow and the body again, up to
-			// the outer level's Next.
-			if pc+1 >= len(in) || in[pc].Op != OpIf || in[pc].P1 != l.flag ||
-				in[pc+1].Op != OpNullRow || in[pc+1].P1 != l.cursors[i] {
-				return 0, 0, false
-			}
-			end := in[pc].P2
-			if end <= pc+2 || end >= len(in) || in[end].Op != OpNext {
-				return 0, 0, false
-			}
-			l.nullBody = [2]int{pc + 2, end}
-			if i < k-1 {
-				// Levels after it: the copy enters them again, and they must
-				// join as they do in the loop.
-				body, ok := l.nullLevels(in, pc+2, end)
-				if !ok {
-					return 0, 0, false
-				}
-				l.nullBody = body
-			}
-			pc = end
+		// An empty level goes on as its last row does.
+		if in[l.rewinds[i]].P2 != pc {
+			return 0, false
 		}
+		if l.outers>>i&1 == 0 {
+			continue
+		}
+		if pc+1 >= len(in) || in[pc].Op != OpIf || in[pc].P1 != l.flags[i] ||
+			in[pc+1].Op != OpNullRow || in[pc+1].P1 != l.cursors[i] {
+			return 0, false
+		}
+		end := in[pc].P2
+		if end <= pc+2 || end >= len(in) || in[end].Op != OpNext {
+			return 0, false
+		}
+		if i == k-1 {
+			l.nullBodies = append(l.nullBodies, [2]int{pc + 2, end})
+		} else if !l.nullLevels(in, pc+2, end, i) {
+			return 0, false
+		}
+		pc = end
 	}
-	closeAt = pc
-	if in[l.rewind0].P2 != closeAt {
+	return pc, true
+}
+
+// tail checks the Next chain at pc (chain) and then the Closes. It returns
+// the first Close and the address after them.
+func (l *segJoinLoop) tail(in []Instruction, pc int) (closeAt, after int, ok bool) {
+	k := len(l.cursors)
+	if pc, ok = l.chain(in, pc, 0); !ok {
 		return 0, 0, false
 	}
+	closeAt = pc
 	for _, at := range l.ifEmpty {
 		if in[at].P2 != closeAt {
 			return 0, 0, false
@@ -443,10 +426,10 @@ func segJoinPeephole(prog *Program) bool {
 	if !ok {
 		return false
 	}
-	if l.outer >= 0 {
-		// The LEFT JOIN's null row: the same arguments, the same step.
-		nsrc, end, ok := parseSegJoinStepBody(in, l.nullBody[0], l.nullBody[1], l.levelOf)
-		if !ok || end+1 != l.nullBody[1] || !segJoinSameInsn(in[end], step) {
+	for _, nb := range l.nullBodies {
+		// A LEFT JOIN's null row: the same arguments, the same step.
+		nsrc, end, ok := parseSegJoinStepBody(in, nb[0], nb[1], l.levelOf)
+		if !ok || end+1 != nb[1] || !segJoinSameInsn(in[end], step) {
 			return false
 		}
 		nargs, ok := segJoinStepArgs(plan, nsrc)
@@ -466,7 +449,7 @@ func segJoinPeephole(prog *Program) bool {
 
 	// The guard takes the place of the first instruction after the opens and
 	// runs it when it declines, so no address moves.
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outer, args: args, agg: plan, seg: step.P2, orders: l.orders}
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outers, args: args, agg: plan, seg: step.P2, orders: l.orders}
 	at := len(in)
 	out := append([]Instruction(nil), in...)
 	out[l.head] = Instruction{Op: OpGoto, P2: at}
@@ -519,11 +502,11 @@ func segJoinGroupPeephole(prog *Program) bool {
 	if !ok {
 		return false
 	}
-	if l.outer >= 0 {
-		// The LEFT JOIN's null row goes through a copy of the body that
-		// must build the same row from the same columns.
-		nb, end, ok := parseSegJoinRowBody(in, l.nullBody[0], l.nullBody[1], l.levelOf)
-		if !ok || end+1 != l.nullBody[1] || !b.same(nb) || !segJoinSameInsn(in[end], hand) {
+	for _, body := range l.nullBodies {
+		// A LEFT JOIN's null row goes through a copy of the body that must
+		// build the same row from the same values.
+		nb, end, ok := parseSegJoinRowBody(in, body[0], body[1], l.levelOf)
+		if !ok || end+1 != body[1] || !b.same(nb) || !segJoinSameInsn(in[end], hand) {
 			return false
 		}
 	}
@@ -733,7 +716,7 @@ func segJoinGroupPeephole(prog *Program) bool {
 	}
 	seqAt := fullOf(seqReg)
 
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outer, args: args, agg: plan, seg: step.P2,
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outers, args: args, agg: plan, seg: step.P2,
 		grouped: true, key: key, loads: loads, orders: l.orders}
 	out := append([]Instruction(nil), in...)
 	guard := len(out)
@@ -811,12 +794,11 @@ func segJoinAggArgs(plan *aggPlan, lookup func(reg int) (segJoinArg, bool)) ([]s
 	return args, true
 }
 
-// segJoinSameArgs reports whether two bodies' arguments come from the same
-// columns. An expression is compared by being the same one, which two
-// bodies never share: a LEFT JOIN over one declines.
+// segJoinSameArgs reports whether two bodies' arguments are the same
+// registers holding the same values.
 func segJoinSameArgs(a, b []segJoinArg) bool {
 	return slices.EqualFunc(a, b, func(x, y segJoinArg) bool {
-		return x.expr == nil && y.expr == nil && x.reg == y.reg && x.level == y.level && x.col == y.col
+		return x.reg == y.reg && segJoinSameSrc(x, y)
 	})
 }
 
@@ -1225,7 +1207,7 @@ func (b *segJoinRowBody) same(o *segJoinRowBody) bool {
 	for r := b.mk.P1; r < b.mk.P1+b.mk.P2; r++ {
 		x, okx := b.writer[r]
 		y, oky := o.writer[r]
-		if okx != oky || x.level != y.level || x.col != y.col || x.expr != nil || y.expr != nil {
+		if okx != oky || !segJoinSameSrc(x, y) {
 			return false
 		}
 	}
@@ -1383,10 +1365,10 @@ func segJoinHashPeephole(prog *Program) bool {
 	if !ok || after >= len(in) || in[after].Op != OpHashAggSort {
 		return false
 	}
-	if l.outer >= 0 {
-		// The LEFT JOIN's null row: the same key and arguments, the same step.
-		nw, nrec, nkey, end, ok := parseSegJoinHashBody(in, l.nullBody[0], l.nullBody[1], l.levelOf)
-		if !ok || end+1 != l.nullBody[1] || nrec != keyRec || nkey != keyReg || !segJoinSameInsn(in[end], step) {
+	for _, nb := range l.nullBodies {
+		// A LEFT JOIN's null row: the same key and arguments, the same step.
+		nw, nrec, nkey, end, ok := parseSegJoinHashBody(in, nb[0], nb[1], l.levelOf)
+		if !ok || end+1 != nb[1] || nrec != keyRec || nkey != keyReg || !segJoinSameInsn(in[end], step) {
 			return false
 		}
 		regs := []int{keyReg}
@@ -1394,12 +1376,14 @@ func segJoinHashPeephole(prog *Program) bool {
 			regs = append(regs, a.reg)
 		}
 		for _, r := range regs {
-			if x, y := writer[r], nw[r]; x.level != y.level || x.col != y.col || x.expr != nil || y.expr != nil {
+			x, okx := writer[r]
+			y, oky := nw[r]
+			if !okx || !oky || !segJoinSameSrc(x, y) {
 				return false
 			}
 		}
 	}
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outer, args: args, agg: plan, seg: step.P2,
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outers, args: args, agg: plan, seg: step.P2,
 		grouped: true, key: key, orders: l.orders}
 	key.reg = keyReg
 	jp.key = key
@@ -1447,18 +1431,18 @@ func segJoinTopPeephole(prog *Program) bool {
 	if !ok || copies[check].P2 != pc+1 || copies[check].P3 != mk.P1 || mk.P2 < ki.nKey {
 		return false // the check skips to the innermost Next, over the key
 	}
-	if l.outer >= 0 {
-		// The LEFT JOIN's null row goes through a copy of the body that must
+	for _, body := range l.nullBodies {
+		// A LEFT JOIN's null row goes through a copy of the body that must
 		// put the same values in the same record.
-		nb, ok := parseSegJoinTopBody(in, l.nullBody[0], l.nullBody[1], l.levelOf, sorter)
-		if !ok || nb.end+1 != l.nullBody[1] || !segJoinSameInsn(nb.mk, mk) ||
-			nb.copies[nb.check].P2 != l.nullBody[1] || nb.copies[nb.check].P3 != mk.P1 {
+		nb, ok := parseSegJoinTopBody(in, body[0], body[1], l.levelOf, sorter)
+		if !ok || nb.end+1 != body[1] || !segJoinSameInsn(nb.mk, mk) ||
+			nb.copies[nb.check].P2 != body[1] || nb.copies[nb.check].P3 != mk.P1 {
 			return false
 		}
 		for r := mk.P1; r < mk.P1+mk.P2; r++ {
 			x, okx := writer[r]
 			y, oky := nb.writer[r]
-			if !okx || !oky || x.level != y.level || x.col != y.col || x.guard != y.guard || !segJoinSameExpr(x.expr, y.expr) {
+			if !okx || !oky || !segJoinSameSrc(x, y) {
 				return false
 			}
 		}
@@ -1474,7 +1458,7 @@ func segJoinTopPeephole(prog *Program) bool {
 			order = append(order, a)
 		}
 	}
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outer, agg: nil, orders: l.orders,
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outers, agg: nil, orders: l.orders,
 		loads: loads, order: order, keys: ki}
 	out := append([]Instruction(nil), in...)
 	guard := len(out)
