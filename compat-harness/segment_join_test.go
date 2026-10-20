@@ -118,7 +118,13 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT al.id, count(*) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.id LIKE '1%' AND abs(t.plays) > 10000 GROUP BY al.id`, true},
 		{`SELECT count(*), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.rating AND al.year % 3 = 1`, true},
 		{`SELECT g.tag, count(*) FROM tracks t JOIN tags g ON g.id = t.album_id WHERE g.tag LIKE 'r%' GROUP BY g.tag`, true},
-		{`SELECT count(*) FROM tracks t JOIN tags g ON g.id = t.album_id WHERE g.ci GLOB '[rR]*' OR g.tag IS NULL`, false},
+		{`SELECT count(*) FROM tracks t JOIN tags g ON g.id = t.album_id WHERE g.ci GLOB '[rR]*' OR g.tag IS NULL`, true},
+		// CASE and IFNULL: jumps that meet again inside the expression.
+		{`SELECT al.id, sum(CASE WHEN t.seconds > 300 THEN 1 ELSE 0 END), count(*) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
+		{`SELECT sum(CASE t.seconds % 3 WHEN 0 THEN t.plays WHEN 1 THEN -t.plays END), total(ifnull(t.rating, -1)) FROM albums al JOIN tracks t ON t.album_id = al.id`, false},
+		{`SELECT CASE WHEN al.year > 1980 THEN 'new' ELSE 'old' END AS era, count(*) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY era`, true},
+		{`SELECT count(*) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE CASE WHEN t.seconds > 200 THEN t.plays > 0 ELSE t.plays < 0 END`, false},
+		{`SELECT count(*) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.seconds > 340 OR t.plays < -29000`, false},
 		// Expressions over one table's columns, computed once per row of it.
 		{`SELECT al.id, sum(t.seconds * t.plays), max(t.seconds - 100), count(t.seconds / 7) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
 		{`SELECT al.year / 10, count(*), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.year / 10`, true},

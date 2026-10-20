@@ -524,16 +524,39 @@ func segJoinGroupPeephole(prog *Program) bool {
 			targets[ins.P2] = true
 		}
 	}
-	runAt := stepAt
-	for runAt-1 > closeAt && !targets[runAt] && segJoinTraceable(in[runAt-1].Op) {
-		runAt--
+	// The run: from the earliest jump target before the step such that
+	// everything from it to the step is a read of the row or what a trace
+	// follows, a CASE's jumps included, and nothing outside jumps into it
+	// past its start.
+	runAt := -1
+	for t := stepAt; t > closeAt && (segJoinTraceable(in[t].Op) || segJoinIsJump(in[t]) || t == stepAt); t-- {
+		if !targets[t] {
+			continue
+		}
+		into := false
+		for i, ins := range in {
+			if (i < t || i >= stepAt) && (segJoinJumpsP2(ins.Op) || segJoinIsJump(ins)) && ins.P2 > t && ins.P2 < stepAt {
+				into = true
+			}
+		}
+		if !into {
+			runAt = t
+		}
 	}
-	if !targets[runAt] {
+	if runAt < 0 {
 		return false
 	}
 	tr := b.trace
 	for i := runAt; i < stepAt; i++ {
 		ins := in[i]
+		if segJoinIsJump(ins) {
+			end, ok := tr.region(i, stepAt)
+			if !ok {
+				return false
+			}
+			i = end - 1
+			continue
+		}
 		if ins.Op == OpRecordColumn {
 			if ins.P1 != rowRec {
 				return false
@@ -739,7 +762,7 @@ func (tr *segJoinTrace) step(pc int) bool {
 
 // expr is the expression the instructions at deps compute into out.
 func (tr *segJoinTrace) expr(deps []int, out int) *segJoinExpr {
-	e := &segJoinExpr{out: out}
+	e := &segJoinExpr{out: out, pcs: slices.Clone(deps)}
 	for _, d := range deps {
 		ins, ok := tr.stand[d]
 		if !ok {
@@ -748,6 +771,106 @@ func (tr *segJoinTrace) expr(deps []int, out int) *segJoinExpr {
 		e.insns = append(e.insns, ins)
 	}
 	return e
+}
+
+// segJoinIsJump reports whether ins may jump: a test, a comparison that
+// jumps rather than stores, a Goto.
+func segJoinIsJump(ins Instruction) bool {
+	switch ins.Op {
+	case OpIf, OpIfNot, OpIsNull, OpNotNull, OpGoto:
+		return true
+	case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
+		return ins.P5&p5StoreP2 == 0
+	}
+	return false
+}
+
+// region follows the run of instructions from the jump at pc to where its
+// jumps all meet again -- a CASE, an IFNULL -- as one expression: every jump
+// in it forward and inside it or to its end, before limit, and no jump from
+// outside into its middle. Every register the run writes gets the run, and
+// what its inputs need, as its expression. It returns the address after the
+// run.
+func (tr *segJoinTrace) region(pc, limit int) (int, bool) {
+	end := pc + 1
+	for i := pc; i < end; i++ {
+		if i >= limit {
+			return 0, false
+		}
+		if ins := tr.in[i]; segJoinIsJump(ins) {
+			if ins.P2 <= i || ins.P2 > limit {
+				return 0, false
+			}
+			end = max(end, ins.P2)
+		}
+		end = max(end, i+1)
+	}
+	for i, ins := range tr.in {
+		if (i < pc || i >= end) && (segJoinJumpsP2(ins.Op) || segJoinIsJump(ins)) && ins.P2 > pc && ins.P2 < end {
+			return 0, false
+		}
+	}
+	level := -1
+	var deps []int
+	written := map[int]bool{}
+	var outs []int
+	for i := pc; i < end; i++ {
+		ins := tr.in[i]
+		if ins.Op == OpGoto {
+			deps = append(deps, i)
+			continue
+		}
+		if ins.Op == OpFunction {
+			name, isName := ins.P4.(string)
+			if !isName || name == "rtreecheck" || name == "vec1_config" || nonConstantFuncs[r33sFoldIdent(name)] {
+				return 0, false
+			}
+		}
+		var reads, writes []int
+		switch ins.Op {
+		case OpColumn, OpRowid:
+			lv, _, ok := segJoinColRead(ins, tr.levelOf)
+			if !ok || level >= 0 && lv != level {
+				return 0, false
+			}
+			level, writes = lv, []int{segJoinColDest(ins)}
+		default:
+			var ok bool
+			if reads, writes, _, ok = segInsnRegs(ins); !ok {
+				return 0, false
+			}
+		}
+		for _, r := range reads {
+			if written[r] {
+				continue
+			}
+			src, ok := tr.src[r]
+			if !ok {
+				return 0, false
+			}
+			if src.level >= 0 {
+				if level >= 0 && level != src.level {
+					return 0, false
+				}
+				level = src.level
+			}
+			deps = append(deps, tr.deps[r]...)
+		}
+		for _, w := range writes {
+			if !written[w] {
+				outs = append(outs, w)
+			}
+			written[w] = true
+		}
+		deps = append(deps, i)
+	}
+	slices.Sort(deps)
+	deps = slices.Compact(deps)
+	for _, o := range outs {
+		tr.src[o] = segJoinArg{reg: o, level: level, expr: tr.expr(deps, o)}
+		tr.deps[o] = deps
+	}
+	return end, true
 }
 
 // from follows the RecordColumn at pc, a drain's read into register dst of
@@ -777,6 +900,14 @@ func (tr *segJoinTrace) from(pc, dst int, src segJoinArg, srcDeps []int, cursors
 func parseSegJoinStepBody(in []Instruction, pc, limit int, levelOf map[int]int) (map[int]segJoinArg, int, bool) {
 	tr := newSegJoinTrace(in, levelOf)
 	for ; pc < limit && in[pc].Op != OpAggStep; pc++ {
+		if segJoinIsJump(in[pc]) {
+			end, ok := tr.region(pc, limit)
+			if !ok {
+				return nil, 0, false
+			}
+			pc = end - 1
+			continue
+		}
 		if !tr.step(pc) {
 			return nil, 0, false
 		}
@@ -791,6 +922,14 @@ func parseSegJoinHashBody(in []Instruction, pc, limit int, levelOf map[int]int) 
 	tr := newSegJoinTrace(in, levelOf)
 	keyRec, keyReg = -1, -1
 	for ; pc < limit && in[pc].Op != OpHashAggStep; pc++ {
+		if segJoinIsJump(in[pc]) {
+			end, ok := tr.region(pc, limit)
+			if !ok {
+				return nil, 0, 0, 0, false
+			}
+			pc = end - 1
+			continue
+		}
 		if ins := in[pc]; ins.Op == OpMakeRecord {
 			if keyRec >= 0 || ins.P2 != 1 {
 				return nil, 0, 0, 0, false
@@ -897,6 +1036,14 @@ func segJoinFilter(in []Instruction, pc, limit, lv int, levelOf map[int]int, nex
 	tr := newSegJoinTrace(in, levelOf)
 	for i := pc; i < limit; i++ {
 		ins := in[i]
+		if segJoinIsJump(ins) && !(ins.Op == OpIfNot && ins.P2 == next) {
+			end, ok := tr.region(i, limit)
+			if !ok {
+				return segJoinArg{}, 0, false
+			}
+			i = end - 1
+			continue
+		}
 		if ins.Op == OpIfNot {
 			src, ok := tr.src[ins.P1]
 			if !ok || i == pc || ins.P2 != next || ins.P3 != 1 || src.level != lv && src.level >= 0 {

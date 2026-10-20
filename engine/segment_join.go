@@ -86,7 +86,16 @@ type segJoinArg struct {
 // that level's table is every evaluation the loop makes.
 type segJoinExpr struct {
 	insns []Instruction
+	pcs   []int // each instruction's address in the program, which its jumps name
 	out   int
+}
+
+// at is where a jump to address pc goes on in the expression: its first
+// instruction at or after pc, which the program would run next of those the
+// expression holds, or past the last.
+func (e *segJoinExpr) at(pc int) int {
+	i, _ := slices.BinarySearch(e.pcs, pc)
+	return i
 }
 
 // segJoinTable is one table's rows as the kernel reads them, in rowid order,
@@ -777,15 +786,25 @@ func (w *segJoinWalk) exprValues(a segJoinArg) ([]Value, bool) {
 	out := make([]Value, n)
 	for r := range n {
 		row = int32(r)
-		for k := range a.expr.insns {
+		for k := 0; k < len(a.expr.insns); {
 			op := &a.expr.insns[k]
-			if op.Op == OpRowid {
+			switch {
+			case op.Op == OpRowid:
 				vm.regs[op.P2] = t.value(row, -1)
+			case op.Op == OpGoto:
+				k = a.expr.at(op.P2)
 				continue
+			default:
+				taken, ok := vm.segEvalInsn(op, column)
+				if !ok {
+					return nil, false
+				}
+				if taken {
+					k = a.expr.at(op.P2)
+					continue
+				}
 			}
-			if _, ok := vm.segEvalInsn(op, column); !ok {
-				return nil, false
-			}
+			k++
 		}
 		out[r] = vm.regs[a.expr.out]
 		// The value may point into the private registers' scratch: kept,
