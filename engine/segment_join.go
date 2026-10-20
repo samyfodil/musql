@@ -1433,13 +1433,20 @@ func segJoinArgsOf(plan *segJoinPlan, w *segJoinWalk) (*segJoinArgs, bool) {
 	args := &segJoinArgs{ints: make([][]int64, n), flts: make([][]float64, n), nulls: make([][]bool, n),
 		levels: make([]int, n), argOf: map[int]int{}, plan: plan, w: w}
 	for a, arg := range plan.args {
-		// An expression over the optional level's NULL row need not be NULL
-		// (coalesce): such an argument declines.
-		if arg.expr != nil && w.opt(w.lv(arg)) {
-			return nil, false
-		}
 		args.levels[a] = w.lv(arg)
 		args.argOf[arg.reg] = a
+		// An expression over an optional level's NULL row need not be NULL
+		// (coalesce). The vectors below take that row's value to be NULL;
+		// when it is not, the argument is read one row at a time instead.
+		if arg.expr != nil && w.opt(w.lv(arg)) {
+			v, ok := w.nullRowValue(arg)
+			if !ok {
+				return nil, false
+			}
+			if v.Typ != Null {
+				continue
+			}
+		}
 		if vals, _, nulls, ok := w.nullable(arg, false); ok {
 			args.ints[a], args.nulls[a] = vals, nulls
 		} else if _, vals, nulls, ok := w.nullable(arg, true); ok {
@@ -1553,7 +1560,10 @@ func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (*segJoinGroups, bool) {
 	keyLv := w.lv(plan.key)
 	if plan.grouped {
 		if plan.key.expr != nil && w.opt(keyLv) {
-			return nil, false // see segJoinArgsOf
+			// Read by value, which evaluates the NULL row.
+			if _, ok := w.nullRowValue(plan.key); !ok {
+				return nil, false
+			}
 		}
 		// A key on the optional level is NULL in its NULL rows, which only the
 		// canonical bytes can say.
