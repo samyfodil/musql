@@ -780,6 +780,45 @@ func (tr *segJoinTrace) expr(deps []int, out int) *segJoinExpr {
 	return e
 }
 
+// writtenOnEveryPath reports whether every path from pc to the instruction
+// at end (exclusive) writes register r. Every jump in the run goes forward,
+// so one pass in address order settles each instruction: written on entry
+// when written on leaving every instruction that reaches it.
+func (tr *segJoinTrace) writtenOnEveryPath(pc, end, r int) bool {
+	in := make([]int8, end-pc+1) // per instruction and end: 1 written on entry, -1 not, 0 unreached
+	set := func(at int, written bool) {
+		v := int8(1)
+		if !written {
+			v = -1
+		}
+		if i := at - pc; i >= 0 && i < len(in) && (in[i] == 0 || in[i] == 1 && v == -1) {
+			in[i] = v
+		}
+	}
+	in[0] = -1
+	for i := pc; i < end; i++ {
+		if in[i-pc] == 0 {
+			continue // no path reaches it
+		}
+		ins := tr.in[i]
+		out := in[i-pc] == 1
+		if !out {
+			if _, writes, _, ok := segInsnRegs(ins); ok && slices.Contains(writes, r) {
+				out = true
+			} else if (ins.Op == OpColumn || ins.Op == OpRowid) && segJoinColDest(ins) == r {
+				out = true
+			}
+		}
+		if segJoinIsJump(ins) && ins.P2 <= end {
+			set(ins.P2, out) // a jump past end reaches it no way
+		}
+		if ins.Op != OpGoto {
+			set(i+1, out)
+		}
+	}
+	return in[end-pc] == 1
+}
+
 // segJoinIsJump reports whether ins may jump: a test, a comparison that
 // jumps rather than stores, a Goto.
 func segJoinIsJump(ins Instruction) bool {
@@ -820,6 +859,7 @@ func (tr *segJoinTrace) region(pc, limit int) (int, bool) {
 	level := -1
 	var deps []int
 	written := map[int]bool{}
+	firstWrite := map[int]int{}
 	var outs []int
 	for i := pc; i < end; i++ {
 		ins := tr.in[i]
@@ -848,12 +888,17 @@ func (tr *segJoinTrace) region(pc, limit int) (int, bool) {
 			}
 		}
 		for _, r := range reads {
-			if written[r] {
-				continue
-			}
+			// A register written before the run carries that value into
+			// every path that does not write it again: its definition is
+			// part of the expression whether or not the run writes it too.
 			src, ok := tr.src[r]
 			if !ok {
-				return 0, false
+				// Only the run's own write, which must then be on every path
+				// to this read: no jump from before it lands past it.
+				if _, mine := firstWrite[r]; !mine || !tr.writtenOnEveryPath(pc, i, r) {
+					return 0, false
+				}
+				continue
 			}
 			if src.level >= 0 {
 				if level >= 0 && level != src.level {
@@ -866,14 +911,39 @@ func (tr *segJoinTrace) region(pc, limit int) (int, bool) {
 		for _, w := range writes {
 			if !written[w] {
 				outs = append(outs, w)
+				firstWrite[w] = i
 			}
 			written[w] = true
 		}
 		deps = append(deps, i)
 	}
+	// A register the run writes on only some paths keeps, on the others, the
+	// value it had before: that definition is part of the expression too. One
+	// with none, not written on every path, would read whatever the register
+	// last held -- another row's value -- so it is left untraced, and
+	// anything that reads it declines.
+	var partial []int
+	for _, o := range outs {
+		if src, ok := tr.src[o]; ok {
+			if src.level >= 0 {
+				if level >= 0 && level != src.level {
+					return 0, false
+				}
+				level = src.level
+			}
+			deps = append(deps, tr.deps[o]...)
+		} else if !tr.writtenOnEveryPath(pc, end, o) {
+			partial = append(partial, o)
+		}
+	}
 	slices.Sort(deps)
 	deps = slices.Compact(deps)
 	for _, o := range outs {
+		if slices.Contains(partial, o) {
+			delete(tr.src, o)
+			delete(tr.deps, o)
+			continue
+		}
 		tr.src[o] = segJoinArg{reg: o, level: level, expr: tr.expr(deps, o)}
 		tr.deps[o] = deps
 	}
