@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -441,17 +442,18 @@ func segJoinPeephole(prog *Program) bool {
 	if !ok {
 		return false
 	}
-	src, pc, ok := parseSegJoinStepBody(in, l.body, len(in), l.levelOf)
+	body, ok := parseSegJoinSteps(in, l.body, len(in), l.levelOf, OpAggStep)
 	if !ok {
 		return false
 	}
-	step := in[pc]
+	pc := body.last()
+	step := in[body.at[0]]
 	plan, ok := step.P4.(*aggPlan)
 	if !ok || step.P3 != 0 || plan == nil || plan.anchorCheck != nil ||
 		len(plan.orderPlans) != 0 || !aggPlanReadsOnlyLoweredColsExceptOrder(plan) {
 		return false
 	}
-	args, ok := segJoinStepArgs(plan, src)
+	args, ok := segJoinStepArgs(plan, body)
 	if !ok {
 		return false
 	}
@@ -461,11 +463,11 @@ func segJoinPeephole(prog *Program) bool {
 	}
 	for _, nb := range l.nullBodies {
 		// A LEFT JOIN's null row: the same arguments, the same step.
-		nsrc, end, ok := parseSegJoinStepBody(in, nb[0], nb[1], l.levelOf)
-		if !ok || end+1 != nb[1] || !segJoinSameInsn(in[end], step) {
+		nbody, ok := parseSegJoinSteps(in, nb[0], nb[1], l.levelOf, OpAggStep)
+		if !ok || nbody.last()+1 != nb[1] || !body.same(in, nbody) {
 			return false
 		}
-		nargs, ok := segJoinStepArgs(plan, nsrc)
+		nargs, ok := segJoinStepArgs(plan, nbody)
 		if !ok || !segJoinSameArgs(nargs, args) {
 			return false
 		}
@@ -482,7 +484,7 @@ func segJoinPeephole(prog *Program) bool {
 
 	// The guard takes the place of the first instruction after the opens and
 	// runs it when it declines, so no address moves.
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2, orders: l.orders}
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2, segs: body.segs, orders: l.orders}
 	at := len(in)
 	out := append([]Instruction(nil), in...)
 	out[l.head] = Instruction{Op: OpGoto, P2: at}
@@ -544,19 +546,22 @@ func segJoinGroupPeephole(prog *Program) bool {
 		}
 	}
 
-	// The drain's one step, over the row the body built.
-	stepAt := -1
+	// The drain's steps over the row the body built: one per segment of the
+	// aggregate (a HAVING's own aggregates are another), the first's loads
+	// a run the trace follows, each later one's straight after the last.
+	var steps []int
 	for i, ins := range in {
 		if ins.Op == OpAggStep {
-			if stepAt >= 0 || ins.P3 != 1 {
+			if ins.P3 != 1 || len(steps) > 0 && (ins.P1 != in[steps[0]].P1 || ins.P4 != in[steps[0]].P4) {
 				return false
 			}
-			stepAt = i
+			steps = append(steps, i)
 		}
 	}
-	if stepAt < 0 {
+	if len(steps) == 0 {
 		return false
 	}
+	stepAt := steps[0]
 	step := in[stepAt]
 	rowRec := step.P1
 	plan, ok := step.P4.(*aggPlan)
@@ -700,11 +705,49 @@ func segJoinGroupPeephole(prog *Program) bool {
 			return false
 		}
 	}
-	drainCol := func(reg int) (segJoinArg, bool) {
-		a, ok := tr.src[reg]
-		return a, ok
+	readRow := func(i int) bool {
+		ins := in[i]
+		if ins.Op != OpRecordColumn {
+			return tr.step(i)
+		}
+		if ins.P1 != rowRec {
+			return false
+		}
+		r, ok := regOf(ins.P2)
+		if !ok {
+			return false
+		}
+		src, ok := writer[r]
+		if !ok {
+			return false
+		}
+		tr.from(i, ins.P3, src, tr.deps[r], l.cursors)
+		return true
 	}
-	args, ok := segJoinAggArgs(plan, drainCol)
+	snaps := map[int]map[int]segJoinArg{step.P2: maps.Clone(tr.src)}
+	segs := []int{step.P2}
+	for k := 1; k < len(steps); k++ {
+		// Nothing jumps into the run of a later step's loads.
+		for t := steps[k-1] + 1; t <= steps[k]; t++ {
+			if targets[t] {
+				return false
+			}
+		}
+		for i := steps[k-1] + 1; i < steps[k]; i++ {
+			if segJoinIsJump(in[i]) || !readRow(i) {
+				return false
+			}
+		}
+		seg := in[steps[k]].P2
+		if _, dup := snaps[seg]; dup {
+			return false
+		}
+		snaps[seg], segs = maps.Clone(tr.src), append(segs, seg)
+	}
+	args, ok := segJoinAggArgs(plan, func(it *aggItem, reg int) (segJoinArg, bool) {
+		a, ok := snaps[it.stepSeg][reg]
+		return a, ok
+	})
 	if !ok {
 		return false
 	}
@@ -750,7 +793,7 @@ func segJoinGroupPeephole(prog *Program) bool {
 	seqAt := fullOf(seqReg)
 
 	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2,
-		grouped: true, key: key, loads: loads, orders: l.orders}
+		segs: segs, grouped: true, key: key, loads: loads, orders: l.orders}
 	out := append([]Instruction(nil), in...)
 	guard := len(out)
 	out[l.head] = Instruction{Op: OpGoto, P2: guard}
@@ -764,20 +807,22 @@ func segJoinGroupPeephole(prog *Program) bool {
 	out = append(out, Instruction{Op: OpSegJoinNext, P2: closeAt, P4: jp})
 	out = append(out, copies...)
 	out = append(out, Instruction{Op: OpGoto, P2: top})
-	// The drain's step, then the group's other rows.
+	// The drain's steps, the last followed by the group's other rows: each
+	// segment takes the group's first row before them.
+	last := steps[len(steps)-1]
 	rest := len(out)
-	out[stepAt] = Instruction{Op: OpGoto, P2: rest}
-	out = append(out, step,
+	out[last] = Instruction{Op: OpGoto, P2: rest}
+	out = append(out, in[last],
 		Instruction{Op: OpSegJoinRest, P1: rowRec, P2: seqAt, P4: jp},
-		Instruction{Op: OpGoto, P2: stepAt + 1})
+		Instruction{Op: OpGoto, P2: last + 1})
 	prog.Insns = out
 	return true
 }
 
 // segJoinStepArgs is the source of each aggregate's argument register.
-func segJoinStepArgs(plan *aggPlan, src map[int]segJoinArg) ([]segJoinArg, bool) {
-	return segJoinAggArgs(plan, func(reg int) (segJoinArg, bool) {
-		a, ok := src[reg]
+func segJoinStepArgs(plan *aggPlan, b *segJoinSteps) ([]segJoinArg, bool) {
+	return segJoinAggArgs(plan, func(it *aggItem, reg int) (segJoinArg, bool) {
+		a, ok := b.snaps[it.stepSeg][reg]
 		return a, ok
 	})
 }
@@ -802,12 +847,12 @@ func segJoinStepRegs(it *aggItem) []int {
 // segJoinAggArgs is the source of every register the aggregates step from --
 // each one's argument and, for group_concat and its kin, separator -- found
 // by lookup, each register once.
-func segJoinAggArgs(plan *aggPlan, lookup func(reg int) (segJoinArg, bool)) ([]segJoinArg, bool) {
+func segJoinAggArgs(plan *aggPlan, lookup func(it *aggItem, reg int) (segJoinArg, bool)) ([]segJoinArg, bool) {
 	var args []segJoinArg
-	seen := map[int]bool{}
+	seen := map[int]segJoinArg{}
 	for _, it := range aggPlanTemplates(plan) {
 		for _, reg := range segJoinStepRegs(it) {
-			a, ok := lookup(reg)
+			a, ok := lookup(it, reg)
 			if !ok {
 				return nil, false
 			}
@@ -816,12 +861,16 @@ func segJoinAggArgs(plan *aggPlan, lookup func(reg int) (segJoinArg, bool)) ([]s
 			if a.guard != 0 && (it.filter == nil || it.rowRegs[aggExprFilter] != a.guard || reg == a.guard-1) {
 				return nil, false
 			}
-			if seen[reg] {
+			if prev, dup := seen[reg]; dup {
+				// Two steps reading one register read the same value.
+				if !segJoinSameSrc(prev, a) {
+					return nil, false
+				}
 				continue
 			}
 			a.reg = reg
 			args = append(args, a)
-			seen[reg] = true
+			seen[reg] = a
 		}
 	}
 	return args, true
@@ -1126,52 +1175,80 @@ func (tr *segJoinTrace) from(pc, dst int, src segJoinArg, srcDeps []int, cursors
 	tr.src[dst] = src
 }
 
-// parseSegJoinStepBody reads a body of argument loads -- a column read and
-// its copy into the argument's register -- up to its OpAggStep, returning the
-// arguments and the step's address.
-func parseSegJoinStepBody(in []Instruction, pc, limit int, levelOf map[int]int) (map[int]segJoinArg, int, bool) {
+// segJoinSteps is a body's aggregate steps -- one per segment of the
+// aggregate, each over the same row -- and, as of each, where every register
+// came from.
+type segJoinSteps struct {
+	at    []int // each step's address
+	segs  []int
+	snaps map[int]map[int]segJoinArg // segment -> register -> source
+	// keyRec and keyReg are a hashed GROUP BY's key record and register.
+	keyRec, keyReg int
+}
+
+// last is the last step's address.
+func (b *segJoinSteps) last() int { return b.at[len(b.at)-1] }
+
+// same reports whether o steps the same plan's same segments the same way,
+// from the same values.
+func (b *segJoinSteps) same(in []Instruction, o *segJoinSteps) bool {
+	if len(b.at) != len(o.at) || b.keyRec != o.keyRec || b.keyReg != o.keyReg {
+		return false
+	}
+	for i := range b.at {
+		if !segJoinSameInsn(in[b.at[i]], in[o.at[i]]) {
+			return false
+		}
+	}
+	return true
+}
+
+// parseSegJoinSteps reads a body from pc: loads and expressions up to a step
+// (op), then any more, each a step of the same plan over another segment --
+// a HAVING's own aggregate -- with the loads it reads before it. A hashed
+// GROUP BY's body also makes its key record (MakeRecord), once, before the
+// first step, which every step names.
+func parseSegJoinSteps(in []Instruction, pc, limit int, levelOf map[int]int, op OpCode) (*segJoinSteps, bool) {
 	tr := newSegJoinTrace(in, levelOf)
-	for ; pc < limit && in[pc].Op != OpAggStep; pc++ {
-		if segJoinIsJump(in[pc]) {
+	b := &segJoinSteps{snaps: map[int]map[int]segJoinArg{}, keyRec: -1, keyReg: -1}
+	for ; pc < limit; pc++ {
+		ins := in[pc]
+		switch {
+		case ins.Op == op:
+			if len(b.at) > 0 && (ins.P4 != in[b.at[0]].P4 || ins.P1 != in[b.at[0]].P1 || ins.P3 != in[b.at[0]].P3) {
+				return nil, false
+			}
+			if _, dup := b.snaps[ins.P2]; dup {
+				return nil, false
+			}
+			b.at, b.segs = append(b.at, pc), append(b.segs, ins.P2)
+			b.snaps[ins.P2] = maps.Clone(tr.src)
+			continue
+		case segJoinIsJump(ins):
+			if len(b.at) > 0 {
+				return b, true // past the steps: the Next chain
+			}
 			end, ok := tr.region(pc, limit)
 			if !ok {
-				return nil, 0, false
+				return nil, false
 			}
 			pc = end - 1
+			continue
+		case op == OpHashAggStep && ins.Op == OpMakeRecord && len(b.at) == 0:
+			if b.keyRec >= 0 || ins.P2 != 1 {
+				return nil, false
+			}
+			b.keyRec, b.keyReg = ins.P3, ins.P1
 			continue
 		}
 		if !tr.step(pc) {
-			return nil, 0, false
+			if len(b.at) > 0 {
+				return b, true
+			}
+			return nil, false
 		}
 	}
-	return tr.src, pc, pc < limit
-}
-
-// parseSegJoinHashBody reads a hashed GROUP BY's body: column loads and
-// copies, the key's record, up to its OpHashAggStep, returning the column
-// each register holds, the key record and register, and the step's address.
-func parseSegJoinHashBody(in []Instruction, pc, limit int, levelOf map[int]int) (writer map[int]segJoinArg, keyRec, keyReg, step int, ok bool) {
-	tr := newSegJoinTrace(in, levelOf)
-	keyRec, keyReg = -1, -1
-	for ; pc < limit && in[pc].Op != OpHashAggStep; pc++ {
-		if segJoinIsJump(in[pc]) {
-			end, ok := tr.region(pc, limit)
-			if !ok {
-				return nil, 0, 0, 0, false
-			}
-			pc = end - 1
-			continue
-		}
-		if ins := in[pc]; ins.Op == OpMakeRecord {
-			if keyRec >= 0 || ins.P2 != 1 {
-				return nil, 0, 0, 0, false
-			}
-			keyRec, keyReg = ins.P3, ins.P1
-		} else if !tr.step(pc) {
-			return nil, 0, 0, 0, false
-		}
-	}
-	return tr.src, keyRec, keyReg, pc, pc < limit && keyRec >= 0
+	return b, len(b.at) > 0
 }
 
 // segJoinRowBody is a loop body that builds a row and hands it on: the
@@ -1371,14 +1448,17 @@ func segJoinHashPeephole(prog *Program) bool {
 	if !ok {
 		return false
 	}
-	writer, keyRec, keyReg, pc, ok := parseSegJoinHashBody(in, l.body, len(in), l.levelOf)
-	if !ok {
+	body, ok := parseSegJoinSteps(in, l.body, len(in), l.levelOf, OpHashAggStep)
+	if !ok || body.keyRec < 0 {
 		return false
 	}
-	if pc >= len(in) || keyRec < 0 || in[pc].P1 != keyRec {
+	pc := body.last()
+	keyRec, keyReg := body.keyRec, body.keyReg
+	writer := body.snaps[body.segs[0]]
+	if in[pc].P1 != keyRec {
 		return false
 	}
-	step := in[pc]
+	step := in[body.at[0]]
 	plan, ok := step.P4.(*aggPlan)
 	if !ok || plan == nil || plan.anchorCheck != nil || !aggPlanReadsOnlyLoweredColsExceptOrder(plan) {
 		return false
@@ -1387,10 +1467,7 @@ func segJoinHashPeephole(prog *Program) bool {
 	if !ok {
 		return false
 	}
-	args, ok := segJoinAggArgs(plan, func(reg int) (segJoinArg, bool) {
-		a, ok := writer[reg]
-		return a, ok
-	})
+	args, ok := segJoinStepArgs(plan, body)
 	if !ok {
 		return false
 	}
@@ -1400,23 +1477,21 @@ func segJoinHashPeephole(prog *Program) bool {
 	}
 	for _, nb := range l.nullBodies {
 		// A LEFT JOIN's null row: the same key and arguments, the same step.
-		nw, nrec, nkey, end, ok := parseSegJoinHashBody(in, nb[0], nb[1], l.levelOf)
-		if !ok || end+1 != nb[1] || nrec != keyRec || nkey != keyReg || !segJoinSameInsn(in[end], step) {
+		nbody, ok := parseSegJoinSteps(in, nb[0], nb[1], l.levelOf, OpHashAggStep)
+		if !ok || nbody.last()+1 != nb[1] || !body.same(in, nbody) {
 			return false
 		}
-		regs := []int{keyReg}
-		for _, a := range args {
-			regs = append(regs, a.reg)
+		x, okx := writer[keyReg]
+		y, oky := nbody.snaps[nbody.segs[0]][keyReg]
+		if !okx || !oky || !segJoinSameSrc(x, y) {
+			return false
 		}
-		for _, r := range regs {
-			x, okx := writer[r]
-			y, oky := nw[r]
-			if !okx || !oky || !segJoinSameSrc(x, y) {
-				return false
-			}
+		nargs, ok := segJoinStepArgs(plan, nbody)
+		if !ok || !segJoinSameArgs(nargs, args) {
+			return false
 		}
 	}
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2,
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2, segs: body.segs,
 		grouped: true, key: key, orders: l.orders}
 	key.reg = keyReg
 	jp.key = key

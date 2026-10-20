@@ -191,7 +191,10 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 		}
 		q := "SELECT " + strings.Join(sel, ", ") + " " + join + " " + w + " " + g
 		if g != "" && r.Intn(3) == 0 {
-			q += " HAVING count(*) > 1"
+			// A HAVING over aggregates the select list does not name: their
+			// own steps.
+			q += []string{" HAVING count(*) > 1", " HAVING max(f.id) % 2 = 0", " HAVING sum(f.v) > 10 AND min(f.w) < 3",
+				" HAVING substr(group_concat(f.id), 1, 2) <> '1,'", " HAVING total(f.w) > 7.25"}[r.Intn(5)]
 		}
 		if g != "" && r.Intn(3) == 0 {
 			q += " ORDER BY 2 DESC, 1"

@@ -61,6 +61,9 @@ type segJoinPlan struct {
 	// for none.
 	crosses [][]*segJoinExpr
 	tags    []*segJoinTags
+	// segs is every segment of agg the body steps, seg first; nil for seg
+	// alone.
+	segs []int
 	// orders is the loop's AutoIndexOrders: a level visiting its rows in an
 	// index's order rather than rowid order.
 	orders []segJoinOrder
@@ -70,6 +73,17 @@ type segJoinPlan struct {
 	order []segJoinArg
 	keys  *sorterKeyInfo
 }
+
+// allSegs is every segment the body steps.
+func (p *segJoinPlan) allSegs() []int {
+	if p.segs == nil {
+		return []int{p.seg}
+	}
+	return p.segs
+}
+
+// steps reports whether the body steps segment seg.
+func (p *segJoinPlan) steps(seg int) bool { return slices.Contains(p.allSegs(), seg) }
 
 // segJoinOrder is an AutoIndexOrder: cursor's rows visited in key's order.
 type segJoinOrder struct {
@@ -1676,7 +1690,7 @@ func segJoinArgsOf(plan *segJoinPlan, w *segJoinWalk) (*segJoinArgs, bool) {
 		// replays its rows.
 	}
 	for _, it := range aggPlanTemplates(plan.agg) {
-		if it.stepSeg != plan.seg {
+		if !plan.steps(it.stepSeg) {
 			return nil, false
 		}
 		for _, r := range segJoinStepRegs(it) {
@@ -2126,8 +2140,10 @@ func (m *vdbe) segJoinAggregate(plan *segJoinPlan) (bool, error) {
 		m.aggNullRow = make([]Value, nr)
 	}
 	row, rowids := m.aggNullRow[:plan.agg.nCols:plan.agg.nCols], m.aggNullRow[plan.agg.nCols:nr]
-	if err := m.aggStep(m.aggRowCtx(plan.agg, row, rowids), plan.seg); err != nil {
-		return false, err
+	for _, seg := range plan.allSegs() {
+		if err := m.aggStep(m.aggRowCtx(plan.agg, row, rowids), seg); err != nil {
+			return false, err
+		}
 	}
 	if err := gs.rest(m, g); err != nil {
 		return false, err
@@ -2157,8 +2173,10 @@ func (m *vdbe) segJoinHashAgg(plan *segJoinPlan) (bool, error) {
 		if !gs.gather(g, row, rowids) {
 			return false, fmt.Errorf("vdbe: OpSegJoinHash over a cursor outside its join")
 		}
-		if err := m.hashAggStepRow(plan.agg, keyVals, plan.seg, row, rowids); err != nil {
-			return false, err
+		for _, seg := range plan.allSegs() {
+			if err := m.hashAggStepRow(plan.agg, keyVals, seg, row, rowids); err != nil {
+				return false, err
+			}
 		}
 		if err := gs.rest(m, g); err != nil {
 			return false, err
