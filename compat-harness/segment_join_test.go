@@ -85,6 +85,13 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT al.id, max(t.plays), t.id FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, false},
 		{`SELECT al.id, sum(t.rating) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
 		{`SELECT al.id, group_concat(t.id) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, false},
+		// DISTINCT over INTEGER arguments.
+		{`SELECT count(DISTINCT t.album_id), count(*), sum(DISTINCT t.seconds % 7) FROM tracks t JOIN albums al ON al.id = t.album_id`, false},
+		{`SELECT count(DISTINCT t.album_id), count(*), sum(DISTINCT al.year) FROM tracks t JOIN albums al ON al.id = t.album_id`, true},
+		{`SELECT al.artist_id, count(DISTINCT t.seconds), avg(DISTINCT t.plays), total(DISTINCT al.year), count(t.seconds) FROM tracks t JOIN albums al ON al.id = t.album_id GROUP BY al.artist_id`, true},
+		{`SELECT al.id, count(DISTINCT t.seconds), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
+		{`SELECT count(DISTINCT t.rating) FROM tracks t JOIN albums al ON al.id = t.album_id`, false},
+		{`SELECT count(DISTINCT w.v), sum(DISTINCT w.album_id) FROM wide w JOIN albums al ON al.id = w.album_id`, true},
 		{`SELECT b.album_id, sum(b.v) FROM big b JOIN albums al ON al.id = b.album_id GROUP BY b.album_id`, false},
 		// Sums the order-strict check has to judge from the values' window.
 		{`SELECT w.album_id, sum(w.v), count(*) FROM wide w JOIN albums al ON al.id = w.album_id GROUP BY w.album_id`, true},

@@ -822,6 +822,9 @@ type segJoinArgs struct {
 	levels []int
 	argOf  map[int]int // the step's argument register -> its index
 	floats bool
+	// keep: a group keeps its joined rows, which a REAL argument replays in
+	// order and a DISTINCT one dedupes.
+	keep bool
 }
 
 // segJoinArgsOf reads plan's arguments, or reports false when an aggregate is
@@ -845,12 +848,22 @@ func segJoinArgsOf(plan *segJoinPlan, w *segJoinWalk) (*segJoinArgs, bool) {
 	if args.floats && plan.sorted {
 		return nil, false // a REAL sum replays the loop's order, unknown here
 	}
+	args.keep = args.keep || args.floats
 	for _, it := range aggPlanTemplates(plan.agg) {
 		sumKind := it.kind == aggSum || it.kind == aggTotal || it.kind == aggAvg
 		// An order-strict sum checks at finalize that no order could change
-		// it, from a window over its values that rest keeps up to date.
-		if it.filter != nil || it.orderBy != nil || it.distinct || it.orderStrict && !sumKind || it.stepSeg != plan.seg {
+		// it, from a window over its values that rest keeps up to date. A
+		// DISTINCT count or sum takes INTEGER arguments, which are equal only
+		// when identical.
+		if it.filter != nil || it.orderBy != nil || it.orderStrict && !sumKind || it.stepSeg != plan.seg {
 			return nil, false
+		}
+		if it.distinct {
+			a, ok := args.argOf[it.rowRegs[aggExprArg]-1]
+			if !ok || args.ints[a] == nil || !sumKind && it.kind != aggCount {
+				return nil, false
+			}
+			args.keep = true
 		}
 		switch it.kind {
 		case aggCountStar:
@@ -963,7 +976,7 @@ func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (*segJoinGroups, bool) {
 			}
 		}
 		g := &groups[gi]
-		if args.floats {
+		if args.keep {
 			g.rows = append(g.rows, at...)
 		}
 		return g.sums.add(args, at)
@@ -1001,6 +1014,37 @@ func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) {
 			return
 		}
 		a := args.argOf[it.rowRegs[aggExprArg]-1]
+		if it.distinct {
+			// Each value the group's other rows bring that it has not seen,
+			// as step takes it: kept, counted, summed.
+			ints, lv := args.ints[a], args.levels[a]
+			seen := make(map[int64]bool, len(it.seen))
+			for _, v := range it.seen {
+				seen[v.I] = true
+			}
+			first := ints[g.first[lv]]
+			skipped := false
+			for r := 0; r < len(g.rows); r += k {
+				v := ints[g.rows[r+lv]]
+				if !skipped && v == first && slices.Equal(g.rows[r:r+k], g.first) {
+					skipped = true // the row already stepped
+					continue
+				}
+				if seen[v] {
+					continue
+				}
+				seen[v] = true
+				it.seen = append(it.seen, Value{Typ: Int, I: v})
+				it.cnt++
+				if it.kind != aggCount {
+					if it.orderStrict {
+						it.sumWatch(true, v, 0)
+					}
+					it.sumStep(true, v, float64(v))
+				}
+			}
+			return
+		}
 		if fl := args.flts[a]; fl != nil {
 			if it.kind == aggCount {
 				it.cnt += s.n - 1
