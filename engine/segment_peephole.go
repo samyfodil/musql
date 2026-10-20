@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"slices"
 	"strings"
 	"sync/atomic"
 )
@@ -306,9 +307,16 @@ func segPeepholeCompareOK(cmp Instruction) bool {
 // that does not start such a group and returns the predicates and that pc;
 // ok is false when a group starts but does not match exactly.
 func segParsePredBlock(in []Instruction, pc, limit, cursor, nextAt int) (preds []segPlanPred, end int, ok bool) {
+	return segParsePredTree(in, pc, limit, cursor, nextAt, nil, -1)
+}
+
+// segParsePredTree is segParsePredBlock inside an AND tree already begun:
+// leadRegs are the results of the tests before pc, each of which fails to
+// falseAt -- a LEFT JOIN's ON clause, whose first test is the join's own
+// equality (segment_join_peephole.go).
+func segParsePredTree(in []Instruction, pc, limit, cursor, nextAt int, leadRegs []int, falseAt int) (preds []segPlanPred, end int, ok bool) {
 	preds = make([]segPlanPred, 0, 2)
-	var cmpRegs []int
-	falseAt := -1
+	cmpRegs := slices.Clone(leadRegs)
 	for pc+3 < limit && in[pc].Op == OpColumn && segLooksLikePredGroup(in, pc, limit) {
 		col, bound, cmp, ifnot := in[pc], in[pc+1], in[pc+2], in[pc+3]
 		// A negative numeric literal is spelled "Integer 100; Negative": the

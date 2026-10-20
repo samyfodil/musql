@@ -171,17 +171,38 @@ func parseSegJoinLoop(in []Instruction, open int) (*segJoinLoop, bool) {
 		la, aCol, okA := segJoinColRead(ca, l.levelOf)
 		lb, bCol, okB := segJoinColRead(cb, l.levelOf)
 		ra, rb := segJoinColDest(ca), segJoinColDest(cb)
+		// A LEFT JOIN's ON clause with terms beside the equality compiles to
+		// one AND tree: the equality's test fails to the tree's false label
+		// (IfNot P3 0) rather than to the Next.
+		tree := flag >= 0 && skip.P3 == 0
 		if !okA || !okB || eq.Op != OpEq || !segJoinEqOK(eq) ||
 			!(eq.P1 == ra && eq.P3 == rb || eq.P1 == rb && eq.P3 == ra) ||
-			skip.Op != OpIfNot || skip.P1 != eq.P2 || skip.P3 != 1 || ra == rb {
+			skip.Op != OpIfNot || skip.P1 != eq.P2 || skip.P3 != 1 && !tree || ra == rb {
 			return nil, false
 		}
 		if (la == self) == (lb == self) {
 			return nil, false // one side must be this level, the other an outer one
 		}
 		l.edges = append(l.edges, segJoinEdge{a: la, aCol: aCol, b: lb, bCol: bCol})
-		l.ifNots[pc+4] = self
-		pc += 5
+		if tree {
+			// The rest of the tree: terms over this level, and the tail that
+			// settles the three-valued result and skips to the Next.
+			next := -1
+			for i, ins := range in {
+				if ins.Op == OpNext && ins.P1 == l.cursors[self] && ins.P2 == l.rewinds[self]+1 {
+					next = i
+				}
+			}
+			preds, end, ok := segParsePredTree(in, pc+5, len(in), l.cursors[self], next, []int{eq.P2}, skip.P2)
+			if !ok || len(preds) == 0 {
+				return nil, false
+			}
+			l.preds[self] = append(l.preds[self], preds...)
+			pc = end
+		} else {
+			l.ifNots[pc+4] = self
+			pc += 5
+		}
 		if flag >= 0 {
 			// ...and sets it once a row matched.
 			if pc >= len(in) || in[pc].Op != OpInteger || in[pc].P1 != 1 || in[pc].P2 != flag {

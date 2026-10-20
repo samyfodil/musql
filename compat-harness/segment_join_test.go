@@ -85,17 +85,16 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT al.id, max(t.plays), t.id FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, false},
 		{`SELECT al.id, sum(t.rating) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
 		{`SELECT al.id, group_concat(t.id) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, false},
-		// LEFT JOIN: an outer row nothing matches still counts, with NULLs. A
-		// term in the ON clause beside the join's own compiles to one AND
-		// tree with the recheck, which the kernel does not read.
+		// LEFT JOIN: an outer row nothing matches still counts, with NULLs,
+		// terms in the ON clause deciding what matches.
 		{`SELECT count(*), count(t.id), sum(t.seconds), max(t.plays), avg(t.seconds) FROM albums al LEFT JOIN tracks t ON t.album_id = al.id`, true},
 		{`SELECT al.id, count(t.id), sum(t.seconds), min(t.plays) FROM albums al LEFT JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
-		{`SELECT al.id, count(*), count(t.id), total(t.rating) FROM albums al LEFT JOIN tracks t ON t.album_id = al.id AND t.plays > 60000 GROUP BY al.id`, false},
-		{`SELECT al.year, count(t.id), count(*) FROM albums al LEFT JOIN tracks t ON t.album_id = al.id AND t.seconds > 340 GROUP BY al.year`, false},
+		{`SELECT al.id, count(*), count(t.id), total(t.rating) FROM albums al LEFT JOIN tracks t ON t.album_id = al.id AND t.plays > 60000 GROUP BY al.id`, true},
+		{`SELECT al.year, count(t.id), count(*) FROM albums al LEFT JOIN tracks t ON t.album_id = al.id AND t.seconds > 340 GROUP BY al.year`, true},
 		{`SELECT count(*), count(al.id), sum(al.year) FROM tracks t LEFT JOIN albums al ON al.id = t.album_id`, true},
-		{`SELECT al.id, count(*), count(al.year) FROM tracks t LEFT JOIN albums al ON al.id = t.album_id AND al.year > 1975 GROUP BY al.id`, false},
+		{`SELECT al.id, count(*), count(al.year) FROM tracks t LEFT JOIN albums al ON al.id = t.album_id AND al.year > 1975 GROUP BY al.id`, true},
 		{`SELECT t.album_id, count(al.id), max(al.year) FROM tracks t LEFT JOIN albums al ON al.id = t.album_id GROUP BY t.album_id`, true},
-		{`SELECT al.year, count(*), count(DISTINCT t.album_id) FROM albums al LEFT JOIN tracks t ON t.album_id = al.id AND t.id < 100 GROUP BY al.year`, false},
+		{`SELECT al.year, count(*), count(DISTINCT t.album_id) FROM albums al LEFT JOIN tracks t ON t.album_id = al.id AND t.id < 100 GROUP BY al.year`, true},
 		{`SELECT ar.id, count(al.id) FROM artists ar LEFT JOIN albums al ON al.artist_id = ar.id GROUP BY ar.id`, false},
 		// ORDER BY ... LIMIT: only rows that can be kept reach the sorter.
 		{`SELECT al.id, t.id, t.plays FROM albums al JOIN tracks t ON t.album_id = al.id ORDER BY t.plays DESC LIMIT 10`, true},
