@@ -111,6 +111,13 @@ type segRowSource struct {
 	pointSeg  *segment
 	pointRow  int
 
+	// list is an index seek's rows (segListSeek): listSegs[k], listRows[k]
+	// for each k in turn, kept across seeks so a join's reseek reuses them.
+	list     bool
+	listPos  int
+	listSegs []*segment
+	listRows []int
+
 	// cols is the per-column work segColumn would otherwise redo on every row.
 	// All four facts are properties of the TABLE, not of the row, and deriving
 	// them per read meant two loads out of a columnInfo slice per column per
@@ -232,12 +239,53 @@ func segColPlansFor(tbl *resolvedTable) []segColPlan {
 // scan here to weigh, only one row whose columns are read as they are asked
 // for, through the same segColumn every lazy read uses.
 func (p *ReadOnlyPager) segPointSeek(cur *vdbeCursor, rid int64, into *segRowSource) (src *segRowSource, served bool) {
-	if !segLazyRows || p == nil || p.segs == nil || cur == nil || cur.tbl == nil {
+	if !p.segSeekable(cur) {
 		return nil, false
 	}
-	if cur.tbl.withoutRowid || cur.hasGeneratedCols() {
+	s, i, served := p.segRowOf(cur, rid)
+	if !served || s == nil {
+		return nil, served
+	}
+	*into = segRowSource{point: true, pointSeg: s, pointRow: i, cols: segColPlansFor(cur.tbl)}
+	return into, true
+}
+
+// segListSeek is segPointSeek for a secondary-index seek's rowids: the source
+// yields those rows, in that order, their columns read as they are asked for,
+// rather than each row fetched, normalized and kept. A join seeking once per
+// outer row built every matching row in full when the program read one or two
+// of its columns. served is false, and nothing is positioned, when any rowid is
+// not the segments' to answer; a rowid with no row is skipped, as the fetch it
+// replaces dropped it.
+func (p *ReadOnlyPager) segListSeek(cur *vdbeCursor, rids []int64, into *segRowSource) (src *segRowSource, served bool) {
+	if !p.segSeekable(cur) {
 		return nil, false
 	}
+	segs, rows := into.listSegs[:0], into.listRows[:0]
+	for _, rid := range rids {
+		s, i, served := p.segRowOf(cur, rid)
+		if !served {
+			return nil, false
+		}
+		if s != nil {
+			segs, rows = append(segs, s), append(rows, i)
+		}
+	}
+	*into = segRowSource{list: true, listSegs: segs, listRows: rows, cols: segColPlansFor(cur.tbl)}
+	return into, true
+}
+
+// segSeekable is whether a seek on cur's table may be served by a lazy source
+// at all: newSegRowSource's shape rules, without its cost rule.
+func (p *ReadOnlyPager) segSeekable(cur *vdbeCursor) bool {
+	return segLazyRows && p != nil && p.segs != nil && cur != nil && cur.tbl != nil &&
+		!cur.tbl.withoutRowid && !cur.hasGeneratedCols()
+}
+
+// segRowOf is the segment and row index holding rowid rid, for a seek. served
+// is false when the segments are not the whole answer for that row; a nil
+// segment with served true is a miss.
+func (p *ReadOnlyPager) segRowOf(cur *vdbeCursor, rid int64) (seg *segment, row int, served bool) {
 	var segs []*segment
 	if p.segs.isLive(cur.tbl.root) {
 		// A write session's row store, which a held connection reads through.
@@ -248,47 +296,46 @@ func (p *ReadOnlyPager) segPointSeek(cur *vdbeCursor, rid int64, into *segRowSou
 		// that pager's log.
 		rows, have, err := p.segs.liveRows(cur.tbl.root)
 		if err != nil || !have || rows == nil || rows.seg == nil {
-			return nil, false
+			return nil, 0, false
 		}
 		if _, over := rows.m[uint64(rid)]; over {
-			return nil, false
+			return nil, 0, false
 		}
 		if rows.baseGone || rows.gone[uint64(rid)] {
-			return nil, true
+			return nil, 0, true
 		}
 		base := rows.seg
 		// A point read needs only ITS row untouched by the delta, not the whole
 		// table: a whole-table check here sorted the delta once per lookup.
 		if base.rp == nil || base.rp.segs == nil || base.rp.segs.isLive(base.root) || base.rp.segs.deltaTouches(base.root, rid) {
-			return nil, false
+			return nil, 0, false
 		}
 		segs = base.rp.segs.byRoot[base.root]
 	} else {
 		// Declined (to seekRowid, which has the delta's maps in front) only when
 		// the delta holds this rowid.
 		if p.segs.deltaTouches(cur.tbl.root, rid) {
-			return nil, false
+			return nil, 0, false
 		}
 		segs = p.segs.byRoot[cur.tbl.root]
 	}
 	if len(segs) == 0 {
-		return nil, false
+		return nil, 0, false
 	}
 	for _, s := range segs {
 		if s == nil {
-			return nil, false
+			return nil, 0, false
 		}
 		i, hit := s.findRowid(rid)
 		if !hit {
 			continue
 		}
 		if len(s.cols) != len(cur.tbl.cols) {
-			return nil, false
+			return nil, 0, false
 		}
-		*into = segRowSource{point: true, pointSeg: s, pointRow: i, cols: segColPlansFor(cur.tbl)}
-		return into, true
+		return s, i, true
 	}
-	return nil, true
+	return nil, 0, true
 }
 
 // segRowSourceWins decides whether a per-column read beats one whole-row read
@@ -340,6 +387,15 @@ func (src *segRowSource) next() (s *segment, row int, rowid uint64, ok bool) {
 		src.pointDone = true
 		segRowsServed.Add(1)
 		return src.pointSeg, src.pointRow, src.pointSeg.Rowid(src.pointRow), true
+	}
+	if src.list {
+		if src.listPos >= len(src.listRows) {
+			return nil, 0, 0, false
+		}
+		k := src.listPos
+		src.listPos++
+		segRowsServed.Add(1)
+		return src.listSegs[k], src.listRows[k], src.listSegs[k].Rowid(src.listRows[k]), true
 	}
 	for src.si < len(src.segs) {
 		s = src.segs[src.si]
