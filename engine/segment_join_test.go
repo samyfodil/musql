@@ -254,6 +254,13 @@ func TestSegJoinVolatileMatchesLoop(t *testing.T) {
 		`SELECT group_concat(segjoin_tick()), group_concat(segjoin_tick() + segjoin_tick()) FROM a JOIN b ON b.a_id = a.id`,
 		`SELECT a.g, group_concat(segjoin_tick()), group_concat(segjoin_tick(b.v)), max(b.v), b.id FROM b JOIN a ON a.id = b.a_id GROUP BY a.g`,
 		`SELECT a.id, group_concat(segjoin_tick() || '-' || b.v), sum(segjoin_tick()) FROM a LEFT JOIN b ON b.a_id = a.id GROUP BY a.id`,
+		// ORDER BY ... LIMIT: the loop computes the record on every joined row.
+		`SELECT b.id, segjoin_tick() FROM a JOIN b ON b.a_id = a.id ORDER BY b.v, b.id LIMIT 7`,
+		`SELECT b.id, b.v FROM a JOIN b ON b.a_id = a.id ORDER BY segjoin_tick() % 7, b.id LIMIT 5`,
+		`SELECT a.id, b.id, segjoin_tick(b.v) FROM a LEFT JOIN b ON b.a_id = a.id AND b.v > 9 ORDER BY a.g DESC, b.id LIMIT 9`,
+		// random() in a WHERE term: a value of the joined row.
+		`SELECT count(*), sum(b.v) FROM a JOIN b ON b.a_id = a.id WHERE random() % 2 = 0 OR b.v >= 0`,
+		`SELECT a.g, count(*) FROM a JOIN b ON b.a_id = a.id WHERE b.v + random() * 0 > 3 GROUP BY a.g`,
 	}
 	run := func(off bool) []string {
 		segPeepholesOffForTest = off

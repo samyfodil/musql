@@ -2694,6 +2694,21 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			segFilterDeclined.Add(1)
 
+		case OpSegJoinVolatile:
+			call, okCall := op.P4.(*segJoinVolatileCall)
+			if !okCall {
+				return nil, fmt.Errorf("vdbe: OpSegJoinVolatile without its call")
+			}
+			if gs := m.segJoin; gs != nil && gs.plan == call.plan && gs.next > 0 {
+				if v, kept := gs.w.called(call.pc, gs.groups[gs.next-1].first); kept {
+					m.regs[call.fn.P3] = v
+					break
+				}
+			}
+			if ferr := m.opFunction(&call.fn); ferr != nil {
+				return nil, ferr
+			}
+
 		case OpSegJoinHash:
 			jp, okPlan := op.P4.(*segJoinPlan)
 			if !okPlan {

@@ -24,6 +24,7 @@ var opNames = [numOpCodes]string{
 	OpSegJoinGroups:        "SegJoinGroups",
 	OpSegJoinNext:          "SegJoinNext",
 	OpSegJoinRest:          "SegJoinRest",
+	OpSegJoinVolatile:      "SegJoinVolatile",
 	OpSegJoinHash:          "SegJoinHash",
 	OpSegJoinTop:           "SegJoinTop",
 	OpSegProgram:           "SegProgram",

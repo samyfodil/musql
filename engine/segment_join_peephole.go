@@ -351,6 +351,7 @@ func (l *segJoinLoop) nullLevels(in []Instruction, pc, end, o int) bool {
 		return false
 	}
 	l.nullBodies = append(l.nullBodies, c.nullBodies...)
+	l.ifEmpty = append(l.ifEmpty, c.ifEmpty...) // checked against the loop's end
 	return true
 }
 
@@ -386,6 +387,15 @@ func (l *segJoinLoop) chain(in []Instruction, pc, lo int) (int, bool) {
 			}
 		}
 		pc++
+		// An empty inner level can end the whole loop instead: "Goto past;
+		// IfEmpty level -> the end", its Rewind going to the IfEmpty. No row
+		// joins either way.
+		if i > 0 && l.outers>>i&1 == 0 && pc+1 < len(in) && in[pc].Op == OpGoto && in[pc].P2 == pc+2 &&
+			in[pc+1].Op == OpIfEmpty && in[pc+1].P1 == l.cursors[i] && in[l.rewinds[i]].P2 == pc+1 {
+			l.ifEmpty = append(l.ifEmpty, pc+1)
+			pc += 2
+			continue
+		}
 		// An empty level goes on as its last row does.
 		if in[l.rewinds[i]].P2 != pc {
 			return 0, false
@@ -544,11 +554,6 @@ func segJoinGroupPeephole(prog *Program) bool {
 		return false
 	}
 	loads, copies, writer, seqReg, rec, mk := b.loads, b.copies, b.writer, b.seqReg, b.rec, b.mk
-	// The drain runs the body's copy for each group's first row, after the
-	// walk computed it: a volatile call there would run twice.
-	if slices.ContainsFunc(copies, segJoinVolatileInsn) {
-		return false
-	}
 	hand := in[pc]
 	closeAt, _, ok := l.tail(in, pc+1)
 	if !ok {
@@ -828,6 +833,18 @@ func segJoinGroupPeephole(prog *Program) bool {
 		}
 		jp.drainCalls = true
 	}
+	// A volatile call in the body's copy, run for each group's first row:
+	// the walk made it, in the scan's order, as the loop's body does, so the
+	// copy reads what it got -- which a call the drain also makes would
+	// make out of order.
+	if slices.ContainsFunc(copies, segJoinVolatileInsn) {
+		if jp.drainCalls {
+			return false
+		}
+		if copies, ok = segJoinKeptCalls(copies, b.copyAt, jp, args); !ok {
+			return false
+		}
+	}
 	guard := len(out)
 	out[l.head] = Instruction{Op: OpGoto, P2: guard}
 	// guard: the kernel, or the loop as it was.
@@ -1017,6 +1034,34 @@ func (tr *segJoinTrace) expr(deps []int, out int) *segJoinExpr {
 func segJoinVolatileInsn(in Instruction) bool {
 	name, ok := in.P4.(string)
 	return in.Op == OpFunction && ok && nonConstantFuncs[r33sFoldIdent(name)]
+}
+
+// segJoinRandomInsn reports whether in is a call of the built-in random():
+// no row's answer can tell when or how often it was made.
+func segJoinRandomInsn(in Instruction) bool {
+	name, ok := in.P4.(string)
+	return in.Op == OpFunction && ok && in.P2 == 0 && r33sFoldIdent(name) == "random" && udfs["random"] == nil
+}
+
+// segJoinKeptCalls is copies, run for one candidate or group row at a time
+// after the walk, with each volatile call (at its address in copyAt) made
+// to read the value the walk kept for that call on that row
+// (OpSegJoinVolatile). The walk makes every call of kept, in the loop's
+// order; random() alone may be called afresh when it made none.
+func segJoinKeptCalls(copies []Instruction, copyAt []int, jp *segJoinPlan, kept []segJoinArg) ([]Instruction, bool) {
+	out := slices.Clone(copies)
+	for i, ins := range copies {
+		if !segJoinVolatileInsn(ins) {
+			continue
+		}
+		pc := copyAt[i]
+		made := slices.ContainsFunc(kept, func(a segJoinArg) bool { return a.expr != nil && slices.Contains(a.expr.pcs, pc) })
+		if !made && !segJoinRandomInsn(ins) {
+			return nil, false
+		}
+		out[i] = Instruction{Op: OpSegJoinVolatile, P4: &segJoinVolatileCall{plan: jp, pc: pc, fn: ins}}
+	}
+	return out, true
 }
 
 // segJoinVolatileLevel is the level of e's value computed over level: a
@@ -1342,6 +1387,7 @@ type segJoinRowBody struct {
 	trace  *segJoinTrace
 	loads  []segJoinArg
 	copies []Instruction
+	copyAt []int // each copy's address in the program
 	writer map[int]segJoinArg
 	seqReg int
 	rec    int
@@ -1380,13 +1426,13 @@ func parseSegJoinRowBody(in []Instruction, pc, limit int, levelOf map[int]int) (
 			}
 			b.rec, b.mk = ins.P3, ins
 		case OpGosub, OpSorterInsert:
-			b.copies = append(b.copies, ins)
+			b.copies, b.copyAt = append(b.copies, ins), append(b.copyAt, pc)
 			if b.rec < 0 || b.seqReg < 0 {
 				return nil, 0, false
 			}
 			return b, pc, true
 		}
-		b.copies = append(b.copies, ins)
+		b.copies, b.copyAt = append(b.copies, ins), append(b.copyAt, pc)
 	}
 	return nil, 0, false
 }
@@ -1619,11 +1665,7 @@ func segJoinTopPeephole(prog *Program) bool {
 		return false
 	}
 	writer, loads, copies, mk, check, pc := b.writer, b.loads, b.copies, b.mk, b.check, b.end
-	// The body's copy runs once per candidate after a walk that already
-	// computed the key: a volatile call would run again.
-	if slices.ContainsFunc(copies, segJoinVolatileInsn) {
-		return false
-	}
+
 	closeAt, _, ok := l.tail(in, pc+1)
 	if !ok || copies[check].P2 != pc+1 || copies[check].P3 != mk.P1 || mk.P2 < ki.nKey {
 		return false // the check skips to the innermost Next, over the key
@@ -1657,6 +1699,20 @@ func segJoinTopPeephole(prog *Program) bool {
 	}
 	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, agg: nil, orders: l.orders,
 		loads: loads, order: order, keys: ki}
+	// The record's volatile values: the loop computes them on every joined
+	// row, so the walk does, and the copy reads what it got.
+	for r := mk.P1; r < mk.P1+mk.P2; r++ {
+		if a := writer[r]; a.expr != nil && a.expr.volatile {
+			a.reg = r
+			jp.volatiles = append(jp.volatiles, a)
+		}
+	}
+	if slices.ContainsFunc(copies, segJoinVolatileInsn) {
+		var ok bool
+		if copies, ok = segJoinKeptCalls(copies, b.copyAt, jp, jp.volatiles); !ok {
+			return false
+		}
+	}
 	out := append([]Instruction(nil), in...)
 	guard := len(out)
 	out[l.head] = Instruction{Op: OpGoto, P2: guard}
@@ -1808,6 +1864,7 @@ type segJoinTopBody struct {
 	writer map[int]segJoinArg
 	loads  []segJoinArg
 	copies []Instruction
+	copyAt []int // each copy's address in the program
 	mk     Instruction
 	check  int
 	end    int
@@ -1842,7 +1899,7 @@ body:
 			if b.mk.Op != OpMakeRecord || ins.P1 != sorter || ins.P2 != b.mk.P3 {
 				return b, false
 			}
-			b.copies = append(b.copies, ins)
+			b.copies, b.copyAt = append(b.copies, ins), append(b.copyAt, pc)
 			break body
 		default:
 			// An expression the record holds: the body's copy computes it
@@ -1851,7 +1908,7 @@ body:
 				return b, false
 			}
 		}
-		b.copies = append(b.copies, ins)
+		b.copies, b.copyAt = append(b.copies, ins), append(b.copyAt, pc)
 	}
 	if pc >= limit || b.check < 0 {
 		return b, false
@@ -1892,6 +1949,12 @@ func segJoinSafeRun(in []Instruction, from, to int, levelOf map[int]int, maxLv, 
 			OpNegative, OpBitNot, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight:
 		case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull, OpGoto:
 			if segJoinIsJump(ins) && (ins.P2 <= j || ins.P2 > to) {
+				return false
+			}
+		case OpFunction:
+			// random() raises nothing, and its values are a joined row's
+			// own whenever and however often it is called.
+			if !segJoinRandomInsn(ins) {
 				return false
 			}
 		default:

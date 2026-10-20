@@ -63,6 +63,9 @@ type segJoinPlan struct {
 	// for none.
 	crosses [][]*segJoinExpr
 	tags    []*segJoinTags
+	// volatiles is a top-k record's volatile values, which the walk computes
+	// on every joined row, in the loop's order, for the body's copy to read.
+	volatiles []segJoinArg
 	// drainCalls: the volatile calls are a GROUP BY drain's, made in its
 	// order -- each group's first row by the drain itself, the others by
 	// the kernel's rest after it, row by row (fullStep) -- not the scan's.
@@ -983,6 +986,20 @@ func segJoinCallKey(pc int, at []int32) string {
 		key = binary.LittleEndian.AppendUint32(key, uint32(r))
 	}
 	return string(key)
+}
+
+// segJoinVolatileCall is OpSegJoinVolatile's: the call it stands for, at
+// address pc, in plan's body copy.
+type segJoinVolatileCall struct {
+	plan *segJoinPlan
+	pc   int
+	fn   Instruction
+}
+
+// called is the value the walk's call at address pc got on joined row at.
+func (w *segJoinWalk) called(pc int, at []int32) (Value, bool) {
+	v, ok := w.calls[segJoinCallKey(pc, at)]
+	return v, ok
 }
 
 // keep reports whether the joined row at, through level i, passes level i's
@@ -2462,7 +2479,18 @@ func (m *vdbe) segJoinTopOf(plan *segJoinPlan) (gs *segJoinGroups, ok bool) {
 			return nil, false
 		}
 	}
-	if gs, ok := segJoinTopNumeric(w, plan); ok {
+	if len(plan.volatiles) > 0 {
+		// A walk over every joined row first, making each volatile call in
+		// the loop's order; the walks after read what they got.
+		vol := (&segJoinPlan{args: plan.volatiles}).argsInCallOrder()
+		at := make([]int32, len(plan.cursors))
+		w.each(at, func() bool {
+			for _, a := range vol {
+				w.value(a, at)
+			}
+			return true
+		})
+	} else if gs, ok := segJoinTopNumeric(w, plan); ok {
 		return gs, true
 	}
 	cmpKeys := &vdbeSorter{keyInfo: *ki, enc: m.encoding()}

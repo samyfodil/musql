@@ -430,6 +430,13 @@ const (
 	// number is rr[P1][P2]. Nothing when OpSegJoinGroups did not serve.
 	// P4(*segJoinPlan).
 	OpSegJoinRest
+	// OpSegJoinVolatile is a volatile call (random()) in the body's copy the
+	// join kernel runs for a candidate or group row (OpSegJoinNext's last):
+	// it reads the value the kernel's walk got from that call on that row,
+	// so the call is made once per joined row, in the loop's order. With none
+	// kept -- random() only -- or the kernel not serving, it makes the call.
+	// P4(*segJoinVolatileCall).
+	OpSegJoinVolatile
 	// OpSegJoinHash fills a hashed GROUP BY's buckets over a join from the
 	// column blocks. P2: jump target (the Closes before the drain), taken only
 	// when it serves. P4(*segJoinPlan).
