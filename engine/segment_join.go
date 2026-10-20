@@ -1384,6 +1384,11 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 		if c >= len(m.cursors) {
 			return nil, false
 		}
+		// A level the loop seeks by an index once visits only the key's rows;
+		// the kernel would read the whole table.
+		if cur := m.cursors[c]; cur != nil && cur.idxSeekConfigured && !cur.seekReseek {
+			return nil, false
+		}
 		t, ok := segJoinTableOf(m.cursors[c])
 		if !ok {
 			return nil, false
