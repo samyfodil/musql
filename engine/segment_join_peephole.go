@@ -315,7 +315,7 @@ func segJoinPeephole(prog *Program) bool {
 	}
 	step := in[pc]
 	plan, ok := step.P4.(*aggPlan)
-	if !ok || step.P3 != 0 || plan == nil || !plan.rowFree || plan.anchorCheck != nil ||
+	if !ok || step.P3 != 0 || plan == nil || plan.anchorCheck != nil ||
 		len(plan.orderPlans) != 0 || !aggPlanReadsOnlyLoweredColsExceptOrder(plan) {
 		return false
 	}
@@ -658,6 +658,23 @@ func segJoinStepArgs(plan *aggPlan, src map[int]segJoinArg) ([]segJoinArg, bool)
 	})
 }
 
+// segJoinStepRegs is every register aggregate it's step reads: its
+// argument, separator and FILTER, and its own ORDER BY's keys.
+func segJoinStepRegs(it *aggItem) []int {
+	var regs []int
+	for _, which := range []int{aggExprArg, aggExprSep, aggExprFilter} {
+		if r := it.rowRegs[which] - 1; r >= 0 {
+			regs = append(regs, r)
+		}
+	}
+	for _, r := range it.obRegs {
+		if r > 0 {
+			regs = append(regs, r-1)
+		}
+	}
+	return regs
+}
+
 // segJoinAggArgs is the source of every register the aggregates step from --
 // each one's argument and, for group_concat and its kin, separator -- found
 // by lookup, each register once.
@@ -665,14 +682,18 @@ func segJoinAggArgs(plan *aggPlan, lookup func(reg int) (segJoinArg, bool)) ([]s
 	var args []segJoinArg
 	seen := map[int]bool{}
 	for _, it := range aggPlanTemplates(plan) {
-		for _, which := range []int{aggExprArg, aggExprSep} {
-			reg := it.rowRegs[which] - 1
-			if reg < 0 || seen[reg] {
-				continue
-			}
+		for _, reg := range segJoinStepRegs(it) {
 			a, ok := lookup(reg)
 			if !ok {
 				return nil, false
+			}
+			// A value written under a truth is read only by the aggregate
+			// whose FILTER is that truth, which reads it under it.
+			if a.guard != 0 && (it.filter == nil || it.rowRegs[aggExprFilter] != a.guard || reg == a.guard-1) {
+				return nil, false
+			}
+			if seen[reg] {
+				continue
 			}
 			a.reg = reg
 			args = append(args, a)
@@ -938,10 +959,21 @@ func (tr *segJoinTrace) region(pc, limit int) (int, bool) {
 	}
 	slices.Sort(deps)
 	deps = slices.Compact(deps)
+	// A run that is "if not G, skip to the end" over the rest: what the rest
+	// writes on every path is written exactly when G is true.
+	guard := 0
+	if first := tr.in[pc]; first.Op == OpIfNot && first.P2 == end && first.P3 != 0 {
+		guard = first.P1 + 1
+	}
 	for _, o := range outs {
 		if slices.Contains(partial, o) {
-			delete(tr.src, o)
-			delete(tr.deps, o)
+			if guard == 0 || !tr.writtenOnEveryPath(pc+1, end, o) {
+				delete(tr.src, o)
+				delete(tr.deps, o)
+				continue
+			}
+			tr.src[o] = segJoinArg{reg: o, level: level, expr: tr.expr(deps, o), guard: guard}
+			tr.deps[o] = deps
 			continue
 		}
 		tr.src[o] = segJoinArg{reg: o, level: level, expr: tr.expr(deps, o)}

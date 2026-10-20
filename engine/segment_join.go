@@ -78,6 +78,11 @@ type segJoinEdge struct {
 type segJoinArg struct {
 	reg, level, col int
 	expr            *segJoinExpr
+	// guard, when set, is the register (+1) whose truth the value is
+	// written under: on a row where it is not true the register keeps
+	// another row's value, so only a reader that reads it under the same
+	// truth -- an aggregate whose FILTER that register is -- may use it.
+	guard int
 }
 
 // segJoinExpr is the body instructions that compute register out, in the
@@ -1302,24 +1307,21 @@ func segJoinArgsOf(plan *segJoinPlan, w *segJoinWalk) (*segJoinArgs, bool) {
 	}
 	orderMatters := args.floats
 	for _, it := range aggPlanTemplates(plan.agg) {
-		// A FILTER, and an aggregate's own ORDER BY, read registers the trace
-		// does not follow.
-		if it.filter != nil || it.orderBy != nil || it.stepSeg != plan.seg {
+		if it.stepSeg != plan.seg {
 			return nil, false
 		}
-		if it.kind == aggCountStar {
-			continue
-		}
-		for _, which := range []int{aggExprArg, aggExprSep} {
-			if r := it.rowRegs[which] - 1; r >= 0 {
-				if _, ok := args.argOf[r]; !ok {
-					return nil, false
-				}
+		for _, r := range segJoinStepRegs(it) {
+			if _, ok := args.argOf[r]; !ok {
+				return nil, false
 			}
+		}
+		if it.kind == aggCountStar && it.filter == nil {
+			continue
 		}
 		if args.replays(it) {
 			args.keep = true
-			orderMatters = orderMatters || it.orderSensitive()
+			// An aggregate's own ORDER BY keeps equal keys in arrival order.
+			orderMatters = orderMatters || it.orderSensitive() || it.orderBy != nil
 		} else if it.distinct {
 			args.distinct = append(args.distinct, args.argOf[it.rowRegs[aggExprArg]-1])
 		}
@@ -1342,8 +1344,12 @@ func segJoinArgsOf(plan *segJoinPlan, w *segJoinWalk) (*segJoinArgs, bool) {
 // kind but count, sum, total, avg, min and max, and those over arguments the
 // sums do not model -- not INTEGER or REAL throughout, a DISTINCT over REALs,
 // a min or max over REALs or one whose ties go to the last -- or order-strict
-// beyond what a sum's window shows.
+// beyond what a sum's window shows; and any with a FILTER or an ORDER BY of
+// its own.
 func (args *segJoinArgs) replays(it *aggItem) bool {
+	if it.filter != nil || it.orderBy != nil {
+		return true // the step decides per row, or buffers the rows
+	}
 	switch it.kind {
 	case aggCountStar:
 		return false
@@ -1554,10 +1560,8 @@ func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) error {
 				skipped = true // the row already stepped
 				continue
 			}
-			for _, which := range []int{aggExprArg, aggExprSep} {
-				if reg := it.rowRegs[which] - 1; reg >= 0 {
-					window[reg] = gs.w.value(gs.plan.args[args.argOf[reg]], at)
-				}
+			for _, reg := range segJoinStepRegs(it) {
+				window[reg] = gs.w.value(gs.plan.args[args.argOf[reg]], at)
 			}
 			if err := it.step(ctx, window); err != nil && replayErr == nil {
 				replayErr = err
@@ -1742,9 +1746,8 @@ func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) error {
 // having changed nothing. An error is the step's own, which the loop would
 // have met.
 func (m *vdbe) segJoinAggregate(plan *segJoinPlan) (bool, error) {
-	if !plan.agg.rowFree {
-		return false, nil
-	}
+	// Nothing reads the row the step is handed (the recogniser checked:
+	// aggPlanReadsOnlyLoweredColsExceptOrder), so it is a NULL one.
 	gs, ok := m.segJoinGroupsOf(plan)
 	if !ok {
 		return false, nil
