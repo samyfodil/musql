@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"cmp"
 	"fmt"
 	"math"
 	"math/bits"
@@ -38,9 +39,10 @@ func SegJoinHitsForTest() int64 { return segJoinHits.Swap(0) }
 // levels and the columns they read, as the recogniser traced them out of the
 // program.
 type segJoinPlan struct {
-	cursors []int         // per level, outermost first
-	edges   []segJoinEdge // the equalities joining the levels
-	args    []segJoinArg  // the aggregate argument registers and their columns
+	cursors []int           // per level, outermost first
+	edges   []segJoinEdge   // the equalities joining the levels
+	preds   [][]segPlanPred // per level, its own WHERE terms
+	args    []segJoinArg    // the aggregate argument registers and their columns
 	agg     *aggPlan
 	seg     int // the AggStep segment selector (OpAggStep's P2)
 
@@ -610,6 +612,9 @@ type segJoinWalk struct {
 	order  []int     // the levels, each after its parent
 	parent []int     // the level a level is looked up from, -1 for the fact
 	slot   [][]int32 // slot[i][r]: level i's row joined to its parent's row r, or -1
+	// pass[i][r] is whether level i's row r satisfies the level's own WHERE
+	// terms; nil when it has none.
+	pass [][]bool
 }
 
 // openSegJoin opens plan's join, or reports false.
@@ -678,6 +683,19 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 			return nil, false // not connected to the fact
 		}
 	}
+	w.pass = make([][]bool, k)
+	for i, preds := range plan.preds {
+		if len(preds) == 0 {
+			continue
+		}
+		// The bounds, resolved now that the parameters are bound, through the
+		// comparison's affinity as the loop applies it.
+		resolved, ok := m.segPlanPreds(&segFilterPlan{preds: preds})
+		if !ok {
+			return nil, false
+		}
+		w.pass[i] = w.tabs[i].passing(preds, resolved)
+	}
 	for _, i := range w.order[1:] {
 		keys, ok := w.tabs[w.parent[i]].col(parentCol[i])
 		if !ok {
@@ -697,12 +715,16 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 // returning false stops the walk, and each reports whether it ran to the end.
 func (w *segJoinWalk) each(at []int32, fn func() bool) bool {
 	rest := w.order[1:]
+	pass := w.pass
 rows:
 	for f := range w.tabs[w.fact].n {
+		if p := pass[w.fact]; p != nil && !p[f] {
+			continue
+		}
 		at[w.fact] = int32(f)
 		for _, i := range rest {
 			r := w.slot[i][at[w.parent[i]]]
-			if r < 0 {
+			if r < 0 || pass[i] != nil && !pass[i][r] {
 				continue rows
 			}
 			at[i] = r
@@ -712,6 +734,39 @@ rows:
 		}
 	}
 	return true
+}
+
+// passing is, per row, whether it satisfies every one of preds, whose
+// bounds are resolved: the column's value through the comparison's affinity,
+// as the loop applies it to both sides, compared as the loop compares. A NULL
+// satisfies nothing.
+func (t *segJoinTable) passing(preds []segPlanPred, resolved []segPred) []bool {
+	pass := make([]bool, t.n)
+	for r := range pass {
+		pass[r] = true
+	}
+	for j, pr := range resolved {
+		aff := preds[j].Aff
+		if ints, ok := t.col(pr.Col); ok && pr.Val.Typ == Int && (aff == affNone || aff == affNumeric) {
+			for r, v := range ints {
+				if pass[r] {
+					pass[r] = pr.Op.satisfied(cmp.Compare(v, pr.Val.I))
+				}
+			}
+			continue
+		}
+		for r := range pass {
+			if !pass[r] {
+				continue
+			}
+			v := t.value(int32(r), pr.Col)
+			if aff != affNone && !affinityIsIdentity(v.Typ, aff) {
+				v = applyAffinityToValue(v, aff)
+			}
+			pass[r] = v.Typ != Null && pr.Op.satisfied(compareValues(v, pr.Val))
+		}
+	}
+	return pass
 }
 
 // segJoinSums is what a group's rows add up to, per integer argument.

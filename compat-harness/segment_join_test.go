@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -50,10 +51,19 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT count(*), sum(al.year) FROM artists ar JOIN albums al ON al.artist_id = ar.id JOIN tracks t ON t.album_id = al.id`, true},
 		{`SELECT count(*), max(ar.id) FROM tracks t JOIN albums al ON al.id = t.album_id JOIN artists ar ON ar.id = al.artist_id`, true},
 		{`SELECT count(*) FROM albums al JOIN artists ar ON ar.id = al.artist_id`, true},
-		{`SELECT count(*), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE al.id > 1000`, false},
+		{`SELECT count(*), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE al.id > 1000`, true},
 		{`SELECT sum(t.rating) FROM albums al JOIN tracks t ON t.album_id = al.id`, true},
 		{`SELECT sum(b.v) FROM albums al JOIN big b ON b.album_id = al.id`, false},
-		{`SELECT count(*), sum(b.v) FROM big b JOIN albums al ON al.id = b.album_id WHERE b.id < 0`, false},
+		{`SELECT count(*), sum(b.v) FROM big b JOIN albums al ON al.id = b.album_id WHERE b.id < 0`, true},
+		// Each table's own WHERE terms filter its rows.
+		{`SELECT count(*), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.plays > 5000 AND al.year < 1977 AND t.seconds BETWEEN 120 AND 300`, false},
+		{`SELECT count(*), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.plays > 5000 AND al.year < 1977 AND t.seconds >= 120`, true},
+		{`SELECT count(*), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE al.year <> 1971`, true},
+		{`SELECT al.id, count(*), max(t.plays) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.plays >= ? GROUP BY al.id`, true},
+		{`SELECT ar.name, count(*) FROM artists ar JOIN albums al ON al.artist_id = ar.id JOIN tracks t ON t.album_id = al.id WHERE ar.name > 'a' AND t.rating < 2.5 AND al.year = '1975' GROUP BY ar.name`, true},
+		{`SELECT count(*) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.rating = 1 AND t.id % 3 = 0`, false},
+		{`SELECT count(*) FROM tags g JOIN tracks t ON t.album_id = g.id WHERE g.tag > 0 AND g.tag < 'S'`, true},
+		{`SELECT count(*) FROM tags g JOIN tracks t ON t.album_id = g.id WHERE g.ci = 'rock'`, false},
 		// GROUP BY: streamed when the groups arrive in scan order, sorted
 		// otherwise; bare columns read the group's first joined row.
 		{`SELECT al.id, count(*), sum(t.seconds), min(t.plays), max(t.plays) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
@@ -112,7 +122,11 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 	}
 	read := func(db *sql.DB, q string) (string, error) {
 		var out []any
-		rows, err := db.Query(q)
+		var args []any
+		if strings.Contains(q, "?") {
+			args = append(args, 40000)
+		}
+		rows, err := db.Query(q, args...)
 		if err != nil {
 			return "", err
 		}

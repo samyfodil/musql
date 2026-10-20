@@ -31,6 +31,9 @@ type segJoinLoop struct {
 	ifNots  map[int]int // each recheck's IfNot -> its level
 	ifEmpty []int
 	sorted  bool // an AutoIndexOrder reorders some level
+	// preds is each level's own WHERE terms, tested right after its Rewind:
+	// a column against a constant, which skip the level's row.
+	preds [][]segPlanPred
 	// head is the first instruction after the opens -- the prologue's, or the
 	// first Rewind -- where a guard goes, before anything reads a table.
 	head    int
@@ -43,6 +46,7 @@ type segJoinLoop struct {
 func parseSegJoinLoop(in []Instruction, open int) (*segJoinLoop, bool) {
 	l := &segJoinLoop{opened: map[int]bool{}, levelOf: map[int]int{}, ifNots: map[int]int{}}
 	pc := open
+	var ok bool
 	for pc < len(in) && in[pc].Op == OpOpenRead {
 		l.opened[in[pc].P1] = true
 		pc++
@@ -86,6 +90,33 @@ func parseSegJoinLoop(in []Instruction, open int) (*segJoinLoop, bool) {
 		return nil, false
 	}
 	pc++
+	// A level's own WHERE terms, right after its Rewind, each skipping to its
+	// Next.
+	levelPreds := func(pc, limit int) (int, bool) {
+		lv := len(l.cursors) - 1
+		cursor, rewind := l.cursors[lv], l.rewinds[lv]
+		next := -1
+		for i, ins := range in {
+			if ins.Op == OpNext && ins.P1 == cursor && ins.P2 == rewind+1 {
+				if next >= 0 {
+					return 0, false
+				}
+				next = i
+			}
+		}
+		if next < 0 {
+			return 0, false
+		}
+		preds, end, ok := segParsePredBlock(in, pc, limit, cursor, next)
+		if !ok {
+			return 0, false
+		}
+		l.preds = append(l.preds, preds)
+		return end, true
+	}
+	if pc, ok = levelPreds(pc, len(in)); !ok {
+		return nil, false
+	}
 	for len(l.cursors) < k {
 		if pc+2 < len(in) && in[pc].Op == OpColumn &&
 			(in[pc+1].Op == OpSeekRowidHint || in[pc+1].Op == OpSeekIndexHint) &&
@@ -99,6 +130,17 @@ func parseSegJoinLoop(in []Instruction, open int) (*segJoinLoop, bool) {
 			return nil, false
 		}
 		self := l.levelOf[in[pc].P1]
+		// The terms end where the join's recheck begins: two column reads
+		// and their equality, which would otherwise read as a term.
+		recheck := pc + 1
+		for recheck+3 < len(in) && !segJoinIsRecheck(in, recheck) {
+			recheck++
+		}
+		end, ok := levelPreds(pc+1, recheck)
+		if !ok || end != recheck || end+3 >= len(in) {
+			return nil, false
+		}
+		pc = end - 1 // so the recheck reads from pc+1
 		// The recheck: two column reads, their equality, and the skip.
 		ca, cb, eq, skip := in[pc+1], in[pc+2], in[pc+3], in[pc+4]
 		la, aCol, okA := segJoinColRead(ca, l.levelOf)
@@ -230,7 +272,7 @@ func segJoinPeephole(prog *Program) bool {
 
 	// The guard takes the place of the first instruction after the opens and
 	// runs it when it declines, so no address moves.
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, args: args, agg: plan, seg: step.P2, sorted: l.sorted}
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, args: args, agg: plan, seg: step.P2, sorted: l.sorted}
 	at := len(in)
 	out := append([]Instruction(nil), in...)
 	out[l.head] = Instruction{Op: OpGoto, P2: at}
@@ -507,7 +549,7 @@ body:
 	}
 	seqAt := fullOf(seqReg)
 
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, args: args, agg: plan, seg: step.P2,
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, args: args, agg: plan, seg: step.P2,
 		grouped: true, key: key, loads: loads, sorted: l.sorted}
 	out := append([]Instruction(nil), in...)
 	guard := len(out)
@@ -530,6 +572,13 @@ body:
 		Instruction{Op: OpGoto, P2: stepAt + 1})
 	prog.Insns = out
 	return true
+}
+
+// segJoinIsRecheck reports whether a join's recheck starts at pc: two column
+// reads and their equality's skip.
+func segJoinIsRecheck(in []Instruction, pc int) bool {
+	read := func(op OpCode) bool { return op == OpColumn || op == OpRowid }
+	return read(in[pc].Op) && read(in[pc+1].Op) && in[pc+2].Op == OpEq && in[pc+3].Op == OpIfNot
 }
 
 // segJoinColRead is the level and column an OpColumn or OpRowid reads, the
@@ -641,7 +690,7 @@ func segJoinHashPeephole(prog *Program) bool {
 	if !ok || after >= len(in) || in[after].Op != OpHashAggSort {
 		return false
 	}
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, args: args, agg: plan, seg: step.P2,
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, args: args, agg: plan, seg: step.P2,
 		grouped: true, key: key, sorted: l.sorted}
 	key.reg = keyReg
 	jp.key = key
