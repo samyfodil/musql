@@ -56,14 +56,20 @@ type segJoinPlan struct {
 	grouped bool
 	key     segJoinArg
 	loads   []segJoinArg
-	// sorted: some level visits its rows in an index's order, not rowid
-	// order, so the loop's order is not one the kernel knows.
-	sorted bool
+	// orders is the loop's AutoIndexOrders: a level visiting its rows in an
+	// index's order rather than rowid order.
+	orders []segJoinOrder
 
 	// An ORDER BY ... LIMIT's: the columns of its sort key, and the bounded
 	// sorter's key (sorterKeyInfo.bound rows kept).
 	order []segJoinArg
 	keys  *sorterKeyInfo
+}
+
+// segJoinOrder is an AutoIndexOrder: cursor's rows visited in key's order.
+type segJoinOrder struct {
+	cursor int
+	key    *autoIndexKey
 }
 
 // segJoinEdge is "level a's column aCol = level b's column bCol", a column of
@@ -797,6 +803,29 @@ type segJoinWalk struct {
 
 	m     *vdbe
 	exprs map[*segJoinExpr][]Value // each expression's value per row
+
+	// order0 is the first level's rows in the order the loop visits them,
+	// and rank0 each row's place in it; nil for rowid order.
+	order0 []int32
+	rank0  []int32
+}
+
+// before reports whether joined row a comes before b in the loop's order:
+// the first level's row by its place in the loop's visit, and each later
+// level's in rowid order, which is its order in its table.
+func (w *segJoinWalk) before(a, b []int32) bool {
+	if a[0] != b[0] {
+		if w.rank0 != nil {
+			return w.rank0[a[0]] < w.rank0[b[0]]
+		}
+		return a[0] < b[0]
+	}
+	for i := 1; i < len(a); i++ {
+		if a[i] != b[i] {
+			return a[i] < b[i]
+		}
+	}
+	return false
 }
 
 // segJoinLink is how a level's rows are found from an earlier level's
@@ -1018,6 +1047,35 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 		}
 		w.tabs[i] = t
 	}
+	// The index orders the loop applies -- as OpAutoIndexOrder does: not to a
+	// cursor it streams or re-seeks -- the first level's by the same sort,
+	// over the same values.
+	for _, o := range plan.orders {
+		lv := slices.Index(plan.cursors, o.cursor)
+		cur := m.cursors[o.cursor]
+		if lv < 0 || cur == nil || cur.rowStore == nil && (cursorHasNoBtree(cur) || cur.streamable || cur.seekReseek) {
+			continue
+		}
+		if lv != 0 {
+			// A later level's rows in an index's order: the walk visits them
+			// in rowid order, so its order is not the loop's.
+			return nil, false
+		}
+		key := o.key
+		if key.multiOr != nil || key.exprs != nil || len(key.cols) == 0 || len(key.colls) < len(key.cols) {
+			return nil, false
+		}
+		t := w.tabs[0]
+		perm := make([]int, t.n)
+		for i := range perm {
+			perm[i] = i
+		}
+		autoIndexSortValues(perm, key, func(i, k int) Value { return t.value(int32(i), key.cols[k]) }, m.encoding())
+		w.order0, w.rank0 = make([]int32, t.n), make([]int32, t.n)
+		for i, r := range perm {
+			w.order0[i], w.rank0[r] = int32(r), int32(i)
+		}
+	}
 	// A LEFT JOIN's optional level is the innermost: a NULL row reaches no
 	// level after it.
 	if o := plan.optional; o >= 0 && o != k-1 {
@@ -1132,11 +1190,15 @@ func (w *segJoinWalk) each(at []int32, fn func() bool) bool {
 		// Every later level found by a rowid: at most one row each, so the
 		// nest is a pass over the first level's rows.
 	rows:
-		for r := range w.tabs[0].n {
+		for j := range w.tabs[0].n {
+			r := int32(j)
+			if w.order0 != nil {
+				r = w.order0[j]
+			}
 			if p := w.pass[0]; p != nil && !p[r] {
 				continue
 			}
-			at[0] = int32(r)
+			at[0] = r
 			for i := 1; i < k; i++ {
 				l := &w.link[i]
 				found := int32(-1)
@@ -1164,9 +1226,13 @@ func (w *segJoinWalk) each(at []int32, fn func() bool) bool {
 		}
 		pass := w.pass[i]
 		if i == 0 {
-			for r := range w.tabs[0].n {
+			for j := range w.tabs[0].n {
+				r := int32(j)
+				if w.order0 != nil {
+					r = w.order0[j]
+				}
 				if pass == nil || pass[r] {
-					at[0] = int32(r)
+					at[0] = r
 					if !visit(1) {
 						return false
 					}
@@ -1331,7 +1397,6 @@ func segJoinArgsOf(plan *segJoinPlan, w *segJoinWalk) (*segJoinArgs, bool) {
 		// Otherwise its values are read one at a time, by an aggregate that
 		// replays its rows.
 	}
-	orderMatters := args.floats
 	for _, it := range aggPlanTemplates(plan.agg) {
 		if it.stepSeg != plan.seg {
 			return nil, false
@@ -1346,14 +1411,9 @@ func segJoinArgsOf(plan *segJoinPlan, w *segJoinWalk) (*segJoinArgs, bool) {
 		}
 		if args.replays(it) {
 			args.keep = true
-			// An aggregate's own ORDER BY keeps equal keys in arrival order.
-			orderMatters = orderMatters || it.orderSensitive() || it.orderBy != nil
 		} else if it.distinct {
 			args.distinct = append(args.distinct, args.argOf[it.rowRegs[aggExprArg]-1])
 		}
-	}
-	if orderMatters && plan.sorted {
-		return nil, false // the rows replay in the loop's order, unknown here
 	}
 	args.keep = args.keep || args.floats
 	// A DISTINCT over integers needs only which of its level's rows took
@@ -1420,18 +1480,6 @@ type segJoinGroup struct {
 	// rows some joined row of the group held: kept instead of rows by a
 	// whole-join aggregate.
 	took [][]bool
-}
-
-// loopBefore reports whether joined row a comes before b in the loop's order:
-// the outermost level's row first, each level visiting its rows in rowid
-// order, which is their order in its table.
-func loopBefore(a, b []int32) bool {
-	for i := range a {
-		if a[i] != b[i] {
-			return a[i] < b[i]
-		}
-	}
-	return false
 }
 
 // segJoinGroupsOf builds plan's groups, or reports false. A plan with no
@@ -1510,11 +1558,11 @@ func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (*segJoinGroups, bool) {
 			// The replay is in the order rows arrive here, which must be the
 			// loop's, so the first row is the first one kept.
 			g := &groups[gi]
-			if !loopBefore(g.rows[len(g.rows)-k:], at) {
+			if !w.before(g.rows[len(g.rows)-k:], at) {
 				return false
 			}
 		default:
-			if g := &groups[gi]; loopBefore(at, g.first) {
+			if g := &groups[gi]; w.before(at, g.first) {
 				copy(g.first, at)
 			}
 		}
@@ -1540,7 +1588,7 @@ func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (*segJoinGroups, bool) {
 	}) {
 		return nil, false
 	}
-	sort.Slice(groups, func(i, j int) bool { return loopBefore(groups[i].first, groups[j].first) })
+	sort.Slice(groups, func(i, j int) bool { return w.before(groups[i].first, groups[j].first) })
 	return &segJoinGroups{w: w, plan: plan, groups: groups, args: args}, true
 }
 
@@ -1868,7 +1916,7 @@ func (gs *segJoinGroups) gather(g *segJoinGroup, row, rowids []Value) bool {
 // order is the loop's. Each is a group of one row, which OpSegJoinNext loads.
 func (m *vdbe) segJoinTopOf(plan *segJoinPlan) (*segJoinGroups, bool) {
 	ki := plan.keys
-	if ki == nil || ki.bound <= 0 || ki.nKey != len(plan.order) || plan.sorted || plan.optional >= 0 {
+	if ki == nil || ki.bound <= 0 || ki.nKey != len(plan.order) || plan.optional >= 0 {
 		return nil, false
 	}
 	w, ok := m.openSegJoin(plan)
@@ -1941,7 +1989,7 @@ func (m *vdbe) segJoinTopOf(plan *segJoinPlan) (*segJoinGroups, bool) {
 		}
 		return true
 	})
-	sort.Slice(gs.groups, func(i, j int) bool { return loopBefore(gs.groups[i].first, gs.groups[j].first) })
+	sort.Slice(gs.groups, func(i, j int) bool { return w.before(gs.groups[i].first, gs.groups[j].first) })
 	return gs, true
 }
 
@@ -2019,6 +2067,6 @@ func segJoinTopNumeric(w *segJoinWalk, plan *segJoinPlan) (*segJoinGroups, bool)
 			gs.groups = append(gs.groups, segJoinGroup{first: rows[i*k : i*k+k : i*k+k]})
 		}
 	}
-	sort.Slice(gs.groups, func(i, j int) bool { return loopBefore(gs.groups[i].first, gs.groups[j].first) })
+	sort.Slice(gs.groups, func(i, j int) bool { return w.before(gs.groups[i].first, gs.groups[j].first) })
 	return gs, true
 }

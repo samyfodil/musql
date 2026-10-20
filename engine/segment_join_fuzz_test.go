@@ -45,6 +45,14 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 	if r.Intn(2) == 0 {
 		setup = append(setup, `CREATE INDEX d2_d1 ON d2(d1_id)`)
 	}
+	// An index the outer level can be scanned by, so the loop visits it in
+	// the index's order rather than by rowid.
+	switch r.Intn(3) {
+	case 0:
+		setup = append(setup, `CREATE INDEX d2_x ON d2(x)`)
+	case 1:
+		setup = append(setup, `CREATE INDEX d2_x ON d2(x DESC, y)`)
+	}
 	id := func(i int) int {
 		switch r.Intn(10) {
 		case 0:
@@ -135,7 +143,7 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 		"WHERE f.s LIKE 'b%'", "WHERE abs(f.v) > 3 AND length(f.s) = 1", "WHERE d2.y", "WHERE f.v + d2.x > 4", "WHERE coalesce(f.w, 1) > 0",
 		"WHERE f.v > 50 OR f.s = 'a'", "WHERE CASE WHEN f.w > 0 THEN 1 END",
 		"WHERE f.v IN (1, 2, 3, 40)", "WHERE d2.x IN (1, 2) AND f.s IN ('a', 'b')", "WHERE f.v NOT IN (1, 2, NULL)",
-		"WHERE f.v IN (5, NULL)", "WHERE f.s NOT IN ('B', '')"}
+		"WHERE f.v IN (5, NULL)", "WHERE f.s NOT IN ('B', '')", "WHERE d2.x > 1", "WHERE d2.x BETWEEN 0 AND 5 AND f.v > 0"}
 	for range 50 {
 		join := joins[r.Intn(len(joins))]
 		hasD1 := strings.Contains(join, "d1 ")

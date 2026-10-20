@@ -34,7 +34,7 @@ type segJoinLoop struct {
 	edges   []segJoinEdge
 	ifNots  map[int]int // each recheck's IfNot -> its level
 	ifEmpty []int
-	sorted  bool // an AutoIndexOrder reorders some level
+	orders  []segJoinOrder
 	// preds is each level's own WHERE terms, tested right after its Rewind:
 	// a column against a constant, which skip the level's row. filters are
 	// the level's other terms: an expression over its columns (a LIKE, a
@@ -80,7 +80,11 @@ func parseSegJoinLoop(in []Instruction, open int) (*segJoinLoop, bool) {
 		if in[pc].Op == OpIfEmpty {
 			l.ifEmpty = append(l.ifEmpty, pc)
 		} else {
-			l.sorted = true
+			key, ok := in[pc].P4.(*autoIndexKey)
+			if !ok {
+				return nil, false
+			}
+			l.orders = append(l.orders, segJoinOrder{cursor: in[pc].P1, key: key})
 		}
 		pc++
 	}
@@ -371,7 +375,7 @@ func segJoinPeephole(prog *Program) bool {
 
 	// The guard takes the place of the first instruction after the opens and
 	// runs it when it declines, so no address moves.
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outer, args: args, agg: plan, seg: step.P2, sorted: l.sorted}
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outer, args: args, agg: plan, seg: step.P2, orders: l.orders}
 	at := len(in)
 	out := append([]Instruction(nil), in...)
 	out[l.head] = Instruction{Op: OpGoto, P2: at}
@@ -454,14 +458,6 @@ func segJoinGroupPeephole(prog *Program) bool {
 	}
 	// A min()/max() picks the row a bare column reads; the first row is not it.
 	if plan.magnet != nil && len(plan.magnet.sites) > 0 && !aggPlanReadsOnlyLoweredColsExceptOrder(plan) {
-		return false
-	}
-
-	// A level visited in an index's order makes another row the group's
-	// first. That shows only where something reads it -- a bare column, a
-	// subquery over the group's row -- or the order of the groups themselves,
-	// which a streamed drain emits as they come and a sorted one sorts.
-	if l.sorted && (hand.Op == OpGosub || !aggPlanReadsOnlyLoweredColsExceptOrder(plan)) {
 		return false
 	}
 
@@ -647,7 +643,7 @@ func segJoinGroupPeephole(prog *Program) bool {
 	seqAt := fullOf(seqReg)
 
 	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outer, args: args, agg: plan, seg: step.P2,
-		grouped: true, key: key, loads: loads, sorted: l.sorted}
+		grouped: true, key: key, loads: loads, orders: l.orders}
 	out := append([]Instruction(nil), in...)
 	guard := len(out)
 	out[l.head] = Instruction{Op: OpGoto, P2: guard}
@@ -1313,7 +1309,7 @@ func segJoinHashPeephole(prog *Program) bool {
 		}
 	}
 	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outer, args: args, agg: plan, seg: step.P2,
-		grouped: true, key: key, sorted: l.sorted}
+		grouped: true, key: key, orders: l.orders}
 	key.reg = keyReg
 	jp.key = key
 	out := append([]Instruction(nil), in...)
@@ -1348,7 +1344,7 @@ func segJoinTopPeephole(prog *Program) bool {
 	}
 	open := 2
 	l, ok := parseSegJoinLoop(in, open)
-	if !ok || l.outer >= 0 || l.sorted {
+	if !ok || l.outer >= 0 {
 		return false
 	}
 	tr := newSegJoinTrace(in, l.levelOf)
@@ -1411,7 +1407,7 @@ body:
 			order = append(order, a)
 		}
 	}
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outer, agg: nil,
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, optional: l.outer, agg: nil, orders: l.orders,
 		loads: loads, order: order, keys: ki}
 	out := append([]Instruction(nil), in...)
 	guard := len(out)
