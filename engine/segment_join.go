@@ -1076,11 +1076,6 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 			w.order0[i], w.rank0[r] = int32(r), int32(i)
 		}
 	}
-	// A LEFT JOIN's optional level is the innermost: a NULL row reaches no
-	// level after it.
-	if o := plan.optional; o >= 0 && o != k-1 {
-		return nil, false
-	}
 	w.pass = make([][]bool, k)
 	for i, preds := range plan.preds {
 		if len(preds) == 0 {

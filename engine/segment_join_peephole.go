@@ -92,167 +92,249 @@ func parseSegJoinLoop(in []Instruction, open int) (*segJoinLoop, bool) {
 		return nil, false
 	}
 	l.rewind0 = pc
-	add := func(cursor, rewind int) bool {
-		if !l.opened[cursor] {
-			return false
-		}
-		if _, dup := l.levelOf[cursor]; dup {
-			return false
-		}
-		l.levelOf[cursor] = len(l.cursors)
-		l.cursors = append(l.cursors, cursor)
-		l.rewinds = append(l.rewinds, rewind)
-		return true
-	}
-	if !add(in[pc].P1, pc) {
+	if !l.add(in[pc].P1, pc) {
 		return nil, false
 	}
 	pc++
-	// A level's own WHERE terms, right after its Rewind, each skipping to its
-	// Next.
-	levelPreds := func(pc, limit int) (int, bool) {
-		lv := len(l.cursors) - 1
-		cursor, rewind := l.cursors[lv], l.rewinds[lv]
-		next := -1
-		for i, ins := range in {
-			if ins.Op == OpNext && ins.P1 == cursor && ins.P2 == rewind+1 {
-				if next >= 0 {
-					return 0, false
-				}
-				next = i
-			}
-		}
-		if next < 0 {
-			return 0, false
-		}
-		var preds []segPlanPred
-		var filters []segJoinArg
-		for {
-			more, end, ok := segParsePredBlock(in, pc, limit, cursor, next)
-			if !ok {
-				return 0, false
-			}
-			preds, pc = append(preds, more...), end
-			f, end, ok := segJoinFilter(in, pc, limit, lv, l.levelOf, next)
-			if !ok {
-				break
-			}
-			filters, pc = append(filters, f), end
-		}
-		l.preds = append(l.preds, preds)
-		l.filters = append(l.filters, filters)
-		return pc, true
-	}
-	if pc, ok = levelPreds(pc, len(in)); !ok {
+	if pc, ok = l.levelPreds(in, pc, len(in)); !ok {
 		return nil, false
 	}
 	for len(l.cursors) < k {
-		// The seek's key and hint, before the Rewind (and a LEFT JOIN's flag).
-		rewindAt := pc + 2
-		if rewindAt+1 < len(in) && in[rewindAt].Op == OpInteger && in[rewindAt].P1 == 0 {
-			rewindAt++
-		}
-		if rewindAt < len(in) && in[pc].Op == OpColumn &&
-			(in[pc+1].Op == OpSeekRowidHint || in[pc+1].Op == OpSeekIndexHint) &&
-			in[pc+1].P2 == in[pc].P3 && in[pc+1].P3 == 1 && in[rewindAt].Op == OpRewind && in[rewindAt].P1 == in[pc+1].P1 {
-			if _, ok := l.levelOf[in[pc].P1]; !ok {
-				return nil, false // the key comes from a level not entered yet
-			}
-			pc += 2
-		}
-		// A LEFT JOIN's level clears its match flag before its Rewind.
-		flag := -1
-		if pc+1 < len(in) && in[pc].Op == OpInteger && in[pc].P1 == 0 && in[pc+1].Op == OpRewind {
-			if len(l.cursors) != k-1 {
-				return nil, false // only the innermost level
-			}
-			flag = in[pc].P2
-			pc++
-		}
-		if pc+4 >= len(in) || in[pc].Op != OpRewind || !add(in[pc].P1, pc) {
+		if pc, ok = l.level(in, pc); !ok {
 			return nil, false
 		}
-		self := l.levelOf[in[pc].P1]
+	}
+	l.body = pc
+	return l, true
+}
+
+// add enters cursor, rewound at rewind, as the next level.
+func (l *segJoinLoop) add(cursor, rewind int) bool {
+	if !l.opened[cursor] {
+		return false
+	}
+	if _, dup := l.levelOf[cursor]; dup {
+		return false
+	}
+	l.levelOf[cursor] = len(l.cursors)
+	l.cursors = append(l.cursors, cursor)
+	l.rewinds = append(l.rewinds, rewind)
+	return true
+}
+
+// levelPreds reads the last level's own WHERE terms, right after its
+// Rewind, each skipping to its Next.
+func (l *segJoinLoop) levelPreds(in []Instruction, pc, limit int) (int, bool) {
+	lv := len(l.cursors) - 1
+	cursor, rewind := l.cursors[lv], l.rewinds[lv]
+	next := -1
+	for i, ins := range in {
+		if ins.Op == OpNext && ins.P1 == cursor && ins.P2 == rewind+1 {
+			if next >= 0 {
+				return 0, false
+			}
+			next = i
+		}
+	}
+	if next < 0 {
+		return 0, false
+	}
+	var preds []segPlanPred
+	var filters []segJoinArg
+	for {
+		more, end, ok := segParsePredBlock(in, pc, limit, cursor, next)
+		if !ok {
+			return 0, false
+		}
+		preds, pc = append(preds, more...), end
+		f, end, ok := segJoinFilter(in, pc, limit, lv, l.levelOf, next)
+		if !ok {
+			break
+		}
+		filters, pc = append(filters, f), end
+	}
+	l.preds = append(l.preds, preds)
+	l.filters = append(l.filters, filters)
+	return pc, true
+}
+
+// level reads the next level from pc: its seek, its Rewind, its recheck and
+// its own terms, and returns the address after them.
+func (l *segJoinLoop) level(in []Instruction, pc int) (int, bool) {
+	// The seek's key and hint, before the Rewind (and a LEFT JOIN's flag).
+	rewindAt := pc + 2
+	if rewindAt+1 < len(in) && in[rewindAt].Op == OpInteger && in[rewindAt].P1 == 0 {
+		rewindAt++
+	}
+	if rewindAt < len(in) && in[pc].Op == OpColumn &&
+		(in[pc+1].Op == OpSeekRowidHint || in[pc+1].Op == OpSeekIndexHint) &&
+		in[pc+1].P2 == in[pc].P3 && in[pc+1].P3 == 1 && in[rewindAt].Op == OpRewind && in[rewindAt].P1 == in[pc+1].P1 {
+		if _, ok := l.levelOf[in[pc].P1]; !ok {
+			return 0, false // the key comes from a level not entered yet
+		}
+		pc += 2
+	}
+	// A LEFT JOIN's level clears its match flag before its Rewind.
+	flag := -1
+	if pc+1 < len(in) && in[pc].Op == OpInteger && in[pc].P1 == 0 && in[pc+1].Op == OpRewind {
+		if l.outer >= 0 {
+			return 0, false // one LEFT JOIN
+		}
+		flag = in[pc].P2
+		pc++
+	}
+	if pc+4 >= len(in) || in[pc].Op != OpRewind || !l.add(in[pc].P1, pc) {
+		return 0, false
+	}
+	self := l.levelOf[in[pc].P1]
+	next := -1
+	for i, ins := range in {
+		if ins.Op == OpNext && ins.P1 == l.cursors[self] && ins.P2 == l.rewinds[self]+1 {
+			next = i
+		}
+	}
+	// The join's recheck: an equality whose failure skips the row -- to
+	// the Next, or, in a LEFT JOIN's ON tree (IfNot P3 0), to the tree's
+	// false label -- between a value of this level and one of an earlier
+	// level, columns or expressions over them. The level's own terms come
+	// first, and a term can be an equality too: each candidate is tried
+	// in turn, the first that parses whole taking it.
+	eqAt, preds0, filters0 := -1, len(l.preds), len(l.filters)
+	var x, y segJoinArg
+	for p := pc + 1; p+1 < len(in) && eqAt < 0; p++ {
+		e, sk := in[p], in[p+1]
+		if e.Op != OpEq || sk.Op != OpIfNot || sk.P1 != e.P2 ||
+			!(sk.P3 == 1 && sk.P2 == next || flag >= 0 && sk.P3 == 0) || !segJoinEqOK(e) {
+			continue
+		}
+		l.preds, l.filters = l.preds[:preds0], l.filters[:filters0]
+		end, ok := l.levelPreds(in, pc+1, p)
+		if !ok {
+			continue
+		}
+		tr := newSegJoinTrace(in, l.levelOf)
+		traced := true
+		for q := end; q < p && traced; q++ {
+			traced = !segJoinIsJump(in[q]) && tr.step(q)
+		}
+		a, okx := tr.src[e.P1]
+		b, oky := tr.src[e.P3]
+		if !traced || !okx || !oky || a.guard != 0 || b.guard != 0 {
+			continue
+		}
+		if b.level == self {
+			a, b = b, a
+		}
+		if a.level != self || b.level < 0 || b.level >= self {
+			continue // one side this level, the other an outer one
+		}
+		eqAt, x, y = p, a, b
+	}
+	if eqAt < 0 {
+		return 0, false
+	}
+	eq, skip := in[eqAt], in[eqAt+1]
+	tree := flag >= 0 && skip.P3 == 0
+	l.edges = append(l.edges, segJoinEdge{a: y.level, aArg: y, b: self, bArg: x})
+	pc = eqAt - 3 // the skip is at pc+4, as it was for the four-instruction recheck
+	if tree {
+		// The rest of the tree: terms over this level, and the tail that
+		// settles the three-valued result and skips to the Next.
 		next := -1
 		for i, ins := range in {
 			if ins.Op == OpNext && ins.P1 == l.cursors[self] && ins.P2 == l.rewinds[self]+1 {
 				next = i
 			}
 		}
-		// The join's recheck: an equality whose failure skips the row -- to
-		// the Next, or, in a LEFT JOIN's ON tree (IfNot P3 0), to the tree's
-		// false label -- between a value of this level and one of an earlier
-		// level, columns or expressions over them. The level's own terms come
-		// first, and a term can be an equality too: each candidate is tried
-		// in turn, the first that parses whole taking it.
-		eqAt, preds0, filters0 := -1, len(l.preds), len(l.filters)
-		var x, y segJoinArg
-		for p := pc + 1; p+1 < len(in) && eqAt < 0; p++ {
-			e, sk := in[p], in[p+1]
-			if e.Op != OpEq || sk.Op != OpIfNot || sk.P1 != e.P2 ||
-				!(sk.P3 == 1 && sk.P2 == next || flag >= 0 && sk.P3 == 0) || !segJoinEqOK(e) {
-				continue
-			}
-			l.preds, l.filters = l.preds[:preds0], l.filters[:filters0]
-			end, ok := levelPreds(pc+1, p)
-			if !ok {
-				continue
-			}
-			tr := newSegJoinTrace(in, l.levelOf)
-			traced := true
-			for q := end; q < p && traced; q++ {
-				traced = !segJoinIsJump(in[q]) && tr.step(q)
-			}
-			a, okx := tr.src[e.P1]
-			b, oky := tr.src[e.P3]
-			if !traced || !okx || !oky || a.guard != 0 || b.guard != 0 {
-				continue
-			}
-			if b.level == self {
-				a, b = b, a
-			}
-			if a.level != self || b.level < 0 || b.level >= self {
-				continue // one side this level, the other an outer one
-			}
-			eqAt, x, y = p, a, b
+		preds, end, ok := segParsePredTree(in, pc+5, len(in), l.cursors[self], next, []int{eq.P2}, skip.P2)
+		if !ok || len(preds) == 0 {
+			return 0, false
 		}
-		if eqAt < 0 {
-			return nil, false
+		l.preds[self] = append(l.preds[self], preds...)
+		pc = end
+	} else {
+		l.ifNots[pc+4] = self
+		pc += 5
+	}
+	if flag >= 0 {
+		// ...and sets it once a row matched.
+		if pc >= len(in) || in[pc].Op != OpInteger || in[pc].P1 != 1 || in[pc].P2 != flag {
+			return 0, false
 		}
-		eq, skip := in[eqAt], in[eqAt+1]
-		tree := flag >= 0 && skip.P3 == 0
-		l.edges = append(l.edges, segJoinEdge{a: y.level, aArg: y, b: self, bArg: x})
-		pc = eqAt - 3 // the skip is at pc+4, as it was for the four-instruction recheck
-		if tree {
-			// The rest of the tree: terms over this level, and the tail that
-			// settles the three-valued result and skips to the Next.
-			next := -1
-			for i, ins := range in {
-				if ins.Op == OpNext && ins.P1 == l.cursors[self] && ins.P2 == l.rewinds[self]+1 {
-					next = i
-				}
-			}
-			preds, end, ok := segParsePredTree(in, pc+5, len(in), l.cursors[self], next, []int{eq.P2}, skip.P2)
-			if !ok || len(preds) == 0 {
-				return nil, false
-			}
-			l.preds[self] = append(l.preds[self], preds...)
-			pc = end
-		} else {
-			l.ifNots[pc+4] = self
-			pc += 5
-		}
-		if flag >= 0 {
-			// ...and sets it once a row matched.
-			if pc >= len(in) || in[pc].Op != OpInteger || in[pc].P1 != 1 || in[pc].P2 != flag {
-				return nil, false
-			}
-			l.outer, l.flag = self, flag
-			pc++
+		l.outer, l.flag = self, flag
+		pc++
+	}
+	return pc, true
+}
+
+// nullLevels reads the levels after the LEFT JOIN's that its null row's
+// copy, from pc to end, enters again. They must read as the loop's own do --
+// the same links, the same terms over columns -- with a Next chain of their
+// own that leaves at end. It returns the copy's body: its first instruction,
+// and the address of its innermost Next.
+func (l *segJoinLoop) nullLevels(in []Instruction, pc, end int) ([2]int, bool) {
+	o, k := l.outer, len(l.cursors)
+	c := &segJoinLoop{opened: l.opened, levelOf: map[int]int{}, ifNots: map[int]int{}, outer: o,
+		cursors: slices.Clone(l.cursors[:o+1]), rewinds: slices.Clone(l.rewinds[:o+1]),
+		preds: slices.Clone(l.preds[:o+1]), filters: slices.Clone(l.filters[:o+1]), edges: slices.Clone(l.edges[:o])}
+	for i, cur := range c.cursors {
+		c.levelOf[cur] = i
+	}
+	for len(c.cursors) < k {
+		var ok bool
+		if pc, ok = c.level(in, pc); !ok || pc > end {
+			return [2]int{}, false
 		}
 	}
-	l.body = pc
-	return l, true
+	for i := o + 1; i < k; i++ {
+		e, ce := l.edges[i-1], c.edges[i-1]
+		if c.cursors[i] != l.cursors[i] || len(l.filters[i]) != 0 || len(c.filters[i]) != 0 ||
+			!reflect.DeepEqual(l.preds[i], c.preds[i]) || !segJoinSameLink(e, ce) {
+			return [2]int{}, false
+		}
+	}
+	// The copy's body, then its Next chain, innermost first, each back to its
+	// level, its Rewinds and skips landing as the loop's do, the outermost
+	// leaving at end.
+	at := -1
+	for i := pc; i < end; i++ {
+		if in[i].Op == OpNext && in[i].P1 == c.cursors[k-1] && in[i].P2 == c.rewinds[k-1]+1 {
+			at = i
+			break
+		}
+	}
+	if at < 0 {
+		return [2]int{}, false
+	}
+	q, innerEnd := at, -1
+	for i := k - 1; i > o; i-- {
+		if q >= end || in[q].Op != OpNext || in[q].P1 != c.cursors[i] || in[q].P2 != c.rewinds[i]+1 {
+			return [2]int{}, false
+		}
+		if i+1 < k && in[c.rewinds[i+1]].P2 != innerEnd {
+			return [2]int{}, false
+		}
+		for skip, lv := range c.ifNots {
+			if lv == i && in[skip].P2 != q {
+				return [2]int{}, false
+			}
+		}
+		q++
+		innerEnd = q
+	}
+	if q != end || in[c.rewinds[o+1]].P2 != end {
+		return [2]int{}, false
+	}
+	return [2]int{pc, at}, true
+}
+
+// segJoinSameLink reports whether two edges join the same columns of the
+// same levels.
+func segJoinSameLink(a, b segJoinEdge) bool {
+	same := func(x, y segJoinArg) bool {
+		return x.expr == nil && y.expr == nil && x.guard == 0 && y.guard == 0 && x.level == y.level && x.col == y.col
+	}
+	return a.a == b.a && a.b == b.b && same(a.aArg, b.aArg) && same(a.bArg, b.bArg)
 }
 
 // tail checks the Next chain at pc, innermost first, each back to its level's
@@ -292,6 +374,15 @@ func (l *segJoinLoop) tail(in []Instruction, pc int) (closeAt, after int, ok boo
 				return 0, 0, false
 			}
 			l.nullBody = [2]int{pc + 2, end}
+			if i < k-1 {
+				// Levels after it: the copy enters them again, and they must
+				// join as they do in the loop.
+				body, ok := l.nullLevels(in, pc+2, end)
+				if !ok {
+					return 0, 0, false
+				}
+				l.nullBody = body
+			}
 			pc = end
 		}
 	}
