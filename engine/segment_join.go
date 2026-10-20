@@ -104,6 +104,7 @@ type segJoinTable struct {
 
 	mu    sync.Mutex
 	cols  map[int][]int64
+	kcols map[int]segJoinKeyCol
 	fcols map[int][]float64
 	// lo/dense map a rowid to its row + 1 when the rowids are dense enough,
 	// else sparse does.
@@ -513,6 +514,50 @@ func (t *segJoinTable) col(c int) ([]int64, bool) {
 	return out, true
 }
 
+// keyCol is col for a join's key: integers, NULLs allowed and marked in
+// nulls (nil when there are none), anything else declining.
+func (t *segJoinTable) keyCol(c int) (vals []int64, nulls []bool, ok bool) {
+	if v, ok := t.col(c); ok {
+		return v, nil, true
+	}
+	if c < 0 || c == t.ipk || c >= len(t.tbl.cols) || t.tbl.cols[c].Aff == affReal {
+		return nil, nil, false
+	}
+	t.mu.Lock()
+	k, seen := t.kcols[c]
+	t.mu.Unlock()
+	if seen {
+		return k.vals, k.nulls, k.vals != nil
+	}
+	vals, nulls = make([]int64, t.n), make([]bool, t.n)
+	for r := range vals {
+		switch v := t.value(int32(r), c); v.Typ {
+		case Int:
+			vals[r] = v.I
+		case Null:
+			nulls[r] = true
+		default:
+			vals, nulls = nil, nil
+		}
+		if vals == nil {
+			break
+		}
+	}
+	t.mu.Lock()
+	if t.kcols == nil {
+		t.kcols = map[int]segJoinKeyCol{}
+	}
+	t.kcols[c] = segJoinKeyCol{vals, nulls}
+	t.mu.Unlock()
+	return vals, nulls, vals != nil
+}
+
+// segJoinKeyCol is a key column keyCol read: nil vals when it declined.
+type segJoinKeyCol struct {
+	vals  []int64
+	nulls []bool
+}
+
 // fcol is REAL column c of every row, as the cursor reads it, or false unless
 // every row holds a REAL there: a REAL, or an integer of a REAL-affinity
 // column (which reads as REAL).
@@ -725,13 +770,18 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 		w.pass[i] = w.tabs[i].passing(preds, resolved)
 	}
 	for _, i := range w.order[1:] {
-		keys, ok := w.tabs[w.parent[i]].col(parentCol[i])
+		keys, nulls, ok := w.tabs[w.parent[i]].keyCol(parentCol[i])
 		if !ok {
 			return nil, false
 		}
 		w.tabs[i].index()
 		s := make([]int32, len(keys))
 		for r, key := range keys {
+			// A NULL key equals no rowid: the loop's equality is not true.
+			if nulls != nil && nulls[r] {
+				s[r] = -1
+				continue
+			}
 			s[r] = w.tabs[i].row(key)
 		}
 		w.slot[i] = s
