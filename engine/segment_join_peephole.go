@@ -224,7 +224,7 @@ func segJoinPeephole(prog *Program) bool {
 
 	// The guard takes the first Rewind's place and runs it when it declines,
 	// so no address moves.
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, args: args, agg: plan, seg: step.P2}
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, args: args, agg: plan, seg: step.P2, sorted: l.sorted}
 	at := len(in)
 	out := append([]Instruction(nil), in...)
 	out[l.rewind0] = Instruction{Op: OpGoto, P2: at}
@@ -618,7 +618,7 @@ func segJoinHashPeephole(prog *Program) bool {
 		return false
 	}
 	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, args: args, agg: plan, seg: step.P2,
-		grouped: true, key: key}
+		grouped: true, key: key, sorted: l.sorted}
 	key.reg = keyReg
 	jp.key = key
 	out := append([]Instruction(nil), in...)

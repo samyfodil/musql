@@ -48,6 +48,9 @@ type segJoinPlan struct {
 	grouped bool
 	key     segJoinArg
 	loads   []segJoinArg
+	// sorted: some level visits its rows in an index's order, not rowid
+	// order, so the loop's order is not one the kernel knows.
+	sorted bool
 }
 
 // segJoinEdge is "level a's column aCol = level b's column bCol", a column of
@@ -303,7 +306,7 @@ rows:
 	return true
 }
 
-// segJoinSums is what a group's rows add up to, per argument.
+// segJoinSums is what a group's rows add up to, per integer argument.
 type segJoinSums struct {
 	n    int64
 	sums []int64
@@ -323,11 +326,15 @@ func newSegJoinSums(na int) *segJoinSums {
 	return s
 }
 
-// add takes one row's arguments, or reports false when a sum could overflow.
-func (s *segJoinSums) add(args [][]int64, levels []int, at []int32) bool {
+// add takes one row's integer arguments, or reports false when a sum could
+// overflow.
+func (s *segJoinSums) add(args *segJoinArgs, at []int32) bool {
 	s.n++
-	for a, vals := range args {
-		v := vals[at[levels[a]]]
+	for a, vals := range args.ints {
+		if vals == nil {
+			continue
+		}
+		v := vals[at[args.levels[a]]]
 		s.sums[a] += v
 		s.mins[a], s.maxs[a] = min(s.mins[a], v), max(s.maxs[a], v)
 		u := uint64(v)
@@ -343,50 +350,219 @@ func (s *segJoinSums) add(args [][]int64, levels []int, at []int32) bool {
 	return true
 }
 
-// segJoinArgsOf is each argument's column, and the argument each step reads by
-// its register, or false when an aggregate is one the sums do not model.
-func segJoinArgsOf(plan *segJoinPlan, w *segJoinWalk) (args [][]int64, levels []int, argOf map[int]int, ok bool) {
-	args = make([][]int64, len(plan.args))
-	levels = make([]int, len(plan.args))
-	argOf = map[int]int{}
+// segJoinArgs is each aggregate argument's column: INTEGER, summed as the
+// rows go by, or REAL, whose values a group replays in the loop's order
+// because a floating-point sum depends on it.
+type segJoinArgs struct {
+	ints   [][]int64   // nil for a REAL argument
+	flts   [][]float64 // nil for an INTEGER one
+	levels []int
+	argOf  map[int]int // the step's argument register -> its index
+	floats bool
+}
+
+// segJoinArgsOf reads plan's arguments, or reports false when an aggregate is
+// one the kernel does not model.
+func segJoinArgsOf(plan *segJoinPlan, w *segJoinWalk) (*segJoinArgs, bool) {
+	n := len(plan.args)
+	args := &segJoinArgs{ints: make([][]int64, n), flts: make([][]float64, n), levels: make([]int, n), argOf: map[int]int{}}
 	for a, arg := range plan.args {
-		vals, ok := w.tabs[arg.level].col(arg.col)
-		if !ok {
-			return nil, nil, nil, false
+		args.levels[a] = arg.level
+		args.argOf[arg.reg] = a
+		if vals, ok := w.tabs[arg.level].col(arg.col); ok {
+			args.ints[a] = vals
+			continue
 		}
-		args[a], levels[a] = vals, arg.level
-		argOf[arg.reg] = a
+		vals, ok := w.tabs[arg.level].fcol(arg.col)
+		if !ok {
+			return nil, false
+		}
+		args.flts[a], args.floats = vals, true
+	}
+	if args.floats && plan.sorted {
+		return nil, false // a REAL sum replays the loop's order, unknown here
 	}
 	for _, it := range aggPlanTemplates(plan.agg) {
+		sumKind := it.kind == aggSum || it.kind == aggTotal || it.kind == aggAvg
 		// An order-strict sum checks at finalize that no order could change
-		// it, from a window over its values that addRest keeps up to date.
-		if it.filter != nil || it.orderBy != nil || it.distinct || it.orderStrict && it.kind != aggSum || it.stepSeg != plan.seg {
-			return nil, nil, nil, false
+		// it, from a window over its values that rest keeps up to date.
+		if it.filter != nil || it.orderBy != nil || it.distinct || it.orderStrict && !sumKind || it.stepSeg != plan.seg {
+			return nil, false
 		}
 		switch it.kind {
 		case aggCountStar:
-		case aggCount, aggSum, aggMin, aggMax:
-			if _, ok := argOf[it.rowRegs[aggExprArg]-1]; !ok || it.minMaxLastWins {
-				return nil, nil, nil, false
+		case aggCount, aggSum, aggTotal, aggAvg, aggMin, aggMax:
+			a, ok := args.argOf[it.rowRegs[aggExprArg]-1]
+			if !ok || it.minMaxLastWins || args.flts[a] != nil && (it.kind == aggMin || it.kind == aggMax) {
+				return nil, false
 			}
 		default:
-			return nil, nil, nil, false
+			return nil, false
 		}
 	}
-	return args, levels, argOf, true
+	return args, true
 }
 
-// addRest adds to accs -- stepped once, with the row whose arguments are
-// first -- the group's other rows.
-func addRest(accs *aggAccumulators, s *segJoinSums, first []int64, argOf map[int]int) {
+// fcol is REAL column c of every row, as the cursor reads it, or false unless
+// every segment stores it as a clean REAL block, or as clean integers of a
+// REAL-affinity column (which read as REAL).
+func (t *segJoinTable) fcol(c int) ([]float64, bool) {
+	if c < 0 || c == t.ipk || c >= len(t.tbl.cols) {
+		return nil, false
+	}
+	out := make([]float64, 0, t.n)
+	for _, s := range t.segs {
+		if vals, ok := s.Float64Column(c); ok {
+			out = append(out, vals[:s.nRows]...)
+			continue
+		}
+		ints, ok := segCleanInt64Column(s, c)
+		if !ok || t.tbl.cols[c].Aff != affReal {
+			return nil, false
+		}
+		for _, v := range ints[:s.nRows] {
+			out = append(out, float64(v))
+		}
+	}
+	return out, true
+}
+
+// segJoinGroups is an aggregate's groups -- one for a whole-join aggregate --
+// as the kernel hands them to the program: in the order the loop first meets
+// them, each with the joined row the loop would have met first.
+type segJoinGroups struct {
+	w      *segJoinWalk
+	plan   *segJoinPlan
+	groups []segJoinGroup
+	next   int
+	args   *segJoinArgs
+}
+
+type segJoinGroup struct {
+	sums  *segJoinSums
+	first []int32 // each level's row in the group's first joined row
+	// rows is every joined row of the group, k levels each, in the loop's
+	// order: kept when a REAL argument is replayed.
+	rows []int32
+}
+
+// loopBefore reports whether joined row a comes before b in the loop's order:
+// the outermost level's row first, each level visiting its rows in rowid
+// order, which is their order in its table.
+func loopBefore(a, b []int32) bool {
+	for i := range a {
+		if a[i] != b[i] {
+			return a[i] < b[i]
+		}
+	}
+	return false
+}
+
+// segJoinGroupsOf builds plan's groups, or reports false. A plan with no
+// GROUP BY has one group, or none when nothing joins.
+func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (*segJoinGroups, bool) {
+	w, ok := m.openSegJoin(plan)
+	if !ok {
+		return nil, false
+	}
+	args, ok := segJoinArgsOf(plan, w)
+	if !ok {
+		return nil, false
+	}
+	var keys []int64
+	if plan.grouped {
+		if keys, ok = w.tabs[plan.key.level].col(plan.key.col); !ok {
+			return nil, false
+		}
+	}
+	byKey := map[int64]int{}
+	var groups []segJoinGroup
+	k := len(plan.cursors)
+	at := make([]int32, k)
+	if !w.each(at, func() bool {
+		var key int64
+		if keys != nil {
+			key = keys[at[plan.key.level]]
+		}
+		gi, seen := byKey[key]
+		switch {
+		case !seen:
+			gi = len(groups)
+			byKey[key] = gi
+			groups = append(groups, segJoinGroup{sums: newSegJoinSums(len(args.ints)), first: slices.Clone(at)})
+		case args.floats:
+			// The replay is in the order rows arrive here, which must be the
+			// loop's, so the first row is the first one kept.
+			g := &groups[gi]
+			if !loopBefore(g.rows[len(g.rows)-k:], at) {
+				return false
+			}
+		default:
+			if g := &groups[gi]; loopBefore(at, g.first) {
+				copy(g.first, at)
+			}
+		}
+		g := &groups[gi]
+		if args.floats {
+			g.rows = append(g.rows, at...)
+		}
+		return g.sums.add(args, at)
+	}) {
+		return nil, false
+	}
+	sort.Slice(groups, func(i, j int) bool { return loopBefore(groups[i].first, groups[j].first) })
+	return &segJoinGroups{w: w, plan: plan, groups: groups, args: args}, true
+}
+
+// load puts group g's first joined row into the registers the loop body
+// reads it into.
+func (gs *segJoinGroups) load(m *vdbe, g *segJoinGroup) {
+	for _, l := range gs.plan.loads {
+		m.regs[l.reg] = gs.w.tabs[l.level].value(g.first[l.level], l.col)
+	}
+}
+
+// loadArgs puts group g's first joined row's arguments into the registers the
+// step reads them from.
+func (gs *segJoinGroups) loadArgs(m *vdbe, g *segJoinGroup) {
+	for _, arg := range gs.plan.args {
+		m.regs[arg.reg] = gs.w.tabs[arg.level].value(g.first[arg.level], arg.col)
+	}
+}
+
+// rest adds group g's other rows to the accumulators its first row was just
+// stepped into.
+func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) {
+	args, s := gs.args, g.sums
+	k := len(gs.plan.cursors)
 	rest := func(it *aggItem) {
+		if it.kind == aggCountStar {
+			it.cnt += s.n - 1
+			return
+		}
+		a := args.argOf[it.rowRegs[aggExprArg]-1]
+		if fl := args.flts[a]; fl != nil {
+			if it.kind == aggCount {
+				it.cnt += s.n - 1
+				return
+			}
+			// The rows after the first, through what step does with each.
+			for r := k; r < len(g.rows); r += k {
+				f := fl[g.rows[r+args.levels[a]]]
+				it.cnt++
+				if it.orderStrict {
+					it.sumWatch(false, 0, f)
+				}
+				it.sumStep(false, 0, f)
+			}
+			return
+		}
 		switch it.kind {
-		case aggCountStar, aggCount:
+		case aggCount:
 			it.cnt += s.n - 1
-		case aggSum:
-			a := argOf[it.rowRegs[aggExprArg]-1]
+		case aggSum, aggTotal, aggAvg:
 			it.cnt += s.n - 1
-			it.iSum += s.sums[a] - first[a]
+			it.iSum += s.sums[a] - args.ints[a][g.first[args.levels[a]]]
 			if it.orderStrict && s.ors[a] != 0 {
 				// What sumWatch over every value would have kept: the
 				// largest magnitude and the smallest power of two dividing
@@ -395,11 +571,12 @@ func addRest(accs *aggAccumulators, s *segJoinSums, first []int64, argOf map[int
 				it.sumWatch(true, int64(1)<<bits.TrailingZeros64(s.ors[a]), 0)
 			}
 		case aggMin:
-			it.best = Value{Typ: Int, I: s.mins[argOf[it.rowRegs[aggExprArg]-1]]}
+			it.best = Value{Typ: Int, I: s.mins[a]}
 		case aggMax:
-			it.best = Value{Typ: Int, I: s.maxs[argOf[it.rowRegs[aggExprArg]-1]]}
+			it.best = Value{Typ: Int, I: s.maxs[a]}
 		}
 	}
+	accs := m.aggAccs
 	for _, set := range accs.out {
 		for _, it := range set {
 			rest(it)
@@ -425,33 +602,17 @@ func (m *vdbe) segJoinAggregate(plan *segJoinPlan) (bool, error) {
 	if !plan.agg.rowFree {
 		return false, nil
 	}
-	w, ok := m.openSegJoin(plan)
+	gs, ok := m.segJoinGroupsOf(plan)
 	if !ok {
-		return false, nil
-	}
-	args, levels, argOf, ok := segJoinArgsOf(plan, w)
-	if !ok {
-		return false, nil
-	}
-	sums := newSegJoinSums(len(args))
-	at := make([]int32, len(plan.cursors))
-	last := make([]int32, len(at))
-	if !w.each(at, func() bool {
-		copy(last, at)
-		return sums.add(args, levels, at)
-	}) {
 		return false, nil
 	}
 	segJoinHits.Add(1)
-	if sums.n == 0 {
+	if len(gs.groups) == 0 {
 		return true, nil // no joined row: the accumulators stay as reset
 	}
-	// Step the last joined row through the shared code, then add the rest.
-	first := make([]int64, len(args))
-	for a, arg := range plan.args {
-		first[a] = args[a][last[arg.level]]
-		m.regs[arg.reg] = Value{Typ: Int, I: first[a]}
-	}
+	// Step the first joined row through the shared code, then add the rest.
+	g := &gs.groups[0]
+	gs.loadArgs(m, g)
 	nr := plan.agg.nCols + len(plan.agg.scopes)
 	if len(m.aggNullRow) < nr {
 		m.aggNullRow = make([]Value, nr)
@@ -460,91 +621,8 @@ func (m *vdbe) segJoinAggregate(plan *segJoinPlan) (bool, error) {
 	if err := m.aggStep(m.aggRowCtx(plan.agg, row, rowids), plan.seg); err != nil {
 		return false, err
 	}
-	addRest(m.aggAccs, sums, first, argOf)
+	gs.rest(m, g)
 	return true, nil
-}
-
-// segJoinGroups is a GROUP BY's groups, as the kernel hands them to the
-// program's own drain: in the order the loop first meets them, each with the
-// joined row the loop would have met first.
-type segJoinGroups struct {
-	w      *segJoinWalk
-	plan   *segJoinPlan
-	groups []segJoinGroup
-	next   int
-	args   [][]int64
-	argOf  map[int]int
-}
-
-type segJoinGroup struct {
-	sums  *segJoinSums
-	first []int32 // each level's row in the group's first joined row
-}
-
-// loopBefore reports whether joined row a comes before b in the loop's order:
-// the outermost level's row first, each level visiting its rows in rowid
-// order, which is their order in its table.
-func loopBefore(a, b []int32) bool {
-	for i := range a {
-		if a[i] != b[i] {
-			return a[i] < b[i]
-		}
-	}
-	return false
-}
-
-// segJoinGroupsOf builds plan's groups, or reports false.
-func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (*segJoinGroups, bool) {
-	w, ok := m.openSegJoin(plan)
-	if !ok {
-		return nil, false
-	}
-	args, levels, argOf, ok := segJoinArgsOf(plan, w)
-	if !ok {
-		return nil, false
-	}
-	keys, ok := w.tabs[plan.key.level].col(plan.key.col)
-	if !ok {
-		return nil, false
-	}
-	byKey := map[int64]int{}
-	var groups []segJoinGroup
-	k := len(plan.cursors)
-	at := make([]int32, k)
-	if !w.each(at, func() bool {
-		key := keys[at[plan.key.level]]
-		gi, seen := byKey[key]
-		if !seen {
-			gi = len(groups)
-			byKey[key] = gi
-			groups = append(groups, segJoinGroup{sums: newSegJoinSums(len(args)), first: slices.Clone(at)})
-		} else if g := &groups[gi]; loopBefore(at, g.first) {
-			copy(g.first, at)
-		}
-		return groups[gi].sums.add(args, levels, at)
-	}) {
-		return nil, false
-	}
-	sort.Slice(groups, func(i, j int) bool { return loopBefore(groups[i].first, groups[j].first) })
-	return &segJoinGroups{w: w, plan: plan, groups: groups, args: args, argOf: argOf}, true
-}
-
-// load puts group g's first joined row into the registers the loop body
-// reads it into.
-func (gs *segJoinGroups) load(m *vdbe, g *segJoinGroup) {
-	for _, l := range gs.plan.loads {
-		m.regs[l.reg] = gs.w.tabs[l.level].value(g.first[l.level], l.col)
-	}
-}
-
-// rest adds group g's other rows to the accumulators its first row was just
-// stepped into.
-func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) {
-	first := make([]int64, len(gs.args))
-	for a, arg := range gs.plan.args {
-		first[a] = gs.args[a][g.first[arg.level]]
-	}
-	addRest(m.aggAccs, g.sums, first, gs.argOf)
 }
 
 // segJoinHashAgg fills a hashed GROUP BY's buckets, or reports false having
@@ -561,13 +639,10 @@ func (m *vdbe) segJoinHashAgg(plan *segJoinPlan) (bool, error) {
 	row := growValues(&m.aggRowBuf, plan.agg.nCols)
 	rowids := growValues(&m.aggRowidBuf, len(plan.agg.scopes))
 	keyVals := make([]Value, 1)
-	keys, _ := gs.w.tabs[plan.key.level].col(plan.key.col)
 	for i := range gs.groups {
 		g := &gs.groups[i]
-		for a, arg := range plan.args {
-			m.regs[arg.reg] = Value{Typ: Int, I: gs.args[a][g.first[arg.level]]}
-		}
-		keyVals[0] = Value{Typ: Int, I: keys[g.first[plan.key.level]]}
+		gs.loadArgs(m, g)
+		keyVals[0] = gs.w.tabs[plan.key.level].value(g.first[plan.key.level], plan.key.col)
 		m.regs[plan.key.reg] = keyVals[0]
 		if !gs.gather(g, row, rowids) {
 			return false, fmt.Errorf("vdbe: OpSegJoinHash over a cursor outside its join")

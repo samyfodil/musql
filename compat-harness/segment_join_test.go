@@ -30,8 +30,11 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 4000)
 			INSERT INTO tracks SELECT i, CASE WHEN i % 50 = 0 THEN 500 + i ELSE 1 + i % 80 END, 100 + i % 250, (i * 7919) % 100000 - 30000, (i % 7) / 2.0 FROM n`,
 		`INSERT INTO big VALUES (1, 1, 9223372036854775000), (2, 1, 900), (3, 2, -9223372036854775000), (4, 2, -900)`,
-		`CREATE TABLE wide(id INTEGER PRIMARY KEY, album_id INTEGER NOT NULL, v INTEGER NOT NULL)`,
-		`INSERT INTO wide VALUES (1, 1, 2305843009213693952), (2, 1, 2305843009213693952), (3, 1, -2305843009213693952), (4, 2, 3), (5, 2, 5), (6, 3, 7)`,
+		`CREATE TABLE wide(id INTEGER PRIMARY KEY, album_id INTEGER NOT NULL, v INTEGER NOT NULL, r REAL NOT NULL)`,
+		`INSERT INTO wide VALUES (1, 1, 2305843009213693952, 1e16), (2, 1, 2305843009213693952, 1.0), (3, 1, -2305843009213693952, -1e16),
+			(4, 2, 3, 0.1), (5, 2, 5, 0.2), (6, 3, 7, 0.3), (7, 2, 1, 0.7), (8, 1, 2, 3.5), (9, 4, 4, 2)`,
+		`CREATE TABLE w2(id INTEGER PRIMARY KEY, album_id INTEGER NOT NULL, r REAL NOT NULL)`,
+		`INSERT INTO w2 VALUES (1, 7, 1e16), (2, 1, 1.0), (3, 7, -1e16), (4, 1, 0.1)`,
 	}
 	queries := []struct {
 		q     string
@@ -45,7 +48,7 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT count(*), max(ar.id) FROM tracks t JOIN albums al ON al.id = t.album_id JOIN artists ar ON ar.id = al.artist_id`, true},
 		{`SELECT count(*) FROM albums al JOIN artists ar ON ar.id = al.artist_id`, true},
 		{`SELECT count(*), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE al.id > 1000`, false},
-		{`SELECT sum(t.rating) FROM albums al JOIN tracks t ON t.album_id = al.id`, false},
+		{`SELECT sum(t.rating) FROM albums al JOIN tracks t ON t.album_id = al.id`, true},
 		{`SELECT sum(b.v) FROM albums al JOIN big b ON b.album_id = al.id`, false},
 		{`SELECT count(*), sum(b.v) FROM big b JOIN albums al ON al.id = b.album_id WHERE b.id < 0`, false},
 		// GROUP BY: streamed when the groups arrive in scan order, sorted
@@ -62,12 +65,22 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT al.id, count(*) + max(t.seconds), (SELECT name FROM artists WHERE id = al.artist_id) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
 		{`SELECT ar.name, count(*) FROM artists ar JOIN albums al ON al.artist_id = ar.id JOIN tracks t ON t.album_id = al.id GROUP BY ar.name`, false},
 		{`SELECT al.id, max(t.plays), t.id FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, false},
-		{`SELECT al.id, sum(t.rating) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, false},
+		{`SELECT al.id, sum(t.rating) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
 		{`SELECT al.id, group_concat(t.id) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, false},
 		{`SELECT b.album_id, sum(b.v) FROM big b JOIN albums al ON al.id = b.album_id GROUP BY b.album_id`, false},
 		// Sums the order-strict check has to judge from the values' window.
 		{`SELECT w.album_id, sum(w.v), count(*) FROM wide w JOIN albums al ON al.id = w.album_id GROUP BY w.album_id`, true},
 		{`SELECT al.id, sum(w.v), al.year FROM albums al JOIN wide w ON w.album_id = al.id GROUP BY al.id HAVING sum(w.v) <> 0`, true},
+		// REAL sums depend on the order the values are added in.
+		{`SELECT al.id, sum(w.r), total(w.r), avg(w.r), count(w.r) FROM albums al JOIN wide w ON w.album_id = al.id GROUP BY al.id`, true},
+		{`SELECT sum(w.r), avg(w.r), avg(w.v) FROM wide w JOIN albums al ON al.id = w.album_id`, true},
+		{`SELECT ar.id, round(avg(t.rating), 2), sum(t.seconds) / 60 FROM artists ar JOIN albums al ON al.artist_id = ar.id JOIN tracks t ON t.album_id = al.id GROUP BY ar.id`, true},
+		{`SELECT al.artist_id, sum(w.r) FROM wide w JOIN albums al ON al.id = w.album_id GROUP BY al.artist_id`, true},
+		{`SELECT * FROM (SELECT al.id AS a, count(*) AS n, round(avg(t.rating), 2) AS r FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id) WHERE n > 40`, true},
+		// Albums 1 and 7 share an artist, and album 7's rows come first in the
+		// table but second in the loop: a REAL sum cannot be replayed in order.
+		{`SELECT ar.id, sum(x.r), count(*) FROM artists ar CROSS JOIN albums al ON al.artist_id = ar.id CROSS JOIN w2 x ON x.album_id = al.id GROUP BY ar.id`, false},
+		{`SELECT ar.id, sum(x.r), count(*) FROM artists ar JOIN albums al ON al.artist_id = ar.id JOIN w2 x ON x.album_id = al.id GROUP BY ar.id`, true},
 	}
 
 	dir := t.TempDir()
