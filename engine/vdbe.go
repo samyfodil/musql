@@ -1373,6 +1373,11 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				op = &insns[pc]
 				goto dispatch
 			}
+			// Nor one that would copy a row out for too little native work.
+			if jx.light != nil && jx.light[pc] && jx.copies(m, pc) {
+				op = &insns[pc]
+				goto dispatch
+			}
 			m.jitEnters++
 			if jitScore {
 				jitScoreEnter()

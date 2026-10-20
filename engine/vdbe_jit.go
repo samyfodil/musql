@@ -39,6 +39,9 @@ type vmJIT struct {
 	// engine copies out of a cursor it cannot hand over as a row list. Nil
 	// for a pc with none.
 	fill [][]curCols
+	// light[pc] is whether an entry at pc does too little besides its column
+	// reads to pay for copying a cursor's row out (copyHeavy); nil for none.
+	light []bool
 
 	// updAt is the pc of the OpUpdateRow whose record native code gathers
 	// (gatherUpdate), or -1. Its rows are the ones a call hands back, and the
@@ -279,6 +282,12 @@ func compileVMJIT(prog *Program) *vmJIT {
 		}
 		jx.gate[pc] = int16(firstCursor(vp, pc))
 		jx.fill[pc] = fillColumns(vp, pc)
+		if jx.fill[pc] != nil && copyHeavy(vp, pc) {
+			if jx.light == nil {
+				jx.light = make([]bool, len(vp))
+			}
+			jx.light[pc] = true
+		}
 	}
 	for _, in := range vp {
 		if (in.Op == jit.VColumn || in.Op == jit.VRowid || in.Op == jit.VNext || in.Op == jit.VRewind) && !seen[in.A] {
@@ -546,18 +555,34 @@ const vmJITCursorEntryWork = 5
 // for itself: vmJITMinWork, plus vmJITCursorEntryWork when the run touches a
 // cursor.
 func worthEntering(vp []jit.VInsn, pc int) bool {
-	w, cursor := nativeRun(vp, pc, vmJITMinWork+vmJITCursorEntryWork)
+	w, cursor, _ := nativeRun(vp, pc, vmJITMinWork+vmJITCursorEntryWork)
 	if cursor {
 		return w >= vmJITMinWork+vmJITCursorEntryWork
 	}
 	return w >= vmJITMinWork
 }
 
+// vmJITCopyWork is the native work, past its column reads, that an entry must
+// do to pay for copying a cursor's row out for it (enter's jitSnap): the
+// engine reads those columns itself, one call each, so the native reads save
+// nothing, and the entry's bookkeeping is several times a plain one's.
+// Measured on joins whose inner seek is read in place: a run of two column
+// reads and a test made a count over a join 28% slower than the VDBE alone.
+const vmJITCopyWork = 24
+
+// copyHeavy is whether an entry at pc does less than vmJITCopyWork besides
+// reading columns: the entries run skips when a cursor they read would have to
+// be copied out.
+func copyHeavy(vp []jit.VInsn, pc int) bool {
+	w, _, reads := nativeRun(vp, pc, vmJITCopyWork+64)
+	return w-reads < vmJITCopyWork
+}
+
 // nativeRun weighs the native instructions from pc along the fall-through and
 // unconditional-jump path, up to limit: a copy or a constant is 1, a jump
 // nothing, anything that computes or tests 2. It reports whether the run
-// includes a cursor instruction.
-func nativeRun(vp []jit.VInsn, pc, limit int) (w int, cursor bool) {
+// includes a cursor instruction, and the weight of its column and rowid reads.
+func nativeRun(vp []jit.VInsn, pc, limit int) (w int, cursor bool, reads int) {
 	for steps := 0; w < limit && steps < 64 && pc >= 0 && pc < len(vp) && vp[pc].Op != jit.VExit; steps++ {
 		switch vp[pc].Op {
 		case jit.VGoto:
@@ -565,17 +590,21 @@ func nativeRun(vp []jit.VInsn, pc, limit int) (w int, cursor bool) {
 			continue
 		case jit.VCopy, jit.VInt:
 			w++
-		case jit.VColumn, jit.VRowid, jit.VNext, jit.VRewind:
+		case jit.VColumn, jit.VRowid:
+			w += 2
+			reads += 2
+			cursor = true
+		case jit.VNext, jit.VRewind:
 			w += 2
 			cursor = true
 		case jit.VResultRow:
-			return w + 2, cursor // native code returns to Go there
+			return w + 2, cursor, reads // native code returns to Go there
 		default:
 			w += 2
 		}
 		pc++
 	}
-	return w, cursor
+	return w, cursor, reads
 }
 
 // lowerVM is in's native form, or VExit. Each case is the INTEGER arm of the
@@ -778,6 +807,17 @@ func jitCursorMask(cur *vdbeCursor) uint64 {
 // sameRow reports whether a and b are the same row: one array, one length.
 func sameRow(a, b []Value) bool {
 	return len(a) == len(b) && len(a) > 0 && &a[0] == &b[0]
+}
+
+// copies is whether an entry at pc would copy a row out of a cursor it reads,
+// one native code cannot walk.
+func (jx *vmJIT) copies(m *vdbe, pc int) bool {
+	for _, cc := range jx.fill[pc] {
+		if cc.cursor < len(m.cursors) && !jitCursorOK(m.cursors[cc.cursor]) {
+			return true
+		}
+	}
+	return false
 }
 
 // jitSnap is the one-row list a cursor native code can read but not walk is
