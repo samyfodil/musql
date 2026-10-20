@@ -21,13 +21,13 @@ import (
 func TestSegJoinAggregateMatchesC(t *testing.T) {
 	setup := []string{
 		`CREATE TABLE artists(id INTEGER PRIMARY KEY, name TEXT NOT NULL)`,
-		`CREATE TABLE albums(id INTEGER PRIMARY KEY, artist_id INTEGER NOT NULL, year INTEGER NOT NULL)`,
+		`CREATE TABLE albums(id INTEGER PRIMARY KEY, artist_id INTEGER NOT NULL, year INTEGER NOT NULL, title TEXT)`,
 		`CREATE TABLE tracks(id INTEGER PRIMARY KEY, album_id INTEGER NOT NULL, seconds INTEGER NOT NULL, plays INTEGER NOT NULL, rating REAL NOT NULL)`,
 		`CREATE INDEX tracks_album ON tracks(album_id)`,
 		`CREATE TABLE big(id INTEGER PRIMARY KEY, album_id INTEGER NOT NULL, v INTEGER NOT NULL)`,
 		`INSERT INTO artists VALUES (-5,'neg'),(1,'a'),(2,'b'),(3,'c'),(1000000000000,'far')`,
 		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 80)
-			INSERT INTO albums SELECT i, CASE i % 5 WHEN 0 THEN -5 WHEN 4 THEN 1000000000000 WHEN 3 THEN 77 ELSE i % 3 + 1 END, 1960 + i % 30 FROM n`,
+			INSERT INTO albums SELECT i, CASE i % 5 WHEN 0 THEN -5 WHEN 4 THEN 1000000000000 WHEN 3 THEN 77 ELSE i % 3 + 1 END, 1960 + i % 30, 'Album ' || (i % 7) FROM n`,
 		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 4000)
 			INSERT INTO tracks SELECT i, CASE WHEN i % 50 = 0 THEN 500 + i ELSE 1 + i % 80 END, 100 + i % 250, (i * 7919) % 100000 - 30000, (i % 7) / 2.0 FROM n`,
 		`INSERT INTO big VALUES (1, 1, 9223372036854775000), (2, 1, 900), (3, 2, -9223372036854775000), (4, 2, -900)`,
@@ -84,7 +84,7 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT g.tag, count(*) FROM tracks t JOIN tags g ON g.id = t.album_id GROUP BY g.tag ORDER BY 2 DESC, 1`, true},
 		{`SELECT al.id, max(t.plays), t.id FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, false},
 		{`SELECT al.id, sum(t.rating) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
-		{`SELECT al.id, group_concat(t.id) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, false},
+		{`SELECT al.id, group_concat(t.id) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
 		// LEFT JOIN: an outer row nothing matches still counts, with NULLs,
 		// terms in the ON clause deciding what matches.
 		{`SELECT count(*), count(t.id), sum(t.seconds), max(t.plays), avg(t.seconds) FROM albums al LEFT JOIN tracks t ON t.album_id = al.id`, true},
@@ -143,7 +143,9 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT count(DISTINCT t.album_id), count(*), sum(DISTINCT al.year) FROM tracks t JOIN albums al ON al.id = t.album_id`, true},
 		{`SELECT al.artist_id, count(DISTINCT t.seconds), avg(DISTINCT t.plays), total(DISTINCT al.year), count(t.seconds) FROM tracks t JOIN albums al ON al.id = t.album_id GROUP BY al.artist_id`, true},
 		{`SELECT al.id, count(DISTINCT t.seconds), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
-		{`SELECT count(DISTINCT t.rating) FROM tracks t JOIN albums al ON al.id = t.album_id`, false},
+		{`SELECT count(DISTINCT t.rating) FROM tracks t JOIN albums al ON al.id = t.album_id`, true},
+		{`SELECT ar.name, group_concat(al.year, '/'), json_group_array(al.id), min(al.title) FROM artists ar JOIN albums al ON al.artist_id = ar.id GROUP BY ar.id`, false},
+		{`SELECT ar.id, group_concat(t.id ORDER BY t.plays) FROM artists ar JOIN albums al ON al.artist_id = ar.id JOIN tracks t ON t.album_id = al.id GROUP BY ar.id`, false},
 		{`SELECT count(DISTINCT w.v), sum(DISTINCT w.album_id) FROM wide w JOIN albums al ON al.id = w.album_id`, true},
 		{`SELECT b.album_id, sum(b.v) FROM big b JOIN albums al ON al.id = b.album_id GROUP BY b.album_id`, false},
 		// Sums the order-strict check has to judge from the values' window.

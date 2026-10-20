@@ -580,18 +580,9 @@ func segJoinGroupPeephole(prog *Program) bool {
 		a, ok := tr.src[reg]
 		return a, ok
 	}
-	var args []segJoinArg
-	for _, it := range aggPlanTemplates(plan) {
-		if it.kind == aggCountStar {
-			continue
-		}
-		reg := it.rowRegs[aggExprArg] - 1
-		a, ok := drainCol(reg)
-		if !ok {
-			return false
-		}
-		a.reg = reg
-		args = append(args, a)
+	args, ok := segJoinAggArgs(plan, drainCol)
+	if !ok {
+		return false
 	}
 	// The one GROUP BY key: the record the drain compares groups by.
 	var key segJoinArg
@@ -661,16 +652,32 @@ func segJoinGroupPeephole(prog *Program) bool {
 
 // segJoinStepArgs is the source of each aggregate's argument register.
 func segJoinStepArgs(plan *aggPlan, src map[int]segJoinArg) ([]segJoinArg, bool) {
+	return segJoinAggArgs(plan, func(reg int) (segJoinArg, bool) {
+		a, ok := src[reg]
+		return a, ok
+	})
+}
+
+// segJoinAggArgs is the source of every register the aggregates step from --
+// each one's argument and, for group_concat and its kin, separator -- found
+// by lookup, each register once.
+func segJoinAggArgs(plan *aggPlan, lookup func(reg int) (segJoinArg, bool)) ([]segJoinArg, bool) {
 	var args []segJoinArg
+	seen := map[int]bool{}
 	for _, it := range aggPlanTemplates(plan) {
-		if it.kind == aggCountStar {
-			continue
+		for _, which := range []int{aggExprArg, aggExprSep} {
+			reg := it.rowRegs[which] - 1
+			if reg < 0 || seen[reg] {
+				continue
+			}
+			a, ok := lookup(reg)
+			if !ok {
+				return nil, false
+			}
+			a.reg = reg
+			args = append(args, a)
+			seen[reg] = true
 		}
-		a, ok := src[it.rowRegs[aggExprArg]-1]
-		if !ok {
-			return nil, false
-		}
-		args = append(args, a)
 	}
 	return args, true
 }
@@ -1155,17 +1162,12 @@ func segJoinHashPeephole(prog *Program) bool {
 	if !ok {
 		return false
 	}
-	var args []segJoinArg
-	for _, it := range aggPlanTemplates(plan) {
-		if it.kind == aggCountStar {
-			continue
-		}
-		reg := it.rowRegs[aggExprArg] - 1
+	args, ok := segJoinAggArgs(plan, func(reg int) (segJoinArg, bool) {
 		a, ok := writer[reg]
-		if !ok {
-			return false
-		}
-		args = append(args, a)
+		return a, ok
+	})
+	if !ok {
+		return false
 	}
 	closeAt, after, ok := l.tail(in, pc+1)
 	if !ok || after >= len(in) || in[after].Op != OpHashAggSort {

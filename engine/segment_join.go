@@ -1229,6 +1229,8 @@ type segJoinArgs struct {
 	nulls  [][]bool    // the rows where an argument is NULL; nil for none
 	levels []int
 	argOf  map[int]int // the step's argument register -> its index
+	plan   *segJoinPlan
+	w      *segJoinWalk
 	floats bool
 	// keep: a group keeps its joined rows, which a REAL argument replays in
 	// order and a DISTINCT one dedupes.
@@ -1239,7 +1241,8 @@ type segJoinArgs struct {
 // one the kernel does not model.
 func segJoinArgsOf(plan *segJoinPlan, w *segJoinWalk) (*segJoinArgs, bool) {
 	n := len(plan.args)
-	args := &segJoinArgs{ints: make([][]int64, n), flts: make([][]float64, n), nulls: make([][]bool, n), levels: make([]int, n), argOf: map[int]int{}}
+	args := &segJoinArgs{ints: make([][]int64, n), flts: make([][]float64, n), nulls: make([][]bool, n),
+		levels: make([]int, n), argOf: map[int]int{}, plan: plan, w: w}
 	for a, arg := range plan.args {
 		// An expression over the optional level's NULL row need not be NULL
 		// (coalesce): such an argument declines.
@@ -1250,46 +1253,72 @@ func segJoinArgsOf(plan *segJoinPlan, w *segJoinWalk) (*segJoinArgs, bool) {
 		args.argOf[arg.reg] = a
 		if vals, _, nulls, ok := w.nullable(arg, false); ok {
 			args.ints[a], args.nulls[a] = vals, nulls
+		} else if _, vals, nulls, ok := w.nullable(arg, true); ok {
+			args.flts[a], args.nulls[a], args.floats = vals, nulls, true
+		}
+		// Otherwise its values are read one at a time, by an aggregate that
+		// replays its rows.
+	}
+	orderMatters := args.floats
+	for _, it := range aggPlanTemplates(plan.agg) {
+		// A FILTER, and an aggregate's own ORDER BY, read registers the trace
+		// does not follow.
+		if it.filter != nil || it.orderBy != nil || it.stepSeg != plan.seg {
+			return nil, false
+		}
+		if it.kind == aggCountStar {
 			continue
 		}
-		_, vals, nulls, ok := w.nullable(arg, true)
-		if !ok {
-			return nil, false
+		for _, which := range []int{aggExprArg, aggExprSep} {
+			if r := it.rowRegs[which] - 1; r >= 0 {
+				if _, ok := args.argOf[r]; !ok {
+					return nil, false
+				}
+			}
 		}
-		args.flts[a], args.nulls[a], args.floats = vals, nulls, true
-	}
-	if args.floats && plan.sorted {
-		return nil, false // a REAL sum replays the loop's order, unknown here
-	}
-	args.keep = args.keep || args.floats
-	for _, it := range aggPlanTemplates(plan.agg) {
-		sumKind := it.kind == aggSum || it.kind == aggTotal || it.kind == aggAvg
-		// An order-strict sum checks at finalize that no order could change
-		// it, from a window over its values that rest keeps up to date. A
-		// DISTINCT count or sum takes INTEGER arguments, which are equal only
-		// when identical.
-		if it.filter != nil || it.orderBy != nil || it.orderStrict && !sumKind || it.stepSeg != plan.seg {
-			return nil, false
+		if args.replays(it) {
+			args.keep = true
+			orderMatters = orderMatters || it.orderSensitive()
 		}
 		if it.distinct {
-			a, ok := args.argOf[it.rowRegs[aggExprArg]-1]
-			if !ok || args.ints[a] == nil || !sumKind && it.kind != aggCount {
-				return nil, false
-			}
 			args.keep = true
 		}
-		switch it.kind {
-		case aggCountStar:
-		case aggCount, aggSum, aggTotal, aggAvg, aggMin, aggMax:
-			a, ok := args.argOf[it.rowRegs[aggExprArg]-1]
-			if !ok || it.minMaxLastWins || args.flts[a] != nil && (it.kind == aggMin || it.kind == aggMax) {
-				return nil, false
-			}
-		default:
-			return nil, false
-		}
 	}
+	if orderMatters && plan.sorted {
+		return nil, false // the rows replay in the loop's order, unknown here
+	}
+	args.keep = args.keep || args.floats
 	return args, true
+}
+
+// replays reports whether aggregate it takes its group's rows after the
+// first through its own step, one at a time, rather than the sums: every
+// kind but count, sum, total, avg, min and max, and those over arguments the
+// sums do not model -- not INTEGER or REAL throughout, a DISTINCT over REALs,
+// a min or max over REALs or one whose ties go to the last -- or order-strict
+// beyond what a sum's window shows.
+func (args *segJoinArgs) replays(it *aggItem) bool {
+	switch it.kind {
+	case aggCountStar:
+		return false
+	case aggCount, aggSum, aggTotal, aggAvg, aggMin, aggMax:
+	default:
+		return true
+	}
+	a := args.argOf[it.rowRegs[aggExprArg]-1]
+	sumKind := it.kind == aggSum || it.kind == aggTotal || it.kind == aggAvg
+	minMax := it.kind == aggMin || it.kind == aggMax
+	switch {
+	case it.minMaxLastWins, it.orderStrict && !sumKind:
+		return true
+	case args.ints[a] == nil && args.flts[a] == nil:
+		return true
+	case args.flts[a] != nil && (minMax || it.distinct):
+		return true
+	case it.distinct && !sumKind && it.kind != aggCount:
+		return true
+	}
+	return false
 }
 
 // segJoinGroups is an aggregate's groups -- one for a whole-join aggregate --
@@ -1437,9 +1466,41 @@ func (gs *segJoinGroups) loadArgs(m *vdbe, g *segJoinGroup) {
 
 // rest adds group g's other rows to the accumulators its first row was just
 // stepped into.
-func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) {
+func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) error {
 	args, s := gs.args, g.sums
 	k := len(gs.plan.cursors)
+	// An aggregate that replays: the group's rows after the first, in the
+	// loop's order, each with the registers its step reads set to that row's
+	// values, through the step itself.
+	var replayErr error
+	var window []Value
+	replay := func(it *aggItem) {
+		if window == nil {
+			window = make([]Value, len(m.regs))
+		}
+		nr := gs.plan.agg.nCols + len(gs.plan.agg.scopes)
+		if len(m.aggNullRow) < nr {
+			m.aggNullRow = make([]Value, nr)
+		}
+		ctx := m.aggRowCtx(gs.plan.agg, m.aggNullRow[:gs.plan.agg.nCols:gs.plan.agg.nCols], m.aggNullRow[gs.plan.agg.nCols:nr])
+		skipped := false
+		for r := 0; r < len(g.rows); r += k {
+			at := g.rows[r : r+k]
+			if !skipped && slices.Equal(at, g.first) {
+				skipped = true // the row already stepped
+				continue
+			}
+			for _, which := range []int{aggExprArg, aggExprSep} {
+				if reg := it.rowRegs[which] - 1; reg >= 0 {
+					window[reg] = gs.w.value(gs.plan.args[args.argOf[reg]], at)
+				}
+			}
+			if err := it.step(ctx, window); err != nil && replayErr == nil {
+				replayErr = err
+				return
+			}
+		}
+	}
 	// firstNN is 1 when the row already stepped holds argument a, 0 when it
 	// is that row's NULL.
 	// null is whether argument a is NULL in level row r: the optional
@@ -1456,6 +1517,10 @@ func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) {
 		return 1
 	}
 	rest := func(it *aggItem) {
+		if args.replays(it) {
+			replay(it)
+			return
+		}
 		if it.kind == aggCountStar {
 			it.cnt += s.n - 1
 			return
@@ -1584,6 +1649,7 @@ func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) {
 	for _, it := range accs.magnets {
 		rest(it)
 	}
+	return replayErr
 }
 
 // segJoinAggregate answers the plan's whole-join aggregate, or reports false
@@ -1612,7 +1678,9 @@ func (m *vdbe) segJoinAggregate(plan *segJoinPlan) (bool, error) {
 	if err := m.aggStep(m.aggRowCtx(plan.agg, row, rowids), plan.seg); err != nil {
 		return false, err
 	}
-	gs.rest(m, g)
+	if err := gs.rest(m, g); err != nil {
+		return false, err
+	}
 	return true, nil
 }
 
@@ -1641,7 +1709,9 @@ func (m *vdbe) segJoinHashAgg(plan *segJoinPlan) (bool, error) {
 		if err := m.hashAggStepRow(plan.agg, keyVals, plan.seg, row, rowids); err != nil {
 			return false, err
 		}
-		gs.rest(m, g)
+		if err := gs.rest(m, g); err != nil {
+			return false, err
+		}
 	}
 	return true, nil
 }

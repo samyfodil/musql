@@ -2737,7 +2737,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 		case OpSegJoinRest:
 			if gs := m.segJoin; gs != nil && gs.plan == op.P4 {
 				if seq := m.recRegs[op.P1][op.P2]; seq.Typ == Int && seq.I >= 0 && seq.I < int64(len(gs.groups)) {
-					gs.rest(m, &gs.groups[seq.I])
+					if rerr := gs.rest(m, &gs.groups[seq.I]); rerr != nil {
+						return nil, rerr
+					}
 				} else {
 					return nil, fmt.Errorf("vdbe: OpSegJoinRest without its group")
 				}

@@ -105,7 +105,9 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 		"sum(f.v * 3 + 1)", "count(1)", "sum(length(f.s))", "max(f.v % 7)", "total(f.w * f.v)", "sum(d2.x * d2.x)",
 		"count(DISTINCT f.v / 10)", "avg(abs(f.v))", "sum(coalesce(f.v, 0))", "min(f.s || 'x')",
 		"sum(CASE WHEN f.v > 10 THEN 1 ELSE 0 END)", "max(CASE f.s WHEN 'a' THEN f.v END)", "total(ifnull(f.w, 2))",
-		"sum(CASE WHEN d2.x IS NULL THEN 0 WHEN d2.x > 2 THEN d2.x ELSE -1 END)"}
+		"sum(CASE WHEN d2.x IS NULL THEN 0 WHEN d2.x > 2 THEN d2.x ELSE -1 END)",
+		"group_concat(f.s)", "group_concat(f.v, '-')", "min(f.s)", "max(f.w)", "json_group_array(f.v)",
+		"count(DISTINCT f.s)", "group_concat(DISTINCT f.s)", "group_concat(f.id ORDER BY f.w DESC)", "max(d1.b)"}
 	joins := []string{
 		"FROM f JOIN d2 ON d2.id = f.d2_id",
 		"FROM d2 JOIN f ON f.d2_id = d2.id",
