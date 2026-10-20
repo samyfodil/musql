@@ -1669,7 +1669,11 @@ type segJoinArgs struct {
 
 // segJoinArgsOf reads plan's arguments, or reports false when an aggregate is
 // one the kernel does not model.
-func segJoinArgsOf(plan *segJoinPlan, w *segJoinWalk) (*segJoinArgs, bool) {
+//
+// replayInts reads every INTEGER argument one row at a time too, its
+// aggregate replaying its rows in the loop's order: what a sum that may
+// overflow takes, to raise the loop's error or turn REAL where it does.
+func segJoinArgsOf(plan *segJoinPlan, w *segJoinWalk, replayInts bool) (*segJoinArgs, bool) {
 	n := len(plan.args)
 	args := &segJoinArgs{ints: make([][]int64, n), flts: make([][]float64, n), nulls: make([][]bool, n),
 		levels: make([]int, n), argOf: map[int]int{}, plan: plan, w: w}
@@ -1689,7 +1693,9 @@ func segJoinArgsOf(plan *segJoinPlan, w *segJoinWalk) (*segJoinArgs, bool) {
 			}
 		}
 		if vals, _, nulls, ok := w.nullable(arg, false); ok {
-			args.ints[a], args.nulls[a] = vals, nulls
+			if !replayInts {
+				args.ints[a], args.nulls[a] = vals, nulls
+			}
 		} else if _, vals, nulls, ok := w.nullable(arg, true); ok {
 			args.flts[a], args.nulls[a], args.floats = vals, nulls, true
 		}
@@ -1784,6 +1790,18 @@ type segJoinGroup struct {
 // segJoinGroupsOf builds plan's groups, or reports false. A plan with no
 // GROUP BY has one group, or none when nothing joins.
 func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (gs *segJoinGroups, ok bool) {
+	gs, ok, overflow := m.segJoinGroupsWith(plan, false)
+	if overflow {
+		// A sum that could overflow: summed again by its own step.
+		gs, ok, _ = m.segJoinGroupsWith(plan, true)
+	}
+	return gs, ok
+}
+
+// segJoinGroupsWith is segJoinGroupsOf with every INTEGER argument summed
+// as the rows go by, or with replayInts, replayed (segJoinArgsOf). overflow
+// reports that a sum could overflow, the groups unbuilt.
+func (m *vdbe) segJoinGroupsWith(plan *segJoinPlan, replayInts bool) (gs *segJoinGroups, ok, overflow bool) {
 	defer func() {
 		// A run the walk could not evaluate: what it produced is not the
 		// loop's.
@@ -1793,11 +1811,11 @@ func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (gs *segJoinGroups, ok bool) {
 	}()
 	w, ok := m.openSegJoin(plan)
 	if !ok {
-		return nil, false
+		return nil, false, false
 	}
-	args, ok := segJoinArgsOf(plan, w)
+	args, ok := segJoinArgsOf(plan, w, replayInts)
 	if !ok {
-		return nil, false
+		return nil, false, false
 	}
 	// The groups, by an INTEGER key's value, or by any other key's canonical
 	// bytes: the encoding hashed GROUP BY keys by, equal exactly when the
@@ -1810,7 +1828,7 @@ func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (gs *segJoinGroups, ok bool) {
 		if plan.key.expr != nil && w.opt(keyLv) {
 			// Read by value, which evaluates the NULL row.
 			if _, ok := w.nullRowValue(plan.key); !ok {
-				return nil, false
+				return nil, false, false
 			}
 		}
 		// A key on the optional level is NULL in its NULL rows, which only the
@@ -1893,12 +1911,16 @@ func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (gs *segJoinGroups, ok bool) {
 				}
 			}
 		}
-		return g.sums.add(args, at)
+		if !g.sums.add(args, at) {
+			overflow = true
+			return false
+		}
+		return true
 	}) {
-		return nil, false
+		return nil, false, overflow
 	}
 	sort.Slice(groups, func(i, j int) bool { return w.before(groups[i].first, groups[j].first) })
-	return &segJoinGroups{w: w, plan: plan, groups: groups, args: args}, true
+	return &segJoinGroups{w: w, plan: plan, groups: groups, args: args}, true, false
 }
 
 // load puts group g's first joined row into the registers the loop body

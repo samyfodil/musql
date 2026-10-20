@@ -78,6 +78,10 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 		if !clean && r.Intn(25) == 0 {
 			return "'t" + fmt.Sprint(r.Intn(5)) + "'"
 		}
+		if !clean && r.Intn(40) == 0 {
+			// Large enough that a sum of a few overflows.
+			return fmt.Sprint(int64(r.Intn(3)-1) * 4611686018427387904)
+		}
 		return fmt.Sprint(r.Intn(max) - max/4)
 	}
 	real := func() string {
