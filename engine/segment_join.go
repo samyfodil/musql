@@ -813,6 +813,50 @@ type segJoinWalk struct {
 	rank   [][]int32
 }
 
+// segJoinOrderEncoding is the encoding OpAutoIndexOrder compares cur's text
+// under: a write cursor's own (applyWriteOrder), else the statement's.
+func segJoinOrderEncoding(cur *vdbeCursor, m *vdbe) TextEncoding {
+	if cur.rowStore == nil {
+		return m.encoding()
+	}
+	if cur.pager != nil {
+		return cur.pager.encoding()
+	}
+	return UTF8
+}
+
+// segJoinCursorOrder is the order autoIndexOrderCursor puts t's rows in,
+// under key, as positions in t: it runs on a cursor like cur holding t's rows
+// in rowid order, each as the cursor reads it (t.value), as the cursor holds
+// them when it is ordered.
+func segJoinCursorOrder(t *segJoinTable, cur *vdbeCursor, key *autoIndexKey, m *vdbe) ([]int, bool) {
+	if t.tbl == nil || key.multiOr != nil && key.multiOr.passes != nil {
+		return nil, false
+	}
+	ncol := len(t.tbl.cols)
+	rows := make([][]Value, t.n)
+	rowids := make([]uint64, t.n)
+	for r := range t.n {
+		row := make([]Value, ncol)
+		for c := range ncol {
+			row[c] = t.value(int32(r), c)
+		}
+		rows[r], rowids[r] = row, uint64(t.rowids[r])
+	}
+	sc := &vdbeCursor{tbl: cur.tbl, pager: cur.pager, params: m.params, rows: rows, rowids: rowids}
+	autoIndexOrderCursor(sc, key, segJoinOrderEncoding(cur, m))
+	t.index()
+	perm := make([]int, t.n)
+	for i, id := range sc.rowids {
+		r := t.row(int64(id))
+		if r < 0 {
+			return nil, false
+		}
+		perm[i] = int(r)
+	}
+	return perm, true
+}
+
 // opt reports whether level i is optional.
 func (w *segJoinWalk) opt(i int) bool { return w.optional>>i&1 != 0 }
 
@@ -1094,15 +1138,25 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 			continue
 		}
 		key := o.key
-		if key.multiOr != nil || key.exprs != nil || len(key.cols) == 0 || len(key.colls) < len(key.cols) {
-			return nil, false
-		}
 		t := w.tabs[lv]
-		perm := make([]int, t.n)
-		for i := range perm {
-			perm[i] = i
+		var perm []int
+		if key.multiOr != nil || key.exprs != nil {
+			// An order by an expression or by a MULTI_OR's sub-scans: the
+			// cursor's own code orders a cursor holding the table's rows.
+			var ok bool
+			if perm, ok = segJoinCursorOrder(t, cur, key, m); !ok {
+				return nil, false
+			}
+		} else {
+			if len(key.cols) == 0 || len(key.colls) < len(key.cols) {
+				return nil, false
+			}
+			perm = make([]int, t.n)
+			for i := range perm {
+				perm[i] = i
+			}
+			autoIndexSortValues(perm, key, func(i, k int) Value { return t.value(int32(i), key.cols[k]) }, segJoinOrderEncoding(cur, m))
 		}
-		autoIndexSortValues(perm, key, func(i, k int) Value { return t.value(int32(i), key.cols[k]) }, m.encoding())
 		rank := make([]int32, t.n)
 		for i, r := range perm {
 			rank[r] = int32(i)
