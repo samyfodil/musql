@@ -117,6 +117,8 @@ type segJoinTable struct {
 	mu    sync.Mutex
 	cols  map[int][]int64
 	kcols map[int]segJoinKeyCol
+	vcols map[int][]Value
+	exprs map[*segJoinExpr][]Value
 	fcols map[int][]float64
 	// lo/dense map a rowid to its row + 1 when the rowids are dense enough,
 	// else sparse does.
@@ -637,6 +639,28 @@ func (t *segJoinTable) value(r int32, c int) Value {
 	return segColumnValue(segColPlansFor(t.tbl), s, row, len(s.cols), uint64(t.rowids[r]), c)
 }
 
+// values is column c of every row as the cursor reads it, kept with the
+// table's other readings.
+func (t *segJoinTable) values(c int) []Value {
+	t.mu.Lock()
+	v, ok := t.vcols[c]
+	t.mu.Unlock()
+	if ok {
+		return v
+	}
+	v = make([]Value, t.n)
+	for r := range v {
+		v[r] = t.value(int32(r), c)
+	}
+	t.mu.Lock()
+	if t.vcols == nil {
+		t.vcols = map[int][]Value{}
+	}
+	t.vcols[c] = v
+	t.mu.Unlock()
+	return v
+}
+
 // index builds the rowid lookup.
 func (t *segJoinTable) index() {
 	t.mu.Lock()
@@ -711,6 +735,23 @@ func (w *segJoinWalk) exprValues(a segJoinArg) ([]Value, bool) {
 	}
 	w.exprs[a.expr] = nil
 	t := w.tabs[w.lv(a)]
+	// Kept with the table while its rows stay the same -- the program, and
+	// so the expression, is the plan cache's -- unless it reads a parameter,
+	// which the next run may bind to another value, or calls a function or a
+	// LIKE, whose answer may follow the connection's settings
+	// (case_sensitive_like).
+	keep := !slices.ContainsFunc(a.expr.insns, func(in Instruction) bool {
+		return in.Op == OpVariable || in.Op == OpFunction || in.Op == OpLike || in.Op == OpGlob
+	})
+	if keep {
+		t.mu.Lock()
+		v, ok := t.exprs[a.expr]
+		t.mu.Unlock()
+		if ok {
+			w.exprs[a.expr] = v
+			return v, v != nil
+		}
+	}
 	vm := *w.m
 	vm.regs = make([]Value, len(w.m.regs))
 	vm.fnArgBuf, vm.likePlan = nil, nil
@@ -719,7 +760,14 @@ func (w *segJoinWalk) exprValues(a segJoinArg) ([]Value, bool) {
 		n = 1
 	}
 	var row int32
-	column := func(op *Instruction) Value { return t.value(row, op.P2) }
+	// Each column the expression reads, read once for every row.
+	cols := map[int][]Value{}
+	for _, op := range a.expr.insns {
+		if op.Op == OpColumn && cols[op.P2] == nil {
+			cols[op.P2] = t.values(op.P2)
+		}
+	}
+	column := func(op *Instruction) Value { return cols[op.P2][row] }
 	out := make([]Value, n)
 	for r := range n {
 		row = int32(r)
@@ -746,6 +794,14 @@ func (w *segJoinWalk) exprValues(a segJoinArg) ([]Value, bool) {
 		}
 	}
 	w.exprs[a.expr] = out
+	if keep {
+		t.mu.Lock()
+		if t.exprs == nil {
+			t.exprs = map[*segJoinExpr][]Value{}
+		}
+		t.exprs[a.expr] = out
+		t.mu.Unlock()
+	}
 	return out, true
 }
 
