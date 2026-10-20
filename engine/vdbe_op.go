@@ -434,6 +434,11 @@ const (
 	// column blocks. P2: jump target (the Closes before the drain), taken only
 	// when it serves. P4(*segJoinPlan).
 	OpSegJoinHash
+	// OpSegJoinTop finds an ORDER BY ... LIMIT's candidate rows over a join
+	// from the column blocks, for OpSegJoinNext to hand the loop body. P2:
+	// jump target (that hand-off), taken only when it serves.
+	// P4(*segJoinPlan).
+	OpSegJoinTop
 
 	OpHashAggData // P2: destination record register rr[P2]. Copies the CURRENT bucket's group-key tuple into rr[P2] and makes that bucket's accumulators the live set (m.aggAccs), so a following OpAggResult finalizes THIS group.
 	OpHashAggNext // P2: jump target. Advances to the next bucket in sorted order; if one exists, jump to P2 (the drain loop's top, exactly like OpSorterNext); otherwise fall through (the drain is exhausted).

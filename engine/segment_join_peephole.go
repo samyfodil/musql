@@ -848,3 +848,115 @@ func segJoinHashPeephole(prog *Program) bool {
 	prog.Insns = out
 	return true
 }
+
+// segJoinTopPeephole recognises an ORDER BY ... LIMIT over the loop: a body
+// that loads the sort key and the output into a record, checks it against
+// the bounded sorter (SorterCheck) and inserts it. The kernel hands the body
+// only the joined rows that can be kept (segJoinTopOf), in the loop's order,
+// through a copy of the body's own instructions; the sorter and its drain
+// run as they did.
+func segJoinTopPeephole(prog *Program) bool {
+	if !jitEnabled || prog == nil {
+		return false
+	}
+	in := prog.Insns
+	if len(in) < 16 || in[0].Op != OpInit || in[1].Op != OpSorterOpen {
+		return false
+	}
+	sorter := in[1].P1
+	ki, ok := in[1].P4.(*sorterKeyInfo)
+	if !ok || ki.bound <= 0 {
+		return false
+	}
+	open := 2
+	l, ok := parseSegJoinLoop(in, open)
+	if !ok || l.outer >= 0 || l.sorted {
+		return false
+	}
+	writer := map[int]segJoinArg{}
+	var loads []segJoinArg
+	var copies []Instruction
+	var mk Instruction
+	pc := l.body
+	check := -1
+body:
+	for ; pc < len(in); pc++ {
+		ins := in[pc]
+		switch ins.Op {
+		case OpColumn, OpRowid:
+			lv, c, ok := segJoinColRead(ins, l.levelOf)
+			if !ok {
+				return false
+			}
+			a := segJoinArg{reg: segJoinColDest(ins), level: lv, col: c}
+			loads = append(loads, a)
+			writer[a.reg] = a
+			continue
+		case OpSCopy:
+			src, ok := writer[ins.P1]
+			if !ok {
+				return false
+			}
+			writer[ins.P2] = segJoinArg{reg: ins.P2, level: src.level, col: src.col}
+		case OpSorterCheck:
+			if check >= 0 || ins.P1 != sorter {
+				return false
+			}
+			check = len(copies)
+		case OpMakeRecord:
+			if mk.Op == OpMakeRecord || check < 0 {
+				return false
+			}
+			mk = ins
+		case OpSorterInsert:
+			if mk.Op != OpMakeRecord || ins.P1 != sorter || ins.P2 != mk.P3 {
+				return false
+			}
+			copies = append(copies, ins)
+			break body
+		default:
+			return false
+		}
+		copies = append(copies, ins)
+	}
+	if pc >= len(in) || check < 0 {
+		return false
+	}
+	closeAt, _, ok := l.tail(in, pc+1)
+	if !ok || copies[check].P2 != pc+1 || copies[check].P3 != mk.P1 || mk.P2 < ki.nKey {
+		return false // the check skips to the innermost Next, over the key
+	}
+	// The sort key's columns, and every value of the record a column.
+	var order []segJoinArg
+	for r := mk.P1; r < mk.P1+mk.P2; r++ {
+		a, ok := writer[r]
+		if !ok {
+			return false
+		}
+		if r < mk.P1+ki.nKey {
+			order = append(order, a)
+		}
+	}
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, optional: l.outer, agg: nil,
+		loads: loads, order: order, keys: ki}
+	out := append([]Instruction(nil), in...)
+	guard := len(out)
+	out[l.head] = Instruction{Op: OpGoto, P2: guard}
+	out = append(out,
+		Instruction{Op: OpSegJoinTop, P2: guard + 3, P4: jp},
+		in[l.head],
+		Instruction{Op: OpGoto, P2: l.head + 1})
+	// guard+3: one candidate at a time through the body's own copies, the
+	// check skipping back here rather than into the loop.
+	top := len(out)
+	out = append(out, Instruction{Op: OpSegJoinNext, P2: closeAt, P4: jp})
+	for i, ins := range copies {
+		if i == check {
+			ins.P2 = top
+		}
+		out = append(out, ins)
+	}
+	out = append(out, Instruction{Op: OpGoto, P2: top})
+	prog.Insns = out
+	return true
+}

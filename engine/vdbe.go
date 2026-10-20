@@ -2710,6 +2710,21 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			segFilterDeclined.Add(1)
 
+		case OpSegJoinTop:
+			jp, okPlan := op.P4.(*segJoinPlan)
+			if !okPlan {
+				return nil, fmt.Errorf("vdbe: OpSegJoinTop without a plan")
+			}
+			m.segJoin = nil
+			if gs, served := m.segJoinTopOf(jp); served {
+				m.segJoin = gs
+				segJoinHits.Add(1)
+				segFilterServed.Add(1)
+				pc = op.P2
+				continue
+			}
+			segFilterDeclined.Add(1)
+
 		case OpSegJoinNext:
 			gs := m.segJoin
 			if gs == nil || gs.plan != op.P4 || gs.next >= len(gs.groups) {

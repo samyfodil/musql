@@ -97,6 +97,22 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT t.album_id, count(al.id), max(al.year) FROM tracks t LEFT JOIN albums al ON al.id = t.album_id GROUP BY t.album_id`, true},
 		{`SELECT al.year, count(*), count(DISTINCT t.album_id) FROM albums al LEFT JOIN tracks t ON t.album_id = al.id AND t.id < 100 GROUP BY al.year`, false},
 		{`SELECT ar.id, count(al.id) FROM artists ar LEFT JOIN albums al ON al.artist_id = ar.id GROUP BY ar.id`, false},
+		// ORDER BY ... LIMIT: only rows that can be kept reach the sorter.
+		{`SELECT al.id, t.id, t.plays FROM albums al JOIN tracks t ON t.album_id = al.id ORDER BY t.plays DESC LIMIT 10`, true},
+		{`SELECT t.id, t.seconds FROM albums al JOIN tracks t ON t.album_id = al.id ORDER BY t.seconds LIMIT 7 OFFSET 30`, true},
+		// Albums first: the rows tied on the key reach the sorter album by
+		// album, not in the tracks' own order, and the sorter keeps the
+		// earliest.
+		{`SELECT al.id, t.id, t.seconds FROM albums al CROSS JOIN tracks t ON t.album_id = al.id ORDER BY t.seconds LIMIT 12 OFFSET 40`, true},
+		{`SELECT al.id, t.id FROM albums al CROSS JOIN tracks t ON t.album_id = al.id ORDER BY t.seconds % 3 DESC LIMIT 20`, false},
+		{`SELECT t.id, al.year FROM tracks t JOIN albums al ON al.id = t.album_id ORDER BY al.year DESC LIMIT 25`, false},
+		{`SELECT t.id, al.year FROM tracks t JOIN albums al ON al.id = t.album_id ORDER BY al.year, t.seconds DESC LIMIT 12`, true},
+		{`SELECT t.id, g.tag FROM tracks t JOIN tags g ON g.id = t.album_id ORDER BY g.tag LIMIT 9`, false},
+		{`SELECT t.id, t.rating FROM albums al JOIN tracks t ON t.album_id = al.id ORDER BY t.rating DESC LIMIT 15`, true},
+		{`SELECT t.id FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.plays > 1000 ORDER BY t.id DESC LIMIT 3`, false},
+		{`SELECT t.id, t.seconds + al.year FROM albums al JOIN tracks t ON t.album_id = al.id ORDER BY t.seconds LIMIT 100000`, false},
+		{`SELECT al.id, al.year FROM tracks t JOIN albums al ON al.id = t.album_id ORDER BY al.year LIMIT 1`, false},
+		{`SELECT t.id FROM albums al LEFT JOIN tracks t ON t.album_id = al.id ORDER BY t.plays LIMIT 5`, false},
 		// DISTINCT over INTEGER arguments.
 		{`SELECT count(DISTINCT t.album_id), count(*), sum(DISTINCT t.seconds % 7) FROM tracks t JOIN albums al ON al.id = t.album_id`, false},
 		{`SELECT count(DISTINCT t.album_id), count(*), sum(DISTINCT al.year) FROM tracks t JOIN albums al ON al.id = t.album_id`, true},

@@ -58,6 +58,11 @@ type segJoinPlan struct {
 	// sorted: some level visits its rows in an index's order, not rowid
 	// order, so the loop's order is not one the kernel knows.
 	sorted bool
+
+	// An ORDER BY ... LIMIT's: the columns of its sort key, and the bounded
+	// sorter's key (sorterKeyInfo.bound rows kept).
+	order []segJoinArg
+	keys  *sorterKeyInfo
 }
 
 // segJoinEdge is "level a's column aCol = level b's column bCol", a column of
@@ -1301,4 +1306,167 @@ func (gs *segJoinGroups) gather(g *segJoinGroup, row, rowids []Value) bool {
 		}
 	}
 	return true
+}
+
+// segJoinTopOf is an ORDER BY ... LIMIT's candidates: the joined rows whose
+// sort key is no later than the bound-th smallest, ties included, in the
+// loop's order. Handed to the bounded sorter in that order, they leave it
+// holding exactly the rows every joined row would have: the rows it keeps
+// are these, and among equal keys it keeps the earliest inserted, whose
+// order is the loop's. Each is a group of one row, which OpSegJoinNext loads.
+func (m *vdbe) segJoinTopOf(plan *segJoinPlan) (*segJoinGroups, bool) {
+	ki := plan.keys
+	if ki == nil || ki.bound <= 0 || ki.nKey != len(plan.order) || plan.sorted || plan.optional >= 0 {
+		return nil, false
+	}
+	w, ok := m.openSegJoin(plan)
+	if !ok {
+		return nil, false
+	}
+	if gs, ok := segJoinTopNumeric(w, plan); ok {
+		return gs, true
+	}
+	cmpKeys := &vdbeSorter{keyInfo: *ki, enc: m.encoding()}
+	key := func(at []int32, into []Value) []Value {
+		into = into[:0]
+		for _, o := range plan.order {
+			into = append(into, w.tabs[o.level].value(at[o.level], o.col))
+		}
+		return into
+	}
+	// The bound-th smallest key: a max-heap of the smallest seen.
+	k := len(plan.cursors)
+	at := make([]int32, k)
+	var heap [][]Value
+	less := func(a, b []Value) bool {
+		l, _ := cmpKeys.keyLess(a, b)
+		return l
+	}
+	var buf []Value
+	w.each(at, func() bool {
+		buf = key(at, buf)
+		if len(heap) < ki.bound {
+			heap = append(heap, slices.Clone(buf))
+			for i := len(heap) - 1; i > 0; {
+				p := (i - 1) / 2
+				if !less(heap[p], heap[i]) {
+					break
+				}
+				heap[p], heap[i] = heap[i], heap[p]
+				i = p
+			}
+			return true
+		}
+		if !less(buf, heap[0]) {
+			return true
+		}
+		copy(heap[0], buf)
+		for i := 0; ; {
+			c := 2*i + 1
+			if c >= len(heap) {
+				break
+			}
+			if c+1 < len(heap) && less(heap[c], heap[c+1]) {
+				c++
+			}
+			if !less(heap[i], heap[c]) {
+				break
+			}
+			heap[i], heap[c] = heap[c], heap[i]
+			i = c
+		}
+		return true
+	})
+	gs := &segJoinGroups{w: w, plan: plan}
+	if len(heap) == 0 {
+		return gs, true
+	}
+	limit := heap[0]
+	w.each(at, func() bool {
+		buf = key(at, buf)
+		if !less(limit, buf) {
+			gs.groups = append(gs.groups, segJoinGroup{first: slices.Clone(at)})
+		}
+		return true
+	})
+	sort.Slice(gs.groups, func(i, j int) bool { return loopBefore(gs.groups[i].first, gs.groups[j].first) })
+	return gs, true
+}
+
+// segJoinTopNumeric is segJoinTopOf for one sort key over a clean INTEGER
+// column, which orders as its values do under any collation and holds no
+// NULL: one walk, the bound-th smallest found in a heap of integers.
+func segJoinTopNumeric(w *segJoinWalk, plan *segJoinPlan) (*segJoinGroups, bool) {
+	ki := plan.keys
+	if ki.nKey != 1 {
+		return nil, false
+	}
+	o := plan.order[0]
+	vals, ok := w.tabs[o.level].col(o.col)
+	if !ok {
+		return nil, false
+	}
+	// Ordered descending, the smallest key is the largest value.
+	desc := ki.desc[0]
+	before := func(a, b int64) bool {
+		if desc {
+			return a > b
+		}
+		return a < b
+	}
+	k := len(plan.cursors)
+	at := make([]int32, k)
+	var keys []int64
+	var rows []int32
+	w.each(at, func() bool {
+		keys = append(keys, vals[at[o.level]])
+		rows = append(rows, at...)
+		return true
+	})
+	gs := &segJoinGroups{w: w, plan: plan}
+	if len(keys) == 0 {
+		return gs, true
+	}
+	// A max-heap, under before, of the bound smallest keys.
+	heap := make([]int64, 0, min(ki.bound, len(keys)))
+	for _, v := range keys {
+		if len(heap) < ki.bound {
+			heap = append(heap, v)
+			for i := len(heap) - 1; i > 0; {
+				p := (i - 1) / 2
+				if !before(heap[p], heap[i]) {
+					break
+				}
+				heap[p], heap[i] = heap[i], heap[p]
+				i = p
+			}
+			continue
+		}
+		if !before(v, heap[0]) {
+			continue
+		}
+		heap[0] = v
+		for i := 0; ; {
+			c := 2*i + 1
+			if c >= len(heap) {
+				break
+			}
+			if c+1 < len(heap) && before(heap[c], heap[c+1]) {
+				c++
+			}
+			if !before(heap[i], heap[c]) {
+				break
+			}
+			heap[i], heap[c] = heap[c], heap[i]
+			i = c
+		}
+	}
+	limit := heap[0]
+	for i, v := range keys {
+		if !before(limit, v) {
+			gs.groups = append(gs.groups, segJoinGroup{first: rows[i*k : i*k+k : i*k+k]})
+		}
+	}
+	sort.Slice(gs.groups, func(i, j int) bool { return loopBefore(gs.groups[i].first, gs.groups[j].first) })
+	return gs, true
 }
