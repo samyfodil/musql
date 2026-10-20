@@ -803,6 +803,8 @@ type segJoinWalk struct {
 
 	m     *vdbe
 	exprs map[*segJoinExpr][]Value // each expression's value per row
+	// nullExprs is each expression's value on the optional level's NULL row.
+	nullExprs map[*segJoinExpr]Value
 
 	// order0 is the first level's rows in the order the loop visits them,
 	// nil for rowid order; rank, per level, each row's place in the order
@@ -895,30 +897,11 @@ func (w *segJoinWalk) exprValues(a segJoinArg) ([]Value, bool) {
 	out := make([]Value, n)
 	for r := range n {
 		row = int32(r)
-		for k := 0; k < len(a.expr.insns); {
-			op := &a.expr.insns[k]
-			switch {
-			case op.Op == OpRowid:
-				vm.regs[op.P2] = t.value(row, -1)
-			case op.Op == OpGoto:
-				k = a.expr.at(op.P2)
-				continue
-			default:
-				taken, ok := vm.segEvalInsn(op, column)
-				if !ok {
-					return nil, false
-				}
-				if taken {
-					k = a.expr.at(op.P2)
-					continue
-				}
-			}
-			k++
+		v, ok := segJoinEvalRow(&vm, a.expr, column, t.value(row, -1))
+		if !ok {
+			return nil, false
 		}
-		out[r] = vm.regs[a.expr.out]
-		// The value may point into the private registers' scratch: kept,
-		// it must be its own.
-		out[r] = copyValue(out[r])
+		out[r] = v
 	}
 	if a.level < 0 {
 		one := out[0]
@@ -937,6 +920,55 @@ func (w *segJoinWalk) exprValues(a segJoinArg) ([]Value, bool) {
 		t.mu.Unlock()
 	}
 	return out, true
+}
+
+// segJoinEvalRow runs e once on vm's registers, its columns read by column
+// and its rowid rowid, and returns its value.
+func segJoinEvalRow(vm *vdbe, e *segJoinExpr, column func(*Instruction) Value, rowid Value) (Value, bool) {
+	for k := 0; k < len(e.insns); {
+		op := &e.insns[k]
+		switch {
+		case op.Op == OpRowid:
+			vm.regs[op.P2] = rowid
+		case op.Op == OpGoto:
+			k = e.at(op.P2)
+			continue
+		default:
+			taken, ok := vm.segEvalInsn(op, column)
+			if !ok {
+				return Value{}, false
+			}
+			if taken {
+				k = e.at(op.P2)
+				continue
+			}
+		}
+		k++
+	}
+	// The value may point into the private registers' scratch: kept, it
+	// must be its own.
+	return copyValue(vm.regs[e.out]), true
+}
+
+// nullRowValue is a's value on the optional level's NULL row, where every
+// column and the rowid read NULL -- not NULL itself for every expression
+// (coalesce).
+func (w *segJoinWalk) nullRowValue(a segJoinArg) (Value, bool) {
+	if v, ok := w.nullExprs[a.expr]; ok {
+		return v, true
+	}
+	vm := *w.m
+	vm.regs = make([]Value, len(w.m.regs))
+	vm.fnArgBuf, vm.likePlan = nil, nil
+	v, ok := segJoinEvalRow(&vm, a.expr, func(*Instruction) Value { return Value{} }, Value{})
+	if !ok {
+		return Value{}, false
+	}
+	if w.nullExprs == nil {
+		w.nullExprs = map[*segJoinExpr]Value{}
+	}
+	w.nullExprs[a.expr] = v
+	return v, true
 }
 
 // ints is a's value per row of its level as integers, or false unless every
@@ -1023,8 +1055,12 @@ func (w *segJoinWalk) value(a segJoinArg, at []int32) Value {
 	if a.expr == nil {
 		return w.tabs[lv].value(at[lv], a.col)
 	}
+	if at[lv] < 0 {
+		v, _ := w.nullRowValue(a)
+		return v
+	}
 	vals, ok := w.exprValues(a)
-	if !ok || at[lv] < 0 {
+	if !ok {
 		return Value{}
 	}
 	return vals[at[lv]]
@@ -1928,12 +1964,25 @@ func (gs *segJoinGroups) gather(g *segJoinGroup, row, rowids []Value) bool {
 // order is the loop's. Each is a group of one row, which OpSegJoinNext loads.
 func (m *vdbe) segJoinTopOf(plan *segJoinPlan) (*segJoinGroups, bool) {
 	ki := plan.keys
-	if ki == nil || ki.bound <= 0 || ki.nKey != len(plan.order) || plan.optional >= 0 {
+	if ki == nil || ki.bound <= 0 || ki.nKey != len(plan.order) {
 		return nil, false
 	}
 	w, ok := m.openSegJoin(plan)
 	if !ok {
 		return nil, false
+	}
+	// Every key computable on every row, the NULL row included: value
+	// reads NULL for one that is not.
+	for _, o := range plan.order {
+		if o.expr == nil {
+			continue
+		}
+		if _, ok := w.exprValues(o); !ok {
+			return nil, false
+		}
+		if _, ok := w.nullRowValue(o); !ok && w.lv(o) == w.optional {
+			return nil, false
+		}
 	}
 	if gs, ok := segJoinTopNumeric(w, plan); ok {
 		return gs, true
@@ -2015,7 +2064,7 @@ func segJoinTopNumeric(w *segJoinWalk, plan *segJoinPlan) (*segJoinGroups, bool)
 	}
 	o := plan.order[0]
 	vals, ok := w.ints(o)
-	if !ok {
+	if !ok || w.lv(o) == w.optional {
 		return nil, false
 	}
 	// Ordered descending, the smallest key is the largest value.

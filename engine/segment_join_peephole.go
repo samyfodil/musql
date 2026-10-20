@@ -1435,57 +1435,33 @@ func segJoinTopPeephole(prog *Program) bool {
 	}
 	open := 2
 	l, ok := parseSegJoinLoop(in, open)
-	if !ok || l.outer >= 0 {
+	if !ok {
 		return false
 	}
-	tr := newSegJoinTrace(in, l.levelOf)
-	writer := tr.src
-	var loads []segJoinArg
-	var copies []Instruction
-	var mk Instruction
-	pc := l.body
-	check := -1
-body:
-	for ; pc < len(in); pc++ {
-		ins := in[pc]
-		switch ins.Op {
-		case OpColumn, OpRowid:
-			if !tr.step(pc) {
-				return false
-			}
-			loads = append(loads, tr.src[segJoinColDest(ins)])
-			continue
-		case OpSorterCheck:
-			if check >= 0 || ins.P1 != sorter {
-				return false
-			}
-			check = len(copies)
-		case OpMakeRecord:
-			if mk.Op == OpMakeRecord || check < 0 {
-				return false
-			}
-			mk = ins
-		case OpSorterInsert:
-			if mk.Op != OpMakeRecord || ins.P1 != sorter || ins.P2 != mk.P3 {
-				return false
-			}
-			copies = append(copies, ins)
-			break body
-		default:
-			// An expression the record holds: the body's copy computes it
-			// again from the loaded columns.
-			if !tr.step(pc) {
-				return false
-			}
-		}
-		copies = append(copies, ins)
-	}
-	if pc >= len(in) || check < 0 {
+	b, ok := parseSegJoinTopBody(in, l.body, len(in), l.levelOf, sorter)
+	if !ok {
 		return false
 	}
+	writer, loads, copies, mk, check, pc := b.writer, b.loads, b.copies, b.mk, b.check, b.end
 	closeAt, _, ok := l.tail(in, pc+1)
 	if !ok || copies[check].P2 != pc+1 || copies[check].P3 != mk.P1 || mk.P2 < ki.nKey {
 		return false // the check skips to the innermost Next, over the key
+	}
+	if l.outer >= 0 {
+		// The LEFT JOIN's null row goes through a copy of the body that must
+		// put the same values in the same record.
+		nb, ok := parseSegJoinTopBody(in, l.nullBody[0], l.nullBody[1], l.levelOf, sorter)
+		if !ok || nb.end+1 != l.nullBody[1] || !segJoinSameInsn(nb.mk, mk) ||
+			nb.copies[nb.check].P2 != l.nullBody[1] || nb.copies[nb.check].P3 != mk.P1 {
+			return false
+		}
+		for r := mk.P1; r < mk.P1+mk.P2; r++ {
+			x, okx := writer[r]
+			y, oky := nb.writer[r]
+			if !okx || !oky || x.level != y.level || x.col != y.col || x.guard != y.guard || !segJoinSameExpr(x.expr, y.expr) {
+				return false
+			}
+		}
 	}
 	// The sort key's columns, and every value of the record a column.
 	var order []segJoinArg
@@ -1520,4 +1496,183 @@ body:
 	out = append(out, Instruction{Op: OpGoto, P2: top})
 	prog.Insns = out
 	return true
+}
+
+// Operand kinds, for comparing two copies of an expression.
+const (
+	segOpConst = iota // compared as is: a cursor, a column, a literal
+	segOpReg          // a register, renamed between the copies
+	segOpJump         // an address, at the same place in each copy
+)
+
+// segJoinOperandKinds is the kind of P1, P2 and P3 of an instruction a
+// segJoinTrace may put in an expression; ok is false for any other.
+func segJoinOperandKinds(in Instruction) (k [3]int, ok bool) {
+	c, r, j := segOpConst, segOpReg, segOpJump
+	switch in.Op {
+	case OpColumn:
+		return [3]int{c, c, r}, true
+	case OpRowid, OpInteger, OpInt64, OpReal, OpString8, OpNull, OpVariable:
+		return [3]int{c, r, c}, true
+	case OpSCopy, OpCopy, OpNot:
+		return [3]int{r, r, c}, true
+	case OpFunction:
+		return [3]int{r, c, r}, true // P2 arguments from P1: renamed as a run
+	case OpLike, OpGlob, OpConcat, OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder:
+		return [3]int{r, r, r}, true
+	case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
+		if in.P5&p5StoreP2 != 0 {
+			return [3]int{r, r, r}, true
+		}
+		return [3]int{r, j, r}, true
+	case OpIf, OpIfNot, OpIsNull, OpNotNull:
+		return [3]int{r, j, c}, true
+	case OpGoto:
+		return [3]int{c, j, c}, true
+	}
+	return k, false
+}
+
+// segJoinSameExpr reports whether a and b compute the same value: the same
+// instructions in the same order, their registers renamed one to one (a
+// register read before the copy writes it is the same register in both),
+// their jumps landing at the same place in each.
+func segJoinSameExpr(a, b *segJoinExpr) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if len(a.insns) != len(b.insns) || len(a.pcs) != len(b.pcs) {
+		return false
+	}
+	ab, ba := map[int]int{}, map[int]int{}
+	reg := func(x, y int) bool {
+		if m, ok := ab[x]; ok {
+			return m == y
+		}
+		if m, ok := ba[y]; ok {
+			return m == x
+		}
+		ab[x], ba[y] = y, x
+		return true
+	}
+	// Where a jump lands: an instruction of the copy by its place, or past
+	// the last by the same distance.
+	place := func(e *segJoinExpr, to int) int {
+		if i := slices.Index(e.pcs, to); i >= 0 {
+			return i
+		}
+		return len(e.pcs) + to - e.pcs[len(e.pcs)-1]
+	}
+	written := map[int]bool{}
+	for i := range a.insns {
+		x, y := a.insns[i], b.insns[i]
+		kinds, ok := segJoinOperandKinds(x)
+		if !ok || x.Op != y.Op || x.P5 != y.P5 {
+			return false
+		}
+		if x.Op == OpLike {
+			// P4 an escape register, or not one.
+			ex, xr := x.P4.(int)
+			ey, yr := y.P4.(int)
+			if xr != yr || xr && (ex >= 0) != (ey >= 0) || xr && ex >= 0 && !reg(ex, ey) {
+				return false
+			}
+		} else if !segJoinSameInsn(Instruction{Op: x.Op, P4: x.P4}, Instruction{Op: y.Op, P4: y.P4}) {
+			return false
+		}
+		reads, writes, _, _ := segInsnRegs(x)
+		if x.Op == OpRowid {
+			writes = []int{x.P2}
+		}
+		px, py := [3]int{x.P1, x.P2, x.P3}, [3]int{y.P1, y.P2, y.P3}
+		for f, kind := range kinds {
+			switch kind {
+			case segOpConst:
+				if px[f] != py[f] {
+					return false
+				}
+			case segOpJump:
+				if place(a, px[f]) != place(b, py[f]) {
+					return false
+				}
+			case segOpReg:
+				n := 1
+				if x.Op == OpFunction && f == 0 {
+					n = x.P2 // the arguments, a run of registers
+				}
+				for d := range n {
+					rx, ry := px[f]+d, py[f]+d
+					if slices.Contains(reads, rx) && !written[rx] && rx != ry {
+						return false // read from outside the copy
+					}
+					if !reg(rx, ry) {
+						return false
+					}
+				}
+			}
+		}
+		for _, w := range writes {
+			written[w] = true
+		}
+	}
+	return reg(a.out, b.out)
+}
+
+// segJoinTopBody is an ORDER BY ... LIMIT loop's body: the columns it loads,
+// its instructions from the loads to the SorterInsert at end (the check at
+// copies[check]), the record it makes and where each register came from.
+type segJoinTopBody struct {
+	writer map[int]segJoinArg
+	loads  []segJoinArg
+	copies []Instruction
+	mk     Instruction
+	check  int
+	end    int
+}
+
+// parseSegJoinTopBody reads the body from pc, before limit, inserting into
+// sorter.
+func parseSegJoinTopBody(in []Instruction, pc, limit int, levelOf map[int]int, sorter int) (segJoinTopBody, bool) {
+	tr := newSegJoinTrace(in, levelOf)
+	b := segJoinTopBody{writer: tr.src, check: -1}
+body:
+	for ; pc < limit; pc++ {
+		ins := in[pc]
+		switch ins.Op {
+		case OpColumn, OpRowid:
+			if !tr.step(pc) {
+				return b, false
+			}
+			b.loads = append(b.loads, tr.src[segJoinColDest(ins)])
+			continue
+		case OpSorterCheck:
+			if b.check >= 0 || ins.P1 != sorter {
+				return b, false
+			}
+			b.check = len(b.copies)
+		case OpMakeRecord:
+			if b.mk.Op == OpMakeRecord || b.check < 0 {
+				return b, false
+			}
+			b.mk = ins
+		case OpSorterInsert:
+			if b.mk.Op != OpMakeRecord || ins.P1 != sorter || ins.P2 != b.mk.P3 {
+				return b, false
+			}
+			b.copies = append(b.copies, ins)
+			break body
+		default:
+			// An expression the record holds: the body's copy computes it
+			// again from the loaded columns.
+			if !tr.step(pc) {
+				return b, false
+			}
+		}
+		b.copies = append(b.copies, ins)
+	}
+	if pc >= limit || b.check < 0 {
+		return b, false
+	}
+	b.end = pc
+	return b, true
 }

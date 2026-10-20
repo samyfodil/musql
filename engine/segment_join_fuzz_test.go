@@ -184,7 +184,7 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 	}
 	for range 10 {
 		join := joins[r.Intn(len(joins))]
-		keys := []string{"f.v", "f.v DESC", "d2.x", "f.w DESC", "f.s", "d2.id DESC, f.id", "f.v % 9 DESC", "length(f.s), f.id"}
+		keys := []string{"f.v", "f.v DESC", "d2.x", "f.w DESC", "f.s", "d2.id DESC, f.id", "f.v % 9 DESC", "length(f.s), f.id", "coalesce(d2.x, 7), f.id", "d2.y DESC, f.id DESC", "d2.x IS NULL, f.v"}
 		queries = append(queries, fmt.Sprintf("SELECT f.id, d2.id, f.v %s ORDER BY %s LIMIT %d OFFSET %d",
 			join, keys[r.Intn(len(keys))], 1+r.Intn(12), r.Intn(4)))
 	}
