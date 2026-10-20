@@ -24,29 +24,29 @@ The × columns compare musql with native C SQLite.
 
 | Query | musql | C native | C via Go | Turso | vs C native |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Filtered count, one predicate | 29 µs | 2.69 ms | 2.16 ms | 5.75 ms | **94× faster** |
-| Filtered count, two predicates | 28 µs | 2.59 ms | 2.58 ms | 7.02 ms | **92× faster** |
-| Rowid lookup | 5 µs | 3.0 µs | 5 µs | 9 µs | **1.7× slower** |
-| Secondary-index equality | 5 µs | 2.8 µs | 5 µs | 10 µs | **1.9× slower** |
-| Indexed equi-join | 7 µs | 4.2 µs | 8 µs | 15 µs | **1.7× slower** |
-| Sum over a filter | 292 µs | 2.40 ms | 2.38 ms | 6.55 ms | **8.2× faster** |
-| Grouped aggregate | 6.10 ms | 13.1 ms | 13.2 ms | 26.3 ms | **2.1× faster** |
-| `ORDER BY v DESC LIMIT 20` | 894 µs | 2.53 ms | 2.54 ms | 22.4 ms | **2.8× faster** |
-| Whole-table count | 5 µs | 7.7 µs | 10 µs | 34 µs | **1.5× faster** |
+| Filtered count, one predicate | 25 µs | 2.77 ms | 2.19 ms | 5.91 ms | **111× faster** |
+| Filtered count, two predicates | 25 µs | 2.61 ms | 2.61 ms | 7.34 ms | **104× faster** |
+| Rowid lookup | <1 µs | 3.1 µs | 5 µs | 9 µs | **9× faster** |
+| Secondary-index equality | <1 µs | 2.9 µs | 6 µs | 11 µs | **6× faster** |
+| Indexed equi-join | 2 µs | 4.4 µs | 8 µs | 16 µs | **2.2× faster** |
+| Sum over a filter | 25 µs | 2.44 ms | 2.43 ms | 6.69 ms | **98× faster** |
+| Grouped aggregate | 169 µs | 14.0 ms | 13.8 ms | 26.4 ms | **83× faster** |
+| `ORDER BY v DESC LIMIT 20` | 100 µs | 2.58 ms | 2.56 ms | 22.4 ms | **26× faster** |
+| Whole-table count | <1 µs | 8.2 µs | 10 µs | 33 µs | **25× faster** |
 
 **Intel Xeon D-2123IT** (amd64, Linux)
 
 | Query | musql | C native | C via Go | Turso | vs C native |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Filtered count, one predicate | 56 µs | 6.12 ms | 6.62 ms | 20.5 ms | **110× faster** |
-| Filtered count, two predicates | 116 µs | 7.11 ms | 7.98 ms | 25.0 ms | **61× faster** |
-| Rowid lookup | 35 µs | 11.2 µs | 27 µs | 41 µs | **3.2× slower** |
-| Secondary-index equality | 37 µs | 10.4 µs | 26 µs | 49 µs | **3.5× slower** |
-| Indexed equi-join | 44 µs | 15.2 µs | 43 µs | 77 µs | **2.9× slower** |
-| Sum over a filter | 887 µs | 6.46 ms | 7.31 ms | 24.3 ms | **7.3× faster** |
-| Grouped aggregate | 17.9 ms | 39.7 ms | 41.9 ms | 110 ms | **2.2× faster** |
-| `ORDER BY v DESC LIMIT 20` | 4.56 ms | 8.70 ms | 9.51 ms | 94.8 ms | **1.9× faster** |
-| Whole-table count | 30 µs | 23.8 µs | 40 µs | 242 µs | **1.3× slower** |
+| Filtered count, one predicate | 40 µs | 5.63 ms | 6.29 ms | 18.9 ms | **142× faster** |
+| Filtered count, two predicates | 76 µs | 6.52 ms | 7.25 ms | 23.4 ms | **86× faster** |
+| Rowid lookup | 1 µs | 10.3 µs | 20 µs | 37 µs | **9× faster** |
+| Secondary-index equality | 2 µs | 9.7 µs | 22 µs | 51 µs | **4× faster** |
+| Indexed equi-join | 7 µs | 14.5 µs | 30 µs | 79 µs | **2× faster** |
+| Sum over a filter | 32 µs | 6.08 ms | 6.80 ms | 22.4 ms | **190× faster** |
+| Grouped aggregate | 543 µs | 38.3 ms | 40.5 ms | 102 ms | **71× faster** |
+| `ORDER BY v DESC LIMIT 20` | 330 µs | 8.07 ms | 8.88 ms | 87.0 ms | **24× faster** |
+| Whole-table count | 1 µs | 22.3 µs | 35 µs | 149 µs | **16× faster** |
 
 ## 1,000,000 rows
 
@@ -56,33 +56,29 @@ The scan multiples hold or grow with ten times the rows.
 
 | Query | musql | C native | Turso | vs C native |
 | --- | ---: | ---: | ---: | ---: |
-| Filtered count, one predicate | 247 µs | 23.2 ms | 60.2 ms | **94× faster** |
-| Filtered count, two predicates | 249 µs | 27.5 ms | 74.0 ms | **111× faster** |
-| Rowid lookup | 5 µs | 3.4 µs | 11 µs | **1.5× slower** |
-| Secondary-index equality | 5 µs | 3.4 µs | 12 µs | **1.3× slower** |
-| Indexed equi-join | 8 µs | 84 µs | 107 µs | 11× faster ¹ |
-| Sum over a filter | 3.10 ms | 25.2 ms | 69.7 ms | **8.1× faster** |
-| Grouped aggregate | 62.1 ms | 140 ms | 382 ms | **2.3× faster** |
-| `ORDER BY v DESC LIMIT 20` | 8.81 ms | 27.1 ms | 287 ms | **3.1× faster** |
-| Whole-table count | 3 µs | 1.37 ms | 5.11 ms | **423× faster** |
+| Filtered count, one predicate | 248 µs | 23.0 ms | 60.7 ms | **93× faster** |
+| Filtered count, two predicates | 253 µs | 27.5 ms | 74.8 ms | **109× faster** |
+| Rowid lookup | 1 µs | 3.5 µs | 11 µs | **3.5× faster** |
+| Secondary-index equality | 3 µs | 3.5 µs | 12 µs | **1.2× faster** |
+| Indexed equi-join | 4 µs | 5.5 µs | 19 µs | **1.4× faster** |
+| Sum over a filter | 252 µs | 25.2 ms | 70.4 ms | **100× faster** |
+| Grouped aggregate | 1.60 ms | 157 ms | 414 ms | **98× faster** |
+| `ORDER BY v DESC LIMIT 20` | 209 µs | 27.1 ms | 293 ms | **130× faster** |
+| Whole-table count | <1 µs | 1.36 ms | 5.82 ms | **4,200× faster** |
 
 **Intel Xeon D-2123IT** (amd64, Linux)
 
 | Query | musql | C native | Turso | vs C native |
 | --- | ---: | ---: | ---: | ---: |
-| Filtered count, one predicate | 452 µs | 63.4 ms | 226 ms | **140× faster** |
-| Filtered count, two predicates | 1.17 ms | 73.0 ms | 277 ms | **63× faster** |
-| Rowid lookup | 14 µs | 12.3 µs | 44 µs | **1.2× slower** |
-| Secondary-index equality | 19 µs | 12.0 µs | 53 µs | **1.5× slower** |
-| Indexed equi-join | 56 µs | 18 µs | 85 µs | **3.1× slower** |
-| Sum over a filter | 7.48 ms | 77.5 ms | 278 ms | **10× faster** |
-| Grouped aggregate | 168 ms | 430 ms | 1.37 s | **2.6× faster** |
-| `ORDER BY v DESC LIMIT 20` | 34.3 ms | 89.6 ms | 1.17 s | **2.6× faster** |
-| Whole-table count | 21 µs | 5.77 ms | 20.4 ms | **280× faster** |
-
-¹ C SQLite took 84 µs for this join on the M4 at 1M rows, against 18 µs on
-the amd64 machine; it has not been investigated, so it is left out of any
-summary.
+| Filtered count, one predicate | 438 µs | 60.0 ms | 207 ms | **137× faster** |
+| Filtered count, two predicates | 1.17 ms | 68.8 ms | 252 ms | **59× faster** |
+| Rowid lookup | 1 µs | 11.4 µs | 50 µs | **9× faster** |
+| Secondary-index equality | 7 µs | 11.2 µs | 51 µs | **1.6× faster** |
+| Indexed equi-join | 15 µs | 17 µs | 96 µs | **1.1× faster** |
+| Sum over a filter | 507 µs | 64.5 ms | 253 ms | **127× faster** |
+| Grouped aggregate | 3.98 ms | 396 ms | 1.32 s | **99× faster** |
+| `ORDER BY v DESC LIMIT 20` | 678 µs | 83.8 ms | 1.07 s | **124× faster** |
+| Whole-table count | 3 µs | 5.67 ms | 18.6 ms | **2,200× faster** |
 
 ## Against DuckDB
 

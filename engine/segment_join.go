@@ -74,6 +74,9 @@ type segJoinPlan struct {
 	// its whole row (segJoinFullStep), rather than the kernel adding its
 	// arguments.
 	fullStep bool
+	// firstRow: only bare columns read the row, from each group's first
+	// joined row (segJoinFirstRow), which is stepped with it.
+	firstRow bool
 	// keyColl is the GROUP BY key's collation when it is not BINARY:
 	// NOCASE or RTRIM.
 	keyColl string
@@ -1381,6 +1384,11 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 		if c >= len(m.cursors) {
 			return nil, false
 		}
+		// A level the loop seeks by an index once visits only the key's rows;
+		// the kernel would read the whole table.
+		if cur := m.cursors[c]; cur != nil && cur.idxSeekConfigured && !cur.seekReseek {
+			return nil, false
+		}
 		t, ok := segJoinTableOf(m.cursors[c])
 		if !ok {
 			return nil, false
@@ -1902,6 +1910,14 @@ type segJoinGroups struct {
 	groups []segJoinGroup
 	next   int
 	args   *segJoinArgs
+	// gcols is each of the aggregate's gathers' level and columns, read
+	// once for gatherAt.
+	gcols []segJoinGatherCols
+}
+
+type segJoinGatherCols struct {
+	level int
+	cols  [][]Value
 }
 
 type segJoinGroup struct {
@@ -2348,7 +2364,7 @@ func (m *vdbe) segJoinAggregate(plan *segJoinPlan) (bool, error) {
 	}
 	// Step the first joined row through the shared code, then add the rest.
 	g := &gs.groups[0]
-	if plan.fullStep {
+	if plan.fullStep || plan.firstRow {
 		nr := plan.agg.nCols + len(plan.agg.scopes)
 		buf := make([]Value, nr)
 		if err := gs.stepRow(m, g.first, buf[:plan.agg.nCols:plan.agg.nCols], buf[plan.agg.nCols:nr]); err != nil {
@@ -2419,13 +2435,30 @@ func (gs *segJoinGroups) gather(g *segJoinGroup, row, rowids []Value) bool {
 // gatherAt is gatherCursorRow over joined row at.
 func (gs *segJoinGroups) gatherAt(at []int32, row, rowids []Value) bool {
 	level := func(cursor int) int { return slices.Index(gs.plan.cursors, cursor) }
-	for _, ga := range gs.plan.agg.gathers {
-		lv := level(ga.cursor)
-		if lv < 0 || ga.offset+ga.n > len(row) {
-			return false
+	if gs.gcols == nil {
+		gs.gcols = make([]segJoinGatherCols, len(gs.plan.agg.gathers))
+		for i, ga := range gs.plan.agg.gathers {
+			lv := level(ga.cursor)
+			if lv < 0 || ga.offset+ga.n > len(row) {
+				gs.gcols = nil
+				return false
+			}
+			cols := make([][]Value, min(ga.n, len(gs.w.tabs[lv].tbl.cols)))
+			for c := range cols {
+				cols[c] = gs.w.tabs[lv].values(c)
+			}
+			gs.gcols[i] = segJoinGatherCols{level: lv, cols: cols}
 		}
-		for c := range min(ga.n, len(gs.w.tabs[lv].tbl.cols)) {
-			row[ga.offset+c] = gs.w.tabs[lv].value(at[lv], c)
+	}
+	for i, ga := range gs.plan.agg.gathers {
+		gc := gs.gcols[i]
+		r := at[gc.level]
+		for c, col := range gc.cols {
+			if r < 0 {
+				row[ga.offset+c] = Value{} // an optional level's NULL row
+			} else {
+				row[ga.offset+c] = col[r]
+			}
 		}
 	}
 	for i, cur := range gs.plan.agg.cursors {
