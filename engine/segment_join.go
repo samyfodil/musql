@@ -933,6 +933,16 @@ func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (*segJoinGroups, bool) {
 		}
 	}
 	byKey := map[int64]int{}
+	// An INTEGER key whose values span little more than the table's rows
+	// finds its group in an array instead.
+	var dense []int32
+	var lo int64
+	if len(keys) > 0 {
+		lo = slices.Min(keys)
+		if span := uint64(slices.Max(keys) - lo); span < uint64(4*len(keys)+1024) {
+			dense = make([]int32, span+1)
+		}
+	}
 	byBytes := map[string]int{}
 	var buf []byte
 	one := make([]Value, 1)
@@ -949,11 +959,14 @@ func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (*segJoinGroups, bool) {
 			if !seen {
 				byBytes[string(buf)] = len(groups)
 			}
-		} else {
-			var key int64
-			if keys != nil {
-				key = keys[at[plan.key.level]]
+		} else if keys == nil {
+			gi, seen = 0, len(groups) > 0 // no GROUP BY: one group
+		} else if key := keys[at[plan.key.level]]; dense != nil {
+			gi, seen = int(dense[key-lo])-1, dense[key-lo] != 0
+			if !seen {
+				dense[key-lo] = int32(len(groups) + 1)
 			}
+		} else {
 			gi, seen = byKey[key]
 			if !seen {
 				byKey[key] = len(groups)
@@ -1018,9 +1031,32 @@ func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) {
 			// Each value the group's other rows bring that it has not seen,
 			// as step takes it: kept, counted, summed.
 			ints, lv := args.ints[a], args.levels[a]
-			seen := make(map[int64]bool, len(it.seen))
+			// Values the group spans narrowly are marked in a bitmap.
+			lo, hi := s.mins[a], s.maxs[a]
+			var bits []uint64
+			var seen map[int64]bool
+			if span := uint64(hi - lo); hi >= lo && span < uint64(64*len(g.rows)+4096) {
+				bits = make([]uint64, span/64+1)
+			} else {
+				seen = make(map[int64]bool, len(it.seen))
+			}
+			has := func(v int64) bool {
+				if bits != nil {
+					i := uint64(v - lo)
+					return bits[i/64]&(1<<(i%64)) != 0
+				}
+				return seen[v]
+			}
+			mark := func(v int64) {
+				if bits != nil {
+					i := uint64(v - lo)
+					bits[i/64] |= 1 << (i % 64)
+					return
+				}
+				seen[v] = true
+			}
 			for _, v := range it.seen {
-				seen[v.I] = true
+				mark(v.I)
 			}
 			first := ints[g.first[lv]]
 			skipped := false
@@ -1030,10 +1066,10 @@ func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) {
 					skipped = true // the row already stepped
 					continue
 				}
-				if seen[v] {
+				if has(v) {
 					continue
 				}
-				seen[v] = true
+				mark(v)
 				it.seen = append(it.seen, Value{Typ: Int, I: v})
 				it.cnt++
 				if it.kind != aggCount {
