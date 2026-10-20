@@ -14,16 +14,17 @@ import (
 // before the next read, is the case an extension must refuse.
 func TestSegJoinSessionFollowsWrites(t *testing.T) {
 	setup := []string{
-		`CREATE TABLE albums(id INTEGER PRIMARY KEY, year INTEGER NOT NULL)`,
+		`CREATE TABLE albums(id INTEGER PRIMARY KEY, year INTEGER NOT NULL, tag TEXT)`,
 		`CREATE TABLE tracks(id INTEGER PRIMARY KEY, album_id INTEGER NOT NULL, seconds INTEGER NOT NULL, rating REAL NOT NULL)`,
 		`CREATE INDEX tracks_album ON tracks(album_id)`,
-		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 20) INSERT INTO albums SELECT i, 1990 + i % 3 FROM n`,
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 20) INSERT INTO albums SELECT i, 1990 + i % 3, CASE i % 3 WHEN 0 THEN 'abc' WHEN 1 THEN 'ABC' ELSE 'xyz' END FROM n`,
 		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 500) INSERT INTO tracks SELECT i, 1 + i % 21, 60 + i % 90, (i % 5) / 4.0 FROM n`,
 	}
 	queries := []string{
 		`SELECT count(*), sum(t.seconds), total(t.rating) FROM albums al JOIN tracks t ON t.album_id = al.id`,
 		`SELECT al.id, count(*), sum(t.seconds), avg(t.rating) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`,
 		`SELECT al.year, max(t.seconds), count(*) FROM tracks t JOIN albums al ON al.id = t.album_id GROUP BY al.year`,
+		`SELECT al.year, count(*) FROM tracks t JOIN albums al ON al.id = t.album_id WHERE al.tag LIKE 'a%' GROUP BY al.year`,
 	}
 	writes := [][]string{
 		{`INSERT INTO tracks(album_id, seconds, rating) VALUES (3, 1000, 0.5)`},
@@ -38,6 +39,9 @@ func TestSegJoinSessionFollowsWrites(t *testing.T) {
 		{`UPDATE tracks SET seconds = 77777 WHERE id = (SELECT max(id) FROM tracks)`, `INSERT INTO tracks(album_id, seconds, rating) VALUES (9, 2, 0.25)`},
 		{`DELETE FROM albums WHERE id = 9`},
 		{`INSERT INTO tracks(album_id, seconds, rating) VALUES (10, 2, 0.5)`},
+		// A LIKE's answer follows the setting, not only the rows.
+		{`PRAGMA case_sensitive_like = 1`},
+		{`PRAGMA case_sensitive_like = 0`},
 	}
 	run := func(off bool) []string {
 		segPeepholesOffForTest = off

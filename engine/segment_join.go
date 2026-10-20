@@ -119,7 +119,7 @@ type segJoinTable struct {
 	cols  map[int][]int64
 	kcols map[int]segJoinKeyCol
 	vcols map[int][]Value
-	exprs map[*segJoinExpr][]Value
+	exprs map[segJoinExprKey][]Value
 	fcols map[int][]float64
 	// lo/dense map a rowid to its row + 1 when the rowids are dense enough,
 	// else sparse does.
@@ -662,6 +662,13 @@ func (t *segJoinTable) values(c int) []Value {
 	return v
 }
 
+// segJoinExprKey is what an expression's values over a table depend on
+// besides its rows: the expression, and the LIKE case setting.
+type segJoinExprKey struct {
+	expr          *segJoinExpr
+	caseSensitive bool
+}
+
 // index builds the rowid lookup.
 func (t *segJoinTable) index() {
 	t.mu.Lock()
@@ -738,15 +745,13 @@ func (w *segJoinWalk) exprValues(a segJoinArg) ([]Value, bool) {
 	t := w.tabs[w.lv(a)]
 	// Kept with the table while its rows stay the same -- the program, and
 	// so the expression, is the plan cache's -- unless it reads a parameter,
-	// which the next run may bind to another value, or calls a function or a
-	// LIKE, whose answer may follow the connection's settings
-	// (case_sensitive_like).
-	keep := !slices.ContainsFunc(a.expr.insns, func(in Instruction) bool {
-		return in.Op == OpVariable || in.Op == OpFunction || in.Op == OpLike || in.Op == OpGlob
-	})
+	// which the next run may bind to another value. A LIKE's answer follows
+	// case_sensitive_like, which is part of the key.
+	keep := !slices.ContainsFunc(a.expr.insns, func(in Instruction) bool { return in.Op == OpVariable })
+	key := segJoinExprKey{a.expr, w.m.likeCaseSensitive()}
 	if keep {
 		t.mu.Lock()
-		v, ok := t.exprs[a.expr]
+		v, ok := t.exprs[key]
 		t.mu.Unlock()
 		if ok {
 			w.exprs[a.expr] = v
@@ -798,9 +803,9 @@ func (w *segJoinWalk) exprValues(a segJoinArg) ([]Value, bool) {
 	if keep {
 		t.mu.Lock()
 		if t.exprs == nil {
-			t.exprs = map[*segJoinExpr][]Value{}
+			t.exprs = map[segJoinExprKey][]Value{}
 		}
-		t.exprs[a.expr] = out
+		t.exprs[key] = out
 		t.mu.Unlock()
 	}
 	return out, true
