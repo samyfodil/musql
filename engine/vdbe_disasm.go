@@ -20,6 +20,7 @@ var opNames = [numOpCodes]string{
 	OpInit:                 "Init",
 	OpSegOrderLimit:        "SegOrderLimit",
 	OpSegHashAgg:           "SegHashAgg",
+	OpSegJoinAgg:           "SegJoinAgg",
 	OpSegProgram:           "SegProgram",
 	OpSegEmitRow:           "SegEmitRow",
 	OpSegDistinct:          "SegDistinct",

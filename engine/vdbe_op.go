@@ -413,6 +413,12 @@ const (
 
 	OpSegHashAgg
 
+	// OpSegJoinAgg answers an aggregate over an inner join from the tables'
+	// column blocks (segment_join.go), filling the accumulators the loop would
+	// have. P2: jump target (the loop's Closes), taken only when it serves.
+	// P4(*segJoinPlan).
+	OpSegJoinAgg
+
 	OpHashAggData // P2: destination record register rr[P2]. Copies the CURRENT bucket's group-key tuple into rr[P2] and makes that bucket's accumulators the live set (m.aggAccs), so a following OpAggResult finalizes THIS group.
 	OpHashAggNext // P2: jump target. Advances to the next bucket in sorted order; if one exists, jump to P2 (the drain loop's top, exactly like OpSorterNext); otherwise fall through (the drain is exhausted).
 

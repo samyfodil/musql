@@ -2662,6 +2662,22 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			segFilterDeclined.Add(1)
 
+		case OpSegJoinAgg:
+			jp, okPlan := op.P4.(*segJoinPlan)
+			if !okPlan {
+				return nil, fmt.Errorf("vdbe: OpSegJoinAgg without a plan")
+			}
+			served, jerr := m.segJoinAggregate(jp)
+			if jerr != nil {
+				return nil, jerr
+			}
+			if served {
+				segFilterServed.Add(1)
+				pc = op.P2
+				continue
+			}
+			segFilterDeclined.Add(1)
+
 		case OpSegHashAgg:
 			gplan, okPlan := op.P4.(*segGroupPlan)
 			if !okPlan || m.pager == nil {
