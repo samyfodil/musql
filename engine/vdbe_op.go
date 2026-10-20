@@ -418,6 +418,22 @@ const (
 	// have. P2: jump target (the loop's Closes), taken only when it serves.
 	// P4(*segJoinPlan).
 	OpSegJoinAgg
+	// OpSegJoinGroups builds a GROUP BY's groups over a join from the column
+	// blocks (segment_join.go). P2: jump target (the group loop), taken only
+	// when it serves. P4(*segJoinPlan).
+	OpSegJoinGroups
+	// OpSegJoinNext loads the next group's first joined row into the registers
+	// the loop body reads, or jumps to P2 when there is none. P4(*segJoinPlan).
+	OpSegJoinNext
+	// OpSegJoinRest adds to the accumulators just stepped with a group's first
+	// row the group's other rows; the group is the one whose scan sequence
+	// number is rr[P1][P2]. Nothing when OpSegJoinGroups did not serve.
+	// P4(*segJoinPlan).
+	OpSegJoinRest
+	// OpSegJoinHash fills a hashed GROUP BY's buckets over a join from the
+	// column blocks. P2: jump target (the Closes before the drain), taken only
+	// when it serves. P4(*segJoinPlan).
+	OpSegJoinHash
 
 	OpHashAggData // P2: destination record register rr[P2]. Copies the CURRENT bucket's group-key tuple into rr[P2] and makes that bucket's accumulators the live set (m.aggAccs), so a following OpAggResult finalizes THIS group.
 	OpHashAggNext // P2: jump target. Advances to the next bucket in sorted order; if one exists, jump to P2 (the drain loop's top, exactly like OpSorterNext); otherwise fall through (the drain is exhausted).

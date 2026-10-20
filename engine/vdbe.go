@@ -93,7 +93,8 @@ type vdbe struct {
 	// aggRowBuf/aggRowidBuf are gatherCursorRow's reusable per-row buffers --
 	// see its doc comment for why reuse is safe here.
 	aggRowBuf   []Value
-	unpackBuf   []Value // OpSorterData's expanded row (recUnpack)
+	unpackBuf   []Value        // OpSorterData's expanded row (recUnpack)
+	segJoin     *segJoinGroups // OpSegJoinGroups' groups, nil when it declined
 	aggRowidBuf []Value
 	// aggNullRow is the row a rowFree step (aggPlan.rowFree) hands on in place
 	// of a gathered one: all NULL, at least as wide as any plan's, never
@@ -2677,6 +2678,55 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				continue
 			}
 			segFilterDeclined.Add(1)
+
+		case OpSegJoinGroups:
+			jp, okPlan := op.P4.(*segJoinPlan)
+			if !okPlan {
+				return nil, fmt.Errorf("vdbe: OpSegJoinGroups without a plan")
+			}
+			m.segJoin = nil
+			if gs, served := m.segJoinGroupsOf(jp); served {
+				m.segJoin = gs
+				segJoinHits.Add(1)
+				segFilterServed.Add(1)
+				pc = op.P2
+				continue
+			}
+			segFilterDeclined.Add(1)
+
+		case OpSegJoinHash:
+			jp, okPlan := op.P4.(*segJoinPlan)
+			if !okPlan {
+				return nil, fmt.Errorf("vdbe: OpSegJoinHash without a plan")
+			}
+			served, jerr := m.segJoinHashAgg(jp)
+			if jerr != nil {
+				return nil, jerr
+			}
+			if served {
+				segFilterServed.Add(1)
+				pc = op.P2
+				continue
+			}
+			segFilterDeclined.Add(1)
+
+		case OpSegJoinNext:
+			gs := m.segJoin
+			if gs == nil || gs.plan != op.P4 || gs.next >= len(gs.groups) {
+				pc = op.P2
+				continue
+			}
+			gs.load(m, &gs.groups[gs.next])
+			gs.next++
+
+		case OpSegJoinRest:
+			if gs := m.segJoin; gs != nil && gs.plan == op.P4 {
+				if seq := m.recRegs[op.P1][op.P2]; seq.Typ == Int && seq.I >= 0 && seq.I < int64(len(gs.groups)) {
+					gs.rest(m, &gs.groups[seq.I])
+				} else {
+					return nil, fmt.Errorf("vdbe: OpSegJoinRest without its group")
+				}
+			}
 
 		case OpSegHashAgg:
 			gplan, okPlan := op.P4.(*segGroupPlan)

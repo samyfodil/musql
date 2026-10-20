@@ -30,6 +30,8 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 4000)
 			INSERT INTO tracks SELECT i, CASE WHEN i % 50 = 0 THEN 500 + i ELSE 1 + i % 80 END, 100 + i % 250, (i * 7919) % 100000 - 30000, (i % 7) / 2.0 FROM n`,
 		`INSERT INTO big VALUES (1, 1, 9223372036854775000), (2, 1, 900), (3, 2, -9223372036854775000), (4, 2, -900)`,
+		`CREATE TABLE wide(id INTEGER PRIMARY KEY, album_id INTEGER NOT NULL, v INTEGER NOT NULL)`,
+		`INSERT INTO wide VALUES (1, 1, 2305843009213693952), (2, 1, 2305843009213693952), (3, 1, -2305843009213693952), (4, 2, 3), (5, 2, 5), (6, 3, 7)`,
 	}
 	queries := []struct {
 		q     string
@@ -46,6 +48,26 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT sum(t.rating) FROM albums al JOIN tracks t ON t.album_id = al.id`, false},
 		{`SELECT sum(b.v) FROM albums al JOIN big b ON b.album_id = al.id`, false},
 		{`SELECT count(*), sum(b.v) FROM big b JOIN albums al ON al.id = b.album_id WHERE b.id < 0`, false},
+		// GROUP BY: streamed when the groups arrive in scan order, sorted
+		// otherwise; bare columns read the group's first joined row.
+		{`SELECT al.id, count(*), sum(t.seconds), min(t.plays), max(t.plays) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
+		{`SELECT al.id, al.year, t.id, t.seconds, count(*) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
+		{`SELECT al.id, ar.name, count(*), sum(t.plays) FROM albums al JOIN artists ar ON ar.id = al.artist_id JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
+		{`SELECT ar.name, sum(t.plays), t.id, al.id FROM artists ar JOIN albums al ON al.artist_id = ar.id JOIN tracks t ON t.album_id = al.id GROUP BY ar.id`, true},
+		{`SELECT al.year, count(*), sum(t.seconds), t.id FROM tracks t JOIN albums al ON al.id = t.album_id GROUP BY al.year`, true},
+		{`SELECT t.album_id, count(*) FROM tracks t JOIN albums al ON al.id = t.album_id GROUP BY t.album_id`, true},
+		{`SELECT al.id, count(*) AS n FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id HAVING n > 49 AND sum(t.plays) > 0`, true},
+		{`SELECT al.id, sum(t.plays) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id LIMIT 4 OFFSET 3`, true},
+		{`SELECT al.year, sum(t.plays) AS s FROM tracks t JOIN albums al ON al.id = t.album_id GROUP BY al.year ORDER BY s DESC`, true},
+		{`SELECT al.id, count(*) + max(t.seconds), (SELECT name FROM artists WHERE id = al.artist_id) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
+		{`SELECT ar.name, count(*) FROM artists ar JOIN albums al ON al.artist_id = ar.id JOIN tracks t ON t.album_id = al.id GROUP BY ar.name`, false},
+		{`SELECT al.id, max(t.plays), t.id FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, false},
+		{`SELECT al.id, sum(t.rating) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, false},
+		{`SELECT al.id, group_concat(t.id) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, false},
+		{`SELECT b.album_id, sum(b.v) FROM big b JOIN albums al ON al.id = b.album_id GROUP BY b.album_id`, false},
+		// Sums the order-strict check has to judge from the values' window.
+		{`SELECT w.album_id, sum(w.v), count(*) FROM wide w JOIN albums al ON al.id = w.album_id GROUP BY w.album_id`, true},
+		{`SELECT al.id, sum(w.v), al.year FROM albums al JOIN wide w ON w.album_id = al.id GROUP BY al.id HAVING sum(w.v) <> 0`, true},
 	}
 
 	dir := t.TempDir()
