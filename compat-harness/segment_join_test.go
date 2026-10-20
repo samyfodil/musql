@@ -119,6 +119,11 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT count(*), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.rating AND al.year % 3 = 1`, true},
 		{`SELECT g.tag, count(*) FROM tracks t JOIN tags g ON g.id = t.album_id WHERE g.tag LIKE 'r%' GROUP BY g.tag`, true},
 		{`SELECT count(*) FROM tracks t JOIN tags g ON g.id = t.album_id WHERE g.ci GLOB '[rR]*' OR g.tag IS NULL`, true},
+		// Equalities between ordinary columns: a self-join, a join on values.
+		{`SELECT count(*), sum(t2.seconds) FROM tracks t1 JOIN tracks t2 ON t2.album_id = t1.album_id WHERE t1.id < 200`, true},
+		{`SELECT t1.album_id, count(*) FROM tracks t1 JOIN tracks t2 ON t2.album_id = t1.album_id WHERE t1.id < 300 AND t2.id < 300 GROUP BY t1.album_id`, true},
+		{`SELECT al.year, count(*) FROM albums al JOIN tracks t ON t.seconds = al.year - 1700 GROUP BY al.year`, false},
+		{`SELECT count(*), count(t.id) FROM albums al LEFT JOIN tracks t ON t.seconds = al.year - 1700`, false},
 		// CASE and IFNULL: jumps that meet again inside the expression.
 		{`SELECT al.id, sum(CASE WHEN t.seconds > 300 THEN 1 ELSE 0 END), count(*) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
 		{`SELECT sum(CASE t.seconds % 3 WHEN 0 THEN t.plays WHEN 1 THEN -t.plays END), total(ifnull(t.rating, -1)) FROM albums al JOIN tracks t ON t.album_id = al.id`, false},

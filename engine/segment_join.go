@@ -124,12 +124,13 @@ type segJoinTable struct {
 	overN      int
 	reshapes   uint64
 
-	mu    sync.Mutex
-	cols  map[int][]int64
-	kcols map[int]segJoinKeyCol
-	vcols map[int][]Value
-	exprs map[segJoinExprKey][]Value
-	fcols map[int][]float64
+	mu     sync.Mutex
+	cols   map[int][]int64
+	kcols  map[int]segJoinKeyCol
+	vcols  map[int][]Value
+	sorted map[int]segJoinSorted
+	exprs  map[segJoinExprKey][]Value
+	fcols  map[int][]float64
 	// lo/dense map a rowid to its row + 1 when the rowids are dense enough,
 	// else sparse does.
 	indexed bool
@@ -678,6 +679,47 @@ type segJoinExprKey struct {
 	caseSensitive bool
 }
 
+// sortedBy is the rows whose column c holds an integer, in order of that
+// value and then of row, with the values: what finds the rows equal to a
+// key. Kept with the table's other readings.
+func (t *segJoinTable) sortedBy(c int) (keys []int64, rows []int32, ok bool) {
+	t.mu.Lock()
+	sb, seen := t.sorted[c]
+	t.mu.Unlock()
+	if seen {
+		return sb.keys, sb.rows, sb.keys != nil
+	}
+	vals, nulls, ok := t.keyCol(c)
+	if ok {
+		for r := range vals {
+			if nulls == nil || !nulls[r] {
+				rows = append(rows, int32(r))
+			}
+		}
+		slices.SortStableFunc(rows, func(a, b int32) int { return cmp.Compare(vals[a], vals[b]) })
+		keys = make([]int64, len(rows))
+		for i, r := range rows {
+			keys[i] = vals[r]
+		}
+		if keys == nil {
+			keys = []int64{}
+		}
+	}
+	t.mu.Lock()
+	if t.sorted == nil {
+		t.sorted = map[int]segJoinSorted{}
+	}
+	t.sorted[c] = segJoinSorted{keys, rows}
+	t.mu.Unlock()
+	return keys, rows, ok
+}
+
+// segJoinSorted is a column sortedBy read: nil keys when it declined.
+type segJoinSorted struct {
+	keys []int64
+	rows []int32
+}
+
 // index builds the rowid lookup.
 func (t *segJoinTable) index() {
 	t.mu.Lock()
@@ -714,14 +756,13 @@ func (t *segJoinTable) row(r int64) int32 {
 	return -1
 }
 
-// segJoinWalk is a join opened for walking: each level's table, and how each
-// level but the fact is reached from its parent.
+// segJoinWalk is a join opened for walking in the loop's own order: the
+// first level's rows in turn, and under each, each later level's rows that
+// its equality with an earlier level finds, in rowid order -- the order the
+// VDBE's nested loop visits them in.
 type segJoinWalk struct {
-	tabs   []*segJoinTable
-	fact   int
-	order  []int     // the levels, each after its parent
-	parent []int     // the level a level is looked up from, -1 for the fact
-	slot   [][]int32 // slot[i][r]: level i's row joined to its parent's row r, or -1
+	tabs []*segJoinTable
+	link []segJoinLink // per level after the first
 	// pass[i][r] is whether level i's row r satisfies the level's own WHERE
 	// terms; nil when it has none.
 	pass [][]bool
@@ -733,10 +774,26 @@ type segJoinWalk struct {
 	exprs map[*segJoinExpr][]Value // each expression's value per row
 }
 
-// lv is the level a's value is per row of: a constant's, the fact's.
+// segJoinLink is how a level's rows are found from an earlier level's
+// (from) row: by the rowid its key names (one, per row of from, the row or
+// -1), or by every row whose join column equals the key (rows[lo[r]:hi[r]],
+// in rowid order).
+type segJoinLink struct {
+	from int
+	one  []int32
+	// The equal rows: the from row's key (keys, nulls), looked up when the
+	// walk reaches it among the level's rows sorted by the join column
+	// (sorted, rows).
+	keys   []int64
+	nulls  []bool
+	sorted []int64
+	rows   []int32
+}
+
+// lv is the level a's value is per row of: a constant's, the first's.
 func (w *segJoinWalk) lv(a segJoinArg) int {
 	if a.level < 0 {
-		return w.fact
+		return 0
 	}
 	return a.level
 }
@@ -866,11 +923,7 @@ func (w *segJoinWalk) nullable(a segJoinArg, real bool) (ints []int64, flts []fl
 			return nil, nil, nil, false
 		}
 	} else {
-		t := w.tabs[a.level]
-		vals = make([]Value, t.n)
-		for r := range vals {
-			vals[r] = t.value(int32(r), a.col)
-		}
+		vals = w.tabs[a.level].values(a.col)
 	}
 	nulls = make([]bool, len(vals))
 	if real {
@@ -928,8 +981,8 @@ func (w *segJoinWalk) value(a segJoinArg, at []int32) Value {
 // openSegJoin opens plan's join, or reports false.
 func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 	k := len(plan.cursors)
-	w := &segJoinWalk{tabs: make([]*segJoinTable, k), parent: make([]int, k), slot: make([][]int32, k),
-		m: m, exprs: map[*segJoinExpr][]Value{}}
+	w := &segJoinWalk{tabs: make([]*segJoinTable, k), link: make([]segJoinLink, k),
+		m: m, exprs: map[*segJoinExpr][]Value{}, optional: plan.optional}
 	for i, c := range plan.cursors {
 		if c >= len(m.cursors) {
 			return nil, false
@@ -940,70 +993,10 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 		}
 		w.tabs[i] = t
 	}
-	isRowid := func(level, col int) bool { return col < 0 || col == w.tabs[level].ipk }
-
-	// Orient each equality: the side that is its table's rowid is looked up
-	// from the other. Every level but one -- the fact -- must be looked up
-	// exactly once, which makes the levels a tree whose every joined row is one
-	// fact row and the rows its keys name.
-	parentCol := make([]int, k)
-	for i := range w.parent {
-		w.parent[i] = -2
-	}
-	for _, e := range plan.edges {
-		ra, rb := isRowid(e.a, e.aCol), isRowid(e.b, e.bCol)
-		switch {
-		case rb && !ra:
-			if w.parent[e.b] != -2 {
-				return nil, false
-			}
-			w.parent[e.b], parentCol[e.b] = e.a, e.aCol
-		case ra && !rb:
-			if w.parent[e.a] != -2 {
-				return nil, false
-			}
-			w.parent[e.a], parentCol[e.a] = e.b, e.bCol
-		default:
-			return nil, false
-		}
-	}
-	w.fact = -1
-	for i := range w.parent {
-		if w.parent[i] == -2 {
-			if w.fact >= 0 {
-				return nil, false
-			}
-			w.fact, w.parent[i] = i, -1
-		}
-	}
-	if w.fact < 0 {
+	// A LEFT JOIN's optional level is the innermost: a NULL row reaches no
+	// level after it.
+	if o := plan.optional; o >= 0 && o != k-1 {
 		return nil, false
-	}
-	w.order = []int{w.fact}
-	for len(w.order) < k {
-		grew := false
-		for i := range w.parent {
-			if w.parent[i] >= 0 && !slices.Contains(w.order, i) && slices.Contains(w.order, w.parent[i]) {
-				w.order = append(w.order, i)
-				grew = true
-			}
-		}
-		if !grew {
-			return nil, false // not connected to the fact
-		}
-	}
-	// A LEFT JOIN's optional level is the innermost. Reached from its
-	// parent, it must be a leaf, so that a NULL row reaches no further; the
-	// one the other levels are reached from, it is the fact of a join of
-	// two, whose outer rows nothing matched are found after the walk.
-	w.optional = plan.optional
-	if o := plan.optional; o >= 0 {
-		if o != k-1 {
-			return nil, false
-		}
-		if o == w.fact && k != 2 || o != w.fact && slices.Contains(w.parent, o) {
-			return nil, false
-		}
 	}
 	w.pass = make([][]bool, k)
 	for i, preds := range plan.preds {
@@ -1045,72 +1038,103 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 			}
 		}
 	}
-	for _, i := range w.order[1:] {
-		keys, nulls, ok := w.tabs[w.parent[i]].keyCol(parentCol[i])
+	// Each later level is found from an earlier one by its recheck's
+	// equality, exactly one.
+	for i := 1; i < k; i++ {
+		var e segJoinEdge
+		n := 0
+		for _, x := range plan.edges {
+			if x.b == i && x.a < i {
+				e, n = x, n+1
+			} else if x.a == i && x.b < i {
+				e, n = segJoinEdge{a: x.b, aCol: x.bCol, b: x.a, bCol: x.aCol}, n+1
+			}
+		}
+		if n != 1 {
+			return nil, false
+		}
+		keys, nulls, ok := w.tabs[e.a].keyCol(e.aCol)
 		if !ok {
 			return nil, false
 		}
-		w.tabs[i].index()
-		s := make([]int32, len(keys))
-		for r, key := range keys {
-			// A NULL key equals no rowid: the loop's equality is not true.
-			if nulls != nil && nulls[r] {
-				s[r] = -1
-				continue
+		l := segJoinLink{from: e.a}
+		t := w.tabs[i]
+		if e.bCol < 0 || e.bCol == t.ipk {
+			t.index()
+			l.one = make([]int32, len(keys))
+			for r, key := range keys {
+				// A NULL key equals no rowid: the loop's equality is not true.
+				if nulls != nil && nulls[r] {
+					l.one[r] = -1
+					continue
+				}
+				l.one[r] = t.row(key)
 			}
-			s[r] = w.tabs[i].row(key)
+		} else {
+			sk, rows, ok := t.sortedBy(e.bCol)
+			if !ok {
+				return nil, false
+			}
+			l.keys, l.nulls, l.sorted, l.rows = keys, nulls, sk, rows
 		}
-		w.slot[i] = s
+		w.link[i] = l
 	}
 	return w, true
 }
 
-// each calls fn once per joined row, with at holding each level's row; fn
-// returning false stops the walk, and each reports whether it ran to the end.
+// each calls fn once per joined row, in the loop's order, with at holding
+// each level's row (-1 for the optional level's NULL row); fn returning false
+// stops the walk, and each reports whether it ran to the end.
 func (w *segJoinWalk) each(at []int32, fn func() bool) bool {
-	rest := w.order[1:]
-	pass := w.pass
-	opt := w.optional
-	// The outer rows something matched, when the optional level is the fact.
-	var outer int
-	var matched []bool
-	if opt >= 0 && opt == w.fact {
-		outer = 1 - opt
-		matched = make([]bool, w.tabs[outer].n)
-	}
-rows:
-	for f := range w.tabs[w.fact].n {
-		if p := pass[w.fact]; p != nil && !p[f] {
-			continue
+	k := len(w.tabs)
+	var visit func(i int) bool
+	visit = func(i int) bool {
+		if i == k {
+			return fn()
 		}
-		at[w.fact] = int32(f)
-		for _, i := range rest {
-			r := w.slot[i][at[w.parent[i]]]
-			if r < 0 || pass[i] != nil && !pass[i][r] {
-				if i == opt {
-					at[i] = -1 // nothing matched: the row is all NULL
-					continue
+		pass := w.pass[i]
+		if i == 0 {
+			for r := range w.tabs[0].n {
+				if pass == nil || pass[r] {
+					at[0] = int32(r)
+					if !visit(1) {
+						return false
+					}
 				}
-				continue rows
 			}
-			at[i] = r
+			return true
 		}
-		if matched != nil {
-			matched[at[outer]] = true
-		}
-		if !fn() {
-			return false
-		}
-	}
-	for r, m := range matched {
-		if !m && (pass[outer] == nil || pass[outer][r]) {
-			at[outer], at[opt] = int32(r), -1
-			if !fn() {
-				return false
+		l := &w.link[i]
+		matched := false
+		if from := at[l.from]; from >= 0 {
+			if l.one != nil {
+				if r := l.one[from]; r >= 0 && (pass == nil || pass[r]) {
+					matched, at[i] = true, r
+					if !visit(i + 1) {
+						return false
+					}
+				}
+			} else if l.nulls == nil || !l.nulls[from] {
+				// A NULL key equals nothing; any other, the rows holding it.
+				key := l.keys[from]
+				lo, _ := slices.BinarySearch(l.sorted, key)
+				for j := lo; j < len(l.sorted) && l.sorted[j] == key; j++ {
+					if r := l.rows[j]; pass == nil || pass[r] {
+						matched, at[i] = true, r
+						if !visit(i + 1) {
+							return false
+						}
+					}
+				}
 			}
 		}
+		if !matched && i == w.optional {
+			at[i] = -1 // nothing matched: the row is all NULL
+			return visit(i + 1)
+		}
+		return true
 	}
-	return true
+	return visit(0)
 }
 
 // passing is, per row, whether it satisfies every one of preds, whose
