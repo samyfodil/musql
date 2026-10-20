@@ -506,7 +506,7 @@ func segJoinPeephole(prog *Program) bool {
 	// The guard takes the place of the first instruction after the opens and
 	// runs it when it declines, so no address moves.
 	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2, segs: body.segs, orders: l.orders,
-		fullStep: segJoinFullStep(plan)}
+		fullStep: segJoinFullStep(plan), firstRow: segJoinFirstRow(plan)}
 	at := len(in)
 	out := append([]Instruction(nil), in...)
 	out[l.head] = Instruction{Op: OpGoto, P2: at}
@@ -819,7 +819,7 @@ func segJoinGroupPeephole(prog *Program) bool {
 	seqAt := fullOf(seqReg)
 
 	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2,
-		segs: segs, grouped: true, key: key, keyColl: keyColl, loads: loads, orders: l.orders, fullStep: segJoinFullStep(plan)}
+		segs: segs, grouped: true, key: key, keyColl: keyColl, loads: loads, orders: l.orders, fullStep: segJoinFullStep(plan), firstRow: segJoinFirstRow(plan)}
 	out := append([]Instruction(nil), in...)
 	// A volatile call in the drain's run, or a later step's loads, the
 	// loop makes in the drain's order: the drain still makes it for each
@@ -874,7 +874,28 @@ func segJoinGroupPeephole(prog *Program) bool {
 // row bare columns read, an anchor certificate, or any read of the row that
 // is not an aggregate's argument.
 func segJoinFullStep(plan *aggPlan) bool {
-	return plan.magnet != nil && len(plan.magnet.sites) > 0 || plan.anchorCheck != nil || !aggPlanReadsOnlyLoweredColsExceptOrder(plan)
+	return plan.magnet != nil && len(plan.magnet.sites) > 0 || plan.anchorCheck != nil || !aggPlanReadsOnlyLoweredColsExceptOrder(plan) && !segJoinReadsOnlyBare(plan)
+}
+
+// segJoinFirstRow reports whether the row is read only by bare columns, with
+// no min() or max() to move their anchor: the anchor is then each group's
+// first row, and the rows after it step from their arguments alone.
+func segJoinFirstRow(plan *aggPlan) bool {
+	return !segJoinFullStep(plan) && !aggPlanReadsOnlyLoweredColsExceptOrder(plan)
+}
+
+// segJoinReadsOnlyBare is aggPlanReadsOnlyLoweredColsExceptOrder with bare
+// columns allowed.
+func segJoinReadsOnlyBare(plan *aggPlan) bool {
+	for _, item := range plan.outPlans {
+		if item == nil || len(item.hoisted) != 0 {
+			return false
+		}
+	}
+	if hp := plan.havingPlan; hp != nil && (hp.usesGroupBare || len(hp.hoisted) != 0 || !havingReadsNoRow(hp.rewritten)) {
+		return false
+	}
+	return true
 }
 
 // segJoinStepArgs is the source of each aggregate's argument register.
@@ -1622,7 +1643,7 @@ func segJoinHashPeephole(prog *Program) bool {
 		}
 	}
 	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2, segs: body.segs,
-		grouped: true, key: key, orders: l.orders, fullStep: segJoinFullStep(plan)}
+		grouped: true, key: key, orders: l.orders, fullStep: segJoinFullStep(plan), firstRow: segJoinFirstRow(plan)}
 	key.reg = keyReg
 	jp.key = key
 	out := append([]Instruction(nil), in...)
