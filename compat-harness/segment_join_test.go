@@ -95,7 +95,7 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT al.id, count(*), count(al.year) FROM tracks t LEFT JOIN albums al ON al.id = t.album_id AND al.year > 1975 GROUP BY al.id`, true},
 		{`SELECT t.album_id, count(al.id), max(al.year) FROM tracks t LEFT JOIN albums al ON al.id = t.album_id GROUP BY t.album_id`, true},
 		{`SELECT al.year, count(*), count(DISTINCT t.album_id) FROM albums al LEFT JOIN tracks t ON t.album_id = al.id AND t.id < 100 GROUP BY al.year`, true},
-		{`SELECT ar.id, count(al.id) FROM artists ar LEFT JOIN albums al ON al.artist_id = ar.id GROUP BY ar.id`, false},
+		{`SELECT ar.id, count(al.id) FROM artists ar LEFT JOIN albums al ON al.artist_id = ar.id GROUP BY ar.id`, true},
 		// ORDER BY ... LIMIT: only rows that can be kept reach the sorter.
 		{`SELECT al.id, t.id, t.plays FROM albums al JOIN tracks t ON t.album_id = al.id ORDER BY t.plays DESC LIMIT 10`, true},
 		{`SELECT t.id, t.seconds FROM albums al JOIN tracks t ON t.album_id = al.id ORDER BY t.seconds LIMIT 7 OFFSET 30`, true},
@@ -104,14 +104,14 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		// earliest.
 		{`SELECT al.id, t.id, t.seconds FROM albums al CROSS JOIN tracks t ON t.album_id = al.id ORDER BY t.seconds LIMIT 12 OFFSET 40`, true},
 		{`SELECT al.id, t.id FROM albums al CROSS JOIN tracks t ON t.album_id = al.id ORDER BY t.seconds % 3 DESC LIMIT 20`, true},
-		{`SELECT t.id, al.year FROM tracks t JOIN albums al ON al.id = t.album_id ORDER BY al.year DESC LIMIT 25`, false},
+		{`SELECT t.id, al.year FROM tracks t JOIN albums al ON al.id = t.album_id ORDER BY al.year DESC LIMIT 25`, true},
 		{`SELECT t.id, al.year FROM tracks t JOIN albums al ON al.id = t.album_id ORDER BY al.year, t.seconds DESC LIMIT 12`, true},
-		{`SELECT t.id, g.tag FROM tracks t JOIN tags g ON g.id = t.album_id ORDER BY g.tag LIMIT 9`, false},
+		{`SELECT t.id, g.tag FROM tracks t JOIN tags g ON g.id = t.album_id ORDER BY g.tag LIMIT 9`, true},
 		{`SELECT t.id, t.rating FROM albums al JOIN tracks t ON t.album_id = al.id ORDER BY t.rating DESC LIMIT 15`, true},
-		{`SELECT t.id FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.plays > 1000 ORDER BY t.id DESC LIMIT 3`, false},
+		{`SELECT t.id FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.plays > 1000 ORDER BY t.id DESC LIMIT 3`, true},
 		{`SELECT t.id, t.seconds + al.year FROM albums al JOIN tracks t ON t.album_id = al.id ORDER BY t.seconds LIMIT 100000`, false},
-		{`SELECT al.id, al.year FROM tracks t JOIN albums al ON al.id = t.album_id ORDER BY al.year LIMIT 1`, false},
-		{`SELECT t.id FROM albums al LEFT JOIN tracks t ON t.album_id = al.id ORDER BY t.plays LIMIT 5`, false},
+		{`SELECT al.id, al.year FROM tracks t JOIN albums al ON al.id = t.album_id ORDER BY al.year LIMIT 1`, true},
+		{`SELECT t.id FROM albums al LEFT JOIN tracks t ON t.album_id = al.id ORDER BY t.plays LIMIT 5`, true},
 		// DISTINCT over INTEGER arguments.
 		{`SELECT count(DISTINCT t.album_id), count(*), sum(DISTINCT t.seconds % 7) FROM tracks t JOIN albums al ON al.id = t.album_id`, true},
 		// Terms that are expressions: a LIKE, a function, a column as a truth.
@@ -142,7 +142,7 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT sum(t.seconds * al.year) FROM albums al JOIN tracks t ON t.album_id = al.id`, false},
 		{`SELECT sum(t.plays * t.plays * t.plays) FROM albums al JOIN tracks t ON t.album_id = al.id`, true},
 		{`SELECT al.id, sum(random() % 2 * 0) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, false},
-		{`SELECT al.id, count(coalesce(t.id, 0)) FROM albums al LEFT JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, false},
+		{`SELECT al.id, count(coalesce(t.id, 0)) FROM albums al LEFT JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
 		{`SELECT count(DISTINCT t.album_id), count(*), sum(DISTINCT al.year) FROM tracks t JOIN albums al ON al.id = t.album_id`, true},
 		{`SELECT al.artist_id, count(DISTINCT t.seconds), avg(DISTINCT t.plays), total(DISTINCT al.year), count(t.seconds) FROM tracks t JOIN albums al ON al.id = t.album_id GROUP BY al.artist_id`, true},
 		{`SELECT al.id, count(DISTINCT t.seconds), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
@@ -162,7 +162,7 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT * FROM (SELECT al.id AS a, count(*) AS n, round(avg(t.rating), 2) AS r FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id) WHERE n > 40`, true},
 		// Albums 1 and 7 share an artist, and album 7's rows come first in the
 		// table but second in the loop: a REAL sum cannot be replayed in order.
-		{`SELECT ar.id, sum(x.r), count(*) FROM artists ar CROSS JOIN albums al ON al.artist_id = ar.id CROSS JOIN w2 x ON x.album_id = al.id GROUP BY ar.id`, false},
+		{`SELECT ar.id, sum(x.r), count(*) FROM artists ar CROSS JOIN albums al ON al.artist_id = ar.id CROSS JOIN w2 x ON x.album_id = al.id GROUP BY ar.id`, true},
 		{`SELECT ar.id, sum(x.r), count(*) FROM artists ar JOIN albums al ON al.artist_id = ar.id JOIN w2 x ON x.album_id = al.id GROUP BY ar.id`, true},
 	}
 
