@@ -199,23 +199,18 @@ func TestBenchColumnarVsC(t *testing.T) {
 		{"count(*) whole table", "SELECT count(*) FROM t",
 			func(rng *rand.Rand) []any { return nil }, true},
 
-		// ---- Shapes NO fast path answers. ----
+		// ---- Shapes beyond the columnar filters. ----
 		//
-		// These exist so the table is evidence rather than a showcase. Every
-		// one of them runs the ordinary VDBE, which trails C SQLite by ~3.5x on
-		// a scan, and a comparison made only of the cases with a fast path
-		// would say nothing about that.
-		//
-		// min()/max(): the GROUP BY driver declines them outright, because the
-		// anchor reads the gathered row.
+		// These exist so the table is evidence rather than a showcase: min/max,
+		// HAVING, predicates the filter kernels do not model, TEXT, DISTINCT,
+		// subqueries, compounds and pagination. The JIT answers every one, and
+		// the flag holds it to that.
 		{"min/max whole table", "SELECT min(v), max(v) FROM t",
 			func(rng *rand.Rand) []any { return nil }, true},
 		{"grouped min/max", "SELECT k, min(v), max(v) FROM t GROUP BY k ORDER BY k",
 			func(rng *rand.Rand) []any { return nil }, true},
-		// HAVING, which the GROUP BY driver also declines.
 		{"GROUP BY with HAVING", "SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > ? ORDER BY k",
-			func(rng *rand.Rand) []any { return []any{5000 + rng.Intn(100)} }, false},
-		// Predicate shapes the recogniser does not model.
+			func(rng *rand.Rand) []any { return []any{5000 + rng.Intn(100)} }, true},
 		{"OR predicate", "SELECT count(*) FROM t WHERE v > ? OR k = ?",
 			func(rng *rand.Rand) []any { return []any{rng.Intn(1_000_000), rng.Intn(10)} }, true},
 		{"BETWEEN range", "SELECT count(*) FROM t WHERE v BETWEEN ? AND ?",
@@ -223,28 +218,25 @@ func TestBenchColumnarVsC(t *testing.T) {
 		{"IN list", "SELECT count(*) FROM t WHERE k IN (1,3,5,7)",
 			func(rng *rand.Rand) []any { return nil }, true},
 		{"IS NULL scan", "SELECT count(*) FROM t WHERE payload IS NULL",
-			func(rng *rand.Rand) []any { return nil }, false},
-		// TEXT: ordering, matching and aggregation, none of it columnar.
+			func(rng *rand.Rand) []any { return nil }, true},
 		{"LIKE scan", "SELECT count(*) FROM t WHERE payload LIKE '%-7-payload'",
-			func(rng *rand.Rand) []any { return nil }, false},
+			func(rng *rand.Rand) []any { return nil }, true},
 		{"ORDER BY text LIMIT", "SELECT id, payload FROM t ORDER BY payload DESC, id DESC LIMIT 20",
-			func(rng *rand.Rand) []any { return nil }, false},
+			func(rng *rand.Rand) []any { return nil }, true},
 		{"group_concat", "SELECT k, count(*) FROM t WHERE k < 3 GROUP BY k ORDER BY k",
-			func(rng *rand.Rand) []any { return nil }, false},
-		// DISTINCT, subqueries and compounds.
+			func(rng *rand.Rand) []any { return nil }, true},
 		{"DISTINCT scan", "SELECT count(*) FROM (SELECT DISTINCT k FROM t)",
-			func(rng *rand.Rand) []any { return nil }, false},
+			func(rng *rand.Rand) []any { return nil }, true},
 		{"scalar subquery", "SELECT count(*) FROM t WHERE v > (SELECT avg(v) FROM t)",
-			func(rng *rand.Rand) []any { return nil }, false},
+			func(rng *rand.Rand) []any { return nil }, true},
 		{"IN subquery", "SELECT count(*) FROM t WHERE bid IN (SELECT id FROM b WHERE id < ?)",
-			func(rng *rand.Rand) []any { return []any{1 + rng.Intn(1000)} }, false},
+			func(rng *rand.Rand) []any { return []any{1 + rng.Intn(1000)} }, true},
 		{"EXISTS correlated", "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.id = t.bid AND b.id < ?)",
-			func(rng *rand.Rand) []any { return []any{1 + rng.Intn(1000)} }, false},
+			func(rng *rand.Rand) []any { return []any{1 + rng.Intn(1000)} }, true},
 		{"UNION ALL compound", "SELECT count(*) FROM (SELECT k FROM t WHERE k < 3 UNION ALL SELECT k FROM t WHERE k > 7)",
 			func(rng *rand.Rand) []any { return nil }, true},
-		// Pagination, which an OFFSET keeps off the bounded-heap fast path.
 		{"paginate OFFSET", "SELECT id, v FROM t ORDER BY v DESC, id DESC LIMIT 20 OFFSET 1000",
-			func(rng *rand.Rand) []any { return nil }, false},
+			func(rng *rand.Rand) []any { return nil }, true},
 		// A join returning ROWS rather than a count.
 		{"join projecting rows", "SELECT t.id, b.id FROM t JOIN b ON t.bid = b.id WHERE t.sec = ?",
 			func(rng *rand.Rand) []any { return []any{rng.Intn(benchN)} }, false},
