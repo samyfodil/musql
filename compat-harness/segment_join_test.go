@@ -17,8 +17,7 @@ import (
 // INTEGER keys with no NULLs, the rows all in segments after VACUUM -- and
 // checks that it served them, so a decline cannot pass for a match. The keys
 // include rows naming a parent that does not exist, negative and far-apart
-// rowids, and a sum whose terms may overflow, which the kernel replays. Only
-// random() declines: its values are not a function of the row.
+// rowids, and a sum whose terms may overflow, which the kernel replays.
 func TestSegJoinAggregateMatchesC(t *testing.T) {
 	setup := []string{
 		`CREATE TABLE artists(id INTEGER PRIMARY KEY, name TEXT NOT NULL)`,
@@ -142,7 +141,7 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT upper(g.tag), count(*) FROM tracks t JOIN tags g ON g.id = t.album_id GROUP BY upper(g.tag)`, true},
 		{`SELECT sum(t.seconds * al.year) FROM albums al JOIN tracks t ON t.album_id = al.id`, true},
 		{`SELECT sum(t.plays * t.plays * t.plays) FROM albums al JOIN tracks t ON t.album_id = al.id`, true},
-		{`SELECT al.id, sum(random() % 2 * 0) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, false},
+		{`SELECT al.id, sum(random() % 2 * 0) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
 		{`SELECT al.id, count(coalesce(t.id, 0)) FROM albums al LEFT JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
 		{`SELECT count(DISTINCT t.album_id), count(*), sum(DISTINCT al.year) FROM tracks t JOIN albums al ON al.id = t.album_id`, true},
 		{`SELECT al.artist_id, count(DISTINCT t.seconds), avg(DISTINCT t.plays), total(DISTINCT al.year), count(t.seconds) FROM tracks t JOIN albums al ON al.id = t.album_id GROUP BY al.artist_id`, true},

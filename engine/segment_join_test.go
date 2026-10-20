@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -153,7 +154,7 @@ func TestSegJoinMultiOrMatchesLoop(t *testing.T) {
 	}
 	for i := range want {
 		if want[i] != got[i] {
-			t.Errorf("%s:\n  loop   %.300s\n  kernel %.300s", queries[i], want[i], got[i])
+			t.Errorf("%s:\n  loop   %.300s ... %s\n  kernel %.300s ... %s", queries[i], want[i], want[i][max(0, len(want[i])-12):], got[i], got[i][max(0, len(got[i])-12):])
 		}
 	}
 }
@@ -207,7 +208,83 @@ func TestSegJoinCollatedGroupsMatchLoop(t *testing.T) {
 	want, got := run(true), run(false)
 	for i := range want {
 		if want[i] != got[i] {
-			t.Errorf("%s:\n  loop   %.300s\n  kernel %.300s", queries[i], want[i], got[i])
+			t.Errorf("%s:\n  loop   %.300s ... %s\n  kernel %.300s ... %s", queries[i], want[i], want[i][max(0, len(want[i])-12):], got[i], got[i][max(0, len(got[i])-12):])
+		}
+	}
+}
+
+// segJoinTicks is tick(): a function that is not a function of its
+// arguments, counting its calls, so an answer shows how often and in what
+// order a statement called it.
+var (
+	segJoinTicks    int64
+	segJoinTickOnce sync.Once
+)
+
+// TestSegJoinVolatileMatchesLoop holds the join kernel to the loop on
+// aggregates over a volatile function, which the loop calls once per joined
+// row it steps, in its order: the kernel must call it exactly so -- once
+// per joined row, never once per table row or twice for a row it reads
+// again -- which tick()'s counts make visible.
+func TestSegJoinVolatileMatchesLoop(t *testing.T) {
+	segJoinTickOnce.Do(func() {
+		if err := RegisterFunction(ScalarFunction{Name: "segjoin_tick", NArg: -1, Fn: func([]Value) (Value, error) {
+			segJoinTicks++
+			return Value{Typ: Int, I: segJoinTicks}, nil
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	setup := []string{
+		`CREATE TABLE a(id INTEGER PRIMARY KEY, g INTEGER)`,
+		`CREATE TABLE b(id INTEGER PRIMARY KEY, a_id INTEGER, v INTEGER)`,
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 30) INSERT INTO a SELECT i, i % 4 FROM n`,
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 200) INSERT INTO b SELECT i, 1 + i % 37, i * 7 % 23 FROM n`,
+	}
+	queries := []string{
+		`SELECT count(*), group_concat(segjoin_tick()), sum(b.v) FROM a JOIN b ON b.a_id = a.id`,
+		`SELECT a.id, group_concat(segjoin_tick() * 10 + b.v), count(*) FROM a JOIN b ON b.a_id = a.id GROUP BY a.id`,
+		`SELECT a.g, sum(segjoin_tick()), group_concat(b.id) FROM a JOIN b ON b.a_id = a.id GROUP BY a.g`,
+		`SELECT a.id, group_concat(segjoin_tick(b.v)) FROM a LEFT JOIN b ON b.a_id = a.id AND b.v > 5 GROUP BY a.id`,
+		`SELECT max(b.v), group_concat(segjoin_tick()), b.id FROM a JOIN b ON b.a_id = a.id`,
+		`SELECT a.g, total(segjoin_tick() + b.v), max(b.v), b.id FROM b JOIN a ON a.id = b.a_id GROUP BY a.g`,
+		// Two calls per row, interleaved as the loop makes them.
+		`SELECT a.g, group_concat(segjoin_tick()), group_concat(segjoin_tick(b.v) * 2) FROM b JOIN a ON a.id = b.a_id GROUP BY a.g`,
+		`SELECT a.id, group_concat(segjoin_tick()), sum(segjoin_tick()) FROM a JOIN b ON b.a_id = a.id GROUP BY a.id`,
+		`SELECT group_concat(segjoin_tick()), group_concat(segjoin_tick() + segjoin_tick()) FROM a JOIN b ON b.a_id = a.id`,
+		`SELECT a.g, group_concat(segjoin_tick()), group_concat(segjoin_tick(b.v)), max(b.v), b.id FROM b JOIN a ON a.id = b.a_id GROUP BY a.g`,
+		`SELECT a.id, group_concat(segjoin_tick() || '-' || b.v), sum(segjoin_tick()) FROM a LEFT JOIN b ON b.a_id = a.id GROUP BY a.id`,
+	}
+	run := func(off bool) []string {
+		segPeepholesOffForTest = off
+		defer func() { segPeepholesOffForTest = false }()
+		db, err := OpenOrCreate(filepath.Join(t.TempDir(), "v.musq"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		for _, s := range setup {
+			if _, _, err := db.ExecArgs(s, nil); err != nil {
+				t.Fatalf("%s: %v", s, err)
+			}
+			db.CommitIfAutocommit()
+		}
+		var out []string
+		for _, q := range queries {
+			segJoinTicks = 0
+			SegJoinHitsForTest()
+			_, rows, err := db.Query(q, nil)
+			if !off && SegJoinHitsForTest() == 0 {
+				t.Errorf("not served by the join kernel: %s", q)
+			}
+			out = append(out, fmt.Sprint(rows, err, segJoinTicks))
+		}
+		return out
+	}
+	want, got := run(true), run(false)
+	for i := range want {
+		if want[i] != got[i] {
+			t.Errorf("%s:\n  loop   %.300s ... %s\n  kernel %.300s ... %s", queries[i], want[i], want[i][max(0, len(want[i])-12):], got[i], got[i][max(0, len(got[i])-12):])
 		}
 	}
 }

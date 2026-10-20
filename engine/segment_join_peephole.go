@@ -544,6 +544,11 @@ func segJoinGroupPeephole(prog *Program) bool {
 		return false
 	}
 	loads, copies, writer, seqReg, rec, mk := b.loads, b.copies, b.writer, b.seqReg, b.rec, b.mk
+	// The drain runs the body's copy for each group's first row, after the
+	// walk computed it: a volatile call there would run twice.
+	if slices.ContainsFunc(copies, segJoinVolatileInsn) {
+		return false
+	}
 	hand := in[pc]
 	closeAt, _, ok := l.tail(in, pc+1)
 	if !ok {
@@ -811,6 +816,18 @@ func segJoinGroupPeephole(prog *Program) bool {
 	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2,
 		segs: segs, grouped: true, key: key, keyColl: keyColl, loads: loads, orders: l.orders, fullStep: segJoinFullStep(plan)}
 	out := append([]Instruction(nil), in...)
+	// A volatile call in the drain's run, or a later step's loads, the
+	// loop makes in the drain's order: the drain still makes it for each
+	// group's first row, and the kernel's rest for the others after it.
+	for pc := runAt; pc < steps[len(steps)-1]; pc++ {
+		if !segJoinVolatileInsn(in[pc]) {
+			continue
+		}
+		if !slices.ContainsFunc(args, func(a segJoinArg) bool { return a.expr != nil && slices.Contains(a.expr.pcs, pc) }) {
+			return false // a call no argument makes
+		}
+		jp.drainCalls = true
+	}
 	guard := len(out)
 	out[l.head] = Instruction{Op: OpGoto, P2: guard}
 	// guard: the kernel, or the loop as it was.
@@ -953,7 +970,7 @@ func (tr *segJoinTrace) step(pc int) bool {
 		return true
 	case OpFunction:
 		name, isName := ins.P4.(string)
-		if !isName || name == "rtreecheck" || name == "vec1_config" || nonConstantFuncs[r33sFoldIdent(name)] {
+		if !isName || name == "rtreecheck" || name == "vec1_config" {
 			return false
 		}
 	}
@@ -974,7 +991,8 @@ func (tr *segJoinTrace) step(pc int) bool {
 	deps = append(deps, pc)
 	slices.Sort(deps)
 	deps = slices.Compact(deps)
-	tr.src[writes[0]] = segJoinArg{reg: writes[0], level: level, expr: tr.expr(deps, writes[0])}
+	e := tr.expr(deps, writes[0])
+	tr.src[writes[0]] = segJoinArg{reg: writes[0], level: segJoinVolatileLevel(level, e), expr: e}
 	tr.deps[writes[0]] = deps
 	return true
 }
@@ -989,7 +1007,25 @@ func (tr *segJoinTrace) expr(deps []int, out int) *segJoinExpr {
 		}
 		e.insns = append(e.insns, ins)
 	}
+	e.volatile = slices.ContainsFunc(e.insns, segJoinVolatileInsn)
 	return e
+}
+
+// segJoinVolatileInsn reports whether in calls a function whose value is not
+// a function of its arguments (random()): the loop calls it once per row it
+// steps, so the kernel may call it only so, never once per table row.
+func segJoinVolatileInsn(in Instruction) bool {
+	name, ok := in.P4.(string)
+	return in.Op == OpFunction && ok && nonConstantFuncs[r33sFoldIdent(name)]
+}
+
+// segJoinVolatileLevel is the level of e's value computed over level: a
+// volatile expression's is a joined row's (segJoinMulti) whatever it reads.
+func segJoinVolatileLevel(level int, e *segJoinExpr) int {
+	if e.volatile {
+		return segJoinMulti
+	}
+	return level
 }
 
 // writtenOnEveryPath reports whether every path from pc to the instruction
@@ -1118,7 +1154,7 @@ func (tr *segJoinTrace) region(pc, limit int) (int, bool) {
 		}
 		if ins.Op == OpFunction {
 			name, isName := ins.P4.(string)
-			if !isName || name == "rtreecheck" || name == "vec1_config" || nonConstantFuncs[r33sFoldIdent(name)] {
+			if !isName || name == "rtreecheck" || name == "vec1_config" {
 				return 0, false
 			}
 		}
@@ -1190,11 +1226,13 @@ func (tr *segJoinTrace) region(pc, limit int) (int, bool) {
 				delete(tr.deps, o)
 				continue
 			}
-			tr.src[o] = segJoinArg{reg: o, level: level, expr: tr.expr(deps, o), guard: guard}
+			e := tr.expr(deps, o)
+			tr.src[o] = segJoinArg{reg: o, level: segJoinVolatileLevel(level, e), expr: e, guard: guard}
 			tr.deps[o] = deps
 			continue
 		}
-		tr.src[o] = segJoinArg{reg: o, level: level, expr: tr.expr(deps, o)}
+		e := tr.expr(deps, o)
+		tr.src[o] = segJoinArg{reg: o, level: segJoinVolatileLevel(level, e), expr: e}
 		tr.deps[o] = deps
 	}
 	return end, true
@@ -1581,6 +1619,11 @@ func segJoinTopPeephole(prog *Program) bool {
 		return false
 	}
 	writer, loads, copies, mk, check, pc := b.writer, b.loads, b.copies, b.mk, b.check, b.end
+	// The body's copy runs once per candidate after a walk that already
+	// computed the key: a volatile call would run again.
+	if slices.ContainsFunc(copies, segJoinVolatileInsn) {
+		return false
+	}
 	closeAt, _, ok := l.tail(in, pc+1)
 	if !ok || copies[check].P2 != pc+1 || copies[check].P3 != mk.P1 || mk.P2 < ki.nKey {
 		return false // the check skips to the innermost Next, over the key

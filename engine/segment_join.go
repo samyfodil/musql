@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"cmp"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"math/bits"
@@ -62,6 +63,10 @@ type segJoinPlan struct {
 	// for none.
 	crosses [][]*segJoinExpr
 	tags    []*segJoinTags
+	// drainCalls: the volatile calls are a GROUP BY drain's, made in its
+	// order -- each group's first row by the drain itself, the others by
+	// the kernel's rest after it, row by row (fullStep) -- not the scan's.
+	drainCalls bool
 	// fullStep: every joined row goes through the aggregate's own step with
 	// its whole row (segJoinFullStep), rather than the kernel adding its
 	// arguments.
@@ -80,6 +85,37 @@ type segJoinPlan struct {
 	// sorter's key (sorterKeyInfo.bound rows kept).
 	order []segJoinArg
 	keys  *sorterKeyInfo
+}
+
+// argsInCallOrder is the arguments, those that call a volatile function in
+// the order the loop makes their first such call -- by address -- and the
+// rest after them.
+func (p *segJoinPlan) argsInCallOrder() []segJoinArg {
+	first := func(a segJoinArg) int {
+		if a.expr == nil || !a.expr.volatile {
+			return math.MaxInt
+		}
+		for k, in := range a.expr.insns {
+			if segJoinVolatileInsn(in) {
+				return a.expr.pcs[k]
+			}
+		}
+		return math.MaxInt
+	}
+	args := slices.Clone(p.args)
+	slices.SortStableFunc(args, func(x, y segJoinArg) int { return cmp.Compare(first(x), first(y)) })
+	return args
+}
+
+// volatile reports whether an argument or the key calls a volatile
+// function.
+func (p *segJoinPlan) volatile() bool {
+	for _, a := range p.args {
+		if a.expr != nil && a.expr.volatile {
+			return true
+		}
+	}
+	return p.key.expr != nil && p.key.expr.volatile
 }
 
 // allSegs is every segment the body steps.
@@ -154,6 +190,10 @@ type segJoinExpr struct {
 	insns []Instruction
 	pcs   []int // each instruction's address in the program, which its jumps name
 	out   int
+	// volatile: it calls random() or another function whose value is not a
+	// function of its arguments, so each joined row's value is computed
+	// once, in the loop's order, and kept (segJoinWalk.memo).
+	volatile bool
 }
 
 // at is where a jump to address pc goes on in the expression: its first
@@ -870,6 +910,7 @@ type segJoinWalk struct {
 	tagKeys [][]func(i, k int) Value
 	vm      *vdbe
 	failed  bool
+	calls   map[string]Value // volatile calls' values, by address and joined row
 
 	// order0 is the first level's rows in the order the loop visits them,
 	// nil for rowid order; rank, per level, each row's place in the order
@@ -908,11 +949,40 @@ func (w *segJoinWalk) eval(e *segJoinExpr, at []int32) (Value, bool) {
 		}
 		return Value{Typ: Int, I: w.tabs[lv].rowids[at[lv]]}
 	}
-	v, ok := segJoinEvalRow(w.vm, e, column, rowid)
+	// A volatile call is made once per joined row: the first time, which
+	// the walk makes the loop's order, and its value kept by the call's
+	// address for any later evaluation -- and for the drain's own copy of
+	// the call (OpSegJoinVolatile).
+	volatile := func(k int, op *Instruction) bool {
+		key := segJoinCallKey(e.pcs[k], at)
+		if v, ok := w.calls[key]; ok {
+			w.vm.regs[op.P3] = v
+			return true
+		}
+		if _, ok := w.vm.segEvalInsn(op, column); !ok {
+			return false
+		}
+		if w.calls == nil {
+			w.calls = map[string]Value{}
+		}
+		w.calls[key] = copyValue(w.vm.regs[op.P3])
+		return true
+	}
+	v, ok := segJoinEvalRow(w.vm, e, column, rowid, volatile)
 	if !ok {
 		w.failed = true
 	}
 	return v, ok
+}
+
+// segJoinCallKey is the key of the call at address pc on joined row at.
+func segJoinCallKey(pc int, at []int32) string {
+	key := make([]byte, 0, 8+4*len(at))
+	key = binary.LittleEndian.AppendUint64(key, uint64(pc))
+	for _, r := range at {
+		key = binary.LittleEndian.AppendUint32(key, uint32(r))
+	}
+	return string(key)
 }
 
 // keep reports whether the joined row at, through level i, passes level i's
@@ -1104,7 +1174,7 @@ func (w *segJoinWalk) exprValues(a segJoinArg) ([]Value, bool) {
 	out := make([]Value, n)
 	for r := range n {
 		row = int32(r)
-		v, ok := segJoinEvalRow(&vm, a.expr, column, func(*Instruction) Value { return t.value(row, -1) })
+		v, ok := segJoinEvalRow(&vm, a.expr, column, func(*Instruction) Value { return t.value(row, -1) }, nil)
 		if !ok {
 			return nil, false
 		}
@@ -1131,10 +1201,17 @@ func (w *segJoinWalk) exprValues(a segJoinArg) ([]Value, bool) {
 
 // segJoinEvalRow runs e once on vm's registers, its columns read by column
 // and its rowids by rowid, and returns its value.
-func segJoinEvalRow(vm *vdbe, e *segJoinExpr, column, rowid func(*Instruction) Value) (Value, bool) {
+//
+// volatile, when not nil, makes the expression's k'th instruction, a call of
+// a volatile function, and reports whether it did; nil makes every call.
+func segJoinEvalRow(vm *vdbe, e *segJoinExpr, column, rowid func(*Instruction) Value, volatile func(k int, op *Instruction) bool) (Value, bool) {
 	for k := 0; k < len(e.insns); {
 		op := &e.insns[k]
 		switch {
+		case volatile != nil && segJoinVolatileInsn(*op):
+			if !volatile(k, op) {
+				return Value{}, false
+			}
 		case op.Op == OpRowid:
 			vm.regs[op.P2] = rowid(op)
 		case op.Op == OpGoto:
@@ -1168,7 +1245,7 @@ func (w *segJoinWalk) nullRowValue(a segJoinArg) (Value, bool) {
 	vm.regs = make([]Value, len(w.m.regs))
 	vm.fnArgBuf, vm.likePlan = nil, nil
 	none := func(*Instruction) Value { return Value{} }
-	v, ok := segJoinEvalRow(&vm, a.expr, none, none)
+	v, ok := segJoinEvalRow(&vm, a.expr, none, none, nil)
 	if !ok {
 		return Value{}, false
 	}
@@ -1755,7 +1832,7 @@ func segJoinArgsOf(plan *segJoinPlan, w *segJoinWalk, replayInts bool) (*segJoin
 			args.distinct = append(args.distinct, args.argOf[it.rowRegs[aggExprArg]-1])
 		}
 	}
-	args.keep = args.keep || args.floats || plan.fullStep
+	args.keep = args.keep || args.floats || plan.fullStep || plan.drainCalls
 	// A DISTINCT over integers needs only which of its level's rows took
 	// part, not how often or in what order -- when there is one group. Many
 	// keep their rows.
@@ -1826,7 +1903,8 @@ type segJoinGroup struct {
 // GROUP BY has one group, or none when nothing joins.
 func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (gs *segJoinGroups, ok bool) {
 	gs, ok, overflow := m.segJoinGroupsWith(plan, false)
-	if overflow {
+	if overflow && !plan.volatile() {
+		// A second walk would call a volatile expression again.
 		// A sum that could overflow: summed again by its own step.
 		gs, ok, _ = m.segJoinGroupsWith(plan, true)
 	}
@@ -1950,6 +2028,14 @@ func (m *vdbe) segJoinGroupsWith(plan *segJoinPlan, replayInts bool) (gs *segJoi
 				}
 			}
 		}
+		// A volatile argument's value, computed now, in the loop's order --
+		// unless the loop computes it in a GROUP BY's drain, in the drain's
+		// order: the group's first row there, its others in rest.
+		if !plan.drainCalls {
+			for _, a := range plan.argsInCallOrder() {
+				w.value(a, at)
+			}
+		}
 		if !g.sums.add(args, at) {
 			overflow = true
 			return false
@@ -1981,7 +2067,7 @@ func (gs *segJoinGroups) loadArgs(m *vdbe, g *segJoinGroup) {
 // rest adds group g's other rows to the accumulators its first row was just
 // stepped into.
 func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) error {
-	if gs.plan.fullStep {
+	if gs.plan.fullStep || gs.plan.drainCalls {
 		return gs.restFull(m, g)
 	}
 	args, s := gs.args, g.sums
@@ -2215,7 +2301,7 @@ func (gs *segJoinGroups) restFull(m *vdbe, g *segJoinGroup) error {
 // its arguments in their registers and its whole row gathered into row and
 // rowids.
 func (gs *segJoinGroups) stepRow(m *vdbe, at []int32, row, rowids []Value) error {
-	for _, a := range gs.plan.args {
+	for _, a := range gs.plan.argsInCallOrder() {
 		m.regs[a.reg] = gs.w.value(a, at)
 	}
 	if !gs.gatherAt(at, row, rowids) {
