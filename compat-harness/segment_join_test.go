@@ -17,7 +17,8 @@ import (
 // INTEGER keys with no NULLs, the rows all in segments after VACUUM -- and
 // checks that it served them, so a decline cannot pass for a match. The keys
 // include rows naming a parent that does not exist, negative and far-apart
-// rowids, and a sum whose terms may overflow, which must decline.
+// rowids, and a sum whose terms may overflow, which the kernel replays. Only
+// random() declines: its values are not a function of the row.
 func TestSegJoinAggregateMatchesC(t *testing.T) {
 	setup := []string{
 		`CREATE TABLE artists(id INTEGER PRIMARY KEY, name TEXT NOT NULL)`,
@@ -53,17 +54,17 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT count(*) FROM albums al JOIN artists ar ON ar.id = al.artist_id`, true},
 		{`SELECT count(*), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE al.id > 1000`, true},
 		{`SELECT sum(t.rating) FROM albums al JOIN tracks t ON t.album_id = al.id`, true},
-		{`SELECT sum(b.v) FROM albums al JOIN big b ON b.album_id = al.id`, false},
+		{`SELECT sum(b.v) FROM albums al JOIN big b ON b.album_id = al.id`, true},
 		{`SELECT count(*), sum(b.v) FROM big b JOIN albums al ON al.id = b.album_id WHERE b.id < 0`, true},
 		// Each table's own WHERE terms filter its rows.
-		{`SELECT count(*), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.plays > 5000 AND al.year < 1977 AND t.seconds BETWEEN 120 AND 300`, false},
+		{`SELECT count(*), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.plays > 5000 AND al.year < 1977 AND t.seconds BETWEEN 120 AND 300`, true},
 		{`SELECT count(*), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.plays > 5000 AND al.year < 1977 AND t.seconds >= 120`, true},
 		{`SELECT count(*), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE al.year <> 1971`, true},
 		{`SELECT al.id, count(*), max(t.plays) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.plays >= ? GROUP BY al.id`, true},
 		{`SELECT ar.name, count(*) FROM artists ar JOIN albums al ON al.artist_id = ar.id JOIN tracks t ON t.album_id = al.id WHERE ar.name > 'a' AND t.rating < 2.5 AND al.year = '1975' GROUP BY ar.name`, true},
-		{`SELECT count(*) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.rating = 1 AND t.id % 3 = 0`, false},
+		{`SELECT count(*) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.rating = 1 AND t.id % 3 = 0`, true},
 		{`SELECT count(*) FROM tags g JOIN tracks t ON t.album_id = g.id WHERE g.tag > 0 AND g.tag < 'S'`, true},
-		{`SELECT count(*) FROM tags g JOIN tracks t ON t.album_id = g.id WHERE g.ci = 'rock'`, false},
+		{`SELECT count(*) FROM tags g JOIN tracks t ON t.album_id = g.id WHERE g.ci = 'rock'`, true},
 		// GROUP BY: streamed when the groups arrive in scan order, sorted
 		// otherwise; bare columns read the group's first joined row.
 		{`SELECT al.id, count(*), sum(t.seconds), min(t.plays), max(t.plays) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
@@ -79,10 +80,10 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT ar.name, count(*) FROM artists ar JOIN albums al ON al.artist_id = ar.id JOIN tracks t ON t.album_id = al.id GROUP BY ar.name`, true},
 		// Keys that are not integers group by their value, BINARY only.
 		{`SELECT g.tag, count(*), sum(t.seconds) FROM tags g JOIN tracks t ON t.album_id = g.id GROUP BY g.tag`, true},
-		{`SELECT g.tag COLLATE NOCASE, count(*) FROM tags g JOIN tracks t ON t.album_id = g.id GROUP BY g.tag COLLATE NOCASE`, false},
-		{`SELECT g.ci, count(*) FROM tags g JOIN tracks t ON t.album_id = g.id GROUP BY g.ci`, false},
+		{`SELECT g.tag COLLATE NOCASE, count(*) FROM tags g JOIN tracks t ON t.album_id = g.id GROUP BY g.tag COLLATE NOCASE`, true},
+		{`SELECT g.ci, count(*) FROM tags g JOIN tracks t ON t.album_id = g.id GROUP BY g.ci`, true},
 		{`SELECT g.tag, count(*) FROM tracks t JOIN tags g ON g.id = t.album_id GROUP BY g.tag ORDER BY 2 DESC, 1`, true},
-		{`SELECT al.id, max(t.plays), t.id FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, false},
+		{`SELECT al.id, max(t.plays), t.id FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
 		{`SELECT al.id, sum(t.rating) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
 		{`SELECT al.id, group_concat(t.id) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
 		// LEFT JOIN: an outer row nothing matches still counts, with NULLs,
@@ -109,7 +110,7 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT t.id, g.tag FROM tracks t JOIN tags g ON g.id = t.album_id ORDER BY g.tag LIMIT 9`, true},
 		{`SELECT t.id, t.rating FROM albums al JOIN tracks t ON t.album_id = al.id ORDER BY t.rating DESC LIMIT 15`, true},
 		{`SELECT t.id FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.plays > 1000 ORDER BY t.id DESC LIMIT 3`, true},
-		{`SELECT t.id, t.seconds + al.year FROM albums al JOIN tracks t ON t.album_id = al.id ORDER BY t.seconds LIMIT 100000`, false},
+		{`SELECT t.id, t.seconds + al.year FROM albums al JOIN tracks t ON t.album_id = al.id ORDER BY t.seconds LIMIT 100000`, true},
 		{`SELECT al.id, al.year FROM tracks t JOIN albums al ON al.id = t.album_id ORDER BY al.year LIMIT 1`, true},
 		{`SELECT t.id FROM albums al LEFT JOIN tracks t ON t.album_id = al.id ORDER BY t.plays LIMIT 5`, true},
 		// DISTINCT over INTEGER arguments.
@@ -129,17 +130,17 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT group_concat(t.id, ',' ORDER BY t.seconds DESC, t.id) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.id < 60`, true},
 		// CASE and IFNULL: jumps that meet again inside the expression.
 		{`SELECT al.id, sum(CASE WHEN t.seconds > 300 THEN 1 ELSE 0 END), count(*) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
-		{`SELECT sum(CASE t.seconds % 3 WHEN 0 THEN t.plays WHEN 1 THEN -t.plays END), total(ifnull(t.rating, -1)) FROM albums al JOIN tracks t ON t.album_id = al.id`, false},
+		{`SELECT sum(CASE t.seconds % 3 WHEN 0 THEN t.plays WHEN 1 THEN -t.plays END), total(ifnull(t.rating, -1)) FROM albums al JOIN tracks t ON t.album_id = al.id`, true},
 		{`SELECT CASE WHEN al.year > 1980 THEN 'new' ELSE 'old' END AS era, count(*) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY era`, true},
-		{`SELECT count(*) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE CASE WHEN t.seconds > 200 THEN t.plays > 0 ELSE t.plays < 0 END`, false},
-		{`SELECT count(*) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.seconds > 340 OR t.plays < -29000`, false},
+		{`SELECT count(*) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE CASE WHEN t.seconds > 200 THEN t.plays > 0 ELSE t.plays < 0 END`, true},
+		{`SELECT count(*) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.seconds > 340 OR t.plays < -29000`, true},
 		// Expressions over one table's columns, computed once per row of it.
 		{`SELECT al.id, sum(t.seconds * t.plays), max(t.seconds - 100), count(t.seconds / 7) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
 		{`SELECT al.year / 10, count(*), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.year / 10`, true},
 		{`SELECT al.year % 4, total(t.rating * 2), avg(t.seconds + 0.5) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY 1`, true},
 		{`SELECT count(1), sum(1), sum(length(g.tag)), count(abs(t.plays)) FROM tracks t JOIN tags g ON g.id = t.album_id`, true},
 		{`SELECT upper(g.tag), count(*) FROM tracks t JOIN tags g ON g.id = t.album_id GROUP BY upper(g.tag)`, true},
-		{`SELECT sum(t.seconds * al.year) FROM albums al JOIN tracks t ON t.album_id = al.id`, false},
+		{`SELECT sum(t.seconds * al.year) FROM albums al JOIN tracks t ON t.album_id = al.id`, true},
 		{`SELECT sum(t.plays * t.plays * t.plays) FROM albums al JOIN tracks t ON t.album_id = al.id`, true},
 		{`SELECT al.id, sum(random() % 2 * 0) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, false},
 		{`SELECT al.id, count(coalesce(t.id, 0)) FROM albums al LEFT JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
@@ -147,10 +148,10 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT al.artist_id, count(DISTINCT t.seconds), avg(DISTINCT t.plays), total(DISTINCT al.year), count(t.seconds) FROM tracks t JOIN albums al ON al.id = t.album_id GROUP BY al.artist_id`, true},
 		{`SELECT al.id, count(DISTINCT t.seconds), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
 		{`SELECT count(DISTINCT t.rating) FROM tracks t JOIN albums al ON al.id = t.album_id`, true},
-		{`SELECT ar.name, group_concat(al.year, '/'), json_group_array(al.id), min(al.title) FROM artists ar JOIN albums al ON al.artist_id = ar.id GROUP BY ar.id`, false},
+		{`SELECT ar.name, group_concat(al.year, '/'), json_group_array(al.id), min(al.title) FROM artists ar JOIN albums al ON al.artist_id = ar.id GROUP BY ar.id`, true},
 		{`SELECT ar.id, group_concat(t.id ORDER BY t.plays) FROM artists ar JOIN albums al ON al.artist_id = ar.id JOIN tracks t ON t.album_id = al.id GROUP BY ar.id`, true},
 		{`SELECT count(DISTINCT w.v), sum(DISTINCT w.album_id) FROM wide w JOIN albums al ON al.id = w.album_id`, true},
-		{`SELECT b.album_id, sum(b.v) FROM big b JOIN albums al ON al.id = b.album_id GROUP BY b.album_id`, false},
+		{`SELECT b.album_id, sum(b.v) FROM big b JOIN albums al ON al.id = b.album_id GROUP BY b.album_id`, true},
 		// Sums the order-strict check has to judge from the values' window.
 		{`SELECT w.album_id, sum(w.v), count(*) FROM wide w JOIN albums al ON al.id = w.album_id GROUP BY w.album_id`, true},
 		{`SELECT al.id, sum(w.v), al.year FROM albums al JOIN wide w ON w.album_id = al.id GROUP BY al.id HAVING sum(w.v) <> 0`, true},
