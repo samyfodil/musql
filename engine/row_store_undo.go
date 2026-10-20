@@ -79,6 +79,7 @@ func (s *rowStore) undoTo(mark int) {
 			s.mPeak = 0
 			s.swaps++
 			s.writes++
+			s.reshapes++
 			s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false
 			s.ubKnown = false
 			s.overValid, s.memBytes = false, 0 // the prior map's in-memory share is not known
@@ -90,6 +91,7 @@ func (s *rowStore) undoTo(mark int) {
 			s.m, s.mPeak = u.clr.prior, 0
 			s.swaps++
 			s.writes++
+			s.reshapes++
 			s.max, s.maxKnown, s.sorted, s.sortedValid = 0, false, nil, false
 			s.ubKnown = false
 			s.overValid, s.memBytes = false, 0 // the prior map's in-memory share is not known

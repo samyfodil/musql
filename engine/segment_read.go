@@ -52,6 +52,10 @@ type segSource struct {
 	// frozenSegs is the session's segment source at that moment.
 	frozen     bool
 	frozenSegs *ReadOnlyPager
+
+	// joinTables is the join kernel's reading of each table's committed rows
+	// (segJoinTableOf), kept while they stay the same. segJoinCacheMu guards it.
+	joinTables map[uint32]*segJoinTable
 }
 
 // isLive reports whether rootPage's rows are a write session's row store, loaded

@@ -6,6 +6,7 @@ import (
 	"math/bits"
 	"slices"
 	"sort"
+	"sync"
 	"sync/atomic"
 )
 
@@ -64,74 +65,405 @@ type segJoinArg struct {
 	reg, level, col int
 }
 
-// segJoinTable is one table's rows as the kernel reads them: flattened across
-// segments in rowid order, with a rowid-to-row lookup.
+// segJoinTable is one table's rows as the kernel reads them, in rowid order,
+// as layered as the table is: its segments' rows, under the rows the log
+// replaced or added, under a write session's own (a patch). A row is a
+// segment row (pos >= 0, its index across the segments' rows) or a patch row
+// (pos -1-k), read as stored and fixed up per value as the cursor fixes it.
+// Its columns and rowid lookup are built when first asked for. Every
+// statement that reads the table while its rows stay the same shares one
+// (segJoinTableOf), so it is read-only once built but for those lazy parts,
+// which mu guards.
 type segJoinTable struct {
+	stamp  segJoinStamp
+	tbl    *resolvedTable
+	ipk    int
+	n      int
+	rowids []int64
+	pos    []int32 // nil: row r is segment row r
 	segs   []*segment
 	starts []int // each segment's first row
-	n      int
-	ipk    int
-	tbl    *resolvedTable
-	rowids []int64
-	cols   map[int][]int64
+	patch  [][]Value
+
+	// extendable: read from a write session's store whose sorted overlay
+	// held overN rowids, at its reshapes count -- what extend checks.
+	extendable bool
+	overN      int
+	reshapes   uint64
+
+	mu    sync.Mutex
+	cols  map[int][]int64
+	fcols map[int][]float64
 	// lo/dense map a rowid to its row + 1 when the rowids are dense enough,
 	// else sparse does.
-	lo     int64
-	dense  []int32
-	sparse map[int64]int32
+	indexed bool
+	lo      int64
+	dense   []int32
+	sparse  map[int64]int32
 }
 
-// segJoinTableOf is cur's table, or false when its segments are not the whole
-// of its rows (rows pending in the log, a write session's own rows, a
-// generated column, a row short of the table's width) or do not hold them in
-// rowid order, which is the order a level visits them in.
+// segJoinStamp is what a table's rows are as of: the source and log state for
+// committed rows, and a write session's store and its write counters for its
+// own. Equal stamps mean the same rows.
+type segJoinStamp struct {
+	root    uint32
+	src     *segSource
+	delta   *segDeltaState
+	batches int
+	store   *rowStore
+	writes  uint64
+	swaps   uint32
+}
+
+// segJoinTableOf is cur's table, or false when the kernel cannot read it: a
+// WITHOUT ROWID table, a generated column, rows a scan does not yield in
+// rowid order.
 func segJoinTableOf(cur *vdbeCursor) (*segJoinTable, bool) {
 	if cur == nil || cur.tbl == nil || cur.pager == nil || cur.pager.segs == nil ||
 		cur.tbl.withoutRowid || cur.hasGeneratedCols() {
 		return nil, false
 	}
 	p, root := cur.pager, cur.tbl.root
-	var segs []*segment
-	if p.segs.isLive(root) {
-		s, ok := p.segs.liveBaseSegments(root)
-		if !ok {
-			return nil, false
-		}
-		segs = s
-	} else {
-		if !p.segCleanFor(root) {
-			return nil, false
-		}
-		segs = p.segs.byRoot[root]
+	src := p.segs
+	stamp := segJoinStamp{root: root, src: src}
+	if src.delta != nil {
+		stamp.delta, stamp.batches = src.delta, src.delta.batches
 	}
-	t := &segJoinTable{segs: segs, ipk: cur.tbl.ipkIndex, tbl: cur.tbl, cols: map[int][]int64{}}
-	for _, s := range segs {
-		if s == nil || len(s.cols) != len(cur.tbl.cols) || !s.fullWidth {
+	if src.isLive(root) {
+		store, have, err := src.liveRows(root)
+		if err != nil || !have || store == nil {
+			return nil, false
+		}
+		stamp.store, stamp.writes, stamp.swaps = store, store.writes, store.swaps
+		if b := store.seg; b != nil {
+			stamp.src, stamp.delta, stamp.batches = b.memoKey()
+		}
+		segJoinCacheMu.Lock()
+		t := store.joinTable
+		segJoinCacheMu.Unlock()
+		if t != nil && t.stamp == stamp && t.sameShape(cur.tbl) {
+			return t, true
+		}
+		if t != nil && t.sameShape(cur.tbl) {
+			if nt, ok := t.extend(store, stamp); ok {
+				segJoinCacheMu.Lock()
+				store.joinTable = nt
+				segJoinCacheMu.Unlock()
+				return nt, true
+			}
+		}
+		t, ok := buildSegJoinTable(cur, stamp)
+		if ok {
+			segJoinCacheMu.Lock()
+			store.joinTable = t
+			segJoinCacheMu.Unlock()
+		}
+		return t, ok
+	}
+	segJoinCacheMu.Lock()
+	t := src.joinTables[root]
+	segJoinCacheMu.Unlock()
+	if t != nil && t.stamp == stamp && t.sameShape(cur.tbl) {
+		return t, true
+	}
+	t, ok := buildSegJoinTable(cur, stamp)
+	if ok {
+		segJoinCacheMu.Lock()
+		if src.joinTables == nil {
+			src.joinTables = map[uint32]*segJoinTable{}
+		}
+		src.joinTables[root] = t
+		segJoinCacheMu.Unlock()
+	}
+	return t, ok
+}
+
+// segJoinCacheMu guards the tables segJoinTableOf keeps.
+var segJoinCacheMu sync.Mutex
+
+// sameShape reports whether tbl reads rows as the table t was read for does:
+// each statement resolves its own, so they are compared by what a read
+// depends on.
+func (t *segJoinTable) sameShape(tbl *resolvedTable) bool {
+	a := t.tbl
+	if a == tbl {
+		return true
+	}
+	if a.root != tbl.root || a.ipkIndex != tbl.ipkIndex || a.withoutRowid != tbl.withoutRowid || len(a.cols) != len(tbl.cols) {
+		return false
+	}
+	for i := range a.cols {
+		x, y := &a.cols[i], &tbl.cols[i]
+		if x.Aff != y.Aff || x.HasDefault != y.HasDefault || x.DefaultKnown != y.DefaultKnown ||
+			x.IsGenerated() != y.IsGenerated() || !valuesIdentical(x.DefaultValue, y.DefaultValue) {
+			return false
+		}
+	}
+	return true
+}
+
+// buildSegJoinTable reads cur's table in the layers a scan of it merges
+// (ScanTable): the committed segments less the rows the log names, the log's
+// rows, and a write session's store over both.
+func buildSegJoinTable(cur *vdbeCursor, stamp segJoinStamp) (*segJoinTable, bool) {
+	t := &segJoinTable{stamp: stamp, ipk: cur.tbl.ipkIndex, tbl: cur.tbl,
+		cols: map[int][]int64{}, fcols: map[int][]float64{}}
+	ncols := len(cur.tbl.cols)
+	store := stamp.store
+	src, root := cur.pager.segs, cur.tbl.root
+	if store != nil {
+		if b := store.seg; b == nil {
+			src = nil // the session's rows are all there is
+		} else if b.rp == nil || b.rp.segs == nil || b.rp.segs.isLive(b.root) {
+			return nil, false
+		} else {
+			src, root = b.rp.segs, b.root
+		}
+	}
+	// The committed layer: segments and the log's rows over them.
+	var skips [][]int
+	var dlive map[int64][]Value
+	if src != nil && (store == nil || !store.baseGone) {
+		t.segs = src.byRoot[root]
+		var ok bool
+		if skips, dlive, ok = src.segDeltaSkips(root, t.segs); !ok {
+			return nil, false
+		}
+	}
+	for _, s := range t.segs {
+		if s == nil || len(s.cols) != ncols || !s.fullWidth {
 			return nil, false
 		}
 		t.starts = append(t.starts, t.n)
 		t.n += s.nRows
 	}
-	t.rowids = make([]int64, 0, t.n)
-	for _, s := range segs {
-		for i := range s.nRows {
-			r := int64(s.Rowid(i))
-			if len(t.rowids) > 0 && r <= t.rowids[len(t.rowids)-1] {
-				return nil, false
+	// The patch: the log's rows, then the session's over them, less the rows
+	// the session removed, in rowid order.
+	var keys []uint64
+	if len(dlive) > 0 {
+		keys = make([]uint64, 0, len(dlive))
+		for rid := range dlive {
+			keys = append(keys, uint64(rid))
+		}
+		radixSortRowids(keys)
+	}
+	var gone []int64
+	patchRow := func(rid int64) []Value { return dlive[rid] }
+	if store != nil {
+		if len(store.m) > 0 {
+			keys = mergeRowids(keys, store.overlaySorted())
+		}
+		for rid, g := range store.gone {
+			if g {
+				gone = append(gone, int64(rid))
 			}
-			t.rowids = append(t.rowids, r)
+		}
+		slices.Sort(gone)
+		if len(gone) > 0 {
+			keys = slices.DeleteFunc(keys, func(rid uint64) bool {
+				_, found := slices.BinarySearch(gone, int64(rid))
+				return found
+			})
+		}
+		patchRow = func(rid int64) []Value {
+			if row, ok := store.m[uint64(rid)]; ok {
+				return store.resolve(row)
+			}
+			return dlive[rid]
+		}
+	}
+
+	// Merge, in rowid order. A segment row the log or the session replaced or
+	// removed gives way.
+	t.rowids = make([]int64, 0, t.n+len(keys))
+	if len(keys) > 0 || len(gone) > 0 || slices.ContainsFunc(skips, func(s []int) bool { return len(s) > 0 }) {
+		t.pos = make([]int32, 0, cap(t.rowids))
+	}
+	pi, gi := 0, 0
+	addPatch := func(rid int64) bool {
+		row := patchRow(rid)
+		if len(row) < ncols {
+			// Written before an ALTER TABLE ADD COLUMN: widened, as the
+			// cursor widens it.
+			row = cur.normalizeFrom(true, uint64(rid), row)
+		}
+		t.rowids = append(t.rowids, rid)
+		t.pos = append(t.pos, int32(-1-len(t.patch)))
+		t.patch = append(t.patch, row)
+		return len(t.patch) < math.MaxInt32
+	}
+	for si, s := range t.segs {
+		skip := skips[si]
+		sk := 0
+		for i := range s.nRows {
+			if sk < len(skip) && skip[sk] == i {
+				sk++
+				continue
+			}
+			rid := int64(s.Rowid(i))
+			for pi < len(keys) && int64(keys[pi]) < rid {
+				if !addPatch(int64(keys[pi])) {
+					return nil, false
+				}
+				pi++
+			}
+			if pi < len(keys) && int64(keys[pi]) == rid {
+				continue // the patch row goes out in its turn
+			}
+			for gi < len(gone) && gone[gi] < rid {
+				gi++
+			}
+			if gi < len(gone) && gone[gi] == rid {
+				continue
+			}
+			t.rowids = append(t.rowids, rid)
+			if t.pos != nil {
+				t.pos = append(t.pos, int32(t.starts[si]+i))
+			}
+		}
+	}
+	for ; pi < len(keys); pi++ {
+		if !addPatch(int64(keys[pi])) {
+			return nil, false
+		}
+	}
+	t.n = len(t.rowids)
+	if store != nil && store.overValid && len(store.over) == len(store.m) {
+		t.overN, t.reshapes, t.extendable = len(store.over), store.reshapes, true
+	}
+	for i := 1; i < t.n; i++ {
+		if t.rowids[i] <= t.rowids[i-1] {
+			return nil, false
 		}
 	}
 	return t, true
 }
 
+// extend is t with the rows store appended since t was read, or false when
+// anything else may have changed: a write that was not an append, a different
+// base, a rowid not past every row t holds.
+func (t *segJoinTable) extend(store *rowStore, stamp segJoinStamp) (*segJoinTable, bool) {
+	was := t.stamp
+	was.writes = stamp.writes
+	if !t.extendable || was != stamp || store.reshapes != t.reshapes || !store.overValid ||
+		len(store.over) != len(store.m) || len(store.over) < t.overN {
+		return nil, false
+	}
+	added := store.over[t.overN:]
+	if len(added) == 0 || t.n > 0 && !rowidLess(uint64(t.rowids[t.n-1]), added[0]) ||
+		t.n+len(added) >= math.MaxInt32 {
+		return nil, false
+	}
+	ncols := len(t.tbl.cols)
+	nt := &segJoinTable{stamp: stamp, tbl: t.tbl, ipk: t.ipk, segs: t.segs, starts: t.starts,
+		extendable: true, overN: len(store.over), reshapes: store.reshapes,
+		cols: map[int][]int64{}, fcols: map[int][]float64{}}
+	nt.rowids = append(t.rowids[:t.n:t.n], make([]int64, 0, len(added))...)
+	nt.patch = t.patch[:len(t.patch):len(t.patch)]
+	if t.pos != nil {
+		nt.pos = t.pos[:t.n:t.n]
+	} else {
+		nt.pos = make([]int32, t.n, t.n+len(added))
+		for i := range nt.pos {
+			nt.pos[i] = int32(i)
+		}
+	}
+	for _, rid := range added {
+		row := store.resolve(store.m[rid])
+		if len(row) < ncols {
+			return nil, false
+		}
+		nt.rowids = append(nt.rowids, int64(rid))
+		nt.pos = append(nt.pos, int32(-1-len(nt.patch)))
+		nt.patch = append(nt.patch, row)
+	}
+	nt.n = len(nt.rowids)
+	// The columns t had read, each extended by the new rows.
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for c, vals := range t.cols {
+		if vals == nil {
+			nt.cols[c] = nil
+			continue
+		}
+		out := append(vals[:t.n:t.n], make([]int64, 0, len(added))...)
+		for r := t.n; r < nt.n; r++ {
+			v := nt.stored(-1-nt.pos[r], c, nt.rowids[r])
+			if v.Typ != Int {
+				out = nil
+				break
+			}
+			out = append(out, v.I)
+		}
+		nt.cols[c] = out
+	}
+	for c, vals := range t.fcols {
+		if vals == nil {
+			nt.fcols[c] = nil
+			continue
+		}
+		out := append(vals[:t.n:t.n], make([]float64, 0, len(added))...)
+		for r := t.n; r < nt.n; r++ {
+			v := nt.stored(-1-nt.pos[r], c, nt.rowids[r])
+			if v.Typ != Float {
+				out = nil
+				break
+			}
+			out = append(out, v.F)
+		}
+		nt.fcols[c] = out
+	}
+	return nt, true
+}
+
+// mergeRowids is a and b, each ascending, merged ascending with no rowid
+// twice.
+func mergeRowids(a, b []uint64) []uint64 {
+	out := make([]uint64, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) || j < len(b) {
+		switch {
+		case j == len(b) || i < len(a) && rowidLess(a[i], b[j]):
+			out = append(out, a[i])
+			i++
+		case i == len(a) || rowidLess(b[j], a[i]):
+			out = append(out, b[j])
+			j++
+		default:
+			out = append(out, a[i])
+			i, j = i+1, j+1
+		}
+	}
+	return out
+}
+
+// stored is column c of patch row k as the cursor reads it: the rowid in an
+// INTEGER PRIMARY KEY stored as NULL, a REAL-affinity column's integer as
+// REAL.
+func (t *segJoinTable) stored(k int32, c int, rowid int64) Value {
+	row := t.patch[k]
+	if c >= len(row) {
+		return Value{}
+	}
+	v := row[c]
+	switch {
+	case c == t.ipk && v.Typ == Null:
+		return Value{Typ: Int, I: rowid}
+	case v.Typ == Int && t.tbl.cols[c].Aff == affReal:
+		return Value{Typ: Float, F: float64(v.I)}
+	}
+	return v
+}
+
 // col is column c of every row (c -1 or the INTEGER PRIMARY KEY: the rowid),
-// or false unless every segment stores it as a clean INTEGER block. A
-// REAL-affinity column declines: its integers read as REAL.
+// or false unless every row holds an INTEGER there. A REAL-affinity column
+// declines: its integers read as REAL.
 func (t *segJoinTable) col(c int) ([]int64, bool) {
 	if c < 0 || c == t.ipk {
 		return t.rowids, true
 	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if v, ok := t.cols[c]; ok {
 		return v, v != nil
 	}
@@ -139,15 +471,81 @@ func (t *segJoinTable) col(c int) ([]int64, bool) {
 	if c >= len(t.tbl.cols) || t.tbl.cols[c].Aff == affReal {
 		return nil, false
 	}
-	out := make([]int64, 0, t.n)
-	for _, s := range t.segs {
-		vals, ok := segCleanInt64Column(s, c)
-		if !ok {
+	var base []int64
+	if len(t.segs) > 0 {
+		base = make([]int64, 0, t.starts[len(t.starts)-1]+t.segs[len(t.segs)-1].nRows)
+		for _, s := range t.segs {
+			vals, ok := segCleanInt64Column(s, c)
+			if !ok {
+				return nil, false
+			}
+			base = append(base, vals[:s.nRows]...)
+		}
+	}
+	if t.pos == nil {
+		t.cols[c] = base
+		return base, true
+	}
+	out := make([]int64, t.n)
+	for r, p := range t.pos {
+		if p >= 0 {
+			out[r] = base[p]
+			continue
+		}
+		v := t.stored(-1-p, c, t.rowids[r])
+		if v.Typ != Int {
 			return nil, false
 		}
-		out = append(out, vals[:s.nRows]...)
+		out[r] = v.I
 	}
 	t.cols[c] = out
+	return out, true
+}
+
+// fcol is REAL column c of every row, as the cursor reads it, or false unless
+// every row holds a REAL there: a REAL, or an integer of a REAL-affinity
+// column (which reads as REAL).
+func (t *segJoinTable) fcol(c int) ([]float64, bool) {
+	if c < 0 || c == t.ipk || c >= len(t.tbl.cols) {
+		return nil, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if v, ok := t.fcols[c]; ok {
+		return v, v != nil
+	}
+	t.fcols[c] = nil
+	var base []float64
+	for _, s := range t.segs {
+		if vals, ok := s.Float64Column(c); ok {
+			base = append(base, vals[:s.nRows]...)
+			continue
+		}
+		ints, ok := segCleanInt64Column(s, c)
+		if !ok || t.tbl.cols[c].Aff != affReal {
+			return nil, false
+		}
+		for _, v := range ints[:s.nRows] {
+			base = append(base, float64(v))
+		}
+	}
+	if t.pos == nil {
+		t.fcols[c] = base
+		return base, true
+	}
+	out := make([]float64, t.n)
+	for r, p := range t.pos {
+		if p >= 0 {
+			out[r] = base[p]
+			continue
+		}
+		v := t.stored(-1-p, c, t.rowids[r])
+		if v.Typ != Float {
+			return nil, false
+		}
+		out[r] = v.F
+	}
+	t.fcols[c] = out
 	return out, true
 }
 
@@ -156,16 +554,26 @@ func (t *segJoinTable) value(r int32, c int) Value {
 	if c < 0 {
 		return Value{Typ: Int, I: t.rowids[r]}
 	}
-	si := sort.SearchInts(t.starts, int(r)+1) - 1
-	s, row := t.segs[si], int(r)-t.starts[si]
+	p := r
+	if t.pos != nil {
+		p = t.pos[r]
+	}
+	if p < 0 {
+		return t.stored(-1-p, c, t.rowids[r])
+	}
+	si := sort.SearchInts(t.starts, int(p)+1) - 1
+	s, row := t.segs[si], int(p)-t.starts[si]
 	return segColumnValue(segColPlansFor(t.tbl), s, row, len(s.cols), uint64(t.rowids[r]), c)
 }
 
 // index builds the rowid lookup.
 func (t *segJoinTable) index() {
-	if t.dense != nil || t.sparse != nil || t.n == 0 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.indexed || t.n == 0 {
 		return
 	}
+	t.indexed = true
 	lo, hi := t.rowids[0], t.rowids[t.n-1]
 	if span := uint64(hi - lo); span < uint64(4*t.n+1024) {
 		t.lo, t.dense = lo, make([]int32, span+1)
@@ -180,7 +588,7 @@ func (t *segJoinTable) index() {
 	}
 }
 
-// row is the row holding rowid r, or -1.
+// row is the row holding rowid r, or -1. index must have run.
 func (t *segJoinTable) row(r int64) int32 {
 	if t.dense != nil {
 		if r < t.lo || uint64(r-t.lo) >= uint64(len(t.dense)) {
@@ -401,30 +809,6 @@ func segJoinArgsOf(plan *segJoinPlan, w *segJoinWalk) (*segJoinArgs, bool) {
 		}
 	}
 	return args, true
-}
-
-// fcol is REAL column c of every row, as the cursor reads it, or false unless
-// every segment stores it as a clean REAL block, or as clean integers of a
-// REAL-affinity column (which read as REAL).
-func (t *segJoinTable) fcol(c int) ([]float64, bool) {
-	if c < 0 || c == t.ipk || c >= len(t.tbl.cols) {
-		return nil, false
-	}
-	out := make([]float64, 0, t.n)
-	for _, s := range t.segs {
-		if vals, ok := s.Float64Column(c); ok {
-			out = append(out, vals[:s.nRows]...)
-			continue
-		}
-		ints, ok := segCleanInt64Column(s, c)
-		if !ok || t.tbl.cols[c].Aff != affReal {
-			return nil, false
-		}
-		for _, v := range ints[:s.nRows] {
-			out = append(out, float64(v))
-		}
-	}
-	return out, true
 }
 
 // segJoinGroups is an aggregate's groups -- one for a whole-join aggregate --
