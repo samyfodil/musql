@@ -805,23 +805,21 @@ type segJoinWalk struct {
 	exprs map[*segJoinExpr][]Value // each expression's value per row
 
 	// order0 is the first level's rows in the order the loop visits them,
-	// and rank0 each row's place in it; nil for rowid order.
+	// nil for rowid order; rank, per level, each row's place in the order
+	// the loop visits that level's rows, nil for rowid order.
 	order0 []int32
-	rank0  []int32
+	rank   [][]int32
 }
 
 // before reports whether joined row a comes before b in the loop's order:
-// the first level's row by its place in the loop's visit, and each later
-// level's in rowid order, which is its order in its table.
+// level by level, each row by its place in the order the loop visits that
+// level's rows.
 func (w *segJoinWalk) before(a, b []int32) bool {
-	if a[0] != b[0] {
-		if w.rank0 != nil {
-			return w.rank0[a[0]] < w.rank0[b[0]]
-		}
-		return a[0] < b[0]
-	}
-	for i := 1; i < len(a); i++ {
+	for i := range a {
 		if a[i] != b[i] {
+			if w.rank != nil && w.rank[i] != nil && a[i] >= 0 && b[i] >= 0 {
+				return w.rank[i][a[i]] < w.rank[i][b[i]]
+			}
 			return a[i] < b[i]
 		}
 	}
@@ -1056,24 +1054,30 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 		if lv < 0 || cur == nil || cur.rowStore == nil && (cursorHasNoBtree(cur) || cur.streamable || cur.seekReseek) {
 			continue
 		}
-		if lv != 0 {
-			// A later level's rows in an index's order: the walk visits them
-			// in rowid order, so its order is not the loop's.
-			return nil, false
-		}
 		key := o.key
 		if key.multiOr != nil || key.exprs != nil || len(key.cols) == 0 || len(key.colls) < len(key.cols) {
 			return nil, false
 		}
-		t := w.tabs[0]
+		t := w.tabs[lv]
 		perm := make([]int, t.n)
 		for i := range perm {
 			perm[i] = i
 		}
 		autoIndexSortValues(perm, key, func(i, k int) Value { return t.value(int32(i), key.cols[k]) }, m.encoding())
-		w.order0, w.rank0 = make([]int32, t.n), make([]int32, t.n)
+		rank := make([]int32, t.n)
 		for i, r := range perm {
-			w.order0[i], w.rank0[r] = int32(r), int32(i)
+			rank[r] = int32(i)
+		}
+		if w.rank == nil {
+			w.rank = make([][]int32, k)
+		}
+		w.rank[lv] = rank
+		if lv != 0 {
+			continue
+		}
+		w.order0 = make([]int32, t.n)
+		for i, r := range perm {
+			w.order0[i] = int32(r)
 		}
 	}
 	w.pass = make([][]bool, k)
@@ -1158,6 +1162,19 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 				}
 			} else if sk, rows, ok = w.sortedByValues(b); !ok {
 				return nil, false
+			}
+			if w.rank != nil && w.rank[i] != nil {
+				// The rows sharing a key, in the order the loop visits them.
+				rank := w.rank[i]
+				rows = slices.Clone(rows)
+				for lo := 0; lo < len(sk); {
+					hi := lo + 1
+					for hi < len(sk) && sk[hi] == sk[lo] {
+						hi++
+					}
+					slices.SortFunc(rows[lo:hi], func(x, y int32) int { return cmp.Compare(rank[x], rank[y]) })
+					lo = hi
+				}
 			}
 			l.keys, l.nulls, l.sorted, l.rows = keys, nulls, sk, rows
 		}
