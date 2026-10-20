@@ -123,6 +123,10 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 		"FROM d2 JOIN f ON f.v = d2.x",
 		"FROM f JOIN d2 ON d2.x = f.v % 4",
 		"FROM d2 LEFT JOIN f ON f.d1_id = d2.d1_id",
+		"FROM d2 JOIN f ON f.v = d2.x * 2",
+		"FROM f JOIN d2 ON d2.id = f.d2_id + 0",
+		"FROM d2 LEFT JOIN f ON f.v % 4 = d2.x AND f.w > 0",
+		"FROM f JOIN d2 ON abs(d2.x) = f.v / 10",
 		"FROM f LEFT JOIN d2 ON d2.id = f.d2_id AND d2.x < 4 AND d2.y >= 0",
 	}
 	groups := []string{"", "GROUP BY d2.id", "GROUP BY f.d2_id", "GROUP BY d2.x", "GROUP BY d1.id", "GROUP BY d1.b", "GROUP BY f.s",

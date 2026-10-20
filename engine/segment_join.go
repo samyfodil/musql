@@ -69,7 +69,8 @@ type segJoinPlan struct {
 // segJoinEdge is "level a's column aCol = level b's column bCol", a column of
 // -1 being the rowid.
 type segJoinEdge struct {
-	a, aCol, b, bCol int
+	a, b       int
+	aArg, bArg segJoinArg // each side's value: a column, or an expression over its level's
 }
 
 // segJoinArg is what a register holds: column col of a level (-1 the rowid),
@@ -719,6 +720,25 @@ func (t *segJoinTable) sortedBy(c int) (keys []int64, rows []int32, ok bool) {
 	return keys, rows, ok
 }
 
+// sortedByValues is sortedBy over an expression's values, for one walk.
+func (w *segJoinWalk) sortedByValues(a segJoinArg) (keys []int64, rows []int32, ok bool) {
+	vals, _, nulls, ok := w.nullable(a, false)
+	if !ok {
+		return nil, nil, false
+	}
+	for r := range vals {
+		if nulls == nil || !nulls[r] {
+			rows = append(rows, int32(r))
+		}
+	}
+	slices.SortStableFunc(rows, func(x, y int32) int { return cmp.Compare(vals[x], vals[y]) })
+	keys = make([]int64, len(rows))
+	for i, r := range rows {
+		keys[i] = vals[r]
+	}
+	return keys, rows, true
+}
+
 // segJoinSorted is a column sortedBy read: nil keys when it declined.
 type segJoinSorted struct {
 	keys []int64
@@ -1052,19 +1072,20 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 			if x.b == i && x.a < i {
 				e, n = x, n+1
 			} else if x.a == i && x.b < i {
-				e, n = segJoinEdge{a: x.b, aCol: x.bCol, b: x.a, bCol: x.aCol}, n+1
+				e, n = segJoinEdge{a: x.b, aArg: x.bArg, b: x.a, bArg: x.aArg}, n+1
 			}
 		}
 		if n != 1 {
 			return nil, false
 		}
-		keys, nulls, ok := w.tabs[e.a].keyCol(e.aCol)
+		// The earlier level's side: integers, NULLs marked.
+		keys, _, nulls, ok := w.nullable(e.aArg, false)
 		if !ok {
 			return nil, false
 		}
 		l := segJoinLink{from: e.a}
 		t := w.tabs[i]
-		if e.bCol < 0 || e.bCol == t.ipk {
+		if b := e.bArg; b.expr == nil && (b.col < 0 || b.col == t.ipk) {
 			t.index()
 			l.one = make([]int32, len(keys))
 			for r, key := range keys {
@@ -1076,8 +1097,13 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 				l.one[r] = t.row(key)
 			}
 		} else {
-			sk, rows, ok := t.sortedBy(e.bCol)
-			if !ok {
+			var sk []int64
+			var rows []int32
+			if b.expr == nil {
+				if sk, rows, ok = t.sortedBy(b.col); !ok {
+					return nil, false
+				}
+			} else if sk, rows, ok = w.sortedByValues(b); !ok {
 				return nil, false
 			}
 			l.keys, l.nulls, l.sorted, l.rows = keys, nulls, sk, rows

@@ -169,35 +169,56 @@ func parseSegJoinLoop(in []Instruction, open int) (*segJoinLoop, bool) {
 			return nil, false
 		}
 		self := l.levelOf[in[pc].P1]
-		// The terms end where the join's recheck begins: two column reads
-		// and their equality, which would otherwise read as a term.
-		recheck := pc + 1
-		for recheck+3 < len(in) && !segJoinIsRecheck(in, recheck) {
-			recheck++
+		next := -1
+		for i, ins := range in {
+			if ins.Op == OpNext && ins.P1 == l.cursors[self] && ins.P2 == l.rewinds[self]+1 {
+				next = i
+			}
 		}
-		end, ok := levelPreds(pc+1, recheck)
-		if !ok || end != recheck || end+3 >= len(in) {
+		// The join's recheck: an equality whose failure skips the row -- to
+		// the Next, or, in a LEFT JOIN's ON tree (IfNot P3 0), to the tree's
+		// false label -- between a value of this level and one of an earlier
+		// level, columns or expressions over them. The level's own terms come
+		// first, and a term can be an equality too: each candidate is tried
+		// in turn, the first that parses whole taking it.
+		eqAt, preds0, filters0 := -1, len(l.preds), len(l.filters)
+		var x, y segJoinArg
+		for p := pc + 1; p+1 < len(in) && eqAt < 0; p++ {
+			e, sk := in[p], in[p+1]
+			if e.Op != OpEq || sk.Op != OpIfNot || sk.P1 != e.P2 ||
+				!(sk.P3 == 1 && sk.P2 == next || flag >= 0 && sk.P3 == 0) || !segJoinEqOK(e) {
+				continue
+			}
+			l.preds, l.filters = l.preds[:preds0], l.filters[:filters0]
+			end, ok := levelPreds(pc+1, p)
+			if !ok {
+				continue
+			}
+			tr := newSegJoinTrace(in, l.levelOf)
+			traced := true
+			for q := end; q < p && traced; q++ {
+				traced = !segJoinIsJump(in[q]) && tr.step(q)
+			}
+			a, okx := tr.src[e.P1]
+			b, oky := tr.src[e.P3]
+			if !traced || !okx || !oky || a.guard != 0 || b.guard != 0 {
+				continue
+			}
+			if b.level == self {
+				a, b = b, a
+			}
+			if a.level != self || b.level < 0 || b.level >= self {
+				continue // one side this level, the other an outer one
+			}
+			eqAt, x, y = p, a, b
+		}
+		if eqAt < 0 {
 			return nil, false
 		}
-		pc = end - 1 // so the recheck reads from pc+1
-		// The recheck: two column reads, their equality, and the skip.
-		ca, cb, eq, skip := in[pc+1], in[pc+2], in[pc+3], in[pc+4]
-		la, aCol, okA := segJoinColRead(ca, l.levelOf)
-		lb, bCol, okB := segJoinColRead(cb, l.levelOf)
-		ra, rb := segJoinColDest(ca), segJoinColDest(cb)
-		// A LEFT JOIN's ON clause with terms beside the equality compiles to
-		// one AND tree: the equality's test fails to the tree's false label
-		// (IfNot P3 0) rather than to the Next.
+		eq, skip := in[eqAt], in[eqAt+1]
 		tree := flag >= 0 && skip.P3 == 0
-		if !okA || !okB || eq.Op != OpEq || !segJoinEqOK(eq) ||
-			!(eq.P1 == ra && eq.P3 == rb || eq.P1 == rb && eq.P3 == ra) ||
-			skip.Op != OpIfNot || skip.P1 != eq.P2 || skip.P3 != 1 && !tree || ra == rb {
-			return nil, false
-		}
-		if (la == self) == (lb == self) {
-			return nil, false // one side must be this level, the other an outer one
-		}
-		l.edges = append(l.edges, segJoinEdge{a: la, aCol: aCol, b: lb, bCol: bCol})
+		l.edges = append(l.edges, segJoinEdge{a: y.level, aArg: y, b: self, bArg: x})
+		pc = eqAt - 3 // the skip is at pc+4, as it was for the four-instruction recheck
 		if tree {
 			// The rest of the tree: terms over this level, and the tail that
 			// settles the three-valued result and skips to the Next.

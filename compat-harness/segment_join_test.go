@@ -122,8 +122,8 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		// Equalities between ordinary columns: a self-join, a join on values.
 		{`SELECT count(*), sum(t2.seconds) FROM tracks t1 JOIN tracks t2 ON t2.album_id = t1.album_id WHERE t1.id < 200`, true},
 		{`SELECT t1.album_id, count(*) FROM tracks t1 JOIN tracks t2 ON t2.album_id = t1.album_id WHERE t1.id < 300 AND t2.id < 300 GROUP BY t1.album_id`, true},
-		{`SELECT al.year, count(*) FROM albums al JOIN tracks t ON t.seconds = al.year - 1700 GROUP BY al.year`, false},
-		{`SELECT count(*), count(t.id) FROM albums al LEFT JOIN tracks t ON t.seconds = al.year - 1700`, false},
+		{`SELECT al.year, count(*) FROM albums al JOIN tracks t ON t.seconds = al.year - 1700 GROUP BY al.year`, true},
+		{`SELECT count(*), count(t.id) FROM albums al LEFT JOIN tracks t ON t.seconds = al.year - 1700`, true},
 		// FILTER and an aggregate's own ORDER BY replay through the step.
 		{`SELECT al.id, count(*) FILTER (WHERE t.plays > 0), sum(t.seconds) FILTER (WHERE t.rating > 1) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
 		{`SELECT group_concat(t.id, ',' ORDER BY t.seconds DESC, t.id) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.id < 60`, true},
