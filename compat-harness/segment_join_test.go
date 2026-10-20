@@ -103,7 +103,7 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		// album, not in the tracks' own order, and the sorter keeps the
 		// earliest.
 		{`SELECT al.id, t.id, t.seconds FROM albums al CROSS JOIN tracks t ON t.album_id = al.id ORDER BY t.seconds LIMIT 12 OFFSET 40`, true},
-		{`SELECT al.id, t.id FROM albums al CROSS JOIN tracks t ON t.album_id = al.id ORDER BY t.seconds % 3 DESC LIMIT 20`, false},
+		{`SELECT al.id, t.id FROM albums al CROSS JOIN tracks t ON t.album_id = al.id ORDER BY t.seconds % 3 DESC LIMIT 20`, true},
 		{`SELECT t.id, al.year FROM tracks t JOIN albums al ON al.id = t.album_id ORDER BY al.year DESC LIMIT 25`, false},
 		{`SELECT t.id, al.year FROM tracks t JOIN albums al ON al.id = t.album_id ORDER BY al.year, t.seconds DESC LIMIT 12`, true},
 		{`SELECT t.id, g.tag FROM tracks t JOIN tags g ON g.id = t.album_id ORDER BY g.tag LIMIT 9`, false},
@@ -113,7 +113,17 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT al.id, al.year FROM tracks t JOIN albums al ON al.id = t.album_id ORDER BY al.year LIMIT 1`, false},
 		{`SELECT t.id FROM albums al LEFT JOIN tracks t ON t.album_id = al.id ORDER BY t.plays LIMIT 5`, false},
 		// DISTINCT over INTEGER arguments.
-		{`SELECT count(DISTINCT t.album_id), count(*), sum(DISTINCT t.seconds % 7) FROM tracks t JOIN albums al ON al.id = t.album_id`, false},
+		{`SELECT count(DISTINCT t.album_id), count(*), sum(DISTINCT t.seconds % 7) FROM tracks t JOIN albums al ON al.id = t.album_id`, true},
+		// Expressions over one table's columns, computed once per row of it.
+		{`SELECT al.id, sum(t.seconds * t.plays), max(t.seconds - 100), count(t.seconds / 7) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},
+		{`SELECT al.year / 10, count(*), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.year / 10`, true},
+		{`SELECT al.year % 4, total(t.rating * 2), avg(t.seconds + 0.5) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY 1`, true},
+		{`SELECT count(1), sum(1), sum(length(g.tag)), count(abs(t.plays)) FROM tracks t JOIN tags g ON g.id = t.album_id`, true},
+		{`SELECT upper(g.tag), count(*) FROM tracks t JOIN tags g ON g.id = t.album_id GROUP BY upper(g.tag)`, true},
+		{`SELECT sum(t.seconds * al.year) FROM albums al JOIN tracks t ON t.album_id = al.id`, false},
+		{`SELECT sum(t.plays * t.plays * t.plays) FROM albums al JOIN tracks t ON t.album_id = al.id`, true},
+		{`SELECT al.id, sum(random() % 2 * 0) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, false},
+		{`SELECT al.id, count(coalesce(t.id, 0)) FROM albums al LEFT JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, false},
 		{`SELECT count(DISTINCT t.album_id), count(*), sum(DISTINCT al.year) FROM tracks t JOIN albums al ON al.id = t.album_id`, true},
 		{`SELECT al.artist_id, count(DISTINCT t.seconds), avg(DISTINCT t.plays), total(DISTINCT al.year), count(t.seconds) FROM tracks t JOIN albums al ON al.id = t.album_id GROUP BY al.artist_id`, true},
 		{`SELECT al.id, count(DISTINCT t.seconds), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},

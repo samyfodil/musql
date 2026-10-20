@@ -101,7 +101,9 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 
 	queries := make([]string, 0, 60)
 	aggs := []string{"count(*)", "count(f.v)", "sum(f.v)", "total(f.w)", "avg(f.v)", "min(f.v)", "max(f.v)",
-		"sum(f.w)", "count(DISTINCT f.v)", "sum(DISTINCT d2.x)", "count(d2.x)", "max(d1.a)", "avg(f.w)"}
+		"sum(f.w)", "count(DISTINCT f.v)", "sum(DISTINCT d2.x)", "count(d2.x)", "max(d1.a)", "avg(f.w)",
+		"sum(f.v * 3 + 1)", "count(1)", "sum(length(f.s))", "max(f.v % 7)", "total(f.w * f.v)", "sum(d2.x * d2.x)",
+		"count(DISTINCT f.v / 10)", "avg(abs(f.v))", "sum(coalesce(f.v, 0))", "min(f.s || 'x')"}
 	joins := []string{
 		"FROM f JOIN d2 ON d2.id = f.d2_id",
 		"FROM d2 JOIN f ON f.d2_id = d2.id",
@@ -114,7 +116,8 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 		"FROM d2 LEFT JOIN f ON f.d2_id = d2.id AND f.v > 5",
 		"FROM f LEFT JOIN d2 ON d2.id = f.d2_id AND d2.x < 4 AND d2.y >= 0",
 	}
-	groups := []string{"", "GROUP BY d2.id", "GROUP BY f.d2_id", "GROUP BY d2.x", "GROUP BY d1.id", "GROUP BY d1.b", "GROUP BY f.s"}
+	groups := []string{"", "GROUP BY d2.id", "GROUP BY f.d2_id", "GROUP BY d2.x", "GROUP BY d1.id", "GROUP BY d1.b", "GROUP BY f.s",
+		"GROUP BY d2.x / 2", "GROUP BY upper(f.s)", "GROUP BY f.v % 5"}
 	wheres := []string{"", "WHERE f.v > 10", "WHERE d2.x <= 3 AND f.w > 0", "WHERE f.id % 2 = 0", "WHERE d1.a <> 2", "WHERE f.v >= ?"}
 	for range 50 {
 		join := joins[r.Intn(len(joins))]
@@ -152,7 +155,7 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 	}
 	for range 10 {
 		join := joins[r.Intn(len(joins))]
-		keys := []string{"f.v", "f.v DESC", "d2.x", "f.w DESC", "f.s", "d2.id DESC, f.id"}
+		keys := []string{"f.v", "f.v DESC", "d2.x", "f.w DESC", "f.s", "d2.id DESC, f.id", "f.v % 9 DESC", "length(f.s), f.id"}
 		queries = append(queries, fmt.Sprintf("SELECT f.id, d2.id, f.v %s ORDER BY %s LIMIT %d OFFSET %d",
 			join, keys[r.Intn(len(keys))], 1+r.Intn(12), r.Intn(4)))
 	}

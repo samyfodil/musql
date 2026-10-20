@@ -71,9 +71,21 @@ type segJoinEdge struct {
 	a, aCol, b, bCol int
 }
 
-// segJoinArg is a column some level reads into a register, -1 the rowid.
+// segJoinArg is what a register holds: column col of a level (-1 the rowid),
+// or, when expr is set, an expression over one level's columns -- or over
+// constants alone, level -1.
 type segJoinArg struct {
 	reg, level, col int
+	expr            *segJoinExpr
+}
+
+// segJoinExpr is the body instructions that compute register out, in the
+// body's order: column reads of one level, constants, and operations over
+// them whose result depends on nothing else, so one evaluation per row of
+// that level's table is every evaluation the loop makes.
+type segJoinExpr struct {
+	insns []Instruction
+	out   int
 }
 
 // segJoinTable is one table's rows as the kernel reads them, in rowid order,
@@ -675,12 +687,168 @@ type segJoinWalk struct {
 	// optional is plan.optional: a level whose row is -1, all NULL, where
 	// nothing there matched.
 	optional int
+
+	m     *vdbe
+	exprs map[*segJoinExpr][]Value // each expression's value per row
+}
+
+// lv is the level a's value is per row of: a constant's, the fact's.
+func (w *segJoinWalk) lv(a segJoinArg) int {
+	if a.level < 0 {
+		return w.fact
+	}
+	return a.level
+}
+
+// exprValues is expression a computed for every row of its level's table, by
+// running its instructions with the VDBE's own code on a private copy of the
+// registers, or false when one cannot be: an error, which the loop will
+// raise, or an opcode an expression may not hold. A constant is computed
+// once.
+func (w *segJoinWalk) exprValues(a segJoinArg) ([]Value, bool) {
+	if v, ok := w.exprs[a.expr]; ok {
+		return v, v != nil
+	}
+	w.exprs[a.expr] = nil
+	t := w.tabs[w.lv(a)]
+	vm := *w.m
+	vm.regs = make([]Value, len(w.m.regs))
+	vm.fnArgBuf, vm.likePlan = nil, nil
+	n := t.n
+	if a.level < 0 {
+		n = 1
+	}
+	var row int32
+	column := func(op *Instruction) Value { return t.value(row, op.P2) }
+	out := make([]Value, n)
+	for r := range n {
+		row = int32(r)
+		for k := range a.expr.insns {
+			op := &a.expr.insns[k]
+			if op.Op == OpRowid {
+				vm.regs[op.P2] = t.value(row, -1)
+				continue
+			}
+			if _, ok := vm.segEvalInsn(op, column); !ok {
+				return nil, false
+			}
+		}
+		out[r] = vm.regs[a.expr.out]
+		// The value may point into the private registers' scratch: kept,
+		// it must be its own.
+		out[r] = copyValue(out[r])
+	}
+	if a.level < 0 {
+		one := out[0]
+		out = make([]Value, t.n)
+		for i := range out {
+			out[i] = one
+		}
+	}
+	w.exprs[a.expr] = out
+	return out, true
+}
+
+// ints is a's value per row of its level as integers, or false unless every
+// one is an INTEGER.
+func (w *segJoinWalk) ints(a segJoinArg) ([]int64, bool) {
+	if a.expr == nil {
+		return w.tabs[a.level].col(a.col)
+	}
+	vals, ok := w.exprValues(a)
+	if !ok {
+		return nil, false
+	}
+	out := make([]int64, len(vals))
+	for i, v := range vals {
+		if v.Typ != Int {
+			return nil, false
+		}
+		out[i] = v.I
+	}
+	return out, true
+}
+
+// nullable is a's value per row as integers (or, with real, REALs) with
+// its NULLs marked, or false unless every value is one or the other.
+func (w *segJoinWalk) nullable(a segJoinArg, real bool) (ints []int64, flts []float64, nulls []bool, ok bool) {
+	if real {
+		if v, ok := w.floats(a); ok {
+			return nil, v, nil, true
+		}
+	} else if v, ok := w.ints(a); ok {
+		return v, nil, nil, true
+	}
+	var vals []Value
+	if a.expr != nil {
+		if vals, ok = w.exprValues(a); !ok {
+			return nil, nil, nil, false
+		}
+	} else {
+		t := w.tabs[a.level]
+		vals = make([]Value, t.n)
+		for r := range vals {
+			vals[r] = t.value(int32(r), a.col)
+		}
+	}
+	nulls = make([]bool, len(vals))
+	if real {
+		flts = make([]float64, len(vals))
+	} else {
+		ints = make([]int64, len(vals))
+	}
+	for r, v := range vals {
+		switch {
+		case v.Typ == Null:
+			nulls[r] = true
+		case real && v.Typ == Float:
+			flts[r] = v.F
+		case !real && v.Typ == Int:
+			ints[r] = v.I
+		default:
+			return nil, nil, nil, false
+		}
+	}
+	return ints, flts, nulls, true
+}
+
+// floats is ints for REAL values.
+func (w *segJoinWalk) floats(a segJoinArg) ([]float64, bool) {
+	if a.expr == nil {
+		return w.tabs[a.level].fcol(a.col)
+	}
+	vals, ok := w.exprValues(a)
+	if !ok {
+		return nil, false
+	}
+	out := make([]float64, len(vals))
+	for i, v := range vals {
+		if v.Typ != Float {
+			return nil, false
+		}
+		out[i] = v.F
+	}
+	return out, true
+}
+
+// value is a's value in joined row at.
+func (w *segJoinWalk) value(a segJoinArg, at []int32) Value {
+	lv := w.lv(a)
+	if a.expr == nil {
+		return w.tabs[lv].value(at[lv], a.col)
+	}
+	vals, ok := w.exprValues(a)
+	if !ok || at[lv] < 0 {
+		return Value{}
+	}
+	return vals[at[lv]]
 }
 
 // openSegJoin opens plan's join, or reports false.
 func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 	k := len(plan.cursors)
-	w := &segJoinWalk{tabs: make([]*segJoinTable, k), parent: make([]int, k), slot: make([][]int32, k)}
+	w := &segJoinWalk{tabs: make([]*segJoinTable, k), parent: make([]int, k), slot: make([][]int32, k),
+		m: m, exprs: map[*segJoinExpr][]Value{}}
 	for i, c := range plan.cursors {
 		if c >= len(m.cursors) {
 			return nil, false
@@ -897,8 +1065,8 @@ func (s *segJoinSums) add(args *segJoinArgs, at []int32) bool {
 	s.n++
 	for a, vals := range args.ints {
 		r := at[args.levels[a]]
-		if r < 0 {
-			continue // an optional level's NULL row
+		if r < 0 || args.nulls[a] != nil && args.nulls[a][r] {
+			continue // an optional level's NULL row, or a NULL
 		}
 		s.nn[a]++
 		if vals == nil {
@@ -926,6 +1094,7 @@ func (s *segJoinSums) add(args *segJoinArgs, at []int32) bool {
 type segJoinArgs struct {
 	ints   [][]int64   // nil for a REAL argument
 	flts   [][]float64 // nil for an INTEGER one
+	nulls  [][]bool    // the rows where an argument is NULL; nil for none
 	levels []int
 	argOf  map[int]int // the step's argument register -> its index
 	floats bool
@@ -938,19 +1107,24 @@ type segJoinArgs struct {
 // one the kernel does not model.
 func segJoinArgsOf(plan *segJoinPlan, w *segJoinWalk) (*segJoinArgs, bool) {
 	n := len(plan.args)
-	args := &segJoinArgs{ints: make([][]int64, n), flts: make([][]float64, n), levels: make([]int, n), argOf: map[int]int{}}
+	args := &segJoinArgs{ints: make([][]int64, n), flts: make([][]float64, n), nulls: make([][]bool, n), levels: make([]int, n), argOf: map[int]int{}}
 	for a, arg := range plan.args {
-		args.levels[a] = arg.level
+		// An expression over the optional level's NULL row need not be NULL
+		// (coalesce): such an argument declines.
+		if arg.expr != nil && w.lv(arg) == w.optional {
+			return nil, false
+		}
+		args.levels[a] = w.lv(arg)
 		args.argOf[arg.reg] = a
-		if vals, ok := w.tabs[arg.level].col(arg.col); ok {
-			args.ints[a] = vals
+		if vals, _, nulls, ok := w.nullable(arg, false); ok {
+			args.ints[a], args.nulls[a] = vals, nulls
 			continue
 		}
-		vals, ok := w.tabs[arg.level].fcol(arg.col)
+		_, vals, nulls, ok := w.nullable(arg, true)
 		if !ok {
 			return nil, false
 		}
-		args.flts[a], args.floats = vals, true
+		args.flts[a], args.nulls[a], args.floats = vals, nulls, true
 	}
 	if args.floats && plan.sorted {
 		return nil, false // a REAL sum replays the loop's order, unknown here
@@ -1033,12 +1207,16 @@ func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (*segJoinGroups, bool) {
 	// keys compare equal under BINARY (the recognisers admit no other
 	// collation).
 	var keys []int64
-	var keyTab *segJoinTable
+	byValue := false
+	keyLv := w.lv(plan.key)
 	if plan.grouped {
+		if plan.key.expr != nil && keyLv == w.optional {
+			return nil, false // see segJoinArgsOf
+		}
 		// A key on the optional level is NULL in its NULL rows, which only the
 		// canonical bytes can say.
-		if keys, ok = w.tabs[plan.key.level].col(plan.key.col); !ok || plan.key.level == w.optional {
-			keys, keyTab = nil, w.tabs[plan.key.level]
+		if keys, ok = w.ints(plan.key); !ok || keyLv == w.optional {
+			keys, byValue = nil, true
 		}
 	}
 	byKey := map[int64]int{}
@@ -1061,8 +1239,8 @@ func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (*segJoinGroups, bool) {
 	if !w.each(at, func() bool {
 		var gi int
 		var seen bool
-		if keyTab != nil {
-			one[0] = keyTab.value(at[plan.key.level], plan.key.col)
+		if byValue {
+			one[0] = w.value(plan.key, at)
 			buf = hashAggKeyBytes(buf[:0], one)
 			gi, seen = byBytes[string(buf)]
 			if !seen {
@@ -1070,7 +1248,7 @@ func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (*segJoinGroups, bool) {
 			}
 		} else if keys == nil {
 			gi, seen = 0, len(groups) > 0 // no GROUP BY: one group
-		} else if key := keys[at[plan.key.level]]; dense != nil {
+		} else if key := keys[at[keyLv]]; dense != nil {
 			gi, seen = int(dense[key-lo])-1, dense[key-lo] != 0
 			if !seen {
 				dense[key-lo] = int32(len(groups) + 1)
@@ -1113,7 +1291,7 @@ func (m *vdbe) segJoinGroupsOf(plan *segJoinPlan) (*segJoinGroups, bool) {
 // reads it into.
 func (gs *segJoinGroups) load(m *vdbe, g *segJoinGroup) {
 	for _, l := range gs.plan.loads {
-		m.regs[l.reg] = gs.w.tabs[l.level].value(g.first[l.level], l.col)
+		m.regs[l.reg] = gs.w.value(l, g.first)
 	}
 }
 
@@ -1121,7 +1299,7 @@ func (gs *segJoinGroups) load(m *vdbe, g *segJoinGroup) {
 // step reads them from.
 func (gs *segJoinGroups) loadArgs(m *vdbe, g *segJoinGroup) {
 	for _, arg := range gs.plan.args {
-		m.regs[arg.reg] = gs.w.tabs[arg.level].value(g.first[arg.level], arg.col)
+		m.regs[arg.reg] = gs.w.value(arg, g.first)
 	}
 }
 
@@ -1132,8 +1310,15 @@ func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) {
 	k := len(gs.plan.cursors)
 	// firstNN is 1 when the row already stepped holds argument a, 0 when it
 	// is that row's NULL.
+	// null is whether argument a is NULL in level row r: the optional
+	// level's NULL row, or a NULL value.
+	null := func(a int, r int32) bool {
+		return r < 0 || args.nulls[a] != nil && args.nulls[a][r]
+	}
+	// firstNN is 1 when the row already stepped holds argument a, 0 when it
+	// is NULL there.
 	firstNN := func(a int) int64 {
-		if g.first[args.levels[a]] < 0 {
+		if null(a, g.first[args.levels[a]]) {
 			return 0
 		}
 		return 1
@@ -1176,12 +1361,12 @@ func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) {
 				mark(v.I)
 			}
 			var first int64
-			if g.first[lv] >= 0 {
+			if !null(a, g.first[lv]) {
 				first = ints[g.first[lv]]
 			}
 			skipped := false
 			for r := 0; r < len(g.rows); r += k {
-				if g.rows[r+lv] < 0 {
+				if null(a, g.rows[r+lv]) {
 					continue // NULL: no value
 				}
 				v := ints[g.rows[r+lv]]
@@ -1211,7 +1396,7 @@ func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) {
 			}
 			// The rows after the first, through what step does with each.
 			for r := k; r < len(g.rows); r += k {
-				if g.rows[r+args.levels[a]] < 0 {
+				if null(a, g.rows[r+args.levels[a]]) {
 					continue // NULL: no value
 				}
 				f := fl[g.rows[r+args.levels[a]]]
@@ -1228,7 +1413,7 @@ func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) {
 			it.cnt += s.nn[a] - firstNN(a)
 		case aggSum, aggTotal, aggAvg:
 			it.cnt += s.nn[a] - firstNN(a)
-			if fr := g.first[args.levels[a]]; fr >= 0 {
+			if fr := g.first[args.levels[a]]; !null(a, fr) {
 				it.iSum += s.sums[a] - args.ints[a][fr]
 			} else {
 				it.iSum += s.sums[a]
@@ -1316,7 +1501,7 @@ func (m *vdbe) segJoinHashAgg(plan *segJoinPlan) (bool, error) {
 	for i := range gs.groups {
 		g := &gs.groups[i]
 		gs.loadArgs(m, g)
-		keyVals[0] = gs.w.tabs[plan.key.level].value(g.first[plan.key.level], plan.key.col)
+		keyVals[0] = gs.w.value(plan.key, g.first)
 		m.regs[plan.key.reg] = keyVals[0]
 		if !gs.gather(g, row, rowids) {
 			return false, fmt.Errorf("vdbe: OpSegJoinHash over a cursor outside its join")
@@ -1380,7 +1565,7 @@ func (m *vdbe) segJoinTopOf(plan *segJoinPlan) (*segJoinGroups, bool) {
 	key := func(at []int32, into []Value) []Value {
 		into = into[:0]
 		for _, o := range plan.order {
-			into = append(into, w.tabs[o.level].value(at[o.level], o.col))
+			into = append(into, w.value(o, at))
 		}
 		return into
 	}
@@ -1452,7 +1637,7 @@ func segJoinTopNumeric(w *segJoinWalk, plan *segJoinPlan) (*segJoinGroups, bool)
 		return nil, false
 	}
 	o := plan.order[0]
-	vals, ok := w.tabs[o.level].col(o.col)
+	vals, ok := w.ints(o)
 	if !ok {
 		return nil, false
 	}
@@ -1469,7 +1654,7 @@ func segJoinTopNumeric(w *segJoinWalk, plan *segJoinPlan) (*segJoinGroups, bool)
 	var keys []int64
 	var rows []int32
 	w.each(at, func() bool {
-		keys = append(keys, vals[at[o.level]])
+		keys = append(keys, vals[at[w.lv(o)]])
 		rows = append(rows, at...)
 		return true
 	})
