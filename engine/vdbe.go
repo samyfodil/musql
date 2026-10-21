@@ -1225,7 +1225,7 @@ func (prog *Program) outerCtxUnread() bool {
 			OpColumn, OpRowid, OpOuterColumn, OpOuterRowid,
 			OpInteger, OpVariable, OpNull, OpString8, OpReal, OpSCopy, OpCopy,
 			OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull,
-			OpSeekRowidHint, OpSeekIndexHint, OpAutoIndexOrder, OpResultRow:
+			OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpAutoIndexOrder, OpResultRow:
 		default:
 			unread = false
 		}
@@ -1967,6 +1967,17 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				cur := m.cursors[op.P1]
 				cur.seekConfigured = false
 				cur.seekReseek = true
+			}
+
+		case OpSeekRowidRangeHint:
+			if cursorHasNoBtree(m.cursors[op.P1]) {
+				break
+			}
+			// An INTEGER bound only, as for OpSeekRowidHint: any other storage
+			// class compares to a rowid by rules this does not reproduce, so it
+			// leaves the scan whole and the conjunct decides every row.
+			if key := m.regs[op.P2]; key.Typ == Int {
+				m.cursors[op.P1].narrowRowidRange(op.P3, key.I)
 			}
 
 		case OpSeekIndexHint:

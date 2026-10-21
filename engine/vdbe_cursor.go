@@ -15,6 +15,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 )
 
@@ -118,6 +119,12 @@ type vdbeCursor struct {
 	// result. A non-Integer key leaves it unset and the full scan runs.
 	seekConfigured bool
 	seekKey        int64
+
+	// rowidLo/rowidHi, when ranged, bound the rowids a segment scan visits
+	// (OpSeekRowidRangeHint), inclusive. Like seekKey they only skip rows the
+	// WHERE rejects.
+	ranged           bool
+	rowidLo, rowidHi int64
 
 	// idxSeekConfigured/idxSeekProbe/idxSeekColl/idxSeekCol turn the first
 	// rewind() into a secondary-index leading-column equality lookup
@@ -473,6 +480,36 @@ func cursorHasNoBtree(cur *vdbeCursor) bool {
 // which calls rewind then advance together). The underlying table scan is
 // materialized only on this cursor's very first rewind (see this file's
 // package doc comment); every later call just resets the position index.
+// The bound kinds of OpSeekRowidRangeHint's P3.
+const (
+	rowidRangeGT = iota
+	rowidRangeGE
+	rowidRangeLT
+	rowidRangeLE
+)
+
+// narrowRowidRange intersects the cursor's rowid range with one bound. A bound
+// past the end of int64 (rowid > max, rowid < min) is left out: it would wrap.
+func (cur *vdbeCursor) narrowRowidRange(kind int, k int64) {
+	if !cur.ranged {
+		cur.ranged, cur.rowidLo, cur.rowidHi = true, math.MinInt64, math.MaxInt64
+	}
+	switch kind {
+	case rowidRangeGT:
+		if k < math.MaxInt64 {
+			cur.rowidLo = max(cur.rowidLo, k+1)
+		}
+	case rowidRangeGE:
+		cur.rowidLo = max(cur.rowidLo, k)
+	case rowidRangeLT:
+		if k > math.MinInt64 {
+			cur.rowidHi = min(cur.rowidHi, k-1)
+		}
+	case rowidRangeLE:
+		cur.rowidHi = min(cur.rowidHi, k)
+	}
+}
+
 // startSegSource makes src the cursor's row source: the lazy segment scan.
 func (cur *vdbeCursor) startSegSource(src *segRowSource) {
 	// The compiled pre-filter, when OpRewind carried one. Purely a
@@ -481,6 +518,7 @@ func (cur *vdbeCursor) startSegSource(src *segRowSource) {
 	src.filter = cur.segFilter
 	src.params = cur.params
 	src.ipkCol = cur.tbl.ipkIndex
+	src.ranged, src.rowidLo, src.rowidHi = cur.ranged, cur.rowidLo, cur.rowidHi
 	cur.segSrc = src
 	cur.segSrcCols = src.cols
 	cur.segCur = nil

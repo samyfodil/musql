@@ -441,7 +441,7 @@ func gatherSkip(prog *Program, at int) uint64 {
 				return 0 // a run of registers
 			}
 			regs = [3]bool{true, false, false}
-		case OpVariable, OpSeekIndexHint, OpSeekRowidHint, OpInteger, OpInt64, OpNull, OpSCopy, OpCopy,
+		case OpVariable, OpSeekIndexHint, OpSeekRowidHint, OpSeekRowidRangeHint, OpInteger, OpInt64, OpNull, OpSCopy, OpCopy,
 			OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight,
 			OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpNot, OpNegative:
 			if in.Op == OpNull && in.P3 > in.P2 {
