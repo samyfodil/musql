@@ -91,7 +91,7 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 	w.memarg(0, 0)
 	w.Set(e.wb)
 	for _, in := range prog {
-		if in.Op == VColumn || in.Op == VNext || in.Op == VRewind {
+		if in.Op == VColumn || in.Op == VNext || in.Op == VRewind || in.Op == VRowid {
 			e.curs, e.rowp, e.valp = w.Local(wI32), w.Local(wI32), w.Local(wI32)
 			w.LoadPtr(POffCur)
 			w.Set(e.curs)
