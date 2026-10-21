@@ -1149,6 +1149,17 @@ func (n *Session) ReadPager() (*ReadOnlyPager, error) {
 	return n.segmentReadPager()
 }
 
+// ReadPagerReusing is ReadPager built in prev's memory rather than a new
+// allocation: a pager per statement was most of a point read's garbage, and a
+// connection's GC cost with it. prev must be a pager this session returned that
+// no statement still uses; nil allocates.
+func (n *Session) ReadPagerReusing(prev *ReadOnlyPager) (*ReadOnlyPager, error) {
+	if n.closed {
+		return nil, fmt.Errorf("engine: write session is closed")
+	}
+	return n.segmentPagerInto(prev, false)
+}
+
 // segmentReadPager is ReadPager without the session wrapper, so the WRITE path can
 // take the same snapshot.
 //
@@ -1179,9 +1190,18 @@ func (db *DB) segmentSnapshotPager() (*ReadOnlyPager, error) { return db.segment
 
 // segmentPager builds the read pager over this session's rows, live or frozen.
 func (db *DB) segmentPager(freeze bool) (*ReadOnlyPager, error) {
+	return db.segmentPagerInto(nil, freeze)
+}
+
+// segmentPagerInto is segmentPager reset into p, or a new pager when p is nil.
+func (db *DB) segmentPagerInto(p *ReadOnlyPager, freeze bool) (*ReadOnlyPager, error) {
 	// A read sees a transaction's direct-path loads as the rows they hold.
 	db.drainTxBulks(nil)
-	p := newReadOnlyPager()
+	if p == nil {
+		p = newReadOnlyPager()
+	} else {
+		*p = ReadOnlyPager{meta: pagerMeta{encoding: UTF8, pageSize: 4096}}
+	}
 	// The schema this session can name, and the handle its committed column
 	// blocks come from. Both are inputs to the source below AND to its cache key.
 	rows := db.segmentSchemaRowsShared()

@@ -192,6 +192,10 @@ type Conn struct {
 	timeDeclType bool
 	loc          *time.Location
 
+	// readPager is the pager queryArgs' last read ran on, which the next one
+	// rebuilds in place.
+	readPager *engine.ReadOnlyPager
+
 	// reportDeclTypes: see ReportDeclTypes.
 	reportDeclTypes bool
 
@@ -2419,10 +2423,13 @@ func (c *Conn) queryArgs(sqlText string, args []engine.Value) (driver.Rows, erro
 		if g := c.enterReadGate(); g != nil {
 			defer g.leave(c)
 		}
-		pager, err := c.readPagerStamped(c.ndb)
+		// The last read's pager, rebuilt in place: nothing holds it past its
+		// statement, since the rows below are materialized.
+		pager, err := c.readPagerStampedReusing(c.ndb, c.readPager)
 		if err != nil {
 			return nil, err
 		}
+		c.readPager = pager
 		_ = sdb
 		release, aerr := c.withAttachedReaders(pager)
 		if aerr != nil {
