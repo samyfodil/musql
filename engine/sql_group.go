@@ -2363,17 +2363,36 @@ func cloneAggTemplates(templates []*aggItem) []*aggItem {
 	}
 	accs := make([]*aggItem, len(templates))
 	for i, tmpl := range templates {
-		// orderStrict, rowRegs and stepSeg are compile-time facts about the scan body
-		// (armOrderSensitive; aggItem.rowRegs; aggItem.stepSeg), the same for every
-		// group, so every clone inherits them.
-		accs[i] = &aggItem{kind: tmpl.kind, expr: tmpl.expr, sepExpr: tmpl.sepExpr, distinct: tmpl.distinct, jsonb: tmpl.jsonb, filter: tmpl.filter,
-			orderStrict: tmpl.orderStrict, rowRegs: tmpl.rowRegs, stepSeg: tmpl.stepSeg,
-			minMaxLastWins: tmpl.minMaxLastWins,
-			// The ORDER BY's compile-time half (aggItem.orderBy); the buffer
-			// and the collations it resolves are per group.
-			orderBy: tmpl.orderBy, obUnique: tmpl.obUnique, obRegs: tmpl.obRegs}
+		accs[i] = new(aggItem)
+		resetAggItem(accs[i], tmpl)
 	}
 	return accs
+}
+
+// resetAggItem makes acc a fresh accumulator from tmpl, replacing the whole
+// struct so no running state survives.
+func resetAggItem(acc, tmpl *aggItem) {
+	// orderStrict, rowRegs and stepSeg are compile-time facts about the scan body
+	// (armOrderSensitive; aggItem.rowRegs; aggItem.stepSeg), the same for every
+	// group, so every clone inherits them.
+	*acc = aggItem{kind: tmpl.kind, expr: tmpl.expr, sepExpr: tmpl.sepExpr, distinct: tmpl.distinct, jsonb: tmpl.jsonb, filter: tmpl.filter,
+		orderStrict: tmpl.orderStrict, rowRegs: tmpl.rowRegs, stepSeg: tmpl.stepSeg,
+		minMaxLastWins: tmpl.minMaxLastWins,
+		// The ORDER BY's compile-time half (aggItem.orderBy); the buffer
+		// and the collations it resolves are per group.
+		orderBy: tmpl.orderBy, obUnique: tmpl.obUnique, obRegs: tmpl.obRegs}
+}
+
+// resetAggItems is cloneAggTemplates into accs when it has one item per
+// template, reporting false when it has not.
+func resetAggItems(accs, templates []*aggItem) bool {
+	if len(accs) != len(templates) {
+		return false
+	}
+	for i, tmpl := range templates {
+		resetAggItem(accs[i], tmpl)
+	}
+	return true
 }
 
 // findOutputColByName returns the index of the first output column whose

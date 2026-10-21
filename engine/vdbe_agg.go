@@ -308,6 +308,45 @@ func (a *aggAccumulators) anchorRow(plan *aggPlan) (vals, rowids []Value) {
 
 // newAggAccs clones a fresh accumulator set from plan's item templates
 // (cloneAggTemplates) for a new group.
+// reuseAggAccs is newAggAccs built in a, a set a finished execution left, when
+// its shape fits plan: every accumulator is rebuilt from its template whole.
+// Otherwise it is newAggAccs.
+func reuseAggAccs(a *aggAccumulators, plan *aggPlan) *aggAccumulators {
+	if a == nil || len(a.out) != len(plan.outPlans) || len(a.order) != len(plan.orderPlans) {
+		return newAggAccs(plan)
+	}
+	for i, it := range plan.outPlans {
+		if !resetAggItems(a.out[i], it.aggTemplates) {
+			return newAggAccs(plan)
+		}
+	}
+	var having, magnets []*aggItem
+	if plan.havingPlan != nil {
+		having = plan.havingPlan.aggTemplates
+	}
+	if plan.magnet != nil {
+		magnets = plan.magnet.sites
+	}
+	if !resetAggItems(a.having, having) || !resetAggItems(a.magnets, magnets) {
+		return newAggAccs(plan)
+	}
+	for i, op := range plan.orderPlans {
+		var t []*aggItem
+		if op.item != nil {
+			t = op.item.aggTemplates
+		}
+		if !resetAggItems(a.order[i], t) {
+			return newAggAccs(plan)
+		}
+	}
+	*a = aggAccumulators{out: a.out, having: a.having, order: a.order, magnets: a.magnets,
+		check: plan.anchorCheck, rowFree: plan.rowFree}
+	if plan.magnet != nil {
+		a.magnetS = plan.magnet.allocS
+	}
+	return a
+}
+
 func newAggAccs(plan *aggPlan) *aggAccumulators {
 	a := &aggAccumulators{out: make([][]*aggItem, len(plan.outPlans)), check: plan.anchorCheck, rowFree: plan.rowFree}
 	for i, it := range plan.outPlans {

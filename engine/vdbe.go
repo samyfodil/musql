@@ -93,6 +93,11 @@ type vdbe struct {
 	colMasksN    int
 	colMasksCurs int
 
+	// aggSpare is the accumulator set the machine's last execution ended on,
+	// kept through its return to the pool for the next OpAggReset to rebuild
+	// (reuseAggAccs) instead of allocating.
+	aggSpare *aggAccumulators
+
 	// aggRowBuf/aggRowidBuf are gatherCursorRow's reusable per-row buffers --
 	// see its doc comment for why reuse is safe here.
 	aggRowBuf   []Value
@@ -2541,7 +2546,11 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 
 		case OpAggReset:
-			m.aggAccs = newAggAccs(op.P4.(*aggPlan))
+			// The set the machine's last execution left, rebuilt, for the first
+			// group; every later group gets its own, since a finished group's
+			// set may still be referenced (a hash bucket keeps its own).
+			m.aggAccs = reuseAggAccs(m.aggSpare, op.P4.(*aggPlan))
+			m.aggSpare = nil
 
 		case OpSegFilterCount:
 			// The JITted VDBE's filter. The cursor's table is columnar, so the
