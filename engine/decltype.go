@@ -7,11 +7,21 @@ package engine
 // ResultDeclTypes returns one declared type per result column ("" if untyped).
 // It parses and resolves but never executes the statement.
 func (p *ReadOnlyPager) ResultDeclTypes(sqlText string) (types []string, ok bool) {
+	prog := p.cachedPlan(sqlText)
+	if prog != nil {
+		if prog.declTypes != nil {
+			return prog.declTypes, true
+		}
+	}
 	stmt, err := ParseSelect(sqlText)
 	if err != nil || stmt == nil {
 		return nil, false
 	}
-	return p.selectDeclTypes(stmt, 0)
+	types, ok = p.selectDeclTypes(stmt, 0)
+	if ok && prog != nil {
+		prog.declTypes = types
+	}
+	return types, ok
 }
 
 // declTypeMaxDepth bounds recursion through derived tables and views.
@@ -37,7 +47,12 @@ func (p *ReadOnlyPager) selectDeclTypes(stmt *SelectStmt, depth int) ([]string, 
 			pop := p.pushCTEScope(stmt.CTEs)
 			defer pop()
 		}
+		// The tables' columns, never their rows: reading them cost every query
+		// whose caller asks for declared types a scan of each table it names.
+		saved := p.fromColumnsOnly
+		p.fromColumnsOnly = true
 		jts, _, err := p.resolveFrom(stmt.From, nil)
+		p.fromColumnsOnly = saved
 		if err != nil {
 			return nil, false
 		}

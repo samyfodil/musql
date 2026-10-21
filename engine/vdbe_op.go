@@ -1121,6 +1121,11 @@ type Instruction struct {
 // register-file size it needs and the number of result columns each
 // OpResultRow emits.
 type Program struct {
+	// declTypes memoises ResultDeclTypes for the text this program is cached
+	// under, which the plan cache already drops on every change that could move
+	// a declared type.
+	declTypes []string
+
 	// orderDecided: the program is a plain join whose loop order the ported
 	// planner decided, so its rows come out in C's plan order
 	// (compileScanAttempt). UPDATE ... FROM reads it to keep the last of
