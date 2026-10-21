@@ -18,6 +18,7 @@ import (
 //	conn      this package's Conn and Stmt, without database/sql
 //	sql_stmt  database/sql with a prepared *sql.Stmt
 //	sql_db    database/sql's db.Query, as most code calls it
+//	fast      FastStmt over a *sql.Conn
 //
 // Every layer reads every column of every row.
 func BenchmarkLayers(b *testing.B) {
@@ -129,6 +130,31 @@ func BenchmarkLayers(b *testing.B) {
 					b.Fatal(err)
 				}
 				scan(b, rows)
+			}
+		})
+		b.Run(w.name+"/fast", func(b *testing.B) {
+			b.ReportAllocs()
+			sc, err := db.Conn(ctx)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer sc.Close()
+			st := PrepareFast(sc, w.sql)
+			args := []any{w.arg}
+			var (
+				id, sec int64
+				name    string
+				v       float64
+			)
+			dest := []any{&id, &sec, &name, &v}
+			if w.name == "count_filter" {
+				dest = dest[:1]
+			}
+			scanRow := func(scan func(dest ...any) error) error { return scan(dest...) }
+			for b.Loop() {
+				if err := st.Query(ctx, args, scanRow); err != nil {
+					b.Fatal(err)
+				}
 			}
 		})
 		b.Run(w.name+"/sql_db", func(b *testing.B) {
