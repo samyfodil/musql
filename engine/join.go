@@ -247,7 +247,16 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 			// schema row has type "table". It keeps a rowid pseudo-column, so
 			// derived stays false. outer is nil: this resolver only produces
 			// column scopes; execution goes through the VDBE's runVtabOnce.
-			vcols, vrows, vrowids, verr := rp.materializeVtab(it, params, nil, nil, nil, nil)
+			var vcols []columnInfo
+			var vrows [][]Value
+			var vrowids []int64
+			verr := errVtabArgNotConstant
+			if p.fromColumnsOnly {
+				vcols, verr = rp.vtabScopeColumns(it)
+			}
+			if verr != nil {
+				vcols, vrows, vrowids, verr = rp.materializeVtab(it, params, nil, nil, nil, nil)
+			}
 			if verr != nil && errors.Is(verr, errVtabArgNotConstant) {
 				// A table-valued function whose argument names the trigger row
 				// (json_each(NEW.x) in a trigger body): only the columns are needed
