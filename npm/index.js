@@ -55,48 +55,79 @@ function bytesOf(v) {
 	return null;
 }
 
-// encodeArgs is the wire format wasm/main.go reads: a tag, then the value.
-function encodeArgs(args) {
-	const parts = [];
+// argBytes is how many bytes writeArgs writes for args.
+function argBytes(args) {
 	let n = 0;
 	for (const a of args) {
+		if (a === null || a === undefined) n += 1;
+		else if (typeof a === "string") n += 5 + 3 * a.length; // UTF-8's most per UTF-16 unit
+		else if (bytesOf(a)) n += 5 + bytesOf(a).length;
+		else n += 9;
+	}
+	return n;
+}
+
+// writeArgs writes args at mem[at] in the wire format wasm/main.go reads (a
+// tag, then the value) and returns how many bytes it wrote.
+function writeArgs(mem, at, args) {
+	const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+	const start = at;
+	for (const a of args) {
 		if (a === null || a === undefined) {
-			parts.push(Uint8Array.of(0));
-			n += 1;
-			continue;
-		}
-		if (typeof a === "string" || bytesOf(a)) {
-			const body = typeof a === "string" ? enc.encode(a) : bytesOf(a);
-			const h = new Uint8Array(5);
-			h[0] = typeof a === "string" ? 3 : 4;
-			new DataView(h.buffer).setUint32(1, body.length, true);
-			parts.push(h, body);
-			n += 5 + body.length;
-			continue;
-		}
-		const h = new Uint8Array(9);
-		const dv = new DataView(h.buffer);
-		if (typeof a === "bigint") {
-			h[0] = 1;
-			dv.setBigInt64(1, a, true);
+			mem[at++] = 0;
+		} else if (typeof a === "string") {
+			const { written } = enc.encodeInto(a, mem.subarray(at + 5));
+			mem[at] = 3;
+			dv.setUint32(at + 1, written, true);
+			at += 5 + written;
+		} else if (bytesOf(a)) {
+			const b = bytesOf(a);
+			mem[at] = 4;
+			dv.setUint32(at + 1, b.length, true);
+			mem.set(b, at + 5);
+			at += 5 + b.length;
+		} else if (typeof a === "bigint") {
+			mem[at] = 1;
+			dv.setBigInt64(at + 1, a, true);
+			at += 9;
 		} else if (typeof a === "boolean") {
-			h[0] = 1;
-			dv.setBigInt64(1, a ? 1n : 0n, true);
+			mem[at] = 1;
+			dv.setBigInt64(at + 1, a ? 1n : 0n, true);
+			at += 9;
 		} else if (typeof a === "number") {
-			if (Number.isInteger(a) && Number.isSafeInteger(a)) {
-				h[0] = 1;
-				dv.setBigInt64(1, BigInt(a), true);
+			if (Number.isSafeInteger(a)) {
+				mem[at] = 1;
+				dv.setBigInt64(at + 1, BigInt(a), true);
 			} else {
-				h[0] = 2;
-				dv.setFloat64(1, a, true);
+				mem[at] = 2;
+				dv.setFloat64(at + 1, a, true);
 			}
+			at += 9;
 		} else {
 			throw new TypeError(`musql: cannot bind a ${typeof a}`);
 		}
-		parts.push(h);
-		n += 9;
 	}
-	return { parts, n };
+	return at - start;
+}
+
+// sqlBytes caches each statement text's UTF-8, which a page sends again and
+// again; bounded, so a stream of distinct texts cannot grow it without end.
+const sqlBytes = new Map();
+function encodeSQL(sql) {
+	let b = sqlBytes.get(sql);
+	if (b === undefined) {
+		b = enc.encode(sql);
+		if (sqlBytes.size >= 256) sqlBytes.clear();
+		sqlBytes.set(sql, b);
+	}
+	return b;
+}
+
+// tagged reports whether a result's text holds a value only revive restores:
+// most results hold none, and a reviver costs a call per value.
+function tagged(bytes) {
+	const text = dec.decode(bytes);
+	return { text, revive: text.includes('{"i":"') || text.includes('{"b":"') || text.includes('{"f":"') };
 }
 
 function fromBase64(s) {
@@ -153,20 +184,16 @@ class Database {
 	#call(fn, sql, params) {
 		if (this.#h === 0) throw new Error("musql: the database is closed");
 		const x = this.#x;
-		const s = enc.encode(sql);
-		const { parts, n } = encodeArgs(params);
-		const ptr = x.musql_inbuf(s.length + n);
+		const s = encodeSQL(sql);
+		const ptr = x.musql_inbuf(s.length + argBytes(params));
 		let mem = new Uint8Array(x.mem.buffer);
 		mem.set(s, ptr);
-		let at = ptr + s.length;
-		for (const p of parts) {
-			mem.set(p, at);
-			at += p.length;
-		}
+		const n = writeArgs(mem, ptr + s.length, params);
 		const len = x[fn](this.#h, s.length, n);
 		mem = new Uint8Array(x.mem.buffer); // the call may have grown memory
 		const out = x.musql_outbuf();
-		const res = JSON.parse(dec.decode(mem.subarray(out, out + len)), revive);
+		const { text, revive: slow } = tagged(mem.subarray(out, out + len));
+		const res = slow ? JSON.parse(text, revive) : JSON.parse(text);
 		if (res.error !== undefined) throw new Error(res.error);
 		return res;
 	}

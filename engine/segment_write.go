@@ -1189,7 +1189,7 @@ func (db *DB) segmentPager(freeze bool) (*ReadOnlyPager, error) {
 	// ONE fingerprint per statement, shared by the two things that want one: the
 	// read source's cache key below, and the plan cache's validity check later
 	// (ReadOnlyPager.schemaFingerprint, which memoises on this field).
-	p.schemaFP = schemaRowsFingerprint(rows)
+	p.schemaFP = db.schemaRowsMemo.fingerprint(rows)
 	src, serr := db.cachedSegSource(rows, cols, freeze, p.schemaFP)
 	if serr != nil {
 		return nil, serr
@@ -1271,7 +1271,7 @@ func (db *DB) segmentSchemaRowsShared() []SchemaRow {
 	}
 	raw, seqs := slices.Clone(m.scratch), slices.Clone(m.seqScratch)
 	out := db.renderSchemaRows(nil, nil, &raw)
-	m.raw, m.seqs, m.out = raw, seqs, out[:len(out):len(out)]
+	m.raw, m.seqs, m.out, m.fp = raw, seqs, out[:len(out):len(out)], 0
 	clear(m.scratch)
 	return m.out
 }
@@ -1282,6 +1282,21 @@ func (db *DB) segmentSchemaRowsShared() []SchemaRow {
 type schemaRowsMemo struct {
 	raw, out, scratch []SchemaRow
 	seqs, seqScratch  []uint64
+	// fp is out's schemaRowsFingerprint, 0 until asked: a statement's pager
+	// asks once, and a new render replaces out with a new slice.
+	fp uint64
+}
+
+// fingerprint is schemaRowsFingerprint(rows), memoised while rows is the
+// memo's own out -- the same slice, so the same rows.
+func (m *schemaRowsMemo) fingerprint(rows []SchemaRow) uint64 {
+	if len(rows) == 0 || len(m.out) != len(rows) || &m.out[0] != &rows[0] {
+		return schemaRowsFingerprint(rows)
+	}
+	if m.fp == 0 {
+		m.fp = schemaRowsFingerprint(rows)
+	}
+	return m.fp
 }
 
 // renderSchemaRows renders the catalog's rows and creation sequences. Into

@@ -4,9 +4,11 @@ import (
 	"encoding/binary"
 	"math/rand/v2"
 	"os"
+	"runtime"
 	"sync/atomic"
 	"unsafe"
 
+	"github.com/samyfodil/musql/internal/fsio"
 	"github.com/samyfodil/musql/internal/mmapfile"
 )
 
@@ -82,13 +84,15 @@ func storeChangeWord(segPath string, f *os.File, v uint64) error {
 	}
 	var b [8]byte
 	binary.LittleEndian.PutUint64(b[:], v)
-	_, err := f.WriteAt(b[:], changeWordOff)
+	_, err := fsio.WriteAt(f, b[:], changeWordOff)
 	return err
 }
 
-// changeWord is a session's mapping of its lock file's change word.
+// changeWord is a session's mapping of its lock file's change word, or on js,
+// where nothing maps, the lock file it reads the word from.
 type changeWord struct {
 	m *mmapfile.File
+	f *os.File
 }
 
 // mapChangeWord maps segPath's change word, or answers nil where it cannot be
@@ -96,6 +100,25 @@ type changeWord struct {
 // "mapping" would be a copy (mmapfile reads the file there), which would never
 // see another connection's store.
 func mapChangeWord(segPath string) *changeWord {
+	// On js one positioned read of the word replaces the two stamps a
+	// statement would otherwise take, each a call out to the host.
+	if runtime.GOOS == "js" {
+		f, err := os.Open(segPath + segmentLockSuffix)
+		if err != nil {
+			return nil
+		}
+		var b [8]byte
+		if n, err := fsio.ReadAt(f, b[:], changeWordOff); err != nil || n != 8 {
+			f.Close()
+			return nil // no word written yet
+		}
+		return &changeWord{f: f}
+	}
+	// Where nothing maps, Open reads the whole file to answer nil, and a
+	// session without a word asks again at every commit.
+	if !mmapfile.CanMapAt {
+		return nil
+	}
 	m, err := mmapfile.Open(segPath + segmentLockSuffix)
 	if err != nil {
 		return nil
@@ -111,6 +134,15 @@ func mapChangeWord(segPath string) *changeWord {
 // and the load is one access; a store racing it from another process gives
 // either value, or a mix of the two that equals neither.
 func (w *changeWord) load() uint64 {
+	if w.f != nil {
+		// A failed or short read is an odd value, which no one records: the
+		// session checks in full.
+		var b [8]byte
+		if n, err := fsio.ReadAt(w.f, b[:], changeWordOff); err != nil || n != 8 {
+			return 1
+		}
+		return binary.LittleEndian.Uint64(b[:])
+	}
 	word := w.m.Data()[changeWordOff : changeWordOff+8]
 	if !segLittleEndian {
 		return binary.LittleEndian.Uint64(word)
@@ -119,7 +151,12 @@ func (w *changeWord) load() uint64 {
 }
 
 func (w *changeWord) close() {
-	if w != nil {
-		w.m.Close()
+	if w == nil {
+		return
 	}
+	if w.f != nil {
+		w.f.Close()
+		return
+	}
+	w.m.Close()
 }

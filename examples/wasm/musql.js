@@ -20,6 +20,18 @@ const statSync = (path) => {
 globalThis.musqlJIT = (go, { enabled = true } = {}) => {
 	// Kernels by slot. A plain array: nothing calls them through a wasm table.
 	const kernels = [];
+	// view is a DataView over the module's memory, made again only when the
+	// memory grows; put64 writes a number below 2^53 without a BigInt.
+	let dv0;
+	const view = () => {
+		const buf = go._inst.exports.mem.buffer;
+		if (dv0?.buffer !== buf) dv0 = new DataView(buf);
+		return dv0;
+	};
+	const put64 = (dv, at, n) => {
+		dv.setUint32(at, n >>> 0, true);
+		dv.setUint32(at + 4, Math.floor(n / 4294967296), true);
+	};
 	go.importObject.musqljit = {
 		compile_kernel(ptr, len) {
 			if (!enabled) return -1;
@@ -40,8 +52,8 @@ globalThis.musqlJIT = (go, { enabled = true } = {}) => {
 			const path = utf8.decode(new Uint8Array(mem.buffer, ptr, len));
 			const st = globalThis.fs.statStamp ? globalThis.fs.statStamp(path) : statSync(path);
 			if (!st) return 0;
-			const dv = new DataView(mem.buffer);
-			dv.setBigInt64(out, BigInt(st[0]), true);
+			const dv = view();
+			put64(dv, out, st[0]);
 			dv.setBigInt64(out + 8, st[1], true);
 			return 1;
 		},
@@ -60,10 +72,10 @@ globalThis.musqlJIT = (go, { enabled = true } = {}) => {
 				}
 			}
 			if (!st) return 0;
-			const dv = new DataView(go._inst.exports.mem.buffer);
-			dv.setBigInt64(out, BigInt(st[0]), true);
+			const dv = view();
+			put64(dv, out, st[0]);
 			dv.setBigInt64(out + 8, BigInt(st[1]), true);
-			dv.setBigInt64(out + 16, BigInt(st[2]), true);
+			put64(dv, out + 16, st[2]);
 			return 1;
 		},
 		// The commit path's positioned read, positioned write and fsync

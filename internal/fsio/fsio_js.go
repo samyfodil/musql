@@ -19,23 +19,52 @@ var (
 	fds  = map[weak.Pointer[os.File]]int32{}
 )
 
+// recent holds the last few files fdOf answered for. weak.Make costs a lookup
+// in the runtime's specials, more than the read it serves; Value on a pointer
+// already made does not. A weak pointer follows its object, not its address,
+// so a file that has been freed never matches a new one at the same address.
+type recentFd struct {
+	wp weak.Pointer[os.File]
+	fd int32
+}
+
+var (
+	recent     [4]recentFd
+	recentNext int
+)
+
 func fdOf(f *os.File) int32 {
+	if f == nil {
+		return -1
+	}
+	fdMu.Lock()
+	for i := range recent {
+		if recent[i].wp.Value() == f {
+			fd := recent[i].fd
+			fdMu.Unlock()
+			return fd
+		}
+	}
+	fdMu.Unlock()
 	wp := weak.Make(f)
 	fdMu.Lock()
 	fd, ok := fds[wp]
 	fdMu.Unlock()
-	if ok {
-		return fd
-	}
-	fd = int32(f.Fd())
-	fdMu.Lock()
-	fds[wp] = fd
-	fdMu.Unlock()
-	runtime.AddCleanup(f, func(wp weak.Pointer[os.File]) {
+	if !ok {
+		fd = int32(f.Fd())
 		fdMu.Lock()
-		delete(fds, wp)
+		fds[wp] = fd
 		fdMu.Unlock()
-	}, wp)
+		runtime.AddCleanup(f, func(wp weak.Pointer[os.File]) {
+			fdMu.Lock()
+			delete(fds, wp)
+			fdMu.Unlock()
+		}, wp)
+	}
+	fdMu.Lock()
+	recent[recentNext] = recentFd{wp, fd}
+	recentNext = (recentNext + 1) % len(recent)
+	fdMu.Unlock()
 	return fd
 }
 

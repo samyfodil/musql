@@ -1,0 +1,15 @@
+{
+  "name": "musql-wasm-bench",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite"
+  },
+  "dependencies": {
+    "@samyfodil/musql": "file:../../npm",
+    "@tursodatabase/database-wasm": "0.8.3"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}

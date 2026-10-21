@@ -265,17 +265,20 @@ func (p *ReadOnlyPager) segSemiCountTable(tRoot uint32, tTbl *resolvedTable, pre
 			}
 			keys[i] = col
 		}
+		// A NULL row is in under neither LIKE nor NOT LIKE: OpLike answers NULL,
+		// which IfNot takes as false.
 		type likeCol struct {
 			cells []uint64
 			heap  []byte
+			nulls []byte
 		}
 		likeCols := make([]likeCol, len(likes))
 		for i, sl := range likes {
-			cells, heap, ok := s.BytesColumn(sl.col)
-			if !ok || s.cols[sl.col].phys != PhysText || !segPredColsFilterable(s, []segPred{{Col: sl.col}}) {
+			cells, heap, nulls, ok := s.BytesColumnNulls(sl.col)
+			if !ok || s.cols[sl.col].phys != PhysText {
 				return 0, false
 			}
-			likeCols[i] = likeCol{cells, heap}
+			likeCols[i] = likeCol{cells, heap, nulls}
 		}
 		inCols := make([][]int64, len(ins))
 		for i, si := range ins {
@@ -318,6 +321,10 @@ func (p *ReadOnlyPager) segSemiCountTable(tRoot uint32, tTbl *resolvedTable, pre
 				}
 				for i, sl := range likes {
 					if !in {
+						break
+					}
+					if nb := likeCols[i].nulls; nb != nil && nb[(lo+r)/8]&(1<<uint((lo+r)%8)) != 0 {
+						in = false
 						break
 					}
 					raw := likeCols[i].cells[lo+r]
