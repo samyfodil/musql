@@ -82,6 +82,9 @@ var segRowsSelected int64
 func SegRowsServedForTest() int64 { return segRowsServed.Swap(0) }
 
 // SegRowsSelectedForTest reads and clears the pre-filter counter.
+// segSelWindow is the rows a filtered scan judges first in a segment.
+const segSelWindow = 1024
+
 func SegRowsSelectedForTest() int64 { n := segRowsSelected; segRowsSelected = 0; return n }
 
 // segRowSource walks a table's segments in order, yielding one row at a time.
@@ -102,7 +105,20 @@ type segRowSource struct {
 	ipkCol int
 	sel    []int64
 	selPos int
-	selOn  bool // sel is authoritative for this segment (it may legitimately be empty)
+	segOn  bool // the current segment's span and selPrep are decided
+	// end is where the current segment's rows stop: its row count, or where a
+	// rowid range (ranged, rowidLo..rowidHi inclusive) stops in it.
+	end              int
+	ranged           bool
+	rowidLo, rowidHi int64
+	// selPrep is the predicate made ready for the current segment, nil when it
+	// declined and every row is a candidate. sel holds the candidates of the
+	// window ending at selHi; selWin is the next window's size, and selScan
+	// marks a window the predicate declined, whose rows ri walks instead.
+	selPrep *segSelection
+	selHi   int
+	selWin  int
+	selScan bool
 
 	// point is a rowid point lookup (segPointSeek): the one row pointSeg/
 	// pointRow, yielded once.
@@ -399,30 +415,63 @@ func (src *segRowSource) next() (s *segment, row int, rowid uint64, ok bool) {
 	}
 	for src.si < len(src.segs) {
 		s = src.segs[src.si]
-		if src.filter != nil && !src.selOn {
-			// First visit to this segment: ask the compiled predicate which
-			// rows can match. A decline leaves sel nil, which scans it whole.
-			src.sel, _ = segSelectRows(s, src.filter, src.ipkCol, src.params, src.sel[:0])
-			src.selOn = true
-			src.selPos = 0
-		}
-		if src.selOn && src.sel != nil {
-			if src.selPos < len(src.sel) {
-				row = int(src.sel[src.selPos])
-				src.selPos++
-				segRowsServed.Add(1)
-				segRowsSelected++
-				return s, row, s.Rowid(row), true
+		if !src.segOn {
+			// First visit to this segment: the rows a rowid range leaves of
+			// it, and the compiled predicate made ready for it. A decline
+			// leaves selPrep nil, which scans the span whole.
+			src.segOn = true
+			src.ri, src.end = 0, s.nRows
+			if src.ranged {
+				src.ri, src.end = s.rowidSpan(src.rowidLo, src.rowidHi)
 			}
-		} else if src.ri < s.nRows {
+			if src.filter != nil {
+				src.selPrep, _ = segSelectPrep(s, src.filter, src.ipkCol, src.params)
+				src.sel, src.selPos = src.sel[:0], 0
+				src.selHi, src.selWin, src.selScan = src.ri, segSelWindow, false
+			}
+		}
+		if src.selPrep != nil {
+			for {
+				if src.selPos < len(src.sel) {
+					row = int(src.sel[src.selPos])
+					src.selPos++
+					segRowsServed.Add(1)
+					segRowsSelected++
+					return s, row, s.Rowid(row), true
+				}
+				if src.selScan && src.ri < src.selHi {
+					row = src.ri
+					src.ri++
+					segRowsServed.Add(1)
+					return s, row, s.Rowid(row), true
+				}
+				if src.selHi >= src.end {
+					break
+				}
+				// The next window, twice the last: a scan that stops early
+				// judges little more than it reads, and one that runs to the
+				// end makes few kernel calls.
+				lo := src.selHi
+				src.selHi = min(lo+src.selWin, src.end)
+				src.selWin *= 2
+				sel, ok := src.selPrep.run(lo, src.selHi, src.sel[:0])
+				src.selPos = 0
+				if ok {
+					src.sel, src.selScan = sel, false
+				} else {
+					// A declined window is scanned whole.
+					src.sel, src.selScan, src.ri = src.sel[:0], true, lo
+				}
+			}
+		} else if src.ri < src.end {
 			row = src.ri
 			src.ri++
 			segRowsServed.Add(1)
 			return s, row, s.Rowid(row), true
 		}
 		src.si++
-		src.ri = 0
-		src.selOn = false
+		src.segOn = false
+		src.selPrep = nil
 		src.selPos = 0
 	}
 	return nil, 0, 0, false
