@@ -127,8 +127,11 @@ func (prog *Program) putMachineTo(m *vdbe, spare **vdbe) {
 	jcur, jsnap := m.jcur, m.jsnap
 	clear(jcur)
 	for i := range jsnap {
-		clear(jsnap[i].row[:cap(jsnap[i].row)])
-		jsnap[i] = jitSnap{row: jsnap[i].row[:0]}
+		sn := &jsnap[i]
+		clear(sn.row[:cap(sn.row)])
+		clear(sn.slab[:cap(sn.slab)])
+		clear(sn.rows[:cap(sn.rows)])
+		*sn = jitSnap{row: sn.row[:0], slab: sn.slab[:0], rows: sn.rows[:0], rids: sn.rids[:0]}
 	}
 	// Zeroed in place, then the kept slices put back: the same machine as the
 	// composite literal this was, without building that 1 KB literal and
