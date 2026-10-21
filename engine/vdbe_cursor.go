@@ -170,6 +170,9 @@ type vdbeCursor struct {
 	// pointSrc is the source a rowid or index seek positions (segPointSeek,
 	// segListSeek), held here so a seek per outer row allocates none.
 	pointSrc segRowSource
+	// seekGen counts the seeks segSrc was positioned by, for the JIT's copy
+	// of their rows (seekSnap).
+	seekGen uint64
 	// seekSlab backs an index seek's fixed-up rows, reused by a reseek.
 	seekSlab         []Value
 	segCur           *segment
@@ -646,6 +649,7 @@ func (cur *vdbeCursor) rewind() error {
 			// columns are read one at a time as the program asks for them.
 			// Not marked materialized, so the next rewind seeks again.
 			if src, served := cur.pager.segPointSeek(cur, cur.seekKey, &cur.pointSrc); served {
+				cur.seekGen = seekGens.Add(1)
 				cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
 				cur.segSrc, cur.segCur = src, nil
 				if src != nil {
@@ -689,6 +693,7 @@ func (cur *vdbeCursor) rewind() error {
 				// (OpAutoIndexOrder) or tagged by position (OpMultiOrTag).
 				if cur.seekReseek {
 					if src, served := cur.pager.segListSeek(cur, rowids, &cur.pointSrc); served {
+						cur.seekGen = seekGens.Add(1)
 						// Positioned, not built, as a rowid seek is above.
 						cur.segSrc, cur.segCur, cur.segSrcCols = src, nil, src.cols
 						cur.streamErrPending = nil

@@ -1381,6 +1381,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				goto dispatch
 			}
 			m.jitEnters++
+			if vmJITCountCursorEnters && jx.gate[pc] >= 0 {
+				vmJITCursorEnters.Add(1)
+			}
 			if jitScore {
 				jitScoreEnter()
 			}

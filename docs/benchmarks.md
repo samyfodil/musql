@@ -74,11 +74,83 @@ The scan multiples hold or grow with ten times the rows.
 | Filtered count, two predicates | 1.17 ms | 68.8 ms | 252 ms | **59× faster** |
 | Rowid lookup | 1 µs | 11.4 µs | 50 µs | **9× faster** |
 | Secondary-index equality | 7 µs | 11.2 µs | 51 µs | **1.6× faster** |
-| Indexed equi-join | 15 µs | 17 µs | 96 µs | **1.1× faster** |
+| Indexed equi-join | 12 µs | 16.6 µs | 82 µs | **1.4× faster** |
 | Sum over a filter | 507 µs | 64.5 ms | 253 ms | **127× faster** |
 | Grouped aggregate | 3.98 ms | 396 ms | 1.32 s | **99× faster** |
 | `ORDER BY v DESC LIMIT 20` | 678 µs | 83.8 ms | 1.07 s | **124× faster** |
 | Whole-table count | 3 µs | 5.67 ms | 18.6 ms | **2,200× faster** |
+
+## Every shape the benchmark times
+
+**1,000,000 rows, Intel Xeon D-2123IT** (amd64, Linux), one thread
+
+The tables above show the core shapes. The benchmark also times shapes that no
+columnar filter models: `HAVING`, `OR`, `LIKE`, TEXT sorting, `DISTINCT`,
+subqueries, compounds and pagination. Every one is JIT-compiled, and
+`TestBenchColumnarVsC` fails if the JIT declines one. musql is faster than C
+SQLite on all 26 shapes, and on the 4 single-row writes (7–8×, through
+`database/sql` against mattn/go-sqlite3).
+
+| Query | musql | C native | Turso | vs C native |
+| --- | ---: | ---: | ---: | ---: |
+| Filtered count, one predicate | 457 µs | 59.3 ms | 214 ms | **130× faster** |
+| Filtered count, two predicates | 1.18 ms | 68.1 ms | 254 ms | **58× faster** |
+| Rowid lookup | 2 µs | 11.2 µs | 45 µs | **5.6× faster** |
+| Secondary-index equality | 7 µs | 11.1 µs | 52 µs | **1.6× faster** |
+| Indexed equi-join | 12 µs | 16.6 µs | 82 µs | **1.4× faster** |
+| Sum over a filter | 500 µs | 63.8 ms | 257 ms | **128× faster** |
+| Grouped aggregate | 3.98 ms | 393 ms | 1.32 s | **99× faster** |
+| `ORDER BY v DESC LIMIT 20` | 676 µs | 83.2 ms | 1.06 s | **123× faster** |
+| Whole-table count | 9 µs | 5.53 ms | 19.1 ms | **614× faster** |
+| `min`/`max` whole table | 25 µs | 86.2 ms | 300 ms | **3,448× faster** |
+| Grouped `min`/`max` | 9.25 ms | 423 ms | 1.38 s | **46× faster** |
+| `GROUP BY ... HAVING` | 2.61 ms | 349 ms | 1.07 s | **134× faster** |
+| `OR` predicate | 5.07 ms | 67.0 ms | 247 ms | **13× faster** |
+| `BETWEEN` range | 600 µs | 64.1 ms | 274 ms | **107× faster** |
+| `IN` list | 11.0 ms | 109 ms | 283 ms | **9.9× faster** |
+| `IS NULL` scan | 1.52 ms | 57.0 ms | 178 ms | **38× faster** |
+| `LIKE` scan | 19.8 ms | 107 ms | 285 ms | **5.4× faster** |
+| `ORDER BY` text `LIMIT 20` | 57.9 ms | 93.7 ms | 489 ms | **1.6× faster** |
+| Grouped count, few groups | 9.77 ms | 132 ms | 407 ms | **14× faster** |
+| `DISTINCT` | 3.37 ms | 99.1 ms | 292 ms | **29× faster** |
+| Scalar subquery | 31.5 ms | 168 ms | 472 ms | **5.3× faster** |
+| `IN` subquery | 11.5 ms | 86.8 ms | 154 s | **7.5× faster** |
+| Correlated `EXISTS` | 11.2 ms | 2.15 s | 3.31 s | **192× faster** |
+| `UNION ALL` compound | 875 µs | 130 ms | 448 ms | **149× faster** |
+| `LIMIT 20 OFFSET 1000` | 6.55 ms | 92.3 ms | 1.07 s | **14× faster** |
+| Join projecting rows | 8 µs | 18.1 µs | 81 µs | **2.3× faster** |
+
+## Vector search
+
+Against libSQL through its Go driver, 384-dimension float32 vectors, top 10,
+one thread unless noted, on a 4-core amd64 server
+([benchmarks](../compat-harness/libsql/bench_test.go)):
+
+| Workload | musql | libSQL |
+| --- | ---: | ---: |
+| `vector_top_k`, 100k clustered vectors | **4.1 ms, exact** | 27.5 ms, recall 10/10 |
+| `vector_top_k`, 100k random vectors | **15.2 ms, exact** | 33.3 ms, recall 6/10 |
+| Brute-force KNN, 100k rows, cosine | 209 ms (60 ms on 4 cores) | 264 ms |
+| Brute-force KNN, 100k rows, L2 | 215 ms (61 ms on 4 cores) | 216 ms |
+| Insert 2,000 vectors as text | **125–134 ms** | 173–185 ms |
+
+libSQL's index answers from a DiskANN graph and can miss neighbours;
+musql's default index returns the exact top 10 and is still faster here.
+
+`vec1` against C SQLite with vec1 built for speed (AVX2/FMA), 100,000
+clustered vectors of 384 dimensions, one thread, mean of 200 queries, on an
+amd64 Xeon D ([benchmark](../compat-harness/vec1/bench_test.go)):
+
+| Index | musql query | C SQLite query | recall@10 (musql / C) | musql train + build | C train + build |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| flat | **25.0 ms** | 72.5 ms | 1.000 / 1.000 | 0.8 s | 0.9 s |
+| ivf | **8.5 ms** | 19.3 ms | 1.000 / 1.000 | 2.8 s | 3.8 s |
+| ivfpq | **1.30 ms** | 1.86 ms | 0.999 / 0.999 | 12.1 s | 16.5 s |
+| ivfopq | **0.99 ms** | 1.30 ms | 0.990 / 0.993 | 60.1 s | 71.5 s |
+| ivfbq | **0.98 ms** | 1.33 ms | 0.994 / 0.996 | 2.7 s | 3.5 s |
+
+Inserting the 100,000 rows takes about the same time in both (0.59–0.63 s
+for musql, 0.52–0.64 s for C).
 
 ## Against DuckDB
 

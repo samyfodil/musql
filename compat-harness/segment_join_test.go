@@ -61,9 +61,11 @@ func TestSegJoinAggregateMatchesC(t *testing.T) {
 		{`SELECT count(*), sum(t.seconds) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE al.year <> 1971`, true},
 		{`SELECT al.id, count(*), max(t.plays) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.plays >= ? GROUP BY al.id`, true},
 		{`SELECT ar.name, count(*) FROM artists ar JOIN albums al ON al.artist_id = ar.id JOIN tracks t ON t.album_id = al.id WHERE ar.name > 'a' AND t.rating < 2.5 AND al.year = '1975' GROUP BY ar.name`, true},
-		{`SELECT count(*) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.rating = 1 AND t.id % 3 = 0`, true},
+		// The loop seeks tracks by its index here, which reads fewer rows than
+		// the kernel's scan, so the kernel leaves it, and the g.ci query below, to the loop.
+		{`SELECT count(*) FROM albums al JOIN tracks t ON t.album_id = al.id WHERE t.rating = 1 AND t.id % 3 = 0`, false},
 		{`SELECT count(*) FROM tags g JOIN tracks t ON t.album_id = g.id WHERE g.tag > 0 AND g.tag < 'S'`, true},
-		{`SELECT count(*) FROM tags g JOIN tracks t ON t.album_id = g.id WHERE g.ci = 'rock'`, true},
+		{`SELECT count(*) FROM tags g JOIN tracks t ON t.album_id = g.id WHERE g.ci = 'rock'`, false},
 		// GROUP BY: streamed when the groups arrive in scan order, sorted
 		// otherwise; bare columns read the group's first joined row.
 		{`SELECT al.id, count(*), sum(t.seconds), min(t.plays), max(t.plays) FROM albums al JOIN tracks t ON t.album_id = al.id GROUP BY al.id`, true},

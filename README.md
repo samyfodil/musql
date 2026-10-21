@@ -107,35 +107,60 @@ The release archive also has `musql-convert`:
 
 ## Performance
 
-Read workloads over **100,000 rows**, one thread each, against C SQLite called
-natively from C (no Go in its path), Turso through its Go driver, and DuckDB.
-Each workload is checked against C SQLite on up to 40 bind values before
-timing, then timed for about 200 ms. Measured on an amd64 server; musql through
-its direct engine API.
+**musql beats C SQLite on every workload in its benchmark.** That is 26 read
+shapes and 4 single-row writes, and every read runs as JIT-compiled native code.
+The benchmark fails if one stops beating C or if the JIT declines one.
 
-| Query | musql | vs C SQLite | vs Turso | vs DuckDB |
-| --- | ---: | ---: | ---: | ---: |
-| Filtered count, one predicate | 40 µs | **142× faster** | 475× faster | 15× faster |
-| Filtered count, two predicates | 76 µs | **86× faster** | 310× faster | 10× faster |
-| Rowid lookup | 1 µs | **9× faster** | 32× faster | 290× faster |
-| Secondary-index equality | 2 µs | **4× faster** | 23× faster | 170× faster |
-| Indexed equi-join | 7 µs | **2× faster** | 11× faster | 98× faster |
-| Sum over a filter | 32 µs | **190× faster** | 700× faster | 21× faster |
-| Grouped aggregate | 543 µs | **71× faster** | 190× faster | 2.4× faster |
-| `ORDER BY v DESC LIMIT 20` | 330 µs | **24× faster** | 260× faster | 2.8× faster |
-| Grouped `min`/`max` | 1.03 ms | **39× faster** | 100× faster | 1.3× faster |
-| `OR` predicate | 506 µs | **13× faster** | 51× faster | 4.7× faster |
-| `IN` list | 1.08 ms | **10× faster** | 25× faster | 2.3× faster |
+Selected reads over **1,000,000 rows**, one thread each, measured on an amd64
+server (Xeon D-2123IT):
 
-Scans and aggregates run as JIT-compiled code over musql's columnar format, and
-the multiples hold or grow at 1,000,000 rows. Through `database/sql`, a point
-lookup costs about 5 µs, still 2× less than native C SQLite.
-DuckDB is an analytical engine and not SQLite-compatible; with its default
-thread count it is faster on some of these, and `engine.WithWorkers(n)` lets
-musql split scans across goroutines too. Without the JIT, musql loses to C
-SQLite by a large multiple on scans. Per-machine timings, the 1M-row runs, the
-multithreaded comparison with DuckDB and the cost of calling C from Go are in
-[docs/benchmarks.md](docs/benchmarks.md).
+| Query | musql | C SQLite | vs C SQLite | vs Turso | vs DuckDB, 1 thread |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `min`/`max` whole table | 25 µs | 86.2 ms | **3,400× faster** | 12,000× faster | 175× faster |
+| Whole-table count | 9 µs | 5.53 ms | **610× faster** | 2,100× faster | 50× faster |
+| Correlated `EXISTS` | 11.2 ms | 2.15 s | **190× faster** | 300× faster | 5.7× faster |
+| `UNION ALL` compound | 875 µs | 130 ms | **150× faster** | 510× faster | 6.2× faster |
+| `GROUP BY ... HAVING` | 2.61 ms | 349 ms | **134× faster** | 410× faster | 2.1× faster |
+| Filtered count | 457 µs | 59.3 ms | **130× faster** | 470× faster | 7.1× faster |
+| Sum over a filter | 500 µs | 63.8 ms | **128× faster** | 510× faster | 7.5× faster |
+| `ORDER BY v DESC LIMIT 20` | 676 µs | 83.2 ms | **123× faster** | 1,560× faster | 8.1× faster |
+| Grouped aggregate | 3.98 ms | 393 ms | **99× faster** | 330× faster | 2.0× faster |
+| `LIMIT 20 OFFSET 1000` | 6.55 ms | 92.3 ms | **14× faster** | 160× faster | 1.1× faster |
+| Rowid lookup | 2 µs | 11.2 µs | **5.6× faster** | 22× faster | 190× faster |
+| Indexed equi-join | 12 µs | 16.6 µs | **1.4× faster** | 6.8× faster | 63× faster |
+
+How the numbers are taken:
+
+- C SQLite is called natively from C, with no Go in its path. Turso goes through
+  its Go driver; musql through its direct engine API.
+- Each workload is checked against C SQLite on up to 40 bind values, then timed
+  for about 200 ms.
+
+Scans and aggregates run as JIT-compiled code over musql's columnar format.
+Point lookups and joins run as JIT-compiled VDBE programs.
+
+Through `database/sql`, a point lookup costs about 5 µs, still 2× less than
+native C SQLite.
+
+DuckDB is an analytical engine and not SQLite-compatible. On one thread it beats
+musql on 6 of the 26 shapes: TEXT sorting, `IS NULL`, a grouped count over few groups, grouped
+`min`/`max`, and two subquery shapes. With its default thread count it beats
+musql on more. `engine.WithWorkers(n)` lets musql split scans across goroutines
+too.
+
+Without the JIT, musql loses to C SQLite by a large multiple on scans.
+
+Vector search is faster too: `vector_top_k` beats libSQL's index while
+returning the exact top 10, and every `vec1` index beats C SQLite's. See
+[Vector search](#vector-search).
+
+[docs/benchmarks.md](docs/benchmarks.md) has:
+
+- all 26 shapes;
+- per-machine timings, including the 100k-row runs and the Apple M4;
+- the multithreaded comparison with DuckDB;
+- the vector benchmarks;
+- the cost of calling C from Go.
 
 Writes, through `database/sql` against C SQLite through `mattn/go-sqlite3`
 ([`TestBenchVsC`](compat-harness/bench_vs_c_test.go), best of 5 rounds,
