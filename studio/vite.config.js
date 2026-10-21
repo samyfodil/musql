@@ -8,6 +8,9 @@ export default defineConfig({
 	// which pre-bundling would break.
 	optimizeDeps: { exclude: ["@samyfodil/musql"] },
 	worker: { format: "es" },
+	// The package is a link to ../npm, outside this root, and the dev server
+	// serves its musql.wasm from there.
+	server: { fs: { allow: [".", "../npm"] } },
 	// React and CodeMirror; the wasm module is its own asset.
 	build: { chunkSizeWarningLimit: 1000 },
 });
