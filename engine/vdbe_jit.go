@@ -57,6 +57,10 @@ type vmJIT struct {
 	// params is how many of the nReg registers, the last ones, hold the bound
 	// parameters (Program.jitParams); enter fills them.
 	params int
+
+	// seekCols is every column the native code reads of each cursor: what a
+	// seek's rows are copied out with (seekSnap).
+	seekCols []curCols
 }
 
 // curCols is one cursor's columns an entry reads.
@@ -294,6 +298,16 @@ func compileVMJIT(prog *Program) *vmJIT {
 			seen[in.A] = true
 			jx.curs = append(jx.curs, in.A)
 			jx.nCurs = max(jx.nCurs, in.A+1)
+		}
+		if in.Op == jit.VColumn {
+			i := slices.IndexFunc(jx.seekCols, func(cc curCols) bool { return cc.cursor == in.A })
+			if i < 0 {
+				jx.seekCols = append(jx.seekCols, curCols{cursor: in.A})
+				i = len(jx.seekCols) - 1
+			}
+			if !slices.Contains(jx.seekCols[i].cols, in.B) {
+				jx.seekCols[i].cols = append(jx.seekCols[i].cols, in.B)
+			}
 		}
 	}
 	return jx
@@ -755,8 +769,22 @@ func lowerVM(in *Instruction, nReg int) jit.VInsn {
 // test sets: two locked adds an entry were a measurable share of a short one.
 var (
 	vmJITCursorSyncs, vmJITWriteCursorSyncs atomic.Int64
+	vmJITSeekSnaps                          atomic.Int64
 	vmJITCountSyncs                         bool
+
+	// vmJITCursorEnters counts entries into native code that reads or walks a
+	// cursor, while vmJITCountCursorEnters is set.
+	vmJITCursorEnters      atomic.Int64
+	vmJITCountCursorEnters bool
 )
+
+// CountVMJITCursorEntersForTest turns counting the whole-program JIT's entries
+// that read rows on or off.
+func CountVMJITCursorEntersForTest(on bool) { vmJITCountCursorEnters = on }
+
+// VMJITCursorEntersForTest returns how many such entries ran since the last
+// call.
+func VMJITCursorEntersForTest() int64 { return vmJITCursorEnters.Swap(0) }
 
 // jitCursorOK reports whether native code may advance cur right now: a
 // materialized row list advance() walks by position -- no streamed or segment
@@ -813,7 +841,7 @@ func sameRow(a, b []Value) bool {
 // one native code cannot walk.
 func (jx *vmJIT) copies(m *vdbe, pc int) bool {
 	for _, cc := range jx.fill[pc] {
-		if cc.cursor < len(m.cursors) && !jitCursorOK(m.cursors[cc.cursor]) {
+		if cc.cursor < len(m.cursors) && !jitCursorOK(m.cursors[cc.cursor]) && !seekWalkable(m.cursors[cc.cursor]) {
 			return true
 		}
 	}
@@ -826,6 +854,130 @@ func (jx *vmJIT) copies(m *vdbe, pc int) bool {
 type jitSnap struct {
 	row []Value
 	hdr [1][]Value
+
+	// seek is how many rows seekSnap copied out of a seek, 0 when none; rows,
+	// rids and slab hold them. They are kept across entries while the cursor
+	// stays on that seek (owner, gen): rows[k] is the list's row base+k. live
+	// is whether this entry handed them over, at row entry.
+	live  bool
+	entry int
+	seek  int
+	rows  [][]Value
+	rids  []uint64
+	slab  []Value
+	mask  uint64
+	owner *vdbeCursor
+	gen   uint64
+	base  int
+}
+
+// jitSeekRows is the most rows of a seek seekSnap copies out.
+const jitSeekRows = 256
+
+// seekWalkable is whether seekSnap can hand cur's rows over for native code
+// to walk.
+func seekWalkable(cur *vdbeCursor) bool {
+	src := cur.segSrc
+	if src == nil || cur.segCur == nil {
+		return false
+	}
+	return src.point || src.list && len(src.listRows)-src.listPos < jitSeekRows
+}
+
+// seekSnap hands native code the rows a rowid or index seek on a segment table
+// has left (segPointSeek, segListSeek): the current one and the rest, each
+// with the columns the program reads, in a list it may walk. false when cur is
+// not such a seek or has too many rows to copy.
+func (jx *vmJIT) seekSnap(c int, cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) bool {
+	src := cur.segSrc
+	if src == nil || cur.segCur == nil || !src.point && !src.list {
+		return false
+	}
+	at := 0
+	if src.list {
+		at = src.listPos - 1
+	}
+	if sn.seek == 0 || sn.owner != cur || sn.gen != cur.seekGen || at < sn.base || at >= sn.base+sn.seek {
+		if !jx.seekCopy(c, cur, sn, at) {
+			return false
+		}
+	}
+	if vmJITCountSyncs {
+		vmJITSeekSnaps.Add(1)
+	}
+	sn.live, sn.entry = true, at-sn.base
+	*jc = jit.VCursor{Rows: unsafe.Pointer(unsafe.SliceData(sn.rows)), Rowids: unsafe.Pointer(unsafe.SliceData(sn.rids)),
+		N: int64(sn.seek), Pos: int64(sn.entry), Last: -1, Ok: 1, Adv: 1, Mask: sn.mask}
+	return true
+}
+
+// seekCopy copies the rows of cur's seek from list position at (the current
+// row) to the end into sn.
+func (jx *vmJIT) seekCopy(c int, cur *vdbeCursor, sn *jitSnap, at int) bool {
+	src := cur.segSrc
+	var cols []int
+	for _, cc := range jx.seekCols {
+		if cc.cursor == c {
+			cols = cc.cols
+		}
+	}
+	if len(cols) == 0 {
+		return false
+	}
+	n := 1
+	if src.list {
+		n = len(src.listRows) - at
+	}
+	if n > jitSeekRows {
+		return false
+	}
+	w := 0
+	var mask uint64
+	for _, col := range cols {
+		if col >= 64 {
+			return false
+		}
+		w = max(w, col+1)
+		mask |= 1 << uint(col)
+	}
+	slab := slices.Grow(sn.slab[:0], n*w)[:n*w]
+	rows, rids := sn.rows[:0], sn.rids[:0]
+	s, row, rid, width := cur.segCur, cur.segRow, cur.rowid, cur.segWidth
+	for k := range n {
+		if k > 0 {
+			s, row = src.listSegs[at+k], src.listRows[at+k]
+			rid = s.Rowid(row)
+			width = min(s.Width(row), len(cur.segSrcCols))
+		}
+		r := slab[k*w : (k+1)*w : (k+1)*w]
+		for _, col := range cols {
+			r[col] = segColumnValue(cur.segSrcCols, s, row, width, rid, col)
+		}
+		rows, rids = append(rows, r), append(rids, rid)
+	}
+	sn.seek, sn.rows, sn.rids, sn.slab, sn.mask = n, rows, rids, slab, mask
+	sn.owner, sn.gen, sn.base = cur, cur.seekGen, at
+	return true
+}
+
+// seekSync brings a cursor seekSnap handed over up to date with the native
+// advance, as advance() would have left it.
+func seekSync(cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) {
+	sn.live = false
+	if jc.Dirty == 0 {
+		return
+	}
+	if moved := int(jc.Last) - sn.entry; jc.Last >= 0 && moved > 0 {
+		src, i := cur.segSrc, sn.base+int(jc.Last)
+		cur.pos += moved
+		segRowsServed.Add(int64(moved))
+		cur.segCur, cur.segRow, cur.rowid = src.listSegs[i], src.listRows[i], sn.rids[jc.Last]
+		cur.segWidth = min(cur.segCur.Width(cur.segRow), len(cur.segSrcCols))
+		src.listPos = i + 1
+	}
+	if int(jc.Pos) >= sn.seek {
+		cur.segSrc, cur.segCur = nil, nil
+	}
 }
 
 // jitReadColumn is cur.readColumn for a cursor whose state is not known to
@@ -942,6 +1094,9 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 				}
 				continue
 			}
+			if jx.seekSnap(c, cur, jc, &m.jsnap[c]) {
+				continue
+			}
 			// Not a cursor native code can walk: hand over a copy of its current
 			// row, with the columns this entry reads, and let it read only
 			// those. Nothing native moves it (Adv and Rewind are zero), so the
@@ -977,6 +1132,10 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 	if jx.nCurs > 0 {
 		for _, c := range jx.curs {
 			jc := &m.jcur[c]
+			if sn := &m.jsnap[c]; sn.live {
+				seekSync(m.cursors[c], jc, sn)
+				continue
+			}
 			if sn := &m.jsnap[c]; len(sn.row) != 0 {
 				clear(sn.row) // the copy holds no row past the call
 				sn.hdr[0] = nil
