@@ -871,6 +871,10 @@ type jitSnap struct {
 	base  int
 }
 
+// seekGens numbers seeks across every cursor, so a copy is never taken for
+// another seek's, even by a cursor recycled at the same address.
+var seekGens atomic.Uint64
+
 // jitSeekRows is the most rows of a seek seekSnap copies out.
 const jitSeekRows = 256
 

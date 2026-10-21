@@ -57,6 +57,10 @@ func TestVMJITSeekDifferential(t *testing.T) {
 		"SELECT u.id, (SELECT max(t.b) FROM t WHERE t.a = u.k) FROM u ORDER BY 1",
 		"SELECT u.id, (SELECT t.c FROM t WHERE t.id = u.w) FROM u ORDER BY 1",
 		"SELECT u.id, t.id FROM u, t WHERE t.a = u.k AND t.id % 7 = 0 ORDER BY 1, 2",
+		// A subquery's machine opens new cursors each time it runs.
+		"SELECT count(*) FROM u WHERE EXISTS (SELECT 1 FROM t WHERE t.id = u.w AND t.b > 2)",
+		"SELECT count(*) FROM u WHERE EXISTS (SELECT 1 FROM t WHERE t.a = u.k AND t.b > 6)",
+		"SELECT u.id FROM u WHERE NOT EXISTS (SELECT 1 FROM t WHERE t.id = u.w) ORDER BY 1",
 	}
 	for i := 1; i < 2600; i += 97 {
 		queries = append(queries, fmt.Sprintf("SELECT b, c, d, e FROM t WHERE id = %d", i))
