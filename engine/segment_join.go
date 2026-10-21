@@ -1377,10 +1377,9 @@ func (w *segJoinWalk) value(a segJoinArg, at []int32) Value {
 
 // openSegJoin opens plan's join, or reports false.
 func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
-	k := len(plan.cursors)
-	w := &segJoinWalk{tabs: make([]*segJoinTable, k), link: make([]segJoinLink, k),
-		m: m, exprs: map[*segJoinExpr][]Value{}, optional: plan.optional}
-	for i, c := range plan.cursors {
+	// The checks that need nothing allocated come first: a join the loop seeks
+	// into declines here on every statement.
+	for _, c := range plan.cursors {
 		if c >= len(m.cursors) {
 			return nil, false
 		}
@@ -1389,6 +1388,11 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 		if cur := m.cursors[c]; cur != nil && cur.idxSeekConfigured && !cur.seekReseek {
 			return nil, false
 		}
+	}
+	k := len(plan.cursors)
+	w := &segJoinWalk{tabs: make([]*segJoinTable, k), link: make([]segJoinLink, k),
+		m: m, exprs: map[*segJoinExpr][]Value{}, optional: plan.optional}
+	for i, c := range plan.cursors {
 		t, ok := segJoinTableOf(m.cursors[c])
 		if !ok {
 			return nil, false

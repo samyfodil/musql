@@ -136,7 +136,13 @@ func (c *Conn) commitIfAutocommit() error {
 // values); every one of them is consulted on the read side and every one is a
 // WRONG ANSWER rather than a gap if it is missing. See its own doc comment.
 func (c *Conn) readPagerStamped(nw *engine.Session) (*engine.ReadOnlyPager, error) {
-	rp, err := nw.ReadPager()
+	return c.readPagerStampedReusing(nw, nil)
+}
+
+// readPagerStampedReusing is readPagerStamped built in prev's memory (see
+// Session.ReadPagerReusing).
+func (c *Conn) readPagerStampedReusing(nw *engine.Session, prev *engine.ReadOnlyPager) (*engine.ReadOnlyPager, error) {
+	rp, err := nw.ReadPagerReusing(prev)
 	if err != nil {
 		return nil, err
 	}

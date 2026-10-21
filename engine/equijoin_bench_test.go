@@ -10,7 +10,12 @@ import (
 // schema+data exactly (same column names/types, same row counts) so this
 // engine-level benchmark isolates the VDBE/pager cost from the driver's
 // per-statement open+parse overhead that TestBenchVsC's numbers also include.
-func buildEquiJoinBenchDB(b *testing.B) *ReadOnlyPager {
+func buildEquiJoinBenchDB(b *testing.B) *ReadOnlyPager { return buildEquiJoinBenchDBVacuumed(b, false) }
+
+// buildEquiJoinBenchDBVacuumed is buildEquiJoinBenchDB, with every row laid
+// into segments by VACUUM when vacuum is set, as the compat harness's benchmark
+// lays them.
+func buildEquiJoinBenchDBVacuumed(b *testing.B, vacuum bool) *ReadOnlyPager {
 	b.Helper()
 	path := filepath.Join(b.TempDir(), "equijoinbench.sqlite")
 	db, err := Create(path)
@@ -44,6 +49,11 @@ func buildEquiJoinBenchDB(b *testing.B) *ReadOnlyPager {
 				{Typ: Int, I: int64(bid)},
 				{Typ: Text, S: []byte(fmt.Sprintf("row-%d-payload", i))},
 			}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if vacuum {
+		if err := db.Exec(`VACUUM`); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -87,5 +97,19 @@ func BenchmarkRowidPointLookupAlone(b *testing.B) {
 			b.Fatal(err)
 		}
 		_ = rows
+	}
+}
+
+// BenchmarkIndexedEquiJoinCount is TestBenchColumnarVsC's "indexed equi-join":
+// an index seek on t.sec (about one row) joined to b by rowid, counted.
+func BenchmarkIndexedEquiJoinCount(b *testing.B) {
+	p := buildEquiJoinBenchDBVacuumed(b, true)
+	const sql = `SELECT count(*) FROM t JOIN b ON t.bid = b.id WHERE t.sec = ?`
+	n := 0
+	for b.Loop() {
+		n++
+		if _, _, err := p.QueryArgs(sql, []Value{{Typ: Int, I: int64(n % 100_000)}}); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

@@ -13,40 +13,45 @@ How each engine is called:
   and options as the Go driver. No Go, cgo or `database/sql` in the path.
 - **C SQLite via Go**: mattn/go-sqlite3 through `database/sql`, for reference.
   The difference between the two C columns is what the Go bridge costs.
-- **Turso**: its Go driver, which reaches the Rust library through purego. It
-  pays a foreign-call cost per statement as the Go path to C does.
+- **Turso (native)**: a C program (`compat-harness/testdata/nativebench/tbench.c`)
+  calling Turso's C API directly, each statement prepared once, like the C
+  SQLite program. Both C programs read every column, and Turso's results are
+  checked against C SQLite's.
 
-The × columns compare musql with native C SQLite.
+The × columns compare musql with native C SQLite, and in the amd64 100,000-row
+table with native Turso too. Turso is timed natively only there; the other
+tables leave it out rather than show numbers measured through its Go driver.
 
 ## 100,000 rows
 
 **Apple M4** (arm64, macOS)
 
-| Query | musql | C native | C via Go | Turso | vs C native |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Filtered count, one predicate | 25 µs | 2.77 ms | 2.19 ms | 5.91 ms | **111× faster** |
-| Filtered count, two predicates | 25 µs | 2.61 ms | 2.61 ms | 7.34 ms | **104× faster** |
-| Rowid lookup | <1 µs | 3.1 µs | 5 µs | 9 µs | **9× faster** |
-| Secondary-index equality | <1 µs | 2.9 µs | 6 µs | 11 µs | **6× faster** |
-| Indexed equi-join | 2 µs | 4.4 µs | 8 µs | 16 µs | **2.2× faster** |
-| Sum over a filter | 25 µs | 2.44 ms | 2.43 ms | 6.69 ms | **98× faster** |
-| Grouped aggregate | 169 µs | 14.0 ms | 13.8 ms | 26.4 ms | **83× faster** |
-| `ORDER BY v DESC LIMIT 20` | 100 µs | 2.58 ms | 2.56 ms | 22.4 ms | **26× faster** |
-| Whole-table count | <1 µs | 8.2 µs | 10 µs | 33 µs | **25× faster** |
+| Query | musql | C native | C via Go | vs C native |
+| --- | ---: | ---: | ---: | ---: |
+| Filtered count, one predicate | 25 µs | 2.77 ms | 2.19 ms | **111× faster** |
+| Filtered count, two predicates | 25 µs | 2.61 ms | 2.61 ms | **104× faster** |
+| Rowid lookup | <1 µs | 3.1 µs | 5 µs | **9× faster** |
+| Secondary-index equality | <1 µs | 2.9 µs | 6 µs | **6× faster** |
+| Indexed equi-join | 2 µs | 4.4 µs | 8 µs | **2.2× faster** |
+| Sum over a filter | 25 µs | 2.44 ms | 2.43 ms | **98× faster** |
+| Grouped aggregate | 169 µs | 14.0 ms | 13.8 ms | **83× faster** |
+| `ORDER BY v DESC LIMIT 20` | 100 µs | 2.58 ms | 2.56 ms | **26× faster** |
+| Whole-table count | <1 µs | 8.2 µs | 10 µs | **25× faster** |
 
 **Intel Xeon D-2123IT** (amd64, Linux)
 
-| Query | musql | C native | C via Go | Turso | vs C native |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Filtered count, one predicate | 40 µs | 5.63 ms | 6.29 ms | 18.9 ms | **142× faster** |
-| Filtered count, two predicates | 76 µs | 6.52 ms | 7.25 ms | 23.4 ms | **86× faster** |
-| Rowid lookup | 1 µs | 10.3 µs | 20 µs | 37 µs | **9× faster** |
-| Secondary-index equality | 2 µs | 9.7 µs | 22 µs | 51 µs | **4× faster** |
-| Indexed equi-join | 7 µs | 14.5 µs | 30 µs | 79 µs | **2× faster** |
-| Sum over a filter | 32 µs | 6.08 ms | 6.80 ms | 22.4 ms | **190× faster** |
-| Grouped aggregate | 543 µs | 38.3 ms | 40.5 ms | 102 ms | **71× faster** |
-| `ORDER BY v DESC LIMIT 20` | 330 µs | 8.07 ms | 8.88 ms | 87.0 ms | **24× faster** |
-| Whole-table count | 1 µs | 22.3 µs | 35 µs | 149 µs | **16× faster** |
+| Query | musql | C native | C via Go | Turso native | vs C native | vs Turso |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Filtered count, one predicate | 20 µs | 6.22 ms | 7.89 ms | 18.7 ms | **312× faster** | 938× faster |
+| Filtered count, two predicates | 81 µs | 7.21 ms | 8.58 ms | 23.1 ms | **89× faster** | 286× faster |
+| Rowid lookup | 1 µs | 11.2 µs | 22 µs | 2.7 µs | **9× faster** | 2.7× faster |
+| Secondary-index equality | 2 µs | 10.4 µs | 25 µs | 4.2 µs | **5× faster** | 2.1× faster |
+| Indexed equi-join | 7 µs | 15.7 µs | 33 µs | 8 µs | **2.2× faster** | 1.1× faster |
+| Sum over a filter | 36 µs | 6.76 ms | 8.12 ms | 22.3 ms | **186× faster** | 615× faster |
+| Grouped aggregate | 440 µs | 39.9 ms | 48.8 ms | 104 ms | **91× faster** | 236× faster |
+| `ORDER BY v DESC LIMIT 20` | 337 µs | 9.09 ms | 11.3 ms | 90.6 ms | **27× faster** | 269× faster |
+| Whole-table count | 1 µs | 23.4 µs | 32 µs | 119 µs | **17× faster** | 89× faster |
+| Join projecting rows | 3 µs | 14.8 µs | 33 µs | 8 µs | **4.9× faster** | 2.7× faster |
 
 ## 1,000,000 rows
 
@@ -54,31 +59,31 @@ The scan multiples hold or grow with ten times the rows.
 
 **Apple M4** (arm64, macOS)
 
-| Query | musql | C native | Turso | vs C native |
-| --- | ---: | ---: | ---: | ---: |
-| Filtered count, one predicate | 248 µs | 23.0 ms | 60.7 ms | **93× faster** |
-| Filtered count, two predicates | 253 µs | 27.5 ms | 74.8 ms | **109× faster** |
-| Rowid lookup | 1 µs | 3.5 µs | 11 µs | **3.5× faster** |
-| Secondary-index equality | 3 µs | 3.5 µs | 12 µs | **1.2× faster** |
-| Indexed equi-join | 4 µs | 5.5 µs | 19 µs | **1.4× faster** |
-| Sum over a filter | 252 µs | 25.2 ms | 70.4 ms | **100× faster** |
-| Grouped aggregate | 1.60 ms | 157 ms | 414 ms | **98× faster** |
-| `ORDER BY v DESC LIMIT 20` | 209 µs | 27.1 ms | 293 ms | **130× faster** |
-| Whole-table count | <1 µs | 1.36 ms | 5.82 ms | **4,200× faster** |
+| Query | musql | C native | vs C native |
+| --- | ---: | ---: | ---: |
+| Filtered count, one predicate | 248 µs | 23.0 ms | **93× faster** |
+| Filtered count, two predicates | 253 µs | 27.5 ms | **109× faster** |
+| Rowid lookup | 1 µs | 3.5 µs | **3.5× faster** |
+| Secondary-index equality | 3 µs | 3.5 µs | **1.2× faster** |
+| Indexed equi-join | 4 µs | 5.5 µs | **1.4× faster** |
+| Sum over a filter | 252 µs | 25.2 ms | **100× faster** |
+| Grouped aggregate | 1.60 ms | 157 ms | **98× faster** |
+| `ORDER BY v DESC LIMIT 20` | 209 µs | 27.1 ms | **130× faster** |
+| Whole-table count | <1 µs | 1.36 ms | **4,200× faster** |
 
 **Intel Xeon D-2123IT** (amd64, Linux)
 
-| Query | musql | C native | Turso | vs C native |
-| --- | ---: | ---: | ---: | ---: |
-| Filtered count, one predicate | 438 µs | 60.0 ms | 207 ms | **137× faster** |
-| Filtered count, two predicates | 1.17 ms | 68.8 ms | 252 ms | **59× faster** |
-| Rowid lookup | 1 µs | 11.4 µs | 50 µs | **9× faster** |
-| Secondary-index equality | 7 µs | 11.2 µs | 51 µs | **1.6× faster** |
-| Indexed equi-join | 12 µs | 16.6 µs | 82 µs | **1.4× faster** |
-| Sum over a filter | 507 µs | 64.5 ms | 253 ms | **127× faster** |
-| Grouped aggregate | 3.98 ms | 396 ms | 1.32 s | **99× faster** |
-| `ORDER BY v DESC LIMIT 20` | 678 µs | 83.8 ms | 1.07 s | **124× faster** |
-| Whole-table count | 3 µs | 5.67 ms | 18.6 ms | **2,200× faster** |
+| Query | musql | C native | vs C native |
+| --- | ---: | ---: | ---: |
+| Filtered count, one predicate | 438 µs | 60.0 ms | **137× faster** |
+| Filtered count, two predicates | 1.17 ms | 68.8 ms | **59× faster** |
+| Rowid lookup | 1 µs | 11.4 µs | **9× faster** |
+| Secondary-index equality | 7 µs | 11.2 µs | **1.6× faster** |
+| Indexed equi-join | 12 µs | 16.6 µs | **1.4× faster** |
+| Sum over a filter | 507 µs | 64.5 ms | **127× faster** |
+| Grouped aggregate | 3.98 ms | 396 ms | **99× faster** |
+| `ORDER BY v DESC LIMIT 20` | 678 µs | 83.8 ms | **124× faster** |
+| Whole-table count | 3 µs | 5.67 ms | **2,200× faster** |
 
 ## Every shape the benchmark times
 
@@ -91,34 +96,34 @@ subqueries, compounds and pagination. Every one is JIT-compiled, and
 SQLite on all 26 shapes, and on the 4 single-row writes (7–8×, through
 `database/sql` against mattn/go-sqlite3).
 
-| Query | musql | C native | Turso | vs C native |
-| --- | ---: | ---: | ---: | ---: |
-| Filtered count, one predicate | 457 µs | 59.3 ms | 214 ms | **130× faster** |
-| Filtered count, two predicates | 1.18 ms | 68.1 ms | 254 ms | **58× faster** |
-| Rowid lookup | 2 µs | 11.2 µs | 45 µs | **5.6× faster** |
-| Secondary-index equality | 7 µs | 11.1 µs | 52 µs | **1.6× faster** |
-| Indexed equi-join | 12 µs | 16.6 µs | 82 µs | **1.4× faster** |
-| Sum over a filter | 500 µs | 63.8 ms | 257 ms | **128× faster** |
-| Grouped aggregate | 3.98 ms | 393 ms | 1.32 s | **99× faster** |
-| `ORDER BY v DESC LIMIT 20` | 676 µs | 83.2 ms | 1.06 s | **123× faster** |
-| Whole-table count | 9 µs | 5.53 ms | 19.1 ms | **614× faster** |
-| `min`/`max` whole table | 25 µs | 86.2 ms | 300 ms | **3,448× faster** |
-| Grouped `min`/`max` | 9.25 ms | 423 ms | 1.38 s | **46× faster** |
-| `GROUP BY ... HAVING` | 2.61 ms | 349 ms | 1.07 s | **134× faster** |
-| `OR` predicate | 5.07 ms | 67.0 ms | 247 ms | **13× faster** |
-| `BETWEEN` range | 600 µs | 64.1 ms | 274 ms | **107× faster** |
-| `IN` list | 11.0 ms | 109 ms | 283 ms | **9.9× faster** |
-| `IS NULL` scan | 1.52 ms | 57.0 ms | 178 ms | **38× faster** |
-| `LIKE` scan | 19.8 ms | 107 ms | 285 ms | **5.4× faster** |
-| `ORDER BY` text `LIMIT 20` | 57.9 ms | 93.7 ms | 489 ms | **1.6× faster** |
-| Grouped count, few groups | 9.77 ms | 132 ms | 407 ms | **14× faster** |
-| `DISTINCT` | 3.37 ms | 99.1 ms | 292 ms | **29× faster** |
-| Scalar subquery | 31.5 ms | 168 ms | 472 ms | **5.3× faster** |
-| `IN` subquery | 11.5 ms | 86.8 ms | 154 s | **7.5× faster** |
-| Correlated `EXISTS` | 11.2 ms | 2.15 s | 3.31 s | **192× faster** |
-| `UNION ALL` compound | 875 µs | 130 ms | 448 ms | **149× faster** |
-| `LIMIT 20 OFFSET 1000` | 6.55 ms | 92.3 ms | 1.07 s | **14× faster** |
-| Join projecting rows | 8 µs | 18.1 µs | 81 µs | **2.3× faster** |
+| Query | musql | C native | vs C native |
+| --- | ---: | ---: | ---: |
+| Filtered count, one predicate | 457 µs | 59.3 ms | **130× faster** |
+| Filtered count, two predicates | 1.18 ms | 68.1 ms | **58× faster** |
+| Rowid lookup | 2 µs | 11.2 µs | **5.6× faster** |
+| Secondary-index equality | 7 µs | 11.1 µs | **1.6× faster** |
+| Indexed equi-join | 12 µs | 16.6 µs | **1.4× faster** |
+| Sum over a filter | 500 µs | 63.8 ms | **128× faster** |
+| Grouped aggregate | 3.98 ms | 393 ms | **99× faster** |
+| `ORDER BY v DESC LIMIT 20` | 676 µs | 83.2 ms | **123× faster** |
+| Whole-table count | 9 µs | 5.53 ms | **614× faster** |
+| `min`/`max` whole table | 25 µs | 86.2 ms | **3,448× faster** |
+| Grouped `min`/`max` | 9.25 ms | 423 ms | **46× faster** |
+| `GROUP BY ... HAVING` | 2.61 ms | 349 ms | **134× faster** |
+| `OR` predicate | 5.07 ms | 67.0 ms | **13× faster** |
+| `BETWEEN` range | 600 µs | 64.1 ms | **107× faster** |
+| `IN` list | 11.0 ms | 109 ms | **9.9× faster** |
+| `IS NULL` scan | 1.52 ms | 57.0 ms | **38× faster** |
+| `LIKE` scan | 19.8 ms | 107 ms | **5.4× faster** |
+| `ORDER BY` text `LIMIT 20` | 57.9 ms | 93.7 ms | **1.6× faster** |
+| Grouped count, few groups | 9.77 ms | 132 ms | **14× faster** |
+| `DISTINCT` | 3.37 ms | 99.1 ms | **29× faster** |
+| Scalar subquery | 31.5 ms | 168 ms | **5.3× faster** |
+| `IN` subquery | 11.5 ms | 86.8 ms | **7.5× faster** |
+| Correlated `EXISTS` | 11.2 ms | 2.15 s | **192× faster** |
+| `UNION ALL` compound | 875 µs | 130 ms | **149× faster** |
+| `LIMIT 20 OFFSET 1000` | 6.55 ms | 92.3 ms | **14× faster** |
+| Join projecting rows | 8 µs | 18.1 µs | **2.3× faster** |
 
 ## Vector search
 

@@ -8,21 +8,24 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
-// The native-C baseline. mattn-C reaches SQLite from Go through cgo and
-// database/sql, which costs microseconds per statement: invisible on a scan,
-// most of the time on a point lookup. testdata/nativebench/cbench.c runs the
-// same workloads, data and bind values straight against the SQLite C API, so
-// "faster than C SQLite" can mean the C library itself.
+// The native baselines. mattn-C reaches SQLite from Go through cgo and
+// database/sql, and tursogo reaches Turso through purego and database/sql --
+// re-preparing the statement on every query, even a prepared *sql.Stmt's.
+// Either costs microseconds per statement: invisible on a scan, most of the
+// time on a point lookup. testdata/nativebench holds two C programs that run
+// the same workloads, data and bind values straight against each library's C
+// API, so "faster than C SQLite" or "than Turso" means the library itself.
 //
-// It is built from the amalgamation mattn bundles -- the oracle's exact
-// SQLite (3.53.3) -- with mattn's compile options, so the only thing that
-// differs from the mattn-C arm is the path from the caller to sqlite3_step.
+// cbench is built from the amalgamation mattn bundles -- the oracle's exact
+// SQLite (3.53.3) -- with mattn's compile options. tbench links the Rust
+// library tursogo loads, from the same module version.
 
 // nativeArgSets is how many bind-value sets each workload hands the C side,
 // cycled through by its timing loop: the start of the same seeded sequence the
@@ -34,36 +37,86 @@ type nativeWorkload struct {
 	args      func(*rand.Rand) []any
 }
 
-// nativeCTimes returns each workload's per-query time from the C harness, or
-// nil (with the reason logged) when no C compiler is available.
-func nativeCTimes(t *testing.T, dbPath string, ws []nativeWorkload) map[string]time.Duration {
+// nativeResult is one workload's per-query time and the checksum of the values
+// its first bind set read, which two libraries agree on when they answered the
+// same rows.
+type nativeResult struct {
+	d   time.Duration
+	sum string
+}
+
+// nativeCTimes times the workloads through the SQLite C API, or returns nil
+// (with the reason logged) when no C compiler is available.
+func nativeCTimes(t *testing.T, dbPath string, ws []nativeWorkload) map[string]nativeResult {
+	t.Helper()
+	src := moduleDir(t, "github.com/mattn/go-sqlite3")
+	return runNative(t, "cbench", dbPath, ws, "-I", src,
+		"-DSQLITE_ENABLE_RTREE", "-DSQLITE_THREADSAFE=1", "-DHAVE_USLEEP=1",
+		"-DSQLITE_ENABLE_FTS3", "-DSQLITE_ENABLE_FTS3_PARENTHESIS",
+		"-DSQLITE_OMIT_DEPRECATED", "-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1",
+		"-DSQLITE_ENABLE_UPDATE_DELETE_LIMIT", "-Wno-deprecated-declarations",
+		"testdata/nativebench/cbench.c", filepath.Join(src, "sqlite3-binding.c"),
+		"-lpthread", "-lm", "-ldl")
+}
+
+// nativeTursoTimes times the workloads through Turso's C API, or returns nil
+// (with the reason logged) when there is no C compiler or no prebuilt library
+// for this platform.
+func nativeTursoTimes(t *testing.T, dbPath string, ws []nativeWorkload) map[string]nativeResult {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Logf("native Turso baseline skipped on windows")
+		return nil
+	}
+	lib := filepath.Join(moduleDir(t, "github.com/tursodatabase/turso-go-platform-libs"), "libs", runtime.GOOS+"_"+runtime.GOARCH)
+	if _, err := os.Stat(lib); err != nil {
+		t.Logf("native Turso baseline skipped: %v", err)
+		return nil
+	}
+	// Turso locks its file exclusively and the Go arm still holds it, so the
+	// harness reads a copy, its WAL included.
+	cp := filepath.Join(t.TempDir(), "turso.db")
+	for _, suffix := range []string{"", "-wal"} {
+		b, err := os.ReadFile(dbPath + suffix)
+		if os.IsNotExist(err) && suffix != "" {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(cp+suffix, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return runNative(t, "tbench", cp, ws, "testdata/nativebench/tbench.c",
+		"-L", lib, "-lturso_sync_sdk_kit", "-Wl,-rpath,"+lib, "-lpthread", "-lm", "-ldl")
+}
+
+func moduleDir(t *testing.T, mod string) string {
+	t.Helper()
+	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", mod).Output()
+	if err != nil {
+		t.Fatalf("locating %s: %v", mod, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func runNative(t *testing.T, name, dbPath string, ws []nativeWorkload, ccArgs ...string) map[string]nativeResult {
 	t.Helper()
 	cc := os.Getenv("CC")
 	if cc == "" {
 		cc = "cc"
 	}
 	if _, err := exec.LookPath(cc); err != nil {
-		t.Logf("native C baseline skipped: no C compiler (%v)", err)
+		t.Logf("native %s skipped: no C compiler (%v)", name, err)
 		return nil
 	}
-	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/mattn/go-sqlite3").Output()
-	if err != nil {
-		t.Fatalf("locating mattn's SQLite source: %v", err)
-	}
-	src := strings.TrimSpace(string(out))
 	dir := t.TempDir()
-	bin := filepath.Join(dir, "cbench")
-	// Header from mattn's tree, and the program compiled together with its
-	// amalgamation: one translation unit per file, -O2 as cgo uses.
-	build := exec.Command(cc, "-O2", "-std=gnu99", "-I", src,
-		"-DSQLITE_ENABLE_RTREE", "-DSQLITE_THREADSAFE=1", "-DHAVE_USLEEP=1",
-		"-DSQLITE_ENABLE_FTS3", "-DSQLITE_ENABLE_FTS3_PARENTHESIS",
-		"-DSQLITE_OMIT_DEPRECATED", "-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1",
-		"-DSQLITE_ENABLE_UPDATE_DELETE_LIMIT", "-Wno-deprecated-declarations",
-		"-o", bin, "testdata/nativebench/cbench.c", filepath.Join(src, "sqlite3-binding.c"),
-		"-lpthread", "-lm", "-ldl")
+	bin := filepath.Join(dir, name)
+	// -O2 as cgo uses.
+	build := exec.Command(cc, append([]string{"-O2", "-std=gnu99", "-o", bin}, ccArgs...)...)
 	if msg, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("building the native C harness: %v\n%s", err, msg)
+		t.Fatalf("building %s: %v\n%s", name, err, msg)
 	}
 
 	var spec bytes.Buffer
@@ -82,19 +135,25 @@ func nativeCTimes(t *testing.T, dbPath string, ws []nativeWorkload) map[string]t
 	if err := os.WriteFile(specPath, spec.Bytes(), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	res, err := exec.Command(bin, dbPath, specPath).Output()
+	var stderr bytes.Buffer
+	cmd := exec.Command(bin, dbPath, specPath)
+	cmd.Stderr = &stderr
+	res, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("native C harness: %v", err)
+		t.Fatalf("%s: %v\n%s", name, err, stderr.Bytes())
 	}
-	times := map[string]time.Duration{}
+	out := map[string]nativeResult{}
 	sc := bufio.NewScanner(bytes.NewReader(res))
 	for sc.Scan() {
-		name, ns, ok := strings.Cut(sc.Text(), "\t")
-		n, err := strconv.ParseInt(ns, 10, 64)
-		if !ok || err != nil {
-			t.Fatalf("native C harness output %q", sc.Text())
+		f := strings.Split(sc.Text(), "\t")
+		if len(f) != 3 {
+			t.Fatalf("%s output %q", name, sc.Text())
 		}
-		times[name] = time.Duration(n)
+		n, err := strconv.ParseInt(f[1], 10, 64)
+		if err != nil {
+			t.Fatalf("%s output %q", name, sc.Text())
+		}
+		out[f[0]] = nativeResult{time.Duration(n), f[2]}
 	}
-	return times
+	return out
 }
