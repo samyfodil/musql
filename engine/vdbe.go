@@ -83,12 +83,15 @@ type vdbe struct {
 	// OpAggStep, read by OpAggResult. nil for a program with no aggregates.
 	aggAccs *aggAccumulators
 
-	// colMasks is the per-cursor column mask cursorColumnMasks derived from this
-	// program, memoized on first OpOpenRead; colMasksDone distinguishes "not
-	// derived yet" from the nil the derivation returns when it declines to
-	// narrow anything.
+	// colMasks is the per-cursor column mask cursorColumnMasks derived from the
+	// instructions colMasksOf names (colMasksN of them, over colMasksCurs
+	// cursors), memoized on first OpOpenRead. It survives the machine's return
+	// to the pool, so a program run again on it skips the walk; holding the
+	// instructions keeps their address from being reused by another program.
 	colMasks     []columnMask
-	colMasksDone bool
+	colMasksOf   *Instruction
+	colMasksN    int
+	colMasksCurs int
 
 	// aggRowBuf/aggRowidBuf are gatherCursorRow's reusable per-row buffers --
 	// see its doc comment for why reuse is safe here.
@@ -1313,12 +1316,14 @@ func readsWholeCursorRows(op OpCode) bool {
 }
 
 // cursorMask returns cursor c's column mask, deriving every cursor's mask from
-// insns on first use (once per execution -- a walk of a program that is about
-// to scan a whole table).
+// insns the first time this machine runs them.
 func (m *vdbe) cursorMask(insns []Instruction, c int) columnMask {
-	if !m.colMasksDone {
+	if len(insns) == 0 {
+		return allColumns
+	}
+	if m.colMasksOf != &insns[0] || m.colMasksN != len(insns) || m.colMasksCurs != len(m.cursors) {
 		m.colMasks = cursorColumnMasks(insns, len(m.cursors))
-		m.colMasksDone = true
+		m.colMasksOf, m.colMasksN, m.colMasksCurs = &insns[0], len(insns), len(m.cursors)
 	}
 	if c < 0 || c >= len(m.colMasks) {
 		return allColumns

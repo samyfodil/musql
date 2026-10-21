@@ -107,6 +107,9 @@ func (prog *Program) putMachine(m *vdbe) { prog.putMachineTo(m, nil) }
 // The machine is scrubbed the same way either way.
 func (prog *Program) putMachineTo(m *vdbe, spare **vdbe) {
 	regs, cursors, recRegs := m.regs, m.cursors, m.recRegs[:cap(m.recRegs)]
+	// The column masks, a pure function of the instructions they are tagged
+	// with (cursorMask), kept as they are.
+	masks, masksOf, masksN, masksCurs := m.colMasks, m.colMasksOf, m.colMasksN, m.colMasksCurs
 	clear(regs)
 	clear(recRegs)
 	// The cursor SHELLS are kept and their CONTENTS dropped. Keeping them saves
@@ -158,6 +161,7 @@ func (prog *Program) putMachineTo(m *vdbe, spare **vdbe) {
 	*m = vdbe{}
 	m.regs, m.cursors, m.recRegs, m.subCache, m.jcur, m.jsnap = regs, cursors, recRegs, sub[:0], jcur, jsnap
 	m.aggVM, m.aggCtx, m.aggNullRow = agg, actx, nullRow
+	m.colMasks, m.colMasksOf, m.colMasksN, m.colMasksCurs = masks, masksOf, masksN, masksCurs
 	if spare != nil && *spare == nil {
 		*spare = m
 		return
