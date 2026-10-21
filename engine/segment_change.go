@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
+	"github.com/samyfodil/musql/internal/fsio"
 	"github.com/samyfodil/musql/internal/mmapfile"
 )
 
@@ -82,7 +83,7 @@ func storeChangeWord(segPath string, f *os.File, v uint64) error {
 	}
 	var b [8]byte
 	binary.LittleEndian.PutUint64(b[:], v)
-	_, err := f.WriteAt(b[:], changeWordOff)
+	_, err := fsio.WriteAt(f, b[:], changeWordOff)
 	return err
 }
 
