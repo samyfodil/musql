@@ -237,3 +237,16 @@ a browser (its cost there is several times what Node measures).
 aggregate path, even on a clean table (15 ms at 100k rows, against 0.1 ms
 without the subquery). An uncorrelated scalar subquery there is a constant;
 the recognizer should let it through.
+
+## Point reads through database/sql against native Turso
+
+Through its engine API musql beats Turso's C API on every benchmark workload
+(`TestBenchColumnarVsC`). Through `database/sql` it does not yet on three:
+the rowid lookup (4 µs against 2.7 µs at 100k rows on amd64), the
+secondary-index equality (6 µs against 4.2 µs) and the indexed equi-join
+(10 µs against 8 µs). `database/sql` alone costs about 1.7 µs a query over a
+driver that does nothing, so the driver cannot close this by itself: the
+engine has to get faster on these shapes, the join below 6 µs and the rowid
+lookup below 1 µs, while the driver keeps trimming its own per-query work
+(`driver.BenchmarkLayers` separates the two). Done means all three faster
+than Turso native through a prepared `*sql.Stmt`, with the gates green.

@@ -80,6 +80,7 @@ type Rows struct {
 	cols []string
 	rows [][]engine.Value
 	pos  int
+	slab valueSlab
 
 	// timeCols and loc are set for connections whose DSN asks for time coercion.
 	// timeCols[i] true means column i's DECLARED type should convert to time.Time.
@@ -114,6 +115,10 @@ func (r *Rows) Next(dest []driver.Value) error {
 	if r.pos >= len(r.rows) {
 		return io.EOF
 	}
+	if r.slab.left == 0 {
+		r.slab.fill(r.rows[r.pos:])
+	}
+	r.slab.left--
 	row := r.rows[r.pos]
 	r.pos++
 	for i, v := range row {
@@ -123,7 +128,7 @@ func (r *Rows) Next(dest []driver.Value) error {
 				continue
 			}
 		}
-		dest[i] = engineValueToDriver(v)
+		dest[i] = r.slab.value(v)
 	}
 	return nil
 }
