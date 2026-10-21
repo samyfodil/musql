@@ -150,6 +150,7 @@ func TestBenchColumnarVsC(t *testing.T) {
 		name              string
 		mushCol, mushDrv  time.Duration
 		c, cNative, turso time.Duration
+		tNative           time.Duration
 		tursoErr          string
 		duck1, duckN      time.Duration
 		duckErr           string
@@ -446,9 +447,30 @@ func TestBenchColumnarVsC(t *testing.T) {
 			natives = append(natives, nativeWorkload{w.name, w.sql, w.args})
 		}
 	}
-	if native := nativeCTimes(t, cee.path, natives); native != nil {
+	cNative := nativeCTimes(t, cee.path, natives)
+	for i := range rows {
+		rows[i].cNative = cNative[rows[i].name].d
+	}
+	// Turso's library, the same way, on the workloads its driver answered. Its
+	// checksum must equal C's: a disagreement is reported, as for its driver.
+	var tnatives []nativeWorkload
+	for i, w := range natives {
+		if tdb != nil && rows[i].tursoErr == "" {
+			tnatives = append(tnatives, w)
+		}
+	}
+	if len(tnatives) > 0 {
+		tNative := nativeTursoTimes(t, trs.path, tnatives)
 		for i := range rows {
-			rows[i].cNative = native[rows[i].name]
+			tr, ok := tNative[rows[i].name]
+			if !ok {
+				continue
+			}
+			if c, ok := cNative[rows[i].name]; ok && c.sum != tr.sum {
+				t.Logf("turso native %s: read different values than C", rows[i].name)
+				continue
+			}
+			rows[i].tNative = tr.d
 		}
 	}
 
@@ -456,7 +478,7 @@ func TestBenchColumnarVsC(t *testing.T) {
 		benchN, musqlengine.JITEnabled())
 	t.Logf("segments laid out by VACUUM in %s", vacDur.Round(time.Millisecond))
 	t.Logf("%-32s | %12s | %12s | %12s | %12s | %12s | %13s | %11s | %11s", "workload",
-		"musql+JIT", "musql drv", "C native", "mattn-C", "turso-rust",
+		"musql+JIT", "musql drv", "C native", "mattn-C", "turso native",
 		"vs C native", "vs mattn-C", "vs turso")
 	t.Logf("%s", "-----------------------------------------------------------------------------------------------------------------------------------")
 	for _, r := range rows {
@@ -465,9 +487,10 @@ func TestBenchColumnarVsC(t *testing.T) {
 			mark = "  (VDBE, not the JIT)"
 		}
 		tursoCell, vsTurso := r.tursoErr, "n/a"
-		if r.tursoErr == "" {
-			tursoCell = r.turso.Round(time.Microsecond).String()
-			vsTurso = speedup(r.turso, r.mushCol)
+		if r.tNative > 0 {
+			tursoCell, vsTurso = r.tNative.Round(100*time.Nanosecond).String(), speedup(r.tNative, r.mushCol)
+		} else if r.tursoErr == "" {
+			tursoCell, vsTurso = "n/a", "n/a"
 		}
 		nativeCell, vsNative := "n/a", "n/a"
 		if r.cNative > 0 {
@@ -479,6 +502,22 @@ func TestBenchColumnarVsC(t *testing.T) {
 			tursoCell, vsNative, speedup(r.c, r.mushCol), vsTurso, mark)
 	}
 	t.Logf("the vs-X columns are how many times FASTER musql+JIT is than X.")
+	t.Logf("")
+	t.Logf("The same engines through database/sql (tursogo re-prepares every query)")
+	t.Logf("%-32s | %12s | %12s | %12s | %12s | %12s", "workload",
+		"musql+JIT", "musql drv", "turso native", "turso drv", "drv overhead")
+	for _, r := range rows {
+		tn, td := "n/a", r.tursoErr
+		if r.tNative > 0 {
+			tn = r.tNative.Round(100 * time.Nanosecond).String()
+		}
+		if r.tursoErr == "" {
+			td = r.turso.Round(time.Microsecond).String()
+		}
+		t.Logf("%-32s | %12s | %12s | %12s | %12s | %12s", r.name,
+			r.mushCol.Round(time.Microsecond), r.mushDrv.Round(time.Microsecond),
+			tn, td, (r.mushDrv - r.mushCol).Round(100*time.Nanosecond))
+	}
 
 	// DuckDB, a different class of engine: a reference, not a headline.
 	t.Logf("")
