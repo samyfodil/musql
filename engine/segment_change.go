@@ -96,6 +96,11 @@ type changeWord struct {
 // "mapping" would be a copy (mmapfile reads the file there), which would never
 // see another connection's store.
 func mapChangeWord(segPath string) *changeWord {
+	// Where nothing maps, Open reads the whole file to answer nil, and a
+	// session without a word asks again at every commit.
+	if !mmapfile.CanMapAt {
+		return nil
+	}
 	m, err := mmapfile.Open(segPath + segmentLockSuffix)
 	if err != nil {
 		return nil
