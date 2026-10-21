@@ -74,7 +74,7 @@ The scan multiples hold or grow with ten times the rows.
 | Filtered count, two predicates | 1.17 ms | 68.8 ms | 252 ms | **59× faster** |
 | Rowid lookup | 1 µs | 11.4 µs | 50 µs | **9× faster** |
 | Secondary-index equality | 7 µs | 11.2 µs | 51 µs | **1.6× faster** |
-| Indexed equi-join | 15 µs | 17 µs | 96 µs | **1.1× faster** |
+| Indexed equi-join | 12 µs | 16.6 µs | 82 µs | **1.4× faster** |
 | Sum over a filter | 507 µs | 64.5 ms | 253 ms | **127× faster** |
 | Grouped aggregate | 3.98 ms | 396 ms | 1.32 s | **99× faster** |
 | `ORDER BY v DESC LIMIT 20` | 678 µs | 83.8 ms | 1.07 s | **124× faster** |
