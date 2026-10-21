@@ -167,79 +167,76 @@ func TestBenchColumnarVsC(t *testing.T) {
 		name string
 		sql  string
 		args func(rng *rand.Rand) []any
-		jit  bool // the recogniser is expected to answer this one
 	}{
 		// Shapes the JIT answers.
 		{"count(*) WHERE v > ?", "SELECT count(*) FROM t WHERE v > ?",
-			func(rng *rand.Rand) []any { return []any{rng.Intn(1_000_000)} }, true},
+			func(rng *rand.Rand) []any { return []any{rng.Intn(1_000_000)} }},
 		{"count(*) WHERE v > ? AND k <> ?", "SELECT count(*) FROM t WHERE v > ? AND k <> ?",
-			func(rng *rand.Rand) []any { return []any{rng.Intn(1_000_000), rng.Intn(10)} }, true},
-		// Shapes it does NOT, kept in the same table so the breadth limit is
-		// visible rather than argued about.
+			func(rng *rand.Rand) []any { return []any{rng.Intn(1_000_000), rng.Intn(10)} }},
+		// Seeks: native code reads the rows the seek positions.
 		{"rowid point lookup", "SELECT sec FROM t WHERE id = ?",
-			func(rng *rand.Rand) []any { return []any{1 + rng.Intn(benchN)} }, false},
+			func(rng *rand.Rand) []any { return []any{1 + rng.Intn(benchN)} }},
 		// Served by the JIT since the recogniser learned to skip
 		// OpAutoIndexOrder -- an index on the column used to be enough to lose
 		// the fast path.
 		{"secondary-index eq", "SELECT count(*) FROM t WHERE sec = ?",
-			func(rng *rand.Rand) []any { return []any{rng.Intn(benchN)} }, true},
+			func(rng *rand.Rand) []any { return []any{rng.Intn(benchN)} }},
 		{"indexed equi-join", "SELECT count(*) FROM t JOIN b ON t.bid = b.id WHERE t.sec = ?",
-			func(rng *rand.Rand) []any { return []any{rng.Intn(benchN)} }, false},
+			func(rng *rand.Rand) []any { return []any{rng.Intn(benchN)} }},
 		// sum(<column>) is answered from the segments.
 		{"sum over a filter", "SELECT sum(v) FROM t WHERE v > ?",
-			func(rng *rand.Rand) []any { return []any{rng.Intn(1_000_000)} }, true},
+			func(rng *rand.Rand) []any { return []any{rng.Intn(1_000_000)} }},
 		// Driven from the columnar blocks, reusing the ordinary aggregation and
 		// drain (segment_group.go).
 		{"aggregate GROUP BY", "SELECT k, count(*), sum(v) FROM t GROUP BY k ORDER BY k",
-			func(rng *rand.Rand) []any { return nil }, true},
+			func(rng *rand.Rand) []any { return nil }},
 		// Bounded top-N over the int64 key blocks, with no record decode.
 		{"ORDER BY v DESC LIMIT 20", "SELECT id, v FROM t ORDER BY v DESC, id DESC LIMIT 20",
-			func(rng *rand.Rand) []any { return nil }, true},
+			func(rng *rand.Rand) []any { return nil }},
 		// Zero predicates: answered from the segments' recorded row counts.
 		{"count(*) whole table", "SELECT count(*) FROM t",
-			func(rng *rand.Rand) []any { return nil }, true},
+			func(rng *rand.Rand) []any { return nil }},
 
 		// ---- Shapes beyond the columnar filters. ----
 		//
 		// These exist so the table is evidence rather than a showcase: min/max,
 		// HAVING, predicates the filter kernels do not model, TEXT, DISTINCT,
-		// subqueries, compounds and pagination. The JIT answers every one, and
-		// the flag holds it to that.
+		// subqueries, compounds and pagination. The JIT answers every one.
 		{"min/max whole table", "SELECT min(v), max(v) FROM t",
-			func(rng *rand.Rand) []any { return nil }, true},
+			func(rng *rand.Rand) []any { return nil }},
 		{"grouped min/max", "SELECT k, min(v), max(v) FROM t GROUP BY k ORDER BY k",
-			func(rng *rand.Rand) []any { return nil }, true},
+			func(rng *rand.Rand) []any { return nil }},
 		{"GROUP BY with HAVING", "SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > ? ORDER BY k",
-			func(rng *rand.Rand) []any { return []any{5000 + rng.Intn(100)} }, true},
+			func(rng *rand.Rand) []any { return []any{5000 + rng.Intn(100)} }},
 		{"OR predicate", "SELECT count(*) FROM t WHERE v > ? OR k = ?",
-			func(rng *rand.Rand) []any { return []any{rng.Intn(1_000_000), rng.Intn(10)} }, true},
+			func(rng *rand.Rand) []any { return []any{rng.Intn(1_000_000), rng.Intn(10)} }},
 		{"BETWEEN range", "SELECT count(*) FROM t WHERE v BETWEEN ? AND ?",
-			func(rng *rand.Rand) []any { n := rng.Intn(500_000); return []any{n, n + 250_000} }, true},
+			func(rng *rand.Rand) []any { n := rng.Intn(500_000); return []any{n, n + 250_000} }},
 		{"IN list", "SELECT count(*) FROM t WHERE k IN (1,3,5,7)",
-			func(rng *rand.Rand) []any { return nil }, true},
+			func(rng *rand.Rand) []any { return nil }},
 		{"IS NULL scan", "SELECT count(*) FROM t WHERE payload IS NULL",
-			func(rng *rand.Rand) []any { return nil }, true},
+			func(rng *rand.Rand) []any { return nil }},
 		{"LIKE scan", "SELECT count(*) FROM t WHERE payload LIKE '%-7-payload'",
-			func(rng *rand.Rand) []any { return nil }, true},
+			func(rng *rand.Rand) []any { return nil }},
 		{"ORDER BY text LIMIT", "SELECT id, payload FROM t ORDER BY payload DESC, id DESC LIMIT 20",
-			func(rng *rand.Rand) []any { return nil }, true},
+			func(rng *rand.Rand) []any { return nil }},
 		{"group_concat", "SELECT k, count(*) FROM t WHERE k < 3 GROUP BY k ORDER BY k",
-			func(rng *rand.Rand) []any { return nil }, true},
+			func(rng *rand.Rand) []any { return nil }},
 		{"DISTINCT scan", "SELECT count(*) FROM (SELECT DISTINCT k FROM t)",
-			func(rng *rand.Rand) []any { return nil }, true},
+			func(rng *rand.Rand) []any { return nil }},
 		{"scalar subquery", "SELECT count(*) FROM t WHERE v > (SELECT avg(v) FROM t)",
-			func(rng *rand.Rand) []any { return nil }, true},
+			func(rng *rand.Rand) []any { return nil }},
 		{"IN subquery", "SELECT count(*) FROM t WHERE bid IN (SELECT id FROM b WHERE id < ?)",
-			func(rng *rand.Rand) []any { return []any{1 + rng.Intn(1000)} }, true},
+			func(rng *rand.Rand) []any { return []any{1 + rng.Intn(1000)} }},
 		{"EXISTS correlated", "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.id = t.bid AND b.id < ?)",
-			func(rng *rand.Rand) []any { return []any{1 + rng.Intn(1000)} }, true},
+			func(rng *rand.Rand) []any { return []any{1 + rng.Intn(1000)} }},
 		{"UNION ALL compound", "SELECT count(*) FROM (SELECT k FROM t WHERE k < 3 UNION ALL SELECT k FROM t WHERE k > 7)",
-			func(rng *rand.Rand) []any { return nil }, true},
+			func(rng *rand.Rand) []any { return nil }},
 		{"paginate OFFSET", "SELECT id, v FROM t ORDER BY v DESC, id DESC LIMIT 20 OFFSET 1000",
-			func(rng *rand.Rand) []any { return nil }, true},
+			func(rng *rand.Rand) []any { return nil }},
 		// A join returning ROWS rather than a count.
 		{"join projecting rows", "SELECT t.id, b.id FROM t JOIN b ON t.bid = b.id WHERE t.sec = ?",
-			func(rng *rand.Rand) []any { return []any{rng.Intn(benchN)} }, false},
+			func(rng *rand.Rand) []any { return []any{rng.Intn(benchN)} }},
 	}
 
 	timeDirect := func(rp *musqlengine.ReadOnlyPager, q string, gen func(*rand.Rand) []any) time.Duration {
@@ -301,6 +298,8 @@ func TestBenchColumnarVsC(t *testing.T) {
 		return time.Since(start) / time.Duration(n)
 	}
 
+	musqlengine.CountVMJITCursorEntersForTest(true)
+	defer musqlengine.CountVMJITCursorEntersForTest(false)
 	var rows []row
 	for _, w := range workloads {
 		if benchSkipped(w.name) {
@@ -316,28 +315,19 @@ func TestBenchColumnarVsC(t *testing.T) {
 			t.Fatalf("compile %q: %v", w.sql, jerr)
 		}
 		// The opcode being PRESENT is not the claim; the claim is that it
-		// answered. Count what the columnar arm actually did.
+		// answered. Count what the columnar kernels and the whole-program JIT
+		// actually did: a kernel that served without handing back, or native
+		// code that read the rows. Every workload must be one or the other, or
+		// the row below is a VDBE time printed under a JIT label.
 		musqlengine.ResetSegFilterCountersForTest()
+		musqlengine.VMJITCursorEntersForTest()
 		cl := timeDirect(colr, w.sql, w.args)
 		served, declined := musqlengine.SegFilterCountersForTest()
-		// ASYMMETRIC, and it took five false alarms to get here. A shape the
-		// recogniser claims must have served, or the row below is a VDBE time
-		// printed under a JIT label -- that is a regression and it fails.
-		//
-		// A shape it does not claim which NOW serves is the opposite: the
-		// recogniser got wider, which is the work. This used to fail for that
-		// too, on the theory that a quiet widening is how a wrong answer
-		// arrives faster. It is not: correctness is the differential's job and
-		// the corpus's, both of which compare ANSWERS, and neither has ever
-		// needed this flag to do it. What this failure actually did was kill a
-		// two-hour benchmark run every time the JIT improved. So it reports.
-		if w.jit && (served == 0 || declined != 0) {
-			t.Errorf("%s: expected the JIT to answer it, got served=%d declined=%d",
-				w.name, served, declined)
-		}
-		if !w.jit && served != 0 {
-			t.Logf("NOTE %s: the JIT now answers this shape (served=%d) -- flip its flag",
-				w.name, served)
+		native := musqlengine.VMJITCursorEntersForTest()
+		jitted := served > 0 && declined == 0 || native > 0
+		if !jitted {
+			t.Errorf("%s: expected the JIT to answer it, got served=%d declined=%d native=%d",
+				w.name, served, declined, native)
 		}
 		td, terr := timeDriverSoft(tdb, w.sql, w.args)
 		var d1, dN time.Duration
@@ -360,7 +350,7 @@ func TestBenchColumnarVsC(t *testing.T) {
 			c:        timeDriver(cdb, w.sql, w.args),
 			turso:    td,
 			tursoErr: terr,
-			jitted:   served > 0 && declined == 0,
+			jitted:   jitted,
 		})
 	}
 
