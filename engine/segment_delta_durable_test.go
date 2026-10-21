@@ -82,8 +82,9 @@ func TestSegmentDeltaEmptyBatchIsNotHistory(t *testing.T) {
 // makes its directory entry durable; later appends need not.
 func TestSegmentDeltaCreateSyncsDirectory(t *testing.T) {
 	segPath := deltaFixture(t, 6)
-	// The VACUUM left a written-ahead tail; without one, the commit creates it.
-	if err := os.Remove(segDeltaPath(segPath)); err != nil {
+	// The VACUUM left a written-ahead tail (none on js, deltaTailWanted);
+	// without one, the commit creates it.
+	if err := os.Remove(segDeltaPath(segPath)); err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
 	}
 	var calls int
