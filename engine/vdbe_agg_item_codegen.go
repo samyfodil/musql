@@ -525,9 +525,11 @@ func (p *aggItemProgram) run(m *vdbe, aggVals, groupKey, bareVals, bareRowids []
 // m.wctx (write state an item must never see).
 func (m *vdbe) aggItemVM(prog *Program) *vdbe {
 	if m.aggVM == nil {
-		m.aggVM = &vdbe{pager: m.pager, params: m.params}
+		m.aggVM = &vdbe{}
 	}
 	vm := m.aggVM
+	// Set on every acquisition: the shell outlives its statement (putMachineTo).
+	vm.pager, vm.params = m.pager, m.params
 	// The enclosing query's evalCtx, for the ONE thing an item program reads it
 	// for: a connection-state function's source (connStateValue, conn_state.go),
 	// which resolves through exactly this chain. Nothing

@@ -133,11 +133,31 @@ func (prog *Program) putMachineTo(m *vdbe, spare **vdbe) {
 		clear(sn.rows[:cap(sn.rows)])
 		*sn = jitSnap{row: sn.row[:0], slab: sn.slab[:0], rows: sn.rows[:0], rids: sn.rids[:0]}
 	}
+	// The aggregate item machine's shell too (aggItemVM), scrubbed like this one
+	// with its register file and sub-cache kept: it was a 1 KB allocation of
+	// every aggregate query.
+	agg := m.aggVM
+	if agg != nil {
+		ar, as := agg.regs[:cap(agg.regs)], agg.subCache[:cap(agg.subCache)]
+		clear(ar)
+		clear(as)
+		*agg = vdbe{regs: ar[:0], subCache: as[:0]}
+	}
+	// And the aggregate row context's shell (aggRowCtx), which every use
+	// rebuilds whole.
+	actx := m.aggCtx
+	if actx != nil {
+		*actx = evalCtx{}
+	}
+	// The all-NULL row a row-free aggregate step hands on (aggNullRow), cleared.
+	nullRow := m.aggNullRow[:cap(m.aggNullRow)]
+	clear(nullRow)
 	// Zeroed in place, then the kept slices put back: the same machine as the
 	// composite literal this was, without building that 1 KB literal and
 	// copying it over -- most of what returning a machine cost per statement.
 	*m = vdbe{}
 	m.regs, m.cursors, m.recRegs, m.subCache, m.jcur, m.jsnap = regs, cursors, recRegs, sub[:0], jcur, jsnap
+	m.aggVM, m.aggCtx, m.aggNullRow = agg, actx, nullRow
 	if spare != nil && *spare == nil {
 		*spare = m
 		return

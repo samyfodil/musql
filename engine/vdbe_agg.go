@@ -206,6 +206,9 @@ type aggAccumulators struct {
 	anchorVals   []Value
 	anchorRowids []Value
 	haveAnchor   bool
+	// rowFree is the plan's (aggPlan.rowFree): nothing reads the anchor, so it
+	// is not copied.
+	rowFree bool
 
 	// magnetHit is M, SQLite's regHit. It is a REGISTER, so it survives from
 	// one scanned row to the next: a row on which every census site is jumped
@@ -280,8 +283,12 @@ func (a *aggAccumulators) magnetWalk(ctx *evalCtx, regs []Value) error {
 	if a.magnetHit {
 		return nil
 	}
-	a.anchorVals = cloneValues(ctx.vals)
-	a.anchorRowids = cloneValues(ctx.rowids)
+	if a.rowFree {
+		a.anchorVals, a.anchorRowids = ctx.vals, ctx.rowids
+	} else {
+		a.anchorVals = cloneValues(ctx.vals)
+		a.anchorRowids = cloneValues(ctx.rowids)
+	}
 	a.haveAnchor = true
 	return nil
 }
@@ -302,7 +309,7 @@ func (a *aggAccumulators) anchorRow(plan *aggPlan) (vals, rowids []Value) {
 // newAggAccs clones a fresh accumulator set from plan's item templates
 // (cloneAggTemplates) for a new group.
 func newAggAccs(plan *aggPlan) *aggAccumulators {
-	a := &aggAccumulators{out: make([][]*aggItem, len(plan.outPlans)), check: plan.anchorCheck}
+	a := &aggAccumulators{out: make([][]*aggItem, len(plan.outPlans)), check: plan.anchorCheck, rowFree: plan.rowFree}
 	for i, it := range plan.outPlans {
 		a.out[i] = cloneAggTemplates(it.aggTemplates)
 	}
