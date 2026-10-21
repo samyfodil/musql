@@ -25,10 +25,11 @@ package main
 
 import (
 	"context"
-	"database/sql"
+	sqldriver "database/sql/driver"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"io"
 	"math"
 	"strconv"
 	"syscall/js"
@@ -40,9 +41,41 @@ import (
 	"github.com/samyfodil/musql/engine"
 )
 
+// conn is the driver's connection itself, not a database/sql pool over it:
+// one handle runs its statements in order on one connection, as a SQLite
+// connection does, and the pool's bookkeeping was a third of a point lookup.
 type conn struct {
-	db    *sql.DB
-	stmts map[string]*sql.Stmt
+	c     *driver.Conn
+	stmts map[string]*driver.Stmt
+}
+
+// stmtsMax bounds a handle's prepared statements: a page that sends many
+// distinct texts drops them all and starts over.
+const stmtsMax = 256
+
+// stmt returns q's prepared statement, preparing it on first use. A statement
+// keeps its argument buffers between runs, which a fresh one allocates.
+func (c *conn) stmt(q string) (*driver.Stmt, error) {
+	if st := c.stmts[q]; st != nil {
+		return st, nil
+	}
+	ds, err := c.c.Prepare(q)
+	if err != nil {
+		return nil, err
+	}
+	if len(c.stmts) >= stmtsMax {
+		c.closeStmts()
+	}
+	st := ds.(*driver.Stmt)
+	c.stmts[q] = st
+	return st, nil
+}
+
+func (c *conn) closeStmts() {
+	for q, st := range c.stmts {
+		st.Close()
+		delete(c.stmts, q)
+	}
 }
 
 var (
@@ -75,41 +108,25 @@ func musqlOutBuf() uint32 {
 //go:wasmexport musql_open
 func musqlOpen(pathLen uint32) int32 {
 	path := string(inBuf[:pathLen])
-	db, err := sql.Open(driver.DriverName, path)
-	if err == nil {
-		err = db.Ping()
-	}
+	dc, err := (&driver.Driver{}).Open(path)
 	if err != nil {
 		outBuf = appendError(outBuf[:0], err)
 		return -int32(len(outBuf)) - 1
 	}
-	// One connection: the statements of one handle run in order, as a
-	// SQLite connection's do, and see each other's writes.
-	db.SetMaxOpenConns(1)
-	// Results carry declared types (driver.Conn.ReportDeclTypes): a page tells a
-	// vector column from any other BLOB by its F32_BLOB(n). The one connection
-	// stays in the pool, and the setting with it.
-	if cn, cerr := db.Conn(context.Background()); cerr == nil {
-		cn.Raw(func(dc any) error {
-			if c, ok := dc.(*driver.Conn); ok {
-				c.ReportDeclTypes(true)
-			}
-			return nil
-		})
-		cn.Close()
-	}
+	c := dc.(*driver.Conn)
+	// Results carry declared types: a page tells a vector column from any
+	// other BLOB by its F32_BLOB(n).
+	c.ReportDeclTypes(true)
 	nextID++
-	conns[nextID] = &conn{db: db, stmts: map[string]*sql.Stmt{}}
+	conns[nextID] = &conn{c: c, stmts: map[string]*driver.Stmt{}}
 	return nextID
 }
 
 //go:wasmexport musql_close
 func musqlClose(h int32) {
 	if c := conns[h]; c != nil {
-		for _, st := range c.stmts {
-			st.Close()
-		}
-		c.db.Close()
+		c.closeStmts()
+		c.c.Close()
 		delete(conns, h)
 	}
 }
@@ -118,7 +135,7 @@ func musqlClose(h int32) {
 func musqlQuery(h int32, sqlLen, argsLen uint32) uint32 {
 	c, q, args, err := request(h, sqlLen, argsLen)
 	if err == nil {
-		var rows [][]any
+		var rows [][]sqldriver.Value
 		var cols, types []string
 		if rows, cols, types, err = c.query(q, args); err == nil {
 			outBuf = appendRows(outBuf[:0], cols, types, rows)
@@ -133,8 +150,12 @@ func musqlQuery(h int32, sqlLen, argsLen uint32) uint32 {
 func musqlExec(h int32, sqlLen, argsLen uint32) uint32 {
 	c, q, args, err := request(h, sqlLen, argsLen)
 	if err == nil {
-		var res sql.Result
-		if res, err = c.db.Exec(q, args...); err == nil {
+		var res sqldriver.Result
+		var st *driver.Stmt
+		if st, err = c.stmt(q); err == nil {
+			res, err = st.ExecContext(context.Background(), args)
+		}
+		if err == nil {
 			n, _ := res.RowsAffected()
 			id, _ := res.LastInsertId()
 			b := append(outBuf[:0], `{"changes":`...)
@@ -177,7 +198,7 @@ func musqlConvert(toSQLite int32, srcLen, dstLen uint32) uint32 {
 
 var errClosed = errors.New("musql: the database is closed")
 
-func request(h int32, sqlLen, argsLen uint32) (*conn, string, []any, error) {
+func request(h int32, sqlLen, argsLen uint32) (*conn, string, []sqldriver.NamedValue, error) {
 	c := conns[h]
 	if c == nil {
 		return nil, "", nil, errClosed
@@ -190,53 +211,47 @@ func request(h int32, sqlLen, argsLen uint32) (*conn, string, []any, error) {
 	return c, q, args, err
 }
 
-// query runs q through its cached prepared statement and reads every row.
-func (c *conn) query(q string, args []any) ([][]any, []string, []string, error) {
-	st := c.stmts[q]
-	if st == nil {
-		var err error
-		if st, err = c.db.Prepare(q); err != nil {
-			return nil, nil, nil, err
-		}
-		c.stmts[q] = st
-	}
-	rows, err := st.Query(args...)
+// query runs q and reads every row.
+func (c *conn) query(q string, args []sqldriver.NamedValue) ([][]sqldriver.Value, []string, []string, error) {
+	st, err := c.stmt(q)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	defer rows.Close()
-	cols, _ := rows.Columns()
-	types := make([]string, len(cols))
-	if cts, terr := rows.ColumnTypes(); terr == nil {
-		for i, ct := range cts {
-			types[i] = ct.DatabaseTypeName()
-		}
+	rs, err := st.QueryContext(context.Background(), args)
+	if err != nil {
+		return nil, nil, nil, err
 	}
-	var out [][]any
-	for rows.Next() {
-		vals := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range vals {
-			ptrs[i] = &vals[i]
-		}
-		if err := rows.Scan(ptrs...); err != nil {
+	defer rs.Close()
+	rows := rs.(*driver.Rows)
+	cols := rows.Columns()
+	types := make([]string, len(cols))
+	for i := range types {
+		types[i] = rows.ColumnTypeDatabaseTypeName(i)
+	}
+	var out [][]sqldriver.Value
+	for {
+		vals := make([]sqldriver.Value, len(cols))
+		if err := rows.Next(vals); err == io.EOF {
+			break
+		} else if err != nil {
 			return nil, nil, nil, err
 		}
 		out = append(out, vals)
 	}
-	return out, cols, types, rows.Err()
+	return out, cols, types, nil
 }
 
 var errArg = errors.New("musql: malformed argument buffer")
 
-func decodeArgs(b []byte) ([]any, error) {
-	var out []any
+func decodeArgs(b []byte) ([]sqldriver.NamedValue, error) {
+	var out []sqldriver.NamedValue
+	add := func(v any) { out = append(out, sqldriver.NamedValue{Ordinal: len(out) + 1, Value: v}) }
 	for len(b) > 0 {
 		tag := b[0]
 		b = b[1:]
 		switch tag {
 		case 0:
-			out = append(out, nil)
+			add(nil)
 		case 1, 2:
 			if len(b) < 8 {
 				return nil, errArg
@@ -244,9 +259,9 @@ func decodeArgs(b []byte) ([]any, error) {
 			u := binary.LittleEndian.Uint64(b)
 			b = b[8:]
 			if tag == 1 {
-				out = append(out, int64(u))
+				add(int64(u))
 			} else {
-				out = append(out, math.Float64frombits(u))
+				add(math.Float64frombits(u))
 			}
 		case 3, 4:
 			if len(b) < 4 {
@@ -258,9 +273,9 @@ func decodeArgs(b []byte) ([]any, error) {
 				return nil, errArg
 			}
 			if tag == 3 {
-				out = append(out, string(b[:n]))
+				add(string(b[:n]))
 			} else {
-				out = append(out, append([]byte{}, b[:n]...))
+				add(append([]byte{}, b[:n]...))
 			}
 			b = b[n:]
 		default:
@@ -270,7 +285,7 @@ func decodeArgs(b []byte) ([]any, error) {
 	return out, nil
 }
 
-func appendRows(b []byte, cols, types []string, rows [][]any) []byte {
+func appendRows(b []byte, cols, types []string, rows [][]sqldriver.Value) []byte {
 	b = appendStrings(append(b, `{"columns":`...), cols)
 	b = appendStrings(append(b, `,"types":`...), types)
 	b = append(b, `,"rows":[`...)

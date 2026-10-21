@@ -16,6 +16,9 @@
 
 	const fail = (code) => { const e = new Error(code); e.code = code; return e; };
 	const norm = (p) => {
+		// Every key is a normalized path, so a key is its own normal form: the
+		// engine stats its database's path on every statement.
+		if (nodes.has(p)) return p;
 		const out = [];
 		for (const part of String(p).split("/")) {
 			if (part === "" || part === ".") continue;
