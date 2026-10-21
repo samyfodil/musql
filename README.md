@@ -150,11 +150,16 @@ too.
 
 Without the JIT, musql loses to C SQLite by a large multiple on scans.
 
+Vector search is faster too: `vector_top_k` beats libSQL's index while
+returning the exact top 10, and every `vec1` index beats C SQLite's. See
+[Vector search](#vector-search).
+
 [docs/benchmarks.md](docs/benchmarks.md) has:
 
 - all 26 shapes;
 - per-machine timings, including the 100k-row runs and the Apple M4;
 - the multithreaded comparison with DuckDB;
+- the vector benchmarks;
 - the cost of calling C from Go.
 
 Writes, through `database/sql` against C SQLite through `mattn/go-sqlite3`
