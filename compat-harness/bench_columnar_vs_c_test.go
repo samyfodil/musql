@@ -148,6 +148,21 @@ func TestBenchColumnarVsC(t *testing.T) {
 		}
 		return n
 	}
+	// timeCalls times call over itersFor(first) iterations, and keeps going
+	// until targetRun has passed for a statement that is not slow. The first
+	// call on a connection compiles the plan, so a count taken from it alone
+	// timed a microsecond query over a millisecond or two, which is noise.
+	timeCalls := func(first time.Duration, call func() error) (time.Duration, error) {
+		n := itersFor(first)
+		start := time.Now()
+		i := 0
+		for ; i < n || n > slowIters && i < maxIters && (i%64 != 0 || time.Since(start) < targetRun); i++ {
+			if err := call(); err != nil {
+				return 0, err
+			}
+		}
+		return time.Since(start) / time.Duration(i), nil
+	}
 	type row struct {
 		name              string
 		mushCol, mushDrv  time.Duration
@@ -249,15 +264,15 @@ func TestBenchColumnarVsC(t *testing.T) {
 		if _, _, err := rp.QueryArgs(q, toEngineVals(gen(rng))); err != nil {
 			t.Fatalf("warm %q: %v", q, err)
 		}
-		n := itersFor(time.Since(warmStart))
 		rng = rand.New(rand.NewSource(benchSeed))
-		start := time.Now()
-		for i := 0; i < n; i++ {
-			if _, _, err := rp.QueryArgs(q, toEngineVals(gen(rng))); err != nil {
-				t.Fatalf("%q: %v", q, err)
-			}
+		d, err := timeCalls(time.Since(warmStart), func() error {
+			_, _, err := rp.QueryArgs(q, toEngineVals(gen(rng)))
+			return err
+		})
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
 		}
-		return time.Since(start) / time.Duration(n)
+		return d
 	}
 	// timeDriverSoft is timeDriver for an engine allowed to fail: it reports the
 	// error instead of ending the run.
@@ -275,15 +290,15 @@ func TestBenchColumnarVsC(t *testing.T) {
 		if _, err := renderDriverInts(db, q, gen(rng)); err != nil {
 			return 0, err.Error()
 		}
-		n := itersFor(time.Since(warmStart))
 		rng = rand.New(rand.NewSource(benchSeed))
-		start := time.Now()
-		for i := 0; i < n; i++ {
-			if _, err := renderDriverInts(db, q, gen(rng)); err != nil {
-				return 0, err.Error()
-			}
+		d, err := timeCalls(time.Since(warmStart), func() error {
+			_, err := renderDriverInts(db, q, gen(rng))
+			return err
+		})
+		if err != nil {
+			return 0, err.Error()
 		}
-		return time.Since(start) / time.Duration(n), ""
+		return d, ""
 	}
 	timeDriver := func(db *sql.DB, q string, gen func(*rand.Rand) []any) time.Duration {
 		rng := rand.New(rand.NewSource(benchSeed))
@@ -291,15 +306,15 @@ func TestBenchColumnarVsC(t *testing.T) {
 		if _, err := renderDriverInts(db, q, gen(rng)); err != nil {
 			t.Fatalf("warm %q: %v", q, err)
 		}
-		n := itersFor(time.Since(warmStart))
 		rng = rand.New(rand.NewSource(benchSeed))
-		start := time.Now()
-		for i := 0; i < n; i++ {
-			if _, err := renderDriverInts(db, q, gen(rng)); err != nil {
-				t.Fatalf("%q: %v", q, err)
-			}
+		d, err := timeCalls(time.Since(warmStart), func() error {
+			_, err := renderDriverInts(db, q, gen(rng))
+			return err
+		})
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
 		}
-		return time.Since(start) / time.Duration(n)
+		return d
 	}
 
 	// timeFast is timeDriver through package boost on its own connections,
@@ -376,13 +391,15 @@ func TestBenchColumnarVsC(t *testing.T) {
 		}
 		warmStart := time.Now()
 		run(args)
-		n := itersFor(time.Since(warmStart))
 		rng = rand.New(rand.NewSource(benchSeed))
-		start := time.Now()
-		for i := 0; i < n; i++ {
+		d, err := timeCalls(time.Since(warmStart), func() error {
 			run(gen(rng))
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("boost %q: %v", q, err)
 		}
-		return time.Since(start) / time.Duration(n)
+		return d
 	}
 
 	musqlengine.CountVMJITCursorEntersForTest(true)
