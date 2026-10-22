@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -344,6 +345,10 @@ func TestFailedCommitLeavesNoTemp(t *testing.T) {
 // is seen by that connection's next statement. Stamped after the read, the
 // session took that commit for one it had loaded, and the connection answered
 // from the older state for as long as nothing else was committed.
+//
+// The racing commit's delta keeps its size (the delta is written ahead) and
+// gets its mtime set back, as a coarse clock does, so only the word at the
+// session's delta end can tell the two states apart.
 func TestReopenRaceStaysFresh(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "r.db")
 	r := openFresh(t, p)
@@ -369,7 +374,14 @@ func TestReopenRaceStaysFresh(t *testing.T) {
 	exec(w, `INSERT INTO t VALUES(2)`) // r is stale now: its next read rebuilds
 	engine.ReopenedHookForTest = func() {
 		engine.ReopenedHookForTest = nil
+		before, err := os.Stat(p + ".delta")
+		if err != nil {
+			t.Fatal(err)
+		}
 		exec(w, `INSERT INTO t VALUES(3)`) // lands mid-rebuild
+		if err := os.Chtimes(p+".delta", before.ModTime(), before.ModTime()); err != nil {
+			t.Fatal(err)
+		}
 	}
 	defer func() { engine.ReopenedHookForTest = nil }()
 	count()

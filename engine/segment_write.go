@@ -214,6 +214,7 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 		baseCtr, basePages = f.srcChangeCounter, f.srcPageCount
 		endCtr, endPages = st.endCtr, st.endPages // the replay's own result, not a second read
 		deltaEnd = st.bytes
+		stamp[1].at = deltaEnd
 		p, perr := buildSegmentPager(segPath, f, st) // takes ownership of f
 		if perr != nil {
 			return perr
@@ -1748,8 +1749,12 @@ type fileStamp struct {
 	there bool
 	// next is the delta's 8 bytes at the session's deltaEnd, where another
 	// writer's batch would begin (pairStamp); bad is "they could not be read,
-	// or deltaEnd is unknown", and a bad stamp never matches.
+	// or deltaEnd is unknown", and a bad stamp never matches. at is the
+	// deltaEnd next was read at: the same 8 bytes at another offset say nothing
+	// (a reopen stamps before its deltaEnd moves, and two batches of one length
+	// begin with the same word).
 	next uint64
+	at   int64
 	bad  bool
 }
 
@@ -1769,6 +1774,7 @@ func (n *Session) pairStamp() [2]fileStamp {
 		n.deltaStat.release()
 	}
 	d := n.deltaStat.stamp(n.deltaPath)
+	d.at = n.deltaEnd
 	if d.there && d.size > n.deltaEnd {
 		d.next, d.bad = n.deltaStat.probe(n.deltaPath, n.deltaEnd)
 	}
