@@ -8,8 +8,8 @@ import (
 )
 
 // BenchmarkBoost times each way of running the same reads: database/sql,
-// boost on its own connections (both scan styles and QueryStruct), and boost
-// over a wrapped *sql.DB.
+// boost on its own connections (both scan styles), and boost over a wrapped
+// *sql.DB.
 func BenchmarkBoost(b *testing.B) {
 	path := filepath.Join(b.TempDir(), "b.musq")
 	std, err := sql.Open("sqlite", path)
@@ -94,16 +94,6 @@ func BenchmarkBoost(b *testing.B) {
 		}
 		b.Run(w.name+"/open", func(b *testing.B) { run(b, db, false) })
 		b.Run(w.name+"/open_scan", func(b *testing.B) { run(b, db, true) })
-		b.Run(w.name+"/open_struct", func(b *testing.B) {
-			b.ReportAllocs()
-			for b.Loop() {
-				for _, err := range QueryStruct[rec](ctx, db, w.sql, w.arg) {
-					if err != nil {
-						b.Fatal(err)
-					}
-				}
-			}
-		})
 		b.Run(w.name+"/wrap", func(b *testing.B) { run(b, wrapped, false) })
 	}
 }

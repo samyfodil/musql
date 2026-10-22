@@ -14,7 +14,7 @@ import (
 )
 
 // TestStressReturnsEveryConnection mixes every path -- reads, both scan
-// styles, QueryStruct broken off early, scan errors, failing queries, Exec,
+// styles, rows closed early, scan errors, failing queries, Exec,
 // committed and rolled-back transactions, cancelled waits and limit changes
 // -- across goroutines on a small pool. Run under -race it is the race pass;
 // afterwards every connection must be back, the pool within its limits, and
@@ -107,12 +107,14 @@ func stressStep(ctx context.Context, db *DB, rng *rand.Rand, id int) error {
 			return rows.Scan(&n)
 		}
 		return rows.Err()
-	case 2: // QueryStruct broken off after one row
-		type r struct{ ID int64 }
-		for _, err := range QueryStruct[r](ctx, db, `SELECT id FROM t`) {
+	case 2: // broken off after one row
+		rows, err := db.Query(ctx, `SELECT id FROM t`)
+		if err != nil {
 			return err
 		}
-		return nil
+		var n int64
+		rows.Next(&n)
+		return rows.Close()
 	case 3: // a scan error ends Next and releases the connection
 		rows, err := db.Query(ctx, `SELECT i FROM t WHERE id = 3`)
 		if err != nil {
