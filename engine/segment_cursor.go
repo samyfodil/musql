@@ -76,7 +76,7 @@ var segRowsServed atomic.Int64
 
 // segRowsSelected counts rows the compiled PRE-FILTER chose, so a test can
 // tell "the filter ran and skipped rows" from "the filter declined".
-var segRowsSelected int64
+var segRowsSelected atomic.Int64
 
 // SegRowsServedForTest reads and clears the counter.
 func SegRowsServedForTest() int64 { return segRowsServed.Swap(0) }
@@ -85,7 +85,7 @@ func SegRowsServedForTest() int64 { return segRowsServed.Swap(0) }
 // segSelWindow is the rows a filtered scan judges first in a segment.
 const segSelWindow = 1024
 
-func SegRowsSelectedForTest() int64 { n := segRowsSelected; segRowsSelected = 0; return n }
+func SegRowsSelectedForTest() int64 { return segRowsSelected.Swap(0) }
 
 // segRowSource walks a table's segments in order, yielding one row at a time.
 //
@@ -436,7 +436,7 @@ func (src *segRowSource) next() (s *segment, row int, rowid uint64, ok bool) {
 					row = int(src.sel[src.selPos])
 					src.selPos++
 					segRowsServed.Add(1)
-					segRowsSelected++
+					segRowsSelected.Add(1)
 					return s, row, s.Rowid(row), true
 				}
 				if src.selScan && src.ri < src.selHi {

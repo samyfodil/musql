@@ -293,7 +293,7 @@ func (b *segRows) walkFiltered(f *segRowFilter, params []Value, yield func(uint6
 		n := sg.nRows
 		if judged {
 			buf, n = sel, len(sel)
-			segRowsSelected += int64(n)
+			segRowsSelected.Add(int64(n))
 		}
 		nCols := len(sg.cols)
 		for k := 0; k < n; k++ {
