@@ -157,6 +157,34 @@ func BenchmarkLayers(b *testing.B) {
 				}
 			}
 		})
+		b.Run(w.name+"/struct", func(b *testing.B) {
+			b.ReportAllocs()
+			sc, err := db.Conn(ctx)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer sc.Close()
+			st := PrepareFast(sc, w.sql)
+			args := []any{w.arg}
+			type rec struct {
+				ID, Sec int64
+				Name    string
+				V       float64
+			}
+			type count struct {
+				N int64 `db:"count(*)"`
+			}
+			for b.Loop() {
+				if w.name == "count_filter" {
+					err = QueryStruct(ctx, st, args, func(*count) error { return nil })
+				} else {
+					err = QueryStruct(ctx, st, args, func(*rec) error { return nil })
+				}
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 		b.Run(w.name+"/sql_db", func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {

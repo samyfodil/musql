@@ -31,6 +31,7 @@ type FastStmt struct {
 	st     Stmt
 	stConn *Conn
 	named  []sqldriver.NamedValue
+	plan   *fastStructPlan
 }
 
 // PrepareFast returns a FastStmt for query on conn. Nothing runs until the
@@ -63,6 +64,34 @@ func (s *FastStmt) QueryRow(ctx context.Context, args []any, dest ...any) error 
 // Query runs the statement and calls each once per row, in order, with a scan
 // function for that row. Returning an error from each stops and returns it.
 func (s *FastStmt) Query(ctx context.Context, args []any, each func(scan func(dest ...any) error) error) error {
+	var (
+		r   *Rows
+		row []engine.Value
+	)
+	scan := func(dest ...any) error {
+		if len(dest) != len(row) {
+			return fmt.Errorf("sql: expected %d destination arguments in Scan, not %d", len(row), len(dest))
+		}
+		for i, d := range dest {
+			if err := r.scanFast(i, row[i], d); err != nil {
+				return fmt.Errorf("sql: Scan error on column index %d: %w", i, err)
+			}
+		}
+		return nil
+	}
+	return s.run(ctx, args, func(rr *Rows) error {
+		r = rr
+		for _, row = range r.rows {
+			if err := each(scan); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// run executes the statement on the connection and hands its rows to use.
+func (s *FastStmt) run(ctx context.Context, args []any, use func(r *Rows) error) error {
 	return s.conn.Raw(func(dc any) error {
 		c, ok := dc.(*Conn)
 		if !ok {
@@ -115,24 +144,7 @@ func (s *FastStmt) Query(ctx context.Context, args []any, each func(scan func(de
 		if !ok {
 			return fmt.Errorf("driver: FastStmt got rows of type %T", dr)
 		}
-		var row []engine.Value
-		scan := func(dest ...any) error {
-			if len(dest) != len(row) {
-				return fmt.Errorf("sql: expected %d destination arguments in Scan, not %d", len(row), len(dest))
-			}
-			for i, d := range dest {
-				if err := r.scanFast(i, row[i], d); err != nil {
-					return fmt.Errorf("sql: Scan error on column index %d: %w", i, err)
-				}
-			}
-			return nil
-		}
-		for _, row = range r.rows {
-			if err := each(scan); err != nil {
-				return err
-			}
-		}
-		return nil
+		return use(r)
 	})
 }
 
@@ -161,6 +173,10 @@ func (r *Rows) scanFast(i int, v engine.Value, d any) error {
 		return p.Scan(engineValueToDriver(v))
 	}
 	if v.Typ == engine.Null {
+		if p, ok := d.(*[]byte); ok {
+			*p = nil
+			return nil
+		}
 		return fmt.Errorf("converting NULL to %T is unsupported", d)
 	}
 	switch p := d.(type) {
@@ -200,7 +216,7 @@ func (r *Rows) scanFast(i int, v engine.Value, d any) error {
 		}
 	case *[]byte:
 		if v.Typ == engine.Text || v.Typ == engine.Blob {
-			*p = append((*p)[:0:0], v.S...)
+			*p = append([]byte{}, v.S...)
 			return nil
 		}
 	}
