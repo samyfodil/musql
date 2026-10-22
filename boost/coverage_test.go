@@ -252,7 +252,6 @@ func waitForWaiter(t *testing.T, p *pool) {
 
 // TestWrapRefusesOtherDrivers: Wrap checks the connection is musql's.
 func TestWrapRefusesOtherDrivers(t *testing.T) {
-	sql.Register("boost-test-other", otherDriver{})
 	other, err := sql.Open("boost-test-other", "")
 	if err != nil {
 		t.Fatal(err)
@@ -278,6 +277,8 @@ func TestWrapRefusesOtherDrivers(t *testing.T) {
 		t.Fatalf("Close closed the wrapped db: %v", err)
 	}
 }
+
+func init() { sql.Register("boost-test-other", otherDriver{}) }
 
 type otherDriver struct{}
 
