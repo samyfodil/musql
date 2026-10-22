@@ -38,7 +38,7 @@ func init() {
 			if err != nil {
 				return nil, err
 			}
-			return r, nil
+			return boostRows{r}, nil
 		},
 		Exec: func(ctx context.Context, c any, query string, args []any) (sql.Result, error) {
 			return c.(*Conn).boostExec(ctx, query, args)
@@ -148,15 +148,17 @@ func (c *Conn) boostExec(ctx context.Context, query string, args []any) (sql.Res
 	return res, err
 }
 
-// Len, Null and Scan make *Rows a boostcore.Rows.
+// boostRows is a boostcore.Rows over *Rows, kept off the exported type.
+type boostRows struct{ r *Rows }
 
-func (r *Rows) Len() int { return len(r.rows) }
+func (b boostRows) Columns() []string { return b.r.cols }
 
-func (r *Rows) Null(row, col int) bool { return r.rows[row][col].Typ == engine.Null }
+func (b boostRows) Len() int { return len(b.r.rows) }
 
-func (r *Rows) Scan(row, col int, dest any) error {
+func (b boostRows) Scan(row, col int, dest any) error {
+	r := b.r
 	v := r.rows[row][col]
-	if p, ok := dest.(*string); ok && (v.Typ == engine.Text || v.Typ == engine.Blob) {
+	if p, ok := dest.(*string); ok && (v.Typ == engine.Text || v.Typ == engine.Blob) && !r.isTimeCol(col) {
 		*p = r.boostString(row, v.S)
 		return nil
 	}
@@ -187,18 +189,29 @@ func (r *Rows) boostString(row int, b []byte) string {
 	return unsafe.String(&r.boostText[start], len(b))
 }
 
+func (r *Rows) isTimeCol(i int) bool { return i < len(r.timeCols) && r.timeCols[i] }
+
 // scanFast stores column i's value v into d.
 func (r *Rows) scanFast(i int, v engine.Value, d any) error {
-	if i < len(r.timeCols) && r.timeCols[i] {
+	if r.isTimeCol(i) {
 		if tv, ok := declTypeTimeValue(v, r.loc); ok {
+			// database/sql scans the time.Time the column coerces to, and
+			// formats it for a text destination.
 			switch p := d.(type) {
 			case *time.Time:
 				*p = tv
-				return nil
 			case *any:
 				*p = tv
-				return nil
+			case sql.Scanner:
+				return p.Scan(tv)
+			case *string:
+				*p = tv.Format(time.RFC3339Nano)
+			case *[]byte:
+				*p = []byte(tv.Format(time.RFC3339Nano))
+			default:
+				return fmt.Errorf("unsupported scan of a time into %T", d)
 			}
+			return nil
 		}
 	}
 	switch p := d.(type) {
@@ -241,8 +254,8 @@ func (r *Rows) scanFast(i int, v engine.Value, d any) error {
 			return nil
 		}
 	case *bool:
-		if v.Typ == engine.Int {
-			*p = v.I != 0
+		if v.Typ == engine.Int && (v.I == 0 || v.I == 1) {
+			*p = v.I == 1
 			return nil
 		}
 	case *string:

@@ -343,6 +343,13 @@ func TestPoolLimits(t *testing.T) {
 	}
 	wg.Wait()
 
+	db.SetMaxIdleConns(0)
+	if p := db.pool; p.open != 0 || len(p.idle) != 0 {
+		t.Fatalf("SetMaxIdleConns(0) kept open=%d idle=%d", p.open, len(p.idle))
+	}
+	if _, err := Open(t.TempDir() + "/x.musq?_busy_timeout=never"); err == nil {
+		t.Fatal("Open with a bad DSN: no error")
+	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}

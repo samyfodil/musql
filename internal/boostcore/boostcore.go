@@ -13,8 +13,6 @@ import (
 type Rows interface {
 	Columns() []string
 	Len() int
-	// Null reports whether row's value in column col is NULL.
-	Null(row, col int) bool
 	// Scan stores row's value in column col into dest, which is a pointer
 	// of a kind the driver scans directly (see package boost).
 	Scan(row, col int, dest any) error

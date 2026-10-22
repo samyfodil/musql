@@ -18,7 +18,6 @@ import (
 //	conn      this package's Conn and Stmt, without database/sql
 //	sql_stmt  database/sql with a prepared *sql.Stmt
 //	sql_db    database/sql's db.Query, as most code calls it
-//	fast      FastStmt over a *sql.Conn
 //
 // Every layer reads every column of every row.
 func BenchmarkLayers(b *testing.B) {
