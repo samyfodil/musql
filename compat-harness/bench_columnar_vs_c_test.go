@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/samyfodil/musql/boost"
 	"github.com/samyfodil/musql/driver"
 	musqlengine "github.com/samyfodil/musql/engine"
 	_ "turso.tech/database/tursogo" // driver "turso": the Rust rewrite
@@ -301,44 +302,40 @@ func TestBenchColumnarVsC(t *testing.T) {
 		return time.Since(start) / time.Duration(n)
 	}
 
-	// timeFast is timeDriver through a driver.FastStmt on one *sql.Conn,
-	// scanning every column into a typed destination. Its rows are first checked
-	// against database/sql's. The pool holds one connection, so the Conn is
-	// returned before anything else queries it.
+	// timeFast is timeDriver through package boost on its own connections,
+	// scanning every column into a typed destination. Its rows are first
+	// checked against database/sql's.
+	bdb, err := boost.Open(mush.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bdb.Close()
 	timeFast := func(q string, gen func(*rand.Rand) []any) time.Duration {
 		ctx := context.Background()
 		rng := rand.New(rand.NewSource(benchSeed))
 		args := gen(rng)
 		want, err := renderDriverInts(mdb, q, args)
 		if err != nil {
-			t.Fatalf("fast %q: %v", q, err)
+			t.Fatalf("boost %q: %v", q, err)
 		}
-		fastConn, err := mdb.Conn(ctx)
+		rows, err := bdb.Query(ctx, q, args...)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("boost %q: %v", q, err)
 		}
-		defer fastConn.Close()
-		st := driver.PrepareFast(fastConn, q)
+		cells := make([]any, len(rows.Columns()))
+		ptrs := make([]any, len(cells))
+		for i := range cells {
+			ptrs[i] = &cells[i]
+		}
 		var sb strings.Builder
 		var dest []any
-		err = st.Query(ctx, args, func(scan func(dest ...any) error) error {
-			cells := make([]any, 64)
-			ptrs := make([]any, 64)
-			for i := range cells {
-				ptrs[i] = &cells[i]
-			}
-			n := 1
-			for ; n <= len(ptrs); n++ {
-				if scan(ptrs[:n]...) == nil {
-					break
-				}
-			}
-			for _, c := range cells[:n] {
+		for rows.Next(ptrs...) {
+			for _, c := range cells {
 				sb.WriteString(renderAnyCell(c))
 			}
 			sb.WriteString(";")
 			if dest == nil {
-				for _, c := range cells[:n] {
+				for _, c := range cells {
 					switch c.(type) {
 					case int64:
 						dest = append(dest, new(int64))
@@ -351,36 +348,39 @@ func TestBenchColumnarVsC(t *testing.T) {
 					}
 				}
 			}
-			return nil
-		})
-		if err != nil {
-			t.Fatalf("fast %q: %v", q, err)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("boost %q: %v", q, err)
 		}
 		if want != sb.String() {
-			t.Fatalf("fast %q: read %q, database/sql %q", q, sb.String(), want)
+			t.Fatalf("boost %q: read %q, database/sql %q", q, sb.String(), want)
 		}
 		// A typed destination per column, falling back to any for a column
 		// whose class differs between rows or bind values.
-		scanRow := func(scan func(dest ...any) error) error {
-			if err := scan(dest...); err != nil {
-				for i := range dest {
-					dest[i] = new(any)
-				}
-				return scan(dest...)
+		run := func(args []any) {
+			rows, err := bdb.Query(ctx, q, args...)
+			if err != nil {
+				t.Fatalf("boost %q: %v", q, err)
 			}
-			return nil
+			for rows.Next() {
+				if rows.Scan(dest...) != nil {
+					for i := range dest {
+						dest[i] = new(any)
+					}
+					if err := rows.Scan(dest...); err != nil {
+						t.Fatalf("boost %q: %v", q, err)
+					}
+				}
+			}
+			rows.Close()
 		}
 		warmStart := time.Now()
-		if err := st.Query(ctx, args, scanRow); err != nil {
-			t.Fatalf("fast %q: %v", q, err)
-		}
+		run(args)
 		n := itersFor(time.Since(warmStart))
 		rng = rand.New(rand.NewSource(benchSeed))
 		start := time.Now()
 		for i := 0; i < n; i++ {
-			if err := st.Query(ctx, gen(rng), scanRow); err != nil {
-				t.Fatalf("fast %q: %v", q, err)
-			}
+			run(gen(rng))
 		}
 		return time.Since(start) / time.Duration(n)
 	}
@@ -592,7 +592,7 @@ func TestBenchColumnarVsC(t *testing.T) {
 	t.Logf("")
 	t.Logf("The same engines through database/sql (tursogo re-prepares every query), and musql's FastStmt")
 	t.Logf("%-32s | %12s | %12s | %12s | %12s | %12s | %12s | %11s", "workload",
-		"musql+JIT", "musql drv", "turso native", "turso drv", "drv overhead", "musql fast", "fast vs tn")
+		"musql+JIT", "musql drv", "turso native", "turso drv", "drv overhead", "musql boost", "boost vs tn")
 	for _, r := range rows {
 		tn, td := "n/a", r.tursoErr
 		if r.tNative > 0 {
