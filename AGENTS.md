@@ -85,6 +85,7 @@ The segment file carries its format version (`segFileVersion` in
 | `convert/sqlite/` | SQLite-format converter: page and b-tree reader/writer, WAL and hot-journal reading, integrity walk, `Import`/`Export`. |
 | `cmd/musql-convert/` | The conversion CLI. |
 | `driver/` | The `database/sql` driver (registered as `"sqlite"`). |
+| `boost/` | A faster read API with a `database/sql`-like surface: its own connection pool (`Open`) or a wrapped `*sql.DB` (`Wrap`), rows scanned straight into typed destinations or structs. It reaches the driver through `internal/boostcore`. |
 | `hrana/` | The Hrana server (HTTP, JSON and Protobuf) and `cmd/musqld`, so libSQL/Turso clients can use musql. Its own module, so the engine and driver depend on nothing but `golang.org/x/sys`. Generated code in `hrana/gen/`. |
 | `proto/` | Protobuf definitions. `buf generate` (repo root) writes the Go code into `hrana/gen/` and `examples/libp2p` has its own config. Never edit generated code by hand. |
 | `replication/` | Replication: capture, HLC, op log, CRDT and leader modes. The network is supplied by the caller (`WithTransport`). |

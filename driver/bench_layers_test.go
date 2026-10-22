@@ -132,59 +132,6 @@ func BenchmarkLayers(b *testing.B) {
 				scan(b, rows)
 			}
 		})
-		b.Run(w.name+"/fast", func(b *testing.B) {
-			b.ReportAllocs()
-			sc, err := db.Conn(ctx)
-			if err != nil {
-				b.Fatal(err)
-			}
-			defer sc.Close()
-			st := PrepareFast(sc, w.sql)
-			args := []any{w.arg}
-			var (
-				id, sec int64
-				name    string
-				v       float64
-			)
-			dest := []any{&id, &sec, &name, &v}
-			if w.name == "count_filter" {
-				dest = dest[:1]
-			}
-			scanRow := func(scan func(dest ...any) error) error { return scan(dest...) }
-			for b.Loop() {
-				if err := st.Query(ctx, args, scanRow); err != nil {
-					b.Fatal(err)
-				}
-			}
-		})
-		b.Run(w.name+"/struct", func(b *testing.B) {
-			b.ReportAllocs()
-			sc, err := db.Conn(ctx)
-			if err != nil {
-				b.Fatal(err)
-			}
-			defer sc.Close()
-			st := PrepareFast(sc, w.sql)
-			args := []any{w.arg}
-			type rec struct {
-				ID, Sec int64
-				Name    string
-				V       float64
-			}
-			type count struct {
-				N int64 `db:"count(*)"`
-			}
-			for b.Loop() {
-				if w.name == "count_filter" {
-					err = QueryStruct(ctx, st, args, func(*count) error { return nil })
-				} else {
-					err = QueryStruct(ctx, st, args, func(*rec) error { return nil })
-				}
-				if err != nil {
-					b.Fatal(err)
-				}
-			}
-		})
 		b.Run(w.name+"/sql_db", func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
