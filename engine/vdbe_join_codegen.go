@@ -227,6 +227,11 @@ type joinSource struct {
 	// most one source per compile.
 	seekKeyExpr Expr
 
+	// rowidRange, when non-nil, is a WHERE conjunct bounding this table's rowid
+	// by a column-free expression: emitJoinLoops evaluates it after OpOpenRead
+	// and emits OpSeekRowidRangeHint. Set by detectRowidRangeKey.
+	rowidRange *rowidRangeKey
+
 	// idxSeek, when non-nil, requests a SECONDARY-INDEX leading-column equality
 	// seek for this (ordinary rowid) table: emitJoinLoops evaluates its
 	// keyExpr once, right after this source's OpOpenRead, and emits an
@@ -3033,6 +3038,15 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 				return kerr
 			}
 			c.emit(Instruction{Op: OpSeekRowidHint, P1: s.scope.cursor, P2: keyReg})
+		}
+		if s.rowidRange != nil {
+			// The bound, evaluated once like the key above. See
+			// OpSeekRowidRangeHint and detectRowidRangeKey.
+			keyReg, kerr := c.compileExpr(s.rowidRange.expr)
+			if kerr != nil {
+				return kerr
+			}
+			c.emit(Instruction{Op: OpSeekRowidRangeHint, P1: s.scope.cursor, P2: keyReg, P3: s.rowidRange.kind})
 		}
 		if s.idxSeek != nil {
 			// Evaluate the (column-free constant/parameter) index seek key now --

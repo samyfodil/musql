@@ -2,6 +2,7 @@ package engine
 
 import (
 	"slices"
+	"sort"
 	"strings"
 	"sync/atomic"
 )
@@ -76,6 +77,17 @@ func (s *segment) findRowid(rid int64) (int, bool) {
 		return lo, true
 	}
 	return 0, false
+}
+
+// rowidSpan is the positions [from, to) of this segment's rows whose rowids
+// lie in lo..hi inclusive: two searches of its ascending rowid array.
+func (s *segment) rowidSpan(lo, hi int64) (from, to int) {
+	if lo > hi {
+		return 0, 0
+	}
+	from = sort.Search(s.nRows, func(i int) bool { return int64(s.Rowid(i)) >= lo })
+	to = from + sort.Search(s.nRows-from, func(i int) bool { return int64(s.Rowid(from+i)) > hi })
+	return from, to
 }
 
 // findRowidFrom is findRowid for a rowid known not to be before position from:

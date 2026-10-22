@@ -585,6 +585,10 @@ func compileScanPlain(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols 
 		// WHERE and is re-tested on every fetched row), so it too is
 		// result-neutral. See detectIndexSeekKey.
 		srcs[idx].idxSeek = plan
+	} else if key, ok := detectRowidRangeKey(c, srcs, stmt.Where); ok {
+		// No equality to seek: a bound on the rowid still skips the rows
+		// below or above it, the same pure restriction.
+		srcs[0].rowidRange = key
 	}
 
 	// A row-mode scan evaluates WHERE and the select list with every cursor
@@ -867,6 +871,54 @@ func detectRowidSeekKey(c *compiler, srcs []joinSource, where Expr) (int, Expr, 
 		}
 	}
 	return 0, nil, false
+}
+
+// rowidRangeOffForTest turns detectRowidRangeKey off, for a differential
+// test's reference.
+var rowidRangeOffForTest bool
+
+// rowidRangeKey is detectRowidRangeKey's result: the bound expression and its
+// kind (rowidRangeGT, GE, LT, LE) with the rowid on the left.
+type rowidRangeKey struct {
+	expr Expr
+	kind int
+}
+
+// detectRowidRangeKey looks for a WHERE conjunct bounding the rowid (or the
+// INTEGER PRIMARY KEY) of a single-table query's table by a column-free
+// constant: "rowid > E", ">=", "<", "<=", either way round. C plans the same
+// conjunct as a rowid range (WHERE_IPK with WHERE_COLUMN_RANGE, where.c) and
+// starts its scan with OP_SeekGT/GE. Here it narrows each segment to its span
+// (OpSeekRowidRangeHint). The conjunct stays in WHERE, so a bound of any class
+// other than INTEGER, whose comparison with a rowid follows affinity rules,
+// simply leaves the scan whole at run time.
+func detectRowidRangeKey(c *compiler, srcs []joinSource, where Expr) (*rowidRangeKey, bool) {
+	if where == nil || len(srcs) != 1 || rowidRangeOffForTest {
+		return nil, false
+	}
+	s := srcs[0]
+	if s.derived != nil || s.tbl == nil || s.tbl.withoutRowid || s.left || s.rightOuter {
+		return nil, false
+	}
+	kinds := map[string]int{">": rowidRangeGT, ">=": rowidRangeGE, "<": rowidRangeLT, "<=": rowidRangeLE}
+	flip := []int{rowidRangeLT, rowidRangeLE, rowidRangeGT, rowidRangeGE}
+	for _, cj := range seekConjuncts(where) {
+		be, ok := cj.(BinaryExpr)
+		if !ok {
+			continue
+		}
+		kind, ok := kinds[be.Op]
+		if !ok {
+			continue
+		}
+		if isScopeRowidRef(c, s, be.L) && isSeekKeyCandidate(be.R) {
+			return &rowidRangeKey{expr: be.R, kind: kind}, true
+		}
+		if isScopeRowidRef(c, s, be.R) && isSeekKeyCandidate(be.L) {
+			return &rowidRangeKey{expr: be.L, kind: flip[kind]}, true
+		}
+	}
+	return nil, false
 }
 
 // seekConjuncts is the WHERE's top-level conjuncts as the seek planners read

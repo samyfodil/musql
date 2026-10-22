@@ -82,6 +82,9 @@ type Rows struct {
 	pos  int
 	slab valueSlab
 
+	// boostText is the current chunk package boost's strings are cut from.
+	boostText []byte
+
 	// timeCols and loc are set for connections whose DSN asks for time coercion.
 	// timeCols[i] true means column i's DECLARED type should convert to time.Time.
 	timeCols []bool

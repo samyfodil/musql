@@ -280,6 +280,28 @@ func segCursorReadsATable(in []Instruction, at, cursor int) bool {
 // row indices that can match, or false to decline -- in which case the caller
 // scans every row of that segment, which is what it did before.
 func segSelectRows(s *segment, f *segRowFilter, ipkCol int, params []Value, buf []int64) ([]int64, bool) {
+	sel, ok := segSelectPrep(s, f, ipkCol, params)
+	if !ok {
+		return nil, false
+	}
+	return sel.run(0, s.nRows, buf)
+}
+
+// segSelection is the compiled predicate made ready for one segment, run over
+// any window of its rows. A scan that stops early (a LIMIT) judges only the
+// windows it reaches instead of the whole segment.
+type segSelection struct {
+	s         *segment
+	kern      *jit.Code
+	blocks    [][]int64
+	isRowid   []bool
+	uncertain []int
+	regs      []int64
+	consts    []int64 // regs as the bound parameters set them, restored per run
+	rowids    [][]int64
+}
+
+func segSelectPrep(s *segment, f *segRowFilter, ipkCol int, params []Value) (*segSelection, bool) {
 	if s == nil || f == nil || f.low == nil || s.nRows == 0 {
 		return nil, false
 	}
@@ -303,6 +325,14 @@ func segSelectRows(s *segment, f *segRowFilter, ipkCol int, params []Value, buf 
 		// call and a merge. Decline and let the scan run.
 		return nil, false
 	}
+	if len(blocks) > len(jit.ProgArgs{}.Col) {
+		return nil, false
+	}
+	for i, b := range blocks {
+		if !isRowid[i] && len(b) < s.nRows {
+			return nil, false
+		}
+	}
 	regs := make([]int64, low.nRegs+2)
 	for i, reg := range low.consts {
 		idx := low.cvIndex[i]
@@ -319,46 +349,61 @@ func segSelectRows(s *segment, f *segRowFilter, ipkCol int, params []Value, buf 
 			return nil, false
 		}
 	}
-	// A rowid-alias column has no block of its own; materialize one, exactly
-	// as segRunProgramAll does.
-	for i := range blocks {
-		if !isRowid[i] {
+	return &segSelection{
+		s: s, kern: kern, blocks: blocks, isRowid: isRowid, uncertain: uncertain,
+		regs: regs, consts: append([]int64(nil), regs...), rowids: make([][]int64, len(blocks)),
+	}, true
+}
+
+// run returns the rows in [lo, hi) that can match, in ascending order, or
+// false to decline that window.
+func (p *segSelection) run(lo, hi int, buf []int64) ([]int64, bool) {
+	n := hi - lo
+	if n <= 0 {
+		return buf[:0], true
+	}
+	copy(p.regs, p.consts)
+	if cap(buf) < n {
+		buf = make([]int64, n)
+	}
+	buf = buf[:n]
+	var out, ovf int64
+	args := &jit.ProgArgs{N: int64(n), Regs: &p.regs[0], Out: &out, Overflow: &ovf, Sel: &buf[0]}
+	for i, b := range p.blocks {
+		if p.isRowid[i] {
+			// A rowid-alias column has no block of its own; materialize the
+			// window's, exactly as segRunProgramAll does.
+			if cap(p.rowids[i]) < n {
+				p.rowids[i] = make([]int64, n)
+			}
+			b = p.rowids[i][:n]
+			for r := range b {
+				b[r] = int64(p.s.Rowid(lo + r))
+			}
+			args.Col[i] = &b[0]
 			continue
 		}
-		tmp := make([]int64, s.nRows)
-		for r := 0; r < s.nRows; r++ {
-			tmp[r] = int64(s.Rowid(r))
-		}
-		blocks[i] = tmp
+		args.Col[i] = &b[lo]
 	}
-	if cap(buf) < s.nRows {
-		buf = make([]int64, s.nRows)
-	}
-	buf = buf[:s.nRows]
-	var out, ovf int64
-	args := &jit.ProgArgs{N: int64(s.nRows), Regs: &regs[0], Out: &out, Overflow: &ovf, Sel: &buf[0]}
-	for i, b := range blocks {
-		if len(b) < s.nRows {
-			return nil, false
-		}
-		args.Col[i] = &b[0]
-	}
-	kern.Call2(args)
+	p.kern.Call2(args)
 	if ovf != 0 {
 		return nil, false
 	}
 	// The emitted indices count up from -n, so shift them back in place.
 	buf = buf[:out]
 	for i := range buf {
-		buf[i] += int64(s.nRows)
-		if buf[i] < 0 || buf[i] >= int64(s.nRows) {
-			return nil, false // a selection outside the segment is a bug, not a hint
+		buf[i] += int64(n)
+		if buf[i] < 0 || buf[i] >= int64(n) {
+			return nil, false // a selection outside the window is a bug, not a hint
 		}
+		buf[i] += int64(lo)
 	}
-	if len(uncertain) == 0 {
+	a := sort.SearchInts(p.uncertain, lo)
+	b := sort.SearchInts(p.uncertain, hi)
+	if a == b {
 		return buf, true
 	}
-	return segMergeUncertain(buf, uncertain), true
+	return segMergeUncertain(buf, p.uncertain[a:b]), true
 }
 
 // segMergeUncertain unions the rows the kernel could not judge into its

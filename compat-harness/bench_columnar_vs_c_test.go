@@ -1,6 +1,7 @@
 package compat
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"math/rand"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/samyfodil/musql/boost"
 	"github.com/samyfodil/musql/driver"
 	musqlengine "github.com/samyfodil/musql/engine"
 	_ "turso.tech/database/tursogo" // driver "turso": the Rust rewrite
@@ -149,6 +151,7 @@ func TestBenchColumnarVsC(t *testing.T) {
 	type row struct {
 		name              string
 		mushCol, mushDrv  time.Duration
+		mushFast          time.Duration
 		c, cNative, turso time.Duration
 		tNative           time.Duration
 		tursoErr          string
@@ -299,6 +302,89 @@ func TestBenchColumnarVsC(t *testing.T) {
 		return time.Since(start) / time.Duration(n)
 	}
 
+	// timeFast is timeDriver through package boost on its own connections,
+	// scanning every column into a typed destination. Its rows are first
+	// checked against database/sql's.
+	bdb, err := boost.Open(mush.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bdb.Close()
+	timeFast := func(q string, gen func(*rand.Rand) []any) time.Duration {
+		ctx := context.Background()
+		rng := rand.New(rand.NewSource(benchSeed))
+		args := gen(rng)
+		want, err := renderDriverInts(mdb, q, args)
+		if err != nil {
+			t.Fatalf("boost %q: %v", q, err)
+		}
+		rows, err := bdb.Query(ctx, q, args...)
+		if err != nil {
+			t.Fatalf("boost %q: %v", q, err)
+		}
+		cells := make([]any, len(rows.Columns()))
+		ptrs := make([]any, len(cells))
+		for i := range cells {
+			ptrs[i] = &cells[i]
+		}
+		var sb strings.Builder
+		var dest []any
+		for rows.Next(ptrs...) {
+			for _, c := range cells {
+				sb.WriteString(renderAnyCell(c))
+			}
+			sb.WriteString(";")
+			if dest == nil {
+				for _, c := range cells {
+					switch c.(type) {
+					case int64:
+						dest = append(dest, new(int64))
+					case float64:
+						dest = append(dest, new(float64))
+					case string:
+						dest = append(dest, new(string))
+					default:
+						dest = append(dest, new(any))
+					}
+				}
+			}
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("boost %q: %v", q, err)
+		}
+		if want != sb.String() {
+			t.Fatalf("boost %q: read %q, database/sql %q", q, sb.String(), want)
+		}
+		// A typed destination per column, falling back to any for a column
+		// whose class differs between rows or bind values.
+		run := func(args []any) {
+			rows, err := bdb.Query(ctx, q, args...)
+			if err != nil {
+				t.Fatalf("boost %q: %v", q, err)
+			}
+			for rows.Next() {
+				if rows.Scan(dest...) != nil {
+					for i := range dest {
+						dest[i] = new(any)
+					}
+					if err := rows.Scan(dest...); err != nil {
+						t.Fatalf("boost %q: %v", q, err)
+					}
+				}
+			}
+			rows.Close()
+		}
+		warmStart := time.Now()
+		run(args)
+		n := itersFor(time.Since(warmStart))
+		rng = rand.New(rand.NewSource(benchSeed))
+		start := time.Now()
+		for i := 0; i < n; i++ {
+			run(gen(rng))
+		}
+		return time.Since(start) / time.Duration(n)
+	}
+
 	musqlengine.CountVMJITCursorEntersForTest(true)
 	defer musqlengine.CountVMJITCursorEntersForTest(false)
 	var rows []row
@@ -348,6 +434,7 @@ func TestBenchColumnarVsC(t *testing.T) {
 			name:     w.name,
 			mushCol:  cl,
 			mushDrv:  timeDriver(mdb, w.sql, w.args),
+			mushFast: timeFast(w.sql, w.args),
 			c:        timeDriver(cdb, w.sql, w.args),
 			turso:    td,
 			tursoErr: terr,
@@ -503,9 +590,9 @@ func TestBenchColumnarVsC(t *testing.T) {
 	}
 	t.Logf("the vs-X columns are how many times FASTER musql+JIT is than X.")
 	t.Logf("")
-	t.Logf("The same engines through database/sql (tursogo re-prepares every query)")
-	t.Logf("%-32s | %12s | %12s | %12s | %12s | %12s", "workload",
-		"musql+JIT", "musql drv", "turso native", "turso drv", "drv overhead")
+	t.Logf("The same engines through database/sql (tursogo re-prepares every query), and musql's FastStmt")
+	t.Logf("%-32s | %12s | %12s | %12s | %12s | %12s | %12s | %11s", "workload",
+		"musql+JIT", "musql drv", "turso native", "turso drv", "drv overhead", "musql boost", "boost vs tn")
 	for _, r := range rows {
 		tn, td := "n/a", r.tursoErr
 		if r.tNative > 0 {
@@ -514,9 +601,14 @@ func TestBenchColumnarVsC(t *testing.T) {
 		if r.tursoErr == "" {
 			td = r.turso.Round(time.Microsecond).String()
 		}
-		t.Logf("%-32s | %12s | %12s | %12s | %12s | %12s", r.name,
+		vsTn := "n/a"
+		if r.tNative > 0 {
+			vsTn = speedup(r.tNative, r.mushFast)
+		}
+		t.Logf("%-32s | %12s | %12s | %12s | %12s | %12s | %12s | %11s", r.name,
 			r.mushCol.Round(time.Microsecond), r.mushDrv.Round(time.Microsecond),
-			tn, td, (r.mushDrv - r.mushCol).Round(100*time.Nanosecond))
+			tn, td, (r.mushDrv - r.mushCol).Round(100*time.Nanosecond),
+			r.mushFast.Round(100*time.Nanosecond), vsTn)
 	}
 
 	// DuckDB, a different class of engine: a reference, not a headline.
@@ -701,6 +793,9 @@ func speedup(other, ours time.Duration) string {
 	x := float64(other) / float64(ours)
 	if x < 1 {
 		return fmt.Sprintf("%.2fx SLOWER", 1/x)
+	}
+	if x < 10 {
+		return fmt.Sprintf("%.2fx faster", x)
 	}
 	return fmt.Sprintf("%.0fx faster", x)
 }

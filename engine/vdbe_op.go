@@ -599,6 +599,15 @@ const (
 	// the loop. P3==1 is a correlated seek, as for OpSeekRowidHint.
 	OpSeekIndexHint
 
+	// OpSeekRowidRangeHint: P1: cursor. P2: bound register. P3: which bound
+	// (rowidRangeGT, GE, LT, LE). Makes cursor P1's segment scan start or stop
+	// at r[P2] in each segment's ascending rowids, when r[P2] is an INTEGER; any
+	// other bound leaves the scan whole. Emitted by emitJoinLoops after
+	// OpOpenRead when detectRowidRangeKey found "rowid > <const/param>" (or the
+	// IPK column, or >=, <, <=). Like OpSeekRowidHint it only skips rows the
+	// conjunct, still evaluated in the loop, rejects.
+	OpSeekRowidRangeHint
+
 	// OpAutoIndexOrder: P1: cursor. P4: *autoIndexKey. Materializes cursor P1 if
 	// needed and reorders its rows into the order SQLite's transient automatic
 	// index would yield (constructAutomaticIndex's key: equality columns, then
