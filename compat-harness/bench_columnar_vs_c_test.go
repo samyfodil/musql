@@ -794,6 +794,9 @@ func speedup(other, ours time.Duration) string {
 	if x < 1 {
 		return fmt.Sprintf("%.2fx SLOWER", 1/x)
 	}
+	if x < 10 {
+		return fmt.Sprintf("%.2fx faster", x)
+	}
 	return fmt.Sprintf("%.0fx faster", x)
 }
 
