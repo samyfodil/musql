@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -24,7 +26,7 @@ type env struct {
 	client *http.Client
 }
 
-func newEnv(t *testing.T) *env {
+func newEnv(t *testing.T, opts ...Option) *env {
 	t.Helper()
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.musq"))
 	if err != nil {
@@ -34,7 +36,7 @@ func newEnv(t *testing.T) *env {
 	var h http.Handler
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { h.ServeHTTP(w, r) }))
 	t.Cleanup(ts.Close)
-	p, err := New(context.Background(), store, ts.URL)
+	p, err := New(context.Background(), store, ts.URL, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,8 +79,29 @@ func decode(t *testing.T, resp *http.Response) map[string]any {
 	return m
 }
 
+var csrfField = regexp.MustCompile(`name="csrf" value="([^"]+)"`)
+
+// csrf loads the sign-in page, which sets the CSRF cookie, and returns the
+// token its form carries.
+func (e *env) csrf() string {
+	e.t.Helper()
+	resp := e.get(e.ts.URL + "/login")
+	b, _ := io.ReadAll(resp.Body)
+	m := csrfField.FindSubmatch(b)
+	if m == nil {
+		e.t.Fatalf("no csrf field in the sign-in page: %s", b)
+	}
+	return string(m[1])
+}
+
+// signIn posts the sign-in form with a valid CSRF token.
+func (e *env) signIn(email, password, next string) *http.Response {
+	e.t.Helper()
+	return e.post(e.ts.URL+"/login", url.Values{"email": {email}, "password": {password}, "next": {next}, "csrf": {e.csrf()}})
+}
+
 func (e *env) login(password string) *http.Response {
-	return e.post(e.ts.URL+"/login", url.Values{"email": {"ADA@example.com"}, "password": {password}, "next": {"/console/"}})
+	return e.signIn("ADA@example.com", password, "/console/")
 }
 
 func TestCodeFlowWithPKCE(t *testing.T) {
@@ -112,7 +135,7 @@ func TestCodeFlowWithPKCE(t *testing.T) {
 	if r := e.login("wrong"); r.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("bad password: %d", r.StatusCode)
 	}
-	resp = e.post(e.ts.URL+"/login", url.Values{"email": {"ada@example.com"}, "password": {"s3cret"}, "next": {next}})
+	resp = e.signIn("ada@example.com", "s3cret", next)
 	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != next {
 		t.Fatalf("login: %d %q", resp.StatusCode, resp.Header.Get("Location"))
 	}
@@ -194,7 +217,7 @@ func TestAuthorizeRejects(t *testing.T) {
 	if loc, _ := r.Location(); loc == nil || loc.Query().Get("error") != "invalid_request" {
 		t.Fatalf("plain PKCE: %v", loc)
 	}
-	r = e.post(e.ts.URL+"/login", url.Values{"email": {"ada@example.com"}, "password": {"s3cret"}, "next": {"//evil.example"}})
+	r = e.signIn("ada@example.com", "s3cret", "//evil.example")
 	if r.Header.Get("Location") != "/console/" {
 		t.Fatalf("open redirect: %q", r.Header.Get("Location"))
 	}

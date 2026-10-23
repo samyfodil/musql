@@ -70,6 +70,7 @@ var loginTmpl = page(`{{define "title"}}Sign in · musql cloud{{end}}{{define "b
 <h1>Sign in</h1><p>Use your email and password.</p>
 <form method="post" action="/login">
 <input type="hidden" name="next" value="{{.Next}}">
+<input type="hidden" name="csrf" value="{{.CSRF}}">
 <label for="email">Email</label><input id="email" name="email" type="email" autocomplete="username" value="{{.Email}}" required autofocus>
 <label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required>
 {{with .Error}}<div class="error">{{.}}</div>{{end}}

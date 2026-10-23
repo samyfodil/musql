@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -30,6 +32,40 @@ type Config struct {
 		Keep  string `yaml:"keep"`
 	} `yaml:"snapshots"`
 	Console ConsoleConfig `yaml:"console"`
+	OIDC    OIDCConfig    `yaml:"oidc"`
+}
+
+// OIDCConfig tunes sign-in. Durations take Go syntax plus "d" for days
+// ("30d").
+type OIDCConfig struct {
+	// KeyRotation is how long a signing key signs before a new one takes
+	// over (default 30d); "0" turns rotation off.
+	KeyRotation string `yaml:"key_rotation"`
+	// LoginPerIP and LoginPerEmail are the failed sign-ins one address and
+	// one email may make within LoginWindow before /login answers 429
+	// (defaults 20, 5 and 15m); a negative count turns that limit off.
+	LoginPerIP    int    `yaml:"login_per_ip"`
+	LoginPerEmail int    `yaml:"login_per_email"`
+	LoginWindow   string `yaml:"login_window"`
+
+	keyRotation time.Duration
+	loginWindow time.Duration
+}
+
+// parseDuration is time.ParseDuration with a "d" suffix for days.
+func parseDuration(s string) (time.Duration, error) {
+	if n, ok := strings.CutSuffix(s, "d"); ok {
+		days, err := strconv.ParseFloat(n, 64)
+		if err != nil || days < 0 {
+			return 0, fmt.Errorf("invalid duration %q", s)
+		}
+		return time.Duration(days * float64(24*time.Hour)), nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d < 0 {
+		return 0, fmt.Errorf("invalid duration %q", s)
+	}
+	return d, nil
 }
 
 // AdminConfig is the admin created, or whose password is reset, at start.
@@ -122,5 +158,18 @@ func (c *Config) normalize() error {
 			return errors.New("config: admin.password_hash is not an argon2id hash")
 		}
 	}
+	if c.OIDC.keyRotation, err = durationOr(c.OIDC.KeyRotation, 30*24*time.Hour); err != nil {
+		return fmt.Errorf("config: oidc.key_rotation: %w", err)
+	}
+	if c.OIDC.loginWindow, err = durationOr(c.OIDC.LoginWindow, 0); err != nil {
+		return fmt.Errorf("config: oidc.login_window: %w", err)
+	}
 	return nil
+}
+
+func durationOr(s string, def time.Duration) (time.Duration, error) {
+	if s == "" {
+		return def, nil
+	}
+	return parseDuration(s)
 }

@@ -57,7 +57,8 @@ func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) 
 		store.Close()
 		return nil, err
 	}
-	if s.provider, err = oidc.New(ctx, store, cfg.PublicURL, oidc.WithConsoleOrigins(cfg.Console.CORSOrigins)); err != nil {
+	if s.provider, err = oidc.New(ctx, store, cfg.PublicURL, oidc.WithConsoleOrigins(cfg.Console.CORSOrigins),
+		oidc.WithLoginLimits(cfg.OIDC.LoginPerIP, cfg.OIDC.LoginPerEmail, cfg.OIDC.loginWindow)); err != nil {
 		store.Close()
 		return nil, err
 	}
