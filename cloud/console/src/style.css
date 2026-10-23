@@ -339,10 +339,6 @@ button.link:hover { text-decoration: underline; }
 .mono { font-family: var(--mono); }
 .result-meta { display: flex; align-items: center; gap: 6px; }
 .result-meta .grow { flex: 1; }
-.stmts { display: flex; gap: 4px; padding: 6px 10px; border-bottom: 1px solid var(--line); overflow-x: auto; }
-.stmts button { font: 11.5px var(--mono); padding: 2px 8px; white-space: nowrap; }
-.stmts button.on { border-color: var(--accent); color: var(--accent); }
-.stmts button.err { color: var(--err); }
 pre.plan { margin: 0; padding: 12px 14px; font: 12px/1.6 var(--mono); }
 .menu-list.wide { left: 0; right: auto; min-width: 420px; max-height: 60vh; overflow: auto; }
 .menu-list.wide button { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -6,7 +6,7 @@ import { closeCompletion } from "@codemirror/autocomplete";
 import { sql, SQLite } from "@codemirror/lang-sql";
 import { lintGutter, setDiagnostics } from "@codemirror/lint";
 import { format } from "sql-formatter";
-import { History as HistoryIcon, PanelRight, WandSparkles } from "lucide-react";
+import { History as HistoryIcon, ListChecks, PanelRight, WandSparkles } from "lucide-react";
 import { query, run, split } from "../db.js";
 import { download, fmt, toCSV, toJSON } from "../values.js";
 import { useStudio } from "../studio.js";
@@ -136,7 +136,7 @@ export default function QueryView({ initial = "", title, onTitle }) {
 					const { sql, params } = await bind(s);
 					if (READS.has(verb(sql))) {
 						const r = await query(sql, params);
-						out.push({ sql: s, ...r, meta: `${fmt(r.rows.length)} row${r.rows.length === 1 ? "" : "s"} · ${r.ms.toFixed(2)} ms` });
+						out.push({ sql: s, ...r, verb: verb(sql), meta: `${fmt(r.rows.length)} row${r.rows.length === 1 ? "" : "s"} · ${r.ms.toFixed(2)} ms` });
 						if (verb(sql) === "PRAGMA") wrote = true; // a PRAGMA can set as well as read
 					} else {
 						const r = await run(sql, params);
@@ -144,25 +144,23 @@ export default function QueryView({ initial = "", title, onTitle }) {
 						// Only INSERT, UPDATE, DELETE and REPLACE count rows: after any other
 						// statement changes() still holds the last count before it.
 						const counted = /^(INSERT|UPDATE|DELETE|REPLACE)$/.test(verb(sql));
-						const ms = `${(performance.now() - t).toFixed(2)} ms`;
-						out.push({ sql: s, columns: [], rows: [], meta: counted ? `${fmt(r.changes)} row${r.changes === 1 ? "" : "s"} changed · ${ms}` : `Done · ${ms}` });
+						const ms = performance.now() - t;
+						out.push({ sql: s, columns: [], rows: [], verb: verb(sql), ms, changes: counted ? r.changes : undefined, meta: counted ? `${fmt(r.changes)} row${r.changes === 1 ? "" : "s"} changed · ${ms.toFixed(2)} ms` : `Done · ${ms.toFixed(2)} ms` });
 					}
 				} catch (e) {
-					out.push({ sql: s, error: e.message });
+					out.push({ sql: s, verb: verb(s), error: e.message, ms: performance.now() - t });
 					mark(qAt + sAt, qAt + sAt + s.length, e.message);
 					break;
 				}
 			}
 		} catch (e) {
-			out.push({ sql: q, error: e.message });
+			out.push({ sql: q, verb: verb(q), error: e.message });
 		} finally {
 			setBusy(false);
 		}
 		setRuns((rs) => [{ at: Date.now(), sql: q, results: out }, ...rs].slice(0, 20));
 		setRunAt(0);
-		// Show the last statement that returned rows, or else the last one.
-		const pick = out.findLastIndex((r) => r.error) >= 0 ? out.length - 1 : Math.max(out.findLastIndex((r) => r.columns?.length), out.length - 1);
-		setShown(pick);
+		setShown(defaultShown(out));
 		const failed = out.find((r) => r.error);
 		const ms = (performance.now() - t0).toFixed(1);
 		if (failed) status(out.length > 1 ? `Statement ${out.length} of the script failed: ${failed.error}` : failed.error, true);
@@ -248,7 +246,7 @@ export default function QueryView({ initial = "", title, onTitle }) {
 		return () => removeEventListener("click", close);
 	}, []);
 
-	const r = results[shown];
+	const r = shown === "summary" ? null : results[shown];
 	const hist = menu === "history" ? history() : [];
 
 	return (
@@ -296,11 +294,16 @@ export default function QueryView({ initial = "", title, onTitle }) {
 				/>
 				{schemaOpen && <SchemaPanel schema={schema} onInsert={insert} />}
 			</div>
-			{results.length > 1 && (
-				<div className="stmts">
-					{results.map((x, i) => (
-						<button key={i} className={`${i === shown ? "on" : ""}${x.error ? " err" : ""}`} title={x.sql} onClick={() => { setShown(i); setPlan(null); }}>
-							{i + 1}. {verb(x.sql)} <span className="dim">{x.error ? "error" : x.meta.split(" · ")[0]}</span>
+			{results.length > 0 && (
+				<div className="rtabs">
+					{(results.length > 1 || !results[0].columns?.length) && (
+						<button className={`${shown === "summary" ? "on" : ""}${results.some((x) => x.error) ? " err" : ""}`} onClick={() => { setShown("summary"); setPlan(null); }}>
+							<ListChecks size={12} /> Summary
+						</button>
+					)}
+					{results.map((x, i) => x.columns?.length > 0 && (
+						<button key={i} className={i === shown ? "on" : ""} title={x.sql} onClick={() => { setShown(i); setPlan(null); }}>
+							{tabLabel(results, i)}
 						</button>
 					))}
 				</div>
@@ -317,14 +320,14 @@ export default function QueryView({ initial = "", title, onTitle }) {
 				<div className="result-meta err">{r.error}</div>
 			) : (
 				<div className="result-meta">
-					{r ? r.meta : "Run a statement to see its rows."}
+					{shown === "summary" ? `${results.length} statement${results.length === 1 ? "" : "s"}` : r ? r.meta : "Run a statement to see its rows."}
 					<span className="grow" />
 					{runs.length > 1 && (
 						<MenuButton
 							className="ghost small"
 							label={<><HistoryIcon size={13} /> {runAt === 0 ? "Latest run" : `${runAt} run${runAt > 1 ? "s" : ""} back`} ▾</>}
 							title="Results of earlier runs"
-							items={runs.map((x, k) => ({ label: x.sql.replace(/\s+/g, " ").slice(0, 60), hint: new Date(x.at).toLocaleTimeString(), onClick: () => { setRunAt(k); setShown(Math.max(0, x.results.length - 1)); setPlan(null); } }))}
+							items={runs.map((x, k) => ({ label: x.sql.replace(/\s+/g, " ").slice(0, 60), hint: new Date(x.at).toLocaleTimeString(), onClick: () => { setRunAt(k); setShown(defaultShown(x.results)); setPlan(null); } }))}
 						/>
 					)}
 					{r?.columns?.length > 0 && (
@@ -349,6 +352,8 @@ export default function QueryView({ initial = "", title, onTitle }) {
 					)
 				) : busy ? (
 					<Spinner label="Running…" />
+				) : shown === "summary" ? (
+					<Summary results={results} onOpen={(i) => setShown(i)} />
 				) : r?.columns?.length > 0 && as === "chart" ? (
 					<Chart key={r.sql} columns={r.columns} rows={r.rows} />
 				) : r?.columns?.length > 0 && (
@@ -358,6 +363,45 @@ export default function QueryView({ initial = "", title, onTitle }) {
 				)}
 			</div>
 		</>
+	);
+}
+
+// defaultShown is what a run shows first: the summary when a statement
+// failed or none returned rows, else the last that did.
+function defaultShown(out) {
+	const last = out.findLastIndex((r) => r.columns?.length);
+	return out.some((r) => r.error) || last < 0 ? "summary" : last;
+}
+
+// tabLabel names result i: the table it reads, or "result N", with its rows
+// and columns ("product 67×7").
+function tabLabel(results, i) {
+	const x = results[i];
+	const from = /\bFROM\s+(?:"((?:[^"]|"")+)"|`([^`]+)`|\[([^\]]+)\]|([\w$]+))/i.exec(x.sql);
+	const name = from ? (from[1]?.replace(/""/g, '"') ?? from[2] ?? from[3] ?? from[4]) : `result ${results.slice(0, i + 1).filter((y) => y.columns?.length).length}`;
+	return `${name} ${fmt(x.rows.length)}×${x.columns.length}`;
+}
+
+// Summary lists every statement of a run: what it was, what it did, how long
+// it took, and its error. A statement that returned rows opens its tab.
+function Summary({ results, onOpen }) {
+	return (
+		<table className="summary">
+			<thead><tr><th>#</th><th>statement</th><th>kind</th><th>result</th><th>time</th></tr></thead>
+			<tbody>
+				{results.map((x, i) => (
+					<tr key={i} className={x.columns?.length ? "click" : ""} onClick={x.columns?.length ? () => onOpen(i) : undefined} title={x.sql}>
+						<td className="dim">{i + 1}</td>
+						<td className="sql">{x.sql.replace(/\s+/g, " ")}</td>
+						<td>{x.verb}</td>
+						<td className={x.error ? "err" : ""}>
+							{x.error ? x.error : x.columns?.length ? `${fmt(x.rows.length)} row${x.rows.length === 1 ? "" : "s"} × ${x.columns.length}` : x.changes !== undefined ? `${fmt(x.changes)} changed` : "done"}
+						</td>
+						<td className="dim">{x.ms !== undefined ? `${x.ms.toFixed(2)} ms` : ""}</td>
+					</tr>
+				))}
+			</tbody>
+		</table>
 	);
 }
 
