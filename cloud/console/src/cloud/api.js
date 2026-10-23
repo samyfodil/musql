@@ -3,6 +3,7 @@
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import { timestampDate, timestampFromDate } from "@bufbuild/protobuf/wkt";
+import { AIService } from "../gen/cloud/v1/ai_pb.js";
 import { AuthService } from "../gen/cloud/v1/auth_pb.js";
 import { DatabaseService } from "../gen/cloud/v1/database_pb.js";
 import { GroupService } from "../gen/cloud/v1/group_pb.js";
@@ -30,6 +31,7 @@ const bearer = (next) => async (req) => {
 const transport = server && createConnectTransport({ baseUrl: server, interceptors: [bearer] });
 
 export const api = server && {
+	ai: createClient(AIService, transport),
 	auth: createClient(AuthService, transport),
 	db: createClient(DatabaseService, transport),
 	groups: createClient(GroupService, transport),
@@ -53,3 +55,10 @@ export const ROLES = [
 	[Role.OWNER, "owner"],
 ];
 export const roleName = (r) => ROLES.find(([v]) => v === r)?.[1] ?? "none";
+
+/** The {org, database} a connection is to, when it is a database of this cloud server; else null. */
+export function cloudDatabase(conn) {
+	if (!server || conn?.kind !== "remote" || !conn.url?.startsWith(`${server}/db/`)) return null;
+	const [org, database] = conn.url.slice(server.length + 4).split("/");
+	return org && database ? { org, database } : null;
+}

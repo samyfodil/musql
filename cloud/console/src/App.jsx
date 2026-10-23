@@ -21,6 +21,7 @@ import { isStudioTable } from "./vectors.js";
 import { CloudMain, CloudSide, PAGES } from "./cloud/Cloud.jsx";
 import { useCloud } from "./cloud/useCloud.js";
 import { server as cloudServer } from "./cloud/auth.js";
+import { cloudDatabase } from "./cloud/api.js";
 
 // The editor (CodeMirror) loads with the first query tab, not with the page.
 const QueryView = lazy(() => import("./components/QueryView.jsx"));
@@ -533,6 +534,7 @@ export default function App() {
 		return m < 1 ? "just now" : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : new Date(t).toLocaleDateString();
 	};
 	const remote = conn.kind === "remote";
+	const cloudTarget = cloudDatabase(conn);
 	const others = recents.filter((r) => r.name !== dbName && !remoteNamed(r.name)).slice(0, 6);
 	const otherRemotes = remoteList.filter((r) => r.name !== dbName).slice(0, 6);
 	// connectRemote opens c and keeps it; it reports whether that worked, so
@@ -780,7 +782,7 @@ export default function App() {
 									</Suspense>
 								) : (
 									<Suspense fallback={<Spinner label="Loading the editor…" />}>
-										<QueryView initial={t.text} title={t.title} onTitle={(title) => retitle(t.id, title)} />
+										<QueryView initial={t.text} title={t.title} onTitle={(title) => retitle(t.id, title)} ask={cloudTarget} />
 									</Suspense>
 								)}
 							</div>
