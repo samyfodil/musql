@@ -3,6 +3,8 @@ import { ident, query, rows as rowsOf, run } from "../db.js";
 import { download, fmt, show, toCSV, toJSON, typed } from "../values.js";
 import { useStudio } from "../studio.js";
 import Grid from "./Grid.jsx";
+import { Spinner } from "./Busy.jsx";
+import Chart from "./Chart.jsx";
 import RowDialog from "./RowDialog.jsx";
 import { DEFAULT_MODEL, MODELS, setEmbedProgress } from "../embed.js";
 import { embeddingsOf, fillMissing, missingCount, search, searchVec1, setUpEmbedding } from "../vectors.js";
@@ -239,6 +241,7 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 			<div className="toolbar">
 				<div className="seg">
 					<button className={mode === "data" ? "on" : ""} onClick={() => setMode("data")}>Data</button>
+					<button className={mode === "chart" ? "on" : ""} title="This page of rows as a chart" onClick={() => setMode("chart")}>Chart</button>
 					<button className={mode === "structure" ? "on" : ""} onClick={() => setMode("structure")}>Structure</button>
 				</div>
 				{mode === "data" && (
@@ -300,12 +303,16 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 					</>
 				)}
 			</div>
-			{mode === "data" ? (
+			{mode === "chart" ? (
+				<div className="gridwrap">{data ? <Chart key={name + offset} columns={shown} rows={body} /> : <Spinner />}</div>
+			) : mode === "data" ? (
 				<>
 					<div className="gridwrap">
 						{error ? (
 							<div className="result-meta err">{error}</div>
-						) : data && (
+						) : !data ? (
+							<Spinner label={`Reading ${name}…`} />
+						) : (
 							<>
 								<Grid
 									columns={shown}

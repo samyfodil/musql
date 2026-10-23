@@ -11,6 +11,9 @@ import { DEFAULT_MODEL, embed, vectorBlob } from "../embed.js";
 import { expandEmbeds, verb } from "../sqltext.js";
 import { history, remember, save } from "../library.js";
 import Grid from "./Grid.jsx";
+import Chart from "./Chart.jsx";
+import PlanFlow from "./PlanFlow.jsx";
+import { Spinner } from "./Busy.jsx";
 
 const MAX_ROWS = 5000;
 const READS = new Set(["SELECT", "WITH", "VALUES", "EXPLAIN", "PRAGMA"]);
@@ -29,6 +32,8 @@ export default function QueryView({ initial = "", title, onTitle }) {
 	const [plan, setPlan] = useState(null); // {sql, tree, code?}
 	const [busy, setBusy] = useState(false);
 	const [menu, setMenu] = useState(null); // "history" | null
+	const [as, setAs] = useState("grid"); // how a result shows: "grid" | "chart"
+	const [planAs, setPlanAs] = useState("flow"); // "flow" | "text"
 	const view = useRef(null);
 	const go = useRef(null);
 
@@ -108,7 +113,7 @@ export default function QueryView({ initial = "", title, onTitle }) {
 			const { sql, params } = await bind(s);
 			const qp = await query(`EXPLAIN QUERY PLAN ${sql}`, params);
 			const bc = code ? await query(`EXPLAIN ${sql}`, params) : null;
-			setPlan({ sql: s, tree: planTree(qp.rows), code: bc });
+			setPlan({ sql: s, rows: qp.rows, tree: planTree(qp.rows), code: bc });
 		} catch (e) {
 			setPlan({ sql: s, error: e.message });
 		}
@@ -178,7 +183,7 @@ export default function QueryView({ initial = "", title, onTitle }) {
 	return (
 		<>
 			<div className="toolbar">
-				<button className="primary" disabled={busy} onClick={() => go.current()}>Run</button>
+				<button className="primary" disabled={busy} onClick={() => go.current()}>{busy ? <><span className="spinner inline" /> Running</> : "Run"}</button>
 				<span className="kbd">⌘ Enter</span>
 				<button title="The query plan of the statement" onClick={() => explain(false)}>Explain</button>
 				<button title="Save this query, by name, in this browser" onClick={saveAs}>Save…</button>
@@ -224,6 +229,7 @@ export default function QueryView({ initial = "", title, onTitle }) {
 				<div className="result-meta">
 					Plan of <span className="mono">{plan.sql.replace(/\s+/g, " ").slice(0, 80)}</span>
 					<span className="grow" />
+					{!plan.error && <button className="link" onClick={() => setPlanAs(planAs === "flow" ? "text" : "flow")}>{planAs === "flow" ? "as text" : "as flow"}</button>}
 					{!plan.code && !plan.error && <button className="link" onClick={() => explain(true)}>bytecode</button>}
 					<button className="link" onClick={() => setPlan(null)}>close</button>
 				</div>
@@ -235,6 +241,10 @@ export default function QueryView({ initial = "", title, onTitle }) {
 					<span className="grow" />
 					{r?.columns?.length > 0 && (
 						<>
+							<div className="seg small-seg">
+								<button className={as === "grid" ? "on" : ""} onClick={() => setAs("grid")}>▦ Grid</button>
+								<button className={as === "chart" ? "on" : ""} onClick={() => setAs("chart")}>▤ Chart</button>
+							</div>
 							<button className="link" onClick={() => download("result.csv", toCSV(r.columns, r.rows), "text/csv")}>CSV</button>
 							<button className="link" onClick={() => download("result.json", toJSON(r.columns, r.rows), "application/json")}>JSON</button>
 						</>
@@ -245,10 +255,14 @@ export default function QueryView({ initial = "", title, onTitle }) {
 				{plan ? (
 					plan.error ? <div className="result-meta err">{plan.error}</div> : (
 						<>
-							<pre className="plan">{plan.tree}</pre>
+							{planAs === "flow" && !plan.code ? <PlanFlow rows={plan.rows} dark={dark} /> : <pre className="plan">{plan.tree}</pre>}
 							{plan.code && <Grid columns={plan.code.columns} rows={plan.code.rows} />}
 						</>
 					)
+				) : busy ? (
+					<Spinner label="Running…" />
+				) : r?.columns?.length > 0 && as === "chart" ? (
+					<Chart key={r.sql} columns={r.columns} rows={r.rows} />
 				) : r?.columns?.length > 0 && (
 					<>
 						<Grid columns={r.columns} rows={r.rows.slice(0, MAX_ROWS)} types={Object.fromEntries(r.columns.map((c, i) => [c, r.types?.[i] ?? ""]))} />

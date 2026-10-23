@@ -14,10 +14,21 @@ export const ready = new Promise((resolve, reject) => {
 	worker.addEventListener("error", (e) => reject(new Error(e.message || "the database worker failed to start")));
 });
 
+// Listeners told how many calls are in flight, for the page's busy bar.
+const busyListeners = new Set();
+const busy = () => busyListeners.forEach((f) => f(pending.size));
+
+/** onBusy(f) calls f(n) whenever the number of calls in flight changes; it returns the unsubscribe. */
+export function onBusy(f) {
+	busyListeners.add(f);
+	return () => busyListeners.delete(f);
+}
+
 worker.addEventListener("message", ({ data }) => {
 	const p = pending.get(data.id);
 	if (!p) return;
 	pending.delete(data.id);
+	busy();
 	if (data.error !== undefined) p.reject(new Error(data.error));
 	else p.resolve(data.result);
 });
@@ -27,6 +38,7 @@ export async function call(op, ...args) {
 	const id = ++nextId;
 	return new Promise((resolve, reject) => {
 		pending.set(id, { resolve, reject });
+		busy();
 		worker.postMessage({ id, op, args });
 	});
 }
