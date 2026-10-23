@@ -89,6 +89,8 @@ type History struct {
 	baseFI os.FileInfo
 	seq    uint64
 	closed bool
+	// notify is closed at the next record written, or at Close.
+	notify chan struct{}
 }
 
 var open sync.Map // absolute database path -> *History
@@ -155,6 +157,10 @@ func (h *History) Close() error {
 		return nil
 	}
 	h.closed = true
+	if h.notify != nil {
+		close(h.notify)
+		h.notify = nil
+	}
 	open.CompareAndDelete(h.path, h)
 	return h.log.Close()
 }
@@ -200,29 +206,12 @@ func (h *History) load() error {
 		if _, err := r.ReadAt(b, off+4); err != nil {
 			break
 		}
-		body := b[:n]
-		if crc32.Checksum(body, crcTable) != binary.LittleEndian.Uint32(b[n:]) {
+		e, err := decodeRecord(b, off)
+		if errors.Is(err, errBadCRC) {
 			break
 		}
-		e := entry{kind: body[0], seq: binary.LittleEndian.Uint64(body[1:]),
-			at: time.Unix(0, int64(binary.LittleEndian.Uint64(body[9:]))), counter: binary.LittleEndian.Uint32(body[17:]), rec: off}
-		pl := body[hdrLen-4:]
-		switch e.kind {
-		case kindBatch:
-			if len(pl) < 8 {
-				return fmt.Errorf("store: %s: short batch record at %d", h.logPath(), off)
-			}
-			e.from = int64(binary.LittleEndian.Uint64(pl))
-			e.off, e.n = off+4+hdrLen-4+8, int64(len(pl)-8)
-		case kindBase, kindManualBase:
-			if len(pl) != baseLen {
-				return fmt.Errorf("store: %s: bad base record at %d", h.logPath(), off)
-			}
-			e.size = int64(binary.LittleEndian.Uint64(pl))
-			copy(e.sum[:], pl[8:40])
-			e.deltaLen = int64(binary.LittleEndian.Uint64(pl[40:]))
-		default:
-			return fmt.Errorf("store: %s: unknown record kind %d at %d", h.logPath(), e.kind, off)
+		if err != nil {
+			return fmt.Errorf("store: %s: %w", h.logPath(), err)
 		}
 		h.entries = append(h.entries, e)
 		off += 4 + n + 4
@@ -246,6 +235,42 @@ func (h *History) load() error {
 		h.loggedEnd = h.spanEnd(len(h.entries) - 1)
 	}
 	return nil
+}
+
+var errBadCRC = errors.New("bad record checksum")
+
+// decodeRecord parses a record's body and checksum (b, the record without its
+// length), found at offset off of a log.
+func decodeRecord(b []byte, off int64) (entry, error) {
+	if len(b) < hdrLen {
+		return entry{}, fmt.Errorf("short record at %d", off)
+	}
+	n := len(b) - 4
+	body := b[:n]
+	if crc32.Checksum(body, crcTable) != binary.LittleEndian.Uint32(b[n:]) {
+		return entry{}, errBadCRC
+	}
+	e := entry{kind: body[0], seq: binary.LittleEndian.Uint64(body[1:]),
+		at: time.Unix(0, int64(binary.LittleEndian.Uint64(body[9:]))), counter: binary.LittleEndian.Uint32(body[17:]), rec: off}
+	pl := body[hdrLen-4:]
+	switch e.kind {
+	case kindBatch:
+		if len(pl) < 8 {
+			return entry{}, fmt.Errorf("short batch record at %d", off)
+		}
+		e.from = int64(binary.LittleEndian.Uint64(pl))
+		e.off, e.n = off+4+hdrLen-4+8, int64(len(pl)-8)
+	case kindBase, kindManualBase:
+		if len(pl) != baseLen {
+			return entry{}, fmt.Errorf("bad base record at %d", off)
+		}
+		e.size = int64(binary.LittleEndian.Uint64(pl))
+		copy(e.sum[:], pl[8:40])
+		e.deltaLen = int64(binary.LittleEndian.Uint64(pl[40:]))
+	default:
+		return entry{}, fmt.Errorf("unknown record kind %d at %d", e.kind, off)
+	}
+	return e, nil
 }
 
 // baseOf is the index of the base entry i replays from.
@@ -288,19 +313,28 @@ func (h *History) appendRecord(e entry, payload ...[]byte) error {
 		b = append(b, p...)
 	}
 	b = binary.LittleEndian.AppendUint32(b, crc32.Checksum(b[4:], crcTable))
+	return h.writeRecord(b)
+}
+
+// writeRecord appends one encoded record, syncs it and indexes it.
+func (h *History) writeRecord(b []byte) error {
+	e, err := decodeRecord(b[4:], h.size)
+	if err != nil {
+		return err
+	}
 	if _, err := h.log.WriteAt(b, h.size); err != nil {
 		return err
 	}
 	if err := h.log.Sync(); err != nil {
 		return err
 	}
-	e.rec = h.size
-	if e.kind == kindBatch {
-		e.off, e.n = h.size+4+hdrLen-4+8, int64(len(payload[1]))
-	}
 	h.size += int64(len(b))
 	h.entries = append(h.entries, e)
 	h.seq = e.seq
+	if h.notify != nil {
+		close(h.notify)
+		h.notify = nil
+	}
 	return nil
 }
 
