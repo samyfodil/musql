@@ -12,12 +12,15 @@ import { MenuButton, useContextMenu } from "./components/Menu.jsx";
 import { useToasts } from "./components/Toasts.jsx";
 import Palette from "./components/Palette.jsx";
 import Shortcuts from "./components/Shortcuts.jsx";
-import { Contrast, Globe, HardDrive, Keyboard, Moon, Network, Search, SquareTerminal, Sun, Table2 } from "lucide-react";
+import { Cloud, Contrast, Globe, HardDrive, Keyboard, Moon, Network, Search, SquareTerminal, Sun, Table2 } from "lucide-react";
 import { ImportDialog, TableDialog } from "./components/Dialogs.jsx";
 import ConnectDrawer from "./components/ConnectDrawer.jsx";
 import { SAMPLE } from "./sample.js";
 import { saved, unsave } from "./library.js";
 import { isStudioTable } from "./vectors.js";
+import { CloudMain, CloudSide, PAGES } from "./cloud/Cloud.jsx";
+import { useCloud } from "./cloud/useCloud.js";
+import { server as cloudServer } from "./cloud/auth.js";
 
 // The editor (CodeMirror) loads with the first query tab, not with the page.
 const QueryView = lazy(() => import("./components/QueryView.jsx"));
@@ -93,7 +96,9 @@ export default function App() {
 	const [active, setActive] = useState(null);
 	const [filter, setFilter] = useState("");
 	const [dragging, setDragging] = useState(false);
-	const [section, setSection] = useState("tables"); // the rail: "tables" | "sql" | "diagram"
+	const [section, setSection] = useState(() => (cloudServer && (location.hash === "#cloud" || location.pathname === "/console/callback") ? "cloud" : "tables")); // the rail: "tables" | "sql" | "diagram" | "cloud"
+	const [cloudPage, setCloudPage] = useState("databases");
+	const cloud = useCloud();
 	const [palette, setPalette] = useState(false);
 	const [keys, setKeys] = useState(false);
 	const [showInternal, setShowInternal] = useState(false);
@@ -540,6 +545,17 @@ export default function App() {
 		setConnecting(null);
 		return true;
 	};
+	// openCloud opens a database of the cloud server in the editor, over Hrana
+	// with a short-lived token the cloud page minted; it is not kept in the
+	// connection list, since the token would outlive its use.
+	const openCloud = async (c) => {
+		await openDatabase(c.name, undefined, undefined, null, c);
+		if (backend().url === c.url) setSection("tables");
+	};
+	const goCloud = (page) => {
+		setSection("cloud");
+		if (page) setCloudPage(page);
+	};
 	const fileItems = [
 		{ label: "Undo", hint: remote ? "local only" : "⌘Z", disabled: remote || !hist.undo, onClick: undo },
 		{ label: "Redo", hint: remote ? "local only" : "⇧⌘Z", disabled: remote || !hist.redo, onClick: redo },
@@ -588,10 +604,12 @@ export default function App() {
 		act("Open a file", pickFile, "⌘O", "⇧");
 		act("Open the sample database", () => openDatabase("sample.musq", undefined, SAMPLE), "", "★");
 		act("New empty database", () => openDatabase("untitled.musq"), "", "＋");
+		if (cloudServer) for (const [k, label, , admin] of PAGES) if (!admin || cloud.admin) act(`Cloud: ${label}`, () => goCloud(k), "", "☁");
+		if (!cloudServer) act("Sign in to a musql cloud", () => goCloud(), "", "☁");
 		act("Keyboard shortcuts", () => setKeys(true), "?", "⌨");
 		act(`Theme: ${theme === "dark" ? "light" : "dark"}`, () => setTheme(dark ? "light" : "dark"), "", dark ? "☀" : "☾");
 		return out;
-	}, [schema, internal, counts, library, dbName, theme, dark, recents, remoteList, remote, undo, redo]);
+	}, [schema, internal, counts, library, dbName, theme, dark, recents, remoteList, remote, undo, redo, cloud.admin]);
 
 	const tabsShown = tabs.filter((t) => (section === "sql" ? t.kind === "query" : section === "diagram" ? t.kind === "diagram" : t.kind === "table"));
 	const current = tabsShown.find((t) => t.id === active) ?? tabsShown.at(-1);
@@ -625,8 +643,9 @@ export default function App() {
 						["tables", <Table2 size={18} />, "Table editor"],
 						["sql", <SquareTerminal size={18} />, "SQL editor"],
 						["diagram", <Network size={18} />, "Schema diagram"],
+						["cloud", <Cloud size={18} />, cloudServer ? "Cloud" : "Sign in to a musql cloud"],
 					].map(([k, ic, label]) => (
-						<button key={k} className={`railbtn${section === k ? " on" : ""}`} title={label} disabled={!dbName && k !== "tables"} onClick={() => goSection(k)}>
+						<button key={k} className={`railbtn${section === k ? " on" : ""}`} title={label} disabled={!dbName && k !== "tables" && k !== "cloud"} onClick={() => goSection(k)}>
 							{ic}
 						</button>
 					))}
@@ -652,7 +671,9 @@ export default function App() {
 						/>
 						{dbName && remote && <p className="dbnote">Remote: changes go straight to the server. Undo works on local databases.</p>}
 					</div>
-					{section === "sql" ? (
+					{section === "cloud" ? (
+						<CloudSide cloud={cloud} page={cloudPage} setPage={(p) => { setCloudPage(p); setSideOpen(false); }} toast={toast} />
+					) : section === "sql" ? (
 						<>
 							<div className="sidehead">
 								<h3>SQL editor</h3>
@@ -733,7 +754,8 @@ export default function App() {
 				</aside>
 
 				<main className="main">
-					{dbName && (
+					{section === "cloud" && <div className="cloudmain"><CloudMain cloud={cloud} page={cloudPage} setPage={setCloudPage} toast={toast} onOpen={openCloud} /></div>}
+					{dbName && section !== "cloud" && (
 						<div className="tabs">
 							{tabsShown.map((t) => (
 								<div key={t.id} className={`tab${t.id === current?.id ? " active" : ""}`} onClick={() => setActive(t.id)} onAuxClick={(e) => e.button === 1 && closeTab(t.id)}>
@@ -747,7 +769,7 @@ export default function App() {
 							<button className="kbdbtn" onClick={() => setPalette(true)}><Search size={13} /><span className="dim">Search</span> <span className="kbd">⌘K</span></button>
 						</div>
 					)}
-					<div className="panes">
+					<div className="panes" hidden={section === "cloud"}>
 						{tabs.map((t) => (
 							<div key={t.id} className="pane" hidden={t.id !== current?.id}>
 								{t.kind === "table" ? (

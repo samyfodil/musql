@@ -556,7 +556,7 @@ button.pressed { background: var(--hover); border-color: var(--dim); }
 .ffield, .rowfield { display: grid; gap: 5px; }
 .flabel2 { font-weight: 600; font-size: 12.5px; }
 .fhelp { display: block; color: var(--dim); font-size: 11.5px; font-weight: 400; }
-.form input:not([type]), .form select, .rowfield input, .rowfield textarea, .fkrow select {
+.form input:not([type]), .form input[type=email], .form input[type=password], .form input[type=datetime-local], .cloudpage select, .form select, .rowfield input, .rowfield textarea, .fkrow select {
 	font: 13px var(--mono); padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: inherit; outline: none; width: 100%;
 }
 .form input:focus, .form select:focus, .rowfield input:focus, .rowfield textarea:focus { border-color: var(--accent); }
@@ -777,3 +777,37 @@ label.stagetoggle { display: inline-flex; align-items: center; gap: 5px; font-si
 .cm-tooltip.fn-sig .arg { color: var(--accent); font-weight: 600; }
 .cm-tooltip.fn-sig .about { display: block; font-family: var(--sans); color: var(--dim); margin-top: 2px; }
 .stagebar button.primary .kbd { background: rgba(255, 255, 255, 0.2); color: #fff; border-color: transparent; }
+
+/* the cloud section */
+.cloudmain { position: relative; grid-row: 1 / -1; min-height: 0; overflow: auto; background: var(--panel); }
+.cloudpage { max-width: 1080px; padding: 22px 28px 60px; }
+.cloudhead { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+.cloudhead h1 { font-size: 20px; margin: 0; font-weight: 600; }
+.cloudhead p { margin: 2px 0 0; }
+.cloudsub { font-size: 14px; font-weight: 600; margin: 26px 0 8px; }
+table.cloudtable { width: 100%; border-collapse: collapse; }
+.cloudtable th { text-align: left; font-size: 12px; font-weight: 500; color: var(--dim); padding: 6px 10px; border-bottom: 1px solid var(--line); }
+.cloudtable td { padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+.cloudtable tr:hover td { background: var(--hover); }
+.cloudtable tr.off td { color: var(--dim); }
+.cloudtable .num { text-align: right; font-variant-numeric: tabular-nums; }
+.cloudtable .rowactions { text-align: right; }
+.cloudtable .badge { margin-left: 6px; }
+.cloudtable .sqlcell { max-width: 460px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.cloud-none { display: grid; justify-items: center; gap: 6px; padding: 48px 20px; border: 1px dashed var(--line); border-radius: var(--radius); text-align: center; }
+.cloud-none p { margin: 0; }
+.cloud-empty { display: grid; justify-items: center; gap: 6px; }
+.chip { display: inline-flex; align-items: center; gap: 2px; padding: 0 2px 0 7px; margin: 0 4px 2px 0; border: 1px solid var(--line); border-radius: 6px; font-size: 12px; }
+.chip .x { border: 0; background: transparent; padding: 0 4px; color: var(--dim); }
+.secret { padding: 10px 12px; background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius); word-break: break-all; font-size: 12px; user-select: all; }
+.err { color: var(--err); }
+.orgswitch { padding: 6px 8px 2px; }
+.orgswitch .dbbtn { width: 100%; display: flex; align-items: center; gap: 6px; text-align: left; }
+.orgswitch .dbn { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 14px; }
+.tile { display: grid; gap: 2px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius); }
+.tile b { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.usagechart { border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 12px 4px 0; margin-bottom: 12px; }
+@media (max-width: 760px) { .cloudpage { padding: 16px; } .cloudtable th:nth-child(4), .cloudtable td:nth-child(4) { display: none; } }
+.cloudpage select { width: auto; font-family: var(--sans); padding: 4px 8px; }
+.cloudhead select { font-size: 13px; }
