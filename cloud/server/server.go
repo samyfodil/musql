@@ -31,14 +31,22 @@ type Server struct {
 	store    *state.Store
 	provider *oidc.Provider
 	pool     *pool
+	meter    *meter
+	hist     histories
 	handler  http.Handler
 	log      *log.Logger
-	stop     chan struct{}
-	bg       sync.WaitGroup
+
+	stop chan struct{}
+	bg   sync.WaitGroup
 }
 
 // New opens the state in cfg.DataDir, makes sure the configured admin can
 // sign in, and builds the handler.
+//
+// Databases' histories are logged by the engine's commit hook: the process
+// must have called engine.Configure(engine.WithCommitHook(store.OnCommit)).
+// Without it a history still catches up when it is synced (a snapshot, a
+// restore), but commits in between are logged as one.
 func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) {
 	if logger == nil {
 		logger = log.New(os.Stderr, "musql-cloud: ", log.LstdFlags)
@@ -66,26 +74,47 @@ func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) 
 		store.Close()
 		return nil, err
 	}
-	s.pool = newPool()
+	s.meter = newMeter(store, func(id string) int64 {
+		d, err := store.DatabaseByID(context.Background(), id)
+		if err != nil {
+			return 0
+		}
+		return fileSize(s.dbPath(d))
+	})
+	s.pool = newPool(s.openEntry)
 	s.handler = s.routes()
 	s.stop = make(chan struct{})
-	s.bg.Add(1)
-	go s.rotateKeys()
+	s.bg.Go(s.rotateKeys)
+	if cfg.snapshotEvery > 0 {
+		s.bg.Go(func() { s.runSnapshots(s.stop) })
+	}
+	s.bg.Go(s.runUsageFlush)
 	return s, nil
 }
 
 // rotateKeys starts new signing keys on schedule and drops expired ones.
 func (s *Server) rotateKeys() {
-	defer s.bg.Done()
-	t := time.NewTicker(time.Hour)
+	s.every(time.Hour, "rotate signing keys", func(ctx context.Context) error {
+		return s.provider.RotateIfDue(ctx, time.Now())
+	})
+}
+
+// runUsageFlush writes counted usage every usageFlush until stop is closed.
+func (s *Server) runUsageFlush() {
+	s.every(s.cfg.usageFlush, "usage", s.meter.flush)
+}
+
+// every runs fn each d until stop is closed.
+func (s *Server) every(d time.Duration, what string, fn func(context.Context) error) {
+	t := time.NewTicker(d)
 	defer t.Stop()
 	for {
 		select {
 		case <-s.stop:
 			return
 		case <-t.C:
-			if err := s.provider.RotateIfDue(context.Background(), time.Now()); err != nil {
-				s.log.Printf("rotate signing keys: %v", err)
+			if err := fn(context.Background()); err != nil {
+				s.log.Printf("%s: %v", what, err)
 			}
 		}
 	}
@@ -105,6 +134,10 @@ func (s *Server) Close() error {
 	close(s.stop)
 	s.bg.Wait()
 	s.pool.closeAll()
+	s.closeHistories()
+	if err := s.meter.flush(context.Background()); err != nil {
+		s.log.Printf("usage: %v", err)
+	}
 	return s.store.Close()
 }
 

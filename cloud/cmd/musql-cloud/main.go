@@ -16,7 +16,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/samyfodil/musql/engine"
+
 	"github.com/samyfodil/musql/cloud/server"
+	"github.com/samyfodil/musql/cloud/store"
 )
 
 func main() {
@@ -30,6 +33,10 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// Every commit to a hosted database is logged for its history, and hosted
+	// databases may use FTS5, which the engine leaves opt-in.
+	engine.Configure(engine.WithCommitHook(store.OnCommit))
+	engine.RegisterFTS5()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	logger := log.New(os.Stderr, "musql-cloud: ", log.LstdFlags)

@@ -20,6 +20,7 @@ import (
 	"github.com/samyfodil/musql/cloud/gen/cloud/v1/cloudv1connect"
 	"github.com/samyfodil/musql/cloud/oidc"
 	"github.com/samyfodil/musql/cloud/state"
+	"github.com/samyfodil/musql/cloud/store"
 )
 
 type databaseService struct {
@@ -98,39 +99,84 @@ func (s databaseService) Create(ctx context.Context, req *connect.Request[v1.Cre
 	if err := validName("database", m.Name); err != nil {
 		return nil, err
 	}
-	if m.GetBranchOf() != "" || m.SchemaOnly || m.BranchAt != nil {
-		return nil, connect.NewError(connect.CodeUnimplemented, errors.New("branching is not implemented yet"))
+	var src *state.Database
+	switch {
+	case m.GetBranchOf() != "":
+		if src, err = s.store.Database(ctx, o.ID, m.GetBranchOf()); err != nil {
+			return nil, rpcErr(err)
+		}
+	case m.BranchAt != nil:
+		return nil, invalid("branch_at needs branch_of")
+	case m.SchemaOnly && m.GetUpload() == "":
+		return nil, invalid("schema_only needs branch_of or an upload")
 	}
 	group := m.Group
-	if group == "" {
-		group = "default"
+	var g *state.Group
+	if group == "" && src != nil {
+		g, err = s.store.GroupByID(ctx, src.GroupID)
+	} else {
+		if group == "" {
+			group = "default"
+		}
+		g, err = s.store.Group(ctx, o.ID, group)
 	}
-	g, err := s.store.Group(ctx, o.ID, group)
 	if err != nil {
 		return nil, rpcErr(err)
 	}
 	if _, err := s.store.Database(ctx, o.ID, m.Name); err == nil {
 		return nil, rpcErr(state.ErrExists)
 	}
-	d := &state.Database{ID: state.NewID(), OrgID: o.ID, Name: m.Name, GroupID: g.ID}
+	d := &state.Database{ID: state.NewID(), OrgID: o.ID, Name: m.Name, GroupID: g.ID, SchemaOnly: m.SchemaOnly}
 	path := s.dbPath(d)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, rpcErr(err)
 	}
-	if up := m.GetUpload(); up != "" {
-		err = s.fromUpload(o, up, path)
-	} else {
+	switch {
+	case src != nil:
+		var at time.Time
+		if m.BranchAt != nil {
+			at = m.BranchAt.AsTime()
+		}
+		d.Parent, d.ParentAt = src.ID, at
+		if at.IsZero() {
+			d.ParentAt = time.Now()
+		}
+		err = restoreErr(s.copyAt(ctx, src, at, m.SchemaOnly, path))
+	case m.GetUpload() != "" && m.SchemaOnly:
+		full := path + ".upload"
+		if err = s.fromUpload(o, m.GetUpload(), full); err == nil {
+			err = rpcErr(store.SchemaOnly(ctx, full, path))
+		}
+		removeDBFiles(s.log, full)
+	case m.GetUpload() != "":
+		err = s.fromUpload(o, m.GetUpload(), path)
+	default:
 		err = createEmpty(path)
 	}
 	if err != nil {
 		s.removeFiles(d)
 		return nil, err
 	}
-	if err := s.store.CreateDatabase(ctx, d); err != nil {
-		s.removeFiles(d)
-		return nil, rpcErr(err)
+	if err := s.host(ctx, d); err != nil {
+		return nil, err
 	}
 	return connect.NewResponse(&v1.CreateDatabaseResponse{Database: s.dbToProto(ctx, o, d)}), nil
+}
+
+// host records a database whose file is in place and starts its history.
+func (s *Server) host(ctx context.Context, d *state.Database) error {
+	if err := s.store.CreateDatabase(ctx, d); err != nil {
+		s.removeFiles(d)
+		return rpcErr(err)
+	}
+	if _, err := s.history(d); err != nil {
+		if derr := s.store.DeleteDatabase(ctx, d.ID); derr != nil {
+			s.log.Printf("delete %s: %v", d.ID, derr)
+		}
+		s.removeFiles(d)
+		return rpcErr(err)
+	}
+	return nil
 }
 
 // createEmpty writes a new, empty database at path.
