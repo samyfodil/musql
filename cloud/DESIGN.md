@@ -49,6 +49,9 @@ ai:
 snapshots:
   every: "1h"
   keep: "168h"
+console:
+  dir: "./console/dist"    # the console's build, served at /console/
+  cors_origins: []         # other origins allowed to call the API and Hrana
 ```
 
 On first start the admin user is created (or its password reset) from the
@@ -71,8 +74,11 @@ The server is its own issuer at `public_url`:
 - Users: email, display name, argon2id password hash, disabled flag,
   created_at. Admin creates, disables, resets passwords. (Self sign-up,
   passkeys and federation are later.)
-- Access tokens are JWTs (`sub`, `org`, `role`, `exp` ≤ 1h); refresh tokens
-  are opaque, stored hashed, rotated on use.
+- Access tokens are JWTs (`sub`, `exp` ≤ 1h, `token_use: access`); refresh
+  tokens are opaque, stored hashed, rotated on use (presenting a used one
+  revokes its whole family). The token carries no `org`/`role`: a user has a
+  role per org and roles change, so every call looks the role up in state.
+  A server admin acts as owner of every org.
 
 ## Model
 
@@ -85,14 +91,22 @@ The server is its own issuer at `public_url`:
   `parent_at` (a branch), schema-only flag. Served over Hrana at
   `https://<public_url>/db/<org>/<name>` (and `wss://` for v3).
 - **Database token**: a JWT signed by the server, claims `db` (or `group`),
-  `access` (`full` | `read-only`), `exp` (optional). Hrana requests must carry
+  `access` (`full` | `read-only`), `exp` (optional), and `gen`. `db`/`group`
+  hold IDs, not names, so a token survives a rename and never reaches a new
+  database that reuses a deleted one's name; `gen` must equal the
+  database's (group's) token generation, which InvalidateTokens bumps.
+  A Hrana connection is confined (`driver.Conn.Confine`): no ATTACH or VACUUM
+  INTO for anyone, and a read-only one runs with `query_only` locked on.
+  Hrana over WebSocket authenticates with the upgrade request's
+  Authorization header (the hello's token is not checked per database yet). Hrana requests must carry
   one (or a user access token with a role that allows it).
 - **Platform token** (API token): for CI and the CLI without a browser; acts
   as the user who created it, revocable.
 
 ## Storage, history, branching, restore
 
-- Each database is `data/databases/<org>/<name>.musq`, opened through
+- Each database is `data/databases/<org id>/<db id>.musq` (IDs, so renames
+  move nothing), opened through
   `replication.Open` so writes are captured in the change log
   (`replication/` op log), giving PITR without a new format.
 - Snapshots every `snapshots.every`: an export of the database at an HLC
