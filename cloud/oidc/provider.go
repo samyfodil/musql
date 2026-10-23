@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
@@ -68,18 +69,29 @@ type Claims struct {
 	Gen    int64  `json:"gen,omitempty"`
 }
 
-type key struct {
-	kid  string
-	priv ed25519.PrivateKey
+// signKey is a signing key and what is known of the tokens it signed.
+type signKey struct {
+	kid     string
+	priv    ed25519.PrivateKey
+	created time.Time
+	retired time.Time
+	maxExp  int64 // see state.SigningKey.MaxExp
 }
+
+// expiryMargin is added to a token's expiry when it is recorded, so the
+// record is written about once a day instead of at every sign-in.
+const expiryMargin = 24 * time.Hour
 
 // Provider is the OIDC provider.
 type Provider struct {
-	store  *state.Store
-	issuer string
-	active key
-	pub    map[string]ed25519.PublicKey
-	secure bool
+	store    *state.Store
+	issuer   string
+	rotation time.Duration
+	secure   bool
+
+	mu     sync.RWMutex
+	active *signKey
+	keys   map[string]*signKey
 	byIP   *limiter
 	byMail *limiter
 }
@@ -89,9 +101,15 @@ type Option func(*options)
 
 type options struct {
 	consoleOrigins []string
+	rotation       time.Duration
 	perIP, perMail int
 	loginWindow    time.Duration
 }
+
+// WithKeyRotation makes a new signing key take over after d; the old key stays
+// in the key set until every token it signed has expired. Zero, the default,
+// never rotates. Rotation happens in RotateIfDue.
+func WithKeyRotation(d time.Duration) Option { return func(o *options) { o.rotation = d } }
 
 // WithLoginLimits sets how many failed sign-ins one address, and one email,
 // may make within the window before /login answers 429. A zero count or window
@@ -126,7 +144,7 @@ func New(ctx context.Context, store *state.Store, issuer string, opts ...Option)
 		f(&o)
 	}
 	issuer = strings.TrimRight(issuer, "/")
-	p := &Provider{store: store, issuer: issuer, pub: map[string]ed25519.PublicKey{}, secure: strings.HasPrefix(issuer, "https://")}
+	p := &Provider{store: store, issuer: issuer, rotation: o.rotation, keys: map[string]*signKey{}, secure: strings.HasPrefix(issuer, "https://")}
 	p.byIP, p.byMail = newLimiter(o.perIP, o.loginWindow), newLimiter(o.perMail, o.loginWindow)
 	keys, err := store.SigningKeys(ctx)
 	if err != nil {
@@ -143,20 +161,23 @@ func New(ctx context.Context, store *state.Store, issuer string, opts ...Option)
 		}
 		keys = []*state.SigningKey{k}
 	}
-	// Every key stays trusted: database tokens may never expire, so a key
-	// that signed one must still verify it. The newest unretired key signs.
+	// Every stored key verifies: database tokens may never expire, so a key
+	// that signed one is kept. The newest unretired key signs.
 	for _, k := range keys {
 		if len(k.PrivateKey) != ed25519.SeedSize {
 			return nil, fmt.Errorf("oidc: signing key %s is malformed", k.KID)
 		}
-		priv := ed25519.NewKeyFromSeed(k.PrivateKey)
-		p.pub[k.KID] = priv.Public().(ed25519.PublicKey)
-		if p.active.priv == nil && k.RetiredAt.IsZero() {
-			p.active = key{kid: k.KID, priv: priv}
+		sk := &signKey{kid: k.KID, priv: ed25519.NewKeyFromSeed(k.PrivateKey), created: k.CreatedAt, retired: k.RetiredAt, maxExp: k.MaxExp}
+		p.keys[k.KID] = sk
+		if p.active == nil && k.RetiredAt.IsZero() {
+			p.active = sk
 		}
 	}
-	if p.active.priv == nil {
+	if p.active == nil {
 		return nil, errors.New("oidc: every signing key is retired")
+	}
+	if err := p.RotateIfDue(ctx, time.Now()); err != nil {
+		return nil, err
 	}
 	console := []string{issuer + "/console/callback"}
 	for _, origin := range o.consoleOrigins {
@@ -179,12 +200,75 @@ func New(ctx context.Context, store *state.Store, issuer string, opts ...Option)
 // Issuer is the provider's issuer URL.
 func (p *Provider) Issuer() string { return p.issuer }
 
+// RotateIfDue starts a new signing key when the active one is older than the
+// rotation period, and drops the retired keys whose tokens have all expired.
+func (p *Provider) RotateIfDue(ctx context.Context, now time.Time) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.rotation > 0 && now.Sub(p.active.created) >= p.rotation {
+		_, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			return err
+		}
+		k := &state.SigningKey{KID: state.NewID(), PrivateKey: priv.Seed(), CreatedAt: now}
+		if err := p.store.AddSigningKey(ctx, k); err != nil {
+			return err
+		}
+		if err := p.store.RetireSigningKey(ctx, p.active.kid, now); err != nil {
+			return err
+		}
+		p.active.retired = now
+		p.active = &signKey{kid: k.KID, priv: priv, created: now}
+		p.keys[k.KID] = p.active
+	}
+	for kid, k := range p.keys {
+		if k.retired.IsZero() || k.maxExp < 0 || k.maxExp+int64(tokenLeeway/time.Second) >= now.Unix() {
+			continue
+		}
+		if err := p.store.DeleteSigningKey(ctx, kid); err != nil {
+			return err
+		}
+		delete(p.keys, kid)
+	}
+	return nil
+}
+
+// tokenLeeway is the clock skew Verify tolerates.
+const tokenLeeway = 30 * time.Second
+
+// noteExpiry records, before k signs a token, that the key must outlive it.
+// A token without an expiry makes the key permanent.
+func (p *Provider) noteExpiry(k *signKey, exp *jwt.NumericDate) error {
+	if k.maxExp < 0 {
+		return nil
+	}
+	want := int64(-1)
+	if exp != nil {
+		want = exp.Time().Add(expiryMargin).Unix()
+		if k.maxExp >= want {
+			return nil
+		}
+	}
+	if err := p.store.SetSigningKeyMaxExp(context.Background(), k.kid, want); err != nil {
+		return err
+	}
+	k.maxExp = want
+	return nil
+}
+
 // Sign signs c, filling in the issuer and issue time.
 func (p *Provider) Sign(c *Claims) (string, error) {
 	c.Issuer = p.issuer
 	c.IssuedAt = jwt.NewNumericDate(time.Now())
-	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.EdDSA, Key: p.active.priv},
-		(&jose.SignerOptions{}).WithType("JWT").WithHeader(jose.HeaderKey("kid"), p.active.kid))
+	p.mu.Lock()
+	k := p.active
+	err := p.noteExpiry(k, c.Expiry)
+	p.mu.Unlock()
+	if err != nil {
+		return "", err
+	}
+	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.EdDSA, Key: k.priv},
+		(&jose.SignerOptions{}).WithType("JWT").WithHeader(jose.HeaderKey("kid"), k.kid))
 	if err != nil {
 		return "", err
 	}
@@ -200,15 +284,17 @@ func (p *Provider) Verify(token, use string) (*Claims, error) {
 	if err != nil || len(t.Headers) != 1 {
 		return nil, ErrInvalidToken
 	}
-	pub, ok := p.pub[t.Headers[0].KeyID]
+	p.mu.RLock()
+	k, ok := p.keys[t.Headers[0].KeyID]
+	p.mu.RUnlock()
 	if !ok {
 		return nil, ErrInvalidToken
 	}
 	var c Claims
-	if err := t.Claims(pub, &c); err != nil {
+	if err := t.Claims(k.priv.Public(), &c); err != nil {
 		return nil, ErrInvalidToken
 	}
-	if err := c.ValidateWithLeeway(jwt.Expected{Issuer: p.issuer, Time: time.Now()}, 30*time.Second); err != nil {
+	if err := c.ValidateWithLeeway(jwt.Expected{Issuer: p.issuer, Time: time.Now()}, tokenLeeway); err != nil {
 		return nil, ErrInvalidToken
 	}
 	if c.Use != use || c.Subject == "" && use != UseDB {
@@ -282,9 +368,11 @@ func (p *Provider) discovery(w http.ResponseWriter, r *http.Request) {
 
 func (p *Provider) jwks(w http.ResponseWriter, r *http.Request) {
 	var set jose.JSONWebKeySet
-	for kid, pub := range p.pub {
-		set.Keys = append(set.Keys, jose.JSONWebKey{Key: pub, KeyID: kid, Algorithm: string(jose.EdDSA), Use: "sig"})
+	p.mu.RLock()
+	for kid, k := range p.keys {
+		set.Keys = append(set.Keys, jose.JSONWebKey{Key: k.priv.Public(), KeyID: kid, Algorithm: string(jose.EdDSA), Use: "sig"})
 	}
+	p.mu.RUnlock()
 	writeJSON(w, http.StatusOK, set)
 }
 

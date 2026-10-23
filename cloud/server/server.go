@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	"connectrpc.com/connect"
 
@@ -31,6 +33,8 @@ type Server struct {
 	pool     *pool
 	handler  http.Handler
 	log      *log.Logger
+	stop     chan struct{}
+	bg       sync.WaitGroup
 }
 
 // New opens the state in cfg.DataDir, makes sure the configured admin can
@@ -57,14 +61,34 @@ func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) 
 		store.Close()
 		return nil, err
 	}
-	if s.provider, err = oidc.New(ctx, store, cfg.PublicURL, oidc.WithConsoleOrigins(cfg.Console.CORSOrigins),
+	if s.provider, err = oidc.New(ctx, store, cfg.PublicURL, oidc.WithConsoleOrigins(cfg.Console.CORSOrigins), oidc.WithKeyRotation(cfg.OIDC.keyRotation),
 		oidc.WithLoginLimits(cfg.OIDC.LoginPerIP, cfg.OIDC.LoginPerEmail, cfg.OIDC.loginWindow)); err != nil {
 		store.Close()
 		return nil, err
 	}
 	s.pool = newPool()
 	s.handler = s.routes()
+	s.stop = make(chan struct{})
+	s.bg.Add(1)
+	go s.rotateKeys()
 	return s, nil
+}
+
+// rotateKeys starts new signing keys on schedule and drops expired ones.
+func (s *Server) rotateKeys() {
+	defer s.bg.Done()
+	t := time.NewTicker(time.Hour)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.stop:
+			return
+		case <-t.C:
+			if err := s.provider.RotateIfDue(context.Background(), time.Now()); err != nil {
+				s.log.Printf("rotate signing keys: %v", err)
+			}
+		}
+	}
 }
 
 // Handler serves everything.
@@ -78,6 +102,8 @@ func (s *Server) Store() *state.Store { return s.store }
 
 // Close closes every open database and the state.
 func (s *Server) Close() error {
+	close(s.stop)
+	s.bg.Wait()
 	s.pool.closeAll()
 	return s.store.Close()
 }

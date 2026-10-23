@@ -154,6 +154,9 @@ var migrations = []string{
 		nonce TEXT NOT NULL,
 		expires_at INTEGER NOT NULL
 	);`,
+	// Keys that existed before this column are -1: what they signed is not
+	// known, so they are never dropped.
+	`ALTER TABLE signing_keys ADD COLUMN max_exp INTEGER NOT NULL DEFAULT -1`,
 }
 
 func (s *Store) migrate() error {
