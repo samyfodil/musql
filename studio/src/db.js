@@ -44,7 +44,15 @@ export async function call(op, ...args) {
 }
 
 export const query = (sql, params) => call("query", sql, params);
-export const run = (sql, params) => call("run", sql, params);
+// beforeWrite, when set, runs before every write: the page snapshots the
+// database there, for undo, and saves it after.
+let beforeWrite = null;
+export const onBeforeWrite = (f) => { beforeWrite = f; };
+
+export async function run(sql, params) {
+	await beforeWrite?.(sql);
+	return call("run", sql, params);
+}
 
 /** Rows as objects keyed by column name. */
 export async function rows(sql, params) {
