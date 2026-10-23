@@ -30,7 +30,7 @@ const OVERSCAN = 12;
 export default function Grid({ columns, count, rowAt, need, types, layoutKey, sort, desc, onSort, onHeaderMenu, picked, onPick, onOpen, onEdit, onPaste, onClear, onContextMenu, range }) {
 	const scroller = useRef(null);
 	const RN = Math.max(52, String(count).length * 8 + 34); // the # column fits the largest row number
-	const [view, setView] = useState({ top: 0, height: 600 });
+	const [view, setView] = useState({ top: 0, height: 600, width: 1000 });
 	const [sel, setSel] = useState(null); // {r0, c0, r1, c1}: anchor and focus, in display order
 	const [editing, setEditing] = useState(null); // [row, displayCol]
 	const [preview, setPreview] = useState(null); // {i, col, x, y}
@@ -41,7 +41,13 @@ export default function Grid({ columns, count, rowAt, need, types, layoutKey, so
 	const shownCols = [...layout.pinned.filter((c) => order.includes(c)), ...order.filter((c) => !layout.pinned.includes(c))];
 	const idx = useMemo(() => Object.fromEntries(columns.map((c, j) => [c, j])), [columns]);
 	const vector = useMemo(() => Object.fromEntries(columns.map((c) => [c, isVectorColumn(c, types?.[c])])), [columns, types]);
-	const width = (c) => layout.widths[c] ?? 140;
+	// Spare width goes to the text columns not sized by hand, so a narrow
+	// table fills the pane rather than cutting its text off.
+	const base = (c) => layout.widths[c] ?? 140;
+	const natural = RN + order.reduce((n, c) => n + base(c), 0);
+	const stretchy = order.filter((c) => !layout.sized?.includes(c) && !/INT|REAL|NUM|DEC|FLOA|DOUB|BOOL|DATE|TIME|BLOB/i.test(types?.[c] ?? "") && c !== "id" && !/_id$/.test(c));
+	const spare = Math.max(0, view.width - natural - 2);
+	const width = (c) => base(c) + (stretchy.includes(c) ? Math.floor(spare / stretchy.length) : 0);
 	const left = {};
 	let acc = RN;
 	for (const c of shownCols) {
@@ -57,7 +63,7 @@ export default function Grid({ columns, count, rowAt, need, types, layoutKey, so
 	}, [first, last, count, need]);
 	useLayoutEffect(() => {
 		const el = scroller.current;
-		const ro = new ResizeObserver(() => setView({ top: el.scrollTop, height: el.clientHeight }));
+		const ro = new ResizeObserver(() => setView({ top: el.scrollTop, height: el.clientHeight, width: el.clientWidth }));
 		ro.observe(el);
 		return () => ro.disconnect();
 	}, []);
@@ -184,7 +190,7 @@ export default function Grid({ columns, count, rowAt, need, types, layoutKey, so
 		e.stopPropagation();
 		const x0 = e.clientX;
 		const w0 = width(c);
-		const onMove = (ev) => setLayout((l) => ({ ...l, widths: { ...l.widths, [c]: Math.max(48, w0 + ev.clientX - x0) } }));
+		const onMove = (ev) => setLayout((l) => ({ ...l, sized: [...new Set([...(l.sized ?? []), c])], widths: { ...l.widths, [c]: Math.max(48, w0 + ev.clientX - x0) } }));
 		const onUp = () => {
 			removeEventListener("mousemove", onMove);
 			removeEventListener("mouseup", onUp);
@@ -192,7 +198,7 @@ export default function Grid({ columns, count, rowAt, need, types, layoutKey, so
 		addEventListener("mousemove", onMove);
 		addEventListener("mouseup", onUp);
 	}
-	const fit = (c) => setLayout((l) => ({ ...l, widths: { ...l.widths, [c]: fitWidth(c, types?.[c], (i) => rowAt(i)?.[idx[c]], count, vector[c], first, last) } }));
+	const fit = (c) => setLayout((l) => ({ ...l, sized: [...new Set([...(l.sized ?? []), c])], widths: { ...l.widths, [c]: fitWidth(c, types?.[c], (i) => rowAt(i)?.[idx[c]], count, vector[c], first, last) } }));
 	const togglePin = (c) => setLayout((l) => ({ ...l, pinned: l.pinned.includes(c) ? l.pinned.filter((p) => p !== c) : [...l.pinned, c] }));
 
 	const dragCol = useRef(null);
@@ -207,7 +213,7 @@ export default function Grid({ columns, count, rowAt, need, types, layoutKey, so
 			ref={scroller}
 			className="vscroll"
 			tabIndex={0}
-			onScroll={(e) => setView({ top: e.currentTarget.scrollTop, height: e.currentTarget.clientHeight })}
+			onScroll={(e) => setView({ top: e.currentTarget.scrollTop, height: e.currentTarget.clientHeight, width: e.currentTarget.clientWidth })}
 			onKeyDown={onKeyDown}
 			onPaste={onPasteEvent}
 			onCopy={(e) => {
@@ -557,5 +563,5 @@ function load(storageKey, columns, types) {
 	}
 	if (!saved) return base;
 	const order = [...(saved.order ?? []).filter((c) => columns.includes(c)), ...columns.filter((c) => !(saved.order ?? []).includes(c))];
-	return { widths: { ...base.widths, ...saved.widths }, order, pinned: (saved.pinned ?? []).filter((c) => columns.includes(c)) };
+	return { widths: { ...base.widths, ...saved.widths }, order, pinned: (saved.pinned ?? []).filter((c) => columns.includes(c)), sized: (saved.sized ?? []).filter((c) => columns.includes(c)) };
 }
