@@ -38,6 +38,7 @@ node:
   name: "node-1"
   location: "fra"          # this node's location code
 peers: []                  # other nodes: {name, location, url, secret}
+primary: ""                # the primary node's name; this node when empty
 ai:
   provider: "jitllm"       # jitllm | openai | anthropic | openrouter | "" (off)
   model: "slm-sql-1.5b"    # provider's model name; for jitllm, a .jlm path or name in models_dir
@@ -119,10 +120,61 @@ The server is its own issuer at `public_url`:
   into a new database (Turso's model) or in place.
 - **Branch**: a restore into a new database, at now or at T; schema-only
   recreates the parent's objects empty.
-- **Groups & regions**: a database's group lists locations; the primary
-  node writes, others replicate with `replication.Leader` over an HTTP
-  transport between peers (`peers` in config, shared secret). A request to a
-  replica for a write is forwarded to the primary.
+- **Groups & regions**: see below.
+
+## Groups and regions
+
+A deployment is one **primary** node and any number of **replica** nodes, one
+location each (`node.location`, and each entry of `peers`). The primary holds
+the state and writes every database; a group's primary location is therefore
+the primary node's (`GroupService.Create` declines another), and its other
+locations are replicas. `AddLocation` places every database of the group at
+that location; `RemoveLocation` takes them away. Nodes share one
+`public_url` (the deployment's, e.g. behind geo-routing): tokens are issued
+there and verified everywhere.
+
+A replica follows by shipping history records (`HISTORY.md`), never rows:
+
+- **Transport**: `cloud.v1.PeerService.Follow` (ConnectRPC, server stream),
+  called with the two nodes' shared `secret` and the caller's node name. It
+  sends the records after the replica's last seq, or from the newest base
+  when that one is gone or the replica asks for 0; a base's record is
+  followed by its segment file and delta prefix in chunks. Then it sends
+  `live` and each record as it is logged; an idle stream repeats `live`
+  every 10s, and a replica that hears nothing for 30s calls again.
+- **The state** (`state.musq`) is followed the same way (database ID `""`).
+  A replica starts by catching up with it, opens it read-only, verifies
+  tokens with the keys in it (reloaded at each state record), and places
+  databases from it: every database whose group lists its location gets a
+  follower; one no longer listed, or deleted, is closed and its files and
+  history removed.
+- **Applying** (`store.History.Apply`): the record is appended to the
+  replica's own copy of the log (the same bytes), then applied under the
+  engine's write lock (`engine.ReplaceState`): a batch's bytes written at
+  their delta offset, or a base's files installed (old delta removed, segment
+  renamed in, delta prefix copied). A reader sees the state before a record
+  or after it, never between, and every held session re-checks at its next
+  statement. A batch must follow the last record applied; anything that does
+  not apply makes the next call start again from the newest base.
+- **Restarts**: a replica reopens its log and brings its file to the log's
+  end (rolling forward a record logged but not applied), then asks for what
+  follows. A restarted primary is just a closed stream: the replica calls
+  again. An in-place restore, a VACUUM or any rewrite on the primary is a new
+  base of the same history; a branch, a restore into a new database and a
+  create are new databases the state names.
+- **Serving**: a replica serves Hrana for a database placed there once it has
+  applied a base, on a read-only connection, as of its applied position.
+  `hrana.WithPrimary` decides per request: one whose statements are all
+  `SELECT` or `VALUES`, on no baton or a baton this replica issued, runs
+  there; anything else (a write, `BEGIN`, a `WITH`, a `PRAGMA`, stored SQL,
+  the primary's baton, a token the replica's state does not accept yet, every
+  WebSocket) goes to the primary whole. A database not placed there, not
+  caught up, or not yet in the replica's state goes to the primary too. The
+  management API, `/oidc/` and `/login` are proxied to the primary.
+
+Declined, deliberately: a group written anywhere but the primary node
+(failover and per-group primaries need the state to move first); usage is
+counted by the primary only, so reads a replica serves are not in it.
 
 ## Usage analytics
 
@@ -168,6 +220,7 @@ Services, each method checks the caller's role:
 - `GroupService`: List, Create, Delete, AddLocation, RemoveLocation, ListLocations.
 - `DatabaseService`: List, Get, Create (empty, from upload, as branch, from restore point), Delete, Rename, Usage, ListSnapshots, Restore (to time, new or in place), CreateToken, InvalidateTokens, Upload, Export (musq or C SQLite), Stats (top queries).
 - `AIService`: GenerateSQL.
+- `PeerService` (between nodes, shared secret): Follow.
 
 ## Console
 
