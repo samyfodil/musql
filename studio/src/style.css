@@ -703,3 +703,41 @@ kbd { font: 11px var(--mono); padding: 1px 6px; border: 1px solid var(--line); b
 .vgrid td .peek { top: 8px; }
 .toolbar select, .fields select, .inline select, .inline input, .coledit input, input.type, .fchip select, .fchip input, .sortrow select, .chart-controls select { font-size: 13px; }
 .editor .cm-editor { font-size: 14px; }
+
+/* ===== type: Geist, shipped with the app, and a real scale ===== */
+:root {
+	--sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+	--mono: "Geist Mono Variable", ui-monospace, monospace;
+	--fs-label: 11px;   /* section labels, uppercase */
+	--fs-meta: 12.5px;  /* counts, hints, types, timings */
+	--fs-ui: 13.5px;    /* buttons, inputs, menus, nav, cells */
+	--fs-body: 14px;
+	--fs-title: 16px;   /* panels, dialogs, drawers */
+}
+body { font: 400 var(--fs-body)/1.5 var(--sans); letter-spacing: -0.006em; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+button, .button, input, select, textarea { font-family: var(--sans); font-size: var(--fs-ui); }
+button, .button { font-weight: 500; }
+.small, .dim.small, .fhelp, .count, .tfoot .dim, .result-meta { font-size: var(--fs-meta); }
+.side .item, .tabs .tab, .ctxmenu button, .palette-list button, .menu-list button { font-size: var(--fs-ui); }
+.side .item { font-weight: 400; }
+.side .item.active, .tabs .tab.active { font-weight: 500; }
+.side .group h4, .sp-head, .palette-group, .structure h4, .recents h4, .sc-groups h4, .popover-head strong { font-size: var(--fs-label); font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--dim); }
+.popover-head strong { color: var(--text); text-transform: none; letter-spacing: 0; font-size: var(--fs-ui); }
+.sidehead h3 { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+.drawer > header h2, .shortcuts header strong, dialog h2 { font-size: var(--fs-title); font-weight: 600; letter-spacing: -0.01em; }
+.empty h1 { font-size: 24px; font-weight: 600; letter-spacing: -0.02em; }
+.dbbtn .dbn { font-family: var(--sans); font-size: var(--fs-ui); font-weight: 600; }
+.badge, .savestate, kbd, .kbd { font-size: 11px; }
+.flabel2, .cname { font-size: var(--fs-ui); font-weight: 600; }
+
+/* grid: proportional text with aligned digits; code-like values stay mono */
+table.grid, .vgrid td, .vgrid td .cv { font-family: var(--sans); font-size: var(--fs-ui); font-variant-numeric: tabular-nums; }
+.vgrid th { font: 600 12.5px var(--sans); letter-spacing: 0; }
+.grid th .type { font: 500 10.5px var(--sans); letter-spacing: .04em; }
+.vgrid td.json .cv, .vgrid td.blob .cv, .vgrid td.vec .cv, .vgrid td.editing input { font-family: var(--mono); font-size: 12.5px; }
+.vgrid td.null .cv { font-style: normal; color: var(--null); font-size: 12px; letter-spacing: .03em; }
+.vgrid td.rn { font-size: 12px; color: var(--dim); }
+.rowfield input, .rowfield textarea, .form input:not([type]), .form select, .fkrow select { font-family: var(--sans); font-size: var(--fs-body); }
+.where, .searchbox input, .filter { font-family: var(--sans); font-size: var(--fs-ui); }
+.grid th .type { text-transform: none; letter-spacing: 0; }
+.side .link.pad { text-align: left; padding: 8px 8px; }

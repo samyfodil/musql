@@ -256,7 +256,7 @@ export default function Grid({ columns, count, rowAt, need, types, layoutKey, so
 								<div className="thin">
 									{layout.pinned.includes(c) && <Pin size={11} className="pinmark" />}
 									<span className="thname">{c}</span>
-									{types?.[c] && <span className="type">{types[c]}</span>}
+									{types?.[c] && <span className="type" title={types[c]}>{shortType(types[c])}</span>}
 									{sort === c && <span className="sortmark">{desc ? "↓" : "↑"}</span>}
 									{onHeaderMenu && <button className="thmenu" title="Sort, filter, pin or change this column" onClick={(e) => { e.stopPropagation(); onHeaderMenu(e, c, gridItems(c)); }}>▾</button>}
 								</div>
@@ -564,4 +564,14 @@ function load(storageKey, columns, types) {
 	if (!saved) return base;
 	const order = [...(saved.order ?? []).filter((c) => columns.includes(c)), ...columns.filter((c) => !(saved.order ?? []).includes(c))];
 	return { widths: { ...base.widths, ...saved.widths }, order, pinned: (saved.pinned ?? []).filter((c) => columns.includes(c)), sized: (saved.sized ?? []).filter((c) => columns.includes(c)) };
+}
+
+/** A declared type as a header shows it: int, text, real, and the rest lowercased. */
+function shortType(t) {
+	const u = t.toUpperCase();
+	if (/^(INT|INTEGER|BIGINT|SMALLINT|TINYINT)$/.test(u)) return "int";
+	if (/^(REAL|DOUBLE|FLOAT)/.test(u)) return "real";
+	if (/^(TEXT|VARCHAR|CHAR|CLOB)/.test(u)) return "text";
+	if (/^BOOL/.test(u)) return "bool";
+	return t.toLowerCase();
 }
