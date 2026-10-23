@@ -86,6 +86,15 @@ export function typed(text, type) {
 	return text;
 }
 
+/** v as a SQL literal: NULL, a number, a quoted string, or a blob X'…'. */
+export function literal(v) {
+	if (v === null || v === undefined) return "NULL";
+	if (typeof v === "bigint") return String(v);
+	if (typeof v === "number") return Number.isFinite(v) ? String(v) : v > 0 ? "9e999" : v < 0 ? "-9e999" : "NULL";
+	if (v instanceof Uint8Array) return `X'${Array.from(v, (b) => b.toString(16).padStart(2, "0")).join("")}'`;
+	return `'${String(v).replace(/'/g, "''")}'`;
+}
+
 /** Rows as CSV text, RFC 4180: a header line, then one line per row. */
 export function toCSV(columns, rows) {
 	const cell = (v) => {

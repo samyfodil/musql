@@ -7,7 +7,7 @@ import { sql, SQLite } from "@codemirror/lang-sql";
 import { lintGutter, setDiagnostics } from "@codemirror/lint";
 import { format } from "sql-formatter";
 import { History as HistoryIcon, PanelRight, WandSparkles } from "lucide-react";
-import { call, query, run } from "../db.js";
+import { query, run, split } from "../db.js";
 import { download, fmt, toCSV, toJSON } from "../values.js";
 import { useStudio } from "../studio.js";
 import { DEFAULT_MODEL, embed, vectorBlob } from "../embed.js";
@@ -60,7 +60,7 @@ export default function QueryView({ initial = "", title, onTitle }) {
 			return { text: st.sliceDoc(from, to).trim(), at: from };
 		}
 		if (all || !st) return { text: doc.trim(), at: Math.max(0, doc.search(/\S/)) };
-		const stmts = await call("split", doc).catch(() => []);
+		const stmts = await split(doc).catch(() => []);
 		const head = st.selection.main.head;
 		let pos = 0;
 		let pick = null;
@@ -124,7 +124,7 @@ export default function QueryView({ initial = "", title, onTitle }) {
 		let wrote = false;
 		const t0 = performance.now();
 		try {
-			const stmts = await call("split", q);
+			const stmts = await split(q);
 			remember(q);
 			let from = 0;
 			for (const s of stmts) {

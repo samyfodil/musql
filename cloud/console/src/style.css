@@ -10,6 +10,8 @@
 	--sel: #fff4ec;
 	--null: #b1b0aa;
 	--err: #c92a2a;
+	--staged: #fff3bf;
+	--added: #2f9e5b;
 	--mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
 	--sans: ui-sans-serif, -apple-system, "Segoe UI", Inter, Roboto, sans-serif;
 	color-scheme: light;
@@ -28,6 +30,8 @@
 		--sel: #2a1f18;
 		--null: #5e5d58;
 		--err: #ff6b6b;
+		--staged: #3d3413;
+		--added: #51cf66;
 		color-scheme: dark;
 	}
 }
@@ -43,6 +47,8 @@
 	--sel: #2a1f18;
 	--null: #5e5d58;
 	--err: #ff6b6b;
+	--staged: #3d3413;
+	--added: #51cf66;
 	color-scheme: dark;
 }
 
@@ -741,3 +747,36 @@ table.grid, .vgrid td, .vgrid td .cv { font-family: var(--sans); font-size: var(
 .where, .searchbox input, .filter { font-family: var(--sans); font-size: var(--fs-ui); }
 .grid th .type { text-transform: none; letter-spacing: 0; }
 .side .link.pad { text-align: left; padding: 8px 8px; }
+
+/* connections: which kind of database is open */
+.dbbtn .dbkind { flex: none; color: var(--dim); }
+.savestate.remote { color: var(--accent); font-family: var(--mono); max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dbnote { margin: 6px 2px 0; font-size: 11.5px; color: var(--dim); line-height: 1.4; }
+
+/* staged edits: queued, not written yet */
+.grid td.staged-cell { background: var(--staged); box-shadow: inset 2px 0 0 #e8a600; }
+.grid tr.staged-added td.rn { box-shadow: inset 3px 0 0 var(--added); }
+.grid tr.staged-added td.rn span::after { content: " new"; color: var(--added); font-size: 10px; }
+.grid tr.staged-deleted td:not(.rn) { text-decoration: line-through; color: var(--dim); opacity: 0.7; }
+.grid tr.staged-deleted td.rn { box-shadow: inset 3px 0 0 var(--err); }
+.stagebar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--line); background: var(--staged); font-size: 12.5px; }
+.stagebar b { font-weight: 600; }
+.stagesql { margin: 0; padding: 12px; font: 12px/1.55 var(--mono); white-space: pre-wrap; word-break: break-word; background: var(--side); border: 1px solid var(--line); border-radius: 6px; }
+label.stagetoggle { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--dim); cursor: pointer; white-space: nowrap; }
+
+/* result tabs */
+.rtabs { display: flex; gap: 2px; padding: 4px 8px 0; border-bottom: 1px solid var(--line); overflow-x: auto; }
+.rtabs button { border: 1px solid transparent; border-bottom: none; border-radius: 6px 6px 0 0; background: none; font: 12px var(--mono); padding: 4px 10px; white-space: nowrap; color: var(--dim); }
+.rtabs button.on { background: var(--panel); border-color: var(--line); color: var(--text); }
+.rtabs button.err { color: var(--err); }
+.summary { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.summary th, .summary td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.summary th { color: var(--dim); font-weight: 500; }
+.summary td.sql { font-family: var(--mono); max-width: 520px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.summary tr.click { cursor: pointer; }
+.summary tr.click:hover td { background: var(--sel); }
+
+/* function hints */
+.cm-tooltip.fn-sig { padding: 4px 8px; font: 12px var(--mono); max-width: 520px; }
+.cm-tooltip.fn-sig .arg { color: var(--accent); font-weight: 600; }
+.cm-tooltip.fn-sig .about { display: block; font-family: var(--sans); color: var(--dim); margin-top: 2px; }
