@@ -136,7 +136,7 @@ func caughtUp(t *testing.T, p, r *node, org, db string) *state.Database {
 	}
 	eventually(t, r.name+" catches up with "+db, func() bool {
 		f := r.s.replicaFollower(d)
-		return f != nil && f.h.Seq() == h.Seq()
+		return f != nil && f.applied.Load() == h.Seq()
 	})
 	return d
 }
@@ -307,12 +307,12 @@ func TestRegions(t *testing.T) {
 	}
 
 	// The replica restarts and goes on from its own log.
-	seq := ams.s.replicaFollower(d).h.Seq()
+	seq := ams.s.replicaFollower(d).applied.Load()
 	ams.stop()
 	pe.exec("/db/acme/app", admin, `INSERT INTO t VALUES(101, 'while away')`)
 	ams.start()
 	caughtUp(t, p, ams, "acme", "app")
-	if got := ams.s.replicaFollower(d).h.Seq(); got <= seq {
+	if got := ams.s.replicaFollower(d).applied.Load(); got <= seq {
 		t.Fatalf("seq %d after restarting at %d", got, seq)
 	}
 	sameCommitted(t, p.s.dbPath(d), ams.s.replicaPath(d))
