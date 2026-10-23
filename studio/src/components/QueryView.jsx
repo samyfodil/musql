@@ -11,6 +11,7 @@ import { DEFAULT_MODEL, embed, vectorBlob } from "../embed.js";
 import { expandEmbeds, verb } from "../sqltext.js";
 import { history, remember, save } from "../library.js";
 import Grid from "./Grid.jsx";
+import { MenuButton } from "./Menu.jsx";
 import Chart from "./Chart.jsx";
 import PlanFlow from "./PlanFlow.jsx";
 import { Spinner } from "./Busy.jsx";
@@ -185,9 +186,15 @@ export default function QueryView({ initial = "", title, onTitle }) {
 			<div className="toolbar">
 				<button className="primary" disabled={busy} onClick={() => go.current()}>{busy ? <><span className="spinner inline" /> Running</> : "Run"}</button>
 				<span className="kbd">⌘ Enter</span>
-				<button title="The query plan of the statement" onClick={() => explain(false)}>Explain</button>
-				<button title="Save this query, by name, in this browser" onClick={saveAs}>Save…</button>
-				<button title="Create a view from this SELECT" onClick={asView}>View…</button>
+				<button title="How the database runs it: the query plan, drawn as a flow" onClick={() => explain(false)}>Explain</button>
+				<MenuButton
+					label="⋯"
+					title="More"
+					items={[
+						{ label: "Save query…", hint: "in this browser", onClick: saveAs },
+						{ label: "Create a view from it…", onClick: asView },
+					]}
+				/>
 				<div className="menu" onClick={(e) => e.stopPropagation()}>
 					<button onClick={() => setMenu(menu === "history" ? null : "history")}>History ▾</button>
 					{menu === "history" && (

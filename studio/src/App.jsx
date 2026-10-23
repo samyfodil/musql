@@ -4,6 +4,7 @@ import { fmt } from "./values.js";
 import { Studio } from "./studio.js";
 import TableView from "./components/TableView.jsx";
 import { BusyBar, Spinner } from "./components/Busy.jsx";
+import { MenuButton, useContextMenu } from "./components/Menu.jsx";
 import { ImportDialog, TableDialog } from "./components/Dialogs.jsx";
 import { SAMPLE } from "./sample.js";
 import { saved, unsave } from "./library.js";
@@ -89,6 +90,7 @@ export default function App() {
 	const [library, setLibrary] = useState(saved);
 	const [dialog, setDialog] = useState(null); // "table" | {edit: table} | "import" | {import: file} | null
 	const [sideOpen, setSideOpen] = useState(false); // the sidebar, on a narrow screen
+	const [ctxMenu, openCtx] = useContextMenu();
 
 	useEffect(() => {
 		const on = () => setLibrary(saved());
@@ -239,6 +241,31 @@ export default function App() {
 		setTabs((ts) => ts.filter((t) => t.kind !== "table" || schema.some((o) => o.name === t.table)));
 	}, [schema]);
 
+	// objectMenu is a right-click on a sidebar entry.
+	function objectMenu(o) {
+		const own = o.type === "table" || o.type === "view";
+		const drop = async () => {
+			if (!confirm(`Drop ${o.type} ${o.name}? This cannot be undone.`)) return;
+			try {
+				await query(`DROP ${o.type.toUpperCase()} ${ident(o.name)}`);
+				changed();
+				status(`Dropped ${o.name}.`);
+			} catch (e) {
+				status(e.message, true);
+			}
+		};
+		return [
+			own && { label: "Open", onClick: () => openTable(o.name, "data") },
+			{ label: "Structure", onClick: () => openTable(own ? o.name : o.tbl_name, "structure") },
+			o.type === "table" && { label: "Edit table…", onClick: () => setDialog({ edit: o.name }) },
+			own && { label: "Query it", onClick: () => openQuery(`SELECT * FROM ${ident(o.name)}\nLIMIT 100;`, o.name) },
+			{ label: "Copy name", onClick: () => navigator.clipboard?.writeText(o.name) },
+			{ label: "Copy definition", disabled: !o.sql, onClick: () => navigator.clipboard?.writeText(`${o.sql};`) },
+			"-",
+			{ label: `Drop ${o.type}`, danger: true, onClick: drop },
+		];
+	}
+
 	const ctx = { schema, columnsOf, status, changed, dark, openQuery, editTable: (name) => setDialog({ edit: name }) };
 	const activeTab = tabs.find((t) => t.id === active);
 	const f = filter.trim().toLowerCase();
@@ -285,13 +312,27 @@ export default function App() {
 				<div className="layout">
 					<aside className="side" onClick={(e) => e.target.closest("button.item, .item .name") && setSideOpen(false)}>
 						<input className="filter" type="search" placeholder="Filter tables…  ⌘K" spellCheck={false} value={filter} onChange={(e) => setFilter(e.target.value)} />
-						<div className="sidebtns">
-							<button className="newquery" disabled={!dbName} onClick={() => openQuery()}>＋ Query</button>
-							<button className="newquery" disabled={!dbName} onClick={() => setDialog("table")}>＋ Table</button>
-							<button className="newquery" disabled={!dbName} title="Import a CSV or JSON file into a table" onClick={() => setDialog("import")}>Import…</button>
-							<button className="newquery" disabled={!dbName} title="The tables and their foreign keys, as a diagram" onClick={openDiagram}>⌗ Diagram</button>
-						</div>
+						{dbName && (
+							<div className="sidebtns">
+								<button className="newquery" onClick={() => openQuery()}>›_ New query</button>
+								<MenuButton
+									className="newquery"
+									label="＋ ▾"
+									title="Create or import"
+									items={[
+										{ label: "New table…", onClick: () => setDialog("table") },
+										{ label: "New query", onClick: () => openQuery() },
+										{ label: "Import CSV or JSON…", onClick: () => setDialog("import") },
+									]}
+								/>
+							</div>
+						)}
 						<nav>
+							{dbName && schema.length > 0 && (
+								<button className={`item${activeTab?.kind === "diagram" ? " active" : ""}`} onClick={openDiagram} title="The tables and their foreign keys, as a diagram">
+									<span className="ic">{ICON.diagram}</span><span className="name">Schema diagram</span>
+								</button>
+							)}
 							{["table", "view", "index", "trigger"].map((type) => {
 								const items = schema.filter((o) => o.type === type && (showInternal || !internal.has(o.name)) && (!f || o.name.toLowerCase().includes(f)));
 								if (!items.length) return null;
@@ -306,6 +347,7 @@ export default function App() {
 													className={`item${activeTab?.table === o.name ? " active" : ""}`}
 													title={o.sql ?? o.name}
 													onClick={() => openTable(own ? o.name : o.tbl_name, own ? "data" : "structure")}
+												onContextMenu={(e) => openCtx(e, objectMenu(o))}
 												>
 													<span className="ic">{ICON[type]}</span>
 													<span className="name">{o.name}</span>
@@ -412,6 +454,7 @@ export default function App() {
 					}} />
 				)}
 
+				{ctxMenu}
 				{dragging && (
 					<div className="drop" onDragLeave={(e) => e.currentTarget === e.target && setDragging(false)}>
 						<div>Drop a .sqlite or .musq file to open it</div>
