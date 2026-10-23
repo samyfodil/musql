@@ -1,6 +1,6 @@
 // The table editor against the package, under Node: node schema.test.mjs
 import assert from "node:assert/strict";
-import { open } from "../npm/index.js";
+import { open } from "../../npm/index.js";
 import { applyEdit, blankColumn, planEdit, readTable } from "./src/schema.js";
 
 const raw = await open();
