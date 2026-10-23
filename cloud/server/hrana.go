@@ -109,7 +109,9 @@ func (p *pool) get(d *state.Database) (e *entry, release func(), err error) {
 func (e *entry) close() {
 	e.srv.Close()
 	e.db.Close()
-	e.ro.Close()
+	if e.ro != nil {
+		e.ro.Close()
+	}
 }
 
 // drop closes a database's servers, before its file is removed or replaced.
@@ -267,14 +269,22 @@ func (s *Server) serveDB(w http.ResponseWriter, r *http.Request) {
 	name, sub, _ := strings.Cut(rest, "/")
 	ctx := r.Context()
 	o, err := s.store.OrgBySlug(ctx, orgSlug)
+	var d *state.Database
+	if err == nil {
+		d, err = s.store.Database(ctx, o.ID, name)
+	}
+	if s.replica != nil && (err != nil || s.replicaFollower(d) == nil) {
+		// Not here, or not caught up yet; or this replica's state is behind
+		// a database just created.
+		s.toPrimary(w, r)
+		return
+	}
 	if err != nil {
 		hranaError(w, http.StatusNotFound, "no such database")
 		return
 	}
-	d, err := s.store.Database(ctx, o.ID, name)
-	if err != nil {
-		hranaError(w, http.StatusNotFound, "no such database")
-		return
+	if s.replica != nil {
+		ctx = context.WithValue(ctx, dbPathKey{}, "/db/"+orgSlug+"/"+name)
 	}
 	e, release, err := s.pool.get(d)
 	if errors.Is(err, errUnavailable) {

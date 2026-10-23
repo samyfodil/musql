@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"sync"
@@ -67,7 +68,35 @@ func (s *Server) closeHistories() {
 
 // snapshotPass takes a base of every database changed since its last one and
 // drops history older than snapshots.keep, as of now.
+//
+// A replica takes no bases of its own (its log is the primary's records); it
+// only prunes.
 func (s *Server) snapshotPass(ctx context.Context, now time.Time) {
+	pass := func(id string, h *store.History) {
+		if s.replica == nil {
+			if err := h.SnapshotIfChanged(); err != nil {
+				s.log.Printf("snapshot %s: %v", id, err)
+			}
+		}
+		if s.cfg.snapshotKeep > 0 {
+			if err := h.Prune(now.Add(-s.cfg.snapshotKeep)); err != nil {
+				s.log.Printf("prune %s: %v", id, err)
+			}
+		}
+	}
+	pass("state", s.stateHist)
+	if s.replica != nil {
+		s.replica.mu.Lock()
+		fs := make(map[string]*follower, len(s.replica.followers))
+		maps.Copy(fs, s.replica.followers)
+		s.replica.mu.Unlock()
+		for id, f := range fs {
+			if id != "" {
+				pass(id, f.h)
+			}
+		}
+		return
+	}
 	dbs, err := s.store.AllDatabases(ctx)
 	if err != nil {
 		s.log.Printf("snapshots: %v", err)
@@ -82,14 +111,7 @@ func (s *Server) snapshotPass(ctx context.Context, now time.Time) {
 			s.log.Printf("snapshots %s: %v", d.ID, err)
 			continue
 		}
-		if err := h.SnapshotIfChanged(); err != nil {
-			s.log.Printf("snapshot %s: %v", d.ID, err)
-		}
-		if s.cfg.snapshotKeep > 0 {
-			if err := h.Prune(now.Add(-s.cfg.snapshotKeep)); err != nil {
-				s.log.Printf("prune %s: %v", d.ID, err)
-			}
-		}
+		pass(d.ID, h)
 	}
 }
 
