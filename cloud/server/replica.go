@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"connectrpc.com/connect"
@@ -42,6 +43,10 @@ type follower struct {
 	histDir string
 	cancel  context.CancelFunc
 	done    chan struct{}
+
+	// applied is the last record whose state the file holds; 0 until the
+	// first base is in.
+	applied atomic.Uint64
 
 	mu   sync.Mutex
 	live chan struct{} // closed once the replica has caught up
@@ -122,6 +127,7 @@ func (f *follower) isLive() bool {
 func (s *Server) startFollower(id string, h *store.History, histDir string, applied func()) *follower {
 	ctx, cancel := context.WithCancel(context.Background())
 	f := &follower{h: h, histDir: histDir, cancel: cancel, done: make(chan struct{}), live: make(chan struct{})}
+	f.applied.Store(h.Seq())
 	s.replica.mu.Lock()
 	s.replica.followers[id] = f
 	s.replica.mu.Unlock()
@@ -206,6 +212,7 @@ func (s *Server) followOnce(ctx context.Context, id string, f *follower, applied
 				return err
 			}
 			*resync = false
+			f.applied.Store(f.h.Seq())
 			if applied != nil {
 				applied()
 			}
@@ -381,7 +388,7 @@ func (s *Server) replicaFollower(d *state.Database) *follower {
 	s.replica.mu.Lock()
 	f := s.replica.followers[d.ID]
 	s.replica.mu.Unlock()
-	if f == nil || f.h.Seq() == 0 {
+	if f == nil || f.applied.Load() == 0 {
 		return nil
 	}
 	return f
