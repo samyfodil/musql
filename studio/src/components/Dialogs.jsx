@@ -1,8 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { ident, run } from "../db.js";
+import { rows, run } from "../db.js";
+import { applyEdit, blankColumn, blankTable, createSQL, previewEdit, readTable } from "../schema.js";
 import { fmt } from "../values.js";
 import { importRows, inferTypes, parseCSV, parseJSON } from "../importer.js";
 import { TypeInput } from "./TableView.jsx";
+
+const db = { run, rows };
 
 function useModal() {
 	const ref = useRef(null);
@@ -10,60 +13,143 @@ function useModal() {
 	return ref;
 }
 
-/** The new-table form. onClose(name) once the table exists, onClose(null) otherwise. */
-export function NewTableDialog({ onClose, status }) {
+const ON_DELETE = ["", "CASCADE", "SET NULL", "SET DEFAULT", "RESTRICT"];
+
+/**
+ * The table form: a new table, or (with table) an existing one's columns,
+ * keys, defaults and foreign keys. onClose(name) once the change is made,
+ * onClose(null) otherwise. tables lists the tables a foreign key can name.
+ */
+export function TableDialog({ table, tables = [], onClose, onSQL, status }) {
 	const ref = useModal();
-	const [name, setName] = useState("");
-	const [cols, setCols] = useState([{ name: "id", type: "INTEGER", pk: true, notnull: false, dflt: "" }, { name: "", type: "TEXT", pk: false, notnull: false, dflt: "" }]);
-	const set = (i, k, v) => setCols(cols.map((c, j) => (j === i ? { ...c, [k]: v } : c)));
-	const used = cols.filter((c) => c.name.trim());
-	const pks = used.filter((c) => c.pk);
-	const ddl =
-		`CREATE TABLE ${ident(name || "…")}(` +
-		[
-			...used.map((c) => `${ident(c.name)} ${c.type}${pks.length === 1 && c.pk ? " PRIMARY KEY" : ""}${c.notnull ? " NOT NULL" : ""}${c.dflt !== "" ? ` DEFAULT ${c.dflt}` : ""}`),
-			...(pks.length > 1 ? [`PRIMARY KEY(${pks.map((c) => ident(c.name)).join(", ")})`] : []),
-		].join(", ") +
-		")";
+	const [old, setOld] = useState(table ? null : blankTable());
+	const [m, setM] = useState(old);
+	const [busy, setBusy] = useState(false);
+	useEffect(() => {
+		if (table) readTable(db, table).then((t) => { setOld(t); setM(structuredClone(t)); }, (e) => status(e.message, true));
+	}, [table]);
+	if (!m) return <dialog ref={ref} onClose={() => onClose(null)}><p className="dim">Reading {table}…</p></dialog>;
+
+	const set = (i, k, v) => setM({ ...m, cols: m.cols.map((c, j) => (j === i ? { ...c, [k]: v } : c)) });
+	const move = (i, d) => {
+		const cols = [...m.cols];
+		[cols[i], cols[i + d]] = [cols[i + d], cols[i]];
+		setM({ ...m, cols });
+	};
+	const used = m.cols.filter((c) => c.name.trim());
+	const dup = used.find((c, i) => used.findIndex((x) => x.name.toLowerCase() === c.name.toLowerCase()) !== i);
+	const script = table ? previewEdit(old, m) : [createSQL(m)];
+	const blocked = table && old.unmodeled.length > 0;
+	const nothing = table && !script.length;
+	const problem = !m.name.trim() ? "The table needs a name." : !used.length ? "The table needs a column." : dup ? `Two columns are named ${dup.name}.` : m.withoutRowid && !used.some((c) => c.pk) ? "A WITHOUT ROWID table needs a primary key." : null;
+
+	async function submit(e) {
+		e.preventDefault();
+		setBusy(true);
+		try {
+			if (table) await applyEdit(db, old, m);
+			else await run(createSQL(m));
+			onClose(m.name);
+		} catch (err) {
+			status(err.message, true);
+			setBusy(false);
+		}
+	}
+
 	return (
-		<dialog ref={ref} onClose={() => onClose(null)}>
-			<form onSubmit={async (e) => {
-				e.preventDefault();
-				try {
-					await run(ddl);
-					onClose(name);
-				} catch (err) {
-					status(err.message, true);
-				}
-			}}>
-				<h2>New table</h2>
-				<div className="fields">
-					<label className="field"><span>name</span><input autoFocus spellCheck={false} value={name} onChange={(e) => setName(e.target.value)} /></label>
-				</div>
-				<table className="grid coledit">
-					<thead><tr><th>column</th><th>type</th><th>key</th><th>not null</th><th>default</th><th /></tr></thead>
-					<tbody>
-						{cols.map((c, i) => (
-							<tr key={i}>
-								<td><input spellCheck={false} value={c.name} placeholder="name" onChange={(e) => set(i, "name", e.target.value)} /></td>
-								<td><TypeInput value={c.type} onChange={(v) => set(i, "type", v)} /></td>
-								<td><input type="checkbox" checked={c.pk} onChange={(e) => set(i, "pk", e.target.checked)} /></td>
-								<td><input type="checkbox" checked={c.notnull} onChange={(e) => set(i, "notnull", e.target.checked)} /></td>
-								<td><input spellCheck={false} value={c.dflt} placeholder="none" onChange={(e) => set(i, "dflt", e.target.value)} /></td>
-								<td><button type="button" className="link" onClick={() => setCols(cols.filter((_, j) => j !== i))}>×</button></td>
-							</tr>
-						))}
-					</tbody>
-				</table>
-				<button type="button" onClick={() => setCols([...cols, { name: "", type: "TEXT", pk: false, notnull: false, dflt: "" }])}>＋ Column</button>
-				<pre className="ddl small">{ddl}</pre>
-				<div className="dialog-actions">
-					<button type="button" onClick={() => onClose(null)}>Cancel</button>
-					<button type="submit" className="primary" disabled={!name.trim() || !used.length}>Create</button>
-				</div>
+		<dialog ref={ref} className="wide" onClose={() => onClose(null)}>
+			<form onSubmit={submit}>
+				<h2>{table ? `Edit ${table}` : "New table"}</h2>
+				{blocked ? (
+					<>
+						<p className="warn small">
+							{table} has {old.unmodeled.join(", ")}, which this form cannot show, so a change made here would lose it. Change it with SQL instead: the
+							query tab opens with its definition and the steps of a rebuild.
+						</p>
+						<pre className="ddl small">{createSQL(old)}</pre>
+						<div className="dialog-actions">
+							<button type="button" onClick={() => onClose(null)}>Cancel</button>
+							<button type="button" className="primary" onClick={() => { onSQL(rebuildTemplate(table)); onClose(null); }}>Edit as SQL</button>
+						</div>
+					</>
+				) : (
+					<>
+						<div className="fields">
+							<label className="field"><span>name</span><input autoFocus={!table} spellCheck={false} value={m.name} onChange={(e) => setM({ ...m, name: e.target.value })} /></label>
+						</div>
+						<div className="coledit-wrap">
+							<table className="grid coledit">
+								<thead>
+									<tr>
+										<th /><th>column</th><th>type</th>
+										<th title="Primary key">key</th><th title="NOT NULL">not null</th><th title="UNIQUE">unique</th>
+										<th>default</th><th title="A foreign key: table, or table(column)">references</th><th>on delete</th><th />
+									</tr>
+								</thead>
+								<tbody>
+									{m.cols.map((c, i) => (
+										<tr key={i} className={c.orig == null && table ? "added" : ""}>
+											<td className="moves">
+												<button type="button" className="link" disabled={i === 0} title="Move up" onClick={() => move(i, -1)}>↑</button>
+												<button type="button" className="link" disabled={i === m.cols.length - 1} title="Move down" onClick={() => move(i, 1)}>↓</button>
+											</td>
+											<td><input spellCheck={false} value={c.name} placeholder="name" title={c.orig && c.orig !== c.name ? `was ${c.orig}` : undefined} onChange={(e) => set(i, "name", e.target.value)} /></td>
+											<td><TypeInput value={c.type} onChange={(v) => set(i, "type", v)} /></td>
+											<td className="ck"><input type="checkbox" checked={c.pk} onChange={(e) => set(i, "pk", e.target.checked)} /></td>
+											<td className="ck"><input type="checkbox" checked={c.notnull} onChange={(e) => set(i, "notnull", e.target.checked)} /></td>
+											<td className="ck"><input type="checkbox" checked={c.unique} onChange={(e) => set(i, "unique", e.target.checked)} /></td>
+											<td><input spellCheck={false} value={c.dflt} placeholder="none" onChange={(e) => set(i, "dflt", e.target.value)} /></td>
+											<td><input spellCheck={false} list="fktables" value={c.ref} placeholder="none" onChange={(e) => set(i, "ref", e.target.value)} /></td>
+											<td>
+												<select value={c.onDelete} disabled={!c.ref.trim()} onChange={(e) => set(i, "onDelete", e.target.value)}>
+													{ON_DELETE.map((o) => <option key={o} value={o}>{o || "no action"}</option>)}
+												</select>
+											</td>
+											<td><button type="button" className="link" title={c.orig ? `Drop ${c.orig}: its values are lost` : "Remove"} onClick={() => setM({ ...m, cols: m.cols.filter((_, j) => j !== i) })}>×</button></td>
+										</tr>
+									))}
+								</tbody>
+							</table>
+							<datalist id="fktables">{tables.map((t) => <option key={t} value={t} />)}</datalist>
+						</div>
+						<div className="inline">
+							<button type="button" onClick={() => setM({ ...m, cols: [...m.cols, blankColumn()] })}>＋ Column</button>
+							<span className="grow" />
+							<label className="check"><input type="checkbox" checked={m.withoutRowid} onChange={(e) => setM({ ...m, withoutRowid: e.target.checked })} />WITHOUT ROWID</label>
+							<label className="check" title="Values must match their column's type"><input type="checkbox" checked={m.strict} onChange={(e) => setM({ ...m, strict: e.target.checked })} />STRICT</label>
+						</div>
+						{table && script.some((s) => s.startsWith("DROP TABLE")) && (
+							<p className="dim small">This change rebuilds {table}: a new table, the rows copied in, the old one dropped, all in one transaction that rolls back if any row or index no longer fits.</p>
+						)}
+						<pre className="ddl small">{nothing ? "-- no change" : script.join(";\n\n")}</pre>
+						{problem && <p className="warn small">{problem}</p>}
+						<div className="dialog-actions">
+							{onSQL && <button type="button" className="ghost" title="Open these statements in a query tab instead" onClick={() => { onSQL(script.join(";\n\n") + ";"); onClose(null); }}>Open as SQL</button>}
+							<span className="grow" />
+							<button type="button" onClick={() => onClose(null)}>Cancel</button>
+							<button type="submit" className="primary" disabled={!!problem || nothing || busy}>{busy ? "Working…" : table ? "Apply" : "Create"}</button>
+						</div>
+					</>
+				)}
 			</form>
 		</dialog>
 	);
+}
+
+// The SQL a hand edit of a table the form cannot hold starts from: SQLite's
+// rebuild steps around the table's definition.
+function rebuildTemplate(name) {
+	return `-- Rebuild ${name}: edit the new definition, keep the column lists in step.
+PRAGMA foreign_keys = OFF;
+BEGIN;
+-- CREATE TABLE "${name}__new"(…);   -- the definition, changed
+-- INSERT INTO "${name}__new"(…) SELECT … FROM "${name}";
+-- DROP TABLE "${name}";
+-- ALTER TABLE "${name}__new" RENAME TO "${name}";
+-- …then create its indexes and triggers again (Structure lists them)
+SELECT sql FROM sqlite_schema WHERE tbl_name = '${name.replace(/'/g, "''")}';
+-- PRAGMA foreign_key_check; COMMIT; PRAGMA foreign_keys = ON;
+`;
 }
 
 /**

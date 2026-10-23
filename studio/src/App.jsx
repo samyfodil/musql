@@ -3,7 +3,7 @@ import { call, ident, query, ready, rows } from "./db.js";
 import { fmt } from "./values.js";
 import { Studio } from "./studio.js";
 import TableView from "./components/TableView.jsx";
-import { ImportDialog, NewTableDialog } from "./components/Dialogs.jsx";
+import { ImportDialog, TableDialog } from "./components/Dialogs.jsx";
 import { SAMPLE } from "./sample.js";
 import { saved, unsave } from "./library.js";
 import { isStudioTable } from "./vectors.js";
@@ -37,22 +37,42 @@ function internalNames(schema) {
 const ICON = { table: "▦", view: "◇", index: "⋮", trigger: "ϟ", query: "›_" };
 const GROUP = { table: "Tables", view: "Views", index: "Indexes", trigger: "Triggers" };
 
-function useDark() {
+const THEMES = { system: "◐", light: "☀", dark: "☾" };
+
+// useTheme is the chosen theme (kept in this browser) and whether the page is
+// dark: the system's choice unless one is picked.
+function useTheme() {
 	const mq = useMemo(() => matchMedia("(prefers-color-scheme: dark)"), []);
-	const [dark, setDark] = useState(mq.matches);
+	const [systemDark, setSystemDark] = useState(mq.matches);
+	const [theme, setTheme] = useState(() => {
+		try {
+			return localStorage.getItem("musql-theme") ?? "system";
+		} catch {
+			return "system";
+		}
+	});
 	useEffect(() => {
-		const on = (e) => setDark(e.matches);
+		const on = (e) => setSystemDark(e.matches);
 		mq.addEventListener("change", on);
 		return () => mq.removeEventListener("change", on);
 	}, [mq]);
-	return dark;
+	useEffect(() => {
+		if (theme === "system") delete document.documentElement.dataset.theme;
+		else document.documentElement.dataset.theme = theme;
+		try {
+			localStorage.setItem("musql-theme", theme);
+		} catch {
+			// a private window keeps the choice for this page only
+		}
+	}, [theme]);
+	return [theme, setTheme, theme === "dark" || (theme === "system" && systemDark)];
 }
 
 let tabSeq = 0;
 let querySeq = 0;
 
 export default function App() {
-	const dark = useDark();
+	const [theme, setTheme, dark] = useTheme();
 	const [dbName, setDbName] = useState(null);
 	const [dirty, setDirty] = useState(false);
 	const [schema, setSchema] = useState([]);
@@ -66,7 +86,7 @@ export default function App() {
 	const [menu, setMenu] = useState(false);
 	const [showInternal, setShowInternal] = useState(false);
 	const [library, setLibrary] = useState(saved);
-	const [dialog, setDialog] = useState(null); // "table" | "import" | {import: file} | null
+	const [dialog, setDialog] = useState(null); // "table" | {edit: table} | "import" | {import: file} | null
 	const [sideOpen, setSideOpen] = useState(false); // the sidebar, on a narrow screen
 
 	useEffect(() => {
@@ -194,9 +214,14 @@ export default function App() {
 	useEffect(() => {
 		const close = () => setMenu(false);
 		const key = (e) => {
-			if (e.key.toLowerCase() === "o" && (e.metaKey || e.ctrlKey)) {
+			if (!(e.metaKey || e.ctrlKey)) return;
+			if (e.key.toLowerCase() === "o") {
 				e.preventDefault();
 				document.getElementById("file").click();
+			} else if (e.key.toLowerCase() === "k") {
+				e.preventDefault();
+				setSideOpen(true);
+				document.querySelector(".side .filter")?.focus();
 			}
 		};
 		addEventListener("click", close);
@@ -212,7 +237,7 @@ export default function App() {
 		setTabs((ts) => ts.filter((t) => t.kind !== "table" || schema.some((o) => o.name === t.table)));
 	}, [schema]);
 
-	const ctx = { schema, columnsOf, status, changed, dark };
+	const ctx = { schema, columnsOf, status, changed, dark, openQuery, editTable: (name) => setDialog({ edit: name }) };
 	const activeTab = tabs.find((t) => t.id === active);
 	const f = filter.trim().toLowerCase();
 	const internal = useMemo(() => internalNames(schema), [schema]);
@@ -241,6 +266,7 @@ export default function App() {
 							Open…
 							<input id="file" type="file" hidden accept=".musq,.sqlite,.sqlite3,.db" onChange={(e) => { openFile(e.target.files[0]); e.target.value = ""; }} />
 						</label>
+						<button className="ghost theme" title={`Theme: ${theme} (click to change)`} onClick={() => setTheme(theme === "system" ? "light" : theme === "light" ? "dark" : "system")}>{THEMES[theme]}</button>
 						<div className="menu" onClick={(e) => e.stopPropagation()}>
 							<button className="primary" onClick={() => setMenu(!menu)}>Export ▾</button>
 							{menu && (
@@ -255,7 +281,7 @@ export default function App() {
 
 				<div className="layout">
 					<aside className="side" onClick={(e) => e.target.closest("button.item, .item .name") && setSideOpen(false)}>
-						<input className="filter" type="search" placeholder="Filter tables…" spellCheck={false} value={filter} onChange={(e) => setFilter(e.target.value)} />
+						<input className="filter" type="search" placeholder="Filter tables…  ⌘K" spellCheck={false} value={filter} onChange={(e) => setFilter(e.target.value)} />
 						<div className="sidebtns">
 							<button className="newquery" disabled={!dbName} onClick={() => openQuery()}>＋ Query</button>
 							<button className="newquery" disabled={!dbName} onClick={() => setDialog("table")}>＋ Table</button>
@@ -351,15 +377,22 @@ export default function App() {
 					<span className="dim">musql · WebAssembly + JIT, in a worker</span>
 				</footer>
 
-				{dialog === "table" && (
-					<NewTableDialog status={status} onClose={(name) => {
-						setDialog(null);
-						if (name) {
-							changed();
-							openTable(name, "structure");
-							status(`Created ${name}.`);
-						}
-					}} />
+				{(dialog === "table" || dialog?.edit) && (
+					<TableDialog
+						table={dialog?.edit}
+						tables={schema.filter((o) => o.type === "table" && !internal.has(o.name)).map((o) => o.name)}
+						status={status}
+						onSQL={(sql) => openQuery(sql, dialog?.edit ? `Edit ${dialog.edit}` : "New table")}
+						onClose={(name) => {
+							const was = dialog?.edit;
+							setDialog(null);
+							if (name) {
+								changed();
+								openTable(name, "structure");
+								status(was ? `Changed ${name}.` : `Created ${name}.`);
+							}
+						}}
+					/>
 				)}
 				{(dialog === "import" || dialog?.import) && (
 					<ImportDialog file={dialog?.import} status={status} tables={schema.filter((o) => o.type === "table").map((o) => o.name)} onClose={(name) => {

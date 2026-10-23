@@ -124,6 +124,22 @@ export default function QueryView({ initial = "", title, onTitle }) {
 		status(`Saved “${name}”.`);
 	}
 
+	// asView makes the SELECT in the editor (or its selection) a view.
+	async function asView() {
+		const q = target().replace(/;\s*$/, "");
+		if (!q) return;
+		if (!["SELECT", "WITH", "VALUES"].includes(verb(q))) return status("Only a SELECT can become a view.", true);
+		const name = prompt("Create a view named:");
+		if (!name) return;
+		try {
+			await run(`CREATE VIEW "${name.replace(/"/g, '""')}" AS ${q}`);
+			changed();
+			status(`Created the view ${name}.`);
+		} catch (e) {
+			status(e.message, true);
+		}
+	}
+
 	// Completion knows every table and view and their columns. Ctrl/Cmd+Enter is
 	// taken before any keymap, so an open completion list cannot swallow it.
 	const extensions = useMemo(() => {
@@ -166,6 +182,7 @@ export default function QueryView({ initial = "", title, onTitle }) {
 				<span className="kbd">⌘ Enter</span>
 				<button title="The query plan of the statement" onClick={() => explain(false)}>Explain</button>
 				<button title="Save this query, by name, in this browser" onClick={saveAs}>Save…</button>
+				<button title="Create a view from this SELECT" onClick={asView}>View…</button>
 				<div className="menu" onClick={(e) => e.stopPropagation()}>
 					<button onClick={() => setMenu(menu === "history" ? null : "history")}>History ▾</button>
 					{menu === "history" && (
