@@ -14,6 +14,7 @@ import { DEFAULT_MODEL, embed, vectorBlob } from "../embed.js";
 import { expandEmbeds, verb } from "../sqltext.js";
 import { history, remember, save } from "../library.js";
 import { functionHints } from "../fnhints.js";
+import AskAI from "./AskAI.jsx";
 import Grid from "./Grid.jsx";
 import { MenuButton } from "./Menu.jsx";
 import Chart from "./Chart.jsx";
@@ -28,7 +29,7 @@ const READS = new Set(["SELECT", "WITH", "VALUES", "EXPLAIN", "PRAGMA"]);
  * at the first error. embed('text') in a statement is the text's vector
  * (embed.js), bound as a parameter.
  */
-export default function QueryView({ initial = "", title, onTitle }) {
+export default function QueryView({ initial = "", title, onTitle, ask }) {
 	const { schema, columnsOf, status, changed, dark } = useStudio();
 	const [text, setText] = useState(initial);
 	const [runs, setRuns] = useState([]); // newest first: {at, sql, results}
@@ -44,6 +45,7 @@ export default function QueryView({ initial = "", title, onTitle }) {
 	});
 	const [plan, setPlan] = useState(null); // {sql, tree, code?}
 	const [busy, setBusy] = useState(false);
+	const [askOpen, setAskOpen] = useState(false);
 	const [menu, setMenu] = useState(null); // "history" | null
 	const [as, setAs] = useState("grid"); // how a result shows: "grid" | "chart"
 	const [planAs, setPlanAs] = useState("flow"); // "flow" | "text"
@@ -255,6 +257,7 @@ export default function QueryView({ initial = "", title, onTitle }) {
 				<button className="primary" disabled={busy} title="Run the selection, or the statement at the cursor (⌘Enter)" onClick={() => go.current()}>{busy ? <><span className="spinner inline" /> Running</> : "Run"}</button>
 				<button className="ghost" disabled={busy} title="Run every statement (⇧⌘Enter)" onClick={() => go.current(true)}>Run all</button>
 				<button className="ghost icon" title="Format the SQL (⇧⌥F)" onClick={tidy}><WandSparkles size={15} /></button>
+				{ask && <button title="Describe what you want; the SQL is put in the editor, never run" onClick={() => setAskOpen((o) => !o)}>Ask AI</button>}
 				<button title="How the database runs it: the query plan, drawn as a flow" onClick={() => explain(false)}>Explain</button>
 				<MenuButton
 					label="⋯"
@@ -281,6 +284,7 @@ export default function QueryView({ initial = "", title, onTitle }) {
 				<span className="dim small" title="embed('text') or embed('text', 'bge') is the text's vector, made in your browser">embed('…') works in SQL</span>
 				<button className={`ghost icon${schemaOpen ? " pressed" : ""}`} title="Tables and columns" onClick={() => { setSchemaOpen(!schemaOpen); try { localStorage.setItem("musql-studio:schema-panel", schemaOpen ? "0" : "1"); } catch { /* kept for this page */ } }}><PanelRight size={15} /></button>
 			</div>
+			{ask && askOpen && <AskAI target={ask} onInsert={(q) => insert(q + "\n")} />}
 			<div className="editor">
 				<CodeMirror
 					value={text}
