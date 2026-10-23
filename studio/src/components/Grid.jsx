@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { isVectorColumn, show } from "../values.js";
+import { Maximize2 } from "lucide-react";
 
 /**
  * A result grid. Every prop past columns and rows is optional:
@@ -10,11 +11,13 @@ import { isVectorColumn, show } from "../values.js";
  *   onEdit      (i, column, text) => Promise; makes cells editable by double-click
  *   start       the number of the first row
  *   onContextMenu (event, i, column, startEdit) for a right-click on a cell
+ *   onHeaderMenu (event, column) for a column's ▾ menu
+ *   onOpen      (i) opens row i whole (its ⤢, or Space)
  *
  * A click or the arrow keys move the current cell; Enter or F2 edits it,
  * Space selects its row, and Ctrl/Cmd+C copies its value.
  */
-export default function Grid({ columns, rows, types, sort, desc, onSort, picked, onPick, onEdit, onContextMenu, start = 0 }) {
+export default function Grid({ columns, rows, types, sort, desc, onSort, onHeaderMenu, picked, onPick, onOpen, onEdit, onContextMenu, start = 0 }) {
 	const [editing, setEditing] = useState(null); // [row, col]
 	const [cur, setCur] = useState(null); // [row, col]
 	const table = useRef(null);
@@ -52,9 +55,9 @@ export default function Grid({ columns, rows, types, sort, desc, onSort, picked,
 				}
 				return;
 			case " ":
-				if (onPick) {
+				if (onOpen || onPick) {
 					e.preventDefault();
-					onPick(i);
+					onOpen ? onOpen(i) : onPick(i);
 				}
 				return;
 		}
@@ -70,10 +73,13 @@ export default function Grid({ columns, rows, types, sort, desc, onSort, picked,
 				<tr>
 					<th className="rn">#</th>
 					{columns.map((c, j) => (
-						<th key={j} className={sort === c ? "sorted" : ""} onClick={onSort && (() => onSort(c))}>
-							{c}
-							{types?.[c] && <span className="type">{types[c]}</span>}
-							{sort === c && (desc ? " ↓" : " ↑")}
+						<th key={j} className={sort === c ? "sorted" : ""} onClick={onSort && (() => onSort(c))} onContextMenu={onHeaderMenu && ((e) => onHeaderMenu(e, c))}>
+							<div className="thin">
+								<span className="thname">{c}</span>
+								{types?.[c] && <span className="type">{types[c]}</span>}
+								{sort === c && <span className="sortmark">{desc ? "↓" : "↑"}</span>}
+								{onHeaderMenu && <button className="thmenu" title="Sort, filter or change this column" onClick={(e) => { e.stopPropagation(); onHeaderMenu(e, c); }}>▾</button>}
+							</div>
 						</th>
 					))}
 				</tr>
@@ -84,6 +90,7 @@ export default function Grid({ columns, rows, types, sort, desc, onSort, picked,
 						<td className={`rn${onPick ? " pickable" : ""}`} title={onPick ? "Click to select this row" : undefined} onClick={onPick && (() => onPick(i))}>
 							{onPick && <input type="checkbox" tabIndex={-1} checked={!!picked?.has(i)} readOnly />}
 							<span>{start + i + 1}</span>
+							{onOpen && <button className="expand" title="Open the row" onClick={(e) => { e.stopPropagation(); onOpen(i); }}><Maximize2 size={12} /></button>}
 						</td>
 						{row.map((v, j) =>
 							editing?.[0] === i && editing?.[1] === j ? (

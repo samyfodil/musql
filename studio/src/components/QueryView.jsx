@@ -102,7 +102,6 @@ export default function QueryView({ initial = "", title, onTitle }) {
 		const failed = out.find((r) => r.error);
 		const ms = (performance.now() - t0).toFixed(1);
 		if (failed) status(out.length > 1 ? `Statement ${out.length} of the script failed: ${failed.error}` : failed.error, true);
-		else status(out.length > 1 ? `${out.length} statements · ${ms} ms` : out[0]?.meta ?? "Done");
 		if (wrote) changed();
 	};
 

@@ -5,6 +5,9 @@ import { Studio } from "./studio.js";
 import TableView from "./components/TableView.jsx";
 import { BusyBar, Spinner } from "./components/Busy.jsx";
 import { MenuButton, useContextMenu } from "./components/Menu.jsx";
+import { useToasts } from "./components/Toasts.jsx";
+import Palette from "./components/Palette.jsx";
+import { Contrast, Moon, Network, Search, SquareTerminal, Sun, Table2 } from "lucide-react";
 import { ImportDialog, TableDialog } from "./components/Dialogs.jsx";
 import { SAMPLE } from "./sample.js";
 import { saved, unsave } from "./library.js";
@@ -40,7 +43,7 @@ function internalNames(schema) {
 const ICON = { table: "▦", view: "◇", index: "⋮", trigger: "ϟ", query: "›_", diagram: "⌗" };
 const GROUP = { table: "Tables", view: "Views", index: "Indexes", trigger: "Triggers" };
 
-const THEMES = { system: "Auto", light: "☀", dark: "☾" };
+const THEMES = { system: <Contrast size={17} />, light: <Sun size={17} />, dark: <Moon size={17} /> };
 
 // useTheme is the chosen theme (kept in this browser) and whether the page is
 // dark: the system's choice unless one is picked.
@@ -83,9 +86,9 @@ export default function App() {
 	const [tabs, setTabs] = useState([]);
 	const [active, setActive] = useState(null);
 	const [filter, setFilter] = useState("");
-	const [msg, setMsg] = useState({ text: "Starting…" });
 	const [dragging, setDragging] = useState(false);
-	const [menu, setMenu] = useState(false);
+	const [section, setSection] = useState("tables"); // the rail: "tables" | "sql" | "diagram"
+	const [palette, setPalette] = useState(false);
 	const [showInternal, setShowInternal] = useState(false);
 	const [library, setLibrary] = useState(saved);
 	const [dialog, setDialog] = useState(null); // "table" | {edit: table} | "import" | {import: file} | null
@@ -98,7 +101,8 @@ export default function App() {
 		return () => removeEventListener("musql-library", on);
 	}, []);
 
-	const status = useCallback((text, err) => setMsg({ text, err }), []);
+	const [toasts, toast] = useToasts();
+	const status = useCallback((text, err) => { if (err || !/^Opening /.test(text)) toast(text, err); }, [toast]);
 
 	// loadSchema reads the catalog, every table's columns and row count.
 	const loadSchema = useCallback(async () => {
@@ -128,7 +132,7 @@ export default function App() {
 	const columnsOf = useCallback((name) => columns[name] ?? [], [columns]);
 
 	useEffect(() => {
-		ready.then(() => status("Ready. Open a file, drop one here, or try the sample."), (e) => status(e.message, true));
+		ready.catch((e) => status(e.message, true));
 	}, [status]);
 
 	useEffect(() => {
@@ -199,7 +203,6 @@ export default function App() {
 	}
 
 	async function exportAs(kind) {
-		setMenu(false);
 		if (!dbName) return status("Nothing to export yet.", true);
 		try {
 			const bytes = await call(kind === "sqlite" ? "exportSQLite" : "exportMusql");
@@ -216,7 +219,6 @@ export default function App() {
 	}
 
 	useEffect(() => {
-		const close = () => setMenu(false);
 		const key = (e) => {
 			if (!(e.metaKey || e.ctrlKey)) return;
 			if (e.key.toLowerCase() === "o") {
@@ -224,16 +226,11 @@ export default function App() {
 				document.getElementById("file").click();
 			} else if (e.key.toLowerCase() === "k") {
 				e.preventDefault();
-				setSideOpen(true);
-				document.querySelector(".side .filter")?.focus();
+				setPalette((p) => !p);
 			}
 		};
-		addEventListener("click", close);
 		addEventListener("keydown", key);
-		return () => {
-			removeEventListener("click", close);
-			removeEventListener("keydown", key);
-		};
+		return () => removeEventListener("keydown", key);
 	}, []);
 
 	// Tabs on objects that no longer exist close themselves.
@@ -266,16 +263,60 @@ export default function App() {
 		];
 	}
 
-	const ctx = { schema, columnsOf, status, changed, dark, openQuery, editTable: (name) => setDialog({ edit: name }) };
+	const ctx = { schema, columnsOf, status, changed, dark, openQuery, editTable: (name) => setDialog({ edit: name }), importInto: () => setDialog("import") };
 	const activeTab = tabs.find((t) => t.id === active);
 	const f = filter.trim().toLowerCase();
 	const internal = useMemo(() => internalNames(schema), [schema]);
 	const hidden = showInternal ? 0 : schema.filter((o) => internal.has(o.name)).length;
+	const pickFile = () => document.getElementById("file").click();
+	const fileItems = [
+		{ label: "New empty database", onClick: () => openDatabase("untitled.musq") },
+		{ label: "Open a file…", hint: "⌘O", onClick: pickFile },
+		{ label: "Open the sample", onClick: () => openDatabase("sample.musq", undefined, SAMPLE) },
+		"-",
+		{ label: "Export as SQLite", hint: ".sqlite", disabled: !dbName, onClick: () => exportAs("sqlite") },
+		{ label: "Export as musql", hint: ".musq", disabled: !dbName, onClick: () => exportAs("musql") },
+	];
+
+	// Everything the palette finds: objects first, then actions.
+	const commands = useMemo(() => {
+		const out = [];
+		for (const o of schema) {
+			if ((o.type !== "table" && o.type !== "view") || internal.has(o.name)) continue;
+			out.push({ group: o.type === "table" ? "Tables" : "Views", icon: ICON[o.type], label: o.name, hint: counts[o.name] !== undefined ? `${fmt(counts[o.name])} rows` : "", run: () => { setSection("tables"); openTable(o.name); } });
+		}
+		for (const q of library) out.push({ group: "Saved queries", icon: ICON.query, label: q.name, run: () => { setSection("sql"); openQuery(q.sql, q.name); } });
+		const act = (label, run, hint, icon = "→") => out.push({ group: "Actions", label, run, hint, icon });
+		if (dbName) {
+			act("New query", () => { setSection("sql"); openQuery(); }, "SQL editor", ICON.query);
+			act("Create a table", () => setDialog("table"), "", "＋");
+			act("Import CSV or JSON", () => setDialog("import"), "", "⇪");
+			act("Schema diagram", () => { setSection("diagram"); openDiagram(); }, "", ICON.diagram);
+			act("Export as SQLite file", () => exportAs("sqlite"), ".sqlite", "⇩");
+			act("Export as musql file", () => exportAs("musql"), ".musq", "⇩");
+		}
+		act("Open a file", pickFile, "⌘O", "⇧");
+		act("Open the sample database", () => openDatabase("sample.musq", undefined, SAMPLE), "", "★");
+		act("New empty database", () => openDatabase("untitled.musq"), "", "＋");
+		act(`Theme: ${theme === "dark" ? "light" : "dark"}`, () => setTheme(dark ? "light" : "dark"), "", dark ? "☀" : "☾");
+		return out;
+	}, [schema, internal, counts, library, dbName, theme, dark]);
+
+	const tabsShown = tabs.filter((t) => (section === "sql" ? t.kind === "query" : section === "diagram" ? t.kind === "diagram" : t.kind === "table"));
+	const current = tabsShown.find((t) => t.id === active) ?? tabsShown.at(-1);
+
+	function goSection(sec) {
+		setSection(sec);
+		// On a narrow screen the list is an overlay a rail button opens and closes.
+		setSideOpen(matchMedia("(max-width: 760px)").matches && (sec !== section || !sideOpen) && sec !== "diagram");
+		if (sec === "diagram" && dbName) openDiagram();
+		if (sec === "sql" && dbName && !tabs.some((t) => t.kind === "query")) openQuery();
+	}
 
 	return (
 		<Studio.Provider value={ctx}>
 			<div
-				className={`shell${sideOpen ? " sideopen" : ""}`}
+				className={`app${sideOpen ? " sideopen" : ""}`}
 				onDragEnter={(e) => e.dataTransfer.types.includes("Files") && setDragging(true)}
 				onDragOver={(e) => e.preventDefault()}
 				onDrop={(e) => {
@@ -285,161 +326,191 @@ export default function App() {
 				}}
 			>
 				<BusyBar />
-				<header className="bar">
-					<button className="menubtn ghost" title="Tables and saved queries" onClick={(e) => { e.stopPropagation(); setSideOpen(!sideOpen); }}>☰</button>
-					<div className="brand"><span className="logo">μ</span>musql <span className="dim">studio</span></div>
-					<div className="dbname">{dbName ?? "no database"}{dirty && <span className="dot" title="Changed since it was opened or exported" />}</div>
-					<div className="actions">
-						<button title="A new, empty database" onClick={() => openDatabase("untitled.musq")}>New</button>
-						<button title="A small music database to try things on" onClick={() => openDatabase("sample.musq", undefined, SAMPLE)}>Sample</button>
-						<label className="button" title="Open a .musq or C SQLite file (⌘O), or drop one anywhere">
-							Open…
-							<input id="file" type="file" hidden accept=".musq,.sqlite,.sqlite3,.db" onChange={(e) => { openFile(e.target.files[0]); e.target.value = ""; }} />
-						</label>
-						<button className="ghost theme" title={`Theme: ${theme} (click to change)`} onClick={() => setTheme(theme === "system" ? "light" : theme === "light" ? "dark" : "system")}>{THEMES[theme]}</button>
-						<div className="menu" onClick={(e) => e.stopPropagation()}>
-							<button className="primary" onClick={() => setMenu(!menu)}>Export ▾</button>
-							{menu && (
-								<div className="menu-list">
-									<button onClick={() => exportAs("sqlite")}>SQLite file <span className="dim">.sqlite</span></button>
-									<button onClick={() => exportAs("musql")}>musql file <span className="dim">.musq</span></button>
-								</div>
-							)}
-						</div>
-					</div>
-				</header>
+				<input id="file" type="file" hidden accept=".musq,.sqlite,.sqlite3,.db,.csv,.tsv,.json" onChange={(e) => { openFile(e.target.files[0]); e.target.value = ""; }} />
 
-				<div className="layout">
-					<aside className="side" onClick={(e) => e.target.closest("button.item, .item .name") && setSideOpen(false)}>
-						<input className="filter" type="search" placeholder="Filter tables…  ⌘K" spellCheck={false} value={filter} onChange={(e) => setFilter(e.target.value)} />
-						{dbName && (
-							<div className="sidebtns">
-								<button className="newquery" onClick={() => openQuery()}>›_ New query</button>
-								<MenuButton
-									className="newquery"
-									label="＋ ▾"
-									title="Create or import"
-									items={[
-										{ label: "New table…", onClick: () => setDialog("table") },
-										{ label: "New query", onClick: () => openQuery() },
-										{ label: "Import CSV or JSON…", onClick: () => setDialog("import") },
-									]}
-								/>
+				<nav className="rail">
+					<div className="logo" title="musql studio">μ</div>
+					{[
+						["tables", <Table2 size={18} />, "Table editor"],
+						["sql", <SquareTerminal size={18} />, "SQL editor"],
+						["diagram", <Network size={18} />, "Schema diagram"],
+					].map(([k, ic, label]) => (
+						<button key={k} className={`railbtn${section === k ? " on" : ""}`} title={label} disabled={!dbName && k !== "tables"} onClick={() => goSection(k)}>
+							{ic}
+						</button>
+					))}
+					<span className="grow" />
+					<button className="railbtn" title="Search everything (⌘K)" onClick={() => setPalette(true)}><Search size={17} /></button>
+					<button className="railbtn" title={`Theme: ${theme} (click to change)`} onClick={() => setTheme(theme === "system" ? "light" : theme === "light" ? "dark" : "system")}>{THEMES[theme]}</button>
+				</nav>
+
+				<aside className="side">
+					<div className="dbswitch">
+						<MenuButton
+							className="dbbtn"
+							label={<><span className="dbn">{dbName ?? "No database"}</span>{dirty && <span className="dot" title="Changed since it was opened or exported" />}<span className="dim">▾</span></>}
+							items={fileItems}
+						/>
+					</div>
+					{section === "sql" ? (
+						<>
+							<div className="sidehead">
+								<h3>SQL editor</h3>
+								<button className="ghost icon" title="New query" disabled={!dbName} onClick={() => openQuery()}>＋</button>
 							</div>
-						)}
-						<nav>
-							{dbName && schema.length > 0 && (
-								<button className={`item${activeTab?.kind === "diagram" ? " active" : ""}`} onClick={openDiagram} title="The tables and their foreign keys, as a diagram">
-									<span className="ic">{ICON.diagram}</span><span className="name">Schema diagram</span>
-								</button>
-							)}
-							{["table", "view", "index", "trigger"].map((type) => {
-								const items = schema.filter((o) => o.type === type && (showInternal || !internal.has(o.name)) && (!f || o.name.toLowerCase().includes(f)));
-								if (!items.length) return null;
-								return (
-									<div className="group" key={type}>
-										<h3>{GROUP[type]}<span>{items.length}</span></h3>
-										{items.map((o) => {
-											const own = type === "table" || type === "view";
-											return (
-												<button
-													key={o.name}
-													className={`item${activeTab?.table === o.name ? " active" : ""}`}
-													title={o.sql ?? o.name}
-													onClick={() => openTable(own ? o.name : o.tbl_name, own ? "data" : "structure")}
-												onContextMenu={(e) => openCtx(e, objectMenu(o))}
-												>
-													<span className="ic">{ICON[type]}</span>
-													<span className="name">{o.name}</span>
-													{counts[o.name] !== undefined && <span className="count">{fmt(counts[o.name])}</span>}
-												</button>
-											);
-										})}
-									</div>
-								);
-							})}
-							{dbName && !schema.length && <p className="dim small pad">No tables yet. Write some SQL in a query tab.</p>}
-							{(hidden > 0 || showInternal) && (
-								<button className="link small pad" onClick={() => setShowInternal(!showInternal)}>
-									{showInternal ? "Hide internal tables" : `Show ${hidden} internal table${hidden === 1 ? "" : "s"}`}
-								</button>
-							)}
-							{library.length > 0 && (
+							<nav>
 								<div className="group">
-									<h3>Saved queries<span>{library.length}</span></h3>
-									{library.filter((q) => !f || q.name.toLowerCase().includes(f)).map((q) => (
-										<div key={q.name} className="item saved">
-											<button className="name" title={q.sql} onClick={() => openQuery(q.sql, q.name)}>
-												<span className="ic">{ICON.query}</span>{q.name}
-											</button>
-											<button className="x" title="Forget this saved query" onClick={() => confirm(`Forget the saved query “${q.name}”?`) && unsave(q.name)}>×</button>
-										</div>
+									<h4>Open</h4>
+									{tabs.filter((t) => t.kind === "query").map((t) => (
+										<button key={t.id} className={`item${current?.id === t.id ? " active" : ""}`} onClick={() => setActive(t.id)}>
+											<span className="ic">{ICON.query}</span><span className="name">{t.title}</span>
+										</button>
 									))}
 								</div>
-							)}
-						</nav>
-					</aside>
+								{library.length > 0 && (
+									<div className="group">
+										<h4>Saved</h4>
+										{library.map((q) => (
+											<div key={q.name} className="item saved">
+												<button className="name" title={q.sql} onClick={() => openQuery(q.sql, q.name)}>
+													<span className="ic">★</span>{q.name}
+												</button>
+												<button className="x" title="Forget this saved query" onClick={() => confirm(`Forget the saved query “${q.name}”?`) && unsave(q.name)}>×</button>
+											</div>
+										))}
+									</div>
+								)}
+							</nav>
+						</>
+					) : (
+						<>
+							<div className="sidehead">
+								<h3>Tables</h3>
+								<button className="ghost icon" title="Create a table" disabled={!dbName} onClick={() => setDialog("table")}>＋</button>
+							</div>
+							<input className="filter" type="search" placeholder="Search tables" spellCheck={false} value={filter} onChange={(e) => setFilter(e.target.value)} />
+							<nav onClick={(e) => e.target.closest("button.item") && setSideOpen(false)}>
+								{["table", "view", "index", "trigger"].map((type) => {
+									const items = schema.filter((o) => o.type === type && (showInternal || !internal.has(o.name)) && (!f || o.name.toLowerCase().includes(f)));
+									if (!items.length || ((type === "index" || type === "trigger") && !f && !showInternal)) return null;
+									return (
+										<div className="group" key={type}>
+											{type !== "table" && <h4>{GROUP[type]}</h4>}
+											{items.map((o) => {
+												const own = type === "table" || type === "view";
+												return (
+													<button
+														key={o.name}
+														className={`item${current?.table === o.name && section === "tables" ? " active" : ""}`}
+														title={o.sql ?? o.name}
+														onClick={() => { setSection("tables"); openTable(own ? o.name : o.tbl_name, own ? "data" : "structure"); }}
+														onContextMenu={(e) => openCtx(e, objectMenu(o))}
+													>
+														<span className="ic">{ICON[type]}</span>
+														<span className="name">{o.name}</span>
+														{counts[o.name] !== undefined && <span className="count">{fmt(counts[o.name])}</span>}
+													</button>
+												);
+											})}
+										</div>
+									);
+								})}
+								{dbName && !schema.length && (
+									<div className="sideempty">
+										<p className="dim small">No tables yet.</p>
+										<button className="primary" onClick={() => setDialog("table")}>Create a table</button>
+										<button onClick={() => setDialog("import")}>Import a CSV</button>
+									</div>
+								)}
+								{dbName && (hidden > 0 || showInternal || schema.some((o) => o.type === "index" || o.type === "trigger")) && (
+									<button className="link small pad" onClick={() => setShowInternal(!showInternal)}>
+										{showInternal ? "Show less" : "Show indexes, triggers and internal tables"}
+									</button>
+								)}
+							</nav>
+						</>
+					)}
+				</aside>
 
-					<main className="main">
+				<main className="main">
+					{dbName && (
 						<div className="tabs">
-							{tabs.map((t) => (
-								<div key={t.id} className={`tab${t.id === active ? " active" : ""}`} onClick={() => setActive(t.id)} onAuxClick={(e) => e.button === 1 && closeTab(t.id)}>
+							{tabsShown.map((t) => (
+								<div key={t.id} className={`tab${t.id === current?.id ? " active" : ""}`} onClick={() => setActive(t.id)} onAuxClick={(e) => e.button === 1 && closeTab(t.id)}>
 									<span className="ic">{t.kind === "table" ? ICON[schema.find((o) => o.name === t.table)?.type ?? "table"] : ICON[t.kind]}</span>
 									{t.title}
 									<button className="x" title="Close" onClick={(e) => { e.stopPropagation(); closeTab(t.id); }}>×</button>
 								</div>
 							))}
+							{section === "sql" && <button className="ghost icon newtab" title="New query" onClick={() => openQuery()}>＋</button>}
+							<span className="grow" />
+							<button className="kbdbtn" onClick={() => setPalette(true)}><Search size={13} /><span className="dim">Search</span> <span className="kbd">⌘K</span></button>
 						</div>
-						<div className="panes">
-							{tabs.map((t) => (
-								<div key={t.id} className="pane" hidden={t.id !== active}>
-									{t.kind === "table" ? (
-										<TableView name={t.table} mode={t.mode} />
-									) : t.kind === "diagram" ? (
-										<Suspense fallback={<Spinner label="Loading the diagram…" />}>
-											<Diagram onOpen={(name) => openTable(name)} />
-										</Suspense>
-									) : (
-										<Suspense fallback={<Spinner label="Loading the editor…" />}>
-											<QueryView initial={t.text} title={t.title} onTitle={(title) => retitle(t.id, title)} />
-										</Suspense>
-									)}
-								</div>
-							))}
-							{!tabs.length && (
-								<div className="empty">
-									<div className="logo big">μ</div>
-									<h1>musql studio</h1>
-									<p>A SQLite-compatible database in your browser, compiled to WebAssembly with its query JIT.</p>
-									<p className="dim">Drop a <b>.sqlite</b> or <b>.musq</b> file anywhere, open one, or start from the sample.</p>
-									<div className="cta">
-										<button className="primary" onClick={() => openDatabase("sample.musq", undefined, SAMPLE)}>Try the sample</button>
-										<button onClick={() => document.getElementById("file").click()}>Open a file…</button>
-									</div>
-								</div>
-							)}
-						</div>
-					</main>
-				</div>
-
-				<footer className="status">
-					<span className={msg.err ? "err" : ""}>{msg.text}</span>
-					<span className="dim">musql · WebAssembly + JIT, in a worker</span>
-				</footer>
+					)}
+					<div className="panes">
+						{tabs.map((t) => (
+							<div key={t.id} className="pane" hidden={t.id !== current?.id}>
+								{t.kind === "table" ? (
+									<TableView name={t.table} mode={t.mode} />
+								) : t.kind === "diagram" ? (
+									<Suspense fallback={<Spinner label="Loading the diagram…" />}>
+										<Diagram onOpen={(name) => { setSection("tables"); openTable(name); }} />
+									</Suspense>
+								) : (
+									<Suspense fallback={<Spinner label="Loading the editor…" />}>
+										<QueryView initial={t.text} title={t.title} onTitle={(title) => retitle(t.id, title)} />
+									</Suspense>
+								)}
+							</div>
+						))}
+						{!current && (
+							<div className="empty">
+								{dbName ? (
+									<>
+										<h1>{section === "sql" ? "Write some SQL" : "Pick a table"}</h1>
+										<p className="dim">{section === "sql" ? "Open a new query, or a saved one from the list." : "Choose one on the left, or create one."}</p>
+										<div className="cta">
+											{section === "sql" ? <button className="primary" onClick={() => openQuery()}>New query</button> : <button className="primary" onClick={() => setDialog("table")}>Create a table</button>}
+											<button onClick={() => setPalette(true)}>Search <span className="kbd">⌘K</span></button>
+										</div>
+									</>
+								) : (
+									<>
+										<div className="logo big">μ</div>
+										<h1>musql studio</h1>
+										<p className="dim">A SQLite-compatible database that runs in your browser. Nothing is uploaded.</p>
+										<div className="starts">
+											<button className="start" onClick={() => openDatabase("sample.musq", undefined, SAMPLE)}>
+												<span className="si">★</span><b>Try the sample</b><span className="dim small">a small music database</span>
+											</button>
+											<button className="start" onClick={pickFile}>
+												<span className="si">⇧</span><b>Open a file</b><span className="dim small">.sqlite, .db, .musq, or drop one</span>
+											</button>
+											<button className="start" onClick={() => openDatabase("untitled.musq")}>
+												<span className="si">＋</span><b>Start empty</b><span className="dim small">a new database</span>
+											</button>
+										</div>
+									</>
+								)}
+							</div>
+						)}
+					</div>
+				</main>
 
 				{(dialog === "table" || dialog?.edit) && (
 					<TableDialog
 						table={dialog?.edit}
 						tables={schema.filter((o) => o.type === "table" && !internal.has(o.name)).map((o) => o.name)}
 						status={status}
-						onSQL={(sql) => openQuery(sql, dialog?.edit ? `Edit ${dialog.edit}` : "New table")}
+						onSQL={(sql) => { setSection("sql"); openQuery(sql, dialog?.edit ? `Edit ${dialog.edit}` : "New table"); }}
 						onClose={(name) => {
 							const was = dialog?.edit;
 							setDialog(null);
 							if (name) {
 								changed();
-								openTable(name, "structure");
-								status(was ? `Changed ${name}.` : `Created ${name}.`);
+								setSection("tables");
+								openTable(name, "data");
+								status(was ? `Saved ${name}.` : `Created ${name}.`);
 							}
 						}}
 					/>
@@ -449,15 +520,17 @@ export default function App() {
 						setDialog(null);
 						if (name) {
 							changed();
+							setSection("tables");
 							openTable(name);
 						}
 					}} />
 				)}
-
+				{palette && <Palette commands={commands} onClose={() => setPalette(false)} />}
 				{ctxMenu}
+				{toasts}
 				{dragging && (
 					<div className="drop" onDragLeave={(e) => e.currentTarget === e.target && setDragging(false)}>
-						<div>Drop a .sqlite or .musq file to open it</div>
+						<div>Drop a .sqlite, .musq, CSV or JSON file</div>
 					</div>
 				)}
 			</div>
