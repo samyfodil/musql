@@ -48,6 +48,9 @@ const (
 	// DatabaseServiceListSnapshotsProcedure is the fully-qualified name of the DatabaseService's
 	// ListSnapshots RPC.
 	DatabaseServiceListSnapshotsProcedure = "/cloud.v1.DatabaseService/ListSnapshots"
+	// DatabaseServiceCreateSnapshotProcedure is the fully-qualified name of the DatabaseService's
+	// CreateSnapshot RPC.
+	DatabaseServiceCreateSnapshotProcedure = "/cloud.v1.DatabaseService/CreateSnapshot"
 	// DatabaseServiceRestoreProcedure is the fully-qualified name of the DatabaseService's Restore RPC.
 	DatabaseServiceRestoreProcedure = "/cloud.v1.DatabaseService/Restore"
 	// DatabaseServiceCreateTokenProcedure is the fully-qualified name of the DatabaseService's
@@ -73,6 +76,7 @@ type DatabaseServiceClient interface {
 	Rename(context.Context, *connect.Request[v1.RenameDatabaseRequest]) (*connect.Response[v1.RenameDatabaseResponse], error)
 	Usage(context.Context, *connect.Request[v1.UsageRequest]) (*connect.Response[v1.UsageResponse], error)
 	ListSnapshots(context.Context, *connect.Request[v1.ListSnapshotsRequest]) (*connect.Response[v1.ListSnapshotsResponse], error)
+	CreateSnapshot(context.Context, *connect.Request[v1.CreateSnapshotRequest]) (*connect.Response[v1.CreateSnapshotResponse], error)
 	Restore(context.Context, *connect.Request[v1.RestoreRequest]) (*connect.Response[v1.RestoreResponse], error)
 	CreateToken(context.Context, *connect.Request[v1.CreateTokenRequest]) (*connect.Response[v1.CreateTokenResponse], error)
 	InvalidateTokens(context.Context, *connect.Request[v1.InvalidateTokensRequest]) (*connect.Response[v1.InvalidateTokensResponse], error)
@@ -134,6 +138,12 @@ func NewDatabaseServiceClient(httpClient connect.HTTPClient, baseURL string, opt
 			connect.WithSchema(databaseServiceMethods.ByName("ListSnapshots")),
 			connect.WithClientOptions(opts...),
 		),
+		createSnapshot: connect.NewClient[v1.CreateSnapshotRequest, v1.CreateSnapshotResponse](
+			httpClient,
+			baseURL+DatabaseServiceCreateSnapshotProcedure,
+			connect.WithSchema(databaseServiceMethods.ByName("CreateSnapshot")),
+			connect.WithClientOptions(opts...),
+		),
 		restore: connect.NewClient[v1.RestoreRequest, v1.RestoreResponse](
 			httpClient,
 			baseURL+DatabaseServiceRestoreProcedure,
@@ -182,6 +192,7 @@ type databaseServiceClient struct {
 	rename           *connect.Client[v1.RenameDatabaseRequest, v1.RenameDatabaseResponse]
 	usage            *connect.Client[v1.UsageRequest, v1.UsageResponse]
 	listSnapshots    *connect.Client[v1.ListSnapshotsRequest, v1.ListSnapshotsResponse]
+	createSnapshot   *connect.Client[v1.CreateSnapshotRequest, v1.CreateSnapshotResponse]
 	restore          *connect.Client[v1.RestoreRequest, v1.RestoreResponse]
 	createToken      *connect.Client[v1.CreateTokenRequest, v1.CreateTokenResponse]
 	invalidateTokens *connect.Client[v1.InvalidateTokensRequest, v1.InvalidateTokensResponse]
@@ -225,6 +236,11 @@ func (c *databaseServiceClient) ListSnapshots(ctx context.Context, req *connect.
 	return c.listSnapshots.CallUnary(ctx, req)
 }
 
+// CreateSnapshot calls cloud.v1.DatabaseService.CreateSnapshot.
+func (c *databaseServiceClient) CreateSnapshot(ctx context.Context, req *connect.Request[v1.CreateSnapshotRequest]) (*connect.Response[v1.CreateSnapshotResponse], error) {
+	return c.createSnapshot.CallUnary(ctx, req)
+}
+
 // Restore calls cloud.v1.DatabaseService.Restore.
 func (c *databaseServiceClient) Restore(ctx context.Context, req *connect.Request[v1.RestoreRequest]) (*connect.Response[v1.RestoreResponse], error) {
 	return c.restore.CallUnary(ctx, req)
@@ -264,6 +280,7 @@ type DatabaseServiceHandler interface {
 	Rename(context.Context, *connect.Request[v1.RenameDatabaseRequest]) (*connect.Response[v1.RenameDatabaseResponse], error)
 	Usage(context.Context, *connect.Request[v1.UsageRequest]) (*connect.Response[v1.UsageResponse], error)
 	ListSnapshots(context.Context, *connect.Request[v1.ListSnapshotsRequest]) (*connect.Response[v1.ListSnapshotsResponse], error)
+	CreateSnapshot(context.Context, *connect.Request[v1.CreateSnapshotRequest]) (*connect.Response[v1.CreateSnapshotResponse], error)
 	Restore(context.Context, *connect.Request[v1.RestoreRequest]) (*connect.Response[v1.RestoreResponse], error)
 	CreateToken(context.Context, *connect.Request[v1.CreateTokenRequest]) (*connect.Response[v1.CreateTokenResponse], error)
 	InvalidateTokens(context.Context, *connect.Request[v1.InvalidateTokensRequest]) (*connect.Response[v1.InvalidateTokensResponse], error)
@@ -321,6 +338,12 @@ func NewDatabaseServiceHandler(svc DatabaseServiceHandler, opts ...connect.Handl
 		connect.WithSchema(databaseServiceMethods.ByName("ListSnapshots")),
 		connect.WithHandlerOptions(opts...),
 	)
+	databaseServiceCreateSnapshotHandler := connect.NewUnaryHandler(
+		DatabaseServiceCreateSnapshotProcedure,
+		svc.CreateSnapshot,
+		connect.WithSchema(databaseServiceMethods.ByName("CreateSnapshot")),
+		connect.WithHandlerOptions(opts...),
+	)
 	databaseServiceRestoreHandler := connect.NewUnaryHandler(
 		DatabaseServiceRestoreProcedure,
 		svc.Restore,
@@ -373,6 +396,8 @@ func NewDatabaseServiceHandler(svc DatabaseServiceHandler, opts ...connect.Handl
 			databaseServiceUsageHandler.ServeHTTP(w, r)
 		case DatabaseServiceListSnapshotsProcedure:
 			databaseServiceListSnapshotsHandler.ServeHTTP(w, r)
+		case DatabaseServiceCreateSnapshotProcedure:
+			databaseServiceCreateSnapshotHandler.ServeHTTP(w, r)
 		case DatabaseServiceRestoreProcedure:
 			databaseServiceRestoreHandler.ServeHTTP(w, r)
 		case DatabaseServiceCreateTokenProcedure:
@@ -420,6 +445,10 @@ func (UnimplementedDatabaseServiceHandler) Usage(context.Context, *connect.Reque
 
 func (UnimplementedDatabaseServiceHandler) ListSnapshots(context.Context, *connect.Request[v1.ListSnapshotsRequest]) (*connect.Response[v1.ListSnapshotsResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("cloud.v1.DatabaseService.ListSnapshots is not implemented"))
+}
+
+func (UnimplementedDatabaseServiceHandler) CreateSnapshot(context.Context, *connect.Request[v1.CreateSnapshotRequest]) (*connect.Response[v1.CreateSnapshotResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("cloud.v1.DatabaseService.CreateSnapshot is not implemented"))
 }
 
 func (UnimplementedDatabaseServiceHandler) Restore(context.Context, *connect.Request[v1.RestoreRequest]) (*connect.Response[v1.RestoreResponse], error) {

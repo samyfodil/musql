@@ -14,6 +14,7 @@ service DatabaseService {
   rpc Rename(RenameDatabaseRequest) returns (RenameDatabaseResponse);
   rpc Usage(UsageRequest) returns (UsageResponse);
   rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
   rpc Restore(RestoreRequest) returns (RestoreResponse);
   rpc CreateToken(CreateTokenRequest) returns (CreateTokenResponse);
   rpc InvalidateTokens(InvalidateTokensRequest) returns (InvalidateTokensResponse);
@@ -108,13 +109,23 @@ message UsagePoint {
 }
 
 message UsageResponse {
+  // The database's series, or the org's totals when no name was given.
   repeated UsagePoint points = 1;
+  // With no name: each database's own series.
+  repeated DatabaseUsage databases = 2;
+}
+
+message DatabaseUsage {
+  string name = 1;
+  repeated UsagePoint points = 2;
 }
 
 message Snapshot {
   string id = 1;
   google.protobuf.Timestamp taken_at = 2;
   int64 size_bytes = 3;
+  // Taken on request (CreateSnapshot), not by the schedule.
+  bool manual = 4;
 }
 
 message ListSnapshotsRequest {
@@ -126,12 +137,25 @@ message ListSnapshotsResponse {
   repeated Snapshot snapshots = 1;
 }
 
+message CreateSnapshotRequest {
+  string org = 1;
+  string name = 2;
+}
+
+message CreateSnapshotResponse {
+  Snapshot snapshot = 1;
+}
+
 message RestoreRequest {
   string org = 1;
   string name = 2;
+  // Now when unset.
   google.protobuf.Timestamp at = 3;
-  // Restore into a new database of this name; in place when empty.
+  // Restore into a new database of this name ("<name>-<time>" when empty).
   string new_name = 4;
+  // Restore in place instead: the database becomes its state at `at`, open
+  // connections are closed, and its history restarts there.
+  bool in_place = 5;
 }
 
 message RestoreResponse {
@@ -186,6 +210,11 @@ message ExportResponse {
 message StatsRequest {
   string org = 1;
   string name = 2;
+  // The last 24 hours when unset.
+  google.protobuf.Timestamp from = 3;
+  google.protobuf.Timestamp to = 4;
+  // 20 when 0.
+  int32 limit = 5;
 }
 
 message TopQuery {
