@@ -25,7 +25,8 @@ var ErrExists = errors.New("state: already exists")
 
 // Store is the service's state database.
 type Store struct {
-	db *sql.DB
+	db       *sql.DB
+	readOnly bool
 }
 
 // Open opens (creating if needed) the state database at path and brings its
@@ -45,6 +46,24 @@ func Open(path string) (*Store, error) {
 	}
 	return s, nil
 }
+
+// OpenReadOnly opens the state database at path, which must exist and be up
+// to date, for reading only: a replica node's copy of the primary's state.
+func OpenReadOnly(path string) (*Store, error) {
+	db, err := sql.Open("sqlite", path+"?_pragma=query_only(1)")
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &Store{db: db, readOnly: true}, nil
+}
+
+// ReadOnly reports whether the store was opened with OpenReadOnly.
+func (s *Store) ReadOnly() bool { return s.readOnly }
 
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
