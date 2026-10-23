@@ -15,7 +15,7 @@ import { MenuButton, useContextMenu } from "./Menu.jsx";
 import { DEFAULT_MODEL, MODELS, setEmbedProgress } from "../embed.js";
 import { embeddingsOf, fillMissing, missingCount, search, searchVec1, setUpEmbedding } from "../vectors.js";
 
-const PAGE = 100;
+const PAGE = 200; // rows read at a time as the grid scrolls
 
 /** One table or view: its rows a page at a time, editable, and its structure. */
 export default function TableView({ name, mode: initialMode = "data", tabId, state }) {
@@ -26,7 +26,10 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 	const [filt, setFilt] = useState(state?.filt ?? { filters: [], sql: "" }); // the menus' conditions, or a typed WHERE
 	const [menu, openMenu] = useContextMenu();
 	const [sorts, setSorts] = useState(state?.sorts ?? []); // [{col, desc}]
-	const [offset, setOffset] = useState(0);
+	const pages = useRef(new Map()); // page number -> rows, for the query in qRef
+	const pending = useRef(new Set());
+	const qRef = useRef(null);
+	const [, bump] = useState(0);
 	const [data, setData] = useState(null);
 	const [total, setTotal] = useState(0);
 	const [error, setError] = useState(null);
@@ -126,7 +129,11 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 		try {
 			const t = performance.now();
 			const n = (await query(`SELECT count(*) FROM ${ident(name)}${filter}`, fp)).rows[0][0];
-			const r = await query(`SELECT ${key}* FROM ${ident(name)}${filter}${order} LIMIT ${PAGE} OFFSET ${offset}`, fp);
+			const base = `SELECT ${key}* FROM ${ident(name)}${filter}${order}`;
+			const r = await query(`${base} LIMIT ${PAGE}`, fp);
+			qRef.current = { base, fp, gen: (qRef.current?.gen ?? 0) + 1 };
+			pages.current = new Map([[0, r.rows]]);
+			pending.current = new Set();
 			setTotal(Number(n));
 			setData(r);
 			setError(null);
@@ -136,7 +143,7 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 			setError(e.message);
 			status(e.message, true);
 		}
-	}, [name, epoch, where, JSON.stringify(whereParams), orderBy, offset, keyed, keyCols.join("\0"), semantic, emb, vec1, vec1Model]);
+	}, [name, epoch, where, JSON.stringify(whereParams), orderBy, keyed, keyCols.join("\0"), semantic, emb, vec1, vec1Model]);
 
 	useEffect(() => {
 		if (cols.length || view) load();
@@ -170,8 +177,43 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 	const searching = !!data?.semantic;
 	const nk = keyed && !searching ? keyCols.length : 0;
 	const shown = data ? data.columns.slice(nk) : [];
-	const body = data ? data.rows.map((r) => r.slice(nk)) : [];
-	const keyOf = (i) => data.rows[i].slice(0, nk);
+	// A row of the table, keys first: from the search result, or from the page
+	// cache, read as the grid scrolls to it.
+	const fullRow = (i) => (searching ? data?.rows[i] : pages.current.get(Math.floor(i / PAGE))?.[i % PAGE]);
+	const sliced = useRef(new WeakMap());
+	const rowAt = useCallback((i) => {
+		const r = fullRow(i);
+		if (!r) return undefined;
+		let v = sliced.current.get(r);
+		if (!v) sliced.current.set(r, (v = r.slice(nk)));
+		return v;
+	}, [data, nk, searching]);
+	const need = useCallback(async (start, end) => {
+		const q = qRef.current;
+		if (!q || searching) return;
+		for (let p = Math.floor(start / PAGE); p <= Math.floor(Math.max(start, end - 1) / PAGE); p++) {
+			if (pages.current.has(p) || pending.current.has(`${q.gen}:${p}`)) continue;
+			pending.current.add(`${q.gen}:${p}`);
+			try {
+				const r = await query(`${q.base} LIMIT ${PAGE} OFFSET ${p * PAGE}`, q.fp);
+				if (qRef.current === q) {
+					pages.current.set(p, r.rows);
+					bump((x) => x + 1);
+				}
+			} catch (e) {
+				status(e.message, true);
+			}
+		}
+	}, [searching]);
+	// ensure reads rows i0..i1 into the cache before a block write or copy.
+	async function ensure(i0, i1) {
+		await need(i0, i1 + 1);
+		for (let p = Math.floor(i0 / PAGE); p <= Math.floor(i1 / PAGE); p++) {
+			if (!pages.current.has(p) && qRef.current) pages.current.set(p, (await query(`${qRef.current.base} LIMIT ${PAGE} OFFSET ${p * PAGE}`, qRef.current.fp)).rows);
+		}
+	}
+	const body = data ? Array.from({ length: Math.min(total, PAGE) }, (_, i) => rowAt(i)).filter(Boolean) : [];
+	const keyOf = (i) => fullRow(i).slice(0, nk);
 	const keyWhere = keyCols.map((k) => `${ident(k)} IS ?`).join(" AND ");
 	const types = Object.fromEntries(cols.map((c) => [c.name, c.type]));
 
@@ -188,11 +230,68 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 	}
 
 	async function edit(i, col, text) {
-		if (body[i][shown.indexOf(col)] instanceof Uint8Array) {
+		const row = fullRow(i);
+		const j = nk + shown.indexOf(col);
+		if (row[j] instanceof Uint8Array) {
 			status("BLOB values are edited with SQL, in a query tab.", true);
 			return;
 		}
-		await write(`UPDATE ${ident(name)} SET ${ident(col)} = ? WHERE ${keyWhere}`, [typed(text, types[col]), ...keyOf(i)], `Updated ${col}.`);
+		// Shown at once, written after; put back if the write fails.
+		const old = row[j];
+		const v = text === null ? null : typed(text, types[col]);
+		row[j] = v;
+		sliced.current.delete(row);
+		bump((x) => x + 1);
+		try {
+			await run(`UPDATE ${ident(name)} SET ${ident(col)} = ? WHERE ${keyWhere}`, [v, ...keyOf(i)]);
+			changed(name);
+			fill();
+		} catch (e) {
+			row[j] = old;
+			sliced.current.delete(row);
+			bump((x) => x + 1);
+			status(e.message, true);
+		}
+	}
+
+	// paste writes a copied block over the cells from row i, columns cs on,
+	// in one transaction (so one undo); rows past the end are left out.
+	async function paste(i, cs, matrix) {
+		const n = Math.min(matrix.length, total - i);
+		if (n <= 0) return;
+		await ensure(i, i + n - 1);
+		const editableCols = cs.filter((c) => !(cols.find((x) => x.name === c)?.hidden));
+		try {
+			await run("BEGIN");
+			for (let r = 0; r < n; r++) {
+				const sets = editableCols.map((c, k) => [c, matrix[r][k]]).filter(([, v]) => v !== undefined);
+				if (!sets.length) continue;
+				await run(`UPDATE ${ident(name)} SET ${sets.map(([c]) => `${ident(c)} = ?`).join(", ")} WHERE ${keyWhere}`, [...sets.map(([c, v]) => (v === "" ? null : typed(v, types[c]))), ...keyOf(i + r)]);
+			}
+			await run("COMMIT");
+			status(`Pasted ${fmt(n * editableCols.length)} cell${n * editableCols.length === 1 ? "" : "s"}${matrix.length > n ? ` (${matrix.length - n} rows past the end left out)` : ""}.`);
+		} catch (e) {
+			await run("ROLLBACK").catch(() => {});
+			status(e.message, true);
+		}
+		changed(name);
+		await load();
+	}
+
+	// clear empties a block of cells (sets them NULL), in one transaction.
+	async function clear(i0, i1, cs) {
+		await ensure(i0, i1);
+		try {
+			await run("BEGIN");
+			for (let i = i0; i <= i1; i++) await run(`UPDATE ${ident(name)} SET ${cs.map((c) => `${ident(c)} = NULL`).join(", ")} WHERE ${keyWhere}`, keyOf(i));
+			await run("COMMIT");
+			status(`Emptied ${fmt((i1 - i0 + 1) * cs.length)} cell${(i1 - i0 + 1) * cs.length === 1 ? "" : "s"}.`);
+		} catch (e) {
+			await run("ROLLBACK").catch(() => {});
+			status(e.message, true);
+		}
+		changed(name);
+		await load();
 	}
 
 	async function remove() {
@@ -285,7 +384,7 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 	// cellMenu is a right-click on a cell: edit it, copy it, filter by it, or
 	// select or delete its row.
 	function cellMenu(i, col, startEdit) {
-		const v = body[i][shown.indexOf(col)];
+		const v = rowAt(i)?.[shown.indexOf(col)];
 		const text = v === null ? null : v instanceof Uint8Array ? null : String(v);
 		const by = (op) => setFilt({ filters: [...filt.filters, { col, op, value: text ?? "" }], sql: "" });
 		return [
@@ -293,7 +392,7 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 			editable && !searching && { label: "Edit cell", hint: "Enter", onClick: startEdit },
 			editable && !searching && v !== null && { label: "Set to NULL", onClick: () => write(`UPDATE ${ident(name)} SET ${ident(col)} = NULL WHERE ${keyWhere}`, keyOf(i), `Set ${col} to NULL.`) },
 			{ label: "Copy value", hint: "⌘C", onClick: () => navigator.clipboard?.writeText(text ?? "NULL") },
-			{ label: "Copy row as JSON", onClick: () => navigator.clipboard?.writeText(JSON.stringify(Object.fromEntries(shown.map((c, j) => [c, typeof body[i][j] === "bigint" ? String(body[i][j]) : body[i][j] instanceof Uint8Array ? null : body[i][j]])))) },
+			{ label: "Copy row as JSON", onClick: () => navigator.clipboard?.writeText(JSON.stringify(Object.fromEntries(shown.map((c, j) => [c, typeof rowAt(i)[j] === "bigint" ? String(rowAt(i)[j]) : rowAt(i)[j] instanceof Uint8Array ? null : rowAt(i)[j]])))) },
 			"-",
 			!searching && cols.some((c) => c.name === col) && (v === null
 				? { label: `Filter: ${col} is empty`, onClick: () => by("null") }
@@ -306,14 +405,15 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 	}
 
 	if (!obj) return <div className="empty"><p className="dim">{name} no longer exists.</p></div>;
-	const last = Math.min(offset + PAGE, total);
 	const tables = schema.filter((o) => o.type === "table").map((o) => o.name);
 	const nf = filt.sql ? 1 : filt.filters.length;
 	const sortBy = (col, d) => setSorts([{ col, desc: d }]);
 
 	// headerMenu is a click on a column's ▾: sort by it, filter on it, or change it.
-	const headerMenu = (e, col) =>
+	const headerMenu = (e, col, gridItems = []) =>
 		openMenu(e, [
+			...gridItems,
+			"-",
 			{ label: "Sort ascending", hint: "A → Z", onClick: () => sortBy(col, false) },
 			{ label: "Sort descending", hint: "Z → A", onClick: () => sortBy(col, true) },
 			sorts.length > 0 && { label: "Clear sort", onClick: () => setSorts([]) },
@@ -335,7 +435,7 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 									<strong>Filter rows</strong>
 									<span className="dim small">conditions are ANDed</span>
 								</div>
-								<FilterBar key={name} columns={cols.map((c) => c.name)} filters={filt.filters} sql={filt.sql} onApply={(f) => { setOffset(0); setFilt({ filters: f.filters ?? [], sql: f.sql ?? "" }); }} />
+								<FilterBar key={name} columns={cols.map((c) => c.name)} filters={filt.filters} sql={filt.sql} onApply={(f) => { setFilt({ filters: f.filters ?? [], sql: f.sql ?? "" }); }} />
 							</Popover>
 							<Popover className={`ghost chipbtn${sorts.length ? " active" : ""}`} label={<><ArrowUpDown size={14} />{sorts.length ? `Sorted by ${sorts.length}` : "Sort"}</>} width={380}>
 								<div className="popover-head"><strong>Sort rows</strong></div>
@@ -421,16 +521,19 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 				) : error ? (
 					<div className="result-meta err">{error}</div>
 				) : !data ? (
-					<Spinner label={`Reading ${name}…`} />
+					cols.length ? <Grid columns={cols.map((c) => c.name)} count={18} rowAt={() => undefined} layoutKey={name} types={types} /> : <Spinner label={`Reading ${name}…`} />
 				) : mode === "chart" ? (
-					<Chart key={name + offset} columns={shown} rows={body} />
+					<Chart key={name} columns={shown} rows={body} />
 				) : (
 					<>
 						<Grid
 							columns={shown}
-							rows={body}
+							count={total}
+							rowAt={rowAt}
+							need={need}
+							range={async (i0, i1) => { await ensure(i0, i1); return Array.from({ length: i1 - i0 + 1 }, (_, k) => rowAt(i0 + k)); }}
+							layoutKey={`${name}`}
 							types={types}
-							start={searching ? 0 : offset}
 							sort={sorts.length === 1 ? sorts[0].col : null}
 							desc={sorts[0]?.desc}
 							onSort={searching ? undefined : (c) => sortBy(c, sorts.length === 1 && sorts[0].col === c ? !sorts[0].desc : false)}
@@ -439,9 +542,11 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 							onPick={keyed && !searching ? togglePick : undefined}
 							onOpen={(i) => setRowPanel({ i })}
 							onEdit={editable && !searching ? edit : undefined}
+							onPaste={editable && !searching ? paste : undefined}
+							onClear={editable && !searching ? clear : undefined}
 							onContextMenu={(e, i, col, startEdit) => openMenu(e, cellMenu(i, col, startEdit))}
 						/>
-						{!body.length && (
+						{!total && data && (
 							<div className="emptyrows">
 								<div className="emptyicon">{where ? "⏷" : "▦"}</div>
 								<p>{where ? "No rows match the filter." : `${name} has no rows yet.`}</p>
@@ -461,13 +566,7 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 				<span className="grow" />
 				{mode !== "structure" && (
 					<>
-						<span className="dim small">{searching ? info : total ? `${fmt(offset + 1)}–${fmt(last)} of ${fmt(total)} ${where ? "matching " : ""}rows · ${info}` : "0 rows"}</span>
-						{!searching && (
-							<div className="pagebtns">
-								<button className="ghost icon" title="Previous page" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - PAGE))}>‹</button>
-								<button className="ghost icon" title="Next page" disabled={last >= total} onClick={() => setOffset(offset + PAGE)}>›</button>
-							</div>
-						)}
+						<span className="dim small">{searching ? info : `${fmt(total)} ${where ? "matching " : ""}row${total === 1 ? "" : "s"} · ${info}`}</span>
 					</>
 				)}
 				{mode === "structure" && editable && <button className="primary" onClick={() => editTable(name)}>Edit table</button>}
@@ -478,7 +577,7 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 					name={name}
 					cols={cols}
 					readOnly={!editable || searching}
-					row={rowPanel.i == null ? null : Object.fromEntries(shown.map((c, j) => [c, body[rowPanel.i][j]]))}
+					row={rowPanel.i == null ? null : Object.fromEntries(shown.map((c, j) => [c, rowAt(rowPanel.i)[j]]))}
 					onSave={(v) => saveRow(rowPanel.i, v)}
 					onClose={() => setRowPanel(null)}
 				/>

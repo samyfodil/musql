@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@codemirror/lang-sql": "^6.8.0",
+    "@codemirror/lint": "^6.9.7",
     "@codemirror/state": "^6.5.0",
     "@codemirror/view": "^6.36.0",
     "@huggingface/transformers": "^3.8.1",
@@ -18,7 +19,8 @@
     "lucide-react": "^0.468.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "recharts": "^3.10.1"
+    "recharts": "^3.10.1",
+    "sql-formatter": "^15.9.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.0",
