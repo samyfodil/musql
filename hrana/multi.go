@@ -77,6 +77,10 @@ func (m *Multi) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// after the upgrade, so without a valid header it may only reach a
 	// database that already exists; creating one takes an authorized request.
 	authed := m.authToken == "" || bearerOK(r, m.authToken)
+	if authed && m.auth != nil {
+		_, status := m.authorize(bearer(r))
+		authed = status == 0
+	}
 	if !authed && !isWebSocket(r) {
 		http.Error(w, `{"message":"unauthorized"}`, http.StatusUnauthorized)
 		return

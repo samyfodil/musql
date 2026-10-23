@@ -40,6 +40,7 @@ type Server struct {
 
 type httpStream struct {
 	*stream
+	ro       bool       // opened on the read-only database
 	mu       sync.Mutex // a stream runs one pipeline at a time
 	lastUsed time.Time
 }
@@ -48,6 +49,8 @@ type httpStream struct {
 // Multi knows the token before any database's Server exists.
 type config struct {
 	authToken string
+	auth      func(token string) (readOnly bool, err error)
+	roDB      *sql.DB
 	idle      time.Duration
 }
 
@@ -66,9 +69,51 @@ type Option func(*config)
 // Without it the server accepts any client.
 func WithAuthToken(token string) Option { return func(c *config) { c.authToken = token } }
 
+// WithAuth checks every token a client presents: the bearer token of an HTTP
+// request, and for a WebSocket the bearer token of its upgrade request when
+// it has one, else the token in its hello message. A non-nil error refuses
+// the client. A read-only client runs on the database given by
+// WithReadOnlyDB, and is refused when there is none.
+func WithAuth(check func(token string) (readOnly bool, err error)) Option {
+	return func(c *config) { c.auth = check }
+}
+
+// WithReadOnlyDB sets the database that clients WithAuth marks read-only run
+// on. Confining it is the caller's job.
+func WithReadOnlyDB(db *sql.DB) Option { return func(c *config) { c.roDB = db } }
+
 // WithIdleTimeout closes a stream after d without a request (default 10s): an
 // HTTP client that stops without closing its stream leaves no other signal.
 func WithIdleTimeout(d time.Duration) Option { return func(c *config) { c.idle = d } }
+
+// bearer is the token of an "Authorization: Bearer <token>" header.
+func bearer(r *http.Request) string {
+	tok, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	return tok
+}
+
+// authorize checks a token against WithAuth; the status is 0 when it passes.
+func (c *config) authorize(token string) (readOnly bool, status int) {
+	if c.auth == nil {
+		return false, 0
+	}
+	ro, err := c.auth(token)
+	switch {
+	case err != nil:
+		return false, http.StatusUnauthorized
+	case ro && c.roDB == nil:
+		return false, http.StatusForbidden
+	}
+	return ro, 0
+}
+
+// dbFor is the database a client runs on.
+func (s *Server) dbFor(readOnly bool) *sql.DB {
+	if readOnly {
+		return s.roDB
+	}
+	return s.db
+}
 
 // NewServer serves db, which must be opened with the musql driver.
 func NewServer(db *sql.DB, opts ...Option) *Server {
@@ -118,6 +163,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"message":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
+	ro, status := s.authorize(bearer(r))
+	if status != 0 {
+		http.Error(w, `{"message":"unauthorized"}`, status)
+		return
+	}
 	path := strings.Trim(r.URL.Path, "/")
 	switch {
 	case r.Method == http.MethodGet && (path == "" || path == "health"):
@@ -125,13 +175,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && (path == "v2" || path == "v3" || path == "v3-protobuf"):
 		w.WriteHeader(http.StatusOK)
 	case r.Method == http.MethodPost && (path == "v2/pipeline" || path == "v3/pipeline"):
-		s.pipeline(w, r, false)
+		s.pipeline(w, r, false, ro)
 	case r.Method == http.MethodPost && path == "v3-protobuf/pipeline":
-		s.pipeline(w, r, true)
+		s.pipeline(w, r, true, ro)
 	case r.Method == http.MethodPost && path == "v3/cursor":
-		s.cursor(w, r, false)
+		s.cursor(w, r, false, ro)
 	case r.Method == http.MethodPost && path == "v3-protobuf/cursor":
-		s.cursor(w, r, true)
+		s.cursor(w, r, true, ro)
 	default:
 		http.Error(w, `{"message":"not found"}`, http.StatusNotFound)
 	}
@@ -145,19 +195,25 @@ func newBaton() string {
 
 // take returns the stream a baton names (a new one for no baton) with its lock
 // held, and removes the baton: every response hands out a fresh one.
-func (s *Server) take(ctx context.Context, baton *string) (*httpStream, error) {
+//
+// A stream opened read-write is never handed to a read-only client.
+func (s *Server) take(ctx context.Context, baton *string, ro bool) (*httpStream, error) {
 	s.reap()
 	if baton == nil || *baton == "" {
-		st, err := newStream(context.WithoutCancel(ctx), s.db, newSQLStore())
+		st, err := newStream(context.WithoutCancel(ctx), s.dbFor(ro), newSQLStore())
 		if err != nil {
 			return nil, err
 		}
-		hs := &httpStream{stream: st}
+		hs := &httpStream{stream: st, ro: ro}
 		hs.mu.Lock()
 		return hs, nil
 	}
 	s.mu.Lock()
 	hs, ok := s.streams[*baton]
+	if ok && ro && !hs.ro {
+		s.mu.Unlock()
+		return nil, protoErr("the baton belongs to a read-write stream")
+	}
 	delete(s.streams, *baton)
 	s.mu.Unlock()
 	if !ok {
@@ -201,7 +257,7 @@ func (s *Server) reap() {
 
 const maxHTTPRequestBody = 64 << 20 // 64 MB
 
-func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, protobuf bool) {
+func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, protobuf, ro bool) {
 	defer r.Body.Close()
 	r.Body = http.MaxBytesReader(w, r.Body, maxHTTPRequestBody)
 	body, err := io.ReadAll(r.Body)
@@ -237,7 +293,7 @@ func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, protobuf bool)
 		batchLens = append(batchLens, len(rq.GetBatch().GetBatch().GetSteps()))
 	}
 
-	hs, err := s.take(r.Context(), req.Baton)
+	hs, err := s.take(r.Context(), req.Baton, ro)
 	if err != nil {
 		writeHTTPError(w, http.StatusBadRequest, err, protobuf)
 		return
@@ -316,7 +372,7 @@ func (hs *httpStream) handle(ctx context.Context, rq *pbhttp.StreamRequest) (res
 }
 
 // cursor runs a batch and streams its result entries.
-func (s *Server) cursor(w http.ResponseWriter, r *http.Request, protobuf bool) {
+func (s *Server) cursor(w http.ResponseWriter, r *http.Request, protobuf, ro bool) {
 	defer r.Body.Close()
 	r.Body = http.MaxBytesReader(w, r.Body, maxHTTPRequestBody)
 	body, err := io.ReadAll(r.Body)
@@ -344,7 +400,7 @@ func (s *Server) cursor(w http.ResponseWriter, r *http.Request, protobuf bool) {
 		}
 		req = &pbhttp.CursorReqBody{Baton: j.Baton, Batch: b}
 	}
-	hs, err := s.take(r.Context(), req.Baton)
+	hs, err := s.take(r.Context(), req.Baton, ro)
 	if err != nil {
 		writeHTTPError(w, http.StatusBadRequest, err, protobuf)
 		return
