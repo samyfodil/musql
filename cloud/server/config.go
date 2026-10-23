@@ -26,7 +26,10 @@ type Config struct {
 	Admin     AdminConfig `yaml:"admin"`
 	Node      NodeConfig  `yaml:"node"`
 	Peers     []Peer      `yaml:"peers"`
-	AI        AIConfig    `yaml:"ai"`
+	// Primary names the node that holds the state and writes every
+	// database: this one when empty. Any other node is a replica.
+	Primary   string   `yaml:"primary"`
+	AI        AIConfig `yaml:"ai"`
 	Snapshots struct {
 		Every string `yaml:"every"`
 		Keep  string `yaml:"keep"`
@@ -140,6 +143,9 @@ func (c *Config) normalize() error {
 	if !state.ValidName.MatchString(c.Node.Location) {
 		return fmt.Errorf("config: node.location %q: lower-case letters, digits and dashes", c.Node.Location)
 	}
+	if err := c.checkPeers(); err != nil {
+		return err
+	}
 	if c.PublicURL == "" {
 		host := c.Listen
 		if strings.HasPrefix(host, ":") {
@@ -185,6 +191,53 @@ func (c *Config) normalize() error {
 		return fmt.Errorf("config: oidc.login_window: %w", err)
 	}
 	return nil
+}
+
+// checkPeers checks the peers and the primary: every node has its own name
+// and location, every peer a URL and a secret.
+func (c *Config) checkPeers() error {
+	names := map[string]bool{c.Node.Name: true}
+	locs := map[string]bool{c.Node.Location: true}
+	for _, p := range c.Peers {
+		if names[p.Name] || p.Name == "" {
+			return fmt.Errorf("config: peer %q: every node needs its own name", p.Name)
+		}
+		if locs[p.Location] || !state.ValidName.MatchString(p.Location) {
+			return fmt.Errorf("config: peer %s: location %q is taken or invalid", p.Name, p.Location)
+		}
+		if u, err := url.Parse(p.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("config: peer %s: url %q is not an http(s) URL", p.Name, p.URL)
+		}
+		if p.Secret == "" {
+			return fmt.Errorf("config: peer %s: a secret is required", p.Name)
+		}
+		names[p.Name], locs[p.Location] = true, true
+	}
+	if c.Primary == "" {
+		c.Primary = c.Node.Name
+	}
+	if !names[c.Primary] {
+		return fmt.Errorf("config: primary %q is not this node or a peer", c.Primary)
+	}
+	return nil
+}
+
+// primaryPeer is the primary's entry, nil on the primary itself.
+func (c *Config) primaryPeer() *Peer {
+	for i := range c.Peers {
+		if c.Peers[i].Name == c.Primary && c.Primary != c.Node.Name {
+			return &c.Peers[i]
+		}
+	}
+	return nil
+}
+
+// primaryLocation is the primary node's location.
+func (c *Config) primaryLocation() string {
+	if p := c.primaryPeer(); p != nil {
+		return p.Location
+	}
+	return c.Node.Location
 }
 
 func durationOr(s string, def time.Duration) (time.Duration, error) {
