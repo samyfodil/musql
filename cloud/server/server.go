@@ -20,7 +20,6 @@ import (
 	"github.com/samyfodil/musql/cloud/gen/cloud/v1/cloudv1connect"
 	"github.com/samyfodil/musql/cloud/oidc"
 	"github.com/samyfodil/musql/cloud/state"
-	cloudstore "github.com/samyfodil/musql/cloud/store"
 )
 
 // maxUpload bounds a request body to the API; an upload carries a whole
@@ -36,14 +35,9 @@ type Server struct {
 	meter    *meter
 	hist     histories
 	handler  http.Handler
+	log      *log.Logger
 	genMu    sync.Mutex
 	gen      ai.Generator
-	// stateHist is the state database's history: logged on the primary,
-	// followed on a replica.
-	stateHist *cloudstore.History
-	// replica is set on a replica node.
-	replica *replica
-	log     *log.Logger
 
 	stop chan struct{}
 	bg   sync.WaitGroup
@@ -65,34 +59,22 @@ func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) 
 			return nil, err
 		}
 	}
-	s := &Server{cfg: cfg, log: logger, stop: make(chan struct{})}
-	if cfg.primaryPeer() != nil {
-		if err := s.newReplicaNode(ctx); err != nil {
-			return nil, err
-		}
-		return s, nil
-	}
-	store, err := state.Open(s.statePath())
+	store, err := state.Open(filepath.Join(cfg.DataDir, "state.musq"))
 	if err != nil {
 		return nil, err
 	}
-	s.store = store
-	if s.stateHist, err = cloudstore.Open(s.statePath(), s.stateHistDir()); err != nil {
+	s := &Server{cfg: cfg, store: store, log: logger}
+	if err := s.ensureAdmin(ctx); err != nil {
 		store.Close()
 		return nil, err
 	}
-	s.stateHist.Logf = logger.Printf
-	if err := s.ensureAdmin(ctx); err != nil {
-		s.closeState()
-		return nil, err
-	}
 	if err := store.EnsureGroupLocation(ctx, cfg.Node.Location); err != nil {
-		s.closeState()
+		store.Close()
 		return nil, err
 	}
 	if s.provider, err = oidc.New(ctx, store, cfg.PublicURL, oidc.WithConsoleOrigins(cfg.Console.CORSOrigins), oidc.WithKeyRotation(cfg.OIDC.keyRotation),
 		oidc.WithLoginLimits(cfg.OIDC.LoginPerIP, cfg.OIDC.LoginPerEmail, cfg.OIDC.loginWindow)); err != nil {
-		s.closeState()
+		store.Close()
 		return nil, err
 	}
 	s.meter = newMeter(store, func(id string) int64 {
@@ -104,45 +86,13 @@ func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) 
 	})
 	s.pool = newPool(s.openEntry)
 	s.handler = s.routes()
+	s.stop = make(chan struct{})
 	s.bg.Go(s.rotateKeys)
 	if cfg.snapshotEvery > 0 {
 		s.bg.Go(func() { s.runSnapshots(s.stop) })
 	}
 	s.bg.Go(s.runUsageFlush)
 	return s, nil
-}
-
-// newReplicaNode starts a replica: the state followed from the primary and
-// read here, databases placed by their groups' locations.
-func (s *Server) newReplicaNode(ctx context.Context) error {
-	if err := s.startReplica(ctx); err != nil {
-		return err
-	}
-	var err error
-	if s.store, err = state.OpenReadOnly(s.statePath()); err != nil {
-		s.stopFollowers()
-		s.stateHist.Close()
-		return err
-	}
-	if s.provider, err = oidc.New(ctx, s.store, s.cfg.PublicURL, oidc.WithVerifyOnly()); err != nil {
-		s.stopFollowers()
-		s.closeState()
-		return err
-	}
-	s.pool = newPool(s.openReplicaEntry)
-	s.handler = s.replicaRoutes()
-	s.bg.Go(s.runReconcile)
-	if s.cfg.snapshotEvery > 0 {
-		s.bg.Go(func() { s.runSnapshots(s.stop) })
-	}
-	return nil
-}
-
-func (s *Server) closeState() {
-	if err := s.store.Close(); err != nil {
-		s.log.Printf("close state: %v", err)
-	}
-	s.stateHist.Close()
 }
 
 // rotateKeys starts new signing keys on schedule and drops expired ones.
@@ -187,17 +137,11 @@ func (s *Server) Close() error {
 	close(s.stop)
 	s.bg.Wait()
 	s.pool.closeAll()
-	if s.replica != nil {
-		s.stopFollowers()
-	} else {
-		s.closeHistories()
-		if err := s.meter.flush(context.Background()); err != nil {
-			s.log.Printf("usage: %v", err)
-		}
+	s.closeHistories()
+	if err := s.meter.flush(context.Background()); err != nil {
+		s.log.Printf("usage: %v", err)
 	}
-	err := s.store.Close()
-	s.stateHist.Close()
-	return err
+	return s.store.Close()
 }
 
 func (s *Server) ensureAdmin(ctx context.Context) error {
@@ -239,7 +183,6 @@ func (s *Server) routes() http.Handler {
 	mux.Handle(cloudv1connect.NewGroupServiceHandler(groupService{s}, opts...))
 	mux.Handle(cloudv1connect.NewDatabaseServiceHandler(databaseService{Server: s}, opts...))
 	mux.Handle(cloudv1connect.NewAIServiceHandler(aiService{Server: s}, opts...))
-	mux.Handle(cloudv1connect.NewPeerServiceHandler(peerService{s}))
 	mux.Handle("/db/", http.HandlerFunc(s.serveDB))
 	op := s.provider.Handler()
 	mux.Handle("/.well-known/openid-configuration", op)
