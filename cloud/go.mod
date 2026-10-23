@@ -8,12 +8,15 @@ replace github.com/samyfodil/musql/hrana => ../hrana
 
 require (
 	connectrpc.com/connect v1.21.0
+	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/samyfodil/musql v0.1.1
+	github.com/samyfodil/musql/hrana v0.0.0
 	golang.org/x/crypto v0.56.0
 	google.golang.org/protobuf v1.36.12
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
-	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
+	github.com/coder/websocket v1.8.15 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 )
