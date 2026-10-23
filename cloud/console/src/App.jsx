@@ -157,11 +157,21 @@ export default function App() {
 				saveSoon();
 				return;
 			}
+			const describe = () => {
+				const what = /^\s*(\w+)(?:\s+(?:OR\s+\w+\s+)?(?:INTO|FROM|TABLE|INDEX|VIEW|TRIGGER))?\s+"?([\w$]+)?/i.exec(sql.replace(/^(\s|--[^\n]*\n)*/, ""));
+				return what?.[2] ? `${what[1].toLowerCase()} ${what[2]}` : v.toLowerCase();
+			};
+			// A step opened by BEGIN or SAVEPOINT is named after the first statement in it.
+			const top = undoStack.current.at(-1);
+			const opener = v === "BEGIN" || v === "SAVEPOINT";
+			if (top?.vague && (inTxn.current || grouping.current) && !opener) {
+				top.label = describe();
+				top.vague = false;
+			}
 			if (inTxn.current) return;
 			if (!grouping.current) {
 				const snap = await exportMusql();
-				const what = /^\s*(\w+)(?:\s+(?:OR\s+\w+\s+)?(?:INTO|FROM|TABLE|INDEX|VIEW|TRIGGER))?\s+"?([\w$]+)?/i.exec(sql.replace(/^(\s|--[^\n]*\n)*/, ""));
-				undoStack.current.push({ label: what?.[2] ? `${what[1].toLowerCase()} ${what[2]}` : v.toLowerCase(), snap });
+				undoStack.current.push({ label: opener ? "change" : describe(), snap, vague: opener });
 				let bytes = undoStack.current.reduce((n, x) => n + x.snap.length, 0);
 				while (undoStack.current.length > 1 && (undoStack.current.length > 50 || bytes > 256e6)) bytes -= undoStack.current.shift().snap.length;
 				redoStack.current = [];
