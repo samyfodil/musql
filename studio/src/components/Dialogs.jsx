@@ -4,6 +4,7 @@ import { applyEdit, blankColumn, blankTable, createSQL, previewEdit, readTable }
 import { fmt } from "../values.js";
 import { importRows, inferTypes, parseCSV, parseJSON } from "../importer.js";
 import { TypeInput } from "./TableView.jsx";
+import Drawer from "./Drawer.jsx";
 
 const db = { run, rows };
 
@@ -21,14 +22,13 @@ const ON_DELETE = ["", "CASCADE", "SET NULL", "SET DEFAULT", "RESTRICT"];
  * onClose(null) otherwise. tables lists the tables a foreign key can name.
  */
 export function TableDialog({ table, tables = [], onClose, onSQL, status }) {
-	const ref = useModal();
 	const [old, setOld] = useState(table ? null : blankTable());
 	const [m, setM] = useState(old);
 	const [busy, setBusy] = useState(false);
 	useEffect(() => {
 		if (table) readTable(db, table).then((t) => { setOld(t); setM(structuredClone(t)); }, (e) => status(e.message, true));
 	}, [table]);
-	if (!m) return <dialog ref={ref} onClose={() => onClose(null)}><p className="dim">Reading {table}…</p></dialog>;
+	if (!m) return <Drawer wide title={`Edit ${table}`} onClose={() => onClose(null)}><p className="dim">Reading {table}…</p></Drawer>;
 
 	const set = (i, k, v) => setM({ ...m, cols: m.cols.map((c, j) => (j === i ? { ...c, [k]: v } : c)) });
 	const move = (i, d) => {
@@ -44,7 +44,7 @@ export function TableDialog({ table, tables = [], onClose, onSQL, status }) {
 	const problem = !m.name.trim() ? "The table needs a name." : !used.length ? "The table needs a column." : dup ? `Two columns are named ${dup.name}.` : m.withoutRowid && !used.some((c) => c.pk) ? "A WITHOUT ROWID table needs a primary key." : null;
 
 	async function submit(e) {
-		e.preventDefault();
+		e?.preventDefault();
 		setBusy(true);
 		try {
 			if (table) await applyEdit(db, old, m);
@@ -57,9 +57,8 @@ export function TableDialog({ table, tables = [], onClose, onSQL, status }) {
 	}
 
 	return (
-		<dialog ref={ref} className="wide" onClose={() => onClose(null)}>
+		<Drawer wide title={table ? `Edit table ${table}` : "Create a table"} subtitle={table ? "Columns, keys and foreign keys" : "Name it, then add its columns"} onClose={() => onClose(null)}>
 			<form onSubmit={submit}>
-				<h2>{table ? `Edit ${table}` : "New table"}</h2>
 				{blocked ? (
 					<>
 						<p className="warn small">
@@ -132,7 +131,7 @@ export function TableDialog({ table, tables = [], onClose, onSQL, status }) {
 					</>
 				)}
 			</form>
-		</dialog>
+		</Drawer>
 	);
 }
 
