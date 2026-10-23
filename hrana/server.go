@@ -52,6 +52,7 @@ type config struct {
 	auth      func(token string) (readOnly bool, err error)
 	roDB      *sql.DB
 	idle      time.Duration
+	observe   func(Stmt)
 }
 
 func newConfig(opts []Option) config {
@@ -114,6 +115,20 @@ func (s *Server) dbFor(readOnly bool) *sql.DB {
 	}
 	return s.db
 }
+
+// Stmt is one statement a client ran, as WithObserver reports it.
+type Stmt struct {
+	SQL      string
+	Duration time.Duration
+	// RowsRead is the rows the statement returned, RowsWritten the rows it
+	// changed (total_changes moved by).
+	RowsRead, RowsWritten int64
+	Err                   error
+}
+
+// WithObserver calls fn after every statement a client runs (an execute, a
+// batch step, a sequence), on the goroutine that ran it, so fn must be quick.
+func WithObserver(fn func(Stmt)) Option { return func(c *config) { c.observe = fn } }
 
 // NewServer serves db, which must be opened with the musql driver.
 func NewServer(db *sql.DB, opts ...Option) *Server {
@@ -200,7 +215,7 @@ func newBaton() string {
 func (s *Server) take(ctx context.Context, baton *string, ro bool) (*httpStream, error) {
 	s.reap()
 	if baton == nil || *baton == "" {
-		st, err := newStream(context.WithoutCancel(ctx), s.dbFor(ro), newSQLStore())
+		st, err := newStream(context.WithoutCancel(ctx), s.dbFor(ro), newSQLStore(), s.observe)
 		if err != nil {
 			return nil, err
 		}
