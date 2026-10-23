@@ -23,8 +23,9 @@ import (
 // stream is one Hrana stream: one musql connection, plus the SQL texts stored
 // with store_sql (per stream over HTTP, per connection over WebSocket).
 type stream struct {
-	conn *sql.Conn
-	sqls *sqlStore
+	conn    *sql.Conn
+	sqls    *sqlStore
+	observe func(Stmt)
 }
 
 // sqlStore is the SQL texts stored with store_sql.
@@ -54,7 +55,7 @@ func (s *sqlStore) del(id int32) {
 	s.mu.Unlock()
 }
 
-func newStream(ctx context.Context, db *sql.DB, sqls *sqlStore) (*stream, error) {
+func newStream(ctx context.Context, db *sql.DB, sqls *sqlStore, observe func(Stmt)) (*stream, error) {
 	c, err := db.Conn(ctx)
 	if err != nil {
 		return nil, err
@@ -70,7 +71,7 @@ func newStream(ctx context.Context, db *sql.DB, sqls *sqlStore) (*stream, error)
 		c.Close()
 		return nil, err
 	}
-	return &stream{conn: c, sqls: sqls}, nil
+	return &stream{conn: c, sqls: sqls, observe: observe}, nil
 }
 
 func (s *stream) close() error { return s.conn.Close() }
@@ -114,6 +115,19 @@ func (s *stream) execute(ctx context.Context, st *pb.Stmt) (*pb.StmtResult, erro
 	if err != nil {
 		return nil, err
 	}
+	if s.observe == nil {
+		res, _, _, err := s.run(ctx, q, st)
+		return res, err
+	}
+	start := time.Now()
+	res, read, written, err := s.run(ctx, q, st)
+	s.observe(Stmt{SQL: q, Duration: time.Since(start), RowsRead: read, RowsWritten: written, Err: err})
+	return res, err
+}
+
+// run is execute's statement, also reporting how many rows it returned and
+// changed.
+func (s *stream) run(ctx context.Context, q string, st *pb.Stmt) (res *pb.StmtResult, read, written int64, err error) {
 	args := make([]any, 0, len(st.Args)+len(st.NamedArgs))
 	for _, v := range st.Args {
 		args = append(args, fromValue(v))
@@ -126,13 +140,13 @@ func (s *stream) execute(ctx context.Context, st *pb.Stmt) (*pb.StmtResult, erro
 	_, total0, _, _ := s.state()
 	rows, err := s.conn.QueryContext(ctx, q, args...)
 	if err != nil {
-		return nil, err
+		return nil, read, 0, err
 	}
 	defer rows.Close()
-	res := &pb.StmtResult{}
+	res = &pb.StmtResult{}
 	types, err := rows.ColumnTypes()
 	if err != nil {
-		return nil, err
+		return nil, read, 0, err
 	}
 	for _, ct := range types {
 		col := &pb.Col{Name: ptr(ct.Name())}
@@ -148,8 +162,9 @@ func (s *stream) execute(ctx context.Context, st *pb.Stmt) (*pb.StmtResult, erro
 	}
 	for rows.Next() {
 		if err := rows.Scan(dest...); err != nil {
-			return nil, err
+			return nil, read, 0, err
 		}
+		read++
 		if !wantRows {
 			continue
 		}
@@ -160,7 +175,7 @@ func (s *stream) execute(ctx context.Context, st *pb.Stmt) (*pb.StmtResult, erro
 		res.Rows = append(res.Rows, row)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, read, 0, err
 	}
 	rows.Close()
 	changes, total, lastID, _ := s.state()
@@ -168,7 +183,7 @@ func (s *stream) execute(ctx context.Context, st *pb.Stmt) (*pb.StmtResult, erro
 		res.AffectedRowCount = uint64(changes)
 	}
 	res.LastInsertRowid = &lastID
-	return res, nil
+	return res, read, total - total0, nil
 }
 
 // batch runs a batch's steps in order, each only when its condition holds.
@@ -249,7 +264,16 @@ func (s *stream) sequence(ctx context.Context, sqlText *string, sqlID *int32) er
 	if err != nil {
 		return err
 	}
+	if s.observe == nil {
+		_, err = s.conn.ExecContext(ctx, q)
+		return err
+	}
+	_, total0, _, _ := s.state()
+	start := time.Now()
 	_, err = s.conn.ExecContext(ctx, q)
+	d := time.Since(start)
+	_, total, _, _ := s.state()
+	s.observe(Stmt{SQL: q, Duration: d, RowsWritten: total - total0, Err: err})
 	return err
 }
 

@@ -260,7 +260,7 @@ func (wc *wsConn) request(rq *pbws.RequestMsg) {
 			}
 		}()
 		st.jobs <- func() {
-			s, err := newStream(wc.ctx, db, wc.sqls)
+			s, err := newStream(wc.ctx, db, wc.sqls, wc.srv.observe)
 			if err != nil {
 				wc.replyErr(id, err)
 				return
