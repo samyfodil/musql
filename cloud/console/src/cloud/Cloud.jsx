@@ -8,7 +8,7 @@ import { Field } from "../components/ColumnPanel.jsx";
 import { MenuButton } from "../components/Menu.jsx";
 import { Spinner } from "../components/Busy.jsx";
 import { fmt } from "../values.js";
-import { Access, api, date, FileFormat, message, Role, ROLES, roleName, stamp, unimplemented } from "./api.js";
+import { Access, api, date, DatabaseType, FileFormat, message, Role, ROLES, roleName, stamp, typeName, unimplemented } from "./api.js";
 import { server, signIn, signOut } from "./auth.js";
 
 export const PAGES = [
@@ -237,11 +237,12 @@ function Databases({ cloud, toast, onOpen, setPage }) {
 			</Head>
 			<Loaded s={s} empty={s.data && !dbs.length && "No databases yet. Create one, or upload a .sqlite or .musq file."}>
 				<table className="cloudtable">
-					<thead><tr><th>Name</th><th>Group</th><th className="num">Size</th><th>Created</th><th /></tr></thead>
+					<thead><tr><th>Name</th><th>Type</th><th>Group</th><th className="num">Size</th><th>Created</th><th /></tr></thead>
 					<tbody>
 						{dbs.map((d) => (
 							<tr key={d.id}>
 								<td><button className="link mono" title="Open in the editor" onClick={() => open(d)}>{d.name}</button>{d.parent && <span className="badge">branch of {d.parent}</span>}</td>
+								<td><span className="chip mono" title={d.type === DatabaseType.CRDT ? "Replicated: every location writes, and restore is per node" : "One file, full SQLite semantics"}>{typeName(d.type)}</span></td>
 								<td className="mono">{d.group}</td>
 								<td className="num">{bytes(d.sizeBytes)}</td>
 								<td title={when(d.createdAt)}>{day(d.createdAt)}</td>
@@ -251,8 +252,8 @@ function Databases({ cloud, toast, onOpen, setPage }) {
 										{ label: "Copy URL", hint: "Hrana", onClick: () => copy(d.url, toast, "the URL") },
 										{ label: "Create a token…", onClick: () => setDrawer({ token: d }) },
 										{ label: "Usage", onClick: () => setPage("usage") },
-										member && { label: "Branch…", onClick: () => setDrawer({ create: { branch: d.name } }) },
-										member && { label: "Restore to a time…", onClick: () => setDrawer({ create: { restore: d.name } }) },
+										member && d.type !== DatabaseType.CRDT && { label: "Branch…", onClick: () => setDrawer({ create: { branch: d.name } }) },
+										member && d.type !== DatabaseType.CRDT && { label: "Restore to a time…", onClick: () => setDrawer({ create: { restore: d.name } }) },
 										"-",
 										{ label: "Export as musql", hint: ".musq", disabled: !member, onClick: () => exportAs(d, FileFormat.MUSQL) },
 										{ label: "Export as SQLite", hint: ".sqlite", disabled: !member, onClick: () => exportAs(d, FileFormat.SQLITE) },
@@ -425,16 +426,17 @@ function Groups({ cloud, toast }) {
 	};
 	return (
 		<>
-			<Head title="Groups & locations" sub="A group places its databases in a set of locations; the primary one writes.">
+			<Head title="Groups & locations" sub="A group places its databases in a set of locations. A crdt group's databases are written at every one of them.">
 				{admin && <button className="primary" onClick={() => setCreate(true)}>New group</button>}
 			</Head>
 			<Loaded s={s}>
 				<table className="cloudtable">
-					<thead><tr><th>Group</th><th>Primary</th><th>Locations</th><th>Created</th><th /></tr></thead>
+					<thead><tr><th>Group</th><th>Type</th><th>Primary</th><th>Locations</th><th>Created</th><th /></tr></thead>
 					<tbody>
 						{(s.data ?? []).map((g) => (
 							<tr key={g.name}>
 								<td className="mono">{g.name}</td>
+								<td className="mono">{typeName(g.type)}</td>
 								<td className="mono">{g.primary}</td>
 								<td>
 									{g.locations.map((l) => (
