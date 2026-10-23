@@ -9,7 +9,8 @@ import { BusyBar, Spinner } from "./components/Busy.jsx";
 import { MenuButton, useContextMenu } from "./components/Menu.jsx";
 import { useToasts } from "./components/Toasts.jsx";
 import Palette from "./components/Palette.jsx";
-import { Contrast, Moon, Network, Search, SquareTerminal, Sun, Table2 } from "lucide-react";
+import Shortcuts from "./components/Shortcuts.jsx";
+import { Contrast, Keyboard, Moon, Network, Search, SquareTerminal, Sun, Table2 } from "lucide-react";
 import { ImportDialog, TableDialog } from "./components/Dialogs.jsx";
 import { SAMPLE } from "./sample.js";
 import { saved, unsave } from "./library.js";
@@ -91,6 +92,7 @@ export default function App() {
 	const [dragging, setDragging] = useState(false);
 	const [section, setSection] = useState("tables"); // the rail: "tables" | "sql" | "diagram"
 	const [palette, setPalette] = useState(false);
+	const [keys, setKeys] = useState(false);
 	const [showInternal, setShowInternal] = useState(false);
 	const [library, setLibrary] = useState(saved);
 	const [dialog, setDialog] = useState(null); // "table" | {edit: table} | "import" | {import: file} | null
@@ -265,12 +267,14 @@ export default function App() {
 		try {
 			const t = performance.now();
 			if (!data && !then) name = await freeName(name);
+			// Read the kept view before anything renders under the new name: the
+			// effect that keeps it would otherwise save an empty one first.
+			const view = viewState(name);
 			await call("open", data);
 			if (then) await query(then);
 			undoStack.current = [];
 			redoStack.current = [];
 			syncHist();
-			setDbName(name);
 			nameRef.current = name;
 			setDirty(false);
 			querySeq = 0;
@@ -281,12 +285,13 @@ export default function App() {
 			} catch {
 				// not remembered across reloads
 			}
-			const view = viewState(name);
 			const known = (t) => t.kind !== "table" || s.some((o) => o.name === t.table);
 			const restored = (view?.tabs ?? []).filter(known).map((t) => ({ ...t, id: crypto.randomUUID() }));
 			setTabs(restored);
+			querySeq = Math.max(0, ...restored.map((t) => Number(/^Query (\d+)$/.exec(t.title ?? "")?.[1] ?? 0)));
 			setActive(restored[view?.active]?.id ?? restored.at(-1)?.id ?? null);
 			if (view?.section) setSection(view.section);
+			setDbName(name);
 			if (route) applyRoute(route, s);
 			else if (!restored.length) {
 				const first = s.find((o) => o.type === "table");
@@ -423,9 +428,15 @@ export default function App() {
 		return () => removeEventListener("popstate", on);
 	});
 
-	// ⌘Z and ⇧⌘Z undo and redo, except while typing in a field or the editor.
+	// ⌘Z and ⇧⌘Z undo and redo, except while typing in a field or the editor;
+	// ? shows the shortcuts.
 	useEffect(() => {
 		const key = (e) => {
+			if (e.key === "?" && !e.target.closest?.("input, textarea, select, .cm-editor, [contenteditable]")) {
+				e.preventDefault();
+				setKeys((k) => !k);
+				return;
+			}
 			if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "z") return;
 			if (e.target.closest?.("input, textarea, select, .cm-editor, [contenteditable]")) return;
 			e.preventDefault();
@@ -531,6 +542,7 @@ export default function App() {
 		act("Open a file", pickFile, "⌘O", "⇧");
 		act("Open the sample database", () => openDatabase("sample.musq", undefined, SAMPLE), "", "★");
 		act("New empty database", () => openDatabase("untitled.musq"), "", "＋");
+		act("Keyboard shortcuts", () => setKeys(true), "?", "⌨");
 		act(`Theme: ${theme === "dark" ? "light" : "dark"}`, () => setTheme(dark ? "light" : "dark"), "", dark ? "☀" : "☾");
 		return out;
 	}, [schema, internal, counts, library, dbName, theme, dark, recents, undo, redo]);
@@ -574,6 +586,7 @@ export default function App() {
 					))}
 					<span className="grow" />
 					<button className="railbtn" title="Search everything (⌘K)" onClick={() => setPalette(true)}><Search size={17} /></button>
+					<button className="railbtn" title="Keyboard shortcuts (?)" onClick={() => setKeys(true)}><Keyboard size={17} /></button>
 					<button className="railbtn" title={`Theme: ${theme} (click to change)`} onClick={() => setTheme(theme === "system" ? "light" : theme === "light" ? "dark" : "system")}>{THEMES[theme]}</button>
 				</nav>
 
@@ -773,6 +786,7 @@ export default function App() {
 					}} />
 				)}
 				{palette && <Palette commands={commands} onClose={() => setPalette(false)} />}
+				{keys && <Shortcuts onClose={() => setKeys(false)} />}
 				{ctxMenu}
 				{toasts}
 				{dragging && (

@@ -15,8 +15,18 @@ export const vectorOf = (b) => new Float32Array(b.buffer.slice(b.byteOffset, b.b
 
 const num = (x) => (Math.abs(x) >= 1e4 || (x !== 0 && Math.abs(x) < 1e-3) ? x.toExponential(2) : x.toFixed(3));
 
-/** v as a grid shows it; vector is whether its column holds vectors. */
-export function show(v, vector = false) {
+const NUMERIC = /INT|REAL|FLOA|DOUB|NUM|DEC/i;
+// Numbers that are names, not quantities: ids, years, codes. They never get separators.
+const isKey = (name) => !name || /^(id|rowid|year|yr|zip|zipcode|postcode|port|pin|code)$|_id$|_year$|_code$/i.test(name);
+
+/**
+ * v as a grid shows it: {text, cls, title, long}. vector says its column holds
+ * vectors; type and name (the column's) pick how a number or a flag reads:
+ * a large number gets separators unless it names a row (id, *_id), and a
+ * BOOLEAN column shows true and false. long marks a value worth opening whole
+ * (long text, JSON).
+ */
+export function show(v, vector = false, type = "", name = "") {
 	if (v === null || v === undefined) return { text: "NULL", cls: "null" };
 	if (v instanceof Uint8Array) {
 		if (vector && v.length % 4 === 0 && v.length > 0) {
@@ -29,14 +39,30 @@ export function show(v, vector = false) {
 			};
 		}
 		const hex = Array.from(v.subarray(0, 8), (b) => b.toString(16).padStart(2, "0")).join("");
-		return { text: `x'${hex}${v.length > 8 ? "…" : ""}' · ${v.length} B`, cls: "blob" };
+		return { text: `BLOB · ${bytes(v.length)}`, cls: "blob", title: `x'${hex}${v.length > 8 ? "…" : ""}'` };
 	}
-	if (typeof v === "number" || typeof v === "bigint") return { text: String(v), cls: "num" };
+	if (typeof v === "number" || typeof v === "bigint") {
+		if (/BOOL/i.test(type) && (v == 0 || v == 1)) return { text: v == 1 ? "true" : "false", cls: v == 1 ? "bool on" : "bool" };
+		const sep = name && !isKey(name) && NUMERIC.test(type) && Math.abs(Number(v)) >= 1000;
+		return { text: sep ? v.toLocaleString() : String(v), cls: "num", title: sep ? String(v) : undefined };
+	}
 	const s = String(v);
-	return { text: s.length > 300 ? s.slice(0, 300) + "…" : s, cls: "", title: s.length > 40 ? s.slice(0, 2000) : undefined };
+	if (/^\s*[[{]/.test(s) && s.length > 1) {
+		try {
+			JSON.parse(s);
+			return { text: s.length > 200 ? s.slice(0, 200) + "…" : s, cls: "json", long: true };
+		} catch {
+			// text that only starts like JSON
+		}
+	}
+	const long = s.length > 60 || s.includes("\n");
+	return { text: s.length > 300 ? s.slice(0, 300).replace(/\n/g, " ↵ ") + "…" : s.replace(/\n/g, " ↵ "), cls: "", title: long ? s.slice(0, 1000) : undefined, long };
 }
 
 export const fmt = (n) => Number(n).toLocaleString();
+
+/** n bytes, readable: 812 B, 3.4 KB, 1.2 MB. */
+export const bytes = (n) => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`);
 
 /**
  * The value an edited cell's text stores, by the column's declared type, the
