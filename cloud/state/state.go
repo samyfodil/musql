@@ -157,6 +157,33 @@ var migrations = []string{
 	// Keys that existed before this column are -1: what they signed is not
 	// known, so they are never dropped.
 	`ALTER TABLE signing_keys ADD COLUMN max_exp INTEGER NOT NULL DEFAULT -1`,
+	// Usage (stage D), and a database's file name as a column so an in-place
+	// restore lands by updating one row: the new file is complete before the
+	// record points at it.
+	`ALTER TABLE databases ADD COLUMN file TEXT NOT NULL DEFAULT '';
+	CREATE TABLE usage_hours (
+		db_id TEXT NOT NULL,
+		org_id TEXT NOT NULL,
+		hour INTEGER NOT NULL,
+		statements INTEGER NOT NULL,
+		rows_read INTEGER NOT NULL,
+		rows_written INTEGER NOT NULL,
+		errors INTEGER NOT NULL,
+		bytes_stored INTEGER NOT NULL,
+		latency TEXT NOT NULL,
+		PRIMARY KEY (db_id, hour)
+	);
+	CREATE INDEX usage_hours_org ON usage_hours (org_id, hour);
+	CREATE TABLE usage_queries (
+		db_id TEXT NOT NULL,
+		hour INTEGER NOT NULL,
+		sql TEXT NOT NULL,
+		count INTEGER NOT NULL,
+		total_us INTEGER NOT NULL,
+		rows_read INTEGER NOT NULL,
+		rows_written INTEGER NOT NULL,
+		PRIMARY KEY (db_id, hour, sql)
+	);`,
 }
 
 func (s *Store) migrate() error {

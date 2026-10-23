@@ -202,14 +202,17 @@ type Database struct {
 	SchemaOnly bool
 	TokenGen   int64
 	CreatedAt  time.Time
+	// File is the database file's name in its org's directory; empty means
+	// "<ID>.musq".
+	File string
 }
 
-const dbCols = `id, org_id, name, group_id, parent, parent_at, schema_only, token_gen, created_at`
+const dbCols = `id, org_id, name, group_id, parent, parent_at, schema_only, token_gen, created_at, file`
 
 func scanDatabase(r scanner) (*Database, error) {
 	var d Database
 	var parentAt, created int64
-	if err := r.Scan(&d.ID, &d.OrgID, &d.Name, &d.GroupID, &d.Parent, &parentAt, &d.SchemaOnly, &d.TokenGen, &created); err != nil {
+	if err := r.Scan(&d.ID, &d.OrgID, &d.Name, &d.GroupID, &d.Parent, &parentAt, &d.SchemaOnly, &d.TokenGen, &created, &d.File); err != nil {
 		return nil, notFound(err)
 	}
 	d.ParentAt, d.CreatedAt = unix(parentAt), unix(created)
@@ -226,8 +229,8 @@ func (s *Store) CreateDatabase(ctx context.Context, d *Database) error {
 	if !d.ParentAt.IsZero() {
 		parentAt = d.ParentAt.Unix()
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO databases (`+dbCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`,
-		d.ID, d.OrgID, d.Name, d.GroupID, d.Parent, parentAt, d.SchemaOnly, d.CreatedAt.Unix())
+	_, err := s.db.ExecContext(ctx, `INSERT INTO databases (`+dbCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+		d.ID, d.OrgID, d.Name, d.GroupID, d.Parent, parentAt, d.SchemaOnly, d.CreatedAt.Unix(), d.File)
 	if isUnique(err) {
 		return ErrExists
 	}
@@ -267,9 +270,15 @@ func (s *Store) RenameDatabase(ctx context.Context, id, name string) error {
 	return one(s.db.ExecContext(ctx, `UPDATE databases SET name = ? WHERE id = ?`, name, id))
 }
 
-// DeleteDatabase removes a database's record.
+// DeleteDatabase removes a database's record. Its usage stays: it is part of
+// the org's history.
 func (s *Store) DeleteDatabase(ctx context.Context, id string) error {
 	return one(s.db.ExecContext(ctx, `DELETE FROM databases WHERE id = ?`, id))
+}
+
+// SetDatabaseFile points a database's record at another file.
+func (s *Store) SetDatabaseFile(ctx context.Context, id, file string) error {
+	return one(s.db.ExecContext(ctx, `UPDATE databases SET file = ? WHERE id = ?`, file, id))
 }
 
 // BumpDatabaseTokens invalidates every token issued so far for a database.
