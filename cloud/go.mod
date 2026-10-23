@@ -8,8 +8,11 @@ replace github.com/samyfodil/musql/hrana => ../hrana
 
 require (
 	connectrpc.com/connect v1.21.0
+	github.com/anthropics/anthropic-sdk-go v1.84.0
 	github.com/coder/websocket v1.8.15
 	github.com/go-jose/go-jose/v4 v4.1.4
+	github.com/jitllm/jitllm v0.2.6
+	github.com/openai/openai-go v1.12.0
 	github.com/samyfodil/musql v0.1.1
 	github.com/samyfodil/musql/hrana v0.0.0
 	github.com/spf13/cobra v1.10.2
@@ -21,16 +24,14 @@ require (
 )
 
 require (
-	github.com/anthropics/anthropic-sdk-go v1.84.0 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.0 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/buger/jsonparser v1.1.2 // indirect
 	github.com/go-logr/logr v1.4.2 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/go-webgpu/goffi v0.6.3 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/invopop/jsonschema v0.14.0 // indirect
-	github.com/jitllm/jitllm v0.2.6 // indirect
-	github.com/openai/openai-go v1.12.0 // indirect
 	github.com/pb33f/ordered-map/v2 v2.3.1 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/standard-webhooks/standard-webhooks/libraries v0.0.1 // indirect
