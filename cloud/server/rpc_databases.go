@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -33,7 +34,7 @@ var sqliteMagic = []byte("SQLite format 3\x00")
 func (s *Server) dbToProto(ctx context.Context, o *state.Org, d *state.Database) *v1.Database {
 	out := &v1.Database{
 		Id: d.ID, Org: o.Slug, Name: d.Name, Parent: d.Parent, ParentAt: stamp(d.ParentAt),
-		SchemaOnly: d.SchemaOnly, CreatedAt: stamp(d.CreatedAt),
+		SchemaOnly: d.SchemaOnly, CreatedAt: stamp(d.CreatedAt), Type: typeToProto(d.Type),
 		Url: s.cfg.PublicURL + "/db/" + o.Slug + "/" + d.Name + "/",
 	}
 	if g, err := s.store.GroupByID(ctx, d.GroupID); err == nil {
@@ -126,7 +127,24 @@ func (s databaseService) Create(ctx context.Context, req *connect.Request[v1.Cre
 	if _, err := s.store.Database(ctx, o.ID, m.Name); err == nil {
 		return nil, rpcErr(state.ErrExists)
 	}
-	d := &state.Database{ID: state.NewID(), OrgID: o.ID, Name: m.Name, GroupID: g.ID, SchemaOnly: m.SchemaOnly}
+	typ, err := s.checkType(m.Type, g.Type)
+	if err != nil {
+		return nil, err
+	}
+	if typ == state.TypeCRDT && src != nil {
+		return nil, errCRDTHistory
+	}
+	d := &state.Database{ID: state.NewID(), OrgID: o.ID, Name: m.Name, GroupID: g.ID, SchemaOnly: m.SchemaOnly, Type: typ}
+	if typ == state.TypeCRDT && !s.placedHere(ctx, d) {
+		if m.GetUpload() != "" {
+			return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("upload into a crdt database on a node of its group: %w", s.notHere(ctx, d)))
+		}
+		// The nodes of its group create the file when they see the record.
+		if err := s.store.CreateDatabase(ctx, d); err != nil {
+			return nil, rpcErr(err)
+		}
+		return connect.NewResponse(&v1.CreateDatabaseResponse{Database: s.dbToProto(ctx, o, d)}), nil
+	}
 	path := s.dbPath(d)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, rpcErr(err)
@@ -153,12 +171,20 @@ func (s databaseService) Create(ctx context.Context, req *connect.Request[v1.Cre
 	default:
 		err = createEmpty(path)
 	}
+	if err == nil && typ == state.TypeCRDT {
+		err = checkCRDT(ctx, path)
+	}
 	if err != nil {
 		s.removeFiles(d)
 		return nil, err
 	}
 	if err := s.host(ctx, d); err != nil {
 		return nil, err
+	}
+	if typ == state.TypeCRDT {
+		if err := s.openCRDT(ctx, d); err != nil {
+			s.log.Printf("open %s: %v", d.ID, err)
+		}
 	}
 	return connect.NewResponse(&v1.CreateDatabaseResponse{Database: s.dbToProto(ctx, o, d)}), nil
 }
@@ -393,6 +419,9 @@ func (s databaseService) InvalidateTokens(ctx context.Context, req *connect.Requ
 func (s databaseService) Export(ctx context.Context, req *connect.Request[v1.ExportRequest]) (*connect.Response[v1.ExportResponse], error) {
 	_, d, _, err := s.lookup(ctx, req, req.Msg.Org, req.Msg.Name, state.RoleMember)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.localCopy(ctx, d); err != nil {
 		return nil, err
 	}
 	tmp, err := os.MkdirTemp(s.cfg.DataDir, "export-")

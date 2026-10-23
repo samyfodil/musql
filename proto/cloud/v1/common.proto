@@ -12,6 +12,15 @@ enum Role {
   ROLE_OWNER = 4;
 }
 
+// How a database is kept: plain on a standalone node, crdt replicated across
+// a cluster's nodes. raft is known and declined: not yet supported.
+enum DatabaseType {
+  DATABASE_TYPE_UNSPECIFIED = 0;
+  DATABASE_TYPE_PLAIN = 1;
+  DATABASE_TYPE_CRDT = 2;
+  DATABASE_TYPE_RAFT = 3;
+}
+
 message User {
   string id = 1;
   string email = 2;
@@ -48,6 +57,8 @@ message Group {
   string primary = 3;
   repeated string locations = 4;
   google.protobuf.Timestamp created_at = 5;
+  // What the group's databases default to.
+  DatabaseType type = 6;
 }
 
 message Database {
@@ -61,4 +72,5 @@ message Database {
   google.protobuf.Timestamp parent_at = 8;
   bool schema_only = 9;
   google.protobuf.Timestamp created_at = 10;
+  DatabaseType type = 11;
 }

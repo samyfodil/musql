@@ -26,6 +26,8 @@ message CreateGroupRequest {
   string name = 2;
   // The primary location; the node's own when empty.
   string location = 3;
+  // The default type of its databases; the deployment's when unspecified.
+  DatabaseType type = 4;
 }
 
 message CreateGroupResponse {

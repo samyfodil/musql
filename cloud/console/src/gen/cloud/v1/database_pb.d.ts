@@ -4,7 +4,7 @@
 
 import type { GenEnum, GenFile, GenMessage, GenService } from "@bufbuild/protobuf/codegenv2";
 import type { Message } from "@bufbuild/protobuf";
-import type { Database } from "./common_pb";
+import type { Database, DatabaseType } from "./common_pb";
 import type { Timestamp } from "@bufbuild/protobuf/wkt";
 
 /**
@@ -137,6 +137,13 @@ export declare type CreateDatabaseRequest = Message<"cloud.v1.CreateDatabaseRequ
    * @generated from field: bool schema_only = 7;
    */
   schemaOnly: boolean;
+
+  /**
+   * The group's type when unspecified.
+   *
+   * @generated from field: cloud.v1.DatabaseType type = 8;
+   */
+  type: DatabaseType;
 };
 
 /**

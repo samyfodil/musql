@@ -12,7 +12,7 @@ import (
 type groupService struct{ *Server }
 
 func groupToProto(o *state.Org, g *state.Group) *v1.Group {
-	return &v1.Group{Name: g.Name, Org: o.Slug, Primary: g.Primary, Locations: g.Locations, CreatedAt: stamp(g.CreatedAt)}
+	return &v1.Group{Name: g.Name, Org: o.Slug, Primary: g.Primary, Locations: g.Locations, CreatedAt: stamp(g.CreatedAt), Type: typeToProto(g.Type)}
 }
 
 // locations are the deployment's: this node's and its peers'.
@@ -64,7 +64,11 @@ func (s groupService) Create(ctx context.Context, req *connect.Request[v1.Create
 	if err := s.knownLocation(loc); err != nil {
 		return nil, err
 	}
-	g, err := s.store.CreateGroup(ctx, o.ID, req.Msg.Name, loc)
+	typ, err := s.checkType(req.Msg.Type, s.store.DefaultType())
+	if err != nil {
+		return nil, err
+	}
+	g, err := s.store.CreateGroup(ctx, o.ID, req.Msg.Name, loc, typ)
 	if err != nil {
 		return nil, rpcErr(err)
 	}

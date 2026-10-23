@@ -114,7 +114,9 @@ type CreateGroupRequest struct {
 	Org   string                 `protobuf:"bytes,1,opt,name=org,proto3" json:"org,omitempty"`
 	Name  string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
 	// The primary location; the node's own when empty.
-	Location      string `protobuf:"bytes,3,opt,name=location,proto3" json:"location,omitempty"`
+	Location string `protobuf:"bytes,3,opt,name=location,proto3" json:"location,omitempty"`
+	// The default type of its databases; the deployment's when unspecified.
+	Type          DatabaseType `protobuf:"varint,4,opt,name=type,proto3,enum=cloud.v1.DatabaseType" json:"type,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -168,6 +170,13 @@ func (x *CreateGroupRequest) GetLocation() string {
 		return x.Location
 	}
 	return ""
+}
+
+func (x *CreateGroupRequest) GetType() DatabaseType {
+	if x != nil {
+		return x.Type
+	}
+	return DatabaseType_DATABASE_TYPE_UNSPECIFIED
 }
 
 type CreateGroupResponse struct {
@@ -651,11 +660,12 @@ const file_cloud_v1_group_proto_rawDesc = "" +
 	"\x11ListGroupsRequest\x12\x10\n" +
 	"\x03org\x18\x01 \x01(\tR\x03org\"=\n" +
 	"\x12ListGroupsResponse\x12'\n" +
-	"\x06groups\x18\x01 \x03(\v2\x0f.cloud.v1.GroupR\x06groups\"V\n" +
+	"\x06groups\x18\x01 \x03(\v2\x0f.cloud.v1.GroupR\x06groups\"\x82\x01\n" +
 	"\x12CreateGroupRequest\x12\x10\n" +
 	"\x03org\x18\x01 \x01(\tR\x03org\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x1a\n" +
-	"\blocation\x18\x03 \x01(\tR\blocation\"<\n" +
+	"\blocation\x18\x03 \x01(\tR\blocation\x12*\n" +
+	"\x04type\x18\x04 \x01(\x0e2\x16.cloud.v1.DatabaseTypeR\x04type\"<\n" +
 	"\x13CreateGroupResponse\x12%\n" +
 	"\x05group\x18\x01 \x01(\v2\x0f.cloud.v1.GroupR\x05group\":\n" +
 	"\x12DeleteGroupRequest\x12\x10\n" +
@@ -718,30 +728,32 @@ var file_cloud_v1_group_proto_goTypes = []any{
 	(*ListLocationsRequest)(nil),   // 11: cloud.v1.ListLocationsRequest
 	(*ListLocationsResponse)(nil),  // 12: cloud.v1.ListLocationsResponse
 	(*Group)(nil),                  // 13: cloud.v1.Group
+	(DatabaseType)(0),              // 14: cloud.v1.DatabaseType
 }
 var file_cloud_v1_group_proto_depIdxs = []int32{
 	13, // 0: cloud.v1.ListGroupsResponse.groups:type_name -> cloud.v1.Group
-	13, // 1: cloud.v1.CreateGroupResponse.group:type_name -> cloud.v1.Group
-	13, // 2: cloud.v1.AddLocationResponse.group:type_name -> cloud.v1.Group
-	13, // 3: cloud.v1.RemoveLocationResponse.group:type_name -> cloud.v1.Group
-	10, // 4: cloud.v1.ListLocationsResponse.locations:type_name -> cloud.v1.Location
-	0,  // 5: cloud.v1.GroupService.List:input_type -> cloud.v1.ListGroupsRequest
-	2,  // 6: cloud.v1.GroupService.Create:input_type -> cloud.v1.CreateGroupRequest
-	4,  // 7: cloud.v1.GroupService.Delete:input_type -> cloud.v1.DeleteGroupRequest
-	6,  // 8: cloud.v1.GroupService.AddLocation:input_type -> cloud.v1.AddLocationRequest
-	8,  // 9: cloud.v1.GroupService.RemoveLocation:input_type -> cloud.v1.RemoveLocationRequest
-	11, // 10: cloud.v1.GroupService.ListLocations:input_type -> cloud.v1.ListLocationsRequest
-	1,  // 11: cloud.v1.GroupService.List:output_type -> cloud.v1.ListGroupsResponse
-	3,  // 12: cloud.v1.GroupService.Create:output_type -> cloud.v1.CreateGroupResponse
-	5,  // 13: cloud.v1.GroupService.Delete:output_type -> cloud.v1.DeleteGroupResponse
-	7,  // 14: cloud.v1.GroupService.AddLocation:output_type -> cloud.v1.AddLocationResponse
-	9,  // 15: cloud.v1.GroupService.RemoveLocation:output_type -> cloud.v1.RemoveLocationResponse
-	12, // 16: cloud.v1.GroupService.ListLocations:output_type -> cloud.v1.ListLocationsResponse
-	11, // [11:17] is the sub-list for method output_type
-	5,  // [5:11] is the sub-list for method input_type
-	5,  // [5:5] is the sub-list for extension type_name
-	5,  // [5:5] is the sub-list for extension extendee
-	0,  // [0:5] is the sub-list for field type_name
+	14, // 1: cloud.v1.CreateGroupRequest.type:type_name -> cloud.v1.DatabaseType
+	13, // 2: cloud.v1.CreateGroupResponse.group:type_name -> cloud.v1.Group
+	13, // 3: cloud.v1.AddLocationResponse.group:type_name -> cloud.v1.Group
+	13, // 4: cloud.v1.RemoveLocationResponse.group:type_name -> cloud.v1.Group
+	10, // 5: cloud.v1.ListLocationsResponse.locations:type_name -> cloud.v1.Location
+	0,  // 6: cloud.v1.GroupService.List:input_type -> cloud.v1.ListGroupsRequest
+	2,  // 7: cloud.v1.GroupService.Create:input_type -> cloud.v1.CreateGroupRequest
+	4,  // 8: cloud.v1.GroupService.Delete:input_type -> cloud.v1.DeleteGroupRequest
+	6,  // 9: cloud.v1.GroupService.AddLocation:input_type -> cloud.v1.AddLocationRequest
+	8,  // 10: cloud.v1.GroupService.RemoveLocation:input_type -> cloud.v1.RemoveLocationRequest
+	11, // 11: cloud.v1.GroupService.ListLocations:input_type -> cloud.v1.ListLocationsRequest
+	1,  // 12: cloud.v1.GroupService.List:output_type -> cloud.v1.ListGroupsResponse
+	3,  // 13: cloud.v1.GroupService.Create:output_type -> cloud.v1.CreateGroupResponse
+	5,  // 14: cloud.v1.GroupService.Delete:output_type -> cloud.v1.DeleteGroupResponse
+	7,  // 15: cloud.v1.GroupService.AddLocation:output_type -> cloud.v1.AddLocationResponse
+	9,  // 16: cloud.v1.GroupService.RemoveLocation:output_type -> cloud.v1.RemoveLocationResponse
+	12, // 17: cloud.v1.GroupService.ListLocations:output_type -> cloud.v1.ListLocationsResponse
+	12, // [12:18] is the sub-list for method output_type
+	6,  // [6:12] is the sub-list for method input_type
+	6,  // [6:6] is the sub-list for extension type_name
+	6,  // [6:6] is the sub-list for extension extendee
+	0,  // [0:6] is the sub-list for field type_name
 }
 
 func init() { file_cloud_v1_group_proto_init() }

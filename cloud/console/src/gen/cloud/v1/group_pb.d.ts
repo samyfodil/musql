@@ -4,7 +4,7 @@
 
 import type { GenFile, GenMessage, GenService } from "@bufbuild/protobuf/codegenv2";
 import type { Message } from "@bufbuild/protobuf";
-import type { Group } from "./common_pb";
+import type { DatabaseType, Group } from "./common_pb";
 
 /**
  * Describes the file cloud/v1/group.proto.
@@ -63,6 +63,13 @@ export declare type CreateGroupRequest = Message<"cloud.v1.CreateGroupRequest"> 
    * @generated from field: string location = 3;
    */
   location: string;
+
+  /**
+   * The default type of its databases; the deployment's when unspecified.
+   *
+   * @generated from field: cloud.v1.DatabaseType type = 4;
+   */
+  type: DatabaseType;
 };
 
 /**

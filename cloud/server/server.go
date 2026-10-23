@@ -36,8 +36,10 @@ type Server struct {
 	hist     histories
 	handler  http.Handler
 	log      *log.Logger
-	genMu    sync.Mutex
-	gen      ai.Generator
+	// cl is set on a cluster node.
+	cl    *clusterSide
+	genMu sync.Mutex
+	gen   ai.Generator
 
 	stop chan struct{}
 	bg   sync.WaitGroup
@@ -59,23 +61,32 @@ func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) 
 			return nil, err
 		}
 	}
-	store, err := state.Open(filepath.Join(cfg.DataDir, "state.musq"))
+	s := &Server{cfg: cfg, log: logger}
+	store, err := s.openState(ctx)
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{cfg: cfg, store: store, log: logger}
-	if err := s.ensureAdmin(ctx); err != nil {
+	s.store = store
+	fail := func(err error) (*Server, error) {
 		store.Close()
+		if s.cl != nil {
+			s.cl.node.Close()
+		}
 		return nil, err
+	}
+	if err := s.ensureAdmin(ctx); err != nil {
+		return fail(err)
 	}
 	if err := store.EnsureGroupLocation(ctx, cfg.Node.Location); err != nil {
-		store.Close()
-		return nil, err
+		return fail(err)
 	}
-	if s.provider, err = oidc.New(ctx, store, cfg.PublicURL, oidc.WithConsoleOrigins(cfg.Console.CORSOrigins), oidc.WithKeyRotation(cfg.OIDC.keyRotation),
-		oidc.WithLoginLimits(cfg.OIDC.LoginPerIP, cfg.OIDC.LoginPerEmail, cfg.OIDC.loginWindow)); err != nil {
-		store.Close()
-		return nil, err
+	opts := []oidc.Option{oidc.WithConsoleOrigins(cfg.Console.CORSOrigins), oidc.WithKeyRotation(cfg.OIDC.keyRotation),
+		oidc.WithLoginLimits(cfg.OIDC.LoginPerIP, cfg.OIDC.LoginPerEmail, cfg.OIDC.loginWindow)}
+	if cfg.Clustered() {
+		opts = append(opts, oidc.WithNode(cfg.Node.Name))
+	}
+	if s.provider, err = oidc.New(ctx, store, cfg.PublicURL, opts...); err != nil {
+		return fail(err)
 	}
 	s.meter = newMeter(store, func(id string) int64 {
 		d, err := store.DatabaseByID(context.Background(), id)
@@ -92,6 +103,9 @@ func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) 
 		s.bg.Go(func() { s.runSnapshots(s.stop) })
 	}
 	s.bg.Go(s.runUsageFlush)
+	if s.cl != nil {
+		s.bg.Go(s.runCluster)
+	}
 	return s, nil
 }
 
@@ -137,11 +151,20 @@ func (s *Server) Close() error {
 	close(s.stop)
 	s.bg.Wait()
 	s.pool.closeAll()
+	if s.cl != nil {
+		s.closeCluster()
+	}
 	s.closeHistories()
 	if err := s.meter.flush(context.Background()); err != nil {
 		s.log.Printf("usage: %v", err)
 	}
-	return s.store.Close()
+	err := s.store.Close()
+	if s.cl != nil {
+		if cerr := s.cl.node.Close(); err == nil {
+			err = cerr
+		}
+	}
+	return err
 }
 
 func (s *Server) ensureAdmin(ctx context.Context) error {
