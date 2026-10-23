@@ -55,3 +55,20 @@ func commitStateUnlocked(path string) (CommitInfo, error) {
 	info.Counter, info.DeltaEnd = st.endCtr, st.bytes
 	return info, nil
 }
+
+// ReplaceState runs fn holding path's exclusive write lock, as a commit does,
+// for a caller that changes the file pair itself: a replica appending the
+// delta bytes its primary committed, or renaming in a new segment file. No
+// reader sees the pair while fn runs, and every session re-checks the files
+// at its next statement. fn must leave the pair a committed state; path need
+// not exist yet.
+func ReplaceState(path string, fn func() error) error {
+	return withSegmentWriteLock(path, func() error {
+		done, err := segChangeBegin(path)
+		if err != nil {
+			return err
+		}
+		defer done()
+		return fn()
+	})
+}
