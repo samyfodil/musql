@@ -203,10 +203,14 @@ func TestEndToEnd(t *testing.T) {
 	}
 	h.run("db", "create", "fromfile", "--from-file", musq)
 
-	if _, err := h.try("db", "restore", "app", "--timestamp", "2026-01-01T00:00:00Z"); err == nil || !strings.Contains(err.Error(), "does not support") {
-		t.Fatalf("restore: %v", err)
+	if _, err := h.try("db", "restore", "app", "--timestamp", "2026-01-01T00:00:00Z"); err == nil || !strings.Contains(err.Error(), "before the oldest") {
+		t.Fatalf("restore before history: %v", err)
 	}
-	if out := h.run("db", "inspect", "app"); !strings.Contains(out, "does not record usage") {
+	h.run("db", "restore", "app", "--timestamp", time.Now().UTC().Format(time.RFC3339Nano), "--new-name", "restored")
+	if out := h.run("db", "shell", "restored", "SELECT count(*) AS n FROM t;"); out != h.run("db", "shell", "app", "SELECT count(*) AS n FROM t;") {
+		t.Fatalf("restored: %q", out)
+	}
+	if out := h.run("db", "inspect", "app"); !strings.Contains(out, "last 24h:") {
 		t.Fatalf("inspect: %q", out)
 	}
 

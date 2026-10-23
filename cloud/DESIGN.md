@@ -97,9 +97,9 @@ The server is its own issuer at `public_url`:
   database's (group's) token generation, which InvalidateTokens bumps.
   A Hrana connection is confined (`driver.Conn.Confine`): no ATTACH or VACUUM
   INTO for anyone, and a read-only one runs with `query_only` locked on.
-  Hrana over WebSocket authenticates with the upgrade request's
-  Authorization header (the hello's token is not checked per database yet). Hrana requests must carry
-  one (or a user access token with a role that allows it).
+  Hrana requests carry a database token (or a user access token with a
+  role that allows it), checked by `hrana.WithAuth` on every HTTP request
+  and in the WebSocket hello.
 - **Platform token** (API token): for CI and the CLI without a browser; acts
   as the user who created it, revocable.
 
