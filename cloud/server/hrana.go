@@ -50,6 +50,9 @@ func registerHook() {
 
 const idleClose = 5 * time.Minute
 
+// errUnavailable is a database being restored in place.
+var errUnavailable = errors.New("the database is being restored")
+
 type entry struct {
 	db       *sql.DB
 	ro       *sql.DB
@@ -62,55 +65,40 @@ type entry struct {
 // Each database has two handles, a full-access one and a read-only one, behind
 // one Hrana server that picks by the client's token.
 type pool struct {
-	mu   sync.Mutex
-	m    map[string]*entry
-	stop chan struct{}
-	wg   sync.WaitGroup
+	open    func(d *state.Database) (*entry, error)
+	mu      sync.Mutex
+	m       map[string]*entry
+	blocked map[string]bool
+	stop    chan struct{}
+	wg      sync.WaitGroup
 }
 
-func newPool() *pool {
+func newPool(open func(d *state.Database) (*entry, error)) *pool {
 	registerHook()
-	p := &pool{m: map[string]*entry{}, stop: make(chan struct{})}
+	p := &pool{open: open, m: map[string]*entry{}, blocked: map[string]bool{}, stop: make(chan struct{})}
 	p.wg.Add(1)
 	go p.reaper()
 	return p
 }
 
-// get returns the Hrana server for a database file, and a release to call
-// when the request is done. check authenticates its clients; it is used only
-// when the server is first opened.
-func (p *pool) get(id, path string, check func(token string) (bool, error)) (*hrana.Server, func(), error) {
+// get returns a database's open entry, and a release to call when done with
+// it.
+func (p *pool) get(d *state.Database) (e *entry, release func(), err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.m[id]
+	if p.blocked[d.ID] {
+		return nil, nil, errUnavailable
+	}
+	e, ok := p.m[d.ID]
 	if !ok {
-		if _, err := os.Stat(path); err != nil {
+		if e, err = p.open(d); err != nil {
 			return nil, nil, err
 		}
-		db, err := sql.Open("sqlite", path+"?"+dsnMode+"=rw")
-		if err != nil {
-			return nil, nil, err
-		}
-		if err := db.Ping(); err != nil {
-			db.Close()
-			return nil, nil, err
-		}
-		ro, err := sql.Open("sqlite", path+"?"+dsnMode+"=ro")
-		if err != nil {
-			db.Close()
-			return nil, nil, err
-		}
-		if err := ro.Ping(); err != nil {
-			ro.Close()
-			db.Close()
-			return nil, nil, err
-		}
-		e = &entry{db: db, ro: ro, srv: hrana.NewServer(db, hrana.WithReadOnlyDB(ro), hrana.WithAuth(check))}
-		p.m[id] = e
+		p.m[d.ID] = e
 	}
 	e.inflight++
 	e.last = time.Now()
-	return e.srv, func() {
+	return e, func() {
 		p.mu.Lock()
 		e.inflight--
 		e.last = time.Now()
@@ -132,6 +120,20 @@ func (p *pool) drop(id string) {
 	p.mu.Unlock()
 	if ok {
 		e.close()
+	}
+}
+
+// block closes a database's servers and keeps it closed until the returned
+// unblock is called: every request meanwhile gets errUnavailable.
+func (p *pool) block(id string) (unblock func()) {
+	p.mu.Lock()
+	p.blocked[id] = true
+	p.mu.Unlock()
+	p.drop(id)
+	return func() {
+		p.mu.Lock()
+		delete(p.blocked, id)
+		p.mu.Unlock()
 	}
 }
 
@@ -173,24 +175,80 @@ func (p *pool) closeAll() {
 	}
 }
 
+// openEntry is the pool's open: a full-access and a read-only handle behind
+// a Hrana server that checks each client's token and meters its statements.
+// It opens only once the database's history is, so no commit goes unlogged.
+func (s *Server) openEntry(d *state.Database) (*entry, error) {
+	path := s.dbPath(d)
+	// Opening creates a missing file; a database whose file is gone is gone.
+	if _, err := os.Stat(path); err != nil {
+		return nil, err
+	}
+	if _, err := s.history(d); err != nil {
+		return nil, err
+	}
+	db, err := openPinged(path + "?" + dsnMode + "=rw")
+	if err != nil {
+		return nil, err
+	}
+	ro, err := openPinged(path + "?" + dsnMode + "=ro")
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &entry{db: db, ro: ro, srv: hrana.NewServer(db,
+		hrana.WithReadOnlyDB(ro),
+		hrana.WithAuth(s.hranaAuth(d.OrgID, d.ID)),
+		hrana.WithObserver(s.meter.observer(d.ID, d.OrgID)))}, nil
+}
+
+func openPinged(dsn string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+// dbDir is the directory an org's database files are in.
+func (s *Server) dbDir(d *state.Database) string {
+	return filepath.Join(s.cfg.DataDir, "databases", d.OrgID)
+}
+
 // dbPath is where a database's file lives: named by IDs, so renaming an org
 // or a database moves nothing.
 func (s *Server) dbPath(d *state.Database) string {
-	return filepath.Join(s.cfg.DataDir, "databases", d.OrgID, d.ID+".musq")
+	if d.File != "" {
+		return filepath.Join(s.dbDir(d), d.File)
+	}
+	return filepath.Join(s.dbDir(d), d.ID+".musq")
 }
 
-// removeFiles closes a database and deletes its file and any sidecars.
+// removeFiles closes a database and deletes its file, any sidecars and its
+// history.
 func (s *Server) removeFiles(d *state.Database) {
 	s.pool.drop(d.ID)
-	p := s.dbPath(d)
+	s.closeHistory(d.ID)
+	removeDBFiles(s.log, s.dbPath(d))
+	if err := os.RemoveAll(s.histDir(d)); err != nil {
+		s.log.Printf("remove %s: %v", s.histDir(d), err)
+	}
+}
+
+// removeDBFiles deletes a database file and the engine's files beside it.
+func removeDBFiles(l interface{ Printf(string, ...any) }, p string) {
 	matches, err := filepath.Glob(p + "*")
 	if err != nil {
-		s.log.Printf("remove %s: %v", p, err)
+		l.Printf("remove %s: %v", p, err)
 		return
 	}
 	for _, m := range matches {
 		if err := os.RemoveAll(m); err != nil {
-			s.log.Printf("remove %s: %v", m, err)
+			l.Printf("remove %s: %v", m, err)
 		}
 	}
 }
@@ -218,7 +276,11 @@ func (s *Server) serveDB(w http.ResponseWriter, r *http.Request) {
 		hranaError(w, http.StatusNotFound, "no such database")
 		return
 	}
-	srv, release, err := s.pool.get(d.ID, s.dbPath(d), s.hranaAuth(o.ID, d.ID))
+	e, release, err := s.pool.get(d)
+	if errors.Is(err, errUnavailable) {
+		hranaError(w, http.StatusServiceUnavailable, "the database is being restored")
+		return
+	}
 	if err != nil {
 		s.log.Printf("open %s/%s: %v", o.Slug, d.Name, err)
 		hranaError(w, http.StatusServiceUnavailable, "database unavailable")
@@ -228,7 +290,7 @@ func (s *Server) serveDB(w http.ResponseWriter, r *http.Request) {
 	r2 := r.Clone(ctx)
 	r2.URL.Path = "/" + sub
 	r2.URL.RawPath = ""
-	srv.ServeHTTP(w, r2)
+	e.srv.ServeHTTP(w, r2)
 }
 
 // hranaAuth is the token check of a database's Hrana server: HTTP requests

@@ -33,6 +33,11 @@ type Config struct {
 	} `yaml:"snapshots"`
 	Console ConsoleConfig `yaml:"console"`
 	OIDC    OIDCConfig    `yaml:"oidc"`
+
+	// snapshots.every and snapshots.keep, parsed; 0 turns each off.
+	snapshotEvery, snapshotKeep time.Duration
+	// usageFlush is how often counted usage is written to the state.
+	usageFlush time.Duration
 }
 
 // OIDCConfig tunes sign-in. Durations take Go syntax plus "d" for days
@@ -147,6 +152,21 @@ func (c *Config) normalize() error {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.RawQuery != "" {
 		return fmt.Errorf("config: public_url %q is not an http(s) URL", c.PublicURL)
 	}
+	for _, d := range []struct {
+		name, val, def string
+		out            *time.Duration
+	}{{"snapshots.every", c.Snapshots.Every, "1h", &c.snapshotEvery}, {"snapshots.keep", c.Snapshots.Keep, "168h", &c.snapshotKeep}} {
+		v := d.val
+		if v == "" {
+			v = d.def
+		}
+		dur, err := time.ParseDuration(v)
+		if err != nil || dur < 0 {
+			return fmt.Errorf("config: %s %q is not a duration", d.name, d.val)
+		}
+		*d.out = dur
+	}
+	c.usageFlush = time.Minute
 	if c.Admin.Email == "" {
 		return errors.New("config: admin.email is required")
 	}

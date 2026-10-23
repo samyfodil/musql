@@ -172,9 +172,13 @@ func TestRoles(t *testing.T) {
 	if _, err := dbs.List(ctx, auth(bob, &v1.ListDatabasesRequest{Org: "acme"})); code(err) != connect.CodeUnauthenticated {
 		t.Fatalf("disabled user: %v", err)
 	}
-	// Stage D methods answer Unimplemented.
-	if _, err := dbs.Restore(ctx, auth(e.admin, &v1.RestoreRequest{Org: "acme", Name: "app"})); code(err) != connect.CodeUnimplemented {
-		t.Fatalf("restore: %v", err)
+	// A viewer may not restore.
+	must(users.Create(ctx, auth(e.admin, &v1.CreateUserRequest{Email: "vic@example.com", Name: "Vic", Password: "vic-password"})))
+	inv := must(orgs.Invite(ctx, auth(e.admin, &v1.InviteRequest{Org: "acme", Email: "vic@example.com", Role: v1.Role_ROLE_VIEWER})))
+	viewer := e.tokenFor("vic@example.com")
+	must(orgs.AcceptInvite(ctx, auth(viewer, &v1.AcceptInviteRequest{Id: inv.Msg.Invite.Id})))
+	if _, err := dbs.Restore(ctx, auth(viewer, &v1.RestoreRequest{Org: "acme", Name: "app"})); code(err) != connect.CodePermissionDenied {
+		t.Fatalf("restore by a viewer: %v", err)
 	}
 }
 
