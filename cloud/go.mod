@@ -13,4 +13,7 @@ require (
 	google.golang.org/protobuf v1.36.12
 )
 
-require golang.org/x/sys v0.47.0 // indirect
+require (
+	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
+	golang.org/x/sys v0.47.0 // indirect
+)
