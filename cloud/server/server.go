@@ -16,6 +16,7 @@ import (
 
 	"connectrpc.com/connect"
 
+	"github.com/samyfodil/musql/cloud/ai"
 	"github.com/samyfodil/musql/cloud/gen/cloud/v1/cloudv1connect"
 	"github.com/samyfodil/musql/cloud/oidc"
 	"github.com/samyfodil/musql/cloud/state"
@@ -35,6 +36,8 @@ type Server struct {
 	hist     histories
 	handler  http.Handler
 	log      *log.Logger
+	genMu    sync.Mutex
+	gen      ai.Generator
 
 	stop chan struct{}
 	bg   sync.WaitGroup
@@ -179,7 +182,7 @@ func (s *Server) routes() http.Handler {
 	mux.Handle(cloudv1connect.NewOrgServiceHandler(orgService{s}, opts...))
 	mux.Handle(cloudv1connect.NewGroupServiceHandler(groupService{s}, opts...))
 	mux.Handle(cloudv1connect.NewDatabaseServiceHandler(databaseService{Server: s}, opts...))
-	mux.Handle(cloudv1connect.NewAIServiceHandler(cloudv1connect.UnimplementedAIServiceHandler{}, opts...))
+	mux.Handle(cloudv1connect.NewAIServiceHandler(aiService{Server: s}, opts...))
 	mux.Handle("/db/", http.HandlerFunc(s.serveDB))
 	op := s.provider.Handler()
 	mux.Handle("/.well-known/openid-configuration", op)
