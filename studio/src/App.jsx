@@ -1,5 +1,7 @@
-import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from "react";
-import { call, ident, query, ready, rows } from "./db.js";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { call, ident, onBeforeWrite, query, ready, rows } from "./db.js";
+import { forgetDb, listDbs, loadDb, saveDb, viewState } from "./store.js";
+import { verb } from "./sqltext.js";
 import { fmt } from "./values.js";
 import { Studio } from "./studio.js";
 import TableView from "./components/TableView.jsx";
@@ -94,6 +96,10 @@ export default function App() {
 	const [dialog, setDialog] = useState(null); // "table" | {edit: table} | "import" | {import: file} | null
 	const [sideOpen, setSideOpen] = useState(false); // the sidebar, on a narrow screen
 	const [ctxMenu, openCtx] = useContextMenu();
+	const [epoch, setEpoch] = useState(0); // bumped when the whole database is replaced (undo, redo)
+	const [savedAt, setSavedAt] = useState(null);
+	const [recents, setRecents] = useState([]);
+	const [hist, setHist] = useState({ undo: 0, redo: 0 });
 
 	useEffect(() => {
 		const on = () => setLibrary(saved());
@@ -102,7 +108,89 @@ export default function App() {
 	}, []);
 
 	const [toasts, toast] = useToasts();
-	const status = useCallback((text, err) => { if (err || !/^Opening /.test(text)) toast(text, err); }, [toast]);
+
+	// ---- undo, redo and saving ----
+	// Before the first write of a change the database is snapshotted (an
+	// export, a few ms): undo puts a snapshot back whole, so it is exact for
+	// any change, a cell or a table rebuild. Writes within half a second, or
+	// inside one transaction, are one change. After a change settles the
+	// database is saved in this browser.
+	const undoStack = useRef([]);
+	const redoStack = useRef([]);
+	const grouping = useRef(false);
+	const inTxn = useRef(false);
+	const lastStep = useRef(0);
+	const saveTimer = useRef(null);
+	const nameRef = useRef(null);
+	nameRef.current = dbName;
+	const syncHist = () => setHist({ undo: undoStack.current.length, redo: redoStack.current.length });
+
+	const saveSoon = useCallback((delay = 600) => {
+		clearTimeout(saveTimer.current);
+		saveTimer.current = setTimeout(async () => {
+			if (!nameRef.current || inTxn.current) return;
+			try {
+				const bytes = await call("exportMusql");
+				await saveDb(nameRef.current, bytes);
+				setSavedAt(Date.now());
+			} catch {
+				// a database mid-transaction exports later
+			}
+		}, delay);
+	}, []);
+
+	useEffect(() => {
+		onBeforeWrite(async (sql) => {
+			const v = verb(sql);
+			if (v === "COMMIT" || v === "END" || v === "ROLLBACK") {
+				inTxn.current = false;
+				saveSoon();
+				return;
+			}
+			if (inTxn.current) return;
+			if (!grouping.current) {
+				const snap = await call("exportMusql");
+				const what = /^\s*(\w+)(?:\s+(?:OR\s+\w+\s+)?(?:INTO|FROM|TABLE|INDEX|VIEW|TRIGGER))?\s+"?([\w$]+)?/i.exec(sql.replace(/^(\s|--[^\n]*\n)*/, ""));
+				undoStack.current.push({ label: what?.[2] ? `${what[1].toLowerCase()} ${what[2]}` : v.toLowerCase(), snap });
+				let bytes = undoStack.current.reduce((n, x) => n + x.snap.length, 0);
+				while (undoStack.current.length > 1 && (undoStack.current.length > 50 || bytes > 256e6)) bytes -= undoStack.current.shift().snap.length;
+				redoStack.current = [];
+				lastStep.current = Date.now();
+				grouping.current = true;
+				setTimeout(() => (grouping.current = false), 500);
+				syncHist();
+			}
+			if (v === "BEGIN" || v === "SAVEPOINT") inTxn.current = true;
+			saveSoon();
+		});
+		return () => onBeforeWrite(null);
+	}, [saveSoon]);
+
+	const loadSchemaRef = useRef(null);
+	const swap = useCallback(async (from, to, verbWord) => {
+		if (inTxn.current) return toast("Finish the open transaction first.", true);
+		const step = from.current.pop();
+		if (!step) return;
+		const now = await call("exportMusql");
+		to.current.push({ label: step.label, snap: now });
+		await call("open", step.snap);
+		await loadSchemaRef.current();
+		setEpoch((e) => e + 1);
+		syncHist();
+		saveSoon(0);
+		toast(`${verbWord} ${step.label}`);
+	}, [toast, saveSoon]);
+	const undo = useCallback(() => swap(undoStack, redoStack, "Undid"), [swap]);
+	const redo = useCallback(() => swap(redoStack, undoStack, "Redid"), [swap]);
+	const undoRef = useRef(undo);
+	undoRef.current = undo;
+
+	// A message right after a change offers to undo it.
+	const status = useCallback((text, err) => {
+		if (/^Opening /.test(text) && !err) return;
+		const fresh = !err && Date.now() - lastStep.current < 2500 && undoStack.current.length;
+		toast(text, err, fresh ? { label: "Undo", run: () => undoRef.current() } : undefined);
+	}, [toast]);
 
 	// loadSchema reads the catalog, every table's columns and row count.
 	const loadSchema = useCallback(async () => {
@@ -124,6 +212,8 @@ export default function App() {
 		return s;
 	}, []);
 
+	loadSchemaRef.current = loadSchema;
+
 	const changed = useCallback(() => {
 		setDirty(true);
 		loadSchema().catch((e) => status(e.message, true));
@@ -135,11 +225,6 @@ export default function App() {
 		ready.catch((e) => status(e.message, true));
 	}, [status]);
 
-	useEffect(() => {
-		const warn = (e) => { if (dirty) e.preventDefault(); };
-		addEventListener("beforeunload", warn);
-		return () => removeEventListener("beforeunload", warn);
-	}, [dirty]);
 
 	// ---- tabs ----
 
@@ -155,7 +240,10 @@ export default function App() {
 			return [...ts, t];
 		});
 	}
-	const openTable = (name, mode = "data") => openTab({ kind: "table", table: name, title: name, mode });
+	const openTable = (name, mode = "data", state) => openTab({ kind: "table", table: name, title: name, mode, ...(state ? { state } : {}) });
+	// tabState keeps what a tab reports about itself (a table's filter, sort and
+	// view), for the URL and for reopening.
+	const tabState = useCallback((id, state) => setTabs((ts) => ts.map((t) => (t.id === id && JSON.stringify(t.state) !== JSON.stringify(state) ? { ...t, state } : t))), []);
 	const openQuery = (text = "", title = `Query ${++querySeq}`) => openTab({ kind: "query", title, text });
 	const openDiagram = () => openTab({ kind: "diagram", title: "Diagram" });
 	const retitle = (id, title) => setTabs((ts) => ts.map((t) => (t.id === id ? { ...t, title } : t)));
@@ -171,25 +259,101 @@ export default function App() {
 
 	// ---- databases ----
 
-	async function openDatabase(name, data, then) {
-		if (dirty && !confirm("Discard the changes to the open database? Export it first to keep them.")) return;
-		status(`Opening ${name}…`);
+	// openDatabase opens bytes (or a new database) as name. A database is kept
+	// in this browser from then on; reopening a kept one restores its tabs.
+	async function openDatabase(name, data, then, route) {
 		try {
 			const t = performance.now();
+			if (!data && !then) name = await freeName(name);
 			await call("open", data);
 			if (then) await query(then);
+			undoStack.current = [];
+			redoStack.current = [];
+			syncHist();
 			setDbName(name);
+			nameRef.current = name;
 			setDirty(false);
-			setTabs([]);
 			querySeq = 0;
 			const s = await loadSchema();
-			status(`Opened ${name} in ${(performance.now() - t).toFixed(0)} ms`);
-			const first = s.find((o) => o.type === "table");
-			if (first) openTable(first.name);
-			else openQuery();
+			saveSoon(0);
+			try {
+				localStorage.setItem("musql-studio:last", name);
+			} catch {
+				// not remembered across reloads
+			}
+			const view = viewState(name);
+			const known = (t) => t.kind !== "table" || s.some((o) => o.name === t.table);
+			const restored = (view?.tabs ?? []).filter(known).map((t) => ({ ...t, id: crypto.randomUUID() }));
+			setTabs(restored);
+			setActive(restored[view?.active]?.id ?? restored.at(-1)?.id ?? null);
+			if (view?.section) setSection(view.section);
+			if (route) applyRoute(route, s);
+			else if (!restored.length) {
+				const first = s.find((o) => o.type === "table");
+				if (first) openTable(first.name);
+				else openQuery();
+			}
+			if (!route) status(`Opened ${name} in ${(performance.now() - t).toFixed(0)} ms`);
+			listDbs().then(setRecents);
 		} catch (e) {
 			status(`Could not open ${name}: ${e.message}`, true);
 		}
+	}
+
+	// freeName is name, or name with a number, so a new database never
+	// replaces a kept one.
+	async function freeName(name) {
+		const have = new Set((await listDbs()).map((d) => d.name));
+		if (!have.has(name)) return name;
+		const [, base, ext] = /^(.*?)(\.[^.]*)?$/.exec(name);
+		for (let i = 2; ; i++) if (!have.has(`${base}-${i}${ext ?? ""}`)) return `${base}-${i}${ext ?? ""}`;
+	}
+
+	// ---- the URL ----
+	// #/<database>/table/<name>?s=<state>, #/<database>/sql/<title> or
+	// #/<database>/diagram: the open database and tab, a table's filter, sort
+	// and view, so a link reopens it and Back and Forward move between tabs.
+	function routeOf(t) {
+		if (!dbName || !t) return dbName ? `#/${encodeURIComponent(dbName)}` : "#/";
+		const base = `#/${encodeURIComponent(dbName)}`;
+		const st = t.state;
+		const custom = st && (st.mode !== "data" || st.filt?.filters?.length || st.filt?.sql || st.sorts?.length);
+		if (t.kind === "table") return `${base}/table/${encodeURIComponent(t.table)}${custom ? `?s=${encodeURIComponent(JSON.stringify(st))}` : ""}`;
+		if (t.kind === "query") return `${base}/sql/${encodeURIComponent(t.title)}`;
+		return `${base}/diagram`;
+	}
+	function parseRoute(hash) {
+		const m = /^#\/([^/?]*)(?:\/(table|sql|diagram)(?:\/([^?]*))?)?(?:\?s=(.*))?$/.exec(hash);
+		if (!m || !m[1]) return null;
+		let state;
+		try {
+			state = m[4] ? JSON.parse(decodeURIComponent(m[4])) : undefined;
+		} catch {
+			state = undefined;
+		}
+		return { db: decodeURIComponent(m[1]), kind: m[2], name: m[3] ? decodeURIComponent(m[3]) : undefined, state };
+	}
+	function applyRoute(r, s = schema) {
+		if (r.kind === "table" && s.some((o) => o.name === r.name)) {
+			setSection("tables");
+			openTable(r.name, r.state?.mode ?? "data", r.state);
+		} else if (r.kind === "sql") {
+			setSection("sql");
+			setTabs((ts) => {
+				const q = ts.find((t) => t.kind === "query" && t.title === r.name);
+				if (q) setActive(q.id);
+				return ts;
+			});
+		} else if (r.kind === "diagram") {
+			setSection("diagram");
+			openDiagram();
+		}
+	}
+
+	async function openSaved(name, route) {
+		const bytes = await loadDb(name);
+		if (!bytes) return status(`${name} is no longer kept in this browser.`, true);
+		await openDatabase(name, bytes, undefined, route);
 	}
 
 	async function openFile(file) {
@@ -217,6 +381,60 @@ export default function App() {
 			status(`Export failed: ${e.message}`, true);
 		}
 	}
+
+	// Startup: the database the URL names, or the last one open, if kept.
+	useEffect(() => {
+		ready.then(async () => {
+			listDbs().then(setRecents);
+			const r = parseRoute(location.hash);
+			let last = null;
+			try {
+				last = localStorage.getItem("musql-studio:last");
+			} catch {
+				last = null;
+			}
+			const name = r?.db ?? last;
+			if (name && (await loadDb(name))) await openSaved(name, r?.db === name ? r : null);
+		}, () => {});
+	}, []);
+
+	// The open tabs are kept per database, and the URL follows the tab in view.
+	const current0 = tabs.find((t) => t.id === active);
+	const lastHash = useRef(null);
+	useEffect(() => {
+		if (!dbName) return;
+		viewState(dbName, { tabs: tabs.map(({ id, ...t }) => t), active: tabs.findIndex((t) => t.id === active), section });
+		const h = routeOf(current0);
+		if (h === location.hash) return;
+		const sameTab = lastHash.current && lastHash.current.split("?")[0] === h.split("?")[0];
+		if (sameTab) history.replaceState(null, "", h);
+		else history.pushState(null, "", h);
+		lastHash.current = h;
+	}, [tabs, active, section, dbName]);
+	useEffect(() => {
+		const on = () => {
+			const r = parseRoute(location.hash);
+			lastHash.current = location.hash;
+			if (!r) return;
+			if (r.db !== nameRef.current) openSaved(r.db, r);
+			else applyRoute(r);
+		};
+		addEventListener("popstate", on);
+		return () => removeEventListener("popstate", on);
+	});
+
+	// ⌘Z and ⇧⌘Z undo and redo, except while typing in a field or the editor.
+	useEffect(() => {
+		const key = (e) => {
+			if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "z") return;
+			if (e.target.closest?.("input, textarea, select, .cm-editor, [contenteditable]")) return;
+			e.preventDefault();
+			if (e.shiftKey) redo();
+			else undo();
+		};
+		addEventListener("keydown", key);
+		return () => removeEventListener("keydown", key);
+	}, [undo, redo]);
 
 	useEffect(() => {
 		const key = (e) => {
@@ -263,13 +481,23 @@ export default function App() {
 		];
 	}
 
-	const ctx = { schema, columnsOf, status, changed, dark, openQuery, editTable: (name) => setDialog({ edit: name }), importInto: () => setDialog("import") };
+	const ctx = { schema, columnsOf, status, changed, dark, openQuery, epoch, tabState, editTable: (name) => setDialog({ edit: name }), importInto: () => setDialog("import") };
 	const activeTab = tabs.find((t) => t.id === active);
 	const f = filter.trim().toLowerCase();
 	const internal = useMemo(() => internalNames(schema), [schema]);
 	const hidden = showInternal ? 0 : schema.filter((o) => internal.has(o.name)).length;
 	const pickFile = () => document.getElementById("file").click();
+	const ago = (t) => {
+		const m = Math.round((Date.now() - t) / 60000);
+		return m < 1 ? "just now" : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : new Date(t).toLocaleDateString();
+	};
+	const others = recents.filter((r) => r.name !== dbName).slice(0, 6);
 	const fileItems = [
+		{ label: "Undo", hint: "⌘Z", disabled: !hist.undo, onClick: undo },
+		{ label: "Redo", hint: "⇧⌘Z", disabled: !hist.redo, onClick: redo },
+		"-",
+		...others.map((r) => ({ label: r.name, hint: ago(r.at), onClick: () => openSaved(r.name) })),
+		others.length > 0 && "-",
 		{ label: "New empty database", onClick: () => openDatabase("untitled.musq") },
 		{ label: "Open a file…", hint: "⌘O", onClick: pickFile },
 		{ label: "Open the sample", onClick: () => openDatabase("sample.musq", undefined, SAMPLE) },
@@ -295,12 +523,17 @@ export default function App() {
 			act("Export as SQLite file", () => exportAs("sqlite"), ".sqlite", "⇩");
 			act("Export as musql file", () => exportAs("musql"), ".musq", "⇩");
 		}
+		if (dbName) {
+			act("Undo", undo, "⌘Z", "↶");
+			act("Redo", redo, "⇧⌘Z", "↷");
+		}
+		for (const r of recents) if (r.name !== dbName) act(`Open ${r.name}`, () => openSaved(r.name), "kept in this browser", "◷");
 		act("Open a file", pickFile, "⌘O", "⇧");
 		act("Open the sample database", () => openDatabase("sample.musq", undefined, SAMPLE), "", "★");
 		act("New empty database", () => openDatabase("untitled.musq"), "", "＋");
 		act(`Theme: ${theme === "dark" ? "light" : "dark"}`, () => setTheme(dark ? "light" : "dark"), "", dark ? "☀" : "☾");
 		return out;
-	}, [schema, internal, counts, library, dbName, theme, dark]);
+	}, [schema, internal, counts, library, dbName, theme, dark, recents, undo, redo]);
 
 	const tabsShown = tabs.filter((t) => (section === "sql" ? t.kind === "query" : section === "diagram" ? t.kind === "diagram" : t.kind === "table"));
 	const current = tabsShown.find((t) => t.id === active) ?? tabsShown.at(-1);
@@ -348,7 +581,7 @@ export default function App() {
 					<div className="dbswitch">
 						<MenuButton
 							className="dbbtn"
-							label={<><span className="dbn">{dbName ?? "No database"}</span>{dirty && <span className="dot" title="Changed since it was opened or exported" />}<span className="dim">▾</span></>}
+							label={<><span className="dbn">{dbName ?? "No database"}</span>{dbName && <span className={`savestate${savedAt ? " ok" : ""}`} title={savedAt ? `Saved in this browser ${ago(savedAt)}. Export to keep a file.` : "Saving…"}>{savedAt ? "saved" : "…"}</span>}<span className="dim">▾</span></>}
 							items={fileItems}
 						/>
 					</div>
@@ -451,7 +684,7 @@ export default function App() {
 						{tabs.map((t) => (
 							<div key={t.id} className="pane" hidden={t.id !== current?.id}>
 								{t.kind === "table" ? (
-									<TableView name={t.table} mode={t.mode} />
+									<TableView name={t.table} mode={t.mode} tabId={t.id} state={t.state} />
 								) : t.kind === "diagram" ? (
 									<Suspense fallback={<Spinner label="Loading the diagram…" />}>
 										<Diagram onOpen={(name) => { setSection("tables"); openTable(name); }} />
@@ -479,6 +712,20 @@ export default function App() {
 										<div className="logo big">μ</div>
 										<h1>musql studio</h1>
 										<p className="dim">A SQLite-compatible database that runs in your browser. Nothing is uploaded.</p>
+										{recents.length > 0 && (
+											<div className="recents">
+												<h4>Continue where you left off</h4>
+												{recents.slice(0, 6).map((r) => (
+													<div key={r.name} className="recent">
+														<button className="recent-open" onClick={() => openSaved(r.name)}>
+															<span className="mono">{r.name}</span>
+															<span className="dim small">{fmt(Math.ceil(r.size / 1024))} KB · {ago(r.at)}</span>
+														</button>
+														<button className="ghost icon" title="Forget it in this browser" onClick={async () => { if (confirm(`Forget ${r.name}? It is deleted from this browser.`)) { await forgetDb(r.name); setRecents(await listDbs()); } }}>×</button>
+													</div>
+												))}
+											</div>
+										)}
 										<div className="starts">
 											<button className="start" onClick={() => openDatabase("sample.musq", undefined, SAMPLE)}>
 												<span className="si">★</span><b>Try the sample</b><span className="dim small">a small music database</span>

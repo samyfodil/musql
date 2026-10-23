@@ -628,3 +628,11 @@ button svg { vertical-align: -2px; flex: none; }
 .pickcol.on { border-color: var(--accent); background: var(--accent-soft); }
 .pickcol .order { margin-left: auto; width: 20px; height: 20px; border-radius: 50%; background: var(--accent); color: #fff; display: grid; place-items: center; font-size: 11px; font-weight: 700; }
 .structure { padding: 18px 22px; }
+.savestate { font-size: 10.5px; font-weight: 500; color: var(--dim); padding: 0 6px; border-radius: 9px; background: var(--hover); }
+.savestate.ok { color: #2f9e5b; }
+.recents { width: min(560px, 92vw); margin: 18px auto 0; text-align: left; display: grid; gap: 4px; }
+.recents h4 { margin: 0 0 4px; font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
+.recent { display: flex; gap: 4px; }
+.recent-open { flex: 1; display: flex; justify-content: space-between; align-items: center; padding: 9px 12px; }
+.recent-open:hover { border-color: var(--accent); }
+.toast-action { margin-left: 8px; padding: 1px 9px; border-radius: 6px; border: 1px solid currentColor; background: transparent; color: inherit; font-weight: 600; font-size: 12px; }

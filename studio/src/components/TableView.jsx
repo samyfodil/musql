@@ -18,14 +18,14 @@ import { embeddingsOf, fillMissing, missingCount, search, searchVec1, setUpEmbed
 const PAGE = 100;
 
 /** One table or view: its rows a page at a time, editable, and its structure. */
-export default function TableView({ name, mode: initialMode = "data" }) {
-	const { schema, status, changed, editTable, openQuery, importInto } = useStudio();
+export default function TableView({ name, mode: initialMode = "data", tabId, state }) {
+	const { schema, status, changed, editTable, openQuery, importInto, epoch, tabState } = useStudio();
 	const obj = schema.find((o) => o.name === name);
 	const [mode, setMode] = useState(initialMode);
 	const [cols, setCols] = useState([]);
-	const [filt, setFilt] = useState({ filters: [], sql: "" }); // the menus' conditions, or a typed WHERE
+	const [filt, setFilt] = useState(state?.filt ?? { filters: [], sql: "" }); // the menus' conditions, or a typed WHERE
 	const [menu, openMenu] = useContextMenu();
-	const [sorts, setSorts] = useState([]); // [{col, desc}]
+	const [sorts, setSorts] = useState(state?.sorts ?? []); // [{col, desc}]
 	const [offset, setOffset] = useState(0);
 	const [data, setData] = useState(null);
 	const [total, setTotal] = useState(0);
@@ -46,6 +46,17 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 	const filling = useRef(false);
 
 	useEffect(() => setMode(initialMode), [initialMode]);
+	// The view's state goes up to the tab (and so to the URL); a state that
+	// comes down (Back, Forward, a link) is applied.
+	useEffect(() => {
+		tabState?.(tabId, { mode, filt, sorts });
+	}, [mode, JSON.stringify(filt), JSON.stringify(sorts)]);
+	useEffect(() => {
+		if (!state) return;
+		if (JSON.stringify(state.filt) !== JSON.stringify(filt)) setFilt(state.filt ?? { filters: [], sql: "" });
+		if (JSON.stringify(state.sorts) !== JSON.stringify(sorts)) setSorts(state.sorts ?? []);
+		if (state.mode && state.mode !== mode) setMode(state.mode);
+	}, [JSON.stringify(state)]);
 
 	const sql = obj?.sql ?? "";
 	const view = obj?.type === "view";
@@ -74,7 +85,7 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 		} catch (e) {
 			status(e.message, true);
 		}
-	}, [name, sql]);
+	}, [name, sql, epoch]);
 	useEffect(() => {
 		loadCols();
 	}, [loadCols]);
@@ -125,7 +136,7 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 			setError(e.message);
 			status(e.message, true);
 		}
-	}, [name, where, JSON.stringify(whereParams), orderBy, offset, keyed, keyCols.join("\0"), semantic, emb, vec1, vec1Model]);
+	}, [name, epoch, where, JSON.stringify(whereParams), orderBy, offset, keyed, keyCols.join("\0"), semantic, emb, vec1, vec1Model]);
 
 	useEffect(() => {
 		if (cols.length || view) load();
