@@ -270,6 +270,9 @@ type Conn struct {
 	// foreignKeys); its setter takes effect inside a transaction.
 	queryOnly bool
 
+	// confined and confinedReadOnly are Confine's; pushed into every session.
+	confined, confinedReadOnly bool
+
 	// maxSize is this connection's "PRAGMA max_size" (maxSizePragma), stamped
 	// on every session of its main database for queryOnly's reason.
 	maxSize int64
@@ -646,6 +649,9 @@ func (c *Conn) openWriteOrCreatePath(path string) (*engine.DB, error) {
 	db.SetVec1Connection(c.vec1Conns)            // likewise; see Conn.vec1Conns
 	db.SetQueryOnly(c.queryOnly)                 // likewise; see Conn.queryOnly
 	db.SetWriteLock(c.captureLock(db, path))     // see Conn.captureLock
+	if c.confined {
+		db.SetConfined(c.confinedReadOnly)
+	}
 	if path == c.path {
 		db.SetMaxSize(c.maxSize) // see Conn.maxSizePragma; main only
 	}
@@ -1473,8 +1479,22 @@ func (c *Conn) queryOnlyPragma(sqlText string) (handled bool, err error) {
 		return true, nil // getter: rows come from queryOnlyPragmaRows
 	}
 	b := engine.PragmaBooleanValue(stmt.ValueText)
+	if c.confinedReadOnly && !b {
+		return true, engine.ErrConfined
+	}
 	c.queryOnly = b
 	return true, nil
+}
+
+// Confine makes this connection fit to serve remote clients: ATTACH and
+// VACUUM INTO, which name files on the server, are refused, and with readOnly
+// every write is (query_only is set and cannot be turned off). Call from a
+// connection hook (RegisterConnectionHook), before the connection is used.
+func (c *Conn) Confine(readOnly bool) {
+	c.confined, c.confinedReadOnly = true, readOnly
+	if readOnly {
+		c.queryOnly = true
+	}
 }
 
 // queryOnlyPragmaRows is the getter's single row, for the Query path.

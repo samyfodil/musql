@@ -79,6 +79,9 @@ func (c *Conn) clearTouched() {
 // the held transaction session.
 func (c *Conn) handleAttachDetach(sqlText string) (res driver.Result, handled bool, err error) {
 	if path, name, ok, perr := engine.ParseAttachStmt(sqlText); ok {
+		if c.confined {
+			return nil, true, engine.ErrConfined
+		}
 		if perr != nil {
 			return nil, true, perr
 		}

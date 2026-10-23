@@ -1954,6 +1954,7 @@ func (db *DB) adoptConnSettingsFrom(old *DB) {
 	db.rtreeConns = old.rtreeConns
 	db.vec1Conns = old.vec1Conns
 	db.queryOnly = old.queryOnly
+	db.confined, db.queryOnlyLocked = old.confined, old.queryOnlyLocked
 	db.writeLock = old.writeLock
 	db.maxSize = old.maxSize
 	db.pragmaState = old.pragmaState

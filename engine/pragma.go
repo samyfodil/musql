@@ -583,6 +583,9 @@ func (db *DB) execPragma(sqlText string) error {
 			return nil // a getter; its single row is discarded by an Exec
 		}
 		b := pragmaGetBoolean(stmt.ValueText, false)
+		if db.queryOnlyLocked && !b {
+			return ErrConfined
+		}
 		db.queryOnly = b
 		return nil
 	case "recursive_triggers":
@@ -1088,6 +1091,19 @@ var ErrDiskFull = errors.New("engine: " + ErrMsgDiskFull)
 // connection-level flag across its one-session-per-statement model, can push it
 // into every session it opens (driver's Conn.queryOnly).
 func (db *DB) SetQueryOnly(on bool) { db.queryOnly = on }
+
+// ErrConfined is the error for a statement SetConfined refuses.
+var ErrConfined = errors.New("engine: not allowed on this connection")
+
+// SetConfined confines a session that serves remote clients: ATTACH and VACUUM
+// INTO, which name files on the server, are refused, and with readOnly
+// query_only is set and cannot be turned off.
+func (db *DB) SetConfined(readOnly bool) {
+	db.confined = true
+	if readOnly {
+		db.queryOnly, db.queryOnlyLocked = true, true
+	}
+}
 
 // QueryOnly reports the current "PRAGMA query_only" setting.
 func (db *DB) QueryOnly() bool { return db.queryOnly }
