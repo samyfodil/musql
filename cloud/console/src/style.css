@@ -746,7 +746,7 @@ table.grid, .vgrid td, .vgrid td .cv { font-family: var(--sans); font-size: var(
 
 /* connections: which kind of database is open */
 .dbbtn .dbkind { flex: none; color: var(--dim); }
-.savestate.remote { color: var(--accent); font-family: var(--mono); max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.savestate.remote { color: var(--accent); font-family: var(--mono); max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dbnote { margin: 6px 2px 0; font-size: 11.5px; color: var(--dim); line-height: 1.4; }
 
 /* staged edits: queued, not written yet */
@@ -773,6 +773,7 @@ label.stagetoggle { display: inline-flex; align-items: center; gap: 5px; font-si
 .summary tr.click:hover td { background: var(--sel); }
 
 /* function hints */
-.cm-tooltip .fn-sig { padding: 4px 8px; font: 12px var(--mono); max-width: 520px; }
-.cm-tooltip .fn-sig .arg { color: var(--accent); font-weight: 600; }
-.cm-tooltip .fn-sig .about { display: block; font-family: var(--sans); color: var(--dim); margin-top: 2px; }
+.cm-tooltip.fn-sig { padding: 4px 8px; font: 12px var(--mono); max-width: 520px; }
+.cm-tooltip.fn-sig .arg { color: var(--accent); font-weight: 600; }
+.cm-tooltip.fn-sig .about { display: block; font-family: var(--sans); color: var(--dim); margin-top: 2px; }
+.stagebar button.primary .kbd { background: rgba(255, 255, 255, 0.2); color: #fff; border-color: transparent; }

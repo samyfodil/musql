@@ -11,6 +11,15 @@ Nothing is uploaded anywhere.
 - Edit a cell with a double-click, add rows, and delete selected rows.
 - Write SQL with highlighting and completion of table and column names;
   ⌘/Ctrl+Enter runs the selection or the whole editor.
+- "Review changes before saving" (the table toolbar) queues edits, pastes,
+  inserts and deletes: Review shows the statements, Save (⌘S) runs them in one
+  transaction, Discard drops them.
+- Each statement that returns rows gets a result tab, beside a summary of the
+  whole run; completion knows the SQL functions and shows a call's signature.
+- Connect to a remote database: a Hrana/libSQL URL and a token, kept in this
+  browser (`@libsql/client`). A remote one downloads as a SQL dump, and undo
+  is for local databases only. The server must allow the console's origin
+  (CORS).
 - Export as a C SQLite file (`.sqlite`) or a musql file (`.musq`).
 - Semantic search: "Embed…" turns a text column into vectors
   (all-MiniLM-L6-v2 via transformers.js, in a worker of its own, downloaded
