@@ -473,6 +473,9 @@ func (n *Session) Commit() (bool, error) {
 		if cerr == nil && wrote {
 			n.compactIfWorthIt()
 			n.mapChangeWordLate()
+			if commitHook != nil && !n.DB.inMemory {
+				commitHook(CommitInfo{Path: n.segPath, Counter: n.endCtr, DeltaEnd: n.deltaEnd})
+			}
 		}
 		return cerr
 	}
