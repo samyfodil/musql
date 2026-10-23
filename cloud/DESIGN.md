@@ -39,9 +39,13 @@ node:
   location: "fra"          # this node's location code
 peers: []                  # other nodes: {name, location, url, secret}
 ai:
-  base_url: ""             # OpenAI-compatible endpoint; empty disables AI SQL
-  api_key: ""
-  model: ""
+  provider: "jitllm"       # jitllm | openai | anthropic | openrouter | "" (off)
+  model: "slm-sql-1.5b"    # provider's model name; for jitllm, a .jlm path or name in models_dir
+  api_key: ""              # openai, anthropic, openrouter
+  base_url: ""             # override (an OpenAI-compatible server, jitllmd, a proxy)
+  jitllm:
+    models_dir: "./models"
+    embedded: true         # run the model in-process; false = talk to jitllmd at base_url
 snapshots:
   every: "1h"
   keep: "168h"
@@ -110,9 +114,30 @@ normalized statement text with counts and total time.
 
 ## AI SQL
 
-If `ai.base_url` is set: `AI.GenerateSQL(database, prompt)` sends the schema
-(CREATE statements, no data) and the prompt to the endpoint, returns SQL and
-an explanation. The console never runs it without the user pressing Run.
+`AI.GenerateSQL(database, prompt)` sends the schema (CREATE statements, no
+data) and the prompt to the configured provider and returns SQL and a short
+explanation; the console never runs it without the user pressing Run. The
+SQL is checked before it is returned: it must parse (`EXPLAIN` it on a
+read-only connection), and a statement that would write is labelled so.
+
+Providers, behind one `cloud/ai` interface (`Generate(ctx, system, user)`):
+
+- **jitllm, embedded** (the default): `github.com/jitllm/jitllm/engine/model`
+  in-process, a `.jlm` from `models_dir`. The default model is SLM-SQL 1.5B
+  (Qwen2.5-Coder based, 67.1% on BIRD), small enough to answer fast on a CPU.
+  The model is opened once, lazily, sessions are short-lived, decoding is
+  greedy with a token budget, and generation is cut at the end of the SQL.
+  Built behind a `jitllm` build tag so a server without it stays small; the
+  release build includes it.
+- **jitllm server**: `jitllmd`'s OpenAI-compatible API at `base_url`.
+- **OpenAI**: Chat Completions, `api_key`, `model`.
+- **Anthropic**: Messages API, `api_key`, `model`.
+- **OpenRouter**: its OpenAI-compatible API (`https://openrouter.ai/api/v1`),
+  any model it routes to.
+
+Calls go through the official Go SDKs where they exist
+(`github.com/openai/openai-go`, `github.com/anthropics/anthropic-sdk-go`;
+OpenRouter through the OpenAI SDK with its base URL).
 
 ## API (ConnectRPC, `proto/cloud/v1`)
 
