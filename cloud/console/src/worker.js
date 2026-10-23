@@ -31,8 +31,12 @@ const ops = {
 		return res;
 	},
 	run: (sql, params = []) => db.run(sql, ...params),
-	// split splits a script into statements as the engine does.
-	split: (sql) => db.split(sql),
+	// split splits a script into statements as the engine does; with a remote
+	// database open there may be no local one, so it opens an empty one to ask.
+	async split(sql) {
+		db ??= await open(`studio-${++seq}.musq`, {});
+		return db.split(sql);
+	},
 	exportMusql: () => db.export(),
 	exportSQLite: () => db.exportSQLite(),
 };

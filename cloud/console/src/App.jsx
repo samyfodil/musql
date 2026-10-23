@@ -1,5 +1,7 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { call, ident, onBeforeWrite, query, ready, rows } from "./db.js";
+import { backend, connect, exportMusql, exportSQLite, hostOf, ident, isRemote, onBeforeWrite, open, query, ready, rows } from "./db.js";
+import { forgetRemote, keepRemote, remoteNamed, remotes } from "./remotes.js";
+import { dumpSQL } from "./dump.js";
 import { forgetDb, listDbs, loadDb, saveDb, viewState } from "./store.js";
 import { verb } from "./sqltext.js";
 import { fmt } from "./values.js";
@@ -10,8 +12,9 @@ import { MenuButton, useContextMenu } from "./components/Menu.jsx";
 import { useToasts } from "./components/Toasts.jsx";
 import Palette from "./components/Palette.jsx";
 import Shortcuts from "./components/Shortcuts.jsx";
-import { Contrast, Keyboard, Moon, Network, Search, SquareTerminal, Sun, Table2 } from "lucide-react";
+import { Contrast, Globe, HardDrive, Keyboard, Moon, Network, Search, SquareTerminal, Sun, Table2 } from "lucide-react";
 import { ImportDialog, TableDialog } from "./components/Dialogs.jsx";
+import ConnectDrawer from "./components/ConnectDrawer.jsx";
 import { SAMPLE } from "./sample.js";
 import { saved, unsave } from "./library.js";
 import { isStudioTable } from "./vectors.js";
@@ -102,6 +105,9 @@ export default function App() {
 	const [savedAt, setSavedAt] = useState(null);
 	const [recents, setRecents] = useState([]);
 	const [hist, setHist] = useState({ undo: 0, redo: 0 });
+	const [conn, setConn] = useState(backend()); // what is open: local, or a remote host
+	const [remoteList, setRemoteList] = useState(remotes);
+	const [connecting, setConnecting] = useState(null); // a ConnectDrawer's starting values, or null
 
 	useEffect(() => {
 		const on = () => setLibrary(saved());
@@ -130,9 +136,9 @@ export default function App() {
 	const saveSoon = useCallback((delay = 600) => {
 		clearTimeout(saveTimer.current);
 		saveTimer.current = setTimeout(async () => {
-			if (!nameRef.current || inTxn.current) return;
+			if (!nameRef.current || inTxn.current || isRemote()) return;
 			try {
-				const bytes = await call("exportMusql");
+				const bytes = await exportMusql();
 				await saveDb(nameRef.current, bytes);
 				setSavedAt(Date.now());
 			} catch {
@@ -143,6 +149,8 @@ export default function App() {
 
 	useEffect(() => {
 		onBeforeWrite(async (sql) => {
+			// A remote database has no snapshot to take: undo is local-only.
+			if (isRemote()) return;
 			const v = verb(sql);
 			if (v === "COMMIT" || v === "END" || v === "ROLLBACK") {
 				inTxn.current = false;
@@ -151,7 +159,7 @@ export default function App() {
 			}
 			if (inTxn.current) return;
 			if (!grouping.current) {
-				const snap = await call("exportMusql");
+				const snap = await exportMusql();
 				const what = /^\s*(\w+)(?:\s+(?:OR\s+\w+\s+)?(?:INTO|FROM|TABLE|INDEX|VIEW|TRIGGER))?\s+"?([\w$]+)?/i.exec(sql.replace(/^(\s|--[^\n]*\n)*/, ""));
 				undoStack.current.push({ label: what?.[2] ? `${what[1].toLowerCase()} ${what[2]}` : v.toLowerCase(), snap });
 				let bytes = undoStack.current.reduce((n, x) => n + x.snap.length, 0);
@@ -170,12 +178,13 @@ export default function App() {
 
 	const loadSchemaRef = useRef(null);
 	const swap = useCallback(async (from, to, verbWord) => {
+		if (isRemote()) return toast("Undo works on local databases, not on a remote one.", true);
 		if (inTxn.current) return toast("Finish the open transaction first.", true);
 		const step = from.current.pop();
 		if (!step) return;
-		const now = await call("exportMusql");
+		const now = await exportMusql();
 		to.current.push({ label: step.label, snap: now });
-		await call("open", step.snap);
+		await open(step.snap);
 		await loadSchemaRef.current();
 		setEpoch((e) => e + 1);
 		syncHist();
@@ -263,14 +272,18 @@ export default function App() {
 
 	// openDatabase opens bytes (or a new database) as name. A database is kept
 	// in this browser from then on; reopening a kept one restores its tabs.
-	async function openDatabase(name, data, then, route) {
+	// remote, when given, is a kept connection ({url, token}) to open instead.
+	async function openDatabase(name, data, then, route, remote) {
 		try {
 			const t = performance.now();
-			if (!data && !then) name = await freeName(name);
+			if (!data && !then && !remote) name = await freeName(name);
 			// Read the kept view before anything renders under the new name: the
 			// effect that keeps it would otherwise save an empty one first.
 			const view = viewState(name);
-			await call("open", data);
+			if (remote) await connect(remote.url, remote.token);
+			else await open(data);
+			setConn(backend());
+			setSavedAt(null);
 			if (then) await query(then);
 			undoStack.current = [];
 			redoStack.current = [];
@@ -356,6 +369,8 @@ export default function App() {
 	}
 
 	async function openSaved(name, route) {
+		const r = remoteNamed(name);
+		if (r) return openDatabase(name, undefined, undefined, route, r);
 		const bytes = await loadDb(name);
 		if (!bytes) return status(`${name} is no longer kept in this browser.`, true);
 		await openDatabase(name, bytes, undefined, route);
@@ -374,10 +389,10 @@ export default function App() {
 	async function exportAs(kind) {
 		if (!dbName) return status("Nothing to export yet.", true);
 		try {
-			const bytes = await call(kind === "sqlite" ? "exportSQLite" : "exportMusql");
+			const bytes = kind === "sql" ? new TextEncoder().encode(await dumpSQL()) : await (kind === "sqlite" ? exportSQLite() : exportMusql());
 			const a = document.createElement("a");
 			a.href = URL.createObjectURL(new Blob([bytes]));
-			a.download = `${dbName.replace(/\.(musq|sqlite3?|db)$/i, "")}.${kind === "sqlite" ? "sqlite" : "musq"}`;
+			a.download = `${dbName.replace(/\.(musq|sqlite3?|db)$/i, "")}.${kind === "sqlite" ? "sqlite" : kind === "sql" ? "sql" : "musq"}`;
 			a.click();
 			setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 			setDirty(false);
@@ -399,7 +414,7 @@ export default function App() {
 				last = null;
 			}
 			const name = r?.db ?? last;
-			if (name && (await loadDb(name))) await openSaved(name, r?.db === name ? r : null);
+			if (name && (remoteNamed(name) || (await loadDb(name)))) await openSaved(name, r?.db === name ? r : null);
 		}, () => {});
 	}, []);
 
@@ -502,19 +517,37 @@ export default function App() {
 		const m = Math.round((Date.now() - t) / 60000);
 		return m < 1 ? "just now" : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : new Date(t).toLocaleDateString();
 	};
-	const others = recents.filter((r) => r.name !== dbName).slice(0, 6);
+	const remote = conn.kind === "remote";
+	const others = recents.filter((r) => r.name !== dbName && !remoteNamed(r.name)).slice(0, 6);
+	const otherRemotes = remoteList.filter((r) => r.name !== dbName).slice(0, 6);
+	// connectRemote opens c and keeps it; it reports whether that worked, so
+	// the drawer stays open on a wrong URL or token.
+	const connectRemote = async (c) => {
+		await openDatabase(c.name, undefined, undefined, null, c);
+		if (!isRemote() || nameRef.current !== c.name) return false;
+		keepRemote(c);
+		setRemoteList(remotes());
+		setConnecting(null);
+		return true;
+	};
 	const fileItems = [
-		{ label: "Undo", hint: "⌘Z", disabled: !hist.undo, onClick: undo },
-		{ label: "Redo", hint: "⇧⌘Z", disabled: !hist.redo, onClick: redo },
+		{ label: "Undo", hint: remote ? "local only" : "⌘Z", disabled: remote || !hist.undo, onClick: undo },
+		{ label: "Redo", hint: remote ? "local only" : "⇧⌘Z", disabled: remote || !hist.redo, onClick: redo },
 		"-",
 		...others.map((r) => ({ label: r.name, hint: ago(r.at), onClick: () => openSaved(r.name) })),
-		others.length > 0 && "-",
+		...otherRemotes.map((r) => ({ label: r.name, hint: hostOf(r.url), onClick: () => openSaved(r.name) })),
+		others.length + otherRemotes.length > 0 && "-",
 		{ label: "New empty database", onClick: () => openDatabase("untitled.musq") },
 		{ label: "Open a file…", hint: "⌘O", onClick: pickFile },
 		{ label: "Open the sample", onClick: () => openDatabase("sample.musq", undefined, SAMPLE) },
+		{ label: "Connect to a remote database…", hint: "libSQL / Hrana", onClick: () => setConnecting({}) },
+		remote && { label: "Edit this connection…", onClick: () => setConnecting(remoteNamed(dbName) ?? {}) },
 		"-",
-		{ label: "Export as SQLite", hint: ".sqlite", disabled: !dbName, onClick: () => exportAs("sqlite") },
-		{ label: "Export as musql", hint: ".musq", disabled: !dbName, onClick: () => exportAs("musql") },
+		remote
+			? { label: "Export as a file", hint: "local only", disabled: true }
+			: { label: "Export as SQLite", hint: ".sqlite", disabled: !dbName, onClick: () => exportAs("sqlite") },
+		!remote && { label: "Export as musql", hint: ".musq", disabled: !dbName, onClick: () => exportAs("musql") },
+		{ label: "Download as SQL dump", hint: ".sql", disabled: !dbName, onClick: () => exportAs("sql") },
 	];
 
 	// Everything the palette finds: objects first, then actions.
@@ -531,21 +564,24 @@ export default function App() {
 			act("Create a table", () => setDialog("table"), "", "＋");
 			act("Import CSV or JSON", () => setDialog("import"), "", "⇪");
 			act("Schema diagram", () => { setSection("diagram"); openDiagram(); }, "", ICON.diagram);
-			act("Export as SQLite file", () => exportAs("sqlite"), ".sqlite", "⇩");
-			act("Export as musql file", () => exportAs("musql"), ".musq", "⇩");
+			if (!remote) act("Export as SQLite file", () => exportAs("sqlite"), ".sqlite", "⇩");
+			if (!remote) act("Export as musql file", () => exportAs("musql"), ".musq", "⇩");
+			act("Download as SQL dump", () => exportAs("sql"), ".sql", "⇩");
 		}
-		if (dbName) {
+		if (dbName && !remote) {
 			act("Undo", undo, "⌘Z", "↶");
 			act("Redo", redo, "⇧⌘Z", "↷");
 		}
-		for (const r of recents) if (r.name !== dbName) act(`Open ${r.name}`, () => openSaved(r.name), "kept in this browser", "◷");
+		for (const r of recents) if (r.name !== dbName && !remoteNamed(r.name)) act(`Open ${r.name}`, () => openSaved(r.name), "kept in this browser", "◷");
+		for (const r of remoteList) if (r.name !== dbName) act(`Open ${r.name}`, () => openSaved(r.name), hostOf(r.url), "◎");
+		act("Connect to a remote database", () => setConnecting({}), "libSQL / Hrana", "◎");
 		act("Open a file", pickFile, "⌘O", "⇧");
 		act("Open the sample database", () => openDatabase("sample.musq", undefined, SAMPLE), "", "★");
 		act("New empty database", () => openDatabase("untitled.musq"), "", "＋");
 		act("Keyboard shortcuts", () => setKeys(true), "?", "⌨");
 		act(`Theme: ${theme === "dark" ? "light" : "dark"}`, () => setTheme(dark ? "light" : "dark"), "", dark ? "☀" : "☾");
 		return out;
-	}, [schema, internal, counts, library, dbName, theme, dark, recents, undo, redo]);
+	}, [schema, internal, counts, library, dbName, theme, dark, recents, remoteList, remote, undo, redo]);
 
 	const tabsShown = tabs.filter((t) => (section === "sql" ? t.kind === "query" : section === "diagram" ? t.kind === "diagram" : t.kind === "table"));
 	const current = tabsShown.find((t) => t.id === active) ?? tabsShown.at(-1);
@@ -594,9 +630,17 @@ export default function App() {
 					<div className="dbswitch">
 						<MenuButton
 							className="dbbtn"
-							label={<><span className="dbn">{dbName ?? "No database"}</span>{dbName && <span className={`savestate${savedAt ? " ok" : ""}`} title={savedAt ? `Saved in this browser ${ago(savedAt)}. Export to keep a file.` : "Saving…"}>{savedAt ? "saved" : "…"}</span>}<span className="dim">▾</span></>}
+							label={<>
+								{dbName && (remote ? <Globe size={14} className="dbkind" /> : <HardDrive size={14} className="dbkind" />)}
+								<span className="dbn">{dbName ?? "No database"}</span>
+								{dbName && (remote
+									? <span className="savestate remote" title={`Every change is written to ${conn.url} as it is made.`}>{conn.host}</span>
+									: <span className={`savestate${savedAt ? " ok" : ""}`} title={savedAt ? `Local, saved in this browser ${ago(savedAt)}. Export to keep a file.` : "Saving…"}>{savedAt ? "local · saved" : "local …"}</span>)}
+								<span className="dim">▾</span>
+							</>}
 							items={fileItems}
 						/>
+						{dbName && remote && <p className="dbnote">Remote: changes go straight to the server. Undo works on local databases.</p>}
 					</div>
 					{section === "sql" ? (
 						<>
@@ -725,9 +769,18 @@ export default function App() {
 										<div className="logo big">μ</div>
 										<h1>musql studio</h1>
 										<p className="dim">A SQLite-compatible database that runs in your browser. Nothing is uploaded.</p>
-										{recents.length > 0 && (
+										{recents.length + remoteList.length > 0 && (
 											<div className="recents">
 												<h4>Continue where you left off</h4>
+												{remoteList.slice(0, 4).map((r) => (
+													<div key={`remote:${r.name}`} className="recent">
+														<button className="recent-open" onClick={() => openSaved(r.name)}>
+															<span className="mono"><Globe size={12} /> {r.name}</span>
+															<span className="dim small">{hostOf(r.url)}</span>
+														</button>
+														<button className="ghost icon" title="Forget this connection" onClick={() => { if (confirm(`Forget the connection ${r.name}? The database itself is not touched.`)) { forgetRemote(r.name); setRemoteList(remotes()); } }}>×</button>
+													</div>
+												))}
 												{recents.slice(0, 6).map((r) => (
 													<div key={r.name} className="recent">
 														<button className="recent-open" onClick={() => openSaved(r.name)}>
@@ -748,6 +801,9 @@ export default function App() {
 											</button>
 											<button className="start" onClick={() => openDatabase("untitled.musq")}>
 												<span className="si">＋</span><b>Start empty</b><span className="dim small">a new database</span>
+											</button>
+											<button className="start" onClick={() => setConnecting({})}>
+												<span className="si"><Globe size={18} /></span><b>Connect to a remote database…</b><span className="dim small">a libSQL or Hrana URL and a token</span>
 											</button>
 										</div>
 									</>
@@ -785,6 +841,7 @@ export default function App() {
 						}
 					}} />
 				)}
+				{connecting && <ConnectDrawer initial={connecting} taken={(n) => n !== connecting.name && (!!remoteNamed(n) || recents.some((r) => r.name === n))} onConnect={connectRemote} onClose={() => setConnecting(null)} />}
 				{palette && <Palette commands={commands} onClose={() => setPalette(false)} />}
 				{keys && <Shortcuts onClose={() => setKeys(false)} />}
 				{ctxMenu}
