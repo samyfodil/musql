@@ -3,6 +3,7 @@ import { call, ident, query, ready, rows } from "./db.js";
 import { fmt } from "./values.js";
 import { Studio } from "./studio.js";
 import TableView from "./components/TableView.jsx";
+import { BusyBar, Spinner } from "./components/Busy.jsx";
 import { ImportDialog, TableDialog } from "./components/Dialogs.jsx";
 import { SAMPLE } from "./sample.js";
 import { saved, unsave } from "./library.js";
@@ -10,6 +11,7 @@ import { isStudioTable } from "./vectors.js";
 
 // The editor (CodeMirror) loads with the first query tab, not with the page.
 const QueryView = lazy(() => import("./components/QueryView.jsx"));
+const Diagram = lazy(() => import("./components/Diagram.jsx"));
 
 // The tables a virtual table keeps its data in, by module: listed only on
 // request, as the sqlite3 shell's .tables leaves them out too.
@@ -34,10 +36,10 @@ function internalNames(schema) {
 	return out;
 }
 
-const ICON = { table: "▦", view: "◇", index: "⋮", trigger: "ϟ", query: "›_" };
+const ICON = { table: "▦", view: "◇", index: "⋮", trigger: "ϟ", query: "›_", diagram: "⌗" };
 const GROUP = { table: "Tables", view: "Views", index: "Indexes", trigger: "Triggers" };
 
-const THEMES = { system: "◐", light: "☀", dark: "☾" };
+const THEMES = { system: "Auto", light: "☀", dark: "☾" };
 
 // useTheme is the chosen theme (kept in this browser) and whether the page is
 // dark: the system's choice unless one is picked.
@@ -68,7 +70,6 @@ function useTheme() {
 	return [theme, setTheme, theme === "dark" || (theme === "system" && systemDark)];
 }
 
-let tabSeq = 0;
 let querySeq = 0;
 
 export default function App() {
@@ -138,18 +139,19 @@ export default function App() {
 
 	function openTab(tab) {
 		setTabs((ts) => {
-			const have = tab.table && ts.find((t) => t.table === tab.table);
+			const have = (tab.table && ts.find((t) => t.table === tab.table)) || (tab.kind === "diagram" && ts.find((t) => t.kind === "diagram"));
 			if (have) {
 				setActive(have.id);
 				return ts.map((t) => (t === have ? { ...t, mode: tab.mode ?? t.mode } : t));
 			}
-			const t = { id: ++tabSeq, ...tab };
+			const t = { id: crypto.randomUUID(), ...tab };
 			setActive(t.id);
 			return [...ts, t];
 		});
 	}
 	const openTable = (name, mode = "data") => openTab({ kind: "table", table: name, title: name, mode });
 	const openQuery = (text = "", title = `Query ${++querySeq}`) => openTab({ kind: "query", title, text });
+	const openDiagram = () => openTab({ kind: "diagram", title: "Diagram" });
 	const retitle = (id, title) => setTabs((ts) => ts.map((t) => (t.id === id ? { ...t, title } : t)));
 
 	function closeTab(id) {
@@ -255,6 +257,7 @@ export default function App() {
 					openFile(e.dataTransfer.files[0]);
 				}}
 			>
+				<BusyBar />
 				<header className="bar">
 					<button className="menubtn ghost" title="Tables and saved queries" onClick={(e) => { e.stopPropagation(); setSideOpen(!sideOpen); }}>☰</button>
 					<div className="brand"><span className="logo">μ</span>musql <span className="dim">studio</span></div>
@@ -286,6 +289,7 @@ export default function App() {
 							<button className="newquery" disabled={!dbName} onClick={() => openQuery()}>＋ Query</button>
 							<button className="newquery" disabled={!dbName} onClick={() => setDialog("table")}>＋ Table</button>
 							<button className="newquery" disabled={!dbName} title="Import a CSV or JSON file into a table" onClick={() => setDialog("import")}>Import…</button>
+							<button className="newquery" disabled={!dbName} title="The tables and their foreign keys, as a diagram" onClick={openDiagram}>⌗ Diagram</button>
 						</div>
 						<nav>
 							{["table", "view", "index", "trigger"].map((type) => {
@@ -338,7 +342,7 @@ export default function App() {
 						<div className="tabs">
 							{tabs.map((t) => (
 								<div key={t.id} className={`tab${t.id === active ? " active" : ""}`} onClick={() => setActive(t.id)} onAuxClick={(e) => e.button === 1 && closeTab(t.id)}>
-									<span className="ic">{t.kind === "query" ? ICON.query : ICON[schema.find((o) => o.name === t.table)?.type ?? "table"]}</span>
+									<span className="ic">{t.kind === "table" ? ICON[schema.find((o) => o.name === t.table)?.type ?? "table"] : ICON[t.kind]}</span>
 									{t.title}
 									<button className="x" title="Close" onClick={(e) => { e.stopPropagation(); closeTab(t.id); }}>×</button>
 								</div>
@@ -349,8 +353,12 @@ export default function App() {
 								<div key={t.id} className="pane" hidden={t.id !== active}>
 									{t.kind === "table" ? (
 										<TableView name={t.table} mode={t.mode} />
+									) : t.kind === "diagram" ? (
+										<Suspense fallback={<Spinner label="Loading the diagram…" />}>
+											<Diagram onOpen={(name) => openTable(name)} />
+										</Suspense>
 									) : (
-										<Suspense fallback={<p className="dim pad">Loading the editor…</p>}>
+										<Suspense fallback={<Spinner label="Loading the editor…" />}>
 											<QueryView initial={t.text} title={t.title} onTitle={(title) => retitle(t.id, title)} />
 										</Suspense>
 									)}
