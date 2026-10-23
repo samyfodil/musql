@@ -57,7 +57,7 @@ func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) 
 		store.Close()
 		return nil, err
 	}
-	if s.provider, err = oidc.New(ctx, store, cfg.PublicURL); err != nil {
+	if s.provider, err = oidc.New(ctx, store, cfg.PublicURL, oidc.WithConsoleOrigins(cfg.Console.CORSOrigins)); err != nil {
 		store.Close()
 		return nil, err
 	}
@@ -132,14 +132,18 @@ func (s *Server) routes() http.Handler {
 	return s.cors(mux)
 }
 
-// cors lets the configured origins call the API and Hrana from a browser.
+// oidcCORSPaths are the OIDC endpoints a console on another origin calls.
+var oidcCORSPaths = []string{"/oidc/token", "/oidc/userinfo", "/oidc/logout", "/oidc/revoke"}
+
+// cors lets the configured origins call the API, Hrana and the OIDC token
+// endpoints from a browser.
 // Credentials travel in the Authorization header, never in cookies, so no
 // cookie-bearing request is allowed across origins.
 func (s *Server) cors(next http.Handler) http.Handler {
 	origins := s.cfg.Console.CORSOrigins
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		api := strings.HasPrefix(r.URL.Path, "/cloud.v1.") || strings.HasPrefix(r.URL.Path, "/db/")
+		api := strings.HasPrefix(r.URL.Path, "/cloud.v1.") || strings.HasPrefix(r.URL.Path, "/db/") || slices.Contains(oidcCORSPaths, r.URL.Path)
 		if origin != "" && api && (slices.Contains(origins, "*") || slices.Contains(origins, origin)) {
 			h := w.Header()
 			h.Set("Access-Control-Allow-Origin", origin)
