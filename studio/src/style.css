@@ -434,3 +434,32 @@ button:focus-visible, .button:focus-visible, input:focus-visible, select:focus-v
 .sidebtns { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
 .sidebtns .newquery { white-space: nowrap; }
 .theme { font-size: 12px; min-width: 42px; }
+
+/* menus, filter bar, selection */
+.ctxmenu { position: fixed; z-index: 50; min-width: 200px; padding: 4px; display: grid; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 10px 30px rgb(0 0 0 / .18); }
+.ctxmenu button { border: 0; border-radius: 5px; background: transparent; text-align: left; display: flex; justify-content: space-between; gap: 18px; padding: 5px 10px; }
+.ctxmenu button:hover:not(:disabled) { background: var(--accent-soft); color: var(--accent); }
+.ctxmenu .danger-item { color: var(--err); }
+.ctxmenu .sep { height: 1px; background: var(--line); margin: 4px 2px; }
+.filterbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 6px 10px; border-bottom: 1px solid var(--line); background: var(--bg); min-height: 38px; }
+.filterbar .grow { flex: 1; }
+.filterbar .flabel { font: 600 11px var(--mono); color: var(--dim); }
+.addfilter { color: var(--dim); padding: 3px 8px; }
+.addfilter:hover { color: var(--text); }
+.ficon { font-size: 10px; }
+.fchip { display: inline-flex; align-items: center; gap: 2px; padding: 2px 2px 2px 4px; border: 1px solid var(--accent); border-radius: 7px; background: var(--accent-soft); }
+.fchip select, .fchip input { font: 12px var(--mono); border: 0; background: transparent; color: inherit; padding: 3px 4px; outline: none; }
+.fchip input { width: 120px; border-bottom: 1px dashed var(--dim); }
+.fchip .x { padding: 0 5px; }
+.selbar { display: inline-flex; align-items: center; gap: 6px; padding: 2px 4px 2px 10px; border-radius: 7px; background: var(--sel); font-size: 12px; }
+.selbar button.danger { padding: 2px 9px; }
+.grid td.rn.pickable { cursor: pointer; white-space: nowrap; }
+.grid td.rn input { display: none; margin: 0 4px 0 0; vertical-align: -2px; pointer-events: none; }
+.grid tr:hover td.rn.pickable input, .grid tr.picked td.rn input { display: inline-block; }
+.grid tr:hover td.rn.pickable span, .grid tr.picked td.rn span { display: none; }
+.emptyrows { padding: 40px 20px; display: grid; justify-items: center; gap: 10px; }
+.emptyrows p { margin: 0; }
+.clickrows tbody tr { cursor: pointer; }
+.clickrows tbody tr:hover td { background: var(--accent-soft); }
+.addcol { margin-top: 8px; }
+.sidebtns { grid-template-columns: 1fr auto; }

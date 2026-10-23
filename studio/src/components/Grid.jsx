@@ -9,11 +9,12 @@ import { isVectorColumn, show } from "../values.js";
  *   picked      the selected row indexes, and onPick(i) to toggle one
  *   onEdit      (i, column, text) => Promise; makes cells editable by double-click
  *   start       the number of the first row
+ *   onContextMenu (event, i, column, startEdit) for a right-click on a cell
  *
  * A click or the arrow keys move the current cell; Enter or F2 edits it,
  * Space selects its row, and Ctrl/Cmd+C copies its value.
  */
-export default function Grid({ columns, rows, types, sort, desc, onSort, picked, onPick, onEdit, start = 0 }) {
+export default function Grid({ columns, rows, types, sort, desc, onSort, picked, onPick, onEdit, onContextMenu, start = 0 }) {
 	const [editing, setEditing] = useState(null); // [row, col]
 	const [cur, setCur] = useState(null); // [row, col]
 	const table = useRef(null);
@@ -80,7 +81,10 @@ export default function Grid({ columns, rows, types, sort, desc, onSort, picked,
 			<tbody>
 				{rows.map((row, i) => (
 					<tr key={start + i} className={picked?.has(i) ? "picked" : ""}>
-						<td className="rn" onClick={onPick && (() => onPick(i))}>{start + i + 1}</td>
+						<td className={`rn${onPick ? " pickable" : ""}`} title={onPick ? "Click to select this row" : undefined} onClick={onPick && (() => onPick(i))}>
+							{onPick && <input type="checkbox" tabIndex={-1} checked={!!picked?.has(i)} readOnly />}
+							<span>{start + i + 1}</span>
+						</td>
 						{row.map((v, j) =>
 							editing?.[0] === i && editing?.[1] === j ? (
 								<EditCell key={j} value={v} onDone={async (save, value) => {
@@ -89,7 +93,7 @@ export default function Grid({ columns, rows, types, sort, desc, onSort, picked,
 									table.current?.focus();
 								}} />
 							) : (
-								<Cell key={j} v={v} vector={vector[j]} cur={cur?.[0] === i && cur?.[1] === j} onClick={() => setCur([i, j])} onDoubleClick={onEdit && (() => setEditing([i, j]))} />
+								<Cell key={j} v={v} vector={vector[j]} cur={cur?.[0] === i && cur?.[1] === j} onClick={() => setCur([i, j])} onDoubleClick={onEdit && (() => setEditing([i, j]))} onContextMenu={onContextMenu && ((e) => { setCur([i, j]); onContextMenu(e, i, columns[j], () => setEditing([i, j])); })} />
 							),
 						)}
 					</tr>
@@ -99,10 +103,10 @@ export default function Grid({ columns, rows, types, sort, desc, onSort, picked,
 	);
 }
 
-function Cell({ v, vector, cur, onClick, onDoubleClick }) {
+function Cell({ v, vector, cur, onClick, onDoubleClick, onContextMenu }) {
 	const { text, cls, title } = show(v, vector);
 	return (
-		<td className={cur ? `${cls ?? ""} cur` : cls} title={title} onClick={onClick} onDoubleClick={onDoubleClick}>
+		<td className={cur ? `${cls ?? ""} cur` : cls} title={title} onClick={onClick} onDoubleClick={onDoubleClick} onContextMenu={onContextMenu}>
 			{text}
 		</td>
 	);

@@ -5,6 +5,8 @@ import { useStudio } from "../studio.js";
 import Grid from "./Grid.jsx";
 import { Spinner } from "./Busy.jsx";
 import Chart from "./Chart.jsx";
+import FilterBar, { whereOf } from "./FilterBar.jsx";
+import { MenuButton, useContextMenu } from "./Menu.jsx";
 import RowDialog from "./RowDialog.jsx";
 import { DEFAULT_MODEL, MODELS, setEmbedProgress } from "../embed.js";
 import { embeddingsOf, fillMissing, missingCount, search, searchVec1, setUpEmbedding } from "../vectors.js";
@@ -13,12 +15,12 @@ const PAGE = 100;
 
 /** One table or view: its rows a page at a time, editable, and its structure. */
 export default function TableView({ name, mode: initialMode = "data" }) {
-	const { schema, status, changed } = useStudio();
+	const { schema, status, changed, editTable, openQuery } = useStudio();
 	const obj = schema.find((o) => o.name === name);
 	const [mode, setMode] = useState(initialMode);
 	const [cols, setCols] = useState([]);
-	const [where, setWhere] = useState("");
-	const [draft, setDraft] = useState("");
+	const [filt, setFilt] = useState({ filters: [], sql: "" }); // the menus' conditions, or a typed WHERE
+	const [menu, openMenu] = useContextMenu();
 	const [sort, setSort] = useState(null);
 	const [desc, setDesc] = useState(false);
 	const [offset, setOffset] = useState(0);
@@ -52,6 +54,9 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 	const keyed = !view && keyCols.length > 0;
 	const editable = keyed && !virtual;
 	const emb = embs[embIdx] ?? null;
+	const built = useMemo(() => whereOf(filt.filters, Object.fromEntries(cols.map((c) => [c.name, c.type]))), [filt, cols]);
+	const where = filt.sql || built.sql;
+	const whereParams = filt.sql ? [] : built.params;
 
 	const loadCols = useCallback(async () => {
 		try {
@@ -98,12 +103,13 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 			return;
 		}
 		const filter = where ? ` WHERE ${where}` : "";
+		const fp = whereParams;
 		const order = sort ? ` ORDER BY ${ident(sort)}${desc ? " DESC" : ""}` : "";
 		const key = keyed ? keyCols.map((k, i) => `${ident(k)} AS "__k${i}"`).join(", ") + ", " : "";
 		try {
 			const t = performance.now();
-			const n = (await query(`SELECT count(*) FROM ${ident(name)}${filter}`)).rows[0][0];
-			const r = await query(`SELECT ${key}* FROM ${ident(name)}${filter}${order} LIMIT ${PAGE} OFFSET ${offset}`);
+			const n = (await query(`SELECT count(*) FROM ${ident(name)}${filter}`, fp)).rows[0][0];
+			const r = await query(`SELECT ${key}* FROM ${ident(name)}${filter}${order} LIMIT ${PAGE} OFFSET ${offset}`, fp);
 			setTotal(Number(n));
 			setData(r);
 			setError(null);
@@ -113,7 +119,7 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 			setError(e.message);
 			status(e.message, true);
 		}
-	}, [name, where, sort, desc, offset, keyed, keyCols.join("\0"), semantic, emb, vec1, vec1Model]);
+	}, [name, where, JSON.stringify(whereParams), sort, desc, offset, keyed, keyCols.join("\0"), semantic, emb, vec1, vec1Model]);
 
 	useEffect(() => {
 		if (cols.length || view) load();
@@ -220,7 +226,7 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 		try {
 			const r = searching
 				? data
-				: await query(`SELECT * FROM ${ident(name)}${where ? ` WHERE ${where}` : ""}${sort ? ` ORDER BY ${ident(sort)}${desc ? " DESC" : ""}` : ""}`);
+				: await query(`SELECT * FROM ${ident(name)}${where ? ` WHERE ${where}` : ""}${sort ? ` ORDER BY ${ident(sort)}${desc ? " DESC" : ""}` : ""}`, whereParams);
 			const cs = searching ? shown : r.columns;
 			const rs = searching ? body : r.rows;
 			download(`${name}.${kind}`, kind === "csv" ? toCSV(cs, rs) : toJSON(cs, rs), kind === "csv" ? "text/csv" : "application/json");
@@ -233,6 +239,34 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 	const canSearch = vec1 || (emb && emb.model);
 	const runSearch = (text) => setSemantic(text.trim() ? { text: text.trim(), keywords } : null);
 
+	function togglePick(i) {
+		const p = new Set(picked);
+		p.has(i) ? p.delete(i) : p.add(i);
+		setPicked(p);
+	}
+
+	// cellMenu is a right-click on a cell: edit it, copy it, filter by it, or
+	// select or delete its row.
+	function cellMenu(i, col, startEdit) {
+		const v = body[i][shown.indexOf(col)];
+		const text = v === null ? null : v instanceof Uint8Array ? null : String(v);
+		const by = (op) => setFilt({ filters: [...filt.filters, { col, op, value: text ?? "" }], sql: "" });
+		return [
+			editable && !searching && { label: "Edit cell", hint: "Enter", onClick: startEdit },
+			editable && !searching && v !== null && { label: "Set to NULL", onClick: () => write(`UPDATE ${ident(name)} SET ${ident(col)} = NULL WHERE ${keyWhere}`, keyOf(i), `Set ${col} to NULL.`) },
+			{ label: "Copy value", hint: "⌘C", onClick: () => navigator.clipboard?.writeText(text ?? "NULL") },
+			{ label: "Copy row as JSON", onClick: () => navigator.clipboard?.writeText(JSON.stringify(Object.fromEntries(shown.map((c, j) => [c, typeof body[i][j] === "bigint" ? String(body[i][j]) : body[i][j] instanceof Uint8Array ? null : body[i][j]])))) },
+			"-",
+			!searching && cols.some((c) => c.name === col) && (v === null
+				? { label: `Filter: ${col} is empty`, onClick: () => by("null") }
+				: text !== null && { label: `Filter: ${col} = ${text.length > 24 ? text.slice(0, 24) + "…" : text}`, onClick: () => by("=") }),
+			!searching && text !== null && cols.some((c) => c.name === col) && { label: `Filter: ${col} ≠ this`, onClick: () => by("!=") },
+			keyed && !searching && "-",
+			keyed && !searching && { label: picked.has(i) ? "Unselect row" : "Select row", hint: "Space", onClick: () => togglePick(i) },
+			editable && !searching && { label: "Delete row", danger: true, onClick: () => confirm(`Delete this row from ${name}?`) && write(`DELETE FROM ${ident(name)} WHERE ${keyWhere}`, keyOf(i), "Deleted a row.") },
+		];
+	}
+
 	if (!obj) return <div className="empty"><p className="dim">{name} no longer exists.</p></div>;
 	const last = Math.min(offset + PAGE, total);
 
@@ -240,69 +274,75 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 		<>
 			<div className="toolbar">
 				<div className="seg">
-					<button className={mode === "data" ? "on" : ""} onClick={() => setMode("data")}>Data</button>
-					<button className={mode === "chart" ? "on" : ""} title="This page of rows as a chart" onClick={() => setMode("chart")}>Chart</button>
-					<button className={mode === "structure" ? "on" : ""} onClick={() => setMode("structure")}>Structure</button>
+					<button className={mode === "data" ? "on" : ""} onClick={() => setMode("data")}>▦ Data</button>
+					<button className={mode === "chart" ? "on" : ""} title="This page of rows as a chart" onClick={() => setMode("chart")}>▤ Chart</button>
+					<button className={mode === "structure" ? "on" : ""} title="Columns, keys, indexes and the definition" onClick={() => setMode("structure")}>⚙ Structure</button>
 				</div>
-				{mode === "data" && (
+				{mode === "data" && canSearch && (
 					<>
+						{embs.length > 1 && (
+							<select title="The vector column searched" value={embIdx} onChange={(e) => { setEmbIdx(Number(e.target.value)); setSemantic(null); }}>
+								{embs.map((e, i) => <option key={e.vec} value={i}>{e.vec}</option>)}
+							</select>
+						)}
+						{vec1 && (
+							<select title="The model a search's text is embedded with: the one the table's vectors came from" value={vec1Model} onChange={(e) => setVec1Model(e.target.value)}>
+								{Object.entries(MODELS).map(([k, m]) => <option key={k} value={k}>{m.name}</option>)}
+							</select>
+						)}
 						<input
-							className="where"
-							placeholder="WHERE …   e.g. plays > 50000 AND title LIKE 'Track 1%'"
+							className="where semantic"
+							placeholder={`✦ Search ${vec1 ? name : emb.src ?? emb.vec} by meaning…`}
 							spellCheck={false}
-							value={draft}
-							onChange={(e) => setDraft(e.target.value)}
+							value={semDraft}
+							onChange={(e) => setSemDraft(e.target.value)}
 							onKeyDown={(e) => {
-								if (e.key === "Enter") {
-									setOffset(0);
-									setWhere(draft.trim());
-								}
+								if (e.key === "Enter") runSearch(semDraft);
+								if (e.key === "Escape") { setSemDraft(""); setSemantic(null); }
 							}}
 						/>
-						{canSearch && (
-							<>
-								{embs.length > 1 && (
-									<select title="The vector column searched" value={embIdx} onChange={(e) => { setEmbIdx(Number(e.target.value)); setSemantic(null); }}>
-										{embs.map((e, i) => <option key={e.vec} value={i}>{e.vec}</option>)}
-									</select>
-								)}
-								{vec1 && (
-									<select title="The model a search's text is embedded with: the one the table's vectors came from" value={vec1Model} onChange={(e) => setVec1Model(e.target.value)}>
-										{Object.entries(MODELS).map(([k, m]) => <option key={k} value={k}>{m.name}</option>)}
-									</select>
-								)}
-								<input
-									className="where semantic"
-									placeholder={`✦ Search ${vec1 ? name : emb.src ?? emb.vec} by meaning…`}
-									spellCheck={false}
-									value={semDraft}
-									onChange={(e) => setSemDraft(e.target.value)}
-									onKeyDown={(e) => {
-										if (e.key === "Enter") runSearch(semDraft);
-										if (e.key === "Escape") { setSemDraft(""); setSemantic(null); }
-									}}
-								/>
-								{emb?.fts && (
-									<label className="check" title="Rank by the words too, through the full-text index">
-										<input type="checkbox" checked={keywords} onChange={(e) => { setKeywords(e.target.checked); if (semantic) setSemantic({ ...semantic, keywords: e.target.checked }); }} />
-										keywords
-									</label>
-								)}
-							</>
+						{emb?.fts && (
+							<label className="check" title="Rank by the words too, through the full-text index">
+								<input type="checkbox" checked={keywords} onChange={(e) => { setKeywords(e.target.checked); if (semantic) setSemantic({ ...semantic, keywords: e.target.checked }); }} />
+								keywords
+							</label>
 						)}
 						{semantic && <button title="Back to the table" onClick={() => { setSemDraft(""); setSemantic(null); }}>✕ Search</button>}
-						{missing > 0 && emb?.model && (
-							<button className="warn" title={`${fmt(missing)} rows of ${emb.src} have no vector yet (new, or their text changed)`} onClick={() => fill()}>
-								✦ Embed {fmt(missing)} new
-							</button>
-						)}
-						<button title="Reload" onClick={load}>↻</button>
-						<button disabled={!editable || withoutRowid || !textCols.length} title="Embed a text column for semantic search" onClick={() => setEmbedding(true)}>✦ Embed…</button>
-						<button disabled={!editable} onClick={() => setAdding(true)}>＋ Row</button>
-						<button disabled={!picked.size} onClick={remove}>{picked.size ? `Delete ${picked.size}` : "Delete"}</button>
 					</>
 				)}
+				<span className="grow" />
+				{mode === "data" && missing > 0 && emb?.model && (
+					<button className="warn" title={`${fmt(missing)} rows of ${emb.src} have no vector yet (new, or their text changed)`} onClick={() => fill()}>
+						✦ Embed {fmt(missing)} new
+					</button>
+				)}
+				{mode === "data" && picked.size > 0 && (
+					<span className="selbar">
+						{picked.size} selected
+						<button className="danger" onClick={remove}>Delete</button>
+						<button className="link" onClick={() => setPicked(new Set())}>clear</button>
+					</span>
+				)}
+				{editable && mode !== "structure" && <button className="primary" onClick={() => setAdding(true)}>＋ Row</button>}
+				{editable && mode === "structure" && <button className="primary" onClick={() => editTable(name)}>Edit table…</button>}
+				<button className="ghost" title="Reload" onClick={load}>↻</button>
+				<MenuButton
+					className="ghost"
+					label="⋯"
+					title="More"
+					items={[
+						editable && { label: "Edit table…", hint: "columns, keys", onClick: () => editTable(name) },
+						{ label: "Query this table", onClick: () => openQuery(`SELECT * FROM ${ident(name)}${where && !whereParams.length ? ` WHERE ${where}` : ""}\nLIMIT 100;`, name) },
+						editable && !withoutRowid && textCols.length > 0 && { label: "✦ Search by meaning…", hint: "embed a column", onClick: () => setEmbedding(true) },
+						"-",
+						{ label: "Download CSV", hint: "all filtered rows", onClick: () => exportRows("csv") },
+						{ label: "Download JSON", hint: "all filtered rows", onClick: () => exportRows("json") },
+					]}
+				/>
 			</div>
+			{mode === "data" && !searching && (
+				<FilterBar key={name} columns={cols.map((c) => c.name)} filters={filt.filters} sql={filt.sql} onApply={(f) => { setOffset(0); setFilt({ filters: f.filters ?? [], sql: f.sql ?? "" }); }} />
+			)}
 			{mode === "chart" ? (
 				<div className="gridwrap">{data ? <Chart key={name + offset} columns={shown} rows={body} /> : <Spinner />}</div>
 			) : mode === "data" ? (
@@ -326,23 +366,23 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 										setSort(c);
 									}}
 									picked={picked}
-									onPick={keyed && !searching ? (i) => {
-										const p = new Set(picked);
-										p.has(i) ? p.delete(i) : p.add(i);
-										setPicked(p);
-									} : undefined}
+									onPick={keyed && !searching ? togglePick : undefined}
 									onEdit={editable && !searching ? edit : undefined}
+									onContextMenu={(e, i, col, startEdit) => openMenu(e, cellMenu(i, col, startEdit))}
 								/>
-								{!body.length && <p className="dim pad">{where ? "No rows match." : "No rows."}</p>}
+								{!body.length && (
+									<div className="emptyrows">
+										<p className="dim">{where ? "No rows match the filter." : `${name} has no rows yet.`}</p>
+										{where ? <button onClick={() => setFilt({ filters: [], sql: "" })}>Clear the filter</button> : editable && <button className="primary" onClick={() => setAdding(true)}>＋ Add the first row</button>}
+									</div>
+								)}
 							</>
 						)}
 					</div>
 					<div className="pager">
-						<span>{searching ? `${fmt(total)} closest` : total ? `${fmt(offset + 1)}–${fmt(last)} of ${fmt(total)}` : "0 rows"}</span>
+						<span>{searching ? `${fmt(total)} closest` : total ? `${fmt(offset + 1)}–${fmt(last)} of ${fmt(total)}${where ? " matching" : ""}` : "0 rows"}</span>
 						<span className="grow" />
-						<span className="small">{searching ? "Closest first" : editable ? "Double-click or Enter edits a cell · # or Space selects a row · arrows move" : view ? "Views are read-only" : ""}</span>
-						<button title="Download the rows shown (all pages) as CSV" onClick={() => exportRows("csv")}>CSV</button>
-						<button title="Download the rows shown (all pages) as JSON" onClick={() => exportRows("json")}>JSON</button>
+						<span className="small">{searching ? "Closest first" : editable ? "Double-click to edit · right-click for more" : view ? "Views are read-only" : ""}</span>
 						{!searching && <button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - PAGE))}>‹ Prev</button>}
 						{!searching && <button disabled={last >= total} onClick={() => setOffset(offset + PAGE)}>Next ›</button>}
 					</div>
@@ -350,6 +390,7 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 			) : (
 				<Structure name={name} obj={obj} cols={cols} schema={schema} editable={editable} onChanged={() => { changed(name); loadCols(); }} />
 			)}
+			{menu}
 			{adding && <RowDialog name={name} cols={cols} onClose={insert} />}
 			{embedding && <EmbedDialog name={name} textCols={textCols} embs={embs} onClose={embedColumn} />}
 		</>
@@ -413,7 +454,6 @@ function EmbedDialog({ name, textCols, embs, onClose }) {
 function Structure({ name, obj, cols, schema, editable, onChanged }) {
 	const { status, editTable, openQuery } = useStudio();
 	const [fks, setFks] = useState([]);
-	const [newCol, setNewCol] = useState({ name: "", type: "TEXT" });
 	const [newIdx, setNewIdx] = useState({ cols: [], unique: false, name: "" });
 	useEffect(() => {
 		rowsOf(`PRAGMA foreign_key_list(${ident(name)})`).then(setFks, () => setFks([]));
@@ -432,60 +472,37 @@ function Structure({ name, obj, cols, schema, editable, onChanged }) {
 			return false;
 		}
 	}
-	const renameCol = (c) => {
-		const to = prompt(`Rename column ${c} to:`, c);
-		if (to && to !== c) change(`ALTER TABLE ${ident(name)} RENAME COLUMN ${ident(c)} TO ${ident(to)}`, `Renamed ${c} to ${to}.`);
-	};
-	const dropCol = (c) => confirm(`Drop column ${c} of ${name}? Its values are lost.`) && change(`ALTER TABLE ${ident(name)} DROP COLUMN ${ident(c)}`, `Dropped ${c}.`);
 
 	return (
 		<div className="structure">
 			<section>
 				<div className="sechead">
 					<h4>Columns</h4>
-					{editable && <button className="primary" title="Change columns, types, keys, defaults and foreign keys" onClick={() => editTable(name)}>Edit table…</button>}
+					{editable && <span className="dim small">Click a column to change it, or add one</span>}
 				</div>
-				<table className="grid">
-					<thead><tr><th /><th>name</th><th>type</th><th>not null</th><th>default</th>{editable && <th />}</tr></thead>
+				<table className={`grid${editable ? " clickrows" : ""}`}>
+					<thead><tr><th /><th>name</th><th>type</th><th>not null</th><th>default</th><th>references</th></tr></thead>
 					<tbody>
-						{cols.map((c) => (
-							<tr key={c.cid}>
-								<td>{c.pk ? <span className="tag">PK</span> : ""}</td>
-								<td>{c.name}</td>
-								<td className="dim">{c.type || "—"}</td>
-								<td>{c.notnull ? "yes" : ""}</td>
-								<td className={show(c.dflt_value).cls}>{show(c.dflt_value).text}</td>
-								{editable && (
-									<td className="rowactions">
-										<button className="link" onClick={() => renameCol(c.name)}>rename</button>
-										{!c.pk && <button className="link" onClick={() => dropCol(c.name)}>drop</button>}
-									</td>
-								)}
-							</tr>
-						))}
+						{cols.map((c) => {
+							const fk = fks.find((f) => f.from === c.name);
+							return (
+								<tr key={c.cid} onClick={editable ? () => editTable(name) : undefined} title={editable ? "Edit the table" : undefined}>
+									<td>{c.pk ? <span className="tag">PK</span> : ""}</td>
+									<td>{c.name}</td>
+									<td className="dim">{c.type || "—"}</td>
+									<td>{c.notnull ? "yes" : ""}</td>
+									<td className={show(c.dflt_value).cls}>{show(c.dflt_value).text}</td>
+									<td className="dim">{fk ? `${fk.table}(${fk.to ?? "rowid"})${fk.on_delete !== "NO ACTION" ? " · on delete " + fk.on_delete.toLowerCase() : ""}` : ""}</td>
+								</tr>
+							);
+						})}
 					</tbody>
 				</table>
-				{editable && (
-					<form className="inline" onSubmit={async (e) => {
-						e.preventDefault();
-						if (newCol.name && await change(`ALTER TABLE ${ident(name)} ADD COLUMN ${ident(newCol.name)} ${newCol.type}`, `Added ${newCol.name}.`)) setNewCol({ name: "", type: newCol.type });
-					}}>
-						<input placeholder="new column" spellCheck={false} value={newCol.name} onChange={(e) => setNewCol({ ...newCol, name: e.target.value })} />
-						<TypeInput value={newCol.type} onChange={(type) => setNewCol({ ...newCol, type })} />
-						<button type="submit" disabled={!newCol.name}>＋ Column</button>
-					</form>
-				)}
+				{editable && <button className="addcol" onClick={() => editTable(name)}>＋ Add a column…</button>}
 			</section>
-			{fks.length > 0 && (
-				<section>
-					<h4>Foreign keys</h4>
-					<pre className="ddl">
-						{fks.map((f) => `${f.from} → ${f.table}(${f.to ?? "rowid"})${f.on_delete !== "NO ACTION" ? " ON DELETE " + f.on_delete : ""}`).join("\n")}
-					</pre>
-				</section>
-			)}
 			<section>
 				<h4>Indexes and triggers</h4>
+				{!related.length && <p className="dim small">No indexes or triggers. An index speeds up filters and joins on its columns.</p>}
 				{related.length > 0 && <pre className="ddl">{related.map((o) => o.sql ?? `-- ${o.name} (automatic)`).join(";\n\n")}</pre>}
 				{related.filter((o) => o.sql && (o.type === "index" || o.type === "trigger")).map((o) => (
 					<div key={o.name} className="inline objrow">
@@ -504,6 +521,7 @@ function Structure({ name, obj, cols, schema, editable, onChanged }) {
 						const idx = newIdx.name.trim() || `${name}_${newIdx.cols.join("_")}_idx`;
 						if (await change(`CREATE ${newIdx.unique ? "UNIQUE " : ""}INDEX ${ident(idx)} ON ${ident(name)}(${newIdx.cols.map(ident).join(", ")})`, `Created ${idx}.`)) setNewIdx({ cols: [], unique: false, name: "" });
 					}}>
+						<span className="small dim" title="Ctrl/⌘-click to pick several columns, in order">New index on</span>
 						<select multiple size={Math.min(4, cols.length)} value={newIdx.cols} onChange={(e) => setNewIdx({ ...newIdx, cols: [...e.target.selectedOptions].map((o) => o.value) })}>
 							{cols.map((c) => <option key={c.name}>{c.name}</option>)}
 						</select>
@@ -518,10 +536,6 @@ function Structure({ name, obj, cols, schema, editable, onChanged }) {
 				<pre className="ddl">{obj.sql};</pre>
 				{(table || obj.type === "view") && (
 					<div className="inline">
-						{table && <button onClick={() => {
-							const to = prompt(`Rename table ${name} to:`, name);
-							if (to && to !== name) change(`ALTER TABLE ${ident(name)} RENAME TO ${ident(to)}`, `Renamed ${name} to ${to}.`);
-						}}>Rename…</button>}
 						{obj.type === "view" && <button onClick={() => openQuery(`DROP VIEW ${ident(name)};\n${obj.sql};\n`, `Edit ${name}`)}>Edit as SQL…</button>}
 						<button className="danger" onClick={() => confirm(`Drop ${obj.type} ${name}? This cannot be undone.`) && change(`DROP ${obj.type.toUpperCase()} ${ident(name)}`, `Dropped ${name}.`)}>Drop {obj.type}</button>
 					</div>
