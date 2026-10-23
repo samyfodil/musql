@@ -37,8 +37,7 @@ admin:
 node:
   name: "node-1"
   location: "fra"          # this node's location code
-peers: []                  # other nodes: {name, location, url, secret}
-primary: ""                # the primary node's name; this node when empty
+peers: []                  # a cluster's other nodes: {name, location, addrs, peer_id}
 ai:
   provider: "jitllm"       # jitllm | openai | anthropic | openrouter | "" (off)
   model: "slm-sql-1.5b"    # provider's model name; for jitllm, a .jlm path or name in models_dir
@@ -86,9 +85,10 @@ The server is its own issuer at `public_url`:
 - **Organization**: name, slug. Every user has a personal org; admins create
   shared ones. **Members** have a role: `owner`, `admin`, `member`, `viewer`.
   Invites by email create a pending membership the user accepts on login.
-- **Group**: a set of locations a database is placed in; primary location is
-  the writer. Every org has a `default` group in the node's location.
-- **Database**: `org/name`, group, created_at, size, optional `parent` and
+- **Group**: a set of locations a database is placed in, and the type its
+  databases default to (`plain` standalone, `crdt` in a cluster). Every org
+  has a `default` group in the creating node's location.
+- **Database**: `org/name`, type (`plain` | `crdt` | `raft`), group, created_at, size, optional `parent` and
   `parent_at` (a branch), schema-only flag. Served over Hrana at
   `https://<public_url>/db/<org>/<name>` (and `wss://` for v3).
 - **Database token**: a JWT signed by the server, claims `db` (or `group`),
@@ -120,65 +120,154 @@ The server is its own issuer at `public_url`:
   into a new database (Turso's model) or in place.
 - **Branch**: a restore into a new database, at now or at T; schema-only
   recreates the parent's objects empty.
-- **Groups & regions**: see below.
+- **Standalone and cluster**: see below; a `crdt` database's history is its
+  node's.
 
-## Groups and regions
+## Deployments: standalone and cluster
 
-A deployment is one **primary** node and any number of **replica** nodes, one
-location each (`node.location`, and each entry of `peers`). The primary holds
-the state and writes every database; a group's primary location is therefore
-the primary node's (`GroupService.Create` declines another), and its other
-locations are replicas. `AddLocation` places every database of the group at
-that location; `RemoveLocation` takes them away. Nodes share one
-`public_url` (the deployment's, e.g. behind geo-routing): tokens are issued
-there and verified everywhere.
+A deployment is one node (**standalone**) or several (**cluster**). The config
+alone decides: no `peers` is standalone.
 
-A replica follows by shipping history records (`HISTORY.md`), never rows:
+### Standalone (the default)
 
-- **Transport**: `cloud.v1.PeerService.Follow` (ConnectRPC, server stream),
-  called with the two nodes' shared `secret` and the caller's node name. It
-  sends the records after the replica's last seq, or from the newest base
-  when that one is gone or the replica asks for 0; a base's record is
-  followed by its segment file and delta prefix in chunks. Then it sends
-  `live` and each record as it is logged; an idle stream repeats `live`
-  every 10s, and a replica that hears nothing for 30s calls again.
-- **The state** (`state.musq`) is followed the same way (database ID `""`).
-  A replica starts by catching up with it, opens it read-only, verifies
-  tokens with the keys in it (reloaded at each state record), and places
-  databases from it: every database whose group lists its location gets a
-  follower; one no longer listed, or deleted, is closed and its files and
-  history removed.
-- **Applying** (`store.History.Apply`): the record is appended to the
-  replica's own copy of the log (the same bytes), then applied under the
-  engine's write lock (`engine.ReplaceState`): a batch's bytes written at
-  their delta offset, or a base's files installed (old delta removed, segment
-  renamed in, delta prefix copied). A reader sees the state before a record
-  or after it, never between, and every held session re-checks at its next
-  statement. A batch must follow the last record applied; anything that does
-  not apply makes the next call start again from the newest base.
-- **Restarts**: a replica reopens its log and brings its file to the log's
-  end (rolling forward a record logged but not applied), then asks for what
-  follows. A restarted primary is just a closed stream: the replica calls
-  again. An in-place restore, a VACUUM or any rewrite on the primary is a new
-  base of the same history; a branch, a restore into a new database and a
-  create are new databases the state names.
-- **Serving**: a replica serves Hrana for a database placed there once it has
-  applied a base, on a read-only connection, as of its applied position.
-  `hrana.WithPrimary` decides per request: one whose statements are all
-  `SELECT` or `VALUES`, on no baton or a baton this replica issued, runs
-  there; anything else (a write, `BEGIN`, a `WITH`, a `PRAGMA`, stored SQL,
-  the primary's baton, a token the replica's state does not accept yet, every
-  WebSocket) goes to the primary whole. A database not placed there, not
-  caught up, or not yet in the replica's state goes to the primary too. The
-  management API, `/oidc/` and `/login` are proxied to the primary.
+With no `peers`, a node is the single server described above: no libp2p host
+is started and no node key is made, the state and every database are opened
+with the plain driver (no capture, so triggers, virtual tables and FTS,
+WITHOUT ROWID and rowids all work), and history is the physical log of
+`HISTORY.md`. Its databases are of type `plain`, the only type it accepts
+(`crdt` needs peers to replicate to and is declined).
 
-Declined, deliberately: a group written anywhere but the primary node
-(failover and per-group primaries need the state to move first); usage is
-counted by the primary only, so reads a replica serves are not in it.
+A standalone node does not join a cluster in place: declined for now. Its
+state and `plain` databases carry no replication bookkeeping and may hold what
+CRDT capture refuses, so turning them into replicated files is a migration of
+its own (export each database, check it against the limits below, upload it
+as a `crdt` database in the cluster). A cluster starts from nodes with a fresh
+`data_dir`.
+
+### Cluster
+
+```yaml
+node:
+  name: "fra-1"
+  location: "fra"
+  p2p_listen: ["/ip4/0.0.0.0/tcp/4001"]   # the default
+peers:
+  - name: "iad-1"
+    location: "iad"
+    addrs: ["/dns4/iad-1.example.com/tcp/4001"]
+    peer_id: "12D3KooW…"
+```
+
+- **Identity and transport**: each node has a libp2p key, made on its first
+  start as `data_dir/node.key` (`musql-cloud -peer-id` prints the ID to put
+  in the other nodes' `peers`). Nodes talk libp2p only, dialling the
+  configured multiaddrs and redialling a lost peer. A connection gater admits
+  only the configured peer IDs, in and out: the transport's handshake
+  authenticates the ID, so there is no shared secret. Replication runs over
+  `examples/libp2p` (`SyncWith`: one gossipsub router per node, one topic per
+  replicated file, `musql-cloud/state` and `musql-cloud/db/<id>`), wired in
+  `cloud/cluster`; the engine, driver and `replication/` never see libp2p.
+- **Every node serves everything it holds.** There is no primary, no control
+  node and no proxy: each node serves the management API, `/oidc/`, `/login`,
+  the console, and Hrana for every database placed at its location, from its
+  own files. `public_url` is the deployment's (behind geo-routing or a load
+  balancer); every node issues tokens for it.
+- **The state** (`state.musq`) is replicated with `replication` in CRDT mode
+  on every node: a write is local, and reaches the others in the background
+  (pushed at commit, anti-entropy every 2s).
+- **Databases** are typed (`type` on a database, defaulting to its group's):
+
+  | type | where | |
+  | --- | --- | --- |
+  | `plain` | standalone only | the full engine, physical history, one writer |
+  | `crdt` | cluster only | opened with `replication.CRDT()` on every node of its group's locations; every node accepts writes locally |
+  | `raft` | — | a known value, declined: "raft databases are not yet supported" |
+
+  Placement follows the state: every node runs a reconcile (at start, after
+  each state change, and every few seconds) that opens each `crdt` database
+  whose group lists its location and is not open yet (creating an empty file,
+  which syncs schema and rows from the peers), and closes and removes the
+  file and history of one no longer placed there, or deleted.
+  `AddLocation`/`RemoveLocation` are state writes like any other. A `crdt`
+  database's file stays open while placed (its sync runs in the background);
+  Hrana writes through the replicated `*sql.DB`. A database whose group does
+  not list this node's location answers 404 here, naming the locations it
+  lives in; nothing is forwarded.
+- **History is per node.** Each node logs its own file's physical history
+  (`cloud/store`), as standalone does: what that node's copy held, with its
+  replication bookkeeping. Restore and branch of a `crdt` database are
+  declined for now: a restored copy carries the node's site and op log, and
+  bringing it back into a replicated group is a replication operation of its
+  own (an op-log rewind), not a file copy. Export reads the local copy.
+
+#### What a `crdt` database refuses
+
+The limits are `replication/`'s, enforced by it when a statement commits, so a
+node never stores what it cannot replicate: the statement fails with an error
+and nothing diverges.
+
+- triggers;
+- virtual tables (FTS3/4/5, rtree, …);
+- `WITHOUT ROWID` tables;
+- a key column collated other than `BINARY`, and a `NULL` in a key column;
+- writes through any connection but the replicated one (Hrana's is it).
+
+And what CRDT means for the rest: constraints hold for each node's own
+writes; a merge may break a multi-column `CHECK` or orphan a child, and a
+`UNIQUE` value written on two nodes at once is kept by the newer row (the
+other is held out until the value frees). An upload into a `crdt` database
+is opened through replication too, so a file holding any of the above is
+refused.
+
+#### The state under CRDT
+
+Conflicting writes merge per column, last writer (hybrid clock) wins. Creates
+that claim a name are made deterministic or visible, never two rows with one
+name:
+
+- **Users** have an ID derived from their normalized email, as do their
+  personal org, its default group and the membership: the same email created
+  on two nodes at once is one user, its columns merged (the later password or
+  name wins). A user deleted and created again has the same ID: an access
+  token from before the delete works for the new account until it expires
+  (≤ 1h); refresh and platform tokens are deleted with the user.
+- **Org slugs, group names, database names and user emails** are `UNIQUE`;
+  when two nodes write the same one, replication keeps the row with the newer
+  hybrid clock and holds the other out. Every node then runs the same
+  resolution: a held-out row is written back under its name suffixed with the
+  first 6 characters of its ID (`shop` → `shop-1a2b3c`; an email gets
+  `+<id6>` before the `@`), so both rows exist under distinct names, and the
+  node logs the rename. Every node writes the same values, so the merge is
+  the same everywhere.
+- **Invites** (`org`, `email`): the newer one stands, the other stays held
+  out (same intent).
+- **Usage** is an increment, so it is kept per node (`node` in the key) and
+  summed when read. A `token_gen` bump needs no sum: any bump changes the
+  generation, which is all invalidation needs.
+- **Signing keys**: every node signs. A node starts a key of its own when it
+  has none and rotates on schedule; JWKS publishes every key in the
+  replicated set, and verification reloads the set on an unknown `kid` (and
+  every minute), so a token signed anywhere verifies everywhere once its key
+  has synced: one sync interval after a node's new key.
+- **Refresh tokens** rotate on use, and a reused one revokes its family. A
+  use reaches the other nodes only at sync, so within one sync interval
+  (≈2s plus the network) the same refresh token presented to two nodes
+  succeeds on both, giving two children of one parent; once the uses meet,
+  any later use of the parent is a reuse and revokes the whole family on
+  every node. Revocation (logout, `/oidc/revoke`, disabling a user, deleting
+  a platform token) reaches the other nodes within the same window.
+  Authorization and device codes are single-use per node: one redeemed on a
+  node that has not synced it yet is "not found" there, and the client
+  retries.
+
+Declined, deliberately: `raft` databases (and with them linearizable
+multi-node writes); `plain` databases in a cluster; restore and branch of
+`crdt` databases; a standalone node joining a cluster in place; a usage view
+that counts more than the nodes have synced.
 
 ## Usage analytics
 
-Per database, per hour: rows read, rows written, statements, errors, bytes
+Per database, per hour (per node, summed when read): rows read, rows written, statements, errors, bytes
 stored, p50/p95 latency; per org totals. Counted at the Hrana layer and kept
 in state. The API returns series; the console charts them. Top queries:
 normalized statement text with counts and total time.
@@ -220,7 +309,6 @@ Services, each method checks the caller's role:
 - `GroupService`: List, Create, Delete, AddLocation, RemoveLocation, ListLocations.
 - `DatabaseService`: List, Get, Create (empty, from upload, as branch, from restore point), Delete, Rename, Usage, ListSnapshots, Restore (to time, new or in place), CreateToken, InvalidateTokens, Upload, Export (musq or C SQLite), Stats (top queries).
 - `AIService`: GenerateSQL.
-- `PeerService` (between nodes, shared secret): Follow.
 
 ## Console
 
