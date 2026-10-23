@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package cloud.v1;
+
+// PeerService is spoken between the nodes of one deployment, never by
+// clients: a replica node follows the primary's databases through it. Every
+// call carries the shared secret of the two nodes' peer entries.
+service PeerService {
+  // Follow streams a database's history records from after_seq on: the
+  // records the replica lacks, then each new one as it is logged.
+  rpc Follow(FollowRequest) returns (stream FollowResponse);
+}
+
+message FollowRequest {
+  // A database's ID, or "" for the deployment's state.
+  string database_id = 1;
+  // The last record the replica applied; 0 to start from the newest base.
+  uint64 after_seq = 2;
+}
+
+// One message of a Follow stream. A record comes first; a base's record is
+// followed by its segment file in chunks (segment_size bytes in all) and then
+// its delta prefix (delta_size bytes).
+message FollowResponse {
+  oneof msg {
+    Record record = 1;
+    bytes segment_chunk = 2;
+    bytes delta_chunk = 3;
+    // Sent once the replica has every record logged so far.
+    bool live = 4;
+  }
+}
+
+message Record {
+  uint64 seq = 1;
+  // The record as the history's log holds it.
+  bytes data = 2;
+  bool base = 3;
+  int64 segment_size = 4;
+  int64 delta_size = 5;
+}
