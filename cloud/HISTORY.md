@@ -1,6 +1,6 @@
 # musql cloud: database history from a physical commit log
 
-Point-in-time restore, branching and read replicas, for databases with
+Point-in-time restore and branching, for databases with
 the engine's full semantics: triggers, virtual tables (FTS included), WITHOUT
 ROWID, and rowids exactly as the engine assigned them. The previous design
 captured ROW changes through `replication/` and had to refuse all of those;
@@ -125,37 +125,12 @@ rowids, triggers, vtab shadow tables and all.
   (`sqlite_%`) and shadow tables (`PRAGMA table_list` type `shadow`, which the
   virtual table recreates itself).
 
-## Read replicas
+## Per node
 
-A replica follows by shipping records (`History.Ship` on the primary,
-`OpenReplica` and `History.Apply` on the replica; the transport and the
-server's side are in `DESIGN.md`, Groups and regions):
-
-- `Ship(after)` returns the records after seq `after`, each as the log holds
-  it, a base with its two files open; when the log no longer has seq
-  `after+1` (pruned, or a log that started over) or `after` is 0, it starts
-  from the newest base. With nothing to send it returns a channel closed at
-  the next record.
-- The replica keeps its own log of the records it applied, the same bytes,
-  so its seqs are the primary's. A batch must be the record after the last
-  one and start at the delta's logged end; a base may come at any seq, and
-  one at or before the last seq starts the replica's log over.
-- A record is logged (and a base's files written and checked against the
-  record's sha256) before it is applied, and applied under
-  `engine.ReplaceState`: the file's exclusive write lock with the change word
-  moved, so no reader sees the pair mid-change and every held session
-  re-checks the files. A batch is written at its delta offset (a torn tail
-  past it is cut); a base is installed as `rollForward` does it, old delta
-  first.
-- `OpenReplica` brings the file to the log's last state: it compares the
-  segment file's sha256 with the latest base's and the delta's committed
-  bytes with the logged span, and rolls forward on any difference (a crash
-  between logging and applying, or inside an install). A file with no log is
-  removed: it is not a state.
-- A replica takes no bases of its own; its log is pruned like the primary's.
-
-The file is then byte-identical to the primary's committed pair at that seq,
-and the engine reads it with no replica-specific code beyond the lock.
+In a cluster a `crdt` database is a file on each node of its group, written
+by replication; each node logs its own file's history as above. The logs are
+not shipped between nodes and are not each other's: a node's log holds what
+its copy held, bookkeeping included. See `DESIGN.md`, Deployments.
 
 ## Concurrency
 
