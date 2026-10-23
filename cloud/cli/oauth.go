@@ -116,6 +116,25 @@ func refresh(ctx context.Context, hc *http.Client, server, rt string) (*tokenRes
 	return &t, nil
 }
 
+// revoke asks the server to forget a refresh token (RFC 7009).
+func revoke(ctx context.Context, hc *http.Client, server, rt string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, server+"/oidc/revoke",
+		strings.NewReader(url.Values{"client_id": {clientID}, "token": {rt}, "token_type_hint": {"refresh_token"}}.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := hc.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("revoke: %s", resp.Status)
+	}
+	return nil
+}
+
 func (c *Config) setTokens(t *tokenResponse) {
 	c.AccessToken, c.RefreshToken = t.AccessToken, t.RefreshToken
 	c.Expiry = time.Now().Add(time.Duration(t.ExpiresIn) * time.Second)
