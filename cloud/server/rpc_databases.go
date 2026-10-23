@@ -33,7 +33,7 @@ func (s *Server) dbToProto(ctx context.Context, o *state.Org, d *state.Database)
 	out := &v1.Database{
 		Id: d.ID, Org: o.Slug, Name: d.Name, Parent: d.Parent, ParentAt: stamp(d.ParentAt),
 		SchemaOnly: d.SchemaOnly, CreatedAt: stamp(d.CreatedAt),
-		Url: s.cfg.PublicURL + "/db/" + o.Slug + "/" + d.Name,
+		Url: s.cfg.PublicURL + "/db/" + o.Slug + "/" + d.Name + "/",
 	}
 	if g, err := s.store.GroupByID(ctx, d.GroupID); err == nil {
 		out.Group = g.Name
