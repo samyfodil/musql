@@ -106,14 +106,19 @@ The server is its own issuer at `public_url`:
 ## Storage, history, branching, restore
 
 - Each database is `data/databases/<org id>/<db id>.musq` (IDs, so renames
-  move nothing), opened through
-  `replication.Open` so writes are captured in the change log
-  (`replication/` op log), giving PITR without a new format.
-- Snapshots every `snapshots.every`: an export of the database at an HLC
-  point, kept for `snapshots.keep`.
-- **Restore to time T**: newest snapshot ≤ T, replay the change log up to T,
-  into a new database (Turso's model: restore creates a new db) or in place.
-- **Branch**: a new database from the parent at now (or at T, via restore).
+  move nothing; an in-place restore points the record at a new file name),
+  opened with the plain driver. Its history is a PHYSICAL commit log in
+  `data/history/<org id>/<db id>/`: the engine's commit hook hands each
+  commit's file state to `cloud/store`, which logs the delta bytes the commit
+  appended, or a new base when the segment file was replaced. Full SQLite
+  semantics (triggers, virtual tables, WITHOUT ROWID, rowids) are restored
+  bit for bit. See `HISTORY.md`.
+- Snapshots (bases) every `snapshots.every` and on request; history older
+  than `snapshots.keep` is pruned.
+- **Restore to time T**: newest base ≤ T plus the logged commits up to T,
+  into a new database (Turso's model) or in place.
+- **Branch**: a restore into a new database, at now or at T; schema-only
+  recreates the parent's objects empty.
 - **Groups & regions**: a database's group lists locations; the primary
   node writes, others replicate with `replication.Leader` over an HTTP
   transport between peers (`peers` in config, shared secret). A request to a
