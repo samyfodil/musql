@@ -1,0 +1,99 @@
+syntax = "proto3";
+
+package cloud.v1;
+
+import "cloud/v1/common.proto";
+
+// OrgService: orgs are named by slug.
+service OrgService {
+  rpc List(ListOrgsRequest) returns (ListOrgsResponse);
+  rpc Create(CreateOrgRequest) returns (CreateOrgResponse);
+  rpc Update(UpdateOrgRequest) returns (UpdateOrgResponse);
+  rpc Delete(DeleteOrgRequest) returns (DeleteOrgResponse);
+  rpc ListMembers(ListMembersRequest) returns (ListMembersResponse);
+  rpc Invite(InviteRequest) returns (InviteResponse);
+  rpc UpdateMember(UpdateMemberRequest) returns (UpdateMemberResponse);
+  rpc RemoveMember(RemoveMemberRequest) returns (RemoveMemberResponse);
+  rpc ListInvites(ListInvitesRequest) returns (ListInvitesResponse);
+  rpc AcceptInvite(AcceptInviteRequest) returns (AcceptInviteResponse);
+}
+
+message ListOrgsRequest {}
+
+message ListOrgsResponse {
+  repeated Org orgs = 1;
+}
+
+message CreateOrgRequest {
+  string slug = 1;
+  string name = 2;
+}
+
+message CreateOrgResponse {
+  Org org = 1;
+}
+
+message UpdateOrgRequest {
+  string org = 1;
+  string name = 2;
+}
+
+message UpdateOrgResponse {
+  Org org = 1;
+}
+
+message DeleteOrgRequest {
+  string org = 1;
+}
+
+message DeleteOrgResponse {}
+
+message ListMembersRequest {
+  string org = 1;
+}
+
+message ListMembersResponse {
+  repeated Member members = 1;
+}
+
+message InviteRequest {
+  string org = 1;
+  string email = 2;
+  Role role = 3;
+}
+
+message InviteResponse {
+  Invite invite = 1;
+}
+
+message UpdateMemberRequest {
+  string org = 1;
+  string user_id = 2;
+  Role role = 3;
+}
+
+message UpdateMemberResponse {}
+
+message RemoveMemberRequest {
+  string org = 1;
+  string user_id = 2;
+}
+
+message RemoveMemberResponse {}
+
+// ListInvites lists an org's pending invites, or with no org the caller's own.
+message ListInvitesRequest {
+  string org = 1;
+}
+
+message ListInvitesResponse {
+  repeated Invite invites = 1;
+}
+
+message AcceptInviteRequest {
+  string id = 1;
+}
+
+message AcceptInviteResponse {
+  Org org = 1;
+}
