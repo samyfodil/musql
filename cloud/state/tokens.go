@@ -42,9 +42,6 @@ func (s *Store) PlatformTokenUser(ctx context.Context, secret string) (*User, er
 	if err := s.db.QueryRowContext(ctx, `SELECT id, user_id FROM platform_tokens WHERE hash = ?`, HashToken(secret)).Scan(&id, &userID); err != nil {
 		return nil, notFound(err)
 	}
-	if s.readOnly {
-		return s.UserByID(ctx, userID) // a replica: the primary notes use
-	}
 	if _, err := s.db.ExecContext(ctx, `UPDATE platform_tokens SET last_used_at = ? WHERE id = ?`, now(), id); err != nil {
 		return nil, err
 	}

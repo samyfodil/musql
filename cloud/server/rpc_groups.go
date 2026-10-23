@@ -64,9 +64,6 @@ func (s groupService) Create(ctx context.Context, req *connect.Request[v1.Create
 	if err := s.knownLocation(loc); err != nil {
 		return nil, err
 	}
-	if loc != s.cfg.primaryLocation() {
-		return nil, invalid("every database is written at the primary node's location, " + s.cfg.primaryLocation() + "; add " + loc + " as a replica location")
-	}
 	g, err := s.store.CreateGroup(ctx, o.ID, req.Msg.Name, loc)
 	if err != nil {
 		return nil, rpcErr(err)

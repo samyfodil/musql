@@ -88,8 +88,6 @@ type Provider struct {
 	issuer   string
 	rotation time.Duration
 	secure   bool
-	// verifyOnly: no active key, nothing signed or written.
-	verifyOnly bool
 
 	mu     sync.RWMutex
 	active *signKey
@@ -106,7 +104,6 @@ type options struct {
 	rotation       time.Duration
 	perIP, perMail int
 	loginWindow    time.Duration
-	verifyOnly     bool
 }
 
 // WithKeyRotation makes a new signing key take over after d; the old key stays
@@ -139,30 +136,6 @@ func WithConsoleOrigins(origins []string) Option {
 	return func(o *options) { o.consoleOrigins = origins }
 }
 
-// WithVerifyOnly makes a provider that verifies tokens and does nothing
-// else: it writes nothing to the state, which a replica node only reads.
-// ReloadKeys picks up the keys the primary adds.
-func WithVerifyOnly() Option { return func(o *options) { o.verifyOnly = true } }
-
-// ReloadKeys reads the signing keys from the state again.
-func (p *Provider) ReloadKeys(ctx context.Context) error {
-	keys, err := p.store.SigningKeys(ctx)
-	if err != nil {
-		return err
-	}
-	m := map[string]*signKey{}
-	for _, k := range keys {
-		if len(k.PrivateKey) != ed25519.SeedSize {
-			return fmt.Errorf("oidc: signing key %s is malformed", k.KID)
-		}
-		m[k.KID] = &signKey{kid: k.KID, priv: ed25519.NewKeyFromSeed(k.PrivateKey), created: k.CreatedAt, retired: k.RetiredAt, maxExp: k.MaxExp}
-	}
-	p.mu.Lock()
-	p.keys = m
-	p.mu.Unlock()
-	return nil
-}
-
 // New returns a provider for issuer (the public URL, no trailing slash),
 // creating a signing key and the built-in clients when missing.
 func New(ctx context.Context, store *state.Store, issuer string, opts ...Option) (*Provider, error) {
@@ -173,10 +146,6 @@ func New(ctx context.Context, store *state.Store, issuer string, opts ...Option)
 	issuer = strings.TrimRight(issuer, "/")
 	p := &Provider{store: store, issuer: issuer, rotation: o.rotation, keys: map[string]*signKey{}, secure: strings.HasPrefix(issuer, "https://")}
 	p.byIP, p.byMail = newLimiter(o.perIP, o.loginWindow), newLimiter(o.perMail, o.loginWindow)
-	if o.verifyOnly {
-		p.verifyOnly = true
-		return p, p.ReloadKeys(ctx)
-	}
 	keys, err := store.SigningKeys(ctx)
 	if err != nil {
 		return nil, err
@@ -234,9 +203,6 @@ func (p *Provider) Issuer() string { return p.issuer }
 // RotateIfDue starts a new signing key when the active one is older than the
 // rotation period, and drops the retired keys whose tokens have all expired.
 func (p *Provider) RotateIfDue(ctx context.Context, now time.Time) error {
-	if p.verifyOnly {
-		return nil
-	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.rotation > 0 && now.Sub(p.active.created) >= p.rotation {
@@ -292,9 +258,6 @@ func (p *Provider) noteExpiry(k *signKey, exp *jwt.NumericDate) error {
 
 // Sign signs c, filling in the issuer and issue time.
 func (p *Provider) Sign(c *Claims) (string, error) {
-	if p.verifyOnly {
-		return "", errors.New("oidc: this provider only verifies")
-	}
 	c.Issuer = p.issuer
 	c.IssuedAt = jwt.NewNumericDate(time.Now())
 	p.mu.Lock()
