@@ -157,13 +157,13 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("group list: %q", out)
 	}
 
-	if out := h.run("db", "create", "app"); !strings.Contains(out, h.url+"/db/acme/app") {
+	if out := h.run("db", "create", "app"); !strings.Contains(out, h.url+"/db/acme/app/") {
 		t.Fatalf("db create: %q", out)
 	}
-	if out := h.run("db", "list"); !strings.Contains(out, "app   default  "+h.url+"/db/acme/app") {
+	if out := h.run("db", "list"); !strings.Contains(out, "app   default  "+h.url+"/db/acme/app/") {
 		t.Fatalf("db list: %q", out)
 	}
-	if out := h.run("db", "show", "app", "--url"); out != h.url+"/db/acme/app\n" {
+	if out := h.run("db", "show", "app", "--url"); out != h.url+"/db/acme/app/\n" {
 		t.Fatalf("db show --url: %q", out)
 	}
 	if tok := h.run("db", "tokens", "create", "app", "--read-only", "-e", "7d"); strings.Count(tok, ".") != 2 {

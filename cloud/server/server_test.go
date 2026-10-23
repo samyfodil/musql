@@ -127,7 +127,7 @@ func TestRoles(t *testing.T) {
 		t.Fatalf("bad token: %v", err)
 	}
 	list := must(dbs.List(ctx, auth(bob, &v1.ListDatabasesRequest{Org: "acme"})))
-	if len(list.Msg.Databases) != 1 || list.Msg.Databases[0].Url != e.ts.URL+"/db/acme/app" || list.Msg.Databases[0].Group != "default" {
+	if len(list.Msg.Databases) != 1 || list.Msg.Databases[0].Url != e.ts.URL+"/db/acme/app/" || list.Msg.Databases[0].Group != "default" {
 		t.Fatalf("viewer list: %v", list.Msg)
 	}
 	if _, err := dbs.Create(ctx, auth(bob, &v1.CreateDatabaseRequest{Org: "acme", Name: "x"})); code(err) != connect.CodePermissionDenied {
