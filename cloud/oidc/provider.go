@@ -9,11 +9,14 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,6 +49,7 @@ const (
 	deviceTTL   = 10 * time.Minute
 	devicePoll  = 5
 	sessionName = "musql_session"
+	csrfName    = "musql_csrf"
 )
 
 // Claims are every claim this provider puts in a token.
@@ -76,6 +80,8 @@ type Provider struct {
 	active key
 	pub    map[string]ed25519.PublicKey
 	secure bool
+	byIP   *limiter
+	byMail *limiter
 }
 
 // Option configures a Provider.
@@ -83,6 +89,25 @@ type Option func(*options)
 
 type options struct {
 	consoleOrigins []string
+	perIP, perMail int
+	loginWindow    time.Duration
+}
+
+// WithLoginLimits sets how many failed sign-ins one address, and one email,
+// may make within the window before /login answers 429. A zero count or window
+// keeps its default; a negative count turns that limit off.
+func WithLoginLimits(perIP, perEmail int, window time.Duration) Option {
+	return func(o *options) {
+		if perIP != 0 {
+			o.perIP = perIP
+		}
+		if perEmail != 0 {
+			o.perMail = perEmail
+		}
+		if window > 0 {
+			o.loginWindow = window
+		}
+	}
 }
 
 // WithConsoleOrigins registers these origins as extra homes of the console
@@ -96,12 +121,13 @@ func WithConsoleOrigins(origins []string) Option {
 // New returns a provider for issuer (the public URL, no trailing slash),
 // creating a signing key and the built-in clients when missing.
 func New(ctx context.Context, store *state.Store, issuer string, opts ...Option) (*Provider, error) {
-	var o options
+	o := options{perIP: DefaultLoginPerIP, perMail: DefaultLoginPerEmail, loginWindow: DefaultLoginWindow}
 	for _, f := range opts {
 		f(&o)
 	}
 	issuer = strings.TrimRight(issuer, "/")
 	p := &Provider{store: store, issuer: issuer, pub: map[string]ed25519.PublicKey{}, secure: strings.HasPrefix(issuer, "https://")}
+	p.byIP, p.byMail = newLimiter(o.perIP, o.loginWindow), newLimiter(o.perMail, o.loginWindow)
 	keys, err := store.SigningKeys(ctx)
 	if err != nil {
 		return nil, err
@@ -319,12 +345,42 @@ func (p *Provider) Authenticate(ctx context.Context, email, password string) (*s
 	return u, nil
 }
 
+// csrfToken is the sign-in form's token, kept in a cookie scoped to /login
+// and echoed in a hidden field (a double-submit): a page on another site can
+// make the browser send the cookie but cannot read it to fill in the field.
+func (p *Provider) csrfToken(w http.ResponseWriter, r *http.Request) string {
+	if ck, err := r.Cookie(csrfName); err == nil && ck.Value != "" {
+		return ck.Value
+	}
+	b := make([]byte, 32)
+	rand.Read(b)
+	tok := base64.RawURLEncoding.EncodeToString(b)
+	http.SetCookie(w, &http.Cookie{Name: csrfName, Value: tok, Path: "/login", HttpOnly: true, Secure: p.secure, SameSite: http.SameSiteStrictMode})
+	return tok
+}
+
+func csrfOK(r *http.Request) bool {
+	ck, err := r.Cookie(csrfName)
+	field := r.PostFormValue("csrf")
+	return err == nil && ck.Value != "" && subtle.ConstantTimeCompare([]byte(ck.Value), []byte(field)) == 1
+}
+
+// clientIP is the peer address; a proxy's forwarding headers are not trusted,
+// since a client could set them to dodge the limit.
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
 func (p *Provider) loginPage(w http.ResponseWriter, r *http.Request) {
 	next := r.URL.Query().Get("next")
 	if !localPath(next) {
 		next = "/console/"
 	}
-	render(w, http.StatusOK, loginTmpl, map[string]any{"Next": next})
+	render(w, http.StatusOK, loginTmpl, map[string]any{"Next": next, "CSRF": p.csrfToken(w, r)})
 }
 
 func (p *Provider) login(w http.ResponseWriter, r *http.Request) {
@@ -332,11 +388,30 @@ func (p *Provider) login(w http.ResponseWriter, r *http.Request) {
 	if !localPath(next) {
 		next = "/console/"
 	}
-	u, err := p.Authenticate(r.Context(), r.PostFormValue("email"), r.PostFormValue("password"))
-	if err != nil {
-		render(w, http.StatusUnauthorized, loginTmpl, map[string]any{"Next": next, "Email": r.PostFormValue("email"), "Error": "Wrong email or password."})
+	if !csrfOK(r) {
+		render(w, http.StatusForbidden, messageTmpl, map[string]any{"Title": "Sign-in failed", "Message": "This sign-in page expired or came from another site. Go back, reload it and try again."})
 		return
 	}
+	email := r.PostFormValue("email")
+	ipKey, mailKey := clientIP(r), strings.ToLower(strings.TrimSpace(email))
+	for _, l := range []struct {
+		l   *limiter
+		key string
+	}{{p.byIP, ipKey}, {p.byMail, mailKey}} {
+		if wait, blocked := l.l.blocked(l.key); blocked {
+			w.Header().Set("Retry-After", strconv.Itoa(int(wait/time.Second)+1))
+			render(w, http.StatusTooManyRequests, loginTmpl, map[string]any{"Next": next, "Email": email, "CSRF": p.csrfToken(w, r), "Error": "Too many failed sign-ins. Try again later."})
+			return
+		}
+	}
+	u, err := p.Authenticate(r.Context(), email, r.PostFormValue("password"))
+	if err != nil {
+		p.byIP.fail(ipKey)
+		p.byMail.fail(mailKey)
+		render(w, http.StatusUnauthorized, loginTmpl, map[string]any{"Next": next, "Email": email, "CSRF": p.csrfToken(w, r), "Error": "Wrong email or password."})
+		return
+	}
+	p.byMail.reset(mailKey)
 	if err := p.setSession(w, u); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
