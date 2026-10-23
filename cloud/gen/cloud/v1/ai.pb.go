@@ -85,6 +85,7 @@ type GenerateSQLResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Sql           string                 `protobuf:"bytes,1,opt,name=sql,proto3" json:"sql,omitempty"`
 	Explanation   string                 `protobuf:"bytes,2,opt,name=explanation,proto3" json:"explanation,omitempty"`
+	Writes        bool                   `protobuf:"varint,3,opt,name=writes,proto3" json:"writes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -133,6 +134,13 @@ func (x *GenerateSQLResponse) GetExplanation() string {
 	return ""
 }
 
+func (x *GenerateSQLResponse) GetWrites() bool {
+	if x != nil {
+		return x.Writes
+	}
+	return false
+}
+
 var File_cloud_v1_ai_proto protoreflect.FileDescriptor
 
 const file_cloud_v1_ai_proto_rawDesc = "" +
@@ -141,10 +149,11 @@ const file_cloud_v1_ai_proto_rawDesc = "" +
 	"\x12GenerateSQLRequest\x12\x10\n" +
 	"\x03org\x18\x01 \x01(\tR\x03org\x12\x1a\n" +
 	"\bdatabase\x18\x02 \x01(\tR\bdatabase\x12\x16\n" +
-	"\x06prompt\x18\x03 \x01(\tR\x06prompt\"I\n" +
+	"\x06prompt\x18\x03 \x01(\tR\x06prompt\"a\n" +
 	"\x13GenerateSQLResponse\x12\x10\n" +
 	"\x03sql\x18\x01 \x01(\tR\x03sql\x12 \n" +
-	"\vexplanation\x18\x02 \x01(\tR\vexplanation2W\n" +
+	"\vexplanation\x18\x02 \x01(\tR\vexplanation\x12\x16\n" +
+	"\x06writes\x18\x03 \x01(\bR\x06writes2W\n" +
 	"\tAIService\x12J\n" +
 	"\vGenerateSQL\x12\x1c.cloud.v1.GenerateSQLRequest\x1a\x1d.cloud.v1.GenerateSQLResponseB\x8f\x01\n" +
 	"\fcom.cloud.v1B\aAiProtoP\x01Z5github.com/samyfodil/musql/cloud/gen/cloud/v1;cloudv1\xa2\x02\x03CXX\xaa\x02\bCloud.V1\xca\x02\bCloud\\V1\xe2\x02\x14Cloud\\V1\\GPBMetadata\xea\x02\tCloud::V1b\x06proto3"

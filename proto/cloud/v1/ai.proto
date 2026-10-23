@@ -15,4 +15,5 @@ message GenerateSQLRequest {
 message GenerateSQLResponse {
   string sql = 1;
   string explanation = 2;
+  bool writes = 3;
 }

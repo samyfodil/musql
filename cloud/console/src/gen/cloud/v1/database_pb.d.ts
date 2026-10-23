@@ -325,9 +325,18 @@ export declare const UsagePointSchema: GenMessage<UsagePoint>;
  */
 export declare type UsageResponse = Message<"cloud.v1.UsageResponse"> & {
   /**
+   * The database's series, or the org's totals when no name was given.
+   *
    * @generated from field: repeated cloud.v1.UsagePoint points = 1;
    */
   points: UsagePoint[];
+
+  /**
+   * With no name: each database's own series.
+   *
+   * @generated from field: repeated cloud.v1.DatabaseUsage databases = 2;
+   */
+  databases: DatabaseUsage[];
 };
 
 /**
@@ -335,6 +344,27 @@ export declare type UsageResponse = Message<"cloud.v1.UsageResponse"> & {
  * Use `create(UsageResponseSchema)` to create a new message.
  */
 export declare const UsageResponseSchema: GenMessage<UsageResponse>;
+
+/**
+ * @generated from message cloud.v1.DatabaseUsage
+ */
+export declare type DatabaseUsage = Message<"cloud.v1.DatabaseUsage"> & {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name: string;
+
+  /**
+   * @generated from field: repeated cloud.v1.UsagePoint points = 2;
+   */
+  points: UsagePoint[];
+};
+
+/**
+ * Describes the message cloud.v1.DatabaseUsage.
+ * Use `create(DatabaseUsageSchema)` to create a new message.
+ */
+export declare const DatabaseUsageSchema: GenMessage<DatabaseUsage>;
 
 /**
  * @generated from message cloud.v1.Snapshot
@@ -354,6 +384,13 @@ export declare type Snapshot = Message<"cloud.v1.Snapshot"> & {
    * @generated from field: int64 size_bytes = 3;
    */
   sizeBytes: bigint;
+
+  /**
+   * Taken on request (CreateSnapshot), not by the schedule.
+   *
+   * @generated from field: bool manual = 4;
+   */
+  manual: boolean;
 };
 
 /**
@@ -400,6 +437,43 @@ export declare type ListSnapshotsResponse = Message<"cloud.v1.ListSnapshotsRespo
 export declare const ListSnapshotsResponseSchema: GenMessage<ListSnapshotsResponse>;
 
 /**
+ * @generated from message cloud.v1.CreateSnapshotRequest
+ */
+export declare type CreateSnapshotRequest = Message<"cloud.v1.CreateSnapshotRequest"> & {
+  /**
+   * @generated from field: string org = 1;
+   */
+  org: string;
+
+  /**
+   * @generated from field: string name = 2;
+   */
+  name: string;
+};
+
+/**
+ * Describes the message cloud.v1.CreateSnapshotRequest.
+ * Use `create(CreateSnapshotRequestSchema)` to create a new message.
+ */
+export declare const CreateSnapshotRequestSchema: GenMessage<CreateSnapshotRequest>;
+
+/**
+ * @generated from message cloud.v1.CreateSnapshotResponse
+ */
+export declare type CreateSnapshotResponse = Message<"cloud.v1.CreateSnapshotResponse"> & {
+  /**
+   * @generated from field: cloud.v1.Snapshot snapshot = 1;
+   */
+  snapshot?: Snapshot | undefined;
+};
+
+/**
+ * Describes the message cloud.v1.CreateSnapshotResponse.
+ * Use `create(CreateSnapshotResponseSchema)` to create a new message.
+ */
+export declare const CreateSnapshotResponseSchema: GenMessage<CreateSnapshotResponse>;
+
+/**
  * @generated from message cloud.v1.RestoreRequest
  */
 export declare type RestoreRequest = Message<"cloud.v1.RestoreRequest"> & {
@@ -414,16 +488,26 @@ export declare type RestoreRequest = Message<"cloud.v1.RestoreRequest"> & {
   name: string;
 
   /**
+   * Now when unset.
+   *
    * @generated from field: google.protobuf.Timestamp at = 3;
    */
   at?: Timestamp | undefined;
 
   /**
-   * Restore into a new database of this name; in place when empty.
+   * Restore into a new database of this name ("<name>-<time>" when empty).
    *
    * @generated from field: string new_name = 4;
    */
   newName: string;
+
+  /**
+   * Restore in place instead: the database becomes its state at `at`, open
+   * connections are closed, and its history restarts there.
+   *
+   * @generated from field: bool in_place = 5;
+   */
+  inPlace: boolean;
 };
 
 /**
@@ -644,6 +728,25 @@ export declare type StatsRequest = Message<"cloud.v1.StatsRequest"> & {
    * @generated from field: string name = 2;
    */
   name: string;
+
+  /**
+   * The last 24 hours when unset.
+   *
+   * @generated from field: google.protobuf.Timestamp from = 3;
+   */
+  from?: Timestamp | undefined;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp to = 4;
+   */
+  to?: Timestamp | undefined;
+
+  /**
+   * 20 when 0.
+   *
+   * @generated from field: int32 limit = 5;
+   */
+  limit: number;
 };
 
 /**
@@ -815,6 +918,14 @@ export declare const DatabaseService: GenService<{
     methodKind: "unary";
     input: typeof ListSnapshotsRequestSchema;
     output: typeof ListSnapshotsResponseSchema;
+  },
+  /**
+   * @generated from rpc cloud.v1.DatabaseService.CreateSnapshot
+   */
+  createSnapshot: {
+    methodKind: "unary";
+    input: typeof CreateSnapshotRequestSchema;
+    output: typeof CreateSnapshotResponseSchema;
   },
   /**
    * @generated from rpc cloud.v1.DatabaseService.Restore

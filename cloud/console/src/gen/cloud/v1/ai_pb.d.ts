@@ -49,6 +49,11 @@ export declare type GenerateSQLResponse = Message<"cloud.v1.GenerateSQLResponse"
    * @generated from field: string explanation = 2;
    */
   explanation: string;
+
+  /**
+   * @generated from field: bool writes = 3;
+   */
+  writes: boolean;
 };
 
 /**
