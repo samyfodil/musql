@@ -173,6 +173,13 @@ export declare type Group = Message<"cloud.v1.Group"> & {
    * @generated from field: google.protobuf.Timestamp created_at = 5;
    */
   createdAt?: Timestamp | undefined;
+
+  /**
+   * What the group's databases default to.
+   *
+   * @generated from field: cloud.v1.DatabaseType type = 6;
+   */
+  type: DatabaseType;
 };
 
 /**
@@ -234,6 +241,11 @@ export declare type Database = Message<"cloud.v1.Database"> & {
    * @generated from field: google.protobuf.Timestamp created_at = 10;
    */
   createdAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: cloud.v1.DatabaseType type = 11;
+   */
+  type: DatabaseType;
 };
 
 /**
@@ -276,4 +288,37 @@ export enum Role {
  * Describes the enum cloud.v1.Role.
  */
 export declare const RoleSchema: GenEnum<Role>;
+
+/**
+ * How a database is kept: plain on a standalone node, crdt replicated across
+ * a cluster's nodes. raft is known and declined: not yet supported.
+ *
+ * @generated from enum cloud.v1.DatabaseType
+ */
+export enum DatabaseType {
+  /**
+   * @generated from enum value: DATABASE_TYPE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: DATABASE_TYPE_PLAIN = 1;
+   */
+  PLAIN = 1,
+
+  /**
+   * @generated from enum value: DATABASE_TYPE_CRDT = 2;
+   */
+  CRDT = 2,
+
+  /**
+   * @generated from enum value: DATABASE_TYPE_RAFT = 3;
+   */
+  RAFT = 3,
+}
+
+/**
+ * Describes the enum cloud.v1.DatabaseType.
+ */
+export declare const DatabaseTypeSchema: GenEnum<DatabaseType>;
 

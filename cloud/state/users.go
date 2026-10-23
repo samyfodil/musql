@@ -37,9 +37,12 @@ func scanUser(r scanner) (*User, error) {
 func NormalizeEmail(email string) string { return strings.ToLower(strings.TrimSpace(email)) }
 
 // CreateUser creates a user and its personal org (slug from the email's local
-// part, made unique), with the user as owner.
+// part, made unique), with the user as owner. The user's ID, and its personal
+// org's and default group's, derive from the email: the same email created on
+// two cluster nodes at once is one user.
 func (s *Store) CreateUser(ctx context.Context, email, name, passwordHash string, admin bool) (*User, error) {
-	u := &User{ID: NewID(), Email: NormalizeEmail(email), Name: name, PasswordHash: passwordHash, Admin: admin, CreatedAt: unix(now())}
+	email = NormalizeEmail(email)
+	u := &User{ID: derivedID("user", email), Email: email, Name: name, PasswordHash: passwordHash, Admin: admin, CreatedAt: unix(now())}
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.Exec(`INSERT INTO users (`+userCols+`) VALUES (?, ?, ?, ?, ?, 0, ?)`,
 			u.ID, u.Email, u.Name, u.PasswordHash, u.Admin, u.CreatedAt.Unix()); err != nil {
@@ -48,18 +51,27 @@ func (s *Store) CreateUser(ctx context.Context, email, name, passwordHash string
 			}
 			return err
 		}
+		// A user deleted and created again finds the personal org it left.
+		org := derivedID("org", u.ID)
+		var kept int
+		if err := tx.QueryRow(`SELECT count(*) FROM orgs WHERE id = ?`, org).Scan(&kept); err != nil {
+			return err
+		}
+		if kept > 0 {
+			_, err := tx.Exec(`INSERT INTO members (org_id, user_id, role) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`, org, u.ID, RoleOwner)
+			return err
+		}
 		slug, err := freeSlug(tx, slugify(strings.SplitN(u.Email, "@", 2)[0]))
 		if err != nil {
 			return err
 		}
-		org := NewID()
 		if _, err := tx.Exec(`INSERT INTO orgs (id, slug, name, personal, created_at) VALUES (?, ?, ?, 1, ?)`, org, slug, slug, now()); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(`INSERT INTO members (org_id, user_id, role) VALUES (?, ?, ?)`, org, u.ID, RoleOwner); err != nil {
 			return err
 		}
-		return createGroupTx(tx, org, "default", "")
+		return createGroupTx(tx, derivedID("group", org, "default"), org, "default", "", s.dbType)
 	})
 	if err != nil {
 		return nil, err

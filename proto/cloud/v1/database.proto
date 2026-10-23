@@ -66,6 +66,8 @@ message CreateDatabaseRequest {
   }
   google.protobuf.Timestamp branch_at = 6;
   bool schema_only = 7;
+  // The group's type when unspecified.
+  DatabaseType type = 8;
 }
 
 message CreateDatabaseResponse {

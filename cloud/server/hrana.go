@@ -53,10 +53,14 @@ const idleClose = 5 * time.Minute
 // errUnavailable is a database being restored in place.
 var errUnavailable = errors.New("the database is being restored")
 
+// errNotHere is a crdt database not placed at this node's location.
+var errNotHere = errors.New("not placed here")
+
 type entry struct {
 	db       *sql.DB
 	ro       *sql.DB
 	srv      *hrana.Server
+	shared   bool // db is a crdt database's replicated handle, not the entry's
 	last     time.Time
 	inflight int
 }
@@ -108,7 +112,9 @@ func (p *pool) get(d *state.Database) (e *entry, release func(), err error) {
 
 func (e *entry) close() {
 	e.srv.Close()
-	e.db.Close()
+	if !e.shared {
+		e.db.Close()
+	}
 	e.ro.Close()
 }
 
@@ -187,16 +193,27 @@ func (s *Server) openEntry(d *state.Database) (*entry, error) {
 	if _, err := s.history(d); err != nil {
 		return nil, err
 	}
-	db, err := openPinged(path + "?" + dsnMode + "=rw")
-	if err != nil {
-		return nil, err
+	// A crdt database is written through its replicated handle, which
+	// outlives the entry; any other connection may only read it.
+	db, shared := s.crdtHandle(d.ID), true
+	if d.Type == state.TypeCRDT && db == nil {
+		return nil, errNotHere
+	}
+	if db == nil {
+		var err error
+		if db, err = openPinged(path + "?" + dsnMode + "=rw"); err != nil {
+			return nil, err
+		}
+		shared = false
 	}
 	ro, err := openPinged(path + "?" + dsnMode + "=ro")
 	if err != nil {
-		db.Close()
+		if !shared {
+			db.Close()
+		}
 		return nil, err
 	}
-	return &entry{db: db, ro: ro, srv: hrana.NewServer(db,
+	return &entry{db: db, ro: ro, shared: shared, srv: hrana.NewServer(db,
 		hrana.WithReadOnlyDB(ro),
 		hrana.WithAuth(s.hranaAuth(d.OrgID, d.ID)),
 		hrana.WithObserver(s.meter.observer(d.ID, d.OrgID)))}, nil
@@ -232,6 +249,7 @@ func (s *Server) dbPath(d *state.Database) string {
 // history.
 func (s *Server) removeFiles(d *state.Database) {
 	s.pool.drop(d.ID)
+	s.closeCRDT(d.ID)
 	s.closeHistory(d.ID)
 	removeDBFiles(s.log, s.dbPath(d))
 	if err := os.RemoveAll(s.histDir(d)); err != nil {
@@ -279,6 +297,10 @@ func (s *Server) serveDB(w http.ResponseWriter, r *http.Request) {
 	e, release, err := s.pool.get(d)
 	if errors.Is(err, errUnavailable) {
 		hranaError(w, http.StatusServiceUnavailable, "the database is being restored")
+		return
+	}
+	if errors.Is(err, errNotHere) {
+		hranaError(w, http.StatusNotFound, s.notHere(ctx, d).Error())
 		return
 	}
 	if err != nil {

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	_ "github.com/samyfodil/musql/driver"
+	"github.com/samyfodil/musql/engine"
 )
 
 // ErrNotFound is returned when a record does not exist.
@@ -26,6 +27,11 @@ var ErrExists = errors.New("state: already exists")
 // Store is the service's state database.
 type Store struct {
 	db *sql.DB
+	// node is this node's name in a cluster, "" standalone: usage is kept
+	// per node there.
+	node string
+	// dbType is what a new group's databases default to.
+	dbType string
 }
 
 // Open opens (creating if needed) the state database at path and brings its
@@ -38,12 +44,78 @@ func Open(path string) (*Store, error) {
 	// One connection: every write is serialized in-process, so two requests
 	// never race each other for the file's write lock.
 	db.SetMaxOpenConns(1)
-	s := &Store{db: db}
+	s := &Store{db: db, dbType: TypePlain}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return s, nil
+}
+
+// OpenReplicated takes the state of a cluster node: db is the *sql.DB
+// replication.Open returned for it, node this node's name. Every node runs
+// the same schema statements, each idempotent, so nodes that start apart
+// create the same tables and merge.
+func OpenReplicated(db *sql.DB, node string) (*Store, error) {
+	s := &Store{db: db, node: node, dbType: TypeCRDT}
+	for _, m := range migrations {
+		for stmt := range strings.SplitSeq(m, ";") {
+			if stmt = strings.TrimSpace(stmt); stmt == "" {
+				continue
+			}
+			if err := s.execIdempotent(stmt); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return s, nil
+}
+
+// execIdempotent runs a schema statement unless what it makes exists.
+func (s *Store) execIdempotent(stmt string) error {
+	for _, kw := range []string{"CREATE TABLE ", "CREATE INDEX "} {
+		if rest, ok := strings.CutPrefix(stmt, kw); ok {
+			stmt = kw + "IF NOT EXISTS " + rest
+		}
+	}
+	if rest, ok := strings.CutPrefix(stmt, "ALTER TABLE "); ok {
+		f := strings.Fields(rest)
+		if len(f) < 4 || f[1] != "ADD" || f[2] != "COLUMN" {
+			return fmt.Errorf("state: not an ADD COLUMN: %s", stmt)
+		}
+		var n int
+		if err := s.db.QueryRow(`SELECT count(*) FROM pragma_table_info(?) WHERE name = ?`, f[0], f[3]).Scan(&n); err != nil {
+			return err
+		}
+		if n > 0 {
+			return nil
+		}
+	}
+	if _, err := s.db.Exec(stmt); err != nil {
+		return fmt.Errorf("state: %s: %w", stmt, err)
+	}
+	return nil
+}
+
+// Database types.
+const (
+	TypePlain = "plain"
+	TypeCRDT  = "crdt"
+	TypeRaft  = "raft"
+)
+
+// DefaultType is the type a new group's databases default to: plain
+// standalone, crdt in a cluster.
+func (s *Store) DefaultType() string { return s.dbType }
+
+// Clustered reports a cluster node's state.
+func (s *Store) Clustered() bool { return s.node != "" }
+
+// derivedID is an ID made from what names a record, so every node that
+// creates it creates the same row.
+func derivedID(parts ...string) string {
+	h := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return hex.EncodeToString(h[:12])
 }
 
 // Close closes the database.
@@ -184,6 +256,35 @@ var migrations = []string{
 		rows_written INTEGER NOT NULL,
 		PRIMARY KEY (db_id, hour, sql)
 	);`,
+	// Database types, and usage kept per node in a cluster, where two nodes
+	// adding to one row would each overwrite the other's count.
+	`ALTER TABLE groups ADD COLUMN type TEXT NOT NULL DEFAULT 'plain';
+	ALTER TABLE databases ADD COLUMN type TEXT NOT NULL DEFAULT 'plain';
+	CREATE TABLE node_usage_hours (
+		node TEXT NOT NULL,
+		db_id TEXT NOT NULL,
+		org_id TEXT NOT NULL,
+		hour INTEGER NOT NULL,
+		statements INTEGER NOT NULL,
+		rows_read INTEGER NOT NULL,
+		rows_written INTEGER NOT NULL,
+		errors INTEGER NOT NULL,
+		bytes_stored INTEGER NOT NULL,
+		latency TEXT NOT NULL,
+		PRIMARY KEY (node, db_id, hour)
+	);
+	CREATE INDEX node_usage_hours_org ON node_usage_hours (org_id, hour);
+	CREATE TABLE node_usage_queries (
+		node TEXT NOT NULL,
+		db_id TEXT NOT NULL,
+		hour INTEGER NOT NULL,
+		sql TEXT NOT NULL,
+		count INTEGER NOT NULL,
+		total_us INTEGER NOT NULL,
+		rows_read INTEGER NOT NULL,
+		rows_written INTEGER NOT NULL,
+		PRIMARY KEY (node, db_id, hour, sql)
+	);`,
 }
 
 func (s *Store) migrate() error {
@@ -278,8 +379,19 @@ func notFound(err error) error {
 	return err
 }
 
-// tx runs fn in a transaction.
+// tx runs fn in a transaction. On a cluster node a peer's change can commit
+// while it is open, which fails it with SQLITE_BUSY; it is run again.
 func (s *Store) tx(ctx context.Context, fn func(*sql.Tx) error) error {
+	for try := 0; ; try++ {
+		err := s.tx1(ctx, fn)
+		if !errors.Is(err, engine.ErrBusy) || try == 20 {
+			return err
+		}
+		time.Sleep(time.Duration(try+1) * 5 * time.Millisecond)
+	}
+}
+
+func (s *Store) tx1(ctx context.Context, fn func(*sql.Tx) error) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err

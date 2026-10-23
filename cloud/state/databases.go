@@ -19,12 +19,13 @@ type Group struct {
 	Locations []string
 	TokenGen  int64
 	CreatedAt time.Time
+	// Type is what the group's databases default to.
+	Type string
 }
 
-func createGroupTx(tx *sql.Tx, orgID, name, location string) error {
-	id := NewID()
-	if _, err := tx.Exec(`INSERT INTO groups (id, org_id, name, primary_location, created_at) VALUES (?, ?, ?, ?, ?)`,
-		id, orgID, name, location, now()); err != nil {
+func createGroupTx(tx *sql.Tx, id, orgID, name, location, typ string) error {
+	if _, err := tx.Exec(`INSERT INTO groups (id, org_id, name, primary_location, created_at, type) VALUES (?, ?, ?, ?, ?, ?)`,
+		id, orgID, name, location, now(), typ); err != nil {
 		if isUnique(err) {
 			return ErrExists
 		}
@@ -37,9 +38,13 @@ func createGroupTx(tx *sql.Tx, orgID, name, location string) error {
 	return err
 }
 
-// CreateGroup creates a group whose primary is location.
-func (s *Store) CreateGroup(ctx context.Context, orgID, name, location string) (*Group, error) {
-	if err := s.tx(ctx, func(tx *sql.Tx) error { return createGroupTx(tx, orgID, name, location) }); err != nil {
+// CreateGroup creates a group whose primary is location, its databases of
+// type typ (the store's default when empty).
+func (s *Store) CreateGroup(ctx context.Context, orgID, name, location, typ string) (*Group, error) {
+	if typ == "" {
+		typ = s.dbType
+	}
+	if err := s.tx(ctx, func(tx *sql.Tx) error { return createGroupTx(tx, NewID(), orgID, name, location, typ) }); err != nil {
 		return nil, err
 	}
 	return s.Group(ctx, orgID, name)
@@ -95,12 +100,12 @@ func (s *Store) loadLocations(ctx context.Context, g *Group) error {
 	return rows.Err()
 }
 
-const groupCols = `id, org_id, name, primary_location, token_gen, created_at`
+const groupCols = `id, org_id, name, primary_location, token_gen, created_at, type`
 
 func scanGroup(r scanner) (*Group, error) {
 	var g Group
 	var created int64
-	if err := r.Scan(&g.ID, &g.OrgID, &g.Name, &g.Primary, &g.TokenGen, &created); err != nil {
+	if err := r.Scan(&g.ID, &g.OrgID, &g.Name, &g.Primary, &g.TokenGen, &created, &g.Type); err != nil {
 		return nil, notFound(err)
 	}
 	g.CreatedAt = unix(created)
@@ -205,14 +210,15 @@ type Database struct {
 	// File is the database file's name in its org's directory; empty means
 	// "<ID>.musq".
 	File string
+	Type string
 }
 
-const dbCols = `id, org_id, name, group_id, parent, parent_at, schema_only, token_gen, created_at, file`
+const dbCols = `id, org_id, name, group_id, parent, parent_at, schema_only, token_gen, created_at, file, type`
 
 func scanDatabase(r scanner) (*Database, error) {
 	var d Database
 	var parentAt, created int64
-	if err := r.Scan(&d.ID, &d.OrgID, &d.Name, &d.GroupID, &d.Parent, &parentAt, &d.SchemaOnly, &d.TokenGen, &created, &d.File); err != nil {
+	if err := r.Scan(&d.ID, &d.OrgID, &d.Name, &d.GroupID, &d.Parent, &parentAt, &d.SchemaOnly, &d.TokenGen, &created, &d.File, &d.Type); err != nil {
 		return nil, notFound(err)
 	}
 	d.ParentAt, d.CreatedAt = unix(parentAt), unix(created)
@@ -229,8 +235,11 @@ func (s *Store) CreateDatabase(ctx context.Context, d *Database) error {
 	if !d.ParentAt.IsZero() {
 		parentAt = d.ParentAt.Unix()
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO databases (`+dbCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
-		d.ID, d.OrgID, d.Name, d.GroupID, d.Parent, parentAt, d.SchemaOnly, d.CreatedAt.Unix(), d.File)
+	if d.Type == "" {
+		d.Type = TypePlain
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO databases (`+dbCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+		d.ID, d.OrgID, d.Name, d.GroupID, d.Parent, parentAt, d.SchemaOnly, d.CreatedAt.Unix(), d.File, d.Type)
 	if isUnique(err) {
 		return ErrExists
 	}

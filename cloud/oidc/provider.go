@@ -89,11 +89,17 @@ type Provider struct {
 	rotation time.Duration
 	secure   bool
 
-	mu     sync.RWMutex
-	active *signKey
-	keys   map[string]*signKey
-	byIP   *limiter
-	byMail *limiter
+	// kidPrefix marks the keys this node made: a cluster node signs with,
+	// rotates and drops only its own (each key's max_exp has one writer); the
+	// others' it only verifies with.
+	kidPrefix string
+
+	mu         sync.RWMutex
+	active     *signKey
+	keys       map[string]*signKey
+	lastReload time.Time
+	byIP       *limiter
+	byMail     *limiter
 }
 
 // Option configures a Provider.
@@ -104,7 +110,13 @@ type options struct {
 	rotation       time.Duration
 	perIP, perMail int
 	loginWindow    time.Duration
+	node           string
 }
+
+// WithNode names this node of a cluster: it signs with keys of its own and
+// verifies with every key in the state, reloading them (ReloadKeys) as other
+// nodes add theirs.
+func WithNode(name string) Option { return func(o *options) { o.node = name } }
 
 // WithKeyRotation makes a new signing key take over after d; the old key stays
 // in the key set until every token it signed has expired. Zero, the default,
@@ -145,33 +157,29 @@ func New(ctx context.Context, store *state.Store, issuer string, opts ...Option)
 	}
 	issuer = strings.TrimRight(issuer, "/")
 	p := &Provider{store: store, issuer: issuer, rotation: o.rotation, keys: map[string]*signKey{}, secure: strings.HasPrefix(issuer, "https://")}
+	if o.node != "" {
+		p.kidPrefix = o.node + "."
+	}
 	p.byIP, p.byMail = newLimiter(o.perIP, o.loginWindow), newLimiter(o.perMail, o.loginWindow)
 	keys, err := store.SigningKeys(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if len(keys) == 0 {
+	if !slices.ContainsFunc(keys, func(k *state.SigningKey) bool { return p.own(k.KID) }) {
 		_, priv, err := ed25519.GenerateKey(rand.Reader)
 		if err != nil {
 			return nil, err
 		}
-		k := &state.SigningKey{KID: state.NewID(), PrivateKey: priv.Seed(), CreatedAt: time.Now()}
+		k := &state.SigningKey{KID: p.kidPrefix + state.NewID(), PrivateKey: priv.Seed(), CreatedAt: time.Now()}
 		if err := store.AddSigningKey(ctx, k); err != nil {
 			return nil, err
 		}
-		keys = []*state.SigningKey{k}
+		keys = append([]*state.SigningKey{k}, keys...)
 	}
 	// Every stored key verifies: database tokens may never expire, so a key
-	// that signed one is kept. The newest unretired key signs.
-	for _, k := range keys {
-		if len(k.PrivateKey) != ed25519.SeedSize {
-			return nil, fmt.Errorf("oidc: signing key %s is malformed", k.KID)
-		}
-		sk := &signKey{kid: k.KID, priv: ed25519.NewKeyFromSeed(k.PrivateKey), created: k.CreatedAt, retired: k.RetiredAt, maxExp: k.MaxExp}
-		p.keys[k.KID] = sk
-		if p.active == nil && k.RetiredAt.IsZero() {
-			p.active = sk
-		}
+	// that signed one is kept. The newest unretired key of this node signs.
+	if err := p.loadKeys(keys); err != nil {
+		return nil, err
 	}
 	if p.active == nil {
 		return nil, errors.New("oidc: every signing key is retired")
@@ -197,6 +205,69 @@ func New(ctx context.Context, store *state.Store, issuer string, opts ...Option)
 	return p, nil
 }
 
+// own reports a key this node made, and so signs with and manages.
+func (p *Provider) own(kid string) bool { return strings.HasPrefix(kid, p.kidPrefix) }
+
+// loadKeys takes the stored keys (newest first): every one verifies, a key
+// already held keeps its in-memory state, and the active key is the newest
+// unretired own one. The caller holds p.mu, or has p to itself.
+func (p *Provider) loadKeys(keys []*state.SigningKey) error {
+	m := make(map[string]*signKey, len(keys))
+	var active *signKey
+	for _, k := range keys {
+		sk, ok := p.keys[k.KID]
+		if !ok || !p.own(k.KID) {
+			if len(k.PrivateKey) != ed25519.SeedSize {
+				return fmt.Errorf("oidc: signing key %s is malformed", k.KID)
+			}
+			sk = &signKey{kid: k.KID, priv: ed25519.NewKeyFromSeed(k.PrivateKey), created: k.CreatedAt, retired: k.RetiredAt, maxExp: k.MaxExp}
+		}
+		m[k.KID] = sk
+		if active == nil && p.own(k.KID) && sk.retired.IsZero() {
+			active = sk
+		}
+	}
+	if active == nil && p.active != nil {
+		// Our active key not stored yet would be a bug; keep signing with it.
+		active = p.active
+		m[active.kid] = active
+	}
+	p.keys, p.active = m, active
+	return nil
+}
+
+// ReloadKeys reads the signing keys again: a cluster node verifies with the
+// keys the other nodes add, and stops on the ones they drop.
+func (p *Provider) ReloadKeys(ctx context.Context) error {
+	keys, err := p.store.SigningKeys(ctx)
+	if err != nil {
+		return err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lastReload = time.Now()
+	return p.loadKeys(keys)
+}
+
+// key finds the key a token names; on a cluster node an unknown kid reloads
+// the set, at most once a second.
+func (p *Provider) key(kid string) (*signKey, bool) {
+	p.mu.RLock()
+	k, ok := p.keys[kid]
+	stale := !ok && p.kidPrefix != "" && time.Since(p.lastReload) > time.Second
+	p.mu.RUnlock()
+	if !stale {
+		return k, ok
+	}
+	if err := p.ReloadKeys(context.Background()); err != nil {
+		return nil, false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	k, ok = p.keys[kid]
+	return k, ok
+}
+
 // Issuer is the provider's issuer URL.
 func (p *Provider) Issuer() string { return p.issuer }
 
@@ -210,7 +281,7 @@ func (p *Provider) RotateIfDue(ctx context.Context, now time.Time) error {
 		if err != nil {
 			return err
 		}
-		k := &state.SigningKey{KID: state.NewID(), PrivateKey: priv.Seed(), CreatedAt: now}
+		k := &state.SigningKey{KID: p.kidPrefix + state.NewID(), PrivateKey: priv.Seed(), CreatedAt: now}
 		if err := p.store.AddSigningKey(ctx, k); err != nil {
 			return err
 		}
@@ -222,7 +293,7 @@ func (p *Provider) RotateIfDue(ctx context.Context, now time.Time) error {
 		p.keys[k.KID] = p.active
 	}
 	for kid, k := range p.keys {
-		if k.retired.IsZero() || k.maxExp < 0 || k.maxExp+int64(tokenLeeway/time.Second) >= now.Unix() {
+		if !p.own(kid) || k.retired.IsZero() || k.maxExp < 0 || k.maxExp+int64(tokenLeeway/time.Second) >= now.Unix() {
 			continue
 		}
 		if err := p.store.DeleteSigningKey(ctx, kid); err != nil {
@@ -284,9 +355,7 @@ func (p *Provider) Verify(token, use string) (*Claims, error) {
 	if err != nil || len(t.Headers) != 1 {
 		return nil, ErrInvalidToken
 	}
-	p.mu.RLock()
-	k, ok := p.keys[t.Headers[0].KeyID]
-	p.mu.RUnlock()
+	k, ok := p.key(t.Headers[0].KeyID)
 	if !ok {
 		return nil, ErrInvalidToken
 	}

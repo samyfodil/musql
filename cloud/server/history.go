@@ -74,6 +74,9 @@ func (s *Server) snapshotPass(ctx context.Context, now time.Time) {
 		return
 	}
 	for _, d := range dbs {
+		if d.Type == state.TypeCRDT && s.crdtHandle(d.ID) == nil {
+			continue // not placed here
+		}
 		h, err := s.history(d)
 		if errors.Is(err, os.ErrNotExist) {
 			continue // being created or deleted

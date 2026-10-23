@@ -38,6 +38,9 @@ type Config struct {
 	snapshotEvery, snapshotKeep time.Duration
 	// usageFlush is how often counted usage is written to the state.
 	usageFlush time.Duration
+	// syncInterval is how often a cluster node runs anti-entropy and
+	// placement.
+	syncInterval time.Duration
 }
 
 // OIDCConfig tunes sign-in. Durations take Go syntax plus "d" for days
@@ -80,18 +83,47 @@ type AdminConfig struct {
 	PasswordHash string `yaml:"password_hash"`
 }
 
-// NodeConfig names this node and its location.
+// NodeConfig names this node and its location; P2PListen is where a cluster
+// node listens for its peers.
 type NodeConfig struct {
-	Name     string `yaml:"name"`
-	Location string `yaml:"location"`
+	Name      string   `yaml:"name"`
+	Location  string   `yaml:"location"`
+	P2PListen []string `yaml:"p2p_listen"`
 }
 
-// Peer is another node of the deployment.
+// Peer is another node of a cluster: its libp2p peer ID and the multiaddrs
+// to dial it at.
 type Peer struct {
-	Name     string `yaml:"name"`
-	Location string `yaml:"location"`
-	URL      string `yaml:"url"`
-	Secret   string `yaml:"secret"`
+	Name     string   `yaml:"name"`
+	Location string   `yaml:"location"`
+	Addrs    []string `yaml:"addrs"`
+	PeerID   string   `yaml:"peer_id"`
+}
+
+// Clustered reports a cluster node: one with peers.
+func (c *Config) Clustered() bool { return len(c.Peers) > 0 }
+
+// checkPeers checks that every node has its own name and location, and every
+// peer an ID and an address.
+func (c *Config) checkPeers() error {
+	names := map[string]bool{c.Node.Name: true}
+	locs := map[string]bool{c.Node.Location: true}
+	for _, p := range c.Peers {
+		if p.Name == "" || names[p.Name] {
+			return fmt.Errorf("config: peer %q: every node needs its own name", p.Name)
+		}
+		if locs[p.Location] || !state.ValidName.MatchString(p.Location) {
+			return fmt.Errorf("config: peer %s: location %q is taken or invalid", p.Name, p.Location)
+		}
+		if p.PeerID == "" || len(p.Addrs) == 0 {
+			return fmt.Errorf("config: peer %s: peer_id and addrs are required", p.Name)
+		}
+		names[p.Name], locs[p.Location] = true, true
+	}
+	if c.Clustered() && len(c.Node.P2PListen) == 0 {
+		c.Node.P2PListen = []string{"/ip4/0.0.0.0/tcp/4001"}
+	}
+	return nil
 }
 
 // AIConfig configures AI SQL; an empty Provider turns it off.
@@ -140,6 +172,9 @@ func (c *Config) normalize() error {
 	if !state.ValidName.MatchString(c.Node.Location) {
 		return fmt.Errorf("config: node.location %q: lower-case letters, digits and dashes", c.Node.Location)
 	}
+	if err := c.checkPeers(); err != nil {
+		return err
+	}
 	if c.PublicURL == "" {
 		host := c.Listen
 		if strings.HasPrefix(host, ":") {
@@ -167,6 +202,7 @@ func (c *Config) normalize() error {
 		*d.out = dur
 	}
 	c.usageFlush = time.Minute
+	c.syncInterval = 2 * time.Second
 	if c.Admin.Email == "" {
 		return errors.New("config: admin.email is required")
 	}

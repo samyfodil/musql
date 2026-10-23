@@ -73,7 +73,7 @@ func (s *Store) CreateOrg(ctx context.Context, slug, name, owner, location strin
 		if _, err := tx.Exec(`INSERT INTO members (org_id, user_id, role) VALUES (?, ?, ?)`, o.ID, owner, RoleOwner); err != nil {
 			return err
 		}
-		return createGroupTx(tx, o.ID, "default", location)
+		return createGroupTx(tx, NewID(), o.ID, "default", location, s.dbType)
 	})
 	if err != nil {
 		return nil, err

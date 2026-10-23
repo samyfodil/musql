@@ -42,6 +42,9 @@ func (s databaseService) ListSnapshots(ctx context.Context, req *connect.Request
 	if err != nil {
 		return nil, err
 	}
+	if err := s.localCopy(ctx, d); err != nil {
+		return nil, err
+	}
 	h, err := s.history(d)
 	if err != nil {
 		return nil, rpcErr(err)
@@ -56,6 +59,9 @@ func (s databaseService) ListSnapshots(ctx context.Context, req *connect.Request
 func (s databaseService) CreateSnapshot(ctx context.Context, req *connect.Request[v1.CreateSnapshotRequest]) (*connect.Response[v1.CreateSnapshotResponse], error) {
 	_, d, _, err := s.lookup(ctx, req, req.Msg.Org, req.Msg.Name, state.RoleMember)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.localCopy(ctx, d); err != nil {
 		return nil, err
 	}
 	h, err := s.history(d)
@@ -74,6 +80,9 @@ func (s databaseService) Restore(ctx context.Context, req *connect.Request[v1.Re
 	o, d, _, err := s.lookup(ctx, req, m.Org, m.Name, state.RoleMember)
 	if err != nil {
 		return nil, err
+	}
+	if d.Type == state.TypeCRDT {
+		return nil, errCRDTHistory
 	}
 	at := time.Now()
 	if m.At != nil {
@@ -98,7 +107,7 @@ func (s databaseService) Restore(ctx context.Context, req *connect.Request[v1.Re
 	if _, err := s.store.Database(ctx, o.ID, name); err == nil {
 		return nil, rpcErr(state.ErrExists)
 	}
-	nd := &state.Database{ID: state.NewID(), OrgID: o.ID, Name: name, GroupID: d.GroupID, Parent: d.ID, ParentAt: at}
+	nd := &state.Database{ID: state.NewID(), OrgID: o.ID, Name: name, GroupID: d.GroupID, Parent: d.ID, ParentAt: at, Type: d.Type}
 	if err := os.MkdirAll(filepath.Dir(s.dbPath(nd)), 0o700); err != nil {
 		return nil, rpcErr(err)
 	}
