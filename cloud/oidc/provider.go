@@ -78,9 +78,28 @@ type Provider struct {
 	secure bool
 }
 
+// Option configures a Provider.
+type Option func(*options)
+
+type options struct {
+	consoleOrigins []string
+}
+
+// WithConsoleOrigins registers these origins as extra homes of the console
+// client: <origin>/console/callback and <origin>/callback are accepted
+// redirect URIs, so a dev server on another port can sign in. "*" is not an
+// origin and is skipped; matching stays exact.
+func WithConsoleOrigins(origins []string) Option {
+	return func(o *options) { o.consoleOrigins = origins }
+}
+
 // New returns a provider for issuer (the public URL, no trailing slash),
 // creating a signing key and the built-in clients when missing.
-func New(ctx context.Context, store *state.Store, issuer string) (*Provider, error) {
+func New(ctx context.Context, store *state.Store, issuer string, opts ...Option) (*Provider, error) {
+	var o options
+	for _, f := range opts {
+		f(&o)
+	}
 	issuer = strings.TrimRight(issuer, "/")
 	p := &Provider{store: store, issuer: issuer, pub: map[string]ed25519.PublicKey{}, secure: strings.HasPrefix(issuer, "https://")}
 	keys, err := store.SigningKeys(ctx)
@@ -113,8 +132,15 @@ func New(ctx context.Context, store *state.Store, issuer string) (*Provider, err
 	if p.active.priv == nil {
 		return nil, errors.New("oidc: every signing key is retired")
 	}
+	console := []string{issuer + "/console/callback"}
+	for _, origin := range o.consoleOrigins {
+		origin = strings.TrimRight(origin, "/")
+		if origin != "*" && origin != "" {
+			console = append(console, origin+"/console/callback", origin+"/callback")
+		}
+	}
 	for _, c := range []*state.Client{
-		{ID: ClientConsole, RedirectURIs: []string{issuer + "/console/callback"}, Public: true},
+		{ID: ClientConsole, RedirectURIs: console, Public: true},
 		{ID: ClientCLI, Public: true},
 	} {
 		if err := store.PutClient(ctx, c); err != nil {
