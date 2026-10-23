@@ -223,9 +223,22 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("api token: %q %v", ci.String(), err)
 	}
 
+	kept, err := cli.LoadConfig(h.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	h.run("auth", "logout")
 	if _, err := h.try("db", "list"); err == nil || !strings.Contains(err.Error(), "not signed in") {
 		t.Fatalf("after logout: %v", err)
+	}
+
+	// A copy of the refresh token taken before logout is dead on the server.
+	kept.AccessToken, kept.Expiry = "", time.Time{}
+	if err := kept.Save(h.dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.try("db", "list"); err == nil || !strings.Contains(err.Error(), "not signed in") {
+		t.Fatalf("refresh token survived logout: %v", err)
 	}
 }
 

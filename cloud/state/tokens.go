@@ -128,6 +128,14 @@ func (s *Store) UseRefreshToken(ctx context.Context, secret string) (*RefreshTok
 	return &rt, nil
 }
 
+// RevokeRefreshToken deletes the whole family of a refresh token issued to
+// clientID. An unknown token, or another client's, is not an error.
+func (s *Store) RevokeRefreshToken(ctx context.Context, secret, clientID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM refresh_tokens WHERE family IN (SELECT family FROM refresh_tokens WHERE hash = ? AND client_id = ?)`,
+		HashToken(secret), clientID)
+	return err
+}
+
 // RevokeUserRefreshTokens revokes every refresh token a user holds.
 func (s *Store) RevokeUserRefreshTokens(ctx context.Context, userID string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM refresh_tokens WHERE user_id = ?`, userID)

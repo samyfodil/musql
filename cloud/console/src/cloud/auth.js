@@ -109,11 +109,20 @@ export async function token() {
 }
 
 /** signOut forgets the tokens and ends the server's sign-in session. */
-export function signOut() {
+export async function signOut() {
+	const rt = storage((s) => s.getItem(REFRESH));
 	access = null;
 	clearTimeout(timer);
 	storage((s) => s.removeItem(REFRESH));
 	set({ status: "out" });
+	// Revoke the refresh token server-side, but never let a failure keep the user signed in.
+	if (rt) {
+		await fetch(`${server}/oidc/revoke`, {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ client_id: CLIENT, token: rt, token_type_hint: "refresh_token" }),
+		}).catch(() => {});
+	}
 	location.assign(`${server}/oidc/logout?${new URLSearchParams({ post_logout_redirect_uri: `${server}/console/` })}`);
 }
 

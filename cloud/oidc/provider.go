@@ -334,6 +334,7 @@ func (p *Provider) Handler() http.Handler {
 	mux.HandleFunc("GET /oidc/jwks", p.jwks)
 	mux.HandleFunc("GET /oidc/authorize", p.authorize)
 	mux.HandleFunc("POST /oidc/token", p.token)
+	mux.HandleFunc("POST /oidc/revoke", p.revoke)
 	mux.HandleFunc("POST /oidc/device", p.deviceAuthorization)
 	mux.HandleFunc("GET /oidc/device/verify", p.deviceVerifyPage)
 	mux.HandleFunc("POST /oidc/device/verify", p.deviceVerify)
@@ -351,6 +352,7 @@ func (p *Provider) discovery(w http.ResponseWriter, r *http.Request) {
 		"issuer":                                p.issuer,
 		"authorization_endpoint":                p.issuer + "/oidc/authorize",
 		"token_endpoint":                        p.issuer + "/oidc/token",
+		"revocation_endpoint":                   p.issuer + "/oidc/revoke",
 		"device_authorization_endpoint":         p.issuer + "/oidc/device",
 		"userinfo_endpoint":                     p.issuer + "/oidc/userinfo",
 		"jwks_uri":                              p.issuer + "/oidc/jwks",
@@ -616,6 +618,27 @@ func (p *Provider) token(w http.ResponseWriter, r *http.Request) {
 	default:
 		tokenError(w, "unsupported_grant_type", "")
 	}
+}
+
+// revoke is RFC 7009. Only refresh tokens are stored, so only they can be
+// revoked (with their whole family); an access token is a signed JWT that
+// stays valid until it expires, and revoking one is accepted and does
+// nothing. As the RFC asks, an unknown token is not an error.
+func (p *Provider) revoke(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	clientID := r.PostFormValue("client_id")
+	if _, err := p.store.Client(ctx, clientID); err != nil {
+		tokenError(w, "invalid_client", "unknown client")
+		return
+	}
+	if tok := r.PostFormValue("token"); tok != "" && r.PostFormValue("token_type_hint") != "access_token" {
+		if err := p.store.RevokeRefreshToken(ctx, tok, clientID); err != nil {
+			tokenError(w, "server_error", "")
+			return
+		}
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
 }
 
 // pkceOK checks an RFC 7636 S256 verifier against its challenge.

@@ -63,9 +63,25 @@ func (a *app) authCmd() *cobra.Command {
 		Short: "Forget the stored sign-in",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Forget locally first, so a server that is down never leaves
+			// the refresh token on disk; then say so to the server.
+			rt := a.cfg.RefreshToken
 			a.cfg.AccessToken, a.cfg.RefreshToken = "", ""
 			a.cfg.Expiry = time.Time{}
-			return a.cfg.Save(a.env.Dir)
+			if err := a.cfg.Save(a.env.Dir); err != nil {
+				return err
+			}
+			if rt == "" {
+				return nil
+			}
+			srv, err := a.server()
+			if err != nil {
+				return nil
+			}
+			if err := revoke(cmd.Context(), a.env.HTTP, srv, rt); err != nil {
+				fmt.Fprintf(a.env.Stderr, "Signed out here, but the server could not revoke the token: %v\n", err)
+			}
+			return nil
 		},
 	}
 
