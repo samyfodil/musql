@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+package cloud.v1;
+
+import "google/protobuf/timestamp.proto";
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_VIEWER = 1;
+  ROLE_MEMBER = 2;
+  ROLE_ADMIN = 3;
+  ROLE_OWNER = 4;
+}
+
+message User {
+  string id = 1;
+  string email = 2;
+  string name = 3;
+  bool disabled = 4;
+  bool admin = 5;
+  google.protobuf.Timestamp created_at = 6;
+}
+
+message Org {
+  string id = 1;
+  string slug = 2;
+  string name = 3;
+  bool personal = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+message Member {
+  User user = 1;
+  Role role = 2;
+}
+
+message Invite {
+  string id = 1;
+  string org = 2;
+  string email = 3;
+  Role role = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+message Group {
+  string name = 1;
+  string org = 2;
+  string primary = 3;
+  repeated string locations = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+message Database {
+  string id = 1;
+  string org = 2;
+  string name = 3;
+  string group = 4;
+  string url = 5;
+  int64 size_bytes = 6;
+  string parent = 7;
+  google.protobuf.Timestamp parent_at = 8;
+  bool schema_only = 9;
+  google.protobuf.Timestamp created_at = 10;
+}
