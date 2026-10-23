@@ -21,3 +21,11 @@ plugins:
   - local: protoc-gen-connect-go
     out: .
     opt: module=github.com/samyfodil/musql
+  # The console's TypeScript-free client (protobuf-es v2), cloud.v1 only. The
+  # plugin is the console's pinned dev dependency: npm install there first.
+  - local: cloud/console/node_modules/.bin/protoc-gen-es
+    out: cloud/console/src/gen
+    opt: target=js+dts
+    include_imports: false
+    types:
+      - cloud.v1
