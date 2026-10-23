@@ -777,6 +777,6 @@ label.stagetoggle { display: inline-flex; align-items: center; gap: 5px; font-si
 .summary tr.click:hover td { background: var(--sel); }
 
 /* function hints */
-.cm-tooltip.fn-sig { padding: 4px 8px; font: 12px var(--mono); max-width: 520px; }
-.cm-tooltip.fn-sig .arg { color: var(--accent); font-weight: 600; }
-.cm-tooltip.fn-sig .about { display: block; font-family: var(--sans); color: var(--dim); margin-top: 2px; }
+.cm-tooltip .fn-sig { padding: 4px 8px; font: 12px var(--mono); max-width: 520px; }
+.cm-tooltip .fn-sig .arg { color: var(--accent); font-weight: 600; }
+.cm-tooltip .fn-sig .about { display: block; font-family: var(--sans); color: var(--dim); margin-top: 2px; }

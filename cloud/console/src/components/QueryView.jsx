@@ -13,6 +13,7 @@ import { useStudio } from "../studio.js";
 import { DEFAULT_MODEL, embed, vectorBlob } from "../embed.js";
 import { expandEmbeds, verb } from "../sqltext.js";
 import { history, remember, save } from "../library.js";
+import { functionHints } from "../fnhints.js";
 import Grid from "./Grid.jsx";
 import { MenuButton } from "./Menu.jsx";
 import Chart from "./Chart.jsx";
@@ -207,7 +208,8 @@ export default function QueryView({ initial = "", title, onTitle }) {
 		}
 	}
 
-	// Completion knows every table and view and their columns. Ctrl/Cmd+Enter is
+	// Completion knows every table and view and their columns, and the functions
+	// with their signatures (fnhints.js). Ctrl/Cmd+Enter is
 	// taken before any keymap, so an open completion list cannot swallow it.
 	const extensions = useMemo(() => {
 		const tables = {};
@@ -219,6 +221,7 @@ export default function QueryView({ initial = "", title, onTitle }) {
 		};
 		return [
 			sql({ dialect: SQLite, schema: tables, upperCaseKeywords: true }),
+			functionHints,
 			// Declared up front so a run's error marks survive the editor reconfiguring.
 			lintGutter(),
 			EditorView.lineWrapping,
