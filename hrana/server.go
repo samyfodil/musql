@@ -53,6 +53,8 @@ type config struct {
 	roDB      *sql.DB
 	idle      time.Duration
 	observe   func(Stmt)
+	primary   http.Handler
+	readOnly  func(sql string) bool
 }
 
 func newConfig(opts []Option) config {
@@ -169,6 +171,14 @@ func (s *Server) track() bool {
 
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.primary != nil {
+		s.replicaServe(w, r)
+		return
+	}
+	s.serve(w, r)
+}
+
+func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	// A WebSocket client authenticates in its hello message, not a header.
 	if isWebSocket(r) {
 		s.serveWS(w, r)
@@ -280,30 +290,12 @@ func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, protobuf, ro b
 		writeHTTPError(w, http.StatusBadRequest, err, protobuf)
 		return
 	}
-	var req *pbhttp.PipelineReqBody
-	var batchLens []int
-	if protobuf {
-		req = &pbhttp.PipelineReqBody{}
-		if err := proto.Unmarshal(body, req); err != nil {
-			writeHTTPError(w, http.StatusBadRequest, err, true)
-			return
-		}
-	} else {
-		var j jPipelineReq
-		if err := json.Unmarshal(body, &j); err != nil {
-			writeHTTPError(w, http.StatusBadRequest, err, false)
-			return
-		}
-		req = &pbhttp.PipelineReqBody{Baton: j.Baton}
-		for i := range j.Requests {
-			pr, err := j.Requests[i].proto()
-			if err != nil {
-				writeHTTPError(w, http.StatusBadRequest, err, false)
-				return
-			}
-			req.Requests = append(req.Requests, pr)
-		}
+	req, err := decodePipeline(body, protobuf)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err, protobuf)
+		return
 	}
+	var batchLens []int
 	for _, rq := range req.GetRequests() {
 		batchLens = append(batchLens, len(rq.GetBatch().GetBatch().GetSteps()))
 	}
@@ -340,6 +332,42 @@ func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, protobuf, ro b
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"baton": resp.Baton, "base_url": nil, "results": results})
+}
+
+func decodePipeline(body []byte, protobuf bool) (*pbhttp.PipelineReqBody, error) {
+	if protobuf {
+		req := &pbhttp.PipelineReqBody{}
+		return req, proto.Unmarshal(body, req)
+	}
+	var j jPipelineReq
+	if err := json.Unmarshal(body, &j); err != nil {
+		return nil, err
+	}
+	req := &pbhttp.PipelineReqBody{Baton: j.Baton}
+	for i := range j.Requests {
+		pr, err := j.Requests[i].proto()
+		if err != nil {
+			return nil, err
+		}
+		req.Requests = append(req.Requests, pr)
+	}
+	return req, nil
+}
+
+func decodeCursor(body []byte, protobuf bool) (*pbhttp.CursorReqBody, error) {
+	if protobuf {
+		req := &pbhttp.CursorReqBody{}
+		return req, proto.Unmarshal(body, req)
+	}
+	var j jCursorReq
+	if err := json.Unmarshal(body, &j); err != nil {
+		return nil, err
+	}
+	b, err := j.Batch.proto()
+	if err != nil {
+		return nil, err
+	}
+	return &pbhttp.CursorReqBody{Baton: j.Baton, Batch: b}, nil
 }
 
 // handle runs one stream request; closed reports a close request.
@@ -395,25 +423,10 @@ func (s *Server) cursor(w http.ResponseWriter, r *http.Request, protobuf, ro boo
 		writeHTTPError(w, http.StatusBadRequest, err, protobuf)
 		return
 	}
-	var req *pbhttp.CursorReqBody
-	if protobuf {
-		req = &pbhttp.CursorReqBody{}
-		if err := proto.Unmarshal(body, req); err != nil {
-			writeHTTPError(w, http.StatusBadRequest, err, true)
-			return
-		}
-	} else {
-		var j jCursorReq
-		if err := json.Unmarshal(body, &j); err != nil {
-			writeHTTPError(w, http.StatusBadRequest, err, false)
-			return
-		}
-		b, err := j.Batch.proto()
-		if err != nil {
-			writeHTTPError(w, http.StatusBadRequest, err, false)
-			return
-		}
-		req = &pbhttp.CursorReqBody{Baton: j.Baton, Batch: b}
+	req, err := decodeCursor(body, protobuf)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err, protobuf)
+		return
 	}
 	hs, err := s.take(r.Context(), req.Baton, ro)
 	if err != nil {
