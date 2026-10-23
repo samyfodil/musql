@@ -324,15 +324,15 @@ func (s databaseService) InvalidateTokens(ctx context.Context, req *connect.Requ
 	}
 	switch {
 	case req.Msg.Name != "":
-		d, err := s.store.Database(ctx, o.ID, req.Msg.Name)
-		if err != nil {
-			return nil, rpcErr(err)
+		d, derr := s.store.Database(ctx, o.ID, req.Msg.Name)
+		if derr != nil {
+			return nil, rpcErr(derr)
 		}
 		err = s.store.BumpDatabaseTokens(ctx, d.ID)
 	case req.Msg.Group != "":
-		g, err := s.store.Group(ctx, o.ID, req.Msg.Group)
-		if err != nil {
-			return nil, rpcErr(err)
+		g, gerr := s.store.Group(ctx, o.ID, req.Msg.Group)
+		if gerr != nil {
+			return nil, rpcErr(gerr)
 		}
 		err = s.store.BumpGroupTokens(ctx, g.ID)
 	default:
