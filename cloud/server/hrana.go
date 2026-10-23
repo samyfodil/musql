@@ -52,13 +52,15 @@ const idleClose = 5 * time.Minute
 
 type entry struct {
 	db       *sql.DB
+	ro       *sql.DB
 	srv      *hrana.Server
 	last     time.Time
 	inflight int
 }
 
 // pool holds the open databases, opened on first use and closed when idle.
-// Each database has up to two: a full-access one and a read-only one.
+// Each database has two handles, a full-access one and a read-only one, behind
+// one Hrana server that picks by the client's token.
 type pool struct {
 	mu   sync.Mutex
 	m    map[string]*entry
@@ -74,29 +76,18 @@ func newPool() *pool {
 	return p
 }
 
-func key(id string, readOnly bool) string {
-	if readOnly {
-		return id + "/ro"
-	}
-	return id + "/rw"
-}
-
 // get returns the Hrana server for a database file, and a release to call
-// when the request is done.
-func (p *pool) get(id, path string, readOnly bool) (*hrana.Server, func(), error) {
+// when the request is done. check authenticates its clients; it is used only
+// when the server is first opened.
+func (p *pool) get(id, path string, check func(token string) (bool, error)) (*hrana.Server, func(), error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	k := key(id, readOnly)
-	e, ok := p.m[k]
+	e, ok := p.m[id]
 	if !ok {
 		if _, err := os.Stat(path); err != nil {
 			return nil, nil, err
 		}
-		mode := "rw"
-		if readOnly {
-			mode = "ro"
-		}
-		db, err := sql.Open("sqlite", path+"?"+dsnMode+"="+mode)
+		db, err := sql.Open("sqlite", path+"?"+dsnMode+"=rw")
 		if err != nil {
 			return nil, nil, err
 		}
@@ -104,8 +95,18 @@ func (p *pool) get(id, path string, readOnly bool) (*hrana.Server, func(), error
 			db.Close()
 			return nil, nil, err
 		}
-		e = &entry{db: db, srv: hrana.NewServer(db)}
-		p.m[k] = e
+		ro, err := sql.Open("sqlite", path+"?"+dsnMode+"=ro")
+		if err != nil {
+			db.Close()
+			return nil, nil, err
+		}
+		if err := ro.Ping(); err != nil {
+			ro.Close()
+			db.Close()
+			return nil, nil, err
+		}
+		e = &entry{db: db, ro: ro, srv: hrana.NewServer(db, hrana.WithReadOnlyDB(ro), hrana.WithAuth(check))}
+		p.m[id] = e
 	}
 	e.inflight++
 	e.last = time.Now()
@@ -120,20 +121,16 @@ func (p *pool) get(id, path string, readOnly bool) (*hrana.Server, func(), error
 func (e *entry) close() {
 	e.srv.Close()
 	e.db.Close()
+	e.ro.Close()
 }
 
 // drop closes a database's servers, before its file is removed or replaced.
 func (p *pool) drop(id string) {
 	p.mu.Lock()
-	var gone []*entry
-	for _, k := range []string{key(id, false), key(id, true)} {
-		if e, ok := p.m[k]; ok {
-			gone = append(gone, e)
-			delete(p.m, k)
-		}
-	}
+	e, ok := p.m[id]
+	delete(p.m, id)
 	p.mu.Unlock()
-	for _, e := range gone {
+	if ok {
 		e.close()
 	}
 }
@@ -221,17 +218,7 @@ func (s *Server) serveDB(w http.ResponseWriter, r *http.Request) {
 		hranaError(w, http.StatusNotFound, "no such database")
 		return
 	}
-	// A WebSocket client sends its token in its hello message, which the
-	// Hrana server checks against one fixed token; this server's tokens are
-	// per database, so a WebSocket must authenticate with its upgrade
-	// request's Authorization header instead.
-	readOnly, err := s.dbAccess(ctx, bearer(r.Header), o, d)
-	if err != nil {
-		w.Header().Set("WWW-Authenticate", `Bearer`)
-		hranaError(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
-	srv, release, err := s.pool.get(d.ID, s.dbPath(d), readOnly)
+	srv, release, err := s.pool.get(d.ID, s.dbPath(d), s.hranaAuth(o.ID, d.ID))
 	if err != nil {
 		s.log.Printf("open %s/%s: %v", o.Slug, d.Name, err)
 		hranaError(w, http.StatusServiceUnavailable, "database unavailable")
@@ -242,6 +229,24 @@ func (s *Server) serveDB(w http.ResponseWriter, r *http.Request) {
 	r2.URL.Path = "/" + sub
 	r2.URL.RawPath = ""
 	srv.ServeHTTP(w, r2)
+}
+
+// hranaAuth is the token check of a database's Hrana server: HTTP requests
+// and WebSocket hellos alike. It looks the database up at each call, so a
+// rename, an invalidation or a role change takes effect at once.
+func (s *Server) hranaAuth(orgID, dbID string) func(string) (bool, error) {
+	return func(tok string) (bool, error) {
+		ctx := context.Background()
+		o, err := s.store.OrgByID(ctx, orgID)
+		if err != nil {
+			return false, errNoAccess
+		}
+		d, err := s.store.DatabaseByID(ctx, dbID)
+		if err != nil {
+			return false, errNoAccess
+		}
+		return s.dbAccess(ctx, tok, o, d)
+	}
 }
 
 var errNoAccess = errors.New("no access")
