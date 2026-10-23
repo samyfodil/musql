@@ -247,7 +247,7 @@ name:
 - **Signing keys**: every node signs. A node starts a key of its own when it
   has none and rotates on schedule; JWKS publishes every key in the
   replicated set, and verification reloads the set on an unknown `kid` (and
-  every minute), so a token signed anywhere verifies everywhere once its key
+  at each 2s sync pass), so a token signed anywhere verifies everywhere once its key
   has synced: one sync interval after a node's new key.
 - **Refresh tokens** rotate on use, and a reused one revokes its family. A
   use reaches the other nodes only at sync, so within one sync interval

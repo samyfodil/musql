@@ -186,6 +186,9 @@ func (p *pool) closeAll() {
 // It opens only once the database's history is, so no commit goes unlogged.
 func (s *Server) openEntry(d *state.Database) (*entry, error) {
 	path := s.dbPath(d)
+	if d.Type == state.TypeCRDT && s.crdtHandle(d.ID) == nil {
+		return nil, errNotHere
+	}
 	// Opening creates a missing file; a database whose file is gone is gone.
 	if _, err := os.Stat(path); err != nil {
 		return nil, err
@@ -196,9 +199,6 @@ func (s *Server) openEntry(d *state.Database) (*entry, error) {
 	// A crdt database is written through its replicated handle, which
 	// outlives the entry; any other connection may only read it.
 	db, shared := s.crdtHandle(d.ID), true
-	if d.Type == state.TypeCRDT && db == nil {
-		return nil, errNotHere
-	}
 	if db == nil {
 		var err error
 		if db, err = openPinged(path + "?" + dsnMode + "=rw"); err != nil {

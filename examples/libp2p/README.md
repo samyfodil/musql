@@ -4,7 +4,7 @@ A `replication.Transport` over libp2p, and the end-to-end test that runs real
 nodes over it. It is an example of plugging a network into
 `replication.WithTransport`, not part of musql: the engine, the driver and the
 replication package know nothing of it, and it is its own module so none of
-them pull in libp2p.
+them pull in libp2p. musql cloud's cluster mode (`cloud/cluster`) runs on it.
 
 ```go
 import (

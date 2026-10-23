@@ -91,7 +91,8 @@ func (s *Store) execIdempotent(stmt string) error {
 			return nil
 		}
 	}
-	if _, err := s.db.Exec(stmt); err != nil {
+	// A peer's same statement can land between the check and this one.
+	if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 		return fmt.Errorf("state: %s: %w", stmt, err)
 	}
 	return nil

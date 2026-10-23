@@ -9,11 +9,14 @@ import { DatabaseService } from "../gen/cloud/v1/database_pb.js";
 import { GroupService } from "../gen/cloud/v1/group_pb.js";
 import { OrgService } from "../gen/cloud/v1/org_pb.js";
 import { UserService } from "../gen/cloud/v1/user_pb.js";
-import { Role } from "../gen/cloud/v1/common_pb.js";
+import { DatabaseType, Role } from "../gen/cloud/v1/common_pb.js";
 import { Access, FileFormat } from "../gen/cloud/v1/database_pb.js";
 import { refresh, server, token } from "./auth.js";
 
-export { Access, Code, FileFormat, Role };
+export { Access, Code, DatabaseType, FileFormat, Role };
+
+// typeName is a database type as the API and the docs spell it.
+export const typeName = (t) => ({ [DatabaseType.PLAIN]: "plain", [DatabaseType.CRDT]: "crdt", [DatabaseType.RAFT]: "raft" })[t] ?? "plain";
 
 const bearer = (next) => async (req) => {
 	req.header.set("Authorization", `Bearer ${await token()}`);
