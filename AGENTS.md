@@ -90,7 +90,7 @@ The segment file carries its format version (`segFileVersion` in
 | `proto/` | Protobuf definitions. `buf generate` (repo root) writes the Go code into `hrana/gen/` and `examples/libp2p` has its own config. Never edit generated code by hand. |
 | `replication/` | Replication: capture, HLC, op log, CRDT and leader modes. The network is supplied by the caller (`WithTransport`). |
 | `npm/` | The npm package (`@samyfodil/musql`, GitHub Packages): `wasm/main.go` is its WebAssembly module, `index.js` the JavaScript API, `build.sh` builds both. Published by the release workflow on every tag. |
-| `studio/` | musql studio: a browser database editor (React, Vite) over the npm package, opening and exporting both musql and C SQLite files. |
+| `cloud/console/` | The console: a browser database editor (React, Vite) over the npm package, opening and exporting both musql and C SQLite files. |
 | `examples/libp2p/` | An example `Transport` over libp2p, its own module. |
 | `internal/jit/` | The JIT: x86-64 and AArch64 emitters, W^X mapping, trampolines. |
 | `internal/filelock/` | OFD byte-range locks used by the write path. |

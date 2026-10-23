@@ -1,4 +1,4 @@
-# musql studio
+# musql console
 
 A database editor that runs entirely in the browser, on the npm package
 (`../npm`): musql compiled to WebAssembly, in a Web Worker so its JIT is on.

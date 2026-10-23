@@ -97,8 +97,8 @@ jobs:
         run: |
           sh build.sh
           node test.mjs
-      - name: studio builds
-        working-directory: studio
+      - name: console builds
+        working-directory: cloud/console
         run: |
           npm ci --no-audit --no-fund
           npm run build
