@@ -333,7 +333,7 @@ export default function TableView({ name, mode: initialMode = "data" }) {
 					<div className="pager">
 						<span>{searching ? `${fmt(total)} closest` : total ? `${fmt(offset + 1)}–${fmt(last)} of ${fmt(total)}` : "0 rows"}</span>
 						<span className="grow" />
-						<span className="small">{searching ? "Closest first" : editable ? "Double-click a cell to edit · click # to select" : view ? "Views are read-only" : ""}</span>
+						<span className="small">{searching ? "Closest first" : editable ? "Double-click or Enter edits a cell · # or Space selects a row · arrows move" : view ? "Views are read-only" : ""}</span>
 						<button title="Download the rows shown (all pages) as CSV" onClick={() => exportRows("csv")}>CSV</button>
 						<button title="Download the rows shown (all pages) as JSON" onClick={() => exportRows("json")}>JSON</button>
 						{!searching && <button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - PAGE))}>‹ Prev</button>}
@@ -404,10 +404,10 @@ function EmbedDialog({ name, textCols, embs, onClose }) {
 // Structure shows a table's columns, keys, indexes and DDL, and changes it:
 // add, rename and drop columns, add an index, rename or drop the table.
 function Structure({ name, obj, cols, schema, editable, onChanged }) {
-	const { status } = useStudio();
+	const { status, editTable, openQuery } = useStudio();
 	const [fks, setFks] = useState([]);
 	const [newCol, setNewCol] = useState({ name: "", type: "TEXT" });
-	const [newIdx, setNewIdx] = useState({ cols: [], unique: false });
+	const [newIdx, setNewIdx] = useState({ cols: [], unique: false, name: "" });
 	useEffect(() => {
 		rowsOf(`PRAGMA foreign_key_list(${ident(name)})`).then(setFks, () => setFks([]));
 	}, [name, obj.sql]);
@@ -434,7 +434,10 @@ function Structure({ name, obj, cols, schema, editable, onChanged }) {
 	return (
 		<div className="structure">
 			<section>
-				<h4>Columns</h4>
+				<div className="sechead">
+					<h4>Columns</h4>
+					{editable && <button className="primary" title="Change columns, types, keys, defaults and foreign keys" onClick={() => editTable(name)}>Edit table…</button>}
+				</div>
 				<table className="grid">
 					<thead><tr><th /><th>name</th><th>type</th><th>not null</th><th>default</th>{editable && <th />}</tr></thead>
 					<tbody>
@@ -478,20 +481,26 @@ function Structure({ name, obj, cols, schema, editable, onChanged }) {
 				<h4>Indexes and triggers</h4>
 				{related.length > 0 && <pre className="ddl">{related.map((o) => o.sql ?? `-- ${o.name} (automatic)`).join(";\n\n")}</pre>}
 				{related.filter((o) => o.sql && (o.type === "index" || o.type === "trigger")).map((o) => (
-					<button key={o.name} className="link" onClick={() => confirm(`Drop ${o.type} ${o.name}?`) && change(`DROP ${o.type.toUpperCase()} ${ident(o.name)}`, `Dropped ${o.name}.`)}>
-						drop {o.name}
-					</button>
+					<div key={o.name} className="inline objrow">
+						<span className="mono small">{o.type} {o.name}</span>
+						<button className="link" title="Open its definition in a query tab, to change and run" onClick={() => openQuery(`DROP ${o.type.toUpperCase()} ${ident(o.name)};\n${o.sql};\n`, `Edit ${o.name}`)}>edit</button>
+						<button className="link" onClick={() => confirm(`Drop ${o.type} ${o.name}?`) && change(`DROP ${o.type.toUpperCase()} ${ident(o.name)}`, `Dropped ${o.name}.`)}>drop</button>
+					</div>
 				))}
+				{table && (
+					<button className="link small" onClick={() => openQuery(`CREATE TRIGGER ${ident(name + "_trigger")} AFTER INSERT ON ${ident(name)}\nBEGIN\n  SELECT 1; -- the trigger's statements; NEW is the row\nEND;\n`, "New trigger")}>＋ trigger…</button>
+				)}
 				{editable && (
 					<form className="inline" onSubmit={async (e) => {
 						e.preventDefault();
 						if (!newIdx.cols.length) return;
-						const idx = `${name}_${newIdx.cols.join("_")}_idx`;
-						if (await change(`CREATE ${newIdx.unique ? "UNIQUE " : ""}INDEX ${ident(idx)} ON ${ident(name)}(${newIdx.cols.map(ident).join(", ")})`, `Created ${idx}.`)) setNewIdx({ cols: [], unique: false });
+						const idx = newIdx.name.trim() || `${name}_${newIdx.cols.join("_")}_idx`;
+						if (await change(`CREATE ${newIdx.unique ? "UNIQUE " : ""}INDEX ${ident(idx)} ON ${ident(name)}(${newIdx.cols.map(ident).join(", ")})`, `Created ${idx}.`)) setNewIdx({ cols: [], unique: false, name: "" });
 					}}>
 						<select multiple size={Math.min(4, cols.length)} value={newIdx.cols} onChange={(e) => setNewIdx({ ...newIdx, cols: [...e.target.selectedOptions].map((o) => o.value) })}>
 							{cols.map((c) => <option key={c.name}>{c.name}</option>)}
 						</select>
+						<input placeholder={newIdx.cols.length ? `${name}_${newIdx.cols.join("_")}_idx` : "index name"} spellCheck={false} value={newIdx.name} onChange={(e) => setNewIdx({ ...newIdx, name: e.target.value })} />
 						<label className="check"><input type="checkbox" checked={newIdx.unique} onChange={(e) => setNewIdx({ ...newIdx, unique: e.target.checked })} />unique</label>
 						<button type="submit" disabled={!newIdx.cols.length}>＋ Index</button>
 					</form>
@@ -506,6 +515,7 @@ function Structure({ name, obj, cols, schema, editable, onChanged }) {
 							const to = prompt(`Rename table ${name} to:`, name);
 							if (to && to !== name) change(`ALTER TABLE ${ident(name)} RENAME TO ${ident(to)}`, `Renamed ${name} to ${to}.`);
 						}}>Rename…</button>}
+						{obj.type === "view" && <button onClick={() => openQuery(`DROP VIEW ${ident(name)};\n${obj.sql};\n`, `Edit ${name}`)}>Edit as SQL…</button>}
 						<button className="danger" onClick={() => confirm(`Drop ${obj.type} ${name}? This cannot be undone.`) && change(`DROP ${obj.type.toUpperCase()} ${ident(name)}`, `Dropped ${name}.`)}>Drop {obj.type}</button>
 					</div>
 				)}

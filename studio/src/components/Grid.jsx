@@ -9,12 +9,62 @@ import { isVectorColumn, show } from "../values.js";
  *   picked      the selected row indexes, and onPick(i) to toggle one
  *   onEdit      (i, column, text) => Promise; makes cells editable by double-click
  *   start       the number of the first row
+ *
+ * A click or the arrow keys move the current cell; Enter or F2 edits it,
+ * Space selects its row, and Ctrl/Cmd+C copies its value.
  */
 export default function Grid({ columns, rows, types, sort, desc, onSort, picked, onPick, onEdit, start = 0 }) {
 	const [editing, setEditing] = useState(null); // [row, col]
+	const [cur, setCur] = useState(null); // [row, col]
+	const table = useRef(null);
 	const vector = columns.map((c) => isVectorColumn(c, types?.[c]));
+	useEffect(() => setCur(null), [rows]);
+	useEffect(() => {
+		if (cur) table.current?.querySelector(`tbody tr:nth-child(${cur[0] + 1}) td:nth-child(${cur[1] + 2})`)?.scrollIntoView({ block: "nearest", inline: "nearest" });
+	}, [cur]);
+
+	function onKeyDown(e) {
+		if (editing || !rows.length) return;
+		const [i, j] = cur ?? [0, 0];
+		const to = (r, c) => {
+			e.preventDefault();
+			setCur([Math.max(0, Math.min(rows.length - 1, r)), Math.max(0, Math.min(columns.length - 1, c))]);
+		};
+		if (!cur && /^Arrow|^Home$|^End$/.test(e.key)) return to(0, 0);
+		if (!cur) return;
+		switch (e.key) {
+			case "ArrowUp": return to(i - 1, j);
+			case "ArrowDown": return to(i + 1, j);
+			case "ArrowLeft": return to(i, j - 1);
+			case "ArrowRight": return to(i, j + 1);
+			case "Tab": return to(i, e.shiftKey ? j - 1 : j + 1);
+			case "Home": return to(e.metaKey || e.ctrlKey ? 0 : i, 0);
+			case "End": return to(e.metaKey || e.ctrlKey ? rows.length - 1 : i, columns.length - 1);
+			case "PageUp": return to(i - 20, j);
+			case "PageDown": return to(i + 20, j);
+			case "Escape": return setCur(null);
+			case "Enter":
+			case "F2":
+				if (onEdit) {
+					e.preventDefault();
+					setEditing([i, j]);
+				}
+				return;
+			case " ":
+				if (onPick) {
+					e.preventDefault();
+					onPick(i);
+				}
+				return;
+		}
+		if (e.key.toLowerCase() === "c" && (e.metaKey || e.ctrlKey) && !getSelection().toString()) {
+			e.preventDefault();
+			navigator.clipboard?.writeText(show(rows[i][j], vector[j]).text);
+		}
+	}
+
 	return (
-		<table className="grid">
+		<table className="grid" ref={table} tabIndex={0} onKeyDown={onKeyDown}>
 			<thead>
 				<tr>
 					<th className="rn">#</th>
@@ -36,9 +86,10 @@ export default function Grid({ columns, rows, types, sort, desc, onSort, picked,
 								<EditCell key={j} value={v} onDone={async (save, value) => {
 									if (save) await onEdit(i, columns[j], value);
 									setEditing(null);
+									table.current?.focus();
 								}} />
 							) : (
-								<Cell key={j} v={v} vector={vector[j]} onDoubleClick={onEdit && (() => setEditing([i, j]))} />
+								<Cell key={j} v={v} vector={vector[j]} cur={cur?.[0] === i && cur?.[1] === j} onClick={() => setCur([i, j])} onDoubleClick={onEdit && (() => setEditing([i, j]))} />
 							),
 						)}
 					</tr>
@@ -48,10 +99,10 @@ export default function Grid({ columns, rows, types, sort, desc, onSort, picked,
 	);
 }
 
-function Cell({ v, vector, onDoubleClick }) {
+function Cell({ v, vector, cur, onClick, onDoubleClick }) {
 	const { text, cls, title } = show(v, vector);
 	return (
-		<td className={cls} title={title} onDoubleClick={onDoubleClick}>
+		<td className={cur ? `${cls ?? ""} cur` : cls} title={title} onClick={onClick} onDoubleClick={onDoubleClick}>
 			{text}
 		</td>
 	);
