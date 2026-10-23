@@ -140,11 +140,15 @@ type SigningKey struct {
 	PrivateKey []byte
 	CreatedAt  time.Time
 	RetiredAt  time.Time
+	// MaxExp is the latest expiry (unix seconds) of any token the key
+	// signed, 0 when it has signed none, and -1 when a token it signed may
+	// never expire.
+	MaxExp int64
 }
 
 // SigningKeys returns every signing key, newest first.
 func (s *Store) SigningKeys(ctx context.Context) ([]*SigningKey, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT kid, private_key, created_at, retired_at FROM signing_keys ORDER BY created_at DESC, kid`)
+	rows, err := s.db.QueryContext(ctx, `SELECT kid, private_key, created_at, retired_at, max_exp FROM signing_keys ORDER BY created_at DESC, kid`)
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +157,7 @@ func (s *Store) SigningKeys(ctx context.Context) ([]*SigningKey, error) {
 	for rows.Next() {
 		var k SigningKey
 		var created, retired int64
-		if err := rows.Scan(&k.KID, &k.PrivateKey, &created, &retired); err != nil {
+		if err := rows.Scan(&k.KID, &k.PrivateKey, &created, &retired, &k.MaxExp); err != nil {
 			return nil, err
 		}
 		k.CreatedAt, k.RetiredAt = unix(created), unix(retired)
@@ -164,8 +168,23 @@ func (s *Store) SigningKeys(ctx context.Context) ([]*SigningKey, error) {
 
 // AddSigningKey stores a key.
 func (s *Store) AddSigningKey(ctx context.Context, k *SigningKey) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO signing_keys (kid, private_key, created_at) VALUES (?, ?, ?)`, k.KID, k.PrivateKey, k.CreatedAt.Unix())
+	_, err := s.db.ExecContext(ctx, `INSERT INTO signing_keys (kid, private_key, created_at, max_exp) VALUES (?, ?, ?, ?)`, k.KID, k.PrivateKey, k.CreatedAt.Unix(), k.MaxExp)
 	return err
+}
+
+// RetireSigningKey marks a key as no longer signing.
+func (s *Store) RetireSigningKey(ctx context.Context, kid string, at time.Time) error {
+	return one(s.db.ExecContext(ctx, `UPDATE signing_keys SET retired_at = ? WHERE kid = ?`, at.Unix(), kid))
+}
+
+// SetSigningKeyMaxExp records the latest expiry of the tokens a key signed.
+func (s *Store) SetSigningKeyMaxExp(ctx context.Context, kid string, maxExp int64) error {
+	return one(s.db.ExecContext(ctx, `UPDATE signing_keys SET max_exp = ? WHERE kid = ?`, maxExp, kid))
+}
+
+// DeleteSigningKey removes a key, which stops verifying what it signed.
+func (s *Store) DeleteSigningKey(ctx context.Context, kid string) error {
+	return one(s.db.ExecContext(ctx, `DELETE FROM signing_keys WHERE kid = ?`, kid))
 }
 
 // Client is an OIDC client.
