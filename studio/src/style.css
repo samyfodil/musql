@@ -52,7 +52,7 @@ body {
 	overflow: hidden;
 	background: var(--bg);
 	color: var(--text);
-	font: 13px/1.45 var(--sans);
+	font: 14px/1.5 var(--sans);
 }
 .dim { color: var(--dim); }
 .small { font-size: 12px; }
@@ -220,7 +220,7 @@ button:disabled { opacity: .45; cursor: default; }
 
 /* grid */
 .gridwrap { flex: 1; overflow: auto; min-height: 0; }
-table.grid { border-collapse: separate; border-spacing: 0; font: 12px var(--mono); min-width: 100%; }
+table.grid { border-collapse: separate; border-spacing: 0; font: 13px var(--mono); min-width: 100%; }
 .grid th, .grid td {
 	padding: 5px 10px;
 	border-right: 1px solid var(--line);
@@ -236,7 +236,7 @@ table.grid { border-collapse: separate; border-spacing: 0; font: 12px var(--mono
 	top: 0;
 	z-index: 1;
 	background: var(--side);
-	font: 600 12px var(--sans);
+	font: 600 13px var(--sans);
 	cursor: pointer;
 	user-select: none;
 }
@@ -641,7 +641,7 @@ button svg { vertical-align: -2px; flex: none; }
 .gridwrap:has(> .vscroll) { overflow: hidden; display: flex; flex-direction: column; }
 .vscroll { flex: 1; min-height: 0; overflow: auto; position: relative; outline: none; }
 table.vgrid { table-layout: fixed; min-width: 0; }
-.vgrid th, .vgrid td { height: 32px; padding: 0 10px; max-width: none; }
+.vgrid th, .vgrid td { height: 36px; padding: 0 10px; max-width: none; }
 .vgrid th { position: sticky; top: 0; z-index: 2; user-select: none; }
 .vgrid th.pinned, .vgrid td.pinned { position: sticky; z-index: 1; background: var(--panel); }
 .vgrid th.pinned { z-index: 3; background: var(--side); }
@@ -696,3 +696,10 @@ button.small { font-size: 11.5px; padding: 2px 8px; display: inline-flex; align-
 .sc-row { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; border-bottom: 1px dashed var(--line); font-size: 12.5px; }
 kbd { font: 11px var(--mono); padding: 1px 6px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; background: var(--side); white-space: nowrap; }
 @media (max-width: 640px) { .sc-groups { grid-template-columns: 1fr; } }
+/* type scale: 14px UI, 13px grid and controls */
+.small { font-size: 12.5px; }
+.side .item, .tabs .tab { font-size: 13.5px; }
+.grid th .type { font-size: 11px; }
+.vgrid td .peek { top: 8px; }
+.toolbar select, .fields select, .inline select, .inline input, .coledit input, input.type, .fchip select, .fchip input, .sortrow select, .chart-controls select { font-size: 13px; }
+.editor .cm-editor { font-size: 14px; }

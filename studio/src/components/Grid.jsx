@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { isVectorColumn, show } from "../values.js";
 import { Copy, Maximize2, Pin } from "lucide-react";
 
-const ROW = 32;
+const ROW = 36;
 const OVERSCAN = 12;
 
 /**
@@ -529,7 +529,7 @@ function defaultLayout(columns, types) {
 	for (const c of columns) {
 		const t = (types?.[c] ?? "").toUpperCase();
 		const key = c === "id" || /_id$/.test(c) || c === "rowid";
-		widths[c] = key ? 84 : /INT|REAL|NUM|DEC|FLOA|DOUB|BOOL/.test(t) ? 110 : /DATE|TIME/.test(t) ? 170 : /BLOB/.test(t) ? 150 : 220;
+		widths[c] = key ? Math.max(96, c.length * 9 + 60) : /INT|REAL|NUM|DEC|FLOA|DOUB|BOOL/.test(t) ? 124 : /DATE|TIME/.test(t) ? 170 : /BLOB/.test(t) ? 150 : 220;
 	}
 	return { widths, order: [...columns], pinned: [] };
 }
