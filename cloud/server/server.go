@@ -74,7 +74,7 @@ func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) 
 		}
 		return nil, err
 	}
-	if err := s.ensureAdmin(ctx); err != nil {
+	if err := s.requireAdmin(ctx); err != nil {
 		return fail(err)
 	}
 	if err := store.EnsureGroupLocation(ctx, cfg.Node.Location); err != nil {
@@ -167,32 +167,58 @@ func (s *Server) Close() error {
 	return err
 }
 
-func (s *Server) ensureAdmin(ctx context.Context) error {
-	hash := s.cfg.Admin.PasswordHash
-	u, err := s.store.UserByEmail(ctx, s.cfg.Admin.Email)
-	if errors.Is(err, state.ErrNotFound) {
-		if hash == "" {
-			hash = state.HashPassword(s.cfg.Admin.Password)
+func (s *Server) requireAdmin(ctx context.Context) error {
+	users, err := s.store.ListUsers(ctx)
+	if err != nil {
+		return err
+	}
+	if !slices.ContainsFunc(users, func(u *state.User) bool { return u.Admin }) {
+		return errors.New("no admin: run musql-cloud init --admin-email <email>")
+	}
+	return nil
+}
+
+// Init creates the admin user in the state under cfg.DataDir, or, when the
+// email exists, resets its password and makes it an enabled admin. In a
+// cluster the row is written locally and replicates when the node runs.
+func Init(ctx context.Context, cfg *Config, email, password string) error {
+	email = state.NormalizeEmail(email)
+	if email == "" {
+		return errors.New("admin email is required")
+	}
+	if password == "" {
+		return errors.New("admin password is required")
+	}
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+		return err
+	}
+	s := &Server{cfg: cfg, log: log.New(os.Stderr, "musql-cloud: ", log.LstdFlags)}
+	store, err := s.openState(ctx)
+	if err != nil {
+		return err
+	}
+	s.store = store
+	defer func() {
+		store.Close()
+		if s.cl != nil {
+			s.cl.node.Close()
 		}
-		_, err = s.store.CreateUser(ctx, s.cfg.Admin.Email, "Admin", hash, true)
+	}()
+	hash := state.HashPassword(password)
+	u, err := store.UserByEmail(ctx, email)
+	if errors.Is(err, state.ErrNotFound) {
+		_, err = store.CreateUser(ctx, email, "Admin", hash, true)
 		return err
 	}
 	if err != nil {
 		return err
 	}
-	// The config is the way back in: its password always works, and the
-	// admin it names is always an enabled admin.
-	if hash == "" && !state.VerifyPassword(u.PasswordHash, s.cfg.Admin.Password) {
-		hash = state.HashPassword(s.cfg.Admin.Password)
-	}
-	if hash != "" && hash != u.PasswordHash {
-		if err := s.store.SetPassword(ctx, u.ID, hash); err != nil {
-			return err
-		}
+	if err := store.SetPassword(ctx, u.ID, hash); err != nil {
+		return err
 	}
 	if !u.Admin || u.Disabled {
 		u.Admin, u.Disabled = true, false
-		return s.store.UpdateUser(ctx, u)
+		return store.UpdateUser(ctx, u)
 	}
 	return nil
 }

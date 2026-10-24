@@ -48,8 +48,11 @@ type harness struct {
 func start(t *testing.T) *harness {
 	t.Helper()
 	data := t.TempDir()
-	cfg, err := server.ParseConfig([]byte("data_dir: " + data + "\nadmin:\n  email: admin@example.com\n  password: admin-password\nnode:\n  location: fra\n"))
+	cfg, err := server.ParseConfig([]byte("data_dir: " + data + "\nnode:\n  location: fra\n"))
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Init(context.Background(), cfg, "admin@example.com", "admin-password"); err != nil {
 		t.Fatal(err)
 	}
 	var h http.Handler

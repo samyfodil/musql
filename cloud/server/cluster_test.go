@@ -72,9 +72,6 @@ func newCluster(t *testing.T, n int) []*clusterNode {
 		cfg, err := ParseConfig([]byte(fmt.Sprintf(`
 data_dir: %s
 public_url: http://cloud.test
-admin:
-  email: admin@example.com
-  password: "admin-password"
 node:
   name: node-%d
   location: %s
@@ -85,6 +82,9 @@ peers:
 			t.Fatal(err)
 		}
 		cfg.syncInterval = 100 * time.Millisecond
+		if err := Init(context.Background(), cfg, "admin@example.com", "admin-password"); err != nil {
+			t.Fatal(err)
+		}
 		c := &clusterNode{cfg: cfg}
 		c.env = &env{t: t}
 		c.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

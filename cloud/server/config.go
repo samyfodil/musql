@@ -20,13 +20,12 @@ import (
 // Config is config.yaml. The command reads the file; this package only
 // parses it.
 type Config struct {
-	Listen    string      `yaml:"listen"`
-	PublicURL string      `yaml:"public_url"`
-	DataDir   string      `yaml:"data_dir"`
-	Admin     AdminConfig `yaml:"admin"`
-	Node      NodeConfig  `yaml:"node"`
-	Peers     []Peer      `yaml:"peers"`
-	AI        AIConfig    `yaml:"ai"`
+	Listen    string     `yaml:"listen"`
+	PublicURL string     `yaml:"public_url"`
+	DataDir   string     `yaml:"data_dir"`
+	Node      NodeConfig `yaml:"node"`
+	Peers     []Peer     `yaml:"peers"`
+	AI        AIConfig   `yaml:"ai"`
 	Snapshots struct {
 		Every string `yaml:"every"`
 		Keep  string `yaml:"keep"`
@@ -74,13 +73,6 @@ func parseDuration(s string) (time.Duration, error) {
 		return 0, fmt.Errorf("invalid duration %q", s)
 	}
 	return d, nil
-}
-
-// AdminConfig is the admin created, or whose password is reset, at start.
-type AdminConfig struct {
-	Email        string `yaml:"email"`
-	Password     string `yaml:"password"`
-	PasswordHash string `yaml:"password_hash"`
 }
 
 // NodeConfig names this node and its location; P2PListen is where a cluster
@@ -151,6 +143,9 @@ func ParseConfig(b []byte) (*Config, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(b))
 	dec.KnownFields(true)
 	if err := dec.Decode(&c); err != nil {
+		if strings.Contains(err.Error(), "field admin not found") {
+			return nil, errors.New("config: the admin block is no longer read: remove it and run musql-cloud init --admin-email <email>")
+		}
 		return nil, fmt.Errorf("config: %w", err)
 	}
 	return &c, c.normalize()
@@ -203,17 +198,6 @@ func (c *Config) normalize() error {
 	}
 	c.usageFlush = time.Minute
 	c.syncInterval = 2 * time.Second
-	if c.Admin.Email == "" {
-		return errors.New("config: admin.email is required")
-	}
-	if c.Admin.Password == "" && c.Admin.PasswordHash == "" {
-		return errors.New("config: admin.password or admin.password_hash is required")
-	}
-	if c.Admin.PasswordHash != "" {
-		if err := state.CheckPasswordHash(c.Admin.PasswordHash); err != nil {
-			return errors.New("config: admin.password_hash is not an argon2id hash")
-		}
-	}
 	if c.OIDC.keyRotation, err = durationOr(c.OIDC.KeyRotation, 30*24*time.Hour); err != nil {
 		return fmt.Errorf("config: oidc.key_rotation: %w", err)
 	}

@@ -50,6 +50,7 @@ removes owner; the last owner stays). owner: delete a non-personal org.
 
 ```sh
 cd cloud
+go run ./cmd/musql-cloud init --admin-email admin@example.com -config config.yaml
 go run ./cmd/musql-cloud -config config.yaml
 ```
 
@@ -57,9 +58,6 @@ go run ./cmd/musql-cloud -config config.yaml
 listen: ":8080"
 public_url: "http://localhost:8080"
 data_dir: "./data"
-admin:
-  email: "admin@example.com"
-  password: "change-me-please"
 node:
   name: "node-1"
   location: "fra"

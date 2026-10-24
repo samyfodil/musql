@@ -2,6 +2,7 @@
 // OIDC provider, Hrana for every hosted database and the console, on one
 // listener.
 //
+//	musql-cloud init --admin-email a@b.c [--admin-password ...] [-config config.yaml]
 //	musql-cloud -config config.yaml
 package main
 
@@ -26,6 +27,12 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "init" {
+		if err := runInit(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	path := flag.String("config", "./config.yaml", "path to config.yaml")
 	peerID := flag.Bool("peer-id", false, "print this node's libp2p peer ID (making its key in data_dir if needed) and exit")
 	flag.Parse()
