@@ -32,6 +32,7 @@ type Config struct {
 	} `yaml:"snapshots"`
 	Console ConsoleConfig `yaml:"console"`
 	OIDC    OIDCConfig    `yaml:"oidc"`
+	Uploads UploadsConfig `yaml:"uploads"`
 
 	// snapshots.every and snapshots.keep, parsed; 0 turns each off.
 	snapshotEvery, snapshotKeep time.Duration
@@ -57,6 +58,19 @@ type OIDCConfig struct {
 
 	keyRotation time.Duration
 	loginWindow time.Duration
+}
+
+// UploadsConfig bounds the files clients send to create a database from.
+type UploadsConfig struct {
+	// MaxBytes is the largest file one upload may carry (default 1 GiB). The
+	// file is kept whole on disk while it is used: converting a C SQLite one
+	// needs about as much room again.
+	MaxBytes int64 `yaml:"max_bytes"`
+	// TTL is how long an upload that nothing writes to or uses is kept before
+	// it is removed (default 24h).
+	TTL string `yaml:"ttl"`
+
+	ttl time.Duration
 }
 
 // parseDuration is time.ParseDuration with a "d" suffix for days.
@@ -203,6 +217,15 @@ func (c *Config) normalize() error {
 	}
 	if c.OIDC.loginWindow, err = durationOr(c.OIDC.LoginWindow, 0); err != nil {
 		return fmt.Errorf("config: oidc.login_window: %w", err)
+	}
+	switch {
+	case c.Uploads.MaxBytes < 0:
+		return fmt.Errorf("config: uploads.max_bytes %d is negative", c.Uploads.MaxBytes)
+	case c.Uploads.MaxBytes == 0:
+		c.Uploads.MaxBytes = 1 << 30
+	}
+	if c.Uploads.ttl, err = durationOr(c.Uploads.TTL, 24*time.Hour); err != nil || c.Uploads.ttl == 0 {
+		return fmt.Errorf("config: uploads.ttl %q is not a positive duration", c.Uploads.TTL)
 	}
 	return nil
 }

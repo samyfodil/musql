@@ -18,8 +18,10 @@ service DatabaseService {
   rpc Restore(RestoreRequest) returns (RestoreResponse);
   rpc CreateToken(CreateTokenRequest) returns (CreateTokenResponse);
   rpc InvalidateTokens(InvalidateTokensRequest) returns (InvalidateTokensResponse);
-  rpc Upload(UploadRequest) returns (UploadResponse);
-  rpc Export(ExportRequest) returns (ExportResponse);
+  rpc StartUpload(StartUploadRequest) returns (StartUploadResponse);
+  rpc UploadChunk(UploadChunkRequest) returns (UploadChunkResponse);
+  rpc FinishUpload(FinishUploadRequest) returns (FinishUploadResponse);
+  rpc Export(ExportRequest) returns (stream ExportResponse);
   rpc Stats(StatsRequest) returns (StatsResponse);
 }
 
@@ -59,7 +61,7 @@ message CreateDatabaseRequest {
   // The org's "default" group when empty.
   string group = 3;
   oneof source {
-    // An upload id from Upload.
+    // An upload id from FinishUpload.
     string upload = 4;
     // A branch of this database (in the same org), at now or at branch_at.
     string branch_of = 5;
@@ -188,15 +190,58 @@ message InvalidateTokensRequest {
 
 message InvalidateTokensResponse {}
 
-// Upload stores a database file (musql or C SQLite) for Create to use.
-message UploadRequest {
+// An upload carries a database file (musql or C SQLite) to the server in
+// pieces, so neither side holds the file in memory. StartUpload opens it,
+// UploadChunk appends the pieces in order, and FinishUpload checks the whole
+// file's SHA-256 and makes the upload usable as CreateDatabaseRequest.upload.
+// The server keeps an upload on the node that started it, refuses files over
+// its uploads.max_bytes, and removes one that is not finished, or not used,
+// within uploads.ttl of its last write.
+message StartUploadRequest {
   string org = 1;
-  bytes content = 2;
+  // The file's size, when known: a file over the server's limit is refused
+  // before any byte is sent.
+  int64 size_bytes = 2;
+  // Continue this upload instead of starting one. The response says where it
+  // stands; a finished upload holds the whole file.
+  string resume = 3;
 }
 
-message UploadResponse {
+message StartUploadResponse {
+  string upload = 1;
+  // The bytes the server holds: 0 for a new upload, and where the next
+  // UploadChunk must start for a resumed one.
+  int64 offset = 2;
+  // The largest content UploadChunk takes.
+  int32 max_chunk_bytes = 3;
+}
+
+message UploadChunkRequest {
+  string org = 1;
+  string upload = 2;
+  // Where this piece starts in the file. It must be the bytes the server
+  // holds, so a piece sent twice, or out of order, is refused.
+  int64 offset = 3;
+  bytes content = 4;
+}
+
+message UploadChunkResponse {
+  // The bytes the server holds now.
+  int64 offset = 1;
+}
+
+message FinishUploadRequest {
+  string org = 1;
+  string upload = 2;
+  // The SHA-256 of the whole file.
+  bytes sha256 = 3;
+}
+
+message FinishUploadResponse {
+  // The id to give CreateDatabaseRequest.upload.
   string upload = 1;
   FileFormat format = 2;
+  int64 size_bytes = 3;
 }
 
 message ExportRequest {
@@ -205,8 +250,11 @@ message ExportRequest {
   FileFormat format = 3;
 }
 
+// Export streams the file: the content of each message is the next piece.
 message ExportResponse {
   bytes content = 1;
+  // The file's size, on the first message only.
+  int64 size_bytes = 2;
 }
 
 message StatsRequest {

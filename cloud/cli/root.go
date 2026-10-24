@@ -26,6 +26,9 @@ type Env struct {
 	Stderr io.Writer
 	// Interactive reports whether Stdin is a terminal.
 	Interactive bool
+	// StderrIsTerminal reports whether Stderr is a terminal, where a transfer's
+	// progress redraws one line instead of printing a line per step.
+	StderrIsTerminal bool
 	// StdinFd is Stdin's descriptor when Interactive, for raw-mode line editing.
 	StdinFd int
 	// OpenBrowser opens a URL for the user; nil or an error means print only.
@@ -53,7 +56,9 @@ type app struct {
 // Run executes the CLI with args (without the program name).
 func Run(ctx context.Context, env Env, args []string) error {
 	if env.HTTP == nil {
-		env.HTTP = &http.Client{Timeout: 5 * time.Minute}
+		// No overall timeout: a download streams for as long as the file takes,
+		// and creating a database from a large upload can run for minutes.
+		env.HTTP = &http.Client{}
 	}
 	a := &app{env: env}
 	root := a.root()
@@ -148,16 +153,7 @@ func (a *app) clients() error {
 	if err != nil {
 		return err
 	}
-	auth := connect.WithInterceptors(connect.UnaryInterceptorFunc(func(next connect.UnaryFunc) connect.UnaryFunc {
-		return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
-			tok, err := a.token(ctx)
-			if err != nil {
-				return nil, err
-			}
-			req.Header().Set("Authorization", "Bearer "+tok)
-			return next(ctx, req)
-		}
-	}))
+	auth := connect.WithInterceptors(bearer{a})
 	hc := a.env.HTTP
 	a.services.auth = cloudv1connect.NewAuthServiceClient(hc, srv, auth)
 	a.services.orgs = cloudv1connect.NewOrgServiceClient(hc, srv, auth)
@@ -165,6 +161,45 @@ func (a *app) clients() error {
 	a.services.db = cloudv1connect.NewDatabaseServiceClient(hc, srv, auth)
 	return nil
 }
+
+// bearer puts the signed-in token on every call, unary or streaming.
+type bearer struct{ a *app }
+
+func (b bearer) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
+	return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+		tok, err := b.a.token(ctx)
+		if err != nil {
+			return nil, err
+		}
+		req.Header().Set("Authorization", "Bearer "+tok)
+		return next(ctx, req)
+	}
+}
+
+func (b bearer) WrapStreamingClient(next connect.StreamingClientFunc) connect.StreamingClientFunc {
+	return func(ctx context.Context, spec connect.Spec) connect.StreamingClientConn {
+		conn := next(ctx, spec)
+		tok, err := b.a.token(ctx)
+		if err != nil {
+			return failedConn{conn, err}
+		}
+		conn.RequestHeader().Set("Authorization", "Bearer "+tok)
+		return conn
+	}
+}
+
+func (bearer) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
+	return next
+}
+
+// failedConn is a call that could not be authorized: it fails when it is used.
+type failedConn struct {
+	connect.StreamingClientConn
+	err error
+}
+
+func (c failedConn) Send(any) error    { return c.err }
+func (c failedConn) Receive(any) error { return c.err }
 
 // orgSlug is --org, else the switched-to org, else the user's personal org.
 func (a *app) orgSlug(ctx context.Context) (string, error) {

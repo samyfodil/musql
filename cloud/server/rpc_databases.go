@@ -162,12 +162,12 @@ func (s databaseService) Create(ctx context.Context, req *connect.Request[v1.Cre
 		err = restoreErr(s.copyAt(ctx, src, at, m.SchemaOnly, path))
 	case m.GetUpload() != "" && m.SchemaOnly:
 		full := path + ".upload"
-		if err = s.fromUpload(o, m.GetUpload(), full); err == nil {
+		if err = s.fromUpload(ctx, o, m.GetUpload(), full); err == nil {
 			err = rpcErr(store.SchemaOnly(ctx, full, path))
 		}
 		removeDBFiles(s.log, full)
 	case m.GetUpload() != "":
-		err = s.fromUpload(o, m.GetUpload(), path)
+		err = s.fromUpload(ctx, o, m.GetUpload(), path)
 	default:
 		err = createEmpty(path)
 	}
@@ -229,12 +229,18 @@ func (s *Server) uploadPath(o *state.Org, id string) (string, error) {
 }
 
 // fromUpload makes the database at path from an upload, converting a C
-// SQLite file, and checks the result before it is served.
-func (s *Server) fromUpload(o *state.Org, id, path string) error {
+// SQLite file, and checks the result before it is served. A musql file moves
+// into place; a C SQLite one is converted and then removed.
+func (s *Server) fromUpload(ctx context.Context, o *state.Org, id, path string) error {
 	src, err := s.uploadPath(o, id)
 	if err != nil {
 		return err
 	}
+	unlock, err := s.uploads.lock(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	f, err := os.Open(src)
 	if err != nil {
 		return invalid("unknown upload")
@@ -245,17 +251,20 @@ func (s *Server) fromUpload(o *state.Org, id, path string) error {
 	if err != nil && n == 0 {
 		return invalid("the upload is empty")
 	}
-	if bytes.Equal(head[:n], sqliteMagic) {
+	converted := bytes.Equal(head[:n], sqliteMagic)
+	if converted {
 		if err := sqliteconv.Import(src, path, sqliteconv.ImportOptions{}); err != nil {
 			return invalid("the SQLite file could not be imported: " + err.Error())
 		}
-	} else if err := copyFile(src, path); err != nil {
+	} else if err := moveFile(src, path); err != nil {
 		return rpcErr(err)
 	}
 	if err := integrityOK(path); err != nil {
 		return invalid("the uploaded database is not usable: " + err.Error())
 	}
-	os.Remove(src)
+	if converted {
+		os.Remove(src)
+	}
 	return nil
 }
 
@@ -275,7 +284,12 @@ func integrityOK(path string) error {
 	return nil
 }
 
-func copyFile(src, dst string) error {
+// moveFile renames src to dst, or copies it where they are on different
+// filesystems.
+func moveFile(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -289,30 +303,10 @@ func copyFile(src, dst string) error {
 		out.Close()
 		return err
 	}
-	return out.Close()
-}
-
-func (s databaseService) Upload(ctx context.Context, req *connect.Request[v1.UploadRequest]) (*connect.Response[v1.UploadResponse], error) {
-	_, o, _, err := s.org(ctx, req.Header(), req.Msg.Org, state.RoleMember)
-	if err != nil {
-		return nil, err
+	if err := out.Close(); err != nil {
+		return err
 	}
-	if len(req.Msg.Content) == 0 {
-		return nil, invalid("the upload is empty")
-	}
-	id := state.NewID()
-	p, err := s.uploadPath(o, id)
-	if err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(p, req.Msg.Content, 0o600); err != nil {
-		return nil, rpcErr(err)
-	}
-	format := v1.FileFormat_FILE_FORMAT_MUSQL
-	if bytes.HasPrefix(req.Msg.Content, sqliteMagic) {
-		format = v1.FileFormat_FILE_FORMAT_SQLITE
-	}
-	return connect.NewResponse(&v1.UploadResponse{Upload: id, Format: format}), nil
+	return os.Remove(src)
 }
 
 func (s databaseService) Delete(ctx context.Context, req *connect.Request[v1.DeleteDatabaseRequest]) (*connect.Response[v1.DeleteDatabaseResponse], error) {
@@ -416,44 +410,86 @@ func (s databaseService) InvalidateTokens(ctx context.Context, req *connect.Requ
 	return connect.NewResponse(&v1.InvalidateTokensResponse{}), nil
 }
 
-func (s databaseService) Export(ctx context.Context, req *connect.Request[v1.ExportRequest]) (*connect.Response[v1.ExportResponse], error) {
+// exportChunk is how much of the file one message of an export carries.
+const exportChunk = 1 << 20
+
+func (s databaseService) Export(ctx context.Context, req *connect.Request[v1.ExportRequest], stream *connect.ServerStream[v1.ExportResponse]) error {
 	_, d, _, err := s.lookup(ctx, req, req.Msg.Org, req.Msg.Name, state.RoleMember)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err := s.localCopy(ctx, d); err != nil {
-		return nil, err
+		return err
+	}
+	path, cleanup, err := s.exportFile(ctx, d, req.Msg.Format)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	f, err := os.Open(path)
+	if err != nil {
+		return rpcErr(err)
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return rpcErr(err)
+	}
+	buf := make([]byte, exportChunk)
+	for first := true; ; first = false {
+		n, err := io.ReadFull(f, buf)
+		if n > 0 {
+			msg := &v1.ExportResponse{Content: buf[:n]}
+			if first {
+				msg.SizeBytes = st.Size()
+			}
+			if err := stream.Send(msg); err != nil {
+				return err
+			}
+		}
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil
+		}
+		if err != nil {
+			return rpcErr(err)
+		}
+	}
+}
+
+// exportFile writes a consistent copy of d in the given format to a file of
+// its own and returns the path; cleanup removes it.
+func (s *Server) exportFile(ctx context.Context, d *state.Database, format v1.FileFormat) (path string, cleanup func(), err error) {
+	switch format {
+	case v1.FileFormat_FILE_FORMAT_MUSQL, v1.FileFormat_FILE_FORMAT_UNSPECIFIED, v1.FileFormat_FILE_FORMAT_SQLITE:
+	default:
+		return "", nil, invalid("unknown format")
 	}
 	tmp, err := os.MkdirTemp(s.cfg.DataDir, "export-")
 	if err != nil {
-		return nil, rpcErr(err)
+		return "", nil, rpcErr(err)
 	}
-	defer os.RemoveAll(tmp)
+	cleanup = func() { os.RemoveAll(tmp) }
 	// VACUUM INTO takes a consistent copy while the database stays live.
 	snap := filepath.Join(tmp, "db.musq")
 	db, err := sql.Open("sqlite", s.dbPath(d))
 	if err != nil {
-		return nil, rpcErr(err)
+		cleanup()
+		return "", nil, rpcErr(err)
 	}
 	_, err = db.ExecContext(ctx, `VACUUM INTO '`+strings.ReplaceAll(snap, "'", "''")+`'`)
 	db.Close()
 	if err != nil {
-		return nil, rpcErr(err)
+		cleanup()
+		return "", nil, rpcErr(err)
 	}
-	out := snap
-	switch req.Msg.Format {
-	case v1.FileFormat_FILE_FORMAT_MUSQL, v1.FileFormat_FILE_FORMAT_UNSPECIFIED:
-	case v1.FileFormat_FILE_FORMAT_SQLITE:
-		out = filepath.Join(tmp, "db.sqlite")
-		if err := sqliteconv.Export(snap, out, 0); err != nil {
-			return nil, rpcErr(err)
-		}
-	default:
-		return nil, invalid("unknown format")
+	if format != v1.FileFormat_FILE_FORMAT_SQLITE {
+		return snap, cleanup, nil
 	}
-	b, err := os.ReadFile(out)
-	if err != nil {
-		return nil, rpcErr(err)
+	out := filepath.Join(tmp, "db.sqlite")
+	if err := sqliteconv.Export(snap, out, 0); err != nil {
+		cleanup()
+		return "", nil, rpcErr(err)
 	}
-	return connect.NewResponse(&v1.ExportResponse{Content: b}), nil
+	os.Remove(snap)
+	return out, cleanup, nil
 }

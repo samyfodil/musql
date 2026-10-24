@@ -101,10 +101,8 @@ func dumpFile(t *testing.T, path string) string {
 // exportDump exports a database and dumps the file.
 func (e *env) exportDump(org, name string) string {
 	e.t.Helper()
-	_, _, dbs := e.clients()
-	out := must(dbs.Export(context.Background(), auth(e.admin, &v1.ExportRequest{Org: org, Name: name})))
 	p := filepath.Join(e.t.TempDir(), "export.musq")
-	if err := os.WriteFile(p, out.Msg.Content, 0o600); err != nil {
+	if err := os.WriteFile(p, e.export(org, name, v1.FileFormat_FILE_FORMAT_MUSQL), 0o600); err != nil {
 		e.t.Fatal(err)
 	}
 	return dumpFile(e.t, p)

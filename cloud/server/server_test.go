@@ -343,23 +343,30 @@ func TestExportAndUpload(t *testing.T) {
 	e.pipeline("/db/acme/app", full, "CREATE TABLE t(a TEXT)", "INSERT INTO t VALUES ('hello')")
 
 	for _, f := range []v1.FileFormat{v1.FileFormat_FILE_FORMAT_MUSQL, v1.FileFormat_FILE_FORMAT_SQLITE} {
-		out := must(dbs.Export(ctx, auth(e.admin, &v1.ExportRequest{Org: "acme", Name: "app", Format: f})))
-		isSQLite := bytes.HasPrefix(out.Msg.Content, sqliteMagic)
+		content := e.export("acme", "app", f)
+		isSQLite := bytes.HasPrefix(content, sqliteMagic)
 		if isSQLite != (f == v1.FileFormat_FILE_FORMAT_SQLITE) {
 			t.Fatalf("%v: wrong file format", f)
 		}
-		up := must(dbs.Upload(ctx, auth(e.admin, &v1.UploadRequest{Org: "acme", Content: out.Msg.Content})))
+		up := e.upload("acme", content)
+		if up.Format != f || up.SizeBytes != int64(len(content)) {
+			t.Fatalf("%v: finished as %v, %d bytes", f, up.Format, up.SizeBytes)
+		}
 		name := "copy-" + strings.ToLower(strings.TrimPrefix(f.String(), "FILE_FORMAT_"))
-		must(dbs.Create(ctx, auth(e.admin, &v1.CreateDatabaseRequest{Org: "acme", Name: name, Source: &v1.CreateDatabaseRequest_Upload{Upload: up.Msg.Upload}})))
+		must(dbs.Create(ctx, auth(e.admin, &v1.CreateDatabaseRequest{Org: "acme", Name: name, Source: &v1.CreateDatabaseRequest_Upload{Upload: up.Upload}})))
 		tok := must(dbs.CreateToken(ctx, auth(e.admin, &v1.CreateTokenRequest{Org: "acme", Name: name}))).Msg.Token
 		_, res := e.pipeline("/db/acme/"+name, tok, "SELECT a FROM t")
 		if res[0].Type != "ok" || res[0].Response.Result.Rows[0][0].Value != "hello" {
 			t.Fatalf("%s: %+v", name, res)
 		}
+		// Creating consumed the upload.
+		if _, err := dbs.Create(ctx, auth(e.admin, &v1.CreateDatabaseRequest{Org: "acme", Name: name + "-again", Source: &v1.CreateDatabaseRequest_Upload{Upload: up.Upload}})); code(err) != connect.CodeInvalidArgument {
+			t.Fatalf("%s: an upload used twice: %v", name, err)
+		}
 	}
 
-	up := must(dbs.Upload(ctx, auth(e.admin, &v1.UploadRequest{Org: "acme", Content: []byte("not a database")})))
-	if _, err := dbs.Create(ctx, auth(e.admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "junk", Source: &v1.CreateDatabaseRequest_Upload{Upload: up.Msg.Upload}})); code(err) != connect.CodeInvalidArgument {
+	up := e.upload("acme", []byte("not a database"))
+	if _, err := dbs.Create(ctx, auth(e.admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "junk", Source: &v1.CreateDatabaseRequest_Upload{Upload: up.Upload}})); code(err) != connect.CodeInvalidArgument {
 		t.Fatalf("junk upload: %v", err)
 	}
 	if _, err := dbs.Get(ctx, auth(e.admin, &v1.GetDatabaseRequest{Org: "acme", Name: "junk"})); code(err) != connect.CodeNotFound {
@@ -367,9 +374,8 @@ func TestExportAndUpload(t *testing.T) {
 	}
 	// An upload belongs to its org.
 	must((cloudv1connect.NewOrgServiceClient(e.ts.Client(), e.ts.URL)).Create(ctx, auth(e.admin, &v1.CreateOrgRequest{Slug: "other"})))
-	out := must(dbs.Export(ctx, auth(e.admin, &v1.ExportRequest{Org: "acme", Name: "app"})))
-	up = must(dbs.Upload(ctx, auth(e.admin, &v1.UploadRequest{Org: "acme", Content: out.Msg.Content})))
-	if _, err := dbs.Create(ctx, auth(e.admin, &v1.CreateDatabaseRequest{Org: "other", Name: "stolen", Source: &v1.CreateDatabaseRequest_Upload{Upload: up.Msg.Upload}})); code(err) != connect.CodeInvalidArgument {
+	up = e.upload("acme", e.export("acme", "app", v1.FileFormat_FILE_FORMAT_MUSQL))
+	if _, err := dbs.Create(ctx, auth(e.admin, &v1.CreateDatabaseRequest{Org: "other", Name: "stolen", Source: &v1.CreateDatabaseRequest_Upload{Upload: up.Upload}})); code(err) != connect.CodeInvalidArgument {
 		t.Fatalf("cross-org upload: %v", err)
 	}
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -36,7 +35,7 @@ func (a *app) dbCmd() *cobra.Command {
 	list.Flags().StringVar(&listGroup, "group", "", "only this group's databases")
 
 	var c struct {
-		group, fromFile, fromDB, timestamp string
+		group, fromFile, fromDB, timestamp, resume string
 	}
 	create := a.cmd("create <name>", "Create a database", cobra.ExactArgs(1), func(ctx context.Context, args []string) error {
 		org, err := a.orgSlug(ctx)
@@ -47,8 +46,10 @@ func (a *app) dbCmd() *cobra.Command {
 		switch {
 		case c.fromFile != "" && c.fromDB != "":
 			return errors.New("--from-file and --from-db cannot be combined")
+		case c.resume != "" && c.fromFile == "":
+			return errors.New("--resume needs --from-file")
 		case c.fromFile != "":
-			up, err := a.upload(ctx, org, c.fromFile)
+			up, err := a.upload(ctx, org, c.fromFile, c.resume)
 			if err != nil {
 				return err
 			}
@@ -66,10 +67,11 @@ func (a *app) dbCmd() *cobra.Command {
 	})
 	create.Flags().StringVar(&c.group, "group", "", "group (default: default)")
 	create.Flags().StringVar(&c.fromFile, "from-file", "", "a .musq or C SQLite file to start from")
+	create.Flags().StringVar(&c.resume, "resume", "", "with --from-file: continue this interrupted upload")
 	create.Flags().StringVar(&c.fromDB, "from-db", "", "branch from this database")
 	create.Flags().StringVar(&c.timestamp, "timestamp", "", "with --from-db: the parent as of this time")
 
-	var importName string
+	var importName, importResume string
 	imp := a.cmd("import <file>", "Create a database from a .musq or C SQLite file", cobra.ExactArgs(1), func(ctx context.Context, args []string) error {
 		org, err := a.orgSlug(ctx)
 		if err != nil {
@@ -79,13 +81,14 @@ func (a *app) dbCmd() *cobra.Command {
 		if name == "" {
 			name = strings.TrimSuffix(filepath.Base(args[0]), filepath.Ext(args[0]))
 		}
-		up, err := a.upload(ctx, org, args[0])
+		up, err := a.upload(ctx, org, args[0], importResume)
 		if err != nil {
 			return err
 		}
 		return a.created(ctx, &v1.CreateDatabaseRequest{Org: org, Name: name, Source: &v1.CreateDatabaseRequest_Upload{Upload: up}})
 	})
 	imp.Flags().StringVar(&importName, "name", "", "database name (default: the file's name)")
+	imp.Flags().StringVar(&importResume, "resume", "", "continue this interrupted upload")
 
 	var urlOnly bool
 	show := a.cmd("show <name>", "Show a database", cobra.ExactArgs(1), func(ctx context.Context, args []string) error {
@@ -199,14 +202,11 @@ func (a *app) dbCmd() *cobra.Command {
 		if out == "" {
 			out = args[0] + ext
 		}
-		r, err := a.services.db.Export(ctx, connect.NewRequest(&v1.ExportRequest{Org: org, Name: args[0], Format: format}))
+		n, err := a.download(ctx, org, args[0], format, out)
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(out, r.Msg.Content, 0o644); err != nil {
-			return err
-		}
-		fmt.Fprintf(a.env.Stderr, "Wrote %s (%s)\n", out, humanBytes(int64(len(r.Msg.Content))))
+		fmt.Fprintf(a.env.Stderr, "Wrote %s (%s)\n", out, humanBytes(n))
 		return nil
 	})
 	export.Flags().BoolVar(&e.sqlite, "sqlite", false, "a C SQLite file instead of .musq")
@@ -308,18 +308,6 @@ func (a *app) get(ctx context.Context, name string) (*v1.Database, error) {
 		return nil, err
 	}
 	return r.Msg.Database, nil
-}
-
-func (a *app) upload(ctx context.Context, org, path string) (string, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	r, err := a.services.db.Upload(ctx, connect.NewRequest(&v1.UploadRequest{Org: org, Content: b}))
-	if err != nil {
-		return "", err
-	}
-	return r.Msg.Upload, nil
 }
 
 func (a *app) created(ctx context.Context, req *v1.CreateDatabaseRequest) error {

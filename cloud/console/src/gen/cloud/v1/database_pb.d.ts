@@ -112,7 +112,7 @@ export declare type CreateDatabaseRequest = Message<"cloud.v1.CreateDatabaseRequ
    */
   source: {
     /**
-     * An upload id from Upload.
+     * An upload id from FinishUpload.
      *
      * @generated from field: string upload = 4;
      */
@@ -637,33 +637,163 @@ export declare type InvalidateTokensResponse = Message<"cloud.v1.InvalidateToken
 export declare const InvalidateTokensResponseSchema: GenMessage<InvalidateTokensResponse>;
 
 /**
- * Upload stores a database file (musql or C SQLite) for Create to use.
+ * An upload carries a database file (musql or C SQLite) to the server in
+ * pieces, so neither side holds the file in memory. StartUpload opens it,
+ * UploadChunk appends the pieces in order, and FinishUpload checks the whole
+ * file's SHA-256 and makes the upload usable as CreateDatabaseRequest.upload.
+ * The server keeps an upload on the node that started it, refuses files over
+ * its uploads.max_bytes, and removes one that is not finished, or not used,
+ * within uploads.ttl of its last write.
  *
- * @generated from message cloud.v1.UploadRequest
+ * @generated from message cloud.v1.StartUploadRequest
  */
-export declare type UploadRequest = Message<"cloud.v1.UploadRequest"> & {
+export declare type StartUploadRequest = Message<"cloud.v1.StartUploadRequest"> & {
   /**
    * @generated from field: string org = 1;
    */
   org: string;
 
   /**
-   * @generated from field: bytes content = 2;
+   * The file's size, when known: a file over the server's limit is refused
+   * before any byte is sent.
+   *
+   * @generated from field: int64 size_bytes = 2;
+   */
+  sizeBytes: bigint;
+
+  /**
+   * Continue this upload instead of starting one. The response says where it
+   * stands; a finished upload holds the whole file.
+   *
+   * @generated from field: string resume = 3;
+   */
+  resume: string;
+};
+
+/**
+ * Describes the message cloud.v1.StartUploadRequest.
+ * Use `create(StartUploadRequestSchema)` to create a new message.
+ */
+export declare const StartUploadRequestSchema: GenMessage<StartUploadRequest>;
+
+/**
+ * @generated from message cloud.v1.StartUploadResponse
+ */
+export declare type StartUploadResponse = Message<"cloud.v1.StartUploadResponse"> & {
+  /**
+   * @generated from field: string upload = 1;
+   */
+  upload: string;
+
+  /**
+   * The bytes the server holds: 0 for a new upload, and where the next
+   * UploadChunk must start for a resumed one.
+   *
+   * @generated from field: int64 offset = 2;
+   */
+  offset: bigint;
+
+  /**
+   * The largest content UploadChunk takes.
+   *
+   * @generated from field: int32 max_chunk_bytes = 3;
+   */
+  maxChunkBytes: number;
+};
+
+/**
+ * Describes the message cloud.v1.StartUploadResponse.
+ * Use `create(StartUploadResponseSchema)` to create a new message.
+ */
+export declare const StartUploadResponseSchema: GenMessage<StartUploadResponse>;
+
+/**
+ * @generated from message cloud.v1.UploadChunkRequest
+ */
+export declare type UploadChunkRequest = Message<"cloud.v1.UploadChunkRequest"> & {
+  /**
+   * @generated from field: string org = 1;
+   */
+  org: string;
+
+  /**
+   * @generated from field: string upload = 2;
+   */
+  upload: string;
+
+  /**
+   * Where this piece starts in the file. It must be the bytes the server
+   * holds, so a piece sent twice, or out of order, is refused.
+   *
+   * @generated from field: int64 offset = 3;
+   */
+  offset: bigint;
+
+  /**
+   * @generated from field: bytes content = 4;
    */
   content: Uint8Array;
 };
 
 /**
- * Describes the message cloud.v1.UploadRequest.
- * Use `create(UploadRequestSchema)` to create a new message.
+ * Describes the message cloud.v1.UploadChunkRequest.
+ * Use `create(UploadChunkRequestSchema)` to create a new message.
  */
-export declare const UploadRequestSchema: GenMessage<UploadRequest>;
+export declare const UploadChunkRequestSchema: GenMessage<UploadChunkRequest>;
 
 /**
- * @generated from message cloud.v1.UploadResponse
+ * @generated from message cloud.v1.UploadChunkResponse
  */
-export declare type UploadResponse = Message<"cloud.v1.UploadResponse"> & {
+export declare type UploadChunkResponse = Message<"cloud.v1.UploadChunkResponse"> & {
   /**
+   * The bytes the server holds now.
+   *
+   * @generated from field: int64 offset = 1;
+   */
+  offset: bigint;
+};
+
+/**
+ * Describes the message cloud.v1.UploadChunkResponse.
+ * Use `create(UploadChunkResponseSchema)` to create a new message.
+ */
+export declare const UploadChunkResponseSchema: GenMessage<UploadChunkResponse>;
+
+/**
+ * @generated from message cloud.v1.FinishUploadRequest
+ */
+export declare type FinishUploadRequest = Message<"cloud.v1.FinishUploadRequest"> & {
+  /**
+   * @generated from field: string org = 1;
+   */
+  org: string;
+
+  /**
+   * @generated from field: string upload = 2;
+   */
+  upload: string;
+
+  /**
+   * The SHA-256 of the whole file.
+   *
+   * @generated from field: bytes sha256 = 3;
+   */
+  sha256: Uint8Array;
+};
+
+/**
+ * Describes the message cloud.v1.FinishUploadRequest.
+ * Use `create(FinishUploadRequestSchema)` to create a new message.
+ */
+export declare const FinishUploadRequestSchema: GenMessage<FinishUploadRequest>;
+
+/**
+ * @generated from message cloud.v1.FinishUploadResponse
+ */
+export declare type FinishUploadResponse = Message<"cloud.v1.FinishUploadResponse"> & {
+  /**
+   * The id to give CreateDatabaseRequest.upload.
+   *
    * @generated from field: string upload = 1;
    */
   upload: string;
@@ -672,13 +802,18 @@ export declare type UploadResponse = Message<"cloud.v1.UploadResponse"> & {
    * @generated from field: cloud.v1.FileFormat format = 2;
    */
   format: FileFormat;
+
+  /**
+   * @generated from field: int64 size_bytes = 3;
+   */
+  sizeBytes: bigint;
 };
 
 /**
- * Describes the message cloud.v1.UploadResponse.
- * Use `create(UploadResponseSchema)` to create a new message.
+ * Describes the message cloud.v1.FinishUploadResponse.
+ * Use `create(FinishUploadResponseSchema)` to create a new message.
  */
-export declare const UploadResponseSchema: GenMessage<UploadResponse>;
+export declare const FinishUploadResponseSchema: GenMessage<FinishUploadResponse>;
 
 /**
  * @generated from message cloud.v1.ExportRequest
@@ -707,6 +842,8 @@ export declare type ExportRequest = Message<"cloud.v1.ExportRequest"> & {
 export declare const ExportRequestSchema: GenMessage<ExportRequest>;
 
 /**
+ * Export streams the file: the content of each message is the next piece.
+ *
  * @generated from message cloud.v1.ExportResponse
  */
 export declare type ExportResponse = Message<"cloud.v1.ExportResponse"> & {
@@ -714,6 +851,13 @@ export declare type ExportResponse = Message<"cloud.v1.ExportResponse"> & {
    * @generated from field: bytes content = 1;
    */
   content: Uint8Array;
+
+  /**
+   * The file's size, on the first message only.
+   *
+   * @generated from field: int64 size_bytes = 2;
+   */
+  sizeBytes: bigint;
 };
 
 /**
@@ -959,18 +1103,34 @@ export declare const DatabaseService: GenService<{
     output: typeof InvalidateTokensResponseSchema;
   },
   /**
-   * @generated from rpc cloud.v1.DatabaseService.Upload
+   * @generated from rpc cloud.v1.DatabaseService.StartUpload
    */
-  upload: {
+  startUpload: {
     methodKind: "unary";
-    input: typeof UploadRequestSchema;
-    output: typeof UploadResponseSchema;
+    input: typeof StartUploadRequestSchema;
+    output: typeof StartUploadResponseSchema;
+  },
+  /**
+   * @generated from rpc cloud.v1.DatabaseService.UploadChunk
+   */
+  uploadChunk: {
+    methodKind: "unary";
+    input: typeof UploadChunkRequestSchema;
+    output: typeof UploadChunkResponseSchema;
+  },
+  /**
+   * @generated from rpc cloud.v1.DatabaseService.FinishUpload
+   */
+  finishUpload: {
+    methodKind: "unary";
+    input: typeof FinishUploadRequestSchema;
+    output: typeof FinishUploadResponseSchema;
   },
   /**
    * @generated from rpc cloud.v1.DatabaseService.Export
    */
   export: {
-    methodKind: "unary";
+    methodKind: "server_streaming";
     input: typeof ExportRequestSchema;
     output: typeof ExportResponseSchema;
   },
