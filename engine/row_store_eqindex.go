@@ -60,8 +60,16 @@ import (
 // rebuild, never a wrong answer.
 
 // rsEqIndex is one column's posting list: value -> the rowids holding it.
+//
+// An INTEGER is listed by value, a TEXT or BLOB by its bytes, and a column holds
+// one kind or the other: under BINARY two of those are equal exactly when their
+// bytes are, but a comparison's affinity can make a stored 5 equal '5' (TEXT,
+// against a column of no affinity) or a stored '5' equal 5 (NUMERIC), so a
+// column holding both is refused, and so is a probe of the other kind. A REAL
+// refuses the column too, since 5.0 must match "v = 5".
 type rsEqIndex struct {
-	rows map[int64][]uint64
+	rows  map[int64][]uint64
+	bytes map[string][]uint64
 	// short is every rowid whose stored row does not reach this column. They
 	// read as the column DEFAULT, so they are unioned into every answer.
 	short []uint64
@@ -70,6 +78,13 @@ type rsEqIndex struct {
 // eqRowids is "which rowids have column col = v", ascending, or false when this
 // column cannot be indexed.
 func (s *rowStore) eqRowids(col int, v int64) ([]uint64, bool) {
+	return s.eqRowidsOf(col, Value{Typ: Int, I: v})
+}
+
+// eqRowidsOf is eqRowids for an INTEGER, TEXT or BLOB probe, a TEXT or BLOB one
+// matched as bytes, which is equality under BINARY only: the caller refuses a
+// TEXT probe under another sequence. Any other class has no answer.
+func (s *rowStore) eqRowidsOf(col int, probe Value) ([]uint64, bool) {
 	if s == nil {
 		return nil, false
 	}
@@ -77,7 +92,15 @@ func (s *rowStore) eqRowids(col int, v int64) ([]uint64, bool) {
 	if !ok {
 		return nil, false
 	}
-	hits := idx.rows[v]
+	var hits []uint64
+	switch {
+	case probe.Typ == Int && len(idx.bytes) == 0:
+		hits = idx.rows[probe.I]
+	case isBytesClass(probe.Typ) && len(idx.rows) == 0:
+		hits = idx.bytes[string(probe.S)]
+	default:
+		return nil, false
+	}
 	if len(idx.short) == 0 {
 		return hits, true
 	}
@@ -113,7 +136,7 @@ func (s *rowStore) segEqRowids(col int, probe Value) ([]uint64, bool) {
 	if !ok {
 		return nil, false
 	}
-	hits = base.withDeltaRowids(s.seg.root, hits)
+	hits = base.withDeltaRowids(s.seg.root, hits, col, probe)
 	out := make([]uint64, 0, len(hits))
 	if !s.baseGone {
 		for _, r := range hits {
@@ -171,10 +194,15 @@ func (s *rowStore) eqIndexFor(col int) (*rsEqIndex, bool) {
 			idx.short = append(idx.short, rid)
 			continue
 		}
-		switch vals[col].Typ {
-		case Int:
-			idx.rows[vals[col].I] = append(idx.rows[vals[col].I], rid)
-		case Null:
+		switch v := vals[col]; {
+		case v.Typ == Int && len(idx.bytes) == 0:
+			idx.rows[v.I] = append(idx.rows[v.I], rid)
+		case isBytesClass(v.Typ) && len(idx.rows) == 0:
+			if idx.bytes == nil {
+				idx.bytes = map[string][]uint64{}
+			}
+			idx.bytes[string(v.S)] = append(idx.bytes[string(v.S)], rid)
+		case v.Typ == Null:
 			// Equals nothing; no posting list can want it.
 		default:
 			// Remember the refusal so the column is not re-examined per query.
@@ -187,6 +215,9 @@ func (s *rowStore) eqIndexFor(col int) (*rsEqIndex, bool) {
 	// per build rather than per probe.
 	for v := range idx.rows {
 		sortUint64s(idx.rows[v])
+	}
+	for v := range idx.bytes {
+		sortUint64s(idx.bytes[v])
 	}
 	sortUint64s(idx.short)
 	s.eqIdx[col] = idx
@@ -238,19 +269,24 @@ func (s *rowStore) noteWrite(rowid uint64, old, neu []Value) {
 }
 
 // sameEqPlace reports whether old and neu put a row in the same list of
-// column col's index: both short of the column, both NULL, or the same
-// integer. Any other value is one the index refuses, which is decided by
-// removeRow and addRow as before.
+// column col's index: both short of the column, both NULL, the same integer,
+// or TEXT and BLOB of the same bytes. Any other value is one the index refuses,
+// which is decided by removeRow and addRow as before.
 func sameEqPlace(old, neu []Value, col int) bool {
 	switch {
 	case col >= len(old) || col >= len(neu):
 		return col >= len(old) && col >= len(neu)
 	case old[col].Typ == Int && neu[col].Typ == Int:
 		return old[col].I == neu[col].I
+	case isBytesClass(old[col].Typ) && isBytesClass(neu[col].Typ):
+		return string(old[col].S) == string(neu[col].S)
 	default:
 		return old[col].Typ == Null && neu[col].Typ == Null
 	}
 }
+
+// isBytesClass is TEXT or BLOB, which the index lists by bytes.
+func isBytesClass(t ValueType) bool { return t == Text || t == Blob }
 
 // removeRow takes rowid out of the list its OLD value put it in. false means the
 // row could not be placed exactly, and the caller must drop the whole column.
@@ -271,6 +307,18 @@ func (idx *rsEqIndex) removeRow(col int, rowid uint64, vals []Value) bool {
 			idx.rows[v] = list
 		}
 		return true
+	case Text, Blob:
+		k := string(vals[col].S)
+		list := idx.bytes[k]
+		if !removeSorted(&list, rowid) {
+			return false
+		}
+		if len(list) == 0 {
+			delete(idx.bytes, k)
+		} else {
+			idx.bytes[k] = list
+		}
+		return true
 	case Null:
 		return true // it was in no list
 	default:
@@ -285,13 +333,22 @@ func (idx *rsEqIndex) addRow(col int, rowid uint64, vals []Value) bool {
 		insertSorted(&idx.short, rowid)
 		return true
 	}
-	switch vals[col].Typ {
-	case Int:
-		list := idx.rows[vals[col].I]
+	switch v := vals[col]; {
+	case v.Typ == Int && len(idx.bytes) == 0:
+		list := idx.rows[v.I]
 		insertSorted(&list, rowid)
-		idx.rows[vals[col].I] = list
+		idx.rows[v.I] = list
 		return true
-	case Null:
+	case isBytesClass(v.Typ) && len(idx.rows) == 0:
+		if idx.bytes == nil {
+			idx.bytes = map[string][]uint64{}
+		}
+		k := string(v.S)
+		list := idx.bytes[k]
+		insertSorted(&list, rowid)
+		idx.bytes[k] = list
+		return true
+	case v.Typ == Null:
 		return true // equals nothing, so it belongs in no list
 	default:
 		return false

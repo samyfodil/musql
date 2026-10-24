@@ -2009,12 +2009,15 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 					cur.idxSeekConfigured, cur.idxSeekMore, cur.idxSeekNext = false, cur.idxSeekMore[:0], 0
 				}
 				// A slot out of step is dropped, and so is the key of "x IS NULL",
-				// which no posting list holds: the keys left bound the rows each
-				// on its own, and with none the scan decides.
+				// which no posting list holds, and a write's TEXT key in a UTF-16
+				// database, whose bytes need not decide its equality: the keys
+				// left bound the rows each on its own, and with none the scan
+				// decides.
 				if h.slot == cur.idxSeekNext {
 					cur.idxSeekNext++
 					switch {
 					case h.is && probe.Typ == Null:
+					case cur.rowStore != nil && probe.Typ == Text && isUTF16(m.encoding()):
 					case !cur.idxSeekConfigured:
 						cur.idxSeekConfigured = true
 						cur.idxSeekProbe, cur.idxSeekColl, cur.idxSeekCol = probe, h.coll, h.leadingCol
