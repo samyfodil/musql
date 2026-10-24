@@ -166,8 +166,11 @@ func (src *segSource) seekIndexRowids(rootPage uint32, col int, probe Value, tex
 		return nil, false // the caller scans, and the scan reports the error
 	}
 	if !live {
+		// However large the log, its rows are tested against the probe before
+		// they join (withDeltaRowids), so the seek never fetches more than a
+		// scan would read.
 		segs, ok := src.byRoot[rootPage]
-		if !ok || (!src.deltaIsSmallFor(rootPage, segs) && probe.Typ != Int) {
+		if !ok {
 			return nil, false
 		}
 		out, ok := segIndexRowids(segs, col, probe)
