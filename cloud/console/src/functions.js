@@ -140,3 +140,25 @@ const LIST = [
 export const FUNCTIONS = LIST.map(([name, args, about, kind]) => ({ name, args, about, kind }));
 
 export const byName = new Map(FUNCTIONS.map((f) => [f.name, f]));
+
+/**
+ * signatureParts cuts an argument list as LIST writes it ("X [, Y]", "A, B, …")
+ * into the pieces a tooltip shows, {text, active}, in order. The one for the
+ * argument at index arg is active; commas, brackets and blanks are pieces of
+ * their own and never are. An argument ending in … stands for all the rest.
+ */
+export function signatureParts(args, arg) {
+	const parts = [];
+	let k = 0;
+	args.split(/([,[\]])/).forEach((piece, i) => {
+		if (i % 2) return parts.push({ text: piece });
+		const [, lead, core, tail] = /^(\s*)(.*?)(\s*)$/.exec(piece);
+		if (lead) parts.push({ text: lead });
+		if (core) {
+			parts.push({ text: core, active: k === arg || (core.endsWith("…") && arg >= k) });
+			k++;
+		}
+		if (tail) parts.push({ text: tail });
+	});
+	return parts;
+}
