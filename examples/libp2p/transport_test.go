@@ -305,3 +305,47 @@ func TestSnapshotOverLibp2p(t *testing.T) {
 	want := dumpUsers(t, a)
 	waitFor(t, 30*time.Second, "c to catch up by snapshot", func() bool { return dumpUsers(t, c) == want })
 }
+
+// TestImageOverLibp2p: a node that joins with nothing takes its peer's database
+// as an image, over the image protocol, and then what is written after it.
+func TestImageOverLibp2p(t *testing.T) {
+	hA, hB := newHost(t), newHost(t)
+	connectHosts(t, hA, hB)
+	a := openUsers(t, hA, "a", "image-test")
+	tx, err := a.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 3000 { // more ops than an empty node pulls one by one
+		if _, err := tx.Exec(`INSERT INTO users VALUES(?, 'n', ?)`, fmt.Sprintf("u%04d", i), i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	b, err := replication.Open(context.Background(), filepath.Join(t.TempDir(), "b.db"), replication.CRDT(),
+		replp2p.Sync(hB, "image-test"), replication.WithSyncInterval(200*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	rows := func() int {
+		var n int
+		if err := b.QueryRow(`SELECT count(*) FROM users`).Scan(&n); err != nil {
+			return -1
+		}
+		return n
+	}
+	waitFor(t, 30*time.Second, "b to catch up", func() bool { return rows() == 3000 })
+	if !replication.ImageInstalled(b) {
+		t.Fatal("b caught up without an image")
+	}
+	if _, err := a.Exec(`UPDATE users SET age = -1 WHERE id = 'u0007'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Exec(`INSERT INTO users VALUES('from-b', 'b', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 30*time.Second, "a and b to converge", func() bool { return rows() == 3001 && dumpUsers(t, a) == dumpUsers(t, b) })
+}
