@@ -877,7 +877,11 @@ func (db *DB) mutatedOutsideChangeLog(changes *changeLog) bool {
 		if t.isTemp || !t.rowsWrittenSinceCommit || t.rows == nil || t.hasAppendLoad() {
 			continue
 		}
-		if !described[strings.ToLower(t.name)] {
+		// A direct-path load's rows are in its segments and never in the log,
+		// however much else of the table the log describes: a transaction that
+		// deleted every committed row and then inserted arms a load on the
+		// emptied store, and appending only its kills lost the new rows.
+		if t.bulk != nil || !described[strings.ToLower(t.name)] {
 			return true
 		}
 	}
