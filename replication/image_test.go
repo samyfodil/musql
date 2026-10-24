@@ -360,8 +360,9 @@ func TestImageRefusedFallsBack(t *testing.T) {
 	}
 }
 
-// TestImageRefusesAnotherFormat: a request for another layout, or file or
-// delta format, is refused before anything is written.
+// TestImageRefusesAnotherFormat: a request for another layout or file format
+// is refused before anything is written, and one that cannot read the
+// database's delta takes a copy the database writes, which has none.
 func TestImageRefusesAnotherFormat(t *testing.T) {
 	c := newCluster(t)
 	c.open("a", imageDDL...)
@@ -371,11 +372,19 @@ func TestImageRefusesAnotherFormat(t *testing.T) {
 		{Layout: "2", FileVersion: file, MinFileVersion: minFile, DeltaVersion: delta},
 		{Layout: bookkeepingLayout, FileVersion: file - 1, MinFileVersion: minFile, DeltaVersion: delta},
 		{Layout: bookkeepingLayout, FileVersion: file + 1, MinFileVersion: file + 1, DeltaVersion: delta},
-		{Layout: bookkeepingLayout, FileVersion: file, MinFileVersion: minFile, DeltaVersion: delta - 1},
 	} {
 		if _, _, err := st.Image(context.Background(), req); !errors.Is(err, ErrImageRefused) {
 			t.Errorf("%+v: %v, want ErrImageRefused", req, err)
 		}
+	}
+	old := ImageRequest{Layout: bookkeepingLayout, FileVersion: file, MinFileVersion: minFile, DeltaVersion: delta - 1}
+	m, body, err := st.Image(context.Background(), old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body.Close()
+	if m.DeltaSize != 0 || m.DeltaVersion != 0 || m.FileVersion != file {
+		t.Fatalf("%+v took an image with delta %d bytes, formats %d/%d", old, m.DeltaSize, m.FileVersion, m.DeltaVersion)
 	}
 	if l := leftovers(t, filepath.Join(c.dir, "a.db")); len(l) > 0 {
 		t.Fatalf("left beside a: %v", l)
@@ -428,5 +437,142 @@ func TestImageNotOverALocalWrite(t *testing.T) {
 	}
 	if n := imagesOf(t, c.dbs["b"]); n != 0 {
 		t.Fatalf("b installed %d images over its own write", n)
+	}
+}
+
+// TestImageCarriesTheDelta: a donor whose database has a delta it has not
+// compacted sends its files as they are, the delta's committed bytes with
+// them, and the node that takes them holds what the donor holds.
+func TestImageCarriesTheDelta(t *testing.T) {
+	lowImageMin(t)
+	c := newCluster(t)
+	c.open("a", imageDDL...)
+	pad := strings.Repeat("x", 1000)
+	for i := range 200 {
+		c.exec("a", fmt.Sprintf(`INSERT INTO t VALUES(%d, 'v%d%s')`, i, i, pad))
+	}
+	c.exec("a", `UPDATE t SET v = 'changed' WHERE id < 50`, `DELETE FROM t WHERE id BETWEEN 100 AND 120`)
+	m, body, err := syncerOf(t, c.dbs["a"]).store.Image(context.Background(), imageRequest(bookkeepingLayout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body.Close()
+	if m.DeltaSize < 100<<10 {
+		t.Fatalf("the image has a delta of %d bytes; the test means less", m.DeltaSize)
+	}
+	c.open("b")
+	c.converge("", imageRowsT, clockQ)
+	waitImage(t, c.dbs["b"])
+	c.exec("b", `INSERT INTO t VALUES(1000, 'from b')`)
+	c.converge("", imageRowsT, clockQ)
+}
+
+// TestImageCompactionRacesThePin: a compaction of the donor's database once
+// an image is cut, before it is read, changes nothing the image holds, and
+// what was committed after the cut arrives by the pull that follows.
+func TestImageCompactionRacesThePin(t *testing.T) {
+	lowImageMin(t)
+	c := newCluster(t)
+	c.open("a", imageDDL...)
+	for i := range 50 {
+		c.exec("a", fmt.Sprintf(`INSERT INTO t VALUES(%d, 'v%d')`, i, i))
+	}
+	path := filepath.Join(c.dir, "a.db")
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := c.dbs["a"]
+	var once sync.Once
+	var mu sync.Mutex
+	var cutErr error
+	imageCutForTest = func() {
+		once.Do(func() {
+			big := strings.Repeat("y", 3<<20)
+			for _, q := range []string{`INSERT INTO t VALUES(1000, '` + big + `')`, `UPDATE t SET v = 'changed' WHERE id = 1`, `DELETE FROM t WHERE id = 2`} {
+				if _, err := a.Exec(q); err != nil {
+					mu.Lock()
+					cutErr = err
+					mu.Unlock()
+				}
+			}
+		})
+	}
+	t.Cleanup(func() { imageCutForTest = nil })
+	c.open("b")
+	c.converge("", `SELECT id, length(v), substr(v, 1, 8) FROM t ORDER BY id`, clockQ)
+	waitImage(t, c.dbs["b"])
+	mu.Lock()
+	defer mu.Unlock()
+	if cutErr != nil {
+		t.Fatal(cutErr)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(before, after) {
+		t.Fatal("the donor's database was not compacted after the cut; the test means less")
+	}
+	if got := dump(t, c.dbs["b"], `SELECT count(*) FROM t WHERE id IN (1000, 2)`); got != "1\n" {
+		t.Fatalf("b holds %q of the rows written and deleted after the cut", got)
+	}
+}
+
+// TestImageStagedAndCrashed: a crash once an image's files are staged, before
+// any marker, leaves the node as it was; the next Open removes the files and
+// the node takes the image again.
+func TestImageStagedAndCrashed(t *testing.T) {
+	ctx := context.Background()
+	lowImageMin(t)
+	c := newCluster(t)
+	c.open("a", imageDDL...)
+	for i := range 20 {
+		c.exec("a", fmt.Sprintf(`INSERT INTO t VALUES(%d, 'v%d')`, i, i))
+	}
+	path := filepath.Join(c.dir, "c.db")
+	db, err := Open(ctx, path, CRDT(), WithSite("c"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	m, body, err := syncerOf(t, c.dbs["a"]).store.Image(ctx, imageRequest(bookkeepingLayout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.DeltaSize == 0 {
+		t.Fatal("the image has no delta; the test means less")
+	}
+	if _, err := stageImage(path, m, body); err != nil {
+		t.Fatal(err)
+	}
+	if l := leftovers(t, path); len(l) != 2 {
+		t.Fatalf("staged %v, want a segment file and its delta", l)
+	}
+	c.open("c")
+	c.converge("", imageRowsT, clockQ)
+	waitImage(t, c.dbs["c"])
+	if l := leftovers(t, path); len(l) > 0 {
+		t.Fatalf("left beside c: %v", l)
+	}
+}
+
+// TestImageMarkerGoesWhenTheDatabaseMoved: an install refused because the
+// database committed since its state was read is not finished over that
+// commit: the marker goes, and nothing is installed.
+func TestImageMarkerGoesWhenTheDatabaseMoved(t *testing.T) {
+	dir := t.TempDir()
+	path, staged := filepath.Join(dir, "x.db"), filepath.Join(dir, "x.db"+stagedInfix+"1")
+	for _, p := range []string{staged, path + markerSuffix} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending, err := keepMarker(path, staged, 7, engine.ErrStateMoved)
+	if pending || !errors.Is(err, engine.ErrStateMoved) {
+		t.Fatalf("pending %v, %v", pending, err)
+	}
+	if _, err := os.Stat(path + markerSuffix); !os.IsNotExist(err) {
+		t.Fatalf("the marker stayed: %v", err)
 	}
 }
