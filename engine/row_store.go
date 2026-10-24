@@ -579,9 +579,13 @@ func (s *rowStore) maxRowidIn(lo, hi uint64) (uint64, bool) {
 	}
 	var max uint64
 	found := false
-	for rowid := range s.all() {
-		if rowid >= lo && rowid < hi && (!found || rowid > max) {
-			max, found = rowid, true
+	if s.seg != nil {
+		max, found = s.segMaxRowidIn(lo, hi)
+	} else {
+		for rowid := range s.all() {
+			if rowid >= lo && rowid < hi && (!found || rowid > max) {
+				max, found = rowid, true
+			}
 		}
 	}
 	s.rangeLo, s.rangeHi, s.rangeMax, s.rangeHas, s.rangeKnown = lo, hi, max, found, true
