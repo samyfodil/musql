@@ -59,8 +59,15 @@ const (
 	// DatabaseServiceInvalidateTokensProcedure is the fully-qualified name of the DatabaseService's
 	// InvalidateTokens RPC.
 	DatabaseServiceInvalidateTokensProcedure = "/cloud.v1.DatabaseService/InvalidateTokens"
-	// DatabaseServiceUploadProcedure is the fully-qualified name of the DatabaseService's Upload RPC.
-	DatabaseServiceUploadProcedure = "/cloud.v1.DatabaseService/Upload"
+	// DatabaseServiceStartUploadProcedure is the fully-qualified name of the DatabaseService's
+	// StartUpload RPC.
+	DatabaseServiceStartUploadProcedure = "/cloud.v1.DatabaseService/StartUpload"
+	// DatabaseServiceUploadChunkProcedure is the fully-qualified name of the DatabaseService's
+	// UploadChunk RPC.
+	DatabaseServiceUploadChunkProcedure = "/cloud.v1.DatabaseService/UploadChunk"
+	// DatabaseServiceFinishUploadProcedure is the fully-qualified name of the DatabaseService's
+	// FinishUpload RPC.
+	DatabaseServiceFinishUploadProcedure = "/cloud.v1.DatabaseService/FinishUpload"
 	// DatabaseServiceExportProcedure is the fully-qualified name of the DatabaseService's Export RPC.
 	DatabaseServiceExportProcedure = "/cloud.v1.DatabaseService/Export"
 	// DatabaseServiceStatsProcedure is the fully-qualified name of the DatabaseService's Stats RPC.
@@ -80,8 +87,10 @@ type DatabaseServiceClient interface {
 	Restore(context.Context, *connect.Request[v1.RestoreRequest]) (*connect.Response[v1.RestoreResponse], error)
 	CreateToken(context.Context, *connect.Request[v1.CreateTokenRequest]) (*connect.Response[v1.CreateTokenResponse], error)
 	InvalidateTokens(context.Context, *connect.Request[v1.InvalidateTokensRequest]) (*connect.Response[v1.InvalidateTokensResponse], error)
-	Upload(context.Context, *connect.Request[v1.UploadRequest]) (*connect.Response[v1.UploadResponse], error)
-	Export(context.Context, *connect.Request[v1.ExportRequest]) (*connect.Response[v1.ExportResponse], error)
+	StartUpload(context.Context, *connect.Request[v1.StartUploadRequest]) (*connect.Response[v1.StartUploadResponse], error)
+	UploadChunk(context.Context, *connect.Request[v1.UploadChunkRequest]) (*connect.Response[v1.UploadChunkResponse], error)
+	FinishUpload(context.Context, *connect.Request[v1.FinishUploadRequest]) (*connect.Response[v1.FinishUploadResponse], error)
+	Export(context.Context, *connect.Request[v1.ExportRequest]) (*connect.ServerStreamForClient[v1.ExportResponse], error)
 	Stats(context.Context, *connect.Request[v1.StatsRequest]) (*connect.Response[v1.StatsResponse], error)
 }
 
@@ -162,10 +171,22 @@ func NewDatabaseServiceClient(httpClient connect.HTTPClient, baseURL string, opt
 			connect.WithSchema(databaseServiceMethods.ByName("InvalidateTokens")),
 			connect.WithClientOptions(opts...),
 		),
-		upload: connect.NewClient[v1.UploadRequest, v1.UploadResponse](
+		startUpload: connect.NewClient[v1.StartUploadRequest, v1.StartUploadResponse](
 			httpClient,
-			baseURL+DatabaseServiceUploadProcedure,
-			connect.WithSchema(databaseServiceMethods.ByName("Upload")),
+			baseURL+DatabaseServiceStartUploadProcedure,
+			connect.WithSchema(databaseServiceMethods.ByName("StartUpload")),
+			connect.WithClientOptions(opts...),
+		),
+		uploadChunk: connect.NewClient[v1.UploadChunkRequest, v1.UploadChunkResponse](
+			httpClient,
+			baseURL+DatabaseServiceUploadChunkProcedure,
+			connect.WithSchema(databaseServiceMethods.ByName("UploadChunk")),
+			connect.WithClientOptions(opts...),
+		),
+		finishUpload: connect.NewClient[v1.FinishUploadRequest, v1.FinishUploadResponse](
+			httpClient,
+			baseURL+DatabaseServiceFinishUploadProcedure,
+			connect.WithSchema(databaseServiceMethods.ByName("FinishUpload")),
 			connect.WithClientOptions(opts...),
 		),
 		export: connect.NewClient[v1.ExportRequest, v1.ExportResponse](
@@ -196,7 +217,9 @@ type databaseServiceClient struct {
 	restore          *connect.Client[v1.RestoreRequest, v1.RestoreResponse]
 	createToken      *connect.Client[v1.CreateTokenRequest, v1.CreateTokenResponse]
 	invalidateTokens *connect.Client[v1.InvalidateTokensRequest, v1.InvalidateTokensResponse]
-	upload           *connect.Client[v1.UploadRequest, v1.UploadResponse]
+	startUpload      *connect.Client[v1.StartUploadRequest, v1.StartUploadResponse]
+	uploadChunk      *connect.Client[v1.UploadChunkRequest, v1.UploadChunkResponse]
+	finishUpload     *connect.Client[v1.FinishUploadRequest, v1.FinishUploadResponse]
 	export           *connect.Client[v1.ExportRequest, v1.ExportResponse]
 	stats            *connect.Client[v1.StatsRequest, v1.StatsResponse]
 }
@@ -256,14 +279,24 @@ func (c *databaseServiceClient) InvalidateTokens(ctx context.Context, req *conne
 	return c.invalidateTokens.CallUnary(ctx, req)
 }
 
-// Upload calls cloud.v1.DatabaseService.Upload.
-func (c *databaseServiceClient) Upload(ctx context.Context, req *connect.Request[v1.UploadRequest]) (*connect.Response[v1.UploadResponse], error) {
-	return c.upload.CallUnary(ctx, req)
+// StartUpload calls cloud.v1.DatabaseService.StartUpload.
+func (c *databaseServiceClient) StartUpload(ctx context.Context, req *connect.Request[v1.StartUploadRequest]) (*connect.Response[v1.StartUploadResponse], error) {
+	return c.startUpload.CallUnary(ctx, req)
+}
+
+// UploadChunk calls cloud.v1.DatabaseService.UploadChunk.
+func (c *databaseServiceClient) UploadChunk(ctx context.Context, req *connect.Request[v1.UploadChunkRequest]) (*connect.Response[v1.UploadChunkResponse], error) {
+	return c.uploadChunk.CallUnary(ctx, req)
+}
+
+// FinishUpload calls cloud.v1.DatabaseService.FinishUpload.
+func (c *databaseServiceClient) FinishUpload(ctx context.Context, req *connect.Request[v1.FinishUploadRequest]) (*connect.Response[v1.FinishUploadResponse], error) {
+	return c.finishUpload.CallUnary(ctx, req)
 }
 
 // Export calls cloud.v1.DatabaseService.Export.
-func (c *databaseServiceClient) Export(ctx context.Context, req *connect.Request[v1.ExportRequest]) (*connect.Response[v1.ExportResponse], error) {
-	return c.export.CallUnary(ctx, req)
+func (c *databaseServiceClient) Export(ctx context.Context, req *connect.Request[v1.ExportRequest]) (*connect.ServerStreamForClient[v1.ExportResponse], error) {
+	return c.export.CallServerStream(ctx, req)
 }
 
 // Stats calls cloud.v1.DatabaseService.Stats.
@@ -284,8 +317,10 @@ type DatabaseServiceHandler interface {
 	Restore(context.Context, *connect.Request[v1.RestoreRequest]) (*connect.Response[v1.RestoreResponse], error)
 	CreateToken(context.Context, *connect.Request[v1.CreateTokenRequest]) (*connect.Response[v1.CreateTokenResponse], error)
 	InvalidateTokens(context.Context, *connect.Request[v1.InvalidateTokensRequest]) (*connect.Response[v1.InvalidateTokensResponse], error)
-	Upload(context.Context, *connect.Request[v1.UploadRequest]) (*connect.Response[v1.UploadResponse], error)
-	Export(context.Context, *connect.Request[v1.ExportRequest]) (*connect.Response[v1.ExportResponse], error)
+	StartUpload(context.Context, *connect.Request[v1.StartUploadRequest]) (*connect.Response[v1.StartUploadResponse], error)
+	UploadChunk(context.Context, *connect.Request[v1.UploadChunkRequest]) (*connect.Response[v1.UploadChunkResponse], error)
+	FinishUpload(context.Context, *connect.Request[v1.FinishUploadRequest]) (*connect.Response[v1.FinishUploadResponse], error)
+	Export(context.Context, *connect.Request[v1.ExportRequest], *connect.ServerStream[v1.ExportResponse]) error
 	Stats(context.Context, *connect.Request[v1.StatsRequest]) (*connect.Response[v1.StatsResponse], error)
 }
 
@@ -362,13 +397,25 @@ func NewDatabaseServiceHandler(svc DatabaseServiceHandler, opts ...connect.Handl
 		connect.WithSchema(databaseServiceMethods.ByName("InvalidateTokens")),
 		connect.WithHandlerOptions(opts...),
 	)
-	databaseServiceUploadHandler := connect.NewUnaryHandler(
-		DatabaseServiceUploadProcedure,
-		svc.Upload,
-		connect.WithSchema(databaseServiceMethods.ByName("Upload")),
+	databaseServiceStartUploadHandler := connect.NewUnaryHandler(
+		DatabaseServiceStartUploadProcedure,
+		svc.StartUpload,
+		connect.WithSchema(databaseServiceMethods.ByName("StartUpload")),
 		connect.WithHandlerOptions(opts...),
 	)
-	databaseServiceExportHandler := connect.NewUnaryHandler(
+	databaseServiceUploadChunkHandler := connect.NewUnaryHandler(
+		DatabaseServiceUploadChunkProcedure,
+		svc.UploadChunk,
+		connect.WithSchema(databaseServiceMethods.ByName("UploadChunk")),
+		connect.WithHandlerOptions(opts...),
+	)
+	databaseServiceFinishUploadHandler := connect.NewUnaryHandler(
+		DatabaseServiceFinishUploadProcedure,
+		svc.FinishUpload,
+		connect.WithSchema(databaseServiceMethods.ByName("FinishUpload")),
+		connect.WithHandlerOptions(opts...),
+	)
+	databaseServiceExportHandler := connect.NewServerStreamHandler(
 		DatabaseServiceExportProcedure,
 		svc.Export,
 		connect.WithSchema(databaseServiceMethods.ByName("Export")),
@@ -404,8 +451,12 @@ func NewDatabaseServiceHandler(svc DatabaseServiceHandler, opts ...connect.Handl
 			databaseServiceCreateTokenHandler.ServeHTTP(w, r)
 		case DatabaseServiceInvalidateTokensProcedure:
 			databaseServiceInvalidateTokensHandler.ServeHTTP(w, r)
-		case DatabaseServiceUploadProcedure:
-			databaseServiceUploadHandler.ServeHTTP(w, r)
+		case DatabaseServiceStartUploadProcedure:
+			databaseServiceStartUploadHandler.ServeHTTP(w, r)
+		case DatabaseServiceUploadChunkProcedure:
+			databaseServiceUploadChunkHandler.ServeHTTP(w, r)
+		case DatabaseServiceFinishUploadProcedure:
+			databaseServiceFinishUploadHandler.ServeHTTP(w, r)
 		case DatabaseServiceExportProcedure:
 			databaseServiceExportHandler.ServeHTTP(w, r)
 		case DatabaseServiceStatsProcedure:
@@ -463,12 +514,20 @@ func (UnimplementedDatabaseServiceHandler) InvalidateTokens(context.Context, *co
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("cloud.v1.DatabaseService.InvalidateTokens is not implemented"))
 }
 
-func (UnimplementedDatabaseServiceHandler) Upload(context.Context, *connect.Request[v1.UploadRequest]) (*connect.Response[v1.UploadResponse], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("cloud.v1.DatabaseService.Upload is not implemented"))
+func (UnimplementedDatabaseServiceHandler) StartUpload(context.Context, *connect.Request[v1.StartUploadRequest]) (*connect.Response[v1.StartUploadResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("cloud.v1.DatabaseService.StartUpload is not implemented"))
 }
 
-func (UnimplementedDatabaseServiceHandler) Export(context.Context, *connect.Request[v1.ExportRequest]) (*connect.Response[v1.ExportResponse], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("cloud.v1.DatabaseService.Export is not implemented"))
+func (UnimplementedDatabaseServiceHandler) UploadChunk(context.Context, *connect.Request[v1.UploadChunkRequest]) (*connect.Response[v1.UploadChunkResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("cloud.v1.DatabaseService.UploadChunk is not implemented"))
+}
+
+func (UnimplementedDatabaseServiceHandler) FinishUpload(context.Context, *connect.Request[v1.FinishUploadRequest]) (*connect.Response[v1.FinishUploadResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("cloud.v1.DatabaseService.FinishUpload is not implemented"))
+}
+
+func (UnimplementedDatabaseServiceHandler) Export(context.Context, *connect.Request[v1.ExportRequest], *connect.ServerStream[v1.ExportResponse]) error {
+	return connect.NewError(connect.CodeUnimplemented, errors.New("cloud.v1.DatabaseService.Export is not implemented"))
 }
 
 func (UnimplementedDatabaseServiceHandler) Stats(context.Context, *connect.Request[v1.StatsRequest]) (*connect.Response[v1.StatsResponse], error) {

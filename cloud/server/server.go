@@ -23,10 +23,6 @@ import (
 	"github.com/samyfodil/musql/cloud/state"
 )
 
-// maxUpload bounds a request body to the API; an upload carries a whole
-// database file.
-const maxUpload = 256 << 20
-
 // Server is a running musql cloud node.
 type Server struct {
 	cfg      *Config
@@ -35,6 +31,7 @@ type Server struct {
 	pool     *pool
 	meter    *meter
 	hist     histories
+	uploads  uploadGate
 	handler  http.Handler
 	log      *log.Logger
 	// cl is set on a cluster node.
@@ -70,6 +67,7 @@ func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) 
 		}
 	}
 	s := &Server{cfg: cfg, log: logger}
+	s.removeStaleExports()
 	store, err := s.openState(ctx)
 	if err != nil {
 		return nil, err
@@ -117,6 +115,7 @@ func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) 
 		s.bg.Go(func() { s.runSnapshots(s.stop) })
 	}
 	s.bg.Go(s.runUsageFlush)
+	s.bg.Go(s.runUploadSweep)
 	if s.cl != nil {
 		s.bg.Go(s.runCluster)
 	}
@@ -239,7 +238,7 @@ func Init(ctx context.Context, cfg *Config, email, password string) error {
 
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
-	opts := []connect.HandlerOption{connect.WithReadMaxBytes(maxUpload)}
+	opts := []connect.HandlerOption{connect.WithReadMaxBytes(maxRequestBytes)}
 	mux.Handle(cloudv1connect.NewAuthServiceHandler(authService{s}, opts...))
 	mux.Handle(cloudv1connect.NewUserServiceHandler(userService{s}, opts...))
 	mux.Handle(cloudv1connect.NewOrgServiceHandler(orgService{s}, opts...))

@@ -35,14 +35,15 @@ func main() {
 	defer stop()
 	fd := int(os.Stdin.Fd())
 	err := cli.Run(ctx, cli.Env{
-		Dir:         dir,
-		Token:       os.Getenv("MUSQL_API_TOKEN"),
-		Stdin:       os.Stdin,
-		Stdout:      os.Stdout,
-		Stderr:      os.Stderr,
-		Interactive: term.IsTerminal(fd),
-		StdinFd:     fd,
-		OpenBrowser: openBrowser,
+		Dir:              dir,
+		Token:            os.Getenv("MUSQL_API_TOKEN"),
+		Stdin:            os.Stdin,
+		Stdout:           os.Stdout,
+		Stderr:           os.Stderr,
+		Interactive:      term.IsTerminal(fd),
+		StderrIsTerminal: term.IsTerminal(int(os.Stderr.Fd())),
+		StdinFd:          fd,
+		OpenBrowser:      openBrowser,
 	}, os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "musql:", err)

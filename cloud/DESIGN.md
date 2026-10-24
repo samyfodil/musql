@@ -47,6 +47,9 @@ ai:
 snapshots:
   every: "1h"
   keep: "168h"
+uploads:
+  max_bytes: 1073741824    # the largest file one upload may carry (default 1 GiB)
+  ttl: "24h"               # an upload that nothing writes to or uses is removed after this
 console:
   dir: "./console/dist"    # the console's build, served at /console/
   cors_origins: []         # other origins allowed to call the API and Hrana
@@ -127,6 +130,50 @@ The server is its own issuer at `public_url`:
   recreates the parent's objects empty.
 - **Standalone and cluster**: see below; a `crdt` database's history is its
   node's.
+
+## Uploads and exports
+
+A database file moves in pieces, so neither side holds it in memory.
+
+- **Upload**, three unary calls (connect-web cannot stream a request).
+  `StartUpload` (`org`, `size_bytes` if known, `resume` to continue an
+  unfinished one) returns the upload's id, the offset the server holds and the
+  largest piece, 4 MiB. `UploadChunk` appends a piece at an offset, which must
+  be exactly the bytes the server holds: a piece sent twice or out of order is
+  refused (`FailedPrecondition`, naming the offset to continue from).
+  `FinishUpload` takes the SHA-256 of the whole file, reads the file back to
+  check it, and makes it usable; a mismatch removes the upload. `Create` then
+  moves the file into place, or converts it if it is a C SQLite file.
+- **Where it lives**: `data_dir/uploads/<org id>-<id>.part` while pieces
+  arrive, without `.part` once finished. The size of the file is the whole
+  state of the upload, so it survives a restart, and a client that gets no
+  answer to a piece asks `StartUpload` with `resume` where the upload stands
+  (a finished one holds the whole file, and finishing it again answers the
+  same). Both clients do; the CLI also takes `--resume <id>` after an
+  interrupted run. An upload belongs to its org and to the node that started
+  it: in a cluster, every call of one upload, and the `Create` that uses it,
+  must reach that node.
+- **Limits**: `uploads.max_bytes` is checked against `size_bytes` at
+  `StartUpload` and on every piece; `uploads.ttl` removes an upload, finished
+  or not, that nothing has written to for that long. Console requests are JSON,
+  where a piece is base64: a reverse proxy in front of the server must pass
+  request bodies of about 6 MiB.
+- **Export** is a server-streaming call. One function (`exportFile`) writes a
+  consistent copy (`VACUUM INTO`, then the converter for a C SQLite file) to a
+  file under `data_dir/export-*`; the call reads it out in 1 MiB messages, the
+  first carrying the size, and removes it when it ends. A stopped server's
+  leftovers are removed at the next start. The CLI writes `<file>.part` and
+  renames it when whole; the console writes through the File System Access API
+  where the browser has one, and folds the pieces into a Blob where not.
+- **What is bounded**: the transfer holds a piece or a message, and the
+  musql-format export (`VACUUM INTO`) stays flat. What runs on the file does
+  not. `Create` from an upload runs the engine's `integrity_check`, whose
+  working set grows with the rows (measured: 2.4x the file for 1M small rows,
+  4.5x with two indexes; a file of large blobs costs nothing). A C SQLite
+  upload is converted first (`convert/sqlite`), whose own check takes about 3x
+  the file in memory, and needs disk for both files; a C SQLite export is built
+  in memory by the converter, about twice the file. Size `uploads.max_bytes`
+  for those.
 
 ## Deployments: standalone and cluster
 
@@ -315,7 +362,7 @@ Services, each method checks the caller's role:
 - `UserService` (admin): List, Create, Update (name, disabled), ResetPassword, Delete.
 - `OrgService`: List, Create, Update, Delete, ListMembers, Invite, UpdateMember, RemoveMember, ListInvites, AcceptInvite.
 - `GroupService`: List, Create, Delete, AddLocation, RemoveLocation, ListLocations.
-- `DatabaseService`: List, Get, Create (empty, from upload, as branch, from restore point), Delete, Rename, Usage, ListSnapshots, Restore (to time, new or in place), CreateToken, InvalidateTokens, Upload, Export (musq or C SQLite), Stats (top queries).
+- `DatabaseService`: List, Get, Create (empty, from upload, as branch, from restore point), Delete, Rename, Usage, ListSnapshots, Restore (to time, new or in place), CreateToken, InvalidateTokens, StartUpload / UploadChunk / FinishUpload (a database file in pieces), Export (musq or C SQLite, streamed), Stats (top queries).
 - `AIService`: GenerateSQL.
 
 ## Console
@@ -344,7 +391,10 @@ Same verbs as `turso` where they apply: `auth login|logout|whoami|token`,
 `org list|create|switch|members …`, `group list|create|destroy|locations …`,
 `db list|create|show|destroy|shell|tokens create|tokens invalidate|import|export|restore|branch`,
 `db inspect` (size, usage), `db shell` (a REPL over Hrana with `.tables`,
-`.schema`, `.mode`). Config in `~/.config/musql/` (only the CLI reads it).
+`.schema`, `.mode`). `db import`, `db create --from-file` and `db export`
+move the file in pieces with progress on stderr; an interrupted upload
+continues with `--resume <id>`. Config in `~/.config/musql/` (only the CLI
+reads it).
 
 ## Releases
 

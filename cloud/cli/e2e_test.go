@@ -45,10 +45,13 @@ type harness struct {
 	dir string
 }
 
-func start(t *testing.T) *harness {
+func start(t *testing.T) *harness { return startWith(t, "") }
+
+// startWith starts the server with extra config.yaml lines.
+func startWith(t *testing.T, extra string) *harness {
 	t.Helper()
 	data := t.TempDir()
-	cfg, err := server.ParseConfig([]byte("data_dir: " + data + "\nnode:\n  location: fra\n"))
+	cfg, err := server.ParseConfig([]byte("data_dir: " + data + "\nnode:\n  location: fra\n" + extra))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,9 +84,16 @@ func (h *harness) run(args ...string) string {
 }
 
 func (h *harness) try(args ...string) (string, error) {
-	var out bytes.Buffer
-	err := cli.Run(context.Background(), cli.Env{Dir: h.dir, Stdin: strings.NewReader(""), Stdout: &out, Stderr: io.Discard}, args)
-	return out.String(), err
+	out, _, err := h.tryEnv(cli.Env{}, args...)
+	return out, err
+}
+
+// tryEnv runs the CLI with env's fields set, returning stdout and stderr.
+func (h *harness) tryEnv(env cli.Env, args ...string) (string, string, error) {
+	var out, errs bytes.Buffer
+	env.Dir, env.Stdin, env.Stdout, env.Stderr = h.dir, strings.NewReader(""), &out, &errs
+	err := cli.Run(context.Background(), env, args)
+	return out.String(), errs.String(), err
 }
 
 // login drives the device flow: the CLI polls while the test approves its
