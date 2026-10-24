@@ -157,7 +157,7 @@ type Session struct {
 // rows: the caller is told the statement failed, so those rows must not be
 // committed by the NEXT statement -- this project's "halted statement still
 // publishes" class. See the driver's commitHeldSession, which found it as a lost
-// row under N4.
+// row under N4. Until the rebuild, Commit refuses and Close drops them.
 func (n *Session) Poison() { n.poisoned = true }
 
 // OpenWrite opens a segment file for writing.
@@ -485,6 +485,9 @@ func (n *Session) ExecArgsOwned(sql string, args []Value) (int64, int64, error) 
 func (n *Session) Commit() (bool, error) {
 	if n.closed {
 		return false, fmt.Errorf("engine: write session is closed")
+	}
+	if n.poisoned {
+		return false, fmt.Errorf("engine: a failed commit left this session's rows; it must be rebuilt from the file first")
 	}
 	var wrote bool
 	// ALREADY HELD? Then commit under it rather than taking a second one.
@@ -985,15 +988,22 @@ func (n *Session) Close() error {
 	// main.c:1398; sqlite3RollbackAll; TestSavepointClosePersistence). Only
 	// autocommit work, which an engine-direct session batches until here, is
 	// committed.
+	//
+	// A poisoned session commits nothing: what it holds is a failed commit's
+	// rows, and a connection pool closing it published one.
 	var err error
 	if n.InTransaction() {
 		_, _, err = n.DB.ExecArgs("ROLLBACK", nil)
 	}
-	if aerr := n.commitAttachedWrites(); aerr != nil && err == nil {
-		err = aerr
-	}
-	if _, cerr := n.Commit(); cerr != nil && err == nil {
-		err = cerr
+	if n.poisoned {
+		n.discardAttachedWrites()
+	} else {
+		if aerr := n.commitAttachedWrites(); aerr != nil && err == nil {
+			err = aerr
+		}
+		if _, cerr := n.Commit(); cerr != nil && err == nil {
+			err = cerr
+		}
 	}
 	n.closeAttached()
 	n.EndWriteTxn()
