@@ -193,8 +193,9 @@ type ReadOnlyPager struct {
 	// reading its rows, for a caller that needs only the column metadata
 	// (derivedSelectScope).
 	fromColumnsOnly bool
-	// fts5ConfigGen is DB.fts5ConfigGen as of this pager, stamped by stampPager.
-	fts5ConfigGen uint64
+	// runFold says the statement being compiled built a value of this run into
+	// its program (noteRunFold).
+	runFold        bool
 	schemaLoaded   bool
 	resolvedTables map[string]*resolvedTable
 

@@ -2065,6 +2065,11 @@ func (n *Session) reopen(afterFailedCommit bool) error {
 	if fresh.schemaCookie == n.schemaCookie && n.stat1Loaded {
 		fresh.stat1 = n.stat1
 	}
+	// ...and the compiled reads: a plan binds no rows (sharedPlanCache), and the
+	// next statement's pager checks its key against the fresh schema, settings
+	// and statistics. The write programs stay behind: each holds the old
+	// session's *tableMeta.
+	fresh.plans = n.plans
 
 	old := n.src
 	n.DB, n.src = fresh.DB, fresh.src

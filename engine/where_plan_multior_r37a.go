@@ -23,6 +23,8 @@
 // WO_AND and its own WhereClause in C, and declines here.
 package engine
 
+import "slices"
+
 // whereOrInfo is WhereTerm.u.pOrInfo (whereInt.h): the broken-out sub-clause of
 // an OR term plus the set of tables every disjunct constrains.
 type whereOrInfo struct {
@@ -622,7 +624,13 @@ func whereOrSubTerms(sub whereIdxTerm, outer []whereIdxTerm) []whereIdxTerm {
 // WHERE_OR_SUBCLAUSE, whose observable effect here is no automatic index
 // (where.c:4067; noAutoIndex). ok == false declines the statement.
 func wherePlanMultiOrOrder(items []whereItem, nEList int, info *whereOrInfo, reverseOrder bool) (*multiOrOrder, bool) {
-	mo := &multiOrOrder{scopes: info.scopes}
+	// The runtime reads only the columns of these scopes; the planner's own
+	// fields would keep the compile's pager alive in a cached plan.
+	scopes := slices.Clone(info.scopes)
+	for i := range scopes {
+		scopes[i].planOuter, scopes[i].planPager = nil, nil
+	}
+	mo := &multiOrOrder{scopes: scopes}
 	for _, d := range info.exprs {
 		// The membership test, compiled once (see multiOrOrder for the C). Only
 		// a single-table FROM reaches here with a scope to compile against (a

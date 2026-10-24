@@ -373,6 +373,7 @@ func (db *DB) cachedWriteProgram(sqlText string) (*Program, error) {
 		db.lastWritePlanText, db.lastWritePlan = sqlText, p
 		return p, nil
 	}
+	db.runFold = false
 	p, err := db.compileWrite(sqlText)
 	if err != nil {
 		return nil, err
@@ -380,7 +381,7 @@ func (db *DB) cachedWriteProgram(sqlText string) (*Program, error) {
 	if !segPeepholesOffForTest {
 		segWriteFilterPeephole(p) // see its doc comment for the shapes it may touch
 	}
-	if p.WritePager == nil || p.FreshWritePager {
+	if (p.WritePager == nil || p.FreshWritePager) && !db.runFold {
 		db.writePlans[sqlText] = p
 	}
 	return p, nil
