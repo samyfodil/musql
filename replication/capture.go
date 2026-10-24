@@ -46,6 +46,7 @@ func (s *Syncer) attach(conn *driver.Conn) {
 		Rollback:   c.discard,
 		HandOff:    c.handOff,
 		LockWait:   s.store.localLockWait,
+		Contended:  s.store.ingestWaits,
 	})
 }
 

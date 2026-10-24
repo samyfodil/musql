@@ -69,13 +69,17 @@ type Store struct {
 	applied      atomic.Uint64
 	// localWaiting counts the local writes waiting for the write lock and
 	// localGot those done waiting; yieldTo is the localGot an apply that
-	// yielded the lock to waiting writes waits for (waitLocal). localFree is
-	// closed when localGot rises or localRetries falls.
-	localWaiting atomic.Int32
-	localGot     atomic.Uint64
-	yieldTo      atomic.Uint64
-	localMu      sync.Mutex
-	localFree    chan struct{}
+	// yielded the lock to waiting writes waits for (waitLocal). ingestWaiting
+	// counts the ingests waiting for the write lock and ingestGot those done
+	// waiting, which a local write lets in first (waitIngest). localFree is
+	// closed when localGot or ingestGot rises or localRetries falls.
+	localWaiting  atomic.Int32
+	localGot      atomic.Uint64
+	yieldTo       atomic.Uint64
+	ingestWaiting atomic.Int32
+	ingestGot     atomic.Uint64
+	localMu       sync.Mutex
+	localFree     chan struct{}
 	// ownSeq is the highest seq of this site's that a local commit here, or the
 	// log at open, holds (capture.lastSeq). NoteLocal raises it without mu, and
 	// vv takes it in (foldOwn) wherever vv is read under mu: a local writer
@@ -485,12 +489,7 @@ func (s *Store) localCommitted() { s.lastLocal.Store(time.Now().UnixNano()) }
 func (s *Store) waitLocal() {
 	until := time.Now().Add(engine.BusyTimeout)
 	for {
-		s.localMu.Lock()
-		if s.localFree == nil {
-			s.localFree = make(chan struct{})
-		}
-		free := s.localFree
-		s.localMu.Unlock()
+		free := s.localChange()
 		left := time.Until(time.Unix(0, s.localUntil.Load()))
 		if s.localRetries.Load() <= 0 || left <= 0 {
 			if left = time.Until(until); s.localGot.Load() >= s.yieldTo.Load() || left <= 0 {
@@ -517,10 +516,35 @@ func (s *Store) localDone() {
 	s.wakeLocal()
 }
 
+// waitIngest lets an ingest waiting for the write lock take it ahead of a
+// local write, waiting at most holdAlone. The lock is not handed over in turn:
+// a writer committing back to back took it back each time before the waiting
+// ingest woke, and its ops waited seconds.
+func (s *Store) waitIngest() {
+	got, until := s.ingestGot.Load(), time.Now().Add(holdAlone)
+	for {
+		free := s.localChange()
+		left := time.Until(until)
+		if s.ingestWaiting.Load() <= 0 || s.ingestGot.Load() != got || left <= 0 {
+			return
+		}
+		t := time.NewTimer(left)
+		select {
+		case <-free:
+		case <-t.C:
+		}
+		t.Stop()
+	}
+}
+
+// ingestWaits reports whether an ingest waits for the write lock (capture).
+func (s *Store) ingestWaits() bool { return s.ingestWaiting.Load() > 0 }
+
 // localLockWait brackets a local write's wait for the write lock (capture).
 func (s *Store) localLockWait(waiting bool) {
 	if waiting {
 		s.localWaiting.Add(1)
+		s.waitIngest()
 		return
 	}
 	s.localGot.Add(1)
@@ -528,7 +552,17 @@ func (s *Store) localLockWait(waiting bool) {
 	s.wakeLocal()
 }
 
-// wakeLocal wakes waitLocal to look again.
+// localChange is the channel wakeLocal closes next.
+func (s *Store) localChange() chan struct{} {
+	s.localMu.Lock()
+	defer s.localMu.Unlock()
+	if s.localFree == nil {
+		s.localFree = make(chan struct{})
+	}
+	return s.localFree
+}
+
+// wakeLocal wakes waitLocal and waitIngest to look again.
 func (s *Store) wakeLocal() {
 	s.localMu.Lock()
 	if s.localFree != nil {
@@ -551,7 +585,11 @@ func (s *Store) ingest(ctx context.Context, ops []Op, local bool) (int, error) {
 	if s.held(ctx, ops) {
 		return len(ops), nil
 	}
+	s.ingestWaiting.Add(1)
 	tx, err := s.begin(ctx)
+	s.ingestGot.Add(1)
+	s.ingestWaiting.Add(-1)
+	s.wakeLocal()
 	if err != nil {
 		return -1, err
 	}
