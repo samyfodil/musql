@@ -8,7 +8,7 @@ import { Field } from "../components/ColumnPanel.jsx";
 import { MenuButton } from "../components/Menu.jsx";
 import { Spinner } from "../components/Busy.jsx";
 import { fmt } from "../values.js";
-import { Access, api, date, DatabaseType, FileFormat, message, Role, ROLES, roleName, stamp, typeName, unimplemented } from "./api.js";
+import { Access, api, databaseToken, date, DatabaseType, FileFormat, message, Role, ROLES, roleName, stamp, typeName, unimplemented } from "./api.js";
 import { server, signIn, signOut } from "./auth.js";
 
 export const PAGES = [
@@ -197,13 +197,22 @@ function Databases({ cloud, toast, onOpen, setPage }) {
 	const dbs = s.data ?? [];
 	const member = can(cloud, Role.MEMBER);
 
-	async function open(d) {
-		try {
-			const readOnly = !member;
-			const r = await api.db.createToken({ org, name: d.name, access: readOnly ? Access.READ_ONLY : Access.FULL, expiresAt: stamp(new Date(Date.now() + 3600e3)) });
+	// connection is d as the editor opens it: its URL, and a token that renews itself.
+	async function connection(d) {
+		const readOnly = !member;
+		const first = await databaseToken(org, d.name, readOnly);
+		return {
+			name: `${org}/${d.name}`,
 			// The client resolves "v3/pipeline" against the URL, which drops a
 			// last path segment that has no trailing slash.
-			await onOpen({ name: `${org}/${d.name}`, url: d.url.replace(/\/?$/, "/"), token: r.token });
+			url: d.url.replace(/\/?$/, "/"),
+			token: first.token,
+			renewal: { exp: first.exp, mint: () => databaseToken(org, d.name, readOnly) },
+		};
+	}
+	async function open(d) {
+		try {
+			await onOpen(await connection(d));
 		} catch (e) {
 			toast(message(e), true);
 		}

@@ -326,6 +326,13 @@ server or any Hrana/libSQL URL with a token), staged edits (changes queue up,
 reviewed as SQL, applied in one transaction or discarded), several result
 tabs per run with a summary tab, function hints in completion, and AI SQL.
 
+A database of this server open in the editor runs on a one-hour token that
+the console renews halfway through its life, and again when Hrana answers
+401; the console's own session is refreshed the same way, and ends only when
+the token endpoint refuses the refresh token. Then the editor shows a "signed
+out" bar with a sign-in button, and the database stops answering once its
+current token expires, with that reason.
+
 ## CLI (`musql`)
 
 Same verbs as `turso` where they apply: `auth login|logout|whoami|token`,

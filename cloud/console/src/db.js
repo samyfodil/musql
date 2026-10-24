@@ -3,6 +3,7 @@
 // server reached with @libsql/client. query, run, rows and the exports go to
 // whichever is open; split always goes to the worker, which splits a script as
 // the engine does whether or not a local database is open.
+import { authFetch, tokenSession } from "./renew.js";
 import { verb } from "./sqltext.js";
 
 const worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
@@ -52,7 +53,7 @@ export async function call(op, ...args) {
 
 // ---- the remote backend ----
 
-let remote = null; // {client, tx, url, host}
+let remote = null; // {client, tx, url, host, session}
 
 async function tracked(f) {
 	remoteCalls++;
@@ -81,18 +82,27 @@ export const isRemote = () => !!remote;
 /**
  * connect opens a remote database and makes it the one every call goes to. It
  * runs SELECT 1 first, so a wrong URL or token fails here, with the server's
- * message, and leaves the open database as it was.
+ * message, and leaves the open database as it was. A token that expires comes
+ * with renewal, {exp, mint}: renew.js renews it before then, and when the
+ * server refuses it.
  */
-export async function connect(url, authToken) {
+export async function connect(url, authToken, renewal) {
 	const { createClient } = await import("@libsql/client/web");
-	const client = createClient({ url, authToken: authToken || undefined, intMode: "bigint" });
-	await tracked(() => client.execute("SELECT 1"));
+	const session = renewal && tokenSession({ token: authToken, exp: renewal.exp, mint: renewal.mint });
+	const client = createClient({ url, authToken: authToken || undefined, intMode: "bigint", fetch: session && authFetch(session) });
+	try {
+		await tracked(() => client.execute("SELECT 1"));
+	} catch (e) {
+		session?.stop();
+		throw e;
+	}
 	disconnect();
-	remote = { client, tx: null, url, host: hostOf(url) };
+	remote = { client, tx: null, url, host: hostOf(url), session };
 }
 
 function disconnect() {
 	if (!remote) return;
+	remote.session?.stop();
 	remote.tx?.close();
 	remote.client.close();
 	remote = null;

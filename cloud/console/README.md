@@ -34,6 +34,7 @@ Nothing is uploaded anywhere.
 sh ../npm/build.sh     # the wasm module the package ships
 npm install
 npm run dev            # or: npm run build, then serve dist/
+npm test               # the *.test.mjs files, under Node 22.15 or later
 ```
 
 React and CodeMirror, built with Vite.
