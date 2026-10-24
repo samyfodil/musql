@@ -73,6 +73,8 @@ type Store struct {
 	// ownSeq is the highest seq of this site's that a local commit here, or the
 	// log at open, holds (capture.lastSeq).
 	ownSeq atomic.Uint64
+	// group gathers concurrent Ingest calls into one transaction (Ingest).
+	group ingestGroup
 }
 
 // begin starts a store transaction: BEGIN IMMEDIATE on a connection of the
@@ -299,9 +301,92 @@ func scanOp(r interface{ Scan(...any) error }) (Op, error) {
 // clock cells it wins, the rows it rewrites and -- for a schema op -- the tables
 // it drops and rebuilds either all land or none do, so a failure part-way leaves
 // the op un-recorded and the next delivery redoes it from the start.
+//
+// GROUP COMMIT: an Ingest that arrives while another is applying waits, and
+// the next transaction applies every op that queued meanwhile -- one commit,
+// one sync to disk, for all of them. A call that finds nothing applying leads
+// at once, so an idle receiver waits for nothing. Each call still returns only
+// once its own op is durable, or refused.
 func (s *Store) Ingest(ctx context.Context, op Op, local bool) error {
-	_, err := s.ingest(ctx, []Op{op}, local)
-	return err
+	g := &s.group
+	c := &ingestCall{op: op, local: local, done: make(chan error, 1)}
+	g.mu.Lock()
+	g.queue = append(g.queue, c)
+	lead := !g.running
+	g.running = true
+	g.mu.Unlock()
+	if !lead {
+		if err := <-c.done; err != errIngestLead {
+			return err
+		}
+	}
+	g.mu.Lock()
+	calls := g.queue
+	g.queue = nil
+	g.mu.Unlock()
+	s.applyCalls(ctx, calls)
+	// The oldest call that queued meanwhile leads the next transaction, so
+	// none waits on a leader that has gone back to its caller.
+	g.mu.Lock()
+	if len(g.queue) > 0 {
+		g.queue[0].done <- errIngestLead
+	} else {
+		g.running = false
+	}
+	g.mu.Unlock()
+	return <-c.done
+}
+
+// ingestGroup is the Ingest calls waiting for the next transaction, and
+// whether one is leading it (Ingest).
+type ingestGroup struct {
+	mu      sync.Mutex
+	running bool
+	queue   []*ingestCall
+}
+
+// ingestCall is one Ingest waiting for its op's transaction: done gets its
+// result, or errIngestLead when it is to lead the next one.
+type ingestCall struct {
+	op    Op
+	local bool
+	done  chan error
+}
+
+var errIngestLead = errors.New("replication: lead the next ingest")
+
+// applyCalls applies the queued calls' ops in order, a run of one local flag
+// to a transaction (ingestAllAs), and hands each call its result: an op that
+// is refused gets its error, and the ops after it still apply. The leader's
+// cancellation does not end the others' transaction: begin ignores it too.
+func (s *Store) applyCalls(ctx context.Context, calls []*ingestCall) {
+	ctx = context.WithoutCancel(ctx)
+	for len(calls) > 0 {
+		n := 1
+		for n < len(calls) && calls[n].local == calls[0].local {
+			n++
+		}
+		run := calls[:n]
+		calls = calls[n:]
+		ops := make([]Op, len(run))
+		for i, c := range run {
+			ops[i] = c.op
+		}
+		for len(run) > 0 {
+			k, err := s.ingestAllAs(ctx, ops, run[0].local)
+			if err == nil || k < 0 {
+				for _, c := range run {
+					c.done <- err
+				}
+				break
+			}
+			for _, c := range run[:k] {
+				c.done <- nil
+			}
+			run[k].done <- err
+			run, ops = run[k+1:], ops[k+1:]
+		}
+	}
 }
 
 // ingestAll applies ops in order, as Ingest one at a time would, a few
@@ -309,9 +394,14 @@ func (s *Store) Ingest(ctx context.Context, op Op, local bool) error {
 // returns k and that error, with ops[:k] applied and the rest not tried; on an
 // error no op caused, -1, and the ops before it may have applied.
 func (s *Store) ingestAll(ctx context.Context, ops []Op) (int, error) {
+	return s.ingestAllAs(ctx, ops, false)
+}
+
+// ingestAllAs is ingestAll for ops that are all local, or all not (Ingest).
+func (s *Store) ingestAllAs(ctx context.Context, ops []Op, local bool) (int, error) {
 	done := 0
 	for done < len(ops) {
-		n, err := s.ingest(ctx, ops[done:], false)
+		n, err := s.ingest(ctx, ops[done:], local)
 		switch {
 		case err == nil:
 			done += n
@@ -320,7 +410,7 @@ func (s *Store) ingestAll(ctx context.Context, ops []Op) (int, error) {
 			return -1, err
 		case n > 0:
 			// The refused op rolled back the ones before it, which apply alone.
-			if _, perr := s.ingestAll(ctx, ops[done:done+n]); perr != nil {
+			if _, perr := s.ingestAllAs(ctx, ops[done:done+n], local); perr != nil {
 				return -1, perr
 			}
 		}
