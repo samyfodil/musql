@@ -1426,15 +1426,21 @@ func wherePlanSubqueryUsage(jts []joinedTable, scopes []tableScope, e Expr) (whe
 	if len(scopes) == 0 || scopes[0].planPager == nil {
 		return 0, false
 	}
-	p := scopes[0].planPager
 	var m whereMask
-	ok := true
-	mark := func(ce ColumnExpr) bool {
+	ok := wherePlanSubqueryNames(scopes[0].planPager, e, func(ce ColumnExpr) bool {
 		if tab, _, found := wherePlanColumnRef(jts, scopes, ce); found && tab < 63 {
 			m |= whereMask(1) << uint(tab)
 		}
 		return true
-	}
+	})
+	return m, ok
+}
+
+// wherePlanSubqueryNames calls mark for every name inside a subquery of e that
+// resolves outside that subquery. ok false when a name or FROM item inside
+// cannot be resolved exactly, mark having seen only the names before it.
+func wherePlanSubqueryNames(p *ReadOnlyPager, e Expr, mark func(ColumnExpr) bool) bool {
+	ok := true
 	// The CTEs in scope where e is compiled: a subquery naming one reads its
 	// body's columns, as resolveFrom would bind it.
 	var cteDefs map[string]*CTEDef
@@ -1458,7 +1464,7 @@ func wherePlanSubqueryUsage(jts []joinedTable, scopes []tableScope, e Expr) (whe
 		return true
 	}
 	wherePlanWalkColumnsSub(e, func(ColumnExpr) bool { return true }, sub)
-	return m, ok
+	return ok
 }
 
 // whereLikeAnalyzable is whereTermAnalyzable for a LIKE/GLOB, in either
