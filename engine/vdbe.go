@@ -1959,36 +1959,25 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			if cursorHasNoBtree(m.cursors[op.P1]) {
 				break
 			}
-			// Only an INTEGER key can equal a rowid; for any other storage
-			// class leave the cursor in full-scan mode (see OpSeekRowidHint's
-			// doc comment, vdbe_op.go). The keyed WHERE conjunct is evaluated
-			// in the loop body regardless, so this only prunes the scan.
-			if key := m.regs[op.P2]; key.Typ == Int {
-				cur := m.cursors[op.P1]
-				cur.seekConfigured = true
-				cur.seekKey = key.I
-				cur.seekReseek = op.P3 == 1 // correlated join seek: re-seek per rewind
-			} else if op.P3 == 1 {
-				// Correlated join seek with a non-integer key this iteration:
-				// leave the cursor in full-scan mode for THIS outer row (no
-				// integer rowid can match), but keep the re-seek flag so a later
-				// outer row whose key IS an integer still re-materializes rather
-				// than reusing this full scan.
-				cur := m.cursors[op.P1]
-				cur.seekConfigured = false
-				cur.seekReseek = true
+			// The key takes numeric affinity, as OP_SeekRowid gives it, and
+			// one that is still no integer equals no rowid: the cursor visits
+			// nothing, as C's loop does. A scan would test the rest of the
+			// WHERE on rows C never reads, and so raise errors C does not.
+			// The keyed conjunct is evaluated in the loop body regardless.
+			key := m.regs[op.P2]
+			if key.Typ != Int {
+				key = applyAffinityToValue(key, affNumeric)
 			}
+			cur := m.cursors[op.P1]
+			cur.seekConfigured, cur.seekNone = true, key.Typ != Int
+			cur.seekKey = key.I
+			cur.seekReseek = op.P3 == 1 // correlated join seek: re-seek per rewind
 
 		case OpSeekRowidRangeHint:
 			if cursorHasNoBtree(m.cursors[op.P1]) {
 				break
 			}
-			// An INTEGER bound only, as for OpSeekRowidHint: any other storage
-			// class compares to a rowid by rules this does not reproduce, so it
-			// leaves the scan whole and the conjunct decides every row.
-			if key := m.regs[op.P2]; key.Typ == Int {
-				m.cursors[op.P1].narrowRowidRange(op.P3, key.I)
-			}
+			m.cursors[op.P1].narrowRowidRangeBy(op.P3, m.regs[op.P2])
 
 		case OpSeekIndexHint:
 			// Coerce the key with the exact affinity the WHERE comparison

@@ -823,19 +823,19 @@ func compileScanPlain(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols 
 //     (rowid/_rowid_/oid) or INTEGER PRIMARY KEY and a column-free E (a
 //     literal or bound parameter), or a column of an ENCLOSING query
 //     (isOuterSeekKey), which is as constant for one run of a correlated
-//     subquery as a literal. Collation cannot matter: the seek fires only for
-//     an integer key, and any coercion the comparison would apply leaves a
-//     non-integer key and so a full scan.
+//     subquery as a literal. Collation cannot matter: the key takes the
+//     numeric affinity the comparison gives it, and one that is then no
+//     integer equals no rowid.
 //
 // E needs no cursor, so it is evaluated once after srcs[i]'s OpOpenRead,
 // before any Rewind, at any FROM or execution position. Outer join targets
 // are excluded because pruning would happen before the level's
 // match/NULL-extension bookkeeping (annotateJoinSeeks excludes them too).
 //
-// The conjunct stays in WHERE, so the seek only restricts candidates: the seek
-// fires only for an integer K (OpSeekRowidHint), and "rowid = K" holds for
-// exactly the row with that rowid, a superset of the answer. A non-integer key
-// leaves a full scan.
+// The conjunct stays in WHERE, so the seek only restricts candidates: "rowid =
+// K" holds for exactly the row with that rowid, and for none when K is no
+// integer under numeric affinity, which OpSeekRowidHint then reads as C's
+// OP_SeekRowid does: no row at all.
 func detectRowidSeekKey(c *compiler, srcs []joinSource, where Expr) (int, Expr, bool) {
 	if where == nil {
 		return 0, nil, false
@@ -1021,8 +1021,7 @@ func planConstantKeySeeks(c *compiler, srcs []joinSource, where Expr, rowidRange
 // trivially evaluable before the scan starts (no cursor row is positioned yet)
 // and independent of the row being sought -- "rowid = othercol" (a per-row
 // value, never a single seek key) is thereby excluded. The literal's/parameter's
-// actual storage class is checked at runtime by OpSeekRowidHint: a non-integer
-// value falls back to a full scan.
+// actual storage class is read at runtime by the seek opcodes.
 func isSeekKeyCandidate(e Expr) bool {
 	switch e.(type) {
 	case LiteralExpr, ParamExpr:

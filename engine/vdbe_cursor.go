@@ -113,12 +113,14 @@ type vdbeCursor struct {
 	colMask columnMask
 
 	// seekConfigured/seekKey turn the first rewind() into a rowid point lookup
-	// (SeekRowidSegments) instead of a full scan. Set by OpSeekRowidHint only for
-	// a runtime-Integer key; the WHERE conjunct is still evaluated on the fetched
-	// row, so the seek only narrows the candidate set and cannot change the
-	// result. A non-Integer key leaves it unset and the full scan runs.
+	// (SeekRowidSegments) instead of a full scan. Set by OpSeekRowidHint; the
+	// WHERE conjunct is still evaluated on the fetched row, so the seek only
+	// narrows the candidate set and cannot change the result.
 	seekConfigured bool
 	seekKey        int64
+	// seekNone is a seek whose key is no integer even under numeric affinity,
+	// so no rowid equals it and the lookup finds nothing.
+	seekNone bool
 
 	// rowidLo/rowidHi, when ranged, bound the rowids a segment scan visits
 	// (OpSeekRowidRangeHint), inclusive. Like seekKey they only skip rows the
@@ -595,6 +597,46 @@ func (cur *vdbeCursor) narrowRowidRange(kind int, k int64) {
 	}
 }
 
+// narrowRowidRangeBy is narrowRowidRange for a bound of any class, read as
+// OP_SeekGT and its kin read one (vdbe.c): numeric affinity first, then a REAL
+// by the integers either side of it; a NULL bound, or a TEXT or BLOB one below
+// which every number sorts, leaves no row for a lower bound, and an upper one
+// of those leaves them all. Exact, like the integer bound: a scan reading rows
+// outside it would test the rest of the WHERE on rows C never reads.
+func (cur *vdbeCursor) narrowRowidRangeBy(kind int, key Value) {
+	if key.Typ != Int {
+		key = applyAffinityToValue(key, affNumeric)
+	}
+	lower := kind == rowidRangeGT || kind == rowidRangeGE
+	none := func() { cur.ranged, cur.rowidLo, cur.rowidHi = true, math.MaxInt64, math.MinInt64 }
+	switch key.Typ {
+	case Int:
+		cur.narrowRowidRange(kind, key.I)
+	case Float:
+		// Integral values folded to Int above; what is left is no integer.
+		switch f := key.F; {
+		case f >= math.MaxInt64:
+			if lower {
+				none()
+			}
+		case f < math.MinInt64:
+			if !lower {
+				none()
+			}
+		case lower:
+			cur.narrowRowidRange(rowidRangeGE, int64(math.Ceil(f)))
+		default:
+			cur.narrowRowidRange(rowidRangeLE, int64(math.Floor(f)))
+		}
+	case Null:
+		none()
+	default:
+		if lower {
+			none()
+		}
+	}
+}
+
 // startSegSource makes src the cursor's row source: the lazy segment scan.
 func (cur *vdbeCursor) startSegSource(src *segRowSource) {
 	// The compiled pre-filter, when OpRewind carried one. Purely a
@@ -697,7 +739,7 @@ func (cur *vdbeCursor) rewind() error {
 			if cur.seekConfigured && !tbl.withoutRowid && tbl.rows != nil {
 				rid := uint64(cur.seekKey)
 				cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
-				if vals, found := tbl.rows.get(rid); found {
+				if vals, found := tbl.rows.get(rid); found && !cur.seekNone {
 					// normalizeRow, not normalizeRowInto over an arena: that is
 					// materializeRowStore's own fallback for a single row, and
 					// with one row there is nothing for an arena to amortize.
@@ -762,6 +804,14 @@ func (cur *vdbeCursor) rewind() error {
 		// the delta's two maps in front. Same precedence as the merged scan,
 		// same normalize, so a seeked row is the row a scan would have found.
 		if cur.seekConfigured && !cur.tbl.withoutRowid {
+			if cur.seekNone {
+				cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
+				cur.segSrc, cur.segCur = nil, nil
+				cur.materialized = true
+				cur.pos = -1
+				cur.rowidNull = false
+				return nil
+			}
 			// Positioned, not built, when the segments are the whole answer:
 			// columns are read one at a time as the program asks for them.
 			// Not marked materialized, so the next rewind seeks again.
@@ -859,6 +909,11 @@ func (cur *vdbeCursor) rewind() error {
 		seq, errFn := cur.pager.ScanTable(cur.tbl.root)
 		shared := cur.pager.ServesLiveRows(cur.tbl.root)
 		for rowid, vals := range seq {
+			// The rowid range bounds this scan as it does the segment one, the
+			// rows of the log included.
+			if cur.ranged && (int64(rowid) < cur.rowidLo || int64(rowid) > cur.rowidHi) {
+				continue
+			}
 			cur.rowids = append(cur.rowids, rowid)
 			cur.rows = append(cur.rows, cur.normalizeFrom(shared, rowid, vals))
 		}
