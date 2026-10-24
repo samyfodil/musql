@@ -114,6 +114,29 @@ func likeSafePattern(e Expr) bool {
 	return ok && lit.deferredErr == "" && (lit.Val.Typ == Text || lit.Val.Typ == Blob) && len(lit.Val.S) < likeSafePatternMax
 }
 
+// termMayRaise is exprMayRaise for a conjunct tested over the tables in
+// scopes, which also counts a read of a VIRTUAL generated column: C computes
+// its expression where the column is read (sqlite3ExprCodeGeneratedColumn),
+// so "g > 0" raises when g is AS (json_extract(j, '$')). A STORED one is read
+// from the row.
+func termMayRaise(e Expr, scopes []tableScope) bool {
+	if exprMayRaise(e) {
+		return true
+	}
+	virtual := false
+	forEachColumnRef(e, func(ce ColumnExpr) {
+		for _, ts := range scopes {
+			if ce.Qualifier != "" && !equalFoldName(ts.name, ce.Qualifier) {
+				continue
+			}
+			if k, ok := ts.colIndex[r33sFoldIdent(ce.Name)]; ok && k < len(ts.cols) && ts.cols[k].IsGenerated() && !ts.cols[k].GeneratedStored {
+				virtual = true
+			}
+		}
+	})
+	return virtual
+}
+
 // seekGuard decides which seek keys of one source keep its rows exact. raiseAt
 // is the WHERE position of the first conjunct that the source's loop tests
 // per row and that can raise, tableRaiseAt the first such that reads no other
@@ -160,7 +183,7 @@ func newSeekGuard(c *compiler, srcs []joinSource, i int, cjs []Expr) seekGuard {
 	g := seekGuard{raiseAt: -1, tableRaiseAt: -1}
 	scopes := tableScopesOf(srcs)
 	for pos, cj := range cjs {
-		if !exprMayRaise(cj) || c.holdsCorrelatedSelect(cj) {
+		if !termMayRaise(cj, scopes) || c.holdsCorrelatedSelect(cj) {
 			continue
 		}
 		if hoist, _ := constWhereTerm(cj, scopes, false); hoist {
@@ -249,7 +272,8 @@ func consumedFirst(c *compiler, srcs []joinSource, terms []Expr) []Expr {
 	if len(srcs) != 1 || len(terms) < 2 {
 		return terms
 	}
-	if !slices.ContainsFunc(terms, exprMayRaise) {
+	scopes := tableScopesOf(srcs)
+	if !slices.ContainsFunc(terms, func(e Expr) bool { return termMayRaise(e, scopes) }) {
 		return terms
 	}
 	a := seekAccessOf(c, srcs, 0)
