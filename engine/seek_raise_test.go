@@ -212,6 +212,55 @@ func TestSeekRaisingTerm(t *testing.T) {
 	}
 }
 
+// seekRaiseOutcome is what a statement answers over a table without an index
+// on the key it seeks, and with one.
+type seekRaiseOutcome struct{ noIndex, index string }
+
+func seekRaiseSame(s string) seekRaiseOutcome { return seekRaiseOutcome{s, s} }
+
+// seekRaiseCase is a statement and its outcome; with runs before it.
+type seekRaiseCase struct {
+	q    string
+	want seekRaiseOutcome
+	with []string
+}
+
+// runSeekRaise checks reads on a session over stmts, and each of writes on a
+// session of its own, at every stage and without and with indexDDL.
+func runSeekRaise(t *testing.T, stmts []string, indexDDL string, reads, writes []seekRaiseCase) {
+	t.Helper()
+	for _, index := range []bool{false, true} {
+		for _, stage := range []string{"session", "log", "segments"} {
+			setup := slices.Clone(stmts)
+			if index {
+				setup = append(setup, indexDDL)
+			}
+			pick := func(o seekRaiseOutcome) string {
+				if index {
+					return o.index
+				}
+				return o.noIndex
+			}
+			t.Run(fmt.Sprintf("index=%v/%s", index, stage), func(t *testing.T) {
+				n := seekRaiseSession(t, stage, setup)
+				defer n.Discard()
+				for _, tc := range reads {
+					if got, want := seekRaiseAnswer(n, tc.q), pick(tc.want); got != want {
+						t.Errorf("%s\n got %q\nwant %q", tc.q, got, want)
+					}
+				}
+				for _, tc := range writes {
+					w := seekRaiseSession(t, stage, append(slices.Clone(setup), tc.with...))
+					if got, want := seekRaiseWrite(w, tc.q), pick(tc.want); got != want {
+						t.Errorf("%s\n got %q\nwant %q", tc.q, got, want)
+					}
+					w.Discard()
+				}
+			})
+		}
+	}
+}
+
 // TestSeekRaiseSubselect: a term holding a sub-select that names nothing
 // outside itself is coded in WHERE order, as any term is, so a seek on a key
 // behind one that can raise must not skip the row it raises on; C tests a
@@ -225,28 +274,23 @@ func TestSeekRaiseSubselect(t *testing.T) {
 		correlated   = `json_extract(j, '$') < (SELECT max(v) FROM other WHERE v > i.value - 100)`
 		constant     = `(SELECT json_extract('[', '$')) IS NULL`
 	)
-	type outcome struct{ noIndex, index string }
-	same := func(s string) outcome { return outcome{s, s} }
-	type test struct {
-		q    string
-		want outcome
-		with []string // run before q
-	}
-	where := func(terms string, want outcome) test {
-		return test{q: `SELECT value FROM i WHERE ` + terms, want: want}
+	same := seekRaiseSame
+	type outcome = seekRaiseOutcome
+	where := func(terms string, want outcome) seekRaiseCase {
+		return seekRaiseCase{q: `SELECT value FROM i WHERE ` + terms, want: want}
 	}
 	// A trigger's NEW is found before lookupName climbs out of a sub-select, so
 	// a sub-select that names only NEW is not correlated; one that also names
 	// the table is.
-	trigger := func(terms string, want outcome) test {
-		return test{q: `INSERT INTO t VALUES (1)`, want: want, with: []string{
+	trigger := func(terms string, want outcome) seekRaiseCase {
+		return seekRaiseCase{q: `INSERT INTO t VALUES (1)`, want: want, with: []string{
 			`CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log SELECT value FROM i WHERE ` + terms + `; END`}}
 	}
 	onlyNew := `json_extract(j, '$') < (SELECT max(v) FROM other WHERE v > new.x - 100)`
 	newAndTable := `json_extract(j, '$') < (SELECT max(v) FROM other WHERE v > new.x + i.value - 100)`
 	// The sub-select names a table of the query the EXISTS is in.
 	outer := `json_extract(i.j, '$') < (SELECT max(v) FROM other WHERE v < o.lim)`
-	reads := []test{
+	reads := []seekRaiseCase{
 		where(uncorrelated+` AND value = 7`, outcome{fail, "7"}),
 		where(`value = 7 AND `+uncorrelated, same("7")),
 		where(correlated+` AND value = 7`, same("7")),
@@ -264,7 +308,7 @@ func TestSeekRaiseSubselect(t *testing.T) {
 		{q: `SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE ` + outer + ` AND i.value = o.want) ORDER BY o.id`, want: same("1")},
 		{q: `SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.value = o.want AND ` + outer + `) ORDER BY o.id`, want: same("1")},
 	}
-	writes := []test{
+	writes := []seekRaiseCase{
 		{q: `UPDATE i SET j = j || '' WHERE ` + uncorrelated + ` AND value = 7`, want: outcome{fail, "1"}},
 		{q: `UPDATE i SET j = j || '' WHERE value = 7 AND ` + uncorrelated, want: same("1")},
 		{q: `DELETE FROM i WHERE ` + uncorrelated + ` AND value = 7`, want: outcome{fail, "1"}},
@@ -274,44 +318,56 @@ func TestSeekRaiseSubselect(t *testing.T) {
 		trigger(`value = 7 AND `+onlyNew, same("1")),
 		trigger(newAndTable+` AND value = 7`, same("1")),
 	}
-	for _, index := range []bool{false, true} {
-		for _, stage := range []string{"session", "log", "segments"} {
-			stmts := []string{
-				`CREATE TABLE i(value INT, j TEXT)`,
-				`CREATE TABLE other(v)`,
-				`CREATE TABLE o(id INTEGER PRIMARY KEY, want INT, lim INT)`,
-				`CREATE TABLE t(x INT)`,
-				`CREATE TABLE log(a)`,
-				`INSERT INTO other VALUES (5)`,
-				`INSERT INTO i VALUES (1, 'bad'), (7, '1')`,
-				`INSERT INTO o VALUES (1, 7, 10), (2, 9, 10)`,
-			}
-			if index {
-				stmts = append(stmts, `CREATE INDEX i_value ON i(value)`)
-			}
-			pick := func(o outcome) string {
-				if index {
-					return o.index
+	runSeekRaise(t, []string{
+		`CREATE TABLE i(value INT, j TEXT)`,
+		`CREATE TABLE other(v)`,
+		`CREATE TABLE o(id INTEGER PRIMARY KEY, want INT, lim INT)`,
+		`CREATE TABLE t(x INT)`,
+		`CREATE TABLE log(a)`,
+		`INSERT INTO other VALUES (5)`,
+		`INSERT INTO i VALUES (1, 'bad'), (7, '1')`,
+		`INSERT INTO o VALUES (1, 7, 10), (2, 9, 10)`,
+	}, `CREATE INDEX i_value ON i(value)`, reads, writes)
+}
+
+// TestSeekRaiseConsumedFirst: an index on (a, b) holds both equalities for C,
+// which visits only the row with a = 1 and b = 2 whatever a term that can raise
+// is. A seek reads every row with a = 1 (or with b = 2), so the two equalities
+// are tested before the term. Each outcome is C's, verified by compat-harness's
+// TestSeekRaiseConsumedFirstVsC.
+func TestSeekRaiseConsumedFirst(t *testing.T) {
+	const keys = `a = 1 AND b = 2`
+	var wheres []string
+	for _, raise := range []string{
+		`json_extract(j, '$') > 0`,
+		`json_extract(j, '$') < (SELECT max(v) FROM other)`,
+		`json_extract(j, '$') < (SELECT max(v) FROM other WHERE v > m.a - 100)`,
+	} {
+		wheres = append(wheres, raise+" AND "+keys, "a = 1 AND "+raise+" AND b = 2", keys+" AND "+raise)
+	}
+	stmts := []string{
+		`CREATE TABLE m(a INT, b INT, j TEXT)`,
+		`CREATE TABLE other(v)`,
+		`INSERT INTO other VALUES (5)`,
+		`INSERT INTO m VALUES (1, 1, 'bad'), (1, 2, '1'), (2, 2, 'bad')`,
+		`CREATE INDEX m_ab ON m(a, b)`,
+	}
+	for _, stage := range []string{"session", "log", "segments"} {
+		t.Run(stage, func(t *testing.T) {
+			n := seekRaiseSession(t, stage, stmts)
+			defer n.Discard()
+			for _, where := range wheres {
+				read, del := `SELECT a, b FROM m WHERE `+where, `DELETE FROM m WHERE `+where
+				if got := seekRaiseAnswer(n, read); got != "1,2" {
+					t.Errorf("%s\n got %q\nwant \"1,2\"", read, got)
 				}
-				return o.noIndex
+				w := seekRaiseSession(t, stage, stmts)
+				if got := seekRaiseWrite(w, del); got != "1" {
+					t.Errorf("%s\n got %q\nwant \"1\"", del, got)
+				}
+				w.Discard()
 			}
-			t.Run(fmt.Sprintf("index=%v/%s", index, stage), func(t *testing.T) {
-				n := seekRaiseSession(t, stage, stmts)
-				defer n.Discard()
-				for _, tc := range reads {
-					if got, want := seekRaiseAnswer(n, tc.q), pick(tc.want); got != want {
-						t.Errorf("%s\n got %q\nwant %q", tc.q, got, want)
-					}
-				}
-				for _, tc := range writes {
-					w := seekRaiseSession(t, stage, append(slices.Clone(stmts), tc.with...))
-					if got, want := seekRaiseWrite(w, tc.q), pick(tc.want); got != want {
-						t.Errorf("%s\n got %q\nwant %q", tc.q, got, want)
-					}
-					w.Discard()
-				}
-			})
-		}
+		})
 	}
 }
 
@@ -323,9 +379,12 @@ func TestSeekRaisingTermStillSeeks(t *testing.T) {
 	stmts := []string{
 		`CREATE TABLE i(k INTEGER, j TEXT)`, `CREATE TABLE x(k INTEGER, j TEXT)`, `CREATE INDEX x_k ON x(k)`,
 		`CREATE TABLE other(v)`, `INSERT INTO other VALUES (1000)`,
+		`CREATE TABLE gs(k INTEGER, j TEXT, g AS (json_extract(j, '$')) STORED)`,
+		`CREATE TABLE gv(k INTEGER, j TEXT, g AS (json_extract(j, '$')) VIRTUAL)`,
 	}
 	for r := 0; r < 600; r++ {
-		stmts = append(stmts, fmt.Sprintf(`INSERT INTO i VALUES (%d, '%d')`, r%30, r), fmt.Sprintf(`INSERT INTO x VALUES (%d, '%d')`, r%30, r))
+		stmts = append(stmts, fmt.Sprintf(`INSERT INTO i VALUES (%d, '%d')`, r%30, r), fmt.Sprintf(`INSERT INTO x VALUES (%d, '%d')`, r%30, r),
+			fmt.Sprintf(`INSERT INTO gs(k, j) VALUES (%d, '%d')`, r%30, r), fmt.Sprintf(`INSERT INTO gv(k, j) VALUES (%d, '%d')`, r%30, r))
 	}
 	buildDB(t, path, stmts...)
 	execDB(t, path, `VACUUM`)
@@ -340,6 +399,9 @@ func TestSeekRaisingTermStillSeeks(t *testing.T) {
 		{`SELECT rowid FROM i WHERE json_extract(j, '$') < (SELECT max(v) FROM other) AND k = 7`, false},
 		{`SELECT rowid FROM i WHERE json_extract(j, '$') < (SELECT max(v) FROM other WHERE v > i.k - 100) AND k = 7`, true},
 		{`SELECT rowid FROM x WHERE json_extract(j, '$') < (SELECT max(v) FROM other) AND k = 7`, true},
+		{`SELECT rowid FROM gs WHERE g > 0 AND k = 7`, true},
+		{`SELECT rowid FROM gv WHERE g > 0 AND k = 7`, false},
+		{`SELECT rowid FROM gv WHERE k = 7 AND g > 0`, true},
 	} {
 		segIndexSeeksServed.Store(0)
 		got, err := queryDB(t, path, tc.q)
