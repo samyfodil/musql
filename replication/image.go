@@ -53,15 +53,16 @@ type ImageRequest struct {
 	FileVersion, MinFileVersion, DeltaVersion uint32
 }
 
-// ImageManifest describes an image: its formats, its bytes (Checksum is their
-// CRC-32C), and the state at its cut. VV is a lower bound of the image's
+// ImageManifest describes an image: its formats, its Size bytes -- a segment
+// file, then the first DeltaSize bytes of its delta -- whose CRC-32C is
+// Checksum, and the state at its cut. VV is a lower bound of the image's
 // version vector, and MaxHLC an upper bound of every HLC in it.
 type ImageManifest struct {
 	Site                      string
 	FileVersion, DeltaVersion uint32
 	Layout                    string
 	Catalog                   string
-	Size                      int64
+	Size, DeltaSize           int64
 	Checksum                  uint32
 	VV, Floors                VersionVector
 	Ranges                    map[string]uint64
@@ -156,24 +157,34 @@ func (s *Store) pinnedFrontier(frontier VersionVector) {
 	}
 }
 
-// imageFile is an image being read; Close removes it and releases its pin.
-type imageFile struct {
-	*os.File
+// imageBody is an image being read: a segment file, then the first bytes of
+// its delta. Close removes the image and releases its pin.
+type imageBody struct {
+	io.Reader
+	files   []*os.File
 	release func()
 }
 
-func (f imageFile) Close() error {
-	err := f.File.Close()
-	f.release()
+func (b imageBody) Close() error {
+	var err error
+	for _, f := range b.files {
+		err = errors.Join(err, f.Close())
+	}
+	b.release()
 	return err
 }
 
-// ImageCutForTest runs once an image is written, before it is sent.
+// imageCutForTest runs once an image is cut, before it is sent.
 var imageCutForTest func()
 
-// Image writes a consistent copy of the database, for a node that holds nothing
-// yet, and returns its manifest and its bytes; closing them removes the copy.
-// Until then, and imagePinGrace after, prune keeps every op after its cut. A
+// deltaSuffix names a segment file's delta (engine.CommitInfo).
+const deltaSuffix = ".delta"
+
+// Image returns a consistent copy of the database, for a node that holds
+// nothing yet: its manifest and its bytes, which closing removes. Until then,
+// and imagePinGrace after, prune keeps every op after its cut. The copy is the
+// committed files themselves, linked at the cut, or, where they cannot be or
+// the node asking cannot read their formats, a copy the database writes. A
 // request for another layout or file format is ErrImageRefused.
 func (s *Store) Image(ctx context.Context, req ImageRequest) (ImageManifest, io.ReadCloser, error) {
 	layout, err := layoutOf(ctx, s.db)
@@ -181,9 +192,9 @@ func (s *Store) Image(ctx context.Context, req ImageRequest) (ImageManifest, io.
 		return ImageManifest{}, nil, err
 	}
 	m := ImageManifest{Site: s.site, Layout: layout}
-	m.FileVersion, _, m.DeltaVersion = engine.FormatVersions()
-	if err := req.accepts(m); err != nil {
-		return ImageManifest{}, nil, err
+	m.FileVersion, _, _ = engine.FormatVersions()
+	if layout != req.Layout {
+		return ImageManifest{}, nil, req.accepts(m)
 	}
 	path, err := mainFile(ctx, s.db)
 	if err != nil {
@@ -204,54 +215,110 @@ func (s *Store) Image(ctx context.Context, req ImageRequest) (ImageManifest, io.
 		os.RemoveAll(dir)
 	}
 	m.VV = pin.vv
-	img := filepath.Join(dir, "image.musq")
-	f, err := s.writeImage(ctx, path, img, &m)
+	body, err := s.cutImage(ctx, path, dir, req, &m)
 	if err != nil {
 		release()
 		return ImageManifest{}, nil, err
 	}
-	return m, imageFile{f, release}, nil
+	body.release = release
+	return m, body, nil
 }
 
-// writeImage writes the image of path to img, fills in what m says of it, and
-// opens it for reading.
-func (s *Store) writeImage(ctx context.Context, path, img string, m *ImageManifest) (*os.File, error) {
+// cutImage links path's committed files into dir, or failing that writes a
+// copy there, fills in what m says of the image, and opens it for reading.
+//
+// The linked files are the state as it was committed, read from the database
+// beforehand: the catalog the image's must equal, and floors and ranges that
+// may be lower than its own.
+func (s *Store) cutImage(ctx context.Context, path, dir string, req ImageRequest, m *ImageManifest) (imageBody, error) {
+	if err := imageState(ctx, s.db, m); err != nil {
+		return imageBody{}, err
+	}
+	p, err := engine.PinCommittedFiles(path, dir)
+	if err == nil {
+		m.FileVersion, m.DeltaVersion = p.FileVersion, p.DeltaVersion
+		if req.accepts(*m) == nil {
+			return s.openImage(p.Seg, p.Delta, p.DeltaLen, m)
+		}
+		os.Remove(p.Seg)
+		os.Remove(p.Delta)
+	} else {
+		log.Printf("replication: linking an image: %v; writing a copy instead", err)
+	}
+	m.FileVersion, _, _ = engine.FormatVersions()
+	m.DeltaVersion = 0
+	if err := req.accepts(*m); err != nil {
+		return imageBody{}, err
+	}
+	img := filepath.Join(dir, "image.musq")
 	src, err := openApplyDB(path)
 	if err != nil {
-		return nil, err
+		return imageBody{}, err
 	}
 	_, err = src.ExecContext(ctx, `VACUUM INTO '`+strings.ReplaceAll(img, "'", "''")+`'`)
 	src.Close()
 	if err != nil {
-		return nil, err
-	}
-	m.MaxHLC = s.clock.Now()
-	if imageCutForTest != nil {
-		imageCutForTest()
+		return imageBody{}, err
 	}
 	db, err := openApplyDB(img)
 	if err != nil {
-		return nil, err
+		return imageBody{}, err
 	}
 	err = imageState(ctx, db, m)
 	db.Close()
 	if err != nil {
-		return nil, err
+		return imageBody{}, err
 	}
-	f, err := os.Open(img)
+	return s.openImage(img, "", 0, m)
+}
+
+// openImage opens the image of segment file seg and the first n bytes of the
+// delta at delta, and fills in m's cut, size and checksum.
+func (s *Store) openImage(seg, delta string, n int64, m *ImageManifest) (imageBody, error) {
+	m.MaxHLC = s.clock.Now()
+	if imageCutForTest != nil {
+		imageCutForTest()
+	}
+	b := imageBody{}
+	f, err := os.Open(seg)
 	if err != nil {
-		return nil, err
+		return b, err
+	}
+	b.files = append(b.files, f)
+	rs := []io.ReadSeeker{f}
+	if delta != "" {
+		d, err := os.Open(delta)
+		if err != nil {
+			f.Close()
+			return b, err
+		}
+		b.files = append(b.files, d)
+		rs = append(rs, io.NewSectionReader(d, 0, n))
 	}
 	h := crc32.New(castagnoli)
-	if m.Size, err = io.Copy(h, f); err == nil {
-		_, err = f.Seek(0, io.SeekStart)
-	}
-	if err != nil {
-		f.Close()
-		return nil, err
+	buf := make([]byte, 1<<20)
+	for i, r := range rs {
+		k, err := io.CopyBuffer(h, r, buf)
+		if err == nil {
+			_, err = r.Seek(0, io.SeekStart)
+		}
+		if err != nil {
+			b.release = func() {}
+			b.Close()
+			return imageBody{}, err
+		}
+		m.Size += k
+		if i > 0 {
+			m.DeltaSize = k
+		}
 	}
 	m.Checksum = h.Sum32()
-	return f, nil
+	readers := make([]io.Reader, len(rs))
+	for i, r := range rs {
+		readers[i] = r
+	}
+	b.Reader = io.MultiReader(readers...)
+	return b, nil
 }
 
 // imageState reads into m the catalog, floors and ranges of the image db.
@@ -528,7 +595,7 @@ func (sy *Syncer) installImage(ctx context.Context, im Imager, peer PeerID) erro
 	}
 	sy.setCatalog(s.cat, s.ver)
 	sy.images.Add(1)
-	log.Printf("replication: installed an image of %d bytes from %s", m.Size, peer)
+	log.Printf("replication: installed an image of %d bytes (%d of delta) from %s", m.Size, m.DeltaSize, peer)
 	return nil
 }
 
@@ -537,7 +604,9 @@ func (sy *Syncer) installImage(ctx context.Context, im Imager, peer PeerID) erro
 // and the staged image stay, for Open to finish the install, and pending is set.
 func keepMarker(path, staged string, ctr uint32, err error) (pending bool, _ error) {
 	if _, serr := os.Stat(staged); serr == nil {
-		if now, cerr := commitCounter(path); cerr == nil && now == ctr {
+		// A commit since the counter was read is the database's own: the
+		// install did nothing, and finishing it would lose that commit.
+		if now, cerr := commitCounter(path); errors.Is(err, engine.ErrStateMoved) || (cerr == nil && now == ctr) {
 			if rerr := removeDurable(path + markerSuffix); rerr != nil {
 				return true, errors.Join(err, rerr)
 			}
@@ -547,25 +616,51 @@ func keepMarker(path, staged string, ctr uint32, err error) (pending bool, _ err
 	return true, fmt.Errorf("%w (the install finishes when the database is next opened)", err)
 }
 
-// stageImage copies body, which m describes, to a new file beside path, and
-// checks its size and checksum.
+// stageImage copies body, which m describes, to a new segment file and its
+// delta beside path, and checks their size and checksum.
 func stageImage(path string, m ImageManifest, body io.ReadCloser) (string, error) {
 	defer body.Close()
+	if m.DeltaSize < 0 || m.DeltaSize > m.Size {
+		return "", fmt.Errorf("replication: image of %d bytes with a delta of %d", m.Size, m.DeltaSize)
+	}
 	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+stagedInfix+"*")
 	if err != nil {
 		return "", err
 	}
 	staged := f.Name()
 	h := crc32.New(castagnoli)
-	n, err := io.CopyBuffer(io.MultiWriter(f, h), io.LimitReader(body, m.Size+1), make([]byte, 1<<20))
-	if err == nil && (n != m.Size || h.Sum32() != m.Checksum) {
-		err = fmt.Errorf("replication: image of %d bytes does not match its manifest (%d bytes)", n, m.Size)
+	buf := make([]byte, 1<<20)
+	part := func(w io.Writer, n int64) (int64, error) {
+		return io.CopyBuffer(io.MultiWriter(w, h), io.LimitReader(body, n), buf)
 	}
+	n, err := part(f, m.Size-m.DeltaSize)
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
+	if err == nil && m.DeltaSize > 0 {
+		var d *os.File
+		if d, err = os.OpenFile(staged+deltaSuffix, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600); err == nil {
+			var k int64
+			k, err = part(d, m.DeltaSize)
+			n += k
+			if cerr := d.Close(); err == nil {
+				err = cerr
+			}
+		}
+	}
+	if err == nil {
+		var extra int64
+		extra, err = io.CopyN(io.Discard, body, 1)
+		if errors.Is(err, io.EOF) {
+			err = nil
+		}
+		n += extra
+	}
+	if err == nil && (n != m.Size || h.Sum32() != m.Checksum) {
+		err = fmt.Errorf("replication: image of %d bytes does not match its manifest (%d bytes)", n, m.Size)
+	}
 	if err != nil {
-		os.Remove(staged)
+		engine.RemoveDatabaseFiles(staged)
 		return "", err
 	}
 	return staged, nil
