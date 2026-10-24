@@ -339,7 +339,7 @@ func (c *Conn) notifyRollback() {
 // routes through exactly the same path a db.Exec would, so during PreCommit
 // it lands in the transaction being committed.
 func (c *Conn) Exec(ctx context.Context, sqlText string, args ...any) error {
-	info, err := engine.ParseParamInfo(sqlText)
+	info, err := c.paramInfoOf(sqlText)
 	if err != nil {
 		return err
 	}
@@ -362,7 +362,7 @@ func (c *Conn) Exec(ctx context.Context, sqlText string, args ...any) error {
 // db.Query would -- so during PreCommit it reads the transaction being
 // committed -- and returns every row as plain Go values (see GoValue).
 func (c *Conn) Query(ctx context.Context, sqlText string, args ...any) ([][]any, error) {
-	info, err := engine.ParseParamInfo(sqlText)
+	info, err := c.paramInfoOf(sqlText)
 	if err != nil {
 		return nil, err
 	}
