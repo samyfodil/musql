@@ -575,16 +575,9 @@ func (s *Store) materializeRowFrom(ctx context.Context, cat *catalog, tblID stri
 // when del is set. conflict reports an alive, complete row the table refused:
 // one of its UNIQUE values is another row's.
 func (s *Store) writeRow(ctx context.Context, t *object, pk []byte, del bool, have map[string]clockCell) (conflict bool, err error) {
-	var keyNames []string
-	for _, kc := range t.keyCols() {
-		keyNames = append(keyNames, kc.Name)
-	}
-	if keyNames == nil {
-		rid := rowidName(t.Cols)
-		if rid == "" {
-			return false, fmt.Errorf("replication: table %q: columns shadow every name for the rowid", t.Name)
-		}
-		keyNames = []string{rid}
+	keyNames, err := keyNamesOf(t)
+	if err != nil {
+		return false, err
 	}
 	keyVals, err := decodeKey(pk, len(keyNames))
 	if err != nil {
@@ -622,41 +615,70 @@ func (s *Store) writeRow(ctx context.Context, t *object, pk []byte, del bool, ha
 			}
 		}
 	}
-	for _, c := range t.Cols {
-		if c.PK || c.Gen || !c.NotNull || c.Default {
-			continue
-		}
-		if _, ok := cells[c.ID]; !ok {
-			return false, nil // completeness gate: withhold until the covering insert arrives
-		}
-	}
-
-	colNames := slices.Clone(keyNames)
-	args := keyVals
-	for _, c := range t.Cols { // schema order, deterministic; a generated column has no cell
-		if c.PK {
-			continue
-		}
-		if v, ok := cells[c.ID]; ok {
-			colNames = append(colNames, c.Name)
-			args = append(args, driverValue(v.typ, v.raw))
-		}
-	}
-	quoted := make([]string, len(colNames))
-	ph := make([]string, len(colNames))
-	for i, c := range colNames {
-		quoted[i] = quoteIdent(c)
-		ph[i] = "?"
+	colNames, args, ok := rowValues(t, keyNames, keyVals, cells)
+	if !ok {
+		return false, nil // completeness gate: withhold until the covering insert arrives
 	}
 	// OR IGNORE: the key's own row is gone (deleted above, or the table is
 	// being rebuilt), so the only conflict left is a UNIQUE one.
 	res, err := s.q.ExecContext(ctx, fmt.Sprintf(`INSERT OR IGNORE INTO main.%s(%s) VALUES(%s)`,
-		quoteIdent(t.Name), strings.Join(quoted, ","), strings.Join(ph, ",")), args...)
+		quoteIdent(t.Name), quotedList(colNames), strings.TrimSuffix(strings.Repeat("?,", len(colNames)), ",")), args...)
 	if err != nil {
 		return false, err
 	}
 	n, err := res.RowsAffected()
 	return n == 0, err
+}
+
+// keyNamesOf is the columns t's rows are keyed by: its key's, or the name
+// that reaches its rowid.
+func keyNamesOf(t *object) ([]string, error) {
+	var keyNames []string
+	for _, kc := range t.keyCols() {
+		keyNames = append(keyNames, kc.Name)
+	}
+	if keyNames == nil {
+		rid := rowidName(t.Cols)
+		if rid == "" {
+			return nil, fmt.Errorf("replication: table %q: columns shadow every name for the rowid", t.Name)
+		}
+		keyNames = []string{rid}
+	}
+	return keyNames, nil
+}
+
+// rowValues is what an INSERT of a row with these cells names: its key, then
+// every column that has a cell, in schema order (a generated column has none),
+// with their values. ok is false while a NOT NULL column without a default has
+// no cell yet: the completeness gate.
+func rowValues(t *object, keyNames []string, keyVals []any, cells map[string]typedVal) (cols []string, args []any, ok bool) {
+	for _, c := range t.Cols {
+		if c.PK || c.Gen || !c.NotNull || c.Default {
+			continue
+		}
+		if _, ok := cells[c.ID]; !ok {
+			return nil, nil, false
+		}
+	}
+	cols, args = slices.Clone(keyNames), slices.Clone(keyVals)
+	for _, c := range t.Cols {
+		if c.PK {
+			continue
+		}
+		if v, ok := cells[c.ID]; ok {
+			cols = append(cols, c.Name)
+			args = append(args, driverValue(v.typ, v.raw))
+		}
+	}
+	return cols, args, true
+}
+
+func quotedList(names []string) string {
+	quoted := make([]string, len(names))
+	for i, n := range names {
+		quoted[i] = quoteIdent(n)
+	}
+	return strings.Join(quoted, ",")
 }
 
 // rebuildTable writes table t afresh from the clock: every alive row, newest
@@ -672,35 +694,42 @@ func (s *Store) rebuildTable(ctx context.Context, t *object) error {
 	if _, err := s.q.ExecContext(ctx, `DELETE FROM main._repl_withheld WHERE tbl=?`, t.ID); err != nil {
 		return err
 	}
+	var unique int
+	if err := s.q.QueryRowContext(ctx, `SELECT count(*) FROM pragma_index_list(?, 'main') WHERE "unique"`, t.Name).Scan(&unique); err != nil {
+		return err
+	}
+	if unique == 0 {
+		return s.rewriteRows(ctx, t)
+	}
 	type stamp struct {
 		pk   []byte
 		hlc  int64
 		site string
 	}
-	rows, err := s.q.QueryContext(ctx, `SELECT pk, max(hlc) FROM main._repl_clock WHERE tbl=? GROUP BY pk`, t.ID)
+	// Each row's latest cell; the site breaks an HLC tie, as it does everywhere
+	// else (TagLess).
+	rows, err := s.q.QueryContext(ctx, `SELECT pk, hlc, site FROM main._repl_clock WHERE tbl=? ORDER BY pk`, t.ID)
 	if err != nil {
 		return err
 	}
 	var all []stamp
 	for rows.Next() {
 		var st stamp
-		if err := rows.Scan(&st.pk, &st.hlc); err != nil {
+		if err := rows.Scan(&st.pk, &st.hlc, &st.site); err != nil {
 			rows.Close()
 			return err
+		}
+		if n := len(all); n > 0 && bytes.Equal(all[n-1].pk, st.pk) {
+			if TagLess(HLC(all[n-1].hlc), all[n-1].site, HLC(st.hlc), st.site) {
+				all[n-1] = st
+			}
+			continue
 		}
 		all = append(all, st)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
-	}
-	for i := range all {
-		// The site of the row's latest cell breaks an HLC tie, as it does
-		// everywhere else (TagLess).
-		if err := s.q.QueryRowContext(ctx, `SELECT max(site) FROM main._repl_clock WHERE tbl=? AND pk=? AND hlc=?`,
-			t.ID, all[i].pk, all[i].hlc).Scan(&all[i].site); err != nil {
-			return err
-		}
 	}
 	slices.SortFunc(all, func(a, b stamp) int {
 		if TagLess(HLC(a.hlc), a.site, HLC(b.hlc), b.site) {
@@ -722,6 +751,141 @@ func (s *Store) rebuildTable(ctx context.Context, t *object) error {
 			}
 		}
 	}
+	return nil
+}
+
+// rewriteRows is rebuildTable for a table with no UNIQUE index: no row can
+// hold a value another wants, so the order rows go in does not matter, and
+// they go in key order, as the clock's cells are read, a few hundred to a
+// statement.
+func (s *Store) rewriteRows(ctx context.Context, t *object) error {
+	keyNames, err := keyNamesOf(t)
+	if err != nil {
+		return err
+	}
+	rows, err := s.q.QueryContext(ctx, `SELECT pk, col, val FROM main._repl_clock WHERE tbl=? ORDER BY pk`, t.ID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	b := rowBatch{s: s, t: t, keyNames: keyNames}
+	var pk []byte
+	alive := false
+	cells := map[string]typedVal{}
+	row := func() error {
+		if pk == nil || !alive {
+			return nil
+		}
+		keyVals, err := decodeKey(pk, len(keyNames))
+		if err != nil {
+			return fmt.Errorf("replication: table %q: %w", t.Name, err)
+		}
+		cols, args, ok := rowValues(t, keyNames, keyVals, cells)
+		if !ok {
+			return nil
+		}
+		return b.add(ctx, pk, cols, args)
+	}
+	for rows.Next() {
+		var rpk, val []byte
+		var col string
+		if err := rows.Scan(&rpk, &col, &val); err != nil {
+			return err
+		}
+		if !bytes.Equal(rpk, pk) {
+			if err := row(); err != nil {
+				return err
+			}
+			pk, alive = rpk, false
+			clear(cells)
+		}
+		if col == presenceCol {
+			alive = len(val) > 0 && val[0] == 1
+			continue
+		}
+		typ, raw := unpackVal(val)
+		cells[col] = typedVal{typ, raw}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := row(); err != nil {
+		return err
+	}
+	return b.flush(ctx)
+}
+
+// rowsPerInsert caps the rows of one rowBatch INSERT, and sqliteMaxVariables
+// its parameters: SQLITE_LIMIT_VARIABLE_NUMBER's default, which the engine
+// keeps.
+const (
+	rowsPerInsert      = 64
+	sqliteMaxVariables = 32766
+)
+
+// rowBatch writes rows of one table, many to an INSERT while they name the
+// same columns.
+type rowBatch struct {
+	s        *Store
+	t        *object
+	keyNames []string
+	cols     []string
+	pks      [][]byte
+	args     []any
+}
+
+func (b *rowBatch) add(ctx context.Context, pk []byte, cols []string, args []any) error {
+	if len(b.pks) > 0 && (!slices.Equal(cols, b.cols) || len(b.pks) == rowsPerInsert || len(b.args)+len(args) > sqliteMaxVariables) {
+		if err := b.flush(ctx); err != nil {
+			return err
+		}
+	}
+	b.cols = cols
+	b.pks = append(b.pks, pk)
+	b.args = append(b.args, args...)
+	return nil
+}
+
+// flush writes the batch. A row the table refused -- it has no UNIQUE index,
+// so a NULL in a NOT NULL column -- is held out, as rebuildTable holds out a
+// row it refuses.
+func (b *rowBatch) flush(ctx context.Context) error {
+	if len(b.pks) == 0 {
+		return nil
+	}
+	one := "(" + strings.TrimSuffix(strings.Repeat("?,", len(b.cols)), ",") + ")"
+	res, err := b.s.q.ExecContext(ctx, fmt.Sprintf(`INSERT OR IGNORE INTO main.%s(%s) VALUES %s`,
+		quoteIdent(b.t.Name), quotedList(b.cols), strings.TrimSuffix(strings.Repeat(one+",", len(b.pks)), ",")), b.args...)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if int(n) < len(b.pks) {
+		where := make([]string, len(b.keyNames))
+		for i, k := range b.keyNames {
+			where[i] = quoteIdent(k) + "=?"
+		}
+		have := fmt.Sprintf(`SELECT count(*) FROM main.%s WHERE %s`, quoteIdent(b.t.Name), strings.Join(where, " AND "))
+		for _, pk := range b.pks {
+			keyVals, err := decodeKey(pk, len(b.keyNames))
+			if err != nil {
+				return err
+			}
+			var k int
+			if err := b.s.q.QueryRowContext(ctx, have, keyVals...).Scan(&k); err != nil {
+				return err
+			}
+			if k == 0 {
+				if _, err := b.s.q.ExecContext(ctx, `INSERT INTO main._repl_withheld(tbl, pk) VALUES(?, ?)`, b.t.ID, pk); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	b.pks, b.args = b.pks[:0], b.args[:0]
 	return nil
 }
 
