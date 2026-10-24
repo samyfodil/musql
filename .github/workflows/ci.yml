@@ -129,19 +129,13 @@ jobs:
           go-version-file: go.mod
           cache: true
           cache-dependency-path: cloud/go.sum
-      # TestClusterPlacement runs out of its 4-minute budget waiting for a
-      # re-placed node to catch up (measured at c324566f, 2026-10-24, twice on
-      # .10): the planner does not use a PRIMARY KEY autoindex, so catch-up is
-      # quadratic. See cloud/HANDOVER-replication-perf.md; drop the skip with
-      # the planner fix.
       - name: build, vet, test
         working-directory: cloud
         run: |
           set -e
           CGO_ENABLED=0 go build -tags jitllm -trimpath -ldflags="-s -w" -o /dev/null ./cmd/musql-cloud
           go vet ./... && go vet -tags jitllm ./ai/
-          go test -tags jitllm ./... -count=1 -timeout 20m \
-            -skip '^TestClusterPlacement$'
+          go test -tags jitllm ./... -count=1 -timeout 20m
           go test ./ai/ -count=1
       - name: the other release targets cross-compile with the tag
         working-directory: cloud
