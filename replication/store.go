@@ -212,6 +212,9 @@ func (s *Store) OpsSince(ctx context.Context, site string, fromSeq uint64, limit
 	if fromSeq < floor {
 		return nil, ErrPruned
 	}
+	if ops, err := s.opsUpTo(ctx, site, fromSeq, limit); err != nil || len(ops) > 0 {
+		return ops, err
+	}
 	q := `SELECT site, seq, hlc, tbl, pk, op, cells FROM main._repl_oplog WHERE site=? AND seq>? ORDER BY seq`
 	args := []any{site, fromSeq}
 	if limit > 0 {
@@ -225,23 +228,61 @@ func (s *Store) OpsSince(ctx context.Context, site string, fromSeq uint64, limit
 	defer rows.Close()
 	var ops []Op
 	for rows.Next() {
-		var (
-			op    Op
-			hlc   int64
-			kind  int64
-			cells []byte
-		)
-		if err := rows.Scan(&op.Site, &op.Seq, &hlc, &op.Tbl, &op.PK, &kind, &cells); err != nil {
-			return nil, err
-		}
-		op.HLC = HLC(hlc)
-		op.Kind = OpKind(kind)
-		if op.Cells, err = decodeCells(cells); err != nil {
+		op, err := scanOp(rows)
+		if err != nil {
 			return nil, err
 		}
 		ops = append(ops, op)
 	}
 	return ops, rows.Err()
+}
+
+// opsUpTo is OpsSince's ops up to the site's contiguous seq, all of which the
+// log holds above the floor: a point read each, where a range of seqs is read
+// by scanning the whole log. It stops at the first seq it does not find (one
+// pruned meanwhile), and returns none when there is none to read.
+func (s *Store) opsUpTo(ctx context.Context, site string, fromSeq uint64, limit int) ([]Op, error) {
+	s.mu.Lock()
+	top := s.vv[site]
+	s.mu.Unlock()
+	if top <= fromSeq {
+		return nil, nil
+	}
+	n := top - fromSeq
+	if limit > 0 && uint64(limit) < n {
+		n = uint64(limit)
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	ops := make([]Op, 0, n)
+	for seq := fromSeq + 1; seq <= fromSeq+n; seq++ {
+		op, err := scanOp(conn.QueryRowContext(ctx, `SELECT site, seq, hlc, tbl, pk, op, cells FROM main._repl_oplog WHERE site=? AND seq=?`, site, int64(seq)))
+		if errors.Is(err, sql.ErrNoRows) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		ops = append(ops, op)
+	}
+	return ops, nil
+}
+
+// scanOp reads an op from a row of "SELECT site, seq, hlc, tbl, pk, op, cells".
+func scanOp(r interface{ Scan(...any) error }) (Op, error) {
+	var op Op
+	var hlc, kind int64
+	var cells []byte
+	if err := r.Scan(&op.Site, &op.Seq, &hlc, &op.Tbl, &op.PK, &kind, &cells); err != nil {
+		return op, err
+	}
+	op.HLC, op.Kind = HLC(hlc), OpKind(kind)
+	var err error
+	op.Cells, err = decodeCells(cells)
+	return op, err
 }
 
 // Ingest applies op to the store. It is idempotent: an op whose (site, seq) is
