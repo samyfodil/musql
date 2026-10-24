@@ -3984,7 +3984,7 @@ func (m *vdbe) opUpdateRow(op *Instruction) (int, error) {
 // one updateInPlaceOK allows, and plan one whose rowid stays (plan.gather).
 func (m *vdbe) inPlace(plan *updatePlan, cur *vdbeCursor, full []Value) ([]Value, bool) {
 	st := plan.tbl.rows
-	if !st.inPlaceOK() {
+	if !st.inPlaceOK(plan.setCol) {
 		return full, false
 	}
 	// The cursor's copy of the committed row, which nothing else holds and

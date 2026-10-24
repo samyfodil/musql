@@ -292,9 +292,19 @@ const (
 
 // inPlaceOK reports whether the store may take an UPDATE's new row written over
 // the old one (applyGathered): it keeps no copy of an old row -- no undo log,
-// no equality or conflict index -- that would then show the new values.
-func (s *rowStore) inPlaceOK() bool {
-	return s != nil && s.seg != nil && !s.logging && len(s.eqIdx) == 0 && len(s.uqIdx) == 0
+// no conflict index, no equality index of a column set assigns -- that would
+// then show the new values. An equality index of a column the UPDATE leaves
+// alone lists the row where it stays.
+func (s *rowStore) inPlaceOK(set []bool) bool {
+	if s == nil || s.seg == nil || s.logging || len(s.uqIdx) != 0 {
+		return false
+	}
+	for col, idx := range s.eqIdx {
+		if idx != nil && (col >= len(set) || set[col]) {
+			return false
+		}
+	}
+	return true
 }
 
 // committedRow is rowid's committed row, as the store's committed rows (not
