@@ -1,0 +1,16 @@
+# Used instead of the root .dockerignore for cloud/Dockerfile: the build needs
+# examples/libp2p (the cloud module replaces it) and examples/wasm (the npm
+# package's glue), which the root one leaves out.
+.git
+.claude
+.context
+.gstack
+.cloud-dev
+bin
+**/dist
+**/node_modules
+compat-harness
+bench
+docs
+examples/doom
+examples/turso
