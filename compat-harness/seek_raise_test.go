@@ -315,6 +315,71 @@ func TestSeekRaiseTriggerVsC(t *testing.T) {
 	}
 }
 
+// seekRaiseGeneratedOpen opens both engines on a table with generated columns,
+// VIRTUAL and STORED, one of them reading another.
+func seekRaiseGeneratedOpen(t *testing.T, index, segments bool) (pure, mattn *sql.Conn) {
+	t.Helper()
+	pure, mattn = seekRaiseConns(t)
+	stmts := []string{
+		`CREATE TABLE i(value INT, j TEXT, g AS (json_extract(j, '$')) VIRTUAL, h AS (value * 2) VIRTUAL,
+			g2 AS (g + 1) VIRTUAL, s AS (json_extract(j, '$') * 2) STORED)`,
+		`INSERT INTO i(value, j) VALUES (1, '5'), (7, '1'), (7, '0'), (3, '2')`,
+	}
+	if index {
+		stmts = append(stmts, `CREATE INDEX i_value ON i(value)`)
+	}
+	if segments {
+		stmts = append(stmts, `VACUUM`)
+	}
+	for _, s := range stmts {
+		execBothConn(t, pure, mattn, "setup", s)
+	}
+	return pure, mattn
+}
+
+// TestSeekRaiseGeneratedVsC: a term that reads a VIRTUAL generated column
+// computes its expression, where a STORED column's was computed when the row
+// was written. Writing a row computes both, so a row the expression raises on
+// is refused, and these terms, in both orders, answer what C does.
+func TestSeekRaiseGeneratedVsC(t *testing.T) {
+	const key = `value = 7`
+	var wheres []string
+	for _, raise := range []string{`g > 0`, `i.g > 0`, `g + 1 > 0`, `g2 > 0`, `h > 0`, `abs(h) > 0`, `s > 0`} {
+		terms := seekRaiseTerms(raise, key)
+		wheres = append(wheres, terms[:]...)
+	}
+	for _, index := range []bool{false, true} {
+		for _, segments := range []bool{false, true} {
+			t.Run(fmt.Sprintf("index=%v/segments=%v", index, segments), func(t *testing.T) {
+				pure, mattn := seekRaiseGeneratedOpen(t, index, segments)
+				for _, where := range wheres {
+					q := `SELECT value, g, h, g2, s FROM i WHERE ` + where + ` ORDER BY rowid`
+					if got, want := seekRaiseOutcome(pure, q), seekRaiseOutcome(mattn, q); got != want {
+						t.Errorf("%s\n  musql: %s\n  C:     %s", q, got, want)
+					}
+				}
+			})
+			t.Run(fmt.Sprintf("index=%v/segments=%v/writes", index, segments), func(t *testing.T) {
+				var writes []string
+				for _, where := range wheres {
+					writes = append(writes, `UPDATE i SET j = j || '' WHERE `+where, `DELETE FROM i WHERE `+where)
+				}
+				writes = append(writes,
+					`INSERT INTO i(value, j) VALUES (9, 'bad')`,
+					`UPDATE i SET j = 'bad' WHERE value = 3`,
+					`UPDATE i SET j = 'bad' WHERE value = 9`)
+				for _, q := range writes {
+					pure, mattn := seekRaiseGeneratedOpen(t, index, segments)
+					const dump = `SELECT rowid, value, j, g, s FROM i ORDER BY rowid`
+					if got, want := seekRaiseWriteOutcome(pure, q, dump), seekRaiseWriteOutcome(mattn, q, dump); got != want {
+						t.Errorf("%s\n  musql: %s\n  C:     %s", q, got, want)
+					}
+				}
+			})
+		}
+	}
+}
+
 // TestSeekRaiseConsumedFirstVsC: an index on (a, b) holds both equalities for
 // C, which visits only the row with a = 1 and b = 2 whatever a term that can
 // raise is. A seek reads every row with a = 1 (or with b = 2), so the two
