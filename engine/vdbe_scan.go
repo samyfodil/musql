@@ -595,6 +595,9 @@ func compileScanPlain(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols 
 	// WHERE, so the row set and order are identical to testing all of WHERE
 	// here; only pruning happens earlier. See joinPushdownPlan/buildJoinPlan.
 	plan := buildJoinPlan(srcs, stmt.Where)
+	if len(plan.buckets) == 1 {
+		plan.buckets[0] = consumedFirst(c, srcs, plan.buckets[0])
+	}
 	// Index-driven joins: seek each INNER source's rowid/index by its join key
 	// instead of full-scanning it per outer row. Pure candidate-set restriction
 	// (the join condition is still re-evaluated on every fetched inner row) --
@@ -890,7 +893,8 @@ func detectRowidRangeKey(c *compiler, srcs []joinSource, where Expr) (*rowidRang
 	}
 	kinds := map[string]int{">": rowidRangeGT, ">=": rowidRangeGE, "<": rowidRangeLT, "<=": rowidRangeLE}
 	flip := []int{rowidRangeLT, rowidRangeLE, rowidRangeGT, rowidRangeGE}
-	for _, cj := range seekConjuncts(where) {
+	conjuncts, at := seekConjunctsAt(where)
+	for n, cj := range conjuncts {
 		be, ok := cj.(BinaryExpr)
 		if !ok {
 			continue
@@ -899,12 +903,19 @@ func detectRowidRangeKey(c *compiler, srcs []joinSource, where Expr) (*rowidRang
 		if !ok {
 			continue
 		}
-		if isScopeRowidRef(c, s, be.L) && isSeekKeyCandidate(be.R) {
-			return &rowidRangeKey{expr: be.R, kind: kind}, true
+		var key *rowidRangeKey
+		switch {
+		case isScopeRowidRef(c, s, be.L) && isSeekKeyCandidate(be.R):
+			key = &rowidRangeKey{expr: be.R, kind: kind}
+		case isScopeRowidRef(c, s, be.R) && isSeekKeyCandidate(be.L):
+			key = &rowidRangeKey{expr: be.L, kind: flip[kind]}
+		default:
+			continue
 		}
-		if isScopeRowidRef(c, s, be.R) && isSeekKeyCandidate(be.L) {
-			return &rowidRangeKey{expr: be.L, kind: flip[kind]}, true
+		if !newSeekGuard(c, srcs, 0, splitTopLevelAnd(where)).keepRange(xnRowid, at[n]) {
+			return nil, false
 		}
+		return key, true
 	}
 	return nil, false
 }
@@ -926,6 +937,20 @@ func seekConjuncts(where Expr) []Expr {
 		out = append(out, cj)
 	}
 	return out
+}
+
+// seekConjunctsAt is seekConjuncts with the position, among the WHERE's
+// top-level conjuncts, of the one each came from.
+func seekConjunctsAt(where Expr) ([]Expr, []int) {
+	var out []Expr
+	var at []int
+	for pos, cj := range splitTopLevelAnd(where) {
+		for _, e := range seekConjuncts(cj) {
+			out = append(out, e)
+			at = append(at, pos)
+		}
+	}
+	return out, at
 }
 
 // simplifyConstAndOr drops an arm that cannot change the truth of an AND or
@@ -1079,6 +1104,9 @@ type indexSeekPlan struct {
 // rest in its more: "WHERE tbl=? AND pk=?" over a key whose leading column
 // holds one value for the whole table is answered from pk's posting list.
 //
+// A key is dropped where skipping its rows would skip a row C tests a term
+// that can raise on (seekGuard, seek_raise.go).
+//
 // As with detectRowidSeekKey the key is evaluated once after OpOpenRead, and
 // the conjunct stays in WHERE, so the seek only restricts. The probe
 // reproduces the equality exactly: the key is coerced with comparisonAffinity
@@ -1089,7 +1117,8 @@ func detectIndexSeekKey(c *compiler, srcs []joinSource, where Expr) (int, *index
 	if c == nil || c.pager == nil || where == nil || indexSeeksOffForTest {
 		return 0, nil, false
 	}
-	conjuncts := seekConjuncts(where)
+	conjuncts, at := seekConjunctsAt(where)
+	cjs := splitTopLevelAnd(where)
 	for i, s := range srcs {
 		if s.derived != nil || s.tbl == nil || s.tbl.withoutRowid || s.left || s.rightOuter {
 			continue
@@ -1123,7 +1152,8 @@ func detectIndexSeekKey(c *compiler, srcs []joinSource, where Expr) (int, *index
 			cands = append(cands, automaticSeekCandidates(s.tbl.cols, cands)...)
 		}
 		var first *indexSeekPlan
-		for _, cj := range conjuncts {
+		var guard *seekGuard
+		for n, cj := range conjuncts {
 			// "x IS ?" is "x = ?" for every key but NULL, which no posting list
 			// holds: a NULL probe is never served, and the scan decides.
 			be, ok := cj.(BinaryExpr)
@@ -1133,6 +1163,13 @@ func detectIndexSeekKey(c *compiler, srcs []joinSource, where Expr) (int, *index
 			plan, ok := columnSeekPlan(c, s, cands, be, be.L, be.R)
 			if !ok {
 				plan, ok = columnSeekPlan(c, s, cands, be, be.R, be.L)
+			}
+			if ok {
+				if guard == nil {
+					g := newSeekGuard(c, srcs, i, cjs)
+					guard = &g
+				}
+				ok = guard.keep(plan.leadingCol, at[n], plan.root != 0 || plan.index != "")
 			}
 			switch {
 			case !ok:

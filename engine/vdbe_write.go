@@ -2649,12 +2649,13 @@ func (db *DB) compileDeleteStmt(stmt *deleteStmt, trig *trigCompileCtx) (*Progra
 	// instead of materializing the table. Pure candidate-set restriction -- the
 	// conjunct below still runs on the fetched row. See write_rowid_seek.go.
 	if !emitWriteRowidSeekHint(c, tbl, 0, stmt.where) {
-		emitWriteIndexSeekHint(c, tbl, 0, stmt.where)
+		db.emitWriteIndexSeekHint(c, tbl, 0, FromItem{Schema: stmt.schema, Alias: stmt.alias, IndexedBy: stmt.indexedBy, NotIndexed: stmt.notIndexed}, stmt.where, trig)
 	}
 	loopWhere, constJumps, cerr := c.emitWriteConstTerms(stmt.where)
 	if cerr != nil {
 		return nil, cerr
 	}
+	loopWhere = db.writeConsumedFirst(c, tbl, 0, FromItem{Schema: stmt.schema, Alias: stmt.alias, IndexedBy: stmt.indexedBy, NotIndexed: stmt.notIndexed}, stmt.where, loopWhere, trig)
 	rewind := c.emit(Instruction{Op: OpRewind, P1: 0})
 	loopTop := c.here()
 
@@ -3013,7 +3014,7 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 		// UPDATE: with a FROM clause the scan drives pass one's EPHEMERAL table,
 		// whose rowids are its own and have nothing to do with the target's.
 		if !emitWriteRowidSeekHint(c, tbl, scanCur, stmt.where) {
-			emitWriteIndexSeekHint(c, tbl, scanCur, stmt.where)
+			db.emitWriteIndexSeekHint(c, tbl, scanCur, FromItem{Schema: stmt.schema, Alias: stmt.alias, IndexedBy: stmt.indexedBy, NotIndexed: stmt.notIndexed}, stmt.where, trig)
 		}
 	}
 	// THE ORDER THIS LOOP VISITS ROWS IN, when a SET subquery may depend on it
@@ -3077,6 +3078,7 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 		if loopWhere, constJumps, cerr = c.emitWriteConstTerms(stmt.where); cerr != nil {
 			return nil, cerr
 		}
+		loopWhere = db.writeConsumedFirst(c, tbl, scanCur, FromItem{Schema: stmt.schema, Alias: stmt.alias, IndexedBy: stmt.indexedBy, NotIndexed: stmt.notIndexed}, stmt.where, loopWhere, trig)
 	}
 	rewind := c.emit(Instruction{Op: OpRewind, P1: scanCur})
 	loopTop := c.here()
