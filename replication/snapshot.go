@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // Package replication implements snapshot bootstrap for nodes whose peers have
@@ -36,60 +37,51 @@ type SnapshotPage struct {
 	Next   []byte
 }
 
-// A page holds at most 512 ops/cells, stops at 16MB to stay within message limits.
+// A page holds at most snapshotPageLen ops or cells, and stops at 16MB to stay
+// within message limits.
 const (
-	snapshotPageLen   = 512
+	snapshotPageLen   = 8192
 	snapshotPageBytes = 16 << 20
 )
+
+// snapshotCursor is where the next page of a part starts: after the row of
+// this rowid. A page is the rows after it in rowid order, which a rowid table
+// is stored in, so serving one is a seek rather than a sort of the table.
+// A cursor of an older format decodes as the start, and the part is sent again
+// from there: every row of it merges idempotently.
+type snapshotCursor struct {
+	Rowid int64 `json:"r"`
+}
 
 // SnapshotPage serves one page of part after cursor (nil: the first).
 func (s *Store) SnapshotPage(ctx context.Context, part int, cursor []byte) (SnapshotPage, error) {
 	var page SnapshotPage
+	var after snapshotCursor
+	if cursor != nil {
+		if err := json.Unmarshal(cursor, &after); err != nil {
+			return page, err
+		}
+	}
+	var err error
 	switch part {
 	case SnapshotOps:
-		var after struct {
-			Site string
-			Seq  uint64
-		}
-		if cursor != nil {
-			if err := json.Unmarshal(cursor, &after); err != nil {
-				return page, err
-			}
-		}
-		rows, err := s.db.QueryContext(ctx, `SELECT site, seq, hlc, tbl, pk, op, cells FROM main._repl_oplog
-			WHERE site > ? OR (site = ? AND seq > ?) ORDER BY site, seq LIMIT ?`,
-			after.Site, after.Site, int64(after.Seq), snapshotPageLen)
-		if err != nil {
-			return page, err
-		}
-		defer rows.Close()
-		size, full := 0, false
-		for rows.Next() {
-			if size >= snapshotPageBytes {
-				full = true
-				break
-			}
-			var op Op
-			var hlc, kind int64
-			var cells []byte
-			if err := rows.Scan(&op.Site, &op.Seq, &hlc, &op.Tbl, &op.PK, &kind, &cells); err != nil {
-				return page, err
-			}
-			op.HLC, op.Kind = HLC(hlc), OpKind(kind)
-			if op.Cells, err = decodeCells(cells); err != nil {
-				return page, err
-			}
-			size += len(op.Site) + len(op.Tbl) + len(op.PK) + len(cells) + 32
-			page.Ops = append(page.Ops, op)
-		}
-		if err := rows.Err(); err != nil {
-			return page, err
-		}
-		if full || len(page.Ops) == snapshotPageLen {
-			last := page.Ops[len(page.Ops)-1]
-			after.Site, after.Seq = last.Site, last.Seq
-			page.Next, _ = json.Marshal(after) // two plain fields cannot fail
-		}
+		page.Next, err = s.pageAfter(ctx, `site, seq, hlc, tbl, pk, op, cells FROM main._repl_oplog`, after.Rowid,
+			func() { page.Ops = page.Ops[:0] },
+			func(scan func(...any) error) (int, error) {
+				var op Op
+				var hlc, kind int64
+				var cells []byte
+				if err := scan(&op.Site, &op.Seq, &hlc, &op.Tbl, &op.PK, &kind, &cells); err != nil {
+					return 0, err
+				}
+				op.HLC, op.Kind = HLC(hlc), OpKind(kind)
+				var err error
+				if op.Cells, err = decodeCells(cells); err != nil {
+					return 0, err
+				}
+				page.Ops = append(page.Ops, op)
+				return len(op.Site) + len(op.Tbl) + len(op.PK) + len(cells) + 32, nil
+			})
 	case SnapshotMeta:
 		page.Floors, page.Ranges = VersionVector{}, map[string]uint64{}
 		rows, err := s.db.QueryContext(ctx, `SELECT site, seq FROM main._repl_floors`)
@@ -122,54 +114,80 @@ func (s *Store) SnapshotPage(ctx context.Context, part int, cursor []byte) (Snap
 			}
 			page.Ranges[site] = uint64(lo)
 		}
-		if err := rows.Err(); err != nil {
-			return page, err
-		}
+		return page, rows.Err()
 	case SnapshotClock:
-		var after struct {
-			Tbl string
-			PK  []byte
-			Col string
-		}
-		if cursor != nil {
-			if err := json.Unmarshal(cursor, &after); err != nil {
-				return page, err
-			}
-		}
-		rows, err := s.db.QueryContext(ctx, `SELECT tbl, pk, col, hlc, site, val FROM main._repl_clock
-			WHERE tbl > ? OR (tbl = ? AND (pk > ? OR (pk = ? AND col > ?))) ORDER BY tbl, pk, col LIMIT ?`,
-			after.Tbl, after.Tbl, after.PK, after.PK, after.Col, snapshotPageLen)
-		if err != nil {
-			return page, err
-		}
-		defer rows.Close()
-		size, full := 0, false
-		for rows.Next() {
-			if size >= snapshotPageBytes {
-				full = true
-				break
-			}
-			var c ClockCell
-			var hlc int64
-			if err := rows.Scan(&c.Tbl, &c.PK, &c.Col, &hlc, &c.Site, &c.Val); err != nil {
-				return page, err
-			}
-			c.HLC = HLC(hlc)
-			size += len(c.Tbl) + len(c.PK) + len(c.Col) + len(c.Site) + len(c.Val) + 16
-			page.Cells = append(page.Cells, c)
-		}
-		if err := rows.Err(); err != nil {
-			return page, err
-		}
-		if full || len(page.Cells) == snapshotPageLen {
-			last := page.Cells[len(page.Cells)-1]
-			after.Tbl, after.PK, after.Col = last.Tbl, last.PK, last.Col
-			page.Next, _ = json.Marshal(after)
-		}
+		page.Next, err = s.pageAfter(ctx, `tbl, pk, col, hlc, site, val FROM main._repl_clock`, after.Rowid,
+			func() { page.Cells = page.Cells[:0] },
+			func(scan func(...any) error) (int, error) {
+				var c ClockCell
+				var hlc int64
+				if err := scan(&c.Tbl, &c.PK, &c.Col, &hlc, &c.Site, &c.Val); err != nil {
+					return 0, err
+				}
+				c.HLC = HLC(hlc)
+				page.Cells = append(page.Cells, c)
+				return len(c.Tbl) + len(c.PK) + len(c.Col) + len(c.Site) + len(c.Val) + 16, nil
+			})
 	default:
 		return page, fmt.Errorf("replication: unknown snapshot part %d", part)
 	}
-	return page, nil
+	return page, err
+}
+
+// pageAfter takes one page of "SELECT rowid, <from>": the rows after rowid
+// after, in rowid order, each handed to take, which scans the columns after
+// the rowid and reports the row's size. It returns the cursor of the next
+// page, nil when this one is the last.
+//
+// The table's own order serves the page without sorting it. A page that comes
+// back out of rowid order is read again sorted (reset discards what take kept):
+// the cursor must be the largest rowid of every row the page could hold.
+func (s *Store) pageAfter(ctx context.Context, from string, after int64, reset func(), take func(scan func(...any) error) (int, error)) ([]byte, error) {
+	for _, order := range []string{``, ` ORDER BY rowid`} {
+		last, more, sorted, err := s.readPage(ctx, `SELECT rowid, `+from+` WHERE rowid > ?`+order+` LIMIT ?`, after, take)
+		if err != nil {
+			return nil, err
+		}
+		if !sorted {
+			reset()
+			continue
+		}
+		if !more {
+			return nil, nil
+		}
+		next, err := json.Marshal(snapshotCursor{Rowid: last})
+		return next, err
+	}
+	return nil, errors.New("replication: a snapshot page sorted by rowid came back out of rowid order")
+}
+
+// readPage runs q for the rows after after, handing each to take until the
+// page is full. sorted reports whether they came in rowid order, more whether
+// a next page may hold rows, and last is the rowid of the last row taken.
+func (s *Store) readPage(ctx context.Context, q string, after int64, take func(scan func(...any) error) (int, error)) (last int64, more, sorted bool, err error) {
+	rows, err := s.db.QueryContext(ctx, q, after, snapshotPageLen)
+	if err != nil {
+		return 0, false, false, err
+	}
+	defer rows.Close()
+	var rowid int64
+	scan := func(dest ...any) error { return rows.Scan(append([]any{&rowid}, dest...)...) }
+	last = after
+	n, size := 0, 0
+	for rows.Next() {
+		if size >= snapshotPageBytes {
+			return last, true, true, nil
+		}
+		k, err := take(scan)
+		if err != nil {
+			return 0, false, false, err
+		}
+		if rowid <= last {
+			return 0, false, false, nil
+		}
+		last, size, n = rowid, size+k, n+1
+	}
+	return last, n == snapshotPageLen, true, rows.Err()
 }
 
 // bootstrap takes a snapshot from peer and merges it.
@@ -229,18 +247,39 @@ func (s *Store) mergeCells(ctx context.Context, cells []ClockCell) error {
 		return err
 	}
 	s.q = tx
-	for _, c := range cells {
-		s.clock.Merge(c.HLC)
-		if err = s.mergeCell(ctx, c.Tbl, c.PK, c.Col, c.HLC, c.Site, c.Val); err != nil {
-			break
-		}
-	}
+	err = s.mergeCellsIn(ctx, cells)
 	s.q = s.db
 	if err != nil {
 		tx.Rollback()
 		return err
 	}
 	return tx.Commit()
+}
+
+// cellsPerUpsert is how many cells one statement of mergeCellsIn writes.
+const cellsPerUpsert = 64
+
+// mergeCellsIn merges cells into the clock, each only where it is a strictly
+// newer writer than the cell there by (hlc, site), as mergeCell does one: an
+// upsert per few hundred cells, whose rows apply in order, so a cell later in
+// cells is merged against an earlier one as a run of mergeCell calls would.
+func (s *Store) mergeCellsIn(ctx context.Context, cells []ClockCell) error {
+	for len(cells) > 0 {
+		chunk := cells[:min(len(cells), cellsPerUpsert)]
+		cells = cells[len(chunk):]
+		args := make([]any, 0, 6*len(chunk))
+		for _, c := range chunk {
+			s.clock.Merge(c.HLC)
+			args = append(args, c.Tbl, c.PK, c.Col, int64(c.HLC), c.Site, c.Val)
+		}
+		if _, err := s.q.ExecContext(ctx, `INSERT INTO main._repl_clock(tbl,pk,col,hlc,site,val) VALUES `+
+			strings.TrimSuffix(strings.Repeat(`(?,?,?,?,?,?),`, len(chunk)), ",")+
+			` ON CONFLICT(tbl,pk,col) DO UPDATE SET hlc=excluded.hlc, site=excluded.site, val=excluded.val
+			WHERE excluded.hlc > hlc OR (excluded.hlc = hlc AND excluded.site > site)`, args...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // finishSnapshot raises this node's floors to the peer's -- every op at or
