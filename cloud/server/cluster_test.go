@@ -1,8 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -44,6 +47,7 @@ func freePort(t *testing.T) int {
 // public URL as a deployment behind a load balancer would.
 func newCluster(t *testing.T, n int) []*clusterNode {
 	t.Helper()
+	startBudget(t)
 	type ident struct {
 		dir, id string
 		port    int
@@ -123,14 +127,47 @@ func (c *clusterNode) restart() {
 	c.start()
 }
 
+// clusterBudget is how long one cluster test may run, -race included; a
+// test's waits share it, and it ends before the package's -timeout does, so a
+// stuck wait fails with what it waited for instead of a goroutine dump.
+const clusterBudget = 4 * time.Minute
+
+var budgets sync.Map // *testing.T -> time.Time
+
+func startBudget(t *testing.T) {
+	end := time.Now().Add(clusterBudget)
+	if d, ok := t.Deadline(); ok && d.Add(-10*time.Second).Before(end) {
+		end = d.Add(-10 * time.Second)
+	}
+	budgets.Store(t, end)
+	t.Cleanup(func() { budgets.Delete(t) })
+}
+
+// eventually polls fn until it holds, failing with what it waited for once
+// the test's budget is spent.
 func eventually(t *testing.T, what string, fn func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
+	end := time.Now().Add(time.Minute)
+	if v, ok := budgets.Load(t); ok {
+		end = v.(time.Time)
+	}
+	start := time.Now()
 	for !fn() {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
+		if time.Now().After(end) {
+			t.Fatalf("gave up after %v waiting for %s", time.Since(start).Round(time.Millisecond), what)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// need(f())(t) is f's value, failing t on f's error.
+func need[T any](v T, err error) func(*testing.T) T {
+	return func(t *testing.T) T {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
 	}
 }
 
@@ -173,11 +210,11 @@ func orgID(n *clusterNode) string {
 func acmeEverywhere(t *testing.T, nodes []*clusterNode) {
 	ctx := context.Background()
 	_, orgs, dbs := nodes[0].clients()
-	must(orgs.Create(ctx, auth(nodes[0].admin, &v1.CreateOrgRequest{Slug: "acme", Name: "Acme"})))
+	need(orgs.Create(ctx, auth(nodes[0].admin, &v1.CreateOrgRequest{Slug: "acme", Name: "Acme"})))(t)
 	for _, loc := range locations[1:len(nodes)] {
-		must(nodes[0].groups().AddLocation(ctx, auth(nodes[0].admin, &v1.AddLocationRequest{Org: "acme", Group: "default", Location: loc})))
+		need(nodes[0].groups().AddLocation(ctx, auth(nodes[0].admin, &v1.AddLocationRequest{Org: "acme", Group: "default", Location: loc})))(t)
 	}
-	d := must(dbs.Create(ctx, auth(nodes[0].admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "app"})))
+	d := need(dbs.Create(ctx, auth(nodes[0].admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "app"})))(t)
 	if d.Msg.Database.Type != v1.DatabaseType_DATABASE_TYPE_CRDT {
 		t.Fatalf("a cluster's database is %v", d.Msg.Database.Type)
 	}
@@ -196,16 +233,24 @@ func TestClusterConcurrentWritesConverge(t *testing.T) {
 		}
 		return true
 	})
-	const each = 20
+	busy := watchBusy(t)
+	const each = 100
 	var wg sync.WaitGroup
 	for i, n := range nodes {
 		wg.Go(func() {
 			for k := range each {
-				n.exec("/db/acme/app", n.admin, fmt.Sprintf("INSERT INTO t(node, v) VALUES ('node-%d', %d)", i, k))
+				stmt := fmt.Sprintf("INSERT INTO t(node, v) VALUES ('node-%d', %d)", i, k)
+				if status, res := n.pipeline("/db/acme/app", n.admin, stmt); status != 200 || len(res) != 1 || res[0].Type != "ok" {
+					t.Errorf("%s on node-%d: HTTP %d %+v", stmt, i, status, res)
+					return
+				}
 			}
 		})
 	}
 	wg.Wait()
+	if t.Failed() {
+		t.FailNow()
+	}
 	eventually(t, "every write on every node", func() bool {
 		for _, n := range nodes {
 			if n.count("app", "t") != each*len(nodes) {
@@ -215,11 +260,71 @@ func TestClusterConcurrentWritesConverge(t *testing.T) {
 		return true
 	})
 
+	// Every op was applied when it arrived: none waited for anti-entropy after
+	// losing its commit to a local write.
+	if n := busy.n.Load(); n > 0 {
+		t.Fatalf("%d replication log lines report SQLITE_BUSY", n)
+	}
+
 	// A node that was down catches up on restart.
 	nodes[1].s.Close()
 	nodes[0].exec("/db/acme/app", nodes[0].admin, "INSERT INTO t(node, v) VALUES ('while-down', 0)")
 	nodes[1].start()
 	eventually(t, "the restarted node to catch up", func() bool { return nodes[1].count("app", "t") == each*len(nodes)+1 })
+}
+
+// watchBusy counts the replication log lines that report SQLITE_BUSY: an op
+// whose apply lost to a local commit, left for the next anti-entropy round.
+func watchBusy(t *testing.T) *busyLog {
+	b := &busyLog{}
+	log.SetOutput(b)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	return b
+}
+
+type busyLog struct{ n atomic.Int64 }
+
+func (b *busyLog) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte("SQLITE_BUSY")) {
+		b.n.Add(1)
+	}
+	return os.Stderr.Write(p)
+}
+
+// A node newly placed serves a database only once it holds all of it: until
+// its first sync with the peers completes it answers 503, never a part.
+func TestClusterNewPlacementServesAllOrNothing(t *testing.T) {
+	nodes := newCluster(t, 3)
+	ctx := context.Background()
+	_, orgs, dbs := nodes[0].clients()
+	need(orgs.Create(ctx, auth(nodes[0].admin, &v1.CreateOrgRequest{Slug: "acme", Name: "Acme"})))(t)
+	need(nodes[0].groups().AddLocation(ctx, auth(nodes[0].admin, &v1.AddLocationRequest{Org: "acme", Group: "default", Location: "iad"})))(t)
+	need(dbs.Create(ctx, auth(nodes[0].admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "app"})))(t)
+	eventually(t, "app open on fra and iad", func() bool { return placed(nodes[:2], "app") })
+	const rows = 500
+	stmts := []string{"CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)"}
+	for i := range rows {
+		stmts = append(stmts, fmt.Sprintf("INSERT INTO t(v) VALUES (%d)", i))
+	}
+	nodes[0].exec("/db/acme/app", nodes[0].admin, stmts...)
+	eventually(t, "the rows on iad", func() bool { return nodes[1].count("app", "t") == rows })
+
+	need(nodes[0].groups().AddLocation(ctx, auth(nodes[0].admin, &v1.AddLocationRequest{Org: "acme", Group: "default", Location: "sea"})))(t)
+	eventually(t, "sea to serve app", func() bool {
+		status, res := nodes[2].pipeline("/db/acme/app", nodes[2].admin, "SELECT count(*) FROM t")
+		switch {
+		case status == http.StatusNotFound || status == http.StatusServiceUnavailable:
+			return false // not placed yet, or still syncing
+		case status != 200 || len(res) != 1:
+			t.Fatalf("sea: HTTP %d %+v", status, res)
+		case res[0].Type != "ok":
+			t.Fatalf("sea served app before its first sync: %s", res[0].Error.Message)
+		}
+		if n := fmt.Sprint(res[0].Response.Result.Rows[0][0].Value); n != fmt.Sprint(rows) {
+			t.Fatalf("sea served %s of %d rows before its first sync completed", n, rows)
+		}
+		return true
+	})
 }
 
 func TestClusterPlacement(t *testing.T) {
@@ -231,7 +336,7 @@ func TestClusterPlacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := nodes[2].s.dbPath(d)
-	must(nodes[1].groups().RemoveLocation(ctx, auth(nodes[1].admin, &v1.RemoveLocationRequest{Org: "acme", Group: "default", Location: "sea"})))
+	need(nodes[1].groups().RemoveLocation(ctx, auth(nodes[1].admin, &v1.RemoveLocationRequest{Org: "acme", Group: "default", Location: "sea"})))(t)
 	eventually(t, "sea to close and remove app", func() bool {
 		_, err := os.Stat(path)
 		return nodes[2].s.crdtHandle(d.ID) == nil && os.IsNotExist(err)
@@ -240,12 +345,12 @@ func TestClusterPlacement(t *testing.T) {
 		t.Fatalf("a database not placed here: HTTP %d, want 404", status)
 	}
 	nodes[0].exec("/db/acme/app", nodes[0].admin, "CREATE TABLE back(x)", "INSERT INTO back VALUES (1)")
-	must(nodes[0].groups().AddLocation(ctx, auth(nodes[0].admin, &v1.AddLocationRequest{Org: "acme", Group: "default", Location: "sea"})))
+	need(nodes[0].groups().AddLocation(ctx, auth(nodes[0].admin, &v1.AddLocationRequest{Org: "acme", Group: "default", Location: "sea"})))(t)
 	eventually(t, "sea to hold app again, rows included", func() bool { return nodes[2].count("app", "back") == 1 })
 
 	// Deleting on one node removes it everywhere.
 	_, _, dbs := nodes[1].clients()
-	must(dbs.Delete(ctx, auth(nodes[1].admin, &v1.DeleteDatabaseRequest{Org: "acme", Name: "app"})))
+	need(dbs.Delete(ctx, auth(nodes[1].admin, &v1.DeleteDatabaseRequest{Org: "acme", Name: "app"})))(t)
 	eventually(t, "app gone from every node", func() bool {
 		for _, n := range nodes {
 			if n.s.crdtHandle(d.ID) != nil {
@@ -262,14 +367,14 @@ func TestClusterDeclinesWhatCRDTCannotReplicate(t *testing.T) {
 	acmeEverywhere(t, nodes)
 	n := nodes[0]
 	n.exec("/db/acme/app", n.admin, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)")
-	for _, stmt := range []string{
-		"CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
-		"CREATE VIRTUAL TABLE f USING fts5(body)",
-		"CREATE TABLE w(k TEXT PRIMARY KEY, v) WITHOUT ROWID",
+	for _, c := range []struct{ stmt, why string }{
+		{"CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END", "triggers are not replicated"},
+		{"CREATE VIRTUAL TABLE f USING fts5(body)", "virtual tables are not replicated"},
+		{"CREATE TABLE w(k TEXT PRIMARY KEY, v) WITHOUT ROWID", "WITHOUT ROWID is not replicated"},
 	} {
-		status, res := n.pipeline("/db/acme/app", n.admin, stmt)
-		if status != 200 || len(res) != 1 || res[0].Type != "error" {
-			t.Fatalf("%s: HTTP %d %+v, want a statement error", stmt, status, res)
+		status, res := n.pipeline("/db/acme/app", n.admin, c.stmt)
+		if status != 200 || len(res) != 1 || res[0].Type != "error" || !strings.Contains(res[0].Error.Message, c.why) {
+			t.Fatalf("%s: HTTP %d %+v, want a statement error saying %q", c.stmt, status, res, c.why)
 		}
 	}
 	// And nothing of them reached the other node.
@@ -298,7 +403,7 @@ func TestClusterEveryNodeServesIdentity(t *testing.T) {
 	// A user made on one node, a token signed on another, the API called on a
 	// third: no node forwards anything.
 	users, _, _ := nodes[0].clients()
-	must(users.Create(ctx, auth(nodes[0].admin, &v1.CreateUserRequest{Email: "bob@example.com", Name: "Bob", Password: "bob-password"})))
+	need(users.Create(ctx, auth(nodes[0].admin, &v1.CreateUserRequest{Email: "bob@example.com", Name: "Bob", Password: "bob-password"})))(t)
 	eventually(t, "bob on node 1", func() bool {
 		_, err := nodes[1].s.Store().UserByEmail(ctx, "bob@example.com")
 		return err == nil

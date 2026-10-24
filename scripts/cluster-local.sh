@@ -42,13 +42,4 @@ start() {
   nohup "$bin/musql-cloud" -config "$root/n$1/config.yaml" > "$root/n$1/log" 2>&1 &
   echo $! > "$root/n$1/pid"
 }
-start 1
-# n2 and n3 refuse to start until the admin row has replicated from n1, and the
-# first attempt can be cut short by it: retry until the process stays up.
-for i in 2 3; do
-  for try in 1 2 3 4 5 6 7 8; do
-    start "$i"
-    sleep 4
-    kill -0 "$(cat "$root/n$i/pid")" 2>/dev/null && break
-  done
-done
+for i in 1 2 3; do start "$i"; done
