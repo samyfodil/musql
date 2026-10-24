@@ -81,6 +81,18 @@ var txBulkMaxBytes = 1 << 30
 // SetTxBulkMaxBytesForTest sets txBulkMaxBytes and returns the old value.
 func SetTxBulkMaxBytesForTest(n int) int { old := txBulkMaxBytes; txBulkMaxBytes = n; return old }
 
+// txLoadAfterWritesForTest arms a transaction's load on a store its own writes
+// emptied, so a test can reach the commit that must then rewrite the file.
+var txLoadAfterWritesForTest bool
+
+// SetTxLoadAfterWritesForTest sets txLoadAfterWritesForTest and returns the
+// old value.
+func SetTxLoadAfterWritesForTest(on bool) bool {
+	old := txLoadAfterWritesForTest
+	txLoadAfterWritesForTest = on
+	return old
+}
+
 // txAppendArmable reports whether plan may write through a load armed inside a
 // transaction: an INSERT ... SELECT the autocommit load takes, or an INSERT ...
 // VALUES that does nothing but build and store its rows.
@@ -177,6 +189,13 @@ func (m *vdbe) bulkLoadInTx(plan *insertPlan) *segBulkLoad {
 			return nil
 		}
 		if !tbl.rows.isEmpty() {
+			return nil
+		}
+		// Emptied by this transaction's own writes, which the log holds: the
+		// inserts join them there, as for a table with rows. A load would
+		// make the commit rewrite the whole file (mutatedOutsideChangeLog)
+		// for what a delta batch says in a few records.
+		if tbl.rowsWrittenSinceCommit && !txLoadAfterWritesForTest {
 			return nil
 		}
 		bl = &segBulkLoad{inTx: true, db: db}
