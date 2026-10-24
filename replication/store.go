@@ -54,12 +54,20 @@ type Store struct {
 	// txHeld caches, within an ingest's transaction, whether a table has rows
 	// held out (_repl_withheld); nil outside one.
 	txHeld map[string]bool
+	// mayHold is every table that may have rows held out: each one that had
+	// some when the store opened, and each one rebuildTable has held a row of
+	// since. Only rebuildTable writes _repl_withheld, always under mu, so a
+	// table not in it has none, and needs no query to say so.
+	mayHold map[string]bool
 	// localRetries counts the local commits being retried after losing to an
 	// apply, and localUntil is when waitLocal stops waiting for them anyway, in
 	// unix nanoseconds. applied counts the ingest commits.
 	localRetries atomic.Int32
 	localUntil   atomic.Int64
 	applied      atomic.Uint64
+	// ownSeq is the highest seq of this site's that a local commit here, or the
+	// log at open, holds (capture.lastSeq).
+	ownSeq atomic.Uint64
 }
 
 // begin starts a store transaction: BEGIN IMMEDIATE on a connection of the
@@ -130,8 +138,11 @@ func OpenStore(ctx context.Context, db *sql.DB, site string) (*Store, error) {
 	if err := InitSchema(ctx, db); err != nil {
 		return nil, err
 	}
-	s := &Store{db: db, q: db, site: site, clock: NewClock(site), vv: VersionVector{}, floors: VersionVector{}, acks: Acks{}, cat: newCatalog()}
+	s := &Store{db: db, q: db, site: site, clock: NewClock(site), vv: VersionVector{}, floors: VersionVector{}, acks: Acks{}, cat: newCatalog(), mayHold: map[string]bool{}}
 	if err := s.claimRanges(ctx); err != nil {
+		return nil, err
+	}
+	if err := s.loadHeld(ctx); err != nil {
 		return nil, err
 	}
 	if err := s.loadFloors(ctx); err != nil {
@@ -140,6 +151,7 @@ func OpenStore(ctx context.Context, db *sql.DB, site string) (*Store, error) {
 	if err := s.loadVV(ctx); err != nil {
 		return nil, err
 	}
+	s.ownSeq.Store(s.vv[site])
 	if cat, ver, ok, err := loadCatalog(ctx, db); err != nil {
 		return nil, err
 	} else if ok {
@@ -170,6 +182,9 @@ func (s *Store) NoteLocal(site string, seq uint64) {
 	defer s.mu.Unlock()
 	if seq > s.vv[site] {
 		s.vv[site] = seq
+	}
+	if site == s.site && seq > s.ownSeq.Load() {
+		s.ownSeq.Store(seq)
 	}
 }
 
@@ -553,11 +568,10 @@ func (s *Store) materializeRowFrom(ctx context.Context, cat *catalog, tblID stri
 	}
 	held, ok := s.txHeld[tblID]
 	if !ok {
-		var n int
-		if err := s.q.QueryRowContext(ctx, `SELECT count(*) FROM (SELECT 1 FROM main._repl_withheld WHERE tbl=? LIMIT 1)`, tblID).Scan(&n); err != nil {
+		var err error
+		if held, err = s.holdsOut(ctx, tblID); err != nil {
 			return err
 		}
-		held = n > 0
 		if s.txHeld != nil {
 			s.txHeld[tblID] = held
 		}
@@ -746,12 +760,46 @@ func (s *Store) rebuildTable(ctx context.Context, t *object) error {
 			return err
 		}
 		if conflict {
-			if _, err := s.q.ExecContext(ctx, `INSERT INTO main._repl_withheld(tbl, pk) VALUES(?, ?)`, t.ID, st.pk); err != nil {
+			if err := s.holdOut(ctx, t.ID, st.pk); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// holdOut records pk's row of tbl as held out.
+func (s *Store) holdOut(ctx context.Context, tbl string, pk []byte) error {
+	s.mayHold[tbl] = true
+	_, err := s.q.ExecContext(ctx, `INSERT INTO main._repl_withheld(tbl, pk) VALUES(?, ?)`, tbl, pk)
+	return err
+}
+
+// holdsOut reports whether tbl has a row held out.
+func (s *Store) holdsOut(ctx context.Context, tbl string) (bool, error) {
+	if !s.mayHold[tbl] {
+		return false, nil
+	}
+	var n int
+	err := s.q.QueryRowContext(ctx, `SELECT count(*) FROM (SELECT 1 FROM main._repl_withheld WHERE tbl=? LIMIT 1)`, tbl).Scan(&n)
+	return n > 0, err
+}
+
+// loadHeld fills mayHold from _repl_withheld.
+func (s *Store) loadHeld(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT tbl FROM main._repl_withheld`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var tbl string
+		if err := rows.Scan(&tbl); err != nil {
+			return err
+		}
+		s.mayHold[tbl] = true
+	}
+	return rows.Err()
 }
 
 // rewriteRows is rebuildTable for a table with no UNIQUE index: no row can
@@ -879,7 +927,7 @@ func (b *rowBatch) flush(ctx context.Context) error {
 				return err
 			}
 			if k == 0 {
-				if _, err := b.s.q.ExecContext(ctx, `INSERT INTO main._repl_withheld(tbl, pk) VALUES(?, ?)`, b.t.ID, pk); err != nil {
+				if err := b.s.holdOut(ctx, b.t.ID, pk); err != nil {
 					return err
 				}
 			}
@@ -895,16 +943,15 @@ func (b *rowBatch) flush(ctx context.Context) error {
 func (s *Store) rebuildHeld(ctx context.Context, tblIDs []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Only rebuildTable writes _repl_withheld, always under mu, so a
-	// table with no row held out needs no transaction, which every local commit
-	// would otherwise pay.
+	// A table with no row held out needs no transaction, which every local
+	// commit would otherwise pay; and one never held out, not even a query.
 	heldOut := false
 	for _, id := range tblIDs {
-		var held int
-		if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM (SELECT 1 FROM main._repl_withheld WHERE tbl=? LIMIT 1)`, id).Scan(&held); err != nil {
+		held, err := s.holdsOut(ctx, id)
+		if err != nil {
 			return err
 		}
-		heldOut = heldOut || held > 0
+		heldOut = heldOut || held
 	}
 	if !heldOut {
 		return nil
@@ -919,11 +966,11 @@ func (s *Store) rebuildHeld(ctx context.Context, tblIDs []string) error {
 			return err
 		}
 		for _, id := range tblIDs {
-			var held int
-			if err := s.q.QueryRowContext(ctx, `SELECT count(*) FROM (SELECT 1 FROM main._repl_withheld WHERE tbl=? LIMIT 1)`, id).Scan(&held); err != nil {
+			held, err := s.holdsOut(ctx, id)
+			if err != nil {
 				return err
 			}
-			if t := s.cat.byID(id); held > 0 && t != nil {
+			if t := s.cat.byID(id); held && t != nil {
 				if err := s.rebuildTable(ctx, t); err != nil {
 					return err
 				}
