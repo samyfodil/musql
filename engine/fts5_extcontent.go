@@ -189,6 +189,9 @@ func fts5ExtProject(st *fts5Store, rt fts5ExtTable, btreeRowids []int64, records
 			rv = Value{Typ: Int, I: btreeRowids[ri]}
 		} else if ridPick < len(rec) {
 			rv = rec[ridPick]
+			if rv.Typ == valueGenErr {
+				return nil, contentGenErrDecline(rt.cols[ridPick].Name, rv)
+			}
 		}
 		if rv.Typ != Int {
 			// fts5 reads this column with sqlite3_column_int64, which COERCES.
@@ -203,6 +206,9 @@ func fts5ExtProject(st *fts5Store, rt fts5ExtTable, btreeRowids []int64, records
 		vals := make([]Value, len(pick))
 		for i, j := range pick {
 			if j < len(rec) {
+				if rec[j].Typ == valueGenErr {
+					return nil, contentGenErrDecline(rt.cols[j].Name, rec[j])
+				}
 				vals[i] = rec[j]
 			}
 		}
