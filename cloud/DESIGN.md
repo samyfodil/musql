@@ -31,9 +31,6 @@ only via `buf generate` from the repo root.
 listen: ":8080"
 public_url: "https://cloud.example.com"   # issuer and links
 data_dir: "./data"                        # state.musq, databases/, snapshots/
-admin:
-  email: "admin@example.com"
-  password: "…"           # or password_hash: argon2id encoded
 node:
   name: "node-1"
   location: "fra"          # this node's location code
@@ -54,8 +51,15 @@ console:
   cors_origins: []         # other origins allowed to call the API and Hrana
 ```
 
-On first start the admin user is created (or its password reset) from the
-config; it is the only way in until it adds others.
+The admin is not in the config. `musql-cloud init --admin-email a@b.c
+[--admin-password …] [-config config.yaml]` opens the state under `data_dir`,
+creates the admin with an argon2id hash (or, if the email exists, resets its
+password and makes it an enabled admin), and exits. The password is prompted
+for twice without echo on a terminal, or read as one line from stdin
+(`echo pw | musql-cloud init --admin-email a@b.c`). It is idempotent and is the
+way back in after a lost password. The server refuses to start while the state
+has no admin. In a cluster `init` writes locally and the row replicates once
+the node runs. An old `admin:` block in the config is an error.
 
 ## Identity: an OIDC provider backed by musql
 

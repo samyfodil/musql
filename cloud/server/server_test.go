@@ -19,7 +19,6 @@ import (
 	v1 "github.com/samyfodil/musql/cloud/gen/cloud/v1"
 	"github.com/samyfodil/musql/cloud/gen/cloud/v1/cloudv1connect"
 	"github.com/samyfodil/musql/cloud/oidc"
-	"github.com/samyfodil/musql/cloud/state"
 )
 
 type env struct {
@@ -34,13 +33,13 @@ func newEnv(t *testing.T, extra string) *env {
 	dir := t.TempDir()
 	cfg, err := ParseConfig([]byte(`
 data_dir: ` + dir + `
-admin:
-  email: admin@example.com
-  password: "admin-password"
 node:
   location: fra
 ` + extra))
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Init(context.Background(), cfg, "admin@example.com", "admin-password"); err != nil {
 		t.Fatal(err)
 	}
 	var h http.Handler
@@ -375,25 +374,34 @@ func TestExportAndUpload(t *testing.T) {
 	}
 }
 
-func TestAdminFromConfig(t *testing.T) {
+func TestInit(t *testing.T) {
 	dir := t.TempDir()
-	conf := func(pw string) *Config {
-		c, err := ParseConfig([]byte("data_dir: " + dir + "\nadmin:\n  email: root@example.com\n  password: " + pw + "\n"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return c
-	}
+	cfg := must(ParseConfig([]byte("data_dir: " + dir + "\n")))
 	ctx := context.Background()
-	s := must(New(ctx, conf("first-password"), nil))
+	if _, err := New(ctx, cfg, nil); err == nil || !strings.Contains(err.Error(), "no admin: run musql-cloud init --admin-email") {
+		t.Fatalf("started without an admin: %v", err)
+	}
+	if err := Init(ctx, cfg, "root@example.com", ""); err == nil {
+		t.Fatal("accepted an empty password")
+	}
+	if err := Init(ctx, cfg, "Root@example.com", "first-password"); err != nil {
+		t.Fatal(err)
+	}
+	s := must(New(ctx, cfg, nil))
 	u := must(s.Store().UserByEmail(ctx, "root@example.com"))
+	if !u.Admin {
+		t.Fatalf("not an admin: %+v", u)
+	}
 	u.Admin, u.Disabled = false, true
 	if err := s.Store().UpdateUser(ctx, u); err != nil {
 		t.Fatal(err)
 	}
 	s.Close()
 
-	s = must(New(ctx, conf("second-password"), nil))
+	if err := Init(ctx, cfg, "root@example.com", "second-password"); err != nil {
+		t.Fatal(err)
+	}
+	s = must(New(ctx, cfg, nil))
 	defer s.Close()
 	if _, err := s.Provider().Authenticate(ctx, "root@example.com", "second-password"); err != nil {
 		t.Fatalf("reset password: %v", err)
@@ -406,19 +414,23 @@ func TestAdminFromConfig(t *testing.T) {
 	}
 }
 
+func TestConfigRejectsAdminBlock(t *testing.T) {
+	_, err := ParseConfig([]byte("admin: {email: a@b.c, password: x}\n"))
+	if err == nil || !strings.Contains(err.Error(), "run musql-cloud init") {
+		t.Fatalf("%v", err)
+	}
+}
+
 func TestConfig(t *testing.T) {
 	for _, bad := range []string{
-		"admin: {email: a@b.c}",
-		"admin: {email: a@b.c, password: x}\nunknown_key: 1",
-		"admin: {email: a@b.c, password_hash: nope}",
-		"admin: {email: a@b.c, password: x}\npublic_url: ftp://x",
+		"unknown_key: 1",
+		"public_url: ftp://x",
 	} {
 		if _, err := ParseConfig([]byte(bad)); err == nil {
 			t.Errorf("accepted %q", bad)
 		}
 	}
 	c := must(ParseConfig([]byte(`
-admin: {email: a@b.c, password_hash: "` + state.HashPassword("x") + `"}
 ai:
   provider: jitllm
   model: slm-sql-1.5b

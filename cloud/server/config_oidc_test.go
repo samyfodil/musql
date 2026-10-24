@@ -6,7 +6,7 @@ import (
 )
 
 func TestOIDCConfig(t *testing.T) {
-	base := "admin: {email: a@b.c, password: x}\n"
+	base := "listen: \":8080\"\n"
 	c := must(ParseConfig([]byte(base)))
 	if c.OIDC.keyRotation != 30*24*time.Hour {
 		t.Fatalf("default rotation %v", c.OIDC.keyRotation)
