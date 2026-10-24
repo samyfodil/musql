@@ -82,6 +82,10 @@ type rowStore struct {
 	// eqIdx is the lazily built per-column equality index, nil until a seek asks
 	// for one and thrown away whole by any mutation. See row_store_eqindex.go.
 	eqIdx map[int]*rsEqIndex
+	// snapWork is how many written rows seeks have tested one by one, beside the
+	// base segments' index (snapshotIndexRowids, segEqRowids). Once that has
+	// cost what building eqIdx would, prefersEqIndex builds it instead.
+	snapWork int
 
 	// uqIdx is each UNIQUE index's conflict-probe index, built on the first probe
 	// and maintained by the same three mutators. See row_store_uniqindex.go.

@@ -147,6 +147,7 @@ func (s *rowStore) segEqRowids(col int, probe Value) ([]uint64, bool) {
 			out = append(out, rid)
 		}
 	}
+	s.snapWork += len(s.m)
 	for rid, vals := range s.m {
 		if col >= len(vals) || !certainlyUnequal(vals[col], probe) {
 			out = append(out, rid)
