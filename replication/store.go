@@ -67,9 +67,15 @@ type Store struct {
 	localUntil   atomic.Int64
 	lastLocal    atomic.Int64
 	applied      atomic.Uint64
-	// localFree is closed when localRetries next falls, for waitLocal.
-	localMu   sync.Mutex
-	localFree chan struct{}
+	// localWaiting counts the local writes waiting for the write lock and
+	// localGot those done waiting; yieldTo is the localGot an apply that
+	// yielded the lock to waiting writes waits for (waitLocal). localFree is
+	// closed when localGot rises or localRetries falls.
+	localWaiting atomic.Int32
+	localGot     atomic.Uint64
+	yieldTo      atomic.Uint64
+	localMu      sync.Mutex
+	localFree    chan struct{}
 	// ownSeq is the highest seq of this site's that a local commit here, or the
 	// log at open, holds (capture.lastSeq).
 	ownSeq atomic.Uint64
@@ -427,6 +433,10 @@ const (
 	maxHold    = 50 * time.Millisecond
 	holdAlone  = 500 * time.Millisecond
 	localQuiet = time.Second
+	// yieldHold is how long an ingest holds the lock, at least, once a local
+	// write waits for it (localWaiting): long enough to apply a few ops for
+	// the commit it then makes, short enough to keep the write's wait short.
+	yieldHold = 10 * time.Millisecond
 )
 
 // hold is how long an ingest may hold the write lock now.
@@ -445,8 +455,13 @@ func (s *Store) localCommitted() { s.lastLocal.Store(time.Now().UnixNano()) }
 // being retried: the driver re-runs an autocommit statement whole, and one
 // longer than the gap between two applies would otherwise never commit. It
 // waits at most as long as the driver retries (engine.BusyTimeout) from the
-// first failure.
+// first failure. After an apply yielded the lock to local writes waiting for
+// it (ingestTx), it also waits for each of them to have taken it: the apply
+// would otherwise take the lock back the moment it let go of it, ahead of
+// writers that had waited through its whole transaction. Writes that start
+// waiting later wait for the next yield. That wait is bounded the same way.
 func (s *Store) waitLocal() {
+	until := time.Now().Add(engine.BusyTimeout)
 	for {
 		s.localMu.Lock()
 		if s.localFree == nil {
@@ -456,7 +471,9 @@ func (s *Store) waitLocal() {
 		s.localMu.Unlock()
 		left := time.Until(time.Unix(0, s.localUntil.Load()))
 		if s.localRetries.Load() <= 0 || left <= 0 {
-			return
+			if left = time.Until(until); s.localGot.Load() >= s.yieldTo.Load() || left <= 0 {
+				return
+			}
 		}
 		t := time.NewTimer(left)
 		select {
@@ -475,6 +492,22 @@ func (s *Store) localFailed() {
 
 func (s *Store) localDone() {
 	s.localRetries.Add(-1)
+	s.wakeLocal()
+}
+
+// localLockWait brackets a local write's wait for the write lock (capture).
+func (s *Store) localLockWait(waiting bool) {
+	if waiting {
+		s.localWaiting.Add(1)
+		return
+	}
+	s.localGot.Add(1)
+	s.localWaiting.Add(-1)
+	s.wakeLocal()
+}
+
+// wakeLocal wakes waitLocal to look again.
+func (s *Store) wakeLocal() {
 	s.localMu.Lock()
 	if s.localFree != nil {
 		close(s.localFree)
@@ -553,6 +586,10 @@ func (s *Store) ingestTx(ctx context.Context, ops []Op, local bool) (map[string]
 	start, hold := time.Now(), s.hold()
 	for i, op := range ops {
 		if i > 0 && time.Since(start) > hold {
+			return added, i, nil
+		}
+		if w := s.localWaiting.Load(); i > 0 && w > 0 && time.Since(start) > yieldHold {
+			s.yieldTo.Store(s.localGot.Load() + uint64(w))
 			return added, i, nil
 		}
 		if op.Seq <= s.floors[op.Site] && op.Kind != OpSchema {
