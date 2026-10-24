@@ -99,10 +99,6 @@ func init() {
 		"trigger_attach_regression.sqltest::memory::trigger-doubly-qualified-expr-runtime-error",
 		"trigger_attach_regression.sqltest::memory::trigger-doubly-qualified-when-runtime-error",
 	)
-	tsKnownGroup("2026-10-12: correlated EXISTS whose inequality compares a json_extract() value is declined",
-		"unnest-correlated.sqltest::memory::correlated-exists-inequality-expression-errors[exists][json-extract-i-json-value-o-limit-value][and-i-value-o-wanted]",
-		"unnest-correlated.sqltest::memory::correlated-exists-inequality-expression-errors[exists][o-limit-value-json-extract-i-json-value][and-i-value-o-wanted]",
-	)
 	tsKnownGroup("2026-10-12: UPDATE: a PRIMARY KEY conflict is worded \"UNIQUE constraint failed: duplicate rowid N\" instead of naming the column, and column-list SET from a star or volatile subquery is declined",
 		"update.sqltest::memory::row-values-from-subquery-star",
 		"update.sqltest::memory::row-values-from-volatile-subquery-project-same-row",
