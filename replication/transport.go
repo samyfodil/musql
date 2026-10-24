@@ -42,3 +42,11 @@ type Transport interface {
 	// when the subscription ends or the context is cancelled.
 	SubscribePush(ctx context.Context) (<-chan PeerOp, error)
 }
+
+// Broadcaster is a Transport whose push reaches every peer at once, as a
+// pubsub topic does: a commit's ops are handed to it in one call, instead of
+// PushOp once per op and peer, which on such a transport sends each op to
+// every peer once per peer.
+type Broadcaster interface {
+	PushOps(ctx context.Context, ops []Op) error
+}
