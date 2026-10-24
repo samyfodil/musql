@@ -59,6 +59,14 @@ this package pulls in none. `examples/libp2p` is a working one over libp2p.
 caller that wires its own transport loop (`WithTransport` hands it the
 `Syncer`).
 
+## Copies
+
+`replication.PlainCopy(ctx, src, dst)` writes an ordinary database: the schema
+and rows of a replicated one, without its bookkeeping or its write guard, for an
+export or a new database (`Open` on the copy makes its rows a new site's first
+ops). `src` may be open; it is only read. A withheld row is in no table, so it
+is not in the copy.
+
 ## How it works
 
 At commit, the driver hands the transaction's row changes to the capture

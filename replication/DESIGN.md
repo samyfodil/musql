@@ -104,6 +104,11 @@ without a declared key. Presence is a synthetic cell
 update, delete and resurrection. A schema op's one cell, `schema`, is a
 `schemaOp` in JSON.
 
+`PlainCopy` undoes all of it on a copy: `VACUUM INTO` through a bookkeeping
+handle (the guard refuses it to a plain one, though it only reads), then on the
+copy the guard lifted and these tables dropped, by their exact names as capture
+skips them, so a user table named `_repl_x` stays.
+
 ## HLC and ordering
 
 64-bit hybrid logical clock: 48-bit physical ms, 16-bit logical counter.
