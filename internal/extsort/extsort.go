@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"slices"
 
@@ -238,7 +239,7 @@ func ReadRecord(r *bufio.Reader, buf []byte) ([]byte, error) {
 		}
 		return buf, unexpected(err)
 	}
-	if n > 1<<40 {
+	if n > math.MaxInt32 {
 		return buf, errors.New("extsort: record length out of range")
 	}
 	buf = slices.Grow(buf[:0], int(n))[:n]
