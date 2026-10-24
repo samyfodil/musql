@@ -110,7 +110,7 @@ func sum(b []byte) []byte {
 
 func TestUploadsConfig(t *testing.T) {
 	c := must(ParseConfig([]byte("listen: \":8080\"\n")))
-	if c.Uploads.MaxBytes != 1<<30 || c.Uploads.ttl != 24*time.Hour {
+	if c.Uploads.MaxBytes != 16<<30 || c.Uploads.ttl != 24*time.Hour {
 		t.Fatalf("defaults: %+v", c.Uploads)
 	}
 	c = must(ParseConfig([]byte("uploads:\n  max_bytes: 1048576\n  ttl: 2d\n")))
@@ -127,7 +127,7 @@ func TestUploadsConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c := must(ParseConfig(example)); c.Uploads.MaxBytes != 1<<30 || c.Uploads.ttl != 24*time.Hour {
+	if c := must(ParseConfig(example)); c.Uploads.MaxBytes != 16<<30 || c.Uploads.ttl != 24*time.Hour {
 		t.Fatalf("example: %+v", c.Uploads)
 	}
 }
