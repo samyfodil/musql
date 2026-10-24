@@ -98,7 +98,8 @@ func TestInstallSegmentFile(t *testing.T) {
 }
 
 // TestPinCommittedFiles: the pinned files are the state at the pin, whatever is
-// committed and compacted after it, and a copy of them opens as that state.
+// committed and compacted after it, a copy of them opens as that state, and
+// the database's own sessions see what was committed after the pin.
 func TestPinCommittedFiles(t *testing.T) {
 	dir := t.TempDir()
 	path, pinDir, cp := filepath.Join(dir, "db.musq"), filepath.Join(dir, "pin"), filepath.Join(dir, "copy.musq")
@@ -126,11 +127,20 @@ func TestPinCommittedFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec(`INSERT INTO t VALUES(2, 'two')`, `UPDATE t SET b = 'uno' WHERE a = 1`)
+	other, err := OpenWrite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if _, _, err := other.Query(`SELECT count(*) FROM t`, nil); err != nil {
+		t.Fatal(err)
+	}
 	p, err := PinCommittedFiles(path, pinDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Delta == "" || p.DeltaLen <= segDeltaHdrSize {
+	defer p.Close()
+	if p.Delta == nil || p.DeltaLen <= segDeltaHdrSize {
 		t.Fatalf("pinned no delta: %+v", p)
 	}
 	if p.FileVersion != segFileVersion || p.DeltaVersion != segDeltaVersion {
@@ -142,20 +152,17 @@ func TestPinCommittedFiles(t *testing.T) {
 	}
 	exec(`INSERT INTO t VALUES(4, 'four')`)
 
-	copyN := func(from, to string, n int64) {
+	copyN := func(from *os.File, to string, n int64) {
 		t.Helper()
-		b, err := os.ReadFile(from)
-		if err != nil {
+		b := make([]byte, n)
+		if _, err := from.ReadAt(b, 0); err != nil {
 			t.Fatal(err)
-		}
-		if n >= 0 {
-			b = b[:n]
 		}
 		if err := os.WriteFile(to, b, 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	copyN(p.Seg, cp, -1)
+	copyN(p.Seg, cp, p.SegSize)
 	copyN(p.Delta, cp+segDeltaSuffix, p.DeltaLen)
 	var ctr uint32
 	if err := CommitState(cp, func(c CommitInfo) error { ctr = c.Counter; return nil }); err != nil {
@@ -179,5 +186,15 @@ func TestPinCommittedFiles(t *testing.T) {
 	}
 	if got != "1|uno\n2|two\n" {
 		t.Fatalf("the copy holds %q", got)
+	}
+	if _, err := other.RefreshIfStale(); err != nil {
+		t.Fatal(err)
+	}
+	_, rows, err = other.Query(`SELECT a, b FROM t ORDER BY a`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 || rows[2][0].I != 4 {
+		t.Fatalf("another session holds %v", rows)
 	}
 }
