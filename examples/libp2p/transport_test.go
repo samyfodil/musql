@@ -346,9 +346,9 @@ func TestImageOverLibp2p(t *testing.T) {
 		return n
 	}
 	waitFor(t, 30*time.Second, "b to catch up", func() bool { return rows() == 3000 })
-	if !replication.ImageInstalled(b) {
-		t.Fatal("b caught up without an image")
-	}
+	// The rows are there as soon as the image is in place, a moment before the
+	// install is counted.
+	waitFor(t, 10*time.Second, "b to count an image install", func() bool { return replication.ImageInstalled(b) })
 	if _, err := a.Exec(`UPDATE users SET age = -1 WHERE id = 'u0007'`); err != nil {
 		t.Fatal(err)
 	}
