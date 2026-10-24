@@ -117,13 +117,10 @@ func TestClusterCRDTExportIsPlain(t *testing.T) {
 		"CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", "CREATE INDEX t_v ON t(v)", "CREATE TABLE k(a, b)",
 		"INSERT INTO t(v) VALUES ('a'), ('b')", "INSERT INTO k VALUES (1, x'01'), (2.5, NULL)")
 	eventually(t, "the rows on node 1", func() bool { return nodes[1].count("app", "k") == 2 })
-	ctx := context.Background()
-	_, _, dbs := nodes[1].clients()
 	dir := t.TempDir()
 	for _, f := range []v1.FileFormat{v1.FileFormat_FILE_FORMAT_MUSQL, v1.FileFormat_FILE_FORMAT_SQLITE} {
-		out := need(dbs.Export(ctx, auth(nodes[1].admin, &v1.ExportRequest{Org: "acme", Name: "app", Format: f})))(t)
 		p := filepath.Join(dir, f.String())
-		if err := os.WriteFile(p, out.Msg.Content, 0o600); err != nil {
+		if err := os.WriteFile(p, nodes[1].export("acme", "app", f), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		if f == v1.FileFormat_FILE_FORMAT_SQLITE {
