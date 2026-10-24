@@ -180,6 +180,32 @@ func TestMultiColumnSeekMatchesTheScan(t *testing.T) {
 		}
 	}
 	check("open transaction", n.Query)
+
+	// Enough written rows, and enough seeks testing them one by one, that the
+	// store builds its own index mid-transaction (prefersEqIndex) and then has
+	// to keep it through more writes.
+	for i := 0; i < 2500; i++ {
+		if err := n.Exec(fmt.Sprintf(`INSERT INTO c VALUES('w', x'%04x', 'c%d', %d)`, i/5, i%5, 20000+i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check("a large transaction", n.Query)
+	check("a large transaction, again", n.Query)
+	if c := n.DB.findTableMeta("c"); c == nil || c.rows == nil || len(c.rows.eqIdx) == 0 {
+		t.Fatal("the store never built its own index, so the writes below test nothing new")
+	}
+	for _, s := range []string{
+		`UPDATE c SET tbl = 't', pk = x'0001', col = 'c6' WHERE tbl = 'w' AND pk = x'0010' AND col = 'c0'`,
+		`UPDATE c SET pk = x'0700' WHERE tbl = 'w' AND pk = x'0010'`,
+		`UPDATE c SET tbl = 't', col = 'c8' WHERE tbl = 'w' AND pk = x'0011' AND col = 'c0'`,
+		`DELETE FROM c WHERE tbl = 't' AND pk = x'0001' AND col = 'c2'`,
+		`UPDATE c SET pk = x'0002' WHERE tbl = 'u' AND pk = x'0002' AND col = 'c7'`,
+	} {
+		if err := n.Exec(s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+	check("a large transaction, after more writes", n.Query)
 }
 
 // TestMultiColumnSeekPlan pins EXPLAIN QUERY PLAN for the composite-key shapes
