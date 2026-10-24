@@ -239,6 +239,10 @@ type segDeltaState struct {
 	// every batch's length prefix (segDeltaLenWidth).
 	version uint32
 
+	// heap is how many of the delta's bytes the rows here alias on the heap
+	// rather than in mapping: the batches catch-ups folded in (Session.caughtUp).
+	heap int64
+
 	// mapping, when set, is the mapped delta the replayed rows alias: they decode
 	// with their bytes left in place (decodeRecord), so the log is never on the
 	// heap. It lives exactly as long as the pager that holds this state, and is
