@@ -16,6 +16,7 @@ import (
 	"github.com/go-jose/go-jose/v4/jwt"
 
 	sqliteconv "github.com/samyfodil/musql/convert/sqlite"
+	"github.com/samyfodil/musql/replication"
 
 	v1 "github.com/samyfodil/musql/cloud/gen/cloud/v1"
 	"github.com/samyfodil/musql/cloud/gen/cloud/v1/cloudv1connect"
@@ -469,15 +470,18 @@ func (s *Server) exportFile(ctx context.Context, d *state.Database, format v1.Fi
 		return "", nil, rpcErr(err)
 	}
 	cleanup = func() { os.RemoveAll(tmp) }
-	// VACUUM INTO takes a consistent copy while the database stays live.
+	// VACUUM INTO takes a consistent copy while the database stays live. A
+	// crdt database's is a plain copy: replication's bookkeeping stays behind.
 	snap := filepath.Join(tmp, "db.musq")
-	db, err := sql.Open("sqlite", s.dbPath(d))
-	if err != nil {
-		cleanup()
-		return "", nil, rpcErr(err)
+	if d.Type == state.TypeCRDT {
+		err = replication.PlainCopy(ctx, s.dbPath(d), snap)
+	} else {
+		var db *sql.DB
+		if db, err = sql.Open("sqlite", s.dbPath(d)); err == nil {
+			_, err = db.ExecContext(ctx, `VACUUM INTO '`+strings.ReplaceAll(snap, "'", "''")+`'`)
+			db.Close()
+		}
 	}
-	_, err = db.ExecContext(ctx, `VACUUM INTO '`+strings.ReplaceAll(snap, "'", "''")+`'`)
-	db.Close()
 	if err != nil {
 		cleanup()
 		return "", nil, rpcErr(err)
