@@ -77,8 +77,9 @@ func multiColSeekQueries() []multiColSeekQuery {
 // TestMultiColumnSeekMatchesTheScan: an equality on several columns is answered
 // from whichever column's posting list the segments say is smallest. Each query,
 // literal and bound, is compared with the same SQL compiled with no index seek:
-// over segments, over rows the log holds, and inside a transaction whose own
-// rows are not committed.
+// over segments, over rows the log holds -- through a session, which loads the
+// table, and through a read-only pager, which reads the log beside the segments
+// -- and inside a transaction whose own rows are not committed.
 func TestMultiColumnSeekMatchesTheScan(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "m.musq")
 	buildDB(t, path, multiColSeekSchema()...)
@@ -94,7 +95,7 @@ func TestMultiColumnSeekMatchesTheScan(t *testing.T) {
 		}
 		return b.String()
 	}
-	check := func(stage string, n *Session) {
+	check := func(stage string, query func(string, []Value) ([]string, [][]Value, error)) {
 		t.Helper()
 		segMultiKeySeeksServed.Store(0)
 		for _, q := range multiColSeekQueries() {
@@ -102,15 +103,20 @@ func TestMultiColumnSeekMatchesTheScan(t *testing.T) {
 				sql  string
 				args []Value
 			}{{q.lit, nil}, {q.bound, q.args}} {
-				_, got, err := n.Query(form.sql, form.args)
+				_, got, err := query(form.sql, form.args)
 				if err != nil {
 					t.Fatalf("%s %s: %v", stage, form.sql, err)
 				}
+				// Spelled differently, so no cached plan of the seek answers it.
+				served := segIndexSeeksServed.Load()
 				indexSeeksOffForTest = true
-				_, want, err := n.Query(form.sql, form.args)
+				_, want, err := query(form.sql+" /* no seek */", form.args)
 				indexSeeksOffForTest = false
 				if err != nil {
 					t.Fatalf("%s %s with no seek: %v", stage, form.sql, err)
+				}
+				if segIndexSeeksServed.Load() != served {
+					t.Fatalf("%s %s: the reference seeked too", stage, form.sql)
 				}
 				if render(got) != render(want) {
 					t.Errorf("%s %s %v:\n seek %.300q\n scan %.300q", stage, form.sql, form.args, render(got), render(want))
@@ -126,22 +132,33 @@ func TestMultiColumnSeekMatchesTheScan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	check("segments", n)
+	check("segments", n.Query)
 	n.Discard()
 
+	// The log's rows are tested against each probe rather than unioned whole, so
+	// rows move both into and out of probed keys here.
 	execDB(t, path,
 		`INSERT INTO c VALUES('t', x'0001', 'c9', 9001)`,
 		`UPDATE c SET v = -v WHERE tbl = 't' AND pk = x'0004'`,
 		`DELETE FROM c WHERE pk = x'0002' AND col = 'c0'`,
+		`UPDATE c SET pk = x'0001', col = 'c7' WHERE pk = x'0100' AND col = 'c3'`,
+		`UPDATE c SET pk = x'0300' WHERE pk = x'0003' AND col = 'c2'`,
 		`INSERT INTO e VALUES(5, 'NAME9', 1.5, 9002)`,
 		`UPDATE e SET b = 'name1x' WHERE a = 7 AND b = 'Name1'`,
+		`UPDATE e SET a = 6, b = 'Moved', r = 1.5 WHERE a = 9 AND b = 'Name2'`,
 		`INSERT INTO x VALUES(1, 'abd', 9003)`)
 	n, err = OpenWrite(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	check("log", n)
+	check("log", n.Query)
 	n.Discard()
+	p, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check("log, read-only", p.QueryArgs)
+	p.Close()
 
 	n, err = OpenWrite(path)
 	if err != nil {
@@ -162,7 +179,7 @@ func TestMultiColumnSeekMatchesTheScan(t *testing.T) {
 			t.Fatalf("%s: %v", s, err)
 		}
 	}
-	check("open transaction", n)
+	check("open transaction", n.Query)
 }
 
 // TestMultiColumnSeekPlan pins EXPLAIN QUERY PLAN for the composite-key shapes
