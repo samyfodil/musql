@@ -312,17 +312,25 @@ func TestImageOverLibp2p(t *testing.T) {
 	hA, hB := newHost(t), newHost(t)
 	connectHosts(t, hA, hB)
 	a := openUsers(t, hA, "a", "image-test")
-	tx, err := a.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := range 3000 { // more ops than an empty node pulls one by one
-		if _, err := tx.Exec(`INSERT INTO users VALUES(?, 'n', ?)`, fmt.Sprintf("u%04d", i), i); err != nil {
+	// a's own sync round may commit while the transaction is open, which then
+	// cannot commit; it is tried again.
+	for try := 1; ; try++ {
+		tx, err := a.Begin()
+		if err != nil {
 			t.Fatal(err)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+		for i := range 3000 { // more ops than an empty node pulls one by one
+			if _, err := tx.Exec(`INSERT INTO users VALUES(?, 'n', ?)`, fmt.Sprintf("u%04d", i), i); err != nil {
+				t.Fatal(err)
+			}
+		}
+		err = tx.Commit()
+		if err == nil {
+			break
+		}
+		if try == 5 {
+			t.Fatal(err)
+		}
 	}
 	b, err := replication.Open(context.Background(), filepath.Join(t.TempDir(), "b.db"), replication.CRDT(),
 		replp2p.Sync(hB, "image-test"), replication.WithSyncInterval(200*time.Millisecond))
