@@ -272,7 +272,7 @@ func TestExplainQueryPlanCompound(t *testing.T) {
 			"4|1|UNION ALL", "5|4|SCAN u", "6|1|UNION ALL", "7|6|SCAN t",
 		}},
 		{`EXPLAIN QUERY PLAN SELECT a FROM t WHERE b=3 UNION ALL SELECT 1`, []string{
-			"1|0|COMPOUND QUERY", "2|1|LEFT-MOST SUBQUERY", "3|2|SEARCH t USING INDEX i1 (b=?)",
+			"1|0|COMPOUND QUERY", "2|1|LEFT-MOST SUBQUERY", "3|2|SEARCH t USING COVERING INDEX i1 (b=?)",
 			"4|1|UNION ALL", "5|4|SCAN CONSTANT ROW",
 		}},
 	} {
