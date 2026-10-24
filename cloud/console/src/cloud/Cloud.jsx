@@ -1,6 +1,6 @@
 // The console's cloud section: the side list (org switcher and pages) and the
 // pages of a musql cloud server, over the management API.
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { BarChart3, Boxes, Building2, Database, KeyRound, LogOut, MapPin, Settings, Users, UserCog } from "lucide-react";
 import Drawer from "../components/Drawer.jsx";
@@ -10,6 +10,7 @@ import { Spinner } from "../components/Busy.jsx";
 import { fmt } from "../values.js";
 import { Access, api, databaseToken, date, DatabaseType, FileFormat, message, Role, ROLES, roleName, stamp, typeName, unimplemented } from "./api.js";
 import { server, signIn, signOut } from "./auth.js";
+import { cancelled, downloadExport, uploadFile } from "./transfer.js";
 
 export const PAGES = [
 	["databases", "Databases", <Database size={14} />],
@@ -196,6 +197,7 @@ function Databases({ cloud, toast, onOpen, setPage, current }) {
 	const org = cloud.org;
 	const [s, reload] = useLoad(() => api.db.list({ org }).then((r) => r.databases), [org]);
 	const [drawer, setDrawer] = useState(null); // {create} | {token: db} | {rename: db} | {del: db}
+	const [xfer, setXfer] = useState(null); // an export under way: {label, done, total, cancel}
 	const dbs = s.data ?? [];
 	const member = can(cloud, Role.MEMBER);
 
@@ -232,15 +234,20 @@ function Databases({ cloud, toast, onOpen, setPage, current }) {
 		}
 	}
 	async function exportAs(d, format) {
+		if (xfer) return;
+		const name = `${d.name}.${format === FileFormat.SQLITE ? "sqlite" : "musq"}`;
+		const ctl = new AbortController();
+		setXfer({ label: `Exporting ${name}`, done: 0, total: 0, cancel: () => ctl.abort() });
 		try {
-			const r = await api.db.export({ org, name: d.name, format });
-			const a = document.createElement("a");
-			a.href = URL.createObjectURL(new Blob([r.content]));
-			a.download = `${d.name}.${format === FileFormat.SQLITE ? "sqlite" : "musq"}`;
-			a.click();
-			setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+			await downloadExport(api.db, { org, name: d.name, format }, name, {
+				signal: ctl.signal,
+				onProgress: (done, total) => setXfer((x) => x && { ...x, done, total }),
+			});
+			toast(`Exported ${name}.`);
 		} catch (e) {
-			toast(unimplemented(e) ? NA : message(e), true);
+			if (!cancelled(e)) toast(unimplemented(e) ? NA : message(e), true);
+		} finally {
+			setXfer(null);
 		}
 	}
 	async function invalidate(d) {
@@ -258,6 +265,7 @@ function Databases({ cloud, toast, onOpen, setPage, current }) {
 			<Head title="Databases" sub={`${org} · served over Hrana at ${server}/db/${org}/<name>`}>
 				{member && <button className="primary" onClick={() => setDrawer({ create: true })}>New database</button>}
 			</Head>
+			{xfer && <Transfer x={xfer} />}
 			<Loaded s={s} empty={s.data && !dbs.length && "No databases yet. Create one, or upload a .sqlite or .musq file."}>
 				<table className="cloudtable">
 					<thead><tr><th>Name</th><th>Type</th><th>Group</th><th className="num">Size</th><th>Created</th><th /></tr></thead>
@@ -278,8 +286,8 @@ function Databases({ cloud, toast, onOpen, setPage, current }) {
 										member && d.type !== DatabaseType.CRDT && { label: "Branch…", onClick: () => setDrawer({ create: { branch: d.name } }) },
 										member && d.type !== DatabaseType.CRDT && { label: "Restore to a time…", onClick: () => setDrawer({ create: { restore: d.name } }) },
 										"-",
-										{ label: "Export as musql", hint: ".musq", disabled: !member, onClick: () => exportAs(d, FileFormat.MUSQL) },
-										{ label: "Export as SQLite", hint: ".sqlite", disabled: !member, onClick: () => exportAs(d, FileFormat.SQLITE) },
+										{ label: "Export as musql", hint: ".musq", disabled: !member || !!xfer, onClick: () => exportAs(d, FileFormat.MUSQL) },
+										{ label: "Export as SQLite", hint: ".sqlite", disabled: !member || !!xfer, onClick: () => exportAs(d, FileFormat.SQLITE) },
 										"-",
 										member && { label: "Invalidate all tokens…", onClick: () => invalidate(d) },
 										member && { label: "Rename…", onClick: () => setDrawer({ rename: d }) },
@@ -307,11 +315,21 @@ function CreateDb({ org, dbs, initial, toast, onClose }) {
 	const [parent, setParent] = useState(initial.branch ?? initial.restore ?? dbs[0]?.name ?? "");
 	const [at, setAt] = useState("");
 	const [busy, setBusy] = useState(false);
+	const [sent, setSent] = useState(null); // an upload under way: {done, total}
+	const ctl = useRef(null);
 	const [groups] = useLoad(() => api.groups.list({ org }).then((r) => r.groups), [org]);
+	// Closing stops an upload under way; the server drops what it holds in time.
+	const close = (made) => {
+		ctl.current?.abort();
+		onClose(made);
+	};
 
 	const ok = name.trim() && !busy && (source !== "upload" || file) && (source === "empty" || source === "upload" || parent) && (source !== "restore" || at);
 	async function go() {
+		// Not after the file has gone up.
+		if (source === "upload" && dbs.some((d) => d.name === name.trim())) return toast(`A database named ${name.trim()} exists.`, true);
 		setBusy(true);
+		setSent(null);
 		try {
 			let r;
 			if (source === "restore") {
@@ -319,7 +337,8 @@ function CreateDb({ org, dbs, initial, toast, onClose }) {
 			} else {
 				const req = { org, name: name.trim(), group };
 				if (source === "upload") {
-					const up = await api.db.upload({ org, content: new Uint8Array(await file.arrayBuffer()) });
+					ctl.current = new AbortController();
+					const up = await uploadFile(api.db, org, file, { signal: ctl.current.signal, onProgress: (done, total) => setSent({ done, total }) });
 					req.source = { case: "upload", value: up.upload };
 				} else if (source === "branch") {
 					req.source = { case: "branchOf", value: parent };
@@ -330,13 +349,14 @@ function CreateDb({ org, dbs, initial, toast, onClose }) {
 			toast(`Created ${r.database.name}.`);
 			onClose(true);
 		} catch (e) {
+			if (cancelled(e)) return;
 			toast(unimplemented(e) ? `${source === "restore" ? "Restore" : source === "branch" ? "Branching" : "That"} is not available on this server.` : message(e), true);
 		} finally {
 			setBusy(false);
 		}
 	}
 	return (
-		<Drawer title="New database" subtitle={org} onClose={() => onClose(false)} footer={<><span className="grow" /><button onClick={() => onClose(false)}>Cancel</button><button className="primary" disabled={!ok} onClick={go}>{busy ? <><span className="spinner inline" /> Creating</> : "Create"}</button></>}>
+		<Drawer title="New database" subtitle={org} onClose={() => close(false)} footer={<><span className="grow" /><button onClick={() => close(false)}>Cancel</button><button className="primary" disabled={!ok} onClick={go}>{busy ? <><span className="spinner inline" /> {sent && sent.done < sent.total ? "Uploading" : "Creating"}</> : "Create"}</button></>}>
 			<form className="form" onSubmit={(e) => { e.preventDefault(); ok && go(); }}>
 				<Field label="Name"><input spellCheck={false} placeholder="my-db" value={name} onChange={(e) => setName(e.target.value)} /></Field>
 				<div className="ffield">
@@ -368,7 +388,21 @@ function CreateDb({ org, dbs, initial, toast, onClose }) {
 				)}
 				<button type="submit" hidden />
 			</form>
+			{busy && sent && <Transfer x={{ label: `Uploading ${file?.name ?? ""}`, ...sent }} />}
 		</Drawer>
+	);
+}
+
+/** A transfer under way: what it is, a bar, how much, and a way to stop it. */
+function Transfer({ x }) {
+	const known = x.total > 0;
+	return (
+		<div className="xfer" role="status">
+			<span className="xfer-label">{x.label}</span>
+			<progress max={known ? x.total : undefined} value={known ? x.done : undefined} />
+			<span className="dim small">{known ? `${bytes(x.done)} of ${bytes(x.total)}` : bytes(x.done)}</span>
+			{x.cancel && <button onClick={x.cancel}>Cancel</button>}
+		</div>
 	);
 }
 

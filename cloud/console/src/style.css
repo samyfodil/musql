@@ -802,6 +802,10 @@ table.cloudtable { width: 100%; border-collapse: collapse; }
 .cloud-none { display: grid; justify-items: center; gap: 6px; padding: 48px 20px; border: 1px dashed var(--line); border-radius: var(--radius); text-align: center; }
 .cloud-none p { margin: 0; }
 .cloud-empty { display: grid; justify-items: center; gap: 6px; }
+.xfer { display: flex; align-items: center; gap: 10px; padding: 8px 12px; margin-bottom: 12px; border: 1px solid var(--line); border-radius: var(--radius); }
+.xfer-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40%; }
+.xfer progress { flex: 1; min-width: 80px; accent-color: var(--accent); }
+.drawer-body > .xfer { margin: 12px 0 0; }
 .chip { display: inline-flex; align-items: center; gap: 2px; padding: 0 2px 0 7px; margin: 0 4px 2px 0; border: 1px solid var(--line); border-radius: 6px; font-size: 12px; }
 .chip .x { border: 0; background: transparent; padding: 0 4px; color: var(--dim); }
 .secret { padding: 10px 12px; background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius); word-break: break-all; font-size: 12px; user-select: all; }

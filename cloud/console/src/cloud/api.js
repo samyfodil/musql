@@ -23,9 +23,11 @@ const bearer = (next) => async (req) => {
 	try {
 		return await next(req);
 	} catch (e) {
-		// A token revoked or expired early: one refresh, one retry.
+		// A token revoked or expired early: one refresh, one retry. A stream's
+		// request is spent once sent, so its caller is the one to try again.
 		if (ConnectError.from(e).code !== Code.Unauthenticated) throw e;
 		await refresh();
+		if (req.stream) throw e;
 		req.header.set("Authorization", `Bearer ${await token()}`);
 		return next(req);
 	}

@@ -20,6 +20,7 @@
     "@fontsource-variable/geist-mono": "^5.3.0",
     "@huggingface/transformers": "^3.8.1",
     "@libsql/client": "0.18.0",
+    "@noble/hashes": "2.4.0",
     "@samyfodil/musql": "file:../../npm",
     "@uiw/react-codemirror": "^4.23.0",
     "@xyflow/react": "^12.12.0",
