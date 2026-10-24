@@ -247,10 +247,17 @@ peers:
   lives in; nothing is forwarded.
 - **History is per node.** Each node logs its own file's physical history
   (`cloud/store`), as standalone does: what that node's copy held, with its
-  replication bookkeeping. Restore and branch of a `crdt` database are
-  declined for now: a restored copy carries the node's site and op log, and
-  bringing it back into a replicated group is a replication operation of its
-  own (an op-log rewind), not a file copy. Export reads the local copy.
+  replication bookkeeping. A restored file carries the node's site and op
+  log, so none goes back into a replicated group as a file: export, branch
+  and restore take a **plain copy** (`replication.PlainCopy`: the schema and
+  rows, without the bookkeeping or the capture guard) of this node's file or
+  of its history at T. Export is the plain copy of the local file. A branch
+  or a restore into a new database is a new `crdt` database made on this
+  node from the plain copy, whose rows become its first ops. A restore in
+  place writes the difference between now and T through the replicated
+  handle, in one transaction, so every node converges to T plus the writes
+  made concurrently; it is declined across a schema change or while a row is
+  withheld. See `HISTORY.md`, "Per node, and `crdt` databases".
 
 #### What a `crdt` database refuses
 
@@ -313,9 +320,10 @@ name:
   retries.
 
 Declined, deliberately: `raft` databases (and with them linearizable
-multi-node writes); `plain` databases in a cluster; restore and branch of
-`crdt` databases; a standalone node joining a cluster in place; a usage view
-that counts more than the nodes have synced.
+multi-node writes); `plain` databases in a cluster; an in-place restore of a
+`crdt` database across a schema change or with a row withheld (restore into a
+new database instead); a standalone node joining a cluster in place; a usage
+view that counts more than the nodes have synced.
 
 ## Usage analytics
 

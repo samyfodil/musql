@@ -125,12 +125,79 @@ rowids, triggers, vtab shadow tables and all.
   (`sqlite_%`) and shadow tables (`PRAGMA table_list` type `shadow`, which the
   virtual table recreates itself).
 
-## Per node
+## Per node, and `crdt` databases
 
 In a cluster a `crdt` database is a file on each node of its group, written
 by replication; each node logs its own file's history as above. The logs are
 not shipped between nodes and are not each other's: a node's log holds what
-its copy held, bookkeeping included. See `DESIGN.md`, Deployments.
+its copy held, bookkeeping included (replication's `_repl_*` tables and the
+file's capture guard). See `DESIGN.md`, Deployments.
+
+So no restored file goes back into a replicated group as it is: it carries
+this node's site id and op log, and a second file under one site is two
+writers of one log. A `crdt` database's export, branch and restore go
+through a **plain copy** instead.
+
+### Plain copy
+
+`replication.PlainCopy(ctx, src, dst)` writes `dst`, an ordinary database
+holding `src`'s schema and rows: `VACUUM INTO` (one consistent read, so `src`
+may be live; it is never written), then on the copy the bookkeeping tables are
+dropped, exactly replication's own names, so a user table that merely starts
+with `_repl_` stays, and the capture guard is lifted. Rowids, `user_version`
+and `sqlite_sequence` come along as `VACUUM INTO` keeps them. A row withheld by
+a UNIQUE conflict (`replication.Withheld`) is in no table, so it is in no
+plain copy.
+
+- **Export** is the plain copy of this node's file.
+- **Branch** (now or at T) and **restore into a new database**: this node's
+  history at T is restored to a scratch file and plain-copied into the new
+  database's file (a schema-only branch then keeps only its schema), which is
+  opened through replication here: what a database holds before its first
+  `Open` becomes that node's first ops (a keyless table's rowids are
+  renumbered into the new site's range). The new database is `crdt`, in the
+  parent's group unless one is named; it is made on this node, so both the
+  parent (its history is here) and the new database's group must be placed
+  here, as for an upload. The group's other nodes sync it like any database
+  newly placed there. A point from before this node's first sync completed
+  holds what the node held then: part of the database.
+
+### Restore in place
+
+The file is not replaced: it is the replicated state every peer's version
+vector points at. A restore to T is ordinary writes through the database's
+replicated `*sql.DB`, in one transaction, so it is never half done:
+
+1. this node's history at T is restored to a scratch file and plain-copied;
+2. in the transaction, `sqlite_schema` less the engine's `sqlite_` objects
+   must equal T's (the bookkeeping is on both sides), else it is declined:
+   "the schema changed since <T>: restore into a new database";
+3. it is declined as well when a row is withheld, at T or now: a withheld row
+   is alive in the clock and in no table, so a table diff can neither bring it
+   back as it was nor delete it;
+4. each table's rows are matched by replication's identity, the declared
+   primary key or else the rowid, and compared value for value, types
+   included (generated columns follow the others). A row only now is deleted,
+   a row only at T is inserted (a keyless table's with its rowid, which is its
+   identity), and a row in both has the columns that differ updated;
+5. commit. `ErrBusy` (a peer's op or a local write landed meanwhile) runs the
+   diff again on the new state, a few times before giving up.
+
+The writes are captured like any others, with fresh HLCs, and win
+last-writer-wins on every node: every node converges to the state at T plus
+the writes made concurrently with the restore, and a cell the restore did not
+change keeps any concurrent write to it. The restore is a commit like others,
+so the history stays linear and a restore to before it undoes it.
+
+- **UNIQUE**: deletes run first and inserts last. An update that fails on a
+  UNIQUE value another changed row still holds (two rows trading a value) is
+  undone and that row is deleted, then inserted with its values at T. From
+  then on the table is a subset of T's, which held every UNIQUE constraint, so
+  no insert can conflict.
+- Foreign keys are off on the restore's connection (a cascade would delete
+  rows it then brings back) and CHECK constraints are not checked (a merge may
+  have broken a multi-column CHECK at T, as replication's apply allows). The
+  connection is closed afterwards, so no client inherits either setting.
 
 ## Concurrency
 
