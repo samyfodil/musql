@@ -3,6 +3,8 @@ package replication
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"sync"
 )
 
@@ -236,6 +238,29 @@ func (t *memTransport) GetSnapshot(ctx context.Context, peer PeerID, part int, c
 		return SnapshotPage{}, errors.New("peer not found")
 	}
 	return peerNode.src.SnapshotPage(part, cursor)
+}
+
+// ImageSource is an OpSource that serves its database's image (Store.Image).
+type ImageSource interface {
+	Image(ctx context.Context, req ImageRequest) (ImageManifest, io.ReadCloser, error)
+}
+
+// GetImage fetches a peer's image.
+func (t *memTransport) GetImage(ctx context.Context, peer PeerID, req ImageRequest) (ImageManifest, io.ReadCloser, error) {
+	if t.net.isPartitioned(t.localID, peer) {
+		return ImageManifest{}, nil, errPartitioned
+	}
+	t.net.mu.RLock()
+	peerNode, ok := t.net.nodes[peer]
+	t.net.mu.RUnlock()
+	if !ok {
+		return ImageManifest{}, nil, errors.New("peer not found")
+	}
+	src, ok := peerNode.src.(ImageSource)
+	if !ok {
+		return ImageManifest{}, nil, fmt.Errorf("%w: the peer serves none", ErrImageRefused)
+	}
+	return src.Image(ctx, req)
 }
 
 // PushOp sends an operation to a peer.

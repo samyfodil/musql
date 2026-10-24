@@ -70,6 +70,8 @@ type Store struct {
 	// ownSeq is the highest seq of this site's that a local commit here, or the
 	// log at open, holds (capture.lastSeq).
 	ownSeq atomic.Uint64
+	// pins hold prune at the cuts of the images being sent (image.go).
+	pins []*imagePin
 }
 
 // begin starts a store transaction: BEGIN IMMEDIATE on a connection of the
