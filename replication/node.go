@@ -98,6 +98,11 @@ func (n *Node) Broadcast(ops []Op) {
 // each page is applied in one transaction.
 const opsPerFetch = 512
 
+// pruneEvery is how many sync rounds run between two prunes, after the first
+// round's. A prune that frees anything is a commit, and every explicit
+// transaction open on the database at the time then fails at its own COMMIT.
+const pruneEvery = 10
+
 // maxPushBatch caps how many pushed ops one transaction applies.
 const maxPushBatch = 512
 
@@ -175,7 +180,7 @@ func (n *Node) Run(ctx context.Context, syncInterval time.Duration) error {
 	}
 	ticker := time.NewTicker(syncInterval)
 	defer ticker.Stop()
-	for {
+	for round := 0; ; {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -189,9 +194,12 @@ func (n *Node) Run(ctx context.Context, syncInterval time.Duration) error {
 			if err := n.Sync(ctx); err != nil {
 				log.Printf("replication: sync round: %v", err)
 			}
-			if err := n.store.prune(ctx); err != nil {
-				log.Printf("replication: prune: %v", err)
+			if round%pruneEvery == 0 {
+				if err := n.store.prune(ctx); err != nil {
+					log.Printf("replication: prune: %v", err)
+				}
 			}
+			round++
 		}
 	}
 }

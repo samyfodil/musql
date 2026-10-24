@@ -240,6 +240,7 @@ func (n *Node) snapshotOps(ctx context.Context, peer PeerID) error {
 // mergeCells merges a peer's clock cells, each only where it is the newer
 // writer.
 func (s *Store) mergeCells(ctx context.Context, cells []ClockCell) error {
+	s.waitLocal()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.begin(ctx)

@@ -62,6 +62,7 @@ func vvEqual(a, b VersionVector) bool {
 // prune deletes, per site, the row and ack ops at or below the frontier, and
 // raises the site's floor to it.
 func (s *Store) prune(ctx context.Context) error {
+	s.waitLocal()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	acks := map[string]VersionVector{s.site: s.vv.Clone()}
