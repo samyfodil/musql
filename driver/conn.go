@@ -1094,7 +1094,25 @@ func (c *Conn) execArgsBody(sqlText string, args []engine.Value) (driver.Result,
 	// (sessionDB), so the retry runs against the other writer's committed
 	// state, exactly like real
 	// SQLite's busy handler re-running the statement.
+	//
+	// A RETRY HOLDS THE WRITE LOCK from before that revalidation to its commit,
+	// as BEGIN IMMEDIATE does (execTxnStmt), which C's writer holds from its
+	// first write. The first attempt runs unlocked, and loses only to a commit
+	// landing while it runs; run unlocked again beside a connection committing
+	// back to back, every attempt lasted as long as the gap between two of its
+	// commits and lost again, until the busy timeout failed the statement.
+	attempt := 0
 	err := busyRetry(c.pragmaState.BusyTimeout(), func() error {
+		if attempt++; attempt > 1 && targetPath == c.path {
+			nw, err := c.session()
+			if err != nil {
+				return err
+			}
+			if err := nw.BeginWriteTxn(false); err != nil {
+				return err
+			}
+			defer nw.EndWriteTxn()
+		}
 		db, err := c.openWriteOrCreatePath(targetPath)
 		if err != nil {
 			return err
