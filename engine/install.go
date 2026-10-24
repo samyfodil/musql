@@ -4,7 +4,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/samyfodil/musql/internal/fsio"
 )
@@ -64,6 +66,69 @@ func InstallSegmentFile(path, src string, counter uint32) error {
 		}
 		return syncDir(path)
 	})
+}
+
+// PinnedFiles is a database's committed state as files that keep it whatever
+// the database commits or compacts after: hard links to its segment file and
+// its delta, of which the first DeltaLen bytes are the state, and the formats
+// the two were written in.
+type PinnedFiles struct {
+	Seg, Delta                string // Delta is "" when the state has none
+	DeltaLen                  int64
+	Counter                   uint32
+	FileVersion, DeltaVersion uint32
+}
+
+// PinCommittedFiles links path's committed state into dir, which must be on
+// path's filesystem, holding the shared lock so that no commit lands
+// meanwhile. The links keep the state: a commit after appends to the delta past
+// DeltaLen, and a compaction replaces both files by rename. A filesystem
+// without hard links is an error.
+func PinCommittedFiles(path, dir string) (PinnedFiles, error) {
+	p := PinnedFiles{Seg: filepath.Join(dir, filepath.Base(path))}
+	err := withSegmentReadLock(path, func() error {
+		info, err := commitStateUnlocked(path)
+		if err != nil {
+			return err
+		}
+		p.Counter, p.DeltaLen = info.Counter, info.DeltaEnd
+		if err := os.Link(path, p.Seg); err != nil {
+			return err
+		}
+		if p.DeltaLen == 0 {
+			return nil
+		}
+		p.Delta = segDeltaPath(p.Seg)
+		return os.Link(segDeltaPath(path), p.Delta)
+	})
+	if err == nil {
+		p.FileVersion, err = headerVersion(p.Seg, segFileMagic)
+	}
+	if err == nil && p.Delta != "" {
+		p.DeltaVersion, err = headerVersion(p.Delta, segDeltaMagic)
+	}
+	if err != nil {
+		return PinnedFiles{}, err
+	}
+	return p, nil
+}
+
+// headerVersion is the format version in the header of the file at path,
+// which starts with magic.
+func headerVersion(path, magic string) (uint32, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	var b [8]byte
+	if _, err := io.ReadFull(f, b[:]); err != nil {
+		return 0, err
+	}
+	if string(b[:4]) != magic {
+		return 0, fmt.Errorf("engine: %s: bad magic %q", path, b[:4])
+	}
+	return binary.LittleEndian.Uint32(b[4:]), nil
 }
 
 // setSegFileCounter rewrites the change counter in the header of the segment
