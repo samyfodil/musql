@@ -1,6 +1,9 @@
 package engine
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
 // A seek that skips a row C reads, or reads a row C skips, changes no answer:
 // every conjunct stays in the WHERE and is tested on every row the seek hands
@@ -121,14 +124,43 @@ type seekGuard struct {
 	access                wherePlanAccess
 }
 
+// holdsCorrelatedSelect reports whether e holds a sub-select a name of which
+// resolves outside it: C's EP_VarSelect, which marks the term TERM_VARSELECT
+// and has wherecode.c test it after every other term. A sub-select that names
+// nothing outside itself is coded in place, like any other term.
+//
+// A name or FROM item the walk cannot resolve exactly leaves the term counted
+// as tested in place, as does a correlated sub-select nested in one that is
+// not (C marks the term for it too, bVarSelect): the seek is then declined.
+func (c *compiler) holdsCorrelatedSelect(e Expr) bool {
+	if c == nil || c.pager == nil || !containsSubquery(e) {
+		return false
+	}
+	inTrigger := enclosingTriggerCtx(c) != nil
+	correlated := false
+	wherePlanSubqueryNames(c.pager, e, func(ce ColumnExpr) bool {
+		// Not an enclosing query's: a bare TRUE, FALSE or double-quoted string
+		// that names no column is a literal, and a trigger's NEW and OLD are
+		// found before lookupName climbs.
+		switch {
+		case ce.FallbackLiteral != nil:
+		case inTrigger && ce.Schema == "" && (equalFoldName(ce.Qualifier, "new") || equalFoldName(ce.Qualifier, "old")):
+		default:
+			correlated = true
+		}
+		return true
+	})
+	return correlated
+}
+
 // newSeekGuard reads where, split into its top-level conjuncts, for source i.
-// A conjunct holding a sub-select is left out: C tests one that is correlated
-// after every other term (TERM_VARSELECT), so after the key too.
+// A conjunct holding a correlated sub-select is left out: C tests it after
+// every other term (TERM_VARSELECT), so after the key too.
 func newSeekGuard(c *compiler, srcs []joinSource, i int, cjs []Expr) seekGuard {
 	g := seekGuard{raiseAt: -1, tableRaiseAt: -1}
 	scopes := tableScopesOf(srcs)
 	for pos, cj := range cjs {
-		if !exprMayRaise(cj) || containsSubquery(cj) {
+		if !exprMayRaise(cj) || c.holdsCorrelatedSelect(cj) {
 			continue
 		}
 		if hoist, _ := constWhereTerm(cj, scopes, false); hoist {
@@ -217,14 +249,7 @@ func consumedFirst(c *compiler, srcs []joinSource, terms []Expr) []Expr {
 	if len(srcs) != 1 || len(terms) < 2 {
 		return terms
 	}
-	raising := false
-	for _, cj := range terms {
-		if exprMayRaise(cj) && !containsSubquery(cj) {
-			raising = true
-			break
-		}
-	}
-	if !raising {
+	if !slices.ContainsFunc(terms, exprMayRaise) {
 		return terms
 	}
 	a := seekAccessOf(c, srcs, 0)

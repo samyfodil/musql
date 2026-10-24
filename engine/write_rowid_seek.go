@@ -1,6 +1,9 @@
 package engine
 
-import "sync/atomic"
+import (
+	"slices"
+	"sync/atomic"
+)
 
 // A rowid point lookup for a write.
 //
@@ -130,7 +133,7 @@ func (db *DB) emitWriteIndexSeekHint(c *compiler, tbl *tableMeta, cursor int, fr
 	cjs := splitTopLevelAnd(where)
 	guard := seekGuard{raiseAt: -1, tableRaiseAt: -1}
 	for pos, cj := range cjs {
-		if exprMayRaise(cj) && !containsSubquery(cj) && writeConjunctPerRow(cj) {
+		if exprMayRaise(cj) && !c.holdsCorrelatedSelect(cj) && writeConjunctPerRow(cj) {
 			guard.raiseAt, guard.tableRaiseAt = pos, pos
 			guard.access = db.writeLoopAccess(tbl, from, where, trig)
 			break
@@ -170,14 +173,7 @@ func (db *DB) writeConsumedFirst(c *compiler, tbl *tableMeta, cursor int, from F
 	if len(terms) < 2 {
 		return loopWhere
 	}
-	raising := false
-	for _, cj := range terms {
-		if exprMayRaise(cj) && !containsSubquery(cj) {
-			raising = true
-			break
-		}
-	}
-	if !raising {
+	if !slices.ContainsFunc(terms, exprMayRaise) {
 		return loopWhere
 	}
 	a := db.writeLoopAccess(tbl, from, where, trig)
@@ -227,9 +223,10 @@ func writeEqualityOnColumn(c *compiler, tbl *tableMeta, cursor int, cj Expr, col
 }
 
 // writeConjunctPerRow reports whether a write tests conjunct e on every row
-// rather than once before its loop: it names a column.
+// rather than once before its loop: it names a column, or holds a sub-select,
+// which C does not hoist.
 func writeConjunctPerRow(e Expr) bool {
-	named := false
+	named := containsSubquery(e)
 	forEachColumnRef(e, func(ColumnExpr) { named = true })
 	return named
 }
