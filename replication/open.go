@@ -333,7 +333,10 @@ func setGuard(ctx context.Context, db *sql.DB) error {
 // CHECK constraints: each write was checked where it was made, and a row merged
 // from two of them may break a CHECK neither did -- applied, every node holds
 // it; refused, the op would fail on every node forever. Foreign keys are off on
-// it as on any connection that does not turn them on.
+// it whatever the DSN says: a peer's UPDATE is applied as a DELETE and an
+// INSERT, which an ON DELETE action would answer with a change to the children
+// here that the peer never made. What an action did on the node that ran it
+// reaches every node as ops of its own.
 type applyConnector struct{ sqldriver.Connector }
 
 func (c applyConnector) Connect(ctx context.Context) (sqldriver.Conn, error) {
@@ -342,9 +345,11 @@ func (c applyConnector) Connect(ctx context.Context) (sqldriver.Conn, error) {
 		return nil, err
 	}
 	conn.(*driver.Conn).AllowUncapturedWrites()
-	if err := conn.(*driver.Conn).Exec(ctx, `PRAGMA ignore_check_constraints = ON`); err != nil {
-		conn.Close()
-		return nil, err
+	for _, pragma := range []string{`PRAGMA ignore_check_constraints = ON`, `PRAGMA foreign_keys = OFF`} {
+		if err := conn.(*driver.Conn).Exec(ctx, pragma); err != nil {
+			conn.Close()
+			return nil, err
+		}
 	}
 	return conn, nil
 }
