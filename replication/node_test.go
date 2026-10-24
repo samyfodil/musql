@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"sync"
 	"testing"
+	"time"
 )
 
 // newNodeOn wires a freshly-opened Store into net under id, returning the
@@ -262,4 +264,52 @@ func TestSyncSkipsARefusedSite(t *testing.T) {
 	if vv["s113311"] != 0 {
 		t.Fatalf("the refused site's op was taken: %v", vv)
 	}
+}
+
+// TestPushAppliesWhileSyncWaits: an op a peer pushes applies while a Sync
+// round waits on a peer that has not answered yet.
+func TestPushAppliesWhileSyncWaits(t *testing.T) {
+	s := newTestStore(t, "pushwait")
+	stall := &stallVV{Transport: stubPeer{}, push: make(chan PeerOp, 1), waiting: make(chan struct{}), release: make(chan struct{})}
+	n := NewNode(s, stall)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- n.Run(ctx, time.Millisecond) }()
+	defer func() {
+		close(stall.release)
+		cancel()
+		<-done
+	}()
+	select {
+	case <-stall.waiting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no Sync round began")
+	}
+	stall.push <- PeerOp{From: "p", Op: insertOp("A", 1, HLC(100), "u1", "n", 1)}
+	for deadline := time.Now().Add(5 * time.Second); s.LocalVV()["A"] < 1; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("a pushed op waited for a Sync round that waits on a peer")
+		}
+	}
+}
+
+// stallVV is a Transport whose pushes are push's, and whose ExchangeVV waits
+// until release is closed.
+type stallVV struct {
+	Transport
+	push             chan PeerOp
+	once             sync.Once
+	waiting, release chan struct{}
+}
+
+func (s *stallVV) SubscribePush(context.Context) (<-chan PeerOp, error) { return s.push, nil }
+
+func (s *stallVV) ExchangeVV(ctx context.Context, peer PeerID, vv VersionVector) (VersionVector, error) {
+	s.once.Do(func() { close(s.waiting) })
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return s.Transport.ExchangeVV(ctx, peer, vv)
 }
