@@ -25,11 +25,17 @@ type capture struct {
 	flushed []Op
 	// handoff holds stamped ops between preCommit and handOff.
 	handoff []Op
+	// committing is set by a preCommit that let the commit go ahead; a
+	// rollback then is the commit failing. retrying is set from such a failure
+	// an apply caused -- one committed since this connection's last commit or
+	// rollback, which applied counts -- to its next one (Store.waitLocal).
+	committing, retrying bool
+	applied              uint64
 }
 
 // attach wires a capture onto one connection via the driver's capture seam.
 func (s *Syncer) attach(conn *driver.Conn) {
-	c := &capture{s: s, conn: conn}
+	c := &capture{s: s, conn: conn, applied: s.store.applied.Load()}
 	conn.SetRowidRange(s.rowidLo, s.rowidHi)
 	conn.SetRowidFloor(s.rowidFloor)
 	conn.SetCaptureHooks(&driver.CaptureHooks{
@@ -167,7 +173,11 @@ func (c *capture) preCommit(ctx context.Context, conn *driver.Conn, changes []en
 		}
 		c.s.setCatalog(cat, ver)
 	}
-	return c.flush(ctx)
+	if err := c.flush(ctx); err != nil {
+		return err
+	}
+	c.committing = true
+	return nil
 }
 
 func hasSchemaOp(ops []Op) bool {
@@ -456,6 +466,12 @@ func (c *capture) upsertClock(ctx context.Context, tbl string, pk []byte, col st
 // it advances the version vector for this site and hands the ops to the syncer
 // for propagation.
 func (c *capture) postCommit() {
+	c.committing = false
+	c.applied = c.s.store.applied.Load()
+	if c.retrying {
+		c.retrying = false
+		c.s.store.localDone()
+	}
 	if len(c.flushed) == 0 {
 		return
 	}
@@ -485,6 +501,19 @@ func (c *capture) postCommit() {
 func (c *capture) discard() {
 	c.buf = c.buf[:0]
 	c.flushed = c.flushed[:0]
+	applied := c.s.store.applied.Load()
+	switch {
+	case c.committing && !c.retrying && applied != c.applied:
+		// The commit failed after the capture, and an apply committed meanwhile:
+		// the driver retries an autocommit statement, and the applies wait for
+		// it (Store.waitLocal).
+		c.retrying = true
+		c.s.store.localFailed()
+	case !c.committing && c.retrying:
+		c.retrying = false
+		c.s.store.localDone()
+	}
+	c.committing, c.applied = false, applied
 }
 
 // valueEqual compares two column values as delivered by the change log

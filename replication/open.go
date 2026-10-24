@@ -112,6 +112,23 @@ func openSyncer(ctx context.Context, path string, opts ...Option) (*Syncer, *sql
 // take the *sql.DB (Retire).
 var openDBs sync.Map
 
+// Synced reports whether db's node has finished an anti-entropy round with
+// its peers: it reached at least one, and held all that each one it reached
+// held. Until then a node that has just joined holds only part of the
+// database. db is the *sql.DB Open returned; without a transport it is never
+// synced.
+func Synced(db *sql.DB) bool {
+	v, ok := openDBs.Load(db)
+	if !ok {
+		return false
+	}
+	s := v.(*Syncer)
+	s.mu.Lock()
+	n := s.node
+	s.mu.Unlock()
+	return n != nil && n.synced.Load()
+}
+
 // Option configures Open.
 type Option func(*config)
 

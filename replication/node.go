@@ -19,6 +19,10 @@ type Node struct {
 	tr    Transport
 
 	seq atomic.Uint64 // next local seq to hand out, monotonic per site
+
+	// synced is set by the first Sync round that reached a peer and left this
+	// node holding all every peer it reached held.
+	synced atomic.Bool
 }
 
 // NewNode creates a Node over an already-open Store and Transport. The local
@@ -90,8 +94,12 @@ func (n *Node) Broadcast(ops []Op) {
 	}
 }
 
-// opsPerFetch caps how many ops Sync pulls from a peer per GetOps round trip.
-const opsPerFetch = 64
+// opsPerFetch caps how many ops Sync pulls from a peer per GetOps round trip;
+// each page is applied in one transaction.
+const opsPerFetch = 512
+
+// maxPushBatch caps how many pushed ops one transaction applies.
+const maxPushBatch = 512
 
 // Sync runs one anti-entropy round: it exchanges version vectors with every
 // currently reachable peer, then pulls and ingests any ops that peer has and
@@ -99,9 +107,12 @@ const opsPerFetch = 64
 // skipped; sync with them resumes automatically once the partition heals and
 // Sync is called again.
 func (n *Node) Sync(ctx context.Context) error {
-	for _, peer := range n.tr.Peers() {
+	peers := n.tr.Peers()
+	whole := len(peers) > 0
+	for _, peer := range peers {
 		peerVV, err := n.tr.ExchangeVV(ctx, peer, n.store.LocalVV())
 		if err != nil {
+			whole = false
 			continue // partitioned or otherwise unreachable; skip this peer
 		}
 		for site, peerSeq := range peerVV {
@@ -126,17 +137,10 @@ func (n *Node) Sync(ctx context.Context) error {
 				if len(ops) == 0 {
 					break // no-progress guard: peer has nothing more to offer
 				}
-				failed := false
-				for _, op := range ops {
-					if err := n.store.Ingest(ctx, op, false); err != nil {
-						// This site's later ops wait on this one; the other sites,
-						// and the other peers, do not.
-						log.Printf("replication: sync %s from %s: %v", site, peer, err)
-						failed = true
-						break
-					}
-				}
-				if failed {
+				if _, err := n.store.ingestAll(ctx, ops); err != nil {
+					// This site's later ops wait on this one; the other sites,
+					// and the other peers, do not.
+					log.Printf("replication: sync %s from %s: %v", site, peer, err)
 					break
 				}
 				newSeq := n.store.LocalVV()[site]
@@ -146,10 +150,17 @@ func (n *Node) Sync(ctx context.Context) error {
 				fromSeq = newSeq
 			}
 		}
+		vv := n.store.LocalVV()
+		for site, seq := range peerVV {
+			whole = whole && vv[site] >= seq
+		}
 		// Acks travel with every round, to every peer, whatever it pulled.
 		if acks, err := n.tr.ExchangeAcks(ctx, peer, n.store.Acks()); err == nil {
 			n.store.MergeAcks(acks)
 		}
+	}
+	if whole {
+		n.synced.Store(true)
 	}
 	return nil
 }
@@ -173,9 +184,7 @@ func (n *Node) Run(ctx context.Context, syncInterval time.Duration) error {
 				ch = nil // push stream closed; rely on periodic Sync
 				continue
 			}
-			if err := n.store.Ingest(ctx, po.Op, false); err != nil {
-				log.Printf("replication: apply pushed op from %s: %v", po.From, err)
-			}
+			n.applyPushed(ctx, drain(ch, po.Op))
 		case <-ticker.C:
 			if err := n.Sync(ctx); err != nil {
 				log.Printf("replication: sync round: %v", err)
@@ -184,6 +193,40 @@ func (n *Node) Run(ctx context.Context, syncInterval time.Duration) error {
 				log.Printf("replication: prune: %v", err)
 			}
 		}
+	}
+}
+
+// drain is first and the ops already waiting on ch, up to maxPushBatch.
+func drain(ch <-chan PeerOp, first Op) []Op {
+	ops := []Op{first}
+	for len(ops) < maxPushBatch {
+		select {
+		case po, ok := <-ch:
+			if !ok {
+				return ops
+			}
+			ops = append(ops, po.Op)
+		default:
+			return ops
+		}
+	}
+	return ops
+}
+
+// applyPushed applies pushed ops, each independent of the others: one refused
+// is logged and left to anti-entropy, and the rest still apply.
+func (n *Node) applyPushed(ctx context.Context, ops []Op) {
+	for len(ops) > 0 {
+		k, err := n.store.ingestAll(ctx, ops)
+		if err == nil || ctx.Err() != nil {
+			return
+		}
+		if k < 0 {
+			log.Printf("replication: apply %d pushed ops: %v", len(ops), err)
+			return
+		}
+		log.Printf("replication: apply pushed op %s/%d: %v", ops[k].Site, ops[k].Seq, err)
+		ops = ops[k+1:]
 	}
 }
 

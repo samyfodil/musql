@@ -411,7 +411,7 @@ func (s *Store) genesis(ctx context.Context, lo uint64) error {
 		return err
 	}
 	s.cat, s.ver = cat, ver
-	return s.advanceVV(ctx, s.site)
+	return s.advanceVV(ctx, s.site, nil)
 }
 
 func (s *Store) genesisTx(ctx context.Context, lo uint64) (*catalog, string, error) {
@@ -466,7 +466,7 @@ func (s *Store) genesisTx(ctx context.Context, lo uint64) (*catalog, string, err
 	}
 	for i := range ops {
 		ops[i].Site, ops[i].Seq, ops[i].HLC = s.site, uint64(i+1), s.clock.Now()
-		if err := s.appendOplog(ctx, ops[i]); err != nil {
+		if _, err := s.appendOplog(ctx, ops[i]); err != nil {
 			return nil, "", err
 		}
 		if ops[i].Kind == OpSchema {

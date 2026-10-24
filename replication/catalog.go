@@ -575,6 +575,12 @@ func (c *catalog) classify(ctx context.Context, w *scratch, stmt string) ([]sche
 		}
 		return []schemaOp{{Act: actRename, ID: obj.ID, Name: added[0].Name}}, nil
 	case len(added) != 0 || len(removed) != 0:
+		// A virtual table comes with its shadow tables: say why it is refused.
+		for _, r := range added {
+			if isVirtual(r) {
+				return refuse(errVirtual.Error())
+			}
+		}
 		return refuse("it changes several objects at once")
 	}
 	// The same objects: a column change, or nothing a replica could see.
@@ -652,12 +658,18 @@ func colIndex(cols []column, name string) int {
 //   - a virtual table: its storage is a module's, not rows this package sees;
 //   - WITHOUT ROWID, a key column not collated BINARY: the key is the row's
 //     identity, and these make it not one.
+var errVirtual = errors.New("virtual tables are not replicated")
+
+func isVirtual(r catRow) bool {
+	return r.Type == "table" && len(r.SQL) >= 20 && strings.EqualFold(r.SQL[:20], "CREATE VIRTUAL TABLE")
+}
+
 func supportedObject(ctx context.Context, db dbtx, r catRow) error {
 	switch {
 	case r.Type == "trigger":
 		return errors.New("triggers are not replicated")
-	case r.Type == "table" && len(r.SQL) >= 20 && strings.EqualFold(r.SQL[:20], "CREATE VIRTUAL TABLE"):
-		return errors.New("virtual tables are not replicated")
+	case isVirtual(r):
+		return errVirtual
 	case r.Type != "table":
 		return nil
 	}

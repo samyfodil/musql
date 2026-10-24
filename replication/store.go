@@ -11,6 +11,10 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/samyfodil/musql/engine"
 )
 
 // presenceCol is the synthetic per-row cell that carries liveness: value {1} =
@@ -47,17 +51,68 @@ type Store struct {
 	// its version in _repl_meta.
 	cat *catalog
 	ver string
+	// txHeld caches, within an ingest's transaction, whether a table has rows
+	// held out (_repl_withheld); nil outside one.
+	txHeld map[string]bool
+	// localRetries counts the local commits being retried after losing to an
+	// apply, and localUntil is when waitLocal stops waiting for them anyway, in
+	// unix nanoseconds. applied counts the ingest commits.
+	localRetries atomic.Int32
+	localUntil   atomic.Int64
+	applied      atomic.Uint64
 }
 
-// begin starts a transaction on the store's handle that ctx's cancellation does
-// not end. database/sql rolls back a transaction whose context is cancelled
-// from a goroutine of its own, which db.Close does not wait for -- so a sync
-// loop stopped mid-transaction let the connection roll back and close, and
-// touch the file, after the database was closed. Every store transaction ends
-// on its own path instead: the statements in it still see ctx, fail once it is
+// begin starts a store transaction: BEGIN IMMEDIATE on a connection of the
+// store's handle, so no other connection commits while it is open and its
+// commit cannot fail because one did. A deferred transaction lost to every
+// local write that committed after it began, and the ops it carried waited for
+// the next anti-entropy round, which lost the same way. The BEGIN waits for
+// another writer as an autocommit statement does (driver's busyRetry).
+//
+// It ignores ctx's cancellation for the same reason a *sql.Tx would not do:
+// database/sql rolls a cancelled transaction back from a goroutine of its own,
+// which db.Close does not wait for. Every store transaction ends on its own
+// path instead: the statements in it still see ctx, fail once it is
 // cancelled, and the error path rolls back before the call returns.
-func (s *Store) begin(ctx context.Context) (*sql.Tx, error) {
-	return s.db.BeginTx(context.WithoutCancel(ctx), nil)
+func (s *Store) begin(ctx context.Context) (storeTx, error) {
+	conn, err := s.db.Conn(context.WithoutCancel(ctx))
+	if err != nil {
+		return storeTx{}, err
+	}
+	deadline := time.Now().Add(engine.BusyTimeout)
+	delay := time.Millisecond
+	for {
+		_, err := conn.ExecContext(context.WithoutCancel(ctx), `BEGIN IMMEDIATE`)
+		if err == nil {
+			return storeTx{conn}, nil
+		}
+		if !errors.Is(err, engine.ErrBusy) || time.Now().After(deadline) || ctx.Err() != nil {
+			conn.Close()
+			return storeTx{}, err
+		}
+		time.Sleep(delay)
+		delay = min(2*delay, 50*time.Millisecond)
+	}
+}
+
+// storeTx is a transaction begin started.
+type storeTx struct{ *sql.Conn }
+
+func (t storeTx) Commit() error {
+	defer t.Close()
+	_, err := t.ExecContext(context.Background(), `COMMIT`)
+	if err != nil {
+		// A failed COMMIT leaves the transaction open; the connection goes
+		// back to the pool, so it must not.
+		t.ExecContext(context.Background(), `ROLLBACK`)
+	}
+	return err
+}
+
+func (t storeTx) Rollback() error {
+	defer t.Close()
+	_, err := t.ExecContext(context.Background(), `ROLLBACK`)
+	return err
 }
 
 // dbtx is the part of *sql.DB and *sql.Tx the store uses.
@@ -184,89 +239,244 @@ func (s *Store) OpsSince(ctx context.Context, site string, fromSeq uint64, limit
 // it drops and rebuilds either all land or none do, so a failure part-way leaves
 // the op un-recorded and the next delivery redoes it from the start.
 func (s *Store) Ingest(ctx context.Context, op Op, local bool) error {
+	_, err := s.ingest(ctx, []Op{op}, local)
+	return err
+}
+
+// ingestAll applies ops in order, as Ingest one at a time would, a few
+// hundred to a transaction instead of one each. When ops[k] is refused it
+// returns k and that error, with ops[:k] applied and the rest not tried; on an
+// error no op caused, -1, and the ops before it may have applied.
+func (s *Store) ingestAll(ctx context.Context, ops []Op) (int, error) {
+	done := 0
+	for done < len(ops) {
+		s.waitLocal()
+		n, err := s.ingest(ctx, ops[done:], false)
+		switch {
+		case err == nil:
+			done += n
+			continue
+		case n < 0:
+			return -1, err
+		case n > 0:
+			// The refused op rolled back the ones before it, which apply alone.
+			if _, perr := s.ingestAll(ctx, ops[done:done+n]); perr != nil {
+				return -1, perr
+			}
+		}
+		return done + n, err
+	}
+	return len(ops), nil
+}
+
+// maxHold is how long an ingest holds the write lock before it commits what it
+// has and lets a local writer in.
+const maxHold = 50 * time.Millisecond
+
+// waitLocal holds an apply off while a local commit that failed after its
+// capture -- it found the write lock taken, or the file moved under it -- is
+// being retried: the driver re-runs an autocommit statement whole, and one
+// longer than the gap between two applies would otherwise never commit. It
+// waits at most as long as the driver retries (engine.BusyTimeout) from the
+// first failure.
+func (s *Store) waitLocal() {
+	for s.localRetries.Load() > 0 && time.Now().UnixNano() < s.localUntil.Load() {
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// localFailed and localDone bracket a local commit's retries (capture).
+func (s *Store) localFailed() {
+	s.localUntil.Store(time.Now().Add(engine.BusyTimeout).UnixNano())
+	s.localRetries.Add(1)
+}
+
+func (s *Store) localDone() { s.localRetries.Add(-1) }
+
+// ingest applies ops, from the first, in one transaction, until they are done
+// or it has held the write lock for maxHold, and reports how many it took. On
+// an error it applies none of them, and reports the index of the op refused,
+// or -1 when no op was.
+func (s *Store) ingest(ctx context.Context, ops []Op, local bool) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if op.Seq <= s.floors[op.Site] && op.Kind != OpSchema {
-		// Pruned here: applied long ago, and everywhere. A schema op is never
-		// pruned, so one at or below a floor that is not in the log is one this
-		// node has not seen -- a snapshot can raise a floor past it.
-		return nil
+	if s.held(ctx, ops) {
+		return len(ops), nil
 	}
-
-	if same, exists, err := s.sameOp(ctx, op); err != nil {
-		return err
-	} else if exists {
-		if !same {
-			// Two nodes are writing under one site id (a copied database file):
-			// their ops at one seq differ, and each peer keeps whichever it saw
-			// first.
-			return fmt.Errorf("replication: site %q wrote two different ops at seq %d; two nodes share that site id", op.Site, op.Seq)
-		}
-		return nil
-	}
-
-	// Advance our clock past the op so the next local write is causally after it.
-	s.clock.Merge(op.HLC)
-
 	tx, err := s.begin(ctx)
 	if err != nil {
-		return err
+		return -1, err
 	}
-	s.q = tx
-	cat, ver, err := s.ingestTx(ctx, op, local)
-	s.q = s.db
+	s.q, s.txHeld = tx, map[string]bool{}
+	cat, ver := s.cat, s.ver
+	added, n, err := s.ingestTx(ctx, ops, local)
+	s.q, s.txHeld = s.db, nil
 	if err != nil {
 		tx.Rollback()
-		return err
+		s.cat, s.ver = cat, ver
+		return n, err
 	}
 	if err := tx.Commit(); err != nil {
-		return err
-	}
-	if cat != nil {
 		s.cat, s.ver = cat, ver
+		return -1, err
 	}
-	return s.advanceVV(ctx, op.Site)
+	s.applied.Add(1)
+	for site, seqs := range added {
+		if err := s.advanceVV(ctx, site, seqs); err != nil {
+			return -1, err
+		}
+	}
+	return n, nil
 }
 
-// ingestTx is Ingest's transaction. For a schema op it returns the catalog now
-// installed.
-func (s *Store) ingestTx(ctx context.Context, op Op, local bool) (*catalog, string, error) {
-	if err := s.claimRange(ctx, op.Site); err != nil {
-		return nil, "", err
+// held reports whether every op is one the log holds already (or pruned), as
+// a peer's push and an anti-entropy pull of the same op make common: those
+// need no transaction. An op past its site's contiguous seq may be new.
+func (s *Store) held(ctx context.Context, ops []Op) bool {
+	for _, op := range ops {
+		if op.Seq > s.vv[op.Site] {
+			return false
+		}
 	}
-	// A local capture may have changed the schema since this store last looked.
+	for _, op := range ops {
+		if op.Seq <= s.floors[op.Site] && op.Kind != OpSchema {
+			continue
+		}
+		if same, exists, err := s.sameOp(ctx, op); err != nil || !exists || !same {
+			return false
+		}
+	}
+	return true
+}
+
+// ingestTx is ingest's transaction: the seqs it added to the log, by site, and
+// how many ops it took, or the index of the op refused.
+func (s *Store) ingestTx(ctx context.Context, ops []Op, local bool) (map[string]map[uint64]bool, int, error) {
+	// A local capture may have changed the schema since this store last looked;
+	// none can while the transaction holds the write lock.
 	if err := s.syncCatalog(ctx); err != nil {
-		return nil, "", err
+		return nil, -1, err
 	}
-	if err := s.appendOplog(ctx, op); err != nil {
-		return nil, "", err
+	added := map[string]map[uint64]bool{}
+	start := time.Now()
+	for i, op := range ops {
+		if i > 0 && time.Since(start) > maxHold {
+			return added, i, nil
+		}
+		if op.Seq <= s.floors[op.Site] && op.Kind != OpSchema {
+			// Pruned here: applied long ago, and everywhere. A schema op is never
+			// pruned, so one at or below a floor that is not in the log is one this
+			// node has not seen -- a snapshot can raise a floor past it.
+			continue
+		}
+		if fresh, err := s.appendOplog(ctx, op); err != nil {
+			return nil, i, err
+		} else if !fresh {
+			same, _, err := s.sameOp(ctx, op)
+			if err != nil {
+				return nil, i, err
+			}
+			if !same {
+				// Two nodes are writing under one site id (a copied database file):
+				// their ops at one seq differ, and each peer keeps whichever it saw
+				// first.
+				return nil, i, fmt.Errorf("replication: site %q wrote two different ops at seq %d; two nodes share that site id", op.Site, op.Seq)
+			}
+			continue
+		}
+		// Advance our clock past the op so the next local write is causally after it.
+		s.clock.Merge(op.HLC)
+		if added[op.Site] == nil {
+			if err := s.claimRange(ctx, op.Site); err != nil {
+				return nil, i, err
+			}
+			added[op.Site] = map[uint64]bool{}
+		}
+		added[op.Site][op.Seq] = true
+		if err := s.applyOp(ctx, op, local); err != nil {
+			return nil, i, err
+		}
 	}
+	return added, len(ops), nil
+}
+
+// applyOp applies op, already in the log, to the clock and the user tables.
+func (s *Store) applyOp(ctx context.Context, op Op, local bool) error {
 	if op.Kind == OpSchema {
-		return s.applySchema(ctx, op)
+		clear(s.txHeld)
+		cat, ver, err := s.applySchema(ctx, op)
+		if err == nil && cat != nil {
+			s.cat, s.ver = cat, ver
+		}
+		return err
 	}
 	// Per-cell merge into the clock, presence first. Cells merge even into a
 	// currently-tombstoned row (grow-only) so a later resurrection sees them --
 	// and into a table or column not known here yet, whose rows are withheld
 	// until the schema op that makes it arrives (applySchema materializes them).
+	have, err := s.mergeOp(ctx, op)
+	if err != nil || local {
+		return err
+	}
+	return s.materializeRowFrom(ctx, s.cat, op.Tbl, op.PK, have)
+}
+
+// clockCell is one _repl_clock cell of a row.
+type clockCell struct {
+	hlc  HLC
+	site string
+	val  []byte
+}
+
+// mergeOp merges op's presence and cells into the clock, each iff op is a
+// strictly newer writer than the cell's, by the (hlc, site) total order -- as
+// mergeCell does one cell, in two statements for the row: one read of its
+// cells, one upsert of those op wins. It returns the row's cells after.
+func (s *Store) mergeOp(ctx context.Context, op Op) (map[string]clockCell, error) {
+	rows, err := s.q.QueryContext(ctx, `SELECT col, hlc, site, val FROM main._repl_clock WHERE tbl=? AND pk=?`, op.Tbl, op.PK)
+	if err != nil {
+		return nil, err
+	}
+	have := map[string]clockCell{}
+	for rows.Next() {
+		var col string
+		var c clockCell
+		var hlc int64
+		if err := rows.Scan(&col, &hlc, &c.site, &c.val); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		c.hlc = HLC(hlc)
+		have[col] = c
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var args []any
+	merge := func(col string, val []byte) {
+		if c, ok := have[col]; ok && !TagLess(c.hlc, c.site, op.HLC, op.Site) {
+			return // the existing writer wins
+		}
+		have[col] = clockCell{op.HLC, op.Site, val}
+		args = append(args, op.Tbl, op.PK, col, int64(op.HLC), op.Site, val)
+	}
 	pval := byte(1)
 	if op.Kind == OpDelete {
 		pval = 0
 	}
-	if err := s.mergeCell(ctx, op.Tbl, op.PK, presenceCol, op.HLC, op.Site, []byte{pval}); err != nil {
-		return nil, "", err
-	}
+	merge(presenceCol, []byte{pval})
 	for _, c := range op.Cells {
-		if err := s.mergeCell(ctx, op.Tbl, op.PK, c.Col, op.HLC, op.Site, packVal(c.Type, c.Val)); err != nil {
-			return nil, "", err
-		}
+		merge(c.Col, packVal(c.Type, c.Val))
 	}
-	if !local {
-		if err := s.materializeRow(ctx, s.cat, op.Tbl, op.PK); err != nil {
-			return nil, "", err
-		}
+	if len(args) == 0 {
+		return have, nil
 	}
-	return nil, "", nil
+	_, err = s.q.ExecContext(ctx, `INSERT INTO main._repl_clock(tbl,pk,col,hlc,site,val) VALUES `+
+		strings.TrimSuffix(strings.Repeat(`(?,?,?,?,?,?),`, len(args)/6), ",")+
+		` ON CONFLICT(tbl,pk,col) DO UPDATE SET hlc=excluded.hlc, site=excluded.site, val=excluded.val`, args...)
+	return have, err
 }
 
 // mergeCell writes (hlc, site, val) for a cell iff it is a strictly newer writer
@@ -331,18 +541,31 @@ func (s *Store) syncCatalog(ctx context.Context) error {
 // not have (not created here yet, or dropped) is not written, and a cell of a
 // column it does not have is not either.
 func (s *Store) materializeRow(ctx context.Context, cat *catalog, tblID string, pk []byte) error {
+	return s.materializeRowFrom(ctx, cat, tblID, pk, nil)
+}
+
+// materializeRowFrom is materializeRow with the row's clock cells, when the
+// caller has them (mergeOp), instead of reading them again.
+func (s *Store) materializeRowFrom(ctx context.Context, cat *catalog, tblID string, pk []byte, have map[string]clockCell) error {
 	t := cat.byID(tblID)
 	if t == nil || t.Type != "table" {
 		return nil
 	}
-	var held int
-	if err := s.q.QueryRowContext(ctx, `SELECT count(*) FROM (SELECT 1 FROM main._repl_withheld WHERE tbl=? LIMIT 1)`, tblID).Scan(&held); err != nil {
-		return err
+	held, ok := s.txHeld[tblID]
+	if !ok {
+		var n int
+		if err := s.q.QueryRowContext(ctx, `SELECT count(*) FROM (SELECT 1 FROM main._repl_withheld WHERE tbl=? LIMIT 1)`, tblID).Scan(&n); err != nil {
+			return err
+		}
+		held = n > 0
+		if s.txHeld != nil {
+			s.txHeld[tblID] = held
+		}
 	}
-	if held > 0 {
+	if held {
 		return s.rebuildTable(ctx, t)
 	}
-	if conflict, err := s.writeRow(ctx, t, pk, true); err != nil || !conflict {
+	if conflict, err := s.writeRow(ctx, t, pk, true, have); err != nil || !conflict {
 		return err
 	}
 	return s.rebuildTable(ctx, t)
@@ -351,7 +574,7 @@ func (s *Store) materializeRow(ctx context.Context, cat *catalog, tblID string, 
 // writeRow writes pk's row as the clock has it, first deleting the one there
 // when del is set. conflict reports an alive, complete row the table refused:
 // one of its UNIQUE values is another row's.
-func (s *Store) writeRow(ctx context.Context, t *object, pk []byte, del bool) (conflict bool, err error) {
+func (s *Store) writeRow(ctx context.Context, t *object, pk []byte, del bool, have map[string]clockCell) (conflict bool, err error) {
 	var keyNames []string
 	for _, kc := range t.keyCols() {
 		keyNames = append(keyNames, kc.Name)
@@ -378,13 +601,26 @@ func (s *Store) writeRow(ctx context.Context, t *object, pk []byte, del bool) (c
 		}
 	}
 
-	alive, known, err := s.presence(ctx, t.ID, pk)
-	if err != nil || !known || !alive {
-		return false, err
-	}
-	cells, err := s.liveCells(ctx, t.ID, pk)
-	if err != nil {
-		return false, err
+	var cells map[string]typedVal
+	if have == nil {
+		alive, known, err := s.presence(ctx, t.ID, pk)
+		if err != nil || !known || !alive {
+			return false, err
+		}
+		if cells, err = s.liveCells(ctx, t.ID, pk); err != nil {
+			return false, err
+		}
+	} else {
+		if p, ok := have[presenceCol]; !ok || len(p.val) == 0 || p.val[0] != 1 {
+			return false, nil
+		}
+		cells = make(map[string]typedVal, len(have))
+		for col, c := range have {
+			if col != presenceCol {
+				typ, raw := unpackVal(c.val)
+				cells[col] = typedVal{typ, raw}
+			}
+		}
 	}
 	for _, c := range t.Cols {
 		if c.PK || c.Gen || !c.NotNull || c.Default {
@@ -476,7 +712,7 @@ func (s *Store) rebuildTable(ctx context.Context, t *object) error {
 		return bytes.Compare(a.pk, b.pk)
 	})
 	for _, st := range all {
-		conflict, err := s.writeRow(ctx, t, st.pk, false)
+		conflict, err := s.writeRow(ctx, t, st.pk, false, nil)
 		if err != nil {
 			return err
 		}
@@ -495,6 +731,20 @@ func (s *Store) rebuildTable(ctx context.Context, t *object) error {
 func (s *Store) rebuildHeld(ctx context.Context, tblIDs []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Only rebuildTable writes _repl_withheld, always under mu, so a
+	// table with no row held out needs no transaction, which every local commit
+	// would otherwise pay.
+	heldOut := false
+	for _, id := range tblIDs {
+		var held int
+		if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM (SELECT 1 FROM main._repl_withheld WHERE tbl=? LIMIT 1)`, id).Scan(&held); err != nil {
+			return err
+		}
+		heldOut = heldOut || held > 0
+	}
+	if !heldOut {
+		return nil
+	}
 	tx, err := s.begin(ctx)
 	if err != nil {
 		return err
@@ -698,22 +948,32 @@ func (s *Store) hasOp(ctx context.Context, site string, seq uint64) (bool, error
 	}
 }
 
-func (s *Store) appendOplog(ctx context.Context, op Op) error {
-	_, err := s.q.ExecContext(ctx,
+// appendOplog adds op to the log, reporting false when the log held its
+// (site, seq) already.
+func (s *Store) appendOplog(ctx context.Context, op Op) (bool, error) {
+	res, err := s.q.ExecContext(ctx,
 		`INSERT OR IGNORE INTO main._repl_oplog(site,seq,hlc,tbl,pk,op,cells) VALUES(?,?,?,?,?,?,?)`,
 		op.Site, op.Seq, int64(op.HLC), op.Tbl, op.PK, int64(op.Kind), encodeCells(op.Cells))
-	return err
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
-func (s *Store) advanceVV(ctx context.Context, site string) error {
+// advanceVV moves site's contiguous seq over every seq the log holds past it:
+// added are seqs just committed, known without a read.
+func (s *Store) advanceVV(ctx context.Context, site string, added map[uint64]bool) error {
 	next := s.vv[site] + 1
 	for {
-		ok, err := s.hasOp(ctx, site, next)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			break
+		if !added[next] {
+			ok, err := s.hasOp(ctx, site, next)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				break
+			}
 		}
 		s.vv[site] = next
 		next++
