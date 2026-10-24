@@ -380,13 +380,9 @@ func (c *capture) fresh(ctx context.Context) ([]Op, error) {
 
 // stamp is the buffered ops with this site, their seqs and their HLCs.
 func (c *capture) stamp(ctx context.Context) ([]Op, error) {
-	rows, err := c.conn.Query(ctx, maxSeqQuery, c.s.site, c.s.site)
+	seq, err := c.lastSeq(ctx)
 	if err != nil {
 		return nil, err
-	}
-	var seq uint64
-	if n, ok := rows[0][0].(int64); ok {
-		seq = uint64(n)
 	}
 	ops := make([]Op, len(c.buf))
 	for i, op := range c.buf {
@@ -396,6 +392,27 @@ func (c *capture) stamp(ctx context.Context) ([]Op, error) {
 	}
 	c.buf = c.buf[:0]
 	return ops, nil
+}
+
+// lastSeq is this site's highest seq as this transaction reads the log. A
+// site's seqs in the log have no hole, so when the one after the last this
+// node committed is not there, that last one is the highest: one point read
+// instead of maxSeqQuery, which reads every op of the site. A transaction
+// whose image predates a commit it then numbers past never commits: the
+// engine refuses a stale image.
+func (c *capture) lastSeq(ctx context.Context) (uint64, error) {
+	seq := c.s.store.ownSeq.Load()
+	rows, err := c.conn.Query(ctx, `SELECT 1 FROM main._repl_oplog WHERE site=? AND seq=?`, c.s.site, int64(seq+1))
+	if err != nil || len(rows) == 0 {
+		return seq, err
+	}
+	if rows, err = c.conn.Query(ctx, maxSeqQuery, c.s.site, c.s.site); err != nil {
+		return 0, err
+	}
+	if n, ok := rows[0][0].(int64); ok {
+		return uint64(n), nil
+	}
+	return 0, nil
 }
 
 // handOff lands a Quorum commit: the transaction is discarded, and its ops
