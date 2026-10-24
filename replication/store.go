@@ -91,7 +91,7 @@ func (s *Store) begin(ctx context.Context) (storeTx, error) {
 			return storeTx{}, err
 		}
 		time.Sleep(delay)
-		delay = min(2*delay, 50*time.Millisecond)
+		delay = min(2*delay, 5*time.Millisecond)
 	}
 }
 
@@ -250,7 +250,6 @@ func (s *Store) Ingest(ctx context.Context, op Op, local bool) error {
 func (s *Store) ingestAll(ctx context.Context, ops []Op) (int, error) {
 	done := 0
 	for done < len(ops) {
-		s.waitLocal()
 		n, err := s.ingest(ctx, ops[done:], false)
 		switch {
 		case err == nil:
@@ -298,6 +297,7 @@ func (s *Store) localDone() { s.localRetries.Add(-1) }
 // an error it applies none of them, and reports the index of the op refused,
 // or -1 when no op was.
 func (s *Store) ingest(ctx context.Context, ops []Op, local bool) (int, error) {
+	s.waitLocal()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
