@@ -61,9 +61,11 @@ type Store struct {
 	mayHold map[string]bool
 	// localRetries counts the local commits being retried after losing to an
 	// apply, and localUntil is when waitLocal stops waiting for them anyway, in
-	// unix nanoseconds. applied counts the ingest commits.
+	// unix nanoseconds; lastLocal is when a local commit last landed. applied
+	// counts the ingest commits.
 	localRetries atomic.Int32
 	localUntil   atomic.Int64
+	lastLocal    atomic.Int64
 	applied      atomic.Uint64
 	// ownSeq is the highest seq of this site's that a local commit here, or the
 	// log at open, holds (capture.lastSeq).
@@ -325,8 +327,25 @@ func (s *Store) ingestAll(ctx context.Context, ops []Op) (int, error) {
 }
 
 // maxHold is how long an ingest holds the write lock before it commits what it
-// has and lets a local writer in.
-const maxHold = 50 * time.Millisecond
+// has and lets a local writer in, and holdAlone how long when no local commit
+// has landed for localQuiet: a commit costs much the same however many ops it
+// carries, and a node catching up with nothing else writing makes few.
+const (
+	maxHold    = 50 * time.Millisecond
+	holdAlone  = 500 * time.Millisecond
+	localQuiet = time.Second
+)
+
+// hold is how long an ingest may hold the write lock now.
+func (s *Store) hold() time.Duration {
+	if time.Since(time.Unix(0, s.lastLocal.Load())) > localQuiet {
+		return holdAlone
+	}
+	return maxHold
+}
+
+// localCommitted notes a local commit, for hold.
+func (s *Store) localCommitted() { s.lastLocal.Store(time.Now().UnixNano()) }
 
 // waitLocal holds an apply off while a local commit that failed after its
 // capture -- it found the write lock taken, or the file moved under it -- is
@@ -415,9 +434,9 @@ func (s *Store) ingestTx(ctx context.Context, ops []Op, local bool) (map[string]
 		return nil, -1, err
 	}
 	added := map[string]map[uint64]bool{}
-	start := time.Now()
+	start, hold := time.Now(), s.hold()
 	for i, op := range ops {
-		if i > 0 && time.Since(start) > maxHold {
+		if i > 0 && time.Since(start) > hold {
 			return added, i, nil
 		}
 		if op.Seq <= s.floors[op.Site] && op.Kind != OpSchema {
