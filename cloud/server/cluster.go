@@ -151,6 +151,18 @@ func (s *Server) placeDatabases(ctx context.Context) error {
 	}
 	s.cl.mu.Unlock()
 	for _, id := range gone {
+		// A database made here (an upload, a branch) is opened once its record
+		// is written, which may be after the list above was read: only what the
+		// state no longer places here goes.
+		d, err := s.store.DatabaseByID(ctx, id)
+		switch {
+		case errors.Is(err, state.ErrNotFound):
+		case err != nil:
+			s.log.Printf("place %s: %v", id, err)
+			continue
+		case d.Type == state.TypeCRDT && s.placedHere(ctx, d):
+			continue
+		}
 		s.unplace(id)
 	}
 	return nil
