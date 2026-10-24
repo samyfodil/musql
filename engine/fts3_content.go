@@ -199,6 +199,13 @@ type fts3ContentSource struct {
 	byID   map[int64]int
 }
 
+// contentGenErrDecline declines an external content row whose VIRTUAL column
+// raised (valueGenErr). The content is read whole here, where C reads a row
+// only when a statement needs it, so raising could fail a statement C answers.
+func contentGenErrDecline(col string, v Value) error {
+	return fmt.Errorf("%w: external content column %s is generated and raises for a row: %v", errVDBEUnsupported, col, genErrOf(v))
+}
+
 // fts3ProjectContent turns a content table's (rowid, row) pairs into that shape
 // by matching the fts table's declared column names against the content
 // table's, as fts3ReadExprList's "x.'%q'" does: a declared column the content
@@ -264,6 +271,9 @@ func fts3ProjectContent(sch fts3Schema, contentCols []columnInfo, ipk int, rowid
 		row[0] = Value{Typ: Int, I: int64(rid)}
 		for c, j := range pick {
 			if j < len(full) {
+				if full[j].Typ == valueGenErr {
+					return nil, contentGenErrDecline(contentCols[j].Name, full[j])
+				}
 				row[c+1] = full[j]
 			}
 		}
@@ -274,6 +284,9 @@ func fts3ProjectContent(sch fts3Schema, contentCols []columnInfo, ipk int, rowid
 			// doc comment.
 			row[width-1] = Value{Typ: Int, I: *matchLangid}
 		} else if langidPick >= 0 && langidPick < len(full) {
+			if full[langidPick].Typ == valueGenErr {
+				return nil, contentGenErrDecline(contentCols[langidPick].Name, full[langidPick])
+			}
 			row[width-1] = full[langidPick]
 		}
 		src.docids[n] = int64(rid)
