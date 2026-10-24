@@ -224,12 +224,13 @@ func (s *Store) Image(ctx context.Context, req ImageRequest) (ImageManifest, io.
 	return m, body, nil
 }
 
-// cutImage links path's committed files into dir, or failing that writes a
-// copy there, fills in what m says of the image, and opens it for reading.
+// cutImage pins path's committed files, or failing that writes a copy of the
+// database into dir, fills in what m says of the image, and opens it for
+// reading.
 //
-// The linked files are the state as it was committed, read from the database
-// beforehand: the catalog the image's must equal, and floors and ranges that
-// may be lower than its own.
+// What m says of pinned files is read from the database beforehand: the
+// catalog the image's must equal, and floors and ranges that may be lower than
+// its own.
 func (s *Store) cutImage(ctx context.Context, path, dir string, req ImageRequest, m *ImageManifest) (imageBody, error) {
 	if err := imageState(ctx, s.db, m); err != nil {
 		return imageBody{}, err
@@ -238,12 +239,11 @@ func (s *Store) cutImage(ctx context.Context, path, dir string, req ImageRequest
 	if err == nil {
 		m.FileVersion, m.DeltaVersion = p.FileVersion, p.DeltaVersion
 		if req.accepts(*m) == nil {
-			return s.openImage(p.Seg, p.Delta, p.DeltaLen, m)
+			return s.openImage(p.Seg, p.SegSize, p.Delta, p.DeltaLen, m)
 		}
-		os.Remove(p.Seg)
-		os.Remove(p.Delta)
+		p.Close()
 	} else {
-		log.Printf("replication: linking an image: %v; writing a copy instead", err)
+		log.Printf("replication: pinning an image's files: %v; writing a copy instead", err)
 	}
 	m.FileVersion, _, _ = engine.FormatVersions()
 	m.DeltaVersion = 0
@@ -269,55 +269,47 @@ func (s *Store) cutImage(ctx context.Context, path, dir string, req ImageRequest
 	if err != nil {
 		return imageBody{}, err
 	}
-	return s.openImage(img, "", 0, m)
+	f, err := os.Open(img)
+	if err != nil {
+		return imageBody{}, err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return imageBody{}, err
+	}
+	return s.openImage(f, fi.Size(), nil, 0, m)
 }
 
-// openImage opens the image of segment file seg and the first n bytes of the
-// delta at delta, and fills in m's cut, size and checksum.
-func (s *Store) openImage(seg, delta string, n int64, m *ImageManifest) (imageBody, error) {
+// openImage reads the image of segment file seg, segSize bytes, and the first
+// n bytes of delta, if any, and fills in m's cut, size and checksum.
+func (s *Store) openImage(seg *os.File, segSize int64, delta *os.File, n int64, m *ImageManifest) (imageBody, error) {
+	b := imageBody{files: []*os.File{seg}, release: func() {}}
+	parts := func() []io.Reader {
+		r := []io.Reader{io.NewSectionReader(seg, 0, segSize)}
+		if delta != nil {
+			r = append(r, io.NewSectionReader(delta, 0, n))
+		}
+		return r
+	}
+	if delta != nil {
+		b.files = append(b.files, delta)
+	}
 	m.MaxHLC = s.clock.Now()
 	if imageCutForTest != nil {
 		imageCutForTest()
 	}
-	b := imageBody{}
-	f, err := os.Open(seg)
-	if err != nil {
-		return b, err
-	}
-	b.files = append(b.files, f)
-	rs := []io.ReadSeeker{f}
-	if delta != "" {
-		d, err := os.Open(delta)
-		if err != nil {
-			f.Close()
-			return b, err
-		}
-		b.files = append(b.files, d)
-		rs = append(rs, io.NewSectionReader(d, 0, n))
-	}
 	h := crc32.New(castagnoli)
-	buf := make([]byte, 1<<20)
-	for i, r := range rs {
-		k, err := io.CopyBuffer(h, r, buf)
-		if err == nil {
-			_, err = r.Seek(0, io.SeekStart)
-		}
-		if err != nil {
-			b.release = func() {}
-			b.Close()
-			return imageBody{}, err
-		}
-		m.Size += k
-		if i > 0 {
-			m.DeltaSize = k
-		}
+	size, err := io.CopyBuffer(h, io.MultiReader(parts()...), make([]byte, 1<<20))
+	if err != nil {
+		b.Close()
+		return imageBody{}, err
 	}
-	m.Checksum = h.Sum32()
-	readers := make([]io.Reader, len(rs))
-	for i, r := range rs {
-		readers[i] = r
+	m.Size, m.Checksum = size, h.Sum32()
+	if delta != nil {
+		m.DeltaSize = n
 	}
-	b.Reader = io.MultiReader(readers...)
+	b.Reader = io.MultiReader(parts()...)
 	return b, nil
 }
 
