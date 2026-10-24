@@ -500,21 +500,28 @@ func (c *Conn) prepareInto(query string, st *Stmt) error {
 			}
 		}
 	}
-	info, cached := c.paramInfo[query]
-	var err error
-	if !cached {
-		if info, err = engine.ParseParamInfo(query); err == nil {
-			if c.paramInfo == nil || len(c.paramInfo) >= 256 {
-				c.paramInfo = make(map[string]engine.ParamInfo, 32)
-			}
-			c.paramInfo[query] = info
-		}
-	}
+	info, err := c.paramInfoOf(query)
 	if err != nil {
 		return err
 	}
 	*st = Stmt{conn: c, sqlText: query, info: info, isQuery: isSelectStmt(query)}
 	return nil
+}
+
+// paramInfoOf is engine.ParseParamInfo(query), kept for the connection's last
+// few hundred statement texts: a statement run again unprepared is lexed once.
+func (c *Conn) paramInfoOf(query string) (engine.ParamInfo, error) {
+	if info, ok := c.paramInfo[query]; ok {
+		return info, nil
+	}
+	info, err := engine.ParseParamInfo(query)
+	if err == nil {
+		if c.paramInfo == nil || len(c.paramInfo) >= 256 {
+			c.paramInfo = make(map[string]engine.ParamInfo, 32)
+		}
+		c.paramInfo[query] = info
+	}
+	return info, err
 }
 
 // mayBeScript reports whether query MIGHT hold more than one statement: a ";"
