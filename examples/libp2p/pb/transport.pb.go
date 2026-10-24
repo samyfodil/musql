@@ -1213,13 +1213,16 @@ type ImageManifest struct {
 	DeltaVersion uint32                 `protobuf:"varint,3,opt,name=delta_version,json=deltaVersion,proto3" json:"delta_version,omitempty"`
 	Layout       string                 `protobuf:"bytes,4,opt,name=layout,proto3" json:"layout,omitempty"`
 	Catalog      string                 `protobuf:"bytes,5,opt,name=catalog,proto3" json:"catalog,omitempty"`
-	Size         uint64                 `protobuf:"varint,6,opt,name=size,proto3" json:"size,omitempty"`
+	// size is the image's length: a segment file, then delta_size bytes of its
+	// delta.
+	Size uint64 `protobuf:"varint,6,opt,name=size,proto3" json:"size,omitempty"`
 	// crc32c is the image's CRC-32C (Castagnoli).
 	Crc32C        uint32        `protobuf:"varint,7,opt,name=crc32c,proto3" json:"crc32c,omitempty"`
 	Vv            []*VVEntry    `protobuf:"bytes,8,rep,name=vv,proto3" json:"vv,omitempty"`
 	Floors        []*VVEntry    `protobuf:"bytes,9,rep,name=floors,proto3" json:"floors,omitempty"`
 	Ranges        []*RangeEntry `protobuf:"bytes,10,rep,name=ranges,proto3" json:"ranges,omitempty"`
 	MaxHlc        uint64        `protobuf:"varint,11,opt,name=max_hlc,json=maxHlc,proto3" json:"max_hlc,omitempty"`
+	DeltaSize     uint64        `protobuf:"varint,12,opt,name=delta_size,json=deltaSize,proto3" json:"delta_size,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1327,6 +1330,13 @@ func (x *ImageManifest) GetRanges() []*RangeEntry {
 func (x *ImageManifest) GetMaxHlc() uint64 {
 	if x != nil {
 		return x.MaxHlc
+	}
+	return 0
+}
+
+func (x *ImageManifest) GetDeltaSize() uint64 {
+	if x != nil {
+		return x.DeltaSize
 	}
 	return 0
 }
@@ -1516,7 +1526,7 @@ const file_transport_proto_rawDesc = "" +
 	"\x06layout\x18\x01 \x01(\tR\x06layout\x12!\n" +
 	"\ffile_version\x18\x02 \x01(\rR\vfileVersion\x12(\n" +
 	"\x10min_file_version\x18\x03 \x01(\rR\x0eminFileVersion\x12#\n" +
-	"\rdelta_version\x18\x04 \x01(\rR\fdeltaVersion\"\xed\x02\n" +
+	"\rdelta_version\x18\x04 \x01(\rR\fdeltaVersion\"\x8c\x03\n" +
 	"\rImageManifest\x12\x12\n" +
 	"\x04site\x18\x01 \x01(\tR\x04site\x12!\n" +
 	"\ffile_version\x18\x02 \x01(\rR\vfileVersion\x12#\n" +
@@ -1529,7 +1539,9 @@ const file_transport_proto_rawDesc = "" +
 	"\x06floors\x18\t \x03(\v2\x16.replicationpb.VVEntryR\x06floors\x121\n" +
 	"\x06ranges\x18\n" +
 	" \x03(\v2\x19.replicationpb.RangeEntryR\x06ranges\x12\x17\n" +
-	"\amax_hlc\x18\v \x01(\x04R\x06maxHlc\"f\n" +
+	"\amax_hlc\x18\v \x01(\x04R\x06maxHlc\x12\x1d\n" +
+	"\n" +
+	"delta_size\x18\f \x01(\x04R\tdeltaSize\"f\n" +
 	"\x10GetImageResponse\x128\n" +
 	"\bmanifest\x18\x01 \x01(\v2\x1c.replicationpb.ImageManifestR\bmanifest\x12\x18\n" +
 	"\arefused\x18\x02 \x01(\tR\arefused\"4\n" +

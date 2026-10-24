@@ -150,7 +150,7 @@ func acksFromPB(entries []*pb.AckEntry) replication.Acks {
 // manifestToPB converts an image manifest to its protobuf representation.
 func manifestToPB(m replication.ImageManifest) *pb.ImageManifest {
 	out := &pb.ImageManifest{Site: m.Site, FileVersion: m.FileVersion, DeltaVersion: m.DeltaVersion, Layout: m.Layout,
-		Catalog: m.Catalog, Size: uint64(m.Size), Crc32C: m.Checksum, Vv: vvToPB(m.VV), Floors: vvToPB(m.Floors), MaxHlc: uint64(m.MaxHLC)}
+		Catalog: m.Catalog, Size: uint64(m.Size), DeltaSize: uint64(m.DeltaSize), Crc32C: m.Checksum, Vv: vvToPB(m.VV), Floors: vvToPB(m.Floors), MaxHlc: uint64(m.MaxHLC)}
 	for site, lo := range m.Ranges {
 		out.Ranges = append(out.Ranges, &pb.RangeEntry{Site: site, Lo: lo})
 	}
@@ -160,7 +160,7 @@ func manifestToPB(m replication.ImageManifest) *pb.ImageManifest {
 // manifestFromPB converts a protobuf image manifest back.
 func manifestFromPB(m *pb.ImageManifest) replication.ImageManifest {
 	out := replication.ImageManifest{Site: m.GetSite(), FileVersion: m.GetFileVersion(), DeltaVersion: m.GetDeltaVersion(), Layout: m.GetLayout(),
-		Catalog: m.GetCatalog(), Size: int64(m.GetSize()), Checksum: m.GetCrc32C(), VV: vvFromPB(m.GetVv()), Floors: vvFromPB(m.GetFloors()),
+		Catalog: m.GetCatalog(), Size: int64(m.GetSize()), DeltaSize: int64(m.GetDeltaSize()), Checksum: m.GetCrc32C(), VV: vvFromPB(m.GetVv()), Floors: vvFromPB(m.GetFloors()),
 		Ranges: map[string]uint64{}, MaxHLC: replication.HLC(m.GetMaxHlc())}
 	for _, e := range m.GetRanges() {
 		out.Ranges[e.GetSite()] = e.GetLo()

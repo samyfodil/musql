@@ -142,6 +142,8 @@ message ImageManifest {
   uint32 delta_version = 3;
   string layout = 4;
   string catalog = 5;
+  // size is the image's length: a segment file, then delta_size bytes of its
+  // delta.
   uint64 size = 6;
   // crc32c is the image's CRC-32C (Castagnoli).
   uint32 crc32c = 7;
@@ -149,6 +151,7 @@ message ImageManifest {
   repeated VVEntry floors = 9;
   repeated RangeEntry ranges = 10;
   uint64 max_hlc = 11;
+  uint64 delta_size = 12;
 }
 
 message GetImageResponse {
