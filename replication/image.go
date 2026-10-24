@@ -130,22 +130,27 @@ type imagePin struct {
 	until time.Time // zero while the image is being sent
 }
 
-// pinnedFrontier lowers frontier to every live pin's cut, and forgets the
-// expired pins. s.mu is held.
-func (s *Store) pinnedFrontier(frontier VersionVector) {
+// livePins forgets the expired pins and returns the others. s.mu is held.
+func (s *Store) livePins() []*imagePin {
 	now := time.Now()
 	live := s.pins[:0]
 	for _, p := range s.pins {
-		if !p.until.IsZero() && now.After(p.until) {
-			continue
-		}
-		live = append(live, p)
-		for site, f := range frontier {
-			frontier[site] = min(f, p.vv[site])
+		if p.until.IsZero() || now.Before(p.until) {
+			live = append(live, p)
 		}
 	}
 	clear(s.pins[len(live):])
 	s.pins = live
+	return live
+}
+
+// pinnedFrontier lowers frontier to every live pin's cut. s.mu is held.
+func (s *Store) pinnedFrontier(frontier VersionVector) {
+	for _, p := range s.livePins() {
+		for site, f := range frontier {
+			frontier[site] = min(f, p.vv[site])
+		}
+	}
 }
 
 // imageFile is an image being read; Close removes it and releases its pin.
@@ -187,7 +192,7 @@ func (s *Store) Image(ctx context.Context, req ImageRequest) (ImageManifest, io.
 	}
 	s.mu.Lock()
 	pin := &imagePin{vv: s.vv.Clone()}
-	s.pins = append(s.pins, pin)
+	s.pins = append(s.livePins(), pin)
 	s.mu.Unlock()
 	release := func() {
 		s.mu.Lock()
