@@ -348,13 +348,18 @@ func (s *Server) notHere(ctx context.Context, d *state.Database) error {
 	return fmt.Errorf("this database is not placed at %s (this node's location); its locations: %s", s.cfg.Node.Location, locs)
 }
 
-// localCopy declines, for a crdt database not open here, what reads this
-// node's copy or history.
+// localCopy declines, for a crdt database not open here or still in its
+// first sync, what reads this node's copy or history.
 func (s *Server) localCopy(ctx context.Context, d *state.Database) error {
-	if d.Type != state.TypeCRDT || s.crdtHandle(d.ID) != nil {
+	switch {
+	case d.Type != state.TypeCRDT:
 		return nil
+	case s.crdtHandle(d.ID) == nil:
+		return connect.NewError(connect.CodeFailedPrecondition, s.notHere(ctx, d))
+	case s.crdtSyncing(d.ID):
+		return connect.NewError(connect.CodeUnavailable, errSyncing)
 	}
-	return connect.NewError(connect.CodeFailedPrecondition, s.notHere(ctx, d))
+	return nil
 }
 
 // checkCRDT opens the file at path through replication, without peers, so a
@@ -368,7 +373,3 @@ func checkCRDT(ctx context.Context, path string) error {
 	}
 	return db.Close()
 }
-
-// errCRDTHistory declines restore and branch of a crdt database.
-var errCRDTHistory = connect.NewError(connect.CodeFailedPrecondition,
-	errors.New("restore and branch are not supported for crdt databases yet: history is per node"))
