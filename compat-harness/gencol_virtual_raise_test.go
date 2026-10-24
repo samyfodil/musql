@@ -164,3 +164,57 @@ func TestGeneratedVirtualRaiseReadsOnlyItsColumn(t *testing.T) {
 		differ(t, "gencol-raise "+name, stmts)
 	}
 }
+
+// Paths that read a key column of every row: a foreign key's scan of its child
+// table and the fill of a new index compute a VIRTUAL key column for each row,
+// so a row whose column raises fails the statement there, as in C.
+func TestGeneratedVirtualRaiseKeyScans(t *testing.T) {
+	for name, stmts := range map[string][]string{
+		"fk": {
+			"PRAGMA foreign_keys = ON",
+			"CREATE TABLE p(id INTEGER PRIMARY KEY, v)",
+			"INSERT INTO p VALUES(1, 'a')",
+			"CREATE TABLE c(x TEXT)",
+			"INSERT INTO c VALUES('bad'),('1')",
+			"ALTER TABLE c ADD COLUMN g AS (json_extract(x,'$')) REFERENCES p(id)",
+			"SELECT x FROM c",
+			"PRAGMA foreign_key_check",
+			"DELETE FROM p WHERE id = 1",
+			"INSERT INTO p VALUES(2, 'b')",
+			"UPDATE p SET v = 'c' WHERE id = 2",
+			"UPDATE p SET id = 3 WHERE id = 2",
+			"DELETE FROM p WHERE id = 2",
+			"SELECT id, v FROM p",
+			"UPDATE c SET x = '2' WHERE x = 'bad'",
+			"SELECT x, g FROM c",
+			"DELETE FROM c WHERE x = '1'",
+			"SELECT x FROM c",
+		},
+		"fk-child-delete": {
+			"PRAGMA foreign_keys = ON",
+			"CREATE TABLE p(id INTEGER PRIMARY KEY)",
+			"INSERT INTO p VALUES(1)",
+			"CREATE TABLE c(x TEXT, y)",
+			"INSERT INTO c VALUES('bad', 1),('1', 2)",
+			"ALTER TABLE c ADD COLUMN g AS (json_extract(x,'$')) REFERENCES p(id)",
+			"UPDATE c SET y = 3 WHERE x = 'bad'",
+			"DELETE FROM c WHERE x = 'bad'",
+			"SELECT x, y FROM c",
+			"PRAGMA foreign_keys = OFF",
+			"DELETE FROM c WHERE x = 'bad'",
+			"SELECT x, y FROM c",
+		},
+		"index": gencolRaiseCase(
+			"CREATE INDEX ig ON i(g)",
+			"CREATE INDEX iv ON i(value, g)",
+			"CREATE UNIQUE INDEX iu ON i(g)",
+			"CREATE INDEX ip ON i(g) WHERE value > 5",
+			"CREATE INDEX ip2 ON i(g) WHERE value < 5",
+			"CREATE INDEX ie ON i(g, lower(j))",
+			"SELECT name FROM sqlite_schema ORDER BY name",
+			"SELECT value FROM i WHERE g = 1",
+		),
+	} {
+		differ(t, "gencol-raise "+name, stmts)
+	}
+}
