@@ -2061,6 +2061,20 @@ func (c *compiler) resolveRowReg(x ColumnExpr) (int, bool, error) {
 	return reg, true, nil
 }
 
+// regHoldsVirtual reports whether reg is a register row's slot for a VIRTUAL
+// generated column, which a row loaded whole from the table holds as that
+// column's error where its expression raised (valueGenErr).
+func regHoldsVirtual(scopes []regScope, reg int) bool {
+	for _, rs := range scopes {
+		for idx, r := range rs.regs {
+			if r == reg && idx < len(rs.scope.cols) && rs.scope.cols[idx].IsGenerated() && !rs.scope.cols[idx].GeneratedStored {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // outerRowCtx returns the nearest live enclosing-row evalCtx on this compile's
 // chain (compiler.rowOuter), or nil. Walking the chain -- rather than reading
 // c.rowOuter alone -- is what lets a subquery compiled BENEATH a FROM-less
@@ -2196,6 +2210,9 @@ func (c *compiler) compileColumn(x ColumnExpr) (int, error) {
 			return 0, amb
 		}
 		if ok {
+			if regHoldsVirtual(c.regScopes, reg) {
+				c.emit(Instruction{Op: OpGenErrCheck, P1: reg})
+			}
 			return reg, nil
 		}
 	}
@@ -2315,6 +2332,9 @@ func (c *compiler) compileColumn(x ColumnExpr) (int, error) {
 				}
 				d := c.alloc()
 				c.emit(Instruction{Op: OpOuterAggReg, P1: reg, P3: d, P5: uint16(level)})
+				if regHoldsVirtual(oc.regScopes, reg) {
+					c.emit(Instruction{Op: OpGenErrCheck, P1: d})
+				}
 				return d, nil
 			}
 		}

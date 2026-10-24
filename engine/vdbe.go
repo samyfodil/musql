@@ -3192,6 +3192,11 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			n := tbl.rows.clear()
 			m.wctx.rowsAffected += int(n)
 
+		case OpGenErrCheck:
+			if m.regs[op.P1].Typ == valueGenErr {
+				return nil, genErrOf(m.regs[op.P1])
+			}
+
 		case OpSkipIfRowGone:
 			tbl := op.P4.(*tableMeta)
 			if _, ok := tbl.rows.get(uint64(m.regs[op.P1].I)); !ok {

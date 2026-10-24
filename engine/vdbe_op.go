@@ -742,6 +742,13 @@ const (
 	// pc back.
 	OpJIT
 
+	// OpGenErrCheck raises the error r[P1] holds when it is a VIRTUAL generated
+	// column's (valueGenErr). A register row loaded whole from the table (the
+	// upsert's conflicting row) holds one where the column's expression raised;
+	// C computes the column only where an expression reads it, which is where
+	// the compiler places this.
+	OpGenErrCheck // P1: register.
+
 	numOpCodes // sentinel: count of opcodes, for the disassembler's name table.
 )
 
