@@ -414,7 +414,18 @@ func (cur *vdbeCursor) readColumn(i int, dst *Value) error {
 		return cur.readColumnFromMaskedRow(i, dst)
 	}
 	*dst = cur.rowVals[i]
+	if dst.Typ == valueGenErr {
+		return takeGenErr(dst)
+	}
 	return nil
+}
+
+// takeGenErr is the error a valueGenErr slot read into *dst holds, with *dst
+// left NULL so the marker goes no further than its read.
+func takeGenErr(dst *Value) error {
+	err := genErrOf(*dst)
+	*dst = Value{}
+	return err
 }
 
 // col is readColumn in expression position, for readers that want a value
@@ -437,6 +448,9 @@ func (cur *vdbeCursor) readColumnFromMaskedRow(i int, dst *Value) error {
 		}
 	}
 	*dst = cur.rowVals[i]
+	if dst.Typ == valueGenErr {
+		return takeGenErr(dst)
+	}
 	return nil
 }
 
@@ -450,6 +464,13 @@ func (cur *vdbeCursor) fullRow() ([]Value, error) {
 	}
 	if cur.rowRaw != nil {
 		if err := cur.decodeFullRow(); err != nil {
+			return nil, err
+		}
+	}
+	// A whole row goes on to readers that do not name a column, so a VIRTUAL
+	// column's error is raised for the row.
+	if cur.hasGeneratedCols() {
+		if err := rowGenErr(cur.rowVals); err != nil {
 			return nil, err
 		}
 	}

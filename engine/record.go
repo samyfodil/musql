@@ -362,7 +362,9 @@ func fitsSignedWidth(i int64, n int) bool {
 // The Int case picks the narrowest width that holds the value.
 func serialTypeOf(v Value) uint64 {
 	switch v.Typ {
-	case Null:
+	case Null, valueGenErr:
+		// A VIRTUAL generated column's error (valueGenErr) is stored as NULL:
+		// its slot is computed again on every read.
 		return 0
 	case Int:
 		switch v.I {
@@ -498,7 +500,7 @@ func recordHeaderLen(typesLen int) int {
 // Value is 48 bytes, and each call copied one.
 func serialTypeOfPtr(v *Value) uint64 {
 	switch v.Typ {
-	case Null:
+	case Null, valueGenErr: // see serialTypeOf
 		return 0
 	case Int:
 		switch v.I {

@@ -1316,9 +1316,7 @@ func normalizeRow(tblName string, cols []columnInfo, ipkIndex int, rowid uint64,
 			out = append([]Value(nil), vals...)
 		}
 		normalizeRowInto(out, cols, ipkIndex, rowid)
-		// A generated expression failing (a bad schema this engine accepted)
-		// leaves the computed columns NULL rather than failing the read.
-		_ = computeGeneratedInto(tblName, cols, out)
+		computeGeneratedOnRead(tblName, cols, out)
 		return out
 	}
 	// A record narrower than the column list (a row written before an
@@ -1357,7 +1355,7 @@ func normalizeRowInPlace(tblName string, cols []columnInfo, ipkIndex int, rowid 
 		// when the table actually has a VIRTUAL column.
 		vals = expandStoredRow(cols, vals)
 		normalizeRowInto(vals, cols, ipkIndex, rowid)
-		_ = computeGeneratedInto(tblName, cols, vals)
+		computeGeneratedOnRead(tblName, cols, vals)
 		return vals
 	}
 	// See normalizeRow's identical widening: padStoredRow already allocates a
@@ -2426,6 +2424,39 @@ func contractToStoredRow(cols []columnInfo, row []Value) []Value {
 // reference an earlier generated one. tblName/scope are needed to bind the
 // expression's column references to this same row.
 func computeGeneratedInto(tblName string, cols []columnInfo, row []Value) error {
+	return computeGenerated(tblName, cols, row, false)
+}
+
+// valueGenErr is the Value a VIRTUAL generated column holds when its
+// expression raised as its committed row was widened (computeGeneratedOnRead).
+// C computes such a column only where it is read (sqlite3ExprCodeGeneratedColumn),
+// so the row stays whole and only a read of the column raises. S holds the
+// error's text. Every reader of a row slot raises it (genErrOf) rather than take
+// it for a value, and none hands it to a record.
+const valueGenErr ValueType = 0xF2
+
+// genErrOf is the error a valueGenErr slot holds.
+func genErrOf(v Value) error { return errors.New(string(v.S)) }
+
+// rowGenErr is the error of the first valueGenErr slot of row, or nil.
+func rowGenErr(row []Value) error {
+	for i := range row {
+		if row[i].Typ == valueGenErr {
+			return genErrOf(row[i])
+		}
+	}
+	return nil
+}
+
+// computeGeneratedOnRead is computeGeneratedInto for a committed row being
+// widened to be read: a VIRTUAL column whose expression raises, or that reads
+// one that did, holds the error (valueGenErr) instead of failing the row, and a
+// STORED one keeps the value its record holds, which is the one C reads.
+func computeGeneratedOnRead(tblName string, cols []columnInfo, row []Value) {
+	computeGenerated(tblName, cols, row, true)
+}
+
+func computeGenerated(tblName string, cols []columnInfo, row []Value, onRead bool) error {
 	if !hasGeneratedCols(cols) {
 		return nil
 	}
@@ -2442,6 +2473,13 @@ func computeGeneratedInto(tblName string, cols []columnInfo, row []Value) error 
 	// (expr.c:5070-5080). columnInfo.genDeps holds the edges.
 	done := make([]bool, len(cols))
 	busy := make([]bool, len(cols))
+	// fail is a column's error on a read: a VIRTUAL slot holds it, a STORED one
+	// keeps its record's value.
+	fail := func(i int, err error) {
+		if !cols[i].GeneratedStored {
+			row[i] = Value{Typ: valueGenErr, S: []byte(err.Error())}
+		}
+	}
 	var compute func(i int) error
 	compute = func(i int) error {
 		c := cols[i]
@@ -2457,12 +2495,26 @@ func computeGeneratedInto(tblName string, cols []columnInfo, row []Value) error 
 		defer func() { busy[i] = false }()
 		for _, j := range c.genDeps {
 			if err := compute(j); err != nil {
-				return err
+				if !onRead {
+					return err
+				}
+				done[i] = true
+				fail(i, err)
+				return nil
+			}
+			if onRead && row[j].Typ == valueGenErr {
+				done[i] = true
+				fail(i, genErrOf(row[j]))
+				return nil
 			}
 		}
 		done[i] = true
 		expr, err := cachedGeneratedExpr(c.GeneratedExpr)
 		if err != nil {
+			if onRead {
+				fail(i, err)
+				return nil
+			}
 			return fmt.Errorf("engine: table %s: generated column %s: %w", tblName, c.Name, err)
 		}
 		// The compiled body, stamped on the column by the schema funnel
@@ -2477,6 +2529,10 @@ func computeGeneratedInto(tblName string, cols []columnInfo, row []Value) error 
 		}
 		v, err := gp.eval(ctx)
 		if err != nil {
+			if onRead {
+				fail(i, err)
+				return nil
+			}
 			return fmt.Errorf("engine: table %s: generated column %s: %w", tblName, c.Name, err)
 		}
 		v = applyAffinityToValue(v, c.Aff)

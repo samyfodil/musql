@@ -4218,6 +4218,11 @@ type selfRowExpr struct {
 	// (compiler.ignoreDbQualifier), kept only so eval's re-stamp reproduces it
 	// rather than compiling a CHECK body under an index expression's rules.
 	ignoreDbQualifier bool
+
+	// virtReads are the VIRTUAL generated columns the expression reads, whose
+	// slot in a committed row may hold its error (valueGenErr): eval raises it
+	// rather than run the program over it.
+	virtReads []int
 }
 
 // compileSelfRowExpr compiles e against scope's columns held in registers. A
@@ -4238,6 +4243,16 @@ func compileSelfRowExprPaged(scope tableScope, e Expr, ignoreDbQualifier bool, p
 	p := &selfRowExpr{expr: e, cols: scope.cols, nCols: len(scope.cols), ignoreDbQualifier: ignoreDbQualifier, pureCtx: pureCtx}
 	if e == nil {
 		return p
+	}
+	if hasVirtualCols(scope.cols) {
+		forEachColumnRef(e, func(ce ColumnExpr) {
+			if ce.Qualifier != "" && !equalFoldName(scope.name, ce.Qualifier) {
+				return
+			}
+			if k, ok := scope.colIndex[r33sFoldIdent(ce.Name)]; ok && k < len(scope.cols) && scope.cols[k].IsGenerated() && !scope.cols[k].GeneratedStored {
+				p.virtReads = append(p.virtReads, k)
+			}
+		})
 	}
 	// rowLive only with a pager: eval seeds the register block before running, so
 	// a subquery beneath can read it across the frame. That is what a vtab

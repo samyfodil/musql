@@ -208,7 +208,11 @@ func (p *ReadOnlyPager) integrityRowsInMemory(tr *SchemaRow, tm *tableMeta, inde
 		}
 		recs := make([][]Value, 0, len(rows))
 		for rowid, vals := range rows {
-			recs = append(recs, indexEntryForNewRow(tm, idx, rowid, vals))
+			key := indexEntryForNewRow(tm, idx, rowid, vals)
+			if gerr := rowGenErr(key); gerr != nil {
+				return nil, nil, gerr
+			}
+			recs = append(recs, key)
 		}
 		sort.SliceStable(recs, func(a, b int) bool {
 			return compareIndexRec(recs[a], recs[b], idx.colCollation, idx.colDesc, enc) < 0
@@ -227,6 +231,9 @@ func (p *ReadOnlyPager) integrityRowsInMemory(tr *SchemaRow, tm *tableMeta, inde
 	_, strict, _ := parseTableTailClauses(tr.SQL)
 	for _, rowid := range order {
 		vals := rows[rowid]
+		if gerr := integrityGenErr(cols, strict, vals); gerr != nil {
+			return nil, nil, gerr
+		}
 		// (1)-(4), per column in declaration order, skipping the rowid alias --
 		// pragma.c:1920's "if( j==pTab->iPKey ) continue".
 		for j, c := range cols {
@@ -311,11 +318,7 @@ func readTableRowsWithin(rp *ReadOnlyPager, tbl *tableMeta, budget int) (rows ma
 	}
 	rows = make(map[uint64][]Value, len(rowids))
 	for i, rowid := range rowids {
-		row, err := fullStoredRow(tbl, rowid, vals[i])
-		if err != nil {
-			return nil, nil, err
-		}
-		rows[rowid] = row
+		rows[rowid] = fullStoredRow(tbl, rowid, vals[i])
 	}
 	return rows, rowidsSorted, nil
 }
@@ -539,6 +542,26 @@ func integrityCheckViolationExpr(checks []checkConstraint) string {
 		sb.WriteString(")")
 	}
 	return sb.String()
+}
+
+// integrityGenErr is the error integrity_check raises over row: C computes a
+// VIRTUAL generated column there only for the column's NOT NULL or datatype
+// check (pragma.c:1926-1931), and that raises whatever its expression raises.
+func integrityGenErr(cols []columnInfo, strict bool, row []Value) error {
+	for j, c := range cols {
+		if j >= len(row) || row[j].Typ != valueGenErr {
+			continue
+		}
+		check := c.Aff > affNone
+		if strict {
+			t := strings.ToUpper(strings.TrimSpace(c.DeclType))
+			check = t != "" && t != "ANY"
+		}
+		if c.NotNull || check {
+			return genErrOf(row[j])
+		}
+	}
+	return nil
 }
 
 // integrityColumnFinding is pragma.c:1911-2032 for one column of one row: the
