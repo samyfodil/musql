@@ -1118,7 +1118,8 @@ func (c *Conn) execArgsBody(sqlText string, args []engine.Value) (driver.Result,
 	// that loses is not only wasted, it leaves its rows in the session, which
 	// then rebuilds from the file (Poison) and builds its indexes again.
 	attempt := 0
-	locked := targetPath == c.path && c.plainDML(sqlText) && time.Now().Before(c.contendedUntil)
+	locked := targetPath == c.path && c.plainDML(sqlText) &&
+		(time.Now().Before(c.contendedUntil) || c.hooks != nil && c.hooks.Contended != nil && c.hooks.Contended())
 	err := busyRetry(c.pragmaState.BusyTimeout(), func() error {
 		if attempt++; (attempt > 1 || locked) && targetPath == c.path {
 			nw, err := c.session()

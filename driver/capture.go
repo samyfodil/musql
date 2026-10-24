@@ -58,6 +58,12 @@ type CaptureHooks struct {
 	// false once it holds the lock or gave up. A consumer that writes through
 	// other connections of its own can let it in first.
 	LockWait func(waiting bool)
+
+	// Contended, when set, reports whether a writer of the consumer's own
+	// waits for the write lock: an autocommit statement then takes the lock
+	// before it runs, as on a file it found contended, so that LockWait can
+	// let that writer in first.
+	Contended func() bool
 }
 
 // ErrHandOff, returned by PreCommit, discards the transaction and makes the
