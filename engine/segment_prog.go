@@ -68,6 +68,11 @@ func (m *vdbe) segRunProgramAll(p *ReadOnlyPager, tbl *resolvedTable, plan *segP
 	if plan == nil || len(plan.lows) == 0 {
 		return nil, false
 	}
+	for _, low := range plan.lows {
+		if low != nil && (lowReadsVirtual(tbl.cols, low) || lowReadsVirtual(tbl.cols, low.textVar)) {
+			return nil, false
+		}
+	}
 	out := make([]Value, len(plan.lows))
 	for i, low := range plan.lows {
 		v, ok := m.segRunOne(p, tbl, rootPage, low, ipkCol)
@@ -77,6 +82,21 @@ func (m *vdbe) segRunProgramAll(p *ReadOnlyPager, tbl *resolvedTable, plan *segP
 		out[i] = v
 	}
 	return out, true
+}
+
+// lowReadsVirtual reports whether low reads a VIRTUAL generated column. Its
+// stored cell is not its value: a row written before the column was added has
+// none, and a rewrite keeps none. Only the VDBE computes it.
+func lowReadsVirtual(cols []columnInfo, low *segLowered) bool {
+	if low == nil {
+		return false
+	}
+	for _, c := range low.cols {
+		if c >= 0 && c < len(cols) && cols[c].IsGenerated() && !cols[c].GeneratedStored {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, low *segLowered, ipkCol int) (Value, bool) {
