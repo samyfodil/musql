@@ -69,7 +69,12 @@ async function tokenRequest(params) {
 		body: new URLSearchParams({ client_id: CLIENT, ...params }),
 	});
 	const body = await res.json().catch(() => ({}));
-	if (!res.ok) throw new Error(body.error_description || body.error || `token endpoint: HTTP ${res.status}`);
+	if (!res.ok) {
+		const err = new Error(body.error_description || body.error || `token endpoint: HTTP ${res.status}`);
+		// A 4xx is the server turning the grant down; a server error or a busy one says nothing about it.
+		err.refused = res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429;
+		throw err;
+	}
 	return body;
 }
 
@@ -92,9 +97,12 @@ export function refresh() {
 	}
 	refreshing = tokenRequest({ grant_type: "refresh_token", refresh_token: rt })
 		.then(took, (e) => {
-			access = null;
-			storage((s) => s.removeItem(REFRESH));
-			set({ status: "out", error: `Signed out: ${e.message}` });
+			// Only the server refusing the refresh token ends the session. A network failure leaves it for the next try.
+			if (e.refused) {
+				access = null;
+				storage((s) => s.removeItem(REFRESH));
+				set({ status: "out", error: `Signed out: ${e.message}` });
+			}
 			throw e;
 		})
 		.finally(() => (refreshing = null));
@@ -143,6 +151,9 @@ export async function start() {
 		}
 		return;
 	}
-	if (storage((s) => s.getItem(REFRESH))) await refresh().catch(() => {});
-	else set({ status: "out" });
+	if (storage((s) => s.getItem(REFRESH))) {
+		await refresh().catch((e) => {
+			if (!e.refused) set({ status: "out", error: `Could not reach ${new URL(server).host}: ${e.message}` });
+		});
+	} else set({ status: "out" });
 }

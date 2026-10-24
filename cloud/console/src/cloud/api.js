@@ -11,7 +11,7 @@ import { OrgService } from "../gen/cloud/v1/org_pb.js";
 import { UserService } from "../gen/cloud/v1/user_pb.js";
 import { DatabaseType, Role } from "../gen/cloud/v1/common_pb.js";
 import { Access, FileFormat } from "../gen/cloud/v1/database_pb.js";
-import { refresh, server, token } from "./auth.js";
+import { authState, refresh, server, token } from "./auth.js";
 
 export { Access, Code, DatabaseType, FileFormat, Role };
 
@@ -64,4 +64,22 @@ export function cloudDatabase(conn) {
 	if (!server || conn?.kind !== "remote" || !conn.url?.startsWith(`${server}/db/`)) return null;
 	const [org, database] = conn.url.slice(server.length + 4).split("/");
 	return org && database ? { org, database } : null;
+}
+
+const DB_TOKEN_LIFETIME = 3600e3;
+
+/**
+ * databaseToken mints a token for one of this server's databases, good for an
+ * hour: {token, exp}, exp in ms since the epoch. The editor's connection asks
+ * again before the token runs out (renew.js).
+ */
+export async function databaseToken(org, name, readOnly) {
+	const exp = Date.now() + DB_TOKEN_LIFETIME;
+	try {
+		const r = await api.db.createToken({ org, name, access: readOnly ? Access.READ_ONLY : Access.FULL, expiresAt: stamp(new Date(exp)) });
+		return { token: r.token, exp };
+	} catch (e) {
+		if (authState().status === "out") throw new Error(`Signed out: sign in again to reach ${org}/${name}.`);
+		throw e;
+	}
 }

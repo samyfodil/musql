@@ -20,7 +20,7 @@ import { saved, unsave } from "./library.js";
 import { isStudioTable } from "./vectors.js";
 import { CloudMain, CloudSide, PAGES } from "./cloud/Cloud.jsx";
 import { useCloud } from "./cloud/useCloud.js";
-import { server as cloudServer } from "./cloud/auth.js";
+import { server as cloudServer, signIn } from "./cloud/auth.js";
 import { cloudDatabase } from "./cloud/api.js";
 
 // The editor (CodeMirror) loads with the first query tab, not with the page.
@@ -296,7 +296,7 @@ export default function App() {
 			// Read the kept view before anything renders under the new name: the
 			// effect that keeps it would otherwise save an empty one first.
 			const view = viewState(name);
-			if (remote) await connect(remote.url, remote.token);
+			if (remote) await connect(remote.url, remote.token, remote.renewal);
 			else await open(data);
 			setConn(backend());
 			setSavedAt(null);
@@ -548,8 +548,9 @@ export default function App() {
 		return true;
 	};
 	// openCloud opens a database of the cloud server in the editor, over Hrana
-	// with a short-lived token the cloud page minted; it is not kept in the
-	// connection list, since the token would outlive its use.
+	// with a short-lived token the cloud page minted (renewed while the
+	// connection is open); it is not kept in the connection list, since the
+	// token would outlive its use.
 	const openCloud = async (c) => {
 		await openDatabase(c.name, undefined, undefined, null, c);
 		if (backend().url === c.url) setSection("tables");
@@ -769,6 +770,14 @@ export default function App() {
 							{section === "sql" && <button className="ghost icon newtab" title="New query" onClick={() => openQuery()}>＋</button>}
 							<span className="grow" />
 							<button className="kbdbtn" onClick={() => setPalette(true)}><Search size={13} /><span className="dim">Search</span> <span className="kbd">⌘K</span></button>
+						</div>
+					)}
+					{cloudTarget && cloud.auth.status === "out" && section !== "cloud" && (
+						<div className="sessionbar" role="alert">
+							<b>Signed out</b>
+							<span title={cloud.auth.error ?? undefined}>{dbName} stops working when its access expires.</span>
+							<span className="grow" />
+							<button className="primary" onClick={signIn}>Sign in again</button>
 						</div>
 					)}
 					<div className="panes" hidden={section === "cloud"}>
