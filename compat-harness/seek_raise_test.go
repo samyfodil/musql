@@ -28,9 +28,8 @@ var seekRaiseKeys = []struct{ name, decl, k1, k2 string }{
 	{"blob", "BLOB", "x'01'", "x'02'"},
 }
 
-// seekRaiseOpen opens both engines on one schema: an inner table whose second
-// row, under a key no outer row wants, holds malformed JSON.
-func seekRaiseOpen(t *testing.T, decl, k1, k2 string, index, segments bool) (pure, mattn *sql.Conn) {
+// seekRaiseConns opens a connection to each engine on a database of its own.
+func seekRaiseConns(t *testing.T) (pure, mattn *sql.Conn) {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -47,7 +46,14 @@ func seekRaiseOpen(t *testing.T, decl, k1, k2 string, index, segments bool) (pur
 		t.Cleanup(func() { c.Close() })
 		return c
 	}
-	pure, mattn = open(driver.DriverName, "pure"), open("sqlite3", "mattn")
+	return open(driver.DriverName, "pure"), open("sqlite3", "mattn")
+}
+
+// seekRaiseOpen opens both engines on one schema: an inner table whose second
+// row, under a key no outer row wants, holds malformed JSON.
+func seekRaiseOpen(t *testing.T, decl, k1, k2 string, index, segments bool) (pure, mattn *sql.Conn) {
+	t.Helper()
+	pure, mattn = seekRaiseConns(t)
 	stmts := []string{
 		fmt.Sprintf(`CREATE TABLE o(id INTEGER PRIMARY KEY, want %s, lim INTEGER)`, decl),
 		fmt.Sprintf(`CREATE TABLE i(k %s, j TEXT)`, decl),
@@ -108,12 +114,13 @@ func seekRaiseOutcome(c *sql.Conn, q string) string {
 	return "rows: " + strings.Join(out, " ")
 }
 
-// seekRaiseWriteOutcome is what a write answers on c, and the table after it.
-func seekRaiseWriteOutcome(c *sql.Conn, q string) string {
+// seekRaiseWriteOutcome is what a write answers on c, and what dump reads of
+// the table after it.
+func seekRaiseWriteOutcome(c *sql.Conn, q, dump string) string {
 	res, err := c.ExecContext(context.Background(), q)
 	if err != nil {
 		if strings.Contains(err.Error(), "malformed JSON") {
-			return "error: malformed JSON; " + seekRaiseOutcome(c, `SELECT rowid, k, j FROM i ORDER BY rowid`)
+			return "error: malformed JSON; " + seekRaiseOutcome(c, dump)
 		}
 		return "error: " + err.Error()
 	}
@@ -121,7 +128,7 @@ func seekRaiseWriteOutcome(c *sql.Conn, q string) string {
 	if err != nil {
 		return "error: " + err.Error()
 	}
-	return fmt.Sprintf("changes %d; %s", n, seekRaiseOutcome(c, `SELECT rowid, k, j FROM i ORDER BY rowid`))
+	return fmt.Sprintf("changes %d; %s", n, seekRaiseOutcome(c, dump))
 }
 
 // seekRaiseTerms are the inner WHERE in both orders: the term that can raise
@@ -170,12 +177,195 @@ func TestSeekRaisingTermVsC(t *testing.T) {
 					}
 					for _, q := range writes {
 						pure, mattn := seekRaiseOpen(t, kt.decl, kt.k1, kt.k2, index, segments)
-						if got, want := seekRaiseWriteOutcome(pure, q), seekRaiseWriteOutcome(mattn, q); got != want {
+						const dump = `SELECT rowid, k, j FROM i ORDER BY rowid`
+						if got, want := seekRaiseWriteOutcome(pure, q, dump), seekRaiseWriteOutcome(mattn, q, dump); got != want {
 							t.Errorf("%s\n  musql: %s\n  C:     %s", q, got, want)
 						}
 					}
 				})
 			}
 		}
+	}
+}
+
+// seekRaiseSubOpen opens both engines on a table whose first row holds
+// malformed JSON under a key the queries do not want, a one-row table for the
+// sub-selects to read, and an outer table of the keys wanted.
+func seekRaiseSubOpen(t *testing.T, index, segments bool) (pure, mattn *sql.Conn) {
+	t.Helper()
+	pure, mattn = seekRaiseConns(t)
+	stmts := []string{
+		`CREATE TABLE i(value INT, j TEXT)`,
+		`CREATE TABLE other(v)`,
+		`CREATE TABLE o(id INTEGER PRIMARY KEY, want INT, lim INT)`,
+		`CREATE TABLE t(x INT)`,
+		`CREATE TABLE log(a)`,
+		`INSERT INTO other VALUES (5)`,
+		`INSERT INTO i VALUES (1, 'bad'), (7, '1')`,
+		`INSERT INTO o VALUES (1, 7, 10), (2, 9, 10)`,
+	}
+	if index {
+		stmts = append(stmts, `CREATE INDEX i_value ON i(value)`)
+	}
+	if segments {
+		stmts = append(stmts, `VACUUM`)
+	}
+	for _, s := range stmts {
+		execBothConn(t, pure, mattn, "setup", s)
+	}
+	return pure, mattn
+}
+
+// seekRaiseSubWheres are WHERE clauses over seekRaiseSubOpen's table. C codes a
+// term holding a correlated sub-select after every other term
+// (TERM_VARSELECT), and any other term, a sub-select that names nothing outside
+// itself included, in WHERE order. With no index on value it scans, so a
+// raising term before "value = 7" is reached on the row that holds malformed
+// JSON, and one after it, or one a correlated sub-select puts last, is not.
+func seekRaiseSubWheres() []string {
+	const (
+		uncorrelated = `json_extract(j, '$') < (SELECT max(v) FROM other)`
+		correlated   = `json_extract(j, '$') < (SELECT max(v) FROM other WHERE v > i.value - 100)`
+		key          = `value = 7`
+	)
+	var wheres []string
+	bothOrders := func(raise, key string) {
+		terms := seekRaiseTerms(raise, key)
+		wheres = append(wheres, terms[:]...)
+	}
+	for _, raise := range []string{
+		uncorrelated,
+		correlated,
+		`json_extract(j, '$') IN (SELECT v FROM other)`,
+		`EXISTS (SELECT 1 FROM other WHERE json_extract(i.j, '$') < v)`,
+		`json_extract(j, '$') < (SELECT max(v) FROM other WHERE v > (SELECT max(v) FROM other WHERE v > i.value - 100) - 100)`,
+	} {
+		bothOrders(raise, key)
+	}
+	wheres = append(wheres,
+		correlated+" AND "+uncorrelated+" AND "+key,
+		uncorrelated+" AND "+correlated+" AND "+key)
+	// The sub-select raises whichever row reaches it.
+	bothOrders(`(SELECT json_extract('[', '$')) IS NULL`, key)
+	bothOrders(`(SELECT json_extract('[', '$')) IS NULL`, `value = 9`)
+	return wheres
+}
+
+func TestSeekRaiseSubselectVsC(t *testing.T) {
+	for _, index := range []bool{false, true} {
+		for _, segments := range []bool{false, true} {
+			t.Run(fmt.Sprintf("index=%v/segments=%v", index, segments), func(t *testing.T) {
+				pure, mattn := seekRaiseSubOpen(t, index, segments)
+				var queries []string
+				for _, where := range seekRaiseSubWheres() {
+					queries = append(queries, `SELECT value FROM i WHERE `+where)
+				}
+				// The sub-select names a table of the query the EXISTS is in.
+				for _, terms := range seekRaiseTerms(`json_extract(i.j, '$') < (SELECT max(v) FROM other WHERE v < o.lim)`, `i.value = o.want`) {
+					queries = append(queries, `SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE `+terms+`) ORDER BY o.id`)
+				}
+				for _, q := range queries {
+					if got, want := seekRaiseOutcome(pure, q), seekRaiseOutcome(mattn, q); got != want {
+						t.Errorf("%s\n  musql: %s\n  C:     %s", q, got, want)
+					}
+				}
+			})
+			t.Run(fmt.Sprintf("index=%v/segments=%v/writes", index, segments), func(t *testing.T) {
+				for _, where := range seekRaiseSubWheres() {
+					for _, q := range []string{`UPDATE i SET j = j || '' WHERE ` + where, `DELETE FROM i WHERE ` + where} {
+						pure, mattn := seekRaiseSubOpen(t, index, segments)
+						const dump = `SELECT rowid, value, j FROM i ORDER BY rowid`
+						if got, want := seekRaiseWriteOutcome(pure, q, dump), seekRaiseWriteOutcome(mattn, q, dump); got != want {
+							t.Errorf("%s\n  musql: %s\n  C:     %s", q, got, want)
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestSeekRaiseTriggerVsC: in a trigger body NEW and OLD are found before
+// lookupName climbs out of a sub-select, so a sub-select that names only them
+// is not correlated and C tests it in WHERE order; one that also names a table
+// of the statement is.
+func TestSeekRaiseTriggerVsC(t *testing.T) {
+	const key = `value = 7`
+	var wheres []string
+	for _, raise := range []string{
+		`json_extract(j, '$') < (SELECT max(v) FROM other WHERE v > new.x - 100)`,
+		`json_extract(j, '$') < (SELECT max(v) FROM other WHERE v > new.x + i.value - 100)`,
+	} {
+		terms := seekRaiseTerms(raise, key)
+		wheres = append(wheres, terms[:]...)
+	}
+	for _, index := range []bool{false, true} {
+		for _, segments := range []bool{false, true} {
+			t.Run(fmt.Sprintf("index=%v/segments=%v", index, segments), func(t *testing.T) {
+				for _, where := range wheres {
+					pure, mattn := seekRaiseSubOpen(t, index, segments)
+					execBothConn(t, pure, mattn, "setup", `CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log SELECT value FROM i WHERE `+where+`; END`)
+					const q, dump = `INSERT INTO t VALUES (1)`, `SELECT a FROM log ORDER BY a`
+					if got, want := seekRaiseWriteOutcome(pure, q, dump), seekRaiseWriteOutcome(mattn, q, dump); got != want {
+						t.Errorf("%s\n  musql: %s\n  C:     %s", where, got, want)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestSeekRaiseConsumedFirstVsC: an index on (a, b) holds both equalities for
+// C, which visits only the row with a = 1 and b = 2 whatever a term that can
+// raise is. A seek reads every row with a = 1 (or with b = 2), so the two
+// equalities are tested before the term, as C's index has them hold.
+func TestSeekRaiseConsumedFirstVsC(t *testing.T) {
+	const keys = `a = 1 AND b = 2`
+	var wheres []string
+	for _, raise := range []string{
+		`json_extract(j, '$') > 0`,
+		`json_extract(j, '$') < (SELECT max(v) FROM other)`,
+		`json_extract(j, '$') < (SELECT max(v) FROM other WHERE v > m.a - 100)`,
+	} {
+		wheres = append(wheres, raise+" AND "+keys, "a = 1 AND "+raise+" AND b = 2", keys+" AND "+raise)
+	}
+	for _, segments := range []bool{false, true} {
+		open := func(t *testing.T) (pure, mattn *sql.Conn) {
+			pure, mattn = seekRaiseConns(t)
+			stmts := []string{
+				`CREATE TABLE m(a INT, b INT, j TEXT)`,
+				`CREATE TABLE other(v)`,
+				`INSERT INTO other VALUES (5)`,
+				`INSERT INTO m VALUES (1, 1, 'bad'), (1, 2, '1'), (2, 2, 'bad')`,
+				`CREATE INDEX m_ab ON m(a, b)`,
+			}
+			if segments {
+				stmts = append(stmts, `VACUUM`)
+			}
+			for _, s := range stmts {
+				execBothConn(t, pure, mattn, "setup", s)
+			}
+			return pure, mattn
+		}
+		t.Run(fmt.Sprintf("segments=%v", segments), func(t *testing.T) {
+			pure, mattn := open(t)
+			for _, where := range wheres {
+				q := `SELECT a, b FROM m WHERE ` + where
+				if got, want := seekRaiseOutcome(pure, q), seekRaiseOutcome(mattn, q); got != want {
+					t.Errorf("%s\n  musql: %s\n  C:     %s", q, got, want)
+				}
+			}
+		})
+		t.Run(fmt.Sprintf("segments=%v/writes", segments), func(t *testing.T) {
+			for _, where := range wheres {
+				for _, q := range []string{`UPDATE m SET j = j || '' WHERE ` + where, `DELETE FROM m WHERE ` + where} {
+					pure, mattn := open(t)
+					const dump = `SELECT rowid, a, b, j FROM m ORDER BY rowid`
+					if got, want := seekRaiseWriteOutcome(pure, q, dump), seekRaiseWriteOutcome(mattn, q, dump); got != want {
+						t.Errorf("%s\n  musql: %s\n  C:     %s", q, got, want)
+					}
+				}
+			}
+		})
 	}
 }
