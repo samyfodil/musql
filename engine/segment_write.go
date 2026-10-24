@@ -623,6 +623,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 			return false, rerr
 		}
 	}
+	n.drainSmallLoads(lockedStamp)
 	changes := n.takeChangeLog()
 	// Handed back for the next statement once this commit is done with it, so
 	// the log does not regrow from nothing every statement. Not under full
@@ -831,6 +832,41 @@ func (n *Session) extendCommittedColumns(batch []byte, recs []SegDeltaRecord) bo
 	// mark bumps; the rows moved, so it moves too.
 	db.schemaCorruptGen++
 	return true
+}
+
+// drainSmallLoads hands a load into an empty table (insert_bulk_direct.go) to
+// the change log when the delta can take its rows: they go out as a delta
+// batch, which costs what they hold, instead of in the whole-file rewrite a
+// load commits by, which costs what the file holds -- one row inserted into an
+// empty table rewrote a gigabyte. A load whose rows would take the delta past
+// the size the commit's own compaction rewrites at (compactionDueAfter) keeps
+// its segments and the rewrite, which would follow anyway. Its size here is an
+// estimate; an under-estimate only reaches that rewrite later, from the row
+// store.
+func (n *Session) drainSmallLoads(stamp [2]fileStamp) {
+	db := n.DB
+	if compactionOffForTest || !stamp[0].there {
+		return
+	}
+	room := compactionThreshold(stamp[0].size) - n.deltaLogicalSize(stamp[1]) - int64(db.changeLog.len())*segDeltaMinRecord
+	for _, t := range db.tables {
+		bl := t.bulk
+		if t.isTemp || bl == nil || bl.stream != nil || bl.rows == 0 {
+			continue
+		}
+		if err := bl.cut.wait(); err != nil {
+			continue
+		}
+		need := int64(bl.rows)*(segDeltaMinRecord+4) + bl.cut.bytes
+		for _, raw := range bl.segs {
+			need += int64(len(raw))
+		}
+		if need > room {
+			continue
+		}
+		room -= need
+		db.drainTxBulk(t)
+	}
 }
 
 // deltaAppendExceeds reports whether appending recs could leave main's segment
