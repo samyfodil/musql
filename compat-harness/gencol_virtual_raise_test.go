@@ -218,3 +218,47 @@ func TestGeneratedVirtualRaiseKeyScans(t *testing.T) {
 		differ(t, "gencol-raise "+name, stmts)
 	}
 }
+
+// An upsert's DO UPDATE reads the conflicting row: C computes its VIRTUAL
+// column only where SET or WHERE reads it, and the new row's from the values
+// the update leaves.
+func TestGeneratedVirtualRaiseUpsert(t *testing.T) {
+	setup := []string{
+		"CREATE TABLE u(k INT UNIQUE, j TEXT, x)",
+		"INSERT INTO u VALUES(1,'bad',0),(7,'1',0)",
+		"ALTER TABLE u ADD COLUMN g AS (json_extract(j,'$')) VIRTUAL",
+		"CREATE TABLE log(x)",
+	}
+	tail := "SELECT k, j, g FROM u WHERE k <> 1 ORDER BY k"
+	for name, stmts := range map[string][]string{
+		"set-reads-g":      {"INSERT INTO u(k,j) VALUES(1,'5') ON CONFLICT(k) DO UPDATE SET j = g", "SELECT k, j FROM u ORDER BY k"},
+		"set-reads-g-expr": {"INSERT INTO u(k,j) VALUES(1,'5') ON CONFLICT(k) DO UPDATE SET j = coalesce(g, 'n')", "SELECT k, j FROM u ORDER BY k"},
+		"set-x-reads-g":    {"INSERT INTO u(k,j) VALUES(1,'5') ON CONFLICT(k) DO UPDATE SET j = excluded.j, x = g", "SELECT k, j, x FROM u ORDER BY k"},
+		"set-x-reads-g-op": {"INSERT INTO u(k,j) VALUES(1,'5') ON CONFLICT(k) DO UPDATE SET j = excluded.j, x = typeof(g) || (g IS NULL)", "SELECT k, j, x FROM u ORDER BY k"},
+		"where-reads-g":    {"INSERT INTO u(k,j) VALUES(1,'5') ON CONFLICT(k) DO UPDATE SET j = excluded.j WHERE g IS NULL", "SELECT k, j FROM u ORDER BY k"},
+		"where-skips-g":    {"INSERT INTO u(k,j) VALUES(1,'5') ON CONFLICT(k) DO UPDATE SET j = '3' WHERE k > 100 AND g > 0", "SELECT k, j FROM u ORDER BY k"},
+		"set-excluded":     {"INSERT INTO u(k,j) VALUES(1,'5') ON CONFLICT(k) DO UPDATE SET j = excluded.j", "SELECT k, j, g FROM u ORDER BY k"},
+		"good-row-reads-g": {"INSERT INTO u(k,j) VALUES(7,'2') ON CONFLICT(k) DO UPDATE SET j = g + 1", "SELECT k, j, g FROM u ORDER BY k"},
+		"returning":        {"INSERT INTO u(k,j) VALUES(1,'9') ON CONFLICT(k) DO UPDATE SET j = excluded.j RETURNING k, g", tail},
+		"new-row-raises":   {"INSERT INTO u(k,j) VALUES(1,'x') ON CONFLICT(k) DO UPDATE SET k = 2", "SELECT k, j FROM u ORDER BY k"},
+		"subquery-reads-g": {"INSERT INTO u(k,j) VALUES(1,'5') ON CONFLICT(k) DO UPDATE SET j = (SELECT g)", "SELECT k, j FROM u ORDER BY k"},
+		"trigger-old-k": {
+			"CREATE TRIGGER tr AFTER UPDATE ON u BEGIN INSERT INTO log VALUES(old.k); END",
+			"INSERT INTO u(k,j) VALUES(1,'5') ON CONFLICT(k) DO UPDATE SET j = excluded.j",
+			"SELECT x FROM log", "SELECT k, j, g FROM u ORDER BY k",
+		},
+		"trigger-old-g": {
+			"CREATE TRIGGER tr AFTER UPDATE ON u BEGIN INSERT INTO log VALUES(old.g); END",
+			"INSERT INTO u(k,j) VALUES(1,'5') ON CONFLICT(k) DO UPDATE SET j = excluded.j",
+			"SELECT x FROM log", "SELECT k, j FROM u ORDER BY k",
+		},
+		"before-trigger": {
+			"CREATE TRIGGER tr BEFORE UPDATE ON u BEGIN INSERT INTO log VALUES(new.k); END",
+			"INSERT INTO u(k,j) VALUES(1,'5') ON CONFLICT(k) DO UPDATE SET j = excluded.j",
+			"SELECT x FROM log", "SELECT k, j, g FROM u ORDER BY k",
+		},
+		"replace": {"INSERT OR REPLACE INTO u(k,j) VALUES(1,'5')", "SELECT k, j, g FROM u ORDER BY k"},
+	} {
+		differ(t, "gencol-raise upsert "+name, append(append([]string{}, setup...), stmts...))
+	}
+}
