@@ -240,6 +240,7 @@ func (s *rowStore) snapshotIndexRowids(col int, probe Value) ([]int64, bool) {
 	// Every row the store has written whose value could equal the probe: the
 	// candidates stay a superset, but a row that certainly differs is not
 	// fetched and re-tested once per seek.
+	s.snapWork += len(s.m)
 	for rid, vals := range s.m {
 		if col >= len(vals) || !certainlyUnequal(vals[col], probe) {
 			out = append(out, int64(rid))
@@ -275,7 +276,10 @@ func certainlyUnequal(v, probe Value) bool {
 // by the store's own equality index (eqRowids) than by its base segments'
 // index plus its written rows: when that index is built already, or the
 // written rows are most of the table, so building it costs about what one
-// seek through the snapshot would.
+// seek through the snapshot would, or seeks have already tested as many
+// written rows as building it reads. Without that last rule a transaction
+// writing tens of thousands of rows and seeking between them -- a snapshot a
+// new replica merges -- tested every written row on every seek.
 func (s *rowStore) prefersEqIndex(col int) bool {
 	if s == nil || s.spill != nil {
 		return false
@@ -290,7 +294,7 @@ func (s *rowStore) prefersEqIndex(col int) bool {
 	for _, sg := range s.seg.rp.segs.byRoot[s.seg.root] {
 		base += sg.nRows
 	}
-	return len(s.m) >= base
+	return len(s.m) >= base || s.snapWork >= base+len(s.m)
 }
 
 // segIndexSeeksServed counts index seeks the segments answered, for tests.

@@ -299,17 +299,23 @@ func (cur *vdbeCursor) idxSeekRowids() ([]int64, bool) {
 }
 
 // writeSeekRowids is a write cursor's equality candidates, from its store's
-// indexes: the committed segments' (segEqRowids), or the store's own
-// (eqRowidsOf). Several keys are asked in the order of how many rows the
-// segments say each holds. fromSeg says the segments answered, which drops the
-// rows the store deleted. A TEXT probe under a sequence other than BINARY is
-// no key: both indexes match exact values (and OpSeekIndexHint keeps no TEXT
-// key of a UTF-16 database, whose bytes need not decide its equality).
+// indexes: its own (eqRowidsOf) where prefersEqIndex says so, else the
+// committed segments' (segEqRowids). Several keys are asked in the order of how
+// many rows the segments say each holds. fromSeg says the segments answered,
+// which drops the rows the store deleted. A TEXT probe under a sequence other
+// than BINARY is no key: both indexes match exact values (and OpSeekIndexHint
+// keeps no TEXT key of a UTF-16 database, whose bytes need not decide its
+// equality).
 func (cur *vdbeCursor) writeSeekRowids() (hits []uint64, fromSeg, ok bool) {
 	rows := cur.rowStore.rows
 	ask := func(k idxSeekKey) ([]uint64, bool, bool) {
 		if k.probe.Typ == Text && !equalFoldName(effectiveCollation(k.coll), "BINARY") {
 			return nil, false, false
+		}
+		if rows.prefersEqIndex(k.col) {
+			if hits, ok := rows.eqRowidsOf(k.col, k.probe); ok {
+				return hits, false, true
+			}
 		}
 		if hits, ok := rows.segEqRowids(k.col, k.probe); ok {
 			return hits, true, true
