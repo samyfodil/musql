@@ -390,31 +390,36 @@ func (db *DB) drainTxBulks(keep *tableMeta) {
 		return
 	}
 	for _, t := range slices.Clone(db.txBulks) {
-		if t == keep {
-			continue
+		if t != keep {
+			db.drainTxBulk(t)
 		}
-		bl := t.bulk
-		db.dropTxBulk(t)
-		if bl == nil {
-			continue
-		}
-		wc := db.activeWC
-		mark := bl.rows
-		if wc != nil && wc.bulkTbl == t {
-			mark = wc.bulkMark
-			wc.bulkTbl = nil
-		}
-		k := 0
-		bl.eachRow(func(rid uint64, vals []Value) bool {
-			t.putRow(rid, vals)
-			db.noteRowChange(t, RowInsert, rid, nil, vals)
-			if k >= mark {
-				wc.undoDrop(t, rid)
-			}
-			k++
-			return true
-		})
 	}
+}
+
+// drainTxBulk moves t's transaction load into its row store, as drainTxBulks
+// does each one.
+func (db *DB) drainTxBulk(t *tableMeta) {
+	bl := t.bulk
+	db.dropTxBulk(t)
+	if bl == nil {
+		return
+	}
+	wc := db.activeWC
+	mark := bl.rows
+	if wc != nil && wc.bulkTbl == t {
+		mark = wc.bulkMark
+		wc.bulkTbl = nil
+	}
+	k := 0
+	bl.eachRow(func(rid uint64, vals []Value) bool {
+		t.putRow(rid, vals)
+		db.noteRowChange(t, RowInsert, rid, nil, vals)
+		if k >= mark {
+			wc.undoDrop(t, rid)
+		}
+		k++
+		return true
+	})
 }
 
 // bulkStore takes one row into the direct-path load, or reports false when the
