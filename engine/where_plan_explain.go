@@ -29,6 +29,40 @@ func explainItemName(f FromItem) string {
 	return f.Table
 }
 
+// accessOf is the access path of the winning loop w: the columns its
+// equality prefix pins, past any skip-scan columns, and the column its range
+// bound constrains. An automatic index's equalities are its key's
+// (wherePlanAutoIndexKey); a multi-index OR loop is not described.
+func (b *wherePlanIdxBuild) accessOf(w *whereIdxLoop) wherePlanAccess {
+	if w == nil || w.multiOr {
+		return wherePlanAccess{}
+	}
+	if w.autoIdx {
+		return wherePlanAccess{known: true, auto: true}
+	}
+	idx := w.idx
+	if idx == nil || w.nEq > len(w.lTerm) {
+		return wherePlanAccess{}
+	}
+	col := func(j int) int {
+		switch {
+		case idx.ipk:
+			return xnRowid
+		case j < len(idx.aiColumn):
+			return idx.aiColumn[j]
+		}
+		return xnExpr
+	}
+	a := wherePlanAccess{known: true, index: !idx.ipk}
+	for j := w.nSkip; j < w.nEq; j++ {
+		a.eq = append(a.eq, col(j))
+	}
+	if len(w.lTerm) > w.nEq {
+		a.rangeCol, a.hasRange = col(w.nEq), true
+	}
+	return a
+}
+
 // explainLoop words the winning loop w of a one-table plan. A multi-index OR
 // loop, an automatic index, an expression index (WHERE_EXPRIDX is not tracked)
 // and a vector range bound (its nBtm/nTop, whereRangeVectorLen, is not

@@ -166,6 +166,32 @@ func (db *DB) updateOnePassOrder(tbl *tableMeta, stmt *updateStmt, trig *trigCom
 	return key, nRow, won.oneRow, ok
 }
 
+// writeLoopAccess is the access path C's one-pass planner gives an UPDATE or
+// DELETE over tbl with this WHERE, planned as updateOnePassOrder plans it;
+// unknown where the port cannot say.
+func (db *DB) writeLoopAccess(tbl *tableMeta, from FromItem, where Expr, trig *trigCompileCtx) wherePlanAccess {
+	p, err := db.segmentReadPager()
+	if err != nil || p == nil {
+		return wherePlanAccess{}
+	}
+	from.Table = tbl.name
+	sel := &SelectStmt{
+		Columns: []SelectColumn{{Expr: LiteralExpr{Val: Value{Typ: Int, I: 1}}}},
+		From:    []FromItem{from},
+		Where:   where,
+	}
+	var won wherePlanWinner
+	c := &compiler{pager: p, onePassPlan: true, planWinner: &won, trig: trig}
+	srcs, err := resolveJoinSources(p, c, sel.From)
+	if err != nil || len(srcs) != 1 || srcs[0].tbl == nil || !equalFoldName(srcs[0].tbl.name, tbl.name) {
+		return wherePlanAccess{}
+	}
+	if _, _, ok := wherePlanSingleTableIndexOrder(p, c, srcs, sel); !ok {
+		return wherePlanAccess{}
+	}
+	return won.access
+}
+
 // subqueryPlansAutoIndex reports whether C plans sel -- a subquery coded
 // inside a loop that runs nQueryLoop times -- with an AUTOMATIC INDEX on its
 // one FROM table. That index is built under OP_Once (constructAutomaticIndex,

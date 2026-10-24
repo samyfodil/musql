@@ -584,6 +584,7 @@ func markWherePlanIndexEligibility(p *ReadOnlyPager, c *compiler, srcs []joinSou
 	if !ok {
 		return
 	}
+	srcs[0].planAccess = c.planWinner.access
 	srcs[0].planExplain = won.explain
 	if won.explain.verb != "" {
 		srcs[0].planExplain.name = explainItemName(stmt.From[0])
@@ -915,6 +916,7 @@ func wherePlanSingleTableSolve(in wherePlanInput, stmt *SelectStmt, idxs []where
 			w := &fb.loops[res.loops[0]]
 			in.winner.auto, in.winner.oneRow = w.autoIdx, w.oneRow
 			in.winner.explain = fb.explainLoop(w)
+			in.winner.access = fb.accessOf(w)
 		}
 		if len(res.loops) == 1 && fb.loops[res.loops[0]].autoIdx {
 			// Not the rowid scan after all: see wherePlanSingleIndexKey's
@@ -922,6 +924,9 @@ func wherePlanSingleTableSolve(in wherePlanInput, stmt *SelectStmt, idxs []where
 			k := wherePlanAutoIndexKey(in, []int{0}, 0)
 			if k == nil {
 				return nil, 0, false
+			}
+			if in.winner != nil {
+				in.winner.access.eq = append([]int(nil), k.cols[:k.autoEq]...)
 			}
 			if reverseOrder && in.sort.nOrderBy() == 0 {
 				k = whereReversedScanKey(k)

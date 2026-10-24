@@ -204,6 +204,23 @@ type whereLoopCache struct {
 type wherePlanWinner struct {
 	auto, oneRow bool
 	explain      wherePlanExplain
+
+	// access is the loop's access path: which columns it pins (seekKeyKept,
+	// seek_raise.go).
+	access wherePlanAccess
+}
+
+// wherePlanAccess is the access path of a winning loop. eq are the columns
+// whose equality the loop consumes, xnRowid for the rowid: an index's
+// equality prefix, or every term driving an automatic index. rangeCol is the
+// column a range bound of the loop constrains, when hasRange.
+type wherePlanAccess struct {
+	known    bool
+	auto     bool
+	index    bool
+	eq       []int
+	rangeCol int
+	hasRange bool
 }
 
 // wherePlanOrder returns the FROM-item order SQLite binds its nested loops in,
@@ -514,6 +531,11 @@ type autoIndexKey struct {
 	// groupsArriveOutOfKeyOrder.
 	nEq          int
 	groupsSorted bool
+
+	// autoEq is how many leading columns of an automatic index's key its
+	// equality terms constrain (constructAutomaticIndex's nKeyCol); zero for
+	// any other key.
+	autoEq int
 }
 
 // wherePlanAutoIndexKey ports constructAutomaticIndex's key construction
@@ -566,6 +588,7 @@ func wherePlanAutoIndexKey(in wherePlanInput, order []int, level int) *autoIndex
 		// makes it unreachable. Answer "no key" rather than assume.
 		return nil
 	}
+	k.autoEq = len(k.cols)
 
 	// extraCols. IsView's ALLBITS arm and the WITHOUT ROWID PRIMARY KEY
 	// force-add are both unreachable here (the gate declines a view, a derived

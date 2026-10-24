@@ -119,12 +119,25 @@ func keyRunsBeforeTheLoop(insns []Instruction, cursor int) bool {
 // comparison's collation is the column's own, the key being a bare literal or
 // parameter. The INTEGER PRIMARY KEY column is never a key: it is stored NULL,
 // its value being the rowid.
-func emitWriteIndexSeekHint(c *compiler, tbl *tableMeta, cursor int, where Expr) bool {
+//
+// A key a conjunct that can raise comes before is kept only where C's own loop
+// leaves it exact (seekGuard): from is the target as the statement names it,
+// for asking the planner what that loop is.
+func (db *DB) emitWriteIndexSeekHint(c *compiler, tbl *tableMeta, cursor int, from FromItem, where Expr, trig *trigCompileCtx) bool {
 	if writeIndexSeekOffForTest || where == nil || tbl == nil || tbl.withoutRowid || hasGeneratedCols(tbl.cols) {
 		return false
 	}
+	cjs := splitTopLevelAnd(where)
+	guard := seekGuard{raiseAt: -1, tableRaiseAt: -1}
+	for pos, cj := range cjs {
+		if exprMayRaise(cj) && !containsSubquery(cj) && writeConjunctPerRow(cj) {
+			guard.raiseAt, guard.tableRaiseAt = pos, pos
+			guard.access = db.writeLoopAccess(tbl, from, where, trig)
+			break
+		}
+	}
 	slot := 0
-	for _, cj := range splitTopLevelAnd(where) {
+	for pos, cj := range cjs {
 		be, ok := cj.(BinaryExpr)
 		if !ok || (be.Op != "=" && be.Op != "==") || slot == maxSeekKeys {
 			continue
@@ -132,7 +145,7 @@ func emitWriteIndexSeekHint(c *compiler, tbl *tableMeta, cursor int, where Expr)
 		for _, side := range [2][2]Expr{{be.L, be.R}, {be.R, be.L}} {
 			colExpr, key := side[0], side[1]
 			col, ok := writeColumnRef(c, cursor, colExpr)
-			if !ok || col == tbl.ipkIndex || !isSeekKeyCandidate(key) {
+			if !ok || col == tbl.ipkIndex || !isSeekKeyCandidate(key) || !guard.keep(col, pos, db.leadsIndex(tbl, col)) {
 				continue
 			}
 			reg, err := c.compileExpr(key)
@@ -147,6 +160,88 @@ func emitWriteIndexSeekHint(c *compiler, tbl *tableMeta, cursor int, where Expr)
 		}
 	}
 	return slot > 0
+}
+
+// writeConsumedFirst is consumedFirst for a write's loop: loopWhere, the
+// terms it tests per row, with the equalities C's one-pass loop consumes for
+// where moved to the front when a term that can raise is among them.
+func (db *DB) writeConsumedFirst(c *compiler, tbl *tableMeta, cursor int, from FromItem, where, loopWhere Expr, trig *trigCompileCtx) Expr {
+	terms := splitTopLevelAnd(loopWhere)
+	if len(terms) < 2 {
+		return loopWhere
+	}
+	raising := false
+	for _, cj := range terms {
+		if exprMayRaise(cj) && !containsSubquery(cj) {
+			raising = true
+			break
+		}
+	}
+	if !raising {
+		return loopWhere
+	}
+	a := db.writeLoopAccess(tbl, from, where, trig)
+	if !a.known || a.auto || len(a.eq) == 0 {
+		return loopWhere
+	}
+	taken := make([]bool, len(terms))
+	var out []Expr
+	for _, col := range a.eq {
+		for k, cj := range terms {
+			if !taken[k] && writeEqualityOnColumn(c, tbl, cursor, cj, col) {
+				taken[k] = true
+				out = append(out, cj)
+				break
+			}
+		}
+	}
+	if len(out) == 0 {
+		return loopWhere
+	}
+	for k, cj := range terms {
+		if !taken[k] {
+			out = append(out, cj)
+		}
+	}
+	return andConjuncts(out)
+}
+
+// writeEqualityOnColumn is equalityOnColumn over a write's target cursor.
+func writeEqualityOnColumn(c *compiler, tbl *tableMeta, cursor int, cj Expr, col int) bool {
+	be, ok := cj.(BinaryExpr)
+	if !ok || be.Op != "=" && be.Op != "==" && be.Op != "IS" {
+		return false
+	}
+	for _, side := range [2][2]Expr{{be.L, be.R}, {be.R, be.L}} {
+		if !isSeekKeyCandidate(side[1]) {
+			continue
+		}
+		if col == xnRowid && writeRowidRef(c, tbl, cursor, side[0]) {
+			return true
+		}
+		if got, ok := writeColumnRef(c, cursor, side[0]); ok && got == col {
+			return true
+		}
+	}
+	return false
+}
+
+// writeConjunctPerRow reports whether a write tests conjunct e on every row
+// rather than once before its loop: it names a column.
+func writeConjunctPerRow(e Expr) bool {
+	named := false
+	forEachColumnRef(e, func(ColumnExpr) { named = true })
+	return named
+}
+
+// leadsIndex reports whether a declared index on tbl leads with column col.
+func (db *DB) leadsIndex(tbl *tableMeta, col int) bool {
+	for _, idx := range db.indexes {
+		if indexBelongsTo(idx, tbl) && len(idx.colIdx) > 0 && idx.colIdx[0] == col {
+			return true
+		}
+	}
+	return false
 }
 
 // writeColumnRef reports whether e is a plain reference to a stored column of

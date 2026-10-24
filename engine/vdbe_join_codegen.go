@@ -119,6 +119,9 @@ type joinSource struct {
 	// planExplain is the same plan's EXPLAIN QUERY PLAN line, carried to the
 	// source's index seek (indexSeekPlan.plan).
 	planExplain wherePlanExplain
+	// planAccess is the same plan's access path, which decides the seek keys
+	// a WHERE that can raise an error leaves exact (seekKeyKept).
+	planAccess wherePlanAccess
 
 	// onToWhere marks an INNER item whose ON clause was moved into the WHERE, as
 	// sqlite3ProcessJoin does before planning. Its conjuncts are bucketed by
