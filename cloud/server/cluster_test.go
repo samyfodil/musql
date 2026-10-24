@@ -392,9 +392,6 @@ func TestClusterDeclinesWhatCRDTCannotReplicate(t *testing.T) {
 			t.Fatalf("type %v: %v", typ, err)
 		}
 	}
-	if _, err := dbs.Restore(ctx, auth(n.admin, &v1.RestoreRequest{Org: "acme", Name: "app"})); err == nil || !strings.Contains(err.Error(), "crdt") {
-		t.Fatalf("restore of a crdt database: %v", err)
-	}
 }
 
 func TestClusterEveryNodeServesIdentity(t *testing.T) {

@@ -136,7 +136,9 @@ file's capture guard). See `DESIGN.md`, Deployments.
 So no restored file goes back into a replicated group as it is: it carries
 this node's site id and op log, and a second file under one site is two
 writers of one log. A `crdt` database's export, branch and restore go
-through a **plain copy** instead.
+through a **plain copy** instead. None of them runs on a node still in its
+first sync of the database, which holds only part of it: they answer
+Unavailable, as Hrana does.
 
 ### Plain copy
 
@@ -186,7 +188,8 @@ replicated `*sql.DB`, in one transaction, so it is never half done:
 The writes are captured like any others, with fresh HLCs, and win
 last-writer-wins on every node: every node converges to the state at T plus
 the writes made concurrently with the restore, and a cell the restore did not
-change keeps any concurrent write to it. The restore is a commit like others,
+change keeps any concurrent write to it (but for a row it deletes and inserts
+again, below). The restore is a commit like others,
 so the history stays linear and a restore to before it undoes it.
 
 - **UNIQUE**: deletes run first and inserts last. An update that fails on a

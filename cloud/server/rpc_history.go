@@ -81,8 +81,8 @@ func (s databaseService) Restore(ctx context.Context, req *connect.Request[v1.Re
 	if err != nil {
 		return nil, err
 	}
-	if d.Type == state.TypeCRDT {
-		return nil, errCRDTHistory
+	if err := s.localCopy(ctx, d); err != nil {
+		return nil, err
 	}
 	at := time.Now()
 	if m.At != nil {
@@ -92,7 +92,11 @@ func (s databaseService) Restore(ctx context.Context, req *connect.Request[v1.Re
 		if m.NewName != "" {
 			return nil, invalid("in_place and new_name exclude each other")
 		}
-		if err := s.restoreInPlace(ctx, d, at); err != nil {
+		restore := s.restoreInPlace
+		if d.Type == state.TypeCRDT {
+			restore = s.restoreCRDTInPlace
+		}
+		if err := restore(ctx, d, at); err != nil {
 			return nil, restoreErr(err)
 		}
 		return connect.NewResponse(&v1.RestoreResponse{Database: s.dbToProto(ctx, o, d)}), nil
@@ -111,12 +115,21 @@ func (s databaseService) Restore(ctx context.Context, req *connect.Request[v1.Re
 	if err := os.MkdirAll(filepath.Dir(s.dbPath(nd)), 0o700); err != nil {
 		return nil, rpcErr(err)
 	}
-	if err := s.copyAt(ctx, d, at, false, s.dbPath(nd)); err != nil {
+	err = restoreErr(s.copyAt(ctx, d, at, false, s.dbPath(nd)))
+	if err == nil && nd.Type == state.TypeCRDT {
+		err = checkCRDT(ctx, s.dbPath(nd))
+	}
+	if err != nil {
 		s.removeFiles(nd)
-		return nil, restoreErr(err)
+		return nil, err
 	}
 	if err := s.host(ctx, nd); err != nil {
 		return nil, err
+	}
+	if nd.Type == state.TypeCRDT {
+		if err := s.openCRDT(ctx, nd); err != nil {
+			s.log.Printf("open %s: %v", nd.ID, err)
+		}
 	}
 	return connect.NewResponse(&v1.RestoreResponse{Database: s.dbToProto(ctx, o, nd)}), nil
 }

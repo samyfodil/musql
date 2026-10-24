@@ -132,13 +132,18 @@ func (s databaseService) Create(ctx context.Context, req *connect.Request[v1.Cre
 	if err != nil {
 		return nil, err
 	}
-	if typ == state.TypeCRDT && src != nil {
-		return nil, errCRDTHistory
+	if src != nil {
+		if err := s.localCopy(ctx, src); err != nil {
+			return nil, err
+		}
 	}
 	d := &state.Database{ID: state.NewID(), OrgID: o.ID, Name: m.Name, GroupID: g.ID, SchemaOnly: m.SchemaOnly, Type: typ}
 	if typ == state.TypeCRDT && !s.placedHere(ctx, d) {
-		if m.GetUpload() != "" {
+		switch {
+		case m.GetUpload() != "":
 			return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("upload into a crdt database on a node of its group: %w", s.notHere(ctx, d)))
+		case src != nil:
+			return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("branch into a crdt database on a node of its group: %w", s.notHere(ctx, d)))
 		}
 		// The nodes of its group create the file when they see the record.
 		if err := s.store.CreateDatabase(ctx, d); err != nil {

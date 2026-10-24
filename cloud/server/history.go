@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/samyfodil/musql/replication"
+
 	"github.com/samyfodil/musql/cloud/state"
 	"github.com/samyfodil/musql/cloud/store"
 )
@@ -110,7 +112,8 @@ func (s *Server) runSnapshots(stop <-chan struct{}) {
 }
 
 // copyAt writes src's state at `at` (now when at is zero) to dst, a new file;
-// schemaOnly keeps its objects and none of its rows.
+// schemaOnly keeps its objects and none of its rows. A crdt database's is a
+// plain copy, without replication's bookkeeping.
 func (s *Server) copyAt(ctx context.Context, src *state.Database, at time.Time, schemaOnly bool, dst string) error {
 	h, err := s.history(src)
 	if err != nil {
@@ -119,10 +122,11 @@ func (s *Server) copyAt(ctx context.Context, src *state.Database, at time.Time, 
 	if at.IsZero() {
 		at = time.Now()
 	}
-	if !schemaOnly {
+	crdt := src.Type == state.TypeCRDT
+	if !schemaOnly && !crdt {
 		return h.Restore(at, dst)
 	}
-	tmp, err := os.MkdirTemp(s.cfg.DataDir, "schema-")
+	tmp, err := os.MkdirTemp(s.cfg.DataDir, "copy-")
 	if err != nil {
 		return err
 	}
@@ -130,6 +134,19 @@ func (s *Server) copyAt(ctx context.Context, src *state.Database, at time.Time, 
 	full := filepath.Join(tmp, "db.musq")
 	if err := h.Restore(at, full); err != nil {
 		return err
+	}
+	if crdt {
+		plain := dst
+		if schemaOnly {
+			plain = filepath.Join(tmp, "plain.musq")
+		}
+		if err := replication.PlainCopy(ctx, full, plain); err != nil {
+			return err
+		}
+		full = plain
+	}
+	if !schemaOnly {
+		return nil
 	}
 	return store.SchemaOnly(ctx, full, dst)
 }
