@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"cmp"
+	"math"
 	"slices"
 	"sort"
 	"strings"
@@ -396,6 +398,100 @@ func (p *ReadOnlyPager) SeekIndexRowidsSegments(rootPage uint32, col int, probe 
 		return nil, false
 	}
 	return p.segs.seekIndexRowids(rootPage, col, probe)
+}
+
+// idxSeekKey is one equality an index seek can be answered from: the table
+// column, the probe already coerced to the comparison's affinity, and the
+// comparison's collation.
+type idxSeekKey struct {
+	col   int
+	probe Value
+	coll  string
+}
+
+// SeekIndexRowidsByKeys is SeekIndexRowidsSegments over equalities on one
+// table. Each key's candidates are a superset of the rows that match all of
+// them, so the key whose column the segments say holds the fewest matching rows
+// is asked first, and a key they cannot answer gives way to the next.
+//
+// A key matching half the table or more is dropped: fetching each of its rows
+// costs more than the scan, which tests them all at a fraction of the price
+// (25,000 rows, every one matching: 14.2ms through the seek, 10.4ms scanned).
+// With no key left the scan answers.
+func (p *ReadOnlyPager) SeekIndexRowidsByKeys(rootPage uint32, keys []idxSeekKey) ([]int64, bool) {
+	if p == nil || p.segs == nil {
+		return nil, false
+	}
+	if len(keys) == 1 {
+		k := keys[0]
+		if n, total, ok := p.segs.seekIndexEstimate(rootPage, k.col, k.probe); ok && total >= seekMinRows && 2*n >= total {
+			return nil, false
+		}
+		return p.SeekIndexRowidsSegments(rootPage, k.col, k.probe, k.coll)
+	}
+	est := make([]int, len(keys))
+	order := make([]int, 0, len(keys))
+	for i, k := range keys {
+		est[i] = math.MaxInt
+		if n, total, ok := p.segs.seekIndexEstimate(rootPage, k.col, k.probe); ok {
+			if total >= seekMinRows && 2*n >= total {
+				continue
+			}
+			est[i] = n
+		}
+		order = append(order, i)
+	}
+	slices.SortStableFunc(order, func(a, b int) int { return cmp.Compare(est[a], est[b]) })
+	for _, i := range order {
+		if rowids, ok := p.SeekIndexRowidsSegments(rootPage, keys[i].col, keys[i].probe, keys[i].coll); ok {
+			segMultiKeySeeksServed.Add(1)
+			return rowids, true
+		}
+	}
+	return nil, false
+}
+
+// seekMinRows is the table size below which a seek is never traded for the
+// scan: either is cheap there.
+const seekMinRows = 256
+
+// segMultiKeySeeksServed counts the seeks SeekIndexRowidsByKeys answered, for
+// tests.
+var segMultiKeySeeksServed atomic.Int64
+
+// seekIndexEstimate is how many rows of the table's segments hold probe in col,
+// counted in each segment's index without building a list, and how many rows
+// those segments hold. It leaves out the delta log and the session's own
+// writes, which every key's candidates take in alike. false when a segment keeps
+// no index this probe can ask.
+func (src *segSource) seekIndexEstimate(rootPage uint32, col int, probe Value) (n, total int, ok bool) {
+	rows, live, err := src.liveRows(rootPage)
+	if err != nil {
+		return 0, 0, false
+	}
+	segs, ok := src.byRoot[rootPage]
+	if live {
+		if probe.Typ == Int && rows.prefersEqIndex(col) {
+			hits, ok := rows.eqRowids(col, probe.I)
+			return len(hits), len(rows.m), ok
+		}
+		if rows.seg == nil || rows.seg.rp == nil || rows.seg.rp.segs == nil {
+			return 0, 0, false
+		}
+		segs, ok = rows.seg.rp.segs.byRoot[rows.seg.root]
+	}
+	if !ok {
+		return 0, 0, false
+	}
+	for _, sg := range segs {
+		c, ok := sg.segEqualityCountOf(col, probe)
+		if !ok {
+			return 0, 0, false
+		}
+		n += c
+		total += sg.nRows
+	}
+	return n, total, true
 }
 
 // RowidBound is min(rowid) (max false) or max(rowid) of the table rooted at

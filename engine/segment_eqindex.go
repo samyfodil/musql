@@ -158,6 +158,19 @@ func (s *segment) segEqualityRowsBytes(col int, probe []byte) ([]int32, bool) {
 	return x.rowsForBytes(probe, nil)
 }
 
+// segEqualityCountOf is how many rows hold probe in col, a TEXT or BLOB probe
+// compared under BINARY, without building their positions. false when this
+// column has no index the probe can ask.
+func (s *segment) segEqualityCountOf(col int, probe Value) (int, bool) {
+	s.eqMu.Lock()
+	x, ok := s.diskIndexFor(col)
+	s.eqMu.Unlock()
+	if !ok {
+		return 0, false
+	}
+	return x.countForValue(probe)
+}
+
 // segEqualityRowsFloat is segEqualityRows for a REAL probe.
 func (s *segment) segEqualityRowsFloat(col int, probe float64) ([]int32, bool) {
 	s.eqMu.Lock()

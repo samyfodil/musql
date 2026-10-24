@@ -2004,10 +2004,24 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			cur := m.cursors[op.P1]
 			switch h := op.P4.(type) {
 			case *indexSeekHint:
-				cur.idxSeekConfigured = true
-				cur.idxSeekProbe = applyAffinityToValue(m.regs[op.P2], h.aff)
-				cur.idxSeekColl = h.coll
-				cur.idxSeekCol = h.leadingCol
+				probe := applyAffinityToValue(m.regs[op.P2], h.aff)
+				if h.slot == 0 {
+					cur.idxSeekConfigured, cur.idxSeekMore, cur.idxSeekNext = false, cur.idxSeekMore[:0], 0
+				}
+				// A slot out of step is dropped, and so is the key of "x IS NULL",
+				// which no posting list holds: the keys left bound the rows each
+				// on its own, and with none the scan decides.
+				if h.slot == cur.idxSeekNext {
+					cur.idxSeekNext++
+					switch {
+					case h.is && probe.Typ == Null:
+					case !cur.idxSeekConfigured:
+						cur.idxSeekConfigured = true
+						cur.idxSeekProbe, cur.idxSeekColl, cur.idxSeekCol = probe, h.coll, h.leadingCol
+					default:
+						cur.idxSeekMore = append(cur.idxSeekMore, idxSeekKey{col: h.leadingCol, probe: probe, coll: h.coll})
+					}
+				}
 			default:
 				return nil, fmt.Errorf("vdbe: OpSeekIndexHint without a plan")
 			}

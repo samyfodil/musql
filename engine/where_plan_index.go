@@ -802,6 +802,9 @@ type whereIdxTerm struct {
 	// constant false tag-20230504-1 makes it -- mirrored for
 	// whereUsablePartialIndex (where_plan_partial.go). nil is unknown.
 	pcx *pcx
+	// vector is a row-value range, "(a,b) > (?,?)": a range on its first
+	// element's column whose nBtm/nTop (whereRangeVectorLen) is not computed.
+	vector bool
 }
 
 // whereIdxLoop is one priced WhereLoop. Only what decides the winner and its
@@ -2949,6 +2952,7 @@ func wherePlanSingleIndexKey(in wherePlanInput, reverseOrder bool) (key *autoInd
 	}
 	if in.winner != nil {
 		in.winner.auto, in.winner.oneRow = w.autoIdx, w.oneRow
+		in.winner.explain = b.explainLoop(w)
 	}
 	if w.autoIdx {
 		// A trusted nested compile's seed is MIN(nQueryLoop,48) (where.c:5921),

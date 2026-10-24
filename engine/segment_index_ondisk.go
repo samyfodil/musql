@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"math"
 	"slices"
+	"sort"
 	"sync"
 	"unsafe"
 )
@@ -584,11 +585,8 @@ func (x *segDiskIndex) findBytes(probe []byte) (int, bool) {
 	return lo, lo < x.nVals && bytes.Equal(x.bytesAt(lo), probe)
 }
 
-// rowsForFloat is rowsFor for a REAL probe.
-func (x *segDiskIndex) rowsForFloat(probe float64, dst []int32) ([]int32, bool) {
-	if x.codec != segIdxCodecFloat || math.IsNaN(probe) {
-		return dst, false
-	}
+// findFloat is find for segIdxCodecFloat.
+func (x *segDiskIndex) findFloat(probe float64) (int, bool) {
 	lo, hi := 0, x.nVals
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
@@ -598,10 +596,56 @@ func (x *segDiskIndex) rowsForFloat(probe float64, dst []int32) ([]int32, bool) 
 			hi = mid
 		}
 	}
-	if lo >= x.nVals || math.Float64frombits(uint64(x.valueAt(lo))) != probe {
+	return lo, lo < x.nVals && math.Float64frombits(uint64(x.valueAt(lo))) == probe
+}
+
+// rowsForFloat is rowsFor for a REAL probe.
+func (x *segDiskIndex) rowsForFloat(probe float64, dst []int32) ([]int32, bool) {
+	if x.codec != segIdxCodecFloat || math.IsNaN(probe) {
+		return dst, false
+	}
+	i, ok := x.findFloat(probe)
+	if !ok {
 		return dst, true
 	}
-	return x.appendPosts(lo, dst), true
+	return x.appendPosts(i, dst), true
+}
+
+// countForValue is countFor for a probe of any storage class, TEXT and BLOB
+// under BINARY: false when this index's codec cannot answer it, never a count
+// of zero standing in for no answer.
+func (x *segDiskIndex) countForValue(probe Value) (int, bool) {
+	switch probe.Typ {
+	case Int:
+		return x.countFor(probe.I)
+	case Float:
+		if x.codec != segIdxCodecFloat || math.IsNaN(probe.F) {
+			return 0, false
+		}
+		i, ok := x.findFloat(probe.F)
+		if !ok {
+			return 0, true
+		}
+		return int(x.start(i+1) - x.start(i)), true
+	case Text, Blob:
+		switch x.codec {
+		case segIdxCodecBytes:
+			i, ok := x.findBytes(probe.S)
+			if !ok {
+				return 0, true
+			}
+			return int(x.start(i+1) - x.start(i)), true
+		case segIdxCodecBytesPerm:
+			at := func(k int) []byte {
+				v, _ := x.rowBytes(int(uint24(x.posts[3*k:]))) // validated at open
+				return v
+			}
+			lo := sort.Search(x.nRows, func(k int) bool { return bytes.Compare(at(k), probe.S) >= 0 })
+			hi := sort.Search(x.nRows, func(k int) bool { return bytes.Compare(at(k), probe.S) > 0 })
+			return hi - lo, true
+		}
+	}
+	return 0, false
 }
 
 // rowsForBytes is rowsFor for a TEXT or BLOB probe.

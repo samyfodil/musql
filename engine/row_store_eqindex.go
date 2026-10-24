@@ -1,6 +1,9 @@
 package engine
 
-import "slices"
+import (
+	"math"
+	"slices"
+)
 
 // An equality index over a write session's row store.
 // This is the sibling of segment_eqindex.go's posting list,
@@ -84,18 +87,20 @@ func (s *rowStore) eqRowids(col int, v int64) ([]uint64, bool) {
 	return out, true
 }
 
-// segEqRowids is a write's equality candidates for col = v on a store over
+// segEqRowids is a write's equality candidates for col = probe on a store over
 // segments, ascending: the committed rows the segments' own column index
 // names (and the delta's, which segIndexRowids cannot see), less those this
 // store has written over or deleted, plus every row it has written whose
-// column could equal v. A superset -- the WHERE is tested again on each row
-// -- so a value the index cannot judge is a candidate rather than a refusal.
+// column could equal probe. A superset -- the WHERE is tested again on each
+// row -- so a value the index cannot judge is a candidate rather than a
+// refusal. A TEXT or BLOB probe is matched as bytes, which is equality under
+// BINARY only: the caller refuses a TEXT probe under another sequence.
 //
 // It is what keeps a held connection's writes off eqIndexFor's walk: that
 // builds an index of the whole table from rows read back one by one, and a
 // compaction -- which rebases the store -- threw it away, so the UPDATE after
 // every compaction paid the walk again.
-func (s *rowStore) segEqRowids(col int, v int64) ([]uint64, bool) {
+func (s *rowStore) segEqRowids(col int, probe Value) ([]uint64, bool) {
 	if s == nil || s.seg == nil || s.spill != nil || s.seg.rp == nil || s.seg.rp.segs == nil {
 		return nil, false
 	}
@@ -104,7 +109,7 @@ func (s *rowStore) segEqRowids(col int, v int64) ([]uint64, bool) {
 	if !ok {
 		return nil, false
 	}
-	hits, ok := segIndexRowids(segs, col, Value{Typ: Int, I: v})
+	hits, ok := segIndexRowids(segs, col, probe)
 	if !ok {
 		return nil, false
 	}
@@ -120,7 +125,7 @@ func (s *rowStore) segEqRowids(col int, v int64) ([]uint64, bool) {
 		}
 	}
 	for rid, vals := range s.m {
-		if col >= len(vals) || vals[col].Typ != Int || vals[col].I == v {
+		if col >= len(vals) || !certainlyUnequal(vals[col], probe) {
 			out = append(out, rid)
 		}
 	}
@@ -130,6 +135,24 @@ func (s *rowStore) segEqRowids(col int, v int64) ([]uint64, bool) {
 	}
 	radixSortRowids(out)
 	return slices.Compact(out), true
+}
+
+// segEqEstimate is how many of the store's base segment rows hold probe in col,
+// math.MaxInt when they cannot say: the measure a write seek over several keys
+// picks its key by.
+func (s *rowStore) segEqEstimate(col int, probe Value) int {
+	if s == nil || s.seg == nil || s.seg.rp == nil || s.seg.rp.segs == nil {
+		return math.MaxInt
+	}
+	n := 0
+	for _, sg := range s.seg.rp.segs.byRoot[s.seg.root] {
+		c, ok := sg.segEqualityCountOf(col, probe)
+		if !ok {
+			return math.MaxInt
+		}
+		n += c
+	}
+	return n
 }
 
 // eqIndexFor builds col's index on first use and caches it.

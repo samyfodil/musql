@@ -577,19 +577,7 @@ func compileScanPlain(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols 
 	// (the key needs no other cursor). One source per query (the first
 	// eligible conjunct); others may still get a correlated seek
 	// (annotateJoinSeeks).
-	if idx, key, ok := detectRowidSeekKey(c, srcs, stmt.Where); ok {
-		srcs[idx].seekKeyExpr = key
-	} else if idx, plan, ok := detectIndexSeekKey(c, srcs, stmt.Where); ok {
-		// No rowid lookup applied; try a secondary-index leading-column equality
-		// seek. Same pure candidate-set restriction (the conjunct stays in
-		// WHERE and is re-tested on every fetched row), so it too is
-		// result-neutral. See detectIndexSeekKey.
-		srcs[idx].idxSeek = plan
-	} else if key, ok := detectRowidRangeKey(c, srcs, stmt.Where); ok {
-		// No equality to seek: a bound on the rowid still skips the rows
-		// below or above it, the same pure restriction.
-		srcs[0].rowidRange = key
-	}
+	planConstantKeySeeks(c, srcs, stmt.Where, true)
 
 	// A row-mode scan evaluates WHERE and the select list with every cursor
 	// positioned at the current row, so a correlated subquery compiled beneath
@@ -1004,6 +992,30 @@ func isScopeRowidRef(c *compiler, s joinSource, e Expr) bool {
 	return s.tbl.ipkIndex >= 0 && colIdx == s.tbl.ipkIndex
 }
 
+// planConstantKeySeeks installs the seek a column-free key allows on one
+// source: a rowid point lookup; else the index equalities (detectIndexSeekKey),
+// which carry the planner's EXPLAIN QUERY PLAN line; else, with rowidRange, a
+// bound on the rowid. Each only restricts the candidates -- every conjunct stays
+// in the WHERE and is re-tested on each fetched row -- and leaves them in the
+// order the scan visits them, so it is result-neutral.
+func planConstantKeySeeks(c *compiler, srcs []joinSource, where Expr, rowidRange bool) {
+	if idx, key, ok := detectRowidSeekKey(c, srcs, where); ok {
+		srcs[idx].seekKeyExpr = key
+		return
+	}
+	if idx, plan, ok := detectIndexSeekKey(c, srcs, where); ok {
+		plan.plan = srcs[idx].planExplain
+		srcs[idx].idxSeek = plan
+		return
+	}
+	if !rowidRange {
+		return
+	}
+	if key, ok := detectRowidRangeKey(c, srcs, where); ok {
+		srcs[0].rowidRange = key
+	}
+}
+
 // isSeekKeyCandidate reports whether e is a column-free constant seek key: a
 // literal or a bound parameter. Restricting to these two forms keeps the key
 // trivially evaluable before the scan starts (no cursor row is positioned yet)
@@ -1039,6 +1051,17 @@ type indexSeekPlan struct {
 	leadingCol int
 	// index is the index's name (indexSeekCandidate.name).
 	index string
+
+	// is marks "x IS key", whose NULL key matches x's NULLs rather than nothing.
+	is bool
+
+	// more are the other equalities on this table a seek can be answered from,
+	// emitted as OpSeekIndexHint's later slots. Any one of them bounds the
+	// rows, so the cursor asks the one the segments say holds fewest.
+	more []*indexSeekPlan
+	// plan is the loop the ported planner chose for the table, for EXPLAIN
+	// QUERY PLAN (markWherePlanIndexEligibility); empty when it did not decide.
+	plan wherePlanExplain
 }
 
 // detectIndexSeekKey looks for a WHERE conjunct "<indexed-col> = <const>" a
@@ -1053,6 +1076,10 @@ type indexSeekPlan struct {
 //   - a top-level AND conjunct is "="/"==" between that column and a
 //     column-free key (isSeekKeyCandidate).
 //
+// Every such conjunct on that source is kept, the first as the plan and the
+// rest in its more: "WHERE tbl=? AND pk=?" over a key whose leading column
+// holds one value for the whole table is answered from pk's posting list.
+//
 // As with detectRowidSeekKey the key is evaluated once after OpOpenRead, and
 // the conjunct stays in WHERE, so the seek only restricts. The probe
 // reproduces the equality exactly: the key is coerced with comparisonAffinity
@@ -1060,7 +1087,7 @@ type indexSeekPlan struct {
 // resolveCompareCollation's. SeekIndexRowidsSegments returns rows in rowid
 // order, matching a full scan.
 func detectIndexSeekKey(c *compiler, srcs []joinSource, where Expr) (int, *indexSeekPlan, bool) {
-	if c == nil || c.pager == nil || where == nil {
+	if c == nil || c.pager == nil || where == nil || indexSeeksOffForTest {
 		return 0, nil, false
 	}
 	conjuncts := seekConjuncts(where)
@@ -1096,24 +1123,51 @@ func detectIndexSeekKey(c *compiler, srcs []joinSource, where Expr) (int, *index
 		if !automaticSeeksOffForTest {
 			cands = append(cands, automaticSeekCandidates(s.tbl.cols, cands)...)
 		}
+		var first *indexSeekPlan
 		for _, cj := range conjuncts {
+			// "x IS ?" is "x = ?" for every key but NULL, which no posting list
+			// holds: a NULL probe is never served, and the scan decides.
 			be, ok := cj.(BinaryExpr)
-			if !ok || (be.Op != "=" && be.Op != "==") {
+			if !ok || (be.Op != "=" && be.Op != "==" && be.Op != "IS") {
 				continue
 			}
-			if colIdx, ok := scopeColumnIndex(c, s, be.L); ok && (isSeekKeyCandidate(be.R) || isOuterSeekKey(c, be.R)) {
-				if plan, ok := planForColumn(c, cands, colIdx, be.L, be.R); ok && outerSeekCollationAgrees(c, be, plan) {
-					return i, plan, true
-				}
+			plan, ok := columnSeekPlan(c, s, cands, be, be.L, be.R)
+			if !ok {
+				plan, ok = columnSeekPlan(c, s, cands, be, be.R, be.L)
 			}
-			if colIdx, ok := scopeColumnIndex(c, s, be.R); ok && (isSeekKeyCandidate(be.L) || isOuterSeekKey(c, be.L)) {
-				if plan, ok := planForColumn(c, cands, colIdx, be.R, be.L); ok && outerSeekCollationAgrees(c, be, plan) {
-					return i, plan, true
-				}
+			switch {
+			case !ok:
+			case first == nil:
+				first = plan
+			case len(first.more) < maxSeekKeys-1:
+				first.more = append(first.more, plan)
 			}
+		}
+		if first != nil {
+			return i, first, true
 		}
 	}
 	return 0, nil, false
+}
+
+// maxSeekKeys bounds how many equalities one seek weighs against each other.
+const maxSeekKeys = 8
+
+// columnSeekPlan is the seek on "colExpr = keyExpr" when colExpr is a column of
+// s some candidate leads on and keyExpr is constant for the scan. The INTEGER
+// PRIMARY KEY column is the rowid's (detectRowidSeekKey): it is stored NULL, so
+// no column index holds its values.
+func columnSeekPlan(c *compiler, s joinSource, cands []indexSeekCandidate, be BinaryExpr, colExpr, keyExpr Expr) (*indexSeekPlan, bool) {
+	colIdx, ok := scopeColumnIndex(c, s, colExpr)
+	if !ok || colIdx == s.tbl.ipkIndex || !isSeekKeyCandidate(keyExpr) && !isOuterSeekKey(c, keyExpr) {
+		return nil, false
+	}
+	plan, ok := planForColumn(c, cands, colIdx, colExpr, keyExpr)
+	if !ok || !outerSeekCollationAgrees(c, be, plan) {
+		return nil, false
+	}
+	plan.is = be.Op == "IS"
+	return plan, true
 }
 
 // isOuterSeekKey reports a seek key that is a column of an ENCLOSING query --
@@ -1148,8 +1202,9 @@ func outerSeekCollationAgrees(c *compiler, be BinaryExpr, plan *indexSeekPlan) b
 }
 
 // automaticSeeksOffForTest turns automaticSeekCandidates off, so a test can
-// run the same SQL with and without them.
-var automaticSeeksOffForTest bool
+// run the same SQL with and without them. indexSeeksOffForTest turns every
+// constant-key index seek off.
+var automaticSeeksOffForTest, indexSeeksOffForTest bool
 
 // automaticSeekCandidates is C's automatic index (where.c's AUTOINDEX), for
 // free: every plain column with no SQL index of its own already has one, the

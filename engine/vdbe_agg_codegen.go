@@ -258,11 +258,7 @@ func compileScanAggregate(c *compiler, stmt *SelectStmt, srcs []joinSource, scop
 	// and the order is unchanged: a rowid key pins one row, and an equality on an
 	// index's leading column visits rows in ascending rowid, their full-scan order.
 	// Order matters here for group_concat and the min()/max() anchor.
-	if idx, key, ok := detectRowidSeekKey(c, srcs, stmt.Where); ok {
-		srcs[idx].seekKeyExpr = key
-	} else if idx, iplan, ok := detectIndexSeekKey(c, srcs, stmt.Where); ok {
-		srcs[idx].idxSeek = iplan
-	}
+	planConstantKeySeeks(c, srcs, stmt.Where, false)
 
 	// Predicate pushdown: see compileScanPlain (vdbe_scan.go). buckets prune at
 	// their join level; this body tests only the deferred residue. (The local
