@@ -3,6 +3,7 @@ package replication
 import (
 	"context"
 	"log"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -177,23 +178,35 @@ func (n *Node) Sync(ctx context.Context) error {
 // Run drives the node until ctx is cancelled: it applies ops pushed by peers as
 // they arrive and runs a full anti-entropy Sync every syncInterval. It works
 // with any Transport (in-memory or libp2p), using only the Transport interface.
+//
+// Pushed ops apply on a goroutine of their own: a Sync round waits on each
+// peer in turn, and the pushes queued behind it waited as long.
 func (n *Node) Run(ctx context.Context, syncInterval time.Duration) error {
 	ch, err := n.tr.SubscribePush(ctx)
 	if err != nil {
 		return err
 	}
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	wg.Go(func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case po, ok := <-ch:
+				if !ok {
+					return // push stream closed; rely on periodic Sync
+				}
+				n.applyPushed(ctx, drain(ch, po.Op))
+			}
+		}
+	})
 	ticker := time.NewTicker(syncInterval)
 	defer ticker.Stop()
 	for round := 0; ; {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case po, ok := <-ch:
-			if !ok {
-				ch = nil // push stream closed; rely on periodic Sync
-				continue
-			}
-			n.applyPushed(ctx, drain(ch, po.Op))
 		case <-ticker.C:
 			if err := n.Sync(ctx); err != nil {
 				log.Printf("replication: sync round: %v", err)
