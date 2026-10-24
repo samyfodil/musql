@@ -550,10 +550,13 @@ export default function App() {
 	// openCloud opens a database of the cloud server in the editor, over Hrana
 	// with a short-lived token the cloud page minted (renewed while the
 	// connection is open); it is not kept in the connection list, since the
-	// token would outlive its use.
-	const openCloud = async (c) => {
+	// token would outlive its use. renamedFrom is the name the database was
+	// open under: it keeps its tabs, and the page stays where it is.
+	const openCloud = async (c, renamedFrom) => {
+		const view = renamedFrom && viewState(renamedFrom);
+		if (view) viewState(c.name, view);
 		await openDatabase(c.name, undefined, undefined, null, c);
-		if (backend().url === c.url) setSection("tables");
+		if (!renamedFrom && backend().url === c.url) setSection("tables");
 	};
 	const goCloud = (page) => {
 		setSection("cloud");
@@ -757,7 +760,7 @@ export default function App() {
 				</aside>
 
 				<main className="main">
-					{section === "cloud" && <div className="cloudmain"><CloudMain cloud={cloud} page={cloudPage} setPage={setCloudPage} toast={toast} onOpen={openCloud} /></div>}
+					{section === "cloud" && <div className="cloudmain"><CloudMain cloud={cloud} page={cloudPage} setPage={setCloudPage} toast={toast} onOpen={openCloud} current={cloudTarget} /></div>}
 					{dbName && section !== "cloud" && (
 						<div className="tabs">
 							{tabsShown.map((t) => (
