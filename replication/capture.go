@@ -329,17 +329,32 @@ func (c *capture) flush(ctx context.Context) error {
 	if len(c.buf) == 0 {
 		return nil
 	}
-	ops, err := c.stamp(ctx)
+	// Numbered on from the last seq this node noted, without reading the log
+	// first: a commit this node has not noted yet holds the next seq, which
+	// the first op's insert finds, and then they go past the log's last.
+	ops := c.stampFrom(c.s.store.ownSeq.Load())
+	wrote, err := c.writeOp(ctx, ops[0], true)
 	if err != nil {
 		return err
 	}
-	for _, op := range ops {
-		if err := c.writeOp(ctx, op); err != nil {
+	if !wrote {
+		seq, err := c.logSeq(ctx)
+		if err != nil {
 			return err
 		}
-		c.flushed = append(c.flushed, op)
+		for i := range ops {
+			ops[i].Seq = seq + 1 + uint64(i)
+		}
+		if _, err := c.writeOp(ctx, ops[0], false); err != nil {
+			return err
+		}
 	}
-	c.buf = c.buf[:0]
+	for _, op := range ops[1:] {
+		if _, err := c.writeOp(ctx, op, false); err != nil {
+			return err
+		}
+	}
+	c.flushed = append(c.flushed, ops...)
 	return nil
 }
 
@@ -395,6 +410,11 @@ func (c *capture) stamp(ctx context.Context) ([]Op, error) {
 	if err != nil {
 		return nil, err
 	}
+	return c.stampFrom(seq), nil
+}
+
+// stampFrom is stamp numbering the ops on from seq.
+func (c *capture) stampFrom(seq uint64) []Op {
 	ops := make([]Op, len(c.buf))
 	for i, op := range c.buf {
 		seq++
@@ -402,7 +422,7 @@ func (c *capture) stamp(ctx context.Context) ([]Op, error) {
 		ops[i] = op
 	}
 	c.buf = c.buf[:0]
-	return ops, nil
+	return ops
 }
 
 // lastSeq is this site's highest seq as this transaction reads the log. A
@@ -417,7 +437,14 @@ func (c *capture) lastSeq(ctx context.Context) (uint64, error) {
 	if err != nil || len(rows) == 0 {
 		return seq, err
 	}
-	if rows, err = c.conn.Query(ctx, maxSeqQuery, c.s.site, c.s.site); err != nil {
+	return c.logSeq(ctx)
+}
+
+// logSeq is this site's highest seq in the log as this transaction reads it,
+// or the floor it was pruned to.
+func (c *capture) logSeq(ctx context.Context) (uint64, error) {
+	rows, err := c.conn.Query(ctx, maxSeqQuery, c.s.site, c.s.site)
+	if err != nil {
 		return 0, err
 	}
 	if n, ok := rows[0][0].(int64); ok {
@@ -463,28 +490,35 @@ func (s *Syncer) propose(ctx context.Context, ops []Op) error {
 	return nil
 }
 
-func (c *capture) writeOp(ctx context.Context, op Op) error {
-	if err := c.conn.Exec(ctx,
-		`INSERT INTO main._repl_oplog(site,seq,hlc,tbl,pk,op,cells) VALUES(?,?,?,?,?,?,?)`,
-		op.Site, int64(op.Seq), int64(op.HLC), op.Tbl, op.PK, int64(op.Kind), encodeCells(op.Cells)); err != nil {
-		return err
+// writeOp writes op into the log and its cells into the clock. With ifFree, a
+// log holding op's (site, seq) already is left as it is and writeOp reports
+// false, having written nothing.
+func (c *capture) writeOp(ctx context.Context, op Op, ifFree bool) (bool, error) {
+	verb := `INSERT`
+	if ifFree {
+		verb = `INSERT OR IGNORE`
+	}
+	n, err := c.conn.ExecChanges(ctx, verb+` INTO main._repl_oplog(site,seq,hlc,tbl,pk,op,cells) VALUES(?,?,?,?,?,?,?)`,
+		op.Site, int64(op.Seq), int64(op.HLC), op.Tbl, op.PK, int64(op.Kind), encodeCells(op.Cells))
+	if err != nil || n == 0 {
+		return false, err
 	}
 	if op.Kind == OpSchema {
-		return nil // a schema op has no cells of any row
+		return true, nil // a schema op has no cells of any row
 	}
 	pval := byte(1)
 	if op.Kind == OpDelete {
 		pval = 0
 	}
 	if err := c.upsertClock(ctx, op.Tbl, op.PK, presenceCol, op.HLC, op.Site, []byte{pval}); err != nil {
-		return err
+		return false, err
 	}
 	for _, cell := range op.Cells {
 		if err := c.upsertClock(ctx, op.Tbl, op.PK, cell.Col, op.HLC, op.Site, packVal(cell.Type, cell.Val)); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return nil
+	return true, nil
 }
 
 func (c *capture) upsertClock(ctx context.Context, tbl string, pk []byte, col string, hlc HLC, site string, val []byte) error {
