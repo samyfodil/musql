@@ -1,4 +1,4 @@
-.PHONY: all build_all_targets clean test harness vet bench-pointread
+.PHONY: all build_all_targets clean test harness vet bench-pointread cloud cloud-console cloud-run
 
 all: vet test
 
@@ -69,6 +69,26 @@ harness:
 # short run; POINTREAD_FULL=1 for 10M rows. Fails if musql loses a gated metric.
 bench-pointread:
 	bench/pointread/run
+
+# musql cloud: the server, the CLI and the console, into bin/. TAGS=jitllm
+# builds the server with embedded AI.
+cloud: cloud-console
+	cd cloud && go build -tags '$(TAGS)' -o ../bin/musql-cloud ./cmd/musql-cloud
+	cd cloud && go build -o ../bin/musql ./cmd/musql
+
+cloud-console:
+	sh npm/build.sh
+	cd cloud/console && npm ci && npm run build
+
+# A standalone node on :8080 with its data in .cloud-dev/. The first run
+# copies cloud/config.example.yaml and asks for the admin's password
+# (ADMIN_EMAIL, default admin@example.com).
+ADMIN_EMAIL ?= admin@example.com
+cloud-run: cloud
+	mkdir -p .cloud-dev
+	test -f .cloud-dev/config.yaml || cp cloud/config.example.yaml .cloud-dev/config.yaml
+	test -d .cloud-dev/data || bin/musql-cloud init -config .cloud-dev/config.yaml --admin-email $(ADMIN_EMAIL)
+	bin/musql-cloud -config .cloud-dev/config.yaml
 
 clean:
 	rm -f log-* cpu.test mem.test *.out go.work*
