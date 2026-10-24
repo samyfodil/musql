@@ -253,10 +253,6 @@ func (db *DB) fts5ConfigPut(name, k string, v Value) {
 	cfg.putRow(key, []Value{{Typ: Text, S: []byte(k)}, v})
 	// The ON-DISK cookie, which is what a C SQLite reader of this file consults.
 	db.fts5BumpConfigCookie(name)
-	// ...and OUR OWN, which is what the compiled-plan cache consults: a program
-	// that reads "rank" baked in which auxiliary function to call, and this row is
-	// what decides it. See DB.fts5ConfigGen.
-	db.fts5ConfigGen++
 }
 
 // fts5ConfigGet returns the value of the %_config row whose key matches k

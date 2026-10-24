@@ -648,9 +648,12 @@ type DB struct {
 	schemaCorrupt *schemaCorruptVerdict
 
 	// schemaCorruptGen is bumped by every commit, and is the second half of that
-	// cache's key. See schemaCorruptVerdict. The compiled-plan cache keys on it
-	// too (sharedPlanCache).
+	// cache's key. See schemaCorruptVerdict.
 	schemaCorruptGen uint64
+
+	// runFold says the write program being compiled built a value of this run
+	// into itself (noteRunFold), so cachedWriteProgram must not keep it.
+	runFold bool
 
 	// plans is the session's compiled-plan cache, shared by pointer with every
 	// pager it stamps so a PREPARED statement is compiled once rather than once
@@ -710,15 +713,6 @@ type DB struct {
 	// set.
 	lastExecSQL  string
 	lastExecArgs []Value
-
-	//	// fts5ConfigGen counts writes to any fts5 table's %_config. It keys the
-	//	// plan cache (sharedPlanCache) because a compiled program bakes in which
-	//	// function "rank" calls, and that lives in a table, moving no schema
-	//	// cookie. C fts5 keeps the same counter: Fts5Config.iCookie,
-	//	// "Incremented when %_config is modified" (ext/fts5/fts5Int.h:254),
-	//	// decremented by 'rank' (fts5_main.c:1830). fts5ConfigPut is the single
-	//	// writer, so it is the one place that bumps.
-	fts5ConfigGen uint64
 
 	// fullColumnNames / shortColumnNamesOff are the connection's legacy
 	// "PRAGMA full_column_names" / "short_column_names", stored so the zero
@@ -1025,9 +1019,6 @@ func (db *DB) stampPager(p *ReadOnlyPager) {
 	// DB.fullColumnNames / shortColumnNamesOff and ReadOnlyPager.colNameMode).
 	p.fullColumnNames = db.fullColumnNames
 	p.shortColumnNamesOff = db.shortColumnNamesOff
-	// ...and the fts5 %_config generation, which the plan cache keys on. See
-	// DB.fts5ConfigGen.
-	p.fts5ConfigGen = db.fts5ConfigGen
 	// Carry the write session's database-qualifier name onto the snapshot, so a
 	// schema-qualified read run against a held (attached-routed) transaction
 	// resolves its qualifier the same way an autocommit read would.

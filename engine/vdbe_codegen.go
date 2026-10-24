@@ -1047,6 +1047,22 @@ func resolveSubProgramLimitOffset(pager *ReadOnlyPager, stmt *SelectStmt) (resto
 	return restore, deferred, nil
 }
 
+// noteRunFold records that the statement being compiled built a value of this
+// run into its program: a LIMIT or OFFSET it evaluated (a subquery in it reads
+// the database, a parameter is bound per run, random() differs; C codes the
+// clause into a register and evaluates it on every run, computeLimitRegisters,
+// select.c:2517), or fts5's corpus statistics (buildFts5AuxState). The plan
+// caches refuse such a program (cachePlan, cachedWriteProgram).
+func (p *ReadOnlyPager) noteRunFold() {
+	if p == nil {
+		return
+	}
+	p.runFold = true
+	if p.writeSession != nil {
+		p.writeSession.runFold = true
+	}
+}
+
 // foldLimitOffsetExpr evaluates one LIMIT/OFFSET expression to the integer the
 // *int64 Limit/Offset needs by compiling it as a one-column FROM-less SELECT and
 // running it once (subqueries compile as sub-Programs). args are the bound
@@ -1061,6 +1077,7 @@ func foldLimitOffsetExpr(pager *ReadOnlyPager, e Expr, args []Value) (int64, err
 	if err := requireZeroedNameContext(e); err != nil {
 		return 0, err
 	}
+	pager.noteRunFold()
 	prog, err := compileSelectNoFromPager(pager, &SelectStmt{Columns: []SelectColumn{{Expr: e}}}, nil)
 	if err != nil {
 		return 0, err
