@@ -797,6 +797,7 @@ table.cloudtable { width: 100%; border-collapse: collapse; }
 .cloudtable .rowactions { text-align: right; }
 .cloudtable .badge { margin-left: 6px; }
 .cloudtable .sqlcell { max-width: 460px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.cloudtable.kv th { width: 9em; padding: 8px 10px; }
 .sessionbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--line); background: var(--accent-soft); font-size: 12.5px; }
 .cloud-none { display: grid; justify-items: center; gap: 6px; padding: 48px 20px; border: 1px dashed var(--line); border-radius: var(--radius); text-align: center; }
 .cloud-none p { margin: 0; }

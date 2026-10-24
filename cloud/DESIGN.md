@@ -318,8 +318,9 @@ Services, each method checks the caller's role:
 
 The current editor becomes the per-database view. Around it:
 sign-in through OIDC (code + PKCE), an org switcher, database list
-(create, branch, restore, delete, copy URL, create token), group and
-location settings, members and roles, users (admins), platform tokens,
+(create, branch, restore, rename, delete, copy URL, create token), group and
+location settings, members and roles, org settings (deleting the org, for
+owners, confirmed by typing its slug), users (admins), platform tokens,
 usage charts per database and org, and the editor's new pieces:
 connections (local files kept in the browser, and remote databases on this
 server or any Hrana/libSQL URL with a token), staged edits (changes queue up,

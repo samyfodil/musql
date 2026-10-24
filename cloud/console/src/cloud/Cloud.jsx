@@ -2,7 +2,7 @@
 // pages of a musql cloud server, over the management API.
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { BarChart3, Boxes, Building2, Database, KeyRound, LogOut, MapPin, Users, UserCog } from "lucide-react";
+import { BarChart3, Boxes, Building2, Database, KeyRound, LogOut, MapPin, Settings, Users, UserCog } from "lucide-react";
 import Drawer from "../components/Drawer.jsx";
 import { Field } from "../components/ColumnPanel.jsx";
 import { MenuButton } from "../components/Menu.jsx";
@@ -16,6 +16,7 @@ export const PAGES = [
 	["groups", "Groups & locations", <MapPin size={14} />],
 	["members", "Members", <Users size={14} />],
 	["usage", "Usage", <BarChart3 size={14} />],
+	["settings", "Org settings", <Settings size={14} />],
 	["tokens", "Platform tokens", <KeyRound size={14} />],
 	["users", "Users", <UserCog size={14} />, true],
 ];
@@ -143,7 +144,7 @@ function NewOrgDrawer({ cloud, toast, onClose }) {
 
 // ---- the pages ----
 
-export function CloudMain({ cloud, page, setPage, toast, onOpen }) {
+export function CloudMain({ cloud, page, setPage, toast, onOpen, current }) {
 	if (!server) {
 		return (
 			<div className="empty">
@@ -158,10 +159,11 @@ export function CloudMain({ cloud, page, setPage, toast, onOpen }) {
 	const props = { cloud, toast, setPage };
 	return (
 		<div className="cloudpage">
-			{page === "databases" && <Databases {...props} onOpen={onOpen} />}
+			{page === "databases" && <Databases {...props} onOpen={onOpen} current={current} />}
 			{page === "groups" && <Groups {...props} />}
 			{page === "members" && <Members {...props} />}
 			{page === "usage" && <UsagePage {...props} />}
+			{page === "settings" && <OrgSettings {...props} />}
 			{page === "tokens" && <PlatformTokens {...props} />}
 			{page === "users" && cloud.admin && <UsersPage {...props} />}
 		</div>
@@ -190,10 +192,10 @@ function Loaded({ s, empty, children }) {
 
 // ---- databases ----
 
-function Databases({ cloud, toast, onOpen, setPage }) {
+function Databases({ cloud, toast, onOpen, setPage, current }) {
 	const org = cloud.org;
 	const [s, reload] = useLoad(() => api.db.list({ org }).then((r) => r.databases), [org]);
-	const [drawer, setDrawer] = useState(null); // {create} | {token: db} | {del: db}
+	const [drawer, setDrawer] = useState(null); // {create} | {token: db} | {rename: db} | {del: db}
 	const dbs = s.data ?? [];
 	const member = can(cloud, Role.MEMBER);
 
@@ -213,6 +215,18 @@ function Databases({ cloud, toast, onOpen, setPage }) {
 	async function open(d) {
 		try {
 			await onOpen(await connection(d));
+		} catch (e) {
+			toast(message(e), true);
+		}
+	}
+	// A renamed database has a new URL: the editor, if it has it open, reopens it there.
+	async function renamed(was, now) {
+		setDrawer(null);
+		if (!now) return;
+		reload();
+		if (current?.org !== org || current.database !== was.name) return;
+		try {
+			await onOpen(await connection(now), `${org}/${was.name}`);
 		} catch (e) {
 			toast(message(e), true);
 		}
@@ -268,6 +282,7 @@ function Databases({ cloud, toast, onOpen, setPage }) {
 										{ label: "Export as SQLite", hint: ".sqlite", disabled: !member, onClick: () => exportAs(d, FileFormat.SQLITE) },
 										"-",
 										member && { label: "Invalidate all tokens…", onClick: () => invalidate(d) },
+										member && { label: "Rename…", onClick: () => setDrawer({ rename: d }) },
 										member && { label: "Delete…", onClick: () => setDrawer({ del: d }) },
 									]} />
 								</td>
@@ -278,6 +293,7 @@ function Databases({ cloud, toast, onOpen, setPage }) {
 			</Loaded>
 			{drawer?.create && <CreateDb org={org} dbs={dbs} initial={drawer.create} toast={toast} onClose={(made) => { setDrawer(null); made && reload(); }} />}
 			{drawer?.token && <DbToken cloud={cloud} db={drawer.token} toast={toast} onClose={() => setDrawer(null)} />}
+			{drawer?.rename && <RenameDb org={org} db={drawer.rename} inEditor={current?.org === org && current.database === drawer.rename.name} toast={toast} onClose={(now) => renamed(drawer.rename, now)} />}
 			{drawer?.del && <DeleteDb org={org} db={drawer.del} toast={toast} onClose={(gone) => { setDrawer(null); gone && reload(); }} />}
 		</>
 	);
@@ -409,6 +425,34 @@ function DeleteDb({ org, db, toast, onClose }) {
 			<form className="form" onSubmit={(e) => { e.preventDefault(); typed === db.name && go(); }}>
 				<p>This deletes the database and its data. It cannot be undone.</p>
 				<Field label={<>Type <b className="mono">{db.name}</b> to confirm</>}><input spellCheck={false} autoComplete="off" value={typed} onChange={(e) => setTyped(e.target.value)} /></Field>
+				<button type="submit" hidden />
+			</form>
+		</Drawer>
+	);
+}
+
+function RenameDb({ org, db, inEditor, toast, onClose }) {
+	const [name, setName] = useState(db.name);
+	const [busy, setBusy] = useState(false);
+	const next = name.trim();
+	const ok = next && next !== db.name && !busy;
+	const go = async () => {
+		setBusy(true);
+		try {
+			const r = await api.db.rename({ org, name: db.name, newName: next });
+			toast(`Renamed ${db.name} to ${r.database.name}.`);
+			onClose(r.database);
+		} catch (e) {
+			toast(message(e), true);
+			setBusy(false);
+		}
+	};
+	return (
+		<Drawer title={`Rename ${db.name}`} subtitle={org} onClose={() => onClose(null)} footer={<><span className="grow" /><button onClick={() => onClose(null)}>Cancel</button><button className="primary" disabled={!ok} onClick={go}>Rename</button></>}>
+			<form className="form" onSubmit={(e) => { e.preventDefault(); ok && go(); }}>
+				<Field label="New name" help="1-63 lower-case letters, digits and dashes"><input spellCheck={false} autoComplete="off" value={name} onChange={(e) => setName(e.target.value)} /></Field>
+				<p className="small">The URL carries the name, so <span className="mono">{db.url}</span> stops working. Tokens stay valid, with the new URL.</p>
+				{inEditor && <p className="small">It is open in the editor, which reopens it under the new name. Changes staged there and not saved are dropped.</p>}
 				<button type="submit" hidden />
 			</form>
 		</Drawer>
@@ -592,6 +636,72 @@ function InviteDrawer({ org, roles, toast, onClose }) {
 			<form className="form" onSubmit={(e) => { e.preventDefault(); email.includes("@") && go(); }}>
 				<Field label="Email" help="They join when they next sign in with this address."><input type="email" spellCheck={false} value={email} onChange={(e) => setEmail(e.target.value)} /></Field>
 				<Field label="Role"><select value={role} onChange={(e) => setRole(Number(e.target.value))}>{roles.map(([r, l]) => <option key={r} value={r}>{l}</option>)}</select></Field>
+				<button type="submit" hidden />
+			</form>
+		</Drawer>
+	);
+}
+
+// ---- org settings ----
+
+function OrgSettings({ cloud, toast, setPage }) {
+	const [del, setDel] = useState(false);
+	const org = cloud.me.memberships.find((m) => m.org.slug === cloud.org)?.org;
+	if (!org) return null;
+	const why = org.personal ? "A personal organization goes with its user, and cannot be deleted." : !can(cloud, Role.OWNER) ? "Only an owner can delete an organization." : null;
+	// Another org takes its place: the personal one if there is one.
+	const deleted = async () => {
+		const rest = cloud.me.memberships.filter((m) => m.org.slug !== org.slug);
+		try {
+			await cloud.reload();
+		} catch (e) {
+			toast(message(e), true);
+		}
+		cloud.setOrg((rest.find((m) => m.org.personal) ?? rest[0])?.org.slug ?? "");
+		setPage("databases");
+	};
+	return (
+		<>
+			<Head title="Org settings" sub={org.slug} />
+			<table className="cloudtable kv">
+				<tbody>
+					<tr><th>Name</th><td>{org.name || org.slug}</td></tr>
+					<tr><th>Slug</th><td className="mono">{org.slug}</td></tr>
+					<tr><th>Your role</th><td>{roleName(cloud.role)}</td></tr>
+					<tr><th>Created</th><td>{day(org.createdAt)}</td></tr>
+				</tbody>
+			</table>
+			<h2 className="cloudsub">Delete this organization</h2>
+			<p className="small">Deletes {org.slug} with its databases, groups, members and invites. It cannot be undone.</p>
+			<div><button className="danger" disabled={!!why} onClick={() => setDel(true)}>Delete {org.slug}…</button></div>
+			{why && <p className="dim small">{why}</p>}
+			{del && <DeleteOrg org={org} toast={toast} onClose={(gone) => { setDel(false); gone && deleted(); }} />}
+		</>
+	);
+}
+
+function DeleteOrg({ org, toast, onClose }) {
+	const [typed, setTyped] = useState("");
+	const [busy, setBusy] = useState(false);
+	const [dbs] = useLoad(() => api.db.list({ org: org.slug }).then((r) => r.databases), [org.slug]);
+	const ok = typed === org.slug && !busy;
+	const go = async () => {
+		setBusy(true);
+		try {
+			await api.orgs.delete({ org: org.slug });
+			toast(`Deleted ${org.slug}.`);
+			onClose(true);
+		} catch (e) {
+			toast(message(e), true);
+			setBusy(false);
+		}
+	};
+	const n = dbs.data?.length;
+	return (
+		<Drawer title={`Delete ${org.slug}`} subtitle="Organization" onClose={() => onClose(false)} footer={<><span className="grow" /><button onClick={() => onClose(false)}>Cancel</button><button className="danger" disabled={!ok} onClick={go}>Delete forever</button></>}>
+			<form className="form" onSubmit={(e) => { e.preventDefault(); ok && go(); }}>
+				<p>This deletes the organization{n ? ` with its ${n} database${n === 1 ? "" : "s"}` : ""}, its groups, members and invites. It cannot be undone.</p>
+				<Field label={<>Type <b className="mono">{org.slug}</b> to confirm</>}><input spellCheck={false} autoComplete="off" value={typed} onChange={(e) => setTyped(e.target.value)} /></Field>
 				<button type="submit" hidden />
 			</form>
 		</Drawer>
