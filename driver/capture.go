@@ -52,6 +52,12 @@ type CaptureHooks struct {
 	// changes must go through someone else's log first (a consensus round)
 	// takes them in PreCommit and lands them itself here.
 	HandOff func() error
+
+	// LockWait, when set, brackets an autocommit statement's wait for the
+	// write lock it takes before it runs (execArgs): true as it starts to wait,
+	// false once it holds the lock or gave up. A consumer that writes through
+	// other connections of its own can let it in first.
+	LockWait func(waiting bool)
 }
 
 // ErrHandOff, returned by PreCommit, discards the transaction and makes the
