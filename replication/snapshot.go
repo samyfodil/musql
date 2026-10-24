@@ -208,10 +208,10 @@ func (n *Node) snapshotOps(ctx context.Context, peer PeerID) error {
 		if err != nil {
 			return err
 		}
-		for _, op := range page.Ops {
-			if err := n.store.Ingest(ctx, op, false); err != nil {
-				return fmt.Errorf("replication: snapshot op %s/%d: %w", op.Site, op.Seq, err)
-			}
+		if k, err := n.store.ingestAll(ctx, page.Ops); k >= 0 && err != nil {
+			return fmt.Errorf("replication: snapshot op %s/%d: %w", page.Ops[k].Site, page.Ops[k].Seq, err)
+		} else if err != nil {
+			return fmt.Errorf("replication: snapshot ops: %w", err)
 		}
 		if cursor = page.Next; cursor == nil {
 			return nil
@@ -296,7 +296,7 @@ func (s *Store) finishSnapshot(ctx context.Context, floors VersionVector, ranges
 		if f > s.vv[site] {
 			s.vv[site] = f
 		}
-		if err := s.advanceVV(ctx, site); err != nil {
+		if err := s.advanceVV(ctx, site, nil); err != nil {
 			return err
 		}
 	}
