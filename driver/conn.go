@@ -3195,6 +3195,10 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 	if want := st.NumInput(); len(args) != want {
 		return nil, fmt.Errorf("sql: expected %d arguments, got %d", want, len(args))
 	}
+	// A statement made for this one call has no arena to reuse: its first
+	// TEXT or BLOB copy took a whole chunk of one, so a call's arena is the
+	// size its arguments take.
+	st.bytesArena = argArena(args)
 	return st.ExecContext(ctx, args)
 }
 
