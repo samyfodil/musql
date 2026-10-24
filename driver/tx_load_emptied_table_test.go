@@ -6,13 +6,17 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/samyfodil/musql/engine"
 )
 
 // TestTxLoadIntoATableTheTransactionEmptied: one transaction deletes every
-// committed row of a table and then inserts, so the INSERT arms a direct-path
-// load on the emptied store. The commit used to append only the deletes: a
-// second handle on the file read the table empty while the writer was open,
-// and a fresh handle still did after it closed.
+// committed row of a table and then inserts, which used to arm a direct-path
+// load on the emptied store. The commit appended only the deletes: a second
+// handle on the file read the table empty while the writer was open, and a
+// fresh handle still did after it closed. Each case runs as it now does, the
+// inserts in the change log, and with the load forced, which the commit must
+// write by rewriting the file.
 func TestTxLoadIntoATableTheTransactionEmptied(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -93,40 +97,47 @@ func TestTxLoadIntoATableTheTransactionEmptied(t *testing.T) {
 		return db
 	}
 	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "x.musq")
-			w := open(t, path)
-			defer w.Close()
-			for _, s := range append(append([]string(nil), c.schema...), c.seed...) {
-				if _, err := w.Exec(s); err != nil {
-					t.Fatalf("%q: %v", s, err)
+		for _, forced := range []bool{false, true} {
+			name := c.name
+			if forced {
+				name += ", load forced"
+			}
+			t.Run(name, func(t *testing.T) {
+				defer engine.SetTxLoadAfterWritesForTest(engine.SetTxLoadAfterWritesForTest(forced))
+				path := filepath.Join(t.TempDir(), "x.musq")
+				w := open(t, path)
+				defer w.Close()
+				for _, s := range append(append([]string(nil), c.schema...), c.seed...) {
+					if _, err := w.Exec(s); err != nil {
+						t.Fatalf("%q: %v", s, err)
+					}
 				}
-			}
-			tx, err := w.Begin()
-			if err != nil {
-				t.Fatal(err)
-			}
-			for _, s := range c.tx {
-				if _, err := tx.Exec(s); err != nil {
-					t.Fatalf("%q: %v", s, err)
+				tx, err := w.Begin()
+				if err != nil {
+					t.Fatal(err)
 				}
-			}
-			if err := tx.Commit(); err != nil {
-				t.Fatal(err)
-			}
-			r := open(t, path)
-			if got := read(t, r, c.tables); got != c.want {
-				t.Errorf("a second handle read %q while the writer was open, want %q", got, c.want)
-			}
-			r.Close()
-			if err := w.Close(); err != nil {
-				t.Fatal(err)
-			}
-			f := open(t, path)
-			defer f.Close()
-			if got := read(t, f, c.tables); got != c.want {
-				t.Errorf("reopened, the file holds %q, want %q", got, c.want)
-			}
-		})
+				for _, s := range c.tx {
+					if _, err := tx.Exec(s); err != nil {
+						t.Fatalf("%q: %v", s, err)
+					}
+				}
+				if err := tx.Commit(); err != nil {
+					t.Fatal(err)
+				}
+				r := open(t, path)
+				if got := read(t, r, c.tables); got != c.want {
+					t.Errorf("a second handle read %q while the writer was open, want %q", got, c.want)
+				}
+				r.Close()
+				if err := w.Close(); err != nil {
+					t.Fatal(err)
+				}
+				f := open(t, path)
+				defer f.Close()
+				if got := read(t, f, c.tables); got != c.want {
+					t.Errorf("reopened, the file holds %q, want %q", got, c.want)
+				}
+			})
+		}
 	}
 }
