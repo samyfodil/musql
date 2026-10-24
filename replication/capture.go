@@ -485,6 +485,7 @@ func (c *capture) upsertClock(ctx context.Context, tbl string, pk []byte, col st
 func (c *capture) postCommit() {
 	c.committing = false
 	c.applied = c.s.store.applied.Load()
+	c.s.store.localCommitted()
 	if c.retrying {
 		c.retrying = false
 		c.s.store.localDone()

@@ -100,7 +100,7 @@ func (n *Node) Broadcast(ops []Op) {
 
 // opsPerFetch caps how many ops Sync pulls from a peer per GetOps round trip;
 // each page is applied in one transaction.
-const opsPerFetch = 512
+const opsPerFetch = 1024
 
 // pruneEvery is how many sync rounds run between two prunes, after the first
 // round's. A prune that frees anything is a commit, and every explicit
