@@ -43,6 +43,7 @@ func (s *Syncer) attach(conn *driver.Conn) {
 		PostCommit: c.postCommit,
 		Rollback:   c.discard,
 		HandOff:    c.handOff,
+		LockWait:   s.store.localLockWait,
 	})
 }
 
