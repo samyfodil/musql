@@ -48,7 +48,7 @@ snapshots:
   every: "1h"
   keep: "168h"
 uploads:
-  max_bytes: 1073741824    # the largest file one upload may carry (default 1 GiB)
+  max_bytes: 17179869184   # the largest file one upload may carry (default 16 GiB)
   ttl: "24h"               # an upload that nothing writes to or uses is removed after this
 console:
   dir: "./console/dist"    # the console's build, served at /console/
@@ -165,15 +165,22 @@ A database file moves in pieces, so neither side holds it in memory.
   leftovers are removed at the next start. The CLI writes `<file>.part` and
   renames it when whole; the console writes through the File System Access API
   where the browser has one, and folds the pieces into a Blob where not.
-- **What is bounded**: the transfer holds a piece or a message, and the
-  musql-format export (`VACUUM INTO`) stays flat. What runs on the file does
-  not. `Create` from an upload runs the engine's `integrity_check`, whose
-  working set grows with the rows (measured: 2.4x the file for 1M small rows,
-  4.5x with two indexes; a file of large blobs costs nothing). A C SQLite
-  upload is converted first (`convert/sqlite`), whose own check takes about 3x
-  the file in memory, and needs disk for both files; a C SQLite export is built
-  in memory by the converter, about twice the file. Size `uploads.max_bytes`
-  for those.
+- **What is bounded**: memory, whatever the file's size. The transfer holds a
+  piece or a message, and the musql-format export (`VACUUM INTO`) stays flat.
+  `Create` from an upload runs the engine's `integrity_check`, which reads the
+  rows once and sorts the index keys it compares in runs on disk
+  (`internal/extsort`). A C SQLite upload is converted first
+  (`convert/sqlite`), which checks its source the same way, and a C SQLite
+  export is built through a fixed page cache straight into its file. Measured
+  heap growth is the same from an 80 MiB file to a 1.7 GiB one of 10M rows
+  with two indexes: about 40 MiB for `integrity_check`, under 100 MiB for an
+  export, about 115 MiB for an import (64 MiB of it the source's page
+  cache). What grows with the file is disk and time: an upload is kept whole
+  while it is used, converting a C SQLite one needs about as much room again,
+  and the sorts write runs the size of the index keys to the temporary
+  directory (keep `TMPDIR` on disk, not tmpfs). That 1.7 GiB file took 3
+  minutes to import and 10 to export on a 4-core server. Size
+  `uploads.max_bytes` for those.
 
 ## Deployments: standalone and cluster
 
