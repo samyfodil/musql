@@ -453,9 +453,12 @@ const (
 	holdAlone  = 500 * time.Millisecond
 	localQuiet = time.Second
 	// yieldHold is how long an ingest holds the lock, at least, once a local
-	// write waits for it (localWaiting): long enough to apply a few ops for
-	// the commit it then makes, short enough to keep the write's wait short.
-	yieldHold = 10 * time.Millisecond
+	// write waits for it (localWaiting). Each turn costs the ingest more than
+	// its commit: the writers then take the lock in turn, and each catches up
+	// with what the ingest applied first. Beside two writers, 10 ms left the
+	// ingest a fifth of the lock (1,700 ops/s, 45 writes/s on .10); 30 ms, a
+	// third (4,000 ops/s, 21 writes/s).
+	yieldHold = 30 * time.Millisecond
 )
 
 // hold is how long an ingest may hold the write lock now.
