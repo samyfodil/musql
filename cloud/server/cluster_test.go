@@ -86,8 +86,12 @@ peers:
 			t.Fatal(err)
 		}
 		cfg.syncInterval = 100 * time.Millisecond
-		if err := Init(context.Background(), cfg, "admin@example.com", "admin-password"); err != nil {
-			t.Fatal(err)
+		// A cluster is initialised once, on one node, and the others get the
+		// admin from it: Init on a node the admin is reaching from a peer fails.
+		if i == 0 {
+			if err := Init(context.Background(), cfg, "admin@example.com", "admin-password"); err != nil {
+				t.Fatal(err)
+			}
 		}
 		c := &clusterNode{cfg: cfg}
 		c.env = &env{t: t}
@@ -116,6 +120,10 @@ func (c *clusterNode) start() {
 	c.mu.Lock()
 	c.s, c.h = s, s.Handler()
 	c.mu.Unlock()
+	eventually(c.t, "the admin on "+c.cfg.Node.Name, func() bool {
+		_, err := s.Store().UserByEmail(context.Background(), "admin@example.com")
+		return err == nil
+	})
 	c.admin = c.tokenFor("admin@example.com")
 }
 
