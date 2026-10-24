@@ -345,9 +345,15 @@ func (c *Conn) notifyRollback() {
 // routes through exactly the same path a db.Exec would, so during PreCommit
 // it lands in the transaction being committed.
 func (c *Conn) Exec(ctx context.Context, sqlText string, args ...any) error {
+	_, err := c.ExecChanges(ctx, sqlText, args...)
+	return err
+}
+
+// ExecChanges is Exec reporting how many rows the statement changed.
+func (c *Conn) ExecChanges(ctx context.Context, sqlText string, args ...any) (int64, error) {
 	info, err := c.paramInfoOf(sqlText)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	eargs := make([]engine.Value, info.NumParams)
 	for i, a := range args {
@@ -356,12 +362,20 @@ func (c *Conn) Exec(ctx context.Context, sqlText string, args ...any) error {
 		}
 		v, cerr := driverValueToEngine(a)
 		if cerr != nil {
-			return cerr
+			return 0, cerr
 		}
 		eargs[i] = v
 	}
-	_, err = c.execArgs(sqlText, eargs)
-	return err
+	// A hook runs inside the statement whose commit it is part of, which may
+	// have asked for no Result (resultDiscarded): this one is read.
+	discarded := c.resultDiscarded
+	c.resultDiscarded = false
+	res, err := c.execArgs(sqlText, eargs)
+	c.resultDiscarded = discarded
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // Query is Exec for a statement that returns rows: it runs on the same path a
