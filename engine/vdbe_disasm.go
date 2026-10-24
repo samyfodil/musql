@@ -138,6 +138,7 @@ var opNames = [numOpCodes]string{
 	OpFireTriggers:         "FireTriggers",
 	OpTriggerBodyRouted:    "TriggerBodyRouted",
 	OpUpsertFind:           "UpsertFind",
+	OpGenErrCheck:          "GenErrCheck",
 	OpUpsertStore:          "UpsertStore",
 	OpInsert:               "Insert",
 	OpDelete:               "Delete",
