@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -78,6 +79,72 @@ func TestApplyYieldsToWaitingLocalWrite(t *testing.T) {
 		t.Fatal("the next apply still waits after the local write it yielded to took the lock")
 	}
 	s.localLockWait(false)
+}
+
+// TestWaitingIngestTakesTheLockFirst: a local write that finds an ingest
+// waiting for the write lock lets it take the lock first, and so reads what it
+// applied. The lock is not handed over in turn: a writer committing back to
+// back took it back each time before the waiting ingest woke.
+func TestWaitingIngestTakesTheLockFirst(t *testing.T) {
+	const rounds = 3
+	ctx := context.Background()
+	src, _ := benchSource(t, rounds)
+	ops, err := src.store.OpsSince(ctx, src.site, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, db, err := openSyncer(ctx, filepath.Join(t.TempDir(), "dst.musq"), CRDT())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	first := len(ops) - rounds
+	if k, err := s.store.ingestAll(ctx, ops[:first]); err != nil {
+		t.Fatalf("refused at %d: %v", k, err)
+	}
+	if _, err := db.Exec(`CREATE TABLE l(n)`); err != nil {
+		t.Fatal(err)
+	}
+	waitFor := func(c *atomic.Int32) {
+		for deadline := time.Now().Add(5 * time.Second); c.Load() == 0 && time.Now().Before(deadline); {
+			time.Sleep(100 * time.Microsecond)
+		}
+	}
+	for r, op := range ops[first:] {
+		gate, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := gate.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+			t.Fatal(err)
+		}
+		ingested := make(chan error, 1)
+		go func() { ingested <- s.store.Ingest(ctx, op, false) }()
+		waitFor(&s.store.ingestWaiting)
+		wrote := make(chan error, 1)
+		go func() {
+			_, err := db.Exec(`INSERT INTO l SELECT count(*) FROM t`)
+			wrote <- err
+		}()
+		waitFor(&s.store.localWaiting)
+		if _, err := gate.ExecContext(ctx, `COMMIT`); err != nil {
+			t.Fatal(err)
+		}
+		gate.Close()
+		if err := <-ingested; err != nil {
+			t.Fatal(err)
+		}
+		if err := <-wrote; err != nil {
+			t.Fatal(err)
+		}
+		var n, want int
+		if err := db.QueryRow(`SELECT (SELECT n FROM l ORDER BY rowid DESC LIMIT 1), (SELECT count(*) FROM t)`).Scan(&n, &want); err != nil {
+			t.Fatal(err)
+		}
+		if n != want {
+			t.Fatalf("round %d: the local write read %d rows of t, want %d: it took the lock ahead of the ingest waiting for it", r, n, want)
+		}
+	}
 }
 
 // TestLocalCommitDoesNotWaitForAnApply: once a local write has committed, its
