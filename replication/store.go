@@ -487,8 +487,9 @@ type clockCell struct {
 
 // mergeOp merges op's presence and cells into the clock, each iff op is a
 // strictly newer writer than the cell's, by the (hlc, site) total order -- as
-// mergeCell does one cell, in two statements for the row: one read of its
-// cells, one upsert of those op wins. It returns the row's cells after.
+// mergeCell does one cell, in a statement or three for the row: one read of
+// its cells, an insert of those the clock had none of, an upsert of those op
+// wins. It returns the row's cells after.
 func (s *Store) mergeOp(ctx context.Context, op Op) (map[string]clockCell, error) {
 	rows, err := s.q.QueryContext(ctx, `SELECT col, hlc, site, val FROM main._repl_clock WHERE tbl=? AND pk=?`, op.Tbl, op.PK)
 	if err != nil {
@@ -510,13 +511,20 @@ func (s *Store) mergeOp(ctx context.Context, op Op) (map[string]clockCell, error
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	var args []any
+	// A plain INSERT of the cells the clock has none of: an upsert's conflict
+	// handling costs the engine several times an insert's.
+	var fresh, won []any
 	merge := func(col string, val []byte) {
-		if c, ok := have[col]; ok && !TagLess(c.hlc, c.site, op.HLC, op.Site) {
+		c, ok := have[col]
+		if ok && !TagLess(c.hlc, c.site, op.HLC, op.Site) {
 			return // the existing writer wins
 		}
 		have[col] = clockCell{op.HLC, op.Site, val}
-		args = append(args, op.Tbl, op.PK, col, int64(op.HLC), op.Site, val)
+		if ok {
+			won = append(won, op.Tbl, op.PK, col, int64(op.HLC), op.Site, val)
+		} else {
+			fresh = append(fresh, op.Tbl, op.PK, col, int64(op.HLC), op.Site, val)
+		}
 	}
 	pval := byte(1)
 	if op.Kind == OpDelete {
@@ -526,13 +534,19 @@ func (s *Store) mergeOp(ctx context.Context, op Op) (map[string]clockCell, error
 	for _, c := range op.Cells {
 		merge(c.Col, packVal(c.Type, c.Val))
 	}
-	if len(args) == 0 {
-		return have, nil
+	const cols = `INSERT INTO main._repl_clock(tbl,pk,col,hlc,site,val) VALUES `
+	if len(fresh) > 0 {
+		if _, err := s.q.ExecContext(ctx, cols+strings.TrimSuffix(strings.Repeat(`(?,?,?,?,?,?),`, len(fresh)/6), ","), fresh...); err != nil {
+			return nil, err
+		}
 	}
-	_, err = s.q.ExecContext(ctx, `INSERT INTO main._repl_clock(tbl,pk,col,hlc,site,val) VALUES `+
-		strings.TrimSuffix(strings.Repeat(`(?,?,?,?,?,?),`, len(args)/6), ",")+
-		` ON CONFLICT(tbl,pk,col) DO UPDATE SET hlc=excluded.hlc, site=excluded.site, val=excluded.val`, args...)
-	return have, err
+	if len(won) > 0 {
+		if _, err := s.q.ExecContext(ctx, cols+strings.TrimSuffix(strings.Repeat(`(?,?,?,?,?,?),`, len(won)/6), ",")+
+			` ON CONFLICT(tbl,pk,col) DO UPDATE SET hlc=excluded.hlc, site=excluded.site, val=excluded.val`, won...); err != nil {
+			return nil, err
+		}
+	}
+	return have, nil
 }
 
 // mergeCell writes (hlc, site, val) for a cell iff it is a strictly newer writer
