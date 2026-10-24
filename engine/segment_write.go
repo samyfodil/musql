@@ -849,6 +849,11 @@ func (n *Session) drainSmallLoads(stamp [2]fileStamp) {
 		return
 	}
 	room := compactionThreshold(stamp[0].size) - n.deltaLogicalSize(stamp[1]) - int64(db.changeLog.len())*segDeltaMinRecord
+	// Logging, encoding and appending a row costs far more per byte than the
+	// rewrite's sequential copy of the file: on a 1 GiB file a million rows
+	// took 4.4 s drained and 3.1 s rewritten. So a load takes the log only
+	// while it is small beside the file, an eighth of what compaction allows.
+	room = min(room, compactionThreshold(stamp[0].size)/8)
 	for _, t := range db.tables {
 		bl := t.bulk
 		if t.isTemp || bl == nil || bl.stream != nil || bl.rows == 0 {
