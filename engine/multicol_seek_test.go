@@ -136,7 +136,14 @@ func TestMultiColumnSeekMatchesTheScan(t *testing.T) {
 	n.Discard()
 
 	// The log's rows are tested against each probe rather than unioned whole, so
-	// rows move both into and out of probed keys here.
+	// rows move both into and out of probed keys here, and the log is made
+	// larger than an eighth of the segments, which once kept a TEXT or BLOB
+	// probe off it.
+	var logRows []string
+	for i := 0; i < 600; i++ {
+		logRows = append(logRows, fmt.Sprintf(`INSERT INTO c VALUES('v', x'%04x', 'c%d', %d)`, i/3, i%3, 30000+i))
+	}
+	execDB(t, path, logRows...)
 	execDB(t, path,
 		`INSERT INTO c VALUES('t', x'0001', 'c9', 9001)`,
 		`UPDATE c SET v = -v WHERE tbl = 't' AND pk = x'0004'`,
