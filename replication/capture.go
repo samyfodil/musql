@@ -23,8 +23,10 @@ type capture struct {
 	buf  []Op // built from this transaction's row changes, at flush time
 	// flushed holds ops written in-txn awaiting commit confirmation.
 	flushed []Op
-	// handoff holds stamped ops between preCommit and handOff.
+	// handoff holds stamped ops between preCommit and handOff, and seen the
+	// log's heads as their transaction read them.
 	handoff []Op
+	seen    string
 	// committing is set by a preCommit that let the commit go ahead; a
 	// rollback then is the commit failing. retrying is set from such a failure
 	// an apply caused -- one committed since this connection's last commit or
@@ -153,16 +155,18 @@ func (c *capture) preCommit(ctx context.Context, conn *driver.Conn, changes []en
 				return errors.New("replication: a Quorum commit cannot also change TEMP tables")
 			}
 		}
-		c.s.store.seqMu.Lock() // released by handOff, which the driver always calls next
-		ops, err := c.fresh(ctx)
-		if err == nil {
-			ops, err = c.stamp(ctx)
-		}
+		// Stamped without seqMu: this transaction may hold the write lock,
+		// which the hand-off holding seqMu waits for to apply. handOff takes
+		// seqMu once the lock is let go, and refuses the ops if the log moved.
+		seen, err := c.heads(ctx)
 		if err != nil {
-			c.s.store.seqMu.Unlock()
 			return err
 		}
-		c.handoff = ops
+		ops, err := c.stamp(ctx)
+		if err != nil {
+			return err
+		}
+		c.handoff, c.seen = ops, seen
 		return driver.ErrHandOff
 	}
 	if r != nil && hasSchemaOp(c.buf) {
@@ -339,26 +343,32 @@ func (c *capture) flush(ctx context.Context) error {
 	return nil
 }
 
-// fresh refuses a Quorum commit whose transaction began before another commit
-// landed. Its statements ran on what the database held then, and its seqs
-// would repeat the other's: an ordinary commit fails for the same reason when
-// it finds the file moved (engine.ErrBusy), but this transaction is discarded
-// and never gets there. Every change to a Quorum database is an op, so the log
-// as the transaction sees it, against the log as it is now, says whether
-// anything landed.
-func (c *capture) fresh(ctx context.Context) ([]Op, error) {
-	const q = `SELECT site, max(seq) FROM main._repl_oplog GROUP BY site ORDER BY site`
-	rows, err := c.conn.Query(ctx, q)
+const headsQuery = `SELECT site, max(seq) FROM main._repl_oplog GROUP BY site ORDER BY site`
+
+// heads is the log's last seq per site as this transaction reads it.
+func (c *capture) heads(ctx context.Context) (string, error) {
+	rows, err := c.conn.Query(ctx, headsQuery)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	var seen strings.Builder
 	for _, r := range rows {
 		fmt.Fprintf(&seen, "%s=%v;", asString(r[0]), r[1])
 	}
-	now, err := c.s.store.db.QueryContext(ctx, q)
+	return seen.String(), nil
+}
+
+// fresh refuses a Quorum commit whose transaction began before another commit
+// landed. Its statements ran on what the database held then, and its seqs
+// would repeat the other's: an ordinary commit fails for the same reason when
+// it finds the file moved (engine.ErrBusy), but this transaction is discarded
+// and never gets there. Every change to a Quorum database is an op, so the log
+// as the transaction saw it (heads), against the log as it is now, says
+// whether anything landed. Under seqMu.
+func (c *capture) fresh(ctx context.Context, seen string) error {
+	now, err := c.s.store.db.QueryContext(ctx, headsQuery)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer now.Close()
 	var cur strings.Builder
@@ -366,17 +376,17 @@ func (c *capture) fresh(ctx context.Context) ([]Op, error) {
 		var site string
 		var seq int64
 		if err := now.Scan(&site, &seq); err != nil {
-			return nil, err
+			return err
 		}
 		fmt.Fprintf(&cur, "%s=%d;", site, seq)
 	}
 	if err := now.Err(); err != nil {
-		return nil, err
+		return err
 	}
-	if seen.String() != cur.String() {
-		return nil, fmt.Errorf("%w: another connection committed while this transaction was open", engine.ErrBusy)
+	if seen != cur.String() {
+		return fmt.Errorf("%w: another connection committed while this transaction was open", engine.ErrBusy)
 	}
-	return nil, nil
+	return nil
 }
 
 // stamp is the buffered ops with this site, their seqs and their HLCs.
@@ -420,15 +430,19 @@ func (c *capture) lastSeq(ctx context.Context) (uint64, error) {
 // go through the caller's consensus, which applies them on every node, this
 // one included. The commit succeeded when they are applied here.
 func (c *capture) handOff() error {
+	ops, seen := c.handoff, c.seen
+	c.handoff, c.seen = nil, ""
+	c.s.store.seqMu.Lock()
 	defer c.s.store.seqMu.Unlock()
-	ops := c.handoff
-	c.handoff = nil
+	if err := c.fresh(context.Background(), seen); err != nil {
+		return err
+	}
 	return c.s.propose(context.Background(), ops)
 }
 
-// propose sends ops, stamped under seqMu which the caller holds, through the
-// caller's consensus log as one entry, and reports whether they were applied
-// here.
+// propose sends ops through the caller's consensus log as one entry, the
+// caller holding seqMu so that no other commit takes their seqs, and reports
+// whether they were applied here.
 func (s *Syncer) propose(ctx context.Context, ops []Op) error {
 	entry, err := json.Marshal(ops)
 	if err != nil {
