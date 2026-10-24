@@ -51,8 +51,8 @@ func writeRowidRef(c *compiler, tbl *tableMeta, cursor int, e Expr) bool {
 // column-free and can be evaluated before the loop opens -- no cursor is
 // positioned yet.
 //
-// A non-integer key is handled at RUN time by OpSeekRowidHint, which leaves the
-// cursor in full-scan mode: only an integer can equal a rowid.
+// A key that is no integer under numeric affinity fetches nothing at RUN time
+// (OpSeekRowidHint): only an integer can equal a rowid.
 func emitWriteRowidSeekHint(c *compiler, tbl *tableMeta, cursor int, where Expr) bool {
 	key, ok := detectWriteRowidSeekKey(c, tbl, cursor, where)
 	if !ok {

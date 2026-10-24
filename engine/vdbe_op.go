@@ -579,15 +579,16 @@ const (
 
 	// OpSeekRowidHint: P1: cursor. P2: key register. Makes cursor P1's next
 	// OpRewind fetch only the row whose rowid == r[P2] (SeekRowidSegments,
-	// segment_seek.go), when r[P2] is an INTEGER; any other key leaves a full
-	// scan. Emitted by emitJoinLoops after OpOpenRead when detectRowidSeekKey
+	// segment_seek.go), r[P2] taking numeric affinity first; a key that is then
+	// no integer fetches nothing, as OP_SeekRowid. Emitted by emitJoinLoops
+	// after OpOpenRead when detectRowidSeekKey
 	// found "rowid = <const/param>" (or the IPK column). The conjunct is still
 	// evaluated in the loop, so this only restricts the rows scanned.
 	//
 	// P3==1 marks a correlated (join inner-side) seek: emitted inside the outer
 	// loop (emitJoinSeekHint, vdbe_join_seek.go) before the inner OpRewind, it
 	// sets vdbeCursor.seekReseek so the cursor re-materializes on every rewind.
-	// A non-integer key then does a full inner scan for that iteration.
+	// A key that is no integer fetches nothing for that iteration.
 	OpSeekRowidHint
 
 	// OpSeekIndexHint: P1: cursor. P2: key register. P4: *indexSeekHint (index
