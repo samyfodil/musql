@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -394,5 +395,38 @@ func TestImageNotOverOwnData(t *testing.T) {
 	}
 	if got := dump(t, c.dbs["a"], `SELECT x FROM mine`); got != "42\n" {
 		t.Fatalf("b's own row on a: %q", got)
+	}
+}
+
+// TestImageNotOverALocalWrite: a write the node makes while its image is on the
+// way makes it a node with data of its own, and the image is not installed.
+func TestImageNotOverALocalWrite(t *testing.T) {
+	lowImageMin(t)
+	c := newCluster(t)
+	c.open("a", imageDDL...)
+	c.exec("a", `INSERT INTO t VALUES(1, 'one')`)
+	var b atomic.Pointer[sql.DB]
+	var mu sync.Mutex
+	wrote := errors.New("the hook never ran")
+	imageStagedForTest = func() error {
+		for b.Load() == nil {
+			runtime.Gosched()
+		}
+		_, err := b.Load().Exec(`CREATE TABLE mine(x)`)
+		mu.Lock()
+		wrote = err
+		mu.Unlock()
+		return nil
+	}
+	t.Cleanup(func() { imageStagedForTest = nil })
+	b.Store(c.open("b"))
+	c.converge("1|one\n", imageRowsT, `SELECT count(*) FROM mine`, clockQ)
+	mu.Lock()
+	defer mu.Unlock()
+	if wrote != nil {
+		t.Fatal(wrote)
+	}
+	if n := imagesOf(t, c.dbs["b"]); n != 0 {
+		t.Fatalf("b installed %d images over its own write", n)
 	}
 }
