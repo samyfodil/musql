@@ -165,12 +165,16 @@ func OpenStore(ctx context.Context, db *sql.DB, site string) (*Store, error) {
 	// write is causally after everything this database has ever seen -- the op
 	// log's, which holds the schema ops, and the clock's, which holds the cells
 	// of row ops long pruned from the log.
-	var maxHLC sql.NullInt64
-	if err := db.QueryRowContext(ctx, `SELECT max(h) FROM (SELECT max(hlc) AS h FROM main._repl_oplog UNION ALL SELECT max(hlc) FROM main._repl_clock)`).Scan(&maxHLC); err != nil {
-		return nil, err
-	}
-	if maxHLC.Valid {
-		s.clock.Merge(HLC(maxHLC.Int64))
+	// Two plain max()es: under a subquery, the clock's every row is loaded
+	// to find one.
+	for _, q := range []string{`SELECT max(hlc) FROM main._repl_oplog`, `SELECT max(hlc) FROM main._repl_clock`} {
+		var maxHLC sql.NullInt64
+		if err := db.QueryRowContext(ctx, q).Scan(&maxHLC); err != nil {
+			return nil, err
+		}
+		if maxHLC.Valid {
+			s.clock.Merge(HLC(maxHLC.Int64))
+		}
 	}
 	return s, nil
 }

@@ -1207,18 +1207,19 @@ func (x *GetImageRequest) GetDeltaVersion() uint32 {
 }
 
 type ImageManifest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Site          string                 `protobuf:"bytes,1,opt,name=site,proto3" json:"site,omitempty"`
-	FileVersion   uint32                 `protobuf:"varint,2,opt,name=file_version,json=fileVersion,proto3" json:"file_version,omitempty"`
-	DeltaVersion  uint32                 `protobuf:"varint,3,opt,name=delta_version,json=deltaVersion,proto3" json:"delta_version,omitempty"`
-	Layout        string                 `protobuf:"bytes,4,opt,name=layout,proto3" json:"layout,omitempty"`
-	Catalog       string                 `protobuf:"bytes,5,opt,name=catalog,proto3" json:"catalog,omitempty"`
-	Size          uint64                 `protobuf:"varint,6,opt,name=size,proto3" json:"size,omitempty"`
-	Sha256        []byte                 `protobuf:"bytes,7,opt,name=sha256,proto3" json:"sha256,omitempty"`
-	Vv            []*VVEntry             `protobuf:"bytes,8,rep,name=vv,proto3" json:"vv,omitempty"`
-	Floors        []*VVEntry             `protobuf:"bytes,9,rep,name=floors,proto3" json:"floors,omitempty"`
-	Ranges        []*RangeEntry          `protobuf:"bytes,10,rep,name=ranges,proto3" json:"ranges,omitempty"`
-	MaxHlc        uint64                 `protobuf:"varint,11,opt,name=max_hlc,json=maxHlc,proto3" json:"max_hlc,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	Site         string                 `protobuf:"bytes,1,opt,name=site,proto3" json:"site,omitempty"`
+	FileVersion  uint32                 `protobuf:"varint,2,opt,name=file_version,json=fileVersion,proto3" json:"file_version,omitempty"`
+	DeltaVersion uint32                 `protobuf:"varint,3,opt,name=delta_version,json=deltaVersion,proto3" json:"delta_version,omitempty"`
+	Layout       string                 `protobuf:"bytes,4,opt,name=layout,proto3" json:"layout,omitempty"`
+	Catalog      string                 `protobuf:"bytes,5,opt,name=catalog,proto3" json:"catalog,omitempty"`
+	Size         uint64                 `protobuf:"varint,6,opt,name=size,proto3" json:"size,omitempty"`
+	// crc32c is the image's CRC-32C (Castagnoli).
+	Crc32C        uint32        `protobuf:"varint,7,opt,name=crc32c,proto3" json:"crc32c,omitempty"`
+	Vv            []*VVEntry    `protobuf:"bytes,8,rep,name=vv,proto3" json:"vv,omitempty"`
+	Floors        []*VVEntry    `protobuf:"bytes,9,rep,name=floors,proto3" json:"floors,omitempty"`
+	Ranges        []*RangeEntry `protobuf:"bytes,10,rep,name=ranges,proto3" json:"ranges,omitempty"`
+	MaxHlc        uint64        `protobuf:"varint,11,opt,name=max_hlc,json=maxHlc,proto3" json:"max_hlc,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1295,11 +1296,11 @@ func (x *ImageManifest) GetSize() uint64 {
 	return 0
 }
 
-func (x *ImageManifest) GetSha256() []byte {
+func (x *ImageManifest) GetCrc32C() uint32 {
 	if x != nil {
-		return x.Sha256
+		return x.Crc32C
 	}
-	return nil
+	return 0
 }
 
 func (x *ImageManifest) GetVv() []*VVEntry {
@@ -1523,7 +1524,7 @@ const file_transport_proto_rawDesc = "" +
 	"\x06layout\x18\x04 \x01(\tR\x06layout\x12\x18\n" +
 	"\acatalog\x18\x05 \x01(\tR\acatalog\x12\x12\n" +
 	"\x04size\x18\x06 \x01(\x04R\x04size\x12\x16\n" +
-	"\x06sha256\x18\a \x01(\fR\x06sha256\x12&\n" +
+	"\x06crc32c\x18\a \x01(\rR\x06crc32c\x12&\n" +
 	"\x02vv\x18\b \x03(\v2\x16.replicationpb.VVEntryR\x02vv\x12.\n" +
 	"\x06floors\x18\t \x03(\v2\x16.replicationpb.VVEntryR\x06floors\x121\n" +
 	"\x06ranges\x18\n" +

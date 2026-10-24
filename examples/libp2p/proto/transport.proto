@@ -143,7 +143,8 @@ message ImageManifest {
   string layout = 4;
   string catalog = 5;
   uint64 size = 6;
-  bytes sha256 = 7;
+  // crc32c is the image's CRC-32C (Castagnoli).
+  uint32 crc32c = 7;
   repeated VVEntry vv = 8;
   repeated VVEntry floors = 9;
   repeated RangeEntry ranges = 10;

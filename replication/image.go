@@ -3,10 +3,10 @@ package replication
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log"
 	"os"
@@ -53,19 +53,22 @@ type ImageRequest struct {
 	FileVersion, MinFileVersion, DeltaVersion uint32
 }
 
-// ImageManifest describes an image: its formats, its bytes, and the state at its
-// cut. VV is a lower bound of the image's version vector.
+// ImageManifest describes an image: its formats, its bytes (Checksum is their
+// CRC-32C), and the state at its cut. VV is a lower bound of the image's
+// version vector, and MaxHLC an upper bound of every HLC in it.
 type ImageManifest struct {
 	Site                      string
 	FileVersion, DeltaVersion uint32
 	Layout                    string
 	Catalog                   string
 	Size                      int64
-	SHA256                    []byte
+	Checksum                  uint32
 	VV, Floors                VersionVector
 	Ranges                    map[string]uint64
 	MaxHLC                    HLC
 }
+
+var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
 func imageRequest(layout string) ImageRequest {
 	file, minFile, delta := engine.FormatVersions()
@@ -239,7 +242,7 @@ func (s *Store) writeImage(ctx context.Context, path, img string, m *ImageManife
 	if err != nil {
 		return nil, err
 	}
-	h := sha256.New()
+	h := crc32.New(castagnoli)
 	if m.Size, err = io.Copy(h, f); err == nil {
 		_, err = f.Seek(0, io.SeekStart)
 	}
@@ -247,7 +250,7 @@ func (s *Store) writeImage(ctx context.Context, path, img string, m *ImageManife
 		f.Close()
 		return nil, err
 	}
-	m.SHA256 = h.Sum(nil)
+	m.Checksum = h.Sum32()
 	return f, nil
 }
 
@@ -478,8 +481,16 @@ func (sy *Syncer) installImage(ctx context.Context, im Imager, peer PeerID) erro
 	if err := adoptImage(ctx, staged, m, sy.site, sy.mode, own); err != nil {
 		return err
 	}
-	if _, err := engine.CompactSegmentFile(staged); err != nil {
+	ownSeq := uint64(0)
+	if len(own) > 0 {
+		ownSeq = own[len(own)-1].Seq
+	}
+	// The compaction makes the staged image durable: a new file, synced before
+	// it is renamed in.
+	if done, err := engine.CompactSegmentFile(staged); err != nil {
 		return err
+	} else if !done {
+		return fmt.Errorf("replication: the staged image %s was not compacted", staged)
 	}
 	marker := path + markerSuffix
 	if err := writeDurable(marker, []byte(filepath.Base(staged))); err != nil {
@@ -502,13 +513,18 @@ func (sy *Syncer) installImage(ctx context.Context, im Imager, peer PeerID) erro
 	if err := removeDurable(marker); err != nil {
 		log.Printf("replication: %v (Open removes it)", err)
 	}
-	high, err := s.rowidHighs(ctx, sy.rowidLo, sy.rowidHi)
-	if err != nil {
-		return err
+	// A site the image knows from more than the mode ops carried in may have
+	// rows in its range, deleted ones too, whose rowids it must not hand out
+	// again. A new site has none, and its scan of the clock is skipped.
+	if s.floors[s.site] > 0 || s.vv[s.site] > ownSeq {
+		high, err := s.rowidHighs(ctx, sy.rowidLo, sy.rowidHi)
+		if err != nil {
+			return err
+		}
+		sy.highMu.Lock()
+		sy.high = high
+		sy.highMu.Unlock()
 	}
-	sy.highMu.Lock()
-	sy.high = high
-	sy.highMu.Unlock()
 	sy.setCatalog(s.cat, s.ver)
 	sy.images.Add(1)
 	log.Printf("replication: installed an image of %d bytes from %s", m.Size, peer)
@@ -530,8 +546,8 @@ func keepMarker(path, staged string, ctr uint32, err error) (pending bool, _ err
 	return true, fmt.Errorf("%w (the install finishes when the database is next opened)", err)
 }
 
-// stageImage copies body, which m describes, to a new file beside path, checks
-// its size and checksum, and makes it durable.
+// stageImage copies body, which m describes, to a new file beside path, and
+// checks its size and checksum.
 func stageImage(path string, m ImageManifest, body io.ReadCloser) (string, error) {
 	defer body.Close()
 	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+stagedInfix+"*")
@@ -539,13 +555,10 @@ func stageImage(path string, m ImageManifest, body io.ReadCloser) (string, error
 		return "", err
 	}
 	staged := f.Name()
-	h := sha256.New()
+	h := crc32.New(castagnoli)
 	n, err := io.CopyBuffer(io.MultiWriter(f, h), io.LimitReader(body, m.Size+1), make([]byte, 1<<20))
-	if err == nil && (n != m.Size || !bytes.Equal(h.Sum(nil), m.SHA256)) {
+	if err == nil && (n != m.Size || h.Sum32() != m.Checksum) {
 		err = fmt.Errorf("replication: image of %d bytes does not match its manifest (%d bytes)", n, m.Size)
-	}
-	if err == nil {
-		err = f.Sync()
 	}
 	if cerr := f.Close(); err == nil {
 		err = cerr
