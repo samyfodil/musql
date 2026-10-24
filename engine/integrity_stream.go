@@ -199,9 +199,9 @@ func (p *ReadOnlyPager) integrityRowFindingsStreamed(tr *SchemaRow, tm *tableMet
 			return nil, nil, 0, errIntegrityInMemory
 		}
 		prev = rowid
-		row, ferr := fullStoredRow(tm, rowid, vals)
-		if ferr != nil {
-			rerr = ferr
+		row := fullStoredRow(tm, rowid, vals)
+		if gerr := integrityGenErr(cols, strict, row); gerr != nil {
+			rerr = gerr
 			break
 		}
 		nRows++
@@ -230,6 +230,9 @@ func (p *ReadOnlyPager) integrityRowFindingsStreamed(tr *SchemaRow, tm *tableMet
 				continue
 			}
 			key := indexEntryForNewRow(tm, ix.idx, rowid, row)
+			if gerr := rowGenErr(key); gerr != nil {
+				return nil, nil, 0, gerr
+			}
 			if valuesHaveNaN(key) {
 				return nil, nil, 0, errIntegrityInMemory
 			}

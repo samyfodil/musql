@@ -378,6 +378,11 @@ func (p *selfRowExpr) eval(ctx *evalCtx) (Value, error) {
 			return Value{}, rerr
 		}
 	}
+	for _, k := range q.virtReads {
+		if k < len(ctx.vals) && ctx.vals[k].Typ == valueGenErr {
+			return Value{}, genErrOf(ctx.vals[k])
+		}
+	}
 	// These run once per ROW of a scan or a write, so the machine and its
 	// register file are pooled rather than allocated per evaluation: built
 	// fresh each time, the seam measured 331ns/1192B for an expression that had
