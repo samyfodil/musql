@@ -146,3 +146,24 @@ func acksFromPB(entries []*pb.AckEntry) replication.Acks {
 	}
 	return out
 }
+
+// manifestToPB converts an image manifest to its protobuf representation.
+func manifestToPB(m replication.ImageManifest) *pb.ImageManifest {
+	out := &pb.ImageManifest{Site: m.Site, FileVersion: m.FileVersion, DeltaVersion: m.DeltaVersion, Layout: m.Layout,
+		Catalog: m.Catalog, Size: uint64(m.Size), Sha256: m.SHA256, Vv: vvToPB(m.VV), Floors: vvToPB(m.Floors), MaxHlc: uint64(m.MaxHLC)}
+	for site, lo := range m.Ranges {
+		out.Ranges = append(out.Ranges, &pb.RangeEntry{Site: site, Lo: lo})
+	}
+	return out
+}
+
+// manifestFromPB converts a protobuf image manifest back.
+func manifestFromPB(m *pb.ImageManifest) replication.ImageManifest {
+	out := replication.ImageManifest{Site: m.GetSite(), FileVersion: m.GetFileVersion(), DeltaVersion: m.GetDeltaVersion(), Layout: m.GetLayout(),
+		Catalog: m.GetCatalog(), Size: int64(m.GetSize()), SHA256: m.GetSha256(), VV: vvFromPB(m.GetVv()), Floors: vvFromPB(m.GetFloors()),
+		Ranges: map[string]uint64{}, MaxHLC: replication.HLC(m.GetMaxHlc())}
+	for _, e := range m.GetRanges() {
+		out.Ranges[e.GetSite()] = e.GetLo()
+	}
+	return out
+}

@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"slices"
 	"time"
@@ -32,6 +33,11 @@ import (
 // so any number of them share a host, each answering only for itself.
 const ProtocolID = protocol.ID("/musql/replication/1.0.0")
 
+// ImageProtocolID is the base of the stream protocol an image is sent over
+// (replication.Imager), per database as ProtocolID is: a stream of its own,
+// since an image is many messages where a call is one.
+const ImageProtocolID = protocol.ID("/musql/replication-image/1.0.0")
+
 // Server is the read side of a replication.Store that Transport serves over
 // the network on behalf of a local node. *replication.Store satisfies this.
 type Server interface {
@@ -49,6 +55,12 @@ type Server interface {
 	MergeAcks(replication.Acks)
 }
 
+// ImageServer is a Server that sends its database's image to a node that holds
+// nothing yet. *replication.Store is one.
+type ImageServer interface {
+	Image(ctx context.Context, req replication.ImageRequest) (replication.ImageManifest, io.ReadCloser, error)
+}
+
 // Transport implements replication.Transport over a libp2p host: ExchangeVV and
 // GetOps are request/response calls over ProtocolID; PushOp publishes to a
 // gossipsub topic and SubscribePush is fed by a background reader of that
@@ -57,6 +69,7 @@ type Transport struct {
 	host  host.Host
 	srv   Server
 	proto protocol.ID
+	image protocol.ID
 	ownPS bool // the router is this Transport's own (New was given nil)
 	topic *pubsub.Topic
 	sub   *pubsub.Subscription
@@ -65,7 +78,10 @@ type Transport struct {
 	pushCh chan replication.PeerOp
 }
 
-var _ replication.Transport = (*Transport)(nil)
+var (
+	_ replication.Transport = (*Transport)(nil)
+	_ replication.Imager    = (*Transport)(nil)
+)
 
 // New creates a Transport bound to host h, joining topicName on the pubsub
 // router ps for PushOp/SubscribePush and registering a stream handler on h for
@@ -82,6 +98,7 @@ func New(ctx context.Context, h host.Host, ps *pubsub.PubSub, topicName string, 
 		host:   h,
 		srv:    srv,
 		proto:  ProtocolID + "/" + protocol.ID(topicName),
+		image:  ImageProtocolID + "/" + protocol.ID(topicName),
 		ownPS:  ps == nil,
 		stop:   stop,
 		pushCh: make(chan replication.PeerOp, 64),
@@ -114,6 +131,7 @@ func New(ctx context.Context, h host.Host, ps *pubsub.PubSub, topicName string, 
 	t.topic = topic
 
 	h.SetStreamHandler(t.proto, t.handleStream)
+	h.SetStreamHandler(t.image, t.handleImage)
 	go t.readGossip(ctx)
 
 	return t, nil
@@ -125,6 +143,7 @@ func New(ctx context.Context, h host.Host, ps *pubsub.PubSub, topicName string, 
 func (t *Transport) Close() error {
 	defer t.stop()
 	t.host.RemoveStreamHandler(t.proto)
+	t.host.RemoveStreamHandler(t.image)
 	t.sub.Cancel()
 	if !t.ownPS {
 		return t.topic.Close()
@@ -246,6 +265,128 @@ func (t *Transport) GetSnapshot(ctx context.Context, peerID replication.PeerID, 
 		return replication.SnapshotPage{}, fmt.Errorf("examples/libp2p: %s answered GetSnapshot with %T", peerID, resp.GetMsg())
 	}
 	return snapshotFromPB(r)
+}
+
+// imageChunk is how many bytes of an image one ImageChunk carries.
+const imageChunk = 1 << 20
+
+// GetImage fetches peer's image: the manifest now, the bytes as the returned
+// reader is read. Closing the reader ends the stream.
+func (t *Transport) GetImage(ctx context.Context, peerID replication.PeerID, req replication.ImageRequest) (replication.ImageManifest, io.ReadCloser, error) {
+	pid, err := peer.Decode(string(peerID))
+	if err != nil {
+		return replication.ImageManifest{}, nil, fmt.Errorf("examples/libp2p: decode peer %q: %w", peerID, err)
+	}
+	s, err := t.host.NewStream(ctx, pid, t.image)
+	if err != nil {
+		return replication.ImageManifest{}, nil, fmt.Errorf("examples/libp2p: new image stream to %s: %w", peerID, err)
+	}
+	fail := func(err error) (replication.ImageManifest, io.ReadCloser, error) {
+		s.Reset()
+		return replication.ImageManifest{}, nil, err
+	}
+	if err := s.SetDeadline(time.Now().Add(streamTimeout)); err != nil {
+		return fail(err)
+	}
+	if _, err := protodelim.MarshalTo(s, &pb.GetImageRequest{Layout: req.Layout, FileVersion: req.FileVersion,
+		MinFileVersion: req.MinFileVersion, DeltaVersion: req.DeltaVersion}); err != nil {
+		return fail(fmt.Errorf("examples/libp2p: write image request to %s: %w", peerID, err))
+	}
+	r := bufio.NewReader(s)
+	var resp pb.GetImageResponse
+	if err := (protodelim.UnmarshalOptions{MaxSize: maxResponse}).UnmarshalFrom(r, &resp); err != nil {
+		return fail(fmt.Errorf("examples/libp2p: read image manifest from %s: %w", peerID, err))
+	}
+	if why := resp.GetRefused(); why != "" || resp.GetManifest() == nil {
+		s.Close()
+		return replication.ImageManifest{}, nil, fmt.Errorf("%w: %s: %s", replication.ErrImageRefused, peerID, why)
+	}
+	return manifestFromPB(resp.GetManifest()), &imageReader{s: s, r: r}, nil
+}
+
+// imageReader reads an image's bytes out of the ImageChunks on its stream.
+type imageReader struct {
+	s    network.Stream
+	r    *bufio.Reader
+	buf  []byte
+	done bool // the last chunk is read
+}
+
+func (r *imageReader) Read(p []byte) (int, error) {
+	for len(r.buf) == 0 {
+		if r.done {
+			return 0, io.EOF
+		}
+		if err := r.s.SetReadDeadline(time.Now().Add(streamTimeout)); err != nil {
+			return 0, err
+		}
+		var c pb.ImageChunk
+		if err := (protodelim.UnmarshalOptions{MaxSize: 2 * imageChunk}).UnmarshalFrom(r.r, &c); err != nil {
+			return 0, fmt.Errorf("examples/libp2p: read image chunk: %w", err)
+		}
+		r.buf, r.done = c.GetData(), c.GetLast()
+	}
+	n := copy(p, r.buf)
+	r.buf = r.buf[n:]
+	return n, nil
+}
+
+func (r *imageReader) Close() error {
+	if !r.done || len(r.buf) > 0 {
+		return r.s.Reset()
+	}
+	return r.s.Close()
+}
+
+// handleImage answers the GetImageRequest read from s with the image of the
+// database t serves, in ImageChunks.
+func (t *Transport) handleImage(s network.Stream) {
+	defer s.Close()
+	if err := s.SetDeadline(time.Now().Add(streamTimeout)); err != nil {
+		s.Reset()
+		return
+	}
+	var req pb.GetImageRequest
+	if err := (protodelim.UnmarshalOptions{MaxSize: maxRequest}).UnmarshalFrom(bufio.NewReader(s), &req); err != nil {
+		s.Reset()
+		return
+	}
+	is, ok := t.srv.(ImageServer)
+	if !ok {
+		protodelim.MarshalTo(s, &pb.GetImageResponse{Refused: "this node serves no image"})
+		return
+	}
+	m, body, err := is.Image(context.Background(), replication.ImageRequest{Layout: req.GetLayout(), FileVersion: req.GetFileVersion(),
+		MinFileVersion: req.GetMinFileVersion(), DeltaVersion: req.GetDeltaVersion()})
+	if err != nil {
+		protodelim.MarshalTo(s, &pb.GetImageResponse{Refused: err.Error()})
+		return
+	}
+	defer body.Close()
+	if _, err := protodelim.MarshalTo(s, &pb.GetImageResponse{Manifest: manifestToPB(m)}); err != nil {
+		s.Reset()
+		return
+	}
+	buf := make([]byte, imageChunk)
+	for {
+		n, err := io.ReadFull(body, buf)
+		last := err == io.EOF || err == io.ErrUnexpectedEOF
+		if err != nil && !last {
+			s.Reset()
+			return
+		}
+		if err := s.SetWriteDeadline(time.Now().Add(streamTimeout)); err != nil {
+			s.Reset()
+			return
+		}
+		if _, err := protodelim.MarshalTo(s, &pb.ImageChunk{Data: buf[:n], Last: last}); err != nil {
+			s.Reset()
+			return
+		}
+		if last {
+			return
+		}
+	}
 }
 
 // PushOp publishes op to the gossipsub topic. The peer argument is ignored:
