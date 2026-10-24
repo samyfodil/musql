@@ -240,3 +240,149 @@ func TestRowStoreEqIndexRollsBackWithRows(t *testing.T) {
 	}
 	exec(`ROLLBACK`)
 }
+
+// The byte lists, directly on the store: TEXT and BLOB are listed by their
+// bytes, but a column holding integers as well is refused, and so is a probe of
+// the kind the column does not hold -- a comparison's affinity can make 5 equal
+// '5' either way round.
+func TestRowStoreEqIndexBytes(t *testing.T) {
+	mk := func(rows map[uint64][]Value) *rowStore { return &rowStore{m: rows} }
+	txt := func(s string) Value { return Value{Typ: Text, S: []byte(s)} }
+	blob := func(s string) Value { return Value{Typ: Blob, S: []byte(s)} }
+	s := mk(map[uint64][]Value{
+		1: {{Typ: Int, I: 1}, txt("ab")},
+		2: {{Typ: Int, I: 2}, blob("ab")},
+		3: {{Typ: Int, I: 3}, txt("AB")},
+		4: {{Typ: Int, I: 4}, {Typ: Null}},
+		5: {{Typ: Int, I: 5}, txt("ab")},
+	})
+	got, ok := s.eqRowidsOf(1, txt("ab"))
+	if !ok || !slices.Equal(got, []uint64{1, 2, 5}) {
+		t.Errorf("'ab' gave %v (ok=%v), want [1 2 5]: the BLOB of the same bytes is a candidate the WHERE rejects", got, ok)
+	}
+	if got, ok = s.eqRowidsOf(1, blob("AB")); !ok || !slices.Equal(got, []uint64{3}) {
+		t.Errorf("x'4142' gave %v (ok=%v), want [3]", got, ok)
+	}
+	if _, ok = s.eqRowidsOf(1, Value{Typ: Int, I: 5}); ok {
+		t.Error("an INTEGER probe of a TEXT column must be refused: under NUMERIC affinity '5' is 5")
+	}
+	if _, ok = s.eqRowidsOf(1, Value{Typ: Float, F: 1}); ok {
+		t.Error("a REAL probe has no list to ask")
+	}
+	s = mk(map[uint64][]Value{
+		1: {{Typ: Int, I: 1}, {Typ: Int, I: 5}},
+		2: {{Typ: Int, I: 2}, txt("5")},
+	})
+	if _, ok = s.eqRowidsOf(1, txt("5")); ok {
+		t.Error("a column holding integers and TEXT must refuse a TEXT probe: under TEXT affinity 5 is '5'")
+	}
+	s = mk(map[uint64][]Value{
+		1: {{Typ: Int, I: 1}, {Typ: Int, I: 5}},
+		2: {{Typ: Int, I: 2}, {Typ: Int, I: 6}},
+	})
+	if _, ok = s.eqRowidsOf(1, txt("5")); ok {
+		t.Error("an INTEGER column must refuse a TEXT probe, not answer it with nothing")
+	}
+	for _, tc := range []struct {
+		v, probe Value
+		unequal  bool
+	}{
+		{blob("ab"), blob("ab"), false},
+		{blob("ab"), blob("ac"), true},
+		{blob("ab"), txt("ab"), true},
+		{txt("ab"), blob("ab"), true},
+		{Value{Typ: Int, I: 1}, blob("\x01"), true},
+		{txt("Ab "), txt("aB"), false},
+		{Value{Typ: Int, I: 5}, txt("5"), false},
+	} {
+		if got := certainlyUnequal(tc.v, tc.probe); got != tc.unequal {
+			t.Errorf("certainlyUnequal(%v, %v) = %v, want %v", tc.v, tc.probe, got, tc.unequal)
+		}
+	}
+}
+
+// TestRowStoreEqIndexTracksTextMutations is TestRowStoreEqIndexTracksEveryMutation
+// over TEXT and BLOB keys bound as parameters, ending with a write of an integer
+// into the TEXT column, which must drop the column's lists rather than lose it.
+func TestRowStoreEqIndexTracksTextMutations(t *testing.T) {
+	sess, err := Create(filepath.Join(t.TempDir(), "r.musq"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Discard()
+	exec := func(s string) {
+		t.Helper()
+		if e := sess.Exec(s); e != nil {
+			t.Fatalf("%s: %v", s, e)
+		}
+	}
+	exec(`CREATE TABLE t(id INTEGER PRIMARY KEY, s, b BLOB)`)
+	const n, mod = 4000, 7
+	type row struct {
+		s string
+		b byte
+	}
+	oracle := map[int64]row{} // s "" is a value no probe asks for
+	for i := int64(1); i <= n; i++ {
+		exec(fmt.Sprintf(`INSERT INTO t(id, s, b) VALUES(%d, 'k%d', x'%02x')`, i, i%mod, i%mod))
+		oracle[i] = row{fmt.Sprint("k", i%mod), byte(i % mod)}
+	}
+	check := func(what string) {
+		t.Helper()
+		for v := 0; v < mod+2; v++ {
+			k := fmt.Sprint("k", v)
+			for _, byB := range []bool{false, true} {
+				q, args := `SELECT id FROM t WHERE s = ?`, []Value{{Typ: Text, S: []byte(k)}}
+				if byB {
+					q, args = `SELECT id FROM t WHERE b = ? AND s = ?`, []Value{{Typ: Blob, S: []byte{byte(v)}}, args[0]}
+				}
+				_, rows, qerr := sess.Query(q, args)
+				if qerr != nil {
+					t.Fatalf("%s %s: %v", what, q, qerr)
+				}
+				got := make([]int64, len(rows))
+				for i, r := range rows {
+					got[i] = r[0].I
+				}
+				slices.Sort(got)
+				var exp []int64
+				for id, r := range oracle {
+					if r.s == k && (!byB || r.b == byte(v)) {
+						exp = append(exp, id)
+					}
+				}
+				slices.Sort(exp)
+				if !slices.Equal(got, exp) {
+					t.Errorf("%s: %s with %q gave %d rows, want %d", what, q, k, len(got), len(exp))
+				}
+			}
+		}
+	}
+	served := segIndexSeeksServed.Load()
+	check("initial")
+	if segIndexSeeksServed.Load() == served {
+		t.Fatal("no seek was served: the lists were never asked")
+	}
+	exec(`UPDATE t SET s = 'k3' WHERE id IN (1, 2, 4000)`)
+	for _, id := range []int64{1, 2, 4000} {
+		oracle[id] = row{"k3", oracle[id].b}
+	}
+	check("after an UPDATE across values")
+	exec(`DELETE FROM t WHERE id IN (8, 23, 3999)`)
+	for _, id := range []int64{8, 23, 3999} {
+		delete(oracle, id)
+	}
+	check("after a DELETE")
+	exec(`INSERT INTO t(id, s, b) VALUES(100000, 'k3', x'03')`)
+	oracle[100000] = row{"k3", 3}
+	check("after an INSERT")
+	exec(`UPDATE t SET b = x'05' WHERE id IN (3, 10)`)
+	oracle[3], oracle[10] = row{oracle[3].s, 5}, row{oracle[10].s, 5}
+	check("after an UPDATE of the BLOB")
+	exec(`UPDATE t SET s = 77 WHERE id = 9`)
+	oracle[9] = row{"", oracle[9].b}
+	check("after an INTEGER in the TEXT column")
+	exec(`DELETE FROM t`)
+	clear(oracle)
+	check("after a DELETE of everything")
+}
