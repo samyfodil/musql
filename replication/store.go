@@ -67,6 +67,9 @@ type Store struct {
 	localUntil   atomic.Int64
 	lastLocal    atomic.Int64
 	applied      atomic.Uint64
+	// localFree is closed when localRetries next falls, for waitLocal.
+	localMu   sync.Mutex
+	localFree chan struct{}
 	// ownSeq is the highest seq of this site's that a local commit here, or the
 	// log at open, holds (capture.lastSeq).
 	ownSeq atomic.Uint64
@@ -354,8 +357,23 @@ func (s *Store) localCommitted() { s.lastLocal.Store(time.Now().UnixNano()) }
 // waits at most as long as the driver retries (engine.BusyTimeout) from the
 // first failure.
 func (s *Store) waitLocal() {
-	for s.localRetries.Load() > 0 && time.Now().UnixNano() < s.localUntil.Load() {
-		time.Sleep(time.Millisecond)
+	for {
+		s.localMu.Lock()
+		if s.localFree == nil {
+			s.localFree = make(chan struct{})
+		}
+		free := s.localFree
+		s.localMu.Unlock()
+		left := time.Until(time.Unix(0, s.localUntil.Load()))
+		if s.localRetries.Load() <= 0 || left <= 0 {
+			return
+		}
+		t := time.NewTimer(left)
+		select {
+		case <-free:
+		case <-t.C:
+		}
+		t.Stop()
 	}
 }
 
@@ -365,7 +383,15 @@ func (s *Store) localFailed() {
 	s.localRetries.Add(1)
 }
 
-func (s *Store) localDone() { s.localRetries.Add(-1) }
+func (s *Store) localDone() {
+	s.localRetries.Add(-1)
+	s.localMu.Lock()
+	if s.localFree != nil {
+		close(s.localFree)
+		s.localFree = nil
+	}
+	s.localMu.Unlock()
+}
 
 // ingest applies ops, from the first, in one transaction, until they are done
 // or it has held the write lock for maxHold, and reports how many it took. On
