@@ -1,8 +1,14 @@
 name: release
 
-# Pushing a tag v* builds musqld, musql-convert and the Doom example for every
-# target and attaches them to a GitHub release. Everything is pure Go
-# (CGO_ENABLED=0), so one Linux runner cross-compiles all of it.
+# Pushing a tag v* builds, for every target, musqld, musql-convert and the Doom
+# example (musql-<os>-<arch>) and musql cloud (musql-cloud-<os>-<arch>), and
+# attaches them to a GitHub release; two images, musql (musqld) and
+# musql-cloud, go to ghcr. Everything is pure Go (CGO_ENABLED=0), so one Linux
+# runner cross-compiles all of it.
+#
+# musql cloud is built with -tags jitllm, the embedded AI, on all six targets
+# (it cross-compiles with CGO_ENABLED=0 on each), and ships the console, which
+# its own job builds once for every archive.
 
 on:
   push:
@@ -52,17 +58,97 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
 
-  release:
-    needs: build
+  # The console (cloud/console), built once for the six cloud archives. It
+  # imports the npm package, so the package's wasm module is built first.
+  console:
     runs-on: ubuntu-latest
     steps:
-      # Only the build archives: the image job's build action uploads a
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: build
+        run: |
+          set -euo pipefail
+          sh npm/build.sh
+          cd cloud/console
+          npm ci --no-audit --no-fund
+          npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: console
+          path: cloud/console/dist
+          if-no-files-found: error
+
+  # musql cloud: the server (embedded AI), the CLI and the console. cloud/ is
+  # its own Go module, so its go.sum keys the module cache.
+  cloud:
+    needs: console
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, darwin, windows]
+        goarch: [amd64, arm64]
+    env:
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: cloud/go.sum
+      - uses: actions/download-artifact@v4
+        with:
+          name: console
+          path: console-dist
+      - name: build
+        run: |
+          set -euo pipefail
+          ext=""; [ "$GOOS" = windows ] && ext=.exe
+          name="musql-cloud-${GOOS}-${GOARCH}"
+          out="$PWD/dist/$name"
+          mkdir -p "$out"
+          flags=(-trimpath -ldflags="-s -w")
+          (
+            cd cloud
+            go build "${flags[@]}" -tags jitllm -o "$out/musql-cloud$ext" ./cmd/musql-cloud
+            go build "${flags[@]}" -o "$out/musql$ext" ./cmd/musql
+          )
+          cp -r console-dist "$out/console"
+          # The example's paths are the development layout (make cloud-run, from
+          # the repository root); the archive keeps the console and the data
+          # beside the binary.
+          sed -e 's|^  dir: "cloud/console/dist"|  dir: "console"|' \
+              -e 's|^data_dir: ".cloud-dev/data"|data_dir: "data"|' \
+              cloud/config.example.yaml > "$out/config.example.yaml"
+          grep -q '^  dir: "console"$' "$out/config.example.yaml"
+          grep -q '^data_dir: "data"$' "$out/config.example.yaml"
+          cp LICENSE README.md cloud/DESIGN.md "$out/"
+          cd dist
+          if [ "$GOOS" = windows ]; then zip -qr "$name.zip" "$name"; else tar czf "$name.tar.gz" "$name"; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cloud-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+
+  release:
+    needs: [build, cloud]
+    runs-on: ubuntu-latest
+    steps:
+      # Only the build archives: the image jobs' build action uploads a
       # build-record artifact of its own, which cannot be extracted here, and a
-      # bare download takes every artifact the run has.
+      # bare download takes every artifact the run has (the console's included).
       - uses: actions/download-artifact@v4
         with:
           path: dist
-          pattern: "{linux,darwin,windows}-*"
+          pattern: "{linux,darwin,windows,cloud}-*"
           merge-multiple: true
       - name: checksums
         run: cd dist && sha256sum * > SHA256SUMS
@@ -89,6 +175,29 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}:${{ github.ref_name }}
             ghcr.io/${{ github.repository }}:latest
+
+  # musql cloud as an image of its own (cloud/Dockerfile): the server with the
+  # embedded AI, and the console, which the Dockerfile builds itself.
+  image-cloud:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: cloud/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          tags: |
+            ghcr.io/${{ github.repository }}-cloud:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}-cloud:latest
 
   # The npm package (npm/), to GitHub Packages as @samyfodil/musql: the wasm
   # module built from this tag, tested, and versioned from the tag's name.
