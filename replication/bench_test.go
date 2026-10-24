@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -165,10 +167,13 @@ func BenchmarkIngestWithLocalWriters(b *testing.B) {
 	}
 }
 
-// BenchmarkCatchUp is B4: a new node taking a 100k-row database from a peer
-// over the in-memory transport.
+// BenchmarkCatchUp is B4: a new node taking a 100k-row database (BENCH_ROWS)
+// from a peer over the in-memory transport.
 func BenchmarkCatchUp(b *testing.B) {
-	const n = 100000
+	n := 100000
+	if v, err := strconv.Atoi(os.Getenv("BENCH_ROWS")); err == nil && v > 0 {
+		n = v
+	}
 	net := NewMemNetwork()
 	src, _ := benchSource(b, n, memSync(net), WithSyncInterval(50*time.Millisecond))
 	want := src.store.LocalVV()[src.site]

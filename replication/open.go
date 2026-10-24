@@ -57,6 +57,13 @@ func openSyncer(ctx context.Context, path string, opts ...Option) (*Syncer, *sql
 		applyDB.Close()
 		return nil, nil, err
 	}
+	// An image install a crash interrupted is finished first (image.go). A
+	// database with no file has none.
+	if file, err := mainFile(ctx, applyDB); err == nil {
+		if err := recoverImage(file); err != nil {
+			return fail(err)
+		}
+	}
 	if err := InitSchema(ctx, applyDB); err != nil {
 		return fail(err)
 	}

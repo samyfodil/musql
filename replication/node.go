@@ -2,6 +2,7 @@ package replication
 
 import (
 	"context"
+	"io"
 	"log"
 	"sync/atomic"
 	"time"
@@ -23,6 +24,12 @@ type Node struct {
 	// synced is set by the first Sync round that reached a peer and left this
 	// node holding all every peer it reached held.
 	synced atomic.Bool
+
+	// syncer is the Syncer that attached the node, which installs images
+	// (image.go); nil for a bare node. imageFails counts the rounds in a row
+	// whose image failed.
+	syncer     *Syncer
+	imageFails int
 }
 
 // NewNode creates a Node over an already-open Store and Transport. The local
@@ -117,6 +124,9 @@ const maxPushBatch = 512
 // Sync is called again.
 func (n *Node) Sync(ctx context.Context) error {
 	peers := n.tr.Peers()
+	if n.bootImage(ctx, peers) {
+		return nil // the next round tries the image again
+	}
 	whole := len(peers) > 0
 	for _, peer := range peers {
 		peerVV, err := n.tr.ExchangeVV(ctx, peer, n.store.LocalVV())
@@ -266,6 +276,11 @@ func (a nodeOpSource) OpsSince(site string, fromSeq uint64, limit int) ([]Op, er
 func (a nodeOpSource) ExchangeAcks(acks Acks) Acks {
 	a.n.store.MergeAcks(acks)
 	return a.n.store.Acks()
+}
+
+// Image delegates to the underlying Store.
+func (a nodeOpSource) Image(ctx context.Context, req ImageRequest) (ImageManifest, io.ReadCloser, error) {
+	return a.n.store.Image(ctx, req)
 }
 
 // SnapshotPage delegates to the underlying Store.
