@@ -515,8 +515,9 @@ func (sy *Syncer) installImage(ctx context.Context, im Imager, peer PeerID) erro
 	}
 	// A site the image knows from more than the mode ops carried in may have
 	// rows in its range, deleted ones too, whose rowids it must not hand out
-	// again. A new site has none, and its scan of the clock is skipped.
-	if s.floors[s.site] > 0 || s.vv[s.site] > ownSeq {
+	// again. A new site has none, and its scan of the clock is skipped; a
+	// donor that pruned to its ack has a floor for it at those mode ops.
+	if s.floors[s.site] > ownSeq || s.vv[s.site] > ownSeq {
 		high, err := s.rowidHighs(ctx, sy.rowidLo, sy.rowidHi)
 		if err != nil {
 			return err
