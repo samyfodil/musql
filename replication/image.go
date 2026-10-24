@@ -565,6 +565,9 @@ func (sy *Syncer) installImage(ctx context.Context, im Imager, peer PeerID) erro
 		}
 		pending = false
 	}
+	// The database is the image now, and the store must follow it even if ctx
+	// ends: a store left as it was would go on as if the database were empty.
+	ctx = context.WithoutCancel(ctx)
 	s.clock.Merge(m.MaxHLC)
 	if err := s.reloadLocked(ctx); err != nil {
 		return err
