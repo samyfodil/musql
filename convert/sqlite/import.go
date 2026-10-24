@@ -3,6 +3,7 @@ package sqlite
 import (
 	"errors"
 	"fmt"
+	"iter"
 	"os"
 	"slices"
 	"strings"
@@ -39,7 +40,7 @@ func Import(src, dst string, opts ImportOptions) error {
 	var found []string
 	nStructural := 0
 	if !opts.Force {
-		res, err := p.checkStructuralIntegrity()
+		res, err := p.checkStructuralIntegrityUpTo(maxErr)
 		if err != nil {
 			return corruptErr(err)
 		}
@@ -119,25 +120,28 @@ func build(p *pager, rows []schemaRow, dst string) error {
 }
 
 // storedIndexEntries returns a function that reads an index's entries from the
-// source b-tree in b-tree order. Returns false if no b-tree or walk fails.
-func storedIndexEntries(p *pager, rows []schemaRow) func(string) ([][]Value, bool) {
+// source b-tree in b-tree order; ok is false for an index with no b-tree, and
+// the walk's error comes after it.
+func storedIndexEntries(p *pager, rows []schemaRow) func(string) (iter.Seq[[]Value], func() error, bool) {
 	roots := map[string]uint32{}
 	for _, r := range rows {
 		if r.Type == "index" && r.RootPage != 0 {
 			roots[strings.ToLower(r.Name)] = r.RootPage
 		}
 	}
-	return func(index string) ([][]Value, bool) {
+	return func(index string) (iter.Seq[[]Value], func() error, bool) {
 		root, ok := roots[strings.ToLower(index)]
 		if !ok {
-			return nil, false
+			return nil, nil, false
 		}
-		var recs [][]Value
 		seq, errFn := p.ScanWithoutRowidRows(root)
-		for _, rec := range seq {
-			recs = append(recs, slices.Clone(rec))
-		}
-		return recs, errFn() == nil
+		return func(yield func([]Value) bool) {
+			for _, rec := range seq {
+				if !yield(rec) {
+					return
+				}
+			}
+		}, errFn, true
 	}
 }
 

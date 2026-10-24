@@ -42,6 +42,13 @@ type StructuralIntegrityResult struct {
 }
 
 func (p *pager) checkStructuralIntegrity() (*StructuralIntegrityResult, error) {
+	return p.checkStructuralIntegrityUpTo(0)
+}
+
+// checkStructuralIntegrityUpTo is checkStructuralIntegrity keeping only the
+// first maxProblems findings when maxProblems is positive. OK still counts
+// them all.
+func (p *pager) checkStructuralIntegrityUpTo(maxProblems int) (*StructuralIntegrityResult, error) {
 	if p != nil && p.nPages == 0 {
 		// A zero-length file is an empty database with nothing to walk -- no
 		// page 1, no freelist, no pointer map. C SQLite answers "ok" for it
@@ -57,12 +64,16 @@ func (p *pager) checkStructuralIntegrity() (*StructuralIntegrityResult, error) {
 	checkFreelist, checkCoverage := true, true
 
 	w := &integrityWalker{
-		pages:      p.page,
-		pageCount:  p.PageCount(),
-		usable:     p.hdr.UsablePageSize(),
-		autoVacuum: autoVacuumModeOfHeader(p.hdr.LargestRootPage, p.hdr.IncrementalVacuum) != 0,
-		owner:      make(map[uint32]string),
+		pages:       p.page,
+		pageCount:   p.PageCount(),
+		usable:      p.hdr.UsablePageSize(),
+		autoVacuum:  autoVacuumModeOfHeader(p.hdr.LargestRootPage, p.hdr.IncrementalVacuum) != 0,
+		maxProblems: maxProblems,
 	}
+	// The owners of the pages the file holds, by number; a header may claim
+	// more pages than that, and claims past them are few (a pointer that leads
+	// out of the file).
+	w.owner = make([]uint32, uint64(min(w.pageCount, p.readablePages()))+1)
 	// Pointer-map pages are claimed FIRST, purely from page-number arithmetic
 	// (isPtrmapPage), before any b-tree/freelist walk runs -- so a b-tree or
 	// freelist pointer that lands on one (real corruption: a ptrmap page is
@@ -71,14 +82,8 @@ func (p *pager) checkStructuralIntegrity() (*StructuralIntegrityResult, error) {
 	// mechanism every other collision uses. Ptrmap CONTENT (whether each
 	// entry names its true parent) is deliberately not validated: only "does a
 	// ptrmap page exist where auto-vacuum says one must, and is it excluded
-	// from the orphan/double-reference check" is.
-	if w.autoVacuum {
-		for pgno := uint32(2); pgno <= w.pageCount; pgno++ {
-			if isPtrmapPage(pgno, w.usable) {
-				w.claim(pgno, "pointer-map page")
-			}
-		}
-	}
+	// from the orphan/double-reference check" is. The claim is the arithmetic
+	// itself (ownerOf), not a record per page.
 	// The pending-byte page is claimed too, as sqlite3BtreeIntegrityCheck
 	// does unconditionally before its freelist check (btree.c:11203):
 	//
@@ -106,13 +111,23 @@ func (p *pager) checkStructuralIntegrity() (*StructuralIntegrityResult, error) {
 		}
 	}
 	if checkCoverage {
-		for pgno := uint32(1); pgno <= w.pageCount; pgno++ {
-			if _, ok := w.owner[pgno]; !ok {
+		for pg := uint64(1); pg <= uint64(w.pageCount); pg++ {
+			pgno := uint32(pg)
+			if _, ok := w.ownerOf(pgno); !ok {
 				w.problem(pgno, fmt.Sprintf("page %d: never used (not reachable from any table/index b-tree, the freelist chain, or a pointer-map page)", pgno))
 			}
 		}
 	}
-	return &StructuralIntegrityResult{OK: len(w.problems) == 0, Problems: w.problems}, nil
+	return &StructuralIntegrityResult{OK: w.nProblems == 0, Problems: w.problems}, nil
+}
+
+// readablePages is how many pages a read can reach: the WAL's committed size
+// when one is in effect, else the file's.
+func (p *pager) readablePages() uint32 {
+	if p.walSnap != nil {
+		return p.walSnap.size
+	}
+	return p.nPages
 }
 
 // pendingByteOffset is the byte offset of SQLite's "pending byte" -- the lock
@@ -171,16 +186,23 @@ func structuralRoots(rows []schemaRow) []structuralRoot {
 // pager.page, its non-copying/cached form -- ptrmap/freelist/b-tree
 // pages are only ever READ here, never mutated, so sharing the pager's own
 // cached buffer is safe, exactly as btree.go's tableScanner already relies
-// on); owner is the "claimed by" map every visited page number is recorded
+// on); owner is the "claimed by" record every visited page number is entered
 // into exactly once (see this file's package doc comment for why this is
-// ONE global map rather than a per-tree local one).
+// ONE global record rather than a per-tree local one): 1 + the claimant's
+// index in labels, 0 for a page nobody claimed, and far for page numbers past
+// the end of owner.
 type integrityWalker struct {
-	pages      pageSource
-	pageCount  uint32
-	usable     uint32
-	autoVacuum bool
-	owner      map[uint32]string
-	problems   []IntegrityProblem
+	pages       pageSource
+	pageCount   uint32
+	usable      uint32
+	autoVacuum  bool
+	owner       []uint32
+	far         map[uint32]uint32
+	labels      []string
+	labelOf     map[string]uint32
+	problems    []IntegrityProblem
+	nProblems   int
+	maxProblems int // 0: keep every finding
 }
 
 // pageSource reads page pgno's (1-indexed) raw bytes -- the same shape
@@ -189,7 +211,48 @@ type integrityWalker struct {
 type pageSource func(pgno uint32) ([]byte, error)
 
 func (w *integrityWalker) problem(pgno uint32, msg string) {
+	w.nProblems++
+	if w.maxProblems > 0 && len(w.problems) >= w.maxProblems {
+		return
+	}
 	w.problems = append(w.problems, IntegrityProblem{Page: pgno, Message: msg})
+}
+
+// ownerOf is who claimed pgno, a page in range.
+func (w *integrityWalker) ownerOf(pgno uint32) (string, bool) {
+	if w.autoVacuum && isPtrmapPage(pgno, w.usable) {
+		return "pointer-map page", true
+	}
+	var id uint32
+	if uint64(pgno) < uint64(len(w.owner)) {
+		id = w.owner[pgno]
+	} else {
+		id = w.far[pgno]
+	}
+	if id == 0 {
+		return "", false
+	}
+	return w.labels[id-1], true
+}
+
+func (w *integrityWalker) setOwner(pgno uint32, owner string) {
+	id, ok := w.labelOf[owner]
+	if !ok {
+		if w.labelOf == nil {
+			w.labelOf = map[string]uint32{}
+		}
+		w.labels = append(w.labels, owner)
+		id = uint32(len(w.labels))
+		w.labelOf[owner] = id
+	}
+	if uint64(pgno) < uint64(len(w.owner)) {
+		w.owner[pgno] = id
+		return
+	}
+	if w.far == nil {
+		w.far = map[uint32]uint32{}
+	}
+	w.far[pgno] = id
 }
 
 // claim records pgno as reachable, owned by owner (a diagnostic label such
@@ -206,11 +269,11 @@ func (w *integrityWalker) claim(pgno uint32, owner string) bool {
 		w.problem(pgno, fmt.Sprintf("%s: page number %d is out of range [1,%d]", owner, pgno, w.pageCount))
 		return false
 	}
-	if prev, dup := w.owner[pgno]; dup {
+	if prev, dup := w.ownerOf(pgno); dup {
 		w.problem(pgno, fmt.Sprintf("page %d is referenced by both %s and %s", pgno, prev, owner))
 		return false
 	}
-	w.owner[pgno] = owner
+	w.setOwner(pgno, owner)
 	return true
 }
 
