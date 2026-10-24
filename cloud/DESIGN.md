@@ -17,6 +17,7 @@ own OIDC provider, and serves the console; plus a CLI companion.
 | `cloud/store/` | Database files, snapshots, change log, branching and restore. |
 | `cloud/gen/` | Generated code (`buf generate`); never edited by hand. |
 | `cloud/console/` | The web console (React, Vite). |
+| `cloud/Dockerfile` | The server's image, built from the repository root; see Releases. |
 | `proto/cloud/v1/` | The management API, one `.proto` per service. |
 
 Rules from `AGENTS.md` hold: library packages read no environment variables
@@ -291,8 +292,11 @@ Providers, behind one `cloud/ai` interface (`Generate(ctx, system, user)`):
   (Qwen2.5-Coder based, 67.1% on BIRD), small enough to answer fast on a CPU.
   The model is opened once, lazily, sessions are short-lived, decoding is
   greedy with a token budget, and generation is cut at the end of the SQL.
-  Built behind a `jitllm` build tag so a server without it stays small; the
-  release build includes it.
+  Built behind a `jitllm` build tag, so a server without it carries none of it
+  (the tag adds 5 MiB to the stripped linux/amd64 binary: 61 MiB without,
+  66 MiB with). The release archives and the image include it (see Releases);
+  the model is in neither: point `jitllm.models_dir` at a directory with the
+  `.jlm`.
 - **jitllm server**: `jitllmd`'s OpenAI-compatible API at `base_url`.
 - **OpenAI**: Chat Completions, `api_key`, `model`.
 - **Anthropic**: Messages API, `api_key`, `model`.
@@ -341,3 +345,41 @@ Same verbs as `turso` where they apply: `auth login|logout|whoami|token`,
 `db list|create|show|destroy|shell|tokens create|tokens invalidate|import|export|restore|branch`,
 `db inspect` (size, usage), `db shell` (a REPL over Hrana with `.tables`,
 `.schema`, `.mode`). Config in `~/.config/musql/` (only the CLI reads it).
+
+## Releases
+
+A tag `v*` runs `.github/workflows/release.yml`. It attaches to the GitHub
+release, beside the `musql-<os>-<arch>` archives of `musqld`, `musql-convert`
+and the Doom example, a `musql-cloud-<os>-<arch>` archive (`.tar.gz`, `.zip`
+on Windows) for linux, darwin and windows on amd64 and arm64. It also pushes
+the image `ghcr.io/samyfodil/musql-cloud` for linux/amd64 and linux/arm64,
+tagged with the version and `latest`.
+
+An archive holds `musql-cloud` (built with `-tags jitllm`, so the embedded AI
+is in), `musql`, `console/` (the console's build, made once for all six),
+`config.example.yaml` with its paths set for this layout (`console/` and `data/`
+beside the binary), `LICENSE`, `README.md` and this file. All six build with
+`CGO_ENABLED=0` and the tag. `musql-cloud` is 61 to 68 MiB stripped.
+
+```sh
+tar xzf musql-cloud-linux-amd64.tar.gz && cd musql-cloud-linux-amd64
+cp config.example.yaml config.yaml        # set public_url, the OIDC issuer
+./musql-cloud init --admin-email you@example.com
+./musql-cloud                             # -config config.yaml
+```
+
+The image is `scratch` and the static binary (`cloud/Dockerfile`, built from
+the repository root; it builds the console itself). It runs as 65532 and
+keeps its state in the `/data` volume. Its `/config.yaml` sets only
+`listen: ":8080"`, `data_dir: "/data"` and `console.dir: "/console"`; mount your
+own over it to set `public_url`, `peers` or `ai`, and a directory of models for
+`ai.jitllm.models_dir`. `init` is the same command:
+
+```sh
+docker run --rm -it -v musql-cloud:/data ghcr.io/samyfodil/musql-cloud init --admin-email you@example.com
+docker run -p 8080:8080 -v musql-cloud:/data ghcr.io/samyfodil/musql-cloud
+```
+
+`make cloud TAGS=jitllm` builds the same server and CLI into `bin/`. CI builds
+the server with the tag, runs this module's tests with it, and cross-compiles
+the other release targets.
