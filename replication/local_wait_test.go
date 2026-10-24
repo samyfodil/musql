@@ -3,6 +3,7 @@ package replication
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
@@ -77,4 +78,40 @@ func TestApplyYieldsToWaitingLocalWrite(t *testing.T) {
 		t.Fatal("the next apply still waits after the local write it yielded to took the lock")
 	}
 	s.localLockWait(false)
+}
+
+// TestLocalCommitDoesNotWaitForAnApply: once a local write has committed, its
+// Exec returns without waiting for the store, which an apply holds through
+// its whole transaction; its seq still reaches the version vector.
+func TestLocalCommitDoesNotWaitForAnApply(t *testing.T) {
+	ctx := context.Background()
+	s, db, err := openSyncer(ctx, filepath.Join(t.TempDir(), "a.musq"), CRDT())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE t(id INTEGER PRIMARY KEY, v)`); err != nil {
+		t.Fatal(err)
+	}
+	before := s.store.LocalVV()[s.store.Site()]
+	s.store.mu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := db.Exec(`INSERT INTO t(v) VALUES(1)`)
+		done <- err
+	}()
+	select {
+	case err = <-done:
+		s.store.mu.Unlock()
+	case <-time.After(5 * time.Second):
+		s.store.mu.Unlock()
+		<-done
+		t.Fatal("a local commit waited for an apply's transaction to end")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.store.LocalVV()[s.store.Site()]; got != before+1 {
+		t.Fatalf("own seq %d in the version vector, want %d", got, before+1)
+	}
 }
