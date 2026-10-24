@@ -86,6 +86,10 @@ func (n *Node) Broadcast(ops []Op) {
 	if n.tr == nil {
 		return
 	}
+	if b, ok := n.tr.(Broadcaster); ok {
+		b.PushOps(context.Background(), ops)
+		return
+	}
 	peers := n.tr.Peers()
 	for _, op := range ops {
 		for _, peer := range peers {

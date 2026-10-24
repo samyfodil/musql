@@ -251,7 +251,45 @@ func (t *Transport) GetSnapshot(ctx context.Context, peerID replication.PeerID, 
 // PushOp publishes op to the gossipsub topic. The peer argument is ignored:
 // gossipsub delivery is topic-wide, not point-to-point.
 func (t *Transport) PushOp(ctx context.Context, _ replication.PeerID, op replication.Op) error {
-	msg := &pb.PushMessage{Op: opToPB(op)}
+	return t.publish(ctx, &pb.PushMessage{Op: opToPB(op)})
+}
+
+var _ replication.Broadcaster = (*Transport)(nil)
+
+// maxPushBytes caps the ops of one gossip message, below gossipsub's 1MiB
+// default message limit.
+const maxPushBytes = 512 << 10
+
+// PushOps publishes a commit's ops to the gossipsub topic, as few messages as
+// fit them, once for every peer. A message of one op carries it in op, which
+// a peer that predates ops reads too.
+func (t *Transport) PushOps(ctx context.Context, ops []replication.Op) error {
+	var errs []error
+	msg, size := &pb.PushMessage{}, 0
+	flush := func() {
+		if len(msg.Ops) == 1 {
+			msg.Op, msg.Ops = msg.Ops[0], nil
+		}
+		if err := t.publish(ctx, msg); err != nil {
+			errs = append(errs, err)
+		}
+		msg, size = &pb.PushMessage{}, 0
+	}
+	for _, op := range opsToPB(ops) {
+		n := proto.Size(op)
+		if len(msg.Ops) > 0 && size+n > maxPushBytes {
+			flush()
+		}
+		msg.Ops = append(msg.Ops, op)
+		size += n
+	}
+	if len(msg.Ops) > 0 {
+		flush()
+	}
+	return errors.Join(errs...)
+}
+
+func (t *Transport) publish(ctx context.Context, msg *pb.PushMessage) error {
 	data, err := proto.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("examples/libp2p: marshal PushMessage: %w", err)
@@ -371,16 +409,22 @@ func (t *Transport) readGossip(ctx context.Context) {
 		if err := proto.Unmarshal(msg.Data, &pm); err != nil {
 			continue
 		}
-		op, err := opFromPB(pm.GetOp())
-		if err != nil {
-			log.Printf("examples/libp2p: pushed op from %s: %v", msg.ReceivedFrom, err)
-			continue
+		ops := pm.GetOps()
+		if pm.GetOp() != nil {
+			ops = append([]*pb.Op{pm.GetOp()}, ops...)
 		}
-		po := replication.PeerOp{From: replication.PeerID(msg.ReceivedFrom.String()), Op: op}
-		select {
-		case t.pushCh <- po:
-		case <-ctx.Done():
-			return
+		for _, o := range ops {
+			op, err := opFromPB(o)
+			if err != nil {
+				log.Printf("examples/libp2p: pushed op from %s: %v", msg.ReceivedFrom, err)
+				continue
+			}
+			po := replication.PeerOp{From: replication.PeerID(msg.ReceivedFrom.String()), Op: op}
+			select {
+			case t.pushCh <- po:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
 }

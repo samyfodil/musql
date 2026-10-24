@@ -852,10 +852,12 @@ func (x *GetSnapshotResponse) GetNext() []byte {
 	return nil
 }
 
-// PushMessage carries a single pushed op, published over gossipsub.
+// PushMessage carries the ops of one commit, published over gossipsub: a
+// single op in op, which every version reads, or several in ops.
 type PushMessage struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Op            *Op                    `protobuf:"bytes,1,opt,name=op,proto3" json:"op,omitempty"`
+	Ops           []*Op                  `protobuf:"bytes,2,rep,name=ops,proto3" json:"ops,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -893,6 +895,13 @@ func (*PushMessage) Descriptor() ([]byte, []int) {
 func (x *PushMessage) GetOp() *Op {
 	if x != nil {
 		return x.Op
+	}
+	return nil
+}
+
+func (x *PushMessage) GetOps() []*Op {
+	if x != nil {
+		return x.Ops
 	}
 	return nil
 }
@@ -1185,9 +1194,10 @@ const file_transport_proto_rawDesc = "" +
 	"\x06floors\x18\x02 \x03(\v2\x16.replicationpb.VVEntryR\x06floors\x121\n" +
 	"\x06ranges\x18\x03 \x03(\v2\x19.replicationpb.RangeEntryR\x06ranges\x12.\n" +
 	"\x05cells\x18\x04 \x03(\v2\x18.replicationpb.ClockCellR\x05cells\x12\x12\n" +
-	"\x04next\x18\x05 \x01(\fR\x04next\"0\n" +
+	"\x04next\x18\x05 \x01(\fR\x04next\"U\n" +
 	"\vPushMessage\x12!\n" +
-	"\x02op\x18\x01 \x01(\v2\x11.replicationpb.OpR\x02op\"\xa1\x02\n" +
+	"\x02op\x18\x01 \x01(\v2\x11.replicationpb.OpR\x02op\x12#\n" +
+	"\x03ops\x18\x02 \x03(\v2\x11.replicationpb.OpR\x03ops\"\xa1\x02\n" +
 	"\aRequest\x12C\n" +
 	"\vexchange_vv\x18\x01 \x01(\v2 .replicationpb.ExchangeVVRequestH\x00R\n" +
 	"exchangeVv\x127\n" +
@@ -1248,19 +1258,20 @@ var file_transport_proto_depIdxs = []int32{
 	11, // 9: replicationpb.GetSnapshotResponse.ranges:type_name -> replicationpb.RangeEntry
 	10, // 10: replicationpb.GetSnapshotResponse.cells:type_name -> replicationpb.ClockCell
 	1,  // 11: replicationpb.PushMessage.op:type_name -> replicationpb.Op
-	3,  // 12: replicationpb.Request.exchange_vv:type_name -> replicationpb.ExchangeVVRequest
-	5,  // 13: replicationpb.Request.get_ops:type_name -> replicationpb.GetOpsRequest
-	12, // 14: replicationpb.Request.get_snapshot:type_name -> replicationpb.GetSnapshotRequest
-	8,  // 15: replicationpb.Request.exchange_acks:type_name -> replicationpb.ExchangeAcksRequest
-	4,  // 16: replicationpb.Response.exchange_vv:type_name -> replicationpb.ExchangeVVResponse
-	6,  // 17: replicationpb.Response.get_ops:type_name -> replicationpb.GetOpsResponse
-	13, // 18: replicationpb.Response.get_snapshot:type_name -> replicationpb.GetSnapshotResponse
-	9,  // 19: replicationpb.Response.exchange_acks:type_name -> replicationpb.ExchangeAcksResponse
-	20, // [20:20] is the sub-list for method output_type
-	20, // [20:20] is the sub-list for method input_type
-	20, // [20:20] is the sub-list for extension type_name
-	20, // [20:20] is the sub-list for extension extendee
-	0,  // [0:20] is the sub-list for field type_name
+	1,  // 12: replicationpb.PushMessage.ops:type_name -> replicationpb.Op
+	3,  // 13: replicationpb.Request.exchange_vv:type_name -> replicationpb.ExchangeVVRequest
+	5,  // 14: replicationpb.Request.get_ops:type_name -> replicationpb.GetOpsRequest
+	12, // 15: replicationpb.Request.get_snapshot:type_name -> replicationpb.GetSnapshotRequest
+	8,  // 16: replicationpb.Request.exchange_acks:type_name -> replicationpb.ExchangeAcksRequest
+	4,  // 17: replicationpb.Response.exchange_vv:type_name -> replicationpb.ExchangeVVResponse
+	6,  // 18: replicationpb.Response.get_ops:type_name -> replicationpb.GetOpsResponse
+	13, // 19: replicationpb.Response.get_snapshot:type_name -> replicationpb.GetSnapshotResponse
+	9,  // 20: replicationpb.Response.exchange_acks:type_name -> replicationpb.ExchangeAcksResponse
+	21, // [21:21] is the sub-list for method output_type
+	21, // [21:21] is the sub-list for method input_type
+	21, // [21:21] is the sub-list for extension type_name
+	21, // [21:21] is the sub-list for extension extendee
+	0,  // [0:21] is the sub-list for field type_name
 }
 
 func init() { file_transport_proto_init() }

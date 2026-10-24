@@ -100,9 +100,11 @@ message GetSnapshotResponse {
   bytes next = 5;
 }
 
-// PushMessage carries a single pushed op, published over gossipsub.
+// PushMessage carries the ops of one commit, published over gossipsub: a
+// single op in op, which every version reads, or several in ops.
 message PushMessage {
   Op op = 1;
+  repeated Op ops = 2;
 }
 
 // Request is the one message a request/response stream carries from the caller.
