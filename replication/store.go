@@ -77,8 +77,12 @@ type Store struct {
 	localMu      sync.Mutex
 	localFree    chan struct{}
 	// ownSeq is the highest seq of this site's that a local commit here, or the
-	// log at open, holds (capture.lastSeq).
+	// log at open, holds (capture.lastSeq). NoteLocal raises it without mu, and
+	// vv takes it in (foldOwn) wherever vv is read under mu: a local writer
+	// otherwise waited after its commit for a whole apply transaction.
 	ownSeq atomic.Uint64
+	// anyHeld is whether mayHold has a table at all, read without mu.
+	anyHeld atomic.Bool
 	// group gathers concurrent Ingest calls into one transaction (Ingest).
 	group ingestGroup
 }
@@ -191,13 +195,26 @@ func (s *Store) Site() string { return s.site }
 // a captured local write has committed its oplog rows out of band (in the user's
 // transaction, on a different connection).
 func (s *Store) NoteLocal(site string, seq uint64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if seq > s.vv[site] {
-		s.vv[site] = seq
+	if site != s.site {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if seq > s.vv[site] {
+			s.vv[site] = seq
+		}
+		return
 	}
-	if site == s.site && seq > s.ownSeq.Load() {
-		s.ownSeq.Store(seq)
+	for {
+		own := s.ownSeq.Load()
+		if seq <= own || s.ownSeq.CompareAndSwap(own, seq) {
+			return
+		}
+	}
+}
+
+// foldOwn takes the local commits NoteLocal noted into vv. Called with mu held.
+func (s *Store) foldOwn() {
+	if own := s.ownSeq.Load(); own > s.vv[s.site] {
+		s.vv[s.site] = own
 	}
 }
 
@@ -208,6 +225,7 @@ func (s *Store) Clock() *Clock { return s.clock }
 func (s *Store) LocalVV() VersionVector {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.foldOwn()
 	return s.vv.Clone()
 }
 
@@ -256,6 +274,7 @@ func (s *Store) OpsSince(ctx context.Context, site string, fromSeq uint64, limit
 // pruned meanwhile), and returns none when there is none to read.
 func (s *Store) opsUpTo(ctx context.Context, site string, fromSeq uint64, limit int) ([]Op, error) {
 	s.mu.Lock()
+	s.foldOwn()
 	top := s.vv[site]
 	s.mu.Unlock()
 	if top <= fromSeq {
@@ -524,6 +543,7 @@ func (s *Store) ingest(ctx context.Context, ops []Op, local bool) (int, error) {
 	s.waitLocal()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.foldOwn()
 
 	if s.held(ctx, ops) {
 		return len(ops), nil
@@ -998,6 +1018,7 @@ func (s *Store) rebuildTable(ctx context.Context, t *object) error {
 // holdOut records pk's row of tbl as held out.
 func (s *Store) holdOut(ctx context.Context, tbl string, pk []byte) error {
 	s.mayHold[tbl] = true
+	s.anyHeld.Store(true)
 	_, err := s.q.ExecContext(ctx, `INSERT INTO main._repl_withheld(tbl, pk) VALUES(?, ?)`, tbl, pk)
 	return err
 }
@@ -1025,6 +1046,7 @@ func (s *Store) loadHeld(ctx context.Context) error {
 			return err
 		}
 		s.mayHold[tbl] = true
+		s.anyHeld.Store(true)
 	}
 	return rows.Err()
 }
@@ -1168,6 +1190,9 @@ func (b *rowBatch) flush(ctx context.Context) error {
 // UNIQUE conflict: a local commit may have freed the value, and the next remote
 // op to the table may be a long way off.
 func (s *Store) rebuildHeld(ctx context.Context, tblIDs []string) error {
+	if !s.anyHeld.Load() {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// A table with no row held out needs no transaction, which every local
