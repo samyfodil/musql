@@ -4271,7 +4271,7 @@ func (m *vdbe) applyGathered(mr, upd *Instruction, rows [][]Value) error {
 	borrow, _ := mr.P4.(recBorrow)
 	owned := m.wctx != nil && m.wctx.db.argsOwned
 	plan := upd.P4.(*updatePlan)
-	if cur.idxSeekConfigured && !cur.overlaySized {
+	if cur.idxSeekConfigured && len(cur.idxSeekMore) == 0 && !cur.overlaySized {
 		// An equality seek's rows all match, so the rest of them are about
 		// to be stored: the overlay is sized for them once, not grown.
 		cur.overlaySized = true

@@ -138,6 +138,11 @@ type vdbeCursor struct {
 	idxSeekColl       string
 	// idxSeekCol is the TABLE column the index leads on.
 	idxSeekCol int
+	// idxSeekMore are the keys of OpSeekIndexHint's later slots: equalities on
+	// other columns of the same table, each of which bounds the rows alone.
+	// idxSeekNext is the slot expected next.
+	idxSeekMore []idxSeekKey
+	idxSeekNext int
 
 	// seekReseek marks a CORRELATED (join inner-side) seek cursor whose seek key
 	// changes per outer-loop iteration: unlike an ordinary single-table seek
@@ -260,6 +265,81 @@ func (cur *vdbeCursor) hasGeneratedCols() bool {
 		}
 	}
 	return cur.genCached == 1
+}
+
+// idxSeekRowids is the candidates of this cursor's equality seek, false when no
+// key can be answered. Each key bounds the rows by itself, because every
+// conjunct is re-checked on every row the seek returns, so several keys are
+// answered by whichever the segments say holds the fewest rows.
+//
+// A VIRTUAL generated column is never a key: it is not stored, and a row written
+// before "ALTER TABLE ADD COLUMN ... AS (expr)" holds NULL in its slot, which the
+// posting list files as matching nothing (C's CREATE INDEX computes the key from
+// the expression).
+func (cur *vdbeCursor) idxSeekRowids() ([]int64, bool) {
+	stored := func(col int) bool {
+		return col < 0 || col >= len(cur.tbl.cols) || !cur.tbl.cols[col].IsGenerated() || cur.tbl.cols[col].GeneratedStored
+	}
+	if len(cur.idxSeekMore) == 0 {
+		if !stored(cur.idxSeekCol) {
+			return nil, false
+		}
+		return cur.pager.SeekIndexRowidsByKeys(cur.tbl.root, []idxSeekKey{{col: cur.idxSeekCol, probe: cur.idxSeekProbe, coll: cur.idxSeekColl}})
+	}
+	keys := make([]idxSeekKey, 0, 1+len(cur.idxSeekMore))
+	if stored(cur.idxSeekCol) {
+		keys = append(keys, idxSeekKey{col: cur.idxSeekCol, probe: cur.idxSeekProbe, coll: cur.idxSeekColl})
+	}
+	for _, k := range cur.idxSeekMore {
+		if stored(k.col) {
+			keys = append(keys, k)
+		}
+	}
+	return cur.pager.SeekIndexRowidsByKeys(cur.tbl.root, keys)
+}
+
+// writeSeekRowids is a write cursor's equality candidates, from its store's
+// indexes: the committed segments' (segEqRowids), or for an integer probe the
+// store's own (eqRowids). Several keys are asked in the order of how many rows
+// the segments say each holds. fromSeg says the segments answered, which drops
+// the rows the store deleted. A TEXT probe under a sequence other than BINARY
+// is no key: both indexes match exact values.
+func (cur *vdbeCursor) writeSeekRowids() (hits []uint64, fromSeg, ok bool) {
+	rows := cur.rowStore.rows
+	ask := func(k idxSeekKey) ([]uint64, bool, bool) {
+		if k.probe.Typ == Text && !equalFoldName(effectiveCollation(k.coll), "BINARY") {
+			return nil, false, false
+		}
+		if hits, ok := rows.segEqRowids(k.col, k.probe); ok {
+			return hits, true, true
+		}
+		if k.probe.Typ == Int {
+			if hits, ok := rows.eqRowids(k.col, k.probe.I); ok {
+				return hits, false, true
+			}
+		}
+		return nil, false, false
+	}
+	first := idxSeekKey{col: cur.idxSeekCol, probe: cur.idxSeekProbe, coll: cur.idxSeekColl}
+	if len(cur.idxSeekMore) == 0 {
+		return ask(first)
+	}
+	keys := append([]idxSeekKey{first}, cur.idxSeekMore...)
+	est := make([]int, len(keys))
+	for i, k := range keys {
+		est[i] = rows.segEqEstimate(k.col, k.probe)
+	}
+	order := make([]int, len(keys))
+	for i := range order {
+		order[i] = i
+	}
+	slices.SortStableFunc(order, func(a, b int) int { return cmp.Compare(est[a], est[b]) })
+	for _, i := range order {
+		if hits, fromSeg, ok := ask(keys[i]); ok {
+			return hits, fromSeg, true
+		}
+	}
+	return nil, false, false
 }
 
 // normalize applies normalizeRowInPlace's IPK-rowid-alias and REAL-affinity
@@ -625,16 +705,10 @@ func (cur *vdbeCursor) rewind() error {
 				return nil
 			}
 			// A column equality (emitWriteIndexSeekHint): the store's equality
-			// index names the candidates, ascending, and nothing else is built.
-			// It refuses a column holding anything but integers and NULLs, and
-			// only an integer probe can use it; either falls to the walk.
-			if cur.idxSeekConfigured && !tbl.withoutRowid && tbl.rows != nil && cur.idxSeekProbe.Typ == Int {
-				hits, ok := tbl.rows.segEqRowids(cur.idxSeekCol, cur.idxSeekProbe.I)
-				fromSeg := ok
-				if !ok {
-					hits, ok = tbl.rows.eqRowids(cur.idxSeekCol, cur.idxSeekProbe.I)
-				}
-				if ok {
+			// indexes name the candidates, ascending, and nothing else is built.
+			// A key no index can answer falls to the next, and none to the walk.
+			if cur.idxSeekConfigured && !tbl.withoutRowid && tbl.rows != nil {
+				if hits, fromSeg, ok := cur.writeSeekRowids(); ok {
 					writeIndexSeeksServed.Add(1)
 					cur.rowids, cur.rows = slices.Grow(cur.rowids[:0], len(hits)), slices.Grow(cur.rows[:0], len(hits))
 					// The stored rows are kept as they are and fixed up as each
@@ -715,14 +789,8 @@ func (cur *vdbeCursor) rewind() error {
 		// own posting list. It only PRUNES -- the keyed conjunct is re-checked
 		// on every row -- so a rowid the list carries that no longer exists is
 		// dropped by the row fetch below.
-		// A VIRTUAL generated column is not stored: a row written before
-		// "ALTER TABLE ADD COLUMN ... AS (expr)" holds NULL in its slot, which
-		// the posting list files as matching nothing, so the seek lost it
-		// (C's CREATE INDEX computes the key from the expression). Scanned.
-		virtualKey := cur.idxSeekCol >= 0 && cur.idxSeekCol < len(cur.tbl.cols) &&
-			cur.tbl.cols[cur.idxSeekCol].IsGenerated() && !cur.tbl.cols[cur.idxSeekCol].GeneratedStored
-		if cur.idxSeekConfigured && !cur.tbl.withoutRowid && !virtualKey {
-			rowids, served := cur.pager.SeekIndexRowidsSegments(cur.tbl.root, cur.idxSeekCol, cur.idxSeekProbe, cur.idxSeekColl)
+		if cur.idxSeekConfigured && !cur.tbl.withoutRowid {
+			rowids, served := cur.idxSeekRowids()
 			if served {
 				segIndexSeeksServed.Add(1)
 				cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]

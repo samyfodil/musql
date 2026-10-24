@@ -113,31 +113,40 @@ func keyRunsBeforeTheLoop(insns []Instruction, cursor int) bool {
 // It needs no declared index: the candidates come in rowid order, which is the
 // order C visits one key's rows in whether it walks an index or the table, and
 // the conjunct still runs on every fetched row, so the hint only narrows.
+//
+// Every such conjunct is a key, up to maxSeekKeys, as the hint's slots: the
+// cursor asks the one whose column holds fewest rows (writeSeekRowids). The
+// comparison's collation is the column's own, the key being a bare literal or
+// parameter. The INTEGER PRIMARY KEY column is never a key: it is stored NULL,
+// its value being the rowid.
 func emitWriteIndexSeekHint(c *compiler, tbl *tableMeta, cursor int, where Expr) bool {
 	if writeIndexSeekOffForTest || where == nil || tbl == nil || tbl.withoutRowid || hasGeneratedCols(tbl.cols) {
 		return false
 	}
+	slot := 0
 	for _, cj := range splitTopLevelAnd(where) {
 		be, ok := cj.(BinaryExpr)
-		if !ok || (be.Op != "=" && be.Op != "==") {
+		if !ok || (be.Op != "=" && be.Op != "==") || slot == maxSeekKeys {
 			continue
 		}
 		for _, side := range [2][2]Expr{{be.L, be.R}, {be.R, be.L}} {
 			colExpr, key := side[0], side[1]
 			col, ok := writeColumnRef(c, cursor, colExpr)
-			if !ok || !isSeekKeyCandidate(key) {
+			if !ok || col == tbl.ipkIndex || !isSeekKeyCandidate(key) {
 				continue
 			}
 			reg, err := c.compileExpr(key)
 			if err != nil {
-				return false
+				return slot > 0
 			}
 			c.emit(Instruction{Op: OpSeekIndexHint, P1: cursor, P2: reg,
-				P4: &indexSeekHint{aff: comparisonAffinity(c.affCtx(), colExpr, key), leadingCol: col}})
-			return true
+				P4: &indexSeekHint{aff: comparisonAffinity(c.affCtx(), colExpr, key), coll: effectiveCollation(tbl.cols[col].Collation),
+					leadingCol: col, slot: slot}})
+			slot++
+			break
 		}
 	}
-	return false
+	return slot > 0
 }
 
 // writeColumnRef reports whether e is a plain reference to a stored column of

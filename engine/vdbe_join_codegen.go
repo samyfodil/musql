@@ -116,6 +116,9 @@ type joinSource struct {
 	// scan. Delivered to emitJoinLoops as plan.autoIdxKeys[0], the same
 	// OpAutoIndexOrder channel as the automatic index.
 	idxOrderKey *autoIndexKey
+	// planExplain is the same plan's EXPLAIN QUERY PLAN line, carried to the
+	// source's index seek (indexSeekPlan.plan).
+	planExplain wherePlanExplain
 
 	// onToWhere marks an INNER item whose ON clause was moved into the WHERE, as
 	// sqlite3ProcessJoin does before planning. Its conjuncts are bucketed by
@@ -3052,13 +3055,19 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 			// Evaluate the (column-free constant/parameter) index seek key now --
 			// before any Rewind -- and hand it, with the index's root/affinity/
 			// collation, to the cursor. See OpSeekIndexHint (vdbe_op.go) and
-			// detectIndexSeekKey (vdbe_scan.go).
-			keyReg, kerr := c.compileExpr(s.idxSeek.keyExpr)
-			if kerr != nil {
-				return kerr
+			// detectIndexSeekKey (vdbe_scan.go). Its further keys follow as the
+			// hint's later slots.
+			for slot, k := range append([]*indexSeekPlan{s.idxSeek}, s.idxSeek.more...) {
+				keyReg, kerr := c.compileExpr(k.keyExpr)
+				if kerr != nil {
+					return kerr
+				}
+				h := &indexSeekHint{root: k.root, aff: k.aff, coll: k.coll, leadingCol: k.leadingCol, index: k.index, slot: slot, is: k.is}
+				if slot == 0 {
+					h.plan = s.idxSeek.plan
+				}
+				c.emit(Instruction{Op: OpSeekIndexHint, P1: s.scope.cursor, P2: keyReg, P4: h})
 			}
-			c.emit(Instruction{Op: OpSeekIndexHint, P1: s.scope.cursor, P2: keyReg,
-				P4: &indexSeekHint{root: s.idxSeek.root, aff: s.idxSeek.aff, coll: s.idxSeek.coll, leadingCol: s.idxSeek.leadingCol, index: s.idxSeek.index}})
 		}
 	}
 	// The transient automatic index: C builds it once per run under OP_Once, from

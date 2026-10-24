@@ -761,6 +761,15 @@ type indexSeekHint struct {
 	// index is the index's name, which EXPLAIN QUERY PLAN prints: a segment
 	// table's index has no root to look it up by.
 	index string
+	// slot is this key's place among the cursor's seek keys. 0 starts the
+	// list; each later slot is an equality on another column, any one of
+	// which bounds the rows as well as the first (see idxSeekRowids).
+	slot int
+	// is marks "x IS key", whose NULL key matches the NULLs.
+	is bool
+	// plan, on slot 0, is the loop C's planner chose for this table, which
+	// EXPLAIN QUERY PLAN prints in place of the hint's own index.
+	plan wherePlanExplain
 }
 
 // multiOrOrder is the autoIndexKey variant OpAutoIndexOrder applies when the

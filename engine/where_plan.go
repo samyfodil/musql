@@ -199,9 +199,11 @@ type whereLoopCache struct {
 // inside one, needs to know about the loop that won beyond its order: whether
 // it is an AUTOMATIC index (WHERE_AUTO_INDEX), and whether it returns at most
 // one row (WHERE_ONEROW, which makes an UPDATE ONEPASS_SINGLE rather than
-// ONEPASS_MULTI, update.c:733/where.c's eOnePass choice).
+// ONEPASS_MULTI, update.c:733/where.c's eOnePass choice). explain is the
+// loop's EXPLAIN QUERY PLAN line.
 type wherePlanWinner struct {
 	auto, oneRow bool
+	explain      wherePlanExplain
 }
 
 // wherePlanOrder returns the FROM-item order SQLite binds its nested loops in,
@@ -887,6 +889,7 @@ func wherePlanTermsFromConj(jts []joinedTable, scopes []tableScope, conj []where
 			}
 			if o != nil {
 				lFirst, rFirst = o.l[0], o.r[0]
+				t.vector = true
 			}
 			var prereqLeft whereMask
 			for _, l := range lhs {
