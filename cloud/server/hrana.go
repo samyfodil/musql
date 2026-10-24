@@ -56,6 +56,10 @@ var errUnavailable = errors.New("the database is being restored")
 // errNotHere is a crdt database not placed at this node's location.
 var errNotHere = errors.New("not placed here")
 
+// errSyncing is a crdt database placed here whose first sync with the peers
+// has not completed: this node holds only part of it.
+var errSyncing = errors.New("this database was just placed here and is still syncing from its peers; it is served once that completes")
+
 type entry struct {
 	db       *sql.DB
 	ro       *sql.DB
@@ -189,6 +193,9 @@ func (s *Server) openEntry(d *state.Database) (*entry, error) {
 	if d.Type == state.TypeCRDT && s.crdtHandle(d.ID) == nil {
 		return nil, errNotHere
 	}
+	if d.Type == state.TypeCRDT && s.crdtSyncing(d.ID) {
+		return nil, errSyncing
+	}
 	// Opening creates a missing file; a database whose file is gone is gone.
 	if _, err := os.Stat(path); err != nil {
 		return nil, err
@@ -301,6 +308,10 @@ func (s *Server) serveDB(w http.ResponseWriter, r *http.Request) {
 	}
 	if errors.Is(err, errNotHere) {
 		hranaError(w, http.StatusNotFound, s.notHere(ctx, d).Error())
+		return
+	}
+	if errors.Is(err, errSyncing) {
+		hranaError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
 	if err != nil {

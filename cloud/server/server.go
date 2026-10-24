@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"connectrpc.com/connect"
@@ -43,7 +44,14 @@ type Server struct {
 
 	stop chan struct{}
 	bg   sync.WaitGroup
+
+	// noAdmin is set while a cluster node waits for the admin user to
+	// replicate to it.
+	noAdmin       atomic.Bool
+	noAdminLogged time.Time
 }
+
+var errNoAdminYet = errors.New("no admin yet: waiting for the state from a peer, or run musql-cloud init")
 
 // New opens the state in cfg.DataDir, makes sure the configured admin can
 // sign in, and builds the handler.
@@ -75,7 +83,13 @@ func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) 
 		return nil, err
 	}
 	if err := s.requireAdmin(ctx); err != nil {
-		return fail(err)
+		if !cfg.Clustered() {
+			return fail(err)
+		}
+		// A new node's state arrives from its peers after it starts.
+		s.log.Print(errNoAdminYet)
+		s.noAdmin.Store(true)
+		s.noAdminLogged = time.Now()
 	}
 	if err := store.EnsureGroupLocation(ctx, cfg.Node.Location); err != nil {
 		return fail(err)

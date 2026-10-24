@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"connectrpc.com/connect"
 
@@ -37,7 +38,14 @@ type crdtDB struct {
 	db   *sql.DB
 	path string
 	hist string
+	// syncing is set from placement until the first sync with the peers has
+	// completed: until then the file holds only part of the database, and it
+	// is not served. It is kept on disk as path+syncingSuffix, so a node that
+	// stops before then resumes it.
+	syncing bool
 }
+
+const syncingSuffix = ".syncing"
 
 // openState opens the state: with the plain driver standalone, replicated in
 // CRDT mode over libp2p in a cluster.
@@ -86,6 +94,15 @@ func (s *Server) runCluster() {
 }
 
 func (s *Server) clusterPass(ctx context.Context) {
+	if s.noAdmin.Load() {
+		if s.requireAdmin(ctx) == nil {
+			s.noAdmin.Store(false)
+			s.log.Printf("the admin user arrived from a peer")
+		} else if time.Since(s.noAdminLogged) >= time.Minute {
+			s.log.Print(errNoAdminYet)
+			s.noAdminLogged = time.Now()
+		}
+	}
 	renamed, err := s.store.ResolveHeld(ctx)
 	if err != nil {
 		s.log.Printf("state conflicts: %v", err)
@@ -99,6 +116,7 @@ func (s *Server) clusterPass(ctx context.Context) {
 	if err := s.placeDatabases(ctx); err != nil {
 		s.log.Printf("placement: %v", err)
 	}
+	s.crdtSynced()
 }
 
 // placedHere reports whether d's group lists this node's location.
@@ -151,10 +169,15 @@ func (s *Server) openCRDT(ctx context.Context, d *state.Database) error {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return err
 		}
+		if err := os.WriteFile(path+syncingSuffix, nil, 0o600); err != nil {
+			return err
+		}
 		if err := createEmpty(path); err != nil {
 			return err
 		}
 	}
+	_, err := os.Stat(path + syncingSuffix)
+	syncing := err == nil
 	if _, err := s.history(d); err != nil {
 		return err
 	}
@@ -162,8 +185,36 @@ func (s *Server) openCRDT(ctx context.Context, d *state.Database) error {
 	if err != nil {
 		return err
 	}
-	s.cl.dbs[d.ID] = &crdtDB{db: db, path: path, hist: s.histDir(d)}
+	s.cl.dbs[d.ID] = &crdtDB{db: db, path: path, hist: s.histDir(d), syncing: syncing}
 	return nil
+}
+
+// crdtSynced serves the databases whose first sync has completed since the
+// last pass.
+func (s *Server) crdtSynced() {
+	s.cl.mu.Lock()
+	defer s.cl.mu.Unlock()
+	for id, c := range s.cl.dbs {
+		if !c.syncing || !replication.Synced(c.db) {
+			continue
+		}
+		if err := os.Remove(c.path + syncingSuffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+			s.log.Printf("synced %s: %v", id, err)
+			continue
+		}
+		c.syncing = false
+	}
+}
+
+// crdtSyncing reports whether d is open here and still in its first sync.
+func (s *Server) crdtSyncing(id string) bool {
+	if s.cl == nil {
+		return false
+	}
+	s.cl.mu.Lock()
+	defer s.cl.mu.Unlock()
+	c, ok := s.cl.dbs[id]
+	return ok && c.syncing
 }
 
 // crdtHandle is d's replicated handle, when d is open here.
