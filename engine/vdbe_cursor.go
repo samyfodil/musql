@@ -258,9 +258,21 @@ func (cur *vdbeCursor) hasRealCols() bool {
 
 // hasGeneratedCols reports whether this cursor's table declares any generated
 // column, memoized in genCached (see its doc comment).
+// columns is the column list of the table cur reads: a read cursor's, or a
+// write cursor's (rowStore).
+func (cur *vdbeCursor) columns() []columnInfo {
+	if cur.tbl != nil {
+		return cur.tbl.cols
+	}
+	if cur.rowStore != nil {
+		return cur.rowStore.cols
+	}
+	return nil
+}
+
 func (cur *vdbeCursor) hasGeneratedCols() bool {
 	if cur.genCached == 0 {
-		if hasGeneratedCols(cur.tbl.cols) {
+		if hasGeneratedCols(cur.columns()) {
 			cur.genCached = 1
 		} else {
 			cur.genCached = 2
@@ -1312,7 +1324,7 @@ func (cur *vdbeCursor) materializeRowStore() {
 	n := tbl.rows.len()
 	var rowids []uint64
 	var rows [][]Value
-	if f, st := cur.segFilter, tbl.rows; f != nil && st != nil && st.seg != nil {
+	if f, st := cur.segFilter, tbl.rows; f != nil && st != nil && st.seg != nil && !lowReadsVirtual(tbl.cols, f.low) {
 		// A write scan the filter peephole judged safe to restrict
 		// (segWriteFilterPeephole): only the base rows that can match, and
 		// every row the overlay holds, are decoded. Sized for the overlay, which

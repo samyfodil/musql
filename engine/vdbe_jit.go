@@ -823,10 +823,11 @@ func jitCursorMask(cur *vdbeCursor) uint64 {
 		}
 		mask = cur.jitLazyMask
 	}
-	if cur.tbl != nil && cur.hasGeneratedCols() {
+	if cur.hasGeneratedCols() {
 		// A VIRTUAL generated column's slot may hold its error (valueGenErr),
 		// which only the VDBE's read raises.
-		for i, c := range cur.tbl.cols[:min(len(cur.tbl.cols), 64)] {
+		cols := cur.columns()
+		for i, c := range cols[:min(len(cols), 64)] {
 			if c.IsGenerated() && !c.GeneratedStored {
 				mask &^= 1 << uint(i)
 			}
