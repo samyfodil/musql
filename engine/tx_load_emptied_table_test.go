@@ -88,6 +88,11 @@ func TestTxLoadIntoATableTheTransactionEmptied(t *testing.T) {
 	}
 	run := func(t *testing.T, c tc, forced bool) {
 		defer SetTxLoadAfterWritesForTest(SetTxLoadAfterWritesForTest(forced))
+		// A load this small would be drained into the change log at COMMIT
+		// (drainSmallLoads); with compaction off it is not, and the commit
+		// has to take the rewrite.
+		compactionOffForTest = forced
+		defer func() { compactionOffForTest = false }()
 		path := filepath.Join(t.TempDir(), "x.musq")
 		w, err := Create(path)
 		if err != nil {
