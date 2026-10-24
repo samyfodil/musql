@@ -3,6 +3,8 @@ package sqlite
 import (
 	"fmt"
 	"os"
+
+	"github.com/samyfodil/musql/internal/fsio"
 )
 
 // btPager is a page cache implementing SQLite pager semantics: zero-filled pages
@@ -26,19 +28,44 @@ type btPager struct {
 	subJournal  []btJournalRec
 	savepoints  []btSavepoint
 
-	// maxPages is the cache size before spilling to a scratch file.
-	maxPages  int
-	spillFile *os.File
-	spillEnd  int64
-	spilled   map[uint32]btSpilled
-	slots     map[uint32]int64 // scratch file offsets for spilled pages
+	// maxPages is the cache size past which shrink writes pages out to file,
+	// the database file being built, each at its own offset; 0 never does.
+	// state holds, per page number, what a page out of the cache was
+	// (btStSpilled and its flags) and whether its place in the file has been
+	// written (btStWritten), which the commit must undo for a page whose
+	// final state is not to be written.
+	maxPages int
+	file     *os.File
+	state    []uint8
 }
 
-// btSpilled tracks a page spilled to the scratch file.
-type btSpilled struct {
-	off                         int64
-	dirty, writeable, dontWrite bool
+// btPager.state bits.
+const (
+	btStSpilled = 1 << iota
+	btStDirty
+	btStWriteable
+	btStDontWrite
+	btStWritten
+)
+
+func (pg *btPager) stateOf(pgno uint32) uint8 {
+	if uint64(pgno) < uint64(len(pg.state)) {
+		return pg.state[pgno]
+	}
+	return 0
 }
+
+func (pg *btPager) setState(pgno uint32, st uint8) {
+	if uint64(pgno) >= uint64(len(pg.state)) {
+		if st == 0 {
+			return
+		}
+		pg.state = append(pg.state, make([]uint8, int(pgno)+1-len(pg.state))...)
+	}
+	pg.state[pgno] = st
+}
+
+func (pg *btPager) offset(pgno uint32) int64 { return int64(pgno-1) * int64(pg.pageSize) }
 
 // btJournalRec is one journal record: a page number and the page it restores.
 type btJournalRec struct {
@@ -81,12 +108,12 @@ func (pg *btPager) get(bt *btShared, pgno uint32, noContent bool) (*memPage, err
 		p = &btPage{}
 		p.mem.aData = make([]byte, pg.pageSize)
 		pg.pages[pgno] = p
-		if s, ok := pg.spilled[pgno]; ok {
-			delete(pg.spilled, pgno)
-			p.dirty, p.writeable, p.dontWrite = s.dirty, s.writeable, s.dontWrite
+		if st := pg.stateOf(pgno); st&btStSpilled != 0 {
+			pg.setState(pgno, st&btStWritten)
+			p.dirty, p.writeable, p.dontWrite = st&btStDirty != 0, st&btStWriteable != 0, st&btStDontWrite != 0
 			if !noContent {
-				if _, err := pg.spillFile.ReadAt(p.mem.aData, s.off); err != nil {
-					return nil, fmt.Errorf("engine: reading a spilled page: %w", err)
+				if _, err := fsio.ReadAt(pg.file, p.mem.aData, pg.offset(pgno)); err != nil {
+					return nil, fmt.Errorf("sqlite: export: reading back page %d: %w", pgno, err)
 				}
 				p.loaded = true
 			}
@@ -180,36 +207,47 @@ func (pg *btPager) dontWrite(m *memPage) {
 // btSQLiteVersionNumber is stamped at offset 96 of page 1 on commit.
 const btSQLiteVersionNumber = 3053003
 
-// commitInto applies dirty pages to a file buffer (pager_write_pagelist, pager.c).
-func (pg *btPager) commitInto(image []byte) ([]byte, error) {
-	size := int(pg.dbSize) * pg.pageSize
-	if len(image) < size {
-		image = append(image, make([]byte, size-len(image))...)
-	}
-	image = image[:size]
+// commit writes the database out to file (pager_write_pagelist, pager.c): a
+// page whose final state is dirty and not dontWrite holds its content, every
+// other page up to dbSize zeros, and the file ends at dbSize.
+func (pg *btPager) commit() error {
+	zero := make([]byte, pg.pageSize)
 	for pgno, p := range pg.pages {
-		if !p.dirty || p.dontWrite || pgno > pg.dbSize {
+		if pgno > pg.dbSize {
 			continue
 		}
-		off := int(pgno-1) * pg.pageSize
-		if off+pg.pageSize > len(image) {
-			return nil, fmt.Errorf("engine: page %d past the end of a %d-page image", pgno, pg.dbSize)
+		var err error
+		switch {
+		case p.dirty && !p.dontWrite:
+			_, err = fsio.WriteAt(pg.file, p.mem.aData, pg.offset(pgno))
+			pg.setState(pgno, btStWritten)
+		case pg.stateOf(pgno)&btStWritten != 0:
+			_, err = fsio.WriteAt(pg.file, zero, pg.offset(pgno))
+			pg.setState(pgno, 0)
 		}
-		copy(image[off:off+pg.pageSize], p.mem.aData)
+		if err != nil {
+			return fmt.Errorf("sqlite: export: writing page %d: %w", pgno, err)
+		}
 	}
-	for pgno, s := range pg.spilled {
-		if !s.dirty || s.dontWrite || pgno > pg.dbSize {
+	for i := 1; i < len(pg.state) && uint64(i) <= uint64(pg.dbSize); i++ {
+		pgno := uint32(i)
+		st := pg.state[i]
+		if st&btStWritten == 0 || pg.pages[pgno] != nil {
 			continue
 		}
-		off := int(pgno-1) * pg.pageSize
-		if _, err := pg.spillFile.ReadAt(image[off:off+pg.pageSize], s.off); err != nil {
-			return nil, fmt.Errorf("engine: reading a spilled page: %w", err)
+		if st&btStSpilled != 0 && st&btStDirty != 0 && st&btStDontWrite == 0 {
+			continue
+		}
+		if _, err := fsio.WriteAt(pg.file, zero, pg.offset(pgno)); err != nil {
+			return fmt.Errorf("sqlite: export: writing page %d: %w", pgno, err)
 		}
 	}
-	return image, nil
+	return pg.file.Truncate(int64(pg.dbSize) * int64(pg.pageSize))
 }
 
-// shrink evicts pages to a scratch file when cache exceeds maxPages.
+// shrink writes pages out of a cache past maxPages, dirty ones to their place
+// in file, until a quarter of it is free. Only a cursor's pages and page 1
+// stay: it runs between operations, when nothing else holds a page.
 func (pg *btPager) shrink(bt *btShared) error {
 	if pg.maxPages == 0 || len(pg.pages) <= pg.maxPages {
 		return nil
@@ -223,14 +261,6 @@ func (pg *btPager) shrink(bt *btShared) error {
 			held[c.page.pgno] = true
 		}
 	}
-	if pg.spillFile == nil {
-		f, err := os.CreateTemp("", "musql-pages-*")
-		if err != nil {
-			return fmt.Errorf("engine: page spill: %w", err)
-		}
-		os.Remove(f.Name()) // the open handle keeps it until the pager is gone
-		pg.spillFile, pg.spilled, pg.slots = f, map[uint32]btSpilled{}, map[uint32]int64{}
-	}
 	target := pg.maxPages * 3 / 4
 	for pgno, p := range pg.pages {
 		if len(pg.pages) <= target {
@@ -240,20 +270,33 @@ func (pg *btPager) shrink(bt *btShared) error {
 			continue
 		}
 		if p.loaded && p.dirty {
-			off, ok := pg.slots[pgno]
-			if !ok {
-				off = pg.spillEnd
-				pg.spillEnd += int64(pg.pageSize)
-				pg.slots[pgno] = off
+			if _, err := fsio.WriteAt(pg.file, p.mem.aData, pg.offset(pgno)); err != nil {
+				return fmt.Errorf("sqlite: export: writing page %d: %w", pgno, err)
 			}
-			if _, err := pg.spillFile.WriteAt(p.mem.aData, off); err != nil {
-				return fmt.Errorf("engine: page spill: %w", err)
+			st := uint8(btStSpilled | btStDirty | btStWritten)
+			if p.writeable {
+				st |= btStWriteable
 			}
-			pg.spilled[pgno] = btSpilled{off, p.dirty, p.writeable, p.dontWrite}
+			if p.dontWrite {
+				st |= btStDontWrite
+			}
+			pg.setState(pgno, st)
 		}
 		delete(pg.pages, pgno)
 	}
 	return nil
+}
+
+// lookup is btreePageLookup: page pgno if the cache holds it, else nil. A page
+// shrink wrote out counts as held, as a cache that never shrinks holds it.
+func (pg *btPager) lookup(bt *btShared, pgno uint32) (*memPage, error) {
+	if p := pg.pages[pgno]; p != nil && p.loaded {
+		return &p.mem, nil
+	}
+	if pg.stateOf(pgno)&btStSpilled != 0 {
+		return pg.get(bt, pgno, false)
+	}
+	return nil, nil
 }
 
 // movePage reassigns a page's number, dropping any cached page at the new number (pager.c:7204).
@@ -265,7 +308,7 @@ func (pg *btPager) movePage(m *memPage, pgno uint32) {
 	}
 	delete(pg.pages, m.pgno)
 	pg.pages[pgno] = p
-	delete(pg.spilled, pgno)
+	pg.setState(pgno, pg.stateOf(pgno)&btStWritten)
 	m.pgno = pgno
 	p.dirty = true
 	p.dontWrite = false

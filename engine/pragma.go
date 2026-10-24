@@ -4551,20 +4551,22 @@ func (p *ReadOnlyPager) integrityCheckViolations(scope schemaScope, stmt *Pragma
 			other = scopeMain
 		}
 		qualify := findSchemaRowIn(rows, other, "table", tr.Name) != nil
-		counts, msgs, cerr := p.integrityRowFindings(tr, rows, qualify, isQuick)
+		// Only the first maxErr of a table's messages can be shown; all of
+		// them are counted.
+		counts, msgs, nMsgs, cerr := p.integrityRowFindings(tr, rows, qualify, isQuick, maxErr)
 		if cerr != nil {
 			return nil, cerr
 		}
-		if len(counts)+len(msgs) > 0 {
+		if len(counts)+nMsgs > 0 {
 			tablesWithFindings++
 		}
 		if len(counts) > 0 {
 			countMsgs = append(countMsgs, counts...)
 			total += len(counts)
 		}
-		if len(msgs) > 0 {
+		if nMsgs > 0 {
 			bad = append(bad, badTable{tr.Name, msgs})
-			total += len(msgs)
+			total += nMsgs
 		}
 	}
 	// The cap is where the unreproducible table order stops being invisible:

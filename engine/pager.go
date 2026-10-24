@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"io"
+	"iter"
 )
 
 // ReadOnlyPager is a read handle on one database: the segment file and its
@@ -13,7 +14,7 @@ type ReadOnlyPager struct {
 
 	// storedIndexEntries is IntegrityCheckOptions.StoredIndexEntries, for the
 	// one check it was handed to.
-	storedIndexEntries func(index string) ([][]Value, bool)
+	storedIndexEntries func(index string) (iter.Seq[[]Value], func() error, bool)
 
 	// segEncodingDeclared is "this SEGMENT file's catalog names a text encoding",
 	// which it does only once the database has a schema (ConvertedCatalog.Encoding).
