@@ -1059,6 +1059,9 @@ func (s *Store) rebuildTable(ctx context.Context, t *object) error {
 // holdOut records pk's row of tbl as held out.
 func (s *Store) holdOut(ctx context.Context, tbl string, pk []byte) error {
 	s.mayHold[tbl] = true
+	if s.txHeld != nil {
+		s.txHeld[tbl] = true
+	}
 	s.anyHeld.Store(true)
 	_, err := s.q.ExecContext(ctx, `INSERT INTO main._repl_withheld(tbl, pk) VALUES(?, ?)`, tbl, pk)
 	return err
