@@ -3578,6 +3578,37 @@ func refreshRowPrograms(tbl *tableMeta) {
 	}
 }
 
+// addColumnQuickCheck is the column arm of the quick_check C runs after ADD
+// COLUMN (alter.c, pragma.c:1911-1931) over one row. A column counts only if it
+// is NOT NULL or its type is checked, and that is also the only time a VIRTUAL
+// one is computed there: it raises what its expression raises. Of the findings,
+// the ALTER raises on a NULL in a NOT NULL column and on a STRICT column whose
+// value is not of its type.
+func addColumnQuickCheck(strict bool, ipk int, cols []columnInfo, row []Value) error {
+	for j, c := range cols {
+		if j == ipk || j >= len(row) {
+			continue
+		}
+		typed := c.Aff > affNone
+		st, ok := strictColTypeOf(c.DeclType)
+		if strict {
+			typed = ok && st != strictColAny
+		}
+		if !c.NotNull && !typed {
+			continue
+		}
+		switch v := row[j]; {
+		case v.Typ == valueGenErr:
+			return genErrOf(v)
+		case c.NotNull && v.Typ == Null:
+			return fmt.Errorf("engine: NOT NULL constraint failed")
+		case strict && typed && !strictValueFits(st, v):
+			return fmt.Errorf("engine: type mismatch on DEFAULT")
+		}
+	}
+	return nil
+}
+
 // addColumnCheckTable is the throwaway tableMeta ADD COLUMN validates its
 // back-fill against: tbl's columns plus the new one, with the full re-derived
 // CHECK list, re-stamped so the back-fill loop compiles each CHECK once
@@ -4259,27 +4290,32 @@ func (db *DB) addColumn(tbl *tableMeta, def *addColumnDef) error {
 		}
 		newCols := append(slices.Clone(tbl.cols), col)
 		notNullGen := def.hasGenerated && col.NotNull
-		if len(checks) > 0 || notNullGen {
+		// In a STRICT table only a generated column can hold a value its type
+		// check refuses: one computed over rows written before it existed.
+		strictGen := tbl.strict && hasGeneratedCols(newCols)
+		if len(checks) > 0 || notNullGen || strictGen {
 			tmpTbl := addColumnCheckTable(tbl, col, checks)
-			for rowid, vals := range tbl.rows.all() {
+			var aerr error
+			tbl.rows.eachSortedUntil(func(rowid uint64, vals []Value) bool {
 				full := append(append([]Value(nil), vals...), fillVal)
-				if hasGeneratedCols(newCols) {
-					if gerr := computeGeneratedInto(tbl.name, newCols, full); gerr != nil {
-						return gerr
-					}
-				}
-				if notNullGen && full[len(full)-1].Typ == Null {
-					return fmt.Errorf("engine: NOT NULL constraint failed")
+				computeGeneratedOnRead(tbl.name, newCols, full)
+				if aerr = addColumnQuickCheck(tbl.strict, tbl.ipkIndex, newCols, full); aerr != nil {
+					return false
 				}
 				if len(checks) > 0 {
 					if cerr := db.checkTableChecks(tmpTbl, tbl.name, rowid, full); cerr != nil {
+						aerr = fmt.Errorf("engine: ALTER TABLE ADD COLUMN: %w", cerr)
 						if strings.HasPrefix(cerr.Error(), "CHECK constraint failed") {
 							// The quick_check RAISE carries no expression.
-							return fmt.Errorf("engine: CHECK constraint failed")
+							aerr = fmt.Errorf("engine: CHECK constraint failed")
 						}
-						return fmt.Errorf("engine: ALTER TABLE ADD COLUMN: %w", cerr)
+						return false
 					}
 				}
+				return true
+			})
+			if aerr != nil {
+				return aerr
 			}
 		}
 	}
