@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -312,4 +313,63 @@ func (s *stallVV) ExchangeVV(ctx context.Context, peer PeerID, vv VersionVector)
 		return nil, ctx.Err()
 	}
 	return s.Transport.ExchangeVV(ctx, peer, vv)
+}
+
+// TestRunGathersPushes: while Run runs, the ops of the commits made while a
+// push is out go in the next push together, in order, and as Broadcast had
+// them when it was called.
+func TestRunGathersPushes(t *testing.T) {
+	s := newTestStore(t, "gather")
+	tr := &holdPush{Transport: stubPeer{}, release: make(chan struct{}), pushes: make(chan []Op, 8)}
+	n := NewNode(s, tr)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- n.Run(ctx, time.Hour) }()
+	defer func() {
+		select {
+		case <-tr.release:
+		default:
+			close(tr.release)
+		}
+		cancel()
+		<-done
+	}()
+	for n.pushq.Load() == nil {
+		time.Sleep(time.Millisecond)
+	}
+	op := func(seq uint64) Op { return insertOp("gather", seq, HLC(seq), fmt.Sprint("u", seq), "n", 1) }
+	first := []Op{op(1)}
+	n.Broadcast(first)
+	first[0].Seq = 99 // a capture reuses its slice for the next commit
+	seqs := func(ops []Op) (out []uint64) {
+		for _, op := range ops {
+			out = append(out, op.Seq)
+		}
+		return out
+	}
+	if got := seqs(<-tr.pushes); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("first push %v, want [1]", got)
+	}
+	for seq := range uint64(3) {
+		n.Broadcast([]Op{op(seq + 2)})
+	}
+	close(tr.release)
+	if got := seqs(<-tr.pushes); !slices.Equal(got, []uint64{2, 3, 4}) {
+		t.Fatalf("second push %v, want [2 3 4]", got)
+	}
+}
+
+// holdPush is a Transport whose first PushOps waits until release is closed;
+// every push's ops go to pushes.
+type holdPush struct {
+	Transport
+	once    sync.Once
+	release chan struct{}
+	pushes  chan []Op
+}
+
+func (h *holdPush) PushOps(_ context.Context, ops []Op) error {
+	h.pushes <- ops
+	h.once.Do(func() { <-h.release })
+	return nil
 }
