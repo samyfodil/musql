@@ -202,11 +202,12 @@ func manifestToPB(m replication.ImageManifest) *pb.ImageManifest {
 
 // manifestFromPB converts a protobuf image manifest back.
 func manifestFromPB(m *pb.ImageManifest) replication.ImageManifest {
+	in := intern{}
 	out := replication.ImageManifest{Site: m.GetSite(), FileVersion: m.GetFileVersion(), DeltaVersion: m.GetDeltaVersion(), Layout: m.GetLayout(),
-		Catalog: m.GetCatalog(), Size: int64(m.GetSize()), DeltaSize: int64(m.GetDeltaSize()), Checksum: m.GetCrc32C(), VV: vvFromPB(m.GetVv()), Floors: vvFromPB(m.GetFloors()),
+		Catalog: m.GetCatalog(), Size: int64(m.GetSize()), DeltaSize: int64(m.GetDeltaSize()), Checksum: m.GetCrc32C(), VV: vvFromPB(m.GetVv(), in), Floors: vvFromPB(m.GetFloors(), in),
 		Ranges: map[string]uint64{}, MaxHLC: replication.HLC(m.GetMaxHlc())}
 	for _, e := range m.GetRanges() {
-		out.Ranges[e.GetSite()] = e.GetLo()
+		out.Ranges[in.str(e.GetSite())] = e.GetLo()
 	}
 	return out
 }
