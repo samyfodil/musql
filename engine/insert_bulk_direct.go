@@ -404,6 +404,11 @@ func (db *DB) drainTxBulk(t *tableMeta) {
 	if bl == nil {
 		return
 	}
+	// The table arms again only after as many inserts as armed it. A
+	// transaction reading it between inserts (a replicated apply, a few
+	// statements per op) otherwise armed a new load at each insert, a chunk
+	// per column, and drained it at the next read.
+	delete(db.appendSeen, t)
 	wc := db.activeWC
 	mark := bl.rows
 	if wc != nil && wc.bulkTbl == t {

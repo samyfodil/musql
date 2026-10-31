@@ -239,6 +239,10 @@ type segDeltaState struct {
 	// every batch's length prefix (segDeltaLenWidth).
 	version uint32
 
+	// heap is how many of the delta's bytes the rows here alias on the heap
+	// rather than in mapping: the batches catch-ups folded in (Session.caughtUp).
+	heap int64
+
 	// mapping, when set, is the mapped delta the replayed rows alias: they decode
 	// with their bytes left in place (decodeRecord), so the log is never on the
 	// heap. It lives exactly as long as the pager that holds this state, and is
@@ -266,6 +270,12 @@ type segDeltaState struct {
 	// segment_delta_merge.go): a statement's parallel scans share this state.
 	posMu    sync.Mutex
 	posCache *namedPosCache
+
+	// top is each table's largest live rowid, where known: a put raises it, a
+	// kill of it forgets it, and maxLive works it out again. topMu guards
+	// maxLive's fill, which parallel scans may reach together.
+	topMu sync.Mutex
+	top   map[int]int64
 }
 
 // release unmaps the delta this state's rows alias. Safe on nil and twice.
@@ -310,6 +320,32 @@ func (st *segDeltaState) rowsFor(table int) []segOverlayRow {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].rowid < out[j].rowid })
 	return out
+}
+
+// maxLive is the largest rowid table has live in the delta, and false when it
+// has none. It is kept between calls (top), so a session's first insert after
+// each catch-up does not sort the table's whole overlay to find it.
+func (st *segDeltaState) maxLive(table int) (int64, bool) {
+	m := st.live[table]
+	if len(m) == 0 {
+		return 0, false
+	}
+	st.topMu.Lock()
+	defer st.topMu.Unlock()
+	if t, ok := st.top[table]; ok {
+		return t, true
+	}
+	first, t := true, int64(0)
+	for rowid := range m {
+		if first || rowid > t {
+			first, t = false, rowid
+		}
+	}
+	if st.top == nil {
+		st.top = map[int]int64{}
+	}
+	st.top[table] = t
+	return t, true
 }
 
 // segOverlayRow is one delta row, ready to merge.
@@ -1191,6 +1227,9 @@ func (st *segDeltaState) applyRecs(recs []SegDeltaRecord) bool {
 			live, liveTable = st.live[r.Table], r.Table
 		}
 		live[r.Rowid] = vals
+		if t, ok := st.top[r.Table]; ok && r.Rowid > t {
+			st.top[r.Table] = r.Rowid
+		}
 		// A patched put was a committed row neither put nor killed by the log
 		// when its UPDATE read it, outside any transaction, so it is in no
 		// dead set: only another put can be.
@@ -1240,10 +1279,16 @@ func (st *segDeltaState) put(table int, rowid int64, vals []Value) {
 	}
 	st.live[table][rowid] = vals
 	delete(st.dead[table], rowid)
+	if t, ok := st.top[table]; ok && rowid > t {
+		st.top[table] = rowid
+	}
 }
 
 func (st *segDeltaState) kill(table int, rowid int64) {
 	delete(st.live[table], rowid)
+	if t, ok := st.top[table]; ok && t == rowid {
+		delete(st.top, table)
+	}
 	if st.dead[table] == nil {
 		st.dead[table] = map[int64]bool{}
 	}

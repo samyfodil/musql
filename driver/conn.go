@@ -82,6 +82,11 @@ type Conn struct {
 	// execArgs and queryArgs, which ARE the boundaries.
 	refreshedThisStmt bool
 
+	// contendedUntil is until when this connection's autocommit writes take the
+	// write lock before their first attempt, as a retry does (execArgs): set by
+	// a retry, and by a lock that had to be waited for.
+	contendedUntil time.Time
+
 	// txSavepoint is the name of the SAVEPOINT that implicitly STARTED the
 	// held transaction, or "" when a BEGIN/BeginTx did. A SAVEPOINT issued in
 	// autocommit starts a transaction in C SQLite, and the RELEASE of that
@@ -500,21 +505,28 @@ func (c *Conn) prepareInto(query string, st *Stmt) error {
 			}
 		}
 	}
-	info, cached := c.paramInfo[query]
-	var err error
-	if !cached {
-		if info, err = engine.ParseParamInfo(query); err == nil {
-			if c.paramInfo == nil || len(c.paramInfo) >= 256 {
-				c.paramInfo = make(map[string]engine.ParamInfo, 32)
-			}
-			c.paramInfo[query] = info
-		}
-	}
+	info, err := c.paramInfoOf(query)
 	if err != nil {
 		return err
 	}
 	*st = Stmt{conn: c, sqlText: query, info: info, isQuery: isSelectStmt(query)}
 	return nil
+}
+
+// paramInfoOf is engine.ParseParamInfo(query), kept for the connection's last
+// few hundred statement texts: a statement run again unprepared is lexed once.
+func (c *Conn) paramInfoOf(query string) (engine.ParamInfo, error) {
+	if info, ok := c.paramInfo[query]; ok {
+		return info, nil
+	}
+	info, err := engine.ParseParamInfo(query)
+	if err == nil {
+		if c.paramInfo == nil || len(c.paramInfo) >= 256 {
+			c.paramInfo = make(map[string]engine.ParamInfo, 32)
+		}
+		c.paramInfo[query] = info
+	}
+	return info, err
 }
 
 // mayBeScript reports whether query MIGHT hold more than one statement: a ";"
@@ -1094,7 +1106,42 @@ func (c *Conn) execArgsBody(sqlText string, args []engine.Value) (driver.Result,
 	// (sessionDB), so the retry runs against the other writer's committed
 	// state, exactly like real
 	// SQLite's busy handler re-running the statement.
+	//
+	// A RETRY HOLDS THE WRITE LOCK from before that revalidation to its commit,
+	// as BEGIN IMMEDIATE does (execTxnStmt), which C's writer holds from its
+	// first write. The first attempt runs unlocked, and loses only to a commit
+	// landing while it runs; run unlocked again beside a connection committing
+	// back to back, every attempt lasted as long as the gap between two of its
+	// commits and lost again, until the busy timeout failed the statement.
+	//
+	// While the file stays contended, the first attempt takes the lock too: one
+	// that loses is not only wasted, it leaves its rows in the session, which
+	// then rebuilds from the file (Poison) and builds its indexes again.
+	attempt := 0
+	locked := targetPath == c.path && c.plainDML(sqlText) &&
+		(time.Now().Before(c.contendedUntil) || c.hooks != nil && c.hooks.Contended != nil && c.hooks.Contended())
 	err := busyRetry(c.pragmaState.BusyTimeout(), func() error {
+		if attempt++; (attempt > 1 || locked) && targetPath == c.path {
+			nw, err := c.session()
+			if err != nil {
+				return err
+			}
+			start := time.Now()
+			if c.hooks != nil && c.hooks.LockWait != nil {
+				c.hooks.LockWait(true)
+			}
+			err = nw.BeginWriteTxn(false)
+			if c.hooks != nil && c.hooks.LockWait != nil {
+				c.hooks.LockWait(false)
+			}
+			if err != nil {
+				return err
+			}
+			defer nw.EndWriteTxn()
+			if attempt > 1 || time.Since(start) > contendedWait {
+				c.contendedUntil = time.Now().Add(contendedFor)
+			}
+		}
 		db, err := c.openWriteOrCreatePath(targetPath)
 		if err != nil {
 			return err
@@ -3081,6 +3128,15 @@ func (c *Conn) dropTempObjects() {
 	c.temp = nil
 }
 
+// contendedFor is how long a connection's autocommit writes take the write lock
+// first after they last found it contended (Conn.contendedUntil), and
+// contendedWait how long taking it must take to count as contended: a lock
+// nobody holds takes microseconds.
+const (
+	contendedFor  = time.Second
+	contendedWait = 200 * time.Microsecond
+)
+
 // BusyRetryAttemptHookForTest, when non-nil, is called once per retry busyRetry
 // performs (fn reported engine.ErrBusy and is about to be re-run in a fresh
 // session). busyRetry hides contention from the caller, so a harness counting
@@ -3170,6 +3226,10 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 	if want := st.NumInput(); len(args) != want {
 		return nil, fmt.Errorf("sql: expected %d arguments, got %d", want, len(args))
 	}
+	// A statement made for this one call has no arena to reuse: its first
+	// TEXT or BLOB copy took a whole chunk of one, so a call's arena is the
+	// size its arguments take.
+	st.bytesArena = argArena(args)
 	return st.ExecContext(ctx, args)
 }
 

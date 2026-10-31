@@ -538,27 +538,99 @@ func (s *rowStore) segSortedRowids() []uint64 {
 	return append(out, over[oi:]...)
 }
 
-// segMaxRowid is the largest visible rowid.
+// segMaxRowid is the largest visible rowid: the overlay's, the delta's largest
+// live one (maxLive), and each segment's top row neither the delta nor this
+// session dropped. Nothing is walked in order: merging the delta into a
+// descending walk sorted every live delta row of the table first, which a
+// session's first insert after each catch-up paid.
 func (s *rowStore) segMaxRowid() (uint64, bool) {
 	var max uint64
 	found := false
-	for rid := range s.m {
+	note := func(rid uint64) {
 		if !found || rowidLess(max, rid) {
 			max, found = rid, true
 		}
 	}
-	if !s.baseGone {
-		// From the top down: the first base rowid not deleted is the base's
-		// largest, so this stops there instead of walking every row.
-		s.seg.walkRowidsDesc(func(rid uint64) bool {
-			if s.gone[rid] {
-				return true
+	for rid := range s.m {
+		note(rid)
+	}
+	src := s.seg.rp.segs
+	if s.baseGone || src == nil {
+		return max, found
+	}
+	var dead map[int64]bool
+	if src.delta != nil {
+		if ti, ok := src.tableOf[s.seg.root]; ok {
+			if top, ok := src.delta.maxLive(ti); ok && !s.isGone(uint64(top)) {
+				note(uint64(top))
+			} else if ok {
+				for rid := range src.delta.live[ti] {
+					if !s.isGone(uint64(rid)) {
+						note(uint64(rid))
+					}
+				}
 			}
-			if !found || rowidLess(max, rid) {
-				max, found = rid, true
+			dead = src.delta.dead[ti]
+		}
+	}
+	for _, sg := range src.byRoot[s.seg.root] {
+		for i := sg.nRows - 1; i >= 0; i-- {
+			rid := sg.Rowid(i)
+			if dead[int64(rid)] || s.isGone(rid) {
+				continue
 			}
-			return false
-		})
+			note(rid)
+			break
+		}
+	}
+	return max, found
+}
+
+// segMaxRowidIn is maxRowidIn for a store over segments, without walking every
+// row: the overlay's rows and the delta's in the range, and in each segment
+// the top of the range, found by its sorted rowids, down to the first row
+// neither the delta nor this session dropped. A session's first insert under
+// a rowid range (replication's per-site ranges) read the whole table back,
+// every time it caught up with another connection's commit.
+func (s *rowStore) segMaxRowidIn(lo, hi uint64) (uint64, bool) {
+	var max uint64
+	found := false
+	note := func(rid uint64) {
+		if rid >= lo && rid < hi && (!found || rid > max) {
+			max, found = rid, true
+		}
+	}
+	for rid := range s.m {
+		note(rid)
+	}
+	if s.baseGone || lo >= hi {
+		return max, found
+	}
+	src := s.seg.rp.segs
+	if src == nil {
+		return max, found
+	}
+	var dead map[int64]bool
+	if src.delta != nil {
+		if ti, ok := src.tableOf[s.seg.root]; ok {
+			for rid := range src.delta.live[ti] {
+				if !s.isGone(uint64(rid)) {
+					note(uint64(rid))
+				}
+			}
+			dead = src.delta.dead[ti]
+		}
+	}
+	for _, sg := range src.byRoot[s.seg.root] {
+		from, to := sg.rowidSpan(int64(lo), int64(hi-1))
+		for i := to - 1; i >= from; i-- {
+			rid := sg.Rowid(i)
+			if dead[int64(rid)] || s.isGone(uint64(rid)) {
+				continue
+			}
+			note(uint64(rid))
+			break
+		}
 	}
 	return max, found
 }

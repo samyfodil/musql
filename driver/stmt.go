@@ -362,6 +362,28 @@ func (s *Stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driv
 	return v, parityErr(err)
 }
 
+// argArena is an arena that holds exactly the TEXT and BLOB arguments of args
+// copyArgBytes carves from one, or nil when there are none.
+func argArena(args []driver.NamedValue) []byte {
+	n := 0
+	for _, a := range args {
+		switch x := a.Value.(type) {
+		case string:
+			if len(x) <= argArenaMax {
+				n += len(x)
+			}
+		case []byte:
+			if len(x) <= argArenaMax {
+				n += len(x)
+			}
+		}
+	}
+	if n == 0 {
+		return nil
+	}
+	return make([]byte, 0, n)
+}
+
 // argArenaChunk is the size of one bytesArena chunk; argArenaMax the largest
 // argument carved from one rather than allocated on its own, so a long value
 // cannot pin a chunk's worth of short ones (or the reverse).
