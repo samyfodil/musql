@@ -456,29 +456,37 @@ func TestImageNotOverALocalWrite(t *testing.T) {
 
 // TestImageCarriesTheDelta: a donor whose database has a delta it has not
 // compacted sends its files as they are, the delta's committed bytes with
-// them, and the node that takes them holds what the donor holds.
+// them, and the node that takes them holds what the donor holds, whether it
+// compacts them before adopting them or adopts them as sent.
 func TestImageCarriesTheDelta(t *testing.T) {
-	lowImageMin(t)
-	c := newCluster(t)
-	c.open("a", imageDDL...)
-	pad := strings.Repeat("x", 1000)
-	for i := range 200 {
-		c.exec("a", fmt.Sprintf(`INSERT INTO t VALUES(%d, 'v%d%s')`, i, i, pad))
+	for name, ratio := range map[string]int64{"compacted before adopt": 1 << 40, "adopted as sent": 0} {
+		t.Run(name, func(t *testing.T) {
+			old := imageCompactRatio
+			imageCompactRatio = ratio
+			t.Cleanup(func() { imageCompactRatio = old })
+			lowImageMin(t)
+			c := newCluster(t)
+			c.open("a", imageDDL...)
+			pad := strings.Repeat("x", 1000)
+			for i := range 200 {
+				c.exec("a", fmt.Sprintf(`INSERT INTO t VALUES(%d, 'v%d%s')`, i, i, pad))
+			}
+			c.exec("a", `UPDATE t SET v = 'changed' WHERE id < 50`, `DELETE FROM t WHERE id BETWEEN 100 AND 120`)
+			m, body, err := syncerOf(t, c.dbs["a"]).store.Image(context.Background(), imageRequest(bookkeepingLayout))
+			if err != nil {
+				t.Fatal(err)
+			}
+			body.Close()
+			if m.DeltaSize < 100<<10 {
+				t.Fatalf("the image has a delta of %d bytes; the test means less", m.DeltaSize)
+			}
+			c.open("b")
+			c.converge("", imageRowsT, clockQ)
+			waitImage(t, c.dbs["b"])
+			c.exec("b", `INSERT INTO t VALUES(1000, 'from b')`)
+			c.converge("", imageRowsT, clockQ)
+		})
 	}
-	c.exec("a", `UPDATE t SET v = 'changed' WHERE id < 50`, `DELETE FROM t WHERE id BETWEEN 100 AND 120`)
-	m, body, err := syncerOf(t, c.dbs["a"]).store.Image(context.Background(), imageRequest(bookkeepingLayout))
-	if err != nil {
-		t.Fatal(err)
-	}
-	body.Close()
-	if m.DeltaSize < 100<<10 {
-		t.Fatalf("the image has a delta of %d bytes; the test means less", m.DeltaSize)
-	}
-	c.open("b")
-	c.converge("", imageRowsT, clockQ)
-	waitImage(t, c.dbs["b"])
-	c.exec("b", `INSERT INTO t VALUES(1000, 'from b')`)
-	c.converge("", imageRowsT, clockQ)
 }
 
 // TestImageCompactionRacesThePin: a compaction of the donor's database once
