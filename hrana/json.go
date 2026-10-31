@@ -25,7 +25,7 @@ type jValue struct {
 func (j jValue) proto() (*pb.Value, error) {
 	switch j.Type {
 	case "null":
-		return &pb.Value{Value: &pb.Value_Null_{Null: &pb.Value_Null{}}}, nil
+		return &pb.Value{Value: nullValue}, nil
 	case "integer":
 		var s string
 		if err := json.Unmarshal(j.Value, &s); err != nil {

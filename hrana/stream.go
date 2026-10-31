@@ -148,13 +148,20 @@ func (s *stream) run(ctx context.Context, q string, st *pb.Stmt) (res *pb.StmtRe
 	if err != nil {
 		return nil, read, 0, err
 	}
-	for _, ct := range types {
-		col := &pb.Col{Name: ptr(ct.Name())}
-		if d := ct.DatabaseTypeName(); d != "" {
-			col.Decltype = ptr(d)
+	if len(types) > 0 {
+		cols, names := make([]pb.Col, len(types)), make([]string, 2*len(types))
+		res.Cols = make([]*pb.Col, len(types))
+		for i, ct := range types {
+			names[2*i] = ct.Name()
+			cols[i].Name = &names[2*i]
+			if d := ct.DatabaseTypeName(); d != "" {
+				names[2*i+1] = d
+				cols[i].Decltype = &names[2*i+1]
+			}
+			res.Cols[i] = &cols[i]
 		}
-		res.Cols = append(res.Cols, col)
 	}
+	var alloc rowAlloc
 	vals := make([]any, len(types))
 	dest := make([]any, len(types))
 	for i := range vals {
@@ -168,11 +175,7 @@ func (s *stream) run(ctx context.Context, q string, st *pb.Stmt) (res *pb.StmtRe
 		if !wantRows {
 			continue
 		}
-		row := &pb.Row{Values: make([]*pb.Value, len(vals))}
-		for i, v := range vals {
-			row.Values[i] = toValue(v)
-		}
-		res.Rows = append(res.Rows, row)
+		res.Rows = append(res.Rows, alloc.row(vals))
 	}
 	if err := rows.Err(); err != nil {
 		return nil, read, 0, err
@@ -203,29 +206,31 @@ func (s *stream) batch(ctx context.Context, b *pb.Batch) *pb.BatchResult {
 	return res
 }
 
-// cursorEntries encodes a batch's result as the entries a cursor streams:
+// cursorEntries emits a batch's result as the entries a cursor streams:
 // step_begin, rows and step_end per executed step, step_error for a failed one,
-// nothing for a skipped one.
-func cursorEntries(b *pb.Batch, res *pb.BatchResult) []*pb.CursorEntry {
-	var out []*pb.CursorEntry
+// nothing for a skipped one. Every row goes out in the same entry, which emit
+// must be done with when it returns.
+func cursorEntries(b *pb.Batch, res *pb.BatchResult, emit func(*pb.CursorEntry)) {
+	row := &pb.CursorEntry_Row{}
+	rowEntry := &pb.CursorEntry{Entry: row}
 	for i := range b.GetSteps() {
 		k := uint32(i)
 		if e, ok := res.StepErrors[k]; ok {
-			out = append(out, &pb.CursorEntry{Entry: &pb.CursorEntry_StepError{StepError: &pb.StepErrorEntry{Step: k, Error: e}}})
+			emit(&pb.CursorEntry{Entry: &pb.CursorEntry_StepError{StepError: &pb.StepErrorEntry{Step: k, Error: e}}})
 			continue
 		}
 		sr, ok := res.StepResults[k]
 		if !ok {
 			continue
 		}
-		out = append(out, &pb.CursorEntry{Entry: &pb.CursorEntry_StepBegin{StepBegin: &pb.StepBeginEntry{Step: k, Cols: sr.Cols}}})
-		for _, row := range sr.Rows {
-			out = append(out, &pb.CursorEntry{Entry: &pb.CursorEntry_Row{Row: row}})
+		emit(&pb.CursorEntry{Entry: &pb.CursorEntry_StepBegin{StepBegin: &pb.StepBeginEntry{Step: k, Cols: sr.Cols}}})
+		for _, r := range sr.Rows {
+			row.Row = r
+			emit(rowEntry)
 		}
-		out = append(out, &pb.CursorEntry{Entry: &pb.CursorEntry_StepEnd{StepEnd: &pb.StepEndEntry{
+		emit(&pb.CursorEntry{Entry: &pb.CursorEntry_StepEnd{StepEnd: &pb.StepEndEntry{
 			AffectedRowCount: sr.AffectedRowCount, LastInsertRowid: sr.LastInsertRowid}}})
 	}
-	return out
 }
 
 func (s *stream) cond(c *pb.BatchCond, res *pb.BatchResult) bool {
@@ -399,26 +404,92 @@ func fromValue(v *pb.Value) any {
 	return nil
 }
 
-// toValue converts a scanned column value to a Hrana value.
-func toValue(v any) *pb.Value {
-	switch x := v.(type) {
-	case nil:
-		return &pb.Value{Value: &pb.Value_Null_{Null: &pb.Value_Null{}}}
-	case int64:
-		return &pb.Value{Value: &pb.Value_Integer{Integer: x}}
-	case float64:
-		return &pb.Value{Value: &pb.Value_Float{Float: x}}
-	case string:
-		return &pb.Value{Value: &pb.Value_Text{Text: x}}
-	case []byte:
-		return &pb.Value{Value: &pb.Value_Blob{Blob: x}}
-	case bool:
-		if x {
-			return &pb.Value{Value: &pb.Value_Integer{Integer: 1}}
-		}
-		return &pb.Value{Value: &pb.Value_Integer{Integer: 0}}
-	case time.Time:
-		return &pb.Value{Value: &pb.Value_Text{Text: x.Format("2006-01-02 15:04:05.999999999-07:00")}}
+// nullValue is every NULL's oneof: messages are only read once built.
+var nullValue = &pb.Value_Null_{Null: &pb.Value_Null{}}
+
+// slab hands out messages from chunks, an allocation per chunk rather than
+// one per message: the first exactly as big as asked for, each after it
+// twice the last, up to slabMax. A chunk lives as long as any message from
+// it, which for a result's rows is as long as the result.
+type slab[T any] struct {
+	free []T
+	next int
+}
+
+const slabMax = 512
+
+func (s *slab[T]) take(n int) []T {
+	if len(s.free) < n {
+		s.next = max(n, min(2*s.next, slabMax))
+		s.free = make([]T, s.next)
 	}
-	return &pb.Value{Value: &pb.Value_Text{Text: fmt.Sprint(v)}}
+	t := s.free[:n:n]
+	s.free = s.free[n:]
+	return t
+}
+
+// rowAlloc builds one result's rows.
+type rowAlloc struct {
+	rows  slab[pb.Row]
+	ptrs  slab[*pb.Value]
+	vals  slab[pb.Value]
+	ints  slab[pb.Value_Integer]
+	flts  slab[pb.Value_Float]
+	txts  slab[pb.Value_Text]
+	blobs slab[pb.Value_Blob]
+}
+
+// row converts a scanned row to a Hrana row, taking from each slab exactly
+// what the row needs.
+func (a *rowAlloc) row(vals []any) *pb.Row {
+	var nInt, nFlt, nTxt, nBlob int
+	for _, v := range vals {
+		switch v.(type) {
+		case nil:
+		case int64, bool:
+			nInt++
+		case float64:
+			nFlt++
+		case []byte:
+			nBlob++
+		default:
+			nTxt++
+		}
+	}
+	ints, flts, txts, blobs := a.ints.take(nInt), a.flts.take(nFlt), a.txts.take(nTxt), a.blobs.take(nBlob)
+	pvs := a.vals.take(len(vals))
+	r := &a.rows.take(1)[0]
+	r.Values = a.ptrs.take(len(vals))
+	for i, v := range vals {
+		pv := &pvs[i]
+		switch x := v.(type) {
+		case nil:
+			pv.Value = nullValue
+		case int64:
+			ints[0].Integer = x
+			pv.Value, ints = &ints[0], ints[1:]
+		case bool:
+			if x {
+				ints[0].Integer = 1
+			}
+			pv.Value, ints = &ints[0], ints[1:]
+		case float64:
+			flts[0].Float = x
+			pv.Value, flts = &flts[0], flts[1:]
+		case []byte:
+			blobs[0].Blob = x
+			pv.Value, blobs = &blobs[0], blobs[1:]
+		case string:
+			txts[0].Text = x
+			pv.Value, txts = &txts[0], txts[1:]
+		case time.Time:
+			txts[0].Text = x.Format("2006-01-02 15:04:05.999999999-07:00")
+			pv.Value, txts = &txts[0], txts[1:]
+		default:
+			txts[0].Text = fmt.Sprint(v)
+			pv.Value, txts = &txts[0], txts[1:]
+		}
+		r.Values[i] = pv
+	}
+	return r
 }

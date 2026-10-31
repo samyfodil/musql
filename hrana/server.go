@@ -8,14 +8,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
-
-	"google.golang.org/protobuf/encoding/protodelim"
-	"google.golang.org/protobuf/proto"
 
 	pb "github.com/samyfodil/musql/hrana/gen/hrana"
 	pbhttp "github.com/samyfodil/musql/hrana/gen/hrana/http"
@@ -275,7 +271,8 @@ const maxHTTPRequestBody = 64 << 20 // 64 MB
 func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, protobuf, ro bool) {
 	defer r.Body.Close()
 	r.Body = http.MaxBytesReader(w, r.Body, maxHTTPRequestBody)
-	body, err := io.ReadAll(r.Body)
+	body, err := readBody(r)
+	defer putBuf(body)
 	if err != nil {
 		writeHTTPError(w, http.StatusBadRequest, err, protobuf)
 		return
@@ -284,13 +281,13 @@ func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, protobuf, ro b
 	var batchLens []int
 	if protobuf {
 		req = &pbhttp.PipelineReqBody{}
-		if err := proto.Unmarshal(body, req); err != nil {
+		if err := req.UnmarshalVT(body.Bytes()); err != nil {
 			writeHTTPError(w, http.StatusBadRequest, err, true)
 			return
 		}
 	} else {
 		var j jPipelineReq
-		if err := json.Unmarshal(body, &j); err != nil {
+		if err := json.Unmarshal(body.Bytes(), &j); err != nil {
 			writeHTTPError(w, http.StatusBadRequest, err, false)
 			return
 		}
@@ -325,7 +322,7 @@ func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, protobuf, ro b
 	resp.Baton = s.give(hs, keep)
 
 	if protobuf {
-		out, err := proto.Marshal(resp)
+		out, err := marshal(body, resp, false)
 		if err != nil {
 			writeHTTPError(w, http.StatusInternalServerError, err, true)
 			return
@@ -390,7 +387,8 @@ func (hs *httpStream) handle(ctx context.Context, rq *pbhttp.StreamRequest) (res
 func (s *Server) cursor(w http.ResponseWriter, r *http.Request, protobuf, ro bool) {
 	defer r.Body.Close()
 	r.Body = http.MaxBytesReader(w, r.Body, maxHTTPRequestBody)
-	body, err := io.ReadAll(r.Body)
+	body, err := readBody(r)
+	defer putBuf(body)
 	if err != nil {
 		writeHTTPError(w, http.StatusBadRequest, err, protobuf)
 		return
@@ -398,13 +396,13 @@ func (s *Server) cursor(w http.ResponseWriter, r *http.Request, protobuf, ro boo
 	var req *pbhttp.CursorReqBody
 	if protobuf {
 		req = &pbhttp.CursorReqBody{}
-		if err := proto.Unmarshal(body, req); err != nil {
+		if err := req.UnmarshalVT(body.Bytes()); err != nil {
 			writeHTTPError(w, http.StatusBadRequest, err, true)
 			return
 		}
 	} else {
 		var j jCursorReq
-		if err := json.Unmarshal(body, &j); err != nil {
+		if err := json.Unmarshal(body.Bytes(), &j); err != nil {
 			writeHTTPError(w, http.StatusBadRequest, err, false)
 			return
 		}
@@ -424,36 +422,29 @@ func (s *Server) cursor(w http.ResponseWriter, r *http.Request, protobuf, ro boo
 	// batch runs; the stream is handed back only once the batch is done.
 	baton := newBaton()
 	bw := bufio.NewWriter(w)
+	dw := delimWriter{bw, body}
 	if protobuf {
 		w.Header().Set("Content-Type", "application/x-protobuf")
-		writeDelimited(bw, &pbhttp.CursorRespBody{Baton: &baton})
+		dw.write(&pbhttp.CursorRespBody{Baton: &baton})
 	} else {
 		w.Header().Set("Content-Type", "text/plain")
 		json.NewEncoder(bw).Encode(map[string]any{"baton": baton, "base_url": nil})
 	}
 	emit := func(e *pb.CursorEntry) {
 		if protobuf {
-			writeDelimited(bw, e)
+			dw.write(e)
 		} else {
 			json.NewEncoder(bw).Encode(jsonCursorEntry(e))
 		}
 	}
 	res := hs.batch(r.Context(), req.GetBatch())
-	for _, e := range cursorEntries(req.GetBatch(), res) {
-		emit(e)
-	}
+	cursorEntries(req.GetBatch(), res, emit)
 	bw.Flush()
 	hs.lastUsed = time.Now()
 	hs.mu.Unlock()
 	s.mu.Lock()
 	s.streams[baton] = hs
 	s.mu.Unlock()
-}
-
-// writeDelimited writes m with the varint length prefix the cursor endpoint's
-// Protobuf framing uses.
-func writeDelimited(w io.Writer, m proto.Message) {
-	protodelim.MarshalTo(w, m)
 }
 
 func writeHTTPError(w http.ResponseWriter, status int, err error, protobuf bool) {
@@ -467,7 +458,11 @@ func writeHTTPError(w http.ResponseWriter, status int, err error, protobuf bool)
 		e.Code = ptr("HRANA_PROTO_ERROR")
 	}
 	if protobuf {
-		b, _ := proto.Marshal(e)
+		b, err := e.MarshalVT()
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		w.Header().Set("Content-Type", "application/x-protobuf")
 		w.WriteHeader(status)
 		w.Write(b)
