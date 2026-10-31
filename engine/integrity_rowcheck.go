@@ -467,7 +467,7 @@ func (p *ReadOnlyPager) integrityIndexesOf(tr *SchemaRow, schema []SchemaRow, tm
 // which keeps the multiset exact (the only thing an order-insensitive
 // comparison can see) and is unreachable for any well-formed table.
 func (p *ReadOnlyPager) integrityCheckViolatingRowids(tr *SchemaRow, cols []columnInfo, checks []checkConstraint, qualify bool, order []uint64, rows map[uint64][]Value) (map[uint64]bool, error) {
-	if len(checks) == 0 {
+	if len(checks) == 0 || len(order) == 0 {
 		return nil, nil
 	}
 	_, vals, qerr := p.QueryArgs(integrityCheckProbeSQL(tr, checks, qualify, "SELECT ("+integrityCheckViolationExpr(checks)+") FROM ")+" NOT INDEXED", nil)
@@ -492,6 +492,15 @@ func (p *ReadOnlyPager) integrityCheckViolatingRowids(tr *SchemaRow, cols []colu
 // messages, and how many there are.
 func (p *ReadOnlyPager) integrityCheckRowsFailingChecks(tr *SchemaRow, cols []columnInfo, checks []checkConstraint, qualify bool, limit int) ([]string, int, error) {
 	if len(checks) == 0 {
+		return nil, 0, nil
+	}
+	// A CHECK is evaluated per row, so a table without rows evaluates none
+	// (see integrityRowFindingsStreamed).
+	_, one, qerr := p.QueryArgs(integrityCheckProbeSQL(tr, checks, qualify, "SELECT 1 FROM ")+" LIMIT 1", nil)
+	if qerr != nil {
+		return nil, 0, fmt.Errorf("engine: PRAGMA integrity_check: %s: %w", tr.Name, qerr)
+	}
+	if len(one) == 0 {
 		return nil, 0, nil
 	}
 	_, vals, qerr := p.QueryArgs(integrityCheckProbeSQL(tr, checks, qualify, "SELECT count(*) FROM ")+" WHERE "+integrityCheckViolationExpr(checks), nil)
