@@ -1235,7 +1235,14 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 		return nil, nil, fmt.Errorf("engine: VDBE-only: compound SELECT not compilable to bytecode (no fallback)")
 	}
 	if len(stmt.From) == 0 {
-		return p.execNoFrom(stmt, outer, params)
+		// Kept for its text like any other read: the program reads its
+		// parameters and functions when it runs. Not with GROUP BY, whose terms
+		// validateNoFromGroupBy evaluates against the bound values before the
+		// compile, a check a kept plan would skip.
+		if len(stmt.GroupBy) > 0 {
+			cacheKey = ""
+		}
+		return p.execNoFromKeyed(stmt, outer, params, cacheKey)
 	}
 	stmt = p.nullUnusedSubqueryColumns(stmt)
 	stmt = nthValueReachOwn(stmt)
