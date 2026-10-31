@@ -194,7 +194,7 @@ func bindArgsInto(buf []engine.Value, info engine.ParamInfo, args []driver.Named
 			v = engine.Value{Typ: engine.Text, S: copyArgBytes(arena, x)}
 		case []byte:
 			if len(x) == 0 {
-				v, err = driverValueToEngine(x) // nil S, as that copy leaves it
+				v, err = driverValueToEngine(x) // NULL for a nil slice, else a BLOB with nil S
 				break
 			}
 			v = engine.Value{Typ: engine.Blob, S: copyArgBytes(arena, x)}
