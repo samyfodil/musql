@@ -35,6 +35,12 @@ const bookkeepingLayout = "1"
 // by op, in about as many round trips as an image takes.
 var imageMinOps uint64 = opsPerFetch
 
+// imageCompactRatio: an image whose delta is more than 1/imageCompactRatio of
+// it is compacted before it is adopted. A deliberate simplification between two
+// measured points: at 100k rows the delta was 1% of the image and compacting
+// it first cost 0.1-0.3 s of 2.2; at 1M it was 13% and saved 6 s of 25.
+var imageCompactRatio int64 = 16
+
 // imagePinGrace is how long a donor keeps the ops after an image's cut once the
 // image is sent: the receiver pulls them after installing it.
 const imagePinGrace = 30 * time.Second
@@ -524,6 +530,13 @@ func (sy *Syncer) installImage(ctx context.Context, im Imager, peer PeerID) erro
 	}()
 	if imageStagedForTest != nil {
 		if err := imageStagedForTest(); err != nil {
+			return err
+		}
+	}
+	if m.DeltaSize > 0 && m.DeltaSize*imageCompactRatio > m.Size {
+		// Every open of the staged file replays its delta, and the adopt below
+		// opens it: a big delta is cheaper rewritten once, outside the lock.
+		if _, err := engine.CompactSegmentFile(staged); err != nil {
 			return err
 		}
 	}
