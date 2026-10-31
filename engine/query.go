@@ -2531,17 +2531,45 @@ func cachedGeneratedExpr(text string) (Expr, error) {
 }
 
 // detachResultRows copies every byte slice a result row holds, so the rows no
-// longer point into a segment file's mapping. See QueryArgs.
+// longer point into a segment file's mapping. See QueryArgs. The copies share
+// chunks of at most detachChunk bytes, each sized to what is left to copy: an
+// allocation for many values rather than one each, and a value kept long pins
+// at most its chunk. A value longer than a chunk is copied alone, and an empty
+// one comes back nil, as a copy of it always did.
 func detachResultRows(rows [][]Value) [][]Value {
+	left := 0
 	for _, r := range rows {
 		for i := range r {
-			if r[i].S != nil {
-				r[i].S = append([]byte(nil), r[i].S...)
+			if n := len(r[i].S); n <= detachChunk {
+				left += n
+			}
+		}
+	}
+	var buf []byte
+	for _, r := range rows {
+		for i := range r {
+			switch n := len(r[i].S); {
+			case n == 0:
+				r[i].S = nil
+			case n > detachChunk:
+				b := make([]byte, n)
+				copy(b, r[i].S)
+				r[i].S = b
+			default:
+				if cap(buf)-len(buf) < n {
+					buf = make([]byte, 0, min(left, detachChunk))
+				}
+				at := len(buf)
+				buf = append(buf, r[i].S...)
+				r[i].S = buf[at:len(buf):len(buf)]
+				left -= n
 			}
 		}
 	}
 	return rows
 }
+
+const detachChunk = 64 << 10
 
 // groupMemberRowidScope returns the parenthesized group member whose stored
 // rowid ce names (tableScope.groupRowidRel), or nil: qualified by the member's
