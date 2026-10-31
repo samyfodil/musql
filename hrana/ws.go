@@ -11,7 +11,6 @@ import (
 	"sync"
 
 	"github.com/coder/websocket"
-	"google.golang.org/protobuf/proto"
 
 	pb "github.com/samyfodil/musql/hrana/gen/hrana"
 	pbws "github.com/samyfodil/musql/hrana/gen/hrana/ws"
@@ -332,7 +331,12 @@ func (wc *wsConn) request(rq *pbws.RequestMsg) {
 		wc.mu.Unlock()
 		wc.onStream(id, cur.streamID, func(st *wsStream) {
 			b := x.OpenCursor.GetBatch()
-			cur.entries = cursorEntries(b, st.batch(wc.ctx, b))
+			cursorEntries(b, st.batch(wc.ctx, b), func(e *pb.CursorEntry) {
+				if row, ok := e.Entry.(*pb.CursorEntry_Row); ok {
+					e = &pb.CursorEntry{Entry: &pb.CursorEntry_Row{Row: row.Row}}
+				}
+				cur.entries = append(cur.entries, e)
+			})
 			wc.reply(id, &pbws.ResponseOkMsg{Response: &pbws.ResponseOkMsg_OpenCursor{OpenCursor: &pbws.OpenCursorResp{}}})
 		})
 	case *pbws.RequestMsg_FetchCursor:
@@ -374,7 +378,9 @@ func (wc *wsConn) send(m *pbws.ServerMsg) {
 	)
 	if wc.protobuf {
 		typ = websocket.MessageBinary
-		data, err = proto.Marshal(m)
+		b := getBuf()
+		defer putBuf(b)
+		data, err = marshal(b, m, false)
 	} else {
 		data, err = json.Marshal(jsonServerMsg(m))
 	}
@@ -389,7 +395,7 @@ func (wc *wsConn) send(m *pbws.ServerMsg) {
 func (wc *wsConn) decode(data []byte) (*pbws.ClientMsg, error) {
 	if wc.protobuf {
 		m := &pbws.ClientMsg{}
-		if err := proto.Unmarshal(data, m); err != nil {
+		if err := m.UnmarshalVT(data); err != nil {
 			return nil, err
 		}
 		return m, nil
