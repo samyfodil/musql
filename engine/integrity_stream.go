@@ -243,7 +243,9 @@ func (p *ReadOnlyPager) integrityRowFindingsStreamed(tr *SchemaRow, tm *tableMet
 		return nil, nil, 0, errIntegrityUnreadable
 	}
 
-	if len(checks) > 0 {
+	// C evaluates a CHECK per row (pragma.c:2035): a table without rows
+	// evaluates none, and a CHECK that raises is never reached.
+	if len(checks) > 0 && nRows > 0 {
 		if err := p.integrityCheckFindings(tr, checks, qualify, rowidName, len(cols), found); err != nil {
 			return nil, nil, 0, err
 		}
