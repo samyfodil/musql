@@ -193,16 +193,14 @@ func (p *ReadOnlyPager) integrityRowFindingsStreamed(tr *SchemaRow, tm *tableMet
 	nRows := 0
 	var prev uint64
 	seq, errFn := p.ScanTable(tm.rootPage)
-	var rerr error
 	for rowid, vals := range seq {
 		if nRows > 0 && !rowidLess(prev, rowid) {
 			return nil, nil, 0, errIntegrityInMemory
 		}
 		prev = rowid
-		row, ferr := fullStoredRow(tm, rowid, vals)
-		if ferr != nil {
-			rerr = ferr
-			break
+		row := fullStoredRow(tm, rowid, vals)
+		if gerr := integrityGenErr(cols, strict, row); gerr != nil {
+			return nil, nil, 0, gerr
 		}
 		nRows++
 		// (1)-(4), per column in declaration order, skipping the rowid alias --
@@ -230,6 +228,9 @@ func (p *ReadOnlyPager) integrityRowFindingsStreamed(tr *SchemaRow, tm *tableMet
 				continue
 			}
 			key := indexEntryForNewRow(tm, ix.idx, rowid, row)
+			if gerr := rowGenErr(key); gerr != nil {
+				return nil, nil, 0, gerr
+			}
 			if valuesHaveNaN(key) {
 				return nil, nil, 0, errIntegrityInMemory
 			}
@@ -238,10 +239,7 @@ func (p *ReadOnlyPager) integrityRowFindingsStreamed(tr *SchemaRow, tm *tableMet
 			}
 		}
 	}
-	if rerr == nil {
-		rerr = errFn()
-	}
-	if rerr != nil {
+	if errFn() != nil {
 		return nil, nil, 0, errIntegrityUnreadable
 	}
 

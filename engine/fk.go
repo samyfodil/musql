@@ -214,6 +214,9 @@ type fkParentWork struct {
 	newKey  []Value // nil when the row has none afterwards (a delete, or NULL)
 	oldKids []uint64
 	newKids int
+	// oldErr/newErr are what the scan for each key raised (see
+	// fkChildRowsMatching); fkParentSide reports one only where C runs that scan.
+	oldErr, newErr error
 }
 
 // fkStmtState is one statement's foreign key bookkeeping.
@@ -1100,11 +1103,12 @@ func (db *DB) fkRowMutated(tbl *tableMeta, oldRowid, newRowid uint64, old, new [
 		w := fkParentWork{fk: fk}
 		if k, ok := fkParentKeyOf(fk, ev.old); ok {
 			w.oldKey = k
-			w.oldKids = db.fkChildRowsMatching(fk, k)
+			w.oldKids, w.oldErr = db.fkChildRowsMatching(fk, k)
 		}
 		if k, ok := fkParentKeyOf(fk, ev.new); ok {
 			w.newKey = k
-			w.newKids = len(db.fkChildRowsMatching(fk, k))
+			kids, err := db.fkChildRowsMatching(fk, k)
+			w.newKids, w.newErr = len(kids), err
 		}
 		// RESTRICT is checked HERE, not at the end of the statement: it is the
 		// one action C SQLite refuses to defer (see fkStmtState.restrict).
@@ -1386,6 +1390,9 @@ func (db *DB) fkMayDecrement(st *fkStmtState, fk *fkConstraint) bool {
 // must resolve to a parent row, and removing an old image that did not
 // resolve gives the counter back (never below zero -- see the doc comment).
 func (db *DB) fkChildSide(st *fkStmtState, ev fkEvent) error {
+	if err := db.fkOldKeyErr(ev); err != nil {
+		return err
+	}
 	for _, fk := range db.fkOf(ev.tbl) {
 		if fk.resolveErr != nil {
 			return fk.resolveErr
@@ -1451,6 +1458,17 @@ func (db *DB) fkParentSide(st *fkStmtState, ev fkEvent) error {
 		fk := w.fk
 		if fk.deferred && db.fkDeferredUnmodelled() {
 			return fkDeferredDeclined(fk)
+		}
+		// C scans the children only when the statement assigns the parent key
+		// (fkParentIsModified), and the new key's children only while a
+		// violation is outstanding (OP_FkIfZero).
+		if ev.mask == nil || fkAssignsParentCols(fk, ev.mask) {
+			if w.oldErr != nil {
+				return w.oldErr
+			}
+			if w.newErr != nil && db.fkMayDecrement(st, fk) {
+				return w.newErr
+			}
 		}
 		counter := db.fkCounterFor(st, fk)
 		// A key the mutation did not change acts on nothing and counts nothing
@@ -1547,6 +1565,52 @@ func fkDeferredDeclined(fk *fkConstraint) error {
 func fkAssignsChildCols(fk *fkConstraint, mask []bool) bool {
 	for _, ci := range fk.childIdx {
 		if ci < len(mask) && mask[ci] {
+			return true
+		}
+	}
+	return false
+}
+
+// fkOldKeyErr is the error of a VIRTUAL child key column of ev's old row
+// whose expression raises. C loads the old row's key columns (sqlite3FkOldmask)
+// for a delete, and for an update that assigns a key column of any foreign key
+// on the table (sqlite3FkRequired), so the load raises there.
+func (db *DB) fkOldKeyErr(ev fkEvent) error {
+	if ev.old == nil {
+		return nil
+	}
+	childFKs := db.fkOf(ev.tbl)
+	required := ev.mask == nil
+	for _, fk := range childFKs {
+		required = required || fkAssignsChildCols(fk, ev.mask)
+	}
+	for _, w := range ev.parent {
+		required = required || fkAssignsParentCols(w.fk, ev.mask)
+	}
+	if !required {
+		return nil
+	}
+	for _, fk := range childFKs {
+		for _, ci := range fk.childIdx {
+			if ci < len(ev.old) && ev.old[ci].Typ == valueGenErr {
+				return genErrOf(ev.old[ci])
+			}
+		}
+	}
+	return nil
+}
+
+// fkAssignsParentCols is fkAssignsChildCols for fk's parent key. A rowid key
+// is its INTEGER PRIMARY KEY column, and counts as assigned without one.
+func fkAssignsParentCols(fk *fkConstraint, mask []bool) bool {
+	for _, pi := range fk.parentIdx {
+		if pi < 0 {
+			if fk.parent == nil || fk.parent.ipkIndex < 0 {
+				return true
+			}
+			pi = fk.parent.ipkIndex
+		}
+		if pi < len(mask) && mask[pi] {
 			return true
 		}
 	}
@@ -1740,24 +1804,38 @@ func (db *DB) fkParentCandidates(fk *fkConstraint, probe []Value) ([]uint64, boo
 // value tuple equals the given PARENT key, in ascending rowid order (the
 // order the child's own b-tree -- and so C SQLite's action loop -- visits
 // them in).
-func (db *DB) fkChildRowsMatching(fk *fkConstraint, parentKey []Value) []uint64 {
+//
+// C finds them with a scan whose WHERE compares the key column by column
+// (fkScanChildren), so a VIRTUAL key column is computed for each row the
+// comparisons reach, and one whose expression raises fails the scan.
+func (db *DB) fkChildRowsMatching(fk *fkConstraint, parentKey []Value) ([]uint64, error) {
 	// See fkParentHasKey's identical guard just above.
 	if err := db.ensureTableLoaded(fk.child); err != nil {
 		if db.pendingLoadErr == nil {
 			db.pendingLoadErr = err
 		}
-		return nil
+		return nil, nil
 	}
 	var out []uint64
+	var scanErr error
+	var errRid uint64
 	for rid, crow := range fk.child.rows.all() {
 		row := normalizeRow(fk.child.name, fk.child.cols, fk.child.ipkIndex, rid, crow)
-		key, ok := fkKeyOf(fk.childIdx, row)
-		if !ok {
-			continue
-		}
 		match := true
-		for i := range key {
-			if compareValuesCollatedEnc(applyAffinityToValue(key[i], fk.affs[i]), parentKey[i], fk.colls[i], db.encoding()) != 0 {
+		for i, ci := range fk.childIdx {
+			if ci >= len(row) || row[ci].Typ == Null {
+				match = false
+				break
+			}
+			if row[ci].Typ == valueGenErr {
+				// The first row in rowid order is the one C's scan raises at.
+				if scanErr == nil || rowidLess(rid, errRid) {
+					scanErr, errRid = genErrOf(row[ci]), rid
+				}
+				match = false
+				break
+			}
+			if compareValuesCollatedEnc(applyAffinityToValue(row[ci], fk.affs[i]), parentKey[i], fk.colls[i], db.encoding()) != 0 {
 				match = false
 				break
 			}
@@ -1766,8 +1844,11 @@ func (db *DB) fkChildRowsMatching(fk *fkConstraint, parentKey []Value) []uint64 
 			out = append(out, rid)
 		}
 	}
+	if scanErr != nil {
+		return nil, scanErr
+	}
 	sort.Slice(out, func(i, j int) bool { return rowidLess(out[i], out[j]) })
-	return out
+	return out, nil
 }
 
 // fkParentRowMatches compares one stored parent row against an
@@ -2218,7 +2299,10 @@ func (db *DB) fkBeforeDropTable(tbl *tableMeta) error {
 			if !ok {
 				continue
 			}
-			kids := db.fkChildRowsMatching(fk, key)
+			kids, kerr := db.fkChildRowsMatching(fk, key)
+			if kerr != nil {
+				return kerr
+			}
 			// fkChildRowsMatching reaches fk.child, a DIFFERENT table than
 			// tbl -- same reasoning as fkParentHasKey's identical check just
 			// above: a load failure there must abort BEFORE this function

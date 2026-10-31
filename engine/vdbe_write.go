@@ -3133,6 +3133,14 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 	// the same register block before OP_MakeRecord/OP_Insert.
 	rowBase := c.allocN(len(tbl.cols))
 	for i := range tbl.cols {
+		if col := tbl.cols[i]; col.IsGenerated() && !col.GeneratedStored && beforePlan == nil && firePlan == nil && stmt.returning == nil {
+			// C never reads a VIRTUAL column into the new row (update.c:945);
+			// OpComputeGenerated computes it below. It reads the OLD row's for a
+			// trigger, here the snapshot taken from these registers, and for
+			// RETURNING, whose column mask is every column (trigger.c:1560).
+			c.emit(Instruction{Op: OpNull, P2: rowBase + i})
+			continue
+		}
 		c.emit(Instruction{Op: OpColumn, P1: 0, P2: i, P3: rowBase + i})
 	}
 	rowidReg := c.allocN(1)

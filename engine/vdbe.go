@@ -1571,6 +1571,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				m.regs[op.P3] = Value{Typ: Int, I: rid}
 			} else if op.P2 < len(src) {
 				m.regs[op.P3] = src[op.P2]
+				if m.regs[op.P3].Typ == valueGenErr {
+					return nil, takeGenErr(&m.regs[op.P3])
+				}
 			} else {
 				// A machine with no firing row cannot answer NEW./OLD.
 				// Reported rather than indexed: a live sub-program that was
@@ -3188,6 +3191,11 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			n := tbl.rows.clear()
 			m.wctx.rowsAffected += int(n)
+
+		case OpGenErrCheck:
+			if m.regs[op.P1].Typ == valueGenErr {
+				return nil, genErrOf(m.regs[op.P1])
+			}
 
 		case OpSkipIfRowGone:
 			tbl := op.P4.(*tableMeta)

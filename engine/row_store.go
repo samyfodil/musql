@@ -791,34 +791,38 @@ func rowidLess(a, b uint64) bool { return int64(a) < int64(b) }
 
 // fullStoredRow widens a record read from tbl's b-tree to the row store's
 // shape -- see readTableRowsFromPager, which does the same for a whole table.
-func fullStoredRow(tbl *tableMeta, rowid uint64, row []Value) ([]Value, error) {
+// A VIRTUAL generated column whose expression raises holds the error
+// (computeGeneratedOnRead): the row itself is never lost to it.
+func fullStoredRow(tbl *tableMeta, rowid uint64, row []Value) []Value {
 	return fullStoredRowOf(tbl.name, tbl.cols, tbl.ipkIndex, rowid, row)
 }
 
 // fullStoredRowOf is fullStoredRow for a table whose metadata is not assembled
 // yet (a schema load).
-func fullStoredRowOf(name string, cols []columnInfo, ipkIndex int, rowid uint64, row []Value) ([]Value, error) {
-	tbl := &tableMeta{name: name, cols: cols, ipkIndex: ipkIndex}
-	gen := hasGeneratedCols(tbl.cols)
+func fullStoredRowOf(name string, cols []columnInfo, ipkIndex int, rowid uint64, row []Value) []Value {
+	gen := hasGeneratedCols(cols)
+	row = widenStoredRow(cols, row)
 	if gen {
-		row = expandStoredRow(tbl.cols, row)
-	}
-	// Padding comes first: a record written before an ALTER TABLE ADD COLUMN is
-	// short of the column list, and a generated expression is computed over the
-	// whole row.
-	row = padStoredRow(tbl.cols, row)
-	if gen {
-		if tbl.ipkIndex >= 0 && row[tbl.ipkIndex].Typ == Null {
-			row[tbl.ipkIndex] = Value{Typ: Int, I: int64(rowid)}
-			if err := computeGeneratedInto(tbl.name, tbl.cols, row); err != nil {
-				return nil, err
-			}
-			row[tbl.ipkIndex] = Value{Typ: Null}
-		} else if err := computeGeneratedInto(tbl.name, tbl.cols, row); err != nil {
-			return nil, err
+		if ipkIndex >= 0 && row[ipkIndex].Typ == Null {
+			row[ipkIndex] = Value{Typ: Int, I: int64(rowid)}
+			computeGeneratedOnRead(name, cols, row)
+			row[ipkIndex] = Value{Typ: Null}
+		} else {
+			computeGeneratedOnRead(name, cols, row)
 		}
 	}
-	return row, nil
+	return row
+}
+
+// widenStoredRow is fullStoredRowOf without the generated columns: the stored
+// values at full width, what a rewrite of the file copies. Padding comes after
+// the slot mapping: a record written before an ALTER TABLE ADD COLUMN is short
+// of the column list.
+func widenStoredRow(cols []columnInfo, row []Value) []Value {
+	if hasGeneratedCols(cols) {
+		row = expandStoredRow(cols, row)
+	}
+	return padStoredRow(cols, row)
 }
 
 // reserve makes room in the overlay for n rows about to be put, so a

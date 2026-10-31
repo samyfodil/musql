@@ -2078,6 +2078,20 @@ func (c *compiler) resolveRowReg(x ColumnExpr) (int, bool, error) {
 	return reg, true, nil
 }
 
+// regHoldsVirtual reports whether reg is a register row's slot for a VIRTUAL
+// generated column, which a row loaded whole from the table holds as that
+// column's error where its expression raised (valueGenErr).
+func regHoldsVirtual(scopes []regScope, reg int) bool {
+	for _, rs := range scopes {
+		for idx, r := range rs.regs {
+			if r == reg && idx < len(rs.scope.cols) && rs.scope.cols[idx].IsGenerated() && !rs.scope.cols[idx].GeneratedStored {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // outerRowCtx returns the nearest live enclosing-row evalCtx on this compile's
 // chain (compiler.rowOuter), or nil. Walking the chain -- rather than reading
 // c.rowOuter alone -- is what lets a subquery compiled BENEATH a FROM-less
@@ -2213,6 +2227,9 @@ func (c *compiler) compileColumn(x ColumnExpr) (int, error) {
 			return 0, amb
 		}
 		if ok {
+			if regHoldsVirtual(c.regScopes, reg) {
+				c.emit(Instruction{Op: OpGenErrCheck, P1: reg})
+			}
 			return reg, nil
 		}
 	}
@@ -2332,6 +2349,9 @@ func (c *compiler) compileColumn(x ColumnExpr) (int, error) {
 				}
 				d := c.alloc()
 				c.emit(Instruction{Op: OpOuterAggReg, P1: reg, P3: d, P5: uint16(level)})
+				if regHoldsVirtual(oc.regScopes, reg) {
+					c.emit(Instruction{Op: OpGenErrCheck, P1: d})
+				}
 				return d, nil
 			}
 		}
@@ -4235,6 +4255,11 @@ type selfRowExpr struct {
 	// (compiler.ignoreDbQualifier), kept only so eval's re-stamp reproduces it
 	// rather than compiling a CHECK body under an index expression's rules.
 	ignoreDbQualifier bool
+
+	// virtReads are the VIRTUAL generated columns the expression reads, whose
+	// slot in a committed row may hold its error (valueGenErr): eval raises it
+	// rather than run the program over it.
+	virtReads []int
 }
 
 // compileSelfRowExpr compiles e against scope's columns held in registers. A
@@ -4255,6 +4280,16 @@ func compileSelfRowExprPaged(scope tableScope, e Expr, ignoreDbQualifier bool, p
 	p := &selfRowExpr{expr: e, cols: scope.cols, nCols: len(scope.cols), ignoreDbQualifier: ignoreDbQualifier, pureCtx: pureCtx}
 	if e == nil {
 		return p
+	}
+	if hasVirtualCols(scope.cols) {
+		forEachColumnRef(e, func(ce ColumnExpr) {
+			if ce.Qualifier != "" && !equalFoldName(scope.name, ce.Qualifier) {
+				return
+			}
+			if k, ok := scope.colIndex[r33sFoldIdent(ce.Name)]; ok && k < len(scope.cols) && scope.cols[k].IsGenerated() && !scope.cols[k].GeneratedStored {
+				p.virtReads = append(p.virtReads, k)
+			}
+		})
 	}
 	// rowLive only with a pager: eval seeds the register block before running, so
 	// a subquery beneath can read it across the frame. That is what a vtab
