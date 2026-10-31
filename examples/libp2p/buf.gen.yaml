@@ -4,3 +4,9 @@ plugins:
     out: pb
     opt:
       - paths=source_relative
+  # See the repository root's buf.gen.yaml for the version to install.
+  - local: protoc-gen-go-vtproto
+    out: pb
+    opt:
+      - paths=source_relative
+      - features=marshal+unmarshal+unmarshal_unsafe+size
