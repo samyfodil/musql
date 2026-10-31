@@ -2533,7 +2533,8 @@ func computeGenerated(tblName string, cols []columnInfo, row []Value, onRead boo
 				fail(i, err)
 				return nil
 			}
-			return fmt.Errorf("engine: table %s: generated column %s: %w", tblName, c.Name, err)
+			// C names no column: the expression's own error is the statement's.
+			return err
 		}
 		v = applyAffinityToValue(v, c.Aff)
 		// sqlite3ExprCodeGeneratedColumn codes the expression then
