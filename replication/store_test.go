@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 
@@ -93,19 +95,36 @@ func dumpUsers(t *testing.T, s *Store) string {
 
 func dumpClock(t *testing.T, s *Store) string {
 	t.Helper()
-	rows, err := s.db.Query(`SELECT tbl, quote(pk), col, hlc, site, quote(val) FROM _repl_clock ORDER BY tbl, pk, col`)
+	return dumpClockDB(t, s.db)
+}
+
+// dumpClockDB is every clock cell db holds, a line each, in key and column
+// order: "tbl|X'pk'|col|hlc|site|X'val'".
+func dumpClockDB(t testing.TB, db *sql.DB) string {
+	t.Helper()
+	rows, err := db.Query(`SELECT tbl, pk, rec FROM main._repl_clock ORDER BY tbl, pk`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rows.Close()
 	var b strings.Builder
 	for rows.Next() {
-		var tbl, pk, col, site, val string
-		var hlc int64
-		if err := rows.Scan(&tbl, &pk, &col, &hlc, &site, &val); err != nil {
+		var tbl string
+		var pk, rec []byte
+		if err := rows.Scan(&tbl, &pk, &rec); err != nil {
 			t.Fatal(err)
 		}
-		fmt.Fprintf(&b, "%s|%s|%s|%d|%s|%s\n", tbl, pk, col, hlc, site, val)
+		cells, err := decodeRec(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, col := range slices.Sorted(maps.Keys(cells)) {
+			c := cells[col]
+			fmt.Fprintf(&b, "%s|X'%X'|%s|%d|%s|X'%X'\n", tbl, pk, col, int64(c.hlc), c.site, c.val)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
 	return b.String()
 }

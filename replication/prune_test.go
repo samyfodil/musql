@@ -173,7 +173,8 @@ func TestClockSeedsTheHLC(t *testing.T) {
 		t.Fatal(err)
 	}
 	future := HLC(uint64(time.Now().Add(time.Hour).UnixMilli()) << 16)
-	if _, err := db.Exec(`INSERT INTO _repl_clock(tbl, pk, col, hlc, site, val) VALUES('t', x'01', 'c', ?, 'old', x'01')`, int64(future)); err != nil {
+	rec, top := encodeRec(map[string]clockCell{"c": {future, "old", []byte{1}}})
+	if _, err := db.Exec(`INSERT INTO _repl_clock(tbl, pk, top, rec) VALUES('t', x'01', ?, ?)`, int64(top), rec); err != nil {
 		t.Fatal(err)
 	}
 	s, err := OpenStore(ctx, db, "hlcseed")
