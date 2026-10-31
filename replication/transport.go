@@ -1,6 +1,9 @@
 package replication
 
-import "context"
+import (
+	"context"
+	"io"
+)
 
 // PeerID uniquely identifies a peer in the network.
 type PeerID string
@@ -41,6 +44,13 @@ type Transport interface {
 	// The returned channel receives PeerOp values. The channel is closed
 	// when the subscription ends or the context is cancelled.
 	SubscribePush(ctx context.Context) (<-chan PeerOp, error)
+}
+
+// Imager is a Transport that streams a peer's image (Store.Image): a node that
+// holds nothing yet takes one instead of the peer's history. Its bytes arrive
+// through the ReadCloser, in pieces, and closing it ends the transfer.
+type Imager interface {
+	GetImage(ctx context.Context, peer PeerID, req ImageRequest) (ImageManifest, io.ReadCloser, error)
 }
 
 // Broadcaster is a Transport whose push reaches every peer at once, as a

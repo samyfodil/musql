@@ -88,6 +88,7 @@ func (s *Store) prune(ctx context.Context) error {
 			}
 		}
 	}
+	s.pinnedFrontier(frontier)
 	tx, err := s.begin(ctx)
 	if err != nil {
 		return err

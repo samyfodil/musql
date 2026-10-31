@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/samyfodil/musql/replication"
+
 	"github.com/samyfodil/musql/cloud/cluster"
 	v1 "github.com/samyfodil/musql/cloud/gen/cloud/v1"
 	"github.com/samyfodil/musql/cloud/gen/cloud/v1/cloudv1connect"
@@ -300,7 +302,8 @@ func (b *busyLog) Write(p []byte) (int, error) {
 }
 
 // A node newly placed serves a database only once it holds all of it: until
-// its first sync with the peers completes it answers 503, never a part.
+// its first sync with the peers completes it answers 503, never a part. It
+// takes the database as a peer's image, not op by op.
 func TestClusterNewPlacementServesAllOrNothing(t *testing.T) {
 	nodes := newCluster(t, 3)
 	ctx := context.Background()
@@ -309,12 +312,9 @@ func TestClusterNewPlacementServesAllOrNothing(t *testing.T) {
 	need(nodes[0].groups().AddLocation(ctx, auth(nodes[0].admin, &v1.AddLocationRequest{Org: "acme", Group: "default", Location: "iad"})))(t)
 	need(dbs.Create(ctx, auth(nodes[0].admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "app"})))(t)
 	eventually(t, "app open on fra and iad", func() bool { return placed(nodes[:2], "app") })
-	const rows = 500
-	stmts := []string{"CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)"}
-	for i := range rows {
-		stmts = append(stmts, fmt.Sprintf("INSERT INTO t(v) VALUES (%d)", i))
-	}
-	nodes[0].exec("/db/acme/app", nodes[0].admin, stmts...)
+	const rows = 2000 // more ops than a new node pulls one by one
+	nodes[0].exec("/db/acme/app", nodes[0].admin, "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)",
+		fmt.Sprintf("WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i < %d) INSERT INTO t(v) SELECT i FROM c", rows))
 	eventually(t, "the rows on iad", func() bool { return nodes[1].count("app", "t") == rows })
 
 	need(nodes[0].groups().AddLocation(ctx, auth(nodes[0].admin, &v1.AddLocationRequest{Org: "acme", Group: "default", Location: "sea"})))(t)
@@ -333,6 +333,13 @@ func TestClusterNewPlacementServesAllOrNothing(t *testing.T) {
 		}
 		return true
 	})
+	d, err := nodes[2].s.Store().Database(ctx, orgID(nodes[2]), "app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replication.ImageInstalled(nodes[2].s.crdtHandle(d.ID)) {
+		t.Fatal("sea took app op by op, not as an image")
+	}
 }
 
 func TestClusterPlacement(t *testing.T) {

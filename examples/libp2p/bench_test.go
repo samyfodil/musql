@@ -74,6 +74,14 @@ func benchSeconds() time.Duration {
 	return 30 * time.Second
 }
 
+// benchRows is B4's row count: BENCH_ROWS, 100k by default.
+func benchRows() int {
+	if n, err := strconv.Atoi(os.Getenv("BENCH_ROWS")); err == nil && n > 0 {
+		return n
+	}
+	return 100000
+}
+
 func pct(d []time.Duration, p float64) time.Duration {
 	if len(d) == 0 {
 		return 0
@@ -203,9 +211,10 @@ func BenchmarkLag(b *testing.B) {
 	}
 }
 
-// BenchmarkCatchUp is B4 over libp2p: a new node taking a 100k-row database.
+// BenchmarkCatchUp is B4 over libp2p: a new node taking a 100k-row database
+// (benchRows).
 func BenchmarkCatchUp(b *testing.B) {
-	const n = 100000
+	n := benchRows()
 	for b.Loop() {
 		hs := benchHosts(b, 2)
 		// Written before sync starts: a lone node prunes what it alone holds.

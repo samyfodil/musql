@@ -126,3 +126,41 @@ message Response {
     ExchangeAcksResponse exchange_acks = 4;
   }
 }
+
+// The image protocol (ImageProtocolID): one GetImageRequest, one
+// GetImageResponse, and unless it refused, ImageChunks up to one that is last.
+message GetImageRequest {
+  string layout = 1;
+  uint32 file_version = 2;
+  uint32 min_file_version = 3;
+  uint32 delta_version = 4;
+}
+
+message ImageManifest {
+  string site = 1;
+  uint32 file_version = 2;
+  uint32 delta_version = 3;
+  string layout = 4;
+  string catalog = 5;
+  // size is the image's length: a segment file, then delta_size bytes of its
+  // delta.
+  uint64 size = 6;
+  // crc32c is the image's CRC-32C (Castagnoli).
+  uint32 crc32c = 7;
+  repeated VVEntry vv = 8;
+  repeated VVEntry floors = 9;
+  repeated RangeEntry ranges = 10;
+  uint64 max_hlc = 11;
+  uint64 delta_size = 12;
+}
+
+message GetImageResponse {
+  ImageManifest manifest = 1;
+  // refused is why the peer sends no image.
+  string refused = 2;
+}
+
+message ImageChunk {
+  bytes data = 1;
+  bool last = 2;
+}
