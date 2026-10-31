@@ -23,8 +23,10 @@ type capture struct {
 	buf  []Op // built from this transaction's row changes, at flush time
 	// flushed holds ops written in-txn awaiting commit confirmation.
 	flushed []Op
-	// handoff holds stamped ops between preCommit and handOff.
+	// handoff holds stamped ops between preCommit and handOff, and seen the
+	// log's heads as their transaction read them.
 	handoff []Op
+	seen    string
 	// committing is set by a preCommit that let the commit go ahead; a
 	// rollback then is the commit failing. retrying is set from such a failure
 	// an apply caused -- one committed since this connection's last commit or
@@ -43,6 +45,8 @@ func (s *Syncer) attach(conn *driver.Conn) {
 		PostCommit: c.postCommit,
 		Rollback:   c.discard,
 		HandOff:    c.handOff,
+		LockWait:   s.store.localLockWait,
+		Contended:  s.store.ingestWaits,
 	})
 }
 
@@ -152,16 +156,18 @@ func (c *capture) preCommit(ctx context.Context, conn *driver.Conn, changes []en
 				return errors.New("replication: a Quorum commit cannot also change TEMP tables")
 			}
 		}
-		c.s.store.seqMu.Lock() // released by handOff, which the driver always calls next
-		ops, err := c.fresh(ctx)
-		if err == nil {
-			ops, err = c.stamp(ctx)
-		}
+		// Stamped without seqMu: this transaction may hold the write lock,
+		// which the hand-off holding seqMu waits for to apply. handOff takes
+		// seqMu once the lock is let go, and refuses the ops if the log moved.
+		seen, err := c.heads(ctx)
 		if err != nil {
-			c.s.store.seqMu.Unlock()
 			return err
 		}
-		c.handoff = ops
+		ops, err := c.stamp(ctx)
+		if err != nil {
+			return err
+		}
+		c.handoff, c.seen = ops, seen
 		return driver.ErrHandOff
 	}
 	if r != nil && hasSchemaOp(c.buf) {
@@ -324,18 +330,48 @@ func (c *capture) flush(ctx context.Context) error {
 	if len(c.buf) == 0 {
 		return nil
 	}
-	ops, err := c.stamp(ctx)
+	// Numbered on from the last seq this node noted, without reading the log
+	// first: a commit this node has not noted yet holds the next seq, which
+	// the first op's insert finds, and then they go past the log's last.
+	ops := c.stampFrom(c.s.store.ownSeq.Load())
+	wrote, err := c.writeOp(ctx, ops[0], true)
 	if err != nil {
 		return err
 	}
-	for _, op := range ops {
-		if err := c.writeOp(ctx, op); err != nil {
+	if !wrote {
+		seq, err := c.logSeq(ctx)
+		if err != nil {
 			return err
 		}
-		c.flushed = append(c.flushed, op)
+		for i := range ops {
+			ops[i].Seq = seq + 1 + uint64(i)
+		}
+		if _, err := c.writeOp(ctx, ops[0], false); err != nil {
+			return err
+		}
 	}
-	c.buf = c.buf[:0]
+	for _, op := range ops[1:] {
+		if _, err := c.writeOp(ctx, op, false); err != nil {
+			return err
+		}
+	}
+	c.flushed = append(c.flushed, ops...)
 	return nil
+}
+
+const headsQuery = `SELECT site, max(seq) FROM main._repl_oplog GROUP BY site ORDER BY site`
+
+// heads is the log's last seq per site as this transaction reads it.
+func (c *capture) heads(ctx context.Context) (string, error) {
+	rows, err := c.conn.Query(ctx, headsQuery)
+	if err != nil {
+		return "", err
+	}
+	var seen strings.Builder
+	for _, r := range rows {
+		fmt.Fprintf(&seen, "%s=%v;", asString(r[0]), r[1])
+	}
+	return seen.String(), nil
 }
 
 // fresh refuses a Quorum commit whose transaction began before another commit
@@ -343,21 +379,12 @@ func (c *capture) flush(ctx context.Context) error {
 // would repeat the other's: an ordinary commit fails for the same reason when
 // it finds the file moved (engine.ErrBusy), but this transaction is discarded
 // and never gets there. Every change to a Quorum database is an op, so the log
-// as the transaction sees it, against the log as it is now, says whether
-// anything landed.
-func (c *capture) fresh(ctx context.Context) ([]Op, error) {
-	const q = `SELECT site, max(seq) FROM main._repl_oplog GROUP BY site ORDER BY site`
-	rows, err := c.conn.Query(ctx, q)
+// as the transaction saw it (heads), against the log as it is now, says
+// whether anything landed. Under seqMu.
+func (c *capture) fresh(ctx context.Context, seen string) error {
+	now, err := c.s.store.db.QueryContext(ctx, headsQuery)
 	if err != nil {
-		return nil, err
-	}
-	var seen strings.Builder
-	for _, r := range rows {
-		fmt.Fprintf(&seen, "%s=%v;", asString(r[0]), r[1])
-	}
-	now, err := c.s.store.db.QueryContext(ctx, q)
-	if err != nil {
-		return nil, err
+		return err
 	}
 	defer now.Close()
 	var cur strings.Builder
@@ -365,17 +392,17 @@ func (c *capture) fresh(ctx context.Context) ([]Op, error) {
 		var site string
 		var seq int64
 		if err := now.Scan(&site, &seq); err != nil {
-			return nil, err
+			return err
 		}
 		fmt.Fprintf(&cur, "%s=%d;", site, seq)
 	}
 	if err := now.Err(); err != nil {
-		return nil, err
+		return err
 	}
-	if seen.String() != cur.String() {
-		return nil, fmt.Errorf("%w: another connection committed while this transaction was open", engine.ErrBusy)
+	if seen != cur.String() {
+		return fmt.Errorf("%w: another connection committed while this transaction was open", engine.ErrBusy)
 	}
-	return nil, nil
+	return nil
 }
 
 // stamp is the buffered ops with this site, their seqs and their HLCs.
@@ -384,6 +411,11 @@ func (c *capture) stamp(ctx context.Context) ([]Op, error) {
 	if err != nil {
 		return nil, err
 	}
+	return c.stampFrom(seq), nil
+}
+
+// stampFrom is stamp numbering the ops on from seq.
+func (c *capture) stampFrom(seq uint64) []Op {
 	ops := make([]Op, len(c.buf))
 	for i, op := range c.buf {
 		seq++
@@ -391,7 +423,7 @@ func (c *capture) stamp(ctx context.Context) ([]Op, error) {
 		ops[i] = op
 	}
 	c.buf = c.buf[:0]
-	return ops, nil
+	return ops
 }
 
 // lastSeq is this site's highest seq as this transaction reads the log. A
@@ -406,7 +438,14 @@ func (c *capture) lastSeq(ctx context.Context) (uint64, error) {
 	if err != nil || len(rows) == 0 {
 		return seq, err
 	}
-	if rows, err = c.conn.Query(ctx, maxSeqQuery, c.s.site, c.s.site); err != nil {
+	return c.logSeq(ctx)
+}
+
+// logSeq is this site's highest seq in the log as this transaction reads it,
+// or the floor it was pruned to.
+func (c *capture) logSeq(ctx context.Context) (uint64, error) {
+	rows, err := c.conn.Query(ctx, maxSeqQuery, c.s.site, c.s.site)
+	if err != nil {
 		return 0, err
 	}
 	if n, ok := rows[0][0].(int64); ok {
@@ -419,15 +458,19 @@ func (c *capture) lastSeq(ctx context.Context) (uint64, error) {
 // go through the caller's consensus, which applies them on every node, this
 // one included. The commit succeeded when they are applied here.
 func (c *capture) handOff() error {
+	ops, seen := c.handoff, c.seen
+	c.handoff, c.seen = nil, ""
+	c.s.store.seqMu.Lock()
 	defer c.s.store.seqMu.Unlock()
-	ops := c.handoff
-	c.handoff = nil
+	if err := c.fresh(context.Background(), seen); err != nil {
+		return err
+	}
 	return c.s.propose(context.Background(), ops)
 }
 
-// propose sends ops, stamped under seqMu which the caller holds, through the
-// caller's consensus log as one entry, and reports whether they were applied
-// here.
+// propose sends ops through the caller's consensus log as one entry, the
+// caller holding seqMu so that no other commit takes their seqs, and reports
+// whether they were applied here.
 func (s *Syncer) propose(ctx context.Context, ops []Op) error {
 	entry, err := json.Marshal(ops)
 	if err != nil {
@@ -448,35 +491,50 @@ func (s *Syncer) propose(ctx context.Context, ops []Op) error {
 	return nil
 }
 
-func (c *capture) writeOp(ctx context.Context, op Op) error {
-	if err := c.conn.Exec(ctx,
-		`INSERT INTO main._repl_oplog(site,seq,hlc,tbl,pk,op,cells) VALUES(?,?,?,?,?,?,?)`,
-		op.Site, int64(op.Seq), int64(op.HLC), op.Tbl, op.PK, int64(op.Kind), encodeCells(op.Cells)); err != nil {
-		return err
+// writeOp writes op into the log and its cells into the clock. With ifFree, a
+// log holding op's (site, seq) already is left as it is and writeOp reports
+// false, having written nothing.
+func (c *capture) writeOp(ctx context.Context, op Op, ifFree bool) (bool, error) {
+	verb := `INSERT`
+	if ifFree {
+		verb = `INSERT OR IGNORE`
+	}
+	n, err := c.conn.ExecChanges(ctx, verb+` INTO main._repl_oplog(site,seq,hlc,tbl,pk,op,cells) VALUES(?,?,?,?,?,?,?)`,
+		op.Site, int64(op.Seq), int64(op.HLC), op.Tbl, op.PK, int64(op.Kind), encodeCells(op.Cells))
+	if err != nil || n == 0 {
+		return false, err
 	}
 	if op.Kind == OpSchema {
-		return nil // a schema op has no cells of any row
+		return true, nil // a schema op has no cells of any row
+	}
+	return true, c.writeClock(ctx, op)
+}
+
+// writeClock writes op's presence and cells into its row's clock record over
+// what the record held: a local op is newer than every cell this node holds.
+func (c *capture) writeClock(ctx context.Context, op Op) error {
+	rows, err := c.conn.Query(ctx, `SELECT rec FROM main._repl_clock WHERE tbl=? AND pk=?`, op.Tbl, op.PK)
+	if err != nil {
+		return err
+	}
+	have := map[string]clockCell{}
+	if len(rows) > 0 {
+		rec, _ := rows[0][0].([]byte)
+		if have, err = decodeRec(rec); err != nil {
+			return err
+		}
 	}
 	pval := byte(1)
 	if op.Kind == OpDelete {
 		pval = 0
 	}
-	if err := c.upsertClock(ctx, op.Tbl, op.PK, presenceCol, op.HLC, op.Site, []byte{pval}); err != nil {
-		return err
-	}
+	have[presenceCol] = clockCell{op.HLC, op.Site, []byte{pval}}
 	for _, cell := range op.Cells {
-		if err := c.upsertClock(ctx, op.Tbl, op.PK, cell.Col, op.HLC, op.Site, packVal(cell.Type, cell.Val)); err != nil {
-			return err
-		}
+		have[cell.Col] = clockCell{op.HLC, op.Site, packVal(cell.Type, cell.Val)}
 	}
-	return nil
-}
-
-func (c *capture) upsertClock(ctx context.Context, tbl string, pk []byte, col string, hlc HLC, site string, val []byte) error {
-	return c.conn.Exec(ctx,
-		`INSERT INTO main._repl_clock(tbl,pk,col,hlc,site,val) VALUES(?,?,?,?,?,?)
-		 ON CONFLICT(tbl,pk,col) DO UPDATE SET hlc=excluded.hlc, site=excluded.site, val=excluded.val`,
-		tbl, pk, col, int64(hlc), site, val)
+	rec, top := encodeRec(have)
+	return c.conn.Exec(ctx, `INSERT INTO main._repl_clock(tbl,pk,top,rec) VALUES(?,?,?,?)
+		ON CONFLICT(tbl,pk) DO UPDATE SET top=excluded.top, rec=excluded.rec`, op.Tbl, op.PK, int64(top), rec)
 }
 
 // postCommit runs after the user's transaction commits. The ops are durable, so

@@ -10,8 +10,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"slices"
+	"sync"
 	"time"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
@@ -58,8 +60,15 @@ type Transport struct {
 	topic *pubsub.Topic
 	sub   *pubsub.Subscription
 	stop  context.CancelFunc
+	ctx   context.Context // done once Close is called
 
 	pushCh chan replication.PeerOp
+
+	mu       sync.Mutex
+	closed   bool
+	idle     map[peer.ID][]*idleStream
+	ahead    map[aheadKey]*aheadPage
+	fetching sync.WaitGroup
 }
 
 var _ replication.Transport = (*Transport)(nil)
@@ -81,6 +90,7 @@ func New(ctx context.Context, h host.Host, ps *pubsub.PubSub, topicName string, 
 		proto:  ProtocolID + "/" + protocol.ID(topicName),
 		ownPS:  ps == nil,
 		stop:   stop,
+		ctx:    ctx,
 		pushCh: make(chan replication.PeerOp, 64),
 	}
 	fail := func(err error) (*Transport, error) {
@@ -120,6 +130,8 @@ func New(ctx context.Context, h host.Host, ps *pubsub.PubSub, topicName string, 
 // its own router if it made one. Other databases on the host, and the host
 // itself, are untouched.
 func (t *Transport) Close() error {
+	defer t.closeIdle()
+	defer t.fetching.Wait()
 	defer t.stop()
 	t.host.RemoveStreamHandler(t.proto)
 	t.sub.Cancel()
@@ -162,31 +174,107 @@ const (
 	streamTimeout     = 30 * time.Second
 )
 
-// call sends req to peer on a fresh stream and reads its one Response.
+// call sends req to peer and reads its one Response, on a stream an earlier
+// call left idle when there is one. A peer that answers one request a stream
+// closed that since, and the request goes again on a fresh stream; every
+// request is safe to send twice.
 func (t *Transport) call(ctx context.Context, peerID replication.PeerID, req *pb.Request) (*pb.Response, error) {
 	pid, err := peer.Decode(string(peerID))
 	if err != nil {
 		return nil, fmt.Errorf("examples/libp2p: decode peer %q: %w", peerID, err)
 	}
-	s, err := t.host.NewStream(ctx, pid, t.proto)
-	if err != nil {
-		return nil, fmt.Errorf("examples/libp2p: new stream to %s: %w", peerID, err)
+	for {
+		is := t.takeIdle(pid)
+		reused := is != nil
+		if !reused {
+			s, err := t.host.NewStream(ctx, pid, t.proto)
+			if err != nil {
+				return nil, fmt.Errorf("examples/libp2p: new stream to %s: %w", peerID, err)
+			}
+			is = &idleStream{s: s, r: bufio.NewReader(s)}
+		}
+		resp, err := is.roundTrip(req)
+		if err == nil {
+			t.putIdle(pid, is)
+			return resp, nil
+		}
+		is.s.Reset()
+		if !reused || ctx.Err() != nil {
+			return nil, fmt.Errorf("examples/libp2p: %s: %w", peerID, err)
+		}
 	}
-	defer s.Close()
-	if err := s.SetDeadline(time.Now().Add(streamTimeout)); err != nil {
-		s.Reset()
+}
+
+// idleStream is a stream to a peer, which answers requests on it in turn
+// until either side closes it (handleStream).
+type idleStream struct {
+	s     network.Stream
+	r     *bufio.Reader
+	since time.Time
+}
+
+// streamIdle is how long a stream may sit idle and still take a request: well
+// under the streamTimeout after which the peer stops waiting for one; maxIdle
+// is how many idle streams to a peer are kept.
+const (
+	streamIdle = streamTimeout / 2
+	maxIdle    = 2
+)
+
+func (is *idleStream) roundTrip(req *pb.Request) (*pb.Response, error) {
+	if err := is.s.SetDeadline(time.Now().Add(streamTimeout)); err != nil {
 		return nil, err
 	}
-	if err := writeMsg(s, req); err != nil {
-		s.Reset()
-		return nil, fmt.Errorf("examples/libp2p: write request to %s: %w", peerID, err)
+	if err := writeMsg(is.s, req); err != nil {
+		return nil, fmt.Errorf("write request: %w", err)
 	}
 	var resp pb.Response
-	if err := readOwnedMsg(bufio.NewReader(s), &resp, maxResponse); err != nil {
-		s.Reset()
-		return nil, fmt.Errorf("examples/libp2p: read response from %s: %w", peerID, err)
+	if err := readOwnedMsg(is.r, &resp, maxResponse); err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
 	}
 	return &resp, nil
+}
+
+func (t *Transport) takeIdle(pid peer.ID) *idleStream {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for l := t.idle[pid]; len(l) > 0; l = t.idle[pid] {
+		is := l[len(l)-1]
+		t.idle[pid] = l[:len(l)-1]
+		if time.Since(is.since) < streamIdle {
+			return is
+		}
+		is.s.Reset()
+	}
+	return nil
+}
+
+func (t *Transport) putIdle(pid peer.ID, is *idleStream) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed || len(t.idle[pid]) >= maxIdle {
+		is.s.Close()
+		return
+	}
+	if t.idle == nil {
+		t.idle = map[peer.ID][]*idleStream{}
+	}
+	is.since = time.Now()
+	t.idle[pid] = append(t.idle[pid], is)
+}
+
+// closeIdle closes the idle streams, and every stream a call finishes with
+// from now on.
+func (t *Transport) closeIdle() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.closed = true
+	for _, l := range t.idle {
+		for _, is := range l {
+			is.s.Close()
+		}
+	}
+	t.idle = nil
 }
 
 // ExchangeVV exchanges version vectors with peer.
@@ -203,8 +291,76 @@ func (t *Transport) ExchangeVV(ctx context.Context, peerID replication.PeerID, v
 }
 
 // GetOps retrieves from peer site's ops after fromSeq, at most limit of them
-// (the peer may send fewer).
+// (the peer may send fewer). Once it answers a full page, it asks for the next
+// one while the caller applies this one, and the next call that starts where
+// this page ends takes it.
 func (t *Transport) GetOps(ctx context.Context, peerID replication.PeerID, site string, fromSeq uint64, limit int) ([]replication.Op, error) {
+	k := aheadKey{peerID, site}
+	ops, ok := t.takeAhead(ctx, k, fromSeq, limit)
+	var err error
+	if !ok {
+		ops, err = t.getOps(ctx, peerID, site, fromSeq, limit)
+	}
+	full := limit
+	if full <= 0 || full > maxOpsPerResponse {
+		full = maxOpsPerResponse
+	}
+	if err == nil && len(ops) >= full {
+		t.fetchAhead(k, ops[len(ops)-1].Seq, limit)
+	}
+	return ops, err
+}
+
+// aheadKey names the page GetOps fetched ahead for a peer and a site.
+type aheadKey struct {
+	peer replication.PeerID
+	site string
+}
+
+type aheadPage struct {
+	from  uint64
+	limit int
+	done  chan struct{}
+	ops   []replication.Op
+	err   error
+}
+
+// takeAhead is the page fetched ahead for k when it starts at from, once it
+// has arrived; ok is false when there is none, or its fetch failed.
+func (t *Transport) takeAhead(ctx context.Context, k aheadKey, from uint64, limit int) (ops []replication.Op, ok bool) {
+	t.mu.Lock()
+	p := t.ahead[k]
+	delete(t.ahead, k)
+	t.mu.Unlock()
+	if p == nil || p.from != from || p.limit != limit {
+		return nil, false
+	}
+	select {
+	case <-p.done:
+		return p.ops, p.err == nil
+	case <-ctx.Done():
+		return nil, false
+	}
+}
+
+func (t *Transport) fetchAhead(k aheadKey, from uint64, limit int) {
+	p := &aheadPage{from: from, limit: limit, done: make(chan struct{})}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return
+	}
+	if t.ahead == nil {
+		t.ahead = map[aheadKey]*aheadPage{}
+	}
+	t.ahead[k] = p
+	t.fetching.Go(func() {
+		defer close(p.done)
+		p.ops, p.err = t.getOps(t.ctx, k.peer, k.site, from, limit)
+	})
+}
+
+func (t *Transport) getOps(ctx context.Context, peerID replication.PeerID, site string, fromSeq uint64, limit int) ([]replication.Op, error) {
 	resp, err := t.call(ctx, peerID, &pb.Request{Msg: &pb.Request_GetOps{GetOps: &pb.GetOpsRequest{Site: site, FromSeq: fromSeq, Limit: uint32(limit)}}})
 	if err != nil {
 		return nil, err
@@ -323,18 +479,37 @@ func (t *Transport) SubscribePush(ctx context.Context) (<-chan replication.PeerO
 	return out, nil
 }
 
-// handleStream answers the one Request read from s, then closes the stream.
+// handleStream answers the Requests read from s in turn, until the caller
+// closes it or sends none for streamTimeout.
 func (t *Transport) handleStream(s network.Stream) {
 	defer s.Close()
-	if err := s.SetDeadline(time.Now().Add(streamTimeout)); err != nil {
-		s.Reset()
-		return
+	r := bufio.NewReader(s)
+	for {
+		if err := s.SetDeadline(time.Now().Add(streamTimeout)); err != nil {
+			s.Reset()
+			return
+		}
+		var req pb.Request
+		if err := readMsg(r, &req, maxRequest); err != nil {
+			if !errors.Is(err, io.EOF) {
+				s.Reset()
+			}
+			return
+		}
+		resp := t.answer(&req)
+		if resp == nil {
+			s.Reset()
+			return
+		}
+		if err := writeMsg(s, resp); err != nil {
+			s.Reset()
+			return
+		}
 	}
-	var req pb.Request
-	if err := readMsg(bufio.NewReader(s), &req, maxRequest); err != nil {
-		s.Reset()
-		return
-	}
+}
+
+// answer is the Response to req, nil for a request it cannot answer.
+func (t *Transport) answer(req *pb.Request) *pb.Response {
 	var resp pb.Response
 	switch m := req.GetMsg().(type) {
 	case *pb.Request_ExchangeVv:
@@ -350,8 +525,7 @@ func (t *Transport) handleStream(s network.Stream) {
 			break
 		}
 		if err != nil {
-			s.Reset()
-			return
+			return nil
 		}
 		out := &pb.GetOpsResponse{}
 		size := 0
@@ -360,8 +534,7 @@ func (t *Transport) handleStream(s network.Stream) {
 			if size+n > maxResponse-binary.MaxVarintLen64 {
 				if len(out.Ops) == 0 {
 					log.Printf("examples/libp2p: op %s/%d is %d bytes, over the %d a response carries; it cannot sync", op.GetSite(), op.GetSeq(), n, maxResponse)
-					s.Reset()
-					return
+					return nil
 				}
 				break
 			}
@@ -375,17 +548,13 @@ func (t *Transport) handleStream(s network.Stream) {
 	case *pb.Request_GetSnapshot:
 		page, err := t.srv.SnapshotPage(context.Background(), int(m.GetSnapshot.GetPart()), m.GetSnapshot.GetCursor())
 		if err != nil {
-			s.Reset()
-			return
+			return nil
 		}
 		resp.Msg = &pb.Response_GetSnapshot{GetSnapshot: snapshotToPB(page)}
 	default:
-		s.Reset()
-		return
+		return nil
 	}
-	if err := writeMsg(s, &resp); err != nil {
-		s.Reset()
-	}
+	return &resp
 }
 
 // readGossip runs until ctx is cancelled, feeding decoded PushMessages from

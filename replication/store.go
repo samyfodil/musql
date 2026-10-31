@@ -67,9 +67,28 @@ type Store struct {
 	localUntil   atomic.Int64
 	lastLocal    atomic.Int64
 	applied      atomic.Uint64
+	// localWaiting counts the local writes waiting for the write lock and
+	// localGot those done waiting; yieldTo is the localGot an apply that
+	// yielded the lock to waiting writes waits for (waitLocal). ingestWaiting
+	// counts the ingests waiting for the write lock and ingestGot those done
+	// waiting, which a local write lets in first (waitIngest). localFree is
+	// closed when localGot or ingestGot rises or localRetries falls.
+	localWaiting  atomic.Int32
+	localGot      atomic.Uint64
+	yieldTo       atomic.Uint64
+	ingestWaiting atomic.Int32
+	ingestGot     atomic.Uint64
+	localMu       sync.Mutex
+	localFree     chan struct{}
 	// ownSeq is the highest seq of this site's that a local commit here, or the
-	// log at open, holds (capture.lastSeq).
+	// log at open, holds (capture.lastSeq). NoteLocal raises it without mu, and
+	// vv takes it in (foldOwn) wherever vv is read under mu: a local writer
+	// otherwise waited after its commit for a whole apply transaction.
 	ownSeq atomic.Uint64
+	// anyHeld is whether mayHold has a table at all, read without mu.
+	anyHeld atomic.Bool
+	// group gathers concurrent Ingest calls into one transaction (Ingest).
+	group ingestGroup
 }
 
 // begin starts a store transaction: BEGIN IMMEDIATE on a connection of the
@@ -164,7 +183,7 @@ func OpenStore(ctx context.Context, db *sql.DB, site string) (*Store, error) {
 	// log's, which holds the schema ops, and the clock's, which holds the cells
 	// of row ops long pruned from the log.
 	var maxHLC sql.NullInt64
-	if err := db.QueryRowContext(ctx, `SELECT max(h) FROM (SELECT max(hlc) AS h FROM main._repl_oplog UNION ALL SELECT max(hlc) FROM main._repl_clock)`).Scan(&maxHLC); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT max(h) FROM (SELECT max(hlc) AS h FROM main._repl_oplog UNION ALL SELECT max(top) FROM main._repl_clock)`).Scan(&maxHLC); err != nil {
 		return nil, err
 	}
 	if maxHLC.Valid {
@@ -180,13 +199,26 @@ func (s *Store) Site() string { return s.site }
 // a captured local write has committed its oplog rows out of band (in the user's
 // transaction, on a different connection).
 func (s *Store) NoteLocal(site string, seq uint64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if seq > s.vv[site] {
-		s.vv[site] = seq
+	if site != s.site {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if seq > s.vv[site] {
+			s.vv[site] = seq
+		}
+		return
 	}
-	if site == s.site && seq > s.ownSeq.Load() {
-		s.ownSeq.Store(seq)
+	for {
+		own := s.ownSeq.Load()
+		if seq <= own || s.ownSeq.CompareAndSwap(own, seq) {
+			return
+		}
+	}
+}
+
+// foldOwn takes the local commits NoteLocal noted into vv. Called with mu held.
+func (s *Store) foldOwn() {
+	if own := s.ownSeq.Load(); own > s.vv[s.site] {
+		s.vv[s.site] = own
 	}
 }
 
@@ -197,6 +229,7 @@ func (s *Store) Clock() *Clock { return s.clock }
 func (s *Store) LocalVV() VersionVector {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.foldOwn()
 	return s.vv.Clone()
 }
 
@@ -245,6 +278,7 @@ func (s *Store) OpsSince(ctx context.Context, site string, fromSeq uint64, limit
 // pruned meanwhile), and returns none when there is none to read.
 func (s *Store) opsUpTo(ctx context.Context, site string, fromSeq uint64, limit int) ([]Op, error) {
 	s.mu.Lock()
+	s.foldOwn()
 	top := s.vv[site]
 	s.mu.Unlock()
 	if top <= fromSeq {
@@ -296,9 +330,92 @@ func scanOp(r interface{ Scan(...any) error }) (Op, error) {
 // clock cells it wins, the rows it rewrites and -- for a schema op -- the tables
 // it drops and rebuilds either all land or none do, so a failure part-way leaves
 // the op un-recorded and the next delivery redoes it from the start.
+//
+// GROUP COMMIT: an Ingest that arrives while another is applying waits, and
+// the next transaction applies every op that queued meanwhile -- one commit,
+// one sync to disk, for all of them. A call that finds nothing applying leads
+// at once, so an idle receiver waits for nothing. Each call still returns only
+// once its own op is durable, or refused.
 func (s *Store) Ingest(ctx context.Context, op Op, local bool) error {
-	_, err := s.ingest(ctx, []Op{op}, local)
-	return err
+	g := &s.group
+	c := &ingestCall{op: op, local: local, done: make(chan error, 1)}
+	g.mu.Lock()
+	g.queue = append(g.queue, c)
+	lead := !g.running
+	g.running = true
+	g.mu.Unlock()
+	if !lead {
+		if err := <-c.done; err != errIngestLead {
+			return err
+		}
+	}
+	g.mu.Lock()
+	calls := g.queue
+	g.queue = nil
+	g.mu.Unlock()
+	s.applyCalls(ctx, calls)
+	// The oldest call that queued meanwhile leads the next transaction, so
+	// none waits on a leader that has gone back to its caller.
+	g.mu.Lock()
+	if len(g.queue) > 0 {
+		g.queue[0].done <- errIngestLead
+	} else {
+		g.running = false
+	}
+	g.mu.Unlock()
+	return <-c.done
+}
+
+// ingestGroup is the Ingest calls waiting for the next transaction, and
+// whether one is leading it (Ingest).
+type ingestGroup struct {
+	mu      sync.Mutex
+	running bool
+	queue   []*ingestCall
+}
+
+// ingestCall is one Ingest waiting for its op's transaction: done gets its
+// result, or errIngestLead when it is to lead the next one.
+type ingestCall struct {
+	op    Op
+	local bool
+	done  chan error
+}
+
+var errIngestLead = errors.New("replication: lead the next ingest")
+
+// applyCalls applies the queued calls' ops in order, a run of one local flag
+// to a transaction (ingestAllAs), and hands each call its result: an op that
+// is refused gets its error, and the ops after it still apply. The leader's
+// cancellation does not end the others' transaction: begin ignores it too.
+func (s *Store) applyCalls(ctx context.Context, calls []*ingestCall) {
+	ctx = context.WithoutCancel(ctx)
+	for len(calls) > 0 {
+		n := 1
+		for n < len(calls) && calls[n].local == calls[0].local {
+			n++
+		}
+		run := calls[:n]
+		calls = calls[n:]
+		ops := make([]Op, len(run))
+		for i, c := range run {
+			ops[i] = c.op
+		}
+		for len(run) > 0 {
+			k, err := s.ingestAllAs(ctx, ops, run[0].local)
+			if err == nil || k < 0 {
+				for _, c := range run {
+					c.done <- err
+				}
+				break
+			}
+			for _, c := range run[:k] {
+				c.done <- nil
+			}
+			run[k].done <- err
+			run, ops = run[k+1:], ops[k+1:]
+		}
+	}
 }
 
 // ingestAll applies ops in order, as Ingest one at a time would, a few
@@ -306,9 +423,14 @@ func (s *Store) Ingest(ctx context.Context, op Op, local bool) error {
 // returns k and that error, with ops[:k] applied and the rest not tried; on an
 // error no op caused, -1, and the ops before it may have applied.
 func (s *Store) ingestAll(ctx context.Context, ops []Op) (int, error) {
+	return s.ingestAllAs(ctx, ops, false)
+}
+
+// ingestAllAs is ingestAll for ops that are all local, or all not (Ingest).
+func (s *Store) ingestAllAs(ctx context.Context, ops []Op, local bool) (int, error) {
 	done := 0
 	for done < len(ops) {
-		n, err := s.ingest(ctx, ops[done:], false)
+		n, err := s.ingest(ctx, ops[done:], local)
 		switch {
 		case err == nil:
 			done += n
@@ -317,7 +439,7 @@ func (s *Store) ingestAll(ctx context.Context, ops []Op) (int, error) {
 			return -1, err
 		case n > 0:
 			// The refused op rolled back the ones before it, which apply alone.
-			if _, perr := s.ingestAll(ctx, ops[done:done+n]); perr != nil {
+			if _, perr := s.ingestAllAs(ctx, ops[done:done+n], local); perr != nil {
 				return -1, perr
 			}
 		}
@@ -334,6 +456,13 @@ const (
 	maxHold    = 50 * time.Millisecond
 	holdAlone  = 500 * time.Millisecond
 	localQuiet = time.Second
+	// yieldHold is how long an ingest holds the lock, at least, once a local
+	// write waits for it (localWaiting). Each turn costs the ingest more than
+	// its commit: the writers then take the lock in turn, and each catches up
+	// with what the ingest applied first. Beside two writers, 10 ms left the
+	// ingest a fifth of the lock (1,700 ops/s, 45 writes/s on .10); 30 ms, a
+	// third (4,000 ops/s, 21 writes/s).
+	yieldHold = 30 * time.Millisecond
 )
 
 // hold is how long an ingest may hold the write lock now.
@@ -352,10 +481,27 @@ func (s *Store) localCommitted() { s.lastLocal.Store(time.Now().UnixNano()) }
 // being retried: the driver re-runs an autocommit statement whole, and one
 // longer than the gap between two applies would otherwise never commit. It
 // waits at most as long as the driver retries (engine.BusyTimeout) from the
-// first failure.
+// first failure. After an apply yielded the lock to local writes waiting for
+// it (ingestTx), it also waits for each of them to have taken it: the apply
+// would otherwise take the lock back the moment it let go of it, ahead of
+// writers that had waited through its whole transaction. Writes that start
+// waiting later wait for the next yield. That wait is bounded the same way.
 func (s *Store) waitLocal() {
-	for s.localRetries.Load() > 0 && time.Now().UnixNano() < s.localUntil.Load() {
-		time.Sleep(time.Millisecond)
+	until := time.Now().Add(engine.BusyTimeout)
+	for {
+		free := s.localChange()
+		left := time.Until(time.Unix(0, s.localUntil.Load()))
+		if s.localRetries.Load() <= 0 || left <= 0 {
+			if left = time.Until(until); s.localGot.Load() >= s.yieldTo.Load() || left <= 0 {
+				return
+			}
+		}
+		t := time.NewTimer(left)
+		select {
+		case <-free:
+		case <-t.C:
+		}
+		t.Stop()
 	}
 }
 
@@ -365,7 +511,66 @@ func (s *Store) localFailed() {
 	s.localRetries.Add(1)
 }
 
-func (s *Store) localDone() { s.localRetries.Add(-1) }
+func (s *Store) localDone() {
+	s.localRetries.Add(-1)
+	s.wakeLocal()
+}
+
+// waitIngest lets an ingest waiting for the write lock take it ahead of a
+// local write, waiting at most holdAlone. The lock is not handed over in turn:
+// a writer committing back to back took it back each time before the waiting
+// ingest woke, and its ops waited seconds.
+func (s *Store) waitIngest() {
+	got, until := s.ingestGot.Load(), time.Now().Add(holdAlone)
+	for {
+		free := s.localChange()
+		left := time.Until(until)
+		if s.ingestWaiting.Load() <= 0 || s.ingestGot.Load() != got || left <= 0 {
+			return
+		}
+		t := time.NewTimer(left)
+		select {
+		case <-free:
+		case <-t.C:
+		}
+		t.Stop()
+	}
+}
+
+// ingestWaits reports whether an ingest waits for the write lock (capture).
+func (s *Store) ingestWaits() bool { return s.ingestWaiting.Load() > 0 }
+
+// localLockWait brackets a local write's wait for the write lock (capture).
+func (s *Store) localLockWait(waiting bool) {
+	if waiting {
+		s.localWaiting.Add(1)
+		s.waitIngest()
+		return
+	}
+	s.localGot.Add(1)
+	s.localWaiting.Add(-1)
+	s.wakeLocal()
+}
+
+// localChange is the channel wakeLocal closes next.
+func (s *Store) localChange() chan struct{} {
+	s.localMu.Lock()
+	defer s.localMu.Unlock()
+	if s.localFree == nil {
+		s.localFree = make(chan struct{})
+	}
+	return s.localFree
+}
+
+// wakeLocal wakes waitLocal and waitIngest to look again.
+func (s *Store) wakeLocal() {
+	s.localMu.Lock()
+	if s.localFree != nil {
+		close(s.localFree)
+		s.localFree = nil
+	}
+	s.localMu.Unlock()
+}
 
 // ingest applies ops, from the first, in one transaction, until they are done
 // or it has held the write lock for maxHold, and reports how many it took. On
@@ -375,21 +580,44 @@ func (s *Store) ingest(ctx context.Context, ops []Op, local bool) (int, error) {
 	s.waitLocal()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.foldOwn()
 
 	if s.held(ctx, ops) {
 		return len(ops), nil
 	}
+	n, err := s.ingestOnce(ctx, ops, local, true)
+	if errors.Is(err, errRunRefused) {
+		// Which op the run failed on is not known: they apply again one at a
+		// time, which finds it and applies the ones before it.
+		n, err = s.ingestOnce(ctx, ops, local, false)
+	}
+	return n, err
+}
+
+// errRunRefused is ingestOnce's answer for a batch transaction that failed and
+// rolled back.
+var errRunRefused = errors.New("replication: a run of ops was refused")
+
+// ingestOnce is ingest's transaction, with ingestTx's batch.
+func (s *Store) ingestOnce(ctx context.Context, ops []Op, local, batch bool) (int, error) {
+	s.ingestWaiting.Add(1)
 	tx, err := s.begin(ctx)
+	s.ingestGot.Add(1)
+	s.ingestWaiting.Add(-1)
+	s.wakeLocal()
 	if err != nil {
 		return -1, err
 	}
 	s.q, s.txHeld = tx, map[string]bool{}
 	cat, ver := s.cat, s.ver
-	added, n, err := s.ingestTx(ctx, ops, local)
+	added, n, err := s.ingestTx(ctx, ops, local, batch)
 	s.q, s.txHeld = s.db, nil
 	if err != nil {
 		tx.Rollback()
 		s.cat, s.ver = cat, ver
+		if batch {
+			return 0, errRunRefused
+		}
 		return n, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -426,18 +654,30 @@ func (s *Store) held(ctx context.Context, ops []Op) bool {
 }
 
 // ingestTx is ingest's transaction: the seqs it added to the log, by site, and
-// how many ops it took, or the index of the op refused.
-func (s *Store) ingestTx(ctx context.Context, ops []Op, local bool) (map[string]map[uint64]bool, int, error) {
+// how many ops it took, or the index of the op refused. With batch, the data
+// ops between two schema ops merge a run at a time (applyOps), and an error
+// names no op.
+func (s *Store) ingestTx(ctx context.Context, ops []Op, local, batch bool) (map[string]map[uint64]bool, int, error) {
 	// A local capture may have changed the schema since this store last looked;
 	// none can while the transaction holds the write lock.
 	if err := s.syncCatalog(ctx); err != nil {
 		return nil, -1, err
 	}
 	added := map[string]map[uint64]bool{}
+	var run []Op
+	flush := func() error {
+		err := s.applyOps(ctx, run, local)
+		run = run[:0]
+		return err
+	}
 	start, hold := time.Now(), s.hold()
 	for i, op := range ops {
 		if i > 0 && time.Since(start) > hold {
-			return added, i, nil
+			return added, i, flush()
+		}
+		if w := s.localWaiting.Load(); i > 0 && w > 0 && time.Since(start) > yieldHold {
+			s.yieldTo.Store(s.localGot.Load() + uint64(w))
+			return added, i, flush()
 		}
 		if op.Seq <= s.floors[op.Site] && op.Kind != OpSchema {
 			// Pruned here: applied long ago, and everywhere. A schema op is never
@@ -469,11 +709,23 @@ func (s *Store) ingestTx(ctx context.Context, ops []Op, local bool) (map[string]
 			added[op.Site] = map[uint64]bool{}
 		}
 		added[op.Site][op.Seq] = true
+		if batch && op.Kind != OpSchema {
+			if run = append(run, op); len(run) < applyRunMax {
+				continue
+			}
+			if err := flush(); err != nil {
+				return nil, i, err
+			}
+			continue
+		}
+		if err := flush(); err != nil { // a schema op applies after every op before it
+			return nil, i, err
+		}
 		if err := s.applyOp(ctx, op, local); err != nil {
 			return nil, i, err
 		}
 	}
-	return added, len(ops), nil
+	return added, len(ops), flush()
 }
 
 // applyOp applies op, already in the log, to the clock and the user tables.
@@ -497,7 +749,7 @@ func (s *Store) applyOp(ctx context.Context, op Op, local bool) error {
 	return s.materializeRowFrom(ctx, s.cat, op.Tbl, op.PK, have)
 }
 
-// clockCell is one _repl_clock cell of a row.
+// clockCell is one cell of a row's clock record.
 type clockCell struct {
 	hlc  HLC
 	site string
@@ -505,45 +757,37 @@ type clockCell struct {
 }
 
 // mergeOp merges op's presence and cells into the clock, each iff op is a
-// strictly newer writer than the cell's, by the (hlc, site) total order -- as
-// mergeCell does one cell, in a statement or three for the row: one read of
-// its cells, an insert of those the clock had none of, an upsert of those op
-// wins. It returns the row's cells after.
+// strictly newer writer than the cell's, by the (hlc, site) total order: one
+// read of the row's record and, when op won a cell of it, one write. It
+// returns the row's cells after.
 func (s *Store) mergeOp(ctx context.Context, op Op) (map[string]clockCell, error) {
-	rows, err := s.q.QueryContext(ctx, `SELECT col, hlc, site, val FROM main._repl_clock WHERE tbl=? AND pk=?`, op.Tbl, op.PK)
+	have, err := s.clockCells(ctx, op.Tbl, op.PK)
 	if err != nil {
 		return nil, err
 	}
-	have := map[string]clockCell{}
-	for rows.Next() {
-		var col string
-		var c clockCell
-		var hlc int64
-		if err := rows.Scan(&col, &hlc, &c.site, &c.val); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		c.hlc = HLC(hlc)
-		have[col] = c
+	had := len(have) > 0
+	if !mergeInto(have, op) {
+		return have, nil
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	// A plain INSERT of the cells the clock has none of: an upsert's conflict
-	// handling costs the engine several times an insert's.
-	var fresh, won []any
+	fresh, won := recArgs(nil, nil, op.Tbl, op.PK, have, had)
+	return have, s.writeRecs(ctx, fresh, won)
+}
+
+// clockCells is the clock's cells of tbl's row pk, by column.
+func (s *Store) clockCells(ctx context.Context, tbl string, pk []byte) (map[string]clockCell, error) {
+	return readRec(ctx, s.q, tbl, pk)
+}
+
+// mergeInto merges op's presence and cells into have, each iff op is a
+// strictly newer writer than the cell's, and reports whether it took any.
+func mergeInto(have map[string]clockCell, op Op) bool {
+	took := false
 	merge := func(col string, val []byte) {
-		c, ok := have[col]
-		if ok && !TagLess(c.hlc, c.site, op.HLC, op.Site) {
+		if c, ok := have[col]; ok && !TagLess(c.hlc, c.site, op.HLC, op.Site) {
 			return // the existing writer wins
 		}
 		have[col] = clockCell{op.HLC, op.Site, val}
-		if ok {
-			won = append(won, op.Tbl, op.PK, col, int64(op.HLC), op.Site, val)
-		} else {
-			fresh = append(fresh, op.Tbl, op.PK, col, int64(op.HLC), op.Site, val)
-		}
+		took = true
 	}
 	pval := byte(1)
 	if op.Kind == OpDelete {
@@ -553,47 +797,120 @@ func (s *Store) mergeOp(ctx context.Context, op Op) (map[string]clockCell, error
 	for _, c := range op.Cells {
 		merge(c.Col, packVal(c.Type, c.Val))
 	}
-	const cols = `INSERT INTO main._repl_clock(tbl,pk,col,hlc,site,val) VALUES `
-	if len(fresh) > 0 {
-		if _, err := s.q.ExecContext(ctx, cols+strings.TrimSuffix(strings.Repeat(`(?,?,?,?,?,?),`, len(fresh)/6), ","), fresh...); err != nil {
-			return nil, err
+	return took
+}
+
+// recsPerStmt is the most clock records one statement of writeRecs writes.
+const recsPerStmt = 128
+
+// writeRecs writes clock records, four arguments each (recArgs): a plain
+// INSERT of those the clock has none of -- an upsert's conflict handling
+// costs the engine several times an insert's -- and an upsert of those it has.
+func (s *Store) writeRecs(ctx context.Context, fresh, won []any) error {
+	const insert = `INSERT INTO main._repl_clock(tbl,pk,top,rec) VALUES `
+	const update = ` ON CONFLICT(tbl,pk) DO UPDATE SET top=excluded.top, rec=excluded.rec`
+	for _, w := range []struct {
+		args []any
+		tail string
+	}{{fresh, ""}, {won, update}} {
+		for args := w.args; len(args) > 0; {
+			n := min(len(args)/4, recsPerStmt)
+			if _, err := s.q.ExecContext(ctx, insert+strings.TrimSuffix(strings.Repeat(`(?,?,?,?),`, n), ",")+w.tail, args[:4*n]...); err != nil {
+				return err
+			}
+			args = args[4*n:]
 		}
 	}
-	if len(won) > 0 {
-		if _, err := s.q.ExecContext(ctx, cols+strings.TrimSuffix(strings.Repeat(`(?,?,?,?,?,?),`, len(won)/6), ",")+
-			` ON CONFLICT(tbl,pk,col) DO UPDATE SET hlc=excluded.hlc, site=excluded.site, val=excluded.val`, won...); err != nil {
-			return nil, err
+	return nil
+}
+
+// applyRunMax is the most data ops ingestTx merges in one run (applyOps).
+const applyRunMax = 256
+
+// applyOps is applyOp for a run of data ops, each in the log already. Every
+// row's ops merge into its clock cells in memory, and the cells that changed
+// are written once for the whole run, many to a statement; then every row that
+// changed is written once. A table that holds rows out, or refuses one of
+// them a UNIQUE value, is rebuilt once, after the rest -- from the clock alone,
+// as every node rebuilds it.
+func (s *Store) applyOps(ctx context.Context, ops []Op, local bool) error {
+	if len(ops) == 0 {
+		return nil
+	}
+	type key struct{ tbl, pk string }
+	var keys []key
+	byKey := map[key][]Op{}
+	for _, op := range ops {
+		k := key{op.Tbl, string(op.PK)}
+		if _, ok := byKey[k]; !ok {
+			keys = append(keys, k)
+		}
+		byKey[k] = append(byKey[k], op)
+	}
+	var fresh, won []any
+	changed := map[key]map[string]clockCell{}
+	for _, k := range keys {
+		pk := []byte(k.pk)
+		have, err := s.clockCells(ctx, k.tbl, pk)
+		if err != nil {
+			return err
+		}
+		had, took := len(have) > 0, false
+		for _, op := range byKey[k] {
+			took = mergeInto(have, op) || took
+		}
+		if took {
+			fresh, won = recArgs(fresh, won, k.tbl, pk, have, had)
+			changed[k] = have
 		}
 	}
-	return have, nil
+	if err := s.writeRecs(ctx, fresh, won); err != nil || local {
+		return err
+	}
+	var rebuild []string
+	for _, k := range keys {
+		have, ok := changed[k]
+		if !ok || slices.Contains(rebuild, k.tbl) {
+			continue
+		}
+		t := s.cat.byID(k.tbl)
+		if t == nil || t.Type != "table" {
+			continue
+		}
+		conflict, err := s.heldInTx(ctx, k.tbl)
+		if err == nil && !conflict {
+			conflict, err = s.writeRow(ctx, t, []byte(k.pk), true, have)
+		}
+		if err != nil {
+			return err
+		}
+		if conflict {
+			rebuild = append(rebuild, k.tbl)
+		}
+	}
+	for _, tbl := range rebuild {
+		if err := s.rebuildTable(ctx, s.cat.byID(tbl)); err != nil {
+			return err
+		}
+		delete(s.txHeld, tbl) // the rebuild may have held rows out
+	}
+	return nil
 }
 
 // mergeCell writes (hlc, site, val) for a cell iff it is a strictly newer writer
 // than what the clock holds, by the (hlc, site) total order.
 func (s *Store) mergeCell(ctx context.Context, tbl string, pk []byte, col string, hlc HLC, site string, val []byte) error {
-	var (
-		eHLC  int64
-		eSite string
-	)
-	err := s.q.QueryRowContext(ctx,
-		`SELECT hlc, site FROM main._repl_clock WHERE tbl=? AND pk=? AND col=?`, tbl, pk, col).Scan(&eHLC, &eSite)
-	switch err {
-	case sql.ErrNoRows:
-		_, err = s.q.ExecContext(ctx,
-			`INSERT INTO main._repl_clock(tbl,pk,col,hlc,site,val) VALUES(?,?,?,?,?,?)`,
-			tbl, pk, col, int64(hlc), site, val)
-		return err
-	case nil:
-		if TagLess(HLC(eHLC), eSite, hlc, site) {
-			_, err = s.q.ExecContext(ctx,
-				`UPDATE main._repl_clock SET hlc=?, site=?, val=? WHERE tbl=? AND pk=? AND col=?`,
-				int64(hlc), site, val, tbl, pk, col)
-			return err
-		}
-		return nil // existing writer wins; discard
-	default:
+	have, err := s.clockCells(ctx, tbl, pk)
+	if err != nil {
 		return err
 	}
+	if c, ok := have[col]; ok && !TagLess(c.hlc, c.site, hlc, site) {
+		return nil // existing writer wins; discard
+	}
+	had := len(have) > 0
+	have[col] = clockCell{hlc, site, val}
+	fresh, won := recArgs(nil, nil, tbl, pk, have, had)
+	return s.writeRecs(ctx, fresh, won)
 }
 
 // syncCatalog reloads the installed catalog if a capture on another
@@ -640,15 +957,9 @@ func (s *Store) materializeRowFrom(ctx context.Context, cat *catalog, tblID stri
 	if t == nil || t.Type != "table" {
 		return nil
 	}
-	held, ok := s.txHeld[tblID]
-	if !ok {
-		var err error
-		if held, err = s.holdsOut(ctx, tblID); err != nil {
-			return err
-		}
-		if s.txHeld != nil {
-			s.txHeld[tblID] = held
-		}
+	held, err := s.heldInTx(ctx, tblID)
+	if err != nil {
+		return err
 	}
 	if held {
 		return s.rebuildTable(ctx, t)
@@ -682,26 +993,14 @@ func (s *Store) writeRow(ctx context.Context, t *object, pk []byte, del bool, ha
 		}
 	}
 
-	var cells map[string]typedVal
 	if have == nil {
-		alive, known, err := s.presence(ctx, t.ID, pk)
-		if err != nil || !known || !alive {
+		if have, err = s.clockCells(ctx, t.ID, pk); err != nil {
 			return false, err
 		}
-		if cells, err = s.liveCells(ctx, t.ID, pk); err != nil {
-			return false, err
-		}
-	} else {
-		if p, ok := have[presenceCol]; !ok || len(p.val) == 0 || p.val[0] != 1 {
-			return false, nil
-		}
-		cells = make(map[string]typedVal, len(have))
-		for col, c := range have {
-			if col != presenceCol {
-				typ, raw := unpackVal(c.val)
-				cells[col] = typedVal{typ, raw}
-			}
-		}
+	}
+	cells, alive := liveCells(have)
+	if !alive {
+		return false, nil
 	}
 	colNames, args, ok := rowValues(t, keyNames, keyVals, cells)
 	if !ok {
@@ -796,22 +1095,28 @@ func (s *Store) rebuildTable(ctx context.Context, t *object) error {
 	}
 	// Each row's latest cell; the site breaks an HLC tie, as it does everywhere
 	// else (TagLess).
-	rows, err := s.q.QueryContext(ctx, `SELECT pk, hlc, site FROM main._repl_clock WHERE tbl=? ORDER BY pk`, t.ID)
+	rows, err := s.q.QueryContext(ctx, `SELECT pk, rec FROM main._repl_clock WHERE tbl=?`, t.ID)
 	if err != nil {
 		return err
 	}
 	var all []stamp
 	for rows.Next() {
 		var st stamp
-		if err := rows.Scan(&st.pk, &st.hlc, &st.site); err != nil {
+		var rec []byte
+		if err := rows.Scan(&st.pk, &rec); err != nil {
 			rows.Close()
 			return err
 		}
-		if n := len(all); n > 0 && bytes.Equal(all[n-1].pk, st.pk) {
-			if TagLess(HLC(all[n-1].hlc), all[n-1].site, HLC(st.hlc), st.site) {
-				all[n-1] = st
+		cells, err := decodeRec(rec)
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		first := true
+		for _, c := range cells {
+			if first || TagLess(HLC(st.hlc), st.site, c.hlc, c.site) {
+				st.hlc, st.site, first = int64(c.hlc), c.site, false
 			}
-			continue
 		}
 		all = append(all, st)
 	}
@@ -848,8 +1153,24 @@ func (s *Store) holdOut(ctx context.Context, tbl string, pk []byte) error {
 	if s.txHeld != nil {
 		s.txHeld[tbl] = true
 	}
+	s.anyHeld.Store(true)
 	_, err := s.q.ExecContext(ctx, `INSERT INTO main._repl_withheld(tbl, pk) VALUES(?, ?)`, tbl, pk)
 	return err
+}
+
+// heldInTx is holdsOut, asked once per table in an ingest's transaction.
+func (s *Store) heldInTx(ctx context.Context, tbl string) (bool, error) {
+	held, ok := s.txHeld[tbl]
+	if !ok {
+		var err error
+		if held, err = s.holdsOut(ctx, tbl); err != nil {
+			return false, err
+		}
+		if s.txHeld != nil {
+			s.txHeld[tbl] = held
+		}
+	}
+	return held, nil
 }
 
 // holdsOut reports whether tbl has a row held out.
@@ -875,6 +1196,7 @@ func (s *Store) loadHeld(ctx context.Context) error {
 			return err
 		}
 		s.mayHold[tbl] = true
+		s.anyHeld.Store(true)
 	}
 	return rows.Err()
 }
@@ -888,18 +1210,24 @@ func (s *Store) rewriteRows(ctx context.Context, t *object) error {
 	if err != nil {
 		return err
 	}
-	rows, err := s.q.QueryContext(ctx, `SELECT pk, col, val FROM main._repl_clock WHERE tbl=? ORDER BY pk`, t.ID)
+	rows, err := s.q.QueryContext(ctx, `SELECT pk, rec FROM main._repl_clock WHERE tbl=? ORDER BY pk`, t.ID)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	b := rowBatch{s: s, t: t, keyNames: keyNames}
-	var pk []byte
-	alive := false
-	cells := map[string]typedVal{}
-	row := func() error {
-		if pk == nil || !alive {
-			return nil
+	for rows.Next() {
+		var pk, rec []byte
+		if err := rows.Scan(&pk, &rec); err != nil {
+			return err
+		}
+		have, err := decodeRec(rec)
+		if err != nil {
+			return err
+		}
+		cells, alive := liveCells(have)
+		if !alive {
+			continue
 		}
 		keyVals, err := decodeKey(pk, len(keyNames))
 		if err != nil {
@@ -907,34 +1235,13 @@ func (s *Store) rewriteRows(ctx context.Context, t *object) error {
 		}
 		cols, args, ok := rowValues(t, keyNames, keyVals, cells)
 		if !ok {
-			return nil
-		}
-		return b.add(ctx, pk, cols, args)
-	}
-	for rows.Next() {
-		var rpk, val []byte
-		var col string
-		if err := rows.Scan(&rpk, &col, &val); err != nil {
-			return err
-		}
-		if !bytes.Equal(rpk, pk) {
-			if err := row(); err != nil {
-				return err
-			}
-			pk, alive = rpk, false
-			clear(cells)
-		}
-		if col == presenceCol {
-			alive = len(val) > 0 && val[0] == 1
 			continue
 		}
-		typ, raw := unpackVal(val)
-		cells[col] = typedVal{typ, raw}
+		if err := b.add(ctx, pk, cols, args); err != nil {
+			return err
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return err
-	}
-	if err := row(); err != nil {
 		return err
 	}
 	return b.flush(ctx)
@@ -1018,6 +1325,9 @@ func (b *rowBatch) flush(ctx context.Context) error {
 // UNIQUE conflict: a local commit may have freed the value, and the next remote
 // op to the table may be a long way off.
 func (s *Store) rebuildHeld(ctx context.Context, tblIDs []string) error {
+	if !s.anyHeld.Load() {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// A table with no row held out needs no transaction, which every local
@@ -1065,43 +1375,25 @@ func (s *Store) rebuildHeld(ctx context.Context, tblIDs []string) error {
 
 // --- clock reads ---
 
-func (s *Store) presence(ctx context.Context, tbl string, pk []byte) (alive, known bool, err error) {
-	var val []byte
-	err = s.q.QueryRowContext(ctx,
-		`SELECT val FROM main._repl_clock WHERE tbl=? AND pk=? AND col=?`, tbl, pk, presenceCol).Scan(&val)
-	switch err {
-	case sql.ErrNoRows:
-		return false, false, nil
-	case nil:
-		return len(val) > 0 && val[0] == 1, true, nil
-	default:
-		return false, false, err
-	}
-}
-
 type typedVal struct {
 	typ byte
 	raw []byte
 }
 
-func (s *Store) liveCells(ctx context.Context, tbl string, pk []byte) (map[string]typedVal, error) {
-	rows, err := s.q.QueryContext(ctx,
-		`SELECT col, val FROM main._repl_clock WHERE tbl=? AND pk=? AND col<>?`, tbl, pk, presenceCol)
-	if err != nil {
-		return nil, err
+// liveCells is a row's cells but its presence, and whether that says the row
+// is there: false for a deleted row and for one the clock does not know.
+func liveCells(have map[string]clockCell) (map[string]typedVal, bool) {
+	if p, ok := have[presenceCol]; !ok || len(p.val) == 0 || p.val[0] != 1 {
+		return nil, false
 	}
-	defer rows.Close()
-	out := map[string]typedVal{}
-	for rows.Next() {
-		var col string
-		var val []byte
-		if err := rows.Scan(&col, &val); err != nil {
-			return nil, err
+	cells := make(map[string]typedVal, len(have))
+	for col, c := range have {
+		if col != presenceCol {
+			typ, raw := unpackVal(c.val)
+			cells[col] = typedVal{typ, raw}
 		}
-		typ, raw := unpackVal(val)
-		out[col] = typedVal{typ, raw}
 	}
-	return out, rows.Err()
+	return cells, true
 }
 
 // --- rowid ranges ---
@@ -1601,24 +1893,14 @@ func Withheld(ctx context.Context, db *sql.DB) ([]WithheldRow, error) {
 			return nil, err
 		}
 		w := WithheldRow{Table: t.Name, Key: key, Row: map[string]any{}}
-		cells, err := db.QueryContext(ctx, `SELECT col, val FROM main._repl_clock WHERE tbl=? AND pk=? AND col<>?`, h.tbl, h.pk, presenceCol)
+		cells, err := readRec(ctx, db, h.tbl, h.pk)
 		if err != nil {
 			return nil, err
 		}
-		for cells.Next() {
-			var col string
-			var val []byte
-			if err := cells.Scan(&col, &val); err != nil {
-				cells.Close()
-				return nil, err
+		for col, cell := range cells {
+			if c := t.col(col); c != nil && col != presenceCol {
+				w.Row[c.Name] = driverValue(unpackVal(cell.val))
 			}
-			if c := t.col(col); c != nil {
-				w.Row[c.Name] = driverValue(unpackVal(val))
-			}
-		}
-		cells.Close()
-		if err := cells.Err(); err != nil {
-			return nil, err
 		}
 		for i, kc := range t.keyCols() {
 			w.Row[kc.Name] = key[i]

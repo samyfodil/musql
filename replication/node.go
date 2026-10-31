@@ -3,6 +3,8 @@ package replication
 import (
 	"context"
 	"log"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -23,6 +25,9 @@ type Node struct {
 	// synced is set by the first Sync round that reached a peer and left this
 	// node holding all every peer it reached held.
 	synced atomic.Bool
+	// pushq, while Run runs, takes Broadcast's ops to the goroutine that
+	// pushes them.
+	pushq atomic.Pointer[chan []Op]
 }
 
 // NewNode creates a Node over an already-open Store and Transport. The local
@@ -81,8 +86,53 @@ func (n *Node) LocalWrite(ctx context.Context, op Op) error {
 }
 
 // Broadcast pushes already-committed local ops to every current peer,
-// best-effort. Peers that miss the push converge later via Sync.
+// best-effort. Peers that miss the push converge later via Sync. While Run
+// runs, the ops go to its pusher, which gathers what commits make for
+// pushWindow into one push; when it is behind, they go at once.
 func (n *Node) Broadcast(ops []Op) {
+	if q := n.pushq.Load(); q != nil {
+		select {
+		case *q <- slices.Clone(ops):
+			return
+		default:
+		}
+	}
+	n.push(ops)
+}
+
+// pushWindow is how long Run's pusher gathers ops after the first before it
+// pushes them.
+const pushWindow = 2 * time.Millisecond
+
+// pushOut pushes what Broadcast hands it, gathering ops for pushWindow or
+// maxPushBatch of them, until ctx is cancelled.
+func (n *Node) pushOut(ctx context.Context, q chan []Op) {
+	for {
+		var ops []Op
+		select {
+		case <-ctx.Done():
+			return
+		case ops = <-q:
+		}
+		t := time.NewTimer(pushWindow)
+	gather:
+		for len(ops) < maxPushBatch {
+			select {
+			case more := <-q:
+				ops = append(ops, more...)
+			case <-t.C:
+				break gather
+			case <-ctx.Done():
+				t.Stop()
+				return
+			}
+		}
+		t.Stop()
+		n.push(ops)
+	}
+}
+
+func (n *Node) push(ops []Op) {
 	if n.tr == nil {
 		return
 	}
@@ -177,23 +227,39 @@ func (n *Node) Sync(ctx context.Context) error {
 // Run drives the node until ctx is cancelled: it applies ops pushed by peers as
 // they arrive and runs a full anti-entropy Sync every syncInterval. It works
 // with any Transport (in-memory or libp2p), using only the Transport interface.
+//
+// Pushed ops apply on a goroutine of their own: a Sync round waits on each
+// peer in turn, and the pushes queued behind it waited as long.
 func (n *Node) Run(ctx context.Context, syncInterval time.Duration) error {
 	ch, err := n.tr.SubscribePush(ctx)
 	if err != nil {
 		return err
 	}
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	q := make(chan []Op, maxPushBatch)
+	n.pushq.Store(&q)
+	defer n.pushq.Store(nil)
+	wg.Go(func() { n.pushOut(ctx, q) })
+	wg.Go(func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case po, ok := <-ch:
+				if !ok {
+					return // push stream closed; rely on periodic Sync
+				}
+				n.applyPushed(ctx, drain(ch, po.Op))
+			}
+		}
+	})
 	ticker := time.NewTicker(syncInterval)
 	defer ticker.Stop()
 	for round := 0; ; {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case po, ok := <-ch:
-			if !ok {
-				ch = nil // push stream closed; rely on periodic Sync
-				continue
-			}
-			n.applyPushed(ctx, drain(ch, po.Op))
 		case <-ticker.C:
 			if err := n.Sync(ctx); err != nil {
 				log.Printf("replication: sync round: %v", err)
