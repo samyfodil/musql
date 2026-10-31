@@ -857,16 +857,23 @@ func (db *DB) execPragma(sqlText string) error {
 			}
 		}
 		// The rows are the read side's; what reaches the exec side is whether
-		// the pragma FAILS, and the r-tree pass can fail it (rtree_check.go's
-		// integrityCheckRtrees). Main only: an attached or temp r-tree is not
-		// reached from here.
+		// the pragma FAILS. The row arm can fail it, where a VIRTUAL column it
+		// computes raises (integrityGenErr), and so can the r-tree pass
+		// (rtree_check.go's integrityCheckRtrees). A shape the read side
+		// declines answers no rows here and fails nothing, as before. Main
+		// only: an attached or temp database is not reached from here.
 		if stmt.Schema == "" || strings.EqualFold(stmt.Schema, "main") {
-			if len(db.vtabs) > 0 {
-				p, perr := db.SnapshotPager()
-				if perr != nil {
-					return perr
+			p, perr := db.SnapshotPager()
+			if perr != nil {
+				return perr
+			}
+			maxErr, only := integrityCheckArgs(stmt)
+			if maxErr > 0 {
+				if _, cerr := p.integrityCheckViolations(scopeMain, stmt, only, maxErr); cerr != nil && !errors.Is(cerr, errVDBEUnsupported) {
+					return cerr
 				}
-				_, only := integrityCheckArgs(stmt)
+			}
+			if len(db.vtabs) > 0 {
 				if _, verr := p.integrityCheckRtrees(scopeMain, only); verr != nil {
 					return verr
 				}
