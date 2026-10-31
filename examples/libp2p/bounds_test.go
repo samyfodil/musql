@@ -69,7 +69,7 @@ func TestRequestOverMaxSizeIsRefused(t *testing.T) {
 // of range -- is refused rather than read as something else.
 func TestMalformedOpIsRefused(t *testing.T) {
 	good := &pb.Op{Site: "s", Seq: 1, Kind: uint32(replication.OpSchema), Cells: []*pb.Cell{{Col: "c", Type: uint32(replication.TypeBlob)}}}
-	if _, err := opFromPB(good); err != nil {
+	if _, err := opsFromPB([]*pb.Op{good}, intern{}); err != nil {
 		t.Fatal(err)
 	}
 	for name, op := range map[string]*pb.Op{
@@ -78,7 +78,7 @@ func TestMalformedOpIsRefused(t *testing.T) {
 		"no site":   {Seq: 1},
 		"seq 0":     {Site: "s"},
 	} {
-		if _, err := opFromPB(op); err == nil {
+		if _, err := opsFromPB([]*pb.Op{op}, intern{}); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}

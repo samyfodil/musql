@@ -2,76 +2,104 @@ package libp2p
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/samyfodil/musql/examples/libp2p/pb"
 	"github.com/samyfodil/musql/replication"
 )
 
-// cellToPB converts a replication.Cell to its protobuf representation.
-func cellToPB(c replication.Cell) *pb.Cell {
-	return &pb.Cell{Col: c.Col, Type: uint32(c.Type), Val: c.Val}
-}
+// A response is read with readOwnedMsg, so its strings and bytes point into
+// its buffer. Converting it back interns every string it keeps (a version
+// vector's site, an op's table) and caps every byte slice, so what outlives
+// the conversion holds the buffer only through bytes it was sent, and an
+// append to those reallocates rather than writing over the buffer.
 
-// cellFromPB converts a protobuf Cell back to replication.Cell.
-func cellFromPB(c *pb.Cell) replication.Cell {
-	return replication.Cell{Col: c.GetCol(), Type: byte(c.GetType()), Val: c.GetVal()}
-}
+// intern copies each distinct string of one message once.
+type intern map[string]string
 
-// opToPB converts a replication.Op to its protobuf representation.
-func opToPB(op replication.Op) *pb.Op {
-	cells := make([]*pb.Cell, 0, len(op.Cells))
-	for _, c := range op.Cells {
-		cells = append(cells, cellToPB(c))
+func (in intern) str(s string) string {
+	if v, ok := in[s]; ok {
+		return v
 	}
-	return &pb.Op{
-		Site:  op.Site,
-		Seq:   op.Seq,
-		Hlc:   uint64(op.HLC),
-		Tbl:   op.Tbl,
-		Pk:    op.PK,
-		Kind:  uint32(op.Kind),
-		Cells: cells,
-	}
+	v := strings.Clone(s)
+	in[v] = v
+	return v
 }
 
-// opFromPB converts a protobuf Op back to replication.Op, refusing one no replication node wrote:
-// a kind or a cell type out of range would be read as something else.
-func opFromPB(op *pb.Op) (replication.Op, error) {
+func capped(b []byte) []byte { return b[:len(b):len(b)] }
+
+// opsToPB converts ops to their protobuf representation, the ops in one
+// allocation and their cells in another rather than one each.
+func opsToPB(ops []replication.Op) []*pb.Op {
+	n := 0
+	for _, op := range ops {
+		n += len(op.Cells)
+	}
+	msgs, out := make([]pb.Op, len(ops)), make([]*pb.Op, len(ops))
+	cells, cellPtrs := make([]pb.Cell, n), make([]*pb.Cell, n)
+	for i, op := range ops {
+		k := len(op.Cells)
+		m := &msgs[i]
+		m.Site, m.Seq, m.Hlc, m.Tbl, m.Pk, m.Kind = op.Site, op.Seq, uint64(op.HLC), op.Tbl, op.PK, uint32(op.Kind)
+		m.Cells = cellPtrs[:k:k]
+		for j, c := range op.Cells {
+			pc := &cells[j]
+			pc.Col, pc.Type, pc.Val = c.Col, uint32(c.Type), c.Val
+			m.Cells[j] = pc
+		}
+		cells, cellPtrs = cells[k:], cellPtrs[k:]
+		out[i] = m
+	}
+	return out
+}
+
+// opDecoder converts protobuf ops back, their cells in one allocation.
+type opDecoder struct {
+	in    intern
+	cells []replication.Cell
+}
+
+func newOpDecoder(ops []*pb.Op, in intern) *opDecoder {
+	n := 0
+	for _, op := range ops {
+		n += len(op.GetCells())
+	}
+	return &opDecoder{in: in, cells: make([]replication.Cell, n)}
+}
+
+// op converts one of the ops the decoder was made for, refusing one no
+// replication node wrote: a kind or a cell type out of range would be read as
+// something else.
+func (d *opDecoder) op(op *pb.Op) (replication.Op, error) {
 	if op.GetSite() == "" || op.GetSeq() == 0 || op.GetKind() > uint32(replication.OpSchema) {
 		return replication.Op{}, fmt.Errorf("examples/libp2p: malformed op %s/%d (kind %d)", op.GetSite(), op.GetSeq(), op.GetKind())
 	}
-	cells := make([]replication.Cell, 0, len(op.GetCells()))
-	for _, c := range op.GetCells() {
+	k := len(op.GetCells())
+	cells := d.cells[:k:k]
+	d.cells = d.cells[k:]
+	for i, c := range op.GetCells() {
 		if c.GetType() > uint32(replication.TypeBlob) {
 			return replication.Op{}, fmt.Errorf("examples/libp2p: op %s/%d: cell %q has type %d", op.GetSite(), op.GetSeq(), c.GetCol(), c.GetType())
 		}
-		cells = append(cells, cellFromPB(c))
+		cells[i] = replication.Cell{Col: d.in.str(c.GetCol()), Type: byte(c.GetType()), Val: capped(c.GetVal())}
 	}
 	return replication.Op{
-		Site:  op.GetSite(),
+		Site:  d.in.str(op.GetSite()),
 		Seq:   op.GetSeq(),
 		HLC:   replication.HLC(op.GetHlc()),
-		Tbl:   op.GetTbl(),
-		PK:    op.GetPk(),
+		Tbl:   d.in.str(op.GetTbl()),
+		PK:    capped(op.GetPk()),
 		Kind:  replication.OpKind(op.GetKind()),
 		Cells: cells,
 	}, nil
 }
 
-// opsToPB converts a slice of replication.Op to their protobuf representation.
-func opsToPB(ops []replication.Op) []*pb.Op {
-	out := make([]*pb.Op, 0, len(ops))
-	for _, op := range ops {
-		out = append(out, opToPB(op))
-	}
-	return out
-}
-
-// opsFromPB converts a slice of protobuf Ops back to []replication.Op.
-func opsFromPB(ops []*pb.Op) ([]replication.Op, error) {
+// opsFromPB converts protobuf ops back to []replication.Op.
+func opsFromPB(ops []*pb.Op, in intern) ([]replication.Op, error) {
+	d := newOpDecoder(ops, in)
 	out := make([]replication.Op, 0, len(ops))
 	for _, op := range ops {
-		o, err := opFromPB(op)
+		o, err := d.op(op)
 		if err != nil {
 			return nil, err
 		}
@@ -82,18 +110,20 @@ func opsFromPB(ops []*pb.Op) ([]replication.Op, error) {
 
 // vvToPB converts a VersionVector into a slice of VVEntry.
 func vvToPB(vv replication.VersionVector) []*pb.VVEntry {
-	out := make([]*pb.VVEntry, 0, len(vv))
+	entries, out := make([]pb.VVEntry, len(vv)), make([]*pb.VVEntry, 0, len(vv))
 	for site, seq := range vv {
-		out = append(out, &pb.VVEntry{Site: site, Seq: seq})
+		e := &entries[len(out)]
+		e.Site, e.Seq = site, seq
+		out = append(out, e)
 	}
 	return out
 }
 
 // vvFromPB converts a slice of VVEntry back into a VersionVector.
-func vvFromPB(entries []*pb.VVEntry) replication.VersionVector {
+func vvFromPB(entries []*pb.VVEntry, in intern) replication.VersionVector {
 	vv := make(replication.VersionVector, len(entries))
 	for _, e := range entries {
-		vv[e.GetSite()] = e.GetSeq()
+		vv[in.str(e.GetSite())] = e.GetSeq()
 	}
 	return vv
 }
@@ -101,48 +131,61 @@ func vvFromPB(entries []*pb.VVEntry) replication.VersionVector {
 // snapshotToPB converts a snapshot page to its protobuf representation.
 func snapshotToPB(p replication.SnapshotPage) *pb.GetSnapshotResponse {
 	out := &pb.GetSnapshotResponse{Ops: opsToPB(p.Ops), Floors: vvToPB(p.Floors), Next: p.Next}
+	ranges := make([]pb.RangeEntry, len(p.Ranges))
 	for site, lo := range p.Ranges {
-		out.Ranges = append(out.Ranges, &pb.RangeEntry{Site: site, Lo: lo})
+		r := &ranges[len(out.Ranges)]
+		r.Site, r.Lo = site, lo
+		out.Ranges = append(out.Ranges, r)
 	}
-	for _, c := range p.Cells {
-		out.Cells = append(out.Cells, &pb.ClockCell{Tbl: c.Tbl, Pk: c.PK, Col: c.Col, Hlc: uint64(c.HLC), Site: c.Site, Val: c.Val})
+	cells := make([]pb.ClockCell, len(p.Cells))
+	out.Cells = make([]*pb.ClockCell, len(p.Cells))
+	for i, c := range p.Cells {
+		pc := &cells[i]
+		pc.Tbl, pc.Pk, pc.Col, pc.Hlc, pc.Site, pc.Val = c.Tbl, c.PK, c.Col, uint64(c.HLC), c.Site, c.Val
+		out.Cells[i] = pc
 	}
 	return out
 }
 
 // snapshotFromPB converts a protobuf snapshot page back.
 func snapshotFromPB(r *pb.GetSnapshotResponse) (replication.SnapshotPage, error) {
-	ops, err := opsFromPB(r.GetOps())
+	in := intern{}
+	ops, err := opsFromPB(r.GetOps(), in)
 	if err != nil {
 		return replication.SnapshotPage{}, err
 	}
-	p := replication.SnapshotPage{Ops: ops, Floors: vvFromPB(r.GetFloors()), Ranges: map[string]uint64{}}
+	p := replication.SnapshotPage{Ops: ops, Floors: vvFromPB(r.GetFloors(), in), Ranges: make(map[string]uint64, len(r.GetRanges()))}
 	if len(r.GetNext()) > 0 {
-		p.Next = r.GetNext()
+		p.Next = capped(r.GetNext())
 	}
 	for _, e := range r.GetRanges() {
-		p.Ranges[e.GetSite()] = e.GetLo()
+		p.Ranges[in.str(e.GetSite())] = e.GetLo()
 	}
-	for _, c := range r.GetCells() {
-		p.Cells = append(p.Cells, replication.ClockCell{Tbl: c.GetTbl(), PK: c.GetPk(), Col: c.GetCol(), HLC: replication.HLC(c.GetHlc()), Site: c.GetSite(), Val: c.GetVal()})
+	if len(r.GetCells()) > 0 {
+		p.Cells = make([]replication.ClockCell, len(r.GetCells()))
+	}
+	for i, c := range r.GetCells() {
+		p.Cells[i] = replication.ClockCell{Tbl: in.str(c.GetTbl()), PK: capped(c.GetPk()), Col: in.str(c.GetCol()), HLC: replication.HLC(c.GetHlc()), Site: in.str(c.GetSite()), Val: capped(c.GetVal())}
 	}
 	return p, nil
 }
 
 // acksToPB converts acks to their protobuf representation.
 func acksToPB(acks replication.Acks) []*pb.AckEntry {
-	out := make([]*pb.AckEntry, 0, len(acks))
+	entries, out := make([]pb.AckEntry, len(acks)), make([]*pb.AckEntry, 0, len(acks))
 	for site, a := range acks {
-		out = append(out, &pb.AckEntry{Site: site, Hlc: uint64(a.HLC), Vv: vvToPB(a.VV)})
+		e := &entries[len(out)]
+		e.Site, e.Hlc, e.Vv = site, uint64(a.HLC), vvToPB(a.VV)
+		out = append(out, e)
 	}
 	return out
 }
 
 // acksFromPB converts protobuf acks back.
-func acksFromPB(entries []*pb.AckEntry) replication.Acks {
+func acksFromPB(entries []*pb.AckEntry, in intern) replication.Acks {
 	out := make(replication.Acks, len(entries))
 	for _, e := range entries {
-		out[e.GetSite()] = replication.Ack{HLC: replication.HLC(e.GetHlc()), VV: vvFromPB(e.GetVv())}
+		out[in.str(e.GetSite())] = replication.Ack{HLC: replication.HLC(e.GetHlc()), VV: vvFromPB(e.GetVv(), in)}
 	}
 	return out
 }

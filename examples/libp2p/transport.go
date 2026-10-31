@@ -14,9 +14,6 @@ import (
 	"slices"
 	"time"
 
-	"google.golang.org/protobuf/encoding/protodelim"
-	"google.golang.org/protobuf/proto"
-
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -180,12 +177,12 @@ func (t *Transport) call(ctx context.Context, peerID replication.PeerID, req *pb
 		s.Reset()
 		return nil, err
 	}
-	if _, err := protodelim.MarshalTo(s, req); err != nil {
+	if err := writeMsg(s, req); err != nil {
 		s.Reset()
 		return nil, fmt.Errorf("examples/libp2p: write request to %s: %w", peerID, err)
 	}
 	var resp pb.Response
-	if err := (protodelim.UnmarshalOptions{MaxSize: maxResponse}).UnmarshalFrom(bufio.NewReader(s), &resp); err != nil {
+	if err := readOwnedMsg(bufio.NewReader(s), &resp, maxResponse); err != nil {
 		s.Reset()
 		return nil, fmt.Errorf("examples/libp2p: read response from %s: %w", peerID, err)
 	}
@@ -202,7 +199,7 @@ func (t *Transport) ExchangeVV(ctx context.Context, peerID replication.PeerID, v
 	if r == nil {
 		return nil, fmt.Errorf("examples/libp2p: %s answered ExchangeVV with %T", peerID, resp.GetMsg())
 	}
-	return vvFromPB(r.GetVv()), nil
+	return vvFromPB(r.GetVv(), intern{}), nil
 }
 
 // GetOps retrieves from peer site's ops after fromSeq, at most limit of them
@@ -219,7 +216,7 @@ func (t *Transport) GetOps(ctx context.Context, peerID replication.PeerID, site 
 	if r.GetPruned() {
 		return nil, replication.ErrPruned
 	}
-	return opsFromPB(r.GetOps())
+	return opsFromPB(r.GetOps(), intern{})
 }
 
 // ExchangeAcks trades acks with peer.
@@ -232,7 +229,7 @@ func (t *Transport) ExchangeAcks(ctx context.Context, peerID replication.PeerID,
 	if r == nil {
 		return nil, fmt.Errorf("examples/libp2p: %s answered ExchangeAcks with %T", peerID, resp.GetMsg())
 	}
-	return acksFromPB(r.GetAcks()), nil
+	return acksFromPB(r.GetAcks(), intern{}), nil
 }
 
 // GetSnapshot fetches one page of part of peer's snapshot.
@@ -251,7 +248,7 @@ func (t *Transport) GetSnapshot(ctx context.Context, peerID replication.PeerID, 
 // PushOp publishes op to the gossipsub topic. The peer argument is ignored:
 // gossipsub delivery is topic-wide, not point-to-point.
 func (t *Transport) PushOp(ctx context.Context, _ replication.PeerID, op replication.Op) error {
-	return t.publish(ctx, &pb.PushMessage{Op: opToPB(op)})
+	return t.publish(ctx, &pb.PushMessage{Op: opsToPB([]replication.Op{op})[0]})
 }
 
 var _ replication.Broadcaster = (*Transport)(nil)
@@ -276,7 +273,7 @@ func (t *Transport) PushOps(ctx context.Context, ops []replication.Op) error {
 		msg, size = &pb.PushMessage{}, 0
 	}
 	for _, op := range opsToPB(ops) {
-		n := proto.Size(op)
+		n := op.SizeVT()
 		if len(msg.Ops) > 0 && size+n > maxPushBytes {
 			flush()
 		}
@@ -290,7 +287,7 @@ func (t *Transport) PushOps(ctx context.Context, ops []replication.Op) error {
 }
 
 func (t *Transport) publish(ctx context.Context, msg *pb.PushMessage) error {
-	data, err := proto.Marshal(msg)
+	data, err := msg.MarshalVT()
 	if err != nil {
 		return fmt.Errorf("examples/libp2p: marshal PushMessage: %w", err)
 	}
@@ -334,7 +331,7 @@ func (t *Transport) handleStream(s network.Stream) {
 		return
 	}
 	var req pb.Request
-	if err := (protodelim.UnmarshalOptions{MaxSize: maxRequest}).UnmarshalFrom(bufio.NewReader(s), &req); err != nil {
+	if err := readMsg(bufio.NewReader(s), &req, maxRequest); err != nil {
 		s.Reset()
 		return
 	}
@@ -359,7 +356,7 @@ func (t *Transport) handleStream(s network.Stream) {
 		out := &pb.GetOpsResponse{}
 		size := 0
 		for _, op := range opsToPB(ops) {
-			n := proto.Size(op) + binary.MaxVarintLen64 + 1 // the field's tag and length
+			n := op.SizeVT() + binary.MaxVarintLen64 + 1 // the field's tag and length
 			if size+n > maxResponse-binary.MaxVarintLen64 {
 				if len(out.Ops) == 0 {
 					log.Printf("examples/libp2p: op %s/%d is %d bytes, over the %d a response carries; it cannot sync", op.GetSite(), op.GetSeq(), n, maxResponse)
@@ -373,7 +370,7 @@ func (t *Transport) handleStream(s network.Stream) {
 		}
 		resp.Msg = &pb.Response_GetOps{GetOps: out}
 	case *pb.Request_ExchangeAcks:
-		t.srv.MergeAcks(acksFromPB(m.ExchangeAcks.GetAcks()))
+		t.srv.MergeAcks(acksFromPB(m.ExchangeAcks.GetAcks(), intern{}))
 		resp.Msg = &pb.Response_ExchangeAcks{ExchangeAcks: &pb.ExchangeAcksResponse{Acks: acksToPB(t.srv.Acks())}}
 	case *pb.Request_GetSnapshot:
 		page, err := t.srv.SnapshotPage(context.Background(), int(m.GetSnapshot.GetPart()), m.GetSnapshot.GetCursor())
@@ -386,7 +383,7 @@ func (t *Transport) handleStream(s network.Stream) {
 		s.Reset()
 		return
 	}
-	if _, err := protodelim.MarshalTo(s, &resp); err != nil {
+	if err := writeMsg(s, &resp); err != nil {
 		s.Reset()
 	}
 }
@@ -405,16 +402,19 @@ func (t *Transport) readGossip(ctx context.Context) {
 		if msg.ReceivedFrom == selfID {
 			continue // skip our own publishes
 		}
+		// msg.Data is the message's own, never written again: the ops
+		// point into it rather than copy it.
 		var pm pb.PushMessage
-		if err := proto.Unmarshal(msg.Data, &pm); err != nil {
+		if err := pm.UnmarshalVTUnsafe(msg.Data); err != nil {
 			continue
 		}
 		ops := pm.GetOps()
 		if pm.GetOp() != nil {
 			ops = append([]*pb.Op{pm.GetOp()}, ops...)
 		}
+		d := newOpDecoder(ops, intern{})
 		for _, o := range ops {
-			op, err := opFromPB(o)
+			op, err := d.op(o)
 			if err != nil {
 				log.Printf("examples/libp2p: pushed op from %s: %v", msg.ReceivedFrom, err)
 				continue
