@@ -110,6 +110,39 @@ func BenchmarkIngest(b *testing.B) {
 	b.ReportMetric(float64(b.N*len(ops))/elapsed.Seconds(), "ops/s")
 }
 
+// BenchmarkIngestConcurrent is B1 with the ops arriving from several senders
+// at once, as pushes from many peers do (memTransport delivers each on its
+// pusher's goroutine). Each Ingest still returns once its op is durable.
+func BenchmarkIngestConcurrent(b *testing.B) {
+	const n, senders = 20000, 16
+	ops := benchOps(b, n)
+	var elapsed time.Duration
+	for b.Loop() {
+		b.StopTimer()
+		s, db := benchDest(b)
+		b.StartTimer()
+		start := time.Now()
+		var next atomic.Int64
+		var wg sync.WaitGroup
+		for range senders {
+			wg.Go(func() {
+				for i := next.Add(1) - 1; i < int64(len(ops)); i = next.Add(1) - 1 {
+					if err := s.store.Ingest(context.Background(), ops[i], false); err != nil {
+						b.Error(err)
+						return
+					}
+				}
+			})
+		}
+		wg.Wait()
+		elapsed += time.Since(start)
+		b.StopTimer()
+		benchCount(b, db, n)
+		b.StartTimer()
+	}
+	b.ReportMetric(float64(b.N*len(ops))/elapsed.Seconds(), "ops/s")
+}
+
 // BenchmarkIngestWithLocalWriters is B2: B1 while local writers commit
 // continuously on the same node. Every op must land.
 func BenchmarkIngestWithLocalWriters(b *testing.B) {

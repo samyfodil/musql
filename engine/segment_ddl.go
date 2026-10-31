@@ -76,7 +76,13 @@ func Create(path string) (*Session, error) {
 // It is how a catalog change is persisted, and it is also what makes a segment
 // session able to CREATE a table at all -- there is nowhere else for the
 // directory entry to come from.
-func (n *Session) rewriteFile() error {
+func (n *Session) rewriteFile() error { return n.rewriteFileKeeping(false) }
+
+// rewriteFileKeeping is rewriteFile, keeping the stores' indexes on the stores
+// over the new file (rebase) when keepIndexes says the rewrite moves bytes and
+// no row: a commit's, which writes the rows the stores hold under the catalog
+// they were indexed under.
+func (n *Session) rewriteFileKeeping(keepIndexes bool) error {
 	db := n.DB
 	// An append load's rows (insert_append_delta.go) are entries for a delta
 	// this rewrite replaces: into the row store, which the rewrite writes from.
@@ -230,7 +236,7 @@ func (n *Session) rewriteFile() error {
 		t.inFile = !t.isTemp // every main table is the file's now
 	}
 	src := n.src
-	n.rebase(openSegmentsUnlocked) // the write lock is held: see openSegmentsUnlocked
+	n.rebase(openSegmentsUnlocked, keepIndexes) // the write lock is held: see openSegmentsUnlocked
 	if n.src == src {
 		// Not rebased -- a virtual table, an alias, a transaction, or the file
 		// would not open -- so the session still reads its row stores, and a
@@ -280,7 +286,12 @@ func (n *Session) rewriteFile() error {
 //
 // A deliberate simplification: a database with a virtual table keeps the old in-memory behavior;
 // keep its shadow tables loaded and re-base the rest if that ever matters.
-func (n *Session) rebase(open func(string) (*ReadOnlyPager, error)) {
+//
+// keepIndexes moves each table's indexes (the UNIQUE probes, the equality
+// posting lists) onto its store over the new file, for a file that holds
+// exactly the rows the stores held: a compaction's, which moves bytes and
+// no row.
+func (n *Session) rebase(open func(string) (*ReadOnlyPager, error), keepIndexes bool) {
 	db := n.DB
 	if db.txActive || len(db.vtabs) > 0 {
 		return
@@ -293,6 +304,17 @@ func (n *Session) rebase(open func(string) (*ReadOnlyPager, error)) {
 	fresh, err := open(n.segPath)
 	if err != nil {
 		return // the old view is still correct, only bigger
+	}
+	var kept map[*tableMeta]*rowStore
+	if keepIndexes {
+		for _, t := range db.tables {
+			if s := t.rows; !t.isTemp && t.bulk == nil && s != nil && (len(s.uqIdx) > 0 || len(s.eqIdx) > 0) {
+				if kept == nil {
+					kept = map[*tableMeta]*rowStore{}
+				}
+				kept[t] = s
+			}
+		}
 	}
 	// Whatever survives the swap must not alias the mapping being closed: the
 	// TEMP tables, which are never reloaded (as in rewriteFile).
@@ -310,6 +332,17 @@ func (n *Session) rebase(open func(string) (*ReadOnlyPager, error)) {
 		if !t.isTemp {
 			t.loaded, t.rows, t.rowsMutatedThisSession = false, nil, false
 		}
+	}
+	for t, s := range kept {
+		if db.ensureTableLoaded(t) == nil && t.rows != nil {
+			t.rows.uqIdx, t.rows.eqIdx = s.uqIdx, s.eqIdx
+		}
+	}
+	// The new delta's end is where this session's view of it ends, and where
+	// its next append goes (OpenWriteWait's own carry).
+	if st := deltaStateOf(fresh); st != nil && st.version != 0 && st.bytes == n.deltaEnd {
+		n.appendAt.release()
+		n.appendAt = SegDeltaAppendState{offset: st.bytes, cksum: st.cksum, version: st.version, known: true}
 	}
 	n.noteCommittedColumnsStale()
 }
