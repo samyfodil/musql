@@ -169,7 +169,8 @@ func (s *Server) placeDatabases(ctx context.Context) error {
 }
 
 // openCRDT opens d's file through replication, creating it empty when
-// missing: the peers fill it.
+// missing: its first sync installs a peer's image of it (replication's
+// image.go), and pulls what came after.
 func (s *Server) openCRDT(ctx context.Context, d *state.Database) error {
 	s.cl.mu.Lock()
 	defer s.cl.mu.Unlock()
