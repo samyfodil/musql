@@ -9,18 +9,19 @@ import (
 )
 
 // valueSlab hands out driver.Values whose payloads live in chunks shared by
-// the values of a few rows. Boxing an int64, float64 or string into an
-// interface otherwise allocates once per value (twice for TEXT, whose bytes
-// are copied first), which was most of the driver's allocations on a point
-// lookup. A value is written once and never again, and a chunk is never
+// the values of a few rows. Boxing an int64, float64, string or []byte into
+// an interface otherwise allocates once per value (twice for TEXT and BLOB,
+// whose bytes are copied first), which was most of the driver's allocations
+// on a point lookup. A value is written once and never again, and a chunk is never
 // reused, so every Value handed out stays valid for as long as its holder
 // keeps it. A chunk covers at most valueSlabRows rows and is sized exactly to
 // them, so a value kept long pins little.
 type valueSlab struct {
 	words []uint64 // an INTEGER's or a REAL's eight bytes
 	strs  []string
-	text  []byte
-	left  int // rows the current chunks were sized for and have not served
+	blobs [][]byte
+	text  []byte // a TEXT's or a BLOB's bytes
+	left  int    // rows the current chunks were sized for and have not served
 }
 
 const valueSlabRows = 16
@@ -28,7 +29,7 @@ const valueSlabRows = 16
 // fill sizes fresh chunks for the rows from rows[0] on.
 func (s *valueSlab) fill(rows [][]engine.Value) {
 	rows = rows[:min(len(rows), valueSlabRows)]
-	var nw, ns, nb int
+	var nw, ns, nbl, nb int
 	for _, row := range rows {
 		for _, v := range row {
 			switch v.Typ {
@@ -36,6 +37,9 @@ func (s *valueSlab) fill(rows [][]engine.Value) {
 				nw++
 			case engine.Text:
 				ns++
+				nb += len(v.S)
+			case engine.Blob:
+				nbl++
 				nb += len(v.S)
 			}
 		}
@@ -46,6 +50,13 @@ func (s *valueSlab) fill(rows [][]engine.Value) {
 	}
 	if ns > 0 {
 		s.strs = make([]string, 0, ns)
+	}
+	if nbl > 0 {
+		s.blobs = make([][]byte, 0, nbl)
+	}
+	if ns+nbl > 0 {
+		// Never nil, even with no bytes to hold: an empty BLOB is an empty
+		// []byte, not the nil that NULL scans as.
 		s.text = make([]byte, 0, nb)
 	}
 }
@@ -62,6 +73,7 @@ var (
 	int64Type   = typeOf(int64(0))
 	float64Type = typeOf(float64(0))
 	stringType  = typeOf("")
+	bytesType   = typeOf([]byte(nil))
 )
 
 func boxAt(typ, data unsafe.Pointer) (v driver.Value) {
@@ -84,6 +96,11 @@ func (s *valueSlab) value(v engine.Value) driver.Value {
 		s.text = append(s.text, v.S...)
 		s.strs = append(s.strs, unsafe.String(unsafe.SliceData(s.text[at:]), len(v.S)))
 		return boxAt(stringType, unsafe.Pointer(&s.strs[len(s.strs)-1]))
+	case engine.Blob:
+		at := len(s.text)
+		s.text = append(s.text, v.S...)
+		s.blobs = append(s.blobs, s.text[at:len(s.text):len(s.text)])
+		return boxAt(bytesType, unsafe.Pointer(&s.blobs[len(s.blobs)-1]))
 	}
 	return engineValueToDriver(v)
 }
