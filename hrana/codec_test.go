@@ -3,6 +3,7 @@ package hrana
 import (
 	"bufio"
 	"bytes"
+	"database/sql/driver"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -94,16 +95,21 @@ func TestProtobufTextNotUTF8(t *testing.T) {
 }
 
 // TestRowAllocValues: rows built from slabs hold every scanned value, for
-// each type a scan yields, across rows of every width and many chunks.
+// each type a scan yields, across rows of every width and many chunks, and a
+// BLOB's bytes are copied, since the driver's are its own after the next Scan.
 func TestRowAllocValues(t *testing.T) {
 	var a rowAlloc
 	ts := time.Date(2026, 10, 30, 1, 2, 3, 0, time.UTC)
-	full := func(i int) []any {
-		return []any{int64(i), float64(i) + 0.5, fmt.Sprint(i), []byte{byte(i)}, nil, i%2 == 0, ts, uint8(7)}
+	full := func(i int) []driver.Value {
+		return []driver.Value{int64(i), float64(i) + 0.5, fmt.Sprint(i), []byte{byte(i)}, nil, i%2 == 0, ts, uint8(7)}
 	}
 	var rows []*pb.Row
 	for i := range 3000 {
-		rows = append(rows, a.row(full(i)[:1+i%8]))
+		vals := full(i)[:1+i%8]
+		rows = append(rows, a.row(vals))
+		if len(vals) > 3 {
+			vals[3].([]byte)[0] ^= 0xff
+		}
 	}
 	for i, r := range rows {
 		want := full(i)[:1+i%8]
@@ -134,5 +140,37 @@ func TestRowAllocValues(t *testing.T) {
 		if !ok {
 			t.Fatalf("row %d: %v, want %v", i, r.Values, want)
 		}
+	}
+}
+
+// TestNamedArgs: named arguments bind by name whatever their prefix, and one
+// whose name does not begin with a letter fails the statement with the text
+// database/sql gave it.
+func TestNamedArgs(t *testing.T) {
+	url := newTestServer(t)
+	q := "SELECT :a + 1, @b, $c"
+	named := func(names ...string) *pbhttp.PipelineReqBody {
+		vals := []*pb.Value{{Value: &pb.Value_Integer{Integer: 41}}, {Value: &pb.Value_Text{Text: "x"}}, {Value: &pb.Value_Blob{Blob: []byte{1, 2}}}}
+		st := &pb.Stmt{Sql: &q}
+		for i, n := range names {
+			st.NamedArgs = append(st.NamedArgs, &pb.NamedArg{Name: n, Value: vals[i]})
+		}
+		return &pbhttp.PipelineReqBody{Requests: []*pbhttp.StreamRequest{
+			{Request: &pbhttp.StreamRequest_Execute{Execute: &pbhttp.ExecuteStreamReq{Stmt: st}}}}}
+	}
+	var out pbhttp.PipelineRespBody
+	if err := out.UnmarshalVT(postProtobuf(t, url+"/v3-protobuf/pipeline", named(":a", "@b", "$c"))); err != nil {
+		t.Fatal(err)
+	}
+	rows := out.GetResults()[0].GetOk().GetExecute().GetResult().GetRows()
+	if len(rows) != 1 || rows[0].Values[0].GetInteger() != 42 || rows[0].Values[1].GetText() != "x" || !bytes.Equal(rows[0].Values[2].GetBlob(), []byte{1, 2}) {
+		t.Fatalf("named args: %v %v", rows, out.GetResults()[0].GetError())
+	}
+	out.Reset()
+	if err := out.UnmarshalVT(postProtobuf(t, url+"/v3-protobuf/pipeline", named(":a", "@b", "$1"))); err != nil {
+		t.Fatal(err)
+	}
+	if e := out.GetResults()[0].GetError(); e.GetMessage() != `name "1" does not begin with a letter` {
+		t.Fatalf("a name not beginning with a letter: %v", e)
 	}
 }
