@@ -149,6 +149,15 @@ func TestGeneratedVirtualRaiseReadsOnlyItsColumn(t *testing.T) {
 			"UPDATE i SET j = '2' WHERE id = 1",
 			"SELECT id, g FROM i",
 		},
+		"typed": {
+			"CREATE TABLE i(value INT, j TEXT)",
+			"INSERT INTO i VALUES(1,'bad'),(7,'1')",
+			"ALTER TABLE i ADD COLUMN g INT AS (json_extract(j,'$')) VIRTUAL",
+			"PRAGMA integrity_check",
+			"PRAGMA quick_check",
+			"PRAGMA integrity_check(i)",
+			"SELECT value FROM i",
+		},
 		"chain": {
 			"CREATE TABLE i(value INT, j TEXT, v AS (value * 2), s AS (value + 1) STORED)",
 			"INSERT INTO i(value, j) VALUES(1,'bad'),(7,'1')",
@@ -260,5 +269,52 @@ func TestGeneratedVirtualRaiseUpsert(t *testing.T) {
 		"replace": {"INSERT OR REPLACE INTO u(k,j) VALUES(1,'5')", "SELECT k, j, g FROM u ORDER BY k"},
 	} {
 		differ(t, "gencol-raise upsert "+name, append(append([]string{}, setup...), stmts...))
+	}
+}
+
+// ALTER TABLE ADD COLUMN runs quick_check over the table when the new column
+// has a CHECK, is a NOT NULL generated column, or the table is STRICT
+// (alter.c). quick_check computes a VIRTUAL column only where the column is
+// NOT NULL or its type is checked, so only then can its expression fail the
+// ALTER, and in a STRICT table a value not of the column's type fails it too.
+// The ALTER is Exec'd: C reports the nested quick_check's columns on a Query.
+func TestGeneratedVirtualAddColumnChecks(t *testing.T) {
+	strict := []string{"CREATE TABLE s(a INT, j TEXT) STRICT"}
+	plain := []string{"CREATE TABLE c(a INT, j TEXT)", "INSERT INTO c VALUES(1,'bad'),(7,'1')"}
+	with := func(base []string, more ...string) []string {
+		return append(append([]string{}, base...), more...)
+	}
+	for _, tc := range []struct {
+		setup    []string
+		q, table string
+	}{
+		{with(strict, "INSERT INTO s VALUES(1,'x'),(2,'5')"), "ALTER TABLE s ADD COLUMN g INT AS (j) VIRTUAL", "s"},
+		{with(strict, "INSERT INTO s VALUES(1,'bad'),(2,'5')"), "ALTER TABLE s ADD COLUMN g INT AS (json_extract(j,'$')) VIRTUAL", "s"},
+		{with(strict, "INSERT INTO s VALUES(1,'7'),(2,'5')"), "ALTER TABLE s ADD COLUMN g INT AS (j) VIRTUAL", "s"},
+		{with(strict, "INSERT INTO s VALUES(1,'bad'),(2,'5')"), "ALTER TABLE s ADD COLUMN g ANY AS (json_extract(j,'$')) VIRTUAL", "s"},
+		{with(strict, "INSERT INTO s VALUES(1,'bad'),(2,'5')", "ALTER TABLE s ADD COLUMN g ANY AS (json_extract(j,'$')) VIRTUAL"), "ALTER TABLE s ADD COLUMN h INT", "s"},
+		{with(plain, "ALTER TABLE c ADD COLUMN g AS (json_extract(j,'$')) VIRTUAL"), "ALTER TABLE c ADD COLUMN h INT CHECK (h IS NULL OR h > 0)", "c"},
+		{with(plain, "ALTER TABLE c ADD COLUMN g AS (json_extract(j,'$')) VIRTUAL"), "ALTER TABLE c ADD COLUMN h INT CHECK (g IS NOT NULL OR h IS NULL)", "c"},
+		{with(plain, "ALTER TABLE c ADD COLUMN g INT AS (json_extract(j,'$')) VIRTUAL"), "ALTER TABLE c ADD COLUMN h INT CHECK (h IS NULL)", "c"},
+		{[]string{"CREATE TABLE n(a INT, j TEXT)", "INSERT INTO n VALUES(1,NULL),(7,'1')"}, "ALTER TABLE n ADD COLUMN g AS (json_extract(j,'$')) VIRTUAL NOT NULL", "n"},
+	} {
+		eoqDiffer(t, tc.setup, tc.q, "SELECT count(*) FROM pragma_table_xinfo('"+tc.table+"')")
+	}
+}
+
+// A write whose VIRTUAL column raises fails with the expression's own message,
+// as in C, which names neither the table nor the column.
+func TestGeneratedVirtualRaiseErrorText(t *testing.T) {
+	for _, q := range []string{
+		"UPDATE i SET value = value + 100",
+		"UPDATE i SET j = 'bad2' WHERE value = 7",
+		"INSERT INTO i(value, j) VALUES(3, 'bad')",
+	} {
+		c, m := boundPair(t, gencolRaiseSetup)
+		_, cerr := c.Exec(q)
+		_, merr := m.Exec(q)
+		if cerr == nil || merr == nil || cerr.Error() != merr.Error() {
+			t.Errorf("%s\n  cgo: %v\n  mus: %v", q, cerr, merr)
+		}
 	}
 }
