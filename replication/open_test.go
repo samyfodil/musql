@@ -246,7 +246,7 @@ func TestOpenRowidTables(t *testing.T) {
 			return
 		}
 		if time.Now().After(deadline) {
-			clk := `SELECT col, hlc, site, hex(val) FROM _repl_clock WHERE pk = X'` + fmt.Sprintf("%X", EncodePK(int64(7))) + `' ORDER BY col`
+			clk := `SELECT hex(rec) FROM _repl_clock WHERE pk = X'` + fmt.Sprintf("%X", EncodePK(int64(7))) + `'`
 			ops := `SELECT site, seq, hlc, op FROM _repl_oplog WHERE pk = X'` + fmt.Sprintf("%X", EncodePK(int64(7))) + `' ORDER BY site, seq`
 			var st strings.Builder
 			for _, site := range []string{"a", "b"} {
