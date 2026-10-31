@@ -364,7 +364,7 @@ func TestImageRefusedFallsBack(t *testing.T) {
 	c := newCluster(t)
 	c.open("a", imageDDL...)
 	c.exec("a", `INSERT INTO t VALUES(1, 'one')`, `INSERT INTO k VALUES('kk')`)
-	if _, err := syncerOf(t, c.dbs["a"]).store.db.Exec(`INSERT INTO main._repl_meta(k, v) VALUES(?, '2')`, metaLayout); err != nil {
+	if _, err := syncerOf(t, c.dbs["a"]).store.db.Exec(`UPDATE main._repl_meta SET v = '1' WHERE k = ?`, metaLayout); err != nil {
 		t.Fatal(err)
 	}
 	c.open("b")
@@ -383,7 +383,7 @@ func TestImageRefusesAnotherFormat(t *testing.T) {
 	st := syncerOf(t, c.dbs["a"]).store
 	file, minFile, delta := engine.FormatVersions()
 	for _, req := range []ImageRequest{
-		{Layout: "2", FileVersion: file, MinFileVersion: minFile, DeltaVersion: delta},
+		{Layout: "1", FileVersion: file, MinFileVersion: minFile, DeltaVersion: delta},
 		{Layout: bookkeepingLayout, FileVersion: file - 1, MinFileVersion: minFile, DeltaVersion: delta},
 		{Layout: bookkeepingLayout, FileVersion: file + 1, MinFileVersion: file + 1, DeltaVersion: delta},
 	} {
