@@ -507,26 +507,34 @@ func (c *capture) writeOp(ctx context.Context, op Op, ifFree bool) (bool, error)
 	if op.Kind == OpSchema {
 		return true, nil // a schema op has no cells of any row
 	}
+	return true, c.writeClock(ctx, op)
+}
+
+// writeClock writes op's presence and cells into its row's clock record over
+// what the record held: a local op is newer than every cell this node holds.
+func (c *capture) writeClock(ctx context.Context, op Op) error {
+	rows, err := c.conn.Query(ctx, `SELECT rec FROM main._repl_clock WHERE tbl=? AND pk=?`, op.Tbl, op.PK)
+	if err != nil {
+		return err
+	}
+	have := map[string]clockCell{}
+	if len(rows) > 0 {
+		rec, _ := rows[0][0].([]byte)
+		if have, err = decodeRec(rec); err != nil {
+			return err
+		}
+	}
 	pval := byte(1)
 	if op.Kind == OpDelete {
 		pval = 0
 	}
-	if err := c.upsertClock(ctx, op.Tbl, op.PK, presenceCol, op.HLC, op.Site, []byte{pval}); err != nil {
-		return false, err
-	}
+	have[presenceCol] = clockCell{op.HLC, op.Site, []byte{pval}}
 	for _, cell := range op.Cells {
-		if err := c.upsertClock(ctx, op.Tbl, op.PK, cell.Col, op.HLC, op.Site, packVal(cell.Type, cell.Val)); err != nil {
-			return false, err
-		}
+		have[cell.Col] = clockCell{op.HLC, op.Site, packVal(cell.Type, cell.Val)}
 	}
-	return true, nil
-}
-
-func (c *capture) upsertClock(ctx context.Context, tbl string, pk []byte, col string, hlc HLC, site string, val []byte) error {
-	return c.conn.Exec(ctx,
-		`INSERT INTO main._repl_clock(tbl,pk,col,hlc,site,val) VALUES(?,?,?,?,?,?)
-		 ON CONFLICT(tbl,pk,col) DO UPDATE SET hlc=excluded.hlc, site=excluded.site, val=excluded.val`,
-		tbl, pk, col, int64(hlc), site, val)
+	rec, top := encodeRec(have)
+	return c.conn.Exec(ctx, `INSERT INTO main._repl_clock(tbl,pk,top,rec) VALUES(?,?,?,?)
+		ON CONFLICT(tbl,pk) DO UPDATE SET top=excluded.top, rec=excluded.rec`, op.Tbl, op.PK, int64(top), rec)
 }
 
 // postCommit runs after the user's transaction commits. The ops are durable, so
