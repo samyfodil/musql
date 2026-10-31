@@ -10,11 +10,16 @@ package hrana
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
+	"unsafe"
 
 	musqldriver "github.com/samyfodil/musql/driver"
 	pb "github.com/samyfodil/musql/hrana/gen/hrana"
@@ -126,67 +131,81 @@ func (s *stream) execute(ctx context.Context, st *pb.Stmt) (*pb.StmtResult, erro
 }
 
 // run is execute's statement, also reporting how many rows it returned and
-// changed.
+// changed. It runs on the musql connection itself, which newStream checked
+// the stream holds, and reads the rows as the driver hands them over:
+// database/sql's Rows would add allocations to every query, and a goroutine
+// to every one whose context can be cancelled. What database/sql checks
+// before a query is checked here too: a context already done, and a named
+// argument whose name does not begin with a letter.
 func (s *stream) run(ctx context.Context, q string, st *pb.Stmt) (res *pb.StmtResult, read, written int64, err error) {
-	args := make([]any, 0, len(st.Args)+len(st.NamedArgs))
+	if err := ctx.Err(); err != nil {
+		return nil, 0, 0, err
+	}
+	args := make([]driver.NamedValue, 0, len(st.Args)+len(st.NamedArgs))
 	for _, v := range st.Args {
-		args = append(args, fromValue(v))
+		args = append(args, driver.NamedValue{Ordinal: len(args) + 1, Value: fromValue(v)})
 	}
 	for _, na := range st.NamedArgs {
-		args = append(args, sql.Named(strings.TrimLeft(na.Name, ":@$"), fromValue(na.Value)))
+		name := strings.TrimLeft(na.Name, ":@$")
+		if r, _ := utf8.DecodeRuneInString(name); name != "" && !unicode.IsLetter(r) {
+			return nil, 0, 0, fmt.Errorf("name %q does not begin with a letter", name)
+		}
+		args = append(args, driver.NamedValue{Name: name, Ordinal: len(args) + 1, Value: fromValue(na.Value)})
 	}
 	wantRows := st.WantRows == nil || *st.WantRows
-
-	_, total0, _, _ := s.state()
-	rows, err := s.conn.QueryContext(ctx, q, args...)
-	if err != nil {
-		return nil, read, 0, err
-	}
-	defer rows.Close()
-	res = &pb.StmtResult{}
-	types, err := rows.ColumnTypes()
-	if err != nil {
-		return nil, read, 0, err
-	}
-	if len(types) > 0 {
-		cols, names := make([]pb.Col, len(types)), make([]string, 2*len(types))
-		res.Cols = make([]*pb.Col, len(types))
-		for i, ct := range types {
-			names[2*i] = ct.Name()
-			cols[i].Name = &names[2*i]
-			if d := ct.DatabaseTypeName(); d != "" {
-				names[2*i+1] = d
-				cols[i].Decltype = &names[2*i+1]
+	err = s.conn.Raw(func(dc any) error {
+		mc := dc.(*musqldriver.Conn)
+		_, total0, _ := mc.ChangeState()
+		rows, err := mc.QueryContext(ctx, q, args)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		res = &pb.StmtResult{}
+		names := rows.Columns()
+		if len(names) > 0 {
+			decl, _ := rows.(driver.RowsColumnTypeDatabaseTypeName)
+			cols, strs := make([]pb.Col, len(names)), make([]string, 2*len(names))
+			res.Cols = make([]*pb.Col, len(names))
+			for i, n := range names {
+				strs[2*i] = n
+				cols[i].Name = &strs[2*i]
+				if decl != nil {
+					if d := decl.ColumnTypeDatabaseTypeName(i); d != "" {
+						strs[2*i+1] = d
+						cols[i].Decltype = &strs[2*i+1]
+					}
+				}
+				res.Cols[i] = &cols[i]
 			}
-			res.Cols[i] = &cols[i]
 		}
-	}
-	var alloc rowAlloc
-	vals := make([]any, len(types))
-	dest := make([]any, len(types))
-	for i := range vals {
-		dest[i] = &vals[i]
-	}
-	for rows.Next() {
-		if err := rows.Scan(dest...); err != nil {
-			return nil, read, 0, err
+		var alloc rowAlloc
+		vals := make([]driver.Value, len(names))
+		for {
+			err := rows.Next(vals)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return err
+			}
+			read++
+			if wantRows {
+				res.Rows = append(res.Rows, alloc.row(vals))
+			}
 		}
-		read++
-		if !wantRows {
-			continue
+		changes, total, lastID := mc.ChangeState()
+		if total != total0 {
+			res.AffectedRowCount = uint64(changes)
 		}
-		res.Rows = append(res.Rows, alloc.row(vals))
-	}
-	if err := rows.Err(); err != nil {
+		res.LastInsertRowid = &lastID
+		written = total - total0
+		return nil
+	})
+	if err != nil {
 		return nil, read, 0, err
 	}
-	rows.Close()
-	changes, total, lastID, _ := s.state()
-	if total != total0 {
-		res.AffectedRowCount = uint64(changes)
-	}
-	res.LastInsertRowid = &lastID
-	return res, read, total - total0, nil
+	return res, read, written, nil
 }
 
 // batch runs a batch's steps in order, each only when its condition holds.
@@ -407,20 +426,21 @@ func fromValue(v *pb.Value) any {
 // nullValue is every NULL's oneof: messages are only read once built.
 var nullValue = &pb.Value_Null_{Null: &pb.Value_Null{}}
 
-// slab hands out messages from chunks, an allocation per chunk rather than
-// one per message: the first exactly as big as asked for, each after it
-// twice the last, up to slabMax. A chunk lives as long as any message from
-// it, which for a result's rows is as long as the result.
+// slab hands out values from chunks, an allocation per chunk rather than one
+// per value: the first exactly as big as asked for, each after it twice the
+// last, up to slabBytes. A chunk lives as long as any value from it, which
+// for a result's rows is as long as the result.
 type slab[T any] struct {
 	free []T
 	next int
 }
 
-const slabMax = 512
+const slabBytes = 64 << 10
 
 func (s *slab[T]) take(n int) []T {
 	if len(s.free) < n {
-		s.next = max(n, min(2*s.next, slabMax))
+		most := max(1, slabBytes/int(unsafe.Sizeof(*new(T))))
+		s.next = max(n, min(2*s.next, most))
 		s.free = make([]T, s.next)
 	}
 	t := s.free[:n:n]
@@ -437,11 +457,13 @@ type rowAlloc struct {
 	flts  slab[pb.Value_Float]
 	txts  slab[pb.Value_Text]
 	blobs slab[pb.Value_Blob]
+	bytes slab[byte]
 }
 
-// row converts a scanned row to a Hrana row, taking from each slab exactly
-// what the row needs.
-func (a *rowAlloc) row(vals []any) *pb.Row {
+// row converts a row the driver handed over to a Hrana row, taking from
+// each slab exactly what the row needs. A []byte is the driver's until its
+// next row, so its bytes are copied.
+func (a *rowAlloc) row(vals []driver.Value) *pb.Row {
 	var nInt, nFlt, nTxt, nBlob int
 	for _, v := range vals {
 		switch v.(type) {
@@ -477,7 +499,8 @@ func (a *rowAlloc) row(vals []any) *pb.Row {
 			flts[0].Float = x
 			pv.Value, flts = &flts[0], flts[1:]
 		case []byte:
-			blobs[0].Blob = x
+			blobs[0].Blob = a.bytes.take(len(x))
+			copy(blobs[0].Blob, x)
 			pv.Value, blobs = &blobs[0], blobs[1:]
 		case string:
 			txts[0].Text = x
