@@ -162,12 +162,7 @@ func (db *DB) loadSchemaObjects(rp *ReadOnlyPager, schemaRows []SchemaRow, what 
 			}
 			rows = make(map[uint64][]Value, len(rowids))
 			for i, rowid := range rowids {
-				row := vals[i]
-				full, ferr := fullStoredRowOf(sr.Name, cols, ipk, rowid, row)
-				if ferr != nil {
-					return fmt.Errorf("engine: "+what+": %s: %w", sr.Name, ferr)
-				}
-				rows[rowid] = full
+				rows[rowid] = fullStoredRowOf(sr.Name, cols, ipk, rowid, vals[i])
 			}
 		}
 

@@ -258,9 +258,21 @@ func (cur *vdbeCursor) hasRealCols() bool {
 
 // hasGeneratedCols reports whether this cursor's table declares any generated
 // column, memoized in genCached (see its doc comment).
+// columns is the column list of the table cur reads: a read cursor's, or a
+// write cursor's (rowStore).
+func (cur *vdbeCursor) columns() []columnInfo {
+	if cur.tbl != nil {
+		return cur.tbl.cols
+	}
+	if cur.rowStore != nil {
+		return cur.rowStore.cols
+	}
+	return nil
+}
+
 func (cur *vdbeCursor) hasGeneratedCols() bool {
 	if cur.genCached == 0 {
-		if hasGeneratedCols(cur.tbl.cols) {
+		if hasGeneratedCols(cur.columns()) {
 			cur.genCached = 1
 		} else {
 			cur.genCached = 2
@@ -414,7 +426,18 @@ func (cur *vdbeCursor) readColumn(i int, dst *Value) error {
 		return cur.readColumnFromMaskedRow(i, dst)
 	}
 	*dst = cur.rowVals[i]
+	if dst.Typ == valueGenErr {
+		return takeGenErr(dst)
+	}
 	return nil
+}
+
+// takeGenErr is the error a valueGenErr slot read into *dst holds, with *dst
+// left NULL so the marker goes no further than its read.
+func takeGenErr(dst *Value) error {
+	err := genErrOf(*dst)
+	*dst = Value{}
+	return err
 }
 
 // col is readColumn in expression position, for readers that want a value
@@ -437,6 +460,9 @@ func (cur *vdbeCursor) readColumnFromMaskedRow(i int, dst *Value) error {
 		}
 	}
 	*dst = cur.rowVals[i]
+	if dst.Typ == valueGenErr {
+		return takeGenErr(dst)
+	}
 	return nil
 }
 
@@ -450,6 +476,13 @@ func (cur *vdbeCursor) fullRow() ([]Value, error) {
 	}
 	if cur.rowRaw != nil {
 		if err := cur.decodeFullRow(); err != nil {
+			return nil, err
+		}
+	}
+	// A whole row goes on to readers that do not name a column, so a VIRTUAL
+	// column's error is raised for the row.
+	if cur.hasGeneratedCols() {
+		if err := rowGenErr(cur.rowVals); err != nil {
 			return nil, err
 		}
 	}
@@ -1291,7 +1324,7 @@ func (cur *vdbeCursor) materializeRowStore() {
 	n := tbl.rows.len()
 	var rowids []uint64
 	var rows [][]Value
-	if f, st := cur.segFilter, tbl.rows; f != nil && st != nil && st.seg != nil {
+	if f, st := cur.segFilter, tbl.rows; f != nil && st != nil && st.seg != nil && !lowReadsVirtual(tbl.cols, f.low) {
 		// A write scan the filter peephole judged safe to restrict
 		// (segWriteFilterPeephole): only the base rows that can match, and
 		// every row the overlay holds, are decoded. Sized for the overlay, which
