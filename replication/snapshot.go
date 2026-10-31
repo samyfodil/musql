@@ -5,7 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
+	"maps"
+	"slices"
 )
 
 // Package replication implements snapshot bootstrap for nodes whose peers have
@@ -18,7 +19,7 @@ const (
 	SnapshotClock = 3
 )
 
-// ClockCell is one _repl_clock row.
+// ClockCell is one cell of a _repl_clock record.
 type ClockCell struct {
 	Tbl  string
 	PK   []byte
@@ -116,17 +117,25 @@ func (s *Store) SnapshotPage(ctx context.Context, part int, cursor []byte) (Snap
 		}
 		return page, rows.Err()
 	case SnapshotClock:
-		page.Next, err = s.pageAfter(ctx, `tbl, pk, col, hlc, site, val FROM main._repl_clock`, after.Rowid,
+		page.Next, err = s.pageAfter(ctx, `tbl, pk, rec FROM main._repl_clock`, after.Rowid,
 			func() { page.Cells = page.Cells[:0] },
 			func(scan func(...any) error) (int, error) {
-				var c ClockCell
-				var hlc int64
-				if err := scan(&c.Tbl, &c.PK, &c.Col, &hlc, &c.Site, &c.Val); err != nil {
+				var tbl string
+				var pk, rec []byte
+				if err := scan(&tbl, &pk, &rec); err != nil {
 					return 0, err
 				}
-				c.HLC = HLC(hlc)
-				page.Cells = append(page.Cells, c)
-				return len(c.Tbl) + len(c.PK) + len(c.Col) + len(c.Site) + len(c.Val) + 16, nil
+				cells, err := decodeRec(rec)
+				if err != nil {
+					return 0, err
+				}
+				size := 0
+				for _, col := range slices.Sorted(maps.Keys(cells)) {
+					c := cells[col]
+					page.Cells = append(page.Cells, ClockCell{Tbl: tbl, PK: pk, Col: col, HLC: c.hlc, Site: c.site, Val: c.val})
+					size += len(tbl) + len(pk) + len(col) + len(c.site) + len(c.val) + 16
+				}
+				return size, nil
 			})
 	default:
 		return page, fmt.Errorf("replication: unknown snapshot part %d", part)
@@ -257,30 +266,41 @@ func (s *Store) mergeCells(ctx context.Context, cells []ClockCell) error {
 	return tx.Commit()
 }
 
-// cellsPerUpsert is how many cells one statement of mergeCellsIn writes.
-const cellsPerUpsert = 64
-
 // mergeCellsIn merges cells into the clock, each only where it is a strictly
-// newer writer than the cell there by (hlc, site), as mergeCell does one: an
-// upsert per few hundred cells, whose rows apply in order, so a cell later in
-// cells is merged against an earlier one as a run of mergeCell calls would.
+// newer writer than the cell there by (hlc, site), as mergeCell does one, and
+// in order, so a cell later in cells is merged against an earlier one as a run
+// of mergeCell calls would. Each row's record is read once and written once.
 func (s *Store) mergeCellsIn(ctx context.Context, cells []ClockCell) error {
-	for len(cells) > 0 {
-		chunk := cells[:min(len(cells), cellsPerUpsert)]
-		cells = cells[len(chunk):]
-		args := make([]any, 0, 6*len(chunk))
-		for _, c := range chunk {
-			s.clock.Merge(c.HLC)
-			args = append(args, c.Tbl, c.PK, c.Col, int64(c.HLC), c.Site, c.Val)
+	type key struct{ tbl, pk string }
+	var keys []key
+	byKey := map[key][]ClockCell{}
+	for _, c := range cells {
+		s.clock.Merge(c.HLC)
+		k := key{c.Tbl, string(c.PK)}
+		if _, ok := byKey[k]; !ok {
+			keys = append(keys, k)
 		}
-		if _, err := s.q.ExecContext(ctx, `INSERT INTO main._repl_clock(tbl,pk,col,hlc,site,val) VALUES `+
-			strings.TrimSuffix(strings.Repeat(`(?,?,?,?,?,?),`, len(chunk)), ",")+
-			` ON CONFLICT(tbl,pk,col) DO UPDATE SET hlc=excluded.hlc, site=excluded.site, val=excluded.val
-			WHERE excluded.hlc > hlc OR (excluded.hlc = hlc AND excluded.site > site)`, args...); err != nil {
+		byKey[k] = append(byKey[k], c)
+	}
+	var fresh, won []any
+	for _, k := range keys {
+		have, err := s.clockCells(ctx, k.tbl, []byte(k.pk))
+		if err != nil {
 			return err
 		}
+		had, took := len(have) > 0, false
+		for _, c := range byKey[k] {
+			if e, ok := have[c.Col]; ok && !TagLess(e.hlc, e.site, c.HLC, c.Site) {
+				continue
+			}
+			have[c.Col] = clockCell{c.HLC, c.Site, c.Val}
+			took = true
+		}
+		if took {
+			fresh, won = recArgs(fresh, won, k.tbl, []byte(k.pk), have, had)
+		}
 	}
-	return nil
+	return s.writeRecs(ctx, fresh, won)
 }
 
 // finishSnapshot raises this node's floors to the peer's -- every op at or

@@ -183,7 +183,7 @@ func OpenStore(ctx context.Context, db *sql.DB, site string) (*Store, error) {
 	// log's, which holds the schema ops, and the clock's, which holds the cells
 	// of row ops long pruned from the log.
 	var maxHLC sql.NullInt64
-	if err := db.QueryRowContext(ctx, `SELECT max(h) FROM (SELECT max(hlc) AS h FROM main._repl_oplog UNION ALL SELECT max(hlc) FROM main._repl_clock)`).Scan(&maxHLC); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT max(h) FROM (SELECT max(hlc) AS h FROM main._repl_oplog UNION ALL SELECT max(top) FROM main._repl_clock)`).Scan(&maxHLC); err != nil {
 		return nil, err
 	}
 	if maxHLC.Valid {
@@ -749,7 +749,7 @@ func (s *Store) applyOp(ctx context.Context, op Op, local bool) error {
 	return s.materializeRowFrom(ctx, s.cat, op.Tbl, op.PK, have)
 }
 
-// clockCell is one _repl_clock cell of a row.
+// clockCell is one cell of a row's clock record.
 type clockCell struct {
 	hlc  HLC
 	site string
@@ -757,55 +757,37 @@ type clockCell struct {
 }
 
 // mergeOp merges op's presence and cells into the clock, each iff op is a
-// strictly newer writer than the cell's, by the (hlc, site) total order -- as
-// mergeCell does one cell, in a statement or three for the row: one read of
-// its cells, an insert of those the clock had none of, an upsert of those op
-// wins. It returns the row's cells after.
+// strictly newer writer than the cell's, by the (hlc, site) total order: one
+// read of the row's record and, when op won a cell of it, one write. It
+// returns the row's cells after.
 func (s *Store) mergeOp(ctx context.Context, op Op) (map[string]clockCell, error) {
 	have, err := s.clockCells(ctx, op.Tbl, op.PK)
 	if err != nil {
 		return nil, err
 	}
-	var fresh, won []any
-	mergeInto(have, op, func(col string, had bool) {
-		fresh, won = cellArgs(fresh, won, op.Tbl, op.PK, col, have[col], had)
-	})
-	return have, s.writeCells(ctx, fresh, won)
+	had := len(have) > 0
+	if !mergeInto(have, op) {
+		return have, nil
+	}
+	fresh, won := recArgs(nil, nil, op.Tbl, op.PK, have, had)
+	return have, s.writeRecs(ctx, fresh, won)
 }
 
 // clockCells is the clock's cells of tbl's row pk, by column.
 func (s *Store) clockCells(ctx context.Context, tbl string, pk []byte) (map[string]clockCell, error) {
-	rows, err := s.q.QueryContext(ctx, `SELECT col, hlc, site, val FROM main._repl_clock WHERE tbl=? AND pk=?`, tbl, pk)
-	if err != nil {
-		return nil, err
-	}
-	have := map[string]clockCell{}
-	for rows.Next() {
-		var col string
-		var c clockCell
-		var hlc int64
-		if err := rows.Scan(&col, &hlc, &c.site, &c.val); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		c.hlc = HLC(hlc)
-		have[col] = c
-	}
-	rows.Close()
-	return have, rows.Err()
+	return readRec(ctx, s.q, tbl, pk)
 }
 
 // mergeInto merges op's presence and cells into have, each iff op is a
-// strictly newer writer than the cell's, and calls took with each column it
-// took and whether have held that column before.
-func mergeInto(have map[string]clockCell, op Op, took func(col string, had bool)) {
+// strictly newer writer than the cell's, and reports whether it took any.
+func mergeInto(have map[string]clockCell, op Op) bool {
+	took := false
 	merge := func(col string, val []byte) {
-		c, ok := have[col]
-		if ok && !TagLess(c.hlc, c.site, op.HLC, op.Site) {
+		if c, ok := have[col]; ok && !TagLess(c.hlc, c.site, op.HLC, op.Site) {
 			return // the existing writer wins
 		}
 		have[col] = clockCell{op.HLC, op.Site, val}
-		took(col, ok)
+		took = true
 	}
 	pval := byte(1)
 	if op.Kind == OpDelete {
@@ -815,36 +797,28 @@ func mergeInto(have map[string]clockCell, op Op, took func(col string, had bool)
 	for _, c := range op.Cells {
 		merge(c.Col, packVal(c.Type, c.Val))
 	}
+	return took
 }
 
-// cellArgs appends one clock cell's insert arguments: to won when the clock
-// held the cell already (had), else to fresh.
-func cellArgs(fresh, won []any, tbl string, pk []byte, col string, c clockCell, had bool) ([]any, []any) {
-	if had {
-		return fresh, append(won, tbl, pk, col, int64(c.hlc), c.site, c.val)
-	}
-	return append(fresh, tbl, pk, col, int64(c.hlc), c.site, c.val), won
-}
+// recsPerStmt is the most clock records one statement of writeRecs writes.
+const recsPerStmt = 128
 
-// cellsPerStmt is the most clock cells one statement of writeCells writes.
-const cellsPerStmt = 128
-
-// writeCells writes clock cells, six arguments each: a plain INSERT of those
-// the clock has none of -- an upsert's conflict handling costs the engine
-// several times an insert's -- and an upsert of those it has.
-func (s *Store) writeCells(ctx context.Context, fresh, won []any) error {
-	const insert = `INSERT INTO main._repl_clock(tbl,pk,col,hlc,site,val) VALUES `
-	const update = ` ON CONFLICT(tbl,pk,col) DO UPDATE SET hlc=excluded.hlc, site=excluded.site, val=excluded.val`
+// writeRecs writes clock records, four arguments each (recArgs): a plain
+// INSERT of those the clock has none of -- an upsert's conflict handling
+// costs the engine several times an insert's -- and an upsert of those it has.
+func (s *Store) writeRecs(ctx context.Context, fresh, won []any) error {
+	const insert = `INSERT INTO main._repl_clock(tbl,pk,top,rec) VALUES `
+	const update = ` ON CONFLICT(tbl,pk) DO UPDATE SET top=excluded.top, rec=excluded.rec`
 	for _, w := range []struct {
 		args []any
 		tail string
 	}{{fresh, ""}, {won, update}} {
 		for args := w.args; len(args) > 0; {
-			n := min(len(args)/6, cellsPerStmt)
-			if _, err := s.q.ExecContext(ctx, insert+strings.TrimSuffix(strings.Repeat(`(?,?,?,?,?,?),`, n), ",")+w.tail, args[:6*n]...); err != nil {
+			n := min(len(args)/4, recsPerStmt)
+			if _, err := s.q.ExecContext(ctx, insert+strings.TrimSuffix(strings.Repeat(`(?,?,?,?),`, n), ",")+w.tail, args[:4*n]...); err != nil {
 				return err
 			}
-			args = args[6*n:]
+			args = args[4*n:]
 		}
 	}
 	return nil
@@ -881,24 +855,16 @@ func (s *Store) applyOps(ctx context.Context, ops []Op, local bool) error {
 		if err != nil {
 			return err
 		}
-		before := map[string]bool{}
-		var took []string
+		had, took := len(have) > 0, false
 		for _, op := range byKey[k] {
-			mergeInto(have, op, func(col string, had bool) {
-				if _, seen := before[col]; !seen {
-					before[col] = had
-					took = append(took, col)
-				}
-			})
+			took = mergeInto(have, op) || took
 		}
-		for _, col := range took {
-			fresh, won = cellArgs(fresh, won, k.tbl, pk, col, have[col], before[col])
-		}
-		if len(took) > 0 {
+		if took {
+			fresh, won = recArgs(fresh, won, k.tbl, pk, have, had)
 			changed[k] = have
 		}
 	}
-	if err := s.writeCells(ctx, fresh, won); err != nil || local {
+	if err := s.writeRecs(ctx, fresh, won); err != nil || local {
 		return err
 	}
 	var rebuild []string
@@ -934,29 +900,17 @@ func (s *Store) applyOps(ctx context.Context, ops []Op, local bool) error {
 // mergeCell writes (hlc, site, val) for a cell iff it is a strictly newer writer
 // than what the clock holds, by the (hlc, site) total order.
 func (s *Store) mergeCell(ctx context.Context, tbl string, pk []byte, col string, hlc HLC, site string, val []byte) error {
-	var (
-		eHLC  int64
-		eSite string
-	)
-	err := s.q.QueryRowContext(ctx,
-		`SELECT hlc, site FROM main._repl_clock WHERE tbl=? AND pk=? AND col=?`, tbl, pk, col).Scan(&eHLC, &eSite)
-	switch err {
-	case sql.ErrNoRows:
-		_, err = s.q.ExecContext(ctx,
-			`INSERT INTO main._repl_clock(tbl,pk,col,hlc,site,val) VALUES(?,?,?,?,?,?)`,
-			tbl, pk, col, int64(hlc), site, val)
-		return err
-	case nil:
-		if TagLess(HLC(eHLC), eSite, hlc, site) {
-			_, err = s.q.ExecContext(ctx,
-				`UPDATE main._repl_clock SET hlc=?, site=?, val=? WHERE tbl=? AND pk=? AND col=?`,
-				int64(hlc), site, val, tbl, pk, col)
-			return err
-		}
-		return nil // existing writer wins; discard
-	default:
+	have, err := s.clockCells(ctx, tbl, pk)
+	if err != nil {
 		return err
 	}
+	if c, ok := have[col]; ok && !TagLess(c.hlc, c.site, hlc, site) {
+		return nil // existing writer wins; discard
+	}
+	had := len(have) > 0
+	have[col] = clockCell{hlc, site, val}
+	fresh, won := recArgs(nil, nil, tbl, pk, have, had)
+	return s.writeRecs(ctx, fresh, won)
 }
 
 // syncCatalog reloads the installed catalog if a capture on another
@@ -1039,26 +993,14 @@ func (s *Store) writeRow(ctx context.Context, t *object, pk []byte, del bool, ha
 		}
 	}
 
-	var cells map[string]typedVal
 	if have == nil {
-		alive, known, err := s.presence(ctx, t.ID, pk)
-		if err != nil || !known || !alive {
+		if have, err = s.clockCells(ctx, t.ID, pk); err != nil {
 			return false, err
 		}
-		if cells, err = s.liveCells(ctx, t.ID, pk); err != nil {
-			return false, err
-		}
-	} else {
-		if p, ok := have[presenceCol]; !ok || len(p.val) == 0 || p.val[0] != 1 {
-			return false, nil
-		}
-		cells = make(map[string]typedVal, len(have))
-		for col, c := range have {
-			if col != presenceCol {
-				typ, raw := unpackVal(c.val)
-				cells[col] = typedVal{typ, raw}
-			}
-		}
+	}
+	cells, alive := liveCells(have)
+	if !alive {
+		return false, nil
 	}
 	colNames, args, ok := rowValues(t, keyNames, keyVals, cells)
 	if !ok {
@@ -1153,22 +1095,28 @@ func (s *Store) rebuildTable(ctx context.Context, t *object) error {
 	}
 	// Each row's latest cell; the site breaks an HLC tie, as it does everywhere
 	// else (TagLess).
-	rows, err := s.q.QueryContext(ctx, `SELECT pk, hlc, site FROM main._repl_clock WHERE tbl=? ORDER BY pk`, t.ID)
+	rows, err := s.q.QueryContext(ctx, `SELECT pk, rec FROM main._repl_clock WHERE tbl=?`, t.ID)
 	if err != nil {
 		return err
 	}
 	var all []stamp
 	for rows.Next() {
 		var st stamp
-		if err := rows.Scan(&st.pk, &st.hlc, &st.site); err != nil {
+		var rec []byte
+		if err := rows.Scan(&st.pk, &rec); err != nil {
 			rows.Close()
 			return err
 		}
-		if n := len(all); n > 0 && bytes.Equal(all[n-1].pk, st.pk) {
-			if TagLess(HLC(all[n-1].hlc), all[n-1].site, HLC(st.hlc), st.site) {
-				all[n-1] = st
+		cells, err := decodeRec(rec)
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		first := true
+		for _, c := range cells {
+			if first || TagLess(HLC(st.hlc), st.site, c.hlc, c.site) {
+				st.hlc, st.site, first = int64(c.hlc), c.site, false
 			}
-			continue
 		}
 		all = append(all, st)
 	}
@@ -1262,18 +1210,24 @@ func (s *Store) rewriteRows(ctx context.Context, t *object) error {
 	if err != nil {
 		return err
 	}
-	rows, err := s.q.QueryContext(ctx, `SELECT pk, col, val FROM main._repl_clock WHERE tbl=? ORDER BY pk`, t.ID)
+	rows, err := s.q.QueryContext(ctx, `SELECT pk, rec FROM main._repl_clock WHERE tbl=? ORDER BY pk`, t.ID)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	b := rowBatch{s: s, t: t, keyNames: keyNames}
-	var pk []byte
-	alive := false
-	cells := map[string]typedVal{}
-	row := func() error {
-		if pk == nil || !alive {
-			return nil
+	for rows.Next() {
+		var pk, rec []byte
+		if err := rows.Scan(&pk, &rec); err != nil {
+			return err
+		}
+		have, err := decodeRec(rec)
+		if err != nil {
+			return err
+		}
+		cells, alive := liveCells(have)
+		if !alive {
+			continue
 		}
 		keyVals, err := decodeKey(pk, len(keyNames))
 		if err != nil {
@@ -1281,34 +1235,13 @@ func (s *Store) rewriteRows(ctx context.Context, t *object) error {
 		}
 		cols, args, ok := rowValues(t, keyNames, keyVals, cells)
 		if !ok {
-			return nil
-		}
-		return b.add(ctx, pk, cols, args)
-	}
-	for rows.Next() {
-		var rpk, val []byte
-		var col string
-		if err := rows.Scan(&rpk, &col, &val); err != nil {
-			return err
-		}
-		if !bytes.Equal(rpk, pk) {
-			if err := row(); err != nil {
-				return err
-			}
-			pk, alive = rpk, false
-			clear(cells)
-		}
-		if col == presenceCol {
-			alive = len(val) > 0 && val[0] == 1
 			continue
 		}
-		typ, raw := unpackVal(val)
-		cells[col] = typedVal{typ, raw}
+		if err := b.add(ctx, pk, cols, args); err != nil {
+			return err
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return err
-	}
-	if err := row(); err != nil {
 		return err
 	}
 	return b.flush(ctx)
@@ -1442,43 +1375,25 @@ func (s *Store) rebuildHeld(ctx context.Context, tblIDs []string) error {
 
 // --- clock reads ---
 
-func (s *Store) presence(ctx context.Context, tbl string, pk []byte) (alive, known bool, err error) {
-	var val []byte
-	err = s.q.QueryRowContext(ctx,
-		`SELECT val FROM main._repl_clock WHERE tbl=? AND pk=? AND col=?`, tbl, pk, presenceCol).Scan(&val)
-	switch err {
-	case sql.ErrNoRows:
-		return false, false, nil
-	case nil:
-		return len(val) > 0 && val[0] == 1, true, nil
-	default:
-		return false, false, err
-	}
-}
-
 type typedVal struct {
 	typ byte
 	raw []byte
 }
 
-func (s *Store) liveCells(ctx context.Context, tbl string, pk []byte) (map[string]typedVal, error) {
-	rows, err := s.q.QueryContext(ctx,
-		`SELECT col, val FROM main._repl_clock WHERE tbl=? AND pk=? AND col<>?`, tbl, pk, presenceCol)
-	if err != nil {
-		return nil, err
+// liveCells is a row's cells but its presence, and whether that says the row
+// is there: false for a deleted row and for one the clock does not know.
+func liveCells(have map[string]clockCell) (map[string]typedVal, bool) {
+	if p, ok := have[presenceCol]; !ok || len(p.val) == 0 || p.val[0] != 1 {
+		return nil, false
 	}
-	defer rows.Close()
-	out := map[string]typedVal{}
-	for rows.Next() {
-		var col string
-		var val []byte
-		if err := rows.Scan(&col, &val); err != nil {
-			return nil, err
+	cells := make(map[string]typedVal, len(have))
+	for col, c := range have {
+		if col != presenceCol {
+			typ, raw := unpackVal(c.val)
+			cells[col] = typedVal{typ, raw}
 		}
-		typ, raw := unpackVal(val)
-		out[col] = typedVal{typ, raw}
 	}
-	return out, rows.Err()
+	return cells, true
 }
 
 // --- rowid ranges ---
@@ -1978,24 +1893,14 @@ func Withheld(ctx context.Context, db *sql.DB) ([]WithheldRow, error) {
 			return nil, err
 		}
 		w := WithheldRow{Table: t.Name, Key: key, Row: map[string]any{}}
-		cells, err := db.QueryContext(ctx, `SELECT col, val FROM main._repl_clock WHERE tbl=? AND pk=? AND col<>?`, h.tbl, h.pk, presenceCol)
+		cells, err := readRec(ctx, db, h.tbl, h.pk)
 		if err != nil {
 			return nil, err
 		}
-		for cells.Next() {
-			var col string
-			var val []byte
-			if err := cells.Scan(&col, &val); err != nil {
-				cells.Close()
-				return nil, err
+		for col, cell := range cells {
+			if c := t.col(col); c != nil && col != presenceCol {
+				w.Row[c.Name] = driverValue(unpackVal(cell.val))
 			}
-			if c := t.col(col); c != nil {
-				w.Row[c.Name] = driverValue(unpackVal(val))
-			}
-		}
-		cells.Close()
-		if err := cells.Err(); err != nil {
-			return nil, err
 		}
 		for i, kc := range t.keyCols() {
 			w.Row[kc.Name] = key[i]
