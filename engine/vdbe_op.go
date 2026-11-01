@@ -609,6 +609,16 @@ const (
 	// conjunct, still evaluated in the loop, rejects.
 	OpSeekRowidRangeHint
 
+	// OpSeekRowidSetHint: P1: cursor. P2: first key register. P3: how many.
+	// Makes cursor P1's next OpRewind fetch only the rows whose rowid is one of
+	// r[P2..P2+P3-1], each key taking numeric affinity first as for
+	// OpSeekRowidHint, in ascending rowid order: C's IN loop over the rowid,
+	// whose ephemeral index holds each value once, sorted. Emitted after
+	// OpOpenRead when detectRowidInKeys found "rowid IN (<consts/params>)". The
+	// IN is still evaluated in the loop, so this only restricts the rows
+	// scanned.
+	OpSeekRowidSetHint
+
 	// OpAutoIndexOrder: P1: cursor. P4: *autoIndexKey. Materializes cursor P1 if
 	// needed and reorders its rows into the order SQLite's transient automatic
 	// index would yield (constructAutomaticIndex's key: equality columns, then

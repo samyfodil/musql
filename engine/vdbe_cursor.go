@@ -121,6 +121,11 @@ type vdbeCursor struct {
 	// seekNone is a seek whose key is no integer even under numeric affinity,
 	// so no rowid equals it and the lookup finds nothing.
 	seekNone bool
+	// seekSet, when seekSetConfigured, is the rowids an IN list pins the rowid
+	// to (OpSeekRowidSetHint), ascending and each once: the first rewind()
+	// fetches those rows and no others. Like seekKey it only narrows.
+	seekSetConfigured bool
+	seekSet           []int64
 
 	// rowidLo/rowidHi, when ranged, bound the rowids a segment scan visits
 	// (OpSeekRowidRangeHint), inclusive. Like seekKey they only skip rows the
@@ -630,6 +635,20 @@ func (cur *vdbeCursor) narrowRowidRange(kind int, k int64) {
 	}
 }
 
+// seekRowidKey is the rowid OP_SeekRowid seeks for v: numeric affinity, then a
+// REAL with no fractional part as that integer, however far it is from zero
+// (applyNumericAffinity's bTryForInt; "9007199254740992.0" seeks
+// 9007199254740992). false is no integer, which no rowid equals.
+func seekRowidKey(v Value) (int64, bool) {
+	if v.Typ != Int {
+		v = applyAffinityToValue(v, affNumeric)
+		if v.Typ == Float {
+			return intFoldWide(v.F)
+		}
+	}
+	return v.I, v.Typ == Int
+}
+
 // narrowRowidRangeBy is narrowRowidRange for a bound of any class, read as
 // OP_SeekGT and its kin read one (vdbe.c): numeric affinity first, then a REAL
 // by the integers either side of it; a NULL bound, or a TEXT or BLOB one below
@@ -730,7 +749,7 @@ func (cur *vdbeCursor) rewind() error {
 	// the b-tree while every other read of the same table read segments. Both
 	// are correct, which is exactly what makes the split dangerous: it would
 	// make a "columnar" measurement quietly a b-tree one.
-	if cur.streamable && !cur.seekConfigured && !cur.idxSeekConfigured && !cur.tbl.withoutRowid {
+	if cur.streamable && !cur.seekConfigured && !cur.idxSeekConfigured && !cur.seekSetConfigured && !cur.tbl.withoutRowid {
 		// A columnar view of this table serves the scan ONE COLUMN AT A TIME
 		// (segment_cursor.go) when it can. Tried before the b-tree stream and
 		// declining to it, so the two never split: a table either scans from
@@ -784,44 +803,23 @@ func (cur *vdbeCursor) rewind() error {
 				cur.rowidNull = false
 				return nil
 			}
+			// An IN list over the rowid: the rows it names, ascending, and
+			// nothing else is built.
+			if cur.seekSetConfigured && !tbl.withoutRowid && tbl.rows != nil {
+				hits := make([]uint64, len(cur.seekSet))
+				for i, k := range cur.seekSet {
+					hits[i] = uint64(k)
+				}
+				cur.materializeWriteHits(hits, false)
+				return nil
+			}
 			// A column equality (emitWriteIndexSeekHint): the store's equality
 			// indexes name the candidates, ascending, and nothing else is built.
 			// A key no index can answer falls to the next, and none to the walk.
 			if cur.idxSeekConfigured && !tbl.withoutRowid && tbl.rows != nil {
 				if hits, fromSeg, ok := cur.writeSeekRowids(); ok {
 					writeIndexSeeksServed.Add(1)
-					cur.rowids, cur.rows = slices.Grow(cur.rowids[:0], len(hits)), slices.Grow(cur.rows[:0], len(hits))
-					// The stored rows are kept as they are and fixed up as each
-					// becomes current (lazyNorm), as materializeRowStore does, rather
-					// than copied here: a tenth of a table is thousands of rows.
-					lazy := rowStoreNormalizesLazily(tbl)
-					ncols := len(tbl.cols)
-					base := make([]uint64, (len(hits)+63)/64)
-					// segEqRowids filtered out the deleted rows; eqRowids's come
-					// from the store's own index and are all rows.
-					tbl.rows.eachOf(hits, fromSeg, func(rid uint64, vals []Value, fromBase bool) {
-						if !lazy || len(vals) != ncols {
-							vals = normalizeRow(tbl.name, tbl.cols, tbl.ipkIndex, rid, vals)
-						}
-						if fromBase {
-							i := len(cur.rows)
-							base[i/64] |= 1 << (i % 64)
-						}
-						cur.rows = append(cur.rows, vals)
-						cur.rowids = append(cur.rowids, rid)
-					})
-					cur.lazyNorm = lazy
-					cur.rowsFrom, cur.rowsSwaps, cur.rowsWrites = tbl.rows, tbl.rows.swaps, tbl.rows.writes
-					cur.overlaySized = false
-					cur.writeHint = len(cur.rows)
-					if !slices.IsSorted(cur.rowids) { // the short rows come unioned at the end
-						sortRowsByRowid(cur)
-					} else {
-						cur.rowsBase = base // positions still those eachOf saw
-					}
-					cur.materialized = true
-					cur.pos = -1
-					cur.rowidNull = false
+					cur.materializeWriteHits(hits, fromSeg)
 					return nil
 				}
 			}
@@ -872,6 +870,12 @@ func (cur *vdbeCursor) rewind() error {
 				cur.rowidNull = false
 				return nil
 			}
+		}
+		// An IN list over the rowid, each key fetched as the point seek above
+		// fetches one. A key the segments do not answer leaves the whole set
+		// to the scan below.
+		if cur.seekSetConfigured && !cur.tbl.withoutRowid && cur.materializeRowidSet() {
+			return nil
 		}
 		// ...and the SECONDARY-INDEX equality seek, from the leading column's
 		// own posting list. It only PRUNES -- the keyed conjunct is re-checked
@@ -932,7 +936,7 @@ func (cur *vdbeCursor) rewind() error {
 		// cursor may stream, as it would have been with no seek planned. An
 		// automatic seek (automaticSeekCandidates) declines this way for any
 		// column the segments keep no equality index for.
-		cur.seekConfigured, cur.idxSeekConfigured = false, false
+		cur.seekConfigured, cur.idxSeekConfigured, cur.seekSetConfigured = false, false, false
 		if cur.streamable && !cur.tbl.withoutRowid {
 			if src := cur.pager.newSegRowSource(cur); src != nil {
 				cur.startSegSource(src)
@@ -1623,6 +1627,68 @@ func (cur *vdbeCursor) orderByWithoutRowidPK() {
 		key.desc = append(key.desc, desc)
 	}
 	autoIndexOrderCursor(cur, key, cur.pager.encoding())
+}
+
+// materializeWriteHits builds a write cursor's rows from the rowids a seek
+// named, in that order, dropping those its store does not hold. fromSeg says
+// the committed segments named them, which already left out the rows the
+// store deleted.
+func (cur *vdbeCursor) materializeWriteHits(hits []uint64, fromSeg bool) {
+	tbl := cur.rowStore
+	cur.rowids, cur.rows = slices.Grow(cur.rowids[:0], len(hits)), slices.Grow(cur.rows[:0], len(hits))
+	// The stored rows are kept as they are and fixed up as each becomes
+	// current (lazyNorm), as materializeRowStore does, rather than copied
+	// here: a tenth of a table is thousands of rows.
+	lazy := rowStoreNormalizesLazily(tbl)
+	ncols := len(tbl.cols)
+	base := make([]uint64, (len(hits)+63)/64)
+	tbl.rows.eachOf(hits, fromSeg, func(rid uint64, vals []Value, fromBase bool) {
+		if !lazy || len(vals) != ncols {
+			vals = normalizeRow(tbl.name, tbl.cols, tbl.ipkIndex, rid, vals)
+		}
+		if fromBase {
+			i := len(cur.rows)
+			base[i/64] |= 1 << (i % 64)
+		}
+		cur.rows = append(cur.rows, vals)
+		cur.rowids = append(cur.rowids, rid)
+	})
+	cur.lazyNorm = lazy
+	cur.rowsFrom, cur.rowsSwaps, cur.rowsWrites = tbl.rows, tbl.rows.swaps, tbl.rows.writes
+	cur.overlaySized = false
+	cur.writeHint = len(cur.rows)
+	if !slices.IsSorted(cur.rowids) { // the short rows come unioned at the end
+		sortRowsByRowid(cur)
+	} else {
+		cur.rowsBase = base // positions still those eachOf saw
+	}
+	cur.materialized = true
+	cur.pos = -1
+	cur.rowidNull = false
+}
+
+// materializeRowidSet builds the rows of an IN list over the rowid
+// (seekSet) from the segments, reporting false, with nothing built, when they
+// do not answer for this table.
+func (cur *vdbeCursor) materializeRowidSet() bool {
+	cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
+	cur.segSrc, cur.segCur = nil, nil
+	shared := cur.pager.ServesLiveRows(cur.tbl.root)
+	for _, rid := range cur.seekSet {
+		raw, found, served := cur.pager.SeekRowidSegments(cur.tbl.root, rid)
+		if !served {
+			cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
+			return false
+		}
+		if found {
+			cur.rowids = append(cur.rowids, uint64(rid))
+			cur.rows = append(cur.rows, cur.normalizeFrom(shared, uint64(rid), raw))
+		}
+	}
+	cur.materialized = true
+	cur.pos = -1
+	cur.rowidNull = false
+	return true
 }
 
 // sortRowsByRowid orders cur's materialized rows by rowid, keeping each row

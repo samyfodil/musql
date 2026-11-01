@@ -2649,8 +2649,9 @@ func (db *DB) compileDeleteStmt(stmt *deleteStmt, trig *trigCompileCtx) (*Progra
 	// A rowid point lookup, when the WHERE pins one: the scan fetches that row
 	// instead of materializing the table. Pure candidate-set restriction -- the
 	// conjunct below still runs on the fetched row. See write_rowid_seek.go.
-	if !emitWriteRowidSeekHint(c, tbl, 0, stmt.where) {
-		db.emitWriteIndexSeekHint(c, tbl, 0, FromItem{Schema: stmt.schema, Alias: stmt.alias, IndexedBy: stmt.indexedBy, NotIndexed: stmt.notIndexed}, stmt.where, trig)
+	if from := (FromItem{Schema: stmt.schema, Alias: stmt.alias, IndexedBy: stmt.indexedBy, NotIndexed: stmt.notIndexed}); !emitWriteRowidSeekHint(c, tbl, 0, stmt.where) &&
+		!db.emitWriteRowidSetHint(c, tbl, 0, from, stmt.where, trig) {
+		db.emitWriteIndexSeekHint(c, tbl, 0, from, stmt.where, trig)
 	}
 	loopWhere, constJumps, cerr := c.emitWriteConstTerms(stmt.where)
 	if cerr != nil {
@@ -3014,8 +3015,9 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 		// A rowid point lookup, when the WHERE pins one. Only for the ordinary
 		// UPDATE: with a FROM clause the scan drives pass one's EPHEMERAL table,
 		// whose rowids are its own and have nothing to do with the target's.
-		if !emitWriteRowidSeekHint(c, tbl, scanCur, stmt.where) {
-			db.emitWriteIndexSeekHint(c, tbl, scanCur, FromItem{Schema: stmt.schema, Alias: stmt.alias, IndexedBy: stmt.indexedBy, NotIndexed: stmt.notIndexed}, stmt.where, trig)
+		if from := (FromItem{Schema: stmt.schema, Alias: stmt.alias, IndexedBy: stmt.indexedBy, NotIndexed: stmt.notIndexed}); !emitWriteRowidSeekHint(c, tbl, scanCur, stmt.where) &&
+			!db.emitWriteRowidSetHint(c, tbl, scanCur, from, stmt.where, trig) {
+			db.emitWriteIndexSeekHint(c, tbl, scanCur, from, stmt.where, trig)
 		}
 	}
 	// THE ORDER THIS LOOP VISITS ROWS IN, when a SET subquery may depend on it

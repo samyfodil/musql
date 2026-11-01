@@ -1233,7 +1233,7 @@ func (prog *Program) outerCtxUnread() bool {
 			OpColumn, OpRowid, OpOuterColumn, OpOuterRowid,
 			OpInteger, OpVariable, OpNull, OpString8, OpReal, OpSCopy, OpCopy,
 			OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull,
-			OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpAutoIndexOrder, OpResultRow:
+			OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpSeekRowidSetHint, OpAutoIndexOrder, OpResultRow:
 		default:
 			unread = false
 		}
@@ -1962,18 +1962,14 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			if cursorHasNoBtree(m.cursors[op.P1]) {
 				break
 			}
-			// The key takes numeric affinity, as OP_SeekRowid gives it, and
-			// one that is still no integer equals no rowid: the cursor visits
+			// A key that is no integer equals no rowid: the cursor visits
 			// nothing, as C's loop does. A scan would test the rest of the
 			// WHERE on rows C never reads, and so raise errors C does not.
 			// The keyed conjunct is evaluated in the loop body regardless.
-			key := m.regs[op.P2]
-			if key.Typ != Int {
-				key = applyAffinityToValue(key, affNumeric)
-			}
+			key, ok := seekRowidKey(m.regs[op.P2])
 			cur := m.cursors[op.P1]
-			cur.seekConfigured, cur.seekNone = true, key.Typ != Int
-			cur.seekKey = key.I
+			cur.seekConfigured, cur.seekNone = true, !ok
+			cur.seekKey = key
 			cur.seekReseek = op.P3 == 1 // correlated join seek: re-seek per rewind
 
 		case OpSeekRowidRangeHint:
@@ -1981,6 +1977,22 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				break
 			}
 			m.cursors[op.P1].narrowRowidRangeBy(op.P3, m.regs[op.P2])
+
+		case OpSeekRowidSetHint:
+			if cursorHasNoBtree(m.cursors[op.P1]) {
+				break
+			}
+			// C's IN loop over the rowid seeks each value of its ephemeral
+			// index once, in order; a value no integer equals no rowid.
+			cur := m.cursors[op.P1]
+			keys := cur.seekSet[:0]
+			for _, v := range m.regs[op.P2 : op.P2+op.P3] {
+				if key, ok := seekRowidKey(v); ok {
+					keys = append(keys, key)
+				}
+			}
+			slices.Sort(keys)
+			cur.seekSet, cur.seekSetConfigured = slices.Compact(keys), true
 
 		case OpSeekIndexHint:
 			// Coerce the key with the exact affinity the WHERE comparison
@@ -2338,7 +2350,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			cur := m.cursors[op.P1]
 			if cur == nil || (cur.tbl == nil && cur.fill == nil) || cur.rowStore != nil || cur.sub != nil || cur.streamable || cur.seekConfigured ||
-				cur.idxSeekConfigured || cur.seekReseek || cur.segFilter != nil {
+				cur.seekSetConfigured || cur.idxSeekConfigured || cur.seekReseek || cur.segFilter != nil {
 				break
 			}
 			cur.params = m.params

@@ -233,6 +233,12 @@ type joinSource struct {
 	// most one source per compile.
 	seekKeyExpr Expr
 
+	// seekSet, when non-nil, is the list of a WHERE conjunct "rowid IN (...)"
+	// whose every element is column-free: emitJoinLoops evaluates them once
+	// after OpOpenRead and emits OpSeekRowidSetHint. Set by detectRowidInKeys
+	// when no seekKeyExpr applies.
+	seekSet []Expr
+
 	// rowidRange, when non-nil, is a WHERE conjunct bounding this table's rowid
 	// by a column-free expression: emitJoinLoops evaluates it after OpOpenRead
 	// and emits OpSeekRowidRangeHint. Set by detectRowidRangeKey.
@@ -3045,6 +3051,13 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 			}
 			c.emit(Instruction{Op: OpSeekRowidHint, P1: s.scope.cursor, P2: keyReg})
 		}
+		if s.seekSet != nil {
+			base, kerr := c.compileExprBlock(s.seekSet)
+			if kerr != nil {
+				return kerr
+			}
+			c.emit(Instruction{Op: OpSeekRowidSetHint, P1: s.scope.cursor, P2: base, P3: len(s.seekSet)})
+		}
 		if s.rowidRange != nil {
 			// The bound, evaluated once like the key above. See
 			// OpSeekRowidRangeHint and detectRowidRangeKey.
@@ -3799,7 +3812,7 @@ func planJoinHalt(srcs []joinSource, plan joinPlan) *joinHalt {
 		if level < len(plan.autoIdxKeys) {
 			auto = plan.autoIdxKeys[level]
 		}
-		noSeek := s.joinSeekKeyExpr == nil && s.joinIdxSeek == nil && s.seekKeyExpr == nil && s.idxSeek == nil &&
+		noSeek := s.joinSeekKeyExpr == nil && s.joinIdxSeek == nil && s.seekKeyExpr == nil && s.seekSet == nil && s.idxSeek == nil &&
 			plainKey(auto) && plainKey(s.idxOrderKey)
 		h.fullScan[level] = noSeek && s.vtabItem == nil && (s.cteItem == nil || s.cteItem.recSelf == nil)
 		// C opens the table itself, and so tests it, unless a covering index
