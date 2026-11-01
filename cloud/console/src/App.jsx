@@ -124,11 +124,10 @@ export default function App() {
 	const [toasts, toast] = useToasts();
 
 	// ---- undo, redo and saving ----
-	// Before the first write of a change the database is snapshotted (an
-	// export, a few ms): undo puts a snapshot back whole, so it is exact for
-	// any change, a cell or a table rebuild. Writes within half a second, or
-	// inside one transaction, are one change. After a change settles the
-	// database is saved in this browser.
+	// Before a change's first write the database is snapshotted (an export, a
+	// few ms), and undo puts the snapshot back whole, exact for any change.
+	// Writes within half a second or in one transaction are one change, saved
+	// in this browser once it settles.
 	const undoStack = useRef([]);
 	const redoStack = useRef([]);
 	const grouping = useRef(false);
@@ -547,11 +546,9 @@ export default function App() {
 		setConnecting(null);
 		return true;
 	};
-	// openCloud opens a database of the cloud server in the editor, over Hrana
-	// with a short-lived token the cloud page minted (renewed while the
-	// connection is open); it is not kept in the connection list, since the
-	// token would outlive its use. renamedFrom is the name the database was
-	// open under: it keeps its tabs, and the page stays where it is.
+	// openCloud opens a cloud database over Hrana with a short-lived token the
+	// cloud page minted and renews; it is not kept in the connection list.
+	// renamedFrom keeps a renamed database's tabs and the page where it is.
 	const openCloud = async (c, renamedFrom) => {
 		const view = renamedFrom && viewState(renamedFrom);
 		if (view) viewState(c.name, view);

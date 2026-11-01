@@ -1,11 +1,9 @@
 // Text-level helpers for the SQL a query tab runs.
 
 /**
- * expandEmbeds replaces every embed('text') or embed('text', 'model') call in
- * sql with a ? parameter: {sql, calls: [{text, model}]}, calls in parameter
- * order. Strings, quoted names and comments are skipped, so an "embed(" inside
- * them is left alone. embed is the studio's, not the engine's: the studio
- * embeds the text (embed.js) and binds the vector.
+ * expandEmbeds replaces every embed('text'[, 'model']) call outside strings,
+ * quoted names and comments with a ? parameter: {sql, calls: [{text, model}]}
+ * in parameter order. The console embeds the text (embed.js) and binds it.
  */
 export function expandEmbeds(sql) {
 	const calls = [];
@@ -119,12 +117,10 @@ function quoteEnd(sql, i) {
 }
 
 /**
- * openCall finds the call the end of sql is inside of: {name, arg}, the name
- * (lower-cased) before the innermost parenthesis still open, and which
- * argument is being written there, counted by the commas at that level. null
- * when that parenthesis is not a call. Strings, quoted names and comments are
- * skipped, so what they hold counts for nothing. The end of sql inside a
- * string or a quoted name is still inside its call; inside a comment, in none.
+ * openCall finds the call the end of sql is inside: {name, arg}, the
+ * lower-cased name before the innermost open parenthesis and the argument
+ * being written, or null when that parenthesis is no call. Strings, quoted
+ * names and comments are skipped.
  */
 export function openCall(sql) {
 	const open = []; // per open parenthesis: {name, arg}

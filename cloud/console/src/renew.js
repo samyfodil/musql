@@ -1,15 +1,10 @@
 // A remote database's token that renews itself, so a connection outlives it.
-// tokenSession tracks one token and mints the next; authFetch is the fetch
-// @libsql/client sends its requests through, signing each with the token of
-// the moment.
 
 /**
- * tokenSession holds a token and its expiry (ms since the epoch). mint()
- * resolves to the next {token, exp}. A token is renewed once half its
- * lifetime has passed: by a timer while the page is awake, at the next use if
- * the page slept through it, and whenever the server refuses it. A renewal
- * that fails is tried again halfway to the expiry; the token goes on serving
- * until then, and past it a request that needs a renewal fails with its error.
+ * tokenSession holds a token and its expiry (ms since the epoch); mint()
+ * resolves to the next {token, exp}. A token renews once half its lifetime has
+ * passed (by a timer, at the next use after a sleep, or when refused); a
+ * failed renewal retries halfway to the expiry while the token still serves.
  */
 export function tokenSession({ token, exp, mint }) {
 	let cur = { token, exp, at: Date.now() };
@@ -68,11 +63,7 @@ export function tokenSession({ token, exp, mint }) {
 	};
 }
 
-/**
- * authFetch is a fetch for @libsql/client's config: each request carries the
- * session's token, and one the server refuses with 401 is sent again with a
- * renewed token, once. send is the fetch underneath.
- */
+/** authFetch is @libsql/client's fetch: each request carries the session's token, and a 401 is retried once with a renewed one. */
 export function authFetch(session, send = (req) => fetch(req)) {
 	return async (req) => {
 		const body = req.method === "GET" || req.method === "HEAD" ? undefined : await req.arrayBuffer();

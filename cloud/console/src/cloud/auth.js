@@ -1,9 +1,7 @@
 // Signing in to a musql cloud server: OIDC authorization code with PKCE (S256)
-// against the server's own provider, as its public "console" client. The
-// access token lives in memory only; the refresh token in sessionStorage, so a
-// reload in the same tab stays signed in and a new tab signs in again. The
-// server registers one redirect URI for the console, <server>/console/callback,
-// so signing in only completes in the console the server itself serves.
+// as its public "console" client. The access token lives in memory and the
+// refresh token in sessionStorage, so a reload stays signed in and a new tab
+// signs in again. Only the console the server serves can complete a sign-in.
 
 const REFRESH = "musql-cloud:refresh";
 const PENDING = "musql-cloud:pending";

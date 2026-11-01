@@ -24,10 +24,9 @@ import { Spinner } from "./Busy.jsx";
 const READS = new Set(["SELECT", "WITH", "VALUES", "EXPLAIN", "PRAGMA"]);
 
 /**
- * A SQL editor and its results. Ctrl/Cmd+Enter runs the selection, or all of
- * it: a script runs a statement at a time, each with its own result, and stops
- * at the first error. embed('text') in a statement is the text's vector
- * (embed.js), bound as a parameter.
+ * A SQL editor and its results. Ctrl/Cmd+Enter runs the selection or all of
+ * it, a statement at a time, stopping at the first error. embed('text') binds
+ * the text's vector (embed.js).
  */
 export default function QueryView({ initial = "", title, onTitle, ask }) {
 	const { schema, columnsOf, status, changed, dark } = useStudio();

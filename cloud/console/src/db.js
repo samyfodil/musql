@@ -1,8 +1,6 @@
-// The page's side of the database. A local database is worker.js (musql in
-// wasm), every call a message answered by id; a remote one is a Hrana/libSQL
-// server reached with @libsql/client. query, run, rows and the exports go to
-// whichever is open; split always goes to the worker, which splits a script as
-// the engine does whether or not a local database is open.
+// The page's side of the database: a local one is worker.js, a remote one a
+// Hrana/libSQL server through @libsql/client. split always goes to the worker,
+// which splits a script as the engine does.
 import { authFetch, tokenSession } from "./renew.js";
 import { verb } from "./sqltext.js";
 
@@ -80,11 +78,9 @@ export const backend = () => (remote ? { kind: "remote", url: remote.url, host: 
 export const isRemote = () => !!remote;
 
 /**
- * connect opens a remote database and makes it the one every call goes to. It
- * runs SELECT 1 first, so a wrong URL or token fails here, with the server's
- * message, and leaves the open database as it was. A token that expires comes
- * with renewal, {exp, mint}: renew.js renews it before then, and when the
- * server refuses it.
+ * connect opens a remote database for every call to go to. SELECT 1 runs first,
+ * so a wrong URL or token fails here and leaves the open database as it was.
+ * renewal ({exp, mint}) renews an expiring token (renew.js).
  */
 export async function connect(url, authToken, renewal) {
 	const { createClient } = await import("@libsql/client/web");

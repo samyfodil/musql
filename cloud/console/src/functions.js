@@ -142,10 +142,9 @@ export const FUNCTIONS = LIST.map(([name, args, about, kind]) => ({ name, args, 
 export const byName = new Map(FUNCTIONS.map((f) => [f.name, f]));
 
 /**
- * signatureParts cuts an argument list as LIST writes it ("X [, Y]", "A, B, …")
- * into the pieces a tooltip shows, {text, active}, in order. The one for the
- * argument at index arg is active; commas, brackets and blanks are pieces of
- * their own and never are. An argument ending in … stands for all the rest.
+ * signatureParts cuts an argument list ("X [, Y]", "A, B, …") into a tooltip's
+ * pieces, {text, active}; the argument at index arg is active, and one ending
+ * in … stands for all the rest.
  */
 export function signatureParts(args, arg) {
 	const parts = [];

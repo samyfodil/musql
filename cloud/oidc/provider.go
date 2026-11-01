@@ -140,10 +140,9 @@ func WithLoginLimits(perIP, perEmail int, window time.Duration) Option {
 	}
 }
 
-// WithConsoleOrigins registers these origins as extra homes of the console
-// client: <origin>/console/callback and <origin>/callback are accepted
-// redirect URIs, so a dev server on another port can sign in. "*" is not an
-// origin and is skipped; matching stays exact.
+// WithConsoleOrigins accepts <origin>/console/callback and <origin>/callback
+// as the console client's redirect URIs, so a dev server on another port can
+// sign in. "*" is skipped; matching stays exact.
 func WithConsoleOrigins(origins []string) Option {
 	return func(o *options) { o.consoleOrigins = origins }
 }
@@ -689,10 +688,9 @@ func (p *Provider) token(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// revoke is RFC 7009. Only refresh tokens are stored, so only they can be
-// revoked (with their whole family); an access token is a signed JWT that
-// stays valid until it expires, and revoking one is accepted and does
-// nothing. As the RFC asks, an unknown token is not an error.
+// revoke is RFC 7009. Only refresh tokens are stored, so only they are revoked
+// (with their family); revoking an access token or an unknown token is
+// accepted and does nothing.
 func (p *Provider) revoke(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	clientID := r.PostFormValue("client_id")
