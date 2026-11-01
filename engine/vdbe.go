@@ -2835,6 +2835,12 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			if cur == nil || cur.tbl == nil || cur.pager == nil {
 				return nil, fmt.Errorf("vdbe: OpSegHashAgg on a closed cursor")
 			}
+			// A seek that reads a sliver of the table answers sooner than a
+			// walk of all of it: the loop below runs it.
+			if cur.seekIsNarrow() {
+				segGroupSeeksTaken.Add(1)
+				break
+			}
 			if m.segHashAggTable(cur.pager, cur.tbl.root, gplan) {
 				segFilterServed.Add(1)
 				pc = op.P2

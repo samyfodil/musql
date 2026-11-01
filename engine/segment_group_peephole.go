@@ -15,7 +15,7 @@ func segGroupPeephole(prog *Program) bool {
 		return false
 	}
 	rewindAt := 2
-	for rewindAt < len(in) && segIsScanPrologue(in[rewindAt].Op) {
+	for rewindAt < len(in) && segGroupPrologue(in[rewindAt].Op) {
 		rewindAt++
 	}
 	if rewindAt >= len(in) || in[rewindAt].Op != OpRewind {
@@ -24,6 +24,15 @@ func segGroupPeephole(prog *Program) bool {
 	cursor := in[rewindAt].P1
 	if in[1].P1 != cursor {
 		return false
+	}
+	// The guard goes after the seek hints, so the cursor it weighs knows its
+	// seek, and before an OpAutoIndexOrder, whose materializing the walk avoids.
+	guardAt := 2
+	for i := 2; i < rewindAt; i++ {
+		switch in[i].Op {
+		case OpSeekRowidHint, OpSeekRowidSetHint, OpSeekIndexHint, OpSeekRowidRangeHint:
+			guardAt = i + 1
+		}
 	}
 
 	// An optional WHERE first: the same predicate groups the filtered count
@@ -142,15 +151,28 @@ bodyDone:
 	// Rewrite: the guard goes before the Rewind, and on success jumps straight
 	// to the drain with the buckets already filled.
 	out := make([]Instruction, 0, len(in)+1)
-	out = append(out, in[0], in[1])
+	out = append(out, in[:guardAt]...)
 	out = append(out, Instruction{Op: OpSegHashAgg, P1: cursor, P2: sortAt + 1, P4: gplan})
-	for _, ins := range in[2:] {
+	for _, ins := range in[guardAt:] {
 		switch ins.Op {
 		case OpRewind, OpNext, OpIfNot, OpIsNull, OpHashAggSort, OpHashAggNext, OpIf, OpGoto, OpSorterCheck:
-			ins.P2++
+			if ins.P2 >= guardAt {
+				ins.P2++
+			}
 		}
 		out = append(out, ins)
 	}
 	prog.Insns = out
 	return true
+}
+
+// segGroupPrologue is segIsScanPrologue with every literal a seek key may load
+// and the rowid IN list's hint: the walk weighs a seek rather than ignoring
+// one, so its key's class does not matter.
+func segGroupPrologue(op OpCode) bool {
+	switch op {
+	case OpString8, OpReal, OpBlob, OpNull, OpSeekRowidSetHint:
+		return true
+	}
+	return segIsScanPrologue(op)
 }

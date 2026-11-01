@@ -319,6 +319,66 @@ func (cur *vdbeCursor) idxSeekRowids() ([]int64, bool) {
 	return cur.pager.SeekIndexRowidsByKeys(cur.tbl.root, keys)
 }
 
+// seekNarrowRatio is how many rows of a native walk cost what fetching one
+// row through a seek does: about 10 ns a row walked against 2.5 us a row
+// fetched and run through the loop, measured over 300k rows.
+const seekNarrowRatio = 256
+
+// seekIsNarrow reports whether the seek planned on cur reads at most a
+// seekNarrowRatio-th of the table's rows, so that it should answer rather than
+// a walk of every row. A rowid seek reads one row a key; an index seek as many
+// as the key its segments estimate fewest for (SeekIndexRowidsByKeys asks that
+// one first), of the keys they serve. No estimate leaves the walk.
+func (cur *vdbeCursor) seekIsNarrow() bool {
+	if cur.tbl == nil || cur.pager == nil || cur.pager.segs == nil {
+		return false
+	}
+	src, root := cur.pager.segs, cur.tbl.root
+	n := -1
+	switch {
+	case cur.seekConfigured:
+		n = 1
+	case cur.seekSetConfigured:
+		n = len(cur.seekSet)
+	case cur.idxSeekConfigured:
+		first := idxSeekKey{col: cur.idxSeekCol, probe: cur.idxSeekProbe, coll: cur.idxSeekColl, set: cur.idxSeekSet}
+		for _, k := range append([]idxSeekKey{first}, cur.idxSeekMore...) {
+			if !cur.idxSeekKeyServed(k) {
+				continue
+			}
+			if c, _, ok := src.seekIndexKeyEstimate(root, k); ok && (n < 0 || c < n) {
+				n = c
+			}
+		}
+	}
+	if n < 0 {
+		return false
+	}
+	total, ok := src.segTableRows(root)
+	return ok && n*seekNarrowRatio <= total
+}
+
+// idxSeekKeyServed reports whether the segments can answer key k: not a VIRTUAL
+// generated column (idxSeekRowids), and no TEXT value under a sequence other
+// than BINARY (SeekIndexRowidsSegments).
+func (cur *vdbeCursor) idxSeekKeyServed(k idxSeekKey) bool {
+	if c := k.col; c >= 0 && c < len(cur.tbl.cols) && cur.tbl.cols[c].IsGenerated() && !cur.tbl.cols[c].GeneratedStored {
+		return false
+	}
+	if equalFoldName(effectiveCollation(k.coll), "BINARY") {
+		return true
+	}
+	if k.set == nil {
+		return k.probe.Typ != Text
+	}
+	for _, v := range k.set {
+		if v.Typ == Text {
+			return false
+		}
+	}
+	return true
+}
+
 // writeSeekRowids is a write cursor's equality candidates, from its store's
 // indexes: its own (eqRowidsOf) where prefersEqIndex says so, else the
 // committed segments' (segEqRowids). Several keys are asked in the order of how

@@ -613,6 +613,10 @@ func ProgramUsesSegFilterForTest(rp *ReadOnlyPager, stmt *SelectStmt) (bool, err
 // Incremented once per statement, not per row.
 var segFilterServed, segFilterDeclined atomic.Int64
 
+// segGroupSeeksTaken counts the columnar GROUP BY walks that gave way to a
+// narrow seek (seekIsNarrow), for tests.
+var segGroupSeeksTaken atomic.Int64
+
 // SegFilterCountersForTest returns how many statements the JITted filter has
 // answered and how many it has handed back to the loop, since the last reset.
 func SegFilterCountersForTest() (served, declined int64) {
@@ -623,6 +627,7 @@ func SegFilterCountersForTest() (served, declined int64) {
 func ResetSegFilterCountersForTest() {
 	segFilterServed.Store(0)
 	segFilterDeclined.Store(0)
+	segGroupSeeksTaken.Store(0)
 }
 
 // segIsScanPrologue reports whether op may appear between the OpenRead and the
