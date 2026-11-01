@@ -44,9 +44,20 @@ func segGroupPeephole(prog *Program) bool {
 	if stepAt+1 >= len(in) {
 		return false
 	}
-	preds, pc, okPreds := segParsePredBlock(in, rewindAt+1, stepAt, cursor, stepAt+1)
-	if !okPreds {
-		return false
+	var preds []segPlanPred
+	var lists []segPlanList
+	pc := rewindAt + 1
+	for {
+		more, npc, ok := segParsePredBlock(in, pc, stepAt, cursor, stepAt+1)
+		if !ok {
+			return false
+		}
+		preds, pc = append(preds, more...), npc
+		if pl, npc, ok := segParseInListGroup(in, pc, stepAt, cursor, stepAt+1); ok {
+			lists, pc = append(lists, pl), npc
+			continue
+		}
+		break
 	}
 
 	// Scan body: Column/SCopy, MakeRecord for key, Column/SCopy for args, then step.
@@ -107,7 +118,7 @@ bodyDone:
 		}
 	}
 
-	gplan := &segGroupPlan{agg: agg, seg: step.P2, preds: preds}
+	gplan := &segGroupPlan{agg: agg, seg: step.P2, preds: preds, lists: lists}
 	for i := 0; i < keyN; i++ {
 		c, okc := regCol[keyBase+i]
 		if !okc {

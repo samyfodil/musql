@@ -440,13 +440,19 @@ func (c *compiler) allocN(n int) int {
 }
 
 // compileExprBlock evaluates exprs into a consecutive block of registers and
-// returns its base.
+// returns its base. A sign over a literal is loaded folded (inListConst), so a
+// seek's keys are constants a scan prologue recognises.
 func (c *compiler) compileExprBlock(exprs []Expr) (int, error) {
 	base := c.allocN(len(exprs))
 	for i, e := range exprs {
-		r, err := c.compileExpr(e)
-		if err != nil {
-			return 0, err
+		var r int
+		if v, ok := inListConst(e); ok {
+			r = c.compileLiteral(v)
+		} else {
+			var err error
+			if r, err = c.compileExpr(e); err != nil {
+				return 0, err
+			}
 		}
 		c.emit(Instruction{Op: OpSCopy, P1: r, P2: base + i})
 	}

@@ -355,7 +355,7 @@ func (cur *vdbeCursor) seekIsNarrow() bool {
 		return false
 	}
 	total, ok := src.segTableRows(root)
-	return ok && n*seekNarrowRatio <= total
+	return ok && n <= total/seekNarrowRatio
 }
 
 // idxSeekKeyServed reports whether the segments can answer key k: not a VIRTUAL

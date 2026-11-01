@@ -65,9 +65,9 @@ const (
 	bulkFailed // buckets partly written: decline the statement
 )
 
-// preds, when not empty, is the WHERE: only rows satisfying it are summed, and a
+// w, when not empty, is the WHERE: only rows satisfying it are summed, and a
 // group none of whose rows does never gets a bucket, as in the row walk.
-func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, rowids, keyVals []Value, preds []segPred, skips [][]int, deltaLive map[int64][]Value) int {
+func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, rowids, keyVals []Value, w segWhere, skips [][]int, deltaLive map[int64][]Value) int {
 	if len(plan.keyCols) != 1 || plan.agg.anchorCheck != nil {
 		return bulkNotEligible
 	}
@@ -164,10 +164,10 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 			pt.groups = map[int64]*segGroupAcc{}
 		}
 		skip, sk := skips[si], 0
-		if len(preds) == 0 && dense && len(skip) == 0 && segGroupDenseFlat(s, plan.argCols, b.key, b.args, needSum, needMM, lo, si, pt.slots) {
+		if w.empty() && dense && len(skip) == 0 && segGroupDenseFlat(s, plan.argCols, b.key, b.args, needSum, needMM, lo, si, pt.slots) {
 			return true
 		}
-		if len(preds) > 0 && !segPredColsFilterable(s, preds) {
+		if !w.empty() && !w.filterable(s) {
 			return false
 		}
 		// The WHERE a batch at a time, into flags on the stack, by the filtered
@@ -184,15 +184,15 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 				sk++
 				continue
 			}
-			if len(preds) > 0 {
+			if !w.empty() {
 				if blo := r - r%segFilterBatch; blo != batchLo {
 					batchLo = blo
 					live := flags[:min(blo+segFilterBatch, s.nRows)-blo]
 					for i := range live {
 						live[i] = 1
 					}
-					for _, pr := range preds {
-						segApplyPred(s, pr, blo, live)
+					if !w.apply(s, blo, live) {
+						return false
 					}
 				}
 				if flags[r-batchLo] == 0 {
@@ -273,8 +273,8 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		keyCol := plan.keyCols[0]
 		for _, rid := range rids {
 			vals := deltaLive[rid]
-			if len(preds) > 0 {
-				matched, served := rowMatchesPreds(vals, preds)
+			if !w.empty() {
+				matched, served := w.matchRow(vals)
 				if !served {
 					return bulkNotEligible
 				}
