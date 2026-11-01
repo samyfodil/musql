@@ -461,8 +461,17 @@ func (db *DB) segmentFileContentsOf(temp bool, w *segFileWriter) ([]ConvertedTab
 		// order and cut as they fill, so a table this session spilled
 		// (row_store_spill.go) is read back a segment at a time, not whole.
 		// addSegment is done with a segment's bytes when it returns: it copies
-		// them or writes them out.
-		cut := &segCutter{cols: colInfos, what: t.name, reuse: true, emit: func(raw []byte) error { return w.addSegment(ti, raw) }}
+		// them or writes them out. While the writer holds its segments in
+		// memory it keeps these bytes instead of a copy, and the next segment
+		// is built in memory of its own.
+		cut := &segCutter{cols: colInfos, what: t.name, reuse: true}
+		cut.emit = func(raw []byte) error {
+			if w.scratch == nil {
+				cut.buf = nil
+				return w.addSegmentOwned(ti, raw)
+			}
+			return w.addSegment(ti, raw)
+		}
 		run := spillRun{st: t.rows, cut: cut, nCols: len(colInfos), emit: func(sg *spillSeg) error { return w.addSpilled(ti, sg) }}
 		var cerr error
 		t.rows.eachSortedRaw(func(rid uint64, vals []Value) bool {
