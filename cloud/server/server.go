@@ -50,13 +50,10 @@ type Server struct {
 
 var errNoAdminYet = errors.New("no admin yet: waiting for the state from a peer, or run musql-cloud init")
 
-// New opens the state in cfg.DataDir, makes sure the configured admin can
-// sign in, and builds the handler.
-//
-// Databases' histories are logged by the engine's commit hook: the process
-// must have called engine.Configure(engine.WithCommitHook(store.OnCommit)).
-// Without it a history still catches up when it is synced (a snapshot, a
-// restore), but commits in between are logged as one.
+// New opens the state in cfg.DataDir, makes sure the configured admin can sign
+// in, and builds the handler. Histories are logged by the engine's commit hook,
+// which the process must install (engine.WithCommitHook(store.OnCommit));
+// without it a history catches up only when synced.
 func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) {
 	if logger == nil {
 		logger = log.New(os.Stderr, "musql-cloud: ", log.LstdFlags)
@@ -261,9 +258,8 @@ func (s *Server) routes() http.Handler {
 var oidcCORSPaths = []string{"/oidc/token", "/oidc/userinfo", "/oidc/logout", "/oidc/revoke"}
 
 // cors lets the configured origins call the API, Hrana and the OIDC token
-// endpoints from a browser.
-// Credentials travel in the Authorization header, never in cookies, so no
-// cookie-bearing request is allowed across origins.
+// endpoints from a browser. Credentials travel in the Authorization header,
+// never in cookies, so no cookie-bearing request crosses origins.
 func (s *Server) cors(next http.Handler) http.Handler {
 	origins := s.cfg.Console.CORSOrigins
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

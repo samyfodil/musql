@@ -63,9 +63,8 @@ type OIDCConfig struct {
 // UploadsConfig bounds the files clients send to create a database from.
 type UploadsConfig struct {
 	// MaxBytes is the largest file one upload may carry (default 16 GiB). The
-	// file is kept whole on disk while it is used: converting a C SQLite one
-	// needs about as much room again, and checking it scratch space for its
-	// index keys. Memory does not grow with it.
+	// file stays on disk while used, and converting a C SQLite one needs about
+	// as much room again; memory does not grow with it.
 	MaxBytes int64 `yaml:"max_bytes"`
 	// TTL is how long an upload that nothing writes to or uses is kept before
 	// it is removed (default 24h).

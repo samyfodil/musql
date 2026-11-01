@@ -71,11 +71,10 @@ func retryable(ctx context.Context, err error) bool {
 	return true
 }
 
-// upload sends the file at path to the server in pieces, with progress on
-// stderr, and returns the finished upload's id. With resume set it continues
-// that unfinished upload from where the server says it stands. A piece that
-// fails like a network does is asked about and sent again from the server's
-// offset; the file's SHA-256 is checked by the server at the end.
+// upload sends the file at path in pieces, with progress on stderr, and returns
+// the finished upload's id; resume continues an unfinished one. A piece that
+// fails like the network is resent from the server's offset, and the server
+// checks the SHA-256 at the end.
 func (a *app) upload(ctx context.Context, org, path, resume string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {

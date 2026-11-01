@@ -19,12 +19,10 @@ const wait = (ms, signal) =>
 	});
 
 /**
- * uploadFile sends file through db (the DatabaseService client) and resolves to
- * {upload, format}: the id to create a database from. Progress is
- * onProgress(sent, total). A piece that fails like the network is asked
- * about and sent again from where the server says the upload stands; the
- * server checks the file's SHA-256 at the end. With `resume`, the upload
- * that id names is continued instead of a new one started.
+ * uploadFile sends file through db and resolves to {upload, format}, the id to
+ * create a database from, with onProgress(sent, total). A piece that fails
+ * like the network is resent from where the server says the upload stands,
+ * and the server checks the SHA-256 at the end. resume continues an upload.
  */
 export async function uploadFile(db, org, file, { onProgress, signal, resume = "", backoffMs = 500 } = {}) {
 	if (!file.size) throw new Error(`${file.name} is empty`);
@@ -104,12 +102,10 @@ function saveBlob(blob, filename) {
 }
 
 /**
- * downloadExport saves the export that req asks db (the DatabaseService
- * client) for as filename, with progress onProgress(received, total). A
- * browser that can write a file as pieces arrive (the File System Access
- * API) holds none of it; any other folds the pieces into a Blob, which it
- * keeps off the page's heap as it sees fit. Call it from the click that
- * starts the download: the save dialog needs that click.
+ * downloadExport saves an export as filename, with onProgress(received,
+ * total). Where the browser can write a file as pieces arrive it holds none of
+ * it; otherwise the pieces fold into a Blob. Call it from the click that starts
+ * the download: the save dialog needs that click.
  */
 export async function downloadExport(db, req, filename, { onProgress, signal, save = saveBlob } = {}) {
 	let out = null;

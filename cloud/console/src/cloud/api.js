@@ -70,11 +70,7 @@ export function cloudDatabase(conn) {
 
 const DB_TOKEN_LIFETIME = 3600e3;
 
-/**
- * databaseToken mints a token for one of this server's databases, good for an
- * hour: {token, exp}, exp in ms since the epoch. The editor's connection asks
- * again before the token runs out (renew.js).
- */
+/** databaseToken mints an hour's token for a database: {token, exp}, exp in ms; the editor renews it (renew.js). */
 export async function databaseToken(org, name, readOnly) {
 	const exp = Date.now() + DB_TOKEN_LIFETIME;
 	try {

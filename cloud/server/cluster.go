@@ -38,10 +38,9 @@ type crdtDB struct {
 	db   *sql.DB
 	path string
 	hist string
-	// syncing is set from placement until the first sync with the peers has
-	// completed: until then the file holds only part of the database, and it
-	// is not served. It is kept on disk as path+syncingSuffix, so a node that
-	// stops before then resumes it.
+	// syncing is set from placement until the first sync with the peers, while
+	// the file holds only part of the database and is not served; kept on disk
+	// as path+syncingSuffix so a restart resumes it.
 	syncing bool
 }
 

@@ -130,13 +130,11 @@ func (s *stream) execute(ctx context.Context, st *pb.Stmt) (*pb.StmtResult, erro
 	return res, err
 }
 
-// run is execute's statement, also reporting how many rows it returned and
-// changed. It runs on the musql connection itself, which newStream checked
-// the stream holds, and reads the rows as the driver hands them over:
-// database/sql's Rows would add allocations to every query, and a goroutine
-// to every one whose context can be cancelled. What database/sql checks
-// before a query is checked here too: a context already done, and a named
-// argument whose name does not begin with a letter.
+// run is execute's statement, also reporting the rows it returned and changed.
+// It runs on the musql connection itself and reads the rows as the driver
+// hands them over, sparing database/sql's allocations and goroutine; what
+// database/sql checks first (a done context, a named argument's name) is
+// checked here too.
 func (s *stream) run(ctx context.Context, q string, st *pb.Stmt) (res *pb.StmtResult, read, written int64, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, 0, 0, err

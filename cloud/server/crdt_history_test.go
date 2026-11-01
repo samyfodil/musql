@@ -217,11 +217,9 @@ func TestClusterCRDTRestoreAsNew(t *testing.T) {
 	holds(t, nodes, "r-0", p0.want)
 }
 
-// An in-place restore writes the difference: every node converges to the
-// state at T whatever changed since (updates, deletes, re-inserts, a UNIQUE
-// value traded between two rows, a keyless table's rows), the database stays
-// live, and a restore to before it undoes it. Across a schema change it is
-// declined.
+// An in-place restore writes the difference: every node converges to the state
+// at T whatever changed since, the database stays live, a later restore undoes
+// it, and one across a schema change is declined.
 func TestClusterCRDTRestoreInPlace(t *testing.T) {
 	nodes := newCluster(t, 3)
 	acmeEverywhere(t, nodes)
