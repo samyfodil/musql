@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"errors"
-	"maps"
 	"slices"
 )
 
@@ -26,25 +25,21 @@ var errBadRec = errors.New("replication: malformed clock record")
 
 // encodeRec packs cells, which hold one at least.
 func encodeRec(cells map[string]clockCell) (rec []byte, top HLC) {
-	type tag struct {
-		hlc  HLC
-		site string
-	}
-	counts := make(map[tag]int, 2)
-	var shared tag
-	best := 0
-	for _, c := range cells {
-		t := tag{c.hlc, c.site}
-		counts[t]++
-		if n := counts[t]; n > best || n == best && TagLess(shared.hlc, shared.site, t.hlc, t.site) {
-			shared, best = t, n
-		}
+	var keyBuf [16]string
+	keys := keyBuf[:0]
+	size := 3 * binary.MaxVarintLen64
+	for col, c := range cells {
+		keys = append(keys, col)
 		top = max(top, c.hlc)
+		size += 4*binary.MaxVarintLen64 + 1 + len(col) + len(c.site) + len(c.val)
 	}
+	slices.Sort(keys)
+	shared := sharedTag(cells, keys)
+	rec = make([]byte, 0, size)
 	rec = binary.AppendUvarint(rec, uint64(shared.hlc))
 	rec = appendRecStr(rec, shared.site)
 	rec = binary.AppendUvarint(rec, uint64(len(cells)))
-	for _, col := range slices.Sorted(maps.Keys(cells)) {
+	for _, col := range keys {
 		c := cells[col]
 		rec = appendRecStr(rec, col)
 		if c.hlc == shared.hlc && c.site == shared.site {
@@ -60,26 +55,63 @@ func encodeRec(cells map[string]clockCell) (rec []byte, top HLC) {
 	return rec, top
 }
 
+type recTag struct {
+	hlc  HLC
+	site string
+}
+
+// sharedTag is the tag most of cells carry, the greatest of those tied.
+func sharedTag(cells map[string]clockCell, keys []string) recTag {
+	type count struct {
+		t recTag
+		n int
+	}
+	var buf [8]count
+	counts := buf[:0]
+	var shared recTag
+	best := 0
+	for _, col := range keys {
+		t := recTag{cells[col].hlc, cells[col].site}
+		i := 0
+		for i < len(counts) && counts[i].t != t {
+			i++
+		}
+		if i == len(counts) {
+			counts = append(counts, count{t: t})
+		}
+		counts[i].n++
+		if n := counts[i].n; n > best || n == best && TagLess(shared.hlc, shared.site, t.hlc, t.site) {
+			shared, best = t, n
+		}
+	}
+	return shared
+}
+
 func appendRecStr(b []byte, s string) []byte {
 	return append(binary.AppendUvarint(b, uint64(len(s))), s...)
 }
 
 // decodeRec unpacks a record. Each cell's value is a slice of rec.
 func decodeRec(rec []byte) (map[string]clockCell, error) {
+	return decodeRecIn(rec, nil)
+}
+
+// decodeRecIn is decodeRec taking each column and site name from in.
+func decodeRecIn(rec []byte, in recIntern) (map[string]clockCell, error) {
 	r := recReader{b: rec}
-	shared := clockCell{hlc: HLC(r.uvarint()), site: string(r.bytes())}
+	shared := clockCell{hlc: HLC(r.uvarint()), site: in.str(r.bytes())}
 	n := r.uvarint()
 	if n > uint64(len(rec)) {
 		return nil, errBadRec
 	}
 	cells := make(map[string]clockCell, n)
 	for range n {
-		col := string(r.bytes())
+		col := in.str(r.bytes())
 		c := shared
 		switch r.byte() {
 		case 0:
 		case 1:
-			c.hlc, c.site = HLC(r.uvarint()), string(r.bytes())
+			c.hlc, c.site = HLC(r.uvarint()), in.str(r.bytes())
 		default:
 			r.bad = true
 		}
@@ -93,6 +125,22 @@ func decodeRec(rec []byte) (map[string]clockCell, error) {
 		return nil, errBadRec
 	}
 	return cells, nil
+}
+
+// recIntern hands out one string per column or site name: they repeat on
+// every record. A nil one copies each name.
+type recIntern map[string]string
+
+func (in recIntern) str(b []byte) string {
+	if in == nil {
+		return string(b)
+	}
+	if s, ok := in[string(b)]; ok {
+		return s
+	}
+	s := string(b)
+	in[s] = s
+	return s
 }
 
 type recReader struct {
