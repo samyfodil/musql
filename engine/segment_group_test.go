@@ -136,7 +136,9 @@ func TestColumnarFilteredGroupByMatchesTheLoop(t *testing.T) {
 		{`SELECT s, count(*) FROM t WHERE v > 0 GROUP BY s ORDER BY s`, nil, true},
 		{`SELECT k, count(*) FROM t WHERE f > 50.5 GROUP BY k ORDER BY k`, nil, true}, // REAL column
 		{`SELECT k, count(*) FROM t WHERE v > 2.5 GROUP BY k ORDER BY k`, nil, true},  // REAL bound, INTEGER column
-		{`SELECT k, count(*) FROM t WHERE v = '17' GROUP BY k ORDER BY k`, nil, true}, // affinity on the bound
+		{`SELECT k, count(*) FROM t WHERE j = '2' GROUP BY k ORDER BY k`, nil, true},  // affinity on the bound
+		// A key holding about one row in 5,000: its seek answers (seekIsNarrow).
+		{`SELECT k, count(*) FROM t WHERE v = '17' GROUP BY k ORDER BY k`, nil, false},
 		{`SELECT k, count(*) FROM t WHERE s > 's5' GROUP BY k ORDER BY k`, nil, true}, // TEXT predicate
 		// Declines, which the loop then answers:
 		{`SELECT k, count(*) FROM t WHERE v > ? GROUP BY k`, []Value{{Typ: Null}}, false}, // NULL bound

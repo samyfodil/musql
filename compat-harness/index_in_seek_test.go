@@ -138,3 +138,33 @@ func TestConstantSeekUnderOrderBy(t *testing.T) {
 		"SELECT t1.id, t2.id FROM t t1 JOIN t t2 ON t2.a = t1.a WHERE t1.id IN (3, 4) ORDER BY 1, 2",
 	})
 }
+
+// A GROUP BY seeks too, and group_concat inside a group sees the rows in the
+// order C's loop visits them; a term that can raise is tested on the seeked
+// rows alone.
+func TestConstantSeekUnderGroupBy(t *testing.T) {
+	differ(t, "seek under GROUP BY", []string{
+		"CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, a INTEGER, s TEXT, j TEXT)",
+		"CREATE INDEX ta ON t(a)",
+		"WITH RECURSIVE c(x) AS (VALUES(-10) UNION ALL SELECT x+1 FROM c WHERE x < 3000) " +
+			"INSERT INTO t SELECT x, x % 7, x % 400, char(97 + (x + 10) % 5), CASE WHEN x % 40 = 0 THEN '{bad' ELSE '{}' END FROM c",
+		"VACUUM",
+		"INSERT INTO t VALUES(5000, 4, 9, 'q', '{}')",
+		"DELETE FROM t WHERE id % 19 = 0",
+		"SELECT k, count(*), group_concat(id) FROM t WHERE a IN (9, 3, 250) GROUP BY k",
+		"SELECT a, group_concat(id) FROM t WHERE a IN (9, 3, 250) GROUP BY a",
+		"SELECT s, sum(a), group_concat(id, ':') FROM t WHERE a = 5 GROUP BY s ORDER BY s DESC",
+		"SELECT k, max(s), min(id), group_concat(s, '') FROM t WHERE id IN (17, 4, -10, 2999, 2000, 5000) GROUP BY k",
+		"SELECT k, count(*) FROM t WHERE a = 11 GROUP BY k HAVING count(*) > 1",
+		"SELECT k, a, count(*) FROM t WHERE a IN (1, 2) GROUP BY k, a",
+		"SELECT count(*) FROM t WHERE a IN (2, 3) GROUP BY s",
+		"SELECT DISTINCT k FROM t WHERE a IN (4, 5, 6) GROUP BY k, s",
+		"SELECT k, count(*) FROM t WHERE json_extract(j, '$.v') IS NULL AND a IN (1, 2) GROUP BY k",
+		"SELECT k, count(*) FROM t WHERE a IN (1, 2) AND json_extract(j, '$.v') IS NULL GROUP BY k",
+		"BEGIN",
+		"UPDATE t SET a = 3 WHERE id % 23 = 0",
+		"SELECT k, count(*), group_concat(id) FROM t WHERE a IN (9, 3) GROUP BY k",
+		"SELECT k, group_concat(s) FROM t WHERE id IN (23, 46, 3, 4) GROUP BY k",
+		"COMMIT",
+	})
+}
