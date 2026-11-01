@@ -143,6 +143,8 @@ type vdbeCursor struct {
 	idxSeekConfigured bool
 	idxSeekProbe      Value
 	idxSeekColl       string
+	// idxSeekSet is the first key's IN list, when it is one (idxSeekKey.set).
+	idxSeekSet []Value
 	// idxSeekCol is the TABLE column the index leads on.
 	idxSeekCol int
 	// idxSeekMore are the keys of OpSeekIndexHint's later slots: equalities on
@@ -303,11 +305,11 @@ func (cur *vdbeCursor) idxSeekRowids() ([]int64, bool) {
 		if !stored(cur.idxSeekCol) {
 			return nil, false
 		}
-		return cur.pager.SeekIndexRowidsByKeys(cur.tbl.root, []idxSeekKey{{col: cur.idxSeekCol, probe: cur.idxSeekProbe, coll: cur.idxSeekColl}})
+		return cur.pager.SeekIndexRowidsByKeys(cur.tbl.root, []idxSeekKey{{col: cur.idxSeekCol, probe: cur.idxSeekProbe, coll: cur.idxSeekColl, set: cur.idxSeekSet}})
 	}
 	keys := make([]idxSeekKey, 0, 1+len(cur.idxSeekMore))
 	if stored(cur.idxSeekCol) {
-		keys = append(keys, idxSeekKey{col: cur.idxSeekCol, probe: cur.idxSeekProbe, coll: cur.idxSeekColl})
+		keys = append(keys, idxSeekKey{col: cur.idxSeekCol, probe: cur.idxSeekProbe, coll: cur.idxSeekColl, set: cur.idxSeekSet})
 	}
 	for _, k := range cur.idxSeekMore {
 		if stored(k.col) {
@@ -327,31 +329,50 @@ func (cur *vdbeCursor) idxSeekRowids() ([]int64, bool) {
 // equality).
 func (cur *vdbeCursor) writeSeekRowids() (hits []uint64, fromSeg, ok bool) {
 	rows := cur.rowStore.rows
-	ask := func(k idxSeekKey) ([]uint64, bool, bool) {
-		if k.probe.Typ == Text && !equalFoldName(effectiveCollation(k.coll), "BINARY") {
+	askOne := func(col int, probe Value, coll string) ([]uint64, bool, bool) {
+		if probe.Typ == Text && !equalFoldName(effectiveCollation(coll), "BINARY") {
 			return nil, false, false
 		}
-		if rows.prefersEqIndex(k.col) {
-			if hits, ok := rows.eqRowidsOf(k.col, k.probe); ok {
+		if rows.prefersEqIndex(col) {
+			if hits, ok := rows.eqRowidsOf(col, probe); ok {
 				return hits, false, true
 			}
 		}
-		if hits, ok := rows.segEqRowids(k.col, k.probe); ok {
+		if hits, ok := rows.segEqRowids(col, probe); ok {
 			return hits, true, true
 		}
-		if hits, ok := rows.eqRowidsOf(k.col, k.probe); ok {
+		if hits, ok := rows.eqRowidsOf(col, probe); ok {
 			return hits, false, true
 		}
 		return nil, false, false
 	}
-	first := idxSeekKey{col: cur.idxSeekCol, probe: cur.idxSeekProbe, coll: cur.idxSeekColl}
+	// An IN list's candidates are its values', in rowid order, each once;
+	// fromSeg only when the segments named them all.
+	ask := func(k idxSeekKey) ([]uint64, bool, bool) {
+		if k.set == nil {
+			return askOne(k.col, k.probe, k.coll)
+		}
+		var out []uint64
+		fromSeg := true
+		for _, v := range k.set {
+			hits, seg, ok := askOne(k.col, v, k.coll)
+			if !ok {
+				return nil, false, false
+			}
+			out = append(out, hits...)
+			fromSeg = fromSeg && seg
+		}
+		slices.SortFunc(out, cmpRowid)
+		return slices.Compact(out), fromSeg, true
+	}
+	first := idxSeekKey{col: cur.idxSeekCol, probe: cur.idxSeekProbe, coll: cur.idxSeekColl, set: cur.idxSeekSet}
 	if len(cur.idxSeekMore) == 0 {
 		return ask(first)
 	}
 	keys := append([]idxSeekKey{first}, cur.idxSeekMore...)
 	est := make([]int, len(keys))
 	for i, k := range keys {
-		est[i] = rows.segEqEstimate(k.col, k.probe)
+		est[i] = rows.segEqKeyEstimate(k)
 	}
 	order := make([]int, len(keys))
 	for i := range order {

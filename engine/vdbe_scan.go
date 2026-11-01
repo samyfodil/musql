@@ -882,7 +882,7 @@ func detectRowidInKeys(c *compiler, srcs []joinSource, where Expr) (int, []Expr,
 		}
 		for n, cj := range conjuncts {
 			in, ok := cj.(InExpr)
-			if !ok || !isRowidInList(in) || !isScopeRowidRef(c, s, in.X) {
+			if !ok || !isSeekInList(in) || !isScopeRowidRef(c, s, in.X) {
 				continue
 			}
 			if !newSeekGuard(c, srcs, i, splitTopLevelAnd(where)).keep(xnRowid, at[n], true) {
@@ -894,9 +894,9 @@ func detectRowidInKeys(c *compiler, srcs []joinSource, where Expr) (int, []Expr,
 	return 0, nil, false
 }
 
-// isRowidInList reports an IN a rowid seek can answer: a list, not negated,
-// of literals, signs over them and bound parameters, none of which can raise.
-func isRowidInList(in InExpr) bool {
+// isSeekInList reports an IN a seek can answer: a list, not negated, of
+// literals, signs over them and bound parameters, none of which can raise.
+func isSeekInList(in InExpr) bool {
 	if in.Not || in.Sub != nil || len(in.List) == 0 {
 		return false
 	}
@@ -1132,6 +1132,9 @@ type indexSeekPlan struct {
 
 	// is marks "x IS key", whose NULL key matches x's NULLs rather than nothing.
 	is bool
+	// keySet, when not nil, is "x IN (keySet)": the key is each of them, and
+	// keyExpr is unused.
+	keySet []Expr
 
 	// more are the other equalities on this table a seek can be answered from,
 	// emitted as OpSeekIndexHint's later slots. Any one of them bounds the
@@ -1210,13 +1213,21 @@ func detectIndexSeekKey(c *compiler, srcs []joinSource, where Expr) (int, *index
 		for n, cj := range conjuncts {
 			// "x IS ?" is "x = ?" for every key but NULL, which no posting list
 			// holds: a NULL probe is never served, and the scan decides.
-			be, ok := cj.(BinaryExpr)
-			if !ok || (be.Op != "=" && be.Op != "==" && be.Op != "IS") {
+			var plan *indexSeekPlan
+			var ok bool
+			switch e := cj.(type) {
+			case BinaryExpr:
+				if e.Op != "=" && e.Op != "==" && e.Op != "IS" {
+					continue
+				}
+				plan, ok = columnSeekPlan(c, s, cands, e, e.L, e.R)
+				if !ok {
+					plan, ok = columnSeekPlan(c, s, cands, e, e.R, e.L)
+				}
+			case InExpr:
+				plan, ok = columnInSeekPlan(c, s, cands, e)
+			default:
 				continue
-			}
-			plan, ok := columnSeekPlan(c, s, cands, be, be.L, be.R)
-			if !ok {
-				plan, ok = columnSeekPlan(c, s, cands, be, be.R, be.L)
 			}
 			if ok {
 				if guard == nil {
@@ -1257,6 +1268,22 @@ func columnSeekPlan(c *compiler, s joinSource, cands []indexSeekCandidate, be Bi
 		return nil, false
 	}
 	plan.is = be.Op == "IS"
+	return plan, true
+}
+
+// columnInSeekPlan is columnSeekPlan for "colExpr IN (list)" over literals
+// and bound parameters (isSeekInList): the key is the list, each value taking
+// the IN's affinity, which is the column's own, and its rows each value's.
+func columnInSeekPlan(c *compiler, s joinSource, cands []indexSeekCandidate, in InExpr) (*indexSeekPlan, bool) {
+	colIdx, ok := scopeColumnIndex(c, s, in.X)
+	if !ok || colIdx == s.tbl.ipkIndex || !isSeekInList(in) {
+		return nil, false
+	}
+	plan, ok := planForColumn(c, cands, colIdx, in.X, in.List[0])
+	if !ok {
+		return nil, false
+	}
+	plan.aff, plan.keySet = c.inAffinity(in.X), in.List
 	return plan, true
 }
 

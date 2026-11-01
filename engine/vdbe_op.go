@@ -791,6 +791,9 @@ type indexSeekHint struct {
 	slot int
 	// is marks "x IS key", whose NULL key matches the NULLs.
 	is bool
+	// in, when not zero, is the length of an IN list whose values are in the
+	// registers from P2 on: the key matches any of them.
+	in int
 	// plan, on slot 0, is the loop C's planner chose for this table, which
 	// EXPLAIN QUERY PLAN prints in place of the hint's own index.
 	plan wherePlanExplain

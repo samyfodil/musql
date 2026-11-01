@@ -2012,8 +2012,22 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			switch h := op.P4.(type) {
 			case *indexSeekHint:
 				probe := applyAffinityToValue(m.regs[op.P2], h.aff)
+				// An IN list's values, each coerced as the one key is: a NULL
+				// equals nothing, so it is no probe.
+				var set []Value
+				textKey := probe.Typ == Text
+				if h.in > 0 {
+					set = make([]Value, 0, h.in)
+					textKey = false
+					for _, v := range m.regs[op.P2 : op.P2+h.in] {
+						if v = applyAffinityToValue(v, h.aff); v.Typ != Null {
+							set = append(set, v)
+							textKey = textKey || v.Typ == Text
+						}
+					}
+				}
 				if h.slot == 0 {
-					cur.idxSeekConfigured, cur.idxSeekMore, cur.idxSeekNext = false, cur.idxSeekMore[:0], 0
+					cur.idxSeekConfigured, cur.idxSeekMore, cur.idxSeekNext, cur.idxSeekSet = false, cur.idxSeekMore[:0], 0, nil
 				}
 				// A slot out of step is dropped, and so is the key of "x IS NULL",
 				// which no posting list holds, and a write's TEXT key in a UTF-16
@@ -2024,12 +2038,12 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 					cur.idxSeekNext++
 					switch {
 					case h.is && probe.Typ == Null:
-					case cur.rowStore != nil && probe.Typ == Text && isUTF16(m.encoding()):
+					case cur.rowStore != nil && textKey && isUTF16(m.encoding()):
 					case !cur.idxSeekConfigured:
 						cur.idxSeekConfigured = true
-						cur.idxSeekProbe, cur.idxSeekColl, cur.idxSeekCol = probe, h.coll, h.leadingCol
+						cur.idxSeekProbe, cur.idxSeekColl, cur.idxSeekCol, cur.idxSeekSet = probe, h.coll, h.leadingCol, set
 					default:
-						cur.idxSeekMore = append(cur.idxSeekMore, idxSeekKey{col: h.leadingCol, probe: probe, coll: h.coll})
+						cur.idxSeekMore = append(cur.idxSeekMore, idxSeekKey{col: h.leadingCol, probe: probe, coll: h.coll, set: set})
 					}
 				}
 			default:

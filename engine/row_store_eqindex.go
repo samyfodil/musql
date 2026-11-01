@@ -179,6 +179,23 @@ func (s *rowStore) segEqEstimate(col int, probe Value) int {
 	return n
 }
 
+// segEqKeyEstimate is segEqEstimate for a key, an IN list's summed over its
+// values.
+func (s *rowStore) segEqKeyEstimate(k idxSeekKey) int {
+	if k.set == nil {
+		return s.segEqEstimate(k.col, k.probe)
+	}
+	n := 0
+	for _, v := range k.set {
+		c := s.segEqEstimate(k.col, v)
+		if c == math.MaxInt {
+			return c
+		}
+		n += c
+	}
+	return n
+}
+
 // eqIndexFor builds col's index on first use and caches it.
 func (s *rowStore) eqIndexFor(col int) (*rsEqIndex, bool) {
 	if s.eqIdx != nil {
