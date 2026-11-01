@@ -102,7 +102,8 @@ func segPeephole(prog *Program) bool {
 	//	OpAutoIndexOrder   whenever the table carries ANY index
 	//	OpVariable/OpInteger + OpSeekIndexHint/OpSeekRowidHint
 	//	                   whenever the WHERE pins a rowid or an indexed
-	//	                   column to a constant
+	//	                   column to a constant, with OpSCopy gathering an
+	//	                   IN list's values
 	//
 	// Skipping either is safe: neither changes which rows satisfy the WHERE.
 	// OpAutoIndexOrder only permutes scan order, and a count ignores order; a
@@ -629,7 +630,7 @@ func ResetSegFilterCountersForTest() {
 // satisfy the WHERE. See segPeephole for the argument for each one.
 func segIsScanPrologue(op OpCode) bool {
 	switch op {
-	case OpAutoIndexOrder, OpSeekIndexHint, OpSeekRowidHint, OpSeekRowidRangeHint, OpVariable, OpInteger:
+	case OpAutoIndexOrder, OpSeekIndexHint, OpSeekRowidHint, OpSeekRowidRangeHint, OpVariable, OpInteger, OpInt64, OpSCopy:
 		return true
 	}
 	return false
