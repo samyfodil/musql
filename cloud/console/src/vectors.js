@@ -1,18 +1,14 @@
-// What the studio knows about a table's embeddings, and everything it does
-// with them: set a column up, fill the rows still missing a vector, and search.
-//
-// The studio records each embedded column in a table of its own,
-// musql_studio_embeddings, which travels with the database:
+// A table's embeddings: set a column up, fill the rows missing a vector, and
+// search. Each embedded column is recorded in musql_studio_embeddings, which
+// travels with the database:
 //
 //	tbl, vec   the table and its vector column, F32_BLOB(dims)
 //	src        the text column the vectors are made from
-//	model      a key of MODELS: a search embeds its text with the same model
+//	model      a key of MODELS, which a search embeds its text with
 //	idx        a libsql_vector_idx index on vec, or NULL
-//	fts        an fts5 table over src, for keyword + meaning search, or NULL
+//	fts        an fts5 table over src, or NULL
 //
-// A trigger sets vec to NULL when src changes, so a stale vector never ranks a
-// row: the row waits, NULL, for fillMissing. A row inserted without a vector
-// waits the same way.
+// A trigger nulls vec when src changes, so a stale vector never ranks a row.
 import { ident, query, rows, run } from "./db.js";
 import { DEFAULT_MODEL, MODELS, embed, vectorBlob } from "./embed.js";
 
@@ -24,14 +20,12 @@ const VECTOR_TYPE = /^(F32_BLOB|FLOAT32)\s*\(\s*(\d+)\s*\)$/i;
 /** The dimensions of a vector column's declared type, or 0. */
 export const vectorDims = (type) => Number(VECTOR_TYPE.exec(type ?? "")?.[2] ?? 0);
 
-/** Whether a table name is one of the studio's own. */
 export const isStudioTable = (name) => name === META;
 
 /**
- * The embeddings of a table: one {vec, src, model, idx, fts, dims} per vector
- * column. A vector column the studio did not set up is listed too, with the
- * default model when its width is that model's and src guessed from a
- * "<src>_emb" name: the columns earlier studios made look exactly like that.
+ * The embeddings of a table, one {vec, src, model, idx, fts, dims} per vector
+ * column. An unrecorded vector column is listed too, with the default model
+ * when its width matches and src guessed from a "<src>_emb" name.
  */
 export async function embeddingsOf(tbl, cols) {
 	let meta = [];
@@ -56,11 +50,7 @@ export async function embeddingsOf(tbl, cols) {
 	return out;
 }
 
-/**
- * Sets up <src>_emb on tbl for model: the column, its record, the trigger that
- * marks a changed row's vector stale, and the indexes asked for. Returns the
- * embedding; fillMissing fills it.
- */
+/** Sets up <src>_emb on tbl for model: the column, its record, the stale-marking trigger and the indexes asked for. */
 export async function setUpEmbedding(tbl, src, model, { index, keywords }) {
 	const m = MODELS[model];
 	const vec = `${src}_emb`;
@@ -96,8 +86,7 @@ export async function setUpEmbedding(tbl, src, model, { index, keywords }) {
 	}
 }
 
-// setUpKeywords makes an fts5 table over tbl's src, kept in step with it by
-// triggers, and fills it.
+// setUpKeywords makes an fts5 table over src, kept in step by triggers.
 async function setUpKeywords(tbl, src) {
 	const fts = `${tbl}_${src}_fts`;
 	const s = ident(src);
@@ -118,10 +107,7 @@ export async function missingCount(tbl, e) {
 	return Number((await query(`SELECT count(*) FROM ${ident(tbl)} WHERE ${ident(e.vec)} IS NULL AND ${ident(e.src)} IS NOT NULL`)).rows[0][0]);
 }
 
-/**
- * Embeds every row whose vector is missing, 64 to a batch and a transaction.
- * progress(done, total) after each batch. Returns the number embedded.
- */
+/** Embeds every row missing a vector, 64 to a transaction, calling progress(done, total). */
 export async function fillMissing(tbl, e, progress = () => {}) {
 	const total = await missingCount(tbl, e);
 	const v = ident(e.vec);
@@ -152,21 +138,19 @@ export async function fillMissing(tbl, e, progress = () => {}) {
 	return done;
 }
 
-/** An fts5 query matching any word of s, or "" when s has none. */
-// STOP is the English words too common to rank by: matching "and" or "the"
-// would lift nearly every row.
+// STOP words are too common to rank by.
 const STOP = new Set("a an and are as at be but by for from has have in into is it its of on or that the their this to was were will with what which who how".split(" "));
 
+/** An fts5 query matching any word of s, or "" when s has none. */
 function anyWord(s) {
 	const words = (s.match(/[\p{L}\p{N}_]+/gu) ?? []).filter((w) => !STOP.has(w.toLowerCase()));
 	return words.map((w) => `"${w}"`).join(" OR ");
 }
 
 /**
- * The rows of tbl closest in meaning to text: {columns, rows, how}. With
- * keywords and an fts table, ranks by meaning and by the words together
- * (reciprocal rank fusion of the two top 50s); otherwise by cosine distance,
- * through the vector index when there is one.
+ * The rows of tbl closest in meaning to text. With keywords and an fts table,
+ * ranks by meaning and words together (reciprocal rank fusion of the two top
+ * 50s); otherwise by cosine distance, through the vector index if any.
  */
 export async function search(tbl, e, text, keywords) {
 	const [q] = await embed([text], e.model, "query");

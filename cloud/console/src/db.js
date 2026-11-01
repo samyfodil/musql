@@ -14,10 +14,21 @@ export const ready = new Promise((resolve, reject) => {
 	worker.addEventListener("error", (e) => reject(new Error(e.message || "the database worker failed to start")));
 });
 
+// Listeners told how many calls are in flight, for the page's busy bar.
+const busyListeners = new Set();
+const busy = () => busyListeners.forEach((f) => f(pending.size));
+
+/** onBusy(f) calls f(n) whenever the number of calls in flight changes; it returns the unsubscribe. */
+export function onBusy(f) {
+	busyListeners.add(f);
+	return () => busyListeners.delete(f);
+}
+
 worker.addEventListener("message", ({ data }) => {
 	const p = pending.get(data.id);
 	if (!p) return;
 	pending.delete(data.id);
+	busy();
 	if (data.error !== undefined) p.reject(new Error(data.error));
 	else p.resolve(data.result);
 });
@@ -27,12 +38,21 @@ export async function call(op, ...args) {
 	const id = ++nextId;
 	return new Promise((resolve, reject) => {
 		pending.set(id, { resolve, reject });
+		busy();
 		worker.postMessage({ id, op, args });
 	});
 }
 
 export const query = (sql, params) => call("query", sql, params);
-export const run = (sql, params) => call("run", sql, params);
+// beforeWrite, when set, runs before every write: the page snapshots the
+// database there, for undo, and saves it after.
+let beforeWrite = null;
+export const onBeforeWrite = (f) => { beforeWrite = f; };
+
+export async function run(sql, params) {
+	await beforeWrite?.(sql);
+	return call("run", sql, params);
+}
 
 /** Rows as objects keyed by column name. */
 export async function rows(sql, params) {
