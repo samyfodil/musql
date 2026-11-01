@@ -423,13 +423,10 @@ const planCacheMax = 256
 // pager: a held connection rebuilds its pager per statement, so a per-pager cache
 // made prepared statements re-parse and re-compile every time.
 //
-// Keyed on what a compile reads, never on the data: a Program binds every row it
-// reads when it runs (OpOpenRead opens the running pager's table, and
-// segPeephole only rewrites instructions), so a commit -- this connection's or
-// another's, which reopens the session (Session.reopen carries this cache over)
-// -- leaves it valid, as a C prepared statement stays valid until its schema
-// changes. A compile that does read the data -- a folded LIMIT, fts5's corpus
-// statistics -- marks itself (noteRunFold), and cachePlan does not keep it.
+// Keyed on what a compile reads, never the data: a Program binds rows only
+// when it runs, so a commit leaves it valid, as a C prepared statement stays
+// valid until its schema changes. A compile that reads data (a folded LIMIT,
+// fts5's statistics) marks itself (noteRunFold) and is not kept.
 type sharedPlanCache struct {
 	m      map[string]*Program
 	cookie uint32
@@ -1158,14 +1155,10 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 	// (computeLimitRegisters, select.c:2517-2556). Only trigger pseudo-rows from
 	// outer are reachable (limitOffsetPseudoRowRefs).
 	//
-	// A folded clause must not be plan-cached: the cache is keyed on text and the
-	// folded value would be reused ("LIMIT ?" stepped with 1, 6, 0 answered one row
-	// every time; "LIMIT (SELECT count(*) FROM u)" kept the count it compiled
-	// with). foldLimitOffsetExpr marks the compile (noteRunFold) and cachePlan
-	// refuses it. C never has this problem because it folds only integer literals
-	// and codes everything else into the counter register; emitLimitOffsetReg
-	// already does that for some bodies, and extending it to the rest (window,
-	// GROUP BY with HAVING, compound) would let these back into the cache.
+	// A folded clause is not plan-cached (noteRunFold): the cache is keyed on
+	// text, and "LIMIT ?" would keep its first value. C folds only integer
+	// literals and codes the rest into the counter register, as
+	// emitLimitOffsetReg does for some bodies.
 	if stmt.LimitParam != nil || stmt.OffsetParam != nil {
 		resolved := *stmt
 		if stmt.LimitParam != nil {
@@ -1235,10 +1228,9 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 		return nil, nil, fmt.Errorf("engine: VDBE-only: compound SELECT not compilable to bytecode (no fallback)")
 	}
 	if len(stmt.From) == 0 {
-		// Kept for its text like any other read: the program reads its
-		// parameters and functions when it runs. Not with GROUP BY, whose terms
-		// validateNoFromGroupBy evaluates against the bound values before the
-		// compile, a check a kept plan would skip.
+		// Kept for its text like any other read. Not with GROUP BY, whose terms
+		// validateNoFromGroupBy checks against the bound values before the
+		// compile.
 		if len(stmt.GroupBy) > 0 {
 			cacheKey = ""
 		}
@@ -2435,12 +2427,10 @@ func computeGeneratedInto(tblName string, cols []columnInfo, row []Value) error 
 	return computeGenerated(tblName, cols, row, false)
 }
 
-// valueGenErr is the Value a VIRTUAL generated column holds when its
-// expression raised as its committed row was widened (computeGeneratedOnRead).
-// C computes such a column only where it is read (sqlite3ExprCodeGeneratedColumn),
-// so the row stays whole and only a read of the column raises. S holds the
-// error's text. Every reader of a row slot raises it (genErrOf) rather than take
-// it for a value, and none hands it to a record.
+// valueGenErr is the Value of a VIRTUAL generated column whose expression
+// raised while its committed row was widened: C computes the column only where
+// it is read, so the row stays whole and only a read of the column raises. S
+// holds the error's text; no reader takes it for a value or writes it out.
 const valueGenErr ValueType = 0xF2
 
 // genErrOf is the error a valueGenErr slot holds.
@@ -2457,9 +2447,8 @@ func rowGenErr(row []Value) error {
 }
 
 // computeGeneratedOnRead is computeGeneratedInto for a committed row being
-// widened to be read: a VIRTUAL column whose expression raises, or that reads
-// one that did, holds the error (valueGenErr) instead of failing the row, and a
-// STORED one keeps the value its record holds, which is the one C reads.
+// read: a VIRTUAL column that raises holds valueGenErr instead of failing the
+// row, and a STORED one keeps its record's value, the one C reads.
 func computeGeneratedOnRead(tblName string, cols []columnInfo, row []Value) {
 	computeGenerated(tblName, cols, row, true)
 }
@@ -2589,10 +2578,8 @@ func cachedGeneratedExpr(text string) (Expr, error) {
 
 // detachResultRows copies every byte slice a result row holds, so the rows no
 // longer point into a segment file's mapping. See QueryArgs. The copies share
-// chunks of at most detachChunk bytes, each sized to what is left to copy: an
-// allocation for many values rather than one each, and a value kept long pins
-// at most its chunk. A value longer than a chunk is copied alone, and an empty
-// one comes back nil, as a copy of it always did.
+// chunks of at most detachChunk bytes, so a kept value pins at most its chunk;
+// a longer value is copied alone, and an empty one comes back nil.
 func detachResultRows(rows [][]Value) [][]Value {
 	left := 0
 	for _, r := range rows {

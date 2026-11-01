@@ -241,10 +241,9 @@ func TestRowStoreEqIndexRollsBackWithRows(t *testing.T) {
 	exec(`ROLLBACK`)
 }
 
-// The byte lists, directly on the store: TEXT and BLOB are listed by their
-// bytes, but a column holding integers as well is refused, and so is a probe of
-// the kind the column does not hold -- a comparison's affinity can make 5 equal
-// '5' either way round.
+// TestRowStoreEqIndexBytes: TEXT and BLOB are listed by their bytes, but a
+// column also holding integers is refused, as is a probe of another kind,
+// since affinity can make 5 equal '5'.
 func TestRowStoreEqIndexBytes(t *testing.T) {
 	mk := func(rows map[uint64][]Value) *rowStore { return &rowStore{m: rows} }
 	txt := func(s string) Value { return Value{Typ: Text, S: []byte(s)} }

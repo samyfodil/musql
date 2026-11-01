@@ -176,10 +176,9 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 	return n, err
 }
 
-// openWrite is OpenWriteWait catching prev's replayed delta up to the file
-// (Session.caughtUp) where it can, instead of replaying the delta whole; caught
-// reports that it did. before is caughtUp's. When it did and the open then
-// fails, prev's state is no longer its view, and prev is poisoned.
+// openWrite is OpenWriteWait catching prev's delta up to the file where it can
+// (Session.caughtUp); caught reports that it did. If the open then fails,
+// prev's state is no longer its view, so prev is poisoned.
 func openWrite(segPath string, wait time.Duration, prev *Session, before func([]deltaBatch)) (*Session, bool, error) {
 	// ONE READ, UNDER ONE SHARED LOCK. The rows, the file's base identity and the
 	// STATE those rows are at must all come from the same look at the pair, and
@@ -238,9 +237,8 @@ func openWrite(segPath string, wait time.Duration, prev *Session, before func([]
 		endCtr, endPages = st.endCtr, st.endPages // the replay's own result, not a second read
 		deltaEnd = st.bytes
 		stamp[1].at = deltaEnd
-		// Where the replay ended is where the next append starts: carried, the
-		// commit checks it against the file's bytes instead of replaying the
-		// whole delta again to find it (appendSegmentDeltaAt).
+		// The next append starts where the replay ended; carried, the commit
+		// checks it rather than replaying the delta (appendSegmentDeltaAt).
 		if st.version != 0 {
 			appendAt = SegDeltaAppendState{offset: st.bytes, cksum: st.cksum, version: st.version, known: true}
 		}
@@ -867,25 +865,19 @@ func (n *Session) extendCommittedColumns(batch []byte, recs []SegDeltaRecord) bo
 	return true
 }
 
-// drainSmallLoads hands a load into an empty table (insert_bulk_direct.go) to
-// the change log when the delta can take its rows: they go out as a delta
-// batch, which costs what they hold, instead of in the whole-file rewrite a
-// load commits by, which costs what the file holds -- one row inserted into an
-// empty table rewrote a gigabyte. A load whose rows would take the delta past
-// the size the commit's own compaction rewrites at (compactionDueAfter) keeps
-// its segments and the rewrite, which would follow anyway. Its size here is an
-// estimate; an under-estimate only reaches that rewrite later, from the row
-// store.
+// drainSmallLoads moves a load into an empty table to the change log when the
+// delta can take its rows, so they commit as a delta batch rather than by a
+// whole-file rewrite (one row into an empty table rewrote a gigabyte). A load
+// that would take the delta past compaction keeps the rewrite.
 func (n *Session) drainSmallLoads(stamp [2]fileStamp) {
 	db := n.DB
 	if compactionOffForTest || !stamp[0].there {
 		return
 	}
 	room := compactionThreshold(stamp[0].size) - n.deltaLogicalSize(stamp[1]) - int64(db.changeLog.len())*segDeltaMinRecord
-	// Logging, encoding and appending a row costs far more per byte than the
-	// rewrite's sequential copy of the file: on a 1 GiB file a million rows
-	// took 4.4 s drained and 3.1 s rewritten. So a load takes the log only
-	// while it is small beside the file, an eighth of what compaction allows.
+	// Logging a row costs far more per byte than the rewrite's copy (a million
+	// rows on a 1 GiB file: 4.4 s drained, 3.1 s rewritten), so only a load
+	// small beside the file drains.
 	room = min(room, compactionThreshold(stamp[0].size)/8)
 	for _, t := range db.tables {
 		bl := t.bulk
@@ -951,10 +943,9 @@ func (db *DB) mutatedOutsideChangeLog(changes *changeLog) bool {
 		if t.isTemp || !t.rowsWrittenSinceCommit || t.rows == nil || t.hasAppendLoad() {
 			continue
 		}
-		// A direct-path load's rows are in its segments and never in the log,
-		// however much else of the table the log describes: a transaction that
-		// deleted every committed row and then inserted arms a load on the
-		// emptied store, and appending only its kills lost the new rows.
+		// A direct-path load's rows are never in the log: a transaction that
+		// emptied the table and inserted again lost them when only its kills
+		// were appended.
 		if t.bulk != nil || !described[strings.ToLower(t.name)] {
 			return true
 		}
@@ -989,8 +980,7 @@ func (n *Session) Close() error {
 	// autocommit work, which an engine-direct session batches until here, is
 	// committed.
 	//
-	// A poisoned session commits nothing: what it holds is a failed commit's
-	// rows, and a connection pool closing it published one.
+	// A poisoned session holds a failed commit's rows and commits nothing.
 	var err error
 	if n.InTransaction() {
 		_, _, err = n.DB.ExecArgs("ROLLBACK", nil)
@@ -1951,8 +1941,8 @@ func (n *Session) RefreshIfStale() (bool, error) {
 	if n.poisoned {
 		// Ahead of BOTH guards below, deliberately: a poisoned session's pending
 		// changes are exactly what must NOT survive, and a transaction it may still
-		// think is open ended when its commit ran. Poisoned until the rebuild
-		// succeeds: one that fails leaves the state that poisoned it.
+		// think is open ended when its commit ran. It stays poisoned until a
+		// rebuild succeeds.
 		if err := n.reopen(true); err != nil {
 			return true, err
 		}
@@ -1989,10 +1979,8 @@ func (n *Session) RefreshIfStale() (bool, error) {
 		n.noteChangeSeen(word, wordOK)
 		return false, nil // nothing has touched either file
 	}
-	// Whether a batch has landed past this session's view of the delta is the
-	// word after it, when the file is the one the session stamped and the delta
-	// still ends its view with the checksum it left there (deltaMoved); only
-	// otherwise is the pair's state replayed.
+	// deltaMoved answers from the bytes past this session's view; only
+	// otherwise is the pair's state read.
 	var ctr, pages uint32
 	moved, known := false, false
 	err := withSegmentReadLockWait(n.segPath, n.busyTimeout(), func() error {
@@ -2069,19 +2057,14 @@ func (db *DB) adoptConnSettingsFrom(old *DB) {
 	db.inMemory = old.inMemory
 }
 
-// reopen rebuilds the session's read side, catalog and row stores from the file
-// as it stands now, keeping this Session's identity so a caller's handle stays
-// valid.
-//
-// afterFailedCommit rebuilds the TEMP database from its file too, rather than
-// carrying the connection's temp objects over as they stand: a commit that
-// failed ended the transaction in memory, temp's half included, and the file --
-// which only a successful commit writes (commitLocked) -- is the state from
-// before it.
 // ReopenedHookForTest runs right after a reopen's read of the file, where
 // another connection's commit is the race the stamp order closes.
 var ReopenedHookForTest func()
 
+// reopen rebuilds the session's read side, catalog and row stores from the file
+// as it stands now, keeping this Session's identity so a caller's handle stays
+// valid. afterFailedCommit rebuilds the TEMP database from its file too: the
+// failed commit ended temp's half of the transaction in memory as well.
 func (n *Session) reopen(afterFailedCommit bool) error {
 	// THE STAMP BEFORE THE STATE. The cheap freshness check trusts seenStat to
 	// describe a file no newer than what this session loaded; stamped AFTER the
@@ -2090,12 +2073,10 @@ func (n *Session) reopen(afterFailedCommit bool) error {
 	// saw "nothing touched". The open's own stamp is taken under its lock,
 	// before its read, at the delta end that read reached.
 	//
-	// The open catches this session's replayed delta up to the file where it
-	// can (caughtUp), and the indexes the session's stores built move into the
-	// reopened ones (carryOut, carryIn): what a reopen costs is then what the
-	// file gained. Not the indexes after a failed commit: they hold the failed
-	// statement's rows, and its writes are not all where they can be named --
-	// a row it put and dropped again leaves no trace in the store.
+	// The open catches this session's delta up where it can (caughtUp) and
+	// moves the store indexes over (carryOut, carryIn), so a reopen costs what
+	// the file gained. Not after a failed commit: the indexes hold its rows,
+	// and a row it put and dropped again leaves no trace to undo.
 	var carried []carriedTable
 	var tail []deltaBatch
 	viewed := false
@@ -2142,10 +2123,8 @@ func (n *Session) reopen(afterFailedCommit bool) error {
 		fresh.stat1 = n.stat1
 	}
 	fresh.carryIn(carried)
-	// ...and the compiled reads: a plan binds no rows (sharedPlanCache), and the
-	// next statement's pager checks its key against the fresh schema, settings
-	// and statistics. The write programs stay behind: each holds the old
-	// session's *tableMeta.
+	// ...and the compiled reads, which bind no rows; the write programs hold
+	// the old session's *tableMeta and stay behind.
 	fresh.plans = n.plans
 
 	old := n.src

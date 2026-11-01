@@ -9,12 +9,9 @@ import (
 )
 
 // TestPlanReuseAcrossCommits holds prepared statements on one connection while
-// a second connection to the same file commits data and schema changes, and
-// compares every execution with C's. musql's plans outlive those commits (the
-// session reopens and keeps its read plans), so a plan that kept anything of
-// the data it was compiled over shows up here as a divergence. "SELECT *" is
-// left out: C reports a statement's column count before the step that
-// re-prepares it, so across an ADD COLUMN the cgo driver reads the old count.
+// another commits data and schema changes, comparing every execution with C's:
+// a kept plan that held on to the data shows up as a divergence. "SELECT *" is
+// left out: across an ADD COLUMN the cgo driver reads the old column count.
 func TestPlanReuseAcrossCommits(t *testing.T) {
 	dir := t.TempDir()
 	open := func(drv, path string) *sql.DB {

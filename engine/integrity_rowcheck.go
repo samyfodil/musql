@@ -6,9 +6,8 @@
 // the loop at pragma.c:1822-2155, "Make sure all the indices are constructed
 // correctly", which opens each table and its indexes and walks the rows. (C's
 // STRUCTURAL half, OP_IntegrityCk at pragma.c:1783, checks pages, which this
-// format does not have.) The loop below holds a table in memory; what runs is
-// integrity_stream.go's, which answers the same in bounded memory and hands
-// this one the few tables it cannot.
+// format does not have.) This in-memory loop answers only the tables
+// integrity_stream.go hands back.
 //
 // ---- RULE ZERO: the shape being ported ----
 //
@@ -88,12 +87,8 @@ import (
 // integrityRowFindings is one table's findings, in pragma.c's order: counts
 // holds its "wrong # of entries in index" findings (pragma.c:1794-1820, which
 // the caller emits for EVERY table before any per-row finding), out the first
-// limit of its per-row findings and n how many of those there are. tr is the
-// table's own catalog row and schema the whole catalog (needed to find its
-// indexes and their rootpages). qualify asks for a "main."/"temp." prefix on
-// the CHECK-constraint query. isQuick omits the per-row index checks, which is
-// what quick_check means (pragma.c:2058's "Omit the remaining tests for
-// quick_check"); the count block runs for both.
+// limit per-row findings and n their total. qualify prefixes "main."/"temp."
+// on the CHECK query; isQuick omits the per-row index checks (pragma.c:2058).
 func (p *ReadOnlyPager) integrityRowFindings(tr *SchemaRow, schema []SchemaRow, qualify, isQuick bool, limit int) (counts, out []string, n int, err error) {
 	withoutRowid := sqlTextTableIsWithoutRowid(tr.SQL)
 	cols, checks, specs, perr := parseCreateTableColumnsAndAutoIndexes(tr.SQL, withoutRowid)
@@ -130,18 +125,14 @@ func (p *ReadOnlyPager) integrityRowFindings(tr *SchemaRow, schema []SchemaRow, 
 		ipkIndex: ipk,
 		rootPage: tr.RootPage,
 	}
-	// A table whose automatic indexes this parser cannot re-derive
-	// contributes no index findings, for the same reason a row-read failure
-	// contributes none: under-report, never error.
+	// A table whose automatic indexes this parser cannot re-derive contributes
+	// no index findings: under-report, never error.
 	indexes := p.integrityIndexesOf(tr, schema, tm, cols, specs)
 	counts, out, n, err = p.integrityRowFindingsStreamed(tr, tm, indexes, checks, qualify, isQuick, limit)
 	switch {
 	case errors.Is(err, errIntegrityUnreadable):
-		// A table whose rows this pager cannot decode is exactly what the
-		// STRUCTURAL half is for. Fall back to the CHECK-only answer this
-		// function gave before the per-row arms existed rather than turn a
-		// report into an error: under-reporting is the pre-existing
-		// behaviour, erroring is a new decline.
+		// Rows this pager cannot decode are the STRUCTURAL half's to report:
+		// answer the CHECK half alone rather than error.
 		out, n, err = p.integrityCheckRowsFailingChecks(tr, cols, checks, qualify, limit)
 		return nil, out, n, err
 	case errors.Is(err, errIntegrityInMemory):
@@ -150,10 +141,9 @@ func (p *ReadOnlyPager) integrityRowFindings(tr *SchemaRow, schema []SchemaRow, 
 	return counts, out, n, err
 }
 
-// integrityRowFindingsInMemory is integrityRowFindings over the table's rows
-// and its indexes' entries all held at once, for a table the streaming form
-// hands back (integrity_stream.go). It reads at most integrityInMemoryBudgetVar
-// bytes of rows and declines past that.
+// integrityRowFindingsInMemory holds the table's rows and index entries at
+// once, for the tables integrity_stream.go hands back. It declines past
+// integrityInMemoryBudgetVar bytes of rows.
 func (p *ReadOnlyPager) integrityRowFindingsInMemory(tr *SchemaRow, tm *tableMeta, indexes []*indexMeta, checks []checkConstraint, qualify, isQuick bool, limit int) (counts, out []string, n int, err error) {
 	rows, rowidsSorted, rerr := readTableRowsWithin(p, tm, integrityInMemoryBudgetVar)
 	if errors.Is(rerr, errIntegrityTooLarge) {
@@ -284,12 +274,9 @@ func (p *ReadOnlyPager) integrityRowsInMemory(tr *SchemaRow, tm *tableMeta, inde
 	return counts, out, nil
 }
 
-// errIntegrityTooLarge is readTableRowsWithin or storedEntriesWithin passing
-// its budget.
 var errIntegrityTooLarge = errors.New("engine: integrity_check: past the in-memory budget")
 
-// readTableRowsWithin is readTableRowsFromPager reading at most budget bytes
-// of rows.
+// readTableRowsWithin is readTableRowsFromPager capped at budget bytes.
 func readTableRowsWithin(rp *ReadOnlyPager, tbl *tableMeta, budget int) (rows map[uint64][]Value, rowidsSorted []uint64, err error) {
 	seq, errFn := rp.ScanTable(tbl.rootPage)
 	var rowids []uint64
@@ -460,12 +447,10 @@ func (p *ReadOnlyPager) integrityIndexesOf(tr *SchemaRow, schema []SchemaRow, tm
 // WHICH rows rather than how many, so that a violation lands in pragma.c's
 // own per-row position rather than in a block of its own.
 //
-// The rows come back in the table b-tree's own ascending walk, the identical
-// order `order` holds, because the scan is NOT INDEXED: a plain scan may read
-// a covering index instead, in that index's order, and put each finding on
-// another row. A length mismatch falls back to marking the FIRST n rows,
-// which keeps the multiset exact (the only thing an order-insensitive
-// comparison can see) and is unreachable for any well-formed table.
+// The scan is NOT INDEXED so rows come back in the b-tree's walk, the order
+// `order` holds: a covering index would read them in its own order and put
+// each finding on another row. A length mismatch marks the first n rows,
+// which keeps the multiset exact; a well-formed table never reaches it.
 func (p *ReadOnlyPager) integrityCheckViolatingRowids(tr *SchemaRow, cols []columnInfo, checks []checkConstraint, qualify bool, order []uint64, rows map[uint64][]Value) (map[uint64]bool, error) {
 	if len(checks) == 0 || len(order) == 0 {
 		return nil, nil
@@ -494,8 +479,7 @@ func (p *ReadOnlyPager) integrityCheckRowsFailingChecks(tr *SchemaRow, cols []co
 	if len(checks) == 0 {
 		return nil, 0, nil
 	}
-	// A CHECK is evaluated per row, so a table without rows evaluates none
-	// (see integrityRowFindingsStreamed).
+	// A CHECK is evaluated per row, so a table without rows evaluates none.
 	_, one, qerr := p.QueryArgs(integrityCheckProbeSQL(tr, checks, qualify, "SELECT 1 FROM ")+" LIMIT 1", nil)
 	if qerr != nil {
 		return nil, 0, fmt.Errorf("engine: PRAGMA integrity_check: %s: %w", tr.Name, qerr)
@@ -554,8 +538,8 @@ func integrityCheckViolationExpr(checks []checkConstraint) string {
 }
 
 // integrityGenErr is the error integrity_check raises over row: C computes a
-// VIRTUAL generated column there only for the column's NOT NULL or datatype
-// check (pragma.c:1926-1931), and that raises whatever its expression raises.
+// VIRTUAL column there only for its NOT NULL or datatype check
+// (pragma.c:1926-1931).
 func integrityGenErr(cols []columnInfo, strict bool, row []Value) error {
 	for j, c := range cols {
 		if j >= len(row) || row[j].Typ != valueGenErr {

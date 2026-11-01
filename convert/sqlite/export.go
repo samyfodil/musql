@@ -24,9 +24,8 @@ import (
 // Export writes the musql database at src to a SQLite file at dst.
 // pageSize is 0 for the database's own page size.
 //
-// The file is built in a scratch file beside dst that takes dst's name once
-// it is whole. Pages past exportCacheBytes are written to their place in it
-// as the build goes, and read back when the build returns to them.
+// The file is built in a scratch file beside dst and renamed over it when
+// whole; pages past exportCacheBytes go out to it and are read back as needed.
 func Export(src, dst string, pageSize int) error {
 	r, err := engine.OpenReader(src)
 	if err != nil {
@@ -66,8 +65,8 @@ const exportCacheBytes = 32 << 20
 // memory; more are sorted in runs on disk (internal/extsort).
 var exportSortBytes = 32 << 20
 
-// exportCachePages is the page cache Export runs with, a variable so a test
-// can make every page go out to the file and back.
+// exportCachePages is a variable so a test can force every page out to the
+// file.
 var exportCachePages = func(pageSize int) int { return max(exportCacheBytes/pageSize, 64) }
 
 // autoIndex is one automatic index an export fills alongside its table's rows.
@@ -333,7 +332,6 @@ func exportRefillIndex(tx *btTxn, r *engine.Reader, e engine.CatalogEntry, root 
 	return nil
 }
 
-// valuesHaveNaN reports a REAL NaN among vs.
 func valuesHaveNaN(vs []Value) bool {
 	for _, v := range vs {
 		if v.Typ == Float && math.IsNaN(v.F) {

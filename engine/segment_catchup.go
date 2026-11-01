@@ -8,35 +8,17 @@ import (
 	"github.com/samyfodil/musql/internal/fsio"
 )
 
-// A SESSION CATCHING UP pays for what changed, not for what the table holds.
-//
-// Another connection's commit makes a session reopen from the file
-// (Session.reopen). That re-read the pair whole -- the freshness check
-// replayed the delta to learn the state it ends at, the reopen replayed it
-// again to rebuild its rows -- and the indexes the session's stores had built,
-// the UNIQUE conflict probes (row_store_uniqindex.go) and the equality posting
-// lists (row_store_eqindex.go), went with the old stores, so the next write
-// rebuilt them from every row of the table. Two connections taking turns on
-// one file paid all of it on every turn: a replicated node's first local write
-// after each apply cost 12 ms at 3,000 rows and 211 ms at 17,000.
-//
-// What a turn changed is the batches the delta grew by. So the freshness
-// check reads the word past the session's own view of the delta (deltaMoved),
-// the reopen replays only the batches past its last replay into the state it
-// already has (Session.caughtUp), and the indexes move into the reopened
-// stores, moved for exactly the rows those batches wrote: out under the row
-// the session last saw, in under the row the file now holds (carryOut,
-// carryIn). So does the committed column view (carryColumns). Each step first
-// checks that the bytes before where it starts reading are the ones it read
-// before -- the same segment file, and the delta's running checksum where it
-// left off -- and anything else reads the pair whole, as before.
+// A session reopened after another connection's commit replays only the delta
+// batches past its own view (caughtUp) and carries its indexes and column view
+// into the reopened stores (carryOut, carryIn, carryColumns). Each step first
+// checks that the bytes it already read are unchanged -- the same segment
+// file, the delta's running checksum where it left off -- and otherwise the
+// pair is read whole.
 
-// catchUpMaxBytes is the most delta a session's catch-ups read onto the heap,
-// between two reads of the pair whole: past it, the reopen maps the pair as an
-// open does, and the heap the earlier catch-ups held goes with the old state.
+// catchUpMaxBytes caps the delta catch-ups hold on the heap; past it the
+// reopen maps the pair as an open does.
 const catchUpMaxBytes = 32 << 20
 
-// deltaBatch is one complete batch of a delta (deltaBatchesFrom).
 type deltaBatch struct {
 	body             []byte // its records
 	endCtr, endPages uint32
@@ -44,13 +26,9 @@ type deltaBatch struct {
 	end              int64 // the byte after its trailer
 }
 
-// deltaBatchesFrom reads the complete batches of the delta open as f, whose
-// version is version, from byte from on, onto the heap: as replaySegDelta walks
-// them, up to the first one truncated, of length zero, or failing its
-// checksum. The running checksum at from must be cksum -- the 8 bytes before
-// from hold it, whether they end the header or a batch -- or ok is false: the
-// bytes before from are not the ones that checksum was taken over. ok is false
-// too past limit bytes of batches.
+// deltaBatchesFrom reads the complete batches from byte from on, as
+// replaySegDelta walks them. ok is false when the checksum stored before from
+// is not cksum, or past limit bytes.
 func deltaBatchesFrom(f *os.File, version uint32, from int64, cksum uint64, limit int64) (batches []deltaBatch, ok bool) {
 	if version < 1 || version > segDeltaVersion || from < segDeltaHdrSize {
 		return nil, false
@@ -73,7 +51,7 @@ func deltaBatchesFrom(f *os.File, version uint32, from int64, cksum uint64, limi
 		}
 		end := off + w + n + segDeltaTrailerSz
 		if n <= 0 || end < off {
-			break // zero ends the log, as in replay; the rest is not a batch
+			break // zero ends the log, as in replay
 		}
 		if read += end - off; read > limit {
 			return nil, false
@@ -98,14 +76,10 @@ func deltaBatchesFrom(f *os.File, version uint32, from int64, cksum uint64, limi
 	return batches, true
 }
 
-// deltaMoved answers RefreshIfStale's question -- has a batch landed past this
-// session's view? -- from the delta's bytes around where the view ends: the
-// view is current while the checksum the session's own append or replay left
-// there is still there, and the length word after it is zero, as an append
-// leaves it and every later one overwrites (appendSegmentDeltaAt's own check).
-// ok is false when the segment file is not the one the session last stamped
-// or the checksum is not there, and the caller replays the pair. Under the
-// caller's read lock.
+// deltaMoved reports whether a batch landed past this session's view: it has
+// not while the view's checksum is still where the view ends and the length
+// word after it is zero. ok is false when the segment file or that checksum
+// changed. Under the caller's read lock.
 func (n *Session) deltaMoved(now [2]fileStamp) (moved, ok bool) {
 	if now[0] != n.seenStat[0] || !n.appendAt.known || n.appendAt.offset != n.deltaEnd {
 		return false, false
@@ -130,19 +104,12 @@ func (n *Session) deltaMoved(now [2]fileStamp) (moved, ok bool) {
 	return binary.LittleEndian.Uint64(b[8:]) != 0, true
 }
 
-// caughtUp is the pair at segPath read from where this session's own read of
-// it ended: the segment file, a new handle on the one the session reads, and
-// the session's replayed delta with every batch appended since folded in. ok
-// is false -- and nothing of the session's is changed -- unless the segment
-// file is the one the session read and the delta still holds the checksum the
-// session's replay ended on, where it ended.
-//
-// The state is the session's own, advanced in place: from the moment caughtUp
-// returns, the session's pager reads the new state, and the caller must take
-// it over (ReadOnlyPager.detachDelta) or rebuild the session from the file.
-// before is called first, while the session still reads the state it had, with
-// the batches read; it is how the indexes learn the rows the batches replace.
-// Under the caller's read lock.
+// caughtUp advances this session's replayed delta in place by the batches
+// appended since its replay, and opens the segment file again. ok is false,
+// with nothing changed, unless the segment file and the checksum the replay
+// ended on are still there. On success the caller must take the state over
+// (ReadOnlyPager.detachDelta) or rebuild the session. before sees the batches
+// while the session still reads the old state. Under the caller's read lock.
 func (n *Session) caughtUp(segPath string, before func([]deltaBatch)) (f *SegmentFile, st *segDeltaState, ok bool) {
 	if n.src == nil || n.src.segs == nil || n.src.segs.file == nil || n.src.segs.file.shared == nil {
 		return nil, nil, false
@@ -171,9 +138,7 @@ func (n *Session) caughtUp(segPath string, before func([]deltaBatch)) (f *Segmen
 		f.Close()
 		return nil, nil, false
 	}
-	// The batches replay into an overlay of their own first, every row a patch
-	// lands on read through the state as it stands -- so a batch that does not
-	// replay leaves that state as it was.
+	// Replay into an overlay first, so a batch that fails leaves st as it was.
 	nd := &segDeltaState{
 		live: map[int]map[int64][]Value{}, dead: map[int]map[int64]bool{}, version: st.version,
 		base: func(ti int, rowid int64) ([]Value, bool) {
@@ -195,9 +160,8 @@ func (n *Session) caughtUp(segPath string, before func([]deltaBatch)) (f *Segmen
 	if before != nil {
 		before(batches)
 	}
-	// A rowid is in an overlay's live rows or its dead ones, never both, so the
-	// order of the two folds does not matter. The batches' segments come after
-	// every earlier one, as their rowids do.
+	// A rowid is live or dead in an overlay, never both, so the fold order does
+	// not matter.
 	for ti, rows := range nd.live {
 		for rowid, vals := range rows {
 			st.put(ti, rowid, vals)
@@ -227,9 +191,8 @@ func (n *Session) caughtUp(segPath string, before func([]deltaBatch)) (f *Segmen
 	return f, st, true
 }
 
-// deltaStateOf is the replayed delta p was built over, nil when it was not
-// built over a segment file's: the state the pager releases on Close, which is
-// there even when it holds no row (ReadOnlyPager.segs.delta is nil then).
+// deltaStateOf is the replayed delta p was built over, or nil. It is set even
+// when the delta holds no row and ReadOnlyPager.segs.delta is nil.
 func deltaStateOf(p *ReadOnlyPager) *segDeltaState {
 	if p == nil {
 		return nil
@@ -241,8 +204,7 @@ func deltaStateOf(p *ReadOnlyPager) *segDeltaState {
 	return c.st
 }
 
-// detachDelta stops p's Close releasing its delta state, which a pager built
-// by a session's catch-up has taken over (Session.caughtUp).
+// detachDelta stops p's Close releasing a delta state a catch-up took over.
 func (p *ReadOnlyPager) detachDelta() {
 	if c, ok := p.closer.(segFileCloser); ok {
 		c.st = nil
@@ -250,13 +212,9 @@ func (p *ReadOnlyPager) detachDelta() {
 	}
 }
 
-// deltaTouched reads what the complete batches of a delta between byte from
-// and byte to wrote: per table index, every rowid a put, patch or kill names,
-// and every table a segment record extends. data is the delta from its first
-// byte. The running checksum must be cksum at from and end at to, which says
-// the batches between are the history that leads from the delta a session saw
-// to the one it reopened at. false when it is not, or a batch does not read
-// back the way replay reads it.
+// deltaTouched lists the rowids and segment tables the batches between from
+// and to wrote. false unless the running checksum is cksum at from and end at
+// to, or when a batch does not parse.
 func deltaTouched(data []byte, version uint32, from, to int64, cksum, end uint64) (rows map[int][]int64, segs map[int]bool, ok bool) {
 	if version < 1 || from < segDeltaHdrSize || from > to || to > int64(len(data)) {
 		return nil, nil, false
@@ -293,8 +251,7 @@ func deltaTouched(data []byte, version uint32, from, to int64, cksum, end uint64
 	return rows, segs, cksum == end
 }
 
-// batchTouched adds what one batch body's records name to rows and segs, as
-// applyBatch reads them; false when a record does not parse.
+// batchTouched adds the rowids and segment tables one batch body names.
 func batchTouched(body []byte, rows map[int][]int64, segs map[int]bool) bool {
 	for off := 0; off < len(body); {
 		if off+13 > len(body) {
@@ -337,9 +294,8 @@ func batchTouched(body []byte, rows map[int][]int64, segs map[int]bool) bool {
 	return true
 }
 
-// carriedTable is one table's indexes on their way from a session's old stores
-// to its reopened ones (carryOut, carryIn): the rowids the batches since the
-// session's view wrote, and those rows as it saw them.
+// carriedTable is one table's indexes on their way to a reopened session, with
+// the rowids the new batches wrote and those rows as the old session saw them.
 type carriedTable struct {
 	t    *tableMeta
 	ti   int
@@ -349,11 +305,9 @@ type carriedTable struct {
 	was  [][]Value
 }
 
-// caughtUpTouched is the batches past this session's view of the delta, and
-// what they wrote, from the batches its catch-up read past its replay
-// (caughtUp, which calls this before it folds them in): the view ends at one
-// of them, or where the replay did, with the checksum the view's own append or
-// replay left. false when it ends nowhere among them like that.
+// caughtUpTouched is the batches past this session's view among those its
+// catch-up read, and what they wrote. false when the view does not end on one
+// of them.
 func (n *Session) caughtUpTouched(batches []deltaBatch) (tail []deltaBatch, rows map[int][]int64, segs map[int]bool, ok bool) {
 	st := deltaStateOf(n.src)
 	if st == nil || !n.appendAt.known || n.appendAt.offset != n.deltaEnd {
@@ -376,12 +330,10 @@ func (n *Session) caughtUpTouched(batches []deltaBatch) (tail []deltaBatch, rows
 	return batches[k:], rows, segs, true
 }
 
-// carryColumns moves this session's committed column view (DB.segColumns)
-// into fresh, the session caughtUp reopened, moved past tail -- the batches
-// after this session's view of the delta -- the way each commit of its own
-// moves it (extendCommittedColumns), where fresh's first read would otherwise
-// read the pair whole to build its own. A view marked stale, over another
-// file, or a tail with a segment record, leaves fresh to build its own.
+// carryColumns moves the committed column view (DB.segColumns) into fresh,
+// advanced past tail as a commit of this session's own would advance it. A
+// stale view, another file, or a segment record in tail leaves fresh to build
+// its own.
 func (n *Session) carryColumns(fresh *Session, tail []deltaBatch) {
 	db := n.DB
 	cols := db.segColumns
@@ -401,8 +353,8 @@ func (n *Session) carryColumns(fresh *Session, tail []deltaBatch) {
 		st = &segDeltaState{live: map[int]map[int64][]Value{}, dead: map[int]map[int64]bool{}, version: fresh.appendAt.version}
 	}
 	if st.base == nil {
-		// A view its own commits started has none: they apply whole rows. A patch
-		// in the tail lands on the file's row.
+		// Commits of this session's own apply whole rows; a patch in tail needs
+		// the file's row under it.
 		st.base = cols.segs.file.committedRows()
 	}
 	db.flushColsPending(st)
@@ -421,10 +373,8 @@ func (n *Session) carryColumns(fresh *Session, tail []deltaBatch) {
 	db.segColumns = nil
 }
 
-// reopenedTouched is what the batches between this session's view of the delta
-// and fresh's wrote, fresh being the session read whole from the same segment
-// file: read from fresh's mapping of the delta, between the checksum the view's
-// own append or replay left and the one fresh's replay ended on.
+// reopenedTouched is what the batches between this session's view and fresh's
+// wrote, read from fresh's mapping of the delta.
 func (n *Session) reopenedTouched(fresh *Session) (rows map[int][]int64, segs map[int]bool, ok bool) {
 	if fresh.baseCtr != n.baseCtr || fresh.basePages != n.basePages ||
 		!n.appendAt.known || n.appendAt.offset != n.deltaEnd || !fresh.appendAt.known ||
@@ -441,18 +391,15 @@ func (n *Session) reopenedTouched(fresh *Session) (rows map[int][]int64, segs ma
 	return deltaTouched(st.mapping.Data(), fresh.appendAt.version, n.deltaEnd, fresh.deltaEnd, n.appendAt.cksum, fresh.appendAt.cksum)
 }
 
-// carryOut takes the indexes this session's stores built, with the rows the
-// batches since its view wrote as the session saw them, for carryIn. Run while
-// the stores still read that view, with nothing written in them that the file
-// does not hold (RefreshIfStale reopens only then), so what they hold is the
-// delta's state where this session's view of it ends.
+// carryOut takes this session's store indexes and the old rows the new batches
+// wrote, for carryIn. The stores must still read the old view and hold nothing
+// uncommitted.
 func (n *Session) carryOut(rows map[int][]int64, segs map[int]bool) []carriedTable {
 	var out []carriedTable
 	for _, t := range n.DB.tables {
 		s := t.rows
-		// A table written since its last commit holds rows no change log may
-		// describe -- a virtual table's shadow rows, a load's -- which no batch
-		// would move out of its indexes.
+		// Rows written since the last commit may not be in any batch, so no batch
+		// would move them out of the indexes.
 		if s == nil || t.isTemp || t.aliasOf != "" || t.rowsWrittenSinceCommit || t.bulk != nil ||
 			len(s.uqIdx) == 0 && len(s.eqIdx) == 0 {
 			continue
@@ -480,9 +427,8 @@ func (n *Session) carryOut(rows map[int][]int64, segs map[int]bool) []carriedTab
 	return out
 }
 
-// carryIn puts carried indexes into n, a session reopened from the same
-// segment file, moving each for the rows carryOut took: out under the row as
-// the old session saw it, in under the row n reads now.
+// carryIn installs carried indexes into n and moves each row the new batches
+// wrote: out under the old row, in under the row n reads now.
 func (n *Session) carryIn(carried []carriedTable) {
 	for _, c := range carried {
 		ft := n.DB.tableNamed(c.t.name)

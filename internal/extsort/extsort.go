@@ -1,8 +1,7 @@
-// Package extsort sorts more records than memory holds: records are kept until
-// they reach a byte budget, then sorted and written to a temporary file as a
-// run, and the runs are merged back in order. The order is a stable sort's --
-// by Compare, ties in the order Add saw them -- so a sort that fits in one run
-// and one that spills give the same sequence.
+// Package extsort sorts more records than memory holds: held records are
+// sorted and spilled to a temporary file in runs, which are merged back. The
+// order is a stable sort's, so a sort that fits in memory and one that spills
+// agree.
 package extsort
 
 import (
@@ -146,9 +145,8 @@ func (s *Sorter[T]) Each(fn func(T) error) error {
 	return s.merge(s.runs, fn)
 }
 
-// merge reads runs together, smallest record first, the earlier run first
-// among equals: runs hold consecutive stretches of what Add saw, so that is
-// the stable order.
+// merge reads runs smallest record first, the earlier run first among equals:
+// runs hold consecutive stretches of the input, so that is the stable order.
 func (s *Sorter[T]) merge(runs []run, fn func(T) error) error {
 	bufSize := min(max(s.budget/(2*len(runs)), 4<<10), 1<<20)
 	h := make([]*cursor[T], 0, len(runs))
@@ -267,8 +265,7 @@ func (s *Sorter[T]) Close() error {
 	return f.Close()
 }
 
-// TempFile is a scratch file with no name where the platform allows: what a
-// spill writes to and reads back.
+// TempFile is a scratch file, unnamed where the platform allows.
 type TempFile struct {
 	f    *os.File
 	name string // set while the file still has its name

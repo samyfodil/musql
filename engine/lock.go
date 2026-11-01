@@ -31,12 +31,10 @@ var BusyTimeout = 5 * time.Second
 // attempts. A fixed short interval keeps latency negligible in the uncontended case.
 var busyRetryInterval = 5 * time.Millisecond
 
-// lockFreed wakes this process's lock waiters (acquireLock) whenever a lock it
-// held is released, instead of leaving each to its next poll. Connections of
-// one process taking turns on a file -- a replicated node's apply beside its
-// local writes -- otherwise waited up to a whole poll interval at every turn,
-// about as long as a commit takes. A lock another process holds is still
-// polled for.
+// lockFreed wakes this process's lock waiters when a lock it held is released,
+// instead of leaving each to its next poll: connections of one process taking
+// turns on a file waited up to a poll interval at every turn. A lock another
+// process holds is still polled for.
 var lockFreed = struct {
 	sync.Mutex
 	ch chan struct{}

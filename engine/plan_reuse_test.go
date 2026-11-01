@@ -8,11 +8,9 @@ import (
 	"testing"
 )
 
-// The read plan cache keeps a compiled Program across commits -- this
-// connection's and another's -- because a Program binds its rows when it runs.
-// Every check below runs a statement twice: by its own text, which the cache
-// serves, and by a text the cache has never held, which compiles afresh. The
-// harness cannot see this: its differ prepares every statement anew.
+// Each check runs a statement by its own text, which the plan cache serves,
+// and by a text it never held. The harness cannot see this: its differ
+// prepares every statement anew.
 
 type reuseQuery struct {
 	q    string
@@ -272,10 +270,8 @@ func TestPlanReuseRollbackAndSavepoints(t *testing.T) {
 	all()
 }
 
-// bm25, rank, snippet and highlight compile against the corpus statistics of
-// the MATCH (fts5AuxState), so their answers must follow every write to the
-// table: inside a transaction, after its commit, and after another
-// connection's.
+// fts5's auxiliary functions compile against corpus statistics, so their
+// answers must follow every write to the table.
 func TestPlanReuseFollowsFts5Corpus(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "corpus.musq")
 	a, err := Create(path)

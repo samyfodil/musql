@@ -205,15 +205,13 @@ type wherePlanWinner struct {
 	auto, oneRow bool
 	explain      wherePlanExplain
 
-	// access is the loop's access path: which columns it pins (seekKeyKept,
-	// seek_raise.go).
+	// access is the loop's access path (seek_raise.go).
 	access wherePlanAccess
 }
 
-// wherePlanAccess is the access path of a winning loop. eq are the columns
-// whose equality the loop consumes, xnRowid for the rowid: an index's
-// equality prefix, or every term driving an automatic index. rangeCol is the
-// column a range bound of the loop constrains, when hasRange.
+// wherePlanAccess is a winning loop's access path: eq are the columns whose
+// equality it consumes (xnRowid for the rowid), rangeCol the column a range
+// bound constrains.
 type wherePlanAccess struct {
 	known    bool
 	auto     bool
@@ -532,9 +530,8 @@ type autoIndexKey struct {
 	nEq          int
 	groupsSorted bool
 
-	// autoEq is how many leading columns of an automatic index's key its
-	// equality terms constrain (constructAutomaticIndex's nKeyCol); zero for
-	// any other key.
+	// autoEq is how many leading key columns an automatic index's equalities
+	// constrain (constructAutomaticIndex's nKeyCol).
 	autoEq int
 }
 
@@ -1436,9 +1433,8 @@ func wherePlanSubqueryUsage(jts []joinedTable, scopes []tableScope, e Expr) (whe
 	return m, ok
 }
 
-// wherePlanSubqueryNames calls mark for every name inside a subquery of e that
-// resolves outside that subquery. ok false when a name or FROM item inside
-// cannot be resolved exactly, mark having seen only the names before it.
+// wherePlanSubqueryNames calls mark for every name in a subquery of e that
+// resolves outside it; false when a name cannot be resolved exactly.
 func wherePlanSubqueryNames(p *ReadOnlyPager, e Expr, mark func(ColumnExpr) bool) bool {
 	ok := true
 	// The CTEs in scope where e is compiled: a subquery naming one reads its

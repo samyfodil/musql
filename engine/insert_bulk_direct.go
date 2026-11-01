@@ -191,10 +191,8 @@ func (m *vdbe) bulkLoadInTx(plan *insertPlan) *segBulkLoad {
 		if !tbl.rows.isEmpty() {
 			return nil
 		}
-		// Emptied by this transaction's own writes, which the log holds: the
-		// inserts join them there, as for a table with rows. A load would
-		// make the commit rewrite the whole file (mutatedOutsideChangeLog)
-		// for what a delta batch says in a few records.
+		// Emptied by this transaction's own writes: the inserts join them in the
+		// log, since a load would make the commit rewrite the whole file.
 		if tbl.rowsWrittenSinceCommit && !txLoadAfterWritesForTest {
 			return nil
 		}
@@ -404,10 +402,9 @@ func (db *DB) drainTxBulk(t *tableMeta) {
 	if bl == nil {
 		return
 	}
-	// The table arms again only after as many inserts as armed it. A
-	// transaction reading it between inserts (a replicated apply, a few
-	// statements per op) otherwise armed a new load at each insert, a chunk
-	// per column, and drained it at the next read.
+	// The table arms again only after as many inserts as armed it; a
+	// transaction reading it between inserts otherwise armed and drained a load
+	// at every insert.
 	delete(db.appendSeen, t)
 	wc := db.activeWC
 	mark := bl.rows

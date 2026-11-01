@@ -572,9 +572,8 @@ func whereReversedScanKey(k *autoIndexKey) *autoIndexKey {
 //   - a WHERE conjunct wherePlanTermsFrom cannot use;
 //   - an index not rebuildable exactly (wherePlanIndexList).
 func markWherePlanIndexEligibility(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt *SelectStmt) {
-	// The winning loop's EXPLAIN QUERY PLAN line rides on the source's seek. A
-	// write compile brings its own winner (compiler.planWinner), which this
-	// leaves alone.
+	// The winning loop's EXPLAIN line rides on the source's seek; a write
+	// compile brings its own winner (compiler.planWinner).
 	var won wherePlanWinner
 	if c.planWinner == nil {
 		c.planWinner = &won

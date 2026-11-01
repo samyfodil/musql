@@ -5,12 +5,8 @@ import (
 	"testing"
 )
 
-// TestPoisonedSessionPublishesNothing: a session whose commit failed keeps
-// the statement's rows until its rebuild (Poison), and neither a commit nor a
-// close before that rebuild may publish them. A replicated writer's refused
-// hand-off left its row there, the connection pool closed the connection, and
-// the close committed the row: durable, with no op, and the caller's retry
-// failed UNIQUE.
+// TestPoisonedSessionPublishesNothing: neither a commit nor a close publishes
+// a failed commit's rows before the rebuild (Poison).
 func TestPoisonedSessionPublishesNothing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "p.musq")
 	buildDB(t, path, `CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)`, `INSERT INTO t VALUES(1, 'one')`)

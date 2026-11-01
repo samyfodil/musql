@@ -5,11 +5,8 @@ import (
 	"testing"
 )
 
-// TestDeltaMaxLiveFollowsEveryChange: the delta's kept largest live rowid
-// (maxLive) is the largest its live rows hold after every way they change --
-// put, kill, and a commit's records (applyRecs) -- whether or not it was asked
-// for in between. A connection's next rowid is one past it: kept too low it
-// is a row's rowid already.
+// TestDeltaMaxLiveFollowsEveryChange: maxLive is the largest live rowid after
+// puts, kills and a commit's records, asked for in between or not.
 func TestDeltaMaxLiveFollowsEveryChange(t *testing.T) {
 	st := &segDeltaState{live: map[int]map[int64][]Value{}, dead: map[int]map[int64]bool{}}
 	rng := rand.New(rand.NewPCG(3, 9))

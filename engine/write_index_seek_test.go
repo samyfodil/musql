@@ -87,10 +87,8 @@ func TestWriteIndexSeekMatchesTheWalk(t *testing.T) {
 	}
 }
 
-// TestWriteIndexSeekCompositeKeys is the same comparison over a composite key
-// of TEXT and BLOB columns whose leading column holds one value for most rows,
-// and a NOCASE key column, whose TEXT probes the byte-exact indexes must
-// refuse: each write, literal and bound, against the walk.
+// TestWriteIndexSeekCompositeKeys: the same comparison over a composite TEXT
+// and BLOB key and a NOCASE column, whose TEXT probes the indexes refuse.
 func TestWriteIndexSeekCompositeKeys(t *testing.T) {
 	setup := []string{
 		`CREATE TABLE c (tbl TEXT, pk BLOB, col TEXT, v, PRIMARY KEY(tbl, pk, col))`,

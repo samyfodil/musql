@@ -1,12 +1,9 @@
 package compat
 
-// Seeks against C SQLite where the WHERE holds a term that can raise: C
-// evaluates its terms in one order on the rows its own loop visits, and fails
-// on the first row that reaches the raising term. A seek must neither skip a
-// row C reaches that term on nor reach it on a row C never visits. Every
-// statement runs on both engines, over the log the rows were written to and
-// then over segments, and the outcome -- the rows, or that it failed -- must
-// match.
+// Seeks where the WHERE holds a term that can raise: C fails on the first row
+// its own loop brings to that term, so a seek must neither skip such a row nor
+// reach the term on a row C never visits. Rows and failures must match, over
+// the log and over segments.
 
 import (
 	"context"
@@ -216,12 +213,10 @@ func seekRaiseSubOpen(t *testing.T, index, segments bool) (pure, mattn *sql.Conn
 	return pure, mattn
 }
 
-// seekRaiseSubWheres are WHERE clauses over seekRaiseSubOpen's table. C codes a
-// term holding a correlated sub-select after every other term
-// (TERM_VARSELECT), and any other term, a sub-select that names nothing outside
-// itself included, in WHERE order. With no index on value it scans, so a
-// raising term before "value = 7" is reached on the row that holds malformed
-// JSON, and one after it, or one a correlated sub-select puts last, is not.
+// seekRaiseSubWheres: C codes a correlated sub-select's term after every
+// other (TERM_VARSELECT) and the rest in WHERE order, so with no index on value
+// a raising term before "value = 7" reaches the malformed row, and one after
+// it does not.
 func seekRaiseSubWheres() []string {
 	const (
 		uncorrelated = `json_extract(j, '$') < (SELECT max(v) FROM other)`
@@ -285,10 +280,8 @@ func TestSeekRaiseSubselectVsC(t *testing.T) {
 	}
 }
 
-// TestSeekRaiseTriggerVsC: in a trigger body NEW and OLD are found before
-// lookupName climbs out of a sub-select, so a sub-select that names only them
-// is not correlated and C tests it in WHERE order; one that also names a table
-// of the statement is.
+// TestSeekRaiseTriggerVsC: in a trigger, a sub-select naming only NEW and OLD
+// is not correlated; one that also names a table of the statement is.
 func TestSeekRaiseTriggerVsC(t *testing.T) {
 	const key = `value = 7`
 	var wheres []string
@@ -337,10 +330,8 @@ func seekRaiseGeneratedOpen(t *testing.T, index, segments bool) (pure, mattn *sq
 	return pure, mattn
 }
 
-// TestSeekRaiseGeneratedVsC: a term that reads a VIRTUAL generated column
-// computes its expression, where a STORED column's was computed when the row
-// was written. Writing a row computes both, so a row the expression raises on
-// is refused, and these terms, in both orders, answer what C does.
+// TestSeekRaiseGeneratedVsC: a term reading a VIRTUAL column computes it; a
+// STORED column was computed when the row was written.
 func TestSeekRaiseGeneratedVsC(t *testing.T) {
 	const key = `value = 7`
 	var wheres []string
@@ -380,10 +371,8 @@ func TestSeekRaiseGeneratedVsC(t *testing.T) {
 	}
 }
 
-// TestSeekRaiseConsumedFirstVsC: an index on (a, b) holds both equalities for
-// C, which visits only the row with a = 1 and b = 2 whatever a term that can
-// raise is. A seek reads every row with a = 1 (or with b = 2), so the two
-// equalities are tested before the term, as C's index has them hold.
+// TestSeekRaiseConsumedFirstVsC: C's index on (a, b) visits only a = 1 AND b =
+// 2, so a seek on one column must test both equalities before the raising term.
 func TestSeekRaiseConsumedFirstVsC(t *testing.T) {
 	const keys = `a = 1 AND b = 2`
 	var wheres []string

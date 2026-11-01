@@ -1,8 +1,7 @@
 package engine
 
-// wherePlanExplain is one loop's EXPLAIN QUERY PLAN line in
-// sqlite3WhereAddExplainText's words (wherecode.c): the verb, the FROM item's
-// name, then using. The zero value is a loop this port does not word.
+// wherePlanExplain is one loop's EXPLAIN QUERY PLAN line as
+// sqlite3WhereAddExplainText words it; the zero value is a loop not worded.
 type wherePlanExplain struct {
 	verb  string // "SEARCH" or "SCAN"
 	name  string // the item as %S prints it (explainItemName), "" for the table's
@@ -29,10 +28,8 @@ func explainItemName(f FromItem) string {
 	return f.Table
 }
 
-// accessOf is the access path of the winning loop w: the columns its
-// equality prefix pins, past any skip-scan columns, and the column its range
-// bound constrains. An automatic index's equalities are its key's
-// (wherePlanAutoIndexKey); a multi-index OR loop is not described.
+// accessOf is the access path of the winning loop w: its equality prefix past
+// any skip-scan columns, and its range column.
 func (b *wherePlanIdxBuild) accessOf(w *whereIdxLoop) wherePlanAccess {
 	if w == nil || w.multiOr {
 		return wherePlanAccess{}
@@ -63,10 +60,8 @@ func (b *wherePlanIdxBuild) accessOf(w *whereIdxLoop) wherePlanAccess {
 	return a
 }
 
-// explainLoop words the winning loop w of a one-table plan. A multi-index OR
-// loop, an automatic index, an expression index (WHERE_EXPRIDX is not tracked)
-// and a vector range bound (its nBtm/nTop, whereRangeVectorLen, is not
-// computed) are not worded.
+// explainLoop words the winning loop of a one-table plan. Multi-index OR,
+// automatic and expression indexes, and vector range bounds are not worded.
 func (b *wherePlanIdxBuild) explainLoop(w *whereIdxLoop) wherePlanExplain {
 	if w == nil || w.multiOr || w.autoIdx || w.idx == nil || w.nEq > len(w.lTerm) {
 		return wherePlanExplain{}

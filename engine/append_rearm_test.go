@@ -6,11 +6,8 @@ import (
 	"testing"
 )
 
-// TestAppendLoadRearmsAfterAnotherRun: a transaction that reads a table
-// between its inserts drains the table's append load at every read, and the
-// next insert arms a new one only after as many inserts again as armed the
-// first -- not at once, every insert, each load a chunk per column. Every row
-// still lands.
+// TestAppendLoadRearmsAfterAnotherRun: reads between inserts drain the append
+// load, which arms again only after another run of inserts; every row lands.
 func TestAppendLoadRearmsAfterAnotherRun(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "a.musq")
 	buildDB(t, path, `CREATE TABLE t(id INTEGER PRIMARY KEY, v)`, `INSERT INTO t VALUES(1, 1)`)

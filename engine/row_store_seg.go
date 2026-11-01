@@ -539,10 +539,8 @@ func (s *rowStore) segSortedRowids() []uint64 {
 }
 
 // segMaxRowid is the largest visible rowid: the overlay's, the delta's largest
-// live one (maxLive), and each segment's top row neither the delta nor this
-// session dropped. Nothing is walked in order: merging the delta into a
-// descending walk sorted every live delta row of the table first, which a
-// session's first insert after each catch-up paid.
+// live one, and each segment's top row neither the delta nor this session
+// dropped, found without a sorted walk.
 func (s *rowStore) segMaxRowid() (uint64, bool) {
 	var max uint64
 	found := false
@@ -586,12 +584,9 @@ func (s *rowStore) segMaxRowid() (uint64, bool) {
 	return max, found
 }
 
-// segMaxRowidIn is maxRowidIn for a store over segments, without walking every
-// row: the overlay's rows and the delta's in the range, and in each segment
-// the top of the range, found by its sorted rowids, down to the first row
-// neither the delta nor this session dropped. A session's first insert under
-// a rowid range (replication's per-site ranges) read the whole table back,
-// every time it caught up with another connection's commit.
+// segMaxRowidIn is maxRowidIn over segments without walking every row: the
+// overlay's and the delta's rows in range, and each segment's top row in
+// range, found by its sorted rowids.
 func (s *rowStore) segMaxRowidIn(lo, hi uint64) (uint64, bool) {
 	var max uint64
 	found := false

@@ -9,12 +9,9 @@ import (
 	"testing"
 )
 
-// TestNewRowidIsOnePastTheTop: every rowid a connection hands out is one past
-// the largest the table holds as that connection reads it, across other
-// connections' commits it catches up with, deletes of the top row (its own, in
-// the same transaction, or another connection's), rollbacks, and compactions
-// (VACUUM) that move the rows into segments. A largest rowid kept too low hands
-// out one a row already has; kept too high, it skips the one C SQLite reuses.
+// TestNewRowidIsOnePastTheTop: a new rowid is one past the largest the table
+// holds as the connection reads it, across catch-ups, deletes of the top row,
+// rollbacks and compactions.
 func TestNewRowidIsOnePastTheTop(t *testing.T) {
 	for _, seed := range []uint64{1, 2} {
 		testNewRowidIsOnePastTheTop(t, seed)

@@ -10,13 +10,9 @@ import (
 	"github.com/samyfodil/musql/engine"
 )
 
-// TestTxLoadIntoATableTheTransactionEmptied: one transaction deletes every
-// committed row of a table and then inserts, which used to arm a direct-path
-// load on the emptied store. The commit appended only the deletes: a second
-// handle on the file read the table empty while the writer was open, and a
-// fresh handle still did after it closed. Each case runs as it now does, the
-// inserts in the change log, and with the load forced, which the commit must
-// write by rewriting the file.
+// TestTxLoadIntoATableTheTransactionEmptied: a transaction that empties a
+// table and inserts again keeps its rows, through the change log and with the
+// load forced, read by a second handle and after the writer closes.
 func TestTxLoadIntoATableTheTransactionEmptied(t *testing.T) {
 	cases := []struct {
 		name   string

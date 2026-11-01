@@ -51,10 +51,8 @@ func TestCommitHookReportsCommittedState(t *testing.T) {
 	}
 }
 
-// TestReplaceStateIsSeenByHeldSession: a copy kept by writing its files
-// directly -- the bytes another file's commits appended, then a new segment
-// file -- is read by a session already open on it once it checks for change, as the
-// driver does before each statement.
+// TestReplaceStateIsSeenByHeldSession: files written directly under
+// ReplaceState are read by an open session at its next change check.
 func TestReplaceStateIsSeenByHeldSession(t *testing.T) {
 	dir := t.TempDir()
 	src, dst := filepath.Join(dir, "src.musq"), filepath.Join(dir, "dst.musq")

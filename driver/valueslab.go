@@ -9,13 +9,10 @@ import (
 )
 
 // valueSlab hands out driver.Values whose payloads live in chunks shared by
-// the values of a few rows. Boxing an int64, float64, string or []byte into
-// an interface otherwise allocates once per value (twice for TEXT and BLOB,
-// whose bytes are copied first), which was most of the driver's allocations
-// on a point lookup. A value is written once and never again, and a chunk is never
-// reused, so every Value handed out stays valid for as long as its holder
-// keeps it. A chunk covers at most valueSlabRows rows and is sized exactly to
-// them, so a value kept long pins little.
+// the values of a few rows, instead of one allocation per boxed value (most of
+// the driver's allocations on a point lookup). Values and chunks are never
+// reused, so every Value stays valid while its holder keeps it, and a chunk is
+// sized to at most valueSlabRows rows, so a value kept long pins little.
 type valueSlab struct {
 	words []uint64 // an INTEGER's or a REAL's eight bytes
 	strs  []string
@@ -55,8 +52,7 @@ func (s *valueSlab) fill(rows [][]engine.Value) {
 		s.blobs = make([][]byte, 0, nbl)
 	}
 	if ns+nbl > 0 {
-		// Never nil, even with no bytes to hold: an empty BLOB is an empty
-		// []byte, not the nil that NULL scans as.
+		// Never nil: an empty BLOB is an empty []byte, not the nil NULL scans as.
 		s.text = make([]byte, 0, nb)
 	}
 }

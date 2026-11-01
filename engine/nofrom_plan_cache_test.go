@@ -2,10 +2,8 @@ package engine
 
 import "testing"
 
-// TestNoFromReadIsPlanCached: a top-level FROM-less read keeps its compiled
-// plan for its text like any other read, and answers its bindings from it;
-// one with GROUP BY does not, since its terms are checked against the
-// bindings before the compile.
+// TestNoFromReadIsPlanCached: a FROM-less read keeps its plan for its text;
+// one with GROUP BY does not.
 func TestNoFromReadIsPlanCached(t *testing.T) {
 	db, err := Create(t.TempDir() + "/x.musq")
 	if err != nil {

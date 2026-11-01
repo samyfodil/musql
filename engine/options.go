@@ -32,11 +32,10 @@ func WithoutJIT() Option { return func(c *config) { c.noJIT = true } }
 // existed. For comparing the two; the answers are the same either way.
 func WithoutFusion() Option { return func(c *config) { c.noFusion = true } }
 
-// WithCommitHook calls fn after every commit that changed a database file
-// (CommitInfo). It runs under that file's exclusive write lock, after the
-// commit is synced and before it returns, so calls for one file arrive in
-// commit order and the files stay as they are until fn returns. fn must not
-// open the same database: its locks would wait on the commit calling it.
+// WithCommitHook calls fn after every commit that changed a database file,
+// under its write lock once the commit is synced: calls for a file arrive in
+// commit order, and the files hold still until fn returns. fn must not open
+// the same database, whose locks would wait on the commit calling it.
 func WithCommitHook(fn func(CommitInfo)) Option { return func(c *config) { c.onCommit = fn } }
 
 // Configure sets process-wide engine behavior; options not given take their

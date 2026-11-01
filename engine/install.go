@@ -22,16 +22,12 @@ func FormatVersions() (file, minFile, delta uint32) {
 // after the caller read its state.
 var ErrStateMoved = errors.New("engine: the database changed since its state was read")
 
-// InstallSegmentFile makes the segment file at src the database at path, in
-// place of what path holds, as a commit after path's last: src's change counter
-// is raised past path's, so every session reloads at its next statement, as
-// after another connection's commit, and a transaction begun on the replaced
-// state cannot commit over it. counter is path's state as the caller read it
-// (CommitState); a commit since is ErrStateMoved.
-//
-// src must have no delta. path's delta is removed before src is renamed in: a
-// crash between the two leaves path's segment file alone, an older state, and
-// src where it was, and calling InstallSegmentFile again finishes the install.
+// InstallSegmentFile replaces the database at path with the segment file src,
+// as a commit after path's last: src's change counter is raised past path's,
+// so every session reloads. counter is path's state as the caller read it
+// (CommitState); a commit since is ErrStateMoved. src must have no delta.
+// path's delta goes first, so a crash midway leaves an older state, and
+// calling it again finishes the install.
 func InstallSegmentFile(path, src string, counter uint32) error {
 	if fi, err := os.Stat(segDeltaPath(src)); err == nil && fi.Size() > 0 {
 		return fmt.Errorf("engine: %s has a delta; compact it before installing it", src)
@@ -69,9 +65,8 @@ func InstallSegmentFile(path, src string, counter uint32) error {
 	})
 }
 
-// PinnedFiles is a database's committed state held open: its segment file,
-// then the first DeltaLen bytes of its delta, readable whatever the database
-// commits or compacts after, and the formats the two were written in.
+// PinnedFiles holds a committed state open: the segment file, the first
+// DeltaLen bytes of the delta, and their format versions.
 type PinnedFiles struct {
 	Seg, Delta                *os.File // Delta is nil when the state has none
 	SegSize, DeltaLen         int64
@@ -92,13 +87,12 @@ func (p *PinnedFiles) Close() error {
 // removed, as on Windows.
 const openFilesStopRenames = runtime.GOOS == "windows"
 
-// PinCommittedFiles opens path's committed state, holding the shared lock so
-// that no commit lands meanwhile. What is open stays that state: a commit after
-// appends to the delta past DeltaLen, and a compaction replaces both files by
-// rename. The files are opened, not linked: a session trusts a descriptor of
-// its own while the file has a name (heldStamp), so another name would hide the
-// rename from it. Where a file held open would stop the rename (Windows), the
-// state is copied into dir instead, under the lock, and the copies are open.
+// PinCommittedFiles opens path's committed state under the shared lock. Later
+// commits append past DeltaLen and compactions rename, so the open files keep
+// the state. They are opened, not linked: a session trusts its own descriptor
+// while the file has a name (heldStamp), and a second name would hide a
+// rename from it. Where open files block renames (Windows), the state is
+// copied into dir instead.
 func PinCommittedFiles(path, dir string) (*PinnedFiles, error) {
 	p := &PinnedFiles{}
 	err := withSegmentReadLock(path, func() error {
@@ -164,8 +158,7 @@ func pinFile(path, cp string, n int64) (*os.File, error) {
 	return dst, nil
 }
 
-// headerVersion is the format version in the header of f, which starts with
-// magic.
+// headerVersion is the format version in f's header, which starts with magic.
 func headerVersion(f *os.File, magic string) (uint32, error) {
 	var b [8]byte
 	if _, err := f.ReadAt(b[:], 0); err != nil {

@@ -1571,10 +1571,9 @@ func fkAssignsChildCols(fk *fkConstraint, mask []bool) bool {
 	return false
 }
 
-// fkOldKeyErr is the error of a VIRTUAL child key column of ev's old row
-// whose expression raises. C loads the old row's key columns (sqlite3FkOldmask)
-// for a delete, and for an update that assigns a key column of any foreign key
-// on the table (sqlite3FkRequired), so the load raises there.
+// fkOldKeyErr is the error of a raising VIRTUAL child key column of ev's old
+// row: C loads the old row's key columns for a delete, and for an update that
+// assigns any foreign key's column (sqlite3FkOldmask, sqlite3FkRequired).
 func (db *DB) fkOldKeyErr(ev fkEvent) error {
 	if ev.old == nil {
 		return nil
@@ -1805,9 +1804,8 @@ func (db *DB) fkParentCandidates(fk *fkConstraint, probe []Value) ([]uint64, boo
 // order the child's own b-tree -- and so C SQLite's action loop -- visits
 // them in).
 //
-// C finds them with a scan whose WHERE compares the key column by column
-// (fkScanChildren), so a VIRTUAL key column is computed for each row the
-// comparisons reach, and one whose expression raises fails the scan.
+// C finds them with a column-by-column WHERE (fkScanChildren), so a raising
+// VIRTUAL key column fails the scan.
 func (db *DB) fkChildRowsMatching(fk *fkConstraint, parentKey []Value) ([]uint64, error) {
 	// See fkParentHasKey's identical guard just above.
 	if err := db.ensureTableLoaded(fk.child); err != nil {

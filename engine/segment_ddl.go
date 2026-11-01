@@ -78,10 +78,8 @@ func Create(path string) (*Session, error) {
 // directory entry to come from.
 func (n *Session) rewriteFile() error { return n.rewriteFileKeeping(false) }
 
-// rewriteFileKeeping is rewriteFile, keeping the stores' indexes on the stores
-// over the new file (rebase) when keepIndexes says the rewrite moves bytes and
-// no row: a commit's, which writes the rows the stores hold under the catalog
-// they were indexed under.
+// rewriteFileKeeping is rewriteFile keeping the stores' indexes (rebase) when
+// keepIndexes says the rewrite moves bytes and no row, as a commit's does.
 func (n *Session) rewriteFileKeeping(keepIndexes bool) error {
 	db := n.DB
 	// An append load's rows (insert_append_delta.go) are entries for a delta
@@ -287,10 +285,8 @@ func (n *Session) rewriteFileKeeping(keepIndexes bool) error {
 // A deliberate simplification: a database with a virtual table keeps the old in-memory behavior;
 // keep its shadow tables loaded and re-base the rest if that ever matters.
 //
-// keepIndexes moves each table's indexes (the UNIQUE probes, the equality
-// posting lists) onto its store over the new file, for a file that holds
-// exactly the rows the stores held: a compaction's, which moves bytes and
-// no row.
+// keepIndexes moves each table's indexes onto its store over the new file, for
+// a rewrite that moves bytes and no row.
 func (n *Session) rebase(open func(string) (*ReadOnlyPager, error), keepIndexes bool) {
 	db := n.DB
 	if db.txActive || len(db.vtabs) > 0 {
@@ -338,8 +334,8 @@ func (n *Session) rebase(open func(string) (*ReadOnlyPager, error), keepIndexes 
 			t.rows.uqIdx, t.rows.eqIdx = s.uqIdx, s.eqIdx
 		}
 	}
-	// The new delta's end is where this session's view of it ends, and where
-	// its next append goes (OpenWriteWait's own carry).
+	// The new delta ends where this session's view does, and its next append
+	// goes there.
 	if st := deltaStateOf(fresh); st != nil && st.version != 0 && st.bytes == n.deltaEnd {
 		n.appendAt.release()
 		n.appendAt = SegDeltaAppendState{offset: st.bytes, cksum: st.cksum, version: st.version, known: true}

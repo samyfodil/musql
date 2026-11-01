@@ -877,10 +877,9 @@ func indexExprsEvalErr(tbl *tableMeta, idx *indexMeta, whereProg *selfRowExpr, k
 	return nil
 }
 
-// indexGenErr is the error filling a new index over tbl's rows raises: C
-// computes each row's key (sqlite3RefillIndex), so a VIRTUAL key column whose
-// expression raised for a row (valueGenErr) fails CREATE INDEX at the first
-// such row in rowid order.
+// indexGenErr is the error CREATE INDEX raises over tbl's rows: C computes
+// each row's key (sqlite3RefillIndex), so a raising VIRTUAL key column fails
+// it at the first such row in rowid order.
 func indexGenErr(tbl *tableMeta, idx *indexMeta) error {
 	if !hasVirtualCols(tbl.cols) {
 		return nil

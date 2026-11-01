@@ -137,11 +137,8 @@ func buildIndexes(t *testing.T, s *Session) {
 	}
 }
 
-// TestCatchUpFoldsInTheNewBatches: a session that another connection's commits
-// left behind folds those batches into the delta state it has -- not a fresh
-// replay of the whole log -- and then answers exactly what a session opened on
-// the file answers: puts, kills, rows put again after a kill, UPDATEs written
-// in place (patch records) and over.
+// TestCatchUpFoldsInTheNewBatches: a catch-up folds in only the new batches
+// and answers as a session opened on the file.
 func TestCatchUpFoldsInTheNewBatches(t *testing.T) {
 	_, a, b := catchUpPair(t)
 	render(t, b, `SELECT count(*) FROM c`)
@@ -181,10 +178,8 @@ func TestCatchUpFoldsInTheNewBatches(t *testing.T) {
 	}
 }
 
-// TestCatchUpCarriesExactIndexes: the indexes a session built move into the
-// session its refresh rebuilds, each moved for exactly the rows the other
-// connection's batches wrote -- a key deleted there conflicts with nothing
-// here, a key added there conflicts, a key moved conflicts only where it went.
+// TestCatchUpCarriesExactIndexes: carried indexes move for exactly the rows
+// the other connection wrote.
 func TestCatchUpCarriesExactIndexes(t *testing.T) {
 	path, a, b := catchUpPair(t)
 	buildIndexes(t, b)
@@ -286,10 +281,9 @@ func TestCatchUpAfterARewrite(t *testing.T) {
 	}
 }
 
-// TestCatchUpKeepsIndexesThroughItsOwnCompaction: a commit that rewrites the
-// file to fold the delta in moves no row, so the committing session's stores
-// over the new file keep the indexes they had -- and its view of the new
-// delta is one the next catch-up starts from.
+// TestCatchUpKeepsIndexesThroughItsOwnCompaction: a commit's own compaction
+// moves no row, so the stores keep their indexes, and the next catch-up starts
+// from the new delta.
 func TestCatchUpKeepsIndexesThroughItsOwnCompaction(t *testing.T) {
 	path, a, b := catchUpPair(t)
 	buildIndexes(t, a)
@@ -321,12 +315,9 @@ func TestCatchUpKeepsIndexesThroughItsOwnCompaction(t *testing.T) {
 	indexesExact(t, path, a)
 }
 
-// TestCatchUpAfterAFailedCommit: a commit refused because another connection
-// committed first leaves the statement's rows in the stores, and the rebuild
-// the refusal asks for (Poison) still folds in only the new batches -- the
-// delta state holds nothing of the failed statement -- but builds its indexes
-// again: a row the failed statement replaced was one this session had put
-// itself, and its drop left no trace in the store to move it back by.
+// TestCatchUpAfterAFailedCommit: the rebuild after a refused commit folds in
+// only the new batches but builds its indexes again, since the failed
+// statement's drops left no trace to undo.
 func TestCatchUpAfterAFailedCommit(t *testing.T) {
 	path, a, b := catchUpPair(t)
 	buildIndexes(t, b)

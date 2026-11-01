@@ -15,8 +15,8 @@ const sqliteTimestampFormat = "2006-01-02 15:04:05.999999999-07:00"
 
 // driverValueToEngine converts a driver.Value into engine.Value.
 // bool binds as INTEGER 0/1, time.Time as TEXT with sqliteTimestampFormat. A
-// nil []byte binds as NULL, as sqlite3_bind_blob does with a NULL pointer and
-// mattn/go-sqlite3 binds it; an empty one as a zero-length BLOB.
+// nil []byte binds as NULL, as sqlite3_bind_blob binds a NULL pointer; an
+// empty one as a zero-length BLOB.
 func driverValueToEngine(v driver.Value) (engine.Value, error) {
 	switch x := v.(type) {
 	case nil:

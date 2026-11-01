@@ -12,11 +12,9 @@ import (
 	"github.com/samyfodil/musql/engine"
 )
 
-// TestContendedWritesLockFirst: once a connection's autocommit write had to be
-// retried, its next writes take the write lock before their first attempt --
-// they wait for it, which LockWait reports, instead of running and losing
-// their commit to the connection committing beside them. Every retry waits
-// for the lock too, so more waits than retries are first attempts.
+// TestContendedWritesLockFirst: after a retry, a connection's autocommit
+// writes take the write lock before their first attempt, so more lock waits
+// than retries are first attempts.
 func TestContendedWritesLockFirst(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "contended.musq")
 	db, err := sql.Open(DriverName, "file:"+path+"?_pragma=busy_timeout(5000)")
@@ -86,10 +84,8 @@ func TestContendedWritesLockFirst(t *testing.T) {
 	}
 }
 
-// TestHandOffLetsGoOfTheWriteLock: a commit handed off by a write holding the
-// write lock -- a contended connection's autocommit write takes it before it
-// runs -- lets go of the lock first: the hand-off lands the changes through a
-// connection that needs it.
+// TestHandOffLetsGoOfTheWriteLock: a hand-off from a write holding the lock
+// releases it first, since the hand-off commits through another connection.
 func TestHandOffLetsGoOfTheWriteLock(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "handoff.musq")
 	db, err := sql.Open(DriverName, "file:"+path+"?_pragma=busy_timeout(1000)")

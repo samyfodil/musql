@@ -7,10 +7,8 @@ import (
 	"testing"
 )
 
-// multiColSeekSchema is a composite key whose leading column holds one value
-// for most of the table (the replication clock's shape), an index over an
-// INTEGER and a NOCASE column, and a key over columns of no affinity holding
-// every class, which the segments cannot index.
+// multiColSeekSchema: a composite key with a mostly constant leading column,
+// an INTEGER and NOCASE index, and a key the segments cannot index.
 func multiColSeekSchema() []string {
 	stmts := []string{
 		`CREATE TABLE c(tbl TEXT, pk BLOB, col TEXT, v, PRIMARY KEY(tbl, pk, col))`,
@@ -74,12 +72,9 @@ func multiColSeekQueries() []multiColSeekQuery {
 	}
 }
 
-// TestMultiColumnSeekMatchesTheScan: an equality on several columns is answered
-// from whichever column's posting list the segments say is smallest. Each query,
-// literal and bound, is compared with the same SQL compiled with no index seek:
-// over segments, over rows the log holds -- through a session, which loads the
-// table, and through a read-only pager, which reads the log beside the segments
-// -- and inside a transaction whose own rows are not committed.
+// TestMultiColumnSeekMatchesTheScan: an equality on several columns seeks the
+// smallest posting list, and answers as the same SQL without a seek, over
+// segments, the log, and a transaction's own rows.
 func TestMultiColumnSeekMatchesTheScan(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "m.musq")
 	buildDB(t, path, multiColSeekSchema()...)
@@ -135,10 +130,8 @@ func TestMultiColumnSeekMatchesTheScan(t *testing.T) {
 	check("segments", n.Query)
 	n.Discard()
 
-	// The log's rows are tested against each probe rather than unioned whole, so
-	// rows move both into and out of probed keys here, and the log is made
-	// larger than an eighth of the segments, which once kept a TEXT or BLOB
-	// probe off it.
+	// Log rows move into and out of probed keys, and the log is larger than an
+	// eighth of the segments, which once kept a TEXT or BLOB probe off it.
 	var logRows []string
 	for i := 0; i < 600; i++ {
 		logRows = append(logRows, fmt.Sprintf(`INSERT INTO c VALUES('v', x'%04x', 'c%d', %d)`, i/3, i%3, 30000+i))

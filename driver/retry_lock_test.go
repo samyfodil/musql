@@ -8,12 +8,9 @@ import (
 	"testing"
 )
 
-// TestRetriedWriteIsNotStarved: an autocommit statement that lost its commit to
-// another connection's runs again holding the write lock, so a connection
-// committing back to back beside it cannot make it lose every attempt until its
-// busy timeout. Unlocked, a statement that takes longer than the gap between
-// the other connection's commits was stale at every commit it reached, and
-// failed "database is locked" while the other's statements all landed.
+// TestRetriedWriteIsNotStarved: a retried autocommit statement holds the write
+// lock, so a connection committing back to back cannot make it lose every
+// attempt until its busy timeout.
 func TestRetriedWriteIsNotStarved(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "starve.musq")
 	var dbs []*sql.DB

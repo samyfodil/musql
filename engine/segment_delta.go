@@ -271,8 +271,7 @@ type segDeltaState struct {
 	posMu    sync.Mutex
 	posCache *namedPosCache
 
-	// top is each table's largest live rowid, where known: a put raises it, a
-	// kill of it forgets it, and maxLive works it out again. topMu guards
+	// top is each table's largest live rowid where known; topMu guards
 	// maxLive's fill, which parallel scans may reach together.
 	topMu sync.Mutex
 	top   map[int]int64
@@ -322,9 +321,8 @@ func (st *segDeltaState) rowsFor(table int) []segOverlayRow {
 	return out
 }
 
-// maxLive is the largest rowid table has live in the delta, and false when it
-// has none. It is kept between calls (top), so a session's first insert after
-// each catch-up does not sort the table's whole overlay to find it.
+// maxLive is the largest rowid table has live in the delta, kept between calls
+// (top) so an insert after each catch-up does not sort the overlay.
 func (st *segDeltaState) maxLive(table int) (int64, bool) {
 	m := st.live[table]
 	if len(m) == 0 {

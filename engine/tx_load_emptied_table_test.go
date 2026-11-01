@@ -9,16 +9,9 @@ import (
 	"testing"
 )
 
-// TestTxLoadIntoATableTheTransactionEmptied: a transaction that deletes every
-// committed row of a table and then inserts used to arm a direct-path load on
-// the emptied store (insert_bulk_direct.go), whose rows only the file rewrite
-// writes. The change log described the table through its deletes, so the
-// commit appended them alone and the new rows were lost: a second session
-// read none of them, and neither did the file once the writer closed.
-//
-// The inserts now take the log and the commit stays a delta append, leaving
-// the segment file as it was. Forced to arm the load anyway, the commit must
-// rewrite the file, and the rows must survive that way too.
+// TestTxLoadIntoATableTheTransactionEmptied: a transaction that empties a
+// table and inserts again commits its rows as a delta append, and with the
+// load forced by a rewrite; a second session and the file both read them.
 func TestTxLoadIntoATableTheTransactionEmptied(t *testing.T) {
 	type tc struct {
 		name   string

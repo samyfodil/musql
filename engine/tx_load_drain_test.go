@@ -9,11 +9,8 @@ import (
 	"testing"
 )
 
-// TestLoadIntoAnEmptyTableCommitsBySize: a load into an empty table commits
-// its rows as a delta batch when the delta can take them, leaving the segment
-// file as it was, and by the whole-file rewrite when they would take the delta
-// past the size compaction rewrites at. Either way a second session reads
-// them, and so does the file once the writer has closed.
+// TestLoadIntoAnEmptyTableCommitsBySize: a load into an empty table commits as
+// a delta batch when the delta can take it, else by a rewrite; both read back.
 func TestLoadIntoAnEmptyTableCommitsBySize(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

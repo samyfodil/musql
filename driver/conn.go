@@ -82,9 +82,8 @@ type Conn struct {
 	// execArgs and queryArgs, which ARE the boundaries.
 	refreshedThisStmt bool
 
-	// contendedUntil is until when this connection's autocommit writes take the
-	// write lock before their first attempt, as a retry does (execArgs): set by
-	// a retry, and by a lock that had to be waited for.
+	// contendedUntil: until then, autocommit writes take the write lock before
+	// their first attempt. Set by a retry and by a lock that was waited for.
 	contendedUntil time.Time
 
 	// txSavepoint is the name of the SAVEPOINT that implicitly STARTED the
@@ -1107,16 +1106,11 @@ func (c *Conn) execArgsBody(sqlText string, args []engine.Value) (driver.Result,
 	// state, exactly like real
 	// SQLite's busy handler re-running the statement.
 	//
-	// A RETRY HOLDS THE WRITE LOCK from before that revalidation to its commit,
-	// as BEGIN IMMEDIATE does (execTxnStmt), which C's writer holds from its
-	// first write. The first attempt runs unlocked, and loses only to a commit
-	// landing while it runs; run unlocked again beside a connection committing
-	// back to back, every attempt lasted as long as the gap between two of its
-	// commits and lost again, until the busy timeout failed the statement.
-	//
-	// While the file stays contended, the first attempt takes the lock too: one
-	// that loses is not only wasted, it leaves its rows in the session, which
-	// then rebuilds from the file (Poison) and builds its indexes again.
+	// A retry holds the write lock from before that revalidation to its commit,
+	// as BEGIN IMMEDIATE does: run unlocked beside a connection committing back
+	// to back, every attempt lost until the busy timeout. While the file stays
+	// contended the first attempt takes the lock too, since a lost attempt
+	// leaves its rows in the session, which must then rebuild (Poison).
 	attempt := 0
 	locked := targetPath == c.path && c.plainDML(sqlText) &&
 		(time.Now().Before(c.contendedUntil) || c.hooks != nil && c.hooks.Contended != nil && c.hooks.Contended())
@@ -1533,10 +1527,10 @@ func (c *Conn) queryOnlyPragma(sqlText string) (handled bool, err error) {
 	return true, nil
 }
 
-// Confine makes this connection fit to serve remote clients: ATTACH and
-// VACUUM INTO, which name files on the server, are refused, and with readOnly
-// every write is (query_only is set and cannot be turned off). Call from a
-// connection hook (RegisterConnectionHook), before the connection is used.
+// Confine fits this connection to serve remote clients: ATTACH and VACUUM
+// INTO, which name files on the server, are refused, and with readOnly so is
+// every write. Call it from a connection hook (RegisterConnectionHook) before
+// the connection is used.
 func (c *Conn) Confine(readOnly bool) {
 	c.confined, c.confinedReadOnly = true, readOnly
 	if readOnly {
@@ -3128,10 +3122,9 @@ func (c *Conn) dropTempObjects() {
 	c.temp = nil
 }
 
-// contendedFor is how long a connection's autocommit writes take the write lock
-// first after they last found it contended (Conn.contendedUntil), and
-// contendedWait how long taking it must take to count as contended: a lock
-// nobody holds takes microseconds.
+// contendedFor is how long autocommit writes keep taking the lock first after
+// contention; contendedWait is how long taking it must last to count as
+// contended, where a free lock takes microseconds.
 const (
 	contendedFor  = time.Second
 	contendedWait = 200 * time.Microsecond
@@ -3226,9 +3219,8 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 	if want := st.NumInput(); len(args) != want {
 		return nil, fmt.Errorf("sql: expected %d arguments, got %d", want, len(args))
 	}
-	// A statement made for this one call has no arena to reuse: its first
-	// TEXT or BLOB copy took a whole chunk of one, so a call's arena is the
-	// size its arguments take, and its result slab holds the one result.
+	// A statement made for one call has no arena to reuse: size it to the
+	// arguments, and the result slab to one result.
 	st.bytesArena = argArena(args)
 	st.results = make([]execResult, 0, 1)
 	return st.ExecContext(ctx, args)

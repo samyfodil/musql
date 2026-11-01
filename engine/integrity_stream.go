@@ -15,49 +15,24 @@ import (
 	"github.com/samyfodil/musql/internal/extsort"
 )
 
-// PRAGMA integrity_check's per-row half in bounded memory.
-//
-// integrityRowFindingsInMemory (integrity_rowcheck.go) holds a table's rows and
-// every index's entries at once. This pass reads the rows once, in walk order,
-// and holds only what a capped answer can show: the first `limit` findings in
-// pragma.c's order, and how many there are in all. The two sides that need
-// more than one row at a time go to disk:
-//
-//   - an index's entries, derived from the rows, are sorted externally
-//     (internal/extsort) wherever the check reads them in index order: a
-//     UNIQUE index, whose finding compares an entry with the next, and every
-//     index the caller holds a stored copy of;
-//   - a stored copy (IntegrityCheckOptions.StoredIndexEntries) is written to a
-//     scratch file in its own order, and each row's entry is found in it as
-//     sort.Search found it in the slice: a merge when the copy is in order, a
-//     replay of the binary search otherwise (integritySearch).
-//
-// The CHECK constraints are two queries in place of one row per row: how many
-// rows violate one, and the first `limit` of those rowids.
-//
-// What it cannot take exactly it hands back to the in-memory form, which reads
-// at most integrityInMemoryBudgetVar bytes of rows and declines past that. Two
-// of those are files this engine did not write: rows out of rowid order, and a
-// REAL NaN in a key (the comparison is then no order, and the in-memory answer
-// turns on the sort it ran). The third is legal and rare: a table with CHECK
-// constraints whose columns take all three names of its rowid.
+// PRAGMA integrity_check's per-row half in bounded memory. One pass over the
+// rows keeps only the first `limit` findings and a count. Index entries read
+// in order are sorted externally (internal/extsort); a stored index copy is
+// spilled to a scratch file and searched as sort.Search searched the slice
+// (integritySearch). Rows out of rowid order, a NaN in a key, and CHECKs over
+// a table whose columns take all three rowid names go to the in-memory form.
 
-// integrityStreamBudgetVar is about how much memory the derived entries being
-// sorted take, all indexes together; a variable so a test can make every sort
-// spill.
+// integrityStreamBudgetVar bounds the entries being sorted, all indexes
+// together; a variable so tests can force spills.
 var integrityStreamBudgetVar = 32 << 20
 
-// integrityInMemoryBudgetVar bounds the rows integrityRowFindingsInMemory
-// reads; a variable so a test can reach the decline.
+// integrityInMemoryBudgetVar bounds the rows the in-memory form reads.
 var integrityInMemoryBudgetVar = 32 << 20
 
-// errIntegrityInMemory is the streaming pass handing a table to the in-memory
-// form.
 var errIntegrityInMemory = errors.New("engine: integrity_check: the in-memory form answers this table")
 
-// rowFinding is one per-row message and its place in pragma.c's order: the
-// row's walk position, then slot -- a column's index, then the CHECK, then
-// each index's two (integrityIndexSlot).
+// rowFinding is ordered as pragma.c reports: by row, then slot (a column, the
+// CHECK, then each index's two).
 type rowFinding struct {
 	rowid int64
 	slot  int
@@ -71,8 +46,8 @@ func rowFindingLess(a, b rowFinding) bool {
 	return a.slot < b.slot
 }
 
-// findingHeap keeps the `limit` first findings it is shown, in any order of
-// showing, and counts them all.
+// findingHeap keeps the first `limit` findings in any arrival order and counts
+// them all.
 type findingHeap struct {
 	limit int
 	h     []rowFinding // a max-heap: h[0] is the last one kept
@@ -117,7 +92,6 @@ func (fh *findingHeap) add(f rowFinding) {
 	}
 }
 
-// messages is what was kept, in order.
 func (fh *findingHeap) messages() []string {
 	slices.SortFunc(fh.h, func(a, b rowFinding) int {
 		if rowFindingLess(a, b) {
@@ -135,25 +109,23 @@ func (fh *findingHeap) messages() []string {
 	return out
 }
 
-// integrityIndexSlot is index k's slot for its row-against-index finding
-// ("missing", or "values differ") when sub is 0, its UNIQUE finding when 1.
+// integrityIndexSlot is index k's slot: sub 0 for a missing or differing
+// entry, 1 for a non-unique one.
 func integrityIndexSlot(nCols, k, sub int) int { return nCols + 1 + 2*k + sub }
 
-// integrityIndex is one index's part of the streaming pass.
 type integrityIndex struct {
 	idx       *indexMeta
 	k         int
 	stored    iter.Seq[[]Value]
 	storedErr func() error
 	hasStored bool
-	// keys is the rows' entries, sorted, where the check reads them in order.
+	// keys holds the rows' entries, sorted, where the check reads them in order.
 	keys *extsort.Sorter[[]Value]
 }
 
-// integrityRowFindingsStreamed is integrityRowFindingsInMemory's answer for a
-// rowid table with a b-tree, or errIntegrityInMemory for a table it hands back
-// (see this file's comment) and errIntegrityUnreadable for rows the pager
-// cannot read.
+// integrityRowFindingsStreamed answers as integrityRowFindingsInMemory does, or
+// returns errIntegrityInMemory to hand the table back, or
+// errIntegrityUnreadable.
 func (p *ReadOnlyPager) integrityRowFindingsStreamed(tr *SchemaRow, tm *tableMeta, indexes []*indexMeta, checks []checkConstraint, qualify, isQuick bool, limit int) (counts, out []string, n int, err error) {
 	cols := tm.cols
 	enc := p.encoding()
@@ -203,8 +175,7 @@ func (p *ReadOnlyPager) integrityRowFindingsStreamed(tr *SchemaRow, tm *tableMet
 			return nil, nil, 0, gerr
 		}
 		nRows++
-		// (1)-(4), per column in declaration order, skipping the rowid alias --
-		// pragma.c:1920's "if( j==pTab->iPKey ) continue".
+		// pragma.c:1920 skips the rowid alias.
 		for j, c := range cols {
 			if j == tm.ipkIndex {
 				continue
@@ -218,8 +189,8 @@ func (p *ReadOnlyPager) integrityRowFindingsStreamed(tr *SchemaRow, tm *tableMet
 		}
 		for _, ix := range ixs {
 			if ix.keys == nil {
-				// Read nowhere, but the in-memory form searches it, and a NaN
-				// key can make that search miss.
+				// Not read here, but the in-memory form searches it, and a NaN key
+				// can make that search miss.
 				for _, ci := range ix.idx.colIdx {
 					if v := indexColumnValue(tm, rowid, row, ci); v.Typ == Float && math.IsNaN(v.F) {
 						return nil, nil, 0, errIntegrityInMemory
@@ -243,8 +214,7 @@ func (p *ReadOnlyPager) integrityRowFindingsStreamed(tr *SchemaRow, tm *tableMet
 		return nil, nil, 0, errIntegrityUnreadable
 	}
 
-	// C evaluates a CHECK per row (pragma.c:2035): a table without rows
-	// evaluates none, and a CHECK that raises is never reached.
+	// C evaluates a CHECK per row (pragma.c:2035), so an empty table raises none.
 	if len(checks) > 0 && nRows > 0 {
 		if err := p.integrityCheckFindings(tr, checks, qualify, rowidName, len(cols), found); err != nil {
 			return nil, nil, 0, err
@@ -285,13 +255,12 @@ func (p *ReadOnlyPager) integrityRowFindingsStreamed(tr *SchemaRow, tm *tableMet
 	return counts, found.messages(), found.n, nil
 }
 
-// errIntegrityUnreadable is the streaming pass finding rows the pager cannot
-// read, which the caller answers with the CHECK half alone, as the in-memory
-// form does.
+// errIntegrityUnreadable makes the caller answer with the CHECK half alone, as
+// the in-memory form does.
 var errIntegrityUnreadable = errors.New("engine: integrity_check: rows unreadable")
 
-// integrityRowidName is a name that reads tm's rowid in SQL: one of the three
-// spellings no column has taken, else the INTEGER PRIMARY KEY's own, else "".
+// integrityRowidName is a rowid spelling no column took, else the INTEGER
+// PRIMARY KEY's name, else "".
 func integrityRowidName(tm *tableMeta) string {
 	for _, name := range []string{"rowid", "_rowid_", "oid"} {
 		taken := false
@@ -311,10 +280,8 @@ func integrityRowidName(tm *tableMeta) string {
 	return ""
 }
 
-// integrityCheckFindings adds a CHECK finding for every row that breaks a
-// constraint, asking the query engine exactly as the in-memory form does
-// (integrityCheckViolatingRowids): how many rows, then which ones, the first
-// `limit` in rowid order.
+// integrityCheckFindings asks as integrityCheckViolatingRowids does: how many
+// rows break a CHECK, then the first `limit` of them by rowid.
 func (p *ReadOnlyPager) integrityCheckFindings(tr *SchemaRow, checks []checkConstraint, qualify bool, rowidName string, nCols int, found *findingHeap) error {
 	where := " WHERE " + integrityCheckViolationExpr(checks)
 	_, vals, qerr := p.QueryArgs(integrityCheckProbeSQL(tr, checks, qualify, "SELECT count(*) FROM ")+where, nil)
@@ -351,9 +318,8 @@ func (p *ReadOnlyPager) integrityCheckFindings(tr *SchemaRow, checks []checkCons
 	return nil
 }
 
-// checkDerivedUnique is the UNIQUE finding over entries derived from the rows:
-// each row's entry is its own in the sorted list, so the one test that can
-// fire is integrityEntryIsNonUnique's against the entry after it.
+// checkDerivedUnique compares each derived entry with the next: the only
+// UNIQUE finding entries derived from the rows can raise.
 func (ix *integrityIndex) checkDerivedUnique(cols []columnInfo, enc TextEncoding, found *findingHeap) error {
 	var prev []Value
 	err := ix.keys.Each(func(k []Value) error {
@@ -366,9 +332,8 @@ func (ix *integrityIndex) checkDerivedUnique(cols []columnInfo, enc TextEncoding
 	return err
 }
 
-// checkStored holds every row's entry against a stored copy of the index, as
-// pragma.c:2066-2149 holds the row against the index b-tree: the entry is
-// found by sort.Search over the copy in its own order.
+// checkStored finds each row's entry in a stored copy as pragma.c:2066-2149
+// finds it in the index, by sort.Search over the copy's own order.
 func (ix *integrityIndex) checkStored(sp *storedSpill, cols []columnInfo, enc TextEncoding, found *findingHeap) error {
 	idx := ix.idx
 	cmp := func(a, b []Value) int { return compareIndexRec(a, b, idx.colCollation, idx.colDesc, enc) }
@@ -394,8 +359,7 @@ func (ix *integrityIndex) checkStored(sp *storedSpill, cols []columnInfo, enc Te
 		var at int
 		var rec, next []Value
 		if seq != nil {
-			// In order, sort.Search's answer is the first entry not below the
-			// key, and keys come in ascending order: a merge.
+			// In order, sort.Search's answer only moves forward: a merge.
 			for seq.pos < sp.m && cmp(seq.cur, key) < 0 {
 				if err := seq.advance(); err != nil {
 					return err
@@ -420,10 +384,9 @@ func (ix *integrityIndex) checkStored(sp *storedSpill, cols []columnInfo, enc Te
 			found.add(rowFinding{rowid, missing, fmt.Sprintf("row %d missing from index %s", rowid, idx.name)})
 			return nil
 		}
-		// pragma.c:2111-2124: a key column under a non-BINARY collation must
-		// still hold the table's exact value. OP_Ne carries no collating
-		// sequence and no SQLITE_NULLEQ, so it compares BINARY and a NULL on
-		// either side never counts as different.
+		// pragma.c:2111-2124: under a non-BINARY collation the key must still
+		// hold the exact value. OP_Ne compares BINARY and never counts a NULL
+		// as different.
 		for kk := range idx.colIdx {
 			if kk < len(idx.colCollation) && !strings.EqualFold(idx.colCollation[kk], "BINARY") &&
 				rec[kk].Typ != Null && key[kk].Typ != Null && compareValues(rec[kk], key[kk]) != 0 {
@@ -452,12 +415,10 @@ func (ix *integrityIndex) checkStored(sp *storedSpill, cols []columnInfo, enc Te
 	})
 }
 
-// integritySearch is sort.Search over a sequence read by position, asked for
-// keys in ascending order: each answer is the one sort.Search gives, and the
-// sequence need not be in order. sort.Search's probes are a path down an
-// implicit tree, and the answer moves right as the key grows, so a key's path
-// is the last key's up to the first node where it now goes right; only the
-// rest is read. No node is entered twice.
+// integritySearch is sort.Search over a sequence read by position, for keys
+// asked in ascending order. The answer only moves right as the key grows, so
+// a search resumes the last probe path where it first turns right and no
+// position is read twice.
 type integritySearch struct {
 	n     int
 	probe func(int) ([]Value, error)
@@ -523,10 +484,9 @@ func (sp *storedSpill) close() {
 	}
 }
 
-// spillStoredEntries reads a stored copy to its end: how many entries, and,
-// when keep is set, the entries themselves, whether they are in index order and
-// whether one holds a NaN. ok is false when the copy could not be read, which
-// leaves the index derived from the rows, as the in-memory form leaves it.
+// spillStoredEntries counts a stored copy's entries and, with keep, spills
+// them, noting whether they are sorted and whether one holds a NaN. ok is
+// false when the copy is unreadable; the index is then derived from the rows.
 func spillStoredEntries(entries iter.Seq[[]Value], errFn func() error, keep bool, idx *indexMeta, enc TextEncoding) (sp *storedSpill, ok bool, err error) {
 	sp = &storedSpill{sorted: true}
 	var w *bufio.Writer
@@ -575,8 +535,7 @@ func spillStoredEntries(entries iter.Seq[[]Value], errFn func() error, keep bool
 	return sp, true, nil
 }
 
-// storedSeq reads a spill front to back: cur is entry pos while pos is short
-// of the end, next the one after it once peeked.
+// storedSeq reads a spill front to back.
 type storedSeq struct {
 	sp       *storedSpill
 	r        *bufio.Reader
@@ -606,7 +565,6 @@ func (s *storedSeq) read() ([]Value, error) {
 	return decodeIntegrityValues(s.buf)
 }
 
-// advance moves to entry pos+1.
 func (s *storedSeq) advance() error {
 	s.pos++
 	switch {
@@ -681,7 +639,6 @@ func newStoredRandom(sp *storedSpill) (*storedRandom, error) {
 
 func (s *storedRandom) close() { s.offs.Close() }
 
-// at is entry i.
 func (s *storedRandom) at(i int) ([]Value, error) {
 	if i == s.last {
 		return s.rec, nil
@@ -719,7 +676,6 @@ func integrityKeyCodec(idx *indexMeta, enc TextEncoding) extsort.Codec[[]Value] 
 	}
 }
 
-// valuesHaveNaN reports a REAL NaN among vs.
 func valuesHaveNaN(vs []Value) bool {
 	for i := range vs {
 		if vs[i].Typ == Float && math.IsNaN(vs[i].F) {
@@ -729,8 +685,8 @@ func valuesHaveNaN(vs []Value) bool {
 	return false
 }
 
-// ownedValues copies vs and the bytes they hold into memory of its own, so a
-// held entry keeps nothing else alive.
+// ownedValues copies vs into memory of its own, so a held entry pins nothing
+// else.
 func ownedValues(vs []Value) []Value {
 	n := 0
 	for i := range vs {
@@ -751,7 +707,7 @@ func ownedValues(vs []Value) []Value {
 	return out
 }
 
-// appendIntegrityValues encodes vs exactly: every field a Value carries.
+// appendIntegrityValues encodes every field of each Value.
 func appendIntegrityValues(dst []byte, vs []Value) []byte {
 	dst = binary.AppendUvarint(dst, uint64(len(vs)))
 	for i := range vs {
@@ -774,8 +730,8 @@ func appendIntegrityValues(dst []byte, vs []Value) []byte {
 
 var errIntegrityRecord = errors.New("engine: integrity_check: a scratch record is malformed")
 
-// decodeIntegrityValues reverses appendIntegrityValues into values that own
-// their bytes.
+// decodeIntegrityValues reverses appendIntegrityValues; the values own their
+// bytes.
 func decodeIntegrityValues(b []byte) ([]Value, error) {
 	n, k := binary.Uvarint(b)
 	if k <= 0 || n > uint64(len(b)) {

@@ -10,11 +10,9 @@ import (
 	_ "github.com/samyfodil/musql/driver"
 )
 
-// TestBlobsReadThroughTheValueSlab: BLOB and TEXT values read through
-// database/sql, over enough rows to span many of the driver's value chunks,
-// come back as stored into []byte, any and sql.RawBytes: an empty BLOB as an
-// empty []byte, NULL as nil, and a column whose type changes from row to row
-// as each row's type.
+// TestBlobsReadThroughTheValueSlab: BLOB and TEXT values across many value
+// chunks scan back as stored into []byte, any and sql.RawBytes; an empty BLOB
+// is an empty []byte and NULL is nil.
 func TestBlobsReadThroughTheValueSlab(t *testing.T) {
 	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "b.musq"))
 	if err != nil {

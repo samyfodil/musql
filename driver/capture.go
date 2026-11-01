@@ -53,16 +53,14 @@ type CaptureHooks struct {
 	// takes them in PreCommit and lands them itself here.
 	HandOff func() error
 
-	// LockWait, when set, brackets an autocommit statement's wait for the
-	// write lock it takes before it runs (execArgs): true as it starts to wait,
-	// false once it holds the lock or gave up. A consumer that writes through
-	// other connections of its own can let it in first.
+	// LockWait, when set, brackets an autocommit statement's wait for the write
+	// lock: true as it starts waiting, false once it holds it or gave up, so a
+	// consumer writing through its own connections can let it in first.
 	LockWait func(waiting bool)
 
-	// Contended, when set, reports whether a writer of the consumer's own
-	// waits for the write lock: an autocommit statement then takes the lock
-	// before it runs, as on a file it found contended, so that LockWait can
-	// let that writer in first.
+	// Contended, when set, reports a writer of the consumer's own waiting for
+	// the write lock; autocommit statements then take the lock before they run,
+	// so LockWait can let that writer in first.
 	Contended func() bool
 }
 
@@ -372,8 +370,8 @@ func (c *Conn) ExecChanges(ctx context.Context, sqlText string, args ...any) (in
 		}
 		eargs[i] = v
 	}
-	// A hook runs inside the statement whose commit it is part of, which may
-	// have asked for no Result (resultDiscarded): this one is read.
+	// A hook may run inside a statement that asked for no Result; this one is
+	// read.
 	discarded := c.resultDiscarded
 	c.resultDiscarded = false
 	res, err := c.execArgs(sqlText, eargs)

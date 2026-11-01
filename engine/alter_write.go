@@ -3579,11 +3579,9 @@ func refreshRowPrograms(tbl *tableMeta) {
 }
 
 // addColumnQuickCheck is the column arm of the quick_check C runs after ADD
-// COLUMN (alter.c, pragma.c:1911-1931) over one row. A column counts only if it
-// is NOT NULL or its type is checked, and that is also the only time a VIRTUAL
-// one is computed there: it raises what its expression raises. Of the findings,
-// the ALTER raises on a NULL in a NOT NULL column and on a STRICT column whose
-// value is not of its type.
+// COLUMN (pragma.c:1911-1931) over one row: only a NOT NULL or type-checked
+// column counts, and only then is a VIRTUAL one computed. The ALTER raises on
+// a NULL in a NOT NULL column and on a mistyped STRICT value.
 func addColumnQuickCheck(strict bool, ipk int, cols []columnInfo, row []Value) error {
 	for j, c := range cols {
 		if j == ipk || j >= len(row) {

@@ -8,12 +8,9 @@ import (
 	"testing"
 )
 
-// A VIRTUAL column added by ALTER TABLE ADD COLUMN is computed over rows written
-// before it, and its expression can raise over one of them: json_extract of a
-// value that is not JSON. C computes the column only where a statement reads it,
-// so the row stays, a read of the column raises, and every other read answers.
-// These pin that, and that no rewrite of the file (VACUUM, compaction) loses
-// the row.
+// A VIRTUAL column added by ADD COLUMN can raise over an older row. C computes
+// it only where it is read, so only that read raises, and no rewrite of the
+// file loses the row.
 
 // genRaiseFixture is i(value, j, g AS json_extract(j,'$')) holding (1,'bad'),
 // whose g raises, and (7,'1'). sameTxn adds the column in the transaction
@@ -195,10 +192,9 @@ func TestVirtualGeneratedRaiseSurvivesRewrites(t *testing.T) {
 	}
 }
 
-// genManyFixture is i(value, j) holding 1..500 as JSON text, and (1000,'bad')
-// when bad is set, with g added after; compact moves the rows into a segment.
-// The stored cells of g are not its values there, so every read of g, by a
-// kernel over the segment or by native code, must take the VDBE's.
+// genManyFixture is i(value, j) holding 1..500 as JSON, plus (1000,'bad') when
+// bad, with g added after; compact moves the rows into a segment, where g's
+// stored cells are not its values.
 func genManyFixture(t *testing.T, bad, compact bool) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "g.musq")

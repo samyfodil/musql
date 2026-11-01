@@ -221,10 +221,9 @@ type IntegrityCheckOptions struct {
 	// its index b-trees ("row %d missing from index %s", "wrong # of entries in
 	// index %s"). Without it an index is derived from the rows and always agrees.
 	//
-	// It may be asked for an index more than once. Each entries it returns is
-	// read at most once, and an entry is not kept past the yield that hands it
-	// over. err, asked after, reports a copy that could not be read, which
-	// leaves the index derived from the rows.
+	// It may be asked for an index more than once; each sequence is read at
+	// most once, and an entry is not kept past its yield. err reports a copy
+	// that could not be read, which leaves the index derived from the rows.
 	StoredIndexEntries func(index string) (entries iter.Seq[[]Value], err func() error, ok bool)
 }
 

@@ -75,10 +75,9 @@ func seekRaiseWrite(n *Session, q string) string {
 	return fmt.Sprint(changed)
 }
 
-// seekRaiseSession runs stmts on a new database and returns a session over it.
-// At stage "session" they are still in the session, at "log" each was committed
-// to the change log, and at "segments" the file was then rewritten into
-// segments.
+// seekRaiseSession runs stmts on a new database: at "session" they stay in the
+// session, at "log" they are committed, and at "segments" the file is then
+// rewritten.
 func seekRaiseSession(t *testing.T, stage string, stmts []string) *Session {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "x.musq")
@@ -112,12 +111,8 @@ func seekRaiseSession(t *testing.T, stage string, stmts []string) *Session {
 	return r
 }
 
-// TestSeekRaisingTerm: a seek over a WHERE holding a term that can raise
-// answers what C SQLite does (each outcome below is C's, verified against the
-// oracle by compat-harness's TestSeekRaisingTermVsC). The inner table's second
-// row holds malformed JSON under a key no outer row wants: C reads it, and
-// fails, exactly when its loop reaches the JSON term on that row -- with no
-// index on the key it scans, and with one it never visits the row.
+// TestSeekRaisingTerm: a seek over a WHERE holding a raising term answers what
+// C does (TestSeekRaisingTermVsC checks these against the oracle).
 func TestSeekRaisingTerm(t *testing.T) {
 	const fail = seekRaiseFail
 	type outcome struct{ noIndex, index string }
@@ -261,12 +256,8 @@ func runSeekRaise(t *testing.T, stmts []string, indexDDL string, reads, writes [
 	}
 }
 
-// TestSeekRaiseSubselect: a term holding a sub-select that names nothing
-// outside itself is coded in WHERE order, as any term is, so a seek on a key
-// behind one that can raise must not skip the row it raises on; C tests a
-// correlated one after every other term, the key included. The first row holds
-// malformed JSON under a key the queries do not want. Each outcome is C's,
-// verified by compat-harness's TestSeekRaiseSubselectVsC.
+// TestSeekRaiseSubselect: an uncorrelated sub-select is tested in WHERE order,
+// a correlated one after the key (TestSeekRaiseSubselectVsC).
 func TestSeekRaiseSubselect(t *testing.T) {
 	const (
 		fail         = seekRaiseFail
@@ -330,11 +321,8 @@ func TestSeekRaiseSubselect(t *testing.T) {
 	}, `CREATE INDEX i_value ON i(value)`, reads, writes)
 }
 
-// TestSeekRaiseConsumedFirst: an index on (a, b) holds both equalities for C,
-// which visits only the row with a = 1 and b = 2 whatever a term that can raise
-// is. A seek reads every row with a = 1 (or with b = 2), so the two equalities
-// are tested before the term. Each outcome is C's, verified by compat-harness's
-// TestSeekRaiseConsumedFirstVsC.
+// TestSeekRaiseConsumedFirst: under C's index on (a, b), both equalities are
+// tested before the raising term (TestSeekRaiseConsumedFirstVsC).
 func TestSeekRaiseConsumedFirst(t *testing.T) {
 	const keys = `a = 1 AND b = 2`
 	var wheres []string

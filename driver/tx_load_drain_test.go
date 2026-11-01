@@ -9,10 +9,8 @@ import (
 	"testing"
 )
 
-// TestLoadIntoAnEmptyTableCommitsBySize: a transaction loading an empty table
-// commits a few rows as a delta append, leaving the database file as it was,
-// and many by rewriting it. Both are read back by a second handle while the
-// writer is open and by a fresh one after it closes.
+// TestLoadIntoAnEmptyTableCommitsBySize: a small load into an empty table
+// commits as a delta append and a large one by a rewrite; both read back.
 func TestLoadIntoAnEmptyTableCommitsBySize(t *testing.T) {
 	for _, tc := range []struct {
 		rows    int

@@ -5,10 +5,8 @@ import (
 	"testing"
 )
 
-// TestDetachResultRowsCopiesIntoChunks: detached bytes equal what the rows
-// held and no longer point at it, an empty value comes back nil, a value
-// longer than a chunk is copied alone, and each copy is capped, so an append
-// to one leaves the values beside it in its chunk as they were.
+// TestDetachResultRowsCopiesIntoChunks: detached bytes are equal copies, an
+// empty value is nil, a long value is copied alone, and each copy is capped.
 func TestDetachResultRowsCopiesIntoChunks(t *testing.T) {
 	src := [][]byte{
 		[]byte("abc"), {}, nil, bytes.Repeat([]byte{7}, detachChunk+1), []byte("defgh"),

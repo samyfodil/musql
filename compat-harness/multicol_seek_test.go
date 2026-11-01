@@ -18,12 +18,10 @@ import (
 	"github.com/samyfodil/musql/driver"
 )
 
-// multiColSeekSchema covers every way a term may or may not drive an index
-// column: a composite PRIMARY KEY whose leading column holds one value for most
-// rows (the replication clock), the op log's (site, seq), a UNIQUE index over an
-// INTEGER and a NOCASE column, a DESC column, a partial index, a WITHOUT ROWID
-// key, an index whose collation is not its column's, and a key over columns of
-// no affinity holding every class.
+// multiColSeekSchema covers the ways a term may or may not drive an index
+// column: composite and UNIQUE keys, NOCASE and DESC columns, partial and
+// WITHOUT ROWID indexes, a collation not the column's, and a key over columns
+// of no affinity holding every class.
 func multiColSeekSchema() []string {
 	s := []string{
 		`CREATE TABLE c(tbl TEXT, pk BLOB, col TEXT, v, PRIMARY KEY(tbl, pk, col))`,

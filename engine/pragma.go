@@ -857,11 +857,8 @@ func (db *DB) execPragma(sqlText string) error {
 			}
 		}
 		// The rows are the read side's; what reaches the exec side is whether
-		// the pragma FAILS. The row arm can fail it, where a VIRTUAL column it
-		// computes raises (integrityGenErr), and so can the r-tree pass
-		// (rtree_check.go's integrityCheckRtrees). A shape the read side
-		// declines answers no rows here and fails nothing, as before. Main
-		// only: an attached or temp database is not reached from here.
+		// the pragma FAILS: the row arm can fail it (integrityGenErr), and so can
+		// the r-tree pass (integrityCheckRtrees). Main only.
 		if stmt.Schema == "" || strings.EqualFold(stmt.Schema, "main") {
 			p, perr := db.SnapshotPager()
 			if perr != nil {
@@ -4558,8 +4555,7 @@ func (p *ReadOnlyPager) integrityCheckViolations(scope schemaScope, stmt *Pragma
 			other = scopeMain
 		}
 		qualify := findSchemaRowIn(rows, other, "table", tr.Name) != nil
-		// Only the first maxErr of a table's messages can be shown; all of
-		// them are counted.
+		// Only the first maxErr messages are kept; all are counted.
 		counts, msgs, nMsgs, cerr := p.integrityRowFindings(tr, rows, qualify, isQuick, maxErr)
 		if cerr != nil {
 			return nil, cerr

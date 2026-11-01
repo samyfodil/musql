@@ -2,11 +2,9 @@ package compat
 
 import "testing"
 
-// A VIRTUAL column added by ALTER TABLE ADD COLUMN whose expression raises over
-// a row written before it (json_extract of a value that is not JSON). C
-// computes the column only where a statement reads it: the read raises, every
-// other statement answers, and no row is lost. musql used to drop the row from
-// every scan, and VACUUM or a compaction then dropped it for good.
+// A VIRTUAL column added by ADD COLUMN whose expression raises over an older
+// row: C computes it only where a statement reads it, so only that read raises
+// and no row is lost.
 
 var gencolRaiseSetup = []string{
 	"CREATE TABLE i(value INT, j TEXT)",
@@ -272,12 +270,10 @@ func TestGeneratedVirtualRaiseUpsert(t *testing.T) {
 	}
 }
 
-// ALTER TABLE ADD COLUMN runs quick_check over the table when the new column
-// has a CHECK, is a NOT NULL generated column, or the table is STRICT
-// (alter.c). quick_check computes a VIRTUAL column only where the column is
-// NOT NULL or its type is checked, so only then can its expression fail the
-// ALTER, and in a STRICT table a value not of the column's type fails it too.
-// The ALTER is Exec'd: C reports the nested quick_check's columns on a Query.
+// ADD COLUMN runs quick_check when the new column has a CHECK, is a NOT NULL
+// generated column, or the table is STRICT (alter.c); only then can a VIRTUAL
+// column's expression or a mistyped STRICT value fail the ALTER. Exec'd: C
+// reports the nested quick_check's columns on a Query.
 func TestGeneratedVirtualAddColumnChecks(t *testing.T) {
 	strict := []string{"CREATE TABLE s(a INT, j TEXT) STRICT"}
 	plain := []string{"CREATE TABLE c(a INT, j TEXT)", "INSERT INTO c VALUES(1,'bad'),(7,'1')"}

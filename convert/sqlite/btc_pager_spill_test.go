@@ -7,10 +7,8 @@ import (
 	"testing"
 )
 
-// TestPagerWritesOutAndReadsBack is the export pager's spill on its own: pages
-// shrink writes to their place in the file come back with their content and
-// flags, lookup finds them as a cache that never shrinks would, and the
-// commit leaves a page that ends dontWrite as zeros.
+// TestPagerWritesOutAndReadsBack: pages shrink wrote out come back with their
+// content and flags, and the commit writes a dontWrite page as zeros.
 func TestPagerWritesOutAndReadsBack(t *testing.T) {
 	const ps = 512
 	f, err := os.Create(filepath.Join(t.TempDir(), "p.db"))

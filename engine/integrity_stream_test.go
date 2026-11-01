@@ -91,10 +91,7 @@ func execAll(t *testing.T, path string, stmts ...string) {
 	}
 }
 
-// integrityFixture is a table that breaks every per-row check: duplicates
-// under two UNIQUE indexes added through writable_schema, a NOT NULL column
-// holding NULLs, two CHECK constraints, a TEXT column holding numbers, NOCASE
-// and RTRIM keys, and a DESC column.
+// integrityFixture is a table that breaks every per-row check.
 func integrityFixture(t *testing.T, n int) string {
 	path := filepath.Join(t.TempDir(), "fx.musq")
 	execAll(t, path,
@@ -130,10 +127,8 @@ func integrityFixture(t *testing.T, n int) string {
 
 var integrityLimits = []int{1, 2, 7, 100, 1 << 30}
 
-// TestIntegrityStreamedMatchesInMemory holds the streamed per-row check to the
-// in-memory one it replaces, over every table of a fixture that breaks every
-// check, at caps that cut the answer at different places, with every sort
-// spilling.
+// TestIntegrityStreamedMatchesInMemory: the streamed check answers as the
+// in-memory one, at several caps, with every sort spilling.
 func TestIntegrityStreamedMatchesInMemory(t *testing.T) {
 	setTinyStreamBudget(t)
 	p, err := Open(integrityFixture(t, 3000))
@@ -343,10 +338,9 @@ func TestIntegrityStoredCopyMatchesInMemory(t *testing.T) {
 	p.storedIndexEntries = nil
 }
 
-// TestIntegrityHandsBackForgedRows covers the two row shapes only a file this
-// engine did not write holds, built through Builder: rowids out of order and
-// a NaN key. Each is answered in memory, as before, and declined past the
-// in-memory budget.
+// TestIntegrityHandsBackForgedRows: rowids out of order and a NaN key, which
+// only a foreign file holds, are answered in memory and declined past its
+// budget.
 func TestIntegrityHandsBackForgedRows(t *testing.T) {
 	setTinyStreamBudget(t)
 	for _, shape := range []string{"order", "nan"} {

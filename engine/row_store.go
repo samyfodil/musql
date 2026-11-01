@@ -82,9 +82,9 @@ type rowStore struct {
 	// eqIdx is the lazily built per-column equality index, nil until a seek asks
 	// for one and thrown away whole by any mutation. See row_store_eqindex.go.
 	eqIdx map[int]*rsEqIndex
-	// snapWork is how many written rows seeks have tested one by one, beside the
-	// base segments' index (snapshotIndexRowids, segEqRowids). Once that has
-	// cost what building eqIdx would, prefersEqIndex builds it instead.
+	// snapWork counts the written rows seeks tested one by one beside the
+	// segments' index; once that costs what building eqIdx would,
+	// prefersEqIndex builds it.
 	snapWork int
 
 	// uqIdx is each UNIQUE index's conflict-probe index, built on the first probe
@@ -819,9 +819,8 @@ func fullStoredRowOf(name string, cols []columnInfo, ipkIndex int, rowid uint64,
 }
 
 // widenStoredRow is fullStoredRowOf without the generated columns: the stored
-// values at full width, what a rewrite of the file copies. Padding comes after
-// the slot mapping: a record written before an ALTER TABLE ADD COLUMN is short
-// of the column list.
+// values at full width, which a rewrite copies. Padding follows the slot
+// mapping, since a record from before an ADD COLUMN is short.
 func widenStoredRow(cols []columnInfo, row []Value) []Value {
 	if hasGeneratedCols(cols) {
 		row = expandStoredRow(cols, row)

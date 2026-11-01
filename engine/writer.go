@@ -321,9 +321,7 @@ type DB struct {
 	// COMMIT, verified), so it is absent from txSnapshot. See
 	// queryOnlyRefusesWrite.
 	queryOnly bool
-	// confined and queryOnlyLocked are SetConfined's: a connection serving
-	// remote clients may not name server files, and a read-only one may not
-	// turn query_only off.
+	// confined and queryOnlyLocked are SetConfined's.
 	confined, queryOnlyLocked bool
 	// writeLock, when set, refuses writes as queryOnly does, with itself as the
 	// error; see SetWriteLock.
