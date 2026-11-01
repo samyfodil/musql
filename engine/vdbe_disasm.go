@@ -84,6 +84,7 @@ var opNames = [numOpCodes]string{
 	OpSeekIndexHint:        "SeekIndexHint",
 	OpSeekRowidRangeHint:   "SeekRowidRangeHint",
 	OpSeekRowidSetHint:     "SeekRowidSetHint",
+	OpInList:               "InList",
 	OpAutoIndexOrder:       "AutoIndexOrder",
 	OpNotExists:            "NotExists",
 	OpRewind:               "Rewind",

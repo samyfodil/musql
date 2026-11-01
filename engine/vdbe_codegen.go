@@ -3635,6 +3635,17 @@ func (c *compiler) compileIn(x InExpr) (int, error) {
 	// expression never contributes one: resolveCompareCollation(ctx, x.X,
 	// nil)).
 	coll := c.compCollation(x.X, nil)
+	if plan := newInListPlan(x.List, aff, coll); plan != nil {
+		keys := c.allocN(len(x.List) + 1)
+		if len(plan.params) > 0 {
+			plan.slot = c.allocSub()
+		}
+		c.emit(Instruction{Op: OpInList, P1: xReg, P2: d, P3: keys, P4: plan})
+		if x.Not {
+			c.emit(Instruction{Op: OpNot, P1: d, P2: d})
+		}
+		return d, nil
+	}
 
 	rNull := c.alloc()
 	c.emit(Instruction{Op: OpInteger, P1: 0, P2: rNull})

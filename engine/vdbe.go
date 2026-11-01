@@ -1978,6 +1978,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			m.cursors[op.P1].narrowRowidRangeBy(op.P3, m.regs[op.P2])
 
+		case OpInList:
+			m.regs[op.P2] = m.inList(op)
+
 		case OpSeekRowidSetHint:
 			if cursorHasNoBtree(m.cursors[op.P1]) {
 				break
