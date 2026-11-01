@@ -198,3 +198,60 @@ func TestPinCommittedFiles(t *testing.T) {
 		t.Fatalf("another session holds %v", rows)
 	}
 }
+
+func TestInstallAndPinErrors(t *testing.T) {
+	dir := t.TempDir()
+	if file, minFile, delta := FormatVersions(); file != segFileVersion || minFile != segFileMinVersion || delta != segDeltaVersion {
+		t.Fatalf("FormatVersions = %d, %d, %d", file, minFile, delta)
+	}
+	db, src := filepath.Join(dir, "db.musq"), filepath.Join(dir, "src.musq")
+	buildDB(t, db, `CREATE TABLE t(a)`, `INSERT INTO t VALUES(1)`)
+	buildDB(t, src, `CREATE TABLE t(a)`)
+	execDB(t, src, `INSERT INTO t VALUES(2)`)
+	if fi, err := os.Stat(segDeltaPath(src)); err != nil || fi.Size() == 0 {
+		t.Fatalf("src has no delta to refuse: %v", err)
+	}
+	var ctr uint32
+	if err := CommitState(db, func(c CommitInfo) error { ctr = c.Counter; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := InstallSegmentFile(db, src, ctr); err == nil {
+		t.Fatal("a source with a delta was installed")
+	}
+	if err := InstallSegmentFile(db, filepath.Join(dir, "none.musq"), ctr); err == nil {
+		t.Fatal("a missing source was installed")
+	}
+	if err := CommitState(filepath.Join(dir, "none.musq"), func(CommitInfo) error { return nil }); err == nil {
+		t.Fatal("CommitState of a missing file succeeded")
+	}
+	stop := errors.New("stop")
+	if err := CommitState(db, func(CommitInfo) error { return stop }); !errors.Is(err, stop) {
+		t.Fatalf("CommitState = %v, want fn's error", err)
+	}
+	if _, err := PinCommittedFiles(filepath.Join(dir, "none.musq"), dir); err == nil {
+		t.Fatal("a missing database was pinned")
+	}
+	if err := setSegFileCounter(filepath.Join(dir, "none.musq"), 1); err == nil {
+		t.Fatal("set the counter of a missing file")
+	}
+	bad := filepath.Join(dir, "bad")
+	if err := os.WriteFile(bad, []byte("NOPE\x01\x00\x00\x00"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(bad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := headerVersion(f, segFileMagic); err == nil {
+		t.Fatal("a bad magic was read as a version")
+	}
+	empty, err := os.Create(filepath.Join(dir, "empty"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer empty.Close()
+	if _, err := headerVersion(empty, segFileMagic); err == nil {
+		t.Fatal("an empty file was read as a version")
+	}
+}

@@ -29,6 +29,15 @@ func TestExprMayRaise(t *testing.T) {
 		{`a IN (SELECT 1)`, true},
 		{`(SELECT 1) = a`, true},
 		{`EXISTS (SELECT 1)`, true},
+		{`a COLLATE NOCASE = 'x'`, false},
+		{`a IN (1, abs(b))`, true},
+		{`(a, b) = (1, 2)`, false},
+		{`(a, abs(b)) = (1, 2)`, true},
+		{`CASE abs(a) WHEN 1 THEN 2 END = 1`, true},
+		{`CASE WHEN abs(a) THEN 1 END = 1`, true},
+		{`a GLOB 'x*'`, false},
+		{`a GLOB b`, true},
+		{`lower(abs(a)) = 'x'`, true},
 	} {
 		stmt, err := ParseSelect(`SELECT 1 FROM t WHERE ` + tc.where)
 		if err != nil {
@@ -37,6 +46,50 @@ func TestExprMayRaise(t *testing.T) {
 		if got := exprMayRaise(stmt.Where); got != tc.want {
 			t.Errorf("exprMayRaise(%s) = %v, want %v", tc.where, got, tc.want)
 		}
+	}
+}
+
+func TestExprMayRaiseUnknownOperators(t *testing.T) {
+	a := ColumnExpr{Name: "a"}
+	if !exprMayRaise(UnaryExpr{Op: "?", X: a}) || !exprMayRaise(BinaryExpr{Op: "MATCH", L: a, R: a}) {
+		t.Fatal("an operator exprMayRaise does not know must count as raising")
+	}
+}
+
+func TestAccessOfKey(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		key  *autoIndexKey
+		want wherePlanAccess
+	}{
+		{"no key", nil, wherePlanAccess{known: true}},
+		{"no columns", &autoIndexKey{}, wherePlanAccess{known: true}},
+		{"multi-index OR", &autoIndexKey{cols: []int{1}, multiOr: &multiOrOrder{}}, wherePlanAccess{}},
+		{"automatic index", &autoIndexKey{cols: []int{1, 2}, autoEq: 1}, wherePlanAccess{known: true, auto: true, eq: []int{1}}},
+		{"index equality", &autoIndexKey{cols: []int{3, 4}, index: "i", nEq: 1}, wherePlanAccess{known: true, index: true, eq: []int{3}}},
+		{"index range", &autoIndexKey{cols: []int{3}, root: 9}, wherePlanAccess{}},
+		{"reverse rowid scan", &autoIndexKey{cols: []int{xnRowid}}, wherePlanAccess{known: true}},
+		{"anything else", &autoIndexKey{cols: []int{2}}, wherePlanAccess{}},
+	} {
+		got := accessOfKey(tc.key)
+		if got.known != tc.want.known || got.auto != tc.want.auto || got.index != tc.want.index || !slices.Equal(got.eq, tc.want.eq) {
+			t.Errorf("%s: %+v, want %+v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestSeekGuardKeepAndRange(t *testing.T) {
+	auto := seekGuard{raiseAt: 2, tableRaiseAt: 1, access: wherePlanAccess{known: true, auto: true}}
+	if !auto.keepRange(xnRowid, 0) || auto.keepRange(xnRowid, 1) {
+		t.Error("an automatic index keeps a range bound only ahead of a raising term on its table")
+	}
+	scan := seekGuard{raiseAt: 2, tableRaiseAt: -1, access: wherePlanAccess{known: true}}
+	if !scan.keepRange(xnRowid, 1) || scan.keepRange(xnRowid, 2) {
+		t.Error("a scan keeps a range bound only ahead of the raising term")
+	}
+	other := seekGuard{raiseAt: 0, tableRaiseAt: -1, access: wherePlanAccess{known: true, index: true, eq: []int{5}}}
+	if other.keep(3, 1, true) || !other.keep(5, 1, true) {
+		t.Error("under an index on other columns only its own columns keep a seek")
 	}
 }
 
