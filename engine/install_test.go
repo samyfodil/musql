@@ -265,3 +265,24 @@ func TestInstallAndPinErrors(t *testing.T) {
 		t.Fatal("an empty file was read as a version")
 	}
 }
+
+func TestCommitStateRefusesABadDelta(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "d.musq")
+	buildDB(t, path, `CREATE TABLE t(a)`)
+	if err := os.WriteFile(segDeltaPath(path), append([]byte(segDeltaMagic), make([]byte, 60)...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CommitState(path, func(CommitInfo) error { return nil }); err == nil {
+		t.Error("a delta of version 0 was read")
+	}
+	if err := os.Remove(segDeltaPath(path)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(segDeltaPath(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := CommitState(path, func(CommitInfo) error { return nil }); err == nil {
+		t.Error("a delta that is a directory was read")
+	}
+}
