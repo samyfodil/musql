@@ -151,7 +151,6 @@ func keyRunsBeforeTheLoop(insns []Instruction, cursor int) bool {
 // order C visits one key's rows in whether it walks an index or the table, and
 // the conjunct still runs on every fetched row, so the hint only narrows.
 //
-//
 // Every such conjunct is a key, up to maxSeekKeys, as the hint's slots; the
 // cursor asks the smallest (writeSeekRowids). The INTEGER PRIMARY KEY is never
 // a key: it is stored NULL. A key behind a raising conjunct is kept only where
