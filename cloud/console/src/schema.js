@@ -1,12 +1,11 @@
-// Table editing: a table's definition as a form's model, and applying an
-// edited model. Everything here takes db = {run(sql, params), rows(sql, params)}
-// (async), so it runs against the worker in the page and the package in Node.
+// Table editing: a table's definition as a form's model, and applying an edited
+// model. db is {run(sql, params), rows(sql, params)}, async, so this runs in the
+// page's worker and in Node.
 
-/** A quoted SQL identifier (db.js has the same; this module also runs in Node). */
+/** A quoted SQL identifier (as db.js's; this module also runs in Node). */
 const ident = (s) => `"${String(s).replace(/"/g, '""')}"`;
 
-// Definitions the model cannot hold: editing one through the form would drop
-// it, so such a table is edited as SQL instead.
+// Definitions the model cannot hold; such a table is edited as SQL instead.
 const UNMODELED = [
 	[/\bCHECK\s*\(/i, "a CHECK constraint"],
 	[/\bCOLLATE\b/i, "a COLLATE clause"],
@@ -24,10 +23,10 @@ function bare(sql) {
 }
 
 /**
- * The model of table name: {name, cols, withoutRowid, strict, unmodeled}. Each
- * column is {orig, name, type, pk, notnull, unique, dflt, ref, onDelete}; orig
- * is its name in the table as it stands (null for a column the form adds).
- * unmodeled lists what the form cannot represent, empty when it can.
+ * The model of table name: {name, cols, withoutRowid, strict, unmodeled}, each
+ * column {orig, name, type, pk, notnull, unique, dflt, ref, onDelete} with orig
+ * its current name (null for a new column). unmodeled lists what the form
+ * cannot represent.
  */
 export async function readTable(db, name) {
 	const [obj] = await db.rows("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?", [name]);
@@ -130,8 +129,7 @@ export function createSQL(m, as = m.name) {
 	return `CREATE TABLE ${ident(as || "…")}(\n  ${defs.join(",\n  ")}\n)${opts ? " " + opts : ""}`;
 }
 
-// A default as the form shows it is SQL: a literal, a name like CURRENT_TIME,
-// or an expression. One that is not an expression the grammar takes bare is
+// A default is shown as SQL; one the grammar does not take bare is
 // parenthesized.
 function defaultSQL(d) {
 	const s = String(d).trim();
@@ -142,9 +140,8 @@ function defaultSQL(d) {
 const same = (a, b, keys) => keys.every((k) => String(a[k]) === String(b[k]));
 
 /**
- * The plan for turning model old into model next: {renames, steps, rebuild}.
- * renames are RENAME COLUMN statements, run first; then either steps (plain
- * ALTERs) or, when the change needs it, a rebuild of the table.
+ * The plan for turning model old into next: {renames, steps, rebuild}. The
+ * RENAME COLUMNs run first, then either plain ALTERs or a rebuild.
  */
 export function planEdit(old, next) {
 	const cols = next.cols.filter((c) => c.name.trim());
@@ -162,9 +159,9 @@ export function planEdit(old, next) {
 	// ADD COLUMN appends, so the kept columns must lead, in their old order.
 	const rest = old.cols.filter((o) => !dropped.includes(o));
 	const order = cols.slice(0, kept.length).every((c, i) => c.orig === rest[i].orig);
-	// ADD COLUMN takes a column with no key, no UNIQUE, and a constant default
-	// when it is NOT NULL; DROP COLUMN one that no key, index or constraint uses
-	// (the engine refuses the rest, and then the rebuild is offered).
+	// ADD COLUMN takes no key, no UNIQUE, and a constant default when NOT NULL;
+	// DROP COLUMN one nothing uses. The engine refuses the rest, and the rebuild
+	// is offered.
 	const simpleAdd = (c) => !c.pk && !c.unique && (!c.notnull || c.dflt !== "") && !/^\(|CURRENT_/i.test(String(c.dflt).trim());
 	const simpleDrop = (c) => !c.pk && !c.unique;
 	const tableOpts = old.withoutRowid === next.withoutRowid && old.strict === next.strict;
@@ -198,10 +195,9 @@ export function previewEdit(old, next) {
 }
 
 /**
- * applyEdit changes table old to model next in one transaction, and rolls all
- * of it back on any error: a rebuild is SQLite's documented procedure (new
- * table, copy, drop, rename), with foreign keys off for its length and checked
- * before the commit.
+ * applyEdit changes table old to model next in one transaction, rolled back on
+ * any error. A rebuild is SQLite's documented procedure (new table, copy, drop,
+ * rename) with foreign keys off for its length and checked before the commit.
  */
 export async function applyEdit(db, old, next) {
 	const p = planEdit(old, next);
@@ -229,8 +225,8 @@ export async function applyEdit(db, old, next) {
 async function rebuild(db, name, next, kept) {
 	const lower = name.toLowerCase();
 	const all = await db.rows("SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY rowid");
-	// Views and other tables' triggers that name the table go too, and come
-	// back after it: renaming the new table into place checks every one.
+	// Views and other tables' triggers that name the table go too and come back
+	// after it, since the rename into place checks every one.
 	const mentions = (o) => o.sql.toLowerCase().includes(lower);
 	const own = all.filter((o) => o.tbl_name === name && (o.type === "index" || o.type === "trigger"));
 	const views = all.filter((o) => o.type === "view" && mentions(o));

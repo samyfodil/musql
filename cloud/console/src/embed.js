@@ -7,9 +7,8 @@ let nextId = 0;
 let onProgress = () => {};
 
 /**
- * The models the studio embeds with. A column remembers which one filled it
- * (vectors.js), so a search always embeds its text with the same model.
- * prefix: what the model expects before a search's text and a stored text.
+ * The models the studio embeds with; a column remembers which one filled it
+ * (vectors.js). prefix is what a model expects before a query and a passage.
  */
 export const MODELS = {
 	minilm: { id: "Xenova/all-MiniLM-L6-v2", dims: 384, pooling: "mean", name: "all-MiniLM-L6-v2", about: "English, small and fast · ~23 MB" },
@@ -51,11 +50,7 @@ function start() {
 	});
 }
 
-/**
- * Embeds texts with a model of MODELS: one Float32Array each. kind is "query"
- * for a search's text and "passage" for text being stored, which some models
- * mark differently.
- */
+/** Embeds texts with a model of MODELS, one Float32Array each; kind "query" or "passage", which some models mark differently. */
 export function embed(texts, model = DEFAULT_MODEL, kind = "passage") {
 	const m = MODELS[model];
 	if (!m) return Promise.reject(new Error(`unknown embedding model "${model}"; one of ${Object.keys(MODELS).join(", ")}`));

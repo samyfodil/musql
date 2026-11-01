@@ -17,9 +17,8 @@ function useModal() {
 const ON_DELETE = ["", "CASCADE", "SET NULL", "SET DEFAULT", "RESTRICT"];
 
 /**
- * The table form: a new table, or (with table) an existing one's columns,
- * keys, defaults and foreign keys. onClose(name) once the change is made,
- * onClose(null) otherwise. tables lists the tables a foreign key can name.
+ * The table form, for a new table or an existing one's columns, keys, defaults
+ * and foreign keys. onClose(name) once changed, onClose(null) otherwise.
  */
 export function TableDialog({ table, tables = [], onClose, onSQL, status }) {
 	const [old, setOld] = useState(table ? null : blankTable());
@@ -151,10 +150,7 @@ SELECT sql FROM sqlite_schema WHERE tbl_name = '${name.replace(/'/g, "''")}';
 `;
 }
 
-/**
- * Imports a CSV or JSON file into a new table or an existing one. onClose(table)
- * once imported, onClose(null) otherwise.
- */
+/** Imports a CSV or JSON file into a new or existing table; onClose(table) once imported, onClose(null) otherwise. */
 export function ImportDialog({ file: dropped, tables, onClose, status }) {
 	const ref = useModal();
 	const [file, setFile] = useState(null);

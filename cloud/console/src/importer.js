@@ -83,10 +83,7 @@ function cell(v, type) {
 	return v;
 }
 
-/**
- * Inserts rows into table, creating it with types when create is set. 200
- * rows to a statement, all in one transaction. progress(done) after each.
- */
+/** Inserts rows into table, creating it when create is set, 200 to a statement in one transaction, calling progress(done). */
 export async function importRows(table, columns, types, rows, create, progress = () => {}) {
 	const t = ident(table);
 	await run("BEGIN");

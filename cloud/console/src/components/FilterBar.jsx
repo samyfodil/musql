@@ -17,9 +17,8 @@ const NOVALUE = new Set(["null", "notnull"]);
 const ident = (s) => `"${String(s).replace(/"/g, '""')}"`;
 
 /**
- * whereOf turns filter rows [{col, op, value}] into {sql, params}: every value
- * is a bound parameter, so nothing typed is spliced into the SQL. A number
- * typed against a numeric column compares as a number.
+ * whereOf turns [{col, op, value}] into {sql, params} with every value bound;
+ * a number typed against a numeric column compares as a number.
  */
 export function whereOf(filters, types = {}) {
 	const parts = [];
@@ -43,11 +42,7 @@ export function whereOf(filters, types = {}) {
 	return { sql: parts.join(" AND "), params };
 }
 
-/**
- * The filter row over a table: column, operator and value, as many as wanted,
- * ANDed; or, switched to SQL, a WHERE clause typed by hand. onApply({filters}
- * or {sql}) runs it.
- */
+/** The filter row: column, operator and value, ANDed, or a hand-typed WHERE clause; onApply({filters} or {sql}). */
 export default function FilterBar({ columns, filters, sql, onApply }) {
 	const [rows, setRows] = useState(filters);
 	const [raw, setRaw] = useState(sql ?? "");

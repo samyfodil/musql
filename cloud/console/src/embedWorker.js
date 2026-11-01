@@ -1,7 +1,6 @@
-// Text embeddings for semantic search, in a worker of their own so a model
-// download or a large batch never stalls the database worker. Each model is
-// fetched from the Hugging Face hub on first use (quantized) and cached by the
-// browser after that; several can be loaded at once.
+// Text embeddings in a worker of their own, so a model download or a large
+// batch never stalls the database worker. Models are fetched from the Hugging
+// Face hub on first use and cached by the browser.
 import { pipeline } from "@huggingface/transformers";
 
 const extractors = new Map();
