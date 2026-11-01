@@ -349,6 +349,9 @@ func segSelectPrep(s *segment, f *segRowFilter, ipkCol int, params []Value) (*se
 			return nil, false
 		}
 	}
+	if !low.seedSorted(regs, params) {
+		return nil, false
+	}
 	return &segSelection{
 		s: s, kern: kern, blocks: blocks, isRowid: isRowid, uncertain: uncertain,
 		regs: regs, consts: append([]int64(nil), regs...), rowids: make([][]int64, len(blocks)),

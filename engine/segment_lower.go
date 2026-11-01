@@ -49,6 +49,41 @@ type segLowered struct {
 	// service-only program.
 	textFold bool
 	textLike bool // a POpTextMatch was lowered, so textFold matters
+	// sorted are the IN lists over bound parameters whose values the caller
+	// sorts into registers before the call (seedSorted), for addInList's tree
+	// to search.
+	sorted []segSortedKeys
+}
+
+// segSortedKeys is one IN list over bound parameters: regs take the sorted
+// values of lits and of the parameters params.
+type segSortedKeys struct {
+	regs   []int
+	lits   []int64
+	params []int
+}
+
+// seedSorted writes each list's sorted values into its registers, false when a
+// bound value is not an INTEGER: every value in a compiled program is an int64,
+// as the constants' seeding says.
+func (l *segLowered) seedSorted(regs []int64, params []Value) bool {
+	for _, g := range l.sorted {
+		vals := slices.Clip(g.lits)
+		for _, p := range g.params {
+			if p < 1 || p > len(params) || params[p-1].Typ != Int {
+				return false
+			}
+			vals = append(vals, params[p-1].I)
+		}
+		slices.Sort(vals)
+		for i, r := range g.regs {
+			if r >= len(regs) {
+				return false
+			}
+			regs[r] = vals[i]
+		}
+	}
+	return true
 }
 
 // segLowerRegOperands returns the operands of in that name a REGISTER, -1 for
@@ -151,6 +186,7 @@ func (l *segLowered) clone() *segLowered {
 	out.cvIndex = append([]int(nil), l.cvIndex...)
 	out.blockIR = append([]int(nil), l.blockIR...)
 	out.textCol = append([]bool(nil), l.textCol...)
+	out.sorted = slices.Clip(l.sorted)
 	if l.textVar != nil {
 		out.textVar = l.textVar.clone()
 	}
@@ -499,18 +535,21 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 				constReg = nextReg
 				nextReg++
 			}
-			pregs := make([]int, len(params))
-			for k, p := range params {
-				pregs[k] = nextReg
-				nextReg++
-				out.consts = append(out.consts, pregs[k])
-				out.cvKind = append(out.cvKind, true)
-				out.cvIndex = append(out.cvIndex, p)
+			// A list with parameters is searched in registers the caller
+			// fills with its values, sorted.
+			var keyRegs []int
+			if len(params) > 0 {
+				keyRegs = make([]int, len(ints)+len(params))
+				for k := range keyRegs {
+					keyRegs[k] = nextReg
+					nextReg++
+				}
+				out.sorted = append(out.sorted, segSortedKeys{regs: keyRegs, lits: ints, params: params})
 			}
 			note(in.P2)
 			note(scratchReg)
 			note(nextReg - 1)
-			out.addInList(in.P1, in.P2, scratchReg, constReg, ints, pregs, &irJumps)
+			out.addInList(in.P1, in.P2, scratchReg, constReg, ints, keyRegs, &irJumps)
 		default:
 			return nil, false
 		}
@@ -552,40 +591,47 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 }
 
 // addInList lowers OpInList over integers: r[dst] = 1 when r[x] is one of
-// ints, searched by a tree of comparisons, or equals one of the parameter
-// registers pregs, each compared in turn, and 0 otherwise. tmp holds each
-// comparison and con each constant. jumps takes the jumps whose targets are
-// IR indices.
-func (l *segLowered) addInList(x, dst, tmp, con int, ints []int64, pregs []int, jumps *[][2]int) {
+// the keys, searched by a tree of comparisons, and 0 otherwise. The keys are
+// ints, sorted, or with keyRegs the registers the caller fills with the
+// sorted values (seedSorted). tmp holds each comparison and con each
+// constant. jumps takes the jumps whose targets are IR indices.
+func (l *segLowered) addInList(x, dst, tmp, con int, ints []int64, keyRegs []int, jumps *[][2]int) {
 	var found, missed []int
 	test := func(cond jit.Cond, r int) int {
 		l.add(jit.ProgInsn{Op: jit.POpCmp, A: tmp, B: x, C: r, Cond: cond})
 		l.add(jit.ProgInsn{Op: jit.POpJumpIfNotZero, B: tmp})
 		return len(l.insns) - 1
 	}
-	var tree func(keys []int64)
-	tree = func(keys []int64) {
-		if len(keys) <= 3 {
-			for _, k := range keys {
-				l.add(jit.ProgInsn{Op: jit.POpSetConst, A: con, B: int(k)})
-				found = append(found, test(jit.CondE, con))
+	key := func(i int) int {
+		if keyRegs != nil {
+			return keyRegs[i]
+		}
+		l.add(jit.ProgInsn{Op: jit.POpSetConst, A: con, B: int(ints[i])})
+		return con
+	}
+	var tree func(lo, hi int)
+	tree = func(lo, hi int) {
+		if hi-lo <= 3 {
+			for i := lo; i < hi; i++ {
+				found = append(found, test(jit.CondE, key(i)))
 			}
 			missed = append(missed, len(l.insns))
 			l.add(jit.ProgInsn{Op: jit.POpJump})
 			return
 		}
-		mid := len(keys) / 2
-		l.add(jit.ProgInsn{Op: jit.POpSetConst, A: con, B: int(keys[mid])})
-		below := test(jit.CondL, con)
-		found = append(found, test(jit.CondE, con))
-		tree(keys[mid+1:])
-		*jumps = append(*jumps, [2]int{below, len(l.insns)})
-		tree(keys[:mid])
-	}
-	for _, r := range pregs {
+		mid := (lo + hi) / 2
+		r := key(mid)
+		below := test(jit.CondL, r)
 		found = append(found, test(jit.CondE, r))
+		tree(mid+1, hi)
+		*jumps = append(*jumps, [2]int{below, len(l.insns)})
+		tree(lo, mid)
 	}
-	tree(ints)
+	n := len(ints)
+	if keyRegs != nil {
+		n = len(keyRegs)
+	}
+	tree(0, n)
 	yes := len(l.insns)
 	l.add(jit.ProgInsn{Op: jit.POpSetConst, A: dst, B: 1}, jit.ProgInsn{Op: jit.POpJump})
 	no := len(l.insns)
