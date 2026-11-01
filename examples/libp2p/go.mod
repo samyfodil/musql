@@ -7,6 +7,7 @@ replace github.com/samyfodil/musql => ../..
 require (
 	github.com/libp2p/go-libp2p v0.48.0
 	github.com/libp2p/go-libp2p-pubsub v0.17.0
+	github.com/planetscale/vtprotobuf v0.6.1-0.20260702190614-8ae5a48058df
 	github.com/samyfodil/musql v0.0.0-00010101000000-000000000000
 	google.golang.org/protobuf v1.36.12
 )

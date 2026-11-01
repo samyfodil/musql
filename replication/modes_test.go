@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/samyfodil/musql/engine"
 )
@@ -430,5 +431,60 @@ func TestQuorumCommitsThroughTheLog(t *testing.T) {
 			db.Close()
 		}
 		t.Fatalf("a quorum database reopened without a Quorum: %v, want ErrMode", err)
+	}
+}
+
+// TestQuorumCommitHoldingTheWriteLock: a Quorum commit made while holding the
+// write lock does not wait for the hand-off before it, which waits for that
+// lock: the two used to deadlock until the busy timeout.
+func TestQuorumCommitHoldingTheWriteLock(t *testing.T) {
+	ctx := t.Context()
+	var lg fakeLog
+	p := filepath.Join(t.TempDir(), "a.db")
+	createSchema(t, p, `CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)`)
+	s, db, err := openSyncer(ctx, p, Leader(func() bool { return true }, lg.quorum()), WithSite("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	y, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer y.Close()
+	for _, q := range []string{`BEGIN IMMEDIATE`, `INSERT INTO t(v) VALUES('y')`} {
+		if _, err := y.ExecContext(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		_, err := db.ExecContext(ctx, `INSERT INTO t(v) VALUES('h')`)
+		done <- err
+	}()
+	applying := func() bool {
+		g := &s.store.group
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		return g.running
+	}
+	for !applying() {
+		if time.Since(start) > time.Minute {
+			t.Fatal("the hand-off never reached its apply")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := y.ExecContext(ctx, `COMMIT`); err != nil && !errors.Is(err, engine.ErrBusy) {
+		t.Fatalf("the transaction holding the lock: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("the hand-off waiting for the lock: %v", err)
+	}
+	if el := time.Since(start); el >= engine.BusyTimeout {
+		t.Fatalf("took %v, the busy timeout", el)
+	}
+	if got := dump(t, db, `SELECT count(*) FROM t WHERE v = 'h'`); got != "1\n" {
+		t.Fatalf("the hand-off's row: %q", got)
 	}
 }

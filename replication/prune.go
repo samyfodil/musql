@@ -23,6 +23,7 @@ type Acks map[string]Ack
 func (s *Store) Acks() Acks {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.foldOwn()
 	if !vvEqual(s.selfAck.VV, s.vv) {
 		s.selfAck = Ack{HLC: s.clock.Now(), VV: s.vv.Clone()}
 	}
@@ -62,8 +63,10 @@ func vvEqual(a, b VersionVector) bool {
 // prune deletes, per site, the row and ack ops at or below the frontier, and
 // raises the site's floor to it.
 func (s *Store) prune(ctx context.Context) error {
+	s.waitLocal()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.foldOwn()
 	acks := map[string]VersionVector{s.site: s.vv.Clone()}
 	for site, a := range s.acks {
 		acks[site] = a.VV
@@ -85,6 +88,7 @@ func (s *Store) prune(ctx context.Context) error {
 			}
 		}
 	}
+	s.pinnedFrontier(frontier)
 	tx, err := s.begin(ctx)
 	if err != nil {
 		return err

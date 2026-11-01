@@ -16,10 +16,11 @@ import (
 // cluster is a set of databases opened with crdt.Open on one in-memory
 // network, each under its own site id.
 type cluster struct {
-	t   *testing.T
-	net *MemNetwork
-	dir string
-	dbs map[string]*sql.DB
+	t     *testing.T
+	net   *MemNetwork
+	dir   string
+	dbs   map[string]*sql.DB
+	query string // appended to every node's DSN
 }
 
 func newCluster(t *testing.T) *cluster {
@@ -36,7 +37,7 @@ func (c *cluster) open(site string, setup ...string) *sql.DB {
 // openWith is open with more options.
 func (c *cluster) openWith(site string, opts []Option, setup ...string) *sql.DB {
 	c.t.Helper()
-	p := filepath.Join(c.dir, site+".db")
+	p := filepath.Join(c.dir, site+".db") + c.query
 	createSchema(c.t, p, setup...)
 	opts = append([]Option{CRDT(), WithSite(site), memSync(c.net), WithSyncInterval(20 * time.Millisecond)}, opts...)
 	db, err := Open(context.Background(), p, opts...)

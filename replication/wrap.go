@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/samyfodil/musql/driver"
 )
@@ -43,6 +45,9 @@ type Syncer struct {
 	catMu  sync.Mutex
 	cat    *catalog
 	catVer string
+
+	// images counts the images installed here (image.go).
+	images atomic.Int32
 }
 
 // catalogIn is the installed catalog as conn's transaction sees it.
@@ -95,6 +100,7 @@ func (s *Syncer) propagate(ops []Op) {
 // Attach wires a Transport to this syncer and returns a Node driving it.
 func (s *Syncer) Attach(tr Transport) *Node {
 	n := NewNode(s.store, tr)
+	n.syncer = s
 	s.mu.Lock()
 	s.node = n
 	s.mu.Unlock()
@@ -117,6 +123,10 @@ func (o syncerOpSource) OpsSince(site string, fromSeq uint64, limit int) ([]Op, 
 
 func (o syncerOpSource) SnapshotPage(part int, cursor []byte) (SnapshotPage, error) {
 	return o.s.store.SnapshotPage(context.Background(), part, cursor)
+}
+
+func (o syncerOpSource) Image(ctx context.Context, req ImageRequest) (ImageManifest, io.ReadCloser, error) {
+	return o.s.store.Image(ctx, req)
 }
 
 func (o syncerOpSource) ExchangeAcks(acks Acks) Acks {

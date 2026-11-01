@@ -852,10 +852,12 @@ func (x *GetSnapshotResponse) GetNext() []byte {
 	return nil
 }
 
-// PushMessage carries a single pushed op, published over gossipsub.
+// PushMessage carries the ops of one commit, published over gossipsub: a
+// single op in op, which every version reads, or several in ops.
 type PushMessage struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Op            *Op                    `protobuf:"bytes,1,opt,name=op,proto3" json:"op,omitempty"`
+	Ops           []*Op                  `protobuf:"bytes,2,rep,name=ops,proto3" json:"ops,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -893,6 +895,13 @@ func (*PushMessage) Descriptor() ([]byte, []int) {
 func (x *PushMessage) GetOp() *Op {
 	if x != nil {
 		return x.Op
+	}
+	return nil
+}
+
+func (x *PushMessage) GetOps() []*Op {
+	if x != nil {
+		return x.Ops
 	}
 	return nil
 }
@@ -1127,6 +1136,316 @@ func (*Response_GetSnapshot) isResponse_Msg() {}
 
 func (*Response_ExchangeAcks) isResponse_Msg() {}
 
+// The image protocol (ImageProtocolID): one GetImageRequest, one
+// GetImageResponse, and unless it refused, ImageChunks up to one that is last.
+type GetImageRequest struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Layout         string                 `protobuf:"bytes,1,opt,name=layout,proto3" json:"layout,omitempty"`
+	FileVersion    uint32                 `protobuf:"varint,2,opt,name=file_version,json=fileVersion,proto3" json:"file_version,omitempty"`
+	MinFileVersion uint32                 `protobuf:"varint,3,opt,name=min_file_version,json=minFileVersion,proto3" json:"min_file_version,omitempty"`
+	DeltaVersion   uint32                 `protobuf:"varint,4,opt,name=delta_version,json=deltaVersion,proto3" json:"delta_version,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *GetImageRequest) Reset() {
+	*x = GetImageRequest{}
+	mi := &file_transport_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetImageRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetImageRequest) ProtoMessage() {}
+
+func (x *GetImageRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_transport_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetImageRequest.ProtoReflect.Descriptor instead.
+func (*GetImageRequest) Descriptor() ([]byte, []int) {
+	return file_transport_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *GetImageRequest) GetLayout() string {
+	if x != nil {
+		return x.Layout
+	}
+	return ""
+}
+
+func (x *GetImageRequest) GetFileVersion() uint32 {
+	if x != nil {
+		return x.FileVersion
+	}
+	return 0
+}
+
+func (x *GetImageRequest) GetMinFileVersion() uint32 {
+	if x != nil {
+		return x.MinFileVersion
+	}
+	return 0
+}
+
+func (x *GetImageRequest) GetDeltaVersion() uint32 {
+	if x != nil {
+		return x.DeltaVersion
+	}
+	return 0
+}
+
+type ImageManifest struct {
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	Site         string                 `protobuf:"bytes,1,opt,name=site,proto3" json:"site,omitempty"`
+	FileVersion  uint32                 `protobuf:"varint,2,opt,name=file_version,json=fileVersion,proto3" json:"file_version,omitempty"`
+	DeltaVersion uint32                 `protobuf:"varint,3,opt,name=delta_version,json=deltaVersion,proto3" json:"delta_version,omitempty"`
+	Layout       string                 `protobuf:"bytes,4,opt,name=layout,proto3" json:"layout,omitempty"`
+	Catalog      string                 `protobuf:"bytes,5,opt,name=catalog,proto3" json:"catalog,omitempty"`
+	// size is the image's length: a segment file, then delta_size bytes of its
+	// delta.
+	Size uint64 `protobuf:"varint,6,opt,name=size,proto3" json:"size,omitempty"`
+	// crc32c is the image's CRC-32C (Castagnoli).
+	Crc32C        uint32        `protobuf:"varint,7,opt,name=crc32c,proto3" json:"crc32c,omitempty"`
+	Vv            []*VVEntry    `protobuf:"bytes,8,rep,name=vv,proto3" json:"vv,omitempty"`
+	Floors        []*VVEntry    `protobuf:"bytes,9,rep,name=floors,proto3" json:"floors,omitempty"`
+	Ranges        []*RangeEntry `protobuf:"bytes,10,rep,name=ranges,proto3" json:"ranges,omitempty"`
+	MaxHlc        uint64        `protobuf:"varint,11,opt,name=max_hlc,json=maxHlc,proto3" json:"max_hlc,omitempty"`
+	DeltaSize     uint64        `protobuf:"varint,12,opt,name=delta_size,json=deltaSize,proto3" json:"delta_size,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ImageManifest) Reset() {
+	*x = ImageManifest{}
+	mi := &file_transport_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ImageManifest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ImageManifest) ProtoMessage() {}
+
+func (x *ImageManifest) ProtoReflect() protoreflect.Message {
+	mi := &file_transport_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ImageManifest.ProtoReflect.Descriptor instead.
+func (*ImageManifest) Descriptor() ([]byte, []int) {
+	return file_transport_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *ImageManifest) GetSite() string {
+	if x != nil {
+		return x.Site
+	}
+	return ""
+}
+
+func (x *ImageManifest) GetFileVersion() uint32 {
+	if x != nil {
+		return x.FileVersion
+	}
+	return 0
+}
+
+func (x *ImageManifest) GetDeltaVersion() uint32 {
+	if x != nil {
+		return x.DeltaVersion
+	}
+	return 0
+}
+
+func (x *ImageManifest) GetLayout() string {
+	if x != nil {
+		return x.Layout
+	}
+	return ""
+}
+
+func (x *ImageManifest) GetCatalog() string {
+	if x != nil {
+		return x.Catalog
+	}
+	return ""
+}
+
+func (x *ImageManifest) GetSize() uint64 {
+	if x != nil {
+		return x.Size
+	}
+	return 0
+}
+
+func (x *ImageManifest) GetCrc32C() uint32 {
+	if x != nil {
+		return x.Crc32C
+	}
+	return 0
+}
+
+func (x *ImageManifest) GetVv() []*VVEntry {
+	if x != nil {
+		return x.Vv
+	}
+	return nil
+}
+
+func (x *ImageManifest) GetFloors() []*VVEntry {
+	if x != nil {
+		return x.Floors
+	}
+	return nil
+}
+
+func (x *ImageManifest) GetRanges() []*RangeEntry {
+	if x != nil {
+		return x.Ranges
+	}
+	return nil
+}
+
+func (x *ImageManifest) GetMaxHlc() uint64 {
+	if x != nil {
+		return x.MaxHlc
+	}
+	return 0
+}
+
+func (x *ImageManifest) GetDeltaSize() uint64 {
+	if x != nil {
+		return x.DeltaSize
+	}
+	return 0
+}
+
+type GetImageResponse struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Manifest *ImageManifest         `protobuf:"bytes,1,opt,name=manifest,proto3" json:"manifest,omitempty"`
+	// refused is why the peer sends no image.
+	Refused       string `protobuf:"bytes,2,opt,name=refused,proto3" json:"refused,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetImageResponse) Reset() {
+	*x = GetImageResponse{}
+	mi := &file_transport_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetImageResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetImageResponse) ProtoMessage() {}
+
+func (x *GetImageResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_transport_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetImageResponse.ProtoReflect.Descriptor instead.
+func (*GetImageResponse) Descriptor() ([]byte, []int) {
+	return file_transport_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *GetImageResponse) GetManifest() *ImageManifest {
+	if x != nil {
+		return x.Manifest
+	}
+	return nil
+}
+
+func (x *GetImageResponse) GetRefused() string {
+	if x != nil {
+		return x.Refused
+	}
+	return ""
+}
+
+type ImageChunk struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Data          []byte                 `protobuf:"bytes,1,opt,name=data,proto3" json:"data,omitempty"`
+	Last          bool                   `protobuf:"varint,2,opt,name=last,proto3" json:"last,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ImageChunk) Reset() {
+	*x = ImageChunk{}
+	mi := &file_transport_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ImageChunk) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ImageChunk) ProtoMessage() {}
+
+func (x *ImageChunk) ProtoReflect() protoreflect.Message {
+	mi := &file_transport_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ImageChunk.ProtoReflect.Descriptor instead.
+func (*ImageChunk) Descriptor() ([]byte, []int) {
+	return file_transport_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *ImageChunk) GetData() []byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
+func (x *ImageChunk) GetLast() bool {
+	if x != nil {
+		return x.Last
+	}
+	return false
+}
+
 var File_transport_proto protoreflect.FileDescriptor
 
 const file_transport_proto_rawDesc = "" +
@@ -1185,9 +1504,10 @@ const file_transport_proto_rawDesc = "" +
 	"\x06floors\x18\x02 \x03(\v2\x16.replicationpb.VVEntryR\x06floors\x121\n" +
 	"\x06ranges\x18\x03 \x03(\v2\x19.replicationpb.RangeEntryR\x06ranges\x12.\n" +
 	"\x05cells\x18\x04 \x03(\v2\x18.replicationpb.ClockCellR\x05cells\x12\x12\n" +
-	"\x04next\x18\x05 \x01(\fR\x04next\"0\n" +
+	"\x04next\x18\x05 \x01(\fR\x04next\"U\n" +
 	"\vPushMessage\x12!\n" +
-	"\x02op\x18\x01 \x01(\v2\x11.replicationpb.OpR\x02op\"\xa1\x02\n" +
+	"\x02op\x18\x01 \x01(\v2\x11.replicationpb.OpR\x02op\x12#\n" +
+	"\x03ops\x18\x02 \x03(\v2\x11.replicationpb.OpR\x03ops\"\xa1\x02\n" +
 	"\aRequest\x12C\n" +
 	"\vexchange_vv\x18\x01 \x01(\v2 .replicationpb.ExchangeVVRequestH\x00R\n" +
 	"exchangeVv\x127\n" +
@@ -1201,7 +1521,34 @@ const file_transport_proto_rawDesc = "" +
 	"\aget_ops\x18\x02 \x01(\v2\x1d.replicationpb.GetOpsResponseH\x00R\x06getOps\x12G\n" +
 	"\fget_snapshot\x18\x03 \x01(\v2\".replicationpb.GetSnapshotResponseH\x00R\vgetSnapshot\x12J\n" +
 	"\rexchange_acks\x18\x04 \x01(\v2#.replicationpb.ExchangeAcksResponseH\x00R\fexchangeAcksB\x05\n" +
-	"\x03msgB2Z0github.com/samyfodil/musql/examples/libp2p/pb;pbb\x06proto3"
+	"\x03msg\"\x9b\x01\n" +
+	"\x0fGetImageRequest\x12\x16\n" +
+	"\x06layout\x18\x01 \x01(\tR\x06layout\x12!\n" +
+	"\ffile_version\x18\x02 \x01(\rR\vfileVersion\x12(\n" +
+	"\x10min_file_version\x18\x03 \x01(\rR\x0eminFileVersion\x12#\n" +
+	"\rdelta_version\x18\x04 \x01(\rR\fdeltaVersion\"\x8c\x03\n" +
+	"\rImageManifest\x12\x12\n" +
+	"\x04site\x18\x01 \x01(\tR\x04site\x12!\n" +
+	"\ffile_version\x18\x02 \x01(\rR\vfileVersion\x12#\n" +
+	"\rdelta_version\x18\x03 \x01(\rR\fdeltaVersion\x12\x16\n" +
+	"\x06layout\x18\x04 \x01(\tR\x06layout\x12\x18\n" +
+	"\acatalog\x18\x05 \x01(\tR\acatalog\x12\x12\n" +
+	"\x04size\x18\x06 \x01(\x04R\x04size\x12\x16\n" +
+	"\x06crc32c\x18\a \x01(\rR\x06crc32c\x12&\n" +
+	"\x02vv\x18\b \x03(\v2\x16.replicationpb.VVEntryR\x02vv\x12.\n" +
+	"\x06floors\x18\t \x03(\v2\x16.replicationpb.VVEntryR\x06floors\x121\n" +
+	"\x06ranges\x18\n" +
+	" \x03(\v2\x19.replicationpb.RangeEntryR\x06ranges\x12\x17\n" +
+	"\amax_hlc\x18\v \x01(\x04R\x06maxHlc\x12\x1d\n" +
+	"\n" +
+	"delta_size\x18\f \x01(\x04R\tdeltaSize\"f\n" +
+	"\x10GetImageResponse\x128\n" +
+	"\bmanifest\x18\x01 \x01(\v2\x1c.replicationpb.ImageManifestR\bmanifest\x12\x18\n" +
+	"\arefused\x18\x02 \x01(\tR\arefused\"4\n" +
+	"\n" +
+	"ImageChunk\x12\x12\n" +
+	"\x04data\x18\x01 \x01(\fR\x04data\x12\x12\n" +
+	"\x04last\x18\x02 \x01(\bR\x04lastB2Z0github.com/samyfodil/musql/examples/libp2p/pb;pbb\x06proto3"
 
 var (
 	file_transport_proto_rawDescOnce sync.Once
@@ -1215,7 +1562,7 @@ func file_transport_proto_rawDescGZIP() []byte {
 	return file_transport_proto_rawDescData
 }
 
-var file_transport_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
+var file_transport_proto_msgTypes = make([]protoimpl.MessageInfo, 21)
 var file_transport_proto_goTypes = []any{
 	(*Cell)(nil),                 // 0: replicationpb.Cell
 	(*Op)(nil),                   // 1: replicationpb.Op
@@ -1234,6 +1581,10 @@ var file_transport_proto_goTypes = []any{
 	(*PushMessage)(nil),          // 14: replicationpb.PushMessage
 	(*Request)(nil),              // 15: replicationpb.Request
 	(*Response)(nil),             // 16: replicationpb.Response
+	(*GetImageRequest)(nil),      // 17: replicationpb.GetImageRequest
+	(*ImageManifest)(nil),        // 18: replicationpb.ImageManifest
+	(*GetImageResponse)(nil),     // 19: replicationpb.GetImageResponse
+	(*ImageChunk)(nil),           // 20: replicationpb.ImageChunk
 }
 var file_transport_proto_depIdxs = []int32{
 	0,  // 0: replicationpb.Op.cells:type_name -> replicationpb.Cell
@@ -1248,19 +1599,24 @@ var file_transport_proto_depIdxs = []int32{
 	11, // 9: replicationpb.GetSnapshotResponse.ranges:type_name -> replicationpb.RangeEntry
 	10, // 10: replicationpb.GetSnapshotResponse.cells:type_name -> replicationpb.ClockCell
 	1,  // 11: replicationpb.PushMessage.op:type_name -> replicationpb.Op
-	3,  // 12: replicationpb.Request.exchange_vv:type_name -> replicationpb.ExchangeVVRequest
-	5,  // 13: replicationpb.Request.get_ops:type_name -> replicationpb.GetOpsRequest
-	12, // 14: replicationpb.Request.get_snapshot:type_name -> replicationpb.GetSnapshotRequest
-	8,  // 15: replicationpb.Request.exchange_acks:type_name -> replicationpb.ExchangeAcksRequest
-	4,  // 16: replicationpb.Response.exchange_vv:type_name -> replicationpb.ExchangeVVResponse
-	6,  // 17: replicationpb.Response.get_ops:type_name -> replicationpb.GetOpsResponse
-	13, // 18: replicationpb.Response.get_snapshot:type_name -> replicationpb.GetSnapshotResponse
-	9,  // 19: replicationpb.Response.exchange_acks:type_name -> replicationpb.ExchangeAcksResponse
-	20, // [20:20] is the sub-list for method output_type
-	20, // [20:20] is the sub-list for method input_type
-	20, // [20:20] is the sub-list for extension type_name
-	20, // [20:20] is the sub-list for extension extendee
-	0,  // [0:20] is the sub-list for field type_name
+	1,  // 12: replicationpb.PushMessage.ops:type_name -> replicationpb.Op
+	3,  // 13: replicationpb.Request.exchange_vv:type_name -> replicationpb.ExchangeVVRequest
+	5,  // 14: replicationpb.Request.get_ops:type_name -> replicationpb.GetOpsRequest
+	12, // 15: replicationpb.Request.get_snapshot:type_name -> replicationpb.GetSnapshotRequest
+	8,  // 16: replicationpb.Request.exchange_acks:type_name -> replicationpb.ExchangeAcksRequest
+	4,  // 17: replicationpb.Response.exchange_vv:type_name -> replicationpb.ExchangeVVResponse
+	6,  // 18: replicationpb.Response.get_ops:type_name -> replicationpb.GetOpsResponse
+	13, // 19: replicationpb.Response.get_snapshot:type_name -> replicationpb.GetSnapshotResponse
+	9,  // 20: replicationpb.Response.exchange_acks:type_name -> replicationpb.ExchangeAcksResponse
+	2,  // 21: replicationpb.ImageManifest.vv:type_name -> replicationpb.VVEntry
+	2,  // 22: replicationpb.ImageManifest.floors:type_name -> replicationpb.VVEntry
+	11, // 23: replicationpb.ImageManifest.ranges:type_name -> replicationpb.RangeEntry
+	18, // 24: replicationpb.GetImageResponse.manifest:type_name -> replicationpb.ImageManifest
+	25, // [25:25] is the sub-list for method output_type
+	25, // [25:25] is the sub-list for method input_type
+	25, // [25:25] is the sub-list for extension type_name
+	25, // [25:25] is the sub-list for extension extendee
+	0,  // [0:25] is the sub-list for field type_name
 }
 
 func init() { file_transport_proto_init() }
@@ -1286,7 +1642,7 @@ func file_transport_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_transport_proto_rawDesc), len(file_transport_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   17,
+			NumMessages:   21,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

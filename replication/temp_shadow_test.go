@@ -21,7 +21,7 @@ func TestTempShadowsDoNotCaptureBookkeeping(t *testing.T) {
 	defer conn.Close()
 	for _, q := range []string{
 		`CREATE TEMP TABLE _repl_oplog(site, seq, hlc, tbl, pk, op, cells)`,
-		`CREATE TEMP TABLE _repl_clock(tbl, pk, col, hlc, site, val, UNIQUE(tbl, pk, col))`,
+		`CREATE TEMP TABLE _repl_clock(tbl, pk, top, rec, UNIQUE(tbl, pk))`,
 		`CREATE TEMP TABLE _repl_meta(k PRIMARY KEY, v)`,
 		`INSERT INTO users(id,name,age) VALUES('u1','alice',30)`,
 	} {

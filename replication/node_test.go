@@ -3,8 +3,12 @@ package replication
 import (
 	"context"
 	"fmt"
+	"io"
 	"math/rand"
+	"slices"
+	"sync"
 	"testing"
+	"time"
 )
 
 // newNodeOn wires a freshly-opened Store into net under id, returning the
@@ -261,5 +265,165 @@ func TestSyncSkipsARefusedSite(t *testing.T) {
 	}
 	if vv["s113311"] != 0 {
 		t.Fatalf("the refused site's op was taken: %v", vv)
+	}
+}
+
+// TestPushAppliesWhileSyncWaits: an op a peer pushes applies while a Sync
+// round waits on a peer that has not answered yet.
+func TestPushAppliesWhileSyncWaits(t *testing.T) {
+	s := newTestStore(t, "pushwait")
+	stall := &stallVV{Transport: stubPeer{}, push: make(chan PeerOp, 1), waiting: make(chan struct{}), release: make(chan struct{})}
+	n := NewNode(s, stall)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- n.Run(ctx, time.Millisecond) }()
+	defer func() {
+		close(stall.release)
+		cancel()
+		<-done
+	}()
+	select {
+	case <-stall.waiting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no Sync round began")
+	}
+	stall.push <- PeerOp{From: "p", Op: insertOp("A", 1, HLC(100), "u1", "n", 1)}
+	for deadline := time.Now().Add(5 * time.Second); s.LocalVV()["A"] < 1; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("a pushed op waited for a Sync round that waits on a peer")
+		}
+	}
+}
+
+// stallVV is a Transport whose pushes are push's, and whose ExchangeVV waits
+// until release is closed.
+type stallVV struct {
+	Transport
+	push             chan PeerOp
+	once             sync.Once
+	waiting, release chan struct{}
+}
+
+func (s *stallVV) SubscribePush(context.Context) (<-chan PeerOp, error) { return s.push, nil }
+
+func (s *stallVV) ExchangeVV(ctx context.Context, peer PeerID, vv VersionVector) (VersionVector, error) {
+	s.once.Do(func() { close(s.waiting) })
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return s.Transport.ExchangeVV(ctx, peer, vv)
+}
+
+// TestRunGathersPushes: while Run runs, the ops of the commits made while a
+// push is out go in the next push together, in order, and as Broadcast had
+// them when it was called.
+func TestRunGathersPushes(t *testing.T) {
+	s := newTestStore(t, "gather")
+	tr := &holdPush{Transport: stubPeer{}, release: make(chan struct{}), pushes: make(chan []Op, 8)}
+	n := NewNode(s, tr)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- n.Run(ctx, time.Hour) }()
+	defer func() {
+		select {
+		case <-tr.release:
+		default:
+			close(tr.release)
+		}
+		cancel()
+		<-done
+	}()
+	for n.pushq.Load() == nil {
+		time.Sleep(time.Millisecond)
+	}
+	op := func(seq uint64) Op { return insertOp("gather", seq, HLC(seq), fmt.Sprint("u", seq), "n", 1) }
+	first := []Op{op(1)}
+	n.Broadcast(first)
+	first[0].Seq = 99 // a capture reuses its slice for the next commit
+	seqs := func(ops []Op) (out []uint64) {
+		for _, op := range ops {
+			out = append(out, op.Seq)
+		}
+		return out
+	}
+	if got := seqs(<-tr.pushes); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("first push %v, want [1]", got)
+	}
+	for seq := range uint64(3) {
+		n.Broadcast([]Op{op(seq + 2)})
+	}
+	close(tr.release)
+	if got := seqs(<-tr.pushes); !slices.Equal(got, []uint64{2, 3, 4}) {
+		t.Fatalf("second push %v, want [2 3 4]", got)
+	}
+}
+
+// holdPush is a Transport whose first PushOps waits until release is closed;
+// every push's ops go to pushes.
+type holdPush struct {
+	Transport
+	once    sync.Once
+	release chan struct{}
+	pushes  chan []Op
+}
+
+func (h *holdPush) PushOps(_ context.Context, ops []Op) error {
+	h.pushes <- ops
+	h.once.Do(func() { <-h.release })
+	return nil
+}
+
+func TestDrainStopsAtABatchOrAClosedChannel(t *testing.T) {
+	ch := make(chan PeerOp, maxPushBatch+1)
+	for i := range maxPushBatch + 1 {
+		ch <- PeerOp{Op: Op{Seq: uint64(i + 1)}}
+	}
+	if ops := drain(ch, Op{}); len(ops) != maxPushBatch {
+		t.Fatalf("a full batch: %d ops", len(ops))
+	}
+	close(ch)
+	if ops := drain(ch, Op{}); len(ops) != 3 {
+		t.Fatalf("after the channel closed: %d ops", len(ops))
+	}
+}
+
+// unreachable is a peer whose version vector never comes back.
+type unreachable struct{ stubPeer }
+
+func (unreachable) ExchangeVV(context.Context, PeerID, VersionVector) (VersionVector, error) {
+	return nil, errPartitioned
+}
+
+func TestSyncSkipsAnUnreachablePeer(t *testing.T) {
+	s := newTestStore(t, "unreachable")
+	if err := NewNode(s, unreachable{}).Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if vv := s.LocalVV(); len(vv) > 1 {
+		t.Fatalf("learned from an unreachable peer: %v", vv)
+	}
+}
+
+// TestNodeServesItsStoresImage: a node's OpSource serves the image its store
+// cuts.
+func TestNodeServesItsStoresImage(t *testing.T) {
+	c := newCluster(t)
+	c.open("a", imageDDL...)
+	st := syncerOf(t, c.dbs["a"]).store
+	src, ok := NewNode(st, nil).OpSource().(interface {
+		Image(context.Context, ImageRequest) (ImageManifest, io.ReadCloser, error)
+	})
+	if !ok {
+		t.Fatal("a node's OpSource serves no image")
+	}
+	m, body, err := src.Image(context.Background(), imageRequest(bookkeepingLayout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body.Close()
+	if m.Site != "a" || m.Size == 0 {
+		t.Fatalf("manifest %+v", m)
 	}
 }

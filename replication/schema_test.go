@@ -85,7 +85,7 @@ func TestInitSchemaColumnStructure(t *testing.T) {
 		},
 		{
 			table:   "_repl_clock",
-			columns: []string{"tbl", "pk", "col", "hlc", "site", "val"},
+			columns: []string{"tbl", "pk", "top", "rec"},
 		},
 	}
 

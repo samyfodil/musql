@@ -3,7 +3,10 @@ package replication
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 
@@ -93,19 +96,36 @@ func dumpUsers(t *testing.T, s *Store) string {
 
 func dumpClock(t *testing.T, s *Store) string {
 	t.Helper()
-	rows, err := s.db.Query(`SELECT tbl, quote(pk), col, hlc, site, quote(val) FROM _repl_clock ORDER BY tbl, pk, col`)
+	return dumpClockDB(t, s.db)
+}
+
+// dumpClockDB is every clock cell db holds, a line each, in key and column
+// order: "tbl|X'pk'|col|hlc|site|X'val'".
+func dumpClockDB(t testing.TB, db *sql.DB) string {
+	t.Helper()
+	rows, err := db.Query(`SELECT tbl, pk, rec FROM main._repl_clock ORDER BY tbl, pk`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rows.Close()
 	var b strings.Builder
 	for rows.Next() {
-		var tbl, pk, col, site, val string
-		var hlc int64
-		if err := rows.Scan(&tbl, &pk, &col, &hlc, &site, &val); err != nil {
+		var tbl string
+		var pk, rec []byte
+		if err := rows.Scan(&tbl, &pk, &rec); err != nil {
 			t.Fatal(err)
 		}
-		fmt.Fprintf(&b, "%s|%s|%s|%d|%s|%s\n", tbl, pk, col, hlc, site, val)
+		cells, err := decodeRec(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, col := range slices.Sorted(maps.Keys(cells)) {
+			c := cells[col]
+			fmt.Fprintf(&b, "%s|X'%X'|%s|%d|%s|X'%X'\n", tbl, pk, col, int64(c.hlc), c.site, c.val)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
 	return b.String()
 }
@@ -280,5 +300,117 @@ func TestIngestRefusesASecondWriterOfOneSite(t *testing.T) {
 	err := s.Ingest(ctx, insertOp("x", 1, 100, "u1", "bob", 30), false)
 	if err == nil || !strings.Contains(err.Error(), "two different ops") {
 		t.Fatalf("got %v, want the two-writers refusal", err)
+	}
+}
+
+func TestNoteLocalForAnotherSite(t *testing.T) {
+	s := newTestStore(t, "noteother")
+	s.NoteLocal("other", 5)
+	s.NoteLocal("other", 3)
+	if got := s.LocalVV()["other"]; got != 5 {
+		t.Fatalf("other's seq %d, want 5", got)
+	}
+}
+
+// bareStore is a store with no object at all, not even the users table.
+func bareStore(t *testing.T, site string) *Store {
+	t.Helper()
+	db, err := openApplyDB("file:" + site + "?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { db.Close() })
+	s, err := OpenStore(context.Background(), db, site)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// TestEmptyOwnOpsRefuses: a store holding a user object, or whose own log holds
+// a write or a schema change beyond its mode, is not empty enough for an image.
+func TestEmptyOwnOpsRefuses(t *testing.T) {
+	ctx := context.Background()
+	notEmpty := func(name string, s *Store) {
+		t.Helper()
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if _, err := s.emptyOwnOps(ctx); !errors.Is(err, errNotEmpty) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	notEmpty("a table", newTestStore(t, "emptytable"))
+
+	w := bareStore(t, "emptywrite")
+	if err := w.Ingest(ctx, insertOp(w.Site(), 1, 10, "u1", "x", 1), false); err != nil {
+		t.Fatal(err)
+	}
+	notEmpty("a write of its own", w)
+
+	d := bareStore(t, "emptydrop")
+	for _, op := range []Op{
+		{Site: d.Site(), Seq: 1, HLC: 10, Kind: OpSchema, Cells: schemaOp{Act: actCreate, ID: usersID, Type: "table", Name: "users", SQL: usersDDL}.cells()},
+		{Site: d.Site(), Seq: 2, HLC: 11, Kind: OpSchema, Cells: schemaOp{Act: actDrop, ID: usersID, Type: "table", Name: "users"}.cells()},
+	} {
+		if err := d.Ingest(ctx, op, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	notEmpty("a table made and dropped", d)
+}
+
+// TestAClosedDatabaseIsRefused: what a store reads from its database fails,
+// rather than answers, once the database is closed.
+func TestAClosedDatabaseIsRefused(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, "closed")
+	s.db.Close()
+	if _, err := s.begin(ctx); err == nil {
+		t.Error("began a transaction")
+	}
+	if _, err := s.OpsSince(ctx, "schema", 0, 10); err == nil {
+		t.Error("read ops")
+	}
+	if _, err := s.SnapshotPage(ctx, SnapshotOps, nil); err == nil {
+		t.Error("read a snapshot page")
+	}
+	if _, _, err := s.Image(ctx, imageRequest(bookkeepingLayout)); err == nil {
+		t.Error("cut an image")
+	}
+	if _, err := OpenStore(ctx, s.db, "closed"); err == nil {
+		t.Error("opened a store")
+	}
+	NewNode(s, nil).applyPushed(ctx, []Op{insertOp("A", 1, 10, "u1", "x", 1)})
+	if seq := s.LocalVV()["A"]; seq != 0 {
+		t.Errorf("applied a pushed op: A at %d", seq)
+	}
+}
+
+// TestSnapshotPagesAreBoundedByBytes: a page stops at snapshotPageBytes,
+// however few rows that is, and the next page goes on from there.
+func TestSnapshotPagesAreBoundedByBytes(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, "bigpages")
+	big := strings.Repeat("x", 1<<20)
+	n := snapshotPageBytes>>20 + 2
+	for i := range n {
+		if err := s.Ingest(ctx, insertOp("A", uint64(i+1), HLC(10+i), fmt.Sprint("u", i), big, 1), false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := s.SnapshotPage(ctx, SnapshotOps, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Next == nil || len(first.Ops) >= n+1 {
+		t.Fatalf("a page of %d ops, next %q", len(first.Ops), first.Next)
+	}
+	rest, err := s.SnapshotPage(ctx, SnapshotOps, first.Next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Ops)+len(rest.Ops) != n+1 {
+		t.Fatalf("pages of %d and %d ops, want %d in all", len(first.Ops), len(rest.Ops), n+1)
 	}
 }

@@ -57,6 +57,13 @@ func openSyncer(ctx context.Context, path string, opts ...Option) (*Syncer, *sql
 		applyDB.Close()
 		return nil, nil, err
 	}
+	// An image install a crash interrupted is finished first (image.go). A
+	// database with no file has none.
+	if file, err := mainFile(ctx, applyDB); err == nil {
+		if err := recoverImage(file); err != nil {
+			return fail(err)
+		}
+	}
 	if err := InitSchema(ctx, applyDB); err != nil {
 		return fail(err)
 	}
@@ -111,6 +118,22 @@ func openSyncer(ctx context.Context, path string, opts ...Option) (*Syncer, *sql
 // openDBs maps each *sql.DB Open returned to its Syncer, for the calls that
 // take the *sql.DB (Retire).
 var openDBs sync.Map
+
+// Synced reports whether db's node finished an anti-entropy round: it reached
+// a peer and holds everything each peer it reached held. Until then a joining
+// node holds only part of the database. Without a transport it is never
+// synced.
+func Synced(db *sql.DB) bool {
+	v, ok := openDBs.Load(db)
+	if !ok {
+		return false
+	}
+	s := v.(*Syncer)
+	s.mu.Lock()
+	n := s.node
+	s.mu.Unlock()
+	return n != nil && n.synced.Load()
+}
 
 // Option configures Open.
 type Option func(*config)
@@ -316,7 +339,9 @@ func setGuard(ctx context.Context, db *sql.DB) error {
 // CHECK constraints: each write was checked where it was made, and a row merged
 // from two of them may break a CHECK neither did -- applied, every node holds
 // it; refused, the op would fail on every node forever. Foreign keys are off on
-// it as on any connection that does not turn them on.
+// it whatever the DSN says: a peer's UPDATE applies as a DELETE and an INSERT,
+// which an ON DELETE action would answer with changes the peer never made; the
+// actions it did run arrive as ops of their own.
 type applyConnector struct{ sqldriver.Connector }
 
 func (c applyConnector) Connect(ctx context.Context) (sqldriver.Conn, error) {
@@ -325,9 +350,11 @@ func (c applyConnector) Connect(ctx context.Context) (sqldriver.Conn, error) {
 		return nil, err
 	}
 	conn.(*driver.Conn).AllowUncapturedWrites()
-	if err := conn.(*driver.Conn).Exec(ctx, `PRAGMA ignore_check_constraints = ON`); err != nil {
-		conn.Close()
-		return nil, err
+	for _, pragma := range []string{`PRAGMA ignore_check_constraints = ON`, `PRAGMA foreign_keys = OFF`} {
+		if err := conn.(*driver.Conn).Exec(ctx, pragma); err != nil {
+			conn.Close()
+			return nil, err
+		}
 	}
 	return conn, nil
 }
