@@ -1050,26 +1050,15 @@ func (s *Store) syncCatalog(ctx context.Context) error {
 	return nil
 }
 
-// materializeRow brings one user-table row to what the clock says: gone if
-// the row is tombstoned or unknown; otherwise the full row from its live cells
-// -- but only once every NOT NULL column without a default has a value (the
-// completeness gate), so an update that races ahead of its insert can never
-// write NULL into a NOT NULL column or leave a torn row.
-//
-// A row that would break a UNIQUE index -- two nodes each wrote the value --
-// is settled by rebuilding the table (rebuildTable), and so is every change to
-// a table that already has a row held out that way: what the table holds is
-// then a function of the clock alone, the same on every node.
-//
-// tblID and the cells' columns are IDs, resolved through cat: a table cat does
-// not have (not created here yet, or dropped) is not written, and a cell of a
-// column it does not have is not either.
-func (s *Store) materializeRow(ctx context.Context, cat *catalog, tblID string, pk []byte) error {
-	return s.materializeRowFrom(ctx, cat, tblID, pk, nil)
-}
-
-// materializeRowFrom is materializeRow with the row's clock cells, when the
-// caller has them (mergeOp), instead of reading them again.
+// materializeRowFrom brings one user-table row to what the clock says, from
+// the row's clock cells when the caller has them (mergeOp): gone if the row is
+// tombstoned or unknown, otherwise the full row from its live cells, but only
+// once every NOT NULL column without a default has a value (the completeness
+// gate), so an update that races its insert never writes a NULL there or a
+// torn row. A row that would break a UNIQUE index is settled by rebuilding the
+// table (rebuildTable), as is every change to a table already holding a row
+// out, so what the table holds is a function of the clock alone. tblID and the
+// cells' columns are IDs resolved through cat; what cat lacks is not written.
 func (s *Store) materializeRowFrom(ctx context.Context, cat *catalog, tblID string, pk []byte, have map[string]clockCell) error {
 	t := cat.byID(tblID)
 	if t == nil || t.Type != "table" {
