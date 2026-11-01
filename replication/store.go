@@ -91,6 +91,9 @@ type Store struct {
 	group ingestGroup
 	// pins hold prune at the cuts of the images being sent (image.go).
 	pins []*imagePin
+	// intern is the column and site names the clock records an ingest reads
+	// hold, one string each (decodeRecIn); read under mu.
+	intern recIntern
 }
 
 // begin starts a store transaction: BEGIN IMMEDIATE on a connection of the
@@ -161,7 +164,7 @@ func OpenStore(ctx context.Context, db *sql.DB, site string) (*Store, error) {
 	if err := InitSchema(ctx, db); err != nil {
 		return nil, err
 	}
-	s := &Store{db: db, q: db, site: site, clock: NewClock(site), vv: VersionVector{}, floors: VersionVector{}, acks: Acks{}, cat: newCatalog(), mayHold: map[string]bool{}}
+	s := &Store{db: db, q: db, site: site, clock: NewClock(site), vv: VersionVector{}, floors: VersionVector{}, acks: Acks{}, cat: newCatalog(), mayHold: map[string]bool{}, intern: recIntern{}}
 	if err := s.claimRanges(ctx); err != nil {
 		return nil, err
 	}
@@ -795,16 +798,28 @@ func mergeInto(have map[string]clockCell, op Op) bool {
 		have[col] = clockCell{op.HLC, op.Site, val}
 		took = true
 	}
-	pval := byte(1)
+	alive := 1
 	if op.Kind == OpDelete {
-		pval = 0
+		alive = 0
 	}
-	merge(presenceCol, []byte{pval})
+	merge(presenceCol, presenceVals[alive])
+	// Every cell of the op packs into one buffer, each its own capped slice.
+	n := 0
 	for _, c := range op.Cells {
-		merge(c.Col, packVal(c.Type, c.Val))
+		n += 1 + len(c.Val)
+	}
+	buf := make([]byte, 0, n)
+	for _, c := range op.Cells {
+		at := len(buf)
+		buf = append(append(buf, c.Type), c.Val...)
+		merge(c.Col, buf[at:len(buf):len(buf)])
 	}
 	return took
 }
+
+// presenceVals is a presence cell's value, dead and alive: shared, and never
+// written to.
+var presenceVals = [2][]byte{{0}, {1}}
 
 // recsPerStmt is the most clock records one statement of writeRecs writes.
 const recsPerStmt = 128
@@ -845,62 +860,185 @@ func (s *Store) applyOps(ctx context.Context, ops []Op, local bool) error {
 	}
 	type key struct{ tbl, pk string }
 	var keys []key
+	var tables []string
 	byKey := map[key][]Op{}
+	pksOf := map[string][][]byte{}
 	for _, op := range ops {
 		k := key{op.Tbl, string(op.PK)}
 		if _, ok := byKey[k]; !ok {
 			keys = append(keys, k)
+			if _, ok := pksOf[op.Tbl]; !ok {
+				tables = append(tables, op.Tbl)
+			}
+			pksOf[op.Tbl] = append(pksOf[op.Tbl], op.PK)
 		}
 		byKey[k] = append(byKey[k], op)
+	}
+	clock := map[key]map[string]clockCell{}
+	for _, tbl := range tables {
+		if err := s.readRecs(ctx, tbl, pksOf[tbl], func(pk []byte, cells map[string]clockCell) {
+			clock[key{tbl, string(pk)}] = cells
+		}); err != nil {
+			return err
+		}
 	}
 	var fresh, won []any
 	changed := map[key]map[string]clockCell{}
 	for _, k := range keys {
-		pk := []byte(k.pk)
-		have, err := s.clockCells(ctx, k.tbl, pk)
-		if err != nil {
-			return err
+		have, had := clock[k]
+		if !had {
+			have = map[string]clockCell{}
 		}
-		had, took := len(have) > 0, false
+		took := false
 		for _, op := range byKey[k] {
 			took = mergeInto(have, op) || took
 		}
 		if took {
-			fresh, won = recArgs(fresh, won, k.tbl, pk, have, had)
+			fresh, won = recArgs(fresh, won, k.tbl, []byte(k.pk), have, had)
 			changed[k] = have
 		}
 	}
 	if err := s.writeRecs(ctx, fresh, won); err != nil || local {
 		return err
 	}
-	var rebuild []string
-	for _, k := range keys {
-		have, ok := changed[k]
-		if !ok || slices.Contains(rebuild, k.tbl) {
-			continue
-		}
-		t := s.cat.byID(k.tbl)
+	live := map[string]typedVal{}
+	for _, tbl := range tables {
+		t := s.cat.byID(tbl)
 		if t == nil || t.Type != "table" {
 			continue
 		}
-		conflict, err := s.heldInTx(ctx, k.tbl)
+		conflict, err := s.heldInTx(ctx, tbl)
 		if err == nil && !conflict {
-			conflict, err = s.writeRow(ctx, t, []byte(k.pk), true, have)
+			conflict, err = s.writeRows(ctx, t, pksOf[tbl], func(pk []byte) map[string]clockCell {
+				return changed[key{tbl, string(pk)}]
+			}, live)
 		}
 		if err != nil {
 			return err
 		}
 		if conflict {
-			rebuild = append(rebuild, k.tbl)
+			if err := s.rebuildTable(ctx, t); err != nil {
+				return err
+			}
+			delete(s.txHeld, tbl) // the rebuild may have held rows out
 		}
-	}
-	for _, tbl := range rebuild {
-		if err := s.rebuildTable(ctx, s.cat.byID(tbl)); err != nil {
-			return err
-		}
-		delete(s.txHeld, tbl) // the rebuild may have held rows out
 	}
 	return nil
+}
+
+// readRecs hands got the clock's cells of each of tbl's rows pks it holds a
+// record of. Each is its own point read: the engine runs "pk IN (...)" as a
+// scan of the table that tests every row against the list.
+func (s *Store) readRecs(ctx context.Context, tbl string, pks [][]byte, got func(pk []byte, cells map[string]clockCell)) error {
+	for _, pk := range pks {
+		var rec []byte
+		err := s.q.QueryRowContext(ctx, `SELECT rec FROM main._repl_clock WHERE tbl=? AND pk=?`, tbl, pk).Scan(&rec)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		cells, err := decodeRecIn(rec, s.intern)
+		if err != nil {
+			return err
+		}
+		got(pk, cells)
+	}
+	return nil
+}
+
+// writeRows is writeRow for the rows of t among pks whose cells changed (an
+// unchanged one has none): each one's row deleted, then every alive, complete
+// one inserted, many to a statement. conflict reports a row the table refused.
+func (s *Store) writeRows(ctx context.Context, t *object, pks [][]byte, cellsOf func(pk []byte) map[string]clockCell, live map[string]typedVal) (conflict bool, err error) {
+	keyNames, err := keyNamesOf(t)
+	if err != nil {
+		return false, err
+	}
+	where := make([]string, len(keyNames))
+	for i, k := range keyNames {
+		where[i] = quoteIdent(k) + "=?"
+	}
+	del := fmt.Sprintf(`DELETE FROM main.%s WHERE %s`, quoteIdent(t.Name), strings.Join(where, " AND "))
+	ins := rowInserter{s: s, t: t}
+	for _, pk := range pks {
+		have := cellsOf(pk)
+		if have == nil {
+			continue
+		}
+		keyVals, err := decodeKey(pk, len(keyNames))
+		if err != nil {
+			return false, fmt.Errorf("replication: table %q: %w", t.Name, err)
+		}
+		if _, err := s.q.ExecContext(ctx, del, keyVals...); err != nil {
+			return false, err
+		}
+		if !liveCellsInto(have, live) {
+			continue
+		}
+		cols, args, ok := rowValues(t, keyNames, keyVals, live)
+		if !ok {
+			continue // completeness gate: withhold until the covering insert arrives
+		}
+		if err := ins.add(ctx, cols, args); err != nil {
+			return false, err
+		}
+	}
+	if err := ins.flush(ctx); err != nil {
+		return false, err
+	}
+	return ins.refused, nil
+}
+
+// rowInserter inserts rows of one table many to a statement, rows of one
+// column list together, as writeRow inserts one: OR IGNORE, the rows being
+// gone already, so that refused is whether a UNIQUE value refused any.
+type rowInserter struct {
+	s       *Store
+	t       *object
+	cols    []string
+	args    []any
+	n       int
+	refused bool
+}
+
+func (b *rowInserter) add(ctx context.Context, cols []string, args []any) error {
+	if b.n > 0 && (!slices.Equal(cols, b.cols) || b.n == rowsPerInsert || len(b.args)+len(args) > sqliteMaxVariables) {
+		if err := b.flush(ctx); err != nil {
+			return err
+		}
+	}
+	b.cols = cols
+	b.args = append(b.args, args...)
+	b.n++
+	return nil
+}
+
+func (b *rowInserter) flush(ctx context.Context) error {
+	if b.n == 0 {
+		return nil
+	}
+	inserted, err := b.s.insertRows(ctx, b.t, b.cols, b.n, b.args)
+	if err != nil {
+		return err
+	}
+	b.refused = b.refused || inserted < b.n
+	b.args, b.n = b.args[:0], 0
+	return nil
+}
+
+// insertRows inserts n rows of t, OR IGNORE, each of cols from args in turn,
+// and says how many went in.
+func (s *Store) insertRows(ctx context.Context, t *object, cols []string, n int, args []any) (int, error) {
+	one := "(" + strings.TrimSuffix(strings.Repeat("?,", len(cols)), ",") + ")"
+	res, err := s.q.ExecContext(ctx, fmt.Sprintf(`INSERT OR IGNORE INTO main.%s(%s) VALUES %s`,
+		quoteIdent(t.Name), quotedList(cols), strings.TrimSuffix(strings.Repeat(one+",", n), ",")), args...)
+	if err != nil {
+		return 0, err
+	}
+	inserted, err := res.RowsAffected()
+	return int(inserted), err
 }
 
 // mergeCell writes (hlc, site, val) for a cell iff it is a strictly newer writer
@@ -1053,7 +1191,8 @@ func rowValues(t *object, keyNames []string, keyVals []any, cells map[string]typ
 			return nil, nil, false
 		}
 	}
-	cols, args = slices.Clone(keyNames), slices.Clone(keyVals)
+	cols = append(make([]string, 0, len(keyNames)+len(cells)), keyNames...)
+	args = append(make([]any, 0, len(keyVals)+len(cells)), keyVals...)
 	for _, c := range t.Cols {
 		if c.PK {
 			continue
@@ -1291,17 +1430,11 @@ func (b *rowBatch) flush(ctx context.Context) error {
 	if len(b.pks) == 0 {
 		return nil
 	}
-	one := "(" + strings.TrimSuffix(strings.Repeat("?,", len(b.cols)), ",") + ")"
-	res, err := b.s.q.ExecContext(ctx, fmt.Sprintf(`INSERT OR IGNORE INTO main.%s(%s) VALUES %s`,
-		quoteIdent(b.t.Name), quotedList(b.cols), strings.TrimSuffix(strings.Repeat(one+",", len(b.pks)), ",")), b.args...)
+	n, err := b.s.insertRows(ctx, b.t, b.cols, len(b.pks), b.args)
 	if err != nil {
 		return err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if int(n) < len(b.pks) {
+	if n < len(b.pks) {
 		where := make([]string, len(b.keyNames))
 		for i, k := range b.keyNames {
 			where[i] = quoteIdent(k) + "=?"
@@ -1389,17 +1522,26 @@ type typedVal struct {
 // liveCells is a row's cells but its presence, and whether that says the row
 // is there: false for a deleted row and for one the clock does not know.
 func liveCells(have map[string]clockCell) (map[string]typedVal, bool) {
-	if p, ok := have[presenceCol]; !ok || len(p.val) == 0 || p.val[0] != 1 {
+	cells := make(map[string]typedVal, len(have))
+	if !liveCellsInto(have, cells) {
 		return nil, false
 	}
-	cells := make(map[string]typedVal, len(have))
+	return cells, true
+}
+
+// liveCellsInto is liveCells into cells, which it clears first.
+func liveCellsInto(have map[string]clockCell, cells map[string]typedVal) bool {
+	clear(cells)
+	if p, ok := have[presenceCol]; !ok || len(p.val) == 0 || p.val[0] != 1 {
+		return false
+	}
 	for col, c := range have {
 		if col != presenceCol {
 			typ, raw := unpackVal(c.val)
 			cells[col] = typedVal{typ, raw}
 		}
 	}
-	return cells, true
+	return true
 }
 
 // --- rowid ranges ---
@@ -1653,7 +1795,10 @@ next:
 
 // packVal prepends the type tag to a cell's raw bytes for storage in the clock.
 func packVal(typ byte, raw []byte) []byte {
-	return append([]byte{typ}, raw...)
+	b := make([]byte, 1+len(raw))
+	b[0] = typ
+	copy(b[1:], raw)
+	return b
 }
 
 func unpackVal(b []byte) (typ byte, raw []byte) {
