@@ -246,36 +246,88 @@ func (m *vdbe) inList(op *Instruction) Value {
 	return finalizeIn(found, s.hasNull, false)
 }
 
+// inListRun is a list's values keyed for one run, with its parameters bound:
+// its integers sorted when every value is one and none is NULL, else its set.
+// OpInList keeps it in registers and the subCache; the columnar GROUP BY walk
+// probes it directly (segList).
+type inListRun struct {
+	aff  affinity
+	coll string
+	ints []int64
+	set  *inListSet
+}
+
+// newInListRun keys plan's values for a run bound to params, false when the
+// comparisons must answer instead: a UTF-16 database, which compares TEXT in
+// its own encoding (inList scans there), or a value that cannot be keyed.
+func newInListRun(plan *inListPlan, params []Value, enc TextEncoding) (*inListRun, bool) {
+	if isUTF16(enc) {
+		return nil, false
+	}
+	r := &inListRun{aff: plan.aff, coll: plan.coll, ints: plan.ints, set: plan.set}
+	if len(plan.params) == 0 {
+		return r, true
+	}
+	vals := slices.Clip(plan.lits)
+	for _, p := range plan.params {
+		vals = append(vals, paramAt(params, p))
+	}
+	keys, hasNull, ok := inListKeys(vals, plan.aff, plan.coll)
+	if !ok {
+		return nil, false
+	}
+	if ints, all := inListInts(keys); all && !hasNull {
+		r.ints, r.set = ints, nil
+	} else {
+		r.ints, r.set = nil, newInListSet(keys, hasNull)
+	}
+	return r, true
+}
+
+// membership is the IN's answer for x: 1, 0 or NULL. false when x cannot be
+// keyed, which leaves the comparisons to answer.
+func (r *inListRun) membership(x Value) (Value, bool) {
+	if x.Typ == Null {
+		return Value{Typ: Null}, true
+	}
+	if x.Typ == Int && r.ints != nil && r.aff != affText {
+		_, found := slices.BinarySearch(r.ints, x.I)
+		return boolValue(found), true
+	}
+	k, _, ok := inListKey(x, r.aff, r.coll)
+	if !ok {
+		return Value{}, false
+	}
+	if r.ints != nil {
+		found := false
+		if k.class == 'i' {
+			_, found = slices.BinarySearch(r.ints, k.i)
+		}
+		return boolValue(found), true
+	}
+	_, found := r.set.keys[k]
+	return finalizeIn(found, r.set.hasNull, false), true
+}
+
 // inListBuild keys the list for this run: its integers sorted into the
 // registers after P3 with their count in P3, or -1 in P3 and the set in
 // plan.set or the subCache slot.
 func (m *vdbe) inListBuild(op *Instruction, plan *inListPlan) {
 	m.regs[op.P3] = Value{Typ: Int, I: -1}
-	ints := plan.ints
-	if len(plan.params) > 0 {
-		vals := slices.Clip(plan.lits)
-		for _, p := range plan.params {
-			vals = append(vals, paramAt(m.params, p))
-		}
-		keys, hasNull, ok := inListKeys(vals, plan.aff, plan.coll)
-		if !ok {
-			return
-		}
-		var all bool
-		if ints, all = inListInts(keys); !all || hasNull {
-			if plan.slot >= 0 && plan.slot < len(m.subCache) {
-				m.subCache[plan.slot].inList = newInListSet(keys, hasNull)
-			}
-			return
-		}
-	}
-	if ints == nil && plan.set != nil {
+	r, ok := newInListRun(plan, m.params, m.encoding())
+	if !ok {
 		return
 	}
-	for i, k := range ints {
+	if r.ints == nil {
+		if len(plan.params) > 0 && plan.slot >= 0 && plan.slot < len(m.subCache) {
+			m.subCache[plan.slot].inList = r.set
+		}
+		return
+	}
+	for i, k := range r.ints {
 		m.regs[op.P3+1+i] = Value{Typ: Int, I: k}
 	}
-	m.regs[op.P3] = Value{Typ: Int, I: int64(len(ints))}
+	m.regs[op.P3] = Value{Typ: Int, I: int64(len(r.ints))}
 }
 
 // inListSearch reports whether x is among keys, INTEGERs in ascending order.
