@@ -166,6 +166,8 @@ func TestGeneratedVirtualRaiseReadsOnlyItsColumn(t *testing.T) {
 			"SELECT v FROM i WHERE h > 0",
 			"SELECT k FROM i",
 			"SELECT * FROM i",
+			"PRAGMA integrity_check",
+			"PRAGMA quick_check",
 		},
 	} {
 		differ(t, "gencol-raise "+name, stmts)
@@ -296,6 +298,9 @@ func TestGeneratedVirtualAddColumnChecks(t *testing.T) {
 	} {
 		eoqDiffer(t, tc.setup, tc.q, "SELECT count(*) FROM pragma_table_xinfo('"+tc.table+"')")
 	}
+	anyCol := with(strict, "INSERT INTO s VALUES(1,'bad'),(2,'5')", "ALTER TABLE s ADD COLUMN g ANY AS (json_extract(j,'$')) VIRTUAL")
+	eoqDiffer(t, anyCol, "SELECT 1", "PRAGMA integrity_check")
+	eoqDiffer(t, anyCol, "SELECT 1", "SELECT a FROM s")
 }
 
 // A write whose VIRTUAL column raises fails with the expression's own message,
