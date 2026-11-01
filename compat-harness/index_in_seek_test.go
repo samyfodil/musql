@@ -1,7 +1,9 @@
 package compat
 
 import (
+	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -81,4 +83,58 @@ func TestIndexInSeekClockShape(t *testing.T) {
 			}
 		}
 	}
+}
+
+// EXPLAIN QUERY PLAN names the index a query's IN list seeks, as C's does.
+func TestIndexInSeekPlan(t *testing.T) {
+	c, m := boundPair(t, []string{
+		"CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, a INTEGER, s TEXT COLLATE NOCASE)",
+		"CREATE INDEX ta ON t(a)",
+		"CREATE INDEX tgs ON t(g, s)",
+		"WITH RECURSIVE c(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM c WHERE x < 300) INSERT INTO t SELECT x, x % 3, x % 37, char(97 + x % 4) FROM c",
+		"VACUUM",
+	})
+	ctx := context.Background()
+	cc, err := c.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cc.Close()
+	mc, err := m.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mc.Close()
+	for _, q := range []string{
+		"SELECT id FROM t WHERE a IN (1, 2, 3)",
+		"SELECT id FROM t WHERE g = 1 AND s IN ('a', 'b', 'c')",
+		"SELECT count(*) FROM t WHERE a IN (4, 5, 6, 7)",
+		"SELECT a FROM t WHERE a IN (3, 1, 2) ORDER BY a",
+	} {
+		want, got := planDetails(t, cc, q), planDetails(t, mc, q)
+		if !slices.Equal(want, got) {
+			t.Errorf("EXPLAIN QUERY PLAN %s:\n  cgo:   %q\n  musql: %q", q, want, got)
+		}
+	}
+}
+
+// With ORDER BY the seeks are taken too: an equality or an IN list fetches
+// its rows and the sort orders them.
+func TestConstantSeekUnderOrderBy(t *testing.T) {
+	differ(t, "seek under ORDER BY", []string{
+		"CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, s TEXT, j TEXT)",
+		"CREATE INDEX ta ON t(a)",
+		"WITH RECURSIVE c(x) AS (VALUES(-10) UNION ALL SELECT x+1 FROM c WHERE x < 400) " +
+			"INSERT INTO t SELECT x, x % 23, char(97 + (x + 10) % 5), CASE WHEN x % 40 = 0 THEN '{bad' ELSE '{}' END FROM c",
+		"VACUUM",
+		"INSERT INTO t VALUES(1000, 4, 'q', '{}')",
+		"SELECT id, s FROM t WHERE id IN (5, -3, 400, 401, 17) ORDER BY s, id",
+		"SELECT id FROM t WHERE id = 17 ORDER BY a DESC",
+		"SELECT id, a FROM t WHERE a IN (4, 1, 9) ORDER BY id DESC LIMIT 7",
+		"SELECT a, id FROM t WHERE a = 4 ORDER BY s DESC, id",
+		"SELECT DISTINCT s FROM t WHERE a IN (2, 3) ORDER BY s",
+		"SELECT id FROM t WHERE id BETWEEN 10 AND 60 AND a IN (1, 2) ORDER BY a, id",
+		"SELECT id FROM t WHERE json_extract(j, '$.v') IS NULL AND a IN (1, 2) ORDER BY id",
+		"SELECT t1.id, t2.id FROM t t1 JOIN t t2 ON t2.a = t1.a WHERE t1.id IN (3, 4) ORDER BY 1, 2",
+	})
 }
