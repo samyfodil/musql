@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
+
 	"github.com/samyfodil/musql/replication"
 
 	"github.com/samyfodil/musql/cloud/cluster"
@@ -359,6 +361,26 @@ func TestClusterPlacement(t *testing.T) {
 	if status, _ := nodes[2].pipeline("/db/acme/app", nodes[2].admin, "SELECT 1"); status != http.StatusNotFound {
 		t.Fatalf("a database not placed here: HTTP %d, want 404", status)
 	}
+	_, _, dbs2 := nodes[2].clients()
+	if _, err := dbs2.Create(ctx, auth(nodes[2].admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "copy", Source: &v1.CreateDatabaseRequest_BranchOf{BranchOf: "app"}})); code(err) != connect.CodeFailedPrecondition {
+		t.Fatalf("a branch of a database not placed here: %v", err)
+	}
+	up := nodes[2].upload("acme", nodes[0].export("acme", "app", v1.FileFormat_FILE_FORMAT_MUSQL))
+	if _, err := dbs2.Create(ctx, auth(nodes[2].admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "uploaded", Source: &v1.CreateDatabaseRequest_Upload{Upload: up.Upload}})); code(err) != connect.CodeFailedPrecondition {
+		t.Fatalf("an upload into a database not placed here: %v", err)
+	}
+	if r := need(dbs2.Create(ctx, auth(nodes[2].admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "elsewhere"})))(t); r.Msg.Database.Name != "elsewhere" {
+		t.Fatalf("a database recorded for its group's nodes: %v", r.Msg)
+	}
+	for name, err := range map[string]error{
+		"its snapshots":   errOf(dbs2.ListSnapshots(ctx, auth(nodes[2].admin, &v1.ListSnapshotsRequest{Org: "acme", Name: "app"}))),
+		"a snapshot":      errOf(dbs2.CreateSnapshot(ctx, auth(nodes[2].admin, &v1.CreateSnapshotRequest{Org: "acme", Name: "app"}))),
+		"a restore of it": errOf(dbs2.Restore(ctx, auth(nodes[2].admin, &v1.RestoreRequest{Org: "acme", Name: "app", NewName: "back"}))),
+	} {
+		if code(err) != connect.CodeFailedPrecondition {
+			t.Errorf("%s on a node not holding it: %v", name, err)
+		}
+	}
 	nodes[0].exec("/db/acme/app", nodes[0].admin, "CREATE TABLE back(x)", "INSERT INTO back VALUES (1)")
 	need(nodes[0].groups().AddLocation(ctx, auth(nodes[0].admin, &v1.AddLocationRequest{Org: "acme", Group: "default", Location: "sea"})))(t)
 	eventually(t, "sea to hold app again, rows included", func() bool { return nodes[2].count("app", "back") == 1 })
@@ -463,11 +485,16 @@ func TestClusterEveryNodeServesIdentity(t *testing.T) {
 		}
 		return true
 	})
+	for _, n := range nodes {
+		if n.s.PeerID() == "" || len(n.s.P2PAddrs()) == 0 {
+			t.Fatalf("%s has no peer ID or address", n.cfg.Node.Name)
+		}
+	}
 }
 
 func TestStandaloneIsPlain(t *testing.T) {
 	e := newEnv(t, "")
-	if e.s.cl != nil || e.s.PeerID() != "" {
+	if e.s.cl != nil || e.s.PeerID() != "" || e.s.P2PAddrs() != nil {
 		t.Fatal("a node without peers started libp2p")
 	}
 	if _, err := os.Stat(filepath.Join(e.s.cfg.DataDir, "node.key")); !os.IsNotExist(err) {

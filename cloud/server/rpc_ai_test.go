@@ -14,10 +14,14 @@ import (
 type fakeGen struct {
 	replies []string
 	prompts []string
+	err     error
 }
 
 func (f *fakeGen) Generate(_ context.Context, system, user string) (string, error) {
 	f.prompts = append(f.prompts, user)
+	if f.err != nil {
+		return "", f.err
+	}
 	r := f.replies[0]
 	if len(f.replies) > 1 {
 		f.replies = f.replies[1:]
