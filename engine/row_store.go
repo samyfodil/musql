@@ -82,6 +82,10 @@ type rowStore struct {
 	// eqIdx is the lazily built per-column equality index, nil until a seek asks
 	// for one and thrown away whole by any mutation. See row_store_eqindex.go.
 	eqIdx map[int]*rsEqIndex
+	// snapWork counts the written rows seeks tested one by one beside the
+	// segments' index; once that costs what building eqIdx would,
+	// prefersEqIndex builds it.
+	snapWork int
 
 	// uqIdx is each UNIQUE index's conflict-probe index, built on the first probe
 	// and maintained by the same three mutators. See row_store_uniqindex.go.
@@ -288,9 +292,19 @@ const (
 
 // inPlaceOK reports whether the store may take an UPDATE's new row written over
 // the old one (applyGathered): it keeps no copy of an old row -- no undo log,
-// no equality or conflict index -- that would then show the new values.
-func (s *rowStore) inPlaceOK() bool {
-	return s != nil && s.seg != nil && !s.logging && len(s.eqIdx) == 0 && len(s.uqIdx) == 0
+// no conflict index, no equality index of a column set assigns -- that would
+// then show the new values. An equality index of a column the UPDATE leaves
+// alone lists the row where it stays.
+func (s *rowStore) inPlaceOK(set []bool) bool {
+	if s == nil || s.seg == nil || s.logging || len(s.uqIdx) != 0 {
+		return false
+	}
+	for col, idx := range s.eqIdx {
+		if idx != nil && (col >= len(set) || set[col]) {
+			return false
+		}
+	}
+	return true
 }
 
 // committedRow is rowid's committed row, as the store's committed rows (not
@@ -565,9 +579,13 @@ func (s *rowStore) maxRowidIn(lo, hi uint64) (uint64, bool) {
 	}
 	var max uint64
 	found := false
-	for rowid := range s.all() {
-		if rowid >= lo && rowid < hi && (!found || rowid > max) {
-			max, found = rowid, true
+	if s.seg != nil {
+		max, found = s.segMaxRowidIn(lo, hi)
+	} else {
+		for rowid := range s.all() {
+			if rowid >= lo && rowid < hi && (!found || rowid > max) {
+				max, found = rowid, true
+			}
 		}
 	}
 	s.rangeLo, s.rangeHi, s.rangeMax, s.rangeHas, s.rangeKnown = lo, hi, max, found, true
@@ -777,34 +795,37 @@ func rowidLess(a, b uint64) bool { return int64(a) < int64(b) }
 
 // fullStoredRow widens a record read from tbl's b-tree to the row store's
 // shape -- see readTableRowsFromPager, which does the same for a whole table.
-func fullStoredRow(tbl *tableMeta, rowid uint64, row []Value) ([]Value, error) {
+// A VIRTUAL generated column whose expression raises holds the error
+// (computeGeneratedOnRead): the row itself is never lost to it.
+func fullStoredRow(tbl *tableMeta, rowid uint64, row []Value) []Value {
 	return fullStoredRowOf(tbl.name, tbl.cols, tbl.ipkIndex, rowid, row)
 }
 
 // fullStoredRowOf is fullStoredRow for a table whose metadata is not assembled
 // yet (a schema load).
-func fullStoredRowOf(name string, cols []columnInfo, ipkIndex int, rowid uint64, row []Value) ([]Value, error) {
-	tbl := &tableMeta{name: name, cols: cols, ipkIndex: ipkIndex}
-	gen := hasGeneratedCols(tbl.cols)
+func fullStoredRowOf(name string, cols []columnInfo, ipkIndex int, rowid uint64, row []Value) []Value {
+	gen := hasGeneratedCols(cols)
+	row = widenStoredRow(cols, row)
 	if gen {
-		row = expandStoredRow(tbl.cols, row)
-	}
-	// Padding comes first: a record written before an ALTER TABLE ADD COLUMN is
-	// short of the column list, and a generated expression is computed over the
-	// whole row.
-	row = padStoredRow(tbl.cols, row)
-	if gen {
-		if tbl.ipkIndex >= 0 && row[tbl.ipkIndex].Typ == Null {
-			row[tbl.ipkIndex] = Value{Typ: Int, I: int64(rowid)}
-			if err := computeGeneratedInto(tbl.name, tbl.cols, row); err != nil {
-				return nil, err
-			}
-			row[tbl.ipkIndex] = Value{Typ: Null}
-		} else if err := computeGeneratedInto(tbl.name, tbl.cols, row); err != nil {
-			return nil, err
+		if ipkIndex >= 0 && row[ipkIndex].Typ == Null {
+			row[ipkIndex] = Value{Typ: Int, I: int64(rowid)}
+			computeGeneratedOnRead(name, cols, row)
+			row[ipkIndex] = Value{Typ: Null}
+		} else {
+			computeGeneratedOnRead(name, cols, row)
 		}
 	}
-	return row, nil
+	return row
+}
+
+// widenStoredRow is fullStoredRowOf without the generated columns: the stored
+// values at full width, which a rewrite copies. Padding follows the slot
+// mapping, since a record from before an ADD COLUMN is short.
+func widenStoredRow(cols []columnInfo, row []Value) []Value {
+	if hasGeneratedCols(cols) {
+		row = expandStoredRow(cols, row)
+	}
+	return padStoredRow(cols, row)
 }
 
 // reserve makes room in the overlay for n rows about to be put, so a

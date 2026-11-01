@@ -477,6 +477,9 @@ func compileWindowProjection(parent *compiler, plan *windowPlan) (*windowProject
 		return nil, err
 	}
 	plan.projLifts = p.buf.exprs
+	// buf holds the compile's scope chain, pager included (windowBufCols.aff), and
+	// run reads only bufRegs: dropped, so a cached plan keeps no pager alive.
+	p.buf = nil
 	return p, nil
 }
 

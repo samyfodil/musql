@@ -52,6 +52,16 @@ type CaptureHooks struct {
 	// changes must go through someone else's log first (a consensus round)
 	// takes them in PreCommit and lands them itself here.
 	HandOff func() error
+
+	// LockWait, when set, brackets an autocommit statement's wait for the write
+	// lock: true as it starts waiting, false once it holds it or gave up, so a
+	// consumer writing through its own connections can let it in first.
+	LockWait func(waiting bool)
+
+	// Contended, when set, reports a writer of the consumer's own waiting for
+	// the write lock; autocommit statements then take the lock before they run,
+	// so LockWait can let that writer in first.
+	Contended func() bool
 }
 
 // ErrHandOff, returned by PreCommit, discards the transaction and makes the
@@ -339,9 +349,15 @@ func (c *Conn) notifyRollback() {
 // routes through exactly the same path a db.Exec would, so during PreCommit
 // it lands in the transaction being committed.
 func (c *Conn) Exec(ctx context.Context, sqlText string, args ...any) error {
-	info, err := engine.ParseParamInfo(sqlText)
+	_, err := c.ExecChanges(ctx, sqlText, args...)
+	return err
+}
+
+// ExecChanges is Exec reporting how many rows the statement changed.
+func (c *Conn) ExecChanges(ctx context.Context, sqlText string, args ...any) (int64, error) {
+	info, err := c.paramInfoOf(sqlText)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	eargs := make([]engine.Value, info.NumParams)
 	for i, a := range args {
@@ -350,19 +366,27 @@ func (c *Conn) Exec(ctx context.Context, sqlText string, args ...any) error {
 		}
 		v, cerr := driverValueToEngine(a)
 		if cerr != nil {
-			return cerr
+			return 0, cerr
 		}
 		eargs[i] = v
 	}
-	_, err = c.execArgs(sqlText, eargs)
-	return err
+	// A hook may run inside a statement that asked for no Result; this one is
+	// read.
+	discarded := c.resultDiscarded
+	c.resultDiscarded = false
+	res, err := c.execArgs(sqlText, eargs)
+	c.resultDiscarded = discarded
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // Query is Exec for a statement that returns rows: it runs on the same path a
 // db.Query would -- so during PreCommit it reads the transaction being
 // committed -- and returns every row as plain Go values (see GoValue).
 func (c *Conn) Query(ctx context.Context, sqlText string, args ...any) ([][]any, error) {
-	info, err := engine.ParseParamInfo(sqlText)
+	info, err := c.paramInfoOf(sqlText)
 	if err != nil {
 		return nil, err
 	}

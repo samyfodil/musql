@@ -228,11 +228,10 @@ func joinSeekReproducesKey(sp *ReadOnlyPager, tbl *resolvedTable, root uint32, n
 }
 
 // findJoinRowidSeek looks for an equality pinning s's rowid (or INTEGER PRIMARY
-// KEY alias) to a key over the outer cursors -- an inner rowid point lookup. The
-// runtime OpSeekRowidHint gate (key must be a genuine Integer, else full scan)
-// makes this superset-safe with no affinity/collation check of its own: an
-// integer key K matches exactly the one inner row rowid==K, and any non-integer
-// key this iteration falls back to a full inner scan.
+// KEY alias) to a key over the outer cursors -- an inner rowid point lookup. It
+// needs no affinity/collation check of its own: OpSeekRowidHint gives the key
+// numeric affinity, an integer K matches exactly the one inner row rowid==K,
+// and any other key matches none.
 func findJoinRowidSeek(c *compiler, s joinSource, outer map[int]bool, eqs []Expr) (Expr, bool) {
 	for _, cj := range eqs {
 		be, ok := cj.(BinaryExpr)

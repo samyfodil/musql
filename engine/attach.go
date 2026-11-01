@@ -644,6 +644,9 @@ const maxAttachedDatabases = 10
 // fails here (C defers that to first access). A missing or zero-length file is
 // created empty first, as C creates it at ATTACH.
 func (db *DB) execAttach(trimmed string) error {
+	if db.confined {
+		return ErrConfined
+	}
 	path, name, ok, err := ParseAttachStmt(trimmed)
 	if !ok {
 		// Unreachable: compileWriteProgram only emits ddlAttach for an ATTACH.

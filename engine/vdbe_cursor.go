@@ -113,12 +113,14 @@ type vdbeCursor struct {
 	colMask columnMask
 
 	// seekConfigured/seekKey turn the first rewind() into a rowid point lookup
-	// (SeekRowidSegments) instead of a full scan. Set by OpSeekRowidHint only for
-	// a runtime-Integer key; the WHERE conjunct is still evaluated on the fetched
-	// row, so the seek only narrows the candidate set and cannot change the
-	// result. A non-Integer key leaves it unset and the full scan runs.
+	// (SeekRowidSegments) instead of a full scan. Set by OpSeekRowidHint; the
+	// WHERE conjunct is still evaluated on the fetched row, so the seek only
+	// narrows the candidate set and cannot change the result.
 	seekConfigured bool
 	seekKey        int64
+	// seekNone is a seek whose key is no integer even under numeric affinity,
+	// so no rowid equals it and the lookup finds nothing.
+	seekNone bool
 
 	// rowidLo/rowidHi, when ranged, bound the rowids a segment scan visits
 	// (OpSeekRowidRangeHint), inclusive. Like seekKey they only skip rows the
@@ -138,6 +140,11 @@ type vdbeCursor struct {
 	idxSeekColl       string
 	// idxSeekCol is the TABLE column the index leads on.
 	idxSeekCol int
+	// idxSeekMore are the keys of OpSeekIndexHint's later slots: equalities on
+	// other columns of the same table, each of which bounds the rows alone.
+	// idxSeekNext is the slot expected next.
+	idxSeekMore []idxSeekKey
+	idxSeekNext int
 
 	// seekReseek marks a CORRELATED (join inner-side) seek cursor whose seek key
 	// changes per outer-loop iteration: unlike an ordinary single-table seek
@@ -251,15 +258,107 @@ func (cur *vdbeCursor) hasRealCols() bool {
 
 // hasGeneratedCols reports whether this cursor's table declares any generated
 // column, memoized in genCached (see its doc comment).
+// columns is the column list of the table cur reads: a read cursor's, or a
+// write cursor's (rowStore).
+func (cur *vdbeCursor) columns() []columnInfo {
+	if cur.tbl != nil {
+		return cur.tbl.cols
+	}
+	if cur.rowStore != nil {
+		return cur.rowStore.cols
+	}
+	return nil
+}
+
 func (cur *vdbeCursor) hasGeneratedCols() bool {
 	if cur.genCached == 0 {
-		if hasGeneratedCols(cur.tbl.cols) {
+		if hasGeneratedCols(cur.columns()) {
 			cur.genCached = 1
 		} else {
 			cur.genCached = 2
 		}
 	}
 	return cur.genCached == 1
+}
+
+// idxSeekRowids is the candidates of this cursor's equality seek, false when no
+// key can be answered. Each key bounds the rows by itself, because every
+// conjunct is re-checked on every row the seek returns, so several keys are
+// answered by whichever the segments say holds the fewest rows.
+//
+// A VIRTUAL generated column is never a key: it is not stored, and a row written
+// before "ALTER TABLE ADD COLUMN ... AS (expr)" holds NULL in its slot, which the
+// posting list files as matching nothing (C's CREATE INDEX computes the key from
+// the expression).
+func (cur *vdbeCursor) idxSeekRowids() ([]int64, bool) {
+	stored := func(col int) bool {
+		return col < 0 || col >= len(cur.tbl.cols) || !cur.tbl.cols[col].IsGenerated() || cur.tbl.cols[col].GeneratedStored
+	}
+	if len(cur.idxSeekMore) == 0 {
+		if !stored(cur.idxSeekCol) {
+			return nil, false
+		}
+		return cur.pager.SeekIndexRowidsByKeys(cur.tbl.root, []idxSeekKey{{col: cur.idxSeekCol, probe: cur.idxSeekProbe, coll: cur.idxSeekColl}})
+	}
+	keys := make([]idxSeekKey, 0, 1+len(cur.idxSeekMore))
+	if stored(cur.idxSeekCol) {
+		keys = append(keys, idxSeekKey{col: cur.idxSeekCol, probe: cur.idxSeekProbe, coll: cur.idxSeekColl})
+	}
+	for _, k := range cur.idxSeekMore {
+		if stored(k.col) {
+			keys = append(keys, k)
+		}
+	}
+	return cur.pager.SeekIndexRowidsByKeys(cur.tbl.root, keys)
+}
+
+// writeSeekRowids is a write cursor's equality candidates, from its store's
+// indexes: its own (eqRowidsOf) where prefersEqIndex says so, else the
+// committed segments' (segEqRowids). Several keys are asked in the order of how
+// many rows the segments say each holds. fromSeg says the segments answered,
+// which drops the rows the store deleted. A TEXT probe under a sequence other
+// than BINARY is no key: both indexes match exact values (and OpSeekIndexHint
+// keeps no TEXT key of a UTF-16 database, whose bytes need not decide its
+// equality).
+func (cur *vdbeCursor) writeSeekRowids() (hits []uint64, fromSeg, ok bool) {
+	rows := cur.rowStore.rows
+	ask := func(k idxSeekKey) ([]uint64, bool, bool) {
+		if k.probe.Typ == Text && !equalFoldName(effectiveCollation(k.coll), "BINARY") {
+			return nil, false, false
+		}
+		if rows.prefersEqIndex(k.col) {
+			if hits, ok := rows.eqRowidsOf(k.col, k.probe); ok {
+				return hits, false, true
+			}
+		}
+		if hits, ok := rows.segEqRowids(k.col, k.probe); ok {
+			return hits, true, true
+		}
+		if hits, ok := rows.eqRowidsOf(k.col, k.probe); ok {
+			return hits, false, true
+		}
+		return nil, false, false
+	}
+	first := idxSeekKey{col: cur.idxSeekCol, probe: cur.idxSeekProbe, coll: cur.idxSeekColl}
+	if len(cur.idxSeekMore) == 0 {
+		return ask(first)
+	}
+	keys := append([]idxSeekKey{first}, cur.idxSeekMore...)
+	est := make([]int, len(keys))
+	for i, k := range keys {
+		est[i] = rows.segEqEstimate(k.col, k.probe)
+	}
+	order := make([]int, len(keys))
+	for i := range order {
+		order[i] = i
+	}
+	slices.SortStableFunc(order, func(a, b int) int { return cmp.Compare(est[a], est[b]) })
+	for _, i := range order {
+		if hits, fromSeg, ok := ask(keys[i]); ok {
+			return hits, fromSeg, true
+		}
+	}
+	return nil, false, false
 }
 
 // normalize applies normalizeRowInPlace's IPK-rowid-alias and REAL-affinity
@@ -327,7 +426,18 @@ func (cur *vdbeCursor) readColumn(i int, dst *Value) error {
 		return cur.readColumnFromMaskedRow(i, dst)
 	}
 	*dst = cur.rowVals[i]
+	if dst.Typ == valueGenErr {
+		return takeGenErr(dst)
+	}
 	return nil
+}
+
+// takeGenErr is the error a valueGenErr slot read into *dst holds, with *dst
+// left NULL so the marker goes no further than its read.
+func takeGenErr(dst *Value) error {
+	err := genErrOf(*dst)
+	*dst = Value{}
+	return err
 }
 
 // col is readColumn in expression position, for readers that want a value
@@ -350,6 +460,9 @@ func (cur *vdbeCursor) readColumnFromMaskedRow(i int, dst *Value) error {
 		}
 	}
 	*dst = cur.rowVals[i]
+	if dst.Typ == valueGenErr {
+		return takeGenErr(dst)
+	}
 	return nil
 }
 
@@ -363,6 +476,13 @@ func (cur *vdbeCursor) fullRow() ([]Value, error) {
 	}
 	if cur.rowRaw != nil {
 		if err := cur.decodeFullRow(); err != nil {
+			return nil, err
+		}
+	}
+	// A whole row goes on to readers that do not name a column, so a VIRTUAL
+	// column's error is raised for the row.
+	if cur.hasGeneratedCols() {
+		if err := rowGenErr(cur.rowVals); err != nil {
 			return nil, err
 		}
 	}
@@ -510,6 +630,46 @@ func (cur *vdbeCursor) narrowRowidRange(kind int, k int64) {
 	}
 }
 
+// narrowRowidRangeBy is narrowRowidRange for a bound of any class, read as
+// OP_SeekGT and its kin read one (vdbe.c): numeric affinity first, then a REAL
+// by the integers either side of it; a NULL bound, or a TEXT or BLOB one below
+// which every number sorts, leaves no row for a lower bound, and an upper one
+// of those leaves them all. Exact, like the integer bound: a scan reading rows
+// outside it would test the rest of the WHERE on rows C never reads.
+func (cur *vdbeCursor) narrowRowidRangeBy(kind int, key Value) {
+	if key.Typ != Int {
+		key = applyAffinityToValue(key, affNumeric)
+	}
+	lower := kind == rowidRangeGT || kind == rowidRangeGE
+	none := func() { cur.ranged, cur.rowidLo, cur.rowidHi = true, math.MaxInt64, math.MinInt64 }
+	switch key.Typ {
+	case Int:
+		cur.narrowRowidRange(kind, key.I)
+	case Float:
+		// Integral values folded to Int above; what is left is no integer.
+		switch f := key.F; {
+		case f >= math.MaxInt64:
+			if lower {
+				none()
+			}
+		case f < math.MinInt64:
+			if !lower {
+				none()
+			}
+		case lower:
+			cur.narrowRowidRange(rowidRangeGE, int64(math.Ceil(f)))
+		default:
+			cur.narrowRowidRange(rowidRangeLE, int64(math.Floor(f)))
+		}
+	case Null:
+		none()
+	default:
+		if lower {
+			none()
+		}
+	}
+}
+
 // startSegSource makes src the cursor's row source: the lazy segment scan.
 func (cur *vdbeCursor) startSegSource(src *segRowSource) {
 	// The compiled pre-filter, when OpRewind carried one. Purely a
@@ -612,7 +772,7 @@ func (cur *vdbeCursor) rewind() error {
 			if cur.seekConfigured && !tbl.withoutRowid && tbl.rows != nil {
 				rid := uint64(cur.seekKey)
 				cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
-				if vals, found := tbl.rows.get(rid); found {
+				if vals, found := tbl.rows.get(rid); found && !cur.seekNone {
 					// normalizeRow, not normalizeRowInto over an arena: that is
 					// materializeRowStore's own fallback for a single row, and
 					// with one row there is nothing for an arena to amortize.
@@ -625,16 +785,10 @@ func (cur *vdbeCursor) rewind() error {
 				return nil
 			}
 			// A column equality (emitWriteIndexSeekHint): the store's equality
-			// index names the candidates, ascending, and nothing else is built.
-			// It refuses a column holding anything but integers and NULLs, and
-			// only an integer probe can use it; either falls to the walk.
-			if cur.idxSeekConfigured && !tbl.withoutRowid && tbl.rows != nil && cur.idxSeekProbe.Typ == Int {
-				hits, ok := tbl.rows.segEqRowids(cur.idxSeekCol, cur.idxSeekProbe.I)
-				fromSeg := ok
-				if !ok {
-					hits, ok = tbl.rows.eqRowids(cur.idxSeekCol, cur.idxSeekProbe.I)
-				}
-				if ok {
+			// indexes name the candidates, ascending, and nothing else is built.
+			// A key no index can answer falls to the next, and none to the walk.
+			if cur.idxSeekConfigured && !tbl.withoutRowid && tbl.rows != nil {
+				if hits, fromSeg, ok := cur.writeSeekRowids(); ok {
 					writeIndexSeeksServed.Add(1)
 					cur.rowids, cur.rows = slices.Grow(cur.rowids[:0], len(hits)), slices.Grow(cur.rows[:0], len(hits))
 					// The stored rows are kept as they are and fixed up as each
@@ -683,6 +837,14 @@ func (cur *vdbeCursor) rewind() error {
 		// the delta's two maps in front. Same precedence as the merged scan,
 		// same normalize, so a seeked row is the row a scan would have found.
 		if cur.seekConfigured && !cur.tbl.withoutRowid {
+			if cur.seekNone {
+				cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
+				cur.segSrc, cur.segCur = nil, nil
+				cur.materialized = true
+				cur.pos = -1
+				cur.rowidNull = false
+				return nil
+			}
 			// Positioned, not built, when the segments are the whole answer:
 			// columns are read one at a time as the program asks for them.
 			// Not marked materialized, so the next rewind seeks again.
@@ -715,14 +877,8 @@ func (cur *vdbeCursor) rewind() error {
 		// own posting list. It only PRUNES -- the keyed conjunct is re-checked
 		// on every row -- so a rowid the list carries that no longer exists is
 		// dropped by the row fetch below.
-		// A VIRTUAL generated column is not stored: a row written before
-		// "ALTER TABLE ADD COLUMN ... AS (expr)" holds NULL in its slot, which
-		// the posting list files as matching nothing, so the seek lost it
-		// (C's CREATE INDEX computes the key from the expression). Scanned.
-		virtualKey := cur.idxSeekCol >= 0 && cur.idxSeekCol < len(cur.tbl.cols) &&
-			cur.tbl.cols[cur.idxSeekCol].IsGenerated() && !cur.tbl.cols[cur.idxSeekCol].GeneratedStored
-		if cur.idxSeekConfigured && !cur.tbl.withoutRowid && !virtualKey {
-			rowids, served := cur.pager.SeekIndexRowidsSegments(cur.tbl.root, cur.idxSeekCol, cur.idxSeekProbe, cur.idxSeekColl)
+		if cur.idxSeekConfigured && !cur.tbl.withoutRowid {
+			rowids, served := cur.idxSeekRowids()
 			if served {
 				segIndexSeeksServed.Add(1)
 				cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
@@ -786,6 +942,11 @@ func (cur *vdbeCursor) rewind() error {
 		seq, errFn := cur.pager.ScanTable(cur.tbl.root)
 		shared := cur.pager.ServesLiveRows(cur.tbl.root)
 		for rowid, vals := range seq {
+			// The rowid range bounds this scan as it does the segment one, the
+			// rows of the log included.
+			if cur.ranged && (int64(rowid) < cur.rowidLo || int64(rowid) > cur.rowidHi) {
+				continue
+			}
 			cur.rowids = append(cur.rowids, rowid)
 			cur.rows = append(cur.rows, cur.normalizeFrom(shared, rowid, vals))
 		}
@@ -1163,7 +1324,7 @@ func (cur *vdbeCursor) materializeRowStore() {
 	n := tbl.rows.len()
 	var rowids []uint64
 	var rows [][]Value
-	if f, st := cur.segFilter, tbl.rows; f != nil && st != nil && st.seg != nil {
+	if f, st := cur.segFilter, tbl.rows; f != nil && st != nil && st.seg != nil && !lowReadsVirtual(tbl.cols, f.low) {
 		// A write scan the filter peephole judged safe to restrict
 		// (segWriteFilterPeephole): only the base rows that can match, and
 		// every row the overlay holds, are decoded. Sized for the overlay, which

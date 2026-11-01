@@ -82,6 +82,10 @@ type Conn struct {
 	// execArgs and queryArgs, which ARE the boundaries.
 	refreshedThisStmt bool
 
+	// contendedUntil: until then, autocommit writes take the write lock before
+	// their first attempt. Set by a retry and by a lock that was waited for.
+	contendedUntil time.Time
+
 	// txSavepoint is the name of the SAVEPOINT that implicitly STARTED the
 	// held transaction, or "" when a BEGIN/BeginTx did. A SAVEPOINT issued in
 	// autocommit starts a transaction in C SQLite, and the RELEASE of that
@@ -269,6 +273,9 @@ type Conn struct {
 	// queryOnly is this connection's "PRAGMA query_only" setting (see
 	// foreignKeys); its setter takes effect inside a transaction.
 	queryOnly bool
+
+	// confined and confinedReadOnly are Confine's; pushed into every session.
+	confined, confinedReadOnly bool
 
 	// maxSize is this connection's "PRAGMA max_size" (maxSizePragma), stamped
 	// on every session of its main database for queryOnly's reason.
@@ -497,21 +504,28 @@ func (c *Conn) prepareInto(query string, st *Stmt) error {
 			}
 		}
 	}
-	info, cached := c.paramInfo[query]
-	var err error
-	if !cached {
-		if info, err = engine.ParseParamInfo(query); err == nil {
-			if c.paramInfo == nil || len(c.paramInfo) >= 256 {
-				c.paramInfo = make(map[string]engine.ParamInfo, 32)
-			}
-			c.paramInfo[query] = info
-		}
-	}
+	info, err := c.paramInfoOf(query)
 	if err != nil {
 		return err
 	}
 	*st = Stmt{conn: c, sqlText: query, info: info, isQuery: isSelectStmt(query)}
 	return nil
+}
+
+// paramInfoOf is engine.ParseParamInfo(query), kept for the connection's last
+// few hundred statement texts: a statement run again unprepared is lexed once.
+func (c *Conn) paramInfoOf(query string) (engine.ParamInfo, error) {
+	if info, ok := c.paramInfo[query]; ok {
+		return info, nil
+	}
+	info, err := engine.ParseParamInfo(query)
+	if err == nil {
+		if c.paramInfo == nil || len(c.paramInfo) >= 256 {
+			c.paramInfo = make(map[string]engine.ParamInfo, 32)
+		}
+		c.paramInfo[query] = info
+	}
+	return info, err
 }
 
 // mayBeScript reports whether query MIGHT hold more than one statement: a ";"
@@ -646,6 +660,9 @@ func (c *Conn) openWriteOrCreatePath(path string) (*engine.DB, error) {
 	db.SetVec1Connection(c.vec1Conns)            // likewise; see Conn.vec1Conns
 	db.SetQueryOnly(c.queryOnly)                 // likewise; see Conn.queryOnly
 	db.SetWriteLock(c.captureLock(db, path))     // see Conn.captureLock
+	if c.confined {
+		db.SetConfined(c.confinedReadOnly)
+	}
 	if path == c.path {
 		db.SetMaxSize(c.maxSize) // see Conn.maxSizePragma; main only
 	}
@@ -1088,7 +1105,37 @@ func (c *Conn) execArgsBody(sqlText string, args []engine.Value) (driver.Result,
 	// (sessionDB), so the retry runs against the other writer's committed
 	// state, exactly like real
 	// SQLite's busy handler re-running the statement.
+	//
+	// A retry holds the write lock from before that revalidation to its commit,
+	// as BEGIN IMMEDIATE does: run unlocked beside a connection committing back
+	// to back, every attempt lost until the busy timeout. While the file stays
+	// contended the first attempt takes the lock too, since a lost attempt
+	// leaves its rows in the session, which must then rebuild (Poison).
+	attempt := 0
+	locked := targetPath == c.path && c.plainDML(sqlText) &&
+		(time.Now().Before(c.contendedUntil) || c.hooks != nil && c.hooks.Contended != nil && c.hooks.Contended())
 	err := busyRetry(c.pragmaState.BusyTimeout(), func() error {
+		if attempt++; (attempt > 1 || locked) && targetPath == c.path {
+			nw, err := c.session()
+			if err != nil {
+				return err
+			}
+			start := time.Now()
+			if c.hooks != nil && c.hooks.LockWait != nil {
+				c.hooks.LockWait(true)
+			}
+			err = nw.BeginWriteTxn(false)
+			if c.hooks != nil && c.hooks.LockWait != nil {
+				c.hooks.LockWait(false)
+			}
+			if err != nil {
+				return err
+			}
+			defer nw.EndWriteTxn()
+			if attempt > 1 || time.Since(start) > contendedWait {
+				c.contendedUntil = time.Now().Add(contendedFor)
+			}
+		}
 		db, err := c.openWriteOrCreatePath(targetPath)
 		if err != nil {
 			return err
@@ -1473,8 +1520,22 @@ func (c *Conn) queryOnlyPragma(sqlText string) (handled bool, err error) {
 		return true, nil // getter: rows come from queryOnlyPragmaRows
 	}
 	b := engine.PragmaBooleanValue(stmt.ValueText)
+	if c.confinedReadOnly && !b {
+		return true, engine.ErrConfined
+	}
 	c.queryOnly = b
 	return true, nil
+}
+
+// Confine fits this connection to serve remote clients: ATTACH and VACUUM
+// INTO, which name files on the server, are refused, and with readOnly so is
+// every write. Call it from a connection hook (RegisterConnectionHook) before
+// the connection is used.
+func (c *Conn) Confine(readOnly bool) {
+	c.confined, c.confinedReadOnly = true, readOnly
+	if readOnly {
+		c.queryOnly = true
+	}
 }
 
 // queryOnlyPragmaRows is the getter's single row, for the Query path.
@@ -3061,6 +3122,14 @@ func (c *Conn) dropTempObjects() {
 	c.temp = nil
 }
 
+// contendedFor is how long autocommit writes keep taking the lock first after
+// contention; contendedWait is how long taking it must last to count as
+// contended, where a free lock takes microseconds.
+const (
+	contendedFor  = time.Second
+	contendedWait = 200 * time.Microsecond
+)
+
 // BusyRetryAttemptHookForTest, when non-nil, is called once per retry busyRetry
 // performs (fn reported engine.ErrBusy and is about to be re-run in a fresh
 // session). busyRetry hides contention from the caller, so a harness counting
@@ -3150,6 +3219,10 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 	if want := st.NumInput(); len(args) != want {
 		return nil, fmt.Errorf("sql: expected %d arguments, got %d", want, len(args))
 	}
+	// A statement made for one call has no arena to reuse: size it to the
+	// arguments, and the result slab to one result.
+	st.bytesArena = argArena(args)
+	st.results = make([]execResult, 0, 1)
 	return st.ExecContext(ctx, args)
 }
 

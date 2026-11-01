@@ -1933,6 +1933,9 @@ func compileScanWindow(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 	recReg := c.allocRec()
 
 	jplan := joinPushdownPlan(srcs, scopes, stmt.Where)
+	if len(jplan.buckets) == 1 {
+		jplan.buckets[0] = consumedFirst(c, srcs, jplan.buckets[0])
+	}
 	annotateJoinSeeks(c, srcs, jplan)
 	deferredWhere := andConjuncts(jplan.deferred)
 

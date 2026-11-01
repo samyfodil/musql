@@ -13,6 +13,7 @@ type config struct {
 	noJIT    bool
 	noFusion bool
 	workers  int
+	onCommit func(CommitInfo)
 }
 
 // WithWorkers lets a columnar scan or aggregate split its segments across n
@@ -31,6 +32,12 @@ func WithoutJIT() Option { return func(c *config) { c.noJIT = true } }
 // existed. For comparing the two; the answers are the same either way.
 func WithoutFusion() Option { return func(c *config) { c.noFusion = true } }
 
+// WithCommitHook calls fn after every commit that changed a database file,
+// under its write lock once the commit is synced: calls for a file arrive in
+// commit order, and the files hold still until fn returns. fn must not open
+// the same database, whose locks would wait on the commit calling it.
+func WithCommitHook(fn func(CommitInfo)) Option { return func(c *config) { c.onCommit = fn } }
+
 // Configure sets process-wide engine behavior; options not given take their
 // defaults (the JIT is on where the platform has an emitter, amd64 and arm64).
 // The JIT's kernel cache is per process, so these settings are too. Call it
@@ -48,4 +55,5 @@ func Configure(opts ...Option) {
 	}
 	vmJITEnabled = jitEnabled
 	jit.SetFusion(!c.noFusion)
+	commitHook = c.onCommit
 }

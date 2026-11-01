@@ -81,6 +81,18 @@ var txBulkMaxBytes = 1 << 30
 // SetTxBulkMaxBytesForTest sets txBulkMaxBytes and returns the old value.
 func SetTxBulkMaxBytesForTest(n int) int { old := txBulkMaxBytes; txBulkMaxBytes = n; return old }
 
+// txLoadAfterWritesForTest arms a transaction's load on a store its own writes
+// emptied, so a test can reach the commit that must then rewrite the file.
+var txLoadAfterWritesForTest bool
+
+// SetTxLoadAfterWritesForTest sets txLoadAfterWritesForTest and returns the
+// old value.
+func SetTxLoadAfterWritesForTest(on bool) bool {
+	old := txLoadAfterWritesForTest
+	txLoadAfterWritesForTest = on
+	return old
+}
+
 // txAppendArmable reports whether plan may write through a load armed inside a
 // transaction: an INSERT ... SELECT the autocommit load takes, or an INSERT ...
 // VALUES that does nothing but build and store its rows.
@@ -177,6 +189,11 @@ func (m *vdbe) bulkLoadInTx(plan *insertPlan) *segBulkLoad {
 			return nil
 		}
 		if !tbl.rows.isEmpty() {
+			return nil
+		}
+		// Emptied by this transaction's own writes: the inserts join them in the
+		// log, since a load would make the commit rewrite the whole file.
+		if tbl.rowsWrittenSinceCommit && !txLoadAfterWritesForTest {
 			return nil
 		}
 		bl = &segBulkLoad{inTx: true, db: db}
@@ -371,31 +388,40 @@ func (db *DB) drainTxBulks(keep *tableMeta) {
 		return
 	}
 	for _, t := range slices.Clone(db.txBulks) {
-		if t == keep {
-			continue
+		if t != keep {
+			db.drainTxBulk(t)
 		}
-		bl := t.bulk
-		db.dropTxBulk(t)
-		if bl == nil {
-			continue
-		}
-		wc := db.activeWC
-		mark := bl.rows
-		if wc != nil && wc.bulkTbl == t {
-			mark = wc.bulkMark
-			wc.bulkTbl = nil
-		}
-		k := 0
-		bl.eachRow(func(rid uint64, vals []Value) bool {
-			t.putRow(rid, vals)
-			db.noteRowChange(t, RowInsert, rid, nil, vals)
-			if k >= mark {
-				wc.undoDrop(t, rid)
-			}
-			k++
-			return true
-		})
 	}
+}
+
+// drainTxBulk moves t's transaction load into its row store, as drainTxBulks
+// does each one.
+func (db *DB) drainTxBulk(t *tableMeta) {
+	bl := t.bulk
+	db.dropTxBulk(t)
+	if bl == nil {
+		return
+	}
+	// The table arms again only after as many inserts as armed it; a
+	// transaction reading it between inserts otherwise armed and drained a load
+	// at every insert.
+	delete(db.appendSeen, t)
+	wc := db.activeWC
+	mark := bl.rows
+	if wc != nil && wc.bulkTbl == t {
+		mark = wc.bulkMark
+		wc.bulkTbl = nil
+	}
+	k := 0
+	bl.eachRow(func(rid uint64, vals []Value) bool {
+		t.putRow(rid, vals)
+		db.noteRowChange(t, RowInsert, rid, nil, vals)
+		if k >= mark {
+			wc.undoDrop(t, rid)
+		}
+		k++
+		return true
+	})
 }
 
 // bulkStore takes one row into the direct-path load, or reports false when the

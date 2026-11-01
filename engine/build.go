@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"iter"
 	"os"
 	"path/filepath"
 )
@@ -219,7 +220,11 @@ type IntegrityCheckOptions struct {
 	// holds none of. The check then holds them against the rows, as C's holds
 	// its index b-trees ("row %d missing from index %s", "wrong # of entries in
 	// index %s"). Without it an index is derived from the rows and always agrees.
-	StoredIndexEntries func(index string) (entries [][]Value, ok bool)
+	//
+	// It may be asked for an index more than once; each sequence is read at
+	// most once, and an entry is not kept past its yield. err reports a copy
+	// that could not be read, which leaves the index derived from the rows.
+	StoredIndexEntries func(index string) (entries iter.Seq[[]Value], err func() error, ok bool)
 }
 
 // IntegrityCheck runs PRAGMA integrity_check over the database at path and

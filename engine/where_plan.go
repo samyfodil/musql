@@ -199,9 +199,26 @@ type whereLoopCache struct {
 // inside one, needs to know about the loop that won beyond its order: whether
 // it is an AUTOMATIC index (WHERE_AUTO_INDEX), and whether it returns at most
 // one row (WHERE_ONEROW, which makes an UPDATE ONEPASS_SINGLE rather than
-// ONEPASS_MULTI, update.c:733/where.c's eOnePass choice).
+// ONEPASS_MULTI, update.c:733/where.c's eOnePass choice). explain is the
+// loop's EXPLAIN QUERY PLAN line.
 type wherePlanWinner struct {
 	auto, oneRow bool
+	explain      wherePlanExplain
+
+	// access is the loop's access path (seek_raise.go).
+	access wherePlanAccess
+}
+
+// wherePlanAccess is a winning loop's access path: eq are the columns whose
+// equality it consumes (xnRowid for the rowid), rangeCol the column a range
+// bound constrains.
+type wherePlanAccess struct {
+	known    bool
+	auto     bool
+	index    bool
+	eq       []int
+	rangeCol int
+	hasRange bool
 }
 
 // wherePlanOrder returns the FROM-item order SQLite binds its nested loops in,
@@ -512,6 +529,10 @@ type autoIndexKey struct {
 	// groupsArriveOutOfKeyOrder.
 	nEq          int
 	groupsSorted bool
+
+	// autoEq is how many leading key columns an automatic index's equalities
+	// constrain (constructAutomaticIndex's nKeyCol).
+	autoEq int
 }
 
 // wherePlanAutoIndexKey ports constructAutomaticIndex's key construction
@@ -564,6 +585,7 @@ func wherePlanAutoIndexKey(in wherePlanInput, order []int, level int) *autoIndex
 		// makes it unreachable. Answer "no key" rather than assume.
 		return nil
 	}
+	k.autoEq = len(k.cols)
 
 	// extraCols. IsView's ALLBITS arm and the WITHOUT ROWID PRIMARY KEY
 	// force-add are both unreachable here (the gate declines a view, a derived
@@ -887,6 +909,7 @@ func wherePlanTermsFromConj(jts []joinedTable, scopes []tableScope, conj []where
 			}
 			if o != nil {
 				lFirst, rFirst = o.l[0], o.r[0]
+				t.vector = true
 			}
 			var prereqLeft whereMask
 			for _, l := range lhs {
@@ -1400,15 +1423,20 @@ func wherePlanSubqueryUsage(jts []joinedTable, scopes []tableScope, e Expr) (whe
 	if len(scopes) == 0 || scopes[0].planPager == nil {
 		return 0, false
 	}
-	p := scopes[0].planPager
 	var m whereMask
-	ok := true
-	mark := func(ce ColumnExpr) bool {
+	ok := wherePlanSubqueryNames(scopes[0].planPager, e, func(ce ColumnExpr) bool {
 		if tab, _, found := wherePlanColumnRef(jts, scopes, ce); found && tab < 63 {
 			m |= whereMask(1) << uint(tab)
 		}
 		return true
-	}
+	})
+	return m, ok
+}
+
+// wherePlanSubqueryNames calls mark for every name in a subquery of e that
+// resolves outside it; false when a name cannot be resolved exactly.
+func wherePlanSubqueryNames(p *ReadOnlyPager, e Expr, mark func(ColumnExpr) bool) bool {
+	ok := true
 	// The CTEs in scope where e is compiled: a subquery naming one reads its
 	// body's columns, as resolveFrom would bind it.
 	var cteDefs map[string]*CTEDef
@@ -1432,7 +1460,7 @@ func wherePlanSubqueryUsage(jts []joinedTable, scopes []tableScope, e Expr) (whe
 		return true
 	}
 	wherePlanWalkColumnsSub(e, func(ColumnExpr) bool { return true }, sub)
-	return m, ok
+	return ok
 }
 
 // whereLikeAnalyzable is whereTermAnalyzable for a LIKE/GLOB, in either

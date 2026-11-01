@@ -258,16 +258,15 @@ func compileScanAggregate(c *compiler, stmt *SelectStmt, srcs []joinSource, scop
 	// and the order is unchanged: a rowid key pins one row, and an equality on an
 	// index's leading column visits rows in ascending rowid, their full-scan order.
 	// Order matters here for group_concat and the min()/max() anchor.
-	if idx, key, ok := detectRowidSeekKey(c, srcs, stmt.Where); ok {
-		srcs[idx].seekKeyExpr = key
-	} else if idx, iplan, ok := detectIndexSeekKey(c, srcs, stmt.Where); ok {
-		srcs[idx].idxSeek = iplan
-	}
+	planConstantKeySeeks(c, srcs, stmt.Where, false)
 
 	// Predicate pushdown: see compileScanPlain (vdbe_scan.go). buckets prune at
 	// their join level; this body tests only the deferred residue. (The local
 	// `plan` here is the aggregate plan, so the pushdown plan is jplan.)
 	jplan := joinPushdownPlan(srcs, scopes, stmt.Where)
+	if len(jplan.buckets) == 1 {
+		jplan.buckets[0] = consumedFirst(c, srcs, jplan.buckets[0])
+	}
 	// Index-driven inner-side seeks (annotateJoinSeeks, vdbe_join_seek.go): the
 	// seek preserves ascending-rowid (full-scan) inner order, so an
 	// order-sensitive aggregate (e.g. group_concat) sees the same row sequence.
@@ -2103,6 +2102,9 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// their join level; this body tests only the deferred residue. (`plan` is
 	// the aggregate plan here, so the pushdown plan is jplan.)
 	jplan := joinPushdownPlan(srcs, scopes, stmt.Where)
+	if len(jplan.buckets) == 1 {
+		jplan.buckets[0] = consumedFirst(c, srcs, jplan.buckets[0])
+	}
 	// Index-driven inner-side seeks (annotateJoinSeeks, vdbe_join_seek.go): order-
 	// preserving, so GROUP BY grouping and order-sensitive aggregates are
 	// unaffected.
@@ -2520,6 +2522,9 @@ func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp
 	// Predicate pushdown / index-driven seeks: identical to compileScanGroupBy's
 	// own setup (see there for the doc comment on both).
 	jplan := joinPushdownPlan(srcs, plan.scopes, stmt.Where)
+	if len(jplan.buckets) == 1 {
+		jplan.buckets[0] = consumedFirst(c, srcs, jplan.buckets[0])
+	}
 	annotateJoinSeeks(c, srcs, jplan)
 	deferredWhere := andConjuncts(jplan.deferred)
 

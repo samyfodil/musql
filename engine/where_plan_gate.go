@@ -572,9 +572,21 @@ func whereReversedScanKey(k *autoIndexKey) *autoIndexKey {
 //   - a WHERE conjunct wherePlanTermsFrom cannot use;
 //   - an index not rebuildable exactly (wherePlanIndexList).
 func markWherePlanIndexEligibility(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt *SelectStmt) {
+	// The winning loop's EXPLAIN line rides on the source's seek; a write
+	// compile brings its own winner (compiler.planWinner).
+	var won wherePlanWinner
+	if c.planWinner == nil {
+		c.planWinner = &won
+		defer func() { c.planWinner = nil }()
+	}
 	key, nRow, ok := wherePlanSingleTableIndexOrder(p, c, srcs, stmt)
 	if !ok {
 		return
+	}
+	srcs[0].planAccess = c.planWinner.access
+	srcs[0].planExplain = won.explain
+	if won.explain.verb != "" {
+		srcs[0].planExplain.name = explainItemName(stmt.From[0])
 	}
 	// Stashed even when key == nil ("this level is the plain ascending-rowid
 	// scan, which is the order this engine already produces" -- see this
@@ -815,7 +827,9 @@ func wherePlanSeedInvariant(in wherePlanInput, solve func(wherePlanInput) (*auto
 			first, firstWin = k, w
 			continue
 		}
-		if w != firstWin || !sameAutoIndexKey(k, first) {
+		// The EXPLAIN line is not asked to agree: it is printed for a top-level
+		// statement only, which never comes here.
+		if w.auto != firstWin.auto || w.oneRow != firstWin.oneRow || !sameAutoIndexKey(k, first) {
 			return nil, 0, false
 		}
 	}
@@ -900,6 +914,8 @@ func wherePlanSingleTableSolve(in wherePlanInput, stmt *SelectStmt, idxs []where
 		if in.winner != nil && len(res.loops) == 1 {
 			w := &fb.loops[res.loops[0]]
 			in.winner.auto, in.winner.oneRow = w.autoIdx, w.oneRow
+			in.winner.explain = fb.explainLoop(w)
+			in.winner.access = fb.accessOf(w)
 		}
 		if len(res.loops) == 1 && fb.loops[res.loops[0]].autoIdx {
 			// Not the rowid scan after all: see wherePlanSingleIndexKey's
@@ -907,6 +923,9 @@ func wherePlanSingleTableSolve(in wherePlanInput, stmt *SelectStmt, idxs []where
 			k := wherePlanAutoIndexKey(in, []int{0}, 0)
 			if k == nil {
 				return nil, 0, false
+			}
+			if in.winner != nil {
+				in.winner.access.eq = append([]int(nil), k.cols[:k.autoEq]...)
 			}
 			if reverseOrder && in.sort.nOrderBy() == 0 {
 				k = whereReversedScanKey(k)

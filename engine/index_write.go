@@ -582,6 +582,9 @@ func (db *DB) CreateIndex(sqlText string) error {
 		unique:       stmt.unique,
 		sql:          normalizeSchemaSQL("INDEX", sqlText),
 	}
+	if err := indexGenErr(tbl, idxm); err != nil {
+		return err
+	}
 	if idxm.unique {
 		if err := validateUniqueIndex(tbl, idxm, db.encoding()); err != nil {
 			return fmt.Errorf("engine: CREATE INDEX %s: %w", stmt.name, err)
@@ -617,6 +620,9 @@ func (db *DB) createExprIndex(sqlText string, stmt *parsedCreateIndex, tbl *tabl
 			return err
 		}
 		return fmt.Errorf("engine: CREATE INDEX %s: %w", stmt.name, err)
+	}
+	if err := indexGenErr(tbl, idxm); err != nil {
+		return err
 	}
 	if idxm.vec != nil {
 		// libSQL fills a new vector index from the table's rows, each one
@@ -857,8 +863,11 @@ func indexExprsEvalErr(tbl *tableMeta, idx *indexMeta, whereProg *selfRowExpr, k
 			return nil
 		}
 	}
-	for _, kp := range keyProgs {
+	for i, kp := range keyProgs {
 		if kp == nil {
+			if ci := idx.keys[i].colIdx; ci >= 0 && ci < len(vals) && vals[ci].Typ == valueGenErr {
+				return genErrOf(vals[ci])
+			}
 			continue
 		}
 		if _, err := kp.eval(ctx); err != nil {
@@ -866,6 +875,35 @@ func indexExprsEvalErr(tbl *tableMeta, idx *indexMeta, whereProg *selfRowExpr, k
 		}
 	}
 	return nil
+}
+
+// indexGenErr is the error CREATE INDEX raises over tbl's rows: C computes
+// each row's key (sqlite3RefillIndex), so a raising VIRTUAL key column fails
+// it at the first such row in rowid order.
+func indexGenErr(tbl *tableMeta, idx *indexMeta) error {
+	if !hasVirtualCols(tbl.cols) {
+		return nil
+	}
+	var whereProg *selfRowExpr
+	var keyProgs []*selfRowExpr
+	if idx.exprOrPartial {
+		whereProg, keyProgs = compileIndexExprs(tbl, idx)
+	}
+	var err error
+	tbl.rows.eachSortedUntil(func(rowid uint64, vals []Value) bool {
+		if idx.exprOrPartial {
+			err = indexExprsEvalErr(tbl, idx, whereProg, keyProgs, rowid, vals)
+			return err == nil
+		}
+		for _, ci := range idx.colIdx {
+			if ci >= 0 && ci < len(vals) && vals[ci].Typ == valueGenErr {
+				err = genErrOf(vals[ci])
+				return false
+			}
+		}
+		return true
+	})
+	return err
 }
 
 // indexOfColumn returns the index of the column named cname (case-insensitive)

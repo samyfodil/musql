@@ -157,7 +157,7 @@ type Session struct {
 // rows: the caller is told the statement failed, so those rows must not be
 // committed by the NEXT statement -- this project's "halted statement still
 // publishes" class. See the driver's commitHeldSession, which found it as a lost
-// row under N4.
+// row under N4. Until the rebuild, Commit refuses and Close drops them.
 func (n *Session) Poison() { n.poisoned = true }
 
 // OpenWrite opens a segment file for writing.
@@ -172,6 +172,14 @@ func OpenWrite(segPath string) (*Session, error) {
 // OpenWriteWait is OpenWrite waiting at most wait for another connection's lock
 // on the file -- the opening connection's busy_timeout.
 func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
+	n, _, err := openWrite(segPath, wait, nil, nil)
+	return n, err
+}
+
+// openWrite is OpenWriteWait catching prev's delta up to the file where it can
+// (Session.caughtUp); caught reports that it did. If the open then fails,
+// prev's state is no longer its view, so prev is poisoned.
+func openWrite(segPath string, wait time.Duration, prev *Session, before func([]deltaBatch)) (*Session, bool, error) {
 	// ONE READ, UNDER ONE SHARED LOCK. The rows, the file's base identity and the
 	// STATE those rows are at must all come from the same look at the pair, and
 	// getting that wrong was a lost-row bug, not a tidiness point: this opened the
@@ -189,8 +197,15 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 	var rootEdits []ConvertedRootEdit
 	var stamp [2]fileStamp
 	var deltaEnd int64
+	var appendAt SegDeltaAppendState
 	var change *changeWord
-	changeable := false
+	changeable, caught := false, false
+	fail := func(err error) (*Session, bool, error) {
+		if caught {
+			prev.poisoned = true
+		}
+		return nil, false, err
+	}
 	if lerr := withSegmentReadLockWait(segPath, wait, func() error {
 		// The pair's stamp, taken under the same lock as the read and before it,
 		// so it describes no newer a file than the rows: the first statement's
@@ -199,9 +214,16 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 		// time -- most of a cold first read, and with twelve connections opening
 		// at once, a queue on the process's mmap lock.
 		stamp = [2]fileStamp{stampOf(segPath), stampOf(segDeltaPath(segPath))}
-		f, st, rerr := readSegmentPairUnlocked(segPath)
-		if rerr != nil {
-			return rerr
+		var f *SegmentFile
+		var st *segDeltaState
+		if prev != nil {
+			f, st, caught = prev.caughtUp(segPath, before)
+		}
+		if !caught {
+			var rerr error
+			if f, st, rerr = readSegmentPairUnlocked(segPath); rerr != nil {
+				return rerr
+			}
 		}
 		// The change word, mapped under the same lock: trusted only on a file
 		// this format wrote, since an older build may write an older file
@@ -215,6 +237,11 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 		endCtr, endPages = st.endCtr, st.endPages // the replay's own result, not a second read
 		deltaEnd = st.bytes
 		stamp[1].at = deltaEnd
+		// The next append starts where the replay ended; carried, the commit
+		// checks it rather than replaying the delta (appendSegmentDeltaAt).
+		if st.version != 0 {
+			appendAt = SegDeltaAppendState{offset: st.bytes, cksum: st.cksum, version: st.version, known: true}
+		}
 		p, perr := buildSegmentPager(segPath, f, st) // takes ownership of f
 		if perr != nil {
 			return perr
@@ -222,14 +249,14 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 		src = p
 		return nil
 	}); lerr != nil {
-		return nil, lerr
+		return fail(lerr)
 	}
 
 	schema, scerr := src.Schema()
 	if scerr != nil {
 		src.Close()
 		change.close()
-		return nil, scerr
+		return fail(scerr)
 	}
 	db := &DB{
 		path:              segPath,
@@ -251,7 +278,7 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 	if lerr := db.loadSchemaObjects(src, schema, "OpenWrite", false); lerr != nil {
 		src.Close()
 		change.close()
-		return nil, lerr
+		return fail(lerr)
 	}
 	// Opening the schema loads its statistics (sqlite3InitOne ->
 	// sqlite3AnalysisLoad): what sqlite_stat1 holds NOW is what plans use until
@@ -265,6 +292,7 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 		loadedCtr: endCtr, loadedPages: endPages, // the state just read
 		seenStat:   stamp,
 		deltaEnd:   deltaEnd,
+		appendAt:   appendAt,
 		change:     change,
 		changeable: changeable,
 
@@ -274,11 +302,11 @@ func OpenWriteWait(segPath string, wait time.Duration) (*Session, error) {
 		if rerr := db.replayRootEdits(rootEdits); rerr != nil {
 			src.Close()
 			change.close()
-			return nil, rerr
+			return fail(rerr)
 		}
 	}
 	n.catalogAtLastWrite = n.catalogFingerprint()
-	return n, nil
+	return n, caught, nil
 }
 
 // PragmaHasNoMeaningHere refuses a pragma naming a SQLite-format mechanism this
@@ -456,6 +484,9 @@ func (n *Session) Commit() (bool, error) {
 	if n.closed {
 		return false, fmt.Errorf("engine: write session is closed")
 	}
+	if n.poisoned {
+		return false, fmt.Errorf("engine: a failed commit left this session's rows; it must be rebuilt from the file first")
+	}
 	var wrote bool
 	// ALREADY HELD? Then commit under it rather than taking a second one.
 	// withSegmentWriteLock's lock is an OFD lock, which conflicts across
@@ -473,6 +504,9 @@ func (n *Session) Commit() (bool, error) {
 		if cerr == nil && wrote {
 			n.compactIfWorthIt()
 			n.mapChangeWordLate()
+			if commitHook != nil && !n.DB.inMemory {
+				commitHook(CommitInfo{Path: n.segPath, Counter: n.endCtr, DeltaEnd: n.deltaEnd})
+			}
 		}
 		return cerr
 	}
@@ -620,6 +654,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 			return false, rerr
 		}
 	}
+	n.drainSmallLoads(lockedStamp)
 	changes := n.takeChangeLog()
 	// Handed back for the next statement once this commit is done with it, so
 	// the log does not regrow from nothing every statement. Not under full
@@ -656,7 +691,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 		if n.loadedCtr != n.endCtr || n.loadedPages != n.endPages {
 			return false, fmt.Errorf("%w: another connection committed while this transaction was open", ErrBusy)
 		}
-		if err := n.rewriteFile(); err != nil {
+		if err := n.rewriteFileKeeping(true); err != nil {
 			return false, err
 		}
 		n.clearWrittenSinceCommit()
@@ -712,7 +747,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 	// only writes the rows twice -- once into the delta, once more into the
 	// file the compaction then builds. Rewrite now, once.
 	if !compactionOffForTest && compactionDueAfter(lockedStamp[0], n.deltaLogicalSize(lockedStamp[1]), recs) {
-		if err := n.rewriteFile(); err != nil {
+		if err := n.rewriteFileKeeping(true); err != nil {
 			return false, err
 		}
 		n.clearWrittenSinceCommit()
@@ -720,7 +755,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 		return true, nil
 	}
 	if n.maxSize > 0 && n.deltaAppendExceeds(recs) {
-		if err := n.rewriteFile(); err != nil {
+		if err := n.rewriteFileKeeping(true); err != nil {
 			return false, err
 		}
 		n.clearWrittenSinceCommit()
@@ -830,6 +865,40 @@ func (n *Session) extendCommittedColumns(batch []byte, recs []SegDeltaRecord) bo
 	return true
 }
 
+// drainSmallLoads moves a load into an empty table to the change log when the
+// delta can take its rows, so they commit as a delta batch rather than by a
+// whole-file rewrite (one row into an empty table rewrote a gigabyte). A load
+// that would take the delta past compaction keeps the rewrite.
+func (n *Session) drainSmallLoads(stamp [2]fileStamp) {
+	db := n.DB
+	if compactionOffForTest || !stamp[0].there {
+		return
+	}
+	room := compactionThreshold(stamp[0].size) - n.deltaLogicalSize(stamp[1]) - int64(db.changeLog.len())*segDeltaMinRecord
+	// Logging a row costs far more per byte than the rewrite's copy (a million
+	// rows on a 1 GiB file: 4.4 s drained, 3.1 s rewritten), so only a load
+	// small beside the file drains.
+	room = min(room, compactionThreshold(stamp[0].size)/8)
+	for _, t := range db.tables {
+		bl := t.bulk
+		if t.isTemp || bl == nil || bl.stream != nil || bl.rows == 0 {
+			continue
+		}
+		if err := bl.cut.wait(); err != nil {
+			continue
+		}
+		need := int64(bl.rows)*(segDeltaMinRecord+4) + bl.cut.bytes
+		for _, raw := range bl.segs {
+			need += int64(len(raw))
+		}
+		if need > room {
+			continue
+		}
+		room -= need
+		db.drainTxBulk(t)
+	}
+}
+
 // deltaAppendExceeds reports whether appending recs could leave main's segment
 // file and delta over maxSize. It over-counts -- a torn tail the append would
 // overwrite, the wider length prefix -- and that is safe: the cost of a false
@@ -874,7 +943,10 @@ func (db *DB) mutatedOutsideChangeLog(changes *changeLog) bool {
 		if t.isTemp || !t.rowsWrittenSinceCommit || t.rows == nil || t.hasAppendLoad() {
 			continue
 		}
-		if !described[strings.ToLower(t.name)] {
+		// A direct-path load's rows are never in the log: a transaction that
+		// emptied the table and inserted again lost them when only its kills
+		// were appended.
+		if t.bulk != nil || !described[strings.ToLower(t.name)] {
 			return true
 		}
 	}
@@ -907,15 +979,21 @@ func (n *Session) Close() error {
 	// main.c:1398; sqlite3RollbackAll; TestSavepointClosePersistence). Only
 	// autocommit work, which an engine-direct session batches until here, is
 	// committed.
+	//
+	// A poisoned session holds a failed commit's rows and commits nothing.
 	var err error
 	if n.InTransaction() {
 		_, _, err = n.DB.ExecArgs("ROLLBACK", nil)
 	}
-	if aerr := n.commitAttachedWrites(); aerr != nil && err == nil {
-		err = aerr
-	}
-	if _, cerr := n.Commit(); cerr != nil && err == nil {
-		err = cerr
+	if n.poisoned {
+		n.discardAttachedWrites()
+	} else {
+		if aerr := n.commitAttachedWrites(); aerr != nil && err == nil {
+			err = aerr
+		}
+		if _, cerr := n.Commit(); cerr != nil && err == nil {
+			err = cerr
+		}
 	}
 	n.closeAttached()
 	n.EndWriteTxn()
@@ -1676,7 +1754,7 @@ func (n *Session) compactIfWorthIt() {
 	// compaction moves, and reopening would throw away a view that is still
 	// correct -- compaction preserves content, only the bytes moved.
 	n.seenStat = n.pairStamp()
-	n.rebase(openSegmentsUnlocked) // the commit's write lock is still held
+	n.rebase(openSegmentsUnlocked, true) // the commit's write lock is still held
 }
 
 // ConnState is sqlite3_changes / sqlite3_total_changes /
@@ -1863,9 +1941,13 @@ func (n *Session) RefreshIfStale() (bool, error) {
 	if n.poisoned {
 		// Ahead of BOTH guards below, deliberately: a poisoned session's pending
 		// changes are exactly what must NOT survive, and a transaction it may still
-		// think is open ended when its commit ran.
+		// think is open ended when its commit ran. It stays poisoned until a
+		// rebuild succeeds.
+		if err := n.reopen(true); err != nil {
+			return true, err
+		}
 		n.poisoned = false
-		return true, n.reopen(true)
+		return true, nil
 	}
 	if n.InTransaction() {
 		return false, nil // isolation: a transaction keeps the state it began with
@@ -1897,8 +1979,14 @@ func (n *Session) RefreshIfStale() (bool, error) {
 		n.noteChangeSeen(word, wordOK)
 		return false, nil // nothing has touched either file
 	}
+	// deltaMoved answers from the bytes past this session's view; only
+	// otherwise is the pair's state read.
 	var ctr, pages uint32
+	moved, known := false, false
 	err := withSegmentReadLockWait(n.segPath, n.busyTimeout(), func() error {
+		if moved, known = n.deltaMoved(now); known {
+			return nil
+		}
 		var serr error
 		ctr, pages, serr = segmentFileStateUnlocked(n.segPath)
 		return serr
@@ -1906,7 +1994,7 @@ func (n *Session) RefreshIfStale() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if ctr == n.loadedCtr && pages == n.loadedPages {
+	if known && !moved || !known && ctr == n.loadedCtr && pages == n.loadedPages {
 		// Touched but not MOVED -- our own append, or a stat granularity artefact.
 		// Record the stamp so the cheap check answers next time.
 		n.seenStat = now
@@ -1954,6 +2042,7 @@ func (db *DB) adoptConnSettingsFrom(old *DB) {
 	db.rtreeConns = old.rtreeConns
 	db.vec1Conns = old.vec1Conns
 	db.queryOnly = old.queryOnly
+	db.confined, db.queryOnlyLocked = old.confined, old.queryOnlyLocked
 	db.writeLock = old.writeLock
 	db.maxSize = old.maxSize
 	db.pragmaState = old.pragmaState
@@ -1968,29 +2057,46 @@ func (db *DB) adoptConnSettingsFrom(old *DB) {
 	db.inMemory = old.inMemory
 }
 
-// reopen rebuilds the session's read side, catalog and row stores from the file
-// as it stands now, keeping this Session's identity so a caller's handle stays
-// valid.
-//
-// afterFailedCommit rebuilds the TEMP database from its file too, rather than
-// carrying the connection's temp objects over as they stand: a commit that
-// failed ended the transaction in memory, temp's half included, and the file --
-// which only a successful commit writes (commitLocked) -- is the state from
-// before it.
-// ReopenedHookForTest runs between a reopen's read of the file and its stamp,
-// where another connection's commit is the race the stamp order closes.
+// ReopenedHookForTest runs right after a reopen's read of the file, where
+// another connection's commit is the race the stamp order closes.
 var ReopenedHookForTest func()
 
+// reopen rebuilds the session's read side, catalog and row stores from the file
+// as it stands now, keeping this Session's identity so a caller's handle stays
+// valid. afterFailedCommit rebuilds the TEMP database from its file too: the
+// failed commit ended temp's half of the transaction in memory as well.
 func (n *Session) reopen(afterFailedCommit bool) error {
 	// THE STAMP BEFORE THE STATE. The cheap freshness check trusts seenStat to
 	// describe a file no newer than what this session loaded; stamped AFTER the
 	// open, a commit landing in between was in the stamp and not in the rows,
 	// and the session served the old state from then on -- every later check
-	// saw "nothing touched" (RefreshIfStale's own stamp is taken first too).
-	stamp := n.pairStamp()
-	fresh, err := OpenWriteWait(n.segPath, n.busyTimeout())
+	// saw "nothing touched". The open's own stamp is taken under its lock,
+	// before its read, at the delta end that read reached.
+	//
+	// The open catches this session's delta up where it can (caughtUp) and
+	// moves the store indexes over (carryOut, carryIn), so a reopen costs what
+	// the file gained. Not after a failed commit: the indexes hold its rows,
+	// and a row it put and dropped again leaves no trace to undo.
+	var carried []carriedTable
+	var tail []deltaBatch
+	viewed := false
+	fresh, caught, err := openWrite(n.segPath, n.busyTimeout(), n, func(batches []deltaBatch) {
+		var rows map[int][]int64
+		var segs map[int]bool
+		if tail, rows, segs, viewed = n.caughtUpTouched(batches); viewed && !afterFailedCommit {
+			carried = n.carryOut(rows, segs)
+		}
+	})
 	if err != nil {
 		return err
+	}
+	if caught && viewed {
+		n.carryColumns(fresh, tail)
+	}
+	if !caught && !afterFailedCommit {
+		if rows, segs, ok := n.reopenedTouched(fresh); ok {
+			carried = n.carryOut(rows, segs)
+		}
 	}
 	if ReopenedHookForTest != nil {
 		ReopenedHookForTest()
@@ -2016,6 +2122,10 @@ func (n *Session) reopen(afterFailedCommit bool) error {
 	if fresh.schemaCookie == n.schemaCookie && n.stat1Loaded {
 		fresh.stat1 = n.stat1
 	}
+	fresh.carryIn(carried)
+	// ...and the compiled reads, which bind no rows; the write programs hold
+	// the old session's *tableMeta and stay behind.
+	fresh.plans = n.plans
 
 	old := n.src
 	n.DB, n.src = fresh.DB, fresh.src
@@ -2024,13 +2134,17 @@ func (n *Session) reopen(afterFailedCommit bool) error {
 	n.loadedCtr, n.loadedPages = fresh.loadedCtr, fresh.loadedPages
 	n.tableIndex, n.ipkOf = fresh.tableIndex, fresh.ipkOf
 	n.appendAt.release()
+	n.appendAt = fresh.appendAt
 	n.catalogAtLastWrite = fresh.catalogAtLastWrite
-	n.seenStat = stamp
+	n.seenStat = fresh.seenStat
 	n.deltaEnd = fresh.deltaEnd
 	// The rebuilt file may be another version: its own word mapping, or none.
 	n.change.close()
 	n.change, n.changeSeenOK, n.changeable = fresh.change, false, fresh.changeable
 	if old != nil {
+		if caught {
+			old.detachDelta() // the reopened pager reads it now
+		}
 		old.Close()
 	}
 	return nil

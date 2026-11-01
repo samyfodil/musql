@@ -131,6 +131,7 @@ func foldLimitOffsetValue(pager *ReadOnlyPager, e Expr, args []Value) (Value, er
 	if err := requireZeroedNameContext(e); err != nil {
 		return Value{}, err
 	}
+	pager.noteRunFold()
 	prog, err := compileSelectNoFromPager(pager, &SelectStmt{Columns: []SelectColumn{{Expr: e}}}, nil)
 	if err != nil {
 		return Value{}, err

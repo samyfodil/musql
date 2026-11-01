@@ -320,8 +320,9 @@ func (tx *btTxn) freePage2(mem *memPage, iPage uint32) error {
 	}
 	pg := mem
 	if pg == nil {
-		if cached := bt.pager.pages[iPage]; cached != nil && cached.loaded {
-			pg = &cached.mem // btreePageLookup
+		var err error
+		if pg, err = bt.pager.lookup(bt, iPage); err != nil {
+			return err
 		}
 	}
 	defer func() {

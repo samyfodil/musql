@@ -334,6 +334,9 @@ func (db *DB) execVacuumAttached(ad *attachedDB) error {
 //     this engine applies a pending mode at VACUUM only. (A pending page_size
 //     is honoured; see notePageSizeRequest.)
 func (db *DB) execVacuumInto(p *parser, schema string) error {
+	if db.confined {
+		return ErrConfined
+	}
 	target, terr := p.parseExpr()
 	if terr != nil {
 		return terr

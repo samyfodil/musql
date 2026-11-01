@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"cmp"
+	"math"
 	"slices"
 	"sort"
 	"strings"
@@ -149,8 +151,10 @@ func (p *ReadOnlyPager) SeekRowidSegments(rootPage uint32, rid int64) (vals []Va
 
 // A secondary-index equality seek: finds rowids where a column matches a probe.
 // An index seek only prunes: the WHERE conjunct is re-evaluated on every row,
-// so overestimating is slow but safe. Results are ascending rowid.
-func (src *segSource) seekIndexRowids(rootPage uint32, col int, probe Value) (rowids []int64, served bool) {
+// so overestimating is slow but safe. Results are ascending rowid. textExact
+// says a TEXT probe's bytes decide its equality, which a UTF-16 database's
+// malformed text does not promise (two byte strings may translate alike).
+func (src *segSource) seekIndexRowids(rootPage uint32, col int, probe Value, textExact bool) (rowids []int64, served bool) {
 	// A table the session holds live is answered from ITS rows, never from the
 	// committed segments in byRoot: the live store is this session's view --
 	// a transaction's snapshot, its own writes -- and byRoot may be a newer
@@ -162,15 +166,18 @@ func (src *segSource) seekIndexRowids(rootPage uint32, col int, probe Value) (ro
 		return nil, false // the caller scans, and the scan reports the error
 	}
 	if !live {
+		// However large the log, its rows are tested against the probe before
+		// they join (withDeltaRowids), so the seek never fetches more than a
+		// scan would read.
 		segs, ok := src.byRoot[rootPage]
-		if !ok || (!src.deltaIsSmallFor(rootPage, segs) && probe.Typ != Int) {
+		if !ok {
 			return nil, false
 		}
 		out, ok := segIndexRowids(segs, col, probe)
 		if !ok {
 			return nil, false
 		}
-		return src.withDeltaRowids(rootPage, out), true
+		return src.withDeltaRowids(rootPage, out, col, probe), true
 	}
 	// A live store over segments answers from THOSE segments' equality index
 	// -- the snapshot it was loaded from -- with every rowid it has written
@@ -185,8 +192,9 @@ func (src *segSource) seekIndexRowids(rootPage uint32, col int, probe Value) (ro
 	// names exactly the matches; the snapshot path would add every row the
 	// store holds to every seek, and a join seeking once per outer row read the
 	// whole table each time.
-	if probe.Typ == Int && rows.prefersEqIndex(col) {
-		if hits, ok := rows.eqRowids(col, probe.I); ok {
+	listed := probe.Typ == Int || probe.Typ == Blob || probe.Typ == Text && textExact
+	if listed && rows.prefersEqIndex(col) {
+		if hits, ok := rows.eqRowidsOf(col, probe); ok {
 			out := make([]int64, len(hits))
 			for i, r := range hits {
 				out[i] = int64(r)
@@ -201,11 +209,10 @@ func (src *segSource) seekIndexRowids(rootPage uint32, col int, probe Value) (ro
 	if out, ok := rows.snapshotIndexRowids(col, probe); ok {
 		return out, true
 	}
-	// Row store index is int64-only; TEXT/BLOB probes against dirty tables scan.
-	if probe.Typ != Int {
+	if !listed {
 		return nil, false
 	}
-	hits, ok := rows.eqRowids(col, probe.I)
+	hits, ok := rows.eqRowidsOf(col, probe)
 	if !ok {
 		return nil, false
 	}
@@ -236,24 +243,28 @@ func (s *rowStore) snapshotIndexRowids(col int, probe Value) ([]int64, bool) {
 	// Every row the store has written whose value could equal the probe: the
 	// candidates stay a superset, but a row that certainly differs is not
 	// fetched and re-tested once per seek.
+	s.snapWork += len(s.m)
 	for rid, vals := range s.m {
 		if col >= len(vals) || !certainlyUnequal(vals[col], probe) {
 			out = append(out, int64(rid))
 		}
 	}
-	return base.withDeltaRowids(s.seg.root, out), true
+	return base.withDeltaRowids(s.seg.root, out, col, probe), true
 }
 
 // certainlyUnequal reports whether a stored value can match an equality probe
 // under no collation or affinity the comparison might use: a NULL, two
-// different integers, two different floats, or two texts that differ even with
-// case folded and trailing spaces trimmed (so BINARY, NOCASE and RTRIM all
-// agree). Anything else, such as an integer against a float or a text, may be
-// equal and is kept.
+// different integers, two different floats, a BLOB against anything but the
+// same bytes as a BLOB (no affinity converts to or from one), or two texts that
+// differ even with case folded and trailing spaces trimmed (so BINARY, NOCASE
+// and RTRIM all agree). Anything else, such as an integer against a float or a
+// text, may be equal and is kept.
 func certainlyUnequal(v, probe Value) bool {
 	switch {
 	case v.Typ == Null || probe.Typ == Null:
 		return true
+	case v.Typ == Blob || probe.Typ == Blob:
+		return v.Typ != probe.Typ || string(v.S) != string(probe.S)
 	case v.Typ == Int && probe.Typ == Int:
 		return v.I != probe.I
 	case v.Typ == Float && probe.Typ == Float:
@@ -268,7 +279,10 @@ func certainlyUnequal(v, probe Value) bool {
 // by the store's own equality index (eqRowids) than by its base segments'
 // index plus its written rows: when that index is built already, or the
 // written rows are most of the table, so building it costs about what one
-// seek through the snapshot would.
+// seek through the snapshot would, or seeks have already tested as many
+// written rows as building it reads. Without that last rule a transaction
+// writing tens of thousands of rows and seeking between them -- a snapshot a
+// new replica merges -- tested every written row on every seek.
 func (s *rowStore) prefersEqIndex(col int) bool {
 	if s == nil || s.spill != nil {
 		return false
@@ -283,7 +297,7 @@ func (s *rowStore) prefersEqIndex(col int) bool {
 	for _, sg := range s.seg.rp.segs.byRoot[s.seg.root] {
 		base += sg.nRows
 	}
-	return len(s.m) >= base
+	return len(s.m) >= base || s.snapWork >= base+len(s.m)
 }
 
 // segIndexSeeksServed counts index seeks the segments answered, for tests.
@@ -343,17 +357,22 @@ func (src *segSource) deltaIsSmallFor(rootPage uint32, segs []*segment) bool {
 	return n*8 <= rows
 }
 
-// withDeltaRowids unions in every rowid the log holds live for this table, then
-// sorts and dedupes.
+// withDeltaRowids unions in every rowid the log holds live for this table whose
+// col could equal probe, then sorts and dedupes.
 //
-// Unioned WHOLE rather than value-tested: those rows postdate the column index,
-// and a test here would only duplicate the WHERE re-evaluation that runs on every
-// row this returns anyway. A rowid the log KILLED is left in, because the row
-// fetch that follows reports it absent and drops it.
-func (src *segSource) withDeltaRowids(rootPage uint32, rowids []int64) []int64 {
+// The log's rows postdate the column index, so each is tested here -- with
+// certainlyUnequal, which keeps whatever a collation or an affinity might make
+// equal -- rather than unioned whole: a whole log was a whole table of rows
+// fetched, re-tested by the WHERE and sorted into the planner's order once per
+// seek, and the replication clock seeks once per op. A rowid the log KILLED is
+// left in, because the row fetch that follows reports it absent and drops it.
+func (src *segSource) withDeltaRowids(rootPage uint32, rowids []int64, col int, probe Value) []int64 {
 	if src.delta != nil {
 		if ti, known := src.tableOf[rootPage]; known {
-			for rid := range src.delta.live[ti] {
+			for rid, vals := range src.delta.live[ti] {
+				if col < len(vals) && certainlyUnequal(vals[col], probe) {
+					continue
+				}
 				rowids = append(rowids, rid)
 			}
 		}
@@ -395,7 +414,107 @@ func (p *ReadOnlyPager) SeekIndexRowidsSegments(rootPage uint32, col int, probe 
 	if probe.Typ == Text && !equalFoldName(effectiveCollation(coll), "BINARY") {
 		return nil, false
 	}
-	return p.segs.seekIndexRowids(rootPage, col, probe)
+	return p.segs.seekIndexRowids(rootPage, col, probe, !isUTF16(p.encoding()))
+}
+
+// idxSeekKey is one equality an index seek can be answered from: the table
+// column, the probe already coerced to the comparison's affinity, and the
+// comparison's collation.
+type idxSeekKey struct {
+	col   int
+	probe Value
+	coll  string
+}
+
+// SeekIndexRowidsByKeys is SeekIndexRowidsSegments over equalities on one
+// table. Each key's candidates are a superset of the rows that match all of
+// them, so the key whose column the segments say holds the fewest matching rows
+// is asked first, and a key they cannot answer gives way to the next.
+//
+// A key matching half the table or more is dropped: fetching each of its rows
+// costs more than the scan, which tests them all at a fraction of the price
+// (25,000 rows, every one matching: 14.2ms through the seek, 10.4ms scanned).
+// With no key left the scan answers.
+func (p *ReadOnlyPager) SeekIndexRowidsByKeys(rootPage uint32, keys []idxSeekKey) ([]int64, bool) {
+	if p == nil || p.segs == nil {
+		return nil, false
+	}
+	if len(keys) == 1 {
+		k := keys[0]
+		if n, total, ok := p.segs.seekIndexEstimate(rootPage, k.col, k.probe); ok && total >= seekMinRows && 2*n >= total {
+			return nil, false
+		}
+		return p.SeekIndexRowidsSegments(rootPage, k.col, k.probe, k.coll)
+	}
+	est := make([]int, len(keys))
+	order := make([]int, 0, len(keys))
+	for i, k := range keys {
+		est[i] = math.MaxInt
+		if n, total, ok := p.segs.seekIndexEstimate(rootPage, k.col, k.probe); ok {
+			if total >= seekMinRows && 2*n >= total {
+				continue
+			}
+			est[i] = n
+		}
+		order = append(order, i)
+	}
+	slices.SortStableFunc(order, func(a, b int) int { return cmp.Compare(est[a], est[b]) })
+	for _, i := range order {
+		if rowids, ok := p.SeekIndexRowidsSegments(rootPage, keys[i].col, keys[i].probe, keys[i].coll); ok {
+			segMultiKeySeeksServed.Add(1)
+			return rowids, true
+		}
+	}
+	return nil, false
+}
+
+// seekMinRows is the table size below which a seek is never traded for the
+// scan: either is cheap there.
+const seekMinRows = 256
+
+// segMultiKeySeeksServed counts the seeks SeekIndexRowidsByKeys answered, for
+// tests.
+var segMultiKeySeeksServed atomic.Int64
+
+// seekIndexEstimate is how many rows of the table's segments hold probe in col,
+// counted in each segment's index without building a list, and how many rows
+// those segments hold. It leaves out the delta log and the session's own
+// writes, which every key's candidates take in alike. false when a segment keeps
+// no index this probe can ask.
+func (src *segSource) seekIndexEstimate(rootPage uint32, col int, probe Value) (n, total int, ok bool) {
+	rows, live, err := src.liveRows(rootPage)
+	if err != nil {
+		return 0, 0, false
+	}
+	segs, ok := src.byRoot[rootPage]
+	if live {
+		if (probe.Typ == Int || isBytesClass(probe.Typ)) && rows.prefersEqIndex(col) {
+			hits, ok := rows.eqRowidsOf(col, probe)
+			total = len(rows.m)
+			if rows.seg != nil && rows.seg.rp != nil && rows.seg.rp.segs != nil {
+				for _, sg := range rows.seg.rp.segs.byRoot[rows.seg.root] {
+					total += sg.nRows
+				}
+			}
+			return len(hits), total, ok
+		}
+		if rows.seg == nil || rows.seg.rp == nil || rows.seg.rp.segs == nil {
+			return 0, 0, false
+		}
+		segs, ok = rows.seg.rp.segs.byRoot[rows.seg.root]
+	}
+	if !ok {
+		return 0, 0, false
+	}
+	for _, sg := range segs {
+		c, ok := sg.segEqualityCountOf(col, probe)
+		if !ok {
+			return 0, 0, false
+		}
+		n += c
+		total += sg.nRows
+	}
+	return n, total, true
 }
 
 // RowidBound is min(rowid) (max false) or max(rowid) of the table rooted at

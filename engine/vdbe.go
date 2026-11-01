@@ -1571,6 +1571,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				m.regs[op.P3] = Value{Typ: Int, I: rid}
 			} else if op.P2 < len(src) {
 				m.regs[op.P3] = src[op.P2]
+				if m.regs[op.P3].Typ == valueGenErr {
+					return nil, takeGenErr(&m.regs[op.P3])
+				}
 			} else {
 				// A machine with no firing row cannot answer NEW./OLD.
 				// Reported rather than indexed: a live sub-program that was
@@ -1959,36 +1962,25 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			if cursorHasNoBtree(m.cursors[op.P1]) {
 				break
 			}
-			// Only an INTEGER key can equal a rowid; for any other storage
-			// class leave the cursor in full-scan mode (see OpSeekRowidHint's
-			// doc comment, vdbe_op.go). The keyed WHERE conjunct is evaluated
-			// in the loop body regardless, so this only prunes the scan.
-			if key := m.regs[op.P2]; key.Typ == Int {
-				cur := m.cursors[op.P1]
-				cur.seekConfigured = true
-				cur.seekKey = key.I
-				cur.seekReseek = op.P3 == 1 // correlated join seek: re-seek per rewind
-			} else if op.P3 == 1 {
-				// Correlated join seek with a non-integer key this iteration:
-				// leave the cursor in full-scan mode for THIS outer row (no
-				// integer rowid can match), but keep the re-seek flag so a later
-				// outer row whose key IS an integer still re-materializes rather
-				// than reusing this full scan.
-				cur := m.cursors[op.P1]
-				cur.seekConfigured = false
-				cur.seekReseek = true
+			// The key takes numeric affinity, as OP_SeekRowid gives it, and
+			// one that is still no integer equals no rowid: the cursor visits
+			// nothing, as C's loop does. A scan would test the rest of the
+			// WHERE on rows C never reads, and so raise errors C does not.
+			// The keyed conjunct is evaluated in the loop body regardless.
+			key := m.regs[op.P2]
+			if key.Typ != Int {
+				key = applyAffinityToValue(key, affNumeric)
 			}
+			cur := m.cursors[op.P1]
+			cur.seekConfigured, cur.seekNone = true, key.Typ != Int
+			cur.seekKey = key.I
+			cur.seekReseek = op.P3 == 1 // correlated join seek: re-seek per rewind
 
 		case OpSeekRowidRangeHint:
 			if cursorHasNoBtree(m.cursors[op.P1]) {
 				break
 			}
-			// An INTEGER bound only, as for OpSeekRowidHint: any other storage
-			// class compares to a rowid by rules this does not reproduce, so it
-			// leaves the scan whole and the conjunct decides every row.
-			if key := m.regs[op.P2]; key.Typ == Int {
-				m.cursors[op.P1].narrowRowidRange(op.P3, key.I)
-			}
+			m.cursors[op.P1].narrowRowidRangeBy(op.P3, m.regs[op.P2])
 
 		case OpSeekIndexHint:
 			// Coerce the key with the exact affinity the WHERE comparison
@@ -2004,10 +1996,27 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			cur := m.cursors[op.P1]
 			switch h := op.P4.(type) {
 			case *indexSeekHint:
-				cur.idxSeekConfigured = true
-				cur.idxSeekProbe = applyAffinityToValue(m.regs[op.P2], h.aff)
-				cur.idxSeekColl = h.coll
-				cur.idxSeekCol = h.leadingCol
+				probe := applyAffinityToValue(m.regs[op.P2], h.aff)
+				if h.slot == 0 {
+					cur.idxSeekConfigured, cur.idxSeekMore, cur.idxSeekNext = false, cur.idxSeekMore[:0], 0
+				}
+				// A slot out of step is dropped, and so is the key of "x IS NULL",
+				// which no posting list holds, and a write's TEXT key in a UTF-16
+				// database, whose bytes need not decide its equality: the keys
+				// left bound the rows each on its own, and with none the scan
+				// decides.
+				if h.slot == cur.idxSeekNext {
+					cur.idxSeekNext++
+					switch {
+					case h.is && probe.Typ == Null:
+					case cur.rowStore != nil && probe.Typ == Text && isUTF16(m.encoding()):
+					case !cur.idxSeekConfigured:
+						cur.idxSeekConfigured = true
+						cur.idxSeekProbe, cur.idxSeekColl, cur.idxSeekCol = probe, h.coll, h.leadingCol
+					default:
+						cur.idxSeekMore = append(cur.idxSeekMore, idxSeekKey{col: h.leadingCol, probe: probe, coll: h.coll})
+					}
+				}
 			default:
 				return nil, fmt.Errorf("vdbe: OpSeekIndexHint without a plan")
 			}
@@ -3182,6 +3191,11 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			n := tbl.rows.clear()
 			m.wctx.rowsAffected += int(n)
+
+		case OpGenErrCheck:
+			if m.regs[op.P1].Typ == valueGenErr {
+				return nil, genErrOf(m.regs[op.P1])
+			}
 
 		case OpSkipIfRowGone:
 			tbl := op.P4.(*tableMeta)

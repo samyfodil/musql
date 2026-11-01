@@ -194,7 +194,7 @@ func bindArgsInto(buf []engine.Value, info engine.ParamInfo, args []driver.Named
 			v = engine.Value{Typ: engine.Text, S: copyArgBytes(arena, x)}
 		case []byte:
 			if len(x) == 0 {
-				v, err = driverValueToEngine(x) // nil S, as that copy leaves it
+				v, err = driverValueToEngine(x) // NULL for a nil slice, else a BLOB with nil S
 				break
 			}
 			v = engine.Value{Typ: engine.Blob, S: copyArgBytes(arena, x)}
@@ -360,6 +360,28 @@ func (s *Stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (drive
 func (s *Stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
 	v, err := s.queryContextImpl(ctx, args)
 	return v, parityErr(err)
+}
+
+// argArena is an arena that holds exactly the TEXT and BLOB arguments of args
+// copyArgBytes carves from one, or nil when there are none.
+func argArena(args []driver.NamedValue) []byte {
+	n := 0
+	for _, a := range args {
+		switch x := a.Value.(type) {
+		case string:
+			if len(x) <= argArenaMax {
+				n += len(x)
+			}
+		case []byte:
+			if len(x) <= argArenaMax {
+				n += len(x)
+			}
+		}
+	}
+	if n == 0 {
+		return nil
+	}
+	return make([]byte, 0, n)
 }
 
 // argArenaChunk is the size of one bytesArena chunk; argArenaMax the largest

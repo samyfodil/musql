@@ -475,13 +475,19 @@ func (w *segFileWriter) finish(path string, tables []ConvertedTable, cat Convert
 	if err != nil {
 		return err
 	}
-	img := make([]byte, dirOff+int64(len(dir)))
-	copy(img, head)
-	for _, p := range w.mem {
-		copy(img[base+p.at:], p.raw)
+	// Each part at its offset, rather than one image of the file built first:
+	// the alignment between two reads as the zeros of the truncated file.
+	if _, err := out.WriteAt(head, 0); err != nil {
+		out.Close()
+		return err
 	}
-	copy(img[dirOff:], dir)
-	if _, err := out.WriteAt(img, 0); err != nil {
+	for _, p := range w.mem {
+		if _, err := out.WriteAt(p.raw, base+p.at); err != nil {
+			out.Close()
+			return err
+		}
+	}
+	if _, err := out.WriteAt(dir, dirOff); err != nil {
 		out.Close()
 		return err
 	}

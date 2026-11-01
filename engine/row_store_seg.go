@@ -102,10 +102,7 @@ func (b *segRows) get(rid uint64) ([]Value, bool) {
 	if !served || !found {
 		return nil, false
 	}
-	row, err := fullStoredRow(b.tbl, rid, vals)
-	if err != nil {
-		return nil, false
-	}
+	row := fullStoredRow(b.tbl, rid, vals)
 	b.memoMu.Lock()
 	if b.memo == nil {
 		if b.memoGets++; b.memoGets > memoAfter {
@@ -178,8 +175,7 @@ func (r *segRun) get(rid uint64) ([]Value, bool, bool) {
 	if r.delta {
 		// As seekRowid: the log's PUT beats the segment's copy, a KILL removes it.
 		if v, live := r.src.delta.live[r.ti][at]; live {
-			row, err := fullStoredRow(r.b.tbl, rid, v)
-			return row, err == nil, false
+			return fullStoredRow(r.b.tbl, rid, v), true, false
 		}
 		if r.src.delta.dead[r.ti][at] {
 			return nil, false, false
@@ -214,8 +210,7 @@ func (r *segRun) get(rid uint64) ([]Value, bool, bool) {
 	for c := range w {
 		row[c] = sg.Value(c, i)
 	}
-	full, err := fullStoredRow(r.b.tbl, rid, row)
-	return full, err == nil, true
+	return fullStoredRow(r.b.tbl, rid, row), true, true
 }
 
 // has reports whether rid has a committed row, without decoding it.
@@ -244,6 +239,16 @@ func (b *segRows) has(rid uint64) bool {
 
 // walk yields every committed row in ascending signed-rowid order.
 func (b *segRows) walk(yield func(uint64, []Value) bool) {
+	b.walkWith(func(rid uint64, vals []Value) []Value { return fullStoredRow(b.tbl, rid, vals) }, yield)
+}
+
+// walkStored is walk handing out the stored values (widenStoredRow), no
+// generated column computed: what a rewrite of the file copies.
+func (b *segRows) walkStored(yield func(uint64, []Value) bool) {
+	b.walkWith(func(_ uint64, vals []Value) []Value { return widenStoredRow(b.tbl.cols, vals) }, yield)
+}
+
+func (b *segRows) walkWith(widen func(uint64, []Value) []Value, yield func(uint64, []Value) bool) {
 	src := b.rp.segs
 	if src == nil {
 		return
@@ -253,11 +258,7 @@ func (b *segRows) walk(yield func(uint64, []Value) bool) {
 		return
 	}
 	for rid, vals := range seq {
-		row, rerr := fullStoredRow(b.tbl, rid, vals)
-		if rerr != nil {
-			return
-		}
-		if !yield(rid, row) {
+		if !yield(rid, widen(rid, vals)) {
 			return
 		}
 	}
@@ -280,8 +281,7 @@ func (b *segRows) walkFiltered(f *segRowFilter, params []Value, yield func(uint6
 	dRows, dead, _ := src.overlayFor(b.root)
 	di := 0
 	emit := func(rid uint64, vals []Value) bool {
-		row, err := fullStoredRow(b.tbl, rid, vals)
-		return err == nil && yield(rid, row)
+		return yield(rid, fullStoredRow(b.tbl, rid, vals))
 	}
 	// The selection buffer is a row per segment row: pooled, since a write
 	// statement walks here once and a one-row UPDATE allocated 800 KB for it.
@@ -454,9 +454,10 @@ func (s *rowStore) segEachSorted(yield func(uint64, []Value) bool) {
 }
 
 // segEachSortedRaw is segEachSorted handing out the overlay's rows as m holds
-// them, a spilled row as its sentinel.
+// them, a spilled row as its sentinel, and the base's stored values
+// (walkStored).
 func (s *rowStore) segEachSortedRaw(yield func(uint64, []Value) bool) {
-	s.segEachSortedOverWith(s.seg.walk, func(v []Value) []Value { return v }, yield)
+	s.segEachSortedOverWith(s.seg.walkStored, func(v []Value) []Value { return v }, yield)
 }
 
 // segEachSortedOver is segEachSorted over the base rows walk hands it, which
@@ -537,27 +538,94 @@ func (s *rowStore) segSortedRowids() []uint64 {
 	return append(out, over[oi:]...)
 }
 
-// segMaxRowid is the largest visible rowid.
+// segMaxRowid is the largest visible rowid: the overlay's, the delta's largest
+// live one, and each segment's top row neither the delta nor this session
+// dropped, found without a sorted walk.
 func (s *rowStore) segMaxRowid() (uint64, bool) {
 	var max uint64
 	found := false
-	for rid := range s.m {
+	note := func(rid uint64) {
 		if !found || rowidLess(max, rid) {
 			max, found = rid, true
 		}
 	}
-	if !s.baseGone {
-		// From the top down: the first base rowid not deleted is the base's
-		// largest, so this stops there instead of walking every row.
-		s.seg.walkRowidsDesc(func(rid uint64) bool {
-			if s.gone[rid] {
-				return true
+	for rid := range s.m {
+		note(rid)
+	}
+	src := s.seg.rp.segs
+	if s.baseGone || src == nil {
+		return max, found
+	}
+	var dead map[int64]bool
+	if src.delta != nil {
+		if ti, ok := src.tableOf[s.seg.root]; ok {
+			if top, ok := src.delta.maxLive(ti); ok && !s.isGone(uint64(top)) {
+				note(uint64(top))
+			} else if ok {
+				for rid := range src.delta.live[ti] {
+					if !s.isGone(uint64(rid)) {
+						note(uint64(rid))
+					}
+				}
 			}
-			if !found || rowidLess(max, rid) {
-				max, found = rid, true
+			dead = src.delta.dead[ti]
+		}
+	}
+	for _, sg := range src.byRoot[s.seg.root] {
+		for i := sg.nRows - 1; i >= 0; i-- {
+			rid := sg.Rowid(i)
+			if dead[int64(rid)] || s.isGone(rid) {
+				continue
 			}
-			return false
-		})
+			note(rid)
+			break
+		}
+	}
+	return max, found
+}
+
+// segMaxRowidIn is maxRowidIn over segments without walking every row: the
+// overlay's and the delta's rows in range, and each segment's top row in
+// range, found by its sorted rowids.
+func (s *rowStore) segMaxRowidIn(lo, hi uint64) (uint64, bool) {
+	var max uint64
+	found := false
+	note := func(rid uint64) {
+		if rid >= lo && rid < hi && (!found || rid > max) {
+			max, found = rid, true
+		}
+	}
+	for rid := range s.m {
+		note(rid)
+	}
+	if s.baseGone || lo >= hi {
+		return max, found
+	}
+	src := s.seg.rp.segs
+	if src == nil {
+		return max, found
+	}
+	var dead map[int64]bool
+	if src.delta != nil {
+		if ti, ok := src.tableOf[s.seg.root]; ok {
+			for rid := range src.delta.live[ti] {
+				if !s.isGone(uint64(rid)) {
+					note(uint64(rid))
+				}
+			}
+			dead = src.delta.dead[ti]
+		}
+	}
+	for _, sg := range src.byRoot[s.seg.root] {
+		from, to := sg.rowidSpan(int64(lo), int64(hi-1))
+		for i := to - 1; i >= from; i-- {
+			rid := sg.Rowid(i)
+			if dead[int64(rid)] || s.isGone(uint64(rid)) {
+				continue
+			}
+			note(uint64(rid))
+			break
+		}
 	}
 	return max, found
 }

@@ -373,6 +373,7 @@ func (db *DB) cachedWriteProgram(sqlText string) (*Program, error) {
 		db.lastWritePlanText, db.lastWritePlan = sqlText, p
 		return p, nil
 	}
+	db.runFold = false
 	p, err := db.compileWrite(sqlText)
 	if err != nil {
 		return nil, err
@@ -380,7 +381,7 @@ func (db *DB) cachedWriteProgram(sqlText string) (*Program, error) {
 	if !segPeepholesOffForTest {
 		segWriteFilterPeephole(p) // see its doc comment for the shapes it may touch
 	}
-	if p.WritePager == nil || p.FreshWritePager {
+	if (p.WritePager == nil || p.FreshWritePager) && !db.runFold {
 		db.writePlans[sqlText] = p
 	}
 	return p, nil
@@ -2649,12 +2650,13 @@ func (db *DB) compileDeleteStmt(stmt *deleteStmt, trig *trigCompileCtx) (*Progra
 	// instead of materializing the table. Pure candidate-set restriction -- the
 	// conjunct below still runs on the fetched row. See write_rowid_seek.go.
 	if !emitWriteRowidSeekHint(c, tbl, 0, stmt.where) {
-		emitWriteIndexSeekHint(c, tbl, 0, stmt.where)
+		db.emitWriteIndexSeekHint(c, tbl, 0, FromItem{Schema: stmt.schema, Alias: stmt.alias, IndexedBy: stmt.indexedBy, NotIndexed: stmt.notIndexed}, stmt.where, trig)
 	}
 	loopWhere, constJumps, cerr := c.emitWriteConstTerms(stmt.where)
 	if cerr != nil {
 		return nil, cerr
 	}
+	loopWhere = db.writeConsumedFirst(c, tbl, 0, FromItem{Schema: stmt.schema, Alias: stmt.alias, IndexedBy: stmt.indexedBy, NotIndexed: stmt.notIndexed}, stmt.where, loopWhere, trig)
 	rewind := c.emit(Instruction{Op: OpRewind, P1: 0})
 	loopTop := c.here()
 
@@ -3013,7 +3015,7 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 		// UPDATE: with a FROM clause the scan drives pass one's EPHEMERAL table,
 		// whose rowids are its own and have nothing to do with the target's.
 		if !emitWriteRowidSeekHint(c, tbl, scanCur, stmt.where) {
-			emitWriteIndexSeekHint(c, tbl, scanCur, stmt.where)
+			db.emitWriteIndexSeekHint(c, tbl, scanCur, FromItem{Schema: stmt.schema, Alias: stmt.alias, IndexedBy: stmt.indexedBy, NotIndexed: stmt.notIndexed}, stmt.where, trig)
 		}
 	}
 	// THE ORDER THIS LOOP VISITS ROWS IN, when a SET subquery may depend on it
@@ -3077,6 +3079,7 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 		if loopWhere, constJumps, cerr = c.emitWriteConstTerms(stmt.where); cerr != nil {
 			return nil, cerr
 		}
+		loopWhere = db.writeConsumedFirst(c, tbl, scanCur, FromItem{Schema: stmt.schema, Alias: stmt.alias, IndexedBy: stmt.indexedBy, NotIndexed: stmt.notIndexed}, stmt.where, loopWhere, trig)
 	}
 	rewind := c.emit(Instruction{Op: OpRewind, P1: scanCur})
 	loopTop := c.here()
@@ -3130,6 +3133,14 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 	// the same register block before OP_MakeRecord/OP_Insert.
 	rowBase := c.allocN(len(tbl.cols))
 	for i := range tbl.cols {
+		if col := tbl.cols[i]; col.IsGenerated() && !col.GeneratedStored && beforePlan == nil && firePlan == nil && stmt.returning == nil {
+			// C never reads a VIRTUAL column into the new row (update.c:945);
+			// OpComputeGenerated computes it below. It reads the OLD row's for a
+			// trigger, here the snapshot taken from these registers, and for
+			// RETURNING, whose column mask is every column (trigger.c:1560).
+			c.emit(Instruction{Op: OpNull, P2: rowBase + i})
+			continue
+		}
 		c.emit(Instruction{Op: OpColumn, P1: 0, P2: i, P3: rowBase + i})
 	}
 	rowidReg := c.allocN(1)
@@ -3984,7 +3995,7 @@ func (m *vdbe) opUpdateRow(op *Instruction) (int, error) {
 // one updateInPlaceOK allows, and plan one whose rowid stays (plan.gather).
 func (m *vdbe) inPlace(plan *updatePlan, cur *vdbeCursor, full []Value) ([]Value, bool) {
 	st := plan.tbl.rows
-	if !st.inPlaceOK() {
+	if !st.inPlaceOK(plan.setCol) {
 		return full, false
 	}
 	// The cursor's copy of the committed row, which nothing else holds and
@@ -4271,7 +4282,7 @@ func (m *vdbe) applyGathered(mr, upd *Instruction, rows [][]Value) error {
 	borrow, _ := mr.P4.(recBorrow)
 	owned := m.wctx != nil && m.wctx.db.argsOwned
 	plan := upd.P4.(*updatePlan)
-	if cur.idxSeekConfigured && !cur.overlaySized {
+	if cur.idxSeekConfigured && len(cur.idxSeekMore) == 0 && !cur.overlaySized {
 		// An equality seek's rows all match, so the rest of them are about
 		// to be stored: the overlay is sized for them once, not grown.
 		cur.overlaySized = true

@@ -1047,6 +1047,22 @@ func resolveSubProgramLimitOffset(pager *ReadOnlyPager, stmt *SelectStmt) (resto
 	return restore, deferred, nil
 }
 
+// noteRunFold records that the statement being compiled built a value of this
+// run into its program: a LIMIT or OFFSET it evaluated (a subquery in it reads
+// the database, a parameter is bound per run, random() differs; C codes the
+// clause into a register and evaluates it on every run, computeLimitRegisters,
+// select.c:2517), or fts5's corpus statistics (buildFts5AuxState). The plan
+// caches refuse such a program (cachePlan, cachedWriteProgram).
+func (p *ReadOnlyPager) noteRunFold() {
+	if p == nil {
+		return
+	}
+	p.runFold = true
+	if p.writeSession != nil {
+		p.writeSession.runFold = true
+	}
+}
+
 // foldLimitOffsetExpr evaluates one LIMIT/OFFSET expression to the integer the
 // *int64 Limit/Offset needs by compiling it as a one-column FROM-less SELECT and
 // running it once (subqueries compile as sub-Programs). args are the bound
@@ -1061,6 +1077,7 @@ func foldLimitOffsetExpr(pager *ReadOnlyPager, e Expr, args []Value) (int64, err
 	if err := requireZeroedNameContext(e); err != nil {
 		return 0, err
 	}
+	pager.noteRunFold()
 	prog, err := compileSelectNoFromPager(pager, &SelectStmt{Columns: []SelectColumn{{Expr: e}}}, nil)
 	if err != nil {
 		return 0, err
@@ -2061,6 +2078,20 @@ func (c *compiler) resolveRowReg(x ColumnExpr) (int, bool, error) {
 	return reg, true, nil
 }
 
+// regHoldsVirtual reports whether reg is a register row's slot for a VIRTUAL
+// generated column, which a row loaded whole from the table holds as that
+// column's error where its expression raised (valueGenErr).
+func regHoldsVirtual(scopes []regScope, reg int) bool {
+	for _, rs := range scopes {
+		for idx, r := range rs.regs {
+			if r == reg && idx < len(rs.scope.cols) && rs.scope.cols[idx].IsGenerated() && !rs.scope.cols[idx].GeneratedStored {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // outerRowCtx returns the nearest live enclosing-row evalCtx on this compile's
 // chain (compiler.rowOuter), or nil. Walking the chain -- rather than reading
 // c.rowOuter alone -- is what lets a subquery compiled BENEATH a FROM-less
@@ -2196,6 +2227,9 @@ func (c *compiler) compileColumn(x ColumnExpr) (int, error) {
 			return 0, amb
 		}
 		if ok {
+			if regHoldsVirtual(c.regScopes, reg) {
+				c.emit(Instruction{Op: OpGenErrCheck, P1: reg})
+			}
 			return reg, nil
 		}
 	}
@@ -2315,6 +2349,9 @@ func (c *compiler) compileColumn(x ColumnExpr) (int, error) {
 				}
 				d := c.alloc()
 				c.emit(Instruction{Op: OpOuterAggReg, P1: reg, P3: d, P5: uint16(level)})
+				if regHoldsVirtual(oc.regScopes, reg) {
+					c.emit(Instruction{Op: OpGenErrCheck, P1: d})
+				}
 				return d, nil
 			}
 		}
@@ -4218,6 +4255,11 @@ type selfRowExpr struct {
 	// (compiler.ignoreDbQualifier), kept only so eval's re-stamp reproduces it
 	// rather than compiling a CHECK body under an index expression's rules.
 	ignoreDbQualifier bool
+
+	// virtReads are the VIRTUAL generated columns the expression reads, whose
+	// slot in a committed row may hold its error (valueGenErr): eval raises it
+	// rather than run the program over it.
+	virtReads []int
 }
 
 // compileSelfRowExpr compiles e against scope's columns held in registers. A
@@ -4238,6 +4280,16 @@ func compileSelfRowExprPaged(scope tableScope, e Expr, ignoreDbQualifier bool, p
 	p := &selfRowExpr{expr: e, cols: scope.cols, nCols: len(scope.cols), ignoreDbQualifier: ignoreDbQualifier, pureCtx: pureCtx}
 	if e == nil {
 		return p
+	}
+	if hasVirtualCols(scope.cols) {
+		forEachColumnRef(e, func(ce ColumnExpr) {
+			if ce.Qualifier != "" && !equalFoldName(scope.name, ce.Qualifier) {
+				return
+			}
+			if k, ok := scope.colIndex[r33sFoldIdent(ce.Name)]; ok && k < len(scope.cols) && scope.cols[k].IsGenerated() && !scope.cols[k].GeneratedStored {
+				p.virtReads = append(p.virtReads, k)
+			}
+		})
 	}
 	// rowLive only with a pager: eval seeds the register block before running, so
 	// a subquery beneath can read it across the frame. That is what a vtab

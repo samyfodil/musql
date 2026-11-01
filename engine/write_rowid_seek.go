@@ -1,6 +1,9 @@
 package engine
 
-import "sync/atomic"
+import (
+	"slices"
+	"sync/atomic"
+)
 
 // A rowid point lookup for a write.
 //
@@ -51,8 +54,8 @@ func writeRowidRef(c *compiler, tbl *tableMeta, cursor int, e Expr) bool {
 // column-free and can be evaluated before the loop opens -- no cursor is
 // positioned yet.
 //
-// A non-integer key is handled at RUN time by OpSeekRowidHint, which leaves the
-// cursor in full-scan mode: only an integer can equal a rowid.
+// A key that is no integer under numeric affinity fetches nothing at RUN time
+// (OpSeekRowidHint): only an integer can equal a rowid.
 func emitWriteRowidSeekHint(c *compiler, tbl *tableMeta, cursor int, where Expr) bool {
 	key, ok := detectWriteRowidSeekKey(c, tbl, cursor, where)
 	if !ok {
@@ -113,27 +116,125 @@ func keyRunsBeforeTheLoop(insns []Instruction, cursor int) bool {
 // It needs no declared index: the candidates come in rowid order, which is the
 // order C visits one key's rows in whether it walks an index or the table, and
 // the conjunct still runs on every fetched row, so the hint only narrows.
-func emitWriteIndexSeekHint(c *compiler, tbl *tableMeta, cursor int, where Expr) bool {
+//
+// Every such conjunct is a key, up to maxSeekKeys, as the hint's slots: the
+// cursor asks the one whose column holds fewest rows (writeSeekRowids). The
+// comparison's collation is the column's own, the key being a bare literal or
+// parameter. The INTEGER PRIMARY KEY column is never a key: it is stored NULL,
+// its value being the rowid.
+//
+// A key a conjunct that can raise comes before is kept only where C's own loop
+// leaves it exact (seekGuard): from is the target as the statement names it,
+// for asking the planner what that loop is.
+func (db *DB) emitWriteIndexSeekHint(c *compiler, tbl *tableMeta, cursor int, from FromItem, where Expr, trig *trigCompileCtx) bool {
 	if writeIndexSeekOffForTest || where == nil || tbl == nil || tbl.withoutRowid || hasGeneratedCols(tbl.cols) {
 		return false
 	}
-	for _, cj := range splitTopLevelAnd(where) {
+	cjs := splitTopLevelAnd(where)
+	guard := seekGuard{raiseAt: -1, tableRaiseAt: -1}
+	for pos, cj := range cjs {
+		if exprMayRaise(cj) && !c.holdsCorrelatedSelect(cj) && writeConjunctPerRow(cj) {
+			guard.raiseAt, guard.tableRaiseAt = pos, pos
+			guard.access = db.writeLoopAccess(tbl, from, where, trig)
+			break
+		}
+	}
+	slot := 0
+	for pos, cj := range cjs {
 		be, ok := cj.(BinaryExpr)
-		if !ok || (be.Op != "=" && be.Op != "==") {
+		if !ok || (be.Op != "=" && be.Op != "==") || slot == maxSeekKeys {
 			continue
 		}
 		for _, side := range [2][2]Expr{{be.L, be.R}, {be.R, be.L}} {
 			colExpr, key := side[0], side[1]
 			col, ok := writeColumnRef(c, cursor, colExpr)
-			if !ok || !isSeekKeyCandidate(key) {
+			if !ok || col == tbl.ipkIndex || !isSeekKeyCandidate(key) || !guard.keep(col, pos, db.leadsIndex(tbl, col)) {
 				continue
 			}
 			reg, err := c.compileExpr(key)
 			if err != nil {
-				return false
+				return slot > 0
 			}
 			c.emit(Instruction{Op: OpSeekIndexHint, P1: cursor, P2: reg,
-				P4: &indexSeekHint{aff: comparisonAffinity(c.affCtx(), colExpr, key), leadingCol: col}})
+				P4: &indexSeekHint{aff: comparisonAffinity(c.affCtx(), colExpr, key), coll: effectiveCollation(tbl.cols[col].Collation),
+					leadingCol: col, slot: slot}})
+			slot++
+			break
+		}
+	}
+	return slot > 0
+}
+
+// writeConsumedFirst is consumedFirst for a write's loop: loopWhere, the
+// terms it tests per row, with the equalities C's one-pass loop consumes for
+// where moved to the front when a term that can raise is among them.
+func (db *DB) writeConsumedFirst(c *compiler, tbl *tableMeta, cursor int, from FromItem, where, loopWhere Expr, trig *trigCompileCtx) Expr {
+	terms := splitTopLevelAnd(loopWhere)
+	if len(terms) < 2 {
+		return loopWhere
+	}
+	if !slices.ContainsFunc(terms, exprMayRaise) {
+		return loopWhere
+	}
+	a := db.writeLoopAccess(tbl, from, where, trig)
+	if !a.known || a.auto || len(a.eq) == 0 {
+		return loopWhere
+	}
+	taken := make([]bool, len(terms))
+	var out []Expr
+	for _, col := range a.eq {
+		for k, cj := range terms {
+			if !taken[k] && writeEqualityOnColumn(c, tbl, cursor, cj, col) {
+				taken[k] = true
+				out = append(out, cj)
+				break
+			}
+		}
+	}
+	if len(out) == 0 {
+		return loopWhere
+	}
+	for k, cj := range terms {
+		if !taken[k] {
+			out = append(out, cj)
+		}
+	}
+	return andConjuncts(out)
+}
+
+// writeEqualityOnColumn is equalityOnColumn over a write's target cursor.
+func writeEqualityOnColumn(c *compiler, tbl *tableMeta, cursor int, cj Expr, col int) bool {
+	be, ok := cj.(BinaryExpr)
+	if !ok || be.Op != "=" && be.Op != "==" && be.Op != "IS" {
+		return false
+	}
+	for _, side := range [2][2]Expr{{be.L, be.R}, {be.R, be.L}} {
+		if !isSeekKeyCandidate(side[1]) {
+			continue
+		}
+		if col == xnRowid && writeRowidRef(c, tbl, cursor, side[0]) {
+			return true
+		}
+		if got, ok := writeColumnRef(c, cursor, side[0]); ok && got == col {
+			return true
+		}
+	}
+	return false
+}
+
+// writeConjunctPerRow reports whether a write tests conjunct e on every row
+// rather than once before its loop: it names a column, or holds a sub-select,
+// which C does not hoist.
+func writeConjunctPerRow(e Expr) bool {
+	named := containsSubquery(e)
+	forEachColumnRef(e, func(ColumnExpr) { named = true })
+	return named
+}
+
+// leadsIndex reports whether a declared index on tbl leads with column col.
+func (db *DB) leadsIndex(tbl *tableMeta, col int) bool {
+	for _, idx := range db.indexes {
+		if indexBelongsTo(idx, tbl) && len(idx.colIdx) > 0 && idx.colIdx[0] == col {
 			return true
 		}
 	}

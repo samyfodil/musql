@@ -7,6 +7,7 @@ package engine
 import (
 	"errors"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/samyfodil/musql/internal/filelock"
@@ -30,6 +31,29 @@ var BusyTimeout = 5 * time.Second
 // attempts. A fixed short interval keeps latency negligible in the uncontended case.
 var busyRetryInterval = 5 * time.Millisecond
 
+// lockFreed wakes this process's lock waiters when a lock it held is released,
+// instead of leaving each to its next poll: connections of one process taking
+// turns on a file waited up to a poll interval at every turn. A lock another
+// process holds is still polled for.
+var lockFreed = struct {
+	sync.Mutex
+	ch chan struct{}
+}{ch: make(chan struct{})}
+
+// lockFreedChan is closed by the next release in this process.
+func lockFreedChan() <-chan struct{} {
+	lockFreed.Lock()
+	defer lockFreed.Unlock()
+	return lockFreed.ch
+}
+
+func noteLockFreed() {
+	lockFreed.Lock()
+	close(lockFreed.ch)
+	lockFreed.ch = make(chan struct{})
+	lockFreed.Unlock()
+}
+
 // acquireLock repeatedly attempts a non-blocking OFD/LockFileEx byte-range
 // lock on [start, start+length) of f until it succeeds or timeout elapses.
 // This is deliberately never a blocking OS-level lock acquisition (e.g.
@@ -40,18 +64,33 @@ var busyRetryInterval = 5 * time.Millisecond
 // hang forever) and a way to widen or shrink the wait window per call site.
 func acquireLock(f *os.File, start, length int64, exclusive bool, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	var poll *time.Timer
 	for {
+		// Taken before the attempt, so a release that lands after it wakes the
+		// wait below.
+		freed := lockFreedChan()
 		ok, err := filelock.LockRange(f, start, length, exclusive)
 		if err != nil {
 			return err
 		}
 		if ok {
+			if poll != nil {
+				poll.Stop()
+			}
 			return nil
 		}
 		if time.Now().After(deadline) {
 			return ErrBusy
 		}
-		time.Sleep(busyRetryInterval)
+		if poll == nil {
+			poll = time.NewTimer(busyRetryInterval)
+		} else {
+			poll.Reset(busyRetryInterval)
+		}
+		select {
+		case <-freed:
+		case <-poll.C:
+		}
 	}
 }
 
@@ -61,7 +100,9 @@ func acquireLock(f *os.File, start, length int64, exclusive bool, timeout time.D
 // so callers may release defensively without tracking exactly which locks
 // they still hold.
 func releaseLock(f *os.File, start, length int64) error {
-	return filelock.UnlockRange(f, start, length)
+	err := filelock.UnlockRange(f, start, length)
+	noteLockFreed()
+	return err
 }
 
 // holdLockingModeLock acquires and holds a SHARED lock for "PRAGMA

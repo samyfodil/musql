@@ -47,6 +47,9 @@ func (c *compiler) buildFts5AuxState(stmt *SelectStmt, scopes []tableScope) (*ft
 	if !usesAux {
 		return nil, nil
 	}
+	// The state below is read from the corpus, and "rank" from the %_config
+	// table: data, which a cached plan would keep across the writes that change it.
+	c.pager.noteRunFold()
 
 	// Exactly one fts5 table may carry rank/bm25/snippet/highlight. C
 	// supports bm25(t1)/bm25(t2) over two MATCHed fts5 tables and resolves

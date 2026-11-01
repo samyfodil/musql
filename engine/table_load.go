@@ -45,11 +45,7 @@ func readTableRowsFromPager(rp *ReadOnlyPager, tbl *tableMeta) (rows map[uint64]
 	rows = make(map[uint64][]Value, len(rowids))
 	for i, rowid := range rowids {
 		// Expand to full width: one Value per declared column.
-		row, err := fullStoredRow(tbl, rowid, vals[i])
-		if err != nil {
-			return nil, nil, err
-		}
-		rows[rowid] = row
+		rows[rowid] = fullStoredRow(tbl, rowid, vals[i])
 	}
 
 	return rows, rowidsSorted, nil

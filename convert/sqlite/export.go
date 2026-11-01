@@ -3,11 +3,15 @@ package sqlite
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 
 	"github.com/samyfodil/musql/engine"
+	"github.com/samyfodil/musql/internal/extsort"
+	"github.com/samyfodil/musql/internal/fsio"
 )
 
 // EXPORT: A MUSQL DATABASE WRITTEN AS A SQLITE FILE.
@@ -19,6 +23,9 @@ import (
 
 // Export writes the musql database at src to a SQLite file at dst.
 // pageSize is 0 for the database's own page size.
+//
+// The file is built in a scratch file beside dst and renamed over it when
+// whole; pages past exportCacheBytes go out to it and are read back as needed.
 func Export(src, dst string, pageSize int) error {
 	r, err := engine.OpenReader(src)
 	if err != nil {
@@ -32,12 +39,35 @@ func Export(src, dst string, pageSize int) error {
 	if pageSize <= 0 {
 		pageSize = 4096
 	}
-	img, err := image(r, m, pageSize)
+	f, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".export-*")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(dst, img, 0o644)
+	if err = image(r, m, pageSize, f); err == nil {
+		err = f.Chmod(0o644) // CreateTemp's 0600 is not what a database file gets
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = fsio.Rename(f.Name(), dst) // see fsio.Rename
+	}
+	if err != nil {
+		os.Remove(f.Name())
+	}
+	return err
 }
+
+// exportCacheBytes is about how much of the file Export holds in memory.
+const exportCacheBytes = 32 << 20
+
+// exportSortBytes is about how much of one index's entries Export sorts in
+// memory; more are sorted in runs on disk (internal/extsort).
+var exportSortBytes = 32 << 20
+
+// exportCachePages is a variable so a test can force every page out to the
+// file.
+var exportCachePages = func(pageSize int) int { return max(exportCacheBytes/pageSize, 64) }
 
 // autoIndex is one automatic index an export fills alongside its table's rows.
 type autoIndex struct {
@@ -51,24 +81,26 @@ type autoIndex struct {
 // other's b-tree, which an export does not write.
 var ErrSharedStorage = errors.New("sqlite: export: a table shares another table's storage (a rootpage edit), which has no SQLite form an export writes")
 
-func image(r *engine.Reader, m engine.Meta, pageSize int) ([]byte, error) {
+// image builds the SQLite file in f.
+func image(r *engine.Reader, m engine.Meta, pageSize int, f *os.File) error {
 	rows, err := r.Catalog()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	for _, e := range rows {
 		if e.AliasOf != "" {
-			return nil, ErrSharedStorage
+			return ErrSharedStorage
 		}
 	}
 	pager := newBtPager(pageSize, 0, true, func(uint32, []byte) error { return errBtCorrupt })
+	pager.file, pager.maxPages = f, exportCachePages(pageSize)
 	bt := newBtShared(pager, pageSize, 0)
 	bt.autoVacuum = m.AutoVacuum != 0
 	bt.incrVacuum = m.AutoVacuum == 2
 	tx := &btTxn{bt: bt}
 	bt.tx = tx
 	if tx.page1, err = bt.getPage(1, false); err != nil {
-		return nil, err
+		return err
 	}
 	tx.newDatabase()
 	enc := TextEncoding(m.Encoding)
@@ -100,7 +132,7 @@ func image(r *engine.Reader, m engine.Meta, pageSize int) ([]byte, error) {
 		case e.Type == "table" && e.Storage:
 			shape, err := r.Shape(e.Name)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			flags := btreeIntKey
 			if shape.WithoutRowid {
@@ -109,10 +141,10 @@ func image(r *engine.Reader, m engine.Meta, pageSize int) ([]byte, error) {
 			// Create the b-tree and placeholder catalog row.
 			root, err := tx.createTable(flags)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			if err := pagePutRow(tx, 1, e.Rowid, catalogNullRow); err != nil {
-				return nil, err
+				return err
 			}
 			// Its automatic indexes, created inside the same CREATE TABLE.
 			var autos []autoIndex
@@ -124,21 +156,21 @@ func image(r *engine.Reader, m engine.Meta, pageSize int) ([]byte, error) {
 				}
 				ki, err := indexKeyInfo(r, ir.Name, shape, enc)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				ixRoot, err := tx.createTable(btreeBlobKey)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				if err := pagePutRow(tx, 1, ir.Rowid, schemaRec(ir, ixRoot)); err != nil {
-					return nil, err
+					return err
 				}
 				autos = append(autos, autoIndex{name: ir.Name, root: ixRoot, ki: ki})
 				autoNames = append(autoNames, ir.Name)
 				done[j] = true
 			}
 			if err := pagePutRow(tx, 1, e.Rowid, schemaRec(e, root)); err != nil {
-				return nil, err
+				return err
 			}
 			// The rows, as INSERT writes them: the row, then each automatic
 			// index's entry for it.
@@ -161,36 +193,39 @@ func image(r *engine.Reader, m engine.Meta, pageSize int) ([]byte, error) {
 						return err
 					}
 				}
-				return nil
+				return tx.bt.pager.shrink(tx.bt)
 			})
 			if err != nil {
-				return nil, fmt.Errorf("export: %w", err)
+				return fmt.Errorf("export: %w", err)
 			}
 		case e.Type == "index" && e.Storage:
 			// Create the index b-tree and catalog row, then refill with sorted entries.
 			shape, err := r.Shape(e.TblName)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			ki, err := indexKeyInfo(r, e.Name, shape, enc)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			root, err := tx.createTable(btreeBlobKey)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			if err := pagePutRow(tx, 1, e.Rowid, schemaRec(e, root)); err != nil {
-				return nil, err
+				return err
 			}
 			if err := exportRefillIndex(tx, r, e, root, ki, enc); err != nil {
-				return nil, fmt.Errorf("export: index %s: %w", e.Name, err)
+				return fmt.Errorf("export: index %s: %w", e.Name, err)
 			}
 		default:
 			// A view, a trigger, a virtual table: a catalog row and no b-tree.
 			if err := pagePutRow(tx, 1, e.Rowid, schemaRec(e, 0)); err != nil {
-				return nil, err
+				return err
 			}
+		}
+		if err := pager.shrink(bt); err != nil {
+			return err
 		}
 	}
 	tx.updateMeta(1, m.SchemaVersion)
@@ -198,7 +233,7 @@ func image(r *engine.Reader, m engine.Meta, pageSize int) ([]byte, error) {
 	tx.updateMeta(8, m.ApplicationID)
 	if bt.autoVacuum {
 		if err := tx.autoVacuumCommit(); err != nil {
-			return nil, err
+			return err
 		}
 	}
 	// A fresh file after one commit, as VACUUM INTO writes it.
@@ -210,7 +245,7 @@ func image(r *engine.Reader, m engine.Meta, pageSize int) ([]byte, error) {
 	if m.WAL {
 		tx.page1.aData[18], tx.page1.aData[19] = 2, 2 // a WAL database's read/write versions
 	}
-	return bt.pager.commitInto(nil)
+	return bt.pager.commit()
 }
 
 // indexKeyInfo returns an index b-tree's KeyInfo with collations and sort orders,
@@ -233,37 +268,77 @@ func indexKeyInfo(r *engine.Reader, index string, shape engine.TableShape, enc T
 	return ki, nil
 }
 
-// exportRefillIndex fills an index's b-tree with entries in sorted order.
+// exportRefillIndex fills an index's b-tree with entries in sorted order: a
+// stable sort of the entries in rowid order, run on disk past exportSortBytes.
 func exportRefillIndex(tx *btTxn, r *engine.Reader, e engine.CatalogEntry, root uint32, ki *btKeyInfo, enc TextEncoding) error {
-	var recs [][]byte
-	err := r.Rows(e.TblName, []string{e.Name}, func(_ int64, _ []Value, entries [][]Value) error {
-		if entries[0] != nil {
-			ki.nAllField = len(entries[0])
-			recs = append(recs, encodeRecordEnc(entries[0], enc))
-		}
-		return nil
-	})
-	if err != nil || len(recs) == 0 {
-		return err
-	}
-	slices.SortStableFunc(recs, func(a, b []byte) int {
+	cmp := func(a, b []byte) int {
 		key, uerr := ki.unpack(b)
 		if uerr != nil {
 			return 0
 		}
 		c, _ := key.recordCompare(a)
 		return c
+	}
+	sorter := extsort.New(extsort.Codec[[]byte]{
+		Compare: cmp,
+		Size:    func(b []byte) int { return 24 + cap(b) },
+		Append:  func(dst, b []byte) []byte { return append(dst, b...) },
+		Decode:  func(b []byte) ([]byte, error) { return slices.Clone(b), nil },
+	}, exportSortBytes)
+	defer sorter.Close()
+	n, nan := 0, false
+	err := r.Rows(e.TblName, []string{e.Name}, func(_ int64, _ []Value, entries [][]Value) error {
+		if entries[0] == nil {
+			return nil
+		}
+		ki.nAllField = len(entries[0])
+		n++
+		nan = nan || valuesHaveNaN(entries[0])
+		return sorter.Add(encodeRecordEnc(entries[0], enc))
 	})
-	for i, rec := range recs {
+	if err != nil || n == 0 {
+		return err
+	}
+	insert := func(rec []byte) error {
 		if err := exportIndexInsert(tx, root, ki, rec); err != nil {
 			return err
 		}
-		if err := tx.bt.pager.shrink(tx.bt); err != nil {
+		return tx.bt.pager.shrink(tx.bt)
+	}
+	if !nan {
+		return sorter.Each(insert)
+	}
+	// A REAL NaN compares equal to every number, so the comparison is no order
+	// and the result depends on the sort that ran: this one is the in-memory
+	// sort over every entry. No file SQL writes holds one.
+	sorter.Close()
+	var recs [][]byte
+	err = r.Rows(e.TblName, []string{e.Name}, func(_ int64, _ []Value, entries [][]Value) error {
+		if entries[0] != nil {
+			recs = append(recs, encodeRecordEnc(entries[0], enc))
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	slices.SortStableFunc(recs, cmp)
+	for i, rec := range recs {
+		if err := insert(rec); err != nil {
 			return err
 		}
 		recs[i] = nil
 	}
 	return nil
+}
+
+func valuesHaveNaN(vs []Value) bool {
+	for _, v := range vs {
+		if v.Typ == Float && math.IsNaN(v.F) {
+			return true
+		}
+	}
+	return false
 }
 
 // exportIndexInsert puts one entry into an index b-tree.

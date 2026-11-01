@@ -579,15 +579,16 @@ const (
 
 	// OpSeekRowidHint: P1: cursor. P2: key register. Makes cursor P1's next
 	// OpRewind fetch only the row whose rowid == r[P2] (SeekRowidSegments,
-	// segment_seek.go), when r[P2] is an INTEGER; any other key leaves a full
-	// scan. Emitted by emitJoinLoops after OpOpenRead when detectRowidSeekKey
+	// segment_seek.go), r[P2] taking numeric affinity first; a key that is then
+	// no integer fetches nothing, as OP_SeekRowid. Emitted by emitJoinLoops
+	// after OpOpenRead when detectRowidSeekKey
 	// found "rowid = <const/param>" (or the IPK column). The conjunct is still
 	// evaluated in the loop, so this only restricts the rows scanned.
 	//
 	// P3==1 marks a correlated (join inner-side) seek: emitted inside the outer
 	// loop (emitJoinSeekHint, vdbe_join_seek.go) before the inner OpRewind, it
 	// sets vdbeCursor.seekReseek so the cursor re-materializes on every rewind.
-	// A non-integer key then does a full inner scan for that iteration.
+	// A key that is no integer fetches nothing for that iteration.
 	OpSeekRowidHint
 
 	// OpSeekIndexHint: P1: cursor. P2: key register. P4: *indexSeekHint (index
@@ -741,6 +742,13 @@ const (
 	// pc back.
 	OpJIT
 
+	// OpGenErrCheck raises the error r[P1] holds when it is a VIRTUAL generated
+	// column's (valueGenErr). A register row loaded whole from the table (the
+	// upsert's conflicting row) holds one where the column's expression raised;
+	// C computes the column only where an expression reads it, which is where
+	// the compiler places this.
+	OpGenErrCheck // P1: register.
+
 	numOpCodes // sentinel: count of opcodes, for the disassembler's name table.
 )
 
@@ -761,6 +769,15 @@ type indexSeekHint struct {
 	// index is the index's name, which EXPLAIN QUERY PLAN prints: a segment
 	// table's index has no root to look it up by.
 	index string
+	// slot is this key's place among the cursor's seek keys. 0 starts the
+	// list; each later slot is an equality on another column, any one of
+	// which bounds the rows as well as the first (see idxSeekRowids).
+	slot int
+	// is marks "x IS key", whose NULL key matches the NULLs.
+	is bool
+	// plan, on slot 0, is the loop C's planner chose for this table, which
+	// EXPLAIN QUERY PLAN prints in place of the hint's own index.
+	plan wherePlanExplain
 }
 
 // multiOrOrder is the autoIndexKey variant OpAutoIndexOrder applies when the

@@ -583,6 +583,9 @@ func (db *DB) execPragma(sqlText string) error {
 			return nil // a getter; its single row is discarded by an Exec
 		}
 		b := pragmaGetBoolean(stmt.ValueText, false)
+		if db.queryOnlyLocked && !b {
+			return ErrConfined
+		}
 		db.queryOnly = b
 		return nil
 	case "recursive_triggers":
@@ -854,16 +857,20 @@ func (db *DB) execPragma(sqlText string) error {
 			}
 		}
 		// The rows are the read side's; what reaches the exec side is whether
-		// the pragma FAILS, and the r-tree pass can fail it (rtree_check.go's
-		// integrityCheckRtrees). Main only: an attached or temp r-tree is not
-		// reached from here.
+		// the pragma FAILS: the row arm can fail it (integrityGenErr), and so can
+		// the r-tree pass (integrityCheckRtrees). Main only.
 		if stmt.Schema == "" || strings.EqualFold(stmt.Schema, "main") {
-			if len(db.vtabs) > 0 {
-				p, perr := db.SnapshotPager()
-				if perr != nil {
-					return perr
+			p, perr := db.SnapshotPager()
+			if perr != nil {
+				return perr
+			}
+			maxErr, only := integrityCheckArgs(stmt)
+			if maxErr > 0 {
+				if _, cerr := p.integrityCheckViolations(scopeMain, stmt, only, maxErr); cerr != nil && !errors.Is(cerr, errVDBEUnsupported) {
+					return cerr
 				}
-				_, only := integrityCheckArgs(stmt)
+			}
+			if len(db.vtabs) > 0 {
 				if _, verr := p.integrityCheckRtrees(scopeMain, only); verr != nil {
 					return verr
 				}
@@ -1088,6 +1095,19 @@ var ErrDiskFull = errors.New("engine: " + ErrMsgDiskFull)
 // connection-level flag across its one-session-per-statement model, can push it
 // into every session it opens (driver's Conn.queryOnly).
 func (db *DB) SetQueryOnly(on bool) { db.queryOnly = on }
+
+// ErrConfined is the error for a statement SetConfined refuses.
+var ErrConfined = errors.New("engine: not allowed on this connection")
+
+// SetConfined confines a session that serves remote clients: ATTACH and VACUUM
+// INTO, which name files on the server, are refused, and with readOnly
+// query_only is set and cannot be turned off.
+func (db *DB) SetConfined(readOnly bool) {
+	db.confined = true
+	if readOnly {
+		db.queryOnly, db.queryOnlyLocked = true, true
+	}
+}
 
 // QueryOnly reports the current "PRAGMA query_only" setting.
 func (db *DB) QueryOnly() bool { return db.queryOnly }
@@ -4535,20 +4555,21 @@ func (p *ReadOnlyPager) integrityCheckViolations(scope schemaScope, stmt *Pragma
 			other = scopeMain
 		}
 		qualify := findSchemaRowIn(rows, other, "table", tr.Name) != nil
-		counts, msgs, cerr := p.integrityRowFindings(tr, rows, qualify, isQuick)
+		// Only the first maxErr messages are kept; all are counted.
+		counts, msgs, nMsgs, cerr := p.integrityRowFindings(tr, rows, qualify, isQuick, maxErr)
 		if cerr != nil {
 			return nil, cerr
 		}
-		if len(counts)+len(msgs) > 0 {
+		if len(counts)+nMsgs > 0 {
 			tablesWithFindings++
 		}
 		if len(counts) > 0 {
 			countMsgs = append(countMsgs, counts...)
 			total += len(counts)
 		}
-		if len(msgs) > 0 {
+		if nMsgs > 0 {
 			bad = append(bad, badTable{tr.Name, msgs})
-			total += len(msgs)
+			total += nMsgs
 		}
 	}
 	// The cap is where the unreproducible table order stops being invisible:

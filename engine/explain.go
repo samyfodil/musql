@@ -399,11 +399,12 @@ func (p *ReadOnlyPager) explainCompoundPlan(stmt *SelectStmt) ([]explainPlanLine
 type explainScan struct {
 	cursor   int
 	name     string
-	rowidKey bool   // an OpSeekRowidHint reached this cursor
-	idxRoot  uint32 // an OpSeekIndexHint's index root, 0 for none
-	idxName  string // its index's name: a segment table's index has root 0
-	write    bool   // opened by OpOpenWrite: a DML target, scanned only if rewound
-	order    int    // rank in nested-loop order: the address of this cursor's OpRewind
+	rowidKey bool             // an OpSeekRowidHint reached this cursor
+	idxRoot  uint32           // an OpSeekIndexHint's index root, 0 for none
+	idxName  string           // its index's name: a segment table's index has root 0
+	plan     wherePlanExplain // the loop C's planner chose, when the port decided it
+	write    bool             // opened by OpOpenWrite: a DML target, scanned only if rewound
+	order    int              // rank in nested-loop order: the address of this cursor's OpRewind
 }
 
 // explainPlanDetails walks the program once and returns one detail string per
@@ -433,8 +434,8 @@ func (p *ReadOnlyPager) explainPlanDetails(prog *Program) []string {
 			}
 		case OpSeekIndexHint:
 			if s, ok := byCursor[in.P1]; ok && s != nil {
-				if h, ok := in.P4.(*indexSeekHint); ok {
-					s.idxRoot, s.idxName = h.root, h.index
+				if h, ok := in.P4.(*indexSeekHint); ok && h.slot == 0 {
+					s.idxRoot, s.idxName, s.plan = h.root, h.index, h.plan
 				}
 			}
 		}
@@ -469,6 +470,8 @@ func (p *ReadOnlyPager) explainPlanDetails(prog *Program) []string {
 		switch {
 		case s.rowidKey:
 			out = append(out, "SEARCH "+name+" USING INTEGER PRIMARY KEY (rowid=?)")
+		case s.plan.verb != "":
+			out = append(out, s.plan.line(name))
 		case s.idxRoot != 0 || s.idxName != "":
 			idx, col := p.explainIndexAt(s.idxRoot, s.idxName)
 			if idx == "" {

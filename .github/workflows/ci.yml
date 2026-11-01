@@ -19,7 +19,7 @@ jobs:
         include:
           - { os: ubuntu-latest,    name: linux-amd64,   race: "-race" }
           - { os: ubuntu-24.04-arm, name: linux-arm64,   race: "" }
-          - { os: macos-14,         name: darwin-arm64,  race: "" }
+          - { os: macos-15,         name: darwin-arm64,  race: "" }
           - { os: macos-15-intel,   name: darwin-amd64,  race: "" }
           - { os: windows-latest,   name: windows-amd64, race: "" }
           - { os: windows-11-arm,   name: windows-arm64, race: "" }
