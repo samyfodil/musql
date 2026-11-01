@@ -895,13 +895,14 @@ func detectRowidInKeys(c *compiler, srcs []joinSource, where Expr) (int, []Expr,
 }
 
 // isRowidInList reports an IN a rowid seek can answer: a list, not negated,
-// of literals and bound parameters, none of which can raise.
+// of literals, signs over them and bound parameters, none of which can raise.
 func isRowidInList(in InExpr) bool {
 	if in.Not || in.Sub != nil || len(in.List) == 0 {
 		return false
 	}
 	for _, e := range in.List {
-		if !isSeekKeyCandidate(e) || exprMayRaise(e) {
+		_, param := e.(ParamExpr)
+		if _, lit := inListConst(e); !param && !lit {
 			return false
 		}
 	}
