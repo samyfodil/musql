@@ -527,15 +527,17 @@ func TestImageCompactionRacesThePin(t *testing.T) {
 	if cutErr != nil {
 		t.Fatal(cutErr)
 	}
+	if got := dump(t, c.dbs["b"], `SELECT count(*) FROM t WHERE id IN (1000, 2)`); got != "1\n" {
+		t.Fatalf("b holds %q of the rows written and deleted after the cut", got)
+	}
 	after, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Where an open file stops a rename (Windows), the pin can keep the
+	// compaction from replacing the file, and the race did not happen.
 	if os.SameFile(before, after) {
-		t.Fatal("the donor's database was not compacted after the cut; the test means less")
-	}
-	if got := dump(t, c.dbs["b"], `SELECT count(*) FROM t WHERE id IN (1000, 2)`); got != "1\n" {
-		t.Fatalf("b holds %q of the rows written and deleted after the cut", got)
+		t.Skip("the donor's database was not compacted after the cut, so the race did not happen")
 	}
 }
 
