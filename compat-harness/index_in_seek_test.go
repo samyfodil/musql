@@ -168,3 +168,44 @@ func TestConstantSeekUnderGroupBy(t *testing.T) {
 		"COMMIT",
 	})
 }
+
+// The columnar GROUP BY walk tests an IN list itself: IN and NOT IN, a NULL
+// in the list, values that take the column's affinity, TEXT under the column's
+// collation, wide lists it walks and narrow ones it seeks, over rows in
+// segments and in the log.
+func TestGroupByInListWalk(t *testing.T) {
+	queries := []string{
+		"SELECT k, count(*), sum(v) FROM t WHERE j IN (0, 2, 5) GROUP BY k ORDER BY k",
+		"SELECT k, count(*) FROM t WHERE j NOT IN (1, 7, 9) GROUP BY k ORDER BY k",
+		"SELECT k, count(*) FROM t WHERE j IN (0, NULL, 2) GROUP BY k ORDER BY k",
+		"SELECT k, count(*) FROM t WHERE j NOT IN (1, NULL, 9) GROUP BY k ORDER BY k",
+		"SELECT k, count(*) FROM t WHERE j IN ('0', 2.0, 5) GROUP BY k ORDER BY k",
+		"SELECT k, min(v), max(v) FROM t WHERE s IN ('s1', 's2', 'S3') GROUP BY k ORDER BY k",
+		"SELECT k, count(*) FROM t WHERE n IN ('a1', 'B2', 'c0') GROUP BY k ORDER BY k",
+		"SELECT k, count(*) FROM t WHERE v IN (17, -4983, 9999, 3, -2) GROUP BY k ORDER BY k",
+		"SELECT k, sum(v) FROM t WHERE v > 0 AND j IN (0, 2, 5) AND s <> 's4' GROUP BY k ORDER BY k",
+		"SELECT j, count(*) FROM t WHERE k IN (5, 1, 3) GROUP BY j",
+	}
+	stmts := []string{
+		"CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, j INTEGER, v INTEGER, s TEXT, n TEXT COLLATE NOCASE)",
+		"WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM c WHERE x < 6000) INSERT INTO t " +
+			"SELECT x, x % 6, x % 3, (x * 7919) % 10000 - 5000, 's' || (x % 11), char(65 + x % 4) || (x % 3) FROM c",
+		"VACUUM",
+	}
+	stmts = append(stmts, queries...)
+	stmts = append(stmts,
+		"INSERT INTO t VALUES(7001, 2, 1, 4000, 's3', 'A1'), (7002, 9, 0, -4000, 's9', 'b2')",
+		"UPDATE t SET j = 5 WHERE id = 10",
+		"DELETE FROM t WHERE id = 20",
+	)
+	stmts = append(stmts, queries...)
+	differ(t, "GROUP BY IN list walk", stmts)
+
+	c, m := boundPair(t, stmts[:3])
+	for _, args := range [][]any{{0, 2, 9}, {"1", 2.0, nil}, {"s1", "s5", 3}} {
+		q := "SELECT k, count(*) FROM t WHERE j IN (?, ?, ?) GROUP BY k ORDER BY k"
+		if want, got := boundRows(c, q, args...), boundRows(m, q, args...); want != got {
+			t.Errorf("%s %v:\n  cgo:   %s\n  musql: %s", q, args, want, got)
+		}
+	}
+}

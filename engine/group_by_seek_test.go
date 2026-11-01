@@ -83,8 +83,8 @@ func TestGroupBySeeksMatchScan(t *testing.T) {
 }
 
 // TestGroupBySeekOrWalk: the columnar GROUP BY walk gives way to a seek that
-// reads a sliver of the table, and keeps a key that matches much of it. A
-// WHERE the walk cannot test (an IN list) leaves the loop, which seeks.
+// reads a sliver of the table, and keeps a key that matches much of it, an IN
+// list's included. A WHERE the walk cannot test leaves the loop.
 func TestGroupBySeekOrWalk(t *testing.T) {
 	if !JITEnabled() {
 		t.Skip("the columnar walk needs the JIT")
@@ -110,7 +110,10 @@ func TestGroupBySeekOrWalk(t *testing.T) {
 		{`SELECT k, count(*) FROM t WHERE b = 1 GROUP BY k`, "walk"},           // a third of the table
 		{`SELECT k, count(*) FROM t WHERE k = 2 GROUP BY k`, "walk"},           // a fifth of the table
 		{`SELECT k, count(*) FROM t WHERE a > 1990 GROUP BY k`, "walk"},        // a range: no seek
-		{`SELECT k, count(*) FROM t WHERE a IN (1, 2, 3) GROUP BY k`, "loop"},
+		{`SELECT k, count(*) FROM t WHERE a IN (1, 2, 3) GROUP BY k`, "seek"},  // 30 rows
+		{`SELECT k, count(*) FROM t WHERE a IN (` + inListLong() + `) GROUP BY k`, "walk"},
+		{`SELECT k, count(*) FROM t WHERE a NOT IN (1, 2, 3) GROUP BY k`, "walk"}, // no seek
+		{`SELECT k, count(*) FROM t WHERE a + 0 IN (1, 2, 3) GROUP BY k`, "loop"}, // an expression
 	} {
 		ResetSegFilterCountersForTest()
 		if _, _, err := p.QueryArgs(c.sql, nil); err != nil {
