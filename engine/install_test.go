@@ -101,6 +101,16 @@ func TestInstallSegmentFile(t *testing.T) {
 // committed and compacted after it, a copy of them opens as that state, and
 // the database's own sessions see what was committed after the pin.
 func TestPinCommittedFiles(t *testing.T) {
+	for _, copies := range []bool{false, true} {
+		t.Run(fmt.Sprintf("copies=%v", copies), func(t *testing.T) {
+			defer func(was bool) { openFilesStopRenames = was }(openFilesStopRenames)
+			openFilesStopRenames = copies
+			pinCommittedFilesCase(t)
+		})
+	}
+}
+
+func pinCommittedFilesCase(t *testing.T) {
 	dir := t.TempDir()
 	path, pinDir, cp := filepath.Join(dir, "db.musq"), filepath.Join(dir, "pin"), filepath.Join(dir, "copy.musq")
 	if err := os.Mkdir(pinDir, 0o700); err != nil {
