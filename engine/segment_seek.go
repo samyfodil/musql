@@ -424,6 +424,43 @@ type idxSeekKey struct {
 	col   int
 	probe Value
 	coll  string
+	// set, when not nil, is an IN list's values, each coerced like probe: the
+	// key matches any of them, and probe is unused.
+	set []Value
+}
+
+// seekIndexKeyEstimate is seekIndexEstimate for a key, an IN list's summed
+// over its values.
+func (src *segSource) seekIndexKeyEstimate(rootPage uint32, k idxSeekKey) (n, total int, ok bool) {
+	if k.set == nil {
+		return src.seekIndexEstimate(rootPage, k.col, k.probe)
+	}
+	for _, v := range k.set {
+		c, t, ok := src.seekIndexEstimate(rootPage, k.col, v)
+		if !ok {
+			return 0, 0, false
+		}
+		n, total = n+c, t
+	}
+	return n, total, true
+}
+
+// seekIndexKeyRowids is SeekIndexRowidsSegments for a key: an IN list's rows
+// are its values', ascending, each once.
+func (p *ReadOnlyPager) seekIndexKeyRowids(rootPage uint32, k idxSeekKey) ([]int64, bool) {
+	if k.set == nil {
+		return p.SeekIndexRowidsSegments(rootPage, k.col, k.probe, k.coll)
+	}
+	var out []int64
+	for _, v := range k.set {
+		rids, ok := p.SeekIndexRowidsSegments(rootPage, k.col, v, k.coll)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, rids...)
+	}
+	slices.Sort(out)
+	return slices.Compact(out), true
 }
 
 // SeekIndexRowidsByKeys is SeekIndexRowidsSegments over equalities on one
@@ -441,16 +478,16 @@ func (p *ReadOnlyPager) SeekIndexRowidsByKeys(rootPage uint32, keys []idxSeekKey
 	}
 	if len(keys) == 1 {
 		k := keys[0]
-		if n, total, ok := p.segs.seekIndexEstimate(rootPage, k.col, k.probe); ok && total >= seekMinRows && 2*n >= total {
+		if n, total, ok := p.segs.seekIndexKeyEstimate(rootPage, k); ok && total >= seekMinRows && 2*n >= total {
 			return nil, false
 		}
-		return p.SeekIndexRowidsSegments(rootPage, k.col, k.probe, k.coll)
+		return p.seekIndexKeyRowids(rootPage, k)
 	}
 	est := make([]int, len(keys))
 	order := make([]int, 0, len(keys))
 	for i, k := range keys {
 		est[i] = math.MaxInt
-		if n, total, ok := p.segs.seekIndexEstimate(rootPage, k.col, k.probe); ok {
+		if n, total, ok := p.segs.seekIndexKeyEstimate(rootPage, k); ok {
 			if total >= seekMinRows && 2*n >= total {
 				continue
 			}
@@ -460,7 +497,7 @@ func (p *ReadOnlyPager) SeekIndexRowidsByKeys(rootPage uint32, keys []idxSeekKey
 	}
 	slices.SortStableFunc(order, func(a, b int) int { return cmp.Compare(est[a], est[b]) })
 	for _, i := range order {
-		if rowids, ok := p.SeekIndexRowidsSegments(rootPage, keys[i].col, keys[i].probe, keys[i].coll); ok {
+		if rowids, ok := p.seekIndexKeyRowids(rootPage, keys[i]); ok {
 			segMultiKeySeeksServed.Add(1)
 			return rowids, true
 		}

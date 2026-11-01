@@ -448,7 +448,16 @@ func gatherSkip(prog *Program, at int) uint64 {
 				}
 			}
 			continue
-		case OpVariable, OpSeekIndexHint, OpSeekRowidHint, OpSeekRowidRangeHint, OpInteger, OpInt64, OpNull, OpSCopy, OpCopy,
+		case OpSeekIndexHint:
+			if h, _ := in.P4.(*indexSeekHint); h != nil && h.in > 0 {
+				for r := in.P2; r < in.P2+h.in; r++ {
+					if isSkipped(r) {
+						return 0
+					}
+				}
+				continue
+			}
+		case OpVariable, OpSeekRowidHint, OpSeekRowidRangeHint, OpInteger, OpInt64, OpNull, OpSCopy, OpCopy,
 			OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight,
 			OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpNot, OpNegative:
 			if in.Op == OpNull && in.P3 > in.P2 {

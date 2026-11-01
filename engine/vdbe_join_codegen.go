@@ -3074,11 +3074,17 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 			// detectIndexSeekKey (vdbe_scan.go). Its further keys follow as the
 			// hint's later slots.
 			for slot, k := range append([]*indexSeekPlan{s.idxSeek}, s.idxSeek.more...) {
-				keyReg, kerr := c.compileExpr(k.keyExpr)
+				var keyReg int
+				var kerr error
+				if k.keySet != nil {
+					keyReg, kerr = c.compileExprBlock(k.keySet)
+				} else {
+					keyReg, kerr = c.compileExpr(k.keyExpr)
+				}
 				if kerr != nil {
 					return kerr
 				}
-				h := &indexSeekHint{root: k.root, aff: k.aff, coll: k.coll, leadingCol: k.leadingCol, index: k.index, slot: slot, is: k.is}
+				h := &indexSeekHint{root: k.root, aff: k.aff, coll: k.coll, leadingCol: k.leadingCol, index: k.index, slot: slot, is: k.is, in: len(k.keySet)}
 				if slot == 0 {
 					h.plan = s.idxSeek.plan
 				}
