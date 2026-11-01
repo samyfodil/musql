@@ -414,6 +414,23 @@ const (
 func (a *Asm) ShlRegCL(dst Reg) { a.rex(4, dst); a.emit(0xD3, modrm(0b11, 4, dst)) }
 func (a *Asm) SarRegCL(dst Reg) { a.rex(7, dst); a.emit(0xD3, modrm(0b11, 7, dst)) }
 
+// SarRegImm8 shifts dst right by n, keeping its sign.
+func (a *Asm) SarRegImm8(dst Reg, n byte) { a.rex(7, dst); a.emit(0xC1, modrm(0b11, 7, dst), n) }
+
+// ImulRegRegImm32 is  dst = src * imm.
+func (a *Asm) ImulRegRegImm32(dst, src Reg, imm int32) {
+	a.rex(dst, src)
+	a.emit(0x69, modrm(0b11, dst, src))
+	a.emit32(uint32(imm))
+}
+
+// LeaRegMemD is  dst = base + disp.
+func (a *Asm) LeaRegMemD(dst, base Reg, disp int32) {
+	a.rex(dst, base)
+	a.emit(0x8D)
+	a.memD(dst, base, disp)
+}
+
 // CmpRegImm32 compares dst against imm.
 func (a *Asm) CmpRegImm32(dst Reg, imm int32) {
 	a.rex(7, dst)
