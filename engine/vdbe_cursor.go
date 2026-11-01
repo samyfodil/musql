@@ -1657,7 +1657,7 @@ func (cur *vdbeCursor) materializeWriteHits(hits []uint64, fromSeg bool) {
 	cur.rowsFrom, cur.rowsSwaps, cur.rowsWrites = tbl.rows, tbl.rows.swaps, tbl.rows.writes
 	cur.overlaySized = false
 	cur.writeHint = len(cur.rows)
-	if !slices.IsSorted(cur.rowids) { // the short rows come unioned at the end
+	if !slices.IsSortedFunc(cur.rowids, cmpRowid) { // the short rows come unioned at the end
 		sortRowsByRowid(cur)
 	} else {
 		cur.rowsBase = base // positions still those eachOf saw
@@ -1691,6 +1691,9 @@ func (cur *vdbeCursor) materializeRowidSet() bool {
 	return true
 }
 
+// cmpRowid orders two rowids as the signed integers they are.
+func cmpRowid(a, b uint64) int { return cmp.Compare(int64(a), int64(b)) }
+
 // sortRowsByRowid orders cur's materialized rows by rowid, keeping each row
 // with its rowid.
 func sortRowsByRowid(cur *vdbeCursor) {
@@ -1698,7 +1701,7 @@ func sortRowsByRowid(cur *vdbeCursor) {
 	for i := range idx {
 		idx[i] = i
 	}
-	slices.SortFunc(idx, func(a, b int) int { return cmp.Compare(cur.rowids[a], cur.rowids[b]) })
+	slices.SortFunc(idx, func(a, b int) int { return cmpRowid(cur.rowids[a], cur.rowids[b]) })
 	rids, rows := make([]uint64, len(idx)), make([][]Value, len(idx))
 	for i, j := range idx {
 		rids[i], rows[i] = cur.rowids[j], cur.rows[j]
