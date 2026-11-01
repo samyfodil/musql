@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/samyfodil/musql/engine"
 )
@@ -57,7 +58,7 @@ func TestStageImageChecksTheManifest(t *testing.T) {
 func TestAdoptImageRefuses(t *testing.T) {
 	ctx := context.Background()
 	c := newCluster(t)
-	c.open("a", imageDDL...)
+	c.openWith("a", []Option{WithSyncInterval(time.Hour)}, imageDDL...) // no round prunes a's ops
 	c.exec("a", `INSERT INTO t VALUES(1, 'one')`)
 	st := syncerOf(t, c.dbs["a"]).store
 	m, body, err := st.Image(ctx, imageRequest(bookkeepingLayout))
