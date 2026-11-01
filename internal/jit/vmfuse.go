@@ -85,6 +85,10 @@ func vmStepOf(in VInsn, pc int) progStep {
 		s.defs, s.fall, s.targets = []int{in.A}, false, []int{in.T}
 	case VColumn, VRowid:
 		s.defs = []int{in.C}
+	case VInSet:
+		// The keys from B on are written by the VDBE only, whose exits read
+		// every register.
+		s.uses, s.defs = []int{in.A, int(in.Imm)}, []int{in.C}
 	case VRewind, VNext:
 		s.targets = []int{in.T}
 	case VResultRow:

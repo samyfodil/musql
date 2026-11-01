@@ -856,6 +856,8 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 			break
 		}
 		e.column(pc, in)
+	case VInSet:
+		e.inSet(pc, in)
 	case VResultRow:
 		e.resultRow(pc, in)
 	case VIntGuard:
@@ -1015,6 +1017,51 @@ func (e *vmEmit) column(pc int, in VInsn) {
 	if val != RDX {
 		e.holds[in.C] = val // its I word; whether it is an INTEGER is still to be checked
 	}
+}
+
+// inSet is VInSet. The search halves the keys left, R9 of them from the one
+// whose I word RAX points at, keeping the last not above r[A]; RAX, RCX, R9
+// and R10 are scratch, and nothing is kept in them.
+func (e *vmEmit) inSet(pc int, in VInsn) {
+	a, L := e.a, e.lay
+	if n := e.src(pc, int(in.Imm), R9); n != R9 {
+		a.MovRegReg(R9, n)
+	}
+	a.TestRegReg(R9, R9)
+	e.jccStub(CondL, pc)
+	x := e.src(pc, in.A, RDX)
+	if !in.Dead {
+		e.destNoS(pc, in.C)
+	}
+	loop, done, none := fmt.Sprintf("in%d", pc), fmt.Sprintf("in%d.d", pc), fmt.Sprintf("in%d.n", pc)
+	a.LeaRegMemD(RAX, RSI, e.d(in.B, L.OffI))
+	a.Label(loop)
+	a.CmpRegImm32(R9, 1)
+	a.Jcc(CondLE, done)
+	a.MovRegReg(R10, R9)
+	a.SarRegImm8(R10, 1)
+	a.SubRegReg(R9, R10)
+	a.ImulRegRegImm32(RCX, R10, int32(L.Size))
+	a.AddRegReg(RCX, RAX)
+	a.AluRegMemD(AluCmp, x, RCX, 0)
+	a.Cmovcc(CondGE, RAX, RCX) // that key is not above x
+	a.Jmp(loop)
+	a.Label(done)
+	a.XorRegReg(R10, R10)
+	a.TestRegReg(R9, R9)
+	a.Jcc(CondE, none)
+	a.AluRegMemD(AluCmp, x, RAX, 0)
+	a.Setcc(CondE, R10)
+	a.Label(none)
+	if in.Dead {
+		e.clobber(in.C)
+		return
+	}
+	m := e.dest(pc, in.C, R10)
+	if m != R10 {
+		a.MovRegReg(m, R10)
+	}
+	e.storeInt(pc, in, in.C, m)
 }
 
 // copyAny is VCopy of any Value (OP_SCopy): all six words, the string or blob

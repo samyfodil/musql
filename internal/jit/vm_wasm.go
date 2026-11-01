@@ -19,6 +19,7 @@ const (
 	opI64GeU    byte = 0x5A
 	opI64Shl    byte = 0x86
 	opI64ShrS   byte = 0x87
+	opI64LeS    byte = 0x57
 	opIf        byte = 0x04
 	opElse      byte = 0x05
 )
@@ -90,6 +91,9 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 	w.op(opI32Load8U)
 	w.memarg(0, 0)
 	w.Set(e.wb)
+	if slices.ContainsFunc(prog, func(in VInsn) bool { return in.Op == VInSet }) {
+		e.keyp, e.keyq = w.Local(wI32), w.Local(wI32)
+	}
 	for _, in := range prog {
 		if in.Op == VColumn || in.Op == VNext || in.Op == VRewind || in.Op == VRowid {
 			e.curs, e.rowp, e.valp = w.Local(wI32), w.Local(wI32), w.Local(wI32)
@@ -160,6 +164,7 @@ type vmEmitWasm struct {
 	fuel, t1, t2, t3 uint32
 	ovf              uint32
 	curs, rowp, valp uint32 // the cursor table, a row's header, its first Value (when the program has cursor ops)
+	keyp, keyq       uint32 // VInSet's search: the candidate key and the halfway one
 	cur              int    // the pc whose code is being emitted
 	extra            int    // if-blocks opened inside it
 
@@ -714,6 +719,8 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 			w.StoreI64(e.addr(in.C, f))
 		})
 		e.know.wroteAny(in.C, false)
+	case VInSet:
+		e.inSet(pc, in)
 	case VResultRow:
 		e.resultRow(pc, in)
 	case VIntGuard:
@@ -959,4 +966,67 @@ func (e *vmEmitWasm) copyRow(in VInsn) {
 		w.LoadI64(e.addr(in.A, k))
 		w.StoreI64(uint32(k))
 	}
+}
+
+// inSet is VInSet, as vm_amd64.go's: t1 keys left from the one whose I word
+// keyp addresses, t2 half of them, keyq the key there.
+func (e *vmEmitWasm) inSet(pc int, in VInsn) {
+	w, L := e.w, e.lay
+	flag := int(in.Imm)
+	e.guards(pc, e.isInt(flag), e.isInt(in.A), e.dstNoS(in, in.C))
+	e.loadI64(flag, L.OffI)
+	w.Set(e.t1)
+	w.Get(e.t1)
+	w.I64(0)
+	w.op(opI64LtS)
+	e.exitIf(pc)
+	w.Get(e.regs)
+	w.I32(int32(e.addr(in.B, L.OffI)))
+	w.op(opI32Add)
+	w.Set(e.keyp)
+	w.op(opBlock, opVoid, opLoop, opVoid)
+	w.Get(e.t1)
+	w.I64(1)
+	w.op(opI64LeS)
+	w.BrIf(1)
+	w.Get(e.t1)
+	w.I64(1)
+	w.op(opI64ShrS)
+	w.Set(e.t2)
+	w.Get(e.t1)
+	w.Get(e.t2)
+	w.op(opI64Sub)
+	w.Set(e.t1)
+	w.Get(e.keyp)
+	w.Get(e.t2)
+	w.op(opI32WrapI64)
+	w.I32(int32(L.Size))
+	w.op(opI32Mul)
+	w.op(opI32Add)
+	w.Set(e.keyq)
+	// keyp = that key when it is not above x
+	w.Get(e.keyq)
+	w.Get(e.keyp)
+	w.Get(e.keyq)
+	w.LoadI64(0)
+	e.loadI64(in.A, L.OffI)
+	w.op(opI64LeS)
+	w.op(opSelect)
+	w.Set(e.keyp)
+	w.Br(0)
+	w.op(opEnd, opEnd)
+	w.I64(0)
+	w.Set(e.t3)
+	w.Get(e.t1)
+	w.op(opI64Eqz)
+	w.op(opI32Eqz)
+	e.openIf()
+	w.Get(e.keyp)
+	w.LoadI64(0)
+	e.loadI64(in.A, L.OffI)
+	w.op(opI64Eq)
+	w.op(opI64ExtendI32U)
+	w.Set(e.t3)
+	e.closeIf()
+	e.storeInt(in, in.C, e.t3)
 }
