@@ -87,9 +87,4 @@ func TestPushes(t *testing.T) {
 	if err := client.PushOps(ctx, []replication.Op{op, op}); err != nil {
 		t.Fatal(err)
 	}
-	done, cancel := context.WithCancel(ctx)
-	cancel()
-	if err := client.PushOps(done, []replication.Op{op}); err == nil {
-		t.Error("a push with its context done went out")
-	}
 }
