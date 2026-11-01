@@ -101,6 +101,8 @@ func (s *Server) admin(ctx context.Context, h http.Header) (*state.User, error) 
 func rpcErr(err error) error {
 	var ce *connect.Error
 	switch {
+	case err == nil:
+		return nil
 	case errors.As(err, &ce):
 		return err
 	case errors.Is(err, state.ErrNotFound):
