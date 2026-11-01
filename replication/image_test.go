@@ -106,6 +106,7 @@ func imageHistory(c *cluster) {
 		c.exec("a", fmt.Sprintf(`INSERT INTO t VALUES(%d, 'a%d')`, i, i), fmt.Sprintf(`INSERT INTO k VALUES('k%d')`, i))
 	}
 	c.exec("a", `UPDATE t SET v = 'changed' WHERE id < 5`, `DELETE FROM t WHERE id BETWEEN 10 AND 14`, `DELETE FROM k WHERE v = 'k3'`)
+	c.converge("", imageRowsT, imageRowsK)
 	c.exec("b", `INSERT INTO t VALUES(100, 'from b')`, `UPDATE t SET v = 'b won' WHERE id = 20`)
 	c.converge("", imageRowsT, imageRowsK)
 	c.partition(true)
