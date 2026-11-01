@@ -237,7 +237,6 @@ func (n *Node) Sync(ctx context.Context) error {
 // they arrive and runs a full anti-entropy Sync every syncInterval. It works
 // with any Transport (in-memory or libp2p), using only the Transport interface.
 //
-//
 // Pushed ops apply on a goroutine of their own, so they do not wait behind a
 // Sync round.
 func (n *Node) Run(ctx context.Context, syncInterval time.Duration) error {
