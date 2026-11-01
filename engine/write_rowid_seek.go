@@ -76,6 +76,41 @@ func emitWriteRowidSeekHint(c *compiler, tbl *tableMeta, cursor int, where Expr)
 	return true
 }
 
+// emitWriteRowidSetHint is emitWriteRowidSeekHint for "rowid IN (...)" over
+// literals and bound parameters (isRowidInList): C's write loop seeks each
+// value of the IN's ephemeral index, as a SELECT's does (detectRowidInKeys).
+// Where a term that can raise comes first and C's loop would read other rows,
+// it is declined (seekGuard): from is the target as the statement names it.
+func (db *DB) emitWriteRowidSetHint(c *compiler, tbl *tableMeta, cursor int, from FromItem, where Expr, trig *trigCompileCtx) bool {
+	if where == nil || tbl == nil || tbl.withoutRowid || rowidInOffForTest {
+		return false
+	}
+	cjs := splitTopLevelAnd(where)
+	guard := seekGuard{raiseAt: -1, tableRaiseAt: -1}
+	for pos, cj := range cjs {
+		if exprMayRaise(cj) && !c.holdsCorrelatedSelect(cj) && writeConjunctPerRow(cj) {
+			guard.raiseAt, guard.tableRaiseAt = pos, pos
+			guard.access = db.writeLoopAccess(tbl, from, where, trig)
+			break
+		}
+	}
+	for pos, cj := range cjs {
+		in, ok := cj.(InExpr)
+		if !ok || !isRowidInList(in) || !writeRowidRef(c, tbl, cursor, in.X) || !guard.keep(xnRowid, pos, true) {
+			continue
+		}
+		mark := len(c.insns)
+		base, err := c.compileExprBlock(in.List)
+		if err != nil {
+			c.insns = c.insns[:mark]
+			return false
+		}
+		c.emit(Instruction{Op: OpSeekRowidSetHint, P1: cursor, P2: base, P3: len(in.List)})
+		return true
+	}
+	return false
+}
+
 // isWriteSeekKeyCandidate is isSeekKeyCandidate plus a scalar subquery: C
 // codes an uncorrelated one once, as a constant, and seeks with its value
 // ("DELETE FROM t WHERE id = (SELECT max(id) FROM t)" is one seek there, and

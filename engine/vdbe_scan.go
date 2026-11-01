@@ -864,6 +864,54 @@ func detectRowidSeekKey(c *compiler, srcs []joinSource, where Expr) (int, Expr, 
 	return 0, nil, false
 }
 
+// detectRowidInKeys is detectRowidSeekKey for "rowid IN (E1, E2, ...)": a
+// top-level conjunct over srcs[i]'s rowid (or INTEGER PRIMARY KEY) whose list
+// is all literals and bound parameters. C plans it as a loop over the IN's
+// ephemeral index seeking each value (WHERE_IPK with WHERE_COLUMN_IN), which
+// visits the rows those values name, in ascending rowid order, each once:
+// OpSeekRowidSetHint's restriction. Where a term that can raise comes first and
+// C would read other rows, the seek is declined (seekGuard).
+func detectRowidInKeys(c *compiler, srcs []joinSource, where Expr) (int, []Expr, bool) {
+	if where == nil || rowidInOffForTest {
+		return 0, nil, false
+	}
+	conjuncts, at := seekConjunctsAt(where)
+	for i, s := range srcs {
+		if s.derived != nil || s.tbl == nil || s.tbl.withoutRowid || s.left || s.rightOuter {
+			continue
+		}
+		for n, cj := range conjuncts {
+			in, ok := cj.(InExpr)
+			if !ok || !isRowidInList(in) || !isScopeRowidRef(c, s, in.X) {
+				continue
+			}
+			if !newSeekGuard(c, srcs, i, splitTopLevelAnd(where)).keep(xnRowid, at[n], true) {
+				continue
+			}
+			return i, in.List, true
+		}
+	}
+	return 0, nil, false
+}
+
+// isRowidInList reports an IN a rowid seek can answer: a list, not negated,
+// of literals and bound parameters, none of which can raise.
+func isRowidInList(in InExpr) bool {
+	if in.Not || in.Sub != nil || len(in.List) == 0 {
+		return false
+	}
+	for _, e := range in.List {
+		if !isSeekKeyCandidate(e) || exprMayRaise(e) {
+			return false
+		}
+	}
+	return true
+}
+
+// rowidInOffForTest turns the rowid IN seek off, for a differential test's
+// reference.
+var rowidInOffForTest bool
+
 // rowidRangeOffForTest turns detectRowidRangeKey off, for a differential
 // test's reference.
 var rowidRangeOffForTest bool
@@ -1018,7 +1066,8 @@ func isScopeRowidRef(c *compiler, s joinSource, e Expr) bool {
 }
 
 // planConstantKeySeeks installs the seek a column-free key allows on one
-// source: a rowid point lookup; else the index equalities (detectIndexSeekKey),
+// source: a rowid point lookup; else a rowid IN list's lookups; else the index
+// equalities (detectIndexSeekKey),
 // which carry the planner's EXPLAIN QUERY PLAN line; else, with rowidRange, a
 // bound on the rowid. Each only restricts the candidates -- every conjunct stays
 // in the WHERE and is re-tested on each fetched row -- and leaves them in the
@@ -1026,6 +1075,10 @@ func isScopeRowidRef(c *compiler, s joinSource, e Expr) bool {
 func planConstantKeySeeks(c *compiler, srcs []joinSource, where Expr, rowidRange bool) {
 	if idx, key, ok := detectRowidSeekKey(c, srcs, where); ok {
 		srcs[idx].seekKeyExpr = key
+		return
+	}
+	if idx, keys, ok := detectRowidInKeys(c, srcs, where); ok {
+		srcs[idx].seekSet = keys
 		return
 	}
 	if idx, plan, ok := detectIndexSeekKey(c, srcs, where); ok {

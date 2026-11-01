@@ -439,6 +439,20 @@ func (c *compiler) allocN(n int) int {
 	return base
 }
 
+// compileExprBlock evaluates exprs into a consecutive block of registers and
+// returns its base.
+func (c *compiler) compileExprBlock(exprs []Expr) (int, error) {
+	base := c.allocN(len(exprs))
+	for i, e := range exprs {
+		r, err := c.compileExpr(e)
+		if err != nil {
+			return 0, err
+		}
+		c.emit(Instruction{Op: OpSCopy, P1: r, P2: base + i})
+	}
+	return base, nil
+}
+
 // allocCursor returns a fresh, never-before-used cursor number.
 func (c *compiler) allocCursor() int {
 	n := c.nCursor
