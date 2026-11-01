@@ -1963,9 +1963,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				break
 			}
 			// A key that is no integer equals no rowid: the cursor visits
-			// nothing, as C's loop does. A scan would test the rest of the
-			// WHERE on rows C never reads, and so raise errors C does not.
-			// The keyed conjunct is evaluated in the loop body regardless.
+			// nothing, as C's loop does, so the WHERE never runs on rows C skips.
 			key, ok := seekRowidKey(m.regs[op.P2])
 			cur := m.cursors[op.P1]
 			cur.seekConfigured, cur.seekNone = true, !ok
@@ -2029,11 +2027,10 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				if h.slot == 0 {
 					cur.idxSeekConfigured, cur.idxSeekMore, cur.idxSeekNext, cur.idxSeekSet = false, cur.idxSeekMore[:0], 0, nil
 				}
-				// A slot out of step is dropped, and so is the key of "x IS NULL",
-				// which no posting list holds, and a write's TEXT key in a UTF-16
-				// database, whose bytes need not decide its equality: the keys
-				// left bound the rows each on its own, and with none the scan
-				// decides.
+				// A slot out of step is dropped, as is the key of "x IS NULL" (no
+				// posting list holds NULL) and a write's TEXT key in a UTF-16
+				// database; the keys left each bound the rows, and with none the
+				// scan decides.
 				if h.slot == cur.idxSeekNext {
 					cur.idxSeekNext++
 					switch {

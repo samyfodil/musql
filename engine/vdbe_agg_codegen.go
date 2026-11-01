@@ -2098,10 +2098,9 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 		subRet = c.alloc()
 	}
 
-	// Constant-key seeks, as compileScanAggregate plans them: they keep the
-	// scan's rowid order, which grouping and group_concat see. Where the
-	// columnar GROUP BY walk can answer, it weighs the seek against itself
-	// at run time (seekIsNarrow).
+	// Constant-key seeks keep the scan's rowid order, which grouping and
+	// group_concat see; the columnar walk weighs them at run time
+	// (seekIsNarrow).
 	planConstantKeySeeks(c, srcs, stmt.Where, false)
 
 	// Predicate pushdown: see compileScanPlain (vdbe_scan.go). buckets prune at

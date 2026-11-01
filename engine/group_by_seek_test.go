@@ -7,10 +7,8 @@ import (
 	"testing"
 )
 
-// TestGroupBySeeksMatchScan: a GROUP BY whose WHERE an index or the rowid can
-// seek now does, and every form must answer what the same query does with no
-// seek -- group_concat's order inside a group included -- over segments, a
-// delta and a session's own rows, through the hash drain and the sorted one.
+// TestGroupBySeeksMatchScan: a GROUP BY that seeks answers as with no seek,
+// group_concat's order included, over segments, a delta and a session's rows.
 func TestGroupBySeeksMatchScan(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "g.musq")
 	stmts := []string{

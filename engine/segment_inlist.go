@@ -2,10 +2,9 @@ package engine
 
 import "slices"
 
-// The columnar GROUP BY walk tests a WHERE's IN lists over columns itself, as
-// it tests its comparisons: with the keys OpInList probes (inListRun), applied
-// a batch at a time beside segApplyPred, and the log's live rows through the
-// same membership. A value the keys cannot hold declines the whole walk.
+// The columnar GROUP BY walk tests a WHERE's IN lists itself, a batch at a
+// time beside segApplyPred, with OpInList's keys (inListRun). A value the keys
+// cannot hold declines the walk.
 
 // segPlanList is an IN list over a column (segParseInListGroup).
 type segPlanList struct {
@@ -55,9 +54,8 @@ func segParseInListGroup(in []Instruction, pc, limit, cursor, nextAt int) (segPl
 	return segPlanList{col: col, plan: plan, not: not}, p + 1, true
 }
 
-// segBindLists keys each list for this run, false when one cannot be: over the
-// rowid alias, which is stored NULL, in a UTF-16 database, or holding a value
-// the keys cannot.
+// segBindLists keys each list for this run; false over the rowid alias (stored
+// NULL), in a UTF-16 database, or for a value that cannot be keyed.
 func (m *vdbe) segBindLists(plan []segPlanList, ipk int) ([]segList, bool) {
 	out := make([]segList, 0, len(plan))
 	for _, pl := range plan {
@@ -73,9 +71,8 @@ func (m *vdbe) segBindLists(plan []segPlanList, ipk int) ([]segList, bool) {
 	return out, true
 }
 
-// passes reports whether the list's WHERE term is TRUE for v: a NULL result
-// -- v NULL, or no match in a list holding NULL -- passes neither IN nor NOT
-// IN. false in the second result when v cannot be keyed.
+// passes reports whether the list's term is TRUE for v; a NULL result passes
+// neither IN nor NOT IN. ok is false when v cannot be keyed.
 func (l segList) passes(v Value) (bool, bool) {
 	r, ok := l.run.membership(v)
 	if !ok {
@@ -84,9 +81,7 @@ func (l segList) passes(v Value) (bool, bool) {
 	return r.Typ == Int && (r.I != 0) != l.not, true
 }
 
-// segApplyList is segApplyPred for an IN list: a clean int64 block against a
-// list of integers by binary search, anything else through the list's
-// membership. false declines the walk.
+// segApplyList is segApplyPred for an IN list; false declines the walk.
 func segApplyList(s *segment, l segList, lo int, live []uint8) bool {
 	if l.run.ints != nil && l.run.aff != affText {
 		if kind, _ := s.scanKind(l.col); kind == segScanSlice {

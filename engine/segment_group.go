@@ -15,9 +15,8 @@ type segGroupPlan struct {
 	argRegs []int // register the scan body writes that argument into
 	agg     *aggPlan
 	seg     int // the AggStep segment selector (OpHashAggStep's P2)
-	// preds and lists are the WHERE, when there is one: only rows satisfying
-	// every comparison and IN list reach the aggregate, as in the loop this
-	// replaces.
+	// preds and lists are the WHERE: only rows passing every comparison and IN
+	// list reach the aggregate.
 	preds []segPlanPred
 	lists []segPlanList
 }

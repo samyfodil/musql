@@ -835,10 +835,8 @@ func compileScanPlain(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols 
 // are excluded because pruning would happen before the level's
 // match/NULL-extension bookkeeping (annotateJoinSeeks excludes them too).
 //
-// The conjunct stays in WHERE, so the seek only restricts candidates: "rowid =
-// K" holds for exactly the row with that rowid, and for none when K is no
-// integer under numeric affinity, which OpSeekRowidHint then reads as C's
-// OP_SeekRowid does: no row at all.
+// The conjunct stays in WHERE, so the seek only restricts candidates; a K that
+// is no integer under numeric affinity matches no row, as in C's OP_SeekRowid.
 func detectRowidSeekKey(c *compiler, srcs []joinSource, where Expr) (int, Expr, bool) {
 	if where == nil {
 		return 0, nil, false
@@ -864,13 +862,10 @@ func detectRowidSeekKey(c *compiler, srcs []joinSource, where Expr) (int, Expr, 
 	return 0, nil, false
 }
 
-// detectRowidInKeys is detectRowidSeekKey for "rowid IN (E1, E2, ...)": a
-// top-level conjunct over srcs[i]'s rowid (or INTEGER PRIMARY KEY) whose list
-// is all literals and bound parameters. C plans it as a loop over the IN's
-// ephemeral index seeking each value (WHERE_IPK with WHERE_COLUMN_IN), which
-// visits the rows those values name, in ascending rowid order, each once:
-// OpSeekRowidSetHint's restriction. Where a term that can raise comes first and
-// C would read other rows, the seek is declined (seekGuard).
+// detectRowidInKeys is detectRowidSeekKey for "rowid IN (list)" over literals
+// and parameters. C loops over the IN's ephemeral index (WHERE_IPK with
+// WHERE_COLUMN_IN), visiting the named rows in ascending rowid order, each
+// once. Declined where seekGuard says C would read other rows.
 func detectRowidInKeys(c *compiler, srcs []joinSource, where Expr) (int, []Expr, bool) {
 	if where == nil || rowidInOffForTest {
 		return 0, nil, false
@@ -1067,12 +1062,9 @@ func isScopeRowidRef(c *compiler, s joinSource, e Expr) bool {
 }
 
 // planConstantKeySeeks installs the seek a column-free key allows on one
-// source: a rowid point lookup; else a rowid IN list's lookups; else the index
-// equalities (detectIndexSeekKey),
-// which carry the planner's EXPLAIN QUERY PLAN line; else, with rowidRange, a
-// bound on the rowid. Each only restricts the candidates -- every conjunct stays
-// in the WHERE and is re-tested on each fetched row -- and leaves them in the
-// order the scan visits them, so it is result-neutral.
+// source: a rowid point lookup, else a rowid IN list, else index equalities
+// (which carry the planner's EXPLAIN line), else with rowidRange a rowid
+// bound. Each only restricts candidates and keeps the scan's order.
 func planConstantKeySeeks(c *compiler, srcs []joinSource, where Expr, rowidRange bool) {
 	if idx, key, ok := detectRowidSeekKey(c, srcs, where); ok {
 		srcs[idx].seekKeyExpr = key
@@ -1136,9 +1128,8 @@ type indexSeekPlan struct {
 	// keyExpr is unused.
 	keySet []Expr
 
-	// more are the other equalities on this table a seek can be answered from,
-	// emitted as OpSeekIndexHint's later slots. Any one of them bounds the
-	// rows, so the cursor asks the one the segments say holds fewest.
+	// more are the other equalities a seek can be answered from
+	// (OpSeekIndexHint's later slots); the cursor asks the smallest.
 	more []*indexSeekPlan
 	// plan is the loop the ported planner chose for the table, for EXPLAIN
 	// QUERY PLAN (markWherePlanIndexEligibility); empty when it did not decide.
@@ -1157,12 +1148,10 @@ type indexSeekPlan struct {
 //   - a top-level AND conjunct is "="/"==" between that column and a
 //     column-free key (isSeekKeyCandidate).
 //
-// Every such conjunct on that source is kept, the first as the plan and the
-// rest in its more: "WHERE tbl=? AND pk=?" over a key whose leading column
-// holds one value for the whole table is answered from pk's posting list.
-//
-// A key is dropped where skipping its rows would skip a row C tests a term
-// that can raise on (seekGuard, seek_raise.go).
+// Every such conjunct is kept, the first as the plan and the rest in more, so
+// a key whose leading column is constant is answered from a later column's
+// posting list. A key is dropped where seekGuard says skipping its rows would
+// skip a row C raises on.
 //
 // As with detectRowidSeekKey the key is evaluated once after OpOpenRead, and
 // the conjunct stays in WHERE, so the seek only restricts. The probe
@@ -1254,10 +1243,9 @@ func detectIndexSeekKey(c *compiler, srcs []joinSource, where Expr) (int, *index
 // maxSeekKeys bounds how many equalities one seek weighs against each other.
 const maxSeekKeys = 8
 
-// columnSeekPlan is the seek on "colExpr = keyExpr" when colExpr is a column of
-// s some candidate leads on and keyExpr is constant for the scan. The INTEGER
-// PRIMARY KEY column is the rowid's (detectRowidSeekKey): it is stored NULL, so
-// no column index holds its values.
+// columnSeekPlan is the seek on "colExpr = keyExpr" over a column some
+// candidate leads on, keyExpr constant for the scan. The INTEGER PRIMARY KEY is
+// the rowid's: stored NULL, no column index holds it.
 func columnSeekPlan(c *compiler, s joinSource, cands []indexSeekCandidate, be BinaryExpr, colExpr, keyExpr Expr) (*indexSeekPlan, bool) {
 	colIdx, ok := scopeColumnIndex(c, s, colExpr)
 	if !ok || colIdx == s.tbl.ipkIndex || !isSeekKeyCandidate(keyExpr) && !isOuterSeekKey(c, keyExpr) {

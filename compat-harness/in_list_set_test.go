@@ -6,11 +6,9 @@ import (
 	"testing"
 )
 
-// C codes an IN over three or more constants as a probe of an ephemeral index
-// of the list (sqlite3FindInIndex's IN_INDEX_EPH): each value takes the left
-// operand's affinity and compares under its collation, and a NULL with no
-// match makes the answer NULL. Every column affinity and collation, over rows
-// in segments and in the log.
+// TestInListSet: C probes an ephemeral index for an IN over three or more
+// constants (IN_INDEX_EPH), with the left operand's affinity and collation and
+// its NULL rules, for every column affinity and collation.
 func TestInListSet(t *testing.T) {
 	vals := []string{"1", "2", "3", "-1", "-4", "4.5", "6", "'6'", "'a'", "'A'", "'c'", "'c '", "'d'",
 		"'x' || char(0) || 'z'", "'x' || char(0) || 'q'", "X'01'", "X'02'", "NULL", "2.0", "'2'", "' 4'",

@@ -8,10 +8,8 @@ import (
 	"testing"
 )
 
-// C codes "col IN (list)" on an indexed column as a loop over the IN's values
-// seeking the index for each, and tests a term that can raise on those rows
-// alone; the order a query without ORDER BY gets is the index's. Reads and
-// writes, over rows in segments and in the log.
+// TestIndexInSeek: C seeks the index for each value of "col IN (list)" and
+// tests a raising term on those rows alone, in the index's order.
 func TestIndexInSeek(t *testing.T) {
 	setup := []string{
 		"CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, a INTEGER, s TEXT COLLATE NOCASE, j TEXT)",
@@ -169,10 +167,8 @@ func TestConstantSeekUnderGroupBy(t *testing.T) {
 	})
 }
 
-// The columnar GROUP BY walk tests an IN list itself: IN and NOT IN, a NULL
-// in the list, values that take the column's affinity, TEXT under the column's
-// collation, wide lists it walks and narrow ones it seeks, over rows in
-// segments and in the log.
+// TestGroupByInListWalk: the columnar GROUP BY walk tests IN and NOT IN lists
+// itself, NULLs, affinity and collation included, walked or seeked.
 func TestGroupByInListWalk(t *testing.T) {
 	queries := []string{
 		"SELECT k, count(*), sum(v) FROM t WHERE j IN (0, 2, 5) GROUP BY k ORDER BY k",

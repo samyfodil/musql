@@ -76,11 +76,9 @@ func emitWriteRowidSeekHint(c *compiler, tbl *tableMeta, cursor int, where Expr)
 	return true
 }
 
-// emitWriteRowidSetHint is emitWriteRowidSeekHint for "rowid IN (...)" over
-// literals and bound parameters (isSeekInList): C's write loop seeks each
-// value of the IN's ephemeral index, as a SELECT's does (detectRowidInKeys).
-// Where a term that can raise comes first and C's loop would read other rows,
-// it is declined (seekGuard): from is the target as the statement names it.
+// emitWriteRowidSetHint is emitWriteRowidSeekHint for "rowid IN (list)"
+// (isSeekInList), as detectRowidInKeys plans a SELECT's; declined where
+// seekGuard says C's loop would read other rows.
 func (db *DB) emitWriteRowidSetHint(c *compiler, tbl *tableMeta, cursor int, from FromItem, where Expr, trig *trigCompileCtx) bool {
 	if where == nil || tbl == nil || tbl.withoutRowid || rowidInOffForTest {
 		return false
@@ -153,15 +151,11 @@ func keyRunsBeforeTheLoop(insns []Instruction, cursor int) bool {
 // order C visits one key's rows in whether it walks an index or the table, and
 // the conjunct still runs on every fetched row, so the hint only narrows.
 //
-// Every such conjunct is a key, up to maxSeekKeys, as the hint's slots: the
-// cursor asks the one whose column holds fewest rows (writeSeekRowids). The
-// comparison's collation is the column's own, the key being a bare literal or
-// parameter. The INTEGER PRIMARY KEY column is never a key: it is stored NULL,
-// its value being the rowid.
 //
-// A key a conjunct that can raise comes before is kept only where C's own loop
-// leaves it exact (seekGuard): from is the target as the statement names it,
-// for asking the planner what that loop is.
+// Every such conjunct is a key, up to maxSeekKeys, as the hint's slots; the
+// cursor asks the smallest (writeSeekRowids). The INTEGER PRIMARY KEY is never
+// a key: it is stored NULL. A key behind a raising conjunct is kept only where
+// seekGuard says C's loop leaves it exact.
 func (db *DB) emitWriteIndexSeekHint(c *compiler, tbl *tableMeta, cursor int, from FromItem, where Expr, trig *trigCompileCtx) bool {
 	if writeIndexSeekOffForTest || where == nil || tbl == nil || tbl.withoutRowid || hasGeneratedCols(tbl.cols) {
 		return false

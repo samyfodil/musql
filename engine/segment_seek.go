@@ -280,9 +280,8 @@ func certainlyUnequal(v, probe Value) bool {
 // index plus its written rows: when that index is built already, or the
 // written rows are most of the table, so building it costs about what one
 // seek through the snapshot would, or seeks have already tested as many
-// written rows as building it reads. Without that last rule a transaction
-// writing tens of thousands of rows and seeking between them -- a snapshot a
-// new replica merges -- tested every written row on every seek.
+// written rows as building it reads; otherwise a large transaction seeking
+// between its writes tested every written row on every seek.
 func (s *rowStore) prefersEqIndex(col int) bool {
 	if s == nil || s.spill != nil {
 		return false
@@ -357,15 +356,11 @@ func (src *segSource) deltaIsSmallFor(rootPage uint32, segs []*segment) bool {
 	return n*8 <= rows
 }
 
-// withDeltaRowids unions in every rowid the log holds live for this table whose
-// col could equal probe, then sorts and dedupes.
-//
-// The log's rows postdate the column index, so each is tested here -- with
-// certainlyUnequal, which keeps whatever a collation or an affinity might make
-// equal -- rather than unioned whole: a whole log was a whole table of rows
-// fetched, re-tested by the WHERE and sorted into the planner's order once per
-// seek, and the replication clock seeks once per op. A rowid the log KILLED is
-// left in, because the row fetch that follows reports it absent and drops it.
+// withDeltaRowids unions in the rowids the log holds live whose col could
+// equal probe, then sorts and dedupes. Each log row is tested (certainlyUnequal
+// keeps whatever an affinity or collation might make equal) rather than
+// unioned whole, which fetched the whole log on every seek. A rowid the log
+// killed is left in; the fetch drops it.
 func (src *segSource) withDeltaRowids(rootPage uint32, rowids []int64, col int, probe Value) []int64 {
 	if src.delta != nil {
 		if ti, known := src.tableOf[rootPage]; known {
@@ -464,14 +459,11 @@ func (p *ReadOnlyPager) seekIndexKeyRowids(rootPage uint32, k idxSeekKey) ([]int
 }
 
 // SeekIndexRowidsByKeys is SeekIndexRowidsSegments over equalities on one
-// table. Each key's candidates are a superset of the rows that match all of
-// them, so the key whose column the segments say holds the fewest matching rows
-// is asked first, and a key they cannot answer gives way to the next.
-//
-// A key matching half the table or more is dropped: fetching each of its rows
-// costs more than the scan, which tests them all at a fraction of the price
-// (25,000 rows, every one matching: 14.2ms through the seek, 10.4ms scanned).
-// With no key left the scan answers.
+// table. Each key's candidates are a superset of the answer, so the key with
+// the fewest matching rows is asked first, and one the segments cannot answer
+// gives way to the next. A key matching half the table or more is dropped:
+// fetching its rows costs more than the scan (25,000 matching rows: 14.2 ms
+// seeked, 10.4 ms scanned).
 func (p *ReadOnlyPager) SeekIndexRowidsByKeys(rootPage uint32, keys []idxSeekKey) ([]int64, bool) {
 	if p == nil || p.segs == nil {
 		return nil, false
@@ -513,11 +505,10 @@ const seekMinRows = 256
 // tests.
 var segMultiKeySeeksServed atomic.Int64
 
-// seekIndexEstimate is how many rows of the table's segments hold probe in col,
-// counted in each segment's index without building a list, and how many rows
-// those segments hold. It leaves out the delta log and the session's own
-// writes, which every key's candidates take in alike. false when a segment keeps
-// no index this probe can ask.
+// seekIndexEstimate is how many segment rows hold probe in col, counted in
+// each segment's index, and how many rows the segments hold; the log and the
+// session's writes, which every key shares, are left out. false when a segment
+// has no index for the probe.
 func (src *segSource) seekIndexEstimate(rootPage uint32, col int, probe Value) (n, total int, ok bool) {
 	rows, live, err := src.liveRows(rootPage)
 	if err != nil {

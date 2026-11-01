@@ -1067,12 +1067,10 @@ func resolveSubProgramLimitOffset(pager *ReadOnlyPager, stmt *SelectStmt) (resto
 	return restore, deferred, nil
 }
 
-// noteRunFold records that the statement being compiled built a value of this
-// run into its program: a LIMIT or OFFSET it evaluated (a subquery in it reads
-// the database, a parameter is bound per run, random() differs; C codes the
-// clause into a register and evaluates it on every run, computeLimitRegisters,
-// select.c:2517), or fts5's corpus statistics (buildFts5AuxState). The plan
-// caches refuse such a program (cachePlan, cachedWriteProgram).
+// noteRunFold records that the compile built a value of this run into its
+// program: a LIMIT or OFFSET it evaluated (C codes those into a register per
+// run, computeLimitRegisters) or fts5's corpus statistics. The plan caches
+// refuse such a program.
 func (p *ReadOnlyPager) noteRunFold() {
 	if p == nil {
 		return

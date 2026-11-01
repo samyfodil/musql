@@ -8,10 +8,7 @@ import (
 	"testing"
 )
 
-// inListLists are IN lists of every class and shape the set keys: integers,
-// a REAL with and without a fraction, numeric and other TEXT, letters in both
-// cases, trailing spaces and an embedded NUL, a BLOB, NULL, signs, and a long
-// list.
+// inListLists cover every class and shape the set keys.
 var inListLists = []string{
 	`1, 2, 3`,
 	`3, 1, 2, 1, 3`,
@@ -36,11 +33,9 @@ func inListLong() string {
 	return b.String()
 }
 
-// TestInListMatchesChain: an IN over three or more literals and parameters is
-// a set (OpInList), so for every column affinity and collation, every list and
-// NOT IN, the answers -- the NULLs included -- must be the comparison chain's.
-// Over segments the program JIT runs the probe, over the log and a session's
-// rows the VDBE does.
+// TestInListMatchesChain: the set answers as the comparison chain for every
+// affinity, collation, list and NOT IN, through the program JIT over segments
+// and the VDBE over the log.
 func TestInListMatchesChain(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l.musq")
 	stmts := []string{`CREATE TABLE t(i INTEGER, r REAL, s TEXT, n TEXT COLLATE NOCASE, rt TEXT COLLATE RTRIM, b BLOB, x)`}

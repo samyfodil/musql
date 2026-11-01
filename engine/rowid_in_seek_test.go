@@ -8,10 +8,8 @@ import (
 	"testing"
 )
 
-// rowidInLists are IN lists over the rowid: unsorted and repeated values,
-// rowids that are missing (every multiple of 7) or negative, both ends of
-// int64, and values of every class -- a TEXT or REAL that numeric affinity
-// makes an integer, one it does not, NULL, a BLOB.
+// rowidInLists: unsorted, repeated, missing and negative rowids, both ends of
+// int64, and values of every class.
 var rowidInLists = []string{
 	`1, 2, 3`,
 	`3, 1, 2, 1, 3`,
@@ -34,10 +32,8 @@ func rowidInLong() string {
 	return b.String()
 }
 
-// TestRowidInSeekMatchesScan: "rowid IN (...)" seeks each value
-// (OpSeekRowidSetHint), so every form of it must return exactly the rows the
-// same query compiled without the seek returns, over several segments, a delta
-// beside them, and a session's own rows.
+// TestRowidInSeekMatchesScan: "rowid IN (...)" returns exactly the rows of the
+// query compiled without the seek.
 func TestRowidInSeekMatchesScan(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "r.musq")
 	stmts := []string{`CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, s TEXT)`}
@@ -137,10 +133,8 @@ func TestRowidInSeekMatchesScan(t *testing.T) {
 	})
 }
 
-// TestRowidInSeekWrites: an UPDATE or DELETE whose WHERE holds "rowid IN
-// (...)" seeks each value, and must change the rows, in the order, the walk of
-// the whole table does: the RETURNING rows and the table after it agree with
-// the statement compiled without the seek.
+// TestRowidInSeekWrites: UPDATE and DELETE over "rowid IN (...)" change the
+// rows, in the order, of the statement compiled without the seek.
 func TestRowidInSeekWrites(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "w.musq")
 	stmts := []string{`CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, s TEXT)`}

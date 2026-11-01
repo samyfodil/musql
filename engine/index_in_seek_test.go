@@ -8,10 +8,8 @@ import (
 	"testing"
 )
 
-// TestIndexInSeekMatchesScan: "col IN (list)" on an indexed column seeks each
-// value's rows (OpSeekIndexHint with an IN list), so every form must return
-// what the same query does with no index seek, over segments, a delta and a
-// session's own rows.
+// TestIndexInSeekMatchesScan: "col IN (list)" seeks each value and answers as
+// with no seek, over segments, a delta and a session's rows.
 func TestIndexInSeekMatchesScan(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "x.musq")
 	stmts := []string{

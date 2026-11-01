@@ -8,10 +8,8 @@ import (
 	"testing"
 )
 
-// TestVMInSet: VInSet finds every probe among sorted keys of every length, in
-// a program entered anywhere and in a fused one whose operand is held in a
-// machine register, and exits writing nothing when the count is not a
-// non-negative INTEGER or the operand is not an INTEGER.
+// TestVMInSet: VInSet finds every probe among sorted keys, entered anywhere or
+// fused, and exits writing nothing on a bad count or operand.
 func TestVMInSet(t *testing.T) {
 	if !Available {
 		t.Skip("no JIT on this platform")

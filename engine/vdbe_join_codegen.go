@@ -120,7 +120,7 @@ type joinSource struct {
 	// source's index seek (indexSeekPlan.plan).
 	planExplain wherePlanExplain
 	// planAccess is the same plan's access path, which decides the seek keys
-	// a WHERE that can raise an error leaves exact (seekKeyKept).
+	// a WHERE that can raise leaves exact (seekGuard).
 	planAccess wherePlanAccess
 
 	// onToWhere marks an INNER item whose ON clause was moved into the WHERE, as
@@ -233,10 +233,8 @@ type joinSource struct {
 	// most one source per compile.
 	seekKeyExpr Expr
 
-	// seekSet, when non-nil, is the list of a WHERE conjunct "rowid IN (...)"
-	// whose every element is column-free: emitJoinLoops evaluates them once
-	// after OpOpenRead and emits OpSeekRowidSetHint. Set by detectRowidInKeys
-	// when no seekKeyExpr applies.
+	// seekSet is the column-free list of a "rowid IN (...)" conjunct,
+	// evaluated once after OpOpenRead for OpSeekRowidSetHint.
 	seekSet []Expr
 
 	// rowidRange, when non-nil, is a WHERE conjunct bounding this table's rowid

@@ -8,10 +8,8 @@ import (
 	"testing"
 )
 
-// C codes "rowid IN (list)" as a loop over the IN's ephemeral index, seeking
-// each value: the rows come in ascending rowid order, each once, and a term
-// that can raise is tested only on those rows. Every shape here runs over
-// rows held in segments and in the log beside them.
+// TestRowidInSeek: C seeks each value of "rowid IN (list)", ascending and once
+// each, and tests a raising term on those rows alone.
 func TestRowidInSeek(t *testing.T) {
 	setup := []string{
 		"CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, j TEXT)",

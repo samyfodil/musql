@@ -118,12 +118,11 @@ type vdbeCursor struct {
 	// narrows the candidate set and cannot change the result.
 	seekConfigured bool
 	seekKey        int64
-	// seekNone is a seek whose key is no integer even under numeric affinity,
-	// so no rowid equals it and the lookup finds nothing.
+	// seekNone: the key is no integer even under numeric affinity, so no rowid
+	// equals it.
 	seekNone bool
-	// seekSet, when seekSetConfigured, is the rowids an IN list pins the rowid
-	// to (OpSeekRowidSetHint), ascending and each once: the first rewind()
-	// fetches those rows and no others. Like seekKey it only narrows.
+	// seekSet: the rowids an IN list pins (OpSeekRowidSetHint), ascending and
+	// distinct; like seekKey it only narrows.
 	seekSetConfigured bool
 	seekSet           []int64
 
@@ -147,9 +146,8 @@ type vdbeCursor struct {
 	idxSeekSet []Value
 	// idxSeekCol is the TABLE column the index leads on.
 	idxSeekCol int
-	// idxSeekMore are the keys of OpSeekIndexHint's later slots: equalities on
-	// other columns of the same table, each of which bounds the rows alone.
-	// idxSeekNext is the slot expected next.
+	// idxSeekMore: later OpSeekIndexHint slots, equalities on other columns
+	// that each bound the rows alone; idxSeekNext is the slot expected next.
 	idxSeekMore []idxSeekKey
 	idxSeekNext int
 
@@ -263,8 +261,6 @@ func (cur *vdbeCursor) hasRealCols() bool {
 	return cur.realCached == 1
 }
 
-// hasGeneratedCols reports whether this cursor's table declares any generated
-// column, memoized in genCached (see its doc comment).
 // columns is the column list of the table cur reads: a read cursor's, or a
 // write cursor's (rowStore).
 func (cur *vdbeCursor) columns() []columnInfo {
@@ -277,6 +273,8 @@ func (cur *vdbeCursor) columns() []columnInfo {
 	return nil
 }
 
+// hasGeneratedCols reports whether this cursor's table declares any generated
+// column, memoized in genCached (see its doc comment).
 func (cur *vdbeCursor) hasGeneratedCols() bool {
 	if cur.genCached == 0 {
 		if hasGeneratedCols(cur.columns()) {
@@ -288,15 +286,11 @@ func (cur *vdbeCursor) hasGeneratedCols() bool {
 	return cur.genCached == 1
 }
 
-// idxSeekRowids is the candidates of this cursor's equality seek, false when no
-// key can be answered. Each key bounds the rows by itself, because every
-// conjunct is re-checked on every row the seek returns, so several keys are
-// answered by whichever the segments say holds the fewest rows.
-//
-// A VIRTUAL generated column is never a key: it is not stored, and a row written
-// before "ALTER TABLE ADD COLUMN ... AS (expr)" holds NULL in its slot, which the
-// posting list files as matching nothing (C's CREATE INDEX computes the key from
-// the expression).
+// idxSeekRowids is the candidates of this cursor's equality seek, false when
+// no key can be answered. Each key bounds the rows alone (every conjunct is
+// re-checked), so the key the segments estimate smallest answers. A VIRTUAL
+// generated column is never a key: rows from before its ADD COLUMN hold NULL
+// in its slot.
 func (cur *vdbeCursor) idxSeekRowids() ([]int64, bool) {
 	stored := func(col int) bool {
 		return col < 0 || col >= len(cur.tbl.cols) || !cur.tbl.cols[col].IsGenerated() || cur.tbl.cols[col].GeneratedStored
@@ -319,16 +313,13 @@ func (cur *vdbeCursor) idxSeekRowids() ([]int64, bool) {
 	return cur.pager.SeekIndexRowidsByKeys(cur.tbl.root, keys)
 }
 
-// seekNarrowRatio is how many rows of a native walk cost what fetching one
-// row through a seek does: about 10 ns a row walked against 2.5 us a row
-// fetched and run through the loop, measured over 300k rows.
+// seekNarrowRatio is how many rows a native walk reads in the time a seek
+// fetches one (about 10 ns against 2.5 us, measured over 300k rows).
 const seekNarrowRatio = 256
 
-// seekIsNarrow reports whether the seek planned on cur reads at most a
-// seekNarrowRatio-th of the table's rows, so that it should answer rather than
-// a walk of every row. A rowid seek reads one row a key; an index seek as many
-// as the key its segments estimate fewest for (SeekIndexRowidsByKeys asks that
-// one first), of the keys they serve. No estimate leaves the walk.
+// seekIsNarrow reports whether the seek reads at most a seekNarrowRatio-th of
+// the table, so it should answer rather than a walk. An index seek counts the
+// served key with the smallest estimate; no estimate leaves the walk.
 func (cur *vdbeCursor) seekIsNarrow() bool {
 	if cur.tbl == nil || cur.pager == nil || cur.pager.segs == nil {
 		return false
@@ -379,14 +370,10 @@ func (cur *vdbeCursor) idxSeekKeyServed(k idxSeekKey) bool {
 	return true
 }
 
-// writeSeekRowids is a write cursor's equality candidates, from its store's
-// indexes: its own (eqRowidsOf) where prefersEqIndex says so, else the
-// committed segments' (segEqRowids). Several keys are asked in the order of how
-// many rows the segments say each holds. fromSeg says the segments answered,
-// which drops the rows the store deleted. A TEXT probe under a sequence other
-// than BINARY is no key: both indexes match exact values (and OpSeekIndexHint
-// keeps no TEXT key of a UTF-16 database, whose bytes need not decide its
-// equality).
+// writeSeekRowids is a write cursor's equality candidates: its store's own
+// indexes where prefersEqIndex says so, else the segments' (fromSeg, which
+// already drops deleted rows), smallest estimate first. A TEXT probe under a
+// non-BINARY collation is no key: both indexes match exact bytes.
 func (cur *vdbeCursor) writeSeekRowids() (hits []uint64, fromSeg, ok bool) {
 	rows := cur.rowStore.rows
 	askOne := func(col int, probe Value, coll string) ([]uint64, bool, bool) {
@@ -731,11 +718,9 @@ func seekRowidKey(v Value) (int64, bool) {
 }
 
 // narrowRowidRangeBy is narrowRowidRange for a bound of any class, read as
-// OP_SeekGT and its kin read one (vdbe.c): numeric affinity first, then a REAL
-// by the integers either side of it; a NULL bound, or a TEXT or BLOB one below
-// which every number sorts, leaves no row for a lower bound, and an upper one
-// of those leaves them all. Exact, like the integer bound: a scan reading rows
-// outside it would test the rest of the WHERE on rows C never reads.
+// OP_SeekGT and kin read it: numeric affinity, then a REAL by the integers
+// either side. A NULL, TEXT or BLOB bound leaves no row for a lower bound and
+// every row for an upper one. Exact, so the WHERE never runs on rows C skips.
 func (cur *vdbeCursor) narrowRowidRangeBy(kind int, key Value) {
 	if key.Typ != Int {
 		key = applyAffinityToValue(key, affNumeric)
@@ -1711,15 +1696,13 @@ func (cur *vdbeCursor) orderByWithoutRowidPK() {
 }
 
 // materializeWriteHits builds a write cursor's rows from the rowids a seek
-// named, in that order, dropping those its store does not hold. fromSeg says
-// the committed segments named them, which already left out the rows the
-// store deleted.
+// named, dropping those its store does not hold (fromSeg: the segments already
+// dropped deleted rows).
 func (cur *vdbeCursor) materializeWriteHits(hits []uint64, fromSeg bool) {
 	tbl := cur.rowStore
 	cur.rowids, cur.rows = slices.Grow(cur.rowids[:0], len(hits)), slices.Grow(cur.rows[:0], len(hits))
-	// The stored rows are kept as they are and fixed up as each becomes
-	// current (lazyNorm), as materializeRowStore does, rather than copied
-	// here: a tenth of a table is thousands of rows.
+	// Rows are fixed up as each becomes current (lazyNorm), as
+	// materializeRowStore does, rather than copied here.
 	lazy := rowStoreNormalizesLazily(tbl)
 	ncols := len(tbl.cols)
 	base := make([]uint64, (len(hits)+63)/64)

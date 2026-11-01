@@ -610,19 +610,14 @@ const (
 	OpSeekRowidRangeHint
 
 	// OpSeekRowidSetHint: P1: cursor. P2: first key register. P3: how many.
-	// Makes cursor P1's next OpRewind fetch only the rows whose rowid is one of
-	// r[P2..P2+P3-1], each key taking numeric affinity first as for
-	// OpSeekRowidHint, in ascending rowid order: C's IN loop over the rowid,
-	// whose ephemeral index holds each value once, sorted. Emitted after
-	// OpOpenRead when detectRowidInKeys found "rowid IN (<consts/params>)". The
-	// IN is still evaluated in the loop, so this only restricts the rows
-	// scanned.
+	// Makes the next OpRewind fetch only the rows whose rowid is one of
+	// r[P2..P2+P3-1] (numeric affinity first), ascending: C's IN loop over the
+	// rowid. The IN is still evaluated, so this only restricts.
 	OpSeekRowidSetHint
 
-	// OpInList: r[P2] = r[P1] IN (list), 1, 0 or NULL, the list's literals and
-	// bound parameters in P4 (*inListPlan) and P3 the first of the registers
-	// its keys are kept in for the run. C's ephemeral index of a constant list
-	// (sqlite3FindInIndex's IN_INDEX_EPH), as a set; see in_list.go.
+	// OpInList: r[P2] = r[P1] IN (list): 1, 0 or NULL. P4 (*inListPlan) holds
+	// the literals and parameters, P3 the first register of the run's keys.
+	// C's IN_INDEX_EPH, as a set (in_list.go).
 	OpInList
 
 	// OpAutoIndexOrder: P1: cursor. P4: *autoIndexKey. Materializes cursor P1 if
@@ -759,10 +754,8 @@ const (
 	OpJIT
 
 	// OpGenErrCheck raises the error r[P1] holds when it is a VIRTUAL generated
-	// column's (valueGenErr). A register row loaded whole from the table (the
-	// upsert's conflicting row) holds one where the column's expression raised;
-	// C computes the column only where an expression reads it, which is where
-	// the compiler places this.
+	// column's (valueGenErr): a row loaded whole holds one, and C raises only
+	// where an expression reads the column, which is where this is placed.
 	OpGenErrCheck // P1: register.
 
 	numOpCodes // sentinel: count of opcodes, for the disassembler's name table.
@@ -785,9 +778,8 @@ type indexSeekHint struct {
 	// index is the index's name, which EXPLAIN QUERY PLAN prints: a segment
 	// table's index has no root to look it up by.
 	index string
-	// slot is this key's place among the cursor's seek keys. 0 starts the
-	// list; each later slot is an equality on another column, any one of
-	// which bounds the rows as well as the first (see idxSeekRowids).
+	// slot is this key's place among the cursor's seek keys; each later slot
+	// is an equality on another column that bounds the rows as well.
 	slot int
 	// is marks "x IS key", whose NULL key matches the NULLs.
 	is bool

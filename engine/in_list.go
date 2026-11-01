@@ -5,55 +5,43 @@ import (
 	"strings"
 )
 
-// An IN over a list of literals and bound parameters was a comparison per
-// element per row (compileIn's chain). C builds an ephemeral index of a list
-// of three or more constants once and probes it per row (sqlite3FindInIndex,
-// IN_INDEX_EPH); OpInList is that index as a set built once per run: its
-// values sorted in registers when they are all integers, where native code
-// searches them too, and otherwise hashed with in_hash.go's keys.
-//
-// Equality is the chain's: each value takes X's own affinity (exprINAffinity
-// of a list) and compares under X's collation, and a NULL on either side with
-// no match is NULL (finalizeIn). NOT IN is the OpNot of it.
+// C probes an ephemeral index for an IN over three or more constants
+// (sqlite3FindInIndex, IN_INDEX_EPH); OpInList is that index as a set built
+// once per run: sorted integers in registers, which native code also searches,
+// or else a hash of in_hash.go's keys. Equality is compileIn's chain's: X's
+// affinity and collation, NULL rules by finalizeIn. NOT IN is its OpNot.
 
-// inListSetMin is the shortest list made a set: C codes two or fewer terms as
-// comparisons (IN_INDEX_NOOP).
+// inListSetMin: C codes two or fewer terms as comparisons (IN_INDEX_NOOP).
 const inListSetMin = 3
 
-// inListOffForTest keeps every list a chain of comparisons, the reference a
-// test compares the set against.
+// inListOffForTest keeps every list a chain, the reference for tests.
 var inListOffForTest bool
 
 // inListPlan is OpInList's P4. P1 is X's register, P2 the result's, and P3 a
-// flag register followed by one register per element: a run's first probe
-// writes the sorted integers there and their count in the flag, or -1 in the
-// flag when the values are not all integers or one is NULL.
+// flag register then one register per element: a run's first probe writes the
+// sorted integers there and their count in the flag, or -1 for a hashed set.
 type inListPlan struct {
 	lits   []Value // the literal elements
 	params []int   // the 1-based indices of the parameter elements
 	aff    affinity
 	coll   string // "", NOCASE or RTRIM
-	// ints is the literals' integers, sorted and distinct, when there are no
-	// parameters and every literal is one: the keys the program JIT compiles
-	// the probe from.
+	// ints is the literals' sorted, distinct integers when there are no
+	// parameters and every literal is one.
 	ints []int64
-	// set is the literals' keys when there are no parameters and ints does
-	// not hold them; slot is the subCache slot a run keys a list with
-	// parameters in.
+	// set is the literals' keys otherwise; slot is the subCache slot that
+	// holds a run's set when there are parameters.
 	set  *inListSet
 	slot int
 }
 
-// inListSet is a list's values keyed as the chain compares them.
 type inListSet struct {
 	keys    map[inHashKey]struct{}
 	hasNull bool
 }
 
-// newInListPlan is the plan for "X IN (list)" with X's affinity and
-// collation, or nil when the list is a chain: too short, an element other
-// than a literal, a sign over one or a bound parameter, or a collation whose
-// equality is not bytes.
+// newInListPlan is the plan for "X IN (list)", or nil when the list stays a
+// chain: too short, an element other than a literal, signed literal or
+// parameter, or a collation whose equality is not bytes.
 func newInListPlan(list []Expr, aff affinity, coll string) *inListPlan {
 	if inListOffForTest || len(list) < inListSetMin {
 		return nil
@@ -95,8 +83,7 @@ func newInListPlan(list []Expr, aff affinity, coll string) *inListPlan {
 	return plan
 }
 
-// inListConst is e's value when e is a literal, or a sign over one folded as
-// OpNegative computes it.
+// inListConst is e's value when e is a literal or a sign over one.
 func inListConst(e Expr) (Value, bool) {
 	switch x := e.(type) {
 	case LiteralExpr:
@@ -114,8 +101,7 @@ func inListConst(e Expr) (Value, bool) {
 	return Value{}, false
 }
 
-// inListKeys keys vals; ok is false when one cannot be keyed (a NaN), which
-// leaves the comparisons to answer.
+// inListKeys keys vals; false when one cannot be keyed (a NaN).
 func inListKeys(vals []Value, aff affinity, coll string) (keys []inHashKey, hasNull, ok bool) {
 	keys = make([]inHashKey, 0, len(vals))
 	for _, v := range vals {
@@ -153,9 +139,8 @@ func newInListSet(keys []inHashKey, hasNull bool) *inListSet {
 	return s
 }
 
-// nativeKeys is what the program JIT compiles the probe from, for a list of
-// integers compared as integers: the literals' integers, sorted, and the
-// parameters, whose caller declines a bound value that is not an INTEGER.
+// nativeKeys is what the program JIT compiles the probe from, for integers
+// compared as integers; the caller declines a bound value that is not one.
 func (plan *inListPlan) nativeKeys() (ints []int64, params []int, ok bool) {
 	if plan == nil || plan.aff != affNone && plan.aff != affNumeric {
 		return nil, nil, false
@@ -181,10 +166,9 @@ func (plan *inListPlan) nativeKeys() (ints []int64, params []int, ok bool) {
 	return ints, plan.params, true
 }
 
-// inListKey is inKeyOf with a TEXT value keyed under coll: NOCASE compares
-// letters folded to lower case and stops at the first NUL of either side,
-// breaking a tie by length (nocaseCompare), and RTRIM ignores trailing
-// spaces.
+// inListKey is inKeyOf with TEXT keyed under coll: NOCASE folds ASCII case up
+// to the first NUL and keeps the length as a tie-break (nocaseCompare), RTRIM
+// drops trailing spaces.
 func inListKey(v Value, aff affinity, coll string) (inHashKey, bool, bool) {
 	k, null, ok := inKeyOf(v, aff)
 	if !ok || null || k.class != 't' {
@@ -208,15 +192,14 @@ func inListKey(v Value, aff affinity, coll string) (inHashKey, bool, bool) {
 	return k, false, true
 }
 
-// inList is OpInList's answer for the current row.
 func (m *vdbe) inList(op *Instruction) Value {
 	plan := op.P4.(*inListPlan)
 	x := m.regs[op.P1]
 	if x.Typ == Null {
 		return Value{Typ: Null}
 	}
-	// A UTF-16 database compares TEXT in its own encoding, where two byte
-	// strings that are not valid UTF-8 may come out alike.
+	// UTF-16 TEXT compares in its own encoding, where two invalid UTF-8 byte
+	// strings may come out alike.
 	if isUTF16(m.encoding()) {
 		return m.inListScan(x, plan)
 	}
@@ -246,10 +229,8 @@ func (m *vdbe) inList(op *Instruction) Value {
 	return finalizeIn(found, s.hasNull, false)
 }
 
-// inListRun is a list's values keyed for one run, with its parameters bound:
-// its integers sorted when every value is one and none is NULL, else its set.
-// OpInList keeps it in registers and the subCache; the columnar GROUP BY walk
-// probes it directly (segList).
+// inListRun is a list keyed for one run with its parameters bound, shared by
+// OpInList and the columnar GROUP BY walk (segList).
 type inListRun struct {
 	aff  affinity
 	coll string
@@ -257,9 +238,8 @@ type inListRun struct {
 	set  *inListSet
 }
 
-// newInListRun keys plan's values for a run bound to params, false when the
-// comparisons must answer instead: a UTF-16 database, which compares TEXT in
-// its own encoding (inList scans there), or a value that cannot be keyed.
+// newInListRun keys plan's values for a run; false when the comparisons must
+// answer instead: a UTF-16 database or a value that cannot be keyed.
 func newInListRun(plan *inListPlan, params []Value, enc TextEncoding) (*inListRun, bool) {
 	if isUTF16(enc) {
 		return nil, false
@@ -284,8 +264,8 @@ func newInListRun(plan *inListPlan, params []Value, enc TextEncoding) (*inListRu
 	return r, true
 }
 
-// membership is the IN's answer for x: 1, 0 or NULL. false when x cannot be
-// keyed, which leaves the comparisons to answer.
+// membership is the IN's answer for x: 1, 0 or NULL; false when x cannot be
+// keyed.
 func (r *inListRun) membership(x Value) (Value, bool) {
 	if x.Typ == Null {
 		return Value{Typ: Null}, true
@@ -309,9 +289,8 @@ func (r *inListRun) membership(x Value) (Value, bool) {
 	return finalizeIn(found, r.set.hasNull, false), true
 }
 
-// inListBuild keys the list for this run: its integers sorted into the
-// registers after P3 with their count in P3, or -1 in P3 and the set in
-// plan.set or the subCache slot.
+// inListBuild keys the list for this run: sorted integers after P3 with their
+// count in P3, or -1 in P3 and the set in plan.set or the subCache slot.
 func (m *vdbe) inListBuild(op *Instruction, plan *inListPlan) {
 	m.regs[op.P3] = Value{Typ: Int, I: -1}
 	r, ok := newInListRun(plan, m.params, m.encoding())
@@ -330,7 +309,6 @@ func (m *vdbe) inListBuild(op *Instruction, plan *inListPlan) {
 	m.regs[op.P3] = Value{Typ: Int, I: int64(len(r.ints))}
 }
 
-// inListSearch reports whether x is among keys, INTEGERs in ascending order.
 func inListSearch(keys []Value, x int64) bool {
 	lo, hi := 0, len(keys)
 	for lo < hi {
@@ -344,8 +322,7 @@ func inListSearch(keys []Value, x int64) bool {
 	return lo < len(keys) && keys[lo].I == x
 }
 
-// inListScan is the chain of comparisons compileIn codes for the list,
-// answering what the set cannot key.
+// inListScan is compileIn's chain of comparisons, for what the set cannot key.
 func (m *vdbe) inListScan(x Value, plan *inListPlan) Value {
 	coll := plan.coll
 	if coll == "" {

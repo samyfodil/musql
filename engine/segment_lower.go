@@ -49,9 +49,8 @@ type segLowered struct {
 	// service-only program.
 	textFold bool
 	textLike bool // a POpTextMatch was lowered, so textFold matters
-	// sorted are the IN lists over bound parameters whose values the caller
-	// sorts into registers before the call (seedSorted), for addInList's tree
-	// to search.
+	// sorted are the IN lists over parameters whose values the caller sorts
+	// into registers before the call (seedSorted).
 	sorted []segSortedKeys
 }
 
@@ -63,9 +62,8 @@ type segSortedKeys struct {
 	params []int
 }
 
-// seedSorted writes each list's sorted values into its registers, false when a
-// bound value is not an INTEGER: every value in a compiled program is an int64,
-// as the constants' seeding says.
+// seedSorted writes each list's sorted values into its registers; false when
+// a bound value is not an INTEGER, since compiled programs hold int64s.
 func (l *segLowered) seedSorted(regs []int64, params []Value) bool {
 	for _, g := range l.sorted {
 		vals := slices.Clip(g.lits)
@@ -590,11 +588,9 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 	return out, true
 }
 
-// addInList lowers OpInList over integers: r[dst] = 1 when r[x] is one of
-// the keys, searched by a tree of comparisons, and 0 otherwise. The keys are
-// ints, sorted, or with keyRegs the registers the caller fills with the
-// sorted values (seedSorted). tmp holds each comparison and con each
-// constant. jumps takes the jumps whose targets are IR indices.
+// addInList lowers OpInList over integers: r[dst] = 1 when r[x] is a key, by a
+// tree of comparisons. The keys are ints, or with keyRegs the sorted registers
+// seedSorted fills. tmp holds each comparison and con each constant.
 func (l *segLowered) addInList(x, dst, tmp, con int, ints []int64, keyRegs []int, jumps *[][2]int) {
 	var found, missed []int
 	test := func(cond jit.Cond, r int) int {
