@@ -159,13 +159,6 @@ func (h *History) Close() error {
 	return h.log.Close()
 }
 
-// Path is the database file the history follows.
-func (h *History) Path() string {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.path
-}
-
 func (h *History) logPath() string { return filepath.Join(h.dir, "log") }
 
 func (h *History) baseFiles(seq uint64) (musq, delta string) {
@@ -519,18 +512,6 @@ func (h *History) Restore(at time.Time, dst string) error {
 		return ErrBeforeHistory
 	}
 	return h.materialize(i, dst)
-}
-
-// RestoreSnapshot writes the state a base holds to dst.
-func (h *History) RestoreSnapshot(seq uint64, dst string) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for i := range h.entries {
-		if e := &h.entries[i]; e.seq == seq && e.isBase() {
-			return h.materialize(i, dst)
-		}
-	}
-	return fmt.Errorf("store: no snapshot %d", seq)
 }
 
 // materialize writes the state after entry i to dst and dst.delta, each
