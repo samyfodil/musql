@@ -3228,8 +3228,9 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 	}
 	// A statement made for this one call has no arena to reuse: its first
 	// TEXT or BLOB copy took a whole chunk of one, so a call's arena is the
-	// size its arguments take.
+	// size its arguments take, and its result slab holds the one result.
 	st.bytesArena = argArena(args)
+	st.results = make([]execResult, 0, 1)
 	return st.ExecContext(ctx, args)
 }
 
