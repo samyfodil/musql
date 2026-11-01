@@ -101,7 +101,11 @@ func TestInstallSegmentFile(t *testing.T) {
 // committed and compacted after it, a copy of them opens as that state, and
 // the database's own sessions see what was committed after the pin.
 func TestPinCommittedFiles(t *testing.T) {
-	for _, copies := range []bool{false, true} {
+	modes := []bool{true}
+	if !openFilesStopRenames {
+		modes = append(modes, false) // files held open stop renames on Windows
+	}
+	for _, copies := range modes {
 		t.Run(fmt.Sprintf("copies=%v", copies), func(t *testing.T) {
 			defer func(was bool) { openFilesStopRenames = was }(openFilesStopRenames)
 			openFilesStopRenames = copies

@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"maps"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -34,6 +35,20 @@ func catchUpPair(t *testing.T) (path string, a, b *Session) {
 		return s
 	}
 	return path, open(), open()
+}
+
+// catchUpsFold reports whether a refresh can fold new batches into the delta
+// state it has: only where segment files are shared (segFileKeyOf), whose
+// identity tells the catch-up the session still reads the same file.
+func catchUpsFold(t *testing.T) bool {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	_, ok := segFileKeyOf(f)
+	return ok
 }
 
 func mustCommit(t *testing.T, s *Session, stmts ...string) {
@@ -140,6 +155,7 @@ func buildIndexes(t *testing.T, s *Session) {
 // TestCatchUpFoldsInTheNewBatches: a catch-up folds in only the new batches
 // and answers as a session opened on the file.
 func TestCatchUpFoldsInTheNewBatches(t *testing.T) {
+	fold := catchUpsFold(t)
 	_, a, b := catchUpPair(t)
 	render(t, b, `SELECT count(*) FROM c`)
 	mustCommit(t, b, `INSERT INTO p(k, s) VALUES(1, 'b0')`)
@@ -159,10 +175,10 @@ func TestCatchUpFoldsInTheNewBatches(t *testing.T) {
 		if refreshed, err := b.RefreshIfStale(); err != nil || !refreshed {
 			t.Fatalf("round %d: refresh %v, %v", i, refreshed, err)
 		}
-		if deltaStateOf(b.src) != st {
+		if fold && deltaStateOf(b.src) != st {
 			t.Fatalf("round %d: the refresh replayed the delta whole instead of folding in the new batches", i)
 		}
-		if b.segColumns == nil || b.segColumnsStale {
+		if fold && (b.segColumns == nil || b.segColumnsStale) {
 			t.Fatalf("round %d: the refresh dropped the committed column view instead of moving it past the new batches", i)
 		}
 		for _, q := range []string{`SELECT rowid, * FROM c ORDER BY rowid`, `SELECT rowid, * FROM p ORDER BY rowid`, `SELECT k, count(*) FROM p WHERE k = 4 GROUP BY k`,
@@ -306,11 +322,13 @@ func TestCatchUpKeepsIndexesThroughItsOwnCompaction(t *testing.T) {
 	if _, err := a.RefreshIfStale(); err != nil {
 		t.Fatal(err)
 	}
-	if deltaStateOf(a.src) != st {
-		t.Fatal("the catch-up after the rewrite replayed the delta whole")
-	}
-	if now := slices.Collect(maps.Values(a.tableNamed("c").rows.uqIdx)); len(now) != 1 || now[0] != before[0] {
-		t.Fatal("the catch-up after the rewrite built the UNIQUE probe again")
+	if catchUpsFold(t) {
+		if deltaStateOf(a.src) != st {
+			t.Fatal("the catch-up after the rewrite replayed the delta whole")
+		}
+		if now := slices.Collect(maps.Values(a.tableNamed("c").rows.uqIdx)); len(now) != 1 || now[0] != before[0] {
+			t.Fatal("the catch-up after the rewrite built the UNIQUE probe again")
+		}
 	}
 	indexesExact(t, path, a)
 }
@@ -341,7 +359,7 @@ func TestCatchUpAfterAFailedCommit(t *testing.T) {
 	if refreshed, err := b.RefreshIfStale(); err != nil || !refreshed {
 		t.Fatalf("refresh %v, %v", refreshed, err)
 	}
-	if deltaStateOf(b.src) != st {
+	if catchUpsFold(t) && deltaStateOf(b.src) != st {
 		t.Fatal("the rebuild after the failed commit replayed the delta whole")
 	}
 	indexesExact(t, path, b)
