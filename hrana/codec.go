@@ -61,18 +61,6 @@ func marshal(b *bytes.Buffer, m vtMessage, delimited bool) ([]byte, error) {
 	return out[:k+n], nil
 }
 
-// writeMsg writes m, marshalled through a pooled buffer.
-func writeMsg(w io.Writer, m vtMessage) error {
-	b := getBuf()
-	defer putBuf(b)
-	out, err := marshal(b, m, false)
-	if err != nil {
-		return err
-	}
-	_, err = w.Write(out)
-	return err
-}
-
 // delimWriter writes delimited messages, each through the same buffer.
 type delimWriter struct {
 	w io.Writer
