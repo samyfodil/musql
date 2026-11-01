@@ -84,8 +84,8 @@ func (p *PinnedFiles) Close() error {
 }
 
 // openFilesStopRenames is whether a file held open cannot be renamed over or
-// removed, as on Windows.
-const openFilesStopRenames = runtime.GOOS == "windows"
+// removed, as on Windows; a variable so a test can take the copy path anywhere.
+var openFilesStopRenames = runtime.GOOS == "windows"
 
 // PinCommittedFiles opens path's committed state under the shared lock. Later
 // commits append past DeltaLen and compactions rename, so the open files keep
