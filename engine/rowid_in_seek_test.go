@@ -177,7 +177,8 @@ func TestRowidInSeekWrites(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return ret, after, nil
+		// Copied: the rows may read the session's mapping, gone with it.
+		return copyRows(ret), copyRows(after), nil
 	}
 	for _, f := range forms {
 		for _, l := range lists {
@@ -203,6 +204,7 @@ func TestRowidInSeekFires(t *testing.T) {
 	p := buildRowidSeekTestDB(t)
 	fires := []string{
 		"SELECT v FROM t WHERE id IN (1, 2, 3)",
+		"SELECT v FROM t WHERE id IN (-100, -1, +2)",
 		"SELECT v FROM t WHERE rowid IN (?, ?)",
 		"SELECT v FROM t WHERE v > 0 AND id IN (1, 'x', NULL)",
 	}
@@ -232,4 +234,16 @@ func TestRowidInSeekFires(t *testing.T) {
 			t.Errorf("did NOT expect SeekRowidSetHint for %q, got:\n%s", sql, d)
 		}
 	}
+}
+
+// copyRows is rows with every TEXT and BLOB copied.
+func copyRows(rows [][]Value) [][]Value {
+	out := make([][]Value, len(rows))
+	for i, r := range rows {
+		out[i] = make([]Value, len(r))
+		for j, v := range r {
+			out[i][j] = copyValue(v)
+		}
+	}
+	return out
 }

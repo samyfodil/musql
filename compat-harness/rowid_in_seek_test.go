@@ -88,6 +88,20 @@ func TestRowidInSeekWrites(t *testing.T) {
 	differ(t, "rowid IN seek writes", stmts)
 }
 
+// A write that seeks a column's equality visits its rows in rowid order,
+// negative rowids first.
+func TestWriteSeekNegativeRowidOrder(t *testing.T) {
+	differ(t, "write seek negative rowids", []string{
+		"CREATE TABLE w(id INTEGER PRIMARY KEY, a, b)",
+		"INSERT INTO w VALUES(-5, 1, 'x'), (-1, 1, 'y'), (3, 1, 'z'), (7, 1, 'w'), (9, 2, 'v')",
+		"VACUUM",
+		"INSERT INTO w VALUES(-9, 1, 'u'), (11, 1, 't')",
+		"UPDATE w SET b = b || '!' WHERE a = 1 RETURNING id, b",
+		"DELETE FROM w WHERE a = 1 RETURNING id",
+		"SELECT id, a, b FROM w",
+	})
+}
+
 // The list's values bound as parameters, of every class.
 func TestRowidInSeekParams(t *testing.T) {
 	c, m := boundPair(t, []string{
