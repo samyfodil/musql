@@ -58,7 +58,8 @@ var segRowQueries = []struct {
 }{
 	{`SELECT id, k, v FROM t WHERE v > 500000 ORDER BY id`, true, ""},
 	{`SELECT * FROM t WHERE id < 20 ORDER BY id`, true, ""},
-	{`SELECT s, b FROM t WHERE k = 3 ORDER BY id`, true, ""},
+	{`SELECT s, b FROM t WHERE k + 0 = 3 ORDER BY id`, true, ""},
+	{`SELECT s, b FROM t WHERE k = 3 ORDER BY id`, false, "an equality seeks the column's segment index, ORDER BY or not"},
 	{`SELECT r FROM t WHERE id < 10 ORDER BY id`, true, "REAL affinity over stored ints"},
 	{`SELECT n FROM t WHERE id < 10 ORDER BY id`, true, "the NULL bitmap"},
 	{`SELECT id FROM t WHERE n IS NULL AND id < 30 ORDER BY id`, true, ""},
