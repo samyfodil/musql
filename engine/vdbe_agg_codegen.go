@@ -2098,6 +2098,12 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 		subRet = c.alloc()
 	}
 
+	// Constant-key seeks, as compileScanAggregate plans them: they keep the
+	// scan's rowid order, which grouping and group_concat see. Where the
+	// columnar GROUP BY walk can answer, it weighs the seek against itself
+	// at run time (seekIsNarrow).
+	planConstantKeySeeks(c, srcs, stmt.Where, false)
+
 	// Predicate pushdown: see compileScanPlain (vdbe_scan.go). buckets prune at
 	// their join level; this body tests only the deferred residue. (`plan` is
 	// the aggregate plan here, so the pushdown plan is jplan.)
@@ -2519,8 +2525,9 @@ func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp
 	keyBase := c.allocN(nGroup)
 	keyRec := c.allocRec()
 
-	// Predicate pushdown / index-driven seeks: identical to compileScanGroupBy's
-	// own setup (see there for the doc comment on both).
+	// Constant-key seeks, predicate pushdown and index-driven seeks: identical
+	// to compileScanGroupBy's own setup (see there for the doc comment on all).
+	planConstantKeySeeks(c, srcs, stmt.Where, false)
 	jplan := joinPushdownPlan(srcs, plan.scopes, stmt.Where)
 	if len(jplan.buckets) == 1 {
 		jplan.buckets[0] = consumedFirst(c, srcs, jplan.buckets[0])

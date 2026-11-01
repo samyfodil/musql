@@ -554,6 +554,31 @@ func (src *segSource) seekIndexEstimate(rootPage uint32, col int, probe Value) (
 	return n, total, true
 }
 
+// segTableRows is how many rows the table's segments hold, with a session's
+// written rows beside them: the scale a seek's estimate is weighed against.
+func (src *segSource) segTableRows(rootPage uint32) (int, bool) {
+	rows, live, err := src.liveRows(rootPage)
+	if err != nil {
+		return 0, false
+	}
+	segs, ok := src.byRoot[rootPage]
+	total := 0
+	if live {
+		total = len(rows.m)
+		if rows.seg == nil || rows.seg.rp == nil || rows.seg.rp.segs == nil {
+			return total, true
+		}
+		segs, ok = rows.seg.rp.segs.byRoot[rows.seg.root]
+	}
+	if !ok {
+		return 0, false
+	}
+	for _, sg := range segs {
+		total += sg.nRows
+	}
+	return total, true
+}
+
 // RowidBound is min(rowid) (max false) or max(rowid) of the table rooted at
 // rootPage, as this pager reads it: from the session's live rows when it holds
 // the table, else from the committed segments and delta. served is false when
