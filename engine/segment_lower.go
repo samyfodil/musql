@@ -49,6 +49,39 @@ type segLowered struct {
 	// service-only program.
 	textFold bool
 	textLike bool // a POpTextMatch was lowered, so textFold matters
+	// sorted are the IN lists over parameters whose values the caller sorts
+	// into registers before the call (seedSorted).
+	sorted []segSortedKeys
+}
+
+// segSortedKeys is one IN list over bound parameters: regs take the sorted
+// values of lits and of the parameters params.
+type segSortedKeys struct {
+	regs   []int
+	lits   []int64
+	params []int
+}
+
+// seedSorted writes each list's sorted values into its registers; false when
+// a bound value is not an INTEGER, since compiled programs hold int64s.
+func (l *segLowered) seedSorted(regs []int64, params []Value) bool {
+	for _, g := range l.sorted {
+		vals := slices.Clip(g.lits)
+		for _, p := range g.params {
+			if p < 1 || p > len(params) || params[p-1].Typ != Int {
+				return false
+			}
+			vals = append(vals, params[p-1].I)
+		}
+		slices.Sort(vals)
+		for i, r := range g.regs {
+			if r >= len(regs) {
+				return false
+			}
+			regs[r] = vals[i]
+		}
+	}
+	return true
 }
 
 // segLowerRegOperands returns the operands of in that name a REGISTER, -1 for
@@ -73,6 +106,8 @@ func segLowerRegOperands(in Instruction) [3]int {
 		if segLowerableFunc(in) {
 			return [3]int{in.P1, in.P3, -1}
 		}
+	case OpInList: // P1 operand, P2 destination, P3 the keys' flag
+		return [3]int{in.P1, in.P2, in.P3}
 	}
 	return [3]int{-1, -1, -1} // OpGoto and anything the switch will refuse
 }
@@ -149,6 +184,7 @@ func (l *segLowered) clone() *segLowered {
 	out.cvIndex = append([]int(nil), l.cvIndex...)
 	out.blockIR = append([]int(nil), l.blockIR...)
 	out.textCol = append([]bool(nil), l.textCol...)
+	out.sorted = slices.Clip(l.sorted)
 	if l.textVar != nil {
 		out.textVar = l.textVar.clone()
 	}
@@ -257,6 +293,9 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 		}
 	}
 	out.blocks = blocks
+	// Registers past the blocks' flags, for an IN list's constant and its
+	// parameters (addInList).
+	nextReg, constReg := scratchReg+1+len(blocks), -1
 
 	for i, in := range body {
 		irOf[i] = len(out.insns)
@@ -484,6 +523,31 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 		case OpSCopy:
 			note(in.P2)
 			out.add(jit.ProgInsn{Op: jit.POpLoadReg, A: in.P2, B: in.P1})
+		case OpInList:
+			plan, _ := in.P4.(*inListPlan)
+			ints, params, ok := plan.nativeKeys()
+			if !ok {
+				return nil, false
+			}
+			if constReg < 0 {
+				constReg = nextReg
+				nextReg++
+			}
+			// A list with parameters is searched in registers the caller
+			// fills with its values, sorted.
+			var keyRegs []int
+			if len(params) > 0 {
+				keyRegs = make([]int, len(ints)+len(params))
+				for k := range keyRegs {
+					keyRegs[k] = nextReg
+					nextReg++
+				}
+				out.sorted = append(out.sorted, segSortedKeys{regs: keyRegs, lits: ints, params: params})
+			}
+			note(in.P2)
+			note(scratchReg)
+			note(nextReg - 1)
+			out.addInList(in.P1, in.P2, scratchReg, constReg, ints, keyRegs, &irJumps)
 		default:
 			return nil, false
 		}
@@ -522,6 +586,59 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 	}
 	out.nRegs = maxReg + 1
 	return out, true
+}
+
+// addInList lowers OpInList over integers: r[dst] = 1 when r[x] is a key, by a
+// tree of comparisons. The keys are ints, or with keyRegs the sorted registers
+// seedSorted fills. tmp holds each comparison and con each constant.
+func (l *segLowered) addInList(x, dst, tmp, con int, ints []int64, keyRegs []int, jumps *[][2]int) {
+	var found, missed []int
+	test := func(cond jit.Cond, r int) int {
+		l.add(jit.ProgInsn{Op: jit.POpCmp, A: tmp, B: x, C: r, Cond: cond})
+		l.add(jit.ProgInsn{Op: jit.POpJumpIfNotZero, B: tmp})
+		return len(l.insns) - 1
+	}
+	key := func(i int) int {
+		if keyRegs != nil {
+			return keyRegs[i]
+		}
+		l.add(jit.ProgInsn{Op: jit.POpSetConst, A: con, B: int(ints[i])})
+		return con
+	}
+	var tree func(lo, hi int)
+	tree = func(lo, hi int) {
+		if hi-lo <= 3 {
+			for i := lo; i < hi; i++ {
+				found = append(found, test(jit.CondE, key(i)))
+			}
+			missed = append(missed, len(l.insns))
+			l.add(jit.ProgInsn{Op: jit.POpJump})
+			return
+		}
+		mid := (lo + hi) / 2
+		r := key(mid)
+		below := test(jit.CondL, r)
+		found = append(found, test(jit.CondE, r))
+		tree(mid+1, hi)
+		*jumps = append(*jumps, [2]int{below, len(l.insns)})
+		tree(lo, mid)
+	}
+	n := len(ints)
+	if keyRegs != nil {
+		n = len(keyRegs)
+	}
+	tree(0, n)
+	yes := len(l.insns)
+	l.add(jit.ProgInsn{Op: jit.POpSetConst, A: dst, B: 1}, jit.ProgInsn{Op: jit.POpJump})
+	no := len(l.insns)
+	l.add(jit.ProgInsn{Op: jit.POpSetConst, A: dst, B: 0})
+	for _, j := range found {
+		*jumps = append(*jumps, [2]int{j, yes})
+	}
+	for _, j := range missed {
+		*jumps = append(*jumps, [2]int{j, no})
+	}
+	*jumps = append(*jumps, [2]int{no - 1, len(l.insns)})
 }
 
 // segLoweredReachable marks every IR instruction some path from the entry can

@@ -76,6 +76,39 @@ func emitWriteRowidSeekHint(c *compiler, tbl *tableMeta, cursor int, where Expr)
 	return true
 }
 
+// emitWriteRowidSetHint is emitWriteRowidSeekHint for "rowid IN (list)"
+// (isSeekInList), as detectRowidInKeys plans a SELECT's; declined where
+// seekGuard says C's loop would read other rows.
+func (db *DB) emitWriteRowidSetHint(c *compiler, tbl *tableMeta, cursor int, from FromItem, where Expr, trig *trigCompileCtx) bool {
+	if where == nil || tbl == nil || tbl.withoutRowid || rowidInOffForTest {
+		return false
+	}
+	cjs := splitTopLevelAnd(where)
+	guard := seekGuard{raiseAt: -1, tableRaiseAt: -1}
+	for pos, cj := range cjs {
+		if exprMayRaise(cj) && !c.holdsCorrelatedSelect(cj) && writeConjunctPerRow(cj) {
+			guard.raiseAt, guard.tableRaiseAt = pos, pos
+			guard.access = db.writeLoopAccess(tbl, from, where, trig)
+			break
+		}
+	}
+	for pos, cj := range cjs {
+		in, ok := cj.(InExpr)
+		if !ok || !isSeekInList(in) || !writeRowidRef(c, tbl, cursor, in.X) || !guard.keep(xnRowid, pos, true) {
+			continue
+		}
+		mark := len(c.insns)
+		base, err := c.compileExprBlock(in.List)
+		if err != nil {
+			c.insns = c.insns[:mark]
+			return false
+		}
+		c.emit(Instruction{Op: OpSeekRowidSetHint, P1: cursor, P2: base, P3: len(in.List)})
+		return true
+	}
+	return false
+}
+
 // isWriteSeekKeyCandidate is isSeekKeyCandidate plus a scalar subquery: C
 // codes an uncorrelated one once, as a constant, and seeks with its value
 // ("DELETE FROM t WHERE id = (SELECT max(id) FROM t)" is one seek there, and
@@ -110,22 +143,19 @@ func keyRunsBeforeTheLoop(insns []Instruction, cursor int) bool {
 }
 
 // emitWriteIndexSeekHint is the column twin of emitWriteRowidSeekHint: for a
-// WHERE conjunct "<col> = <column-free key>" on the written table it emits an
+// WHERE conjunct "<col> = <column-free key>", or "<col> IN (<list>)" of such
+// keys, on the written table it emits an
 // OpSeekIndexHint, which the row-store cursor answers from the store's own
 // equality index (row_store_eqindex.go) instead of materializing the table.
 // It needs no declared index: the candidates come in rowid order, which is the
 // order C visits one key's rows in whether it walks an index or the table, and
 // the conjunct still runs on every fetched row, so the hint only narrows.
 //
-// Every such conjunct is a key, up to maxSeekKeys, as the hint's slots: the
-// cursor asks the one whose column holds fewest rows (writeSeekRowids). The
-// comparison's collation is the column's own, the key being a bare literal or
-// parameter. The INTEGER PRIMARY KEY column is never a key: it is stored NULL,
-// its value being the rowid.
 //
-// A key a conjunct that can raise comes before is kept only where C's own loop
-// leaves it exact (seekGuard): from is the target as the statement names it,
-// for asking the planner what that loop is.
+// Every such conjunct is a key, up to maxSeekKeys, as the hint's slots; the
+// cursor asks the smallest (writeSeekRowids). The INTEGER PRIMARY KEY is never
+// a key: it is stored NULL. A key behind a raising conjunct is kept only where
+// seekGuard says C's loop leaves it exact.
 func (db *DB) emitWriteIndexSeekHint(c *compiler, tbl *tableMeta, cursor int, from FromItem, where Expr, trig *trigCompileCtx) bool {
 	if writeIndexSeekOffForTest || where == nil || tbl == nil || tbl.withoutRowid || hasGeneratedCols(tbl.cols) {
 		return false
@@ -141,6 +171,23 @@ func (db *DB) emitWriteIndexSeekHint(c *compiler, tbl *tableMeta, cursor int, fr
 	}
 	slot := 0
 	for pos, cj := range cjs {
+		if in, ok := cj.(InExpr); ok && slot < maxSeekKeys {
+			// "col IN (list)": each value of the list a key, the column's
+			// affinity and collation the IN's own.
+			col, ok := writeColumnRef(c, cursor, in.X)
+			if !ok || col == tbl.ipkIndex || !isSeekInList(in) || !guard.keep(col, pos, db.leadsIndex(tbl, col)) {
+				continue
+			}
+			base, err := c.compileExprBlock(in.List)
+			if err != nil {
+				return slot > 0
+			}
+			c.emit(Instruction{Op: OpSeekIndexHint, P1: cursor, P2: base,
+				P4: &indexSeekHint{aff: c.inAffinity(in.X), coll: effectiveCollation(tbl.cols[col].Collation),
+					leadingCol: col, slot: slot, in: len(in.List)}})
+			slot++
+			continue
+		}
 		be, ok := cj.(BinaryExpr)
 		if !ok || (be.Op != "=" && be.Op != "==") || slot == maxSeekKeys {
 			continue

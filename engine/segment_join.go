@@ -1385,7 +1385,7 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 		}
 		// A level the loop seeks by an index once visits only the key's rows;
 		// the kernel would read the whole table.
-		if cur := m.cursors[c]; cur != nil && cur.idxSeekConfigured && !cur.seekReseek {
+		if cur := m.cursors[c]; cur != nil && (cur.idxSeekConfigured || cur.seekSetConfigured) && !cur.seekReseek {
 			return nil, false
 		}
 	}

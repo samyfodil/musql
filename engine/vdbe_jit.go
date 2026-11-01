@@ -441,7 +441,23 @@ func gatherSkip(prog *Program, at int) uint64 {
 				return 0 // a run of registers
 			}
 			regs = [3]bool{true, false, false}
-		case OpVariable, OpSeekIndexHint, OpSeekRowidHint, OpSeekRowidRangeHint, OpInteger, OpInt64, OpNull, OpSCopy, OpCopy,
+		case OpSeekRowidSetHint:
+			for r := in.P2; r < in.P2+in.P3; r++ {
+				if isSkipped(r) {
+					return 0
+				}
+			}
+			continue
+		case OpSeekIndexHint:
+			if h, _ := in.P4.(*indexSeekHint); h != nil && h.in > 0 {
+				for r := in.P2; r < in.P2+h.in; r++ {
+					if isSkipped(r) {
+						return 0
+					}
+				}
+				continue
+			}
+		case OpVariable, OpSeekRowidHint, OpSeekRowidRangeHint, OpInteger, OpInt64, OpNull, OpSCopy, OpCopy,
 			OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight,
 			OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpNot, OpNegative:
 			if in.Op == OpNull && in.P3 > in.P2 {
@@ -731,6 +747,13 @@ func lowerVM(in *Instruction, nReg int) jit.VInsn {
 			return jit.VInsn{Op: jit.VRowid, A: in.P1, C: in.P2}
 		}
 		return exit
+	case OpInList:
+		// The search of the run's integers, which OpInList keeps from P3 on
+		// once it has built them; any other set, or operand, exits to it.
+		if plan, _ := in.P4.(*inListPlan); plan != nil && plan.aff != affText && ok(in.P1, in.P2, in.P3) &&
+			in.P3+1+len(plan.lits)+len(plan.params) <= nReg {
+			return jit.VInsn{Op: jit.VInSet, A: in.P1, B: in.P3 + 1, C: in.P2, Imm: int64(in.P3)}
+		}
 	case OpColumn:
 		// Native code reads a cursor's column from its row list; whether the
 		// cursor is one it may (scannableCursors) is checked by the caller, and

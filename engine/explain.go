@@ -428,7 +428,7 @@ func (p *ReadOnlyPager) explainPlanDetails(prog *Program) []string {
 			s := &explainScan{cursor: in.P1, name: explainSourceName(in.P4), order: 1 << 30, write: true}
 			scans = append(scans, s)
 			byCursor[in.P1] = s
-		case OpSeekRowidHint:
+		case OpSeekRowidHint, OpSeekRowidSetHint:
 			if s := byCursor[in.P1]; s != nil {
 				s.rowidKey = true
 			}

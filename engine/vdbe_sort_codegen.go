@@ -156,6 +156,10 @@ func compileScanSorted(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols
 	c.rowLive = true
 	sorterNum := c.allocSorter()
 
+	// The seeks a constant key allows, as compileScanPlain plans them: they
+	// only narrow the rows the loops read, and the sort below orders them.
+	planConstantKeySeeks(c, srcs, stmt.Where, true)
+
 	initAddr := c.emit(Instruction{Op: OpInit})
 	c.patch(initAddr, 1)
 

@@ -102,7 +102,8 @@ func segPeephole(prog *Program) bool {
 	//	OpAutoIndexOrder   whenever the table carries ANY index
 	//	OpVariable/OpInteger + OpSeekIndexHint/OpSeekRowidHint
 	//	                   whenever the WHERE pins a rowid or an indexed
-	//	                   column to a constant
+	//	                   column to a constant, with OpSCopy gathering an
+	//	                   IN list's values
 	//
 	// Skipping either is safe: neither changes which rows satisfy the WHERE.
 	// OpAutoIndexOrder only permutes scan order, and a count ignores order; a
@@ -612,6 +613,10 @@ func ProgramUsesSegFilterForTest(rp *ReadOnlyPager, stmt *SelectStmt) (bool, err
 // Incremented once per statement, not per row.
 var segFilterServed, segFilterDeclined atomic.Int64
 
+// segGroupSeeksTaken counts the columnar GROUP BY walks that gave way to a
+// narrow seek (seekIsNarrow), for tests.
+var segGroupSeeksTaken atomic.Int64
+
 // SegFilterCountersForTest returns how many statements the JITted filter has
 // answered and how many it has handed back to the loop, since the last reset.
 func SegFilterCountersForTest() (served, declined int64) {
@@ -622,6 +627,7 @@ func SegFilterCountersForTest() (served, declined int64) {
 func ResetSegFilterCountersForTest() {
 	segFilterServed.Store(0)
 	segFilterDeclined.Store(0)
+	segGroupSeeksTaken.Store(0)
 }
 
 // segIsScanPrologue reports whether op may appear between the OpenRead and the
@@ -629,7 +635,7 @@ func ResetSegFilterCountersForTest() {
 // satisfy the WHERE. See segPeephole for the argument for each one.
 func segIsScanPrologue(op OpCode) bool {
 	switch op {
-	case OpAutoIndexOrder, OpSeekIndexHint, OpSeekRowidHint, OpSeekRowidRangeHint, OpVariable, OpInteger:
+	case OpAutoIndexOrder, OpSeekIndexHint, OpSeekRowidHint, OpSeekRowidRangeHint, OpVariable, OpInteger, OpInt64, OpSCopy:
 		return true
 	}
 	return false

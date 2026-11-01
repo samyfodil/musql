@@ -147,6 +147,9 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 		}
 		regs[reg] = v.I
 	}
+	if !low.seedSorted(regs, m.params) {
+		return Value{}, false
+	}
 
 	// Each segment runs on its own copy of the register file (on its own
 	// goroutine under WithWorkers); the results are then combined in segment
@@ -368,7 +371,7 @@ var segZoneExtremeHits atomic.Int64
 func segZoneExtreme(s *segment, low *segLowered) (int64, bool) {
 	n := len(low.insns)
 	if (low.agg != aggMin && low.agg != aggMax) || len(low.cols) != 1 || low.nullCol[0] ||
-		len(low.consts) != 0 || n < 2 {
+		len(low.consts) != 0 || len(low.sorted) != 0 || n < 2 {
 		return 0, false
 	}
 	holds := map[int]bool{} // registers holding the column's value

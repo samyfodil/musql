@@ -61,12 +61,10 @@ import (
 
 // rsEqIndex is one column's posting list: value -> the rowids holding it.
 //
-// An INTEGER is listed by value, a TEXT or BLOB by its bytes, and a column holds
-// one kind or the other: under BINARY two of those are equal exactly when their
-// bytes are, but a comparison's affinity can make a stored 5 equal '5' (TEXT,
-// against a column of no affinity) or a stored '5' equal 5 (NUMERIC), so a
-// column holding both is refused, and so is a probe of the other kind. A REAL
-// refuses the column too, since 5.0 must match "v = 5".
+// An INTEGER is listed by value, TEXT and BLOB by bytes. Affinity can make a
+// stored 5 equal '5' or the reverse, so a column holding both kinds is
+// refused, as is a probe of the other kind; a REAL refuses the column, since
+// 5.0 must match "v = 5".
 type rsEqIndex struct {
 	rows  map[int64][]uint64
 	bytes map[string][]uint64
@@ -173,6 +171,23 @@ func (s *rowStore) segEqEstimate(col int, probe Value) int {
 		c, ok := sg.segEqualityCountOf(col, probe)
 		if !ok {
 			return math.MaxInt
+		}
+		n += c
+	}
+	return n
+}
+
+// segEqKeyEstimate is segEqEstimate for a key, an IN list's summed over its
+// values.
+func (s *rowStore) segEqKeyEstimate(k idxSeekKey) int {
+	if k.set == nil {
+		return s.segEqEstimate(k.col, k.probe)
+	}
+	n := 0
+	for _, v := range k.set {
+		c := s.segEqEstimate(k.col, v)
+		if c == math.MaxInt {
+			return c
 		}
 		n += c
 	}

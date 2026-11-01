@@ -120,7 +120,7 @@ type joinSource struct {
 	// source's index seek (indexSeekPlan.plan).
 	planExplain wherePlanExplain
 	// planAccess is the same plan's access path, which decides the seek keys
-	// a WHERE that can raise an error leaves exact (seekKeyKept).
+	// a WHERE that can raise leaves exact (seekGuard).
 	planAccess wherePlanAccess
 
 	// onToWhere marks an INNER item whose ON clause was moved into the WHERE, as
@@ -232,6 +232,10 @@ type joinSource struct {
 	// after OpOpenRead and emits OpSeekRowidHint. Set by detectRowidSeekKey for at
 	// most one source per compile.
 	seekKeyExpr Expr
+
+	// seekSet is the column-free list of a "rowid IN (...)" conjunct,
+	// evaluated once after OpOpenRead for OpSeekRowidSetHint.
+	seekSet []Expr
 
 	// rowidRange, when non-nil, is a WHERE conjunct bounding this table's rowid
 	// by a column-free expression: emitJoinLoops evaluates it after OpOpenRead
@@ -3045,6 +3049,13 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 			}
 			c.emit(Instruction{Op: OpSeekRowidHint, P1: s.scope.cursor, P2: keyReg})
 		}
+		if s.seekSet != nil {
+			base, kerr := c.compileExprBlock(s.seekSet)
+			if kerr != nil {
+				return kerr
+			}
+			c.emit(Instruction{Op: OpSeekRowidSetHint, P1: s.scope.cursor, P2: base, P3: len(s.seekSet)})
+		}
 		if s.rowidRange != nil {
 			// The bound, evaluated once like the key above. See
 			// OpSeekRowidRangeHint and detectRowidRangeKey.
@@ -3061,11 +3072,17 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 			// detectIndexSeekKey (vdbe_scan.go). Its further keys follow as the
 			// hint's later slots.
 			for slot, k := range append([]*indexSeekPlan{s.idxSeek}, s.idxSeek.more...) {
-				keyReg, kerr := c.compileExpr(k.keyExpr)
+				var keyReg int
+				var kerr error
+				if k.keySet != nil {
+					keyReg, kerr = c.compileExprBlock(k.keySet)
+				} else {
+					keyReg, kerr = c.compileExpr(k.keyExpr)
+				}
 				if kerr != nil {
 					return kerr
 				}
-				h := &indexSeekHint{root: k.root, aff: k.aff, coll: k.coll, leadingCol: k.leadingCol, index: k.index, slot: slot, is: k.is}
+				h := &indexSeekHint{root: k.root, aff: k.aff, coll: k.coll, leadingCol: k.leadingCol, index: k.index, slot: slot, is: k.is, in: len(k.keySet)}
 				if slot == 0 {
 					h.plan = s.idxSeek.plan
 				}
@@ -3799,7 +3816,7 @@ func planJoinHalt(srcs []joinSource, plan joinPlan) *joinHalt {
 		if level < len(plan.autoIdxKeys) {
 			auto = plan.autoIdxKeys[level]
 		}
-		noSeek := s.joinSeekKeyExpr == nil && s.joinIdxSeek == nil && s.seekKeyExpr == nil && s.idxSeek == nil &&
+		noSeek := s.joinSeekKeyExpr == nil && s.joinIdxSeek == nil && s.seekKeyExpr == nil && s.seekSet == nil && s.idxSeek == nil &&
 			plainKey(auto) && plainKey(s.idxOrderKey)
 		h.fullScan[level] = noSeek && s.vtabItem == nil && (s.cteItem == nil || s.cteItem.recSelf == nil)
 		// C opens the table itself, and so tests it, unless a covering index

@@ -116,6 +116,11 @@ const (
 	// VRowid: r[C] = the rowid of cursor A's current row, from its rowid list
 	// (VCursor.Rowids); a cursor with none, or past its rows, exits.
 	VRowid
+	// VInSet: r[C] = 1 when the INTEGER in r[A] is among the ascending
+	// INTEGERs from r[B] on, counted by the INTEGER in r[Imm]; else 0. A
+	// non-INTEGER operand, or a count that is not a non-negative INTEGER,
+	// exits.
+	VInSet
 )
 
 // VInsn is one instruction of a VM program: the one at its index's pc.

@@ -439,6 +439,26 @@ func (c *compiler) allocN(n int) int {
 	return base
 }
 
+// compileExprBlock evaluates exprs into a consecutive block of registers and
+// returns its base. A sign over a literal is loaded folded (inListConst), so a
+// seek's keys are constants a scan prologue recognises.
+func (c *compiler) compileExprBlock(exprs []Expr) (int, error) {
+	base := c.allocN(len(exprs))
+	for i, e := range exprs {
+		var r int
+		if v, ok := inListConst(e); ok {
+			r = c.compileLiteral(v)
+		} else {
+			var err error
+			if r, err = c.compileExpr(e); err != nil {
+				return 0, err
+			}
+		}
+		c.emit(Instruction{Op: OpSCopy, P1: r, P2: base + i})
+	}
+	return base, nil
+}
+
 // allocCursor returns a fresh, never-before-used cursor number.
 func (c *compiler) allocCursor() int {
 	n := c.nCursor
@@ -1047,12 +1067,10 @@ func resolveSubProgramLimitOffset(pager *ReadOnlyPager, stmt *SelectStmt) (resto
 	return restore, deferred, nil
 }
 
-// noteRunFold records that the statement being compiled built a value of this
-// run into its program: a LIMIT or OFFSET it evaluated (a subquery in it reads
-// the database, a parameter is bound per run, random() differs; C codes the
-// clause into a register and evaluates it on every run, computeLimitRegisters,
-// select.c:2517), or fts5's corpus statistics (buildFts5AuxState). The plan
-// caches refuse such a program (cachePlan, cachedWriteProgram).
+// noteRunFold records that the compile built a value of this run into its
+// program: a LIMIT or OFFSET it evaluated (C codes those into a register per
+// run, computeLimitRegisters) or fts5's corpus statistics. The plan caches
+// refuse such a program.
 func (p *ReadOnlyPager) noteRunFold() {
 	if p == nil {
 		return
@@ -3621,6 +3639,17 @@ func (c *compiler) compileIn(x InExpr) (int, error) {
 	// expression never contributes one: resolveCompareCollation(ctx, x.X,
 	// nil)).
 	coll := c.compCollation(x.X, nil)
+	if plan := newInListPlan(x.List, aff, coll); plan != nil {
+		keys := c.allocN(len(x.List) + 1)
+		if len(plan.params) > 0 {
+			plan.slot = c.allocSub()
+		}
+		c.emit(Instruction{Op: OpInList, P1: xReg, P2: d, P3: keys, P4: plan})
+		if x.Not {
+			c.emit(Instruction{Op: OpNot, P1: d, P2: d})
+		}
+		return d, nil
+	}
 
 	rNull := c.alloc()
 	c.emit(Instruction{Op: OpInteger, P1: 0, P2: rNull})

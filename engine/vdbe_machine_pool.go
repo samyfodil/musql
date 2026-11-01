@@ -116,7 +116,10 @@ func (prog *Program) putMachineTo(m *vdbe, spare **vdbe) {
 	if aggSpare == nil {
 		aggSpare = m.aggSpare
 	}
-	clear(regs)
+	// Past the file's length too: native code keeps the parameters there
+	// (jitParams), and a program of more registers taking this machine would
+	// start with one of them in a register it has not written.
+	clear(regs[:max(len(regs), min(cap(regs), prog.NReg+prog.jitParams()))])
 	clear(recRegs)
 	// The cursor SHELLS are kept and their CONTENTS dropped. Keeping them saves
 	// the 496-byte allocation every FROM clause makes; scrubbing them is what

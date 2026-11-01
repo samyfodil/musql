@@ -1233,7 +1233,7 @@ func (prog *Program) outerCtxUnread() bool {
 			OpColumn, OpRowid, OpOuterColumn, OpOuterRowid,
 			OpInteger, OpVariable, OpNull, OpString8, OpReal, OpSCopy, OpCopy,
 			OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull,
-			OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpAutoIndexOrder, OpResultRow:
+			OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpSeekRowidSetHint, OpAutoIndexOrder, OpResultRow:
 		default:
 			unread = false
 		}
@@ -1962,18 +1962,12 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			if cursorHasNoBtree(m.cursors[op.P1]) {
 				break
 			}
-			// The key takes numeric affinity, as OP_SeekRowid gives it, and
-			// one that is still no integer equals no rowid: the cursor visits
-			// nothing, as C's loop does. A scan would test the rest of the
-			// WHERE on rows C never reads, and so raise errors C does not.
-			// The keyed conjunct is evaluated in the loop body regardless.
-			key := m.regs[op.P2]
-			if key.Typ != Int {
-				key = applyAffinityToValue(key, affNumeric)
-			}
+			// A key that is no integer equals no rowid: the cursor visits
+			// nothing, as C's loop does, so the WHERE never runs on rows C skips.
+			key, ok := seekRowidKey(m.regs[op.P2])
 			cur := m.cursors[op.P1]
-			cur.seekConfigured, cur.seekNone = true, key.Typ != Int
-			cur.seekKey = key.I
+			cur.seekConfigured, cur.seekNone = true, !ok
+			cur.seekKey = key
 			cur.seekReseek = op.P3 == 1 // correlated join seek: re-seek per rewind
 
 		case OpSeekRowidRangeHint:
@@ -1981,6 +1975,25 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				break
 			}
 			m.cursors[op.P1].narrowRowidRangeBy(op.P3, m.regs[op.P2])
+
+		case OpInList:
+			m.regs[op.P2] = m.inList(op)
+
+		case OpSeekRowidSetHint:
+			if cursorHasNoBtree(m.cursors[op.P1]) {
+				break
+			}
+			// C's IN loop over the rowid seeks each value of its ephemeral
+			// index once, in order; a value no integer equals no rowid.
+			cur := m.cursors[op.P1]
+			keys := cur.seekSet[:0]
+			for _, v := range m.regs[op.P2 : op.P2+op.P3] {
+				if key, ok := seekRowidKey(v); ok {
+					keys = append(keys, key)
+				}
+			}
+			slices.Sort(keys)
+			cur.seekSet, cur.seekSetConfigured = slices.Compact(keys), true
 
 		case OpSeekIndexHint:
 			// Coerce the key with the exact affinity the WHERE comparison
@@ -1997,24 +2010,37 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			switch h := op.P4.(type) {
 			case *indexSeekHint:
 				probe := applyAffinityToValue(m.regs[op.P2], h.aff)
-				if h.slot == 0 {
-					cur.idxSeekConfigured, cur.idxSeekMore, cur.idxSeekNext = false, cur.idxSeekMore[:0], 0
+				// An IN list's values, each coerced as the one key is: a NULL
+				// equals nothing, so it is no probe.
+				var set []Value
+				textKey := probe.Typ == Text
+				if h.in > 0 {
+					set = make([]Value, 0, h.in)
+					textKey = false
+					for _, v := range m.regs[op.P2 : op.P2+h.in] {
+						if v = applyAffinityToValue(v, h.aff); v.Typ != Null {
+							set = append(set, v)
+							textKey = textKey || v.Typ == Text
+						}
+					}
 				}
-				// A slot out of step is dropped, and so is the key of "x IS NULL",
-				// which no posting list holds, and a write's TEXT key in a UTF-16
-				// database, whose bytes need not decide its equality: the keys
-				// left bound the rows each on its own, and with none the scan
-				// decides.
+				if h.slot == 0 {
+					cur.idxSeekConfigured, cur.idxSeekMore, cur.idxSeekNext, cur.idxSeekSet = false, cur.idxSeekMore[:0], 0, nil
+				}
+				// A slot out of step is dropped, as is the key of "x IS NULL" (no
+				// posting list holds NULL) and a write's TEXT key in a UTF-16
+				// database; the keys left each bound the rows, and with none the
+				// scan decides.
 				if h.slot == cur.idxSeekNext {
 					cur.idxSeekNext++
 					switch {
 					case h.is && probe.Typ == Null:
-					case cur.rowStore != nil && probe.Typ == Text && isUTF16(m.encoding()):
+					case cur.rowStore != nil && textKey && isUTF16(m.encoding()):
 					case !cur.idxSeekConfigured:
 						cur.idxSeekConfigured = true
-						cur.idxSeekProbe, cur.idxSeekColl, cur.idxSeekCol = probe, h.coll, h.leadingCol
+						cur.idxSeekProbe, cur.idxSeekColl, cur.idxSeekCol, cur.idxSeekSet = probe, h.coll, h.leadingCol, set
 					default:
-						cur.idxSeekMore = append(cur.idxSeekMore, idxSeekKey{col: h.leadingCol, probe: probe, coll: h.coll})
+						cur.idxSeekMore = append(cur.idxSeekMore, idxSeekKey{col: h.leadingCol, probe: probe, coll: h.coll, set: set})
 					}
 				}
 			default:
@@ -2338,7 +2364,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			cur := m.cursors[op.P1]
 			if cur == nil || (cur.tbl == nil && cur.fill == nil) || cur.rowStore != nil || cur.sub != nil || cur.streamable || cur.seekConfigured ||
-				cur.idxSeekConfigured || cur.seekReseek || cur.segFilter != nil {
+				cur.seekSetConfigured || cur.idxSeekConfigured || cur.seekReseek || cur.segFilter != nil {
 				break
 			}
 			cur.params = m.params
@@ -2805,6 +2831,12 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			cur := m.cursors[op.P1]
 			if cur == nil || cur.tbl == nil || cur.pager == nil {
 				return nil, fmt.Errorf("vdbe: OpSegHashAgg on a closed cursor")
+			}
+			// A seek that reads a sliver of the table answers sooner than a
+			// walk of all of it: the loop below runs it.
+			if cur.seekIsNarrow() {
+				segGroupSeeksTaken.Add(1)
+				break
 			}
 			if m.segHashAggTable(cur.pager, cur.tbl.root, gplan) {
 				segFilterServed.Add(1)

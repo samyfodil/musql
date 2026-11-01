@@ -136,12 +136,24 @@ func TestColumnarFilteredGroupByMatchesTheLoop(t *testing.T) {
 		{`SELECT s, count(*) FROM t WHERE v > 0 GROUP BY s ORDER BY s`, nil, true},
 		{`SELECT k, count(*) FROM t WHERE f > 50.5 GROUP BY k ORDER BY k`, nil, true}, // REAL column
 		{`SELECT k, count(*) FROM t WHERE v > 2.5 GROUP BY k ORDER BY k`, nil, true},  // REAL bound, INTEGER column
-		{`SELECT k, count(*) FROM t WHERE v = '17' GROUP BY k ORDER BY k`, nil, true}, // affinity on the bound
+		{`SELECT k, count(*) FROM t WHERE j = '2' GROUP BY k ORDER BY k`, nil, true},  // affinity on the bound
+		// A key holding about one row in 5,000: its seek answers (seekIsNarrow).
+		{`SELECT k, count(*) FROM t WHERE v = '17' GROUP BY k ORDER BY k`, nil, false},
 		{`SELECT k, count(*) FROM t WHERE s > 's5' GROUP BY k ORDER BY k`, nil, true}, // TEXT predicate
+		// IN lists, beside comparisons or alone (segParseInListGroup):
+		{`SELECT k, count(*), sum(v) FROM t WHERE j IN (0, 2, 5) GROUP BY k ORDER BY k`, nil, true},
+		{`SELECT k, count(*) FROM t WHERE j NOT IN (1, 7, 9) GROUP BY k ORDER BY k`, nil, true},
+		{`SELECT k, count(*) FROM t WHERE j IN (?, ?, ?) GROUP BY k ORDER BY k`, []Value{iv(0), iv(2), iv(9)}, true},
+		{`SELECT k, count(*) FROM t WHERE j IN (0, NULL, 2) GROUP BY k ORDER BY k`, nil, true},
+		{`SELECT k, count(*) FROM t WHERE j NOT IN (1, NULL, 9) GROUP BY k ORDER BY k`, nil, true},
+		{`SELECT k, count(*) FROM t WHERE j IN ('0', 2.0, 5) GROUP BY k ORDER BY k`, nil, true},
+		{`SELECT k, count(*) FROM t WHERE s IN ('s1', 's2', 'S3') GROUP BY k ORDER BY k`, nil, true},
+		{`SELECT k, max(v) FROM t WHERE v > 0 AND j IN (0, 2, 5) AND s <> 's4' GROUP BY k ORDER BY k`, nil, true},
 		// Declines, which the loop then answers:
 		{`SELECT k, count(*) FROM t WHERE v > ? GROUP BY k`, []Value{{Typ: Null}}, false}, // NULL bound
 		{`SELECT k, count(*) FROM t WHERE n > 10 GROUP BY k ORDER BY k`, nil, false},      // NULL-bearing column
 		{`SELECT k, count(*) FROM t WHERE id > 100 GROUP BY k ORDER BY k`, nil, false},    // rowid alias
+		{`SELECT k, count(*) FROM t WHERE n IN (1, 2, 3) GROUP BY k ORDER BY k`, nil, false},
 		{`SELECT k, count(*) FROM t WHERE v > 0 OR j = 1 GROUP BY k ORDER BY k`, nil, false},
 		{`SELECT k, count(*) FROM t WHERE v + 1 > 0 GROUP BY k ORDER BY k`, nil, false},
 	}

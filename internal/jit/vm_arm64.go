@@ -843,6 +843,8 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		a.B("dispatch")
 	case VColumn:
 		e.column(pc, in)
+	case VInSet:
+		e.inSet(pc, in)
 	case VResultRow:
 		e.resultRow(pc, in)
 	case VIntGuard:
@@ -1124,4 +1126,51 @@ func (e *vmEmitArm) copyRow(in VInsn, dst Reg64) {
 	a.AddImm(dst, dst, 8)
 	a.SubsImm(X11, X11, 1)
 	a.Bcond(CondNE, loop)
+}
+
+// inSet is VInSet, as vm_amd64.go's: X10 keys left from the one whose I word
+// X11 points at, X12 and X13 the halving's scratch.
+func (e *vmEmitArm) inSet(pc int, in VInsn) {
+	a, L := e.a, e.lay
+	if n := e.src(pc, int(in.Imm), X10); n != X10 {
+		a.MovReg(X10, n)
+	}
+	a.CmpImm(X10, 0)
+	a.Bcond(CondL, e.stub(pc))
+	x := e.src(pc, in.A, X9)
+	if !in.Dead {
+		e.destNoS(pc, in.C)
+	}
+	loop, done, none := fmt.Sprintf("in%d", pc), fmt.Sprintf("in%d.d", pc), fmt.Sprintf("in%d.n", pc)
+	a.MovImm64(X11, int64(e.off(in.B, L.OffI)))
+	a.AddReg(X11, X1, X11)
+	a.Label(loop)
+	a.CmpImm(X10, 1)
+	a.Bcond(CondLE, done)
+	a.LsrImm(X12, X10, 1)
+	a.SubsReg(X10, X10, X12)
+	a.MovImm64(X13, int64(L.Size))
+	a.Mul(X13, X12, X13)
+	a.AddReg(X13, X11, X13)
+	a.LdrImm(X12, X13, 0)
+	a.Cmp(x, X12)
+	a.Csel(X11, X13, X11, CondGE) // that key is not above x
+	a.B(loop)
+	// X10 is 0 (no keys, the answer) or 1; the answer is left in it, clear of
+	// X12, which writeInt stores the type from.
+	a.Label(done)
+	a.Cbz(X10, none)
+	a.LdrImm(X13, X11, 0)
+	a.Cmp(x, X13)
+	a.Cset(X10, CondE)
+	a.Label(none)
+	if in.Dead {
+		e.clobber(in.C)
+		return
+	}
+	m := e.dest(pc, in.C, X10)
+	if m != X10 {
+		a.MovReg(m, X10)
+	}
+	e.storeInt(in, in.C, m)
 }
