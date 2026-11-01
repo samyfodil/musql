@@ -119,10 +119,9 @@ func openSyncer(ctx context.Context, path string, opts ...Option) (*Syncer, *sql
 // take the *sql.DB (Retire).
 var openDBs sync.Map
 
-// Synced reports whether db's node has finished an anti-entropy round with
-// its peers: it reached at least one, and held all that each one it reached
-// held. Until then a node that has just joined holds only part of the
-// database. db is the *sql.DB Open returned; without a transport it is never
+// Synced reports whether db's node finished an anti-entropy round: it reached
+// a peer and holds everything each peer it reached held. Until then a joining
+// node holds only part of the database. Without a transport it is never
 // synced.
 func Synced(db *sql.DB) bool {
 	v, ok := openDBs.Load(db)
@@ -340,10 +339,9 @@ func setGuard(ctx context.Context, db *sql.DB) error {
 // CHECK constraints: each write was checked where it was made, and a row merged
 // from two of them may break a CHECK neither did -- applied, every node holds
 // it; refused, the op would fail on every node forever. Foreign keys are off on
-// it whatever the DSN says: a peer's UPDATE is applied as a DELETE and an
-// INSERT, which an ON DELETE action would answer with a change to the children
-// here that the peer never made. What an action did on the node that ran it
-// reaches every node as ops of its own.
+// it whatever the DSN says: a peer's UPDATE applies as a DELETE and an INSERT,
+// which an ON DELETE action would answer with changes the peer never made; the
+// actions it did run arrive as ops of their own.
 type applyConnector struct{ sqldriver.Connector }
 
 func (c applyConnector) Connect(ctx context.Context) (sqldriver.Conn, error) {

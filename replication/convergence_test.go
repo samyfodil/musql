@@ -25,22 +25,16 @@ var (
 	convSteps = flag.Int("convergence.steps", 0, "steps each seed takes (default depends on -short)")
 )
 
-// TestConvergenceRandom is the safety net for everything between a peer's op
-// and a user table. Three CRDT nodes write at random while the network drops,
-// delays, reorders and repeats what they send each other, partitions come and
-// go and nodes restart; schema changes land on one node while its rows reach
-// the others first. After a final full sync every node must hold the same user
-// tables, the same withheld rows, the same version vector and the same clock
-// cells -- and that clock must be the last-writer-wins fold of the op log. A
-// fresh node fed the whole log in a random order must land on that state too.
-// Along the way two sites stamp writes with the same HLC, a node reads an op
-// from a clock that runs ahead of its own and must stamp its next write after
-// it, and no node ever holds out a row that is missing a NOT NULL value.
+// TestConvergenceRandom: three CRDT nodes write at random while the network
+// drops, delays, reorders and repeats messages, partitions come and go, nodes
+// restart, and schema changes race their rows. After a final sync every node
+// holds the same tables, withheld rows, version vector and clock, the clock is
+// the last-writer-wins fold of the log, and a fresh node fed the log in random
+// order lands on the same state.
 //
-// A failing seed replays with -convergence.seed=N (and -convergence.steps, a
-// prefix of the same run, to shorten it); each run logs every step. The clocks
-// are the wall clock's, so no two runs of a seed are quite alike. For a long
-// hunt: -convergence.seeds=100 -convergence.steps=250.
+// A failing seed replays with -convergence.seed=N (-convergence.steps
+// shortens it); each run logs every step. For a long hunt:
+// -convergence.seeds=100 -convergence.steps=250.
 func TestConvergenceRandom(t *testing.T) {
 	seeds, steps := 30, 120
 	if testing.Short() {
@@ -285,10 +279,9 @@ func convTextPool(prefix string, n int) func(*rand.Rand) any {
 	return func(r *rand.Rand) any { return prefix + strconv.Itoa(r.IntN(n)) }
 }
 
-// The base tables span the shapes the apply path tells apart: a rowid alias
-// key with a UNIQUE column, a composite TEXT key with a UNIQUE pair, a TEXT
-// key, and a rowid alias with no index at all, whose rows are written in
-// batches.
+// The base tables span the shapes the apply path tells apart: rowid and
+// composite TEXT keys with UNIQUE columns, a TEXT key, and an unindexed rowid
+// table written in batches.
 var (
 	convItems = &convTable{
 		name: "items",
@@ -619,10 +612,8 @@ func (c *convCluster) scramble(ops []Op) []Op {
 	return ops
 }
 
-// SubscribePush refuses, so Run ends before it starts anything: pushes reach a
-// node through convSource, this test drives anti-entropy itself, and with no
-// Run a commit's Broadcast pushes inside the write that made it, which the
-// weather and the races here are built on.
+// SubscribePush refuses, so Run ends at once: this test drives pushes and
+// anti-entropy itself, and a commit's Broadcast pushes inside its write.
 func (t *convTransport) SubscribePush(ctx context.Context) (<-chan PeerOp, error) {
 	return nil, errConvNoRun
 }
@@ -844,13 +835,10 @@ func (c *convCluster) pull(n, peer *convNode) {
 	c.calm = calm
 }
 
-// freeRace has a take in, as one batch, two ops of b's: one that wants a UNIQUE
-// value a row already holds there, and one that frees the value. The row that
-// waited must be in the table when a has them, as it would be had a applied the
-// ops one at a time. On the way, b takes in the newer write that gave the value
-// to the holder, and the newer row must win it there; then b frees the value
-// and its own waiting row must take it. Ids and values are fresh, so nothing
-// else holds or wants them.
+// freeRace has a take in, as one batch, an op of b's wanting a UNIQUE value a
+// row holds and one freeing it: the waiting row must end in the table, as op
+// by op. On the way b takes the newer write that gave the value to the holder,
+// then frees it for its own waiting row.
 func (c *convCluster) freeRace() {
 	a, b := c.pair()
 	c.fresh++
@@ -1107,10 +1095,8 @@ func (c *convCluster) uniqueRace() {
 	}
 }
 
-// createLate creates a table on one node and writes to it, with the schema
-// op held back and the rows pushed at once, so the others get rows for a table
-// they do not have. Half the time one transaction brings more rows than the
-// apply path writes in a statement.
+// createLate creates a table on one node with the schema op held back and the
+// rows pushed at once, so the others get rows for a table they lack.
 func (c *convCluster) createLate() {
 	n := c.pickNode()
 	unique := c.rng.IntN(2) == 0
@@ -1195,10 +1181,8 @@ func (c *convCluster) tableOf(name string) *convTable {
 	return nil
 }
 
-// checkHeld fails when a node holds out a row that lacks a value for a NOT
-// NULL column: only a row that is alive and complete is held out, for a UNIQUE
-// value another row took. An update that raced ahead of its insert makes a row
-// that is neither, until the insert comes.
+// checkHeld fails when a node holds out a row missing a NOT NULL value: only
+// a live, complete row is held out, for a UNIQUE value another row took.
 func (c *convCluster) checkHeld() {
 	for _, n := range c.nodes {
 		held, err := Withheld(c.ctx, n.db)
@@ -1560,11 +1544,9 @@ func (c *convCluster) replay() {
 	c.compare("after replaying the log in random order", c.view(ref, d.site), c.view(d, d.site), ref.site, d.site)
 }
 
-// TestConvergenceFreedValueInOneBatch is the smallest run TestConvergenceRandom
-// found diverging. Row 5 is held out of the table by a UNIQUE value that row 9
-// took while apart, and the op that frees the value comes in the same batch as
-// the op that held row 5 out; the batch must leave row 5 in the table, as an
-// op by op apply does.
+// TestConvergenceFreedValueInOneBatch is the smallest divergence
+// TestConvergenceRandom found: the op freeing a UNIQUE value arrives in the
+// same batch as the op that held row 5 out, and row 5 must end in the table.
 func TestConvergenceFreedValueInOneBatch(t *testing.T) {
 	c := newConvCluster(t, 1000)
 	c.setup()

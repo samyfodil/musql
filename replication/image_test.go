@@ -238,10 +238,8 @@ func TestImageInstallRetried(t *testing.T) {
 	}
 }
 
-// TestImageInstallCrashed: a crash part way through an install -- the image
-// staged and made the node's, its marker written, the database's delta gone and
-// the image not yet renamed in -- is finished by the next Open, under the
-// node's own identity, and the node syncs on from there.
+// TestImageInstallCrashed: an install interrupted after its marker is written
+// is finished by the next Open, and the node syncs on.
 func TestImageInstallCrashed(t *testing.T) {
 	ctx := context.Background()
 	c := newCluster(t)
@@ -454,10 +452,9 @@ func TestImageNotOverALocalWrite(t *testing.T) {
 	}
 }
 
-// TestImageCarriesTheDelta: a donor whose database has a delta it has not
-// compacted sends its files as they are, the delta's committed bytes with
-// them, and the node that takes them holds what the donor holds, whether it
-// compacts them before adopting them or adopts them as sent.
+// TestImageCarriesTheDelta: a donor with an uncompacted delta sends its files
+// as they are, and the receiver holds what the donor holds, compacting first
+// or not.
 func TestImageCarriesTheDelta(t *testing.T) {
 	for name, ratio := range map[string]int64{"compacted before adopt": 1 << 40, "adopted as sent": 0} {
 		t.Run(name, func(t *testing.T) {

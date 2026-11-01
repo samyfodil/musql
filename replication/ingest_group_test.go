@@ -8,10 +8,8 @@ import (
 	"testing"
 )
 
-// TestIngestGroupsConcurrentCalls: Ingest calls that arrive while one applies
-// share the next transaction, and each still gets its own op's result: every
-// op lands, and the one refused -- a second, different op at a seq its site
-// already used -- is refused alone.
+// TestIngestGroupsConcurrentCalls: concurrent Ingest calls share a transaction
+// and each gets its own result; a refused op is refused alone.
 func TestIngestGroupsConcurrentCalls(t *testing.T) {
 	s := newTestStore(t, "group")
 	ctx := context.Background()

@@ -54,9 +54,8 @@ type Imager interface {
 }
 
 // Broadcaster is a Transport whose push reaches every peer at once, as a
-// pubsub topic does: a commit's ops are handed to it in one call, instead of
-// PushOp once per op and peer, which on such a transport sends each op to
-// every peer once per peer.
+// pubsub topic does: a commit's ops go in one call rather than PushOp per op
+// and peer.
 type Broadcaster interface {
 	PushOps(ctx context.Context, ops []Op) error
 }

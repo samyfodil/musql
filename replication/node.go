@@ -24,15 +24,15 @@ type Node struct {
 	seq atomic.Uint64 // next local seq to hand out, monotonic per site
 
 	// synced is set by the first Sync round that reached a peer and left this
-	// node holding all every peer it reached held.
+	// node holding everything the peers it reached held.
 	synced atomic.Bool
 	// pushq, while Run runs, takes Broadcast's ops to the goroutine that
 	// pushes them.
 	pushq atomic.Pointer[chan []Op]
 
-	// syncer is the Syncer that attached the node, which installs images
-	// (image.go); nil for a bare node. imageFails counts the rounds in a row
-	// whose image failed.
+	// syncer is the Syncer that attached the node, which installs images; nil
+	// for a bare node. imageFails counts the rounds in a row whose image
+	// failed.
 	syncer     *Syncer
 	imageFails int
 }
@@ -94,8 +94,7 @@ func (n *Node) LocalWrite(ctx context.Context, op Op) error {
 
 // Broadcast pushes already-committed local ops to every current peer,
 // best-effort. Peers that miss the push converge later via Sync. While Run
-// runs, the ops go to its pusher, which gathers what commits make for
-// pushWindow into one push; when it is behind, they go at once.
+// runs, its pusher gathers the ops of pushWindow into one push.
 func (n *Node) Broadcast(ops []Op) {
 	if q := n.pushq.Load(); q != nil {
 		select {
@@ -159,9 +158,9 @@ func (n *Node) push(ops []Op) {
 // each page is applied in one transaction.
 const opsPerFetch = 1024
 
-// pruneEvery is how many sync rounds run between two prunes, after the first
-// round's. A prune that frees anything is a commit, and every explicit
-// transaction open on the database at the time then fails at its own COMMIT.
+// pruneEvery is how many sync rounds run between prunes: a prune that frees
+// anything is a commit, which fails every explicit transaction open at the
+// time at its COMMIT.
 const pruneEvery = 10
 
 // maxPushBatch caps how many pushed ops one transaction applies.
@@ -238,8 +237,9 @@ func (n *Node) Sync(ctx context.Context) error {
 // they arrive and runs a full anti-entropy Sync every syncInterval. It works
 // with any Transport (in-memory or libp2p), using only the Transport interface.
 //
-// Pushed ops apply on a goroutine of their own: a Sync round waits on each
-// peer in turn, and the pushes queued behind it waited as long.
+//
+// Pushed ops apply on a goroutine of their own, so they do not wait behind a
+// Sync round.
 func (n *Node) Run(ctx context.Context, syncInterval time.Duration) error {
 	ch, err := n.tr.SubscribePush(ctx)
 	if err != nil {

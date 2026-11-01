@@ -121,11 +121,10 @@ func InitSchema(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-// clockLayout is the layout of _repl_clock this build reads and writes, kept
-// in _repl_meta under metaLayout: one record per row (clockrec.go). A database
-// without it holds a row per cell, which InitSchema packs once. A build older
-// than records fails at OpenStore on the column it reads, rather than reading
-// the clock wrong.
+// clockLayout is the _repl_clock layout this build reads and writes, kept in
+// _repl_meta under metaLayout: one record per row. A database without it holds
+// a row per cell, which InitSchema packs once; an older build fails at
+// OpenStore rather than misread the clock.
 const (
 	metaLayout  = "layout"
 	clockLayout = 2

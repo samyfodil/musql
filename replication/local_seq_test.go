@@ -6,11 +6,9 @@ import (
 	"testing"
 )
 
-// TestLocalOpsNumberPastAnUnnotedCommit: a local commit numbers its ops on
-// from the last seq this node noted, and when a commit it has not noted yet
-// holds the next one -- another connection's, between its commit and its note
-// -- it numbers them past the log's last instead: every op is in the log once,
-// at seqs with no hole.
+// TestLocalOpsNumberPastAnUnnotedCommit: when a commit not yet noted holds the
+// next seq, a local commit numbers its ops past the log's last, every op once
+// and with no hole.
 func TestLocalOpsNumberPastAnUnnotedCommit(t *testing.T) {
 	ctx := context.Background()
 	s, db, err := openSyncer(ctx, filepath.Join(t.TempDir(), "a.musq"), CRDT())

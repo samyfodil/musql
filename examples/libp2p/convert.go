@@ -8,11 +8,10 @@ import (
 	"github.com/samyfodil/musql/replication"
 )
 
-// A response is read with readOwnedMsg, so its strings and bytes point into
-// its buffer. Converting it back interns every string it keeps (a version
-// vector's site, an op's table) and caps every byte slice, so what outlives
-// the conversion holds the buffer only through bytes it was sent, and an
-// append to those reallocates rather than writing over the buffer.
+// A response is read with readOwnedMsg, so its strings and bytes point into its
+// buffer. Converting it interns every string kept and caps every byte slice,
+// so what outlives it pins the buffer only through bytes it was sent, and an
+// append reallocates.
 
 // intern copies each distinct string of one message once.
 type intern map[string]string

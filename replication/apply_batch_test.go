@@ -119,10 +119,9 @@ func ingestEach(t *testing.T, s *Store, ops []Op) {
 	}
 }
 
-// TestBatchAppliesAsOpsOneAtATime: ops applied a batch to a transaction, a
-// run of them merged at once, leave the table, the rows it holds out and the
-// clock as the same ops do applied one to a transaction, or each merged
-// alone -- and the table is what a rebuild from the clock makes of it.
+// TestBatchAppliesAsOpsOneAtATime: a batch of ops leaves the table, its
+// withheld rows and the clock as the ops applied one at a time do, and as a
+// rebuild from the clock makes them.
 func TestBatchAppliesAsOpsOneAtATime(t *testing.T) {
 	ctx := context.Background()
 	seeds := 3

@@ -8,11 +8,9 @@ import (
 	"testing"
 )
 
-// TestPlainCopy: a plain copy of a live replicated database holds its schema
-// and rows and nothing of replication -- a user table named like the
-// bookkeeping stays, a withheld row is in no table and so not in the copy --
-// any connection writes it, and opened through replication it is a new
-// database whose rows are its site's first ops. The source is untouched.
+// TestPlainCopy: a plain copy holds the schema and rows and nothing of
+// replication, any connection writes it, and opened through replication its
+// rows are a new site's first ops. The source is untouched.
 func TestPlainCopy(t *testing.T) {
 	ctx := context.Background()
 	c := newCluster(t)

@@ -8,18 +8,15 @@ import (
 	"slices"
 )
 
-// A clock record is one row's clock cells, its presence among them, packed
-// into _repl_clock's rec: the tag most of them share, then each cell's column,
-// its own tag where it differs, and its value. The cells still merge one at a
-// time (mergeInto); a record only stores them, one row per key instead of one
-// per cell.
+// A clock record packs one row's clock cells, presence included, into
+// _repl_clock's rec: the tag most of them share, then each cell's column, its
+// own tag where it differs, and its value.
 //
 //	rec  = uvarint(hlc) str(site) uvarint(cells) cell...
 //	cell = str(col) byte(own) [uvarint(hlc) str(site)] str(val)
 //	str  = uvarint(len) bytes
 //
-// top, beside it, is the record's largest hlc, which OpenStore starts the
-// clock past.
+// top, beside it, is the record's largest hlc.
 
 var errBadRec = errors.New("replication: malformed clock record")
 

@@ -27,10 +27,9 @@ type capture struct {
 	// log's heads as their transaction read them.
 	handoff []Op
 	seen    string
-	// committing is set by a preCommit that let the commit go ahead; a
-	// rollback then is the commit failing. retrying is set from such a failure
-	// an apply caused -- one committed since this connection's last commit or
-	// rollback, which applied counts -- to its next one (Store.waitLocal).
+	// committing is set by a preCommit that let the commit go ahead, so a
+	// rollback then is the commit failing; retrying is set by such a failure
+	// that an apply caused (applied counts them) until the next commit.
 	committing, retrying bool
 	applied              uint64
 }
@@ -156,9 +155,8 @@ func (c *capture) preCommit(ctx context.Context, conn *driver.Conn, changes []en
 				return errors.New("replication: a Quorum commit cannot also change TEMP tables")
 			}
 		}
-		// Stamped without seqMu: this transaction may hold the write lock,
-		// which the hand-off holding seqMu waits for to apply. handOff takes
-		// seqMu once the lock is let go, and refuses the ops if the log moved.
+		// Stamped without seqMu, which a hand-off holds while it waits for this
+		// transaction's write lock; handOff refuses the ops if the log moved.
 		seen, err := c.heads(ctx)
 		if err != nil {
 			return err
@@ -330,9 +328,8 @@ func (c *capture) flush(ctx context.Context) error {
 	if len(c.buf) == 0 {
 		return nil
 	}
-	// Numbered on from the last seq this node noted, without reading the log
-	// first: a commit this node has not noted yet holds the next seq, which
-	// the first op's insert finds, and then they go past the log's last.
+	// Numbered on from the last seq this node noted: a commit not noted yet
+	// holds the next seq, which the first op's insert finds.
 	ops := c.stampFrom(c.s.store.ownSeq.Load())
 	wrote, err := c.writeOp(ctx, ops[0], true)
 	if err != nil {
@@ -375,12 +372,10 @@ func (c *capture) heads(ctx context.Context) (string, error) {
 }
 
 // fresh refuses a Quorum commit whose transaction began before another commit
-// landed. Its statements ran on what the database held then, and its seqs
-// would repeat the other's: an ordinary commit fails for the same reason when
-// it finds the file moved (engine.ErrBusy), but this transaction is discarded
-// and never gets there. Every change to a Quorum database is an op, so the log
-// as the transaction saw it (heads), against the log as it is now, says
-// whether anything landed. Under seqMu.
+// landed: its seqs would repeat the other's, and unlike an ordinary commit it
+// is discarded before the engine can refuse it. Every change to a Quorum
+// database is an op, so comparing the log's heads then and now tells. Under
+// seqMu.
 func (c *capture) fresh(ctx context.Context, seen string) error {
 	now, err := c.s.store.db.QueryContext(ctx, headsQuery)
 	if err != nil {
@@ -427,11 +422,10 @@ func (c *capture) stampFrom(seq uint64) []Op {
 }
 
 // lastSeq is this site's highest seq as this transaction reads the log. A
-// site's seqs in the log have no hole, so when the one after the last this
-// node committed is not there, that last one is the highest: one point read
-// instead of maxSeqQuery, which reads every op of the site. A transaction
-// whose image predates a commit it then numbers past never commits: the
-// engine refuses a stale image.
+// site's seqs have no hole, so when the one after the last this node committed
+// is absent, that one is the highest: a point read instead of maxSeqQuery. A
+// transaction numbering past a commit it did not see never commits: the
+// engine refuses its stale image.
 func (c *capture) lastSeq(ctx context.Context) (uint64, error) {
 	seq := c.s.store.ownSeq.Load()
 	rows, err := c.conn.Query(ctx, `SELECT 1 FROM main._repl_oplog WHERE site=? AND seq=?`, c.s.site, int64(seq+1))
@@ -468,9 +462,9 @@ func (c *capture) handOff() error {
 	return c.s.propose(context.Background(), ops)
 }
 
-// propose sends ops through the caller's consensus log as one entry, the
-// caller holding seqMu so that no other commit takes their seqs, and reports
-// whether they were applied here.
+// propose sends ops through the caller's consensus log as one entry, with
+// seqMu held so no other commit takes their seqs, and reports whether they
+// were applied here.
 func (s *Syncer) propose(ctx context.Context, ops []Op) error {
 	entry, err := json.Marshal(ops)
 	if err != nil {
@@ -580,9 +574,8 @@ func (c *capture) discard() {
 	applied := c.s.store.applied.Load()
 	switch {
 	case c.committing && !c.retrying && applied != c.applied:
-		// The commit failed after the capture, and an apply committed meanwhile:
-		// the driver retries an autocommit statement, and the applies wait for
-		// it (Store.waitLocal).
+		// The commit failed after the capture while an apply committed: the
+		// driver retries the statement, and applies wait for it (waitLocal).
 		c.retrying = true
 		c.s.store.localFailed()
 	case !c.committing && c.retrying:

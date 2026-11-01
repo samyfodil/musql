@@ -18,12 +18,10 @@ import (
 	"github.com/samyfodil/musql/engine"
 )
 
-// A node that holds nothing yet takes a peer's whole database as one file, an
-// image, instead of replaying the peer's history op by op: the donor writes a
-// consistent copy (VACUUM INTO), streams it, and the receiver installs it under
-// its own identity, then pulls the ops after the copy's cut as any node does.
-// The image carries the donor's bookkeeping as it is -- op log, clock, floors,
-// ranges, withheld rows, catalog -- so the receiver holds what the donor held.
+// A node that holds nothing takes a peer's whole database as one file, an
+// image, instead of replaying its history op by op: the donor sends a
+// consistent copy with its bookkeeping, and the receiver installs it under its
+// own identity, then pulls the ops after the copy's cut.
 
 // bookkeepingLayout is the layout of the bookkeeping tables this build writes,
 // as _repl_meta names it under metaLayout (schema.go).
@@ -33,10 +31,10 @@ var bookkeepingLayout = strconv.Itoa(clockLayout)
 // by op, in about as many round trips as an image takes.
 var imageMinOps uint64 = opsPerFetch
 
-// imageCompactRatio: an image whose delta is more than 1/imageCompactRatio of
-// it is compacted before it is adopted. A deliberate simplification between two
-// measured points: at 100k rows the delta was 1% of the image and compacting
-// it first cost 0.1-0.3 s of 2.2; at 1M it was 13% and saved 6 s of 25.
+// imageCompactRatio: an image whose delta is over 1/imageCompactRatio of it is
+// compacted before it is adopted. A fixed ratio between two measurements: at
+// 100k rows the delta was 1% and compacting first cost 0.1-0.3 s of 2.2; at
+// 1M it was 13% and saved 6 s of 25.
 var imageCompactRatio int64 = 16
 
 // imagePinGrace is how long a donor keeps the ops after an image's cut once the
@@ -185,12 +183,12 @@ var imageCutForTest func()
 // deltaSuffix names a segment file's delta (engine.CommitInfo).
 const deltaSuffix = ".delta"
 
-// Image returns a consistent copy of the database, for a node that holds
-// nothing yet: its manifest and its bytes, which closing removes. Until then,
-// and imagePinGrace after, prune keeps every op after its cut. The copy is the
-// committed files themselves, linked at the cut, or, where they cannot be or
-// the node asking cannot read their formats, a copy the database writes. A
-// request for another layout or file format is ErrImageRefused.
+// Image returns a consistent copy of the database for a node that holds
+// nothing yet: its manifest and bytes, removed on close. Until then, and
+// imagePinGrace after, prune keeps every op after its cut. The copy is the
+// committed files pinned at the cut, or one the database writes where they
+// cannot be pinned or read by the asking node. Another layout or file format
+// is ErrImageRefused.
 func (s *Store) Image(ctx context.Context, req ImageRequest) (ImageManifest, io.ReadCloser, error) {
 	layout, err := layoutOf(ctx, s.db)
 	if err != nil {
@@ -229,13 +227,9 @@ func (s *Store) Image(ctx context.Context, req ImageRequest) (ImageManifest, io.
 	return m, body, nil
 }
 
-// cutImage pins path's committed files, or failing that writes a copy of the
-// database into dir, fills in what m says of the image, and opens it for
-// reading.
-//
-// What m says of pinned files is read from the database beforehand: the
-// catalog the image's must equal, and floors and ranges that may be lower than
-// its own.
+// cutImage pins path's committed files, or else writes a copy into dir, fills
+// in m and opens the image. m's catalog, floors and ranges are read first: the
+// image's catalog must equal it, and its floors and ranges may be higher.
 func (s *Store) cutImage(ctx context.Context, path, dir string, req ImageRequest, m *ImageManifest) (imageBody, error) {
 	if err := imageState(ctx, s.db, m); err != nil {
 		return imageBody{}, err
@@ -426,10 +420,9 @@ func aheadOf(vv, mine VersionVector, self string) uint64 {
 	return n
 }
 
-// mayBeEmpty is the in-memory half of emptyOwnOps: no user object, and no op of
-// another site in the version vector or below a floor. Its own floor is no
-// matter: a lone node prunes its own ops, and the mode ops it may hold are
-// never pruned.
+// mayBeEmpty is the in-memory half of emptyOwnOps: no user object, and no
+// other site's op in the version vector or below a floor. Its own floor does
+// not matter: a lone node prunes its own ops.
 func (s *Store) mayBeEmpty() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -451,10 +444,9 @@ func (s *Store) emptyInMemory() bool {
 }
 
 // emptyOwnOps returns this site's ops when the database holds nothing an image
-// would lose: no user object, no other site's floor, of its own ops only mode ops, and of
-// other sites' only ops the version vector does not count yet -- pushed ahead of
-// the history they follow, they are still at their origin, which keeps them
-// until this node acks them. Otherwise it is errNotEmpty. s.mu is held.
+// would lose: no user object, no other site's floor, only mode ops of its own,
+// and of other sites only ops pushed ahead of their history, which their
+// origin still keeps. Otherwise errNotEmpty. s.mu is held.
 func (s *Store) emptyOwnOps(ctx context.Context) ([]Op, error) {
 	if !s.emptyInMemory() {
 		return nil, errNotEmpty
@@ -489,15 +481,12 @@ func (s *Store) emptyOwnOps(ctx context.Context) ([]Op, error) {
 	return own, rows.Err()
 }
 
-// installImage takes peer's image and installs it in place of this node's
-// database, which holds nothing yet.
-//
-// The image is staged beside the database and verified, then made this node's:
-// its own site id, its own rowid range, and its own ops so far (mode ops). Then,
-// with the store's lock held and nothing committed since its emptiness was
-// checked, it is renamed in as a commit after the database's last, so every
-// connection reloads. A marker names the staged file meanwhile, and Open
-// finishes an install a crash interrupted.
+// installImage installs peer's image in place of this empty node's database:
+// staged beside it and verified, made this node's (site id, rowid range, mode
+// ops), then renamed in as a commit after the database's last, under the
+// store's lock with nothing committed since the emptiness check. A marker
+// names the staged file meanwhile, and Open finishes an install a crash
+// interrupted.
 func (sy *Syncer) installImage(ctx context.Context, im Imager, peer PeerID) error {
 	s := sy.store
 	path, err := mainFile(ctx, s.db)
@@ -587,10 +576,9 @@ func (sy *Syncer) installImage(ctx context.Context, im Imager, peer PeerID) erro
 	if err := removeDurable(marker); err != nil {
 		log.Printf("replication: %v (Open removes it)", err)
 	}
-	// A site the image knows from more than the mode ops carried in may have
-	// rows in its range, deleted ones too, whose rowids it must not hand out
-	// again. A new site has none, and its scan of the clock is skipped; a
-	// donor that pruned to its ack has a floor for it at those mode ops.
+	// A site the image knows beyond the mode ops may have rows, deleted ones
+	// too, in its range, whose rowids it must not reuse; a new site has none,
+	// so its clock scan is skipped.
 	if s.floors[s.site] > ownSeq || s.vv[s.site] > ownSeq {
 		high, err := s.rowidHighs(ctx, sy.rowidLo, sy.rowidHi)
 		if err != nil {

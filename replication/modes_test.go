@@ -435,10 +435,8 @@ func TestQuorumCommitsThroughTheLog(t *testing.T) {
 }
 
 // TestQuorumCommitHoldingTheWriteLock: a Quorum commit made while holding the
-// write lock -- a BEGIN IMMEDIATE transaction's, or a retried autocommit
-// write's -- does not wait for the hand-off before it, which waits for that
-// lock to apply: the two used to wait on each other until the busy timeout
-// failed the hand-off.
+// write lock does not wait for the hand-off before it, which waits for that
+// lock: the two used to deadlock until the busy timeout.
 func TestQuorumCommitHoldingTheWriteLock(t *testing.T) {
 	ctx := t.Context()
 	var lg fakeLog

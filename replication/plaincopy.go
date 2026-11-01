@@ -10,12 +10,11 @@ import (
 	"github.com/samyfodil/musql/engine"
 )
 
-// PlainCopy writes dst, a copy of the replicated database at src as an
-// ordinary one: its schema and rows, without this package's bookkeeping tables
-// and with the capture guard lifted, so any connection may write it, and Open
-// on it makes its rows a new site's first ops. src is only read, in one
-// consistent snapshot, and may be open; dst must not exist. A row Withheld
-// lists is in no table, so it is not in the copy.
+// PlainCopy writes dst, an ordinary copy of the replicated database at src: its
+// schema and rows without the bookkeeping tables or the capture guard, so any
+// connection may write it and Open makes its rows a new site's first ops. src
+// is read in one snapshot and may be open; dst must not exist. Withheld rows
+// are not copied.
 func PlainCopy(ctx context.Context, src, dst string) (err error) {
 	if _, err := os.Stat(src); err != nil {
 		return err

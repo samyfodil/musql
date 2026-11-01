@@ -31,9 +31,8 @@ import (
 // so any number of them share a host, each answering only for itself.
 const ProtocolID = protocol.ID("/musql/replication/1.0.0")
 
-// ImageProtocolID is the base of the stream protocol an image is sent over
-// (replication.Imager), per database as ProtocolID is: a stream of its own,
-// since an image is many messages where a call is one.
+// ImageProtocolID is the base of the per-database stream protocol an image is
+// sent over: many messages, where a call is one.
 const ImageProtocolID = protocol.ID("/musql/replication-image/1.0.0")
 
 // Server is the read side of a replication.Store that Transport serves over
@@ -192,10 +191,9 @@ const (
 	streamTimeout     = 30 * time.Second
 )
 
-// call sends req to peer and reads its one Response, on a stream an earlier
-// call left idle when there is one. A peer that answers one request a stream
-// closed that since, and the request goes again on a fresh stream; every
-// request is safe to send twice.
+// call sends req to peer and reads its Response, on an idle stream when there
+// is one. A peer may have closed that stream since, and the request goes again
+// on a fresh one; every request is safe to send twice.
 func (t *Transport) call(ctx context.Context, peerID replication.PeerID, req *pb.Request) (*pb.Response, error) {
 	pid, err := peer.Decode(string(peerID))
 	if err != nil {
@@ -231,9 +229,9 @@ type idleStream struct {
 	since time.Time
 }
 
-// streamIdle is how long a stream may sit idle and still take a request: well
-// under the streamTimeout after which the peer stops waiting for one; maxIdle
-// is how many idle streams to a peer are kept.
+// streamIdle is how long a stream may sit idle and still take a request, well
+// under the peer's streamTimeout; maxIdle is how many idle streams a peer
+// keeps.
 const (
 	streamIdle = streamTimeout / 2
 	maxIdle    = 2
@@ -309,9 +307,8 @@ func (t *Transport) ExchangeVV(ctx context.Context, peerID replication.PeerID, v
 }
 
 // GetOps retrieves from peer site's ops after fromSeq, at most limit of them
-// (the peer may send fewer). Once it answers a full page, it asks for the next
-// one while the caller applies this one, and the next call that starts where
-// this page ends takes it.
+// (the peer may send fewer). After a full page it asks for the next while the
+// caller applies this one.
 func (t *Transport) GetOps(ctx context.Context, peerID replication.PeerID, site string, fromSeq uint64, limit int) ([]replication.Op, error) {
 	k := aheadKey{peerID, site}
 	ops, ok := t.takeAhead(ctx, k, fromSeq, limit)
@@ -553,9 +550,8 @@ var _ replication.Broadcaster = (*Transport)(nil)
 // default message limit.
 const maxPushBytes = 512 << 10
 
-// PushOps publishes a commit's ops to the gossipsub topic, as few messages as
-// fit them, once for every peer. A message of one op carries it in op, which
-// a peer that predates ops reads too.
+// PushOps publishes a commit's ops to the gossipsub topic in as few messages
+// as fit them. A one-op message carries it in op, which older peers read.
 func (t *Transport) PushOps(ctx context.Context, ops []replication.Op) error {
 	var errs []error
 	msg, size := &pb.PushMessage{}, 0

@@ -51,28 +51,26 @@ type Store struct {
 	// its version in _repl_meta.
 	cat *catalog
 	ver string
-	// txHeld caches, within an ingest's transaction, whether a table has rows
-	// held out (_repl_withheld); nil outside one.
+	// txHeld caches, inside an ingest's transaction, whether a table has
+	// withheld rows.
 	txHeld map[string]bool
-	// mayHold is every table that may have rows held out: each one that had
-	// some when the store opened, and each one rebuildTable has held a row of
-	// since. Only rebuildTable writes _repl_withheld, always under mu, so a
-	// table not in it has none, and needs no query to say so.
+	// mayHold is every table that may have withheld rows: those with some at
+	// open and those rebuildTable held a row of since (it alone writes
+	// _repl_withheld, under mu).
 	mayHold map[string]bool
-	// localRetries counts the local commits being retried after losing to an
-	// apply, and localUntil is when waitLocal stops waiting for them anyway, in
-	// unix nanoseconds; lastLocal is when a local commit last landed. applied
-	// counts the ingest commits.
+	// localRetries counts local commits being retried after losing to an
+	// apply, localUntil (unix ns) is when waitLocal stops waiting for them,
+	// lastLocal is when a local commit last landed, and applied counts ingest
+	// commits.
 	localRetries atomic.Int32
 	localUntil   atomic.Int64
 	lastLocal    atomic.Int64
 	applied      atomic.Uint64
-	// localWaiting counts the local writes waiting for the write lock and
-	// localGot those done waiting; yieldTo is the localGot an apply that
-	// yielded the lock to waiting writes waits for (waitLocal). ingestWaiting
-	// counts the ingests waiting for the write lock and ingestGot those done
-	// waiting, which a local write lets in first (waitIngest). localFree is
-	// closed when localGot or ingestGot rises or localRetries falls.
+	// localWaiting and localGot count the local writes waiting for the write
+	// lock and done waiting; yieldTo is the localGot a yielding apply waits for
+	// (waitLocal). ingestWaiting and ingestGot are the same for ingests
+	// (waitIngest). localFree closes when localGot or ingestGot rises or
+	// localRetries falls.
 	localWaiting  atomic.Int32
 	localGot      atomic.Uint64
 	yieldTo       atomic.Uint64
@@ -80,10 +78,9 @@ type Store struct {
 	ingestGot     atomic.Uint64
 	localMu       sync.Mutex
 	localFree     chan struct{}
-	// ownSeq is the highest seq of this site's that a local commit here, or the
-	// log at open, holds (capture.lastSeq). NoteLocal raises it without mu, and
-	// vv takes it in (foldOwn) wherever vv is read under mu: a local writer
-	// otherwise waited after its commit for a whole apply transaction.
+	// ownSeq is the highest seq of this site's that a local commit or the log
+	// at open holds. NoteLocal raises it without mu and foldOwn takes it into
+	// vv under mu, so a local writer need not wait for an apply transaction.
 	ownSeq atomic.Uint64
 	// anyHeld is whether mayHold has a table at all, read without mu.
 	anyHeld atomic.Bool
@@ -96,18 +93,12 @@ type Store struct {
 	intern recIntern
 }
 
-// begin starts a store transaction: BEGIN IMMEDIATE on a connection of the
-// store's handle, so no other connection commits while it is open and its
-// commit cannot fail because one did. A deferred transaction lost to every
-// local write that committed after it began, and the ops it carried waited for
-// the next anti-entropy round, which lost the same way. The BEGIN waits for
-// another writer as an autocommit statement does (driver's busyRetry).
-//
-// It ignores ctx's cancellation for the same reason a *sql.Tx would not do:
-// database/sql rolls a cancelled transaction back from a goroutine of its own,
-// which db.Close does not wait for. Every store transaction ends on its own
-// path instead: the statements in it still see ctx, fail once it is
-// cancelled, and the error path rolls back before the call returns.
+// begin starts a store transaction with BEGIN IMMEDIATE, so no other
+// connection commits while it is open: a deferred one lost to every local
+// write that committed after it began. It ignores ctx's cancellation, since
+// database/sql rolls a cancelled transaction back from a goroutine of its own
+// that db.Close does not wait for; the statements inside still see ctx, and
+// the error path rolls back before returning.
 func (s *Store) begin(ctx context.Context) (storeTx, error) {
 	conn, err := s.db.Conn(context.WithoutCancel(ctx))
 	if err != nil {
@@ -281,10 +272,9 @@ func (s *Store) OpsSince(ctx context.Context, site string, fromSeq uint64, limit
 	return ops, rows.Err()
 }
 
-// opsUpTo is OpsSince's ops up to the site's contiguous seq, all of which the
-// log holds above the floor: a point read each, where a range of seqs is read
-// by scanning the whole log. It stops at the first seq it does not find (one
-// pruned meanwhile), and returns none when there is none to read.
+// opsUpTo is OpsSince's ops up to the site's contiguous seq, by a point read
+// each where a range of seqs would scan the whole log. It stops at the first
+// seq missing (pruned meanwhile).
 func (s *Store) opsUpTo(ctx context.Context, site string, fromSeq uint64, limit int) ([]Op, error) {
 	s.mu.Lock()
 	s.foldOwn()
@@ -340,11 +330,10 @@ func scanOp(r interface{ Scan(...any) error }) (Op, error) {
 // it drops and rebuilds either all land or none do, so a failure part-way leaves
 // the op un-recorded and the next delivery redoes it from the start.
 //
-// GROUP COMMIT: an Ingest that arrives while another is applying waits, and
-// the next transaction applies every op that queued meanwhile -- one commit,
-// one sync to disk, for all of them. A call that finds nothing applying leads
-// at once, so an idle receiver waits for nothing. Each call still returns only
-// once its own op is durable, or refused.
+// GROUP COMMIT: an Ingest arriving while another applies waits, and the next
+// transaction applies every op queued meanwhile, one commit and sync for all.
+// A call that finds nothing applying leads at once. Each returns once its own
+// op is durable or refused.
 func (s *Store) Ingest(ctx context.Context, op Op, local bool) error {
 	g := &s.group
 	c := &ingestCall{op: op, local: local, done: make(chan error, 1)}
@@ -393,10 +382,9 @@ type ingestCall struct {
 
 var errIngestLead = errors.New("replication: lead the next ingest")
 
-// applyCalls applies the queued calls' ops in order, a run of one local flag
-// to a transaction (ingestAllAs), and hands each call its result: an op that
-// is refused gets its error, and the ops after it still apply. The leader's
-// cancellation does not end the others' transaction: begin ignores it too.
+// applyCalls applies the queued ops in order, a run of one local flag to a
+// transaction, and hands each call its result; a refused op does not stop the
+// rest. The leader's cancellation does not end the others' transaction.
 func (s *Store) applyCalls(ctx context.Context, calls []*ingestCall) {
 	ctx = context.WithoutCancel(ctx)
 	for len(calls) > 0 {
@@ -457,20 +445,16 @@ func (s *Store) ingestAllAs(ctx context.Context, ops []Op, local bool) (int, err
 	return len(ops), nil
 }
 
-// maxHold is how long an ingest holds the write lock before it commits what it
-// has and lets a local writer in, and holdAlone how long when no local commit
-// has landed for localQuiet: a commit costs much the same however many ops it
-// carries, and a node catching up with nothing else writing makes few.
+// maxHold is how long an ingest holds the write lock before it commits and
+// lets a local writer in, and holdAlone how long when no local commit landed
+// for localQuiet: a commit costs much the same however many ops it carries.
 const (
 	maxHold    = 50 * time.Millisecond
 	holdAlone  = 500 * time.Millisecond
 	localQuiet = time.Second
-	// yieldHold is how long an ingest holds the lock, at least, once a local
-	// write waits for it (localWaiting). Each turn costs the ingest more than
-	// its commit: the writers then take the lock in turn, and each catches up
-	// with what the ingest applied first. Beside two writers, 10 ms left the
-	// ingest a fifth of the lock (1,700 ops/s, 45 writes/s on .10); 30 ms, a
-	// third (4,000 ops/s, 21 writes/s).
+	// yieldHold is the least an ingest holds the lock once a local write waits:
+	// each turn costs it more than its commit. Beside two writers, 10 ms gave
+	// the ingest 1,700 ops/s and 30 ms gave it 4,000.
 	yieldHold = 30 * time.Millisecond
 )
 
@@ -486,15 +470,10 @@ func (s *Store) hold() time.Duration {
 func (s *Store) localCommitted() { s.lastLocal.Store(time.Now().UnixNano()) }
 
 // waitLocal holds an apply off while a local commit that failed after its
-// capture -- it found the write lock taken, or the file moved under it -- is
-// being retried: the driver re-runs an autocommit statement whole, and one
-// longer than the gap between two applies would otherwise never commit. It
-// waits at most as long as the driver retries (engine.BusyTimeout) from the
-// first failure. After an apply yielded the lock to local writes waiting for
-// it (ingestTx), it also waits for each of them to have taken it: the apply
-// would otherwise take the lock back the moment it let go of it, ahead of
-// writers that had waited through its whole transaction. Writes that start
-// waiting later wait for the next yield. That wait is bounded the same way.
+// capture is being retried: the driver re-runs an autocommit statement whole,
+// and a long one would never fit between applies. After an apply yielded the
+// lock to waiting local writes, it also waits for each of them to take it.
+// Both waits end engine.BusyTimeout after they began.
 func (s *Store) waitLocal() {
 	until := time.Now().Add(engine.BusyTimeout)
 	for {
@@ -526,9 +505,7 @@ func (s *Store) localDone() {
 }
 
 // waitIngest lets an ingest waiting for the write lock take it ahead of a
-// local write, waiting at most holdAlone. The lock is not handed over in turn:
-// a writer committing back to back took it back each time before the waiting
-// ingest woke, and its ops waited seconds.
+// local write, waiting at most holdAlone: the lock is not handed over in turn.
 func (s *Store) waitIngest() {
 	got, until := s.ingestGot.Load(), time.Now().Add(holdAlone)
 	for {
@@ -824,9 +801,9 @@ var presenceVals = [2][]byte{{0}, {1}}
 // recsPerStmt is the most clock records one statement of writeRecs writes.
 const recsPerStmt = 128
 
-// writeRecs writes clock records, four arguments each (recArgs): a plain
-// INSERT of those the clock has none of -- an upsert's conflict handling
-// costs the engine several times an insert's -- and an upsert of those it has.
+// writeRecs writes clock records (recArgs): a plain INSERT of new ones, since
+// an upsert costs the engine several times an insert, and an upsert of the
+// rest.
 func (s *Store) writeRecs(ctx context.Context, fresh, won []any) error {
 	const insert = `INSERT INTO main._repl_clock(tbl,pk,top,rec) VALUES `
 	const update = ` ON CONFLICT(tbl,pk) DO UPDATE SET top=excluded.top, rec=excluded.rec`
@@ -848,12 +825,10 @@ func (s *Store) writeRecs(ctx context.Context, fresh, won []any) error {
 // applyRunMax is the most data ops ingestTx merges in one run (applyOps).
 const applyRunMax = 256
 
-// applyOps is applyOp for a run of data ops, each in the log already. Every
-// row's ops merge into its clock cells in memory, and the cells that changed
-// are written once for the whole run, many to a statement; then every row that
-// changed is written once. A table that holds rows out, or refuses one of
-// them a UNIQUE value, is rebuilt once, after the rest -- from the clock alone,
-// as every node rebuilds it.
+// applyOps is applyOp for a run of data ops already in the log: each row's ops
+// merge into its clock cells in memory, the changed cells and rows are written
+// once for the run, many to a statement, and a table that holds rows out or
+// refuses a UNIQUE value is rebuilt from the clock afterwards.
 func (s *Store) applyOps(ctx context.Context, ops []Op, local bool) error {
 	if len(ops) == 0 {
 		return nil
@@ -927,8 +902,7 @@ func (s *Store) applyOps(ctx context.Context, ops []Op, local bool) error {
 }
 
 // readRecs hands got the clock's cells of each of tbl's rows pks it holds a
-// record of. Each is its own point read: the engine runs "pk IN (...)" as a
-// scan of the table that tests every row against the list.
+// record of, by a point read each.
 func (s *Store) readRecs(ctx context.Context, tbl string, pks [][]byte, got func(pk []byte, cells map[string]clockCell)) error {
 	for _, pk := range pks {
 		var rec []byte
@@ -1346,10 +1320,8 @@ func (s *Store) loadHeld(ctx context.Context) error {
 	return rows.Err()
 }
 
-// rewriteRows is rebuildTable for a table with no UNIQUE index: no row can
-// hold a value another wants, so the order rows go in does not matter, and
-// they go in key order, as the clock's cells are read, a few hundred to a
-// statement.
+// rewriteRows is rebuildTable for a table with no UNIQUE index: the order rows
+// go in does not matter, so they go in key order, many to a statement.
 func (s *Store) rewriteRows(ctx context.Context, t *object) error {
 	keyNames, err := keyNamesOf(t)
 	if err != nil {

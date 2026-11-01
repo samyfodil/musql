@@ -6,12 +6,9 @@ import "testing"
 // for any other database.
 const fkDSN = "?_pragma=foreign_keys(1)"
 
-// TestForeignKeysDoNotActOnApply: a node whose DSN turns foreign keys on gives
-// its users enforcement and its apply handle none. Applying a peer's UPDATE
-// writes the row as a DELETE and an INSERT, which ON DELETE CASCADE would answer
-// by deleting the children here that the peer never deleted. What a foreign key
-// action did to the children on the node that ran it reaches every node as ops
-// of its own, captured there, so applying the parent's delete alone is exact.
+// TestForeignKeysDoNotActOnApply: foreign keys on in the DSN enforce for users
+// but not on the apply handle, where a peer's UPDATE, applied as a DELETE and
+// an INSERT, would cascade to children the peer never touched.
 func TestForeignKeysDoNotActOnApply(t *testing.T) {
 	for _, tc := range []struct {
 		name, onDelete, write, want string

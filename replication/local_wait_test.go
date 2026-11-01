@@ -10,11 +10,8 @@ import (
 	"time"
 )
 
-// TestApplyYieldsToWaitingLocalWrite: an apply holding the write lock commits
-// what it has soon after a local write starts waiting for the lock, instead of
-// holding it as long as it may when nothing waits, and the next apply waits
-// for that write to have taken the lock -- for that one only. A local write
-// waiting while no apply yielded to it holds no apply off.
+// TestApplyYieldsToWaitingLocalWrite: an apply commits soon after a local
+// write starts waiting, and the next apply waits for that write alone.
 func TestApplyYieldsToWaitingLocalWrite(t *testing.T) {
 	s := newTestStore(t, "localyield")
 	waitLocal := func() <-chan struct{} {
@@ -82,9 +79,7 @@ func TestApplyYieldsToWaitingLocalWrite(t *testing.T) {
 }
 
 // TestWaitingIngestTakesTheLockFirst: a local write that finds an ingest
-// waiting for the write lock lets it take the lock first, and so reads what it
-// applied. The lock is not handed over in turn: a writer committing back to
-// back took it back each time before the waiting ingest woke.
+// waiting for the lock lets it in first, and reads what it applied.
 func TestWaitingIngestTakesTheLockFirst(t *testing.T) {
 	const rounds = 3
 	ctx := context.Background()

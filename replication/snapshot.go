@@ -45,11 +45,10 @@ const (
 	snapshotPageBytes = 16 << 20
 )
 
-// snapshotCursor is where the next page of a part starts: after the row of
-// this rowid. A page is the rows after it in rowid order, which a rowid table
-// is stored in, so serving one is a seek rather than a sort of the table.
-// A cursor of an older format decodes as the start, and the part is sent again
-// from there: every row of it merges idempotently.
+// snapshotCursor is where a part's next page starts: after the row of this
+// rowid, so serving a page is a seek in rowid order rather than a sort. A
+// cursor of an older format decodes as the start; the part's rows merge
+// idempotently.
 type snapshotCursor struct {
 	Rowid int64 `json:"r"`
 }
@@ -145,12 +144,10 @@ func (s *Store) SnapshotPage(ctx context.Context, part int, cursor []byte) (Snap
 
 // pageAfter takes one page of "SELECT rowid, <from>": the rows after rowid
 // after, in rowid order, each handed to take, which scans the columns after
-// the rowid and reports the row's size. It returns the cursor of the next
-// page, nil when this one is the last.
-//
-// The table's own order serves the page without sorting it. A page that comes
-// back out of rowid order is read again sorted (reset discards what take kept):
-// the cursor must be the largest rowid of every row the page could hold.
+// the rowid and reports the row's size. It returns the next page's cursor, nil
+// after the last. A page that comes back out of rowid order is read again
+// sorted (reset discards what take kept), since the cursor must be the largest
+// rowid the page could hold.
 func (s *Store) pageAfter(ctx context.Context, from string, after int64, reset func(), take func(scan func(...any) error) (int, error)) ([]byte, error) {
 	for _, order := range []string{``, ` ORDER BY rowid`} {
 		last, more, sorted, err := s.readPage(ctx, `SELECT rowid, `+from+` WHERE rowid > ?`+order+` LIMIT ?`, after, take)
