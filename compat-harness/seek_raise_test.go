@@ -152,6 +152,9 @@ func TestSeekRaisingTermVsC(t *testing.T) {
 					for _, terms := range seekRaiseTerms(`json_extract(j, '$') > 0`, `k = `+kt.k1) {
 						queries = append(queries, `SELECT rowid FROM i WHERE `+terms)
 					}
+					queries = append(queries,
+						`SELECT rowid FROM i WHERE json_extract('1', '$') = 1 AND k = `+kt.k1,
+						`SELECT o.id, i.rowid FROM o JOIN i ON i.k = o.want WHERE json_extract(o.lim, '$') IS NOT NULL ORDER BY o.id, i.rowid`)
 					for _, key := range []string{`rowid = 'x'`, `rowid = 1.5`, `rowid = NULL`, `rowid = '1'`,
 						`rowid < 2`, `rowid <= 1.5`, `rowid > 'abc'`, `rowid >= 2.5`, `rowid < 'abc'`} {
 						for _, terms := range seekRaiseTerms(`json_extract(j, '$') > 0`, key) {

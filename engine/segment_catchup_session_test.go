@@ -8,9 +8,8 @@ import (
 	"testing"
 )
 
-// TestCatchUpOverAnAppendedSegment: a batch that appends a segment (an append
-// load) folds in like any other, and the session then answers and indexes as
-// one opened on the file does.
+// TestCatchUpOverAnAppendedSegment: after another connection's append load, a
+// session answers and indexes as one opened on the file does.
 func TestCatchUpOverAnAppendedSegment(t *testing.T) {
 	defer SetAppendArmAfterForTest(SetAppendArmAfterForTest(1))
 	path, a, b := catchUpPair(t)
@@ -18,10 +17,9 @@ func TestCatchUpOverAnAppendedSegment(t *testing.T) {
 	if _, err := CompactSegmentFile(path); err != nil {
 		t.Fatal(err)
 	}
-	for _, s := range []*Session{a, b} {
-		if _, err := s.RefreshIfStale(); err != nil {
-			t.Fatal(err)
-		}
+	mustCommit(t, b, `UPDATE q SET v = 'uno' WHERE id = 1`)
+	if _, err := a.RefreshIfStale(); err != nil {
+		t.Fatal(err)
 	}
 	buildIndexes(t, a)
 	b.SetCommitsEachStatement(true)
