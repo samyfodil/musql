@@ -196,3 +196,34 @@ func TestBatchRefusedOpAppliesThoseBefore(t *testing.T) {
 		t.Fatalf("the log holds %d ops (%v), want %d", logged, err, k)
 	}
 }
+
+// TestRewriteHoldsOutARefusedRow: a row a table without a UNIQUE index refuses,
+// a NULL in a NOT NULL column that has a default, is held out by the rewrite
+// that settles it, and the rows written beside it stay.
+func TestRewriteHoldsOutARefusedRow(t *testing.T) {
+	const ddl = `CREATE TABLE c(id INTEGER PRIMARY KEY, x NOT NULL DEFAULT 0)`
+	id := objectID("table", "c", ddl, 0)
+	ctx := context.Background()
+	s := newTestStore(t, "rewritecheck")
+	ops := []Op{{Site: "schema", Seq: 2, HLC: 2, Kind: OpSchema,
+		Cells: schemaOp{Act: actCreate, ID: id, Type: "table", Name: "c", SQL: ddl}.cells()}}
+	for i, x := range []any{int64(1), nil, int64(3)} {
+		ops = append(ops, Op{Site: "A", Seq: uint64(i + 1), HLC: HLC(10 + i), Tbl: id, PK: EncodePK(int64(i + 1)),
+			Kind: OpInsert, Cells: []Cell{CellFromValue(initialColID(id, "x"), x)}})
+	}
+	for _, op := range ops {
+		if err := s.Ingest(ctx, op, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var rows, held string
+	if err := s.db.QueryRowContext(ctx, `SELECT coalesce(group_concat(id || ':' || x, ' '), '') FROM (SELECT id, x FROM main.c ORDER BY id)`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT coalesce(group_concat(hex(pk), ' '), '') FROM main._repl_withheld WHERE tbl = ?`, id).Scan(&held); err != nil {
+		t.Fatal(err)
+	}
+	if want := fmt.Sprintf("%X", EncodePK(int64(2))); rows != "1:1 3:3" || held != want {
+		t.Fatalf("rows %q, held out %q (want %q)", rows, held, want)
+	}
+}

@@ -154,3 +154,56 @@ func TestCallsShareAStream(t *testing.T) {
 		}
 	}
 }
+
+// TestIdleStreamsAreCappedAndAged: calls that ran at once leave at most
+// maxIdle of their streams to reuse, and a stream idle too long is not reused.
+func TestIdleStreamsAreCappedAndAged(t *testing.T) {
+	ctx := context.Background()
+	server, serverHost, client := pullPair(t, nopServer{})
+	id := replication.PeerID(serverHost.ID().String())
+	const calls = maxIdle + 2
+	arrived, release := make(chan struct{}, calls), make(chan struct{})
+	var streams atomic.Int32
+	serverHost.SetStreamHandler(server.proto, func(s network.Stream) {
+		if streams.Add(1) <= calls {
+			arrived <- struct{}{}
+			<-release
+		}
+		server.handleStream(s)
+	})
+	errs := make(chan error, calls)
+	for range calls {
+		go func() {
+			_, err := client.ExchangeVV(ctx, id, replication.VersionVector{})
+			errs <- err
+		}()
+	}
+	for range calls {
+		<-arrived
+	}
+	close(release)
+	for range calls {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	idle := func() int {
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		return len(client.idle[serverHost.ID()])
+	}
+	if n := idle(); n != maxIdle {
+		t.Fatalf("%d idle streams, want %d", n, maxIdle)
+	}
+	client.mu.Lock()
+	for _, is := range client.idle[serverHost.ID()] {
+		is.since = time.Now().Add(-streamIdle)
+	}
+	client.mu.Unlock()
+	if _, err := client.ExchangeVV(ctx, id, replication.VersionVector{}); err != nil {
+		t.Fatal(err)
+	}
+	if n := streams.Load(); n != calls+1 {
+		t.Fatalf("%d streams after the idle ones aged, want %d", n, calls+1)
+	}
+}

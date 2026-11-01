@@ -68,4 +68,16 @@ func TestGetImageRefusals(t *testing.T) {
 		body.Close()
 		t.Error("an image of another layout was sent")
 	}
+
+	// A reader closed before the image's end resets the stream.
+	_, body, err := tb2.GetImage(ctx, replication.PeerID(hD.ID().String()), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := body.Read(make([]byte, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := body.Close(); err != nil {
+		t.Fatal(err)
+	}
 }

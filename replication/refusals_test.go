@@ -45,6 +45,14 @@ func TestDecodeRecRefusesMalformed(t *testing.T) {
 			t.Fatalf("cut at %d of %d: %v, want errBadRec", n, len(rec), err)
 		}
 	}
+	for name, rec := range map[string][]byte{
+		"more cells than bytes": {1, 0, 100},
+		"an unknown cell kind":  {1, 0, 1, 1, 'a', 7},
+	} {
+		if _, err := decodeRec(rec); !errors.Is(err, errBadRec) {
+			t.Fatalf("%s: %v, want errBadRec", name, err)
+		}
+	}
 }
 
 func TestSnapshotPageRefusesAnUnknownPart(t *testing.T) {

@@ -5,11 +5,13 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -78,6 +80,8 @@ func TestAdoptImageRefuses(t *testing.T) {
 	other.HLC++
 	otherSite := m
 	otherSite.Site = "zz"
+	lo, _ := RowidRange(m.Site)
+	clash := fmt.Sprintf("b#r%d", lo>>32)
 	for name, tc := range map[string]struct {
 		m          ImageManifest
 		site, mode string
@@ -88,6 +92,7 @@ func TestAdoptImageRefuses(t *testing.T) {
 		"its own site":                 {m, m.Site, modeCRDT, nil, false},
 		"another mode":                 {m, "b", modeLeader, nil, true},
 		"another op at a seq":          {m, "b", modeCRDT, []Op{other}, true},
+		"a site on the image's range":  {m, clash, modeCRDT, nil, true},
 	} {
 		err := adoptImage(ctx, staged, tc.m, tc.site, tc.mode, tc.own)
 		if err == nil || errors.Is(err, ErrImageRefused) != tc.refused {
@@ -144,5 +149,78 @@ func TestPlainCopyRefuses(t *testing.T) {
 	}
 	if err := PlainCopy(context.Background(), filepath.Join(c.dir, "a.db"), existing); err == nil {
 		t.Error("copied over an existing file")
+	}
+}
+
+func TestDurableFilesReportFailures(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "f"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeDurable(dir); err == nil {
+		t.Error("removed a directory that is not empty")
+	}
+	if _, err := os.Stat("/dev/full"); err == nil {
+		if err := writeDurable("/dev/full", []byte("x")); err == nil {
+			t.Error("a write to a full device succeeded")
+		}
+	}
+}
+
+// TestKeepMarkerLeavesAMovedInstall: an install that failed with the database
+// no longer as it was keeps its marker, for Open to finish it.
+func TestKeepMarkerLeavesAMovedInstall(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "x.db")
+	pending, err := keepMarker(path, filepath.Join(dir, "x.db"+stagedInfix+"1"), 7, errors.New("install failed"))
+	if !pending || err == nil || !strings.Contains(err.Error(), "next opened") {
+		t.Fatalf("pending %v, %v", pending, err)
+	}
+}
+
+// TestImageStateRefusesBrokenBookkeeping: an image whose bookkeeping tables are
+// missing or hold what is not a number is refused, not half read.
+func TestImageStateRefusesBrokenBookkeeping(t *testing.T) {
+	ctx := context.Background()
+	meta := `CREATE TABLE _repl_meta(k TEXT PRIMARY KEY, v BLOB)`
+	floors := `CREATE TABLE _repl_floors(site TEXT PRIMARY KEY, seq INTEGER)`
+	for name, ddl := range map[string][]string{
+		"no meta":                   nil,
+		"no floors":                 {meta},
+		"a floor that is no number": {meta, floors, `INSERT INTO _repl_floors VALUES('a', 'x')`},
+		"no ranges":                 {meta, floors},
+		"a range that is no number": {meta, floors, `CREATE TABLE _repl_ranges(lo INTEGER, site TEXT)`, `INSERT INTO _repl_ranges VALUES('x', 'a')`},
+	} {
+		db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "image.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, q := range ddl {
+			if _, err := db.Exec(q); err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+		}
+		var m ImageManifest
+		if err := imageState(ctx, db, &m); err == nil {
+			t.Errorf("%s: read", name)
+		}
+		db.Close()
+	}
+}
+
+func TestImageNeedsADatabaseFile(t *testing.T) {
+	ctx := context.Background()
+	db, err := openApplyDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	s, err := OpenStore(ctx, db, "mem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Image(ctx, imageRequest(bookkeepingLayout)); err == nil {
+		t.Fatal("an image of a database with no file")
 	}
 }

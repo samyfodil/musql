@@ -3,6 +3,7 @@ package replication
 import (
 	"context"
 	"fmt"
+	"io"
 	"math/rand"
 	"slices"
 	"sync"
@@ -372,4 +373,57 @@ func (h *holdPush) PushOps(_ context.Context, ops []Op) error {
 	h.pushes <- ops
 	h.once.Do(func() { <-h.release })
 	return nil
+}
+
+func TestDrainStopsAtABatchOrAClosedChannel(t *testing.T) {
+	ch := make(chan PeerOp, maxPushBatch+1)
+	for i := range maxPushBatch + 1 {
+		ch <- PeerOp{Op: Op{Seq: uint64(i + 1)}}
+	}
+	if ops := drain(ch, Op{}); len(ops) != maxPushBatch {
+		t.Fatalf("a full batch: %d ops", len(ops))
+	}
+	close(ch)
+	if ops := drain(ch, Op{}); len(ops) != 3 {
+		t.Fatalf("after the channel closed: %d ops", len(ops))
+	}
+}
+
+// unreachable is a peer whose version vector never comes back.
+type unreachable struct{ stubPeer }
+
+func (unreachable) ExchangeVV(context.Context, PeerID, VersionVector) (VersionVector, error) {
+	return nil, errPartitioned
+}
+
+func TestSyncSkipsAnUnreachablePeer(t *testing.T) {
+	s := newTestStore(t, "unreachable")
+	if err := NewNode(s, unreachable{}).Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if vv := s.LocalVV(); len(vv) > 1 {
+		t.Fatalf("learned from an unreachable peer: %v", vv)
+	}
+}
+
+// TestNodeServesItsStoresImage: a node's OpSource serves the image its store
+// cuts.
+func TestNodeServesItsStoresImage(t *testing.T) {
+	c := newCluster(t)
+	c.open("a", imageDDL...)
+	st := syncerOf(t, c.dbs["a"]).store
+	src, ok := NewNode(st, nil).OpSource().(interface {
+		Image(context.Context, ImageRequest) (ImageManifest, io.ReadCloser, error)
+	})
+	if !ok {
+		t.Fatal("a node's OpSource serves no image")
+	}
+	m, body, err := src.Image(context.Background(), imageRequest(bookkeepingLayout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body.Close()
+	if m.Site != "a" || m.Size == 0 {
+		t.Fatalf("manifest %+v", m)
+	}
 }

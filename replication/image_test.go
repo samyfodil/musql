@@ -595,3 +595,65 @@ func TestImageMarkerGoesWhenTheDatabaseMoved(t *testing.T) {
 		t.Fatalf("the marker stayed: %v", err)
 	}
 }
+
+// TestImageOverABackupSkipsItsOldRowids: a node restored from a backup taken
+// before it wrote takes an image that knows its later writes, and its next row
+// takes a rowid past every one it wrote, the deleted one's too.
+func TestImageOverABackupSkipsItsOldRowids(t *testing.T) {
+	lowImageMin(t)
+	c := newCluster(t)
+	c.open("a", imageDDL...)
+	c.exec("a", `INSERT INTO k VALUES('a0')`)
+	c.net.Partition("a", "b", true)
+	c.open("b")
+	c.dbs["b"].Close()
+	backup := t.TempDir()
+	copyFiles(t, c.dir, backup, "b.db")
+	c.net.Partition("a", "b", false)
+	c.open("b")
+	c.converge("", imageRowsK)
+	for i := range 5 {
+		c.exec("b", fmt.Sprintf(`INSERT INTO k VALUES('b%d')`, i))
+	}
+	var gone int64
+	if err := c.dbs["b"].QueryRow(`SELECT rowid FROM k WHERE v = 'b4'`).Scan(&gone); err != nil {
+		t.Fatal(err)
+	}
+	c.exec("b", `DELETE FROM k WHERE v = 'b4'`)
+	c.converge("", imageRowsK)
+	c.dbs["b"].Close()
+	engine.RemoveDatabaseFiles(filepath.Join(c.dir, "b.db"))
+	copyFiles(t, backup, c.dir, "b.db")
+	c.open("b")
+	waitImage(t, c.dbs["b"])
+	c.exec("b", `INSERT INTO k VALUES('again')`)
+	var next int64
+	if err := c.dbs["b"].QueryRow(`SELECT rowid FROM k WHERE v = 'again'`).Scan(&next); err != nil {
+		t.Fatal(err)
+	}
+	if next <= gone {
+		t.Fatalf("the restored site reused rowid %d (its deleted row had %d)", next, gone)
+	}
+	c.converge("", imageRowsK)
+}
+
+// copyFiles copies the files of from whose names start with prefix into to.
+func copyFiles(t *testing.T, from, to, prefix string) {
+	t.Helper()
+	ents, err := os.ReadDir(from)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if !strings.HasPrefix(e.Name(), prefix) || e.IsDir() {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(from, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(to, e.Name()), b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
