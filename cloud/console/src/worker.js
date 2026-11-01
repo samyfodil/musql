@@ -1,7 +1,6 @@
-// The database side of musql studio: the npm package in a module worker, so
-// the JIT is on (browsers compile wasm synchronously only off the main
-// thread). The page sends {id, op, args}; the answer is {id, result} or
-// {id, error}.
+// The database side of the console: the npm package in a module worker, where
+// browsers compile wasm synchronously so the JIT is on. The page sends {id, op,
+// args} and gets {id, result} or {id, error}.
 import { open } from "@samyfodil/musql";
 
 let db = null;
@@ -31,8 +30,12 @@ const ops = {
 		return res;
 	},
 	run: (sql, params = []) => db.run(sql, ...params),
-	// split splits a script into statements as the engine does.
-	split: (sql) => db.split(sql),
+	// split splits a script into statements as the engine does; with a remote
+	// database open there may be no local one, so it opens an empty one to ask.
+	async split(sql) {
+		db ??= await open(`studio-${++seq}.musq`, {});
+		return db.split(sql);
+	},
 	exportMusql: () => db.export(),
 	exportSQLite: () => db.exportSQLite(),
 };

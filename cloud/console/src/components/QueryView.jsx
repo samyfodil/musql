@@ -6,13 +6,15 @@ import { closeCompletion } from "@codemirror/autocomplete";
 import { sql, SQLite } from "@codemirror/lang-sql";
 import { lintGutter, setDiagnostics } from "@codemirror/lint";
 import { format } from "sql-formatter";
-import { History as HistoryIcon, PanelRight, WandSparkles } from "lucide-react";
-import { call, query, run } from "../db.js";
+import { History as HistoryIcon, ListChecks, PanelRight, WandSparkles } from "lucide-react";
+import { query, run, split } from "../db.js";
 import { download, fmt, toCSV, toJSON } from "../values.js";
 import { useStudio } from "../studio.js";
 import { DEFAULT_MODEL, embed, vectorBlob } from "../embed.js";
 import { expandEmbeds, verb } from "../sqltext.js";
 import { history, remember, save } from "../library.js";
+import { functionHints } from "../fnhints.js";
+import AskAI from "./AskAI.jsx";
 import Grid from "./Grid.jsx";
 import { MenuButton } from "./Menu.jsx";
 import Chart from "./Chart.jsx";
@@ -22,12 +24,11 @@ import { Spinner } from "./Busy.jsx";
 const READS = new Set(["SELECT", "WITH", "VALUES", "EXPLAIN", "PRAGMA"]);
 
 /**
- * A SQL editor and its results. Ctrl/Cmd+Enter runs the selection, or all of
- * it: a script runs a statement at a time, each with its own result, and stops
- * at the first error. embed('text') in a statement is the text's vector
- * (embed.js), bound as a parameter.
+ * A SQL editor and its results. Ctrl/Cmd+Enter runs the selection or all of
+ * it, a statement at a time, stopping at the first error. embed('text') binds
+ * the text's vector (embed.js).
  */
-export default function QueryView({ initial = "", title, onTitle }) {
+export default function QueryView({ initial = "", title, onTitle, ask }) {
 	const { schema, columnsOf, status, changed, dark } = useStudio();
 	const [text, setText] = useState(initial);
 	const [runs, setRuns] = useState([]); // newest first: {at, sql, results}
@@ -43,6 +44,7 @@ export default function QueryView({ initial = "", title, onTitle }) {
 	});
 	const [plan, setPlan] = useState(null); // {sql, tree, code?}
 	const [busy, setBusy] = useState(false);
+	const [askOpen, setAskOpen] = useState(false);
 	const [menu, setMenu] = useState(null); // "history" | null
 	const [as, setAs] = useState("grid"); // how a result shows: "grid" | "chart"
 	const [planAs, setPlanAs] = useState("flow"); // "flow" | "text"
@@ -60,7 +62,7 @@ export default function QueryView({ initial = "", title, onTitle }) {
 			return { text: st.sliceDoc(from, to).trim(), at: from };
 		}
 		if (all || !st) return { text: doc.trim(), at: Math.max(0, doc.search(/\S/)) };
-		const stmts = await call("split", doc).catch(() => []);
+		const stmts = await split(doc).catch(() => []);
 		const head = st.selection.main.head;
 		let pos = 0;
 		let pick = null;
@@ -124,7 +126,7 @@ export default function QueryView({ initial = "", title, onTitle }) {
 		let wrote = false;
 		const t0 = performance.now();
 		try {
-			const stmts = await call("split", q);
+			const stmts = await split(q);
 			remember(q);
 			let from = 0;
 			for (const s of stmts) {
@@ -135,7 +137,7 @@ export default function QueryView({ initial = "", title, onTitle }) {
 					const { sql, params } = await bind(s);
 					if (READS.has(verb(sql))) {
 						const r = await query(sql, params);
-						out.push({ sql: s, ...r, meta: `${fmt(r.rows.length)} row${r.rows.length === 1 ? "" : "s"} · ${r.ms.toFixed(2)} ms` });
+						out.push({ sql: s, ...r, verb: verb(sql), meta: `${fmt(r.rows.length)} row${r.rows.length === 1 ? "" : "s"} · ${r.ms.toFixed(2)} ms` });
 						if (verb(sql) === "PRAGMA") wrote = true; // a PRAGMA can set as well as read
 					} else {
 						const r = await run(sql, params);
@@ -143,25 +145,23 @@ export default function QueryView({ initial = "", title, onTitle }) {
 						// Only INSERT, UPDATE, DELETE and REPLACE count rows: after any other
 						// statement changes() still holds the last count before it.
 						const counted = /^(INSERT|UPDATE|DELETE|REPLACE)$/.test(verb(sql));
-						const ms = `${(performance.now() - t).toFixed(2)} ms`;
-						out.push({ sql: s, columns: [], rows: [], meta: counted ? `${fmt(r.changes)} row${r.changes === 1 ? "" : "s"} changed · ${ms}` : `Done · ${ms}` });
+						const ms = performance.now() - t;
+						out.push({ sql: s, columns: [], rows: [], verb: verb(sql), ms, changes: counted ? r.changes : undefined, meta: counted ? `${fmt(r.changes)} row${r.changes === 1 ? "" : "s"} changed · ${ms.toFixed(2)} ms` : `Done · ${ms.toFixed(2)} ms` });
 					}
 				} catch (e) {
-					out.push({ sql: s, error: e.message });
+					out.push({ sql: s, verb: verb(s), error: e.message, ms: performance.now() - t });
 					mark(qAt + sAt, qAt + sAt + s.length, e.message);
 					break;
 				}
 			}
 		} catch (e) {
-			out.push({ sql: q, error: e.message });
+			out.push({ sql: q, verb: verb(q), error: e.message });
 		} finally {
 			setBusy(false);
 		}
 		setRuns((rs) => [{ at: Date.now(), sql: q, results: out }, ...rs].slice(0, 20));
 		setRunAt(0);
-		// Show the last statement that returned rows, or else the last one.
-		const pick = out.findLastIndex((r) => r.error) >= 0 ? out.length - 1 : Math.max(out.findLastIndex((r) => r.columns?.length), out.length - 1);
-		setShown(pick);
+		setShown(defaultShown(out));
 		const failed = out.find((r) => r.error);
 		const ms = (performance.now() - t0).toFixed(1);
 		if (failed) status(out.length > 1 ? `Statement ${out.length} of the script failed: ${failed.error}` : failed.error, true);
@@ -207,7 +207,8 @@ export default function QueryView({ initial = "", title, onTitle }) {
 		}
 	}
 
-	// Completion knows every table and view and their columns. Ctrl/Cmd+Enter is
+	// Completion knows every table and view and their columns, and the functions
+	// with their signatures (fnhints.js). Ctrl/Cmd+Enter is
 	// taken before any keymap, so an open completion list cannot swallow it.
 	const extensions = useMemo(() => {
 		const tables = {};
@@ -219,6 +220,7 @@ export default function QueryView({ initial = "", title, onTitle }) {
 		};
 		return [
 			sql({ dialect: SQLite, schema: tables, upperCaseKeywords: true }),
+			functionHints,
 			// Declared up front so a run's error marks survive the editor reconfiguring.
 			lintGutter(),
 			EditorView.lineWrapping,
@@ -245,7 +247,7 @@ export default function QueryView({ initial = "", title, onTitle }) {
 		return () => removeEventListener("click", close);
 	}, []);
 
-	const r = results[shown];
+	const r = shown === "summary" ? null : results[shown];
 	const hist = menu === "history" ? history() : [];
 
 	return (
@@ -254,6 +256,7 @@ export default function QueryView({ initial = "", title, onTitle }) {
 				<button className="primary" disabled={busy} title="Run the selection, or the statement at the cursor (⌘Enter)" onClick={() => go.current()}>{busy ? <><span className="spinner inline" /> Running</> : "Run"}</button>
 				<button className="ghost" disabled={busy} title="Run every statement (⇧⌘Enter)" onClick={() => go.current(true)}>Run all</button>
 				<button className="ghost icon" title="Format the SQL (⇧⌥F)" onClick={tidy}><WandSparkles size={15} /></button>
+				{ask && <button title="Describe what you want; the SQL is put in the editor, never run" onClick={() => setAskOpen((o) => !o)}>Ask AI</button>}
 				<button title="How the database runs it: the query plan, drawn as a flow" onClick={() => explain(false)}>Explain</button>
 				<MenuButton
 					label="⋯"
@@ -280,6 +283,7 @@ export default function QueryView({ initial = "", title, onTitle }) {
 				<span className="dim small" title="embed('text') or embed('text', 'bge') is the text's vector, made in your browser">embed('…') works in SQL</span>
 				<button className={`ghost icon${schemaOpen ? " pressed" : ""}`} title="Tables and columns" onClick={() => { setSchemaOpen(!schemaOpen); try { localStorage.setItem("musql-studio:schema-panel", schemaOpen ? "0" : "1"); } catch { /* kept for this page */ } }}><PanelRight size={15} /></button>
 			</div>
+			{ask && askOpen && <AskAI target={ask} onInsert={(q) => insert(q + "\n")} />}
 			<div className="editor">
 				<CodeMirror
 					value={text}
@@ -293,11 +297,16 @@ export default function QueryView({ initial = "", title, onTitle }) {
 				/>
 				{schemaOpen && <SchemaPanel schema={schema} onInsert={insert} />}
 			</div>
-			{results.length > 1 && (
-				<div className="stmts">
-					{results.map((x, i) => (
-						<button key={i} className={`${i === shown ? "on" : ""}${x.error ? " err" : ""}`} title={x.sql} onClick={() => { setShown(i); setPlan(null); }}>
-							{i + 1}. {verb(x.sql)} <span className="dim">{x.error ? "error" : x.meta.split(" · ")[0]}</span>
+			{results.length > 0 && (
+				<div className="rtabs">
+					{(results.length > 1 || !results[0].columns?.length) && (
+						<button className={`${shown === "summary" ? "on" : ""}${results.some((x) => x.error) ? " err" : ""}`} onClick={() => { setShown("summary"); setPlan(null); }}>
+							<ListChecks size={12} /> Summary
+						</button>
+					)}
+					{results.map((x, i) => x.columns?.length > 0 && (
+						<button key={i} className={i === shown ? "on" : ""} title={x.sql} onClick={() => { setShown(i); setPlan(null); }}>
+							{tabLabel(results, i)}
 						</button>
 					))}
 				</div>
@@ -314,14 +323,14 @@ export default function QueryView({ initial = "", title, onTitle }) {
 				<div className="result-meta err">{r.error}</div>
 			) : (
 				<div className="result-meta">
-					{r ? r.meta : "Run a statement to see its rows."}
+					{shown === "summary" ? `${results.length} statement${results.length === 1 ? "" : "s"}` : r ? r.meta : "Run a statement to see its rows."}
 					<span className="grow" />
 					{runs.length > 1 && (
 						<MenuButton
 							className="ghost small"
 							label={<><HistoryIcon size={13} /> {runAt === 0 ? "Latest run" : `${runAt} run${runAt > 1 ? "s" : ""} back`} ▾</>}
 							title="Results of earlier runs"
-							items={runs.map((x, k) => ({ label: x.sql.replace(/\s+/g, " ").slice(0, 60), hint: new Date(x.at).toLocaleTimeString(), onClick: () => { setRunAt(k); setShown(Math.max(0, x.results.length - 1)); setPlan(null); } }))}
+							items={runs.map((x, k) => ({ label: x.sql.replace(/\s+/g, " ").slice(0, 60), hint: new Date(x.at).toLocaleTimeString(), onClick: () => { setRunAt(k); setShown(defaultShown(x.results)); setPlan(null); } }))}
 						/>
 					)}
 					{r?.columns?.length > 0 && (
@@ -346,6 +355,8 @@ export default function QueryView({ initial = "", title, onTitle }) {
 					)
 				) : busy ? (
 					<Spinner label="Running…" />
+				) : shown === "summary" ? (
+					<Summary results={results} onOpen={(i) => setShown(i)} />
 				) : r?.columns?.length > 0 && as === "chart" ? (
 					<Chart key={r.sql} columns={r.columns} rows={r.rows} />
 				) : r?.columns?.length > 0 && (
@@ -355,6 +366,45 @@ export default function QueryView({ initial = "", title, onTitle }) {
 				)}
 			</div>
 		</>
+	);
+}
+
+// defaultShown is what a run shows first: the summary when a statement
+// failed or none returned rows, else the last that did.
+function defaultShown(out) {
+	const last = out.findLastIndex((r) => r.columns?.length);
+	return out.some((r) => r.error) || last < 0 ? "summary" : last;
+}
+
+// tabLabel names result i: the table it reads, or "result N", with its rows
+// and columns ("product 67×7").
+function tabLabel(results, i) {
+	const x = results[i];
+	const from = /\bFROM\s+(?:"((?:[^"]|"")+)"|`([^`]+)`|\[([^\]]+)\]|([\w$]+))/i.exec(x.sql);
+	const name = from ? (from[1]?.replace(/""/g, '"') ?? from[2] ?? from[3] ?? from[4]) : `result ${results.slice(0, i + 1).filter((y) => y.columns?.length).length}`;
+	return `${name} ${fmt(x.rows.length)}×${x.columns.length}`;
+}
+
+// Summary lists every statement of a run: what it was, what it did, how long
+// it took, and its error. A statement that returned rows opens its tab.
+function Summary({ results, onOpen }) {
+	return (
+		<table className="summary">
+			<thead><tr><th>#</th><th>statement</th><th>kind</th><th>result</th><th>time</th></tr></thead>
+			<tbody>
+				{results.map((x, i) => (
+					<tr key={i} className={x.columns?.length ? "click" : ""} onClick={x.columns?.length ? () => onOpen(i) : undefined} title={x.sql}>
+						<td className="dim">{i + 1}</td>
+						<td className="sql">{x.sql.replace(/\s+/g, " ")}</td>
+						<td>{x.verb}</td>
+						<td className={x.error ? "err" : ""}>
+							{x.error ? x.error : x.columns?.length ? `${fmt(x.rows.length)} row${x.rows.length === 1 ? "" : "s"} × ${x.columns.length}` : x.changes !== undefined ? `${fmt(x.changes)} changed` : "done"}
+						</td>
+						<td className="dim">{x.ms !== undefined ? `${x.ms.toFixed(2)} ms` : ""}</td>
+					</tr>
+				))}
+			</tbody>
+		</table>
 	);
 }
 

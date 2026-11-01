@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package cloud.v1;
+
+import "cloud/v1/common.proto";
+
+// UserService is for server admins.
+service UserService {
+  rpc List(ListUsersRequest) returns (ListUsersResponse);
+  rpc Create(CreateUserRequest) returns (CreateUserResponse);
+  rpc Update(UpdateUserRequest) returns (UpdateUserResponse);
+  rpc ResetPassword(ResetPasswordRequest) returns (ResetPasswordResponse);
+  rpc Delete(DeleteUserRequest) returns (DeleteUserResponse);
+}
+
+message ListUsersRequest {}
+
+message ListUsersResponse {
+  repeated User users = 1;
+}
+
+message CreateUserRequest {
+  string email = 1;
+  string name = 2;
+  string password = 3;
+  bool admin = 4;
+}
+
+message CreateUserResponse {
+  User user = 1;
+}
+
+message UpdateUserRequest {
+  string id = 1;
+  optional string name = 2;
+  optional bool disabled = 3;
+  optional bool admin = 4;
+}
+
+message UpdateUserResponse {
+  User user = 1;
+}
+
+message ResetPasswordRequest {
+  string id = 1;
+  string password = 2;
+}
+
+message ResetPasswordResponse {}
+
+message DeleteUserRequest {
+  string id = 1;
+}
+
+message DeleteUserResponse {}

@@ -1,0 +1,15 @@
+# A standalone node (no peers). Paths are relative to where musql-cloud runs.
+# The admin is not configured here: run musql-cloud init --admin-email <email>.
+listen: ":8080"
+public_url: "http://localhost:8080"
+data_dir: ".cloud-dev/data"
+console:
+  dir: "cloud/console/dist"
+snapshots:
+  every: "1h"
+  keep: "168h"
+uploads:
+  max_bytes: 17179869184  # the largest database file one upload may carry
+  ttl: "24h"              # an upload nothing writes to or uses is removed after this
+ai:
+  provider: ""   # jitllm | openai | anthropic | openrouter

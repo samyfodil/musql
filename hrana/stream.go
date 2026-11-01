@@ -10,11 +10,16 @@ package hrana
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
+	"unsafe"
 
 	musqldriver "github.com/samyfodil/musql/driver"
 	pb "github.com/samyfodil/musql/hrana/gen/hrana"
@@ -23,8 +28,9 @@ import (
 // stream is one Hrana stream: one musql connection, plus the SQL texts stored
 // with store_sql (per stream over HTTP, per connection over WebSocket).
 type stream struct {
-	conn *sql.Conn
-	sqls *sqlStore
+	conn    *sql.Conn
+	sqls    *sqlStore
+	observe func(Stmt)
 }
 
 // sqlStore is the SQL texts stored with store_sql.
@@ -54,7 +60,7 @@ func (s *sqlStore) del(id int32) {
 	s.mu.Unlock()
 }
 
-func newStream(ctx context.Context, db *sql.DB, sqls *sqlStore) (*stream, error) {
+func newStream(ctx context.Context, db *sql.DB, sqls *sqlStore, observe func(Stmt)) (*stream, error) {
 	c, err := db.Conn(ctx)
 	if err != nil {
 		return nil, err
@@ -70,7 +76,7 @@ func newStream(ctx context.Context, db *sql.DB, sqls *sqlStore) (*stream, error)
 		c.Close()
 		return nil, err
 	}
-	return &stream{conn: c, sqls: sqls}, nil
+	return &stream{conn: c, sqls: sqls, observe: observe}, nil
 }
 
 func (s *stream) close() error { return s.conn.Close() }
@@ -114,61 +120,90 @@ func (s *stream) execute(ctx context.Context, st *pb.Stmt) (*pb.StmtResult, erro
 	if err != nil {
 		return nil, err
 	}
-	args := make([]any, 0, len(st.Args)+len(st.NamedArgs))
+	if s.observe == nil {
+		res, _, _, err := s.run(ctx, q, st)
+		return res, err
+	}
+	start := time.Now()
+	res, read, written, err := s.run(ctx, q, st)
+	s.observe(Stmt{SQL: q, Duration: time.Since(start), RowsRead: read, RowsWritten: written, Err: err})
+	return res, err
+}
+
+// run is execute's statement, also reporting the rows it returned and changed.
+// It runs on the musql connection itself and reads the rows as the driver
+// hands them over, sparing database/sql's allocations and goroutine; what
+// database/sql checks first (a done context, a named argument's name) is
+// checked here too.
+func (s *stream) run(ctx context.Context, q string, st *pb.Stmt) (res *pb.StmtResult, read, written int64, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, 0, err
+	}
+	args := make([]driver.NamedValue, 0, len(st.Args)+len(st.NamedArgs))
 	for _, v := range st.Args {
-		args = append(args, fromValue(v))
+		args = append(args, driver.NamedValue{Ordinal: len(args) + 1, Value: fromValue(v)})
 	}
 	for _, na := range st.NamedArgs {
-		args = append(args, sql.Named(strings.TrimLeft(na.Name, ":@$"), fromValue(na.Value)))
+		name := strings.TrimLeft(na.Name, ":@$")
+		if r, _ := utf8.DecodeRuneInString(name); name != "" && !unicode.IsLetter(r) {
+			return nil, 0, 0, fmt.Errorf("name %q does not begin with a letter", name)
+		}
+		args = append(args, driver.NamedValue{Name: name, Ordinal: len(args) + 1, Value: fromValue(na.Value)})
 	}
 	wantRows := st.WantRows == nil || *st.WantRows
-
-	_, total0, _, _ := s.state()
-	rows, err := s.conn.QueryContext(ctx, q, args...)
+	err = s.conn.Raw(func(dc any) error {
+		mc := dc.(*musqldriver.Conn)
+		_, total0, _ := mc.ChangeState()
+		rows, err := mc.QueryContext(ctx, q, args)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		res = &pb.StmtResult{}
+		names := rows.Columns()
+		if len(names) > 0 {
+			decl, _ := rows.(driver.RowsColumnTypeDatabaseTypeName)
+			cols, strs := make([]pb.Col, len(names)), make([]string, 2*len(names))
+			res.Cols = make([]*pb.Col, len(names))
+			for i, n := range names {
+				strs[2*i] = n
+				cols[i].Name = &strs[2*i]
+				if decl != nil {
+					if d := decl.ColumnTypeDatabaseTypeName(i); d != "" {
+						strs[2*i+1] = d
+						cols[i].Decltype = &strs[2*i+1]
+					}
+				}
+				res.Cols[i] = &cols[i]
+			}
+		}
+		var alloc rowAlloc
+		vals := make([]driver.Value, len(names))
+		for {
+			err := rows.Next(vals)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return err
+			}
+			read++
+			if wantRows {
+				res.Rows = append(res.Rows, alloc.row(vals))
+			}
+		}
+		changes, total, lastID := mc.ChangeState()
+		if total != total0 {
+			res.AffectedRowCount = uint64(changes)
+		}
+		res.LastInsertRowid = &lastID
+		written = total - total0
+		return nil
+	})
 	if err != nil {
-		return nil, err
+		return nil, read, 0, err
 	}
-	defer rows.Close()
-	res := &pb.StmtResult{}
-	types, err := rows.ColumnTypes()
-	if err != nil {
-		return nil, err
-	}
-	for _, ct := range types {
-		col := &pb.Col{Name: ptr(ct.Name())}
-		if d := ct.DatabaseTypeName(); d != "" {
-			col.Decltype = ptr(d)
-		}
-		res.Cols = append(res.Cols, col)
-	}
-	vals := make([]any, len(types))
-	dest := make([]any, len(types))
-	for i := range vals {
-		dest[i] = &vals[i]
-	}
-	for rows.Next() {
-		if err := rows.Scan(dest...); err != nil {
-			return nil, err
-		}
-		if !wantRows {
-			continue
-		}
-		row := &pb.Row{Values: make([]*pb.Value, len(vals))}
-		for i, v := range vals {
-			row.Values[i] = toValue(v)
-		}
-		res.Rows = append(res.Rows, row)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	rows.Close()
-	changes, total, lastID, _ := s.state()
-	if total != total0 {
-		res.AffectedRowCount = uint64(changes)
-	}
-	res.LastInsertRowid = &lastID
-	return res, nil
+	return res, read, written, nil
 }
 
 // batch runs a batch's steps in order, each only when its condition holds.
@@ -188,29 +223,31 @@ func (s *stream) batch(ctx context.Context, b *pb.Batch) *pb.BatchResult {
 	return res
 }
 
-// cursorEntries encodes a batch's result as the entries a cursor streams:
+// cursorEntries emits a batch's result as the entries a cursor streams:
 // step_begin, rows and step_end per executed step, step_error for a failed one,
-// nothing for a skipped one.
-func cursorEntries(b *pb.Batch, res *pb.BatchResult) []*pb.CursorEntry {
-	var out []*pb.CursorEntry
+// nothing for a skipped one. Every row goes out in the same entry, which emit
+// must be done with when it returns.
+func cursorEntries(b *pb.Batch, res *pb.BatchResult, emit func(*pb.CursorEntry)) {
+	row := &pb.CursorEntry_Row{}
+	rowEntry := &pb.CursorEntry{Entry: row}
 	for i := range b.GetSteps() {
 		k := uint32(i)
 		if e, ok := res.StepErrors[k]; ok {
-			out = append(out, &pb.CursorEntry{Entry: &pb.CursorEntry_StepError{StepError: &pb.StepErrorEntry{Step: k, Error: e}}})
+			emit(&pb.CursorEntry{Entry: &pb.CursorEntry_StepError{StepError: &pb.StepErrorEntry{Step: k, Error: e}}})
 			continue
 		}
 		sr, ok := res.StepResults[k]
 		if !ok {
 			continue
 		}
-		out = append(out, &pb.CursorEntry{Entry: &pb.CursorEntry_StepBegin{StepBegin: &pb.StepBeginEntry{Step: k, Cols: sr.Cols}}})
-		for _, row := range sr.Rows {
-			out = append(out, &pb.CursorEntry{Entry: &pb.CursorEntry_Row{Row: row}})
+		emit(&pb.CursorEntry{Entry: &pb.CursorEntry_StepBegin{StepBegin: &pb.StepBeginEntry{Step: k, Cols: sr.Cols}}})
+		for _, r := range sr.Rows {
+			row.Row = r
+			emit(rowEntry)
 		}
-		out = append(out, &pb.CursorEntry{Entry: &pb.CursorEntry_StepEnd{StepEnd: &pb.StepEndEntry{
+		emit(&pb.CursorEntry{Entry: &pb.CursorEntry_StepEnd{StepEnd: &pb.StepEndEntry{
 			AffectedRowCount: sr.AffectedRowCount, LastInsertRowid: sr.LastInsertRowid}}})
 	}
-	return out
 }
 
 func (s *stream) cond(c *pb.BatchCond, res *pb.BatchResult) bool {
@@ -249,7 +286,16 @@ func (s *stream) sequence(ctx context.Context, sqlText *string, sqlID *int32) er
 	if err != nil {
 		return err
 	}
+	if s.observe == nil {
+		_, err = s.conn.ExecContext(ctx, q)
+		return err
+	}
+	_, total0, _, _ := s.state()
+	start := time.Now()
 	_, err = s.conn.ExecContext(ctx, q)
+	d := time.Since(start)
+	_, total, _, _ := s.state()
+	s.observe(Stmt{SQL: q, Duration: d, RowsWritten: total - total0, Err: err})
 	return err
 }
 
@@ -375,26 +421,96 @@ func fromValue(v *pb.Value) any {
 	return nil
 }
 
-// toValue converts a scanned column value to a Hrana value.
-func toValue(v any) *pb.Value {
-	switch x := v.(type) {
-	case nil:
-		return &pb.Value{Value: &pb.Value_Null_{Null: &pb.Value_Null{}}}
-	case int64:
-		return &pb.Value{Value: &pb.Value_Integer{Integer: x}}
-	case float64:
-		return &pb.Value{Value: &pb.Value_Float{Float: x}}
-	case string:
-		return &pb.Value{Value: &pb.Value_Text{Text: x}}
-	case []byte:
-		return &pb.Value{Value: &pb.Value_Blob{Blob: x}}
-	case bool:
-		if x {
-			return &pb.Value{Value: &pb.Value_Integer{Integer: 1}}
-		}
-		return &pb.Value{Value: &pb.Value_Integer{Integer: 0}}
-	case time.Time:
-		return &pb.Value{Value: &pb.Value_Text{Text: x.Format("2006-01-02 15:04:05.999999999-07:00")}}
+// nullValue is every NULL's oneof: messages are only read once built.
+var nullValue = &pb.Value_Null_{Null: &pb.Value_Null{}}
+
+// slab hands out values from chunks, an allocation per chunk rather than one
+// per value: the first exactly as big as asked for, each after it twice the
+// last, up to slabBytes. A chunk lives as long as any value from it, which
+// for a result's rows is as long as the result.
+type slab[T any] struct {
+	free []T
+	next int
+}
+
+const slabBytes = 64 << 10
+
+func (s *slab[T]) take(n int) []T {
+	if len(s.free) < n {
+		most := max(1, slabBytes/int(unsafe.Sizeof(*new(T))))
+		s.next = max(n, min(2*s.next, most))
+		s.free = make([]T, s.next)
 	}
-	return &pb.Value{Value: &pb.Value_Text{Text: fmt.Sprint(v)}}
+	t := s.free[:n:n]
+	s.free = s.free[n:]
+	return t
+}
+
+// rowAlloc builds one result's rows.
+type rowAlloc struct {
+	rows  slab[pb.Row]
+	ptrs  slab[*pb.Value]
+	vals  slab[pb.Value]
+	ints  slab[pb.Value_Integer]
+	flts  slab[pb.Value_Float]
+	txts  slab[pb.Value_Text]
+	blobs slab[pb.Value_Blob]
+	bytes slab[byte]
+}
+
+// row converts a row the driver handed over to a Hrana row, taking from
+// each slab exactly what the row needs. A []byte is the driver's until its
+// next row, so its bytes are copied.
+func (a *rowAlloc) row(vals []driver.Value) *pb.Row {
+	var nInt, nFlt, nTxt, nBlob int
+	for _, v := range vals {
+		switch v.(type) {
+		case nil:
+		case int64, bool:
+			nInt++
+		case float64:
+			nFlt++
+		case []byte:
+			nBlob++
+		default:
+			nTxt++
+		}
+	}
+	ints, flts, txts, blobs := a.ints.take(nInt), a.flts.take(nFlt), a.txts.take(nTxt), a.blobs.take(nBlob)
+	pvs := a.vals.take(len(vals))
+	r := &a.rows.take(1)[0]
+	r.Values = a.ptrs.take(len(vals))
+	for i, v := range vals {
+		pv := &pvs[i]
+		switch x := v.(type) {
+		case nil:
+			pv.Value = nullValue
+		case int64:
+			ints[0].Integer = x
+			pv.Value, ints = &ints[0], ints[1:]
+		case bool:
+			if x {
+				ints[0].Integer = 1
+			}
+			pv.Value, ints = &ints[0], ints[1:]
+		case float64:
+			flts[0].Float = x
+			pv.Value, flts = &flts[0], flts[1:]
+		case []byte:
+			blobs[0].Blob = a.bytes.take(len(x))
+			copy(blobs[0].Blob, x)
+			pv.Value, blobs = &blobs[0], blobs[1:]
+		case string:
+			txts[0].Text = x
+			pv.Value, txts = &txts[0], txts[1:]
+		case time.Time:
+			txts[0].Text = x.Format("2006-01-02 15:04:05.999999999-07:00")
+			pv.Value, txts = &txts[0], txts[1:]
+		default:
+			txts[0].Text = fmt.Sprint(v)
+			pv.Value, txts = &txts[0], txts[1:]
+		}
+		r.Values[i] = pv
+	}
+	return r
 }

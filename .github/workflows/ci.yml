@@ -116,6 +116,36 @@ jobs:
           go build ./...
           go test ./... -count=1 -timeout 10m
 
+  # musql cloud is its own module (cloud/). It is built and tested as the
+  # release ships it, with the embedded AI (-tags jitllm); the console is the
+  # npm job's.
+  cloud:
+    name: musql cloud (nested module)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: cloud/go.sum
+      - name: build, vet, test
+        working-directory: cloud
+        run: |
+          set -e
+          CGO_ENABLED=0 go build -tags jitllm -trimpath -ldflags="-s -w" -o /dev/null ./cmd/musql-cloud
+          go vet ./... && go vet -tags jitllm ./ai/
+          go test -tags jitllm ./... -count=1 -timeout 20m
+          go test ./ai/ -count=1
+      - name: the other release targets cross-compile with the tag
+        working-directory: cloud
+        run: |
+          set -e
+          for t in linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            echo "== $t =="
+            CGO_ENABLED=0 GOOS=${t%/*} GOARCH=${t#*/} go build -tags jitllm -o /dev/null ./cmd/musql-cloud ./cmd/musql
+          done
+
   pointread:
     name: bulk load + point reads vs C SQLite (nested module)
     runs-on: ubuntu-latest

@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ident, query, rows as rowsOf, run } from "../db.js";
-import { download, fmt, show, toCSV, toJSON, typed } from "../values.js";
+import { download, fmt, literal, show, toCSV, toJSON, typed } from "../values.js";
 import { useStudio } from "../studio.js";
 import Grid from "./Grid.jsx";
 import { Spinner } from "./Busy.jsx";
 import Chart from "./Chart.jsx";
 import FilterBar, { whereOf } from "./FilterBar.jsx";
 import Popover from "./Popover.jsx";
-import { ArrowUpDown, Ellipsis, Filter, Maximize2, Plus, RefreshCw, Sparkles } from "lucide-react";
+import { ArrowUpDown, Ellipsis, Filter, ListChecks, Plus, RefreshCw, Sparkles } from "lucide-react";
 import RowPanel from "./RowPanel.jsx";
 import ColumnPanel, { Field, Toggle } from "./ColumnPanel.jsx";
 import Drawer from "./Drawer.jsx";
@@ -16,6 +16,32 @@ import { DEFAULT_MODEL, MODELS, setEmbedProgress } from "../embed.js";
 import { embeddingsOf, fillMissing, missingCount, search, searchVec1, setUpEmbedding } from "../vectors.js";
 
 const PAGE = 200; // rows read at a time as the grid scrolls
+
+// Staged edits queue here when "Review changes before saving" is on: changed
+// cells by row key, deleted keys and new rows. Save writes them in one
+// transaction.
+const NO_STAGE = { cells: new Map(), dels: new Map(), adds: [] };
+const keyString = (key) => key.map((v) => (typeof v === "bigint" ? `n${v}` : v instanceof Uint8Array ? `b${Array.from(v).join(",")}` : JSON.stringify(v))).join("\0");
+const same = (a, b) => a === b || (typeof a === "bigint" && typeof b === "number" && a === BigInt(b)) || (typeof b === "bigint" && typeof a === "number" && b === BigInt(a));
+
+function useStagingPref() {
+	const [on, setOn] = useState(() => {
+		try {
+			return localStorage.getItem("musql-studio:staged") === "1";
+		} catch {
+			return false;
+		}
+	});
+	const set = (v) => {
+		setOn(v);
+		try {
+			localStorage.setItem("musql-studio:staged", v ? "1" : "0");
+		} catch {
+			// kept for this page only
+		}
+	};
+	return [on, set];
+}
 
 /** One table or view: its rows a page at a time, editable, and its structure. */
 export default function TableView({ name, mode: initialMode = "data", tabId, state }) {
@@ -47,6 +73,11 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 	const [vec1Model, setVec1Model] = useState(DEFAULT_MODEL);
 	const [embedding, setEmbedding] = useState(false);
 	const filling = useRef(false);
+	const [staging, setStaging] = useStagingPref();
+	const [stage, setStage] = useState(NO_STAGE);
+	const [review, setReview] = useState(false);
+	const [saving, setSaving] = useState(false);
+	const root = useRef(null);
 
 	useEffect(() => setMode(initialMode), [initialMode]);
 	// The view's state goes up to the tab (and so to the URL); a state that
@@ -152,8 +183,8 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 	const loadRef = useRef(load);
 	loadRef.current = load;
 
-	// fill embeds the rows still missing a vector, in the background of the
-	// page: after "Embed…", and after every write the studio makes here.
+	// fill embeds the rows still missing a vector, in the background, after
+	// "Embed…" and every write made here.
 	async function fill(e = emb) {
 		if (!e?.src || !e.model || filling.current) return;
 		filling.current = true;
@@ -181,7 +212,7 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 	// cache, read as the grid scrolls to it.
 	const fullRow = (i) => (searching ? data?.rows[i] : pages.current.get(Math.floor(i / PAGE))?.[i % PAGE]);
 	const sliced = useRef(new WeakMap());
-	const rowAt = useCallback((i) => {
+	const baseRowAt = useCallback((i) => {
 		const r = fullRow(i);
 		if (!r) return undefined;
 		let v = sliced.current.get(r);
@@ -212,10 +243,147 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 			if (!pages.current.has(p) && qRef.current) pages.current.set(p, (await query(`${qRef.current.base} LIMIT ${PAGE} OFFSET ${p * PAGE}`, qRef.current.fp)).rows);
 		}
 	}
-	const body = data ? Array.from({ length: Math.min(total, PAGE) }, (_, i) => rowAt(i)).filter(Boolean) : [];
+	const body = data ? Array.from({ length: Math.min(total, PAGE) }, (_, i) => baseRowAt(i)).filter(Boolean) : [];
 	const keyOf = (i) => fullRow(i).slice(0, nk);
 	const keyWhere = keyCols.map((k) => `${ident(k)} IS ?`).join(" AND ");
 	const types = Object.fromEntries(cols.map((c) => [c.name, c.type]));
+
+	// ---- staged edits ----
+	// The grid's row i is a new row while i < nAdd, else row i - nAdd of the
+	// table with its staged cells laid over it. Every handler below takes the
+	// grid's index; base(i) is the table's.
+	const staged = staging && editable && !searching;
+	const nAdd = staged ? stage.adds.length : 0;
+	const base = (i) => i - nAdd;
+	const nChanges = stage.cells.size + stage.dels.size + stage.adds.length;
+	const rowAt = useCallback((i) => {
+		if (i < nAdd) {
+			const vals = stage.adds[i].vals;
+			return shown.map((c) => (c in vals ? vals[c] : null));
+		}
+		const r = baseRowAt(i - nAdd);
+		if (!r || !staged || !stage.cells.size) return r;
+		const st = stage.cells.get(keyString(keyOf(i - nAdd)));
+		return st ? shown.map((c, j) => (st.vals.has(c) ? st.vals.get(c) : r[j])) : r;
+	}, [baseRowAt, stage, nAdd, staged, shown.join("\0")]);
+	const marks = useCallback((i) => {
+		if (i < nAdd) return { row: "added", cells: new Set(Object.keys(stage.adds[i].vals)) };
+		if (!fullRow(i - nAdd)) return undefined;
+		const k = keyString(keyOf(i - nAdd));
+		if (stage.dels.has(k)) return { row: "deleted" };
+		const st = stage.cells.get(k);
+		return st ? { cells: new Set(st.vals.keys()) } : undefined;
+	}, [stage, nAdd, data]);
+
+	// stageCells queues values ({column: value}) for grid row i. A value put
+	// back to what is stored drops out of the queue.
+	function stageCells(st, i, values) {
+		if (i < nAdd) {
+			const adds = st.adds.map((a, k) => (k === i ? { vals: { ...a.vals, ...values } } : a));
+			return { ...st, adds };
+		}
+		const b = base(i);
+		const row = fullRow(b);
+		const key = keyOf(b);
+		const k = keyString(key);
+		const cells = new Map(st.cells);
+		const vals = new Map(cells.get(k)?.vals ?? []);
+		for (const [c, v] of Object.entries(values)) {
+			if (same(row[nk + shown.indexOf(c)], v)) vals.delete(c);
+			else vals.set(c, v);
+		}
+		if (vals.size) cells.set(k, { key, vals });
+		else cells.delete(k);
+		return { ...st, cells };
+	}
+	function stageDeletes(list) {
+		setStage((st) => {
+			const drop = new Set(list.filter((i) => i < nAdd));
+			const dels = new Map(st.dels);
+			const cells = new Map(st.cells);
+			for (const i of list) {
+				if (i < nAdd) continue;
+				const key = keyOf(base(i));
+				dels.set(keyString(key), key);
+				cells.delete(keyString(key));
+			}
+			return { cells, dels, adds: st.adds.filter((_, k) => !drop.has(k)) };
+		});
+		setPicked(new Set());
+	}
+
+	// stagedSQL is the queue as statements: deletes, then updates, then inserts
+	// in the order they were added.
+	function stagedSQL() {
+		const out = [];
+		const t = ident(name);
+		for (const key of stage.dels.values()) out.push({ sql: `DELETE FROM ${t} WHERE ${keyWhere}`, params: key });
+		for (const [k, { key, vals }] of stage.cells) {
+			if (stage.dels.has(k)) continue;
+			const set = [...vals];
+			out.push({ sql: `UPDATE ${t} SET ${set.map(([c]) => `${ident(c)} = ?`).join(", ")} WHERE ${keyWhere}`, params: [...set.map(([, v]) => v), ...key] });
+		}
+		for (const { vals } of [...stage.adds].reverse()) {
+			const set = Object.entries(vals);
+			out.push(set.length
+				? { sql: `INSERT INTO ${t} (${set.map(([c]) => ident(c)).join(", ")}) VALUES (${set.map(() => "?").join(", ")})`, params: set.map(([, v]) => v) }
+				: { sql: `INSERT INTO ${t} DEFAULT VALUES`, params: [] });
+		}
+		return out;
+	}
+	// inlined shows a statement with its values in place of the ?s, to read.
+	const inlined = ({ sql, params }) => {
+		let k = 0;
+		return sql.replace(/\?/g, () => literal(params[k++]));
+	};
+
+	async function saveStaged() {
+		const stmts = stagedSQL();
+		if (!stmts.length || saving) return;
+		setSaving(true);
+		let failed = null;
+		try {
+			await run("BEGIN");
+			for (const st of stmts) {
+				failed = st;
+				await run(st.sql, st.params);
+			}
+			failed = null;
+			await run("COMMIT");
+			setStage(NO_STAGE);
+			setReview(false);
+			status(`Saved ${fmt(stmts.length)} change${stmts.length === 1 ? "" : "s"} to ${name}.`);
+		} catch (e) {
+			await run("ROLLBACK").catch(() => {});
+			status(`Nothing was saved: ${e.message}${failed ? ` (in ${inlined(failed).slice(0, 120)})` : ""}`, true);
+		} finally {
+			setSaving(false);
+		}
+		changed(name);
+		await load();
+		fill();
+	}
+	function discardStaged() {
+		setStage(NO_STAGE);
+		setReview(false);
+		setPicked(new Set());
+		status("Discarded the queued changes.");
+	}
+	const saveRef = useRef(saveStaged);
+	saveRef.current = saveStaged;
+	// ⌘S saves the queue of the table in view.
+	useEffect(() => {
+		if (!staged || !nChanges) return;
+		const key = (e) => {
+			if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "s" || !root.current?.offsetParent) return;
+			e.preventDefault();
+			saveRef.current();
+		};
+		addEventListener("keydown", key);
+		return () => removeEventListener("keydown", key);
+	}, [staged, nChanges]);
+	// A table changed under the queue (its columns) or another table: start over.
+	useEffect(() => setStage(NO_STAGE), [name, sql]);
 
 	async function write(sql, params, msg) {
 		try {
@@ -230,6 +398,12 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 	}
 
 	async function edit(i, col, text) {
+		if (staged) {
+			const cur = rowAt(i)?.[shown.indexOf(col)];
+			if (cur instanceof Uint8Array) return status("BLOB values are edited with SQL, in a query tab.", true);
+			setStage((st) => stageCells(st, i, { [col]: text === null ? null : typed(text, types[col]) }));
+			return;
+		}
 		const row = fullRow(i);
 		const j = nk + shown.indexOf(col);
 		if (row[j] instanceof Uint8Array) {
@@ -257,10 +431,20 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 	// paste writes a copied block over the cells from row i, columns cs on,
 	// in one transaction (so one undo); rows past the end are left out.
 	async function paste(i, cs, matrix) {
-		const n = Math.min(matrix.length, total - i);
+		const n = Math.min(matrix.length, total + nAdd - i);
 		if (n <= 0) return;
-		await ensure(i, i + n - 1);
+		await ensure(Math.max(0, base(i)), base(i + n - 1));
 		const editableCols = cs.filter((c) => !(cols.find((x) => x.name === c)?.hidden));
+		if (staged) {
+			setStage((st) => {
+				for (let r = 0; r < n; r++) {
+					const sets = editableCols.map((c, k) => [c, matrix[r][k]]).filter(([, v]) => v !== undefined);
+					if (sets.length) st = stageCells(st, i + r, Object.fromEntries(sets.map(([c, v]) => [c, v === "" ? null : typed(v, types[c])])));
+				}
+				return st;
+			});
+			return;
+		}
 		try {
 			await run("BEGIN");
 			for (let r = 0; r < n; r++) {
@@ -280,7 +464,14 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 
 	// clear empties a block of cells (sets them NULL), in one transaction.
 	async function clear(i0, i1, cs) {
-		await ensure(i0, i1);
+		await ensure(Math.max(0, base(i0)), base(i1));
+		if (staged) {
+			setStage((st) => {
+				for (let i = i0; i <= i1; i++) st = stageCells(st, i, Object.fromEntries(cs.map((c) => [c, null])));
+				return st;
+			});
+			return;
+		}
 		try {
 			await run("BEGIN");
 			for (let i = i0; i <= i1; i++) await run(`UPDATE ${ident(name)} SET ${cs.map((c) => `${ident(c)} = NULL`).join(", ")} WHERE ${keyWhere}`, keyOf(i));
@@ -296,6 +487,7 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 
 	async function remove() {
 		const list = [...picked];
+		if (staged) return stageDeletes(list);
 		if (!confirm(`Delete ${list.length} row${list.length > 1 ? "s" : ""} from ${name}?`)) return;
 		try {
 			await run("BEGIN");
@@ -331,6 +523,13 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 	async function saveRow(i, values) {
 		const set = Object.entries(values);
 		const val = ([c, v]) => (v === null ? null : typed(v, types[c]));
+		if (staged) {
+			const vals = Object.fromEntries(set.map(([c, v]) => [c, val([c, v])]));
+			setStage((st) => (i == null ? { ...st, adds: [{ vals }, ...st.adds] } : stageCells(st, i, vals)));
+			setPicked(new Set());
+			setRowPanel(null);
+			return true;
+		}
 		let sql;
 		let params;
 		if (i == null) {
@@ -381,8 +580,7 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 		setPicked(p);
 	}
 
-	// cellMenu is a right-click on a cell: edit it, copy it, filter by it, or
-	// select or delete its row.
+	// cellMenu is a right-click on a cell.
 	function cellMenu(i, col, startEdit) {
 		const v = rowAt(i)?.[shown.indexOf(col)];
 		const text = v === null ? null : v instanceof Uint8Array ? null : String(v);
@@ -390,7 +588,7 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 		return [
 			{ label: editable && !searching ? "Edit row…" : "View row…", hint: "Space", onClick: () => setRowPanel({ i }) },
 			editable && !searching && { label: "Edit cell", hint: "Enter", onClick: startEdit },
-			editable && !searching && v !== null && { label: "Set to NULL", onClick: () => write(`UPDATE ${ident(name)} SET ${ident(col)} = NULL WHERE ${keyWhere}`, keyOf(i), `Set ${col} to NULL.`) },
+			editable && !searching && v !== null && { label: "Set to NULL", onClick: () => (staged ? setStage((st) => stageCells(st, i, { [col]: null })) : write(`UPDATE ${ident(name)} SET ${ident(col)} = NULL WHERE ${keyWhere}`, keyOf(i), `Set ${col} to NULL.`)) },
 			{ label: "Copy value", hint: "⌘C", onClick: () => navigator.clipboard?.writeText(text ?? "NULL") },
 			{ label: "Copy row as JSON", onClick: () => navigator.clipboard?.writeText(JSON.stringify(Object.fromEntries(shown.map((c, j) => [c, typeof rowAt(i)[j] === "bigint" ? String(rowAt(i)[j]) : rowAt(i)[j] instanceof Uint8Array ? null : rowAt(i)[j]])))) },
 			"-",
@@ -400,7 +598,7 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 			!searching && text !== null && cols.some((c) => c.name === col) && { label: `Filter: ${col} ≠ this`, onClick: () => by("!=") },
 			keyed && !searching && "-",
 			keyed && !searching && { label: picked.has(i) ? "Unselect row" : "Select row", onClick: () => togglePick(i) },
-			editable && !searching && { label: "Delete row", danger: true, onClick: () => confirm(`Delete this row from ${name}?`) && write(`DELETE FROM ${ident(name)} WHERE ${keyWhere}`, keyOf(i), "Deleted a row.") },
+			editable && !searching && { label: "Delete row", danger: true, onClick: () => (staged ? stageDeletes([i]) : confirm(`Delete this row from ${name}?`) && write(`DELETE FROM ${ident(name)} WHERE ${keyWhere}`, keyOf(i), "Deleted a row.")) },
 		];
 	}
 
@@ -425,7 +623,7 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 		]);
 
 	return (
-		<div className="tablepage">
+		<div className="tablepage" ref={root}>
 			{mode === "data" && (
 				<div className="toolbar tbar">
 					{!searching && (
@@ -495,9 +693,15 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 					{picked.size > 0 && (
 						<span className="selbar">
 							{picked.size} row{picked.size > 1 ? "s" : ""} selected
-							<button className="danger" onClick={remove}>Delete</button>
+							<button className="danger" onClick={remove}>{staged ? "Mark deleted" : "Delete"}</button>
 							<button className="link" onClick={() => setPicked(new Set())}>clear</button>
 						</span>
+					)}
+					{editable && !searching && (
+						<label className="stagetoggle" title={nChanges ? "Save or discard the queued changes first" : "Queue edits, inserts and deletes, review them as SQL, then save them in one transaction"}>
+							<input type="checkbox" checked={staging} disabled={staging && nChanges > 0} onChange={(e) => setStaging(e.target.checked)} />
+							Review changes before saving
+						</label>
 					)}
 					<button className="ghost icon" title="Reload" onClick={load}><RefreshCw size={14} /></button>
 					<MenuButton
@@ -515,6 +719,16 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 				</div>
 			)}
 
+			{mode === "data" && staged && nChanges > 0 && (
+				<div className="stagebar">
+					<b>{fmt(nChanges)} change{nChanges === 1 ? "" : "s"}</b>
+					<span className="dim">not saved yet</span>
+					<span className="grow" />
+					<button className="ghost" onClick={() => setReview(true)}><ListChecks size={14} /> Review SQL</button>
+					<button className="ghost" onClick={discardStaged}>Discard</button>
+					<button className="primary" disabled={saving} onClick={saveStaged}>{saving ? "Saving…" : "Save"} <span className="kbd">⌘S</span></button>
+				</div>
+			)}
 			<div className="gridwrap">
 				{mode === "structure" ? (
 					<Structure name={name} obj={obj} cols={cols} schema={schema} editable={editable} onColumn={(column) => setColPanel(column ? { column } : {})} onChanged={() => { changed(name); loadCols(); }} />
@@ -528,10 +742,11 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 					<>
 						<Grid
 							columns={shown}
-							count={total}
+							count={total + nAdd}
 							rowAt={rowAt}
-							need={need}
-							range={async (i0, i1) => { await ensure(i0, i1); return Array.from({ length: i1 - i0 + 1 }, (_, k) => rowAt(i0 + k)); }}
+							need={nAdd ? (s0, e0) => need(Math.max(0, s0 - nAdd), Math.max(0, e0 - nAdd)) : need}
+							range={async (i0, i1) => { await ensure(Math.max(0, base(i0)), Math.max(0, base(i1))); return Array.from({ length: i1 - i0 + 1 }, (_, k) => rowAt(i0 + k)); }}
+							marks={staged ? marks : undefined}
 							layoutKey={`${name}`}
 							types={types}
 							sort={sorts.length === 1 ? sorts[0].col : null}
@@ -546,7 +761,7 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 							onClear={editable && !searching ? clear : undefined}
 							onContextMenu={(e, i, col, startEdit) => openMenu(e, cellMenu(i, col, startEdit))}
 						/>
-						{!total && data && (
+						{!total && !nAdd && data && (
 							<div className="emptyrows">
 								<div className="emptyicon">{where ? "⏷" : "▦"}</div>
 								<p>{where ? "No rows match the filter." : `${name} has no rows yet.`}</p>
@@ -572,6 +787,24 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 				{mode === "structure" && editable && <button className="primary" onClick={() => editTable(name)}>Edit table</button>}
 			</div>
 			{menu}
+			{review && (
+				<Drawer
+					title={`${fmt(nChanges)} queued change${nChanges === 1 ? "" : "s"} to ${name}`}
+					subtitle="Save runs these statements in one transaction"
+					wide
+					onClose={() => setReview(false)}
+					footer={
+						<>
+							<button className="ghost" onClick={() => navigator.clipboard?.writeText(stagedSQL().map((x) => `${inlined(x)};`).join("\n"))}>Copy</button>
+							<span className="grow" />
+							<button onClick={discardStaged}>Discard</button>
+							<button className="primary" disabled={saving || !nChanges} onClick={saveStaged}>Save</button>
+						</>
+					}
+				>
+					<pre className="stagesql">{["BEGIN;", ...stagedSQL().map((x) => `${inlined(x)};`), "COMMIT;"].join("\n")}</pre>
+				</Drawer>
+			)}
 			{rowPanel && (
 				<RowPanel
 					name={name}

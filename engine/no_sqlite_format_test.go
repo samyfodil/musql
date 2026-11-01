@@ -40,8 +40,9 @@ func TestOnlyTheCLICallsTheConverter(t *testing.T) {
 		}
 		rel, _ := filepath.Rel(root, path)
 		if d.IsDir() {
-			// compat-harness is a module of its own, whose oracle is C SQLite.
-			if rel == "compat-harness" || rel == "convert" || rel == filepath.Join("cmd", "musql-convert") || rel == filepath.Join("npm", "wasm") || strings.HasPrefix(d.Name(), ".") && rel != "." {
+			// compat-harness is a module of its own, whose oracle is C SQLite;
+			// cloud imports and exports the files people upload and download.
+			if rel == "compat-harness" || rel == "cloud" || rel == "convert" || rel == filepath.Join("cmd", "musql-convert") || rel == filepath.Join("npm", "wasm") || strings.HasPrefix(d.Name(), ".") && rel != "." {
 				return filepath.SkipDir
 			}
 			return nil

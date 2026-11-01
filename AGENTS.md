@@ -53,7 +53,8 @@ The engine runs a program two ways only: the VDBE, or the JIT-compiled VDBE.
   b-tree, header, WAL or journal code lives in `engine/`.
 - The converter is `convert/sqlite` (`Import`, `Export`). It imports `engine`,
   never the reverse, and only `cmd/musql-convert`, `compat-harness` and the npm
-  package's wasm module (`npm/wasm`, for files a browser opens or saves) call it.
+  package's wasm module (`npm/wasm`, for files a browser opens or saves) and
+  `cloud/server` (uploads and exports) call it.
   `engine/no_sqlite_format_test.go` enforces this.
 - A SQLite file handed to the driver or to ATTACH is an error like any other
   foreign file.
@@ -94,6 +95,7 @@ The segment file carries its format version (`segFileVersion` in
 | `examples/libp2p/` | An example `Transport` over libp2p, its own module. |
 | `internal/jit/` | The JIT: x86-64 and AArch64 emitters, W^X mapping, trampolines. |
 | `internal/filelock/` | OFD byte-range locks used by the write path. |
+| `cloud/` | musql cloud: a self-hosted server (management API, OIDC provider, Hrana per database, console) and its CLI; its own module. See `cloud/DESIGN.md`. |
 | `compat-harness/` | Differential tests against C SQLite (`mattn/go-sqlite3`). A separate module, and the only one that needs CGo. |
 
 ## Invariants

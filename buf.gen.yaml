@@ -1,16 +1,41 @@
 version: v2
 
-# Regenerate with `buf generate` from the repository root. `clean` makes the
-# output a function of the .proto files alone.
-clean: true
+# Regenerate with `buf generate` from the repository root. Every file lands
+# under its go_package (module=): hrana/gen for proto/hrana, cloud/gen for
+# proto/cloud. The output root is the repository, so there is no `clean`;
+# delete a removed .proto's generated file by hand.
 
 managed:
   enabled: true
   override:
     - file_option: go_package_prefix
       value: github.com/samyfodil/musql/hrana/gen
+    - file_option: go_package_prefix
+      path: cloud
+      value: github.com/samyfodil/musql/cloud/gen
 
 plugins:
   - local: protoc-gen-go
-    out: hrana/gen
-    opt: paths=source_relative
+    out: .
+    opt: module=github.com/samyfodil/musql
+  - local: protoc-gen-connect-go
+    out: .
+    opt: module=github.com/samyfodil/musql
+  # MarshalVT, UnmarshalVT and SizeVT: the same wire format without reflection,
+  # for Hrana's hot path. Install the version go.mod pins:
+  # go install github.com/planetscale/vtprotobuf/cmd/protoc-gen-go-vtproto@v0.6.1-0.20260702190614-8ae5a48058df
+  - local: protoc-gen-go-vtproto
+    out: .
+    opt:
+      - module=github.com/samyfodil/musql
+      - features=marshal+unmarshal+size
+    types:
+      - hrana.**
+  # The console's TypeScript-free client (protobuf-es v2), cloud.v1 only. The
+  # plugin is the console's pinned dev dependency: npm install there first.
+  - local: cloud/console/node_modules/.bin/protoc-gen-es
+    out: cloud/console/src/gen
+    opt: target=js+dts
+    include_imports: false
+    types:
+      - cloud.v1

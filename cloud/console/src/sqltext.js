@@ -1,11 +1,9 @@
 // Text-level helpers for the SQL a query tab runs.
 
 /**
- * expandEmbeds replaces every embed('text') or embed('text', 'model') call in
- * sql with a ? parameter: {sql, calls: [{text, model}]}, calls in parameter
- * order. Strings, quoted names and comments are skipped, so an "embed(" inside
- * them is left alone. embed is the studio's, not the engine's: the studio
- * embeds the text (embed.js) and binds the vector.
+ * expandEmbeds replaces every embed('text'[, 'model']) call outside strings,
+ * quoted names and comments with a ? parameter: {sql, calls: [{text, model}]}
+ * in parameter order. The console embeds the text (embed.js) and binds it.
  */
 export function expandEmbeds(sql) {
 	const calls = [];
@@ -101,6 +99,65 @@ export function expandEmbeds(sql) {
 		i++;
 	}
 	return { sql: out, calls };
+}
+
+const isWord = (c) => (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c === "_" || c === "$" || c > "\x7f";
+
+// quoteEnd is the index just past the quote that closes the one at i, or -1 if
+// the text ends first. A doubled quote belongs to the string or name; a [name]
+// has no such escape.
+function quoteEnd(sql, i) {
+	const close = sql[i] === "[" ? "]" : sql[i];
+	for (let j = i + 1; j < sql.length; j++) {
+		if (sql[j] !== close) continue;
+		if (close !== "]" && sql[j + 1] === close) j++;
+		else return j + 1;
+	}
+	return -1;
+}
+
+/**
+ * openCall finds the call the end of sql is inside: {name, arg}, the
+ * lower-cased name before the innermost open parenthesis and the argument
+ * being written, or null when that parenthesis is no call. Strings, quoted
+ * names and comments are skipped.
+ */
+export function openCall(sql) {
+	const open = []; // per open parenthesis: {name, arg}
+	let word = null; // the name just read, while only blanks and comments follow it
+	const n = sql.length;
+	let i = 0;
+	while (i < n) {
+		const c = sql[i];
+		if (c === "'" || c === '"' || c === "`" || c === "[") {
+			const end = quoteEnd(sql, i);
+			if (end < 0) break;
+			word = null;
+			i = end;
+		} else if (c === "-" && sql[i + 1] === "-") {
+			const end = sql.indexOf("\n", i);
+			if (end < 0) return null;
+			i = end + 1;
+		} else if (c === "/" && sql[i + 1] === "*") {
+			const end = sql.indexOf("*/", i + 2);
+			if (end < 0) return null;
+			i = end + 2;
+		} else if (isWord(c)) {
+			let j = i + 1;
+			while (j < n && isWord(sql[j])) j++;
+			word = sql.slice(i, j);
+			i = j;
+		} else {
+			if (c === "(") open.push({ name: word, arg: 0 });
+			else if (c === ")") open.pop();
+			else if (c === "," && open.length) open.at(-1).arg++;
+			else if (c === ";") open.length = 0;
+			if (!" \t\n\r\f".includes(c)) word = null;
+			i++;
+		}
+	}
+	const call = open.at(-1);
+	return call?.name ? { name: call.name.toLowerCase(), arg: call.arg } : null;
 }
 
 /** A statement's first keyword, upper-cased, past comments and a leading WITH's CTEs not inspected. */

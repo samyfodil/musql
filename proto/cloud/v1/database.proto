@@ -1,0 +1,280 @@
+syntax = "proto3";
+
+package cloud.v1;
+
+import "cloud/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+// DatabaseService: databases are named org/name.
+service DatabaseService {
+  rpc List(ListDatabasesRequest) returns (ListDatabasesResponse);
+  rpc Get(GetDatabaseRequest) returns (GetDatabaseResponse);
+  rpc Create(CreateDatabaseRequest) returns (CreateDatabaseResponse);
+  rpc Delete(DeleteDatabaseRequest) returns (DeleteDatabaseResponse);
+  rpc Rename(RenameDatabaseRequest) returns (RenameDatabaseResponse);
+  rpc Usage(UsageRequest) returns (UsageResponse);
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+  rpc Restore(RestoreRequest) returns (RestoreResponse);
+  rpc CreateToken(CreateTokenRequest) returns (CreateTokenResponse);
+  rpc InvalidateTokens(InvalidateTokensRequest) returns (InvalidateTokensResponse);
+  rpc StartUpload(StartUploadRequest) returns (StartUploadResponse);
+  rpc UploadChunk(UploadChunkRequest) returns (UploadChunkResponse);
+  rpc FinishUpload(FinishUploadRequest) returns (FinishUploadResponse);
+  rpc Export(ExportRequest) returns (stream ExportResponse);
+  rpc Stats(StatsRequest) returns (StatsResponse);
+}
+
+enum FileFormat {
+  FILE_FORMAT_UNSPECIFIED = 0;
+  FILE_FORMAT_MUSQL = 1;
+  FILE_FORMAT_SQLITE = 2;
+}
+
+enum Access {
+  ACCESS_UNSPECIFIED = 0;
+  ACCESS_FULL = 1;
+  ACCESS_READ_ONLY = 2;
+}
+
+message ListDatabasesRequest {
+  string org = 1;
+  string group = 2;
+}
+
+message ListDatabasesResponse {
+  repeated Database databases = 1;
+}
+
+message GetDatabaseRequest {
+  string org = 1;
+  string name = 2;
+}
+
+message GetDatabaseResponse {
+  Database database = 1;
+}
+
+message CreateDatabaseRequest {
+  string org = 1;
+  string name = 2;
+  // The org's "default" group when empty.
+  string group = 3;
+  oneof source {
+    // An upload id from FinishUpload.
+    string upload = 4;
+    // A branch of this database (in the same org), at now or at branch_at.
+    string branch_of = 5;
+  }
+  google.protobuf.Timestamp branch_at = 6;
+  bool schema_only = 7;
+  // The group's type when unspecified.
+  DatabaseType type = 8;
+}
+
+message CreateDatabaseResponse {
+  Database database = 1;
+}
+
+message DeleteDatabaseRequest {
+  string org = 1;
+  string name = 2;
+}
+
+message DeleteDatabaseResponse {}
+
+message RenameDatabaseRequest {
+  string org = 1;
+  string name = 2;
+  string new_name = 3;
+}
+
+message RenameDatabaseResponse {
+  Database database = 1;
+}
+
+message UsageRequest {
+  string org = 1;
+  // Every database of the org when empty.
+  string name = 2;
+  google.protobuf.Timestamp from = 3;
+  google.protobuf.Timestamp to = 4;
+}
+
+message UsagePoint {
+  google.protobuf.Timestamp hour = 1;
+  int64 rows_read = 2;
+  int64 rows_written = 3;
+  int64 statements = 4;
+  int64 errors = 5;
+  int64 bytes_stored = 6;
+  double p50_ms = 7;
+  double p95_ms = 8;
+}
+
+message UsageResponse {
+  // The database's series, or the org's totals when no name was given.
+  repeated UsagePoint points = 1;
+  // With no name: each database's own series.
+  repeated DatabaseUsage databases = 2;
+}
+
+message DatabaseUsage {
+  string name = 1;
+  repeated UsagePoint points = 2;
+}
+
+message Snapshot {
+  string id = 1;
+  google.protobuf.Timestamp taken_at = 2;
+  int64 size_bytes = 3;
+  // Taken on request (CreateSnapshot), not by the schedule.
+  bool manual = 4;
+}
+
+message ListSnapshotsRequest {
+  string org = 1;
+  string name = 2;
+}
+
+message ListSnapshotsResponse {
+  repeated Snapshot snapshots = 1;
+}
+
+message CreateSnapshotRequest {
+  string org = 1;
+  string name = 2;
+}
+
+message CreateSnapshotResponse {
+  Snapshot snapshot = 1;
+}
+
+message RestoreRequest {
+  string org = 1;
+  string name = 2;
+  // Now when unset.
+  google.protobuf.Timestamp at = 3;
+  // Restore into a new database of this name ("<name>-<time>" when empty).
+  string new_name = 4;
+  // Restore in place instead: the database becomes its state at `at`, open
+  // connections are closed, and its history restarts there.
+  bool in_place = 5;
+}
+
+message RestoreResponse {
+  Database database = 1;
+}
+
+message CreateTokenRequest {
+  string org = 1;
+  // A database name, or empty with group set for a group token.
+  string name = 2;
+  string group = 3;
+  Access access = 4;
+  // No expiry when unset.
+  google.protobuf.Timestamp expires_at = 5;
+}
+
+message CreateTokenResponse {
+  string token = 1;
+}
+
+// InvalidateTokens invalidates every token issued so far for the database
+// (or group).
+message InvalidateTokensRequest {
+  string org = 1;
+  string name = 2;
+  string group = 3;
+}
+
+message InvalidateTokensResponse {}
+
+// An upload carries a database file (musql or C SQLite) to the server in
+// pieces, so neither side holds the file in memory. StartUpload opens it,
+// UploadChunk appends the pieces in order, and FinishUpload checks the whole
+// file's SHA-256 and makes the upload usable as CreateDatabaseRequest.upload.
+// The server keeps an upload on the node that started it, refuses files over
+// its uploads.max_bytes, and removes one that is not finished, or not used,
+// within uploads.ttl of its last write.
+message StartUploadRequest {
+  string org = 1;
+  // The file's size, when known: a file over the server's limit is refused
+  // before any byte is sent.
+  int64 size_bytes = 2;
+  // Continue this upload instead of starting one. The response says where it
+  // stands; a finished upload holds the whole file.
+  string resume = 3;
+}
+
+message StartUploadResponse {
+  string upload = 1;
+  // The bytes the server holds: 0 for a new upload, and where the next
+  // UploadChunk must start for a resumed one.
+  int64 offset = 2;
+  // The largest content UploadChunk takes.
+  int32 max_chunk_bytes = 3;
+}
+
+message UploadChunkRequest {
+  string org = 1;
+  string upload = 2;
+  // Where this piece starts in the file. It must be the bytes the server
+  // holds, so a piece sent twice, or out of order, is refused.
+  int64 offset = 3;
+  bytes content = 4;
+}
+
+message UploadChunkResponse {
+  // The bytes the server holds now.
+  int64 offset = 1;
+}
+
+message FinishUploadRequest {
+  string org = 1;
+  string upload = 2;
+  // The SHA-256 of the whole file.
+  bytes sha256 = 3;
+}
+
+message FinishUploadResponse {
+  // The id to give CreateDatabaseRequest.upload.
+  string upload = 1;
+  FileFormat format = 2;
+  int64 size_bytes = 3;
+}
+
+message ExportRequest {
+  string org = 1;
+  string name = 2;
+  FileFormat format = 3;
+}
+
+// Export streams the file: the content of each message is the next piece.
+message ExportResponse {
+  bytes content = 1;
+  // The file's size, on the first message only.
+  int64 size_bytes = 2;
+}
+
+message StatsRequest {
+  string org = 1;
+  string name = 2;
+  // The last 24 hours when unset.
+  google.protobuf.Timestamp from = 3;
+  google.protobuf.Timestamp to = 4;
+  // 20 when 0.
+  int32 limit = 5;
+}
+
+message TopQuery {
+  string sql = 1;
+  int64 count = 2;
+  double total_ms = 3;
+  int64 rows_read = 4;
+  int64 rows_written = 5;
+}
+
+message StatsResponse {
+  repeated TopQuery top_queries = 1;
+}

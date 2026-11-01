@@ -3,11 +3,7 @@
 
 const VECTOR_TYPE = /^(F32_BLOB|FLOAT32)\s*\(\s*\d+\s*\)$/i;
 
-/**
- * Whether a column holds float32 vectors: by its declared type, or, for a
- * plain BLOB column or a result column with no type (an expression), by a
- * name that says so (vec1 declares its vector column a BLOB named "vector").
- */
+/** Whether a column holds float32 vectors: by its declared type, or for an untyped or BLOB column by its name (vec1's is "vector"). */
 export const isVectorColumn = (name, type) => VECTOR_TYPE.test(type ?? "") || ((!type || /^BLOB$/i.test(type)) && /(_emb|embedding|vector)$/i.test(name ?? ""));
 
 /** The components of a float32 vector blob. */
@@ -20,11 +16,9 @@ const NUMERIC = /INT|REAL|FLOA|DOUB|NUM|DEC/i;
 const isKey = (name) => !name || /^(id|rowid|year|yr|zip|zipcode|postcode|port|pin|code)$|_id$|_year$|_code$/i.test(name);
 
 /**
- * v as a grid shows it: {text, cls, title, long}. vector says its column holds
- * vectors; type and name (the column's) pick how a number or a flag reads:
- * a large number gets separators unless it names a row (id, *_id), and a
- * BOOLEAN column shows true and false. long marks a value worth opening whole
- * (long text, JSON).
+ * v as a grid shows it: {text, cls, title, long}. A large number gets
+ * separators unless it names a row (id, *_id), a BOOLEAN column shows true and
+ * false, and long marks text or JSON worth opening whole.
  */
 export function show(v, vector = false, type = "", name = "") {
 	if (v === null || v === undefined) return { text: "NULL", cls: "null" };
@@ -65,11 +59,9 @@ export const fmt = (n) => Number(n).toLocaleString();
 export const bytes = (n) => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`);
 
 /**
- * The value an edited cell's text stores, by the column's declared type, the
- * way C SQLite's type affinity would read the text: a number for a column of
- * INTEGER, REAL or NUMERIC affinity (or none) when the text is one, the text
- * itself otherwise. Text in single quotes is always text, quotes removed:
- * '42' stores the string 42 in any column.
+ * The value an edited cell's text stores, read as C's type affinity would: a
+ * number for a numeric or untyped column when the text is one, else the text.
+ * Single-quoted text is always text, quotes removed.
  */
 export function typed(text, type) {
 	if (text === null) return null;
@@ -84,6 +76,15 @@ export function typed(text, type) {
 	}
 	if (/^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(s)) return Number(s);
 	return text;
+}
+
+/** v as a SQL literal: NULL, a number, a quoted string, or a blob X'…'. */
+export function literal(v) {
+	if (v === null || v === undefined) return "NULL";
+	if (typeof v === "bigint") return String(v);
+	if (typeof v === "number") return Number.isFinite(v) ? String(v) : v > 0 ? "9e999" : v < 0 ? "-9e999" : "NULL";
+	if (v instanceof Uint8Array) return `X'${Array.from(v, (b) => b.toString(16).padStart(2, "0")).join("")}'`;
+	return `'${String(v).replace(/'/g, "''")}'`;
 }
 
 /** Rows as CSV text, RFC 4180: a header line, then one line per row. */

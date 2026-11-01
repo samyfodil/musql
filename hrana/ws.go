@@ -11,7 +11,6 @@ import (
 	"sync"
 
 	"github.com/coder/websocket"
-	"google.golang.org/protobuf/proto"
 
 	pb "github.com/samyfodil/musql/hrana/gen/hrana"
 	pbws "github.com/samyfodil/musql/hrana/gen/hrana/ws"
@@ -47,6 +46,7 @@ type wsConn struct {
 
 	mu      sync.Mutex
 	authed  bool
+	ro      bool // WithAuth marked the client read-only
 	streams map[int32]*wsStream
 	cursors map[int32]*wsCursor
 	sqls    *sqlStore
@@ -105,9 +105,20 @@ func (s *Server) serveWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.ws.Done()
-	if s.authToken == "" && !isSafeOrigin(r) {
+	if s.authToken == "" && s.auth == nil && !isSafeOrigin(r) {
 		http.Error(w, `{"message":"forbidden: cross-origin websocket connection without auth token"}`, http.StatusForbidden)
 		return
+	}
+	// A client that sends its token with the upgrade is checked now, so a
+	// bad one never gets a socket; one that does not sends it in the hello.
+	upgradeAuthed, upgradeRO := false, false
+	if s.auth != nil && r.Header.Get("Authorization") != "" {
+		ro, status := s.authorize(bearer(r))
+		if status != 0 {
+			http.Error(w, `{"message":"unauthorized"}`, status)
+			return
+		}
+		upgradeAuthed, upgradeRO = true, ro
 	}
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: wsSubprotocols, InsecureSkipVerify: true})
 	if err != nil {
@@ -121,7 +132,7 @@ func (s *Server) serveWS(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithCancel(s.base)
 	wc := &wsConn{srv: s, c: c, protobuf: sub == "hrana3-protobuf", ctx: ctx,
-		authed: s.authToken == "", streams: map[int32]*wsStream{}, cursors: map[int32]*wsCursor{}, sqls: newSQLStore()}
+		authed: s.authToken == "" && s.auth == nil || upgradeAuthed, ro: upgradeRO, streams: map[int32]*wsStream{}, cursors: map[int32]*wsCursor{}, sqls: newSQLStore()}
 	defer func() {
 		cancel()
 		wc.closeAll()
@@ -160,14 +171,22 @@ func (wc *wsConn) closeAll() {
 func (wc *wsConn) dispatch(msg *pbws.ClientMsg) bool {
 	switch m := msg.Msg.(type) {
 	case *pbws.ClientMsg_Hello:
-		if wc.srv.authToken != "" && subtle.ConstantTimeCompare([]byte(m.Hello.GetJwt()), []byte(wc.srv.authToken)) != 1 {
+		jwt := m.Hello.GetJwt()
+		wc.mu.Lock()
+		ro, status := wc.ro, 0
+		// A token in the upgrade request already passed; an empty hello
+		// keeps it, a token in the hello replaces it.
+		if wc.srv.auth != nil && (jwt != "" || !wc.authed) {
+			ro, status = wc.srv.authorize(jwt)
+		}
+		if status != 0 || wc.srv.authToken != "" && subtle.ConstantTimeCompare([]byte(jwt), []byte(wc.srv.authToken)) != 1 {
+			wc.mu.Unlock()
 			wc.send(&pbws.ServerMsg{Msg: &pbws.ServerMsg_HelloError{HelloError: &pbws.HelloErrorMsg{
 				Error: &pb.Error{Message: "authentication failed", Code: ptr("UNAUTHORIZED")}}}})
 			wc.c.Close(websocket.StatusPolicyViolation, "authentication failed")
 			return false
 		}
-		wc.mu.Lock()
-		wc.authed = true
+		wc.authed, wc.ro = true, ro
 		wc.mu.Unlock()
 		wc.send(&pbws.ServerMsg{Msg: &pbws.ServerMsg_HelloOk{HelloOk: &pbws.HelloOkMsg{}}})
 		return true
@@ -227,6 +246,7 @@ func (wc *wsConn) request(rq *pbws.RequestMsg) {
 		}
 		st := &wsStream{jobs: make(chan func(), 64)}
 		wc.streams[sid] = st
+		db := wc.srv.dbFor(wc.ro)
 		wc.mu.Unlock()
 		wc.srv.ws.Add(1) // under the connection, which Close is already waiting on
 		go func() {
@@ -239,7 +259,7 @@ func (wc *wsConn) request(rq *pbws.RequestMsg) {
 			}
 		}()
 		st.jobs <- func() {
-			s, err := newStream(wc.ctx, wc.srv.db, wc.sqls)
+			s, err := newStream(wc.ctx, db, wc.sqls, wc.srv.observe)
 			if err != nil {
 				wc.replyErr(id, err)
 				return
@@ -311,7 +331,12 @@ func (wc *wsConn) request(rq *pbws.RequestMsg) {
 		wc.mu.Unlock()
 		wc.onStream(id, cur.streamID, func(st *wsStream) {
 			b := x.OpenCursor.GetBatch()
-			cur.entries = cursorEntries(b, st.batch(wc.ctx, b))
+			cursorEntries(b, st.batch(wc.ctx, b), func(e *pb.CursorEntry) {
+				if row, ok := e.Entry.(*pb.CursorEntry_Row); ok {
+					e = &pb.CursorEntry{Entry: &pb.CursorEntry_Row{Row: row.Row}}
+				}
+				cur.entries = append(cur.entries, e)
+			})
 			wc.reply(id, &pbws.ResponseOkMsg{Response: &pbws.ResponseOkMsg_OpenCursor{OpenCursor: &pbws.OpenCursorResp{}}})
 		})
 	case *pbws.RequestMsg_FetchCursor:
@@ -353,7 +378,9 @@ func (wc *wsConn) send(m *pbws.ServerMsg) {
 	)
 	if wc.protobuf {
 		typ = websocket.MessageBinary
-		data, err = proto.Marshal(m)
+		b := getBuf()
+		defer putBuf(b)
+		data, err = marshal(b, m, false)
 	} else {
 		data, err = json.Marshal(jsonServerMsg(m))
 	}
@@ -368,7 +395,7 @@ func (wc *wsConn) send(m *pbws.ServerMsg) {
 func (wc *wsConn) decode(data []byte) (*pbws.ClientMsg, error) {
 	if wc.protobuf {
 		m := &pbws.ClientMsg{}
-		if err := proto.Unmarshal(data, m); err != nil {
+		if err := m.UnmarshalVT(data); err != nil {
 			return nil, err
 		}
 		return m, nil

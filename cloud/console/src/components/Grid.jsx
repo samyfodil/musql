@@ -21,13 +21,14 @@ const OVERSCAN = 12;
  *   onPaste(i, column, matrix), onClear(i0, i1, columns)   block writes
  *   onContextMenu(event, i, column, startEdit)
  *   range(i0, i1)           the rows i0..i1 for a copy (async), when not all loaded
+ *   marks(i)                staged-edit marks of row i: {row: "added" | "deleted", cells: Set of changed columns}
  *
  * A click or the arrow keys move the current cell; Shift or a drag selects a
  * block, which Ctrl/Cmd+C copies as tab-separated text and Ctrl/Cmd+V fills
  * from a copied block. Enter or F2 edits, Delete empties the block, Space
  * opens the row.
  */
-export default function Grid({ columns, count, rowAt, need, types, layoutKey, sort, desc, onSort, onHeaderMenu, picked, onPick, onOpen, onEdit, onPaste, onClear, onContextMenu, range }) {
+export default function Grid({ columns, count, rowAt, need, types, layoutKey, sort, desc, onSort, onHeaderMenu, picked, onPick, onOpen, onEdit, onPaste, onClear, onContextMenu, range, marks }) {
 	const scroller = useRef(null);
 	const RN = Math.max(52, String(count).length * 8 + 34); // the # column fits the largest row number
 	const [view, setView] = useState({ top: 0, height: 600, width: 1000 });
@@ -278,8 +279,9 @@ export default function Grid({ columns, count, rowAt, need, types, layoutKey, so
 								</tr>
 							);
 						}
+						const mk = marks?.(i);
 						return (
-							<tr key={i} className={picked?.has(i) ? "picked" : ""}>
+							<tr key={i} className={`${picked?.has(i) ? "picked" : ""}${mk?.row ? ` staged-${mk.row}` : ""}`}>
 								<td className={`rn${onPick ? " pickable" : ""}`} onClick={onPick && (() => onPick(i))}>
 									{onPick && <input type="checkbox" tabIndex={-1} checked={!!picked?.has(i)} readOnly />}
 									<span>{i + 1}</span>
@@ -303,8 +305,8 @@ export default function Grid({ columns, count, rowAt, need, types, layoutKey, so
 										<td
 											key={c}
 											style={pinStyle}
-											className={`${s.cls ?? ""}${left[c] !== undefined ? " pinned" : ""}${inSel(i, j) ? (multi ? " insel" : "") : ""}${isCur ? " cur" : ""}`}
-											title={s.title}
+											className={`${s.cls ?? ""}${left[c] !== undefined ? " pinned" : ""}${inSel(i, j) ? (multi ? " insel" : "") : ""}${isCur ? " cur" : ""}${mk?.cells?.has(c) ? " staged-cell" : ""}`}
+											title={mk?.cells?.has(c) ? `${s.title ?? s.text} (not saved yet)` : s.title}
 											onMouseDown={(e) => {
 												if (e.button !== 0) return;
 												dragging.current = true;

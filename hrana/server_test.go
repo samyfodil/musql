@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/coder/websocket"
@@ -421,5 +422,35 @@ func TestMultiCreatesOnlyWhenAuthorized(t *testing.T) {
 	// in the hello message.
 	if code := do("d.db.test", "", true); code != http.StatusSwitchingProtocols {
 		t.Fatalf("WebSocket to an existing database: %d", code)
+	}
+}
+
+func TestObserver(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "o.musq"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var got []Stmt
+	srv := NewServer(db, WithObserver(func(s Stmt) {
+		mu.Lock()
+		got = append(got, s)
+		mu.Unlock()
+	}))
+	hs := httptest.NewServer(srv)
+	t.Cleanup(func() { hs.Close(); srv.Close(); db.Close() })
+	postJSON(t, hs.URL, "/v3/pipeline", `{"baton":null,"requests":[
+		{"type":"sequence","sql":"CREATE TABLE t(a); INSERT INTO t VALUES(1)"},
+		{"type":"execute","stmt":{"sql":"INSERT INTO t VALUES(2),(3)"}},
+		{"type":"execute","stmt":{"sql":"SELECT a FROM t"}},
+		{"type":"execute","stmt":{"sql":"SELECT * FROM nope"}}
+	]}`)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 4 {
+		t.Fatalf("observed %d statements, want 4", len(got))
+	}
+	if got[0].RowsWritten != 1 || got[1].RowsWritten != 2 || got[2].RowsRead != 3 || got[3].Err == nil {
+		t.Fatalf("observed %+v", got)
 	}
 }
