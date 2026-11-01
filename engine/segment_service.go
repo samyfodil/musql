@@ -71,6 +71,8 @@ func segInsnRegs(in Instruction) (reads, writes []int, jump, ok bool) {
 		return []int{in.P1, in.P3}, nil, true, true
 	case OpIf, OpIfNot, OpIsNull, OpNotNull:
 		return []int{in.P1}, nil, true, true
+	case OpInList:
+		return []int{in.P1}, []int{in.P2}, false, true
 	case OpConcat, OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder:
 		return []int{in.P1, in.P2}, []int{in.P3}, false, true
 	}
@@ -92,6 +94,10 @@ func segNativeLowerable(in Instruction, cursor int) bool {
 		return ok
 	case OpFunction:
 		return segLowerableFunc(in)
+	case OpInList:
+		plan, _ := in.P4.(*inListPlan)
+		_, _, ok := plan.nativeKeys()
+		return ok
 	}
 	return false
 }
@@ -419,6 +425,8 @@ func (m *vdbe) segEvalInsn(op *Instruction, column func(*Instruction) Value) (ta
 		taken = w[op.P1].Typ == Null
 	case OpNotNull:
 		taken = w[op.P1].Typ != Null
+	case OpInList:
+		w[op.P2] = m.inList(op)
 	default:
 		return false, false
 	}

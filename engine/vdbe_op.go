@@ -619,6 +619,12 @@ const (
 	// scanned.
 	OpSeekRowidSetHint
 
+	// OpInList: r[P2] = r[P1] IN (list), 1, 0 or NULL, the list's literals and
+	// bound parameters in P4 (*inListPlan) and P3 the first of the registers
+	// its keys are kept in for the run. C's ephemeral index of a constant list
+	// (sqlite3FindInIndex's IN_INDEX_EPH), as a set; see in_list.go.
+	OpInList
+
 	// OpAutoIndexOrder: P1: cursor. P4: *autoIndexKey. Materializes cursor P1 if
 	// needed and reorders its rows into the order SQLite's transient automatic
 	// index would yield (constructAutomaticIndex's key: equality columns, then
@@ -940,6 +946,8 @@ type subCacheEntry struct {
 	// inSet is an IN's membership set over rows (in_hash.go), keyed by the
 	// rows it was built from.
 	inSet *inHashSet
+	// inList is an IN list's set of a run's values (OpInList, in_list.go).
+	inList *inListSet
 }
 
 // derivedSource is OpOpenDerived's P4. Exactly one of these is set:

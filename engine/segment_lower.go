@@ -73,6 +73,8 @@ func segLowerRegOperands(in Instruction) [3]int {
 		if segLowerableFunc(in) {
 			return [3]int{in.P1, in.P3, -1}
 		}
+	case OpInList: // P1 operand, P2 destination, P3 the keys' flag
+		return [3]int{in.P1, in.P2, in.P3}
 	}
 	return [3]int{-1, -1, -1} // OpGoto and anything the switch will refuse
 }
@@ -257,6 +259,9 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 		}
 	}
 	out.blocks = blocks
+	// Registers past the blocks' flags, for an IN list's constant and its
+	// parameters (addInList).
+	nextReg, constReg := scratchReg+1+len(blocks), -1
 
 	for i, in := range body {
 		irOf[i] = len(out.insns)
@@ -484,6 +489,28 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 		case OpSCopy:
 			note(in.P2)
 			out.add(jit.ProgInsn{Op: jit.POpLoadReg, A: in.P2, B: in.P1})
+		case OpInList:
+			plan, _ := in.P4.(*inListPlan)
+			ints, params, ok := plan.nativeKeys()
+			if !ok {
+				return nil, false
+			}
+			if constReg < 0 {
+				constReg = nextReg
+				nextReg++
+			}
+			pregs := make([]int, len(params))
+			for k, p := range params {
+				pregs[k] = nextReg
+				nextReg++
+				out.consts = append(out.consts, pregs[k])
+				out.cvKind = append(out.cvKind, true)
+				out.cvIndex = append(out.cvIndex, p)
+			}
+			note(in.P2)
+			note(scratchReg)
+			note(nextReg - 1)
+			out.addInList(in.P1, in.P2, scratchReg, constReg, ints, pregs, &irJumps)
 		default:
 			return nil, false
 		}
@@ -522,6 +549,54 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 	}
 	out.nRegs = maxReg + 1
 	return out, true
+}
+
+// addInList lowers OpInList over integers: r[dst] = 1 when r[x] is one of
+// ints, searched by a tree of comparisons, or equals one of the parameter
+// registers pregs, each compared in turn, and 0 otherwise. tmp holds each
+// comparison and con each constant. jumps takes the jumps whose targets are
+// IR indices.
+func (l *segLowered) addInList(x, dst, tmp, con int, ints []int64, pregs []int, jumps *[][2]int) {
+	var found, missed []int
+	test := func(cond jit.Cond, r int) int {
+		l.add(jit.ProgInsn{Op: jit.POpCmp, A: tmp, B: x, C: r, Cond: cond})
+		l.add(jit.ProgInsn{Op: jit.POpJumpIfNotZero, B: tmp})
+		return len(l.insns) - 1
+	}
+	var tree func(keys []int64)
+	tree = func(keys []int64) {
+		if len(keys) <= 3 {
+			for _, k := range keys {
+				l.add(jit.ProgInsn{Op: jit.POpSetConst, A: con, B: int(k)})
+				found = append(found, test(jit.CondE, con))
+			}
+			missed = append(missed, len(l.insns))
+			l.add(jit.ProgInsn{Op: jit.POpJump})
+			return
+		}
+		mid := len(keys) / 2
+		l.add(jit.ProgInsn{Op: jit.POpSetConst, A: con, B: int(keys[mid])})
+		below := test(jit.CondL, con)
+		found = append(found, test(jit.CondE, con))
+		tree(keys[mid+1:])
+		*jumps = append(*jumps, [2]int{below, len(l.insns)})
+		tree(keys[:mid])
+	}
+	for _, r := range pregs {
+		found = append(found, test(jit.CondE, r))
+	}
+	tree(ints)
+	yes := len(l.insns)
+	l.add(jit.ProgInsn{Op: jit.POpSetConst, A: dst, B: 1}, jit.ProgInsn{Op: jit.POpJump})
+	no := len(l.insns)
+	l.add(jit.ProgInsn{Op: jit.POpSetConst, A: dst, B: 0})
+	for _, j := range found {
+		*jumps = append(*jumps, [2]int{j, yes})
+	}
+	for _, j := range missed {
+		*jumps = append(*jumps, [2]int{j, no})
+	}
+	*jumps = append(*jumps, [2]int{no - 1, len(l.insns)})
 }
 
 // segLoweredReachable marks every IR instruction some path from the entry can
