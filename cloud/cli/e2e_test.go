@@ -91,20 +91,27 @@ func (h *harness) try(args ...string) (string, error) {
 // tryEnv runs the CLI with env's fields set, returning stdout and stderr.
 func (h *harness) tryEnv(env cli.Env, args ...string) (string, string, error) {
 	var out, errs bytes.Buffer
-	env.Dir, env.Stdin, env.Stdout, env.Stderr = h.dir, strings.NewReader(""), &out, &errs
+	if env.Stdin == nil {
+		env.Stdin = strings.NewReader("")
+	}
+	env.Dir, env.Stdout, env.Stderr = h.dir, &out, &errs
 	err := cli.Run(context.Background(), env, args)
 	return out.String(), errs.String(), err
 }
 
 // login drives the device flow: the CLI polls while the test approves its
 // code through the server's own state, as the verify page would.
-func (h *harness) login() {
+func (h *harness) login() { h.loginWith(nil, "--headless") }
+
+// loginWith is login with env's OpenBrowser and extra flags.
+func (h *harness) loginWith(open func(string) error, extra ...string) {
 	h.t.Helper()
 	ctx := context.Background()
 	stderr := &syncBuf{}
 	done := make(chan error, 1)
 	go func() {
-		done <- cli.Run(ctx, cli.Env{Dir: h.dir, Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: stderr}, []string{"auth", "login", "--headless", "--url", h.url})
+		done <- cli.Run(ctx, cli.Env{Dir: h.dir, Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: stderr, OpenBrowser: open},
+			append([]string{"auth", "login", "--url", h.url}, extra...))
 	}()
 	re := regexp.MustCompile(`confirm the code (\S+)`)
 	var code string

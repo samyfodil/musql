@@ -309,6 +309,9 @@ func TestUploadResume(t *testing.T) {
 	if strings.Contains(errs, "--resume") {
 		t.Fatalf("offered to resume an upload the server dropped: %q", errs)
 	}
+	if _, err := h.try("db", "import", small, "--name", "shorter", "--resume", partial(src)); err == nil || !strings.Contains(err.Error(), "more than") {
+		t.Fatalf("a resume of an upload holding more than the file: %v", err)
+	}
 	if _, err := h.try("db", "create", "x", "--resume", "abc"); err == nil || !strings.Contains(err.Error(), "--resume needs --from-file") {
 		t.Fatalf("resume without a file: %v", err)
 	}
