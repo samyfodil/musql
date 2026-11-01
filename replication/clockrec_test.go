@@ -2,6 +2,7 @@ package replication
 
 import (
 	"context"
+	"database/sql"
 	"maps"
 	"path/filepath"
 	"strings"
@@ -124,5 +125,19 @@ func TestInitSchemaPacksACellClock(t *testing.T) {
 	}
 	if err := InitSchema(ctx, db); err == nil {
 		t.Fatal("InitSchema took a layout newer than this build's")
+	}
+}
+
+func TestInitSchemaRefusesAForeignMeta(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE _repl_meta(k TEXT PRIMARY KEY, x BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := InitSchema(context.Background(), db); err == nil {
+		t.Fatal("InitSchema took a _repl_meta it cannot read")
 	}
 }

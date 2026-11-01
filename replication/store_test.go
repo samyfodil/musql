@@ -381,6 +381,10 @@ func TestAClosedDatabaseIsRefused(t *testing.T) {
 	if _, err := OpenStore(ctx, s.db, "closed"); err == nil {
 		t.Error("opened a store")
 	}
+	NewNode(s, nil).applyPushed(ctx, []Op{insertOp("A", 1, 10, "u1", "x", 1)})
+	if seq := s.LocalVV()["A"]; seq != 0 {
+		t.Errorf("applied a pushed op: A at %d", seq)
+	}
 }
 
 // TestSnapshotPagesAreBoundedByBytes: a page stops at snapshotPageBytes,
