@@ -1,7 +1,6 @@
-// The database side of musql studio: the npm package in a module worker, so
-// the JIT is on (browsers compile wasm synchronously only off the main
-// thread). The page sends {id, op, args}; the answer is {id, result} or
-// {id, error}.
+// The database side of the console: the npm package in a module worker, where
+// browsers compile wasm synchronously so the JIT is on. The page sends {id, op,
+// args} and gets {id, result} or {id, error}.
 import { open } from "@samyfodil/musql";
 
 let db = null;

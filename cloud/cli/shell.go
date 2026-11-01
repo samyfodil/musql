@@ -145,10 +145,9 @@ func (s *Shell) REPL(ctx context.Context, in LineReader, errw io.Writer) error {
 	}
 }
 
-// Complete reports whether text ends with a finished statement: a ";" that
-// is not inside a literal, comment or trigger body (trailing comments may
-// follow it). The engine's own
-// splitter decides, so the shell agrees with the server on boundaries.
+// Complete reports whether text ends with a finished statement: a ";" outside
+// a literal, comment or trigger body, trailing comments allowed. The engine's
+// splitter decides, so the shell and the server agree on boundaries.
 func Complete(text string) bool {
 	const probe = "musql_probe"
 	without, err := engine.SplitStatements(text)

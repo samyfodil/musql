@@ -17,10 +17,9 @@ import { embeddingsOf, fillMissing, missingCount, search, searchVec1, setUpEmbed
 
 const PAGE = 200; // rows read at a time as the grid scrolls
 
-// Staged edits: with "Review changes before saving" on, a table's edits queue
-// here instead of being written: changed cells by row key, deleted row keys,
-// and new rows (newest first, shown at the top of the grid). Save writes them
-// all in one transaction, so one undo step.
+// Staged edits queue here when "Review changes before saving" is on: changed
+// cells by row key, deleted keys and new rows. Save writes them in one
+// transaction.
 const NO_STAGE = { cells: new Map(), dels: new Map(), adds: [] };
 const keyString = (key) => key.map((v) => (typeof v === "bigint" ? `n${v}` : v instanceof Uint8Array ? `b${Array.from(v).join(",")}` : JSON.stringify(v))).join("\0");
 const same = (a, b) => a === b || (typeof a === "bigint" && typeof b === "number" && a === BigInt(b)) || (typeof b === "bigint" && typeof a === "number" && b === BigInt(a));
@@ -184,8 +183,8 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 	const loadRef = useRef(load);
 	loadRef.current = load;
 
-	// fill embeds the rows still missing a vector, in the background of the
-	// page: after "Embed…", and after every write the studio makes here.
+	// fill embeds the rows still missing a vector, in the background, after
+	// "Embed…" and every write made here.
 	async function fill(e = emb) {
 		if (!e?.src || !e.model || filling.current) return;
 		filling.current = true;
@@ -581,8 +580,7 @@ export default function TableView({ name, mode: initialMode = "data", tabId, sta
 		setPicked(p);
 	}
 
-	// cellMenu is a right-click on a cell: edit it, copy it, filter by it, or
-	// select or delete its row.
+	// cellMenu is a right-click on a cell.
 	function cellMenu(i, col, startEdit) {
 		const v = rowAt(i)?.[shown.indexOf(col)];
 		const text = v === null ? null : v instanceof Uint8Array ? null : String(v);

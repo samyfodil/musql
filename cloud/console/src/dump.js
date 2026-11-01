@@ -1,10 +1,7 @@
-// dumpSQL is the open database as a SQL script, the way the sqlite3 shell's
-// .dump writes one: each table's CREATE and its rows as INSERTs, then the
-// indexes, views and triggers. It is how a remote database is downloaded,
-// since the file export reads the local engine's bytes.
-//
-// A virtual table's CREATE is written but not its rows: its module rebuilds
-// its own shadow tables, which are left out (named <vtab>_<suffix>).
+// dumpSQL is the open database as a SQL script, as the sqlite3 shell's .dump
+// writes one; it is how a remote database is downloaded. A virtual table's
+// CREATE is written but not its rows or its shadow tables, which its module
+// rebuilds.
 import { ident, query, rows } from "./db.js";
 import { literal } from "./values.js";
 
