@@ -747,6 +747,13 @@ func lowerVM(in *Instruction, nReg int) jit.VInsn {
 			return jit.VInsn{Op: jit.VRowid, A: in.P1, C: in.P2}
 		}
 		return exit
+	case OpInList:
+		// The search of the run's integers, which OpInList keeps from P3 on
+		// once it has built them; any other set, or operand, exits to it.
+		if plan, _ := in.P4.(*inListPlan); plan != nil && plan.aff != affText && ok(in.P1, in.P2, in.P3) &&
+			in.P3+1+len(plan.lits)+len(plan.params) <= nReg {
+			return jit.VInsn{Op: jit.VInSet, A: in.P1, B: in.P3 + 1, C: in.P2, Imm: int64(in.P3)}
+		}
 	case OpColumn:
 		// Native code reads a cursor's column from its row list; whether the
 		// cursor is one it may (scannableCursors) is checked by the caller, and
