@@ -758,15 +758,37 @@ func fnSubstr(args []Value) Value {
 		start, count := substrRange(len(x.S), y, hasZ, z)
 		return Value{Typ: Blob, S: append([]byte(nil), x.S[start:start+count]...)}
 	}
-	// The two character positions are found with SQLite's own reader, and the
-	// RAW BYTES between them are returned -- never re-encoded. Going through
-	// []rune substituted U+FFFD for every byte Go's decoder rejected, so
-	// substr(cast(x'41ff42' as text),2,1) answered EF BF BD where C SQLite
-	// answers the FF it was given (verified against 3.53.3). See sqliteUTF8Skip.
-	s := []byte(textBeforeNUL(valueToText(x)))
-	starts := sqliteUTF8Starts(s)
-	start, count := substrRange(len(starts)-1, y, hasZ, z)
-	return Value{Typ: Text, S: append([]byte(nil), s[starts[start]:starts[start+count]]...)}
+	// The text up to its first NUL is walked as substrFunc walks it
+	// (func.c:394-440): its characters are counted only when a negative start
+	// needs the length, and the two positions are found by skipping
+	// characters with SQLite's own reader. The RAW BYTES between them are
+	// returned -- never re-encoded. Going through []rune substituted U+FFFD
+	// for every byte Go's decoder rejected, so substr(cast(x'41ff42' as
+	// text),2,1) answered EF BF BD where C SQLite answers the FF it was given
+	// (verified against 3.53.3). See sqliteUTF8Skip.
+	s := x.S
+	if x.Typ != Text {
+		s = []byte(valueToText(x))
+	}
+	if i := bytes.IndexByte(s, 0); i >= 0 {
+		s = s[:i]
+	}
+	n := 0
+	if y < 0 {
+		for i := 0; i < len(s); n++ {
+			i += sqliteUTF8Skip(s[i:])
+		}
+	}
+	p1, p2 := substrBounds(n, y, hasZ, z)
+	i := 0
+	for ; i < len(s) && p1 > 0; p1-- {
+		i += sqliteUTF8Skip(s[i:])
+	}
+	j := i
+	for ; j < len(s) && p2 > 0; p2-- {
+		j += sqliteUTF8Skip(s[j:])
+	}
+	return Value{Typ: Text, S: append([]byte(nil), s[i:j]...)}
 }
 
 // substrRange implements SQLite's substr(X,Y[,Z]) index algorithm (see
@@ -775,7 +797,23 @@ func fnSubstr(args []Value) Value {
 // negative (counts from the end); Z, if given, is a length, possibly
 // negative (grabs characters preceding position Y instead of following it).
 func substrRange(length int, y int64, hasZ bool, z int64) (start, count int) {
-	p1 := y
+	p1, p2 := substrBounds(length, y, hasZ, z)
+	// substrFunc's own "assert( p1>=0 && p2>=0 )" holds here. What follows is
+	// its two output loops, which simply stop at the end of the value.
+	if p1 > int64(length) {
+		p1 = int64(length)
+	}
+	if p2 > int64(length)-p1 {
+		p2 = int64(length) - p1
+	}
+	return int(p1), int(p2)
+}
+
+// substrBounds is substrRange before its output loops: the characters to skip
+// (p1) and then to take (p2), either past the end of a value of the given
+// length, which is read only for a negative Y.
+func substrBounds(length int, y int64, hasZ bool, z int64) (p1, p2 int64) {
+	p1 = y
 	// The two-argument form is not "unbounded": substrFunc gives p2 the
 	// connection's SQLITE_LIMIT_LENGTH, and that finite value is load-bearing
 	// for a hugely negative Y, because the underflow branch below subtracts
@@ -783,7 +821,7 @@ func substrRange(length int, y int64, hasZ bool, z int64) (start, count int) {
 	// SMALLEST_INT64, p2 goes to 1e9 + p1 which is negative, and the p2<0
 	// block collapses the range to nothing. Treating the length as unlimited
 	// answered the WHOLE string.
-	p2 := int64(sqliteMaxLength)
+	p2 = int64(sqliteMaxLength)
 	if hasZ {
 		p2 = z
 	}
@@ -810,13 +848,5 @@ func substrRange(length int, y int64, hasZ bool, z int64) (start, count int) {
 		}
 		p1 -= p2
 	}
-	// substrFunc's own "assert( p1>=0 && p2>=0 )" holds here. What follows is
-	// its two output loops, which simply stop at the end of the value.
-	if p1 > int64(length) {
-		p1 = int64(length)
-	}
-	if p2 > int64(length)-p1 {
-		p2 = int64(length) - p1
-	}
-	return int(p1), int(p2)
+	return p1, p2
 }

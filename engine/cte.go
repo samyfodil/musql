@@ -405,7 +405,10 @@ func applyCTEColNames(name string, colNames []string, cols []columnInfo, rows []
 // (row_store_spill.go), so there cteRecursionByteCap bounds only what the queue
 // holds (frontier plus UNION seen set, recQueue.residentBytes), and
 // cteRecursionStreamByteCap the content produced (time and disk): bigsort.test
-// 1.0 produces 2.83 GiB at a 462 MiB heap peak.
+// 1.0 produces 2.83 GiB at a 462 MiB heap peak. A recursion read as a
+// co-routine by consumers that gather nothing is capped the same way, with
+// cteRecursionByteCap also bounding what its holder's result rows keep
+// (vdbe.holder): a sudoku solver yields 374,729 rows there and keeps one.
 const (
 	cteRecursionRowCap        = 300_000
 	cteRecursionByteCap       = 512 << 20

@@ -244,6 +244,12 @@ type aggItem struct {
 	// not compareValues-equal, but a second integer 2 contributes only
 	// once) -- see step's shared pre-dispatch dedup check below.
 	seen []Value
+	// seenHead and seenNext chain seen by aggDistinctHash (a hash's latest
+	// index plus one, and each entry's previous one), so a probe compares only
+	// values that hash alike; scanning all of seen made sum(DISTINCT x)
+	// quadratic.
+	seenHead hashIndex
+	seenNext []int
 
 	// argColl caches the collating sequence of the aggregate's ARGUMENT --
 	// see argCollation. Resolved on the first contributing row (planning has
@@ -857,6 +863,21 @@ func planAggregateCallKind(fc FuncExpr) (*aggItem, error) {
 	return nil, fmt.Errorf("engine: unsupported aggregate function %s()", fc.Name)
 }
 
+// distinctSeen returns the value already fed to this DISTINCT accumulator
+// that v equals under coll in encoding enc, or remembers v when there is none.
+// Two NULLs are equal, as compareValuesCollatedEnc has them.
+func (it *aggItem) distinctSeen(v Value, coll string, enc TextEncoding) (Value, bool) {
+	h := aggDistinctHash(v, coll, enc)
+	for i := it.seenHead.get(h); i > 0; i = it.seenNext[i-1] {
+		if s := it.seen[i-1]; compareValuesCollatedEnc(v, s, coll, enc) == 0 {
+			return s, true
+		}
+	}
+	it.seen = append(it.seen, v)
+	it.seenNext = append(it.seenNext, it.seenHead.swap(h, len(it.seen)))
+	return Value{}, false
+}
+
 // step feeds one surviving row's values into its accumulator.
 //
 // With it.distinct, a non-NULL value reaches the kind-specific logic only the
@@ -931,21 +952,18 @@ func (it *aggItem) step(ctx *evalCtx, regs []Value) error {
 	}
 	coll := it.argCollation(ctx)
 	if it.distinct {
-		for _, s := range it.seen {
-			if compareValuesCollatedEnc(v, s, coll, ctx.encoding()) == 0 {
-				// The dedup keeps the FIRST spelling of a value, so when the two
-				// are not byte-identical -- 'abc'/'ABC' under NOCASE, INTEGER 1
-				// and REAL 1.0 -- WHICH one every downstream kind then sees is an
-				// arrival-order question, decided here rather than in the kind
-				// branches below because they never see the loser at all.
-				// count(DISTINCT x) is unaffected either way and is never armed.
-				if it.orderStrict && !valuesIdentical(v, s) {
-					it.orderRisk = true
-				}
-				return nil
+		if s, dup := it.distinctSeen(v, coll, ctx.encoding()); dup {
+			// The dedup keeps the FIRST spelling of a value, so when the two
+			// are not byte-identical -- 'abc'/'ABC' under NOCASE, INTEGER 1
+			// and REAL 1.0 -- WHICH one every downstream kind then sees is an
+			// arrival-order question, decided here rather than in the kind
+			// branches below because they never see the loser at all.
+			// count(DISTINCT x) is unaffected either way and is never armed.
+			if it.orderStrict && !valuesIdentical(v, s) {
+				it.orderRisk = true
 			}
+			return nil
 		}
-		it.seen = append(it.seen, v)
 	}
 
 	switch it.kind {
@@ -1099,16 +1117,9 @@ func (it *aggItem) magnetStep(ctx *evalCtx, regs []Value) (touched, hit bool, er
 	}
 	coll := it.argCollation(ctx)
 	if it.distinct {
-		for _, s := range it.seen {
-			if s.Typ == Null && v.Typ == Null {
-				return false, false, nil
-			}
-			if s.Typ != Null && v.Typ != Null &&
-				compareValuesCollatedEnc(v, s, coll, ctx.encoding()) == 0 {
-				return false, false, nil
-			}
+		if _, dup := it.distinctSeen(v, coll, ctx.encoding()); dup {
+			return false, false, nil
 		}
-		it.seen = append(it.seen, v)
 	}
 	if v.Typ == Null {
 		return true, it.haveBest, nil

@@ -145,6 +145,15 @@ func (m *vdbe) bulkLoadFor(plan *insertPlan) *segBulkLoad {
 			return nil
 		}
 	}
+	bl := newSegBulkLoad(tbl)
+	tbl.bulk, wc.bulkTbl = bl, tbl
+	wc.undoFn(func() { tbl.bulk = nil }) // a failed statement keeps none of it
+	return bl
+}
+
+// newSegBulkLoad is an autocommit direct-path load into tbl, cutting segments
+// from its columns as they are now.
+func newSegBulkLoad(tbl *tableMeta) *segBulkLoad {
 	bl := &segBulkLoad{}
 	cols := make([]columnInfo, len(tbl.cols))
 	copy(cols, tbl.cols)
@@ -152,9 +161,16 @@ func (m *vdbe) bulkLoadFor(plan *insertPlan) *segBulkLoad {
 		bl.segs = append(bl.segs, raw)
 		return nil
 	}, own: true}
-	tbl.bulk, wc.bulkTbl = bl, tbl
-	wc.undoFn(func() { tbl.bulk = nil }) // a failed statement keeps none of it
 	return bl
+}
+
+// ctasDirect reports whether CREATE TABLE AS may build its new table's segments
+// straight from the rows it selected (createTableAsSelect), as an autocommit
+// INSERT ... SELECT into an empty table does: the caller commits right after,
+// outside a transaction, and nothing captures or checks the rows one by one.
+func (db *DB) ctasDirect(tbl *tableMeta) bool {
+	return db.commitsEachStatement && !db.inTransaction() && !db.fkEnforce && !db.captureFull &&
+		!tbl.isTemp && !tbl.withoutRowid && tbl.aliasOf == "" && tbl.rows != nil
 }
 
 // bulkLoadInTx is bulkLoadFor inside a transaction: the table's load if it has

@@ -545,11 +545,21 @@ func (m *vdbe) recQueueCaps(q *recQueue) error {
 	if !q.spec.unbounded() {
 		return nil
 	}
-	if m.sink != nil && m.sink.bounded {
+	streamed := m.sink != nil && m.sink.bounded
+	if !streamed && m.holder != nil {
+		// A read co-routine: its consumers drop or pass on what it yields, and
+		// only what reaches the holder's result rows stays in memory.
+		if m.holder.heldBytes > cteRecursionByteCap {
+			return fmt.Errorf("engine: unsupported: recursive CTE %s fed more than %d bytes of result rows with nothing bounding it", q.spec.name, int64(cteRecursionByteCap))
+		}
+		streamed = true
+	}
+	if streamed {
 		// The rows leave memory as the INSERT they feed stores them
-		// (streamSink.bounded, row_store_spill.go): memory is bounded by what
-		// the queue itself holds, and the content produced only by time and
-		// disk. See cteRecursionStreamByteCap.
+		// (streamSink.bounded, row_store_spill.go) or as the read consuming
+		// them moves on: memory is bounded by what the queue itself holds, and
+		// the content produced only by time and disk. See
+		// cteRecursionStreamByteCap.
 		if q.residentBytes() > cteRecursionByteCap {
 			return fmt.Errorf("engine: unsupported: recursive CTE %s holds more than %d bytes of pending rows (this engine keeps a recursive CTE's queue in memory, where C SQLite spills it to a temp file -- select.c:2740)", q.spec.name, int64(cteRecursionByteCap))
 		}
@@ -560,7 +570,7 @@ func (m *vdbe) recQueueCaps(q *recQueue) error {
 		// be far above the in-memory one, but a runaway still has to stop
 		// in seconds (cteRecursionStreamRowCap).
 		if q.emitted+int64(q.len()) > cteRecursionStreamRowCap {
-			return fmt.Errorf("engine: unsupported: recursive CTE %s exceeded this engine's internal row limit of %d rows streamed into an INSERT (possible non-terminating recursion)", q.spec.name, int64(cteRecursionStreamRowCap))
+			return fmt.Errorf("engine: unsupported: recursive CTE %s exceeded this engine's internal row limit of %d rows streamed to its consumer (possible non-terminating recursion)", q.spec.name, int64(cteRecursionStreamRowCap))
 		}
 		return nil
 	}

@@ -5,8 +5,9 @@
 // step=0 is treated as 1; negative step produces descending. start defaults to 0.
 // NULL bounds produce an empty result.
 //
-// An unbounded series (no stop bound) is declined with an error. This engine
-// materializes all FROM rows up front, unlike SQLite's lazy evaluation.
+// An unbounded series (no stop bound) is declined with an error, and so is one
+// longer than maxRows: a scan that cannot stream it (vtab_stream.go)
+// materializes it.
 package engine
 
 import "fmt"
@@ -49,6 +50,10 @@ const (
 )
 
 type seriesTable struct{}
+
+// streams makes generate_series a vtabStreamer: filtering it again is a few
+// integer operations.
+func (seriesTable) streams() {}
 
 // BestIndex consumes at most one EQ constraint per hidden bound column
 // (start/stop/step), assigning argv slots in the fixed order start, stop, step
@@ -118,12 +123,11 @@ func seriesInputName(col int) string {
 
 func (seriesTable) Open() (VtabCursor, error) { return &seriesCursor{}, nil }
 
-// seriesCursor eagerly materializes the whole series in Filter (matching the
-// engine's eager row model) and then walks it.
+// seriesCursor walks the series: count values from start, step apart.
 type seriesCursor struct {
-	vals              []int64
 	start, stop, step int64
-	pos               int
+	value             int64
+	count, k          uint64
 }
 
 func (c *seriesCursor) Filter(idxNum int, _ string, argv []Value) error {
@@ -148,8 +152,7 @@ func (c *seriesCursor) Filter(idxNum int, _ string, argv []Value) error {
 	if (idxNum&seriesHasStart != 0 && startV.Typ == Null) ||
 		(idxNum&seriesHasStop != 0 && stopV.Typ == Null) ||
 		(idxNum&seriesHasStep != 0 && stepV.Typ == Null) {
-		c.vals = nil
-		c.pos = 0
+		c.count, c.k = 0, 0
 		return nil
 	}
 	if idxNum&seriesHasStart != 0 {
@@ -167,7 +170,7 @@ func (c *seriesCursor) Filter(idxNum int, _ string, argv []Value) error {
 	c.stop = seriesInt(stopV)
 
 	// Count the rows first, to reject a pathologically large series rather than
-	// attempt to allocate it (this engine materializes eagerly).
+	// attempt to materialize it.
 	const maxRows = 1 << 24 // ~16.7M; far beyond any real test, bounded for safety
 	// In uint64: the span of a series over the whole int64 range does not fit
 	// in an int64, and an overflowed count once let
@@ -186,24 +189,19 @@ func (c *seriesCursor) Filter(idxNum int, _ string, argv []Value) error {
 	if count > maxRows {
 		return fmt.Errorf("engine: generate_series would produce %d rows, exceeding this engine's materialization limit", count)
 	}
-	// Exactly count values: a bound check on v itself wraps at the int64
-	// ends, and nothing else stops the loop.
-	c.vals = make([]int64, 0, count)
-	for v, k := c.start, uint64(0); k < count; k++ {
-		c.vals = append(c.vals, v)
-		v += c.step
-	}
-	c.pos = 0
+	// Exactly count values: a bound check on the value itself wraps at the
+	// int64 ends, and nothing else stops the walk.
+	c.count, c.k, c.value = count, 0, c.start
 	return nil
 }
 
-func (c *seriesCursor) Next() error { c.pos++; return nil }
-func (c *seriesCursor) Eof() bool   { return c.pos >= len(c.vals) }
+func (c *seriesCursor) Next() error { c.k++; c.value += c.step; return nil }
+func (c *seriesCursor) Eof() bool   { return c.k >= c.count }
 
 func (c *seriesCursor) Column(i int) (Value, error) {
 	switch i {
 	case seriesColValue:
-		return Value{Typ: Int, I: c.vals[c.pos]}, nil
+		return Value{Typ: Int, I: c.value}, nil
 	case seriesColStart:
 		return Value{Typ: Int, I: c.start}, nil
 	case seriesColStop:
@@ -214,7 +212,7 @@ func (c *seriesCursor) Column(i int) (Value, error) {
 	return Value{}, fmt.Errorf("engine: generate_series: no column %d", i)
 }
 
-func (c *seriesCursor) Rowid() (int64, error) { return c.vals[c.pos], nil }
+func (c *seriesCursor) Rowid() (int64, error) { return c.value, nil }
 func (c *seriesCursor) Close() error          { return nil }
 
 // seriesInt coerces a bound Value to an int64 the way SQLite's
