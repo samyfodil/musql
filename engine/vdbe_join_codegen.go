@@ -3013,7 +3013,7 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 			case s.cteItem.recSelf != nil:
 				ds = &derivedSource{recSelf: s.cteItem.recSelf, tbl: s.tbl}
 			case s.cteItem.queue != nil:
-				ds = &derivedSource{prog: s.cteItem.queue, tbl: s.tbl, dbIdx: s.dbIdx}
+				ds = &derivedSource{prog: s.cteItem.queue, tbl: s.tbl, dbIdx: s.dbIdx, cteOnce: !s.cteItem.queue.Correlated}
 				if i == streamDerived {
 					ds.stream = streamIfYielding
 					if s.cteCoroutine {
