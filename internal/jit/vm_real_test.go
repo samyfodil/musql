@@ -85,18 +85,19 @@ func TestVMRealArith(t *testing.T) {
 }
 
 // TestVMRealCompare: VFCmpJump, VFCmpSet and VFCmpBr over REALs and the
-// INTEGERs a double holds exactly; a larger INTEGER or a NULL exits.
+// INTEGERs a double holds exactly; a larger INTEGER, a NULL or a NaN exits.
 func TestVMRealCompare(t *testing.T) {
 	if !Available || !VMReal {
 		t.Skip("no REAL arms here")
 	}
-	vals := []tvalue{treal(2.5), treal(math.Copysign(0, -1)), treal(0), tint(2), tint(3), tint(1 << 53), tint(1<<53 + 1), treal(math.Inf(-1)), {Typ: tvNull}}
+	vals := []tvalue{treal(2.5), treal(math.Copysign(0, -1)), treal(0), tint(2), tint(3), tint(1 << 53), tint(1<<53 + 1), treal(math.Inf(-1)),
+		treal(math.NaN()), {Typ: tvNull}}
 	conds := []Cond{CondE, CondNE, CondL, CondLE, CondG, CondGE}
 	for _, c := range conds {
 		for _, b := range vals {
 			for _, av := range vals {
 				ok := func(v tvalue) bool {
-					return v.Typ == tvReal || (v.Typ == tvInt && v.I <= 1<<53 && v.I >= -(1<<53))
+					return (v.Typ == tvReal && !math.IsNaN(v.F)) || (v.Typ == tvInt && v.I <= 1<<53 && v.I >= -(1<<53))
 				}
 				f := func(v tvalue) float64 {
 					if v.Typ == tvInt {

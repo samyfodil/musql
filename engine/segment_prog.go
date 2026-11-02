@@ -130,6 +130,9 @@ func (m *vdbe) segKindsOf(p *ReadOnlyPager, tbl *resolvedTable, src *segProgSour
 	}
 	for _, idx := range src.params {
 		if idx >= 1 && idx <= len(m.params) && m.params[idx-1].Typ == Float {
+			if f := m.params[idx-1].F; f != f {
+				return nil, false // a NaN, which a REAL register holds as NULL
+			}
 			if kinds == nil {
 				kinds = &segKinds{realCol: map[int]bool{}, realParam: map[int]bool{}}
 			}

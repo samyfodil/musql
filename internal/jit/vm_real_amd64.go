@@ -131,6 +131,7 @@ func (e *vmEmit) realInsn(pc int, in VInsn) (bool, error) {
 			a.MovRegImm64(R10, 0)
 		}
 		a.Ucomisd(X0, X1)
+		e.jccStub(ccP, pc) // a NaN, which no VDBE value holds
 		if in.Op == VFCmpJump {
 			e.jccBlock(c, pc, in.T)
 			break

@@ -473,7 +473,7 @@ func segSelectPrep(s *segment, f *segRowFilter, ipkCol int, params []Value) (*se
 		// ordering would be got wrong. Declining costs a full scan, which is
 		// the answer this started from.
 		switch v := params[idx-1]; {
-		case low.real[reg] && v.Typ == Float:
+		case low.real[reg] && v.Typ == Float && v.F == v.F:
 			regs[reg] = int64(math.Float64bits(v.F))
 		case !low.real[reg] && v.Typ == Int:
 			regs[reg] = v.I

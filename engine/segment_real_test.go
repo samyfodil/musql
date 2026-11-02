@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -49,6 +50,7 @@ func TestRealProgramsMatchTheLoop(t *testing.T) {
 		{`SELECT count(*) FROM t WHERE x > ? AND y < ?`, []Value{integer(3), real(0.5)}, 1},
 		{`SELECT count(*) FROM t WHERE x > ?`, []Value{integer(1 << 60)}, 0}, // the fixed filter compares it exactly
 		{`SELECT sum(y) FROM t WHERE x > ?`, []Value{integer(1 << 60)}, -1},  // not an exact double
+		{`SELECT count(*), sum(y) FROM t WHERE x >= ?`, []Value{real(math.NaN())}, -1},
 		{`SELECT sum(x * ?) FROM t`, []Value{integer(1<<60 + 1)}, 1},
 		{`SELECT sum(n) FROM t`, nil, -1},         // a REAL column with NULLs
 		{`SELECT sum(v), max(v) FROM u`, nil, -1}, // INTEGER in one segment, REAL in another
@@ -91,18 +93,18 @@ func TestRealProgramsMatchTheLoop(t *testing.T) {
 
 // realRows renders rows with every REAL's bits, so -0.0 and 0.0 differ.
 func realRows(rows [][]Value) string {
-	s := ""
+	var b strings.Builder
 	for _, r := range rows {
 		for _, v := range r {
 			if v.Typ == Float {
-				s += fmt.Sprintf("f%x|", math.Float64bits(v.F))
+				fmt.Fprintf(&b, "f%x|", math.Float64bits(v.F))
 				continue
 			}
-			s += fmt.Sprint(typedRows([][]Value{{v}}))
+			fmt.Fprint(&b, typedRows([][]Value{{v}}))
 		}
-		s += ";"
+		b.WriteString(";")
 	}
-	return s
+	return b.String()
 }
 
 // TestRealRowFilter: a WHERE over REAL columns selects a segment's rows in
@@ -134,6 +136,7 @@ func TestRealRowFilter(t *testing.T) {
 		{`SELECT id FROM t WHERE x > ?`, []Value{real(184.25)}, true},
 		{`SELECT id FROM t WHERE x > ? AND y < ?`, []Value{integer(180), real(-40)}, true},
 		{`SELECT id FROM t WHERE x > ?`, []Value{integer(1<<53 + 1)}, false},
+		{`SELECT id FROM t WHERE x >= ? AND x < 0`, []Value{real(math.NaN())}, false},
 		{`SELECT id FROM t WHERE n > 69990`, nil, false},
 	}
 	check := func() {
