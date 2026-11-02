@@ -63,8 +63,9 @@ type vmJIT struct {
 	// parameters (Program.jitParams); enter fills them.
 	params int
 
-	// text is whether the code compares TEXTs (VTextCmpJump), which it does
-	// only in a UTF-8 database: enter says which (ProgArgs.UTF16).
+	// text is whether the code has TEXT arms: enter says whether TEXTs
+	// compare converted, which VTextCmpJump leaves to the VDBE
+	// (ProgArgs.UTF16), and that no bytes are checked yet (TextPtr).
 	text bool
 
 	// seekCols is every column the native code reads of each cursor: what a
@@ -284,7 +285,9 @@ func compileVMJIT(prog *Program) *vmJIT {
 		}
 	}
 	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams, params: nParams, entry: entry, marked: marked, native: native, updAt: updAt}
-	jx.text = slices.ContainsFunc(vp, func(in jit.VInsn) bool { return in.Op == jit.VTextCmpJump || in.Op == jit.VTextCmpSet })
+	jx.text = slices.ContainsFunc(vp, func(in jit.VInsn) bool {
+		return in.Op == jit.VTextCmpJump || in.Op == jit.VTextCmpSet || in.Op == jit.VSubstr
+	})
 	if updAt >= 0 {
 		jx.updSkip = vp[updAt-1].Skip
 		jx.updPlan, _ = prog.Insns[updAt].P4.(*updatePlan)
@@ -1150,7 +1153,7 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 	}
 	args.Regs, args.PC, args.Cur = (*int64)(unsafe.Pointer(&regs[0])), int64(pc), nil
 	if jx.text {
-		args.UTF16 = 0
+		args.UTF16, args.TextPtr = 0, 0
 		if isUTF16(m.encoding()) {
 			args.UTF16 = 1
 		}

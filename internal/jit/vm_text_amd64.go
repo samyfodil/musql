@@ -25,11 +25,31 @@ func (e *vmEmit) substr(pc int, in VInsn) {
 	a.LeaRegMemD(RDX, RAX, -1)
 	a.AluRegMemD(AluCmp, RDX, RSI, e.d(in.A, L.OffS+8))
 	e.jccStub(condAboveEq, pc)
-	// The first y bytes: eight at a time while eight are left, none with
-	// its high bit set and then none 0 (with no high bit set, a byte borrows
-	// when 0x01 is taken from each only where one is 0), then one at a time.
-	words, bytes, done := e.vmLabel("sw"), e.vmLabel("sb"), e.vmLabel("sd")
+	// The first y bytes, past those this entry checked at the same pointer
+	// (ProgArgs.TextPtr): recorded before they are checked, as a failure
+	// exits and the next entry starts afresh.
+	fresh, scan, have, got := e.vmLabel("sf"), e.vmLabel("ss"), e.vmLabel("sh"), e.vmLabel("sg")
 	a.MovRegMemD(R9, RSI, e.d(in.A, L.OffS))
+	a.AluRegMemD(AluCmp, R9, RDI, POffTextPtr)
+	a.Jcc(CondNE, fresh)
+	a.MovRegMemD(RDX, RDI, POffTextLen)
+	a.CmpRegReg(RAX, RDX)
+	a.Jcc(condBelowEq, have)
+	a.MovMemDReg(RDI, POffTextLen, RAX)
+	a.SubRegReg(RAX, RDX)
+	a.AddRegReg(R9, RDX)
+	a.Jmp(scan)
+	a.Label(have)
+	a.AddRegReg(R9, RAX)
+	a.Jmp(got)
+	a.Label(fresh)
+	a.MovMemDReg(RDI, POffTextPtr, R9)
+	a.MovMemDReg(RDI, POffTextLen, RAX)
+	a.Label(scan)
+	// Eight at a time while eight are left, none with its high bit set and
+	// then none 0 (with no high bit set, a byte borrows when 0x01 is taken
+	// from each only where one is 0), then one at a time.
+	words, bytes, done := e.vmLabel("sw"), e.vmLabel("sb"), got
 	a.MovRegImm64(R10, 0x0101010101010101)
 	a.MovRegImm64(RCX, -0x7f7f7f7f7f7f7f80) // 0x8080808080808080
 	a.Label(words)

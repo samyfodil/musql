@@ -83,6 +83,64 @@ func TestVMSubstr(t *testing.T) {
 	}
 }
 
+// TestVMSubstrChecked: in one entry, substr over bytes an earlier substr
+// checked answers without checking them again, and checks only those past
+// them; a NUL past them still exits, and so does one past them in the same
+// TEXT a later, longer substr reaches.
+func TestVMSubstrChecked(t *testing.T) {
+	if !Available {
+		t.Skip("no JIT on this platform")
+	}
+	noGC(t)
+	table := &tvASCII
+	imm := int64(uintptr(unsafe.Pointer(&table[0])))
+	// r0 the TEXT, r1 y, r2 1; r3 = substr; r4 = y2; r5 = substr at y2; r6 =
+	// y3, r7 = substr at y3. The three run one after another.
+	prog := []VInsn{
+		{Op: VSubstr, A: 0, C: 3, Imm: imm},
+		{Op: VCopy, A: 4, B: 1},
+		{Op: VSubstr, A: 0, C: 5, Imm: imm},
+		{Op: VCopy, A: 6, B: 1},
+		{Op: VSubstr, A: 0, C: 7, Imm: imm},
+		{Op: VExit},
+	}
+	s := strings.Repeat("abcdefgh", 4) + "\x00tail"
+	for _, c := range []struct {
+		ys     [3]int64
+		exitAt int64 // -1 for none
+	}{
+		{[3]int64{20, 5, 30}, -1},
+		{[3]int64{30, 30, 1}, -1},
+		{[3]int64{1, 32, 32}, -1},
+		{[3]int64{20, 33, 1}, 2},
+		{[3]int64{32, 10, 35}, 4},
+	} {
+		regs := make([]tvalue, 8)
+		regs[0] = tvalue{Typ: tvText, S: []byte(s)}
+		regs[2] = tvalue{Typ: tvInt, I: 1}
+		prog[1] = VInsn{Op: VInt, A: 1, Imm: c.ys[1]}
+		prog[3] = VInsn{Op: VInt, A: 1, Imm: c.ys[2]}
+		regs[1] = tvalue{Typ: tvInt, I: c.ys[0]}
+		var args ProgArgs
+		runVM(t, prog, nil, regs, &args, 0)
+		want := int64(5)
+		if c.exitAt >= 0 {
+			want = c.exitAt
+		}
+		if args.PC != want {
+			t.Fatalf("%v: pc %d, want %d", c.ys, args.PC, want)
+		}
+		for k, r := range []int{3, 5, 7} {
+			if int64(2*k) >= want {
+				break
+			}
+			if regs[r].Typ != tvText || len(regs[r].S) != 1 || regs[r].S[0] != s[c.ys[k]-1] {
+				t.Fatalf("%v: r%d %+v, want %q", c.ys, r, regs[r], s[c.ys[k]-1])
+			}
+		}
+	}
+}
+
 // TestVMTextCmp: = and <> over two TEXTs and two INTEGERs, in both forms,
 // and the pairs that exit: mixed, NULL, BLOB, and two TEXTs in a UTF-16
 // database.

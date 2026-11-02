@@ -155,7 +155,8 @@ const (
 	// the INTEGER y, from 1 to the TEXT's length, and r[A+2] the INTEGER 1.
 	// The answer is the byte at y-1, as one byte of the table at Imm (the
 	// engine's own, as its substr answers it). Anything else exits, as does a
-	// write barrier that is on.
+	// write barrier that is on. The bytes already checked in this entry are
+	// not checked again (ProgArgs.TextPtr).
 	VSubstr
 	// VTextCmpJump, VTextCmpSet: VCmpJump and VCmpSet for Cond E or NE over
 	// two TEXTs, equal when their bytes are, or two INTEGERs. Any other pair
