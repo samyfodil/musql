@@ -213,12 +213,18 @@ Vector search is faster too: `vector_top_k` beats libSQL's index while
 returning the exact top 10, and every `vec1` index beats C SQLite's. See
 [Vector search](#vector-search).
 
+Queries users reported as slow (issues #69 to #74) now beat C SQLite too. They
+cover `generate_series`, a sudoku solved by a recursive CTE, `GROUP BY` an
+expression, and `sum(DISTINCT ...)`. On an Apple M4, the sudoku takes 18.5 ms
+against C SQLite's 38 ms, and `GROUP BY a+1` over 10M rows 20 ms against 1.67 s.
+
 [docs/benchmarks.md](docs/benchmarks.md) has:
 
 - all 26 shapes;
 - per-machine timings, including the 100k-row runs and the Apple M4;
 - the multithreaded comparison with DuckDB;
 - the vector benchmarks;
+- the queries from issues #69 to #74;
 - the cost of calling C from Go.
 
 Writes, through `database/sql` against C SQLite through `mattn/go-sqlite3`
