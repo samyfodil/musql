@@ -2,7 +2,11 @@
 
 package jit
 
-import "github.com/samyfodil/musql/internal/fir"
+import (
+	"math"
+
+	"github.com/samyfodil/musql/internal/fir"
+)
 
 // firBudgets are the register sets the kernel tests give a kernel: what a
 // test loop can spare, a few, and so few that most values spill.
@@ -57,5 +61,13 @@ func firLoop(f *fir.Func, budget int) (*Code, error) {
 	return Map(code)
 }
 
-// firFMod is whether this backend compiles fir.OpFMod.
+// firFMod is whether this backend computes every fir.OpFMod itself.
 const firFMod = false
+
+// firFModExits is whether this backend's fmod leaves (x, y) to Go: unless
+// |x| < |y|, a quotient |x/y| not below 2^53, which includes an infinity, a
+// zero divisor and a NaN.
+func firFModExits(x, y float64) bool {
+	ax, ay := math.Abs(x), math.Abs(y)
+	return !(ax < ay) && !(ax/ay < 1<<53)
+}

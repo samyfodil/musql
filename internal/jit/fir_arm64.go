@@ -95,12 +95,11 @@ func emitFirArm64(a *Arm, f *fir.Func, env *firEnv, feat cpuFeatures) error {
 	if f.Fused && !feat.fma {
 		return fmt.Errorf("jit: kernel %s is built fused and this CPU has no FMA", f.Name)
 	}
-	rounds := firHasOp(f.Body, fir.OpRoundEven) || firHasOp(f.Body, fir.OpFloor) || firHasOp(f.Body, fir.OpCeil) ||
+	fmod := firHasOp(f.Body, fir.OpFMod)
+	rounds := fmod || firHasOp(f.Body, fir.OpRoundEven) || firHasOp(f.Body, fir.OpFloor) || firHasOp(f.Body, fir.OpCeil) ||
 		firHasOp(f.Body, fir.OpTrunc)
 	switch {
-	case firHasOp(f.Body, fir.OpFMod):
-		return fmt.Errorf("jit: kernel %s: no fmod on arm64", f.Name)
-	case !feat.fma && firHasOp(f.Body, fir.OpFMA):
+	case !feat.fma && (fmod || firHasOp(f.Body, fir.OpFMA)):
 		return fmt.Errorf("jit: kernel %s needs FMA", f.Name)
 	case !feat.round && rounds:
 		return fmt.Errorf("jit: kernel %s needs FRINT", f.Name)
@@ -250,6 +249,8 @@ func (e *firArm64) step(st *fir.Step, end string) {
 			a.Fadd(r, tmp, rc)
 		}
 		e.fput(st.Dst, r)
+	case fir.OpFMod:
+		e.fmod(st)
 	case fir.OpFSqrt, fir.OpFAbs, fir.OpFNeg, fir.OpRoundEven, fir.OpFloor, fir.OpCeil, fir.OpTrunc:
 		ra := e.fget(st.A, e.s0)
 		r := e.fdst(st.Dst)
@@ -361,6 +362,46 @@ func (e *firArm64) step(st *fir.Step, end string) {
 		}
 		a.B(end)
 	}
+}
+
+// fmod emits fmod(A, B) without x87's FPREM: with n = trunc(|A|/|B|) below
+// 2^53, |A| - n*|B| is exact in one FMA, and a quotient rounded up to n
+// leaves it short by |B|, which one addition gives back. Any other quotient,
+// an infinity or a NaN, goes to Go; |A| < |B| is A itself.
+func (e *firArm64) fmod(st *fir.Step) {
+	a := e.a
+	rb, ra := e.fget(st.B, e.s1), e.fget(st.A, e.s0)
+	r := e.fdst(st.Dst)
+	small, fast, pos, done := e.label("fmx"), e.label("fmf"), e.label("fmp"), e.label("fmd")
+	a.FmovToX(e.t0, ra)
+	a.Fabs(e.s2, rb)
+	a.Fabs(e.s1, ra)
+	a.Fcmp(e.s1, e.s2)
+	a.BcondRaw(armMI, small)
+	a.Fdiv(e.s0, e.s1, e.s2)
+	a.FmovToX(e.t1, e.s0)
+	a.LsrImm(e.t1, e.t1, 52)
+	a.CmpImm(e.t1, 1023+53)
+	a.BcondRaw(armLO, fast)
+	a.B(e.env.exit)
+	a.Label(fast)
+	a.Frint(e.s0, e.s0, 3)
+	a.Fneg(e.s0, e.s0)
+	a.Fmadd(e.s0, e.s0, e.s2, e.s1)
+	a.FcmpZero(e.s0)
+	a.BcondRaw(armPL, pos)
+	a.Fadd(e.s0, e.s0, e.s2)
+	a.Label(pos)
+	a.FmovToX(e.t1, e.s0)
+	a.LsrImm(e.t0, e.t0, 63)
+	a.LslImm(e.t0, e.t0, 63)
+	a.OrrReg(e.t1, e.t1, e.t0)
+	a.FmovToD(r, e.t1)
+	a.B(done)
+	a.Label(small)
+	a.FmovToD(r, e.t0)
+	a.Label(done)
+	e.fput(st.Dst, r)
 }
 
 // branchUnless branches to target unless st's comparison holds. After FCMP an

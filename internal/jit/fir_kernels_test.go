@@ -188,11 +188,9 @@ func TestFloatProgramCompares(t *testing.T) {
 	}
 }
 
-// fmod is exact, so the kernel's must be math.Mod's, a NaN for a NaN.
+// fmod is exact, so the kernel's must be math.Mod's, a NaN for a NaN, where
+// it does not leave the input to Go.
 func TestFirFMod(t *testing.T) {
-	if !firFMod {
-		t.Skip("no fmod in this backend")
-	}
 	b := fir.New("fmod", 2, false)
 	b.Return(b.FMod(b.Arg(0), b.Arg(1)))
 	f, err := b.Func()
@@ -216,17 +214,32 @@ func TestFirFMod(t *testing.T) {
 		for range 100000 {
 			x := math.Float64frombits(r.Uint64())
 			y := math.Float64frombits(r.Uint64())
-			if r.IntN(2) == 0 {
+			switch r.IntN(4) {
+			case 0:
 				x, y = (r.Float64()-0.5)*1e6, (r.Float64()-0.5)*100
+			case 1:
+				// n*y rounded: x/y is n, or rounds to it from below.
+				y = (r.Float64() - 0.5) * 100
+				x = float64(r.Int64N(1<<53)>>r.IntN(53)) * y
+				x = math.Nextafter(x, math.Inf(r.IntN(2)*2-1))
 			}
 			xs, ys = append(xs, x), append(ys, y)
 		}
 		got, exited := runFir(k, xs, ys)
+		roundedUp := 0
 		for i := range xs {
 			want := math.Mod(xs[i], ys[i])
-			if exited[i] || (math.Float64bits(got[i]) != math.Float64bits(want) && !(got[i] != got[i] && want != want)) {
-				t.Fatalf("fmod(%v, %v) = %v (%x), math.Mod %v (%x)", xs[i], ys[i], got[i], math.Float64bits(got[i]), want, math.Float64bits(want))
+			if exited[i] != firFModExits(xs[i], ys[i]) ||
+				!exited[i] && math.Float64bits(got[i]) != math.Float64bits(want) && !(got[i] != got[i] && want != want) {
+				t.Fatalf("fmod(%v, %v) = %v (%x, exit %v), math.Mod %v (%x)", xs[i], ys[i], got[i], math.Float64bits(got[i]),
+					exited[i], want, math.Float64bits(want))
 			}
+			if q := math.Abs(xs[i] / ys[i]); q < 1<<53 && q == math.Trunc(q) && math.Abs(want) > math.Abs(ys[i])/2 {
+				roundedUp++
+			}
+		}
+		if roundedUp == 0 {
+			t.Error("no quotient rounded up to an integer")
 		}
 		k.Close()
 	}

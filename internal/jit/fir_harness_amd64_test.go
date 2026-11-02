@@ -57,5 +57,7 @@ func firLoop(f *fir.Func, budget int) (*Code, error) {
 	return Map(code)
 }
 
-// firFMod is whether this backend compiles fir.OpFMod.
+// firFMod is whether this backend computes every fir.OpFMod itself.
 const firFMod = true
+
+func firFModExits(float64, float64) bool { return false }

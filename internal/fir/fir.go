@@ -64,7 +64,8 @@ const (
 	OpFloor
 	OpCeil
 	OpTrunc
-	// OpFMod: C's fmod(A, B), exact.
+	// OpFMod: C's fmod(A, B), exact. A backend may leave the inputs it has
+	// no exact fast path for to Go, as an Exit does.
 	OpFMod
 	// OpFToI: int64(A), truncated. A must be finite and inside int64's range.
 	OpFToI
