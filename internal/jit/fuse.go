@@ -231,6 +231,20 @@ func stepOf(in ProgInsn) progStep {
 		if !in.BCol {
 			s.uses = append(s.uses, in.B)
 		}
+	case POpI2F, POpFIsNull, POpFAbs:
+		s.uses, s.defs, s.pure = []int{in.B}, []int{in.A}, true
+	case POpFAdd, POpFSub, POpFMul, POpFDiv:
+		s.uses, s.defs, s.pure = []int{in.B, in.C}, []int{in.A}, true
+	case POpFCmp:
+		// Not pure when a NULL raises the overflow flag.
+		s.uses, s.defs, s.pure = []int{in.B, in.C}, []int{in.A}, in.Imm != ProgNullDeclines
+	case POpMath:
+		// It can stop for its service, which reads any register.
+		s.useAll = true
+	case POpFAccSum, POpFAccMin, POpFAccMax:
+		s.uses, s.defs = []int{in.A, in.B}, []int{in.B}
+	case POpFAccCount:
+		s.uses = []int{in.A}
 	default:
 		// An opcode this pass does not know: reads and writes anything, so
 		// nothing around it is touched.

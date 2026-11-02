@@ -61,9 +61,10 @@ check-no-stray-dbs:
 	    exit 1; \
 	  fi
 
-# Differential tests against real C SQLite (CGo, separate nested module).
+# Differential tests against real C SQLite (CGo, separate nested module), whose
+# oracle needs the SQL math functions.
 harness:
-	cd compat-harness && go test ./...
+	cd compat-harness && go test -tags sqlite_math_functions ./...
 
 # Bulk load + point reads vs C SQLite (bench/pointread, its own CGo module). The
 # short run; POINTREAD_FULL=1 for 10M rows. Fails if musql loses a gated metric.
