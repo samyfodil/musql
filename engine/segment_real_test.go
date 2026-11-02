@@ -56,6 +56,9 @@ func TestRealProgramsMatchTheLoop(t *testing.T) {
 		{`SELECT sum(v), max(v) FROM u`, nil, -1}, // INTEGER in one segment, REAL in another
 		{`SELECT min(x), max(x), sum(x), total(x), avg(x), count(x) FROM z`, nil, 0},
 		{`SELECT min(-x), max(-x), min(x*0), max(x*0) FROM z`, nil, 0},
+		{`SELECT count(DISTINCT x), sum(DISTINCT x), avg(DISTINCT x), total(DISTINCT x) FROM z`, nil, -1},
+		{`SELECT count(DISTINCT x), sum(DISTINCT y) FROM t`, nil, -1},
+		{`SELECT count(DISTINCT i), sum(DISTINCT i), min(DISTINCT x) FROM t WHERE x > 0.5`, nil, 1},
 	}
 	check := func() {
 		t.Helper()

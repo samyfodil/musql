@@ -16,7 +16,7 @@ import (
 type progResult struct {
 	out, ovf int64
 	counters []int64 // the accumulate steps' row counters, in program order
-	sel      []int64 // POpEmitRow's selection
+	sel      []int64 // POpEmitRow's selection, or POpEmitVal's values
 }
 
 // interpProgram runs insns the way their contract says, in Go: the reference
@@ -154,6 +154,9 @@ func interpProgram(insns []ProgInsn, cols [][]int64, n int, regs []int64) progRe
 			case POpEmitRow:
 				sel = append(sel, int64(row-n))
 				acc++
+			case POpEmitVal:
+				sel = append(sel, regs[in.A])
+				acc++
 			default:
 				panic(fmt.Sprintf("interpProgram: op %d", in.Op))
 			}
@@ -170,7 +173,7 @@ func randProgram(rng *rand.Rand, nCols int) []ProgInsn {
 	reg := func() int { return rng.Intn(12) }
 	tmp := func() int { return rng.Intn(8) }
 	conds := []Cond{CondE, CondNE, CondL, CondGE, CondLE, CondG}
-	accKind := []POp{POpAccCount, POpAccSum, POpAccMin, POpAccMax, POpEmitRow}[rng.Intn(5)]
+	accKind := []POp{POpAccCount, POpAccSum, POpAccMin, POpAccMax, POpEmitRow, POpEmitVal}[rng.Intn(6)]
 	counter := 12 // the accumulate's row counter, outside every other range
 	// A quarter of the programs are only conditions and their tests, the
 	// shape the condition fusion takes whole.
@@ -237,6 +240,8 @@ func randProgram(rng *rand.Rand, nCols int) []ProgInsn {
 	switch accKind {
 	case POpAccSum, POpAccMin, POpAccMax:
 		p = append(p, ProgInsn{Op: accKind, A: reg(), B: counter})
+	case POpEmitVal:
+		p = append(p, ProgInsn{Op: accKind, A: reg()})
 	default:
 		p = append(p, ProgInsn{Op: accKind})
 	}
@@ -338,7 +343,7 @@ func TestFusionMatchesUnfused(t *testing.T) {
 			}
 			kern.Call2(args)
 			r := progResult{out: out, ovf: b2int(ovf != 0), counters: []int64{regs[12]}}
-			if insns[len(insns)-1].Op == POpEmitRow {
+			if op := insns[len(insns)-1].Op; op == POpEmitRow || op == POpEmitVal {
 				r.sel = sel[:out]
 			}
 			return r
@@ -347,7 +352,7 @@ func TestFusionMatchesUnfused(t *testing.T) {
 		want := interpProgram(insns, cols, n, regs)
 		want.ovf = b2int(want.ovf != 0)
 		want.counters = []int64{regs[12]}
-		if insns[len(insns)-1].Op != POpEmitRow {
+		if op := insns[len(insns)-1].Op; op != POpEmitRow && op != POpEmitVal {
 			want.sel = nil
 		}
 		if len(Fuse(insns)) < len(insns) {

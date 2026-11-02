@@ -335,15 +335,19 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			w.I64(1)
 			w.op(opI64Add)
 			w.Set(acc)
-		case POpEmitRow:
-			// Sel[acc] = idx; acc++.
+		case POpEmitRow, POpEmitVal:
+			// Sel[acc] = idx, or r[A]; acc++.
 			w.LoadPtr(POffSel)
 			w.Get(acc)
 			w.op(opI32WrapI64)
 			w.I32(3)
 			w.op(opI32Shl)
 			w.op(opI32Add)
-			w.Get(idx)
+			if in.Op == POpEmitVal {
+				loadReg(in.A)
+			} else {
+				w.Get(idx)
+			}
 			w.StoreI64(0)
 			w.Get(acc)
 			w.I64(1)

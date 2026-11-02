@@ -6,7 +6,10 @@
 // number of distinct rows.
 package engine
 
-import "math"
+import (
+	"bytes"
+	"math"
+)
 
 // vdbeDistinctSet is the DISTINCT opcode's ephemeral tracker: every unique
 // dedup key seen so far, in first-seen order (irrelevant to membership, kept
@@ -102,6 +105,38 @@ func distinctHash(v Value, coll string) uint64 {
 		return 2 ^ fnvBytes(v.S, nocase, rtrim)
 	}
 	return 5
+}
+
+// aggDistinctHash hashes v so that values compareValuesCollatedEnc calls equal
+// under coll in encoding enc hash alike, the comparison an aggregate's DISTINCT
+// dedups by. It follows collatedTextCompareEnc: NOCASE compares the UTF-8
+// bytes up to the first NUL and then the lengths, and BINARY in a UTF-16
+// database compares the code units nextUTF16Unit reads.
+func aggDistinctHash(v Value, coll string, enc TextEncoding) uint64 {
+	if v.Typ != Text {
+		return distinctHash(v, "")
+	}
+	s := v.S
+	switch {
+	case asciiEqualFold(coll, "NOCASE"):
+		n := len(s)
+		if i := bytes.IndexByte(s, 0); i >= 0 {
+			s = s[:i]
+		}
+		return 2 ^ fnvBytes(s, true, false) ^ mix64(uint64(n))
+	case asciiEqualFold(coll, "RTRIM"):
+		s = rtrimTrailingSpaces(s)
+	}
+	if !isUTF16(enc) {
+		return 2 ^ fnvBytes(s, false, false)
+	}
+	h := uint64(14695981039346656037)
+	for len(s) > 0 {
+		u, n := nextUTF16Unit(s)
+		h = (h ^ uint64(u)) * 1099511628211
+		s = s[n:]
+	}
+	return 2 ^ h
 }
 
 func fnvBytes(b []byte, fold, rtrim bool) uint64 {

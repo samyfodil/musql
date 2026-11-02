@@ -158,6 +158,16 @@ func (src *segProgSource) lower(kinds *segKinds) ([]*segLowered, bool) {
 		// A REAL argument, which may be NULL (a NaN), accumulates in FAcc.
 		isReal := a.kind != aggCountStar && low.real[argReg]
 		switch {
+		case a.distinct && a.kind != aggMin && a.kind != aggMax:
+			// The distinct values are found in Go from the arguments the
+			// program hands back (segDistinctAnswer), as integers. A DISTINCT
+			// min or max is the plain one.
+			if isReal {
+				return nil, false
+			}
+			low.nRegs--
+			low.distinct = true
+			low.add(jit.ProgInsn{Op: jit.POpEmitVal, A: argReg})
 		case a.kind == aggCountStar || (a.kind == aggCount && !isReal):
 			// count(x) is the row count: segCleanInt64Column refuses a column
 			// with a NULL bitmap or an exception, so every value the program
@@ -185,12 +195,12 @@ func (src *segProgSource) lower(kinds *segKinds) ([]*segLowered, bool) {
 			// The same accumulate, on the same registers, in the text variant;
 			// its own row counter sits past its own registers.
 			acc := low.insns[len(low.insns)-1]
-			if a.kind != aggCountStar && a.kind != aggCount {
+			if a.kind != aggCountStar && a.kind != aggCount && !low.distinct {
 				acc.B = tv.nRegs
 				tv.nRegs++
 				tv.sumReg, tv.rowsReg = low.sumReg, acc.B
 			}
-			tv.agg, tv.fAcc = low.agg, low.fAcc
+			tv.agg, tv.fAcc, tv.distinct = low.agg, low.fAcc, low.distinct
 			tv.add(acc)
 		}
 		lows = append(lows, low)
@@ -204,8 +214,9 @@ func (src *segProgSource) lower(kinds *segKinds) ([]*segLowered, bool) {
 // The per-item checks are segPlanSoleAgg's, applied to every item instead of
 // insisting there be one: no bare group column and no hoist (both read the
 // group's ANCHOR ROW, which these opcodes never touch), exactly one template,
-// no DISTINCT, no separator. The plan-wide checks -- one scope, no HAVING, no
-// ORDER BY, no anchor -- still have to hold once.
+// no separator. DISTINCT is allowed: segProgPeephole hands its values back to
+// Go. The plan-wide checks -- one scope, no HAVING, no ORDER BY, no anchor --
+// still have to hold once.
 func segPlanAggs(plan *aggPlan, n int) []*aggItem {
 	if plan == nil || len(plan.scopes) != 1 || len(plan.outPlans) != n ||
 		plan.havingPlan != nil || len(plan.orderPlans) != 0 || plan.anchorCheck != nil {
@@ -217,7 +228,7 @@ func segPlanAggs(plan *aggPlan, n int) []*aggItem {
 			return nil
 		}
 		a := item.aggTemplates[0]
-		if a == nil || a.distinct || a.sepExpr != nil {
+		if a == nil || a.sepExpr != nil {
 			return nil
 		}
 		out = append(out, a)
