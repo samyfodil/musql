@@ -34,6 +34,13 @@ func runFir(k *Code, xs, ys []float64) ([]float64, []bool) {
 	return out, ex
 }
 
+// firNeeds reports whether f needs an instruction this CPU lacks.
+func firNeeds(f *fir.Func) bool {
+	round := firHasOp(f.Body, fir.OpRoundEven) || firHasOp(f.Body, fir.OpFloor) || firHasOp(f.Body, fir.OpCeil) ||
+		firHasOp(f.Body, fir.OpTrunc)
+	return !cpuFeat.fma && firHasOp(f.Body, fir.OpFMA) || !cpuFeat.round && round
+}
+
 func firInputs(name string, n int) []float64 {
 	r := rand.New(rand.NewPCG(3, uint64(len(name))))
 	xs := make([]float64, 0, n)
@@ -72,6 +79,10 @@ func TestFirKernels(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if firNeeds(f) {
+				t.Logf("fused=%v %s: not on this CPU", fused, name)
+				continue
+			}
 			k, err := firLoop(f, 0)
 			if err != nil {
 				t.Fatalf("%s: %v", name, err)
@@ -101,6 +112,10 @@ func TestFirKernels(t *testing.T) {
 			f, err := libm.Build2(name)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if firNeeds(f) {
+				t.Logf("fused=%v %s: not on this CPU", fused, name)
+				continue
 			}
 			k, err := firLoop(f, 0)
 			if err != nil {
