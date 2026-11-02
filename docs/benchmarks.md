@@ -192,6 +192,49 @@ Point lookups are DuckDB's weak spot and C SQLite's strength.
 
 Run with `MUSQL_WORKERS=4` for the four-worker column.
 
+## Reported queries (issues #69 to #74)
+
+The queries users reported as slow in issues #69 to #74, as they wrote them,
+after #89. All were measured on one Apple M4, in the same hour. musql runs
+through `database/sql`, best of three. C SQLite is the macOS `sqlite3` 3.51
+shell with `.timer on`, best of three. "Before" is main just before #89.
+
+`t` is the table the `create table` row makes, 10M rows. The sudoku queries are
+the ones in #70 and #74, each with its digits from a recursive CTE, `VALUES` or
+`generate_series`.
+
+| issue | query | before | after | C SQLite |
+| --- | --- | ---: | ---: | ---: |
+| #73 | `select count(*) from generate_series(1,1000000)` | 40.2 ms | 0.6 ms | 7 ms |
+| #73 | `select count(*) from generate_series(1,1000)a,generate_series(1,1000)b` | 22.2 ms | 0.7 ms | 6 ms |
+| #73 | `select sum((a.value-1)*1000+b.value)from generate_series(1,1000)a,generate_series(1,1000)b` | 65.3 ms | 5.6 ms | 24 ms |
+| #73 | `select sum(value)from generate_series(1,1000000)` | 53.2 ms | 1.8 ms | 11 ms |
+| #69 | `select count(*) from generate_series(1,10000000)` | 400.5 ms | 3.6 ms | 59 ms |
+| #69 | `select sum(value) s FROM generate_series(1, 10000000)` | 534.2 ms | 10.3 ms | 115 ms |
+| #69 | `SELECT s id, 'sum' name from(select sum(value) s FROM generate_series(1, 10000000) )` | 534.0 ms | 10.1 ms | 114 ms |
+| #69 | `create table t as select value%7 a,value%11 b,value i from generate_series(1,10000000)` | 2912 ms | 531 ms | 696 ms |
+| #69 | `select a,sum(i) from t group by a` | 13.2 ms | 13.2 ms | 1413 ms |
+| #69 | `select count(*) from t` | <0.1 ms | <0.1 ms | 21 ms |
+| #69 | `select distinct a from t` | 12.3 ms | 12.2 ms | 244 ms |
+| #69 | `select sum(i) s from t` | 2.6 ms | 2.7 ms | 181 ms |
+| #69 | `select sum(log(i)) from t` | 46.4 ms | 45.6 ms | 260 ms |
+| #71 | `select a,sum(i) from t group by a+1` | 1663 ms | 20.0 ms | 1667 ms |
+| #71 | `select a+1,sum(i) from t group by a+1` | 1757 ms | 16.7 ms | 1679 ms |
+| #71 | `select a+1,sum(i) from t group by a` | 12.4 ms | 12.7 ms | 1413 ms |
+| #72 | `select sum(distinct round(value/1.5))from generate_series(1,10000)` | 1.7 ms | 0.1 ms | 0.7 ms [1] |
+| #72 | the same over `generate_series(1,100000)` | 15.1 ms | 1.0 ms | 7 ms |
+| #72 | the same over `generate_series(1,1000000)` | 162.3 ms | 12.2 ms | 68 ms |
+| #74 | sudoku, digits from a recursive CTE | 88.8 ms | 18.5 ms | 38 ms |
+| #74 | sudoku, digits from `VALUES` | 100.2 ms | 18.7 ms | 35 ms |
+| #74 | sudoku, digits from `generate_series` | 92.1 ms | 18.5 ms | 40 ms |
+| #70 | the harder sudoku | 7.33 s | 1.48 s | 2.88 s |
+
+[1] The shell's 1 ms timer reads 0 for one run of this query. Its time is from
+1,000 runs, less the shell's own cost per statement.
+
+On the Xeon D the sudoku takes about 70 ms against C SQLite's 99 ms (mattn), and
+the harder one 5.9 s against 7.9 s.
+
 ## Bulk load and point reads
 
 `bench/pointread` measures what an application does with a key-value table,
