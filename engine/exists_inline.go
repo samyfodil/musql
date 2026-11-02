@@ -69,7 +69,7 @@ func existsInlinable(sub *Program) bool {
 				return false
 			}
 		case OpOpenDerived:
-			if ds, ok := in.P4.(*derivedSource); !ok || !existsInlinableSource(ds) {
+			if ds, ok := in.P4.(*derivedSource); !ok || !derivedReadsSameRows(ds) {
 				return false
 			}
 		}
@@ -77,13 +77,13 @@ func existsInlinable(sub *Program) bool {
 	return true
 }
 
-// existsInlinableSource reports whether a derived source the body opens reads
-// the same rows wherever it runs: a CTE, which resolveCTERows reads without
-// the outer row, or an uncorrelated subquery or recursive CTE materialized
-// once a statement, each with a body that is deterministic. The parent's slot
-// then keeps the rows across the body's runs, as each run of the sub-program
-// would have found them again.
-func existsInlinableSource(ds *derivedSource) bool {
+// derivedReadsSameRows reports whether a derived source an inlined body opens
+// reads the same rows wherever it runs: a CTE, which resolveCTERows reads
+// without the outer row, or an uncorrelated subquery or recursive CTE
+// materialized once a statement, each with a body that is deterministic. The
+// parent's slot then keeps the rows across the body's runs, as each run of
+// the sub-program would have found them again.
+func derivedReadsSameRows(ds *derivedSource) bool {
 	if ds.rerun || ds.vtab != nil || ds.recSelf != nil || ds.catalogScope != scopeAny || ds.vtabWrite != nil ||
 		ds.upfrom != nil || ds.viewUpfrom != nil {
 		return false
