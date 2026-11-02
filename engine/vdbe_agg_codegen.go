@@ -1948,7 +1948,7 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// can serve. A reference to a GROUP BY key column is allowed: each bucket holds
 	// a full aggAccumulators and magnetWalk runs per bucket in scan order.
 	if !useDistinctBatch && (!hasOrder || orderIsGroupKeyAscending(stmt, gp)) &&
-		!gp.usesGroupBare && !gp.selectHasSubquery &&
+		!gp.selectHasSubquery &&
 		!joinHasCoalescedColumns(plan.scopes) &&
 		!anyNonBinaryCollation(gp.groupColls) && !scanOrderGroups {
 		return compileScanGroupByHash(c, stmt, srcs, gp, plan, savedNQueryLoopKnown)
