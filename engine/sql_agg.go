@@ -248,7 +248,7 @@ type aggItem struct {
 	// index plus one, and each entry's previous one), so a probe compares only
 	// values that hash alike; scanning all of seen made sum(DISTINCT x)
 	// quadratic.
-	seenHead map[uint64]int
+	seenHead hashIndex
 	seenNext []int
 
 	// argColl caches the collating sequence of the aggregate's ARGUMENT --
@@ -868,17 +868,13 @@ func planAggregateCallKind(fc FuncExpr) (*aggItem, error) {
 // Two NULLs are equal, as compareValuesCollatedEnc has them.
 func (it *aggItem) distinctSeen(v Value, coll string, enc TextEncoding) (Value, bool) {
 	h := aggDistinctHash(v, coll, enc)
-	for i := it.seenHead[h]; i > 0; i = it.seenNext[i-1] {
+	for i := it.seenHead.get(h); i > 0; i = it.seenNext[i-1] {
 		if s := it.seen[i-1]; compareValuesCollatedEnc(v, s, coll, enc) == 0 {
 			return s, true
 		}
 	}
-	if it.seenHead == nil {
-		it.seenHead = make(map[uint64]int)
-	}
-	it.seenNext = append(it.seenNext, it.seenHead[h])
 	it.seen = append(it.seen, v)
-	it.seenHead[h] = len(it.seen)
+	it.seenNext = append(it.seenNext, it.seenHead.swap(h, len(it.seen)))
 	return Value{}, false
 }
 

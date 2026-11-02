@@ -35,3 +35,36 @@ func TestAggDistinctHashAgrees(t *testing.T) {
 		}
 	}
 }
+
+// TestAggDistinctColumnarAgrees pins the DISTINCT aggregates the program JIT
+// serves -- over a VACUUMed table, so its rows are segments -- against the
+// oracle, beside a delta, and where the loop answers instead: a NULL column,
+// and a sum whose magnitude may overflow.
+func TestAggDistinctColumnarAgrees(t *testing.T) {
+	setup := []string{
+		"CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, n INTEGER, big INTEGER)",
+		"INSERT INTO t SELECT x, x % 10, (x * 7919) % 501 - 250, CASE WHEN x % 41 = 0 THEN NULL ELSE x % 50 END, 9223372036854775807 - x % 3 " +
+			"FROM (WITH RECURSIVE s(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM s WHERE x < 5000) SELECT x FROM s)",
+		"VACUUM",
+	}
+	delta := []string{"INSERT INTO t VALUES(9001, 1, 9999, 1, 1)", "UPDATE t SET v = v + 1000 WHERE id % 97 = 0", "DELETE FROM t WHERE id % 89 = 0"}
+	queries := []string{
+		"SELECT count(DISTINCT v), sum(DISTINCT v), total(DISTINCT v), avg(DISTINCT v) FROM t",
+		"SELECT min(DISTINCT v), max(DISTINCT v), count(DISTINCT k) FROM t",
+		"SELECT count(DISTINCT v % 7), sum(DISTINCT k * 3) FROM t WHERE v > 0",
+		"SELECT count(DISTINCT id), sum(DISTINCT id) FROM t WHERE k < 3",
+		"SELECT sum(DISTINCT v), count(DISTINCT v) FROM t WHERE v > 100000",
+		"SELECT count(DISTINCT n), sum(DISTINCT n) FROM t",
+		"SELECT sum(DISTINCT big) FROM t",
+		"SELECT avg(DISTINCT big), total(DISTINCT big) FROM t",
+	}
+	for _, withDelta := range []bool{false, true} {
+		for _, q := range queries {
+			stmts := append([]string(nil), setup...)
+			if withDelta {
+				stmts = append(stmts, delta...)
+			}
+			aggOrderCheck(t, aggOrderCase{q, append(stmts, q), true})
+		}
+	}
+}

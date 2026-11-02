@@ -311,6 +311,13 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.MovRegMem(RAX, RDI, POffSel)
 			a.MovMemIdxReg(RAX, R8, RCX)
 			a.IncReg(R8)
+		case POpEmitVal:
+			// Sel[acc] = r[A]; acc++. The value may be in RAX, so the base
+			// goes in RDX.
+			x := val(in.A, RAX)
+			a.MovRegMem(RDX, RDI, POffSel)
+			a.MovMemIdxReg(RDX, R8, x)
+			a.IncReg(R8)
 		case POpAccMin, POpAccMax:
 			x := val(in.A, RAX)
 			a.CmpRegReg(R8, x)

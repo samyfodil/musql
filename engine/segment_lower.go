@@ -32,6 +32,9 @@ type segLowered struct {
 	agg     aggKind
 	sumReg  int
 	rowsReg int // counts matched rows; sum()/avg() answer NULL at 0
+	// distinct: the program hands back each row's argument (POpEmitVal) for a
+	// DISTINCT aggregate, which segRunOne finishes from the distinct values.
+	distinct bool
 	// blocks are the service blocks the body stops for (segment_service.go),
 	// indexed by POpService's A; none when the whole body is native.
 	blocks []segSvcBlock

@@ -18,8 +18,9 @@ type segProgPlan struct {
 // The per-item checks are segPlanSoleAgg's, applied to every item instead of
 // insisting there be one: no bare group column and no hoist (both read the
 // group's ANCHOR ROW, which these opcodes never touch), exactly one template,
-// no DISTINCT, no separator. The plan-wide checks -- one scope, no HAVING, no
-// ORDER BY, no anchor -- still have to hold once.
+// no separator. DISTINCT is allowed: segProgPeephole hands its values back to
+// Go. The plan-wide checks -- one scope, no HAVING, no ORDER BY, no anchor --
+// still have to hold once.
 func segPlanAggs(plan *aggPlan, n int) []*aggItem {
 	if plan == nil || len(plan.scopes) != 1 || len(plan.outPlans) != n ||
 		plan.havingPlan != nil || len(plan.orderPlans) != 0 || plan.anchorCheck != nil {
@@ -31,7 +32,7 @@ func segPlanAggs(plan *aggPlan, n int) []*aggItem {
 			return nil
 		}
 		a := item.aggTemplates[0]
-		if a == nil || a.distinct || a.sepExpr != nil {
+		if a == nil || a.sepExpr != nil {
 			return nil
 		}
 		out = append(out, a)
@@ -179,16 +180,23 @@ func segProgPeephole(prog *Program) bool {
 		rowsReg := low.nRegs
 		low.nRegs++
 		low.sumReg, low.rowsReg = argReg, rowsReg
-		switch a.kind {
-		case aggCountStar, aggCount:
+		switch {
+		case a.distinct && a.kind != aggMin && a.kind != aggMax:
+			// The distinct values are found in Go from the arguments the
+			// program hands back (segDistinctAnswer). A DISTINCT min or max is
+			// the plain one.
+			low.nRegs--
+			low.distinct = true
+			low.add(jit.ProgInsn{Op: jit.POpEmitVal, A: argReg})
+		case a.kind == aggCountStar || a.kind == aggCount:
 			// count(x) is the row count: segCleanInt64Column refuses a column
 			// with a NULL bitmap or an exception, so every value the program
 			// sees is non-NULL and countStep (func.c:1970) steps on every one.
 			low.nRegs--
 			low.add(jit.ProgInsn{Op: jit.POpAccCount})
-		case aggMin:
+		case a.kind == aggMin:
 			low.add(jit.ProgInsn{Op: jit.POpAccMin, A: argReg, B: rowsReg})
-		case aggMax:
+		case a.kind == aggMax:
 			low.add(jit.ProgInsn{Op: jit.POpAccMax, A: argReg, B: rowsReg})
 		default:
 			low.add(jit.ProgInsn{Op: jit.POpAccSum, A: argReg, B: rowsReg})
@@ -197,12 +205,12 @@ func segProgPeephole(prog *Program) bool {
 			// The same accumulate, on the same registers, in the text variant;
 			// its own row counter sits past its own registers.
 			acc := low.insns[len(low.insns)-1]
-			if a.kind != aggCountStar && a.kind != aggCount {
+			if acc.Op == jit.POpAccSum || acc.Op == jit.POpAccMin || acc.Op == jit.POpAccMax {
 				acc.B = tv.nRegs
 				tv.nRegs++
 				tv.sumReg, tv.rowsReg = low.sumReg, acc.B
 			}
-			tv.agg = low.agg
+			tv.agg, tv.distinct = low.agg, low.distinct
 			tv.add(acc)
 		}
 		lows = append(lows, low)
