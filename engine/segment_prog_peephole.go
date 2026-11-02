@@ -31,6 +31,10 @@ type segProgSource struct {
 	aggs                []*aggItem
 	cols                []int // the table columns the body loads
 	params              []int // the parameters it reads
+	// series is a loop over generate_series (segment_series.go), whose one
+	// INTEGER column comes in blocks, so a body reading nothing still has rows
+	// to count.
+	series bool
 }
 
 // forKinds is the plan's programs for kinds, lowered on first use.
@@ -50,7 +54,7 @@ func (p *segProgPlan) forKinds(kinds *segKinds) []*segLowered {
 // segProgPlanFor is the plan for a loop whose body feeds the AggStep at
 // aggAt, or nil when its aggregates are not ones a program computes or the
 // body lowers for no kinds of column.
-func segProgPlanFor(body []Instruction, base, cursor, aggAt int, plan *aggPlan, nAgg int) *segProgPlan {
+func segProgPlanFor(body []Instruction, base, cursor, aggAt int, plan *aggPlan, nAgg int, series bool) *segProgPlan {
 	aggs := segPlanAggs(plan, nAgg)
 	if aggs == nil {
 		return nil
@@ -87,7 +91,7 @@ func segProgPlanFor(body []Instruction, base, cursor, aggAt int, plan *aggPlan, 
 			}
 		}
 	}
-	src := &segProgSource{body: body, base: base, cursor: cursor, aggAt: aggAt, aggs: aggs}
+	src := &segProgSource{body: body, base: base, cursor: cursor, aggAt: aggAt, aggs: aggs, series: series}
 	seen := map[int]bool{}
 	for _, in := range body {
 		switch {
@@ -99,6 +103,9 @@ func segProgPlanFor(body []Instruction, base, cursor, aggAt int, plan *aggPlan, 
 		}
 	}
 	lows, ok := src.lower(nil)
+	if !ok && series {
+		return nil
+	}
 	if !ok {
 		// Lowering may need REAL columns: a REAL literal compared with one.
 		// Which columns are REAL is for the segments to say when it runs.
@@ -121,7 +128,7 @@ func (src *segProgSource) lower(kinds *segKinds) ([]*segLowered, bool) {
 	// aggregate gets a copy with its own terminal op. N aggregates are N passes
 	// over the same int64 blocks, which is the trade segRunProgramAll explains.
 	base, okLow := segLowerBody(src.body, src.base, src.cursor, src.aggAt, kinds)
-	if !okLow || (len(base.cols) == 0 && len(base.blocks) == 0) {
+	if !okLow || (len(base.cols) == 0 && len(base.blocks) == 0 && !src.series) {
 		return nil, false
 	}
 	// Each aggregate's argument is read by the accumulate appended below,
@@ -242,7 +249,11 @@ func segProgPeephole(prog *Program) bool {
 		return false
 	}
 	in := prog.Insns
-	if len(in) < 9 || in[0].Op != OpInit || in[1].Op != OpAggReset || in[2].Op != OpOpenRead {
+	if len(in) < 9 || in[0].Op != OpInit || in[1].Op != OpAggReset {
+		return false
+	}
+	series := segSeriesOpen(in[2])
+	if in[2].Op != OpOpenRead && !series {
 		return false
 	}
 	rewindAt := 3
@@ -298,7 +309,10 @@ func segProgPeephole(prog *Program) bool {
 		return false
 	}
 	cursor := in[rewindAt].P1
-	pplan := segProgPlanFor(in[rewindAt+1:aggAt], rewindAt+1, cursor, aggAt, plan, nAgg)
+	if series && in[2].P1 != cursor {
+		return false
+	}
+	pplan := segProgPlanFor(in[rewindAt+1:aggAt], rewindAt+1, cursor, aggAt, plan, nAgg, series)
 	if pplan == nil {
 		return false
 	}

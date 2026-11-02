@@ -159,6 +159,48 @@ func readsVirtual(cols []columnInfo, read []int) bool {
 	return false
 }
 
+// segProgRegs is low's register file with the statement's bound parameters
+// in place, or false when one is not a value the program can hold.
+func (m *vdbe) segProgRegs(low *segLowered) ([]int64, bool) {
+	nRegs := low.nRegs
+	if low.textVar != nil {
+		nRegs = max(nRegs, low.textVar.nRegs)
+	}
+	regs := make([]int64, nRegs+2)
+	// Bound parameters go into the registers the body reads them from. A
+	// non-integer bound declines: every value in a compiled program is an
+	// int64, and coercing here is exactly where SQLite's cross-class ordering
+	// would be got wrong.
+	for i, reg := range low.consts {
+		idx := low.cvIndex[i]
+		if idx < 1 || idx > len(m.params) || reg >= len(regs) {
+			return nil, false
+		}
+		v := m.params[idx-1]
+		if low.real[reg] {
+			if v.Typ != Float {
+				return nil, false
+			}
+			regs[reg] = int64(math.Float64bits(v.F))
+			continue
+		}
+		if v.Typ != Int {
+			return nil, false
+		}
+		regs[reg] = v.I
+	}
+	// An INTEGER a REAL comparison reads as a double must be one exactly.
+	for _, idx := range low.exactParams {
+		if idx < 1 || idx > len(m.params) {
+			return nil, false
+		}
+		if v := m.params[idx-1]; v.Typ != Int || v.I > 1<<53 || v.I < -(1<<53) {
+			return nil, false
+		}
+	}
+	return regs, low.seedSorted(regs, m.params)
+}
+
 func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, low *segLowered, ipkCol int) (Value, bool) {
 	if p == nil || p.segs == nil || low == nil {
 		return Value{}, false
@@ -188,44 +230,8 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 	if kern == nil {
 		return Value{}, false
 	}
-
-	nRegs := low.nRegs
-	if low.textVar != nil {
-		nRegs = max(nRegs, low.textVar.nRegs)
-	}
-	regs := make([]int64, nRegs+2)
-	// Bound parameters go into the registers the body reads them from. A
-	// non-integer bound declines: every value in a compiled program is an
-	// int64, and coercing here is exactly where SQLite's cross-class ordering
-	// would be got wrong.
-	for i, reg := range low.consts {
-		idx := low.cvIndex[i]
-		if idx < 1 || idx > len(m.params) || reg >= len(regs) {
-			return Value{}, false
-		}
-		v := m.params[idx-1]
-		if low.real[reg] {
-			if v.Typ != Float {
-				return Value{}, false
-			}
-			regs[reg] = int64(math.Float64bits(v.F))
-			continue
-		}
-		if v.Typ != Int {
-			return Value{}, false
-		}
-		regs[reg] = v.I
-	}
-	// An INTEGER a REAL comparison reads as a double must be one exactly.
-	for _, idx := range low.exactParams {
-		if idx < 1 || idx > len(m.params) {
-			return Value{}, false
-		}
-		if v := m.params[idx-1]; v.Typ != Int || v.I > 1<<53 || v.I < -(1<<53) {
-			return Value{}, false
-		}
-	}
-	if !low.seedSorted(regs, m.params) {
+	regs, ok := m.segProgRegs(low)
+	if !ok {
 		return Value{}, false
 	}
 
@@ -425,6 +431,12 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 	if !ok {
 		return Value{}, false
 	}
+	return segProgAnswer(low, results, facc)
+}
+
+// segProgAnswer folds the runs' results, in row order, into the aggregate's
+// value.
+func segProgAnswer(low *segLowered, results []segRunResult, facc [2]float64) (Value, bool) {
 	if low.distinct {
 		return segDistinctAnswer(low.agg, results)
 	}
