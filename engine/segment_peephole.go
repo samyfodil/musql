@@ -246,7 +246,7 @@ func segPeephole(prog *Program) bool {
 	dst := in[end-3].P1
 	var fallback *segProgPlan
 	if len(semis) == 0 && len(insubs) == 0 && len(likes) == 0 {
-		fallback = segProgPlanFor(in[rewindAt+1:aggAt], rewindAt+1, in[rewindAt].P1, aggAt, plan, 1, false)
+		fallback = segProgPlanFor(in[rewindAt+1:aggAt], rewindAt+1, in[rewindAt].P1, aggAt, plan, 1, nil)
 	}
 	out := make([]Instruction, 0, len(in)+4)
 	out = append(out, in[0], in[1], in[2])

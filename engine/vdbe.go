@@ -2761,7 +2761,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpSegProgram:
 			pplan, okPlan := op.P4.(*segProgPlan)
-			series := okPlan && pplan.src != nil && pplan.src.series
+			series := okPlan && pplan.src != nil && pplan.src.series != nil
 			if !okPlan || (m.pager == nil && !series) {
 				return nil, fmt.Errorf("vdbe: OpSegProgram without a plan")
 			}
@@ -2772,7 +2772,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			var vs []Value
 			var served bool
 			if series {
-				vs, served = m.segRunSeries(cur, pplan)
+				vs, served = m.segRunSeries(pplan)
 			} else {
 				vs, served = m.segRunProgramAll(cur.pager, cur.tbl, pplan)
 			}
