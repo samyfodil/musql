@@ -309,6 +309,15 @@ type vdbe struct {
 	// the whole chain of co-routines that produce them. nil outside such a
 	// chain. See streamSink.
 	sink *streamSink
+
+	// holder is, for a read co-routine, the machine whose result rows keep
+	// what this one yields (streamHolder); nil when a machine on the chain
+	// gathers every row instead. heldBytes counts what this machine's result
+	// rows hold, once countHeld is set by an unbounded recursive CTE beneath
+	// it (recQueueCaps).
+	holder    *vdbe
+	countHeld bool
+	heldBytes int64
 }
 
 // runSub is the subquery opcodes' shared dispatcher: an uncorrelated subquery
@@ -1409,6 +1418,11 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			next, n := jx.enter(m, pc, &rows)
 			pc = next
+			if m.countHeld {
+				for _, r := range rows[before:] {
+					m.heldBytes += recursiveRowFootprint(r)
+				}
+			}
 			if jx.updAt >= 0 {
 				// The rows are an UPDATE's records (gatherUpdate), stored now,
 				// before the VDBE runs anything. A row handed over alone (n)
@@ -1451,6 +1465,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				row = m.recAlloc(n) // the n Values at the head of the chunk, which hold the row
 			}
 			rows = append(rows, row)
+			if m.countHeld {
+				m.heldBytes += recursiveRowFootprint(row)
+			}
 			if m.yield {
 				m.resumePC = pc
 				return rows, nil
@@ -1603,6 +1620,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			copy(row, m.regs[op.P1:op.P1+op.P2])
 			rows = append(rows, row)
+			if m.countHeld {
+				m.heldBytes += recursiveRowFootprint(row)
+			}
 			if m.maxRows > 0 && len(rows) >= m.maxRows {
 				return rows, nil
 			}
@@ -1618,6 +1638,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				return nil, fmt.Errorf("vdbe: OpRecQueueOpen without a queue spec")
 			}
 			m.recq = newRecQueue(spec, m.encoding())
+			if m.holder != nil && spec.unbounded() {
+				m.holder.countHeld = true
+			}
 
 		case OpRecQueueFill:
 			if ferr := m.recQueueFill(op); ferr != nil {
@@ -2273,7 +2296,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			if m.streamsDerived(ds, insns) {
 				// A co-routine rather than a materialization: see subStream
 				// (vdbe_stream.go) and derivedSource.stream.
-				m.cursors[op.P1] = openStreamCursor(ds.tbl, m.newSubStream(ds, srcPager))
+				m.cursors[op.P1] = openStreamCursor(ds.tbl, m.newSubStream(ds, srcPager, insns))
 				break
 			}
 			if ds.rerun && ds.upfrom == nil && ds.viewUpfrom == nil && srcPager == m.pager {
