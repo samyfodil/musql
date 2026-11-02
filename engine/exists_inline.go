@@ -46,7 +46,7 @@ func existsInlinePeephole(prog *Program) {
 // can relocate.
 func existsInlinable(sub *Program) bool {
 	if sub == nil || sub.Compound != nil || sub.LiveSource != nil ||
-		sub.NSorters != 0 || sub.NDistinct != 0 || sub.NRecRegs != 0 || sub.NSubCache != 0 ||
+		sub.NSorters != 0 || sub.NDistinct != 0 || sub.NRecRegs != 0 ||
 		len(sub.Insns) == 0 || sub.Insns[0].Op != OpInit {
 		return false
 	}
@@ -63,6 +63,66 @@ func existsInlinable(sub *Program) bool {
 			if in.P4 != nil {
 				return false // a row-filter plan: not read here, so not relocated
 			}
+		case OpFunction:
+			// These two read the machine they run on, which inlining changes.
+			if name, isName := in.P4.(string); isName && (name == "rtreecheck" || name == "vec1_config") {
+				return false
+			}
+		case OpOpenDerived:
+			if ds, ok := in.P4.(*derivedSource); !ok || !existsInlinableSource(ds) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// existsInlinableSource reports whether a derived source the body opens reads
+// the same rows wherever it runs: a CTE, which resolveCTERows reads without
+// the outer row, or an uncorrelated subquery or recursive CTE materialized
+// once a statement, each with a body that is deterministic. The parent's slot
+// then keeps the rows across the body's runs, as each run of the sub-program
+// would have found them again.
+func existsInlinableSource(ds *derivedSource) bool {
+	if ds.rerun || ds.vtab != nil || ds.recSelf != nil || ds.catalogScope != scopeAny || ds.vtabWrite != nil ||
+		ds.upfrom != nil || ds.viewUpfrom != nil {
+		return false
+	}
+	switch {
+	case ds.cte != nil && ds.prog == nil:
+		return !selectCallsNondeterministicFunc(ds.cte.binding.core)
+	case ds.prog != nil && ds.cte == nil:
+		return !ds.prog.Correlated && (ds.stmtOnce || ds.cteOnce) && progDeterministic(ds.prog, map[*Program]bool{})
+	}
+	return false
+}
+
+// progDeterministic reports whether prog, and every program it runs, calls
+// no function that may answer differently on another run.
+func progDeterministic(prog *Program, seen map[*Program]bool) bool {
+	if seen[prog] {
+		return true
+	}
+	seen[prog] = true
+	for _, in := range prog.Insns {
+		switch p4 := in.P4.(type) {
+		case *Program:
+			if !progDeterministic(p4, seen) {
+				return false
+			}
+		case *derivedSource:
+			if p4.prog != nil && !progDeterministic(p4.prog, seen) ||
+				p4.cte != nil && selectCallsNondeterministicFunc(p4.cte.binding.core) {
+				return false
+			}
+		case *ScalarFunction:
+			if in.Op == OpFunction {
+				return false
+			}
+		case string:
+			if in.Op == OpFunction && nonConstantFuncs[r33sFoldIdent(p4)] {
+				return false
+			}
 		}
 	}
 	return true
@@ -76,7 +136,8 @@ func existsInlineOperands(in Instruction) bool {
 		OpColumn, OpRowid, OpOuterColumn, OpOuterRowid,
 		OpInteger, OpVariable, OpNull, OpString8, OpReal, OpSCopy, OpCopy,
 		OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull,
-		OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpSeekRowidSetHint, OpAutoIndexOrder, OpResultRow:
+		OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpSeekRowidSetHint, OpAutoIndexOrder, OpResultRow,
+		OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpConcat, OpFunction, OpOpenDerived:
 		return true
 	}
 	return false
@@ -93,7 +154,7 @@ func existsInlineOperands(in Instruction) bool {
 func existsInline(prog *Program, at int, sub *Program) {
 	call := prog.Insns[at]
 	dest, not := call.P1, call.P3 != 0
-	regOff, curOff := prog.NReg, prog.NCursors
+	regOff, curOff, slotOff := prog.NReg, prog.NCursors, prog.NSubCache
 	retReg := prog.NReg + sub.NReg
 
 	base := len(prog.Insns)
@@ -156,6 +217,12 @@ func existsInline(prog *Program, at int, sub *Program) {
 			r.P1, r.P2 = reg(in.P1), jump(in.P2)
 		case OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpSeekRowidSetHint:
 			r.P1, r.P2 = cur(in.P1), reg(in.P2)
+		case OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpConcat:
+			r.P1, r.P2, r.P3 = reg(in.P1), reg(in.P2), reg(in.P3)
+		case OpFunction:
+			r.P1, r.P3 = reg(in.P1), reg(in.P3)
+		case OpOpenDerived:
+			r.P1, r.P2 = cur(in.P1), in.P2+slotOff
 		}
 		out = append(out, r)
 	}
@@ -172,4 +239,5 @@ func existsInline(prog *Program, at int, sub *Program) {
 	prog.Insns = out
 	prog.NReg += sub.NReg + 1
 	prog.NCursors += sub.NCursors
+	prog.NSubCache += sub.NSubCache
 }

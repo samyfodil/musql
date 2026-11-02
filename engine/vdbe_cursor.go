@@ -217,6 +217,9 @@ type vdbeCursor struct {
 	// sits inside the loop (wherecode.c:1550) and restarts the body each time
 	// the loop is entered. Set by OpOpenDerived for derivedSource.rerun.
 	refillEach bool
+	// slotFill marks a cursor openSlotFillCursor made, which reopening its slot
+	// resets in place: nothing but the slot holds it.
+	slotFill bool
 
 	// sub, when non-nil, makes this a DERIVED-table cursor whose rows come from
 	// a co-routine (openStreamCursor, vdbe_stream.go) rather than a
@@ -640,21 +643,41 @@ func clearDerivedSubtypes(row []Value, keep []bool) {
 // rowids shorter than rows (including nil, openDerivedCursor's case) pads
 // the remainder with 0, matching a plain derived table's rowid-less rows.
 func openMaterializedCursor(tbl *resolvedTable, rows [][]Value, rowids []int64) *vdbeCursor {
-	rids := make([]uint64, len(rows))
-	for i := range rids {
-		if i < len(rowids) {
-			rids[i] = uint64(rowids[i])
-		}
-	}
 	// The JSON subtype is deliberately NOT cleared here -- see openDerivedCursor
 	// above, which clears it for its own rows before delegating.
 	return &vdbeCursor{
 		tbl:          tbl,
 		rows:         rows,
-		rowids:       rids,
+		rowids:       materializedRowids(len(rows), rowids),
 		materialized: true,
 		colMask:      allColumns,
 	}
+}
+
+// materializedRowids is n rows' rowids as a materialized cursor holds them,
+// 0 past the end of rowids.
+func materializedRowids(n int, rowids []int64) []uint64 {
+	rids := make([]uint64, n)
+	for i := range rids {
+		if i < len(rowids) {
+			rids[i] = uint64(rowids[i])
+		}
+	}
+	return rids
+}
+
+// openSlotFillCursor is openFillCursor for a CTE's or a subquery's rows into
+// slot p, reusing the cursor p holds when it was one of these: a subroutine
+// that reads one again for every outer row (an EXISTS over it) allocated a
+// cursor each time.
+func (m *vdbe) openSlotFillCursor(p int, tbl *resolvedTable, fill func() ([][]Value, []int64, error), keep []bool) *vdbeCursor {
+	if cur := m.cursors[p]; cur != nil && cur.slotFill {
+		*cur = vdbeCursor{tbl: tbl, fill: fill, clearSubtypes: true, fillKeep: keep, colMask: allColumns, pos: -1, slotFill: true}
+		return cur
+	}
+	cur := openFillCursor(tbl, fill, true, keep)
+	cur.slotFill = true
+	return cur
 }
 
 // cursorHasNoBtree reports whether cur is a pre-materialized row source (a
@@ -815,8 +838,7 @@ func (cur *vdbeCursor) rewind() error {
 				derivedRealAffinity(row, cur.tbl)
 			}
 		}
-		m := openMaterializedCursor(cur.tbl, rows, rowids)
-		cur.rows, cur.rowids, cur.materialized = m.rows, m.rowids, true
+		cur.rows, cur.rowids, cur.materialized = rows, materializedRowids(len(rows), rowids), true
 	}
 	// A columnar view of this table, when one is attached, is served through
 	// ScanTable (segment_read.go) -- so the streaming b-tree cursor is declined

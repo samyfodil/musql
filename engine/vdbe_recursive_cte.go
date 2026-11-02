@@ -320,10 +320,15 @@ func (p *ReadOnlyPager) compileRecursiveCTEPart(stmt *SelectStmt, queue *compile
 	case len(stmt.From) > 0:
 		stmt = p.r37cFlattenTransparent(stmt)
 	}
+	outer := queue
 	if queue.outer == nil {
-		return compileSubProgram(p, stmt, nil)
+		outer = nil
 	}
-	return compileSubProgram(p, stmt, queue)
+	prog, err := compileSubProgram(p, stmt, outer)
+	if err == nil && !segPeepholesOffForTest {
+		existsInlinePeephole(prog)
+	}
+	return prog, err
 }
 
 // recQueue is one execution's queue state for a recursive CTE: select.c's
