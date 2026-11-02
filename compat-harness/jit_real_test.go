@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -87,15 +88,23 @@ func realRow(t *testing.T, db *sql.DB, q string, args []any) ([]any, error) {
 	return out, rows.Err()
 }
 
-// sameValue compares two scanned values, a REAL to the bit.
-func sameValue(a, b any) bool {
+// sameValue compares two scanned values, a REAL to the bit, or within near
+// of each other relatively.
+func sameValue(a, b any, near float64) bool {
 	fa, aok := a.(float64)
 	fb, bok := b.(float64)
 	if aok && bok {
-		return math.Float64bits(fa) == math.Float64bits(fb)
+		return math.Float64bits(fa) == math.Float64bits(fb) || math.Abs(fa-fb) <= near*math.Abs(fb)
 	}
 	return fmt.Sprint(a) == fmt.Sprint(b)
 }
+
+// ibmCall finds a call to one of the functions glibc takes from IBM's
+// library, which misround an ulp on a fraction of a percent of inputs where
+// musql's are correctly rounded: an aggregate over thousands of them can
+// differ from C's in its last bits. That musql's JIT answers them exactly as
+// its loop does is TestRealProgramsMatchTheLoop's.
+var ibmCall = regexp.MustCompile(`\b(sin|cos|tan|asin|acos|atan|atan2)\(`)
 
 // TestJITRealMatchesC runs REAL arithmetic, comparisons and math functions
 // through the program JIT and holds every answer to C's, to the bit, and
@@ -111,7 +120,9 @@ func TestJITRealMatchesC(t *testing.T) {
 		"x", "y", "x*y", "x/y", "x-y", "x+i", "i*1.5", "-x", "x*-1", "abs(x)", "abs(x-y)",
 		"sqrt(x)", "ln(x)", "log(x)", "log10(x)", "log2(x)", "log(2, x)", "log(x, y)", "log(y, 100)",
 		"exp(x)", "exp(-x)", "exp(y)", "pow(x, y)", "pow(x, 2.5)", "pow(abs(x), y)", "power(y, 3)", "pow(2, y)",
-		"sin(x)", "cos(x)", "sin(y)", "cos(y*1000)", "sin(x*1e6)",
+		"sin(x)", "cos(x)", "sin(y)", "cos(y*1000)", "sin(x*1e6)", "tan(x)", "tan(y/4)", "atan(x)", "atan(y*100)",
+		"asin(x/1000)", "acos(y/10)", "atan2(x, y)", "atan2(y, x*1000)", "sinh(y)", "cosh(x/100)", "tanh(y)",
+		"asinh(x)", "acosh(abs(x)+1)", "atanh(y/10.5)",
 		"floor(x)", "ceil(x)", "ceiling(y)", "trunc(x)", "floor(i)", "radians(x)", "degrees(y)", "pi()*x",
 		"sqrt(i)", "exp(i/1000.0)", "x/0", "x/(y-y)", "(x+y)/(x-y)",
 	} {
@@ -158,8 +169,12 @@ func TestJITRealMatchesC(t *testing.T) {
 		if merr != nil {
 			continue
 		}
+		near := 0.0
+		if ibmCall.MatchString(x.sql) {
+			near = 1e-12
+		}
 		for i := range want {
-			if i >= len(got) || !sameValue(got[i], want[i]) {
+			if i >= len(got) || !sameValue(got[i], want[i], near) {
 				t.Errorf("%s %v: musql %v, C %v", x.sql, x.args, got, want)
 				break
 			}

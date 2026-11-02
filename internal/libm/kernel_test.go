@@ -48,6 +48,17 @@ var kernelCases = []kernelCase{
 	{"log10", Log10, K.Log10, mixed(logUniform(-1022, 1024), uniform(0.9, 1.1))},
 	{"sin", Sin, K.Sin, mixed(uniform(-10, 10), uniform(-1e6, 1e6), signed(logUniform(-7, 31)))},
 	{"cos", Cos, K.Cos, mixed(uniform(-10, 10), uniform(-1e6, 1e6), signed(logUniform(-40, 31)))},
+	{"expm1", Expm1, K.Expm1, mixed(uniform(-40, 40), uniform(-1, 1), signed(logUniform(-60, 9)))},
+	{"sinh", Sinh, K.Sinh, mixed(uniform(-30, 30), uniform(-1, 1), signed(logUniform(-60, 9)))},
+	{"cosh", Cosh, K.Cosh, mixed(uniform(-30, 30), uniform(-1, 1), signed(logUniform(-60, 9)))},
+	{"tanh", Tanh, K.Tanh, mixed(uniform(-30, 30), uniform(-1, 1), signed(logUniform(-60, 9)))},
+	{"asinh", Asinh, K.Asinh, mixed(uniform(-30, 30), uniform(-1, 1), signed(logUniform(-60, 1000)))},
+	{"acosh", Acosh, K.Acosh, mixed(uniform(1, 30), uniform(1, 1.2), logUniform(0, 1000))},
+	{"atanh", Atanh, K.Atanh, mixed(uniform(-1, 1), uniform(-0.3, 0.3), signed(logUniform(-60, 0)))},
+	{"tan", Tan, K.Tan, mixed(uniform(-6.28, 6.28), uniform(-1, 1), signed(logUniform(-26, 2)))},
+	{"atan", Atan, K.Atan, mixed(uniform(-10, 10), uniform(-1, 1), signed(logUniform(-26, 60)))},
+	{"asin", Asin, K.Asin, mixed(uniform(-1, 1), uniform(-0.6, 0.6), signed(logUniform(-25, 0)))},
+	{"acos", Acos, K.Acos, mixed(uniform(-1, 1), uniform(-0.6, 0.6), signed(logUniform(-25, 0)))},
 }
 
 // kernelCase2 is kernelCase for a function of two arguments.
@@ -67,6 +78,12 @@ var kernelCases2 = []kernelCase2{
 			return uniform(0, 1000)(r), uniform(-3, 3)(r)
 		}
 		return logUniform(-1022, 1024)(r), uniform(-1, 1)(r)
+	}},
+	{"atan2", Atan2, K.Atan2, func(r *rand.Rand) (float64, float64) {
+		if r.IntN(2) == 0 {
+			return uniform(-10, 10)(r), uniform(-10, 10)(r)
+		}
+		return signed(logUniform(-20, 20))(r), signed(logUniform(-20, 20))(r)
 	}},
 }
 

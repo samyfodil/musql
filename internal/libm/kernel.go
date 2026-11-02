@@ -58,6 +58,17 @@ var Kernels1 = map[string]Kernel1{
 	"log10": {Log10, K.Log10},
 	"sin":   {Sin, K.Sin},
 	"cos":   {Cos, K.Cos},
+	"expm1": {Expm1, K.Expm1},
+	"sinh":  {Sinh, K.Sinh},
+	"cosh":  {Cosh, K.Cosh},
+	"tanh":  {Tanh, K.Tanh},
+	"asinh": {Asinh, K.Asinh},
+	"acosh": {Acosh, K.Acosh},
+	"atanh": {Atanh, K.Atanh},
+	"tan":   {Tan, K.Tan},
+	"atan":  {Atan, K.Atan},
+	"asin":  {Asin, K.Asin},
+	"acos":  {Acos, K.Acos},
 }
 
 // Kernel2 is a two-argument function with a kernel.
@@ -68,7 +79,8 @@ type Kernel2 struct {
 
 // Kernels2 is every two-argument function with a kernel.
 var Kernels2 = map[string]Kernel2{
-	"pow": {Pow, K.Pow},
+	"pow":   {Pow, K.Pow},
+	"atan2": {Atan2, K.Atan2},
 }
 
 // Build1 is the kernel answering name(x), built for this CPU's glibc build.

@@ -107,7 +107,12 @@ func (k K) sinMulDD(xh, xl, ch, cl fir.Val) (h, l fir.Val) {
 
 // fastSum is fastSum.
 func (k K) fastSum(xh, xl, yh, yl fir.Val) (h, l fir.Val) {
-	s := k.FAdd(xh, yh)
-	e := k.FSub(yh, k.FSub(s, xh))
+	s, e := k.fastTwoSum(xh, yh)
 	return s, k.FAdd(k.FAdd(xl, yl), e)
+}
+
+// fastTwoSum is fastTwoSum.
+func (k K) fastTwoSum(x, y fir.Val) (s, e fir.Val) {
+	s = k.FAdd(x, y)
+	return s, k.FSub(y, k.FSub(s, x))
 }

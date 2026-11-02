@@ -97,6 +97,36 @@ func TestFirKernels(t *testing.T) {
 			t.Logf("fused=%v %s: %d of %d left to Go", fused, name, left, len(xs))
 			k.Close()
 		}
+		for name, kern := range libm.Kernels2 {
+			f, err := libm.Build2(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			k, err := firLoop(f, 0)
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			xs := firInputs(name, 200000)
+			ys := firInputs(name+"y", len(xs))[:len(xs)]
+			for i := range ys {
+				if i%3 == 0 {
+					ys[i] = math.Abs(ys[i]) // pow's fast path wants a positive x
+					xs[i], ys[i] = ys[i], xs[i]/1000
+				}
+			}
+			got, exited := runFir(k, xs, ys)
+			for i := range xs {
+				if exited[i] {
+					continue
+				}
+				if want := kern.Go(xs[i], ys[i]); math.Float64bits(got[i]) != math.Float64bits(want) {
+					t.Errorf("fused=%v %s(%x, %x) = %x, Go %x", fused, name, math.Float64bits(xs[i]), math.Float64bits(ys[i]),
+						math.Float64bits(got[i]), math.Float64bits(want))
+					break
+				}
+			}
+			k.Close()
+		}
 		restore()
 	}
 }

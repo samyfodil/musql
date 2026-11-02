@@ -404,6 +404,9 @@ func buildSegMathKernel(name string, nargs int) *fir.Func {
 		case "pow", "power":
 			null(y)
 			k.Return(k.Pow(x, y))
+		case "atan2":
+			null(y)
+			k.Return(k.Atan2(x, y))
 		case "log":
 			// mathLog: log(B,X) is ln(X)/ln(B), NULL unless B, ln(B) and
 			// X are all positive.
@@ -450,6 +453,26 @@ func buildSegMathKernel(name string, nargs int) *fir.Func {
 		k.Return(k.Sin(x))
 	case "cos":
 		k.Return(k.Cos(x))
+	case "sinh":
+		k.Return(k.Sinh(x))
+	case "cosh":
+		k.Return(k.Cosh(x))
+	case "tanh":
+		k.Return(k.Tanh(x))
+	case "asinh":
+		k.Return(k.Asinh(x))
+	case "acosh":
+		k.Return(k.Acosh(x))
+	case "atanh":
+		k.Return(k.Atanh(x))
+	case "tan":
+		k.Return(k.Tan(x))
+	case "atan":
+		k.Return(k.Atan(x))
+	case "asin":
+		k.Return(k.Asin(x))
+	case "acos":
+		k.Return(k.Acos(x))
 	default:
 		return nil
 	}
