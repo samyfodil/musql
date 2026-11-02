@@ -23,6 +23,8 @@ package jit
 import (
 	"strconv"
 	"unsafe"
+
+	"github.com/samyfodil/musql/internal/fir"
 )
 
 // Args is the single struct a generated kernel reads, at fixed byte offsets.
@@ -241,7 +243,49 @@ const (
 	// POpCmpJump: jump to A when operand B <Cond> r[C], operand B as for
 	// POpCmpSkip; fused from a POpCmp and the jump testing it.
 	POpCmpJump
+
+	// ---- REAL values. A REAL lives in a register as its IEEE bits, as a
+	// double lives in an integer slot in V8, and NULL as a NaN: SQLite never
+	// holds a NaN (an operation that yields one yields NULL instead), so no
+	// value is one, and the arithmetic carries it as SQL carries NULL.
+
+	// POpI2F: r[A] = float64(int64 r[B]).
+	POpI2F
+	// POpFAdd, POpFSub, POpFMul, POpFDiv: r[A] = r[B] op r[C]. A zero divisor
+	// gives NaN, since dividing by zero is NULL in SQL.
+	POpFAdd
+	POpFSub
+	POpFMul
+	POpFDiv
+	// POpFCmp: r[A] = 1 when r[B] Cond r[C], else 0. When either is NULL r[A]
+	// is Imm, or with Imm == ProgNullDeclines the overflow flag is raised and
+	// the caller declines.
+	POpFCmp
+	// POpFIsNull: r[A] = 1 when r[B] is NULL, else 0.
+	POpFIsNull
+	// POpFAbs: r[A] = -r[B] when r[B] < 0, else r[B]: SQLite's abs(), which
+	// leaves -0.0 as it is.
+	POpFAbs
+	// POpMath: r[A] = Kernel(r[B]) or Kernel(r[B], r[C]), the kernel's code
+	// inline. An Exit in the kernel stops the program for service Imm, as
+	// POpService does: the caller computes the function and resumes the
+	// program after this instruction.
+	POpMath
+	// POpFAccSum: unless r[A] is NULL, add it to the sum in FAcc by SQLite's
+	// Kahan-Babuska-Neumaier step (func.c's kahanBabuskaNeumaierStep: FAcc[0]
+	// the sum, FAcc[1] its compensation) and r[B]++.
+	POpFAccSum
+	// POpFAccMin, POpFAccMax: unless r[A] is NULL, FAcc[0] = r[A] when it is
+	// smaller (larger), and r[B]++. The caller seeds FAcc[0] with +Inf (-Inf).
+	POpFAccMin
+	POpFAccMax
+	// POpFAccCount: acc++ unless r[A] is NULL.
+	POpFAccCount
 )
+
+// ProgNullDeclines is POpFCmp's Imm for a comparison whose NULL the program
+// cannot represent: one NULL operand declines the statement.
+const ProgNullDeclines = 2
 
 // ProgNextRow is the jump target meaning "abandon this row and start the next".
 // The VDBE's equivalent is a jump to the loop's OpNext.
@@ -261,6 +305,10 @@ type ProgInsn struct {
 	// BCol is POpCmpSkip's and POpCmpJump's: B is a column slot, read at the
 	// current row, rather than a register.
 	BCol bool
+	// Imm is POpFCmp's NULL answer and POpMath's service.
+	Imm int64
+	// Kernel is POpMath's function.
+	Kernel *fir.Func
 }
 
 // TextMode is what POpTextMatch tests.
@@ -330,7 +378,18 @@ type ProgArgs struct {
 	RowsBuf *int64
 	RowsCap int64
 	Yield   int64
+	// FAcc is a program's floating-point accumulator: the running sum and
+	// its compensation for POpFAccSum, the running extreme in FAcc[0] for
+	// POpFAccMin and POpFAccMax. The caller seeds it, and finds it there
+	// after the call, as for Out.
+	FAcc [2]float64
+	// Scratch is where a float kernel (POpMath) keeps the values it has no
+	// register for. Nothing in it outlives the kernel.
+	Scratch [ProgScratch]int64
 }
+
+// ProgScratch is how many words of ProgArgs.Scratch a kernel may use.
+const ProgScratch = 32
 
 // Byte offsets of ProgArgs' fields, asserted by TestProgArgsLayout.
 const (
@@ -352,13 +411,38 @@ const (
 	POffRowsBuf  = POffRowUsed + 8
 	POffRowsCap  = POffRowsBuf + 8
 	POffYield    = POffRowsCap + 8
+	POffFAcc     = POffYield + 8
+	POffScratch  = POffFAcc + 16
 )
 
 // progHasService reports whether a program can stop for a service, and so
 // needs the re-entry dispatch.
 func progHasService(insns []ProgInsn) bool {
 	for _, in := range insns {
-		if in.Op == POpService {
+		if _, ok := progService(in); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// progService is the service in stops for: POpService's, or the one a
+// POpMath's kernel leaves its inputs to.
+func progService(in ProgInsn) (int, bool) {
+	switch in.Op {
+	case POpService:
+		return in.A, true
+	case POpMath:
+		return int(in.Imm), true
+	}
+	return 0, false
+}
+
+// progHasFloat reports whether a program keeps a REAL accumulator in FAcc.
+func progHasFloat(insns []ProgInsn) bool {
+	for _, in := range insns {
+		switch in.Op {
+		case POpFAccSum, POpFAccMin, POpFAccMax:
 			return true
 		}
 	}
