@@ -147,6 +147,22 @@ const (
 	// argument a REAL or (Imm zero) an INTEGER read as a double. Any other
 	// argument, a NaN answer and the kernel's own Exit exit.
 	VMath
+
+	// ---- TEXT arms.
+
+	// VSubstr: r[C] = substr(r[A], r[A+1], r[A+2]) where that is one ASCII
+	// character: r[A] a TEXT whose first y bytes are ASCII and none NUL, r[A+1]
+	// the INTEGER y, from 1 to the TEXT's length, and r[A+2] the INTEGER 1.
+	// The answer is the byte at y-1, as one byte of the table at Imm (the
+	// engine's own, as its substr answers it). Anything else exits, as does a
+	// write barrier that is on.
+	VSubstr
+	// VTextCmpJump, VTextCmpSet: VCmpJump and VCmpSet for Cond E or NE over
+	// two TEXTs, equal when their bytes are, or two INTEGERs. Any other pair
+	// exits, as do two TEXTs when ProgArgs.UTF16 is set: the engine compares
+	// those converted.
+	VTextCmpJump
+	VTextCmpSet
 )
 
 // VInsn is one instruction of a VM program: the one at its index's pc.
@@ -232,6 +248,7 @@ type ValueLayout struct {
 	TypNull  byte
 	TypInt   byte
 	TypFloat byte
+	TypText  byte
 }
 
 // VMFuel is how many backward jumps run between two returns to Go.

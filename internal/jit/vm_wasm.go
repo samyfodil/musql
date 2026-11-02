@@ -94,6 +94,11 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 	if slices.ContainsFunc(prog, func(in VInsn) bool { return in.Op == VInSet }) {
 		e.keyp, e.keyq = w.Local(wI32), w.Local(wI32)
 	}
+	if slices.ContainsFunc(prog, func(in VInsn) bool {
+		return in.Op == VSubstr || in.Op == VTextCmpJump || in.Op == VTextCmpSet
+	}) {
+		e.txa, e.txb = w.Local(wI32), w.Local(wI32)
+	}
 	for _, in := range prog {
 		if in.Op == VColumn || in.Op == VNext || in.Op == VRewind || in.Op == VRowid {
 			e.curs, e.rowp, e.valp = w.Local(wI32), w.Local(wI32), w.Local(wI32)
@@ -165,6 +170,7 @@ type vmEmitWasm struct {
 	ovf              uint32
 	curs, rowp, valp uint32 // the cursor table, a row's header, its first Value (when the program has cursor ops)
 	keyp, keyq       uint32 // VInSet's search: the candidate key and the halfway one
+	txa, txb         uint32 // the TEXT arms' byte addresses
 	cur              int    // the pc whose code is being emitted
 	extra            int    // if-blocks opened inside it
 
@@ -719,6 +725,10 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 			w.StoreI64(e.addr(in.C, f))
 		})
 		e.know.wroteAny(in.C, false)
+	case VSubstr:
+		e.substr(pc, in)
+	case VTextCmpJump, VTextCmpSet:
+		e.textCmp(pc, in)
 	case VInSet:
 		e.inSet(pc, in)
 	case VResultRow:

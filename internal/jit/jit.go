@@ -397,6 +397,9 @@ type ProgArgs struct {
 	// Scratch is where a float kernel (POpMath) keeps the values it has no
 	// register for. Nothing in it outlives the kernel.
 	Scratch [ProgScratch]int64
+	// UTF16 is non-zero when the engine compares TEXT converted to UTF-16
+	// (VTextCmpJump).
+	UTF16 int64
 }
 
 // ProgScratch is how many words of ProgArgs.Scratch a kernel may use.
@@ -424,6 +427,7 @@ const (
 	POffYield    = POffRowsCap + 8
 	POffFAcc     = POffYield + 8
 	POffScratch  = POffFAcc + 16
+	POffUTF16    = POffScratch + ProgScratch*8
 )
 
 // progHasService reports whether a program can stop for a service, and so

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"slices"
+	"strings"
 	"sync/atomic"
 	"unsafe"
 
@@ -61,6 +62,10 @@ type vmJIT struct {
 	// params is how many of the nReg registers, the last ones, hold the bound
 	// parameters (Program.jitParams); enter fills them.
 	params int
+
+	// text is whether the code compares TEXTs (VTextCmpJump), which it does
+	// only in a UTF-8 database: enter says which (ProgArgs.UTF16).
+	text bool
 
 	// seekCols is every column the native code reads of each cursor: what a
 	// seek's rows are copied out with (seekSnap).
@@ -171,6 +176,7 @@ var valueLayout = jit.ValueLayout{
 	TypNull:  byte(Null),
 	TypInt:   byte(Int),
 	TypFloat: byte(Float),
+	TypText:  byte(Text),
 }
 
 // compileVMJIT compiles prog, or returns nil: the JIT off, no emitter for this
@@ -278,6 +284,7 @@ func compileVMJIT(prog *Program) *vmJIT {
 		}
 	}
 	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams, params: nParams, entry: entry, marked: marked, native: native, updAt: updAt}
+	jx.text = slices.ContainsFunc(vp, func(in jit.VInsn) bool { return in.Op == jit.VTextCmpJump || in.Op == jit.VTextCmpSet })
 	if updAt >= 0 {
 		jx.updSkip = vp[updAt-1].Skip
 		jx.updPlan, _ = prog.Insns[updAt].P4.(*updatePlan)
@@ -639,8 +646,9 @@ const (
 	vmJITCopyWorkOne = 8
 )
 
-// vmJITMathWork is a math kernel's weight in nativeRun: the VDBE's call of
-// the same function costs about as much as a dozen of its plain steps.
+// vmJITMathWork is a math kernel's weight in nativeRun, and a substr's: the
+// VDBE's call of the same function costs about as much as a dozen of its plain
+// steps.
 const vmJITMathWork = 24
 
 // copyLimit is how many cursors an entry at pc may have copied out and still
@@ -678,7 +686,7 @@ func nativeRun(vp []jit.VInsn, pc, limit int) (w int, cursor bool, reads int) {
 			cursor = true
 		case jit.VResultRow:
 			return w + 2, cursor, reads // native code returns to Go there
-		case jit.VMath:
+		case jit.VMath, jit.VSubstr:
 			w += vmJITMathWork
 		default:
 			w += 2
@@ -737,9 +745,21 @@ func lowerVM(in *Instruction, nReg int) jit.VInsn {
 		}
 	case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
 		// A comparison under TEXT affinity is one of text values -- a TEXT
-		// column against a string -- which native code would only enter to
-		// exit from. The VDBE answers it from the start.
+		// column against a string. Two TEXTs stand as they are under it, and
+		// are equal under BINARY when their bytes are; two INTEGERs answer
+		// before affinity (below). Native code takes those two pairs for = and
+		// <> and exits on any other; an ordering of TEXTs, or another
+		// collation, is the VDBE's from the start.
 		if affinity(in.P5&p5AffMask) == affText {
+			coll, _ := in.P4.(string)
+			if (in.Op == OpEq || in.Op == OpNe) && (coll == "" || strings.EqualFold(coll, "BINARY")) {
+				if in.P5&p5StoreP2 == 0 && ok(in.P1, in.P3) {
+					return jit.VInsn{Op: jit.VTextCmpJump, A: in.P1, B: in.P3, T: in.P2, Cond: vmCond[in.Op]}
+				}
+				if in.P5&p5StoreP2 != 0 && ok(in.P1, in.P3, in.P2) {
+					return jit.VInsn{Op: jit.VTextCmpSet, A: in.P1, B: in.P3, C: in.P2, Cond: vmCond[in.Op]}
+				}
+			}
 			break
 		}
 		// Two INTEGERs answer before NULL handling, affinity or collation
@@ -752,6 +772,12 @@ func lowerVM(in *Instruction, nReg int) jit.VInsn {
 		// (deliverCompare).
 		if in.P5&p5StoreP2 != 0 && ok(in.P1, in.P3, in.P2) {
 			return jit.VInsn{Op: jit.VCmpSet, A: in.P1, B: in.P3, C: in.P2, Cond: vmCond[in.Op]}
+		}
+	case OpFunction:
+		// substr(x, y, 1) of a TEXT whose first y bytes are ASCII and none NUL
+		// is its byte at y-1, which fnSubstr answers from asciiBytes.
+		if name, _ := in.P4.(string); (name == "substr" || name == "substring") && in.P2 == 3 && ok(in.P1, in.P1+2, in.P3) {
+			return jit.VInsn{Op: jit.VSubstr, A: in.P1, C: in.P3, Imm: int64(uintptr(unsafe.Pointer(&asciiBytes[0])))}
 		}
 	case OpIf, OpIfNot:
 		if ok(in.P1) {
@@ -1121,6 +1147,12 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 		}
 	}
 	args.Regs, args.PC, args.Cur = (*int64)(unsafe.Pointer(&regs[0])), int64(pc), nil
+	if jx.text {
+		args.UTF16 = 0
+		if isUTF16(m.encoding()) {
+			args.UTF16 = 1
+		}
+	}
 	args.RowBuf, args.RowCap, args.RowUsed, args.RowsBuf, args.RowsCap, args.Yield = nil, -1, 0, nil, 0, 0
 	switch {
 	case jx.rows == nil || !jx.rows[pc] || m.firstRow:

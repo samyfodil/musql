@@ -76,6 +76,12 @@ func vmStepOf(in VInsn, pc int) progStep {
 		if in.B == 2 {
 			s.uses = append(s.uses, in.A+1)
 		}
+	case VSubstr:
+		s.uses, s.defs = []int{in.A, in.A + 1, in.A + 2}, []int{in.C}
+	case VTextCmpJump:
+		s.uses, s.targets = []int{in.A, in.B}, []int{in.T}
+	case VTextCmpSet:
+		s.uses, s.defs = []int{in.A, in.B}, []int{in.C}
 	case VNotBr:
 		s.uses, s.defs, s.targets = []int{in.A}, []int{in.C}, []int{in.T}
 	case VNullJump, VIf:

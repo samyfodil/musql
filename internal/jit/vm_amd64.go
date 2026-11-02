@@ -870,6 +870,10 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		e.column(pc, in)
 	case VInSet:
 		e.inSet(pc, in)
+	case VSubstr:
+		e.substr(pc, in)
+	case VTextCmpJump, VTextCmpSet:
+		e.textCmp(pc, in)
 	case VResultRow:
 		e.resultRow(pc, in)
 	case VIntGuard:

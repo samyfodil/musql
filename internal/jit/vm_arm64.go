@@ -851,6 +851,10 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		a.B("dispatch")
 	case VColumn:
 		e.column(pc, in)
+	case VSubstr:
+		e.substr(pc, in)
+	case VTextCmpJump, VTextCmpSet:
+		e.textCmp(pc, in)
 	case VInSet:
 		e.inSet(pc, in)
 	case VResultRow:
