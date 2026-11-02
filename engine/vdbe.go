@@ -2301,7 +2301,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				// (vdbeCursor.fill).
 				slot, prog := op.P2, ds.prog
 				m.cursors[op.P1] = openFillCursor(ds.tbl, func() ([][]Value, []int64, error) {
-					if ds.stmtOnce {
+					if ds.stmtOnce || ds.cteOnce && m.stmtRoot().wctx == nil {
 						rows, err := m.runStmtOnce(slot, prog, srcPager)
 						return rows, nil, err
 					}
