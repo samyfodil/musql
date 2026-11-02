@@ -149,19 +149,6 @@ func sqliteUTF8Next(s []byte) (cp int64, n int) {
 	return c, n
 }
 
-// sqliteUTF8Starts returns the byte offset of every character start in s,
-// terminated by len(s) -- so the character range [i,j) spans bytes
-// s[starts[i]:starts[j]] and len(starts)-1 is the character count. It is the
-// one shape substr() needs: SQLite slices raw BYTES between two character
-// positions, never re-encoding what it found there.
-func sqliteUTF8Starts(s []byte) []int {
-	starts := make([]int, 0, len(s)+1)
-	for i := 0; i < len(s); {
-		starts = append(starts, i)
-		i += sqliteUTF8Skip(s[i:])
-	}
-	return append(starts, len(s))
-}
 
 // fnRound is roundFunc (func.c:451): Y is sqlite3_value_int64 clamped to
 // [0,30] (func.c:458-460), X is sqlite3_value_double. A magnitude beyond 2^52

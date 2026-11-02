@@ -56,6 +56,11 @@ type segFilterPlan struct {
 	semis []segPlanSemi
 	ins   []segPlanIn
 	likes []segPlanLike
+
+	// prog is the compiled program for the same loop, tried when these
+	// kernels decline -- a REAL column, which they do not read -- before
+	// the loop runs.
+	prog *segProgPlan
 }
 
 // segPlanPred is a predicate whose bound is a literal, or the 1-based index of
@@ -239,11 +244,15 @@ func segPeephole(prog *Program) bool {
 	// the original one, because the original runs AggResult, which would
 	// overwrite the count with the accumulators the loop never filled.
 	dst := in[end-3].P1
+	var fallback *segProgPlan
+	if len(semis) == 0 && len(insubs) == 0 && len(likes) == 0 {
+		fallback = segProgPlanFor(in[rewindAt+1:aggAt], rewindAt+1, in[rewindAt].P1, aggAt, plan, 1)
+	}
 	out := make([]Instruction, 0, len(in)+4)
 	out = append(out, in[0], in[1], in[2])
 	guardTarget := len(in) + 1 // the duplicated tail, after every shifted insn
 	out = append(out, Instruction{Op: OpSegFilterCount, P1: dst, P2: in[rewindAt].P1, P3: guardTarget,
-		P4: &segFilterPlan{preds: preds, isSum: isSum, sumCol: sumCol, semis: semis, ins: insubs, likes: likes}})
+		P4: &segFilterPlan{preds: preds, isSum: isSum, sumCol: sumCol, semis: semis, ins: insubs, likes: likes, prog: fallback}})
 	// Everything from the third instruction on -- which is OpAutoIndexOrder when
 	// there is one, then the Rewind -- one address later than it was.
 	for _, ins := range in[3:] {

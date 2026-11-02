@@ -30,6 +30,22 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		}
 		return 0, false
 	}
+	consts := newFirPool()
+	// fval puts r's REAL in x; fset makes x r's value.
+	fval := func(r int, x XReg) {
+		if p, ok := phys(r); ok {
+			a0.MovqXR(x, p)
+			return
+		}
+		a0.MovsdLoad(x, RSI, int32(r*8))
+	}
+	fset := func(r int, x XReg) {
+		if p, ok := phys(r); ok {
+			a0.MovqRX(p, x)
+			return
+		}
+		a0.MovsdStore(RSI, int32(r*8), x)
+	}
 	// val is a register holding r's value: its own, or scratch loaded from
 	// the file.
 	val := func(r int, scratch Reg) Reg {
@@ -88,6 +104,13 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	a.XorRegReg(R11, R11)
 	for c := 0; c < nCols; c++ {
 		a.MovRegMem(colReg[c], RDI, int8(POffCol+c*8))
+	}
+	// A REAL accumulator lives in X14 (and its compensation in X13) for the
+	// whole call; kernels leave both alone.
+	hasFloat := progHasFloat(insns)
+	if hasFloat {
+		a.MovsdLoad(X14, RDI, POffFAcc)
+		a.MovsdLoad(X13, RDI, POffFAcc+8)
 	}
 	for _, r := range pa.load {
 		p, _ := phys(r)
@@ -323,6 +346,160 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		case POpAccSum:
 			a.AddRegRegOverflow(R8, val(in.A, RAX), R9)
 			incReg(in.B)
+		case POpI2F:
+			x := val(in.B, RAX)
+			a.Xorps(X0, X0)
+			a.Cvtsi2sdq(X0, x)
+			fset(in.A, X0)
+		case POpFAdd, POpFSub, POpFMul, POpFDiv:
+			fval(in.B, X0)
+			fval(in.C, X1)
+			switch in.Op {
+			case POpFAdd:
+				a.Addsd(X0, X1)
+			case POpFSub:
+				a.Subsd(X0, X1)
+			case POpFMul:
+				a.Mulsd(X0, X1)
+			default:
+				// A divisor equal to zero (either sign) is NULL; a NaN one
+				// divides to NaN anyway.
+				ok, done := "dv"+itoa(idx), "dd"+itoa(idx)
+				a.Xorps(X2, X2)
+				a.Ucomisd(X1, X2)
+				a.Jcc(ccP, ok)
+				a.Jcc(CondNE, ok)
+				a.MovsdRIP(X0, consts.label(progNaN, 0))
+				a.Jmp(done)
+				a.Label(ok)
+				a.Divsd(X0, X1)
+				a.Label(done)
+			}
+			fset(in.A, X0)
+		case POpFCmp:
+			fval(in.B, X0)
+			fval(in.C, X1)
+			unord, done := "fu"+itoa(idx), "fd"+itoa(idx)
+			a.XorRegReg(R10, R10)
+			a.Ucomisd(X0, X1)
+			a.Jcc(ccP, unord)
+			a.Setcc(floatCond(in.Cond), R10)
+			a.Jmp(done)
+			a.Label(unord)
+			if in.Imm == ProgNullDeclines {
+				a.aluImm32(1, R9, 1)
+			} else if in.Imm != 0 {
+				a.MovRegImm64(R10, in.Imm)
+			}
+			a.Label(done)
+			set(in.A, R10)
+		case POpFIsNull:
+			fval(in.B, X0)
+			a.XorRegReg(R10, R10)
+			a.Ucomisd(X0, X0)
+			a.Setcc(ccP, R10)
+			set(in.A, R10)
+		case POpFAbs:
+			keep := "fa" + itoa(idx)
+			fval(in.B, X0)
+			a.Xorps(X1, X1)
+			a.Ucomisd(X1, X0) // 0 > x
+			a.Jcc(ccBE, keep)
+			a.XorpdRIP(X0, consts.label(1<<63, 0))
+			a.Label(keep)
+			fset(in.A, X0)
+		case POpFAccSum:
+			// kahanBabuskaNeumaierStep: t = s + r; the error of whichever
+			// of s and r is larger in magnitude goes into the compensation.
+			skip, small, step := "ks"+itoa(idx), "kl"+itoa(idx), "kt"+itoa(idx)
+			fval(in.A, X0)
+			a.Ucomisd(X0, X0)
+			a.Jcc(ccP, skip)
+			a.Movapd(X1, X14)
+			a.Addsd(X1, X0) // t
+			a.Movapd(X2, X14)
+			a.AndpdRIP(X2, consts.label(math.MaxInt64, 0))
+			a.Movapd(X3, X0)
+			a.AndpdRIP(X3, consts.label(math.MaxInt64, 0))
+			a.Ucomisd(X2, X3) // |s| > |r|
+			a.Jcc(ccBE, small)
+			a.Movapd(X2, X14)
+			a.Subsd(X2, X1)
+			a.Addsd(X2, X0) // (s - t) + r
+			a.Jmp(step)
+			a.Label(small)
+			a.Movapd(X2, X0)
+			a.Subsd(X2, X1)
+			a.Addsd(X2, X14) // (r - t) + s
+			a.Label(step)
+			a.Addsd(X13, X2)
+			a.Movapd(X14, X1)
+			incReg(in.B)
+			a.Label(skip)
+		case POpFAccMin, POpFAccMax:
+			skip, keep := "ms"+itoa(idx), "mk"+itoa(idx)
+			fval(in.A, X0)
+			a.Ucomisd(X0, X0)
+			a.Jcc(ccP, skip)
+			if in.Op == POpFAccMin {
+				a.Ucomisd(X14, X0) // acc > x
+			} else {
+				a.Ucomisd(X0, X14) // x > acc
+			}
+			a.Jcc(ccBE, keep)
+			a.Movapd(X14, X0)
+			a.Label(keep)
+			incReg(in.B)
+			a.Label(skip)
+		case POpFAccCount:
+			skip := "cs" + itoa(idx)
+			fval(in.A, X0)
+			a.Ucomisd(X0, X0)
+			a.Jcc(ccP, skip)
+			a.IncReg(R8)
+			a.Label(skip)
+		case POpMath:
+			if in.Kernel == nil || in.Kernel.NArgs > 2 {
+				return nil, fmt.Errorf("jit: POpMath without a kernel")
+			}
+			svc := int(in.Imm)
+			env := &firEnv{
+				args:      []firLoc{firMem(RSI, int32(in.B*8)), firMem(RSI, int32(in.C*8))}[:in.Kernel.NArgs],
+				out:       firMem(RSI, int32(in.A*8)),
+				exit:      "mx" + itoa(idx),
+				gprs:      append([]Reg{RAX, RDX, R10, R11}, pool...),
+				xmms:      []XReg{X0, X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12},
+				spillBase: RDI, spillDisp: POffScratch, spillN: ProgScratch,
+				prefix: "m" + itoa(idx) + "_", pool: consts,
+			}
+			if len(pa.slot) != 0 {
+				return nil, fmt.Errorf("jit: POpMath in a program with allocated registers")
+			}
+			if err := emitFirAmd64(a, in.Kernel, env, cpuFeat); err != nil {
+				return nil, err
+			}
+			a.XorRegReg(R11, R11) // POpAccSum's SETO needs its upper bytes zero
+			if in.Imm == ProgMathSelects {
+				// An input the kernel cannot judge selects the row.
+				at := progEmitAt(insns)
+				if at < 0 {
+					return nil, fmt.Errorf("jit: POpMath selects in a program with no POpEmitRow")
+				}
+				after := "ma" + itoa(idx)
+				a.Jmp(after)
+				a.Label(env.exit)
+				a.XorRegReg(R11, R11)
+				a.Jmp(progLabel(at))
+				a.Label(after)
+				break
+			}
+			a.Jmp(svcLabel(svc))
+			a.Label(env.exit)
+			a.MovRegImm64(RAX, in.Imm+1)
+			a.MovMemReg(RDI, POffPC, RAX)
+			a.MovMemReg(RDI, POffRow, RCX)
+			a.Jmp("fin")
+			a.Label(svcLabel(svc))
 		default:
 			return nil, fmt.Errorf("jit: unknown program opcode %d", in.Op)
 		}
@@ -343,9 +520,33 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	a.MovMemReg(RDX, 0, R8)
 	a.MovRegMem(RDX, RDI, POffOverflow)
 	a.MovMemReg(RDX, 0, R9)
+	if hasFloat {
+		a.MovsdStore(RDI, POffFAcc, X14)
+		a.MovsdStore(RDI, POffFAcc+8, X13)
+	}
 	a.Ret()
 	emitTextPool(a, insns)
+	consts.emit(a)
 	return a.Code()
+}
+
+// progNaN is the NaN a program writes for a NULL REAL.
+const progNaN = 0x7ff8000000000000
+
+// floatCond is the condition UCOMISD x, y leaves for x c y, given an ordered
+// pair: it compares like unsigned integers.
+func floatCond(c Cond) Cond {
+	switch c {
+	case CondG:
+		return ccA
+	case CondGE:
+		return ccAE
+	case CondL:
+		return ccB
+	case CondLE:
+		return ccBE
+	}
+	return c
 }
 
 // progLabel names the emitted label for one IR index.
@@ -392,9 +593,9 @@ func emitProgResume(a *Asm, insns []ProgInsn) {
 	a.MovRegMem(RDX, RDI, POffOverflow)
 	a.MovRegMem(R9, RDX, 0)
 	for _, in := range insns {
-		if in.Op == POpService {
-			a.CmpRegImm32(RAX, int32(in.A)+1)
-			a.Jcc(CondE, svcLabel(in.A))
+		if k, ok := progService(in); ok {
+			a.CmpRegImm32(RAX, int32(k)+1)
+			a.Jcc(CondE, svcLabel(k))
 		}
 	}
 	a.Jmp("done") // no such service: finish rather than guess

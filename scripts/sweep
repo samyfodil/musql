@@ -133,11 +133,15 @@ guard() { # guard SECONDS CMD...
 # and did not have it.
 #
 #   SWEEP_TAGS=sqlite_fts5 SWEEP_JOBS=3 scripts/sweep
+#
+# sqlite_math_functions is always added: the oracle must have the SQL math
+# functions musql has (compat-harness's TestMain refuses to run without them).
+tags="sqlite_math_functions${SWEEP_TAGS:+,$SWEEP_TAGS}"
 log="${SWEEP_LOG:-$(mktemp -d "${TMPDIR:-/tmp}/sweep.XXXXXX")}"
 mkdir -p "$log"
 bin="$log/compat-harness.test"
-echo "===== building the test binary once -> $bin${SWEEP_TAGS:+ (-tags $SWEEP_TAGS)}"
-if ! ../scripts/cap -- go test -c ${SWEEP_TAGS:+-tags "$SWEEP_TAGS"} -o "$bin" ./ >"$log/build.log" 2>&1; then
+echo "===== building the test binary once -> $bin (-tags $tags)"
+if ! ../scripts/cap -- go test -c -tags "$tags" -o "$bin" ./ >"$log/build.log" 2>&1; then
   cat "$log/build.log" >&2
   echo "===== FAIL test binary did not build" >&2
   exit 1

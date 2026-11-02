@@ -1,6 +1,10 @@
 package jit
 
-import "unsafe"
+import (
+	"unsafe"
+
+	"github.com/samyfodil/musql/internal/fir"
+)
 
 // VM JIT: compiling whole VDBE programs to machine code.
 // EmitProgram compiles every recognized instruction to native blocks.
@@ -121,6 +125,28 @@ const (
 	// non-INTEGER operand, or a count that is not a non-negative INTEGER,
 	// exits.
 	VInSet
+
+	// ---- REAL arms, which the engine chooses where an operand is a REAL.
+
+	// VReal: r[A] = the REAL whose bits are Imm.
+	VReal
+	// VFAdd, VFSub, VFMul, VFDiv: r[C] = r[B] op r[A] in floating point, each
+	// operand an INTEGER (read as a double) or a REAL, at least one a REAL.
+	// Two INTEGERs, any other operand, a zero divisor and a NaN result (each
+	// NULL or the INTEGER arm) exit.
+	VFAdd
+	VFSub
+	VFMul
+	VFDiv
+	// VFCmpJump, VFCmpSet, VFCmpBr: VCmpJump, VCmpSet and VCmpBr over REALs,
+	// and over INTEGERs a double holds exactly; any other operand exits.
+	VFCmpJump
+	VFCmpSet
+	VFCmpBr
+	// VMath: r[C] = Kernel(r[A]), or Kernel(r[A], r[A+1]) when B is 2, each
+	// argument a REAL or (Imm zero) an INTEGER read as a double. Any other
+	// argument, a NaN answer and the kernel's own Exit exit.
+	VMath
 )
 
 // VInsn is one instruction of a VM program: the one at its index's pc.
@@ -141,6 +167,8 @@ type VInsn struct {
 	// them may be dead. The engine sets it only where it does not read those
 	// slots and does not need those registers.
 	Skip uint64
+	// Kernel is VMath's function.
+	Kernel *fir.Func
 }
 
 // VCursor is native code's view of one materialized cursor: the rows the
@@ -196,13 +224,14 @@ const (
 
 // ValueLayout is where a register's fields live, which only the engine knows.
 type ValueLayout struct {
-	Size    int // bytes per register
-	OffTyp  int // the type byte
-	OffI    int // int64
-	OffF    int // float64
-	OffS    int // the string/blob data pointer; nil means no string or blob
-	TypNull byte
-	TypInt  byte
+	Size     int // bytes per register
+	OffTyp   int // the type byte
+	OffI     int // int64
+	OffF     int // float64
+	OffS     int // the string/blob data pointer; nil means no string or blob
+	TypNull  byte
+	TypInt   byte
+	TypFloat byte
 }
 
 // VMFuel is how many backward jumps run between two returns to Go.

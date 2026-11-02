@@ -1386,7 +1386,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				goto dispatch
 			}
 			// Nor one that would copy a row out for too little native work.
-			if jx.light != nil && jx.light[pc] && jx.copies(m, pc) {
+			if jx.light != nil && jx.light[pc] >= 0 && jx.copies(m, pc) > int(jx.light[pc]) {
 				op = &insns[pc]
 				goto dispatch
 			}
@@ -2180,6 +2180,19 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 					for i, t := range ds.vtabCorr {
 						corr[i] = vtabCorrValue{conj: t.conj, arg: t.arg, col: t.col, op: t.op, v: m.regs[t.reg]}
 					}
+					if ds.vtabStream {
+						vt, params, outer := *ds.vtab, m.params, m.outer
+						m.cursors[op.P1] = openVtabStreamCursor(ds.tbl, &vtabStream{
+							start: func() (*vtabScan, error) {
+								return dsPager.startVtabStream(vt, params, outer, ds.vtabTrig, m, corr)
+							},
+							fallback: func() ([][]Value, []int64, error) {
+								_, rows, rowids, err := dsPager.materializeVtab(vt, params, outer, ds.vtabTrig, m, corr)
+								return rows, rowids, err
+							},
+						})
+						break
+					}
 					_, rows, rowids, verr := dsPager.materializeVtab(*ds.vtab, m.params, m.outer, ds.vtabTrig, m, corr)
 					if verr != nil {
 						return nil, verr
@@ -2197,6 +2210,17 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 					break
 				}
 				slot := op.P2
+				if ds.vtabStream && ds.lazy {
+					m.cursors[op.P1] = openVtabStreamCursor(ds.tbl, &vtabStream{
+						start: func() (*vtabScan, error) {
+							return dsPager.startVtabStream(*ds.vtab, m.params, m.outer, ds.vtabTrig, m, nil)
+						},
+						fallback: func() ([][]Value, []int64, error) {
+							return m.runVtabOnce(slot, ds, dsPager)
+						},
+					})
+					break
+				}
 				m.cursors[op.P1] = openFillCursor(ds.tbl, func() ([][]Value, []int64, error) {
 					return m.runVtabOnce(slot, ds, dsPager)
 				}, false, nil)
@@ -2277,7 +2301,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				// (vdbeCursor.fill).
 				slot, prog := op.P2, ds.prog
 				m.cursors[op.P1] = openFillCursor(ds.tbl, func() ([][]Value, []int64, error) {
-					if ds.stmtOnce {
+					if ds.stmtOnce || ds.cteOnce && m.stmtRoot().wctx == nil {
 						rows, err := m.runStmtOnce(slot, prog, srcPager)
 						return rows, nil, err
 					}
@@ -2363,7 +2387,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				}
 			}
 			cur := m.cursors[op.P1]
-			if cur == nil || (cur.tbl == nil && cur.fill == nil) || cur.rowStore != nil || cur.sub != nil || cur.streamable || cur.seekConfigured ||
+			if cur == nil || (cur.tbl == nil && cur.fill == nil) || cur.rowStore != nil || cur.sub != nil || cur.vt != nil || cur.streamable || cur.seekConfigured ||
 				cur.seekSetConfigured || cur.idxSeekConfigured || cur.seekReseek || cur.segFilter != nil {
 				break
 			}
@@ -2637,6 +2661,14 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				} else if total, served := cur.pager.segFilterCountTable(cur.tbl.root, preds, cur.tbl.ipkIndex); served {
 					segFilterServed.Add(1)
 					m.regs[op.P1] = Value{Typ: Int, I: int64(total)}
+					pc = op.P3
+					continue
+				}
+			}
+			if plan.prog != nil {
+				if vs, served := m.segRunProgramAll(cur.pager, cur.tbl, plan.prog); served && len(vs) == 1 {
+					segFilterServed.Add(1)
+					m.regs[op.P1] = vs[0]
 					pc = op.P3
 					continue
 				}

@@ -50,7 +50,7 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 	}
 	e := &vmEmit{a: NewAsm(), lay: lay, n: n, stubs: map[int]bool{}, prog: prog, bound: bound,
 		cache: cache && bound != nil, know: newVMKnow(), holds: map[int]Reg{}, pinned: map[Reg]bool{},
-		zeroS: map[int]bool{}}
+		zeroS: map[int]bool{}, consts: newFirPool()}
 	e.heads = vmLoopHeads(prog)
 	a := e.a
 
@@ -190,6 +190,7 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 		rel := int32(target - (f.at + 4))
 		a.buf[f.at], a.buf[f.at+1], a.buf[f.at+2], a.buf[f.at+3] = byte(rel), byte(rel>>8), byte(rel>>16), byte(rel>>24)
 	}
+	e.consts.emit(a)
 	return a.Code()
 }
 
@@ -219,6 +220,10 @@ type vmEmit struct {
 	// cold is the code of the paths a block branches out to and back from
 	// (coldPath), emitted after the blocks.
 	cold []func()
+	// consts is the doubles the REAL arms load (vm_real_amd64.go), and
+	// nLabel the labels they have made.
+	consts *firPool
+	nLabel int
 }
 
 // coldPath branches, when the flags say NE, to body emitted out of line, which
@@ -428,6 +433,7 @@ func (e *vmEmit) clobber(r int) {
 	delete(e.know.isInt, r)
 	delete(e.know.canon, r)
 	delete(e.know.noS, r)
+	delete(e.know.isFloat, r)
 }
 
 func (e *vmEmit) nextUse(key, pc int) int { return vmEmitNextUse(e.prog, e.bound, key, pc) }
@@ -590,6 +596,9 @@ func (e *vmEmit) operand2(pc int, in VInsn) (x, y Reg) {
 }
 
 func (e *vmEmit) insn(pc int, in VInsn) error {
+	if ok, err := e.realInsn(pc, in); ok {
+		return err
+	}
 	a, L := e.a, e.lay
 	switch in.Op {
 	case VExit:
@@ -640,11 +649,14 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		}
 		e.clearS(in.B)
 		if in.A != in.B {
-			isInt := e.know.isInt[in.A]
+			isInt, isFloat := e.know.isInt[in.A], e.know.isFloat[in.A]
 			e.unmap(in.B)
 			e.know.wroteAny(in.B, true)
 			if isInt {
 				e.know.isInt[in.B] = true
+			}
+			if isFloat {
+				e.know.isFloat[in.B] = true
 			}
 			if m, ok := e.holds[in.A]; ok {
 				e.holds[in.B] = m

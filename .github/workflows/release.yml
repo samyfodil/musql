@@ -1,10 +1,10 @@
 name: release
 
-# Pushing a tag v* builds, for every target, musqld, musql-convert and the Doom
-# example (musql-<os>-<arch>) and musql cloud (musql-cloud-<os>-<arch>), and
-# attaches them to a GitHub release; two images, musql (musqld) and
-# musql-cloud, go to ghcr. Everything is pure Go (CGO_ENABLED=0), so one Linux
-# runner cross-compiles all of it.
+# Pushing a tag v* builds, for every target, musqld, musql-convert, the musql
+# command line and the Doom example (musql-<os>-<arch>) and musql cloud
+# (musql-cloud-<os>-<arch>), and attaches them to a GitHub release; two images,
+# musql (musqld) and musql-cloud, go to ghcr. Everything is pure Go
+# (CGO_ENABLED=0), so one Linux runner cross-compiles all of it.
 #
 # musql cloud is built with -tags jitllm, the embedded AI, on all six targets
 # (it cross-compiles with CGO_ENABLED=0 on each), and ships the console, which
@@ -36,6 +36,7 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: |
             go.sum
+            cloud/go.sum
             examples/doom/go.sum
       - name: build
         run: |
@@ -47,6 +48,7 @@ jobs:
           flags=(-trimpath -ldflags="-s -w")
           (cd hrana && go build "${flags[@]}" -o "$out/musqld$ext" ./cmd/musqld)
           go build "${flags[@]}" -o "$out/musql-convert$ext" ./cmd/musql-convert
+          (cd cloud && go build "${flags[@]}" -o "$out/musql$ext" ./cmd/musql)
           (cd examples/doom && go build "${flags[@]}" -o "$out/musql-doom$ext" ./cmd/doom)
           cp LICENSE README.md "$out/"
           cd dist

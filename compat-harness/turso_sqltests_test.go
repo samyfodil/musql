@@ -706,15 +706,6 @@ func tsRunFile(t *testing.T, rel, path string, fix *tsFixtures, st *tsStats) {
 	}
 }
 
-// tsMathFuncs are the functions of SQLITE_ENABLE_MATH_FUNCTIONS (func.c), which
-// the oracle's build does not compile in.
-var tsMathFuncs = map[string]bool{
-	"acos": true, "acosh": true, "asin": true, "asinh": true, "atan": true, "atan2": true, "atanh": true,
-	"ceil": true, "ceiling": true, "cos": true, "cosh": true, "degrees": true, "exp": true, "floor": true,
-	"ln": true, "log": true, "log10": true, "log2": true, "mod": true, "pi": true, "pow": true, "power": true,
-	"radians": true, "sin": true, "sinh": true, "sqrt": true, "tan": true, "tanh": true, "trunc": true,
-}
-
 // tsLacks reports whether a capability is one neither musql nor the oracle has.
 func tsLacks(capability string) bool {
 	return capability == "custom_types" || capability == "materialized_views"
@@ -809,10 +800,6 @@ func tsRunCase(t *testing.T, rel string, tf *tsFile, db tsDB, c tsCase, matrix, 
 		if strings.HasPrefix(r.Err, "no such table: btree_dump") || strings.HasPrefix(r.Err, "no such function: turso_") {
 			st.skip("Turso-only extension (btree_dump, turso_*): neither engine under test has it")
 			t.Skip("Turso-only extension")
-		}
-		if fn, ok := strings.CutPrefix(r.Err, "no such function: "); ok && tsMathFuncs[strings.ToLower(fn)] {
-			st.skip("the oracle build lacks the SQL math functions (SQLITE_ENABLE_MATH_FUNCTIONS)")
-			t.Skip("oracle lacks math functions")
 		}
 	}
 

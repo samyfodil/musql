@@ -16,3 +16,6 @@ var HasVector = sync.OnceValue(func() bool {
 // is measured, not scaled: 8 made a recursive CTE slower than no JIT at
 // all, and 12 through 24 measured the same on every demo workload.
 const VMMinWork = 24
+
+// VMReal reports whether the VM JIT has its REAL arms (VReal to VMath).
+const VMReal = false
