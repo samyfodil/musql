@@ -17,14 +17,12 @@ var vmFKernelXMMs = []XReg{X0, X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12
 
 // fload puts r[r] in x as a double: a REAL's F, an INTEGER converted (only
 // when intOK), anything else exiting at pc. isReal, when non-nil, gets 1
-// ORed in when the operand was a REAL.
+// ORed in when the operand was a REAL; the caller passes it only where no
+// operand is known to be one.
 func (e *vmEmit) fload(pc, r int, x XReg, intOK bool, isReal Reg) {
 	a, L := e.a, e.lay
 	if e.know.isFloat[r] {
 		a.MovsdLoad(x, RSI, e.d(r, L.OffF))
-		if isReal != 0 {
-			a.aluImm32(1, isReal, 1)
-		}
 		return
 	}
 	if e.know.isInt[r] && intOK {

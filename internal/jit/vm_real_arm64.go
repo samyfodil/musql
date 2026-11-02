@@ -42,15 +42,13 @@ func (e *vmEmitArm) vmLabel(s string) string {
 }
 
 // fload puts r[r] in d as a double: a REAL's F, an INTEGER converted (only
-// when intOK), anything else exiting at pc. When flag is set, it becomes 1
-// when the operand was a REAL.
+// when intOK), anything else exiting at pc. When useFlag is set, flag becomes
+// 1 when the operand was a REAL; the caller sets it only where no operand is
+// known to be one.
 func (e *vmEmitArm) fload(pc, r int, d VReg, intOK bool, flag Reg64, useFlag bool) {
 	a, L := e.a, e.lay
 	if e.know.isFloat[r] {
 		e.fldr(d, r)
-		if useFlag {
-			a.MovImm16(flag, 1)
-		}
 		return
 	}
 	if e.know.isInt[r] && intOK {

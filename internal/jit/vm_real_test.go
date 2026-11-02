@@ -199,3 +199,78 @@ func TestVMMath(t *testing.T) {
 		}
 	}
 }
+
+// TestVMRealPaths: the REAL arms where the emitter knows an operand's type,
+// where a result is dead, a fused test that jumps on false, a REAL compare's
+// result kept in a machine register, and a VMath with no usable kernel.
+func TestVMRealPaths(t *testing.T) {
+	if !Available || !VMReal {
+		t.Skip("no REAL arms here")
+	}
+	all := func(n int) []bool { return make([]bool, n) }
+	entry := func(n int) []bool { e := all(n); e[0] = true; return e }
+	// r0 = 2.5 (known REAL), r1 = 3 (known INTEGER), r2 = r1 + r0, a dead
+	// REAL and a dead sum, then r0 < r2 kept in a register for r3 = r4 + it.
+	regs := []tvalue{{}, {}, {}, {}, tint(10), {}}
+	prog := []VInsn{
+		{Op: VReal, A: 0, Imm: int64(math.Float64bits(2.5))},
+		{Op: VInt, A: 1, Imm: 3},
+		{Op: VFAdd, A: 0, B: 1, C: 2},
+		{Op: VReal, A: 5, Imm: int64(math.Float64bits(9)), Dead: true},
+		{Op: VFMul, A: 0, B: 2, C: 5, Dead: true},
+		{Op: VFCmpSet, A: 2, B: 0, C: 3, Cond: CondL},
+		{Op: VAdd, A: 3, B: 4, C: 3},
+		{Op: VFCmpJump, A: 0, B: 2, T: 9, Cond: CondG},
+		{Op: VExit},
+		{Op: VExit},
+	}
+	args := &ProgArgs{}
+	runVM(t, prog, entry(len(prog)), regs, args, 0)
+	if args.PC != 9 || !same(regs[2], treal(5.5)) || !same(regs[3], tint(11)) {
+		t.Errorf("known types: pc %d r2 %+v r3 %+v", args.PC, regs[2], regs[3])
+	}
+	// A fused compare that jumps when false, its result dead.
+	for _, x := range []float64{1, 4} {
+		regs = []tvalue{treal(x), treal(2), tint(77)}
+		prog = []VInsn{
+			{Op: VFCmpBr, A: 1, B: 0, C: 2, T: 3, Cond: CondG, Dead: true},
+			{Op: VFused, A: 2, C: 0, T: 3},
+			{Op: VExit},
+			{Op: VExit},
+		}
+		args = &ProgArgs{}
+		runVM(t, prog, entry(len(prog)), regs, args, 0)
+		if want := map[bool]int64{true: 2, false: 3}[x > 2]; args.PC != want {
+			t.Errorf("VFCmpBr on false, %v > 2: pc %d, want %d", x, args.PC, want)
+		}
+	}
+	// No kernel, or one of the wrong arity: the VDBE's.
+	k := fir.New("one", 1, false)
+	k.Return(k.Arg(0))
+	one, err := k.Func()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, in := range []VInsn{{Op: VMath, A: 0, B: 1, C: 1}, {Op: VMath, A: 0, B: 2, C: 1, Kernel: one}} {
+		regs = []tvalue{treal(1), tint(77)}
+		args = &ProgArgs{}
+		runVM(t, []VInsn{in, {Op: VExit}}, nil, regs, args, 0)
+		if args.PC != 0 || !same(regs[1], tint(77)) {
+			t.Errorf("%+v: pc %d r1 %+v, want an exit", in, args.PC, regs[1])
+		}
+	}
+	// A kernel the CPU cannot run fails the emission.
+	k = fir.New("fma", 1, false)
+	x := k.Arg(0)
+	k.Return(k.FMA(x, x, x))
+	fma, err := k.Func()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore := SetCPUForTest(false, false)
+	_, err = EmitVM([]VInsn{{Op: VMath, A: 0, B: 1, C: 1, Kernel: fma}, {Op: VExit}}, 2, tvLayout)
+	restore()
+	if err == nil {
+		t.Error("a kernel needing FMA was emitted without it")
+	}
+}
