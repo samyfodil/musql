@@ -1386,7 +1386,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				goto dispatch
 			}
 			// Nor one that would copy a row out for too little native work.
-			if jx.light != nil && jx.light[pc] && jx.copies(m, pc) {
+			if jx.light != nil && jx.light[pc] >= 0 && jx.copies(m, pc) > int(jx.light[pc]) {
 				op = &insns[pc]
 				goto dispatch
 			}

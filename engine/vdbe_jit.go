@@ -39,9 +39,10 @@ type vmJIT struct {
 	// engine copies out of a cursor it cannot hand over as a row list. Nil
 	// for a pc with none.
 	fill [][]curCols
-	// light[pc] is whether an entry at pc does too little besides its column
-	// reads to pay for copying a cursor's row out (copyHeavy); nil for none.
-	light []bool
+	// light[pc] is how many cursors an entry at pc may copy rows out of and
+	// still do enough besides its column reads to pay for them (copyLimit):
+	// 0 or 1, or -1 for any; nil for no entry with a limit.
+	light []int8
 
 	// updAt is the pc of the OpUpdateRow whose record native code gathers
 	// (gatherUpdate), or -1. Its rows are the ones a call hands back, and the
@@ -291,11 +292,14 @@ func compileVMJIT(prog *Program) *vmJIT {
 		}
 		jx.gate[pc] = int16(firstCursor(vp, pc))
 		jx.fill[pc] = fillColumns(vp, pc)
-		if jx.fill[pc] != nil && copyHeavy(vp, pc) {
+		if l := copyLimit(vp, pc); jx.fill[pc] != nil && l >= 0 {
 			if jx.light == nil {
-				jx.light = make([]bool, len(vp))
+				jx.light = make([]int8, len(vp))
+				for i := range jx.light {
+					jx.light[i] = -1
+				}
 			}
-			jx.light[pc] = true
+			jx.light[pc] = int8(l)
 		}
 	}
 	for _, in := range vp {
@@ -598,19 +602,35 @@ func worthEntering(vp []jit.VInsn, pc int) bool {
 }
 
 // vmJITCopyWork is the native work, past its column reads, that an entry must
-// do to pay for copying a cursor's row out for it (enter's jitSnap): the
+// do to pay for copying cursors' rows out for it (enter's jitSnap): the
 // engine reads those columns itself, one call each, so the native reads save
 // nothing, and the entry's bookkeeping is several times a plain one's.
 // Measured on joins whose inner seek is read in place: a run of two column
-// reads and a test made a count over a join 28% slower than the VDBE alone.
-const vmJITCopyWork = 24
+// reads and a test made a count over a join 28% slower than the VDBE alone,
+// and a join that copied both its cursors' rows for a comparison and a row 47%
+// slower. A scan copying its one row is paid for sooner (vmJITCopyWorkOne):
+// a filter and a projection over a lazily read segment ran 1.4-1.7x faster.
+const (
+	vmJITCopyWork    = 24
+	vmJITCopyWorkOne = 8
+)
 
-// copyHeavy is whether an entry at pc does less than vmJITCopyWork besides
-// reading columns: the entries run skips when a cursor they read would have to
-// be copied out.
-func copyHeavy(vp []jit.VInsn, pc int) bool {
+// vmJITMathWork is a math kernel's weight in nativeRun: the VDBE's call of
+// the same function costs about as much as a dozen of its plain steps.
+const vmJITMathWork = 24
+
+// copyLimit is how many cursors an entry at pc may have copied out and still
+// be entered (light): 0 when it does less than vmJITCopyWorkOne besides
+// reading columns, 1 when less than vmJITCopyWork, -1 when it pays for any.
+func copyLimit(vp []jit.VInsn, pc int) int {
 	w, _, reads := nativeRun(vp, pc, vmJITCopyWork+64)
-	return w-reads < vmJITCopyWork
+	switch {
+	case w-reads < vmJITCopyWorkOne:
+		return 0
+	case w-reads < vmJITCopyWork:
+		return 1
+	}
+	return -1
 }
 
 // nativeRun weighs the native instructions from pc along the fall-through and
@@ -634,6 +654,8 @@ func nativeRun(vp []jit.VInsn, pc, limit int) (w int, cursor bool, reads int) {
 			cursor = true
 		case jit.VResultRow:
 			return w + 2, cursor, reads // native code returns to Go there
+		case jit.VMath:
+			w += vmJITMathWork
 		default:
 			w += 2
 		}
@@ -875,15 +897,20 @@ func sameRow(a, b []Value) bool {
 	return len(a) == len(b) && len(a) > 0 && &a[0] == &b[0]
 }
 
-// copies is whether an entry at pc would copy a row out of a cursor it reads,
-// one native code cannot walk.
-func (jx *vmJIT) copies(m *vdbe, pc int) bool {
+// copies is how many cursors an entry at pc would copy a row out of: those it
+// reads that native code cannot walk, and a point seek, whose one row
+// seekSnap copies for this entry alone.
+func (jx *vmJIT) copies(m *vdbe, pc int) int {
+	n := 0
 	for _, cc := range jx.fill[pc] {
-		if cc.cursor < len(m.cursors) && !jitCursorOK(m.cursors[cc.cursor]) && !seekWalkable(m.cursors[cc.cursor]) {
-			return true
+		if cc.cursor >= len(m.cursors) {
+			continue
+		}
+		if cur := m.cursors[cc.cursor]; !jitCursorOK(cur) && (cur == nil || !seekWalkable(cur) || cur.segSrc.point) {
+			n++
 		}
 	}
-	return false
+	return n
 }
 
 // jitSnap is the one-row list a cursor native code can read but not walk is
