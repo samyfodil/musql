@@ -224,6 +224,9 @@ func funcArity(name string) (min, max int, ok bool) {
 // "non-deterministic use of %s() in %s" (vdbeaux.c:5643) instead of a value.
 // Empty everywhere else, which is every ordinary statement.
 func callScalarFuncEnc(name string, args []Value, caseSensitiveLike bool, enc TextEncoding, pureCtx uint16) (Value, error) {
+	if v, ok, err := callMathFunc(name, args, enc); ok {
+		return v, err
+	}
 	if err := coerceUTF16BlobArgs(name, args, enc); err != nil {
 		return Value{}, err
 	}
@@ -592,9 +595,6 @@ func callScalarFuncEnc(name string, args []Value, caseSensitiveLike bool, enc Te
 		return fts5LocaleFunc(args)
 
 	default:
-		if v, ok, err := callMathFunc(name, args, enc); ok {
-			return v, err
-		}
 		if _, ok := jsonFuncFlags[name]; ok {
 			return callJSONFunc(name, args, enc)
 		}

@@ -38,13 +38,49 @@ func mathFuncArity(name string) (lo, hi int, ok bool) {
 }
 
 // callMathFunc is name(args) for a math function, and ok == false for any
-// other name.
+// other name. It is the first thing callScalarFuncEnc tries, so it decides
+// with one switch.
 func callMathFunc(name string, args []Value, enc TextEncoding) (v Value, ok bool, err error) {
-	lo, hi, ok := mathFuncArity(name)
-	if !ok {
+	var f1 func(float64) float64
+	switch name {
+	case "exp":
+		f1 = libm.Exp
+	case "sin":
+		f1 = libm.Sin
+	case "cos":
+		f1 = libm.Cos
+	case "tan":
+		f1 = libm.Tan
+	case "asin":
+		f1 = libm.Asin
+	case "acos":
+		f1 = libm.Acos
+	case "atan":
+		f1 = libm.Atan
+	case "sinh":
+		f1 = libm.Sinh
+	case "cosh":
+		f1 = libm.Cosh
+	case "tanh":
+		f1 = libm.Tanh
+	case "asinh":
+		f1 = libm.Asinh
+	case "acosh":
+		f1 = libm.Acosh
+	case "atanh":
+		f1 = libm.Atanh
+	case "sqrt":
+		f1 = math.Sqrt
+	case "radians":
+		// degToRad: x*(M_PI/180.0), whose double is the one nearest pi/180.
+		f1 = func(x float64) float64 { return x * (math.Pi / 180) }
+	case "degrees":
+		f1 = func(x float64) float64 { return x * (180 / math.Pi) }
+	case "pi", "ceil", "ceiling", "floor", "trunc", "ln", "log", "log10", "log2", "pow", "power", "mod", "atan2":
+	default:
 		return Value{}, false, nil
 	}
-	if len(args) < lo || len(args) > hi {
+	if lo, hi, _ := mathFuncArity(name); len(args) < lo || len(args) > hi {
 		return Value{}, true, fmt.Errorf("engine: wrong number of arguments to function %s()", name)
 	}
 	switch name {
@@ -57,13 +93,12 @@ func callMathFunc(name string, args []Value, enc TextEncoding) (v Value, ok bool
 	case "pow", "power", "mod", "atan2":
 		x, xok := mathNumeric(args[0])
 		y, yok := mathNumeric(args[1])
-		if !xok || !yok {
+		switch {
+		case !xok || !yok:
 			return Value{Typ: Null}, true, nil
-		}
-		switch name {
-		case "mod":
+		case name == "mod":
 			return mathResult(math.Mod(x, y)), true, nil
-		case "atan2":
+		case name == "atan2":
 			return mathResult(libm.Atan2(x, y)), true, nil
 		}
 		return mathResult(libm.Pow(x, y)), true, nil
@@ -72,43 +107,7 @@ func callMathFunc(name string, args []Value, enc TextEncoding) (v Value, ok bool
 	if !xok {
 		return Value{Typ: Null}, true, nil
 	}
-	var r float64
-	switch name {
-	case "exp":
-		r = libm.Exp(x)
-	case "acos":
-		r = libm.Acos(x)
-	case "asin":
-		r = libm.Asin(x)
-	case "atan":
-		r = libm.Atan(x)
-	case "cos":
-		r = libm.Cos(x)
-	case "sin":
-		r = libm.Sin(x)
-	case "tan":
-		r = libm.Tan(x)
-	case "cosh":
-		r = libm.Cosh(x)
-	case "sinh":
-		r = libm.Sinh(x)
-	case "tanh":
-		r = libm.Tanh(x)
-	case "acosh":
-		r = libm.Acosh(x)
-	case "asinh":
-		r = libm.Asinh(x)
-	case "atanh":
-		r = libm.Atanh(x)
-	case "sqrt":
-		r = math.Sqrt(x)
-	case "radians":
-		// degToRad: x*(M_PI/180.0), whose double is the one nearest pi/180.
-		r = x * (math.Pi / 180)
-	case "degrees":
-		r = x * (180 / math.Pi)
-	}
-	return mathResult(r), true, nil
+	return mathResult(f1(x)), true, nil
 }
 
 // mathCeiling is ceilingFunc: an INTEGER is its own answer, and a REAL goes
