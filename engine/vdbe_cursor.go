@@ -224,6 +224,10 @@ type vdbeCursor struct {
 	// row. Its errors travel through streamErrPending like stream's.
 	sub *subStream
 
+	// vt, when non-nil, makes this a virtual-table cursor read through the
+	// module's live cursor (vtab_stream.go) rather than its materialized rows.
+	vt *vtabStream
+
 	// genCached memoizes hasGeneratedCols(tbl.cols) for this cursor, which
 	// normalize() below would otherwise re-derive on EVERY row -- a full scan of
 	// the column list per scanned row, ~7% of a filtered full-table scan, to
@@ -783,6 +787,11 @@ func (cur *vdbeCursor) rewind() error {
 	if cur.sub != nil {
 		return cur.rewindStream()
 	}
+	if cur.vt != nil {
+		if streamed, err := cur.rewindVtab(); streamed || err != nil {
+			return err
+		}
+	}
 	if cur.fill != nil {
 		fill := cur.fill
 		if !cur.refillEach {
@@ -1206,6 +1215,9 @@ func leadingIndexColumn(sqlText string) (string, bool) {
 func (cur *vdbeCursor) advance() bool {
 	if cur.sub != nil {
 		return cur.advanceStream()
+	}
+	if cur.vt != nil {
+		return cur.advanceVtab()
 	}
 	if cur.segSrc != nil {
 		s, row, rowid, ok := cur.segSrc.next()

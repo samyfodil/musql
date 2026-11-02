@@ -227,8 +227,9 @@ func tvfArgIsLateral(c *compiler, arg Expr, allowed map[int]bool) bool {
 //
 // Right-hand sides are compiled under a narrowed scope including only
 // levels bound strictly before this one. Must run before emitJoinSeekHint
-// at the same level, as this is the only open such a source gets.
-func (c *compiler) emitVtabCorrelatedOpen(srcs []joinSource, order []int, level int, s joinSource) error {
+// at the same level, as this is the only open such a source gets. stream is
+// derivedSource.vtabStream.
+func (c *compiler) emitVtabCorrelatedOpen(srcs []joinSource, order []int, level int, s joinSource, stream bool) error {
 	if len(s.vtabCorr) == 0 {
 		return nil
 	}
@@ -251,6 +252,14 @@ func (c *compiler) emitVtabCorrelatedOpen(srcs []joinSource, order []int, level 
 		terms[i] = t
 	}
 	c.emit(Instruction{Op: OpOpenDerived, P1: s.scope.cursor, P2: s.derivedSlot,
-		P4: &derivedSource{vtab: s.vtabItem, vtabTrig: c.trig, vtabCorr: terms, tbl: s.tbl, dbIdx: s.dbIdx, rightJoin: s.rightOuter}})
+		P4: &derivedSource{vtab: s.vtabItem, vtabTrig: c.trig, vtabCorr: terms, tbl: s.tbl, dbIdx: s.dbIdx, rightJoin: s.rightOuter, vtabStream: stream}})
 	return nil
+}
+
+// vtabStreamable reports whether the virtual table s, at join level level,
+// may stream (derivedSource.vtabStream): no RIGHT JOIN sweeps it, and no
+// automatic index, multi-OR grouping or join seek works on its rows.
+func vtabStreamable(plan joinPlan, level int, s joinSource) bool {
+	return !s.rightOuter && s.joinIdxSeek == nil && s.joinSeekKeyExpr == nil &&
+		(level >= len(plan.autoIdxKeys) || plan.autoIdxKeys[level] == nil)
 }

@@ -815,7 +815,7 @@ func VMJITCursorEntersForTest() int64 { return vmJITCursorEnters.Swap(0) }
 // OP_Next is the same walk of its frozen list, and the engine replays what
 // advance() does with the row after the call (enter).
 func jitCursorOK(cur *vdbeCursor) bool {
-	return cur != nil && cur.materialized && cur.sub == nil && cur.segSrc == nil && cur.segCur == nil &&
+	return cur != nil && cur.materialized && cur.sub == nil && cur.vt == nil && cur.segSrc == nil && cur.segCur == nil &&
 		cur.rowRaw == nil && !cur.rowidNull &&
 		cur.streamErrPending == nil && len(cur.rows) >= len(cur.rowids)
 }
