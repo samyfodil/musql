@@ -48,11 +48,12 @@ func RegAllocStatsForTest() (allocated, spilled, coalesced int64) {
 //
 // Nothing is allocated when fusion is off (the unfused emission is the
 // reference the fused one is tested against), when the program has a
-// service (it reads any register, from the file, mid-row), or for a
-// register a text step writes (those write the file themselves).
+// service (it reads any register, from the file, mid-row) or a math kernel
+// (which takes the pool's registers), or for a register a text step writes
+// (those write the file themselves).
 func allocProgRegs(insns []ProgInsn, pool int) progAlloc {
 	var pa progAlloc
-	if pool == 0 || !Fusing() || progHasService(insns) {
+	if pool == 0 || !Fusing() || progHasService(insns) || slices.ContainsFunc(insns, func(in ProgInsn) bool { return in.Op == POpMath }) {
 		return pa
 	}
 	nRegs := progRegs(insns)

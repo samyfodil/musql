@@ -224,6 +224,10 @@ type vdbeCursor struct {
 	// row. Its errors travel through streamErrPending like stream's.
 	sub *subStream
 
+	// vt, when non-nil, makes this a virtual-table cursor read through the
+	// module's live cursor (vtab_stream.go) rather than its materialized rows.
+	vt *vtabStream
+
 	// genCached memoizes hasGeneratedCols(tbl.cols) for this cursor, which
 	// normalize() below would otherwise re-derive on EVERY row -- a full scan of
 	// the column list per scanned row, ~7% of a filtered full-table scan, to
@@ -783,6 +787,11 @@ func (cur *vdbeCursor) rewind() error {
 	if cur.sub != nil {
 		return cur.rewindStream()
 	}
+	if cur.vt != nil {
+		if streamed, err := cur.rewindVtab(); streamed || err != nil {
+			return err
+		}
+	}
 	if cur.fill != nil {
 		fill := cur.fill
 		if !cur.refillEach {
@@ -1207,6 +1216,9 @@ func (cur *vdbeCursor) advance() bool {
 	if cur.sub != nil {
 		return cur.advanceStream()
 	}
+	if cur.vt != nil {
+		return cur.advanceVtab()
+	}
 	if cur.segSrc != nil {
 		s, row, rowid, ok := cur.segSrc.next()
 		if !ok {
@@ -1394,7 +1406,7 @@ func (cur *vdbeCursor) materializeRowStore() {
 	n := tbl.rows.len()
 	var rowids []uint64
 	var rows [][]Value
-	if f, st := cur.segFilter, tbl.rows; f != nil && st != nil && st.seg != nil && !lowReadsVirtual(tbl.cols, f.low) {
+	if f, st := cur.segFilter, tbl.rows; f != nil && st != nil && st.seg != nil && !readsVirtual(tbl.cols, f.cols) {
 		// A write scan the filter peephole judged safe to restrict
 		// (segWriteFilterPeephole): only the base rows that can match, and
 		// every row the overlay holds, are decoded. Sized for the overlay, which

@@ -48,12 +48,15 @@
 // SQLITE_INNOCUOUS's bit with the opposite meaning for built-ins) and hash.c's
 // element-list order would each be a formula nothing here could check.
 //
-// The BUILT-IN half is identical in both builds (131 rows). The CONNECTION half
-// is where they differ: the default build registers 16 rows -- the fts3 and
-// rtree extensions' functions, match() (sqlite3_overload_function), and the
-// five authenticate/auth_* functions mattn/go-sqlite3 registers on every
-// connection it opens (its sqlite3.go) -- and -tags sqlite_fts5 adds
-// fts5's seven, which land INTERLEAVED in that hash's order, not appended.
+// The BUILT-IN half is identical in both builds (161 rows, the math
+// functions' among them: both builds have -tags sqlite_math_functions, which
+// is SQLITE_ENABLE_MATH_FUNCTIONS, as this engine always does). The
+// CONNECTION half is where they differ: the default build registers 16 rows --
+// the fts3 and rtree extensions' functions, match()
+// (sqlite3_overload_function), and the five authenticate/auth_* functions
+// mattn/go-sqlite3 registers on every connection it opens (its sqlite3.go) --
+// and -tags sqlite_fts5 adds fts5's seven, which land INTERLEAVED in that
+// hash's order, not appended.
 // Which half applies is decided the way pragma_module_list.go decides it:
 // whether this process has fts5 registered.
 //
@@ -78,6 +81,7 @@ type pragmaFunctionListRow struct {
 // pragmaFunctionListBuiltinRows is the sqlite3BuiltinFunctions half, in the
 // oracle's bucket order. See this file's doc comment.
 var pragmaFunctionListBuiltinRows = []pragmaFunctionListRow{
+	{"pow", 1, "s", "utf8", 2, 2099200},
 	{"group_concat", 1, "w", "utf8", 1, 2097152},
 	{"group_concat", 1, "w", "utf8", 2, 2097152},
 	{"json_type", 1, "s", "utf8", 1, 2099200},
@@ -94,6 +98,7 @@ var pragmaFunctionListBuiltinRows = []pragmaFunctionListRow{
 	{"->", 1, "s", "utf8", 2, 2099200},
 	{"json_array", 1, "s", "utf8", -1, 3147776},
 	{"current_timestamp", 1, "s", "utf8", 0, 2097152},
+	{"power", 1, "s", "utf8", 2, 2099200},
 	{"sqlite_compileoption_used", 1, "s", "utf8", 1, 2097152},
 	{"json_remove", 1, "s", "utf8", -1, 2099200},
 	{"json_pretty", 1, "s", "utf8", 1, 2099200},
@@ -103,6 +108,7 @@ var pragmaFunctionListBuiltinRows = []pragmaFunctionListRow{
 	{"json_insert", 1, "s", "utf8", -1, 3147776},
 	{"->>", 1, "s", "utf8", 2, 2099200},
 	{"jsonb_array", 1, "s", "utf8", -1, 3147776},
+	{"sin", 1, "s", "utf8", 1, 2099200},
 	{"sum", 1, "w", "utf8", 1, 2097152},
 	{"quote", 1, "s", "utf8", 1, 2099200},
 	{"printf", 1, "s", "utf8", -1, 2099200},
@@ -115,6 +121,9 @@ var pragmaFunctionListBuiltinRows = []pragmaFunctionListRow{
 	{"last_value", 1, "w", "utf8", 1, 2097152},
 	{"rank", 1, "w", "utf8", 0, 2097152},
 	{"sign", 1, "s", "utf8", 1, 2099200},
+	{"sqrt", 1, "s", "utf8", 1, 2099200},
+	{"sinh", 1, "s", "utf8", 1, 2099200},
+	{"tan", 1, "s", "utf8", 1, 2099200},
 	{"round", 1, "s", "utf8", 1, 2099200},
 	{"round", 1, "s", "utf8", 2, 2099200},
 	{"rtrim", 1, "s", "utf8", 1, 2099200},
@@ -122,10 +131,13 @@ var pragmaFunctionListBuiltinRows = []pragmaFunctionListRow{
 	{"jsonb_replace", 1, "s", "utf8", -1, 3147776},
 	{"jsonb_extract", 1, "s", "utf8", -1, 2099200},
 	{"nth_value", 1, "w", "utf8", 2, 2097152},
+	{"tanh", 1, "s", "utf8", 1, 2099200},
 	{"random", 1, "s", "utf8", 0, 2097152},
 	{"trim", 1, "s", "utf8", 1, 2099200},
 	{"trim", 1, "s", "utf8", 2, 2099200},
 	{"time", 1, "s", "utf8", -1, 2099200},
+	{"radians", 1, "s", "utf8", 1, 2099200},
+	{"trunc", 1, "s", "utf8", 1, 2099200},
 	{"total", 1, "w", "utf8", 1, 2097152},
 	{"substr", 1, "s", "utf8", 2, 2099200},
 	{"substr", 1, "s", "utf8", 3, 2099200},
@@ -148,6 +160,9 @@ var pragmaFunctionListBuiltinRows = []pragmaFunctionListRow{
 	{"json_array_length", 1, "s", "utf8", 2, 2099200},
 	{"json_array_insert", 1, "s", "utf8", -1, 3147776},
 	{"strftime", 1, "s", "utf8", -1, 2099200},
+	{"atan", 1, "s", "utf8", 1, 2099200},
+	{"asin", 1, "s", "utf8", 1, 2099200},
+	{"acos", 1, "s", "utf8", 1, 2099200},
 	{"substring", 1, "s", "utf8", 2, 2099200},
 	{"substring", 1, "s", "utf8", 3, 2099200},
 	{"randomblob", 1, "s", "utf8", 1, 2097152},
@@ -157,23 +172,34 @@ var pragmaFunctionListBuiltinRows = []pragmaFunctionListRow{
 	{"timediff", 1, "s", "utf8", 2, 2099200},
 	{"percent_rank", 1, "w", "utf8", 0, 2097152},
 	{"row_number", 1, "w", "utf8", 0, 2097152},
+	{"atanh", 1, "s", "utf8", 1, 2099200},
+	{"asinh", 1, "s", "utf8", 1, 2099200},
+	{"acosh", 1, "s", "utf8", 1, 2099200},
+	{"cos", 1, "s", "utf8", 1, 2099200},
+	{"atan2", 1, "s", "utf8", 2, 2099200},
 	{"string_agg", 1, "w", "utf8", 2, 2097152},
 	{"last_insert_rowid", 1, "s", "utf8", 0, 2097152},
 	{"sqlite_log", 1, "s", "utf8", 2, 2099200},
 	{"unlikely", 1, "s", "utf8", 1, 2099200},
 	{"json_error_position", 1, "s", "utf8", 1, 2099200},
+	{"cosh", 1, "s", "utf8", 1, 2099200},
+	{"ceil", 1, "s", "utf8", 1, 2099200},
 	{"char", 1, "s", "utf8", -1, 2099200},
 	{"unixepoch", 1, "s", "utf8", -1, 2099200},
+	{"exp", 1, "s", "utf8", 1, 2099200},
 	{"count", 1, "w", "utf8", 0, 2097152},
 	{"count", 1, "w", "utf8", 1, 2097152},
 	{"date", 1, "s", "utf8", -1, 2099200},
 	{"concat", 1, "s", "utf8", -3, 2099200},
+	{"ceiling", 1, "s", "utf8", 1, 2099200},
 	{"total_changes", 1, "s", "utf8", 0, 2097152},
 	{"changes", 1, "s", "utf8", 0, 2097152},
 	{"unistr_quote", 1, "s", "utf8", 1, 2099200},
 	{"sqlite_version", 1, "s", "utf8", 0, 2097152},
 	{"if", 1, "s", "utf8", -4, 2099200},
 	{"coalesce", 1, "s", "utf8", -4, 2099200},
+	{"degrees", 1, "s", "utf8", 1, 2099200},
+	{"floor", 1, "s", "utf8", 1, 2099200},
 	{"glob", 1, "s", "utf8", 2, 2099200},
 	{"zeroblob", 1, "s", "utf8", 1, 2099200},
 	{"hex", 1, "s", "utf8", 1, 2099200},
@@ -183,9 +209,12 @@ var pragmaFunctionListBuiltinRows = []pragmaFunctionListRow{
 	{"format", 1, "s", "utf8", -1, 2099200},
 	{"datetime", 1, "s", "utf8", -1, 2099200},
 	{"cume_dist", 1, "w", "utf8", 0, 2097152},
+	{"ln", 1, "s", "utf8", 1, 2099200},
 	{"instr", 1, "s", "utf8", 2, 2099200},
 	{"json", 1, "s", "utf8", 1, 2099200},
 	{"dense_rank", 1, "w", "utf8", 0, 2097152},
+	{"log", 1, "s", "utf8", 1, 2099200},
+	{"log", 1, "s", "utf8", 2, 2099200},
 	{"ifnull", 1, "s", "utf8", 2, 2099200},
 	{"jsonb", 1, "s", "utf8", 1, 2099200},
 	{"current_date", 1, "s", "utf8", 0, 2097152},
@@ -193,6 +222,8 @@ var pragmaFunctionListBuiltinRows = []pragmaFunctionListRow{
 	{"lag", 1, "w", "utf8", 1, 2097152},
 	{"lag", 1, "w", "utf8", 3, 2097152},
 	{"lag", 1, "w", "utf8", 2, 2097152},
+	{"mod", 1, "s", "utf8", 2, 2099200},
+	{"log2", 1, "s", "utf8", 1, 2099200},
 	{"like", 1, "s", "utf8", 2, 2099200},
 	{"like", 1, "s", "utf8", 3, 2099200},
 	{"max", 1, "s", "utf8", -3, 2099200},
@@ -202,10 +233,12 @@ var pragmaFunctionListBuiltinRows = []pragmaFunctionListRow{
 	{"lead", 1, "w", "utf8", 1, 2097152},
 	{"lead", 1, "w", "utf8", 3, 2097152},
 	{"lead", 1, "w", "utf8", 2, 2097152},
+	{"log10", 1, "s", "utf8", 1, 2099200},
 	{"lower", 1, "s", "utf8", 1, 2099200},
 	{"ltrim", 1, "s", "utf8", 1, 2099200},
 	{"ltrim", 1, "s", "utf8", 2, 2099200},
 	{"first_value", 1, "w", "utf8", 1, 2097152},
+	{"pi", 1, "s", "utf8", 0, 2099200},
 	{"length", 1, "s", "utf8", 1, 2099200},
 	{"likely", 1, "s", "utf8", 1, 2099200},
 	{"json_set", 1, "s", "utf8", -1, 3147776},
