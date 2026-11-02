@@ -9,8 +9,14 @@ import "slices"
 // segGroupPlan is what OpSegHashAgg carries: which columns feed which
 // registers, and where the key tuple lives.
 type segGroupPlan struct {
-	keyCols []int // table column for each GROUP BY key
+	keyCols []int // table column for each GROUP BY key, -1 for keyProg's
 	keyRegs []int // register the scan body writes that key into
+	// keyProg computes the one key when it is an expression, a block a
+	// segment (segGroupKeys).
+	keyProg *segLowered
+	// bare is a plan whose outputs read the group's bare columns: each group
+	// is stepped with its whole last row, which only the bulk path does.
+	bare    bool
 	argCols []int // table column for each lowered aggregate argument
 	argRegs []int // register the scan body writes that argument into
 	agg     *aggPlan
@@ -24,7 +30,7 @@ type segGroupPlan struct {
 // segHashAggTable drives the whole grouped scan from segments, or declines to
 // let the ordinary loop run. A decline is all or nothing: the walk uses its own
 // hash table so any refusal can fall back cleanly.
-func (m *vdbe) segHashAggTable(p *ReadOnlyPager, rootPage uint32, plan *segGroupPlan) bool {
+func (m *vdbe) segHashAggTable(p *ReadOnlyPager, tbl *resolvedTable, plan *segGroupPlan) bool {
 	saved := m.hashAgg
 	if saved != nil && len(saved.buckets) > 0 {
 		return false // not the fresh table this walk may throw away
@@ -53,17 +59,18 @@ func (m *vdbe) segHashAggTable(p *ReadOnlyPager, rootPage uint32, plan *segGroup
 		}
 	}
 	m.hashAgg = nil
-	if !m.segHashAggWalk(p, rootPage, plan, w) {
+	if !m.segHashAggWalk(p, tbl, plan, w) {
 		m.hashAgg = saved
 		return false
 	}
 	return true
 }
 
-func (m *vdbe) segHashAggWalk(p *ReadOnlyPager, rootPage uint32, plan *segGroupPlan, w segWhere) bool {
+func (m *vdbe) segHashAggWalk(p *ReadOnlyPager, tbl *resolvedTable, plan *segGroupPlan, w segWhere) bool {
 	if p == nil || p.segs == nil || plan == nil || plan.agg == nil {
 		return false
 	}
+	rootPage := tbl.root
 	segs, ok := p.segs.byRoot[rootPage]
 	if !ok {
 		return false
@@ -82,11 +89,14 @@ func (m *vdbe) segHashAggWalk(p *ReadOnlyPager, rootPage uint32, plan *segGroupP
 	// first time it sees one (append([]Value(nil), keyVals...)) and otherwise
 	// only hashes it, so nothing downstream retains this slice.
 	keyVals := make([]Value, len(plan.keyRegs))
-	switch m.segGroupBulk(segs, plan, segTableIPK(m, plan), row, rowids, keyVals, w, skips, deltaLive) {
+	switch m.segGroupBulk(segs, plan, segTableIPK(m, plan), row, rowids, keyVals, w, skips, deltaLive, segColPlansFor(tbl)) {
 	case bulkAnswered:
 		return true
 	case bulkFailed:
 		return false
+	}
+	if plan.keyProg != nil || plan.bare {
+		return false // the row walk reads neither a computed key nor a whole row
 	}
 	for si, s := range segs {
 		skip, sk := skips[si], 0

@@ -2901,7 +2901,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				segGroupSeeksTaken.Add(1)
 				break
 			}
-			if m.segHashAggTable(cur.pager, cur.tbl.root, gplan) {
+			if m.segHashAggTable(cur.pager, cur.tbl, gplan) {
 				segFilterServed.Add(1)
 				pc = op.P2
 				continue
