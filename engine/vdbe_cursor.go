@@ -1406,7 +1406,7 @@ func (cur *vdbeCursor) materializeRowStore() {
 	n := tbl.rows.len()
 	var rowids []uint64
 	var rows [][]Value
-	if f, st := cur.segFilter, tbl.rows; f != nil && st != nil && st.seg != nil && !lowReadsVirtual(tbl.cols, f.low) {
+	if f, st := cur.segFilter, tbl.rows; f != nil && st != nil && st.seg != nil && !readsVirtual(tbl.cols, f.cols) {
 		// A write scan the filter peephole judged safe to restrict
 		// (segWriteFilterPeephole): only the base rows that can match, and
 		// every row the overlay holds, are decoded. Sized for the overlay, which

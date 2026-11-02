@@ -1,13 +1,15 @@
 package compat
 
 import (
-	"strings"
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -18,17 +20,29 @@ var workerBin = map[string]string{}
 var engineOrder = []string{"cgo", "musql"}
 
 var buildTag = map[string]string{
-	"cgo":    "cgoengine",
+	"cgo":   "cgoengine,sqlite_math_functions",
 	"musql": "musql",
 }
 
 // workerExt is each engine's own file extension: C's file and ours.
 var workerExt = map[string]string{
-	"cgo":    ".db",
+	"cgo":   ".db",
 	"musql": ".musq",
 }
 
 func TestMain(m *testing.M) {
+	// The oracle needs the SQL math functions musql always has, which
+	// mattn/go-sqlite3 compiles in only under -tags sqlite_math_functions;
+	// without them every math test would compare against "no such function".
+	if db, err := sql.Open("sqlite3", ":memory:"); err == nil {
+		var on int
+		db.QueryRow(`SELECT sqlite_compileoption_used('ENABLE_MATH_FUNCTIONS')`).Scan(&on)
+		db.Close()
+		if on != 1 {
+			fmt.Fprintln(os.Stderr, "compat-harness: build with -tags sqlite_math_functions (and sqlite_fts5 for the fts5 build)")
+			os.Exit(2)
+		}
+	}
 	dir, err := os.MkdirTemp("", "compat-workers-")
 	if err != nil {
 		panic(err)
@@ -298,4 +312,3 @@ func TestCorpus(t *testing.T) {
 		})
 	}
 }
-

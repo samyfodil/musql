@@ -107,7 +107,7 @@ const (
 
 	// Logical.
 	OpNot      // P1, P2: r[P2] = NOT r[P1] (NULL-preserving three-valued negation).
-	OpNegative // P1, P2: r[P2] = -r[P1] (SQLite unary minus, negateValueUnary -- preserves IEEE negative zero, unlike a "0 - x" subtraction).
+	OpNegative // P1, P2: r[P2] = -r[P1] (unary minus of a numeric literal, negateValueUnary: -0.0 is -0.0, where C's "0 - x" for any other operand gives +0.0).
 
 	// Affinity / cast. OpAffinity and OpRealAffinity MUTATE their target
 	// register(s) in place (a permanent change), exactly like SQLite's

@@ -49,20 +49,78 @@ data, or replicate a database across nodes that need to work independently.
 go get github.com/samyfodil/musql/driver
 ```
 
+A complete program, in a new module (`go mod init example`, then the
+`go get` above and `go run .`):
+
 ```go
+package main
+
 import (
     "database/sql"
+    "fmt"
+    "log"
 
     _ "github.com/samyfodil/musql/driver"
 )
 
-db, err := sql.Open("sqlite", "app.musq") // created if missing
-// ...then use db exactly like any database/sql database.
+func main() {
+    db, err := sql.Open("sqlite", "app.musq") // created if missing
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
+
+    if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS people (id INTEGER PRIMARY KEY, name TEXT)`); err != nil {
+        log.Fatal(err)
+    }
+    if _, err := db.Exec(`INSERT INTO people (name) VALUES (?)`, "John"); err != nil {
+        log.Fatal(err)
+    }
+
+    rows, err := db.Query(`SELECT id, name FROM people`)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer rows.Close()
+    for rows.Next() {
+        var id int
+        var name string
+        if err := rows.Scan(&id, &name); err != nil {
+            log.Fatal(err)
+        }
+        fmt.Println(id, name)
+    }
+    if err := rows.Err(); err != nil {
+        log.Fatal(err)
+    }
+}
 ```
 
 Pure Go, no CGo; needs Go 1.27 or newer. The driver registers as `sqlite`
 (and `musql`), so code written for another SQLite driver usually only
 changes its import. Use one SQL statement per `Exec` or `Query` call.
+
+### From the command line
+
+`musql open` runs SQL on a local database file, created if missing: a
+statement given as an argument, a script on standard input, or an interactive
+shell.
+
+```sh
+$ ./musql open app.musq
+Opened app.musq. End statements with ;  .help for commands.
+musql> CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT);
+musql> INSERT INTO people (name) VALUES ('John'), ('Ann');
+musql> .timer on
+musql> SELECT id, name FROM people;
+id  name
+1   John
+2   Ann
+Run Time: real 0.001
+```
+
+`musql` is in the [release archive](https://github.com/samyfodil/musql/releases/latest)
+with `musqld` and `musql-convert`. `.help` lists the shell's commands.
 
 ### As a server, no Go needed
 

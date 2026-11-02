@@ -134,15 +134,16 @@ make harness                  # differential tests vs C SQLite (needs CGo)
 make build_all_targets        # cross-build every supported GOOS/GOARCH
 ```
 
-The compat harness:
+The compat harness, whose oracle needs the SQL math functions musql has
+(`TestMain` refuses to run without them):
 
 ```sh
-cd compat-harness && go test -short -count=1 -timeout 7200s ./
+cd compat-harness && go test -tags sqlite_math_functions -short -count=1 -timeout 7200s ./
 ```
 
 - `-timeout` matters: the `-short` set runs well past Go's default 600 s, and a
   timed-out run reports only whatever ran before the cut.
-- Run both builds: the default one and `-tags sqlite_fts5`.
+- Run both builds: the default one and `-tags sqlite_fts5,sqlite_math_functions`.
 - Write the full log to a file and count `--- FAIL` lines; do not trust a
   truncated tail, and check for `panic:`.
 

@@ -84,5 +84,9 @@ func (f *ScalarFunction) call(args []Value) (Value, error) {
 	if f.NArg >= 0 && len(args) != f.NArg {
 		return Value{}, fmt.Errorf("engine: wrong number of arguments to function %s()", f.Name)
 	}
-	return f.Fn(args)
+	v, err := f.Fn(args)
+	if v.Typ == Float && v.F != v.F {
+		v = Value{Typ: Null} // sqlite3_result_double stores a NaN as NULL
+	}
+	return v, err
 }
