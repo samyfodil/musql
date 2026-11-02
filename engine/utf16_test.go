@@ -51,12 +51,19 @@ func TestUTF16CompareMatchesCSQLiteOrder(t *testing.T) {
 // TestUTF16RoundTripAndMemcmpAgreement verifies UTF-16 transcoding and comparison.
 func TestUTF16RoundTripAndMemcmpAgreement(t *testing.T) {
 	for _, enc := range []TextEncoding{UTF16LE, UTF16BE} {
-		for _, s := range []string{"", "a", "héllo", "\U0001F600ab", "z", "愀"} {
+		// The emoji share their high surrogate, so only the low halves tell
+		// them apart; "\xed\xa0\xbd\xed\xb8\x80" is 😀's two halves written
+		// as lone surrogates, which encode to the same units.
+		strs := []string{"", "a", "héllo", "\U0001F600ab", "z", "愀", "\U0001F600", "\U0001F601", "\U0001F600a", "\U0001F601a", "\xed\xa0\xbd\xed\xb8\x80", "\xed\xa0\xbd"}
+		for _, s := range strs[:6] {
 			enc16 := encodeTextBytes(enc, []byte(s))
 			if got := string(decodeTextBytes(enc, enc16)); got != s {
 				t.Errorf("enc %d: round trip of %q gave %q", enc, s, got)
 			}
-			for _, o := range []string{"", "a", "héllo", "\U0001F600ab", "z", "愀"} {
+		}
+		for _, s := range strs {
+			enc16 := encodeTextBytes(enc, []byte(s))
+			for _, o := range strs {
 				want := bytesCompare(enc16, encodeTextBytes(enc, []byte(o)))
 				if got := utf16CompareUTF8(enc, []byte(s), []byte(o)); sign(got) != sign(want) {
 					t.Errorf("enc %d: %q vs %q: utf16CompareUTF8=%d, memcmp of encoded=%d", enc, s, o, got, want)

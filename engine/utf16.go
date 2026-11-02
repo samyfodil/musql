@@ -163,33 +163,56 @@ func appendUTF8(dst []byte, c uint32) []byte {
 // nothing.
 func utf16CompareUTF8(enc TextEncoding, a, b []byte) int {
 	bigEndian := enc == UTF16BE
-	for len(a) > 0 && len(b) > 0 {
-		ua, na := nextUTF16Unit(a)
-		ub, nb := nextUTF16Unit(b)
+	ra, rb := utf16Units{s: a}, utf16Units{s: b}
+	for {
+		ua, oka := ra.next()
+		ub, okb := rb.next()
+		switch {
+		case !oka && !okb:
+			return 0
+		case !oka:
+			return -1
+		case !okb:
+			return 1
+		}
 		if ua != ub {
 			if utf16UnitLess(bigEndian, ua, ub) {
 				return -1
 			}
 			return 1
 		}
-		a, b = a[na:], b[nb:]
 	}
-	switch {
-	case len(a) > 0:
-		return 1
-	case len(b) > 0:
-		return -1
+}
+
+// utf16Units reads the UTF-16 code units a UTF-8 string encodes to, both halves
+// of a non-BMP code point included. It uses the same decoder and unit
+// arithmetic as encodeTextBytes (sqliteUTF8Next + utf16UnitsOf), so comparison
+// order and encoded bytes cannot disagree over malformed text. Reading only the
+// high surrogate made "SELECT '😀' = '😁'" true in a UTF-16 database: the two
+// share it.
+type utf16Units struct {
+	s   []byte
+	low uint16 // the pending low surrogate, when has
+	has bool
+}
+
+func (r *utf16Units) next() (uint16, bool) {
+	if r.has {
+		r.has = false
+		return r.low, true
 	}
-	return 0
+	if len(r.s) == 0 {
+		return 0, false
+	}
+	cp, n := sqliteUTF8Next(r.s)
+	r.s = r.s[n:]
+	u0, u1, pair := utf16UnitsOf(uint32(cp))
+	r.low, r.has = u1, pair
+	return u0, true
 }
 
 // nextUTF16Unit returns the first UTF-16 code unit s encodes to and how many
-// UTF-8 bytes it consumed. A non-BMP code point yields its high surrogate and
-// consumes the whole code point: the low surrogate is only reached after the
-// high ones agreed, when the code points are identical. It uses the same
-// decoder and unit arithmetic as encodeTextBytes (sqliteUTF8Next +
-// utf16UnitsOf), so comparison order and encoded bytes cannot disagree over
-// malformed text.
+// UTF-8 bytes it consumed: for a non-BMP code point, its high surrogate.
 func nextUTF16Unit(s []byte) (unit uint16, advance int) {
 	cp, n := sqliteUTF8Next(s)
 	u0, _, _ := utf16UnitsOf(uint32(cp))

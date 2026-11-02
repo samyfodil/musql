@@ -286,9 +286,8 @@ func appendCollatedKeyBytes(buf []byte, vals []Value, collations []string, enc T
 //   - RTRIM strips trailing ASCII spaces and falls through;
 //   - BINARY is memcmp -- over the encoded bytes in a UTF-16 database, which
 //     utf16CompareUTF8 computes unit by unit from the UTF-8, so the key is that
-//     unit sequence. Raw bytes would over-split: two different invalid UTF-8
-//     sequences both decode to U+FFFD, and a non-BMP rune contributes only its
-//     high surrogate (nextUTF16Unit).
+//     unit sequence (utf16Units). Raw bytes would over-split: two different
+//     invalid UTF-8 sequences both decode to U+FFFD.
 func collatedTextKey(collation string, s []byte, enc TextEncoding) []byte {
 	switch strings.ToUpper(collation) {
 	case "NOCASE":
@@ -304,10 +303,9 @@ func collatedTextKey(collation string, s []byte, enc TextEncoding) []byte {
 		return s
 	}
 	out := make([]byte, 0, len(s))
-	for len(s) > 0 {
-		u, n := nextUTF16Unit(s)
+	r := utf16Units{s: s}
+	for u, ok := r.next(); ok; u, ok = r.next() {
 		out = append(out, byte(u>>8), byte(u))
-		s = s[n:]
 	}
 	return out
 }
