@@ -32,6 +32,8 @@ jobs:
       - run: go build ./...
       - name: JIT
         run: go test ./internal/jit/ ${{ matrix.race }} -count=1 -timeout 10m
+      - name: libm
+        run: go test ./internal/libm/ ${{ matrix.race }} -count=1 -timeout 10m
       - name: engine suite
         run: go test ./engine/ ${{ matrix.race }} -count=1 -timeout 20m
       - name: engine suite (fts5 build tag)

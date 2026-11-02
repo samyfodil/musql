@@ -40,13 +40,19 @@ func (a *app) shell(ctx context.Context, args []string) error {
 	}
 	db := sql.OpenDB(conn)
 	defer db.Close()
+	return a.runShell(ctx, db, args[1:], fmt.Sprintf("Connected to %s/%s.", d.Org, d.Name))
+}
+
+// runShell runs the SQL argument, a piped script, or the REPL on db, the REPL
+// greeting with banner.
+func (a *app) runShell(ctx context.Context, db *sql.DB, script []string, banner string) error {
 	sh := &Shell{DB: db, Out: a.env.Stdout, Mode: "table"}
 	if a.json {
 		sh.Mode = "json"
 	}
 	switch {
-	case len(args) == 2:
-		return sh.Script(ctx, args[1])
+	case len(script) == 1:
+		return sh.Script(ctx, script[0])
 	case !a.env.Interactive:
 		b, err := io.ReadAll(a.env.Stdin)
 		if err != nil {
@@ -65,7 +71,7 @@ func (a *app) shell(ctx context.Context, args []string) error {
 	}{a.env.Stdin, a.env.Stdout}, "")
 	t.History = loadHistory(filepath.Join(a.env.Dir, "history"))
 	sh.Out = t
-	fmt.Fprintf(t, "Connected to %s/%s. End statements with ;  .help for commands.\n", d.Org, d.Name)
+	fmt.Fprintf(t, "%s End statements with ;  .help for commands.\n", banner)
 	return sh.REPL(ctx, t, t)
 }
 
@@ -94,9 +100,10 @@ type LineReader interface {
 
 // Shell runs SQL and dot-commands against a database and prints results.
 type Shell struct {
-	DB   *sql.DB
-	Out  io.Writer
-	Mode string // table, csv or json
+	DB    *sql.DB
+	Out   io.Writer
+	Mode  string // table, csv or json
+	Timer bool   // print each statement's run time
 }
 
 const (
@@ -177,6 +184,11 @@ func (s *Shell) Script(ctx context.Context, text string) error {
 
 // Exec runs one statement and prints its rows, if it has any.
 func (s *Shell) Exec(ctx context.Context, stmt string, args ...any) error {
+	if s.Timer {
+		defer func(start time.Time) {
+			fmt.Fprintf(s.Out, "Run Time: real %.3f\n", time.Since(start).Seconds())
+		}(time.Now())
+	}
 	rows, err := s.DB.QueryContext(ctx, stmt, args...)
 	if err != nil {
 		return err
@@ -290,6 +302,7 @@ func writeRowsJSON(w io.Writer, cols []string, data [][]any) error {
 const helpText = `.tables              list tables and views
 .schema [table]      show CREATE statements
 .mode table|csv|json output format
+.timer on|off        print each statement's run time
 .quit                leave the shell
 `
 
@@ -331,6 +344,11 @@ func (s *Shell) Meta(ctx context.Context, line string) (quit bool, err error) {
 			return false, errors.New("usage: .mode table|csv|json")
 		}
 		s.Mode = f[1]
+	case ".timer":
+		if len(f) != 2 || (f[1] != "on" && f[1] != "off") {
+			return false, errors.New("usage: .timer on|off")
+		}
+		s.Timer = f[1] == "on"
 	default:
 		return false, fmt.Errorf("unknown command %s (.help lists them)", f[0])
 	}

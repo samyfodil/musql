@@ -16,7 +16,8 @@ const sqliteTimestampFormat = "2006-01-02 15:04:05.999999999-07:00"
 // driverValueToEngine converts a driver.Value into engine.Value.
 // bool binds as INTEGER 0/1, time.Time as TEXT with sqliteTimestampFormat. A
 // nil []byte binds as NULL, as sqlite3_bind_blob binds a NULL pointer; an
-// empty one as a zero-length BLOB.
+// empty one as a zero-length BLOB. A NaN binds as NULL, as
+// sqlite3_bind_double and sqlite3_result_double store one.
 func driverValueToEngine(v driver.Value) (engine.Value, error) {
 	switch x := v.(type) {
 	case nil:
@@ -24,6 +25,9 @@ func driverValueToEngine(v driver.Value) (engine.Value, error) {
 	case int64:
 		return engine.Value{Typ: engine.Int, I: x}, nil
 	case float64:
+		if x != x {
+			return engine.Value{Typ: engine.Null}, nil // sqlite3VdbeMemSetDouble
+		}
 		return engine.Value{Typ: engine.Float, F: x}, nil
 	// The kinds Conn.CheckNamedValue lets through unconverted.
 	case int:
@@ -35,6 +39,9 @@ func driverValueToEngine(v driver.Value) (engine.Value, error) {
 	case int8:
 		return engine.Value{Typ: engine.Int, I: int64(x)}, nil
 	case float32:
+		if x != x {
+			return engine.Value{Typ: engine.Null}, nil
+		}
 		return engine.Value{Typ: engine.Float, F: float64(x)}, nil
 	case bool:
 		i := int64(0)

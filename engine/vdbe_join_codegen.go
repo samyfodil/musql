@@ -2962,6 +2962,14 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 			streamDerived = o
 		}
 	}
+	// The outermost loop's virtual table, read through its live cursor when the
+	// module allows (vtab_stream.go): that loop is rewound once a run.
+	streamVtab := -1
+	if len(plan.execOrder) > 0 {
+		if o := plan.execOrder[0]; srcs[o].vtabItem != nil && len(srcs[o].vtabCorr) == 0 && vtabStreamable(plan, 0, srcs[o]) {
+			streamVtab = o
+		}
+	}
 	for i, s := range srcs {
 		if s.derived != nil {
 			ds := &derivedSource{prog: s.derived, tbl: s.tbl, dbIdx: s.dbIdx, keepSubtype: s.keepSubtype, lazy: true, rerun: s.coroutineRerun}
@@ -2996,7 +3004,7 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 			// is folded at RUN time, and that is the only channel by which
 			// "json_each(NEW.x)" in a trigger body can reach the firing row.
 			// See derivedSource.vtabTrig (vdbe_op.go).
-			c.emit(Instruction{Op: OpOpenDerived, P1: s.scope.cursor, P2: s.derivedSlot, P4: &derivedSource{vtab: s.vtabItem, vtabTrig: c.trig, tbl: s.tbl, dbIdx: s.dbIdx, lazy: true}})
+			c.emit(Instruction{Op: OpOpenDerived, P1: s.scope.cursor, P2: s.derivedSlot, P4: &derivedSource{vtab: s.vtabItem, vtabTrig: c.trig, tbl: s.tbl, dbIdx: s.dbIdx, lazy: true, vtabStream: i == streamVtab}})
 			continue
 		}
 		if s.cteItem != nil {
@@ -3242,7 +3250,7 @@ func (c *compiler) emitRightOuterSweep(srcs []joinSource, plan joinPlan, order [
 		for _, oc := range others {
 			c.emit(Instruction{Op: OpNullRow, P1: oc})
 		}
-		if err := c.emitVtabCorrelatedOpen(srcs, order, level, s); err != nil {
+		if err := c.emitVtabCorrelatedOpen(srcs, order, level, s, false); err != nil {
 			return err
 		}
 	}
@@ -3399,7 +3407,7 @@ func (c *compiler) emitJoinLevel(srcs []joinSource, plan joinPlan, level int, bo
 	// OP_VFilter (wherecode.c:1610). A no-op unless annotateVtabCorrelations
 	// recorded terms. It must precede emitJoinSeekHint below, which
 	// dereferences this cursor. See vtab_correlated.go.
-	if err := c.emitVtabCorrelatedOpen(srcs, order, level, s); err != nil {
+	if err := c.emitVtabCorrelatedOpen(srcs, order, level, s, vtabStreamable(plan, level, s)); err != nil {
 		return err
 	}
 

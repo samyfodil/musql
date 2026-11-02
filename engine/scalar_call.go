@@ -203,6 +203,9 @@ func funcArity(name string) (min, max int, ok bool) {
 	if lo, hi, ok := extFuncArity(name); ok {
 		return lo, hi, true
 	}
+	if lo, hi, ok := mathFuncArity(name); ok {
+		return lo, hi, true
+	}
 	return jsonFuncArity(name)
 }
 
@@ -221,6 +224,9 @@ func funcArity(name string) (min, max int, ok bool) {
 // "non-deterministic use of %s() in %s" (vdbeaux.c:5643) instead of a value.
 // Empty everywhere else, which is every ordinary statement.
 func callScalarFuncEnc(name string, args []Value, caseSensitiveLike bool, enc TextEncoding, pureCtx uint16) (Value, error) {
+	if v, ok, err := callMathFunc(name, args, enc); ok {
+		return v, err
+	}
 	if err := coerceUTF16BlobArgs(name, args, enc); err != nil {
 		return Value{}, err
 	}
@@ -632,11 +638,16 @@ func fnAbs(v Value) (Value, error) {
 			return Value{Typ: Int, I: -v.I}, nil
 		}
 		return v, nil
-	case Float:
-		return Value{Typ: Float, F: math.Abs(v.F)}, nil
-	default: // Text, Blob
-		return Value{Typ: Float, F: math.Abs(valueToFloatLoose(v))}, nil
 	}
+	// Negated only below zero (absFunc), so -0.0 stays -0.0.
+	f := v.F
+	if v.Typ != Float {
+		f = valueToFloatLoose(v)
+	}
+	if f < 0 {
+		f = -f
+	}
+	return Value{Typ: Float, F: f}, nil
 }
 
 func fnLength(v Value) Value {
