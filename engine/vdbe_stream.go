@@ -100,7 +100,7 @@ func (m *vdbe) streamsDerived(ds *derivedSource, insns []Instruction) bool {
 // would have run prog on (execTrig, with this machine as the source of the
 // pseudo-rows), marked to yield. A streamAlways source starts a new sink; any
 // other shares this machine's.
-func (m *vdbe) newSubStream(ds *derivedSource, pager *ReadOnlyPager) *subStream {
+func (m *vdbe) newSubStream(ds *derivedSource, pager *ReadOnlyPager, insns []Instruction) *subStream {
 	prog := ds.prog
 	var rest []*Program
 	if cp := prog.Compound; cp != nil {
@@ -109,6 +109,7 @@ func (m *vdbe) newSubStream(ds *derivedSource, pager *ReadOnlyPager) *subStream 
 	child := prog.newMachine(pager, nil, m.params, m)
 	child.yield, child.yieldReuse = true, true
 	child.sink = m.sink
+	child.holder = m.streamHolder(insns)
 	if ds.stream == streamAlways {
 		child.sink = &streamSink{plan: ds.sinkPlan}
 		// The rows this source produces leave memory as they arrive -- see
@@ -119,6 +120,24 @@ func (m *vdbe) newSubStream(ds *derivedSource, pager *ReadOnlyPager) *subStream 
 		}
 	}
 	return &subStream{m: child, prog: prog, keep: ds.keepSubtype, rest: rest, parent: m, pager: pager}
+}
+
+// streamHolder is the machine whose result rows keep what a co-routine opened
+// by m yields: m when it is a read that does not yield, m's own holder when it
+// yields, and none when m writes or gathers every row it reads
+// (programAccumulates), since then those rows are held elsewhere.
+func (m *vdbe) streamHolder(insns []Instruction) *vdbe {
+	if !m.accumChecked {
+		m.accumulates = programAccumulates(insns)
+		m.accumChecked = true
+	}
+	switch {
+	case m.wctx != nil || m.accumulates:
+		return nil
+	case m.yield:
+		return m.holder
+	}
+	return m
 }
 
 // next returns the co-routine's next row, resuming it when nothing is
@@ -145,7 +164,7 @@ func (s *subStream) next() (row []Value, ok bool, err error) {
 				s.rest = s.rest[1:]
 				child := prog.newMachine(s.pager, nil, s.parent.params, s.parent)
 				child.yield, child.yieldReuse = true, true
-				child.sink = s.parent.sink
+				child.sink, child.holder = s.parent.sink, s.m.holder
 				s.m, s.prog = child, prog
 			}
 		}
