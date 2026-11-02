@@ -318,6 +318,13 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.AddRegLSL3(X9, X9, X3)
 			a.StrImm(X2, X9, 0)
 			a.AddImm(X3, X3, 1)
+		case POpEmitVal:
+			// Sel[acc] = r[A]; acc++.
+			x := val(in.A, X10)
+			a.LdrImm(X9, X0, POffSel)
+			a.AddRegLSL3(X9, X9, X3)
+			a.StrImm(x, X9, 0)
+			a.AddImm(X3, X3, 1)
 		case POpAccMin, POpAccMax:
 			x := val(in.A, X9)
 			a.Cmp(X3, x)

@@ -238,6 +238,20 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 		nSlots++ // the delta's own rows, after every segment
 	}
 	results := make([]segResult, nSlots)
+	// A DISTINCT aggregate's values go into one set when the runs take turns,
+	// and into a set per run, joined at the end, when they run at once.
+	if low.distinct {
+		var shared *int64Set
+		if segWorkers <= 1 || len(low.blocks) > 0 {
+			shared = &int64Set{}
+		}
+		for i := range results {
+			results[i].set = shared
+			if shared == nil {
+				results[i].set = &int64Set{}
+			}
+		}
+	}
 	// A REAL accumulator is carried from each run to the next, in row order.
 	var facc [2]float64
 	switch low.agg {
@@ -341,7 +355,7 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 		// min()/max() of a whole column, with no predicate: the zone map
 		// already holds the segment's extreme, so no row is read -- unless the
 		// delta replaced a row, whose value the zone map may still hold.
-		if len(skip) == 0 {
+		if len(skip) == 0 && !low.distinct {
 			if extreme, ok := segZoneExtreme(s, low); ok {
 				res.out, res.rows = extreme, int64(s.nRows)
 				return true
@@ -376,11 +390,22 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 						args.Heap[i], args.HeapLen[i] = &h[0], int64(len(h))
 					}
 				}
+				var vals []int64
+				if low.distinct {
+					vals = make([]int64, end-start)
+					args.Sel = &vals[0]
+				}
 				if !segCallKernel(kern, args, svc, low.blocks, s, local) {
 					return false
 				}
 				if low.fAcc {
 					facc = args.FAcc
+				}
+				if low.distinct {
+					res.ovf = res.ovf || ovf != 0
+					res.set.addAll(vals[:out])
+					start = end + 1
+					continue
 				}
 				part := segResult{out: out, ovf: ovf != 0}
 				if low.agg != aggCountStar && low.agg != aggCount {
@@ -399,6 +424,9 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 	})
 	if !ok {
 		return Value{}, false
+	}
+	if low.distinct {
+		return segDistinctAnswer(low.agg, results)
 	}
 	var total int64
 	matched := int64(0)
@@ -509,11 +537,75 @@ func segZoneExtreme(s *segment, low *segLowered) (int64, bool) {
 
 // segRunResult is one kernel run's answer: a segment's, a run of a segment's
 // rows, or the delta's rows. rows is the count matched, for the aggregates
-// whose out is not itself a count.
+// whose out is not itself a count; set holds a DISTINCT aggregate's values.
 type segRunResult struct {
 	out, rows int64
 	ovf       bool
 	empty     bool
+	set       *int64Set
+}
+
+// segDistinctAnswer finishes a DISTINCT count, sum, total or avg from the
+// values each run handed back: their union, in which a value counts once.
+// The sum is exact in any order only while the values' magnitudes sum within
+// an int64: C adds them in first-occurrence order and raises "integer
+// overflow" if any partial sum overflows (sumFinalize), so past that the
+// statement goes back to the loop, which adds them as C does.
+func segDistinctAnswer(agg aggKind, results []segRunResult) (Value, bool) {
+	var all *int64Set
+	for i := range results {
+		r := &results[i]
+		if r.ovf {
+			return Value{}, false
+		}
+		switch {
+		case r.set == nil || r.set == all:
+		case all == nil:
+			all = r.set
+		default:
+			all.union(r.set)
+		}
+	}
+	if all == nil {
+		all = &int64Set{}
+	}
+	var sum, mag int64
+	ok := all.each(func(v int64) bool {
+		if v == math.MinInt64 {
+			return false
+		}
+		a := v
+		if a < 0 {
+			a = -a
+		}
+		if mag > math.MaxInt64-a {
+			return false
+		}
+		mag += a
+		sum += v
+		return true
+	})
+	if !ok {
+		return Value{}, false
+	}
+	n := all.len()
+	switch agg {
+	case aggCount:
+		return Value{Typ: Int, I: int64(n)}, true
+	case aggSum:
+		if n == 0 {
+			return Value{Typ: Null}, true
+		}
+		return Value{Typ: Int, I: sum}, true
+	case aggAvg:
+		if n == 0 {
+			return Value{Typ: Null}, true
+		}
+		return Value{Typ: Float, F: float64(sum) / float64(n)}, true
+	case aggTotal:
+		return Value{Typ: Float, F: float64(sum)}, true
+	}
+	return Value{}, false
 }
 
 // segCombine folds part into acc as segRunOne's final loop folds segments:
@@ -655,8 +747,16 @@ func (sp *segDeltaSplit) runDelta(kern *jit.Code, low *segLowered, regs []int64,
 	for i, b := range sp.blocks {
 		args.Col[i] = &b[0]
 	}
+	var vals []int64
+	if low.distinct {
+		vals = make([]int64, sp.n)
+		args.Sel = &vals[0]
+	}
 	if !segCallKernel(kern, args, nil, nil, nil, local) {
 		return false
+	}
+	if low.distinct {
+		res.set.addAll(vals[:out])
 	}
 	res.out, res.ovf = out, ovf != 0
 	if low.agg != aggCountStar && low.agg != aggCount {

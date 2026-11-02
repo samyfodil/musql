@@ -1227,12 +1227,9 @@ func (it *aggItem) stepJSONGroupArray(ctx *evalCtx, regs []Value) error {
 		return err
 	}
 	if it.distinct {
-		for _, s := range it.seen {
-			if compareValues(v, s) == 0 {
-				return nil
-			}
+		if _, dup := it.distinctSeen(v, "", UTF8); dup {
+			return nil
 		}
-		it.seen = append(it.seen, v)
 	}
 	text, err := jsonGroupValueText(v, ctx.encoding())
 	if err != nil {

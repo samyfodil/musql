@@ -283,6 +283,11 @@ const (
 	POpFAccMax
 	// POpFAccCount: acc++ unless r[A] is NULL.
 	POpFAccCount
+
+	// POpEmitVal appends r[A] to Sel and counts it in the accumulator, as
+	// POpEmitRow appends the row index: the program hands back the values it
+	// computed, for the caller to finish -- a DISTINCT aggregate's dedup.
+	POpEmitVal
 )
 
 // ProgNullDeclines is POpFCmp's Imm for a comparison whose NULL the program
@@ -349,7 +354,7 @@ type ProgArgs struct {
 	Regs     *int64              // the register file      (40)
 	Out      *int64              // accumulator out        (48)
 	Overflow *int64              // set non-zero by POpAccSum on overflow (56)
-	Sel      *int64              // POpEmitRow's selection buffer          (64)
+	Sel      *int64              // POpEmitRow's selection buffer, POpEmitVal's values (64)
 	PC       int64               // EmitVM: the pc to enter at, and on return the pc to resume at (72); EmitProgram: the service to resume after, 1-based, 0 to start
 	Row      int64               // EmitProgram: the loop index a POpService stopped at (80)
 	// Heap is, per column slot holding TEXT cells, the base of the bytes those

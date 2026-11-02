@@ -210,6 +210,8 @@ func stepOf(in ProgInsn) progStep {
 	case POpJumpIfZero, POpJumpIfNotZero:
 		s.uses, s.targets = []int{in.B}, []int{in.A}
 	case POpAccCount, POpEmitRow:
+	case POpEmitVal:
+		s.uses = []int{in.A}
 	case POpAccSum, POpAccMin, POpAccMax:
 		s.uses, s.defs = []int{in.A, in.B}, []int{in.B}
 	case POpAdd, POpSub, POpMul, POpRem:
