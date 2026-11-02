@@ -571,3 +571,39 @@ func VReachesResultRow(prog []VInsn) []bool {
 	}
 	return reach
 }
+
+// VReachFrom reports which instructions native code entered at pc can run
+// before it exits. A reachable VReturn may return past any VGosub.
+func VReachFrom(prog []VInsn, pc int) []bool {
+	n := len(prog)
+	reach := make([]bool, n)
+	work := []int{pc}
+	returned := false
+	for len(work) > 0 {
+		at := work[len(work)-1]
+		work = work[:len(work)-1]
+		if at < 0 || at >= n || reach[at] {
+			continue
+		}
+		reach[at] = true
+		switch in := prog[at]; in.Op {
+		case VExit:
+		case VReturn:
+			if !returned {
+				returned = true
+				for g, x := range prog {
+					if x.Op == VGosub {
+						work = append(work, g+1)
+					}
+				}
+			}
+		default:
+			st := vmStepOf(in, at)
+			if st.fall {
+				work = append(work, at+1)
+			}
+			work = append(work, st.targets...)
+		}
+	}
+	return reach
+}

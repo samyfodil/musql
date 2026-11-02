@@ -33,7 +33,10 @@ type vmJIT struct {
 	// the call and exit at that instruction.
 	curs  []int
 	nCurs int
-	gate  []int16
+	// entryCurs[pc] is the part of curs that native code entered at pc can
+	// reach before it exits: all an entry hands over and brings back.
+	entryCurs [][]int
+	gate      []int16
 	// fill[pc] lists, for an entry at pc, the columns of each cursor that the
 	// native code on the straight path from pc reads (VColumn): what the
 	// engine copies out of a cursor it cannot hand over as a row list. Nil
@@ -300,6 +303,22 @@ func compileVMJIT(prog *Program) *vmJIT {
 				}
 			}
 			jx.light[pc] = int8(l)
+		}
+	}
+	if len(vp) <= vmJITReachLimit {
+		jx.entryCurs = make([][]int, len(vp))
+		for pc := range vp {
+			if !entry[pc] {
+				continue
+			}
+			jx.entryCurs[pc] = []int{}
+			for at, r := range jit.VReachFrom(vp, pc) {
+				in := vp[at]
+				if r && (in.Op == jit.VColumn || in.Op == jit.VRowid || in.Op == jit.VNext || in.Op == jit.VRewind) &&
+					!slices.Contains(jx.entryCurs[pc], in.A) {
+					jx.entryCurs[pc] = append(jx.entryCurs[pc], in.A)
+				}
+			}
 		}
 	}
 	for _, in := range vp {
@@ -584,6 +603,11 @@ var vmJITCursorOps = true
 // platform's figure is jit.VMMinWork: an entry on js/wasm crosses into the JS
 // host and back, which costs more than a native call.
 var vmJITMinWork = jit.VMMinWork
+
+// vmJITReachLimit is the longest program whose entries each prepare only the
+// cursors they reach (vmJIT.entryCurs): finding them walks the program once an
+// entry.
+const vmJITReachLimit = 2000
 
 // vmJITCursorEntryWork is what an entry whose run reads or advances a cursor
 // costs beyond a plain one, in nativeRun's units: the engine fills the native
@@ -1131,12 +1155,16 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 			args.RowsBuf, args.RowsCap = (*int64)(unsafe.Pointer(unsafe.SliceData(spare))), int64(len(spare))
 		}
 	}
+	curs := jx.curs
+	if jx.entryCurs != nil {
+		curs = jx.entryCurs[pc]
+	}
 	if jx.nCurs > 0 {
 		if len(m.jcur) < jx.nCurs {
 			m.jcur = make([]jit.VCursor, jx.nCurs)
 			m.jsnap = make([]jitSnap, jx.nCurs)
 		}
-		for _, c := range jx.curs {
+		for _, c := range curs {
 			jc := &m.jcur[c]
 			*jc = jit.VCursor{Last: -1}
 			if c >= len(m.cursors) || m.cursors[c] == nil {
@@ -1199,7 +1227,7 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 	}
 	jx.code.Call2(args)
 	if jx.nCurs > 0 {
-		for _, c := range jx.curs {
+		for _, c := range curs {
 			jc := &m.jcur[c]
 			if sn := &m.jsnap[c]; sn.live {
 				seekSync(m.cursors[c], jc, sn)
