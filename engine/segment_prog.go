@@ -364,7 +364,12 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 			if end > start {
 				local := slices.Clone(regs)
 				var out, ovf int64
-				args := &jit.ProgArgs{N: int64(end - start), Regs: &local[0], Out: &out, Overflow: &ovf, FAcc: facc}
+				args := &jit.ProgArgs{N: int64(end - start), Regs: &local[0], Out: &out, Overflow: &ovf}
+				// Only a program with a REAL accumulator carries one, and its
+				// segments run one at a time.
+				if low.fAcc {
+					args.FAcc = facc
+				}
 				for i, b := range blocks {
 					args.Col[i] = &b[start]
 					if h := heaps[i]; len(h) > 0 {
@@ -374,7 +379,9 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 				if !segCallKernel(kern, args, svc, low.blocks, s, local) {
 					return false
 				}
-				facc = args.FAcc
+				if low.fAcc {
+					facc = args.FAcc
+				}
 				part := segResult{out: out, ovf: ovf != 0}
 				if low.agg != aggCountStar && low.agg != aggCount {
 					part.rows = local[low.rowsReg]
