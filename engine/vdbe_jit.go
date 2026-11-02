@@ -744,22 +744,24 @@ func lowerVM(in *Instruction, nReg int) jit.VInsn {
 			return jit.VInsn{Op: vmArith[in.Op], A: in.P1, B: in.P2, C: in.P3}
 		}
 	case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
-		// A comparison under TEXT affinity is one of text values -- a TEXT
-		// column against a string. Two TEXTs stand as they are under it, and
+		// Two TEXTs stand as they are under no affinity or TEXT affinity, and
 		// are equal under BINARY when their bytes are; two INTEGERs answer
 		// before affinity (below). Native code takes those two pairs for = and
-		// <> and exits on any other; an ordering of TEXTs, or another
-		// collation, is the VDBE's from the start.
-		if affinity(in.P5&p5AffMask) == affText {
-			coll, _ := in.P4.(string)
-			if (in.Op == OpEq || in.Op == OpNe) && (coll == "" || strings.EqualFold(coll, "BINARY")) {
-				if in.P5&p5StoreP2 == 0 && ok(in.P1, in.P3) {
-					return jit.VInsn{Op: jit.VTextCmpJump, A: in.P1, B: in.P3, T: in.P2, Cond: vmCond[in.Op]}
-				}
-				if in.P5&p5StoreP2 != 0 && ok(in.P1, in.P3, in.P2) {
-					return jit.VInsn{Op: jit.VTextCmpSet, A: in.P1, B: in.P3, C: in.P2, Cond: vmCond[in.Op]}
-				}
+		// <> and exits on any other.
+		aff := affinity(in.P5 & p5AffMask)
+		if coll, _ := in.P4.(string); (in.Op == OpEq || in.Op == OpNe) && (aff == affNone || aff == affText) &&
+			(coll == "" || strings.EqualFold(coll, "BINARY")) {
+			if in.P5&p5StoreP2 == 0 && ok(in.P1, in.P3) {
+				return jit.VInsn{Op: jit.VTextCmpJump, A: in.P1, B: in.P3, T: in.P2, Cond: vmCond[in.Op]}
 			}
+			if in.P5&p5StoreP2 != 0 && ok(in.P1, in.P3, in.P2) {
+				return jit.VInsn{Op: jit.VTextCmpSet, A: in.P1, B: in.P3, C: in.P2, Cond: vmCond[in.Op]}
+			}
+		}
+		// Any other comparison under TEXT affinity is one of text values -- a
+		// TEXT column against a string -- which native code would only enter
+		// to exit from. The VDBE answers it from the start.
+		if aff == affText {
 			break
 		}
 		// Two INTEGERs answer before NULL handling, affinity or collation

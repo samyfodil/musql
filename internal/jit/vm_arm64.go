@@ -854,6 +854,9 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 	case VSubstr:
 		e.substr(pc, in)
 	case VTextCmpJump, VTextCmpSet:
+		if e.know.isInt[in.A] || e.know.isInt[in.B] {
+			return e.insn(pc, vmIntCmp(in))
+		}
 		e.textCmp(pc, in)
 	case VInSet:
 		e.inSet(pc, in)

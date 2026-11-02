@@ -137,6 +137,20 @@ func TestVMTextCmp(t *testing.T) {
 			case want >= 0 && (args.PC != 1 || regs[2].Typ != tvInt || regs[2].I != int64(want) || regs[2].S != nil):
 				t.Fatalf("case %d %v: set pc %d, r2 %+v; want %d", k, cond, args.PC, regs[2], want)
 			}
+			// After an operand is known to be an INTEGER (a fused program
+			// that wrote it), the other must be one too.
+			if c.a.Typ == tvInt {
+				regs = []tvalue{{}, c.b, text("old")}
+				args = ProgArgs{UTF16: utf16}
+				prog := []VInsn{{Op: VInt, A: 0, Imm: c.a.I}, {Op: VTextCmpSet, A: 0, B: 1, C: 2, Cond: cond}, {Op: VExit}}
+				runVM(t, prog, []bool{true, false, false}, regs, &args, 0)
+				switch {
+				case want < 0 && (args.PC != 1 || string(regs[2].S) != "old"):
+					t.Fatalf("case %d %v: known INTEGER set ran to pc %d, r2 %+v; want an exit at 1", k, cond, args.PC, regs[2])
+				case want >= 0 && (args.PC != 2 || regs[2].Typ != tvInt || regs[2].I != int64(want)):
+					t.Fatalf("case %d %v: known INTEGER set pc %d, r2 %+v; want %d", k, cond, args.PC, regs[2], want)
+				}
+			}
 			// The jump form: to 2 when the condition holds, else on to 1.
 			regs = []tvalue{c.a, c.b}
 			args = ProgArgs{UTF16: utf16}

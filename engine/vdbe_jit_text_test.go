@@ -24,13 +24,16 @@ func TestVMJITTextQueries(t *testing.T) {
 		`'abcdefghijklmnopq'`, `'abcdefgh'`, `'53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79'`,
 		`NULL`, `7`, `X'6162'`, `2.5`}
 	chars := []string{`'h'`, `'e'`, `'.'`, `'5'`, `''`, `'é'`, `NULL`, `5`, `'hello'`}
-	setup := []string{`CREATE TABLE t(id INTEGER PRIMARY KEY, s TEXT, c TEXT, i INTEGER, r)`}
+	// u is s with no affinity, and v a character with none: their
+	// comparisons are under no affinity, c's and s's under TEXT affinity.
+	setup := []string{`CREATE TABLE t(id INTEGER PRIMARY KEY, s TEXT, c TEXT, i INTEGER, r, u, v)`}
 	id := 0
 	for k, s := range texts {
 		for j := range 4 {
 			id++
-			setup = append(setup, fmt.Sprintf("INSERT INTO t VALUES(%d, %s, %s, %d, %s)",
-				id, s, chars[(k+j)%len(chars)], (k*3+j*5)%14-2, []string{"1", "2.0", "'3'", "NULL"}[j]))
+			c := chars[(k+j)%len(chars)]
+			setup = append(setup, fmt.Sprintf("INSERT INTO t VALUES(%d, %s, %s, %d, %s, %s, %s)",
+				id, s, c, (k*3+j*5)%14-2, []string{"1", "2.0", "'3'", "NULL"}[j], s, c))
 		}
 	}
 	queries := []string{
@@ -44,6 +47,10 @@ func TestVMJITTextQueries(t *testing.T) {
 		"SELECT id FROM t WHERE s = 'hello' OR s = '' ORDER BY id",
 		"SELECT id, s = i, c = 5, c IS s, c IS NOT s FROM t ORDER BY id",
 		"SELECT id FROM t WHERE c = s COLLATE NOCASE ORDER BY id",
+		"SELECT id, u = v, u <> v, v = substr(u, i, 1), substr(u, i, 1) <> v, u = 'hello', r = 1, r = '3', r <> 2.0, u = r FROM t ORDER BY id",
+		"SELECT id FROM t WHERE u = v OR v = substr(u, i, 1) ORDER BY id",
+		"SELECT id FROM t WHERE u <> 'hello' AND r = 1 ORDER BY id",
+		"SELECT id FROM t WHERE i + 0 = 3 OR i * 2 <> r ORDER BY id",
 		"WITH c(x) AS (VALUES('a'), (5), ('5'), (NULL), (5.0), (X'35')) SELECT x, x = 5, x = '5', x <> 'a' FROM c",
 		`WITH RECURSIVE
   input(sud) AS (VALUES('53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79')),

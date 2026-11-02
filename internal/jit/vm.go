@@ -165,6 +165,17 @@ const (
 	VTextCmpSet
 )
 
+// vmIntCmp is a VTextCmpJump or VTextCmpSet as the VCmpJump or VCmpSet it is
+// when an operand is known to be an INTEGER: the other must be one too.
+func vmIntCmp(in VInsn) VInsn {
+	if in.Op == VTextCmpJump {
+		in.Op = VCmpJump
+	} else {
+		in.Op = VCmpSet
+	}
+	return in
+}
+
 // VInsn is one instruction of a VM program: the one at its index's pc.
 type VInsn struct {
 	Op VOp
