@@ -638,11 +638,16 @@ func fnAbs(v Value) (Value, error) {
 			return Value{Typ: Int, I: -v.I}, nil
 		}
 		return v, nil
-	case Float:
-		return Value{Typ: Float, F: math.Abs(v.F)}, nil
-	default: // Text, Blob
-		return Value{Typ: Float, F: math.Abs(valueToFloatLoose(v))}, nil
 	}
+	// Negated only below zero (absFunc), so -0.0 stays -0.0.
+	f := v.F
+	if v.Typ != Float {
+		f = valueToFloatLoose(v)
+	}
+	if f < 0 {
+		f = -f
+	}
+	return Value{Typ: Float, F: f}, nil
 }
 
 func fnLength(v Value) Value {

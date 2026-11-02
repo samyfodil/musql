@@ -12,6 +12,7 @@ import (
 // TestUnaryMinusSignOfZero holds unary minus to C's two forms: a numeric
 // literal negated where it stands ("-0.0" is -0.0), any other operand
 // computed as 0 - X, which is +0.0 for a stored 0.0 and for the text '-0.0'.
+// abs() negates only below zero, so abs(-0.0) is -0.0.
 func TestUnaryMinusSignOfZero(t *testing.T) {
 	db, err := engine.Create(filepath.Join(t.TempDir(), "neg.musq"))
 	if err != nil {
@@ -39,6 +40,7 @@ func TestUnaryMinusSignOfZero(t *testing.T) {
 		`SELECT -i FROM z`, `SELECT typeof(-i) FROM z`, `SELECT -(-i) FROM z`,
 		`SELECT -0.0 FROM z`, `SELECT -(0.0) FROM z`, `SELECT -9223372036854775808 FROM z`, `SELECT -'0.0' FROM z`,
 		`SELECT sum(-x) FROM z`, `SELECT min(-x) FROM z`, `SELECT max(-x) FROM z`,
+		`SELECT abs(-0.0) FROM z`, `SELECT abs(-x) FROM z`, `SELECT abs(s) FROM z`, `SELECT abs(-0.0) || '' FROM z`,
 	} {
 		pager, err := db.SnapshotPager()
 		if err != nil {
