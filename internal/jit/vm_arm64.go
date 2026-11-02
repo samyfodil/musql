@@ -49,7 +49,8 @@ func emitVMArm(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cac
 	}
 	e := &vmEmitArm{a: NewArm(), lay: lay, n: n, stubs: map[int]bool{}, far: far,
 		prog: prog, bound: bound, cache: cache && bound != nil, know: newVMKnow(),
-		holds: map[int]Reg64{}, pinned: map[Reg64]bool{}, fusedStub: map[int]string{}, zeroS: map[int]bool{}}
+		holds: map[int]Reg64{}, pinned: map[Reg64]bool{}, fusedStub: map[int]string{}, zeroS: map[int]bool{},
+		consts: &firPool{labels: map[uint64]string{}, prefix: "i0"}}
 	e.heads = vmLoopHeads(prog)
 	a := e.a
 
@@ -194,7 +195,7 @@ func padArm(a *Arm, align int) {
 // island emits the exit stubs requested since the last island, after a branch
 // over them to next ("" when nothing falls through).
 func (e *vmEmitArm) island(next string) {
-	if len(e.stubs) == 0 && !e.exitpc && len(e.cold) == 0 {
+	if len(e.stubs) == 0 && !e.exitpc && len(e.cold) == 0 && len(e.consts.order) == 0 {
 		return
 	}
 	if next != "" {
@@ -217,6 +218,8 @@ func (e *vmEmitArm) island(next string) {
 	}
 	e.stubs, e.exitpc = map[int]bool{}, false
 	e.islandN++
+	e.consts.emit(e.a)
+	e.consts = &firPool{labels: map[uint64]string{}, prefix: "i" + itoa(e.islandN)}
 }
 
 func vmBlock(pc int) string { return fmt.Sprintf("b%d", pc) }
@@ -242,6 +245,7 @@ type vmEmitArm struct {
 	entries   []vmEntryStubArm
 	zeroS     map[int]bool // vmEmit.zeroS
 	cold      []func()     // vmEmit.cold, emitted in the next island
+	consts    *firPool     // the next island's doubles (vm_real_arm64.go)
 }
 
 // coldPath is vm_amd64.go's: when reg is non-zero, branch to body, emitted in
@@ -584,6 +588,9 @@ func isPoolArm(m Reg64) bool {
 }
 
 func (e *vmEmitArm) insn(pc int, in VInsn) error {
+	if ok, err := e.realInsn(pc, in); ok {
+		return err
+	}
 	a, L := e.a, e.lay
 	switch in.Op {
 	case VExit:

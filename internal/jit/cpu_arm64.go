@@ -25,4 +25,4 @@ func SetCPUForTest(fma, round bool) (restore func()) {
 }
 
 // VMReal reports whether the VM JIT has its REAL arms (VReal to VMath).
-const VMReal = false
+const VMReal = true

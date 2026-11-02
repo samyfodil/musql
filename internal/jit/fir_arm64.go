@@ -40,9 +40,11 @@ type firEnv struct {
 }
 
 // firPool is the doubles a program's kernels load, laid out after its code.
+// prefix keeps the labels of a program's several pools apart.
 type firPool struct {
 	labels map[uint64]string
 	order  []uint64
+	prefix string
 }
 
 func newFirPool() *firPool { return &firPool{labels: map[uint64]string{}} }
@@ -51,7 +53,7 @@ func (p *firPool) label(u uint64) string {
 	if l, ok := p.labels[u]; ok {
 		return l
 	}
-	l := "fp" + itoa(len(p.order))
+	l := p.prefix + "fp" + itoa(len(p.order))
 	p.labels[u] = l
 	p.order = append(p.order, u)
 	return l
@@ -93,8 +95,15 @@ func emitFirArm64(a *Arm, f *fir.Func, env *firEnv, feat cpuFeatures) error {
 	if f.Fused && !feat.fma {
 		return fmt.Errorf("jit: kernel %s is built fused and this CPU has no FMA", f.Name)
 	}
-	if firHasOp(f.Body, fir.OpFMod) {
+	rounds := firHasOp(f.Body, fir.OpRoundEven) || firHasOp(f.Body, fir.OpFloor) || firHasOp(f.Body, fir.OpCeil) ||
+		firHasOp(f.Body, fir.OpTrunc)
+	switch {
+	case firHasOp(f.Body, fir.OpFMod):
 		return fmt.Errorf("jit: kernel %s: no fmod on arm64", f.Name)
+	case !feat.fma && firHasOp(f.Body, fir.OpFMA):
+		return fmt.Errorf("jit: kernel %s needs FMA", f.Name)
+	case !feat.round && rounds:
+		return fmt.Errorf("jit: kernel %s needs FRINT", f.Name)
 	}
 	e := &firArm64{a: a, f: f, env: env,
 		t0: env.gprs[0], t1: env.gprs[1], s0: env.fprs[0], s1: env.fprs[1], s2: env.fprs[2],
