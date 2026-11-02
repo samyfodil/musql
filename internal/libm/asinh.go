@@ -18,30 +18,30 @@ func Asinh(x float64) float64 {
 			}
 			return math.FMA(-0x1p-60, x, x)
 		}
-		x2h := x * x
+		x2h := float64(x * x)
 		x2l := math.FMA(x, x, -x2h)
 		x3h := x2h * x
 		var sl float64
 		switch {
 		case u < 0x3e5a000000000000:
 			// |x| < 0x1.ap-26.
-			sl = x3h * -0x1.5555555555555p-3
+			sl = float64(x3h * -0x1.5555555555555p-3)
 		case u < 0x3f30000000000000:
 			// |x| < 0x1p-12.
-			sl = x3h * (-0x1.5555555555555p-3 + x2h*0x1.3333327c57c6p-4)
+			sl = float64(x3h * (-0x1.5555555555555p-3 + float64(x2h*0x1.3333327c57c6p-4)))
 		case u < 0x3f93000000000000:
 			// |x| < 0x1.3p-6.
-			sl = x3h * (-0x1.5555555555555p-3 + x2h*(0x1.333333332f2ffp-4+x2h*(-0x1.6db6d9a665159p-5+x2h*0x1.f186866d775fp-6)))
+			sl = float64(x3h * (-0x1.5555555555555p-3 + float64(x2h*(0x1.333333332f2ffp-4+float64(x2h*(-0x1.6db6d9a665159p-5+float64(x2h*0x1.f186866d775fp-6)))))))
 		default:
 			// 0x1.3p-6 <= |x| < 0x1.bp-4: a minimax polynomial with relative
 			// error < 2^-63.091.
-			c1 := 0x1.333333333331p-4 + x2h*-0x1.6db6db6da466cp-5
-			c3 := 0x1.f1c71c2ea7be4p-6 + x2h*-0x1.6e8b651b09d72p-6
-			c5 := 0x1.1c309fc0e69c2p-6 + x2h*-0x1.bab7833c1ep-7
+			c1 := 0x1.333333333331p-4 + float64(x2h*-0x1.6db6db6da466cp-5)
+			c3 := 0x1.f1c71c2ea7be4p-6 + float64(x2h*-0x1.6e8b651b09d72p-6)
+			c5 := 0x1.1c309fc0e69c2p-6 + float64(x2h*-0x1.bab7833c1ep-7)
 			x4 := x2h * x2h
-			sl = x3h * (-0x1.5555555555555p-3 + x2h*(c1+x4*(c3+x4*c5)))
+			sl = float64(x3h * (-0x1.5555555555555p-3 + float64(x2h*(c1+float64(x4*(c3+float64(x4*c5)))))))
 		}
-		eps := 0x1.79p-53 * x3h
+		eps := float64(0x1.79p-53 * x3h)
 		lb, ub := x+(sl-eps), x+(sl+eps)
 		if lb == ub {
 			return lb
@@ -56,7 +56,7 @@ func Asinh(x float64) float64 {
 	case u < 0x4190000000000000:
 		// |x| < 0x1p+26.
 		var th, tl float64
-		x2h = x * x
+		x2h = float64(x * x)
 		x2l = math.FMA(x, x, -x2h)
 		if u < 0x3ff0000000000000 {
 			th, tl = fastTwoSum(1, x2h)
@@ -66,12 +66,12 @@ func Asinh(x float64) float64 {
 		tl += x2l
 		ah = math.Sqrt(th)
 		rs := 0.5 / th
-		al = (tl - math.FMA(ah, ah, -th)) * (rs * ah)
+		al = float64((tl - math.FMA(ah, ah, -th)) * (rs * ah))
 		ah, tl = fastTwoSum(ah, ax)
 		al += tl
 	case u < 0x4330000000000000:
 		// |x| < 0x1p+52.
-		ah = 2 * ax
+		ah = float64(2 * ax)
 		al = 0.5 / ax
 	default:
 		// |x| >= 0x1p+52.
@@ -96,13 +96,13 @@ func Asinh(x float64) float64 {
 	r := cmLogR1[i1] * cmLogR2[i2]
 	dx := math.FMA(r, asdouble(t), -1)
 	dx2 := dx * dx
-	f := dx2 * ((-0x1p-1 + dx*0x1.555555555553p-2) + dx2*((-0x1.fffffffffffap-3+dx*0x1.99999e33a6366p-3)+dx2*-0x1.555559ef9525fp-3))
+	f := float64(dx2 * ((-0x1p-1 + float64(dx*0x1.555555555553p-2)) + float64(dx2*((-0x1.fffffffffffap-3+float64(dx*0x1.99999e33a6366p-3))+float64(dx2*-0x1.555559ef9525fp-3)))))
 	const l2h, l2l = 0x1.62e42fefa38p-1, 0x1.ef35793c7673p-45
-	lh := l2h*ed + (cmLogL1[i1][1] + cmLogL2[i2][1])
-	ll := l2l*ed + cmLogL1[i1][0] + cmLogL2[i2][0] + al/ah + f
+	lh := float64(l2h*ed) + (cmLogL1[i1][1] + cmLogL2[i2][1])
+	ll := float64(l2l*ed) + cmLogL1[i1][0] + cmLogL2[i2][0] + al/ah + f
 	ll += dx
-	lh *= math.Copysign(1, x)
-	ll *= math.Copysign(1, x)
+	lh = float64(lh * math.Copysign(1, x))
+	ll = float64(ll * math.Copysign(1, x))
 	const eps = 1.63e-19
 	lb, ub := lh+(ll-eps), lh+(ll+eps)
 	if lb == ub {
@@ -111,7 +111,7 @@ func Asinh(x float64) float64 {
 	if ax < 0x1p-2 {
 		return asinhZero(x, x2h, x2l)
 	}
-	return asinhRefine(x, ah, al, 0x1.71547652b82fep+0*math.Abs(lb))
+	return asinhRefine(x, ah, al, float64(0x1.71547652b82fep+0*math.Abs(lb)))
 }
 
 func asinhAddDD(xh, xl, ch, cl float64) (s, l float64) {
@@ -121,7 +121,7 @@ func asinhAddDD(xh, xl, ch, cl float64) (s, l float64) {
 }
 
 func asinhMulDDAcc(xh, xl, ch, cl float64) (h, l float64) {
-	ahlh, alhh, ahhh := ch*xl, cl*xh, ch*xh
+	ahlh, alhh, ahhh := float64(ch*xl), float64(cl*xh), float64(ch*xh)
 	ahhl := math.FMA(ch, xh, -ahhh)
 	ahhl += alhh + ahlh
 	h = ahhh + ahhl
@@ -129,7 +129,7 @@ func asinhMulDDAcc(xh, xl, ch, cl float64) (h, l float64) {
 }
 
 func cmMulDDD(xh, xl, ch float64) (h, l float64) {
-	ahlh, ahhh := ch*xl, ch*xh
+	ahlh, ahhh := float64(ch*xl), float64(ch*xh)
 	ahhl := math.FMA(ch, xh, -ahhh)
 	ahhl += ahlh
 	h = ahhh + ahhl
@@ -169,7 +169,7 @@ func roundAway(y1, y2 float64) float64 {
 
 func asinhZero(x, x2h, x2l float64) float64 {
 	cl := &asinhZeroCL
-	y2 := x2h * (cl[0] + x2h*(cl[1]+x2h*(cl[2]+x2h*(cl[3]+x2h*cl[4]))))
+	y2 := float64(x2h * (cl[0] + float64(x2h*(cl[1]+float64(x2h*(cl[2]+float64(x2h*(cl[3]+float64(x2h*cl[4])))))))))
 	y1, y2 := asinhPolyDD(x2h, x2l, asinhZeroCH[:], y2)
 	y1, y2 = asinhMulDDAcc(y1, y2, x2h, x2l)
 	y1, y2 = cmMulDDD(y1, y2, x)
@@ -188,7 +188,7 @@ func asinhDatabase(x, f float64) float64 {
 			a = m + 1
 		case asinhDB[m][0] == ax:
 			sgn := math.Copysign(1, x)
-			return sgn*asinhDB[m][1] + sgn*asinhDB[m][2]
+			return float64(sgn*asinhDB[m][1]) + float64(sgn*asinhDB[m][2])
 		default:
 			b = m - 1
 		}
@@ -210,26 +210,26 @@ func asinhRefine(x, zh, zl, a float64) float64 {
 	i := (v - 0x3ff<<52) >> (52 - 16)
 	i1, i2, i3, i4 := (i>>12)&0x1f, (i>>8)&0xf, (i>>4)&0xf, i&0xf
 	const l20, l21, l22 = 0x1.62e42fefa38p-2, 0x1.ef35793c768p-46, -0x1.9ff0342542fc3p-91
-	el2, el1, el0 := l22*ed, l21*ed, l20*ed
+	el2, el1, el0 := float64(l22*ed), float64(l21*ed), float64(l20*ed)
 	var L [3]float64
 	for k := range L {
 		L[k] = cmLogLL[0][i1][k] + cmLogLL[1][i2][k] + (cmLogLL[2][i3][k] + cmLogLL[3][i4][k])
 	}
 	L[0] += el0
 	t12, t34 := cmLogT1[i1]*cmLogT2[i2], cmLogT3[i3]*cmLogT4[i4]
-	th := t12 * t34
+	th := float64(t12 * t34)
 	tl := math.FMA(t12, t34, -th)
 	tf := asdouble(t)
-	dh := th * tf
+	dh := float64(th * tf)
 	dl := math.FMA(th, tf, -dh)
-	sh := tl * tf
+	sh := float64(tl * tf)
 	sl := math.FMA(tl, tf, -sh)
 	xh, xl := fastTwoSum(dh-1, dl)
 	if zl != 0 {
-		xl += th * asdouble(asuint64(zl)-uint64(int64(e)<<52))
+		xl += float64(th * asdouble(asuint64(zl)-uint64(int64(e)<<52)))
 	}
 	xh, xl = asinhAddDD(xh, xl, sh, sl)
-	sl = xh * (-0x1p-3 + xh*(0x1.9999999a0754fp-4+xh*-0x1.55555555c3157p-4))
+	sl = float64(xh * (-0x1p-3 + float64(xh*(0x1.9999999a0754fp-4+float64(xh*-0x1.55555555c3157p-4)))))
 	sh, sl = asinhPolyDD(xh, xl, cmLogCH[:], sl)
 	sh, sl = asinhMulDDAcc(xh, xl, sh, sl)
 	sh, sl = asinhAddDD(sh, sl, el1, el2)
@@ -239,9 +239,9 @@ func asinhRefine(x, zh, zl, a float64) float64 {
 	v0, v1 = fastTwoSum(v0, v1)
 	v1, v2 = fastTwoSum(v1, v2)
 	s2 := math.Copysign(2, x)
-	v0 *= s2
-	v1 *= s2
-	v2 *= s2
+	v0 = float64(v0 * s2)
+	v1 = float64(v1 * s2)
+	v2 = float64(v2 * s2)
 	v1 = roundAway(v1, v2)
 	t, t0 := asuint64(v1), asuint64(v0)
 	er := (t + 41) & (^uint64(0) >> 12)

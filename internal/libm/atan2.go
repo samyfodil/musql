@@ -40,24 +40,24 @@ func Atan2(y0, x0 float64) float64 {
 	}
 	kw := sx<<2 | sy<<1 | gt
 	jt := int64(asuint64(y/x+(2+1/128.0))>>(52-7)) & 127
-	fh := atan2F2[jt][1]*sgn + atan2O[kw][0]
-	fl := atan2F2[jt][0]*sgn + atan2O[kw][1]
+	fh := float64(atan2F2[jt][1]*sgn) + atan2O[kw][0]
+	fl := float64(atan2F2[jt][0]*sgn) + atan2O[kw][1]
 	if x < 0x1p-920 {
-		x *= 0x1p920
-		y *= 0x1p920
+		x = float64(x * 0x1p920)
+		y = float64(y * 0x1p920)
 	}
 	if x > 0x1p1022 && jt != 0 {
-		x *= 0x1p-1
-		y *= 0x1p-1
+		x = float64(x * 0x1p-1)
+		y = float64(y * 0x1p-1)
 	}
 	t0 := atan2T2[jt]
 	zn := math.FMA(-t0, x, y)
 	zd := math.FMA(t0, y, x)
 	z := zn / zd
 	z2 := z * z
-	z *= sgn
-	dz := (z * z2) * (-0x1.55555555554d2p-2 + z2*(0x1.999999860e1cap-3+z2*-0x1.248ad469844a1p-3))
-	eps := math.Abs(z)*0x1.051p-51 + 0x1p-90
+	z = float64(z * sgn)
+	dz := float64((z * z2) * (-0x1.55555555554d2p-2 + float64(z2*(0x1.999999860e1cap-3+float64(z2*-0x1.248ad469844a1p-3)))))
+	eps := float64(math.Abs(z)*0x1.051p-51) + 0x1p-90
 	rh, z := fastTwoSum(fh, z)
 	rl := (fl + dz) + z
 	lb, ub := rh+(rl-eps), rh+(rl+eps)
@@ -65,12 +65,12 @@ func Atan2(y0, x0 float64) float64 {
 		return ub
 	}
 
-	dh := y * t0
+	dh := float64(y * t0)
 	dl := math.FMA(y, t0, -dh)
 	dh, e := fastTwoSum(x, dh)
 	rdh := 1 / dh
 	dl += e
-	nh := x * t0
+	nh := float64(x * t0)
 	nl := math.FMA(x, t0, -nh)
 	dt := y - nh
 	if y1 := dt + nh; y1 == y {
@@ -78,14 +78,14 @@ func Atan2(y0, x0 float64) float64 {
 	} else {
 		nh, nl = fastTwoSum(dt, (y-y1)-nl)
 	}
-	zh := nh * rdh
+	zh := float64(nh * rdh)
 	z2 = zh * zh
-	zl := rdh * (math.FMA(dh, -zh, nh) + (nl - (nh*rdh)*dl))
+	zl := float64(rdh * (math.FMA(dh, -zh, nh) + (nl - float64((nh*rdh)*dl))))
 	b2 := &atan2B2
-	zl += zh * z2 * ((b2[0] + z2*b2[1]) + (z2*z2)*(b2[2]+z2*b2[3]))
-	zh *= sgn
-	zl *= sgn
-	eps = 0x1.4p-50 * (math.Abs(zh)*z2 + 0x1p-51)
+	zl += float64(zh * z2 * ((b2[0] + float64(z2*b2[1])) + float64((z2*z2)*(b2[2]+float64(z2*b2[3])))))
+	zh = float64(zh * sgn)
+	zl = float64(zl * sgn)
+	eps = float64(0x1.4p-50 * (float64(math.Abs(zh)*z2) + 0x1p-51))
 	fh, fl = fastSum(fh, fl, zh, zl)
 	lb, ub = fh+(fl-eps), fh+(fl+eps)
 	if lb != ub {
@@ -153,7 +153,7 @@ func atan2Accurate(y, x float64) float64 {
 	}
 	// t exact and |t| <= 0x1.d12ed0af1a27fp-27, x > 0: atan(t) rounds to t.
 	if math.FMA(t, x, -y) == 0 && x > 0 && math.Abs(t) <= 0x1.d12ed0af1a27fp-27 {
-		if math.Abs(y) >= 0x1p-915 || math.FMA(t*0x1p105, x, -y*0x1p105) == 0 {
+		if math.Abs(y) >= 0x1p-915 || math.FMA(t*0x1p105, x, float64(-y*0x1p105)) == 0 {
 			return math.FMA(t, -0x1p-54, t)
 		}
 	}
@@ -417,9 +417,9 @@ func tintToD(a tint, err uint64) float64 {
 			s = -s
 		}
 		if a.ex < -1074 || a.h == 1<<63 && a.m == 0 && a.l == 0 {
-			return s * 0.5
+			return float64(s * 0.5)
 		}
-		return s * 0.75
+		return float64(s * 0.75)
 	}
 	hh, mm, ll := a.h, a.m, a.l
 	ex := a.ex
@@ -451,8 +451,8 @@ func tintToD(a tint, err uint64) float64 {
 	if a.sgn != 0 {
 		s = -1
 	}
-	h = math.FMA(l, s, s*h) * 0x1p-52
-	return h * asdouble(asuint64(1)+uint64(ex-1)<<52)
+	h = math.FMA(l, s, float64(s*h)) * 0x1p-52
+	return float64(h * asdouble(asuint64(1)+uint64(ex-1)<<52))
 }
 
 // invTint is 1/a for a non-zero a, to within 2^87.1 ulps of 1/a in [1, 2].
@@ -460,7 +460,7 @@ func invTint(A tint) tint {
 	a := tintToD(A, 0)
 	subnormal := math.Abs(a) < 0x1p-1022
 	if subnormal {
-		a *= 0x1p53
+		a = float64(a * 0x1p53)
 	}
 	r := tintFromD(1.0 / a)
 	if subnormal {

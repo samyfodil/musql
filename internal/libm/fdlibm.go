@@ -59,7 +59,7 @@ func Log10(x float64) float64 {
 			return math.NaN()
 		}
 		k -= 54
-		x *= 0x1p54
+		x = float64(x * 0x1p54)
 		hx = int64(asuint64(x))
 	}
 	if uint64(hx) >= 0x7ff0000000000000 {
@@ -134,7 +134,7 @@ func Expm1(x float64) float64 {
 
 	// x is now in the primary range.
 	hfx := 0.5 * x
-	hxs := x * hfx
+	hxs := float64(x * hfx)
 	h2 := hxs * hxs
 	r1 := madd(h2*h2, madd(hxs, q5, q4), madd(h2, madd(hxs, q3, q2), madd(hxs, q1, 1)))
 	t := madd(-hfx, r1, 3)
@@ -293,7 +293,7 @@ func Sinh(x float64) float64 {
 	}
 	// |x| in [log(maxdouble), overflow threshold].
 	if lx := uint32(asuint64(x)); ix < 0x408633ce || ix == 0x408633ce && lx <= 0x8fb9f87d {
-		w := Exp(0.5 * math.Abs(x))
+		w := Exp(float64(0.5 * math.Abs(x)))
 		t := h * w
 		return t * w
 	}
@@ -324,7 +324,7 @@ func Cosh(x float64) float64 {
 	}
 	// |x| in [log(maxdouble), overflow threshold].
 	if asuint64(x)&0x7fffffffffffffff <= 0x408633ce8fb9f87d {
-		w := Exp(0.5 * math.Abs(x))
+		w := Exp(float64(0.5 * math.Abs(x)))
 		t := 0.5 * w
 		return t * w
 	}
@@ -354,10 +354,10 @@ func Tanh(x float64) float64 {
 			// |x| < 2^-55.
 			return x * (1 + x)
 		case ix >= 0x3ff00000:
-			t := Expm1(2 * math.Abs(x))
+			t := Expm1(float64(2 * math.Abs(x)))
 			z = 1 - 2/(t+2)
 		default:
-			t := Expm1(-2 * math.Abs(x))
+			t := Expm1(float64(-2 * math.Abs(x)))
 			z = -t / (t + 2)
 		}
 	}

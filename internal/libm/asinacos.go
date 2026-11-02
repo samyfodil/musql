@@ -25,22 +25,22 @@ func Asin(x float64) float64 {
 			return math.NaN()
 		}
 		// asin(x) = pi/2 - 2*asin(sqrt((1-x)/2)).
-		t = 2 - 2*math.Abs(x)
+		t = 2 - float64(2*math.Abs(x))
 		jd = math.RoundToEven(t * 0x1p5)
 		z = math.Copysign(math.Sqrt(t), -x)
-		zl = math.FMA(z, z, -t) * ((-0.5 / t) * z)
-		t = 0.25*t - jd*0x1p-7
-		eps = math.Abs(z*t) * 0x1.99p-52
+		zl = float64(math.FMA(z, z, -t) * ((-0.5 / t) * z))
+		t = float64(0.25*t) - float64(jd*0x1p-7)
+		eps = float64(math.Abs(z*t) * 0x1.99p-52)
 	} else {
 		if ax < 0x7cae26e892247dec {
 			// |x| < 0x1.7137449123ef6p-26: asin(x) rounds to x.
 			return math.FMA(0x1p-55, x, x)
 		}
-		t = x * x
+		t = float64(x * x)
 		jd = math.RoundToEven(t * 0x1p7)
-		t = math.FMA(x, x, -0x1p-7*jd)
+		t = math.FMA(x, x, float64(-0x1p-7*jd))
 		z = x
-		eps = math.Abs(z*t) * 0x1.77p-52
+		eps = float64(math.Abs(z*t) * 0x1.77p-52)
 	}
 	fh, fl := asinPoly(t, z, zl, jd, f0h, f0l)
 	lb, ub := fh+(fl-eps), fh+(fl+eps)
@@ -72,19 +72,19 @@ func Acos(x float64) float64 {
 		}
 		// acos(x) = 2*asin(sqrt((1-x)/2)) for x > 0.5 and
 		// pi - 2*asin(sqrt((1+x)/2)) for x < -0.5.
-		t = 2 - 2*math.Abs(x)
+		t = 2 - float64(2*math.Abs(x))
 		jd = math.RoundToEven(t * 0x1p5)
 		z = math.Copysign(math.Sqrt(t), x)
-		zl = math.FMA(z, z, -t) * ((-0.5 / t) * z)
-		t = 0.25*t - jd*0x1p-7
-		eps = math.Abs(z*t)*0x1.8cp-52 + 0x1p-105
+		zl = float64(math.FMA(z, z, -t) * ((-0.5 / t) * z))
+		t = float64(0.25*t) - float64(jd*0x1p-7)
+		eps = float64(math.Abs(z*t)*0x1.8cp-52) + 0x1p-105
 	} else {
 		f0h, f0l = 0x1.921fb54442d18p+0, 0x1.1a62633145c07p-54
 		if ax <= 0x7e00000000000000 {
 			// |x| < 2^-15.
 			var v float64
 			if ax > 0x791967670d2e8fe8 {
-				v = (x * x) * (-0x1.5555555555555p-3 * x)
+				v = float64((x * x) * (-0x1.5555555555555p-3 * x))
 			}
 			h, w := fastTwoSum(f0h, -x)
 			l := v + (w + f0l)
@@ -96,11 +96,11 @@ func Acos(x float64) float64 {
 			return lb
 		}
 		// acos(x) = pi/2 - asin(x), so both branches use the same tables.
-		t = x * x
+		t = float64(x * x)
 		jd = math.RoundToEven(t * 0x1p7)
-		t = math.FMA(x, x, -0x1p-7*jd)
+		t = math.FMA(x, x, float64(-0x1p-7*jd))
 		z = -x
-		eps = (z * t) * 0x1.81p-52
+		eps = float64((z * t) * 0x1.81p-52)
 	}
 	fh, fl := asinPoly(t, z, zl, jd, f0h, f0l)
 	lb, ub := fh+(fl-eps), fh+(fl+eps)
@@ -115,7 +115,7 @@ func Acos(x float64) float64 {
 func asinPoly(t, z, zl, jd, f0h, f0l float64) (fh, fl float64) {
 	c := &asinCC[int64(jd)]
 	t2 := t * t
-	d := t * ((c[2] + t*c[3]) + t2*((c[4]+t*c[5])+t2*(c[6]+t*c[7])))
+	d := float64(t * ((c[2] + float64(t*c[3])) + float64(t2*((c[4]+float64(t*c[5]))+float64(t2*(c[6]+float64(t*c[7])))))))
 	fh, fl = sinMulDD(z, zl, c[0], c[1]+d)
 	return fastSum(f0h, f0l, fh, fl)
 }
@@ -144,27 +144,27 @@ func asinRotate(ax, ch, cl float64, j int64) (v, dv float64) {
 	cs := math.FMA(Ch, dsh, magic) - magic
 	dcs := math.FMA(Ch, dsh, -cs)
 	v = cs - sc
-	dv = (Ch*dsl + Cl*dsh) - (Sh*dcl + Sl*dch) - (dsc - dcs)
+	dv = (float64(Ch*dsl) + float64(Cl*dsh)) - (float64(Sh*dcl) + float64(Sl*dch)) - (dsc - dcs)
 	return fastTwoSum(v, dv)
 }
 
 // asinSqrt1m is sqrt(1-x^2) as ch+cl.
 func asinSqrt1m(x float64) (ch, cl float64) {
-	s2 := x * x
+	s2 := float64(x * x)
 	dx2 := math.FMA(x, x, -s2)
 	c2h, c2l := fastTwoSum(1.0, -s2)
 	c2l -= dx2
 	c2h, c2l = fastTwoSum(c2h, c2l)
 	ch = math.Sqrt(c2h)
-	return ch, (c2l - math.FMA(ch, ch, -c2h)) * (0.5 / ch)
+	return ch, float64((c2l - math.FMA(ch, ch, -c2h)) * (0.5 / ch))
 }
 
 // asinSeries is asin(v+dv) for |v| small, times sgn.
 func asinSeries(v, dv, sgn float64) (fh, fl float64) {
 	v2, dv2 := sinMulDD(v, dv, v, dv)
-	v *= sgn
-	dv *= sgn
-	fl = v2 * (0x1.6e8ba2ec8cb69p-6 + v2*(0x1.1c4ea7a15c997p-6+v2*0x1.ca8355d39bb67p-7))
+	v = float64(v * sgn)
+	dv = float64(dv * sgn)
+	fl = float64(v2 * (0x1.6e8ba2ec8cb69p-6 + float64(v2*(0x1.1c4ea7a15c997p-6+float64(v2*0x1.ca8355d39bb67p-7)))))
 	fh, fl = asinPolyDD(v2, dv2, asinC[:], fl)
 	return sinMulDD(v, dv, fh, fl)
 }
@@ -172,9 +172,9 @@ func asinSeries(v, dv, sgn float64) (fh, fl float64) {
 // asinPiTimes is jt*pi/64 + fh+fl as ph+pl+ps, for 0 <= jt <= 64; sum is
 // how fh+fl is added in.
 func asinPiTimes(jt, fh, fl float64, sum func(xh, xl, yh, yl float64) (float64, float64)) (ph, pl, ps float64) {
-	ph = jt * 0x1.921fb54442dp-5
-	pl = 0x1.8469898cc518p-53 * jt
-	ps = -0x1.fc8f8cbb5bf6cp-102 * jt
+	ph = float64(jt * 0x1.921fb54442dp-5)
+	pl = float64(0x1.8469898cc518p-53 * jt)
+	ps = float64(-0x1.fc8f8cbb5bf6cp-102 * jt)
 	pl, ps = sum(fh, fl, pl, ps)
 	ph, pl = fastTwoSum(ph, pl)
 	pl, ps = fastTwoSum(pl, ps)
@@ -190,7 +190,7 @@ func asinRefine(x, phi float64) float64 {
 	v, dv := asinRotate(math.Abs(x), ch, cl, int64(jf))
 	sgn := math.Copysign(1.0, x)
 	fh, fl := asinSeries(v, dv, sgn)
-	ph, pl, _ := asinPiTimes(jf*sgn, fh, fl, fastSum)
+	ph, pl, _ := asinPiTimes(float64(jf*sgn), fh, fl, fastSum)
 	th, tl := asuint64(ph), asuint64(pl)
 	tn := th&(0x7ff<<52) - 53<<52
 	tl &= ^uint64(0) >> 1
@@ -229,7 +229,7 @@ func acosRefine(x, phi float64) float64 {
 	v, dv := asinRotate(math.Abs(x), ch, cl, jf)
 	sgn := math.Copysign(1.0, x)
 	fh, fl := asinSeries(v, dv, -sgn)
-	ph, pl, ps := asinPiTimes(32-float64(jf)*sgn, fh, fl, sum)
+	ph, pl, ps := asinPiTimes(32-float64(float64(jf)*sgn), fh, fl, sum)
 	t := asuint64(pl)
 	e := int64((t>>52)&0x7ff) - 1023
 	e = min(max(52-(107+e), 0), 52)

@@ -37,8 +37,10 @@
 // between 0.02% (atan2) and 0.2% (tan) of inputs, and there these answer the
 // correctly rounded value. IBM's code is LGPL, which this package cannot take.
 //
-// Correct rounding does not depend on how the arithmetic is fused, so these
-// are written as CORE-MATH's C is, without libm.go's float64() conversions.
+// CORE-MATH's analysis is of unfused arithmetic, with explicit fma() where it
+// wants one, and the Go compiler fuses far more than GCC: a product fused
+// into a TwoSum breaks it (tan(1) was an ulp low on arm64). So these convert
+// their added products with float64() too, as TestNoUnguardedProducts checks.
 
 package libm
 

@@ -76,7 +76,7 @@ func expSpecial(tmp float64, sbits, ki uint64) float64 {
 		// k > 0: the exponent of scale may have overflowed by <= 460.
 		sbits -= 1009 << 52
 		scale := asdouble(sbits)
-		return madd(scale, tmp, scale) * 0x1p1009
+		return float64(madd(scale, tmp, scale) * 0x1p1009)
 	}
 	// k < 0: y is rounded to its precision before it is scaled into the
 	// subnormal range, to avoid a double rounding.
@@ -97,5 +97,5 @@ func expSpecial(tmp float64, sbits, ki uint64) float64 {
 			y = asdouble(sbits & 0x8000000000000000)
 		}
 	}
-	return 0x1p-1022 * y
+	return float64(0x1p-1022 * y)
 }

@@ -31,14 +31,14 @@ func Acosh(x float64) float64 {
 	case ix < 0x3ff1e83e425aee63:
 		// 1 < x < 0x1.1e83e425aee63p+0.
 		z := x - 1
-		iz, zt := -0.25/z, 2*z
+		iz, zt := -0.25/z, float64(2*z)
 		sh := math.Sqrt(zt)
-		sl := math.FMA(sh, sh, -zt) * (sh * iz)
+		sl := float64(math.FMA(sh, sh, -zt) * (sh * iz))
 		cl := &acoshNearCL
 		z2 := z * z
 		z4 := z2 * z2
-		ds := math.FMA(sh*z, cl[0]+z*(((cl[1]+z*cl[2])+z2*(cl[3]+z*cl[4]))+z4*((cl[5]+z*cl[6])+z2*(cl[7]+z*cl[8]))), sl)
-		eps = ds*0x1.00p-50 - 0x1p-104*sh
+		ds := math.FMA(sh*z, cl[0]+float64(z*(((cl[1]+float64(z*cl[2]))+float64(z2*(cl[3]+float64(z*cl[4]))))+float64(z4*((cl[5]+float64(z*cl[6]))+float64(z2*(cl[7]+float64(z*cl[8]))))))), sl)
+		eps = float64(ds*0x1.00p-50) - float64(0x1p-104*sh)
 		lb, ub := sh+(ds-eps), sh+(ds+eps)
 		if lb == ub {
 			return lb
@@ -47,12 +47,12 @@ func Acosh(x float64) float64 {
 	case ix < 0x405bf00000000000:
 		// x < 111.75.
 		off = 0x3ff
-		x2h := x * x
+		x2h := float64(x * x)
 		wh := x2h - 1
 		wl := math.FMA(x, x, -x2h)
 		sh := math.Sqrt(wh)
 		ish := 0.5 / wh
-		sl := (wl - math.FMA(sh, sh, -wh)) * (sh * ish)
+		sl := float64((wl - math.FMA(sh, sh, -wh)) * (sh * ish))
 		th, tl := fastTwoSum(x, sh)
 		tl += sl
 		t = asuint64(th)
@@ -61,17 +61,17 @@ func Acosh(x float64) float64 {
 	case ix < 0x4087100000000000:
 		// x < 738.
 		z := 1 / (x * x)
-		g = 0x1.5c4b6148816e2p-66 + z*(-0x1.000000000005cp-2+z*(-0x1.7fffffebf3e6cp-4+z*-0x1.aab6691f2bae7p-5))
+		g = 0x1.5c4b6148816e2p-66 + float64(z*(-0x1.000000000005cp-2+float64(z*(-0x1.7fffffebf3e6cp-4+float64(z*-0x1.aab6691f2bae7p-5)))))
 		eps = 0x1.c3p-63
 	case ix < 0x40e0100000000000:
 		// x < 32896.
 		z := 1 / (x * x)
-		g = -0x1.7f77c8429c6c6p-67 + z*(-0x1.ffffffffff214p-3+z*-0x1.8000268641bfep-4)
+		g = -0x1.7f77c8429c6c6p-67 + float64(z*(-0x1.ffffffffff214p-3+float64(z*-0x1.8000268641bfep-4)))
 		eps = 0x1.9ap-63
 	case ix < 0x41ea000000000000:
 		// x < 0x1.ap+31.
 		z := 1 / (x * x)
-		g = 0x1.7a0ed2effdd1p-67 + z*-0x1.000000017d048p-2
+		g = 0x1.7a0ed2effdd1p-67 + float64(z*-0x1.000000017d048p-2)
 		eps = 0x1.99p-63
 	default:
 		eps = 0x1.b2p-63
@@ -88,10 +88,10 @@ func Acosh(x float64) float64 {
 	r := cmLogR1[i1] * cmLogR2[i2]
 	dx := math.FMA(r, asdouble(t), -1)
 	dx2 := dx * dx
-	f := dx2 * ((-0x1p-1 + dx*0x1.555555555553p-2) + dx2*((-0x1.fffffffffffap-3+dx*0x1.99999e33a6366p-3)+dx2*-0x1.555559ef9525fp-3))
+	f := float64(dx2 * ((-0x1p-1 + float64(dx*0x1.555555555553p-2)) + float64(dx2*((-0x1.fffffffffffap-3+float64(dx*0x1.99999e33a6366p-3))+float64(dx2*-0x1.555559ef9525fp-3)))))
 	const l2h, l2l = 0x1.62e42fefa38p-1, 0x1.ef35793c7673p-45
-	lh := (cmLogL1[i1][1] + cmLogL2[i2][1]) + l2h*ed
-	t1 := (l2l * ed) + (cmLogL1[i1][0] + cmLogL2[i2][0])
+	lh := (cmLogL1[i1][1] + cmLogL2[i2][1]) + float64(l2h*ed)
+	t1 := (float64(l2l * ed)) + (cmLogL1[i1][0] + cmLogL2[i2][0])
 	t2 := f + t1
 	t3 := g + t2
 	ll := dx + t3
@@ -99,7 +99,7 @@ func Acosh(x float64) float64 {
 	if lb == ub {
 		return lb
 	}
-	return acoshRefine(x, 0x1.71547652b82fep+0*lb)
+	return acoshRefine(x, float64(0x1.71547652b82fep+0*lb))
 }
 
 func acoshAddDD(xh, xl, ch, cl float64) (s, l float64) {
@@ -108,7 +108,7 @@ func acoshAddDD(xh, xl, ch, cl float64) (s, l float64) {
 }
 
 func acoshMulDDAcc(xh, xl, ch, cl float64) (h, l float64) {
-	ahlh, alhh, ahhh := ch*xl, cl*xh, ch*xh
+	ahlh, alhh, ahhh := float64(ch*xl), float64(cl*xh), float64(ch*xh)
 	ahhl := math.FMA(ch, xh, -ahhh)
 	ahhl += alhh + ahlh
 	return fastTwoSum(ahhh, ahhl)
@@ -129,7 +129,7 @@ func acoshPolyDD(xh, xl float64, c [][2]float64, l float64) (h, lo float64) {
 
 func acoshOne(x, sh, sl float64) float64 {
 	cl := &acoshOneCL
-	y2 := x * (cl[0] + x*(cl[1]+x*(cl[2]+x*(cl[3]+x*(cl[4]+x*cl[5])))))
+	y2 := float64(x * (cl[0] + float64(x*(cl[1]+float64(x*(cl[2]+float64(x*(cl[3]+float64(x*(cl[4]+float64(x*cl[5])))))))))))
 	y1, y2 := acoshPolyDD(x, 0, acoshOneCH[:], y2)
 	y1, y2 = cmMulDDD(y1, y2, x)
 	y0, y1 := fastTwoSum(1, y1)
@@ -162,7 +162,7 @@ func acoshRefine(x, a float64) float64 {
 	switch {
 	case ix < 0x4190000000000000:
 		// x < 2^26.
-		x2h := x * x
+		x2h := float64(x * x)
 		x2l := math.FMA(x, x, -x2h)
 		wh, wl := fastTwoSum(x2h-1, x2l)
 		sh := math.Sqrt(wh)
@@ -172,7 +172,7 @@ func acoshRefine(x, a float64) float64 {
 		zh, zl = fastTwoSum(zh, zl)
 	case ix < 0x4330000000000000:
 		// x < 2^52.
-		zh = 2 * x
+		zh = float64(2 * x)
 		zl = -0.5 / x
 	default:
 		// x >= 2^52: zh+zl is (x+sqrt(x^2-1))/2, so 2*x cannot overflow.
@@ -189,35 +189,35 @@ func acoshRefine(x, a float64) float64 {
 	i := (v - 0x3ff<<52) >> (52 - 16)
 	i1, i2, i3, i4 := (i>>12)&0x1f, (i>>8)&0xf, (i>>4)&0xf, i&0xf
 	const l20, l21, l22 = 0x1.62e42fefa38p-2, 0x1.ef35793c768p-46, -0x1.9ff0342542fc3p-91
-	el2, el1, el0 := l22*ed, l21*ed, l20*ed
+	el2, el1, el0 := float64(l22*ed), float64(l21*ed), float64(l20*ed)
 	var L [3]float64
 	for k := range L {
 		L[k] = cmLogLL[0][i1][k] + cmLogLL[1][i2][k] + (cmLogLL[2][i3][k] + cmLogLL[3][i4][k])
 	}
 	L[0] += el0
 	t12, t34 := cmLogT1[i1]*cmLogT2[i2], cmLogT3[i3]*cmLogT4[i4]
-	th := t12 * t34
+	th := float64(t12 * t34)
 	tl := math.FMA(t12, t34, -th)
 	tf := asdouble(t)
-	dh := th * tf
+	dh := float64(th * tf)
 	dl := math.FMA(th, tf, -dh)
-	sh := tl * tf
+	sh := float64(tl * tf)
 	sl := math.FMA(tl, tf, -sh)
 	xh, xl := fastTwoSum(dh-1, dl)
 	if zl != 0 {
-		xl += th * asdouble(asuint64(zl)-uint64(int64(e)<<52))
+		xl += float64(th * asdouble(asuint64(zl)-uint64(int64(e)<<52)))
 	}
 	xh, xl = acoshAddDD(xh, xl, sh, sl)
-	sl = xh * (-0x1p-3 + xh*(0x1.9999999a0754fp-4+xh*-0x1.55555555c3157p-4))
+	sl = float64(xh * (-0x1p-3 + float64(xh*(0x1.9999999a0754fp-4+float64(xh*-0x1.55555555c3157p-4)))))
 	sh, sl = acoshPolyDD(xh, xl, cmLogCH[:], sl)
 	sh, sl = acoshMulDDAcc(xh, xl, sh, sl)
 	sh, sl = acoshAddDD(sh, sl, el1, el2)
 	sh, sl = acoshAddDD(sh, sl, L[1], L[2])
 	v0, v2 := fastTwoSum(L[0], sh)
 	v1, v2 := fastTwoSum(v2, sl)
-	v0 *= 2
-	v1 *= 2
-	v2 *= 2
+	v0 = float64(v0 * 2)
+	v1 = float64(v1 * 2)
+	v2 = float64(v2 * 2)
 	v1 = roundAway(v1, v2)
 	t, t0 := asuint64(v1), asuint64(v0)
 	er := (t + 7) & (^uint64(0) >> 12)

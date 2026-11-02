@@ -29,18 +29,18 @@ func Atanh(x float64) float64 {
 		// x + (0x1.5555555555555p-2 + 0x1.5555555555555p-56) x^3 + x^5 c(x)
 		// approximates atanh(x) with relative error <= 2^-64.377.
 		c := &atanhSmallC
-		x2 := x * x
+		x2 := float64(x * x)
 		dx2 := math.FMA(x, x, -x2)
-		x4, x3 := x2*x2, x2*x
+		x4, x3 := x2*x2, float64(x2*x)
 		x8 := x4 * x4
-		dx3 := math.FMA(x2, x, -x3) + dx2*x
-		p := (c[0] + x2*c[1]) + x4*(c[2]+x2*c[3]) + x8*((c[4]+x2*c[5])+x4*(c[6]+x2*c[7])+x8*c[8])
+		dx3 := math.FMA(x2, x, -x3) + float64(dx2*x)
+		p := (c[0] + float64(x2*c[1])) + float64(x4*(c[2]+float64(x2*c[3]))) + float64(x8*((c[4]+float64(x2*c[5]))+float64(x4*(c[6]+float64(x2*c[7])))+float64(x8*c[8])))
 		t := math.FMA(x2, p, 0x1.5555555555555p-56)
 		ph, pl := fastTwoSum(0x1.5555555555555p-2, t)
 		ph, pl = atanhMulDD(ph, pl, x3, dx3)
 		ph, tl := fastTwoSum(x, ph)
 		pl += tl
-		eps := x * (x4*0x1.dp-53 + 0x1p-103)
+		eps := float64(x * (float64(x4*0x1.dp-53) + 0x1p-103))
 		lb, ub := ph+(pl-eps), ph+(pl+eps)
 		if lb == ub {
 			return lb
@@ -51,8 +51,8 @@ func Atanh(x float64) float64 {
 	ph, pl := fastTwoSum(1, ax)
 	qh, ql := fastTwoSub(1, ax)
 	iqh := 1 / qh
-	th := ph * iqh
-	tl := math.FMA(ph, iqh, -th) + (pl+ph*(math.FMA(-qh, iqh, 1)-ql*iqh))*iqh
+	th := float64(ph * iqh)
+	tl := math.FMA(ph, iqh, -th) + float64((pl+float64(ph*(math.FMA(-qh, iqh, 1)-float64(ql*iqh))))*iqh)
 
 	t := asuint64(th)
 	ex := int(t >> 52)
@@ -68,24 +68,24 @@ func Atanh(x float64) float64 {
 	r := (0.5 * cmLogR1[i1]) * cmLogR2[i2]
 	dx := math.FMA(r, tf, -0.5)
 	dx2 := dx * dx
-	rx := r * tf
+	rx := float64(r * tf)
 	dxl := math.FMA(r, tf, -rx)
 	c := &atanhC
-	f := dx2 * ((c[0] + dx*c[1]) + dx2*(c[2]+dx*c[3]+dx2*c[4]))
+	f := float64(dx2 * ((c[0] + float64(dx*c[1])) + float64(dx2*(c[2]+float64(dx*c[3])+float64(dx2*c[4])))))
 	const l2h, l2l = 0x1.62e42fefa3ap-2, -0x1.0ca86c3898dp-50
-	lh := (atanhL1[i1][1] + atanhL2[i2][1]) + l2h*ed
+	lh := (atanhL1[i1][1] + atanhL2[i2][1]) + float64(l2h*ed)
 	lh, ll := fastTwoSum(lh, rx-0.5)
-	ll += l2l*ed + (atanhL1[i1][0] + atanhL2[i2][0]) + dxl + 0.5*tl/th
+	ll += float64(l2l*ed) + (atanhL1[i1][0] + atanhL2[i2][0]) + dxl + 0.5*tl/th
 	ll += f
-	lh *= math.Copysign(1, x)
-	ll *= math.Copysign(1, x)
-	eps := 38e-24 + dx2*0x1p-49
+	lh = float64(lh * math.Copysign(1, x))
+	ll = float64(ll * math.Copysign(1, x))
+	eps := 38e-24 + float64(dx2*0x1p-49)
 	lb, ub := lh+(ll-eps), lh+(ll+eps)
 	if lb == ub {
 		return lb
 	}
 	th, tl = fastTwoSum(th, tl)
-	return atanhRefine(x, th, tl, 0x1.71547652b82fep+1*math.Abs(lh+ll))
+	return atanhRefine(x, th, tl, float64(0x1.71547652b82fep+1*math.Abs(lh+ll)))
 }
 
 // fastTwoSub is s = x-y rounded and the error e = x-y-s, exact when |x| >= |y|.
@@ -97,21 +97,21 @@ func fastTwoSub(x, y float64) (s, e float64) {
 
 // atanhMulDD is (xh+xl)*(ch+cl) as h+l, h not renormalized.
 func atanhMulDD(xh, xl, ch, cl float64) (h, l float64) {
-	ahlh, alhh, ahhh := ch*xl, cl*xh, ch*xh
+	ahlh, alhh, ahhh := float64(ch*xl), float64(cl*xh), float64(ch*xh)
 	ahhl := math.FMA(ch, xh, -ahhh)
 	return ahhh, ahhl + (alhh + ahlh)
 }
 
 func atanhMulDDD(xh, xl, ch float64) (h, l float64) {
-	hh := xh * ch
-	return hh, math.FMA(ch, xh, -hh) + xl*ch
+	hh := float64(xh * ch)
+	return hh, math.FMA(ch, xh, -hh) + float64(xl*ch)
 }
 
 func atanhZero(x float64) float64 {
 	cl := &atanhZeroCL
-	x2 := x * x
+	x2 := float64(x * x)
 	x2l := math.FMA(x, x, -x2)
-	y2 := x2 * (cl[0] + x2*(cl[1]+x2*(cl[2]+x2*(cl[3]+x2*cl[4]))))
+	y2 := float64(x2 * (cl[0] + float64(x2*(cl[1]+float64(x2*(cl[2]+float64(x2*(cl[3]+float64(x2*cl[4])))))))))
 	y1, y2 := acoshPolyDD(x2, x2l, atanhZeroCH[:], y2)
 	y1, y2 = atanhMulDDD(y1, y2, x)
 	y1, y2 = acoshMulDDAcc(x2, x2l, y1, y2)
@@ -129,7 +129,7 @@ func atanhDatabase(x, f float64) float64 {
 		case atanhDB[m][0] < ax:
 			a = m + 1
 		case atanhDB[m][0] == ax:
-			return sgn*atanhDB[m][1] + sgn*atanhDB[m][2]
+			return float64(sgn*atanhDB[m][1]) + float64(sgn*atanhDB[m][2])
 		default:
 			b = m - 1
 		}
@@ -148,24 +148,24 @@ func atanhRefine(x, zh, zl, a float64) float64 {
 	i := (v - 0x3ff<<52) >> (52 - 16)
 	i1, i2, i3, i4 := i>>12, (i>>8)&0xf, (i>>4)&0xf, i&0xf
 	const l20, l21, l22 = 0x1.62e42fefa3ap-2, -0x1.0ca86c3898dp-50, 0x1.f97b57a079ap-104
-	el2, el1, el0 := l22*ed, l21*ed, l20*ed
+	el2, el1, el0 := float64(l22*ed), float64(l21*ed), float64(l20*ed)
 	var L [3]float64
 	for k := range L {
 		L[k] = cmLogLL[0][i1][k] + cmLogLL[1][i2][k] + (cmLogLL[2][i3][k] + cmLogLL[3][i4][k])
 	}
 	L[0] += el0
 	t12, t34 := cmLogT1[i1]*cmLogT2[i2], cmLogT3[i3]*cmLogT4[i4]
-	th := t12 * t34
+	th := float64(t12 * t34)
 	tl := math.FMA(t12, t34, -th)
 	tf := asdouble(t)
-	dh := th * tf
+	dh := float64(th * tf)
 	dl := math.FMA(th, tf, -dh)
-	sh := tl * tf
+	sh := float64(tl * tf)
 	sl := math.FMA(tl, tf, -sh)
 	xh, xl := fastTwoSum(dh-1, dl)
-	xl += th * asdouble(asuint64(zl)-uint64(int64(e)<<52))
+	xl += float64(th * asdouble(asuint64(zl)-uint64(int64(e)<<52)))
 	xh, xl = asinhAddDD(xh, xl, sh, sl)
-	sl = xh * (-0x1p-3 + xh*(0x1.9999999a0754fp-4+xh*-0x1.55555555c3157p-4))
+	sl = float64(xh * (-0x1p-3 + float64(xh*(0x1.9999999a0754fp-4+float64(xh*-0x1.55555555c3157p-4)))))
 	sh, sl = acoshPolyDD(xh, xl, cmLogCH[:], sl)
 	sh, sl = acoshMulDDAcc(xh, xl, sh, sl)
 	sh, sl = asinhAddDD(sh, sl, el1, el2)
@@ -181,8 +181,8 @@ func atanhRefine(x, zh, zl, a float64) float64 {
 	t0 := asuint64(v0)
 	er := (t + 1) & (^uint64(0) >> 12)
 	de := (t0>>52)&0x7ff - (t>>52)&0x7ff
-	v0 *= math.Copysign(1, x)
-	v1 *= math.Copysign(1, x)
+	v0 = float64(v0 * math.Copysign(1, x))
+	v1 = float64(v1 * math.Copysign(1, x))
 	res := v0 + v1
 	if de > 104 || er < 3 {
 		return atanhDatabase(x, res)

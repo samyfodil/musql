@@ -245,19 +245,19 @@ func dintToD(a dint) float64 {
 	default:
 		e = asdouble(1 << (a.ex + 1073))
 	}
-	return r * e
+	return float64(r * e)
 }
 
 // sMul is a*(bh+bl) to within ulp(lo).
 func sMul(a, bh, bl float64) (hi, lo float64) {
-	hi = a * bh
+	hi = float64(a * bh)
 	lo = math.FMA(a, bh, -hi)
 	return hi, math.FMA(a, bl, lo)
 }
 
 // dMul is (ah+al)*(bh+bl) - al*bl.
 func dMul(ah, al, bh, bl float64) (hi, lo float64) {
-	hi = ah * bh
+	hi = float64(ah * bh)
 	s := math.FMA(ah, bh, -hi)
 	t := math.FMA(al, bh, s)
 	return hi, math.FMA(ah, bl, t)
@@ -447,7 +447,7 @@ func tanReduceFast(x float64) (int, float64, float64) {
 	if x <= 0x1.921fb54442d17p+2 {
 		// x < 2*pi: |CH+CL - 1/(2pi)| < 2^-110.523.
 		const ch, cl = 0x1.45f306dc9c883p-3, -0x1.6b01ec5417056p-57
-		h = ch * x
+		h = float64(ch * x)
 		l = math.FMA(ch, x, -h)
 		l = math.FMA(cl, x, l)
 	} else {
@@ -497,10 +497,10 @@ func tanReduceFast(x float64) (int, float64, float64) {
 // |bl|, |al| < 2^-49.47 (Karp-Markstein).
 func tanFastDiv(bh, bl, ah, al float64) (h, l float64) {
 	y := 1.0 / ah
-	h = bh * y
+	h = float64(bh * y)
 	eh := math.FMA(ah, -h, bh)
 	el := math.FMA(al, -h, bl)
-	return h, y * (eh + el)
+	return h, float64(y * (eh + el))
 }
 
 // tanFast is tan(x) as h+l and err with |h + l - tan(x)| < err, for a finite
@@ -531,7 +531,7 @@ func tanFast(x float64) (h, l, err float64) {
 	// SC[i] is at i/2^11 + SC[i][0]; h - SC[i][0] is exact.
 	h -= tanSC[i][0]
 	h, l = fastTwoSum(h, l)
-	uh := h * h
+	uh := float64(h * h)
 	ul := math.FMA(h, h, -uh)
 	ul = math.FMA(h+h, l, ul)
 	sh, sl := tanEvalPSFast(h, l, uh, ul)
@@ -552,7 +552,7 @@ func tanFast(x float64) (h, l, err float64) {
 	if neg != 0 {
 		h, l = -h, -l
 	}
-	return h, l, h * 0x1.1ap-66
+	return h, l, float64(h * 0x1.1ap-66)
 }
 
 // tanAccurate is tan(x) for a finite |x| > 0x1.d12ed0af1a27ep-27, the path

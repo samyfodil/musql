@@ -44,8 +44,8 @@ func Cos(x float64) float64 {
 }
 
 func sinMulDD(xh, xl, ch, cl float64) (h, l float64) {
-	ahhh := xh * ch
-	return ahhh, (xh*cl + xl*ch) + math.FMA(xh, ch, -ahhh)
+	ahhh := float64(xh * ch)
+	return ahhh, (float64(xh*cl) + float64(xl*ch)) + math.FMA(xh, ch, -ahhh)
 }
 
 func fastSum(xh, xl, yh, yl float64) (h, l float64) {
@@ -64,7 +64,7 @@ func sinModerate(x float64, sbit uint64) float64 {
 	ax := math.Abs(x)
 	k := math.RoundToEven(invPi * ax)
 	rh := math.FMA(k, sinPih, ax)
-	rl := k * sinPil
+	rl := float64(k * sinPil)
 	r := rh + rl
 	r2 := r * r
 	j := int64(k)
@@ -73,12 +73,12 @@ func sinModerate(x float64, sbit uint64) float64 {
 	s1h, s1l := sinMulDD(sinU1[i1][0], sinU1[i1][1], sinU2[i2][2], sinU2[i2][3])
 	s2h, s2l := sinMulDD(sinU2[i2][0], sinU2[i2][1], sinU1[i1][2], sinU1[i1][3])
 	sh, sl := fastSum(s1h, s1l, s2h, s2l)
-	ch := sinU1[i1][2]*sinU2[i2][2] - sinU1[i1][0]*sinU2[i2][0]
+	ch := float64(sinU1[i1][2]*sinU2[i2][2]) - float64(sinU1[i1][0]*sinU2[i2][0])
 	// r - 0x1.55555553068fp-3*r^3 approximates sin(r) and -0.5*r^2 +
 	// 0x1.55555553bfd3p-5*r^4 approximates cos(r)-1.
-	pr := r * (1.0 - 0x1.55555553068fp-3*r2)
-	qr := r2 * (-0.5 + 0x1.55555553bfd3p-5*r2)
-	fh, fl := sh, sl+sh*qr+ch*pr
+	pr := r * (1.0 - float64(0x1.55555553068fp-3*r2))
+	qr := r2 * (-0.5 + float64(0x1.55555553bfd3p-5*r2))
+	fh, fl := sh, sl+float64(sh*qr)+float64(ch*pr)
 	if sbit != 0 {
 		fh, fl = -fh, -fl
 	}
@@ -106,10 +106,10 @@ func sinLarge(x float64) float64 {
 	s1h, s1l := sinMulDD(sinU1[i1][0], sinU1[i1][1], sinU2[i2][2], sinU2[i2][3])
 	s2h, s2l := sinMulDD(sinU2[i2][0], sinU2[i2][1], sinU1[i1][2], sinU1[i1][3])
 	sh, sl := fastSum(s1h, s1l, s2h, s2l)
-	ch := sinU1[i1][2]*sinU2[i2][2] - sinU1[i1][0]*sinU2[i2][0]
-	pr := r * (0x1.921fb54442d18p2 - 0x1.4abbcdb6b26d1p5*r2)
-	qr := r2 * (-0x1.3bd3cc9be45dep4 + 0x1.03c1eee483083p6*r2)
-	fh, fl := sh, sl+sh*qr+ch*pr
+	ch := float64(sinU1[i1][2]*sinU2[i2][2]) - float64(sinU1[i1][0]*sinU2[i2][0])
+	pr := r * (0x1.921fb54442d18p2 - float64(0x1.4abbcdb6b26d1p5*r2))
+	qr := r2 * (-0x1.3bd3cc9be45dep4 + float64(0x1.03c1eee483083p6*r2))
+	fh, fl := sh, sl+float64(sh*qr)+float64(ch*pr)
 	if sbit != 0 {
 		fh, fl = -fh, -fl
 	}
@@ -123,9 +123,9 @@ func sinLarge(x float64) float64 {
 
 // sinSmallAccurate is sin(x) for |x| < 2^-16, to within 2^-112.7.
 func sinSmallAccurate(x float64) float64 {
-	x2h := x * x
+	x2h := float64(x * x)
 	x2l := math.FMA(x, x, -x2h)
-	h := 0x1.111111110848p-7 * x2h
+	h := float64(0x1.111111110848p-7 * x2h)
 	h += -0x1.55554b00de7e8p-57
 	h, l := fastTwoSum(-0x1.5555555555555p-3, h)
 	h, l = sinMulDD(h, l, x2h, x2l)
@@ -191,7 +191,7 @@ func sinLargeAccurate(x float64) float64 {
 func cosModerate(x float64) float64 {
 	k := math.RoundToEven(invPi * x)
 	rh := math.FMA(k, sinPih, x)
-	rl := k * sinPil
+	rl := float64(k * sinPil)
 	r := rh + rl
 	r2 := r * r
 	j := int64(k)
@@ -200,10 +200,10 @@ func cosModerate(x float64) float64 {
 	c1h, c1l := sinMulDD(sinU1[i1][2], sinU1[i1][3], sinU2[i2][2], sinU2[i2][3])
 	c2h, c2l := sinMulDD(sinU2[i2][0], sinU2[i2][1], sinU1[i1][0], sinU1[i1][1])
 	ch, cl := fastSum(c1h, c1l, -c2h, -c2l)
-	sh := sinU1[i1][0]*sinU2[i2][2] + sinU1[i1][2]*sinU2[i2][0]
-	pr := r * (1.0 - 0x1.55555553068fp-3*r2)
-	qr := r2 * (-0.5 + 0x1.55555553bfd3p-5*r2)
-	fh, fl := ch, cl+ch*qr-sh*pr
+	sh := float64(sinU1[i1][0]*sinU2[i2][2]) + float64(sinU1[i1][2]*sinU2[i2][0])
+	pr := r * (1.0 - float64(0x1.55555553068fp-3*r2))
+	qr := r2 * (-0.5 + float64(0x1.55555553bfd3p-5*r2))
+	fh, fl := ch, cl+float64(ch*qr)-float64(sh*pr)
 	if sbit != 0 {
 		fh, fl = -fh, -fl
 	}
@@ -224,10 +224,10 @@ func cosLarge(x float64) float64 {
 	c1h, c1l := sinMulDD(sinU1[i1][2], sinU1[i1][3], sinU2[i2][2], sinU2[i2][3])
 	c2h, c2l := sinMulDD(sinU2[i2][0], sinU2[i2][1], sinU1[i1][0], sinU1[i1][1])
 	ch, cl := fastSum(c1h, c1l, -c2h, -c2l)
-	sh := sinU1[i1][0]*sinU2[i2][2] + sinU1[i1][2]*sinU2[i2][0]
-	pr := r * (0x1.921fb54442d18p2 - 0x1.4abbcdb6b26d1p5*r2)
-	qr := r2 * (-0x1.3bd3cc9be45dep4 + 0x1.03c1eee483083p6*r2)
-	fh, fl := ch, cl+ch*qr-sh*pr
+	sh := float64(sinU1[i1][0]*sinU2[i2][2]) + float64(sinU1[i1][2]*sinU2[i2][0])
+	pr := r * (0x1.921fb54442d18p2 - float64(0x1.4abbcdb6b26d1p5*r2))
+	qr := r2 * (-0x1.3bd3cc9be45dep4 + float64(0x1.03c1eee483083p6*r2))
+	fh, fl := ch, cl+float64(ch*qr)-float64(sh*pr)
 	if sbit != 0 {
 		fh, fl = -fh, -fl
 	}
@@ -319,7 +319,7 @@ func reduceLarge(x float64) (float64, uint64) {
 	u := mulLo(u128{0, m}, u128{v0, v1})
 	// Round r to nearest: 0x810000000000000 is 2^59 + 2^52.
 	u = u.add(u128{1 << 48, 0x810000000000000})
-	r := float64(u.shl(15).shr(75).lo)*0x1p-68 - 0x1p-16
+	r := float64(float64(u.shl(15).shr(75).lo)*0x1p-68) - 0x1p-16
 	return r, u.shr(113).lo
 }
 
@@ -362,7 +362,7 @@ func u128ToD(r u128, s int) float64 {
 	sgn := [2]float64{0x1p-53, -0x1p-53}
 	v := asdouble(asuint64(sgn[s]) - sh<<52)
 	low := [2]float64{0x1.8p-2, 0x1.8p-1}
-	return float64(h)*v + low[rbit]*v
+	return float64(float64(h)*v) + float64(low[rbit]*v)
 }
 
 var sinT = [20]uint64{

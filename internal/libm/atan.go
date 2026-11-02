@@ -22,8 +22,8 @@ func Atan(x float64) float64 {
 		x2 := x * x
 		x3, x4 := x*x2, x2*x2
 		c := &atanSmallCH
-		f := x3 * ((c[0] + x2*c[1]) + x4*(c[2]+x2*c[3]))
-		epsp, epsm := f*0x1.6p-50, f*0x1.6p-51
+		f := float64(x3 * ((c[0] + float64(x2*c[1])) + float64(x4*(c[2]+float64(x2*c[3])))))
+		epsp, epsm := float64(f*0x1.6p-50), float64(f*0x1.6p-51)
 		ub, lb := (f+epsp)+x, (f-epsm)+x
 		if ub == lb {
 			return ub
@@ -51,16 +51,16 @@ func Atan(x float64) float64 {
 		c := &atanC[i]
 		i = int64((uint64(c[0])<<16 + ut*uint64(c[1]) - ut2*uint64(c[2])) >> (16 + 9))
 		sgn := math.Copysign(1.0, x)
-		ta, id := sgn*atanA[i][0], sgn*float64(i)
-		al = sgn*atanA[i][1] + 0x1.8469898cc517p-55*id
-		h = (x - ta) / (1 + x*ta)
-		ah = 0x1.921fb54442dp-7 * id
+		ta, id := float64(sgn*atanA[i][0]), sgn*float64(i)
+		al = float64(sgn*atanA[i][1]) + float64(0x1.8469898cc517p-55*id)
+		h = (x - ta) / (1 + float64(x*ta))
+		ah = float64(0x1.921fb54442dp-7 * id)
 	}
 	h2 := h * h
 	h4 := h2 * h2
-	f := (1 + h2*-0x1.555555555552bp-2) + h4*(0x1.9999999069c2p-3+h2*-0x1.248d2c8444ac6p-3)
+	f := (1 + float64(h2*-0x1.555555555552bp-2)) + float64(h4*(0x1.9999999069c2p-3+float64(h2*-0x1.248d2c8444ac6p-3)))
 	al = math.FMA(h, f, al)
-	e := h * 0x3.fp-52
+	e := float64(h * 0x3.fp-52)
 	ub, lb := (al+e)+ah, (al-e)+ah
 	if ub == lb {
 		return ub
@@ -71,30 +71,30 @@ func Atan(x float64) float64 {
 // atanRefine2 is atan(x) for 0x1p-27 <= |x|, where a is the fast path's
 // approximation of it.
 func atanRefine2(x, a float64) float64 {
-	phi := asuint64(math.Abs(a)*0x1.45f306dc9c883p6 + 256.5)
+	phi := asuint64(float64(math.Abs(a)*0x1.45f306dc9c883p6) + 256.5)
 	i := int64(phi>>(52-8)) & 0xff
 	var h, hl float64
 	if i == 128 {
 		h = -1.0 / x
-		hl = math.FMA(h, x, 1) * h
+		hl = float64(math.FMA(h, x, 1) * h)
 	} else {
 		ta := math.Copysign(atanA[i][0], x)
-		zta := x * ta
+		zta := float64(x * ta)
 		ztal := math.FMA(x, ta, -zta)
 		zmta := x - ta
 		v := 1 + zta
 		d := 1 - v
 		ev := (d + zta) - ((d + v) - 1) + ztal
 		r := 1.0 / v
-		rl := (math.FMA(r, -v, 1.0) - ev*r) * r
-		h = r * zmta
-		hl = math.FMA(r, zmta, -h) + rl*zmta
+		rl := (math.FMA(r, -v, 1.0) - float64(ev*r)) * r
+		h = float64(r * zmta)
+		hl = math.FMA(r, zmta, -h) + float64(rl*zmta)
 	}
 	h2, h2l := acoshMulDDAcc(h, hl, h, hl)
 	h4 := h2 * h2
 	h3, h3l := acoshMulDDAcc(h, hl, h2, h2l)
 	cl := &atanRefCL
-	fl := h2 * ((cl[0] + h2*cl[1]) + h4*(cl[2]+h2*cl[3]))
+	fl := float64(h2 * ((cl[0] + float64(h2*cl[1])) + float64(h4*(cl[2]+float64(h2*cl[3])))))
 	// atan's polydd normalizes its products with fastTwoSum rather than
 	// asinh's two lines, which is the same in round-to-nearest.
 	f, fl := asinhPolyDD(h2, h2l, atanRefCH[:], fl)
@@ -105,12 +105,12 @@ func atanRefine2(x, a float64) float64 {
 	} else {
 		var df float64
 		if i < 128 {
-			df = math.Copysign(1.0, x) * atanA[i][1]
+			df = float64(math.Copysign(1.0, x) * atanA[i][1])
 		}
 		id := math.Copysign(float64(i), x)
-		ah = 0x1.921fb54442dp-7 * id
-		al = 0x1.8469898cc518p-55 * id
-		at = -0x1.fc8f8cbb5bf8p-104 * id
+		ah = float64(0x1.921fb54442dp-7 * id)
+		al = float64(0x1.8469898cc518p-55 * id)
+		at = float64(-0x1.fc8f8cbb5bf8p-104 * id)
 		al, at = asinhAddDD(al, at, df, 0)
 		al, at = asinhAddDD(al, at, h, hl)
 		al, at = asinhAddDD(al, at, f, fl)
@@ -122,7 +122,7 @@ func atanRefine2(x, a float64) float64 {
 		ax := math.Abs(x)
 		for _, d := range atanDB {
 			if ax == d[0] {
-				return math.Copysign(d[1], x) + math.Copysign(1.0, x)*d[2]
+				return math.Copysign(d[1], x) + float64(math.Copysign(1.0, x)*d[2])
 			}
 		}
 		if t1&(^uint64(0)>>12) == 0 {
