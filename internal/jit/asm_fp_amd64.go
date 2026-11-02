@@ -162,3 +162,23 @@ func (a *Asm) aluImm32(op byte, dst Reg, imm int32) {
 	a.emit(0x81, modrm(0b11, Reg(op), dst))
 	a.emit32(uint32(imm))
 }
+
+// The x87 instructions fmod needs: FPREM's partial remainder is exact
+// whatever the precision control, and it leaves C2 set until the remainder
+// is complete.
+func (a *Asm) FldM64(base Reg, disp int32) { a.fpRexX87(base); a.emit(0xDD); a.memAny(0, base, disp) }
+func (a *Asm) FstpM64(base Reg, disp int32) {
+	a.fpRexX87(base)
+	a.emit(0xDD)
+	a.memAny(3, base, disp)
+}
+func (a *Asm) Fprem()            { a.emit(0xD9, 0xF8) }
+func (a *Asm) FnstswAX()         { a.emit(0xDF, 0xE0) }
+func (a *Asm) FstpST0()          { a.emit(0xDD, 0xD8) }
+func (a *Asm) TestAHImm8(b byte) { a.emit(0xF6, 0xC4, b) }
+
+func (a *Asm) fpRexX87(base Reg) {
+	if base >= R8 {
+		a.emit(0x41)
+	}
+}

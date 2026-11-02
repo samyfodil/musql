@@ -7,7 +7,7 @@ import (
 
 var opNames = [...]string{
 	opNone: "?", OpArg: "arg", OpConst: "const", OpCopy: "set",
-	OpFAdd: "fadd", OpFSub: "fsub", OpFMul: "fmul", OpFDiv: "fdiv", OpFSqrt: "fsqrt", OpFAbs: "fabs", OpFNeg: "fneg",
+	OpFAdd: "fadd", OpFSub: "fsub", OpFMul: "fmul", OpFDiv: "fdiv", OpFMod: "fmod", OpFSqrt: "fsqrt", OpFAbs: "fabs", OpFNeg: "fneg",
 	OpFMA: "fma", OpMAdd: "madd", OpRoundEven: "roundeven", OpFloor: "floor", OpCeil: "ceil", OpTrunc: "trunc",
 	OpFToI: "ftoi", OpIToF: "itof", OpAdd: "add", OpSub: "sub", OpMul: "mul", OpAnd: "and", OpOr: "or", OpXor: "xor",
 	OpShl: "shl", OpShr: "shr", OpSar: "sar", OpLoadF: "loadf", OpLoadI: "loadi",

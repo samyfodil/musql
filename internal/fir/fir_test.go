@@ -45,6 +45,7 @@ func TestEvalOps(t *testing.T) {
 		want   float64
 		bits   uint64 // checked instead of want when non-zero
 		exited bool
+		fused  bool
 	}
 	neg0 := math.Copysign(0, -1)
 	cases := []tc{
@@ -53,10 +54,12 @@ func TestEvalOps(t *testing.T) {
 		{build: func(b *B, x, y Val) Val { return b.FMul(x, y) }, x: 3, y: 2, want: 6},
 		{build: func(b *B, x, y Val) Val { return b.FDiv(x, y) }, x: 3, y: 2, want: 1.5},
 		{build: func(b *B, x, y Val) Val { return b.FSqrt(x) }, x: 9, want: 3},
+		{build: func(b *B, x, y Val) Val { return b.FMod(x, y) }, x: -7.5, y: 2, want: -1.5},
 		{build: func(b *B, x, y Val) Val { return b.FAbs(x) }, x: neg0, want: 0},
 		{build: func(b *B, x, y Val) Val { return b.FNeg(x) }, x: 0, bits: 1 << 63},
 		{build: func(b *B, x, y Val) Val { return b.FMA(x, y, b.K(-1)) }, x: 1 + 0x1p-30, y: 1 - 0x1p-30, want: -0x1p-60},
 		{build: func(b *B, x, y Val) Val { return b.MAdd(x, y, b.K(-1)) }, x: 1 + 0x1p-30, y: 1 - 0x1p-30, want: 0},
+		{build: func(b *B, x, y Val) Val { return b.MAdd(x, y, b.K(-1)) }, x: 1 + 0x1p-30, y: 1 - 0x1p-30, want: -0x1p-60, fused: true},
 		{build: func(b *B, x, y Val) Val { return b.RoundEven(x) }, x: 2.5, want: 2},
 		{build: func(b *B, x, y Val) Val { return b.Floor(x) }, x: -2.5, want: -3},
 		{build: func(b *B, x, y Val) Val { return b.Ceil(x) }, x: -2.5, want: -2},
@@ -75,10 +78,7 @@ func TestEvalOps(t *testing.T) {
 		{build: func(b *B, x, y Val) Val { b.Exit(); return x }, exited: true},
 	}
 	for i, c := range cases {
-		b := New("t", 2, false)
-		if i == 8 {
-			b = New("t", 2, true) // MAdd fused: one rounding
-		}
+		b := New("t", 2, c.fused)
 		x, y := b.Arg(0), b.Arg(1)
 		b.Return(c.build(b, x, y))
 		f, err := b.Func()
@@ -97,9 +97,7 @@ func TestEvalOps(t *testing.T) {
 			if math.Float64bits(got) != c.bits {
 				t.Errorf("case %d: %x, want %x", i, math.Float64bits(got), c.bits)
 			}
-		} else if i == 8 && got != -0x1p-60 {
-			t.Errorf("fused MAdd: %v", got)
-		} else if i != 8 && got != c.want {
+		} else if got != c.want {
 			t.Errorf("case %d: %v, want %v", i, got, c.want)
 		}
 	}

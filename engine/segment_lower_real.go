@@ -407,6 +407,9 @@ func buildSegMathKernel(name string, nargs int) *fir.Func {
 		case "atan2":
 			null(y)
 			k.Return(k.Atan2(x, y))
+		case "mod":
+			null(y)
+			k.Return(k.FMod(x, y))
 		case "log":
 			// mathLog: log(B,X) is ln(X)/ln(B), NULL unless B, ln(B) and
 			// X are all positive.

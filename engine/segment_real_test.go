@@ -37,6 +37,7 @@ func TestRealProgramsMatchTheLoop(t *testing.T) {
 		{`SELECT sum(tan(x)), sum(atan(y)), sum(asin(y/50)), sum(acos(y/50)), sum(atan2(x, y)) FROM t`, nil, 1},
 		{`SELECT sum(sinh(y/10)), sum(cosh(y/10)), sum(tanh(y)), sum(asinh(x)), sum(acosh(abs(x)+1)), sum(atanh(y/51)) FROM t`, nil, 1},
 		{`SELECT sum(radians(x)), sum(degrees(y)), sum(pi()*x), sum(floor(i)), sum(sqrt(i)) FROM t`, nil, 1},
+		{`SELECT sum(mod(x, 7)), sum(mod(y, x)), sum(mod(i, 3.5)), count(mod(x, y-y)) FROM t`, nil, 1},
 		{`SELECT count(*), sum(x) FROM t WHERE x > 0.5`, nil, 1},
 		{`SELECT count(*), sum(y) FROM t WHERE x < y AND i > 0`, nil, 1},
 		{`SELECT count(*) FROM t WHERE sqrt(x) > 3`, nil, 1},

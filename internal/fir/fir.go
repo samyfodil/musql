@@ -64,6 +64,8 @@ const (
 	OpFloor
 	OpCeil
 	OpTrunc
+	// OpFMod: C's fmod(A, B), exact.
+	OpFMod
 	// OpFToI: int64(A), truncated. A must be finite and inside int64's range.
 	OpFToI
 	// OpIToF: float64(int64(A)), rounded to nearest-even.
@@ -236,6 +238,7 @@ func (b *B) FAdd(x, y Val) Val { return b.f2(OpFAdd, x, y) }
 func (b *B) FSub(x, y Val) Val { return b.f2(OpFSub, x, y) }
 func (b *B) FMul(x, y Val) Val { return b.f2(OpFMul, x, y) }
 func (b *B) FDiv(x, y Val) Val { return b.f2(OpFDiv, x, y) }
+func (b *B) FMod(x, y Val) Val { return b.f2(OpFMod, x, y) }
 func (b *B) FSqrt(x Val) Val   { return b.f1(OpFSqrt, x) }
 func (b *B) FAbs(x Val) Val    { return b.f1(OpFAbs, x) }
 func (b *B) FNeg(x Val) Val    { return b.f1(OpFNeg, x) }

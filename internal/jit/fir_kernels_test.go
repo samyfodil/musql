@@ -187,3 +187,47 @@ func TestFloatProgramCompares(t *testing.T) {
 		}
 	}
 }
+
+// fmod is exact, so the kernel's must be math.Mod's, a NaN for a NaN.
+func TestFirFMod(t *testing.T) {
+	if !firFMod {
+		t.Skip("no fmod in this backend")
+	}
+	b := fir.New("fmod", 2, false)
+	b.Return(b.FMod(b.Arg(0), b.Arg(1)))
+	f, err := b.Func()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for budget := range firBudgets {
+		k, err := firLoop(f, budget)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := rand.New(rand.NewPCG(21, uint64(budget)))
+		special := []float64{0, math.Copysign(0, -1), 1, -1, 7, -7, 0.5, math.Inf(1), math.Inf(-1), math.NaN(),
+			0x1p-1074, -0x1p-1074, 0x1p-1022, math.MaxFloat64, -math.MaxFloat64, 1e300, 3e-300}
+		var xs, ys []float64
+		for _, x := range special {
+			for _, y := range special {
+				xs, ys = append(xs, x), append(ys, y)
+			}
+		}
+		for range 100000 {
+			x := math.Float64frombits(r.Uint64())
+			y := math.Float64frombits(r.Uint64())
+			if r.IntN(2) == 0 {
+				x, y = (r.Float64()-0.5)*1e6, (r.Float64()-0.5)*100
+			}
+			xs, ys = append(xs, x), append(ys, y)
+		}
+		got, exited := runFir(k, xs, ys)
+		for i := range xs {
+			want := math.Mod(xs[i], ys[i])
+			if exited[i] || (math.Float64bits(got[i]) != math.Float64bits(want) && !(got[i] != got[i] && want != want)) {
+				t.Fatalf("fmod(%v, %v) = %v (%x), math.Mod %v (%x)", xs[i], ys[i], got[i], math.Float64bits(got[i]), want, math.Float64bits(want))
+			}
+		}
+		k.Close()
+	}
+}

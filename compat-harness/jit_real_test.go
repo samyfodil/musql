@@ -122,7 +122,7 @@ func TestJITRealMatchesC(t *testing.T) {
 		"exp(x)", "exp(-x)", "exp(y)", "pow(x, y)", "pow(x, 2.5)", "pow(abs(x), y)", "power(y, 3)", "pow(2, y)",
 		"sin(x)", "cos(x)", "sin(y)", "cos(y*1000)", "sin(x*1e6)", "tan(x)", "tan(y/4)", "atan(x)", "atan(y*100)",
 		"asin(x/1000)", "acos(y/10)", "atan2(x, y)", "atan2(y, x*1000)", "sinh(y)", "cosh(x/100)", "tanh(y)",
-		"asinh(x)", "acosh(abs(x)+1)", "atanh(y/10.5)",
+		"asinh(x)", "acosh(abs(x)+1)", "atanh(y/10.5)", "mod(x, 7)", "mod(y, x)", "mod(x, y-y)", "mod(i, 2.5)",
 		"floor(x)", "ceil(x)", "ceiling(y)", "trunc(x)", "floor(i)", "radians(x)", "degrees(y)", "pi()*x",
 		"sqrt(i)", "exp(i/1000.0)", "x/0", "x/(y-y)", "(x+y)/(x-y)",
 	} {

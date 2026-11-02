@@ -56,3 +56,6 @@ func firLoop(f *fir.Func, budget int) (*Code, error) {
 	}
 	return Map(code)
 }
+
+// firFMod is whether this backend compiles fir.OpFMod.
+const firFMod = false

@@ -93,6 +93,9 @@ func emitFirArm64(a *Arm, f *fir.Func, env *firEnv, feat cpuFeatures) error {
 	if f.Fused && !feat.fma {
 		return fmt.Errorf("jit: kernel %s is built fused and this CPU has no FMA", f.Name)
 	}
+	if firHasOp(f.Body, fir.OpFMod) {
+		return fmt.Errorf("jit: kernel %s: no fmod on arm64", f.Name)
+	}
 	e := &firArm64{a: a, f: f, env: env,
 		t0: env.gprs[0], t1: env.gprs[1], s0: env.fprs[0], s1: env.fprs[1], s2: env.fprs[2],
 		gpr: env.gprs[2:], fpr: env.fprs[3:]}

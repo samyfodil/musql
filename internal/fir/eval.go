@@ -52,6 +52,8 @@ func (e *evaluator) run(steps []Step) (res uint64, exited, done bool) {
 			fl(fa * fb)
 		case OpFDiv:
 			fl(fa / fb)
+		case OpFMod:
+			fl(math.Mod(fa, fb))
 		case OpFSqrt:
 			fl(math.Sqrt(fa))
 		case OpFAbs:

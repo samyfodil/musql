@@ -45,7 +45,10 @@ func randomKernel(r *rand.Rand, fused bool) *fir.Func {
 			switch k := r.IntN(30); {
 			case k < 4:
 				ops := []func(a, c fir.Val) fir.Val{b.FAdd, b.FSub, b.FMul, b.FDiv}
-				p.f = append(p.f, ops[r.IntN(4)](pick(p.f), pick(p.f)))
+				if firFMod {
+					ops = append(ops, b.FMod)
+				}
+				p.f = append(p.f, ops[r.IntN(len(ops))](pick(p.f), pick(p.f)))
 			case k < 6:
 				ops := []func(a fir.Val) fir.Val{b.FSqrt, b.RoundEven, b.Floor, b.Ceil, b.Trunc}
 				p.f = append(p.f, ops[r.IntN(len(ops))](pick(p.f)))

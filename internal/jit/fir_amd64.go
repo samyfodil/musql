@@ -93,7 +93,8 @@ type firAmd64 struct {
 	s0   XReg
 	s1   XReg
 	s2   XReg
-	n    int // labels made
+	n    int  // labels made
+	fmod bool // the kernel has an OpFMod
 }
 
 // emitFirAmd64 emits f inline: arguments read from env.args, the answer
@@ -134,6 +135,12 @@ func (e *firAmd64) check(steps []fir.Step) error {
 			if !e.feat.round {
 				return fmt.Errorf("jit: kernel %s needs SSE4.1", e.f.Name)
 			}
+		case fir.OpFMod:
+			// FNSTSW writes AX, which must be scratch.
+			if e.t0 != RAX || e.env.spillN < 3 {
+				return fmt.Errorf("jit: kernel %s: fmod needs RAX and two spill slots", e.f.Name)
+			}
+			e.fmod = true
 		case fir.OpIf:
 			if err := e.check(st.Then); err != nil {
 				return err
@@ -151,9 +158,14 @@ func (e *firAmd64) label(s string) string {
 	return e.env.prefix + s + itoa(e.n)
 }
 
-// allocate gives every value a home (firAllocate).
+// allocate gives every value a home (firAllocate), keeping the last two
+// spill slots for fmod's x87 transfers when the kernel has one.
 func (e *firAmd64) allocate() error {
-	home, err := firAllocate(e.f, len(e.gpr), len(e.xmm), e.env.spillN)
+	n := e.env.spillN
+	if e.fmod {
+		n -= 2
+	}
+	home, err := firAllocate(e.f, len(e.gpr), len(e.xmm), n)
 	e.home = home
 	return err
 }
@@ -345,6 +357,26 @@ func (e *firAmd64) step(st *fir.Step, end string) error {
 			a.Mulsd(r, rb)
 			a.Addsd(r, rc)
 		}
+		e.fput(st.Dst, r)
+	case fir.OpFMod:
+		rb := e.fget(st.B, e.s1)
+		ra := e.fget(st.A, e.s0)
+		base := e.env.spillBase
+		x, y := e.slotDisp(e.env.spillN-2), e.slotDisp(e.env.spillN-1)
+		a.MovsdStore(base, y, rb)
+		a.MovsdStore(base, x, ra)
+		a.FldM64(base, y)
+		a.FldM64(base, x)
+		loop := e.label("prem")
+		a.Label(loop)
+		a.Fprem()
+		a.FnstswAX()
+		a.TestAHImm8(4) // C2: the remainder is partial
+		a.Jcc(CondNE, loop)
+		a.FstpM64(base, x)
+		a.FstpST0()
+		r := e.fdst(st.Dst)
+		a.MovsdLoad(r, base, x)
 		e.fput(st.Dst, r)
 	case fir.OpFSqrt, fir.OpRoundEven, fir.OpFloor, fir.OpCeil, fir.OpTrunc:
 		ra := e.fget(st.A, e.s0)

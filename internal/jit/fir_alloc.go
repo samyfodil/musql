@@ -196,3 +196,13 @@ func firEnds(steps []fir.Step) bool {
 	}
 	return false
 }
+
+// firHasOp reports whether op occurs in steps.
+func firHasOp(steps []fir.Step, op fir.Op) bool {
+	for _, st := range steps {
+		if st.Op == op || firHasOp(st.Then, op) || firHasOp(st.Else, op) {
+			return true
+		}
+	}
+	return false
+}
