@@ -3,6 +3,7 @@ package engine
 import (
 	"math"
 	"slices"
+	"strings"
 
 	"github.com/samyfodil/musql/internal/jit"
 )
@@ -25,7 +26,14 @@ const seriesCols = 4
 // table, which only generate_series does (vtab_stream.go).
 func segSeriesOpen(in Instruction) bool {
 	ds, ok := in.P4.(*derivedSource)
-	return in.Op == OpOpenDerived && ok && ds.vtabStream && ds.vtab != nil && ds.prog == nil
+	return in.Op == OpOpenDerived && ok && ds.vtabStream && isSeriesSource(ds) && ds.prog == nil
+}
+
+// isSeriesSource reports whether ds is generate_series: the one table-valued
+// function a series program reads (seriesOf); any other would only add a
+// guard that never serves.
+func isSeriesSource(ds *derivedSource) bool {
+	return ds.vtab != nil && strings.EqualFold(ds.vtab.Table, "generate_series")
 }
 
 // segSeriesInner reports whether in opens a table-valued function a loop
@@ -33,7 +41,7 @@ func segSeriesOpen(in Instruction) bool {
 // depend on the outer row, so it is the same series at every rewind.
 func segSeriesInner(in Instruction) bool {
 	ds, ok := in.P4.(*derivedSource)
-	return in.Op == OpOpenDerived && ok && ds.vtab != nil && ds.prog == nil && len(ds.vtabCorr) == 0 && !ds.rightJoin
+	return in.Op == OpOpenDerived && ok && isSeriesSource(ds) && ds.prog == nil && len(ds.vtabCorr) == 0 && !ds.rightJoin
 }
 
 // segSeriesPairPeephole is segProgPeephole for a loop over one series inside

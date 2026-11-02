@@ -119,3 +119,38 @@ func TestRoundKernelIsFnRound(t *testing.T) {
 		t.Error("round(NULL) is not NULL")
 	}
 }
+
+// TestSeriesProgramInUpdateSet: an UPDATE whose SET counts the rows of a
+// table-valued function -- generate_series over the row being updated,
+// json_each in a trigger body, pragma_table_info -- updates as the loop
+// would. Only generate_series is compiled: a guard over any other function
+// never served, and read as a read of the target, so the UPDATE declined.
+func TestSeriesProgramInUpdateSet(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "u.musq")
+	buildDB(t, path,
+		`CREATE TABLE t(x, n)`,
+		`INSERT INTO t VALUES(1, 0), (2, 0), (3, 0), (40, 0)`,
+		`UPDATE t SET n = (SELECT count(*) FROM generate_series(1, t.x))`,
+		`UPDATE t SET n = n + (SELECT count(*) FROM pragma_table_info('t')) WHERE x > 2`,
+		`CREATE TABLE a(j)`,
+		`CREATE TRIGGER ta AFTER INSERT ON a BEGIN UPDATE t SET n = n + (SELECT count(*) FROM json_each(NEW.j)) WHERE x = 1; END`,
+		`INSERT INTO a VALUES('[5,6,7]')`)
+	rp, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rp.Close()
+	_, rows, err := rp.QueryArgs(`SELECT x, n FROM t ORDER BY x`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][2]int64{{1, 4}, {2, 2}, {3, 5}, {40, 42}}
+	if len(rows) != len(want) {
+		t.Fatalf("%d rows, want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		if rows[i][0].I != w[0] || rows[i][1].I != w[1] {
+			t.Errorf("row %d: x %d n %d, want %d and %d", i, rows[i][0].I, rows[i][1].I, w[0], w[1])
+		}
+	}
+}
