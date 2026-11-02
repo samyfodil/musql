@@ -479,6 +479,20 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 				return nil, err
 			}
 			a.XorRegReg(R11, R11) // POpAccSum's SETO needs its upper bytes zero
+			if in.Imm == ProgMathSelects {
+				// An input the kernel cannot judge selects the row.
+				at := progEmitAt(insns)
+				if at < 0 {
+					return nil, fmt.Errorf("jit: POpMath selects in a program with no POpEmitRow")
+				}
+				after := "ma" + itoa(idx)
+				a.Jmp(after)
+				a.Label(env.exit)
+				a.XorRegReg(R11, R11)
+				a.Jmp(progLabel(at))
+				a.Label(after)
+				break
+			}
 			a.Jmp(svcLabel(svc))
 			a.Label(env.exit)
 			a.MovRegImm64(RAX, in.Imm+1)

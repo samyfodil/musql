@@ -143,10 +143,12 @@ func (m *vdbe) segKindsOf(p *ReadOnlyPager, tbl *resolvedTable, src *segProgSour
 // stored cell is not its value: a row written before the column was added has
 // none, and a rewrite keeps none. Only the VDBE computes it.
 func lowReadsVirtual(cols []columnInfo, low *segLowered) bool {
-	if low == nil {
-		return false
-	}
-	for _, c := range low.cols {
+	return low != nil && readsVirtual(cols, low.cols)
+}
+
+// readsVirtual reports whether any of read is a VIRTUAL generated column.
+func readsVirtual(cols []columnInfo, read []int) bool {
+	for _, c := range read {
 		if c >= 0 && c < len(cols) && cols[c].IsGenerated() && !cols[c].GeneratedStored {
 			return true
 		}

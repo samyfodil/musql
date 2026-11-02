@@ -39,6 +39,9 @@ type segSvcBlock struct {
 	// real marks the kernel registers holding REALs, which a block loads
 	// and writes back as REALs (NULL as a NaN).
 	real map[int]bool
+	// math marks the block of a POpMath: the call its kernel leaves an input
+	// to.
+	math bool
 }
 
 // segInsnRegs is the registers in reads and writes, and whether it may end in

@@ -269,7 +269,9 @@ const (
 	// POpMath: r[A] = Kernel(r[B]) or Kernel(r[B], r[C]), the kernel's code
 	// inline. An Exit in the kernel stops the program for service Imm, as
 	// POpService does: the caller computes the function and resumes the
-	// program after this instruction.
+	// program after this instruction. With Imm == ProgMathSelects it goes
+	// to the program's POpEmitRow instead: a selection may hold rows it
+	// could not judge.
 	POpMath
 	// POpFAccSum: unless r[A] is NULL, add it to the sum in FAcc by SQLite's
 	// Kahan-Babuska-Neumaier step (func.c's kahanBabuskaNeumaierStep: FAcc[0]
@@ -286,6 +288,10 @@ const (
 // ProgNullDeclines is POpFCmp's Imm for a comparison whose NULL the program
 // cannot represent: one NULL operand declines the statement.
 const ProgNullDeclines = 2
+
+// ProgMathSelects is POpMath's Imm in a selection (POpEmitRow) program: the
+// kernel's Exit selects the row.
+const ProgMathSelects = -1
 
 // ProgNextRow is the jump target meaning "abandon this row and start the next".
 // The VDBE's equivalent is a jump to the loop's OpNext.
@@ -433,9 +439,22 @@ func progService(in ProgInsn) (int, bool) {
 	case POpService:
 		return in.A, true
 	case POpMath:
+		if in.Imm == ProgMathSelects {
+			return 0, false
+		}
 		return int(in.Imm), true
 	}
 	return 0, false
+}
+
+// progEmitAt is the index of the program's POpEmitRow, or -1.
+func progEmitAt(insns []ProgInsn) int {
+	for i, in := range insns {
+		if in.Op == POpEmitRow {
+			return i
+		}
+	}
+	return -1
 }
 
 // progHasFloat reports whether a program keeps a REAL accumulator in FAcc.

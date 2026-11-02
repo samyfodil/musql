@@ -182,6 +182,8 @@ func segRealNative(in Instruction, cursor int, real, lits map[int]bool, params m
 		return true
 	case OpAdd, OpSubtract, OpMultiply, OpDivide:
 		return real[in.P1] || real[in.P2]
+	case OpNegative:
+		return real[in.P1]
 	case OpIsNull, OpNotNull:
 		return true
 	case OpGt, OpGe, OpLt, OpLe, OpEq, OpNe:
@@ -253,6 +255,15 @@ func (l *segLowered) lowerReal(body []Instruction, i, base int, nextReg *int, sc
 		note(in.P3)
 		l.add(jit.ProgInsn{Op: op, A: in.P3, B: b, C: c})
 		return true, true
+	case OpNegative:
+		// The sign flipped, -0.0 for 0.0 included: x * -1.0, exactly.
+		t := *nextReg
+		*nextReg++
+		note(t)
+		l.add(jit.ProgInsn{Op: jit.POpSetConst, A: t, B: int(math.Float64bits(-1))})
+		note(in.P2)
+		l.add(jit.ProgInsn{Op: jit.POpFMul, A: in.P2, B: in.P1, C: t})
+		return true, true
 	case OpGt, OpGe, OpLt, OpLe, OpEq, OpNe:
 		store, okCmp := segRealCompareLowerable(in, real, lits, params)
 		cond, okCond := jitCondOfOpcode(in.Op)
@@ -318,7 +329,7 @@ func (l *segLowered) lowerReal(body []Instruction, i, base int, nextReg *int, sc
 				load[a] = in.P1 + a
 			}
 			bi := len(l.blocks)
-			l.blocks = append(l.blocks, segSvcBlock{insns: []Instruction{in}, load: load, writeBack: []int{in.P3}, flag: -1})
+			l.blocks = append(l.blocks, segSvcBlock{insns: []Instruction{in}, load: load, writeBack: []int{in.P3}, flag: -1, math: true})
 			l.blockIR = append(l.blockIR, len(l.insns))
 			l.add(jit.ProgInsn{Op: jit.POpMath, A: in.P3, B: b, C: c, Kernel: k, Imm: int64(bi)})
 		}

@@ -457,6 +457,19 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			if err := emitFirArm64(a, in.Kernel, env, cpuFeat); err != nil {
 				return nil, err
 			}
+			if in.Imm == ProgMathSelects {
+				// An input the kernel cannot judge selects the row.
+				at := progEmitAt(insns)
+				if at < 0 {
+					return nil, fmt.Errorf("jit: POpMath selects in a program with no POpEmitRow")
+				}
+				after := "ma" + itoa(idx)
+				a.B(after)
+				a.Label(env.exit)
+				a.B(progLabel(at))
+				a.Label(after)
+				break
+			}
 			a.B(svcLabel(svc))
 			a.Label(env.exit)
 			a.MovImm64(X9, in.Imm+1)

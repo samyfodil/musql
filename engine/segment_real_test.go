@@ -104,3 +104,62 @@ func realRows(rows [][]Value) string {
 	}
 	return s
 }
+
+// TestRealRowFilter: a WHERE over REAL columns selects a segment's rows in
+// the compiled pre-filter -- comparisons, arithmetic and math kernels, a row
+// a kernel cannot judge selected for the loop to decide -- and the rows are
+// the loop's.
+func TestRealRowFilter(t *testing.T) {
+	p := newSegPair(t,
+		`CREATE TABLE t(id INTEGER PRIMARY KEY, x REAL, y REAL, i INTEGER, n REAL)`,
+		`WITH RECURSIVE c(k) AS (SELECT 1 UNION ALL SELECT k+1 FROM c WHERE k < 140000)
+		 INSERT INTO t SELECT k, (k % 1000 - 500) * 0.37 + k * 1e-7, sin(k) * 50, k % 777 - 300,
+		 CASE WHEN k % 5 = 0 THEN NULL ELSE k * 0.5 END FROM c`)
+	real := func(f float64) Value { return Value{Typ: Float, F: f} }
+	integer := func(i int64) Value { return Value{Typ: Int, I: i} }
+	cases := []struct {
+		sql      string
+		args     []Value
+		filtered bool
+	}{
+		{`SELECT id, x FROM t WHERE x > 180.5`, nil, true},
+		{`SELECT id FROM t WHERE x < y AND i > 250`, nil, true},
+		{`SELECT id, y FROM t WHERE sqrt(x) > 13.4`, nil, true},
+		{`SELECT id FROM t WHERE ln(x) < 0.5`, nil, true},
+		{`SELECT id FROM t WHERE pow(x, 2) > 34000 AND y > 0`, nil, true},
+		{`SELECT id FROM t WHERE abs(x) < 0.2`, nil, true},
+		{`SELECT id FROM t WHERE x BETWEEN -0.5 AND 0.5`, nil, true},
+		{`SELECT id FROM t WHERE exp(x/100) > 6`, nil, true},
+		{`SELECT id FROM t WHERE x * 2 + 1 > 360`, nil, true},
+		{`SELECT id FROM t WHERE x > ?`, []Value{real(184.25)}, true},
+		{`SELECT id FROM t WHERE x > ? AND y < ?`, []Value{integer(180), real(-40)}, true},
+		{`SELECT id FROM t WHERE x > ?`, []Value{integer(1<<53 + 1)}, false},
+		{`SELECT id FROM t WHERE n > 69990`, nil, false},
+	}
+	check := func() {
+		t.Helper()
+		for _, c := range cases {
+			_, want, werr := p.plain(c.sql, c.args...)
+			SegRowsSelectedForTest()
+			_, got, gerr := p.fast(c.sql, c.args...)
+			selected := SegRowsSelectedForTest()
+			if (werr == nil) != (gerr == nil) {
+				t.Errorf("%s: fast error %v, loop error %v", c.sql, gerr, werr)
+				continue
+			}
+			if g, w := realRows(got), realRows(want); g != w {
+				t.Errorf("%s %v: %d rows, the loop's %d", c.sql, c.args, len(got), len(want))
+			}
+			if JITEnabled() && c.filtered && (selected == 0 || selected >= 140000) {
+				t.Errorf("%s %v: %d rows selected of 140000", c.sql, c.args, selected)
+			}
+		}
+	}
+	check()
+	// A delta beside the segments: the rows are still the loop's.
+	p.delta(`INSERT INTO t VALUES (200001, 190.5, -45.5, 300, 1.5)`, `DELETE FROM t WHERE id = 1000`)
+	for i := range cases {
+		cases[i].filtered = false
+	}
+	check()
+}
