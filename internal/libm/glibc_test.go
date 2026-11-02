@@ -22,12 +22,30 @@ var refFuncs = map[string]func(x, y float64) float64{
 	"asinh": func(x, _ float64) float64 { return Asinh(x) },
 	"acosh": func(x, _ float64) float64 { return Acosh(x) },
 	"atanh": func(x, _ float64) float64 { return Atanh(x) },
+	"sin":   func(x, _ float64) float64 { return Sin(x) },
+	"cos":   func(x, _ float64) float64 { return Cos(x) },
+	"tan":   func(x, _ float64) float64 { return Tan(x) },
+	"asin":  func(x, _ float64) float64 { return Asin(x) },
+	"acos":  func(x, _ float64) float64 { return Acos(x) },
+	"atan":  func(x, _ float64) float64 { return Atan(x) },
+	"atan2": Atan2,
+	// What C SQLite calls that needs no port: Go's are exact too, and
+	// radians/degrees multiply by M_PI/180.0 and 180.0/M_PI, which are the
+	// doubles nearest pi/180 and 180/pi.
+	"fmod":    math.Mod,
+	"sqrt":    func(x, _ float64) float64 { return math.Sqrt(x) },
+	"radians": func(x, _ float64) float64 { return x * (math.Pi / 180) },
+	"degrees": func(x, _ float64) float64 { return x * (180 / math.Pi) },
 }
 
+// ibmFuncs are the functions glibc takes from IBM's library, which is not
+// correctly rounded: these may differ from it by an ulp.
+var ibmFuncs = map[string]bool{"sin": true, "cos": true, "tan": true, "asin": true, "acos": true, "atan": true, "atan2": true}
+
 // TestAgainstGlibc compares each function with what glibc answered for the
-// same inputs, as testdata/mathref.c and mathwc.c record them: MUSQL_LIBM_REF names a
-// directory with a nofma and an fma directory of <function>.bin files, written
-// by mathref on a machine without FMA and on one with it.
+// same inputs, as testdata/mathref.c and mathwc.c record them: MUSQL_LIBM_REF
+// names a directory with a nofma and an fma directory of <function>.bin
+// files, written on a machine without FMA and on one with it.
 func TestAgainstGlibc(t *testing.T) {
 	dir := os.Getenv("MUSQL_LIBM_REF")
 	if dir == "" {
@@ -47,7 +65,7 @@ func TestAgainstGlibc(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				bad := 0
+				bad, ulp, refereed := 0, 0, 0
 				for off := 0; off+24 <= len(b); off += 24 {
 					x := math.Float64frombits(binary.LittleEndian.Uint64(b[off:]))
 					y := math.Float64frombits(binary.LittleEndian.Uint64(b[off+8:]))
@@ -56,11 +74,34 @@ func TestAgainstGlibc(t *testing.T) {
 					if math.Float64bits(got) == math.Float64bits(want) || got != got && want != want {
 						continue
 					}
+					if ibmFuncs[name] {
+						// Where glibc is IBM's, the answer is the correctly
+						// rounded one, which bigRef referees: every
+						// disagreement over an ulp, and one in 64 of the rest.
+						near := math.Nextafter(want, math.Inf(1)) == got || math.Nextafter(want, math.Inf(-1)) == got
+						if near {
+							ulp++
+						}
+						ref, ok := bigRef(name, x, y)
+						if !ok && near || ok && near && ulp%64 != 1 {
+							continue
+						}
+						if ok && math.Float64bits(got) == math.Float64bits(ref) {
+							refereed++
+							continue
+						}
+						if ok {
+							if bad++; bad <= 5 {
+								t.Errorf("%s %s(%x, %x) = %x, correctly rounded %x, glibc %x", variant, name, x, y, got, ref, want)
+							}
+							continue
+						}
+					}
 					if bad++; bad <= 5 {
 						t.Errorf("%s %s(%x, %x) = %x, glibc %x", variant, name, x, y, got, want)
 					}
 				}
-				t.Logf("%s %s: %d records", variant, file, len(b)/24)
+				t.Logf("%s %s: %d records, %d an ulp from glibc, %d refereed", variant, file, len(b)/24, ulp, refereed)
 				if bad > 0 {
 					t.Errorf("%s %s: %d of %d differ", variant, file, bad, len(b)/24)
 				}
