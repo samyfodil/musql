@@ -203,6 +203,9 @@ func funcArity(name string) (min, max int, ok bool) {
 	if lo, hi, ok := extFuncArity(name); ok {
 		return lo, hi, true
 	}
+	if lo, hi, ok := mathFuncArity(name); ok {
+		return lo, hi, true
+	}
 	return jsonFuncArity(name)
 }
 
@@ -589,6 +592,9 @@ func callScalarFuncEnc(name string, args []Value, caseSensitiveLike bool, enc Te
 		return fts5LocaleFunc(args)
 
 	default:
+		if v, ok, err := callMathFunc(name, args, enc); ok {
+			return v, err
+		}
 		if _, ok := jsonFuncFlags[name]; ok {
 			return callJSONFunc(name, args, enc)
 		}
