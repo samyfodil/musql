@@ -38,7 +38,7 @@ import (
 // fusion pass works on: a comparison or NOT stored into a register and the
 // test of it, or a step reading what the one before wrote.
 func VFusable(prev, next VInsn) bool {
-	if next.Op == VIf && (prev.Op == VCmpSet || prev.Op == VNot) && next.A == prev.C {
+	if next.Op == VIf && (prev.Op == VCmpSet || prev.Op == VFCmpSet || prev.Op == VNot) && next.A == prev.C {
 		return true
 	}
 	ps, ns := vmStepOf(prev, 0), vmStepOf(next, 1)
@@ -63,12 +63,19 @@ func vmStepOf(in VInsn, pc int) progStep {
 		s.defs = []int{in.A}
 	case VCopy:
 		s.uses, s.defs = []int{in.A}, []int{in.B}
-	case VAdd, VSub, VMul, VAnd, VOr, VShl, VShr, VDiv, VRem, VCmpSet:
+	case VAdd, VSub, VMul, VAnd, VOr, VShl, VShr, VDiv, VRem, VCmpSet, VFAdd, VFSub, VFMul, VFDiv, VFCmpSet:
 		s.uses, s.defs = []int{in.A, in.B}, []int{in.C}
-	case VCmpJump:
+	case VCmpJump, VFCmpJump:
 		s.uses, s.targets = []int{in.A, in.B}, []int{in.T}
-	case VCmpBr:
+	case VCmpBr, VFCmpBr:
 		s.uses, s.defs, s.targets = []int{in.A, in.B}, []int{in.C}, []int{in.T}
+	case VReal:
+		s.defs = []int{in.A}
+	case VMath:
+		s.uses, s.defs = []int{in.A}, []int{in.C}
+		if in.B == 2 {
+			s.uses = append(s.uses, in.A+1)
+		}
 	case VNotBr:
 		s.uses, s.defs, s.targets = []int{in.A}, []int{in.C}, []int{in.T}
 	case VNullJump, VIf:
@@ -217,6 +224,8 @@ func FuseVM(prog []VInsn, nReg int, hard, entry []bool) []VInsn {
 		switch in.Op {
 		case VCmpSet:
 			op = VCmpBr
+		case VFCmpSet:
+			op = VFCmpBr
 		case VNot:
 			op = VNotBr
 		default:
@@ -241,8 +250,11 @@ func FuseVM(prog []VInsn, nReg int, hard, entry []bool) []VInsn {
 			d = in.A
 		case VCopy:
 			d = in.B
-		case VAdd, VSub, VMul, VAnd, VOr, VShl, VShr, VDiv, VRem, VCmpSet, VNull, VNeg, VNot:
+		case VAdd, VSub, VMul, VAnd, VOr, VShl, VShr, VDiv, VRem, VCmpSet, VNull, VNeg, VNot,
+			VFAdd, VFSub, VFMul, VFDiv, VFCmpSet, VMath:
 			d = in.C
+		case VReal:
+			d = in.A
 		default:
 			continue
 		}
@@ -293,20 +305,34 @@ func VMFusionStatsForTest() (pairs, dead int64) {
 // Everything is forgotten at a boundary.
 type vmKnow struct {
 	isInt, noS, canon map[int]bool
+	// isFloat: known to hold a REAL (a guard passed, or native code wrote
+	// one).
+	isFloat map[int]bool
 }
 
 func newVMKnow() *vmKnow {
-	return &vmKnow{isInt: map[int]bool{}, noS: map[int]bool{}, canon: map[int]bool{}}
+	return &vmKnow{isInt: map[int]bool{}, noS: map[int]bool{}, canon: map[int]bool{}, isFloat: map[int]bool{}}
 }
 
 func (k *vmKnow) reset() {
 	clear(k.isInt)
 	clear(k.noS)
 	clear(k.canon)
+	clear(k.isFloat)
 }
 
 // wroteInt records that native code made r the integer Value.
-func (k *vmKnow) wroteInt(r int) { k.isInt[r], k.noS[r], k.canon[r] = true, true, true }
+func (k *vmKnow) wroteInt(r int) {
+	k.isInt[r], k.noS[r], k.canon[r] = true, true, true
+	delete(k.isFloat, r)
+}
+
+// wroteFloat records that native code made r a REAL Value.
+func (k *vmKnow) wroteFloat(r int) {
+	k.isFloat[r], k.noS[r] = true, true
+	delete(k.isInt, r)
+	delete(k.canon, r)
+}
 
 // wroteAny records that native code wrote r a value of unknown type (a copy
 // of a column or a register, a NULL); noS is whether it is known to hold no
@@ -314,6 +340,7 @@ func (k *vmKnow) wroteInt(r int) { k.isInt[r], k.noS[r], k.canon[r] = true, true
 func (k *vmKnow) wroteAny(r int, noS bool) {
 	delete(k.isInt, r)
 	delete(k.canon, r)
+	delete(k.isFloat, r)
 	if noS {
 		k.noS[r] = true
 	} else {
@@ -467,6 +494,7 @@ func vmEntryKeep(prog []VInsn, bound []bool, pc int) map[int]bool {
 // known to hold no string.
 func (k *vmKnow) pruneForEntry(keep map[int]bool) (ints, noS []int) {
 	clear(k.canon)
+	clear(k.isFloat) // a REAL op guards its operands again
 	for r := range k.isInt {
 		if keep[r] {
 			ints = append(ints, r)

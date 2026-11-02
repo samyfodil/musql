@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"math"
 	"slices"
 	"sort"
 	"sync"
@@ -65,16 +66,24 @@ func segProgKernel(low *segLowered) *jit.Code {
 // SLOWER than C SQLite while every single-aggregate form measured faster.
 func (m *vdbe) segRunProgramAll(p *ReadOnlyPager, tbl *resolvedTable, plan *segProgPlan) ([]Value, bool) {
 	rootPage, ipkCol := tbl.root, tbl.ipkIndex
-	if plan == nil || len(plan.lows) == 0 {
+	if plan == nil || plan.src == nil {
 		return nil, false
 	}
-	for _, low := range plan.lows {
+	kinds, ok := m.segKindsOf(p, tbl, plan.src)
+	if !ok {
+		return nil, false
+	}
+	lows := plan.forKinds(kinds)
+	if len(lows) == 0 {
+		return nil, false
+	}
+	for _, low := range lows {
 		if low != nil && (lowReadsVirtual(tbl.cols, low) || lowReadsVirtual(tbl.cols, low.textVar)) {
 			return nil, false
 		}
 	}
-	out := make([]Value, len(plan.lows))
-	for i, low := range plan.lows {
+	out := make([]Value, len(lows))
+	for i, low := range lows {
 		v, ok := m.segRunOne(p, tbl, rootPage, low, ipkCol)
 		if !ok {
 			return nil, false
@@ -84,14 +93,65 @@ func (m *vdbe) segRunProgramAll(p *ReadOnlyPager, tbl *resolvedTable, plan *segP
 	return out, true
 }
 
+// segKindsOf is which of the columns src loads hold REALs in every segment of
+// the table now, and which of its parameters are bound to REALs: nil when
+// none do. A column that is REAL in some segments and INTEGER in others
+// declines, since one program reads it one way.
+func (m *vdbe) segKindsOf(p *ReadOnlyPager, tbl *resolvedTable, src *segProgSource) (*segKinds, bool) {
+	var kinds *segKinds
+	if p != nil && p.segs != nil {
+		segs := p.segs.byRoot[tbl.root]
+		for _, c := range src.cols {
+			if c == tbl.ipkIndex && c >= 0 {
+				continue
+			}
+			isReal, isInt := false, false
+			for _, s := range segs {
+				if c >= len(s.cols) {
+					continue
+				}
+				switch s.cols[c].phys {
+				case PhysFloat64:
+					isReal = true
+				case PhysInt64:
+					isInt = true
+				}
+			}
+			if isReal && isInt {
+				return nil, false
+			}
+			if isReal {
+				if kinds == nil {
+					kinds = &segKinds{realCol: map[int]bool{}, realParam: map[int]bool{}}
+				}
+				kinds.realCol[c] = true
+			}
+		}
+	}
+	for _, idx := range src.params {
+		if idx >= 1 && idx <= len(m.params) && m.params[idx-1].Typ == Float {
+			if f := m.params[idx-1].F; f != f {
+				return nil, false // a NaN, which a REAL register holds as NULL
+			}
+			if kinds == nil {
+				kinds = &segKinds{realCol: map[int]bool{}, realParam: map[int]bool{}}
+			}
+			kinds.realParam[idx] = true
+		}
+	}
+	return kinds, true
+}
+
 // lowReadsVirtual reports whether low reads a VIRTUAL generated column. Its
 // stored cell is not its value: a row written before the column was added has
 // none, and a rewrite keeps none. Only the VDBE computes it.
 func lowReadsVirtual(cols []columnInfo, low *segLowered) bool {
-	if low == nil {
-		return false
-	}
-	for _, c := range low.cols {
+	return low != nil && readsVirtual(cols, low.cols)
+}
+
+// readsVirtual reports whether any of read is a VIRTUAL generated column.
+func readsVirtual(cols []columnInfo, read []int) bool {
+	for _, c := range read {
 		if c >= 0 && c < len(cols) && cols[c].IsGenerated() && !cols[c].GeneratedStored {
 			return true
 		}
@@ -115,6 +175,11 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 	// answer.
 	var split *segDeltaSplit
 	if !p.segCleanFor(rootPage) {
+		// A REAL sum is rounded in row order, which the split does not keep:
+		// it runs the delta's rows after every segment's.
+		if low.fAcc {
+			return Value{}, false
+		}
 		if split, ok = p.segs.deltaSplitFor(rootPage, segs, low, ipkCol); !ok {
 			return Value{}, false
 		}
@@ -135,17 +200,30 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 	// would be got wrong.
 	for i, reg := range low.consts {
 		idx := low.cvIndex[i]
-		if idx < 1 || idx > len(m.params) {
+		if idx < 1 || idx > len(m.params) || reg >= len(regs) {
 			return Value{}, false
 		}
 		v := m.params[idx-1]
+		if low.real[reg] {
+			if v.Typ != Float {
+				return Value{}, false
+			}
+			regs[reg] = int64(math.Float64bits(v.F))
+			continue
+		}
 		if v.Typ != Int {
 			return Value{}, false
 		}
-		if reg >= len(regs) {
+		regs[reg] = v.I
+	}
+	// An INTEGER a REAL comparison reads as a double must be one exactly.
+	for _, idx := range low.exactParams {
+		if idx < 1 || idx > len(m.params) {
 			return Value{}, false
 		}
-		regs[reg] = v.I
+		if v := m.params[idx-1]; v.Typ != Int || v.I > 1<<53 || v.I < -(1<<53) {
+			return Value{}, false
+		}
 	}
 	if !low.seedSorted(regs, m.params) {
 		return Value{}, false
@@ -160,12 +238,22 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 		nSlots++ // the delta's own rows, after every segment
 	}
 	results := make([]segResult, nSlots)
+	// A REAL accumulator is carried from each run to the next, in row order.
+	var facc [2]float64
+	switch low.agg {
+	case aggMin:
+		facc[0] = math.Inf(1)
+	case aggMax:
+		facc[0] = math.Inf(-1)
+	}
 	// Service blocks share one window across the statement, in row order, as
 	// the interpreter shares its registers: their segments run one at a time.
 	var svc *segSvcRunner
 	each := segEach
-	if len(low.blocks) > 0 {
-		svc = newSegSvcRunner(m, tbl)
+	if len(low.blocks) > 0 || low.fAcc {
+		if len(low.blocks) > 0 {
+			svc = newSegSvcRunner(m, tbl)
+		}
 		each = func(n int, work func(int) bool) bool {
 			for i := range n {
 				if !work(i) {
@@ -207,6 +295,14 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 		blocks := make([][]int64, len(low.cols))
 		isRowid := make([]bool, len(low.cols))
 		for i, c := range low.cols {
+			if i < len(low.realCol) && low.realCol[i] {
+				f, okF := s.Float64Column(c)
+				if !okF || len(f) < s.nRows {
+					return false
+				}
+				blocks[i] = unsafe.Slice((*int64)(unsafe.Pointer(unsafe.SliceData(f))), len(f))
+				continue
+			}
 			if i < len(low.textCol) && low.textCol[i] {
 				// A text slot holds the column's cells; its heap goes in
 				// ProgArgs.Heap.
@@ -269,6 +365,11 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 				local := slices.Clone(regs)
 				var out, ovf int64
 				args := &jit.ProgArgs{N: int64(end - start), Regs: &local[0], Out: &out, Overflow: &ovf}
+				// Only a program with a REAL accumulator carries one, and its
+				// segments run one at a time.
+				if low.fAcc {
+					args.FAcc = facc
+				}
 				for i, b := range blocks {
 					args.Col[i] = &b[start]
 					if h := heaps[i]; len(h) > 0 {
@@ -277,6 +378,9 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 				}
 				if !segCallKernel(kern, args, svc, low.blocks, s, local) {
 					return false
+				}
+				if low.fAcc {
+					facc = args.FAcc
 				}
 				part := segResult{out: out, ovf: ovf != 0}
 				if low.agg != aggCountStar && low.agg != aggCount {
@@ -332,6 +436,9 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 			total = sum
 			matched += res.rows
 		}
+	}
+	if low.fAcc {
+		return segFloatAnswer(low.agg, matched, facc), true
 	}
 	// func.c's finalizers, for the all-integer non-NULL case this path is the
 	// only one that reaches: sumFinalize (2003) returns the int64 or NULL at

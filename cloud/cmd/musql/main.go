@@ -1,6 +1,8 @@
-// musql is the command line for musql cloud: sign in, manage organizations,
-// groups and databases, and run SQL over Hrana.
+// musql is the command line for musql: run SQL on a local database file, and
+// for musql cloud, sign in, manage organizations, groups and databases, and
+// run SQL over Hrana.
 //
+//	musql open app.musq
 //	musql config set url https://cloud.example.com
 //	musql auth login
 //	musql db create app

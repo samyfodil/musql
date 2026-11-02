@@ -1,7 +1,10 @@
 package engine
 
 import (
+	"math"
 	"sort"
+	"sync"
+	"unsafe"
 
 	"github.com/samyfodil/musql/internal/jit"
 )
@@ -28,6 +31,75 @@ import (
 // segRowFilter is what the recogniser attaches to an OpRewind.
 type segRowFilter struct {
 	low *segLowered
+	// The predicate as the VDBE has it, which a segment with REAL columns
+	// lowers again for them (forKinds), and those lowerings by kinds.
+	body              []Instruction
+	base, cursor, end int
+	cols              []int
+	params            []int
+	variants          sync.Map // segKinds.key() -> *segLowered, nil when it does not lower
+}
+
+// forKinds is the filter lowered for kinds, on first use.
+func (f *segRowFilter) forKinds(kinds *segKinds) *segLowered {
+	if kinds == nil {
+		return f.low
+	}
+	key := kinds.key()
+	if v, ok := f.variants.Load(key); ok {
+		return v.(*segLowered)
+	}
+	low, ok := segLowerBody(f.body, f.base, f.cursor, f.end, kinds)
+	if ok {
+		low = segSelecting(low)
+	} else {
+		low = nil
+	}
+	v, _ := f.variants.LoadOrStore(key, low)
+	return v.(*segLowered)
+}
+
+// segSelecting makes low a selection: its POpMath kernels, instead of
+// stopping for their calls, select a row they cannot judge, and the
+// selection's POpEmitRow is appended.
+func segSelecting(low *segLowered) *segLowered {
+	blocks := low.blocks[:0:0]
+	for _, b := range low.blocks {
+		if !b.math {
+			blocks = append(blocks, b)
+		}
+	}
+	low.blocks = blocks
+	for i := range low.insns {
+		if low.insns[i].Op == jit.POpMath {
+			low.insns[i].Imm = jit.ProgMathSelects
+		}
+	}
+	low.add(jit.ProgInsn{Op: jit.POpEmitRow})
+	return low
+}
+
+// kindsFor is which of the columns the filter reads are REAL blocks in s,
+// and which of its parameters are bound to REALs: nil when none.
+func (f *segRowFilter) kindsFor(s *segment, ipkCol int, params []Value) *segKinds {
+	var kinds *segKinds
+	mark := func(m func(*segKinds) map[int]bool, k int) {
+		if kinds == nil {
+			kinds = &segKinds{realCol: map[int]bool{}, realParam: map[int]bool{}}
+		}
+		m(kinds)[k] = true
+	}
+	for _, c := range f.cols {
+		if c != ipkCol && c >= 0 && c < len(s.cols) && s.cols[c].phys == PhysFloat64 {
+			mark(func(k *segKinds) map[int]bool { return k.realCol }, c)
+		}
+	}
+	for _, p := range f.params {
+		if p >= 1 && p <= len(params) && params[p-1].Typ == Float {
+			mark(func(k *segKinds) map[int]bool { return k.realParam }, p)
+		}
+	}
+	return kinds
 }
 
 // segRowFilterPeephole finds a row-returning scan loop whose WHERE lowers, and
@@ -100,24 +172,74 @@ func segAttachRowFilter(in []Instruction, at, cursor int) bool {
 	// boundary in turn. Projection follows the last one and does not
 	// lower, which is what ends the search; the cost is a few compile-time
 	// attempts on a program that is compiled once.
-	var low *segLowered
+	//
+	// A body is judged lowerable when it lowers for INTEGER columns or for
+	// the table's REAL-affinity columns held as REALs; each segment then
+	// gets the lowering for the kinds it actually holds (forKinds).
+	guess := segRealAffinityKinds(in, at, cursor)
 	predEnd := -1
 	for j := at + 1; j < nextAt; j++ {
 		if (in[j].Op != OpIfNot && in[j].Op != OpIf) || in[j].P2 != nextAt {
 			continue
 		}
-		cand, ok := segLowerBody(in[at+1:j+1], at+1, cursor, j+1)
-		if !ok || len(cand.cols) == 0 {
+		if !segBodyLowers(in[at+1:j+1], at+1, cursor, j+1, guess) {
 			break
 		}
-		low, predEnd = cand, j+1
+		predEnd = j + 1
 	}
-	if low == nil || predEnd < 0 {
+	if predEnd < 0 {
 		return false // no WHERE this models: every row is a candidate anyway
 	}
-	low.add(jit.ProgInsn{Op: jit.POpEmitRow})
-	in[at].P4 = &segRowFilter{low: low}
+	f := &segRowFilter{body: in[at+1 : predEnd], base: at + 1, cursor: cursor, end: predEnd}
+	if low, ok := segLowerBody(f.body, f.base, cursor, predEnd, nil); ok && len(low.cols) > 0 {
+		f.low = segSelecting(low)
+	}
+	seen := map[int]bool{}
+	for _, ins := range f.body {
+		switch {
+		case ins.Op == OpColumn && ins.P1 == cursor && !seen[ins.P2]:
+			seen[ins.P2] = true
+			f.cols = append(f.cols, ins.P2)
+		case ins.Op == OpVariable:
+			f.params = append(f.params, ins.P1)
+		}
+	}
+	in[at].P4 = f
 	return true
+}
+
+// segBodyLowers reports whether body lowers to a program that reads a
+// column, for INTEGER columns or for guess.
+func segBodyLowers(body []Instruction, base, cursor, end int, guess *segKinds) bool {
+	low, ok := segLowerBody(body, base, cursor, end, nil)
+	if (!ok || len(low.cols) == 0) && guess != nil {
+		low, ok = segLowerBody(body, base, cursor, end, guess)
+	}
+	return ok && len(low.cols) > 0
+}
+
+// segRealAffinityKinds is the kinds of the cursor's table with its
+// REAL-affinity columns held as REALs, or nil when it has none.
+func segRealAffinityKinds(in []Instruction, at, cursor int) *segKinds {
+	var t *resolvedTable
+	for i := 0; i < at; i++ {
+		if (in[i].Op == OpOpenRead || in[i].Op == OpOpenWrite) && in[i].P1 == cursor {
+			t, _ = in[i].P4.(*resolvedTable)
+		}
+	}
+	if t == nil {
+		return nil
+	}
+	var kinds *segKinds
+	for c, col := range t.cols {
+		if col.Aff == affReal {
+			if kinds == nil {
+				kinds = &segKinds{realCol: map[int]bool{}, realParam: map[int]bool{}}
+			}
+			kinds.realCol[c] = true
+		}
+	}
+	return kinds
 }
 
 // segWriteFilterPeephole is segRowFilterPeephole for a write program's scan --
@@ -189,7 +311,7 @@ var segWriteFilterSafeOps = map[OpCode]bool{
 // So a column with NULLs costs the scan its NULL rows, not its fast path. That
 // matters because "the column has no NULLs anywhere" is a property synthetic
 // data has and real tables mostly do not.
-func segFilterColumns(s *segment, want []int, asNull []bool, ipkCol int) (blocks [][]int64, isRowid []bool, uncertain []int, ok bool) {
+func segFilterColumns(s *segment, want []int, asNull, real []bool, ipkCol int) (blocks [][]int64, isRowid []bool, uncertain []int, ok bool) {
 	blocks = make([][]int64, len(want))
 	isRowid = make([]bool, len(want))
 	seen := make(map[int]bool)
@@ -213,10 +335,14 @@ func segFilterColumns(s *segment, want []int, asNull []bool, ipkCol int) (blocks
 			isRowid[i] = true // the rowid block has neither NULLs nor exceptions
 			continue
 		}
-		if c < 0 || c >= len(s.cols) || s.cols[c].phys != PhysInt64 {
+		phys := PhysInt64
+		if i < len(real) && real[i] {
+			phys = PhysFloat64
+		}
+		if c < 0 || c >= len(s.cols) || s.cols[c].phys != phys {
 			return nil, nil, nil, false
 		}
-		col, okCol := s.Int64Column(c)
+		col, okCol := s.rawWordColumn(c)
 		if !okCol {
 			return nil, nil, nil, false // unaligned, or not little-endian
 		}
@@ -302,10 +428,13 @@ type segSelection struct {
 }
 
 func segSelectPrep(s *segment, f *segRowFilter, ipkCol int, params []Value) (*segSelection, bool) {
-	if s == nil || f == nil || f.low == nil || s.nRows == 0 {
+	if s == nil || f == nil || s.nRows == 0 {
 		return nil, false
 	}
-	low := f.low
+	low := f.forKinds(f.kindsFor(s, ipkCol, params))
+	if low == nil {
+		return nil, false
+	}
 	if len(low.blocks) > 0 {
 		// A selection kernel with services needs the driver loop and a
 		// machine to run them on, which this hint path does not have yet.
@@ -315,7 +444,7 @@ func segSelectPrep(s *segment, f *segRowFilter, ipkCol int, params []Value) (*se
 	if kern == nil {
 		return nil, false
 	}
-	blocks, isRowid, uncertain, ok := segFilterColumns(s, low.cols, low.nullCol, ipkCol)
+	blocks, isRowid, uncertain, ok := segFilterColumns(s, low.cols, low.nullCol, low.realCol, ipkCol)
 	if !ok {
 		return nil, false
 	}
@@ -339,13 +468,24 @@ func segSelectPrep(s *segment, f *segRowFilter, ipkCol int, params []Value) (*se
 		if idx < 1 || idx > len(params) || reg >= len(regs) {
 			return nil, false
 		}
-		// A non-integer bound declines the whole selection: every value in a
-		// compiled program is an int64, and coercing here is exactly where
-		// SQLite's cross-class ordering would be got wrong. Declining costs a
-		// full scan, which is the answer this started from.
-		if v := params[idx-1]; v.Typ == Int {
+		// A bound of any other class than the lowering's declines the whole
+		// selection: coercing here is exactly where SQLite's cross-class
+		// ordering would be got wrong. Declining costs a full scan, which is
+		// the answer this started from.
+		switch v := params[idx-1]; {
+		case low.real[reg] && v.Typ == Float && v.F == v.F:
+			regs[reg] = int64(math.Float64bits(v.F))
+		case !low.real[reg] && v.Typ == Int:
 			regs[reg] = v.I
-		} else {
+		default:
+			return nil, false
+		}
+	}
+	for _, idx := range low.exactParams {
+		if idx < 1 || idx > len(params) {
+			return nil, false
+		}
+		if v := params[idx-1]; v.Typ != Int || v.I > 1<<53 || v.I < -(1<<53) {
 			return nil, false
 		}
 	}
@@ -437,4 +577,21 @@ func segMergeUncertain(sel []int64, uncertain []int) []int64 {
 		out = append(out, int64(uncertain[j]))
 	}
 	return out
+}
+
+// rawWordColumn is column c's fixed-width block as words, NULLs and exceptions
+// included: an INTEGER block's values, a REAL block's bits. What a row's word
+// means where it is NULL or an exception is the caller's business.
+func (s *segment) rawWordColumn(c int) ([]int64, bool) {
+	if c < 0 || c >= len(s.cols) || !segLittleEndian {
+		return nil, false
+	}
+	if p := s.cols[c].phys; p != PhysInt64 && p != PhysFloat64 {
+		return nil, false
+	}
+	off := int(s.cols[c].blockOff)
+	if off == 0 || uintptr(unsafe.Pointer(&s.buf[off]))%8 != 0 {
+		return nil, false
+	}
+	return unsafe.Slice((*int64)(unsafe.Pointer(&s.buf[off])), s.nRows), true
 }

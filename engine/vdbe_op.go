@@ -107,7 +107,7 @@ const (
 
 	// Logical.
 	OpNot      // P1, P2: r[P2] = NOT r[P1] (NULL-preserving three-valued negation).
-	OpNegative // P1, P2: r[P2] = -r[P1] (SQLite unary minus, negateValueUnary -- preserves IEEE negative zero, unlike a "0 - x" subtraction).
+	OpNegative // P1, P2: r[P2] = -r[P1] (unary minus of a numeric literal, negateValueUnary: -0.0 is -0.0, where C's "0 - x" for any other operand gives +0.0).
 
 	// Affinity / cast. OpAffinity and OpRealAffinity MUTATE their target
 	// register(s) in place (a permanent change), exactly like SQLite's
@@ -989,6 +989,10 @@ type derivedSource struct {
 	pager *ReadOnlyPager
 
 	vtab *FromItem
+	// vtabStream lets vtab be read through its module's live cursor
+	// (vtab_stream.go): its loop is rewound once a run, or once an open for a
+	// correlated source, and nothing reorders, seeks or sweeps its rows.
+	vtabStream bool
 	// vtabTrig is the trigger context vtab was resolved under (c.trig at the
 	// emitting compile), nil outside a trigger body. A table-valued function's
 	// arguments are compiled at run time (buildVtabConstraints /
@@ -1033,6 +1037,12 @@ type derivedSource struct {
 	// materializes it the first time only. See emitJoinLoops for where it is
 	// set.
 	stmtOnce bool
+	// cteOnce is stmtOnce for an uncorrelated recursive CTE, taken only under
+	// a read statement: C materializes one under OP_Once too, but a trigger
+	// body runs in a frame of its own whose once flags start clear
+	// (sqlite3VdbeExec's OP_Program), and every trigger here shares its
+	// write statement's root.
+	cteOnce bool
 
 	// stream says whether prog may run as a CO-ROUTINE feeding this cursor one
 	// row at a time instead of being materialized first (streamsDerived,
