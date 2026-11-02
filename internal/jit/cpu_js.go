@@ -19,3 +19,7 @@ const VMMinWork = 24
 
 // VMReal reports whether the VM JIT has its REAL arms (VReal to VMath).
 const VMReal = false
+
+// SetCPUForTest narrows the features the float kernels see: none, as there
+// are no REAL arms here.
+func SetCPUForTest(fma, round bool) (restore func()) { return func() {} }
