@@ -1161,6 +1161,9 @@ func vectorArity(name string) (lo, hi int, ok bool) {
 // callVectorFunc evaluates a vector function; ok is false for any other name.
 // funcArity has checked the argument count at prepare time.
 func callVectorFunc(name string, args []Value) (res Value, ok bool, err error) {
+	if !strings.HasPrefix(name, "vector") && name != "libsql_vector_idx" {
+		return Value{}, false, nil
+	}
 	if t, isEnc := vectorEncoders[name]; isEnc {
 		v, err := parseVector(args[0], t)
 		if err != nil {

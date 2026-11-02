@@ -41,6 +41,9 @@ func vec1Arity(name string) (lo, hi int, ok bool) {
 // callVec1Func evaluates a vec1 scalar function other than vec1_config; ok is
 // false for any other name.
 func callVec1Func(name string, args []Value) (Value, bool, error) {
+	if !strings.HasPrefix(name, "vec1_") {
+		return Value{}, false, nil
+	}
 	switch name {
 	case "vec1_info":
 		// The arithmetic is vec1's portable C, which is how vec1 describes a
