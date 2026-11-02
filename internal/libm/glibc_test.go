@@ -45,7 +45,8 @@ var ibmFuncs = map[string]bool{"sin": true, "cos": true, "tan": true, "asin": tr
 // TestAgainstGlibc compares each function with what glibc answered for the
 // same inputs, as testdata/mathref.c and mathwc.c record them: MUSQL_LIBM_REF
 // names a directory with a nofma and an fma directory of <function>.bin
-// files, written on a machine without FMA and on one with it.
+// files, written on a machine without FMA and on one with it. A build with no
+// directory is skipped: a machine without FMA can record only nofma.
 func TestAgainstGlibc(t *testing.T) {
 	dir := os.Getenv("MUSQL_LIBM_REF")
 	if dir == "" {
@@ -53,6 +54,10 @@ func TestAgainstGlibc(t *testing.T) {
 	}
 	defer func(f bool) { fused = f }(fused)
 	for _, variant := range []string{"nofma", "fma"} {
+		if _, err := os.Stat(filepath.Join(dir, variant)); os.IsNotExist(err) {
+			t.Logf("no %s records in %s", variant, dir)
+			continue
+		}
 		fused = variant == "fma"
 		for name, fn := range refFuncs {
 			// <name>.bin is mathref's sample, <name>-wc.bin the inputs
