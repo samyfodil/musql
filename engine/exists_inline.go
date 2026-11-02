@@ -97,6 +97,19 @@ func derivedReadsSameRows(ds *derivedSource) bool {
 	return false
 }
 
+// inlinedSource is ds as an inlined body opens it. A source that streams
+// only while the program opening it yields (streamIfYielding) stays
+// materialized: the body's own machine never yields, and the parent's may,
+// which would run the source again at every rewind.
+func inlinedSource(ds *derivedSource) *derivedSource {
+	if ds.stream != streamIfYielding {
+		return ds
+	}
+	cp := *ds
+	cp.stream = streamNever
+	return &cp
+}
+
 // progDeterministic reports whether prog, and every program it runs, calls
 // no function that may answer differently on another run.
 func progDeterministic(prog *Program, seen map[*Program]bool) bool {
@@ -222,7 +235,7 @@ func existsInline(prog *Program, at int, sub *Program) {
 		case OpFunction:
 			r.P1, r.P3 = reg(in.P1), reg(in.P3)
 		case OpOpenDerived:
-			r.P1, r.P2 = cur(in.P1), in.P2+slotOff
+			r.P1, r.P2, r.P4 = cur(in.P1), in.P2+slotOff, inlinedSource(in.P4.(*derivedSource))
 		}
 		out = append(out, r)
 	}

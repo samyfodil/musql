@@ -115,7 +115,7 @@ func recInline(prog *Program, at int, arm *Program) {
 		case OpResultRow:
 			r = Instruction{Op: OpRecQueuePush, P1: reg(in.P1), P2: in.P2}
 		case OpOpenDerived:
-			r.P1, r.P2 = cur(in.P1), in.P2+slotOff
+			r.P1, r.P2, r.P4 = cur(in.P1), in.P2+slotOff, inlinedSource(in.P4.(*derivedSource))
 		case OpClose:
 			r.P1 = cur(in.P1)
 		case OpRewind, OpNext:
