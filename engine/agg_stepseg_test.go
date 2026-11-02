@@ -103,16 +103,17 @@ func TestAggStepSegments(t *testing.T) {
 		{`SELECT sum(json(s)), sum(abs(v)) FROM t`, []int{0, 0}, []int{0},
 			"a whole-table aggregate keeps the subtype and lowers both, so there is no raising point and no cut"},
 
-		// The census block over a SUBQUERY census site, which the drain also
-		// lowers now. A bare column in the select list puts this plan on the
-		// sorted drain (usesGroupBare excludes the hash path), and magnetWalk is
-		// ONE unit: whatever happens inside it, no cut may land between the two
-		// census sites. Mutating that guard is a WRONG ANSWER, not a lost
-		// lowering -- magnetWalk steps every site in segment 0, so a site
-		// stamped for segment 1 would read a register this row has not filled
-		// yet. See TestAggCensusBlockIsOneSegment.
+		// The census block over a SUBQUERY census site, on the hash path and,
+		// ordered descending, on the sorted drain, which lowers it too.
+		// magnetWalk is ONE unit: whatever happens inside it, no cut may land
+		// between the two census sites. Mutating that guard is a WRONG ANSWER,
+		// not a lost lowering -- magnetWalk steps every site in segment 0, so a
+		// site stamped for segment 1 would read a register this row has not
+		// filled yet. See TestAggCensusBlockIsOneSegment.
 		{`SELECT k, max((SELECT 1)), min(v), v FROM t GROUP BY k`, []int{0, 0, 0, 0}, []int{0},
-			"two census sites, both lowered off the drain's record: one block, one segment"},
+			"two census sites, both lowered: one block, one segment"},
+		{`SELECT k, max((SELECT 1)), min(v), v FROM t GROUP BY k ORDER BY k DESC`, []int{0, 0, 0, 0}, []int{0},
+			"...and off the drain's record"},
 	} {
 		prog, plan := compiledAgg(t, p, tc.sql)
 		if got := segs(plan); !intsEqual(got, tc.wantSegs) {
