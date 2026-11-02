@@ -87,8 +87,12 @@ func (m *vdbe) hashAggSort() bool {
 	for _, b := range h.buckets {
 		h.sorted = append(h.sorted, b)
 	}
+	// BINARY order is memcmp over the encoded text, which in a UTF-16 database
+	// is not UTF-8 byte order (utf16CompareUTF8); the sorted drain's sorter
+	// orders its groups the same way.
+	enc := m.encoding()
 	sort.Slice(h.sorted, func(i, j int) bool {
-		return keyTupleLess(h.sorted[i].key, h.sorted[j].key)
+		return keyTupleLess(h.sorted[i].key, h.sorted[j].key, enc)
 	})
 	h.pos = 0
 	return len(h.sorted) > 0

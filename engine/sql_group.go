@@ -2408,12 +2408,11 @@ func findOutputColByName(outCols []outputColumn, name string) int {
 	return -1
 }
 
-// keyTupleLess orders two group-key tuples via compareValues, elementwise --
-// used only to give GROUP-BY-without-ORDER-BY output a deterministic,
-// reproducible row order.
-func keyTupleLess(a, b []Value) bool {
+// keyTupleLess orders two group-key tuples elementwise in BINARY order for a
+// database of encoding enc: the order the hash GROUP BY drains its groups in.
+func keyTupleLess(a, b []Value, enc TextEncoding) bool {
 	for i := range a {
-		if c := compareValues(a[i], b[i]); c != 0 {
+		if c := compareValuesCollatedEnc(a[i], b[i], "", enc); c != 0 {
 			return c < 0
 		}
 	}
