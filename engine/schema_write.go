@@ -947,7 +947,11 @@ func (db *DB) createTableAsSelect(name string, isTemp bool, sel *SelectStmt, ifN
 		defer pager.pushCTEScope(sel.CTEs)()
 	}
 	if len(sel.From) > 0 {
+		// The tables' columns, never their rows: execSelect below reads those.
+		saved := pager.fromColumnsOnly
+		pager.fromColumnsOnly = true
 		jts, _, ferr := pager.resolveFrom(sel.From, nil)
+		pager.fromColumnsOnly = saved
 		if ferr != nil {
 			return ferr
 		}
@@ -1092,6 +1096,13 @@ func (db *DB) createTableAsSelect(name string, isTemp bool, sel *SelectStmt, ifN
 	if len(selCols) != len(tbl.cols) {
 		return fmt.Errorf("engine: internal error: CREATE TABLE %s AS SELECT: column count mismatch (%d select columns, %d table columns)", name, len(selCols), len(tbl.cols))
 	}
+	// C stores these rows with OP_Insert and no OPFLAG_LASTROWID (select.c's
+	// SRT_Table arm), so last_insert_rowid() is left as it was.
+	defer func(r int64) { db.lastInsertRowid = r }(db.lastInsertRowid)
+	var bl *segBulkLoad
+	if db.ctasDirect(tbl) {
+		bl = newSegBulkLoad(tbl)
+	}
 	// Store this statement's own rows under FLEXNUM where that is the folded
 	// affinity: apply it here and neutralize the column's own NUMERIC for the
 	// population pass only, so tbl.cols keeps matching the CREATE TABLE text
@@ -1103,15 +1114,30 @@ func (db *DB) createTableAsSelect(name string, isTemp bool, sel *SelectStmt, ifN
 			tbl.cols[i].Aff = affNone
 		}
 	}
-	for _, rowVals := range selRows {
+	for n, rowVals := range selRows {
 		for _, i := range flexnumCols {
 			if i < len(rowVals) && rowVals[i].Typ != Float {
 				rowVals[i] = applyAffinityToValue(rowVals[i], affNumeric)
 			}
 		}
+		if bl != nil {
+			full, _, _, ferr := buildFullRow(tbl, name, false, nil, rowVals)
+			if ferr != nil {
+				return ferr
+			}
+			if aerr := bl.cut.add(uint64(n+1), full); aerr != nil {
+				return aerr
+			}
+			bl.last, bl.any = uint64(n+1), true
+			bl.rows++
+			continue
+		}
 		if _, ierr := db.insertRowFromValues(tbl, name, false, nil, rowVals); ierr != nil {
 			return ierr
 		}
+	}
+	if bl != nil {
+		tbl.bulk, tbl.rowsWrittenSinceCommit = bl, true
 	}
 
 	db.tables = append(db.tables, tbl)
