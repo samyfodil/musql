@@ -72,7 +72,7 @@ func Run(ctx context.Context, env Env, args []string) error {
 func (a *app) root() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "musql",
-		Short:         "Manage musql cloud databases",
+		Short:         "Run SQL on local musql databases and manage musql cloud ones",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
@@ -87,7 +87,7 @@ func (a *app) root() *cobra.Command {
 	root.PersistentFlags().StringVar(&a.url, "url", "", "server URL (default: the configured one)")
 	root.PersistentFlags().StringVar(&a.org, "org", "", "organization slug (default: the current one)")
 	root.PersistentFlags().BoolVar(&a.json, "json", false, "print JSON")
-	root.AddCommand(a.authCmd(), a.configCmd(), a.orgCmd(), a.groupCmd(), a.dbCmd())
+	root.AddCommand(a.authCmd(), a.configCmd(), a.orgCmd(), a.groupCmd(), a.dbCmd(), a.openCmd())
 	return root
 }
 

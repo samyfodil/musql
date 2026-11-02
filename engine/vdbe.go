@@ -1386,7 +1386,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				goto dispatch
 			}
 			// Nor one that would copy a row out for too little native work.
-			if jx.light != nil && jx.light[pc] && jx.copies(m, pc) {
+			if jx.light != nil && jx.light[pc] >= 0 && jx.copies(m, pc) > int(jx.light[pc]) {
 				op = &insns[pc]
 				goto dispatch
 			}
@@ -2637,6 +2637,14 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				} else if total, served := cur.pager.segFilterCountTable(cur.tbl.root, preds, cur.tbl.ipkIndex); served {
 					segFilterServed.Add(1)
 					m.regs[op.P1] = Value{Typ: Int, I: int64(total)}
+					pc = op.P3
+					continue
+				}
+			}
+			if plan.prog != nil {
+				if vs, served := m.segRunProgramAll(cur.pager, cur.tbl, plan.prog); served && len(vs) == 1 {
+					segFilterServed.Add(1)
+					m.regs[op.P1] = vs[0]
 					pc = op.P3
 					continue
 				}

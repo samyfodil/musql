@@ -7,7 +7,7 @@ import (
 	"unsafe"
 )
 
-var tvLayout = ValueLayout{Size: 48, OffTyp: 0, OffI: 8, OffF: 16, OffS: 24, TypNull: tvNull, TypInt: tvInt}
+var tvLayout = ValueLayout{Size: 48, OffTyp: 0, OffI: 8, OffF: 16, OffS: 24, TypNull: tvNull, TypInt: tvInt, TypFloat: tvReal}
 
 // runVM compiles prog (fused, entered at the pcs entry marks; every pc when
 // entry is nil) and runs it from pc over regs.
