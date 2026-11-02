@@ -52,6 +52,16 @@ type segLowered struct {
 	// sorted are the IN lists over parameters whose values the caller sorts
 	// into registers before the call (seedSorted).
 	sorted []segSortedKeys
+	// real marks the registers holding REALs (segment_lower_real.go), and
+	// realCol, parallel to cols, the slots that are REAL blocks.
+	real    map[int]bool
+	realCol []bool
+	// fAcc says the aggregate accumulates REALs in ProgArgs.FAcc, which
+	// orders the run: segments one after another, each from the last's sum.
+	fAcc bool
+	// exactParams are the parameters a REAL comparison converts, which must
+	// be INTEGERs a double holds exactly.
+	exactParams []int
 }
 
 // segSortedKeys is one IN list over bound parameters: regs take the sorted
@@ -98,13 +108,22 @@ func segLowerRegOperands(in Instruction) [3]int {
 		return [3]int{in.P1, -1, -1}
 	case OpNot, OpSCopy, OpNegative: // P1 source, P2 destination
 		return [3]int{in.P1, in.P2, -1}
-	case OpAdd, OpSubtract, OpMultiply, OpRemainder, OpBitAnd, OpBitOr: // r[P3] = r[P2] op r[P1]
+	case OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpBitAnd, OpBitOr: // r[P3] = r[P2] op r[P1]
 		return [3]int{in.P1, in.P2, in.P3}
 	case OpNull: // P1 destination
 		return [3]int{in.P1, -1, -1}
-	case OpFunction: // P1 first argument, P3 destination
-		if segLowerableFunc(in) {
-			return [3]int{in.P1, in.P3, -1}
+	case OpReal: // P2 destination
+		return [3]int{in.P2, -1, -1}
+	case OpFunction: // P1 first argument (P1+1 a second), P3 destination
+		if segLowerableFunc(in) || segIsMathCall(in) {
+			ops := [3]int{in.P1, in.P3, -1}
+			switch in.P2 {
+			case 0:
+				ops[0] = -1
+			case 2:
+				ops[2] = in.P1 + 1
+			}
+			return ops
 		}
 	case OpInList: // P1 operand, P2 destination, P3 the keys' flag
 		return [3]int{in.P1, in.P2, in.P3}
@@ -132,14 +151,14 @@ func segNullTestedOnly(body []Instruction) map[int]bool {
 			reads[in.P3]-- // its own destination is not a read
 		case OpIsNull, OpNotNull:
 			reads[in.P1]-- // a null test does not read the VALUE
-		case OpInteger, OpVariable, OpNot, OpSCopy, OpNegative, OpNull:
+		case OpInteger, OpVariable, OpNot, OpSCopy, OpNegative, OpNull, OpReal:
 			writes[in.P2]++
 			reads[in.P2]--
-		case OpAdd, OpSubtract, OpMultiply, OpRemainder, OpBitAnd, OpBitOr:
+		case OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpBitAnd, OpBitOr:
 			writes[in.P3]++
 			reads[in.P3]--
 		case OpFunction:
-			if segLowerableFunc(in) {
+			if segLowerableFunc(in) || segIsMathCall(in) {
 				writes[in.P3]++
 				reads[in.P3]--
 			}
@@ -185,21 +204,24 @@ func (l *segLowered) clone() *segLowered {
 	out.blockIR = append([]int(nil), l.blockIR...)
 	out.textCol = append([]bool(nil), l.textCol...)
 	out.sorted = slices.Clip(l.sorted)
+	out.realCol = append([]bool(nil), l.realCol...)
+	out.exactParams = slices.Clip(l.exactParams)
 	if l.textVar != nil {
 		out.textVar = l.textVar.clone()
 	}
 	return &out
 }
 
-// segLowerBody compiles the instructions of a scan loop body, or reports false
+// segLowerBody compiles the instructions of a scan loop body for the column
+// and parameter kinds given (nil: every one an INTEGER), or reports false
 // when it contains an opcode this does not model.
-func segLowerBody(body []Instruction, base int, cursor int, aggAt int) (*segLowered, bool) {
-	out, ok := segLowerBodyWith(body, base, cursor, aggAt, false, false)
+func segLowerBody(body []Instruction, base int, cursor int, aggAt int, kinds *segKinds) (*segLowered, bool) {
+	out, ok := segLowerBodyWith(body, base, cursor, aggAt, false, false, kinds)
 	if !ok || len(out.blocks) == 0 {
 		return out, ok
 	}
 	// LIKE's default rule is case-insensitive; that is the program compiled.
-	if tv, tok := segLowerBodyWith(body, base, cursor, aggAt, true, true); tok && len(tv.textCol) > 0 && slices.Contains(tv.textCol, true) {
+	if tv, tok := segLowerBodyWith(body, base, cursor, aggAt, true, true, kinds); tok && len(tv.textCol) > 0 && slices.Contains(tv.textCol, true) {
 		out.textVar = tv
 	}
 	return out, ok
@@ -210,7 +232,7 @@ func segLowerBody(body []Instruction, base int, cursor int, aggAt int) (*segLowe
 // that column's cells, with the block kept right after it as the fallback for
 // a cell that is not pure ASCII. Only valid over a segment whose column is
 // clean TEXT, so it is a second program beside the first, not a replacement.
-func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text, textFold bool) (*segLowered, bool) {
+func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text, textFold bool, kinds *segKinds) (*segLowered, bool) {
 	// AN OpNull ON A PATH THAT RUNS REFUSES THE WHOLE BODY, and modelling NULL
 	// any more cleverly than that is how this went wrong before.
 	//
@@ -262,9 +284,20 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 	// OpColumn that loads the register comes BEFORE the tests that constrain it
 	// and the decision has to be made at the load.
 	nullOnly := segNullTestedOnly(body)
+	real, okReal := segRegReals(body, cursor, kinds, nullOnly)
+	if !okReal {
+		return nil, false
+	}
+	out.real = real
+	lits, params := segIntSources(body)
 	// Instructions with no native form run in service blocks. A register a
 	// block reads holds a VALUE, never a NULL indicator.
-	svc := segClassifyServices(body, cursor)
+	svc := segClassifyServices(body, cursor, func(in Instruction) bool {
+		if segRealOp(in, real) {
+			return segRealNative(in, cursor, real, lits, params)
+		}
+		return segNativeLowerable(in, cursor)
+	})
 	if svc == nil {
 		return nil, false
 	}
@@ -299,6 +332,15 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 
 	for i, in := range body {
 		irOf[i] = len(out.insns)
+		if !svc[i] && segRealOp(in, real) {
+			done, ok := out.lowerReal(body, i, base, &nextReg, scratchReg, lits, params, note)
+			if !ok {
+				return nil, false
+			}
+			if done {
+				continue
+			}
+		}
 		if svc[i] {
 			// Run by its block: the block's first instruction stops the
 			// kernel for it, and a block ending in a jump branches on the flag
@@ -387,6 +429,10 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 				colSlot[key] = slot
 				out.cols = append(out.cols, in.P2)
 				out.nullCol = append(out.nullCol, asNull)
+				for len(out.realCol) < slot {
+					out.realCol = append(out.realCol, false)
+				}
+				out.realCol = append(out.realCol, !asNull && kinds.col(in.P2))
 			}
 			note(in.P3)
 			out.add(jit.ProgInsn{Op: jit.POpLoadCol, A: in.P3, B: slot})
@@ -573,6 +619,12 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 	for len(out.textCol) < len(out.cols) {
 		out.textCol = append(out.textCol, false)
 	}
+	for len(out.realCol) < len(out.cols) {
+		out.realCol = append(out.realCol, false)
+	}
+	for bi := range out.blocks {
+		out.blocks[bi].real = real
+	}
 	if len(nullMarks) > 0 {
 		reach := segLoweredReachable(out.insns)
 		for _, at := range nullMarks {
@@ -717,7 +769,9 @@ func segLoweredReachable(insns []jit.ProgInsn) []bool {
 			known = maps.Clone(known)
 			known[in.A] = int64(in.B)
 		case jit.POpLoadCol, jit.POpLoadReg, jit.POpCmp, jit.POpAnd, jit.POpOr,
-			jit.POpNot, jit.POpAdd, jit.POpSub, jit.POpMul, jit.POpRem, jit.POpAbs:
+			jit.POpNot, jit.POpAdd, jit.POpSub, jit.POpMul, jit.POpRem, jit.POpAbs,
+			jit.POpI2F, jit.POpFAdd, jit.POpFSub, jit.POpFMul, jit.POpFDiv, jit.POpFCmp,
+			jit.POpFIsNull, jit.POpFAbs, jit.POpMath:
 			if _, ok := known[in.A]; ok {
 				known = maps.Clone(known)
 				delete(known, in.A)

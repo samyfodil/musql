@@ -2641,6 +2641,14 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 					continue
 				}
 			}
+			if plan.prog != nil {
+				if vs, served := m.segRunProgramAll(cur.pager, cur.tbl, plan.prog); served && len(vs) == 1 {
+					segFilterServed.Add(1)
+					m.regs[op.P1] = vs[0]
+					pc = op.P3
+					continue
+				}
+			}
 			segFilterDeclined.Add(1)
 			// Not served: fall through to the loop, which the peephole left in
 			// the program precisely so this branch has somewhere to go.

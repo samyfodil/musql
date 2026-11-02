@@ -106,7 +106,7 @@ func segAttachRowFilter(in []Instruction, at, cursor int) bool {
 		if (in[j].Op != OpIfNot && in[j].Op != OpIf) || in[j].P2 != nextAt {
 			continue
 		}
-		cand, ok := segLowerBody(in[at+1:j+1], at+1, cursor, j+1)
+		cand, ok := segLowerBody(in[at+1:j+1], at+1, cursor, j+1, nil)
 		if !ok || len(cand.cols) == 0 {
 			break
 		}

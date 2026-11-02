@@ -36,6 +36,9 @@ type segSvcBlock struct {
 	// flag is the kernel register the block's closing jump decision lands
 	// in (1 taken, 0 not), -1 when it does not end in a jump.
 	flag int
+	// real marks the kernel registers holding REALs, which a block loads
+	// and writes back as REALs (NULL as a NaN).
+	real map[int]bool
 }
 
 // segInsnRegs is the registers in reads and writes, and whether it may end in
@@ -125,11 +128,11 @@ func segServiceable(in Instruction, cursor int) bool {
 // value only blocks would use or that reads what a block wrote -- so a text
 // column feeding length() is read by the block that calls it, and the IfNot
 // after a LIKE sees its NULL. nil when an instruction can be neither.
-func segClassifyServices(body []Instruction, cursor int) []bool {
+func segClassifyServices(body []Instruction, cursor int, native func(Instruction) bool) []bool {
 	svc := make([]bool, len(body))
 	some := false
 	for i, in := range body {
-		if !segNativeLowerable(in, cursor) {
+		if !native(in) {
 			if !segServiceable(in, cursor) {
 				return nil
 			}
@@ -323,6 +326,10 @@ func newSegSvcRunner(m *vdbe, tbl *resolvedTable) *segSvcRunner {
 func (r *segSvcRunner) run(b *segSvcBlock, s *segment, row int, regs []int64) bool {
 	w := r.vm.regs
 	for _, x := range b.load {
+		if b.real[x] {
+			w[x] = segRealValue(regs[x])
+			continue
+		}
 		w[x] = Value{Typ: Int, I: regs[x]}
 	}
 	m := &r.vm
@@ -344,6 +351,14 @@ func (r *segSvcRunner) run(b *segSvcBlock, s *segment, row int, regs []int64) bo
 	}
 	for _, x := range b.writeBack {
 		v := w[x]
+		if b.real[x] {
+			bits, ok := segRealBits(v)
+			if !ok {
+				return false
+			}
+			regs[x] = bits
+			continue
+		}
 		if v.Typ != Int {
 			return false
 		}
