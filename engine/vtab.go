@@ -414,25 +414,9 @@ func (p *ReadOnlyPager) materializeVtab(it FromItem, params []Value, outer *eval
 		return p.materializeFts3Item(it, it.Table, cols, sch)
 	}
 
-	constraints, rhsVals, err := p.buildVtabConstraints(it, cols, params, outer, trig, from, corr)
+	info, argv, err := p.vtabFilterArgs(it, cols, tab, params, outer, trig, from, corr)
 	if err != nil {
 		return nil, nil, nil, err
-	}
-	info := &VtabIndexInfo{Constraints: constraints, Usage: make([]VtabConstraintUsage, len(constraints))}
-	if err := tab.BestIndex(info); err != nil {
-		return nil, nil, nil, err
-	}
-	maxArgv := 0
-	for _, u := range info.Usage {
-		if u.ArgvIndex > maxArgv {
-			maxArgv = u.ArgvIndex
-		}
-	}
-	argv := make([]Value, maxArgv)
-	for i, u := range info.Usage {
-		if u.ArgvIndex >= 1 && u.ArgvIndex <= maxArgv {
-			argv[u.ArgvIndex-1] = rhsVals[i]
-		}
 	}
 
 	// A module whose rows come from the DATABASE this pager reads, rather than
@@ -521,6 +505,32 @@ func (p *ReadOnlyPager) materializeVtab(it FromItem, params []Value, outer *eval
 		}
 	}
 	return cols, rows, rowids, nil
+}
+
+// vtabFilterArgs offers the constraints of it to tab's BestIndex and returns the
+// plan it chose and the arguments Filter takes for it.
+func (p *ReadOnlyPager) vtabFilterArgs(it FromItem, cols []columnInfo, tab VirtualTable, params []Value, outer *evalCtx, trig *trigCompileCtx, from *vdbe, corr []vtabCorrValue) (*VtabIndexInfo, []Value, error) {
+	constraints, rhsVals, err := p.buildVtabConstraints(it, cols, params, outer, trig, from, corr)
+	if err != nil {
+		return nil, nil, err
+	}
+	info := &VtabIndexInfo{Constraints: constraints, Usage: make([]VtabConstraintUsage, len(constraints))}
+	if err := tab.BestIndex(info); err != nil {
+		return nil, nil, err
+	}
+	maxArgv := 0
+	for _, u := range info.Usage {
+		if u.ArgvIndex > maxArgv {
+			maxArgv = u.ArgvIndex
+		}
+	}
+	argv := make([]Value, maxArgv)
+	for i, u := range info.Usage {
+		if u.ArgvIndex >= 1 && u.ArgvIndex <= maxArgv {
+			argv[u.ArgvIndex-1] = rhsVals[i]
+		}
+	}
+	return info, argv, nil
 }
 
 // materializeWritableVtab reads a writable virtual table's rows from the real

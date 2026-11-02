@@ -989,6 +989,10 @@ type derivedSource struct {
 	pager *ReadOnlyPager
 
 	vtab *FromItem
+	// vtabStream lets vtab be read through its module's live cursor
+	// (vtab_stream.go): its loop is rewound once a run, or once an open for a
+	// correlated source, and nothing reorders, seeks or sweeps its rows.
+	vtabStream bool
 	// vtabTrig is the trigger context vtab was resolved under (c.trig at the
 	// emitting compile), nil outside a trigger body. A table-valued function's
 	// arguments are compiled at run time (buildVtabConstraints /
