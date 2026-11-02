@@ -217,6 +217,11 @@ type vdbeCursor struct {
 	// sits inside the loop (wherecode.c:1550) and restarts the body each time
 	// the loop is entered. Set by OpOpenDerived for derivedSource.rerun.
 	refillEach bool
+	// slotFill marks a cursor openSlotFillCursor made, which reopening its slot
+	// resets in place: nothing but the slot holds it.
+	slotFill bool
+	// slot is what a reopen of such a cursor keeps (openSlotFillCursor).
+	slot *slotFill
 
 	// sub, when non-nil, makes this a DERIVED-table cursor whose rows come from
 	// a co-routine (openStreamCursor, vdbe_stream.go) rather than a
@@ -640,21 +645,62 @@ func clearDerivedSubtypes(row []Value, keep []bool) {
 // rowids shorter than rows (including nil, openDerivedCursor's case) pads
 // the remainder with 0, matching a plain derived table's rowid-less rows.
 func openMaterializedCursor(tbl *resolvedTable, rows [][]Value, rowids []int64) *vdbeCursor {
-	rids := make([]uint64, len(rows))
-	for i := range rids {
-		if i < len(rowids) {
-			rids[i] = uint64(rowids[i])
-		}
-	}
 	// The JSON subtype is deliberately NOT cleared here -- see openDerivedCursor
 	// above, which clears it for its own rows before delegating.
 	return &vdbeCursor{
 		tbl:          tbl,
 		rows:         rows,
-		rowids:       rids,
+		rowids:       materializedRowids(len(rows), rowids),
 		materialized: true,
 		colMask:      allColumns,
 	}
+}
+
+// materializedRowids is n rows' rowids as a materialized cursor holds them,
+// 0 past the end of rowids.
+func materializedRowids(n int, rowids []int64) []uint64 {
+	rids := make([]uint64, n)
+	for i := range rids {
+		if i < len(rowids) {
+			rids[i] = uint64(rowids[i])
+		}
+	}
+	return rids
+}
+
+// openSlotFillCursor is openFillCursor for a CTE's or a subquery's rows into
+// slot p, reusing the cursor p holds when it was one of these: a subroutine
+// that reads one again for every outer row (an EXISTS over it) allocated a
+// cursor each time.
+//
+// A reopen by the same OpOpenDerived -- the same derived source and run-once
+// slot over the same pager -- keeps its fill function, made once (newFill),
+// and the rows that function last gave: a fill that gives the same rows again
+// skips the pass over them and keeps their rowids (rewind).
+func (m *vdbe) openSlotFillCursor(p, slot int, ds *derivedSource, pager *ReadOnlyPager, newFill func() func() ([][]Value, []int64, error)) *vdbeCursor {
+	if cur := m.cursors[p]; cur != nil && cur.slotFill {
+		sf := cur.slot
+		if sf.ds != ds || sf.slot != slot || sf.pager != pager {
+			*sf = slotFill{ds: ds, slot: slot, pager: pager, fill: newFill()}
+		}
+		*cur = vdbeCursor{tbl: ds.tbl, fill: sf.fill, clearSubtypes: true, fillKeep: ds.keepSubtype, colMask: allColumns, pos: -1, slotFill: true, slot: sf}
+		return cur
+	}
+	sf := &slotFill{ds: ds, slot: slot, pager: pager, fill: newFill()}
+	cur := openFillCursor(ds.tbl, sf.fill, true, ds.keepSubtype)
+	cur.slotFill, cur.slot = true, sf
+	return cur
+}
+
+// slotFill is a slot-fill cursor's fill function, what it reads, and the rows
+// it last gave, as rewind left them.
+type slotFill struct {
+	ds    *derivedSource
+	slot  int
+	pager *ReadOnlyPager
+	fill  func() ([][]Value, []int64, error)
+	rows  [][]Value
+	ids   []uint64
 }
 
 // cursorHasNoBtree reports whether cur is a pre-materialized row source (a
@@ -809,14 +855,21 @@ func (cur *vdbeCursor) rewind() error {
 			return err
 		}
 		cur.streamErrPending = tail
-		if cur.clearSubtypes {
-			for _, row := range rows {
-				clearDerivedSubtypes(row, cur.fillKeep)
-				derivedRealAffinity(row, cur.tbl)
+		if sf := cur.slot; sf != nil && rowids == nil && len(rows) > 0 && len(rows) == len(sf.rows) && &rows[0] == &sf.rows[0] {
+			// The rows this slot's last fill gave, as it left them.
+			cur.rows, cur.rowids, cur.materialized = rows, sf.ids, true
+		} else {
+			if cur.clearSubtypes {
+				for _, row := range rows {
+					clearDerivedSubtypes(row, cur.fillKeep)
+					derivedRealAffinity(row, cur.tbl)
+				}
+			}
+			cur.rows, cur.rowids, cur.materialized = rows, materializedRowids(len(rows), rowids), true
+			if sf := cur.slot; sf != nil && rowids == nil {
+				sf.rows, sf.ids = rows, cur.rowids
 			}
 		}
-		m := openMaterializedCursor(cur.tbl, rows, rowids)
-		cur.rows, cur.rowids, cur.materialized = m.rows, m.rowids, true
 	}
 	// A columnar view of this table, when one is attached, is served through
 	// ScanTable (segment_read.go) -- so the streaming b-tree cursor is declined

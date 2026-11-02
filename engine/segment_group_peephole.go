@@ -1,5 +1,7 @@
 package engine
 
+import "github.com/samyfodil/musql/internal/jit"
+
 // Recognizer for hash-drained GROUP BY over columnar tables. A separate matcher
 // (like ORDER BY) due to its own skeleton. Replaces only the scan loop; the drain
 // is unchanged, preserving group order and finalization.
@@ -60,38 +62,40 @@ func segGroupPeephole(prog *Program) bool {
 		break
 	}
 
-	// Scan body: Column/SCopy, MakeRecord for key, Column/SCopy for args, then step.
+	// Scan body: the key's computation up to its MakeRecord, Column/SCopy for
+	// each argument, then the step. A key that is more than a column is
+	// computed by a program over the body before the record (segGroupKeys).
 	regCol := map[int]int{}
 	bodyAt := pc
-	var keyBase, keyN int
-	sawKey := false
-	for pc < len(in) {
-		switch in[pc].Op {
-		case OpColumn:
-			if in[pc].P1 != cursor {
-				return false
-			}
-			regCol[in[pc].P3] = in[pc].P2
-		case OpSCopy:
-			src, okSrc := regCol[in[pc].P1]
-			if !okSrc {
-				return false
-			}
-			regCol[in[pc].P2] = src
-		case OpMakeRecord:
-			if sawKey {
+	keyAt := -1
+	plainKey := true
+	for ; pc < len(in) && in[pc].Op != OpHashAggStep; pc++ {
+		switch op := in[pc]; {
+		case op.Op == OpMakeRecord:
+			if keyAt >= 0 {
 				return false // one group-key record, not two
 			}
-			sawKey, keyBase, keyN = true, in[pc].P1, in[pc].P2
+			keyAt = pc
+		case op.Op == OpColumn && op.P1 == cursor:
+			regCol[op.P3] = op.P2
+		case op.Op == OpSCopy:
+			if src, ok := regCol[op.P1]; ok {
+				regCol[op.P2] = src
+			} else if keyAt < 0 {
+				plainKey = false
+			} else {
+				return false
+			}
+		case keyAt < 0:
+			plainKey = false
 		default:
-			goto bodyDone
+			return false
 		}
-		pc++
 	}
-bodyDone:
-	if !sawKey || keyN <= 0 || pc+1 >= len(in) {
+	if keyAt < 0 || in[keyAt].P2 <= 0 || pc+1 >= len(in) {
 		return false
 	}
+	keyBase, keyN := in[keyAt].P1, in[keyAt].P2
 	step := in[pc]
 	if step.Op != OpHashAggStep || in[pc+1].Op != OpNext ||
 		in[pc+1].P1 != cursor || in[pc+1].P2 != rewindAt+1 {
@@ -101,10 +105,22 @@ bodyDone:
 	if !okAgg || agg == nil || len(agg.cursors) != 1 || agg.cursors[0] != cursor {
 		return false
 	}
-	// Driver hands empty rows; plans reading them (bare columns, anchors) must decline.
-	// ORDER BY excluded: OpHashAggSort emits only for keys ascending (no evaluation).
+	// The walk hands each step the cells it read, or with bare columns the
+	// group's whole last row (segGroupBulk), which an order other than the
+	// rowids' would move. ORDER BY excluded: OpHashAggSort emits only for keys
+	// ascending (no evaluation).
+	bare := false
 	if !aggPlanReadsOnlyLoweredColsExceptOrder(agg) {
-		return false
+		if !aggPlanBareOnly(agg) {
+			return false
+		}
+		for i := 2; i < rewindAt; i++ {
+			switch in[i].Op {
+			case OpAutoIndexOrder, OpSeekRowidHint, OpSeekRowidSetHint, OpSeekIndexHint, OpSeekRowidRangeHint:
+				return false
+			}
+		}
+		bare = true
 	}
 	// OpAutoIndexOrder uses index order, not ROWID order; order-sensitive aggregates must decline.
 	for i := 2; i < rewindAt; i++ {
@@ -118,21 +134,40 @@ bodyDone:
 		}
 	}
 
-	gplan := &segGroupPlan{agg: agg, seg: step.P2, preds: preds, lists: lists}
-	for i := 0; i < keyN; i++ {
-		c, okc := regCol[keyBase+i]
-		if !okc {
+	gplan := &segGroupPlan{agg: agg, seg: step.P2, preds: preds, lists: lists, bare: bare}
+	argsAt := bodyAt
+	if plainKey {
+		for i := 0; i < keyN; i++ {
+			c, okc := regCol[keyBase+i]
+			if !okc {
+				return false
+			}
+			gplan.keyCols = append(gplan.keyCols, c)
+			gplan.keyRegs = append(gplan.keyRegs, keyBase+i)
+		}
+	} else {
+		if keyN != 1 {
 			return false
 		}
-		gplan.keyCols = append(gplan.keyCols, c)
-		gplan.keyRegs = append(gplan.keyRegs, keyBase+i)
+		for _, x := range in[bodyAt:keyAt] {
+			if _, _, jump, _ := segInsnRegs(x); jump {
+				return false
+			}
+		}
+		low, okLow := segLowerBody(in[bodyAt:keyAt], bodyAt, cursor, keyAt, nil)
+		if !okLow || len(low.blocks) > 0 || low.real[keyBase] {
+			return false
+		}
+		low.add(jit.ProgInsn{Op: jit.POpEmitVal, A: keyBase})
+		gplan.keyProg, gplan.keyCols, gplan.keyRegs = low, []int{-1}, []int{keyBase}
+		argsAt = keyAt + 1
 	}
 	// The lowered argument registers are every OTHER register the body wrote
 	// that is not part of the key record and not the scratch a Column landed
 	// in first. Taking them from the SCopy destinations is what identifies
 	// them: planAggArgRegs reserved those registers, and the body copies each
 	// argument into its own.
-	for i := bodyAt; i < pc; i++ {
+	for i := argsAt; i < pc; i++ {
 		if in[i].Op != OpSCopy {
 			continue
 		}

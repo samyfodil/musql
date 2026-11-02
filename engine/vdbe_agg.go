@@ -556,6 +556,23 @@ func havingReadsNoRow(e Expr) bool {
 	return false
 }
 
+// aggPlanBareOnly is aggPlanReadsOnlyLoweredColsExceptOrder letting the
+// outputs read the group's bare columns, for the columnar walk's bulk path,
+// which steps each group once with its whole last row: the row they read when
+// no min()/max() census picks another and no certificate checks it.
+func aggPlanBareOnly(plan *aggPlan) bool {
+	if plan == nil || plan.anchorCheck != nil || plan.magnet != nil && len(plan.magnet.sites) != 0 {
+		return false
+	}
+	for _, item := range plan.outPlans {
+		if item == nil || len(item.hoisted) != 0 {
+			return false
+		}
+	}
+	hp := plan.havingPlan
+	return hp == nil || !hp.usesGroupBare && len(hp.hoisted) == 0 && havingReadsNoRow(hp.rewritten)
+}
+
 // aggPlanReadsOnlyLoweredColsExceptOrder is the same test without the ORDER BY
 // exclusion, for the columnar GROUP BY recognizer, which accepts only an
 // OpHashAggSort drain, emitted only when ORDER BY is the group keys ascending

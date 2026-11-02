@@ -111,7 +111,9 @@ func compileSelectScanRow(p *ReadOnlyPager, stmt *SelectStmt, outer *compiler, r
 		}
 		if !segPeepholesOffForTest && !segPeephole(prog) && !segVectorPeephole(prog) && !segOrderPeephole(prog) &&
 			!segGroupPeephole(prog) && !segDistinctPeephole(prog) && !segJoinPeephole(prog) && !segJoinGroupPeephole(prog) && !segJoinHashPeephole(prog) && !segJoinTopPeephole(prog) {
-			segProgPeephole(prog)
+			if !segProgPeephole(prog) {
+				segSeriesPairPeephole(prog)
+			}
 		}
 		// And the ROW recogniser, which is not one of the alternatives above:
 		// those four REPLACE a loop with a guarded fast path that answers the

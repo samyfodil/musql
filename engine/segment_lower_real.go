@@ -121,13 +121,18 @@ func segFuncReal(in Instruction, real map[int]bool) bool {
 	return isMath
 }
 
-// segIsMathCall reports whether in calls one of the math functions.
+// segIsMathCall reports whether in calls one of the math functions, or
+// round() with no digits, which has a kernel too.
 func segIsMathCall(in Instruction) bool {
 	name, ok := in.P4.(string)
 	if !ok || in.Op != OpFunction {
 		return false
 	}
-	_, isMath := mathFuncArgs[strings.ToLower(name)]
+	name = strings.ToLower(name)
+	if name == "round" {
+		return in.P2 == 1
+	}
+	_, isMath := mathFuncArgs[name]
 	return isMath
 }
 
@@ -398,6 +403,9 @@ func segMathKernel(name string, nargs int) *fir.Func {
 }
 
 func buildSegMathKernel(name string, nargs int) *fir.Func {
+	if name == "round" && nargs == 1 {
+		return buildSegRoundKernel()
+	}
 	if lo, hi, ok := mathFuncArity(name); !ok || nargs < lo || nargs > hi || nargs == 0 {
 		return nil
 	}
@@ -530,6 +538,25 @@ func segCmpNullAnswer(body []Instruction, i, dst int) int64 {
 		return 0
 	}
 	return 1
+}
+
+// buildSegRoundKernel is round(x) with no digits, as roundFunc computes it:
+// a double past +-2^52 has no fraction to round, and any other is
+// (double)(i64)(x +- 0.5), whose zero is +0.0.
+func buildSegRoundKernel() *fir.Func {
+	k := libm.NewKernel("sql:round", 1)
+	x := k.Arg(0)
+	k.If(fir.FNe, x, x, func() { k.Return(x) }, nil)
+	k.If(fir.FGt, k.FAbs(x), k.K(4503599627370496), func() { k.Return(x) }, nil)
+	h := k.Var(fir.F)
+	k.Set(h, k.K(0.5))
+	k.If(fir.FLt, x, k.K(0), func() { k.Set(h, k.K(-0.5)) }, nil)
+	k.Return(k.FAdd(k.Trunc(k.FAdd(x, h)), k.K(0)))
+	f, err := k.Func()
+	if err != nil {
+		return nil
+	}
+	return f
 }
 
 // segFloatAnswer finalizes a REAL aggregate a program accumulated in FAcc,

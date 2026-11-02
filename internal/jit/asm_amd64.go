@@ -471,3 +471,9 @@ func (a *Asm) IdivReg(src Reg) {
 	a.rex(7, src)
 	a.emit(0xF7, modrm(0b11, 7, src))
 }
+
+// ImulRDXRAX is  RDX:RAX = RAX * src, signed: the product's high half in RDX.
+func (a *Asm) ImulRDXRAX(src Reg) {
+	a.rex(5, src)
+	a.emit(0xF7, modrm(0b11, 5, src))
+}

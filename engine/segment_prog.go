@@ -159,6 +159,48 @@ func readsVirtual(cols []columnInfo, read []int) bool {
 	return false
 }
 
+// segProgRegs is low's register file with the statement's bound parameters
+// in place, or false when one is not a value the program can hold.
+func (m *vdbe) segProgRegs(low *segLowered) ([]int64, bool) {
+	nRegs := low.nRegs
+	if low.textVar != nil {
+		nRegs = max(nRegs, low.textVar.nRegs)
+	}
+	regs := make([]int64, nRegs+2)
+	// Bound parameters go into the registers the body reads them from. A
+	// non-integer bound declines: every value in a compiled program is an
+	// int64, and coercing here is exactly where SQLite's cross-class ordering
+	// would be got wrong.
+	for i, reg := range low.consts {
+		idx := low.cvIndex[i]
+		if idx < 1 || idx > len(m.params) || reg >= len(regs) {
+			return nil, false
+		}
+		v := m.params[idx-1]
+		if low.real[reg] {
+			if v.Typ != Float {
+				return nil, false
+			}
+			regs[reg] = int64(math.Float64bits(v.F))
+			continue
+		}
+		if v.Typ != Int {
+			return nil, false
+		}
+		regs[reg] = v.I
+	}
+	// An INTEGER a REAL comparison reads as a double must be one exactly.
+	for _, idx := range low.exactParams {
+		if idx < 1 || idx > len(m.params) {
+			return nil, false
+		}
+		if v := m.params[idx-1]; v.Typ != Int || v.I > 1<<53 || v.I < -(1<<53) {
+			return nil, false
+		}
+	}
+	return regs, low.seedSorted(regs, m.params)
+}
+
 func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, low *segLowered, ipkCol int) (Value, bool) {
 	if p == nil || p.segs == nil || low == nil {
 		return Value{}, false
@@ -177,7 +219,7 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 	if !p.segCleanFor(rootPage) {
 		// A REAL sum is rounded in row order, which the split does not keep:
 		// it runs the delta's rows after every segment's.
-		if low.fAcc {
+		if low.fAcc || low.distinctReal() {
 			return Value{}, false
 		}
 		if split, ok = p.segs.deltaSplitFor(rootPage, segs, low, ipkCol); !ok {
@@ -188,44 +230,8 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 	if kern == nil {
 		return Value{}, false
 	}
-
-	nRegs := low.nRegs
-	if low.textVar != nil {
-		nRegs = max(nRegs, low.textVar.nRegs)
-	}
-	regs := make([]int64, nRegs+2)
-	// Bound parameters go into the registers the body reads them from. A
-	// non-integer bound declines: every value in a compiled program is an
-	// int64, and coercing here is exactly where SQLite's cross-class ordering
-	// would be got wrong.
-	for i, reg := range low.consts {
-		idx := low.cvIndex[i]
-		if idx < 1 || idx > len(m.params) || reg >= len(regs) {
-			return Value{}, false
-		}
-		v := m.params[idx-1]
-		if low.real[reg] {
-			if v.Typ != Float {
-				return Value{}, false
-			}
-			regs[reg] = int64(math.Float64bits(v.F))
-			continue
-		}
-		if v.Typ != Int {
-			return Value{}, false
-		}
-		regs[reg] = v.I
-	}
-	// An INTEGER a REAL comparison reads as a double must be one exactly.
-	for _, idx := range low.exactParams {
-		if idx < 1 || idx > len(m.params) {
-			return Value{}, false
-		}
-		if v := m.params[idx-1]; v.Typ != Int || v.I > 1<<53 || v.I < -(1<<53) {
-			return Value{}, false
-		}
-	}
-	if !low.seedSorted(regs, m.params) {
+	regs, ok := m.segProgRegs(low)
+	if !ok {
 		return Value{}, false
 	}
 
@@ -239,8 +245,14 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 	}
 	results := make([]segResult, nSlots)
 	// A DISTINCT aggregate's values go into one set when the runs take turns,
-	// and into a set per run, joined at the end, when they run at once.
-	if low.distinct {
+	// and into a set per run, joined at the end, when they run at once. REALs
+	// are taken in row order, the runs taking turns.
+	if low.distinctReal() {
+		rd := &segRealDistinct{}
+		for i := range results {
+			results[i].real = rd
+		}
+	} else if low.distinct {
 		var shared *int64Set
 		if segWorkers <= 1 || len(low.blocks) > 0 {
 			shared = &int64Set{}
@@ -264,7 +276,7 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 	// the interpreter shares its registers: their segments run one at a time.
 	var svc *segSvcRunner
 	each := segEach
-	if len(low.blocks) > 0 || low.fAcc {
+	if len(low.blocks) > 0 || low.fAcc || low.distinctReal() {
 		if len(low.blocks) > 0 {
 			svc = newSegSvcRunner(m, tbl)
 		}
@@ -403,7 +415,7 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 				}
 				if low.distinct {
 					res.ovf = res.ovf || ovf != 0
-					res.set.addAll(vals[:out])
+					res.addDistinct(vals[:out])
 					start = end + 1
 					continue
 				}
@@ -424,6 +436,15 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 	})
 	if !ok {
 		return Value{}, false
+	}
+	return segProgAnswer(low, results, facc)
+}
+
+// segProgAnswer folds the runs' results, in row order, into the aggregate's
+// value.
+func segProgAnswer(low *segLowered, results []segRunResult, facc [2]float64) (Value, bool) {
+	if low.distinct && len(results) > 0 && results[0].real != nil {
+		return results[0].real.answer(low.agg, results)
 	}
 	if low.distinct {
 		return segDistinctAnswer(low.agg, results)
@@ -543,6 +564,59 @@ type segRunResult struct {
 	ovf       bool
 	empty     bool
 	set       *int64Set
+	real      *segRealDistinct
+}
+
+// addDistinct takes the values a DISTINCT aggregate's run handed back.
+func (r *segRunResult) addDistinct(vals []int64) {
+	if r.real != nil {
+		r.real.add(vals)
+		return
+	}
+	r.set.addAll(vals)
+}
+
+// distinctReal reports whether low hands back REALs for a DISTINCT
+// aggregate, which segRealDistinct takes in row order.
+func (l *segLowered) distinctReal() bool { return l.distinct && l.real[l.sumReg] }
+
+// segRealDistinct is a DISTINCT aggregate over REALs: the values the runs
+// hand back, taken in row order, each the first time it is seen (-0.0 and
+// 0.0 are one value, a NULL none), and summed as sumStep sums them.
+type segRealDistinct struct {
+	seen int64Set
+	it   aggItem
+}
+
+func (d *segRealDistinct) add(vals []int64) {
+	for i, b := range vals {
+		f := math.Float64frombits(uint64(b))
+		if f != f || i > 0 && b == vals[i-1] {
+			continue
+		}
+		key := b
+		if f == 0 {
+			key = 0
+		}
+		if d.seen.insert(key) {
+			d.it.cnt++
+			d.it.kbnStep(f)
+		}
+	}
+}
+
+// answer is the aggregate over the values taken, or false when a run
+// overflowed.
+func (d *segRealDistinct) answer(agg aggKind, results []segRunResult) (Value, bool) {
+	for _, r := range results {
+		if r.ovf {
+			return Value{}, false
+		}
+	}
+	if agg == aggCount {
+		return Value{Typ: Int, I: d.it.cnt}, true
+	}
+	return segFloatAnswer(agg, d.it.cnt, [2]float64{d.it.rSum, d.it.rErr}), true
 }
 
 // segDistinctAnswer finishes a DISTINCT count, sum, total or avg from the
@@ -756,7 +830,7 @@ func (sp *segDeltaSplit) runDelta(kern *jit.Code, low *segLowered, regs []int64,
 		return false
 	}
 	if low.distinct {
-		res.set.addAll(vals[:out])
+		res.addDistinct(vals[:out])
 	}
 	res.out, res.ovf = out, ovf != 0
 	if low.agg != aggCountStar && low.agg != aggCount {

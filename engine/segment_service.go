@@ -313,6 +313,9 @@ func segBlockHomes(body []Instruction, svc []bool, blocks []segSvcBlock) {
 type segSvcRunner struct {
 	vm    vdbe // a shallow copy of the running machine, regs = the window
 	plans []segColPlan
+	// column, when set, reads a block's columns instead of a segment: a
+	// series' (segment_series.go).
+	column func(row, col int) Value
 }
 
 func newSegSvcRunner(m *vdbe, tbl *resolvedTable) *segSvcRunner {
@@ -337,6 +340,9 @@ func (r *segSvcRunner) run(b *segSvcBlock, s *segment, row int, regs []int64) bo
 	}
 	m := &r.vm
 	column := func(op *Instruction) Value {
+		if r.column != nil {
+			return r.column(row, op.P2)
+		}
 		width := min(s.Width(row), len(r.plans))
 		return segColumnValue(r.plans, s, row, width, s.Rowid(row), op.P2)
 	}

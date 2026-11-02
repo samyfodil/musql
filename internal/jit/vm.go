@@ -147,7 +147,62 @@ const (
 	// argument a REAL or (Imm zero) an INTEGER read as a double. Any other
 	// argument, a NaN answer and the kernel's own Exit exit.
 	VMath
+
+	// ---- TEXT arms.
+
+	// VSubstr: r[C] = substr(r[A], r[A+1], r[A+2]) where that is one ASCII
+	// character: r[A] a TEXT whose first y bytes are ASCII and none NUL, r[A+1]
+	// the INTEGER y, from 1 to the TEXT's length, and r[A+2] the INTEGER 1.
+	// The answer is the byte at y-1, as one byte of the table at Imm (the
+	// engine's own, as its substr answers it). Anything else exits, as does a
+	// write barrier that is on. The bytes already checked in this entry are
+	// not checked again (ProgArgs.TextPtr).
+	VSubstr
+	// VTextCmpJump, VTextCmpSet: VCmpJump and VCmpSet for Cond E or NE over
+	// two TEXTs, equal when their bytes are, or two INTEGERs. Any other pair
+	// exits, as do two TEXTs when ProgArgs.UTF16 is set: the engine compares
+	// those converted.
+	VTextCmpJump
+	VTextCmpSet
 )
+
+// sdivMagic is the multiplier m and shift s with which n/d, truncated, is
+// (mulhs(m, n) [+ n when m < 0]) >> s, plus 1 when n < 0 -- for a divisor
+// from 2 that is not a power of two (Hacker's Delight, 10-1).
+func sdivMagic(d int64) (m int64, s uint) {
+	const two63 = uint64(1) << 63
+	ad := uint64(d)
+	anc := two63 - 1 - two63%ad
+	p := 63
+	q1, r1 := two63/anc, two63-two63/anc*anc
+	q2, r2 := two63/ad, two63-two63/ad*ad
+	for {
+		p++
+		q1, r1 = 2*q1, 2*r1
+		if r1 >= anc {
+			q1, r1 = q1+1, r1-anc
+		}
+		q2, r2 = 2*q2, 2*r2
+		if r2 >= ad {
+			q2, r2 = q2+1, r2-ad
+		}
+		if delta := ad - r2; q1 > delta || q1 == delta && r1 != 0 {
+			break
+		}
+	}
+	return int64(q2 + 1), uint(p - 64)
+}
+
+// vmIntCmp is a VTextCmpJump or VTextCmpSet as the VCmpJump or VCmpSet it is
+// when an operand is known to be an INTEGER: the other must be one too.
+func vmIntCmp(in VInsn) VInsn {
+	if in.Op == VTextCmpJump {
+		in.Op = VCmpJump
+	} else {
+		in.Op = VCmpSet
+	}
+	return in
+}
 
 // VInsn is one instruction of a VM program: the one at its index's pc.
 type VInsn struct {
@@ -232,6 +287,7 @@ type ValueLayout struct {
 	TypNull  byte
 	TypInt   byte
 	TypFloat byte
+	TypText  byte
 }
 
 // VMFuel is how many backward jumps run between two returns to Go.

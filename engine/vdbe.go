@@ -2278,10 +2278,12 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 					m.cursors[op.P1] = cur
 					break
 				}
-				m.cursors[op.P1] = openFillCursor(ds.tbl, func() ([][]Value, []int64, error) {
-					rows, err := m.runCTEOnce(slot, ds, dsPager)
-					return rows, nil, err
-				}, true, ds.keepSubtype)
+				m.cursors[op.P1] = m.openSlotFillCursor(op.P1, slot, ds, dsPager, func() func() ([][]Value, []int64, error) {
+					return func() ([][]Value, []int64, error) {
+						rows, err := m.runCTEOnce(slot, ds, dsPager)
+						return rows, nil, err
+					}
+				})
 				if !ds.lazy {
 					if ferr := m.cursors[op.P1].rewind(); ferr != nil {
 						return nil, ferr
@@ -2323,18 +2325,20 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				// Materialized on the first rewind, at the top of its own loop
 				// (vdbeCursor.fill).
 				slot, prog := op.P2, ds.prog
-				m.cursors[op.P1] = openFillCursor(ds.tbl, func() ([][]Value, []int64, error) {
-					if ds.stmtOnce || ds.cteOnce && m.stmtRoot().wctx == nil {
-						rows, err := m.runStmtOnce(slot, prog, srcPager)
+				m.cursors[op.P1] = m.openSlotFillCursor(op.P1, slot, ds, srcPager, func() func() ([][]Value, []int64, error) {
+					return func() ([][]Value, []int64, error) {
+						if ds.stmtOnce || ds.cteOnce && m.stmtRoot().wctx == nil {
+							rows, err := m.runStmtOnce(slot, prog, srcPager)
+							return rows, nil, err
+						}
+						if !prog.Correlated {
+							rows, err := m.runSubOnce(slot, prog, srcPager)
+							return rows, nil, err
+						}
+						rows, err := prog.execWithParent(m)
 						return rows, nil, err
 					}
-					if !prog.Correlated {
-						rows, err := m.runSubOnce(slot, prog, srcPager)
-						return rows, nil, err
-					}
-					rows, err := prog.execWithParent(m)
-					return rows, nil, err
-				}, true, ds.keepSubtype)
+				})
 				if !ds.lazy {
 					if ferr := m.cursors[op.P1].rewind(); ferr != nil {
 						return nil, ferr
@@ -2761,14 +2765,22 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpSegProgram:
 			pplan, okPlan := op.P4.(*segProgPlan)
-			if !okPlan || m.pager == nil {
+			series := okPlan && pplan.src != nil && pplan.src.series != nil
+			if !okPlan || (m.pager == nil && !series) {
 				return nil, fmt.Errorf("vdbe: OpSegProgram without a plan")
 			}
 			cur := m.cursors[op.P2]
-			if cur == nil || cur.tbl == nil || cur.pager == nil {
+			if cur == nil || (!series && (cur.tbl == nil || cur.pager == nil)) {
 				return nil, fmt.Errorf("vdbe: OpSegProgram on a closed cursor")
 			}
-			if vs, served := m.segRunProgramAll(cur.pager, cur.tbl, pplan); served {
+			var vs []Value
+			var served bool
+			if series {
+				vs, served = m.segRunSeries(pplan)
+			} else {
+				vs, served = m.segRunProgramAll(cur.pager, cur.tbl, pplan)
+			}
+			if served {
 				segFilterServed.Add(1)
 				// P1 is the FIRST destination register; the statement's N
 				// aggregates land in P1..P1+N-1, which is the range the
@@ -2893,7 +2905,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				segGroupSeeksTaken.Add(1)
 				break
 			}
-			if m.segHashAggTable(cur.pager, cur.tbl.root, gplan) {
+			if m.segHashAggTable(cur.pager, cur.tbl, gplan) {
 				segFilterServed.Add(1)
 				pc = op.P2
 				continue

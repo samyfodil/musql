@@ -31,6 +31,13 @@ type segProgSource struct {
 	aggs                []*aggItem
 	cols                []int // the table columns the body loads
 	params              []int // the parameters it reads
+	// series is the generate_series cursors the loop reads, outer first, when
+	// it reads them and not a table (segment_series.go): their INTEGER columns
+	// come in blocks, so a body reading nothing still has rows to count.
+	series []int
+	// seriesSrc is each one's source, for a cursor that materializes it
+	// rather than streaming it.
+	seriesSrc []*derivedSource
 }
 
 // forKinds is the plan's programs for kinds, lowered on first use.
@@ -50,8 +57,8 @@ func (p *segProgPlan) forKinds(kinds *segKinds) []*segLowered {
 // segProgPlanFor is the plan for a loop whose body feeds the AggStep at
 // aggAt, or nil when its aggregates are not ones a program computes or the
 // body lowers for no kinds of column.
-func segProgPlanFor(body []Instruction, base, cursor, aggAt int, plan *aggPlan, nAgg int) *segProgPlan {
-	aggs := segPlanAggs(plan, nAgg)
+func segProgPlanFor(body []Instruction, base, cursor, aggAt int, plan *aggPlan, nAgg int, series []int) *segProgPlan {
+	aggs := segPlanAggs(plan, nAgg, max(1, len(series)))
 	if aggs == nil {
 		return nil
 	}
@@ -87,7 +94,7 @@ func segProgPlanFor(body []Instruction, base, cursor, aggAt int, plan *aggPlan, 
 			}
 		}
 	}
-	src := &segProgSource{body: body, base: base, cursor: cursor, aggAt: aggAt, aggs: aggs}
+	src := &segProgSource{body: body, base: base, cursor: cursor, aggAt: aggAt, aggs: aggs, series: series}
 	seen := map[int]bool{}
 	for _, in := range body {
 		switch {
@@ -99,6 +106,9 @@ func segProgPlanFor(body []Instruction, base, cursor, aggAt int, plan *aggPlan, 
 		}
 	}
 	lows, ok := src.lower(nil)
+	if !ok && series != nil {
+		return nil
+	}
 	if !ok {
 		// Lowering may need REAL columns: a REAL literal compared with one.
 		// Which columns are REAL is for the segments to say when it runs.
@@ -121,7 +131,7 @@ func (src *segProgSource) lower(kinds *segKinds) ([]*segLowered, bool) {
 	// aggregate gets a copy with its own terminal op. N aggregates are N passes
 	// over the same int64 blocks, which is the trade segRunProgramAll explains.
 	base, okLow := segLowerBody(src.body, src.base, src.cursor, src.aggAt, kinds)
-	if !okLow || (len(base.cols) == 0 && len(base.blocks) == 0) {
+	if !okLow || (len(base.cols) == 0 && len(base.blocks) == 0 && src.series == nil) {
 		return nil, false
 	}
 	// Each aggregate's argument is read by the accumulate appended below,
@@ -160,11 +170,8 @@ func (src *segProgSource) lower(kinds *segKinds) ([]*segLowered, bool) {
 		switch {
 		case a.distinct && a.kind != aggMin && a.kind != aggMax:
 			// The distinct values are found in Go from the arguments the
-			// program hands back (segDistinctAnswer), as integers. A DISTINCT
-			// min or max is the plain one.
-			if isReal {
-				return nil, false
-			}
+			// program hands back (segDistinctAnswer, segRealDistinct). A
+			// DISTINCT min or max is the plain one.
 			low.nRegs--
 			low.distinct = true
 			low.add(jit.ProgInsn{Op: jit.POpEmitVal, A: argReg})
@@ -190,7 +197,7 @@ func (src *segProgSource) lower(kinds *segKinds) ([]*segLowered, bool) {
 		default:
 			low.add(jit.ProgInsn{Op: jit.POpAccSum, A: argReg, B: rowsReg})
 		}
-		low.fAcc = isReal && a.kind != aggCount
+		low.fAcc = isReal && a.kind != aggCount && !low.distinct
 		if tv := low.textVar; tv != nil {
 			// The same accumulate, on the same registers, in the text variant;
 			// its own row counter sits past its own registers.
@@ -215,10 +222,10 @@ func (src *segProgSource) lower(kinds *segKinds) ([]*segLowered, bool) {
 // insisting there be one: no bare group column and no hoist (both read the
 // group's ANCHOR ROW, which these opcodes never touch), exactly one template,
 // no separator. DISTINCT is allowed: segProgPeephole hands its values back to
-// Go. The plan-wide checks -- one scope, no HAVING, no ORDER BY, no anchor --
+// Go. The plan-wide checks -- scopes sources, no HAVING, no ORDER BY, no anchor --
 // still have to hold once.
-func segPlanAggs(plan *aggPlan, n int) []*aggItem {
-	if plan == nil || len(plan.scopes) != 1 || len(plan.outPlans) != n ||
+func segPlanAggs(plan *aggPlan, n, scopes int) []*aggItem {
+	if plan == nil || len(plan.scopes) != scopes || len(plan.outPlans) != n ||
 		plan.havingPlan != nil || len(plan.orderPlans) != 0 || plan.anchorCheck != nil {
 		return nil
 	}
@@ -242,7 +249,11 @@ func segProgPeephole(prog *Program) bool {
 		return false
 	}
 	in := prog.Insns
-	if len(in) < 9 || in[0].Op != OpInit || in[1].Op != OpAggReset || in[2].Op != OpOpenRead {
+	if len(in) < 9 || in[0].Op != OpInit || in[1].Op != OpAggReset {
+		return false
+	}
+	isSeries := segSeriesOpen(in[2])
+	if in[2].Op != OpOpenRead && !isSeries {
 		return false
 	}
 	rewindAt := 3
@@ -298,7 +309,14 @@ func segProgPeephole(prog *Program) bool {
 		return false
 	}
 	cursor := in[rewindAt].P1
-	pplan := segProgPlanFor(in[rewindAt+1:aggAt], rewindAt+1, cursor, aggAt, plan, nAgg)
+	var series []int
+	if isSeries {
+		if in[2].P1 != cursor {
+			return false
+		}
+		series = []int{cursor}
+	}
+	pplan := segProgPlanFor(in[rewindAt+1:aggAt], rewindAt+1, cursor, aggAt, plan, nAgg, series)
 	if pplan == nil {
 		return false
 	}

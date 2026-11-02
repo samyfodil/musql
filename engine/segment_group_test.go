@@ -66,8 +66,8 @@ func TestColumnarGroupByMatchesTheLoop(t *testing.T) {
 		// semantics aggStep already gave it. This case was written expecting a
 		// decline and the test disagreed.
 		{`SELECT k, count(DISTINCT v) FROM t GROUP BY k`, true},
-		// expression key:
-		{`SELECT k + 1, count(*) FROM t GROUP BY k + 1`, false},
+		// expression key, computed a block at a time (segGroupKeys):
+		{`SELECT k + 1, count(*) FROM t GROUP BY k + 1`, true},
 		// Served for the same reason as the TEXT cases above: group_concat gets
 		// its argument as a Value and keeps whatever semantics aggStep gave it.
 		{`SELECT k, group_concat(s) FROM t GROUP BY k`, true},

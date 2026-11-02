@@ -76,6 +76,12 @@ func vmStepOf(in VInsn, pc int) progStep {
 		if in.B == 2 {
 			s.uses = append(s.uses, in.A+1)
 		}
+	case VSubstr:
+		s.uses, s.defs = []int{in.A, in.A + 1, in.A + 2}, []int{in.C}
+	case VTextCmpJump:
+		s.uses, s.targets = []int{in.A, in.B}, []int{in.T}
+	case VTextCmpSet:
+		s.uses, s.defs = []int{in.A, in.B}, []int{in.C}
 	case VNotBr:
 		s.uses, s.defs, s.targets = []int{in.A}, []int{in.C}, []int{in.T}
 	case VNullJump, VIf:
@@ -291,6 +297,10 @@ func EmitVM(prog []VInsn, nReg int, lay ValueLayout) ([]byte, error) {
 // The pass's accounting, for a test to see it ran.
 var vmFusedPairs, vmDeadStores atomic.Int64
 
+// vmDivConsts counts the divisions emitted without a divide instruction
+// (divConst), for a test to see they were.
+var vmDivConsts atomic.Int64
+
 // VMFusionStatsForTest reads and clears how many pairs the VM pass fused and
 // how many stores it found dead.
 func VMFusionStatsForTest() (pairs, dead int64) {
@@ -308,10 +318,14 @@ type vmKnow struct {
 	// isFloat: known to hold a REAL (a guard passed, or native code wrote
 	// one).
 	isFloat map[int]bool
+	// konst: known to hold the INTEGER given, which a VInt of this run wrote
+	// with nothing writing the register since.
+	konst map[int]int64
 }
 
 func newVMKnow() *vmKnow {
-	return &vmKnow{isInt: map[int]bool{}, noS: map[int]bool{}, canon: map[int]bool{}, isFloat: map[int]bool{}}
+	return &vmKnow{isInt: map[int]bool{}, noS: map[int]bool{}, canon: map[int]bool{}, isFloat: map[int]bool{},
+		konst: map[int]int64{}}
 }
 
 func (k *vmKnow) reset() {
@@ -319,6 +333,15 @@ func (k *vmKnow) reset() {
 	clear(k.noS)
 	clear(k.canon)
 	clear(k.isFloat)
+	clear(k.konst)
+}
+
+// wrote forgets the constants in the registers in writes, before it is
+// emitted.
+func (k *vmKnow) wrote(in VInsn, pc int) {
+	for _, r := range vmStepOf(in, pc).defs {
+		delete(k.konst, r)
+	}
 }
 
 // wroteInt records that native code made r the integer Value.
@@ -495,6 +518,7 @@ func vmEntryKeep(prog []VInsn, bound []bool, pc int) map[int]bool {
 func (k *vmKnow) pruneForEntry(keep map[int]bool) (ints, noS []int) {
 	clear(k.canon)
 	clear(k.isFloat) // a REAL op guards its operands again
+	clear(k.konst)
 	for r := range k.isInt {
 		if keep[r] {
 			ints = append(ints, r)
@@ -567,6 +591,42 @@ func VReachesResultRow(prog []VInsn) []bool {
 			if r {
 				reach[pc], changed = true, true
 			}
+		}
+	}
+	return reach
+}
+
+// VReachFrom reports which instructions native code entered at pc can run
+// before it exits. A reachable VReturn may return past any VGosub.
+func VReachFrom(prog []VInsn, pc int) []bool {
+	n := len(prog)
+	reach := make([]bool, n)
+	work := []int{pc}
+	returned := false
+	for len(work) > 0 {
+		at := work[len(work)-1]
+		work = work[:len(work)-1]
+		if at < 0 || at >= n || reach[at] {
+			continue
+		}
+		reach[at] = true
+		switch in := prog[at]; in.Op {
+		case VExit:
+		case VReturn:
+			if !returned {
+				returned = true
+				for g, x := range prog {
+					if x.Op == VGosub {
+						work = append(work, g+1)
+					}
+				}
+			}
+		default:
+			st := vmStepOf(in, at)
+			if st.fall {
+				work = append(work, at+1)
+			}
+			work = append(work, st.targets...)
 		}
 	}
 	return reach

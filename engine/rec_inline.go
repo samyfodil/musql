@@ -36,9 +36,10 @@ func recInlinePeephole(prog *Program) {
 }
 
 // recInlinable reports whether arm is a step this pass can relocate. Its
-// NSubCache is not a bar: the slot belongs to the self reference's
-// OpOpenDerived, which openRecursiveSelf serves without the cache, and no
-// other opcode recInlineOperands accepts reads one.
+// slots move past the queue program's own: the self reference's, which
+// openRecursiveSelf serves without the cache, and those of the derived
+// sources that read the same rows on every run (derivedReadsSameRows), which
+// the queue program's slots then keep across steps.
 func recInlinable(arm *Program) bool {
 	if arm == nil || arm.Compound != nil || arm.LiveSource != nil || arm.NSorters != 0 || arm.NDistinct != 0 ||
 		arm.NRecRegs != 0 || len(arm.Insns) == 0 || arm.Insns[0].Op != OpInit {
@@ -51,7 +52,11 @@ func recInlinable(arm *Program) bool {
 		switch in.Op {
 		case OpOpenDerived:
 			ds, ok := in.P4.(*derivedSource)
-			if !ok || ds == nil || ds.recSelf == nil || ds.catalogScope != scopeAny || ds.vtabWrite != nil || ds.dbIdx != 0 {
+			if !ok || ds == nil {
+				return false
+			}
+			if ds.recSelf == nil && !derivedReadsSameRows(ds) ||
+				ds.recSelf != nil && (ds.catalogScope != scopeAny || ds.vtabWrite != nil || ds.dbIdx != 0) {
 				return false
 			}
 		case OpRewind:
@@ -75,7 +80,7 @@ func recInlineOperands(in Instruction) bool {
 		OpInteger, OpInt64, OpReal, OpString8, OpNull, OpVariable, OpSCopy, OpCopy, OpNot,
 		OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpConcat,
 		OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull,
-		OpFunction, OpResultRow:
+		OpFunction, OpResultRow, OpGosub, OpReturn:
 		return true
 	}
 	return false
@@ -88,7 +93,7 @@ func recInlineOperands(in Instruction) bool {
 // fill becomes a Gosub to a trampoline at the end that runs the arm and then
 // RecQueueCheck before returning: no address in prog moves.
 func recInline(prog *Program, at int, arm *Program) {
-	regOff, curOff := prog.NReg, prog.NCursors
+	regOff, curOff, slotOff := prog.NReg, prog.NCursors, prog.NSubCache
 	retReg := prog.NReg + arm.NReg
 	base := len(prog.Insns)
 	body := base                  // arm address a lands at body+a
@@ -109,7 +114,9 @@ func recInline(prog *Program, at int, arm *Program) {
 			r = Instruction{Op: OpGoto, P2: done}
 		case OpResultRow:
 			r = Instruction{Op: OpRecQueuePush, P1: reg(in.P1), P2: in.P2}
-		case OpOpenDerived, OpClose:
+		case OpOpenDerived:
+			r.P1, r.P2, r.P4 = cur(in.P1), in.P2+slotOff, inlinedSource(in.P4.(*derivedSource))
+		case OpClose:
 			r.P1 = cur(in.P1)
 		case OpRewind, OpNext:
 			r.P1, r.P2 = cur(in.P1), jump(in.P2)
@@ -132,6 +139,10 @@ func recInline(prog *Program, at int, arm *Program) {
 			r.P1, r.P2 = reg(in.P1), jump(in.P2)
 		case OpFunction:
 			r.P1, r.P3 = reg(in.P1), reg(in.P3)
+		case OpGosub:
+			r.P1, r.P2 = reg(in.P1), jump(in.P2)
+		case OpReturn:
+			r.P1 = reg(in.P1)
 		}
 		out = append(out, r)
 	}
@@ -142,4 +153,5 @@ func recInline(prog *Program, at int, arm *Program) {
 	prog.Insns = out
 	prog.NReg += arm.NReg + 1
 	prog.NCursors += arm.NCursors
+	prog.NSubCache += arm.NSubCache
 }

@@ -244,11 +244,6 @@ func bytesIndexOrder(cells []int64, heap []byte) ([]int32, func(a, b int64) int,
 	return order, compare, true
 }
 
-// radixOrderInt64 returns the positions of vals ordered by (value, position):
-// an LSD radix sort on the value with its sign bit flipped. Each pass is stable
-// and the positions start ascending, so ties come out in position order. A pass
-// whose byte every key shares moves nothing and is skipped, so clustered values
-// cost fewer passes.
 // scratchU64 holds the work arrays an index build sorts in, which it lets go
 // as it returns: a load builds one index per column per segment, and they were
 // a sixth of what it allocated.
@@ -264,24 +259,39 @@ func getScratchU64(n int) *[]uint64 {
 	return &s
 }
 
+// radixOrderInt64 returns the positions of vals ordered by (value, position):
+// an LSD radix sort on the value with its sign bit flipped. Each pass is stable
+// and the positions start ascending, so ties come out in position order. Only
+// the bytes some keys differ in take a pass, so clustered values cost fewer,
+// and values already ascending, as a rowid-like column's are, take none.
 func radixOrderInt64(vals []int64) []int32 {
 	n := len(vals)
+	order := make([]int32, n)
+	for i := range order {
+		order[i] = int32(i)
+	}
+	if slices.IsSorted(vals) {
+		return order
+	}
 	kp, tp := getScratchU64(n), getScratchU64(n)
 	defer scratchU64.Put(kp)
 	defer scratchU64.Put(tp)
 	keys, tk := *kp, *tp
-	order, to := make([]int32, n), make([]int32, n)
+	to := make([]int32, n)
+	and, or := ^uint64(0), uint64(0)
 	for i, v := range vals {
-		keys[i] = uint64(v) ^ 1<<63
-		order[i] = int32(i)
+		k := uint64(v) ^ 1<<63
+		keys[i] = k
+		and &= k
+		or |= k
 	}
 	for shift := uint(0); shift < 64; shift += 8 {
+		if (and^or)>>shift&0xff == 0 {
+			continue
+		}
 		var at [256]int
 		for _, k := range keys {
 			at[k>>shift&0xff]++
-		}
-		if at[keys[0]>>shift&0xff] == n {
-			continue
 		}
 		sum := 0
 		for b, c := range at {

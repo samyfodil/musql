@@ -33,10 +33,26 @@ func TestRecInlineMatchesTheSubProgram(t *testing.T) {
 		// machine (with5.test, with2.test).
 		`WITH RECURSIVE closure(x) AS (VALUES(1) UNION SELECT aa FROM link, closure WHERE link.bb=closure.x UNION SELECT bb FROM closure, link WHERE link.aa=closure.x) SELECT group_concat(x) FROM (SELECT x FROM closure ORDER BY x)`,
 		`WITH q(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM q, v WHERE a<5) SELECT count(*), sum(a) FROM q`,
+		// A step that joins a CTE and tests a correlated NOT EXISTS over a
+		// recursive one, inlined as a subroutine (issue #74's sudoku).
+		`WITH RECURSIVE input(sud) AS (VALUES('53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79')),
+		  digits(z, lp) AS (VALUES('1', 1) UNION ALL SELECT CAST(lp+1 AS TEXT), lp+1 FROM digits WHERE lp<9),
+		  x(s, ind) AS (SELECT sud, instr(sud, '.') FROM input UNION ALL
+		    SELECT substr(s, 1, ind-1) || z || substr(s, ind+1), instr(substr(s, 1, ind-1) || z || substr(s, ind+1), '.')
+		    FROM x, digits AS z WHERE ind>0 AND NOT EXISTS (SELECT 1 FROM digits AS lp
+		      WHERE z.z = substr(s, ((ind-1)/9)*9 + lp, 1) OR z.z = substr(s, ((ind-1)%9) + (lp-1)*9 + 1, 1)
+		         OR z.z = substr(s, (((ind-1)/3) % 3) * 3 + ((ind-1)/27) * 27 + lp + ((lp-1) / 3) * 6, 1)))
+		SELECT s FROM x WHERE ind=0`,
+		`WITH RECURSIVE d(z, lp) AS (VALUES('1', 1) UNION ALL SELECT CAST(lp+1 AS TEXT), lp+1 FROM d WHERE lp<5),
+		  e(w) AS (VALUES(2),(4)),
+		  x(s, k) AS (SELECT '', 1 UNION ALL SELECT s || z, k + 1 FROM x, d WHERE k < 4
+		    AND NOT EXISTS (SELECT 1 FROM d AS f, e WHERE f.z = substr(s, k - 1, 1) OR f.lp * e.w = k + d.lp))
+		SELECT count(*), max(s), min(s) FROM x`,
+		`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 20 AND EXISTS (SELECT 1 FROM link WHERE aa + bb > i)) SELECT group_concat(i) FROM c`,
 	}
 	ask := func(q string, inline bool) string {
-		recInlineOffForTest = !inline
-		defer func() { recInlineOffForTest = false }()
+		recInlineOffForTest, segPeepholesOffForTest = !inline, !inline
+		defer func() { recInlineOffForTest, segPeepholesOffForTest = false, false }()
 		n, err := OpenWrite(p.path)
 		if err != nil {
 			t.Fatal(err)

@@ -1087,6 +1087,19 @@ func (db *DB) createTableAsSelect(name string, isTemp bool, sel *SelectStmt, ifN
 		return err
 	}
 
+	// A projection over generate_series is cut into segments column by
+	// column (ctas_series.go), and anything else selects its rows below.
+	if db.ctasDirect(tbl) && len(flexnumCols) == 0 {
+		if segs, n, ok := pager.ctasSeriesSegments(sel, tbl.cols); ok {
+			bl := newSegBulkLoad(tbl)
+			bl.segs, bl.rows, bl.last, bl.any = segs, int(n), n, n > 0
+			tbl.bulk, tbl.rowsWrittenSinceCommit = bl, true
+			db.tables = append(db.tables, tbl)
+			db.bumpSchema(isTemp)
+			return nil
+		}
+	}
+
 	// Populate before registering the table (db.tables/db.schemaCookie), so a
 	// SELECT error leaves db.tables untouched.
 	selCols, selRows, err := pager.execSelect(sel, nil, nil, "")

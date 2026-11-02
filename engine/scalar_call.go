@@ -14,6 +14,7 @@ package engine
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"unicode/utf8"
@@ -770,26 +771,52 @@ func fnSubstr(args []Value) Value {
 	if x.Typ != Text {
 		s = []byte(valueToText(x))
 	}
-	if i := bytes.IndexByte(s, 0); i >= 0 {
-		s = s[:i]
-	}
 	n := 0
 	if y < 0 {
-		for i := 0; i < len(s); n++ {
+		for i := 0; i < len(s) && s[i] != 0; n++ {
 			i += sqliteUTF8Skip(s[i:])
 		}
 	}
 	p1, p2 := substrBounds(n, y, hasZ, z)
 	i := 0
-	for ; i < len(s) && p1 > 0; p1-- {
-		i += sqliteUTF8Skip(s[i:])
+	// ASCII with no NUL is a byte a character: eight at a time.
+	for p1 >= 8 && i+8 <= len(s) {
+		w := binary.LittleEndian.Uint64(s[i:])
+		if w&0x8080808080808080 != 0 || (w-0x0101010101010101)&^w&0x8080808080808080 != 0 {
+			break
+		}
+		i, p1 = i+8, p1-8
+	}
+	for ; i < len(s) && s[i] != 0 && p1 > 0; p1-- {
+		if s[i] < 0x80 {
+			i++
+		} else {
+			i += sqliteUTF8Skip(s[i:])
+		}
 	}
 	j := i
-	for ; j < len(s) && p2 > 0; p2-- {
-		j += sqliteUTF8Skip(s[j:])
+	for ; j < len(s) && s[j] != 0 && p2 > 0; p2-- {
+		if s[j] < 0x80 {
+			j++
+		} else {
+			j += sqliteUTF8Skip(s[j:])
+		}
+	}
+	if j == i+1 && s[i] < 0x80 {
+		// One ASCII character, from a table: a Value's bytes are never
+		// written in place, and the capacity of one makes any append copy.
+		return Value{Typ: Text, S: asciiBytes[s[i] : s[i]+1 : s[i]+1]}
 	}
 	return Value{Typ: Text, S: append([]byte(nil), s[i:j]...)}
 }
+
+// asciiBytes is every ASCII byte, for one-character results.
+var asciiBytes = func() (b [128]byte) {
+	for i := range b {
+		b[i] = byte(i)
+	}
+	return
+}()
 
 // substrRange implements SQLite's substr(X,Y[,Z]) index algorithm (see
 // func.c's substrFunc), returning a 0-based [start, start+count) byte/rune

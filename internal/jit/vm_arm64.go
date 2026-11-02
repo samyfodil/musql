@@ -4,6 +4,7 @@ package jit
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 )
@@ -588,6 +589,7 @@ func isPoolArm(m Reg64) bool {
 }
 
 func (e *vmEmitArm) insn(pc int, in VInsn) error {
+	e.know.wrote(in, pc)
 	if ok, err := e.realInsn(pc, in); ok {
 		return err
 	}
@@ -607,6 +609,7 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		m := e.dest(pc, in.A, X10)
 		a.MovImm64(m, in.Imm)
 		e.storeInt(in, in.A, m)
+		e.know.konst[in.A] = in.Imm
 	case VCopy:
 		if in.Dead {
 			e.clobber(in.B)
@@ -696,6 +699,10 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		}
 		e.storeInt(in, in.C, x)
 	case VDiv, VRem:
+		if d, ok := e.know.konst[in.A]; ok && d >= 2 && d <= math.MaxInt32 {
+			e.divConst(pc, in, d)
+			break
+		}
 		y := e.src(pc, in.A, X10)
 		b := e.src(pc, in.B, X9)
 		if !in.Dead {
@@ -851,6 +858,13 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		a.B("dispatch")
 	case VColumn:
 		e.column(pc, in)
+	case VSubstr:
+		e.substr(pc, in)
+	case VTextCmpJump, VTextCmpSet:
+		if e.know.isInt[in.A] || e.know.isInt[in.B] {
+			return e.insn(pc, vmIntCmp(in))
+		}
+		e.textCmp(pc, in)
 	case VInSet:
 		e.inSet(pc, in)
 	case VResultRow:
