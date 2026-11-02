@@ -2278,10 +2278,12 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 					m.cursors[op.P1] = cur
 					break
 				}
-				m.cursors[op.P1] = m.openSlotFillCursor(op.P1, ds.tbl, func() ([][]Value, []int64, error) {
-					rows, err := m.runCTEOnce(slot, ds, dsPager)
-					return rows, nil, err
-				}, ds.keepSubtype)
+				m.cursors[op.P1] = m.openSlotFillCursor(op.P1, slot, ds, dsPager, func() func() ([][]Value, []int64, error) {
+					return func() ([][]Value, []int64, error) {
+						rows, err := m.runCTEOnce(slot, ds, dsPager)
+						return rows, nil, err
+					}
+				})
 				if !ds.lazy {
 					if ferr := m.cursors[op.P1].rewind(); ferr != nil {
 						return nil, ferr
@@ -2323,18 +2325,20 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				// Materialized on the first rewind, at the top of its own loop
 				// (vdbeCursor.fill).
 				slot, prog := op.P2, ds.prog
-				m.cursors[op.P1] = m.openSlotFillCursor(op.P1, ds.tbl, func() ([][]Value, []int64, error) {
-					if ds.stmtOnce || ds.cteOnce && m.stmtRoot().wctx == nil {
-						rows, err := m.runStmtOnce(slot, prog, srcPager)
+				m.cursors[op.P1] = m.openSlotFillCursor(op.P1, slot, ds, srcPager, func() func() ([][]Value, []int64, error) {
+					return func() ([][]Value, []int64, error) {
+						if ds.stmtOnce || ds.cteOnce && m.stmtRoot().wctx == nil {
+							rows, err := m.runStmtOnce(slot, prog, srcPager)
+							return rows, nil, err
+						}
+						if !prog.Correlated {
+							rows, err := m.runSubOnce(slot, prog, srcPager)
+							return rows, nil, err
+						}
+						rows, err := prog.execWithParent(m)
 						return rows, nil, err
 					}
-					if !prog.Correlated {
-						rows, err := m.runSubOnce(slot, prog, srcPager)
-						return rows, nil, err
-					}
-					rows, err := prog.execWithParent(m)
-					return rows, nil, err
-				}, ds.keepSubtype)
+				})
 				if !ds.lazy {
 					if ferr := m.cursors[op.P1].rewind(); ferr != nil {
 						return nil, ferr

@@ -220,6 +220,8 @@ type vdbeCursor struct {
 	// slotFill marks a cursor openSlotFillCursor made, which reopening its slot
 	// resets in place: nothing but the slot holds it.
 	slotFill bool
+	// slot is what a reopen of such a cursor keeps (openSlotFillCursor).
+	slot *slotFill
 
 	// sub, when non-nil, makes this a DERIVED-table cursor whose rows come from
 	// a co-routine (openStreamCursor, vdbe_stream.go) rather than a
@@ -670,14 +672,35 @@ func materializedRowids(n int, rowids []int64) []uint64 {
 // slot p, reusing the cursor p holds when it was one of these: a subroutine
 // that reads one again for every outer row (an EXISTS over it) allocated a
 // cursor each time.
-func (m *vdbe) openSlotFillCursor(p int, tbl *resolvedTable, fill func() ([][]Value, []int64, error), keep []bool) *vdbeCursor {
+//
+// A reopen by the same OpOpenDerived -- the same derived source and run-once
+// slot over the same pager -- keeps its fill function, made once (newFill),
+// and the rows that function last gave: a fill that gives the same rows again
+// skips the pass over them and keeps their rowids (rewind).
+func (m *vdbe) openSlotFillCursor(p, slot int, ds *derivedSource, pager *ReadOnlyPager, newFill func() func() ([][]Value, []int64, error)) *vdbeCursor {
 	if cur := m.cursors[p]; cur != nil && cur.slotFill {
-		*cur = vdbeCursor{tbl: tbl, fill: fill, clearSubtypes: true, fillKeep: keep, colMask: allColumns, pos: -1, slotFill: true}
+		sf := cur.slot
+		if sf.ds != ds || sf.slot != slot || sf.pager != pager {
+			*sf = slotFill{ds: ds, slot: slot, pager: pager, fill: newFill()}
+		}
+		*cur = vdbeCursor{tbl: ds.tbl, fill: sf.fill, clearSubtypes: true, fillKeep: ds.keepSubtype, colMask: allColumns, pos: -1, slotFill: true, slot: sf}
 		return cur
 	}
-	cur := openFillCursor(tbl, fill, true, keep)
-	cur.slotFill = true
+	sf := &slotFill{ds: ds, slot: slot, pager: pager, fill: newFill()}
+	cur := openFillCursor(ds.tbl, sf.fill, true, ds.keepSubtype)
+	cur.slotFill, cur.slot = true, sf
 	return cur
+}
+
+// slotFill is a slot-fill cursor's fill function, what it reads, and the rows
+// it last gave, as rewind left them.
+type slotFill struct {
+	ds    *derivedSource
+	slot  int
+	pager *ReadOnlyPager
+	fill  func() ([][]Value, []int64, error)
+	rows  [][]Value
+	ids   []uint64
 }
 
 // cursorHasNoBtree reports whether cur is a pre-materialized row source (a
@@ -832,13 +855,21 @@ func (cur *vdbeCursor) rewind() error {
 			return err
 		}
 		cur.streamErrPending = tail
-		if cur.clearSubtypes {
-			for _, row := range rows {
-				clearDerivedSubtypes(row, cur.fillKeep)
-				derivedRealAffinity(row, cur.tbl)
+		if sf := cur.slot; sf != nil && rowids == nil && len(rows) > 0 && len(rows) == len(sf.rows) && &rows[0] == &sf.rows[0] {
+			// The rows this slot's last fill gave, as it left them.
+			cur.rows, cur.rowids, cur.materialized = rows, sf.ids, true
+		} else {
+			if cur.clearSubtypes {
+				for _, row := range rows {
+					clearDerivedSubtypes(row, cur.fillKeep)
+					derivedRealAffinity(row, cur.tbl)
+				}
+			}
+			cur.rows, cur.rowids, cur.materialized = rows, materializedRowids(len(rows), rowids), true
+			if sf := cur.slot; sf != nil && rowids == nil {
+				sf.rows, sf.ids = rows, cur.rowids
 			}
 		}
-		cur.rows, cur.rowids, cur.materialized = rows, materializedRowids(len(rows), rowids), true
 	}
 	// A columnar view of this table, when one is attached, is served through
 	// ScanTable (segment_read.go) -- so the streaming b-tree cursor is declined
