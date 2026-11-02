@@ -2970,19 +2970,21 @@ func (c *compiler) compileUnary(x UnaryExpr) (int, error) {
 		c.emit(Instruction{Op: OpNot, P1: r, P2: d})
 		return d, nil
 	case "-":
-		// OpNegative reuses negateValueUnary (value_arith.go), so there is
-		// exactly ONE unary-minus semantics in this package, negative zero
-		// included. (An earlier
-		// "0 - X" OpSubtract codegen matched for every operand except -0.0,
-		// where "0 - 0.0" is +0.0 but SQLite's unary "-" yields -0.0; the read
-		// path's -0.0 == +0.0 comparison never caught it, but the write path's
-		// byte-exact stored double did.)
+		// C negates a numeric literal where it stands (codeInteger, codeReal:
+		// "-0.0" is -0.0) and compiles any other operand to 0 - X
+		// (sqlite3ExprCodeTarget's TK_UMINUS), which is +0.0 for a stored 0.0.
 		r, err := c.compileExpr(x.X)
 		if err != nil {
 			return 0, err
 		}
 		d := c.alloc()
-		c.emit(Instruction{Op: OpNegative, P1: r, P2: d})
+		if lit, ok := x.X.(LiteralExpr); ok && (lit.Val.Typ == Int || lit.Val.Typ == Float) {
+			c.emit(Instruction{Op: OpNegative, P1: r, P2: d})
+			return d, nil
+		}
+		zero := c.alloc()
+		c.emit(Instruction{Op: OpInteger, P1: 0, P2: zero})
+		c.emit(Instruction{Op: OpSubtract, P1: r, P2: zero, P3: d})
 		return d, nil
 	case "~":
 		// OpBitNot reuses bitNotValueUnary (value_arith.go), so there is

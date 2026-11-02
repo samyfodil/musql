@@ -118,6 +118,8 @@ var sqliteCompileOptionsPinned = map[string]string{
 	"OMIT_DEPRECATED":            "OMIT_DEPRECATED",
 	"THREADSAFE":                 "THREADSAFE=1",
 	"DEFAULT_WAL_SYNCHRONOUS":    "DEFAULT_WAL_SYNCHRONOUS=1",
+	// Both oracle builds are -tags sqlite_math_functions, as musql always is.
+	"ENABLE_MATH_FUNCTIONS": "ENABLE_MATH_FUNCTIONS",
 }
 
 // sqliteCompileOptionCatalogue is every option name sqlite3azCompileOpt[] can
