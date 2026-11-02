@@ -423,6 +423,7 @@ func (e *vmEmitWasm) openIf()  { e.w.op(opIf, opVoid); e.extra++ }
 func (e *vmEmitWasm) closeIf() { e.w.op(opEnd); e.extra-- }
 
 func (e *vmEmitWasm) insn(pc int, in VInsn) error {
+	e.know.wrote(in, pc)
 	w, L := e.w, e.lay
 	e.cur, e.extra = pc, 0
 	clear(e.zeroS)

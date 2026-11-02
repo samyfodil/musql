@@ -165,6 +165,33 @@ const (
 	VTextCmpSet
 )
 
+// sdivMagic is the multiplier m and shift s with which n/d, truncated, is
+// (mulhs(m, n) [+ n when m < 0]) >> s, plus 1 when n < 0 -- for a divisor
+// from 2 that is not a power of two (Hacker's Delight, 10-1).
+func sdivMagic(d int64) (m int64, s uint) {
+	const two63 = uint64(1) << 63
+	ad := uint64(d)
+	anc := two63 - 1 - two63%ad
+	p := 63
+	q1, r1 := two63/anc, two63-two63/anc*anc
+	q2, r2 := two63/ad, two63-two63/ad*ad
+	for {
+		p++
+		q1, r1 = 2*q1, 2*r1
+		if r1 >= anc {
+			q1, r1 = q1+1, r1-anc
+		}
+		q2, r2 = 2*q2, 2*r2
+		if r2 >= ad {
+			q2, r2 = q2+1, r2-ad
+		}
+		if delta := ad - r2; q1 > delta || q1 == delta && r1 != 0 {
+			break
+		}
+	}
+	return int64(q2 + 1), uint(p - 64)
+}
+
 // vmIntCmp is a VTextCmpJump or VTextCmpSet as the VCmpJump or VCmpSet it is
 // when an operand is known to be an INTEGER: the other must be one too.
 func vmIntCmp(in VInsn) VInsn {

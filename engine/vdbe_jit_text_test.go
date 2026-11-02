@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -70,19 +71,32 @@ SELECT s FROM x WHERE ind=0`,
 		queries = append(queries, fmt.Sprintf("SELECT id, substr(s, %d, 1) FROM t ORDER BY id", k))
 	}
 	queries = append(queries, "SELECT id, substr(s, 81, 1), substr(s, 82, 1) FROM t ORDER BY id")
-	run := func(enc string, jitOn bool) ([]string, int) {
+	for _, enc := range []string{"UTF-8", "UTF-16le"} {
+		db := append([]string{"PRAGMA encoding = '" + enc + "'"}, setup...)
+		if arms := vmJITOnOff(t, db, queries, jit.VSubstr, jit.VTextCmpJump, jit.VTextCmpSet); arms < len(queries) {
+			t.Fatalf("%s: %d TEXT arms over %d queries: the test checks little", enc, arms, len(queries))
+		}
+	}
+}
+
+// vmJITOnOff runs queries over a database made by setup with the VM JIT off
+// and then on, failing on any difference between the two or any error, and
+// returns how many of the queries' instructions lower to one of ops.
+func vmJITOnOff(t *testing.T, setup, queries []string, ops ...jit.VOp) int {
+	t.Helper()
+	run := func(jitOn bool) ([]string, int) {
 		old := vmJITEnabled
 		vmJITEnabled = jitOn
 		defer func() { vmJITEnabled = old }()
 		path := filepath.Join(t.TempDir(), "t.musq")
-		buildDB(t, path, append([]string{"PRAGMA encoding = '" + enc + "'"}, setup...)...)
+		buildDB(t, path, setup...)
 		p, err := Open(path)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer p.Close()
 		out := make([]string, len(queries))
-		arms := 0
+		lowered := 0
 		for i, q := range queries {
 			cols, rows, err := p.QueryArgs(q, nil)
 			if err != nil {
@@ -101,30 +115,48 @@ SELECT s FROM x WHERE ind=0`,
 			if stmt, err := ParseSelect(q); err == nil {
 				if prog, err := compileSelectScan(p, stmt, nil); err == nil {
 					for k := range prog.Insns {
-						switch lowerVM(&prog.Insns[k], prog.NReg).Op {
-						case jit.VSubstr, jit.VTextCmpJump, jit.VTextCmpSet:
-							arms++
+						if slices.Contains(ops, lowerVM(&prog.Insns[k], prog.NReg).Op) {
+							lowered++
 						}
 					}
 				}
 			}
 		}
-		return out, arms
+		return out, lowered
 	}
-	for _, enc := range []string{"UTF-8", "UTF-16le"} {
-		want, _ := run(enc, false)
-		got, arms := run(enc, true)
-		for i := range queries {
-			if want[i] != got[i] {
-				t.Fatalf("%s: JIT diverges on %s\nvdbe %.600s\njit  %.600s", enc, queries[i], want[i], got[i])
-			}
-			if strings.HasPrefix(got[i], "error: ") {
-				t.Fatalf("%s: %s: %s", enc, queries[i], got[i])
-			}
+	want, _ := run(false)
+	got, lowered := run(true)
+	for i := range queries {
+		if want[i] != got[i] {
+			t.Fatalf("JIT diverges on %s\nvdbe %.600s\njit  %.600s", queries[i], want[i], got[i])
 		}
-		if arms < len(queries) {
-			t.Fatalf("%s: %d TEXT arms over %d queries: the test checks little", enc, arms, len(queries))
+		if strings.HasPrefix(got[i], "error: ") {
+			t.Fatalf("%s: %s", queries[i], got[i])
 		}
-		t.Logf("%s: %d queries agree; %d TEXT arms", enc, len(queries), arms)
+	}
+	t.Logf("%d queries agree; %d instructions lowered", len(queries), lowered)
+	return lowered
+}
+
+// TestVMJITDivideByConstant: / and % by a constant answer with the VM JIT --
+// a multiply and shifts for a divisor from 2 -- as the VDBE answers them,
+// over the INTEGER edges and the values that exit.
+func TestVMJITDivideByConstant(t *testing.T) {
+	lowEntryThreshold(t)
+	if !vmJITEnabled {
+		t.Skip("no VM JIT on this platform")
+	}
+	vals := []string{"0", "1", "-1", "7", "-7", "26", "-27", "81", "-80", "9223372036854775807", "-9223372036854775808",
+		"-9223372036854775807", "123456789012345", "-98765432109876", "NULL", "2.5", "'12'", "'x'"}
+	setup := []string{`CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, x)`}
+	for k, v := range vals {
+		setup = append(setup, fmt.Sprintf("INSERT INTO t VALUES(%d, %s, %s)", k+1, v, vals[(k*5+3)%len(vals)]))
+	}
+	var queries []string
+	for _, d := range []string{"2", "3", "7", "9", "27", "64", "1000", "2147483647", "2147483648", "-3", "1", "0"} {
+		queries = append(queries, fmt.Sprintf("SELECT id, i / %[1]s, i %% %[1]s, x / %[1]s, x %% %[1]s, (i - 1) / %[1]s * %[1]s FROM t ORDER BY id", d))
+	}
+	if n := vmJITOnOff(t, setup, queries, jit.VDiv, jit.VRem); n < len(queries) {
+		t.Fatalf("%d divisions lowered over %d queries: the test checks little", n, len(queries))
 	}
 }
