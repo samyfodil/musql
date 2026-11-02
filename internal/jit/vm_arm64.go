@@ -459,6 +459,7 @@ func (e *vmEmitArm) clobber(r int) {
 	delete(e.know.isInt, r)
 	delete(e.know.canon, r)
 	delete(e.know.noS, r)
+	delete(e.know.isFloat, r)
 }
 
 func (e *vmEmitArm) nextUse(key, pc int) int { return vmEmitNextUse(e.prog, e.bound, key, pc) }

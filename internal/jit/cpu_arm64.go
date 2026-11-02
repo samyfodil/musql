@@ -23,3 +23,6 @@ func SetCPUForTest(fma, round bool) (restore func()) {
 	cpuFeat = cpuFeatures{fma: fma && old.fma, round: round && old.round}
 	return func() { cpuFeat = old }
 }
+
+// VMReal reports whether the VM JIT has its REAL arms (VReal to VMath).
+const VMReal = false

@@ -159,13 +159,14 @@ func (prog *Program) writeJIT() *vmJIT {
 }
 
 var valueLayout = jit.ValueLayout{
-	Size:    int(unsafe.Sizeof(Value{})),
-	OffTyp:  int(unsafe.Offsetof(Value{}.Typ)),
-	OffI:    int(unsafe.Offsetof(Value{}.I)),
-	OffF:    int(unsafe.Offsetof(Value{}.F)),
-	OffS:    int(unsafe.Offsetof(Value{}.S)),
-	TypNull: byte(Null),
-	TypInt:  byte(Int),
+	Size:     int(unsafe.Sizeof(Value{})),
+	OffTyp:   int(unsafe.Offsetof(Value{}.Typ)),
+	OffI:     int(unsafe.Offsetof(Value{}.I)),
+	OffF:     int(unsafe.Offsetof(Value{}.F)),
+	OffS:     int(unsafe.Offsetof(Value{}.S)),
+	TypNull:  byte(Null),
+	TypInt:   byte(Int),
+	TypFloat: byte(Float),
 }
 
 // compileVMJIT compiles prog, or returns nil: the JIT off, no emitter for this
@@ -184,8 +185,12 @@ func compileVMJIT(prog *Program) *vmJIT {
 	fusable := false
 	nParams := prog.jitParams()
 	ipk := writeCursorIPK(prog)
+	realVP, realOK := vmRealLowering(prog)
 	for pc := range prog.Insns {
 		vp[pc] = lowerVM(&prog.Insns[pc], prog.NReg)
+		if realOK != nil && realOK[pc] {
+			vp[pc] = realVP[pc]
+		}
 		switch in := &prog.Insns[pc]; {
 		case in.Op == OpVariable && in.P1 >= 1 && in.P1 <= nParams && in.P2 >= 0 && in.P2 < prog.NReg:
 			// A shallow copy of the parameter, from the register past NReg
