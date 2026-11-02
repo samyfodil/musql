@@ -219,7 +219,7 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 	if !p.segCleanFor(rootPage) {
 		// A REAL sum is rounded in row order, which the split does not keep:
 		// it runs the delta's rows after every segment's.
-		if low.fAcc {
+		if low.fAcc || low.distinctReal() {
 			return Value{}, false
 		}
 		if split, ok = p.segs.deltaSplitFor(rootPage, segs, low, ipkCol); !ok {
@@ -245,8 +245,14 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 	}
 	results := make([]segResult, nSlots)
 	// A DISTINCT aggregate's values go into one set when the runs take turns,
-	// and into a set per run, joined at the end, when they run at once.
-	if low.distinct {
+	// and into a set per run, joined at the end, when they run at once. REALs
+	// are taken in row order, the runs taking turns.
+	if low.distinctReal() {
+		rd := &segRealDistinct{}
+		for i := range results {
+			results[i].real = rd
+		}
+	} else if low.distinct {
 		var shared *int64Set
 		if segWorkers <= 1 || len(low.blocks) > 0 {
 			shared = &int64Set{}
@@ -270,7 +276,7 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 	// the interpreter shares its registers: their segments run one at a time.
 	var svc *segSvcRunner
 	each := segEach
-	if len(low.blocks) > 0 || low.fAcc {
+	if len(low.blocks) > 0 || low.fAcc || low.distinctReal() {
 		if len(low.blocks) > 0 {
 			svc = newSegSvcRunner(m, tbl)
 		}
@@ -409,7 +415,7 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 				}
 				if low.distinct {
 					res.ovf = res.ovf || ovf != 0
-					res.set.addAll(vals[:out])
+					res.addDistinct(vals[:out])
 					start = end + 1
 					continue
 				}
@@ -437,6 +443,9 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 // segProgAnswer folds the runs' results, in row order, into the aggregate's
 // value.
 func segProgAnswer(low *segLowered, results []segRunResult, facc [2]float64) (Value, bool) {
+	if low.distinct && len(results) > 0 && results[0].real != nil {
+		return results[0].real.answer(low.agg, results)
+	}
 	if low.distinct {
 		return segDistinctAnswer(low.agg, results)
 	}
@@ -555,6 +564,59 @@ type segRunResult struct {
 	ovf       bool
 	empty     bool
 	set       *int64Set
+	real      *segRealDistinct
+}
+
+// addDistinct takes the values a DISTINCT aggregate's run handed back.
+func (r *segRunResult) addDistinct(vals []int64) {
+	if r.real != nil {
+		r.real.add(vals)
+		return
+	}
+	r.set.addAll(vals)
+}
+
+// distinctReal reports whether low hands back REALs for a DISTINCT
+// aggregate, which segRealDistinct takes in row order.
+func (l *segLowered) distinctReal() bool { return l.distinct && l.real[l.sumReg] }
+
+// segRealDistinct is a DISTINCT aggregate over REALs: the values the runs
+// hand back, taken in row order, each the first time it is seen (-0.0 and
+// 0.0 are one value, a NULL none), and summed as sumStep sums them.
+type segRealDistinct struct {
+	seen int64Set
+	it   aggItem
+}
+
+func (d *segRealDistinct) add(vals []int64) {
+	for i, b := range vals {
+		f := math.Float64frombits(uint64(b))
+		if f != f || i > 0 && b == vals[i-1] {
+			continue
+		}
+		key := b
+		if f == 0 {
+			key = 0
+		}
+		if d.seen.insert(key) {
+			d.it.cnt++
+			d.it.kbnStep(f)
+		}
+	}
+}
+
+// answer is the aggregate over the values taken, or false when a run
+// overflowed.
+func (d *segRealDistinct) answer(agg aggKind, results []segRunResult) (Value, bool) {
+	for _, r := range results {
+		if r.ovf {
+			return Value{}, false
+		}
+	}
+	if agg == aggCount {
+		return Value{Typ: Int, I: d.it.cnt}, true
+	}
+	return segFloatAnswer(agg, d.it.cnt, [2]float64{d.it.rSum, d.it.rErr}), true
 }
 
 // segDistinctAnswer finishes a DISTINCT count, sum, total or avg from the
@@ -768,7 +830,7 @@ func (sp *segDeltaSplit) runDelta(kern *jit.Code, low *segLowered, regs []int64,
 		return false
 	}
 	if low.distinct {
-		res.set.addAll(vals[:out])
+		res.addDistinct(vals[:out])
 	}
 	res.out, res.ovf = out, ovf != 0
 	if low.agg != aggCountStar && low.agg != aggCount {

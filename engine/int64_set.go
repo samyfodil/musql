@@ -20,6 +20,31 @@ func (s *int64Set) add(v int64) {
 	s.put(v)
 }
 
+// reserve sizes the table for n values, so filling it rehashes nothing.
+func (s *int64Set) reserve(n int) {
+	size := 16
+	for size < 2*n {
+		size *= 2
+	}
+	if size > len(s.slots) {
+		old := s.slots
+		s.slots = make([]int64, size)
+		s.n = 0
+		for _, v := range old {
+			if v != 0 {
+				s.put(v)
+			}
+		}
+	}
+}
+
+// insert adds v and reports whether it was not in the set before.
+func (s *int64Set) insert(v int64) bool {
+	n, zero := s.n, s.zero
+	s.add(v)
+	return s.n != n || s.zero != zero
+}
+
 // put places v, which is not zero, in a table with room for it.
 func (s *int64Set) put(v int64) {
 	mask := uint64(len(s.slots) - 1)

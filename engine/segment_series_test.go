@@ -1,8 +1,11 @@
 package engine
 
 import (
+	"math"
 	"path/filepath"
 	"testing"
+
+	"github.com/samyfodil/musql/internal/fir"
 )
 
 // TestSeriesProgramsMatchTheLoop holds the compiled program over
@@ -45,7 +48,10 @@ func TestSeriesProgramsMatchTheLoop(t *testing.T) {
 		{`SELECT sum(value) FROM generate_series(9223372036854775000, 9223372036854775807)`, nil, -1},
 		{`SELECT sum(value / 1.5), max(sqrt(value)), total(value * 0.25) FROM generate_series(1, 100000)`, nil, 1},
 		{`SELECT sum(round(value / 1.5)), sum(ln(value - 50000)) FROM generate_series(1, 100000)`, nil, 1},
-		{`SELECT sum(DISTINCT round(value / 1.5)) FROM generate_series(1, 20000)`, nil, 0},
+		{`SELECT sum(DISTINCT round(value / 1.5)), count(DISTINCT round(value / 1.5)) FROM generate_series(1, 100000)`, nil, 1},
+		{`SELECT count(DISTINCT value % 10), sum(DISTINCT value / 3), avg(DISTINCT value % 1000), total(DISTINCT value % 7) FROM generate_series(1, 100000)`, nil, 1},
+		{`SELECT count(DISTINCT ln(value % 100)), sum(DISTINCT ln(value % 100)), avg(DISTINCT ln(value - 50)) FROM generate_series(1, 30000)`, nil, 1},
+		{`SELECT sum(DISTINCT (0.5 - value % 2) * 0.0), total(DISTINCT (value % 2 - 0.5) * 0.0), count(DISTINCT (value % 2 - 0.5) * 0.0) FROM generate_series(1, 1000)`, nil, 1},
 		{`SELECT count(*) FROM generate_series(1, 200000) WHERE value IN (3, 5, 70000)`, nil, 0},
 		{`SELECT sum(start), sum(stop), sum(step), count(*) FROM generate_series(1, 100000, 7) WHERE value > start + 5`, nil, 1},
 		{`SELECT sum(length(value)), sum(length(start)) FROM generate_series(1, 100000)`, nil, 0},
@@ -73,5 +79,34 @@ func TestSeriesProgramsMatchTheLoop(t *testing.T) {
 		if JITEnabled() && c.served == -1 && served != 0 {
 			t.Errorf("%s %v: served, but should decline", c.sql, c.args)
 		}
+	}
+}
+
+// The round() kernel is fnRound with no digits, to the bit: halves, the
+// sums that round up on their own, -0.0 and +0.0, and the edges of 2^52.
+func TestRoundKernelIsFnRound(t *testing.T) {
+	f := buildSegRoundKernel()
+	if f == nil {
+		t.Fatal("no round kernel")
+	}
+	xs := []float64{0, math.Copysign(0, -1), 0.5, -0.5, 1.5, -1.5, 2.5, -2.5, 0.49999999999999994, -0.49999999999999994,
+		0.3, -0.3, 1e-300, -1e-300, 123456.5, -123456.5, 4503599627370495.5, -4503599627370495.5, 4503599627370496,
+		-4503599627370496, 4503599627370497, 9007199254740993, -9007199254740993, 1e300, -1e300,
+		math.Inf(1), math.Inf(-1), math.MaxFloat64, -math.MaxFloat64, 5e-324}
+	for i := range 20000 {
+		xs = append(xs, (float64(i)-10000)*0.37+float64(i%7)*0.5, math.Ldexp(1+float64(i)/20000, i%60-5))
+	}
+	for _, x := range xs {
+		want, err := fnRound([]Value{{Typ: Float, F: x}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, exited := fir.Eval(f, x)
+		if exited || math.Float64bits(got) != math.Float64bits(want.F) {
+			t.Errorf("round(%v): kernel %v (%x), fnRound %v (%x)", x, got, math.Float64bits(got), want.F, math.Float64bits(want.F))
+		}
+	}
+	if got, _ := fir.Eval(f, math.NaN()); got == got {
+		t.Error("round(NULL) is not NULL")
 	}
 }

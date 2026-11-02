@@ -167,11 +167,8 @@ func (src *segProgSource) lower(kinds *segKinds) ([]*segLowered, bool) {
 		switch {
 		case a.distinct && a.kind != aggMin && a.kind != aggMax:
 			// The distinct values are found in Go from the arguments the
-			// program hands back (segDistinctAnswer), as integers. A DISTINCT
-			// min or max is the plain one.
-			if isReal {
-				return nil, false
-			}
+			// program hands back (segDistinctAnswer, segRealDistinct). A
+			// DISTINCT min or max is the plain one.
 			low.nRegs--
 			low.distinct = true
 			low.add(jit.ProgInsn{Op: jit.POpEmitVal, A: argReg})
@@ -197,7 +194,7 @@ func (src *segProgSource) lower(kinds *segKinds) ([]*segLowered, bool) {
 		default:
 			low.add(jit.ProgInsn{Op: jit.POpAccSum, A: argReg, B: rowsReg})
 		}
-		low.fAcc = isReal && a.kind != aggCount
+		low.fAcc = isReal && a.kind != aggCount && !low.distinct
 		if tv := low.textVar; tv != nil {
 			// The same accumulate, on the same registers, in the text variant;
 			// its own row counter sits past its own registers.

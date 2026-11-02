@@ -105,6 +105,22 @@ func (m *vdbe) segRunSeriesOne(cur *vdbeCursor, sr *seriesCursor, low *segLowere
 			return Value{Typ: Int, I: v[col]}
 		}
 	}
+	// A DISTINCT aggregate's values come back through Sel, into one set.
+	var set *int64Set
+	var rd *segRealDistinct
+	var vals []int64
+	if low.distinct {
+		vals = make([]int64, bufN)
+		// Sized for every value up to a million, as a series of distinct
+		// values needs.
+		if low.distinctReal() {
+			rd = &segRealDistinct{}
+			rd.seen.reserve(int(min(sr.count, 1<<20)))
+		} else {
+			set = &int64Set{}
+			set.reserve(int(min(sr.count, 1<<20)))
+		}
+	}
 	results := make([]segRunResult, 0, sr.count/seriesBlockRows+1)
 	v := sr.value
 	for done := uint64(0); done < sr.count; {
@@ -120,12 +136,18 @@ func (m *vdbe) segRunSeriesOne(cur *vdbeCursor, sr *seriesCursor, low *segLowere
 		for i, b := range blocks {
 			args.Col[i] = &b[0]
 		}
+		if low.distinct {
+			args.Sel = &vals[0]
+		}
 		if !segCallKernel(kern, args, svc, low.blocks, nil, local) {
 			return Value{}, false
 		}
 		facc = args.FAcc
-		res := segRunResult{out: out, ovf: ovf != 0}
-		if low.agg != aggCountStar && low.agg != aggCount {
+		res := segRunResult{out: out, ovf: ovf != 0, set: set, real: rd}
+		switch {
+		case low.distinct:
+			res.addDistinct(vals[:out])
+		case low.agg != aggCountStar && low.agg != aggCount:
 			res.rows = local[low.rowsReg]
 		}
 		results = append(results, res)
