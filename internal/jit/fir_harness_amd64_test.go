@@ -61,3 +61,6 @@ func firLoop(f *fir.Func, budget int) (*Code, error) {
 const firFMod = true
 
 func firFModExits(float64, float64) bool { return false }
+
+// firRoundOptional is whether a CPU can lack the rounding instructions.
+const firRoundOptional = true

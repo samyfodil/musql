@@ -171,6 +171,7 @@ type vmEmitWasm struct {
 	curs, rowp, valp uint32 // the cursor table, a row's header, its first Value (when the program has cursor ops)
 	keyp, keyq       uint32 // VInSet's search: the candidate key and the halfway one
 	txa, txb         uint32 // the TEXT arms' byte addresses
+	f0, f1, fr       uint32 // the REAL arms' scratch (vm_real_wasm.go's flocals)
 	cur              int    // the pc whose code is being emitted
 	extra            int    // if-blocks opened inside it
 
@@ -333,6 +334,7 @@ func (e *vmEmitWasm) forgetReg(reg int) {
 	delete(e.know.isInt, reg)
 	delete(e.know.canon, reg)
 	delete(e.know.noS, reg)
+	delete(e.know.isFloat, reg)
 }
 
 // storeInt is writeInt for in's destination: nothing for a Dead store, only
@@ -466,10 +468,13 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		}
 		e.clearS(in.B)
 		if in.A != in.B {
-			isInt := e.know.isInt[in.A]
+			isInt, isFloat := e.know.isInt[in.A], e.know.isFloat[in.A]
 			e.know.wroteAny(in.B, true)
 			if isInt {
 				e.know.isInt[in.B] = true
+			}
+			if isFloat {
+				e.know.isFloat[in.B] = true
 			}
 		}
 	case VAdd, VSub, VMul, VAnd, VOr:
@@ -726,6 +731,8 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 			w.StoreI64(e.addr(in.C, f))
 		})
 		e.know.wroteAny(in.C, false)
+	case VReal, VFAdd, VFSub, VFMul, VFDiv, VFCmpJump, VFCmpSet, VFCmpBr, VMath:
+		return e.realInsn(pc, in)
 	case VSubstr:
 		e.substr(pc, in)
 	case VTextCmpJump, VTextCmpSet:

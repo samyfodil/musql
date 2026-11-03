@@ -1,4 +1,4 @@
-//go:build (amd64 || arm64) && (unix || windows)
+//go:build ((amd64 || arm64) && (unix || windows)) || js
 
 package jit
 
@@ -167,7 +167,11 @@ func TestKernelOKRefusesMissingFeatures(t *testing.T) {
 	}
 	restore := SetCPUForTest(false, false)
 	defer restore()
-	for name, f := range map[string]*fir.Func{"fma": fma, "round": round, "fused": fused} {
+	refused := map[string]*fir.Func{"fma": fma, "fused": fused}
+	if firRoundOptional {
+		refused["round"] = round
+	}
+	for name, f := range refused {
 		if KernelOK(f) {
 			t.Errorf("%s: accepted without the instruction", name)
 		}

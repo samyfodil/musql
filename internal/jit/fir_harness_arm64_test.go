@@ -71,3 +71,6 @@ func firFModExits(x, y float64) bool {
 	ax, ay := math.Abs(x), math.Abs(y)
 	return !(ax < ay) && !(ax/ay < 1<<53)
 }
+
+// firRoundOptional is whether a CPU can lack the rounding instructions.
+const firRoundOptional = true
