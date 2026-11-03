@@ -7,6 +7,15 @@ package engine
 
 // segOrderPeephole rewrites prog when it is an ORDER BY ... LIMIT over a table
 // whose key and output columns are all plain integers. Reports whether it did.
+//
+//	Init; SorterOpen s (bounded); OpenRead c; <prologue>; Rewind c -> close
+//	top:   Column c.x -> r; [SCopy r -> r'] ...  keys, then outputs
+//	       [SorterCheck s]; MakeRecord base n -> rec; SorterInsert s rec
+//	       Next c -> top
+//	close: Close c; <drain: limit, [offset], SorterSort s ... ResultRow ...>; Halt
+//
+// It puts OpSegOrderLimit after the OpenRead, shifting the jumps after it by
+// one, and appends the loop that hands out the rows it kept (OpSegEmitRow).
 func segOrderPeephole(prog *Program) bool {
 	if !jitEnabled || prog == nil {
 		return false

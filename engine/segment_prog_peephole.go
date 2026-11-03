@@ -244,6 +244,15 @@ func segPlanAggs(plan *aggPlan, n, scopes int) []*aggItem {
 }
 
 // segProgPeephole rewrites prog when its scan loop lowers to the program JIT.
+//
+//	Init; AggReset; OpenRead c (or generate_series); <prologue>; Rewind c -> close
+//	top:   <any body segment_lower.go lowers>; AggStep
+//	       Next c -> top
+//	close: Close c; AggResult ... (one per output); ResultRow dst n; Halt
+//
+// Unlike the fixed-shape recognisers it moves nothing: the Rewind becomes a
+// Goto to an appended block holding the OpSegProgram guard, the Rewind
+// itself and a Goto back (see the comment at the rewrite).
 func segProgPeephole(prog *Program) bool {
 	if !jitEnabled || !jit.Available || prog == nil {
 		return false

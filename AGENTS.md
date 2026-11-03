@@ -80,6 +80,9 @@ The segment file carries its format version (`segFileVersion` in
 
 ## Layout
 
+[docs/architecture.md](docs/architecture.md) follows one query through these,
+file by file.
+
 | Path | What it is |
 | --- | --- |
 | `engine/` | The database: format (`segment_*.go`), build/read API for converters (`build.go`, `read_view.go`), parser, VDBE (`vdbe*.go`), write path, triggers, FTS3/4/5, rtree, JSON. |
