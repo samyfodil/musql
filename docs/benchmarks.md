@@ -195,7 +195,8 @@ Run with `MUSQL_WORKERS=4` for the four-worker column.
 ## Reported queries (issues #69 to #74)
 
 The queries users reported as slow in issues #69 to #74, as they wrote them,
-after #89. All were measured on one Apple M4, in the same hour. musql runs
+after #89, and the sudoku's after #91 too. Each was measured on one Apple M4,
+musql and C SQLite in the same hour: the sudoku rows again for #91. musql runs
 through `database/sql`, best of three. C SQLite is the macOS `sqlite3` 3.51
 shell with `.timer on`, best of three. "Before" is main just before #89.
 
@@ -224,16 +225,16 @@ the ones in #70 and #74, each with its digits from a recursive CTE, `VALUES` or
 | #72 | `select sum(distinct round(value/1.5))from generate_series(1,10000)` | 1.7 ms | 0.1 ms | 0.7 ms [1] |
 | #72 | the same over `generate_series(1,100000)` | 15.1 ms | 1.0 ms | 7 ms |
 | #72 | the same over `generate_series(1,1000000)` | 162.3 ms | 12.2 ms | 68 ms |
-| #74 | sudoku, digits from a recursive CTE | 88.8 ms | 18.5 ms | 38 ms |
-| #74 | sudoku, digits from `VALUES` | 100.2 ms | 18.7 ms | 35 ms |
-| #74 | sudoku, digits from `generate_series` | 92.1 ms | 18.5 ms | 40 ms |
-| #70 | the harder sudoku | 7.33 s | 1.48 s | 2.88 s |
+| #74 | sudoku, digits from a recursive CTE | 88.8 ms | 12.0 ms | 36 ms |
+| #74 | sudoku, digits from `VALUES` | 100.2 ms | 12.1 ms | 36 ms |
+| #74 | sudoku, digits from `generate_series` | 92.1 ms | 12.0 ms | 43 ms |
+| #70 | the harder sudoku | 7.33 s | 0.95 s | 3.09 s |
 
 [1] The shell's 1 ms timer reads 0 for one run of this query. Its time is from
 1,000 runs, less the shell's own cost per statement.
 
-On the Xeon D the sudoku takes about 70 ms against C SQLite's 99 ms (mattn), and
-the harder one 5.9 s against 7.9 s.
+On the Xeon D the sudoku takes about 55 ms against C SQLite's 99 ms (mattn), and
+the harder one 4.3 s against 7.9 s.
 
 ## Bulk load and point reads
 

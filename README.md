@@ -215,8 +215,8 @@ returning the exact top 10, and every `vec1` index beats C SQLite's. See
 
 Queries users reported as slow (issues #69 to #74) now beat C SQLite too. They
 cover `generate_series`, a sudoku solved by a recursive CTE, `GROUP BY` an
-expression, and `sum(DISTINCT ...)`. On an Apple M4, the sudoku takes 18.5 ms
-against C SQLite's 38 ms, and `GROUP BY a+1` over 10M rows 20 ms against 1.67 s.
+expression, and `sum(DISTINCT ...)`. On an Apple M4, the sudoku takes 12 ms
+against C SQLite's 36 ms, and `GROUP BY a+1` over 10M rows 20 ms against 1.67 s.
 
 [docs/benchmarks.md](docs/benchmarks.md) has:
 
