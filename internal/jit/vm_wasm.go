@@ -100,7 +100,7 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 		e.txa, e.txb = w.Local(wI32), w.Local(wI32)
 	}
 	for _, in := range prog {
-		if in.Op == VColumn || in.Op == VNext || in.Op == VRewind || in.Op == VRowid {
+		if in.Op == VColumn || in.Op == VNext || in.Op == VRewind || in.Op == VRowid || in.Op == VOpen || in.Op == VClose {
 			e.curs, e.rowp, e.valp = w.Local(wI32), w.Local(wI32), w.Local(wI32)
 			w.LoadPtr(POffCur)
 			w.Set(e.curs)
@@ -773,6 +773,29 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		w.LoadI64(0)
 		w.Set(e.t1)
 		e.storeInt(in, in.C, e.t1)
+	case VOpen, VClose:
+		cb := uint32(in.A * VCursorSize)
+		w.Get(e.curs)
+		w.LoadI64(cb + VCursorOffReop)
+		w.op(opI64Eqz)
+		e.exitIf(pc)
+		set := func(off uint32, v int64) {
+			w.Get(e.curs)
+			w.I64(v)
+			w.StoreI64(cb + off)
+		}
+		if in.Op == VOpen {
+			w.Get(e.curs)
+			w.Get(e.curs)
+			w.LoadI64(cb + VCursorOffN)
+			w.StoreI64(cb + VCursorOffPos)
+			set(VCursorOffLast, -1)
+			set(VCursorOffOk, 1)
+			set(VCursorOffState, 1)
+		} else {
+			set(VCursorOffOk, 0)
+		}
+		set(VCursorOffDirty, 1)
 	case VRewind:
 		cb := uint32(in.A * VCursorSize)
 		w.Get(e.curs)

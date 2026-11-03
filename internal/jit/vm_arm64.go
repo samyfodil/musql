@@ -935,6 +935,24 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		e.strAt(X10, X9, cb+VCursorOffLast)
 		e.jmpBlock(pc, in.T)
 		a.Label(done)
+	case VOpen, VClose:
+		e.unmap(^in.A)
+		cb := in.A * VCursorSize
+		a.LdrImm(X9, X0, POffCur)
+		e.ldrAt(X10, X9, cb+VCursorOffReop)
+		a.Cbz(X10, e.stub(pc))
+		a.MovImm16(X11, 1)
+		if in.Op == VOpen {
+			e.ldrAt(X10, X9, cb+VCursorOffN)
+			e.strAt(X10, X9, cb+VCursorOffPos)
+			a.MovImm64(X10, -1)
+			e.strAt(X10, X9, cb+VCursorOffLast)
+			e.strAt(X11, X9, cb+VCursorOffOk)
+			e.strAt(X11, X9, cb+VCursorOffState)
+		} else {
+			e.strAt(xzr, X9, cb+VCursorOffOk)
+		}
+		e.strAt(X11, X9, cb+VCursorOffDirty)
 	default:
 		return fmt.Errorf("unknown VM op %d", in.Op)
 	}

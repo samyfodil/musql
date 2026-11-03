@@ -54,6 +54,8 @@ func TestVCursorLayout(t *testing.T) {
 		{"Adv", unsafe.Offsetof(c.Adv), VCursorOffAdv},
 		{"Mask", unsafe.Offsetof(c.Mask), VCursorOffMask},
 		{"Rowids", unsafe.Offsetof(c.Rowids), VCursorOffRids},
+		{"Reopen", unsafe.Offsetof(c.Reopen), VCursorOffReop},
+		{"State", unsafe.Offsetof(c.State), VCursorOffState},
 	} {
 		if f.got != f.want {
 			t.Errorf("VCursor %s is %d, generated code uses %d", f.name, f.got, f.want)
@@ -300,6 +302,60 @@ func TestVMCursorColumnAndNext(t *testing.T) {
 		cur.Rewind = 0 // readable and advanceable, but a rewind builds rows
 		if pc := runVMCursor(t, prog, newRegs(), rows, cur, 0); pc != 0 || cur.Pos != 1 || cur.Dirty != 0 {
 			t.Fatalf("re-seeking: pc %d pos %d dirty %d, want the cursor untouched at pc 0", pc, cur.Pos, cur.Dirty)
+		}
+	})
+	t.Run("open and close", func(t *testing.T) {
+		// Three times over: open, sum column 0 into r2, close.
+		prog := []VInsn{
+			{Op: VInt, A: 3, Imm: 3},
+			{Op: VOpen, A: 0},
+			{Op: VRewind, A: 0, T: 6},
+			{Op: VColumn, A: 0, B: 0, C: 0},
+			{Op: VAdd, A: 0, B: 2, C: 2},
+			{Op: VNext, A: 0, T: 3},
+			{Op: VClose, A: 0},
+			{Op: VInt, A: 1, Imm: 1},
+			{Op: VSub, A: 1, B: 3, C: 3},
+			{Op: VIf, A: 3, T: 1, Imm: 1},
+			{Op: VExit},
+		}
+		rows := newRows(4)
+		regs := newRegs()
+		cur := cursor(rows, 2)
+		cur.Ok, cur.Reopen = 0, 1 // closed, and reopened over rows
+		if pc := runVMCursor(t, prog, regs, rows, cur, 0); pc != 10 || regs[2].I != 3*6 {
+			t.Fatalf("pc %d sum %d, want 10, 18", pc, regs[2].I)
+		}
+		if cur.Ok != 0 || cur.State != 1 || cur.Dirty != 1 || cur.Pos != 4 || cur.Last != 3 {
+			t.Fatalf("cursor ok %d state %d dirty %d pos %d last %d, want 0, 1, 1, 4, 3", cur.Ok, cur.State, cur.Dirty, cur.Pos, cur.Last)
+		}
+		// Stopped between the open and the rewind: open, on no row, and a
+		// next falls through.
+		regs, cur = newRegs(), cursor(rows, 2)
+		cur.Ok, cur.Reopen = 0, 1
+		if pc := runVMCursor(t, []VInsn{{Op: VOpen, A: 0}, {Op: VExit}}, regs, rows, cur, 0); pc != 1 ||
+			cur.Ok != 1 || cur.State != 1 || cur.Pos != 4 || cur.Last != -1 || cur.Dirty != 1 {
+			t.Fatalf("pc %d ok %d state %d pos %d last %d dirty %d, want 1, 1, 1, 4, -1, 1", pc, cur.Ok, cur.State, cur.Pos, cur.Last, cur.Dirty)
+		}
+		cur = cursor(rows, 2)
+		cur.Ok, cur.Reopen = 0, 1
+		if pc := runVMCursor(t, []VInsn{{Op: VOpen, A: 0}, {Op: VNext, A: 0, T: 3}, {Op: VExit}, {Op: VExit}}, newRegs(), rows, cur, 0); pc != 2 || cur.Last != -1 {
+			t.Fatalf("next after open: pc %d last %d, want 2, -1", pc, cur.Last)
+		}
+		// A close alone.
+		cur = cursor(rows, 2)
+		cur.Reopen = 1
+		if pc := runVMCursor(t, []VInsn{{Op: VClose, A: 0}, {Op: VExit}}, newRegs(), rows, cur, 0); pc != 1 || cur.Ok != 0 || cur.State != 0 || cur.Dirty != 1 {
+			t.Fatalf("close: pc %d ok %d state %d dirty %d, want 1, 0, 0, 1", pc, cur.Ok, cur.State, cur.Dirty)
+		}
+		// A cursor the engine has not said may be reopened: both exit with it
+		// untouched.
+		for _, op := range []VOp{VOpen, VClose} {
+			cur = cursor(rows, 2)
+			if pc := runVMCursor(t, []VInsn{{Op: op, A: 0}, {Op: VExit}}, newRegs(), rows, cur, 0); pc != 0 ||
+				cur.Ok != 1 || cur.State != 0 || cur.Pos != 2 || cur.Dirty != 0 {
+				t.Fatalf("op %d: pc %d ok %d state %d pos %d dirty %d, want the cursor untouched at pc 0", op, pc, cur.Ok, cur.State, cur.Pos, cur.Dirty)
+			}
 		}
 	})
 }

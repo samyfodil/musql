@@ -164,6 +164,17 @@ const (
 	// those converted.
 	VTextCmpJump
 	VTextCmpSet
+
+	// ---- Cursor lifetime.
+
+	// VOpen: reopen cursor A over Rows, on no row until a VRewind (Pos is
+	// N, so a VNext falls through as the VDBE's advance of an unfilled cursor
+	// does). Only a cursor whose VCursor.Reopen the engine set; any other
+	// exits.
+	VOpen
+	// VClose: close cursor A (Ok zero), when VCursor.Reopen is set; any other
+	// exits.
+	VClose
 )
 
 // sdivMagic is the multiplier m and shift s with which n/d, truncated, is
@@ -259,10 +270,17 @@ type VCursor struct {
 	// Rowids is the first element of the cursor's []uint64 of rowids, one per
 	// row, or nil: VRowid exits.
 	Rowids unsafe.Pointer
+	// Reopen is non-zero when an open of the cursor (VOpen) would give it
+	// Rows again, so native code may close and reopen it: Rows, N, Rowids and
+	// Mask are then the reopened cursor's even while it is closed (Ok zero).
+	// The engine's value says what state it handed the cursor over in.
+	Reopen int64
+	// State is 1 once native code has reopened the cursor (VOpen).
+	State int64
 }
 
 const (
-	VCursorSize     = 80
+	VCursorSize     = 96
 	VCursorOffRows  = 0
 	VCursorOffN     = 8
 	VCursorOffPos   = 16
@@ -273,6 +291,8 @@ const (
 	VCursorOffAdv   = 56
 	VCursorOffMask  = 64
 	VCursorOffRids  = 72
+	VCursorOffReop  = 80
+	VCursorOffState = 88
 	// sliceHeaderSize is the size of a []Value header in the rows array.
 	sliceHeaderSize = 24
 )
