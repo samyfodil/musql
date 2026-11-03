@@ -62,5 +62,9 @@ const firFMod = true
 
 func firFModExits(float64, float64) bool { return false }
 
-// firRoundOptional is whether a CPU can lack the rounding instructions.
-const firRoundOptional = true
+// firFeaturesOptional is whether a CPU can lack the fma or the rounding
+// instructions.
+const firFeaturesOptional = true
+
+// firExitsMore is whether this backend leaves to Go inputs fir.Eval answers.
+const firExitsMore = false

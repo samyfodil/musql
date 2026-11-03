@@ -172,6 +172,9 @@ func TestFirRandomKernels(t *testing.T) {
 		got, exited := runFir(code, xs, ys)
 		for i := range xs {
 			want, wantExit := fir.Eval(f, xs[i], ys[i])
+			if exited[i] && !wantExit && firExitsMore {
+				continue
+			}
 			same := math.Float64bits(got[i]) == math.Float64bits(want) || (got[i] != got[i] && want != want)
 			if exited[i] != wantExit || (!wantExit && !same) {
 				t.Fatalf("kernel %d (env %d) on (%v, %v): machine code %v (exit %v), Eval %v (exit %v)\n%v",

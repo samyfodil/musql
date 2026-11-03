@@ -8,9 +8,9 @@ import (
 	"github.com/samyfodil/musql/internal/fir"
 )
 
-// cpuFeat is what the kernel tests ask of the CPU: wasm rounds, and has no
-// fma.
-var cpuFeat = struct{ fma, round bool }{round: true}
+// cpuFeat is what the kernel tests ask of the CPU: wasm rounds, and fma is
+// computed from doubles.
+var cpuFeat = struct{ fma, round bool }{fma: true, round: true}
 
 // firBudgets: wasm keeps every value in a local, so there is one budget.
 var firBudgets = []struct{}{{}}
@@ -73,9 +73,18 @@ func firLoop(f *fir.Func, _ int) (*Code, error) {
 // firFMod is whether this backend computes every fir.OpFMod itself.
 const firFMod = false
 
-// firFModExits is whether this backend's fmod leaves (x, y) to Go: all but
-// |x| < |y|.
-func firFModExits(x, y float64) bool { return !(math.Abs(x) < math.Abs(y)) }
+// firFModExits is whether this backend's fmod leaves (x, y) to Go: unless
+// |x| < |y|, a quotient |x/y| not below 2^53, which includes an infinity, a
+// zero divisor and a NaN. Its fma may leave more (firExitsMore).
+func firFModExits(x, y float64) bool {
+	ax, ay := math.Abs(x), math.Abs(y)
+	return !(ax < ay) && !(ax/ay < 1<<53)
+}
 
-// firRoundOptional is whether a CPU can lack the rounding instructions.
-const firRoundOptional = false
+// firFeaturesOptional is whether a CPU can lack the fma or the rounding
+// instructions.
+const firFeaturesOptional = false
+
+// firExitsMore is whether this backend leaves to Go inputs fir.Eval answers:
+// those where its fma could overflow or underflow.
+const firExitsMore = true

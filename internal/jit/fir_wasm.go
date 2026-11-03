@@ -9,9 +9,10 @@ import (
 
 // A math kernel (internal/fir) in wasm. Wasm is a stack machine with typed
 // locals, so there is nothing to allocate: each value is a local of its
-// class, f64 or i64, and a constant is pushed at each use. Every op fir has
-// is one wasm instruction, but for fma, which wasm lacks: a kernel with an
-// FMA, or a fused multiply-add, is refused, and fmod answers only |x| < |y|.
+// class, f64 or i64, and a constant is pushed at each use. Nearly every op
+// fir has is one wasm instruction. Wasm has no fma, so fma is computed
+// exactly from doubles (firWasm.fma), leaving to Go the inputs where that
+// could overflow or underflow; fmod answers only |x| < |y|.
 
 const (
 	wF64 byte = 0x7C
@@ -40,6 +41,7 @@ const (
 	opF64Sub            byte = 0xA1
 	opF64Mul            byte = 0xA2
 	opF64Div            byte = 0xA3
+	opF64Copysign       byte = 0xA6
 	opF64ConvertI64S    byte = 0xB9
 	opI64ReinterpretF64 byte = 0xBD
 	opF64ReinterpretI64 byte = 0xBF
@@ -68,7 +70,8 @@ type firWasm struct {
 	konst map[fir.Val]uint64
 	args  []uint32
 	out   uint32
-	depth uint32 // ifs open inside the kernel's two blocks
+	depth uint32   // ifs open inside the kernel's two blocks
+	fl    []uint32 // fma's f64 scratch, declared at first use
 }
 
 // emitFirWasm emits f inline: its arguments in the f64 locals args, its
@@ -107,8 +110,8 @@ func emitFirWasm(w *Wasm, f *fir.Func, args []uint32, out uint32, onExit func())
 
 // firWasmOK refuses what wasm has no instruction for.
 func firWasmOK(f *fir.Func) error {
-	if f.NArgs > 2 || firHasOp(f.Body, fir.OpFMA) || f.Fused && firHasOp(f.Body, fir.OpMAdd) {
-		return fmt.Errorf("jit: kernel %s needs FMA", f.Name)
+	if f.NArgs > 2 {
+		return fmt.Errorf("jit: kernel %s takes %d arguments", f.Name, f.NArgs)
 	}
 	return nil
 }
@@ -215,24 +218,19 @@ func (e *firWasm) step(st *fir.Step) error {
 		e.get(st.A, fir.F)
 		w.op(firWasmF1[st.Op])
 		e.set(st.Dst, fir.F)
-	case fir.OpMAdd:
-		// Unfused: firWasmOK refused a fused one.
-		e.get(st.A, fir.F)
-		e.get(st.B, fir.F)
-		w.op(opF64Mul)
-		e.get(st.C, fir.F)
-		w.op(opF64Add)
+	case fir.OpFMA, fir.OpMAdd:
+		if st.Op == fir.OpFMA || e.f.Fused {
+			e.fma(st.A, st.B, st.C)
+		} else {
+			e.get(st.A, fir.F)
+			e.get(st.B, fir.F)
+			w.op(opF64Mul)
+			e.get(st.C, fir.F)
+			w.op(opF64Add)
+		}
 		e.set(st.Dst, fir.F)
 	case fir.OpFMod:
-		// fmod(x, y) is x when |x| < |y|; anything else is Go's.
-		e.get(st.A, fir.F)
-		w.op(opF64Abs)
-		e.get(st.B, fir.F)
-		w.op(opF64Abs)
-		w.op(opF64Lt)
-		w.op(opI32Eqz)
-		w.BrIf(e.depth)
-		e.get(st.A, fir.F)
+		e.fmod(st)
 		e.set(st.Dst, fir.F)
 	case fir.OpFToI:
 		e.get(st.A, fir.F)
@@ -299,4 +297,292 @@ func (e *firWasm) step(st *fir.Step) error {
 		return fmt.Errorf("jit: kernel %s: op %d", e.f.Name, st.Op)
 	}
 	return nil
+}
+
+// fmod pushes C's fmod(x, y), as fir_arm64.go's: x when |x| < |y|, else
+// with q = trunc(|x/y|) below 2^53, fma(-q, |y|, |x|) -- exact, being the
+// remainder or (q rounded up) it less |y| -- made positive and given x's
+// sign. A larger quotient, which includes an infinity, a zero divisor and a
+// NaN, exits.
+func (e *firWasm) fmod(st *fir.Step) {
+	w := e.w
+	e.scratch()
+	ax, ay := e.fl[15], e.fl[16]
+	e.get(st.A, fir.F)
+	w.op(opF64Abs)
+	w.Set(ax)
+	e.get(st.B, fir.F)
+	w.op(opF64Abs)
+	w.Set(ay)
+	w.Get(ax)
+	w.Get(ay)
+	w.op(opF64Lt)
+	w.op(opIf, wF64)
+	e.get(st.A, fir.F)
+	w.op(opElse)
+	e.depth++
+	w.Get(ax)
+	w.Get(ay)
+	w.op(opF64Div)
+	w.Set(e.fl[0])
+	w.Get(e.fl[0])
+	w.F64(0x1p53)
+	w.op(opF64Lt)
+	w.op(opI32Eqz)
+	w.BrIf(e.depth)
+	w.Get(e.fl[0])
+	w.op(opF64Trunc)
+	w.op(opF64Neg)
+	w.Set(e.fl[0])
+	w.Get(ay)
+	w.Set(e.fl[1])
+	w.Get(ax)
+	w.Set(e.fl[2])
+	e.fmaLocals()
+	w.Set(e.fl[14])
+	w.Get(e.fl[14])
+	w.Get(ay)
+	w.op(opF64Add)
+	w.Get(e.fl[14])
+	w.Get(e.fl[14])
+	w.F64(0)
+	w.op(opF64Lt)
+	w.op(opSelect)
+	e.get(st.A, fir.F)
+	w.op(opF64Copysign)
+	e.depth--
+	w.op(opEnd)
+}
+
+// scratch declares fma's and fmod's f64 locals at first use.
+func (e *firWasm) scratch() {
+	if e.fl == nil {
+		for range 17 {
+			e.fl = append(e.fl, e.w.Local(wF64))
+		}
+	}
+}
+
+// fma pushes a*b + c rounded once, as math.FMA answers it. Dekker's product
+// splits a*b into uh + ul exactly, a two-sum splits c + uh into th + tl
+// exactly, and th + RO(tl + ul), the inner sum rounded to odd, is rounded
+// once (Boldo and Melquiond, "Emulation of FMA and correctly rounded sums:
+// proved algorithms using rounding to odd", 2008). That holds where no step
+// overflows and the product's error is a normal double, which the bounds
+// below make so; a product too small for them is scaled up by 2^600, with
+// c, and the answer down, which is exact unless the answer is subnormal.
+// Any other input exits.
+func (e *firWasm) fma(a, b, c fir.Val) {
+	e.scratch()
+	for i, v := range []fir.Val{a, b, c} {
+		e.get(v, fir.F)
+		e.w.Set(e.fl[i])
+	}
+	e.fmaLocals()
+}
+
+// fmaLocals is fma over the scratch locals 0, 1 and 2.
+func (e *firWasm) fmaLocals() {
+	w := e.w
+	x, y, z, uh, sc, res := e.fl[0], e.fl[1], e.fl[2], e.fl[7], e.fl[13], e.fl[14]
+	product := func() {
+		w.Get(x)
+		w.Get(y)
+		w.op(opF64Mul)
+		w.Set(uh)
+	}
+	product()
+	inRange := func(v uint32, lo, hi float64) {
+		w.Get(v)
+		w.op(opF64Abs)
+		w.F64(lo)
+		w.op(opF64Ge)
+		w.Get(v)
+		w.op(opF64Abs)
+		w.F64(hi)
+		w.op(opF64Le)
+		w.op(opI32And)
+	}
+	// A zero operand makes a*b exact, and so a*b + c the answer.
+	w.Get(x)
+	w.F64(0)
+	w.op(opF64Eq)
+	w.Get(y)
+	w.F64(0)
+	w.op(opF64Eq)
+	w.op(opI32Or)
+	w.op(opIf, wF64)
+	w.Get(uh)
+	w.Get(z)
+	w.op(opF64Add)
+	w.op(opElse)
+	// A product below 2^-60 of a finite c of 2^-1000 or more is well inside
+	// a quarter of c's ulp, and c is the answer.
+	w.Get(uh)
+	w.op(opF64Abs)
+	w.Get(z)
+	w.op(opF64Abs)
+	w.F64(0x1p-60)
+	w.op(opF64Mul)
+	w.op(opF64Lt)
+	inRange(z, 0x1p-1000, math.MaxFloat64)
+	w.op(opI32And)
+	w.op(opIf, wF64)
+	w.Get(z)
+	w.op(opElse)
+	w.F64(0x1p600)
+	w.F64(1)
+	w.Get(uh)
+	w.op(opF64Abs)
+	w.F64(0x1p-950)
+	w.op(opF64Lt)
+	w.op(opSelect)
+	w.Set(sc)
+	for _, v := range []uint32{x, z} {
+		w.Get(v)
+		w.Get(sc)
+		w.op(opF64Mul)
+		w.Set(v)
+	}
+	product()
+	// The exact path's bounds: |a|, |b| <= 2^995, so the split cannot
+	// overflow; 2^-950 <= |a*b| <= 2^1000, so the product's error is a
+	// normal double and no partial product overflows (Dekker's condition is
+	// an exponent sum of at least -970); and c is 0 or 2^-960 <= |c| <=
+	// 2^1000. A NaN or an infinity fails a comparison.
+	inRange(x, 0, 0x1p995)
+	inRange(y, 0, 0x1p995)
+	w.op(opI32And)
+	inRange(uh, 0x1p-950, 0x1p1000)
+	w.op(opI32And)
+	inRange(z, 0x1p-960, 0x1p1000)
+	w.Get(z)
+	w.F64(0)
+	w.op(opF64Eq)
+	w.op(opI32Or)
+	w.op(opI32And)
+	w.op(opIf, wF64)
+	e.fmaExact(x, y, z, uh)
+	w.F64(1)
+	w.Get(sc)
+	w.op(opF64Div)
+	w.op(opF64Mul)
+	w.Set(res)
+	// Scaled down into the subnormals, it was rounded twice.
+	w.Get(sc)
+	w.F64(1)
+	w.op(opF64Ne)
+	w.Get(res)
+	w.op(opF64Abs)
+	w.F64(0x1p-1022)
+	w.op(opF64Lt)
+	w.op(opI32And)
+	w.Get(res)
+	w.F64(0)
+	w.op(opF64Ne)
+	w.op(opI32And)
+	w.BrIf(e.depth + 3)
+	w.Get(res)
+	w.op(opElse)
+	w.Br(e.depth + 3)
+	w.op(opEnd)
+	w.op(opEnd)
+	w.op(opEnd)
+}
+
+// fmaExact pushes x*y + z rounded once, uh being x*y rounded, for operands
+// fma's bounds admit.
+func (e *firWasm) fmaExact(x, y, z, uh uint32) {
+	w := e.w
+	xh, xl, yh, yl := e.fl[3], e.fl[4], e.fl[5], e.fl[6]
+	ul, th, tl, s, r := e.fl[8], e.fl[9], e.fl[10], e.fl[11], e.fl[12]
+	mul := func(p, q uint32) {
+		w.Get(p)
+		w.Get(q)
+		w.op(opF64Mul)
+	}
+	// Veltkamp's split: v = hi + lo, each of 26 bits.
+	split := func(v, hi, lo uint32) {
+		w.F64(0x1p27 + 1)
+		w.Get(v)
+		w.op(opF64Mul)
+		w.Set(s)
+		w.Get(s)
+		w.Get(s)
+		w.Get(v)
+		w.op(opF64Sub)
+		w.op(opF64Sub)
+		w.Set(hi)
+		w.Get(v)
+		w.Get(hi)
+		w.op(opF64Sub)
+		w.Set(lo)
+	}
+	split(x, xh, xl)
+	split(y, yh, yl)
+	// ul = ((xh*yh - uh) + xh*yl + xl*yh) + xl*yl
+	mul(xh, yh)
+	w.Get(uh)
+	w.op(opF64Sub)
+	mul(xh, yl)
+	w.op(opF64Add)
+	mul(xl, yh)
+	w.op(opF64Add)
+	mul(xl, yl)
+	w.op(opF64Add)
+	w.Set(ul)
+	// twoSum sets hi and lo to p + q rounded and its error.
+	twoSum := func(p, q, hi, lo uint32) {
+		w.Get(p)
+		w.Get(q)
+		w.op(opF64Add)
+		w.Set(hi)
+		w.Get(hi)
+		w.Get(p)
+		w.op(opF64Sub)
+		w.Set(r) // the part of q in hi
+		w.Get(p)
+		w.Get(hi)
+		w.Get(r)
+		w.op(opF64Sub)
+		w.op(opF64Sub)
+		w.Get(q)
+		w.Get(r)
+		w.op(opF64Sub)
+		w.op(opF64Add)
+		w.Set(lo)
+	}
+	twoSum(z, uh, th, tl)
+	twoSum(tl, ul, s, r)
+	// Rounded to odd: s, or when the sum was inexact (r != 0) and s is even,
+	// s one ulp toward r.
+	w.Get(s)
+	w.op(opI64ReinterpretF64)
+	w.I64(1)
+	w.op(opI64Add)
+	w.Get(s)
+	w.op(opI64ReinterpretF64)
+	w.Get(r)
+	w.op(opI64ReinterpretF64)
+	w.op(opI64Xor)
+	w.I64(63)
+	w.op(opI64ShrU)
+	w.I64(1)
+	w.op(opI64Shl)
+	w.op(opI64Sub) // bits(s) + 1, or - 1 when r's sign is not s's
+	w.Get(s)
+	w.op(opI64ReinterpretF64)
+	w.Get(r)
+	w.F64(0)
+	w.op(opF64Ne)
+	w.Get(s)
+	w.op(opI64ReinterpretF64)
+	w.I64(1)
+	w.op(opI64And)
+	w.op(opI64Eqz)
+	w.op(opI32And)
+	w.op(opSelect)
+	w.op(opF64ReinterpretI64)
+	w.Get(th)
+	w.op(opF64Add)
 }

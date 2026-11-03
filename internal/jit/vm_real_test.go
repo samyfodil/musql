@@ -259,7 +259,8 @@ func TestVMRealPaths(t *testing.T) {
 			t.Errorf("%+v: pc %d r1 %+v, want an exit", in, args.PC, regs[1])
 		}
 	}
-	// A kernel the CPU cannot run fails the emission.
+	// A kernel the CPU cannot run fails the emission; wasm computes fma from
+	// doubles, and so runs every one.
 	k = fir.New("fma", 1, false)
 	x := k.Arg(0)
 	k.Return(k.FMA(x, x, x))
@@ -270,7 +271,10 @@ func TestVMRealPaths(t *testing.T) {
 	restore := SetCPUForTest(false, false)
 	_, err = EmitVM([]VInsn{{Op: VMath, A: 0, B: 1, C: 1, Kernel: fma}, {Op: VExit}}, 2, tvLayout)
 	restore()
-	if err == nil {
+	if firFeaturesOptional && err == nil {
 		t.Error("a kernel needing FMA was emitted without it")
+	}
+	if !firFeaturesOptional && err != nil {
+		t.Errorf("a kernel with an fma: %v", err)
 	}
 }

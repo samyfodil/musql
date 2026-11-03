@@ -167,17 +167,85 @@ func TestKernelOKRefusesMissingFeatures(t *testing.T) {
 	}
 	restore := SetCPUForTest(false, false)
 	defer restore()
-	refused := map[string]*fir.Func{"fma": fma, "fused": fused}
-	if firRoundOptional {
-		refused["round"] = round
-	}
-	for name, f := range refused {
-		if KernelOK(f) {
+	for name, f := range map[string]*fir.Func{"fma": fma, "round": round, "fused": fused} {
+		if firFeaturesOptional && KernelOK(f) {
 			t.Errorf("%s: accepted without the instruction", name)
 		}
 	}
 	if !KernelOK(plain) {
 		t.Error("an unfused multiply-add needs nothing")
+	}
+}
+
+// TestFirFMA: a kernel's fma is math.FMA's, rounded once, wherever it
+// answers: over random operands, over sums that cancel to the product's
+// rounding error, and over ties. A backend that computes fma from doubles
+// may leave an input to Go, but not one in the ordinary range.
+func TestFirFMA(t *testing.T) {
+	if !cpuFeat.fma {
+		t.Skip("no fma here")
+	}
+	cs := map[string]func(b *fir.B, x, y fir.Val) fir.Val{
+		"k":       func(b *fir.B, x, y fir.Val) fir.Val { return b.K(0.3) },
+		"zero":    func(b *fir.B, x, y fir.Val) fir.Val { return b.K(0) },
+		"-xy":     func(b *fir.B, x, y fir.Val) fir.Val { return b.FNeg(b.FMul(x, y)) },
+		"x":       func(b *fir.B, x, y fir.Val) fir.Val { return x },
+		"-x*1e-9": func(b *fir.B, x, y fir.Val) fir.Val { return b.FMul(x, b.K(-1e-9)) },
+		"huge":    func(b *fir.B, x, y fir.Val) fir.Val { return b.K(0x1p1020) },
+		"wide":    func(b *fir.B, x, y fir.Val) fir.Val { return b.FMul(y, b.K(0x1p-300)) },
+	}
+	r := rand.New(rand.NewPCG(5, 6))
+	var xs, ys []float64
+	for range 100000 {
+		x, y := (r.Float64()-0.5)*math.Pow(2, float64(r.IntN(60)-30)), (r.Float64()-0.5)*math.Pow(2, float64(r.IntN(60)-30))
+		if r.IntN(4) == 0 {
+			// Ties: products whose low half is a half ulp of c's.
+			x, y = float64(1+r.Int64N(1<<26)), float64(1+r.Int64N(1<<27))*0x1p-26
+		}
+		xs, ys = append(xs, x), append(ys, y)
+	}
+	n := len(xs)
+	for range 100000 {
+		// Anywhere: what is not left to Go must still be exact.
+		xs = append(xs, math.Ldexp(r.Float64()-0.5, r.IntN(2100)-1050))
+		ys = append(ys, math.Ldexp(r.Float64()-0.5, r.IntN(2100)-1050))
+	}
+	special := []float64{0, math.Copysign(0, -1), 1, -1, math.Inf(1), math.NaN(), 0x1p-1074, math.MaxFloat64, 0x1p-500, 0x1p500}
+	for _, x := range special {
+		for _, y := range special {
+			xs, ys = append(xs, x), append(ys, y)
+		}
+	}
+	for name, c := range cs {
+		b := fir.New("fma", 2, false)
+		x, y := b.Arg(0), b.Arg(1)
+		b.Return(b.FMA(x, y, c(b, x, y)))
+		f, err := b.Func()
+		if err != nil {
+			t.Fatal(err)
+		}
+		k, err := firLoop(f, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, exited := runFir(k, xs, ys)
+		left := 0
+		for i := range xs {
+			want, _ := fir.Eval(f, xs[i], ys[i])
+			if exited[i] {
+				left++
+				if !firExitsMore || i < n && name != "huge" {
+					t.Fatalf("%s: fma(%v, %v) left to Go", name, xs[i], ys[i])
+				}
+				continue
+			}
+			if math.Float64bits(got[i]) != math.Float64bits(want) && !(got[i] != got[i] && want != want) {
+				t.Fatalf("%s: fma(%x, %x) = %x, math.FMA %x", name, math.Float64bits(xs[i]), math.Float64bits(ys[i]),
+					math.Float64bits(got[i]), math.Float64bits(want))
+			}
+		}
+		t.Logf("%s: %d of %d left to Go", name, left, len(xs))
+		k.Close()
 	}
 }
 
@@ -245,9 +313,13 @@ func TestFirFMod(t *testing.T) {
 			xs, ys = append(xs, x), append(ys, y)
 		}
 		got, exited := runFir(k, xs, ys)
-		roundedUp := 0
+		roundedUp, extra := 0, 0
 		for i := range xs {
 			want := math.Mod(xs[i], ys[i])
+			if exited[i] && firExitsMore && !firFModExits(xs[i], ys[i]) {
+				extra++
+				continue
+			}
 			if exited[i] != firFModExits(xs[i], ys[i]) ||
 				!exited[i] && math.Float64bits(got[i]) != math.Float64bits(want) && !(got[i] != got[i] && want != want) {
 				t.Fatalf("fmod(%v, %v) = %v (%x, exit %v), math.Mod %v (%x)", xs[i], ys[i], got[i], math.Float64bits(got[i]),
@@ -259,6 +331,9 @@ func TestFirFMod(t *testing.T) {
 		}
 		if roundedUp == 0 {
 			t.Error("no quotient rounded up to an integer")
+		}
+		if extra > len(xs)/20 {
+			t.Errorf("%d of %d left to Go by the fma", extra, len(xs))
 		}
 		k.Close()
 	}
