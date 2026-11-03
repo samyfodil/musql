@@ -444,6 +444,9 @@ changes within the same transaction as the data it tracks.
 | [examples/libp2p](examples/libp2p/) | A replication transport and end-to-end tests in a separate module. |
 | [compat-harness](compat-harness/) | Differential tests against C SQLite in a separate module that requires CGo. |
 
+[docs/architecture.md](docs/architecture.md) follows one query through the
+code, from the driver to the JIT, and names the file that owns each step.
+
 ## Yes, it runs DOOM
 
 <p align="center"><img src="examples/doom/screenshot.png" alt="Doom running on the musql VDBE" width="480"></p>

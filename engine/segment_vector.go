@@ -88,6 +88,16 @@ func (a segVecArg) value(params []Value) (Value, bool) {
 
 // segVectorPeephole rewrites prog when it is a distance-ordered top-k over a
 // table. Reports whether it did.
+//
+//	Init; SorterOpen s (bounded, one key); OpenRead c; <prologue>; Rewind c -> close
+//	top:   Column / Variable / String8 / Blob / SCopy ...   the columns, the query vector
+//	       [Function vector32 etc. -> q]; Function vector_distance_cos|l2 -> d
+//	       [SorterCheck s]; MakeRecord base n -> rec; SorterInsert s rec
+//	       Next c -> top
+//	close: Close c; <drain, as segOrderPeephole's>; Halt
+//
+// It puts OpSegVectorTopK after the OpenRead and appends the emit loop, as
+// segOrderPeephole does.
 func segVectorPeephole(prog *Program) bool {
 	if !jitEnabled || prog == nil {
 		return false

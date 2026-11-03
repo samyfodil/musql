@@ -8,6 +8,17 @@ import "github.com/samyfodil/musql/internal/jit"
 
 // segGroupPeephole rewrites GROUP BY with all-integer keys and lowered
 // arguments, optionally under a WHERE of the predicates segParsePredBlock reads.
+//
+//	Init; OpenRead c; <prologue: seek hints, ...>; Rewind c -> close
+//	top:   [<predicate blocks and IN lists, each jumping to the Next>]
+//	       <the key, Column c.x or computed> ...; MakeRecord -> key
+//	       [Column c.x -> r; SCopy r -> arg] ...   the aggregates' arguments
+//	       HashAggStep; Next c -> top
+//	close: Close c; HashAggSort ... <the drain, unchanged>
+//
+// It puts OpSegHashAgg after the seek hints, shifting the jumps after it by
+// one; on success it fills the hash buckets itself and jumps to the
+// HashAggSort, past the loop and its Close.
 func segGroupPeephole(prog *Program) bool {
 	if !jitEnabled || prog == nil {
 		return false
