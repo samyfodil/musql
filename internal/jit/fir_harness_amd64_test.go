@@ -61,3 +61,10 @@ func firLoop(f *fir.Func, budget int) (*Code, error) {
 const firFMod = true
 
 func firFModExits(float64, float64) bool { return false }
+
+// firFeaturesOptional is whether a CPU can lack the fma or the rounding
+// instructions.
+const firFeaturesOptional = true
+
+// firExitsMore is whether this backend leaves to Go inputs fir.Eval answers.
+const firExitsMore = false

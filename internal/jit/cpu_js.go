@@ -18,8 +18,8 @@ var HasVector = sync.OnceValue(func() bool {
 const VMMinWork = 24
 
 // VMReal reports whether the VM JIT has its REAL arms (VReal to VMath).
-const VMReal = false
+const VMReal = true
 
-// SetCPUForTest narrows the features the float kernels see: none, as there
-// are no REAL arms here.
+// SetCPUForTest narrows the features the float kernels see: none, as wasm
+// has no optional ones.
 func SetCPUForTest(fma, round bool) (restore func()) { return func() {} }

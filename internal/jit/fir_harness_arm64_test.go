@@ -71,3 +71,10 @@ func firFModExits(x, y float64) bool {
 	ax, ay := math.Abs(x), math.Abs(y)
 	return !(ax < ay) && !(ax/ay < 1<<53)
 }
+
+// firFeaturesOptional is whether a CPU can lack the fma or the rounding
+// instructions.
+const firFeaturesOptional = true
+
+// firExitsMore is whether this backend leaves to Go inputs fir.Eval answers.
+const firExitsMore = false

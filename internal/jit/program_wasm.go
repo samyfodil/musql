@@ -62,6 +62,21 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	t1, t2, t3 := w.Local(wI64), w.Local(wI64), w.Local(wI64)
 	tp, tl, tc, tb := w.Local(wI32), w.Local(wI32), w.Local(wI64), w.Local(wI32) // POpTextLen
 	te, ts := w.Local(wI32), w.Local(wI32)                                      // POpTextMatch: the heap's end, a scan pointer
+	// The REAL steps' scratch.
+	fx, fy, fu := w.Local(wF64), w.Local(wF64), w.Local(wI32)
+	// A REAL accumulator lives in fs (and its compensation in fe) for the
+	// whole call.
+	hasFloat := progHasFloat(insns)
+	var fs, fe uint32
+	if hasFloat {
+		fs, fe = w.Local(wF64), w.Local(wF64)
+		w.Get(0)
+		w.LoadF64(POffFAcc)
+		w.Set(fs)
+		w.Get(0)
+		w.LoadF64(POffFAcc + 8)
+		w.Set(fe)
+	}
 
 	w.LoadPtr(POffRegs)
 	w.Set(regs)
@@ -133,6 +148,11 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		w.Set(l)
 	}
 	bool64 := func() { w.op(opI64ExtendI32U) }
+	// A REAL lives in a register as its bits, NULL as a NaN.
+	fval := func(r int) { loadReg(r); w.op(opF64ReinterpretI64) }
+	fset := func(r int, push func()) { storeReg(r, func() { push(); w.op(opI64ReinterpretF64) }) }
+	incReg := func(r int) { storeReg(r, func() { loadReg(r); w.I64(1); w.op(opI64Add) }) }
+	notNaN := func(x uint32) { w.Get(x); w.Get(x); w.op(opF64Eq) }
 
 	w.op(opBlock, opVoid) // $done
 	// Re-entry after a POpService (the protocol is in jit.go): restore the
@@ -177,15 +197,15 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		w.op(opBlock, opVoid)
 		maxSvc := 0
 		for _, in := range insns {
-			if in.Op == POpService {
-				maxSvc = max(maxSvc, in.A+1)
+			if k, ok := progService(in); ok {
+				maxSvc = max(maxSvc, k+1)
 			}
 		}
 		depths := make([]uint32, maxSvc+1) // entries with no service fall through
 		for i, in := range insns {
-			if in.Op == POpService {
+			if k, ok := progService(in); ok {
 				// From inside the extra block, instruction t is t+1 levels out.
-				depths[in.A+1] = uint32(i + 1)
+				depths[k+1] = uint32(i + 1)
 			}
 		}
 		w.Get(resume)
@@ -376,6 +396,165 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			w.Set(t1)
 			emitCheckedArith(w, POpAdd, t1, t2, acc, ovf)
 			storeReg(in.B, func() { loadReg(in.B); w.I64(1); w.op(opI64Add) })
+		case POpI2F:
+			fset(in.A, func() { loadReg(in.B); w.op(opF64ConvertI64S) })
+		case POpFAdd, POpFSub, POpFMul:
+			fset(in.A, func() { fval(in.B); fval(in.C); w.op(progWasmFArith[in.Op]) })
+		case POpFDiv:
+			// A divisor equal to zero (either sign) is NULL.
+			fset(in.A, func() {
+				w.F64(math.Float64frombits(progNaN))
+				fval(in.B)
+				fval(in.C)
+				w.op(opF64Div)
+				fval(in.C)
+				w.F64(0)
+				w.op(opF64Eq)
+				w.op(opSelect)
+			})
+		case POpFCmp:
+			fval(in.B)
+			w.Set(fx)
+			fval(in.C)
+			w.Set(fy)
+			w.Get(fx)
+			w.Get(fx)
+			w.op(opF64Ne)
+			w.Get(fy)
+			w.Get(fy)
+			w.op(opF64Ne)
+			w.op(opI32Or)
+			w.Set(fu) // a NULL operand
+			null := in.Imm
+			if in.Imm == ProgNullDeclines {
+				null = 0
+				w.Get(ovf)
+				w.Get(fu)
+				w.op(opI64ExtendI32U)
+				w.op(opI64Or)
+				w.Set(ovf)
+			}
+			storeReg(in.A, func() {
+				w.I64(null)
+				w.Get(fx)
+				w.Get(fy)
+				w.op(fcmpOp(in.Cond))
+				bool64()
+				w.Get(fu)
+				w.op(opSelect)
+			})
+		case POpFIsNull:
+			fval(in.B)
+			w.Set(fx)
+			storeReg(in.A, func() { w.Get(fx); w.Get(fx); w.op(opF64Ne); bool64() })
+		case POpFAbs:
+			// -x when 0 > x, so -0.0 and a NaN stay as they are.
+			fval(in.B)
+			w.Set(fx)
+			fset(in.A, func() {
+				w.Get(fx)
+				w.op(opF64Neg)
+				w.Get(fx)
+				w.F64(0)
+				w.Get(fx)
+				w.op(opF64Gt)
+				w.op(opSelect)
+			})
+		case POpFAccSum:
+			// kahanBabuskaNeumaierStep: t = s + r; the error of whichever of
+			// s and r is larger in magnitude goes into the compensation.
+			fval(in.A)
+			w.Set(fx)
+			notNaN(fx)
+			w.op(opIf, opVoid)
+			w.Get(fs)
+			w.Get(fx)
+			w.op(opF64Add)
+			w.Set(fy) // t
+			w.Get(fe)
+			w.Get(fs)
+			w.Get(fy)
+			w.op(opF64Sub)
+			w.Get(fx)
+			w.op(opF64Add) // (s - t) + r
+			w.Get(fx)
+			w.Get(fy)
+			w.op(opF64Sub)
+			w.Get(fs)
+			w.op(opF64Add) // (r - t) + s
+			w.Get(fs)
+			w.op(opF64Abs)
+			w.Get(fx)
+			w.op(opF64Abs)
+			w.op(opF64Gt) // |s| > |r|
+			w.op(opSelect)
+			w.op(opF64Add)
+			w.Set(fe)
+			w.Get(fy)
+			w.Set(fs)
+			incReg(in.B)
+			w.op(opEnd)
+		case POpFAccMin, POpFAccMax:
+			fval(in.A)
+			w.Set(fx)
+			notNaN(fx)
+			w.op(opIf, opVoid)
+			w.Get(fx)
+			w.Get(fs)
+			if in.Op == POpFAccMin {
+				w.Get(fs)
+				w.Get(fx) // acc > x
+			} else {
+				w.Get(fx)
+				w.Get(fs) // x > acc
+			}
+			w.op(opF64Gt)
+			w.op(opSelect)
+			w.Set(fs)
+			incReg(in.B)
+			w.op(opEnd)
+		case POpFAccCount:
+			fval(in.A)
+			w.Set(fx)
+			w.Get(acc)
+			notNaN(fx)
+			bool64()
+			w.op(opI64Add)
+			w.Set(acc)
+		case POpMath:
+			if in.Kernel == nil || in.Kernel.NArgs > 2 {
+				return nil, fmt.Errorf("jit: POpMath without a kernel")
+			}
+			args := make([]uint32, in.Kernel.NArgs)
+			for k, r := range []int{in.B, in.C}[:len(args)] {
+				args[k] = w.Local(wF64)
+				fval(r)
+				w.Set(args[k])
+			}
+			at := progEmitAt(insns)
+			if in.Imm == ProgMathSelects && at <= i {
+				return nil, fmt.Errorf("jit: POpMath selects in a program with no POpEmitRow after it")
+			}
+			// The kernel's exit is one block further in than instruction i.
+			exit := func() {
+				if in.Imm == ProgMathSelects {
+					// An input the kernel cannot judge selects the row.
+					w.Br(depthTo(i, at) + 1)
+					return
+				}
+				// Stop for the service, as POpService does.
+				w.Get(0)
+				w.I64(in.Imm + 1)
+				w.StoreI64(POffPC)
+				w.Get(0)
+				w.Get(idx)
+				w.StoreI64(POffRow)
+				w.Br(uint32(n-i) + 2)
+			}
+			if err := emitFirWasm(w, in.Kernel, args, fx, exit); err != nil {
+				return nil, err
+			}
+			fset(in.A, func() { w.Get(fx) })
 		default:
 			return nil, fmt.Errorf("jit: unknown program opcode %d", in.Op)
 		}
@@ -409,8 +588,21 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	w.LoadPtr(POffOverflow)
 	w.Get(ovf)
 	w.StoreI64(0)
+	if hasFloat {
+		w.Get(0)
+		w.Get(fs)
+		w.StoreF64(POffFAcc)
+		w.Get(0)
+		w.Get(fe)
+		w.StoreF64(POffFAcc + 8)
+	}
 	return w.Module(), nil
 }
+
+// progNaN is the NaN a program writes for a NULL REAL.
+const progNaN = 0x7ff8000000000000
+
+var progWasmFArith = map[POp]byte{POpFAdd: opF64Add, POpFSub: opF64Sub, POpFMul: opF64Mul}
 
 // wasmRegLocals is how many locals a program's registers may take. A local
 // is not a machine register, but the engine compiling the module keeps
