@@ -71,6 +71,10 @@ type vmJIT struct {
 	// seekCols is every column the native code reads of each cursor: what a
 	// seek's rows are copied out with (seekSnap).
 	seekCols []curCols
+
+	// reopen is, per cursor number, the derived source whose opens native
+	// code may make (reopenSources); nil when there is none.
+	reopen []reopenSrc
 }
 
 // curCols is one cursor's columns an entry reads.
@@ -197,8 +201,15 @@ func compileVMJIT(prog *Program) *vmJIT {
 	nParams := prog.jitParams()
 	ipk := writeCursorIPK(prog)
 	realVP, realOK := vmRealLowering(prog)
+	reopen := reopenSources(prog)
 	for pc := range prog.Insns {
 		vp[pc] = lowerVM(&prog.Insns[pc], prog.NReg)
+		if in := &prog.Insns[pc]; (in.Op == OpOpenDerived || in.Op == OpClose) && in.P1 >= 0 && in.P1 < len(reopen) && reopen[in.P1].ds != nil {
+			vp[pc] = jit.VInsn{Op: jit.VClose, A: in.P1}
+			if in.Op == OpOpenDerived {
+				vp[pc].Op = jit.VOpen
+			}
+		}
 		if realOK != nil && realOK[pc] {
 			vp[pc] = realVP[pc]
 		}
@@ -217,7 +228,7 @@ func compileVMJIT(prog *Program) *vmJIT {
 		// A column of any cursor is read natively (a cursor native code cannot
 		// walk is read from a copy of its current row); only a cursor that
 		// materializes its rows is walked natively.
-		if c := vp[pc]; !vmJITCursorOps && (c.Op == jit.VColumn || c.Op == jit.VRowid || c.Op == jit.VNext || c.Op == jit.VRewind) {
+		if c := vp[pc]; !vmJITCursorOps && vmCursorOp(c.Op) {
 			vp[pc] = jit.VInsn{Op: jit.VExit}
 		} else if c.Op == jit.VRewind && (c.A >= len(rewindable) || !rewindable[c.A]) {
 			vp[pc] = jit.VInsn{Op: jit.VExit}
@@ -285,6 +296,9 @@ func compileVMJIT(prog *Program) *vmJIT {
 		}
 	}
 	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams, params: nParams, entry: entry, marked: marked, native: native, updAt: updAt}
+	if slices.ContainsFunc(vp, func(in jit.VInsn) bool { return in.Op == jit.VOpen || in.Op == jit.VClose }) {
+		jx.reopen = reopen
+	}
 	jx.text = slices.ContainsFunc(vp, func(in jit.VInsn) bool {
 		return in.Op == jit.VTextCmpJump || in.Op == jit.VTextCmpSet || in.Op == jit.VSubstr
 	})
@@ -324,7 +338,7 @@ func compileVMJIT(prog *Program) *vmJIT {
 			jx.entryCurs[pc] = []int{}
 			for at, r := range jit.VReachFrom(vp, pc) {
 				in := vp[at]
-				if r && (in.Op == jit.VColumn || in.Op == jit.VRowid || in.Op == jit.VNext || in.Op == jit.VRewind) &&
+				if r && vmCursorOp(in.Op) &&
 					!slices.Contains(jx.entryCurs[pc], in.A) {
 					jx.entryCurs[pc] = append(jx.entryCurs[pc], in.A)
 				}
@@ -332,7 +346,7 @@ func compileVMJIT(prog *Program) *vmJIT {
 		}
 	}
 	for _, in := range vp {
-		if (in.Op == jit.VColumn || in.Op == jit.VRowid || in.Op == jit.VNext || in.Op == jit.VRewind) && !seen[in.A] {
+		if vmCursorOp(in.Op) && !seen[in.A] {
 			seen[in.A] = true
 			jx.curs = append(jx.curs, in.A)
 			jx.nCurs = max(jx.nCurs, in.A+1)
@@ -383,6 +397,131 @@ func writeCursorIPK(prog *Program) []int {
 // isCursorOpen reports whether op opens a table cursor (its P1).
 func isCursorOpen(op OpCode) bool {
 	return op == OpOpenRead || op == OpOpenDerived || op == OpOpenWrite
+}
+
+// vmCursorOp reports whether op reads or moves its cursor (A).
+func vmCursorOp(op jit.VOp) bool {
+	switch op {
+	case jit.VColumn, jit.VRowid, jit.VNext, jit.VRewind, jit.VOpen, jit.VClose:
+		return true
+	}
+	return false
+}
+
+// reopenSrc is the derived source and run-once slot every open of a cursor
+// names.
+type reopenSrc struct {
+	ds   *derivedSource
+	slot int
+}
+
+// reopenSources is, per cursor number, the derived source every open of the
+// cursor reads, when each is an OpOpenDerived of that one source into one
+// slot, which always opens a slot-fill cursor (slotSource): native code may
+// then close and reopen it (VOpen, VClose) while another open would give it
+// the rows it holds (vdbeCursor.slotReopenable). nil when no cursor
+// qualifies.
+func reopenSources(prog *Program) []reopenSrc {
+	var out []reopenSrc
+	bad := make([]bool, prog.NCursors)
+	for i := range prog.Insns {
+		in := &prog.Insns[i]
+		if !isCursorOpen(in.Op) && in.Op != OpIfEmpty || in.P1 < 0 || in.P1 >= prog.NCursors || bad[in.P1] {
+			continue
+		}
+		if in.Op == OpIfEmpty {
+			if _, opens := in.P4.(*resolvedTable); !opens {
+				continue
+			}
+		}
+		ds, _ := in.P4.(*derivedSource)
+		if in.Op != OpOpenDerived || !slotSource(ds) || out != nil && out[in.P1].ds != nil && (out[in.P1].ds != ds || out[in.P1].slot != in.P2) {
+			bad[in.P1] = true
+			if out != nil {
+				out[in.P1] = reopenSrc{}
+			}
+			continue
+		}
+		if out == nil {
+			out = make([]reopenSrc, prog.NCursors)
+		}
+		out[in.P1] = reopenSrc{ds: ds, slot: in.P2}
+	}
+	return out
+}
+
+// slotSource reports whether OpOpenDerived always opens ds as a slot-fill
+// cursor over run-once rows (openSlotFillCursor): no source its case takes
+// first, and a CTE or a subquery it neither runs again at every rewind,
+// streams, nor runs per outer row.
+func slotSource(ds *derivedSource) bool {
+	if ds == nil || ds.catalogScope != scopeAny || ds.vtabWrite != nil || ds.schemaWrite || ds.vtab != nil || ds.recSelf != nil {
+		return false
+	}
+	if ds.cte != nil {
+		b := ds.cte.binding
+		return !ds.rerun || b.m10d != cteM10dNo && b.nUse >= 2
+	}
+	return ds.prog != nil && !ds.prog.Correlated && !ds.rerun && ds.stream == streamNever && ds.upfrom == nil && ds.viewUpfrom == nil
+}
+
+// The states handReopen hands a reopenable cursor over in (VCursor.Reopen).
+const (
+	reopenOpen   = 1 // open over its slot's rows
+	reopenFresh  = 2 // opened, not yet rewound
+	reopenClosed = 3
+)
+
+// handReopen hands cur, cursor c, over as one native code may close and
+// reopen (VOpen, VClose), when it is one: another open would give it its
+// slot's rows again (slotReopenable), and it is open over them, opened and not
+// yet rewound, or closed. Its view holds those rows in each state.
+func (jx *vmJIT) handReopen(cur *vdbeCursor, c int, jc *jit.VCursor) bool {
+	if c >= len(jx.reopen) || jx.reopen[c].ds == nil || !cur.slotReopenable(jx.reopen[c].ds, jx.reopen[c].slot) {
+		return false
+	}
+	sf := cur.slot
+	switch {
+	case cur.materialized && sameRows(cur.rows, sf.rows) && len(cur.rowids) == len(sf.ids) && &cur.rowids[0] == &sf.ids[0] && jitCursorOK(cur):
+		jc.Ok, jc.Pos, jc.Reopen = 1, int64(cur.pos), reopenOpen
+	case !cur.materialized && cur.fill != nil:
+		// As the VDBE's advance before a rewind: no row (VOpen's position).
+		jc.Ok, jc.Pos, jc.Reopen = 1, int64(len(sf.rows)), reopenFresh
+	case cur.rows == nil && cur.fill == nil:
+		jc.Reopen = reopenClosed
+	default:
+		return false
+	}
+	jc.Rows, jc.N, jc.Rowids = unsafe.Pointer(unsafe.SliceData(sf.rows)), int64(len(sf.ids)), unsafe.Pointer(unsafe.SliceData(sf.ids))
+	jc.Adv, jc.Rewind, jc.Mask = 1, 1, jitCursorMask(cur)
+	return true
+}
+
+// syncReopen brings a cursor handReopen handed over up to date with what
+// native code did to it, as the VDBE's opens, rewinds, advances and closes of
+// it would have left it.
+func syncReopen(cur *vdbeCursor, jc *jit.VCursor, params []Value) {
+	switch {
+	case jc.State == 0 && jc.Reopen == reopenOpen:
+		cur.pos = int(jc.Pos)
+		if jc.Last >= 0 {
+			cur.rowid, cur.rowVals, cur.rowRaw = cur.rowids[jc.Last], cur.rows[jc.Last], nil
+		}
+	case jc.Last >= 0:
+		// Rewound since it was last opened, and on row Last or past it.
+		cur.slotRewound()
+		cur.params = params
+		cur.pos = int(jc.Pos)
+		cur.rowid, cur.rowVals = cur.rowids[jc.Last], cur.rows[jc.Last]
+	case jc.State != 0 && cur.slot.ds.lazy:
+		cur.slotOpened()
+	case jc.State != 0:
+		// The open rewinds a source that is not lazy.
+		cur.slotRewound()
+	}
+	if jc.Ok == 0 {
+		cur.close()
+	}
 }
 
 // gatherUpdate lowers an UPDATE's OpMakeRecord and the OpUpdateRow right after
@@ -583,7 +722,7 @@ func firstCursor(vp []jit.VInsn, pc int) int {
 		case jit.VGoto:
 			pc = vp[pc].T
 			continue
-		case jit.VColumn, jit.VRowid, jit.VNext, jit.VRewind:
+		case jit.VColumn, jit.VRowid, jit.VNext, jit.VRewind, jit.VOpen, jit.VClose:
 			return vp[pc].A
 		case jit.VResultRow:
 			return -1
@@ -684,7 +823,7 @@ func nativeRun(vp []jit.VInsn, pc, limit int) (w int, cursor bool, reads int) {
 			w += 2
 			reads += 2
 			cursor = true
-		case jit.VNext, jit.VRewind:
+		case jit.VNext, jit.VRewind, jit.VOpen, jit.VClose:
 			w += 2
 			cursor = true
 		case jit.VResultRow:
@@ -875,6 +1014,9 @@ func lowerVM(in *Instruction, nReg int) jit.VInsn {
 var (
 	vmJITCursorSyncs, vmJITWriteCursorSyncs atomic.Int64
 	vmJITSeekSnaps                          atomic.Int64
+	// vmJITReopens counts the entries in which native code reopened a
+	// derived cursor (VOpen).
+	vmJITReopens atomic.Int64
 	vmJITCountSyncs                         bool
 
 	// vmJITCursorEnters counts entries into native code that reads or walks a
@@ -960,6 +1102,9 @@ func (jx *vmJIT) copies(m *vdbe, pc int) int {
 	for _, cc := range jx.fill[pc] {
 		if cc.cursor >= len(m.cursors) {
 			continue
+		}
+		if cc.cursor < len(jx.reopen) && jx.reopen[cc.cursor].ds != nil {
+			continue // handed over whole when it can be (handReopen)
 		}
 		if cur := m.cursors[cc.cursor]; !jitCursorOK(cur) && (cur == nil || !seekWalkable(cur) || cur.segSrc.point) {
 			n++
@@ -1208,6 +1353,9 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 				continue
 			}
 			cur := m.cursors[c]
+			if jx.reopen != nil && jx.handReopen(cur, c, jc) {
+				continue
+			}
 			if jitCursorOK(cur) {
 				jc.Rows = unsafe.Pointer(unsafe.SliceData(cur.rows))
 				// The rowid list is the cursor's rowid only while its position
@@ -1266,6 +1414,15 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 	if jx.nCurs > 0 {
 		for _, c := range curs {
 			jc := &m.jcur[c]
+			if jc.Reopen != 0 {
+				if jc.Dirty != 0 {
+					syncReopen(m.cursors[c], jc, m.params)
+				}
+				if vmJITCountSyncs && jc.State != 0 {
+					vmJITReopens.Add(1)
+				}
+				continue
+			}
 			if sn := &m.jsnap[c]; sn.live {
 				seekSync(m.cursors[c], jc, sn)
 				continue

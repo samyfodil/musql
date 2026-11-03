@@ -104,6 +104,7 @@ func vmStepOf(in VInsn, pc int) progStep {
 		s.uses, s.defs = []int{in.A, int(in.Imm)}, []int{in.C}
 	case VRewind, VNext:
 		s.targets = []int{in.T}
+	case VOpen, VClose:
 	case VResultRow:
 		if in.Skip == 0 {
 			s.useAll = true // VDBE code reads the row, or a return to Go
@@ -436,7 +437,7 @@ func vmEmitNextUse(prog []VInsn, bound []bool, key, pc int) int {
 			switch {
 			case in.Op == VColumn && in.A == c:
 				return q
-			case (in.Op == VNext || in.Op == VRewind) && in.A == c:
+			case vmMovesCursor(in.Op) && in.A == c:
 				return -1
 			case in.Op == VExit || in.Op == VReturn || in.Op == VResultRow:
 				return -1
@@ -457,6 +458,12 @@ func vmEmitNextUse(prog []VInsn, bound []bool, key, pc int) int {
 	return -1
 }
 
+// vmMovesCursor reports whether op moves its cursor off the row a VColumn
+// before it read.
+func vmMovesCursor(op VOp) bool {
+	return op == VNext || op == VRewind || op == VOpen || op == VClose
+}
+
 // vmRunColumns adds to mask and maxCol the columns of the cursor pc's VColumn
 // reads that later VColumns of the same run read before anything moves it:
 // what the first one checks for them all.
@@ -467,7 +474,7 @@ func vmRunColumns(prog []VInsn, bound []bool, pc int, mask uint64, maxCol int) (
 			break
 		}
 		in := prog[q]
-		if (in.Op == VNext || in.Op == VRewind) && in.A == c {
+		if vmMovesCursor(in.Op) && in.A == c {
 			break
 		}
 		if in.Op == VColumn && in.A == c {

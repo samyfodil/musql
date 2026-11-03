@@ -677,16 +677,22 @@ func materializedRowids(n int, rowids []int64) []uint64 {
 // slot over the same pager -- keeps its fill function, made once (newFill),
 // and the rows that function last gave: a fill that gives the same rows again
 // skips the pass over them and keeps their rowids (rewind).
-func (m *vdbe) openSlotFillCursor(p, slot int, ds *derivedSource, pager *ReadOnlyPager, newFill func() func() ([][]Value, []int64, error)) *vdbeCursor {
+//
+// newFill also makes the fill's peek: the rows it would give, when it would
+// give them without running anything (its run-once cache is filled), which
+// lets native code reopen the cursor (vdbeCursor.slotReopenable).
+func (m *vdbe) openSlotFillCursor(p, slot int, ds *derivedSource, pager *ReadOnlyPager, newFill func() (func() ([][]Value, []int64, error), func() ([][]Value, bool))) *vdbeCursor {
 	if cur := m.cursors[p]; cur != nil && cur.slotFill {
 		sf := cur.slot
 		if sf.ds != ds || sf.slot != slot || sf.pager != pager {
-			*sf = slotFill{ds: ds, slot: slot, pager: pager, fill: newFill()}
+			*sf = slotFill{ds: ds, slot: slot, pager: pager}
+			sf.fill, sf.peek = newFill()
 		}
-		*cur = vdbeCursor{tbl: ds.tbl, fill: sf.fill, clearSubtypes: true, fillKeep: ds.keepSubtype, colMask: allColumns, pos: -1, slotFill: true, slot: sf}
+		cur.slotOpened()
 		return cur
 	}
-	sf := &slotFill{ds: ds, slot: slot, pager: pager, fill: newFill()}
+	sf := &slotFill{ds: ds, slot: slot, pager: pager}
+	sf.fill, sf.peek = newFill()
 	cur := openFillCursor(ds.tbl, sf.fill, true, ds.keepSubtype)
 	cur.slotFill, cur.slot = true, sf
 	return cur
@@ -699,8 +705,52 @@ type slotFill struct {
 	slot  int
 	pager *ReadOnlyPager
 	fill  func() ([][]Value, []int64, error)
+	peek  func() ([][]Value, bool)
 	rows  [][]Value
 	ids   []uint64
+}
+
+// onceRows is the rows run-once slot slot holds, when it has run.
+func (m *vdbe) onceRows(slot int) ([][]Value, bool) {
+	if slot < 0 || slot >= len(m.subCache) {
+		return nil, false
+	}
+	e := &m.subCache[slot]
+	return e.rows, e.done
+}
+
+// slotOpened is a slot-fill cursor as openSlotFillCursor opens it again.
+func (cur *vdbeCursor) slotOpened() {
+	sf := cur.slot
+	*cur = vdbeCursor{tbl: sf.ds.tbl, fill: sf.fill, clearSubtypes: true, fillKeep: sf.ds.keepSubtype, colMask: allColumns, pos: -1, slotFill: true, slot: sf}
+}
+
+// slotRewound is a slot-fill cursor as an open and a rewind leave it when the
+// fill gives its slot's rows again (rewind).
+func (cur *vdbeCursor) slotRewound() {
+	sf := cur.slot
+	*cur = vdbeCursor{tbl: sf.ds.tbl, clearSubtypes: true, fillKeep: sf.ds.keepSubtype, colMask: allColumns, pos: -1, slotFill: true, slot: sf,
+		rows: sf.rows, rowids: sf.ids, materialized: true}
+}
+
+// slotReopenable reports whether an OpOpenDerived of ds into run-once slot
+// slot would open cur again over the rows it last held: a slot-fill cursor
+// of that source, whose fill would give them without running anything.
+func (cur *vdbeCursor) slotReopenable(ds *derivedSource, slot int) bool {
+	if cur == nil || !cur.slotFill {
+		return false
+	}
+	sf := cur.slot
+	if sf.ds != ds || sf.slot != slot || sf.peek == nil || len(sf.rows) == 0 || len(sf.ids) != len(sf.rows) {
+		return false
+	}
+	rows, ok := sf.peek()
+	return ok && sameRows(rows, sf.rows)
+}
+
+// sameRows reports whether a and b are the same rows: one array, one length.
+func sameRows(a, b [][]Value) bool {
+	return len(a) == len(b) && len(a) > 0 && &a[0] == &b[0]
 }
 
 // cursorHasNoBtree reports whether cur is a pre-materialized row source (a

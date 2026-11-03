@@ -2278,11 +2278,12 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 					m.cursors[op.P1] = cur
 					break
 				}
-				m.cursors[op.P1] = m.openSlotFillCursor(op.P1, slot, ds, dsPager, func() func() ([][]Value, []int64, error) {
-					return func() ([][]Value, []int64, error) {
+				m.cursors[op.P1] = m.openSlotFillCursor(op.P1, slot, ds, dsPager, func() (func() ([][]Value, []int64, error), func() ([][]Value, bool)) {
+					fill := func() ([][]Value, []int64, error) {
 						rows, err := m.runCTEOnce(slot, ds, dsPager)
 						return rows, nil, err
 					}
+					return fill, func() ([][]Value, bool) { return m.onceRows(slot) }
 				})
 				if !ds.lazy {
 					if ferr := m.cursors[op.P1].rewind(); ferr != nil {
@@ -2325,8 +2326,8 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				// Materialized on the first rewind, at the top of its own loop
 				// (vdbeCursor.fill).
 				slot, prog := op.P2, ds.prog
-				m.cursors[op.P1] = m.openSlotFillCursor(op.P1, slot, ds, srcPager, func() func() ([][]Value, []int64, error) {
-					return func() ([][]Value, []int64, error) {
+				m.cursors[op.P1] = m.openSlotFillCursor(op.P1, slot, ds, srcPager, func() (func() ([][]Value, []int64, error), func() ([][]Value, bool)) {
+					fill := func() ([][]Value, []int64, error) {
 						if ds.stmtOnce || ds.cteOnce && m.stmtRoot().wctx == nil {
 							rows, err := m.runStmtOnce(slot, prog, srcPager)
 							return rows, nil, err
@@ -2338,6 +2339,17 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 						rows, err := prog.execWithParent(m)
 						return rows, nil, err
 					}
+					peek := func() ([][]Value, bool) {
+						if ds.stmtOnce || ds.cteOnce && m.stmtRoot().wctx == nil {
+							if rows, ok := m.stmtRoot().stmtOnceRows[prog]; ok {
+								return rows, true
+							}
+						} else if prog.Correlated {
+							return nil, false
+						}
+						return m.onceRows(slot)
+					}
+					return fill, peek
 				})
 				if !ds.lazy {
 					if ferr := m.cursors[op.P1].rewind(); ferr != nil {
