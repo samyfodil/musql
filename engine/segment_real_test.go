@@ -52,7 +52,7 @@ func TestRealProgramsMatchTheLoop(t *testing.T) {
 		{`SELECT sum(y) FROM t WHERE x > ?`, []Value{integer(1 << 60)}, -1},  // not an exact double
 		{`SELECT count(*), sum(y) FROM t WHERE x >= ?`, []Value{real(math.NaN())}, -1},
 		{`SELECT sum(x * ?) FROM t`, []Value{integer(1<<60 + 1)}, 1},
-		{`SELECT sum(n) FROM t`, nil, -1},         // a REAL column with NULLs
+		{`SELECT sum(n) FROM t`, nil, 1},          // a REAL column with NULLs, as NaNs
 		{`SELECT sum(v), max(v) FROM u`, nil, -1}, // INTEGER in one segment, REAL in another
 		{`SELECT min(x), max(x), sum(x), total(x), avg(x), count(x) FROM z`, nil, 0},
 		{`SELECT min(-x), max(-x), min(x*0), max(x*0) FROM z`, nil, 0},

@@ -295,7 +295,25 @@ func (l *segLowered) lowerReal(body []Instruction, i, base int, nextReg *int, sc
 		x, y := asReal(in.P3), asReal(in.P1)
 		if store {
 			note(in.P2)
-			l.add(jit.ProgInsn{Op: jit.POpFCmp, A: in.P2, B: x, C: y, Cond: cond, Imm: segCmpNullAnswer(body, i, in.P2)})
+			null, tested, okNull := segNullReaders(body, i, in.P2)
+			if !okNull {
+				null = jit.ProgNullDeclines
+			}
+			l.add(jit.ProgInsn{Op: jit.POpFCmp, A: in.P2, B: x, C: y, Cond: cond, Imm: null})
+			if okNull && tested {
+				// Whether it was NULL, for the IsNull and NotNull asking.
+				f, g := *nextReg, *nextReg+1
+				*nextReg += 2
+				note(f)
+				note(g)
+				l.add(jit.ProgInsn{Op: jit.POpFIsNull, A: f, B: x},
+					jit.ProgInsn{Op: jit.POpFIsNull, A: g, B: y},
+					jit.ProgInsn{Op: jit.POpOr, A: f, B: f, C: g})
+				if l.nullFlag == nil {
+					l.nullFlag = map[int]int{}
+				}
+				l.nullFlag[in.P2] = f
+			}
 			return true, true
 		}
 		// The jump form: with a NULL it jumps only under p5JumpIfNull.
@@ -532,39 +550,45 @@ func buildSegMathKernel(name string, nargs int) *fir.Func {
 	return f
 }
 
-// segCmpNullAnswer is what a REAL comparison storing into dst at body index i
-// may store for a NULL: the value its one reader, an If or IfNot, treats as it
-// treats NULL. With any other reader the NULL cannot be represented, and a
-// NULL declines the statement.
-func segCmpNullAnswer(body []Instruction, i, dst int) int64 {
-	reader := -1
+// segNullReaders is what the register dst, which body[i] writes, may hold
+// for a NULL: the value every If and IfNot reading it treats as NULL. tested
+// is whether an IsNull or NotNull also reads it. ok is false with any other
+// reader, with none, or with two that want different values.
+func segNullReaders(body []Instruction, i, dst int) (answer int64, tested, ok bool) {
+	answer = -1
 	for j, in := range body {
 		if j == i {
 			continue
 		}
-		for _, r := range segLowerRegOperands(in) {
-			if r != dst {
-				continue
+		reads, _, _, known := segInsnRegs(in)
+		if !known {
+			if ops := segLowerRegOperands(in); slices.Contains(ops[:], dst) {
+				return 0, false, false
 			}
-			if reader >= 0 && reader != j {
-				return jit.ProgNullDeclines
+			continue
+		}
+		if !slices.Contains(reads, dst) {
+			continue
+		}
+		switch {
+		case (in.Op == OpIf || in.Op == OpIfNot) && in.P1 == dst:
+			// IfNot jumps on false, and on NULL when P3 is set; If jumps on
+			// true, and on NULL when P3 is set.
+			a := int64(1)
+			if (in.Op == OpIfNot) == (in.P3 != 0) {
+				a = 0
 			}
-			reader = j
+			if answer >= 0 && a != answer {
+				return 0, false, false
+			}
+			answer = a
+		case (in.Op == OpIsNull || in.Op == OpNotNull) && in.P1 == dst:
+			tested = true
+		default:
+			return 0, false, false
 		}
 	}
-	if reader < 0 {
-		return jit.ProgNullDeclines
-	}
-	in := body[reader]
-	if (in.Op != OpIf && in.Op != OpIfNot) || in.P1 != dst {
-		return jit.ProgNullDeclines
-	}
-	// IfNot jumps on false, and on NULL when P3 is set; If jumps on true,
-	// and on NULL when P3 is set.
-	if (in.Op == OpIfNot) == (in.P3 != 0) {
-		return 0
-	}
-	return 1
+	return answer, tested, answer >= 0
 }
 
 // buildSegRoundKernel is round(x) with no digits, as roundFunc computes it:

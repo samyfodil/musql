@@ -65,6 +65,9 @@ type segLowered struct {
 	// exactParams are the parameters a REAL comparison converts, which must
 	// be INTEGERs a double holds exactly.
 	exactParams []int
+	// nullFlag is, for a stored REAL comparison whose result an IsNull or
+	// NotNull tests, the register holding whether it was NULL.
+	nullFlag map[int]int
 }
 
 // segSortedKeys is one IN list over bound parameters: regs take the sorted
@@ -494,6 +497,10 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 		case OpGoto:
 			out.add(jit.ProgInsn{Op: jit.POpJump, A: in.P2 - base})
 		case OpIsNull:
+			if f, ok := out.nullFlag[in.P1]; ok {
+				out.add(jit.ProgInsn{Op: jit.POpJumpIfNotZero, A: in.P2 - base, B: f})
+				break
+			}
 			if nullOnly[in.P1] {
 				// A REAL test, over the indicator block: jump when it is 1.
 				out.add(jit.ProgInsn{
@@ -503,6 +510,10 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 			// Never taken: see the file comment. Emitted as nothing at all, so
 			// the IR index still maps for any jump that targets it.
 		case OpNotNull:
+			if f, ok := out.nullFlag[in.P1]; ok {
+				out.add(jit.ProgInsn{Op: jit.POpJumpIfZero, A: in.P2 - base, B: f})
+				break
+			}
 			if nullOnly[in.P1] {
 				// The mirror: jump when the indicator is 0.
 				out.add(jit.ProgInsn{
@@ -573,9 +584,16 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 			note(in.P3)
 			out.add(jit.ProgInsn{Op: pop, A: in.P3, B: in.P2, C: in.P1})
 		case OpNull:
-			// A marker, proven unreachable below or the body is refused. It
-			// writes the lowering's scratch register, never a register the
-			// program reads.
+			// A NULL only If and IfNot read is the value they treat as NULL:
+			// the three-valued AND and OR store theirs this way.
+			if ans, tested, ok := segNullReaders(body, i, in.P2); ok && !tested && in.P3 <= in.P2 {
+				note(in.P2)
+				out.add(jit.ProgInsn{Op: jit.POpSetConst, A: in.P2, B: int(ans)})
+				break
+			}
+			// Otherwise a marker, proven unreachable below or the body is
+			// refused. It writes the lowering's scratch register, never a
+			// register the program reads.
 			note(scratchReg)
 			nullMarks = append(nullMarks, len(out.insns))
 			out.add(jit.ProgInsn{Op: jit.POpSetConst, A: scratchReg, B: 0})

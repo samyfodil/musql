@@ -115,6 +115,9 @@ type segment struct {
 	// can read where the bitmap cannot. See segment_nullidx.go.
 	nullMu  eqCountMu
 	nullIdx map[int][]int64
+	// nanReal is a REAL column's block with a NaN in each NULL row, as a
+	// compiled program reads it (segment_nullidx.go).
+	nanReal map[int][]float64
 
 	// Lazily built order-preserving prefixes of a TEXT/BLOB column, one uint64
 	// per row. See segment_prefix.go.
