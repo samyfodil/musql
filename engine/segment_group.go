@@ -12,8 +12,13 @@ type segGroupPlan struct {
 	keyCols []int // table column for each GROUP BY key, -1 for keyProg's
 	keyRegs []int // register the scan body writes that key into
 	// keyProg computes the one key when it is an expression, a block a
-	// segment (segGroupKeys).
+	// segment (segGroupKeys). keyReal is that key a REAL, handed back as its
+	// bits.
 	keyProg *segLowered
+	keyReal bool
+	// series is a loop over generate_series rather than a table: its rows
+	// are written into segments for the walk (segHashAggSeries).
+	series bool
 	// bare is a plan whose outputs read the group's bare columns: each group
 	// is stepped with its whole last row, which only the bulk path does.
 	bare    bool

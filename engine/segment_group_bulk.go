@@ -90,10 +90,14 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		}
 	}
 	var keyRegs []int64
+	var svc *segSvcRunner
 	if plan.keyProg != nil {
 		var ok bool
 		if keyRegs, ok = m.segProgRegs(plan.keyProg); !ok {
 			return bulkNotEligible
+		}
+		if len(plan.keyProg.blocks) > 0 {
+			svc = newSegSvcRunnerFor(m, cols)
 		}
 	}
 	// Which argument column each count(col)/sum(col) reads, by its register.
@@ -143,7 +147,10 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 			}
 		}
 		if plan.keyProg != nil {
-			if bs[si].key, ok = m.segGroupKeys(s, plan.keyProg, ipk, keyRegs); !ok {
+			if bs[si].key, ok = m.segGroupKeys(s, plan.keyProg, ipk, keyRegs, svc); !ok {
+				return bulkNotEligible
+			}
+			if plan.keyReal && !segRealKeysGroup(bs[si].key[:s.nRows]) {
 				return bulkNotEligible
 			}
 		} else {
@@ -372,6 +379,9 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 			}
 		}
 		val := Value{Typ: Int, I: key}
+		if plan.keyReal {
+			val = Value{Typ: Float, F: math.Float64frombits(uint64(key))}
+		}
 		m.regs[plan.keyRegs[0]] = val
 		if c := plan.keyCols[0]; c >= 0 && c < len(row) && !plan.bare {
 			row[c] = val
@@ -554,10 +564,23 @@ func segAbs(v int64) uint64 {
 	return uint64(v)
 }
 
+// segRealKeysGroup reports whether REAL keys, as bits, group as their values
+// do: no NULL (a NaN), and no -0.0, which is 0.0's group under another
+// pattern.
+func segRealKeysGroup(keys []int64) bool {
+	for _, k := range keys {
+		if f := math.Float64frombits(uint64(k)); f != f || k == math.MinInt64 {
+			return false
+		}
+	}
+	return true
+}
+
 // segGroupKeys is the computed key of each of s's rows: low over the
-// segment's column blocks, handing back the key register. false when a
-// column is not a clean INTEGER block, or the key overflowed.
-func (m *vdbe) segGroupKeys(s *segment, low *segLowered, ipk int, regs []int64) ([]int64, bool) {
+// segment's column blocks, handing back the key register, svc running its
+// service blocks. false when a column is not a clean INTEGER block, or the
+// key overflowed.
+func (m *vdbe) segGroupKeys(s *segment, low *segLowered, ipk int, regs []int64, svc *segSvcRunner) ([]int64, bool) {
 	keys := make([]int64, s.nRows)
 	if s.nRows == 0 {
 		return keys, true
@@ -587,7 +610,7 @@ func (m *vdbe) segGroupKeys(s *segment, low *segLowered, ipk int, regs []int64) 
 		}
 		args.Col[i] = &b[0]
 	}
-	if !segCallKernel(kern, args, nil, nil, nil, local) || ovf != 0 || int(out) != s.nRows {
+	if !segCallKernel(kern, args, svc, low.blocks, s, local) || ovf != 0 || int(out) != s.nRows {
 		return nil, false
 	}
 	return keys, true

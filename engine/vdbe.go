@@ -2908,6 +2908,15 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				return nil, fmt.Errorf("vdbe: OpSegHashAgg without a plan")
 			}
 			cur := m.cursors[op.P1]
+			if gplan.series {
+				if cur != nil && m.segHashAggSeries(cur, gplan) {
+					segFilterServed.Add(1)
+					pc = op.P2
+					continue
+				}
+				segFilterDeclined.Add(1)
+				break
+			}
 			if cur == nil || cur.tbl == nil || cur.pager == nil {
 				return nil, fmt.Errorf("vdbe: OpSegHashAgg on a closed cursor")
 			}

@@ -130,6 +130,10 @@ func segLowerRegOperands(in Instruction) [3]int {
 		}
 	case OpInList: // P1 operand, P2 destination, P3 the keys' flag
 		return [3]int{in.P1, in.P2, in.P3}
+	case OpCast: // renamed (segRenameCasts): P1 source, P2 destination
+		if in.P3 == segCastRenamed {
+			return [3]int{in.P1, in.P2, -1}
+		}
 	}
 	return [3]int{-1, -1, -1} // OpGoto and anything the switch will refuse
 }
@@ -164,6 +168,11 @@ func segNullTestedOnly(body []Instruction) map[int]bool {
 			if segLowerableFunc(in) || segIsMathCall(in) {
 				writes[in.P3]++
 				reads[in.P3]--
+			}
+		case OpCast:
+			if in.P3 == segCastRenamed {
+				writes[in.P2]++
+				reads[in.P2]--
 			}
 		case OpGt, OpGe, OpLt, OpLe, OpEq, OpNe:
 			if store, _ := segCompareLowerable(in.P5); store {
@@ -255,6 +264,7 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 	// the lowered control flow from the entry refuses the body if any marker
 	// is reached. "col = NULL" reaches its OpNull on the straight-line path and
 	// is refused exactly as before.
+	body = segRenameCasts(body, base)
 	out := &segLowered{}
 	colSlot := map[int]int{}         // table column -> program column slot
 	irOf := make([]int, len(body)+1) // body index -> IR index
@@ -572,6 +582,10 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 		case OpSCopy:
 			note(in.P2)
 			out.add(jit.ProgInsn{Op: jit.POpLoadReg, A: in.P2, B: in.P1})
+		case OpCast:
+			// An INTEGER cast to INTEGER is itself (segCastNative).
+			note(in.P2)
+			out.add(jit.ProgInsn{Op: jit.POpLoadReg, A: in.P2, B: in.P1})
 		case OpInList:
 			plan, _ := in.P4.(*inListPlan)
 			ints, params, ok := plan.nativeKeys()
@@ -773,7 +787,7 @@ func segLoweredReachable(insns []jit.ProgInsn) []bool {
 			known[in.A] = int64(in.B)
 		case jit.POpLoadCol, jit.POpLoadReg, jit.POpCmp, jit.POpAnd, jit.POpOr,
 			jit.POpNot, jit.POpAdd, jit.POpSub, jit.POpMul, jit.POpRem, jit.POpAbs,
-			jit.POpI2F, jit.POpFAdd, jit.POpFSub, jit.POpFMul, jit.POpFDiv, jit.POpFCmp,
+			jit.POpI2F, jit.POpF2I, jit.POpFAdd, jit.POpFSub, jit.POpFMul, jit.POpFDiv, jit.POpFCmp,
 			jit.POpFIsNull, jit.POpFAbs, jit.POpMath:
 			if _, ok := known[in.A]; ok {
 				known = maps.Clone(known)

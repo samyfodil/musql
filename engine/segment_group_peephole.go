@@ -9,10 +9,10 @@ import "github.com/samyfodil/musql/internal/jit"
 // segGroupPeephole rewrites GROUP BY with all-integer keys and lowered
 // arguments, optionally under a WHERE of the predicates segParsePredBlock reads.
 //
-//	Init; OpenRead c; <prologue: seek hints, ...>; Rewind c -> close
+//	Init; OpenRead c (or generate_series); <prologue: seek hints, ...>; Rewind c -> close
 //	top:   [<predicate blocks and IN lists, each jumping to the Next>]
 //	       <the key, Column c.x or computed> ...; MakeRecord -> key
-//	       [Column c.x -> r; SCopy r -> arg] ...   the aggregates' arguments
+//	       [Column c.x -> r; [ClearSubtype r]; SCopy r -> arg] ...   the aggregates' arguments
 //	       HashAggStep; Next c -> top
 //	close: Close c; HashAggSort ... <the drain, unchanged>
 //
@@ -24,7 +24,11 @@ func segGroupPeephole(prog *Program) bool {
 		return false
 	}
 	in := prog.Insns
-	if len(in) < 10 || in[0].Op != OpInit || in[1].Op != OpOpenRead {
+	if len(in) < 10 || in[0].Op != OpInit {
+		return false
+	}
+	series := segSeriesOpen(in[1])
+	if in[1].Op != OpOpenRead && !series {
 		return false
 	}
 	rewindAt := 2
@@ -89,6 +93,11 @@ func segGroupPeephole(prog *Program) bool {
 			keyAt = pc
 		case op.Op == OpColumn && op.P1 == cursor:
 			regCol[op.P3] = op.P2
+		case op.Op == OpClearSubtype && keyAt >= 0:
+			// A column's value carries no subtype to drop.
+			if _, ok := regCol[op.P1]; !ok {
+				return false
+			}
 		case op.Op == OpSCopy:
 			if src, ok := regCol[op.P1]; ok {
 				regCol[op.P2] = src
@@ -122,7 +131,7 @@ func segGroupPeephole(prog *Program) bool {
 	// ascending (no evaluation).
 	bare := false
 	if !aggPlanReadsOnlyLoweredColsExceptOrder(agg) {
-		if !aggPlanBareOnly(agg) {
+		if series || !aggPlanBareOnly(agg) {
 			return false
 		}
 		for i := 2; i < rewindAt; i++ {
@@ -145,7 +154,7 @@ func segGroupPeephole(prog *Program) bool {
 		}
 	}
 
-	gplan := &segGroupPlan{agg: agg, seg: step.P2, preds: preds, lists: lists, bare: bare}
+	gplan := &segGroupPlan{agg: agg, seg: step.P2, preds: preds, lists: lists, bare: bare, series: series}
 	argsAt := bodyAt
 	if plainKey {
 		for i := 0; i < keyN; i++ {
@@ -165,12 +174,15 @@ func segGroupPeephole(prog *Program) bool {
 				return false
 			}
 		}
+		// Its service blocks (a math kernel's rare inputs, a call native code
+		// does not make) run as an aggregate program's do (segGroupKeys).
 		low, okLow := segLowerBody(in[bodyAt:keyAt], bodyAt, cursor, keyAt, nil)
-		if !okLow || len(low.blocks) > 0 || low.real[keyBase] {
+		if !okLow {
 			return false
 		}
 		low.add(jit.ProgInsn{Op: jit.POpEmitVal, A: keyBase})
 		gplan.keyProg, gplan.keyCols, gplan.keyRegs = low, []int{-1}, []int{keyBase}
+		gplan.keyReal = low.real[keyBase]
 		argsAt = keyAt + 1
 	}
 	// The lowered argument registers are every OTHER register the body wrote

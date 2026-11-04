@@ -344,6 +344,16 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		case POpI2F:
 			a.Scvtf(0, val(in.B, X9))
 			fset(in.A, 0)
+		case POpF2I:
+			// FCVTZS saturates at both ends as CAST does; a NaN, a NULL with no
+			// INTEGER, raises the overflow flag.
+			fval(in.B, 0)
+			d := dst(in.A, X11)
+			a.Fcvtzs(d, 0)
+			a.Fcmp(0, 0)
+			a.CsetRaw(X10, armVS)
+			a.OrrReg(X4, X4, X10)
+			fin(in.A, d)
 		case POpFAdd, POpFSub, POpFMul, POpFDiv:
 			fval(in.B, 0)
 			fval(in.C, 1)

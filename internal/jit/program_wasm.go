@@ -398,6 +398,19 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			storeReg(in.B, func() { loadReg(in.B); w.I64(1); w.op(opI64Add) })
 		case POpI2F:
 			fset(in.A, func() { loadReg(in.B); w.op(opF64ConvertI64S) })
+		case POpF2I:
+			// trunc_sat saturates at both ends as CAST does; a NaN, a NULL with
+			// no INTEGER, raises the overflow flag.
+			fval(in.B)
+			w.Set(fx)
+			w.Get(ovf)
+			w.Get(fx)
+			w.Get(fx)
+			w.op(opF64Ne)
+			w.op(opI64ExtendI32U)
+			w.op(opI64Or)
+			w.Set(ovf)
+			storeReg(in.A, func() { w.Get(fx); w.op(opMisc, miscI64TruncSatF64S) })
 		case POpFAdd, POpFSub, POpFMul:
 			fset(in.A, func() { fval(in.B); fval(in.C); w.op(progWasmFArith[in.Op]) })
 		case POpFDiv:

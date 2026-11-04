@@ -251,6 +251,10 @@ const (
 
 	// POpI2F: r[A] = float64(int64 r[B]).
 	POpI2F
+	// POpF2I: r[A] = the REAL r[B] as an INTEGER by CAST's rule (vdbemem.c's
+	// doubleToInt64): truncated, and MinInt64 or MaxInt64 past either end. A
+	// NULL has no INTEGER: it raises the overflow flag.
+	POpF2I
 	// POpFAdd, POpFSub, POpFMul, POpFDiv: r[A] = r[B] op r[C]. A zero divisor
 	// gives NaN, since dividing by zero is NULL in SQL.
 	POpFAdd
