@@ -65,6 +65,7 @@ func (a *app) runShell(ctx context.Context, db *sql.DB, script []string, banner 
 		return err
 	}
 	defer term.Restore(a.env.StdinFd, old)
+	defer consoleVT(a.env.StdoutFd)()
 	t := term.NewTerminal(struct {
 		io.Reader
 		io.Writer
