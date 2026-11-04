@@ -105,6 +105,7 @@ type Shell struct {
 	Out   io.Writer
 	Mode  string // table, csv or json
 	Timer bool   // print each statement's run time
+	reads int    // .read files open, one inside another
 }
 
 const (
@@ -115,23 +116,36 @@ const (
 // REPL reads statements until .quit or end of input; errors are printed to
 // errw and do not stop it.
 func (s *Shell) REPL(ctx context.Context, in LineReader, errw io.Writer) error {
+	_, err := s.run(ctx, in, errw, false)
+	return err
+}
+
+// run is REPL, reporting whether a .quit ended it. With finish, a statement
+// left unterminated at the end of input runs, as the last one of a file
+// does.
+func (s *Shell) run(ctx context.Context, in LineReader, errw io.Writer, finish bool) (quit bool, err error) {
 	var buf strings.Builder
 	in.SetPrompt(prompt)
 	for {
 		line, err := in.ReadLine()
 		if errors.Is(err, io.EOF) {
-			return nil
+			if finish && strings.TrimSpace(buf.String()) != "" {
+				if err := s.Script(ctx, buf.String()); err != nil {
+					fmt.Fprintf(errw, "Error: %v\n", err)
+				}
+			}
+			return false, nil
 		}
 		if err != nil {
-			return err
+			return false, err
 		}
 		if buf.Len() == 0 && strings.HasPrefix(strings.TrimSpace(line), ".") {
-			quit, err := s.Meta(ctx, strings.TrimSpace(line))
+			quit, err := s.meta(ctx, strings.TrimSpace(line), errw)
 			if err != nil {
 				fmt.Fprintf(errw, "Error: %v\n", err)
 			}
 			if quit {
-				return nil
+				return true, nil
 			}
 			continue
 		}
@@ -304,15 +318,34 @@ const helpText = `.tables              list tables and views
 .schema [table]      show CREATE statements
 .mode table|csv|json output format
 .timer on|off        print each statement's run time
+.read FILE           run the SQL and dot-commands in FILE
 .quit                leave the shell
 `
 
+// readsMax bounds .read files open inside one another, so a file that reads
+// itself stops.
+const readsMax = 16
+
 // Meta runs a dot-command.
 func (s *Shell) Meta(ctx context.Context, line string) (quit bool, err error) {
+	return s.meta(ctx, line, s.Out)
+}
+
+// meta is Meta, the errors of a .read file's statements printed to errw.
+func (s *Shell) meta(ctx context.Context, line string, errw io.Writer) (quit bool, err error) {
 	f := strings.Fields(line)
 	switch f[0] {
 	case ".quit", ".exit", ".q":
 		return true, nil
+	case ".read":
+		name := strings.TrimSpace(strings.TrimPrefix(line, ".read"))
+		if len(name) >= 2 && (name[0] == '"' || name[0] == '\'') && name[len(name)-1] == name[0] {
+			name = name[1 : len(name)-1]
+		}
+		if name == "" {
+			return false, errors.New("usage: .read FILE")
+		}
+		return s.read(ctx, name, errw)
 	case ".help":
 		io.WriteString(s.Out, helpText)
 	case ".tables":
@@ -355,6 +388,35 @@ func (s *Shell) Meta(ctx context.Context, line string) (quit bool, err error) {
 	}
 	return false, nil
 }
+
+// read runs the SQL and dot-commands in the file name, as typed at the
+// prompt; a .quit there ends the shell.
+func (s *Shell) read(ctx context.Context, name string, errw io.Writer) (quit bool, err error) {
+	if s.reads >= readsMax {
+		return false, fmt.Errorf(".read %s: more than %d files open one inside another", name, readsMax)
+	}
+	b, err := os.ReadFile(name)
+	if err != nil {
+		return false, err
+	}
+	s.reads++
+	defer func() { s.reads-- }()
+	return s.run(ctx, &fileLines{lines: strings.Split(string(b), "\n")}, errw, true)
+}
+
+// fileLines reads a file's lines as the REPL reads typed ones.
+type fileLines struct{ lines []string }
+
+func (f *fileLines) ReadLine() (string, error) {
+	if len(f.lines) == 0 {
+		return "", io.EOF
+	}
+	line := strings.TrimSuffix(f.lines[0], "\r")
+	f.lines = f.lines[1:]
+	return line, nil
+}
+
+func (f *fileLines) SetPrompt(string) {}
 
 func (s *Shell) listTables(ctx context.Context) error {
 	rows, err := s.DB.QueryContext(ctx, `SELECT name FROM sqlite_schema WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name`)

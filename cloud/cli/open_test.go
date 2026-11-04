@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -62,5 +63,52 @@ func TestShellTimer(t *testing.T) {
 	}
 	if !strings.Contains(errs.String(), "usage: .timer on|off") {
 		t.Fatalf("errors %q", errs.String())
+	}
+}
+
+// TestShellRead: .read runs a file's statements and dot-commands as if typed,
+// its last statement with or without a ";", and carries on past an error as
+// the prompt does; a .quit in it ends the shell, and a file reading itself
+// stops.
+func TestShellRead(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, text string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dir, "t.musq"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	a := write("a.txt", ".mode csv\r\nselect 1 a,2 b")
+	b := write("b with space.sql", ".read "+a+"\nSELECT nosuch;\nSELECT 3 AS c;\n")
+	q := write("q.sql", "SELECT 4 AS d;\n.quit\n")
+	self := write("self.sql", ".read "+filepath.Join(dir, "self.sql")+"\n")
+	run := func(in ...string) (string, string) {
+		var out, errs bytes.Buffer
+		sh := &cli.Shell{DB: db, Out: &out, Mode: "table"}
+		if err := sh.REPL(context.Background(), &lines{in: in}, &errs); err != nil {
+			t.Fatal(err)
+		}
+		return out.String(), errs.String()
+	}
+	if out, errs := run(".read " + a); out != "a,b\n1,2\n" || errs != "" {
+		t.Fatalf("the issue's file: %q %q", out, errs)
+	}
+	if out, errs := run(`.read "`+b+`"`, "SELECT 5 AS e;"); out != "a,b\n1,2\nc\n3\ne\n5\n" || !strings.Contains(errs, "nosuch") {
+		t.Fatalf("nested, past an error: %q %q", out, errs)
+	}
+	if out, _ := run(".read "+q, "SELECT 6 AS f;"); out != "d\n4\n" {
+		t.Fatalf(".quit in a file: %q", out)
+	}
+	if _, errs := run(".read " + self); !strings.Contains(errs, "one inside another") {
+		t.Fatalf("a file reading itself: %q", errs)
+	}
+	if _, errs := run(".read "+filepath.Join(dir, "none.sql"), ".read"); !strings.Contains(errs, "none.sql") || !strings.Contains(errs, "usage: .read FILE") {
+		t.Fatalf("no file: %q", errs)
 	}
 }
