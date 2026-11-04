@@ -236,6 +236,29 @@ the ones in #70 and #74, each with its digits from a recursive CTE, `VALUES` or
 On the Xeon D the sudoku takes about 55 ms against C SQLite's 99 ms (mattn), and
 the harder one 4.3 s against 7.9 s.
 
+### Issue #95, and REAL columns with NULLs
+
+The GROUP BY queries reported in #95, and filters and aggregates over a REAL
+column holding NULLs, which until #102 kept every compiled program off the
+column. Measured as above, on an M4 also running other jobs (load average
+about 29), so every time here is higher than on a quiet machine, C SQLite's
+too. "Before" is main just before #98 for #95, and just before #102 for the
+rest.
+
+`u` is `create table u as select value id, case when value % 10 = 0 then null
+else (value % 300 - 150) * 0.25 end x, value % 17 * 1.5 y from
+generate_series(1, 1000000)`: 1M rows, a NULL in every tenth `x`.
+
+| issue | query | before | after | C SQLite |
+| --- | --- | ---: | ---: | ---: |
+| #95 | `select sum(value)from generate_series(1,1000000) group by round(log(value))` | 1055 ms | 112.7 ms | 263 ms |
+| #95 | `select sum(value)from generate_series(1,1000000) group by cast(round(log(value)) as int)` | 931 ms | 50.9 ms | 172 ms |
+| #95 | `select sum(value)from generate_series(1,1000000) group by value%7` | 514 ms | 29.2 ms | 192 ms |
+| | `select count(*) from u where x > 3` | 69.0 ms | 0.6 ms | 26 ms |
+| | `select sum(x), min(x), max(x) from u` | 407.9 ms | 2.3 ms | 68 ms |
+| | `select count(*) from u where x < -10 or x > 10` | 246.2 ms | 1.5 ms | 42 ms |
+| | `select sum(y) from u where x between -10 and 10` | 362.3 ms | 1.6 ms | 39 ms |
+
 ## Bulk load and point reads
 
 `bench/pointread` measures what an application does with a key-value table,
