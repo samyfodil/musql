@@ -42,27 +42,31 @@ func openPTY(t *testing.T) (master, slave *os.File) {
 	return m, s
 }
 
-// TestInteractiveShell: on a terminal the shell edits lines in raw mode, runs
-// what is typed and keeps it in its history.
-func TestInteractiveShell(t *testing.T) {
+// shellOnPTY runs the shell on a pseudo-terminal cols wide, types typed into
+// it and returns what it printed once it quits.
+func shellOnPTY(t *testing.T, cols uint16, typed string) (dir, out string) {
 	h := start(t)
 	h.login()
 	h.run("org", "create", "acme")
 	h.run("config", "set", "org", "acme")
 	h.run("db", "create", "app")
 	master, slave := openPTY(t)
-	out := &syncBuf{}
+	ws := [4]uint16{24, cols}
+	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, slave.Fd(), syscall.TIOCSWINSZ, uintptr(unsafe.Pointer(&ws))); e != 0 {
+		t.Fatal(e)
+	}
+	buf := &syncBuf{}
 	done := make(chan error, 1)
 	go func() {
-		done <- cli.Run(context.Background(), cli.Env{Dir: h.dir, Stdin: slave, Stdout: out, Stderr: io.Discard,
-			Interactive: true, StdinFd: int(slave.Fd())}, []string{"db", "shell", "app"})
+		done <- cli.Run(context.Background(), cli.Env{Dir: h.dir, Stdin: slave, Stdout: buf, Stderr: io.Discard,
+			Interactive: true, StdinFd: int(slave.Fd()), StdoutFd: int(slave.Fd())}, []string{"db", "shell", "app"})
 	}()
-	for deadline := time.Now().Add(10 * time.Second); !strings.Contains(out.String(), "Connected to acme/app"); time.Sleep(10 * time.Millisecond) {
+	for deadline := time.Now().Add(10 * time.Second); !strings.Contains(buf.String(), "Connected to acme/app"); time.Sleep(10 * time.Millisecond) {
 		if time.Now().After(deadline) {
-			t.Fatalf("no greeting: %q", out.String())
+			t.Fatalf("no greeting: %q", buf.String())
 		}
 	}
-	if _, err := master.Write([]byte("SELECT 41 + 1 AS n;\r.quit\r")); err != nil {
+	if _, err := master.Write([]byte(typed)); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -71,12 +75,29 @@ func TestInteractiveShell(t *testing.T) {
 			t.Fatal(err)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatalf("the shell did not quit: %q", out.String())
+		t.Fatalf("the shell did not quit: %q", buf.String())
 	}
-	if !strings.Contains(out.String(), "42") {
-		t.Fatalf("output: %q", out.String())
+	return h.dir, buf.String()
+}
+
+// TestInteractiveShell: on a terminal the shell edits lines in raw mode, runs
+// what is typed and keeps it in its history.
+func TestInteractiveShell(t *testing.T) {
+	dir, out := shellOnPTY(t, 80, "SELECT 41 + 1 AS n;\r.quit\r")
+	if !strings.Contains(out, "42") {
+		t.Fatalf("output: %q", out)
 	}
-	if b, err := os.ReadFile(h.dir + "/history"); err != nil || !strings.Contains(string(b), "SELECT 41 + 1 AS n;") {
+	if b, err := os.ReadFile(dir + "/history"); err != nil || !strings.Contains(string(b), "SELECT 41 + 1 AS n;") {
 		t.Fatalf("history: %q %v", b, err)
+	}
+}
+
+// TestInteractiveShellWidth: a line longer than 80 columns is echoed on one
+// line of a terminal wide enough for it, not wrapped at the 80th (#101).
+func TestInteractiveShellWidth(t *testing.T) {
+	stmt := "SELECT '" + strings.Repeat("a", 120) + "' AS s;"
+	_, out := shellOnPTY(t, 200, stmt+"\r.quit\r")
+	if !strings.Contains(out, "musql> "+stmt) {
+		t.Fatalf("the line was wrapped: %q", out)
 	}
 }

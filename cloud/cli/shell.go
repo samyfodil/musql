@@ -73,7 +73,22 @@ func (a *app) runShell(ctx context.Context, db *sql.DB, script []string, banner 
 	t.History = loadHistory(filepath.Join(a.env.Dir, "history"))
 	sh.Out = t
 	fmt.Fprintf(t, "%s End statements with ;  .help for commands.\n", banner)
-	return sh.REPL(ctx, t, t)
+	return sh.REPL(ctx, sizedTerminal{t, a.env.StdoutFd}, t)
+}
+
+// sizedTerminal is the line editor fitted to the terminal before each line:
+// it wraps what is typed at the width it was given, 80 columns unless told
+// (#101), and the window may have been resized since the last line.
+type sizedTerminal struct {
+	*term.Terminal
+	fd int
+}
+
+func (t sizedTerminal) ReadLine() (string, error) {
+	if w, h, err := term.GetSize(t.fd); err == nil {
+		t.SetSize(w, h)
+	}
+	return t.Terminal.ReadLine()
 }
 
 // dbToken mints a one-hour token for d: full access when the caller's role

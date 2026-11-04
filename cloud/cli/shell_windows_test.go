@@ -16,8 +16,9 @@ import (
 )
 
 // TestConsoleLineEditing (#93): in a Windows console the line editor's
-// backspace and arrow keys move the cursor instead of printing "^[[D". The
-// shell runs in a child of this test inside a pseudo-console, the keys are
+// backspace and arrow keys move the cursor instead of printing "^[[D", and a
+// line longer than 80 columns is not wrapped at the 80th (#101). The shell
+// runs in a child of this test inside a pseudo-console, the keys are
 // typed into it, and what the console renders is read back.
 func TestConsoleLineEditing(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "t.musq")
@@ -105,6 +106,8 @@ func TestConsoleLineEditing(t *testing.T) {
 	typ("e csv\r")
 	typ("SELECT 41 + 1 AS a, 'x' AS b;\r")
 	wait("42,x")
+	long := "SELECT'" + strings.Repeat("a", 70) + "';"
+	typ(long + "\r")
 	typ(".quit\r")
 	windows.WaitForSingleObject(pi.Process, 20000)
 	windows.ClosePseudoConsole(pc)
@@ -113,6 +116,9 @@ func TestConsoleLineEditing(t *testing.T) {
 	// them would show their text, the ESC as a glyph and "[D" after it.
 	if strings.Contains(strings.ReplaceAll(got, "\x1b[", ""), "[D") || strings.Contains(got, "←[") {
 		t.Errorf("escape sequences printed as text:\n%q", got)
+	}
+	if !strings.Contains(got, long) {
+		t.Errorf("the long line was wrapped:\n%q", got)
 	}
 }
 
