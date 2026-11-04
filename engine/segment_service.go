@@ -81,6 +81,11 @@ func segInsnRegs(in Instruction) (reads, writes []int, jump, ok bool) {
 		return []int{in.P1}, []int{in.P2}, false, true
 	case OpConcat, OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder:
 		return []int{in.P1, in.P2}, []int{in.P3}, false, true
+	case OpCast:
+		if in.P3 == segCastRenamed {
+			return []int{in.P1}, []int{in.P2}, false, true
+		}
+		return []int{in.P1}, []int{in.P1}, false, true
 	}
 	return nil, nil, false, false
 }
@@ -104,6 +109,8 @@ func segNativeLowerable(in Instruction, cursor int) bool {
 		plan, _ := in.P4.(*inListPlan)
 		_, _, ok := plan.nativeKeys()
 		return ok
+	case OpCast:
+		return segCastNative(in) == affInteger
 	}
 	return false
 }
@@ -319,7 +326,12 @@ type segSvcRunner struct {
 }
 
 func newSegSvcRunner(m *vdbe, tbl *resolvedTable) *segSvcRunner {
-	r := &segSvcRunner{vm: *m, plans: segColPlansFor(tbl)}
+	return newSegSvcRunnerFor(m, segColPlansFor(tbl))
+}
+
+// newSegSvcRunnerFor is newSegSvcRunner for columns read as plans say.
+func newSegSvcRunnerFor(m *vdbe, plans []segColPlan) *segSvcRunner {
+	r := &segSvcRunner{vm: *m, plans: plans}
 	r.vm.regs = append([]Value(nil), m.regs...)
 	r.vm.fnArgBuf = nil
 	r.vm.likePlan = nil
@@ -451,6 +463,12 @@ func (m *vdbe) segEvalInsn(op *Instruction, column func(*Instruction) Value) (ta
 		taken = w[op.P1].Typ != Null
 	case OpInList:
 		w[op.P2] = m.inList(op)
+	case OpCast:
+		dst := op.P1
+		if op.P3 == segCastRenamed {
+			dst = op.P2
+		}
+		w[dst] = castValueEnc(w[op.P1], op.P4.(string), m.encoding())
 	default:
 		return false, false
 	}
@@ -460,6 +478,11 @@ func (m *vdbe) segEvalInsn(op *Instruction, column func(*Instruction) Value) (ta
 // segCallKernel runs kern to completion, performing each service it stops
 // for. false declines the statement.
 func segCallKernel(kern *jit.Code, args *jit.ProgArgs, svc *segSvcRunner, blocks []segSvcBlock, s *segment, regs []int64) bool {
+	// A block's registers are the kernel's, which may be past the machine's
+	// (segRenameCasts): the window covers them all.
+	if svc != nil && len(svc.vm.regs) < len(regs) {
+		svc.vm.regs = append(svc.vm.regs, make([]Value, len(regs)-len(svc.vm.regs))...)
+	}
 	for {
 		kern.Call2(args)
 		if args.PC == 0 {

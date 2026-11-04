@@ -235,6 +235,9 @@ func stepOf(in ProgInsn) progStep {
 		}
 	case POpI2F, POpFIsNull, POpFAbs:
 		s.uses, s.defs, s.pure = []int{in.B}, []int{in.A}, true
+	case POpF2I:
+		// Not pure: a NULL raises the overflow flag.
+		s.uses, s.defs = []int{in.B}, []int{in.A}
 	case POpFAdd, POpFSub, POpFMul, POpFDiv:
 		s.uses, s.defs, s.pure = []int{in.B, in.C}, []int{in.A}, true
 	case POpFCmp:

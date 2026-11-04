@@ -222,3 +222,35 @@ func TestFloatProgramMathService(t *testing.T) {
 		t.Errorf("%d stops, want 2 (the tiny and the huge x)", stops)
 	}
 }
+
+// POpF2I is CAST(x AS INTEGER) of a REAL: truncated toward zero, MinInt64 and
+// MaxInt64 past either end, and a NULL raising the overflow flag.
+func TestFloatProgramToInteger(t *testing.T) {
+	xs := []float64{1.5, -1.5, 0, math.Copysign(0, -1), 2.999999, -2.999999, 0x1p62, 0x1p63, -0x1p63,
+		math.Nextafter(0x1p63, 0), math.Nextafter(-0x1p63, -1e300), 1e300, -1e300, math.Inf(1), math.Inf(-1), math.NaN()}
+	insns := []ProgInsn{
+		{Op: POpLoadCol, A: 0, B: 0},
+		{Op: POpF2I, A: 1, B: 0},
+		{Op: POpService, A: 0},
+	}
+	for _, x := range xs {
+		var got int64
+		_, _, ovf, _ := floatRun(t, insns, [2]float64{}, func(regs []int64, row int) { got = regs[1] }, []float64{x})
+		if x != x {
+			if ovf == 0 {
+				t.Errorf("CAST(NULL AS INTEGER) raised no overflow")
+			}
+			continue
+		}
+		want := int64(x)
+		switch {
+		case x >= 0x1p63:
+			want = math.MaxInt64
+		case x <= -0x1p63:
+			want = math.MinInt64
+		}
+		if got != want || ovf != 0 {
+			t.Errorf("CAST(%v AS INTEGER) = %d (overflow %d), want %d", x, got, ovf, want)
+		}
+	}
+}

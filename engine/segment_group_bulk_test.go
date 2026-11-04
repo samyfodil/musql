@@ -61,7 +61,7 @@ func TestColumnarGroupBulkMatchesTheLoop(t *testing.T) {
 		{`SELECT v, count(*) FROM t GROUP BY k ORDER BY k`, true},
 		{`SELECT k, id, wide, count(*), sum(v) FROM t GROUP BY k ORDER BY k`, true},
 		{`SELECT n + 1, count(*) FROM t GROUP BY n + 1`, false}, // NULLs
-		{`SELECT k / 2.0, count(*) FROM t GROUP BY k / 2.0`, false},
+		{`SELECT k / 2.0, count(*) FROM t GROUP BY k / 2.0`, true}, // a REAL key
 		{`SELECT k+1, count(*) FROM t GROUP BY k+1 ORDER BY 1`, false}, // a sorter drains it
 		{`SELECT big * 5, count(*) FROM t GROUP BY big * 5`, false},    // overflow
 	}

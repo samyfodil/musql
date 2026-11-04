@@ -100,6 +100,15 @@ func segRegReals(body []Instruction, cursor int, kinds *segKinds, nullOnly map[i
 			set(in.P3, segFuncReal(in, real))
 		case OpInList, OpLike, OpGlob:
 			set(in.P2, false)
+		case OpCast:
+			if in.P3 == segCastRenamed {
+				set(in.P2, segCastNative(in) == affReal)
+			} else {
+				// In place: the register's one representation must be the
+				// cast's answer's too.
+				typ, _ := in.P4.(string)
+				set(in.P1, typ == "REAL")
+			}
 		}
 	}
 	return real, ok
@@ -197,6 +206,9 @@ func segRealNative(in Instruction, cursor int, real, lits map[int]bool, params m
 	case OpFunction:
 		_, ok := segRealCall(in, real)
 		return ok
+	case OpCast:
+		a := segCastNative(in)
+		return a == affInteger || a == affReal
 	}
 	return false
 }
@@ -305,6 +317,21 @@ func (l *segLowered) lowerReal(body []Instruction, i, base int, nextReg *int, sc
 		}
 		note(scratch)
 		l.add(jit.ProgInsn{Op: jit.POpFIsNull, A: scratch, B: in.P1}, jit.ProgInsn{Op: op, A: in.P2 - base, B: scratch})
+		return true, true
+	case OpCast:
+		// To INTEGER by CAST's rule, a NULL declining (POpF2I); to REAL, an
+		// INTEGER read as a double and a REAL itself.
+		note(in.P2)
+		switch {
+		case segCastNative(in) == affInteger && real[in.P1]:
+			l.add(jit.ProgInsn{Op: jit.POpF2I, A: in.P2, B: in.P1})
+		case segCastNative(in) == affInteger:
+			l.add(jit.ProgInsn{Op: jit.POpLoadReg, A: in.P2, B: in.P1})
+		case real[in.P1]:
+			l.add(jit.ProgInsn{Op: jit.POpLoadReg, A: in.P2, B: in.P1})
+		default:
+			l.add(jit.ProgInsn{Op: jit.POpI2F, A: in.P2, B: in.P1})
+		}
 		return true, true
 	case OpFunction:
 		kind, okCall := segRealCall(in, real)

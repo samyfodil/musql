@@ -358,6 +358,24 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.Xorps(X0, X0)
 			a.Cvtsi2sdq(X0, x)
 			fset(in.A, X0)
+		case POpF2I:
+			// CVTTSD2SI answers MinInt64 for a NaN and past either end; CAST
+			// answers MaxInt64 from 2^63 up, and a NULL has no INTEGER.
+			nan, big, done := "fn"+itoa(idx), "fb"+itoa(idx), "fi"+itoa(idx)
+			fval(in.B, X0)
+			a.Cvttsd2siq(RAX, X0)
+			a.MovsdRIP(X1, consts.label(math.Float64bits(0x1p63), 0))
+			a.Ucomisd(X0, X1)
+			a.Jcc(ccP, nan)
+			a.Jcc(ccAE, big)
+			a.Jmp(done)
+			a.Label(big)
+			a.MovRegImm64(RAX, math.MaxInt64)
+			a.Jmp(done)
+			a.Label(nan)
+			a.aluImm32(1, R9, 1)
+			a.Label(done)
+			set(in.A, RAX)
 		case POpFAdd, POpFSub, POpFMul, POpFDiv:
 			fval(in.B, X0)
 			fval(in.C, X1)
