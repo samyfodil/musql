@@ -31,6 +31,9 @@ type Env struct {
 	StderrIsTerminal bool
 	// StdinFd is Stdin's descriptor when Interactive, for raw-mode line editing.
 	StdinFd int
+	// StdoutFd is Stdout's descriptor, whose console the line editor asks to
+	// interpret its escape sequences (Windows).
+	StdoutFd int
 	// OpenBrowser opens a URL for the user; nil or an error means print only.
 	OpenBrowser func(string) error
 	HTTP        *http.Client

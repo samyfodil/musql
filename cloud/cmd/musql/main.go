@@ -45,6 +45,7 @@ func main() {
 		Interactive:      term.IsTerminal(fd),
 		StderrIsTerminal: term.IsTerminal(int(os.Stderr.Fd())),
 		StdinFd:          fd,
+		StdoutFd:         int(os.Stdout.Fd()),
 		OpenBrowser:      openBrowser,
 	}, os.Args[1:])
 	if err != nil {
