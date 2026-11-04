@@ -164,8 +164,8 @@ func segRealOp(in Instruction, real map[int]bool) bool {
 	return false
 }
 
-// segIntSources finds the registers written once, by an INTEGER literal
-// (lits) or a parameter (params: its index).
+// segIntSources finds the registers written once, by an INTEGER literal or
+// its negation (lits) or a parameter (params: its index).
 func segIntSources(body []Instruction) (lits map[int]bool, params map[int]int) {
 	writes := map[int]int{}
 	for _, in := range body {
@@ -181,6 +181,10 @@ func segIntSources(body []Instruction) (lits map[int]bool, params map[int]int) {
 			lits[in.P2] = true
 		case in.Op == OpVariable && writes[in.P2] == 1:
 			params[in.P2] = in.P1
+		case in.Op == OpNegative && writes[in.P2] == 1 && lits[in.P1]:
+			// "-10" is Integer 10 and its negation: an int32 still, which a
+			// double holds exactly.
+			lits[in.P2] = true
 		}
 	}
 	return lits, params

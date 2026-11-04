@@ -2677,6 +2677,19 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			// Every one of these reads the cursor's own pager, not m.pager: a
 			// root page is file-local, so counting root N in main for a cursor
 			// over TEMP or an attachment answers about a different table.
+			//
+			// A comparison on a REAL block runs fastest as the compiled
+			// program, which reads the block as doubles: the kernels below
+			// compare int64 lanes and leave a REAL to a slower path.
+			progFirst := plan.prog != nil && cur.pager.segReadsReal(cur.tbl.root, plan.preds)
+			if progFirst {
+				if vs, served := m.segRunProgramAll(cur.pager, cur.tbl, plan.prog); served && len(vs) == 1 {
+					segFilterServed.Add(1)
+					m.regs[op.P1] = vs[0]
+					pc = op.P3
+					continue
+				}
+			}
 			if preds, okBounds := m.segPlanPreds(plan); okBounds && (len(plan.semis) > 0 || len(plan.ins) > 0 || len(plan.likes) > 0) {
 				semis, okSemi := m.segSemis(plan.semis)
 				ins, okIn := m.segIns(plan.ins)
@@ -2704,7 +2717,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 					continue
 				}
 			}
-			if plan.prog != nil {
+			if plan.prog != nil && !progFirst {
 				if vs, served := m.segRunProgramAll(cur.pager, cur.tbl, plan.prog); served && len(vs) == 1 {
 					segFilterServed.Add(1)
 					m.regs[op.P1] = vs[0]

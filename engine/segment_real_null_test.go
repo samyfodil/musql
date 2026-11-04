@@ -7,8 +7,9 @@ import (
 
 // TestRealNullColumns: a REAL column holding NULLs is read by a compiled
 // program as its block with a NaN for each NULL, which is how the program
-// holds a REAL NULL. Aggregates, filters, arithmetic and NULL tests over it
-// answer as the loop does, and are compiled programs rather than the loop.
+// holds a REAL NULL. Aggregates, filters (OR, BETWEEN, a negative literal, an
+// INTEGER bound), arithmetic and NULL tests over it answer as the loop does,
+// and are compiled programs rather than the loop.
 func TestRealNullColumns(t *testing.T) {
 	stmts := []string{`CREATE TABLE t(id INTEGER PRIMARY KEY, x REAL, y REAL, k INTEGER)`}
 	for i := 1; i <= 4000; i++ {
@@ -35,6 +36,10 @@ func TestRealNullColumns(t *testing.T) {
 		`SELECT max(abs(x)), min(round(x)) FROM t WHERE k < 5`,
 		`SELECT sum(x) FROM t WHERE x BETWEEN -10 AND 10`,
 		`SELECT count(*) FROM t WHERE x + y > 4`,
+		`SELECT count(*) FROM t WHERE x > -10 AND x < 10`,
+		`SELECT count(*) FROM t WHERE y > 3 AND y < 20`,
+		`SELECT sum(y) FROM t WHERE y > 3`,
+		`SELECT count(*) FROM t WHERE x < -7 OR x > -3`,
 	}
 	for _, q := range queries {
 		want := typedRows(p.mustPlain(q))
