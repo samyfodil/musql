@@ -173,12 +173,17 @@ vector points at. A restore to T is ordinary writes through the database's
 replicated `*sql.DB`, in one transaction, so it is never half done:
 
 1. this node's history at T is restored to a scratch file and plain-copied;
-2. in the transaction, `sqlite_schema` less the engine's `sqlite_` objects
-   must equal T's (the bookkeeping is on both sides), else it is declined:
-   "the schema changed since <T>: restore into a new database";
-3. it is declined as well when a row is withheld, at T or now: a withheld row
-   is alive in the clock and in no table, so a table diff can neither bring it
-   back as it was nor delete it;
+2. in the transaction, the schema is made T's, in statements that replicate
+   like any (the user's objects of `sqlite_schema`, the bookkeeping set
+   aside: the objects the plain copy lacks): what T did not have is dropped,
+   a table T defined otherwise is dropped and made again as T had it, empty
+   (its rows come back in step 4), and what T had and is missing is made.
+   Views and indexes are dropped first and made last;
+3. a row withheld now is ended: it is alive in the clock and in no table, and
+   would come in once its value frees, which T did not have. It is written,
+   its UNIQUE columns given values no row holds, and deleted in the same
+   transaction, a delete newer than the row on every node. A row withheld at
+   T is in no table of T's plain copy, so the diff leaves it out;
 4. each table's rows are matched by replication's identity, the declared
    primary key or else the rowid, and compared value for value, types
    included (generated columns follow the others). A row only now is deleted,

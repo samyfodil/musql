@@ -307,8 +307,8 @@ peers:
   regular database's are made on its master). A restore in
   place writes the difference between now and T through the replicated
   handle, in one transaction, so every node converges to T plus the writes
-  made concurrently; it is declined across a schema change or while a row is
-  withheld. See `HISTORY.md`, "Per node, in a cluster".
+  made concurrently, its schema made T's too and a row withheld now ended.
+  See `HISTORY.md`, "Per node, in a cluster".
 
 #### What a cluster database refuses
 
@@ -364,10 +364,8 @@ deterministic or visible, never two rows with one name:
 
 Declined, deliberately: linearizable multi-node writes (a master's commit is
 durable on the master and reaches the others after it); a standalone database
-holding what a cluster refuses joining one; an in-place restore of a
-`crdt` database across a schema change or with a row withheld (restore into a
-new database instead); a usage
-view that counts more than the nodes have synced.
+holding what a cluster refuses joining one; a usage view that counts more
+than the nodes have synced.
 
 ## Usage analytics
 
