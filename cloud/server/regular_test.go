@@ -89,7 +89,7 @@ func regularDatabase(t *testing.T, du v1.Durability) {
 
 // ids is t's ids in db on node c, in order, "" on any error.
 func (c *clusterNode) ids(db string) string {
-	status, res := c.pipeline("/db/acme/"+db, c.admin, "SELECT group_concat(id) FROM (SELECT id FROM t ORDER BY id)")
+	status, res := c.pipeline("/db/acme/"+db, c.admin, "SELECT group_concat(id || v) FROM (SELECT id, v FROM t ORDER BY id)")
 	if status != 200 || len(res) != 1 || res[0].Type != "ok" || len(res[0].Response.Result.Rows) != 1 {
 		return ""
 	}
@@ -120,13 +120,18 @@ func TestClusterDurableDatabase(t *testing.T) {
 	for _, n := range rest {
 		n.exec(app, n.admin, "INSERT INTO t(v) VALUES ('after')")
 	}
-	eventually(t, "every row on the rest", func() bool {
-		for _, n := range rest {
-			if n.ids("app") != "1,3,4" {
-				return false
-			}
+	var seen []string
+	defer func() {
+		if t.Failed() {
+			t.Logf("ids on the rest: %q", seen)
 		}
-		return true
+	}()
+	eventually(t, "every row on the rest", func() bool {
+		seen = seen[:0]
+		for _, n := range rest {
+			seen = append(seen, n.ids("app"))
+		}
+		return seen[0] == "1a,3after,4after" && seen[1] == "1a,3after,4after"
 	})
 }
 

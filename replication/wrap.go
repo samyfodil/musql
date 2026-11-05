@@ -174,7 +174,7 @@ func newSyncer(ctx context.Context, applyDB *sql.DB, site string, shared bool) (
 	s.rowidLo, s.rowidHi = RowidRange(site)
 	renumber := s.rowidLo
 	if shared {
-		s.rowidLo, s.rowidHi, renumber = 1, 1<<63, 0
+		s.rowidLo, s.rowidHi, renumber = 1, 1<<63-1, 0
 		store.seenRowid = s.noteRowid
 	}
 	if err := store.genesis(ctx, renumber); err != nil {
@@ -187,6 +187,7 @@ func newSyncer(ctx context.Context, applyDB *sql.DB, site string, shared bool) (
 		return nil, err
 	}
 	s.setCatalog(store.cat, store.ver) // rowidFloor needs it before any capture has run
+	store.catalogSet = s.setCatalog
 	return s, nil
 }
 
