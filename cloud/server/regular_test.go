@@ -80,3 +80,39 @@ func TestClusterRegularDatabase(t *testing.T) {
 	nodes[m].ready()
 	eventually(t, "the stopped node to catch up", func() bool { return nodes[m].count("app", "t") == 7 })
 }
+
+// TestClusterUsageCountsEveryNode: a usage read on one node counts what every
+// node served up to it, not what the others last flushed.
+func TestClusterUsageCountsEveryNode(t *testing.T) {
+	nodes := newCluster(t, 3)
+	acmeEverywhereAs(t, nodes, v1.DatabaseType_DATABASE_TYPE_CRDT)
+	ctx := context.Background()
+	nodes[0].exec("/db/acme/app", nodes[0].admin, "CREATE TABLE t(a)")
+	eventually(t, "t on every node", func() bool { return counts(nodes, "app", "t", 0) })
+	_, _, dbs := nodes[0].clients()
+	base := need(dbs.Usage(ctx, auth(nodes[0].admin, &v1.UsageRequest{Org: "acme", Name: "app"})))(t).Msg
+	var before int64
+	for _, p := range base.Points {
+		before += p.Statements
+	}
+	// Each node serves its own: a crdt database is written where it is reached.
+	for i, n := range nodes {
+		for range i + 1 {
+			n.exec("/db/acme/app", n.admin, "INSERT INTO t VALUES (1)")
+		}
+	}
+	u := need(dbs.Usage(ctx, auth(nodes[0].admin, &v1.UsageRequest{Org: "acme", Name: "app"})))(t).Msg
+	var after int64
+	for _, p := range u.Points {
+		after += p.Statements
+	}
+	if after-before != 6 {
+		t.Fatalf("node 0 counts %d statements since, want the 6 the three nodes served", after-before)
+	}
+	st := need(dbs.Stats(ctx, auth(nodes[0].admin, &v1.StatsRequest{Org: "acme", Name: "app"})))(t).Msg
+	for _, q := range st.TopQueries {
+		if q.Sql == "INSERT INTO t VALUES (?)" && q.Count != 6 {
+			t.Fatalf("the insert counted %d times, want 6", q.Count)
+		}
+	}
+}

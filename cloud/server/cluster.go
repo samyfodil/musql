@@ -179,6 +179,7 @@ func (s *Server) openState(ctx context.Context) (*state.Store, error) {
 		mux := http.NewServeMux()
 		mux.Handle("/state/", http.StripPrefix("/state", hrana.NewServer(db)))
 		mux.Handle("/fwd/", http.StripPrefix("/fwd", http.HandlerFunc(s.serveForwarded)))
+		mux.HandleFunc("/usage/flush", s.serveFlushUsage)
 		if err := n.ServeHTTP(mux); err != nil {
 			st.Close()
 			return fail(err)

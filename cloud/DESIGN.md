@@ -364,8 +364,7 @@ deterministic or visible, never two rows with one name:
 
 Declined, deliberately: linearizable multi-node writes (a master's commit is
 durable on the master and reaches the others after it); a standalone database
-holding what a cluster refuses joining one; a usage view that counts more
-than the nodes have synced.
+holding what a cluster refuses joining one.
 
 ## Usage analytics
 
@@ -373,6 +372,12 @@ Per database, per hour (per node, summed when read): rows read, rows written, st
 stored, p50/p95 latency; per org totals. Counted at the Hrana layer and kept
 in state. The API returns series; the console charts them. Top queries:
 normalized statement text with counts and total time.
+
+Each node counts what it serves in memory and writes it to the state every
+minute. A usage or stats read first writes this node's counts and has every
+other node it reaches write its own (`/usage/flush` over libp2p, waiting up
+to 2s), so it counts every statement those nodes have served; a node that
+does not answer in time is counted at its next write.
 
 ## AI SQL
 
