@@ -80,8 +80,9 @@ The server is its own issuer at `public_url`:
   `public_url/console/callback`) and `cli` (device flow). Admins may register
   more.
 - Users: email, display name, argon2id password hash, disabled flag,
-  created_at. Admin creates, disables, resets passwords. (Self sign-up,
-  passkeys and federation are later.)
+  created_at. Admin creates, disables, resets passwords. Accounts are the
+  admin's to make: there is no self sign-up, and sign-in is by password
+  alone (no passkeys, no third-party provider), deliberately.
 - Access tokens are JWTs (`sub`, `exp` ≤ 1h, `token_use: access`); refresh
   tokens are opaque, stored hashed, rotated on use (presenting a used one
   revokes its whole family). The token carries no `org`/`role`: a user has a
