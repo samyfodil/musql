@@ -52,6 +52,8 @@ type clusterSide struct {
 	// importFrom is a state this node held before, its records not yet
 	// imported into the cluster's.
 	importFrom string
+	// stateDB is the state's replicated handle, once open.
+	stateDB atomic.Pointer[sql.DB]
 }
 
 type replDB struct {
@@ -149,7 +151,12 @@ func (s *Server) openState(ctx context.Context) (*state.Store, error) {
 			return fail(fmt.Errorf("state election: %w", err))
 		}
 		s.cl.state = e
-		here = e.Writer
+		// A master writes, and answers the others, from its copy: one that
+		// has not synced with a peer yet may miss what they hold.
+		here = func() bool {
+			db := s.cl.stateDB.Load()
+			return e.Writer() && db != nil && replication.Synced(db)
+		}
 	}
 	elected := here
 	here = func() bool { return s.cl.starting.Load() || elected() }
@@ -160,6 +167,7 @@ func (s *Server) openState(ctx context.Context) (*state.Store, error) {
 	}
 	// One connection, as standalone: writes are serialized in-process.
 	db.SetMaxOpenConns(1)
+	s.cl.stateDB.Store(db)
 	m := &state.Master{Here: here, Client: s.cl.client, URL: func() (string, error) {
 		id := s.cl.state.Leader()
 		if id == "" || id == n.ID() {
@@ -177,7 +185,16 @@ func (s *Server) openState(ctx context.Context) (*state.Store, error) {
 		// The other nodes reach this one's state, and the requests they
 		// forward, here; only the configured peers can open the protocol.
 		mux := http.NewServeMux()
-		mux.Handle("/state/", http.StripPrefix("/state", hrana.NewServer(db)))
+		stateHrana := http.StripPrefix("/state", hrana.NewServer(db))
+		mux.Handle("/state/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Elected but not yet one to answer from (settling, or its copy
+			// not synced): the asker uses its own copy meanwhile.
+			if !elected() {
+				http.Error(w, state.ErrNoMaster.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			stateHrana.ServeHTTP(w, r)
+		}))
 		mux.Handle("/fwd/", http.StripPrefix("/fwd", http.HandlerFunc(s.serveForwarded)))
 		if err := n.ServeHTTP(mux); err != nil {
 			st.Close()
@@ -600,24 +617,32 @@ func (s *Server) unplace(id string) {
 	}
 }
 
-// closeCluster closes the replicated databases and leaves the groups'
-// elections; the state and its election close after.
+// leaveElections leaves the groups' elections and the state's.
+func (s *Server) leaveElections() {
+	s.cl.mu.Lock()
+	groups := s.cl.groups
+	s.cl.groups = map[string]*cluster.Election{}
+	s.cl.mu.Unlock()
+	for id, e := range groups {
+		if err := e.Close(); err != nil {
+			s.log.Printf("group %s: %v", id, err)
+		}
+	}
+	if err := s.cl.state.Close(); err != nil {
+		s.log.Printf("state election: %v", err)
+	}
+}
+
+// closeCluster closes the replicated databases.
 func (s *Server) closeCluster() {
 	s.cl.mu.Lock()
 	ids := make([]string, 0, len(s.cl.dbs))
 	for id := range s.cl.dbs {
 		ids = append(ids, id)
 	}
-	groups := s.cl.groups
-	s.cl.groups = map[string]*cluster.Election{}
 	s.cl.mu.Unlock()
 	for _, id := range ids {
 		s.closeReplicated(id)
-	}
-	for id, e := range groups {
-		if err := e.Close(); err != nil {
-			s.log.Printf("group %s: %v", id, err)
-		}
 	}
 }
 
