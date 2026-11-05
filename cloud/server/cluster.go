@@ -49,6 +49,9 @@ type clusterSide struct {
 	dbs      map[string]*replDB
 	// groups elects each group's master, among the nodes it is placed on.
 	groups map[string]*cluster.Election
+	// importFrom is a state this node held before, its records not yet
+	// imported into the cluster's.
+	importFrom string
 }
 
 type replDB struct {
@@ -132,7 +135,7 @@ func (s *Server) openState(ctx context.Context) (*state.Store, error) {
 	elected := here
 	here = func() bool { return s.cl.starting.Load() || elected() }
 	s.cl.starting.Store(true)
-	db, err := openLeaderState(ctx, path, here, s.cfg.syncInterval, n.Sync(stateTopic))
+	db, pending, err := openLeaderState(ctx, path, here, s.cfg.syncInterval, n.Sync(stateTopic))
 	if err != nil {
 		return fail(fmt.Errorf("state: %w", err))
 	}
@@ -150,6 +153,7 @@ func (s *Server) openState(ctx context.Context) (*state.Store, error) {
 		db.Close()
 		return fail(err)
 	}
+	s.cl.importFrom = pending
 	if !s.initOnly {
 		// The other nodes reach this one's state, and the requests they
 		// forward, here; only the configured peers can open the protocol.
@@ -164,32 +168,62 @@ func (s *Server) openState(ctx context.Context) (*state.Store, error) {
 	return st, nil
 }
 
-// openLeaderState opens the state in Leader mode. A state a node kept in CRDT
-// mode, before the state moved to Leader mode, is made a plain copy first,
-// whose rows become this node's first ops; every node does the same and
-// their rows merge. The old file is kept beside it, as state.musq.crdt.
-func openLeaderState(ctx context.Context, path string, isWriter func() bool, every time.Duration, sync replication.Option) (*sql.DB, error) {
+// openLeaderState opens the state in Leader mode. A state this node kept in
+// CRDT mode, before the state moved to Leader mode, is not converted in
+// place: genesis would record its tables by their final text, and the
+// cluster's other nodes by the statements that made them, two schemas whose
+// rows would not merge. It is set aside (state.musq.crdt), a plain copy of it
+// left for Import (state.musq.import, its name returned), and the node starts
+// from a state built as every node's is.
+func openLeaderState(ctx context.Context, path string, isWriter func() bool, every time.Duration, sync replication.Option) (*sql.DB, string, error) {
 	open := func() (*sql.DB, error) {
 		return replication.Open(ctx, path, replication.Leader(isWriter), replication.WithSyncInterval(every), sync)
 	}
+	pending := path + importSuffix
 	db, err := open()
 	if !errors.Is(err, replication.ErrMode) {
-		return db, err
+		if _, serr := os.Stat(pending); serr != nil {
+			pending = ""
+		}
+		return db, pending, err
 	}
-	tmp := path + ".leader"
-	engine.RemoveDatabaseFiles(tmp)
-	if err := replication.PlainCopy(ctx, path, tmp); err != nil {
-		return nil, fmt.Errorf("moving the state to Leader mode: %w", err)
+	engine.RemoveDatabaseFiles(pending)
+	if err := replication.PlainCopy(ctx, path, pending); err != nil {
+		return nil, "", fmt.Errorf("moving the state to Leader mode: %w", err)
 	}
 	old := path + ".crdt"
 	engine.RemoveDatabaseFiles(old)
 	if err := moveDB(path, old); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	if err := moveDB(tmp, path); err != nil {
-		return nil, err
+	db, err = open()
+	return db, pending, err
+}
+
+// importSuffix names a state this node held before, whose records are
+// waiting to be imported into the cluster's.
+const importSuffix = ".import"
+
+// importState writes the records of the state this node held before into the
+// cluster's, through its master, and marks the file done (".imported"). It
+// waits for a master: until one is reached it fails, and the next pass tries
+// again.
+func (s *Server) importState(ctx context.Context) error {
+	src, err := sql.Open("sqlite", s.cl.importFrom)
+	if err != nil {
+		return err
 	}
-	return open()
+	n, err := s.store.Import(ctx, src)
+	src.Close()
+	if err != nil {
+		return err
+	}
+	if err := moveDB(s.cl.importFrom, strings.TrimSuffix(s.cl.importFrom, importSuffix)+".imported"); err != nil {
+		return err
+	}
+	s.log.Printf("imported %d rows of this node's earlier state into the cluster's", n)
+	s.cl.importFrom = ""
+	return nil
 }
 
 // moveDB renames a database's file and, when it has one, its delta.
@@ -222,6 +256,11 @@ func (s *Server) clusterPass(ctx context.Context) {
 		} else if time.Since(s.noAdminLogged) >= time.Minute {
 			s.log.Print(errNoAdminYet)
 			s.noAdminLogged = time.Now()
+		}
+	}
+	if s.cl.importFrom != "" {
+		if err := s.importState(ctx); err != nil {
+			s.log.Printf("import of this node's earlier state: %v", err)
 		}
 	}
 	// Two masters can overlap for a moment around an election, and both

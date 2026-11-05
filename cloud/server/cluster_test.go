@@ -23,6 +23,7 @@ import (
 	"github.com/samyfodil/musql/cloud/cluster"
 	v1 "github.com/samyfodil/musql/cloud/gen/cloud/v1"
 	"github.com/samyfodil/musql/cloud/gen/cloud/v1/cloudv1connect"
+	"github.com/samyfodil/musql/cloud/state"
 )
 
 // clusterNode is one node of an in-process cluster: its server behind an
@@ -51,6 +52,19 @@ func freePort(t *testing.T) int {
 // public URL as a deployment behind a load balancer would.
 func newCluster(t *testing.T, n int) []*clusterNode {
 	t.Helper()
+	cfgs := clusterConfigs(t, n, "")
+	// A cluster is initialised once, on one node, and the others get the
+	// admin from it: Init on a node the admin is reaching from a peer fails.
+	if err := Init(context.Background(), cfgs[0], "admin@example.com", "admin-password"); err != nil {
+		t.Fatal(err)
+	}
+	return startCluster(t, cfgs)
+}
+
+// clusterConfigs are the configs of n nodes on localhost, each the others'
+// peer; node 0's data directory is dir0 when given.
+func clusterConfigs(t *testing.T, n int, dir0 string) []*Config {
+	t.Helper()
 	startBudget(t)
 	type ident struct {
 		dir, id string
@@ -59,6 +73,9 @@ func newCluster(t *testing.T, n int) []*clusterNode {
 	ids := make([]ident, n)
 	for i := range ids {
 		dir := t.TempDir()
+		if i == 0 && dir0 != "" {
+			dir = dir0
+		}
 		key, err := cluster.LoadKey(filepath.Join(dir, "node.key"))
 		if err != nil {
 			t.Fatal(err)
@@ -69,8 +86,8 @@ func newCluster(t *testing.T, n int) []*clusterNode {
 		}
 		ids[i] = ident{dir, id, freePort(t)}
 	}
-	nodes := make([]*clusterNode, n)
-	for i := range nodes {
+	cfgs := make([]*Config, n)
+	for i := range cfgs {
 		var peers strings.Builder
 		for j, p := range ids {
 			if j != i {
@@ -91,13 +108,16 @@ peers:
 		}
 		cfg.syncInterval = 100 * time.Millisecond
 		cfg.election = cluster.ElectionTiming{Heartbeat: 200 * time.Millisecond, Election: 200 * time.Millisecond, Lease: 100 * time.Millisecond}
-		// A cluster is initialised once, on one node, and the others get the
-		// admin from it: Init on a node the admin is reaching from a peer fails.
-		if i == 0 {
-			if err := Init(context.Background(), cfg, "admin@example.com", "admin-password"); err != nil {
-				t.Fatal(err)
-			}
-		}
+		cfgs[i] = cfg
+	}
+	return cfgs
+}
+
+// startCluster starts a node per config, then waits for each to serve.
+func startCluster(t *testing.T, cfgs []*Config) []*clusterNode {
+	t.Helper()
+	nodes := make([]*clusterNode, len(cfgs))
+	for i, cfg := range cfgs {
 		c := &clusterNode{cfg: cfg}
 		c.env = &env{t: t}
 		c.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -555,5 +575,43 @@ func TestStandaloneIsPlain(t *testing.T) {
 	r := must(dbs.Create(ctx, auth(e.admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "r", Type: v1.DatabaseType_DATABASE_TYPE_RAFT})))
 	if r.Msg.Database.Type != v1.DatabaseType_DATABASE_TYPE_PLAIN {
 		t.Fatalf("a raft database on a standalone node is %v", r.Msg.Database.Type)
+	}
+}
+
+// TestClusterStateFromCRDT: a node whose state was kept in CRDT mode starts
+// in a cluster whose state is in Leader mode: its records come in by import,
+// on every node, and the old file stays beside the new one.
+func TestClusterStateFromCRDT(t *testing.T) {
+	ctx := context.Background()
+	cfgs := clusterConfigs(t, 3, "")
+	path := filepath.Join(cfgs[0].DataDir, "state.musq")
+	db, err := replication.Open(ctx, path, replication.CRDT())
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := state.OpenReplicated(db, "node-0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := old.CreateUser(ctx, "admin@example.com", "Admin", state.HashPassword("admin-password"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.CreateOrg(ctx, "kept", "Kept", u.ID, "fra"); err != nil {
+		t.Fatal(err)
+	}
+	old.Close()
+
+	nodes := startCluster(t, cfgs)
+	for _, n := range nodes {
+		eventually(t, "the org on "+n.cfg.Node.Name, func() bool {
+			_, err := n.s.Store().OrgBySlug(ctx, "kept")
+			return err == nil
+		})
+	}
+	for _, f := range []string{"state.musq.crdt", "state.musq.imported"} {
+		if _, err := os.Stat(filepath.Join(cfgs[0].DataDir, f)); err != nil {
+			t.Errorf("%s: %v", f, err)
+		}
 	}
 }

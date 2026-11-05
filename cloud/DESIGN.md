@@ -254,9 +254,15 @@ peers:
   15s. A node writes its own copy alone while it starts: its schema
   statements, its signing key, the built-in clients, each the same on every
   node or that node's alone, so the writes merge. A state kept in CRDT mode
-  before is converted at start: a plain copy whose rows become the node's
-  first ops (the old file stays as `state.musq.crdt`), on a topic of its own
-  (`musql-cloud/state/leader`) so the two kinds never mix.
+  before is not converted in place: replication names a schema object by its
+  text, and a file's own tables (made by `CREATE` then `ALTER`, recorded by
+  their final text) would not be the cluster's (recorded statement by
+  statement), so their rows would not merge. The node starts from a state
+  built as every node's is, on a topic of its own
+  (`musql-cloud/state/leader`), and imports the old file's records into it
+  through the master (`state.Store.Import`): a record already there by its
+  key stays, one whose name is taken comes in renamed as below. The old file
+  stays as `state.musq.crdt`, the copy imported as `state.musq.imported`.
 - **Databases** are typed (`type` on a database, defaulting to its group's,
   `plain` unless set):
 

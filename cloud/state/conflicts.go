@@ -18,6 +18,20 @@ var heldNames = map[string]string{
 	"databases": "name",
 }
 
+// heldName is the name a row comes back under when another holds its own:
+// suffixed with its ID's first 6 characters, "shop-1a2b3c", or for an email
+// "a+1a2b3c@example.com". A name that has the suffix already keeps it.
+func heldName(col, name, id string) string {
+	if strings.HasSuffix(name, "-"+id[:6]) || strings.Contains(name, "+"+id[:6]+"@") {
+		return name
+	}
+	if col == "email" {
+		local, domain, _ := strings.Cut(name, "@")
+		return local + "+" + id[:6] + "@" + domain
+	}
+	return name + "-" + id[:6]
+}
+
 // Renamed is a row ResolveHeld wrote back under a new name.
 type Renamed struct {
 	Table, ID, From, To string
@@ -46,12 +60,8 @@ func (s *Store) ResolveHeld(ctx context.Context) ([]Renamed, error) {
 		if len(id) < 6 || name == "" {
 			continue
 		}
-		to := name + "-" + id[:6]
-		if col == "email" {
-			local, domain, _ := strings.Cut(name, "@")
-			to = local + "+" + id[:6] + "@" + domain
-		}
-		if strings.HasSuffix(name, "-"+id[:6]) || strings.Contains(name, "+"+id[:6]+"@") {
+		to := heldName(col, name, id)
+		if to == name {
 			continue
 		}
 		h.Row[col] = to
