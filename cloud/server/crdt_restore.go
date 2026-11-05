@@ -68,17 +68,15 @@ func (s *Server) restoreReplicatedInPlace(ctx context.Context, d *state.Database
 	return connect.NewError(connect.CodeAborted, fmt.Errorf("the database kept changing during the restore: %w", err))
 }
 
-// restorePoint is a crdt database as this node held it at a time: full is the
-// restored file, bookkeeping included, and plain its plain copy.
+// restorePoint is a cluster database as this node held it at a time: full is
+// the restored file, bookkeeping included, and plain its plain copy.
 type restorePoint struct {
 	at          time.Time
 	full, plain *sql.DB
-	schema      [][]any // full's, once read
-	heldChecked bool
-}
-
-func declined(format string, args ...any) error {
-	return connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf(format, args...))
+	// then is plain's schema, and bookkeeping the names of the objects only
+	// full has: replication's own, once read.
+	then        [][]any
+	bookkeeping map[string]bool
 }
 
 // restore is one attempt: checked, diffed and written in a transaction on a
@@ -100,28 +98,19 @@ func (p *restorePoint) restore(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	defer tx.Rollback()
-	if p.schema == nil {
-		if p.schema, err = schemaRows(ctx, p.full); err != nil {
-			return err
-		}
+	if err := p.syncSchema(ctx, tx); err != nil {
+		return err
 	}
-	now, err := schemaRows(ctx, tx)
+	// Read after the transaction's first: a commit since then fails the
+	// transaction with ErrBusy, so what this saw is what the restore ends.
+	held, err := replication.Withheld(ctx, db)
 	if err != nil {
 		return err
 	}
-	if !slices.EqualFunc(now, p.schema, sameRow) {
-		return declined("the schema changed since %s: restore into a new database", p.at.UTC().Format(time.RFC3339Nano))
-	}
-	if !p.heldChecked {
-		if held, err := replication.Withheld(ctx, p.full); err != nil || len(held) > 0 {
-			return heldErr(held, err, "at "+p.at.UTC().Format(time.RFC3339Nano))
+	for _, h := range held {
+		if err := endHeld(ctx, tx, h); err != nil {
+			return err
 		}
-		p.heldChecked = true
-	}
-	// Read after the transaction's first: a commit since then fails the
-	// transaction with ErrBusy, so what this saw is what the diff runs on.
-	if held, err := replication.Withheld(ctx, db); err != nil || len(held) > 0 {
-		return heldErr(held, err, "now")
 	}
 	tables, err := userTables(ctx, p.plain)
 	if err != nil {
@@ -135,12 +124,143 @@ func (p *restorePoint) restore(ctx context.Context, db *sql.DB) error {
 	return tx.Commit()
 }
 
-func heldErr(held []replication.WithheldRow, err error, when string) error {
+// syncSchema makes the database's schema in tx what it was at the point, in
+// statements that replicate like any: what was not there goes, a table
+// defined otherwise is made again as it was (empty: the rows follow), and what
+// is missing is made. Views and indexes go first and come last, so none is
+// left naming what changed under it.
+func (p *restorePoint) syncSchema(ctx context.Context, tx *sql.Tx) error {
+	if p.then == nil {
+		var err error
+		if p.then, err = schemaRows(ctx, p.plain); err != nil {
+			return err
+		}
+		full, err := schemaRows(ctx, p.full)
+		if err != nil {
+			return err
+		}
+		p.bookkeeping = map[string]bool{}
+		for _, r := range full {
+			p.bookkeeping[fmt.Sprint(r[1])] = true
+		}
+		for _, r := range p.then {
+			delete(p.bookkeeping, fmt.Sprint(r[1]))
+		}
+	}
+	all, err := schemaRows(ctx, tx)
 	if err != nil {
 		return err
 	}
-	return declined("a row of %s is withheld by a UNIQUE conflict %s, which a restore in place cannot reproduce: restore into a new database", held[0].Table, when)
+	key := func(r []any) string { return fmt.Sprint(r[0]) + "\x00" + fmt.Sprint(r[1]) }
+	then := map[string][]any{}
+	for _, r := range p.then {
+		then[key(r)] = r
+	}
+	now := map[string][]any{}
+	for _, r := range all {
+		if !p.bookkeeping[fmt.Sprint(r[1])] {
+			now[key(r)] = r
+		}
+	}
+	same := func(r []any) bool {
+		o, ok := then[key(r)]
+		return ok && sameRow(o, r)
+	}
+	var stmts []string
+	for _, typ := range []string{"view", "index", "table"} {
+		for _, r := range all {
+			if fmt.Sprint(r[0]) == typ && now[key(r)] != nil && !same(r) {
+				stmts = append(stmts, "DROP "+strings.ToUpper(typ)+" IF EXISTS main."+quoteIdent(fmt.Sprint(r[1])))
+			}
+		}
+	}
+	for _, typ := range []string{"table", "index", "view"} {
+		for _, r := range p.then {
+			if fmt.Sprint(r[0]) != typ {
+				continue
+			}
+			if o, ok := now[key(r)]; ok && sameRow(o, r) {
+				continue
+			}
+			stmts = append(stmts, fmt.Sprint(r[3]))
+		}
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("restoring the schema of %s: %s: %w", p.at.UTC().Format(time.RFC3339Nano), q, err)
+		}
+	}
+	return nil
 }
+
+// endHeld deletes a row replication holds out of its table because another
+// claimed its UNIQUE value: it would come in once the value frees, which the
+// point restored to did not have. A held row is in no table, so it is written
+// first, its UNIQUE columns given values no row holds, and deleted in the same
+// transaction: the delete, newer than the row, ends it on every node.
+func endHeld(ctx context.Context, tx *sql.Tx, h replication.WithheldRow) error {
+	unique, err := uniqueCols(ctx, tx, h.Table)
+	if err != nil {
+		return err
+	}
+	tbl := "main." + quoteIdent(h.Table)
+	var cols, marks []string
+	var args []any
+	// A table that declares no key names its rows by rowid, which the row's
+	// columns do not hold.
+	keyed, err := readRows(ctx, tx, "SELECT 1 FROM pragma_table_info("+quoteLiteral(h.Table)+") WHERE pk > 0")
+	if err != nil {
+		return err
+	}
+	if len(keyed) == 0 && len(h.Key) == 1 {
+		cols, marks, args = append(cols, "rowid"), append(marks, "?"), append(args, h.Key[0])
+	}
+	for c, v := range h.Row {
+		if unique[strings.ToLower(c)] {
+			v = "held-" + state.NewID()
+		}
+		cols, marks, args = append(cols, quoteIdent(c)), append(marks, "?"), append(args, v)
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO "+tbl+" ("+strings.Join(cols, ", ")+") VALUES ("+strings.Join(marks, ", ")+")", args...); err != nil {
+		return fmt.Errorf("ending a row of %s held by a UNIQUE conflict: %w", h.Table, err)
+	}
+	rowid, err := lastRowid(ctx, tx)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, "DELETE FROM "+tbl+" WHERE rowid = ?", rowid)
+	return err
+}
+
+func lastRowid(ctx context.Context, tx *sql.Tx) (int64, error) {
+	var id int64
+	err := tx.QueryRowContext(ctx, "SELECT last_insert_rowid()").Scan(&id)
+	return id, err
+}
+
+// uniqueCols are the columns of table's UNIQUE constraints and indexes,
+// lower-cased, its primary key's not among them.
+func uniqueCols(ctx context.Context, tx *sql.Tx, table string) (map[string]bool, error) {
+	idx, err := readRows(ctx, tx, "SELECT name FROM pragma_index_list("+quoteLiteral(table)+") WHERE \"unique\" AND origin <> 'pk'")
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]bool{}
+	for _, r := range idx {
+		cols, err := readRows(ctx, tx, "SELECT name FROM pragma_index_info("+quoteLiteral(fmt.Sprint(r[0]))+")")
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range cols {
+			if c[0] != nil {
+				out[strings.ToLower(fmt.Sprint(c[0]))] = true
+			}
+		}
+	}
+	return out, nil
+}
+
+func quoteLiteral(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
 
 type querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)

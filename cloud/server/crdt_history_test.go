@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	sqliteconv "github.com/samyfodil/musql/convert/sqlite"
+	"github.com/samyfodil/musql/replication"
 
 	v1 "github.com/samyfodil/musql/cloud/gen/cloud/v1"
 )
@@ -313,17 +315,32 @@ func restoreInPlace(t *testing.T, typ v1.DatabaseType) {
 	}
 	holds(t, nodes, "app", since.want)
 
-	nodes[0].exec(app, nodes[0].admin, "ALTER TABLE u ADD COLUMN extra")
+	// Across schema changes: a column added, a table dropped, a table and an
+	// index made. The schema comes back as it was, and the rows with it.
+	schema := nodes[0].rows("app", userSchema)
+	nodes[0].exec(app, nodes[0].admin, "ALTER TABLE u ADD COLUMN extra", "DROP TABLE k", "CREATE TABLE z(a)", "INSERT INTO z VALUES (1)", "CREATE INDEX u_n ON u(n)")
 	eventually(t, "the new column on node 1", func() bool { return !strings.HasPrefix(nodes[1].rows("app", "SELECT extra FROM u"), "error: ") })
-	if err := inPlace(at.at); code(err) != connect.CodeFailedPrecondition || !strings.Contains(err.Error(), "schema changed since") {
+	if err := inPlace(at.at); err != nil {
 		t.Fatalf("an in-place restore across a schema change: %v", err)
 	}
+	want := maps.Clone(at.want)
+	want[userSchema] = schema
+	holds(t, nodes, "app", want)
+	nodes[1].exec(app, nodes[1].admin, "INSERT INTO k VALUES (9, 'nine')")
+	eventually(t, "a write to the table restored on every node", func() bool {
+		for _, n := range nodes {
+			if n.count("app", "k") != 4 {
+				return false
+			}
+		}
+		return true
+	})
 }
 
 // A row withheld by a UNIQUE conflict is alive and in no table, which writes
 // to the tables cannot reproduce: an in-place restore is declined, and a copy
 // does not carry the row.
-func TestClusterCRDTRestoreDeclinesWithheld(t *testing.T) {
+func TestClusterRestoreEndsWithheld(t *testing.T) {
 	nodes := newCluster(t, 2)
 	acmeEverywhere(t, nodes)
 	n0, n1 := nodes[0], nodes[1]
@@ -350,10 +367,25 @@ func TestClusterCRDTRestoreDeclinesWithheld(t *testing.T) {
 
 	ctx := context.Background()
 	_, _, dbs := n0.clients()
-	_, err := dbs.Restore(ctx, auth(n0.admin, &v1.RestoreRequest{Org: "acme", Name: "app", At: timestamppb.New(before), InPlace: true}))
-	if code(err) != connect.CodeFailedPrecondition || !strings.Contains(err.Error(), "withheld") {
-		t.Fatalf("an in-place restore with a withheld row: %v", err)
-	}
 	need(dbs.Restore(ctx, auth(n0.admin, &v1.RestoreRequest{Org: "acme", Name: "app", NewName: "w-copy"})))(t)
 	holds(t, nodes, "w-copy", map[string]string{q: "integer:2|text:x@\n"})
+	// In place, to before either row: the held one is ended with the other,
+	// on both nodes, and does not come back once its value is free.
+	need(dbs.Restore(ctx, auth(n0.admin, &v1.RestoreRequest{Org: "acme", Name: "app", At: timestamppb.New(before), InPlace: true})))(t)
+	holds(t, nodes, "app", map[string]string{q: ""})
+	eventually(t, "no row held on either node", func() bool {
+		for _, n := range nodes {
+			d, err := n.s.Store().Database(ctx, orgID(n), "app")
+			if err != nil {
+				return false
+			}
+			held, err := replication.Withheld(ctx, n.s.replHandle(d.ID))
+			if err != nil || len(held) > 0 {
+				return false
+			}
+		}
+		return true
+	})
+	time.Sleep(time.Second)
+	holds(t, nodes, "app", map[string]string{q: ""})
 }
