@@ -42,6 +42,12 @@ func (s databaseService) ListSnapshots(ctx context.Context, req *connect.Request
 	if err != nil {
 		return nil, err
 	}
+	if c, err := s.atMaster(ctx, d); c != nil || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		return forward(ctx, req, c.ListSnapshots)
+	}
 	if err := s.localCopy(ctx, d); err != nil {
 		return nil, err
 	}
@@ -60,6 +66,12 @@ func (s databaseService) CreateSnapshot(ctx context.Context, req *connect.Reques
 	_, d, _, err := s.lookup(ctx, req, req.Msg.Org, req.Msg.Name, state.RoleMember)
 	if err != nil {
 		return nil, err
+	}
+	if c, err := s.atMaster(ctx, d); c != nil || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		return forward(ctx, req, c.CreateSnapshot)
 	}
 	if err := s.localCopy(ctx, d); err != nil {
 		return nil, err
@@ -81,6 +93,14 @@ func (s databaseService) Restore(ctx context.Context, req *connect.Request[v1.Re
 	if err != nil {
 		return nil, err
 	}
+	// A regular database's master holds the history to restore from, and is
+	// the one that writes it.
+	if c, err := s.atMaster(ctx, d); c != nil || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		return forward(ctx, req, c.Restore)
+	}
 	if err := s.localCopy(ctx, d); err != nil {
 		return nil, err
 	}
@@ -93,8 +113,8 @@ func (s databaseService) Restore(ctx context.Context, req *connect.Request[v1.Re
 			return nil, invalid("in_place and new_name exclude each other")
 		}
 		restore := s.restoreInPlace
-		if d.Type == state.TypeCRDT {
-			restore = s.restoreCRDTInPlace
+		if s.cl != nil {
+			restore = s.restoreReplicatedInPlace
 		}
 		if err := restore(ctx, d, at); err != nil {
 			return nil, restoreErr(err)
@@ -116,8 +136,8 @@ func (s databaseService) Restore(ctx context.Context, req *connect.Request[v1.Re
 		return nil, rpcErr(err)
 	}
 	err = restoreErr(s.copyAt(ctx, d, at, false, s.dbPath(nd)))
-	if err == nil && nd.Type == state.TypeCRDT {
-		err = checkCRDT(ctx, s.dbPath(nd))
+	if err == nil && s.cl != nil {
+		err = s.checkReplicable(ctx, nd, s.dbPath(nd))
 	}
 	if err != nil {
 		s.removeFiles(nd)
@@ -126,8 +146,8 @@ func (s databaseService) Restore(ctx context.Context, req *connect.Request[v1.Re
 	if err := s.host(ctx, nd); err != nil {
 		return nil, err
 	}
-	if nd.Type == state.TypeCRDT {
-		if err := s.openCRDT(ctx, nd); err != nil {
+	if s.cl != nil {
+		if err := s.openReplicated(ctx, nd); err != nil {
 			s.log.Printf("open %s: %v", nd.ID, err)
 		}
 	}

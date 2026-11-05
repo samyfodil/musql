@@ -77,8 +77,10 @@ func (Role) EnumDescriptor() ([]byte, []int) {
 	return file_cloud_v1_common_proto_rawDescGZIP(), []int{0}
 }
 
-// How a database is kept: plain on a standalone node, crdt replicated across
-// a cluster's nodes. raft is known and declined: not yet supported.
+// How a database is kept. plain is a regular database: on a standalone node
+// the full engine, in a cluster replicated to its group's nodes and written
+// by the master raft elects among them. crdt replicates across a cluster's
+// nodes, every one of them writing. raft is plain.
 type DatabaseType int32
 
 const (

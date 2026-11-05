@@ -14,6 +14,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/samyfodil/musql/cloud/cluster"
 	"github.com/samyfodil/musql/cloud/state"
 )
 
@@ -41,6 +42,8 @@ type Config struct {
 	// syncInterval is how often a cluster node runs anti-entropy and
 	// placement.
 	syncInterval time.Duration
+	// election is raft's timing for the elections; zero is raft's defaults.
+	election cluster.ElectionTiming
 }
 
 // OIDCConfig tunes sign-in. Durations take Go syntax plus "d" for days

@@ -290,8 +290,10 @@ export enum Role {
 export declare const RoleSchema: GenEnum<Role>;
 
 /**
- * How a database is kept: plain on a standalone node, crdt replicated across
- * a cluster's nodes. raft is known and declined: not yet supported.
+ * How a database is kept. plain is a regular database: on a standalone node
+ * the full engine, in a cluster replicated to its group's nodes and written
+ * by the master raft elects among them. crdt replicates across a cluster's
+ * nodes, every one of them writing. raft is plain.
  *
  * @generated from enum cloud.v1.DatabaseType
  */

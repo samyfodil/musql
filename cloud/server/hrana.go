@@ -190,10 +190,10 @@ func (p *pool) closeAll() {
 // It opens only once the database's history is, so no commit goes unlogged.
 func (s *Server) openEntry(d *state.Database) (*entry, error) {
 	path := s.dbPath(d)
-	if d.Type == state.TypeCRDT && s.crdtHandle(d.ID) == nil {
+	if s.cl != nil && s.replHandle(d.ID) == nil {
 		return nil, errNotHere
 	}
-	if d.Type == state.TypeCRDT && s.crdtSyncing(d.ID) {
+	if s.cl != nil && s.replSyncing(d.ID) {
 		return nil, errSyncing
 	}
 	// Opening creates a missing file; a database whose file is gone is gone.
@@ -205,7 +205,7 @@ func (s *Server) openEntry(d *state.Database) (*entry, error) {
 	}
 	// A crdt database is written through its replicated handle, which
 	// outlives the entry; any other connection may only read it.
-	db, shared := s.crdtHandle(d.ID), true
+	db, shared := s.replHandle(d.ID), true
 	if db == nil {
 		var err error
 		if db, err = openPinged(path + "?" + dsnMode + "=rw"); err != nil {
@@ -256,7 +256,7 @@ func (s *Server) dbPath(d *state.Database) string {
 // history.
 func (s *Server) removeFiles(d *state.Database) {
 	s.pool.drop(d.ID)
-	s.closeCRDT(d.ID)
+	s.closeReplicated(d.ID)
 	s.closeHistory(d.ID)
 	removeDBFiles(s.log, s.dbPath(d))
 	if err := os.RemoveAll(s.histDir(d)); err != nil {
@@ -301,7 +301,27 @@ func (s *Server) serveDB(w http.ResponseWriter, r *http.Request) {
 		hranaError(w, http.StatusNotFound, "no such database")
 		return
 	}
+	// A regular database in a cluster is served by its group's master, reads
+	// included: a stream's statements run where its transaction is.
+	if base, err := s.masterURL(ctx, d); err != nil {
+		hranaError(w, http.StatusServiceUnavailable, errNoMaster.Error())
+		return
+	} else if base != "" {
+		s.proxy(w, r, base)
+		return
+	}
 	e, release, err := s.pool.get(d)
+	// A copy in its first sync is a moment from whole, most of all a new
+	// database's on the master its group just elected: the request waits
+	// for it, as for the election, before it is refused.
+	for deadline := time.Now().Add(masterWait); errors.Is(err, errSyncing) && time.Now().Before(deadline); {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(20 * time.Millisecond):
+		}
+		e, release, err = s.pool.get(d)
+	}
 	if errors.Is(err, errUnavailable) {
 		hranaError(w, http.StatusServiceUnavailable, "the database is being restored")
 		return

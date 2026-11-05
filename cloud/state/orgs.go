@@ -83,12 +83,12 @@ func (s *Store) CreateOrg(ctx context.Context, slug, name, owner, location strin
 
 // OrgBySlug returns an org.
 func (s *Store) OrgBySlug(ctx context.Context, slug string) (*Org, error) {
-	return scanOrg(s.db.QueryRowContext(ctx, `SELECT `+orgCols+` FROM orgs WHERE slug = ?`, slug))
+	return scanOrg(s.q().QueryRowContext(ctx, `SELECT `+orgCols+` FROM orgs WHERE slug = ?`, slug))
 }
 
 // OrgByID returns an org.
 func (s *Store) OrgByID(ctx context.Context, id string) (*Org, error) {
-	return scanOrg(s.db.QueryRowContext(ctx, `SELECT `+orgCols+` FROM orgs WHERE id = ?`, id))
+	return scanOrg(s.q().QueryRowContext(ctx, `SELECT `+orgCols+` FROM orgs WHERE id = ?`, id))
 }
 
 // Membership is an org and the user's role in it.
@@ -99,7 +99,7 @@ type Membership struct {
 
 // UserOrgs returns the orgs user belongs to.
 func (s *Store) UserOrgs(ctx context.Context, userID string) ([]Membership, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT o.id, o.slug, o.name, o.personal, o.created_at, m.role
+	rows, err := s.q().QueryContext(ctx, `SELECT o.id, o.slug, o.name, o.personal, o.created_at, m.role
 		FROM orgs o JOIN members m ON m.org_id = o.id WHERE m.user_id = ? ORDER BY o.slug`, userID)
 	if err != nil {
 		return nil, err
@@ -121,7 +121,7 @@ func (s *Store) UserOrgs(ctx context.Context, userID string) ([]Membership, erro
 
 // AllOrgs returns every org.
 func (s *Store) AllOrgs(ctx context.Context) ([]*Org, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+orgCols+` FROM orgs ORDER BY slug`)
+	rows, err := s.q().QueryContext(ctx, `SELECT `+orgCols+` FROM orgs ORDER BY slug`)
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +139,7 @@ func (s *Store) AllOrgs(ctx context.Context) ([]*Org, error) {
 
 // UpdateOrgName renames an org's display name.
 func (s *Store) UpdateOrgName(ctx context.Context, id, name string) error {
-	return one(s.db.ExecContext(ctx, `UPDATE orgs SET name = ? WHERE id = ?`, name, id))
+	return one(s.exec(ctx, `UPDATE orgs SET name = ? WHERE id = ?`, name, id))
 }
 
 // DeleteOrg removes an org and its records; the caller removes database
@@ -167,7 +167,7 @@ func (s *Store) DeleteOrg(ctx context.Context, id string) error {
 // MemberRole is user's role in org, or "" when not a member.
 func (s *Store) MemberRole(ctx context.Context, orgID, userID string) (Role, error) {
 	var role string
-	err := s.db.QueryRowContext(ctx, `SELECT role FROM members WHERE org_id = ? AND user_id = ?`, orgID, userID).Scan(&role)
+	err := s.q().QueryRowContext(ctx, `SELECT role FROM members WHERE org_id = ? AND user_id = ?`, orgID, userID).Scan(&role)
 	if err == sql.ErrNoRows {
 		return "", nil
 	}
@@ -182,7 +182,7 @@ type Member struct {
 
 // Members lists an org's members.
 func (s *Store) Members(ctx context.Context, orgID string) ([]Member, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT u.id, u.email, u.name, u.password_hash, u.admin, u.disabled, u.created_at, m.role
+	rows, err := s.q().QueryContext(ctx, `SELECT u.id, u.email, u.name, u.password_hash, u.admin, u.disabled, u.created_at, m.role
 		FROM users u JOIN members m ON m.user_id = u.id WHERE m.org_id = ? ORDER BY u.email`, orgID)
 	if err != nil {
 		return nil, err
@@ -219,13 +219,13 @@ func (s *Store) SetMember(ctx context.Context, orgID, userID string, role Role) 
 
 // RemoveMember removes user from org.
 func (s *Store) RemoveMember(ctx context.Context, orgID, userID string) error {
-	return one(s.db.ExecContext(ctx, `DELETE FROM members WHERE org_id = ? AND user_id = ?`, orgID, userID))
+	return one(s.exec(ctx, `DELETE FROM members WHERE org_id = ? AND user_id = ?`, orgID, userID))
 }
 
 // CountOwners counts an org's owners.
 func (s *Store) CountOwners(ctx context.Context, orgID string) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM members WHERE org_id = ? AND role = ?`, orgID, RoleOwner).Scan(&n)
+	err := s.q().QueryRowContext(ctx, `SELECT count(*) FROM members WHERE org_id = ? AND role = ?`, orgID, RoleOwner).Scan(&n)
 	return n, err
 }
 
@@ -242,7 +242,7 @@ type Invite struct {
 // CreateInvite invites email to org with role.
 func (s *Store) CreateInvite(ctx context.Context, orgID, email string, role Role) (*Invite, error) {
 	inv := &Invite{ID: NewID(), OrgID: orgID, Email: NormalizeEmail(email), Role: role, CreatedAt: unix(now())}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO invites (id, org_id, email, role, created_at) VALUES (?, ?, ?, ?, ?)`,
+	_, err := s.exec(ctx, `INSERT INTO invites (id, org_id, email, role, created_at) VALUES (?, ?, ?, ?, ?)`,
 		inv.ID, inv.OrgID, inv.Email, inv.Role, inv.CreatedAt.Unix())
 	if isUnique(err) {
 		return nil, ErrExists
@@ -251,7 +251,7 @@ func (s *Store) CreateInvite(ctx context.Context, orgID, email string, role Role
 }
 
 func (s *Store) invites(ctx context.Context, where string, arg string) ([]*Invite, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT i.id, i.org_id, o.slug, i.email, i.role, i.created_at
+	rows, err := s.q().QueryContext(ctx, `SELECT i.id, i.org_id, o.slug, i.email, i.role, i.created_at
 		FROM invites i JOIN orgs o ON o.id = i.org_id WHERE `+where+` ORDER BY i.created_at`, arg)
 	if err != nil {
 		return nil, err

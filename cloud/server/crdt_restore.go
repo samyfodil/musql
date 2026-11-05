@@ -22,16 +22,16 @@ import (
 	"github.com/samyfodil/musql/cloud/state"
 )
 
-// restoreTries is how often an in-place restore of a crdt database runs its
+// restoreTries is how often an in-place restore of a cluster database runs its
 // diff again when a commit (a peer's op, a client's write) lands meanwhile.
 const restoreTries = 10
 
-// restoreCRDTInPlace makes crdt database d's tables what this node held at
-// `at`: the difference is written through its replicated handle in one
-// transaction, so it replicates like any write (HISTORY.md, "Restore in
-// place").
-func (s *Server) restoreCRDTInPlace(ctx context.Context, d *state.Database, at time.Time) error {
-	db := s.crdtHandle(d.ID)
+// restoreReplicatedInPlace makes a cluster database d's tables what this
+// node held at `at`: the difference is written through its replicated handle
+// in one transaction, so it replicates like any write (HISTORY.md, "Restore
+// in place").
+func (s *Server) restoreReplicatedInPlace(ctx context.Context, d *state.Database, at time.Time) error {
+	db := s.replHandle(d.ID)
 	if db == nil {
 		return connect.NewError(connect.CodeFailedPrecondition, s.notHere(ctx, d))
 	}

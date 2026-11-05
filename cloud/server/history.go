@@ -76,7 +76,7 @@ func (s *Server) snapshotPass(ctx context.Context, now time.Time) {
 		return
 	}
 	for _, d := range dbs {
-		if d.Type == state.TypeCRDT && s.crdtHandle(d.ID) == nil {
+		if s.cl != nil && s.replHandle(d.ID) == nil {
 			continue // not placed here
 		}
 		h, err := s.history(d)
@@ -122,8 +122,10 @@ func (s *Server) copyAt(ctx context.Context, src *state.Database, at time.Time, 
 	if at.IsZero() {
 		at = time.Now()
 	}
-	crdt := src.Type == state.TypeCRDT
-	if !schemaOnly && !crdt {
+	// A cluster's file carries replication's bookkeeping, which a copy
+	// leaves behind.
+	replicated := s.cl != nil
+	if !schemaOnly && !replicated {
 		return h.Restore(at, dst)
 	}
 	tmp, err := os.MkdirTemp(s.cfg.DataDir, "copy-")
@@ -135,7 +137,7 @@ func (s *Server) copyAt(ctx context.Context, src *state.Database, at time.Time, 
 	if err := h.Restore(at, full); err != nil {
 		return err
 	}
-	if crdt {
+	if replicated {
 		plain := dst
 		if schemaOnly {
 			plain = filepath.Join(tmp, "plain.musq")

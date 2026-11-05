@@ -16,6 +16,7 @@ import (
 
 	_ "github.com/samyfodil/musql/driver"
 	"github.com/samyfodil/musql/engine"
+	"github.com/samyfodil/musql/replication"
 )
 
 // ErrNotFound is returned when a record does not exist.
@@ -27,6 +28,10 @@ var ErrExists = errors.New("state: already exists")
 // Store is the service's state database.
 type Store struct {
 	db *sql.DB
+	// master and remote reach the state on the master, from a cluster
+	// follower; nil standalone.
+	master *Master
+	remote *sql.DB
 	// node is this node's name in a cluster, "" standalone: usage is kept
 	// per node there.
 	node string
@@ -53,11 +58,16 @@ func Open(path string) (*Store, error) {
 }
 
 // OpenReplicated takes the state of a cluster node: db is the *sql.DB
-// replication.Open returned for it, node this node's name. Every node runs
-// the same schema statements, each idempotent, so nodes that start apart
-// create the same tables and merge.
-func OpenReplicated(db *sql.DB, node string) (*Store, error) {
-	s := &Store{db: db, node: node, dbType: TypeCRDT}
+// replication.Open returned for it, node this node's name, m how a follower
+// reaches the master's (nil: every call runs here). Every node runs the same
+// schema statements on its own copy, each idempotent, so nodes that start
+// apart create the same tables and merge; the caller lets this node write
+// while they run.
+func OpenReplicated(db *sql.DB, node string, m *Master) (*Store, error) {
+	s := &Store{db: db, master: m, node: node, dbType: TypePlain}
+	if m != nil {
+		s.remote = remoteDB(m)
+	}
 	for _, m := range migrations {
 		for stmt := range strings.SplitSeq(m, ";") {
 			if stmt = strings.TrimSpace(stmt); stmt == "" {
@@ -105,8 +115,8 @@ const (
 	TypeRaft  = "raft"
 )
 
-// DefaultType is the type a new group's databases default to: plain
-// standalone, crdt in a cluster.
+// DefaultType is the type a new group's databases default to: plain, which
+// is a regular database on its own node and in a cluster alike.
 func (s *Store) DefaultType() string { return s.dbType }
 
 // Clustered reports a cluster node's state.
@@ -119,8 +129,27 @@ func derivedID(parts ...string) string {
 	return hex.EncodeToString(h[:12])
 }
 
+// q is the handle a call runs on: this node's state, or the master's on a
+// cluster follower, so a request that writes and then reads sees its write.
+// With no master to reach, this node's copy still answers reads; a write
+// there fails as not the writer, which tx waits out.
+func (s *Store) q() *sql.DB {
+	if s.master == nil || s.master.Here() {
+		return s.db
+	}
+	if _, err := s.master.URL(); err != nil {
+		return s.db
+	}
+	return s.remote
+}
+
 // Close closes the database.
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	if s.remote != nil {
+		s.remote.Close()
+	}
+	return s.db.Close()
+}
 
 var migrations = []string{
 	`CREATE TABLE users (
@@ -380,20 +409,57 @@ func notFound(err error) error {
 	return err
 }
 
-// tx runs fn in a transaction. On a cluster node a peer's change can commit
-// while it is open, which fails it with SQLITE_BUSY; it is run again.
+// tx runs fn in a transaction. On a cluster node a change from elsewhere can
+// commit while it is open, which fails it with SQLITE_BUSY, and the master can
+// change under it; it is run again, for up to retryFor.
 func (s *Store) tx(ctx context.Context, fn func(*sql.Tx) error) error {
+	deadline := time.Now().Add(retryFor)
 	for try := 0; ; try++ {
 		err := s.tx1(ctx, fn)
-		if !errors.Is(err, engine.ErrBusy) || try == 20 {
+		if !retryable(err) || time.Now().After(deadline) {
 			return err
 		}
-		time.Sleep(time.Duration(try+1) * 5 * time.Millisecond)
+		time.Sleep(min(time.Duration(try+1)*5*time.Millisecond, 200*time.Millisecond))
+	}
+}
+
+// retryFor is how long tx retries: longer than an election takes.
+const retryFor = 15 * time.Second
+
+// retryable reports a failure that running the transaction again may not
+// meet: a busy file, or no master (being elected, or just elected and still
+// catching up).
+func retryable(err error) bool {
+	var r *errRemote
+	switch {
+	case err == nil:
+		return false
+	case errors.Is(err, engine.ErrBusy), errors.Is(err, ErrNoMaster), errors.Is(err, replication.ErrNotWriter):
+		return true
+	case errors.As(err, &r):
+		// The master's own error, as text.
+		return strings.Contains(r.msg, engine.ErrBusy.Error()) || strings.Contains(r.msg, replication.ErrNotWriter.Error())
+	}
+	return false
+}
+
+// ErrNoMaster is a cluster's state with no master to write to yet.
+var ErrNoMaster = errors.New("state: no master yet: an election is under way")
+
+// exec runs one write, again while it meets what tx retries.
+func (s *Store) exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	deadline := time.Now().Add(retryFor)
+	for try := 0; ; try++ {
+		res, err := s.q().ExecContext(ctx, query, args...)
+		if !retryable(err) || time.Now().After(deadline) {
+			return res, err
+		}
+		time.Sleep(min(time.Duration(try+1)*5*time.Millisecond, 200*time.Millisecond))
 	}
 }
 
 func (s *Store) tx1(ctx context.Context, fn func(*sql.Tx) error) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.q().BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}

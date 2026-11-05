@@ -35,9 +35,12 @@ type Server struct {
 	handler  http.Handler
 	log      *log.Logger
 	// cl is set on a cluster node.
-	cl    *clusterSide
-	genMu sync.Mutex
-	gen   ai.Generator
+	cl *clusterSide
+	// initOnly opens the state for Init: written on this node alone, with no
+	// election.
+	initOnly bool
+	genMu    sync.Mutex
+	gen      ai.Generator
 
 	stop chan struct{}
 	bg   sync.WaitGroup
@@ -73,6 +76,7 @@ func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) 
 	fail := func(err error) (*Server, error) {
 		store.Close()
 		if s.cl != nil {
+			s.cl.state.Close()
 			s.cl.node.Close()
 		}
 		return nil, err
@@ -96,6 +100,9 @@ func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) 
 	}
 	if s.provider, err = oidc.New(ctx, store, cfg.PublicURL, opts...); err != nil {
 		return fail(err)
+	}
+	if s.cl != nil {
+		s.cl.starting.Store(false)
 	}
 	s.meter = newMeter(store, func(id string) int64 {
 		d, err := store.DatabaseByID(context.Background(), id)
@@ -170,6 +177,9 @@ func (s *Server) Close() error {
 	}
 	err := s.store.Close()
 	if s.cl != nil {
+		if cerr := s.cl.state.Close(); err == nil {
+			err = cerr
+		}
 		if cerr := s.cl.node.Close(); err == nil {
 			err = cerr
 		}
@@ -202,7 +212,7 @@ func Init(ctx context.Context, cfg *Config, email, password string) error {
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return err
 	}
-	s := &Server{cfg: cfg, log: log.New(os.Stderr, "musql-cloud: ", log.LstdFlags)}
+	s := &Server{cfg: cfg, log: log.New(os.Stderr, "musql-cloud: ", log.LstdFlags), initOnly: true}
 	store, err := s.openState(ctx)
 	if err != nil {
 		return err

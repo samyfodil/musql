@@ -43,12 +43,12 @@ func TestReplicatedSchemaStatements(t *testing.T) {
 	old := migrations
 	defer func() { migrations = old }()
 	migrations = []string{`CREATE TABLE t(a); ALTER TABLE t ADD COLUMN b; ALTER TABLE t ADD COLUMN b`}
-	if _, err := OpenReplicated(db, "n1"); err != nil {
+	if _, err := OpenReplicated(db, "n1", nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, m := range []string{`ALTER TABLE t RENAME TO u`, `CREATE TABLE (`} {
 		migrations = []string{m}
-		if _, err := OpenReplicated(db, "n1"); err == nil {
+		if _, err := OpenReplicated(db, "n1", nil); err == nil {
 			t.Errorf("%s: ran", m)
 		}
 	}

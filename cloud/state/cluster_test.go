@@ -10,18 +10,20 @@ import (
 	"github.com/samyfodil/musql/replication"
 )
 
-// openClusterState opens a replicated state for node on net.
+// openClusterState opens a replicated state for node on net, a master: two
+// of them are two masters overlapping around an election.
 func openClusterState(t *testing.T, net *replication.MemNetwork, node string) *Store {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "state.musq")
-	db, err := replication.Open(context.Background(), path, replication.CRDT(), replication.WithSyncInterval(50*time.Millisecond),
+	master := func() bool { return true }
+	db, err := replication.Open(context.Background(), path, replication.Leader(master), replication.WithSyncInterval(50*time.Millisecond),
 		replication.WithTransport(func(ctx context.Context, s *replication.Syncer) (replication.Transport, error) {
 			return net.AddNode(replication.PeerID(node), s.OpSource()), nil
 		}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := OpenReplicated(db, node)
+	st, err := OpenReplicated(db, node, &Master{Here: master})
 	if err != nil {
 		db.Close()
 		t.Fatal(err)

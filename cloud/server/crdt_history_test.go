@@ -18,6 +18,14 @@ import (
 	v1 "github.com/samyfodil/musql/cloud/gen/cloud/v1"
 )
 
+// forBothTypes runs test once with a crdt database and once with a regular
+// one.
+func forBothTypes(t *testing.T, test func(*testing.T, v1.DatabaseType)) {
+	for _, typ := range []v1.DatabaseType{v1.DatabaseType_DATABASE_TYPE_CRDT, v1.DatabaseType_DATABASE_TYPE_PLAIN} {
+		t.Run(typ.String(), func(t *testing.T) { test(t, typ) })
+	}
+}
+
 // rows renders query's rows on db over Hrana on node c, typed, a line each,
 // or "error: …".
 func (c *clusterNode) rows(db, query string) string {
@@ -110,9 +118,13 @@ const userSchema = `SELECT type, name, sql FROM sqlite_schema WHERE name NOT LIK
 
 // A crdt database's export is the user's database, in either format: none of
 // replication's bookkeeping, and no guard refusing a plain connection's write.
-func TestClusterCRDTExportIsPlain(t *testing.T) {
+func TestClusterExportIsPlain(t *testing.T) {
+	forBothTypes(t, exportIsPlain)
+}
+
+func exportIsPlain(t *testing.T, typ v1.DatabaseType) {
 	nodes := newCluster(t, 2)
-	acmeEverywhere(t, nodes)
+	acmeEverywhereAs(t, nodes, typ)
 	nodes[0].exec("/db/acme/app", nodes[0].admin,
 		"CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", "CREATE INDEX t_v ON t(v)", "CREATE TABLE k(a, b)",
 		"INSERT INTO t(v) VALUES ('a'), ('b')", "INSERT INTO k VALUES (1, x'01'), (2.5, NULL)")
@@ -169,11 +181,16 @@ func historyApp(t *testing.T, nodes []*clusterNode) []crdtPoint {
 	return []crdtPoint{p0, p1, crdtMark(t, nodes, "app", branchQueries)}
 }
 
-// A branch (now, at a time, schema only) is a new crdt database made from this
-// node's history, on every node of its group, apart from its parent.
-func TestClusterCRDTBranch(t *testing.T) {
+// A branch (now, at a time, schema only) is a new database made from this
+// node's history (a regular one's master's), on every node of its group,
+// apart from its parent.
+func TestClusterBranch(t *testing.T) {
+	forBothTypes(t, branch)
+}
+
+func branch(t *testing.T, typ v1.DatabaseType) {
 	nodes := newCluster(t, 2)
-	acmeEverywhere(t, nodes)
+	acmeEverywhereAs(t, nodes, typ)
 	n0, n1 := nodes[0], nodes[1]
 	points := historyApp(t, nodes)
 	p1, now := points[1], points[2]
@@ -195,8 +212,15 @@ func TestClusterCRDTBranch(t *testing.T) {
 		t.Fatalf("a write to the branch reached its parent:\n%s", got)
 	}
 
-	// Made here, so its group must be placed here.
-	need(n0.groups().Create(ctx, auth(n0.admin, &v1.CreateGroupRequest{Org: "acme", Name: "far", Location: "iad"})))(t)
+	// Made where its parent's copy is, so its group must be placed there:
+	// here, or for a regular database on its master.
+	far := locations[1]
+	if typ == v1.DatabaseType_DATABASE_TYPE_PLAIN {
+		var m int
+		eventually(t, "app's master", func() bool { m = masterOf(nodes, "app"); return m >= 0 })
+		far = locations[1-m]
+	}
+	need(n0.groups().Create(ctx, auth(n0.admin, &v1.CreateGroupRequest{Org: "acme", Name: "far", Location: far})))(t)
 	_, err := dbs.Create(ctx, auth(n0.admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "b-far", Source: branchOf, Group: "far"}))
 	if code(err) != connect.CodeFailedPrecondition {
 		t.Fatalf("a branch into a group not placed here: %v", err)
@@ -204,14 +228,19 @@ func TestClusterCRDTBranch(t *testing.T) {
 }
 
 // A restore into a new database, from the history of a node the parent was
-// placed on rather than made on, is a new crdt database on every node.
-func TestClusterCRDTRestoreAsNew(t *testing.T) {
+// placed on rather than made on, is a new database of the parent's type on
+// every node.
+func TestClusterRestoreAsNew(t *testing.T) {
+	forBothTypes(t, restoreAsNew)
+}
+
+func restoreAsNew(t *testing.T, typ v1.DatabaseType) {
 	nodes := newCluster(t, 2)
-	acmeEverywhere(t, nodes)
+	acmeEverywhereAs(t, nodes, typ)
 	p0 := historyApp(t, nodes)[0]
 	_, _, dbs := nodes[1].clients()
 	r := need(dbs.Restore(context.Background(), auth(nodes[1].admin, &v1.RestoreRequest{Org: "acme", Name: "app", At: timestamppb.New(p0.at), NewName: "r-0"})))(t)
-	if d := r.Msg.Database; d.Parent == "" || d.Type != v1.DatabaseType_DATABASE_TYPE_CRDT {
+	if d := r.Msg.Database; d.Parent == "" || d.Type != typ {
 		t.Fatalf("restored into %+v", d)
 	}
 	holds(t, nodes, "r-0", p0.want)
@@ -220,9 +249,13 @@ func TestClusterCRDTRestoreAsNew(t *testing.T) {
 // An in-place restore writes the difference: every node converges to the state
 // at T whatever changed since, the database stays live, a later restore undoes
 // it, and one across a schema change is declined.
-func TestClusterCRDTRestoreInPlace(t *testing.T) {
+func TestClusterRestoreInPlace(t *testing.T) {
+	forBothTypes(t, restoreInPlace)
+}
+
+func restoreInPlace(t *testing.T, typ v1.DatabaseType) {
 	nodes := newCluster(t, 3)
-	acmeEverywhere(t, nodes)
+	acmeEverywhereAs(t, nodes, typ)
 	const app = "/db/acme/app"
 	queries := []string{"SELECT * FROM u ORDER BY id", "SELECT * FROM p ORDER BY x, y", "SELECT rowid, a, b FROM k ORDER BY rowid"}
 	nodes[0].exec(app, nodes[0].admin,

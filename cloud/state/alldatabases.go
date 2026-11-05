@@ -4,7 +4,7 @@ import "context"
 
 // AllDatabases lists every database of every org.
 func (s *Store) AllDatabases(ctx context.Context) ([]*Database, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+dbCols+` FROM databases ORDER BY id`)
+	rows, err := s.q().QueryContext(ctx, `SELECT `+dbCols+` FROM databases ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
