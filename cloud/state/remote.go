@@ -29,17 +29,23 @@ type Master struct {
 
 // remoteDB is a *sql.DB over the master's state. A connection holds a Hrana
 // stream only while a transaction is open; a statement outside one is a
-// request of its own, so the master may change between two of them.
-func remoteDB(m *Master) *sql.DB {
-	db := sql.OpenDB(remoteConnector{m})
+// request of its own, so the master may change between two of them. One that
+// cannot reach the master (it stopped, and the election has not noticed yet)
+// runs on local, this node's copy: a read is answered, and a write fails as
+// not the writer, which the Store waits out.
+func remoteDB(m *Master, local *sql.DB) *sql.DB {
+	db := sql.OpenDB(remoteConnector{m, local})
 	db.SetConnMaxIdleTime(time.Minute)
 	return db
 }
 
-type remoteConnector struct{ m *Master }
+type remoteConnector struct {
+	m     *Master
+	local *sql.DB
+}
 
 func (c remoteConnector) Connect(context.Context) (driver.Conn, error) {
-	return &remoteConn{m: c.m}, nil
+	return &remoteConn{m: c.m, local: c.local}, nil
 }
 
 func (c remoteConnector) Driver() driver.Driver { return remoteDriver{} }
@@ -51,11 +57,15 @@ func (remoteDriver) Open(string) (driver.Conn, error) {
 }
 
 type remoteConn struct {
-	m *Master
+	m     *Master
+	local *sql.DB
 	// url and baton are the open transaction's stream.
 	url   string
 	baton *string
 }
+
+// errUnreachable is a request that did not reach a master that could answer.
+var errUnreachable = errors.New("state: the master is unreachable")
 
 // errRemote is a statement the master refused: its message is the master's.
 type errRemote struct{ msg string }
@@ -90,7 +100,7 @@ func (c *remoteConn) run(ctx context.Context, stmt *hpb.Stmt, keep, end bool) (*
 	resp, err := c.m.Client.Do(req)
 	if err != nil {
 		c.baton = nil
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", errUnreachable, err)
 	}
 	defer resp.Body.Close()
 	b, err := io.ReadAll(resp.Body)
@@ -100,7 +110,11 @@ func (c *remoteConn) run(ctx context.Context, stmt *hpb.Stmt, keep, end bool) (*
 	}
 	if resp.StatusCode != http.StatusOK {
 		c.baton = nil
-		return nil, fmt.Errorf("state: the master answered %s: %s", resp.Status, bytes.TrimSpace(b))
+		err := fmt.Errorf("state: the master answered %s: %s", resp.Status, bytes.TrimSpace(b))
+		if resp.StatusCode >= 500 {
+			err = fmt.Errorf("%w: %v", errUnreachable, err)
+		}
+		return nil, err
 	}
 	var out hhttp.PipelineRespBody
 	if err := out.UnmarshalVT(b); err != nil {
@@ -186,7 +200,11 @@ func (c *remoteConn) ExecContext(ctx context.Context, query string, args []drive
 	if err != nil {
 		return nil, err
 	}
-	r, err := c.run(ctx, st, c.baton != nil, false)
+	inTx := c.baton != nil
+	r, err := c.run(ctx, st, inTx, false)
+	if errors.Is(err, errUnreachable) && !inTx {
+		return c.local.ExecContext(ctx, query, values(args)...)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -198,11 +216,74 @@ func (c *remoteConn) QueryContext(ctx context.Context, query string, args []driv
 	if err != nil {
 		return nil, err
 	}
-	r, err := c.run(ctx, st, c.baton != nil, false)
+	inTx := c.baton != nil
+	r, err := c.run(ctx, st, inTx, false)
+	if errors.Is(err, errUnreachable) && !inTx {
+		return localRows(ctx, c.local, query, values(args))
+	}
 	if err != nil {
 		return nil, err
 	}
 	return &remoteRows{r: r}, nil
+}
+
+func values(args []driver.NamedValue) []any {
+	out := make([]any, len(args))
+	for i, a := range args {
+		out[i] = a.Value
+		if a.Name != "" {
+			out[i] = sql.Named(a.Name, a.Value)
+		}
+	}
+	return out
+}
+
+// localRows runs query on this node's copy, its rows read whole, as a
+// request's are.
+func localRows(ctx context.Context, db *sql.DB, query string, args []any) (driver.Rows, error) {
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	out := &memRows{cols: cols}
+	for rows.Next() {
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		row := make([]driver.Value, len(vals))
+		for i, v := range vals {
+			row[i] = v
+		}
+		out.rows = append(out.rows, row)
+	}
+	return out, rows.Err()
+}
+
+type memRows struct {
+	cols []string
+	rows [][]driver.Value
+}
+
+func (r *memRows) Columns() []string { return r.cols }
+func (r *memRows) Close() error      { return nil }
+
+func (r *memRows) Next(dest []driver.Value) error {
+	if len(r.rows) == 0 {
+		return io.EOF
+	}
+	copy(dest, r.rows[0])
+	r.rows = r.rows[1:]
+	return nil
 }
 
 func (c *remoteConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {

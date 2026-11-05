@@ -69,7 +69,8 @@ type Node struct {
 	stop  context.CancelFunc
 	wg    sync.WaitGroup
 	// closers stop what serves on the host, before it closes.
-	closers []func() error
+	closers     []func() error
+	stopServing sync.Once
 }
 
 // gater admits connections to and from the configured peers only. The
@@ -149,6 +150,16 @@ func (n *Node) dial(ctx context.Context) {
 	}
 }
 
+// StopServing stops what ServeHTTP serves, so the other nodes stop reaching
+// this one before it closes what it serves.
+func (n *Node) StopServing() {
+	n.stopServing.Do(func() {
+		for _, c := range n.closers {
+			c()
+		}
+	})
+}
+
 // ID is this node's peer ID.
 func (n *Node) ID() string { return n.host.ID().String() }
 
@@ -171,9 +182,7 @@ func (n *Node) Sync(topic string) replication.Option {
 // replicated file and election first.
 func (n *Node) Close() error {
 	n.stop()
-	for _, c := range n.closers {
-		c()
-	}
+	n.StopServing()
 	n.wg.Wait()
 	return n.host.Close()
 }

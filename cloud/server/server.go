@@ -42,8 +42,10 @@ type Server struct {
 	genMu    sync.Mutex
 	gen      ai.Generator
 
-	stop chan struct{}
-	bg   sync.WaitGroup
+	stop      chan struct{}
+	bg        sync.WaitGroup
+	closeOnce sync.Once
+	closeErr  error
 
 	// noAdmin is set while a cluster node waits for the admin user to
 	// replicate to it.
@@ -76,7 +78,7 @@ func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) 
 	fail := func(err error) (*Server, error) {
 		store.Close()
 		if s.cl != nil {
-			s.cl.state.Close()
+			s.leaveElections()
 			s.cl.node.Close()
 		}
 		return nil, err
@@ -163,23 +165,33 @@ func (s *Server) Provider() *oidc.Provider { return s.provider }
 // Store is the state database.
 func (s *Server) Store() *state.Store { return s.store }
 
-// Close closes every open database and the state.
+// Close closes every open database and the state; once, a second call
+// answering as the first did.
 func (s *Server) Close() error {
+	s.closeOnce.Do(func() { s.closeErr = s.close() })
+	return s.closeErr
+}
+
+func (s *Server) close() error {
 	close(s.stop)
 	s.bg.Wait()
+	// Its counts go to the state while it can still reach the master.
+	if err := s.meter.flush(context.Background()); err != nil {
+		s.log.Printf("usage: %v", err)
+	}
+	if s.cl != nil {
+		// The others stop hearing from it, and elect, before what it served
+		// closes under them.
+		s.cl.node.StopServing()
+		s.leaveElections()
+	}
 	s.pool.closeAll()
 	if s.cl != nil {
 		s.closeCluster()
 	}
 	s.closeHistories()
-	if err := s.meter.flush(context.Background()); err != nil {
-		s.log.Printf("usage: %v", err)
-	}
 	err := s.store.Close()
 	if s.cl != nil {
-		if cerr := s.cl.state.Close(); err == nil {
-			err = cerr
-		}
 		if cerr := s.cl.node.Close(); err == nil {
 			err = cerr
 		}

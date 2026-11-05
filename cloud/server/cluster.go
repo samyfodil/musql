@@ -52,6 +52,8 @@ type clusterSide struct {
 	// importFrom is a state this node held before, its records not yet
 	// imported into the cluster's.
 	importFrom string
+	// stateDB is the state's replicated handle, once open.
+	stateDB atomic.Pointer[sql.DB]
 }
 
 type replDB struct {
@@ -101,6 +103,25 @@ func (s *Server) openState(ctx context.Context) (*state.Store, error) {
 	if !s.cfg.Clustered() {
 		return state.Open(path)
 	}
+	// A state no replication has opened is a standalone node's, joining a
+	// cluster: its databases must all be ones a cluster can replicate before
+	// any of them is turned into one. Its records then join the cluster's
+	// state by import, as a CRDT state's do (openLeaderState).
+	if _, err := os.Stat(path); err == nil {
+		replicated, err := replication.Replicated(ctx, path)
+		if err != nil {
+			return nil, fmt.Errorf("state: %w", err)
+		}
+		if !replicated {
+			if err := s.preflightJoin(ctx, path); err != nil {
+				return nil, err
+			}
+			engine.RemoveDatabaseFiles(path + importSuffix)
+			if err := moveDB(path, path+importSuffix); err != nil {
+				return nil, err
+			}
+		}
+	}
 	key, err := cluster.LoadKey(filepath.Join(s.cfg.DataDir, "node.key"))
 	if err != nil {
 		return nil, fmt.Errorf("node key: %w", err)
@@ -130,7 +151,12 @@ func (s *Server) openState(ctx context.Context) (*state.Store, error) {
 			return fail(fmt.Errorf("state election: %w", err))
 		}
 		s.cl.state = e
-		here = e.Writer
+		// A master writes, and answers the others, from its copy: one that
+		// has not synced with a peer yet may miss what they hold.
+		here = func() bool {
+			db := s.cl.stateDB.Load()
+			return e.Writer() && db != nil && replication.Synced(db)
+		}
 	}
 	elected := here
 	here = func() bool { return s.cl.starting.Load() || elected() }
@@ -141,6 +167,7 @@ func (s *Server) openState(ctx context.Context) (*state.Store, error) {
 	}
 	// One connection, as standalone: writes are serialized in-process.
 	db.SetMaxOpenConns(1)
+	s.cl.stateDB.Store(db)
 	m := &state.Master{Here: here, Client: s.cl.client, URL: func() (string, error) {
 		id := s.cl.state.Leader()
 		if id == "" || id == n.ID() {
@@ -158,7 +185,16 @@ func (s *Server) openState(ctx context.Context) (*state.Store, error) {
 		// The other nodes reach this one's state, and the requests they
 		// forward, here; only the configured peers can open the protocol.
 		mux := http.NewServeMux()
-		mux.Handle("/state/", http.StripPrefix("/state", hrana.NewServer(db)))
+		stateHrana := http.StripPrefix("/state", hrana.NewServer(db))
+		mux.Handle("/state/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Elected but not yet one to answer from (settling, or its copy
+			// not synced): the asker uses its own copy meanwhile.
+			if !elected() {
+				http.Error(w, state.ErrNoMaster.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			stateHrana.ServeHTTP(w, r)
+		}))
 		mux.Handle("/fwd/", http.StripPrefix("/fwd", http.HandlerFunc(s.serveForwarded)))
 		if err := n.ServeHTTP(mux); err != nil {
 			st.Close()
@@ -166,6 +202,38 @@ func (s *Server) openState(ctx context.Context) (*state.Store, error) {
 		}
 	}
 	return st, nil
+}
+
+// preflightJoin checks, before a standalone node's data is replicated, that
+// every database it holds can be: it names each one a cluster would refuse
+// (a trigger, a virtual table, a WITHOUT ROWID table), so the node stops
+// rather than serve some of its databases and not others.
+func (s *Server) preflightJoin(ctx context.Context, path string) error {
+	st, err := state.Open(path)
+	if err != nil {
+		return fmt.Errorf("state: %w", err)
+	}
+	defer st.Close()
+	dbs, err := st.AllDatabases(ctx)
+	if err != nil {
+		return err
+	}
+	var refused []string
+	for _, d := range dbs {
+		err := replication.Check(ctx, s.dbPath(d))
+		if err == nil || errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		name := d.Name
+		if o, oerr := st.OrgByID(ctx, d.OrgID); oerr == nil {
+			name = o.Slug + "/" + d.Name
+		}
+		refused = append(refused, fmt.Sprintf("  %s: %v", name, err))
+	}
+	if len(refused) > 0 {
+		return fmt.Errorf("this node's databases cannot all join a cluster; start it without peers and drop what is named, or export the database and delete it:\n%s", strings.Join(refused, "\n"))
+	}
+	return nil
 }
 
 // openLeaderState opens the state in Leader mode. A state this node kept in
@@ -218,6 +286,15 @@ func (s *Server) importState(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// A standalone node's groups may name the location it had alone: placed
+	// nowhere in the cluster, placement would never open their databases.
+	g, err := s.store.AdoptGroups(ctx, s.allLocations(), s.cfg.Node.Location)
+	if err != nil {
+		return err
+	}
+	if g > 0 {
+		s.log.Printf("placed %d groups placed at no node's location at %s", g, s.cfg.Node.Location)
+	}
 	if err := moveDB(s.cl.importFrom, strings.TrimSuffix(s.cl.importFrom, importSuffix)+".imported"); err != nil {
 		return err
 	}
@@ -266,6 +343,9 @@ func (s *Server) clusterPass(ctx context.Context) {
 	// Two masters can overlap for a moment around an election, and both
 	// claim one name; the master renames the row held out.
 	if s.cl.state.Writer() {
+		if err := s.cl.state.SetMembers(s.members(s.allLocations())); err != nil {
+			s.log.Printf("state election: members: %v", err)
+		}
 		renamed, err := s.store.ResolveHeld(ctx)
 		if err != nil {
 			s.log.Printf("state conflicts: %v", err)
@@ -537,24 +617,32 @@ func (s *Server) unplace(id string) {
 	}
 }
 
-// closeCluster closes the replicated databases and leaves the groups'
-// elections; the state and its election close after.
+// leaveElections leaves the groups' elections and the state's.
+func (s *Server) leaveElections() {
+	s.cl.mu.Lock()
+	groups := s.cl.groups
+	s.cl.groups = map[string]*cluster.Election{}
+	s.cl.mu.Unlock()
+	for id, e := range groups {
+		if err := e.Close(); err != nil {
+			s.log.Printf("group %s: %v", id, err)
+		}
+	}
+	if err := s.cl.state.Close(); err != nil {
+		s.log.Printf("state election: %v", err)
+	}
+}
+
+// closeCluster closes the replicated databases.
 func (s *Server) closeCluster() {
 	s.cl.mu.Lock()
 	ids := make([]string, 0, len(s.cl.dbs))
 	for id := range s.cl.dbs {
 		ids = append(ids, id)
 	}
-	groups := s.cl.groups
-	s.cl.groups = map[string]*cluster.Election{}
 	s.cl.mu.Unlock()
 	for _, id := range ids {
 		s.closeReplicated(id)
-	}
-	for id, e := range groups {
-		if err := e.Close(); err != nil {
-			s.log.Printf("group %s: %v", id, err)
-		}
 	}
 }
 
