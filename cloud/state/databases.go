@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"slices"
 	"time"
 )
 
@@ -182,6 +183,70 @@ func (s *Store) AddLocation(ctx context.Context, groupID, location string) error
 		return ErrExists
 	}
 	return err
+}
+
+// AdoptGroups places at location every group placed at none of known (the
+// locations a cluster's nodes have): a standalone node's groups when it joins
+// a cluster under another location name. Their primary location becomes
+// location too. It reports how many groups it placed.
+func (s *Store) AdoptGroups(ctx context.Context, known []string, location string) (int, error) {
+	var n int
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		n = 0
+		rows, err := tx.Query(`SELECT id FROM groups`)
+		if err != nil {
+			return err
+		}
+		var ids []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return err
+			}
+			ids = append(ids, id)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, id := range ids {
+			locs, err := groupLocations(tx, id)
+			if err != nil {
+				return err
+			}
+			if slices.ContainsFunc(locs, func(l string) bool { return slices.Contains(known, l) }) {
+				continue
+			}
+			if _, err := tx.Exec(`INSERT INTO group_locations (group_id, location) VALUES (?, ?)`, id, location); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`UPDATE groups SET primary_location = ? WHERE id = ?`, location, id); err != nil {
+				return err
+			}
+			n++
+		}
+		return nil
+	})
+	return n, err
+}
+
+// groupLocations is a group's locations, read in tx.
+func groupLocations(tx *sql.Tx, id string) ([]string, error) {
+	rows, err := tx.Query(`SELECT location FROM group_locations WHERE group_id = ?`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var l string
+		if err := rows.Scan(&l); err != nil {
+			return nil, err
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
 }
 
 // RemoveLocation removes a non-primary location from a group.

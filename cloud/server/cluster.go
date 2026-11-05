@@ -101,6 +101,25 @@ func (s *Server) openState(ctx context.Context) (*state.Store, error) {
 	if !s.cfg.Clustered() {
 		return state.Open(path)
 	}
+	// A state no replication has opened is a standalone node's, joining a
+	// cluster: its databases must all be ones a cluster can replicate before
+	// any of them is turned into one. Its records then join the cluster's
+	// state by import, as a CRDT state's do (openLeaderState).
+	if _, err := os.Stat(path); err == nil {
+		replicated, err := replication.Replicated(ctx, path)
+		if err != nil {
+			return nil, fmt.Errorf("state: %w", err)
+		}
+		if !replicated {
+			if err := s.preflightJoin(ctx, path); err != nil {
+				return nil, err
+			}
+			engine.RemoveDatabaseFiles(path + importSuffix)
+			if err := moveDB(path, path+importSuffix); err != nil {
+				return nil, err
+			}
+		}
+	}
 	key, err := cluster.LoadKey(filepath.Join(s.cfg.DataDir, "node.key"))
 	if err != nil {
 		return nil, fmt.Errorf("node key: %w", err)
@@ -168,6 +187,38 @@ func (s *Server) openState(ctx context.Context) (*state.Store, error) {
 	return st, nil
 }
 
+// preflightJoin checks, before a standalone node's data is replicated, that
+// every database it holds can be: it names each one a cluster would refuse
+// (a trigger, a virtual table, a WITHOUT ROWID table), so the node stops
+// rather than serve some of its databases and not others.
+func (s *Server) preflightJoin(ctx context.Context, path string) error {
+	st, err := state.Open(path)
+	if err != nil {
+		return fmt.Errorf("state: %w", err)
+	}
+	defer st.Close()
+	dbs, err := st.AllDatabases(ctx)
+	if err != nil {
+		return err
+	}
+	var refused []string
+	for _, d := range dbs {
+		err := replication.Check(ctx, s.dbPath(d))
+		if err == nil || errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		name := d.Name
+		if o, oerr := st.OrgByID(ctx, d.OrgID); oerr == nil {
+			name = o.Slug + "/" + d.Name
+		}
+		refused = append(refused, fmt.Sprintf("  %s: %v", name, err))
+	}
+	if len(refused) > 0 {
+		return fmt.Errorf("this node's databases cannot all join a cluster; start it without peers and drop what is named, or export the database and delete it:\n%s", strings.Join(refused, "\n"))
+	}
+	return nil
+}
+
 // openLeaderState opens the state in Leader mode. A state this node kept in
 // CRDT mode, before the state moved to Leader mode, is not converted in
 // place: genesis would record its tables by their final text, and the
@@ -218,6 +269,15 @@ func (s *Server) importState(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// A standalone node's groups may name the location it had alone: placed
+	// nowhere in the cluster, placement would never open their databases.
+	g, err := s.store.AdoptGroups(ctx, s.allLocations(), s.cfg.Node.Location)
+	if err != nil {
+		return err
+	}
+	if g > 0 {
+		s.log.Printf("placed %d groups placed at no node's location at %s", g, s.cfg.Node.Location)
+	}
 	if err := moveDB(s.cl.importFrom, strings.TrimSuffix(s.cl.importFrom, importSuffix)+".imported"); err != nil {
 		return err
 	}
@@ -266,6 +326,9 @@ func (s *Server) clusterPass(ctx context.Context) {
 	// Two masters can overlap for a moment around an election, and both
 	// claim one name; the master renames the row held out.
 	if s.cl.state.Writer() {
+		if err := s.cl.state.SetMembers(s.members(s.allLocations())); err != nil {
+			s.log.Printf("state election: members: %v", err)
+		}
 		renamed, err := s.store.ResolveHeld(ctx)
 		if err != nil {
 			s.log.Printf("state conflicts: %v", err)

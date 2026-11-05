@@ -197,12 +197,21 @@ WITHOUT ROWID and rowids all work), and history is the physical log of
 the only kind it accepts (`crdt` needs peers to replicate to and is
 declined).
 
-A standalone node does not join a cluster in place: declined for now. Its
-state and `plain` databases carry no replication bookkeeping and may hold what
-CRDT capture refuses, so turning them into replicated files is a migration of
-its own (export each database, check it against the limits below, upload it
-as a `crdt` database in the cluster). A cluster starts from nodes with a fresh
-`data_dir`.
+A standalone node joins a cluster in place: give it `peers` (and the other
+nodes it in theirs) and restart it. At that first start it checks every
+database it holds against what a cluster refuses (below) without changing
+any; one that holds a trigger, a virtual table or a WITHOUT ROWID table stops
+it, named, so it serves all of its databases or none, and starting it again
+without peers lets the operator fix or export it. Then its state is set aside
+(`state.musq.import`) and its records join the cluster's state by import, as
+a state kept in CRDT mode does (below): the cluster may already have its own,
+and the two merge, a name another record holds coming in renamed. A group
+placed at no cluster node's location (the node's location may have been
+another while it was alone) is placed at its location. Its databases stay
+where they are, regular ones, each opened through replication at its next
+placement, its rows becoming the node's first ops; placing their groups at
+more locations copies them to those nodes. Their history from before stays
+readable on this node.
 
 ### Cluster
 
@@ -354,9 +363,10 @@ deterministic or visible, never two rows with one name:
   its key has synced: one sync interval after a node's new key.
 
 Declined, deliberately: linearizable multi-node writes (a master's commit is
-durable on the master and reaches the others after it); an in-place restore of a
+durable on the master and reaches the others after it); a standalone database
+holding what a cluster refuses joining one; an in-place restore of a
 `crdt` database across a schema change or with a row withheld (restore into a
-new database instead); a standalone node joining a cluster in place; a usage
+new database instead); a usage
 view that counts more than the nodes have synced.
 
 ## Usage analytics
