@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -354,17 +355,28 @@ func (s *Server) hranaAuth(orgID, dbID string) func(string) (bool, error) {
 		ctx := context.Background()
 		o, err := s.store.OrgByID(ctx, orgID)
 		if err != nil {
-			return false, errNoAccess
+			return false, authErr(err)
 		}
 		d, err := s.store.DatabaseByID(ctx, dbID)
 		if err != nil {
-			return false, errNoAccess
+			return false, authErr(err)
 		}
 		return s.dbAccess(ctx, tok, o, d)
 	}
 }
 
 var errNoAccess = errors.New("no access")
+
+// authErr is how a token check that failed on err refuses the client: a bad
+// token, or a record that is not there, denies it; any other error is the
+// state out of reach, as around a master's election, and the client may
+// retry.
+func authErr(err error) error {
+	if errors.Is(err, state.ErrNotFound) || errors.Is(err, oidc.ErrInvalidToken) {
+		return errNoAccess
+	}
+	return fmt.Errorf("%w: %v", hrana.ErrUnavailable, err)
+}
 
 // dbAccess decides what a bearer token may do to d: (readOnly, nil) when it
 // may connect at all.
@@ -380,7 +392,10 @@ func (s *Server) dbAccess(ctx context.Context, tok string, o *state.Org, d *stat
 			}
 		case c.Group != "":
 			g, err := s.store.GroupByID(ctx, c.Group)
-			if err != nil || c.Group != d.GroupID || c.Gen != g.TokenGen {
+			if err != nil {
+				return false, authErr(err)
+			}
+			if c.Group != d.GroupID || c.Gen != g.TokenGen {
 				return false, errNoAccess
 			}
 		default:
@@ -396,10 +411,13 @@ func (s *Server) dbAccess(ctx context.Context, tok string, o *state.Org, d *stat
 	}
 	u, err := s.userFromToken(ctx, tok)
 	if err != nil {
-		return false, errNoAccess
+		return false, authErr(err)
 	}
 	r, err := s.role(ctx, u, o)
-	if err != nil || r == "" {
+	if err != nil {
+		return false, authErr(err)
+	}
+	if r == "" {
 		return false, errNoAccess
 	}
 	return !r.AtLeast(state.RoleMember), nil
