@@ -118,4 +118,10 @@ func TestFollowerStore(t *testing.T) {
 	if time.Since(start) < 300*time.Millisecond {
 		t.Fatal("the write did not wait for a master")
 	}
+	// The master stops before the election notices: a read answers from
+	// this node's copy instead of failing.
+	srv.Close()
+	if _, err := follower.OrgBySlug(ctx, "shop"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("with the master gone, the follower's own copy answers: %v, want ErrNotFound (it holds no rows)", err)
+	}
 }

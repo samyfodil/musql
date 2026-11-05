@@ -66,7 +66,7 @@ func Open(path string) (*Store, error) {
 func OpenReplicated(db *sql.DB, node string, m *Master) (*Store, error) {
 	s := &Store{db: db, master: m, node: node, dbType: TypePlain}
 	if m != nil {
-		s.remote = remoteDB(m)
+		s.remote = remoteDB(m, db)
 	}
 	for _, m := range migrations {
 		for stmt := range strings.SplitSeq(m, ";") {
@@ -427,14 +427,14 @@ func (s *Store) tx(ctx context.Context, fn func(*sql.Tx) error) error {
 const retryFor = 15 * time.Second
 
 // retryable reports a failure that running the transaction again may not
-// meet: a busy file, or no master (being elected, or just elected and still
-// catching up).
+// meet: a busy file, or no master (being elected, unreachable, or just
+// elected and still catching up).
 func retryable(err error) bool {
 	var r *errRemote
 	switch {
 	case err == nil:
 		return false
-	case errors.Is(err, engine.ErrBusy), errors.Is(err, ErrNoMaster), errors.Is(err, replication.ErrNotWriter):
+	case errors.Is(err, engine.ErrBusy), errors.Is(err, ErrNoMaster), errors.Is(err, replication.ErrNotWriter), errors.Is(err, errUnreachable):
 		return true
 	case errors.As(err, &r):
 		// The master's own error, as text.
