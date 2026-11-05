@@ -68,6 +68,8 @@ type Node struct {
 	logf  func(string, ...any)
 	stop  context.CancelFunc
 	wg    sync.WaitGroup
+	// closers stop what serves on the host, before it closes.
+	closers []func() error
 }
 
 // gater admits connections to and from the configured peers only. The
@@ -165,10 +167,13 @@ func (n *Node) Sync(topic string) replication.Option {
 	return repllibp2p.SyncWith(n.host, n.ps, topic)
 }
 
-// Close stops dialling and closes the host. Close every replicated file
-// first.
+// Close stops dialling and serving, and closes the host. Close every
+// replicated file and election first.
 func (n *Node) Close() error {
 	n.stop()
+	for _, c := range n.closers {
+		c()
+	}
 	n.wg.Wait()
 	return n.host.Close()
 }
