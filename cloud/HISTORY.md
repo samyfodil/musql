@@ -125,20 +125,22 @@ rowids, triggers, vtab shadow tables and all.
   (`sqlite_%`) and shadow tables (`PRAGMA table_list` type `shadow`, which the
   virtual table recreates itself).
 
-## Per node, and `crdt` databases
+## Per node, in a cluster
 
-In a cluster a `crdt` database is a file on each node of its group, written
-by replication; each node logs its own file's history as above. The logs are
+In a cluster a database, regular or `crdt`, is a file on each node of its
+group, written by replication; each node logs its own file's history as
+above. The logs are
 not shipped between nodes and are not each other's: a node's log holds what
 its copy held, bookkeeping included (replication's `_repl_*` tables and the
 file's capture guard). See `DESIGN.md`, Deployments.
 
 So no restored file goes back into a replicated group as it is: it carries
 this node's site id and op log, and a second file under one site is two
-writers of one log. A `crdt` database's export, branch and restore go
-through a **plain copy** instead. None of them runs on a node still in its
-first sync of the database, which holds only part of it: they answer
-Unavailable, as Hrana does.
+writers of one log. A cluster database's export, branch and restore go
+through a **plain copy** instead. A regular database's run on its group's
+master, whose copy every write went through: another node forwards them. None
+of them runs on a node still in its first sync of the database, which holds
+only part of it: they answer Unavailable, as Hrana does.
 
 ### Plain copy
 
@@ -157,8 +159,8 @@ plain copy.
   database's file (a schema-only branch then keeps only its schema), which is
   opened through replication here: what a database holds before its first
   `Open` becomes that node's first ops (a keyless table's rowids are
-  renumbered into the new site's range). The new database is `crdt`, in the
-  parent's group unless one is named; it is made on this node, so both the
+  renumbered into the new site's range). The new database is of the parent's
+  type, in the parent's group unless one is named; it is made on this node, so both the
   parent (its history is here) and the new database's group must be placed
   here, as for an upload. The group's other nodes sync it like any database
   newly placed there. A point from before this node's first sync completed

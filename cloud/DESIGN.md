@@ -94,7 +94,7 @@ The server is its own issuer at `public_url`:
   shared ones. **Members** have a role: `owner`, `admin`, `member`, `viewer`.
   Invites by email create a pending membership the user accepts on login.
 - **Group**: a set of locations a database is placed in, and the type its
-  databases default to (`plain` standalone, `crdt` in a cluster). Every org
+  databases default to (`plain`, a regular database, unless set). Every org
   has a `default` group in the creating node's location.
 - **Database**: `org/name`, type (`plain` | `crdt` | `raft`), group, created_at, size, optional `parent` and
   `parent_at` (a branch), schema-only flag. Served over Hrana at
@@ -128,8 +128,8 @@ The server is its own issuer at `public_url`:
   into a new database (Turso's model) or in place.
 - **Branch**: a restore into a new database, at now or at T; schema-only
   recreates the parent's objects empty.
-- **Standalone and cluster**: see below; a `crdt` database's history is its
-  node's.
+- **Standalone and cluster**: see below; a cluster database's history is
+  its node's.
 
 ## Uploads and exports
 
@@ -193,8 +193,9 @@ With no `peers`, a node is the single server described above: no libp2p host
 is started and no node key is made, the state and every database are opened
 with the plain driver (no capture, so triggers, virtual tables and FTS,
 WITHOUT ROWID and rowids all work), and history is the physical log of
-`HISTORY.md`. Its databases are of type `plain`, the only type it accepts
-(`crdt` needs peers to replicate to and is declined).
+`HISTORY.md`. Its databases are regular ones (type `plain`, `raft` an alias),
+the only kind it accepts (`crdt` needs peers to replicate to and is
+declined).
 
 A standalone node does not join a cluster in place: declined for now. Its
 state and `plain` databases carry no replication bookkeeping and may hold what
@@ -226,32 +227,59 @@ peers:
   `examples/libp2p` (`SyncWith`: one gossipsub router per node, one topic per
   replicated file, `musql-cloud/state` and `musql-cloud/db/<id>`), wired in
   `cloud/cluster`; the engine, driver and `replication/` never see libp2p.
-- **Every node serves everything it holds.** There is no primary, no control
-  node and no proxy: each node serves the management API, `/oidc/`, `/login`,
-  the console, and Hrana for every database placed at its location, from its
-  own files. `public_url` is the deployment's (behind geo-routing or a load
-  balancer); every node issues tokens for it.
-- **The state** (`state.musq`) is replicated with `replication` in CRDT mode
-  on every node: a write is local, and reaches the others in the background
-  (pushed at commit, anti-entropy every 2s).
-- **Databases** are typed (`type` on a database, defaulting to its group's):
+- **Masters, elected by raft.** The state, and each group with a regular
+  database, has one node that writes it: the master, elected by a raft group
+  (`hashicorp/raft` over a libp2p stream per group, `/musql-cloud/raft/<name>/1`;
+  `cloud/cluster.Election`). The state's election runs on every node; a
+  group's on the nodes at its locations, its master adding and removing them
+  as locations change. raft's log carries nothing but the election: the data
+  moves as before, by replication's anti-entropy, in Leader mode with the
+  master as the writer. A node newly elected writes only after two sync
+  intervals, so the previous master's last commits reach it first; a commit
+  the previous master made and nobody pulled before it stopped is lost (no
+  Quorum: a write costs no consensus round). Its raft state (term, vote, a
+  short log) is `data_dir/raft/<name>/raft.json`.
+- **Every node serves everything it holds.** Each node serves the management
+  API, `/oidc/`, `/login`, the console, and Hrana for every database placed
+  at its location. `public_url` is the deployment's (behind geo-routing or a
+  load balancer); every node issues tokens for it. What must be written by a
+  master goes to it over libp2p (`/musql-cloud/http/1`, which only the
+  configured peers can open): a follower's state calls, and Hrana requests and
+  history requests for a regular database.
+- **The state** (`state.musq`) is replicated with `replication` in Leader mode
+  on every node, the state's master writing it. A follower's `state.Store`
+  runs every call on the master's, over Hrana on that stream, so a request
+  reads back what it wrote; with no master to reach (an election under way),
+  reads answer from the node's own copy and a write waits for a master, up to
+  15s. A node writes its own copy alone while it starts: its schema
+  statements, its signing key, the built-in clients, each the same on every
+  node or that node's alone, so the writes merge. A state kept in CRDT mode
+  before is converted at start: a plain copy whose rows become the node's
+  first ops (the old file stays as `state.musq.crdt`), on a topic of its own
+  (`musql-cloud/state/leader`) so the two kinds never mix.
+- **Databases** are typed (`type` on a database, defaulting to its group's,
+  `plain` unless set):
 
   | type | where | |
   | --- | --- | --- |
-  | `plain` | standalone only | the full engine, physical history, one writer |
+  | `plain` (regular) | anywhere | standalone: the full engine, physical history, one writer. In a cluster: opened with `replication.Leader` on every node of its group's locations, its group's master the writer; a write on any other node is forwarded to it |
   | `crdt` | cluster only | opened with `replication.CRDT()` on every node of its group's locations; every node accepts writes locally |
-  | `raft` | — | a known value, declined: "raft databases are not yet supported" |
+  | `raft` | anywhere | a regular database: in a cluster raft elects the master that writes it |
 
   Placement follows the state: every node runs a reconcile (at start, after
-  each state change, and every few seconds) that opens each `crdt` database
-  whose group lists its location and is not open yet (creating an empty file,
+  each state change, and every few seconds) that opens each database whose
+  group lists its location and is not open yet (creating an empty file,
   which syncs schema and rows from the peers), and closes and removes the
-  file and history of one no longer placed there, or deleted.
-  `AddLocation`/`RemoveLocation` are state writes like any other. A `crdt`
+  file and history of one no longer placed there, or deleted. A regular
+  database is served by its group's master, reads included (a stream's
+  statements run where its transaction is), and so are its history, export,
+  branches and restores: the master's copy is the one every write went
+  through. A request waits up to 10s for a master while one is elected.
+  `AddLocation`/`RemoveLocation` are state writes like any other. A
   database's file stays open while placed (its sync runs in the background);
   Hrana writes through the replicated `*sql.DB`. A database whose group does
   not list this node's location answers 404 here, naming the locations it
-  lives in; nothing is forwarded.
+  lives in; it is not forwarded.
 - **History is per node.** Each node logs its own file's physical history
   (`cloud/store`), as standalone does: what that node's copy held, with its
   replication bookkeeping. A restored file carries the node's site and op
@@ -259,18 +287,19 @@ peers:
   and restore take a **plain copy** (`replication.PlainCopy`: the schema and
   rows, without the bookkeeping or the capture guard) of this node's file or
   of its history at T. Export is the plain copy of the local file. A branch
-  or a restore into a new database is a new `crdt` database made on this
-  node from the plain copy, whose rows become its first ops. A restore in
+  or a restore into a new database is a new database of its parent's type
+  made on this node from the plain copy, whose rows become its first ops (a
+  regular database's are made on its master). A restore in
   place writes the difference between now and T through the replicated
   handle, in one transaction, so every node converges to T plus the writes
   made concurrently; it is declined across a schema change or while a row is
-  withheld. See `HISTORY.md`, "Per node, and `crdt` databases".
+  withheld. See `HISTORY.md`, "Per node, in a cluster".
 
-#### What a `crdt` database refuses
+#### What a cluster database refuses
 
-The limits are `replication/`'s, enforced by it when a statement commits, so a
-node never stores what it cannot replicate: the statement fails with an error
-and nothing diverges.
+The limits are `replication/`'s, the same in either mode, enforced by it when
+a statement commits, so a node never stores what it cannot replicate: the
+statement fails with an error and nothing diverges.
 
 - triggers;
 - virtual tables (FTS3/4/5, rtree, …);
@@ -281,53 +310,45 @@ and nothing diverges.
 And what CRDT means for the rest: constraints hold for each node's own
 writes; a merge may break a multi-column `CHECK` or orphan a child, and a
 `UNIQUE` value written on two nodes at once is kept by the newer row (the
-other is held out until the value frees). An upload into a `crdt` database
-is opened through replication too, so a file holding any of the above is
-refused.
+other is held out until the value frees). A regular database's master checks
+every constraint, and the others hold what it holds. An upload into a
+cluster database is opened through replication too, so a file holding any of
+the above is refused.
 
-#### The state under CRDT
+#### The state's writes
 
-Conflicting writes merge per column, last writer (hybrid clock) wins. Creates
-that claim a name are made deterministic or visible, never two rows with one
-name:
+Every write reaches the state's master, which runs them one at a time: a
+name is claimed once, a refresh token's use and an authorization or device
+code's redemption are seen by the next call anywhere, and revocation holds at
+once. Two masters can overlap for a moment around an election (one that has
+not yet seen it lost its term); what both wrote then merges per column, last
+writer (hybrid clock) wins, and creates that claim a name are made
+deterministic or visible, never two rows with one name:
 
 - **Users** have an ID derived from their normalized email, as do their
   personal org, its default group and the membership: the same email created
-  on two nodes at once is one user, its columns merged (the later password or
-  name wins). A user deleted and created again has the same ID: an access
+  on two masters at once is one user, its columns merged (the later password
+  or name wins). A user deleted and created again has the same ID: an access
   token from before the delete works for the new account until it expires
   (≤ 1h); refresh and platform tokens are deleted with the user.
 - **Org slugs, group names, database names and user emails** are `UNIQUE`;
-  when two nodes write the same one, replication keeps the row with the newer
-  hybrid clock and holds the other out. Every node then runs the same
-  resolution: a held-out row is written back under its name suffixed with the
-  first 6 characters of its ID (`shop` → `shop-1a2b3c`; an email gets
-  `+<id6>` before the `@`), so both rows exist under distinct names, and the
-  node logs the rename. Every node writes the same values, so the merge is
-  the same everywhere.
+  when two masters write the same one, replication keeps the row with the
+  newer hybrid clock and holds the other out. The master then writes the held
+  row back under its name suffixed with the first 6 characters of its ID
+  (`shop` → `shop-1a2b3c`; an email gets `+<id6>` before the `@`), so both
+  rows exist under distinct names, and logs the rename.
 - **Invites** (`org`, `email`): the newer one stands, the other stays held
   out (same intent).
-- **Usage** is an increment, so it is kept per node (`node` in the key) and
-  summed when read. A `token_gen` bump needs no sum: any bump changes the
-  generation, which is all invalidation needs.
+- **Usage** is kept per node (`node` in the key) and summed when read: each
+  node counts what it served.
 - **Signing keys**: every node signs. A node starts a key of its own when it
   has none and rotates on schedule; JWKS publishes every key in the
   replicated set, and verification reloads the set on an unknown `kid` (and
-  at each 2s sync pass), so a token signed anywhere verifies everywhere once its key
-  has synced: one sync interval after a node's new key.
-- **Refresh tokens** rotate on use, and a reused one revokes its family. A
-  use reaches the other nodes only at sync, so within one sync interval
-  (≈2s plus the network) the same refresh token presented to two nodes
-  succeeds on both, giving two children of one parent; once the uses meet,
-  any later use of the parent is a reuse and revokes the whole family on
-  every node. Revocation (logout, `/oidc/revoke`, disabling a user, deleting
-  a platform token) reaches the other nodes within the same window.
-  Authorization and device codes are single-use per node: one redeemed on a
-  node that has not synced it yet is "not found" there, and the client
-  retries.
+  at each 2s sync pass), so a token signed anywhere verifies everywhere once
+  its key has synced: one sync interval after a node's new key.
 
-Declined, deliberately: `raft` databases (and with them linearizable
-multi-node writes); `plain` databases in a cluster; an in-place restore of a
+Declined, deliberately: linearizable multi-node writes (a master's commit is
+durable on the master and reaches the others after it); an in-place restore of a
 `crdt` database across a schema change or with a row withheld (restore into a
 new database instead); a standalone node joining a cluster in place; a usage
 view that counts more than the nodes have synced.
