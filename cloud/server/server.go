@@ -42,8 +42,10 @@ type Server struct {
 	genMu    sync.Mutex
 	gen      ai.Generator
 
-	stop chan struct{}
-	bg   sync.WaitGroup
+	stop      chan struct{}
+	bg        sync.WaitGroup
+	closeOnce sync.Once
+	closeErr  error
 
 	// noAdmin is set while a cluster node waits for the admin user to
 	// replicate to it.
@@ -163,8 +165,14 @@ func (s *Server) Provider() *oidc.Provider { return s.provider }
 // Store is the state database.
 func (s *Server) Store() *state.Store { return s.store }
 
-// Close closes every open database and the state.
+// Close closes every open database and the state; once, a second call
+// answering as the first did.
 func (s *Server) Close() error {
+	s.closeOnce.Do(func() { s.closeErr = s.close() })
+	return s.closeErr
+}
+
+func (s *Server) close() error {
 	close(s.stop)
 	s.bg.Wait()
 	s.pool.closeAll()
