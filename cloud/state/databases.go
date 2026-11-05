@@ -274,16 +274,17 @@ type Database struct {
 	CreatedAt  time.Time
 	// File is the database file's name in its org's directory; empty means
 	// "<ID>.musq".
-	File string
-	Type string
+	File       string
+	Type       string
+	Durability string
 }
 
-const dbCols = `id, org_id, name, group_id, parent, parent_at, schema_only, token_gen, created_at, file, type`
+const dbCols = `id, org_id, name, group_id, parent, parent_at, schema_only, token_gen, created_at, file, type, durability`
 
 func scanDatabase(r scanner) (*Database, error) {
 	var d Database
 	var parentAt, created int64
-	if err := r.Scan(&d.ID, &d.OrgID, &d.Name, &d.GroupID, &d.Parent, &parentAt, &d.SchemaOnly, &d.TokenGen, &created, &d.File, &d.Type); err != nil {
+	if err := r.Scan(&d.ID, &d.OrgID, &d.Name, &d.GroupID, &d.Parent, &parentAt, &d.SchemaOnly, &d.TokenGen, &created, &d.File, &d.Type, &d.Durability); err != nil {
 		return nil, notFound(err)
 	}
 	d.ParentAt, d.CreatedAt = unix(parentAt), unix(created)
@@ -303,8 +304,11 @@ func (s *Store) CreateDatabase(ctx context.Context, d *Database) error {
 	if d.Type == "" {
 		d.Type = TypePlain
 	}
-	_, err := s.exec(ctx, `INSERT INTO databases (`+dbCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
-		d.ID, d.OrgID, d.Name, d.GroupID, d.Parent, parentAt, d.SchemaOnly, d.CreatedAt.Unix(), d.File, d.Type)
+	if d.Durability == "" {
+		d.Durability = DurabilityDurable
+	}
+	_, err := s.exec(ctx, `INSERT INTO databases (`+dbCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
+		d.ID, d.OrgID, d.Name, d.GroupID, d.Parent, parentAt, d.SchemaOnly, d.CreatedAt.Unix(), d.File, d.Type, d.Durability)
 	if isUnique(err) {
 		return ErrExists
 	}
@@ -319,6 +323,26 @@ func (s *Store) Database(ctx context.Context, orgID, name string) (*Database, er
 // DatabaseByID returns a database.
 func (s *Store) DatabaseByID(ctx context.Context, id string) (*Database, error) {
 	return scanDatabase(s.q().QueryRowContext(ctx, `SELECT `+dbCols+` FROM databases WHERE id = ?`, id))
+}
+
+// DatabaseGone reports whether the database id no longer exists, as the
+// master's state says: a follower's own copy may not hold a new database yet,
+// so with no master to ask it is an error. A follower asks inside a
+// transaction, which never answers from that copy.
+func (s *Store) DatabaseGone(ctx context.Context, id string) (bool, error) {
+	var n int
+	const query = `SELECT count(*) FROM databases WHERE id = ?`
+	if s.master == nil || s.master.Here() {
+		err := s.db.QueryRowContext(ctx, query, id).Scan(&n)
+		return n == 0, err
+	}
+	tx, err := s.remote.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	err = tx.QueryRowContext(ctx, query, id).Scan(&n)
+	return n == 0, err
 }
 
 // Databases lists an org's databases, optionally of one group.

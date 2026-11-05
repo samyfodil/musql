@@ -133,6 +133,60 @@ func (DatabaseType) EnumDescriptor() ([]byte, []int) {
 	return file_cloud_v1_common_proto_rawDescGZIP(), []int{1}
 }
 
+// How a regular database's commits are kept in a cluster. DURABLE, the
+// default: a commit returns once a majority of its group's nodes hold it, so
+// the master stopping loses none. FAST: a commit returns once the master holds
+// it, and the others copy it right after; a master that stops first takes its
+// last commits along. A crdt database and a standalone node's have neither.
+type Durability int32
+
+const (
+	Durability_DURABILITY_UNSPECIFIED Durability = 0
+	Durability_DURABILITY_DURABLE     Durability = 1
+	Durability_DURABILITY_FAST        Durability = 2
+)
+
+// Enum value maps for Durability.
+var (
+	Durability_name = map[int32]string{
+		0: "DURABILITY_UNSPECIFIED",
+		1: "DURABILITY_DURABLE",
+		2: "DURABILITY_FAST",
+	}
+	Durability_value = map[string]int32{
+		"DURABILITY_UNSPECIFIED": 0,
+		"DURABILITY_DURABLE":     1,
+		"DURABILITY_FAST":        2,
+	}
+)
+
+func (x Durability) Enum() *Durability {
+	p := new(Durability)
+	*p = x
+	return p
+}
+
+func (x Durability) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (Durability) Descriptor() protoreflect.EnumDescriptor {
+	return file_cloud_v1_common_proto_enumTypes[2].Descriptor()
+}
+
+func (Durability) Type() protoreflect.EnumType {
+	return &file_cloud_v1_common_proto_enumTypes[2]
+}
+
+func (x Durability) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use Durability.Descriptor instead.
+func (Durability) EnumDescriptor() ([]byte, []int) {
+	return file_cloud_v1_common_proto_rawDescGZIP(), []int{2}
+}
+
 type User struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
@@ -519,6 +573,7 @@ type Database struct {
 	SchemaOnly    bool                   `protobuf:"varint,9,opt,name=schema_only,json=schemaOnly,proto3" json:"schema_only,omitempty"`
 	CreatedAt     *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
 	Type          DatabaseType           `protobuf:"varint,11,opt,name=type,proto3,enum=cloud.v1.DatabaseType" json:"type,omitempty"`
+	Durability    Durability             `protobuf:"varint,12,opt,name=durability,proto3,enum=cloud.v1.Durability" json:"durability,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -630,6 +685,13 @@ func (x *Database) GetType() DatabaseType {
 	return DatabaseType_DATABASE_TYPE_UNSPECIFIED
 }
 
+func (x *Database) GetDurability() Durability {
+	if x != nil {
+		return x.Durability
+	}
+	return Durability_DURABILITY_UNSPECIFIED
+}
+
 var File_cloud_v1_common_proto protoreflect.FileDescriptor
 
 const file_cloud_v1_common_proto_rawDesc = "" +
@@ -667,7 +729,7 @@ const file_cloud_v1_common_proto_rawDesc = "" +
 	"\tlocations\x18\x04 \x03(\tR\tlocations\x129\n" +
 	"\n" +
 	"created_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x12*\n" +
-	"\x04type\x18\x06 \x01(\x0e2\x16.cloud.v1.DatabaseTypeR\x04type\"\xe0\x02\n" +
+	"\x04type\x18\x06 \x01(\x0e2\x16.cloud.v1.DatabaseTypeR\x04type\"\x96\x03\n" +
 	"\bDatabase\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x10\n" +
 	"\x03org\x18\x02 \x01(\tR\x03org\x12\x12\n" +
@@ -683,7 +745,10 @@ const file_cloud_v1_common_proto_rawDesc = "" +
 	"\n" +
 	"created_at\x18\n" +
 	" \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x12*\n" +
-	"\x04type\x18\v \x01(\x0e2\x16.cloud.v1.DatabaseTypeR\x04type*^\n" +
+	"\x04type\x18\v \x01(\x0e2\x16.cloud.v1.DatabaseTypeR\x04type\x124\n" +
+	"\n" +
+	"durability\x18\f \x01(\x0e2\x14.cloud.v1.DurabilityR\n" +
+	"durability*^\n" +
 	"\x04Role\x12\x14\n" +
 	"\x10ROLE_UNSPECIFIED\x10\x00\x12\x0f\n" +
 	"\vROLE_VIEWER\x10\x01\x12\x0f\n" +
@@ -696,7 +761,12 @@ const file_cloud_v1_common_proto_rawDesc = "" +
 	"\x19DATABASE_TYPE_UNSPECIFIED\x10\x00\x12\x17\n" +
 	"\x13DATABASE_TYPE_PLAIN\x10\x01\x12\x16\n" +
 	"\x12DATABASE_TYPE_CRDT\x10\x02\x12\x16\n" +
-	"\x12DATABASE_TYPE_RAFT\x10\x03B\x93\x01\n" +
+	"\x12DATABASE_TYPE_RAFT\x10\x03*U\n" +
+	"\n" +
+	"Durability\x12\x1a\n" +
+	"\x16DURABILITY_UNSPECIFIED\x10\x00\x12\x16\n" +
+	"\x12DURABILITY_DURABLE\x10\x01\x12\x13\n" +
+	"\x0fDURABILITY_FAST\x10\x02B\x93\x01\n" +
 	"\fcom.cloud.v1B\vCommonProtoP\x01Z5github.com/samyfodil/musql/cloud/gen/cloud/v1;cloudv1\xa2\x02\x03CXX\xaa\x02\bCloud.V1\xca\x02\bCloud\\V1\xe2\x02\x14Cloud\\V1\\GPBMetadata\xea\x02\tCloud::V1b\x06proto3"
 
 var (
@@ -711,36 +781,38 @@ func file_cloud_v1_common_proto_rawDescGZIP() []byte {
 	return file_cloud_v1_common_proto_rawDescData
 }
 
-var file_cloud_v1_common_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_cloud_v1_common_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
 var file_cloud_v1_common_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
 var file_cloud_v1_common_proto_goTypes = []any{
 	(Role)(0),                     // 0: cloud.v1.Role
 	(DatabaseType)(0),             // 1: cloud.v1.DatabaseType
-	(*User)(nil),                  // 2: cloud.v1.User
-	(*Org)(nil),                   // 3: cloud.v1.Org
-	(*Member)(nil),                // 4: cloud.v1.Member
-	(*Invite)(nil),                // 5: cloud.v1.Invite
-	(*Group)(nil),                 // 6: cloud.v1.Group
-	(*Database)(nil),              // 7: cloud.v1.Database
-	(*timestamppb.Timestamp)(nil), // 8: google.protobuf.Timestamp
+	(Durability)(0),               // 2: cloud.v1.Durability
+	(*User)(nil),                  // 3: cloud.v1.User
+	(*Org)(nil),                   // 4: cloud.v1.Org
+	(*Member)(nil),                // 5: cloud.v1.Member
+	(*Invite)(nil),                // 6: cloud.v1.Invite
+	(*Group)(nil),                 // 7: cloud.v1.Group
+	(*Database)(nil),              // 8: cloud.v1.Database
+	(*timestamppb.Timestamp)(nil), // 9: google.protobuf.Timestamp
 }
 var file_cloud_v1_common_proto_depIdxs = []int32{
-	8,  // 0: cloud.v1.User.created_at:type_name -> google.protobuf.Timestamp
-	8,  // 1: cloud.v1.Org.created_at:type_name -> google.protobuf.Timestamp
-	2,  // 2: cloud.v1.Member.user:type_name -> cloud.v1.User
+	9,  // 0: cloud.v1.User.created_at:type_name -> google.protobuf.Timestamp
+	9,  // 1: cloud.v1.Org.created_at:type_name -> google.protobuf.Timestamp
+	3,  // 2: cloud.v1.Member.user:type_name -> cloud.v1.User
 	0,  // 3: cloud.v1.Member.role:type_name -> cloud.v1.Role
 	0,  // 4: cloud.v1.Invite.role:type_name -> cloud.v1.Role
-	8,  // 5: cloud.v1.Invite.created_at:type_name -> google.protobuf.Timestamp
-	8,  // 6: cloud.v1.Group.created_at:type_name -> google.protobuf.Timestamp
+	9,  // 5: cloud.v1.Invite.created_at:type_name -> google.protobuf.Timestamp
+	9,  // 6: cloud.v1.Group.created_at:type_name -> google.protobuf.Timestamp
 	1,  // 7: cloud.v1.Group.type:type_name -> cloud.v1.DatabaseType
-	8,  // 8: cloud.v1.Database.parent_at:type_name -> google.protobuf.Timestamp
-	8,  // 9: cloud.v1.Database.created_at:type_name -> google.protobuf.Timestamp
+	9,  // 8: cloud.v1.Database.parent_at:type_name -> google.protobuf.Timestamp
+	9,  // 9: cloud.v1.Database.created_at:type_name -> google.protobuf.Timestamp
 	1,  // 10: cloud.v1.Database.type:type_name -> cloud.v1.DatabaseType
-	11, // [11:11] is the sub-list for method output_type
-	11, // [11:11] is the sub-list for method input_type
-	11, // [11:11] is the sub-list for extension type_name
-	11, // [11:11] is the sub-list for extension extendee
-	0,  // [0:11] is the sub-list for field type_name
+	2,  // 11: cloud.v1.Database.durability:type_name -> cloud.v1.Durability
+	12, // [12:12] is the sub-list for method output_type
+	12, // [12:12] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_cloud_v1_common_proto_init() }
@@ -753,7 +825,7 @@ func file_cloud_v1_common_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_cloud_v1_common_proto_rawDesc), len(file_cloud_v1_common_proto_rawDesc)),
-			NumEnums:      2,
+			NumEnums:      3,
 			NumMessages:   6,
 			NumExtensions: 0,
 			NumServices:   0,

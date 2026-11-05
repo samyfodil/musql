@@ -35,7 +35,7 @@ var sqliteMagic = []byte("SQLite format 3\x00")
 func (s *Server) dbToProto(ctx context.Context, o *state.Org, d *state.Database) *v1.Database {
 	out := &v1.Database{
 		Id: d.ID, Org: o.Slug, Name: d.Name, Parent: d.Parent, ParentAt: stamp(d.ParentAt),
-		SchemaOnly: d.SchemaOnly, CreatedAt: stamp(d.CreatedAt), Type: typeToProto(d.Type),
+		SchemaOnly: d.SchemaOnly, CreatedAt: stamp(d.CreatedAt), Type: typeToProto(d.Type), Durability: durabilityToProto(d),
 		Url: s.cfg.PublicURL + "/db/" + o.Slug + "/" + d.Name + "/",
 	}
 	if g, err := s.store.GroupByID(ctx, d.GroupID); err == nil {
@@ -139,12 +139,16 @@ func (s databaseService) Create(ctx context.Context, req *connect.Request[v1.Cre
 	if err != nil {
 		return nil, err
 	}
+	durability, err := checkDurability(m.Durability, typ)
+	if err != nil {
+		return nil, err
+	}
 	if src != nil {
 		if err := s.localCopy(ctx, src); err != nil {
 			return nil, err
 		}
 	}
-	d := &state.Database{ID: state.NewID(), OrgID: o.ID, Name: m.Name, GroupID: g.ID, SchemaOnly: m.SchemaOnly, Type: typ}
+	d := &state.Database{ID: state.NewID(), OrgID: o.ID, Name: m.Name, GroupID: g.ID, SchemaOnly: m.SchemaOnly, Type: typ, Durability: durability}
 	if s.cl != nil && !s.placedHere(ctx, d) {
 		switch {
 		case m.GetUpload() != "":

@@ -36,13 +36,19 @@ func counts(nodes []*clusterNode, db, tbl string, want int) bool {
 	return true
 }
 
-// TestClusterRegularDatabase: a regular database takes writes on every node
-// of its group, transactions included, and its master runs them all. When the
-// master stops, the others elect another and go on writing, and the stopped
-// node catches up when it is back.
+// TestClusterRegularDatabase: a regular database, durable or fast, takes
+// writes on every node of its group, transactions included, and its master
+// runs them all. When the master stops, the others elect another and go on
+// writing, and the stopped node catches up when it is back.
 func TestClusterRegularDatabase(t *testing.T) {
+	for _, du := range []v1.Durability{v1.Durability_DURABILITY_DURABLE, v1.Durability_DURABILITY_FAST} {
+		t.Run(du.String(), func(t *testing.T) { regularDatabase(t, du) })
+	}
+}
+
+func regularDatabase(t *testing.T, du v1.Durability) {
 	nodes := newCluster(t, 3)
-	acmeEverywhereAs(t, nodes, v1.DatabaseType_DATABASE_TYPE_PLAIN)
+	acmeEverywhereWith(t, nodes, v1.DatabaseType_DATABASE_TYPE_PLAIN, du)
 	const app = "/db/acme/app"
 	nodes[0].exec(app, nodes[0].admin, "CREATE TABLE t(id INTEGER PRIMARY KEY, node TEXT)")
 	for i, n := range nodes {
@@ -79,6 +85,49 @@ func TestClusterRegularDatabase(t *testing.T) {
 	nodes[m].start()
 	nodes[m].ready()
 	eventually(t, "the stopped node to catch up", func() bool { return nodes[m].count("app", "t") == 7 })
+}
+
+// ids is t's ids in db on node c, in order, "" on any error.
+func (c *clusterNode) ids(db string) string {
+	status, res := c.pipeline("/db/acme/"+db, c.admin, "SELECT group_concat(id) FROM (SELECT id FROM t ORDER BY id)")
+	if status != 200 || len(res) != 1 || res[0].Type != "ok" || len(res[0].Response.Result.Rows) != 1 {
+		return ""
+	}
+	return fmt.Sprint(res[0].Response.Result.Rows[0][0].Value)
+}
+
+// TestClusterDurableDatabase: a durable database's commit is in its group's
+// raft log on a majority of the nodes when it returns, so the master stopping
+// right after it loses nothing: the master the others elect has the rows. Its
+// rowids are the table's, 1, 2, 3, ... whichever node writes.
+func TestClusterDurableDatabase(t *testing.T) {
+	nodes := newCluster(t, 3)
+	acmeEverywhereAs(t, nodes, v1.DatabaseType_DATABASE_TYPE_PLAIN)
+	const app = "/db/acme/app"
+	var m int
+	eventually(t, "one master", func() bool { m = masterOf(nodes, "app"); return m >= 0 })
+	nodes[m].exec(app, nodes[m].admin, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", "INSERT INTO t(v) VALUES ('a'), ('b')", "DELETE FROM t WHERE id = 2")
+	if err := nodes[m].s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var rest []*clusterNode
+	for i, n := range nodes {
+		if i != m {
+			rest = append(rest, n)
+		}
+	}
+	eventually(t, "a new master", func() bool { return masterOf(rest, "app") >= 0 })
+	for _, n := range rest {
+		n.exec(app, n.admin, "INSERT INTO t(v) VALUES ('after')")
+	}
+	eventually(t, "every row on the rest", func() bool {
+		for _, n := range rest {
+			if n.ids("app") != "1,3,4" {
+				return false
+			}
+		}
+		return true
+	})
 }
 
 // TestClusterUsageCountsEveryNode: a usage read on one node counts what every

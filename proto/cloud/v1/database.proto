@@ -70,6 +70,8 @@ message CreateDatabaseRequest {
   bool schema_only = 7;
   // The group's type when unspecified.
   DatabaseType type = 8;
+  // DURABLE when unspecified; a regular database's alone.
+  Durability durability = 9;
 }
 
 message CreateDatabaseResponse {

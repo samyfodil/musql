@@ -131,7 +131,7 @@ func (s databaseService) Restore(ctx context.Context, req *connect.Request[v1.Re
 	if _, err := s.store.Database(ctx, o.ID, name); err == nil {
 		return nil, rpcErr(state.ErrExists)
 	}
-	nd := &state.Database{ID: state.NewID(), OrgID: o.ID, Name: name, GroupID: d.GroupID, Parent: d.ID, ParentAt: at, Type: d.Type}
+	nd := &state.Database{ID: state.NewID(), OrgID: o.ID, Name: name, GroupID: d.GroupID, Parent: d.ID, ParentAt: at, Type: d.Type, Durability: d.Durability}
 	if err := os.MkdirAll(filepath.Dir(s.dbPath(nd)), 0o700); err != nil {
 		return nil, rpcErr(err)
 	}

@@ -58,6 +58,9 @@ type Store struct {
 	// open and those rebuildTable held a row of since (it alone writes
 	// _repl_withheld, under mu).
 	mayHold map[string]bool
+	// seenRowid, when set, is told each applied op's integer key: the
+	// Syncer's rowid floor, where every site assigns rowids alike.
+	seenRowid func(tbl string, rowid int64)
 	// localRetries counts local commits being retried after losing to an
 	// apply, localUntil (unix ns) is when waitLocal stops waiting for them,
 	// lastLocal is when a local commit last landed, and applied counts ingest
@@ -695,6 +698,11 @@ func (s *Store) ingestTx(ctx context.Context, ops []Op, local, batch bool) (map[
 			added[op.Site] = map[uint64]bool{}
 		}
 		added[op.Site][op.Seq] = true
+		if s.seenRowid != nil && op.Kind != OpSchema {
+			if v, ok := driverValue(unpackVal(op.PK)).(int64); ok {
+				s.seenRowid(op.Tbl, v)
+			}
+		}
 		if batch && op.Kind != OpSchema {
 			if run = append(run, op); len(run) < applyRunMax {
 				continue

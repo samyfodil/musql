@@ -242,13 +242,32 @@ peers:
   (`hashicorp/raft` over a libp2p stream per group, `/musql-cloud/raft/<name>/1`;
   `cloud/cluster.Election`). The state's election runs on every node; a
   group's on the nodes at its locations, its master adding and removing them
-  as locations change. raft's log carries nothing but the election: the data
-  moves as before, by replication's anti-entropy, in Leader mode with the
-  master as the writer. A node newly elected writes only after two sync
-  intervals, so the previous master's last commits reach it first; a commit
-  the previous master made and nobody pulled before it stopped is lost (no
-  Quorum: a write costs no consensus round). Its raft state (term, vote, a
-  short log) is `data_dir/raft/<name>/raft.json`.
+  as locations change. The data moves by replication in Leader mode with the
+  master as the writer, and a regular database's durability, chosen when it
+  is created, decides how a commit is kept:
+  - **durable** (the default): the commit goes into its group's raft log
+    (replication's Leader with a Quorum) and returns once a majority of the
+    group's nodes hold it, so the master stopping loses none. Each node
+    applies the log in order (`server.groupLog`); one that has yet to open a
+    database waits for it, since the proposer may stop before any other copy
+    has the commit. A new master writes once it has applied every entry from
+    before its term (a raft Barrier). One log orders every commit, so rowids
+    are the table's, 1, 2, 3, as on a single node. A commit costs one round
+    trip to a majority, and a database's commits run one at a time.
+  - **fast**: the commit returns once the master has it, and replication's
+    anti-entropy brings it to the others right after. A commit the master
+    made and nobody pulled before it stopped is lost. Rowids come from
+    per-node ranges, so two masters overlapping around an election never
+    give one rowid to two rows.
+
+  Either way a newly elected master writes only after two sync intervals,
+  so a fast database's last commits reach it first. The state's own raft log
+  carries only its election. An election's raft state (term, vote, the log)
+  is `data_dir/raft/<name>/raft.musq`, a musql database, synced at every
+  commit; a snapshot of a group's log records what each durable database
+  held, and a node too far behind for the log waits until anti-entropy
+  brings it that far. An upload, a branch and a restore into a new database
+  start as their first node's rows and reach the others by anti-entropy.
 - **Every node serves everything it holds.** Each node serves the management
   API, `/oidc/`, `/login`, the console, and Hrana for every database placed
   at its location. `public_url` is the deployment's (behind geo-routing or a
@@ -363,9 +382,9 @@ deterministic or visible, never two rows with one name:
   at each 2s sync pass), so a token signed anywhere verifies everywhere once
   its key has synced: one sync interval after a node's new key.
 
-Declined, deliberately: linearizable multi-node writes (a master's commit is
-durable on the master and reaches the others after it); a standalone database
-holding what a cluster refuses joining one.
+Declined, deliberately: linearizable writes to the state (its master's commit
+is durable on the master and reaches the others after it); a standalone
+database holding what a cluster refuses joining one.
 
 ## Usage analytics
 

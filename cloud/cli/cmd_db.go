@@ -36,6 +36,7 @@ func (a *app) dbCmd() *cobra.Command {
 
 	var c struct {
 		group, fromFile, fromDB, timestamp, resume string
+		fast                                       bool
 	}
 	create := a.cmd("create <name>", "Create a database", cobra.ExactArgs(1), func(ctx context.Context, args []string) error {
 		org, err := a.orgSlug(ctx)
@@ -43,6 +44,9 @@ func (a *app) dbCmd() *cobra.Command {
 			return err
 		}
 		req := &v1.CreateDatabaseRequest{Org: org, Name: args[0], Group: c.group}
+		if c.fast {
+			req.Durability = v1.Durability_DURABILITY_FAST
+		}
 		switch {
 		case c.fromFile != "" && c.fromDB != "":
 			return errors.New("--from-file and --from-db cannot be combined")
@@ -66,6 +70,7 @@ func (a *app) dbCmd() *cobra.Command {
 		return a.created(ctx, req)
 	})
 	create.Flags().StringVar(&c.group, "group", "", "group (default: default)")
+	create.Flags().BoolVar(&c.fast, "fast", false, "in a cluster, return a commit once the master has it, not a majority of the group's nodes")
 	create.Flags().StringVar(&c.fromFile, "from-file", "", "a .musq or C SQLite file to start from")
 	create.Flags().StringVar(&c.resume, "resume", "", "with --from-file: continue this interrupted upload")
 	create.Flags().StringVar(&c.fromDB, "from-db", "", "branch from this database")

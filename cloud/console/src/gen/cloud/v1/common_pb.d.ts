@@ -246,6 +246,11 @@ export declare type Database = Message<"cloud.v1.Database"> & {
    * @generated from field: cloud.v1.DatabaseType type = 11;
    */
   type: DatabaseType;
+
+  /**
+   * @generated from field: cloud.v1.Durability durability = 12;
+   */
+  durability: Durability;
 };
 
 /**
@@ -323,4 +328,35 @@ export enum DatabaseType {
  * Describes the enum cloud.v1.DatabaseType.
  */
 export declare const DatabaseTypeSchema: GenEnum<DatabaseType>;
+
+/**
+ * How a regular database's commits are kept in a cluster. DURABLE, the
+ * default: a commit returns once a majority of its group's nodes hold it, so
+ * the master stopping loses none. FAST: a commit returns once the master holds
+ * it, and the others copy it right after; a master that stops first takes its
+ * last commits along. A crdt database and a standalone node's have neither.
+ *
+ * @generated from enum cloud.v1.Durability
+ */
+export enum Durability {
+  /**
+   * @generated from enum value: DURABILITY_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: DURABILITY_DURABLE = 1;
+   */
+  DURABLE = 1,
+
+  /**
+   * @generated from enum value: DURABILITY_FAST = 2;
+   */
+  FAST = 2,
+}
+
+/**
+ * Describes the enum cloud.v1.Durability.
+ */
+export declare const DurabilitySchema: GenEnum<Durability>;
 

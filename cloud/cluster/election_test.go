@@ -1,11 +1,18 @@
 package cluster
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/hashicorp/raft"
 )
 
 // startNodes starts n nodes on localhost, each the others' peer.
@@ -59,7 +66,7 @@ func startNodes(t *testing.T, n int) []*Node {
 // elect joins n to the election, which the test leaves before n closes.
 func elect(t *testing.T, n *Node, dir, name string, members []string) *Election {
 	t.Helper()
-	e, err := n.Elect(dir, name, members, 50*time.Millisecond, fast)
+	e, err := n.Elect(dir, name, members, 50*time.Millisecond, fast, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,4 +176,142 @@ func TestElectionMembers(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, "a master among the rest", func() bool { n, w := writers(es); return n == 1 && w != m })
+}
+
+// recorder is a StateMachine that keeps what it applied, as key=data.
+type recorder struct {
+	mu      sync.Mutex
+	applied []string
+}
+
+func (r *recorder) Apply(key string, data []byte) error {
+	if key == "refuse" {
+		return errors.New("refused")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.applied = append(r.applied, key+"="+string(data))
+	return nil
+}
+
+func (r *recorder) Snapshot() ([]byte, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return []byte(strings.Join(r.applied, "\n")), nil
+}
+
+func (r *recorder) Restore(b []byte) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.applied = strings.Split(string(b), "\n")
+	return nil
+}
+
+func (r *recorder) Stop() {}
+
+func (r *recorder) list() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return strings.Join(r.applied, ",")
+}
+
+// TestElectionLog: what the master proposes is applied on every member in
+// one order, and Propose returns what the master's Apply did. A member that
+// joins after the master compacted its log starts from a snapshot. A
+// follower cannot propose.
+func TestElectionLog(t *testing.T) {
+	nodes := startNodes(t, 3)
+	two := []string{nodes[0].ID(), nodes[1].ID()}
+	timing := fast
+	timing.Snapshot, timing.Trailing = 4, 1
+	rs := []*recorder{{}, {}, {}}
+	es := make([]*Election, 3)
+	join := func(i int, members []string) {
+		e, err := nodes[i].Elect(t.TempDir(), "g", members, 0, timing, rs[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { e.Close() })
+		es[i] = e
+	}
+	join(0, two)
+	join(1, two)
+	waitFor(t, "a master", func() bool { n, _ := writers(es); return n == 1 })
+	_, m := writers(es)
+	var want []string
+	for i := range 20 {
+		if err := es[m].Propose("db", fmt.Appendf(nil, "%d", i)); err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, fmt.Sprintf("db=%d", i))
+	}
+	if err := es[m].Propose("refuse", nil); err == nil || err.Error() != "refused" {
+		t.Fatalf("a refused entry: %v", err)
+	}
+	if err := es[1-m].Propose("db", []byte("x")); err == nil {
+		t.Fatal("a follower proposed")
+	}
+	if got := rs[m].list(); got != strings.Join(want, ",") {
+		t.Fatalf("the master applied %q", got)
+	}
+	waitFor(t, "the follower to apply every entry", func() bool { return rs[1-m].list() == strings.Join(want, ",") })
+
+	// The log is compacted by now: the third node starts from a snapshot.
+	waitFor(t, "a snapshot", func() bool {
+		first, err := es[m].st.FirstIndex()
+		return err == nil && first > 1
+	})
+	all := append(two, nodes[2].ID())
+	join(2, all)
+	if err := es[m].SetMembers(all); err != nil {
+		t.Fatal(err)
+	}
+	if err := es[m].Propose("db", []byte("last")); err != nil {
+		t.Fatal(err)
+	}
+	want = append(want, "db=last")
+	waitFor(t, "the third node to hold every entry", func() bool { return rs[2].list() == strings.Join(want, ",") })
+}
+
+// TestRaftStoreAdoptsJSON: an election's state from before its log moved to
+// a database, raft.json, is moved into it.
+func TestRaftStoreAdoptsJSON(t *testing.T) {
+	dir := t.TempDir()
+	old := struct {
+		Stable map[string][]byte
+		Logs   []*raft.Log
+	}{
+		Stable: map[string][]byte{"CurrentTerm": {0, 0, 0, 0, 0, 0, 0, 7}},
+		Logs:   []*raft.Log{{Index: 3, Term: 6, Type: raft.LogConfiguration, Data: []byte("c")}, {Index: 4, Term: 7, Type: raft.LogNoop}},
+	}
+	b, err := json.Marshal(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "raft.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := openRaftStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if term, err := st.GetUint64([]byte("CurrentTerm")); err != nil || term != 7 {
+		t.Fatalf("term %d, %v", term, err)
+	}
+	first, err := st.FirstIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	last, err := st.LastIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var l raft.Log
+	if err := st.GetLog(3, &l); err != nil || first != 3 || last != 4 || l.Term != 6 || l.Type != raft.LogConfiguration || string(l.Data) != "c" {
+		t.Fatalf("log %d..%d, entry 3 %+v, %v", first, last, l, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "raft.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("raft.json is still there: %v", err)
+	}
 }
