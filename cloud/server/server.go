@@ -82,7 +82,7 @@ func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) 
 	fail := func(err error) (*Server, error) {
 		store.Close()
 		if s.cl != nil {
-			s.cl.state.Close()
+			s.leaveElections()
 			s.cl.node.Close()
 		}
 		return nil, err
@@ -180,19 +180,23 @@ func (s *Server) Close() error {
 func (s *Server) close() error {
 	close(s.stop)
 	s.bg.Wait()
+	// Its counts go to the state while it can still reach the master.
+	if err := s.meter.flush(context.Background()); err != nil {
+		s.log.Printf("usage: %v", err)
+	}
+	if s.cl != nil {
+		// The others stop hearing from it, and elect, before what it served
+		// closes under them.
+		s.cl.node.StopServing()
+		s.leaveElections()
+	}
 	s.pool.closeAll()
 	if s.cl != nil {
 		s.closeCluster()
 	}
 	s.closeHistories()
-	if err := s.meter.flush(context.Background()); err != nil {
-		s.log.Printf("usage: %v", err)
-	}
 	err := s.store.Close()
 	if s.cl != nil {
-		if cerr := s.cl.state.Close(); err == nil {
-			err = cerr
-		}
 		if cerr := s.cl.node.Close(); err == nil {
 			err = cerr
 		}
