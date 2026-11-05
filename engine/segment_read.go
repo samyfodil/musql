@@ -535,3 +535,19 @@ func (db *DB) pageTableByRoot(root uint32) *tableMeta {
 	}
 	return nil
 }
+
+// segReadsReal reports whether a predicate of preds reads a REAL block in a
+// segment of the table at rootPage.
+func (p *ReadOnlyPager) segReadsReal(rootPage uint32, preds []segPlanPred) bool {
+	if p == nil || p.segs == nil {
+		return false
+	}
+	for _, s := range p.segs.byRoot[rootPage] {
+		for _, pr := range preds {
+			if pr.Col >= 0 && pr.Col < len(s.cols) && s.cols[pr.Col].phys == PhysFloat64 {
+				return true
+			}
+		}
+	}
+	return false
+}

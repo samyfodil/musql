@@ -322,7 +322,7 @@ func (m *vdbe) segRunOne(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, 
 		isRowid := make([]bool, len(low.cols))
 		for i, c := range low.cols {
 			if i < len(low.realCol) && low.realCol[i] {
-				f, okF := s.Float64Column(c)
+				f, okF := s.realNullNaN(c)
 				if !okF || len(f) < s.nRows {
 					return false
 				}
