@@ -183,8 +183,8 @@ func (s databaseService) Usage(ctx context.Context, req *connect.Request[v1.Usag
 	if !from.Before(to) {
 		return nil, invalid("from is not before to")
 	}
-	// What is counted but not yet flushed belongs in the answer.
-	if err := s.meter.flush(ctx); err != nil {
+	// What is counted but not yet flushed belongs in the answer, every node's.
+	if err := s.flushUsage(ctx); err != nil {
 		return nil, rpcErr(err)
 	}
 	resp := &v1.UsageResponse{}
@@ -262,7 +262,7 @@ func (s databaseService) Stats(ctx context.Context, req *connect.Request[v1.Stat
 		limit = 20
 	}
 	limit = min(limit, 200)
-	if err := s.meter.flush(ctx); err != nil {
+	if err := s.flushUsage(ctx); err != nil {
 		return nil, rpcErr(err)
 	}
 	qs, err := s.store.TopQueries(ctx, d.ID, from, to, limit)

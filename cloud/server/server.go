@@ -47,6 +47,10 @@ type Server struct {
 	closeOnce sync.Once
 	closeErr  error
 
+	// metering is set once meter is: the other nodes may ask this one to
+	// flush before New is done.
+	metering atomic.Bool
+
 	// noAdmin is set while a cluster node waits for the admin user to
 	// replicate to it.
 	noAdmin       atomic.Bool
@@ -113,6 +117,7 @@ func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) 
 		}
 		return fileSize(s.dbPath(d))
 	})
+	s.metering.Store(true)
 	s.pool = newPool(s.openEntry)
 	s.handler = s.routes()
 	s.stop = make(chan struct{})

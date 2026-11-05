@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/samyfodil/musql/hrana"
 
+	"github.com/samyfodil/musql/cloud/cluster"
 	"github.com/samyfodil/musql/cloud/state"
 )
 
@@ -49,6 +51,48 @@ type hourMeter struct {
 
 func newMeter(store *state.Store, size func(dbID string) int64) *meter {
 	return &meter{store: store, size: size, dbs: map[string]*dbMeter{}}
+}
+
+// flushUsage writes what this node has counted to the state, and has every
+// other node it reaches do the same, so a usage read after it counts every
+// statement those nodes have served. A node that does not answer within
+// peerFlushWait is left out: its counts come at its next flush.
+func (s *Server) flushUsage(ctx context.Context) error {
+	if err := s.meter.flush(ctx); err != nil || s.cl == nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, peerFlushWait)
+	defer cancel()
+	var wg sync.WaitGroup
+	for _, p := range s.cfg.Peers {
+		wg.Go(func() {
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, cluster.PeerURL(p.PeerID)+"/usage/flush", nil)
+			if err != nil {
+				return
+			}
+			resp, err := s.cl.client.Do(req)
+			if err != nil {
+				return
+			}
+			resp.Body.Close()
+		})
+	}
+	wg.Wait()
+	return nil
+}
+
+// peerFlushWait bounds how long a usage read waits for the other nodes.
+const peerFlushWait = 2 * time.Second
+
+// serveFlushUsage is a peer's request that this node write its counts.
+func (s *Server) serveFlushUsage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost || !s.metering.Load() {
+		http.Error(w, "not now", http.StatusServiceUnavailable)
+		return
+	}
+	if err := s.meter.flush(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 // observer is the hrana.WithObserver callback for one database.
