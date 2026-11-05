@@ -198,12 +198,19 @@ func (e *Election) Writer() bool {
 	return caughtUp && time.Since(since) >= e.settle && e.r.State() == raft.Leader
 }
 
+// ErrNotLeader is a proposal on a node that is not, or stopped being, the
+// group's leader: the entry may or may not be in the log.
+var ErrNotLeader = errors.New("cluster: this node is not the group's leader")
+
 // Propose appends data, under key, to the group's log on its leader, and
 // returns once a majority of the members hold it and this node applied it,
 // with what the StateMachine's Apply returned.
 func (e *Election) Propose(key string, data []byte) error {
 	f := e.r.ApplyLog(raft.Log{Data: data, Extensions: []byte(key)}, 10*time.Second)
 	if err := f.Error(); err != nil {
+		if errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrLeadershipLost) || errors.Is(err, raft.ErrLeadershipTransferInProgress) {
+			return fmt.Errorf("%w: %v", ErrNotLeader, err)
+		}
 		return err
 	}
 	if err, ok := f.Response().(error); ok {

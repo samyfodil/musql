@@ -519,7 +519,11 @@ func (s *Server) mode(d *state.Database) (o replication.Option, q *replication.Q
 		if e == nil {
 			return replication.ErrNotWriter
 		}
-		return e.Propose(d.ID, entry)
+		err := e.Propose(d.ID, entry)
+		if errors.Is(err, cluster.ErrNotLeader) {
+			return fmt.Errorf("%w: %v", replication.ErrNotWriter, err)
+		}
+		return err
 	})
 	return replication.Leader(isWriter, q), q
 }
