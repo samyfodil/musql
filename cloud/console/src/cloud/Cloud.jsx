@@ -8,7 +8,7 @@ import { Field } from "../components/ColumnPanel.jsx";
 import { MenuButton } from "../components/Menu.jsx";
 import { Spinner } from "../components/Busy.jsx";
 import { fmt } from "../values.js";
-import { Access, api, databaseToken, date, DatabaseType, FileFormat, message, Role, ROLES, roleName, stamp, typeName, unimplemented } from "./api.js";
+import { Access, api, databaseToken, date, DatabaseType, Durability, FileFormat, message, Role, ROLES, roleName, stamp, typeName, unimplemented } from "./api.js";
 import { server, signIn, signOut } from "./auth.js";
 import { cancelled, downloadExport, uploadFile } from "./transfer.js";
 
@@ -273,7 +273,7 @@ function Databases({ cloud, toast, onOpen, setPage, current }) {
 						{dbs.map((d) => (
 							<tr key={d.id}>
 								<td><button className="link mono" title="Open in the editor" onClick={() => open(d)}>{d.name}</button>{d.parent && <span className="badge">branch of {d.parent}</span>}</td>
-								<td><span className="chip mono" title={d.type === DatabaseType.CRDT ? "Replicated: every location writes, and restore is per node" : "One file, full SQLite semantics"}>{typeName(d.type)}</span></td>
+								<td><span className="chip mono" title={d.type === DatabaseType.CRDT ? "Replicated: every location writes, and restore is per node" : "One file, full SQLite semantics"}>{typeName(d.type)}</span>{d.durability === Durability.FAST && <span className="chip mono" title="In a cluster, a commit returns once the master has it: a master that stops first takes its last commits along">fast</span>}</td>
 								<td className="mono">{d.group}</td>
 								<td className="num">{bytes(d.sizeBytes)}</td>
 								<td title={when(d.createdAt)}>{day(d.createdAt)}</td>

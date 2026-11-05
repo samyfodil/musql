@@ -57,9 +57,12 @@ type clusterSide struct {
 }
 
 type replDB struct {
-	db   *sql.DB
-	path string
-	hist string
+	db    *sql.DB
+	path  string
+	hist  string
+	group string
+	// quorum takes a durable database's commits from its group's log.
+	quorum *replication.Quorum
 	// syncing is set from placement until the first sync with the peers, while
 	// the file holds only part of the database and is not served; kept on disk
 	// as path+syncingSuffix so a restart resumes it.
@@ -146,7 +149,7 @@ func (s *Server) openState(ctx context.Context) (*state.Store, error) {
 	// Init writes the admin on this node alone, before it runs: no election.
 	here := func() bool { return true }
 	if !s.initOnly {
-		e, err := n.Elect(filepath.Join(s.cfg.DataDir, "raft", "state"), "state", s.members(s.allLocations()), s.settle(), s.cfg.election)
+		e, err := n.Elect(filepath.Join(s.cfg.DataDir, "raft", "state"), "state", s.members(s.allLocations()), s.settle(), s.cfg.election, nil)
 		if err != nil {
 			return fail(fmt.Errorf("state election: %w", err))
 		}
@@ -456,7 +459,7 @@ func (s *Server) groupElection(g *state.Group) error {
 	if _, ok := s.cl.groups[g.ID]; ok {
 		return nil
 	}
-	e, err := s.cl.node.Elect(s.groupRaftDir(g.ID), "group/"+g.ID, s.members(g.Locations), s.settle(), s.cfg.election)
+	e, err := s.cl.node.Elect(s.groupRaftDir(g.ID), "group/"+g.ID, s.members(g.Locations), s.settle(), s.cfg.election, newGroupLog(s, g.ID))
 	if err != nil {
 		return err
 	}
@@ -498,15 +501,31 @@ func (s *Server) groupMaster(d *state.Database) *cluster.Election {
 }
 
 // mode is how d replicates: a crdt database merges every node's writes; a
-// regular one is written by its group's master alone.
-func (s *Server) mode(d *state.Database) replication.Option {
+// regular one is written by its group's master alone, and a durable one's
+// commits go through its group's raft log, q taking them on this node.
+func (s *Server) mode(d *state.Database) (o replication.Option, q *replication.Quorum) {
 	if d.Type == state.TypeCRDT {
-		return replication.CRDT()
+		return replication.CRDT(), nil
 	}
-	return replication.Leader(func() bool {
+	isWriter := func() bool {
 		e := s.groupMaster(d)
 		return e != nil && e.Writer()
+	}
+	if d.Durability == state.DurabilityFast {
+		return replication.Leader(isWriter), nil
+	}
+	q = replication.NewQuorum(func(ctx context.Context, entry []byte) error {
+		e := s.groupMaster(d)
+		if e == nil {
+			return replication.ErrNotWriter
+		}
+		err := e.Propose(d.ID, entry)
+		if errors.Is(err, cluster.ErrNotLeader) {
+			return fmt.Errorf("%w: %v", replication.ErrNotWriter, err)
+		}
+		return err
 	})
+	return replication.Leader(isWriter, q), q
 }
 
 // openReplicated opens d's file through replication, creating it empty when
@@ -535,11 +554,12 @@ func (s *Server) openReplicated(ctx context.Context, d *state.Database) error {
 	if _, err := s.history(d); err != nil {
 		return err
 	}
-	db, err := replication.Open(ctx, path+"?"+dsnMode+"=rw", s.mode(d), replication.WithSyncInterval(s.cfg.syncInterval), s.cl.node.Sync(dbTopic(d.ID)))
+	mode, q := s.mode(d)
+	db, err := replication.Open(ctx, path+"?"+dsnMode+"=rw", mode, replication.WithSyncInterval(s.cfg.syncInterval), s.cl.node.Sync(dbTopic(d.ID)))
 	if err != nil {
 		return err
 	}
-	s.cl.dbs[d.ID] = &replDB{db: db, path: path, hist: s.histDir(d), syncing: syncing}
+	s.cl.dbs[d.ID] = &replDB{db: db, path: path, hist: s.histDir(d), group: d.GroupID, quorum: q, syncing: syncing}
 	return nil
 }
 
@@ -686,6 +706,28 @@ func (s *Server) checkType(t v1.DatabaseType, def string) (string, error) {
 	return typ, nil
 }
 
+// checkDurability resolves a new database's durability: durable unless asked
+// to be fast. A crdt database's commits are each node's, with neither.
+func checkDurability(du v1.Durability, typ string) (string, error) {
+	switch {
+	case typ == state.TypeCRDT && du != v1.Durability_DURABILITY_UNSPECIFIED:
+		return "", invalid("durability is a regular database's: a crdt database commits on each node")
+	case du == v1.Durability_DURABILITY_FAST:
+		return state.DurabilityFast, nil
+	}
+	return state.DurabilityDurable, nil
+}
+
+func durabilityToProto(d *state.Database) v1.Durability {
+	switch {
+	case d.Type == state.TypeCRDT:
+		return v1.Durability_DURABILITY_UNSPECIFIED
+	case d.Durability == state.DurabilityFast:
+		return v1.Durability_DURABILITY_FAST
+	}
+	return v1.Durability_DURABILITY_DURABLE
+}
+
 func typeToProto(t string) v1.DatabaseType {
 	switch t {
 	case state.TypeCRDT:
@@ -724,7 +766,8 @@ func (s *Server) localCopy(ctx context.Context, d *state.Database) error {
 // a virtual table, a WITHOUT ROWID table) is declined before it is recorded.
 // Its rows become this node's first ops.
 func (s *Server) checkReplicable(ctx context.Context, d *state.Database, path string) error {
-	db, err := replication.Open(ctx, path, s.mode(d))
+	mode, _ := s.mode(d)
+	db, err := replication.Open(ctx, path, mode)
 	if err != nil {
 		return connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("the database cannot be replicated in a cluster: %w", err))
 	}

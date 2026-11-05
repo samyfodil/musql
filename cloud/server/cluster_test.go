@@ -260,15 +260,24 @@ func acmeEverywhere(t *testing.T, nodes []*clusterNode) {
 
 // acmeEverywhereAs is acmeEverywhere with app of type typ.
 func acmeEverywhereAs(t *testing.T, nodes []*clusterNode, typ v1.DatabaseType) {
+	acmeEverywhereWith(t, nodes, typ, v1.Durability_DURABILITY_UNSPECIFIED)
+}
+
+// acmeEverywhereWith is acmeEverywhereAs with app's durability du asked for.
+func acmeEverywhereWith(t *testing.T, nodes []*clusterNode, typ v1.DatabaseType, du v1.Durability) {
 	ctx := context.Background()
 	_, orgs, dbs := nodes[0].clients()
 	need(orgs.Create(ctx, auth(nodes[0].admin, &v1.CreateOrgRequest{Slug: "acme", Name: "Acme"})))(t)
 	for _, loc := range locations[1:len(nodes)] {
 		need(nodes[0].groups().AddLocation(ctx, auth(nodes[0].admin, &v1.AddLocationRequest{Org: "acme", Group: "default", Location: loc})))(t)
 	}
-	d := need(dbs.Create(ctx, auth(nodes[0].admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "app", Type: typ})))(t)
-	if d.Msg.Database.Type != typ {
-		t.Fatalf("app is %v, not %v", d.Msg.Database.Type, typ)
+	d := need(dbs.Create(ctx, auth(nodes[0].admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "app", Type: typ, Durability: du})))(t)
+	want := du
+	if want == v1.Durability_DURABILITY_UNSPECIFIED && typ != v1.DatabaseType_DATABASE_TYPE_CRDT {
+		want = v1.Durability_DURABILITY_DURABLE
+	}
+	if d.Msg.Database.Type != typ || d.Msg.Database.Durability != want {
+		t.Fatalf("app is %v %v, not %v %v", d.Msg.Database.Type, d.Msg.Database.Durability, typ, want)
 	}
 	eventually(t, "app open on every node", func() bool { return placed(nodes, "app") })
 }

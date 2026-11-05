@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"slices"
 	"sync"
 	"time"
@@ -20,13 +19,16 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 )
 
-// Election picks one node of a group to write: a raft group over libp2p whose
-// log carries nothing but raft's own entries. The leader is the master; the
-// data replicates by replication's Leader mode, not through this log.
+// Election picks one node of a group to write: a raft group over libp2p. The
+// leader is the master. Without a StateMachine its log carries nothing but
+// raft's own entries, and the data replicates by replication's Leader mode
+// alone; with one, the log also carries what the master proposes, applied on
+// every member in order.
 type Election struct {
 	r    *raft.Raft
 	tr   *raft.NetworkTransport
 	st   *raftStore
+	sm   StateMachine
 	self raft.ServerID
 	// settle is how long a new leader waits before it writes, so the commits
 	// the previous master made reach it first (replication's anti-entropy).
@@ -34,21 +36,41 @@ type Election struct {
 
 	mu    sync.Mutex
 	since time.Time // when this node became leader; zero when it is not
-	done  chan struct{}
-	once  sync.Once
-	err   error
+	// caughtUp is set once a leader has applied every entry before its term.
+	caughtUp bool
+	done     chan struct{}
+	once     sync.Once
+	err      error
 }
 
-// ElectionTiming sets raft's timeouts; zero fields keep raft's defaults.
+// StateMachine applies what a group's log carries. Its state outlives a
+// restart on its own (the databases' files), so raft does not restore a
+// snapshot into it at start.
+type StateMachine interface {
+	// Apply applies an entry Propose made under key, on every member, in log
+	// order; what it returns is what Propose returns on the master.
+	Apply(key string, data []byte) error
+	// Snapshot describes the state, for a member too far behind for the log.
+	Snapshot() ([]byte, error)
+	// Restore makes the state at least what a Snapshot described.
+	Restore(snapshot []byte) error
+	// Stop ends an Apply or Restore that is waiting, as the election closes.
+	Stop()
+}
+
+// ElectionTiming sets raft's timeouts, and how often it compacts its log
+// into a snapshot (every Snapshot entries, keeping the last Trailing); zero
+// fields keep raft's defaults.
 type ElectionTiming struct {
 	Heartbeat, Election, Lease time.Duration
+	Snapshot, Trailing         uint64
 }
 
 // Elect joins the election called name among members (peer IDs, this node's
 // included), keeping its raft state under dir. A node that has no state yet
 // starts the group with members; one that has keeps the membership it knows,
-// which SetMembers changes.
-func (n *Node) Elect(dir, name string, members []string, settle time.Duration, timing ElectionTiming) (*Election, error) {
+// which SetMembers changes. sm, when not nil, applies the log's entries.
+func (n *Node) Elect(dir, name string, members []string, settle time.Duration, timing ElectionTiming, sm StateMachine) (*Election, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
@@ -59,19 +81,24 @@ func (n *Node) Elect(dir, name string, members []string, settle time.Duration, t
 	sl := &streamLayer{Listener: l, n: n, proto: raftProtocol(name)}
 	logger := hclog.New(&hclog.LoggerOptions{Name: "raft " + name, Output: logWriter(n.logf), Level: hclog.Warn})
 	tr := raft.NewNetworkTransportWithLogger(sl, 3, 10*time.Second, logger)
-	st, err := openRaftStore(filepath.Join(dir, "raft.json"))
+	st, err := openRaftStore(dir)
 	if err != nil {
 		tr.Close()
+		return nil, err
+	}
+	fail := func(err error) (*Election, error) {
+		tr.Close()
+		st.Close()
 		return nil, err
 	}
 	snaps, err := raft.NewFileSnapshotStoreWithLogger(dir, 2, logger)
 	if err != nil {
-		tr.Close()
-		return nil, err
+		return fail(err)
 	}
 	conf := raft.DefaultConfig()
 	conf.LocalID = raft.ServerID(n.ID())
 	conf.Logger = logger
+	conf.NoSnapshotRestoreOnStart = true
 	if timing.Heartbeat > 0 {
 		conf.HeartbeatTimeout = timing.Heartbeat
 	}
@@ -81,17 +108,25 @@ func (n *Node) Elect(dir, name string, members []string, settle time.Duration, t
 	if timing.Lease > 0 {
 		conf.LeaderLeaseTimeout = timing.Lease
 	}
+	if timing.Snapshot > 0 {
+		conf.SnapshotThreshold, conf.SnapshotInterval = timing.Snapshot, 100*time.Millisecond
+	}
+	if timing.Trailing > 0 {
+		conf.TrailingLogs = timing.Trailing
+	}
 	has, err := raft.HasExistingState(st, st, snaps)
 	if err != nil {
-		tr.Close()
-		return nil, err
+		return fail(err)
 	}
-	r, err := raft.NewRaft(conf, noFSM{}, st, st, snaps, tr)
+	var fsm raft.FSM = noFSM{}
+	if sm != nil {
+		fsm = smFSM{sm}
+	}
+	r, err := raft.NewRaft(conf, fsm, st, st, snaps, tr)
 	if err != nil {
-		tr.Close()
-		return nil, err
+		return fail(err)
 	}
-	e := &Election{r: r, tr: tr, st: st, self: conf.LocalID, settle: settle, done: make(chan struct{})}
+	e := &Election{r: r, tr: tr, st: st, sm: sm, self: conf.LocalID, settle: settle, done: make(chan struct{})}
 	if !has {
 		if err := r.BootstrapCluster(configuration(members)).Error(); err != nil && !errors.Is(err, raft.ErrCantBootstrap) {
 			e.Close()
@@ -112,7 +147,7 @@ func configuration(members []string) raft.Configuration {
 	return c
 }
 
-// watch keeps since: when this node became leader.
+// watch keeps since, when this node became leader, and caughtUp.
 func (e *Election) watch() {
 	ch := e.r.LeaderCh()
 	for {
@@ -121,22 +156,67 @@ func (e *Election) watch() {
 			return
 		case leader := <-ch:
 			e.mu.Lock()
-			e.since = time.Time{}
+			e.since, e.caughtUp = time.Time{}, false
 			if leader {
 				e.since = time.Now()
+				go e.catchUp(e.since)
 			}
 			e.mu.Unlock()
 		}
 	}
 }
 
-// Writer reports whether this node is the group's master: raft's leader, for
-// long enough to have the previous master's last commits.
+// catchUp sets caughtUp once this node, leader since since, has applied
+// every entry the log held when it was elected (a raft Barrier).
+func (e *Election) catchUp(since time.Time) {
+	for {
+		err := e.r.Barrier(10 * time.Second).Error()
+		e.mu.Lock()
+		current := e.since.Equal(since)
+		if err == nil && current {
+			e.caughtUp = true
+		}
+		e.mu.Unlock()
+		if err == nil || !current {
+			return
+		}
+		select {
+		case <-e.done:
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// Writer reports whether this node is the group's master: raft's leader, with
+// every entry before its term applied, for long enough to have the previous
+// master's last commits.
 func (e *Election) Writer() bool {
 	e.mu.Lock()
-	since := e.since
+	since, caughtUp := e.since, e.caughtUp
 	e.mu.Unlock()
-	return !since.IsZero() && time.Since(since) >= e.settle && e.r.State() == raft.Leader
+	return caughtUp && time.Since(since) >= e.settle && e.r.State() == raft.Leader
+}
+
+// ErrNotLeader is a proposal on a node that is not, or stopped being, the
+// group's leader: the entry may or may not be in the log.
+var ErrNotLeader = errors.New("cluster: this node is not the group's leader")
+
+// Propose appends data, under key, to the group's log on its leader, and
+// returns once a majority of the members hold it and this node applied it,
+// with what the StateMachine's Apply returned.
+func (e *Election) Propose(key string, data []byte) error {
+	f := e.r.ApplyLog(raft.Log{Data: data, Extensions: []byte(key)}, 10*time.Second)
+	if err := f.Error(); err != nil {
+		if errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrLeadershipLost) || errors.Is(err, raft.ErrLeadershipTransferInProgress) {
+			return fmt.Errorf("%w: %v", ErrNotLeader, err)
+		}
+		return err
+	}
+	if err, ok := f.Response().(error); ok {
+		return err
+	}
+	return nil
 }
 
 // Leader is the peer ID of the group's leader as this node knows it, "" when
@@ -191,8 +271,14 @@ func (e *Election) SetMembers(members []string) error {
 func (e *Election) Close() error {
 	e.once.Do(func() {
 		close(e.done)
+		if e.sm != nil {
+			e.sm.Stop()
+		}
 		e.err = e.r.Shutdown().Error()
 		if err := e.tr.Close(); e.err == nil {
+			e.err = err
+		}
+		if err := e.st.Close(); e.err == nil {
 			e.err = err
 		}
 	})
@@ -226,6 +312,37 @@ func (noFSM) Snapshot() (raft.FSMSnapshot, error) { return noSnapshot{}, nil }
 func (noFSM) Restore(r io.ReadCloser) error       { return r.Close() }
 
 type noSnapshot struct{}
+
+// smFSM is raft's FSM over a StateMachine.
+type smFSM struct{ sm StateMachine }
+
+func (f smFSM) Apply(l *raft.Log) any { return f.sm.Apply(string(l.Extensions), l.Data) }
+
+func (f smFSM) Snapshot() (raft.FSMSnapshot, error) {
+	b, err := f.sm.Snapshot()
+	return bytesSnapshot(b), err
+}
+
+func (f smFSM) Restore(r io.ReadCloser) error {
+	defer r.Close()
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	return f.sm.Restore(b)
+}
+
+type bytesSnapshot []byte
+
+func (b bytesSnapshot) Persist(sink raft.SnapshotSink) error {
+	if _, err := sink.Write(b); err != nil {
+		sink.Cancel()
+		return err
+	}
+	return sink.Close()
+}
+
+func (bytesSnapshot) Release() {}
 
 func (noSnapshot) Persist(sink raft.SnapshotSink) error { return sink.Close() }
 func (noSnapshot) Release()                             {}

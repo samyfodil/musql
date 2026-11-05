@@ -4,7 +4,7 @@
 
 import type { GenEnum, GenFile, GenMessage, GenService } from "@bufbuild/protobuf/codegenv2";
 import type { Message } from "@bufbuild/protobuf";
-import type { Database, DatabaseType } from "./common_pb";
+import type { Database, DatabaseType, Durability } from "./common_pb";
 import type { Timestamp } from "@bufbuild/protobuf/wkt";
 
 /**
@@ -144,6 +144,13 @@ export declare type CreateDatabaseRequest = Message<"cloud.v1.CreateDatabaseRequ
    * @generated from field: cloud.v1.DatabaseType type = 8;
    */
   type: DatabaseType;
+
+  /**
+   * DURABLE when unspecified; a regular database's alone.
+   *
+   * @generated from field: cloud.v1.Durability durability = 9;
+   */
+  durability: Durability;
 };
 
 /**

@@ -23,6 +23,17 @@ enum DatabaseType {
   DATABASE_TYPE_RAFT = 3;
 }
 
+// How a regular database's commits are kept in a cluster. DURABLE, the
+// default: a commit returns once a majority of its group's nodes hold it, so
+// the master stopping loses none. FAST: a commit returns once the master holds
+// it, and the others copy it right after; a master that stops first takes its
+// last commits along. A crdt database and a standalone node's have neither.
+enum Durability {
+  DURABILITY_UNSPECIFIED = 0;
+  DURABILITY_DURABLE = 1;
+  DURABILITY_FAST = 2;
+}
+
 message User {
   string id = 1;
   string email = 2;
@@ -75,4 +86,5 @@ message Database {
   bool schema_only = 9;
   google.protobuf.Timestamp created_at = 10;
   DatabaseType type = 11;
+  Durability durability = 12;
 }

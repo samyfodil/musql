@@ -380,7 +380,9 @@ var ErrMode = errors.New("replication: wrong mode")
 // site's rowid range (lo): its rowids are its identity, and two nodes' rowid-1
 // rows are different rows. C SQLite promises no stable rowid for such a table
 // either (VACUUM may renumber it). A table with an INTEGER PRIMARY KEY keeps its
-// ids, which are the application's: two nodes' row 1 is the same row.
+// ids, which are the application's: two nodes' row 1 is the same row. lo 0
+// keeps every table's rowids: a database whose commits one log orders has no
+// other node's rows to collide with.
 //
 // It runs once, in one transaction, and only on a database with no op log.
 func (s *Store) genesis(ctx context.Context, lo uint64) error {
@@ -453,7 +455,7 @@ func (s *Store) genesisTx(ctx context.Context, lo uint64) (*catalog, string, err
 		if t.Type != "table" {
 			continue
 		}
-		if t.keyCols() == nil {
+		if t.keyCols() == nil && lo != 0 {
 			if err := s.renumber(ctx, t, lo); err != nil {
 				return nil, "", err
 			}

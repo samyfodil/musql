@@ -115,6 +115,14 @@ const (
 	TypeRaft  = "raft"
 )
 
+// How a regular database's commits are kept in a cluster: durable once a
+// majority of its group's nodes hold them (its group's raft log carries
+// them), or fast, once its master does.
+const (
+	DurabilityDurable = "durable"
+	DurabilityFast    = "fast"
+)
+
 // DefaultType is the type a new group's databases default to: plain, which
 // is a regular database on its own node and in a cluster alike.
 func (s *Store) DefaultType() string { return s.dbType }
@@ -315,6 +323,9 @@ var migrations = []string{
 		rows_written INTEGER NOT NULL,
 		PRIMARY KEY (node, db_id, hour, sql)
 	);`,
+	// A regular database's durability in a cluster. Those from before were
+	// opened without a quorum, which their replication catalog keeps.
+	`ALTER TABLE databases ADD COLUMN durability TEXT NOT NULL DEFAULT 'fast'`,
 }
 
 func (s *Store) migrate() error {

@@ -326,7 +326,9 @@ type CreateDatabaseRequest struct {
 	BranchAt   *timestamppb.Timestamp         `protobuf:"bytes,6,opt,name=branch_at,json=branchAt,proto3" json:"branch_at,omitempty"`
 	SchemaOnly bool                           `protobuf:"varint,7,opt,name=schema_only,json=schemaOnly,proto3" json:"schema_only,omitempty"`
 	// The group's type when unspecified.
-	Type          DatabaseType `protobuf:"varint,8,opt,name=type,proto3,enum=cloud.v1.DatabaseType" json:"type,omitempty"`
+	Type DatabaseType `protobuf:"varint,8,opt,name=type,proto3,enum=cloud.v1.DatabaseType" json:"type,omitempty"`
+	// DURABLE when unspecified; a regular database's alone.
+	Durability    Durability `protobuf:"varint,9,opt,name=durability,proto3,enum=cloud.v1.Durability" json:"durability,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -426,6 +428,13 @@ func (x *CreateDatabaseRequest) GetType() DatabaseType {
 		return x.Type
 	}
 	return DatabaseType_DATABASE_TYPE_UNSPECIFIED
+}
+
+func (x *CreateDatabaseRequest) GetDurability() Durability {
+	if x != nil {
+		return x.Durability
+	}
+	return Durability_DURABILITY_UNSPECIFIED
 }
 
 type isCreateDatabaseRequest_Source interface {
@@ -2259,7 +2268,7 @@ const file_cloud_v1_database_proto_rawDesc = "" +
 	"\x03org\x18\x01 \x01(\tR\x03org\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\"E\n" +
 	"\x13GetDatabaseResponse\x12.\n" +
-	"\bdatabase\x18\x01 \x01(\v2\x12.cloud.v1.DatabaseR\bdatabase\"\x9c\x02\n" +
+	"\bdatabase\x18\x01 \x01(\v2\x12.cloud.v1.DatabaseR\bdatabase\"\xd2\x02\n" +
 	"\x15CreateDatabaseRequest\x12\x10\n" +
 	"\x03org\x18\x01 \x01(\tR\x03org\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x14\n" +
@@ -2269,7 +2278,10 @@ const file_cloud_v1_database_proto_rawDesc = "" +
 	"\tbranch_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\bbranchAt\x12\x1f\n" +
 	"\vschema_only\x18\a \x01(\bR\n" +
 	"schemaOnly\x12*\n" +
-	"\x04type\x18\b \x01(\x0e2\x16.cloud.v1.DatabaseTypeR\x04typeB\b\n" +
+	"\x04type\x18\b \x01(\x0e2\x16.cloud.v1.DatabaseTypeR\x04type\x124\n" +
+	"\n" +
+	"durability\x18\t \x01(\x0e2\x14.cloud.v1.DurabilityR\n" +
+	"durabilityB\b\n" +
 	"\x06source\"H\n" +
 	"\x16CreateDatabaseResponse\x12.\n" +
 	"\bdatabase\x18\x01 \x01(\v2\x12.cloud.v1.DatabaseR\bdatabase\"=\n" +
@@ -2476,69 +2488,71 @@ var file_cloud_v1_database_proto_goTypes = []any{
 	(*Database)(nil),                 // 38: cloud.v1.Database
 	(*timestamppb.Timestamp)(nil),    // 39: google.protobuf.Timestamp
 	(DatabaseType)(0),                // 40: cloud.v1.DatabaseType
+	(Durability)(0),                  // 41: cloud.v1.Durability
 }
 var file_cloud_v1_database_proto_depIdxs = []int32{
 	38, // 0: cloud.v1.ListDatabasesResponse.databases:type_name -> cloud.v1.Database
 	38, // 1: cloud.v1.GetDatabaseResponse.database:type_name -> cloud.v1.Database
 	39, // 2: cloud.v1.CreateDatabaseRequest.branch_at:type_name -> google.protobuf.Timestamp
 	40, // 3: cloud.v1.CreateDatabaseRequest.type:type_name -> cloud.v1.DatabaseType
-	38, // 4: cloud.v1.CreateDatabaseResponse.database:type_name -> cloud.v1.Database
-	38, // 5: cloud.v1.RenameDatabaseResponse.database:type_name -> cloud.v1.Database
-	39, // 6: cloud.v1.UsageRequest.from:type_name -> google.protobuf.Timestamp
-	39, // 7: cloud.v1.UsageRequest.to:type_name -> google.protobuf.Timestamp
-	39, // 8: cloud.v1.UsagePoint.hour:type_name -> google.protobuf.Timestamp
-	13, // 9: cloud.v1.UsageResponse.points:type_name -> cloud.v1.UsagePoint
-	15, // 10: cloud.v1.UsageResponse.databases:type_name -> cloud.v1.DatabaseUsage
-	13, // 11: cloud.v1.DatabaseUsage.points:type_name -> cloud.v1.UsagePoint
-	39, // 12: cloud.v1.Snapshot.taken_at:type_name -> google.protobuf.Timestamp
-	16, // 13: cloud.v1.ListSnapshotsResponse.snapshots:type_name -> cloud.v1.Snapshot
-	16, // 14: cloud.v1.CreateSnapshotResponse.snapshot:type_name -> cloud.v1.Snapshot
-	39, // 15: cloud.v1.RestoreRequest.at:type_name -> google.protobuf.Timestamp
-	38, // 16: cloud.v1.RestoreResponse.database:type_name -> cloud.v1.Database
-	1,  // 17: cloud.v1.CreateTokenRequest.access:type_name -> cloud.v1.Access
-	39, // 18: cloud.v1.CreateTokenRequest.expires_at:type_name -> google.protobuf.Timestamp
-	0,  // 19: cloud.v1.FinishUploadResponse.format:type_name -> cloud.v1.FileFormat
-	0,  // 20: cloud.v1.ExportRequest.format:type_name -> cloud.v1.FileFormat
-	39, // 21: cloud.v1.StatsRequest.from:type_name -> google.protobuf.Timestamp
-	39, // 22: cloud.v1.StatsRequest.to:type_name -> google.protobuf.Timestamp
-	36, // 23: cloud.v1.StatsResponse.top_queries:type_name -> cloud.v1.TopQuery
-	2,  // 24: cloud.v1.DatabaseService.List:input_type -> cloud.v1.ListDatabasesRequest
-	4,  // 25: cloud.v1.DatabaseService.Get:input_type -> cloud.v1.GetDatabaseRequest
-	6,  // 26: cloud.v1.DatabaseService.Create:input_type -> cloud.v1.CreateDatabaseRequest
-	8,  // 27: cloud.v1.DatabaseService.Delete:input_type -> cloud.v1.DeleteDatabaseRequest
-	10, // 28: cloud.v1.DatabaseService.Rename:input_type -> cloud.v1.RenameDatabaseRequest
-	12, // 29: cloud.v1.DatabaseService.Usage:input_type -> cloud.v1.UsageRequest
-	17, // 30: cloud.v1.DatabaseService.ListSnapshots:input_type -> cloud.v1.ListSnapshotsRequest
-	19, // 31: cloud.v1.DatabaseService.CreateSnapshot:input_type -> cloud.v1.CreateSnapshotRequest
-	21, // 32: cloud.v1.DatabaseService.Restore:input_type -> cloud.v1.RestoreRequest
-	23, // 33: cloud.v1.DatabaseService.CreateToken:input_type -> cloud.v1.CreateTokenRequest
-	25, // 34: cloud.v1.DatabaseService.InvalidateTokens:input_type -> cloud.v1.InvalidateTokensRequest
-	27, // 35: cloud.v1.DatabaseService.StartUpload:input_type -> cloud.v1.StartUploadRequest
-	29, // 36: cloud.v1.DatabaseService.UploadChunk:input_type -> cloud.v1.UploadChunkRequest
-	31, // 37: cloud.v1.DatabaseService.FinishUpload:input_type -> cloud.v1.FinishUploadRequest
-	33, // 38: cloud.v1.DatabaseService.Export:input_type -> cloud.v1.ExportRequest
-	35, // 39: cloud.v1.DatabaseService.Stats:input_type -> cloud.v1.StatsRequest
-	3,  // 40: cloud.v1.DatabaseService.List:output_type -> cloud.v1.ListDatabasesResponse
-	5,  // 41: cloud.v1.DatabaseService.Get:output_type -> cloud.v1.GetDatabaseResponse
-	7,  // 42: cloud.v1.DatabaseService.Create:output_type -> cloud.v1.CreateDatabaseResponse
-	9,  // 43: cloud.v1.DatabaseService.Delete:output_type -> cloud.v1.DeleteDatabaseResponse
-	11, // 44: cloud.v1.DatabaseService.Rename:output_type -> cloud.v1.RenameDatabaseResponse
-	14, // 45: cloud.v1.DatabaseService.Usage:output_type -> cloud.v1.UsageResponse
-	18, // 46: cloud.v1.DatabaseService.ListSnapshots:output_type -> cloud.v1.ListSnapshotsResponse
-	20, // 47: cloud.v1.DatabaseService.CreateSnapshot:output_type -> cloud.v1.CreateSnapshotResponse
-	22, // 48: cloud.v1.DatabaseService.Restore:output_type -> cloud.v1.RestoreResponse
-	24, // 49: cloud.v1.DatabaseService.CreateToken:output_type -> cloud.v1.CreateTokenResponse
-	26, // 50: cloud.v1.DatabaseService.InvalidateTokens:output_type -> cloud.v1.InvalidateTokensResponse
-	28, // 51: cloud.v1.DatabaseService.StartUpload:output_type -> cloud.v1.StartUploadResponse
-	30, // 52: cloud.v1.DatabaseService.UploadChunk:output_type -> cloud.v1.UploadChunkResponse
-	32, // 53: cloud.v1.DatabaseService.FinishUpload:output_type -> cloud.v1.FinishUploadResponse
-	34, // 54: cloud.v1.DatabaseService.Export:output_type -> cloud.v1.ExportResponse
-	37, // 55: cloud.v1.DatabaseService.Stats:output_type -> cloud.v1.StatsResponse
-	40, // [40:56] is the sub-list for method output_type
-	24, // [24:40] is the sub-list for method input_type
-	24, // [24:24] is the sub-list for extension type_name
-	24, // [24:24] is the sub-list for extension extendee
-	0,  // [0:24] is the sub-list for field type_name
+	41, // 4: cloud.v1.CreateDatabaseRequest.durability:type_name -> cloud.v1.Durability
+	38, // 5: cloud.v1.CreateDatabaseResponse.database:type_name -> cloud.v1.Database
+	38, // 6: cloud.v1.RenameDatabaseResponse.database:type_name -> cloud.v1.Database
+	39, // 7: cloud.v1.UsageRequest.from:type_name -> google.protobuf.Timestamp
+	39, // 8: cloud.v1.UsageRequest.to:type_name -> google.protobuf.Timestamp
+	39, // 9: cloud.v1.UsagePoint.hour:type_name -> google.protobuf.Timestamp
+	13, // 10: cloud.v1.UsageResponse.points:type_name -> cloud.v1.UsagePoint
+	15, // 11: cloud.v1.UsageResponse.databases:type_name -> cloud.v1.DatabaseUsage
+	13, // 12: cloud.v1.DatabaseUsage.points:type_name -> cloud.v1.UsagePoint
+	39, // 13: cloud.v1.Snapshot.taken_at:type_name -> google.protobuf.Timestamp
+	16, // 14: cloud.v1.ListSnapshotsResponse.snapshots:type_name -> cloud.v1.Snapshot
+	16, // 15: cloud.v1.CreateSnapshotResponse.snapshot:type_name -> cloud.v1.Snapshot
+	39, // 16: cloud.v1.RestoreRequest.at:type_name -> google.protobuf.Timestamp
+	38, // 17: cloud.v1.RestoreResponse.database:type_name -> cloud.v1.Database
+	1,  // 18: cloud.v1.CreateTokenRequest.access:type_name -> cloud.v1.Access
+	39, // 19: cloud.v1.CreateTokenRequest.expires_at:type_name -> google.protobuf.Timestamp
+	0,  // 20: cloud.v1.FinishUploadResponse.format:type_name -> cloud.v1.FileFormat
+	0,  // 21: cloud.v1.ExportRequest.format:type_name -> cloud.v1.FileFormat
+	39, // 22: cloud.v1.StatsRequest.from:type_name -> google.protobuf.Timestamp
+	39, // 23: cloud.v1.StatsRequest.to:type_name -> google.protobuf.Timestamp
+	36, // 24: cloud.v1.StatsResponse.top_queries:type_name -> cloud.v1.TopQuery
+	2,  // 25: cloud.v1.DatabaseService.List:input_type -> cloud.v1.ListDatabasesRequest
+	4,  // 26: cloud.v1.DatabaseService.Get:input_type -> cloud.v1.GetDatabaseRequest
+	6,  // 27: cloud.v1.DatabaseService.Create:input_type -> cloud.v1.CreateDatabaseRequest
+	8,  // 28: cloud.v1.DatabaseService.Delete:input_type -> cloud.v1.DeleteDatabaseRequest
+	10, // 29: cloud.v1.DatabaseService.Rename:input_type -> cloud.v1.RenameDatabaseRequest
+	12, // 30: cloud.v1.DatabaseService.Usage:input_type -> cloud.v1.UsageRequest
+	17, // 31: cloud.v1.DatabaseService.ListSnapshots:input_type -> cloud.v1.ListSnapshotsRequest
+	19, // 32: cloud.v1.DatabaseService.CreateSnapshot:input_type -> cloud.v1.CreateSnapshotRequest
+	21, // 33: cloud.v1.DatabaseService.Restore:input_type -> cloud.v1.RestoreRequest
+	23, // 34: cloud.v1.DatabaseService.CreateToken:input_type -> cloud.v1.CreateTokenRequest
+	25, // 35: cloud.v1.DatabaseService.InvalidateTokens:input_type -> cloud.v1.InvalidateTokensRequest
+	27, // 36: cloud.v1.DatabaseService.StartUpload:input_type -> cloud.v1.StartUploadRequest
+	29, // 37: cloud.v1.DatabaseService.UploadChunk:input_type -> cloud.v1.UploadChunkRequest
+	31, // 38: cloud.v1.DatabaseService.FinishUpload:input_type -> cloud.v1.FinishUploadRequest
+	33, // 39: cloud.v1.DatabaseService.Export:input_type -> cloud.v1.ExportRequest
+	35, // 40: cloud.v1.DatabaseService.Stats:input_type -> cloud.v1.StatsRequest
+	3,  // 41: cloud.v1.DatabaseService.List:output_type -> cloud.v1.ListDatabasesResponse
+	5,  // 42: cloud.v1.DatabaseService.Get:output_type -> cloud.v1.GetDatabaseResponse
+	7,  // 43: cloud.v1.DatabaseService.Create:output_type -> cloud.v1.CreateDatabaseResponse
+	9,  // 44: cloud.v1.DatabaseService.Delete:output_type -> cloud.v1.DeleteDatabaseResponse
+	11, // 45: cloud.v1.DatabaseService.Rename:output_type -> cloud.v1.RenameDatabaseResponse
+	14, // 46: cloud.v1.DatabaseService.Usage:output_type -> cloud.v1.UsageResponse
+	18, // 47: cloud.v1.DatabaseService.ListSnapshots:output_type -> cloud.v1.ListSnapshotsResponse
+	20, // 48: cloud.v1.DatabaseService.CreateSnapshot:output_type -> cloud.v1.CreateSnapshotResponse
+	22, // 49: cloud.v1.DatabaseService.Restore:output_type -> cloud.v1.RestoreResponse
+	24, // 50: cloud.v1.DatabaseService.CreateToken:output_type -> cloud.v1.CreateTokenResponse
+	26, // 51: cloud.v1.DatabaseService.InvalidateTokens:output_type -> cloud.v1.InvalidateTokensResponse
+	28, // 52: cloud.v1.DatabaseService.StartUpload:output_type -> cloud.v1.StartUploadResponse
+	30, // 53: cloud.v1.DatabaseService.UploadChunk:output_type -> cloud.v1.UploadChunkResponse
+	32, // 54: cloud.v1.DatabaseService.FinishUpload:output_type -> cloud.v1.FinishUploadResponse
+	34, // 55: cloud.v1.DatabaseService.Export:output_type -> cloud.v1.ExportResponse
+	37, // 56: cloud.v1.DatabaseService.Stats:output_type -> cloud.v1.StatsResponse
+	41, // [41:57] is the sub-list for method output_type
+	25, // [25:41] is the sub-list for method input_type
+	25, // [25:25] is the sub-list for extension type_name
+	25, // [25:25] is the sub-list for extension extendee
+	0,  // [0:25] is the sub-list for field type_name
 }
 
 func init() { file_cloud_v1_database_proto_init() }

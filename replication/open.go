@@ -74,7 +74,7 @@ func openSyncer(ctx context.Context, path string, opts ...Option) (*Syncer, *sql
 	if err != nil {
 		return fail(err)
 	}
-	s, err := newSyncer(ctx, applyDB, site)
+	s, err := newSyncer(ctx, applyDB, site, cfg.quorum != nil)
 	if err != nil {
 		return fail(err)
 	}
@@ -179,7 +179,9 @@ func CRDT() Option { return func(c *config) { c.mode, c.writer = modeCRDT, nil }
 // with it, and a new writer may start before it has them -- primary/replica.
 // With one (NewQuorum), a commit returns only once the caller's consensus has
 // committed it and this node has applied it -- the raft model -- and every node
-// of the database must be opened with one.
+// of the database must be opened with one. The log then orders every commit,
+// so rowids need no per-site range: a new row gets the next one above every
+// rowid its table ever had, 1, 2, 3, ... as on a single node.
 func Leader(isWriter func() bool, q ...*Quorum) Option {
 	return func(c *config) {
 		c.mode, c.writer, c.quorum = modeLeader, isWriter, nil
@@ -210,6 +212,26 @@ type Quorum struct {
 // NewQuorum returns a Quorum that proposes through propose.
 func NewQuorum(propose func(ctx context.Context, entry []byte) error) *Quorum {
 	return &Quorum{propose: propose}
+}
+
+// Frontier is what this node's database holds: each site's highest
+// contiguous seq.
+func (q *Quorum) Frontier() VersionVector {
+	if s := q.s.Load(); s != nil {
+		return s.store.LocalVV()
+	}
+	return VersionVector{}
+}
+
+// Covers reports whether this node's database holds everything vv names.
+func (q *Quorum) Covers(vv VersionVector) bool {
+	have := q.Frontier()
+	for site, seq := range vv {
+		if have[site] < seq {
+			return false
+		}
+	}
+	return true
 }
 
 // Apply applies one committed entry to this node's database. Call it from the
