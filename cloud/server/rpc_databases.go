@@ -107,6 +107,13 @@ func (s databaseService) Create(ctx context.Context, req *connect.Request[v1.Cre
 		if src, err = s.store.Database(ctx, o.ID, m.GetBranchOf()); err != nil {
 			return nil, rpcErr(err)
 		}
+		// A branch of a regular database is made from its master's history.
+		if c, err := s.atMaster(ctx, src); c != nil || err != nil {
+			if err != nil {
+				return nil, err
+			}
+			return forward(ctx, req, c.Create)
+		}
 	case m.BranchAt != nil:
 		return nil, invalid("branch_at needs branch_of")
 	case m.SchemaOnly && m.GetUpload() == "":
@@ -423,6 +430,12 @@ func (s databaseService) Export(ctx context.Context, req *connect.Request[v1.Exp
 	_, d, _, err := s.lookup(ctx, req, req.Msg.Org, req.Msg.Name, state.RoleMember)
 	if err != nil {
 		return err
+	}
+	if c, err := s.atMaster(ctx, d); c != nil || err != nil {
+		if err != nil {
+			return err
+		}
+		return forwardExport(ctx, req, c, stream)
 	}
 	if err := s.localCopy(ctx, d); err != nil {
 		return err

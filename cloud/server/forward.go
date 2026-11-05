@@ -11,6 +11,8 @@ import (
 	"connectrpc.com/connect"
 
 	"github.com/samyfodil/musql/cloud/cluster"
+	v1 "github.com/samyfodil/musql/cloud/gen/cloud/v1"
+	"github.com/samyfodil/musql/cloud/gen/cloud/v1/cloudv1connect"
 	"github.com/samyfodil/musql/cloud/state"
 )
 
@@ -57,6 +59,33 @@ func (s *Server) masterURL(ctx context.Context, d *state.Database) (string, erro
 // masterWait is how long a request waits for its group's master: longer than
 // an election and the settling after it take.
 const masterWait = 10 * time.Second
+
+// atMaster is a client of d's master when a request about d's copy or
+// history goes there, nil when this node serves it.
+func (s *Server) atMaster(ctx context.Context, d *state.Database) (cloudv1connect.DatabaseServiceClient, error) {
+	base, err := s.masterURL(ctx, d)
+	if err != nil || base == "" {
+		return nil, err
+	}
+	return cloudv1connect.NewDatabaseServiceClient(s.cl.client, base), nil
+}
+
+// forwardExport relays the master's export of req's database.
+func forwardExport(ctx context.Context, req *connect.Request[v1.ExportRequest], c cloudv1connect.DatabaseServiceClient, stream *connect.ServerStream[v1.ExportResponse]) error {
+	out := connect.NewRequest(req.Msg)
+	out.Header().Set("Authorization", req.Header().Get("Authorization"))
+	in, err := c.Export(ctx, out)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	for in.Receive() {
+		if err := stream.Send(in.Msg()); err != nil {
+			return err
+		}
+	}
+	return in.Err()
+}
 
 // forward makes req's call on the master with the caller's credential.
 func forward[Req, Res any](ctx context.Context, req *connect.Request[Req], call func(context.Context, *connect.Request[Req]) (*connect.Response[Res], error)) (*connect.Response[Res], error) {

@@ -212,11 +212,12 @@ func (c *clusterNode) groups() cloudv1connect.GroupServiceClient {
 	return cloudv1connect.NewGroupServiceClient(c.ts.Client(), c.ts.URL)
 }
 
-// placed reports whether every node in nodes holds db open.
+// placed reports whether every node in nodes holds db open, its first sync
+// done: a regular database's reads go to its master, so they do not show it.
 func placed(nodes []*clusterNode, db string) bool {
 	for _, n := range nodes {
 		d, err := n.s.Store().Database(context.Background(), orgID(n), db)
-		if err != nil || n.s.replHandle(d.ID) == nil {
+		if err != nil || n.s.replHandle(d.ID) == nil || n.s.replSyncing(d.ID) {
 			return false
 		}
 	}

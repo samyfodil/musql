@@ -11,8 +11,6 @@ import (
 	"net/http"
 	"time"
 
-	"google.golang.org/protobuf/proto"
-
 	hpb "github.com/samyfodil/musql/hrana/gen/hrana"
 	hhttp "github.com/samyfodil/musql/hrana/gen/hrana/http"
 )
@@ -80,7 +78,7 @@ func (c *remoteConn) run(ctx context.Context, stmt *hpb.Stmt, keep, end bool) (*
 	if !keep {
 		reqs = append(reqs, &hhttp.StreamRequest{Request: &hhttp.StreamRequest_Close{Close: &hhttp.CloseStreamReq{}}})
 	}
-	body, err := proto.Marshal(&hhttp.PipelineReqBody{Baton: c.baton, Requests: reqs})
+	body, err := (&hhttp.PipelineReqBody{Baton: c.baton, Requests: reqs}).MarshalVT()
 	if err != nil {
 		return nil, err
 	}
@@ -105,7 +103,7 @@ func (c *remoteConn) run(ctx context.Context, stmt *hpb.Stmt, keep, end bool) (*
 		return nil, fmt.Errorf("state: the master answered %s: %s", resp.Status, bytes.TrimSpace(b))
 	}
 	var out hhttp.PipelineRespBody
-	if err := proto.Unmarshal(b, &out); err != nil {
+	if err := out.UnmarshalVT(b); err != nil {
 		c.baton = nil
 		return nil, err
 	}

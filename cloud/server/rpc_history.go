@@ -11,7 +11,6 @@ import (
 	"connectrpc.com/connect"
 
 	v1 "github.com/samyfodil/musql/cloud/gen/cloud/v1"
-	"github.com/samyfodil/musql/cloud/gen/cloud/v1/cloudv1connect"
 	"github.com/samyfodil/musql/cloud/state"
 	"github.com/samyfodil/musql/cloud/store"
 )
@@ -43,6 +42,12 @@ func (s databaseService) ListSnapshots(ctx context.Context, req *connect.Request
 	if err != nil {
 		return nil, err
 	}
+	if c, err := s.atMaster(ctx, d); c != nil || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		return forward(ctx, req, c.ListSnapshots)
+	}
 	if err := s.localCopy(ctx, d); err != nil {
 		return nil, err
 	}
@@ -61,6 +66,12 @@ func (s databaseService) CreateSnapshot(ctx context.Context, req *connect.Reques
 	_, d, _, err := s.lookup(ctx, req, req.Msg.Org, req.Msg.Name, state.RoleMember)
 	if err != nil {
 		return nil, err
+	}
+	if c, err := s.atMaster(ctx, d); c != nil || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		return forward(ctx, req, c.CreateSnapshot)
 	}
 	if err := s.localCopy(ctx, d); err != nil {
 		return nil, err
@@ -82,6 +93,14 @@ func (s databaseService) Restore(ctx context.Context, req *connect.Request[v1.Re
 	if err != nil {
 		return nil, err
 	}
+	// A regular database's master holds the history to restore from, and is
+	// the one that writes it.
+	if c, err := s.atMaster(ctx, d); c != nil || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		return forward(ctx, req, c.Restore)
+	}
 	if err := s.localCopy(ctx, d); err != nil {
 		return nil, err
 	}
@@ -92,12 +111,6 @@ func (s databaseService) Restore(ctx context.Context, req *connect.Request[v1.Re
 	if m.InPlace {
 		if m.NewName != "" {
 			return nil, invalid("in_place and new_name exclude each other")
-		}
-		if base, err := s.masterURL(ctx, d); err != nil || base != "" {
-			if err != nil {
-				return nil, err
-			}
-			return forward(ctx, req, cloudv1connect.NewDatabaseServiceClient(s.cl.client, base).Restore)
 		}
 		restore := s.restoreInPlace
 		if s.cl != nil {
