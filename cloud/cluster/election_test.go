@@ -109,11 +109,15 @@ func TestElection(t *testing.T) {
 	}
 	waitFor(t, "a master", func() bool { n, _ := writers(es); return n == 1 })
 	_, m := writers(es)
-	for i, e := range es {
-		if got := e.Leader(); got != nodes[m].ID() {
-			t.Fatalf("node %d names %q as the master, not %q", i, got, nodes[m].ID())
+	// A follower learns the leader from its first heartbeat.
+	waitFor(t, "every node to name the master", func() bool {
+		for _, e := range es {
+			if e.Leader() != nodes[m].ID() {
+				return false
+			}
 		}
-	}
+		return true
+	})
 	if err := es[m].Close(); err != nil {
 		t.Fatal(err)
 	}
