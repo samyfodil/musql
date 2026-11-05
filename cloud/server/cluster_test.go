@@ -90,6 +90,7 @@ peers:
 			t.Fatal(err)
 		}
 		cfg.syncInterval = 100 * time.Millisecond
+		cfg.election = cluster.ElectionTiming{Heartbeat: 200 * time.Millisecond, Election: 200 * time.Millisecond, Lease: 100 * time.Millisecond}
 		// A cluster is initialised once, on one node, and the others get the
 		// admin from it: Init on a node the admin is reaching from a peer fails.
 		if i == 0 {
@@ -112,9 +113,15 @@ peers:
 			c.s.Close()
 		})
 	}
+	// A cluster writes once a majority of its nodes elected a master, so each
+	// node signs the admin in only once they all run.
+	for _, c := range nodes {
+		c.ready()
+	}
 	return nodes
 }
 
+// start starts the node's server.
 func (c *clusterNode) start() {
 	c.t.Helper()
 	s, err := New(context.Background(), c.cfg, nil)
@@ -124,6 +131,12 @@ func (c *clusterNode) start() {
 	c.mu.Lock()
 	c.s, c.h = s, s.Handler()
 	c.mu.Unlock()
+}
+
+// ready waits for the admin to reach the node and signs it in there.
+func (c *clusterNode) ready() {
+	c.t.Helper()
+	s := c.s
 	eventually(c.t, "the admin on "+c.cfg.Node.Name, func() bool {
 		_, err := s.Store().UserByEmail(context.Background(), "admin@example.com")
 		return err == nil
@@ -137,6 +150,7 @@ func (c *clusterNode) restart() {
 		c.t.Fatal(err)
 	}
 	c.start()
+	c.ready()
 }
 
 // clusterBudget is how long one cluster test may run, -race included; a
@@ -202,7 +216,7 @@ func (c *clusterNode) groups() cloudv1connect.GroupServiceClient {
 func placed(nodes []*clusterNode, db string) bool {
 	for _, n := range nodes {
 		d, err := n.s.Store().Database(context.Background(), orgID(n), db)
-		if err != nil || n.s.crdtHandle(d.ID) == nil {
+		if err != nil || n.s.replHandle(d.ID) == nil {
 			return false
 		}
 	}
@@ -220,15 +234,20 @@ func orgID(n *clusterNode) string {
 // acmeEverywhere makes org acme on node 0 with its default group placed at
 // every node's location, and a crdt database app in it, open on every node.
 func acmeEverywhere(t *testing.T, nodes []*clusterNode) {
+	acmeEverywhereAs(t, nodes, v1.DatabaseType_DATABASE_TYPE_CRDT)
+}
+
+// acmeEverywhereAs is acmeEverywhere with app of type typ.
+func acmeEverywhereAs(t *testing.T, nodes []*clusterNode, typ v1.DatabaseType) {
 	ctx := context.Background()
 	_, orgs, dbs := nodes[0].clients()
 	need(orgs.Create(ctx, auth(nodes[0].admin, &v1.CreateOrgRequest{Slug: "acme", Name: "Acme"})))(t)
 	for _, loc := range locations[1:len(nodes)] {
 		need(nodes[0].groups().AddLocation(ctx, auth(nodes[0].admin, &v1.AddLocationRequest{Org: "acme", Group: "default", Location: loc})))(t)
 	}
-	d := need(dbs.Create(ctx, auth(nodes[0].admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "app"})))(t)
-	if d.Msg.Database.Type != v1.DatabaseType_DATABASE_TYPE_CRDT {
-		t.Fatalf("a cluster's database is %v", d.Msg.Database.Type)
+	d := need(dbs.Create(ctx, auth(nodes[0].admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "app", Type: typ})))(t)
+	if d.Msg.Database.Type != typ {
+		t.Fatalf("app is %v, not %v", d.Msg.Database.Type, typ)
 	}
 	eventually(t, "app open on every node", func() bool { return placed(nodes, "app") })
 }
@@ -304,15 +323,22 @@ func (b *busyLog) Write(p []byte) (int, error) {
 }
 
 // A node newly placed serves a database only once it holds all of it: until
-// its first sync with the peers completes it answers 503, never a part. It
-// takes the database as a peer's image, not op by op.
+// its first sync with the peers completes it answers 503 (a crdt database) or
+// its master answers (a regular one), never a part. It takes the database as
+// a peer's image, not op by op.
 func TestClusterNewPlacementServesAllOrNothing(t *testing.T) {
+	for _, typ := range []v1.DatabaseType{v1.DatabaseType_DATABASE_TYPE_CRDT, v1.DatabaseType_DATABASE_TYPE_PLAIN} {
+		t.Run(typ.String(), func(t *testing.T) { newPlacementAllOrNothing(t, typ) })
+	}
+}
+
+func newPlacementAllOrNothing(t *testing.T, typ v1.DatabaseType) {
 	nodes := newCluster(t, 3)
 	ctx := context.Background()
 	_, orgs, dbs := nodes[0].clients()
 	need(orgs.Create(ctx, auth(nodes[0].admin, &v1.CreateOrgRequest{Slug: "acme", Name: "Acme"})))(t)
 	need(nodes[0].groups().AddLocation(ctx, auth(nodes[0].admin, &v1.AddLocationRequest{Org: "acme", Group: "default", Location: "iad"})))(t)
-	need(dbs.Create(ctx, auth(nodes[0].admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "app"})))(t)
+	need(dbs.Create(ctx, auth(nodes[0].admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "app", Type: typ})))(t)
 	eventually(t, "app open on fra and iad", func() bool { return placed(nodes[:2], "app") })
 	const rows = 2000 // more ops than a new node pulls one by one
 	nodes[0].exec("/db/acme/app", nodes[0].admin, "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)",
@@ -339,7 +365,8 @@ func TestClusterNewPlacementServesAllOrNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !replication.ImageInstalled(nodes[2].s.crdtHandle(d.ID)) {
+	eventually(t, "sea's own copy of app", func() bool { return nodes[2].s.replHandle(d.ID) != nil && !nodes[2].s.replSyncing(d.ID) })
+	if !replication.ImageInstalled(nodes[2].s.replHandle(d.ID)) {
 		t.Fatal("sea took app op by op, not as an image")
 	}
 }
@@ -356,7 +383,7 @@ func TestClusterPlacement(t *testing.T) {
 	need(nodes[1].groups().RemoveLocation(ctx, auth(nodes[1].admin, &v1.RemoveLocationRequest{Org: "acme", Group: "default", Location: "sea"})))(t)
 	eventually(t, "sea to close and remove app", func() bool {
 		_, err := os.Stat(path)
-		return nodes[2].s.crdtHandle(d.ID) == nil && os.IsNotExist(err)
+		return nodes[2].s.replHandle(d.ID) == nil && os.IsNotExist(err)
 	})
 	if status, _ := nodes[2].pipeline("/db/acme/app", nodes[2].admin, "SELECT 1"); status != http.StatusNotFound {
 		t.Fatalf("a database not placed here: HTTP %d, want 404", status)
@@ -390,7 +417,7 @@ func TestClusterPlacement(t *testing.T) {
 	need(dbs.Delete(ctx, auth(nodes[1].admin, &v1.DeleteDatabaseRequest{Org: "acme", Name: "app"})))(t)
 	eventually(t, "app gone from every node", func() bool {
 		for _, n := range nodes {
-			if n.s.crdtHandle(d.ID) != nil {
+			if n.s.replHandle(d.ID) != nil {
 				return false
 			}
 		}
@@ -399,9 +426,18 @@ func TestClusterPlacement(t *testing.T) {
 	})
 }
 
-func TestClusterDeclinesWhatCRDTCannotReplicate(t *testing.T) {
+// TestClusterDeclinesWhatCannotReplicate: replication refuses a trigger, a
+// virtual table and a WITHOUT ROWID table in a crdt database and a regular one
+// alike, and a raft database is a regular one.
+func TestClusterDeclinesWhatCannotReplicate(t *testing.T) {
+	for _, typ := range []v1.DatabaseType{v1.DatabaseType_DATABASE_TYPE_CRDT, v1.DatabaseType_DATABASE_TYPE_PLAIN} {
+		t.Run(typ.String(), func(t *testing.T) { declinesWhatCannotReplicate(t, typ) })
+	}
+}
+
+func declinesWhatCannotReplicate(t *testing.T, typ v1.DatabaseType) {
 	nodes := newCluster(t, 2)
-	acmeEverywhere(t, nodes)
+	acmeEverywhereAs(t, nodes, typ)
 	n := nodes[0]
 	n.exec("/db/acme/app", n.admin, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)")
 	for _, c := range []struct{ stmt, why string }{
@@ -423,11 +459,9 @@ func TestClusterDeclinesWhatCRDTCannotReplicate(t *testing.T) {
 
 	ctx := context.Background()
 	_, _, dbs := n.clients()
-	for _, typ := range []v1.DatabaseType{v1.DatabaseType_DATABASE_TYPE_RAFT, v1.DatabaseType_DATABASE_TYPE_PLAIN} {
-		_, err := dbs.Create(ctx, auth(n.admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "x", Type: typ}))
-		if err == nil || !strings.Contains(err.Error(), "not yet supported") && !strings.Contains(err.Error(), "standalone") {
-			t.Fatalf("type %v: %v", typ, err)
-		}
+	r := need(dbs.Create(ctx, auth(n.admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "r", Type: v1.DatabaseType_DATABASE_TYPE_RAFT})))(t)
+	if r.Msg.Database.Type != v1.DatabaseType_DATABASE_TYPE_PLAIN {
+		t.Fatalf("a raft database is %v, not a regular one", r.Msg.Database.Type)
 	}
 }
 
@@ -513,9 +547,12 @@ func TestStandaloneIsPlain(t *testing.T) {
 		"CREATE VIRTUAL TABLE f USING fts5(body)",
 		"CREATE TABLE w(k TEXT PRIMARY KEY, v) WITHOUT ROWID",
 		"INSERT INTO t(v) VALUES (1)")
-	for _, typ := range []v1.DatabaseType{v1.DatabaseType_DATABASE_TYPE_CRDT, v1.DatabaseType_DATABASE_TYPE_RAFT} {
-		if _, err := dbs.Create(ctx, auth(e.admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "x", Type: typ})); err == nil {
-			t.Fatalf("a standalone node accepted type %v", typ)
-		}
+	if _, err := dbs.Create(ctx, auth(e.admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "x", Type: v1.DatabaseType_DATABASE_TYPE_CRDT})); err == nil {
+		t.Fatal("a standalone node accepted a crdt database")
+	}
+	// A raft database is a regular one: plain on a node of its own.
+	r := must(dbs.Create(ctx, auth(e.admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "r", Type: v1.DatabaseType_DATABASE_TYPE_RAFT})))
+	if r.Msg.Database.Type != v1.DatabaseType_DATABASE_TYPE_PLAIN {
+		t.Fatalf("a raft database on a standalone node is %v", r.Msg.Database.Type)
 	}
 }

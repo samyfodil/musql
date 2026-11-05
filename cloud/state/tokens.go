@@ -25,7 +25,7 @@ const PlatformTokenPrefix = "mpt_"
 func (s *Store) CreatePlatformToken(ctx context.Context, userID, name string) (*PlatformToken, string, error) {
 	secret := PlatformTokenPrefix + NewSecret()
 	t := &PlatformToken{ID: NewID(), UserID: userID, Name: name, CreatedAt: unix(now())}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO platform_tokens (id, user_id, name, hash, created_at) VALUES (?, ?, ?, ?, ?)`,
+	_, err := s.exec(ctx, `INSERT INTO platform_tokens (id, user_id, name, hash, created_at) VALUES (?, ?, ?, ?, ?)`,
 		t.ID, t.UserID, t.Name, HashToken(secret), t.CreatedAt.Unix())
 	if err != nil {
 		return nil, "", err
@@ -39,10 +39,10 @@ func (s *Store) PlatformTokenUser(ctx context.Context, secret string) (*User, er
 		return nil, ErrNotFound
 	}
 	var id, userID string
-	if err := s.db.QueryRowContext(ctx, `SELECT id, user_id FROM platform_tokens WHERE hash = ?`, HashToken(secret)).Scan(&id, &userID); err != nil {
+	if err := s.q().QueryRowContext(ctx, `SELECT id, user_id FROM platform_tokens WHERE hash = ?`, HashToken(secret)).Scan(&id, &userID); err != nil {
 		return nil, notFound(err)
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE platform_tokens SET last_used_at = ? WHERE id = ?`, now(), id); err != nil {
+	if _, err := s.exec(ctx, `UPDATE platform_tokens SET last_used_at = ? WHERE id = ?`, now(), id); err != nil {
 		return nil, err
 	}
 	return s.UserByID(ctx, userID)
@@ -50,7 +50,7 @@ func (s *Store) PlatformTokenUser(ctx context.Context, secret string) (*User, er
 
 // PlatformTokens lists a user's platform tokens.
 func (s *Store) PlatformTokens(ctx context.Context, userID string) ([]*PlatformToken, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, user_id, name, created_at, last_used_at FROM platform_tokens WHERE user_id = ? ORDER BY created_at`, userID)
+	rows, err := s.q().QueryContext(ctx, `SELECT id, user_id, name, created_at, last_used_at FROM platform_tokens WHERE user_id = ? ORDER BY created_at`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +70,7 @@ func (s *Store) PlatformTokens(ctx context.Context, userID string) ([]*PlatformT
 
 // RevokePlatformToken deletes one of a user's platform tokens.
 func (s *Store) RevokePlatformToken(ctx context.Context, userID, id string) error {
-	return one(s.db.ExecContext(ctx, `DELETE FROM platform_tokens WHERE id = ? AND user_id = ?`, id, userID))
+	return one(s.exec(ctx, `DELETE FROM platform_tokens WHERE id = ? AND user_id = ?`, id, userID))
 }
 
 // RefreshToken is a stored refresh token.
@@ -88,7 +88,7 @@ func (s *Store) CreateRefreshToken(ctx context.Context, rt RefreshToken, ttl tim
 		rt.Family = NewID()
 	}
 	secret := NewSecret()
-	_, err := s.db.ExecContext(ctx, `INSERT INTO refresh_tokens (hash, family, user_id, client_id, scope, expires_at) VALUES (?, ?, ?, ?, ?, ?)`,
+	_, err := s.exec(ctx, `INSERT INTO refresh_tokens (hash, family, user_id, client_id, scope, expires_at) VALUES (?, ?, ?, ?, ?, ?)`,
 		HashToken(secret), rt.Family, rt.UserID, rt.ClientID, rt.Scope, time.Now().Add(ttl).Unix())
 	return secret, err
 }
@@ -131,14 +131,14 @@ func (s *Store) UseRefreshToken(ctx context.Context, secret string) (*RefreshTok
 // RevokeRefreshToken deletes the whole family of a refresh token issued to
 // clientID. An unknown token, or another client's, is not an error.
 func (s *Store) RevokeRefreshToken(ctx context.Context, secret, clientID string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM refresh_tokens WHERE family IN (SELECT family FROM refresh_tokens WHERE hash = ? AND client_id = ?)`,
+	_, err := s.exec(ctx, `DELETE FROM refresh_tokens WHERE family IN (SELECT family FROM refresh_tokens WHERE hash = ? AND client_id = ?)`,
 		HashToken(secret), clientID)
 	return err
 }
 
 // RevokeUserRefreshTokens revokes every refresh token a user holds.
 func (s *Store) RevokeUserRefreshTokens(ctx context.Context, userID string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM refresh_tokens WHERE user_id = ?`, userID)
+	_, err := s.exec(ctx, `DELETE FROM refresh_tokens WHERE user_id = ?`, userID)
 	return err
 }
 
@@ -156,7 +156,7 @@ type SigningKey struct {
 
 // SigningKeys returns every signing key, newest first.
 func (s *Store) SigningKeys(ctx context.Context) ([]*SigningKey, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT kid, private_key, created_at, retired_at, max_exp FROM signing_keys ORDER BY created_at DESC, kid`)
+	rows, err := s.q().QueryContext(ctx, `SELECT kid, private_key, created_at, retired_at, max_exp FROM signing_keys ORDER BY created_at DESC, kid`)
 	if err != nil {
 		return nil, err
 	}
@@ -176,23 +176,23 @@ func (s *Store) SigningKeys(ctx context.Context) ([]*SigningKey, error) {
 
 // AddSigningKey stores a key.
 func (s *Store) AddSigningKey(ctx context.Context, k *SigningKey) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO signing_keys (kid, private_key, created_at, max_exp) VALUES (?, ?, ?, ?)`, k.KID, k.PrivateKey, k.CreatedAt.Unix(), k.MaxExp)
+	_, err := s.exec(ctx, `INSERT INTO signing_keys (kid, private_key, created_at, max_exp) VALUES (?, ?, ?, ?)`, k.KID, k.PrivateKey, k.CreatedAt.Unix(), k.MaxExp)
 	return err
 }
 
 // RetireSigningKey marks a key as no longer signing.
 func (s *Store) RetireSigningKey(ctx context.Context, kid string, at time.Time) error {
-	return one(s.db.ExecContext(ctx, `UPDATE signing_keys SET retired_at = ? WHERE kid = ?`, at.Unix(), kid))
+	return one(s.exec(ctx, `UPDATE signing_keys SET retired_at = ? WHERE kid = ?`, at.Unix(), kid))
 }
 
 // SetSigningKeyMaxExp records the latest expiry of the tokens a key signed.
 func (s *Store) SetSigningKeyMaxExp(ctx context.Context, kid string, maxExp int64) error {
-	return one(s.db.ExecContext(ctx, `UPDATE signing_keys SET max_exp = ? WHERE kid = ?`, maxExp, kid))
+	return one(s.exec(ctx, `UPDATE signing_keys SET max_exp = ? WHERE kid = ?`, maxExp, kid))
 }
 
 // DeleteSigningKey removes a key, which stops verifying what it signed.
 func (s *Store) DeleteSigningKey(ctx context.Context, kid string) error {
-	return one(s.db.ExecContext(ctx, `DELETE FROM signing_keys WHERE kid = ?`, kid))
+	return one(s.exec(ctx, `DELETE FROM signing_keys WHERE kid = ?`, kid))
 }
 
 // Client is an OIDC client.
@@ -217,7 +217,7 @@ func (s *Store) PutClient(ctx context.Context, c *Client) error {
 func (s *Store) Client(ctx context.Context, id string) (*Client, error) {
 	var c Client
 	var uris string
-	if err := s.db.QueryRowContext(ctx, `SELECT id, redirect_uris, public FROM oidc_clients WHERE id = ?`, id).Scan(&c.ID, &uris, &c.Public); err != nil {
+	if err := s.q().QueryRowContext(ctx, `SELECT id, redirect_uris, public FROM oidc_clients WHERE id = ?`, id).Scan(&c.ID, &uris, &c.Public); err != nil {
 		return nil, notFound(err)
 	}
 	if uris != "" {
@@ -239,7 +239,7 @@ type AuthCode struct {
 // CreateAuthCode stores a code and returns its secret.
 func (s *Store) CreateAuthCode(ctx context.Context, c AuthCode, ttl time.Duration) (string, error) {
 	secret := NewSecret()
-	_, err := s.db.ExecContext(ctx, `INSERT INTO auth_codes (hash, client_id, user_id, redirect_uri, challenge, scope, nonce, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+	_, err := s.exec(ctx, `INSERT INTO auth_codes (hash, client_id, user_id, redirect_uri, challenge, scope, nonce, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		HashToken(secret), c.ClientID, c.UserID, c.RedirectURI, c.Challenge, c.Scope, c.Nonce, time.Now().Add(ttl).Unix())
 	return secret, err
 }
@@ -288,11 +288,11 @@ type DeviceCode struct {
 // CreateDeviceCode stores a device authorization and returns the device
 // code's secret. userCode must be unique among pending ones.
 func (s *Store) CreateDeviceCode(ctx context.Context, userCode, clientID, scope string, ttl time.Duration) (string, error) {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM device_codes WHERE expires_at < ?`, now()); err != nil {
+	if _, err := s.exec(ctx, `DELETE FROM device_codes WHERE expires_at < ?`, now()); err != nil {
 		return "", err
 	}
 	secret := NewSecret()
-	_, err := s.db.ExecContext(ctx, `INSERT INTO device_codes (device_hash, user_code, client_id, scope, expires_at) VALUES (?, ?, ?, ?, ?)`,
+	_, err := s.exec(ctx, `INSERT INTO device_codes (device_hash, user_code, client_id, scope, expires_at) VALUES (?, ?, ?, ?, ?)`,
 		HashToken(secret), userCode, clientID, scope, time.Now().Add(ttl).Unix())
 	if isUnique(err) {
 		return "", ErrExists
@@ -304,7 +304,7 @@ func (s *Store) CreateDeviceCode(ctx context.Context, userCode, clientID, scope 
 func (s *Store) DeviceByUserCode(ctx context.Context, userCode string) (*DeviceCode, error) {
 	var d DeviceCode
 	var exp int64
-	if err := s.db.QueryRowContext(ctx, `SELECT user_code, client_id, scope, user_id, status, expires_at FROM device_codes WHERE user_code = ?`, userCode).
+	if err := s.q().QueryRowContext(ctx, `SELECT user_code, client_id, scope, user_id, status, expires_at FROM device_codes WHERE user_code = ?`, userCode).
 		Scan(&d.UserCode, &d.ClientID, &d.Scope, &d.UserID, &d.Status, &exp); err != nil {
 		return nil, notFound(err)
 	}
@@ -320,7 +320,7 @@ func (s *Store) DecideDevice(ctx context.Context, userCode, userID string, appro
 	if approve {
 		status = DeviceApproved
 	}
-	return one(s.db.ExecContext(ctx, `UPDATE device_codes SET status = ?, user_id = ? WHERE user_code = ? AND status = ? AND expires_at >= ?`,
+	return one(s.exec(ctx, `UPDATE device_codes SET status = ?, user_id = ? WHERE user_code = ? AND status = ? AND expires_at >= ?`,
 		status, userID, userCode, DevicePending, now()))
 }
 

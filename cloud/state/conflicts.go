@@ -66,7 +66,7 @@ func (s *Store) ResolveHeld(ctx context.Context) ([]Renamed, error) {
 			cols[i] = `"` + c + `"`
 		}
 		q := fmt.Sprintf(`INSERT INTO %s (%s) VALUES (%s)`, h.Table, strings.Join(cols, ", "), strings.TrimSuffix(strings.Repeat("?, ", len(cols)), ", "))
-		if _, err := s.db.ExecContext(ctx, q, args...); err != nil {
+		if _, err := s.exec(ctx, q, args...); err != nil {
 			return out, fmt.Errorf("state: rename held %s %s: %w", h.Table, id, err)
 		}
 		out = append(out, Renamed{Table: h.Table, ID: id, From: name, To: to})

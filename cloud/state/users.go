@@ -81,17 +81,17 @@ func (s *Store) CreateUser(ctx context.Context, email, name, passwordHash string
 
 // UserByID returns a user.
 func (s *Store) UserByID(ctx context.Context, id string) (*User, error) {
-	return scanUser(s.db.QueryRowContext(ctx, `SELECT `+userCols+` FROM users WHERE id = ?`, id))
+	return scanUser(s.q().QueryRowContext(ctx, `SELECT `+userCols+` FROM users WHERE id = ?`, id))
 }
 
 // UserByEmail returns a user.
 func (s *Store) UserByEmail(ctx context.Context, email string) (*User, error) {
-	return scanUser(s.db.QueryRowContext(ctx, `SELECT `+userCols+` FROM users WHERE email = ?`, NormalizeEmail(email)))
+	return scanUser(s.q().QueryRowContext(ctx, `SELECT `+userCols+` FROM users WHERE email = ?`, NormalizeEmail(email)))
 }
 
 // ListUsers returns every user.
 func (s *Store) ListUsers(ctx context.Context) ([]*User, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+userCols+` FROM users ORDER BY email`)
+	rows, err := s.q().QueryContext(ctx, `SELECT `+userCols+` FROM users ORDER BY email`)
 	if err != nil {
 		return nil, err
 	}
@@ -109,12 +109,12 @@ func (s *Store) ListUsers(ctx context.Context) ([]*User, error) {
 
 // UpdateUser writes name, admin and disabled.
 func (s *Store) UpdateUser(ctx context.Context, u *User) error {
-	return one(s.db.ExecContext(ctx, `UPDATE users SET name = ?, admin = ?, disabled = ? WHERE id = ?`, u.Name, u.Admin, u.Disabled, u.ID))
+	return one(s.exec(ctx, `UPDATE users SET name = ?, admin = ?, disabled = ? WHERE id = ?`, u.Name, u.Admin, u.Disabled, u.ID))
 }
 
 // SetPassword replaces a user's password hash.
 func (s *Store) SetPassword(ctx context.Context, id, hash string) error {
-	return one(s.db.ExecContext(ctx, `UPDATE users SET password_hash = ? WHERE id = ?`, hash, id))
+	return one(s.exec(ctx, `UPDATE users SET password_hash = ? WHERE id = ?`, hash, id))
 }
 
 // DeleteUser removes a user with its memberships and tokens. Orgs it owned

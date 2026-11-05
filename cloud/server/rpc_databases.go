@@ -138,7 +138,7 @@ func (s databaseService) Create(ctx context.Context, req *connect.Request[v1.Cre
 		}
 	}
 	d := &state.Database{ID: state.NewID(), OrgID: o.ID, Name: m.Name, GroupID: g.ID, SchemaOnly: m.SchemaOnly, Type: typ}
-	if typ == state.TypeCRDT && !s.placedHere(ctx, d) {
+	if s.cl != nil && !s.placedHere(ctx, d) {
 		switch {
 		case m.GetUpload() != "":
 			return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("upload into a crdt database on a node of its group: %w", s.notHere(ctx, d)))
@@ -177,8 +177,8 @@ func (s databaseService) Create(ctx context.Context, req *connect.Request[v1.Cre
 	default:
 		err = createEmpty(path)
 	}
-	if err == nil && typ == state.TypeCRDT {
-		err = checkCRDT(ctx, path)
+	if err == nil && s.cl != nil {
+		err = s.checkReplicable(ctx, d, path)
 	}
 	if err != nil {
 		s.removeFiles(d)
@@ -187,8 +187,8 @@ func (s databaseService) Create(ctx context.Context, req *connect.Request[v1.Cre
 	if err := s.host(ctx, d); err != nil {
 		return nil, err
 	}
-	if typ == state.TypeCRDT {
-		if err := s.openCRDT(ctx, d); err != nil {
+	if s.cl != nil {
+		if err := s.openReplicated(ctx, d); err != nil {
 			s.log.Printf("open %s: %v", d.ID, err)
 		}
 	}
@@ -478,7 +478,7 @@ func (s *Server) exportFile(ctx context.Context, d *state.Database, format v1.Fi
 	// VACUUM INTO takes a consistent copy while the database stays live. A
 	// crdt database's is a plain copy: replication's bookkeeping stays behind.
 	snap := filepath.Join(tmp, "db.musq")
-	if d.Type == state.TypeCRDT {
+	if s.cl != nil {
 		err = replication.PlainCopy(ctx, s.dbPath(d), snap)
 	} else {
 		var db *sql.DB

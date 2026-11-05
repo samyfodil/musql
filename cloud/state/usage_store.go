@@ -76,7 +76,7 @@ func (s *Store) AddUsage(ctx context.Context, hours []*UsageHour, queries []*Que
 // UsageHours lists the hours in [from, to) of one database, or of every
 // database of an org when dbID is empty, by hour: every node's counts summed.
 func (s *Store) UsageHours(ctx context.Context, orgID, dbID string, from, to time.Time) ([]*UsageHour, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT db_id, org_id, hour, statements, rows_read, rows_written, errors, bytes_stored, latency
+	rows, err := s.q().QueryContext(ctx, `SELECT db_id, org_id, hour, statements, rows_read, rows_written, errors, bytes_stored, latency
 		FROM usage_hours WHERE org_id = ?1 AND (?2 = '' OR db_id = ?2) AND hour >= ?3 AND hour < ?4
 		UNION ALL SELECT db_id, org_id, hour, statements, rows_read, rows_written, errors, bytes_stored, latency
 		FROM node_usage_hours WHERE org_id = ?1 AND (?2 = '' OR db_id = ?2) AND hour >= ?3 AND hour < ?4
@@ -115,7 +115,7 @@ func (s *Store) UsageHours(ctx context.Context, orgID, dbID string, from, to tim
 
 // TopQueries is a database's statements in [from, to), most total time first.
 func (s *Store) TopQueries(ctx context.Context, dbID string, from, to time.Time, limit int) ([]*QueryUsage, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT sql, sum(count), sum(total_us), sum(rows_read), sum(rows_written)
+	rows, err := s.q().QueryContext(ctx, `SELECT sql, sum(count), sum(total_us), sum(rows_read), sum(rows_written)
 		FROM (SELECT sql, count, total_us, rows_read, rows_written FROM usage_queries WHERE db_id = ?1 AND hour >= ?2 AND hour < ?3
 			UNION ALL SELECT sql, count, total_us, rows_read, rows_written FROM node_usage_queries WHERE db_id = ?1 AND hour >= ?2 AND hour < ?3)
 		GROUP BY sql ORDER BY sum(total_us) DESC, sql LIMIT ?4`,

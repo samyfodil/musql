@@ -12,18 +12,15 @@ import (
 	"github.com/samyfodil/musql/cloud/state"
 )
 
-// TestTypesAndCopies: a raft database reads back as raft, a crdt database not
-// placed here has no local copy, and a file holding what replication refuses
-// cannot become a crdt database.
+// TestTypesAndCopies: a raft database reads back as raft, and a file
+// holding what replication refuses cannot become a cluster database of
+// either kind.
 func TestTypesAndCopies(t *testing.T) {
 	if typeToProto(state.TypeRaft) != v1.DatabaseType_DATABASE_TYPE_RAFT {
 		t.Error("a raft database reads back as another type")
 	}
 	e := newEnv(t, "")
 	ctx := context.Background()
-	if err := e.s.localCopy(ctx, &state.Database{ID: "x", Type: state.TypeCRDT}); code(err) != connect.CodeFailedPrecondition {
-		t.Errorf("a crdt database placed elsewhere: %v", err)
-	}
 	path := filepath.Join(t.TempDir(), "trig.musq")
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -35,7 +32,9 @@ func TestTypesAndCopies(t *testing.T) {
 		}
 	}
 	db.Close()
-	if err := checkCRDT(ctx, path); code(err) != connect.CodeInvalidArgument {
-		t.Errorf("a file with a trigger as a crdt database: %v", err)
+	for _, typ := range []string{state.TypeCRDT, state.TypePlain} {
+		if err := e.s.checkReplicable(ctx, &state.Database{Type: typ}, path); code(err) != connect.CodeInvalidArgument {
+			t.Errorf("a file with a trigger as a %s cluster database: %v", typ, err)
+		}
 	}
 }

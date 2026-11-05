@@ -11,6 +11,7 @@ import (
 	"connectrpc.com/connect"
 
 	v1 "github.com/samyfodil/musql/cloud/gen/cloud/v1"
+	"github.com/samyfodil/musql/cloud/gen/cloud/v1/cloudv1connect"
 	"github.com/samyfodil/musql/cloud/state"
 	"github.com/samyfodil/musql/cloud/store"
 )
@@ -92,9 +93,15 @@ func (s databaseService) Restore(ctx context.Context, req *connect.Request[v1.Re
 		if m.NewName != "" {
 			return nil, invalid("in_place and new_name exclude each other")
 		}
+		if base, err := s.masterURL(ctx, d); err != nil || base != "" {
+			if err != nil {
+				return nil, err
+			}
+			return forward(ctx, req, cloudv1connect.NewDatabaseServiceClient(s.cl.client, base).Restore)
+		}
 		restore := s.restoreInPlace
-		if d.Type == state.TypeCRDT {
-			restore = s.restoreCRDTInPlace
+		if s.cl != nil {
+			restore = s.restoreReplicatedInPlace
 		}
 		if err := restore(ctx, d, at); err != nil {
 			return nil, restoreErr(err)
@@ -116,8 +123,8 @@ func (s databaseService) Restore(ctx context.Context, req *connect.Request[v1.Re
 		return nil, rpcErr(err)
 	}
 	err = restoreErr(s.copyAt(ctx, d, at, false, s.dbPath(nd)))
-	if err == nil && nd.Type == state.TypeCRDT {
-		err = checkCRDT(ctx, s.dbPath(nd))
+	if err == nil && s.cl != nil {
+		err = s.checkReplicable(ctx, nd, s.dbPath(nd))
 	}
 	if err != nil {
 		s.removeFiles(nd)
@@ -126,8 +133,8 @@ func (s databaseService) Restore(ctx context.Context, req *connect.Request[v1.Re
 	if err := s.host(ctx, nd); err != nil {
 		return nil, err
 	}
-	if nd.Type == state.TypeCRDT {
-		if err := s.openCRDT(ctx, nd); err != nil {
+	if s.cl != nil {
+		if err := s.openReplicated(ctx, nd); err != nil {
 			s.log.Printf("open %s: %v", nd.ID, err)
 		}
 	}
