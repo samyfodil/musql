@@ -109,7 +109,10 @@ The server is its own issuer at `public_url`:
   INTO for anyone, and a read-only one runs with `query_only` locked on.
   Hrana requests carry a database token (or a user access token with a
   role that allows it), checked by `hrana.WithAuth` on every HTTP request
-  and in the WebSocket hello.
+  and in the WebSocket hello. A bad token, or a record that is not there,
+  answers 401; a check the state could not answer (its master out of reach,
+  as around an election) answers 503, and an RPC `Unavailable`, so a client
+  retries rather than taking a good token for a bad one.
 - **Platform token** (API token): for CI and the CLI without a browser; acts
   as the user who created it, revocable.
 

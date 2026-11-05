@@ -115,7 +115,7 @@ func (s *Server) serveWS(w http.ResponseWriter, r *http.Request) {
 	if s.auth != nil && r.Header.Get("Authorization") != "" {
 		ro, status := s.authorize(bearer(r))
 		if status != 0 {
-			http.Error(w, `{"message":"unauthorized"}`, status)
+			refuse(w, status)
 			return
 		}
 		upgradeAuthed, upgradeRO = true, ro
@@ -178,6 +178,13 @@ func (wc *wsConn) dispatch(msg *pbws.ClientMsg) bool {
 		// keeps it, a token in the hello replaces it.
 		if wc.srv.auth != nil && (jwt != "" || !wc.authed) {
 			ro, status = wc.srv.authorize(jwt)
+		}
+		if status == http.StatusServiceUnavailable {
+			wc.mu.Unlock()
+			wc.send(&pbws.ServerMsg{Msg: &pbws.ServerMsg_HelloError{HelloError: &pbws.HelloErrorMsg{
+				Error: &pb.Error{Message: "the token cannot be checked now; try again", Code: ptr("UNAVAILABLE")}}}})
+			wc.c.Close(websocket.StatusTryAgainLater, "the token cannot be checked now")
+			return false
 		}
 		if status != 0 || wc.srv.authToken != "" && subtle.ConstantTimeCompare([]byte(jwt), []byte(wc.srv.authToken)) != 1 {
 			wc.mu.Unlock()

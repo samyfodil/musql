@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -40,6 +41,8 @@ func authServer(t *testing.T) string {
 			return false, nil
 		case "ro":
 			return true, nil
+		case "busy":
+			return false, fmt.Errorf("%w: the records are out of reach", ErrUnavailable)
 		}
 		return false, errors.New("bad token")
 	}))
@@ -191,5 +194,41 @@ func TestAuthHookNeedsReadOnlyDB(t *testing.T) {
 	r, err := wsSession(t, hs.URL, nil, `{"type":"hello","jwt":"x"}`)
 	if err != nil || !strings.Contains(r[0], "hello_error") {
 		t.Fatalf("hello: %v %v", r, err)
+	}
+}
+
+// TestAuthHookUnavailable: a check that cannot decide refuses the client as
+// one to retry, not as unauthorized: HTTP 503, a WebSocket upgrade refused
+// the same way, and a hello error coded UNAVAILABLE. A Multi refuses it so
+// before it opens anything.
+func TestAuthHookUnavailable(t *testing.T) {
+	url := authServer(t)
+	if status, out := post(t, url, "busy", exec1("SELECT 1")); status != http.StatusServiceUnavailable || !strings.Contains(out, "try again") {
+		t.Fatalf("HTTP: %d %s", status, out)
+	}
+	r, err := wsSession(t, url, nil, `{"type":"hello","jwt":"busy"}`)
+	if err != nil || !strings.Contains(r[0], "hello_error") || !strings.Contains(r[0], "UNAVAILABLE") {
+		t.Fatalf("hello: %v %v", r, err)
+	}
+	_, resp, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(url, "http"), &websocket.DialOptions{
+		Subprotocols: []string{"hrana3"}, HTTPHeader: http.Header{"Authorization": {"Bearer busy"}}})
+	if err == nil || resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("upgrade: %v %v", resp, err)
+	}
+
+	m := NewMulti(t.TempDir(), true, WithAuth(func(string) (bool, error) { return false, ErrUnavailable }))
+	defer m.Close()
+	hs := httptest.NewServer(m)
+	defer hs.Close()
+	req, _ := http.NewRequest(http.MethodPost, hs.URL+"/v2/pipeline", strings.NewReader(exec1("SELECT 1")))
+	req.Host = "db.example"
+	req.Header.Set("Authorization", "Bearer any")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("Multi: %d", res.StatusCode)
 	}
 }

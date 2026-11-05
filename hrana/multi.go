@@ -79,6 +79,10 @@ func (m *Multi) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	authed := m.authToken == "" || bearerOK(r, m.authToken)
 	if authed && m.auth != nil {
 		_, status := m.authorize(bearer(r))
+		if status == http.StatusServiceUnavailable {
+			refuse(w, status)
+			return
+		}
 		authed = status == 0
 	}
 	if !authed && !isWebSocket(r) {

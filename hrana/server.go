@@ -69,11 +69,17 @@ func WithAuthToken(token string) Option { return func(c *config) { c.authToken =
 // WithAuth checks every token a client presents: the bearer token of an HTTP
 // request, and for a WebSocket the bearer token of its upgrade request when
 // it has one, else the token in its hello message. A non-nil error refuses
-// the client. A read-only client runs on the database given by
-// WithReadOnlyDB, and is refused when there is none.
+// the client: as unauthorized, or, when it wraps ErrUnavailable, as a check
+// that could not be made now, which the client may retry (HTTP 503). A
+// read-only client runs on the database given by WithReadOnlyDB, and is
+// refused when there is none.
 func WithAuth(check func(token string) (readOnly bool, err error)) Option {
 	return func(c *config) { c.auth = check }
 }
+
+// ErrUnavailable is a WithAuth check that could not decide, such as one whose
+// records are out of reach for a moment.
+var ErrUnavailable = errors.New("hrana: the token cannot be checked now")
 
 // WithReadOnlyDB sets the database that clients WithAuth marks read-only run
 // on. Confining it is the caller's job.
@@ -96,12 +102,23 @@ func (c *config) authorize(token string) (readOnly bool, status int) {
 	}
 	ro, err := c.auth(token)
 	switch {
+	case errors.Is(err, ErrUnavailable):
+		return false, http.StatusServiceUnavailable
 	case err != nil:
 		return false, http.StatusUnauthorized
 	case ro && c.roDB == nil:
 		return false, http.StatusForbidden
 	}
 	return ro, 0
+}
+
+// refuse answers a request authorize did not pass.
+func refuse(w http.ResponseWriter, status int) {
+	msg := `{"message":"unauthorized"}`
+	if status == http.StatusServiceUnavailable {
+		msg = `{"message":"the token cannot be checked now; try again"}`
+	}
+	http.Error(w, msg, status)
 }
 
 // dbFor is the database a client runs on.
@@ -176,7 +193,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	ro, status := s.authorize(bearer(r))
 	if status != 0 {
-		http.Error(w, `{"message":"unauthorized"}`, status)
+		refuse(w, status)
 		return
 	}
 	path := strings.Trim(r.URL.Path, "/")

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -32,8 +33,11 @@ func (s *Server) userFromToken(ctx context.Context, tok string) (*state.User, er
 	}
 	if strings.HasPrefix(tok, state.PlatformTokenPrefix) {
 		u, err := s.store.PlatformTokenUser(ctx, tok)
-		if err != nil {
+		switch {
+		case errors.Is(err, state.ErrNotFound):
 			return nil, oidc.ErrInvalidToken
+		case err != nil:
+			return nil, err
 		}
 		if u.Disabled {
 			return nil, oidc.ErrInvalidToken
@@ -46,8 +50,13 @@ func (s *Server) userFromToken(ctx context.Context, tok string) (*state.User, er
 // caller is the signed-in user making an RPC.
 func (s *Server) caller(ctx context.Context, h http.Header) (*state.User, error) {
 	u, err := s.userFromToken(ctx, bearer(h))
-	if err != nil {
+	switch {
+	case errors.Is(err, oidc.ErrInvalidToken):
 		return nil, errUnauthenticated
+	case err != nil:
+		// The state is out of reach, as around a master's election: the
+		// token may well be good.
+		return nil, connect.NewError(connect.CodeUnavailable, fmt.Errorf("checking the token: %w", err))
 	}
 	return u, nil
 }
