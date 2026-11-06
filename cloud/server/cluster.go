@@ -54,6 +54,9 @@ type clusterSide struct {
 	importFrom string
 	// stateDB is the state's replicated handle, once open.
 	stateDB atomic.Pointer[sql.DB]
+	// stateSyncing is a state made on this node that has not finished a sync
+	// with a peer yet (state.musq.syncing): its copy is not one to answer from.
+	stateSyncing atomic.Bool
 }
 
 type replDB struct {
@@ -125,6 +128,14 @@ func (s *Server) openState(ctx context.Context) (*state.Store, error) {
 			}
 		}
 	}
+	// A state made here now holds nothing until its first sync: until then,
+	// with no master to ask, it answers nothing rather than "not found". The
+	// mark is a file, so a restart in between keeps it.
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		if err := os.WriteFile(path+syncingSuffix, nil, 0o600); err != nil {
+			return nil, err
+		}
+	}
 	key, err := cluster.LoadKey(filepath.Join(s.cfg.DataDir, "node.key"))
 	if err != nil {
 		return nil, fmt.Errorf("node key: %w", err)
@@ -138,6 +149,9 @@ func (s *Server) openState(ctx context.Context) (*state.Store, error) {
 		return nil, err
 	}
 	s.cl = &clusterSide{node: n, client: n.HTTPClient(), dbs: map[string]*replDB{}, groups: map[string]*cluster.Election{}}
+	if _, err := os.Stat(path + syncingSuffix); err == nil {
+		s.cl.stateSyncing.Store(true)
+	}
 	fail := func(err error) (*state.Store, error) {
 		if s.cl.state != nil {
 			s.cl.state.Close()
@@ -177,7 +191,7 @@ func (s *Server) openState(ctx context.Context) (*state.Store, error) {
 			return "", state.ErrNoMaster
 		}
 		return cluster.PeerURL(id) + "/state/v3-protobuf/pipeline", nil
-	}}
+	}, Local: func() bool { return !s.cl.stateSyncing.Load() }}
 	st, err := state.OpenReplicated(db, s.cfg.Node.Name, m)
 	if err != nil {
 		db.Close()
@@ -564,8 +578,16 @@ func (s *Server) openReplicated(ctx context.Context, d *state.Database) error {
 }
 
 // replSynced serves the databases whose first sync has completed since the
-// last pass.
+// last pass, and lets the state answer from this node's copy once it has.
 func (s *Server) replSynced() {
+	if db := s.cl.stateDB.Load(); s.cl.stateSyncing.Load() && db != nil && replication.Synced(db) {
+		path := filepath.Join(s.cfg.DataDir, "state.musq") + syncingSuffix
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			s.log.Printf("state synced: %v", err)
+		} else {
+			s.cl.stateSyncing.Store(false)
+		}
+	}
 	s.cl.mu.Lock()
 	defer s.cl.mu.Unlock()
 	for id, c := range s.cl.dbs {

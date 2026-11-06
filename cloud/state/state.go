@@ -139,13 +139,15 @@ func derivedID(parts ...string) string {
 
 // q is the handle a call runs on: this node's state, or the master's on a
 // cluster follower, so a request that writes and then reads sees its write.
-// With no master to reach, this node's copy still answers reads; a write
-// there fails as not the writer, which tx waits out.
+// With no master to reach, this node's copy still answers reads, once it has
+// synced with a peer (Master.Local): before, the call goes to the master and
+// fails with ErrNoMaster. A write on this copy fails as not the writer; tx
+// waits either out.
 func (s *Store) q() *sql.DB {
 	if s.master == nil || s.master.Here() {
 		return s.db
 	}
-	if _, err := s.master.URL(); err != nil {
+	if _, err := s.master.URL(); err != nil && s.master.local() {
 		return s.db
 	}
 	return s.remote

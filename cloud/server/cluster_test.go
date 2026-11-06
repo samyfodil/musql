@@ -157,9 +157,12 @@ func (c *clusterNode) start() {
 func (c *clusterNode) ready() {
 	c.t.Helper()
 	s := c.s
+	// The admin, read through the master, and this node's own copy of the
+	// state synced: a test that stops the master may only count on what
+	// reached the others.
 	eventually(c.t, "the admin on "+c.cfg.Node.Name, func() bool {
 		_, err := s.Store().UserByEmail(context.Background(), "admin@example.com")
-		return err == nil
+		return err == nil && (s.cl == nil || !s.cl.stateSyncing.Load())
 	})
 	c.admin = c.tokenFor("admin@example.com")
 }
