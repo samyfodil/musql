@@ -125,3 +125,51 @@ func TestAbsKernelMatchesTheLoop(t *testing.T) {
 		}
 	}
 }
+
+// TestShiftKernelMatchesTheLoop: "<<" and ">>" lowered to POpShl and POpShr
+// answer as OP_ShiftLeft and OP_ShiftRight do for an amount in 0..63 -- bits
+// shifted out of the top lost, a right shift keeping the sign -- and decline
+// to the loop for any other amount: a negative one shifts the other way, and
+// 64 or past leaves 0 or -1.
+func TestShiftKernelMatchesTheLoop(t *testing.T) {
+	stmts := []string{`CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER, s INTEGER, n INTEGER)`}
+	rng := rand.New(rand.NewSource(23))
+	edges := []string{"-9223372036854775808", "9223372036854775807", "-1", "0", "1"}
+	for i := 1; i <= 1500; i++ {
+		v := fmt.Sprint(rng.Intn(2_000_001) - 1_000_000)
+		if i%13 == 0 {
+			v = edges[i%len(edges)]
+		}
+		s := fmt.Sprint(i % 64)                          // always in range
+		n := []string{"-3", "64", "70", "-64", "5"}[i%5] // mostly out of range
+		stmts = append(stmts, fmt.Sprintf(`INSERT INTO t VALUES(%d, %s, %s, %s)`, i, v, s, n))
+	}
+	p := newSegPair(t, stmts...)
+	for _, c := range []struct {
+		sql    string
+		served bool
+	}{
+		{`SELECT count(*) FROM t WHERE (v << 3) > 1000`, true},
+		{`SELECT sum((v >> 4) & 255) FROM t`, true},
+		{`SELECT count(*) FROM t WHERE (v << s) < 0`, true},
+		{`SELECT min(v >> s), max(v >> s) FROM t`, true},
+		{`SELECT count(*), sum((((v & 65535) * 7 + id) & 1023) | (s << 6)) FROM t WHERE (v & 1023) > (s << 4)`, true},
+		{`SELECT count(*) FROM t WHERE (v << n) = 0`, false}, // out-of-range amounts: declined
+		{`SELECT sum(v >> n) FROM t`, false},
+	} {
+		_, want, werr := p.plain(c.sql)
+		ResetSegFilterCountersForTest()
+		_, got, gerr := p.fast(c.sql)
+		served, _ := SegFilterCountersForTest()
+		if (werr == nil) != (gerr == nil) {
+			t.Errorf("%s: kernel error %v, loop error %v", c.sql, gerr, werr)
+			continue
+		}
+		if g, w := fmt.Sprint(typedRows(got)), fmt.Sprint(typedRows(want)); g != w {
+			t.Errorf("%s:\n kernel %.200s\n loop   %.200s", c.sql, g, w)
+		}
+		if JITEnabled() && c.served && served == 0 {
+			t.Errorf("%s: not served by a kernel", c.sql)
+		}
+	}
+}

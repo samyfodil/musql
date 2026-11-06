@@ -46,6 +46,9 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		if (in.Op == POpLoadCol || in.Op == POpTextLen || in.Op == POpTextMatch || in.BCol) && (in.B < 0 || in.B >= nCols) {
 			return nil, fmt.Errorf("jit: column %d out of range", in.B)
 		}
+		if in.CCol && (in.C < 0 || in.C >= nCols) {
+			return nil, fmt.Errorf("jit: column %d out of range", in.C)
+		}
 		switch in.Op {
 		case POpJump, POpJumpIfZero, POpJumpIfNotZero, POpCmpJump:
 			if in.A != ProgNextRow && in.A <= i {
@@ -129,6 +132,16 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		}
 		w.Get(regs)
 		w.LoadI64(reg(r))
+	}
+	// loadCol pushes column c's value at the row.
+	loadCol := func(c int) {
+		w.Get(colEnd[c])
+		w.Get(idx)
+		w.op(opI32WrapI64)
+		w.I32(3)
+		w.op(opI32Shl)
+		w.op(opI32Add)
+		w.LoadI64(0)
 	}
 	// storeReg stores the i64 that pushVal pushes into r[r].
 	storeReg := func(r int, pushVal func()) {
@@ -344,11 +357,50 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 				w.op(opSelect) // t1 < 0 ? -t1 : t1
 			})
 		case POpAdd, POpSub, POpMul:
+			if in.BCol {
+				loadCol(in.B)
+			} else {
+				loadReg(in.B)
+			}
+			w.Set(t1)
+			if in.CCol {
+				loadCol(in.C)
+			} else {
+				loadReg(in.C)
+			}
+			w.Set(t2)
+			emitCheckedArith(w, in.Op, t1, t2, t3, ovf)
+			storeReg(in.A, func() { w.Get(t3) })
+		case POpRemK:
+			// A constant divisor from 2: rem_s cannot trap, and the engine
+			// compiling the module divides by it as it sees fit.
+			loadReg(in.B)
+			w.I64(in.Imm)
+			w.op(opI64RemS)
+			w.Set(t3)
+			storeReg(in.A, func() { w.Get(t3) })
+		case POpShl, POpShr:
+			// Wasm takes the amount mod 64; one outside 0..63 is flagged
+			// instead (unsigned: a negative one is huge).
 			loadReg(in.B)
 			w.Set(t1)
 			loadReg(in.C)
 			w.Set(t2)
-			emitCheckedArith(w, in.Op, t1, t2, t3, ovf)
+			w.Get(ovf)
+			w.Get(t2)
+			w.I64(63)
+			w.op(opI64GtU)
+			w.op(opI64ExtendI32U)
+			w.op(opI64Or)
+			w.Set(ovf)
+			w.Get(t1)
+			w.Get(t2)
+			if in.Op == POpShl {
+				w.op(opI64Shl)
+			} else {
+				w.op(opI64ShrS)
+			}
+			w.Set(t3)
 			storeReg(in.A, func() { w.Get(t3) })
 		case POpAccCount:
 			w.Get(acc)

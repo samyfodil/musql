@@ -289,16 +289,10 @@ func (a *Asm) OrRegReg(dst, src Reg) {
 	a.emit(0x09, modrm(0b11, src, dst))
 }
 
-// AddRegRegOverflow is  dst += src, recording signed overflow into flag.
-//
-// SQLite switches sum() to floating point when an integer sum overflows, and
-// this cannot, so the caller has to know it happened. SETO reads exactly the
-// flag ADD sets for a signed carry, and OR-ing it into a sticky register keeps
-// the answer for the whole loop without a branch in the hot path.
-func (a *Asm) AddRegRegOverflow(dst, src, flag Reg) {
-	a.AddRegReg(dst, src)
-	a.Setcc(condOverflow, R11)
-	a.OrRegReg(flag, R11)
+// XchgRegReg swaps dst and src.
+func (a *Asm) XchgRegReg(dst, src Reg) {
+	a.rex(src, dst)
+	a.emit(0x87, modrm(0b11, src, dst))
 }
 
 func (a *Asm) emit32(v uint32) {

@@ -292,6 +292,19 @@ const (
 	// POpEmitRow appends the row index: the program hands back the values it
 	// computed, for the caller to finish -- a DISTINCT aggregate's dedup.
 	POpEmitVal
+
+	// POpShl / POpShr: r[A] = r[B] shifted left / right, arithmetically, by
+	// r[C], for an amount in 0..63. Any other amount -- a negative one shifts
+	// the other way, 64 and past leave 0 or -1 (vdbe.c's OP_ShiftLeft) -- is
+	// flagged like an overflow, and the caller declines for the VDBE to answer.
+	POpShl
+	POpShr
+	// POpRemK: r[A] = r[B] % Imm, for Imm from 2 to MaxInt32: the absolute
+	// value of a constant divisor (C's % takes the dividend's sign, so a % -d
+	// is a % d). Fusion makes it of a POpRem whose divisor a POpSetConst of
+	// the same straight run set, and the emitters multiply by Imm's magic
+	// number (sdivMagic) in place of a division.
+	POpRemK
 )
 
 // ProgNullDeclines is POpFCmp's Imm for a comparison whose NULL the program
@@ -317,9 +330,10 @@ type ProgInsn struct {
 	Pat  []byte
 	Mode TextMode
 	Fold bool
-	// BCol is POpCmpSkip's and POpCmpJump's: B is a column slot, read at the
-	// current row, rather than a register.
-	BCol bool
+	// BCol is POpCmpSkip's, POpCmpJump's, POpAdd's, POpSub's and POpMul's: B
+	// is a column slot, read at the current row, rather than a register. CCol
+	// is the same for C, on the arithmetic steps.
+	BCol, CCol bool
 	// Imm is POpFCmp's NULL answer and POpMath's service.
 	Imm int64
 	// Kernel is POpMath's function.

@@ -114,7 +114,7 @@ func segLowerRegOperands(in Instruction) [3]int {
 		return [3]int{in.P1, -1, -1}
 	case OpNot, OpSCopy, OpNegative: // P1 source, P2 destination
 		return [3]int{in.P1, in.P2, -1}
-	case OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpBitAnd, OpBitOr: // r[P3] = r[P2] op r[P1]
+	case OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight: // r[P3] = r[P2] op r[P1]
 		return [3]int{in.P1, in.P2, in.P3}
 	case OpNull: // P1 destination
 		return [3]int{in.P1, -1, -1}
@@ -164,7 +164,7 @@ func segNullTestedOnly(body []Instruction) map[int]bool {
 		case OpInteger, OpVariable, OpNot, OpSCopy, OpNegative, OpNull, OpReal:
 			writes[in.P2]++
 			reads[in.P2]--
-		case OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpBitAnd, OpBitOr:
+		case OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight:
 			writes[in.P3]++
 			reads[in.P3]--
 		case OpFunction:
@@ -547,6 +547,15 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 			}
 			note(in.P3)
 			out.add(jit.ProgInsn{Op: pop, A: in.P3, B: in.P2, C: in.P1})
+		case OpShiftLeft, OpShiftRight:
+			// The same operand order: r[P2] shifted by r[P1]. An amount
+			// outside 0..63 the VDBE answers.
+			pop := jit.POpShl
+			if in.Op == OpShiftRight {
+				pop = jit.POpShr
+			}
+			note(in.P3)
+			out.add(jit.ProgInsn{Op: pop, A: in.P3, B: in.P2, C: in.P1})
 		case OpFunction:
 			// The builtin abs() of one argument, which over an int64 is |x|;
 			// abs(MinInt64) is SQLite's overflow error, which POpAbs flags so
@@ -805,6 +814,7 @@ func segLoweredReachable(insns []jit.ProgInsn) []bool {
 			known[in.A] = int64(in.B)
 		case jit.POpLoadCol, jit.POpLoadReg, jit.POpCmp, jit.POpAnd, jit.POpOr,
 			jit.POpNot, jit.POpAdd, jit.POpSub, jit.POpMul, jit.POpRem, jit.POpAbs,
+			jit.POpShl, jit.POpShr,
 			jit.POpI2F, jit.POpF2I, jit.POpFAdd, jit.POpFSub, jit.POpFMul, jit.POpFDiv, jit.POpFCmp,
 			jit.POpFIsNull, jit.POpFAbs, jit.POpMath:
 			if _, ok := known[in.A]; ok {

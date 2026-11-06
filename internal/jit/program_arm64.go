@@ -5,6 +5,7 @@ package jit
 import (
 	"fmt"
 	"math"
+	"math/bits"
 )
 
 // EmitProgram compiles an instruction list into a native row loop (arm64 version).
@@ -16,6 +17,9 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	for _, in := range insns {
 		if (in.Op == POpLoadCol || in.Op == POpTextLen || in.Op == POpTextMatch || in.BCol) && (in.B < 0 || in.B >= nCols) {
 			return nil, fmt.Errorf("jit: column %d out of range", in.B)
+		}
+		if in.CCol && (in.C < 0 || in.C >= nCols) {
+			return nil, fmt.Errorf("jit: column %d out of range", in.C)
 		}
 	}
 	colReg := [MaxProgCols]Reg64{X5, X6, X7, X8}
@@ -289,7 +293,18 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.B("fin")
 			a.Label(svcLabel(in.A))
 		case POpAdd, POpSub, POpMul:
-			x, y, d := val(in.B, X9), val(in.C, X10), dst(in.A, X9)
+			x, y := X9, X10
+			if in.BCol {
+				a.LdrRegIdx(X9, colReg[in.B], X2)
+			} else {
+				x = val(in.B, X9)
+			}
+			if in.CCol {
+				a.LdrRegIdx(X10, colReg[in.C], X2)
+			} else {
+				y = val(in.C, X10)
+			}
+			d := dst(in.A, X9)
 			switch in.Op {
 			case POpAdd:
 				a.AddsReg(d, x, y)
@@ -309,6 +324,47 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			}
 			a.CsetOverflow(X10)
 			a.OrrReg(X4, X4, X10)
+			fin(in.A, d)
+		case POpRemK:
+			// SMULH by Imm's magic number and shifts for the truncated
+			// quotient (vm_div_arm64.go's divConst), then MSUB.
+			d := in.Imm
+			n := val(in.B, X9)
+			if d&(d-1) == 0 {
+				k := uint32(bits.TrailingZeros64(uint64(d)))
+				a.AsrImm(X10, n, 63)
+				a.LsrImm(X10, X10, 64-k)
+				a.AddReg(X10, X10, n)
+				a.AsrImm(X10, X10, k)
+			} else {
+				m, s := sdivMagic(d)
+				a.MovImm64(X11, m)
+				a.Smulh(X10, n, X11)
+				if m < 0 {
+					a.AddReg(X10, X10, n)
+				}
+				if s > 0 {
+					a.AsrImm(X10, X10, uint32(s))
+				}
+				a.LsrImm(X11, n, 63)
+				a.AddReg(X10, X10, X11)
+			}
+			a.MovImm64(X11, d)
+			r := dst(in.A, X9)
+			a.Msub(r, X10, X11, n)
+			fin(in.A, r)
+		case POpShl, POpShr:
+			// LSLV and ASRV take the amount mod 64; one outside 0..63 is
+			// flagged instead (unsigned HI: a negative one is huge).
+			x, y, d := val(in.B, X9), val(in.C, X10), dst(in.A, X9)
+			a.CmpImm(y, 63)
+			a.CsetRaw(X11, armHI)
+			a.OrrReg(X4, X4, X11)
+			if in.Op == POpShl {
+				a.Lslv(d, x, y)
+			} else {
+				a.Asrv(d, x, y)
+			}
 			fin(in.A, d)
 		case POpAccCount:
 			a.AddImm(X3, X3, 1)
