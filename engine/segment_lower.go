@@ -39,6 +39,9 @@ type segLowered struct {
 	// program, each in registers of its own (segProgSource.lower), and agg is
 	// not used.
 	multi []segAccSlot
+	// zone says the program is one segZoneExtreme answers from a segment's
+	// zone map (zoneShaped), found as it is lowered.
+	zone bool
 	// blocks are the service blocks the body stops for (segment_service.go),
 	// indexed by POpService's A; none when the whole body is native.
 	blocks []segSvcBlock

@@ -106,19 +106,15 @@ func (m *vdbe) segRunProgramAll(p *ReadOnlyPager, tbl *resolvedTable, plan *segP
 			return nil, false
 		}
 	}
-	if one != nil {
-		if vs, ok := m.segRun(p, tbl, rootPage, one, ipkCol); ok {
-			segOnePassRuns.Add(1)
-			return vs, true
-		}
-	}
 	out := make([]Value, len(lows))
+	if one != nil && m.segRun(p, tbl, rootPage, one, ipkCol, out) {
+		segOnePassRuns.Add(1)
+		return out, true
+	}
 	for i, low := range lows {
-		vs, ok := m.segRun(p, tbl, rootPage, low, ipkCol)
-		if !ok {
+		if !m.segRun(p, tbl, rootPage, low, ipkCol, out[i:i+1]) {
 			return nil, false
 		}
-		out[i] = vs[0]
 	}
 	return out, true
 }
@@ -231,15 +227,15 @@ func (m *vdbe) segProgRegs(low *segLowered) ([]int64, bool) {
 	return regs, low.seedSorted(regs, m.params)
 }
 
-// segRun answers low's aggregate, or each of a program's that computes
-// several, over the table's segments.
-func (m *vdbe) segRun(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, low *segLowered, ipkCol int) ([]Value, bool) {
+// segRun answers low's aggregate into out[0], or each of a program's that
+// computes several into out, over the table's segments.
+func (m *vdbe) segRun(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, low *segLowered, ipkCol int, out []Value) bool {
 	if p == nil || p.segs == nil || low == nil {
-		return nil, false
+		return false
 	}
 	segs, ok := p.segs.byRoot[rootPage]
 	if !ok {
-		return nil, false
+		return false
 	}
 	// A row-major delta beside the segments makes a raw block read wrong
 	// (segCleanFor). It is merged instead (segDeltaSplit): the kernel runs over
@@ -252,19 +248,19 @@ func (m *vdbe) segRun(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, low
 		// A REAL sum is rounded in row order, which the split does not keep:
 		// it runs the delta's rows after every segment's.
 		if low.fAcc || low.distinctReal() {
-			return nil, false
+			return false
 		}
 		if split, ok = p.segs.deltaSplitFor(rootPage, segs, low, ipkCol); !ok {
-			return nil, false
+			return false
 		}
 	}
 	kern := segProgKernel(low)
 	if kern == nil {
-		return nil, false
+		return false
 	}
 	regs, ok := m.segProgRegs(low)
 	if !ok {
-		return nil, false
+		return false
 	}
 	// Each extreme starts from the value that never wins, as POpAccMin and
 	// POpAccMax start the accumulator.
@@ -492,13 +488,13 @@ func (m *vdbe) segRun(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, low
 		return true
 	})
 	if !ok {
-		return nil, false
+		return false
 	}
 	if low.multi == nil {
 		v, ok := segProgAnswer(low, results, facc)
-		return []Value{v}, ok
+		out[0] = v
+		return ok
 	}
-	vs := make([]Value, len(low.multi))
 	per := make([]segRunResult, len(results))
 	for j, sl := range low.multi {
 		for i, res := range results {
@@ -509,11 +505,11 @@ func (m *vdbe) segRun(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, low
 		}
 		v, ok := segProgAnswer(&segLowered{agg: sl.agg}, per, facc)
 		if !ok {
-			return nil, false
+			return false
 		}
-		vs[j] = v
+		out[j] = v
 	}
-	return vs, true
+	return true
 }
 
 // takeRun folds one kernel run's answer, over n rows, into res: its
@@ -634,7 +630,7 @@ var segOnePassRuns atomic.Int64
 // copies between registers, with no bound parameters, so every register it
 // writes -- the accumulated one included -- holds that column's value.
 func segZoneExtreme(s *segment, low *segLowered) (int64, bool) {
-	if !zoneShaped(low) {
+	if !low.zone {
 		return 0, false
 	}
 	z, ok := s.intZones(low.cols[0])
