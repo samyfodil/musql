@@ -35,6 +35,17 @@ func RegAllocStatsForTest() (allocated, spilled, coalesced int64) {
 	return raAllocated.Swap(0), raSpilled.Swap(0), raCoalesced.Swap(0)
 }
 
+// readsFirst reports whether in, which writes r, is a step every emitter
+// emits reading all its operands before it writes r, so r may share a
+// machine register with an operand whose last read is in.
+func readsFirst(in ProgInsn, r int) bool {
+	switch in.Op {
+	case POpAdd, POpSub, POpMul, POpRem, POpRemK, POpShl, POpShr, POpCmp, POpAnd, POpOr, POpNot:
+		return in.A == r
+	}
+	return false
+}
+
 // allocProgRegs is a linear scan over the program's liveness intervals.
 //
 // An IR register's interval is the hull of every instruction it is live
@@ -93,13 +104,14 @@ func allocProgRegs(insns []ProgInsn, pool int) progAlloc {
 			}
 		}
 	}
+	carried := make([]bool, nRegs)
 	for r := 0; r < nRegs; r++ {
 		if start[r] == none {
 			continue
 		}
 		if liveIn[0].has(r) || liveIn[n].has(r) {
 			// Carried round the loop, or read after it: live throughout.
-			start[r], end[r] = 0, n
+			start[r], end[r], carried[r] = 0, n, true
 			if liveIn[0].has(r) {
 				pa.load = append(pa.load, r)
 			}
@@ -126,14 +138,14 @@ func allocProgRegs(insns []ProgInsn, pool int) progAlloc {
 	var active []int // allocated registers whose interval is still open
 	spilled := 0
 	for _, r := range order {
-		// Expire every interval that ended before this one starts. An
-		// interval ending AT this start still holds its register: the last
-		// read of one and the write of the next can be the same instruction
-		// (r = a + b), and the emitters read every operand first, but a
-		// shared register there would still make two-operand forms alias.
+		// Expire every interval that ended before this one starts, and one
+		// ending AT this start where that instruction is a step whose
+		// emitters read every operand before they write the result
+		// (readsFirst): the result takes the register of an operand read
+		// there for the last time.
 		live := active[:0]
 		for _, q := range active {
-			if end[q] < start[r] {
+			if end[q] < start[r] || end[q] == start[r] && start[r] < n && readsFirst(insns[start[r]], r) {
 				free = append(free, int(pa.slot[q]))
 			} else {
 				live = append(live, q)
@@ -158,14 +170,15 @@ func allocProgRegs(insns []ProgInsn, pool int) progAlloc {
 			continue
 		}
 		// No register: whichever of r and the active ones ends furthest
-		// stays in the file.
+		// stays in the file -- but not one the row loop carries round, read
+		// or written every row, when a shorter one can go instead.
 		far := -1
 		for i, q := range active {
-			if far < 0 || end[q] > end[active[far]] {
+			if !carried[q] && (far < 0 || end[q] > end[active[far]]) {
 				far = i
 			}
 		}
-		if far >= 0 && end[active[far]] > end[r] {
+		if far >= 0 && (carried[r] || end[active[far]] > end[r]) {
 			q := active[far]
 			pa.slot[r], pa.slot[q] = pa.slot[q], -1
 			active[far] = r

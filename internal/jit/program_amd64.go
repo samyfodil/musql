@@ -84,7 +84,9 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	// into is val, but the value lands in dst (which the caller then changes).
 	into := func(dst Reg, r int) {
 		if p, ok := phys(r); ok {
-			a0.MovRegReg(dst, p)
+			if p != dst {
+				a0.MovRegReg(dst, p)
+			}
 			return
 		}
 		a0.MovRegMem32(dst, RSI, r)
@@ -290,31 +292,26 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 				op = a.ImulRegReg
 			}
 			// An operand that is a column (BCol, CCol) is read at the row
-			// into the scratch register.
+			// into the scratch register. x86's two-operand form computes in
+			// the result's own register when it has one -- its left operand
+			// there already when the two are one (r = r + c) or the operand
+			// died into it (readsFirst) -- unless that register holds c.
 			c := RDX
 			if in.CCol {
 				a.MovRegMemIdx(RDX, colReg[in.C], RCX)
-			}
-			// x86's two-operand form in place when the result overwrites
-			// its left operand in a register (r = r + c, an accumulation).
-			dst := RAX
-			if p, ok := phys(in.A); ok && in.A == in.B && !in.BCol {
-				dst = p
-				if !in.CCol {
-					c = val(in.C, RDX)
-				}
-				op(p, c)
 			} else {
-				if in.BCol {
-					a.MovRegMemIdx(RAX, colReg[in.B], RCX)
-				} else {
-					into(RAX, in.B)
-				}
-				if !in.CCol {
-					c = val(in.C, RDX)
-				}
-				op(RAX, c)
+				c = val(in.C, RDX)
 			}
+			dst := RAX
+			if p, ok := phys(in.A); ok && p != c {
+				dst = p
+			}
+			if in.BCol {
+				a.MovRegMemIdx(dst, colReg[in.B], RCX)
+			} else {
+				into(dst, in.B)
+			}
+			op(dst, c)
 			a.Jcc(condOverflow, "ovf")
 			set(in.A, dst)
 		case POpRemK:
