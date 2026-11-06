@@ -46,6 +46,9 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		if (in.Op == POpLoadCol || in.Op == POpTextLen || in.Op == POpTextMatch || in.BCol) && (in.B < 0 || in.B >= nCols) {
 			return nil, fmt.Errorf("jit: column %d out of range", in.B)
 		}
+		if in.CCol && (in.C < 0 || in.C >= nCols) {
+			return nil, fmt.Errorf("jit: column %d out of range", in.C)
+		}
 		switch in.Op {
 		case POpJump, POpJumpIfZero, POpJumpIfNotZero, POpCmpJump:
 			if in.A != ProgNextRow && in.A <= i {
@@ -129,6 +132,16 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		}
 		w.Get(regs)
 		w.LoadI64(reg(r))
+	}
+	// loadCol pushes column c's value at the row.
+	loadCol := func(c int) {
+		w.Get(colEnd[c])
+		w.Get(idx)
+		w.op(opI32WrapI64)
+		w.I32(3)
+		w.op(opI32Shl)
+		w.op(opI32Add)
+		w.LoadI64(0)
 	}
 	// storeReg stores the i64 that pushVal pushes into r[r].
 	storeReg := func(r int, pushVal func()) {
@@ -344,9 +357,17 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 				w.op(opSelect) // t1 < 0 ? -t1 : t1
 			})
 		case POpAdd, POpSub, POpMul:
-			loadReg(in.B)
+			if in.BCol {
+				loadCol(in.B)
+			} else {
+				loadReg(in.B)
+			}
 			w.Set(t1)
-			loadReg(in.C)
+			if in.CCol {
+				loadCol(in.C)
+			} else {
+				loadReg(in.C)
+			}
 			w.Set(t2)
 			emitCheckedArith(w, in.Op, t1, t2, t3, ovf)
 			storeReg(in.A, func() { w.Get(t3) })

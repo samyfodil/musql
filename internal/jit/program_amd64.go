@@ -20,6 +20,9 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		if (in.Op == POpLoadCol || in.Op == POpTextLen || in.Op == POpTextMatch || in.BCol) && (in.B < 0 || in.B >= nCols) {
 			return nil, fmt.Errorf("jit: column %d out of range", in.B)
 		}
+		if in.CCol && (in.C < 0 || in.C >= nCols) {
+			return nil, fmt.Errorf("jit: column %d out of range", in.C)
+		}
 	}
 	colReg := [MaxProgCols]Reg{RBX, R12, R13, R15}
 	// The column registers this program does not read hold its IR registers
@@ -286,15 +289,31 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			case POpMul:
 				op = a.ImulRegReg
 			}
+			// An operand that is a column (BCol, CCol) is read at the row
+			// into the scratch register.
+			c := RDX
+			if in.CCol {
+				a.MovRegMemIdx(RDX, colReg[in.C], RCX)
+			}
 			// x86's two-operand form in place when the result overwrites
 			// its left operand in a register (r = r + c, an accumulation).
 			dst := RAX
-			if p, ok := phys(in.A); ok && in.A == in.B {
+			if p, ok := phys(in.A); ok && in.A == in.B && !in.BCol {
 				dst = p
-				op(p, val(in.C, RDX))
+				if !in.CCol {
+					c = val(in.C, RDX)
+				}
+				op(p, c)
 			} else {
-				into(RAX, in.B)
-				op(RAX, val(in.C, RDX))
+				if in.BCol {
+					a.MovRegMemIdx(RAX, colReg[in.B], RCX)
+				} else {
+					into(RAX, in.B)
+				}
+				if !in.CCol {
+					c = val(in.C, RDX)
+				}
+				op(RAX, c)
 			}
 			a.Jcc(condOverflow, "ovf")
 			set(in.A, dst)

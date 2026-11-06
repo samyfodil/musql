@@ -18,6 +18,9 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		if (in.Op == POpLoadCol || in.Op == POpTextLen || in.Op == POpTextMatch || in.BCol) && (in.B < 0 || in.B >= nCols) {
 			return nil, fmt.Errorf("jit: column %d out of range", in.B)
 		}
+		if in.CCol && (in.C < 0 || in.C >= nCols) {
+			return nil, fmt.Errorf("jit: column %d out of range", in.C)
+		}
 	}
 	colReg := [MaxProgCols]Reg64{X5, X6, X7, X8}
 
@@ -290,7 +293,18 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.B("fin")
 			a.Label(svcLabel(in.A))
 		case POpAdd, POpSub, POpMul:
-			x, y, d := val(in.B, X9), val(in.C, X10), dst(in.A, X9)
+			x, y := X9, X10
+			if in.BCol {
+				a.LdrRegIdx(X9, colReg[in.B], X2)
+			} else {
+				x = val(in.B, X9)
+			}
+			if in.CCol {
+				a.LdrRegIdx(X10, colReg[in.C], X2)
+			} else {
+				y = val(in.C, X10)
+			}
+			d := dst(in.A, X9)
 			switch in.Op {
 			case POpAdd:
 				a.AddsReg(d, x, y)

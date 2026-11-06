@@ -220,7 +220,13 @@ func stepOf(in ProgInsn) progStep {
 		// writes: where the VDBE would compute it, as a REAL (or a NULL for a
 		// zero divisor), and raise no error. With that value dead, nothing the
 		// caller reads depends on it.
-		s.uses, s.defs, s.pure = []int{in.B, in.C}, []int{in.A}, true
+		s.defs, s.pure = []int{in.A}, true
+		if !in.BCol {
+			s.uses = append(s.uses, in.B)
+		}
+		if !in.CCol {
+			s.uses = append(s.uses, in.C)
+		}
 	case POpRemK:
 		s.uses, s.defs, s.pure = []int{in.B}, []int{in.A}, true
 	case POpShl, POpShr:
@@ -545,6 +551,35 @@ func fuseOnce(insns []ProgInsn) ([]ProgInsn, bool) {
 						break
 					}
 					if j.BCol {
+						work[p], keep[i], changed = j, false, true
+					}
+					break
+				}
+				if st.useAll || !st.fall || len(st.targets) > 0 || slicesContains(st.uses, in.A) || slicesContains(st.defs, in.A) {
+					break
+				}
+			}
+			if !keep[i] {
+				continue
+			}
+			// Or an add, subtract or multiply: the step reads the column
+			// into the scratch register it would have read the register
+			// into, and the file is never touched.
+			for p := i + 1; p < n && !tgt[p]; p++ {
+				j := work[p]
+				if !keep[p] {
+					continue
+				}
+				st := stepOf(j)
+				if (j.Op == POpAdd || j.Op == POpSub || j.Op == POpMul) && dead(p, in.A) && slicesContains(st.uses, in.A) {
+					folded := false
+					switch {
+					case !j.BCol && j.B == in.A && (j.CCol || j.C != in.A):
+						j.B, j.BCol, folded = in.B, true, true
+					case !j.CCol && j.C == in.A && (j.BCol || j.B != in.A):
+						j.C, j.CCol, folded = in.B, true, true
+					}
+					if folded {
 						work[p], keep[i], changed = j, false, true
 					}
 					break

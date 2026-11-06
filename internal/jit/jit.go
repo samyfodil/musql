@@ -330,9 +330,10 @@ type ProgInsn struct {
 	Pat  []byte
 	Mode TextMode
 	Fold bool
-	// BCol is POpCmpSkip's and POpCmpJump's: B is a column slot, read at the
-	// current row, rather than a register.
-	BCol bool
+	// BCol is POpCmpSkip's, POpCmpJump's, POpAdd's, POpSub's and POpMul's: B
+	// is a column slot, read at the current row, rather than a register. CCol
+	// is the same for C, on the arithmetic steps.
+	BCol, CCol bool
 	// Imm is POpFCmp's NULL answer and POpMath's service.
 	Imm int64
 	// Kernel is POpMath's function.
