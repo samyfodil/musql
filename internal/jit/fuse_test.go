@@ -15,7 +15,7 @@ import (
 // progResult is everything a program's caller can observe.
 type progResult struct {
 	out, ovf int64
-	counters []int64 // the accumulate steps' row counters, in program order
+	counters []int64 // the accumulate steps' row counters and register accumulators
 	sel      []int64 // POpEmitRow's selection, or POpEmitVal's values
 }
 
@@ -172,6 +172,19 @@ func interpProgram(insns []ProgInsn, cols [][]int64, n int, regs []int64) progRe
 			case POpAccMax:
 				acc = max(acc, regs[in.A])
 				regs[in.B]++
+			case POpRAccCount:
+				regs[in.A]++
+			case POpRAccSum:
+				x, v := regs[in.A], regs[in.B]
+				s := x + v
+				if (x >= 0) == (v >= 0) && (s >= 0) != (x >= 0) {
+					ovf = 1
+				}
+				regs[in.A] = s
+			case POpRAccMin:
+				regs[in.A] = min(regs[in.A], regs[in.B])
+			case POpRAccMax:
+				regs[in.A] = max(regs[in.A], regs[in.B])
 			case POpEmitRow:
 				sel = append(sel, int64(row-n))
 				acc++
@@ -258,6 +271,15 @@ func randProgram(rng *rand.Rand, nCols int) []ProgInsn {
 				ProgInsn{Op: POpSkipIfZero, A: r})
 		}
 	}
+	if rng.Intn(5) == 0 {
+		// Several aggregates in one pass, each in a register of its own past
+		// the counter, 13 to 15, and their row count in 16.
+		for j := range 2 + rng.Intn(2) {
+			op := []POp{POpRAccSum, POpRAccMin, POpRAccMax}[rng.Intn(3)]
+			p = append(p, ProgInsn{Op: op, A: 13 + j, B: reg()})
+		}
+		return append(p, ProgInsn{Op: POpRAccCount, A: 16})
+	}
 	switch accKind {
 	case POpAccSum, POpAccMin, POpAccMax:
 		p = append(p, ProgInsn{Op: accKind, A: reg(), B: counter})
@@ -340,8 +362,9 @@ func TestFusionMatchesUnfused(t *testing.T) {
 		insns := randProgram(rng, nCols)
 		consts := []int64{int64(rng.Intn(9) - 4), int64(rng.Intn(9) - 4), 0, 1}
 		fresh := func() []int64 {
-			regs := make([]int64, 16)
+			regs := make([]int64, 20)
 			copy(regs[8:], consts)
+			regs[14], regs[15] = math.MaxInt64, math.MinInt64
 			return regs
 		}
 		run := func(fuse bool) progResult {
@@ -363,7 +386,7 @@ func TestFusionMatchesUnfused(t *testing.T) {
 				args.Col[i] = &c[0]
 			}
 			kern.Call2(args)
-			r := progResult{out: out, ovf: b2int(ovf != 0), counters: []int64{regs[12]}}
+			r := progResult{out: out, ovf: b2int(ovf != 0), counters: regs[12:]}
 			if op := insns[len(insns)-1].Op; op == POpEmitRow || op == POpEmitVal {
 				r.sel = sel[:out]
 			}
@@ -373,7 +396,7 @@ func TestFusionMatchesUnfused(t *testing.T) {
 			regs := fresh()
 			r := interpProgram(insns, cols, n, regs)
 			r.ovf = b2int(r.ovf != 0)
-			r.counters = []int64{regs[12]}
+			r.counters = regs[12:]
 			if op := insns[len(insns)-1].Op; op != POpEmitRow && op != POpEmitVal {
 				r.sel = nil
 			}

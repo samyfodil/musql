@@ -39,6 +39,24 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	if flagInFile {
 		pool = append(pool, R9)
 	}
+	// R8 is the accumulator; a program that accumulates only in registers
+	// (POpRAccSum and kin) has it to spare, and answers 0.
+	accFree := !slices.ContainsFunc(insns, usesAcc)
+	if accFree {
+		pool = append(pool, R8)
+	}
+	// R10 is scratch for a predicated row and the steps below; a program
+	// with none of them has it to spare too.
+	ps, pred := progPredicated(insns)
+	if !pred && !slices.ContainsFunc(insns, func(in ProgInsn) bool {
+		switch in.Op {
+		case POpCmp, POpNot, POpRemK, POpRem, POpFCmp, POpFIsNull, POpTextLen, POpTextMatch, POpMath:
+			return true
+		}
+		return false
+	}) {
+		pool = append(pool, R10)
+	}
 	pa := allocProgRegs(insns, len(pool))
 	phys := func(r int) (Reg, bool) {
 		if k := pa.at(r); k >= 0 {
@@ -150,7 +168,6 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 
 	padNops(a, loopAlign)
 	a.Label("loop")
-	ps, pred := progPredicated(insns)
 	// One label per IR instruction, so a lowered OpIf/OpIfNot/OpGoto becomes an
 	// ordinary branch. Without these the IR could only express a straight line
 	// of predicates -- which is exactly the limit the fixed kernels had.
@@ -427,6 +444,27 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.AddRegReg(R8, val(in.A, RAX))
 			a.Jcc(condOverflow, "ovf")
 			incReg(in.B)
+		case POpRAccCount:
+			incReg(in.A)
+		case POpRAccSum, POpRAccMin, POpRAccMax:
+			x := val(in.B, RDX)
+			acc := RAX
+			if p, ok := phys(in.A); ok && p != x {
+				acc = p
+			}
+			into(acc, in.A)
+			if in.Op == POpRAccSum {
+				a.AddRegReg(acc, x)
+				a.Jcc(condOverflow, "ovf")
+			} else {
+				a.CmpRegReg(acc, x)
+				cond := CondG // min: acc > v, so take v
+				if in.Op == POpRAccMax {
+					cond = CondL
+				}
+				a.Cmovcc(cond, acc, x)
+			}
+			set(in.A, acc)
 		case POpI2F:
 			x := val(in.B, RAX)
 			a.Xorps(X0, X0)
@@ -623,7 +661,11 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	a.MovMemReg(RDI, POffPC, RAX)
 	a.Label("fin")
 	a.MovRegMem(RDX, RDI, POffOut)
-	a.MovMemReg(RDX, 0, R8)
+	if accFree {
+		a.MovMemDImm(RDX, 0, 0)
+	} else {
+		a.MovMemReg(RDX, 0, R8)
+	}
 	if !flagInFile {
 		a.MovRegMem(RDX, RDI, POffOverflow)
 		a.MovMemReg(RDX, 0, R9)
