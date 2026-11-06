@@ -255,6 +255,47 @@ func (a *Asm) MovRegMemIdx(dst, base, index Reg) {
 	a.emitSIB(0x8B, dst, index, base)
 }
 
+// AddRegMemIdx is  dst += [base + index*8].
+func (a *Asm) AddRegMemIdx(dst, base, index Reg) {
+	a.rexX(dst, index, base)
+	a.emitSIB(0x03, dst, index, base)
+}
+
+// SubRegMemIdx is  dst -= [base + index*8].
+func (a *Asm) SubRegMemIdx(dst, base, index Reg) {
+	a.rexX(dst, index, base)
+	a.emitSIB(0x2B, dst, index, base)
+}
+
+// ImulRegMemIdx is  dst *= [base + index*8], setting OF on signed overflow.
+func (a *Asm) ImulRegMemIdx(dst, base, index Reg) {
+	a.rexX(dst, index, base)
+	a.emit(0x0F)
+	a.emitSIB(0xAF, dst, index, base)
+}
+
+// ImulRegMemIdxImm32 is  dst = [base + index*8] * imm, setting OF on signed
+// overflow.
+func (a *Asm) ImulRegMemIdxImm32(dst, base, index Reg, imm int32) {
+	a.rexX(dst, index, base)
+	a.emitSIB(0x69, dst, index, base)
+	a.emit32(uint32(imm))
+}
+
+// AddRegImm32 is  dst += imm.
+func (a *Asm) AddRegImm32(dst Reg, imm int32) {
+	a.rex(0, dst)
+	a.emit(0x81, modrm(0b11, 0, dst))
+	a.emit32(uint32(imm))
+}
+
+// SubRegImm32 is  dst -= imm.
+func (a *Asm) SubRegImm32(dst Reg, imm int32) {
+	a.rex(0, dst)
+	a.emit(0x81, modrm(0b11, 5, dst))
+	a.emit32(uint32(imm))
+}
+
 // MovMemIdxReg is  [base + index*8] = src, MovRegMemIdx's mirror.
 func (a *Asm) MovMemIdxReg(base, index, src Reg) {
 	a.rexX(src, index, base)

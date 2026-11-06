@@ -219,24 +219,18 @@ func stepOf(in ProgInsn) progStep {
 		s.uses, s.defs = []int{in.A}, []int{in.A}
 	case POpRAccSum, POpRAccMin, POpRAccMax:
 		s.uses, s.defs = []int{in.A, in.B}, []int{in.A}
-	case POpAdd, POpSub, POpMul, POpRem:
+	case POpAdd, POpSub, POpMul, POpRem, POpRemK, POpShl, POpShr:
 		// The overflow each can flag only declines the run for the value it
 		// writes: where the VDBE would compute it, as a REAL (or a NULL for a
-		// zero divisor), and raise no error. With that value dead, nothing the
-		// caller reads depends on it.
+		// zero divisor), and raise no error -- a shift's out-of-range amount
+		// too. With that value dead, nothing the caller reads depends on it.
 		s.defs, s.pure = []int{in.A}, true
 		if !in.BCol {
 			s.uses = append(s.uses, in.B)
 		}
-		if !in.CCol {
+		if !in.CCol && !in.CImm && in.Op != POpRemK {
 			s.uses = append(s.uses, in.C)
 		}
-	case POpRemK:
-		s.uses, s.defs, s.pure = []int{in.B}, []int{in.A}, true
-	case POpShl, POpShr:
-		// A shift's out-of-range amount declines the run for its value alone,
-		// which the VDBE computes without an error.
-		s.uses, s.defs, s.pure = []int{in.B, in.C}, []int{in.A}, true
 	case POpAbs:
 		s.uses, s.defs = []int{in.B}, []int{in.A}
 	case POpService:
@@ -276,6 +270,16 @@ func stepOf(in ProgInsn) progStep {
 		s.useAll = true
 	}
 	return s
+}
+
+// colFoldable reports whether op can read its operands as column slots
+// (BCol, CCol).
+func colFoldable(op POp) bool {
+	switch op {
+	case POpAdd, POpSub, POpMul, POpRem, POpRemK, POpShl, POpShr:
+		return true
+	}
+	return false
 }
 
 // SkipsRows reports whether a program can leave a row before its end: a
@@ -508,14 +512,31 @@ func fuseOnce(insns []ProgInsn) ([]ProgInsn, bool) {
 
 	for i := 0; i < n; i++ {
 		in := work[i]
+		// An add, subtract or multiply by a constant set earlier in the same
+		// straight run takes it as an immediate; either side of an add or a
+		// multiply.
+		if (in.Op == POpAdd || in.Op == POpSub || in.Op == POpMul) && !in.CImm {
+			imm := func(r int) (int64, bool) {
+				k, ok := constBefore(work, keep, tgt, i, r)
+				return k, ok && k >= math.MinInt32 && k <= math.MaxInt32
+			}
+			if k, ok := imm(in.C); ok && !in.CCol {
+				in.C, in.CImm, in.Imm = 0, true, k
+				work[i], changed = in, true
+			} else if k, ok := imm(in.B); ok && !in.BCol && in.Op != POpSub {
+				in.B, in.BCol, in.C, in.CCol = in.C, in.CCol, 0, false
+				in.CImm, in.Imm = true, k
+				work[i], changed = in, true
+			}
+		}
 		// A remainder by a constant set earlier in the same straight run.
-		if in.Op == POpRem {
+		if in.Op == POpRem && !in.CCol {
 			if d, ok := constBefore(work, keep, tgt, i, in.C); ok {
 				if d < 0 {
 					d = -d
 				}
 				if d >= 2 && d <= math.MaxInt32 {
-					work[i] = ProgInsn{Op: POpRemK, A: in.A, B: in.B, Imm: d}
+					work[i] = ProgInsn{Op: POpRemK, A: in.A, B: in.B, BCol: in.BCol, Imm: d}
 					in, changed = work[i], true
 				}
 			}
@@ -591,21 +612,22 @@ func fuseOnce(insns []ProgInsn) ([]ProgInsn, bool) {
 			if !keep[i] {
 				continue
 			}
-			// Or an add, subtract or multiply: the step reads the column
-			// into the scratch register it would have read the register
-			// into, and the file is never touched.
+			// Or an arithmetic step: it reads the column into the scratch
+			// register it would have read the register into, or as a memory
+			// operand, and the file is never touched.
 			for p := i + 1; p < n && !tgt[p]; p++ {
 				j := work[p]
 				if !keep[p] {
 					continue
 				}
 				st := stepOf(j)
-				if (j.Op == POpAdd || j.Op == POpSub || j.Op == POpMul) && dead(p, in.A) && slicesContains(st.uses, in.A) {
+				if colFoldable(j.Op) && dead(p, in.A) && slicesContains(st.uses, in.A) {
 					folded := false
+					cReg := !j.CCol && !j.CImm && j.Op != POpRemK
 					switch {
-					case !j.BCol && j.B == in.A && (j.CCol || j.C != in.A):
+					case !j.BCol && j.B == in.A && (!cReg || j.C != in.A):
 						j.B, j.BCol, folded = in.B, true, true
-					case !j.CCol && j.C == in.A && (j.BCol || j.B != in.A):
+					case cReg && j.C == in.A && (j.BCol || j.B != in.A):
 						j.C, j.CCol, folded = in.B, true, true
 					}
 					if folded {

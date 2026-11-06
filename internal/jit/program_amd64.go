@@ -110,6 +110,15 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		a0.MovRegMem32(dst, RSI, r)
 	}
 
+	// operand is into, or a column slot's value at the row when col.
+	operand := func(dst Reg, r int, col bool) {
+		if col {
+			a0.MovRegMemIdx(dst, colReg[r], RCX)
+			return
+		}
+		into(dst, r)
+	}
+
 	a := a0
 	// incReg is r++, a row counter.
 	incReg := func(r int) {
@@ -301,41 +310,60 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.Setcc(CondE, R10)
 			set(in.A, R10)
 		case POpAdd, POpSub, POpMul:
-			op := a.AddRegReg
-			switch in.Op {
-			case POpSub:
-				op = a.SubRegReg
-			case POpMul:
-				op = a.ImulRegReg
-			}
-			// An operand that is a column (BCol, CCol) is read at the row
-			// into the scratch register. x86's two-operand form computes in
-			// the result's own register when it has one -- its left operand
-			// there already when the two are one (r = r + c) or the operand
-			// died into it (readsFirst) -- unless that register holds c.
+			// x86's two-operand form computes in the result's own register
+			// when it has one -- its left operand there already when the two
+			// are one (r = r + c) or the operand died into it (readsFirst) --
+			// unless that register holds c. A column operand (BCol, CCol) is
+			// read at the row, c as a memory operand; a constant one (CImm) is
+			// an immediate.
 			c := RDX
-			if in.CCol {
-				a.MovRegMemIdx(RDX, colReg[in.C], RCX)
-			} else {
+			if !in.CCol && !in.CImm {
 				c = val(in.C, RDX)
 			}
 			dst := RAX
-			if p, ok := phys(in.A); ok && p != c {
+			if p, ok := phys(in.A); ok && (in.CCol || in.CImm || p != c) {
 				dst = p
 			}
-			if in.BCol {
+			switch {
+			case in.CImm && in.Op == POpMul:
+				if in.BCol {
+					a.ImulRegMemIdxImm32(dst, colReg[in.B], RCX, int32(in.Imm))
+				} else {
+					a.ImulRegRegImm32(dst, val(in.B, dst), int32(in.Imm))
+				}
+				a.Jcc(condOverflow, "ovf")
+				set(in.A, dst)
+				continue
+			case in.BCol:
 				a.MovRegMemIdx(dst, colReg[in.B], RCX)
-			} else {
+			default:
 				into(dst, in.B)
 			}
-			op(dst, c)
+			switch {
+			case in.CImm && in.Op == POpAdd:
+				a.AddRegImm32(dst, int32(in.Imm))
+			case in.CImm:
+				a.SubRegImm32(dst, int32(in.Imm))
+			case in.CCol && in.Op == POpAdd:
+				a.AddRegMemIdx(dst, colReg[in.C], RCX)
+			case in.CCol && in.Op == POpSub:
+				a.SubRegMemIdx(dst, colReg[in.C], RCX)
+			case in.CCol:
+				a.ImulRegMemIdx(dst, colReg[in.C], RCX)
+			case in.Op == POpAdd:
+				a.AddRegReg(dst, c)
+			case in.Op == POpSub:
+				a.SubRegReg(dst, c)
+			default:
+				a.ImulRegReg(dst, c)
+			}
 			a.Jcc(condOverflow, "ovf")
 			set(in.A, dst)
 		case POpRemK:
 			// A multiply by Imm's magic number and shifts for the truncated
 			// quotient (vm_div_amd64.go's divConst), then n - q*Imm.
 			d := in.Imm
-			into(R10, in.B)
+			operand(R10, in.B, in.BCol)
 			if d&(d-1) == 0 {
 				k := byte(bits.TrailingZeros64(uint64(d)))
 				a.MovRegReg(RDX, R10)
@@ -363,8 +391,8 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		case POpShl, POpShr:
 			// x86 shifts by CL, and RCX is the row index: the amount goes in
 			// RDX and is swapped into RCX around the shift.
-			into(RAX, in.B)
-			into(RDX, in.C)
+			operand(RAX, in.B, in.BCol)
+			operand(RDX, in.C, in.CCol)
 			a.CmpRegImm32(RDX, 63)
 			a.Jcc(condAbove, "ovf") // unsigned: a negative amount is huge
 			a.XchgRegReg(RCX, RDX)
@@ -380,8 +408,8 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			// goes in R10; idiv clobbers RDX, which is scratch here. A zero
 			// divisor (a NULL) is the overflow.
 			m1, st := "rm"+itoa(idx), "rs"+itoa(idx)
-			into(RAX, in.B)
-			into(R10, in.C)
+			operand(RAX, in.B, in.BCol)
+			operand(R10, in.C, in.CCol)
 			a.TestRegReg(R10, R10)
 			a.Jcc(CondE, "ovf")
 			a.CmpRegImm32(R10, -1)

@@ -342,11 +342,16 @@ type ProgInsn struct {
 	Pat  []byte
 	Mode TextMode
 	Fold bool
-	// BCol is POpCmpSkip's, POpCmpJump's, POpAdd's, POpSub's and POpMul's: B
-	// is a column slot, read at the current row, rather than a register. CCol
-	// is the same for C, on the arithmetic steps.
+	// BCol is POpCmpSkip's, POpCmpJump's and the arithmetic steps' (POpAdd,
+	// POpSub, POpMul, POpRem, POpRemK, POpShl, POpShr): B is a column slot,
+	// read at the current row, rather than a register. CCol is the same for
+	// C, on the arithmetic steps but POpRemK.
 	BCol, CCol bool
-	// Imm is POpFCmp's NULL answer and POpMath's service.
+	// CImm is POpAdd's, POpSub's and POpMul's: C is the constant Imm, an
+	// int32, rather than a register.
+	CImm bool
+	// Imm is POpFCmp's NULL answer, POpMath's service, POpRemK's divisor and
+	// the constant of a CImm step.
 	Imm int64
 	// Kernel is POpMath's function.
 	Kernel *fir.Func
