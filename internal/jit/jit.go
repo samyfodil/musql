@@ -299,6 +299,12 @@ const (
 	// flagged like an overflow, and the caller declines for the VDBE to answer.
 	POpShl
 	POpShr
+	// POpRemK: r[A] = r[B] % Imm, for Imm from 2 to MaxInt32: the absolute
+	// value of a constant divisor (C's % takes the dividend's sign, so a % -d
+	// is a % d). Fusion makes it of a POpRem whose divisor a POpSetConst of
+	// the same straight run set, and the emitters multiply by Imm's magic
+	// number (sdivMagic) in place of a division.
+	POpRemK
 )
 
 // ProgNullDeclines is POpFCmp's Imm for a comparison whose NULL the program

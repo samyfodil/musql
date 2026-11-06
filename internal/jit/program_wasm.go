@@ -350,6 +350,14 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			w.Set(t2)
 			emitCheckedArith(w, in.Op, t1, t2, t3, ovf)
 			storeReg(in.A, func() { w.Get(t3) })
+		case POpRemK:
+			// A constant divisor from 2: rem_s cannot trap, and the engine
+			// compiling the module divides by it as it sees fit.
+			loadReg(in.B)
+			w.I64(in.Imm)
+			w.op(opI64RemS)
+			w.Set(t3)
+			storeReg(in.A, func() { w.Get(t3) })
 		case POpShl, POpShr:
 			// Wasm takes the amount mod 64; one outside 0..63 is flagged
 			// instead (unsigned: a negative one is huge).

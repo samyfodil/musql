@@ -135,6 +135,16 @@ func interpProgram(insns []ProgInsn, cols [][]int64, n int, regs []int64) progRe
 				if o {
 					ovf = 1
 				}
+			case POpRem:
+				// A zero divisor is SQL's NULL, flagged; -1 gives 0.
+				switch c := regs[in.C]; c {
+				case 0:
+					ovf = 1
+				case -1:
+					regs[in.A] = 0
+				default:
+					regs[in.A] = regs[in.B] % c
+				}
 			case POpShl, POpShr:
 				x, c := regs[in.B], regs[in.C]
 				if c < 0 || c > 63 {
@@ -237,7 +247,7 @@ func randProgram(rng *rand.Rand, nCols int) []ProgInsn {
 		case 11:
 			in = ProgInsn{Op: POpJump, A: target()}
 		default:
-			in = ProgInsn{Op: []POp{POpAdd, POpSub, POpMul, POpShl, POpShr}[rng.Intn(5)], A: tmp(), B: reg(), C: reg()}
+			in = ProgInsn{Op: []POp{POpAdd, POpSub, POpMul, POpRem, POpShl, POpShr}[rng.Intn(6)], A: tmp(), B: reg(), C: reg()}
 		}
 		p = append(p, in)
 		// The common lowered shape, often: a load, a comparison, its test.
@@ -414,21 +424,19 @@ func TestFusionMatchesUnfused(t *testing.T) {
 	}
 }
 
-// deadArithAsConst is insns with every integer step whose result nothing
-// reads (and whose overflow or shift amount fusion then cannot see) made a
-// constant into the same register: what a fused run computes,
-// its indices unchanged.
+// deadArithAsConst is insns with every pure step whose result nothing reads
+// made a constant into the same register, until none is left: what fusion
+// drops, an integer step's overflow or shift amount with it, at indices
+// unchanged.
 func deadArithAsConst(insns []ProgInsn) []ProgInsn {
 	out := slices.Clone(insns)
 	for {
 		liveOut, _ := progLivenessInOut(out, progRegs(out))
 		changed := false
 		for i, in := range out {
-			switch in.Op {
-			case POpAdd, POpSub, POpMul, POpRem, POpShl, POpShr:
-				if !liveOut[i].has(in.A) {
-					out[i], changed = ProgInsn{Op: POpSetConst, A: in.A}, true
-				}
+			st := stepOf(in)
+			if in.Op != POpSetConst && st.pure && !st.useAll && len(st.defs) == 1 && !liveOut[i].has(st.defs[0]) {
+				out[i], changed = ProgInsn{Op: POpSetConst, A: st.defs[0]}, true
 			}
 		}
 		if !changed {
@@ -581,6 +589,49 @@ func TestFusionCondChains(t *testing.T) {
 		}
 		if len(got) != terms+1 {
 			t.Fatalf("%v chain fused to %d steps, want %d:\n%v", op, len(got), terms+1, got)
+		}
+	}
+}
+
+// TestRemByConstant: a remainder by a constant the same run set becomes a
+// POpRemK, and answers as the division does for every divisor shape -- a
+// power of two, a magic number with and without the add, negative divisors --
+// over dividends of both signs and the extremes.
+func TestRemByConstant(t *testing.T) {
+	ns := []int64{0, 1, -1, 7, -7, 100, -100, 12345, -12345, math.MaxInt64, math.MinInt64, math.MaxInt64 - 1, math.MinInt64 + 1}
+	for _, d := range []int64{2, -2, 3, -3, 5, 7, 10, 64, -64, 1000, 1024, 7919, 65536, 1 << 30, math.MaxInt32, -math.MaxInt32} {
+		insns := []ProgInsn{
+			{Op: POpLoadCol, A: 0, B: 0},
+			{Op: POpSetConst, A: 1, B: int(d)},
+			{Op: POpRem, A: 2, B: 0, C: 1},
+			{Op: POpEmitVal, A: 2},
+		}
+		fused := Fuse(insns)
+		if !slices.ContainsFunc(fused, func(in ProgInsn) bool { return in.Op == POpRemK }) {
+			t.Fatalf("%% %d: not a POpRemK: %v", d, fused)
+		}
+		if !Available {
+			continue
+		}
+		code, err := EmitProgramFlagged(insns, 1, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		k, err := Map(code)
+		if err != nil {
+			t.Fatal(err)
+		}
+		regs := make([]int64, 16)
+		sel := make([]int64, len(ns))
+		var out, ovf int64
+		args := &ProgArgs{N: int64(len(ns)), Regs: &regs[0], Out: &out, Overflow: &ovf, Sel: &sel[0]}
+		args.Col[0] = &ns[0]
+		k.Call2(args)
+		k.Close()
+		for i, n := range ns {
+			if want := n % d; ovf != 0 || sel[i] != want {
+				t.Errorf("%d %% %d = %d (overflow %d), want %d", n, d, sel[i], ovf, want)
+			}
 		}
 	}
 }

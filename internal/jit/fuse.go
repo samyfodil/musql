@@ -1,6 +1,7 @@
 package jit
 
 import (
+	"math"
 	"sync/atomic"
 	"time"
 )
@@ -220,6 +221,8 @@ func stepOf(in ProgInsn) progStep {
 		// zero divisor), and raise no error. With that value dead, nothing the
 		// caller reads depends on it.
 		s.uses, s.defs, s.pure = []int{in.B, in.C}, []int{in.A}, true
+	case POpRemK:
+		s.uses, s.defs, s.pure = []int{in.B}, []int{in.A}, true
 	case POpShl, POpShr:
 		// A shift's out-of-range amount declines the run for its value alone,
 		// which the VDBE computes without an error.
@@ -389,6 +392,27 @@ func progJumpTargets(insns []ProgInsn) []bool {
 	return tgt
 }
 
+// constBefore is the constant a POpSetConst put in r that reaches i: the last
+// write to r before i in i's straight run, where no jump arrives between.
+func constBefore(work []ProgInsn, keep, tgt []bool, i, r int) (int64, bool) {
+	for p := i - 1; p >= 0 && !tgt[p+1]; p-- {
+		if !keep[p] {
+			continue
+		}
+		st := stepOf(work[p])
+		if st.useAll {
+			return 0, false
+		}
+		if slicesContains(st.defs, r) {
+			if work[p].Op == POpSetConst {
+				return int64(work[p].B), true
+			}
+			return 0, false
+		}
+	}
+	return 0, false
+}
+
 // reverseCond is c with its operands swapped: a < b is b > a.
 func reverseCond(c Cond) Cond {
 	switch c {
@@ -449,6 +473,18 @@ func fuseOnce(insns []ProgInsn) ([]ProgInsn, bool) {
 
 	for i := 0; i < n; i++ {
 		in := work[i]
+		// A remainder by a constant set earlier in the same straight run.
+		if in.Op == POpRem {
+			if d, ok := constBefore(work, keep, tgt, i, in.C); ok {
+				if d < 0 {
+					d = -d
+				}
+				if d >= 2 && d <= math.MaxInt32 {
+					work[i] = ProgInsn{Op: POpRemK, A: in.A, B: in.B, Imm: d}
+					in, changed = work[i], true
+				}
+			}
+		}
 		// A comparison tested right after, its result read nowhere else.
 		if in.Op == POpCmp && i+1 < n && !tgt[i+1] {
 			j := work[i+1]

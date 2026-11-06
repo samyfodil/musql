@@ -5,6 +5,7 @@ package jit
 import (
 	"fmt"
 	"math"
+	"math/bits"
 	"slices"
 )
 
@@ -297,6 +298,35 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			}
 			a.Jcc(condOverflow, "ovf")
 			set(in.A, dst)
+		case POpRemK:
+			// A multiply by Imm's magic number and shifts for the truncated
+			// quotient (vm_div_amd64.go's divConst), then n - q*Imm.
+			d := in.Imm
+			into(R10, in.B)
+			if d&(d-1) == 0 {
+				k := byte(bits.TrailingZeros64(uint64(d)))
+				a.MovRegReg(RDX, R10)
+				a.SarRegImm8(RDX, 63)
+				a.ShrRegImm8(RDX, 64-k)
+				a.AddRegReg(RDX, R10)
+				a.SarRegImm8(RDX, k)
+			} else {
+				m, s := sdivMagic(d)
+				a.MovRegImm64(RAX, m)
+				a.ImulRDXRAX(R10)
+				if m < 0 {
+					a.AddRegReg(RDX, R10)
+				}
+				if s > 0 {
+					a.SarRegImm8(RDX, byte(s))
+				}
+				a.MovRegReg(RAX, R10)
+				a.ShrRegImm8(RAX, 63)
+				a.AddRegReg(RDX, RAX)
+			}
+			a.ImulRegRegImm32(RDX, RDX, int32(d))
+			a.SubRegReg(R10, RDX)
+			set(in.A, R10)
 		case POpShl, POpShr:
 			// x86 shifts by CL, and RCX is the row index: the amount goes in
 			// RDX and is swapped into RCX around the shift.
