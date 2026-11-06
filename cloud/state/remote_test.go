@@ -16,7 +16,8 @@ import (
 // TestFollowerStore: a follower's Store runs every call on the master's
 // state, over Hrana: what it writes the master holds, it reads its own writes
 // back at once, a transaction commits or rolls back there, and the master's
-// errors keep their meaning.
+// errors keep their meaning. With no master, its own copy answers reads,
+// unless it has yet to sync once.
 func TestFollowerStore(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "state.musq")
@@ -38,7 +39,7 @@ func TestFollowerStore(t *testing.T) {
 	// The follower's own copy has the schema and no rows: anything it answers
 	// came from the master. It writes there only while it starts, as a
 	// cluster node does.
-	var electing, starting atomic.Bool
+	var electing, starting, unsynced atomic.Bool
 	starting.Store(true)
 	fdb, err := replication.Open(ctx, filepath.Join(t.TempDir(), "state.musq"), replication.Leader(starting.Load))
 	if err != nil {
@@ -50,7 +51,8 @@ func TestFollowerStore(t *testing.T) {
 		}
 		return srv.URL + "/v3-protobuf/pipeline", nil
 	}
-	follower, err := OpenReplicated(fdb, "f", &Master{Here: starting.Load, Client: srv.Client(), URL: url})
+	local := func() bool { return !unsynced.Load() }
+	follower, err := OpenReplicated(fdb, "f", &Master{Here: starting.Load, Client: srv.Client(), URL: url, Local: local})
 	if err != nil {
 		fdb.Close()
 		t.Fatal(err)
@@ -107,6 +109,13 @@ func TestFollowerStore(t *testing.T) {
 	if _, err := follower.OrgBySlug(ctx, "shop"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("with no master, the follower's own copy answers: %v, want ErrNotFound (it holds no rows)", err)
 	}
+	// A copy that has yet to sync once answers nothing: its "not found" could
+	// be a record it has not received.
+	unsynced.Store(true)
+	if _, err := follower.OrgBySlug(ctx, "shop"); !errors.Is(err, ErrNoMaster) {
+		t.Fatalf("with no master, an unsynced copy: %v, want ErrNoMaster", err)
+	}
+	unsynced.Store(false)
 	start := time.Now()
 	go func() {
 		time.Sleep(300 * time.Millisecond)
@@ -123,5 +132,9 @@ func TestFollowerStore(t *testing.T) {
 	srv.Close()
 	if _, err := follower.OrgBySlug(ctx, "shop"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("with the master gone, the follower's own copy answers: %v, want ErrNotFound (it holds no rows)", err)
+	}
+	unsynced.Store(true)
+	if _, err := follower.OrgBySlug(ctx, "shop"); err == nil || errors.Is(err, ErrNotFound) {
+		t.Fatalf("with the master gone, an unsynced copy: %v, want the master's absence", err)
 	}
 }

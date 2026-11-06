@@ -73,3 +73,44 @@ func TestProviderRefusals(t *testing.T) {
 		t.Error("rotated a key the store could not take")
 	}
 }
+
+// TestReloadKeepsLiveKeys: a reload that misses a peer's key, as one from a
+// state copy that has yet to get it can, keeps verifying with it; a key its
+// owner has deleted by now (retired, every token it signed expired) goes.
+func TestReloadKeepsLiveKeys(t *testing.T) {
+	e := newEnv(t, WithNode("a"))
+	ctx := context.Background()
+	now := time.Now()
+	for _, k := range []*state.SigningKey{
+		{KID: "b.live", PrivateKey: make([]byte, 32), CreatedAt: now},
+		{KID: "b.old", PrivateKey: make([]byte, 32), CreatedAt: now.Add(-48 * time.Hour), MaxExp: now.Add(-time.Hour).Unix()},
+	} {
+		if err := e.store.AddSigningKey(ctx, k); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.store.RetireSigningKey(ctx, "b.old", now.Add(-24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.p.ReloadKeys(ctx); err != nil {
+		t.Fatal(err)
+	}
+	all, err := e.store.SigningKeys(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var own []*state.SigningKey
+	for _, k := range all {
+		if e.p.own(k.KID) {
+			own = append(own, k)
+		}
+	}
+	e.p.mu.Lock()
+	err = e.p.loadKeys(own)
+	_, live := e.p.keys["b.live"]
+	_, old := e.p.keys["b.old"]
+	e.p.mu.Unlock()
+	if err != nil || !live || old {
+		t.Fatalf("after a reload missing b's keys: %v, b.live held %v, b.old held %v", err, live, old)
+	}
+}

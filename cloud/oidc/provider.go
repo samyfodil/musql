@@ -209,7 +209,11 @@ func (p *Provider) own(kid string) bool { return strings.HasPrefix(kid, p.kidPre
 
 // loadKeys takes the stored keys (newest first): every one verifies, a key
 // already held keeps its in-memory state, and the active key is the newest
-// unretired own one. The caller holds p.mu, or has p to itself.
+// unretired own one. A key held and missing from keys stays unless its owner
+// may have deleted it by now (RotateIfDue: retired, and every token it signed
+// expired): in a cluster the read may come from a copy that has yet to get it,
+// as a newly elected state master's can for a moment, and dropping it would
+// refuse every token it signed. The caller holds p.mu, or has p to itself.
 func (p *Provider) loadKeys(keys []*state.SigningKey) error {
 	m := make(map[string]*signKey, len(keys))
 	var active *signKey
@@ -225,6 +229,13 @@ func (p *Provider) loadKeys(keys []*state.SigningKey) error {
 		if active == nil && p.own(k.KID) && sk.retired.IsZero() {
 			active = sk
 		}
+	}
+	now := time.Now()
+	for kid, sk := range p.keys {
+		if _, ok := m[kid]; ok || deletable(sk, now) {
+			continue
+		}
+		m[kid] = sk
 	}
 	if active == nil && p.active != nil {
 		// Our active key not stored yet would be a bug; keep signing with it.
@@ -292,7 +303,7 @@ func (p *Provider) RotateIfDue(ctx context.Context, now time.Time) error {
 		p.keys[k.KID] = p.active
 	}
 	for kid, k := range p.keys {
-		if !p.own(kid) || k.retired.IsZero() || k.maxExp < 0 || k.maxExp+int64(tokenLeeway/time.Second) >= now.Unix() {
+		if !p.own(kid) || !deletable(k, now) {
 			continue
 		}
 		if err := p.store.DeleteSigningKey(ctx, kid); err != nil {
@@ -301,6 +312,12 @@ func (p *Provider) RotateIfDue(ctx context.Context, now time.Time) error {
 		delete(p.keys, kid)
 	}
 	return nil
+}
+
+// deletable reports a key its owner deletes at now: retired, and past the
+// expiry of every token it signed.
+func deletable(k *signKey, now time.Time) bool {
+	return !k.retired.IsZero() && k.maxExp >= 0 && k.maxExp+int64(tokenLeeway/time.Second) < now.Unix()
 }
 
 // tokenLeeway is the clock skew Verify tolerates.

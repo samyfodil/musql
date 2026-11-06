@@ -25,7 +25,13 @@ type Master struct {
 	// URL is the master's Hrana pipeline endpoint ("…/v3-protobuf/pipeline").
 	URL    func() (string, error)
 	Client *http.Client
+	// Local reports whether this node's copy may answer while no master can
+	// (nil: it may). A copy that has yet to sync once holds part of the
+	// state, and its "not found" would be wrong.
+	Local func() bool
 }
+
+func (m *Master) local() bool { return m.Local == nil || m.Local() }
 
 // remoteDB is a *sql.DB over the master's state. A connection holds a Hrana
 // stream only while a transaction is open; a statement outside one is a
@@ -202,7 +208,7 @@ func (c *remoteConn) ExecContext(ctx context.Context, query string, args []drive
 	}
 	inTx := c.baton != nil
 	r, err := c.run(ctx, st, inTx, false)
-	if errors.Is(err, errUnreachable) && !inTx {
+	if errors.Is(err, errUnreachable) && !inTx && c.m.local() {
 		return c.local.ExecContext(ctx, query, values(args)...)
 	}
 	if err != nil {
@@ -218,7 +224,7 @@ func (c *remoteConn) QueryContext(ctx context.Context, query string, args []driv
 	}
 	inTx := c.baton != nil
 	r, err := c.run(ctx, st, inTx, false)
-	if errors.Is(err, errUnreachable) && !inTx {
+	if errors.Is(err, errUnreachable) && !inTx && c.m.local() {
 		return localRows(ctx, c.local, query, values(args))
 	}
 	if err != nil {
