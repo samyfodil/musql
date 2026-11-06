@@ -59,8 +59,7 @@ func segProgKernel(low *segLowered) *jit.Code {
 // recogniser left in the program runs.
 //
 // One pass computes them all where it can (segProgPlan.one): integer counts,
-// sums and extremes, each accumulating in registers of its own. Otherwise, and
-// where every one is an extreme a zone map answers without reading a row, each
+// sums and extremes, each accumulating in registers of its own. Otherwise each
 // aggregate is its own pass over the same blocks.
 func (m *vdbe) segRunProgramAll(p *ReadOnlyPager, tbl *resolvedTable, plan *segProgPlan) ([]Value, bool) {
 	rootPage, ipkCol := tbl.root, tbl.ipkIndex
@@ -79,9 +78,6 @@ func (m *vdbe) segRunProgramAll(p *ReadOnlyPager, tbl *resolvedTable, plan *segP
 		if low != nil && (lowReadsVirtual(tbl.cols, low) || lowReadsVirtual(tbl.cols, low.textVar)) {
 			return nil, false
 		}
-	}
-	if one != nil && !slices.ContainsFunc(lows, func(l *segLowered) bool { return !zoneShaped(l) }) {
-		one = nil
 	}
 	if one != nil {
 		if vs, ok := m.segRun(p, tbl, rootPage, one, ipkCol); ok {
