@@ -257,8 +257,10 @@ func compileScanAggregate(c *compiler, stmt *SelectStmt, srcs []joinSource, scop
 	// Safe because it only restricts candidates (the conjunct stays in the WHERE),
 	// and the order is unchanged: a rowid key pins one row, and an equality on an
 	// index's leading column visits rows in ascending rowid, their full-scan order.
-	// Order matters here for group_concat and the min()/max() anchor.
-	planConstantKeySeeks(c, srcs, stmt.Where, false)
+	// Order matters here for group_concat and the min()/max() anchor. A join's
+	// levels take rowid bounds too, which keep it as well: without them an inner
+	// level read its whole table once per outer row.
+	planConstantKeySeeks(c, srcs, stmt.Where, len(srcs) > 1)
 
 	// Predicate pushdown: see compileScanPlain (vdbe_scan.go). buckets prune at
 	// their join level; this body tests only the deferred residue. (The local
