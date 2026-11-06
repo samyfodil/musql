@@ -215,8 +215,11 @@ func stepOf(in ProgInsn) progStep {
 	case POpAccSum, POpAccMin, POpAccMax:
 		s.uses, s.defs = []int{in.A, in.B}, []int{in.B}
 	case POpAdd, POpSub, POpMul, POpRem:
-		// Not pure: each can flag an overflow the caller declines on.
-		s.uses, s.defs = []int{in.B, in.C}, []int{in.A}
+		// The overflow each can flag only declines the run for the value it
+		// writes: where the VDBE would compute it, as a REAL (or a NULL for a
+		// zero divisor), and raise no error. With that value dead, nothing the
+		// caller reads depends on it.
+		s.uses, s.defs, s.pure = []int{in.B, in.C}, []int{in.A}, true
 	case POpAbs:
 		s.uses, s.defs = []int{in.B}, []int{in.A}
 	case POpService:

@@ -348,12 +348,22 @@ func TestFusionMatchesUnfused(t *testing.T) {
 			}
 			return r
 		}
-		regs := fresh()
-		want := interpProgram(insns, cols, n, regs)
-		want.ovf = b2int(want.ovf != 0)
-		want.counters = []int64{regs[12]}
-		if op := insns[len(insns)-1].Op; op != POpEmitRow && op != POpEmitVal {
-			want.sel = nil
+		answer := func(insns []ProgInsn) progResult {
+			regs := fresh()
+			r := interpProgram(insns, cols, n, regs)
+			r.ovf = b2int(r.ovf != 0)
+			r.counters = []int64{regs[12]}
+			if op := insns[len(insns)-1].Op; op != POpEmitRow && op != POpEmitVal {
+				r.sel = nil
+			}
+			return r
+		}
+		// A fused run drops an integer step whose result nothing reads, and
+		// with it any overflow that step would flag. A program with no pair
+		// to fuse is emitted as it is (Fusable).
+		want, wantFused := answer(insns), answer(insns)
+		if AnyFusable(insns) {
+			wantFused = answer(deadArithAsConst(insns))
 		}
 		if len(Fuse(insns)) < len(insns) {
 			fusedSome++
@@ -362,7 +372,10 @@ func TestFusionMatchesUnfused(t *testing.T) {
 			condsSome++
 		}
 		for _, fuse := range []bool{false, true} {
-			got := run(fuse)
+			got, want := run(fuse), want
+			if fuse {
+				want = wantFused
+			}
 			if got.out != want.out || got.ovf != want.ovf || !slices.Equal(got.counters, want.counters) || !slices.Equal(got.sel, want.sel) {
 				t.Fatalf("trial %d fused=%v: got %+v, want %+v\nprogram %v\nfused %v", trial, fuse, got, want, insns, Fuse(insns))
 			}
@@ -381,6 +394,28 @@ func TestFusionMatchesUnfused(t *testing.T) {
 	}
 	if fusedSome < 500 {
 		t.Fatalf("only %d of 1500 programs fused at all -- the test exercises too little", fusedSome)
+	}
+}
+
+// deadArithAsConst is insns with every integer step whose result nothing
+// reads made a constant into the same register: what a fused run computes,
+// its indices unchanged.
+func deadArithAsConst(insns []ProgInsn) []ProgInsn {
+	out := slices.Clone(insns)
+	for {
+		liveOut, _ := progLivenessInOut(out, progRegs(out))
+		changed := false
+		for i, in := range out {
+			switch in.Op {
+			case POpAdd, POpSub, POpMul, POpRem:
+				if !liveOut[i].has(in.A) {
+					out[i], changed = ProgInsn{Op: POpSetConst, A: in.A}, true
+				}
+			}
+		}
+		if !changed {
+			return out
+		}
 	}
 }
 
@@ -403,6 +438,46 @@ func TestFusionShrinksTheLoweredShape(t *testing.T) {
 	want := []ProgInsn{{Op: POpCmpSkip, B: 1, BCol: true, C: 5, Cond: CondG}, {Op: POpAccCount}}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("fused to %v, want %v", got, want)
+	}
+}
+
+// TestFusionDropsDeadArithmetic: an integer step whose result nothing reads
+// goes, and the overflow it would have flagged with it: the run is not
+// declined over a value no one reads, which the VDBE would have computed as a
+// REAL and thrown away.
+func TestFusionDropsDeadArithmetic(t *testing.T) {
+	insns := []ProgInsn{
+		{Op: POpLoadCol, A: 0, B: 0},
+		{Op: POpLoadCol, A: 1, B: 1},
+		{Op: POpMul, A: 2, B: 0, C: 1},
+		{Op: POpSub, A: 3, B: 0, C: 1},
+		{Op: POpAccMax, A: 3, B: 9},
+	}
+	for _, in := range Fuse(insns) {
+		if in.Op == POpMul {
+			t.Fatalf("the dead multiply survived: %v", Fuse(insns))
+		}
+	}
+	if !Available {
+		return
+	}
+	code, err := EmitProgramFlagged(insns, 2, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, err := Map(code)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+	a, b := []int64{math.MaxInt64 / 2, 5}, []int64{4, 3}
+	regs := make([]int64, 16)
+	out, ovf := int64(math.MinInt64), int64(0)
+	args := &ProgArgs{N: 2, Regs: &regs[0], Out: &out, Overflow: &ovf}
+	args.Col[0], args.Col[1] = &a[0], &b[0]
+	k.Call2(args)
+	if ovf != 0 || out != math.MaxInt64/2-4 {
+		t.Fatalf("max %d, overflow %d: want %d and none", out, ovf, int64(math.MaxInt64/2-4))
 	}
 }
 
