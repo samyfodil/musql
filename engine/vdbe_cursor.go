@@ -1125,8 +1125,11 @@ func (cur *vdbeCursor) rewind() error {
 		shared := cur.pager.ServesLiveRows(cur.tbl.root)
 		for rowid, vals := range seq {
 			// The rowid range bounds this scan as it does the segment one, the
-			// rows of the log included.
-			if cur.ranged && (int64(rowid) < cur.rowidLo || int64(rowid) > cur.rowidHi) {
+			// rows of the log included. Rowids ascend, so the upper bound ends it.
+			if cur.ranged && int64(rowid) > cur.rowidHi {
+				break
+			}
+			if cur.ranged && int64(rowid) < cur.rowidLo {
 				continue
 			}
 			cur.rowids = append(cur.rowids, rowid)
