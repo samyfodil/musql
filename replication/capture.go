@@ -89,10 +89,10 @@ func (c *capture) preCommit(ctx context.Context, conn *driver.Conn, changes []en
 			}
 			defer w.close()
 		}
-		if words := sqlWords(ch.SQL); words["CREATE"] && words["TRIGGER"] {
-			return fmt.Errorf("%w: %s: triggers are not replicated", errSchemaUnsupported, ch.SQL)
+		if words := sqlWords(ch.SQL); c.s.mode == modeCRDT && words["CREATE"] && words["TRIGGER"] {
+			return fmt.Errorf("%w: %s: triggers are not replicated in CRDT mode", errSchemaUnsupported, ch.SQL)
 		}
-		sops, err := cat.classify(ctx, w, ch.SQL)
+		sops, err := cat.classify(ctx, w, ch.SQL, c.s.mode != modeCRDT)
 		if errors.Is(err, errNotOnScratch) {
 			verify = true
 			continue

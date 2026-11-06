@@ -16,6 +16,7 @@ import (
 
 	"connectrpc.com/connect"
 
+	"github.com/samyfodil/musql/driver"
 	"github.com/samyfodil/musql/engine"
 	"github.com/samyfodil/musql/replication"
 
@@ -81,13 +82,17 @@ type restorePoint struct {
 
 // restore is one attempt: checked, diffed and written in a transaction on a
 // connection of db's own, which is closed after, so no client inherits the
-// pragmas it sets.
+// pragmas it sets. Its triggers are off: the rows it writes are the point's,
+// what a trigger wrote then included.
 func (p *restorePoint) restore(ctx context.Context, db *sql.DB) error {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Raw(func(any) error { return sqldriver.ErrBadConn })
+	if err := conn.Raw(func(dc any) error { dc.(*driver.Conn).DisableTriggers(); return nil }); err != nil {
+		return err
+	}
 	for _, q := range []string{`PRAGMA foreign_keys = OFF`, `PRAGMA ignore_check_constraints = ON`} {
 		if _, err := conn.ExecContext(ctx, q); err != nil {
 			return err
@@ -128,7 +133,7 @@ func (p *restorePoint) restore(ctx context.Context, db *sql.DB) error {
 // statements that replicate like any: what was not there goes, a table
 // defined otherwise is made again as it was (empty: the rows follow), and what
 // is missing is made. Views and indexes go first and come last, so none is
-// left naming what changed under it.
+// left naming what changed under it, and triggers before them and after.
 func (p *restorePoint) syncSchema(ctx context.Context, tx *sql.Tx) error {
 	if p.then == nil {
 		var err error
@@ -167,14 +172,14 @@ func (p *restorePoint) syncSchema(ctx context.Context, tx *sql.Tx) error {
 		return ok && sameRow(o, r)
 	}
 	var stmts []string
-	for _, typ := range []string{"view", "index", "table"} {
+	for _, typ := range []string{"trigger", "view", "index", "table"} {
 		for _, r := range all {
 			if fmt.Sprint(r[0]) == typ && now[key(r)] != nil && !same(r) {
 				stmts = append(stmts, "DROP "+strings.ToUpper(typ)+" IF EXISTS main."+quoteIdent(fmt.Sprint(r[1])))
 			}
 		}
 	}
-	for _, typ := range []string{"table", "index", "view"} {
+	for _, typ := range []string{"table", "index", "view", "trigger"} {
 		for _, r := range p.then {
 			if fmt.Sprint(r[0]) != typ {
 				continue

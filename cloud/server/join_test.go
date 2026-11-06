@@ -50,19 +50,19 @@ func TestClusterJoin(t *testing.T) {
 		_, orgs, dbs := e.clients()
 		need(orgs.Create(ctx, auth(e.admin, &v1.CreateOrgRequest{Slug: "acme", Name: "Acme"})))(t)
 		need(dbs.Create(ctx, auth(e.admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "app"})))(t)
-		need(dbs.Create(ctx, auth(e.admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "trig"})))(t)
+		need(dbs.Create(ctx, auth(e.admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "vt"})))(t)
 		e.exec("/db/acme/app", e.admin, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", "INSERT INTO t(v) VALUES ('a'), ('b'), ('c')")
-		e.exec("/db/acme/trig", e.admin, "CREATE TABLE x(a)", "CREATE TRIGGER tr AFTER INSERT ON x BEGIN SELECT 1; END")
+		e.exec("/db/acme/vt", e.admin, "CREATE VIRTUAL TABLE f USING fts4(body)")
 	})
 	cfgs := clusterConfigs(t, 3, dir)
 	if s, err := New(ctx, cfgs[0], nil); err == nil {
 		s.Close()
-		t.Fatal("a node with a trigger joined a cluster")
-	} else if !strings.Contains(err.Error(), "acme/trig") || !strings.Contains(err.Error(), "trigger") || strings.Contains(err.Error(), "acme/app") {
-		t.Fatalf("the refusal does not name acme/trig alone: %v", err)
+		t.Fatal("a node with a virtual table joined a cluster")
+	} else if !strings.Contains(err.Error(), "acme/vt") || !strings.Contains(err.Error(), "virtual table") || strings.Contains(err.Error(), "acme/app") {
+		t.Fatalf("the refusal does not name acme/vt alone: %v", err)
 	}
 	runStandalone(t, dir, func(e *env) {
-		e.exec("/db/acme/trig", e.admin, "DROP TRIGGER tr")
+		e.exec("/db/acme/vt", e.admin, "DROP TABLE f")
 	})
 
 	nodes := startCluster(t, cfgs)
@@ -75,7 +75,7 @@ func TestClusterJoin(t *testing.T) {
 	for _, loc := range locations[1:] {
 		need(nodes[0].groups().AddLocation(ctx, auth(nodes[0].admin, &v1.AddLocationRequest{Org: "acme", Group: "default", Location: loc})))(t)
 	}
-	eventually(t, "app on every node", func() bool { return placed(nodes, "app") && placed(nodes, "trig") })
+	eventually(t, "app on every node", func() bool { return placed(nodes, "app") && placed(nodes, "vt") })
 	eventually(t, "app's rows on every node", func() bool { return counts(nodes, "app", "t", 3) })
 	nodes[2].exec("/db/acme/app", nodes[2].admin, "INSERT INTO t(v) VALUES ('from sea')")
 	eventually(t, "a write from a new node", func() bool { return counts(nodes, "app", "t", 4) })

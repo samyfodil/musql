@@ -416,8 +416,8 @@ Choose the mode that fits your application:
 | Leader with quorum | Commits go through your consensus log and return after quorum commitment and local application. |
 
 CRDT merges can violate constraints that each local write satisfied, such as
-foreign keys or a multi-column `CHECK`. Replicated databases also restrict
-features such as triggers, virtual tables, and `WITHOUT ROWID`. Read the
+foreign keys or a multi-column `CHECK`. Replicated databases also refuse
+virtual tables, and in CRDT mode triggers and `WITHOUT ROWID`. Read the
 [replication guide](replication/README.md) for setup, conflict behavior, and
 supported schemas, or start with the [libp2p example](examples/libp2p/).
 

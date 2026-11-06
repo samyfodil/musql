@@ -502,7 +502,7 @@ var errNotOnScratch = errors.New("replication: statement does not run on the rep
 // object appeared, objects vanished, a table's name changed, or a table's column
 // list gained, lost or renamed one. Nothing changed (IF NOT EXISTS, a TEMP
 // object) is no op at all. c is only read.
-func (c *catalog) classify(ctx context.Context, w *scratch, stmt string) ([]schemaOp, error) {
+func (c *catalog) classify(ctx context.Context, w *scratch, stmt string, leader bool) ([]schemaOp, error) {
 	before, err := w.snapshot(ctx)
 	if err != nil {
 		return nil, err
@@ -542,7 +542,7 @@ func (c *catalog) classify(ctx context.Context, w *scratch, stmt string) ([]sche
 	switch {
 	case len(added) == 1 && len(removed) == 0:
 		r := added[0]
-		if err := supportedObject(ctx, w.db, r); err != nil {
+		if err := supportedObject(ctx, w.db, r, leader); err != nil {
 			return refuse(err.Error())
 		}
 		o := schemaOp{Act: actCreate, Type: r.Type, Name: r.Name, SQL: r.SQL}
@@ -603,7 +603,7 @@ func (c *catalog) classify(ctx context.Context, w *scratch, stmt string) ([]sche
 			if !ok {
 				return refuse("a column appeared that no ADD COLUMN added")
 			}
-			if err := supportedObject(ctx, w.db, r); err != nil {
+			if err := supportedObject(ctx, w.db, r, leader); err != nil {
 				return refuse(err.Error())
 			}
 			name := cols[len(cols)-1].Name
@@ -653,28 +653,31 @@ func colIndex(cols []column, name string) int {
 // row may break a rule each write kept, which is the eventual consistency the
 // caller chose. What is left:
 //
-//   - a trigger: its effects are not captured (engine/rowhook.go records only
-//     the firing statement's rows) and it would fire again on every peer;
 //   - a virtual table: its storage is a module's, not rows this package sees;
-//   - WITHOUT ROWID, a key column not collated BINARY: the key is the row's
-//     identity, and these make it not one.
+//   - a key column not collated BINARY: the key is the row's identity, and
+//     this makes it not one;
+//   - in CRDT mode, a trigger and a WITHOUT ROWID table. Every node writes
+//     there, and a trigger's effects merged from two of them (a running total,
+//     say) are not what either computed. In Leader mode the writer runs its
+//     triggers, what they wrote arrives as ops like any other row, and the
+//     others apply it with their own triggers off (applyConnector).
 var errVirtual = errors.New("virtual tables are not replicated")
 
 func isVirtual(r catRow) bool {
 	return r.Type == "table" && len(r.SQL) >= 20 && strings.EqualFold(r.SQL[:20], "CREATE VIRTUAL TABLE")
 }
 
-func supportedObject(ctx context.Context, db dbtx, r catRow) error {
+func supportedObject(ctx context.Context, db dbtx, r catRow, leader bool) error {
 	switch {
-	case r.Type == "trigger":
-		return errors.New("triggers are not replicated")
+	case r.Type == "trigger" && !leader:
+		return fmt.Errorf("trigger %q: triggers are not replicated in CRDT mode", r.Name)
 	case isVirtual(r):
 		return errVirtual
 	case r.Type != "table":
 		return nil
 	}
-	if sqlWords(r.SQL)["WITHOUT"] {
-		return fmt.Errorf("table %q: WITHOUT ROWID is not replicated", r.Name)
+	if !leader && sqlWords(r.SQL)["WITHOUT"] {
+		return fmt.Errorf("table %q: WITHOUT ROWID is not replicated in CRDT mode", r.Name)
 	}
 	rows, err := db.QueryContext(ctx, `SELECT name FROM pragma_index_list(?) WHERE origin = 'pk'`, r.Name)
 	if err != nil {

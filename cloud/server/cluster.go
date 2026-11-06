@@ -224,7 +224,7 @@ func (s *Server) openState(ctx context.Context) (*state.Store, error) {
 
 // preflightJoin checks, before a standalone node's data is replicated, that
 // every database it holds can be: it names each one a cluster would refuse
-// (a trigger, a virtual table, a WITHOUT ROWID table), so the node stops
+// (a virtual table), so the node stops
 // rather than serve some of its databases and not others.
 func (s *Server) preflightJoin(ctx context.Context, path string) error {
 	st, err := state.Open(path)
@@ -238,7 +238,7 @@ func (s *Server) preflightJoin(ctx context.Context, path string) error {
 	}
 	var refused []string
 	for _, d := range dbs {
-		err := replication.Check(ctx, s.dbPath(d))
+		err := replication.Check(ctx, s.dbPath(d), replication.Leader(nil))
 		if err == nil || errors.Is(err, os.ErrNotExist) {
 			continue
 		}
