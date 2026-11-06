@@ -54,6 +54,33 @@ func segProgKernel(low *segLowered) *jit.Code {
 	return k
 }
 
+// segVecCache holds each program's vector loop (jit.EmitProgramVec), nil
+// for one it has none of.
+var segVecCache sync.Map // *segLowered -> *jit.Code
+
+// segProgVecKernel is low's vector loop, mapped on first use; nil where the
+// machine or the program has none, or with fusion off, whose emission is the
+// reference the fused one is held to.
+func segProgVecKernel(low *segLowered) *jit.Code {
+	if !jit.HasVector() || !jit.Fusing() {
+		return nil
+	}
+	if c, ok := segVecCache.Load(low); ok {
+		return c.(*jit.Code)
+	}
+	var k *jit.Code
+	if code, err := jit.EmitProgramVec(low.insns, len(low.cols)); err == nil {
+		if k, err = jit.Map(code); err != nil {
+			k = nil
+		}
+	}
+	actual, loaded := segVecCache.LoadOrStore(low, k)
+	if loaded && k != nil {
+		k.Close()
+	}
+	return actual.(*jit.Code)
+}
+
 // segRunProgramAll answers every aggregate the statement computes from the
 // segments, or reports false to decline -- in which case the loop the
 // recogniser left in the program runs.
@@ -405,6 +432,25 @@ func (m *vdbe) segRun(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, low
 			end := s.nRows
 			if k < len(skip) {
 				end = skip[k]
+			}
+			// Whole groups of four rows through the vector loop, where it
+			// takes the program; the rows it cannot vouch for, and the rest,
+			// through the scalar one.
+			if vk := segProgVecKernel(low); vk != nil && end-start >= 4 {
+				m := (end - start) &^ 3
+				local := slices.Clone(regs)
+				var out, ovf int64
+				args := &jit.ProgArgs{N: int64(m), Regs: &local[0], Out: &out, Overflow: &ovf}
+				for i, b := range blocks {
+					args.Col[i] = &b[start]
+				}
+				vk.Call2(args)
+				if ovf == 0 {
+					if !low.takeRun(res, out, false, local, int64(m)) {
+						return false
+					}
+					start += m
+				}
 			}
 			if end > start {
 				local := slices.Clone(regs)
