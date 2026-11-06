@@ -261,11 +261,12 @@ func (src *segProgSource) lower(kinds *segKinds) ([]*segLowered, *segLowered, bo
 			tv.agg, tv.fAcc, tv.distinct = low.agg, low.fAcc, low.distinct
 			tv.add(acc)
 		}
+		low.zone = zoneShaped(low)
 		lows = append(lows, low)
 	}
 	// Where every aggregate is an extreme a zone map answers without reading
 	// a row, a pass each reads none.
-	if one != nil && !slices.ContainsFunc(lows, func(l *segLowered) bool { return !zoneShaped(l) }) {
+	if one != nil && !slices.ContainsFunc(lows, func(l *segLowered) bool { return !l.zone }) {
 		one = nil
 	}
 	if one != nil {
