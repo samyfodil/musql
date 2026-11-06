@@ -310,6 +310,19 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.CsetOverflow(X10)
 			a.OrrReg(X4, X4, X10)
 			fin(in.A, d)
+		case POpShl, POpShr:
+			// LSLV and ASRV take the amount mod 64; one outside 0..63 is
+			// flagged instead (unsigned HI: a negative one is huge).
+			x, y, d := val(in.B, X9), val(in.C, X10), dst(in.A, X9)
+			a.CmpImm(y, 63)
+			a.CsetRaw(X11, armHI)
+			a.OrrReg(X4, X4, X11)
+			if in.Op == POpShl {
+				a.Lslv(d, x, y)
+			} else {
+				a.Asrv(d, x, y)
+			}
+			fin(in.A, d)
 		case POpAccCount:
 			a.AddImm(X3, X3, 1)
 		case POpEmitRow:

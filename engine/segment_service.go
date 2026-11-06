@@ -98,7 +98,7 @@ func segNativeLowerable(in Instruction, cursor int) bool {
 	case OpColumn:
 		return in.P1 == cursor
 	case OpInteger, OpVariable, OpIfNot, OpIf, OpGoto, OpIsNull, OpNotNull, OpNot,
-		OpAdd, OpSubtract, OpMultiply, OpRemainder, OpNegative, OpBitAnd, OpBitOr, OpNull, OpSCopy:
+		OpAdd, OpSubtract, OpMultiply, OpRemainder, OpNegative, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight, OpNull, OpSCopy:
 		return true
 	case OpGt, OpGe, OpLt, OpLe, OpEq, OpNe:
 		_, ok := segCompareLowerable(in.P5)

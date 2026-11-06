@@ -5,6 +5,7 @@ package jit
 import (
 	"fmt"
 	"math"
+	"slices"
 )
 
 // EmitProgram compiles an instruction list into a native row loop. The loop
@@ -21,8 +22,19 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	}
 	colReg := [MaxProgCols]Reg{RBX, R12, R13, R15}
 	// The column registers this program does not read hold its IR registers
-	// (allocProgRegs); the trampoline saves all four either way.
-	pool := colReg[nCols:]
+	// (allocProgRegs); the trampoline saves all four either way. So do R11,
+	// which only the text steps use as scratch, and R9, the overflow flag,
+	// unless a service may resume the run: the flag then lives in the file
+	// the caller reads (POffOverflow), written as the run ends at ovf.
+	pool := append([]Reg(nil), colReg[nCols:]...)
+	text := slices.ContainsFunc(insns, func(in ProgInsn) bool { return in.Op == POpTextLen || in.Op == POpTextMatch })
+	flagInFile := !progHasService(insns)
+	if !text {
+		pool = append(pool, R11)
+	}
+	if flagInFile {
+		pool = append(pool, R9)
+	}
 	pa := allocProgRegs(insns, len(pool))
 	phys := func(r int) (Reg, bool) {
 		if k := pa.at(r); k >= 0 {
@@ -96,12 +108,15 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.MovRegImm64(R8, math.MinInt64)
 		}
 	}
-	a.XorRegReg(R9, R9)
-	// R11 is the SETO landing pad for POpAccSum. SETcc writes only the LOW
-	// BYTE, so the other seven have to start at zero or the sticky OR into R9
-	// reports overflow that never happened -- it read 43497009332224 for a sum
-	// that did not overflow at all.
-	a.XorRegReg(R11, R11)
+	// A step that would flag an overflow jumps to ovf instead, which ends the
+	// run: the caller declines a flagged one whatever else it holds, so the
+	// rows after cost nothing and the hot path carries no flag.
+	if flagInFile {
+		a.MovRegMem(RDX, RDI, POffOverflow)
+		a.MovMemDImm(RDX, 0, 0)
+	} else {
+		a.XorRegReg(R9, R9)
+	}
 	for c := 0; c < nCols; c++ {
 		a.MovRegMem(colReg[c], RDI, int8(POffCol+c*8))
 	}
@@ -171,7 +186,8 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 				a.MovRegReg(RDX, R10)
 				a.NegReg(RDX)
 				a.AndRegReg(RDX, x)
-				a.AddRegRegOverflow(R8, RDX, R9)
+				a.AddRegReg(R8, RDX)
+				a.Jcc(condOverflow, "ovf")
 				if p, ok := phys(in.B); ok {
 					a.AddRegReg(p, R10)
 				} else {
@@ -279,26 +295,38 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 				into(RAX, in.B)
 				op(RAX, val(in.C, RDX))
 			}
-			a.Setcc(condOverflow, R11)
-			a.OrRegReg(R9, R11)
+			a.Jcc(condOverflow, "ovf")
 			set(in.A, dst)
+		case POpShl, POpShr:
+			// x86 shifts by CL, and RCX is the row index: the amount goes in
+			// RDX and is swapped into RCX around the shift.
+			into(RAX, in.B)
+			into(RDX, in.C)
+			a.CmpRegImm32(RDX, 63)
+			a.Jcc(condAbove, "ovf") // unsigned: a negative amount is huge
+			a.XchgRegReg(RCX, RDX)
+			if in.Op == POpShl {
+				a.ShlRegCL(RAX)
+			} else {
+				a.SarRegCL(RAX)
+			}
+			a.XchgRegReg(RCX, RDX)
+			set(in.A, RAX)
 		case POpRem:
 			// RCX is the loop index and R9 the overflow flag, so the divisor
-			// goes in R10; idiv clobbers RDX, which is scratch here.
-			z, m1, st := "rz"+itoa(idx), "rm"+itoa(idx), "rs"+itoa(idx)
+			// goes in R10; idiv clobbers RDX, which is scratch here. A zero
+			// divisor (a NULL) is the overflow.
+			m1, st := "rm"+itoa(idx), "rs"+itoa(idx)
 			into(RAX, in.B)
 			into(R10, in.C)
 			a.TestRegReg(R10, R10)
-			a.Jcc(CondE, z)
+			a.Jcc(CondE, "ovf")
 			a.CmpRegImm32(R10, -1)
 			a.Jcc(CondE, m1)
 			a.Cqo()
 			a.IdivReg(R10)
 			a.MovRegReg(RAX, RDX)
 			a.Jmp(st)
-			a.Label(z)
-			a.MovRegImm64(R11, 1)
-			a.OrRegReg(R9, R11)
 			a.Label(m1)
 			a.XorRegReg(RAX, RAX)
 			a.Label(st)
@@ -309,9 +337,8 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			into(RAX, in.B)
 			a.MovRegReg(RDX, RAX)
 			a.NegReg(RDX)
-			a.Setcc(condOverflow, R11)   // SETcc and CMOVcc leave the flags alone;
-			a.Cmovcc(condSign, RDX, RAX) // the OR below does not, so it goes last
-			a.OrRegReg(R9, R11)
+			a.Jcc(condOverflow, "ovf") // a jump leaves the flags for the CMOVcc
+			a.Cmovcc(condSign, RDX, RAX)
 			set(in.A, RDX)
 		case POpService:
 			a.MovRegImm64(RAX, int64(in.A)+1)
@@ -351,7 +378,8 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.Cmovcc(cond, R8, x)
 			incReg(in.B)
 		case POpAccSum:
-			a.AddRegRegOverflow(R8, val(in.A, RAX), R9)
+			a.AddRegReg(R8, val(in.A, RAX))
+			a.Jcc(condOverflow, "ovf")
 			incReg(in.B)
 		case POpI2F:
 			x := val(in.B, RAX)
@@ -373,7 +401,7 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.MovRegImm64(RAX, math.MaxInt64)
 			a.Jmp(done)
 			a.Label(nan)
-			a.aluImm32(1, R9, 1)
+			a.Jmp("ovf")
 			a.Label(done)
 			set(in.A, RAX)
 		case POpFAdd, POpFSub, POpFMul, POpFDiv:
@@ -412,7 +440,7 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.Jmp(done)
 			a.Label(unord)
 			if in.Imm == ProgNullDeclines {
-				a.aluImm32(1, R9, 1)
+				a.Jmp("ovf")
 			} else if in.Imm != 0 {
 				a.MovRegImm64(R10, in.Imm)
 			}
@@ -492,7 +520,7 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 				args:      []firLoc{firMem(RSI, int32(in.B*8)), firMem(RSI, int32(in.C*8))}[:in.Kernel.NArgs],
 				out:       firMem(RSI, int32(in.A*8)),
 				exit:      "mx" + itoa(idx),
-				gprs:      append([]Reg{RAX, RDX, R10, R11}, pool...),
+				gprs:      progMathGPRs(pool),
 				xmms:      []XReg{X0, X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12},
 				spillBase: RDI, spillDisp: POffScratch, spillN: ProgScratch,
 				prefix: "m" + itoa(idx) + "_", pool: consts,
@@ -503,7 +531,6 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			if err := emitFirAmd64(a, in.Kernel, env, cpuFeat); err != nil {
 				return nil, err
 			}
-			a.XorRegReg(R11, R11) // POpAccSum's SETO needs its upper bytes zero
 			if in.Imm == ProgMathSelects {
 				// An input the kernel cannot judge selects the row.
 				at := progEmitAt(insns)
@@ -513,7 +540,6 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 				after := "ma" + itoa(idx)
 				a.Jmp(after)
 				a.Label(env.exit)
-				a.XorRegReg(R11, R11)
 				a.Jmp(progLabel(at))
 				a.Label(after)
 				break
@@ -533,6 +559,15 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	a.IncReg(RCX)
 	a.Jcc(CondNE, "loop")
 
+	a.Jmp("done")
+	a.Label("ovf")
+	if flagInFile {
+		a.MovRegMem(RDX, RDI, POffOverflow)
+		a.MovMemDImm(RDX, 0, 1)
+	} else {
+		a.MovRegImm64(R9, 1)
+	}
+
 	a.Label("done")
 	for _, r := range pa.store {
 		p, _ := phys(r)
@@ -543,8 +578,10 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	a.Label("fin")
 	a.MovRegMem(RDX, RDI, POffOut)
 	a.MovMemReg(RDX, 0, R8)
-	a.MovRegMem(RDX, RDI, POffOverflow)
-	a.MovMemReg(RDX, 0, R9)
+	if !flagInFile {
+		a.MovRegMem(RDX, RDI, POffOverflow)
+		a.MovMemReg(RDX, 0, R9)
+	}
 	if hasFloat {
 		a.MovsdStore(RDI, POffFAcc, X14)
 		a.MovsdStore(RDI, POffFAcc+8, X13)
@@ -553,6 +590,16 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	emitTextPool(a, insns)
 	consts.emit(a)
 	return a.Code()
+}
+
+// progMathGPRs is the integer registers a POpMath kernel may use: the scratch
+// ones and the pool, R11 among them once.
+func progMathGPRs(pool []Reg) []Reg {
+	gprs := []Reg{RAX, RDX, R10}
+	if !slices.Contains(pool, R11) {
+		gprs = append(gprs, R11)
+	}
+	return append(gprs, pool...)
 }
 
 // progNaN is the NaN a program writes for a NULL REAL.
@@ -630,8 +677,7 @@ func emitProgResume(a *Asm, insns []ProgInsn) {
 // bytes at a time while 16 remain in the cell (so it never reads past it),
 // then a byte at a time. PMOVMSKB of the bytes is their high bits, the
 // non-ASCII test; against zero it finds the NUL. RAX, RDX, R10 and R11 are
-// scratch; R11 is re-zeroed after, because POpAccSum's SETO relies on its
-// upper bytes being zero.
+// scratch.
 func emitTextLenAmd64(a *Asm, in ProgInsn, cells Reg, fallback string, idx int) {
 	lp, nul, tail, done, fb, after := "tl"+itoa(idx), "tn"+itoa(idx), "tt"+itoa(idx), "td"+itoa(idx), "tf"+itoa(idx), "ta"+itoa(idx)
 	a.MovRegMemIdx(RAX, cells, RCX)
@@ -675,10 +721,8 @@ func emitTextLenAmd64(a *Asm, in ProgInsn, cells Reg, fallback string, idx int) 
 	a.Jmp(tail)
 	a.Label(done)
 	a.MovMemReg32(RSI, in.A, R11)
-	a.XorRegReg(R11, R11)
 	a.Jmp(after)
 	a.Label(fb)
-	a.XorRegReg(R11, R11)
 	a.Jmp(fallback)
 	a.Label(after)
 }
@@ -730,8 +774,7 @@ func emitTextFoldX0(a *Asm) {
 }
 
 // emitTextMatchAmd64 tests the cell in slot in.B against in.Pat. RAX, RDX,
-// R10 and R11 are scratch (R11 re-zeroed after: POpAccSum's SETO relies on
-// its upper bytes). The pattern is at most 16 bytes, so one comparison at a
+// R10 and R11 are scratch. The pattern is at most 16 bytes, so one comparison at a
 // position is one 16-byte load when 16 bytes remain in the heap, and an
 // unrolled run of byte compares against immediates otherwise.
 func emitTextMatchAmd64(a *Asm, in ProgInsn, cells Reg, idx int) {
@@ -850,7 +893,6 @@ func emitTextMatchAmd64(a *Asm, in ProgInsn, cells Reg, idx int) {
 	a.XorRegReg(RAX, RAX)
 	a.MovMemReg32(RSI, in.A, RAX)
 	a.Label(end)
-	a.XorRegReg(R11, R11)
 }
 
 // emitTextEffLenAmd64 sets RDX to the text's length before its first NUL,

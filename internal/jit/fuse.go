@@ -220,6 +220,10 @@ func stepOf(in ProgInsn) progStep {
 		// zero divisor), and raise no error. With that value dead, nothing the
 		// caller reads depends on it.
 		s.uses, s.defs, s.pure = []int{in.B, in.C}, []int{in.A}, true
+	case POpShl, POpShr:
+		// A shift's out-of-range amount declines the run for its value alone,
+		// which the VDBE computes without an error.
+		s.uses, s.defs, s.pure = []int{in.B, in.C}, []int{in.A}, true
 	case POpAbs:
 		s.uses, s.defs = []int{in.B}, []int{in.A}
 	case POpService:

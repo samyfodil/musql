@@ -135,6 +135,17 @@ func interpProgram(insns []ProgInsn, cols [][]int64, n int, regs []int64) progRe
 				if o {
 					ovf = 1
 				}
+			case POpShl, POpShr:
+				x, c := regs[in.B], regs[in.C]
+				if c < 0 || c > 63 {
+					ovf = 1
+					break
+				}
+				if in.Op == POpShl {
+					regs[in.A] = int64(uint64(x) << c)
+				} else {
+					regs[in.A] = x >> c
+				}
 			case POpAccCount:
 				acc++
 			case POpAccSum:
@@ -226,7 +237,7 @@ func randProgram(rng *rand.Rand, nCols int) []ProgInsn {
 		case 11:
 			in = ProgInsn{Op: POpJump, A: target()}
 		default:
-			in = ProgInsn{Op: []POp{POpAdd, POpSub, POpMul}[rng.Intn(3)], A: tmp(), B: reg(), C: reg()}
+			in = ProgInsn{Op: []POp{POpAdd, POpSub, POpMul, POpShl, POpShr}[rng.Intn(5)], A: tmp(), B: reg(), C: reg()}
 		}
 		p = append(p, in)
 		// The common lowered shape, often: a load, a comparison, its test.
@@ -376,6 +387,12 @@ func TestFusionMatchesUnfused(t *testing.T) {
 			if fuse {
 				want = wantFused
 			}
+			if want.ovf != 0 {
+				// The caller declines a flagged run whatever else it holds,
+				// and the run stops at the overflow.
+				got = progResult{ovf: got.ovf}
+				want = progResult{ovf: want.ovf}
+			}
 			if got.out != want.out || got.ovf != want.ovf || !slices.Equal(got.counters, want.counters) || !slices.Equal(got.sel, want.sel) {
 				t.Fatalf("trial %d fused=%v: got %+v, want %+v\nprogram %v\nfused %v", trial, fuse, got, want, insns, Fuse(insns))
 			}
@@ -398,7 +415,8 @@ func TestFusionMatchesUnfused(t *testing.T) {
 }
 
 // deadArithAsConst is insns with every integer step whose result nothing
-// reads made a constant into the same register: what a fused run computes,
+// reads (and whose overflow or shift amount fusion then cannot see) made a
+// constant into the same register: what a fused run computes,
 // its indices unchanged.
 func deadArithAsConst(insns []ProgInsn) []ProgInsn {
 	out := slices.Clone(insns)
@@ -407,7 +425,7 @@ func deadArithAsConst(insns []ProgInsn) []ProgInsn {
 		changed := false
 		for i, in := range out {
 			switch in.Op {
-			case POpAdd, POpSub, POpMul, POpRem:
+			case POpAdd, POpSub, POpMul, POpRem, POpShl, POpShr:
 				if !liveOut[i].has(in.A) {
 					out[i], changed = ProgInsn{Op: POpSetConst, A: in.A}, true
 				}

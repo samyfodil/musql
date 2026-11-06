@@ -292,6 +292,13 @@ const (
 	// POpEmitRow appends the row index: the program hands back the values it
 	// computed, for the caller to finish -- a DISTINCT aggregate's dedup.
 	POpEmitVal
+
+	// POpShl / POpShr: r[A] = r[B] shifted left / right, arithmetically, by
+	// r[C], for an amount in 0..63. Any other amount -- a negative one shifts
+	// the other way, 64 and past leave 0 or -1 (vdbe.c's OP_ShiftLeft) -- is
+	// flagged like an overflow, and the caller declines for the VDBE to answer.
+	POpShl
+	POpShr
 )
 
 // ProgNullDeclines is POpFCmp's Imm for a comparison whose NULL the program
