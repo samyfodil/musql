@@ -204,8 +204,7 @@ declined).
 A standalone node joins a cluster in place: give it `peers` (and the other
 nodes it in theirs) and restart it. At that first start it checks every
 database it holds against what a cluster refuses (below) without changing
-any; one that holds a trigger, a virtual table or a WITHOUT ROWID table stops
-it, named, so it serves all of its databases or none, and starting it again
+any; one that holds a virtual table stops it, named, so it serves all of its databases or none, and starting it again
 without peers lets the operator fix or export it. Then its state is set aside
 (`state.musq.import`) and its records join the cluster's state by import, as
 a state kept in CRDT mode does (below): the cluster may already have its own,
@@ -335,15 +334,18 @@ peers:
 
 #### What a cluster database refuses
 
-The limits are `replication/`'s, the same in either mode, enforced by it when
-a statement commits, so a node never stores what it cannot replicate: the
-statement fails with an error and nothing diverges.
+The limits are `replication/`'s, enforced by it when a statement commits, so
+a node never stores what it cannot replicate: the statement fails with an
+error and nothing diverges. Either type refuses:
 
-- triggers;
 - virtual tables (FTS3/4/5, rtree, …);
-- `WITHOUT ROWID` tables;
 - a key column collated other than `BINARY`, and a `NULL` in a key column;
 - writes through any connection but the replicated one (Hrana's is it).
+
+A crdt database also refuses triggers and `WITHOUT ROWID` tables. A regular
+one takes them: its master runs a trigger, what the trigger wrote reaches the
+others as rows, and they apply them with their own triggers off. A restore in
+place runs with triggers off too, so the rows it writes are the point's.
 
 And what CRDT means for the rest: constraints hold for each node's own
 writes; a merge may break a multi-column `CHECK` or orphan a child, and a

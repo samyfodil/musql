@@ -252,6 +252,12 @@ func (db *DB) matchingInsteadOfTriggers(view string, viewIsTemp bool, event trig
 // Past that the walk follows bucket order, which tempTrigHash reproduces;
 // where it does not know the hash, checkTempTriggerOrder declines.
 func (db *DB) orderedTriggers(tableIsTemp bool, keep func(*triggerMeta) bool) []*triggerMeta {
+	if db.triggersOff {
+		// triggersReallyExist cuts the list to its TEMP triggers (a TEMP
+		// table's own are TEMP too).
+		inner := keep
+		keep = func(tr *triggerMeta) bool { return tr.isTemp && inner(tr) }
+	}
 	var out []*triggerMeta
 	if !tableIsTemp {
 		if temps, ok := db.tempTrigOrder(keep); ok {
@@ -272,6 +278,12 @@ func (db *DB) orderedTriggers(tableIsTemp bool, keep func(*triggerMeta) bool) []
 	}
 	return out
 }
+
+// SetTriggersEnabled is SQLITE_DBCONFIG_ENABLE_TRIGGER: off, a write fires
+// only TEMP triggers, and the database's own never. Per session; on by
+// default. A consumer that applies rows another node's triggers already
+// wrote (replication) turns it off.
+func (db *DB) SetTriggersEnabled(on bool) { db.triggersOff = !on }
 
 // noteTempTriggerCreated records the temp trigger hash's size before a TEMP
 // trigger is added to it: C's hash is cleared when it empties and grows

@@ -121,6 +121,11 @@ type DB struct {
 	// writePlanReverse is the reverse_unordered_selects setting they were
 	// compiled under (cachedWriteProgram).
 	writePlanReverse bool
+	// writePlanTriggersOff is the triggersOff they were compiled under: a
+	// write's program carries the triggers it fires.
+	writePlanTriggersOff bool
+	// triggersOff is SetTriggersEnabled(false).
+	triggersOff bool
 
 	// stat1 is sqlite_stat1 as this connection last LOADED it, and stat1Loaded
 	// whether it has -- the Table/Index statistics C keeps in its schema. See

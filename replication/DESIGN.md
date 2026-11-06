@@ -47,7 +47,9 @@ the session's log, and a `RowSchema` entry (the statement's SQL) for each DDL
 statement on main, in its place among the rows. Recording, not calling back
 mid-statement, is what keeps the log honest: a statement-level abort and a
 `ROLLBACK` truncate it, so a drained log holds only changes about to commit.
-Trigger-body changes are not recorded (and triggers are refused, below). A CTAS
+Trigger-body changes are recorded like the statement's own: in Leader mode
+they replicate as rows, and the apply handle runs with triggers off
+(`driver.Conn.DisableTriggers`), so a follower does not run them again. A CTAS
 journals its `RowSchema` entry at the statement's START mark, since its rows land
 in the log before the CREATE finishes.
 
@@ -394,13 +396,14 @@ or comes later by anti-entropy. Pages stop at 512 records or 16 MiB.
 ## Refused
 
 At `Open` for a database that has them, at commit for a statement that makes
-them (`supportedObject`), because they cannot be replicated at all:
+them (`supportedObject`), because they cannot be replicated (in the mode named):
 
 | Refused | Why |
 |---------|-----|
-| triggers | their effects are not captured, and they would fire again on every peer |
+| triggers, in CRDT mode | every node writes, and what triggers wrote on two of them merges into what neither computed (a running total) |
+| `WITHOUT ROWID`, in CRDT mode | not proven against the merge paths (held rows, rebuilds) |
 | virtual tables | their storage is a module's, not rows the capture sees |
-| `WITHOUT ROWID`, a key column collated other than `BINARY` | the key is the row's identity, and these make it not one |
+| a key column collated other than `BINARY` | the key is the row's identity, and this makes it not one |
 | a `NULL` in a key column | a rowid table's PRIMARY KEY allows any number of them |
 
 TEMP objects are the connection's own and never replicate; ATTACHed databases'

@@ -74,7 +74,7 @@ func openSyncer(ctx context.Context, path string, opts ...Option) (*Syncer, *sql
 	if err != nil {
 		return fail(err)
 	}
-	s, err := newSyncer(ctx, applyDB, site, cfg.quorum != nil)
+	s, err := newSyncer(ctx, applyDB, site, cfg.mode)
 	if err != nil {
 		return fail(err)
 	}
@@ -363,7 +363,9 @@ func setGuard(ctx context.Context, db *sql.DB) error {
 // it; refused, the op would fail on every node forever. Foreign keys are off on
 // it whatever the DSN says: a peer's UPDATE applies as a DELETE and an INSERT,
 // which an ON DELETE action would answer with changes the peer never made; the
-// actions it did run arrive as ops of their own.
+// actions it did run arrive as ops of their own. Triggers are off for the same
+// reason (driver.Conn.DisableTriggers): what a peer's triggers wrote arrives as
+// ops too.
 type applyConnector struct{ sqldriver.Connector }
 
 func (c applyConnector) Connect(ctx context.Context) (sqldriver.Conn, error) {
@@ -372,6 +374,7 @@ func (c applyConnector) Connect(ctx context.Context) (sqldriver.Conn, error) {
 		return nil, err
 	}
 	conn.(*driver.Conn).AllowUncapturedWrites()
+	conn.(*driver.Conn).DisableTriggers()
 	for _, pragma := range []string{`PRAGMA ignore_check_constraints = ON`, `PRAGMA foreign_keys = OFF`} {
 		if err := conn.(*driver.Conn).Exec(ctx, pragma); err != nil {
 			conn.Close()

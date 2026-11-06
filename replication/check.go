@@ -2,6 +2,7 @@ package replication
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 )
@@ -23,11 +24,17 @@ func Replicated(ctx context.Context, path string) (bool, error) {
 	return n > 0, err
 }
 
-// Check reports what in the ordinary database at path Open would refuse to
-// replicate (a trigger, a virtual table, a WITHOUT ROWID table, a key column
-// not collated BINARY), naming it, or nil. It reads the file and writes
-// nothing, so a caller can check several before it opens any.
-func Check(ctx context.Context, path string) error {
+// Check reports what in the ordinary database at path Open, in mode (CRDT()
+// or Leader(...)), would refuse to replicate, naming it, or nil: a virtual
+// table, a key column not collated BINARY, and in CRDT mode a trigger or a
+// WITHOUT ROWID table. It reads the file and writes nothing, so a caller can
+// check several before it opens any.
+func Check(ctx context.Context, path string, mode Option) error {
+	var cfg config
+	mode(&cfg)
+	if cfg.mode == "" {
+		return errors.New("replication: Check needs a mode: CRDT() or Leader(isWriter)")
+	}
 	if _, err := os.Stat(path); err != nil {
 		return err
 	}
@@ -44,7 +51,7 @@ func Check(ctx context.Context, path string) error {
 		if r.Type == "index" && r.SQL == "" {
 			continue // an automatic index is its table's
 		}
-		if err := supportedObject(ctx, db, r); err != nil {
+		if err := supportedObject(ctx, db, r, cfg.mode != modeCRDT); err != nil {
 			return fmt.Errorf("replication: %w", err)
 		}
 	}

@@ -3,7 +3,10 @@ package server
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
+
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	v1 "github.com/samyfodil/musql/cloud/gen/cloud/v1"
 )
@@ -169,4 +172,87 @@ func TestClusterUsageCountsEveryNode(t *testing.T) {
 			t.Fatalf("the insert counted %d times, want 6", q.Count)
 		}
 	}
+}
+
+// TestClusterRegularTriggers: a regular database takes triggers and WITHOUT
+// ROWID tables. The master runs a trigger once per write; what it wrote
+// reaches every node, which applies it without firing its own copy. After a
+// failover the new master fires the trigger in its turn.
+func TestClusterRegularTriggers(t *testing.T) {
+	nodes := newCluster(t, 3)
+	acmeEverywhereAs(t, nodes, v1.DatabaseType_DATABASE_TYPE_PLAIN)
+	const app = "/db/acme/app"
+	n := nodes[0]
+	n.exec(app, n.admin,
+		"CREATE TABLE t(id INTEGER PRIMARY KEY, v)",
+		"CREATE TABLE log(k TEXT, n INT, msg, PRIMARY KEY(k, n)) WITHOUT ROWID",
+		"CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES ('t', new.id, 'added ' || new.v); END")
+	for _, x := range nodes {
+		x.exec(app, x.admin, "INSERT INTO t(v) VALUES ('"+x.cfg.Node.Name+"')")
+	}
+	eventually(t, "one log row per insert on every node", func() bool { return counts(nodes, "app", "log", 3) })
+
+	var m int
+	eventually(t, "one master", func() bool { m = masterOf(nodes, "app"); return m >= 0 })
+	if err := nodes[m].s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var rest []*clusterNode
+	for i, x := range nodes {
+		if i != m {
+			rest = append(rest, x)
+		}
+	}
+	eventually(t, "a new master", func() bool { return masterOf(rest, "app") >= 0 })
+	rest[0].exec(app, rest[0].admin, "INSERT INTO t(v) VALUES ('after')", "UPDATE log SET msg = upper(msg) WHERE k = 't'")
+	var seen []string
+	defer func() {
+		if t.Failed() {
+			t.Logf("log on the rest: %q", seen)
+		}
+	}()
+	eventually(t, "the new master's trigger and the update on the rest", func() bool {
+		seen = seen[:0]
+		for _, x := range rest {
+			status, res := x.pipeline(app, x.admin, "SELECT group_concat(k || ':' || n || ':' || msg, ',') FROM (SELECT * FROM log ORDER BY n)")
+			if status != 200 || len(res) != 1 || res[0].Type != "ok" {
+				seen = append(seen, fmt.Sprint(status, res))
+				continue
+			}
+			seen = append(seen, fmt.Sprint(res[0].Response.Result.Rows[0][0].Value))
+		}
+		for _, v := range seen {
+			if strings.Count(v, ":ADDED ") != 4 {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// TestClusterRestoreKeepsTriggers: a regular database restored in place has
+// the triggers it had then, and the rows: the restore's own writes fire none,
+// so a row it puts back adds nothing a trigger would have.
+func TestClusterRestoreKeepsTriggers(t *testing.T) {
+	nodes := newCluster(t, 3)
+	acmeEverywhereAs(t, nodes, v1.DatabaseType_DATABASE_TYPE_PLAIN)
+	const app = "/db/acme/app"
+	n := nodes[0]
+	queries := []string{"SELECT v FROM t ORDER BY v", "SELECT v FROM audit ORDER BY v", "SELECT name FROM sqlite_schema WHERE type = 'trigger' ORDER BY name"}
+	n.exec(app, n.admin,
+		"CREATE TABLE t(id INTEGER PRIMARY KEY, v)",
+		"CREATE TABLE audit(id INTEGER PRIMARY KEY, v)",
+		"CREATE TRIGGER ins AFTER INSERT ON t BEGIN INSERT INTO audit(v) VALUES (new.v); END",
+		"INSERT INTO t(v) VALUES ('one'), ('two')")
+	at := crdtMark(t, nodes, "app", queries)
+	n.exec(app, n.admin,
+		"DELETE FROM t WHERE v = 'one'",
+		"DROP TRIGGER ins",
+		"CREATE TRIGGER other AFTER DELETE ON t BEGIN INSERT INTO audit(v) VALUES ('gone ' || old.v); END",
+		"INSERT INTO t(v) VALUES ('three')")
+	crdtMark(t, nodes, "app", queries)
+
+	_, _, dbs := nodes[1].clients()
+	need(dbs.Restore(context.Background(), auth(nodes[1].admin, &v1.RestoreRequest{Org: "acme", Name: "app", At: timestamppb.New(at.at), InPlace: true})))(t)
+	holds(t, nodes, "app", at.want)
 }

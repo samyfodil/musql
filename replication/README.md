@@ -136,8 +136,10 @@ Networking and consensus are the caller's in both.
 ## Not replicated
 
 Refused with an error, at `Open` for a database that has them and at commit for
-a statement that makes them: triggers, virtual tables, `WITHOUT ROWID`, a key
-column collated other than `BINARY`, and a `NULL` in a key column. `TEMP`
+a statement that makes them: virtual tables, a key column collated other than
+`BINARY`, a `NULL` in a key column, and in CRDT mode triggers and `WITHOUT
+ROWID` tables. In Leader mode the writer runs its triggers, what they wrote
+replicates as rows, and the other nodes apply those with triggers off. `TEMP`
 objects are the connection's own and never replicate.
 
 Every write -- rows and schema alike -- goes through the `*sql.DB` that `Open`
@@ -145,5 +147,5 @@ returned. Any other connection to a replicated file can read it, but its writes
 are refused ("this database is replicated; write it through the *sql.DB
 replication.Open returned"): they would never reach a peer.
 
-And by design: no triggers on synced tables; edge and collaboration scale rather
+And by design: no triggers in CRDT mode; edge and collaboration scale rather
 than a high-throughput write path.

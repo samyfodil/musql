@@ -456,9 +456,9 @@ func TestClusterPlacement(t *testing.T) {
 	})
 }
 
-// TestClusterDeclinesWhatCannotReplicate: replication refuses a trigger, a
-// virtual table and a WITHOUT ROWID table in a crdt database and a regular one
-// alike, and a raft database is a regular one.
+// TestClusterDeclinesWhatCannotReplicate: replication refuses a virtual table
+// in a crdt database and a regular one alike, and a trigger and a WITHOUT
+// ROWID table in a crdt one; a raft database is a regular one.
 func TestClusterDeclinesWhatCannotReplicate(t *testing.T) {
 	for _, typ := range []v1.DatabaseType{v1.DatabaseType_DATABASE_TYPE_CRDT, v1.DatabaseType_DATABASE_TYPE_PLAIN} {
 		t.Run(typ.String(), func(t *testing.T) { declinesWhatCannotReplicate(t, typ) })
@@ -470,11 +470,13 @@ func declinesWhatCannotReplicate(t *testing.T, typ v1.DatabaseType) {
 	acmeEverywhereAs(t, nodes, typ)
 	n := nodes[0]
 	n.exec("/db/acme/app", n.admin, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)")
-	for _, c := range []struct{ stmt, why string }{
-		{"CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END", "triggers are not replicated"},
-		{"CREATE VIRTUAL TABLE f USING fts5(body)", "virtual tables are not replicated"},
-		{"CREATE TABLE w(k TEXT PRIMARY KEY, v) WITHOUT ROWID", "WITHOUT ROWID is not replicated"},
-	} {
+	refused := []struct{ stmt, why string }{{"CREATE VIRTUAL TABLE f USING fts5(body)", "virtual tables are not replicated"}}
+	if typ == v1.DatabaseType_DATABASE_TYPE_CRDT {
+		refused = append(refused,
+			struct{ stmt, why string }{"CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END", "triggers are not replicated"},
+			struct{ stmt, why string }{"CREATE TABLE w(k TEXT PRIMARY KEY, v) WITHOUT ROWID", "WITHOUT ROWID is not replicated"})
+	}
+	for _, c := range refused {
 		status, res := n.pipeline("/db/acme/app", n.admin, c.stmt)
 		if status != 200 || len(res) != 1 || res[0].Type != "error" || !strings.Contains(res[0].Error.Message, c.why) {
 			t.Fatalf("%s: HTTP %d %+v, want a statement error saying %q", c.stmt, status, res, c.why)

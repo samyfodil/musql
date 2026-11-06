@@ -149,11 +149,10 @@ var openSites = struct {
 	m  map[string]bool
 }{m: map[string]bool{}}
 
-// newSyncer builds the Syncer for site, which owns applyDB. shared is a
-// database every node assigns rowids in alike (Leader with a Quorum): its
-// keyless tables keep their rowids at genesis, and the floor counts every
-// site's rows.
-func newSyncer(ctx context.Context, applyDB *sql.DB, site string, shared bool) (s *Syncer, err error) {
+// newSyncer builds the Syncer for site, which owns applyDB, in mode. Leader
+// with a Quorum is a database every node assigns rowids in alike: its keyless
+// tables keep their rowids at genesis, and the floor counts every site's rows.
+func newSyncer(ctx context.Context, applyDB *sql.DB, site, mode string) (s *Syncer, err error) {
 	openSites.mu.Lock()
 	dup := openSites.m[site]
 	openSites.m[site] = true
@@ -171,9 +170,10 @@ func newSyncer(ctx context.Context, applyDB *sql.DB, site string, shared bool) (
 		return nil, err
 	}
 	s = &Syncer{site: site, store: store, clock: store.Clock()}
+	store.leader = mode != modeCRDT
 	s.rowidLo, s.rowidHi = RowidRange(site)
 	renumber := s.rowidLo
-	if shared {
+	if mode == modeLeaderQuorum {
 		s.rowidLo, s.rowidHi, renumber = 1, 1<<63-1, 0
 		store.seenRowid = s.noteRowid
 	}
