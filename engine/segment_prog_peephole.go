@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"slices"
 	"sync"
 
 	"github.com/samyfodil/musql/internal/jit"
@@ -261,6 +262,11 @@ func (src *segProgSource) lower(kinds *segKinds) ([]*segLowered, *segLowered, bo
 			tv.add(acc)
 		}
 		lows = append(lows, low)
+	}
+	// Where every aggregate is an extreme a zone map answers without reading
+	// a row, a pass each reads none.
+	if one != nil && !slices.ContainsFunc(lows, func(l *segLowered) bool { return !zoneShaped(l) }) {
+		one = nil
 	}
 	if one != nil {
 		one.nRegs = oneAt + 1 + len(src.aggs)
