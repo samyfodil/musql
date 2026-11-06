@@ -97,6 +97,11 @@ func (c *Conn) SetCaptureGuard(reason string) error {
 // application's. A connection with capture hooks needs no call.
 func (c *Conn) AllowUncapturedWrites() { c.uncapturedWriter = true }
 
+// DisableTriggers stops this connection's writes firing the database's
+// triggers; TEMP triggers still fire (SQLITE_DBCONFIG_ENABLE_TRIGGER off). A
+// consumer that applies rows a trigger already wrote elsewhere needs it.
+func (c *Conn) DisableTriggers() { c.triggersOff = true }
+
 // captureLock is the write lock for this connection's session of path: empty,
 // or the guard's reason it may not write db. The exemption is for the
 // connection's own main file only: capture covers nothing else, so a guarded

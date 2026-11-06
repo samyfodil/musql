@@ -63,6 +63,9 @@ type Store struct {
 	seenRowid func(tbl string, rowid int64)
 	// catalogSet, when set, is told the catalog a peer's schema op installed.
 	catalogSet func(cat *catalog, ver string)
+	// leader is a database Open was asked to replicate in Leader mode, whose
+	// genesis takes what only that mode can (supportedObject).
+	leader bool
 	// localRetries counts local commits being retried after losing to an
 	// apply, localUntil (unix ns) is when waitLocal stops waiting for them,
 	// lastLocal is when a local commit last landed, and applied counts ingest

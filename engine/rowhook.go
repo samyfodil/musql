@@ -5,7 +5,7 @@ import "slices"
 // Package engine records row changes into an in-session log if capture is
 // enabled. The log is drained by TakeRowChanges before commit. A rollback
 // truncates the log, so it only contains changes that are actually committed.
-// Changes made by trigger bodies are not recorded.
+// Changes made by trigger bodies are recorded like any other.
 
 // RowChangeKind is the kind of mutation a RowChange describes.
 type RowChangeKind int

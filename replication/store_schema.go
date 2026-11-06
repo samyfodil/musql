@@ -422,7 +422,7 @@ func (s *Store) genesisTx(ctx context.Context, lo uint64) (*catalog, string, err
 		return nil, "", err
 	}
 	// Tables before what depends on them.
-	rank := map[string]int{"table": 0, "index": 1, "view": 2}
+	rank := map[string]int{"table": 0, "index": 1, "view": 2, "trigger": 3}
 	sort.SliceStable(real, func(i, j int) bool { return rank[real[i].Type] < rank[real[j].Type] })
 	cat, sc := newCatalog(), (*scratch)(nil)
 	if sc, err = newScratch(); err != nil {
@@ -434,7 +434,7 @@ func (s *Store) genesisTx(ctx context.Context, lo uint64) (*catalog, string, err
 		if r.Type == "index" && r.SQL == "" {
 			continue // an automatic index is its table's
 		}
-		if err := supportedObject(ctx, s.q, r); err != nil {
+		if err := supportedObject(ctx, s.q, r, s.leader); err != nil {
 			return nil, "", fmt.Errorf("replication: %w", err)
 		}
 		so := schemaOp{Act: actCreate, ID: objectID(r.Type, r.Name, r.SQL, 0), Type: r.Type, Name: r.Name, SQL: r.SQL}
@@ -540,8 +540,8 @@ func (s *Store) tableRows(ctx context.Context, t *object) ([]Op, error) {
 		names[i] = q(c.Name)
 	}
 	rid := rowidName(t.Cols)
-	if rid == "" {
-		rid = "NULL" // shadowed names: the table has a key, which is its identity
+	if rid == "" || t.keyCols() != nil {
+		rid = "NULL" // the table has a key, which is its identity (and WITHOUT ROWID has no rowid)
 	}
 	rows, err := s.q.QueryContext(ctx, fmt.Sprintf("SELECT %s,%s FROM main.%s", rid, strings.Join(names, ","), q(t.Name)))
 	if err != nil {

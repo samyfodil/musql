@@ -356,11 +356,12 @@ func (db *DB) cachedWriteProgram(sqlText string) (*Program, error) {
 	// cache (SetPragmaTuningValues drops that one).
 	reverse := db.pragmaState.ReverseUnorderedSelects()
 	if db.writePlans == nil || db.writePlanCookie != db.schemaGen || db.writePlanTxGen != db.txGen ||
-		db.writePlanStat1 != db.planStats() || db.writePlanReverse != reverse {
+		db.writePlanStat1 != db.planStats() || db.writePlanReverse != reverse || db.writePlanTriggersOff != db.triggersOff {
 		db.writePlans = make(map[string]*Program)
 		db.writePlanCookie, db.writePlanTxGen = db.schemaGen, db.txGen
 		db.writePlanStat1 = db.planStats()
 		db.writePlanReverse = reverse
+		db.writePlanTriggersOff = db.triggersOff
 		db.lastWritePlanText, db.lastWritePlan = "", nil
 	}
 	// The statement run last, again -- a prepared INSERT in a loop -- is the

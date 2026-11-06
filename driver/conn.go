@@ -149,6 +149,8 @@ type Conn struct {
 	rowidFloor       func(table string) uint64
 	// uncapturedWriter is AllowUncapturedWrites'.
 	uncapturedWriter bool
+	// triggersOff is DisableTriggers'.
+	triggersOff bool
 	// stmtText is the statement being run, for refreshOnce's locking-mode rule:
 	// only a statement that opens main's file takes the lock.
 	stmtText string
@@ -668,6 +670,7 @@ func (c *Conn) openWriteOrCreatePath(path string) (*engine.DB, error) {
 	}
 	db.SetLegacyAlterTable(c.legacyAlterTable) // likewise; see Conn.legacyAlterTable
 	db.SetIgnoreCheckConstraints(c.ignoreCheckConstraints)
+	db.SetTriggersEnabled(!c.triggersOff)          // see Conn.DisableTriggers
 	db.SetAutomaticIndex(!c.noAutomaticIndex)      // likewise; see Conn.noAutomaticIndex
 	db.SetFullColumnNames(c.fullColumnNames)       // likewise; see Conn.fullColumnNames
 	db.SetShortColumnNames(!c.shortColumnNamesOff) // likewise; see Conn.fullColumnNames
