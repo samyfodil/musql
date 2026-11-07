@@ -190,7 +190,7 @@ func joinSeekReproducesKey(sp *ReadOnlyPager, tbl *resolvedTable, root uint32, n
 	var chosen *SchemaRow
 	for i := range rows {
 		r := &rows[i]
-		if r.Type == "index" && r.SQL != "" && (root != 0 && r.RootPage == root || root == 0 && r.RootPage == 0 && equalFoldName(r.Name, name) && equalFoldName(r.TblName, tbl.name)) {
+		if r.Type == "index" && (r.SQL != "" || root == 0) && (root != 0 && r.RootPage == root || root == 0 && r.RootPage == 0 && equalFoldName(r.Name, name) && equalFoldName(r.TblName, tbl.name)) {
 			chosen = r
 			break
 		}
@@ -198,6 +198,14 @@ func joinSeekReproducesKey(sp *ReadOnlyPager, tbl *resolvedTable, root uint32, n
 	if chosen == nil {
 		// An automatic index (sqlite_schema.sql NULL) is not reproduced.
 		return false, false
+	}
+	if chosen.SQL == "" {
+		// A segment table's PRIMARY KEY or UNIQUE index (autoIndexSeekCandidate):
+		// the planner's key is its columns, then the rowid, and each probe's
+		// rows are sorted into it.
+		n := len(key.cols) - 1
+		return n >= 1 && len(key.colls) == n+1 && len(key.desc) == n+1 &&
+			key.cols[n] == -1 && equalFoldName(key.colls[n], "BINARY") && !key.desc[n], true
 	}
 	lead, ok := leadingIndexColumn(chosen.SQL)
 	if !ok {
@@ -396,7 +404,15 @@ func findJoinIndexSeek(c *compiler, sp *ReadOnlyPager, s joinSource, outer map[i
 		return nil, false // NOT INDEXED takes every secondary index away (where.c:4070)
 	}
 	cands, err := sp.secondaryIndexSeekCandidates(s.scope.tableName, s.tbl.root, s.tbl.cols)
-	if err != nil || len(cands) == 0 {
+	if err != nil {
+		return nil, false
+	}
+	if want != nil && want.root == 0 {
+		if cd, ok := sp.autoIndexSeekCandidate(s.scope.tableName, s.tbl.root, s.tbl.cols, want.index); ok {
+			cands = append(cands, cd)
+		}
+	}
+	if len(cands) == 0 {
 		return nil, false
 	}
 	if want != nil {
@@ -588,11 +604,14 @@ func (c *compiler) emitJoinSeekHint(srcs []joinSource, order []int, level int, s
 		return nil
 	}
 	if s.joinSortedSeek != nil {
+		start := len(c.insns)
 		keyReg, err := c.compileExpr(s.joinSortedKey)
 		if err != nil {
 			return err
 		}
-		c.emit(Instruction{Op: OpSortedSeek, P1: cur, P2: keyReg, P3: 1, P4: s.joinSortedSeek})
+		h := *s.joinSortedSeek
+		h.keyLen = len(c.insns) - start
+		c.emit(Instruction{Op: OpSortedSeek, P1: cur, P2: keyReg, P3: 1, P4: &h})
 		return nil
 	}
 	keyReg, err := c.compileExpr(s.joinIdxSeek.keyExpr)

@@ -196,7 +196,15 @@ func (l *segJoinLoop) level(in []Instruction, pc int) (int, bool) {
 		if _, ok := l.levelOf[in[pc].P1]; !ok {
 			return 0, false // the key comes from a level not entered yet
 		}
+		if h, _ := in[pc+1].P4.(*indexSeekHint); h != nil && h.order != nil {
+			return 0, false // each probe's rows are sorted into an index's order, which the kernel does not keep
+		}
 		pc += 2
+	}
+	// A sorted seek's key computed over the levels entered, which the kernel
+	// has no use for: it joins on the level's own terms.
+	if n, ok := segJoinSortedKey(in, pc, l.levelOf); ok {
+		pc += n + 1
 	}
 	// A LEFT JOIN's level clears its match flag before its Rewind.
 	flag := -1
@@ -1156,6 +1164,36 @@ func segJoinSeekHint(in []Instruction, pc int, opened map[int]bool) int {
 		return i + 1
 	}
 	return pc
+}
+
+// segJoinSortedKey reports how many instructions from pc compute an
+// OpSortedSeek's key, the seek following them: arithmetic over constants and
+// the columns of levels in levelOf, with no jump and nothing written but
+// registers.
+func segJoinSortedKey(in []Instruction, pc int, levelOf map[int]int) (int, bool) {
+	for n := 0; pc+n < len(in); n++ {
+		ins := in[pc+n]
+		switch ins.Op {
+		case OpSortedSeek:
+			// Then the Rewind, after a LEFT JOIN's match flag.
+			r := pc + n + 1
+			if r+1 < len(in) && in[r].Op == OpInteger && in[r].P1 == 0 {
+				r++
+			}
+			h, _ := ins.P4.(*sortedSeekHint)
+			return n, n > 0 && h != nil && h.keyLen == n && ins.P3 == 1 && r < len(in) &&
+				in[r].Op == OpRewind && in[r].P1 == ins.P1
+		case OpColumn:
+			if _, ok := levelOf[ins.P1]; !ok {
+				return 0, false
+			}
+		case OpInteger, OpInt64, OpReal, OpString8, OpNull, OpSCopy, OpCopy,
+			OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder:
+		default:
+			return 0, false
+		}
+	}
+	return 0, false
 }
 
 // segJoinMulti is the level of a value over several levels: computed on a

@@ -778,6 +778,8 @@ type sortedSeekHint struct {
 	col  int
 	coll string
 	aff  affinity
+	// keyLen is how many instructions before the OpSortedSeek compute its key.
+	keyLen int
 }
 
 // indexSeekHint is the P4 payload of OpSeekIndexHint: everything the runtime
