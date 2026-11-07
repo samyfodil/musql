@@ -64,6 +64,30 @@ type segGroupAcc struct {
 	lastDelta []int64
 }
 
+// segGroupSlab carves groups' argument arrays out of chunks, so a group costs
+// no allocation of its own.
+type segGroupSlab struct {
+	ints  []int64
+	uints []uint64
+}
+
+// take gives g its na-long arrays, the minimums and maximums at their identity.
+func (sl *segGroupSlab) take(g *segGroupAcc, na int) {
+	if len(sl.ints) < 3*na {
+		sl.ints = make([]int64, 3*na*segGroupSlabGroups)
+		sl.uints = make([]uint64, na*segGroupSlabGroups)
+	}
+	g.sums, g.mins, g.maxs = sl.ints[:na:na], sl.ints[na:2*na:2*na], sl.ints[2*na:3*na:3*na]
+	g.abs = sl.uints[:na:na]
+	sl.ints, sl.uints = sl.ints[3*na:], sl.uints[na:]
+	for a := range na {
+		g.mins[a], g.maxs[a] = math.MaxInt64, math.MinInt64
+	}
+}
+
+// segGroupSlabGroups is how many groups a slab chunk holds.
+const segGroupSlabGroups = 256
+
 // segGroupBulk's outcomes.
 const (
 	bulkNotEligible = iota // nothing written: walk the rows
@@ -176,7 +200,7 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 	// the one a single pass would have seen last.
 	na := len(plan.argCols)
 	dense := uint64(hi-lo) < segGroupBulkMaxDense
-	add := func(groups map[int64]*segGroupAcc, slots []segGroupAcc, k int64) *segGroupAcc {
+	add := func(groups map[int64]*segGroupAcc, slots []segGroupAcc, sl *segGroupSlab, k int64) *segGroupAcc {
 		var g *segGroupAcc
 		if slots != nil {
 			g = &slots[k-lo]
@@ -185,17 +209,14 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 			groups[k] = g
 		}
 		if g.sums == nil {
-			g.sums, g.abs = make([]int64, na), make([]uint64, na)
-			g.mins, g.maxs = make([]int64, na), make([]int64, na)
-			for a := range na {
-				g.mins[a], g.maxs[a] = math.MaxInt64, math.MinInt64
-			}
+			sl.take(g, na)
 		}
 		return g
 	}
 	type partial struct {
 		slots  []segGroupAcc
 		groups map[int64]*segGroupAcc
+		slab   segGroupSlab
 	}
 	parts := make([]partial, len(segs))
 	ok := segEach(len(segs), func(si int) bool {
@@ -241,7 +262,7 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 					continue
 				}
 			}
-			g := add(pt.groups, pt.slots, b.key[r])
+			g := add(pt.groups, pt.slots, &pt.slab, b.key[r])
 			if g.n++; g.n == 1 {
 				g.firstSeg, g.firstRow = si, r
 			}
@@ -275,14 +296,22 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 	if dense {
 		slots = make([]segGroupAcc, hi-lo+1)
 	}
+	var slab segGroupSlab
 	merge := func(k int64, from *segGroupAcc) bool {
 		if from.n == 0 {
 			return true
 		}
-		g := add(groups, slots, k)
-		if g.n == 0 {
-			g.firstSeg, g.firstRow = from.firstSeg, from.firstRow
+		// A group no earlier segment had takes this one's partial whole: the
+		// partials are not read again.
+		if dense && slots[k-lo].n == 0 {
+			slots[k-lo] = *from
+			return true
 		}
+		if !dense && groups[k] == nil {
+			groups[k] = from
+			return true
+		}
+		g := add(groups, slots, &slab, k)
 		g.n += from.n
 		g.lastSeg, g.lastRow = from.lastSeg, from.lastRow
 		for a := range na {
@@ -343,7 +372,7 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 				}
 				args[a] = vals[c].I
 			}
-			g := add(groups, slots, k)
+			g := add(groups, slots, &slab, k)
 			g.n++
 			g.lastDelta = args
 			for a, v := range args {

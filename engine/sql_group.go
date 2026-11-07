@@ -2362,8 +2362,9 @@ func cloneAggTemplates(templates []*aggItem) []*aggItem {
 		return nil
 	}
 	accs := make([]*aggItem, len(templates))
+	items := make([]aggItem, len(templates))
 	for i, tmpl := range templates {
-		accs[i] = new(aggItem)
+		accs[i] = &items[i]
 		resetAggItem(accs[i], tmpl)
 	}
 	return accs

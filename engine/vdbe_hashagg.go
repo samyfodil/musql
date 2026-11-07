@@ -29,6 +29,11 @@ type hashAggState struct {
 	buckets map[string]*hashAggBucket
 	sorted  []*hashAggBucket
 	pos     int
+	// made is the buckets in the order they were made, and unordered whether
+	// one was made below the one before it: until then made is already the
+	// drain's order (a scan in key order, the columnar walk's dense groups).
+	made      []*hashAggBucket
+	unordered bool
 }
 
 // hashAggStep is OpHashAggStep's body: find or create keyVals' bucket, make
@@ -74,8 +79,13 @@ func (m *vdbe) hashAggStepRow(plan *aggPlan, keyVals []Value, seg int, row, rowi
 	m.aggKeyBuf = hashAggKeyBytes(m.aggKeyBuf[:0], keyVals)
 	b := m.hashAgg.buckets[string(m.aggKeyBuf)]
 	if b == nil {
+		h := m.hashAgg
 		b = &hashAggBucket{key: append([]Value(nil), keyVals...), accs: newAggAccs(plan)}
-		m.hashAgg.buckets[string(m.aggKeyBuf)] = b
+		h.buckets[string(m.aggKeyBuf)] = b
+		if n := len(h.made); n > 0 && !h.unordered && !keyTupleLess(h.made[n-1].key, b.key, m.encoding()) {
+			h.unordered = true
+		}
+		h.made = append(h.made, b)
 	}
 	m.aggAccs = b.accs
 	// JSON subtype is cleared here for grouped queries, matching the sorted drain path.
@@ -91,17 +101,16 @@ func (m *vdbe) hashAggSort() bool {
 		return false
 	}
 	h := m.hashAgg
-	h.sorted = make([]*hashAggBucket, 0, len(h.buckets))
-	for _, b := range h.buckets {
-		h.sorted = append(h.sorted, b)
+	h.sorted = h.made
+	if h.unordered {
+		// BINARY order is memcmp over the encoded text, which in a UTF-16
+		// database is not UTF-8 byte order (utf16CompareUTF8); the sorted
+		// drain's sorter orders its groups the same way.
+		enc := m.encoding()
+		sort.Slice(h.sorted, func(i, j int) bool {
+			return keyTupleLess(h.sorted[i].key, h.sorted[j].key, enc)
+		})
 	}
-	// BINARY order is memcmp over the encoded text, which in a UTF-16 database
-	// is not UTF-8 byte order (utf16CompareUTF8); the sorted drain's sorter
-	// orders its groups the same way.
-	enc := m.encoding()
-	sort.Slice(h.sorted, func(i, j int) bool {
-		return keyTupleLess(h.sorted[i].key, h.sorted[j].key, enc)
-	})
 	h.pos = 0
 	return len(h.sorted) > 0
 }
