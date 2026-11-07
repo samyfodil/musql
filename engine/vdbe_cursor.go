@@ -1714,6 +1714,17 @@ func (cur *vdbeCursor) reseekRowStoreByPK(db *DB, tbl *tableMeta) bool {
 		key[i] = indexColumnValue(tbl, cur.rowid, cur.rowVals, ci)
 	}
 	enc := db.encoding()
+	if rowids, ok := tbl.rows.uniqConflictCandidates(tbl, pk, key, enc); ok {
+		for _, rid := range rowids {
+			if rvals, have := tbl.rows.get(rid); have && uniqueKeyMatches(db, tbl, pk, key, rid, rvals) {
+				cur.rowid = rid
+				cur.rowVals = normalizeRow(tbl.name, tbl.cols, tbl.ipkIndex, rid, rvals)
+				cur.rowRaw = nil
+				return true
+			}
+		}
+		return false
+	}
 	for rid, rvals := range tbl.rows.all() {
 		match := true
 		for i, ci := range pk.colIdx {

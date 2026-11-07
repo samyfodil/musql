@@ -246,6 +246,23 @@ func identifyTargetRow(tbl *tableMeta, key []Value) (uint64, error) {
 		return uint64(key[0].I), nil
 	}
 	cand := make([]Value, len(key))
+	// The store's unique index prunes to the rows whose key normalizes like
+	// this one, which includes the byte-identical one; keysEqual decides.
+	if rowids, ok := tbl.rows.uniqConflictCandidates(tbl, tbl.pkIndex, key, UTF8); ok {
+		for _, rowid := range rowids {
+			vals, have := tbl.rows.get(rowid)
+			if !have {
+				continue
+			}
+			for i, ci := range tbl.pkIndex.colIdx {
+				cand[i] = indexColumnValue(tbl, rowid, vals, ci)
+			}
+			if keysEqual(cand, key) {
+				return rowid, nil
+			}
+		}
+		return 0, fmt.Errorf("unsupported UPDATE ... FROM shape (the join produced a target PRIMARY KEY that matches no row of this WITHOUT ROWID table)")
+	}
 	for rowid, vals := range tbl.rows.all() {
 		for i, ci := range tbl.pkIndex.colIdx {
 			cand[i] = indexColumnValue(tbl, rowid, vals, ci)

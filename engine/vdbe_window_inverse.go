@@ -15,10 +15,8 @@ package engine
 // row.
 
 import (
-	"bytes"
 	"fmt"
 	"math"
-	"strconv"
 )
 
 // inverse is sumInverse / countInverse (func.c:1962, 2084): take one row back
@@ -243,65 +241,4 @@ func windowRunningEligible(call windowCall, tmpl *aggItem, spans []windowFrameSp
 		}
 	}
 	return true
-}
-
-// windowPartitionKey spells k, a PARTITION BY key, as a string two keys share
-// exactly when keysEqualCollated holds for them under colls: a numeric value
-// by its exact number (an integral REAL is its integer, as compareIntFloat
-// has it), a text by its bytes under NOCASE's ASCII fold or RTRIM's trailing
-// spaces, a blob by its bytes. ok is false where that equality is not a plain
-// byte equality: a UTF-16 database's comparison, or a NOCASE text holding a
-// NUL (sqlite3StrNICmp stops there).
-func windowPartitionKey(k []Value, colls []string, enc TextEncoding) (string, bool) {
-	if isUTF16(enc) {
-		return "", false
-	}
-	var b []byte
-	for i, v := range k {
-		switch v.Typ {
-		case Null:
-			b = append(b, 'N')
-		case Int:
-			b = append(b, 'I')
-			b = strconv.AppendInt(b, v.I, 10)
-		case Float:
-			f := v.F
-			if f == math.Trunc(f) && f >= -9223372036854775808 && f < 9223372036854775808 {
-				b = append(b, 'I')
-				b = strconv.AppendInt(b, int64(f), 10)
-			} else {
-				b = append(b, 'F')
-				b = strconv.AppendUint(b, math.Float64bits(f), 16)
-			}
-		case Text:
-			s := v.S
-			coll := atOrEmpty(colls, i)
-			switch {
-			case asciiEqualFold(coll, "NOCASE"):
-				if bytes.IndexByte(s, 0) >= 0 {
-					return "", false
-				}
-				folded := make([]byte, len(s))
-				for j, c := range s {
-					folded[j] = asciiLowerByte(c)
-				}
-				s = folded
-			case asciiEqualFold(coll, "RTRIM"):
-				s = rtrimTrailingSpaces(s)
-			}
-			b = append(b, 'T')
-			b = strconv.AppendInt(b, int64(len(s)), 10)
-			b = append(b, ':')
-			b = append(b, s...)
-		case Blob:
-			b = append(b, 'B')
-			b = strconv.AppendInt(b, int64(len(v.S)), 10)
-			b = append(b, ':')
-			b = append(b, v.S...)
-		default:
-			return "", false
-		}
-		b = append(b, ';')
-	}
-	return string(b), true
 }
