@@ -208,15 +208,15 @@ func (s seriesRows) fill(dst []int64, r0 uint64, col int) {
 		run *= x.count
 	}
 	k, at := r0/run%sr.count, r0%run
-	v := sr.start + int64(k)*sr.step
+	v := sr.base + int64(k)*sr.by
 	for j := range dst {
 		dst[j] = v
 		if at++; at == run {
 			at = 0
 			k++
-			v += sr.step
+			v += sr.by
 			if k == sr.count {
-				k, v = 0, sr.start
+				k, v = 0, sr.base
 			}
 		}
 	}

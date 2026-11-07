@@ -232,6 +232,14 @@ func withVtabWhere(p *ReadOnlyPager, stmt *SelectStmt) []FromItem {
 	if stmt.Where != nil {
 		conj = splitTopLevelAnd(stmt.Where)
 	}
+	// "x BETWEEN a AND b" is also offered as "x >= a" and "x <= b", the two
+	// virtual terms exprAnalyze adds for it (whereexpr.c, TK_BETWEEN). They go
+	// after the conjuncts, whose positions the omit stamps count.
+	for _, e := range conj[:len(conj):len(conj)] {
+		if b, ok := e.(BetweenExpr); ok && !b.Not {
+			conj = append(conj, BinaryExpr{Op: ">=", L: b.X, R: b.Lo}, BinaryExpr{Op: "<=", L: b.X, R: b.Hi})
+		}
+	}
 	out := make([]FromItem, len(from))
 	copy(out, from)
 	for i := range out {

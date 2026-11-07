@@ -126,10 +126,18 @@ func TestGenerateSeriesRowid(t *testing.T) {
 // TestGenerateSeriesSpanOverflow verifies overflow handling at span limits.
 func TestGenerateSeriesSpanOverflow(t *testing.T) {
 	p := newEmptyPager(t)
-	if _, _, err := p.Query("SELECT value FROM generate_series(-9223372036854775808, 9223372036854775807, 2) WHERE value BETWEEN 1 AND 5"); err == nil {
+	if _, _, err := p.Query("SELECT value FROM generate_series(-9223372036854775808, 9223372036854775807, 2)"); err == nil {
 		t.Error("the whole-range series answered; want the materialization limit")
 	}
-	_, rows, err := p.Query("SELECT value FROM generate_series(9223372036854760000,9223372036854775807,10000)")
+	// The value constraints narrow it first, as seriesFilter does.
+	_, rows, err := p.Query("SELECT value FROM generate_series(-9223372036854775808, 9223372036854775807, 2) WHERE value BETWEEN 1 AND 5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := vtabRowsInt(t, rows, 0); !eqInts(got, []int64{2, 4}) {
+		t.Errorf("narrowed whole-range series = %v, want [2 4]", got)
+	}
+	_, rows, err = p.Query("SELECT value FROM generate_series(9223372036854760000,9223372036854775807,10000)")
 	if err != nil {
 		t.Fatal(err)
 	}
