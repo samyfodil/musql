@@ -173,9 +173,9 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 
 		if derived {
 			// A derived table: run its uncorrelated subquery once with a nil outer
-			// scope (no LATERAL, as in C). The schema-only retry instead derives
-			// the columns from the subquery's expression list without running it
-			// (derivedSchemaCols, ReadOnlyPager.derivedSchemaOnly).
+			// scope (no LATERAL, as in C). The schema-only retry, and a caller that
+			// wants columns only, instead derive the columns from the subquery's
+			// expression list without running it (derivedSchemaCols).
 			cols, ok := p.derivedSchemaCols(it.Subquery)
 			var subRows [][]Value
 			if !ok {
@@ -674,8 +674,10 @@ func (p *ReadOnlyPager) resolveFromSchemaOnly(items []FromItem) ([]joinedTable, 
 }
 
 // derivedSchemaCols builds a FROM subquery's column list without running it,
-// or returns (nil, false) when the schema-only retry is inactive or the body
-// does not compile.
+// or returns (nil, false) when neither the schema-only retry nor a
+// columns-only resolve (derivedSelectScope) is under way, or the body does not
+// compile. Running it there ran a GROUP BY over a whole table at compile time
+// to learn one column's affinity (TPC-H q20).
 //
 // Names come from the body's compiled program, matching
 // sqlite3ColumnsFromExprList over the leftmost arm (select.c:5901-5902);
@@ -683,7 +685,7 @@ func (p *ReadOnlyPager) resolveFromSchemaOnly(items []FromItem) ([]joinedTable, 
 // pushes the body's own CTE scope first, since derivedColumnInfos re-resolves
 // the body's FROM.
 func (p *ReadOnlyPager) derivedSchemaCols(sub *SelectStmt) ([]columnInfo, bool) {
-	if !p.derivedSchemaOnly || sub == nil {
+	if !p.derivedSchemaOnly && !p.fromColumnsOnly || sub == nil {
 		return nil, false
 	}
 	prog, err := compileSubProgram(p, sub, nil)
