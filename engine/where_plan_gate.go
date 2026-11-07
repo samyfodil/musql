@@ -2288,6 +2288,12 @@ func wherePlanColUsed(p *ReadOnlyPager, c *compiler, jts []joinedTable, scopes [
 			if c.outer == nil && ce.Qualifier == "" && ce.FallbackLiteral != nil {
 				return true
 			}
+			// A result-column alias no FROM item has a column for: lookupName
+			// takes it from the select list (resolveAlias, resolve.c:688), a
+			// copy of what the select list already credited.
+			if ce.Qualifier == "" && selectAliasIndex(stmt, ce.Name) >= 0 && !anyScopeHasColumn(scopes, ce.Name) {
+				return true
+			}
 			ok = false
 			return false
 		}
@@ -2352,6 +2358,11 @@ func wherePlanColUsed(p *ReadOnlyPager, c *compiler, jts []joinedTable, scopes [
 		walk(e)
 	}
 	for _, ot := range stmt.OrderBy {
+		// An ORDER BY that is a bare alias names that result column before any
+		// FROM column (resolveAsName, resolve.c:1816), and credits nothing.
+		if ce, isCol := ot.Expr.(ColumnExpr); isCol && ce.Qualifier == "" && ce.Schema == "" && selectAliasIndex(stmt, ce.Name) >= 0 {
+			continue
+		}
 		walk(ot.Expr)
 	}
 	for i := range srcs {
@@ -2362,6 +2373,28 @@ func wherePlanColUsed(p *ReadOnlyPager, c *compiler, jts []joinedTable, scopes [
 		return nil, false
 	}
 	return out, true
+}
+
+// selectAliasIndex is the position of the first result column stmt names
+// name with AS, or -1.
+func selectAliasIndex(stmt *SelectStmt, name string) int {
+	for i, sc := range stmt.Columns {
+		if sc.HasAlias && !sc.Star && equalFoldName(sc.Alias, name) {
+			return i
+		}
+	}
+	return -1
+}
+
+// anyScopeHasColumn reports whether some FROM item has a column called name.
+func anyScopeHasColumn(scopes []tableScope, name string) bool {
+	lname := r33sFoldIdent(name)
+	for i := range scopes {
+		if _, hit := scopes[i].colIndex[lname]; hit {
+			return true
+		}
+	}
+	return false
 }
 
 // wherePlanWalkColumns calls visit for every plain column reference in e,
