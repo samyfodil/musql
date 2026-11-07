@@ -32,6 +32,10 @@ type compiler struct {
 	// can change.
 	rowOrderFree bool
 
+	// inConstOnce is set while compileFunc codes a call it computes once, so
+	// the call itself compiles plainly.
+	inConstOnce bool
+
 	// recSelfKeepsRow maps the cursor of a recursive CTE's self-reference to
 	// whether an outer join's NULL extension of it keeps the current queue row
 	// (C's pseudo-cursor; emitNullExtend). Set by emitJoinLoops; a cursor
@@ -511,6 +515,45 @@ func (c *compiler) here() int { return len(c.insns) }
 
 // patch sets instruction addr's jump target (P2) to target.
 func (c *compiler) patch(addr, target int) { c.insns[addr].P2 = target }
+
+// constOnceBlock reports whether in[pc] opens the block compileFunc codes
+// for a call computed once -- "NotNull flag, end"; the call; "Copy r, dst";
+// "Integer 1, flag" -- returning the address past it and its flag register.
+// Whatever the flag holds, the block leaves dst the call's value, so a reader
+// may take the block as straight-line code.
+func constOnceBlock(in []Instruction, pc int) (end, flag int, ok bool) {
+	if pc < 0 || pc >= len(in) || in[pc].Op != OpNotNull {
+		return 0, 0, false
+	}
+	end, flag = in[pc].P2, in[pc].P1
+	if end-2 <= pc+1 || end > len(in) {
+		return 0, 0, false
+	}
+	if cp, set := in[end-2], in[end-1]; cp.Op != OpCopy || set.Op != OpInteger || set.P1 != 1 || set.P2 != flag {
+		return 0, 0, false
+	}
+	return end, flag, true
+}
+
+// dateTimeLiteralCall reports a date/time function called on literals only,
+// none of them 'now': a value fixed for the statement.
+func dateTimeLiteralCall(x FuncExpr) bool {
+	switch x.Name {
+	case "date", "time", "datetime", "julianday", "unixepoch", "strftime":
+	default:
+		return false
+	}
+	if len(x.Args) == 0 || x.Star || x.Distinct || x.Filter != nil || x.Over != nil || len(x.OrderBy) > 0 {
+		return false
+	}
+	for _, a := range x.Args {
+		lit, ok := a.(LiteralExpr)
+		if !ok || lit.materialized || lit.Val.Typ == Text && asciiEqualFold(string(lit.Val.S), "now") {
+			return false
+		}
+	}
+	return true
+}
 
 // errVDBEUnsupported is returned (wrapped) whenever the compiler meets a
 // construct outside this increment's scope. The integration layer treats any
@@ -4064,6 +4107,25 @@ func declineOrSemantic(err error) error {
 // a wrong-arity call errors even when no row runs it ("SELECT coalesce(1) FROM
 // t LIMIT 0").
 func (c *compiler) compileFunc(x FuncExpr) (int, error) {
+	// A date/time call on literals alone, 'now' aside, has one value for the
+	// whole statement and raises no error, so it is computed once, the first
+	// time it is reached, as C codes a constant expression once
+	// (sqlite3ExprCodeRunJustOnce). A filter on "l_shipdate < date('1995-01-01')"
+	// called it for every row.
+	if !c.inConstOnce && dateTimeLiteralCall(x) {
+		flag, dst := c.alloc(), c.alloc()
+		skip := c.emit(Instruction{Op: OpNotNull, P1: flag})
+		c.inConstOnce = true
+		r, err := c.compileFunc(x)
+		c.inConstOnce = false
+		if err != nil {
+			return 0, err
+		}
+		c.emit(Instruction{Op: OpCopy, P1: r, P2: dst})
+		c.emit(Instruction{Op: OpInteger, P1: 1, P2: flag})
+		c.patch(skip, c.here())
+		return dst, nil
+	}
 	// "f(*)" on a non-aggregate is "f()": the grammar passes zero arguments and the
 	// arity check decides (abs(*) is an arity error).
 	// likelihood()'s probability is checked when the call is coded, as C does: a

@@ -1243,6 +1243,9 @@ func (tr *segJoinTrace) region(pc, limit int) (int, bool) {
 			}
 		}
 		for _, r := range reads {
+			if _, flag, once := constOnceBlock(tr.in, i); once && r == flag {
+				continue // a call computed once: its flag picks no value
+			}
 			// A register written before the run carries that value into
 			// every path that does not write it again: its definition is
 			// part of the expression whether or not the run writes it too.
@@ -1272,12 +1275,20 @@ func (tr *segJoinTrace) region(pc, limit int) (int, bool) {
 	// with none, not written on every path, would read whatever the register
 	// last held -- another row's value -- so it is left untraced, and
 	// anything that reads it declines.
+	//
+	// A call computed once (constOnceBlock) is the exception: its writes are
+	// skipped only once they have been made, so they hold the call's value
+	// either way.
+	once := false
+	if e, _, ok := constOnceBlock(tr.in, pc); ok && e == end {
+		once = true
+	}
 	var partial []int
 	for _, o := range outs {
 		if src, ok := tr.src[o]; ok {
 			level = segJoinMix(level, src.level)
 			deps = append(deps, tr.deps[o]...)
-		} else if !tr.writtenOnEveryPath(pc, end, o) {
+		} else if !once && !tr.writtenOnEveryPath(pc, end, o) {
 			partial = append(partial, o)
 		}
 	}
