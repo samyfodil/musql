@@ -136,3 +136,59 @@ func (a *Asm) AndRegImm8(dst Reg, imm int8) {
 	a.rex(0, dst)
 	a.emit(0x83, modrm(0b11, 4, dst), byte(imm))
 }
+
+// VmovdquLoadIdx is  dst = [base + index*8]  (256-bit, unaligned).
+func (a *Asm) VmovdquLoadIdx(dst, base, index Reg) {
+	a.vexm(dst, index, base, 0, vexMap0F, 0, 1, vexPF3)
+	if base&7 == RBP {
+		a.emit(0x6F, modrm(0b01, dst, 0b100), sib(3, index, base), 0)
+		return
+	}
+	a.emit(0x6F, modrm(0b00, dst, 0b100), sib(3, index, base))
+}
+
+// VpmuldqYmm is  dst = src1 * src2, the low signed 32 bits of each 64-bit
+// lane multiplied into all 64.
+func (a *Asm) VpmuldqYmm(dst, src1, src2 Reg) {
+	a.vinst(0x28, dst, src1, src2, vexMap0F38, 0, 1, vexP66, false)
+}
+
+// VpsrlqYmm is  dst = src >> imm, four uint64 lanes.
+func (a *Asm) VpsrlqYmm(dst, src Reg, imm byte) {
+	a.vex3(2, src, dst, vexMap0F, 0, 1, vexP66, false) // 73 /2
+	a.emit(0x73, modrm(0b11, 2, src), imm)
+}
+
+// VpsllvqYmm is  dst = src1 << src2, lane by lane; an amount past 63 gives 0.
+func (a *Asm) VpsllvqYmm(dst, src1, src2 Reg) {
+	a.vinst(0x47, dst, src1, src2, vexMap0F38, 1, 1, vexP66, false)
+}
+
+// VpsrlvqYmm is  dst = src1 >> src2, unsigned, lane by lane; an amount past
+// 63 gives 0.
+func (a *Asm) VpsrlvqYmm(dst, src1, src2 Reg) {
+	a.vinst(0x45, dst, src1, src2, vexMap0F38, 1, 1, vexP66, false)
+}
+
+// VmovmskpdYmm is  gpr dst = the four lanes' sign bits.
+func (a *Asm) VmovmskpdYmm(dst, src Reg) {
+	a.vinst(0x50, dst, 0, src, vexMap0F, 0, 1, vexP66, true)
+}
+
+// VpbroadcastqMem fills every lane of dst with [base + slot*8].
+func (a *Asm) VpbroadcastqMem(dst, base Reg, slot int) {
+	a.vexm(dst, 0, base, 0, vexMap0F38, 0, 1, vexP66)
+	a.emit(0x59, modrm(0b10, dst, base))
+	if base&7 == RSP {
+		a.emit(0x24)
+	}
+	a.emit32(uint32(int32(slot * 8)))
+}
+
+// VpbroadcastqRIP fills every lane of dst with the quadword at label.
+func (a *Asm) VpbroadcastqRIP(dst Reg, label string) {
+	a.vexm(dst, 0, 0, 0, vexMap0F38, 0, 1, vexP66)
+	a.emit(0x59, modrm(0b00, dst, 0b101))
+	a.fixups = append(a.fixups, fixup{at: len(a.buf), label: label})
+	a.emit(0, 0, 0, 0)
+}

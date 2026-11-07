@@ -487,6 +487,19 @@ func Fuse(insns []ProgInsn) []ProgInsn {
 	}
 }
 
+// fuseStraight is Fuse without turning conditions into branches, for the
+// vector loop (EmitProgramVec), which tests a row by clearing its lane.
+func fuseStraight(insns []ProgInsn) []ProgInsn {
+	out := insns
+	for {
+		next, changed := fuseOnce(out)
+		if !changed {
+			return next
+		}
+		out = next
+	}
+}
+
 // fusedSteps counts the steps fusion has removed, for a test to see it ran.
 var fusedSteps atomic.Int64
 
