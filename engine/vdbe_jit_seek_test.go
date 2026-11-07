@@ -110,3 +110,77 @@ func TestVMJITSeekDifferential(t *testing.T) {
 	}
 	t.Logf("%d queries agree; native code walked a seek in %d entries", len(queries), snaps)
 }
+
+// TestVMJITScanBatchDifferential: loops native code runs whole over a streamed
+// segment scan, which it walks a batch at a time (seekSnap): LIMITs that stop
+// a batch part way, filters that skip most rows, rows narrower than the table
+// after an ADD COLUMN, REAL affinity, INTEGERs and REALs in one column, and
+// NULLs. With the JIT and without, every row must match.
+func TestVMJITScanBatchDifferential(t *testing.T) {
+	lowEntryThreshold(t)
+	countSyncs(t)
+	if !vmJITEnabled {
+		t.Skip("JIT not enabled on this platform")
+	}
+	rng := rand.New(rand.NewSource(12))
+	setup := []string{"CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b REAL, n INT, c TEXT)"}
+	for i := 1; i <= 3000; i++ {
+		n := fmt.Sprint(rng.Intn(50))
+		if i%3 == 0 {
+			n = fmt.Sprintf("%d.5", rng.Intn(50))
+		}
+		a := fmt.Sprint(rng.Intn(20))
+		if i%11 == 0 {
+			a = "NULL"
+		}
+		setup = append(setup, fmt.Sprintf("INSERT INTO t VALUES(%d, %s, %d, %s, 's%d')", i, a, rng.Intn(9), n, rng.Intn(7)))
+	}
+	setup = append(setup, "ALTER TABLE t ADD COLUMN d DEFAULT 7", "VACUUM", "ALTER TABLE t ADD COLUMN e DEFAULT 5")
+	queries := []string{
+		"SELECT id, a, b, n FROM t WHERE a > 15",
+		"SELECT id, n FROM t WHERE a = 3 LIMIT 7",
+		"SELECT id FROM t WHERE a < 2 LIMIT 300",
+		"SELECT id, b, d, e FROM t WHERE a = 19",
+		"SELECT id, a + 1 FROM t WHERE id % 13 = 0",
+		"SELECT n, c FROM t WHERE a = 4 AND id > 2000",
+		"SELECT id FROM t WHERE a IS NULL",
+	}
+	run := func(jitOn bool) []string {
+		old := vmJITEnabled
+		vmJITEnabled = jitOn
+		defer func() { vmJITEnabled = old }()
+		n, err := OpenOrCreate(filepath.Join(t.TempDir(), "s.musq"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer n.Close()
+		for _, s := range setup {
+			if _, _, err := n.ExecArgs(s, nil); err != nil {
+				t.Fatalf("%s: %v", s, err)
+			}
+			n.CommitIfAutocommit()
+		}
+		out := make([]string, len(queries))
+		for i, q := range queries {
+			cols, rows, err := n.Query(q, nil)
+			if err != nil {
+				t.Fatalf("%s: %v", q, err)
+			}
+			out[i] = fmt.Sprint(cols, rows)
+		}
+		return out
+	}
+	want := run(false)
+	before := vmJITSeekSnaps.Load()
+	got := run(true)
+	snaps := vmJITSeekSnaps.Load() - before
+	for i := range queries {
+		if want[i] != got[i] {
+			t.Fatalf("JIT diverges on %s\nvdbe %s\njit  %s", queries[i], want[i], got[i])
+		}
+	}
+	if snaps == 0 {
+		t.Fatalf("native code walked no scan: the test checks nothing")
+	}
+	t.Logf("%d queries agree; native code walked a scan in %d entries", len(queries), snaps)
+}

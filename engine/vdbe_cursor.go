@@ -913,6 +913,7 @@ func (cur *vdbeCursor) startSegSource(src *segRowSource) {
 	cur.segSrc = src
 	cur.segSrcCols = src.cols
 	cur.segCur = nil
+	cur.seekGen = seekGens.Add(1)
 	cur.streamErrPending = nil
 	cur.pos = -1
 	cur.rowidNull = false

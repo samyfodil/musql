@@ -261,7 +261,8 @@ type VCursor struct {
 	// Adv is non-zero when native code may advance the cursor (VNext). A cursor
 	// the engine can only read -- a streamed scan's current row, copied into a
 	// one-row list for the length of the call -- has Adv and Rewind zero, so
-	// native code never moves it.
+	// native code never moves it. Adv 2 says the cursor has rows past the N
+	// handed over: a VNext off the end exits rather than falling through.
 	Adv int64
 	// Mask has bit c set for each column c < 64 native code may read; a
 	// column outside it exits. A materialized cursor has them all. A copied

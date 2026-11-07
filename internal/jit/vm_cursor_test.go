@@ -181,6 +181,20 @@ func TestVMCursorColumnAndNext(t *testing.T) {
 			t.Fatalf("column 1, in the mask: pc %d r1 %+v", pc, regs[1])
 		}
 	})
+	t.Run("a batch with rows past it exits at its end", func(t *testing.T) {
+		rows := newRows(10)
+		regs, cur := newRegs(), cursor(rows, 3)
+		cur.Adv = 2
+		if pc := runVMCursor(t, prog, regs, rows, cur, 0); pc != 4 {
+			t.Fatalf("stopped at %d, want 4 (the Next, for the VDBE's)", pc)
+		}
+		if want := int64(11 * (3 + 4 + 5 + 6 + 7 + 8 + 9)); regs[2].I != want {
+			t.Fatalf("sum %d, want %d", regs[2].I, want)
+		}
+		if cur.Pos != 9 || cur.Last != 9 {
+			t.Fatalf("cursor left at pos %d last %d, want 9, 9: on the batch's last row", cur.Pos, cur.Last)
+		}
+	})
 	t.Run("next on a cursor native code may read but not move", func(t *testing.T) {
 		rows := newRows(2)
 		cur := cursor(rows, 0)

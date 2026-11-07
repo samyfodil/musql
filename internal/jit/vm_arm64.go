@@ -926,15 +926,23 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		a.Cbz(X10, e.stub(pc))
 		e.ldrAt(X10, X9, cb+VCursorOffPos)
 		a.AddImm(X10, X10, 1)
+		e.ldrAt(X11, X9, cb+VCursorOffN)
+		a.Cmp(X10, X11)
+		a.BcondRaw(armHS, done)
 		e.strAt(X10, X9, cb+VCursorOffPos)
 		a.MovImm16(X11, 1)
 		e.strAt(X11, X9, cb+VCursorOffDirty)
-		e.ldrAt(X11, X9, cb+VCursorOffN)
-		a.Cmp(X10, X11)
-		a.BcondRaw(armHS, done) // off the end: fall through
 		e.strAt(X10, X9, cb+VCursorOffLast)
 		e.jmpBlock(pc, in.T)
 		a.Label(done)
+		// Off the end of the rows handed over: one with more past them (Adv 2)
+		// exits for the VDBE's OP_Next to fetch them; any other falls through.
+		e.ldrAt(X11, X9, cb+VCursorOffAdv)
+		a.CmpImm(X11, 2)
+		a.Bcond(CondE, e.stub(pc))
+		e.strAt(X10, X9, cb+VCursorOffPos)
+		a.MovImm16(X11, 1)
+		e.strAt(X11, X9, cb+VCursorOffDirty)
 	case VOpen, VClose:
 		e.unmap(^in.A)
 		cb := in.A * VCursorSize

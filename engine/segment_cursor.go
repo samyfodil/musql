@@ -1,6 +1,9 @@
 package engine
 
-import "sync/atomic"
+import (
+	"encoding/binary"
+	"sync/atomic"
+)
 
 // A LAZY row source over a table's segments.
 //
@@ -133,6 +136,13 @@ type segRowSource struct {
 	listPos  int
 	listSegs []*segment
 	listRows []int
+
+	// ahead is the rows a scan has pulled past the cursor's (lookahead), which
+	// next serves, from aheadPos, before pulling more; drained is set once a
+	// pull found none left.
+	ahead    []segAheadRow
+	aheadPos int
+	drained  bool
 
 	// cols is the per-column work segColumn would otherwise redo on every row.
 	// All four facts are properties of the TABLE, not of the row, and deriving
@@ -393,9 +403,44 @@ func segRowSourceWins(cur *vdbeCursor) bool {
 	return wanted*2 <= n
 }
 
+// segAheadRow is one row a scan pulled ahead.
+type segAheadRow struct {
+	s     *segment
+	row   int
+	rowid uint64
+}
+
 // next advances to the next row, or reports false at the end of the last
 // segment.
 func (src *segRowSource) next() (s *segment, row int, rowid uint64, ok bool) {
+	if src.aheadPos < len(src.ahead) {
+		r := src.ahead[src.aheadPos]
+		src.aheadPos++
+		return r.s, r.row, r.rowid, true
+	}
+	return src.pull()
+}
+
+// lookahead pulls rows until k wait past the current one, or none are left,
+// and returns those waiting, in the order next will serve them.
+func (src *segRowSource) lookahead(k int) []segAheadRow {
+	if src.aheadPos > 0 {
+		n := copy(src.ahead, src.ahead[src.aheadPos:])
+		src.ahead, src.aheadPos = src.ahead[:n], 0
+	}
+	for len(src.ahead) < k && !src.drained {
+		s, row, rowid, ok := src.pull()
+		if !ok {
+			src.drained = true
+			break
+		}
+		src.ahead = append(src.ahead, segAheadRow{s, row, rowid})
+	}
+	return src.ahead
+}
+
+// pull is next past the rows pulled ahead.
+func (src *segRowSource) pull() (s *segment, row int, rowid uint64, ok bool) {
 	if src.point {
 		if src.pointDone {
 			return nil, 0, 0, false
@@ -526,6 +571,55 @@ func segColumnValue(plans []segColPlan, s *segment, row, width int, rowid uint64
 		return Value{Typ: Float, F: float64(v.I)}
 	}
 	return v
+}
+
+// segColumnRun is segColumnValue for column c of len(rowids) consecutive rows
+// of s from row i0, written to dst[0], dst[stride], and so on.
+func segColumnRun(plans []segColPlan, s *segment, c, i0 int, rowids []uint64, dst []Value, stride int) {
+	if !s.fullWidth || c < 0 || c >= len(s.cols) || c >= len(plans) {
+		for k, rid := range rowids {
+			dst[k*stride] = segColumnValue(plans, s, i0+k, min(s.Width(i0+k), len(plans)), rid, c)
+		}
+		return
+	}
+	plan, col := &plans[c], s.cols[c]
+	var nulls []byte
+	if col.nullOff != 0 {
+		nulls = s.buf[col.nullOff:]
+	}
+	var exc []uint64
+	if s.excRows != nil {
+		exc = s.excRows[c]
+	}
+	fixed := !col.bounds && (col.phys == PhysInt64 || col.phys == PhysFloat64)
+	var block []byte
+	if fixed {
+		block = s.buf[col.blockOff:]
+	}
+	for k, rid := range rowids {
+		i := i0 + k
+		var v Value
+		switch {
+		case nulls != nil && nulls[i/8]&(1<<uint(i%8)) != 0:
+		case exc != nil && exc[i/64]&(1<<uint(i%64)) != 0:
+			v = s.exc[uint64(i)*uint64(len(s.cols))+uint64(c)]
+		case fixed:
+			raw := binary.LittleEndian.Uint64(block[i*segCellWidth:])
+			if col.phys == PhysInt64 {
+				v = Value{Typ: Int, I: int64(raw)}
+			} else {
+				v = Value{Typ: Float, F: bitsFloat(raw)}
+			}
+		default:
+			v = s.Value(c, i)
+		}
+		if plan.isIPK && v.Typ == Null {
+			v = Value{Typ: Int, I: int64(rid)}
+		} else if plan.isReal && v.Typ == Int {
+			v = Value{Typ: Float, F: float64(v.I)}
+		}
+		dst[k*stride] = v
+	}
 }
 
 // segFullRow builds the whole row, for the readers that consume one at once
