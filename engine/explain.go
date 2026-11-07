@@ -142,6 +142,9 @@ func (p *ReadOnlyPager) explainProgram(inner string) (*Program, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(stmt.CTEs) > 0 {
+		defer p.pushCTEScope(stmt.CTEs)()
+	}
 	return p.explainCompile(stmt)
 }
 
@@ -257,6 +260,9 @@ func (p *ReadOnlyPager) explainQueryPlanRows(inner string) (cols []string, rows 
 		stmt, perr := p.explainParse(inner)
 		if perr != nil {
 			return nil, nil, perr
+		}
+		if len(stmt.CTEs) > 0 {
+			defer p.pushCTEScope(stmt.CTEs)()
 		}
 		if lines, err = p.explainPlanOf(stmt); err != nil {
 			return nil, nil, err
