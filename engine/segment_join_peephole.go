@@ -191,7 +191,7 @@ func (l *segJoinLoop) level(in []Instruction, pc int) (int, bool) {
 		rewindAt++
 	}
 	if rewindAt < len(in) && in[pc].Op == OpColumn &&
-		(in[pc+1].Op == OpSeekRowidHint || in[pc+1].Op == OpSeekIndexHint) &&
+		(in[pc+1].Op == OpSeekRowidHint || in[pc+1].Op == OpSeekIndexHint || in[pc+1].Op == OpSortedSeek) &&
 		in[pc+1].P2 == in[pc].P3 && in[pc+1].P3 == 1 && in[rewindAt].Op == OpRewind && in[rewindAt].P1 == in[pc+1].P1 {
 		if _, ok := l.levelOf[in[pc].P1]; !ok {
 			return 0, false // the key comes from a level not entered yet

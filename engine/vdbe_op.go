@@ -758,8 +758,27 @@ const (
 	// where an expression reads the column, which is where this is placed.
 	OpGenErrCheck // P1: register.
 
+	// OpSortedSeek: P1: cursor. P2: key register. P3: 1. P4: *sortedSeekHint.
+	// Narrows a join level's materialized cursor P1 to the rows whose column
+	// P4.col equals r[P2], coerced with P4.aff, under P4.coll. The first one
+	// sorts a copy of the cursor's rows by that column, stably, so each key's
+	// run keeps the order a full scan would have visited it in (the scan's own,
+	// or the one OpAutoIndexOrder put it in): the rows the level's loop passes
+	// arrive as they would without the seek. Every conjunct is still evaluated
+	// in the loop, and a cursor it cannot sort keeps all its rows.
+	OpSortedSeek
+
 	numOpCodes // sentinel: count of opcodes, for the disassembler's name table.
 )
+
+// sortedSeekHint is the P4 payload of OpSortedSeek: the column the rows are
+// sorted and searched by, its comparison's collation, and the affinity the
+// comparison applies to the key.
+type sortedSeekHint struct {
+	col  int
+	coll string
+	aff  affinity
+}
 
 // indexSeekHint is the P4 payload of OpSeekIndexHint: everything the runtime
 // needs, beyond the key register, to configure a secondary-index leading-column

@@ -1242,7 +1242,7 @@ func (prog *Program) outerCtxUnread() bool {
 			OpColumn, OpRowid, OpOuterColumn, OpOuterRowid,
 			OpInteger, OpVariable, OpNull, OpString8, OpReal, OpSCopy, OpCopy,
 			OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull,
-			OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpSeekRowidSetHint, OpAutoIndexOrder, OpResultRow:
+			OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpSeekRowidSetHint, OpAutoIndexOrder, OpSortedSeek, OpResultRow:
 		default:
 			unread = false
 		}
@@ -2095,10 +2095,24 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			// The cursor materializes on its first rewind; force that now so the
 			// permutation below is the one every later rewind re-iterates.
 			cur.params = m.params // see vdbeCursor.params
+			cur.unsort()
 			if rerr := cur.rewind(); rerr != nil {
 				return nil, rerr
 			}
 			autoIndexOrderCursor(cur, op.P4.(*autoIndexKey), m.encoding())
+
+		case OpSortedSeek:
+			cur := m.cursors[op.P1]
+			if cur == nil || cursorHasNoBtree(cur) || cur.rowStore != nil || cur.streamable || cur.seekReseek || cur.refillEach {
+				break // a cursor whose rows are not one list built once
+			}
+			if !cur.materialized {
+				cur.params = m.params
+				if rerr := cur.rewind(); rerr != nil {
+					return nil, rerr
+				}
+			}
+			cur.sortedSeek(op.P4.(*sortedSeekHint), m.regs[op.P2], m.encoding())
 
 		case OpMultiOrTag:
 			cur := m.cursors[op.P1]
@@ -2426,6 +2440,14 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				}
 			}
 			cur := m.cursors[op.P1]
+			if cur != nil && cur.sorted != nil && cur.sorted.ok {
+				// A seek narrowed the rows; the full list answers.
+				if len(cur.sorted.orig) == 0 {
+					pc = op.P2
+					continue
+				}
+				break
+			}
 			if cur == nil || (cur.tbl == nil && cur.fill == nil) || cur.rowStore != nil || cur.sub != nil || cur.vt != nil || cur.streamable || cur.seekConfigured ||
 				cur.seekSetConfigured || cur.idxSeekConfigured || cur.seekReseek || cur.segFilter != nil {
 				break
@@ -2537,6 +2559,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpRightJoinSweepOrder:
 			cur := m.cursors[op.P1]
+			cur.unsort()
 			if !cur.materialized {
 				if rerr := cur.rewind(); rerr != nil {
 					return nil, rerr
@@ -2549,6 +2572,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpRightJoinSweepRewind:
 			cur := m.cursors[op.P1]
+			cur.unsort()
 			if !cur.materialized {
 				// The main pass never reached this cursor's OpRewind (e.g. an
 				// empty preceding table) -- materialize it now so the sweep

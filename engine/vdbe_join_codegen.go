@@ -262,6 +262,13 @@ type joinSource struct {
 	joinSeekKeyExpr Expr
 	joinIdxSeek     *indexSeekPlan
 
+	// joinSortedKey and joinSortedSeek seek this level's rows sorted by one
+	// column, per outer row (OpSortedSeek), where no index or rowid seek
+	// applies: joinSortedKey is the key over the outer tables. Set by
+	// annotateJoinSeeks.
+	joinSortedKey  Expr
+	joinSortedSeek *sortedSeekHint
+
 	// memberScopes, non-nil only for a materialized parenthesized join group
 	// (resolveGroupSource), lists its leaf member scopes in FROM order, each on the
 	// group's one derived cursor with its own columns (offset via colBase). scope is

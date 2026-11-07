@@ -40,7 +40,10 @@
 // DESC-leading index (secondaryIndexSeekCandidates).
 package engine
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
 // annotateJoinSeeks records a correlated inner-side seek plan on every inner
 // join source (depth >= 1) whose key can be safely seeked, so emitJoinLevel
@@ -61,15 +64,9 @@ func annotateJoinSeeks(c *compiler, srcs []joinSource, plan joinPlan) {
 	for level := 1; level < len(order); level++ {
 		origIdx := order[level]
 		s := srcs[origIdx]
-		// INNER and LEFT; decline RIGHT/FULL, derived tables, and WITHOUT ROWID
-		// tables (see this file's package doc comment).
-		if s.rightOuter || s.derived != nil || s.tbl == nil || s.tbl.withoutRowid {
+		if s.derived != nil || s.tbl == nil {
 			continue
 		}
-		// A level the planner gave an index-order key has a decided visit
-		// order. OpAutoIndexOrder declines a re-seeking cursor (it
-		// re-materializes a different row set per rewind), so the seek is kept
-		// only where its order provably agrees (joinSeekReproducesKey).
 		var planKey *autoIndexKey
 		if level < len(plan.autoIdxKeys) {
 			planKey = plan.autoIdxKeys[level]
@@ -88,56 +85,77 @@ func annotateJoinSeeks(c *compiler, srcs []joinSource, plan joinPlan) {
 		// part of the match-vs-NULL-extend decision, so pruning with one could
 		// NULL-extend a row SQLite would join. planJoinPushdown already leaves
 		// buckets empty from the first LEFT join on; this enforces the
-		// invariant the seek depends on.
+		// invariant the seek depends on. A RIGHT/FULL operand's unmatched-row
+		// sweep is decided the same way, by ON alone.
 		var eqs []Expr
 		eqs = append(eqs, splitTopLevelAnd(s.on)...)
-		if !s.left && level < len(plan.buckets) {
+		if !s.left && !s.rightOuter && level < len(plan.buckets) {
 			eqs = append(eqs, plan.buckets[level]...)
 		}
-		if planKey == nil {
-			// A ROWID point lookup delivers its (at most one) row per outer row
-			// in the table's own order, which is what an sPk loop produces --
-			// and an sPk loop carries no key at all. A non-nil key therefore
-			// means the planner chose to WALK an index here, so the rowid seek
-			// would deliver a different order and is not taken.
-			if key, ok := findJoinRowidSeek(c, s, outer, eqs); ok {
-				srcs[origIdx].joinSeekKeyExpr = key // strictly cheaper than an index seek
-				continue
-			}
-		}
-		// An index root page only means something in its own file. A
-		// cross-database item's cursor opens on the attached reader
-		// (OpOpenRead's P3 = dbIdx), so its index must be looked up there too;
-		// using the compiling pager's root reads an unrelated b-tree in the
-		// attached file -- a wrong answer
-		// (TestR30CrossDatabaseSeekReadsTheRightFile). A dbIdx naming no
-		// attached reader declines.
-		sp := c.pager
-		if s.dbIdx != 0 {
-			if s.dbIdx-1 >= len(c.pager.attachedReaders) {
-				continue
-			}
-			sp = c.pager.attachedReaders[s.dbIdx-1].pager
-		}
-		var want *autoIndexKey
-		if planKey != nil {
-			// A real index has a root, or, on a segment table (whose indexes are
-			// SQL only), a name. A key with neither is a transient automatic
-			// index or a REVERSED rowid scan.
-			if planKey.root == 0 && (planKey.index == "" || !sp.ScannedFromSegments(s.tbl.root)) {
-				continue
-			}
-			want = planKey
-		}
-		p, ok := findJoinIndexSeek(c, sp, s, outer, eqs, want)
-		if !ok {
+		eqs = plainUsingRefs(srcs, eqs)
+		// RIGHT/FULL operands (whose sweep needs the full row list back) and
+		// WITHOUT ROWID tables take only the sorted seek.
+		if !s.rightOuter && !s.tbl.withoutRowid && annotateIndexJoinSeek(c, srcs, origIdx, planKey, outer, eqs) {
 			continue
 		}
-		if planKey != nil && !joinSeekReproducesKey(sp, s.tbl, p.root, p.index, planKey) {
-			continue
+		if planKey != nil && planKey.multiOr != nil {
+			continue // ordered per outer row, inside the loop
 		}
-		srcs[origIdx].joinIdxSeek = p
+		srcs[origIdx].joinSortedKey, srcs[origIdx].joinSortedSeek = findJoinSortedSeek(c, s, outer, eqs)
 	}
+}
+
+// annotateIndexJoinSeek installs a rowid or index seek on srcs[origIdx] when
+// one applies, reporting whether it did.
+func annotateIndexJoinSeek(c *compiler, srcs []joinSource, origIdx int, planKey *autoIndexKey, outer map[int]bool, eqs []Expr) bool {
+	s := srcs[origIdx]
+	// A level the planner gave an index-order key has a decided visit order.
+	// OpAutoIndexOrder declines a re-seeking cursor (it re-materializes a
+	// different row set per rewind), so the seek is kept only where its order
+	// provably agrees (joinSeekReproducesKey).
+	if planKey == nil {
+		// A ROWID point lookup delivers its (at most one) row per outer row in
+		// the table's own order, which is what an sPk loop produces -- and an
+		// sPk loop carries no key at all. A non-nil key therefore means the
+		// planner chose to WALK an index here, so the rowid seek would deliver
+		// a different order and is not taken.
+		if key, ok := findJoinRowidSeek(c, s, outer, eqs); ok {
+			srcs[origIdx].joinSeekKeyExpr = key // strictly cheaper than an index seek
+			return true
+		}
+	}
+	// An index root page only means something in its own file. A
+	// cross-database item's cursor opens on the attached reader (OpOpenRead's
+	// P3 = dbIdx), so its index must be looked up there too; using the
+	// compiling pager's root reads an unrelated b-tree in the attached file --
+	// a wrong answer (TestR30CrossDatabaseSeekReadsTheRightFile). A dbIdx
+	// naming no attached reader declines.
+	sp := c.pager
+	if s.dbIdx != 0 {
+		if s.dbIdx-1 >= len(c.pager.attachedReaders) {
+			return false
+		}
+		sp = c.pager.attachedReaders[s.dbIdx-1].pager
+	}
+	var want *autoIndexKey
+	if planKey != nil {
+		// A real index has a root, or, on a segment table (whose indexes are
+		// SQL only), a name. A key with neither is a transient automatic index
+		// or a REVERSED rowid scan.
+		if planKey.root == 0 && (planKey.index == "" || !sp.ScannedFromSegments(s.tbl.root)) {
+			return false
+		}
+		want = planKey
+	}
+	p, ok := findJoinIndexSeek(c, sp, s, outer, eqs, want)
+	if !ok {
+		return false
+	}
+	if planKey != nil && !joinSeekReproducesKey(sp, s.tbl, p.root, p.index, planKey) {
+		return false
+	}
+	srcs[origIdx].joinIdxSeek = p
+	return true
 }
 
 // joinSeekReproducesKey reports whether this level's correlated index seek will
@@ -225,6 +243,75 @@ func joinSeekReproducesKey(sp *ReadOnlyPager, tbl *resolvedTable, root uint32, n
 	}
 	// The trailing rowid every index record over a rowid table carries.
 	return key.cols[n] == -1 && equalFoldName(key.colls[n], "BINARY") && !key.desc[n]
+}
+
+// plainUsingRefs rewrites a USING/NATURAL condition's representative column
+// (ColumnExpr.UsingRepr) as the plain qualified column it is when no RIGHT or
+// FULL operand before the condition's own item can coalesce it, so it can key
+// a seek. A pinned one is left as it is. The loop still tests the condition as
+// written.
+func plainUsingRefs(srcs []joinSource, eqs []Expr) []Expr {
+	plain := func(e Expr) (Expr, bool) {
+		ce, ok := e.(ColumnExpr)
+		if !ok || !ce.UsingRepr || ce.UsingPinned || ce.Qualifier == "" || ce.UsingReprOwnItem > len(srcs) {
+			return e, false
+		}
+		for k := 0; k < ce.UsingReprOwnItem; k++ {
+			if srcs[k].rightOuter {
+				return e, false
+			}
+		}
+		ce.UsingRepr, ce.UsingReprOwnItem = false, 0
+		return ce, true
+	}
+	var out []Expr
+	for i, cj := range eqs {
+		be, ok := cj.(BinaryExpr)
+		if !ok || (be.Op != "=" && be.Op != "==") {
+			continue
+		}
+		l, lok := plain(be.L)
+		r, rok := plain(be.R)
+		if !lok && !rok {
+			continue
+		}
+		if out == nil {
+			out = slices.Clone(eqs)
+		}
+		be.L, be.R = l, r
+		out[i] = be
+	}
+	if out == nil {
+		return eqs
+	}
+	return out
+}
+
+// findJoinSortedSeek looks for an equality pinning a bare column of s to a key
+// over the outer cursors, for OpSortedSeek: the rows whose column equals the
+// key under the comparison's collation, once the key takes the comparison's
+// affinity, must include every row the equality passes, which
+// seekAffinitySafe guarantees.
+func findJoinSortedSeek(c *compiler, s joinSource, outer map[int]bool, eqs []Expr) (Expr, *sortedSeekHint) {
+	for _, cj := range eqs {
+		be, ok := cj.(BinaryExpr)
+		if !ok || (be.Op != "=" && be.Op != "==") {
+			continue
+		}
+		for _, side := range [2][2]Expr{{be.L, be.R}, {be.R, be.L}} {
+			col, ok := scopeColumnIndex(c, s, side[0])
+			if !ok || col < 0 || col >= len(s.tbl.cols) || !keyRefsOnlyCursors(c, side[1], outer) {
+				continue
+			}
+			aff := comparisonAffinity(c.affCtx(), side[0], side[1])
+			if !seekAffinitySafe(aff, s.tbl.cols[col].Aff) {
+				continue
+			}
+			coll := effectiveCollation(resolveCompareCollation(c.affCtx(), be.L, be.R))
+			return side[1], &sortedSeekHint{col: col, coll: coll, aff: aff}
+		}
+	}
+	return nil, nil
 }
 
 // findJoinRowidSeek looks for an equality pinning s's rowid (or INTEGER PRIMARY
@@ -433,7 +520,7 @@ func exprRefsOnly(e Expr, col func(ColumnExpr) bool) bool {
 // already-positioned outer cursor (annotateJoinSeeks already verified this;
 // narrowing makes it structural, mirroring emitJoinLevel's own ON narrowing).
 func (c *compiler) emitJoinSeekHint(srcs []joinSource, order []int, level int, s joinSource) error {
-	if s.joinSeekKeyExpr == nil && s.joinIdxSeek == nil {
+	if s.joinSeekKeyExpr == nil && s.joinIdxSeek == nil && s.joinSortedSeek == nil {
 		return nil
 	}
 	saved := c.scopes
@@ -455,6 +542,14 @@ func (c *compiler) emitJoinSeekHint(srcs []joinSource, order []int, level int, s
 			return err
 		}
 		c.emit(Instruction{Op: OpSeekRowidHint, P1: cur, P2: keyReg, P3: 1})
+		return nil
+	}
+	if s.joinSortedSeek != nil {
+		keyReg, err := c.compileExpr(s.joinSortedKey)
+		if err != nil {
+			return err
+		}
+		c.emit(Instruction{Op: OpSortedSeek, P1: cur, P2: keyReg, P3: 1, P4: s.joinSortedSeek})
 		return nil
 	}
 	keyReg, err := c.compileExpr(s.joinIdxSeek.keyExpr)

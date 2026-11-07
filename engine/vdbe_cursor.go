@@ -162,6 +162,11 @@ type vdbeCursor struct {
 	// unchanged. See rewind().
 	seekReseek bool
 
+	// sorted is OpSortedSeek's copy of the rows, sorted by its column, that
+	// each seek narrows rows/rowids to a run of. nil until the first seek, and
+	// dropped whenever the rows are built again.
+	sorted *sortedRows
+
 	// matched is this cursor's RIGHT/FULL JOIN mark bitmap (parallel to
 	// rows/rowids) -- nil until OpRightJoinMark or OpRightJoinSweepRewind/Next
 	// first touches it, for a cursor that is never a RIGHT/FULL JOIN target
@@ -880,6 +885,10 @@ func openFillCursor(tbl *resolvedTable, fill func() ([][]Value, []int64, error),
 }
 
 func (cur *vdbeCursor) rewind() error {
+	if cur.sorted != nil && (!cur.materialized || cur.fill != nil || cur.seekReseek) {
+		// The rows are about to be built again, possibly into the same arrays.
+		cur.sorted = nil
+	}
 	if cur.sub != nil {
 		return cur.rewindStream()
 	}
@@ -1410,6 +1419,7 @@ func (cur *vdbeCursor) close() {
 	cur.sub = nil
 	cur.rowids = nil
 	cur.rows = nil
+	cur.sorted = nil
 	cur.lazyNorm = false
 	// BOTH halves of the current row, never just one. rowRaw is what tells
 	// readColumn a masked rowVals is incomplete, so clearing rowRaw while
@@ -1432,11 +1442,20 @@ func (cur *vdbeCursor) close() {
 // OpRightJoinMark only ever runs immediately after a successful ON test
 // inside the cursor's own Rewind/Next loop body).
 func (cur *vdbeCursor) markMatched() {
-	if cur.matched == nil {
-		cur.matched = make([]bool, len(cur.rows))
+	n, at := len(cur.rows), cur.pos
+	if s := cur.sorted; s != nil && s.ok {
+		// A seek's run: the mark goes on the row's place in the full list,
+		// which the sweep walks.
+		n, at = len(s.orig), -1
+		if cur.pos >= 0 && s.base+cur.pos < len(s.pos) {
+			at = int(s.pos[s.base+cur.pos])
+		}
 	}
-	if cur.pos >= 0 && cur.pos < len(cur.matched) {
-		cur.matched[cur.pos] = true
+	if cur.matched == nil {
+		cur.matched = make([]bool, n)
+	}
+	if at >= 0 && at < len(cur.matched) {
+		cur.matched[at] = true
 	}
 }
 
