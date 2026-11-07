@@ -11,9 +11,10 @@ import (
 // rowKeyValueMatrix is the value set both directions below are checked over.
 // Deliberately full of near-misses: 1 vs 1.0 (equal under compareNumeric), 'a'
 // vs 'A' (equal only under NOCASE), 'a' vs 'a ' (equal only under RTRIM),
-// x'61' vs 'a' (a BLOB never equals TEXT), and the two invalid UTF-8 bytes
-// 0x80/0x81, which are byte-different but BOTH decode to U+FFFD and therefore
-// compare EQUAL in a UTF-16 database.
+// x'61' vs 'a' (a BLOB never equals TEXT), 'a\0b' vs 'A\0c' (equal under
+// NOCASE, which stops at a NUL and then compares lengths), and the two invalid
+// UTF-8 bytes 0x80/0x81, which are byte-different but BOTH decode to U+FFFD and
+// therefore compare EQUAL in a UTF-16 database.
 //
 // The last two entries exist to make the encoding's LENGTH PREFIX load-bearing
 // in the multi-column check: they spell a TEXT tag followed by a zero length,
@@ -44,6 +45,11 @@ func rowKeyValueMatrix() []Value {
 		{Typ: Blob, S: []byte{}},
 		{Typ: Text, S: []byte("\x03\x00\x00\x00\x00\x00\x00\x00\x00")},
 		{Typ: Text, S: []byte("\x03\x00\x00\x00\x00\x00\x00\x00\x00a")},
+		{Typ: Text, S: []byte("a\x00b")},
+		{Typ: Text, S: []byte("A\x00c")},
+		{Typ: Text, S: []byte("a\x00")},
+		{Typ: Text, S: []byte("a\x00bc")},
+		{Typ: Text, S: []byte("\x00")},
 	}
 }
 

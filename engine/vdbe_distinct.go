@@ -102,6 +102,10 @@ func distinctHash(v Value, coll string) uint64 {
 				return 4
 			}
 		}
+		if i := bytes.IndexByte(v.S, 0); nocase && i >= 0 {
+			// NOCASE stops at a NUL, then compares the lengths.
+			return 2 ^ fnvBytes(v.S[:i], true, false) ^ mix64(uint64(len(v.S)))
+		}
 		return 2 ^ fnvBytes(v.S, nocase, rtrim)
 	}
 	return 5

@@ -7,6 +7,7 @@
 package engine
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -260,22 +261,32 @@ func appendCollatedKeyBytes(buf []byte, vals []Value, collations []string, enc T
 // collatedTextKey canonicalizes one TEXT value so two values encode identically
 // iff collatedTextCompareEnc calls them equal, mirroring its switch:
 //
-//   - NOCASE folds ASCII case and returns (nocaseCompare compares the UTF-8
-//     bytes in every encoding);
+//   - NOCASE folds ASCII case through the first NUL, followed by the length
+//     when there is one, and returns (nocaseCompare compares the UTF-8 bytes in
+//     every encoding);
 //   - RTRIM strips trailing ASCII spaces and falls through;
 //   - BINARY is memcmp -- over the encoded bytes in a UTF-16 database, which
 //     utf16CompareUTF8 computes unit by unit from the UTF-8, so the key is that
 //     unit sequence (utf16Units). Raw bytes would over-split: two different
 //     invalid UTF-8 sequences both decode to U+FFFD.
 func collatedTextKey(collation string, s []byte, enc TextEncoding) []byte {
-	switch strings.ToUpper(collation) {
-	case "NOCASE":
-		out := make([]byte, len(s))
-		for i, c := range s {
+	switch {
+	case asciiEqualFold(collation, "NOCASE"):
+		// nocaseCompare stops at the first NUL and then compares lengths, so
+		// the bytes past that NUL are not part of the key; the length is.
+		z := bytes.IndexByte(s, 0)
+		if z < 0 {
+			z = len(s) - 1
+		}
+		out := make([]byte, z+1, z+9)
+		for i, c := range s[:z+1] {
 			out[i] = asciiLowerByte(c)
 		}
+		if z < len(s)-1 || (z >= 0 && s[z] == 0) {
+			out = binary.BigEndian.AppendUint64(out, uint64(len(s)))
+		}
 		return out
-	case "RTRIM":
+	case asciiEqualFold(collation, "RTRIM"):
 		s = rtrimTrailingSpaces(s)
 	}
 	if !isUTF16(enc) {
