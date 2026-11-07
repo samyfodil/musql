@@ -1,8 +1,8 @@
 package engine
 
 import (
-	"fmt"
 	"slices"
+	"strconv"
 )
 
 // segRowsInKeyOrder reports whether the table's rows, read in rowid order,
@@ -73,7 +73,12 @@ func (s *segment) ascendingOn(cols []int) ([][]int64, bool) {
 		}
 		blocks[j] = b
 	}
-	k := fmt.Sprint(cols)
+	var kb [64]byte
+	key := kb[:0]
+	for _, c := range cols {
+		key = strconv.AppendInt(append(key, ','), int64(c), 10)
+	}
+	k := string(key)
 	s.keyOrderMu.Lock()
 	defer s.keyOrderMu.Unlock()
 	if ok, known := s.keyOrder[k]; known {

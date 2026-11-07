@@ -2150,9 +2150,11 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				break
 			}
 			if cur.streamIfOrdered && !cur.materialized && !cur.hasGeneratedCols() &&
+				!cur.seekConfigured && !cur.idxSeekConfigured && !cur.seekSetConfigured &&
 				cur.pager.segRowsInKeyOrder(cur.tbl.root, op.P4.(*autoIndexKey)) {
 				// The rows already run in the key's order: the outermost scan
-				// streams them as it would with no key.
+				// streams them as it would with no key. (A seek's few rows are
+				// sorted for less than asking.)
 				cur.streamable, cur.colMask = true, cur.scanMask.widenIfTotal(len(cur.tbl.cols))
 				break
 			}

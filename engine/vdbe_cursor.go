@@ -1150,8 +1150,8 @@ func (cur *vdbeCursor) rewind() error {
 				// Only for a correlated seek, which nothing reorders: a seek
 				// that materializes once may have its rows permuted in place
 				// (OpAutoIndexOrder) or tagged by position (OpMultiOrTag).
-				if cur.seekReseek && cur.idxSeekOrder == nil {
-					if src, served := cur.pager.segListSeek(cur, rowids, &cur.pointSrc); served {
+				if cur.seekReseek {
+					if src, served := cur.pager.segListSeek(cur, rowids, &cur.pointSrc); served && src.sortListBy(cur.idxSeekOrder) {
 						cur.seekGen = seekGens.Add(1)
 						// Positioned, not built, as a rowid seek is above.
 						cur.segSrc, cur.segCur, cur.segSrcCols = src, nil, src.cols

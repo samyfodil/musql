@@ -1,7 +1,9 @@
 package engine
 
 import (
+	"cmp"
 	"encoding/binary"
+	"slices"
 	"sync/atomic"
 )
 
@@ -299,6 +301,59 @@ func (p *ReadOnlyPager) segListSeek(cur *vdbeCursor, rids []int64, into *segRowS
 	}
 	*into = segRowSource{list: true, listSegs: segs, listRows: rows, cols: segColPlansFor(cur.tbl)}
 	return into, true
+}
+
+// sortListBy puts a list seek's rows in key's order, reporting false, having
+// moved nothing, when a key value is not an INTEGER (the seek then builds its
+// rows and sorts them, autoIndexOrderCursor). Ties keep their rowid order, as
+// the index's own does.
+func (src *segRowSource) sortListBy(key *autoIndexKey) bool {
+	n := len(src.listRows)
+	if key == nil || n < 2 {
+		return true
+	}
+	nk := len(key.cols)
+	flat := make([]int64, 0, n*nk)
+	for i, s := range src.listSegs {
+		row := src.listRows[i]
+		rid := s.Rowid(row)
+		width := min(s.Width(row), len(src.cols))
+		for _, c := range key.cols {
+			if c < 0 {
+				flat = append(flat, int64(rid))
+				continue
+			}
+			v := segColumnValue(src.cols, s, row, width, rid, c)
+			if v.Typ != Int {
+				return false
+			}
+			flat = append(flat, v.I)
+		}
+	}
+	perm := make([]int, n)
+	for i := range perm {
+		perm[i] = i
+	}
+	slices.SortFunc(perm, func(a, b int) int {
+		ka, kb := flat[a*nk:a*nk+nk], flat[b*nk:b*nk+nk]
+		for k := range ka {
+			if ka[k] != kb[k] {
+				c := cmp.Compare(ka[k], kb[k])
+				if k < len(key.desc) && key.desc[k] {
+					return -c
+				}
+				return c
+			}
+		}
+		return a - b
+	})
+	segs, rows := make([]*segment, n), make([]int, n)
+	for i, p := range perm {
+		segs[i], rows[i] = src.listSegs[p], src.listRows[p]
+	}
+	copy(src.listSegs, segs)
+	copy(src.listRows, rows)
+	return true
 }
 
 // segSeekable is whether a seek on cur's table may be served by a lazy source
