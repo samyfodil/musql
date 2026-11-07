@@ -115,6 +115,29 @@ func (prog *Program) jitCode() *vmJIT {
 	return jx
 }
 
+// vmJITLoopFree compiles a program with no loop too. Only tests set it, to run
+// the code generator over straight-line programs.
+var vmJITLoopFree bool
+
+// programLoops reports whether prog has a loop the VDBE runs: a cursor or
+// sorter loop, a subroutine, or a jump back. With none, and none among the
+// instructions native code runs (jit.VLoops), each instruction runs at most
+// once (a FROM-less SELECT, a constant folded per run), which native code
+// cannot pay back the compile for.
+func programLoops(prog *Program) bool {
+	for pc, in := range prog.Insns {
+		switch in.Op {
+		case OpNext, OpSorterNext, OpHashAggNext, OpRightJoinSweepNext, OpSegJoinNext, OpGosub:
+			return true
+		case OpGoto:
+			if in.P2 <= pc {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // maxJITParams bounds the parameters native code reads from registers of
 // their own (jitParams); an OpVariable of a later one exits.
 const maxJITParams = 32
@@ -239,6 +262,9 @@ func compileVMJIT(prog *Program) *vmJIT {
 			entry[pc] = true
 			native++
 		}
+	}
+	if !vmJITLoopFree && !programLoops(prog) && !jit.VLoops(vp) {
+		return nil
 	}
 	updAt := gatherUpdate(prog, vp)
 	if updAt >= 0 {

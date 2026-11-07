@@ -603,6 +603,25 @@ func VReachesResultRow(prog []VInsn) []bool {
 	return reach
 }
 
+// VLoops reports whether some native instruction of prog can transfer back to
+// itself or an earlier one: a jump back, or a subroutine.
+func VLoops(prog []VInsn) bool {
+	for pc, in := range prog {
+		switch in.Op {
+		case VExit:
+			continue
+		case VGosub, VReturn:
+			return true
+		}
+		for _, t := range vmStepOf(in, pc).targets {
+			if t <= pc {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // VReachFrom reports which instructions native code entered at pc can run
 // before it exits. A reachable VReturn may return past any VGosub.
 func VReachFrom(prog []VInsn, pc int) []bool {
