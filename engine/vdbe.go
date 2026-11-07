@@ -1290,6 +1290,9 @@ func cursorColumnMasks(insns []Instruction, ncursors int) []columnMask {
 			if p, ok := insns[i].P4.(*aggPlan); ok && (insns[i].Op == OpAggStep || insns[i].Op == OpHashAggStep) && (p.rowFree || p.rowCols != nil) {
 				continue // gathers no row, or rowCols (marked below)
 			}
+			if insns[i].Op == OpAggStep && insns[i].P3 != 0 {
+				continue // reads a sorter record, not the cursors
+			}
 			return nil
 		}
 	}
@@ -2026,6 +2029,10 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				// stored. expandStoredRow also inserts a slot per VIRTUAL
 				// column, so record positions stop matching the mask.
 				cur.colMask = m.cursorMask(insns, op.P1).widenIfTotal(len(cur.tbl.cols))
+			} else if !cur.streamable {
+				// A materialized cursor's scan leaves the columns nothing reads
+				// unread instead (scanTableCols), which its reads fill in.
+				cur.scanMask = m.cursorMask(insns, op.P1).widenIfTotal(len(cur.tbl.cols))
 			}
 			m.cursors[op.P1] = cur
 

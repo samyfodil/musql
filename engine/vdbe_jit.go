@@ -1289,7 +1289,7 @@ func jitReadColumn(cur *vdbeCursor, i int, dst *Value) bool {
 			}
 		}
 	}
-	if i < 0 || i >= len(cur.rowVals) || cur.rowVals[i].Typ == valueGenErr {
+	if i < 0 || i >= len(cur.rowVals) || cur.rowVals[i].Typ >= valueGenErr {
 		return false
 	}
 	*dst = cur.rowVals[i]

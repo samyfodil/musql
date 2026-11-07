@@ -110,6 +110,9 @@ type vdbeCursor struct {
 	// cursorColumnMasks (vdbe.go) and installed by OpOpenRead; allColumns for
 	// every cursor and every path that does not opt in. It is a PURE
 	// PERFORMANCE HINT: col()/fullRow() re-decode rather than trust it.
+	// scanMask is the columns a materialized cursor's scan decodes from the
+	// segments (scanTableCols); the rest read valueUnread until fetched.
+	scanMask columnMask
 	colMask columnMask
 
 	// seekConfigured/seekKey turn the first rewind() into a rowid point lookup
@@ -493,7 +496,7 @@ func (cur *vdbeCursor) normalizeFrom(shared bool, rowid uint64, vals []Value) []
 // more than once per program execution (once per outer-loop combination, for
 // every join level but the outermost).
 func openCursor(p *ReadOnlyPager, tbl *resolvedTable) *vdbeCursor {
-	return &vdbeCursor{pager: p, tbl: tbl, colMask: allColumns}
+	return &vdbeCursor{pager: p, tbl: tbl, colMask: allColumns, scanMask: allColumns}
 }
 
 // readColumn writes column i of the current row into *dst -- OpColumn's whole
@@ -1168,8 +1171,8 @@ func (cur *vdbeCursor) rewind() error {
 		// Only the columns the program reads are decoded (scanTableCols); a
 		// table computing generated columns, or one with no rowid to fetch the
 		// rest by, is read whole.
-		cols := cur.colMask
-		if cur.hasGeneratedCols() || cur.tbl.withoutRowid {
+		cols := cur.scanMask
+		if cols == 0 || cur.hasGeneratedCols() || cur.tbl.withoutRowid {
 			cols = allColumns
 		} else if cols != allColumns && cur.tbl.ipkIndex >= 0 {
 			cols |= 1 << uint(min(cur.tbl.ipkIndex, 63))
