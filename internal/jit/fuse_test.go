@@ -722,8 +722,18 @@ func TestImmediatesAndColumnOperands(t *testing.T) {
 		args.Col[0], args.Col[1] = &xs[0], &ys[0]
 		k.Call2(args)
 		k.Close()
-		// A flagged run stops at the flag: the rows before it still agree.
-		if (ovf != 0) != (want.ovf != 0) || out > int64(len(want.sel)) || !slices.Equal(sel[:out], want.sel[:out]) ||
+		// A flagged run is declined whatever it holds: amd64 stops at the
+		// flag, arm64 and wasm go on. The rows before the first flagged one
+		// agree either way.
+		agree := len(xs)
+		for r := range xs {
+			if interpProgram(sh.insns, [][]int64{xs[:r+1], ys[:r+1]}, r+1, make([]int64, 8)).ovf != 0 {
+				agree = r
+				break
+			}
+		}
+		agree = min(agree, int(out))
+		if (ovf != 0) != (want.ovf != 0) || out > int64(len(want.sel)) || !slices.Equal(sel[:agree], want.sel[:agree]) ||
 			ovf == 0 && out != int64(len(want.sel)) {
 			t.Errorf("%v: got %v (overflow %d), want %v (overflow %d)", sh.insns, sel[:out], ovf, want.sel, want.ovf)
 		}
