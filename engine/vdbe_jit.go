@@ -101,7 +101,11 @@ var noVMJIT = &vmJIT{}
 // The cache is checked against prog.Insns rather than trusted: a Program
 // copied by value (limit_offset_halt.go) and given new instructions carries
 // the old pointer, and compiles its own.
-func (prog *Program) jitCode() *vmJIT {
+func (prog *Program) jitCode() *vmJIT { return prog.jitCodeOn(nil) }
+
+// jitCodeOn is jitCode for a machine that runs on p, whose segments inform
+// which columns the first compile guesses hold REALs (vmRealLowering).
+func (prog *Program) jitCodeOn(p *ReadOnlyPager) *vmJIT {
 	if len(prog.Insns) == 0 {
 		return nil
 	}
@@ -111,7 +115,7 @@ func (prog *Program) jitCode() *vmJIT {
 		}
 		return jx
 	}
-	jx := compileVMJIT(prog)
+	jx := compileVMJIT(prog, p)
 	if jx == nil {
 		atomic.StorePointer(&prog.vmJIT, unsafe.Pointer(noVMJIT))
 		return nil
@@ -215,7 +219,7 @@ var valueLayout = jit.ValueLayout{
 // compileVMJIT compiles prog, or returns nil: the JIT off, no emitter for this
 // platform, or nothing in the program it could run natively. nil means the
 // VDBE runs every instruction, which is always correct.
-func compileVMJIT(prog *Program) *vmJIT {
+func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	if !vmJITEnabled || len(prog.Insns) == 0 {
 		return nil
 	}
@@ -228,7 +232,7 @@ func compileVMJIT(prog *Program) *vmJIT {
 	fusable := false
 	nParams := prog.jitParams()
 	ipk := writeCursorIPK(prog)
-	realVP, realOK := vmRealLowering(prog)
+	realVP, realOK := vmRealLowering(prog, p.segStoresReal)
 	reopen := reopenSources(prog)
 	for pc := range prog.Insns {
 		vp[pc] = lowerVM(&prog.Insns[pc], prog.NReg)

@@ -99,3 +99,24 @@ func (s *segment) ascendingOn(cols []int) ([][]int64, bool) {
 	s.keyOrder[k] = ok
 	return blocks, ok
 }
+
+// segStoresReal reports whether a segment of the table at root stores column
+// col as REALs: a PhysFloat64 or PhysNumeric block.
+func (p *ReadOnlyPager) segStoresReal(root uint32, col int) bool {
+	if p == nil || p.segs == nil {
+		return false
+	}
+	segs := p.segs.byRoot[root]
+	if p.segs.isLive(root) {
+		var ok bool
+		if segs, ok = p.segs.liveBaseSegments(root); !ok {
+			return false
+		}
+	}
+	for _, s := range segs {
+		if col < len(s.cols) && (s.cols[col].phys == PhysFloat64 || s.cols[col].phys == PhysNumeric) {
+			return true
+		}
+	}
+	return false
+}

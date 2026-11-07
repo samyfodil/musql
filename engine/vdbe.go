@@ -1092,7 +1092,7 @@ func (prog *Program) execOuterTrigCap(pager *ReadOnlyPager, outer *evalCtx, para
 // resumed rather than run once.
 func (prog *Program) newMachine(pager *ReadOnlyPager, outer *evalCtx, params []Value, from *vdbe) *vdbe {
 	m := prog.getMachine()
-	m.jx = prog.jitCode()
+	m.jx = prog.jitCodeOn(pager)
 	m.sorters = make([]*vdbeSorter, prog.NSorters)
 	m.distinctSets = make([]*vdbeDistinctSet, prog.NDistinct)
 	m.subCache = reuseSubCache(m.subCache, prog.NSubCache)
@@ -1174,7 +1174,7 @@ func (prog *Program) execWithParentRun(parent *vdbe, pager *ReadOnlyPager, first
 	// most of what such a query allocated. See vdbe_machine_pool.go for what
 	// may be reused.
 	m := prog.getMachine()
-	m.jx = prog.jitCode()
+	m.jx = prog.jitCodeOn(pager)
 	m.sorters = make([]*vdbeSorter, prog.NSorters)
 	m.distinctSets = make([]*vdbeDistinctSet, prog.NDistinct)
 	m.subCache = reuseSubCache(m.subCache, prog.NSubCache)
