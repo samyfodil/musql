@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"slices"
 	"sync"
 
 	"github.com/samyfodil/musql/internal/jit"
@@ -14,13 +15,21 @@ import (
 // the statement computes, in output-column order.
 type segProgPlan struct {
 	// lows is the programs over INTEGER columns and parameters, nil when the
-	// loop lowers only where some are REAL.
+	// loop lowers only where some are REAL; one computes all their aggregates
+	// in one pass, nil when it cannot.
 	lows []*segLowered
+	one  *segLowered
 	src  *segProgSource
 	// variants are the programs for each combination of REAL columns and
-	// parameters a run has met: segKinds.key() -> []*segLowered, nil when
-	// the loop does not lower for it.
+	// parameters a run has met: segKinds.key() -> segLowSet, empty when the
+	// loop does not lower for it.
 	variants sync.Map
+}
+
+// segLowSet is a loop's programs for one combination of kinds.
+type segLowSet struct {
+	lows []*segLowered
+	one  *segLowered
 }
 
 // segProgSource is the loop a plan lowers, kept for the lowerings a run over
@@ -41,17 +50,19 @@ type segProgSource struct {
 }
 
 // forKinds is the plan's programs for kinds, lowered on first use.
-func (p *segProgPlan) forKinds(kinds *segKinds) []*segLowered {
+func (p *segProgPlan) forKinds(kinds *segKinds) ([]*segLowered, *segLowered) {
 	if kinds == nil {
-		return p.lows
+		return p.lows, p.one
 	}
 	key := kinds.key()
 	if v, ok := p.variants.Load(key); ok {
-		return v.([]*segLowered)
+		set := v.(segLowSet)
+		return set.lows, set.one
 	}
-	lows, _ := p.src.lower(kinds)
-	v, _ := p.variants.LoadOrStore(key, lows)
-	return v.([]*segLowered)
+	lows, one, _ := p.src.lower(kinds)
+	v, _ := p.variants.LoadOrStore(key, segLowSet{lows, one})
+	set := v.(segLowSet)
+	return set.lows, set.one
 }
 
 // segProgPlanFor is the plan for a loop whose body feeds the AggStep at
@@ -105,7 +116,7 @@ func segProgPlanFor(body []Instruction, base, cursor, aggAt int, plan *aggPlan, 
 			src.params = append(src.params, in.P1)
 		}
 	}
-	lows, ok := src.lower(nil)
+	lows, one, ok := src.lower(nil)
 	if !ok && series != nil {
 		return nil
 	}
@@ -116,23 +127,24 @@ func segProgPlanFor(body []Instruction, base, cursor, aggAt int, plan *aggPlan, 
 		for _, c := range src.cols {
 			all.realCol[c] = true
 		}
-		if _, okReal := src.lower(all); !okReal {
+		if _, _, okReal := src.lower(all); !okReal {
 			return nil
 		}
-		lows = nil
+		lows, one = nil, nil
 	}
-	return &segProgPlan{lows: lows, src: src}
+	return &segProgPlan{lows: lows, one: one, src: src}
 }
 
-// lower builds one program per aggregate for kinds.
-func (src *segProgSource) lower(kinds *segKinds) ([]*segLowered, bool) {
+// lower builds one program per aggregate for kinds, and one for them all.
+func (src *segProgSource) lower(kinds *segKinds) ([]*segLowered, *segLowered, bool) {
 	// ONE lowered body, shared. The aggregates differ only in the accumulate at
 	// the end, so the predicate and the column reads are compiled once and each
-	// aggregate gets a copy with its own terminal op. N aggregates are N passes
-	// over the same int64 blocks, which is the trade segRunProgramAll explains.
+	// aggregate gets a copy with its own terminal op; one more copy ends in
+	// every aggregate's accumulate, each into registers of its own, for a
+	// single pass (segRunProgramAll).
 	base, okLow := segLowerBody(src.body, src.base, src.cursor, src.aggAt, kinds)
 	if !okLow || (len(base.cols) == 0 && len(base.blocks) == 0 && src.series == nil) {
-		return nil, false
+		return nil, nil, false
 	}
 	// Each aggregate's argument is read by the accumulate appended below,
 	// outside the body: a service block that computes it must write it back.
@@ -145,20 +157,31 @@ func (src *segProgSource) lower(kinds *segKinds) ([]*segLowered, bool) {
 		}
 	}
 	lows := make([]*segLowered, 0, len(src.aggs))
-	for _, a := range src.aggs {
+	var one *segLowered
+	oneAt := base.nRegs
+	// A body that never leaves a row early sees every row of a run, which is
+	// then each aggregate's row count: nothing counts them.
+	counted := jit.SkipsRows(base.insns) || base.textVar != nil && jit.SkipsRows(base.textVar.insns)
+	if len(src.aggs) > 1 && src.series == nil {
+		one = base.clone()
+		if base.textVar != nil {
+			oneAt = max(oneAt, base.textVar.nRegs)
+		}
+	}
+	for j, a := range src.aggs {
 		argReg := 0
 		switch a.kind {
 		case aggCountStar:
 			if a.expr != nil {
-				return nil, false
+				return nil, nil, false
 			}
 		case aggSum, aggTotal, aggAvg, aggCount, aggMin, aggMax:
 			if a.expr == nil || a.rowRegs[aggExprArg] == 0 {
-				return nil, false
+				return nil, nil, false
 			}
 			argReg = a.rowRegs[aggExprArg] - 1
 		default:
-			return nil, false
+			return nil, nil, false
 		}
 		low := base.clone()
 		low.agg = a.kind
@@ -167,6 +190,34 @@ func (src *segProgSource) lower(kinds *segKinds) ([]*segLowered, bool) {
 		low.sumReg, low.rowsReg = argReg, rowsReg
 		// A REAL argument, which may be NULL (a NaN), accumulates in FAcc.
 		isReal := a.kind != aggCountStar && low.real[argReg]
+		if one != nil && (isReal || a.distinct && a.kind != aggMin && a.kind != aggMax) {
+			one = nil
+		}
+		if one != nil {
+			// Every aggregate sees the rows the one counter at oneAt counts,
+			// or all of them, and a count is that number.
+			rows := -1
+			if counted {
+				rows = oneAt
+			}
+			sl := segAccSlot{agg: a.kind, acc: oneAt + 1 + j, rows: rows}
+			acc := jit.ProgInsn{Op: jit.POpRAccSum, A: sl.acc, B: argReg}
+			switch a.kind {
+			case aggCountStar, aggCount:
+				sl.acc = rows
+			case aggMin:
+				acc.Op = jit.POpRAccMin
+			case aggMax:
+				acc.Op = jit.POpRAccMax
+			}
+			if sl.acc != rows {
+				one.add(acc)
+				if one.textVar != nil {
+					one.textVar.add(acc)
+				}
+			}
+			one.multi = append(one.multi, sl)
+		}
 		switch {
 		case a.distinct && a.kind != aggMin && a.kind != aggMax:
 			// The distinct values are found in Go from the arguments the
@@ -210,9 +261,28 @@ func (src *segProgSource) lower(kinds *segKinds) ([]*segLowered, bool) {
 			tv.agg, tv.fAcc, tv.distinct = low.agg, low.fAcc, low.distinct
 			tv.add(acc)
 		}
+		low.zone = zoneShaped(low)
 		lows = append(lows, low)
 	}
-	return lows, true
+	// Where every aggregate is an extreme a zone map answers without reading
+	// a row, a pass each reads none.
+	if one != nil && !slices.ContainsFunc(lows, func(l *segLowered) bool { return !l.zone }) {
+		one = nil
+	}
+	if one != nil {
+		one.nRegs = oneAt + 1 + len(src.aggs)
+		count := jit.ProgInsn{Op: jit.POpRAccCount, A: oneAt}
+		if counted {
+			one.add(count)
+		}
+		if tv := one.textVar; tv != nil {
+			if counted {
+				tv.add(count)
+			}
+			tv.nRegs, tv.multi = one.nRegs, one.multi
+		}
+	}
+	return lows, one, true
 }
 
 // segPlanAggs returns the ONE aggregate each of the plan's n output columns

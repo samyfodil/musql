@@ -305,6 +305,18 @@ const (
 	// the same straight run set, and the emitters multiply by Imm's magic
 	// number (sdivMagic) in place of a division.
 	POpRemK
+
+	// POpRAccCount, POpRAccSum, POpRAccMin, POpRAccMax: the accumulate steps
+	// with their accumulator in register A rather than the one accumulator,
+	// so one program computes several aggregates in one pass. POpRAccCount is
+	// r[A]++; the others fold r[B] into r[A] as POpAccSum, POpAccMin and
+	// POpAccMax fold into the accumulator, without a row count: the
+	// aggregates of one pass see the same rows, which one POpRAccCount
+	// counts. The caller seeds r[A] and reads it after the run.
+	POpRAccCount
+	POpRAccSum
+	POpRAccMin
+	POpRAccMax
 )
 
 // ProgNullDeclines is POpFCmp's Imm for a comparison whose NULL the program

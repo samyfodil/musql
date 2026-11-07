@@ -448,6 +448,33 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			w.Set(t1)
 			emitCheckedArith(w, POpAdd, t1, t2, acc, ovf)
 			storeReg(in.B, func() { loadReg(in.B); w.I64(1); w.op(opI64Add) })
+		case POpRAccCount:
+			storeReg(in.A, func() { loadReg(in.A); w.I64(1); w.op(opI64Add) })
+		case POpRAccSum:
+			loadReg(in.A)
+			w.Set(t1)
+			loadReg(in.B)
+			w.Set(t2)
+			emitCheckedArith(w, POpAdd, t1, t2, t3, ovf)
+			storeReg(in.A, func() { w.Get(t3) })
+		case POpRAccMin, POpRAccMax:
+			// r[A] = v when v beats it.
+			loadReg(in.B)
+			w.Set(t1)
+			loadReg(in.A)
+			w.Set(t2)
+			storeReg(in.A, func() {
+				w.Get(t1)
+				w.Get(t2)
+				w.Get(t1)
+				w.Get(t2)
+				if in.Op == POpRAccMin {
+					w.op(opI64LtS) // v < r[A]
+				} else {
+					w.op(0x55) // i64.gt_s: v > r[A]
+				}
+				w.op(opSelect)
+			})
 		case POpI2F:
 			fset(in.A, func() { loadReg(in.B); w.op(opF64ConvertI64S) })
 		case POpF2I:

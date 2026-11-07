@@ -33,8 +33,15 @@ type segLowered struct {
 	sumReg  int
 	rowsReg int // counts matched rows; sum()/avg() answer NULL at 0
 	// distinct: the program hands back each row's argument (POpEmitVal) for a
-	// DISTINCT aggregate, which segRunOne finishes from the distinct values.
+	// DISTINCT aggregate, which segRun finishes from the distinct values.
 	distinct bool
+	// multi, when set, is every aggregate of a statement computed in this one
+	// program, each in registers of its own (segProgSource.lower), and agg is
+	// not used.
+	multi []segAccSlot
+	// zone says the program is one segZoneExtreme answers from a segment's
+	// zone map (zoneShaped), found as it is lowered.
+	zone bool
 	// blocks are the service blocks the body stops for (segment_service.go),
 	// indexed by POpService's A; none when the whole body is native.
 	blocks []segSvcBlock
@@ -202,6 +209,14 @@ func (l *segLowered) add(ins ...jit.ProgInsn) {
 		}
 		l.insns = append(l.insns, in)
 	}
+}
+
+// segAccSlot is one aggregate of a program that computes several: its
+// accumulator register (POpRAccCount, POpRAccSum, POpRAccMin, POpRAccMax) and
+// its row counter, -1 for the number of rows the run read.
+type segAccSlot struct {
+	agg       aggKind
+	acc, rows int
 }
 
 // clone copies a lowered body so several aggregates can share it, each

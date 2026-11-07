@@ -215,6 +215,10 @@ func stepOf(in ProgInsn) progStep {
 		s.uses = []int{in.A}
 	case POpAccSum, POpAccMin, POpAccMax:
 		s.uses, s.defs = []int{in.A, in.B}, []int{in.B}
+	case POpRAccCount:
+		s.uses, s.defs = []int{in.A}, []int{in.A}
+	case POpRAccSum, POpRAccMin, POpRAccMax:
+		s.uses, s.defs = []int{in.A, in.B}, []int{in.A}
 	case POpAdd, POpSub, POpMul, POpRem:
 		// The overflow each can flag only declines the run for the value it
 		// writes: where the VDBE would compute it, as a REAL (or a NULL for a
@@ -272,6 +276,28 @@ func stepOf(in ProgInsn) progStep {
 		s.useAll = true
 	}
 	return s
+}
+
+// SkipsRows reports whether a program can leave a row before its end: a
+// test, a jump, or a step that stops for the caller. Without one, every
+// accumulate at its end sees every row, so a count is the number of rows.
+func SkipsRows(insns []ProgInsn) bool {
+	for _, in := range insns {
+		if st := stepOf(in); st.useAll || !st.fall || len(st.targets) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// usesAcc reports whether in reads or writes the one accumulator.
+func usesAcc(in ProgInsn) bool {
+	switch in.Op {
+	case POpAccCount, POpAccSum, POpAccMin, POpAccMax, POpEmitRow, POpEmitVal,
+		POpFAccSum, POpFAccMin, POpFAccMax, POpFAccCount:
+		return true
+	}
+	return false
 }
 
 // regSet is a set of register numbers.
@@ -333,8 +359,11 @@ func progLivenessInOut(insns []ProgInsn, nRegs int) (liveOut, liveIn []regSet) {
 	// After the last row the caller reads the accumulators' row counters.
 	exit := newRegSet(nRegs)
 	for _, in := range insns {
-		if in.Op == POpAccSum || in.Op == POpAccMin || in.Op == POpAccMax {
+		switch in.Op {
+		case POpAccSum, POpAccMin, POpAccMax:
 			exit.add(in.B)
+		case POpRAccCount, POpRAccSum, POpRAccMin, POpRAccMax:
+			exit.add(in.A)
 		}
 	}
 	at := func(t int) regSet {

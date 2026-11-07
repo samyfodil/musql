@@ -7,7 +7,7 @@ import (
 )
 
 // TestColumnarAggregatesMergeTheDelta: the compiled-program aggregates
-// (segRunOne, through segDeltaSplit) and the filtered sum
+// (segRun, through segDeltaSplit) and the filtered sum
 // (segFilterSumTable, through segDeltaSumCorrection) answer over the
 // segments with the delta merged, rather than declining to the row loop once
 // a table has been written. Each delta state below -- rows added, replaced,
@@ -41,12 +41,18 @@ func TestColumnarAggregatesMergeTheDelta(t *testing.T) {
 		// A FILTER is per aggregate: the other aggregate must still see the row.
 		`SELECT sum(abs(v)) FILTER (WHERE 0), count(*) FROM t`,
 		`SELECT sum(v) FILTER (WHERE k = 3), count(*), sum(w) FROM t`,
+		// Several aggregates in one pass.
+		`SELECT min(v), max(v), sum(w), count(*) FROM t WHERE k <> 3`,
+		`SELECT max(v * k - w), min(v + w * 2 - k), avg(v) FROM t`,
+		`SELECT count(v), total(w), max(w), min(k) FROM t WHERE v > ?`,
+		`SELECT min(DISTINCT k), max(v), sum(v) FROM t WHERE w < 50`,
+		`SELECT sum(v * 922337203685), count(*) FROM t WHERE k = 1`,
 	}
 	check := func(label string) {
 		t.Helper()
 		for _, q := range queries {
 			var args []Value
-			if q == `SELECT sum(v) FROM t WHERE v > ?` {
+			if q == `SELECT sum(v) FROM t WHERE v > ?` || q == `SELECT count(v), total(w), max(w), min(k) FROM t WHERE v > ?` {
 				args = []Value{{Typ: Int, I: 250000}}
 			}
 			want := fmt.Sprint(typedRows(p.mustPlain(q, args...)))
@@ -56,7 +62,11 @@ func TestColumnarAggregatesMergeTheDelta(t *testing.T) {
 			}
 		}
 	}
+	runs := segOnePassRuns.Load()
 	check("segments")
+	if segOnePassRuns.Load() == runs {
+		t.Fatal("no statement's aggregates were answered in one pass")
+	}
 	// A table whose rows are all in the delta: no segment to correct, so a
 	// correction alone answers.
 	p.delta(`CREATE TABLE u(id INTEGER PRIMARY KEY, v INTEGER)`, `INSERT INTO u VALUES (1, 5)`, `INSERT INTO u VALUES (2, 6)`)

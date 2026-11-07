@@ -397,6 +397,24 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			a.CsetOverflow(X10)
 			a.OrrReg(X4, X4, X10)
 			inc(in.B)
+		case POpRAccCount:
+			inc(in.A)
+		case POpRAccSum, POpRAccMin, POpRAccMax:
+			x := val(in.B, X10)
+			acc := val(in.A, X9)
+			if in.Op == POpRAccSum {
+				a.AddsReg(acc, acc, x)
+				a.CsetOverflow(X10)
+				a.OrrReg(X4, X4, X10)
+			} else {
+				a.Cmp(acc, x)
+				cond := CondG // min: acc > v, so take v
+				if in.Op == POpRAccMax {
+					cond = CondL
+				}
+				a.Csel(acc, x, acc, cond)
+			}
+			fin(in.A, acc)
 		case POpI2F:
 			a.Scvtf(0, val(in.B, X9))
 			fset(in.A, 0)
