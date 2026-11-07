@@ -31,6 +31,7 @@ package engine
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -1929,6 +1930,8 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 		magnet:      gp.magnet,
 		anchorCheck: anchorChk,
 	}
+	rowFree := !gp.usesGroupBare && !gp.selectHasSubquery && !gp.anchorObservable && anchorChk == nil &&
+		!anyAggOrderBy(aggs) && !orderByMentionsSubquery(stmt.OrderBy) && !mentionsSubquery(stmt.Having)
 	// See compileScanAggregate's identical call: this is select.c:8746/:8747's
 	// pair for the sorted GROUP BY drain -- finalizeAggFunctions, then HAVING
 	// and the select list CODED against the registers it wrote. Done here so
@@ -1939,6 +1942,16 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	c.nQueryLoopKnown = false
 	if itemErr != nil {
 		return nil, itemErr
+	}
+	// As compileScanAggregate's: when nothing reads the scanned row but the
+	// steps, which read their registers, the hash path's step gathers none. A
+	// result naming a GROUP BY column reads it from the group's row, so every
+	// item program must leave that block alone.
+	if rowFree {
+		cols, rowids := aggItemsRowReads(plan)
+		if plan.rowFree = len(cols) == 0 && !rowids; !plan.rowFree {
+			plan.rowCols = append(make([]int, 0, len(cols)), cols...)
+		}
 	}
 
 	// Hash-aggregate fast path (vdbe_hashagg.go): O(n) instead of sort+drain, only
@@ -2516,6 +2529,55 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 // The body is WHERE, the GROUP BY keys packed into one record for the bucket
 // lookup, then OpHashAggStep, which reads the row from the positioned cursors
 // like OpAggStep's P3==0 mode, so no payload record is built.
+// aggItemsRowReads is the columns of the group's row block plan's item
+// programs may read, and whether they may read its rowid block: any operand,
+// or the result register, that falls in one counts.
+func aggItemsRowReads(plan *aggPlan) (cols []int, rowids bool) {
+	seen := map[int]bool{}
+	read := func(it *itemPlan) {
+		if it == nil || it.prog == nil || it.prog.prog == nil {
+			return
+		}
+		p := it.prog
+		// The result register counts too: an item that is just a column is a
+		// program of no instructions whose result IS that column's register.
+		regs := [][3]int{{p.resultReg, -1, -1}}
+		for _, ins := range p.prog.Insns {
+			regs = append(regs, [3]int{ins.P1, ins.P2, ins.P3})
+		}
+		for _, rs := range regs {
+			for _, r := range rs {
+				switch {
+				case r >= p.colBase && r < p.colBase+p.nCols && !seen[r-p.colBase]:
+					seen[r-p.colBase] = true
+					cols = append(cols, r-p.colBase)
+				case r >= p.rowidBase && r < p.rowidBase+p.nRowid:
+					rowids = true
+				}
+			}
+		}
+	}
+	for _, it := range plan.outPlans {
+		read(it)
+	}
+	read(plan.havingPlan)
+	for _, op := range plan.orderPlans {
+		read(op.item)
+	}
+	slices.Sort(cols)
+	return cols, rowids
+}
+
+// orderByMentionsSubquery reports whether an ORDER BY term holds a subquery.
+func orderByMentionsSubquery(terms []OrderTerm) bool {
+	for _, ot := range terms {
+		if mentionsSubquery(ot.Expr) {
+			return true
+		}
+	}
+	return false
+}
+
 func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp *groupByPlan, plan *aggPlan, preNQLKnown bool) (*Program, error) {
 	nGroup := len(gp.groupExprs)
 	nOut := len(gp.outCols)

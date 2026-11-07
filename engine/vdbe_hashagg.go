@@ -43,6 +43,14 @@ type hashAggState struct {
 // re-reads cursors that have not moved. Only which accumulators advance
 // differs.
 func (m *vdbe) hashAggStep(plan *aggPlan, keyVals []Value, seg int) error {
+	if plan.rowFree {
+		// Nothing reads the row (aggPlan.rowFree): the steps read their
+		// registers.
+		if n := plan.nCols + len(plan.scopes); len(m.aggNullRow) < n {
+			m.aggNullRow = make([]Value, n)
+		}
+		return m.hashAggStepRow(plan, keyVals, seg, m.aggNullRow[:plan.nCols:plan.nCols], m.aggNullRow[plan.nCols:plan.nCols+len(plan.scopes)])
+	}
 	row, rowids, gerr := m.gatherCursorRow(plan)
 	if gerr != nil {
 		return gerr

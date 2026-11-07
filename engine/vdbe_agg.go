@@ -37,6 +37,10 @@ type aggPlan struct {
 	// aggregate ORDER BY). OpAggStep then gathers no row, and the cursors
 	// decode only the columns the program names (cursorColumnMasks).
 	rowFree bool
+	// rowCols, when not nil, is the only columns of the row block anything
+	// reads: rowFree's conditions hold but for a result naming a column (a
+	// GROUP BY key, read from the group's row). The step gathers just those.
+	rowCols []int
 
 	scopes  []tableScope
 	nCols   int   // total column count across every joined table -- the [cols..] block width; len(scopes) rowid slots immediately follow it in the [cols.., rowids..] layout (see aggRowSplit)
@@ -120,6 +124,9 @@ func (m *vdbe) gatherCursorRow(plan *aggPlan) (row []Value, rowids []Value, err 
 	// and hashAggStep, never re-entrantly from expression evaluation.
 	row = growValues(&m.aggRowBuf, plan.nCols)
 	rowids = growValues(&m.aggRowidBuf, len(plan.scopes))
+	if plan.rowCols != nil && m.gatherCols(plan, row) {
+		return row, m.gatherRowids(plan, rowids), nil
+	}
 	// The ROW, once per physical cursor.
 	for _, g := range plan.gathers {
 		cur := m.cursors[g.cursor]
@@ -132,6 +139,32 @@ func (m *vdbe) gatherCursorRow(plan *aggPlan) (row []Value, rowids []Value, err 
 		}
 		copy(row[g.offset:g.offset+len(vals)], vals)
 	}
+	return row, m.gatherRowids(plan, rowids), nil
+}
+
+// gatherCols fills just plan.rowCols of row, reporting false (row untouched)
+// when a cursor holding one computes generated columns on a whole-row read.
+func (m *vdbe) gatherCols(plan *aggPlan, row []Value) bool {
+	for _, c := range plan.rowCols {
+		for _, g := range plan.gathers {
+			if c < g.offset || c >= g.offset+g.n {
+				continue
+			}
+			cur := m.cursors[g.cursor]
+			if cur.hasGeneratedCols() {
+				return false
+			}
+			if err := cur.readColumn(c-g.offset, &row[c]); err != nil {
+				return false
+			}
+			break
+		}
+	}
+	return true
+}
+
+// gatherRowids is gatherCursorRow's rowid half.
+func (m *vdbe) gatherRowids(plan *aggPlan, rowids []Value) []Value {
 	// The ROWIDS, once per SCOPE, since that is what evalCtx.rowids is indexed
 	// by. A scope with no rowid pseudo-column of its own -- a derived table, a
 	// view, and every member of a materialized join GROUP -- has none to
@@ -148,7 +181,7 @@ func (m *vdbe) gatherCursorRow(plan *aggPlan) (row []Value, rowids []Value, err 
 			rowids[i] = Value{Typ: Int, I: int64(cur.rowid)}
 		}
 	}
-	return row, rowids, nil
+	return rowids
 }
 
 // growValues returns buf re-sliced to n, reallocating only when it is too
