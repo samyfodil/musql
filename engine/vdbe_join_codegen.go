@@ -3290,8 +3290,9 @@ func (c *compiler) emitRightOuterSweep(srcs []joinSource, plan joinPlan, order [
 //
 // Only the order changes; a row satisfying no pass is filed last and fails the
 // OR the body still tests.
-func (c *compiler) emitMultiOrGroups(plan joinPlan, level, cur int) error {
-	if level >= len(plan.autoIdxKeys) {
+func (c *compiler) emitMultiOrGroups(plan joinPlan, level, cur int, s joinSource) error {
+	if level >= len(plan.autoIdxKeys) || s.joinSeekKeyExpr != nil {
+		// A rowid seek's one row needs no order.
 		return nil
 	}
 	key := plan.autoIdxKeys[level]
@@ -3428,7 +3429,7 @@ func (c *compiler) emitJoinLevel(srcs []joinSource, plan joinPlan, level int, bo
 		if err := c.emitJoinSeekHint(srcs, order, level, s); err != nil {
 			return err
 		}
-		if err := c.emitMultiOrGroups(plan, level, cur); err != nil {
+		if err := c.emitMultiOrGroups(plan, level, cur, s); err != nil {
 			return err
 		}
 		rewindJump := c.emit(Instruction{Op: OpRewind, P1: cur})
@@ -3497,7 +3498,7 @@ func (c *compiler) emitJoinLevel(srcs []joinSource, plan joinPlan, level int, bo
 	}
 	matchReg := c.alloc()
 	c.emit(Instruction{Op: OpInteger, P1: 0, P2: matchReg})
-	if err := c.emitMultiOrGroups(plan, level, cur); err != nil {
+	if err := c.emitMultiOrGroups(plan, level, cur, s); err != nil {
 		return err
 	}
 	rewindJump := c.emit(Instruction{Op: OpRewind, P1: cur})

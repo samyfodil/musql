@@ -92,7 +92,7 @@ func annotateJoinSeeks(c *compiler, srcs []joinSource, plan joinPlan) {
 		if !s.left && !s.rightOuter && level < len(plan.buckets) {
 			eqs = append(eqs, plan.buckets[level]...)
 		}
-		eqs = plainUsingRefs(srcs, eqs)
+		eqs = plainUsingRefs(srcs, orCommonConjuncts(eqs))
 		// RIGHT/FULL operands (whose sweep needs the full row list back) and
 		// WITHOUT ROWID tables take only the sorted seek.
 		if !s.rightOuter && !s.tbl.withoutRowid && annotateIndexJoinSeek(c, srcs, origIdx, planKey, outer, eqs) {
@@ -113,12 +113,13 @@ func annotateIndexJoinSeek(c *compiler, srcs []joinSource, origIdx int, planKey 
 	// OpAutoIndexOrder declines a re-seeking cursor (it re-materializes a
 	// different row set per rewind), so the seek is kept only where its order
 	// provably agrees (joinSeekReproducesKey).
-	if planKey == nil {
+	if planKey == nil || planKey.multiOr != nil {
 		// A ROWID point lookup delivers its (at most one) row per outer row in
 		// the table's own order, which is what an sPk loop produces -- and an
 		// sPk loop carries no key at all. A non-nil key therefore means the
 		// planner chose to WALK an index here, so the rowid seek would deliver
-		// a different order and is not taken.
+		// a different order and is not taken -- unless the key is a
+		// WHERE_MULTI_OR's, whose order of one row is that row.
 		if key, ok := findJoinRowidSeek(c, s, outer, eqs); ok {
 			srcs[origIdx].joinSeekKeyExpr = key // strictly cheaper than an index seek
 			return true
@@ -243,6 +244,41 @@ func joinSeekReproducesKey(sp *ReadOnlyPager, tbl *resolvedTable, root uint32, n
 	}
 	// The trailing rowid every index record over a rowid table carries.
 	return key.cols[n] == -1 && equalFoldName(key.colls[n], "BINARY") && !key.desc[n]
+}
+
+// orCommonConjuncts adds to eqs, for each OR among them, the conjuncts every
+// one of its disjuncts carries: a row the OR passes passes each of those, so
+// one can key a seek as a top-level conjunct can. "(a.k=b.k AND ...) OR
+// (a.k=b.k AND ...)" seeks on a.k=b.k.
+func orCommonConjuncts(eqs []Expr) []Expr {
+	out := eqs
+	for _, cj := range eqs {
+		if be, ok := cj.(BinaryExpr); !ok || be.Op != "OR" {
+			continue
+		}
+		ds := splitTopLevelOr(cj)
+		common := splitTopLevelAnd(ds[0])
+		for _, d := range ds[1:] {
+			conj := splitTopLevelAnd(d)
+			var kept []Expr
+			for _, c := range common {
+				if slices.ContainsFunc(conj, func(e Expr) bool { return exprEqual(c, e) }) {
+					kept = append(kept, c)
+				}
+			}
+			common = kept
+		}
+		out = append(out[:len(out):len(out)], common...)
+	}
+	return out
+}
+
+// splitTopLevelOr is splitTopLevelAnd for OR.
+func splitTopLevelOr(e Expr) []Expr {
+	if b, ok := e.(BinaryExpr); ok && b.Op == "OR" {
+		return append(splitTopLevelOr(b.L), splitTopLevelOr(b.R)...)
+	}
+	return []Expr{e}
 }
 
 // plainUsingRefs rewrites a USING/NATURAL condition's representative column

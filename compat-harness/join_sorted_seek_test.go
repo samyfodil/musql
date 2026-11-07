@@ -42,6 +42,10 @@ func TestJoinSortedSeekKeepsOrder(t *testing.T) {
 		"SELECT a.v, (SELECT group_concat(b.v) FROM b WHERE b.k=a.k) FROM a",
 		"SELECT a.v, b.v FROM a JOIN b ON a.k=b.k LIMIT 3",
 		"SELECT a.k, count(b.v) FROM a LEFT JOIN b ON a.k=b.k GROUP BY a.k",
+		"SELECT a.v, b.v FROM a, b WHERE (b.id=a.k AND a.v<4) OR (b.id=a.k AND b.v>40) OR (b.id=a.k AND a.s='z')",
+		"SELECT sum(a.v*b.v) FROM a, b WHERE (b.id=a.k AND a.v<4) OR (a.k=b.id AND b.v>40)",
+		"SELECT a.v, b.v FROM a, b WHERE (b.k=a.k AND a.v<4) OR (b.k=a.k AND b.v>40)",
+		"SELECT a.v, b.v FROM a, b WHERE (b.k=a.k AND a.v<4) OR (b.v=a.v*10)",
 	}
 	for _, q := range queries {
 		differ(t, q, append(append([]string(nil), joinSeekSetup...), q))
@@ -76,5 +80,19 @@ func TestCompoundDedupUnderCollations(t *testing.T) {
 		"SELECT DISTINCT x FROM c",
 		"SELECT x, count(*) FROM c GROUP BY x",
 		"SELECT x, row_number() OVER (PARTITION BY x) FROM c",
+	})
+}
+
+// TestJoinSeekUnderMultiIndexOr pins TPC-H q19's shape: every OR branch pins
+// the inner table's rowid to the outer row, which C answers with one rowid
+// search per branch (MULTI-INDEX OR) and this engine with one rowid seek.
+func TestJoinSeekUnderMultiIndexOr(t *testing.T) {
+	differ(t, "q19 shape", []string{
+		"CREATE TABLE part(pk INTEGER PRIMARY KEY, brand TEXT, size INT)",
+		"CREATE TABLE line(ok INT, pk INT, qty INT, price REAL)",
+		"WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<2000) INSERT INTO part SELECT i, 'B'||(i%5), i%17 FROM s",
+		"WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<6000) INSERT INTO line SELECT i/4, (i*7)%2100, i%30, i*1.5 FROM s",
+		"SELECT sum(price) FROM line, part WHERE (part.pk=line.pk AND brand='B1' AND qty<10) OR (part.pk=line.pk AND brand='B2' AND size<5) OR (part.pk=line.pk AND qty>25)",
+		"SELECT line.ok, part.pk FROM line, part WHERE (part.pk=line.pk AND brand='B1' AND qty<3) OR (part.pk=line.pk AND size=16 AND qty>28)",
 	})
 }
