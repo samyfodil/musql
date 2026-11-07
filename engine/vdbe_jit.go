@@ -1206,9 +1206,11 @@ type jitSnap struct {
 	live  bool
 	entry int
 	seek  int
-	// refs is where each row is in its segment; win a scan's batch size, and
-	// more whether the scan has rows past it.
+	// refs is where each row is in its segment, width a row's length in the
+	// slab; win a scan's batch size, and more whether the scan has rows past
+	// it.
 	refs  []segAheadRow
+	width int
 	win   int
 	more  bool
 	rows  [][]Value
@@ -1218,6 +1220,16 @@ type jitSnap struct {
 	owner *vdbeCursor
 	gen   uint64
 	base  int
+}
+
+// fillFor is the columns of cursor c an entry reads (vmJIT.fill).
+func fillFor(fill []curCols, c int) []int {
+	for _, cc := range fill {
+		if cc.cursor == c {
+			return cc.cols
+		}
+	}
+	return nil
 }
 
 // seekGens numbers seeks across every cursor, so a copy is never taken for
@@ -1249,7 +1261,10 @@ func (jx *vmJIT) seekWalkable(c int, cur *vdbeCursor) bool {
 // has left (segPointSeek, segListSeek), or a batch of a scan's: the current
 // one and those after it, each with the columns the program reads, in a list
 // it may walk. false when cur has no such rows or too many to copy.
-func (jx *vmJIT) seekSnap(c int, cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) bool {
+//
+// The rows' columns are decoded as entries read them: need, this entry's, for
+// every row handed over, joining those an earlier entry decoded.
+func (jx *vmJIT) seekSnap(c int, cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap, need []int) bool {
 	src := cur.segSrc
 	if !jx.seekWalkable(c, cur) {
 		return false
@@ -1266,6 +1281,7 @@ func (jx *vmJIT) seekSnap(c int, cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) 
 			return false
 		}
 	}
+	sn.decode(cur, need)
 	if vmJITCountSyncs {
 		vmJITSeekSnaps.Add(1)
 	}
@@ -1313,13 +1329,11 @@ func (jx *vmJIT) seekCopy(c int, cur *vdbeCursor, sn *jitSnap, at int) bool {
 		return false
 	}
 	w := 0
-	var mask uint64
 	for _, col := range cols {
 		if col >= 64 {
 			return false
 		}
 		w = max(w, col+1)
-		mask |= 1 << uint(col)
 	}
 	slab := slices.Grow(sn.slab[:0], n*w)[:n*w]
 	rows, rids := sn.rows[:0], sn.rids[:0]
@@ -1335,22 +1349,39 @@ func (jx *vmJIT) seekCopy(c int, cur *vdbeCursor, sn *jitSnap, at int) bool {
 	for k := range n {
 		rows, rids = append(rows, slab[k*w:(k+1)*w:(k+1)*w]), append(rids, refs[k].rowid)
 	}
-	// Column by column over each run of consecutive rows of one segment.
+	sn.refs, sn.width = refs, w
+	sn.seek, sn.rows, sn.rids, sn.slab, sn.mask = n, rows, rids, slab, 0
+	sn.owner, sn.gen, sn.base = cur, cur.seekGen, at
+	return true
+}
+
+// decode decodes the columns of cols not decoded yet for every row sn hands
+// over, column by column over each run of consecutive rows of one segment.
+func (sn *jitSnap) decode(cur *vdbeCursor, cols []int) {
+	var want []int
+	for _, col := range cols {
+		if col >= 0 && col < sn.width && sn.mask&(1<<uint(col)) == 0 {
+			want = append(want, col)
+		}
+	}
+	if len(want) == 0 {
+		return
+	}
+	n, w, refs := sn.seek, sn.width, sn.refs
 	for k0 := 0; k0 < n; {
 		s, row := refs[k0].s, refs[k0].row
 		k1 := k0 + 1
 		for k1 < n && refs[k1].s == s && refs[k1].row == row+k1-k0 {
 			k1++
 		}
-		for _, col := range cols {
-			segColumnRun(cur.segSrcCols, s, col, row, rids[k0:k1], slab[k0*w+col:], w)
+		for _, col := range want {
+			segColumnRun(cur.segSrcCols, s, col, row, sn.rids[k0:k1], sn.slab[k0*w+col:], w)
 		}
 		k0 = k1
 	}
-	sn.refs = refs
-	sn.seek, sn.rows, sn.rids, sn.slab, sn.mask = n, rows, rids, slab, mask
-	sn.owner, sn.gen, sn.base = cur, cur.seekGen, at
-	return true
+	for _, col := range want {
+		sn.mask |= 1 << uint(col)
+	}
 }
 
 // seekSync brings a cursor seekSnap handed over up to date with the native
@@ -1507,7 +1538,7 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 				}
 				continue
 			}
-			if jx.seekSnap(c, cur, jc, &m.jsnap[c]) {
+			if jx.seekSnap(c, cur, jc, &m.jsnap[c], fillFor(jx.fill[pc], c)) {
 				continue
 			}
 			// Not a cursor native code can walk: hand over a copy of its current
