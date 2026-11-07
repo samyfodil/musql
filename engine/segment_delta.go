@@ -73,8 +73,9 @@ const (
 	// with its 4-byte prefix. Version 3 adds the segment record
 	// (segDeltaSeg); its batches are otherwise version 2's. Version 4 changes
 	// only the checksum (segDeltaChecksum). Version 5 adds the patch record
-	// (segDeltaPatch). Every new delta is version 5.
-	segDeltaVersion   = 5
+	// (segDeltaPatch). Version 6 may hold segment records with a PhysNumeric
+	// column (segFlagNumeric). Every new delta is version 6.
+	segDeltaVersion   = 6
 	segDeltaHdrSize   = 32
 	segDeltaSuffix    = ".delta"
 	segDeltaTrailerSz = 16 // endCtr + endPages + cksum
@@ -623,7 +624,7 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 	//
 	// At st.bytes, not at the file's end: a previous torn append is OVERWRITTEN
 	// rather than kept, exactly as a WAL writer overwrites an aborted tail.
-	if st.version < 3 && hasSegRecord(recs) {
+	if st.version < 3 && hasSegRecord(recs) || st.version < 6 && hasNumericSegRecord(recs) {
 		return errDeltaPredatesSegments
 	}
 	var keep *[]byte
@@ -1543,9 +1544,19 @@ func alignedCopy(b []byte) []byte {
 }
 
 // errDeltaPredatesSegments refuses a segment record for a delta older than
-// version 3, which an older reader would fail on: the caller rewrites the file
-// instead, which leaves a version-3 delta behind.
-var errDeltaPredatesSegments = errors.New("engine: segment delta: version predates segment records")
+// version 3, or one with a PhysNumeric column for a delta older than version 6,
+// which an older reader would fail on: the caller rewrites the file instead,
+// which leaves a current delta behind.
+var errDeltaPredatesSegments = errors.New("engine: segment delta: version predates these segment records")
+
+func hasNumericSegRecord(recs []SegDeltaRecord) bool {
+	for i := range recs {
+		if segHasNumeric(recs[i].Seg) {
+			return true
+		}
+	}
+	return false
+}
 
 func hasSegRecord(recs []SegDeltaRecord) bool {
 	for i := range recs {

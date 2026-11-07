@@ -54,7 +54,10 @@ const segFlagLittleEndian = 1 << 0
 const (
 	segFlagDenseRowids = 1 << 1
 	segFlagFullWidth   = 1 << 2
-	segFlagsKnown      = segFlagLittleEndian | segFlagDenseRowids | segFlagFullWidth
+	// segFlagNumeric says a column is PhysNumeric, which no segment of a file
+	// older than version 7, or of a delta older than version 6, holds.
+	segFlagNumeric = 1 << 3
+	segFlagsKnown  = segFlagLittleEndian | segFlagDenseRowids | segFlagFullWidth | segFlagNumeric
 )
 
 // segCellBounds, in a column directory entry's second byte, marks a TEXT or
@@ -205,8 +208,10 @@ func buildSegmentWith(dst []byte, cols []columnInfo, rowids []uint64, rows [][]V
 				census[c].Null++
 			case Int:
 				census[c].Int++
+				census[c].countNumeric(v, 1)
 			case Float:
 				census[c].Real++
+				census[c].countNumeric(v, 1)
 			case Text:
 				census[c].Text++
 			case Blob:
@@ -361,6 +366,10 @@ func buildSegmentWith(dst []byte, cols []columnInfo, rowids []uint64, rows [][]V
 				cells[c][i] = uint64(v.I)
 			case phys[c] == PhysFloat64 && v.Typ == Float:
 				cells[c][i] = floatBits(v.F)
+			case phys[c] == PhysNumeric && v.Typ == Int:
+				cells[c][i] = floatBits(float64(v.I))
+			case phys[c] == PhysNumeric && v.Typ == Float:
+				cells[c][i] = floatBits(v.F)
 			case (phys[c] == PhysText && v.Typ == Text) || (phys[c] == PhysBlob && v.Typ == Blob):
 				if phys[c] == PhysBlob {
 					for len(heap) < segAlignBlob(len(heap)) {
@@ -505,7 +514,7 @@ func buildSegmentWith(dst []byte, cols []columnInfo, rowids []uint64, rows [][]V
 		out = append(out, idx[c]...)
 	}
 
-	flags := uint32(segFlagLittleEndian)
+	flags := uint32(segFlagLittleEndian) | segNumericFlag(phys)
 	if dense {
 		flags |= segFlagDenseRowids
 	}
@@ -536,6 +545,27 @@ func buildSegmentWith(dst []byte, cols []columnInfo, rowids []uint64, rows [][]V
 }
 
 func segAlign8(n int) int { return (n + 7) &^ 7 }
+
+// segNumericFlag is segFlagNumeric when a column is PhysNumeric.
+func segNumericFlag(phys []PhysicalType) uint32 {
+	if slices.Contains(phys, PhysNumeric) {
+		return segFlagNumeric
+	}
+	return 0
+}
+
+// segHasNumeric is whether a built segment has a PhysNumeric column.
+func segHasNumeric(raw []byte) bool {
+	return len(raw) >= 8 && binary.LittleEndian.Uint32(raw[4:])&segFlagNumeric != 0
+}
+
+// numericValue is the value a PhysNumeric cell holds.
+func numericValue(raw uint64) Value {
+	if f := bitsFloat(raw); numericReadsInt(f) {
+		return Value{Typ: Int, I: int64(f)}
+	}
+	return Value{Typ: Float, F: bitsFloat(raw)}
+}
 
 func floatBits(f float64) uint64 { return *(*uint64)(unsafe.Pointer(&f)) }
 func bitsFloat(u uint64) float64 { return *(*float64)(unsafe.Pointer(&u)) }
@@ -596,6 +626,8 @@ func openSegment(buf []byte) (*segment, error) {
 			idxOff:   binary.LittleEndian.Uint32(buf[d+12:]),
 		}
 		switch {
+		case col.phys > PhysNumeric || col.phys == PhysTagged || col.phys == PhysNumeric && flags&segFlagNumeric == 0:
+			return nil, fmt.Errorf("segment: column %d has an unknown physical type %d", c, buf[d])
 		case buf[d+1] > segCellBounds, col.bounds && col.phys != PhysText && col.phys != PhysBlob:
 			return nil, fmt.Errorf("segment: column %d has an unknown cell format %d", c, buf[d+1])
 		case col.bounds:
@@ -902,6 +934,8 @@ func (s *segment) Value(c, i int) Value {
 		return Value{Typ: Int, I: int64(raw)}
 	case PhysFloat64:
 		return Value{Typ: Float, F: bitsFloat(raw)}
+	case PhysNumeric:
+		return numericValue(raw)
 	default:
 		o, n := uint32(raw), uint32(raw>>32)
 		if int(o)+int(n) > len(s.heap) {

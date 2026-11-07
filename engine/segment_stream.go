@@ -85,9 +85,11 @@ func (s *segStream) add(rowid uint64, vals []Value) bool {
 			col.census.Null++
 		case Int:
 			col.census.Int++
+			col.census.countNumeric(*v, 1)
 			cell = uint64(v.I)
 		case Float:
 			col.census.Real++
+			col.census.countNumeric(*v, 1)
 			cell = floatBits(v.F)
 			if v.intReal {
 				t |= streamIntReal
@@ -123,8 +125,10 @@ func (s *segStream) truncate(n int) {
 				col.census.Null--
 			case Int:
 				col.census.Int--
+				col.census.countNumeric(col.value(i), -1)
 			case Float:
 				col.census.Real--
+				col.census.countNumeric(col.value(i), -1)
 			case Text, Blob:
 				if ValueType(col.typ.at(i)) == Text {
 					col.census.Text--
@@ -260,8 +264,10 @@ func (s *segStream) finish() ([]byte, error) {
 			switch {
 			case t == Null:
 				nulls[c][i/8] |= 1 << uint(i%8)
-			case phys[c] == PhysInt64 && t == Int, phys[c] == PhysFloat64 && t == Float:
+			case phys[c] == PhysInt64 && t == Int, phys[c] == PhysFloat64 && t == Float, phys[c] == PhysNumeric && t == Float:
 				binary.LittleEndian.PutUint64(out[base+i*segCellWidth:], cell)
+			case phys[c] == PhysNumeric && t == Int:
+				binary.LittleEndian.PutUint64(out[base+i*segCellWidth:], floatBits(float64(int64(cell))))
 			case phys[c] == PhysText && t == Text, phys[c] == PhysBlob && t == Blob:
 				if t == Blob {
 					for len(heap) < segAlignBlob(len(heap)) {
@@ -310,7 +316,7 @@ func (s *segStream) finish() ([]byte, error) {
 	out = slices.Grow(out, len(excBuf))
 	out = append(out, excBuf...)
 
-	flags := uint32(segFlagLittleEndian | segFlagFullWidth)
+	flags := uint32(segFlagLittleEndian|segFlagFullWidth) | segNumericFlag(phys)
 	if dense {
 		flags |= segFlagDenseRowids
 	}

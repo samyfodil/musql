@@ -23,20 +23,21 @@ import (
 // format version is added, into a directory of its own, leaving the old one.
 
 // formatFixtureDir is the fixture the current format writes.
-const formatFixtureDir = "testdata/format/v6"
+const formatFixtureDir = "testdata/format/v7"
 
 // formatVersionWritten is the segment file version a rewrite writes: a
 // fixture of any older version is written back as this one by its VACUUM.
-const formatVersionWritten = 6
+const formatVersionWritten = 7
 
 // formatFixtureSetup builds the fixture: every storage class and NULL, a
+// NUMERIC column of INTEGERs and a REAL (PhysNumeric, from version 7), a
 // rowid alias and a WITHOUT ROWID table, indexes plain, expression and
 // partial, a view, a trigger, AUTOINCREMENT, vectors and a vector index, and
 // fts4, fts5 and rtree tables. The statements after the VACUUM are what the
 // delta log holds.
 var formatFixtureSetup = []string{
 	"CREATE TABLE kinds(id INTEGER PRIMARY KEY, i INT, r REAL, t TEXT, b BLOB, n NUMERIC, any)",
-	"INSERT INTO kinds VALUES (1, 42, 1.5, 'text', x'00ff10', 12.0, NULL)",
+	"INSERT INTO kinds VALUES (1, 42, 1.5, 'text', x'00ff10', 12.5, NULL)",
 	"INSERT INTO kinds VALUES (2, -9223372036854775808, -0.0, '', x'', '7', 3.25)",
 	"INSERT INTO kinds VALUES (3, NULL, NULL, NULL, NULL, NULL, 'mixed')",
 	"INSERT INTO kinds VALUES (4, 9223372036854775807, 1e308, 'é ünïcode ✓', zeroblob(4), 1e3, x'01')",

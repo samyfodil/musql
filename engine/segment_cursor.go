@@ -591,7 +591,7 @@ func segColumnRun(plans []segColPlan, s *segment, c, i0 int, rowids []uint64, ds
 	if s.excRows != nil {
 		exc = s.excRows[c]
 	}
-	fixed := !col.bounds && (col.phys == PhysInt64 || col.phys == PhysFloat64)
+	fixed := !col.bounds && (col.phys == PhysInt64 || col.phys == PhysFloat64 || col.phys == PhysNumeric)
 	var block []byte
 	if fixed {
 		block = s.buf[col.blockOff:]
@@ -605,10 +605,13 @@ func segColumnRun(plans []segColPlan, s *segment, c, i0 int, rowids []uint64, ds
 			v = s.exc[uint64(i)*uint64(len(s.cols))+uint64(c)]
 		case fixed:
 			raw := binary.LittleEndian.Uint64(block[i*segCellWidth:])
-			if col.phys == PhysInt64 {
+			switch col.phys {
+			case PhysInt64:
 				v = Value{Typ: Int, I: int64(raw)}
-			} else {
+			case PhysFloat64:
 				v = Value{Typ: Float, F: bitsFloat(raw)}
+			default:
+				v = numericValue(raw)
 			}
 		default:
 			v = s.Value(c, i)
