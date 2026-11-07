@@ -172,7 +172,8 @@ func segJoinFuzzSeed(t *testing.T, seed int64) int64 {
 		"WHERE f.v IN (5, NULL)", "WHERE f.s NOT IN ('B', '')", "WHERE d2.x > 1", "WHERE d2.x BETWEEN 0 AND 5 AND f.v > 0",
 		"WHERE d2.x * 2 - d2.y > 1", "WHERE d2.x = 1 OR d2.y > 3", "WHERE d2.x IN (2, 3) OR d2.y < 0",
 		"WHERE f.v > d2.x", "WHERE f.w < d2.y OR f.s = 'a'", "WHERE d2.x = 1 OR d2.y = f.w", "WHERE d2.x = f.v % 5 OR d2.y > 3",
-		"WHERE coalesce(f.v, d2.x) > 2", "WHERE -f.v < 3 AND f.v & 1 = 0", "WHERE f.v BETWEEN 5 AND 60", "WHERE f.v = 7", "WHERE f.s = 'b' COLLATE NOCASE", "WHERE d2.x = 2 AND f.v = 3", "WHERE CASE WHEN f.v > d2.x THEN f.w ELSE d2.y END > 0"}
+		"WHERE coalesce(f.v, d2.x) > 2", "WHERE -f.v < 3 AND f.v & 1 = 0", "WHERE f.v BETWEEN 5 AND 60", "WHERE f.v = 7", "WHERE f.s = 'b' COLLATE NOCASE", "WHERE d2.x = 2 AND f.v = 3", "WHERE CASE WHEN f.v > d2.x THEN f.w ELSE d2.y END > 0",
+		"WHERE f.id <= 40", "WHERE d2.id > 5 AND f.id < 30", "WHERE d1.id < 4 AND f.v > 2"}
 	for range 50 {
 		join := joins[r.Intn(len(joins))]
 		hasD1 := strings.Contains(join, "d1 ")

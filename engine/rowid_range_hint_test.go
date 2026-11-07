@@ -5,6 +5,7 @@ import (
 	"math"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -48,6 +49,12 @@ func TestRowidRangeHintMatchesScan(t *testing.T) {
 		`SELECT id FROM t WHERE id > ? AND id < 2000`,
 		`SELECT id FROM t WHERE id > ? ORDER BY id DESC LIMIT 3`,
 		`SELECT count(*), sum(id) FROM (SELECT id FROM t WHERE id >= ?)`,
+		// A join's levels each take their own bound.
+		`SELECT a.id, b.s FROM t a, t b WHERE a.id < 30 AND b.id > ? AND b.id < 2950 AND b.k = a.k`,
+		`SELECT count(*), sum(b.id), group_concat(a.id) FROM t a JOIN t b ON b.k = a.k WHERE a.id <= ? AND a.id > 2900 AND b.id < 25`,
+		`SELECT count(*), max(b.id) FROM t a, t b WHERE a.id BETWEEN 0 AND 5 AND b.id >= ? AND b.id <= 2990`,
+		`SELECT a.id, b.id FROM t a LEFT JOIN t b ON b.k = a.k AND b.id > 2990 WHERE a.id < 15 AND b.id <= ?`,
+		`SELECT count(*) FROM (SELECT k FROM t WHERE id <= ?) a, (SELECT k FROM t WHERE id <= 40) b WHERE a.k = b.k`,
 	}
 	check := func(t *testing.T, name string, query func(string, []Value) ([][]Value, error)) {
 		for _, f := range forms {
@@ -66,6 +73,13 @@ func TestRowidRangeHintMatchesScan(t *testing.T) {
 					t.Fatalf("%s %s %v:\n got %v\nwant %v", name, f, b, got, want)
 				}
 			}
+		}
+	}
+	// BETWEEN is no bound.
+	for i, want := range []int{2, 2, 1} {
+		f := forms[9+i]
+		if d, err := DisassembleScan(clean, f); err != nil || strings.Count(d, "SeekRowidRangeHint") != want {
+			t.Fatalf("%s: want %d bounds (%v):\n%s", f, want, err, d)
 		}
 	}
 	check(t, "segments", func(q string, a []Value) ([][]Value, error) {

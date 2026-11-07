@@ -922,18 +922,17 @@ type rowidRangeKey struct {
 }
 
 // detectRowidRangeKey looks for a WHERE conjunct bounding the rowid (or the
-// INTEGER PRIMARY KEY) of a single-table query's table by a column-free
-// constant: "rowid > E", ">=", "<", "<=", either way round. C plans the same
+// INTEGER PRIMARY KEY) of source i by a column-free constant: "rowid > E", ">=", "<", "<=", either way round. C plans the same
 // conjunct as a rowid range (WHERE_IPK with WHERE_COLUMN_RANGE, where.c) and
 // starts its scan with OP_SeekGT/GE. Here it narrows each segment to its span
 // (OpSeekRowidRangeHint). The conjunct stays in WHERE, so a bound of any class
 // other than INTEGER, whose comparison with a rowid follows affinity rules,
 // simply leaves the scan whole at run time.
-func detectRowidRangeKey(c *compiler, srcs []joinSource, where Expr) (*rowidRangeKey, bool) {
-	if where == nil || len(srcs) != 1 || rowidRangeOffForTest {
+func detectRowidRangeKey(c *compiler, srcs []joinSource, i int, where Expr) (*rowidRangeKey, bool) {
+	if where == nil || rowidRangeOffForTest {
 		return nil, false
 	}
-	s := srcs[0]
+	s := srcs[i]
 	if s.derived != nil || s.tbl == nil || s.tbl.withoutRowid || s.left || s.rightOuter {
 		return nil, false
 	}
@@ -958,7 +957,7 @@ func detectRowidRangeKey(c *compiler, srcs []joinSource, where Expr) (*rowidRang
 		default:
 			continue
 		}
-		if !newSeekGuard(c, srcs, 0, splitTopLevelAnd(where)).keepRange(xnRowid, at[n]) {
+		if !newSeekGuard(c, srcs, i, splitTopLevelAnd(where)).keepRange(xnRowid, at[n]) {
 			return nil, false
 		}
 		return key, true
@@ -1065,27 +1064,29 @@ func isScopeRowidRef(c *compiler, s joinSource, e Expr) bool {
 
 // planConstantKeySeeks installs the seek a column-free key allows on one
 // source: a rowid point lookup, else a rowid IN list, else index equalities
-// (which carry the planner's EXPLAIN line), else with rowidRange a rowid
-// bound. Each only restricts candidates and keeps the scan's order.
+// (which carry the planner's EXPLAIN line). With rowidRange, every source
+// left without one takes a rowid bound. Each only restricts candidates and
+// keeps the scan's order.
 func planConstantKeySeeks(c *compiler, srcs []joinSource, where Expr, rowidRange bool) {
+	seeked := -1
 	if idx, key, ok := detectRowidSeekKey(c, srcs, where); ok {
-		srcs[idx].seekKeyExpr = key
-		return
-	}
-	if idx, keys, ok := detectRowidInKeys(c, srcs, where); ok {
-		srcs[idx].seekSet = keys
-		return
-	}
-	if idx, plan, ok := detectIndexSeekKey(c, srcs, where); ok {
+		srcs[idx].seekKeyExpr, seeked = key, idx
+	} else if idx, keys, ok := detectRowidInKeys(c, srcs, where); ok {
+		srcs[idx].seekSet, seeked = keys, idx
+	} else if idx, plan, ok := detectIndexSeekKey(c, srcs, where); ok {
 		plan.plan = srcs[idx].planExplain
-		srcs[idx].idxSeek = plan
-		return
+		srcs[idx].idxSeek, seeked = plan, idx
 	}
 	if !rowidRange {
 		return
 	}
-	if key, ok := detectRowidRangeKey(c, srcs, where); ok {
-		srcs[0].rowidRange = key
+	for i := range srcs {
+		if i == seeked {
+			continue
+		}
+		if key, ok := detectRowidRangeKey(c, srcs, i, where); ok {
+			srcs[i].rowidRange = key
+		}
 	}
 }
 

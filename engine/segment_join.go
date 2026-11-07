@@ -1573,11 +1573,37 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 					lo = hi
 				}
 			}
+			if p := w.pass[i]; p != nil {
+				sk, rows = passingOnly(sk, rows, p)
+			}
 			l.keys, l.nulls, l.sorted, l.rows = keys, nulls, sk, rows
 		}
 		w.link[i] = l
 	}
 	return w, true
+}
+
+// passingOnly is a level's rows sorted by key without those its own terms
+// fail, which the walk never visits, when they are most of them: a bounded
+// level ("id <= 400") otherwise had every probe step over the whole table's
+// rows holding the key.
+func passingOnly(sk []int64, rows []int32, pass []bool) ([]int64, []int32) {
+	n := 0
+	for _, r := range rows {
+		if pass[r] {
+			n++
+		}
+	}
+	if n > len(rows)/2 {
+		return sk, rows
+	}
+	fsk, frows := make([]int64, 0, n), make([]int32, 0, n)
+	for j, r := range rows {
+		if pass[r] {
+			fsk, frows = append(fsk, sk[j]), append(frows, r)
+		}
+	}
+	return fsk, frows
 }
 
 // flat reports whether every level after the first is found by a rowid.

@@ -1134,10 +1134,11 @@ func (tr *segJoinTrace) writtenOnEveryPath(pc, end, r int) bool {
 }
 
 // segJoinSeekHint is the address after a seek hint at pc for an opened
-// cursor that seeks once (OpSeekIndexHint P3 0) -- constants into registers,
-// then the hint -- or pc when there is none. The cursor then holds, in rowid
-// order, a superset of the rows its terms pass, which the loop tests again:
-// the kernel, testing every row, visits the same ones in the same order.
+// cursor that seeks once (OpSeekIndexHint P3 0) or takes a rowid bound
+// (OpSeekRowidRangeHint) -- constants into registers, then the hint -- or pc
+// when there is none. The cursor then holds, in rowid order, a superset of the
+// rows its terms pass, which the loop tests again: the kernel, testing every
+// row, visits the same ones in the same order.
 func segJoinSeekHint(in []Instruction, pc int, opened map[int]bool) int {
 	i := pc
 	for i < len(in) {
@@ -1148,10 +1149,13 @@ func segJoinSeekHint(in []Instruction, pc int, opened map[int]bool) int {
 		}
 		break
 	}
-	if i == pc || i >= len(in) || in[i].Op != OpSeekIndexHint || in[i].P3 != 0 || !opened[in[i].P1] {
+	if i == pc || i >= len(in) || !opened[in[i].P1] {
 		return pc
 	}
-	return i + 1
+	if h := in[i]; h.Op == OpSeekIndexHint && h.P3 == 0 || h.Op == OpSeekRowidRangeHint {
+		return i + 1
+	}
+	return pc
 }
 
 // segJoinMulti is the level of a value over several levels: computed on a
