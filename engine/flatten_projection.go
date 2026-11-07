@@ -450,7 +450,7 @@ func (p *ReadOnlyPager) r41FlattenItem(stmt *SelectStmt, i int, expand bool) (*S
 		return nil, false
 	}
 	if it.Join == JoinLeft {
-		if a.baseTbl == nil {
+		if a.baseTbl == nil || a.b.TableFunc {
 			return nil, false
 		}
 		// TK_IF_NULL_ROW (substExpr, select.c:3830) is spelled as a CASE on
@@ -477,6 +477,31 @@ func (p *ReadOnlyPager) r41FlattenItem(stmt *SelectStmt, i int, expand bool) (*S
 		}
 	}
 	return a.parent(stmt, i, it)
+}
+
+// r41SeriesBase is r37cOrdinaryBase for a generate_series call, which C's
+// flattenSubquery takes like any table (its restriction (3b) on a virtual
+// table is omitted), so "(SELECT value FROM generate_series(1,9))" reads the
+// series itself. Its arguments must read no column: a derived table cannot
+// see the FROM items beside it, and flattened, the call would.
+func (p *ReadOnlyPager) r41SeriesBase(b FromItem) (*resolvedTable, bool) {
+	if !b.TableFunc || !equalFoldName(b.Table, "generate_series") || b.Schema != "" ||
+		b.On != nil || len(b.Using) != 0 || b.Natural || b.GroupLen != 0 || b.GroupAlias != "" || b.HasGroupAlias {
+		return nil, false
+	}
+	if _, isCTE := p.lookupCTE(b.Table); isCTE {
+		return nil, false
+	}
+	for _, a := range b.TableFuncArgs {
+		if !exprRefsOnly(a, func(ColumnExpr) bool { return false }) {
+			return nil, false
+		}
+	}
+	cols, err := p.vtabScopeColumns(b)
+	if err != nil {
+		return nil, false
+	}
+	return &resolvedTable{cols: cols, ipkIndex: -1}, true
 }
 
 // r41ArmFlat is one projection body analysed for flattening: its derived
@@ -513,6 +538,9 @@ func (p *ReadOnlyPager) r41Arm(stmt *SelectStmt, i int, it FromItem, body *Selec
 	}
 	b := body.From[0]
 	tbl, ok := p.r37cOrdinaryBase(b)
+	if !ok && names == nil {
+		tbl, ok = p.r41SeriesBase(b)
+	}
 	if !ok {
 		return nil, false
 	}
@@ -526,7 +554,11 @@ func (p *ReadOnlyPager) r41Arm(stmt *SelectStmt, i int, it FromItem, body *Selec
 		aliases: map[string]bool{},
 	}
 	for _, c := range tbl.cols {
-		if c.Hidden {
+		// A table's hidden column is one the derived table hides and the base
+		// shows. Only a table-valued function's are taken, where a hidden
+		// name stays in base, so a parent reference to it declines
+		// (parentRef) rather than newly binding.
+		if c.Hidden && !b.TableFunc {
 			return nil, false
 		}
 		f.base[r33sFoldIdent(c.Name)] = c.Name
@@ -589,6 +621,9 @@ func (p *ReadOnlyPager) r41Arm(stmt *SelectStmt, i int, it FromItem, body *Selec
 				return nil, false
 			}
 			for _, tc := range tbl.cols {
+				if tc.Hidden {
+					continue
+				}
 				f.cols = append(f.cols, r41DerivedCol{name: tc.Name, base: tc.Name})
 			}
 			continue
@@ -899,6 +934,10 @@ func (a *r41ArmFlat) parent(stmt *SelectStmt, i int, it FromItem) (*SelectStmt, 
 		IndexedBy:    b.IndexedBy,
 		NotIndexed:   b.NotIndexed,
 		flattened:    true,
+		// A table-valued function's call (r41SeriesBase): its arguments read
+		// no column, so they mean the same in the parent.
+		TableFunc:     b.TableFunc,
+		TableFuncArgs: b.TableFuncArgs,
 	}
 	// WHERE, GROUP BY, HAVING and ORDER BY are resolved with the result list
 	// in view (NC_UEList, resolve.c:1996-2007), so a name there that no FROM
