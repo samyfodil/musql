@@ -337,7 +337,7 @@ func identityOrder(n int) []int {
 // identity order with everything deferred to the innermost body (as join.go
 // does). planJoinPushdown assumes one scope per source, which groups break.
 // Both are optimizations, so this is never wrong.
-func buildJoinPlan(srcs []joinSource, where Expr) joinPlan {
+func buildJoinPlan(c *compiler, srcs []joinSource, where Expr) joinPlan {
 	if groupPresent(srcs) {
 		consts, outerConsts, rest := splitConstWhereTerms(splitTopLevelAnd(where), tableScopesOf(srcs), true)
 		return joinPlan{
@@ -348,7 +348,7 @@ func buildJoinPlan(srcs []joinSource, where Expr) joinPlan {
 			outerConsts: outerConsts,
 		}
 	}
-	return joinPushdownPlan(srcs, tableScopesOf(srcs), where)
+	return joinPushdownPlan(c, srcs, tableScopesOf(srcs), where)
 }
 
 // resolveJoinSources resolves every FROM item into a joinSource, allocating one
@@ -2869,8 +2869,30 @@ func gathersOf(srcs []joinSource) []aggGather {
 // emitJoinLevel), and deferred (conjuncts that need the full, possibly
 // NULL-extended row, emitted by the caller's body). Reusing join.go's planner
 // keeps row order and ON-vs-WHERE safety identical.
-func joinPushdownPlan(srcs []joinSource, scopes []tableScope, where Expr) joinPlan {
-	return planJoinPushdown(where, joinedTablesFor(srcs), scopes)
+func joinPushdownPlan(c *compiler, srcs []joinSource, scopes []tableScope, where Expr) joinPlan {
+	var subFree func(Expr) bool
+	if c != nil && c.pager != nil {
+		subFree = c.subTermsUncorrelated
+	}
+	return planJoinPushdownSub(where, joinedTablesFor(srcs), scopes, subFree)
+}
+
+// subTermsUncorrelated reports whether every sub-select of conjunct e
+// compiles here without binding a row of this query or one enclosing it: a
+// trial compile, so the binder that will compile the term decides. Anything
+// it cannot walk or compile counts as correlated.
+func (c *compiler) subTermsUncorrelated(e Expr) bool {
+	subs, ok := subSelects(e)
+	if !ok || len(subs) == 0 {
+		return false
+	}
+	for _, sub := range subs {
+		prog, err := compileSubProgram(c.pager, sub, c)
+		if err != nil || prog == nil || prog.Correlated {
+			return false
+		}
+	}
+	return true
 }
 
 // joinedTablesFor projects a resolved FROM clause onto the []joinedTable that

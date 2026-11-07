@@ -1919,6 +1919,68 @@ func mentionsSubquery(e Expr) bool {
 	}
 }
 
+// subSelects returns every sub-select e holds outside another one, or false
+// when e holds a node this does not walk (which could hide one).
+func subSelects(e Expr) ([]*SelectStmt, bool) {
+	var out []*SelectStmt
+	ok := true
+	var walk func(Expr)
+	walk = func(e Expr) {
+		switch x := e.(type) {
+		case nil, LiteralExpr, ColumnExpr, ParamExpr:
+		case SubqueryExpr:
+			out = append(out, x.Stmt)
+		case ExistsExpr:
+			out = append(out, x.Stmt)
+		case UnaryExpr:
+			walk(x.X)
+		case BinaryExpr:
+			walk(x.L)
+			walk(x.R)
+		case IsNullExpr:
+			walk(x.X)
+		case InExpr:
+			if x.Sub != nil {
+				out = append(out, x.Sub)
+			}
+			walk(x.X)
+			for _, a := range x.List {
+				walk(a)
+			}
+		case BetweenExpr:
+			walk(x.X)
+			walk(x.Lo)
+			walk(x.Hi)
+		case LikeExpr:
+			walk(x.X)
+			walk(x.Pattern)
+			walk(x.Escape)
+		case GlobExpr:
+			walk(x.X)
+			walk(x.Pattern)
+		case CollateExpr:
+			walk(x.X)
+		case CastExpr:
+			walk(x.X)
+		case FuncExpr:
+			for _, a := range x.walkArgs() {
+				walk(a)
+			}
+		case CaseExpr:
+			walk(x.Base)
+			for _, w := range x.Whens {
+				walk(w.When)
+				walk(w.Then)
+			}
+			walk(x.Else)
+		default:
+			ok = false
+		}
+	}
+	walk(e)
+	return out, ok
+}
+
 // collectTableRefs adds to out the index of every scope e references a column
 // of; constants and outer references contribute nothing. A qualified reference
 // matches the named table; an unqualified one matches every table with that
@@ -2347,6 +2409,15 @@ type joinPlan struct {
 // bound, deferring it if that is at or past the first LEFT-joined table (LEFT
 // tables are never reordered) or it contains a correlated subquery.
 func planJoinPushdown(where Expr, jts []joinedTable, scopes []tableScope) joinPlan {
+	return planJoinPushdownSub(where, jts, scopes, nil)
+}
+
+// planJoinPushdownSub is planJoinPushdown placing a conjunct that holds a
+// subquery by the tables it names outside it, as any other, when subFree says
+// none of its subqueries reads a row of this FROM clause: where.c's prereqAll
+// counts a subquery's correlated columns only (exprSelectUsage). nil subFree
+// keeps every such conjunct for the innermost level.
+func planJoinPushdownSub(where Expr, jts []joinedTable, scopes []tableScope, subFree func(Expr) bool) joinPlan {
 	if hasRightOuter(jts) || hasGroups(jts) {
 		// Defer every conjunct with a RIGHT/FULL item or a join group. A
 		// RIGHT/FULL match decision is global, so pruning any combination early
@@ -2409,7 +2480,8 @@ func planJoinPushdown(where Expr, jts []joinedTable, scopes []tableScope) joinPl
 				origMax = idx
 			}
 		}
-		forceLast := mentionsSubquery(cj) && !levelZeroConstTerm(cj, scopes, false) && !constSubTerm(cj, scopes)
+		forceLast := mentionsSubquery(cj) && !levelZeroConstTerm(cj, scopes, false) && !constSubTerm(cj, scopes) &&
+			(subFree == nil || !subFree(cj))
 		checkIdx := origMax
 		if forceLast && checkIdx < len(jts)-1 {
 			checkIdx = len(jts) - 1

@@ -596,7 +596,7 @@ func compileScanPlain(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols 
 	// subquery-carrying) for this body. The two are a complete partition of
 	// WHERE, so the row set and order are identical to testing all of WHERE
 	// here; only pruning happens earlier. See joinPushdownPlan/buildJoinPlan.
-	plan := buildJoinPlan(srcs, stmt.Where)
+	plan := buildJoinPlan(c, srcs, stmt.Where)
 	if len(plan.buckets) == 1 {
 		plan.buckets[0] = consumedFirst(c, srcs, plan.buckets[0])
 	}

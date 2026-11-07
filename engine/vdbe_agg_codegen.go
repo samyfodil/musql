@@ -266,7 +266,7 @@ func compileScanAggregate(c *compiler, stmt *SelectStmt, srcs []joinSource, scop
 	// Predicate pushdown: see compileScanPlain (vdbe_scan.go). buckets prune at
 	// their join level; this body tests only the deferred residue. (The local
 	// `plan` here is the aggregate plan, so the pushdown plan is jplan.)
-	jplan := joinPushdownPlan(srcs, scopes, stmt.Where)
+	jplan := joinPushdownPlan(c, srcs, scopes, stmt.Where)
 	if len(jplan.buckets) == 1 {
 		jplan.buckets[0] = consumedFirst(c, srcs, jplan.buckets[0])
 	}
@@ -2124,7 +2124,7 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// Predicate pushdown: see compileScanPlain (vdbe_scan.go). buckets prune at
 	// their join level; this body tests only the deferred residue. (`plan` is
 	// the aggregate plan here, so the pushdown plan is jplan.)
-	jplan := joinPushdownPlan(srcs, scopes, stmt.Where)
+	jplan := joinPushdownPlan(c, srcs, scopes, stmt.Where)
 	if len(jplan.buckets) == 1 {
 		jplan.buckets[0] = consumedFirst(c, srcs, jplan.buckets[0])
 	}
@@ -2596,7 +2596,7 @@ func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp
 	if len(srcs) == 1 {
 		planConstantKeySeeks(c, srcs, stmt.Where, false)
 	}
-	jplan := joinPushdownPlan(srcs, plan.scopes, stmt.Where)
+	jplan := joinPushdownPlan(c, srcs, plan.scopes, stmt.Where)
 	if len(jplan.buckets) == 1 {
 		jplan.buckets[0] = consumedFirst(c, srcs, jplan.buckets[0])
 	}

@@ -165,7 +165,7 @@ func compileScanSorted(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols
 
 	// Predicate pushdown: see compileScanPlain (vdbe_scan.go). buckets are
 	// pruned at their join level; this body tests only the deferred residue.
-	plan := buildJoinPlan(srcs, stmt.Where)
+	plan := buildJoinPlan(c, srcs, stmt.Where)
 	if len(plan.buckets) == 1 {
 		plan.buckets[0] = consumedFirst(c, srcs, plan.buckets[0])
 	}
