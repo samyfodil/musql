@@ -139,7 +139,10 @@ func TestExplain(t *testing.T) {
 
 func TestCell(t *testing.T) {
 	at := time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)
-	for v, want := range map[any]string{nil: "NULL", "x": "x", int64(7): "7", at: "2026-01-02T03:04:05.000000006Z"} {
+	// A REAL is shown as SQLite renders it, not as Go's shortest form
+	// (issue #116): 2^81 is ...584e+24 there, ...583e+24 in Go.
+	for v, want := range map[any]string{nil: "NULL", "x": "x", int64(7): "7", at: "2026-01-02T03:04:05.000000006Z",
+		float64(1 << 81): "2.4178516392292584e+24", 0.30000000000000004: "0.30000000000000004", 3.0: "3.0", 49.47: "49.47"} {
 		if got := cell(v); got != want {
 			t.Errorf("%v: %q", v, got)
 		}

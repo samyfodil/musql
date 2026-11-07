@@ -283,6 +283,8 @@ func cell(v any) string {
 	switch v := v.(type) {
 	case nil:
 		return "NULL"
+	case float64:
+		return engine.FormatReal(v)
 	case []byte:
 		return string(v)
 	case time.Time:
