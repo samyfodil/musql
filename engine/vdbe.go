@@ -1287,13 +1287,26 @@ func (m *vdbe) outerFrame(levels int) *vdbe {
 func cursorColumnMasks(insns []Instruction, ncursors int) []columnMask {
 	for i := range insns {
 		if readsWholeCursorRows(insns[i].Op) {
-			if p, ok := insns[i].P4.(*aggPlan); ok && insns[i].Op == OpAggStep && p.rowFree {
-				continue // gathers no row (aggPlan.rowFree)
+			if p, ok := insns[i].P4.(*aggPlan); ok && (insns[i].Op == OpAggStep || insns[i].Op == OpHashAggStep) && (p.rowFree || p.rowCols != nil) {
+				continue // gathers no row, or rowCols (marked below)
 			}
 			return nil
 		}
 	}
 	masks := make([]columnMask, ncursors)
+	for i := range insns {
+		p, ok := insns[i].P4.(*aggPlan)
+		if !ok || insns[i].Op != OpHashAggStep || p.rowCols == nil {
+			continue
+		}
+		for _, c := range p.rowCols {
+			for _, g := range p.gathers {
+				if c >= g.offset && c < g.offset+g.n && g.cursor >= 0 && g.cursor < ncursors {
+					masks[g.cursor] |= 1 << uint(min(c-g.offset, 63))
+				}
+			}
+		}
+	}
 	for i := range insns {
 		in := &insns[i]
 		if in.Op != OpColumn || in.P1 < 0 || in.P1 >= ncursors {
@@ -2106,7 +2119,8 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpSortedSeek:
 			cur := m.cursors[op.P1]
-			if cur == nil || cursorHasNoBtree(cur) || cur.rowStore != nil || cur.streamable || cur.seekReseek || cur.refillEach {
+			if cur == nil || cur.rowStore != nil || cur.streamable || cur.seekReseek || cur.refillEach || cur.sub != nil || cur.vt != nil ||
+				cursorHasNoBtree(cur) && cur.fill == nil && !cur.materialized {
 				break // a cursor whose rows are not one list built once
 			}
 			if !cur.materialized {

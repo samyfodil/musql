@@ -64,7 +64,7 @@ func annotateJoinSeeks(c *compiler, srcs []joinSource, plan joinPlan) {
 	for level := 1; level < len(order); level++ {
 		origIdx := order[level]
 		s := srcs[origIdx]
-		if s.derived != nil || s.tbl == nil {
+		if s.tbl == nil || s.vtabItem != nil {
 			continue
 		}
 		var planKey *autoIndexKey
@@ -95,7 +95,10 @@ func annotateJoinSeeks(c *compiler, srcs []joinSource, plan joinPlan) {
 		eqs = plainUsingRefs(srcs, orCommonConjuncts(eqs))
 		// RIGHT/FULL operands (whose sweep needs the full row list back) and
 		// WITHOUT ROWID tables take only the sorted seek.
-		if !s.rightOuter && !s.tbl.withoutRowid && annotateIndexJoinSeek(c, srcs, origIdx, planKey, outer, eqs) {
+		// A derived table or CTE has no index or rowid to seek; its rows,
+		// built once, take the sorted seek.
+		table := s.derived == nil && s.cteItem == nil
+		if table && !s.rightOuter && !s.tbl.withoutRowid && annotateIndexJoinSeek(c, srcs, origIdx, planKey, outer, eqs) {
 			continue
 		}
 		if planKey != nil && planKey.multiOr != nil {
