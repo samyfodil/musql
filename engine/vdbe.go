@@ -2104,6 +2104,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				}
 				if h.slot == 0 {
 					cur.idxSeekConfigured, cur.idxSeekMore, cur.idxSeekNext, cur.idxSeekSet = false, cur.idxSeekMore[:0], 0, nil
+					cur.idxSeekOrder = h.order
 				}
 				// A slot out of step is dropped, as is the key of "x IS NULL" (no
 				// posting list holds NULL) and a write's TEXT key in a UTF-16

@@ -96,3 +96,19 @@ func TestJoinSeekUnderMultiIndexOr(t *testing.T) {
 		"SELECT line.ok, part.pk FROM line, part WHERE (part.pk=line.pk AND brand='B1' AND qty<3) OR (part.pk=line.pk AND size=16 AND qty>28)",
 	})
 }
+
+// TestJoinSeekOnTwoColumnKeyKeepsIndexOrder pins a correlated seek on the
+// leading column of a two-column PRIMARY KEY whose rows were written in the
+// key's reverse order: C walks the index, so each outer row's matches come
+// by the second column, not by rowid.
+func TestJoinSeekOnTwoColumnKeyKeepsIndexOrder(t *testing.T) {
+	differ(t, "two-column key order", []string{
+		"CREATE TABLE o(k INTEGER PRIMARY KEY, d TEXT)",
+		"CREATE TABLE l(k INT, n INT, q REAL, PRIMARY KEY(k, n))",
+		"WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<300) INSERT INTO o SELECT i, 'd'||(i%7) FROM s",
+		"WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<1500) INSERT INTO l SELECT 1+(i%300), 10-(i/300), i*0.5 FROM s",
+		"SELECT o.k, l.n, l.q FROM o JOIN l ON l.k = o.k WHERE o.d = 'd3'",
+		"SELECT o.k, group_concat(l.n) FROM o JOIN l ON l.k = o.k WHERE o.k < 20 GROUP BY o.k",
+		"SELECT o.k, sum(l.q) FROM o, l WHERE l.k = o.k AND o.d IN ('d1','d2') GROUP BY o.k ORDER BY 2 DESC LIMIT 5",
+	})
+}

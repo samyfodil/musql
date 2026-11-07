@@ -800,6 +800,10 @@ type indexSeekHint struct {
 	// slot is this key's place among the cursor's seek keys; each later slot
 	// is an equality on another column that bounds the rows as well.
 	slot int
+	// order, on a correlated seek of a segment table's index of more than one
+	// column, is the planner's key: each probe's rows, which come in rowid
+	// order, are sorted by it into the order that index's walk visits them.
+	order *autoIndexKey
 	// is marks "x IS key", whose NULL key matches the NULLs.
 	is bool
 	// in, when not zero, is the length of an IN list whose values are in the

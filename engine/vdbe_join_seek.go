@@ -155,8 +155,14 @@ func annotateIndexJoinSeek(c *compiler, srcs []joinSource, origIdx int, planKey 
 	if !ok {
 		return false
 	}
-	if planKey != nil && !joinSeekReproducesKey(sp, s.tbl, p.root, p.index, planKey) {
-		return false
+	if planKey != nil {
+		ok, sorted := joinSeekReproducesKey(sp, s.tbl, p.root, p.index, planKey)
+		if !ok {
+			return false
+		}
+		if sorted {
+			p.order = planKey
+		}
 	}
 	srcs[origIdx].joinIdxSeek = p
 	return true
@@ -169,17 +175,17 @@ func annotateIndexJoinSeek(c *compiler, srcs []joinSource, origIdx int, planKey 
 // caller drops the seek and the planner's key wins. It re-derives the index's
 // key from its schema text (no automatic index, no rival index with the same
 // leading column) and compares it with key column for column.
-func joinSeekReproducesKey(sp *ReadOnlyPager, tbl *resolvedTable, root uint32, name string, key *autoIndexKey) bool {
+func joinSeekReproducesKey(sp *ReadOnlyPager, tbl *resolvedTable, root uint32, name string, key *autoIndexKey) (ok, sorted bool) {
 	if sp == nil || tbl == nil || key == nil || key.root != root {
-		return false
+		return false, false
 	}
 	// A segment table's index (root 0) is found by name, and only there.
 	if root == 0 && (name == "" || !equalFoldName(name, key.index) || !sp.ScannedFromSegments(tbl.root)) {
-		return false
+		return false, false
 	}
 	rows, err := sp.Schema()
 	if err != nil {
-		return false
+		return false, false
 	}
 	var chosen *SchemaRow
 	for i := range rows {
@@ -191,11 +197,11 @@ func joinSeekReproducesKey(sp *ReadOnlyPager, tbl *resolvedTable, root uint32, n
 	}
 	if chosen == nil {
 		// An automatic index (sqlite_schema.sql NULL) is not reproduced.
-		return false
+		return false, false
 	}
 	lead, ok := leadingIndexColumn(chosen.SQL)
 	if !ok {
-		return false
+		return false, false
 	}
 	for i := range rows {
 		r := &rows[i]
@@ -204,25 +210,21 @@ func joinSeekReproducesKey(sp *ReadOnlyPager, tbl *resolvedTable, root uint32, n
 			continue
 		}
 		if other, lok := leadingIndexColumn(r.SQL); !lok || equalFoldName(other, lead) {
-			return false // a rival index leads with the same column
+			return false, false // a rival index leads with the same column
 		}
 	}
 	stmt, perr := parseCreateIndexStmt(chosen.SQL)
 	if perr != nil || stmt.exprOrPartial || len(stmt.cols) == 0 {
-		return false
+		return false, false
 	}
 	n := len(stmt.cols)
 	if len(key.cols) != n+1 || len(key.colls) != n+1 || len(key.desc) != n+1 {
-		return false
+		return false, false
 	}
 	// A segment seek (root 0) answers from the column's equality index, which
 	// hands each key's rows over in rowid order: the index's own order only
-	// when the index has one column, the equality pinning it. A longer key
-	// orders a key's rows by its later columns first, which only a walk of
-	// that index gives.
-	if root == 0 && n != 1 {
-		return false
-	}
+	// for one column. A longer key's rows are sorted into it (sorted).
+	sorted = root == 0 && n != 1
 	for j, name := range stmt.cols {
 		ci := -1
 		for k := range tbl.cols {
@@ -232,21 +234,21 @@ func joinSeekReproducesKey(sp *ReadOnlyPager, tbl *resolvedTable, root uint32, n
 			}
 		}
 		if ci < 0 || key.cols[j] != ci {
-			return false
+			return false, false
 		}
 		coll := effectiveCollation(tbl.cols[ci].Collation)
 		if j < len(stmt.collate) && stmt.collate[j] != "" {
 			coll = strings.ToUpper(stmt.collate[j])
 		}
 		if !equalFoldName(key.colls[j], coll) {
-			return false
+			return false, false
 		}
 		if key.desc[j] != (j < len(stmt.desc) && stmt.desc[j]) {
-			return false
+			return false, false
 		}
 	}
 	// The trailing rowid every index record over a rowid table carries.
-	return key.cols[n] == -1 && equalFoldName(key.colls[n], "BINARY") && !key.desc[n]
+	return key.cols[n] == -1 && equalFoldName(key.colls[n], "BINARY") && !key.desc[n], sorted
 }
 
 // orCommonConjuncts adds to eqs, for each OR among them, the conjuncts every
@@ -598,6 +600,6 @@ func (c *compiler) emitJoinSeekHint(srcs []joinSource, order []int, level int, s
 		return err
 	}
 	c.emit(Instruction{Op: OpSeekIndexHint, P1: cur, P2: keyReg, P3: 1,
-		P4: &indexSeekHint{root: s.joinIdxSeek.root, aff: s.joinIdxSeek.aff, coll: s.joinIdxSeek.coll, leadingCol: s.joinIdxSeek.leadingCol, index: s.joinIdxSeek.index}})
+		P4: &indexSeekHint{root: s.joinIdxSeek.root, aff: s.joinIdxSeek.aff, coll: s.joinIdxSeek.coll, leadingCol: s.joinIdxSeek.leadingCol, index: s.joinIdxSeek.index, order: s.joinIdxSeek.order}})
 	return nil
 }

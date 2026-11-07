@@ -164,6 +164,9 @@ type vdbeCursor struct {
 	// false, so that path's materialize-once behaviour is byte-for-byte
 	// unchanged. See rewind().
 	seekReseek bool
+	// idxSeekOrder is the key a correlated index seek's rows are sorted by
+	// (indexSeekHint.order), nil to keep them in rowid order.
+	idxSeekOrder *autoIndexKey
 
 	// sorted is OpSortedSeek's copy of the rows, sorted by its column, that
 	// each seek narrows rows/rowids to a run of. nil until the first seek, and
@@ -1114,7 +1117,7 @@ func (cur *vdbeCursor) rewind() error {
 				// Only for a correlated seek, which nothing reorders: a seek
 				// that materializes once may have its rows permuted in place
 				// (OpAutoIndexOrder) or tagged by position (OpMultiOrTag).
-				if cur.seekReseek {
+				if cur.seekReseek && cur.idxSeekOrder == nil {
 					if src, served := cur.pager.segListSeek(cur, rowids, &cur.pointSrc); served {
 						cur.seekGen = seekGens.Add(1)
 						// Positioned, not built, as a rowid seek is above.
@@ -1150,6 +1153,9 @@ func (cur *vdbeCursor) rewind() error {
 				}
 				if cur.seekReseek {
 					cur.seekSlab = slab
+				}
+				if cur.idxSeekOrder != nil {
+					autoIndexOrderCursor(cur, cur.idxSeekOrder, cur.pager.encoding())
 				}
 				cur.materialized = true
 				cur.pos = -1
@@ -1205,6 +1211,10 @@ func (cur *vdbeCursor) rewind() error {
 		// move replaces the row ahead of it.
 		if cur.tbl.withoutRowid {
 			cur.orderByWithoutRowidPK()
+		}
+		if cur.idxSeekOrder != nil {
+			// The scan a seek fell back to, in the order its index walk visits.
+			autoIndexOrderCursor(cur, cur.idxSeekOrder, cur.pager.encoding())
 		}
 		cur.materialized = true
 	}

@@ -1131,6 +1131,8 @@ type indexSeekPlan struct {
 	// keyExpr is unused.
 	keySet []Expr
 
+	// order is indexSeekHint.order.
+	order *autoIndexKey
 	// more are the other equalities a seek can be answered from
 	// (OpSeekIndexHint's later slots); the cursor asks the smallest.
 	more []*indexSeekPlan
