@@ -130,6 +130,9 @@ type vdbe struct {
 	// reused across every item of every group. It carries a register file, this
 	// machine's pager and its bound parameters and nothing else.
 	aggVM *vdbe
+	// aggSubCaches is each item program's run-once cache (aggItemVM), kept for
+	// the machine's one run of its program (the pool's scrub drops it).
+	aggSubCaches map[*Program][]subCacheEntry
 
 	// aggKeyBuf is hashAggStep's reusable group-key encoding buffer -- see its
 	// doc comment for why handing back the same bytes every row is safe.

@@ -337,8 +337,8 @@ func aggAnchorRegScopesUsable(plan *aggPlan) bool {
 // an opcode needing cursors, record registers, sorters or distinct sets would
 // panic (compileSelfRowExpr's check).
 //
-// nSub is allowed: aggItemVM sizes a subCache from NSubCache, cleared per item per
-// group (a body is not necessarily pure, so this is deliberately not OP_Once).
+// nSub is allowed: aggItemVM keeps each item's subCache for the aggregate's run,
+// so an uncorrelated body runs once, as under C's OP_Once.
 func compileAggItemProgram(pager *ReadOnlyPager, enclosing *compiler, plan *aggPlan, it *itemPlan) *aggItemProgram {
 	if it == nil || it.rewritten == nil {
 		return nil
@@ -551,17 +551,23 @@ func (m *vdbe) aggItemVM(prog *Program) *vdbe {
 	vm.trigExcluded, vm.trigExcludedRowid = m.trigExcluded, m.trigExcludedRowid
 	vm.trigReturn, vm.trigReturnRowid = m.trigReturn, m.trigReturnRowid
 	vm.regs = prog.regFile(vm.regs, false)
-	// The run-once cache slots an UNCORRELATED body in this item takes. Sized
-	// and CLEARED per acquisition rather than kept: the slot numbering belongs
-	// to ONE item's program and this machine is shared by every item of every
-	// group, so a kept cache would answer item B out of item A's slot. Clearing
-	// it also makes each evaluation re-run the body, which a body that is not a
-	// pure function of its inputs requires -- see compileAggItemProgram's note.
-	if cap(vm.subCache) < prog.NSubCache {
-		vm.subCache = make([]subCacheEntry, prog.NSubCache)
-	} else {
-		vm.subCache = vm.subCache[:prog.NSubCache]
-		clear(vm.subCache)
+	// The run-once cache slots an UNCORRELATED body in this item takes: the
+	// item's own, since the slot numbering belongs to its program and this
+	// machine runs every item. It lasts for the statement's run, as OP_Once's
+	// bit does in C, so the body runs once and not once per group; a body that
+	// reads the group is correlated and never cached.
+	if prog.NSubCache == 0 {
+		vm.subCache = vm.subCache[:0]
+		return vm
 	}
+	sc, ok := m.aggSubCaches[prog]
+	if !ok {
+		if m.aggSubCaches == nil {
+			m.aggSubCaches = map[*Program][]subCacheEntry{}
+		}
+		sc = make([]subCacheEntry, prog.NSubCache)
+		m.aggSubCaches[prog] = sc
+	}
+	vm.subCache = sc
 	return vm
 }
