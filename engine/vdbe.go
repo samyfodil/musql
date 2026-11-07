@@ -1294,6 +1294,38 @@ func cursorColumnMasks(insns []Instruction, ncursors int) []columnMask {
 		}
 	}
 	masks := make([]columnMask, ncursors)
+	// What reorders or searches a cursor's rows reads their key columns
+	// without an OpColumn.
+	keyCols := func(cur int, k *autoIndexKey) bool {
+		if k == nil || k.multiOr != nil || cur < 0 || cur >= ncursors {
+			return k == nil
+		}
+		for _, c := range k.cols {
+			if c == xnExpr {
+				return false
+			}
+			if c >= 0 {
+				masks[cur] |= 1 << uint(min(c, 63))
+			}
+		}
+		return true
+	}
+	for i := range insns {
+		in := &insns[i]
+		switch in.Op {
+		case OpAutoIndexOrder, OpRightJoinSweepOrder:
+			k, _ := in.P4.(*autoIndexKey)
+			if !keyCols(in.P1, k) {
+				return nil
+			}
+		case OpSortedSeek:
+			if h, ok := in.P4.(*sortedSeekHint); ok && in.P1 >= 0 && in.P1 < ncursors {
+				masks[in.P1] |= 1 << uint(min(h.col, 63))
+			}
+		case OpMultiOrTag, OpMultiOrSort:
+			return nil
+		}
+	}
 	for i := range insns {
 		p, ok := insns[i].P4.(*aggPlan)
 		if !ok || insns[i].Op != OpHashAggStep || p.rowCols == nil {

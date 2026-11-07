@@ -915,6 +915,14 @@ func (s *segment) Value(c, i int) Value {
 	}
 }
 
+// valueIf is Value when cols names column c, valueUnread otherwise.
+func (s *segment) valueIf(cols columnMask, c, i int) Value {
+	if cols != allColumns && !cols.has(c) {
+		return Value{Typ: valueUnread}
+	}
+	return s.Value(c, i)
+}
+
 // segAlignBlob is where a BLOB cell starts in the heap: 4-aligned, so a vector
 // column's cells read as []float32 in place (segment_vector.go). TEXT cells
 // stay packed. The heap itself starts 8-aligned.

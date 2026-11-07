@@ -2433,6 +2433,10 @@ func computeGeneratedInto(tblName string, cols []columnInfo, row []Value) error 
 // holds the error's text; no reader takes it for a value or writes it out.
 const valueGenErr ValueType = 0xF2
 
+// valueUnread is a column a masked scan left undecoded (scanTableCols); a
+// read of it fetches the row whole (vdbeCursor.unreadColumn).
+const valueUnread ValueType = 0xF3
+
 // genErrOf is the error a valueGenErr slot holds.
 func genErrOf(v Value) error { return errors.New(string(v.S)) }
 

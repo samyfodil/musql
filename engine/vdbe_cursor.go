@@ -513,8 +513,38 @@ func (cur *vdbeCursor) readColumn(i int, dst *Value) error {
 		return cur.readColumnFromMaskedRow(i, dst)
 	}
 	*dst = cur.rowVals[i]
+	if dst.Typ >= valueGenErr {
+		return cur.oddSlot(i, dst)
+	}
+	return nil
+}
+
+// oddSlot is readColumn's cold half for a slot holding a marker rather than a
+// value: a VIRTUAL column's error, or a column a masked scan left unread,
+// which brings the row in whole first.
+func (cur *vdbeCursor) oddSlot(i int, dst *Value) error {
+	if dst.Typ == valueUnread {
+		if err := cur.fillUnread(); err != nil {
+			return err
+		}
+		*dst = cur.rowVals[i]
+	}
 	if dst.Typ == valueGenErr {
 		return takeGenErr(dst)
+	}
+	return nil
+}
+
+// fillUnread replaces the current row, which a masked scan decoded only in
+// part (scanTableCols), with the whole row, in the cursor's list too.
+func (cur *vdbeCursor) fillUnread() error {
+	vals, found, served := cur.pager.SeekRowidSegments(cur.tbl.root, int64(cur.rowid))
+	if !served || !found {
+		return fmt.Errorf("engine: internal: row %d of %s, read in part, is not there whole", cur.rowid, cur.tbl.name)
+	}
+	cur.rowVals = cur.normalizeFrom(true, cur.rowid, vals)
+	if cur.pos >= 0 && cur.pos < len(cur.rows) {
+		cur.rows[cur.pos] = cur.rowVals
 	}
 	return nil
 }
@@ -563,6 +593,11 @@ func (cur *vdbeCursor) fullRow() ([]Value, error) {
 	}
 	if cur.rowRaw != nil {
 		if err := cur.decodeFullRow(); err != nil {
+			return nil, err
+		}
+	}
+	if slices.ContainsFunc(cur.rowVals, func(v Value) bool { return v.Typ == valueUnread }) {
+		if err := cur.fillUnread(); err != nil {
 			return nil, err
 		}
 	}
@@ -1130,7 +1165,16 @@ func (cur *vdbeCursor) rewind() error {
 				return nil
 			}
 		}
-		seq, errFn := cur.pager.ScanTable(cur.tbl.root)
+		// Only the columns the program reads are decoded (scanTableCols); a
+		// table computing generated columns, or one with no rowid to fetch the
+		// rest by, is read whole.
+		cols := cur.colMask
+		if cur.hasGeneratedCols() || cur.tbl.withoutRowid {
+			cols = allColumns
+		} else if cols != allColumns && cur.tbl.ipkIndex >= 0 {
+			cols |= 1 << uint(min(cur.tbl.ipkIndex, 63))
+		}
+		seq, errFn := cur.pager.scanTableCols(cur.tbl.root, cols)
 		shared := cur.pager.ServesLiveRows(cur.tbl.root)
 		for rowid, vals := range seq {
 			// The rowid range bounds this scan as it does the segment one, the
