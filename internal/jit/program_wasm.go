@@ -143,6 +143,14 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		w.op(opI32Add)
 		w.LoadI64(0)
 	}
+	// operand pushes r's value, or column slot r's at the row when col.
+	operand := func(r int, col bool) {
+		if col {
+			loadCol(r)
+			return
+		}
+		loadReg(r)
+	}
 	// storeReg stores the i64 that pushVal pushes into r[r].
 	storeReg := func(r int, pushVal func()) {
 		if l, ok := local(r); ok {
@@ -317,9 +325,9 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			// rem_s traps on a zero divisor, so a zero is flagged (SQL NULL:
 			// the caller declines) and replaced by 1. MinInt64 rem_s -1 is 0,
 			// which is already vdbe.c's answer for a divisor of -1.
-			loadReg(in.B)
+			operand(in.B, in.BCol)
 			w.Set(t1)
-			loadReg(in.C)
+			operand(in.C, in.CCol)
 			w.Set(t2)
 			w.Get(ovf)
 			w.Get(t2)
@@ -363,9 +371,12 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 				loadReg(in.B)
 			}
 			w.Set(t1)
-			if in.CCol {
+			switch {
+			case in.CCol:
 				loadCol(in.C)
-			} else {
+			case in.CImm:
+				w.I64(in.Imm)
+			default:
 				loadReg(in.C)
 			}
 			w.Set(t2)
@@ -374,7 +385,7 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		case POpRemK:
 			// A constant divisor from 2: rem_s cannot trap, and the engine
 			// compiling the module divides by it as it sees fit.
-			loadReg(in.B)
+			operand(in.B, in.BCol)
 			w.I64(in.Imm)
 			w.op(opI64RemS)
 			w.Set(t3)
@@ -382,9 +393,9 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		case POpShl, POpShr:
 			// Wasm takes the amount mod 64; one outside 0..63 is flagged
 			// instead (unsigned: a negative one is huge).
-			loadReg(in.B)
+			operand(in.B, in.BCol)
 			w.Set(t1)
-			loadReg(in.C)
+			operand(in.C, in.CCol)
 			w.Set(t2)
 			w.Get(ovf)
 			w.Get(t2)

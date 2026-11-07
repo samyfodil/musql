@@ -658,3 +658,84 @@ func TestRemByConstant(t *testing.T) {
 		}
 	}
 }
+
+// TestImmediatesAndColumnOperands: a constant operand of an add, subtract or
+// multiply becomes an immediate (CImm), a column one of every arithmetic step
+// a column operand (BCol, CCol), and the code each form emits answers as the
+// unfused program does, overflow included.
+func TestImmediatesAndColumnOperands(t *testing.T) {
+	xs := []int64{0, 1, -1, 3, -7, 62, 63, 64, -64, 1 << 40, math.MaxInt64, math.MinInt64, math.MaxInt64 / 3}
+	ys := []int64{5, -5, 1, 2, 63, 0, 7, -1, 3, 1 << 30, 2, -2, 3}
+	type shape struct {
+		insns []ProgInsn
+		want  func(ProgInsn) bool
+	}
+	arith := func(op POp, cConst bool, k int) shape {
+		c := 1
+		p := []ProgInsn{{Op: POpLoadCol, A: 0, B: 0}, {Op: POpLoadCol, A: 1, B: 1}}
+		if cConst {
+			p = append(p, ProgInsn{Op: POpSetConst, A: 2, B: k})
+			c = 2
+		}
+		p = append(p, ProgInsn{Op: op, A: 3, B: 0, C: c}, ProgInsn{Op: POpEmitVal, A: 3})
+		return shape{p, func(in ProgInsn) bool {
+			if cConst {
+				return in.Op == op && in.CImm && in.BCol && in.Imm == int64(k)
+			}
+			return in.Op == op && in.BCol && (in.CCol || op == POpRemK)
+		}}
+	}
+	var shapes []shape
+	for _, op := range []POp{POpAdd, POpSub, POpMul} {
+		for _, k := range []int{3, -2, 1 << 20, math.MaxInt32, math.MinInt32} {
+			shapes = append(shapes, arith(op, true, k))
+		}
+		shapes = append(shapes, arith(op, false, 0))
+	}
+	for _, op := range []POp{POpShl, POpShr, POpRem} {
+		shapes = append(shapes, arith(op, false, 0))
+	}
+	// A constant on the left of a commutative step.
+	shapes = append(shapes, shape{[]ProgInsn{{Op: POpSetConst, A: 2, B: 9}, {Op: POpLoadCol, A: 0, B: 0},
+		{Op: POpMul, A: 3, B: 2, C: 0}, {Op: POpEmitVal, A: 3}},
+		func(in ProgInsn) bool { return in.Op == POpMul && in.CImm && in.BCol && in.Imm == 9 }})
+	for _, sh := range shapes {
+		if fused := Fuse(sh.insns); !slices.ContainsFunc(fused, sh.want) {
+			t.Fatalf("%v fused to %v", sh.insns, fused)
+		}
+		if !Available {
+			continue
+		}
+		want := interpProgram(sh.insns, [][]int64{xs, ys}, len(xs), make([]int64, 8))
+		code, err := EmitProgramFlagged(sh.insns, 2, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		k, err := Map(code)
+		if err != nil {
+			t.Fatal(err)
+		}
+		regs := make([]int64, 8)
+		sel := make([]int64, len(xs))
+		var out, ovf int64
+		args := &ProgArgs{N: int64(len(xs)), Regs: &regs[0], Out: &out, Overflow: &ovf, Sel: &sel[0]}
+		args.Col[0], args.Col[1] = &xs[0], &ys[0]
+		k.Call2(args)
+		k.Close()
+		// A flagged run is declined whatever it holds: amd64 stops at the
+		// flag, arm64 and wasm go on. The rows before the first flagged one
+		// agree either way.
+		agree := len(xs)
+		for r := range xs {
+			if interpProgram(sh.insns, [][]int64{xs[:r+1], ys[:r+1]}, r+1, make([]int64, 8)).ovf != 0 {
+				agree = r
+				break
+			}
+		}
+		agree = min(agree, int(out))
+		if (ovf != 0) != (want.ovf != 0) || out > int64(len(want.sel)) || !slices.Equal(sel[:agree], want.sel[:agree]) ||
+			ovf == 0 && out != int64(len(want.sel)) {
+			t.Errorf("%v: got %v (overflow %d), want %v (overflow %d)", sh.insns, sel[:out], ovf, want.sel, want.ovf)
+		}
+	}
+}

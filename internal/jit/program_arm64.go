@@ -55,6 +55,14 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		}
 		a.LdrImm(dst, X1, r*8)
 	}
+	// operand is val, or a column slot's value at the row when col.
+	operand := func(r int, col bool, scratch Reg64) Reg64 {
+		if col {
+			a.LdrRegIdx(scratch, colReg[r], X2)
+			return scratch
+		}
+		return val(r, scratch)
+	}
 	// dst is where to compute r: its own register, or scratch; fin then
 	// stores scratch to the file.
 	dst := func(r int, scratch Reg64) Reg64 {
@@ -258,8 +266,12 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			// 0 for a divisor of -1 included; only a zero divisor (SQL NULL) is
 			// flagged, for the caller to decline.
 			nz, st := "rn"+itoa(idx), "rs"+itoa(idx)
-			into(X9, in.B)
-			into(X10, in.C)
+			if x := operand(in.B, in.BCol, X9); x != X9 {
+				a.MovReg(X9, x)
+			}
+			if y := operand(in.C, in.CCol, X10); y != X10 {
+				a.MovReg(X10, y)
+			}
 			a.Cbnz(X10, nz)
 			a.MovImm16(X11, 1)
 			a.OrrReg(X4, X4, X11)
@@ -299,9 +311,12 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			} else {
 				x = val(in.B, X9)
 			}
-			if in.CCol {
+			switch {
+			case in.CCol:
 				a.LdrRegIdx(X10, colReg[in.C], X2)
-			} else {
+			case in.CImm:
+				a.MovImm64(X10, in.Imm)
+			default:
 				y = val(in.C, X10)
 			}
 			d := dst(in.A, X9)
@@ -329,7 +344,7 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 			// SMULH by Imm's magic number and shifts for the truncated
 			// quotient (vm_div_arm64.go's divConst), then MSUB.
 			d := in.Imm
-			n := val(in.B, X9)
+			n := operand(in.B, in.BCol, X9)
 			if d&(d-1) == 0 {
 				k := uint32(bits.TrailingZeros64(uint64(d)))
 				a.AsrImm(X10, n, 63)
@@ -356,7 +371,7 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 		case POpShl, POpShr:
 			// LSLV and ASRV take the amount mod 64; one outside 0..63 is
 			// flagged instead (unsigned HI: a negative one is huge).
-			x, y, d := val(in.B, X9), val(in.C, X10), dst(in.A, X9)
+			x, y, d := operand(in.B, in.BCol, X9), operand(in.C, in.CCol, X10), dst(in.A, X9)
 			a.CmpImm(y, 63)
 			a.CsetRaw(X11, armHI)
 			a.OrrReg(X4, X4, X11)
