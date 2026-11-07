@@ -97,7 +97,9 @@ type segment struct {
 	// fullWidth is segFlagFullWidth: every row stored every column.
 	fullWidth bool
 	exc       map[uint64]Value // row*nCols+col -> the value that did not fit
-	excCols   []bool           // excCols[c]: some row of column c is in exc
+	// excRows[c] is a bitmap of the rows of column c in exc, nil for a column
+	// with none: most reads are of a row that is not, and need no map probe.
+	excRows [][]uint64
 
 	// cells is the 8-byte cells built from segCellBounds columns, kept while
 	// the process-wide budget allows (boundsCells).
@@ -633,7 +635,7 @@ func openSegment(buf []byte) (*segment, error) {
 		exc := buf[excOff : excOff+excLen]
 		n := int(binary.LittleEndian.Uint32(exc))
 		s.exc = make(map[uint64]Value, n)
-		s.excCols = make([]bool, nCols)
+		s.excRows = make([][]uint64, nCols)
 		p := 4
 		for k := 0; k < n; k++ {
 			if p+12 > len(exc) {
@@ -655,7 +657,10 @@ func openSegment(buf []byte) (*segment, error) {
 				return nil, fmt.Errorf("segment: exception %d names row %d column %d, out of range", k, row, col)
 			}
 			s.exc[uint64(row)*uint64(nCols)+uint64(col)] = vals[0]
-			s.excCols[col] = true
+			if s.excRows[col] == nil {
+				s.excRows[col] = make([]uint64, (nRows+63)/64)
+			}
+			s.excRows[col][row/64] |= 1 << (row % 64)
 		}
 	}
 	return s, nil
@@ -875,8 +880,8 @@ func (s *segment) Value(c, i int) Value {
 	if s.cols[c].nullOff != 0 && s.buf[int(s.cols[c].nullOff)+i/8]&(1<<uint(i%8)) != 0 {
 		return Value{Typ: Null}
 	}
-	if v, ok := s.exc[uint64(i)*uint64(len(s.cols))+uint64(c)]; ok {
-		return v
+	if b := s.excRows; b != nil && b[c] != nil && b[c][i/64]&(1<<uint(i%64)) != 0 {
+		return s.exc[uint64(i)*uint64(len(s.cols))+uint64(c)]
 	}
 	col := s.cols[c]
 	if col.phys.Width() == 0 {
