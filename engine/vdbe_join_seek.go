@@ -484,7 +484,7 @@ func seekAffinitySafe(aff, colAff affinity) bool {
 // rules match the rest of the compile) to a cursor in the allowed set (the
 // tables bound strictly before this join level), and e is built only from a
 // conservative whitelist of column-free-safe expression nodes. Any subquery,
-// aggregate, OR/IN/MATCH/row expression, USING-representative or
+// aggregate, OR/IN/MATCH/row expression, USING-representative, pinned or
 // schema-qualified column, unresolved/ambiguous column, or column resolving to
 // a not-yet-bound cursor makes it decline -- the safe direction (full scan).
 func keyRefsOnlyCursors(c *compiler, e Expr, allowed map[int]bool) bool {
@@ -504,7 +504,9 @@ func exprRefsOnly(e Expr, col func(ColumnExpr) bool) bool {
 	case LiteralExpr, ParamExpr:
 		return true
 	case ColumnExpr:
-		if x.UsingRepr || x.Schema != "" {
+		// A pinned name counts FROM items, which the narrowed scope a seek key
+		// compiles under does not.
+		if x.UsingRepr || x.UsingPinned || x.Schema != "" {
 			return false
 		}
 		return col(x)
