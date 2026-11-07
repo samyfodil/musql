@@ -132,6 +132,10 @@ type segment struct {
 	// Lazily built zone maps, one per int64 column. See segment_zone.go.
 	zoneMu eqCountMu
 	zones  map[int]*segZones
+	// keyOrder is, per list of int64 columns, whether the rows ascend on them
+	// (segRowsInKeyOrder).
+	keyOrderMu eqCountMu
+	keyOrder   map[string]bool
 	// Lazily built int8 copies of vector columns, a nil entry for a column
 	// that has none. See segment_vector_bound.go.
 	vecMu       eqCountMu

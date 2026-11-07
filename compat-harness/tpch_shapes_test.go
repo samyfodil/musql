@@ -70,3 +70,26 @@ func TestExistsOverEmptyTable(t *testing.T) {
 		"SELECT count(*) FROM o WHERE NOT EXISTS (SELECT * FROM e WHERE e.k = o.k)",
 	})
 }
+
+// TestOuterScanInKeyOrderStreams pins an outermost scan the planner walks in
+// a PRIMARY KEY's order, which streams when the table's rows already run in
+// that order: rows written in key order, in reverse, equal leading keys whose
+// tie the rowid breaks, and the same after writes leave rows in the log.
+func TestOuterScanInKeyOrderStreams(t *testing.T) {
+	differ(t, "outer scan in key order", []string{
+		"CREATE TABLE o(k INTEGER PRIMARY KEY, d TEXT, p INT)",
+		"CREATE TABLE l(k INT, n INT, v REAL, s TEXT, PRIMARY KEY(k, n))",
+		"CREATE TABLE r(k INT, n INT, v REAL, PRIMARY KEY(k, n))",
+		"WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<400) INSERT INTO o SELECT i, 'd'||(i%9), i%3 FROM s",
+		"WITH RECURSIVE s(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM s WHERE i<2399) INSERT INTO l SELECT 1+i/6, 1+i%6, (i*37%101)*1.25, 's'||(i%4) FROM s",
+		"WITH RECURSIVE s(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM s WHERE i<2399) INSERT INTO r SELECT 400-i/6, 6-i%6, (i*37%101)*1.25 FROM s",
+		"VACUUM",
+		"SELECT l.k, sum(l.v*(1-0.05)) AS rev, o.d, o.p FROM o, l WHERE l.k = o.k AND o.d < 'd4' AND l.s > 's0' GROUP BY l.k, o.d, o.p ORDER BY rev DESC, o.d LIMIT 10",
+		"SELECT l.k, group_concat(l.n), o.p FROM o, l WHERE l.k = o.k AND o.d = 'd2' GROUP BY l.k, o.p",
+		"SELECT r.k, group_concat(r.n), o.p FROM o, r WHERE r.k = o.k AND o.d = 'd2' GROUP BY r.k, o.p",
+		"SELECT l.k, l.n FROM l JOIN o ON o.k = l.k WHERE o.p = 1 AND l.n > 4 LIMIT 20",
+		"INSERT INTO l VALUES (0, 9, 1.5, 's9')",
+		"DELETE FROM l WHERE k = 7",
+		"SELECT l.k, group_concat(l.n), o.p FROM o, l WHERE l.k = o.k AND o.d = 'd2' GROUP BY l.k, o.p",
+	})
+}

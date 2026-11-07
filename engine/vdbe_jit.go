@@ -712,8 +712,9 @@ func scannableCursors(insns []Instruction, nCursors int) (rewind, next, streamed
 		var rew, adv bool
 		switch in.Op {
 		case OpOpenRead:
-			rew = in.P5&1 == 0
-			adv = rew
+			// A scan that may stream (P5 1, or 4 when its rows are in its key's
+			// order) is advanced natively only where nativeStreamNexts says.
+			rew, adv = in.P5&1 == 0, in.P5&5 == 0
 		case OpOpenDerived:
 			rew, adv = true, true
 		case OpOpenWrite:
@@ -726,7 +727,7 @@ func scannableCursors(insns []Instruction, nCursors int) (rewind, next, streamed
 		}
 		if !opened[in.P1] {
 			opened[in.P1], rewind[in.P1], next[in.P1] = true, rew, adv
-			streamed[in.P1] = in.Op == OpOpenRead && in.P5&1 != 0
+			streamed[in.P1] = in.Op == OpOpenRead && in.P5&5 != 0
 			continue
 		}
 		rewind[in.P1] = rewind[in.P1] && rew

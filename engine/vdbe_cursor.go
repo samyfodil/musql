@@ -185,6 +185,11 @@ type vdbeCursor struct {
 	// (and cleared) by OpMultiOrSort. See multiOrSortTagged.
 	multiOrGrp []int
 
+	// streamIfOrdered is set by OpOpenRead (P5 4) on the outermost scan when
+	// only its index-order key kept it from streaming: OpAutoIndexOrder lets it
+	// stream when its rows already run in that order (segRowsInKeyOrder).
+	streamIfOrdered bool
+
 	// emptyKnown is whether tableEmpty has answered, and empty its answer.
 	emptyKnown, empty bool
 

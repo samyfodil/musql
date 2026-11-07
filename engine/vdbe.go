@@ -2017,6 +2017,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			cur := m.openCursorInto(op.P1, rp, op.P4.(*resolvedTable))
 			cur.streamable = op.P5&1 != 0
+			cur.streamIfOrdered = op.P5&4 != 0
 			if cur.streamable && !cur.hasGeneratedCols() {
 				// Only a streaming scan masks: a materialized cursor retains
 				// every row, so a masked row would outlive its record, and it
@@ -2146,6 +2147,13 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				// sorting that superset and letting the loop filter keeps the same
 				// relative order. Declining leaves the pre-port scan order, never a
 				// different row set -- see OpAutoIndexOrder.
+				break
+			}
+			if cur.streamIfOrdered && !cur.materialized && !cur.hasGeneratedCols() &&
+				cur.pager.segRowsInKeyOrder(cur.tbl.root, op.P4.(*autoIndexKey)) {
+				// The rows already run in the key's order: the outermost scan
+				// streams them as it would with no key.
+				cur.streamable, cur.colMask = true, cur.scanMask.widenIfTotal(len(cur.tbl.cols))
 				break
 			}
 			// The cursor materializes on its first rewind; force that now so the

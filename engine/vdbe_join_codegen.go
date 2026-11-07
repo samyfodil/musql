@@ -2960,7 +2960,7 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 	// target -- can therefore iterate the b-tree LAZILY instead of materializing
 	// the whole table (see vdbeCursor.streamable). Deeper levels, and any
 	// rightOuter/withoutRowid/derived source, keep materializing.
-	streamOuter := -1
+	streamOuter, orderedOuter := -1, -1
 	if len(plan.execOrder) > 0 {
 		o := plan.execOrder[0]
 		s := srcs[o]
@@ -2976,6 +2976,12 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 			// b-tree pull has nothing to permute. See OpAutoIndexOrder. Not when
 			// no order can show (compiler.rowOrderFree): the key is not applied.
 			streamOuter = o
+		}
+		// One whose key orders it may still stream: when its rows already run
+		// in the key's order, OpAutoIndexOrder has nothing to permute.
+		if streamOuter < 0 && s.derived == nil && s.vtabItem == nil && s.cteItem == nil && s.catalogScope == scopeAny &&
+			!s.rightOuter && !s.tbl.withoutRowid && len(plan.autoIdxKeys) > 0 && plan.autoIdxKeys[0] != nil && plan.autoIdxKeys[0].multiOr == nil {
+			orderedOuter = o
 		}
 	}
 	// The same once-per-run outermost level, when it is a DERIVED source (a
@@ -3070,6 +3076,9 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 		var p5 uint16
 		if i == streamOuter {
 			p5 = 1
+		}
+		if i == orderedOuter {
+			p5 |= 4
 		}
 		if s.flattened {
 			p5 |= 2 // see returningSubqueryLifetimes
