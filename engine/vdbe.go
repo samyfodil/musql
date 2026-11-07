@@ -2495,6 +2495,14 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 					}
 					m.cursors[op.P1] = m.openCursorInto(op.P1, rp, tbl)
 				}
+				// Nothing reads its rows: one row answers, not the whole table.
+				if empty, ok := m.cursors[op.P1].tableEmpty(); ok {
+					if empty {
+						pc = op.P2
+						continue
+					}
+					break
+				}
 			}
 			cur := m.cursors[op.P1]
 			if cur != nil && cur.sorted != nil && cur.sorted.ok {

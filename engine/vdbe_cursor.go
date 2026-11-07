@@ -185,6 +185,9 @@ type vdbeCursor struct {
 	// (and cleared) by OpMultiOrSort. See multiOrSortTagged.
 	multiOrGrp []int
 
+	// emptyKnown is whether tableEmpty has answered, and empty its answer.
+	emptyKnown, empty bool
+
 	// streamable is set by OpOpenRead (P5) when the join codegen proved this
 	// cursor is rewound at most once and is not a RIGHT/FULL JOIN mark/sweep
 	// target: the outermost level of a plain full scan with no seek hint. Such a
@@ -899,6 +902,30 @@ func (cur *vdbeCursor) narrowRowidRangeBy(kind int, key Value) {
 			none()
 		}
 	}
+}
+
+// tableEmpty reports whether the cursor's table has no row, from its first,
+// for a cursor no loop reads (OpIfEmpty's own); ok is false where the answer
+// is the rewind's. Known once, as a rewind materializes once.
+func (cur *vdbeCursor) tableEmpty() (empty, ok bool) {
+	if cur.emptyKnown {
+		return cur.empty, true
+	}
+	if cur.tbl == nil || cur.pager == nil || cur.materialized || cur.fill != nil || cur.rowStore != nil || cur.sub != nil || cur.vt != nil ||
+		cur.seekConfigured || cur.seekSetConfigured || cur.idxSeekConfigured || cur.seekReseek || cur.ranged || cur.segFilter != nil {
+		return false, false
+	}
+	seq, errFn := cur.pager.scanTableCols(cur.tbl.root, 1)
+	empty = true
+	for range seq {
+		empty = false
+		break
+	}
+	if errFn() != nil {
+		return false, false
+	}
+	cur.emptyKnown, cur.empty = true, empty
+	return empty, true
 }
 
 // startSegSource makes src the cursor's row source: the lazy segment scan.

@@ -47,3 +47,26 @@ func TestTPCHShapesOrderedByAlias(t *testing.T) {
 		differ(t, q, append(append([]string(nil), tpchShapesSetup...), q))
 	}
 }
+
+// TestExistsOverEmptyTable pins an EXISTS that finds nothing, after which the
+// query asks whether its table is empty at all (OpIfEmpty), which one row
+// answers: a table empty from the start, emptied by DELETEs after its rows
+// were compacted, and holding rows only in the delta log.
+func TestExistsOverEmptyTable(t *testing.T) {
+	differ(t, "exists over an empty table", []string{
+		"CREATE TABLE o(k INTEGER PRIMARY KEY, d TEXT)",
+		"CREATE TABLE l(k INT, n INT, PRIMARY KEY(k, n))",
+		"CREATE TABLE e(k INT)",
+		"WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<200) INSERT INTO o SELECT i, 'd'||(i%5) FROM s",
+		"WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<600) INSERT INTO l SELECT 1+(i*7)%250, i FROM s",
+		"SELECT d, count(*) FROM o WHERE EXISTS (SELECT * FROM l WHERE l.k = o.k AND l.n % 3 = 0) GROUP BY d ORDER BY d",
+		"SELECT count(*) FROM o WHERE EXISTS (SELECT * FROM e WHERE e.k = o.k)",
+		"SELECT count(*) FROM o WHERE NOT EXISTS (SELECT * FROM e WHERE e.k = o.k)",
+		"VACUUM",
+		"DELETE FROM l",
+		"SELECT count(*) FROM o WHERE EXISTS (SELECT * FROM l WHERE l.k = o.k)",
+		"INSERT INTO e VALUES (3), (5)",
+		"SELECT k FROM o WHERE EXISTS (SELECT * FROM e WHERE e.k = o.k) ORDER BY k",
+		"SELECT count(*) FROM o WHERE NOT EXISTS (SELECT * FROM e WHERE e.k = o.k)",
+	})
+}
