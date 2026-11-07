@@ -97,6 +97,7 @@ type segment struct {
 	// fullWidth is segFlagFullWidth: every row stored every column.
 	fullWidth bool
 	exc       map[uint64]Value // row*nCols+col -> the value that did not fit
+	excCols   []bool           // excCols[c]: some row of column c is in exc
 
 	// cells is the 8-byte cells built from segCellBounds columns, kept while
 	// the process-wide budget allows (boundsCells).
@@ -632,6 +633,7 @@ func openSegment(buf []byte) (*segment, error) {
 		exc := buf[excOff : excOff+excLen]
 		n := int(binary.LittleEndian.Uint32(exc))
 		s.exc = make(map[uint64]Value, n)
+		s.excCols = make([]bool, nCols)
 		p := 4
 		for k := 0; k < n; k++ {
 			if p+12 > len(exc) {
@@ -653,6 +655,7 @@ func openSegment(buf []byte) (*segment, error) {
 				return nil, fmt.Errorf("segment: exception %d names row %d column %d, out of range", k, row, col)
 			}
 			s.exc[uint64(row)*uint64(nCols)+uint64(col)] = vals[0]
+			s.excCols[col] = true
 		}
 	}
 	return s, nil

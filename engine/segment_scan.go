@@ -53,16 +53,7 @@ func (s *segment) scanKind(c int) (segScanKind, string) {
 
 // hasException reports whether any row of column c missed its physical type.
 func (s *segment) hasException(c int) bool {
-	if len(s.exc) == 0 {
-		return false
-	}
-	nCols := uint64(len(s.cols))
-	for k := range s.exc {
-		if k%nCols == uint64(c) {
-			return true
-		}
-	}
-	return false
+	return c >= 0 && c < len(s.excCols) && s.excCols[c]
 }
 
 // segmentCountGreater answers "count the rows whose column c exceeds bound",
