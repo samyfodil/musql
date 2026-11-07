@@ -1,6 +1,9 @@
 package engine
 
-import "slices"
+import (
+	"math"
+	"slices"
+)
 
 // GROUP BY answered by feeding existing hash aggregation from columnar blocks.
 // Replaces only the row source: writes group keys and aggregate arguments into
@@ -9,6 +12,10 @@ import "slices"
 // segGroupPlan is what OpSegHashAgg carries: which columns feed which
 // registers, and where the key tuple lives.
 type segGroupPlan struct {
+	// intOrderFree says the scan's index order matters only to a sum, total
+	// or avg, so the walk may take rowid order where segIntSumsOrderFree
+	// proves no order of its arguments overflows.
+	intOrderFree bool
 	keyCols []int // table column for each GROUP BY key, -1 for keyProg's
 	keyRegs []int // register the scan body writes that key into
 	// keyProg computes the one key when it is an expression, a block a
@@ -83,6 +90,9 @@ func (m *vdbe) segHashAggWalk(p *ReadOnlyPager, tbl *resolvedTable, plan *segGro
 	// Logs are merged: positions the log invalidated are skipped as blocks are walked.
 	skips, deltaLive, mergeable := p.segs.segDeltaSkips(rootPage, segs)
 	if !mergeable {
+		return false
+	}
+	if plan.intOrderFree && (len(deltaLive) != 0 || slices.ContainsFunc(skips, func(s []int) bool { return len(s) != 0 }) || !segIntSumsOrderFree(segs, plan.argCols)) {
 		return false
 	}
 	// The row every step will be handed: correctly shaped, never read. See the
@@ -287,4 +297,27 @@ func segAnySkips(skips [][]int) bool {
 		}
 	}
 	return false
+}
+
+// segIntSumsOrderFree reports whether every argument column holds integers
+// only, small enough that no running sum of all of them, in any order, leaves
+// int64: an integer sum is exact then, and the order its rows arrive in
+// cannot change it. The zone maps bound each column.
+func segIntSumsOrderFree(segs []*segment, cols []int) bool {
+	n := int64(0)
+	var bound int64
+	for _, s := range segs {
+		n += int64(s.nRows)
+		for _, c := range cols {
+			if c < 0 {
+				return false
+			}
+			z, ok := s.intZones(c)
+			if !ok || z.min == math.MinInt64 {
+				return false
+			}
+			bound = max(bound, -z.min, z.max)
+		}
+	}
+	return n == 0 || bound < math.MaxInt64/n
 }

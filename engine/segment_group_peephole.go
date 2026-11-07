@@ -142,19 +142,28 @@ func segGroupPeephole(prog *Program) bool {
 		}
 		bare = true
 	}
-	// OpAutoIndexOrder uses index order, not ROWID order; order-sensitive aggregates must decline.
+	// OpAutoIndexOrder uses index order, not ROWID order; order-sensitive
+	// aggregates must decline -- but for a sum, total or avg, which an order
+	// changes only by where an overflow falls, the walk may prove at run time
+	// that no order overflows (segIntSumsOrderFree).
+	intOrderFree := false
 	for i := 2; i < rewindAt; i++ {
 		if in[i].Op != OpAutoIndexOrder {
 			continue
 		}
 		for _, it := range aggPlanTemplates(agg) {
-			if it.orderSensitive() {
-				return false
+			if !it.orderSensitive() {
+				continue
 			}
+			if (it.kind == aggSum || it.kind == aggTotal || it.kind == aggAvg) && !it.distinct && it.filter == nil && it.orderBy == nil {
+				intOrderFree = true
+				continue
+			}
+			return false
 		}
 	}
 
-	gplan := &segGroupPlan{agg: agg, seg: step.P2, preds: preds, lists: lists, bare: bare, series: series}
+	gplan := &segGroupPlan{agg: agg, seg: step.P2, preds: preds, lists: lists, bare: bare, series: series, intOrderFree: intOrderFree}
 	argsAt := bodyAt
 	if plainKey {
 		for i := 0; i < keyN; i++ {
