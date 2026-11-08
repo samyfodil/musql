@@ -1257,6 +1257,11 @@ func (cur *vdbeCursor) rewind() error {
 		}
 		seq, errFn := cur.pager.scanTableCols(cur.tbl.root, cols)
 		shared := cur.pager.ServesLiveRows(cur.tbl.root)
+		// The copies a shared row's fix-up needs are carved from chunks, as a
+		// seek's are, rather than allocated one per row: an INTEGER PRIMARY
+		// KEY, stored NULL, needs one on every row.
+		plain := shared && !cur.hasGeneratedCols()
+		var slab []Value
 		for rowid, vals := range seq {
 			// The rowid range bounds this scan as it does the segment one, the
 			// rows of the log included. Rowids ascend, so the upper bound ends it.
@@ -1267,6 +1272,17 @@ func (cur *vdbeCursor) rewind() error {
 				continue
 			}
 			cur.rowids = append(cur.rowids, rowid)
+			if n := len(cur.tbl.cols); plain && len(vals) == n && rowNeedsNormalize(cur.tbl.cols, cur.tbl.ipkIndex, vals) {
+				if len(slab) < n {
+					slab = make([]Value, 256*n)
+				}
+				row := slab[:n:n]
+				slab = slab[n:]
+				copy(row, vals)
+				normalizeRowInto(row, cur.tbl.cols, cur.tbl.ipkIndex, rowid)
+				cur.rows = append(cur.rows, row)
+				continue
+			}
 			cur.rows = append(cur.rows, cur.normalizeFrom(shared, rowid, vals))
 		}
 		if err := errFn(); err != nil {
