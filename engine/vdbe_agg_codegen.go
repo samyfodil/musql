@@ -2622,7 +2622,9 @@ func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp
 			}
 			c.emit(Instruction{Op: OpSCopy, P1: r, P2: keyBase + i})
 		}
-		c.emit(Instruction{Op: OpMakeRecord, P1: keyBase, P2: nGroup, P3: keyRec})
+		// A view: the steps read the key before anything writes those
+		// registers, and a new group copies it (aggSlab.cloneValues).
+		c.emit(Instruction{Op: OpMakeRecord, P1: keyBase, P2: nGroup, P3: keyRec, P4: recView{}})
 		if err := emitAggSteps(c, loweredArgs, func(seg int) {
 			c.emit(Instruction{Op: OpHashAggStep, P1: keyRec, P2: seg, P4: plan})
 		}); err != nil {

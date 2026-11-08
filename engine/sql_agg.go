@@ -336,6 +336,10 @@ type aggOrderBuf struct {
 	done    bool
 }
 
+// aggDistinctLinear is how many values a DISTINCT accumulator holds before it
+// indexes them by hash.
+const aggDistinctLinear = 8
+
 func (it *aggItem) distState() *aggDistinct {
 	if it.dist == nil {
 		it.dist = &aggDistinct{}
@@ -917,7 +921,27 @@ func planAggregateCallKind(fc FuncExpr) (*aggItem, error) {
 // that v equals under coll in encoding enc, or remembers v when there is none.
 // Two NULLs are equal, as compareValuesCollatedEnc has them.
 func (it *aggItem) distinctSeen(v Value, coll string, enc TextEncoding) (Value, bool) {
-	h, d := aggDistinctHash(v, coll, enc), it.distState()
+	d := it.distState()
+	if len(d.seen) < aggDistinctLinear {
+		// A few values are compared in turn; most groups never hold more.
+		for _, s := range d.seen {
+			if compareValuesCollatedEnc(v, s, coll, enc) == 0 {
+				return s, true
+			}
+		}
+		if d.seen == nil {
+			d.seen = make([]Value, 0, aggDistinctLinear)
+		}
+		d.seen = append(d.seen, v)
+		return Value{}, false
+	}
+	if d.next == nil {
+		d.next = make([]int, len(d.seen), 2*len(d.seen))
+		for i, s := range d.seen {
+			d.next[i] = d.head.swap(aggDistinctHash(s, coll, enc), i+1)
+		}
+	}
+	h := aggDistinctHash(v, coll, enc)
 	for i := d.head.get(h); i > 0; i = d.next[i-1] {
 		if s := d.seen[i-1]; compareValuesCollatedEnc(v, s, coll, enc) == 0 {
 			return s, true

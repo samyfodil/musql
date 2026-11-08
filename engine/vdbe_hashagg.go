@@ -72,15 +72,22 @@ func (s *aggSlab) key(k []byte) string {
 	return unsafe.String(&out[0], len(out))
 }
 
-// cloneValues is cloneValues over the slab: a group's anchor.
+// cloneValues is vs with every TEXT and BLOB carved from the slab's bytes: a
+// group's key, taken from a record that is only a view of its registers, or
+// its anchor.
 func (s *aggSlab) cloneValues(vs []Value) []Value {
 	if vs == nil {
 		return nil
 	}
 	out := s.values(vs)
 	for i := range out {
-		if out[i].S != nil {
-			out[i].S = append([]byte(nil), out[i].S...)
+		if b := out[i].S; b != nil {
+			if len(s.keys) < len(b) {
+				s.keys = make([]byte, max(len(b), s.chunk(1)*16))
+			}
+			out[i].S = s.keys[:len(b):len(b)]
+			s.keys = s.keys[len(b):]
+			copy(out[i].S, b)
 		}
 	}
 	return out
@@ -115,7 +122,9 @@ func (s *aggSlab) acc() *aggAccumulators {
 func (s *aggSlab) values(vs []Value) []Value {
 	n := len(vs)
 	if len(s.vals) < n {
-		s.vals = make([]Value, s.chunk(1)*max(n, 1))
+		// A group asks for its key, its anchor and its rowids in turn, so a
+		// chunk sized by one request would leave too little for the next.
+		s.vals = make([]Value, max(n, s.chunk(1)*16))
 	}
 	out := s.vals[:n:n]
 	s.vals = s.vals[n:]
@@ -242,7 +251,7 @@ func (m *vdbe) hashAggStepRow(plan *aggPlan, keyVals []Value, seg int, row, rowi
 	if b == nil {
 		h := m.hashAgg
 		b = h.slab.bucket()
-		*b = hashAggBucket{key: h.slab.values(keyVals), accs: h.slab.newAggAccs(plan)}
+		*b = hashAggBucket{key: h.slab.cloneValues(keyVals), accs: h.slab.newAggAccs(plan)}
 		h.buckets[h.slab.key(m.aggKeyBuf)] = b
 		if n := len(h.made); n > 0 && !h.unordered && !keyTupleLess(h.made[n-1].key, b.key, m.encoding()) {
 			h.unordered = true
