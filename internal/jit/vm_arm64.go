@@ -868,6 +868,8 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		e.seekRewind(pc, in)
 	case VText:
 		e.text(pc, in)
+	case VLike:
+		e.like(pc, in)
 	case VSubstr:
 		e.substr(pc, in)
 	case VTextCmpJump, VTextCmpSet:

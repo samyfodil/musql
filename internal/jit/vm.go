@@ -193,7 +193,26 @@ const (
 	// alive and never writes, shared as the VDBE's OP_String8 shares its
 	// constant. The write barrier on exits. (VMTextOrder)
 	VText
+	// VLike: r[C] = r[A] LIKE r[B] (NOT LIKE when Pat.Not), 1 or 0, for the
+	// pattern Pat, which r[B] must be: the TEXT sharing Pat's constant bytes.
+	// Matched as the engine's likePlan matches, ASCII letters in either case.
+	// A non-TEXT operand, any other pattern, a NUL in r[A]'s TEXT and
+	// ProgArgs.LikeCS (case_sensitive_like) exit. (VMTextOrder)
+	VLike
 )
+
+// VLikePat is the LIKE pattern a VLike matches: a constant with no '_', no
+// NUL and nothing past ASCII, split at its '%'s as the engine's likePlan
+// splits it.
+type VLikePat struct {
+	Src    uintptr  // the constant's bytes, which the pattern register shares
+	SrcLen int      // and their length
+	Pieces [][]byte // the text between the '%'s, none empty (but an exact "")
+	Head   bool     // the pattern does not start with '%'
+	Tail   bool     // nor end with one
+	Exact  bool     // it has no '%': the text must be Pieces[0]
+	Not    bool     // NOT LIKE
+}
 
 // sdivMagic is the multiplier m and shift s with which n/d, truncated, is
 // (mulhs(m, n) [+ n when m < 0]) >> s, plus 1 when n < 0 -- for a divisor
@@ -253,6 +272,8 @@ type VInsn struct {
 	Skip uint64
 	// Kernel is VMath's function.
 	Kernel *fir.Func
+	// Pat is VLike's pattern.
+	Pat *VLikePat
 }
 
 // VCursor is native code's view of one materialized cursor: the rows the
