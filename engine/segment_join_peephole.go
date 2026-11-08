@@ -1676,6 +1676,11 @@ func segJoinHashPeephole(prog *Program) bool {
 		return false
 	}
 	closeAt, after, ok := l.tail(in, pc+1)
+	// An ORDER BY's emission counter is set between the loop and the drain;
+	// the kernel goes on at closeAt, so it still is.
+	for ok && after < len(in) && in[after].Op == OpInteger {
+		after++
+	}
 	if !ok || after >= len(in) || in[after].Op != OpHashAggSort {
 		return false
 	}
