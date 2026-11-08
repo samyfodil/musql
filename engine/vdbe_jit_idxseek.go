@@ -35,15 +35,16 @@ type idxSeekSpec struct {
 // first slot, its other slots and an OpAutoIndexOrder, then the OpRewind -- to
 // jit.VSeekIdx, gotos and jit.VSeekRewind, for a cursor every seek of which in
 // the program is the same one and which native code seeks no other way. It
-// returns the specs by cursor (nil when there are none) and the seeks' pcs,
-// native code's entries.
-func lowerIdxSeeks(prog *Program, vp []jit.VInsn, segCap []bool) ([]*idxSeekSpec, []int) {
+// returns the specs by cursor (nil when there are none), the seeks' pcs,
+// native code's entries, and the pcs past each seek through its rewind, which
+// must not be: the VDBE that runs a seek runs its OpAutoIndexOrder too.
+func lowerIdxSeeks(prog *Program, vp []jit.VInsn, segCap []bool) (specs []*idxSeekSpec, pcs, inner []int) {
 	if segCap == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	type site struct{ pc, end, c, key, t int }
 	var sites []site
-	specs := make([]*idxSeekSpec, len(segCap))
+	specs = make([]*idxSeekSpec, len(segCap))
 	bad := make([]bool, len(segCap))
 	insns := prog.Insns
 	for _, in := range insns {
@@ -104,7 +105,6 @@ func lowerIdxSeeks(prog *Program, vp []jit.VInsn, segCap []bool) ([]*idxSeekSpec
 		}
 		sites = append(sites, site{pc, j, c, in.P2, insns[j].P2})
 	}
-	var pcs []int
 	any := false
 	for _, s := range sites {
 		if bad[s.c] {
@@ -114,14 +114,16 @@ func lowerIdxSeeks(prog *Program, vp []jit.VInsn, segCap []bool) ([]*idxSeekSpec
 		vp[s.pc] = jit.VInsn{Op: jit.VSeekIdx, A: s.c, B: s.key, T: s.t}
 		for q := s.pc + 1; q < s.end; q++ {
 			vp[q] = jit.VInsn{Op: jit.VGoto, T: q + 1}
+			inner = append(inner, q)
 		}
+		inner = append(inner, s.end)
 		vp[s.end] = jit.VInsn{Op: jit.VSeekRewind, A: s.c, T: s.t}
 		// Only the seek is entered from the VDBE: entered later, native code
 		// would skip what the VDBE had still to run of it.
 		pcs = append(pcs, s.pc)
 	}
 	if !any {
-		return nil, nil
+		return nil, nil, nil
 	}
 	for c := range specs {
 		if bad[c] {
@@ -163,7 +165,22 @@ func lowerIdxSeeks(prog *Program, vp []jit.VInsn, segCap []bool) ([]*idxSeekSpec
 			pcs = append(pcs, q)
 		}
 	}
-	return specs, pcs
+	return specs, pcs, inner
+}
+
+// openedTab is the table cursor c's OpOpenRead opens, as tabFor last worked
+// it out, while that stands; nil when it does not or never was.
+func (jx *vmJIT) openedTab(m *vdbe, c int) *vmTab {
+	op := &unsafe.Slice(jx.insns, jx.n)[jx.idxSpecs[c].open]
+	tbl, _ := op.P4.(*resolvedTable)
+	rp, err := m.dbPager(op.P3)
+	if tbl == nil || err != nil || rp == nil || rp.segs == nil {
+		return nil
+	}
+	if t := jx.tabs[c].Load(); t.current(rp.segs, tbl.root) && !t.none {
+		return t
+	}
+	return nil
 }
 
 // syncSeekOpen takes back a seek cursor native code may have opened or closed

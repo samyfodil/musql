@@ -347,7 +347,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	}
 	// An integer equality index seek of a table cursor, which native code
 	// makes itself over the table's one segment (vmJIT.idxFor).
-	idxSpecs, idxPCs := lowerIdxSeeks(prog, vp, segCap)
+	idxSpecs, idxPCs, idxInner := lowerIdxSeeks(prog, vp, segCap)
 	for _, q := range idxPCs {
 		if !entry[q] {
 			entry[q] = true
@@ -403,6 +403,14 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 		// OpMakeRecord itself, and the jump past it would drop that record.
 		entry[updAt] = false
 		entries--
+	}
+	for _, q := range idxInner {
+		// Nor past a native index seek: the VDBE that ran the seek runs the
+		// rest of it, its OpAutoIndexOrder above all, which the gotos skip.
+		if entry[q] {
+			entry[q] = false
+			entries--
+		}
 	}
 	if entries == 0 {
 		return nil
@@ -2023,10 +2031,26 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 func (jx *vmJIT) handCursor(m *vdbe, pc, c int) {
 	jc := &m.jcur[c]
 	resetVCursor(jc)
-	if c >= len(m.cursors) || m.cursors[c] == nil {
+	var cur *vdbeCursor
+	if c < len(m.cursors) {
+		cur = m.cursors[c]
+	}
+	if jx.idxSpecs != nil && jx.idxSpecs[c] != nil && jx.idxSpecs[c].open >= 0 && (cur == nil || cur.closed || cur.tbl == nil) {
+		// A seek cursor native code opens itself (VOpen), not open now: it
+		// seeks the table its open names, as last worked out for an open
+		// cursor while that still stands.
+		if t := jx.openedTab(m, c); t != nil {
+			jc.Tab = unsafe.Pointer(&t.tab)
+			if x := jx.idxFor(c, t); x != nil {
+				jc.Idx = unsafe.Pointer(&x.vidx[0])
+			}
+		}
+		jc.Reopen = jit.VReopenSeek
 		return
 	}
-	cur := m.cursors[c]
+	if cur == nil {
+		return
+	}
 	if t := jx.tabFor(c, cur); t != nil {
 		jc.Tab = unsafe.Pointer(&t.tab)
 		if jx.idxSpecs != nil && jx.idxSpecs[c] != nil {
@@ -2038,9 +2062,6 @@ func (jx *vmJIT) handCursor(m *vdbe, pc, c int) {
 	if jx.idxSpecs != nil && jx.idxSpecs[c] != nil && jx.idxSpecs[c].open >= 0 {
 		// A seek cursor native code may open and close (VOpen, VClose).
 		defer func() { jc.Reopen = jit.VReopenSeek }()
-		if cur.closed {
-			return
-		}
 	}
 	if jx.reopen != nil && jx.handReopen(cur, c, jc) {
 		return

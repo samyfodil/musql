@@ -66,7 +66,8 @@ func TestVMJITSeekDifferential(t *testing.T) {
 		queries = append(queries, fmt.Sprintf("SELECT b, c, d, e FROM t WHERE id = %d", i))
 	}
 	// served is how many rows the seeks handed out: native code walking one
-	// must account for the rows it moved over as advance() would.
+	// must account for the rows it moved over as advance() would. Each query
+	// runs twice, the second time on the machine and cursors the first left.
 	run := func(jitOn bool) (out []string, served int64) {
 		old := vmJITEnabled
 		vmJITEnabled = jitOn
@@ -83,8 +84,9 @@ func TestVMJITSeekDifferential(t *testing.T) {
 			n.CommitIfAutocommit()
 		}
 		SegRowsServedForTest()
-		out = make([]string, len(queries))
-		for i, q := range queries {
+		out = make([]string, 2*len(queries))
+		for i := range out {
+			q := queries[i%len(queries)]
 			cols, rows, err := n.Query(q, nil)
 			if err != nil {
 				t.Fatalf("%s: %v", q, err)
@@ -99,9 +101,9 @@ func TestVMJITSeekDifferential(t *testing.T) {
 	before := vmJITSeekSnaps.Load() + vmJITSegWalks.Load()
 	got, gotServed := run(true)
 	snaps := vmJITSeekSnaps.Load() + vmJITSegWalks.Load() - before
-	for i := range queries {
+	for i := range want {
 		if want[i] != got[i] {
-			t.Fatalf("JIT diverges on %s\nvdbe %s\njit  %s", queries[i], want[i], got[i])
+			t.Fatalf("JIT diverges on %s\nvdbe %s\njit  %s", queries[i%len(queries)], want[i], got[i])
 		}
 	}
 	if gotServed != wantServed {
