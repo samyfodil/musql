@@ -2201,7 +2201,7 @@ func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) error {
 			if span := uint64(hi - lo); hi >= lo && span < uint64(64*len(g.rows)+4096) {
 				bits = make([]uint64, span/64+1)
 			} else {
-				seen = make(map[int64]bool, len(it.seen))
+				seen = make(map[int64]bool, len(it.distState().seen))
 			}
 			has := func(v int64) bool {
 				if bits != nil {
@@ -2218,7 +2218,7 @@ func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) error {
 				}
 				seen[v] = true
 			}
-			for _, v := range it.seen {
+			for _, v := range it.distState().seen {
 				mark(v.I)
 			}
 			if g.took != nil && g.took[lv] != nil {
@@ -2231,7 +2231,7 @@ func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) error {
 					}
 					if v := ints[r]; !has(v) {
 						mark(v)
-						it.seen = append(it.seen, Value{Typ: Int, I: v})
+						it.distState().seen = append(it.distState().seen, Value{Typ: Int, I: v})
 						it.cnt++
 						if it.kind != aggCount {
 							if it.orderStrict {
@@ -2261,7 +2261,7 @@ func (gs *segJoinGroups) rest(m *vdbe, g *segJoinGroup) error {
 					continue
 				}
 				mark(v)
-				it.seen = append(it.seen, Value{Typ: Int, I: v})
+				it.distState().seen = append(it.distState().seen, Value{Typ: Int, I: v})
 				it.cnt++
 				if it.kind != aggCount {
 					if it.orderStrict {
