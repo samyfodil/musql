@@ -1953,188 +1953,14 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 			m.jsnap = make([]jitSnap, jx.nCurs)
 		}
 		for _, c := range curs {
-			jc := &m.jcur[c]
-			resetVCursor(jc)
-			if c >= len(m.cursors) || m.cursors[c] == nil {
-				continue
-			}
-			cur := m.cursors[c]
-			if t := jx.tabFor(c, cur); t != nil {
-				jc.Tab = unsafe.Pointer(&t.tab)
-				if jx.idxSpecs != nil && jx.idxSpecs[c] != nil {
-					if x := jx.idxFor(c, t); x != nil {
-						jc.Idx = unsafe.Pointer(&x.vidx[0])
-					}
-				}
-			}
-			if jx.reopen != nil && jx.handReopen(cur, c, jc) {
-				continue
-			}
-			if jitCursorOK(cur) {
-				jc.Rows = unsafe.Pointer(unsafe.SliceData(cur.rows))
-				// The rowid list is the cursor's rowid only while its position
-				// says so: a seek that sets the rowid apart from the list (the
-				// UPDATE ... FROM target's, a WITHOUT ROWID key's) leaves pos
-				// where it was. Out of the list VRowid exits anyway, and a
-				// native advance keeps the two together.
-				if p := cur.pos; len(cur.rowids) > 0 && (p < 0 || p >= len(cur.rowids) || cur.rowids[p] == cur.rowid) {
-					jc.Rowids = unsafe.Pointer(unsafe.SliceData(cur.rowids))
-				}
-				jc.N, jc.Pos, jc.Ok, jc.Adv = int64(len(cur.rowids)), int64(cur.pos), 1, 1
-				jc.Mask = jitCursorMask(cur)
-				if !cur.seekReseek && cur.rowStore == nil && !cur.refillEach {
-					// A re-seeking cursor rebuilds its rows at every rewind, and
-					// so do a write-path one and an inner co-routine
-					// (derivedSource.rerun).
-					jc.Rewind = 1
-				}
-				continue
-			}
-			if jx.segMode(c, cur, jc, &m.jsnap[c]) {
-				continue
-			}
-			if jx.seekSnap(c, cur, jc, &m.jsnap[c], fillFor(jx.fill[pc], c)) {
-				continue
-			}
-			// Not a cursor native code can walk: hand over a copy of its current
-			// row, with the columns this entry reads, and let it read only
-			// those. Nothing native moves it (Adv and Rewind are zero), so the
-			// copy stays the cursor's row for as long as the code runs.
-			for _, cc := range jx.fill[pc] {
-				if cc.cursor != c {
-					continue
-				}
-				sn := &m.jsnap[c]
-				// A segment row's copy is kept while the cursor stays on it, so a
-				// column is copied once however many entries read it.
-				var mask uint64
-				if cur.segCur != nil && sn.rowCur == cur && sn.rowSeg == cur.segCur && sn.rowIdx == cur.segRow &&
-					sn.rowPos == cur.pos && sn.rowGen == cur.seekGen {
-					mask = sn.rowMask
-				}
-				n := len(sn.row)
-				if mask == 0 {
-					n = 0
-				}
-				for _, col := range cc.cols {
-					n = max(n, col+1)
-				}
-				if cap(sn.row) < n {
-					sn.row = append(make([]Value, 0, n), sn.row...)
-				}
-				sn.row = sn.row[:n]
-				for _, col := range cc.cols {
-					if mask&(1<<uint(col)) == 0 && jitReadColumn(cur, col, &sn.row[col]) {
-						mask |= 1 << uint(col)
-					}
-				}
-				sn.rowCur = nil
-				if cur.segCur != nil {
-					sn.rowCur, sn.rowSeg, sn.rowIdx, sn.rowPos, sn.rowGen, sn.rowMask = cur, cur.segCur, cur.segRow, cur.pos, cur.seekGen, mask
-				}
-				if mask != 0 {
-					sn.hdr[0] = sn.row
-					jc.Rows, jc.N, jc.Pos, jc.Ok, jc.Mask = unsafe.Pointer(&sn.hdr[0]), 1, 0, 1, mask
-				}
-			}
+			jx.handCursor(m, pc, c)
 		}
 		args.Cur = &m.jcur[0]
 	}
 	jx.code.Call2(args)
 	if jx.nCurs > 0 {
 		for _, c := range curs {
-			jc := &m.jcur[c]
-			if jc.Reopen != 0 {
-				if jc.Dirty != 0 {
-					syncReopen(m.cursors[c], jc, m.params)
-				}
-				if vmJITCountSyncs && jc.State != 0 {
-					vmJITReopens.Add(1)
-				}
-				continue
-			}
-			if jc.Idx != nil && jc.State >= 2 && jc.State <= 4 {
-				// Native code seeked the cursor through its index: the VDBE's
-				// seek of the last key is run here, and walks on to where
-				// native code left it -- unless what it stopped at closes or
-				// reopens the cursor, which drops that state anyway.
-				m.jsnap[c].segLive, m.jsnap[c].live = false, false
-				// Served is the rows the seeks before the last served; the
-				// last served up to the cursor's row, which the VDBE's walk
-				// counts when it takes the cursor back.
-				last, served := int64(0), jc.Served
-				if jc.State != 3 {
-					last = jc.Last + 1
-				}
-				if !jx.idxSpecs[c].listed {
-					last, served = 0, 0
-				}
-				if vmJITCountSyncs {
-					vmJITIdxSeeks.Add(max(jc.Served, 0) + 1)
-				}
-				if at := int(args.PC); at >= 0 && at < jx.n {
-					if in := unsafe.Slice(jx.insns, jx.n)[at]; in.P1 == c && (in.Op == OpClose || isCursorOpen(in.Op)) {
-						segRowsServed.Add(served + last)
-						continue
-					}
-				}
-				segRowsServed.Add(served)
-				if vmJITCountSyncs {
-					vmJITIdxSyncs.Add(1)
-				}
-				if err := m.syncIdxSeek(jx, c, jc, jx.idxSpecs[c]); err != nil && m.jitErr == nil {
-					m.jitErr = err
-				}
-				continue
-			}
-			if jc.Tab != nil && jc.State >= 2 && jc.State <= 4 {
-				// Native code seeked the cursor: the VDBE's seek of the last key
-				// is run here, and leaves the cursor as native code did.
-				m.jsnap[c].segLive, m.jsnap[c].live = false, false
-				cur := m.cursors[c]
-				cur.vmTab.seekSync(cur, jc)
-				if vmJITCountSyncs {
-					vmJITTabSeeks.Add(1)
-				}
-				continue
-			}
-			if sn := &m.jsnap[c]; sn.segLive {
-				segSync(m.cursors[c], jc, sn)
-				if vmJITCountSyncs && jc.Dirty != 0 {
-					vmJITSegWalks.Add(1)
-				}
-				continue
-			}
-			if sn := &m.jsnap[c]; sn.live {
-				seekSync(m.cursors[c], jc, sn)
-				continue
-			}
-			if sn := &m.jsnap[c]; len(sn.row) != 0 && sn.rowCur == nil {
-				clear(sn.row) // the copy holds no row past the call
-				sn.hdr[0] = nil
-			}
-			if jc.Dirty != 0 {
-				// The native advance moved only the position; the cursor's
-				// current row, rowid and the rest follow it here, as advance()
-				// would have left them. Past the end advance leaves the last row
-				// current, and so does this (Last).
-				cur := m.cursors[c]
-				if vmJITCountSyncs {
-					vmJITCursorSyncs.Add(1)
-					if cur.rowStore != nil {
-						vmJITWriteCursorSyncs.Add(1)
-					}
-				}
-				cur.pos = int(jc.Pos)
-				if jc.Last >= 0 {
-					cur.rowid = cur.rowids[jc.Last]
-					cur.rowVals = cur.rows[jc.Last]
-					if cur.lazyNorm {
-						cur.rowVals = cur.normalizeStored(cur.rowVals)
-					}
-					cur.rowRaw = nil
-				}
-			}
+			jx.syncCursor(m, c, int(args.PC))
 		}
 	}
 	if args.Yield > 0 {
@@ -2152,4 +1978,189 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 		return int(args.PC), int(args.Yield) - 1
 	}
 	return int(args.PC), -1
+}
+
+// handCursor hands cursor c over to native code entered at pc (m.jcur[c]).
+func (jx *vmJIT) handCursor(m *vdbe, pc, c int) {
+	jc := &m.jcur[c]
+	resetVCursor(jc)
+	if c >= len(m.cursors) || m.cursors[c] == nil {
+		return
+	}
+	cur := m.cursors[c]
+	if t := jx.tabFor(c, cur); t != nil {
+		jc.Tab = unsafe.Pointer(&t.tab)
+		if jx.idxSpecs != nil && jx.idxSpecs[c] != nil {
+			if x := jx.idxFor(c, t); x != nil {
+				jc.Idx = unsafe.Pointer(&x.vidx[0])
+			}
+		}
+	}
+	if jx.reopen != nil && jx.handReopen(cur, c, jc) {
+		return
+	}
+	if jitCursorOK(cur) {
+		jc.Rows = unsafe.Pointer(unsafe.SliceData(cur.rows))
+		// The rowid list is the cursor's rowid only while its position
+		// says so: a seek that sets the rowid apart from the list (the
+		// UPDATE ... FROM target's, a WITHOUT ROWID key's) leaves pos
+		// where it was. Out of the list VRowid exits anyway, and a
+		// native advance keeps the two together.
+		if p := cur.pos; len(cur.rowids) > 0 && (p < 0 || p >= len(cur.rowids) || cur.rowids[p] == cur.rowid) {
+			jc.Rowids = unsafe.Pointer(unsafe.SliceData(cur.rowids))
+		}
+		jc.N, jc.Pos, jc.Ok, jc.Adv = int64(len(cur.rowids)), int64(cur.pos), 1, 1
+		jc.Mask = jitCursorMask(cur)
+		if !cur.seekReseek && cur.rowStore == nil && !cur.refillEach {
+			// A re-seeking cursor rebuilds its rows at every rewind, and
+			// so do a write-path one and an inner co-routine
+			// (derivedSource.rerun).
+			jc.Rewind = 1
+		}
+		return
+	}
+	if jx.segMode(c, cur, jc, &m.jsnap[c]) {
+		return
+	}
+	if jx.seekSnap(c, cur, jc, &m.jsnap[c], fillFor(jx.fill[pc], c)) {
+		return
+	}
+	// Not a cursor native code can walk: hand over a copy of its current
+	// row, with the columns this entry reads, and let it read only
+	// those. Nothing native moves it (Adv and Rewind are zero), so the
+	// copy stays the cursor's row for as long as the code runs.
+	for _, cc := range jx.fill[pc] {
+		if cc.cursor != c {
+			continue
+		}
+		sn := &m.jsnap[c]
+		// A segment row's copy is kept while the cursor stays on it, so a
+		// column is copied once however many entries read it.
+		var mask uint64
+		if cur.segCur != nil && sn.rowCur == cur && sn.rowSeg == cur.segCur && sn.rowIdx == cur.segRow &&
+			sn.rowPos == cur.pos && sn.rowGen == cur.seekGen {
+			mask = sn.rowMask
+		}
+		n := len(sn.row)
+		if mask == 0 {
+			n = 0
+		}
+		for _, col := range cc.cols {
+			n = max(n, col+1)
+		}
+		if cap(sn.row) < n {
+			sn.row = append(make([]Value, 0, n), sn.row...)
+		}
+		sn.row = sn.row[:n]
+		for _, col := range cc.cols {
+			if mask&(1<<uint(col)) == 0 && jitReadColumn(cur, col, &sn.row[col]) {
+				mask |= 1 << uint(col)
+			}
+		}
+		sn.rowCur = nil
+		if cur.segCur != nil {
+			sn.rowCur, sn.rowSeg, sn.rowIdx, sn.rowPos, sn.rowGen, sn.rowMask = cur, cur.segCur, cur.segRow, cur.pos, cur.seekGen, mask
+		}
+		if mask != 0 {
+			sn.hdr[0] = sn.row
+			jc.Rows, jc.N, jc.Pos, jc.Ok, jc.Mask = unsafe.Pointer(&sn.hdr[0]), 1, 0, 1, mask
+		}
+	}
+}
+
+// syncCursor brings cursor c up to date with what native code, which
+// stopped at exit, did to it (m.jcur[c]).
+func (jx *vmJIT) syncCursor(m *vdbe, c, exit int) {
+	jc := &m.jcur[c]
+	if jc.Reopen != 0 {
+		if jc.Dirty != 0 {
+			syncReopen(m.cursors[c], jc, m.params)
+		}
+		if vmJITCountSyncs && jc.State != 0 {
+			vmJITReopens.Add(1)
+		}
+		return
+	}
+	if jc.Idx != nil && jc.State >= 2 && jc.State <= 4 {
+		// Native code seeked the cursor through its index: the VDBE's
+		// seek of the last key is run here, and walks on to where
+		// native code left it -- unless what it stopped at closes or
+		// reopens the cursor, which drops that state anyway.
+		m.jsnap[c].segLive, m.jsnap[c].live = false, false
+		// Served is the rows the seeks before the last served; the
+		// last served up to the cursor's row, which the VDBE's walk
+		// counts when it takes the cursor back.
+		last, served := int64(0), jc.Served
+		if jc.State != 3 {
+			last = jc.Last + 1
+		}
+		if !jx.idxSpecs[c].listed {
+			last, served = 0, 0
+		}
+		if vmJITCountSyncs {
+			vmJITIdxSeeks.Add(max(jc.Served, 0) + 1)
+		}
+		if at := exit; at >= 0 && at < jx.n {
+			if in := unsafe.Slice(jx.insns, jx.n)[at]; in.P1 == c && (in.Op == OpClose || isCursorOpen(in.Op)) {
+				segRowsServed.Add(served + last)
+				return
+			}
+		}
+		segRowsServed.Add(served)
+		if vmJITCountSyncs {
+			vmJITIdxSyncs.Add(1)
+		}
+		if err := m.syncIdxSeek(jx, c, jc, jx.idxSpecs[c]); err != nil && m.jitErr == nil {
+			m.jitErr = err
+		}
+		return
+	}
+	if jc.Tab != nil && jc.State >= 2 && jc.State <= 4 {
+		// Native code seeked the cursor: the VDBE's seek of the last key
+		// is run here, and leaves the cursor as native code did.
+		m.jsnap[c].segLive, m.jsnap[c].live = false, false
+		cur := m.cursors[c]
+		cur.vmTab.seekSync(cur, jc)
+		if vmJITCountSyncs {
+			vmJITTabSeeks.Add(1)
+		}
+		return
+	}
+	if sn := &m.jsnap[c]; sn.segLive {
+		segSync(m.cursors[c], jc, sn)
+		if vmJITCountSyncs && jc.Dirty != 0 {
+			vmJITSegWalks.Add(1)
+		}
+		return
+	}
+	if sn := &m.jsnap[c]; sn.live {
+		seekSync(m.cursors[c], jc, sn)
+		return
+	}
+	if sn := &m.jsnap[c]; len(sn.row) != 0 && sn.rowCur == nil {
+		clear(sn.row) // the copy holds no row past the call
+		sn.hdr[0] = nil
+	}
+	if jc.Dirty != 0 {
+		// The native advance moved only the position; the cursor's
+		// current row, rowid and the rest follow it here, as advance()
+		// would have left them. Past the end advance leaves the last row
+		// current, and so does this (Last).
+		cur := m.cursors[c]
+		if vmJITCountSyncs {
+			vmJITCursorSyncs.Add(1)
+			if cur.rowStore != nil {
+				vmJITWriteCursorSyncs.Add(1)
+			}
+		}
+		cur.pos = int(jc.Pos)
+		if jc.Last >= 0 {
+			cur.rowid = cur.rowids[jc.Last]
+			cur.rowVals = cur.rows[jc.Last]
+			if cur.lazyNorm {
+				cur.rowVals = cur.normalizeStored(cur.rowVals)
+			}
+			cur.rowRaw = nil
+		}
+	}
 }
