@@ -423,6 +423,44 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 			}
 		}
 	}
+	// A HAVING over aggregates, keys and constants alone is decided here, from
+	// the sums, and a group it drops gets no bucket: the drain would output
+	// nothing for it. Every aggregate is a count, sum, min or max over clean
+	// INTEGERs, whose finalized value the sums are.
+	var having *aggItemProgram
+	var havingVals []Value
+	if hp := plan.agg.havingPlan; hp != nil && !hp.usesGroupBare && len(hp.hoisted) == 0 && havingReadsNoRow(hp.rewritten) {
+		having = hp.prog
+	}
+	dropped := func(val Value, g *segGroupAcc) bool {
+		if having == nil {
+			return false
+		}
+		havingVals = havingVals[:0]
+		for _, it := range plan.agg.havingPlan.aggTemplates {
+			v := Value{Typ: Int}
+			switch it.kind {
+			case aggCountStar, aggCount:
+				v.I = g.n
+			case aggSum:
+				v.I = g.sums[argOf[it.rowRegs[aggExprArg]-1]]
+			case aggMin:
+				v.I = g.mins[argOf[it.rowRegs[aggExprArg]-1]]
+			case aggMax:
+				v.I = g.maxs[argOf[it.rowRegs[aggExprArg]-1]]
+			}
+			havingVals = append(havingVals, v)
+		}
+		keyVals[0] = val
+		bare := growValues(&m.aggNullRow, plan.agg.nCols+len(plan.agg.scopes))
+		cols, rids := bare[:plan.agg.nCols], bare[plan.agg.nCols:]
+		if !having.runnable(m, havingVals, keyVals, cols, rids) {
+			return false
+		}
+		v, err := having.run(m, havingVals, keyVals, cols, rids)
+		return err == nil && (v.Typ == Null || !isTruthy(v))
+	}
+
 	// Step each group's last row through the shared code, then add the rest.
 	apply := func(key int64, g *segGroupAcc) bool {
 		b := bs[g.lastSeg]
@@ -439,6 +477,9 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		val := Value{Typ: Int, I: key}
 		if plan.keyReal {
 			val = Value{Typ: Float, F: math.Float64frombits(uint64(key))}
+		}
+		if dropped(val, g) {
+			return true
 		}
 		m.regs[plan.keyRegs[0]] = val
 		if c := plan.keyCols[0]; c >= 0 && c < len(row) && !plan.bare {
