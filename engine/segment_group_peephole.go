@@ -221,7 +221,9 @@ func segGroupPeephole(prog *Program) bool {
 		return false
 	}
 	at++
-	if at >= len(in) || in[at].Op != OpHashAggSort {
+	// A drain in the order the groups were made (P3) reads the scan's order,
+	// which the walk does not keep.
+	if at >= len(in) || in[at].Op != OpHashAggSort || in[at].P3 != 0 {
 		return false
 	}
 	sortAt := at

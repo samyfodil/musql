@@ -1635,7 +1635,8 @@ func segJoinEqOK(eq Instruction) bool {
 // OpHashAggSort. The kernel fills the buckets instead, one row per group
 // stepped through hashAggStepRow and the rest added, as segGroupBulk does,
 // and jumps to the drain. Nothing here reads a row, so the order a level
-// visits its rows in cannot show.
+// visits its rows in cannot show, unless the drain keeps the order the groups
+// were made in, which this refuses.
 func segJoinHashPeephole(prog *Program) bool {
 	if !jitEnabled || prog == nil {
 		return false
@@ -1681,7 +1682,9 @@ func segJoinHashPeephole(prog *Program) bool {
 	for ok && after < len(in) && in[after].Op == OpInteger {
 		after++
 	}
-	if !ok || after >= len(in) || in[after].Op != OpHashAggSort {
+	// A drain in the order the groups were made (P3) reads the order the
+	// levels visit their rows in, which the kernel does not keep.
+	if !ok || after >= len(in) || in[after].Op != OpHashAggSort || in[after].P3 != 0 {
 		return false
 	}
 	for _, nb := range l.nullBodies {

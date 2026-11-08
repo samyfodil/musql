@@ -8,8 +8,9 @@ import (
 // TestGroupByGatheredSteps: hashed GROUP BYs whose steps native code gathers
 // and the VDBE replays in order. A group's first row decides what its key
 // columns show (1 against a later 1.0), a LEFT JOIN steps its null row too,
-// groups that arrive in an index's order come out in it, and a sorted seek
-// into one segment finds tied keys in rowid order.
+// groups that arrive in an index's order come out in it, whether the index is
+// named or chosen, and a sorted seek into one segment finds tied keys in rowid
+// order.
 func TestGroupByGatheredSteps(t *testing.T) {
 	base := []string{
 		`CREATE TABLE c(id INTEGER PRIMARY KEY, k INTEGER, name TEXT)`,
@@ -41,6 +42,8 @@ func TestGroupByGatheredSteps(t *testing.T) {
 		`SELECT c.name, count(o.id), total(o.amt) FROM c LEFT JOIN o ON o.ck = c.k GROUP BY c.name`,
 		`SELECT c.k, group_concat(o.id) FROM c JOIN o ON o.ck = c.k GROUP BY c.k`,
 		`SELECT a, count(*) FROM g INDEXED BY g_a_desc WHERE a IS NOT NULL GROUP BY a`,
+		`SELECT a, count(*) FROM g GROUP BY a`,
+		`SELECT b, a, count(*) FROM g GROUP BY b, a`,
 		`SELECT b, a, count(*) FROM g INDEXED BY g_ba GROUP BY b, a`,
 		`SELECT a, count(*) FROM g INDEXED BY g_a_desc WHERE a IS NOT NULL GROUP BY a LIMIT 2`,
 		`SELECT a, count(*) FROM g INDEXED BY g_a_desc WHERE a IS NOT NULL GROUP BY a LIMIT 2 OFFSET 1`,
