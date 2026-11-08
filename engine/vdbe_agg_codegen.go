@@ -2299,18 +2299,7 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// It is emitted twice (at a boundary, and for the final group),
 	// self-contained each time.
 	emitGroup := func() {
-		if !c.isExistsBody(stmt) {
-			// See isExistsBody: the output list of an EXISTS is never evaluated.
-			for i := 0; i < nOut; i++ {
-				c.emit(Instruction{Op: OpAggResult, P1: outBase + i, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetOut, idx: i}})
-			}
-		}
-		var skipJumps []int
-		if gp.havingPlan != nil {
-			c.emit(Instruction{Op: OpAggResult, P1: havingReg, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetHaving, idx: 0}})
-			// HAVING false or NULL -> skip this group's output.
-			skipJumps = append(skipJumps, c.emit(Instruction{Op: OpIfNot, P1: havingReg, P3: 1}))
-		}
+		skipJumps := c.emitGroupOutputs(stmt, plan, gp, nOut, outBase, havingReg, curKeyRec)
 		switch {
 		case useDistinctBatch:
 			// Collect this group's entry -- [minSeq, groupKey.., out..,
@@ -2670,18 +2659,7 @@ func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp
 	sortJump := c.emit(Instruction{Op: OpHashAggSort})
 	drainLoop := c.here()
 	c.emit(Instruction{Op: OpHashAggData, P2: curKeyRec})
-	if !c.isExistsBody(stmt) {
-		// See isExistsBody: the output list of an EXISTS is never evaluated.
-		for i := 0; i < nOut; i++ {
-			c.emit(Instruction{Op: OpAggResult, P1: outBase + i, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetOut, idx: i}})
-		}
-	}
-	var skipJumps []int
-	if gp.havingPlan != nil {
-		c.emit(Instruction{Op: OpAggResult, P1: havingReg, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetHaving, idx: 0}})
-		// HAVING false or NULL -> skip this group's output.
-		skipJumps = append(skipJumps, c.emit(Instruction{Op: OpIfNot, P1: havingReg, P3: 1}))
-	}
+	skipJumps := c.emitGroupOutputs(stmt, plan, gp, nOut, outBase, havingReg, curKeyRec)
 	skipJumps = append(skipJumps, c.emitLimitOffsetGate(offsetReg, limitReg, oneReg, haveOffset, haveLimit, outBase, nOut)...)
 	skip := c.here()
 	for _, j := range skipJumps {
@@ -4266,4 +4244,43 @@ func minMaxRowidQuery(c *compiler, stmt *SelectStmt, srcs []joinSource, plan *ag
 		return 0, false, false
 	}
 	return s.tbl.root, max, true
+}
+
+// emitGroupOutputs emits a GROUP BY group's select list and its HAVING, which
+// jumps (the returned jumps, to be patched past the group's output) when false
+// or NULL. C finalizes every aggregate, then tests HAVING, then evaluates the
+// select list (select.c, finalizeAggFunctions before sqlite3ExprIfFalse before
+// selectInnerLoop). An item here finalizes its own aggregates, so where any
+// item names one the select list is evaluated first, its finalizing raising
+// for every group as C's does; where none does, HAVING comes first, and a
+// group it drops evaluates nothing more, as in C.
+func (c *compiler) emitGroupOutputs(stmt *SelectStmt, plan *aggPlan, gp *groupByPlan, nOut, outBase, havingReg, curKeyRec int) []int {
+	outputs := func() {
+		if !c.isExistsBody(stmt) {
+			// See isExistsBody: the output list of an EXISTS is never evaluated.
+			for i := 0; i < nOut; i++ {
+				c.emit(Instruction{Op: OpAggResult, P1: outBase + i, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetOut, idx: i}})
+			}
+		}
+	}
+	if gp.havingPlan == nil {
+		outputs()
+		return nil
+	}
+	havingFirst := true
+	for _, op := range plan.outPlans {
+		if len(op.aggTemplates) > 0 {
+			havingFirst = false
+		}
+	}
+	if !havingFirst {
+		outputs()
+	}
+	c.emit(Instruction{Op: OpAggResult, P1: havingReg, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetHaving, idx: 0}})
+	// HAVING false or NULL -> skip this group's output.
+	skip := c.emit(Instruction{Op: OpIfNot, P1: havingReg, P3: 1})
+	if havingFirst {
+		outputs()
+	}
+	return []int{skip}
 }
