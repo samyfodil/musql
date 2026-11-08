@@ -231,3 +231,76 @@ func TestVMJITLikeDifferential(t *testing.T) {
 		}
 	}
 }
+
+// TestVMJITInSubDifferential: uncorrelated IN subqueries, which native code
+// probes in the set the VDBE builds (VInSub): INTEGER sets, one holding a
+// NULL, an empty one, NOT IN, and sets it leaves to the VDBE (TEXT and REAL
+// members, a TEXT affinity), probed with INTEGERs, NULLs, REALs and TEXTs.
+// With the JIT and without, every row must match.
+func TestVMJITInSubDifferential(t *testing.T) {
+	lowEntryThreshold(t)
+	if !vmJITEnabled {
+		t.Skip("JIT not enabled on this platform")
+	}
+	rng := rand.New(rand.NewSource(15))
+	setup := []string{"CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b, c TEXT)", "CREATE TABLE u(k INT, r REAL, s TEXT)"}
+	for i := 1; i <= 3000; i++ {
+		b := fmt.Sprint(rng.Intn(60))
+		switch i % 13 {
+		case 0:
+			b = "NULL"
+		case 5:
+			b = fmt.Sprintf("%d.5", rng.Intn(60))
+		case 9:
+			b = fmt.Sprintf("'%d'", rng.Intn(60))
+		}
+		setup = append(setup, fmt.Sprintf("INSERT INTO t VALUES(%d, %d, %s, '%d')", i, rng.Intn(80), b, rng.Intn(60)))
+	}
+	for i := range 40 {
+		setup = append(setup, fmt.Sprintf("INSERT INTO u VALUES(%d, %d.0, '%d')", rng.Intn(70), rng.Intn(70), i))
+	}
+	setup = append(setup, "INSERT INTO u VALUES(NULL, NULL, NULL)", "VACUUM")
+	queries := []string{
+		"SELECT id FROM t WHERE a IN (SELECT k FROM u WHERE k IS NOT NULL)",
+		"SELECT id FROM t WHERE a NOT IN (SELECT k FROM u WHERE k IS NOT NULL)",
+		"SELECT id, a IN (SELECT k FROM u) FROM t WHERE id % 7 = 0",
+		"SELECT count(*) FROM t WHERE a NOT IN (SELECT k FROM u)",
+		"SELECT id FROM t WHERE b IN (SELECT k FROM u WHERE k < 30)",
+		"SELECT id FROM t WHERE a IN (SELECT k FROM u WHERE k > 1000)",
+		"SELECT id FROM t WHERE a NOT IN (SELECT k FROM u WHERE k > 1000)",
+		"SELECT id FROM t WHERE a IN (SELECT r FROM u)",
+		"SELECT id FROM t WHERE a IN (SELECT s FROM u)",
+		"SELECT id FROM t WHERE c IN (SELECT k FROM u WHERE k IS NOT NULL)",
+		"SELECT t1.id FROM t t1 JOIN t t2 ON t2.id = t1.a WHERE t2.a IN (SELECT k FROM u WHERE k IS NOT NULL)",
+	}
+	run := func(jitOn bool) (out []string) {
+		old := vmJITEnabled
+		vmJITEnabled = jitOn
+		defer func() { vmJITEnabled = old }()
+		n, err := OpenOrCreate(filepath.Join(t.TempDir(), "i.musq"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer n.Close()
+		for _, s := range setup {
+			if _, _, err := n.ExecArgs(s, nil); err != nil {
+				t.Fatalf("%s: %v", s, err)
+			}
+			n.CommitIfAutocommit()
+		}
+		for _, q := range queries {
+			cols, rows, err := n.Query(q, nil)
+			if err != nil {
+				t.Fatalf("%s: %v", q, err)
+			}
+			out = append(out, fmt.Sprint(q, cols, rows))
+		}
+		return out
+	}
+	want, got := run(false), run(true)
+	for i := range want {
+		if want[i] != got[i] {
+			t.Fatalf("JIT diverges:\nvdbe %s\njit  %s", want[i], got[i])
+		}
+	}
+}
