@@ -2028,31 +2028,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			m.regs[op.P3] = bitwiseBinaryValue(bitwiseOpName[op.Op], m.regs[op.P2], m.regs[op.P1])
 
 		case OpOpenRead:
-			rp, perr := m.dbPager(op.P3)
-			if perr != nil {
-				return nil, perr
+			if err := m.execOpenRead(op, insns); err != nil {
+				return nil, err
 			}
-			cur := m.openCursorInto(op.P1, rp, op.P4.(*resolvedTable))
-			cur.streamable = op.P5&1 != 0
-			cur.streamIfOrdered = op.P5&4 != 0
-			if cur.streamable && !cur.hasGeneratedCols() {
-				// Only a streaming scan masks: a materialized cursor retains
-				// every row, so a masked row would outlive its record, and it
-				// decodes each row once anyway.
-				//
-				// A generated-column table is excluded for correctness: a
-				// generated column is computed, not read. normalize() runs
-				// computeGeneratedInto over the decoded row, so under a mask
-				// "c AS (a+b)" would be computed from undecoded NULLs and
-				// stored. expandStoredRow also inserts a slot per VIRTUAL
-				// column, so record positions stop matching the mask.
-				cur.colMask = m.cursorMask(insns, op.P1).widenIfTotal(len(cur.tbl.cols))
-			} else if !cur.streamable {
-				// A materialized cursor's scan leaves the columns nothing reads
-				// unread instead (scanTableCols), which its reads fill in.
-				cur.scanMask = m.cursorMask(insns, op.P1).widenIfTotal(len(cur.tbl.cols))
-			}
-			m.cursors[op.P1] = cur
 
 		case OpSeekRowidHint:
 			if cursorHasNoBtree(m.cursors[op.P1]) {
@@ -2092,124 +2070,14 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			cur.seekSet, cur.seekSetConfigured = slices.Compact(keys), true
 
 		case OpSeekIndexHint:
-			// Coerce the key with the exact affinity the WHERE comparison
-			// applies (P4.aff, pre-computed by detectIndexSeekKey), then
-			// configure the cursor to seek the secondary index b-tree for
-			// candidate rowids on its next OpRewind rather than full-scanning.
-			// The keyed WHERE conjunct is re-evaluated on every fetched row, so
-			// this only prunes the scan; see OpSeekIndexHint (vdbe_op.go) and
-			// vdbeCursor.idxSeek* (vdbe_cursor.go).
-			if cursorHasNoBtree(m.cursors[op.P1]) {
-				break
+			if err := m.execSeekIndexHint(op); err != nil {
+				return nil, err
 			}
-			cur := m.cursors[op.P1]
-			switch h := op.P4.(type) {
-			case *indexSeekHint:
-				probe := applyAffinityToValue(m.regs[op.P2], h.aff)
-				// An IN list's values, each coerced as the one key is: a NULL
-				// equals nothing, so it is no probe.
-				var set []Value
-				textKey := probe.Typ == Text
-				if h.in > 0 {
-					set = make([]Value, 0, h.in)
-					textKey = false
-					for _, v := range m.regs[op.P2 : op.P2+h.in] {
-						if v = applyAffinityToValue(v, h.aff); v.Typ != Null {
-							set = append(set, v)
-							textKey = textKey || v.Typ == Text
-						}
-					}
-				}
-				if h.slot == 0 {
-					cur.idxSeekConfigured, cur.idxSeekMore, cur.idxSeekNext, cur.idxSeekSet = false, cur.idxSeekMore[:0], 0, nil
-					cur.idxSeekOrder, cur.idxListOnce, cur.idxListReady = h.order, false, false
-				}
-				// A slot out of step is dropped, as is the key of "x IS NULL" (no
-				// posting list holds NULL) and a write's TEXT key in a UTF-16
-				// database; the keys left each bound the rows, and with none the
-				// scan decides.
-				if h.slot == cur.idxSeekNext {
-					cur.idxSeekNext++
-					switch {
-					case h.is && probe.Typ == Null:
-					case cur.rowStore != nil && textKey && isUTF16(m.encoding()):
-					case !cur.idxSeekConfigured:
-						cur.idxSeekConfigured = true
-						cur.idxSeekProbe, cur.idxSeekColl, cur.idxSeekCol, cur.idxSeekSet = probe, h.coll, h.leadingCol, set
-					default:
-						cur.idxSeekMore = append(cur.idxSeekMore, idxSeekKey{col: h.leadingCol, probe: probe, coll: h.coll, set: set})
-					}
-				}
-			default:
-				return nil, fmt.Errorf("vdbe: OpSeekIndexHint without a plan")
-			}
-			cur.seekReseek = op.P3 == 1 // correlated join seek: re-seek per rewind
 
 		case OpAutoIndexOrder:
-			cur := m.cursors[op.P1]
-			if cur != nil && cur.rowStore != nil {
-				// A WRITE loop's cursor: the order is kept on it and applied at
-				// every materialization (applyWriteOrder), never skipped -- a
-				// per-row SET subquery was lowered on the promise of it.
-				cur.writeOrder = op.P4.(*autoIndexKey)
-				cur.applyWriteOrder()
-				break
+			if err := m.execAutoIndexOrder(op); err != nil {
+				return nil, err
 			}
-			if cur == nil || cursorHasNoBtree(cur) || cur.streamable || cur.seekReseek {
-				// Nothing to permute (no b-tree, or a lazy pull), or a correlated
-				// seek that re-materializes a different row set per rewind.
-				//
-				// A non-correlated seek is permuted like any cursor: it
-				// materializes once and its rows are a superset of the answer, so
-				// sorting that superset and letting the loop filter keeps the same
-				// relative order. Declining leaves the pre-port scan order, never a
-				// different row set -- see OpAutoIndexOrder.
-				break
-			}
-			if cur.streamIfOrdered && !cur.materialized && !cur.hasGeneratedCols() &&
-				!cur.seekConfigured && !cur.idxSeekConfigured && !cur.seekSetConfigured {
-				if cur.pager.segRowsInKeyOrder(cur.tbl.root, op.P4.(*autoIndexKey)) {
-					// The rows already run in the key's order: the outermost scan
-					// streams them as it would with no key. (A seek's few rows are
-					// sorted for less than asking.)
-					cur.streamable, cur.colMask = true, cur.scanMask.widenIfTotal(len(cur.tbl.cols))
-					break
-				}
-				// Or they are put in that order without being built: positioned
-				// on the segment rows, sorted, every rewind after walking them.
-				if src := cur.pager.segKeyOrderList(cur, op.P4.(*autoIndexKey), &cur.pointSrc); src != nil {
-					cur.seekGen = seekGens.Add(1)
-					cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
-					cur.segSrc, cur.segCur, cur.segSrcCols = src, nil, src.cols
-					cur.streamErrPending = nil
-					cur.pos = -1
-					cur.rowidNull = false
-					cur.keyListReady = true
-					break
-				}
-			}
-			// The cursor materializes on its first rewind; force that now so the
-			// permutation below is the one every later rewind re-iterates.
-			cur.params = m.params // see vdbeCursor.params
-			cur.unsort()
-			key := op.P4.(*autoIndexKey)
-			// An index seek's rows are positioned in the key's order instead,
-			// when the segments serve it (idxListOnce): the seek keeps its
-			// probe, so every rewind finds the same rows in the same order.
-			once := cur.idxSeekConfigured && !cur.seekConfigured && !cur.seekSetConfigured && !cur.materialized &&
-				key.multiOr == nil && cur.idxSeekOrder == nil
-			if once {
-				cur.idxSeekOrder, cur.idxListOnce = key, true
-			}
-			if rerr := cur.rewind(); rerr != nil {
-				return nil, rerr
-			}
-			if once && cur.segSrc != nil && cur.segSrc.list {
-				cur.idxListReady = true
-				break
-			}
-			cur.idxListOnce = false
-			autoIndexOrderCursor(cur, key, m.encoding())
 
 		case OpSortedSeek:
 			cur := m.cursors[op.P1]
@@ -3854,4 +3722,163 @@ func reuseSubCache(s []subCacheEntry, n int) []subCacheEntry {
 	s = s[:n]
 	clear(s)
 	return s
+}
+
+// execOpenRead is OpOpenRead, for the VDBE and for a cursor native code
+// opened (vmJIT.syncIdxSeek).
+func (m *vdbe) execOpenRead(op *Instruction, insns []Instruction) error {
+	rp, perr := m.dbPager(op.P3)
+	if perr != nil {
+		return perr
+	}
+	cur := m.openCursorInto(op.P1, rp, op.P4.(*resolvedTable))
+	cur.streamable = op.P5&1 != 0
+	cur.streamIfOrdered = op.P5&4 != 0
+	if cur.streamable && !cur.hasGeneratedCols() {
+		// Only a streaming scan masks: a materialized cursor retains
+		// every row, so a masked row would outlive its record, and it
+		// decodes each row once anyway.
+		//
+		// A generated-column table is excluded for correctness: a
+		// generated column is computed, not read. normalize() runs
+		// computeGeneratedInto over the decoded row, so under a mask
+		// "c AS (a+b)" would be computed from undecoded NULLs and
+		// stored. expandStoredRow also inserts a slot per VIRTUAL
+		// column, so record positions stop matching the mask.
+		cur.colMask = m.cursorMask(insns, op.P1).widenIfTotal(len(cur.tbl.cols))
+	} else if !cur.streamable {
+		// A materialized cursor's scan leaves the columns nothing reads
+		// unread instead (scanTableCols), which its reads fill in.
+		cur.scanMask = m.cursorMask(insns, op.P1).widenIfTotal(len(cur.tbl.cols))
+	}
+	m.cursors[op.P1] = cur
+	return nil
+}
+
+// execSeekIndexHint is OpSeekIndexHint, for the VDBE and for a cursor native
+// code seeked (vmJIT.syncIdxSeek).
+func (m *vdbe) execSeekIndexHint(op *Instruction) error {
+	// Coerce the key with the exact affinity the WHERE comparison
+	// applies (P4.aff, pre-computed by detectIndexSeekKey), then
+	// configure the cursor to seek the secondary index b-tree for
+	// candidate rowids on its next OpRewind rather than full-scanning.
+	// The keyed WHERE conjunct is re-evaluated on every fetched row, so
+	// this only prunes the scan; see OpSeekIndexHint (vdbe_op.go) and
+	// vdbeCursor.idxSeek* (vdbe_cursor.go).
+	if cursorHasNoBtree(m.cursors[op.P1]) {
+		return nil
+	}
+	cur := m.cursors[op.P1]
+	switch h := op.P4.(type) {
+	case *indexSeekHint:
+		probe := applyAffinityToValue(m.regs[op.P2], h.aff)
+		// An IN list's values, each coerced as the one key is: a NULL
+		// equals nothing, so it is no probe.
+		var set []Value
+		textKey := probe.Typ == Text
+		if h.in > 0 {
+			set = make([]Value, 0, h.in)
+			textKey = false
+			for _, v := range m.regs[op.P2 : op.P2+h.in] {
+				if v = applyAffinityToValue(v, h.aff); v.Typ != Null {
+					set = append(set, v)
+					textKey = textKey || v.Typ == Text
+				}
+			}
+		}
+		if h.slot == 0 {
+			cur.idxSeekConfigured, cur.idxSeekMore, cur.idxSeekNext, cur.idxSeekSet = false, cur.idxSeekMore[:0], 0, nil
+			cur.idxSeekOrder, cur.idxListOnce, cur.idxListReady = h.order, false, false
+		}
+		// A slot out of step is dropped, as is the key of "x IS NULL" (no
+		// posting list holds NULL) and a write's TEXT key in a UTF-16
+		// database; the keys left each bound the rows, and with none the
+		// scan decides.
+		if h.slot == cur.idxSeekNext {
+			cur.idxSeekNext++
+			switch {
+			case h.is && probe.Typ == Null:
+			case cur.rowStore != nil && textKey && isUTF16(m.encoding()):
+			case !cur.idxSeekConfigured:
+				cur.idxSeekConfigured = true
+				cur.idxSeekProbe, cur.idxSeekColl, cur.idxSeekCol, cur.idxSeekSet = probe, h.coll, h.leadingCol, set
+			default:
+				cur.idxSeekMore = append(cur.idxSeekMore, idxSeekKey{col: h.leadingCol, probe: probe, coll: h.coll, set: set})
+			}
+		}
+	default:
+		return fmt.Errorf("vdbe: OpSeekIndexHint without a plan")
+	}
+	cur.seekReseek = op.P3 == 1 // correlated join seek: re-seek per rewind
+	return nil
+}
+
+// execAutoIndexOrder is OpAutoIndexOrder, for the VDBE and for a cursor
+// native code seeked (vmJIT.syncIdxSeek).
+func (m *vdbe) execAutoIndexOrder(op *Instruction) error {
+	cur := m.cursors[op.P1]
+	if cur != nil && cur.rowStore != nil {
+		// A WRITE loop's cursor: the order is kept on it and applied at
+		// every materialization (applyWriteOrder), never skipped -- a
+		// per-row SET subquery was lowered on the promise of it.
+		cur.writeOrder = op.P4.(*autoIndexKey)
+		cur.applyWriteOrder()
+		return nil
+	}
+	if cur == nil || cursorHasNoBtree(cur) || cur.streamable || cur.seekReseek {
+		// Nothing to permute (no b-tree, or a lazy pull), or a correlated
+		// seek that re-materializes a different row set per rewind.
+		//
+		// A non-correlated seek is permuted like any cursor: it
+		// materializes once and its rows are a superset of the answer, so
+		// sorting that superset and letting the loop filter keeps the same
+		// relative order. Declining leaves the pre-port scan order, never a
+		// different row set -- see OpAutoIndexOrder.
+		return nil
+	}
+	if cur.streamIfOrdered && !cur.materialized && !cur.hasGeneratedCols() &&
+		!cur.seekConfigured && !cur.idxSeekConfigured && !cur.seekSetConfigured {
+		if cur.pager.segRowsInKeyOrder(cur.tbl.root, op.P4.(*autoIndexKey)) {
+			// The rows already run in the key's order: the outermost scan
+			// streams them as it would with no key. (A seek's few rows are
+			// sorted for less than asking.)
+			cur.streamable, cur.colMask = true, cur.scanMask.widenIfTotal(len(cur.tbl.cols))
+			return nil
+		}
+		// Or they are put in that order without being built: positioned
+		// on the segment rows, sorted, every rewind after walking them.
+		if src := cur.pager.segKeyOrderList(cur, op.P4.(*autoIndexKey), &cur.pointSrc); src != nil {
+			cur.seekGen = seekGens.Add(1)
+			cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
+			cur.segSrc, cur.segCur, cur.segSrcCols = src, nil, src.cols
+			cur.streamErrPending = nil
+			cur.pos = -1
+			cur.rowidNull = false
+			cur.keyListReady = true
+			return nil
+		}
+	}
+	// The cursor materializes on its first rewind; force that now so the
+	// permutation below is the one every later rewind re-iterates.
+	cur.params = m.params // see vdbeCursor.params
+	cur.unsort()
+	key := op.P4.(*autoIndexKey)
+	// An index seek's rows are positioned in the key's order instead,
+	// when the segments serve it (idxListOnce): the seek keeps its
+	// probe, so every rewind finds the same rows in the same order.
+	once := cur.idxSeekConfigured && !cur.seekConfigured && !cur.seekSetConfigured && !cur.materialized &&
+		key.multiOr == nil && cur.idxSeekOrder == nil
+	if once {
+		cur.idxSeekOrder, cur.idxListOnce = key, true
+	}
+	if rerr := cur.rewind(); rerr != nil {
+		return rerr
+	}
+	if once && cur.segSrc != nil && cur.segSrc.list {
+		cur.idxListReady = true
+		return nil
+	}
+	cur.idxListOnce = false
+	autoIndexOrderCursor(cur, key, m.encoding())
+	return nil
 }
