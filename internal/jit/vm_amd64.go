@@ -885,6 +885,8 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		e.text(pc, in)
 	case VLike:
 		e.like(pc, in)
+	case VInSub:
+		e.inSub(pc, in)
 	case VSeekRewind:
 		e.seekRewind(pc, in)
 	case VInSet:

@@ -443,6 +443,8 @@ type ProgArgs struct {
 	TextPtr, TextLen int64
 	// LikeCS is non-zero under PRAGMA case_sensitive_like, where VLike exits.
 	LikeCS int64
+	// InSets is the program's IN subquery sets, VInSub's B indexing them.
+	InSets *VInSubSet
 }
 
 // ProgScratch is how many words of ProgArgs.Scratch a kernel may use.
@@ -474,6 +476,7 @@ const (
 	POffTextPtr  = POffUTF16 + 8
 	POffTextLen  = POffTextPtr + 8
 	POffLikeCS   = POffTextLen + 8
+	POffInSets   = POffLikeCS + 8
 )
 
 // progHasService reports whether a program can stop for a service, and so

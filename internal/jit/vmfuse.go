@@ -82,6 +82,8 @@ func vmStepOf(in VInsn, pc int) progStep {
 		s.uses, s.targets = []int{in.A, in.B}, []int{in.T}
 	case VTextCmpSet, VLike:
 		s.uses, s.defs = []int{in.A, in.B}, []int{in.C}
+	case VInSub:
+		s.uses, s.defs = []int{in.A}, []int{in.C}
 	case VNotBr:
 		s.uses, s.defs, s.targets = []int{in.A}, []int{in.C}, []int{in.T}
 	case VNullJump, VIf:
@@ -261,7 +263,7 @@ func FuseVM(prog []VInsn, nReg int, hard, entry []bool) []VInsn {
 		case VCopy:
 			d = in.B
 		case VAdd, VSub, VMul, VAnd, VOr, VShl, VShr, VDiv, VRem, VCmpSet, VNull, VNeg, VNot,
-			VFAdd, VFSub, VFMul, VFDiv, VFCmpSet, VMath, VLike:
+			VFAdd, VFSub, VFMul, VFDiv, VFCmpSet, VMath, VLike, VInSub:
 			d = in.C
 		case VReal, VText:
 			d = in.A

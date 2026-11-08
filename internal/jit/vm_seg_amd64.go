@@ -345,3 +345,70 @@ func (e *vmEmit) text(pc int, in VInsn) {
 	e.unmap(in.A)
 	e.know.wroteAny(in.A, false)
 }
+
+// inSub is VInSub: a binary search of the set's ascending keys. R9 the set
+// (kept in X0 while R9 is the probe's middle), RDX its keys, RCX the key, RAX
+// and R10 the bounds.
+func (e *vmEmit) inSub(pc int, in VInsn) {
+	if in.Dead {
+		e.clobber(in.C)
+		return
+	}
+	a, L := e.a, e.lay
+	e.destNoS(pc, in.C)
+	loop, hi, miss, absent, yes, no, done := e.vmLabel("ql"), e.vmLabel("qh"), e.vmLabel("qm"), e.vmLabel("qa"),
+		e.vmLabel("qy"), e.vmLabel("qn"), e.vmLabel("qd")
+	a.MovRegMemD(R9, RDI, POffInSets)
+	if in.B > 0 {
+		a.AddRegImm32(R9, int32(in.B*VInSubSize))
+	}
+	a.CmpMemDImm8(R9, VInSubOffReady, 0)
+	e.jccStub(CondE, pc)
+	a.CmpMemDImm8(R9, VInSubOffEmpty, 0)
+	a.Jcc(CondNE, no)
+	a.CmpMemDByte(RSI, e.d(in.A, L.OffTyp), L.TypInt)
+	e.jccStub(CondNE, pc)
+	a.MovRegMemD(RCX, RSI, e.d(in.A, L.OffI))
+	a.MovRegMemD(RDX, R9, VInSubOffKeys)
+	a.MovqXR(X0, R9)
+	a.XorRegReg(RAX, RAX)
+	a.MovRegMemD(R10, R9, VInSubOffN)
+	a.Label(loop)
+	a.CmpRegReg(RAX, R10)
+	a.Jcc(CondGE, miss)
+	a.MovRegReg(R9, RAX)
+	a.AddRegReg(R9, R10)
+	a.SarRegImm8(R9, 1)
+	a.CmpMemIdxReg(RDX, R9, RCX) // keys[mid] against the key
+	a.Jcc(CondGE, hi)
+	a.LeaRegMemD(RAX, R9, 1)
+	a.Jmp(loop)
+	a.Label(hi)
+	a.MovRegReg(R10, R9)
+	a.Jmp(loop)
+	a.Label(miss)
+	a.MovqRX(R9, X0)
+	a.AluRegMemD(AluCmp, RAX, R9, VInSubOffN)
+	a.Jcc(CondGE, absent)
+	a.CmpMemIdxReg(RDX, RAX, RCX)
+	a.Jcc(CondE, yes)
+	a.Label(absent)
+	a.CmpMemDImm8(R9, VInSubOffHasNull, 0)
+	e.jccStub(CondNE, pc) // NULL, which the VDBE answers
+	a.Jmp(no)
+	in1, in0 := int64(1), int64(0)
+	if in.Imm == 1 {
+		in1, in0 = 0, 1
+	}
+	a.Label(yes)
+	a.MovRegImm64(R10, in1)
+	a.Jmp(done)
+	a.Label(no)
+	a.MovRegImm64(R10, in0)
+	a.Label(done)
+	m := e.dest(pc, in.C, R10)
+	if m != R10 {
+		a.MovRegReg(m, R10)
+	}
+	e.storeInt(pc, in, in.C, m)
+}

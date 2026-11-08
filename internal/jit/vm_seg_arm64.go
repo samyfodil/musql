@@ -456,3 +456,71 @@ func (e *vmEmitArm) numericTextExit(pc, r int) {
 	a.B(e.stub(pc))
 	a.Label(text)
 }
+
+// inSub is vm_seg_amd64.go's VInSub: X9 the set, X4 its keys, X5 the key,
+// X6 and X7 the bounds, X8 the middle.
+func (e *vmEmitArm) inSub(pc int, in VInsn) {
+	if in.Dead {
+		e.clobber(in.C)
+		return
+	}
+	a, L := e.a, e.lay
+	e.destNoS(pc, in.C)
+	loop, hi, miss, absent, yes, no, done := e.vmLabel("ql"), e.vmLabel("qh"), e.vmLabel("qm"), e.vmLabel("qa"),
+		e.vmLabel("qy"), e.vmLabel("qn"), e.vmLabel("qd")
+	a.LdrImm(X9, X0, POffInSets)
+	if in.B > 0 {
+		a.MovImm64(X10, int64(in.B*VInSubSize))
+		a.AddReg(X9, X9, X10)
+	}
+	a.LdrImm(X10, X9, VInSubOffReady)
+	a.Cbz(X10, e.stub(pc))
+	a.LdrImm(X10, X9, VInSubOffEmpty)
+	a.Cbnz(X10, no)
+	e.ldrb(X10, in.A, L.OffTyp)
+	a.CmpImm(X10, uint32(L.TypInt))
+	a.Bcond(CondNE, e.stub(pc))
+	e.ldr(X5, in.A, L.OffI)
+	a.LdrImm(X4, X9, VInSubOffKeys)
+	a.MovImm16(X6, 0)
+	a.LdrImm(X7, X9, VInSubOffN)
+	a.Label(loop)
+	a.Cmp(X6, X7)
+	a.Bcond(CondGE, miss)
+	a.AddReg(X8, X6, X7)
+	a.AsrImm(X8, X8, 1)
+	a.LdrRegIdx(X10, X4, X8)
+	a.Cmp(X10, X5)
+	a.Bcond(CondGE, hi)
+	a.AddImm(X6, X8, 1)
+	a.B(loop)
+	a.Label(hi)
+	a.MovReg(X7, X8)
+	a.B(loop)
+	a.Label(miss)
+	a.LdrImm(X10, X9, VInSubOffN)
+	a.Cmp(X6, X10)
+	a.Bcond(CondGE, absent)
+	a.LdrRegIdx(X10, X4, X6)
+	a.Cmp(X10, X5)
+	a.Bcond(CondE, yes)
+	a.Label(absent)
+	a.LdrImm(X10, X9, VInSubOffHasNull)
+	a.Cbnz(X10, e.stub(pc)) // NULL, which the VDBE answers
+	a.B(no)
+	in1, in0 := uint16(1), uint16(0)
+	if in.Imm == 1 {
+		in1, in0 = 0, 1
+	}
+	a.Label(yes)
+	a.MovImm16(X8, in1)
+	a.B(done)
+	a.Label(no)
+	a.MovImm16(X8, in0)
+	a.Label(done)
+	m := e.dest(pc, in.C, X8)
+	if m != X8 {
+		a.MovReg(m, X8)
+	}
+	e.storeInt(in, in.C, m)
+}

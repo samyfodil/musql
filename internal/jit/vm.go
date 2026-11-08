@@ -199,6 +199,31 @@ const (
 	// A non-TEXT operand, any other pattern, a NUL in r[A]'s TEXT and
 	// ProgArgs.LikeCS (case_sensitive_like) exit. (VMTextOrder)
 	VLike
+	// VInSub: r[C] = 1 when the INTEGER in r[A] is in the set
+	// ProgArgs.InSets[B] holds, else 0; the other way round under Imm 1 (NOT
+	// IN). An empty set answers without reading r[A]. A set not Ready, any
+	// other r[A], and a miss in a set holding a NULL exit. (VMTextOrder)
+	VInSub
+)
+
+// VInSubSet is an uncorrelated IN subquery's rows as VInSub probes them, which
+// the engine publishes at every entry: Keys the INTEGERs ascending, N of
+// them; HasNull, Empty and Ready flags.
+type VInSubSet struct {
+	Keys    unsafe.Pointer
+	N       int64
+	HasNull int64
+	Empty   int64
+	Ready   int64
+}
+
+const (
+	VInSubSize       = 40
+	VInSubOffKeys    = 0
+	VInSubOffN       = 8
+	VInSubOffHasNull = 16
+	VInSubOffEmpty   = 24
+	VInSubOffReady   = 32
 )
 
 // VLikePat is the LIKE pattern a VLike matches: a constant with no '_', no
