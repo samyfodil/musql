@@ -1804,6 +1804,7 @@ func seekSync(cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) {
 		} else {
 			// Batch row k is the source's ahead[k-1] (lookahead): the cursor on
 			// row k has taken k of them.
+			segRowsServed.Add(int64(int(jc.Last) - src.aheadPos))
 			src.aheadPos = int(jc.Last)
 		}
 		cur.segWidth = min(cur.segCur.Width(cur.segRow), len(cur.segSrcCols))

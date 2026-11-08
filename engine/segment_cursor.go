@@ -568,6 +568,7 @@ func (src *segRowSource) next() (s *segment, row int, rowid uint64, ok bool) {
 	if src.aheadPos < len(src.ahead) {
 		r := src.ahead[src.aheadPos]
 		src.aheadPos++
+		segRowsServed.Add(1)
 		return r.s, r.row, r.rowid, true
 	}
 	return src.pull()
@@ -586,6 +587,7 @@ func (src *segRowSource) lookahead(k int) []segAheadRow {
 			src.drained = true
 			break
 		}
+		segRowsServed.Add(-1) // served when taken, as rows pulled ahead may never be
 		src.ahead = append(src.ahead, segAheadRow{s, row, rowid})
 	}
 	return src.ahead
