@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/samyfodil/musql/internal/jit"
@@ -144,3 +145,89 @@ func TestVMJITSegmentModeDifferential(t *testing.T) {
 
 // segCursorsHere is whether this build hands cursors over in segment mode.
 func segCursorsHere() bool { return jit.VMSegCursor }
+
+// TestVMJITLikeDifferential: LIKE against constant patterns, which native
+// code matches (VLike), over TEXTs in both cases, NULLs, non-TEXTs and
+// embedded NULs, NOT LIKE, and patterns it leaves to the VDBE ('_', an
+// ESCAPE); then the same under case_sensitive_like. With the JIT and without,
+// every row must match.
+func TestVMJITLikeDifferential(t *testing.T) {
+	lowEntryThreshold(t)
+	if !vmJITEnabled {
+		t.Skip("JIT not enabled on this platform")
+	}
+	rng := rand.New(rand.NewSource(14))
+	words := []string{"green", "GREEN", "Forest", "brass", "BRASS", "polished", "MEDIUM", "Customer", "Complaints", "x", "%", "_"}
+	setup := []string{"CREATE TABLE t(id INTEGER PRIMARY KEY, s TEXT, n)"}
+	for i := 1; i <= 3000; i++ {
+		var b strings.Builder
+		for range rng.Intn(4) {
+			if b.Len() > 0 {
+				b.WriteByte(' ')
+			}
+			b.WriteString(words[rng.Intn(len(words))])
+		}
+		s := "'" + b.String() + "'"
+		switch i % 29 {
+		case 0:
+			s = "NULL"
+		case 7:
+			s = "'gr' || char(0) || 'een'"
+		case 11:
+			s = fmt.Sprint(rng.Intn(100))
+		}
+		setup = append(setup, fmt.Sprintf("INSERT INTO t VALUES(%d, %s, %d)", i, s, rng.Intn(9)))
+	}
+	setup = append(setup, "VACUUM")
+	queries := []string{
+		"SELECT id, s FROM t WHERE s LIKE '%green%'",
+		"SELECT count(*) FROM t WHERE s NOT LIKE 'MEDIUM%'",
+		"SELECT id FROM t WHERE s LIKE '%BRASS'",
+		"SELECT id FROM t WHERE s LIKE '%customer%complaints%' AND n < 5",
+		"SELECT id, s LIKE 'green' FROM t WHERE n = 3",
+		"SELECT id FROM t WHERE s LIKE 'Forest'",
+		"SELECT count(*) FROM t WHERE s LIKE '%'",
+		"SELECT id FROM t WHERE s LIKE 'g_een%'",
+		"SELECT id FROM t WHERE s LIKE '%x\\%%' ESCAPE '\\'",
+		"SELECT id FROM t WHERE s LIKE '%G%r%'",
+		// The LIKE of a seeked row runs in the VDBE's loop.
+		"SELECT t1.id, t2.s FROM t t1 JOIN t t2 ON t2.id = t1.n WHERE t2.s LIKE '%green%'",
+		"SELECT t1.id FROM t t1 JOIN t t2 ON t2.id = t1.n WHERE t2.s NOT LIKE 'b%' AND t1.s LIKE '%s'",
+	}
+	run := func(jitOn bool) (out []string) {
+		old := vmJITEnabled
+		vmJITEnabled = jitOn
+		defer func() { vmJITEnabled = old }()
+		n, err := OpenOrCreate(filepath.Join(t.TempDir(), "l.musq"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer n.Close()
+		exec := func(s string) {
+			if _, _, err := n.ExecArgs(s, nil); err != nil {
+				t.Fatalf("%s: %v", s, err)
+			}
+			n.CommitIfAutocommit()
+		}
+		for _, s := range setup {
+			exec(s)
+		}
+		for _, cs := range []string{"OFF", "ON", "OFF"} {
+			exec("PRAGMA case_sensitive_like=" + cs)
+			for _, q := range queries {
+				cols, rows, err := n.Query(q, nil)
+				if err != nil {
+					t.Fatalf("%s: %v", q, err)
+				}
+				out = append(out, fmt.Sprint(cs, q, cols, rows))
+			}
+		}
+		return out
+	}
+	want, got := run(false), run(true)
+	for i := range want {
+		if want[i] != got[i] {
+			t.Fatalf("JIT diverges:\nvdbe %s\njit  %s", want[i], got[i])
+		}
+	}
+}
