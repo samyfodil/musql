@@ -287,7 +287,7 @@ func (l *segJoinLoop) level(in []Instruction, pc int) (int, bool) {
 				next = i
 			}
 		}
-		preds, end, ok := segParsePredTree(in, pc+5, len(in), l.cursors[self], next, []int{eq.P2}, skip.P2)
+		preds, end, ok := segParsePredTree(in, pc+5, len(in), l.cursors[self], next, []int{eq.P2}, skip.P2, false)
 		if !ok || len(preds) == 0 {
 			return 0, false
 		}

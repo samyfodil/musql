@@ -80,6 +80,11 @@ type segPlanPred struct {
 	// bound, cached in sub-cache slot SubSlot as OpSubquery caches it.
 	SubProg *Program
 	SubSlot int
+	// Reg, when not zero, is one more than the register supplying the bound,
+	// which a once-block computes (segOnceBound) and the plan's caller runs
+	// before the plan; once is that block's span.
+	Reg  int
+	once [2]int
 	// Aff is the comparison's affinity (P5), which the loop applies to the
 	// bound before comparing and so must segPlanPreds.
 	Aff affinity
@@ -317,17 +322,73 @@ func segPeepholeCompareOK(cmp Instruction) bool {
 // that does not start such a group and returns the predicates and that pc;
 // ok is false when a group starts but does not match exactly.
 func segParsePredBlock(in []Instruction, pc, limit, cursor, nextAt int) (preds []segPlanPred, end int, ok bool) {
-	return segParsePredTree(in, pc, limit, cursor, nextAt, nil, -1)
+	return segParsePredTree(in, pc, limit, cursor, nextAt, nil, -1, false)
+}
+
+// segParsePredBlockOnce is segParsePredBlock also taking a bound a once-block
+// computes (segOnceBound), for a caller that runs those blocks before its plan.
+func segParsePredBlockOnce(in []Instruction, pc, limit, cursor, nextAt int) (preds []segPlanPred, end int, ok bool) {
+	return segParsePredTree(in, pc, limit, cursor, nextAt, nil, -1, true)
+}
+
+// segOnceBound reports a predicate group at pc whose bound a once-block
+// computes -- a date/time call on literals, made once per statement:
+//
+//	Column c -> r; NotNull flag -> L; <literal loads, the call, a Copy>;
+//	Integer 1 -> flag; L: <compare the bound with r>; IfNot
+//
+// It returns the block's span, from the NotNull up to L.
+func segOnceBound(in []Instruction, pc, limit int) (from, to int, ok bool) {
+	if pc+1 >= limit || in[pc].Op != OpColumn || in[pc+1].Op != OpNotNull {
+		return 0, 0, false
+	}
+	from, to = pc+1, in[pc+1].P2
+	if to <= from+1 || to+1 >= limit || !segIsCompare(in[to].Op) || in[to+1].Op != OpIfNot {
+		return 0, 0, false
+	}
+	if set := in[to-1]; set.Op != OpInteger || set.P1 != 1 || set.P2 != in[from].P1 {
+		return 0, 0, false
+	}
+	for _, x := range in[from+1 : to-1] {
+		switch x.Op {
+		case OpString8, OpSCopy, OpCopy, OpInteger, OpInt64, OpReal:
+		case OpFunction:
+			switch name, _ := x.P4.(string); name {
+			case "date", "time", "datetime", "julianday", "unixepoch", "strftime":
+			default:
+				return 0, 0, false
+			}
+		default:
+			return 0, 0, false
+		}
+	}
+	return from, to, true
 }
 
 // segParsePredTree is segParsePredBlock inside an AND tree already begun:
 // leadRegs are the results of the tests before pc, each of which fails to
 // falseAt -- a LEFT JOIN's ON clause, whose first test is the join's own
 // equality (segment_join_peephole.go).
-func segParsePredTree(in []Instruction, pc, limit, cursor, nextAt int, leadRegs []int, falseAt int) (preds []segPlanPred, end int, ok bool) {
+func segParsePredTree(in []Instruction, pc, limit, cursor, nextAt int, leadRegs []int, falseAt int, once bool) (preds []segPlanPred, end int, ok bool) {
 	preds = make([]segPlanPred, 0, 2)
 	cmpRegs := slices.Clone(leadRegs)
-	for pc+3 < limit && in[pc].Op == OpColumn && segLooksLikePredGroup(in, pc, limit) {
+	for pc+3 < limit && in[pc].Op == OpColumn {
+		if from, to, isOnce := segOnceBound(in, pc, limit); once && isOnce {
+			col, cmp, ifnot := in[pc], in[to], in[to+1]
+			direct := ifnot.P3 == 1 && ifnot.P2 == nextAt
+			op, ok := segOpOfCompare(cmp.Op)
+			if col.P1 != cursor || !direct || falseAt >= 0 || !ok || cmp.P3 != col.P3 || ifnot.P1 != cmp.P2 || !segPeepholeCompareOK(cmp) ||
+				!slices.ContainsFunc(in[from+1:to-1], func(x Instruction) bool { return (x.Op == OpCopy || x.Op == OpSCopy) && x.P2 == cmp.P1 }) {
+				return nil, 0, false
+			}
+			preds = append(preds, segPlanPred{Col: col.P2, Op: op, Aff: affinity(cmp.P5 & p5AffMask), Reg: cmp.P1 + 1, once: [2]int{from, to}})
+			cmpRegs = append(cmpRegs, cmp.P2)
+			pc = to + 2
+			continue
+		}
+		if !segLooksLikePredGroup(in, pc, limit) {
+			break
+		}
 		col, bound, cmp, ifnot := in[pc], in[pc+1], in[pc+2], in[pc+3]
 		// A negative numeric literal is spelled "Integer 100; Negative": the
 		// bound then sits in the Negative's register, and the group is five
@@ -540,6 +601,12 @@ func (m *vdbe) segPlanPreds(plan *segFilterPlan) ([]segPred, bool) {
 	preds := make([]segPred, 0, len(plan.preds))
 	for _, p := range plan.preds {
 		v := p.Lit
+		if p.Reg != 0 {
+			if p.Reg-1 >= len(m.regs) {
+				return nil, false
+			}
+			v = m.regs[p.Reg-1]
+		}
 		if p.ParamIdx != 0 {
 			if p.ParamIdx < 1 || p.ParamIdx > len(m.params) {
 				return nil, false

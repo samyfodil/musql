@@ -65,7 +65,7 @@ func segGroupPeephole(prog *Program) bool {
 	var lists []segPlanList
 	pc := rewindAt + 1
 	for {
-		more, npc, ok := segParsePredBlock(in, pc, stepAt, cursor, stepAt+1)
+		more, npc, ok := segParsePredBlockOnce(in, pc, stepAt, cursor, stepAt+1)
 		if !ok {
 			return false
 		}
@@ -226,17 +226,36 @@ func segGroupPeephole(prog *Program) bool {
 	}
 	sortAt := at
 
+	// A bound a once-block computes is computed before the walk: a copy of
+	// each such block goes ahead of the guard, which then reads its register.
+	// The loop's own copy, should the walk decline, finds its flag set.
+	var once []Instruction
+	for _, p := range preds {
+		if p.Reg == 0 {
+			continue
+		}
+		if !plainKey {
+			return false
+		}
+		base := guardAt + len(once)
+		for _, x := range in[p.once[0]:p.once[1]] {
+			if x.Op == OpNotNull {
+				x.P2 = base + p.once[1] - p.once[0]
+			}
+			once = append(once, x)
+		}
+	}
+	shift := 1 + len(once)
+
 	// Rewrite: the guard goes before the Rewind, and on success jumps straight
 	// to the drain with the buckets already filled.
-	out := make([]Instruction, 0, len(in)+1)
+	out := make([]Instruction, 0, len(in)+shift)
 	out = append(out, in[:guardAt]...)
-	out = append(out, Instruction{Op: OpSegHashAgg, P1: cursor, P2: sortAt + 1, P4: gplan})
+	out = append(out, once...)
+	out = append(out, Instruction{Op: OpSegHashAgg, P1: cursor, P2: sortAt + shift, P4: gplan})
 	for _, ins := range in[guardAt:] {
-		switch ins.Op {
-		case OpRewind, OpNext, OpIfNot, OpIsNull, OpHashAggSort, OpHashAggNext, OpIf, OpGoto, OpSorterCheck:
-			if ins.P2 >= guardAt {
-				ins.P2++
-			}
+		if segJoinJumpsP2(ins.Op) && ins.P2 >= guardAt {
+			ins.P2 += shift
 		}
 		out = append(out, ins)
 	}
