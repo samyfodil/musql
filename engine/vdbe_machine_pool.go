@@ -70,7 +70,11 @@ func (prog *Program) getMachineFrom(spare **vdbe) *vdbe {
 // reason putMachine rebuilds the machine from a composite literal.
 func (m *vdbe) openCursorInto(slot int, p *ReadOnlyPager, tbl *resolvedTable) *vdbeCursor {
 	cur := m.cursorShell(slot)
-	*cur = vdbeCursor{pager: p, tbl: tbl, colMask: allColumns}
+	// A list seek's buffers outlive the cursor, for a subquery that opens it
+	// once per outer row and seeks once (segListSeek).
+	ps := &cur.pointSrc
+	src := segRowSource{listSegs: ps.listSegs[:0], listRows: ps.listRows[:0], listKeys: ps.listKeys[:0], listPerm: ps.listPerm[:0], listHits: ps.listHits[:0]}
+	*cur = vdbeCursor{pager: p, tbl: tbl, colMask: allColumns, pointSrc: src}
 	return cur
 }
 

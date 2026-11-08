@@ -138,6 +138,11 @@ type segRowSource struct {
 	listPos  int
 	listSegs []*segment
 	listRows []int
+	// listKeys and listPerm are sortListBy's, and listHits segListSeekIndex's,
+	// kept across seeks as the list is.
+	listKeys []int64
+	listPerm []int
+	listHits []int32
 
 	// ahead is the rows a scan has pulled past the cursor's (lookahead), which
 	// next serves, from aheadPos, before pulling more; drained is set once a
@@ -299,21 +304,96 @@ func (p *ReadOnlyPager) segListSeek(cur *vdbeCursor, rids []int64, into *segRowS
 			segs, rows = append(segs, s), append(rows, i)
 		}
 	}
-	*into = segRowSource{list: true, listSegs: segs, listRows: rows, cols: segColPlansFor(cur.tbl)}
+	*into = segRowSource{list: true, listSegs: segs, listRows: rows, listKeys: into.listKeys, listPerm: into.listPerm,
+		listHits: into.listHits, cols: segColPlansFor(cur.tbl)}
+	return into, true
+}
+
+// segListSeekIndex is segListSeek of cur's index seek straight from the
+// segments' equality indexes, where they are the whole answer: one key, a
+// table with nothing in the log, and nothing in the session's store over it
+// (liveBaseSegments), every segment as wide as the table. Their hits are already segment rows, in rowid order, so no
+// rowid is made and searched for again. served is false, and nothing is
+// positioned, where the seek is any other, or matches so much of the table
+// that SeekIndexRowidsByKeys would leave it to the scan.
+func (p *ReadOnlyPager) segListSeekIndex(cur *vdbeCursor, into *segRowSource) (src *segRowSource, served bool) {
+	if !p.segSeekable(cur) || len(cur.idxSeekMore) > 0 || cur.idxSeekSet != nil || cur.idxSeekCol < 0 || cur.idxSeekCol >= len(cur.tbl.cols) {
+		return nil, false
+	}
+	probe, root := cur.idxSeekProbe, cur.tbl.root
+	if probe.Typ == Text && !equalFoldName(effectiveCollation(cur.idxSeekColl), "BINARY") {
+		return nil, false
+	}
+	table := p.segs.byRoot[root]
+	if p.segs.isLive(root) {
+		var ok bool
+		if table, ok = p.segs.liveBaseSegments(root); !ok {
+			return nil, false
+		}
+	} else if !p.segs.cleanFor(root) {
+		return nil, false
+	}
+	segs, rows, hits := into.listSegs[:0], into.listRows[:0], into.listHits
+	total := 0
+	for _, sg := range table {
+		if sg == nil || len(sg.cols) != len(cur.tbl.cols) {
+			return nil, false
+		}
+		var have bool
+		switch probe.Typ {
+		case Int:
+			sg.eqMu.Lock()
+			x, ok := sg.diskIndexFor(cur.idxSeekCol)
+			sg.eqMu.Unlock()
+			if have = ok && x.codec == segIdxCodecPostings; have {
+				hits = x.rowsFor(probe.I, hits[:0])
+			}
+		case Text, Blob:
+			hits, have = sg.segEqualityRowsBytes(cur.idxSeekCol, probe.S)
+		case Float:
+			hits, have = sg.segEqualityRowsFloat(cur.idxSeekCol, probe.F)
+		}
+		if !have {
+			return nil, false
+		}
+		for _, i := range hits {
+			segs, rows = append(segs, sg), append(rows, int(i))
+		}
+		total += sg.nRows
+	}
+	if total == 0 || total >= seekMinRows && 2*len(rows) >= total {
+		return nil, false
+	}
+	*into = segRowSource{list: true, listSegs: segs, listRows: rows, listKeys: into.listKeys, listPerm: into.listPerm,
+		listHits: hits, cols: segColPlansFor(cur.tbl)}
 	return into, true
 }
 
 // sortListBy puts a list seek's rows in key's order, reporting false, having
 // moved nothing, when a key value is not an INTEGER (the seek then builds its
 // rows and sorts them, autoIndexOrderCursor). Ties keep their rowid order, as
-// the index's own does.
+// the index's own does. A list already in order -- an equality seek whose key
+// is its own column, ties in rowid order -- is left as it is.
 func (src *segRowSource) sortListBy(key *autoIndexKey) bool {
 	n := len(src.listRows)
 	if key == nil || n < 2 {
 		return true
 	}
 	nk := len(key.cols)
-	flat := make([]int64, 0, n*nk)
+	less := func(ka, kb []int64) int {
+		for k := range ka {
+			if ka[k] != kb[k] {
+				c := cmp.Compare(ka[k], kb[k])
+				if k < len(key.desc) && key.desc[k] {
+					return -c
+				}
+				return c
+			}
+		}
+		return 0
+	}
+	flat := src.listKeys[:0]
+	defer func() { src.listKeys = flat }()
 	for i, s := range src.listSegs {
 		row := src.listRows[i]
 		rid := s.Rowid(row)
@@ -330,20 +410,21 @@ func (src *segRowSource) sortListBy(key *autoIndexKey) bool {
 			flat = append(flat, v.I)
 		}
 	}
-	perm := make([]int, n)
-	for i := range perm {
-		perm[i] = i
+	inOrder := true
+	for i := nk; i < len(flat) && inOrder; i += nk {
+		inOrder = less(flat[i-nk:i], flat[i:i+nk]) <= 0
 	}
+	if inOrder {
+		return true
+	}
+	perm := src.listPerm[:0]
+	for i := range n {
+		perm = append(perm, i)
+	}
+	src.listPerm = perm
 	slices.SortFunc(perm, func(a, b int) int {
-		ka, kb := flat[a*nk:a*nk+nk], flat[b*nk:b*nk+nk]
-		for k := range ka {
-			if ka[k] != kb[k] {
-				c := cmp.Compare(ka[k], kb[k])
-				if k < len(key.desc) && key.desc[k] {
-					return -c
-				}
-				return c
-			}
+		if c := less(flat[a*nk:a*nk+nk], flat[b*nk:b*nk+nk]); c != 0 {
+			return c
 		}
 		return a - b
 	})

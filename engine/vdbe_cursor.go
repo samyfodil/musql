@@ -1158,6 +1158,18 @@ func (cur *vdbeCursor) rewind() error {
 				return nil
 			}
 			cur.idxListReady = false
+			if cur.seekReseek || cur.idxListOnce {
+				if src, served := cur.pager.segListSeekIndex(cur, &cur.pointSrc); served && src.sortListBy(cur.idxSeekOrder) {
+					segIndexSeeksServed.Add(1)
+					cur.seekGen = seekGens.Add(1)
+					cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
+					cur.segSrc, cur.segCur, cur.segSrcCols = src, nil, src.cols
+					cur.streamErrPending = nil
+					cur.pos = -1
+					cur.rowidNull = false
+					return nil
+				}
+			}
 			rowids, served := cur.idxSeekRowids()
 			if served {
 				segIndexSeeksServed.Add(1)
