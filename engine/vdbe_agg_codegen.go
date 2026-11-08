@@ -1957,6 +1957,15 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 					plan.anchorKeep = plan.rowCols
 				}
 			}
+			plan.keyCols = make([]int, len(gp.groupExprs))
+			for i, ge := range gp.groupExprs {
+				plan.keyCols[i] = -1
+				if col, ok := ge.(ColumnExpr); ok {
+					if idx, ok := resolveColumnIndex(plan.scopes, col); ok {
+						plan.keyCols[i] = idx
+					}
+				}
+			}
 		}
 	}
 
@@ -1966,7 +1975,9 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// scan-ordered groups (hashAggSort drains ascending), select-list subqueries
 	// and bare columns reading the anchor through state only the sorter path has,
 	// and RIGHT/FULL coalesced columns in aggregate arguments, which only the drain
-	// can serve. A reference to a GROUP BY key column is allowed: each bucket holds
+	// can serve. Scan-ordered groups are drained in the order they were made, the
+	// order they arrive in, unless a LIMIT or OFFSET would stop the streamed scan
+	// early. A reference to a GROUP BY key column is allowed: each bucket holds
 	// a full aggAccumulators and magnetWalk runs per bucket in scan order.
 	//
 	// Under any other ORDER BY the groups go on to the same ORDER BY sorter
@@ -1976,8 +1987,8 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	ordered := hasOrder && !orderIsGroupKeyAscending(stmt, gp)
 	if !useDistinctBatch && !gp.selectHasSubquery &&
 		!joinHasCoalescedColumns(plan.scopes) &&
-		!anyNonBinaryCollation(gp.groupColls) && !scanOrderGroups {
-		return compileScanGroupByHash(c, stmt, srcs, gp, plan, savedNQueryLoopKnown, ordered)
+		!anyNonBinaryCollation(gp.groupColls) && (!scanOrderGroups || !hasLimitOrOffset(stmt)) {
+		return compileScanGroupByHash(c, stmt, srcs, gp, plan, aggs, savedNQueryLoopKnown, ordered, scanOrderGroups, rowFree)
 	}
 
 	sorter1 := c.allocSorter()
@@ -2208,11 +2219,7 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// its own (an index walk delivering the groups together). The groups then
 	// arrive, and finish, exactly as before; only the order of rows within one,
 	// which nothing here reads, moves.
-	c.rowOrderFree = rowFree && stmt.Having == nil && !anyOrderSensitive(aggs) && len(jplan.execOrder) > 0 &&
-		(len(jplan.autoIdxKeys) == 0 || jplan.autoIdxKeys[0] == nil) &&
-		!slices.ContainsFunc(stmt.GroupBy, func(e Expr) bool {
-			return !keyRefsOnlyCursors(c, e, map[int]bool{srcs[jplan.execOrder[0]].scope.cursor: true})
-		})
+	c.rowOrderFree = rowOrderFreeGroups(c, stmt, srcs, jplan, aggs, rowFree)
 	gotoSetup, scanStart := -1, -1
 	if stream {
 		gotoSetup = c.emit(Instruction{Op: OpGoto})
@@ -2526,9 +2533,19 @@ func aggItemsRowReads(plan *aggPlan) (cols []int, rowids bool) {
 		p := it.prog
 		// The result register counts too: an item that is just a column is a
 		// program of no instructions whose result IS that column's register.
-		regs := [][3]int{{p.resultReg, -1, -1}}
+		regs := [][]int{{p.resultReg}}
 		for _, ins := range p.prog.Insns {
-			regs = append(regs, [3]int{ins.P1, ins.P2, ins.P3})
+			// The registers it reads where segInsnRegs knows them, else all
+			// three operands: a constant operand is not a read of the row.
+			switch ins.Op {
+			case OpInit, OpHalt, OpGoto:
+				continue
+			}
+			if reads, _, _, ok := segInsnRegs(ins); ok {
+				regs = append(regs, reads)
+				continue
+			}
+			regs = append(regs, []int{ins.P1, ins.P2, ins.P3})
 		}
 		for _, rs := range regs {
 			for _, r := range rs {
@@ -2563,7 +2580,26 @@ func orderBySubqueryReadsRow(p *ReadOnlyPager, terms []OrderTerm) bool {
 	return false
 }
 
-func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp *groupByPlan, plan *aggPlan, preNQLKnown, ordered bool) (*Program, error) {
+// hasLimitOrOffset is whether stmt has a LIMIT or an OFFSET, as written or as
+// a parameter.
+func hasLimitOrOffset(stmt *SelectStmt) bool {
+	return stmt.Limit != nil || stmt.Offset != nil || stmt.LimitParam != nil || stmt.OffsetParam != nil
+}
+
+// rowOrderFreeGroups is compileScanGroupBy's compiler.rowOrderFree: nothing
+// reads the order of rows within a group (rowFree: no anchor; no HAVING, no
+// order-sensitive aggregate), every grouping term reads only the outermost
+// loop's table, and that loop carries no order of its own. The groups then
+// arrive, and finish, as before.
+func rowOrderFreeGroups(c *compiler, stmt *SelectStmt, srcs []joinSource, jplan joinPlan, aggs []*aggItem, rowFree bool) bool {
+	return rowFree && stmt.Having == nil && !anyOrderSensitive(aggs) && len(jplan.execOrder) > 0 &&
+		(len(jplan.autoIdxKeys) == 0 || jplan.autoIdxKeys[0] == nil) &&
+		!slices.ContainsFunc(stmt.GroupBy, func(e Expr) bool {
+			return !keyRefsOnlyCursors(c, e, map[int]bool{srcs[jplan.execOrder[0]].scope.cursor: true})
+		})
+}
+
+func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp *groupByPlan, plan *aggPlan, aggs []*aggItem, preNQLKnown, ordered, scanOrder, rowFree bool) (*Program, error) {
 	nGroup := len(gp.groupExprs)
 	nOut := len(gp.outCols)
 
@@ -2639,10 +2675,11 @@ func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp
 	// subquery in the WHERE or grouping keys may read them (rowLive), as in
 	// compileScanPlain (e_fkey.test). Restored afterwards: the result phase is not
 	// row-live.
-	savedRowLive := c.rowLive
+	savedRowLive, savedOrderFree := c.rowLive, c.rowOrderFree
 	c.rowLive = true
+	c.rowOrderFree = rowOrderFreeGroups(c, stmt, srcs, jplan, aggs, rowFree)
 	err := aggLoopNQueryLoop(c, preNQLKnown, func() error { return emitJoinLoops(c, srcs, jplan, body) })
-	c.rowLive = savedRowLive
+	c.rowLive, c.rowOrderFree = savedRowLive, savedOrderFree
 	if err != nil {
 		return nil, err
 	}
@@ -2675,7 +2712,13 @@ func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp
 	if slices.Contains(gp.groupDesc, true) {
 		desc = gp.groupDesc
 	}
-	sortJump := c.emit(Instruction{Op: OpHashAggSort, P4: desc})
+	// P3: the groups arrive in scan order (scanOrderGroups), which is the
+	// order they were made.
+	madeOrder := 0
+	if scanOrder {
+		madeOrder = 1
+	}
+	sortJump := c.emit(Instruction{Op: OpHashAggSort, P3: madeOrder, P4: desc})
 	drainLoop := c.here()
 	c.emit(Instruction{Op: OpHashAggData, P2: curKeyRec})
 	if ordered {

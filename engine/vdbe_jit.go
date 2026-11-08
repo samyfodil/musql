@@ -53,6 +53,13 @@ type vmJIT struct {
 	// VDBE applies them as soon as the call returns (vdbe.applyGathered).
 	updAt int
 
+	// aggAt is the pc of the OpHashAggStep whose registers native code
+	// gathers (gatherAggStep), or -1: entries before aggSort gather into
+	// vdbe.aggRows, and the VDBE steps each row as soon as the call returns.
+	// aggLo..aggHi are the registers gathered, aggKey the key's record and
+	// aggKeyLo its registers' first.
+	aggAt, aggSort, aggLo, aggHi, aggKey, aggKeyLo, aggKeyN int
+
 	// updSkip is the gathered record's Skip (gatherSkip): the columns whose
 	// registers may be stale when the record is made, which updateRow then
 	// reads from the cursor's row instead.
@@ -371,6 +378,16 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 		entry[updAt-1] = true
 		native++
 	}
+	agg := stepGather{at: -1}
+	if updAt < 0 {
+		agg = gatherAggStep(prog, vp)
+	}
+	for _, at := range agg.ats {
+		// Where the VDBE goes on after stepping a row native code could not
+		// gather.
+		entry[at+1] = true
+		native++
+	}
 	if native == 0 {
 		return nil
 	}
@@ -430,7 +447,8 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 		}
 	}
 	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams, params: nParams, entry: entry, marked: marked, native: native, updAt: updAt,
-		segCap: segCap, walkScan: walkScan, inSlots: inSlots, idxSpecs: idxSpecs}
+		segCap: segCap, walkScan: walkScan, inSlots: inSlots, idxSpecs: idxSpecs,
+		aggAt: agg.at, aggSort: agg.sort, aggLo: agg.lo, aggHi: agg.hi, aggKey: agg.key, aggKeyLo: agg.keyLo, aggKeyN: agg.keyN}
 	if segCap != nil {
 		jx.tabs = make([]atomic.Pointer[vmTab], len(segCap))
 	}
@@ -736,6 +754,121 @@ func gatherUpdate(prog *Program, vp []jit.VInsn) int {
 // nothing but the record, which takes the column from elsewhere. Anything
 // else -- a trigger, a constraint's substitution, a function's argument run
 // -- keeps them all.
+// stepGather is gatherAggStep's verdict: at is -1 when it lowered nothing.
+type stepGather struct {
+	at, sort, lo, hi, key, keyLo, keyN int
+	ats                                []int // every step, at the first
+}
+
+// gatherAggStep lowers a hashed GROUP BY's one OpHashAggStep, when it reads
+// nothing but registers (aggPlan.rowFree) or its row is its key's
+// (aggPlan.rowFromKeys), to a VResultRow that gathers them:
+// the key's and every register an aggregate steps from. Its OpMakeRecord is a
+// view of the key's registers (recView), which native code skips; enter keeps
+// the record pointing at them. Native code then goes on past many rows before
+// the VDBE steps them in order (vdbe.stepGathered).
+//
+// Only where no entry can run both it and an OpResultRow: every OpResultRow
+// follows the OpHashAggSort, which native code never runs, and no native jump
+// crosses it, so the entries before it are the ones that gather.
+func gatherAggStep(prog *Program, vp []jit.VInsn) stepGather {
+	none := stepGather{at: -1}
+	var ats []int
+	sort := -1
+	for pc := range prog.Insns {
+		switch in := &prog.Insns[pc]; in.Op {
+		case OpHashAggStep:
+			// A LEFT JOIN's null row steps the same key and registers again.
+			if len(ats) > 0 {
+				if first := &prog.Insns[ats[0]]; in.P1 != first.P1 || in.P2 != first.P2 || in.P4 != first.P4 {
+					return none
+				}
+			}
+			ats = append(ats, pc)
+		case OpHashAggSort:
+			if sort >= 0 {
+				return none
+			}
+			sort = pc
+		case OpResultRow:
+			if sort < 0 {
+				return none
+			}
+		}
+	}
+	if len(ats) == 0 || sort < ats[len(ats)-1] || vp[sort].Op != jit.VExit {
+		return none
+	}
+	for _, at := range ats {
+		if vp[at].Op != jit.VExit {
+			return none
+		}
+	}
+	step := &prog.Insns[ats[0]]
+	plan, _ := step.P4.(*aggPlan)
+	if plan == nil || !plan.rowFree && !plan.rowFromKeys() {
+		return none
+	}
+	var mrAts []int
+	for pc := range sort {
+		if in := &prog.Insns[pc]; in.Op == OpMakeRecord && in.P3 == step.P1 {
+			_, view := in.P4.(recView)
+			if !view || vp[pc].Op != jit.VExit || len(mrAts) > 0 && (in.P1 != prog.Insns[mrAts[0]].P1 || in.P2 != prog.Insns[mrAts[0]].P2) {
+				return none
+			}
+			mrAts = append(mrAts, pc)
+		}
+	}
+	if len(mrAts) == 0 {
+		return none
+	}
+	mr := &prog.Insns[mrAts[0]]
+	if !plan.rowFree && mr.P2 != len(plan.keyCols) {
+		return none
+	}
+	lo, hi := mr.P1, mr.P1+mr.P2
+	for _, it := range aggPlanTemplates(plan) {
+		for which := range it.rowRegs {
+			if it.rowExpr(which) != nil && it.rowRegs[which] <= 0 {
+				return none
+			}
+		}
+		if len(it.obRegs) != len(it.orderBy) {
+			return none
+		}
+		for _, r := range it.obRegs {
+			if r <= 0 {
+				return none
+			}
+		}
+		for _, r := range segJoinStepRegs(it) {
+			lo, hi = min(lo, r), max(hi, r+1)
+		}
+	}
+	if lo < 0 || hi > prog.NReg || hi-lo > 32 {
+		return none
+	}
+	for pc, in := range vp {
+		if in.Op == jit.VExit || in.T == 0 {
+			continue
+		}
+		if pc < sort && in.T > sort || pc > sort && in.T < sort {
+			return none
+		}
+	}
+	for _, pc := range mrAts {
+		vp[pc] = jit.VInsn{Op: jit.VGoto, T: pc + 1}
+	}
+	for _, pc := range ats {
+		vp[pc] = jit.VInsn{Op: jit.VResultRow, A: lo, B: hi - lo}
+	}
+	return stepGather{at: ats[0], ats: ats, sort: sort, lo: lo, hi: hi, key: step.P1, keyLo: mr.P1, keyN: mr.P2}
+}
+
+// aggGathers is whether an entry at pc gathers OpHashAggStep's rows
+// (gatherAggStep).
+func (jx *vmJIT) aggGathers(pc int) bool { return jx.aggAt >= 0 && pc < jx.aggSort }
+
 func gatherSkip(prog *Program, at int) uint64 {
 	mr := &prog.Insns[at-1]
 	borrow, _ := mr.P4.(recBorrow)
@@ -1241,7 +1374,10 @@ var (
 	// vmJITIdxSeeks counts the index seeks native code made (VSeekIdx) and
 	// vmJITIdxSyncs the times the VDBE took such a cursor back (syncIdxSeek).
 	vmJITIdxSeeks, vmJITIdxSyncs atomic.Int64
-	vmJITCountSyncs              bool
+	// vmJITAggGathered counts the hashed GROUP BY steps native code gathered
+	// and the VDBE replayed (gatherAggStep).
+	vmJITAggGathered atomic.Int64
+	vmJITCountSyncs  bool
 
 	// vmJITCursorEnters counts entries into native code that reads or walks a
 	// cursor, while vmJITCountCursorEnters is set.
@@ -1947,11 +2083,12 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 		args.InSets = jx.inSets(m)
 	}
 	args.RowBuf, args.RowCap, args.RowUsed, args.RowsBuf, args.RowsCap, args.Yield = nil, -1, 0, nil, 0, 0
+	gather := jx.updAt >= 0 || jx.aggGathers(pc)
 	switch {
 	case jx.rows == nil || !jx.rows[pc] || m.firstRow:
 		// No OpResultRow native code runs; or the VDBE's stops the run with an
 		// empty row.
-	case m.yieldReuse && len(*rows) == 0:
+	case !gather && m.yieldReuse && len(*rows) == 0:
 		if c := cap(m.yieldRow); c > 0 {
 			args.RowBuf, args.RowCap = (*int64)(unsafe.Pointer(unsafe.SliceData(m.yieldRow[:c]))), int64(c)
 		} else {
@@ -1961,7 +2098,7 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 		// An UPDATE's gathered rows (gatherUpdate) go to a buffer of their
 		// own, which the VDBE stores out of and reuses (vdbe.gatherChunk).
 		buf := m.recChunk
-		if jx.updAt >= 0 {
+		if gather {
 			buf = m.gatherChunk
 		}
 		if c := len(buf); c > 0 {
@@ -1969,7 +2106,8 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 		} else {
 			args.RowCap = 0
 		}
-		if !m.yield {
+		// A step's rows are the VDBE's own, never handed over one by one.
+		if !m.yield || jx.aggGathers(pc) {
 			if cap(*rows) == len(*rows) {
 				// Grown as append would grow it, so a subquery that returns one
 				// row allocates for one; native code gathers rows only as far as
@@ -2021,7 +2159,7 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 			// spare capacity, their Values the chunk's first RowUsed.
 			k := int(args.Yield)
 			*rows = (*rows)[:len(*rows)+k]
-			if jx.updAt < 0 {
+			if !gather {
 				m.recChunk = m.recChunk[args.RowUsed:]
 			}
 			m.jitRows += k

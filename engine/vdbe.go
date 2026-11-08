@@ -170,6 +170,10 @@ type vdbe struct {
 	// are stored as their own copy.
 	gatherChunk []Value
 	keptChunk   []Value
+	// aggRows is the hashed GROUP BY steps native code gathered
+	// (gatherAggStep), and aggSaved the registers stepGathered borrows.
+	aggRows  [][]Value
+	aggSaved []Value
 	// runRids and runRows are the run of rows applyGathered has written in
 	// place and storeInPlace has yet to store.
 	runRids []uint64
@@ -1503,6 +1507,36 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			if jitScore {
 				jitScoreEnter()
+			}
+			if jx.aggGathers(pc) {
+				// Room for a batch of steps, gathered into a list of their own
+				// and stepped before the VDBE runs anything (gatherAggStep).
+				const batch = 256
+				m.aggRows = slices.Grow(m.aggRows[:0], batch)
+				if n := batch * (jx.aggHi - jx.aggLo); len(m.gatherChunk) < n {
+					m.gatherChunk = make([]Value, n)
+				}
+				m.recRegs[jx.aggKey] = m.regs[jx.aggKeyLo : jx.aggKeyLo+jx.aggKeyN : jx.aggKeyLo+jx.aggKeyN]
+				next, n := jx.enter(m, pc, &m.aggRows)
+				pc = next
+				if err := m.jitErr; err != nil {
+					m.jitErr = nil
+					return nil, err
+				}
+				gathered := m.aggRows
+				if n >= 0 {
+					gathered = append(gathered, m.gatherChunk[:n:n])
+				}
+				err := m.stepGathered(jx, &insns[jx.aggAt], gathered)
+				clear(gathered)
+				m.aggRows = gathered[:0]
+				if err != nil {
+					return nil, err
+				}
+				if n < 0 {
+					jitSkip = pc
+				}
+				continue
 			}
 			before := len(rows)
 			if jx.updAt >= 0 {
@@ -3085,7 +3119,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpHashAggSort:
 			desc, _ := op.P4.([]bool)
-			if !m.hashAggSort(desc) {
+			if !m.hashAggSort(desc, op.P3 == 1) {
 				pc = op.P2
 				continue
 			}

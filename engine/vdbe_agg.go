@@ -18,7 +18,10 @@
 // compiler is compileScanAggregate / compileScanGroupBy (vdbe_agg_codegen.go).
 package engine
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 // aggPlan is an OpAggReset/OpAggStep P4 payload: what the aggregate opcodes share
 // across one query's groups. The offset-adjusted table scopes, the total column
@@ -47,6 +50,9 @@ type aggPlan struct {
 	// spelling every one of them as the anchor does leaves the anchor as it
 	// is instead of being copied again (aggAccumulators.keep).
 	anchorKeep []int
+	// keyCols[i], set with rowCols, is the row block's column GROUP BY key i
+	// is a bare read of, or -1.
+	keyCols []int
 
 	scopes  []tableScope
 	nCols   int   // total column count across every joined table -- the [cols..] block width; len(scopes) rowid slots immediately follow it in the [cols.., rowids..] layout (see aggRowSplit)
@@ -146,6 +152,21 @@ func (m *vdbe) gatherCursorRow(plan *aggPlan) (row []Value, rowids []Value, err 
 		copy(row[g.offset:g.offset+len(vals)], vals)
 	}
 	return row, m.gatherRowids(plan, rowids), nil
+}
+
+// rowFromKeys is whether a step's row is its GROUP BY key's registers: every
+// column anything reads is a key's bare read, the group's first row is its
+// anchor (no census site, no certificate), and nothing reads its rowids.
+func (plan *aggPlan) rowFromKeys() bool {
+	if plan.rowFree || plan.anchorKeep == nil || plan.magnet != nil && len(plan.magnet.sites) > 0 || plan.anchorCheck != nil {
+		return false
+	}
+	for _, c := range plan.rowCols {
+		if !slices.Contains(plan.keyCols, c) {
+			return false
+		}
+	}
+	return true
 }
 
 // gatherCols fills just plan.rowCols of row, reporting false (row untouched)

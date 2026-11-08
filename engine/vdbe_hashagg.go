@@ -264,17 +264,64 @@ func (m *vdbe) hashAggStepRow(plan *aggPlan, keyVals []Value, seg int, row, rowi
 	return m.aggStep(m.aggRowCtx(plan, row, rowids), seg)
 }
 
+// stepGathered is step's body for each of rows, the registers native code
+// gathered at it (gatherAggStep), in the order it gathered them. The
+// registers are lent to each row in turn and then hold again what native
+// code left in them.
+func (m *vdbe) stepGathered(jx *vmJIT, step *Instruction, rows [][]Value) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	if vmJITCountSyncs {
+		vmJITAggGathered.Add(int64(len(rows)))
+	}
+	plan := step.P4.(*aggPlan)
+	regs := m.regs[jx.aggLo:jx.aggHi]
+	m.aggSaved = append(m.aggSaved[:0], regs...)
+	defer func() {
+		copy(regs, m.aggSaved)
+		clear(m.aggSaved)
+	}()
+	key := m.regs[jx.aggKeyLo : jx.aggKeyLo+jx.aggKeyN : jx.aggKeyLo+jx.aggKeyN]
+	if plan.rowFree {
+		for _, r := range rows {
+			copy(regs, r)
+			if err := m.hashAggStep(plan, key, step.P2); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	// The row a new group takes as its anchor, its columns the key's values
+	// (aggPlan.rowFromKeys); nothing reads the rest of it.
+	n := plan.nCols + len(plan.scopes)
+	row := growValues(&m.aggRowBuf, n)
+	for _, r := range rows {
+		copy(regs, r)
+		for i, c := range plan.keyCols {
+			if c >= 0 {
+				row[c] = key[i]
+			}
+		}
+		if err := m.hashAggStepRow(plan, key, step.P2, row[:plan.nCols:plan.nCols], row[plan.nCols:]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // hashAggSort is OpHashAggSort's body: finalize m.hashAgg's buckets into
 // group-key order (keyTupleLess), descending in the keys desc marks as sorter1
-// sorts them, reporting whether there is at least one group -- mirroring
-// vdbeSorter.sort's "jump if empty" convention.
-func (m *vdbe) hashAggSort(desc []bool) bool {
+// sorts them, or with made the order they were made in, reporting whether
+// there is at least one group -- mirroring vdbeSorter.sort's "jump if empty"
+// convention.
+func (m *vdbe) hashAggSort(desc []bool, made bool) bool {
 	if m.hashAgg == nil {
 		return false
 	}
 	h := m.hashAgg
 	h.sorted = h.made
-	if h.unordered || desc != nil {
+	if !made && (h.unordered || desc != nil) {
 		// BINARY order is memcmp over the encoded text, which in a UTF-16
 		// database is not UTF-8 byte order (utf16CompareUTF8); the sorted
 		// drain's sorter orders its groups the same way.
