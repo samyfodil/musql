@@ -3169,7 +3169,7 @@ func groupEmissionOrderProvable(p *ReadOnlyPager, c *compiler, srcs []joinSource
 // GROUP BY column.
 func groupingCouldArriveOrdered(p *ReadOnlyPager, srcs []joinSource, scopes []tableScope, gp *groupByPlan, stmt *SelectStmt) bool {
 	if p != nil && len(srcs) > 1 {
-		return !groupTermUnorderable(p, srcs, scopes, gp, stmt)
+		return !groupTermUnorderable(p, srcs, scopes, gp, stmt) && !groupJoinNeverOrdered(p, srcs, scopes, gp, stmt)
 	}
 	if p == nil || len(srcs) != 1 || srcs[0].tbl == nil {
 		return true
@@ -3225,6 +3225,164 @@ func groupingCouldArriveOrdered(p *ReadOnlyPager, srcs []joinSource, scopes []ta
 			}
 		}
 		if covered {
+			return true
+		}
+	}
+	return false
+}
+
+// groupJoinNeverOrdered reports that no join order delivers the grouping
+// unsorted. wherePathSatisfiesOrderBy walks the loops outermost first and stops
+// at the first that is not order-distinct, so a GROUP BY column satisfied
+// neither by an equality term nor by an index of its own table can only be
+// satisfied through a run of order-distinct loops -- and that run cannot start
+// when no table could be order-distinct as the outermost loop: no one-row
+// lookup on constants, no unique index (or rowid) whose key columns are all
+// GROUP BY columns or pinned to constants. Every test errs toward "could": an
+// OR term pins every column it names, an equality between two columns pins
+// both once either is pinned, and any index holding the column disqualifies it.
+func groupJoinNeverOrdered(p *ReadOnlyPager, srcs []joinSource, scopes []tableScope, gp *groupByPlan, stmt *SelectStmt) bool {
+	if stmt == nil || len(scopes) != len(srcs) || len(stmt.From) != len(srcs) || r37cExprMayReferenceRowid(stmt.Where) {
+		return false
+	}
+	jts := make([]joinedTable, len(srcs))
+	for i, s := range srcs {
+		if s.tbl == nil || s.derived != nil || s.cteItem != nil || s.vtabItem != nil || s.tbl.withoutRowid || p.forDB(s.dbIdx) == nil {
+			return false
+		}
+		jts[i] = joinedTable{tbl: s.tbl}
+	}
+	terms := whereSplitAnd(stmt.Where)
+	for _, it := range stmt.From {
+		if len(it.Using) != 0 || it.Natural || r37cExprMayReferenceRowid(it.On) {
+			return false
+		}
+		terms = append(terms, whereSplitAnd(it.On)...)
+	}
+	type tc struct{ tab, col int }
+	local := func(e Expr) (tc, bool) {
+		e, _, _ = whereSkipCollateAndLikely(e)
+		tab, col, ok := wherePlanColumnRef(jts, scopes, e)
+		return tc{tab, col}, ok
+	}
+	// each calls f on every column of this FROM clause that e names.
+	each := func(e Expr, f func(tc)) {
+		var walk func(Expr)
+		walk = func(x Expr) {
+			if x == nil {
+				return
+			}
+			if _, ok := x.(ColumnExpr); ok {
+				if k, ok := local(x); ok {
+					f(k)
+				}
+				return
+			}
+			wherePlanWalkChildren(x, walk)
+		}
+		walk(e)
+	}
+	hasLocal := func(e Expr) bool {
+		found := false
+		each(e, func(tc) { found = true })
+		return found
+	}
+	eq, pinned := map[tc]bool{}, map[tc]bool{}
+	var links [][2]tc
+	for _, t := range terms {
+		inner, _, _ := whereSkipCollateAndLikely(t)
+		var l, r Expr
+		switch x := inner.(type) {
+		case BinaryExpr:
+			switch {
+			case x.Op == "=" || x.Op == "==" || equalFoldName(x.Op, "IS"):
+				l, r = x.L, x.R
+			case equalFoldName(x.Op, "OR"):
+				each(x, func(k tc) { eq[k], pinned[k] = true, true })
+			}
+		case IsNullExpr:
+			if k, ok := local(x.X); ok && !x.Not {
+				eq[k], pinned[k] = true, true
+			}
+		case InExpr:
+			if !x.Not && x.Sub == nil && len(x.List) == 1 {
+				l, r = x.X, x.List[0]
+			}
+		}
+		if l == nil {
+			continue
+		}
+		lk, lok := local(l)
+		rk, rok := local(r)
+		if lok {
+			eq[lk] = true
+			if !hasLocal(r) {
+				pinned[lk] = true
+			}
+		}
+		if rok {
+			eq[rk] = true
+			if !hasLocal(l) {
+				pinned[rk] = true
+			}
+		}
+		if lok && rok {
+			links = append(links, [2]tc{lk, rk})
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for _, lk := range links {
+			if pinned[lk[0]] != pinned[lk[1]] {
+				pinned[lk[0]], pinned[lk[1]], changed = true, true, true
+			}
+		}
+	}
+	groupCols := map[tc]bool{}
+	for _, ge := range gp.groupExprs {
+		if k, ok := local(ge); ok {
+			groupCols[k] = true
+		}
+	}
+	indexes := make([][]whereIndexInfo, len(srcs))
+	for i, s := range srcs {
+		idxs, _, ok := wherePlanIndexList(p.forDB(s.dbIdx), s.tbl, s.tbl.name, "", false, nil)
+		if !ok {
+			return false
+		}
+		indexes[i] = idxs
+	}
+	for i := range srcs {
+		if rowid := (tc{i, -1}); pinned[rowid] || groupCols[rowid] {
+			return false
+		}
+		for _, ix := range indexes[i] {
+			if ix.ipk || !ix.onError {
+				continue
+			}
+			all := true
+			for _, c := range ix.aiColumn[:ix.nKeyCol] {
+				if k := (tc{i, c}); c < 0 || !pinned[k] && !groupCols[k] {
+					all = false
+					break
+				}
+			}
+			if all {
+				return false
+			}
+		}
+	}
+	for k := range groupCols {
+		if k.col < 0 || eq[k] {
+			continue
+		}
+		inIndex := false
+		for _, ix := range indexes[k.tab] {
+			if !ix.ipk && slices.Contains(ix.aiColumn, k.col) {
+				inIndex = true
+			}
+		}
+		if !inIndex {
 			return true
 		}
 	}
