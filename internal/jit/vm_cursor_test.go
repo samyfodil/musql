@@ -56,10 +56,19 @@ func TestVCursorLayout(t *testing.T) {
 		{"Rowids", unsafe.Offsetof(c.Rowids), VCursorOffRids},
 		{"Reopen", unsafe.Offsetof(c.Reopen), VCursorOffReop},
 		{"State", unsafe.Offsetof(c.State), VCursorOffState},
+		{"Seg", unsafe.Offsetof(c.Seg), VCursorOffSeg},
 	} {
 		if f.got != f.want {
 			t.Errorf("VCursor %s is %d, generated code uses %d", f.name, f.got, f.want)
 		}
+	}
+	var sg VSeg
+	var sc VSegCol
+	if unsafe.Offsetof(sg.Cols) != VSegOffCols || unsafe.Offsetof(sg.First) != VSegOffFirst || unsafe.Offsetof(sg.Dense) != VSegOffDense ||
+		unsafe.Offsetof(sg.Rowids) != VSegOffRowids || unsafe.Sizeof(sc) != VSegColSize || unsafe.Offsetof(sc.Kind) != VSegColOffKind ||
+		unsafe.Offsetof(sc.Block) != VSegColOffBlock || unsafe.Offsetof(sc.Nulls) != VSegColOffNulls ||
+		unsafe.Offsetof(sc.Exc) != VSegColOffExc || unsafe.Offsetof(sc.Heap) != VSegColOffHeap {
+		t.Fatalf("VSeg or VSegCol is laid out differently from what generated code uses")
 	}
 	var v tvalue
 	if unsafe.Sizeof(v) != 48 || unsafe.Offsetof(v.I) != 8 || unsafe.Offsetof(v.F) != 16 || unsafe.Offsetof(v.S) != 24 {
@@ -73,7 +82,7 @@ func TestVCursorLayout(t *testing.T) {
 // runVMCursor runs prog over one cursor and returns where native code stopped.
 func runVMCursor(t *testing.T, prog []VInsn, regs []tvalue, rows [][]tvalue, cur *VCursor, pc int) int {
 	t.Helper()
-	lay := ValueLayout{Size: 48, OffTyp: 0, OffI: 8, OffF: 16, OffS: 24, TypNull: tvNull, TypInt: tvInt}
+	lay := ValueLayout{Size: 48, OffTyp: 0, OffI: 8, OffF: 16, OffS: 24, TypNull: tvNull, TypInt: tvInt, TypFloat: tvReal, TypText: tvText}
 	b, err := EmitVM(prog, len(regs), lay)
 	if err != nil {
 		t.Fatalf("EmitVM: %v", err)
