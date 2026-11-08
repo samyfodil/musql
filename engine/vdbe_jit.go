@@ -1205,6 +1205,21 @@ func jitCursorOK(cur *vdbeCursor) bool {
 		cur.streamErrPending == nil && len(cur.rows) >= len(cur.rowids)
 }
 
+// rewindsInVDBE reports whether in, where an entry starts, is an OP_Rewind
+// native code would only exit at: VRewind rewinds a cursor walking its own
+// row list (jitCursorOK, with the Rewind flag enter sets) or one it reopens,
+// and no other.
+func (jx *vmJIT) rewindsInVDBE(m *vdbe, in *Instruction) bool {
+	if in.Op != OpRewind || in.P1 < 0 || in.P1 >= len(m.cursors) {
+		return false
+	}
+	if in.P1 < len(jx.reopen) && jx.reopen[in.P1].ds != nil {
+		return false
+	}
+	cur := m.cursors[in.P1]
+	return cur == nil || !jitCursorOK(cur) || cur.seekReseek || cur.rowStore != nil || cur.refillEach
+}
+
 // jitCursorMask is the columns native code may read from cur's row list:
 // those where rows[pos] holds what OpColumn reads, now and after any advance.
 //

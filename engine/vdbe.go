@@ -1455,6 +1455,13 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				op = &insns[pc]
 				goto dispatch
 			}
+			// Nor one starting at an OP_Rewind native code cannot make: only a
+			// cursor walking its own row list rewinds natively (VRewind), and
+			// a seek's or a reopened one rewinds in the VDBE either way.
+			if jx.rewindsInVDBE(m, &insns[pc]) {
+				op = &insns[pc]
+				goto dispatch
+			}
 			// Nor one that would copy a row out for too little native work.
 			if jx.light != nil && jx.light[pc] >= 0 && jx.copies(m, pc) > int(jx.light[pc]) {
 				op = &insns[pc]
