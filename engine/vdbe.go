@@ -1335,6 +1335,12 @@ func cursorColumnMasks(insns []Instruction, ncursors int) []columnMask {
 			if h, ok := in.P4.(*sortedSeekHint); ok && in.P1 >= 0 && in.P1 < ncursors {
 				masks[in.P1] |= 1 << uint(min(h.col, 63))
 			}
+		case OpSeekIndexHint:
+			// A seek's rows are sorted into its index's order, by its key's
+			// columns, when they are built (autoIndexOrderCursor).
+			if h, ok := in.P4.(*indexSeekHint); ok && h.order != nil && !keyCols(in.P1, h.order) {
+				return nil
+			}
 		case OpMultiOrTag, OpMultiOrSort:
 			return nil
 		}
