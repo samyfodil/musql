@@ -44,3 +44,7 @@ const VMSegCursor = true
 // VMTextOrder reports whether VTextCmpJump and VTextCmpSet take an ordered
 // condition, and a numeric affinity's whole-number test (Imm 1).
 const VMTextOrder = true
+
+// VMRealInts reports whether VFAdd, VFSub and VFMul over two INTEGERs run the
+// INTEGER arm rather than exit.
+const VMRealInts = true

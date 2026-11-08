@@ -110,16 +110,24 @@ func (e *vmEmitArm) realInsn(pc int, in VInsn) (bool, error) {
 		a.FmovToD(0, X9)
 		e.storeFloat(pc, VInsn{}, in.A, 0)
 	case VFAdd, VFSub, VFMul, VFDiv:
-		// At least one operand must be a REAL: two INTEGERs are the INTEGER
-		// arm's, which overflows into a REAL only where it must.
+		// Two INTEGERs are vm_real_amd64.go's: the INTEGER arm, here for an
+		// add, subtract or multiply, a divide exiting.
 		useFlag := !e.know.isFloat[in.A] && !e.know.isFloat[in.B]
 		if useFlag {
 			a.MovImm16(X13, 0)
 		}
 		e.fload(pc, in.B, 0, true, X13, useFlag)
 		e.fload(pc, in.A, 1, true, X13, useFlag)
+		ints := useFlag && in.Op != VFDiv && !in.Dead
+		intArm, join := "", ""
 		if useFlag {
-			a.Cbz(X13, e.stub(pc))
+			if ints {
+				intArm, join = e.vmLabel("fi"), e.vmLabel("fj")
+				e.destNoS(pc, in.C) // for both arms
+				a.Cbz(X13, intArm)
+			} else {
+				a.Cbz(X13, e.stub(pc))
+			}
 		}
 		switch in.Op {
 		case VFAdd:
@@ -136,6 +144,36 @@ func (e *vmEmitArm) realInsn(pc int, in VInsn) (bool, error) {
 		a.Fcmp(0, 0)
 		a.BcondRaw(armVS, e.stub(pc)) // NaN: NULL
 		e.storeFloat(pc, in, in.C, 0)
+		if ints {
+			L := e.lay
+			a.B(join)
+			a.Label(intArm)
+			e.ldr(X9, in.B, L.OffI)
+			e.ldr(X10, in.A, L.OffI)
+			switch in.Op {
+			case VFAdd:
+				a.AddsReg(X9, X9, X10)
+				a.BcondRaw(armVS, e.stub(pc))
+			case VFSub:
+				a.SubsReg(X9, X9, X10)
+				a.BcondRaw(armVS, e.stub(pc))
+			default:
+				a.Smulh(X12, X9, X10)
+				a.Mul(X9, X9, X10)
+				a.CmpAsr63(X12, X9)
+				a.Bcond(CondNE, e.stub(pc))
+			}
+			a.MovImm16(X12, uint16(L.TypInt))
+			e.str(X12, in.C, 0)
+			e.str(X9, in.C, L.OffI)
+			e.str(xzr, in.C, L.OffF)
+			for k := range 3 {
+				e.str(xzr, in.C, L.OffS+8*k)
+			}
+			a.Label(join)
+			e.unmap(in.C)
+			e.know.wroteAny(in.C, true)
+		}
 	case VFCmpJump, VFCmpSet, VFCmpBr:
 		e.fcmpLoad(pc, in.B, 0)
 		e.fcmpLoad(pc, in.A, 1)

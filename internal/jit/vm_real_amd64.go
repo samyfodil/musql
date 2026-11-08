@@ -91,8 +91,9 @@ func (e *vmEmit) realInsn(pc int, in VInsn) (bool, error) {
 		a.MovqXR(X0, RAX)
 		e.storeFloat(pc, VInsn{}, in.A, X0)
 	case VFAdd, VFSub, VFMul, VFDiv:
-		// At least one operand must be a REAL: two INTEGERs are the INTEGER
-		// arm's, which overflows into a REAL only where it must.
+		// Two INTEGERs are the INTEGER arm's, which overflows into a REAL only
+		// where it must: an add, subtract or multiply of two runs that arm
+		// here, exiting on overflow; a divide exits.
 		flag := Reg(0)
 		if !e.know.isFloat[in.A] && !e.know.isFloat[in.B] {
 			flag = RCX
@@ -100,9 +101,19 @@ func (e *vmEmit) realInsn(pc int, in VInsn) (bool, error) {
 		}
 		e.fload(pc, in.B, X0, true, flag)
 		e.fload(pc, in.A, X1, true, flag)
+		ints := flag != 0 && in.Op != VFDiv && !in.Dead
+		intArm, join := "", ""
+		if ints {
+			e.destNoS(pc, in.C) // for both arms, ahead of the test: it sets the flags
+		}
 		if flag != 0 {
 			a.TestRegReg(RCX, RCX)
-			e.jccStub(CondE, pc)
+			if ints {
+				intArm, join = e.vmLabel("fi"), e.vmLabel("fj")
+				a.Jcc(CondE, intArm)
+			} else {
+				e.jccStub(CondE, pc)
+			}
 		}
 		switch in.Op {
 		case VFAdd:
@@ -120,6 +131,31 @@ func (e *vmEmit) realInsn(pc int, in VInsn) (bool, error) {
 		a.Ucomisd(X0, X0)
 		e.jccStub(ccP, pc) // NaN: NULL
 		e.storeFloat(pc, in, in.C, X0)
+		if ints {
+			L := e.lay
+			a.Jmp(join)
+			a.Label(intArm)
+			a.MovRegMemD(RAX, RSI, e.d(in.B, L.OffI))
+			a.MovRegMemD(RDX, RSI, e.d(in.A, L.OffI))
+			switch in.Op {
+			case VFAdd:
+				a.AddRegReg(RAX, RDX)
+			case VFSub:
+				a.SubRegReg(RAX, RDX)
+			default:
+				a.ImulRegReg(RAX, RDX)
+			}
+			e.jccStub(condOverflow, pc)
+			a.MovMemDImm(RSI, e.d(in.C, 0), int32(L.TypInt))
+			a.MovMemDReg(RSI, e.d(in.C, L.OffI), RAX)
+			a.MovMemDImm(RSI, e.d(in.C, L.OffF), 0)
+			for k := range 3 {
+				a.MovMemDImm(RSI, e.d(in.C, L.OffS+8*k), 0)
+			}
+			a.Label(join)
+			e.unmap(in.C)
+			e.know.wroteAny(in.C, true)
+		}
 	case VFCmpJump, VFCmpSet, VFCmpBr:
 		e.fcmpLoad(pc, in.B, X0)
 		e.fcmpLoad(pc, in.A, X1)
