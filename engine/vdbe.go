@@ -30,6 +30,16 @@ type vdbe struct {
 	// (syncIdxSeek), which the run returns.
 	jitErr error
 
+	// jLive is the cursors native code holds, handed over. jDefer is set
+	// when it stopped at an instruction that touches no cursor and resumes
+	// at jDeferPC of jDeferJX: taking them back waits for that entry, which
+	// keeps them as they are (vmJIT.enter), or for anything else, which takes
+	// them back first (flushJIT).
+	jLive    []int
+	jDefer   bool
+	jDeferPC int
+	jDeferJX *vmJIT
+
 	regs []Value
 	jx   *vmJIT        // native code for the program run() is given, when it has some
 	jcur []jit.VCursor // native code's view of the cursors it names, filled at each entry
@@ -1439,6 +1449,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 		code = jx.marked
 	}
 	jitSkip := -1
+	m.jDefer, m.jLive = false, m.jLive[:0]
 	if jitScore {
 		native := 0
 		if jx != nil {
@@ -1456,24 +1467,33 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 		case OpJIT:
 			if pc == jitSkip {
 				jitSkip = -1
+				if m.flushJIT() {
+					return nil, m.takeJITErr()
+				}
 				op = &insns[pc]
 				goto dispatch
 			}
+			// Native code that stopped at an instruction touching no cursor
+			// resumes here holding them, whatever would decline the entry.
+			resume := m.jDefer && m.jDeferJX == jx && m.jDeferPC == pc
+			if !resume && m.jDefer && m.flushJIT() {
+				return nil, m.takeJITErr()
+			}
 			// An entry whose first cursor native code could not use would only
 			// pay for the call and exit at that instruction.
-			if g := jx.gate[pc]; g >= 0 && (int(g) >= len(m.cursors) || m.cursors[g] == nil) {
+			if g := jx.gate[pc]; !resume && g >= 0 && (int(g) >= len(m.cursors) || m.cursors[g] == nil) {
 				op = &insns[pc]
 				goto dispatch
 			}
 			// Nor one starting at an OP_Rewind native code cannot make: only a
 			// cursor walking its own row list rewinds natively (VRewind), and
 			// a seek's or a reopened one rewinds in the VDBE either way.
-			if jx.rewindsInVDBE(m, &insns[pc]) {
+			if !resume && jx.rewindsInVDBE(m, &insns[pc]) {
 				op = &insns[pc]
 				goto dispatch
 			}
 			// Nor one that would copy a row out for too little native work.
-			if jx.light != nil && jx.light[pc] >= 0 && jx.copies(m, pc) > int(jx.light[pc]) {
+			if !resume && jx.light != nil && jx.light[pc] >= 0 && jx.copies(m, pc) > int(jx.light[pc]) {
 				op = &insns[pc]
 				goto dispatch
 			}
@@ -3895,4 +3915,27 @@ func (m *vdbe) execAutoIndexOrder(op *Instruction) error {
 	cur.idxListOnce = false
 	autoIndexOrderCursor(cur, key, m.encoding())
 	return nil
+}
+
+// flushJIT takes back the cursors native code still holds from a stop at an
+// instruction touching none (vdbe.jDefer). It reports whether that left an
+// error (takeJITErr).
+func (m *vdbe) flushJIT() bool {
+	if !m.jDefer {
+		return false
+	}
+	jx, exit := m.jDeferJX, m.jDeferPC
+	m.jDefer = false
+	for _, c := range m.jLive {
+		jx.syncCursor(m, c, exit)
+	}
+	m.jLive = m.jLive[:0]
+	return m.jitErr != nil
+}
+
+// takeJITErr returns the error native code's return left, clearing it.
+func (m *vdbe) takeJITErr() error {
+	err := m.jitErr
+	m.jitErr = nil
+	return err
 }

@@ -86,6 +86,11 @@ type vmJIT struct {
 	// tabs is, per cursor number, the table tabFor last worked out for it.
 	tabs []atomic.Pointer[vmTab]
 
+	// safeExit is, per pc, the entry native code that stops there resumes at
+	// keeping its cursors (vdbe.jDefer), or -1: the VDBE reaches that entry
+	// running instructions that touch none and jump nowhere.
+	safeExit []int32
+
 	// idxSpecs is, per cursor number, the index seek native code makes
 	// (lowerIdxSeeks), and idxs the index idxFor last worked out for it.
 	idxSpecs []*idxSeekSpec
@@ -423,6 +428,20 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	}
 	if idxSpecs != nil {
 		jx.idxs = make([]atomic.Pointer[vmIdx], len(idxSpecs))
+	}
+	jx.safeExit = make([]int32, len(prog.Insns))
+	for pc := range prog.Insns {
+		jx.safeExit[pc] = -1
+		if !cursorFreeOp(&prog.Insns[pc]) {
+			continue
+		}
+		q := pc + 1
+		for q < len(prog.Insns) && !entry[q] && cursorFreeOp(&prog.Insns[q]) {
+			q++
+		}
+		if q < len(prog.Insns) && entry[q] {
+			jx.safeExit[pc] = int32(q)
+		}
 	}
 	if slices.ContainsFunc(vp, func(in jit.VInsn) bool { return in.Op == jit.VOpen || in.Op == jit.VClose }) {
 		jx.reopen = reopen
@@ -1882,7 +1901,12 @@ func jitReadColumn(cur *vdbeCursor, i int, dst *Value) bool {
 func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 	regs := m.regs
 	if cap(regs) < jx.nReg || jx.nReg == 0 {
+		m.flushJIT()
 		return pc, -1
+	}
+	resume := m.jDefer && m.jDeferJX == jx && m.jDeferPC == pc
+	if !resume && m.jDefer {
+		m.flushJIT()
 	}
 	args := &m.jargs
 	if jx.params > 0 {
@@ -1952,15 +1976,30 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 			m.jcur = make([]jit.VCursor, jx.nCurs)
 			m.jsnap = make([]jitSnap, jx.nCurs)
 		}
+		if !resume {
+			m.jLive = m.jLive[:0]
+		}
 		for _, c := range curs {
+			if resume && slices.Contains(m.jLive, c) {
+				continue // as native code left it
+			}
 			jx.handCursor(m, pc, c)
+			m.jLive = append(m.jLive, c)
 		}
 		args.Cur = &m.jcur[0]
 	}
+	m.jDefer = false
 	jx.code.Call2(args)
 	if jx.nCurs > 0 {
-		for _, c := range curs {
-			jx.syncCursor(m, c, int(args.PC))
+		// Stopped at an instruction that touches no cursor, which the VDBE
+		// runs before it enters again at the next: native code keeps them.
+		if exit := int(args.PC); args.Yield == 0 && exit >= 0 && exit < len(jx.safeExit) && jx.safeExit[exit] >= 0 {
+			m.jDefer, m.jDeferPC, m.jDeferJX = true, int(jx.safeExit[exit]), jx
+		} else {
+			for _, c := range m.jLive {
+				jx.syncCursor(m, c, exit)
+			}
+			m.jLive = m.jLive[:0]
 		}
 	}
 	if args.Yield > 0 {
@@ -2163,4 +2202,23 @@ func (jx *vmJIT) syncCursor(m *vdbe, c, exit int) {
 			cur.rowRaw = nil
 		}
 	}
+}
+
+// cursorFreeOp reports whether the VDBE's run of in reads or moves no cursor:
+// it reads and writes registers only, so native code may keep its cursors
+// across it.
+func cursorFreeOp(in *Instruction) bool {
+	switch in.Op {
+	case OpMakeRecord, OpConcat, OpSCopy, OpCopy, OpInteger, OpInt64, OpReal, OpString8, OpNull, OpClearSubtype, OpLike, OpGlob,
+		OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight, OpBitNot, OpNegative:
+		return true
+	case OpFunction:
+		switch name, _ := in.P4.(string); name {
+		case "date", "time", "datetime", "julianday", "unixepoch", "strftime", "printf", "format",
+			"upper", "lower", "length", "abs", "round", "substr", "substring", "replace", "trim", "ltrim", "rtrim",
+			"instr", "hex", "typeof", "coalesce", "ifnull", "nullif", "concat", "concat_ws":
+			return true
+		}
+	}
+	return false
 }
