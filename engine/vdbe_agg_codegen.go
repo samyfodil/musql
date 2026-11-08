@@ -3953,6 +3953,19 @@ func groupByNeededCols(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 		return nil
 	}
 	ok := true
+	// A select-list alias an ORDER BY or HAVING names is that item, whose
+	// columns the select list's own walk marks.
+	alias := func(x ColumnExpr) bool {
+		if x.Qualifier != "" || x.Schema != "" {
+			return false
+		}
+		for _, sc := range stmt.Columns {
+			if sc.HasAlias && equalFoldName(sc.Alias, x.Name) {
+				return true
+			}
+		}
+		return false
+	}
 	var walk func(e Expr)
 	walk = func(e Expr) {
 		if !ok || e == nil {
@@ -3962,6 +3975,9 @@ func groupByNeededCols(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 		case ColumnExpr:
 			if slot := d.slotFor(c, x); slot >= 0 {
 				d.need[slot] = true
+				return
+			}
+			if alias(x) {
 				return
 			}
 			slots := d.coalesceSlots(c, x)
