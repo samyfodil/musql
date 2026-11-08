@@ -67,6 +67,9 @@ type vmJIT struct {
 	// compare converted, which VTextCmpJump leaves to the VDBE
 	// (ProgArgs.UTF16), and that no bytes are checked yet (TextPtr).
 	text bool
+	// like is whether it has a VLike, which reads case_sensitive_like
+	// (ProgArgs.LikeCS).
+	like bool
 
 	// seekCols is every column the native code reads of each cursor: what a
 	// seek's rows are copied out with (seekSnap).
@@ -380,6 +383,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	if slices.ContainsFunc(vp, func(in jit.VInsn) bool { return in.Op == jit.VOpen || in.Op == jit.VClose }) {
 		jx.reopen = reopen
 	}
+	jx.like = slices.ContainsFunc(vp, func(in jit.VInsn) bool { return in.Op == jit.VLike })
 	jx.text = slices.ContainsFunc(vp, func(in jit.VInsn) bool {
 		return in.Op == jit.VTextCmpJump || in.Op == jit.VTextCmpSet || in.Op == jit.VSubstr
 	})
@@ -1752,6 +1756,12 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 		args.UTF16, args.TextPtr = 0, 0
 		if isUTF16(m.encoding()) {
 			args.UTF16 = 1
+		}
+	}
+	if jx.like {
+		args.LikeCS = 0
+		if m.likeCaseSensitive() {
+			args.LikeCS = 1
 		}
 	}
 	args.RowBuf, args.RowCap, args.RowUsed, args.RowsBuf, args.RowsCap, args.Yield = nil, -1, 0, nil, 0, 0
