@@ -49,7 +49,7 @@ func vmTextLowering(prog *Program, storesText func(root uint32, col int) bool) (
 			}
 			// The constant's bytes, as OpString8 shares them; "" keeps the
 			// VDBE's non-nil empty slice.
-			if str, _ := ins.P4.(string); str != "" && len(str) < 1<<31 && in(ins.P2) {
+			if str, _ := ins.P4.(string); str != "" && int64(len(str)) < 1<<31 && in(ins.P2) {
 				if ok == nil {
 					out, ok = make([]jit.VInsn, n), make([]bool, n)
 				}
