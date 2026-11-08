@@ -93,3 +93,53 @@ func likeRef(pat, text string) bool {
 	}
 	return text != "" && bytes.EqualFold([]byte{pat[0]}, []byte{text[0]}) && likeRef(pat[1:], text[1:])
 }
+
+// TestVMInSub probes sets of INTEGERs, IN and NOT IN: present, absent, an
+// empty set (any probe), a set holding a NULL (a miss exits), a set not
+// ready and a probe that is not an INTEGER (both exit).
+func TestVMInSub(t *testing.T) {
+	if !Available || !VMTextOrder {
+		t.Skip("no native IN subquery on this platform")
+	}
+	noGC(t)
+	keys := []int64{-9, -1, 0, 3, 4, 10, 1 << 40}
+	sets := []VInSubSet{
+		{Keys: unsafe.Pointer(&keys[0]), N: int64(len(keys)), Ready: 1},
+		{Empty: 1, Ready: 1},
+		{Keys: unsafe.Pointer(&keys[0]), N: int64(len(keys)), HasNull: 1, Ready: 1},
+		{Keys: unsafe.Pointer(&keys[0]), N: int64(len(keys))},
+	}
+	in := map[int64]bool{}
+	for _, k := range keys {
+		in[k] = true
+	}
+	for b := range sets {
+		for _, not := range []int64{0, 1} {
+			prog := []VInsn{{Op: VInSub, A: 0, B: b, C: 1, Imm: not}, {Op: VExit}}
+			for _, x := range []int64{-10, -9, -2, -1, 0, 1, 3, 4, 5, 10, 11, 1 << 40, 1<<40 + 1} {
+				regs := []tvalue{{Typ: tvInt, I: x}, {Typ: tvInt, I: 99}}
+				args := &ProgArgs{InSets: &sets[0]}
+				pc := runVMCursorArgs(t, prog, regs, nil, &VCursor{}, args)
+				found := in[x] && sets[b].Empty == 0
+				exits := sets[b].Ready == 0 || !found && sets[b].HasNull != 0 && sets[b].Empty == 0
+				if exits {
+					if pc != 0 || regs[1].I != 99 {
+						t.Fatalf("set %d x %d: pc %d r1 %+v, want an exit", b, x, pc, regs[1])
+					}
+					continue
+				}
+				want := int64(0)
+				if found != (not == 1) {
+					want = 1
+				}
+				if pc != 1 || regs[1].Typ != tvInt || regs[1].I != want {
+					t.Fatalf("set %d x %d not %d: pc %d r1 %+v, want %d", b, x, not, pc, regs[1], want)
+				}
+			}
+		}
+	}
+	regs := []tvalue{{Typ: tvText, S: []byte("3")}, {Typ: tvInt, I: 99}}
+	if pc := runVMCursorArgs(t, []VInsn{{Op: VInSub, A: 0, C: 1}, {Op: VExit}}, regs, nil, &VCursor{}, &ProgArgs{InSets: &sets[0]}); pc != 0 {
+		t.Fatalf("a TEXT probe ran natively to %d", pc)
+	}
+}

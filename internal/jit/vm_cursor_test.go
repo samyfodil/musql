@@ -82,6 +82,12 @@ func TestVCursorLayout(t *testing.T) {
 // runVMCursor runs prog over one cursor and returns where native code stopped.
 func runVMCursor(t *testing.T, prog []VInsn, regs []tvalue, rows [][]tvalue, cur *VCursor, pc int) int {
 	t.Helper()
+	return runVMCursorArgs(t, prog, regs, rows, cur, &ProgArgs{PC: int64(pc)})
+}
+
+// runVMCursorArgs is runVMCursor with the rest of args as the caller set them.
+func runVMCursorArgs(t *testing.T, prog []VInsn, regs []tvalue, rows [][]tvalue, cur *VCursor, args *ProgArgs) int {
+	t.Helper()
 	lay := ValueLayout{Size: 48, OffTyp: 0, OffI: 8, OffF: 16, OffS: 24, TypNull: tvNull, TypInt: tvInt, TypFloat: tvReal, TypText: tvText}
 	b, err := EmitVM(prog, len(regs), lay)
 	if err != nil {
@@ -92,8 +98,8 @@ func runVMCursor(t *testing.T, prog []VInsn, regs []tvalue, rows [][]tvalue, cur
 		t.Fatalf("Map: %v", err)
 	}
 	defer code.Close()
-	args := ProgArgs{Regs: (*int64)(unsafe.Pointer(&regs[0])), PC: int64(pc), Cur: cur}
-	code.Call2(&args)
+	args.Regs, args.Cur = (*int64)(unsafe.Pointer(&regs[0])), cur
+	code.Call2(args)
 	return int(args.PC)
 }
 
