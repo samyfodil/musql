@@ -2105,7 +2105,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				}
 				if h.slot == 0 {
 					cur.idxSeekConfigured, cur.idxSeekMore, cur.idxSeekNext, cur.idxSeekSet = false, cur.idxSeekMore[:0], 0, nil
-					cur.idxSeekOrder = h.order
+					cur.idxSeekOrder, cur.idxListOnce, cur.idxListReady = h.order, false, false
 				}
 				// A slot out of step is dropped, as is the key of "x IS NULL" (no
 				// posting list holds NULL) and a write's TEXT key in a UTF-16
@@ -2162,10 +2162,24 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			// permutation below is the one every later rewind re-iterates.
 			cur.params = m.params // see vdbeCursor.params
 			cur.unsort()
+			key := op.P4.(*autoIndexKey)
+			// An index seek's rows are positioned in the key's order instead,
+			// when the segments serve it (idxListOnce): the seek keeps its
+			// probe, so every rewind finds the same rows in the same order.
+			once := cur.idxSeekConfigured && !cur.seekConfigured && !cur.seekSetConfigured && !cur.materialized &&
+				key.multiOr == nil && cur.idxSeekOrder == nil
+			if once {
+				cur.idxSeekOrder, cur.idxListOnce = key, true
+			}
 			if rerr := cur.rewind(); rerr != nil {
 				return nil, rerr
 			}
-			autoIndexOrderCursor(cur, op.P4.(*autoIndexKey), m.encoding())
+			if once && cur.segSrc != nil && cur.segSrc.list {
+				cur.idxListReady = true
+				break
+			}
+			cur.idxListOnce = false
+			autoIndexOrderCursor(cur, key, m.encoding())
 
 		case OpSortedSeek:
 			cur := m.cursors[op.P1]
