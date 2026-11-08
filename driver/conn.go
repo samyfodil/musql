@@ -182,8 +182,8 @@ type Conn struct {
 	// four questions is answered by its own parse, so without this a bulk
 	// INSERT re-parsed its statement four times per row just to be told "no"
 	// each time. Keyed by text because that is what the answers depend on;
-	// bounded because a connection issues finitely many DISTINCT statements
-	// (database/sql prepares and reuses them). See plainDML.
+	// capped at maxPlainStmts because unprepared calls can issue arbitrarily
+	// many distinct statement texts. See plainDML.
 	plainStmts map[string]bool
 	// lastPlainText/lastPlain are plainDML's answer for the statement asked
 	// about last: a prepared statement run in a loop asks five times a call,
@@ -2985,6 +2985,10 @@ func (t *Tx) rollbackImpl() error {
 	return t.conn.discardSession(db)
 }
 
+// maxPlainStmts bounds the classification cache per connection; past it the
+// cache starts over, as paramInfoOf and boostStmt do for their caches.
+const maxPlainStmts = 256
+
 // plainDML reports whether sqlText is ordinary DML: not ATTACH/DETACH, not
 // transaction control, not a PRAGMA, not RETURNING, so execArgs can skip those
 // four parses. Cached per statement text (Conn.plainStmts). Anything not cheaply
@@ -2997,7 +3001,7 @@ func (c *Conn) plainDML(sqlText string) bool {
 	plain, ok := c.plainStmts[sqlText]
 	if !ok {
 		plain = isPlainDMLText(sqlText)
-		if c.plainStmts == nil {
+		if c.plainStmts == nil || len(c.plainStmts) >= maxPlainStmts {
 			c.plainStmts = make(map[string]bool)
 		}
 		c.plainStmts[sqlText] = plain
