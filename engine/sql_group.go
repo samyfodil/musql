@@ -2496,6 +2496,15 @@ func stmtReadsAnchorRow(stmt *SelectStmt, groupExprs []Expr, scopes []tableScope
 		if e == nil || found {
 			return
 		}
+		// A GROUP BY expression written out again reads the group's key, as
+		// rewriteGroupExpr substitutes it.
+		if _, col := e.(ColumnExpr); !col {
+			for _, ge := range groupExprs {
+				if exprEqual(e, ge) {
+					return
+				}
+			}
+		}
 		switch x := e.(type) {
 		case ColumnExpr:
 			if !isKey(x) && !keywordLiteralNotInScope(x, scopes) {
