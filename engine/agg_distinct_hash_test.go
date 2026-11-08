@@ -67,12 +67,13 @@ func TestAggDistinctSeenProbesItsBucket(t *testing.T) {
 	}
 	// A different value chained into x's bucket must not match x.
 	h := aggDistinctHash(Value{Typ: Text, S: []byte("x")}, "", UTF8)
-	it.seen = append(it.seen, Value{Typ: Text, S: []byte("y")})
-	it.seenNext = append(it.seenNext, it.seenHead.swap(h, len(it.seen)))
+	d := it.distState()
+	d.seen = append(d.seen, Value{Typ: Text, S: []byte("y")})
+	d.next = append(d.next, d.head.swap(h, len(d.seen)))
 	if _, dup := it.distinctSeen(Value{Typ: Text, S: []byte("x")}, "", UTF8); dup {
 		t.Fatal("a different value in the same bucket reported as seen")
 	}
-	if len(it.seen) != 6 {
-		t.Fatalf("seen has %d values, want 6", len(it.seen))
+	if len(it.dist.seen) != 6 {
+		t.Fatalf("seen has %d values, want 6", len(it.dist.seen))
 	}
 }
