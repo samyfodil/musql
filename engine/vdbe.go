@@ -8,6 +8,7 @@ package engine
 
 import (
 	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
 	"math"
@@ -711,47 +712,49 @@ func autoIndexOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) 
 	for i := range perm {
 		perm[i] = i
 	}
-	// Every key value an integer -- an INTEGER column's, and the rowid --
-	// compares as one, under any collating sequence: the keys are copied out
-	// flat once and compared as int64s, not fetched as Values per comparison.
+	// An integer -- an INTEGER column's, and the rowid -- compares as one under
+	// any collating sequence: the leading key columns every row holds as an
+	// INTEGER are copied out flat once and compared as int64s, and only rows
+	// they leave tied fetch the rest as Values.
 	nk := len(key.cols)
-	flat := make([]int64, 0, len(perm)*nk)
-	for i := range perm {
-		for k := range key.cols {
-			v := at(i, k)
-			if v.Typ != Int {
-				flat = nil
-				break
-			}
-			flat = append(flat, v.I)
-		}
-		if flat == nil {
-			break
-		}
+	lead := 0
+	for lead < nk && !slices.ContainsFunc(perm, func(i int) bool { return at(i, lead).Typ != Int }) {
+		lead++
 	}
-	// Stable by the last comparison, on the rows' original positions, which
-	// makes the order total: an unstable sort then gives exactly the stable
-	// one's permutation, in O(n log n) where sort.SliceStable's in-place
-	// merges took most of a 100,000-row scan's time.
-	if flat != nil {
+	if lead == 0 {
+		autoIndexSortValues(perm, key, at, enc)
+	} else {
+		flat := make([]int64, 0, len(perm)*lead)
+		for i := range perm {
+			for k := range lead {
+				flat = append(flat, at(i, k).I)
+			}
+		}
+		desc := func(k, c int) int {
+			if k < len(key.desc) && key.desc[k] {
+				return -c // a DESC column, as autoIndexSortValues explains
+			}
+			return c
+		}
+		// Stable by the last comparison, on the rows' original positions,
+		// which makes the order total: an unstable sort then gives exactly
+		// the stable one's permutation, in O(n log n) where
+		// sort.SliceStable's in-place merges took most of a 100,000-row
+		// scan's time.
 		slices.SortFunc(perm, func(a, b int) int {
-			ka, kb := flat[a*nk:a*nk+nk], flat[b*nk:b*nk+nk]
+			ka, kb := flat[a*lead:a*lead+lead], flat[b*lead:b*lead+lead]
 			for k := range ka {
 				if ka[k] != kb[k] {
-					c := 1
-					if ka[k] < kb[k] {
-						c = -1
-					}
-					if k < len(key.desc) && key.desc[k] {
-						return -c // a DESC column, as below
-					}
-					return c
+					return desc(k, cmp.Compare(ka[k], kb[k]))
+				}
+			}
+			for k := lead; k < nk; k++ {
+				if c := compareValuesCollatedEnc(at(a, k), at(b, k), key.colls[k], enc); c != 0 {
+					return desc(k, c)
 				}
 			}
 			return a - b
 		})
-	} else {
-		autoIndexSortValues(perm, key, at, enc)
 	}
 	rows := make([][]Value, len(perm))
 	rowids := make([]uint64, len(perm))
