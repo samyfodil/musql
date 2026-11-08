@@ -94,9 +94,11 @@ func TestVMJITSeekDifferential(t *testing.T) {
 		return out, SegRowsServedForTest()
 	}
 	want, wantServed := run(false)
-	before := vmJITSeekSnaps.Load()
+	// A seek's rows in one segment are walked in place (segment mode), any
+	// other's through a copy (seekSnap).
+	before := vmJITSeekSnaps.Load() + vmJITSegWalks.Load()
 	got, gotServed := run(true)
-	snaps := vmJITSeekSnaps.Load() - before
+	snaps := vmJITSeekSnaps.Load() + vmJITSegWalks.Load() - before
 	for i := range queries {
 		if want[i] != got[i] {
 			t.Fatalf("JIT diverges on %s\nvdbe %s\njit  %s", queries[i], want[i], got[i])
