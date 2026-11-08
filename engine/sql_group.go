@@ -2511,9 +2511,24 @@ func stmtReadsAnchorRow(stmt *SelectStmt, groupExprs []Expr, scopes []tableScope
 	}
 	walk(stmt.Having)
 	for _, ot := range stmt.OrderBy {
+		// A bare name that is an output column's alias is that column, as
+		// resolveAsName decides before any table is searched; the select
+		// list above walked it already.
+		if c, ok := ot.Expr.(ColumnExpr); ok && c.Qualifier == "" && c.Schema == "" && isOutputAlias(stmt.Columns, c.Name) {
+			continue
+		}
 		walk(ot.Expr)
 	}
 	return found
+}
+
+func isOutputAlias(cols []SelectColumn, name string) bool {
+	for _, sc := range cols {
+		if sc.Alias != "" && equalFoldName(sc.Alias, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // walkSelectForAnchor applies walk to every expression of a nested SELECT --
