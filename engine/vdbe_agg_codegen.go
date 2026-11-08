@@ -1931,7 +1931,7 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 		anchorCheck: anchorChk,
 	}
 	rowFree := !gp.usesGroupBare && !gp.selectHasSubquery && !gp.anchorObservable && anchorChk == nil &&
-		!anyAggOrderBy(aggs) && !orderByMentionsSubquery(stmt.OrderBy) && !mentionsSubquery(stmt.Having)
+		!anyAggOrderBy(aggs) && !orderBySubqueryReadsRow(c.pager, stmt.OrderBy) && !subqueryReadsRow(c.pager, stmt.Having)
 	// See compileScanAggregate's identical call: this is select.c:8746/:8747's
 	// pair for the sorted GROUP BY drain -- finalizeAggFunctions, then HAVING
 	// and the select list CODED against the registers it wrote. Done here so
@@ -2553,10 +2553,10 @@ func aggItemsRowReads(plan *aggPlan) (cols []int, rowids bool) {
 	return cols, rowids
 }
 
-// orderByMentionsSubquery reports whether an ORDER BY term holds a subquery.
-func orderByMentionsSubquery(terms []OrderTerm) bool {
+// orderBySubqueryReadsRow is subqueryReadsRow over the ORDER BY's terms.
+func orderBySubqueryReadsRow(p *ReadOnlyPager, terms []OrderTerm) bool {
 	for _, ot := range terms {
-		if mentionsSubquery(ot.Expr) {
+		if subqueryReadsRow(p, ot.Expr) {
 			return true
 		}
 	}
