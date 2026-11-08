@@ -191,7 +191,7 @@ func hoistAggregatesOutward(outer *compiler, body *SelectStmt, ae *aggAssociatio
 		if perOwner[i] != target {
 			continue
 		}
-		if target.hoist.recordHoist(hoistSpec{call: m.srcCall, body: body}) {
+		if target.hoist.recordHoist(hoistSpec{call: m.call(), body: body}) {
 			recorded = true
 		}
 	}
@@ -206,7 +206,7 @@ func hoistAggregatesOutward(outer *compiler, body *SelectStmt, ae *aggAssociatio
 // hoistBox.narrowed, and the trig/regScopes refusal below.
 func hoistOwnerFor(outer *compiler, agg *aggItem) (*compiler, int) {
 	exprs := aggArgExprs(agg)
-	if len(exprs) == 0 || agg.srcCall.Name == "" {
+	if len(exprs) == 0 || agg.call().Name == "" {
 		// count(*) names nothing, so it is SQLite's -1 and never moves; an
 		// accumulator with no recorded call cannot be re-planned elsewhere.
 		return nil, -1

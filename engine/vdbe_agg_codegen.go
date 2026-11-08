@@ -526,7 +526,7 @@ func planAggArgRegs(c *compiler, plan *aggPlan, grouped bool, srcs []joinSource,
 		// RESOLVE it (resolve.c:1326-1330): "max(x ORDER BY nosuch)" is "no
 		// such column: nosuch" in 3.53.3.
 		if it.orderBy == nil && (it.kind == aggMin || it.kind == aggMax) {
-			for _, ob := range it.srcCall.orderByExprs() {
+			for _, ob := range it.call().orderByExprs() {
 				if err := validateOrderByExprResolves(c, ob); err != nil {
 					return aggArgPlan{}, err
 				}
@@ -664,7 +664,7 @@ func emitDrainStepsWithoutRow(c *compiler, plan *aggPlan, emitDrainStep func(seg
 				return fmt.Errorf("%w: a sorted GROUP BY drain over a row source whose scope and table disagree about their column count, with a per-row aggregate expression to evaluate", errVDBEUnsupported)
 			}
 		}
-		if len(it.orderBy) > 0 || len(it.srcCall.OrderBy) > 0 {
+		if len(it.orderBy) > 0 || len(it.call().OrderBy) > 0 {
 			return fmt.Errorf("%w: a sorted GROUP BY drain over a row source whose scope and table disagree about their column count, with an aggregate ORDER BY to evaluate", errVDBEUnsupported)
 		}
 	}

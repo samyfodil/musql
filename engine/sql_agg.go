@@ -183,7 +183,7 @@ type aggItem struct {
 	// srcCall is the FuncExpr this template was planned from (planAggregateCall),
 	// a PLAN-time-only field: it lets an aggregate that turns out to belong to an
 	// ENCLOSING query be re-planned there verbatim. See vdbe_agg_hoist.go.
-	srcCall FuncExpr
+	srcCall *FuncExpr
 
 	// Running state, mutated by step as rows are scanned. Only the fields
 	// relevant to kind are used.
@@ -363,11 +363,20 @@ func (it *aggItem) rowExpr(which int) Expr {
 //     select.c:8607).
 //
 // ctx is unused.
+// call is the call this template was planned from (srcCall), or none: a
+// group's clone keeps no copy.
+func (it *aggItem) call() FuncExpr {
+	if it.srcCall == nil {
+		return FuncExpr{}
+	}
+	return *it.srcCall
+}
+
 func (it *aggItem) rowValue(which int, ctx *evalCtx, regs []Value) (Value, error) {
 	if r := it.rowRegs[which]; r > 0 && r <= len(regs) {
 		return regs[r-1], nil
 	}
-	return Value{}, fmt.Errorf("engine: internal: aggregate %s per-row expression %d was never lowered into a register", it.srcCall.Name, which)
+	return Value{}, fmt.Errorf("engine: internal: aggregate %s per-row expression %d was never lowered into a register", it.call().Name, which)
 }
 
 // orderSensitive reports whether the order rows reach step can change this
@@ -685,7 +694,7 @@ func planAggregateCall(fc FuncExpr) (*aggItem, error) {
 	// turns out not to own can be re-planned against the query that does (see
 	// hoistOwnerFor, vdbe_agg_hoist.go). Nothing at run time reads it --
 	// cloneAggTemplates deliberately does not copy it.
-	it.srcCall = fc
+	it.srcCall = &fc
 	return it, nil
 }
 
@@ -950,9 +959,8 @@ func (it *aggItem) step(ctx *evalCtx, regs []Value) error {
 	if v.Typ == Null {
 		return nil
 	}
-	coll := it.argCollation(ctx)
 	if it.distinct {
-		if s, dup := it.distinctSeen(v, coll, ctx.encoding()); dup {
+		if s, dup := it.distinctSeen(v, it.argCollation(ctx), ctx.encoding()); dup {
 			// The dedup keeps the FIRST spelling of a value, so when the two
 			// are not byte-identical -- 'abc'/'ABC' under NOCASE, INTEGER 1
 			// and REAL 1.0 -- WHICH one every downstream kind then sees is an
@@ -985,7 +993,7 @@ func (it *aggItem) step(ctx *evalCtx, regs []Value) error {
 			it.best, it.haveBest = v, true
 			return nil
 		}
-		c := compareValuesCollatedEnc(v, it.best, coll, ctx.encoding())
+		c := compareValuesCollatedEnc(v, it.best, it.argCollation(ctx), ctx.encoding())
 		if (it.kind == aggMin && c < 0) || (it.kind == aggMax && c > 0) ||
 			(it.minMaxLastWins && c == 0) {
 			it.best = v
@@ -1115,9 +1123,8 @@ func (it *aggItem) magnetStep(ctx *evalCtx, regs []Value) (touched, hit bool, er
 	if err != nil {
 		return false, false, err
 	}
-	coll := it.argCollation(ctx)
 	if it.distinct {
-		if _, dup := it.distinctSeen(v, coll, ctx.encoding()); dup {
+		if _, dup := it.distinctSeen(v, it.argCollation(ctx), ctx.encoding()); dup {
 			return false, false, nil
 		}
 	}
@@ -1128,7 +1135,7 @@ func (it *aggItem) magnetStep(ctx *evalCtx, regs []Value) (touched, hit bool, er
 		it.best, it.haveBest = v, true
 		return true, false, nil
 	}
-	c := compareValuesCollatedEnc(v, it.best, coll, ctx.encoding())
+	c := compareValuesCollatedEnc(v, it.best, it.argCollation(ctx), ctx.encoding())
 	if (it.kind == aggMin && c < 0) || (it.kind == aggMax && c > 0) {
 		it.best = v
 		return true, false, nil
@@ -1696,7 +1703,7 @@ func aggArgExprs(agg *aggItem) []Expr {
 	// walks pLeft for every aggregate (expr.c:7215-7220), min()/max() included,
 	// whose aggItem.orderBy is nil. Without it "(SELECT group_concat(n.i ORDER
 	// BY m.i) FROM m)" was handed to the OUTER query for naming only n.i.
-	exprs = append(exprs, agg.srcCall.orderByExprs()...)
+	exprs = append(exprs, agg.call().orderByExprs()...)
 	return exprs
 }
 

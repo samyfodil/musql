@@ -76,7 +76,7 @@ func unstampedOperands(plan *aggPlan) []string {
 	for _, it := range aggPlanTemplates(plan) {
 		for j, ch := range []byte("FAS") {
 			if it.rowExpr(j) != nil && it.rowRegs[j] == 0 {
-				out = append(out, fmt.Sprintf("%s.%c", it.srcCall.Name, ch))
+				out = append(out, fmt.Sprintf("%s.%c", it.call().Name, ch))
 			}
 		}
 	}
