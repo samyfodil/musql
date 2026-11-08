@@ -499,6 +499,22 @@ func (e *vmEmitArm) text(pc int, in VInsn) {
 		return
 	}
 	a, L := e.a, e.lay
+	// Left as it is when r[A] already holds this TEXT, as from the last row on.
+	same, store := e.vmLabel("ts"), e.vmLabel("tw")
+	a.MovImm64(X9, in.Imm)
+	e.ldr(X10, in.A, L.OffS)
+	a.Cmp(X9, X10)
+	a.Bcond(CondNE, store)
+	e.ldrb(X10, in.A, L.OffTyp)
+	a.CmpImm(X10, uint32(L.TypText))
+	a.Bcond(CondNE, store)
+	e.ldrb(X10, in.A, L.OffTyp+1) // no subtype
+	a.Cbnz(X10, store)
+	a.MovImm64(X9, int64(in.B))
+	e.ldr(X10, in.A, L.OffS+8)
+	a.Cmp(X9, X10)
+	a.Bcond(CondE, same)
+	a.Label(store)
 	e.branchWB(pc)
 	delete(e.zeroS, in.A)
 	a.MovImm16(X9, uint16(L.TypText))
@@ -510,6 +526,7 @@ func (e *vmEmitArm) text(pc int, in VInsn) {
 	a.MovImm64(X9, int64(in.B))
 	e.str(X9, in.A, L.OffS+8)
 	e.str(X9, in.A, L.OffS+16)
+	a.Label(same)
 	e.unmap(in.A)
 	e.know.wroteAny(in.A, false)
 }

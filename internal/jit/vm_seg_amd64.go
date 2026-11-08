@@ -522,16 +522,31 @@ func (e *vmEmit) seekRewind(pc int, in VInsn) {
 	a.MovMemDImm(RAX, cb+VCursorOffState, 4)
 }
 
-// text is VText: a pointer store, so the write barrier exits.
+// text is VText: a pointer store, so the write barrier exits -- unless r[A]
+// already holds this TEXT, as it does from the last row on, which is left as
+// it is.
 func (e *vmEmit) text(pc int, in VInsn) {
 	if in.Dead {
 		e.clobber(in.A)
 		return
 	}
 	a, L := e.a, e.lay
+	dst := e.d(in.A, 0)
+	same := fmt.Sprintf("tx%d.same", pc)
+	a.MovRegImm64(RAX, in.Imm)
+	a.AluRegMemD(AluCmp, RAX, RSI, dst+int32(L.OffS))
+	store := fmt.Sprintf("tx%d.store", pc)
+	a.Jcc(CondNE, store)
+	a.CmpMemDByte(RSI, dst, L.TypText)
+	a.Jcc(CondNE, store)
+	a.CmpMemDByte(RSI, dst+1, 0) // no subtype
+	a.Jcc(CondNE, store)
+	a.MovRegImm64(RAX, int64(in.B))
+	a.AluRegMemD(AluCmp, RAX, RSI, dst+int32(L.OffS+8))
+	a.Jcc(CondE, same)
+	a.Label(store)
 	e.jccWB(pc)
 	delete(e.zeroS, in.A)
-	dst := e.d(in.A, 0)
 	a.MovMemDImm(RSI, dst, int32(L.TypText))
 	a.MovMemDImm(RSI, dst+int32(L.OffI), 0)
 	a.MovMemDImm(RSI, dst+int32(L.OffF), 0)
@@ -539,6 +554,7 @@ func (e *vmEmit) text(pc int, in VInsn) {
 	a.MovMemDReg(RSI, dst+int32(L.OffS), RAX)
 	a.MovMemDImm(RSI, dst+int32(L.OffS+8), int32(in.B))
 	a.MovMemDImm(RSI, dst+int32(L.OffS+16), int32(in.B))
+	a.Label(same)
 	e.unmap(in.A)
 	e.know.wroteAny(in.A, false)
 }
