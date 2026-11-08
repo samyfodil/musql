@@ -357,7 +357,7 @@ func findJoinSortedSeek(c *compiler, s joinSource, outer map[int]bool, eqs []Exp
 				continue
 			}
 			coll := effectiveCollation(resolveCompareCollation(c.affCtx(), be.L, be.R))
-			return side[1], &sortedSeekHint{col: col, coll: coll, aff: aff}
+			return side[1], &sortedSeekHint{col: col, coll: coll, aff: aff, built: s.rightOuter}
 		}
 	}
 	return nil, nil

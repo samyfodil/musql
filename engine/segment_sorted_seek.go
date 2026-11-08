@@ -30,7 +30,7 @@ type segSortedRows struct {
 // nothing changed, where the segments are not the whole table or the column
 // is not a clean INTEGER block in every one of them.
 func (cur *vdbeCursor) segSortedSeek(h *sortedSeekHint, probe Value) bool {
-	if cur.materialized || cur.fill != nil || cur.ranged || cur.seekConfigured || cur.idxSeekConfigured || cur.seekSetConfigured ||
+	if h.built || cur.materialized || cur.fill != nil || cur.ranged || cur.seekConfigured || cur.idxSeekConfigured || cur.seekSetConfigured ||
 		cur.segSorted == nil && (cur.segSrc != nil || cur.keyListReady) {
 		return false
 	}

@@ -780,6 +780,9 @@ type sortedSeekHint struct {
 	aff  affinity
 	// keyLen is how many instructions before the OpSortedSeek compute its key.
 	keyLen int
+	// built is set for a RIGHT/FULL JOIN operand: its unmatched-row sweep walks
+	// and marks the built rows, so the segments do not serve it.
+	built bool
 }
 
 // indexSeekHint is the P4 payload of OpSeekIndexHint: everything the runtime
