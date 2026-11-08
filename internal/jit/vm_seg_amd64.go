@@ -73,8 +73,14 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 	}
 	a.Jmp(l("done"))
 
-	// The segment's: R9 the VSeg, RDX the row, R10 the column's VSegCol.
+	// The segment's: R9 the VSeg, RDX the row (Sel[Pos] when the cursor has
+	// a selection), R10 the column's VSegCol.
 	a.Label(l("seg"))
+	a.MovRegMemD(R10, RAX, cb+VCursorOffSel)
+	a.TestRegReg(R10, R10)
+	a.Jcc(CondE, l("nosel"))
+	a.MovRegMemIdx(RDX, R10, RDX)
+	a.Label(l("nosel"))
 	a.MovRegMemD(R10, R9, VSegOffCols)
 	a.AddRegImm32(R10, int32(in.B*VSegColSize))
 	a.MovRegMemD(RAX, R10, VSegColOffNulls)
@@ -288,6 +294,7 @@ func (e *vmEmit) seekRowid(pc int, in VInsn) {
 	a.MovMemDReg(R9, VCursorOffRids, RCX)
 	a.MovRegMemD(RCX, R10, VTabSegOffMask)
 	a.MovMemDReg(R9, VCursorOffMask, RCX)
+	a.MovMemDImm(R9, VCursorOffSel, 0)
 	a.MovMemDReg(R9, VCursorOffPos, RAX)
 	a.MovMemDReg(R9, VCursorOffLast, RAX)
 	a.IncReg(RAX)

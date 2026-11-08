@@ -354,6 +354,10 @@ type VCursor struct {
 	Tab    unsafe.Pointer
 	Key    int64
 	Served int64
+	// Sel, when not nil, is in segment mode the segment row of each position:
+	// a list of N ints, the row at Pos being Sel[Pos] (an index seek's rows,
+	// a scan in a key's order). Nil, the row is Pos.
+	Sel unsafe.Pointer
 }
 
 // VTab is the segments of a table, in the order the engine searches them.
@@ -403,7 +407,7 @@ const (
 )
 
 const (
-	VCursorSize     = 128
+	VCursorSize     = 136
 	VCursorOffRows  = 0
 	VCursorOffN     = 8
 	VCursorOffPos   = 16
@@ -420,6 +424,7 @@ const (
 	VCursorOffTab   = 104
 	VCursorOffKey   = 112
 	VCursorOffSrvd  = 120
+	VCursorOffSel   = 128
 	VTabOffSegs     = 0
 	VTabOffN        = 8
 	VTabSegSize     = 40

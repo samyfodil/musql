@@ -64,6 +64,11 @@ func (e *vmEmitArm) segColumn(pc int, in VInsn) {
 	a.B(done)
 
 	a.Label(seg)
+	nosel := e.vmLabel("sl")
+	a.LdrImm(X4, X9, VCursorOffSel) // a selection's row for the position
+	a.Cbz(X4, nosel)
+	a.LdrRegIdx(X5, X4, X5)
+	a.Label(nosel)
 	a.LdrImm(X7, X6, VSegOffCols)
 	a.MovImm64(X4, int64(in.B*VSegColSize))
 	a.AddReg(X7, X7, X4)
@@ -255,6 +260,7 @@ func (e *vmEmitArm) seekRowid(pc int, in VInsn) {
 	a.StrImm(X10, X9, VCursorOffRids)
 	a.LdrImm(X10, X5, VTabSegOffMask)
 	a.StrImm(X10, X9, VCursorOffMask)
+	a.StrImm(xzr, X9, VCursorOffSel)
 	a.StrImm(X8, X9, VCursorOffPos)
 	a.StrImm(X8, X9, VCursorOffLast)
 	a.AddImm(X10, X8, 1)

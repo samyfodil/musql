@@ -912,13 +912,19 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		}
 		e.destNoS(pc, in.C)
 		cb := int32(in.A * VCursorSize)
-		dense, have := e.vmLabel("rd"), e.vmLabel("rh")
+		dense, have, row := e.vmLabel("rd"), e.vmLabel("rh"), e.vmLabel("rs")
 		a.MovRegMemD(RAX, RDI, POffCur)
 		a.CmpMemDImm8(RAX, cb+VCursorOffOk, 0)
 		e.jccStub(CondE, pc)
 		a.MovRegMemD(R9, RAX, cb+VCursorOffPos)
 		a.AluRegMemD(AluCmp, R9, RAX, cb+VCursorOffN)
 		e.jccStub(condAboveEq, pc) // unsigned: a position before the first row is huge
+		// A selection's position names its segment row (VCursor.Sel).
+		a.MovRegMemD(RDX, RAX, cb+VCursorOffSel)
+		a.TestRegReg(RDX, RDX)
+		a.Jcc(CondE, row)
+		a.MovRegMemIdx(R9, RDX, R9)
+		a.Label(row)
 		a.MovRegMemD(RDX, RAX, cb+VCursorOffRids)
 		a.TestRegReg(RDX, RDX)
 		a.Jcc(CondE, dense)
