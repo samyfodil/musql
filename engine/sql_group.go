@@ -2358,16 +2358,7 @@ func (p *ReadOnlyPager) planGroupByStmt(stmt *SelectStmt, scopes []tableScope, o
 // vdbe_agg.go), which feed these instances into the shared
 // aggItem.step/finalize logic.
 func cloneAggTemplates(templates []*aggItem) []*aggItem {
-	if len(templates) == 0 {
-		return nil
-	}
-	accs := make([]*aggItem, len(templates))
-	items := make([]aggItem, len(templates))
-	for i, tmpl := range templates {
-		accs[i] = &items[i]
-		resetAggItem(accs[i], tmpl)
-	}
-	return accs
+	return (&aggSlab{exact: true}).clone(templates)
 }
 
 // resetAggItem makes acc a fresh accumulator from tmpl, replacing the whole

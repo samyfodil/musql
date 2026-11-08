@@ -1951,6 +1951,9 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 		cols, rowids := aggItemsRowReads(plan)
 		if plan.rowFree = len(cols) == 0 && !rowids; !plan.rowFree {
 			plan.rowCols = append(make([]int, 0, len(cols)), cols...)
+			if len(cols) > 0 {
+				plan.rowWidth = slices.Max(cols) + 1
+			}
 		}
 	}
 

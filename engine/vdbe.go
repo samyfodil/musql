@@ -104,6 +104,8 @@ type vdbe struct {
 	unpackBuf   []Value        // OpSorterData's expanded row (recUnpack)
 	segJoin     *segJoinGroups // OpSegJoinGroups' groups, nil when it declined
 	aggRowidBuf []Value
+	// anchorPad is an anchor row widened to the plan's width (aggPlan.rowWidth).
+	anchorPad []Value
 	// aggNullRow is the row a rowFree step (aggPlan.rowFree) hands on in place
 	// of a gathered one: all NULL, at least as wide as any plan's, never
 	// written. The anchor copies it and nothing reads that.

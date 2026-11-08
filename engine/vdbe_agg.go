@@ -39,8 +39,10 @@ type aggPlan struct {
 	rowFree bool
 	// rowCols, when not nil, is the only columns of the row block anything
 	// reads: rowFree's conditions hold but for a result naming a column (a
-	// GROUP BY key, read from the group's row). The step gathers just those.
-	rowCols []int
+	// GROUP BY key, read from the group's row). The step gathers just those,
+	// and a group keeps its anchor row only up to the last (rowWidth).
+	rowCols  []int
+	rowWidth int
 
 	scopes  []tableScope
 	nCols   int   // total column count across every joined table -- the [cols..] block width; len(scopes) rowid slots immediately follow it in the [cols.., rowids..] layout (see aggRowSplit)
@@ -240,8 +242,10 @@ type aggAccumulators struct {
 	anchorRowids []Value
 	haveAnchor   bool
 	// rowFree is the plan's (aggPlan.rowFree): nothing reads the anchor, so it
-	// is not copied.
-	rowFree bool
+	// is not copied. rowWidth, when not zero, is how much of it anything reads
+	// (aggPlan.rowWidth), and all of it that is copied.
+	rowFree  bool
+	rowWidth int
 
 	// magnetHit is M, SQLite's regHit. It is a REGISTER, so it survives from
 	// one scanned row to the next: a row on which every census site is jumped
@@ -319,7 +323,11 @@ func (a *aggAccumulators) magnetWalk(ctx *evalCtx, regs []Value) error {
 	if a.rowFree {
 		a.anchorVals, a.anchorRowids = ctx.vals, ctx.rowids
 	} else {
-		a.anchorVals = cloneValues(ctx.vals)
+		vals := ctx.vals
+		if a.rowWidth > 0 && a.rowWidth < len(vals) {
+			vals = vals[:a.rowWidth]
+		}
+		a.anchorVals = cloneValues(vals)
 		a.anchorRowids = cloneValues(ctx.rowids)
 	}
 	a.haveAnchor = true
@@ -373,33 +381,14 @@ func reuseAggAccs(a *aggAccumulators, plan *aggPlan) *aggAccumulators {
 		}
 	}
 	*a = aggAccumulators{out: a.out, having: a.having, order: a.order, magnets: a.magnets,
-		check: plan.anchorCheck, rowFree: plan.rowFree}
+		check: plan.anchorCheck, rowFree: plan.rowFree, rowWidth: plan.rowWidth}
 	if plan.magnet != nil {
 		a.magnetS = plan.magnet.allocS
 	}
 	return a
 }
 
-func newAggAccs(plan *aggPlan) *aggAccumulators {
-	a := &aggAccumulators{out: make([][]*aggItem, len(plan.outPlans)), check: plan.anchorCheck, rowFree: plan.rowFree}
-	for i, it := range plan.outPlans {
-		a.out[i] = cloneAggTemplates(it.aggTemplates)
-	}
-	if plan.havingPlan != nil {
-		a.having = cloneAggTemplates(plan.havingPlan.aggTemplates)
-	}
-	if plan.magnet != nil {
-		a.magnets = cloneAggTemplates(plan.magnet.sites)
-		a.magnetS = plan.magnet.allocS
-	}
-	a.order = make([][]*aggItem, len(plan.orderPlans))
-	for i, op := range plan.orderPlans {
-		if op.item != nil {
-			a.order[i] = cloneAggTemplates(op.item.aggTemplates)
-		}
-	}
-	return a
-}
+func newAggAccs(plan *aggPlan) *aggAccumulators { return (&aggSlab{exact: true}).newAggAccs(plan) }
 
 // aggRowCtx builds the evalCtx an aggregate opcode uses for a row: the query's
 // scopes, the row's concatenated values, one rowid per table (NULL for a LEFT
@@ -515,6 +504,12 @@ func (m *vdbe) aggResult(info *aggResultInfo, groupKey []Value) (Value, error) {
 		clearJSONSubtype(groupKey)
 	}
 	bareVals, bareRowids := m.aggAccs.anchorRow(plan)
+	if len(bareVals) < plan.nCols {
+		// An anchor kept only as wide as anything reads it (aggPlan.rowWidth).
+		pad := growValues(&m.anchorPad, plan.nCols)
+		copy(pad, bareVals)
+		bareVals = pad
+	}
 	// The compiled item: run seeds the three register blocks and the
 	// program reads them, C's answer for the same nodes (AggInfoFuncReg,
 	// expr.c:5342; AggInfoColumnReg, expr.c:4996; the key via OP_Column,
