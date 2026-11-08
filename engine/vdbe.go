@@ -2217,6 +2217,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				cursorHasNoBtree(cur) && cur.fill == nil && !cur.materialized {
 				break // a cursor whose rows are not one list built once
 			}
+			if cur.segSortedSeek(op.P4.(*sortedSeekHint), m.regs[op.P2]) {
+				break
+			}
 			if !cur.materialized {
 				cur.params = m.params
 				if rerr := cur.rewind(); rerr != nil {

@@ -181,6 +181,9 @@ type vdbeCursor struct {
 	// each seek narrows rows/rowids to a run of. nil until the first seek, and
 	// dropped whenever the rows are built again.
 	sorted *sortedRows
+	// segSorted is the same served from the segments (segSortedSeek), kept
+	// across rewinds since nothing is built.
+	segSorted *segSortedRows
 
 	// matched is this cursor's RIGHT/FULL JOIN mark bitmap (parallel to
 	// rows/rowids) -- nil until OpRightJoinMark or OpRightJoinSweepRewind/Next
@@ -1564,7 +1567,7 @@ func (cur *vdbeCursor) close() {
 	cur.sub = nil
 	cur.rowids = nil
 	cur.rows = nil
-	cur.sorted = nil
+	cur.sorted, cur.segSorted = nil, nil
 	cur.lazyNorm = false
 	// BOTH halves of the current row, never just one. rowRaw is what tells
 	// readColumn a masked rowVals is incomplete, so clearing rowRaw while
