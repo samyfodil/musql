@@ -131,7 +131,7 @@ func (prog *Program) putMachineTo(m *vdbe, spare **vdbe) {
 	// stops the next statement from reading the last one's row by accident.
 	for _, c := range cursors {
 		if c != nil {
-			*c = vdbeCursor{}
+			*c = vdbeCursor{pointSrc: keptListBuffers(&c.pointSrc)}
 		}
 	}
 	// The sub-cache slice too (reuseSubCache), emptied to its full capacity
@@ -181,6 +181,23 @@ func (prog *Program) putMachineTo(m *vdbe, spare **vdbe) {
 		return
 	}
 	vdbeMachines.Put(m)
+}
+
+// maxKeptList is the most rows a cursor's list buffers may hold and still be
+// pooled with its shell.
+const maxKeptList = 1 << 16
+
+// keptListBuffers is src's list buffers emptied, for the next statement's list
+// (an AutoIndexOrder walk builds one per execution): listSegs cleared, so the
+// pool pins no segment, and none kept past maxKeptList rows.
+func keptListBuffers(src *segRowSource) segRowSource {
+	if cap(src.listSegs) > maxKeptList || cap(src.listRows) > maxKeptList || cap(src.listKeys) > maxKeptList ||
+		cap(src.listPerm) > maxKeptList || cap(src.listHits) > maxKeptList {
+		return segRowSource{}
+	}
+	segs := src.listSegs[:cap(src.listSegs)]
+	clear(segs)
+	return segRowSource{listSegs: segs[:0], listRows: src.listRows[:0], listKeys: src.listKeys[:0], listPerm: src.listPerm[:0], listHits: src.listHits[:0]}
 }
 
 // vdbeMachines holds every released machine, whatever program it ran.
