@@ -219,7 +219,18 @@ func (p *ReadOnlyPager) explainCompile(stmt *SelectStmt) (*Program, error) {
 		// picks between the two the same way.
 		return compileSelectNoFromPager(p, stmt, nil)
 	}
-	return compileSelectScan(p, stmt, nil)
+	// The rewrites execSelect makes before it compiles, so the plan shown is
+	// the one that runs.
+	stmt = p.r37cFlattenTransparent(stmt)
+	nCTE := len(stmt.CTEs)
+	stmt = p.r41FlattenProjection(stmt)
+	if len(stmt.CTEs) > nCTE {
+		defer p.pushCTEScope(stmt.CTEs[nCTE:])()
+	}
+	if len(stmt.Compound) > 0 {
+		return nil, fmt.Errorf("%w: EXPLAIN of a SELECT whose subquery flattened into a compound", errVDBEUnsupported)
+	}
+	return compileSelectScan(p, p.r41PushDown(stmt), nil)
 }
 
 // explainQueryPlanRows answers "EXPLAIN QUERY PLAN", whose four columns are
