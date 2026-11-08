@@ -265,6 +265,19 @@ type compiler struct {
 	// destination (select.c, the "eDest!=SRT_Exists" arm).
 	existsStmt *SelectStmt
 
+	// existsMemo is the programs of the EXISTS directly inside the body of the
+	// one this compiler is compiling twice (compileExistsSubquery: as written,
+	// then with its result list blanked): the first compile records them and
+	// the second, existsMemoRead, takes them, since only the result list
+	// differs. Compiling each again made nested EXISTS cost 2^depth compiles.
+	existsMemo     map[*SelectStmt]*Program
+	existsMemoRead bool
+
+	// subUncorrelated is, on a statement's outermost compiler, whether each
+	// sub-select a WHERE term holds compiled uncorrelated
+	// (subTermsUncorrelated).
+	subUncorrelated map[*SelectStmt]bool
+
 	// existsJoinPlan is the planned existsToJoin rewrite of this compiler's
 	// SELECT (markWherePlanExistsEligibility), nil when there is none or the
 	// planner declined it. existsPos maps each converted EXISTS select to where
@@ -1445,18 +1458,34 @@ func (c *compiler) compileExistsSubquery(x ExistsExpr, top bool) (int, error) {
 		// nthValueReach.
 		body = nthValueReach(body, 1)
 	}
-	savedExistsJoin, savedExistsStmt, savedExistsAt := c.existsJoin, c.existsStmt, c.existsAt
-	c.existsJoin, c.existsStmt, c.existsAt = top && !x.Not && existsJoinable(body), body, c.existsPos[x.Stmt]
-	prog, err := c.liveSubSelect(body)
-	c.existsJoin, c.existsStmt, c.existsAt = savedExistsJoin, savedExistsStmt, savedExistsAt
-	if err != nil {
-		return 0, err
+	var memo map[*SelectStmt]*Program
+	if c.outer != nil && c.outer.existsMemo != nil {
+		memo = c.outer.existsMemo
 	}
-	// The compile above has reported every unknown name; the result list is
-	// then dead code to EXISTS (existsBlankedStmt).
-	if blanked := existsBlankedStmt(x.Stmt); blanked != nil {
-		if prog2, err2 := c.liveSubSelect(blanked); err2 == nil {
-			prog = prog2
+	prog := memo[x.Stmt]
+	if prog == nil || !c.outer.existsMemoRead {
+		savedMemo, savedRead := c.existsMemo, c.existsMemoRead
+		c.existsMemo, c.existsMemoRead = map[*SelectStmt]*Program{}, false
+		savedExistsJoin, savedExistsStmt, savedExistsAt := c.existsJoin, c.existsStmt, c.existsAt
+		c.existsJoin, c.existsStmt, c.existsAt = top && !x.Not && existsJoinable(body), body, c.existsPos[x.Stmt]
+		var err error
+		prog, err = c.liveSubSelect(body)
+		c.existsJoin, c.existsStmt, c.existsAt = savedExistsJoin, savedExistsStmt, savedExistsAt
+		if err != nil {
+			c.existsMemo, c.existsMemoRead = savedMemo, savedRead
+			return 0, err
+		}
+		// The compile above has reported every unknown name; the result list is
+		// then dead code to EXISTS (existsBlankedStmt).
+		if blanked := existsBlankedStmt(x.Stmt); blanked != nil {
+			c.existsMemoRead = true
+			if prog2, err2 := c.liveSubSelect(blanked); err2 == nil {
+				prog = prog2
+			}
+		}
+		c.existsMemo, c.existsMemoRead = savedMemo, savedRead
+		if memo != nil {
+			memo[x.Stmt] = prog
 		}
 	}
 	if c.pager == nil && c.liveDB == nil && prog.NCursors != 0 {

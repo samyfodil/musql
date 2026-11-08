@@ -2881,14 +2881,36 @@ func joinPushdownPlan(c *compiler, srcs []joinSource, scopes []tableScope, where
 // compiles here without binding a row of this query or one enclosing it: a
 // trial compile, so the binder that will compile the term decides. Anything
 // it cannot walk or compile counts as correlated.
+//
+// The verdict is kept for the statement (compiler.subUncorrelated): a trial
+// compile makes the sub-select's own sub-selects ask again, so without it each
+// level of nesting doubled the compiles.
 func (c *compiler) subTermsUncorrelated(e Expr) bool {
 	subs, ok := subSelects(e)
 	if !ok || len(subs) == 0 {
 		return false
 	}
+	root := c
+	for root.outer != nil {
+		root = root.outer
+	}
+	keep := root.trig == nil && root.liveDB == nil && root.liveRow == nil && root.retRow == nil
 	for _, sub := range subs {
+		if v, seen := root.subUncorrelated[sub]; keep && seen {
+			if !v {
+				return false
+			}
+			continue
+		}
 		prog, err := compileSubProgram(c.pager, sub, c)
-		if err != nil || prog == nil || prog.Correlated {
+		v := err == nil && prog != nil && !prog.Correlated
+		if keep {
+			if root.subUncorrelated == nil {
+				root.subUncorrelated = map[*SelectStmt]bool{}
+			}
+			root.subUncorrelated[sub] = v
+		}
+		if !v {
 			return false
 		}
 	}
