@@ -57,6 +57,10 @@ func TestVCursorLayout(t *testing.T) {
 		{"Reopen", unsafe.Offsetof(c.Reopen), VCursorOffReop},
 		{"State", unsafe.Offsetof(c.State), VCursorOffState},
 		{"Seg", unsafe.Offsetof(c.Seg), VCursorOffSeg},
+		{"Tab", unsafe.Offsetof(c.Tab), VCursorOffTab},
+		{"Key", unsafe.Offsetof(c.Key), VCursorOffKey},
+		{"Served", unsafe.Offsetof(c.Served), VCursorOffSrvd},
+		{"Sel", unsafe.Offsetof(c.Sel), VCursorOffSel},
 	} {
 		if f.got != f.want {
 			t.Errorf("VCursor %s is %d, generated code uses %d", f.name, f.got, f.want)

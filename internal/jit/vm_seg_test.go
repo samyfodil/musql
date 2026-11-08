@@ -294,3 +294,46 @@ func TestVMSegRowid(t *testing.T) {
 		}
 	}
 }
+
+// TestVMSegSel walks a cursor in segment mode through a selection (VCursor.Sel):
+// each position reads its column and its rowid from the segment row the
+// selection names, over a dense segment and one with a rowid block.
+func TestVMSegSel(t *testing.T) {
+	if !Available || !VMSegCursor {
+		t.Skip("no segment cursors on this platform")
+	}
+	noGC(t)
+	vals := []uint64{10, 11, 12, 13, 14, 15}
+	rids := []uint64{100, 200, 300, 400, 500, 600}
+	sel := []int{4, 0, 5, 2}
+	cols := []VSegCol{{Kind: VSegInt, Block: unsafe.Pointer(&vals[0])}}
+	// r0 += column 0, r1 += rowid, over every position.
+	prog := []VInsn{
+		{Op: VColumn, A: 0, B: 0, C: 2, Imm: 1},
+		{Op: VAdd, A: 2, B: 0, C: 0},
+		{Op: VRowid, A: 0, C: 3},
+		{Op: VAdd, A: 3, B: 1, C: 1},
+		{Op: VNext, A: 0, T: 0},
+		{Op: VExit},
+	}
+	for _, dense := range []bool{true, false} {
+		seg := &VSeg{Cols: unsafe.Pointer(&cols[0]), First: 1000, Rowids: unsafe.Pointer(&rids[0])}
+		wantR := int64(0)
+		for _, r := range sel {
+			wantR += int64(rids[r])
+		}
+		cur := &VCursor{N: int64(len(sel)), Pos: 0, Last: -1, Ok: 1, Adv: 1, Mask: 1, Seg: unsafe.Pointer(seg), Rowids: seg.Rowids, Sel: unsafe.Pointer(&sel[0])}
+		if dense {
+			seg.Dense, cur.Rowids = 1, nil
+			wantR = 0
+			for _, r := range sel {
+				wantR += 1000 + int64(r)
+			}
+		}
+		regs := []tvalue{{Typ: tvInt}, {Typ: tvInt}, {}, {}}
+		pc := runVMCursor(t, prog, regs, nil, cur, 0)
+		if pc != len(prog)-1 || regs[0].I != 14+10+15+12 || regs[1].I != wantR || cur.Last != int64(len(sel)-1) {
+			t.Fatalf("dense %v: pc %d sum %d rowids %d (want %d) last %d", dense, pc, regs[0].I, regs[1].I, wantR, cur.Last)
+		}
+	}
+}
