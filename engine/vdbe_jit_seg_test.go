@@ -304,3 +304,96 @@ func TestVMJITInSubDifferential(t *testing.T) {
 		}
 	}
 }
+
+// TestVMJITIdxSeekDifferential: integer equality seeks native code makes
+// through a segment table's index (VSeekIdx) -- in EXISTS bodies, joins and
+// correlated subqueries, over a table of several segments, with keys no row
+// holds, NULL, REAL and TEXT keys, an index whose order the seek keeps (a
+// PRIMARY KEY of two columns), and a loop body that exits to the VDBE between
+// rows, which takes the cursor back -- then the same after writes the
+// segments no longer answer alone. With the JIT and without, every row must
+// match.
+func TestVMJITIdxSeekDifferential(t *testing.T) {
+	lowEntryThreshold(t)
+	countSyncs(t)
+	if !vmJITEnabled {
+		t.Skip("JIT not enabled on this platform")
+	}
+	setup := []string{
+		"CREATE TABLE t(id INTEGER PRIMARY KEY, k INT, a INT, c TEXT)",
+		"CREATE INDEX tk ON t(k)",
+		"CREATE TABLE p(k INT NOT NULL, j INT NOT NULL, v INT, PRIMARY KEY(k, j))",
+		"CREATE TABLE u(id INTEGER PRIMARY KEY, w, s TEXT)",
+		"INSERT INTO t SELECT value, value / 7, value % 13, 'c' || (value % 5) FROM generate_series(1, 90000)",
+		"INSERT INTO p SELECT value / 4, value % 4, value FROM generate_series(1, 40000)",
+	}
+	keys := []string{"5", "12856", "12857", "0", "-3", "99999", "NULL", "7.0", "7.5", "'11'", "'x'", "6000", "1"}
+	for i, k := range keys {
+		setup = append(setup, fmt.Sprintf("INSERT INTO u VALUES(%d, %s, 's%d')", i+1, k, i%3))
+	}
+	for i := len(keys) + 1; i <= 300; i++ {
+		setup = append(setup, fmt.Sprintf("INSERT INTO u VALUES(%d, %d, 's%d')", i, (i*311)%13000, i%3))
+	}
+	setup = append(setup, "VACUUM")
+	queries := []string{
+		"SELECT count(*) FROM u WHERE EXISTS (SELECT 1 FROM t WHERE t.k = u.w AND t.a <> 3)",
+		"SELECT count(*) FROM u WHERE NOT EXISTS (SELECT 1 FROM t WHERE t.k = u.w AND t.a > 10)",
+		"SELECT u.id, t.id, t.a FROM u JOIN t ON t.k = u.w ORDER BY 1, 2",
+		"SELECT u.id, (SELECT sum(t.a) FROM t WHERE t.k = u.w) FROM u ORDER BY 1",
+		"SELECT u.id, t.id, upper(t.c) FROM u JOIN t ON t.k = u.w WHERE t.a < 9 ORDER BY 1, 2",
+		"SELECT count(*) FROM u WHERE EXISTS (SELECT 1 FROM p WHERE p.k = u.w AND p.j <> 2)",
+		"SELECT u.id, p.j, p.v FROM u JOIN p ON p.k = u.w ORDER BY 1, 2",
+	}
+	writes := []string{
+		"UPDATE t SET a = a + 1 WHERE id % 50 = 0",
+		"DELETE FROM t WHERE id % 61 = 0",
+		"INSERT INTO t VALUES(95000, 5, 3, 'new')",
+	}
+	run := func(jitOn bool) (out []string) {
+		old := vmJITEnabled
+		vmJITEnabled = jitOn
+		defer func() { vmJITEnabled = old }()
+		n, err := OpenOrCreate(filepath.Join(t.TempDir(), "x.musq"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer n.Close()
+		exec := func(s string) {
+			if _, _, err := n.ExecArgs(s, nil); err != nil {
+				t.Fatalf("%s: %v", s, err)
+			}
+			n.CommitIfAutocommit()
+		}
+		for _, s := range setup {
+			exec(s)
+		}
+		query := func() {
+			for _, q := range queries {
+				cols, rows, err := n.Query(q, nil)
+				if err != nil {
+					t.Fatalf("%s: %v", q, err)
+				}
+				out = append(out, fmt.Sprint(q, cols, rows))
+			}
+		}
+		query()
+		for _, s := range writes {
+			exec(s)
+		}
+		query()
+		return out
+	}
+	want := run(false)
+	seeks, syncs := vmJITIdxSeeks.Load(), vmJITIdxSyncs.Load()
+	got := run(true)
+	seeks, syncs = vmJITIdxSeeks.Load()-seeks, vmJITIdxSyncs.Load()-syncs
+	for i := range want {
+		if want[i] != got[i] {
+			t.Fatalf("JIT diverges:\nvdbe %.600s\njit  %.600s", want[i], got[i])
+		}
+	}
+	if segCursorsHere() && (seeks == 0 || syncs == 0) {
+		t.Fatalf("native index seeks %d, cursors taken back %d: the test checks nothing", seeks, syncs)
+	}
+	t.Logf("%d queries agree; %d native index seeks, %d taken back", len(want), seeks, syncs)
+}

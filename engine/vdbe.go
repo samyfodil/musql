@@ -26,6 +26,10 @@ import (
 // used per run; registers, cursors, and sorters are not shared across
 // executions.
 type vdbe struct {
+	// jitErr is an error native code's return found taking a cursor back
+	// (syncIdxSeek), which the run returns.
+	jitErr error
+
 	regs []Value
 	jx   *vmJIT        // native code for the program run() is given, when it has some
 	jcur []jit.VCursor // native code's view of the cursors it names, filled at each entry
@@ -1492,6 +1496,10 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			next, n := jx.enter(m, pc, &rows)
 			pc = next
+			if err := m.jitErr; err != nil {
+				m.jitErr = nil
+				return nil, err
+			}
 			if m.countHeld {
 				for _, r := range rows[before:] {
 					m.heldBytes += recursiveRowFootprint(r)

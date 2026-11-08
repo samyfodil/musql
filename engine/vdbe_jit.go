@@ -86,6 +86,11 @@ type vmJIT struct {
 	// tabs is, per cursor number, the table tabFor last worked out for it.
 	tabs []atomic.Pointer[vmTab]
 
+	// idxSpecs is, per cursor number, the index seek native code makes
+	// (lowerIdxSeeks), and idxs the index idxFor last worked out for it.
+	idxSpecs []*idxSeekSpec
+	idxs     []atomic.Pointer[vmIdx]
+
 	// inSlots is the subquery cache slot of each VInSub's set, its B.
 	inSlots []int
 
@@ -335,6 +340,15 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 			}
 		}
 	}
+	// An integer equality index seek of a table cursor, which native code
+	// makes itself over the table's one segment (vmJIT.idxFor).
+	idxSpecs, idxPCs := lowerIdxSeeks(prog, vp, segCap)
+	for _, q := range idxPCs {
+		if !entry[q] {
+			entry[q] = true
+			native++
+		}
+	}
 	n, walkScan := nativeStreamNexts(prog.Insns, vp, streamed, segCap, prog.NReg)
 	if n > 0 {
 		for pc, in := range prog.Insns {
@@ -403,9 +417,12 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 		}
 	}
 	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams, params: nParams, entry: entry, marked: marked, native: native, updAt: updAt,
-		segCap: segCap, walkScan: walkScan, inSlots: inSlots}
+		segCap: segCap, walkScan: walkScan, inSlots: inSlots, idxSpecs: idxSpecs}
 	if segCap != nil {
 		jx.tabs = make([]atomic.Pointer[vmTab], len(segCap))
+	}
+	if idxSpecs != nil {
+		jx.idxs = make([]atomic.Pointer[vmIdx], len(idxSpecs))
 	}
 	if slices.ContainsFunc(vp, func(in jit.VInsn) bool { return in.Op == jit.VOpen || in.Op == jit.VClose }) {
 		jx.reopen = reopen
@@ -514,7 +531,7 @@ func isCursorOpen(op OpCode) bool {
 // vmCursorOp reports whether op reads or moves its cursor (A).
 func vmCursorOp(op jit.VOp) bool {
 	switch op {
-	case jit.VColumn, jit.VRowid, jit.VNext, jit.VRewind, jit.VOpen, jit.VClose, jit.VSeekRowid, jit.VSeekRewind:
+	case jit.VColumn, jit.VRowid, jit.VNext, jit.VRewind, jit.VOpen, jit.VClose, jit.VSeekRowid, jit.VSeekIdx, jit.VSeekRewind:
 		return true
 	}
 	return false
@@ -1189,6 +1206,9 @@ var (
 	// vmJITSegWalks counts the entries that walked a cursor in segment mode
 	// (segSync), and vmJITTabSeeks those that seeked one natively (seekSync).
 	vmJITSegWalks, vmJITTabSeeks atomic.Int64
+	// vmJITIdxSeeks counts the index seeks native code made (VSeekIdx) and
+	// vmJITIdxSyncs the times the VDBE took such a cursor back (syncIdxSeek).
+	vmJITIdxSeeks, vmJITIdxSyncs atomic.Int64
 	vmJITCountSyncs              bool
 
 	// vmJITCursorEnters counts entries into native code that reads or walks a
@@ -1559,6 +1579,9 @@ func resetVCursor(jc *jit.VCursor) {
 	if jc.Sel != nil {
 		jc.Sel = nil
 	}
+	if jc.Idx != nil {
+		jc.Idx = nil
+	}
 	jc.N, jc.Pos, jc.Last, jc.Ok, jc.Dirty, jc.Rewind, jc.Adv, jc.Mask, jc.Reopen, jc.State = 0, 0, -1, 0, 0, 0, 0, 0, 0, 0
 	jc.Key, jc.Served = 0, 0
 }
@@ -1612,6 +1635,11 @@ func (jx *vmJIT) segMode(c int, cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) b
 		if jc.Rows != nil {
 			jc.Rows = nil
 		}
+		if jx.idxSpecs != nil && jx.idxSpecs[c] != nil && k >= 0 {
+			// A seek native code may make again: the rows it walks on this
+			// list first are counted from here (jit.VSeekIdx, State 5).
+			jc.State, jc.Last, jc.Served = 5, int64(k), -int64(k+1)
+		}
 		sn.segLive, sn.segEntry = true, k
 		return true
 	}
@@ -1633,6 +1661,10 @@ func (jx *vmJIT) segMode(c int, cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) b
 	}
 	if jc.Rows != nil {
 		jc.Rows = nil
+	}
+	if jx.idxSpecs != nil && jx.idxSpecs[c] != nil {
+		// As for a list above.
+		jc.State, jc.Last, jc.Served = 5, int64(cur.segRow), -int64(cur.segRow+1)
 	}
 	sn.segLive, sn.segEntry = true, cur.segRow
 	return true
@@ -1929,6 +1961,11 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 			cur := m.cursors[c]
 			if t := jx.tabFor(c, cur); t != nil {
 				jc.Tab = unsafe.Pointer(&t.tab)
+				if jx.idxSpecs != nil && jx.idxSpecs[c] != nil {
+					if x := jx.idxFor(c, t); x != nil {
+						jc.Idx = unsafe.Pointer(&x.vidx[0])
+					}
+				}
 			}
 			if jx.reopen != nil && jx.handReopen(cur, c, jc) {
 				continue
@@ -2016,7 +2053,41 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 				}
 				continue
 			}
-			if jc.Tab != nil && jc.State >= 2 {
+			if jc.Idx != nil && jc.State >= 2 && jc.State <= 4 {
+				// Native code seeked the cursor through its index: the VDBE's
+				// seek of the last key is run here, and walks on to where
+				// native code left it -- unless what it stopped at closes or
+				// reopens the cursor, which drops that state anyway.
+				m.jsnap[c].segLive, m.jsnap[c].live = false, false
+				// Served is the rows the seeks before the last served; the
+				// last served up to the cursor's row, which the VDBE's walk
+				// counts when it takes the cursor back.
+				last, served := int64(0), jc.Served
+				if jc.State != 3 {
+					last = jc.Last + 1
+				}
+				if !jx.idxSpecs[c].listed {
+					last, served = 0, 0
+				}
+				if vmJITCountSyncs {
+					vmJITIdxSeeks.Add(max(jc.Served, 0) + 1)
+				}
+				if at := int(args.PC); at >= 0 && at < jx.n {
+					if in := unsafe.Slice(jx.insns, jx.n)[at]; in.P1 == c && (in.Op == OpClose || isCursorOpen(in.Op)) {
+						segRowsServed.Add(served + last)
+						continue
+					}
+				}
+				segRowsServed.Add(served)
+				if vmJITCountSyncs {
+					vmJITIdxSyncs.Add(1)
+				}
+				if err := m.syncIdxSeek(jx, c, jc, jx.idxSpecs[c]); err != nil && m.jitErr == nil {
+					m.jitErr = err
+				}
+				continue
+			}
+			if jc.Tab != nil && jc.State >= 2 && jc.State <= 4 {
 				// Native code seeked the cursor: the VDBE's seek of the last key
 				// is run here, and leaves the cursor as native code did.
 				m.jsnap[c].segLive, m.jsnap[c].live = false, false
