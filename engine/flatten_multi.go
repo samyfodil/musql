@@ -1,6 +1,9 @@
 package engine
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // r41FlattenMultiItem is flattenSubquery for a body r41Arm does not take: a
 // join of several FROM items, or one carrying its own WITH -- taken only for a
@@ -47,7 +50,7 @@ func (p *ReadOnlyPager) r41FlattenMultiItem(stmt *SelectStmt, i int, expand bool
 			body, colNames = pcv.selectStmt, pcv.colNames
 		}
 	}
-	if body == nil || !p.cVolatile(body) || it.Join != JoinInner && it.Join != JoinCross ||
+	if body == nil || !p.cVolatile(body) && !r41FlattenPlainJoin(stmt, body) || it.Join != JoinInner && it.Join != JoinCross ||
 		len(it.Using) != 0 || it.Natural || it.IndexedBy != "" || it.NotIndexed {
 		return nil, false
 	}
@@ -429,4 +432,47 @@ func selectNamesFromItem(s *SelectStmt, name string) bool {
 	}
 	walkSel(s)
 	return found
+}
+
+// r41FlattenPlainJoin reports whether a body without random() is still one
+// this rewrite flattens as C does: a join whose result columns are bare
+// columns or named, none calling a function that may hand back a subtype (a
+// subtype dies at the subquery boundary unless the column is bare), under a
+// parent holding no subquery a moved expression could land in.
+func r41FlattenPlainJoin(stmt, body *SelectStmt) bool {
+	if len(body.From) < 2 {
+		return false
+	}
+	for _, c := range body.Columns {
+		if c.Star {
+			return false
+		}
+		if _, bare := c.Expr.(ColumnExpr); bare {
+			continue
+		}
+		if !c.HasAlias || c.Alias == "" {
+			return false
+		}
+		subtyped := !walkExprShallow(c.Expr, func(f FuncExpr) bool {
+			name := r33sFoldIdent(f.Name)
+			return !strings.HasPrefix(name, "json") && udfs[name] == nil
+		})
+		if subtyped {
+			return false
+		}
+	}
+	exprs := []Expr{stmt.Where, stmt.Having}
+	exprs = append(exprs, stmt.GroupBy...)
+	for _, c := range stmt.Columns {
+		exprs = append(exprs, c.Expr)
+	}
+	for _, o := range stmt.OrderBy {
+		exprs = append(exprs, o.Expr)
+	}
+	for _, e := range exprs {
+		if exprContainsSubquery(e) {
+			return false
+		}
+	}
+	return len(stmt.Compound) == 0
 }
