@@ -376,9 +376,10 @@ func (e *vmEmit) seekRowid(pc int, in VInsn) {
 	a.Label(l("done"))
 }
 
-// seekIdx is VSeekIdx: a binary search of the index's INTEGERs, then the
-// cursor on the rows its run names (Sel). RAX, RCX, RDX, R9, R10 and X0-X1 are
-// scratch.
+// seekIdx is VSeekIdx: the segments' indexes in turn, each skipped when the
+// key is outside its range and otherwise binary searched; a find is the cursor
+// on the rows its run names (Sel), unless a later segment's range holds the key
+// too. RAX, RCX, RDX, R9, R10 and X0-X2 are scratch.
 func (e *vmEmit) seekIdx(pc int, in VInsn) {
 	a, L := e.a, e.lay
 	cb := int32(in.A * VCursorSize)
@@ -393,33 +394,66 @@ func (e *vmEmit) seekIdx(pc int, in VInsn) {
 	a.TestRegReg(R9, R9)
 	e.jccStub(CondE, pc)
 	a.MovqXR(X0, RAX) // the cursor
-	a.MovqXR(X1, R9)  // the index
 	a.MovRegMemD(RCX, RSI, e.d(in.B, L.OffI))
-	a.MovRegMemD(RDX, R9, VIdxOffVals)
-	a.MovRegMemD(R9, R9, VIdxOffNVals) // hi
-	a.XorRegReg(RAX, RAX)              // lo
+	a.MovRegMemD(RDX, R9, VIdxOffCount)
+
+	a.Label(l("seg"))
+	a.TestRegReg(RDX, RDX)
+	a.Jcc(CondE, l("miss"))
+	a.MovqXR(X1, R9) // this segment's index
+	a.MovqXR(X2, RDX)
+	a.AluRegMemD(AluCmp, RCX, R9, VIdxOffLo)
+	a.Jcc(CondL, l("next"))
+	a.AluRegMemD(AluCmp, RCX, R9, VIdxOffHi)
+	a.Jcc(CondG, l("next"))
+	a.MovRegMemD(R10, R9, VIdxOffVals)
+	a.MovRegMemD(RDX, R9, VIdxOffNVals) // hi
+	a.XorRegReg(RAX, RAX)               // lo
 	a.Label(l("bloop"))
-	a.CmpRegReg(RAX, R9)
+	a.CmpRegReg(RAX, RDX)
 	a.Jcc(CondGE, l("bdone"))
-	a.MovRegReg(R10, RAX)
-	a.AddRegReg(R10, R9)
-	a.SarRegImm8(R10, 1)
-	a.CmpMemIdxReg(RDX, R10, RCX) // vals[mid] against key
+	a.MovRegReg(R9, RAX)
+	a.AddRegReg(R9, RDX)
+	a.SarRegImm8(R9, 1)
+	a.CmpMemIdxReg(R10, R9, RCX) // vals[mid] against key
 	a.Jcc(CondGE, l("bhi"))
-	a.LeaRegMemD(RAX, R10, 1)
+	a.LeaRegMemD(RAX, R9, 1)
 	a.Jmp(l("bloop"))
 	a.Label(l("bhi"))
-	a.MovRegReg(R9, R10)
+	a.MovRegReg(RDX, R9)
 	a.Jmp(l("bloop"))
 	a.Label(l("bdone"))
 	a.MovqRX(R9, X1)
 	a.AluRegMemD(AluCmp, RAX, R9, VIdxOffNVals)
-	a.Jcc(CondGE, l("miss"))
-	a.CmpMemIdxReg(RDX, RAX, RCX)
-	a.Jcc(CondNE, l("miss"))
+	a.Jcc(CondGE, l("next"))
+	a.CmpMemIdxReg(R10, RAX, RCX)
+	a.Jcc(CondNE, l("next"))
 
-	// Found value RAX: its rows are Rows[Starts[RAX]:Starts[RAX+1]].
+	// Found value RAX of segment R9: a later segment whose range holds the
+	// key may hold some of its rows, which the VDBE gathers.
+	a.MovqRX(RDX, X2)
+	a.MovRegReg(R10, R9)
+	a.Label(l("rest"))
+	a.DecReg(RDX)
+	a.Jcc(CondE, l("found"))
+	a.AddRegImm32(R10, VIdxSize)
+	a.AluRegMemD(AluCmp, RCX, R10, VIdxOffLo)
+	a.Jcc(CondL, l("rest"))
+	a.AluRegMemD(AluCmp, RCX, R10, VIdxOffHi)
+	e.jccStub(CondLE, pc)
+	a.Jmp(l("rest"))
+
+	a.Label(l("next"))
+	a.MovqRX(R9, X1)
+	a.MovqRX(RDX, X2)
+	a.AddRegImm32(R9, VIdxSize)
+	a.DecReg(RDX)
+	a.Jmp(l("seg"))
+
+	// Its rows are Rows[Starts[RAX]:Starts[RAX+1]].
+	a.Label(l("found"))
 	a.MovqRX(R10, X0)
+	e.seekIdxServed(R10, RDX, l("fserved"), l("fsearch"))
 	a.MovMemDReg(R10, VCursorOffKey, RCX)
 	a.MovRegMemD(RDX, R9, VIdxOffStarts)
 	a.MovsxdRegMemIdx4(RCX, RDX, RAX)
@@ -442,14 +476,12 @@ func (e *vmEmit) seekIdx(pc int, in VInsn) {
 	a.MovMemDImm(R10, VCursorOffDirty, 1)
 	a.MovMemDImm(R10, VCursorOffAdv, 1)
 	a.MovMemDImm(R10, VCursorOffState, 2)
-	a.MovRegMemD(RCX, R10, VCursorOffSrvd)
-	a.IncReg(RCX)
-	a.MovMemDReg(R10, VCursorOffSrvd, RCX)
 	a.Jmp(l("done"))
 
 	// No row: the cursor on none, and on to T.
 	a.Label(l("miss"))
 	a.MovqRX(R10, X0)
+	e.seekIdxServed(R10, RDX, l("mserved"), l("msearch"))
 	a.MovMemDReg(R10, VCursorOffKey, RCX)
 	a.MovMemDImm(R10, VCursorOffN, 0)
 	a.MovMemDImm(R10, VCursorOffPos, 0)
@@ -458,6 +490,25 @@ func (e *vmEmit) seekIdx(pc int, in VInsn) {
 	a.MovMemDImm(R10, VCursorOffState, 3)
 	e.jmpBlock(pc, in.T)
 	a.Label(l("done"))
+}
+
+// seekIdxServed adds to cursor cur's Served the rows its last seek's run
+// served, up to the row it is on, when it has one (State 2, 4 or 5). tmp is
+// scratch.
+func (e *vmEmit) seekIdxServed(cur, tmp Reg, served, skip string) {
+	a := e.a
+	a.CmpMemDImm8(cur, VCursorOffState, 2)
+	a.Jcc(CondE, served)
+	a.CmpMemDImm8(cur, VCursorOffState, 4)
+	a.Jcc(CondE, served)
+	a.CmpMemDImm8(cur, VCursorOffState, 5)
+	a.Jcc(CondNE, skip)
+	a.Label(served)
+	a.MovRegMemD(tmp, cur, VCursorOffLast)
+	a.IncReg(tmp)
+	a.AddRegMemD(tmp, cur, VCursorOffSrvd)
+	a.MovMemDReg(cur, VCursorOffSrvd, tmp)
+	a.Label(skip)
 }
 
 // seekRewind is VSeekRewind.

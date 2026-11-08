@@ -344,11 +344,14 @@ func (e *vmEmitArm) seekRowid(pc int, in VInsn) {
 }
 
 // seekIdx is vm_seg_amd64.go's VSeekIdx. X9 the cursor, X4 the key, X5 the
-// index, X7 its values; X8 lo, X13 hi and X12 mid of the search.
+// segment's index and X6 the indexes left, X7 its values; X8 lo, X13 hi and
+// X12 mid of the search.
 func (e *vmEmitArm) seekIdx(pc int, in VInsn) {
 	a, L := e.a, e.lay
 	e.unmap(^in.A)
-	bloop, bhi, bdone, miss, done := e.vmLabel("ib"), e.vmLabel("ih"), e.vmLabel("id"), e.vmLabel("im"), e.vmLabel("ie")
+	seg, bloop, bhi, bdone, rest, next, found, miss, done := e.vmLabel("is"), e.vmLabel("ib"), e.vmLabel("ih"), e.vmLabel("id"),
+		e.vmLabel("ir"), e.vmLabel("in"), e.vmLabel("if"), e.vmLabel("im"), e.vmLabel("ie")
+	fserved, fskip, mserved, mskip := e.vmLabel("iv"), e.vmLabel("iw"), e.vmLabel("ix"), e.vmLabel("iy")
 	e.ldrb(X10, in.B, L.OffTyp)
 	a.CmpImm(X10, uint32(L.TypInt))
 	a.Bcond(CondNE, e.stub(pc)) // the key's conversions are the VDBE's
@@ -357,6 +360,16 @@ func (e *vmEmitArm) seekIdx(pc int, in VInsn) {
 	e.curBase(in.A)
 	a.LdrImm(X5, X9, VCursorOffIdx)
 	a.Cbz(X5, e.stub(pc))
+	a.LdrImm(X6, X5, VIdxOffCount)
+
+	a.Label(seg)
+	a.Cbz(X6, miss)
+	a.LdrImm(X10, X5, VIdxOffLo)
+	a.Cmp(X4, X10)
+	a.Bcond(CondL, next)
+	a.LdrImm(X10, X5, VIdxOffHi)
+	a.Cmp(X4, X10)
+	a.Bcond(CondG, next)
 	a.LdrImm(X7, X5, VIdxOffVals)
 	a.MovImm16(X8, 0)
 	a.LdrImm(X13, X5, VIdxOffNVals)
@@ -376,12 +389,35 @@ func (e *vmEmitArm) seekIdx(pc int, in VInsn) {
 	a.Label(bdone)
 	a.LdrImm(X11, X5, VIdxOffNVals)
 	a.Cmp(X8, X11)
-	a.Bcond(CondGE, miss)
+	a.Bcond(CondGE, next)
 	a.LdrRegIdx(X11, X7, X8)
 	a.Cmp(X11, X4)
-	a.Bcond(CondNE, miss)
+	a.Bcond(CondNE, next)
 
-	// Found value X8: its rows are Rows[Starts[X8]:Starts[X8+1]].
+	// Found value X8 of segment X5: a later segment whose range holds the key
+	// may hold some of its rows, which the VDBE gathers.
+	a.MovReg(X13, X6)
+	a.MovReg(X12, X5)
+	a.Label(rest)
+	a.SubsImm(X13, X13, 1)
+	a.Bcond(CondE, found)
+	a.AddImm(X12, X12, VIdxSize)
+	a.LdrImm(X10, X12, VIdxOffLo)
+	a.Cmp(X4, X10)
+	a.Bcond(CondL, rest)
+	a.LdrImm(X10, X12, VIdxOffHi)
+	a.Cmp(X4, X10)
+	a.Bcond(CondLE, e.stub(pc))
+	a.B(rest)
+
+	a.Label(next)
+	a.AddImm(X5, X5, VIdxSize)
+	a.SubsImm(X6, X6, 1)
+	a.B(seg)
+
+	// Its rows are Rows[Starts[X8]:Starts[X8+1]].
+	a.Label(found)
+	e.seekIdxServed(fserved, fskip)
 	a.StrImm(X4, X9, VCursorOffKey)
 	a.LdrImm(X10, X5, VIdxOffStarts)
 	a.LdrswRegLSL2(X11, X10, X8)
@@ -406,13 +442,11 @@ func (e *vmEmitArm) seekIdx(pc int, in VInsn) {
 	a.StrImm(X10, X9, VCursorOffAdv)
 	a.MovImm16(X10, 2)
 	a.StrImm(X10, X9, VCursorOffState)
-	a.LdrImm(X10, X9, VCursorOffSrvd)
-	a.AddImm(X10, X10, 1)
-	a.StrImm(X10, X9, VCursorOffSrvd)
 	a.B(done)
 
 	// No row: the cursor on none, and on to T.
 	a.Label(miss)
+	e.seekIdxServed(mserved, mskip)
 	a.StrImm(X4, X9, VCursorOffKey)
 	a.StrImm(xzr, X9, VCursorOffN)
 	a.StrImm(xzr, X9, VCursorOffPos)
@@ -423,6 +457,27 @@ func (e *vmEmitArm) seekIdx(pc int, in VInsn) {
 	a.StrImm(X10, X9, VCursorOffState)
 	e.jmpBlock(pc, in.T)
 	a.Label(done)
+}
+
+// seekIdxServed adds to the cursor in X9's Served the rows its last seek's run
+// served, up to the row it is on, when it has one (State 2, 4 or 5). X10 and
+// X11 are scratch.
+func (e *vmEmitArm) seekIdxServed(served, skip string) {
+	a := e.a
+	a.LdrImm(X10, X9, VCursorOffState)
+	a.CmpImm(X10, 2)
+	a.Bcond(CondE, served)
+	a.CmpImm(X10, 4)
+	a.Bcond(CondE, served)
+	a.CmpImm(X10, 5)
+	a.Bcond(CondNE, skip)
+	a.Label(served)
+	a.LdrImm(X10, X9, VCursorOffLast)
+	a.AddImm(X10, X10, 1)
+	a.LdrImm(X11, X9, VCursorOffSrvd)
+	a.AddReg(X10, X10, X11)
+	a.StrImm(X10, X9, VCursorOffSrvd)
+	a.Label(skip)
 }
 
 // seekRewind is VSeekRewind.

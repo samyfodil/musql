@@ -164,25 +164,33 @@ func TestVMSeekRowid(t *testing.T) {
 	}
 }
 
-// TestVMSeekIdx seeks keys through a segment's equality index with VSeekIdx
-// and VSeekRewind, walks the run with VNext reading a column in segment mode,
-// and jumps to T for a key no row holds; a REAL key and a cursor with no index
-// exit.
+// TestVMSeekIdx seeks keys through the equality indexes of two segments with
+// VSeekIdx and VSeekRewind, walks the run with VNext reading a column in
+// segment mode, and jumps to T for a key no row holds. A key both segments'
+// ranges hold, a REAL key and a cursor with no index exit.
 func TestVMSeekIdx(t *testing.T) {
 	if !Available || !VMSegCursor {
 		t.Skip("no segment cursors on this platform")
 	}
 	noGC(t)
-	// Rows 0..7: key column 0, value column 1.
-	keys := []uint64{7, 3, 7, 1, 3, 7, 9, 3}
-	vals := []uint64{100, 101, 102, 103, 104, 105, 106, 107}
-	cols := []VSegCol{{Kind: VSegInt, Block: unsafe.Pointer(&keys[0])}, {Kind: VSegInt, Block: unsafe.Pointer(&vals[0])}}
-	seg := &VSeg{Cols: unsafe.Pointer(&cols[0]), First: 1, Dense: 1}
-	ivals := []int64{1, 3, 7, 9}
-	starts := []int32{0, 1, 4, 7, 8}
-	rows := []int{3, 1, 4, 7, 0, 2, 5, 6}
-	ix := &VIdx{Vals: unsafe.Pointer(&ivals[0]), NVals: 4, Starts: unsafe.Pointer(&starts[0]), Rows: unsafe.Pointer(&rows[0]),
-		Seg: unsafe.Pointer(seg), Mask: 3}
+	// Segment 0, rows 0..7 (rowids 1..8): key column 0, value column 1.
+	keys0 := []uint64{7, 3, 7, 1, 3, 7, 9, 3}
+	vals0 := []uint64{100, 101, 102, 103, 104, 105, 106, 107}
+	// Segment 1, rows 0..3 (rowids 9..12): keys 9 (again), 12, 15.
+	keys1 := []uint64{12, 9, 15, 12}
+	vals1 := []uint64{200, 201, 202, 203}
+	cols0 := []VSegCol{{Kind: VSegInt, Block: unsafe.Pointer(&keys0[0])}, {Kind: VSegInt, Block: unsafe.Pointer(&vals0[0])}}
+	cols1 := []VSegCol{{Kind: VSegInt, Block: unsafe.Pointer(&keys1[0])}, {Kind: VSegInt, Block: unsafe.Pointer(&vals1[0])}}
+	seg0 := &VSeg{Cols: unsafe.Pointer(&cols0[0]), First: 1, Dense: 1}
+	seg1 := &VSeg{Cols: unsafe.Pointer(&cols1[0]), First: 9, Dense: 1}
+	iv0, st0, rw0 := []int64{1, 3, 7, 9}, []int32{0, 1, 4, 7, 8}, []int{3, 1, 4, 7, 0, 2, 5, 6}
+	iv1, st1, rw1 := []int64{9, 12, 15}, []int32{0, 1, 3, 4}, []int{1, 0, 3, 2}
+	ix := []VIdx{
+		{Vals: unsafe.Pointer(&iv0[0]), NVals: 4, Starts: unsafe.Pointer(&st0[0]), Rows: unsafe.Pointer(&rw0[0]), Seg: unsafe.Pointer(seg0), Mask: 3,
+			Count: 2, Lo: 1, Hi: 9},
+		{Vals: unsafe.Pointer(&iv1[0]), NVals: 3, Starts: unsafe.Pointer(&st1[0]), Rows: unsafe.Pointer(&rw1[0]), Seg: unsafe.Pointer(seg1), Mask: 3,
+			Count: 1, Lo: 9, Hi: 15},
+	}
 	prog := []VInsn{
 		{Op: VSeekIdx, A: 0, B: 0, T: 5},
 		{Op: VSeekRewind, A: 0},
@@ -191,31 +199,41 @@ func TestVMSeekIdx(t *testing.T) {
 		{Op: VExit},
 		{Op: VExit},
 	}
-	want := map[int64][]int{1: {3}, 3: {1, 4, 7}, 7: {0, 2, 5}, 9: {6}}
-	for _, key := range []int64{0, 1, 2, 3, 7, 8, 9, 10, -1} {
+	type hit struct {
+		seg  *VSeg
+		run  []int
+		last uint64
+	}
+	want := map[int64]hit{1: {seg0, []int{3}, 103}, 3: {seg0, []int{1, 4, 7}, 107}, 7: {seg0, []int{0, 2, 5}, 105},
+		12: {seg1, []int{0, 3}, 203}, 15: {seg1, []int{2}, 202}}
+	for _, key := range []int64{0, 1, 2, 3, 7, 8, 9, 10, 12, 13, 15, 16, -1} {
 		regs := []tvalue{{Typ: tvInt, I: key}, {Typ: tvInt, I: -1}}
-		cur := &VCursor{Last: -1, Idx: unsafe.Pointer(ix)}
+		cur := &VCursor{Last: -1, Idx: unsafe.Pointer(&ix[0])}
 		pc := runVMCursor(t, prog, regs, nil, cur, 0)
-		run, found := want[key]
+		h, found := want[key]
 		switch {
+		case key == 9:
+			if pc != 0 || cur.State != 0 {
+				t.Fatalf("key 9, in both segments' ranges: pc %d state %d, want an exit", pc, cur.State)
+			}
 		case !found:
 			if pc != 5 || cur.State != 3 || cur.Key != key || regs[1].I != -1 {
 				t.Fatalf("key %d (none): pc %d state %d r1 %+v", key, pc, cur.State, regs[1])
 			}
-		case pc != 4 || cur.State != 4 || cur.N != int64(len(run)) || cur.Last != int64(len(run)-1) ||
-			regs[1].Typ != tvInt || regs[1].I != int64(vals[run[len(run)-1]]):
+		case pc != 4 || cur.State != 4 || cur.Seg != unsafe.Pointer(h.seg) || cur.N != int64(len(h.run)) || cur.Last != int64(len(h.run)-1) ||
+			regs[1].Typ != tvInt || regs[1].I != int64(h.last):
 			t.Fatalf("key %d: pc %d state %d N %d last %d r1 %+v", key, pc, cur.State, cur.N, cur.Last, regs[1])
 		default:
 			sel := unsafe.Slice((*int)(cur.Sel), cur.N)
-			for i, r := range run {
+			for i, r := range h.run {
 				if sel[i] != r {
-					t.Fatalf("key %d: run %v, want %v", key, sel, run)
+					t.Fatalf("key %d: run %v, want %v", key, sel, h.run)
 				}
 			}
 		}
 	}
 	regs := []tvalue{{Typ: tvReal, F: 3}, {Typ: tvInt, I: -1}}
-	if pc := runVMCursor(t, prog, regs, nil, &VCursor{Last: -1, Idx: unsafe.Pointer(ix)}, 0); pc != 0 {
+	if pc := runVMCursor(t, prog, regs, nil, &VCursor{Last: -1, Idx: unsafe.Pointer(&ix[0])}, 0); pc != 0 {
 		t.Fatalf("a REAL key ran natively to %d", pc)
 	}
 	regs = []tvalue{{Typ: tvInt, I: 3}, {Typ: tvInt, I: -1}}

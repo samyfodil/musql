@@ -188,13 +188,16 @@ const (
 	// VSeekRewind: the OP_Rewind after a VSeekRowid, which has done its work:
 	// go on (State 2 becomes 4). Reached any other way, it exits.
 	VSeekRewind
-	// VSeekIdx: put cursor A in segment mode on the rows of its table's
-	// segment whose indexed column (VCursor.Idx) holds the INTEGER in r[B], in
-	// the index's row order, as the VDBE's OP_SeekIndexHint, OP_AutoIndexOrder
-	// and OP_Rewind of that key would, then fall through to the VSeekRewind;
-	// jump to T when no row does. A key that is no INTEGER, a cursor with no
-	// Idx, and the write barrier exit. Key and State are as VSeekRowid leaves
-	// them.
+	// VSeekIdx: put cursor A in segment mode on the rows of its table whose
+	// indexed column (VCursor.Idx) holds the INTEGER in r[B], in the index's
+	// row order, as the VDBE's OP_SeekIndexHint, OP_AutoIndexOrder and
+	// OP_Rewind of that key would, then fall through to the VSeekRewind; jump
+	// to T when no row does. A key that is no INTEGER, a cursor with no Idx, a
+	// key a later segment's range also holds (its rows may span segments) and
+	// the write barrier exit. Key and State are as VSeekRowid leaves them;
+	// Served gains, at each VSeekIdx, the rows the last seek's run served up
+	// to the cursor's row -- State 5 being a list the engine seeked and handed
+	// over on its row Last, with Served set so the gain is the rows past it.
 	VSeekIdx
 
 	// VText: r[A] = the TEXT of the B bytes at Imm, which the engine keeps
@@ -366,16 +369,17 @@ type VCursor struct {
 	// a list of N ints, the row at Pos being Sel[Pos] (an index seek's rows,
 	// a scan in a key's order). Nil, the row is Pos.
 	Sel unsafe.Pointer
-	// Idx, when not nil, is the equality index VSeekIdx searches (a *VIdx):
-	// the cursor's table is that one segment.
+	// Idx, when not nil, is the equality indexes VSeekIdx searches: the first
+	// of the VIdxs of the table's segments, in order.
 	Idx unsafe.Pointer
 }
 
 // VIdx is one segment's equality index over a column, as VSeekIdx searches
-// it: Vals the NVals distinct INTEGERs ascending, Starts the NVals+1 int32s
-// where each value's rows begin in Rows, Rows the segment rows (ints) in the
-// order a seek visits them, Seg the segment's VSeg and Mask the columns native
-// code reads from it.
+// it: Vals the NVals distinct INTEGERs ascending, from Lo to Hi, Starts the
+// NVals+1 int32s where each value's rows begin in Rows, Rows the segment rows
+// (ints) in the order a seek visits them, Seg the segment's VSeg and Mask the
+// columns native code reads from it. Count is how many VIdxs this one and
+// those after it in the table's array make.
 type VIdx struct {
 	Vals   unsafe.Pointer
 	NVals  int64
@@ -383,6 +387,8 @@ type VIdx struct {
 	Rows   unsafe.Pointer
 	Seg    unsafe.Pointer
 	Mask   uint64
+	Count  int64
+	Lo, Hi int64
 }
 
 // VTab is the segments of a table, in the order the engine searches them.
@@ -460,6 +466,10 @@ const (
 	VIdxOffRows     = 24
 	VIdxOffSeg      = 32
 	VIdxOffMask     = 40
+	VIdxOffCount    = 48
+	VIdxOffLo       = 56
+	VIdxOffHi       = 64
+	VIdxSize        = 72
 	VTabOffSegs     = 0
 	VTabOffN        = 8
 	VTabSegSize     = 40
