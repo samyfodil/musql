@@ -864,6 +864,8 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		e.column(pc, in)
 	case VSeekRowid:
 		e.seekRowid(pc, in)
+	case VSeekIdx:
+		e.seekIdx(pc, in)
 	case VSeekRewind:
 		e.seekRewind(pc, in)
 	case VText:

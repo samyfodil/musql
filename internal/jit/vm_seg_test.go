@@ -164,6 +164,66 @@ func TestVMSeekRowid(t *testing.T) {
 	}
 }
 
+// TestVMSeekIdx seeks keys through a segment's equality index with VSeekIdx
+// and VSeekRewind, walks the run with VNext reading a column in segment mode,
+// and jumps to T for a key no row holds; a REAL key and a cursor with no index
+// exit.
+func TestVMSeekIdx(t *testing.T) {
+	if !Available || !VMSegCursor {
+		t.Skip("no segment cursors on this platform")
+	}
+	noGC(t)
+	// Rows 0..7: key column 0, value column 1.
+	keys := []uint64{7, 3, 7, 1, 3, 7, 9, 3}
+	vals := []uint64{100, 101, 102, 103, 104, 105, 106, 107}
+	cols := []VSegCol{{Kind: VSegInt, Block: unsafe.Pointer(&keys[0])}, {Kind: VSegInt, Block: unsafe.Pointer(&vals[0])}}
+	seg := &VSeg{Cols: unsafe.Pointer(&cols[0]), First: 1, Dense: 1}
+	ivals := []int64{1, 3, 7, 9}
+	starts := []int32{0, 1, 4, 7, 8}
+	rows := []int{3, 1, 4, 7, 0, 2, 5, 6}
+	ix := &VIdx{Vals: unsafe.Pointer(&ivals[0]), NVals: 4, Starts: unsafe.Pointer(&starts[0]), Rows: unsafe.Pointer(&rows[0]),
+		Seg: unsafe.Pointer(seg), Mask: 3}
+	prog := []VInsn{
+		{Op: VSeekIdx, A: 0, B: 0, T: 5},
+		{Op: VSeekRewind, A: 0},
+		{Op: VColumn, A: 0, B: 1, C: 1, Imm: 1},
+		{Op: VNext, A: 0, T: 2},
+		{Op: VExit},
+		{Op: VExit},
+	}
+	want := map[int64][]int{1: {3}, 3: {1, 4, 7}, 7: {0, 2, 5}, 9: {6}}
+	for _, key := range []int64{0, 1, 2, 3, 7, 8, 9, 10, -1} {
+		regs := []tvalue{{Typ: tvInt, I: key}, {Typ: tvInt, I: -1}}
+		cur := &VCursor{Last: -1, Idx: unsafe.Pointer(ix)}
+		pc := runVMCursor(t, prog, regs, nil, cur, 0)
+		run, found := want[key]
+		switch {
+		case !found:
+			if pc != 5 || cur.State != 3 || cur.Key != key || regs[1].I != -1 {
+				t.Fatalf("key %d (none): pc %d state %d r1 %+v", key, pc, cur.State, regs[1])
+			}
+		case pc != 4 || cur.State != 4 || cur.N != int64(len(run)) || cur.Last != int64(len(run)-1) ||
+			regs[1].Typ != tvInt || regs[1].I != int64(vals[run[len(run)-1]]):
+			t.Fatalf("key %d: pc %d state %d N %d last %d r1 %+v", key, pc, cur.State, cur.N, cur.Last, regs[1])
+		default:
+			sel := unsafe.Slice((*int)(cur.Sel), cur.N)
+			for i, r := range run {
+				if sel[i] != r {
+					t.Fatalf("key %d: run %v, want %v", key, sel, run)
+				}
+			}
+		}
+	}
+	regs := []tvalue{{Typ: tvReal, F: 3}, {Typ: tvInt, I: -1}}
+	if pc := runVMCursor(t, prog, regs, nil, &VCursor{Last: -1, Idx: unsafe.Pointer(ix)}, 0); pc != 0 {
+		t.Fatalf("a REAL key ran natively to %d", pc)
+	}
+	regs = []tvalue{{Typ: tvInt, I: 3}, {Typ: tvInt, I: -1}}
+	if pc := runVMCursor(t, prog, regs, nil, &VCursor{Last: -1}, 0); pc != 0 {
+		t.Fatalf("a cursor with no index ran natively to %d", pc)
+	}
+}
+
 // TestVMTextOrder compares TEXTs with every ordered condition, as
 // bytes.Compare orders them, and under a numeric affinity (Imm 1) exits when
 // either is a whole number, which parseFullNumeric would convert.

@@ -61,6 +61,7 @@ func TestVCursorLayout(t *testing.T) {
 		{"Key", unsafe.Offsetof(c.Key), VCursorOffKey},
 		{"Served", unsafe.Offsetof(c.Served), VCursorOffSrvd},
 		{"Sel", unsafe.Offsetof(c.Sel), VCursorOffSel},
+		{"Idx", unsafe.Offsetof(c.Idx), VCursorOffIdx},
 	} {
 		if f.got != f.want {
 			t.Errorf("VCursor %s is %d, generated code uses %d", f.name, f.got, f.want)
@@ -74,6 +75,11 @@ func TestVCursorLayout(t *testing.T) {
 		unsafe.Offsetof(sc.Exc) != VSegColOffExc || unsafe.Offsetof(sc.Heap) != VSegColOffHeap ||
 		unsafe.Offsetof(sc.Plain) != VSegColOffPlain {
 		t.Fatalf("VSeg or VSegCol is laid out differently from what generated code uses")
+	}
+	var ix VIdx
+	if unsafe.Offsetof(ix.Vals) != VIdxOffVals || unsafe.Offsetof(ix.NVals) != VIdxOffNVals || unsafe.Offsetof(ix.Starts) != VIdxOffStarts ||
+		unsafe.Offsetof(ix.Rows) != VIdxOffRows || unsafe.Offsetof(ix.Seg) != VIdxOffSeg || unsafe.Offsetof(ix.Mask) != VIdxOffMask {
+		t.Fatalf("VIdx is laid out differently from what generated code uses")
 	}
 	var v tvalue
 	if unsafe.Sizeof(v) != 48 || unsafe.Offsetof(v.I) != 8 || unsafe.Offsetof(v.F) != 16 || unsafe.Offsetof(v.S) != 24 {

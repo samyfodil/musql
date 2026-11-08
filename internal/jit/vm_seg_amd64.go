@@ -376,6 +376,90 @@ func (e *vmEmit) seekRowid(pc int, in VInsn) {
 	a.Label(l("done"))
 }
 
+// seekIdx is VSeekIdx: a binary search of the index's INTEGERs, then the
+// cursor on the rows its run names (Sel). RAX, RCX, RDX, R9, R10 and X0-X1 are
+// scratch.
+func (e *vmEmit) seekIdx(pc int, in VInsn) {
+	a, L := e.a, e.lay
+	cb := int32(in.A * VCursorSize)
+	e.unmap(^in.A)
+	l := func(s string) string { return fmt.Sprintf("si%d.%s", pc, s) }
+	a.CmpMemDByte(RSI, e.d(in.B, L.OffTyp), L.TypInt)
+	e.jccStub(CondNE, pc) // the key's conversions are the VDBE's
+	e.jccWB(pc)           // the cursor's segment pointers are stored
+	a.MovRegMemD(RAX, RDI, POffCur)
+	a.LeaRegMemD(RAX, RAX, cb)
+	a.MovRegMemD(R9, RAX, VCursorOffIdx)
+	a.TestRegReg(R9, R9)
+	e.jccStub(CondE, pc)
+	a.MovqXR(X0, RAX) // the cursor
+	a.MovqXR(X1, R9)  // the index
+	a.MovRegMemD(RCX, RSI, e.d(in.B, L.OffI))
+	a.MovRegMemD(RDX, R9, VIdxOffVals)
+	a.MovRegMemD(R9, R9, VIdxOffNVals) // hi
+	a.XorRegReg(RAX, RAX)              // lo
+	a.Label(l("bloop"))
+	a.CmpRegReg(RAX, R9)
+	a.Jcc(CondGE, l("bdone"))
+	a.MovRegReg(R10, RAX)
+	a.AddRegReg(R10, R9)
+	a.SarRegImm8(R10, 1)
+	a.CmpMemIdxReg(RDX, R10, RCX) // vals[mid] against key
+	a.Jcc(CondGE, l("bhi"))
+	a.LeaRegMemD(RAX, R10, 1)
+	a.Jmp(l("bloop"))
+	a.Label(l("bhi"))
+	a.MovRegReg(R9, R10)
+	a.Jmp(l("bloop"))
+	a.Label(l("bdone"))
+	a.MovqRX(R9, X1)
+	a.AluRegMemD(AluCmp, RAX, R9, VIdxOffNVals)
+	a.Jcc(CondGE, l("miss"))
+	a.CmpMemIdxReg(RDX, RAX, RCX)
+	a.Jcc(CondNE, l("miss"))
+
+	// Found value RAX: its rows are Rows[Starts[RAX]:Starts[RAX+1]].
+	a.MovqRX(R10, X0)
+	a.MovMemDReg(R10, VCursorOffKey, RCX)
+	a.MovRegMemD(RDX, R9, VIdxOffStarts)
+	a.MovsxdRegMemIdx4(RCX, RDX, RAX)
+	a.IncReg(RAX)
+	a.MovsxdRegMemIdx4(RAX, RDX, RAX)
+	a.SubRegReg(RAX, RCX)
+	a.MovMemDReg(R10, VCursorOffN, RAX)
+	a.MovRegMemD(RDX, R9, VIdxOffRows)
+	a.LeaIdx(RDX, RDX, RCX)
+	a.MovMemDReg(R10, VCursorOffSel, RDX)
+	a.MovRegMemD(RCX, R9, VIdxOffSeg)
+	a.MovMemDReg(R10, VCursorOffSeg, RCX)
+	a.MovRegMemD(RCX, RCX, VSegOffRowids)
+	a.MovMemDReg(R10, VCursorOffRids, RCX)
+	a.MovRegMemD(RCX, R9, VIdxOffMask)
+	a.MovMemDReg(R10, VCursorOffMask, RCX)
+	a.MovMemDImm(R10, VCursorOffPos, 0)
+	a.MovMemDImm(R10, VCursorOffLast, 0)
+	a.MovMemDImm(R10, VCursorOffOk, 1)
+	a.MovMemDImm(R10, VCursorOffDirty, 1)
+	a.MovMemDImm(R10, VCursorOffAdv, 1)
+	a.MovMemDImm(R10, VCursorOffState, 2)
+	a.MovRegMemD(RCX, R10, VCursorOffSrvd)
+	a.IncReg(RCX)
+	a.MovMemDReg(R10, VCursorOffSrvd, RCX)
+	a.Jmp(l("done"))
+
+	// No row: the cursor on none, and on to T.
+	a.Label(l("miss"))
+	a.MovqRX(R10, X0)
+	a.MovMemDReg(R10, VCursorOffKey, RCX)
+	a.MovMemDImm(R10, VCursorOffN, 0)
+	a.MovMemDImm(R10, VCursorOffPos, 0)
+	a.MovMemDImm(R10, VCursorOffOk, 1)
+	a.MovMemDImm(R10, VCursorOffDirty, 1)
+	a.MovMemDImm(R10, VCursorOffState, 3)
+	e.jmpBlock(pc, in.T)
+	a.Label(l("done"))
+}
+
 // seekRewind is VSeekRewind.
 func (e *vmEmit) seekRewind(pc int, in VInsn) {
 	a := e.a

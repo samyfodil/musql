@@ -343,6 +343,88 @@ func (e *vmEmitArm) seekRowid(pc int, in VInsn) {
 	a.Label(done)
 }
 
+// seekIdx is vm_seg_amd64.go's VSeekIdx. X9 the cursor, X4 the key, X5 the
+// index, X7 its values; X8 lo, X13 hi and X12 mid of the search.
+func (e *vmEmitArm) seekIdx(pc int, in VInsn) {
+	a, L := e.a, e.lay
+	e.unmap(^in.A)
+	bloop, bhi, bdone, miss, done := e.vmLabel("ib"), e.vmLabel("ih"), e.vmLabel("id"), e.vmLabel("im"), e.vmLabel("ie")
+	e.ldrb(X10, in.B, L.OffTyp)
+	a.CmpImm(X10, uint32(L.TypInt))
+	a.Bcond(CondNE, e.stub(pc)) // the key's conversions are the VDBE's
+	e.branchWB(pc)              // the cursor's segment pointers are stored
+	e.ldr(X4, in.B, L.OffI)
+	e.curBase(in.A)
+	a.LdrImm(X5, X9, VCursorOffIdx)
+	a.Cbz(X5, e.stub(pc))
+	a.LdrImm(X7, X5, VIdxOffVals)
+	a.MovImm16(X8, 0)
+	a.LdrImm(X13, X5, VIdxOffNVals)
+	a.Label(bloop)
+	a.Cmp(X8, X13)
+	a.Bcond(CondGE, bdone)
+	a.AddReg(X12, X8, X13)
+	a.AsrImm(X12, X12, 1)
+	a.LdrRegIdx(X11, X7, X12)
+	a.Cmp(X11, X4)
+	a.Bcond(CondGE, bhi)
+	a.AddImm(X8, X12, 1)
+	a.B(bloop)
+	a.Label(bhi)
+	a.MovReg(X13, X12)
+	a.B(bloop)
+	a.Label(bdone)
+	a.LdrImm(X11, X5, VIdxOffNVals)
+	a.Cmp(X8, X11)
+	a.Bcond(CondGE, miss)
+	a.LdrRegIdx(X11, X7, X8)
+	a.Cmp(X11, X4)
+	a.Bcond(CondNE, miss)
+
+	// Found value X8: its rows are Rows[Starts[X8]:Starts[X8+1]].
+	a.StrImm(X4, X9, VCursorOffKey)
+	a.LdrImm(X10, X5, VIdxOffStarts)
+	a.LdrswRegLSL2(X11, X10, X8)
+	a.AddImm(X8, X8, 1)
+	a.LdrswRegLSL2(X12, X10, X8)
+	a.SubReg(X12, X12, X11)
+	a.StrImm(X12, X9, VCursorOffN)
+	a.LdrImm(X10, X5, VIdxOffRows)
+	a.AddRegLSL3(X10, X10, X11)
+	a.StrImm(X10, X9, VCursorOffSel)
+	a.LdrImm(X10, X5, VIdxOffSeg)
+	a.StrImm(X10, X9, VCursorOffSeg)
+	a.LdrImm(X10, X10, VSegOffRowids)
+	a.StrImm(X10, X9, VCursorOffRids)
+	a.LdrImm(X10, X5, VIdxOffMask)
+	a.StrImm(X10, X9, VCursorOffMask)
+	a.StrImm(xzr, X9, VCursorOffPos)
+	a.StrImm(xzr, X9, VCursorOffLast)
+	a.MovImm16(X10, 1)
+	a.StrImm(X10, X9, VCursorOffOk)
+	a.StrImm(X10, X9, VCursorOffDirty)
+	a.StrImm(X10, X9, VCursorOffAdv)
+	a.MovImm16(X10, 2)
+	a.StrImm(X10, X9, VCursorOffState)
+	a.LdrImm(X10, X9, VCursorOffSrvd)
+	a.AddImm(X10, X10, 1)
+	a.StrImm(X10, X9, VCursorOffSrvd)
+	a.B(done)
+
+	// No row: the cursor on none, and on to T.
+	a.Label(miss)
+	a.StrImm(X4, X9, VCursorOffKey)
+	a.StrImm(xzr, X9, VCursorOffN)
+	a.StrImm(xzr, X9, VCursorOffPos)
+	a.MovImm16(X10, 1)
+	a.StrImm(X10, X9, VCursorOffOk)
+	a.StrImm(X10, X9, VCursorOffDirty)
+	a.MovImm16(X10, 3)
+	a.StrImm(X10, X9, VCursorOffState)
+	e.jmpBlock(pc, in.T)
+	a.Label(done)
+}
+
 // seekRewind is VSeekRewind.
 func (e *vmEmitArm) seekRewind(pc int, in VInsn) {
 	a := e.a
