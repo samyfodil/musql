@@ -3196,6 +3196,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				return nil, serr
 			}
 			xs := m.regs[op.P1 : op.P1+len(plan.affs)]
+			if plan.shared && inSubConverts(xs[0], plan) {
+				return nil, fmt.Errorf("%w: an IN converts a group's value that C SQLite shares with the rest of the aggregate's result", errVDBEUnsupported)
+			}
 			if set := m.inSetFor(plan, op.P3, rows); set != nil {
 				m.regs[op.P2] = set.membership(xs[0], plan.not)
 			} else {

@@ -890,6 +890,13 @@ type inSubPlan struct {
 	// must be RE-RUN (against the enclosing frame) on every evaluation rather
 	// than materialized once and cached -- see the OpInSub doc comment above.
 	correlated bool
+	// shared marks a probe that is a group's value C converts in place to
+	// sharedAff, which the aggregate's result reads again
+	// (inSubConvertsGroupValue). sharedReal says the value is a REAL column's,
+	// which C's register holds as a REAL where this one may hold the integer it
+	// is stored as.
+	shared, sharedReal bool
+	sharedAff          affinity
 }
 
 // rowSubPlan is the P4 payload of OpRowSub: a ROW-VALUE comparison one of

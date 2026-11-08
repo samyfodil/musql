@@ -40,6 +40,10 @@ type aggResultRegs struct {
 	// identity (see the owner note above groupKeyExpr, sql_group.go). A
 	// placeholder naming a DIFFERENT owner walks straight past this block.
 	owner *aggPlan
+	// item is the result item being compiled and tree the copy of its
+	// expression compiled, whose subquery bodies are rewritten.
+	item *itemPlan
+	tree Expr
 
 	agg   []int
 	key   []int
@@ -407,6 +411,8 @@ func compileAggItemProgram(pager *ReadOnlyPager, enclosing *compiler, plan *aggP
 	c.aggSkipped = enclosing
 	c.aggRegs = &aggResultRegs{
 		owner: plan,
+		item:  it,
+		tree:  tree,
 		agg:   rowRegsFor(p.aggBase, p.nAgg),
 		key:   rowRegsFor(p.keyBase, p.nKey),
 		col:   rowRegsFor(p.colBase, p.nCols),

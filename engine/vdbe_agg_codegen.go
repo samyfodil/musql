@@ -1929,6 +1929,7 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 
 		magnet:      gp.magnet,
 		anchorCheck: anchorChk,
+		groupExprs:  gp.groupExprs,
 	}
 	rowFree := !gp.usesGroupBare && !gp.selectHasSubquery && !gp.anchorObservable && anchorChk == nil &&
 		!anyAggOrderBy(aggs) && !orderBySubqueryReadsRow(c.pager, stmt.OrderBy) && !subqueryReadsRow(c.pager, stmt.Having)

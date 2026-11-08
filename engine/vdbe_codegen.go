@@ -3926,6 +3926,10 @@ func (c *compiler) compileInSubquery(x InExpr) (int, error) {
 	}
 	colls := inSubRowCollations(c.affCtx(), lhsCollOperands, subColls)
 	plan := &inSubPlan{prog: prog, affs: affs, colls: colls, not: x.Not, correlated: prog.Correlated}
+	if arity == 1 && lhsSub == nil && len(subAffs) == 1 {
+		plan.sharedAff, plan.shared = c.inSubConvertsGroupValue(probe[0], subAffs[0], subMats[0], x.Sub, prog.Correlated)
+		plan.sharedReal = plan.shared && groupValueIsReal(probe[0])
+	}
 	d := c.alloc()
 	// A correlated membership subquery re-runs per evaluation (no cache slot);
 	// an uncorrelated one runs once and caches, keyed by a fresh slot.

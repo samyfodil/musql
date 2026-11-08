@@ -53,6 +53,9 @@ type aggPlan struct {
 	// keyCols[i], set with rowCols, is the row block's column GROUP BY key i
 	// is a bare read of, or -1.
 	keyCols []int
+	// groupExprs is the GROUP BY list, for compile-time questions about which
+	// columns a key reads (groupValueReadAgain); nil without a GROUP BY.
+	groupExprs []Expr
 
 	scopes  []tableScope
 	nCols   int   // total column count across every joined table -- the [cols..] block width; len(scopes) rowid slots immediately follow it in the [cols.., rowids..] layout (see aggRowSplit)

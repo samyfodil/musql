@@ -282,7 +282,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 		if in := &prog.Insns[pc]; in.Op == OpInSub && jit.VMTextOrder {
 			// An uncorrelated IN of one column, which native code probes in the
 			// set the VDBE builds on its first run (inHashSet.ints).
-			if plan, isPlan := in.P4.(*inSubPlan); isPlan && !plan.correlated && len(plan.affs) == 1 && plan.affs[0] != affText &&
+			if plan, isPlan := in.P4.(*inSubPlan); isPlan && !plan.correlated && !plan.shared && len(plan.affs) == 1 && plan.affs[0] != affText &&
 				(plan.colls[0] == "" || strings.EqualFold(plan.colls[0], "BINARY")) && in.P1 >= 0 && in.P1 < prog.NReg && in.P2 >= 0 && in.P2 < prog.NReg && in.P3 >= 0 {
 				vp[pc] = jit.VInsn{Op: jit.VInSub, A: in.P1, B: len(inSlots), C: in.P2}
 				if plan.not {
