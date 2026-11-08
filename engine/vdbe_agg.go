@@ -489,7 +489,7 @@ func (m *vdbe) aggResult(info *aggResultInfo, groupKey []Value) (Value, error) {
 	default: // aggSetOut
 		it, accs = plan.outPlans[info.idx], m.aggAccs.out[info.idx]
 	}
-	aggVals := make([]Value, len(accs))
+	aggVals := growValues(&m.aggValsBuf, len(accs))
 	for i, acc := range accs {
 		v, err := acc.finalize()
 		if err != nil {
@@ -535,6 +535,9 @@ func (m *vdbe) aggResult(info *aggResultInfo, groupKey []Value) (Value, error) {
 	// An item that does not lower fails at compile time, so this check only
 	// guards per-execution widths.
 	if p := it.prog; p.runnable(m, aggVals, groupKey, bareVals, bareRowids) {
+		if v, ok := p.seeded(aggVals, groupKey, bareVals, bareRowids); ok {
+			return v, nil
+		}
 		return p.run(m, aggVals, groupKey, bareVals, bareRowids)
 	}
 	return Value{}, fmt.Errorf("%w: aggregate result item's register block does not match its program", errVDBEUnsupported)

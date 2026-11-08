@@ -498,6 +498,25 @@ func (p *aggItemProgram) runnable(m *vdbe, aggVals, groupKey, bareVals, bareRowi
 		len(bareVals) >= p.nCols && len(bareRowids) >= p.nRowid
 }
 
+// seeded is run's answer without running, for a program that computes
+// nothing: its result is a register of one of the blocks run would seed (a
+// group's column, key, rowid or aggregate value as it stands).
+func (p *aggItemProgram) seeded(aggVals, groupKey, bareVals, bareRowids []Value) (Value, bool) {
+	if in := p.prog.Insns; len(in) != 2 || in[0].Op != OpInit || in[1].Op != OpHalt {
+		return Value{}, false
+	}
+	r := p.resultReg
+	for _, b := range []struct {
+		base, n int
+		vals    []Value
+	}{{p.aggBase, p.nAgg, aggVals}, {p.keyBase, p.nKey, groupKey}, {p.colBase, p.nCols, bareVals}, {p.rowidBase, p.nRowid, bareRowids}} {
+		if r >= b.base && r < b.base+b.n {
+			return b.vals[r-b.base], true
+		}
+	}
+	return Value{}, false
+}
+
 // run seeds the four register blocks for one group and runs the program.
 func (p *aggItemProgram) run(m *vdbe, aggVals, groupKey, bareVals, bareRowids []Value) (Value, error) {
 	pm := m.aggItemVM(p.prog)
