@@ -2246,7 +2246,7 @@ func (jx *vmJIT) syncCursor(m *vdbe, c, exit int) {
 // across it.
 func cursorFreeOp(in *Instruction) bool {
 	switch in.Op {
-	case OpMakeRecord, OpConcat, OpSCopy, OpCopy, OpInteger, OpInt64, OpReal, OpString8, OpNull, OpClearSubtype, OpLike, OpGlob,
+	case OpMakeRecord, OpConcat, OpSCopy, OpCopy, OpInteger, OpInt64, OpReal, OpString8, OpNull, OpClearSubtype, OpLike, OpGlob, OpSorterInsert,
 		OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight, OpBitNot, OpNegative:
 		return true
 	case OpFunction:
