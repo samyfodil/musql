@@ -185,6 +185,9 @@ type vdbeCursor struct {
 	// (and cleared) by OpMultiOrSort. See multiOrSortTagged.
 	multiOrGrp []int
 
+	// vmTab is the cursor's table as native code seeks it (vmJIT.tabFor).
+	vmTab *vmTab
+
 	// streamIfOrdered is set by OpOpenRead (P5 4) on the outermost scan when
 	// only its index-order key kept it from streaming: OpAutoIndexOrder lets it
 	// stream when its rows already run in that order (segRowsInKeyOrder).

@@ -1,0 +1,99 @@
+package engine
+
+import (
+	"encoding/binary"
+	"unsafe"
+
+	"github.com/samyfodil/musql/internal/jit"
+)
+
+// vmSeg is a segment as native code reads it in place (jit.VSeg): per column,
+// its cells and how they read, and mask the columns it reads at all.
+type vmSeg struct {
+	seg  jit.VSeg
+	cols []jit.VSegCol
+	mask uint64
+}
+
+// vmSegFor returns s as native code reads it for a table whose columns read by
+// plans, built once and kept with s. A column reads natively only where its
+// cells read as segColumnValue reads them with no fix-up native code lacks:
+// an int64, double or numeric block, an INTEGER PRIMARY KEY stored NULL (the
+// rowid), TEXT between heap bounds. Rows narrower than the table, defaults and
+// blobs are the VDBE's.
+func (s *segment) vmSegFor(plans []segColPlan) *vmSeg {
+	if v := s.vseg.Load(); v != nil {
+		return v
+	}
+	s.vsegMu.Lock()
+	defer s.vsegMu.Unlock()
+	if v := s.vseg.Load(); v != nil {
+		return v
+	}
+	v := &vmSeg{cols: make([]jit.VSegCol, min(len(s.cols), len(plans), 64))}
+	if s.dense {
+		v.seg.First, v.seg.Dense = int64(s.firstRowid), 1
+	} else {
+		v.seg.Rowids = unsafe.Pointer(&s.buf[s.rowidOff])
+	}
+	for c := range v.cols {
+		if !s.fullWidth || s.nRows == 0 {
+			break
+		}
+		col, plan := s.cols[c], &plans[c]
+		vc := &v.cols[c]
+		hasExc := s.excRows != nil && s.excRows[c] != nil
+		switch {
+		case plan.isIPK:
+			if col.phys == PhysNull && !hasExc {
+				vc.Kind = jit.VSegRowid
+			}
+		case col.bounds:
+			if col.phys == PhysText && len(s.heap) > 0 && s.textBoundsValid(c) {
+				vc.Kind = jit.VSegText
+				vc.Heap = unsafe.Pointer(unsafe.SliceData(s.heap))
+			}
+		case col.phys == PhysInt64 && plan.isReal:
+			vc.Kind = jit.VSegIntReal
+		case col.phys == PhysInt64:
+			vc.Kind = jit.VSegInt
+		case col.phys == PhysFloat64:
+			vc.Kind = jit.VSegFloat
+		case col.phys == PhysNumeric && !plan.isReal:
+			vc.Kind = jit.VSegNumeric
+		}
+		if vc.Kind == jit.VSegNone {
+			continue
+		}
+		if vc.Kind != jit.VSegRowid {
+			vc.Block = unsafe.Pointer(&s.buf[col.blockOff])
+			if col.nullOff != 0 {
+				vc.Nulls = unsafe.Pointer(&s.buf[col.nullOff])
+			}
+			if hasExc {
+				vc.Exc = unsafe.Pointer(&s.excRows[c][0])
+			}
+		}
+		v.mask |= 1 << uint(c)
+	}
+	if len(v.cols) > 0 {
+		v.seg.Cols = unsafe.Pointer(&v.cols[0])
+	}
+	s.vseg.Store(v)
+	return v
+}
+
+// textBoundsValid reports whether TEXT column c's bounds never step back and
+// stay within the heap: what boundCell checks per read, once for all rows.
+func (s *segment) textBoundsValid(c int) bool {
+	b := s.buf[int(s.cols[c].blockOff):]
+	prev := uint32(0)
+	for i := 0; i <= s.nRows; i++ {
+		x := binary.LittleEndian.Uint32(b[4*i:])
+		if x < prev || int(x) > len(s.heap) {
+			return false
+		}
+		prev = x
+	}
+	return true
+}

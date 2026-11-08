@@ -136,6 +136,10 @@ type segment struct {
 	// (segRowsInKeyOrder).
 	keyOrderMu eqCountMu
 	keyOrder   map[string]bool
+	// vseg is native code's view of this segment (segment_vseg.go), built on
+	// first use.
+	vsegMu eqCountMu
+	vseg   atomic.Pointer[vmSeg]
 	// Lazily built int8 copies of vector columns, a nil entry for a column
 	// that has none. See segment_vector_bound.go.
 	vecMu       eqCountMu
