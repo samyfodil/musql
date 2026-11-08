@@ -1965,18 +1965,20 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// and RIGHT/FULL coalesced columns in aggregate arguments, which only the drain
 	// can serve. A reference to a GROUP BY key column is allowed: each bucket holds
 	// a full aggAccumulators and magnetWalk runs per bucket in scan order.
-	if !useDistinctBatch && (!hasOrder || orderIsGroupKeyAscending(stmt, gp)) &&
+	//
+	// Under any other ORDER BY the groups go on to the same ORDER BY sorter
+	// this path's drain would feed: the hash drain emits them in key order,
+	// as sorter1 does when no DESC was pushed onto the keys (groupDesc), so
+	// the emission ordinals that break the ORDER BY's ties are the same.
+	ordered := hasOrder && !orderIsGroupKeyAscending(stmt, gp)
+	if !useDistinctBatch && (!ordered || !slices.Contains(gp.groupDesc, true)) &&
 		!gp.selectHasSubquery &&
 		!joinHasCoalescedColumns(plan.scopes) &&
 		!anyNonBinaryCollation(gp.groupColls) && !scanOrderGroups {
-		return compileScanGroupByHash(c, stmt, srcs, gp, plan, savedNQueryLoopKnown)
+		return compileScanGroupByHash(c, stmt, srcs, gp, plan, savedNQueryLoopKnown, ordered)
 	}
 
 	sorter1 := c.allocSorter()
-	sorter2 := -1
-	if hasOrder && !useDistinctBatch {
-		sorter2 = c.allocSorter()
-	}
 
 	initAddr := c.emit(Instruction{Op: OpInit})
 	c.patch(initAddr, 1)
@@ -2008,20 +2010,9 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 		coll1 = collationNames(gp.groupColls)
 	}
 	c.emit(Instruction{Op: OpSorterOpen, P1: sorter1, P4: &sorterKeyInfo{nKey: nSortKey, desc: desc1, nulls: nulls1, coll: coll1}})
+	sorter2 := -1
 	if hasOrder && !useDistinctBatch {
-		// sorter2 sorts finished groups by the ORDER BY keys, with the group's emission
-		// ordinal as a final ascending tiebreak (C pushes groups into the ORDER BY sorter
-		// in emission order). Unused with useDistinctBatch.
-		desc2 := make([]bool, nOrder+1)
-		nulls2 := make([]NullsOrder, nOrder+1)
-		// coll2's trailing entry is the sequence-number tiebreak, always BINARY.
-		coll2 := make([]string, nOrder+1)
-		for i, op := range gp.orderPlans {
-			desc2[i] = op.desc
-			nulls2[i] = op.nulls
-			coll2[i] = op.coll
-		}
-		c.emit(Instruction{Op: OpSorterOpen, P1: sorter2, P4: &sorterKeyInfo{nKey: nOrder + 1, desc: desc2, nulls: nulls2, coll: coll2}})
+		sorter2 = c.openGroupOrderSorter(gp)
 	}
 
 	// seqCounterReg is the scan-order sequence counter (see this function's
@@ -2257,7 +2248,7 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// batchBase below -- since it also needs the group's OWN key columns,
 	// which live in a record register, copied out via OpRecordColumn, not a
 	// plain register range).
-	var outBase, sort2Base, minSeqSlot, rec2Reg, finalRec, finalBase int
+	var outBase, sort2Base, rec2Reg, finalRec, finalBase int
 	var orderKeyBase, batchBase, batchWidth, batchRecReg int
 	switch {
 	case useDistinctBatch:
@@ -2273,7 +2264,6 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 		batchRecReg = c.allocRec()
 	case hasOrder:
 		sort2Base = c.allocN(nOrder + 1 + nOut)
-		minSeqSlot = sort2Base + nOrder
 		outBase = sort2Base + nOrder + 1
 		rec2Reg = c.allocRec()
 		finalRec = c.allocRec()
@@ -2333,16 +2323,7 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 			c.emit(Instruction{Op: OpMakeRecord, P1: batchBase, P2: batchWidth, P3: batchRecReg})
 			c.emit(Instruction{Op: OpGroupBatchAppend, P1: batchRecReg})
 		case hasOrder:
-			for i, op := range gp.orderPlans {
-				if op.ordinal > 0 {
-					c.emit(Instruction{Op: OpSCopy, P1: outBase + (op.ordinal - 1), P2: sort2Base + i})
-				} else {
-					c.emit(Instruction{Op: OpAggResult, P1: sort2Base + i, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetOrder, idx: i}})
-				}
-			}
-			c.emit(Instruction{Op: OpSCopy, P1: curEmitSeqReg, P2: minSeqSlot})
-			c.emit(Instruction{Op: OpMakeRecord, P1: sort2Base, P2: nOrder + 1 + nOut, P3: rec2Reg})
-			c.emit(Instruction{Op: OpSorterInsert, P1: sorter2, P2: rec2Reg})
+			c.emitGroupOrderInsert(plan, gp, sorter2, sort2Base, nOut, curEmitSeqReg, curKeyRec, rec2Reg)
 		default:
 			skipJumps = append(skipJumps, c.emitLimitOffsetGate(offsetReg, limitReg, oneReg, haveOffset, haveLimit, outBase, nOut)...)
 		}
@@ -2570,12 +2551,17 @@ func orderByMentionsSubquery(terms []OrderTerm) bool {
 	return false
 }
 
-func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp *groupByPlan, plan *aggPlan, preNQLKnown bool) (*Program, error) {
+func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp *groupByPlan, plan *aggPlan, preNQLKnown, ordered bool) (*Program, error) {
 	nGroup := len(gp.groupExprs)
 	nOut := len(gp.outCols)
 
 	initAddr := c.emit(Instruction{Op: OpInit})
 	c.patch(initAddr, 1)
+	// ordered: the groups go through the ORDER BY sorter (compileScanGroupBy).
+	sorter2 := -1
+	if ordered {
+		sorter2 = c.openGroupOrderSorter(gp)
+	}
 
 	// Scan-phase registers: the group-key columns, packed into their own
 	// small record (keyRec) purely so OpHashAggStep can key its bucket
@@ -2649,18 +2635,40 @@ func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp
 
 	// Drain phase: one bucket at a time, in group-key-ascending order.
 	curKeyRec := c.allocRec()
-	outBase := c.allocN(nOut)
 	havingReg := -1
 	if gp.havingPlan != nil {
 		havingReg = c.alloc()
 	}
-	offsetReg, limitReg, oneReg, haveOffset, haveLimit := c.emitLimitOffsetCounters(stmt)
+	// Ordered, a group's output is the tail of its ORDER BY sorter record
+	// [orderKeys.., ordinal, out..], as compileScanGroupBy lays it out.
+	nOrder := len(gp.orderPlans)
+	var outBase, sort2Base, seqReg, oneSeq, rec2Reg, finalRec, finalBase int
+	var offsetReg, limitReg, oneReg int
+	var haveOffset, haveLimit bool
+	if ordered {
+		sort2Base = c.allocN(nOrder + 1 + nOut)
+		outBase = sort2Base + nOrder + 1
+		seqReg, oneSeq = c.alloc(), c.alloc()
+		rec2Reg, finalRec, finalBase = c.allocRec(), c.allocRec(), c.allocN(nOut)
+		c.emit(Instruction{Op: OpInteger, P1: 0, P2: seqReg})
+		c.emit(Instruction{Op: OpInteger, P1: 1, P2: oneSeq})
+	} else {
+		outBase = c.allocN(nOut)
+		offsetReg, limitReg, oneReg, haveOffset, haveLimit = c.emitLimitOffsetCounters(stmt)
+	}
 
 	sortJump := c.emit(Instruction{Op: OpHashAggSort})
 	drainLoop := c.here()
 	c.emit(Instruction{Op: OpHashAggData, P2: curKeyRec})
+	if ordered {
+		c.emit(Instruction{Op: OpAdd, P1: oneSeq, P2: seqReg, P3: seqReg})
+	}
 	skipJumps := c.emitGroupOutputs(stmt, plan, gp, nOut, outBase, havingReg, curKeyRec)
-	skipJumps = append(skipJumps, c.emitLimitOffsetGate(offsetReg, limitReg, oneReg, haveOffset, haveLimit, outBase, nOut)...)
+	if ordered {
+		c.emitGroupOrderInsert(plan, gp, sorter2, sort2Base, nOut, seqReg, curKeyRec, rec2Reg)
+	} else {
+		skipJumps = append(skipJumps, c.emitLimitOffsetGate(offsetReg, limitReg, oneReg, haveOffset, haveLimit, outBase, nOut)...)
+	}
 	skip := c.here()
 	for _, j := range skipJumps {
 		c.patch(j, skip)
@@ -2668,6 +2676,9 @@ func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp
 	c.emit(Instruction{Op: OpHashAggNext, P2: drainLoop})
 	afterDrain := c.here()
 	c.patch(sortJump, afterDrain)
+	if ordered {
+		c.emitOrderedDrain(stmt, sorter2, finalRec, finalBase, nOut)
+	}
 
 	c.emit(Instruction{Op: OpHalt})
 
@@ -2675,6 +2686,7 @@ func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp
 		Insns:      c.insns,
 		NReg:       c.nReg,
 		NCursors:   c.nCursor,
+		NSorters:   c.nSorter,
 		NRecRegs:   c.nRec,
 		NSubCache:  c.nSub,
 		NResultCol: nOut,
@@ -2732,6 +2744,42 @@ func (c *compiler) emitLimitOffsetGate(offsetReg, limitReg, oneReg int, haveOffs
 		c.emit(Instruction{Op: OpSubtract, P1: oneReg, P2: limitReg, P3: limitReg})
 	}
 	return skipJumps
+}
+
+// openGroupOrderSorter opens the sorter a GROUP BY's finished groups are put
+// in their ORDER BY's order by: its keys, then the group's emission ordinal
+// as a final ascending tiebreak (C pushes groups into the ORDER BY sorter in
+// emission order, so its sort is stable over that order).
+func (c *compiler) openGroupOrderSorter(gp *groupByPlan) int {
+	nOrder := len(gp.orderPlans)
+	desc := make([]bool, nOrder+1)
+	nulls := make([]NullsOrder, nOrder+1)
+	// coll's trailing entry is the sequence-number tiebreak, always BINARY.
+	coll := make([]string, nOrder+1)
+	for i, op := range gp.orderPlans {
+		desc[i], nulls[i], coll[i] = op.desc, op.nulls, op.coll
+	}
+	sorter := c.allocSorter()
+	c.emit(Instruction{Op: OpSorterOpen, P1: sorter, P4: &sorterKeyInfo{nKey: nOrder + 1, desc: desc, nulls: nulls, coll: coll}})
+	return sorter
+}
+
+// emitGroupOrderInsert puts a group into its ORDER BY sorter: the record
+// [orderKeys.., ordinal, out..] at sort2Base, the outputs already in place at
+// its tail, each key a copy of the output it names or computed for the group.
+func (c *compiler) emitGroupOrderInsert(plan *aggPlan, gp *groupByPlan, sorter2, sort2Base, nOut, seqReg, curKeyRec, rec2Reg int) {
+	nOrder := len(gp.orderPlans)
+	outBase := sort2Base + nOrder + 1
+	for i, op := range gp.orderPlans {
+		if op.ordinal > 0 {
+			c.emit(Instruction{Op: OpSCopy, P1: outBase + (op.ordinal - 1), P2: sort2Base + i})
+		} else {
+			c.emit(Instruction{Op: OpAggResult, P1: sort2Base + i, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetOrder, idx: i}})
+		}
+	}
+	c.emit(Instruction{Op: OpSCopy, P1: seqReg, P2: sort2Base + nOrder})
+	c.emit(Instruction{Op: OpMakeRecord, P1: sort2Base, P2: nOrder + 1 + nOut, P3: rec2Reg})
+	c.emit(Instruction{Op: OpSorterInsert, P1: sorter2, P2: rec2Reg})
 }
 
 // emitOrderedDrain emits the sorter-2 drain for a GROUP BY + ORDER BY query:
