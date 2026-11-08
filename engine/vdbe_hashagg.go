@@ -42,8 +42,9 @@ type hashAggState struct {
 // aggSlab carves a hash aggregate's groups out of chunks, so a group costs no
 // allocation of its own: its bucket, key, accumulator set and items. Each
 // piece is capped at its length, so an append to one never reaches the next.
-// Chunks grow with the groups made, from 16 groups' worth to 4096; an exact
-// slab makes each piece alone (newAggAccs).
+// Chunks grow with the groups made, from 16 groups' worth to 1024, so at
+// most that many groups' worth is made and not used; an exact slab makes
+// each piece alone (newAggAccs).
 type aggSlab struct {
 	exact   bool
 	n       int
@@ -89,7 +90,7 @@ func (s *aggSlab) chunk(need int) int {
 	if s.exact {
 		return need
 	}
-	return max(need, min(max(s.n, 16), 4096))
+	return max(need, min(max(s.n, 16), 1024))
 }
 
 func (s *aggSlab) bucket() *hashAggBucket {
