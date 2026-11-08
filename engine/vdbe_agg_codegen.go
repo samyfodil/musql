@@ -3164,6 +3164,11 @@ func groupsArriveOutOfKeyOrder(srcs []joinSource, scopes []tableScope, gp *group
 		}
 		j := nEq + next
 		next++
+		// The rowid follows the key's columns, ascending, and is unique: the
+		// whole key of a rowid walk, and the end of the grouping either way.
+		if j == len(key.cols) && c == xnRowid && !src.tbl.withoutRowid {
+			break
+		}
 		if j >= len(key.cols) || j >= len(key.desc) || key.desc[j] ||
 			keyColumnOf(src.tbl, key.cols[j]) != c {
 			inKeyOrder = false
