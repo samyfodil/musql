@@ -2417,6 +2417,17 @@ func keyTupleLess(a, b []Value, enc TextEncoding) bool {
 	return false
 }
 
+// keyTupleLessDesc is keyTupleLess with key i reversed where desc[i]. Two
+// distinct groups never compare equal, so no tiebreak is needed.
+func keyTupleLessDesc(a, b []Value, desc []bool, enc TextEncoding) bool {
+	for i := range a {
+		if c := compareValuesCollatedEnc(a[i], b[i], "", enc); c != 0 {
+			return c < 0 != (i < len(desc) && desc[i])
+		}
+	}
+	return false
+}
+
 // sqliteOrdinalWord renders n the way printf's "%r" conversion does in
 // SQLite's own formatter -- "1st", "2nd", "3rd", "4th", with the 11th/12th/
 // 13th exceptions -- which is how an out-of-range ORDER BY term names WHICH

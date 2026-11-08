@@ -446,6 +446,9 @@ func disasmComment(prog *Program, addr int, in Instruction) string {
 	case OpHashAggStep:
 		return fmt.Sprintf("hashagg: step segment %d over joined cursor(s) row (key=rr[%d])", in.P2, in.P1)
 	case OpHashAggSort:
+		if desc, ok := in.P4.([]bool); ok {
+			return fmt.Sprintf("hashagg: sort buckets (desc %v); if empty goto %d", desc, in.P2)
+		}
 		return fmt.Sprintf("hashagg: sort buckets; if empty goto %d", in.P2)
 	case OpHashAggData:
 		return fmt.Sprintf("rr[%d]=hashagg bucket key (accs live)", in.P2)

@@ -265,20 +265,24 @@ func (m *vdbe) hashAggStepRow(plan *aggPlan, keyVals []Value, seg int, row, rowi
 }
 
 // hashAggSort is OpHashAggSort's body: finalize m.hashAgg's buckets into
-// group-key-ascending order (keyTupleLess), reporting whether there is at
-// least one group -- mirroring vdbeSorter.sort's "jump if empty" convention.
-func (m *vdbe) hashAggSort() bool {
+// group-key order (keyTupleLess), descending in the keys desc marks as sorter1
+// sorts them, reporting whether there is at least one group -- mirroring
+// vdbeSorter.sort's "jump if empty" convention.
+func (m *vdbe) hashAggSort(desc []bool) bool {
 	if m.hashAgg == nil {
 		return false
 	}
 	h := m.hashAgg
 	h.sorted = h.made
-	if h.unordered {
+	if h.unordered || desc != nil {
 		// BINARY order is memcmp over the encoded text, which in a UTF-16
 		// database is not UTF-8 byte order (utf16CompareUTF8); the sorted
 		// drain's sorter orders its groups the same way.
 		enc := m.encoding()
 		sort.Slice(h.sorted, func(i, j int) bool {
+			if desc != nil {
+				return keyTupleLessDesc(h.sorted[i].key, h.sorted[j].key, desc, enc)
+			}
 			return keyTupleLess(h.sorted[i].key, h.sorted[j].key, enc)
 		})
 	}

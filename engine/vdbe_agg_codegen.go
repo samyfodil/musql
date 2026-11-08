@@ -1970,12 +1970,11 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// a full aggAccumulators and magnetWalk runs per bucket in scan order.
 	//
 	// Under any other ORDER BY the groups go on to the same ORDER BY sorter
-	// this path's drain would feed: the hash drain emits them in key order,
-	// as sorter1 does when no DESC was pushed onto the keys (groupDesc), so
-	// the emission ordinals that break the ORDER BY's ties are the same.
+	// this path's drain would feed: the hash drain emits them in sorter1's
+	// key order, descending in the keys the ORDER BY pushed DESC onto
+	// (groupDesc), so the emission ordinals that break its ties are the same.
 	ordered := hasOrder && !orderIsGroupKeyAscending(stmt, gp)
-	if !useDistinctBatch && (!ordered || !slices.Contains(gp.groupDesc, true)) &&
-		!gp.selectHasSubquery &&
+	if !useDistinctBatch && !gp.selectHasSubquery &&
 		!joinHasCoalescedColumns(plan.scopes) &&
 		!anyNonBinaryCollation(gp.groupColls) && !scanOrderGroups {
 		return compileScanGroupByHash(c, stmt, srcs, gp, plan, savedNQueryLoopKnown, ordered)
@@ -2672,7 +2671,11 @@ func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp
 		offsetReg, limitReg, oneReg, haveOffset, haveLimit = c.emitLimitOffsetCounters(stmt)
 	}
 
-	sortJump := c.emit(Instruction{Op: OpHashAggSort})
+	var desc any
+	if slices.Contains(gp.groupDesc, true) {
+		desc = gp.groupDesc
+	}
+	sortJump := c.emit(Instruction{Op: OpHashAggSort, P4: desc})
 	drainLoop := c.here()
 	c.emit(Instruction{Op: OpHashAggData, P2: curKeyRec})
 	if ordered {

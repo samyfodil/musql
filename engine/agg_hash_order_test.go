@@ -43,10 +43,10 @@ func TestGroupByOrderKeyUsesHashDrain(t *testing.T) {
 		{`SELECT k, count(*), sum(v) FROM t GROUP BY k ORDER BY k`, true, false},
 		{`SELECT k, j, count(*) FROM t GROUP BY k, j ORDER BY k, j`, true, false},
 		{`SELECT k, count(*) FROM t GROUP BY k ORDER BY k LIMIT 2`, true, false},
-		// Not the hash drain's order: sorted after it. A DESC the ORDER BY
-		// pushes onto the keys changes the emission order the sort's ties
-		// keep, so it stays with the sorted GROUP BY.
-		{`SELECT k, count(*) FROM t GROUP BY k ORDER BY k DESC`, false, true},
+		// Not the hash drain's order: sorted after it. The DESC the ORDER BY
+		// pushes onto the keys reverses the drain, which emits the groups in
+		// the order the sorted GROUP BY would.
+		{`SELECT k, count(*) FROM t GROUP BY k ORDER BY k DESC`, true, true},
 		{`SELECT k, j, count(*) FROM t GROUP BY k, j ORDER BY j, k`, true, true},
 		// A PREFIX of the keys leaves the rest unordered, so it is not the same
 		// order and must not be claimed.
@@ -109,11 +109,8 @@ func TestGroupByOrderKeyAnswersIdentically(t *testing.T) {
 	defer rp.Close()
 
 	for _, pair := range [][2]string{
-		// The hash-drained query, and the same answer forced through the
-		// sorter by asking for the reverse and reversing it back is not
-		// expressible in SQL here -- so instead each ascending query is
-		// compared against its own DESC twin, which takes the sorter path and
-		// whose rows must be the exact reverse.
+		// Each ascending query against its own DESC twin, whose drain runs
+		// the keys descending and whose rows must be the exact reverse.
 		{`SELECT k, count(*), sum(v) FROM t GROUP BY k ORDER BY k`,
 			`SELECT k, count(*), sum(v) FROM t GROUP BY k ORDER BY k DESC`},
 		{`SELECT k, j, count(*) FROM t GROUP BY k, j ORDER BY k, j`,

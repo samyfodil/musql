@@ -9,20 +9,20 @@ import (
 // from grouped rows to match C SQLite's serialization behavior.
 func TestSortedDrainRecordDropsSubtype(t *testing.T) {
 	p := argRegsFixture(t)
-	// Descending order forces the SORTED drain (HASH does ascending only).
+	// A NOCASE grouping key forces the SORTED drain (HASH groups BINARY only).
 	for _, tc := range []struct {
 		sql        string
 		wantStamps []string
 		wantAgg    string // the first group's aggregate cell
 		why        string
 	}{
-		{`SELECT key, max(subtype(value)) FROM json_each('[[7],[8]]') GROUP BY key ORDER BY key DESC`,
+		{`SELECT key, max(subtype(value)) FROM json_each('[[7],[8]]') GROUP BY key COLLATE NOCASE ORDER BY key DESC`,
 			[]string{"-A-", "-A-"}, "0",
 			"a subtype CONSUMER: the drained row has lost the subtype, so subtype() reports 0 -- 74 is what an uncleared register answers, and it was a live wrong answer"},
-		{`SELECT key, group_concat(json_quote(value)) FROM json_each('[[7]]') GROUP BY key ORDER BY key DESC`,
+		{`SELECT key, group_concat(json_quote(value)) FROM json_each('[[7]]') GROUP BY key COLLATE NOCASE ORDER BY key DESC`,
 			[]string{"-A-"}, `"[7]"`,
 			"a subtype GENERATOR: json_quote of a value that LOST its subtype quotes the text, where an uncleared one embeds the array verbatim as [7]"},
-		{`SELECT key, json_group_array(value) FROM json_each('[[7]]') GROUP BY key ORDER BY key DESC`,
+		{`SELECT key, json_group_array(value) FROM json_each('[[7]]') GROUP BY key COLLATE NOCASE ORDER BY key DESC`,
 			[]string{"-A-"}, `["[7]"]`,
 			"...and the same loss reaches json_group_array's own embedding decision"},
 	} {

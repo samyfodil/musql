@@ -3084,7 +3084,8 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 
 		case OpHashAggSort:
-			if !m.hashAggSort() {
+			desc, _ := op.P4.([]bool)
+			if !m.hashAggSort(desc) {
 				pc = op.P2
 				continue
 			}
