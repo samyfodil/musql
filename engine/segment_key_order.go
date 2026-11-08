@@ -172,7 +172,7 @@ func (p *ReadOnlyPager) segKeyOrderList(cur *vdbeCursor, key *autoIndexKey, into
 	if prev == nil {
 		return nil
 	}
-	*into = segRowSource{list: true, listSegs: lsegs, listRows: lrows, listKeys: into.listKeys, listPerm: into.listPerm,
+	*into = segRowSource{list: true, listSegs: lsegs, listRows: lrows, listOne: oneSegment(lsegs), listKeys: into.listKeys, listPerm: into.listPerm,
 		listHits: into.listHits, cols: segColPlansFor(cur.tbl)}
 	return into
 }

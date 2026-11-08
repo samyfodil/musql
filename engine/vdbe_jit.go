@@ -1530,6 +1530,9 @@ func resetVCursor(jc *jit.VCursor) {
 	if jc.Tab != nil {
 		jc.Tab = nil
 	}
+	if jc.Sel != nil {
+		jc.Sel = nil
+	}
 	jc.N, jc.Pos, jc.Last, jc.Ok, jc.Dirty, jc.Rewind, jc.Adv, jc.Mask, jc.Reopen, jc.State = 0, 0, -1, 0, 0, 0, 0, 0, 0, 0
 	jc.Key, jc.Served = 0, 0
 }
@@ -1544,8 +1547,13 @@ func (jx *vmJIT) segModeOK(c int, cur *vdbeCursor) bool {
 	}
 	src, s := cur.segSrc, cur.segCur
 	switch {
-	case src == nil || s == nil || src.list:
+	case src == nil || s == nil:
 		return false
+	case src.list:
+		// A list in one segment, on its current entry: walked through its rows
+		// (jit.VCursor.Sel).
+		k := src.listPos - 1
+		return s == src.listOne && k >= 0 && k < len(src.listRows) && cur.segRow == src.listRows[k]
 	case src.point:
 		return s == src.pointSeg && cur.segRow == src.pointRow
 	}
@@ -1561,6 +1569,26 @@ func (jx *vmJIT) segMode(c int, cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) b
 		return false
 	}
 	src, s := cur.segSrc, cur.segCur
+	if src.list {
+		v := s.vmSegFor(cur.segSrcCols)
+		k := src.listPos - 1
+		jc.N, jc.Pos, jc.Last, jc.Ok, jc.Dirty, jc.Rewind, jc.Adv, jc.Mask = int64(len(src.listRows)), int64(k), -1, 1, 0, 0, 1, v.mask
+		jc.Reopen, jc.State = 0, 0
+		if seg := unsafe.Pointer(&v.seg); jc.Seg != seg {
+			jc.Seg = seg
+		}
+		if rids := v.seg.Rowids; jc.Rowids != rids {
+			jc.Rowids = rids
+		}
+		if sel := unsafe.Pointer(unsafe.SliceData(src.listRows)); jc.Sel != sel {
+			jc.Sel = sel
+		}
+		if jc.Rows != nil {
+			jc.Rows = nil
+		}
+		sn.segLive, sn.segEntry = true, k
+		return true
+	}
 	end, adv := cur.segRow+1, int64(1)
 	if !src.point {
 		end = src.end
@@ -1713,12 +1741,18 @@ func segSync(cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) {
 	}
 	if moved := int(jc.Last) - sn.segEntry; jc.Last >= 0 && moved > 0 {
 		cur.pos += moved
-		cur.segRow = int(jc.Last)
+		switch src := cur.segSrc; {
+		case src.list:
+			// Last is a position in the list, which names the row.
+			cur.segRow, src.listPos = src.listRows[jc.Last], int(jc.Last)+1
+		default:
+			cur.segRow = int(jc.Last)
+			if !src.point {
+				src.ri = cur.segRow + 1
+			}
+		}
 		cur.rowid = cur.segCur.Rowid(cur.segRow)
 		cur.segWidth = min(cur.segCur.Width(cur.segRow), len(cur.segSrcCols))
-		if src := cur.segSrc; !src.point {
-			src.ri = cur.segRow + 1
-		}
 		segRowsServed.Add(int64(moved))
 	}
 	if jc.Pos >= jc.N && jc.Adv == 1 {

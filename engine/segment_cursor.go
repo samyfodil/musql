@@ -138,6 +138,9 @@ type segRowSource struct {
 	listPos  int
 	listSegs []*segment
 	listRows []int
+	// listOne is the one segment every row of the list is in, or nil: then
+	// native code walks the list in place (vmJIT.segMode).
+	listOne *segment
 	// listKeys and listPerm are sortListBy's, and listHits segListSeekIndex's,
 	// kept across seeks as the list is.
 	listKeys []int64
@@ -304,9 +307,22 @@ func (p *ReadOnlyPager) segListSeek(cur *vdbeCursor, rids []int64, into *segRowS
 			segs, rows = append(segs, s), append(rows, i)
 		}
 	}
-	*into = segRowSource{list: true, listSegs: segs, listRows: rows, listKeys: into.listKeys, listPerm: into.listPerm,
+	*into = segRowSource{list: true, listSegs: segs, listRows: rows, listOne: oneSegment(segs), listKeys: into.listKeys, listPerm: into.listPerm,
 		listHits: into.listHits, cols: segColPlansFor(cur.tbl)}
 	return into, true
+}
+
+// oneSegment is the segment every entry of segs is, or nil.
+func oneSegment(segs []*segment) *segment {
+	if len(segs) == 0 {
+		return nil
+	}
+	for _, s := range segs[1:] {
+		if s != segs[0] {
+			return nil
+		}
+	}
+	return segs[0]
 }
 
 // segListSeekIndex is segListSeek of cur's index seek straight from the
@@ -364,7 +380,7 @@ func (p *ReadOnlyPager) segListSeekIndex(cur *vdbeCursor, into *segRowSource) (s
 	if total == 0 || total >= seekMinRows && 2*len(rows) >= total {
 		return nil, false
 	}
-	*into = segRowSource{list: true, listSegs: segs, listRows: rows, listKeys: into.listKeys, listPerm: into.listPerm,
+	*into = segRowSource{list: true, listSegs: segs, listRows: rows, listOne: oneSegment(segs), listKeys: into.listKeys, listPerm: into.listPerm,
 		listHits: hits, cols: segColPlansFor(cur.tbl)}
 	return into, true
 }

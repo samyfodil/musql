@@ -1044,8 +1044,11 @@ func (cur *vdbeCursor) rewind() error {
 		cur.matched = nil
 	}
 	if !cur.materialized {
-		if cur.keyListReady && cur.segSrc != nil && cur.segSrc.list {
-			cur.segSrc.listPos, cur.segCur = 0, nil
+		if cur.keyListReady && cur.pointSrc.list {
+			// The list is the cursor's own (pointSrc), walked to its end or
+			// not; a walk past the end let go of segSrc.
+			cur.segSrc, cur.segCur = &cur.pointSrc, nil
+			cur.pointSrc.listPos = 0
 			cur.pos = -1
 			return nil
 		}
@@ -1160,8 +1163,9 @@ func (cur *vdbeCursor) rewind() error {
 		// on every row -- so a rowid the list carries that no longer exists is
 		// dropped by the row fetch below.
 		if cur.idxSeekConfigured && !cur.tbl.withoutRowid {
-			if cur.idxListReady && cur.segSrc != nil && cur.segSrc.list {
-				cur.segSrc.listPos, cur.segCur = 0, nil
+			if cur.idxListReady && cur.pointSrc.list {
+				cur.segSrc, cur.segCur = &cur.pointSrc, nil
+				cur.pointSrc.listPos = 0
 				cur.pos = -1
 				return nil
 			}
