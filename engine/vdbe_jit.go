@@ -86,6 +86,9 @@ type vmJIT struct {
 	// tabs is, per cursor number, the table tabFor last worked out for it.
 	tabs []atomic.Pointer[vmTab]
 
+	// inSlots is the subquery cache slot of each VInSub's set, its B.
+	inSlots []int
+
 	// walkScan is, per cursor number, whether native code advances the
 	// streamed scan (nativeStreamNexts): only then is it handed over a batch
 	// at a time, and otherwise its current row with the columns an entry reads.
@@ -245,6 +248,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	realVP, realOK := vmRealLowering(prog, p.segStoresReal)
 	textVP, textOK := vmTextLowering(prog, p.segStoresText)
 	reopen := reopenSources(prog)
+	var inSlots []int
 	for pc := range prog.Insns {
 		vp[pc] = lowerVM(&prog.Insns[pc], prog.NReg)
 		if in := &prog.Insns[pc]; (in.Op == OpOpenDerived || in.Op == OpClose) && in.P1 >= 0 && in.P1 < len(reopen) && reopen[in.P1].ds != nil {
@@ -257,6 +261,18 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 			vp[pc] = realVP[pc]
 		} else if textOK != nil && textOK[pc] {
 			vp[pc] = textVP[pc]
+		}
+		if in := &prog.Insns[pc]; in.Op == OpInSub && jit.VMTextOrder {
+			// An uncorrelated IN of one column, which native code probes in the
+			// set the VDBE builds on its first run (inHashSet.ints).
+			if plan, isPlan := in.P4.(*inSubPlan); isPlan && !plan.correlated && len(plan.affs) == 1 && plan.affs[0] != affText &&
+				(plan.colls[0] == "" || strings.EqualFold(plan.colls[0], "BINARY")) && in.P1 >= 0 && in.P1 < prog.NReg && in.P2 >= 0 && in.P2 < prog.NReg && in.P3 >= 0 {
+				vp[pc] = jit.VInsn{Op: jit.VInSub, A: in.P1, B: len(inSlots), C: in.P2}
+				if plan.not {
+					vp[pc].Imm = 1
+				}
+				inSlots = append(inSlots, in.P3)
+			}
 		}
 		switch in := &prog.Insns[pc]; {
 		case in.Op == OpVariable && in.P1 >= 1 && in.P1 <= nParams && in.P2 >= 0 && in.P2 < prog.NReg:
@@ -376,7 +392,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 		}
 	}
 	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams, params: nParams, entry: entry, marked: marked, native: native, updAt: updAt,
-		segCap: segCap, walkScan: walkScan}
+		segCap: segCap, walkScan: walkScan, inSlots: inSlots}
 	if segCap != nil {
 		jx.tabs = make([]atomic.Pointer[vmTab], len(segCap))
 	}
@@ -1465,6 +1481,39 @@ func (sn *jitSnap) decode(cur *vdbeCursor, cols []int) {
 	}
 }
 
+// inSets publishes the sets the program's VInSubs probe: each one ready while
+// the subquery's cached rows are still those its set was built from.
+func (jx *vmJIT) inSets(m *vdbe) *jit.VInSubSet {
+	if len(m.jinsub) < len(jx.inSlots) {
+		m.jinsub = make([]jit.VInSubSet, len(jx.inSlots))
+	}
+	for k, slot := range jx.inSlots {
+		v := &m.jinsub[k]
+		var s *inHashSet
+		if slot < len(m.subCache) {
+			s = m.subCache[slot].inSet
+		}
+		if s == nil || !s.intsOK || !s.current(&m.subCache[slot]) {
+			v.Ready = 0
+			continue
+		}
+		keys := unsafe.Pointer(unsafe.SliceData(s.ints))
+		if v.Keys != keys {
+			v.Keys = keys
+		}
+		v.N, v.HasNull, v.Empty, v.Ready = int64(len(s.ints)), flag(s.hasNull), flag(s.empty), 1
+	}
+	return &m.jinsub[0]
+}
+
+// flag is b as native code's flag word.
+func flag(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 // resetVCursor is *jc = jit.VCursor{Last: -1}, storing a pointer field only
 // where it holds one: a whole-struct store is a bulk write barrier on every
 // entry while the collector runs.
@@ -1763,6 +1812,9 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 		if m.likeCaseSensitive() {
 			args.LikeCS = 1
 		}
+	}
+	if len(jx.inSlots) > 0 {
+		args.InSets = jx.inSets(m)
 	}
 	args.RowBuf, args.RowCap, args.RowUsed, args.RowsBuf, args.RowsCap, args.Yield = nil, -1, 0, nil, 0, 0
 	switch {

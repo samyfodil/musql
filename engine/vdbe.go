@@ -28,6 +28,9 @@ type vdbe struct {
 	regs []Value
 	jx   *vmJIT        // native code for the program run() is given, when it has some
 	jcur []jit.VCursor // native code's view of the cursors it names, filled at each entry
+	// jinsub is native code's view of the program's IN subquery sets
+	// (vmJIT.inSets), filled at each entry.
+	jinsub []jit.VInSubSet
 	// jargs is the argument block of every entry into native code: kept on the
 	// machine and only its live fields set per entry, because zeroing a fresh
 	// one -- most of it the segment JIT's -- was a measurable share of a short
