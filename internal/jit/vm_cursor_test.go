@@ -71,7 +71,8 @@ func TestVCursorLayout(t *testing.T) {
 	if unsafe.Offsetof(sg.Cols) != VSegOffCols || unsafe.Offsetof(sg.First) != VSegOffFirst || unsafe.Offsetof(sg.Dense) != VSegOffDense ||
 		unsafe.Offsetof(sg.Rowids) != VSegOffRowids || unsafe.Sizeof(sc) != VSegColSize || unsafe.Offsetof(sc.Kind) != VSegColOffKind ||
 		unsafe.Offsetof(sc.Block) != VSegColOffBlock || unsafe.Offsetof(sc.Nulls) != VSegColOffNulls ||
-		unsafe.Offsetof(sc.Exc) != VSegColOffExc || unsafe.Offsetof(sc.Heap) != VSegColOffHeap {
+		unsafe.Offsetof(sc.Exc) != VSegColOffExc || unsafe.Offsetof(sc.Heap) != VSegColOffHeap ||
+		unsafe.Offsetof(sc.Plain) != VSegColOffPlain {
 		t.Fatalf("VSeg or VSegCol is laid out differently from what generated code uses")
 	}
 	var v tvalue

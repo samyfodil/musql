@@ -337,3 +337,82 @@ func TestVMSegSel(t *testing.T) {
 		}
 	}
 }
+
+// TestVMSegColumnPredicted reads columns of a segment cursor in one run with
+// a predicted kind (T): plain columns of that kind take the shared checks and
+// the direct read, and a column with a NULL bitmap or exceptions, one of
+// another kind, a row list, a NULL and an exception all read as without a
+// prediction.
+func TestVMSegColumnPredicted(t *testing.T) {
+	if !Available || !VMSegCursor {
+		t.Skip("no segment cursors on this platform")
+	}
+	noGC(t)
+	ints := []uint64{5, 6, 7, 8}
+	floats := []uint64{math.Float64bits(1.5), math.Float64bits(2.5), math.Float64bits(3.5), math.Float64bits(4.5)}
+	nulls := []byte{1 << 2} // row 2 of column 2 is NULL
+	exc := []uint64{1 << 3} // row 3 of column 3 is an exception
+	cols := []VSegCol{
+		{Kind: VSegInt, Block: unsafe.Pointer(&ints[0]), Plain: VSegInt},
+		{Kind: VSegFloat, Block: unsafe.Pointer(&floats[0]), Plain: VSegFloat},
+		{Kind: VSegInt, Block: unsafe.Pointer(&ints[0]), Nulls: unsafe.Pointer(&nulls[0])},
+		{Kind: VSegInt, Block: unsafe.Pointer(&ints[0]), Exc: unsafe.Pointer(&exc[0])},
+	}
+	seg := &VSeg{Cols: unsafe.Pointer(&cols[0]), First: 1, Dense: 1}
+	// Column 1 predicted INTEGER though it is REAL: the full read.
+	prog := []VInsn{
+		{Op: VColumn, A: 0, B: 0, C: 0, Imm: 1, T: VSegInt},
+		{Op: VColumn, A: 0, B: 1, C: 1, Imm: 1, T: VSegInt},
+		{Op: VColumn, A: 0, B: 2, C: 2, Imm: 1, T: VSegInt},
+		{Op: VColumn, A: 0, B: 3, C: 3, Imm: 1, T: VSegInt},
+		{Op: VColumn, A: 0, B: 0, C: 4, Imm: 1, T: VSegInt},
+		{Op: VExit},
+	}
+	lay := ValueLayout{Size: 48, OffTyp: 0, OffI: 8, OffF: 16, OffS: 24, TypNull: tvNull, TypInt: tvInt, TypFloat: tvReal, TypText: tvText}
+	entry := make([]bool, len(prog))
+	entry[0] = true
+	b, err := EmitVMFused(prog, 5, lay, entry, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := Map(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer code.Close()
+	for row := range 4 {
+		regs := make([]tvalue, 5)
+		for i := range regs {
+			regs[i] = tvalue{Typ: tvInt, I: -1}
+		}
+		cur := &VCursor{N: 4, Pos: int64(row), Last: -1, Ok: 1, Mask: 15, Seg: unsafe.Pointer(seg)}
+		args := ProgArgs{Regs: (*int64)(unsafe.Pointer(&regs[0])), Cur: cur}
+		code.Call2(&args)
+		want := []tvalue{{Typ: tvInt, I: int64(ints[row])}, {Typ: tvReal, F: math.Float64frombits(floats[row])},
+			{Typ: tvInt, I: int64(ints[row])}, {Typ: tvInt, I: int64(ints[row])}, {Typ: tvInt, I: int64(ints[row])}}
+		stop := 5
+		switch row {
+		case 2:
+			stop = 2 // the NULL exits at column 2
+		case 3:
+			stop = 3 // the exception exits at column 3
+		}
+		if int(args.PC) != stop {
+			t.Fatalf("row %d: stopped at %d, want %d", row, args.PC, stop)
+		}
+		for i := range stop {
+			if !same(regs[i], want[i]) {
+				t.Fatalf("row %d r%d: %+v, want %+v", row, i, regs[i], want[i])
+			}
+		}
+	}
+	// A row list under the same predicted reads.
+	rows := [][]tvalue{{{Typ: tvInt, I: 1}, {Typ: tvReal, F: 2}, {Typ: tvInt, I: 3}, {Typ: tvInt, I: 4}}}
+	regs := make([]tvalue, 5)
+	cur := &VCursor{Rows: unsafe.Pointer(unsafe.SliceData(rows)), N: 1, Pos: 0, Last: -1, Ok: 1, Mask: 15}
+	args := ProgArgs{Regs: (*int64)(unsafe.Pointer(&regs[0])), Cur: cur}
+	code.Call2(&args)
+	if args.PC != 5 || regs[0].I != 1 || regs[1].F != 2 || regs[2].I != 3 || regs[3].I != 4 || regs[4].I != 1 {
+		t.Fatalf("row list: pc %d regs %+v", args.PC, regs)
+	}
+}
