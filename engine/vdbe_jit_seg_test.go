@@ -309,9 +309,10 @@ func TestVMJITInSubDifferential(t *testing.T) {
 // through a segment table's index (VSeekIdx) -- in EXISTS bodies, joins and
 // correlated subqueries, over a table of several segments, with keys no row
 // holds, NULL, REAL and TEXT keys, an index whose order the seek keeps (a
-// PRIMARY KEY of two columns), and a loop body that exits to the VDBE between
-// rows, which takes the cursor back -- then the same after writes the
-// segments no longer answer alone. With the JIT and without, every row must
+// PRIMARY KEY of two columns, or both its columns held equal), subroutines
+// that open and close the cursor per call, and a loop body that exits to the
+// VDBE between rows, which takes the cursor back -- then the same after
+// writes the segments no longer answer alone. With the JIT and without, every row must
 // match.
 func TestVMJITIdxSeekDifferential(t *testing.T) {
 	lowEntryThreshold(t)
@@ -343,6 +344,8 @@ func TestVMJITIdxSeekDifferential(t *testing.T) {
 		"SELECT u.id, t.id, upper(t.c) FROM u JOIN t ON t.k = u.w WHERE t.a < 9 ORDER BY 1, 2",
 		"SELECT count(*) FROM u WHERE EXISTS (SELECT 1 FROM p WHERE p.k = u.w AND p.j <> 2)",
 		"SELECT u.id, p.j, p.v FROM u JOIN p ON p.k = u.w ORDER BY 1, 2",
+		"SELECT u.id, group_concat(p.v) FROM u JOIN p ON p.k = u.w AND p.j = u.id % 4 GROUP BY u.id",
+		"SELECT count(*) FROM u WHERE EXISTS (SELECT 1 FROM p WHERE p.k = u.w AND p.j = 3) AND EXISTS (SELECT 1 FROM t WHERE t.k = u.w)",
 	}
 	writes := []string{
 		"UPDATE t SET a = a + 1 WHERE id % 50 = 0",
