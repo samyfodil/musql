@@ -33,21 +33,26 @@ func TestGroupByOrderKeyUsesHashDrain(t *testing.T) {
 	}
 	defer rp.Close()
 
+	// wantSort: an ORDER BY sorter follows the drain, which only then may
+	// emit groups out of the ORDER BY's order.
 	for _, tc := range []struct {
 		sql      string
 		wantHash bool
+		wantSort bool
 	}{
-		{`SELECT k, count(*), sum(v) FROM t GROUP BY k ORDER BY k`, true},
-		{`SELECT k, j, count(*) FROM t GROUP BY k, j ORDER BY k, j`, true},
-		{`SELECT k, count(*) FROM t GROUP BY k ORDER BY k LIMIT 2`, true},
-		// Not the hash drain's order:
-		{`SELECT k, count(*) FROM t GROUP BY k ORDER BY k DESC`, false},
-		{`SELECT k, j, count(*) FROM t GROUP BY k, j ORDER BY j, k`, false},
+		{`SELECT k, count(*), sum(v) FROM t GROUP BY k ORDER BY k`, true, false},
+		{`SELECT k, j, count(*) FROM t GROUP BY k, j ORDER BY k, j`, true, false},
+		{`SELECT k, count(*) FROM t GROUP BY k ORDER BY k LIMIT 2`, true, false},
+		// Not the hash drain's order: sorted after it. A DESC the ORDER BY
+		// pushes onto the keys changes the emission order the sort's ties
+		// keep, so it stays with the sorted GROUP BY.
+		{`SELECT k, count(*) FROM t GROUP BY k ORDER BY k DESC`, false, true},
+		{`SELECT k, j, count(*) FROM t GROUP BY k, j ORDER BY j, k`, true, true},
 		// A PREFIX of the keys leaves the rest unordered, so it is not the same
 		// order and must not be claimed.
-		{`SELECT k, j, count(*) FROM t GROUP BY k, j ORDER BY k`, false},
+		{`SELECT k, j, count(*) FROM t GROUP BY k, j ORDER BY k`, true, true},
 		// An expression that is not a group key at all.
-		{`SELECT k, count(*) FROM t GROUP BY k ORDER BY count(*)`, false},
+		{`SELECT k, count(*) FROM t GROUP BY k ORDER BY count(*)`, true, true},
 	} {
 		stmt, perr := ParseSelect(tc.sql)
 		if perr != nil {
@@ -57,11 +62,17 @@ func TestGroupByOrderKeyUsesHashDrain(t *testing.T) {
 		if cerr != nil {
 			t.Fatalf("%s: %v", tc.sql, cerr)
 		}
-		hash := false
+		hash, sorters := false, 0
 		for _, in := range prog.Insns {
-			if in.Op == OpHashAggData {
+			switch in.Op {
+			case OpHashAggData:
 				hash = true
+			case OpSorterOpen:
+				sorters++
 			}
+		}
+		if sort := sorters > 0 && (hash || sorters > 1); sort != tc.wantSort {
+			t.Errorf("%s: ORDER BY sorter=%v, want %v", tc.sql, sort, tc.wantSort)
 		}
 		if hash != tc.wantHash {
 			t.Errorf("%s: hash drain=%v, want %v", tc.sql, hash, tc.wantHash)
