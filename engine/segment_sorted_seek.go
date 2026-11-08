@@ -23,6 +23,12 @@ type segSortedRows struct {
 	keys []int64
 	segs []*segment
 	rows []int
+	// one is the table's one segment, when it is: then perm, its rows in the
+	// column's order, and block, the column, are the segment's own (sortedOn),
+	// and keys, segs and rows are not built.
+	one   *segment
+	perm  []int32
+	block []int64
 }
 
 // segSortedSeek positions cur on the rows whose column h.col equals probe,
@@ -44,8 +50,14 @@ func (cur *vdbeCursor) segSortedSeek(h *sortedSeekHint, probe Value) bool {
 	}
 	lo, hi := s.find(probe)
 	src := &cur.pointSrc
-	segs := append(src.listSegs[:0], s.segs[lo:hi]...)
-	rows := append(src.listRows[:0], s.rows[lo:hi]...)
+	segs, rows := src.listSegs[:0], src.listRows[:0]
+	if s.one != nil {
+		for _, r := range s.perm[lo:hi] {
+			segs, rows = append(segs, s.one), append(rows, int(r))
+		}
+	} else {
+		segs, rows = append(segs, s.segs[lo:hi]...), append(rows, s.rows[lo:hi]...)
+	}
 	*src = segRowSource{list: true, listSegs: segs, listRows: rows, listOne: oneSegment(segs), listKeys: src.listKeys, listPerm: src.listPerm,
 		listHits: src.listHits, cols: segColPlansFor(cur.tbl)}
 	cur.seekGen = seekGens.Add(1)
@@ -79,12 +91,26 @@ func (p *ReadOnlyPager) segSortedRowsFor(cur *vdbeCursor, h *sortedSeekHint) *se
 	} else if !p.segs.cleanFor(root) {
 		return s
 	}
-	n := 0
+	n, nonEmpty := 0, 0
+	var one *segment
 	for _, sg := range segs {
 		if sg == nil || len(sg.cols) != len(cur.tbl.cols) {
 			return s
 		}
 		n += sg.nRows
+		if sg.nRows > 0 {
+			nonEmpty, one = nonEmpty+1, sg
+		}
+	}
+	if nonEmpty == 1 {
+		// sortedOn's stable sort keeps a segment's rows, which are in rowid
+		// order, in that order among equal keys.
+		blocks, perm, ok := one.sortedOn([]int{h.col})
+		if !ok {
+			return s
+		}
+		s.one, s.perm, s.block, s.ok = one, perm, blocks[0], true
+		return s
 	}
 	keys, ksegs, krows := make([]int64, 0, n), make([]*segment, 0, n), make([]int, 0, n)
 	var prevRid uint64
@@ -139,6 +165,14 @@ func (s *segSortedRows) find(probe Value) (int, int) {
 		k = int64(f)
 	default:
 		return 0, 0
+	}
+	if s.one != nil {
+		lo, _ := slices.BinarySearchFunc(s.perm, k, func(r int32, k int64) int { return cmp.Compare(s.block[r], k) })
+		hi := lo
+		for hi < len(s.perm) && s.block[s.perm[hi]] == k {
+			hi++
+		}
+		return lo, hi
 	}
 	lo, _ := slices.BinarySearch(s.keys, k)
 	hi := lo
