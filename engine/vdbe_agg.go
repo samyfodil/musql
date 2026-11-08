@@ -511,6 +511,11 @@ func (m *vdbe) aggResult(info *aggResultInfo, groupKey []Value) (Value, error) {
 		clearJSONSubtype(groupKey)
 	}
 	bareVals, bareRowids := m.aggAccs.anchorRow(plan)
+	if p := it.prog; p != nil && p.prog != nil {
+		if v, ok := p.seeded(aggVals, groupKey, bareVals, bareRowids); ok {
+			return v, nil
+		}
+	}
 	if len(bareVals) < plan.nCols {
 		// An anchor kept only as wide as anything reads it (aggPlan.rowWidth).
 		pad := growValues(&m.anchorPad, plan.nCols)
@@ -542,9 +547,6 @@ func (m *vdbe) aggResult(info *aggResultInfo, groupKey []Value) (Value, error) {
 	// An item that does not lower fails at compile time, so this check only
 	// guards per-execution widths.
 	if p := it.prog; p.runnable(m, aggVals, groupKey, bareVals, bareRowids) {
-		if v, ok := p.seeded(aggVals, groupKey, bareVals, bareRowids); ok {
-			return v, nil
-		}
 		return p.run(m, aggVals, groupKey, bareVals, bareRowids)
 	}
 	return Value{}, fmt.Errorf("%w: aggregate result item's register block does not match its program", errVDBEUnsupported)

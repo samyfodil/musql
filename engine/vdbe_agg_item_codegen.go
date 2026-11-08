@@ -500,7 +500,10 @@ func (p *aggItemProgram) runnable(m *vdbe, aggVals, groupKey, bareVals, bareRowi
 
 // seeded is run's answer without running, for a program that computes
 // nothing: its result is a register of one of the blocks run would seed (a
-// group's column, key, rowid or aggregate value as it stands).
+// group's column, key, rowid or aggregate value as it stands). A block
+// shorter than its width -- an anchor kept only as wide as anything reads it
+// -- is NULL past its end, as run's padded copy is; any other short block is
+// run's to refuse.
 func (p *aggItemProgram) seeded(aggVals, groupKey, bareVals, bareRowids []Value) (Value, bool) {
 	if in := p.prog.Insns; len(in) != 2 || in[0].Op != OpInit || in[1].Op != OpHalt {
 		return Value{}, false
@@ -511,7 +514,13 @@ func (p *aggItemProgram) seeded(aggVals, groupKey, bareVals, bareRowids []Value)
 		vals    []Value
 	}{{p.aggBase, p.nAgg, aggVals}, {p.keyBase, p.nKey, groupKey}, {p.colBase, p.nCols, bareVals}, {p.rowidBase, p.nRowid, bareRowids}} {
 		if r >= b.base && r < b.base+b.n {
-			return b.vals[r-b.base], true
+			switch i := r - b.base; {
+			case i < len(b.vals):
+				return b.vals[i], true
+			case b.base == p.colBase:
+				return Value{}, true
+			}
+			return Value{}, false
 		}
 	}
 	return Value{}, false

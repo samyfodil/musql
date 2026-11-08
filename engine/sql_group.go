@@ -2404,6 +2404,12 @@ func findOutputColByName(outCols []outputColumn, name string) int {
 // database of encoding enc: the order the hash GROUP BY drains its groups in.
 func keyTupleLess(a, b []Value, enc TextEncoding) bool {
 	for i := range a {
+		if a[i].Typ == Int && b[i].Typ == Int {
+			if a[i].I != b[i].I {
+				return a[i].I < b[i].I
+			}
+			continue
+		}
 		if c := compareValuesCollatedEnc(a[i], b[i], "", enc); c != 0 {
 			return c < 0
 		}

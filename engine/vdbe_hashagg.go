@@ -204,6 +204,19 @@ func (m *vdbe) hashAggStep(plan *aggPlan, keyVals []Value, seg int) error {
 		}
 		return m.hashAggStepRow(plan, keyVals, seg, m.aggNullRow[:plan.nCols:plan.nCols], m.aggNullRow[plan.nCols:plan.nCols+len(plan.scopes)])
 	}
+	if plan.rowCols != nil && m.hashAgg != nil {
+		// The row is read only for a group's anchor, which a group with no
+		// census site took on its first row (magnetWalk): an existing such
+		// group steps from its registers alone.
+		m.aggKeyBuf = hashAggKeyBytes(m.aggKeyBuf[:0], keyVals)
+		if b := m.hashAgg.buckets[string(m.aggKeyBuf)]; b != nil && b.accs.seenRow && len(b.accs.magnets) == 0 && b.accs.check == nil {
+			if n := plan.nCols + len(plan.scopes); len(m.aggNullRow) < n {
+				m.aggNullRow = make([]Value, n)
+			}
+			m.aggAccs = b.accs
+			return m.aggStep(m.aggRowCtx(plan, m.aggNullRow[:plan.nCols:plan.nCols], m.aggNullRow[plan.nCols:plan.nCols+len(plan.scopes)]), seg)
+		}
+	}
 	row, rowids, gerr := m.gatherCursorRow(plan)
 	if gerr != nil {
 		return gerr
