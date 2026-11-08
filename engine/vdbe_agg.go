@@ -43,6 +43,10 @@ type aggPlan struct {
 	// and a group keeps its anchor row only up to the last (rowWidth).
 	rowCols  []int
 	rowWidth int
+	// anchorKeep is rowCols when nothing reads the anchor's rowids: a row
+	// spelling every one of them as the anchor does leaves the anchor as it
+	// is instead of being copied again (aggAccumulators.keep).
+	anchorKeep []int
 
 	scopes  []tableScope
 	nCols   int   // total column count across every joined table -- the [cols..] block width; len(scopes) rowid slots immediately follow it in the [cols.., rowids..] layout (see aggRowSplit)
@@ -246,6 +250,8 @@ type aggAccumulators struct {
 	// (aggPlan.rowWidth), and all of it that is copied.
 	rowFree  bool
 	rowWidth int
+	// keep is the plan's anchorKeep.
+	keep []int
 	// slab, when not nil, is where the anchor is copied to: the hash
 	// aggregate's (aggSlab), for a group whose anchor is taken once.
 	slab *aggSlab
@@ -330,6 +336,9 @@ func (a *aggAccumulators) magnetWalk(ctx *evalCtx, regs []Value) error {
 		if a.rowWidth > 0 && a.rowWidth < len(vals) {
 			vals = vals[:a.rowWidth]
 		}
+		if a.haveAnchor && a.keep != nil && anchorSpelledAs(a.anchorVals, vals, a.keep) {
+			return nil
+		}
 		if a.slab != nil {
 			a.anchorVals, a.anchorRowids = a.slab.cloneValues(vals), a.slab.cloneValues(ctx.rowids)
 		} else {
@@ -339,6 +348,17 @@ func (a *aggAccumulators) magnetWalk(ctx *evalCtx, regs []Value) error {
 	}
 	a.haveAnchor = true
 	return nil
+}
+
+// anchorSpelledAs reports whether row holds, at every one of cols, exactly
+// what anchor does: a copy of row would read back the same.
+func anchorSpelledAs(anchor, row []Value, cols []int) bool {
+	for _, c := range cols {
+		if c >= len(anchor) || c >= len(row) || anchor[c].intReal != row[c].intReal || !anchorValuesIdentical(anchor[c], row[c]) {
+			return false
+		}
+	}
+	return true
 }
 
 // anchorRow returns the row a groupBareColExpr placeholder (or a correlated
@@ -388,7 +408,7 @@ func reuseAggAccs(a *aggAccumulators, plan *aggPlan) *aggAccumulators {
 		}
 	}
 	*a = aggAccumulators{out: a.out, having: a.having, order: a.order, magnets: a.magnets,
-		check: plan.anchorCheck, rowFree: plan.rowFree, rowWidth: plan.rowWidth}
+		check: plan.anchorCheck, rowFree: plan.rowFree, rowWidth: plan.rowWidth, keep: plan.anchorKeep}
 	if plan.magnet != nil {
 		a.magnetS = plan.magnet.allocS
 	}

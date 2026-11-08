@@ -1953,6 +1953,9 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 			plan.rowCols = append(make([]int, 0, len(cols)), cols...)
 			if len(cols) > 0 {
 				plan.rowWidth = slices.Max(cols) + 1
+				if !rowids {
+					plan.anchorKeep = plan.rowCols
+				}
 			}
 		}
 	}

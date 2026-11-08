@@ -159,7 +159,7 @@ func (s *aggSlab) clone(templates []*aggItem) []*aggItem {
 // newAggAccs makes a group's accumulator set, one item per template.
 func (s *aggSlab) newAggAccs(plan *aggPlan) *aggAccumulators {
 	a := s.acc()
-	*a = aggAccumulators{out: s.itemSets(len(plan.outPlans)), check: plan.anchorCheck, rowFree: plan.rowFree, rowWidth: plan.rowWidth}
+	*a = aggAccumulators{out: s.itemSets(len(plan.outPlans)), check: plan.anchorCheck, rowFree: plan.rowFree, rowWidth: plan.rowWidth, keep: plan.anchorKeep}
 	for i, it := range plan.outPlans {
 		a.out[i] = s.clone(it.aggTemplates)
 	}
