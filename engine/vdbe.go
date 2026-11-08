@@ -2152,13 +2152,26 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				break
 			}
 			if cur.streamIfOrdered && !cur.materialized && !cur.hasGeneratedCols() &&
-				!cur.seekConfigured && !cur.idxSeekConfigured && !cur.seekSetConfigured &&
-				cur.pager.segRowsInKeyOrder(cur.tbl.root, op.P4.(*autoIndexKey)) {
-				// The rows already run in the key's order: the outermost scan
-				// streams them as it would with no key. (A seek's few rows are
-				// sorted for less than asking.)
-				cur.streamable, cur.colMask = true, cur.scanMask.widenIfTotal(len(cur.tbl.cols))
-				break
+				!cur.seekConfigured && !cur.idxSeekConfigured && !cur.seekSetConfigured {
+				if cur.pager.segRowsInKeyOrder(cur.tbl.root, op.P4.(*autoIndexKey)) {
+					// The rows already run in the key's order: the outermost scan
+					// streams them as it would with no key. (A seek's few rows are
+					// sorted for less than asking.)
+					cur.streamable, cur.colMask = true, cur.scanMask.widenIfTotal(len(cur.tbl.cols))
+					break
+				}
+				// Or they are put in that order without being built: positioned
+				// on the segment rows, sorted, every rewind after walking them.
+				if src := cur.pager.segKeyOrderList(cur, op.P4.(*autoIndexKey), &cur.pointSrc); src != nil {
+					cur.seekGen = seekGens.Add(1)
+					cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
+					cur.segSrc, cur.segCur, cur.segSrcCols = src, nil, src.cols
+					cur.streamErrPending = nil
+					cur.pos = -1
+					cur.rowidNull = false
+					cur.keyListReady = true
+					break
+				}
 			}
 			// The cursor materializes on its first rewind; force that now so the
 			// permutation below is the one every later rewind re-iterates.

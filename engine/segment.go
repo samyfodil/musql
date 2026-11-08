@@ -136,6 +136,9 @@ type segment struct {
 	// (segRowsInKeyOrder).
 	keyOrderMu eqCountMu
 	keyOrder   map[string]bool
+	// keyPerm is, per list of int64 columns, the rows in the order of those
+	// columns, ties in row order (sortedOn).
+	keyPerm map[string][]int32
 	// vseg is native code's view of this segment (segment_vseg.go), built on
 	// first use.
 	vsegMu eqCountMu

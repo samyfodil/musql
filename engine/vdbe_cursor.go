@@ -173,6 +173,9 @@ type vdbeCursor struct {
 	// list OpAutoIndexOrder positioned stands for every rewind after it, as
 	// the built rows would have.
 	idxListOnce, idxListReady bool
+	// keyListReady is the same for an outermost scan OpAutoIndexOrder
+	// positioned on the table's rows in its key's order (segKeyOrderList).
+	keyListReady bool
 
 	// sorted is OpSortedSeek's copy of the rows, sorted by its column, that
 	// each seek narrows rows/rowids to a run of. nil until the first seek, and
@@ -1041,6 +1044,11 @@ func (cur *vdbeCursor) rewind() error {
 		cur.matched = nil
 	}
 	if !cur.materialized {
+		if cur.keyListReady && cur.segSrc != nil && cur.segSrc.list {
+			cur.segSrc.listPos, cur.segCur = 0, nil
+			cur.pos = -1
+			return nil
+		}
 		if cur.rowStore != nil {
 			// Whichever exit below built the rows, they are walked in the
 			// planned one-pass order when one was installed.
