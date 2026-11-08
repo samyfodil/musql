@@ -393,6 +393,9 @@ type VSegCol struct {
 	Nulls unsafe.Pointer // the NULL bitmap (bit i%8 of byte i/8), or nil: a NULL exits
 	Exc   unsafe.Pointer // the exceptions' bitmap (bit i%64 of uint64 i/64), or nil: one exits
 	Heap  unsafe.Pointer // VSegText's bytes
+	// Plain is Kind for a column with no NULL bitmap and no exceptions, else
+	// 0: a VColumn that predicted the kind (T) reads such a cell with one test.
+	Plain int64
 }
 
 // VSegCol kinds: how a cell reads as a Value.
@@ -437,12 +440,13 @@ const (
 	VSegOffFirst    = 8
 	VSegOffDense    = 16
 	VSegOffRowids   = 24
-	VSegColSize     = 40
+	VSegColSize     = 48
 	VSegColOffKind  = 0
 	VSegColOffBlock = 8
 	VSegColOffNulls = 16
 	VSegColOffExc   = 24
 	VSegColOffHeap  = 32
+	VSegColOffPlain = 40
 	// sliceHeaderSize is the size of a []Value header in the rows array.
 	sliceHeaderSize = 24
 )

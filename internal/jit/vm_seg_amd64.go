@@ -32,14 +32,69 @@ func (a *Asm) MovRegMemD32(dst, base Reg, disp int32) {
 //
 // A segment cell reads exactly as segColumnValue reads it, or exits: a NULL
 // or an exception exits, and so does a kind the engine left out of the Mask.
+//
+// With a predicted kind (T) a run's reads of one cursor share their checks:
+// the first checks the cursor, every column the run reads of it (the Mask)
+// and its position, and keeps the cursor's address in a register
+// (holds[^A]); each read then tests only that its column is plain (no NULL
+// bitmap, no exceptions) and of the kind predicted, and goes straight to that
+// kind's read. Anything else takes the full read below.
 func (e *vmEmit) segColumn(pc int, in VInsn) {
 	a, L := e.a, e.lay
 	cb := int32(in.A * VCursorSize)
-	e.unmap(^in.A)
 	e.destNoS(pc, in.C)
 	delete(e.zeroS, in.C) // every word of the destination is written below
 	dst := e.d(in.C, 0)
 	l := func(s string) string { return fmt.Sprintf("sc%d.%s", pc, s) }
+	kindLabel := map[int64]string{VSegInt: "int", VSegFloat: "float", VSegNumeric: "num", VSegIntReal: "intreal", VSegRowid: "rowid", VSegText: "text"}
+	if name, ok := kindLabel[int64(in.T)]; ok {
+		base, have := e.holds[^in.A]
+		if have {
+			e.pinned[base] = true
+		} else {
+			mask := uint64(1) << uint(in.B)
+			if e.cache {
+				mask, _ = vmRunColumns(e.prog, e.bound, pc, mask, in.B)
+			}
+			a.MovRegMemD(RAX, RDI, POffCur)
+			a.LeaRegMemD(RAX, RAX, cb)
+			a.CmpMemDImm8(RAX, VCursorOffOk, 0)
+			e.jccStub(CondE, pc)
+			a.MovRegMemD(RDX, RAX, VCursorOffMask)
+			a.MovRegImm64(R10, int64(mask))
+			a.AndRegReg(RDX, R10)
+			a.CmpRegReg(RDX, R10)
+			e.jccStub(CondNE, pc)
+			a.MovRegMemD(RDX, RAX, VCursorOffPos)
+			a.AluRegMemD(AluCmp, RDX, RAX, VCursorOffN)
+			e.jccStub(condAboveEq, pc) // unsigned: a position before the first row is huge
+			base = RAX
+			if u := e.nextUse(^in.A, pc); u >= 0 {
+				if m, ok := e.alloc(pc, u, true); ok {
+					a.MovRegReg(m, RAX)
+					base = m
+					e.holds[^in.A] = m
+					e.pinned[m] = true
+				}
+			}
+		}
+		a.MovRegMemD(RDX, base, VCursorOffPos)
+		a.MovRegMemD(R9, base, VCursorOffSeg)
+		a.TestRegReg(R9, R9)
+		a.Jcc(CondE, l("full"))
+		a.MovRegMemD(R10, base, VCursorOffSel)
+		a.TestRegReg(R10, R10)
+		a.Jcc(CondE, l("fnosel"))
+		a.MovRegMemIdx(RDX, R10, RDX)
+		a.Label(l("fnosel"))
+		a.MovRegMemD(R10, R9, VSegOffCols)
+		a.AddRegImm32(R10, int32(in.B*VSegColSize))
+		a.CmpMemDImm8(R10, VSegColOffPlain, int8(in.T))
+		a.Jcc(CondE, l(name))
+		a.Label(l("full"))
+	} else {
+		e.unmap(^in.A)
+	}
 
 	a.MovRegMemD(RAX, RDI, POffCur)
 	a.CmpMemDImm8(RAX, cb+VCursorOffOk, 0)

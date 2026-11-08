@@ -23,12 +23,68 @@ func (e *vmEmitArm) curBase(c int) {
 // segColumn is vm_seg_amd64.go's: column B of cursor A's row Pos, from the
 // segment's blocks when the engine handed one over (VCursor.Seg), else from
 // its row list. X9 the cursor, X5 the row, X6 the VSeg, X7 the VSegCol.
+//
+// A predicted kind (T) shares a run's checks of the cursor and reads a plain
+// column of that kind directly, as on amd64.
 func (e *vmEmitArm) segColumn(pc int, in VInsn) {
 	a, L := e.a, e.lay
-	e.unmap(^in.A)
 	e.destNoS(pc, in.C)
 	delete(e.zeroS, in.C) // every word of the destination is written below
 	seg, nonull, noexc, done := e.vmLabel("sg"), e.vmLabel("sn"), e.vmLabel("sx"), e.vmLabel("sd")
+	kinds := []int{VSegInt, VSegFloat, VSegNumeric, VSegIntReal, VSegRowid, VSegText}
+	at := map[int]string{}
+	for _, k := range kinds {
+		at[k] = e.vmLabel("sk")
+	}
+	if kind, ok := at[in.T]; ok {
+		full, fnosel := e.vmLabel("sf"), e.vmLabel("so")
+		base, have := e.holds[^in.A]
+		if have {
+			e.pinned[base] = true
+		} else {
+			mask := uint64(1) << uint(in.B)
+			if e.cache {
+				mask, _ = vmRunColumns(e.prog, e.bound, pc, mask, in.B)
+			}
+			e.curBase(in.A)
+			a.LdrImm(X10, X9, VCursorOffOk)
+			a.Cbz(X10, e.stub(pc))
+			a.LdrImm(X10, X9, VCursorOffMask)
+			a.MovImm64(X4, int64(mask))
+			a.AndReg(X10, X10, X4)
+			a.Cmp(X10, X4)
+			a.Bcond(CondNE, e.stub(pc))
+			a.LdrImm(X5, X9, VCursorOffPos)
+			a.LdrImm(X10, X9, VCursorOffN)
+			a.Cmp(X5, X10)
+			a.BcondRaw(armHS, e.stub(pc)) // unsigned: a position before the first row is huge
+			base = X9
+			if u := e.nextUse(^in.A, pc); u >= 0 {
+				if m, ok := e.alloc(pc, u); ok {
+					a.MovReg(m, X9)
+					base = m
+					e.holds[^in.A] = m
+					e.pinned[m] = true
+				}
+			}
+		}
+		a.LdrImm(X5, base, VCursorOffPos)
+		a.LdrImm(X6, base, VCursorOffSeg)
+		a.Cbz(X6, full)
+		a.LdrImm(X4, base, VCursorOffSel)
+		a.Cbz(X4, fnosel)
+		a.LdrRegIdx(X5, X4, X5)
+		a.Label(fnosel)
+		a.LdrImm(X7, X6, VSegOffCols)
+		a.MovImm64(X4, int64(in.B*VSegColSize))
+		a.AddReg(X7, X7, X4)
+		a.LdrImm(X8, X7, VSegColOffPlain)
+		a.CmpImm(X8, uint32(in.T))
+		a.Bcond(CondE, kind)
+		a.Label(full)
+	} else {
+		e.unmap(^in.A)
+	}
 
 	e.curBase(in.A)
 	a.LdrImm(X10, X9, VCursorOffOk)
@@ -90,10 +146,7 @@ func (e *vmEmitArm) segColumn(pc int, in VInsn) {
 	a.Cbnz(X8, e.stub(pc)) // an exception: the VDBE's
 	a.Label(noexc)
 	a.LdrImm(X8, X7, VSegColOffKind)
-	kinds := []int{VSegInt, VSegFloat, VSegNumeric, VSegIntReal, VSegRowid, VSegText}
-	at := map[int]string{}
 	for _, k := range kinds {
-		at[k] = e.vmLabel("sk")
 		a.CmpImm(X8, uint32(k))
 		a.Bcond(CondE, at[k])
 	}
