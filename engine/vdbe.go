@@ -2571,6 +2571,17 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				cur.seekSetConfigured || cur.idxSeekConfigured || cur.seekReseek || cur.segFilter != nil {
 				break
 			}
+			// One row answers here too: the seeks configured after this
+			// rewind again, so a rewind now would copy the whole table only
+			// to be thrown away. Asked afresh, as a rewind would be.
+			cur.emptyKnown = false
+			if empty, ok := cur.tableEmpty(); ok {
+				if empty {
+					pc = op.P2
+					continue
+				}
+				break
+			}
 			cur.params = m.params
 			if rerr := cur.rewind(); rerr != nil {
 				return nil, rerr
