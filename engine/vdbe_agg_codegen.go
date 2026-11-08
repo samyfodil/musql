@@ -2204,11 +2204,13 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// row-live.
 	savedRowLive, savedOrderFree := c.rowLive, c.rowOrderFree
 	c.rowLive = true
-	// As compileScanAggregate's, with one more condition: every grouping term
-	// reads only the outermost loop's table, whose order no automatic index
-	// changes. The groups then arrive, and finish, exactly as before; only the
-	// order of rows within one, which nothing here reads, moves.
+	// As compileScanAggregate's, with two more conditions: every grouping term
+	// reads only the outermost loop's table, and that loop carries no order of
+	// its own (an index walk delivering the groups together). The groups then
+	// arrive, and finish, exactly as before; only the order of rows within one,
+	// which nothing here reads, moves.
 	c.rowOrderFree = rowFree && stmt.Having == nil && !anyOrderSensitive(aggs) && len(jplan.execOrder) > 0 &&
+		(len(jplan.autoIdxKeys) == 0 || jplan.autoIdxKeys[0] == nil) &&
 		!slices.ContainsFunc(stmt.GroupBy, func(e Expr) bool {
 			return !keyRefsOnlyCursors(c, e, map[int]bool{srcs[jplan.execOrder[0]].scope.cursor: true})
 		})
