@@ -349,7 +349,9 @@ type VCursor struct {
 	// Reopen is non-zero when an open of the cursor (VOpen) would give it
 	// Rows again, so native code may close and reopen it: Rows, N, Rowids and
 	// Mask are then the reopened cursor's even while it is closed (Ok zero).
-	// The engine's value says what state it handed the cursor over in.
+	// The engine's value says what state it handed the cursor over in. At
+	// VReopenSeek the cursor is one VSeekIdx positions, which an open marks
+	// VReopenSeekOpened for the engine to open when it takes it back.
 	Reopen int64
 	// State is 1 once native code has reopened the cursor (VOpen).
 	State int64
@@ -508,3 +510,10 @@ type ValueLayout struct {
 
 // VMFuel is how many backward jumps run between two returns to Go.
 const VMFuel = 1 << 20
+
+// VCursor.Reopen of a cursor VSeekIdx positions, which VOpen and VClose may
+// open and close.
+const (
+	VReopenSeek       = 4
+	VReopenSeekOpened = 5
+)

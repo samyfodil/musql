@@ -22,6 +22,13 @@ type idxSeekSpec struct {
 	// rows (a correlated seek, or one in an automatic index's order), whose
 	// rows it counts as served (segRowsServed); it builds the others.
 	listed bool
+	// open is the pc of the cursor's OpOpenRead, which native code makes as
+	// a VOpen (with its OpClose a VClose), or -1.
+	open int
+	// pinned is the columns the seek's slots and its loop's first tests hold
+	// equal (loopPinnedCols): rows sharing all of them, the only ones the
+	// loop keeps, run in rowid order when the order has no other column.
+	pinned []int
 }
 
 // lowerIdxSeeks lowers each integer equality index seek -- an OpSeekIndexHint's
@@ -61,13 +68,18 @@ func lowerIdxSeeks(prog *Program, vp []jit.VInsn, segCap []bool) ([]*idxSeekSpec
 			continue
 		}
 		j := pc + 1
+		pinned := []int{h.leadingCol}
 		for j < len(insns) && insns[j].Op == OpSeekIndexHint && insns[j].P1 == c {
-			if h2, ok := insns[j].P4.(*indexSeekHint); !ok || h2.slot == 0 || h2.in != 0 {
+			h2, ok := insns[j].P4.(*indexSeekHint)
+			if !ok || h2.slot == 0 || h2.in != 0 {
 				break
+			}
+			if !h2.is {
+				pinned = append(pinned, h2.leadingCol)
 			}
 			j++
 		}
-		spec := &idxSeekSpec{col: h.leadingCol, order: h.order, seek: pc, aio: -1, listed: in.P3 == 1}
+		spec := &idxSeekSpec{col: h.leadingCol, order: h.order, seek: pc, aio: -1, listed: in.P3 == 1, pinned: pinned, open: -1}
 		if j < len(insns) && insns[j].Op == OpAutoIndexOrder && insns[j].P1 == c {
 			k, ok := insns[j].P4.(*autoIndexKey)
 			if !ok || h.order != nil {
@@ -79,10 +91,11 @@ func lowerIdxSeeks(prog *Program, vp []jit.VInsn, segCap []bool) ([]*idxSeekSpec
 		if j >= len(insns) || insns[j].Op != OpRewind || insns[j].P1 != c || insns[j].P4 != nil {
 			continue
 		}
+		spec.pinned = append(spec.pinned, loopPinnedCols(insns, j+1, c)...)
 		if o := spec.order; o != nil && (len(o.cols) == 0 || o.cols[0] != h.leadingCol || o.exprs != nil || o.multiOr != nil || o.rjSweep != nil) {
 			continue
 		}
-		if prev := specs[c]; prev != nil && (prev.col != spec.col || prev.order != spec.order || prev.listed != spec.listed) {
+		if prev := specs[c]; prev != nil && (prev.col != spec.col || prev.order != spec.order || prev.listed != spec.listed || !slices.Equal(prev.pinned, spec.pinned)) {
 			bad[c] = true
 			continue
 		}
@@ -115,7 +128,82 @@ func lowerIdxSeeks(prog *Program, vp []jit.VInsn, segCap []bool) ([]*idxSeekSpec
 			specs[c] = nil
 		}
 	}
+	// A cursor's opens, all of one table, and its closes: native code makes
+	// them too, so a seek in a subroutine opened per call stays native.
+	for c, spec := range specs {
+		if spec == nil {
+			continue
+		}
+		var opens, closes []int
+		same := true
+		for pc, in := range insns {
+			switch {
+			case in.Op == OpOpenRead && in.P1 == c:
+				if len(opens) > 0 {
+					o := insns[opens[0]]
+					same = same && in.P2 == o.P2 && in.P3 == o.P3 && in.P4 == o.P4 && in.P5 == o.P5
+				}
+				opens = append(opens, pc)
+			case in.Op == OpClose && in.P1 == c:
+				closes = append(closes, pc)
+			case isCursorOpen(in.Op) && in.P1 == c:
+				same = false
+			}
+		}
+		if len(opens) == 0 || !same {
+			continue
+		}
+		spec.open = opens[0]
+		for _, q := range opens {
+			vp[q] = jit.VInsn{Op: jit.VOpen, A: c}
+			pcs = append(pcs, q)
+		}
+		for _, q := range closes {
+			vp[q] = jit.VInsn{Op: jit.VClose, A: c}
+			pcs = append(pcs, q)
+		}
+	}
 	return specs, pcs
+}
+
+// syncSeekOpen takes back a seek cursor native code may have opened or closed
+// (jit.VReopenSeek): an open of native code's is the VDBE's OpOpenRead, and a
+// cursor native code left closed is closed. It reports whether that is all
+// there is to take back.
+func (jx *vmJIT) syncSeekOpen(m *vdbe, c int, jc *jit.VCursor) bool {
+	spec := jx.idxSpecs[c]
+	if jc.Reopen == jit.VReopenSeekOpened {
+		insns := unsafe.Slice(jx.insns, jx.n)
+		if err := m.execOpenRead(&insns[spec.open], insns); err != nil {
+			if m.jitErr == nil {
+				m.jitErr = err
+			}
+			return true
+		}
+		m.jsnap[c].segLive, m.jsnap[c].live = false, false
+		if jc.Ok != 0 && jc.State == 1 {
+			if spec.listed {
+				segRowsServed.Add(jc.Served)
+			}
+			return true
+		}
+	}
+	if jc.Ok != 0 {
+		return false
+	}
+	if jc.Dirty != 0 || jc.Reopen == jit.VReopenSeekOpened {
+		if spec.listed {
+			served := jc.Served
+			if jc.State == 2 || jc.State == 4 || jc.State == 5 {
+				served += jc.Last + 1
+			}
+			segRowsServed.Add(served)
+		}
+		if cur := m.cursors[c]; cur != nil && !cur.closed {
+			cur.close()
+		}
+	}
+	return true
 }
 
 // vmIdx is a cursor's table as VSeekIdx searches it (jit.VIdx, one a
@@ -167,7 +255,7 @@ func buildVMIdx(t *vmTab, spec *idxSeekSpec) *vmIdx {
 		for i := range rows {
 			rows[i] = int(binary.LittleEndian.Uint32(d.posts[4*i:]))
 		}
-		if spec.order != nil && !runsInKeyOrder(sg, d, rows, spec.order) {
+		if spec.order != nil && !pinnedToRowid(spec) && !runsInKeyOrder(sg, d, rows, spec.order) {
 			return x
 		}
 		x.vidx = append(x.vidx, jit.VIdx{Vals: unsafe.Pointer(unsafe.SliceData(d.vals)), NVals: int64(d.nVals),
@@ -180,6 +268,55 @@ func buildVMIdx(t *vmTab, spec *idxSeekSpec) *vmIdx {
 	}
 	x.none = false
 	return x
+}
+
+// loopPinnedCols is the columns of cursor c the loop opening at pc holds equal
+// to another cursor's before anything else: each a comparison
+//
+//	Column c.x -> r1; Column o.y -> r2; Eq r1, r2 (BINARY); IfNot -> Next c
+//
+// whose failure skips the row, with o another cursor, positioned outside the
+// loop since nothing has moved inside it yet.
+func loopPinnedCols(insns []Instruction, pc, c int) []int {
+	var cols []int
+	for pc+3 < len(insns) {
+		a, b, eq, skip := insns[pc], insns[pc+1], insns[pc+2], insns[pc+3]
+		if a.Op != OpColumn || b.Op != OpColumn || eq.Op != OpEq || skip.Op != OpIfNot || skip.P1 != eq.P2 {
+			break
+		}
+		if coll, _ := eq.P4.(string); coll != "" && !equalFoldName(effectiveCollation(coll), "BINARY") {
+			break
+		}
+		if a.P1 != c {
+			a, b = b, a
+		}
+		if a.P1 != c || b.P1 == c || !(eq.P1 == a.P3 && eq.P3 == b.P3 || eq.P1 == b.P3 && eq.P3 == a.P3) {
+			break
+		}
+		if t := skip.P2; t < 0 || t >= len(insns) || insns[t].Op != OpNext || insns[t].P1 != c {
+			break
+		}
+		cols = append(cols, a.P2)
+		pc += 4
+	}
+	return cols
+}
+
+// pinnedToRowid reports whether spec's seek and loop hold equal every column
+// of its order but the trailing rowid: the rows the loop keeps then run in
+// rowid order, as the index lists each value's rows.
+func pinnedToRowid(spec *idxSeekSpec) bool {
+	cols := spec.order.cols
+	n := len(cols)
+	if n > 0 && cols[n-1] == -1 {
+		n--
+	}
+	for _, col := range cols[:n] {
+		if !slices.Contains(spec.pinned, col) {
+			return false
+		}
+	}
+	return true
 }
 
 // runsInKeyOrder reports whether each value's rows, in the index's order, are

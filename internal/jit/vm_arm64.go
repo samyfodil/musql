@@ -981,6 +981,18 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		a.LdrImm(X9, X0, POffCur)
 		e.ldrAt(X10, X9, cb+VCursorOffReop)
 		a.Cbz(X10, e.stub(pc))
+		if in.Op == VOpen {
+			// A seek cursor (Reopen 4 or 5): as vm_amd64.go's.
+			gen := e.vmLabel("og")
+			a.CmpImm(X10, VReopenSeek)
+			a.Bcond(CondL, gen)
+			e.curBase(in.A)
+			e.seekIdxServed(e.vmLabel("ov"), e.vmLabel("ok"))
+			a.MovImm16(X10, VReopenSeekOpened)
+			a.StrImm(X10, X9, VCursorOffReop)
+			a.LdrImm(X9, X0, POffCur)
+			a.Label(gen)
+		}
 		a.MovImm16(X11, 1)
 		if in.Op == VOpen {
 			e.ldrAt(X10, X9, cb+VCursorOffN)

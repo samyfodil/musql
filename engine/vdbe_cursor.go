@@ -185,6 +185,9 @@ type vdbeCursor struct {
 	// across rewinds since nothing is built.
 	segSorted *segSortedRows
 
+	// closed is set by close(); an open makes a fresh cursor.
+	closed bool
+
 	// matched is this cursor's RIGHT/FULL JOIN mark bitmap (parallel to
 	// rows/rowids) -- nil until OpRightJoinMark or OpRightJoinSweepRewind/Next
 	// first touches it, for a cursor that is never a RIGHT/FULL JOIN target
@@ -1559,6 +1562,7 @@ func (cur *vdbeCursor) nullRow() {
 // b-tree cursor, which owns no goroutine). Safe to call more than once, and
 // safe even if rewind was never called.
 func (cur *vdbeCursor) close() {
+	cur.closed = true
 	// Same discipline for the segment row: segCur is what tells readColumn to
 	// go to the segment instead of rowVals, so a closed cursor must not keep
 	// pointing at a row it no longer scans.

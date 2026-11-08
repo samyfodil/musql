@@ -2035,6 +2035,13 @@ func (jx *vmJIT) handCursor(m *vdbe, pc, c int) {
 			}
 		}
 	}
+	if jx.idxSpecs != nil && jx.idxSpecs[c] != nil && jx.idxSpecs[c].open >= 0 {
+		// A seek cursor native code may open and close (VOpen, VClose).
+		defer func() { jc.Reopen = jit.VReopenSeek }()
+		if cur.closed {
+			return
+		}
+	}
 	if jx.reopen != nil && jx.handReopen(cur, c, jc) {
 		return
 	}
@@ -2111,7 +2118,11 @@ func (jx *vmJIT) handCursor(m *vdbe, pc, c int) {
 // stopped at exit, did to it (m.jcur[c]).
 func (jx *vmJIT) syncCursor(m *vdbe, c, exit int) {
 	jc := &m.jcur[c]
-	if jc.Reopen != 0 {
+	if jc.Reopen >= jit.VReopenSeek {
+		if jx.syncSeekOpen(m, c, jc) {
+			return
+		}
+	} else if jc.Reopen != 0 {
 		if jc.Dirty != 0 {
 			syncReopen(m.cursors[c], jc, m.params)
 		}

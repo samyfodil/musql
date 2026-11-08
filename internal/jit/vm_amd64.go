@@ -994,6 +994,15 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		a.CmpMemDImm8(RAX, cb+VCursorOffReop, 0)
 		e.jccStub(CondE, pc)
 		if in.Op == VOpen {
+			// A seek cursor (Reopen 4 or 5): the rows its last seek's run
+			// served are counted, and the open marked native (5).
+			gen := fmt.Sprintf("op%d.gen", pc)
+			a.CmpMemDImm8(RAX, cb+VCursorOffReop, VReopenSeek)
+			a.Jcc(CondL, gen)
+			a.LeaRegMemD(R10, RAX, cb)
+			e.seekIdxServed(R10, RDX, fmt.Sprintf("op%d.sv", pc), fmt.Sprintf("op%d.sk", pc))
+			a.MovMemDImm(R10, VCursorOffReop, VReopenSeekOpened)
+			a.Label(gen)
 			a.MovRegMemD(RDX, RAX, cb+VCursorOffN)
 			a.MovMemDReg(RAX, cb+VCursorOffPos, RDX)
 			a.MovMemDImm(RAX, cb+VCursorOffLast, -1)
