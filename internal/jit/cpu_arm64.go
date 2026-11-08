@@ -26,3 +26,11 @@ func SetCPUForTest(fma, round bool) (restore func()) {
 
 // VMReal reports whether the VM JIT has its REAL arms (VReal to VMath).
 const VMReal = true
+
+// VMSegCursor reports whether a VColumn marked segment-capable reads a
+// segment cursor's column blocks (VCursor.Seg).
+const VMSegCursor = false
+
+// VMTextOrder reports whether VTextCmpJump and VTextCmpSet take an ordered
+// condition, and a numeric affinity's whole-number test (Imm 1).
+const VMTextOrder = false

@@ -874,7 +874,17 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 			e.clobber(in.C)
 			break
 		}
+		if in.Imm == 1 {
+			e.segColumn(pc, in)
+			break
+		}
 		e.column(pc, in)
+	case VSeekRowid:
+		e.seekRowid(pc, in)
+	case VText:
+		e.text(pc, in)
+	case VSeekRewind:
+		e.seekRewind(pc, in)
 	case VInSet:
 		e.inSet(pc, in)
 	case VSubstr:

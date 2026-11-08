@@ -175,6 +175,23 @@ const (
 	// VClose: close cursor A (Ok zero), when VCursor.Reopen is set; any other
 	// exits.
 	VClose
+
+	// ---- Segment seeks (VMSegCursor).
+
+	// VSeekRowid: find the row whose rowid is the INTEGER in r[B] among the
+	// segments of cursor A's table (VCursor.Tab) and put the cursor on it in
+	// segment mode, as the VDBE's OP_SeekRowidHint and OP_Rewind would, then
+	// fall through to the VSeekRewind; jump to T when no row has it. A key
+	// that is no INTEGER, a cursor with no Tab, and the write barrier on exit.
+	VSeekRowid
+	// VSeekRewind: the OP_Rewind after a VSeekRowid, which has done its work:
+	// go on (State 2 becomes 4). Reached any other way, it exits.
+	VSeekRewind
+
+	// VText: r[A] = the TEXT of the B bytes at Imm, which the engine keeps
+	// alive and never writes, shared as the VDBE's OP_String8 shares its
+	// constant. The write barrier on exits. (VMTextOrder)
+	VText
 )
 
 // sdivMagic is the multiplier m and shift s with which n/d, truncated, is
@@ -278,10 +295,68 @@ type VCursor struct {
 	Reopen int64
 	// State is 1 once native code has reopened the cursor (VOpen).
 	State int64
+	// Seg, when not nil, is the cursor's current segment (a *VSeg): a
+	// VColumn marked segment-capable (Imm 1) reads row Pos's cell from the
+	// column blocks there instead of from Rows, and N is where the segment's
+	// rows the cursor walks end. Only where VMSegCursor.
+	Seg unsafe.Pointer
+	// Tab, when not nil, is the segments of the cursor's table (a *VTab),
+	// every row of which they hold: what VSeekRowid searches. Key is the last
+	// key it searched for, State 2 when it found the row (4 once its
+	// VSeekRewind ran) and 3 when not; Served counts its finds.
+	Tab    unsafe.Pointer
+	Key    int64
+	Served int64
 }
 
+// VTab is the segments of a table, in the order the engine searches them.
+type VTab struct {
+	Segs unsafe.Pointer // the first of N VTabSegs
+	N    int64
+}
+
+// VTabSeg is one segment of a VTab: the rowids from Lo to Hi it holds, its
+// Rows, its VSeg, and the columns native code reads from it.
+type VTabSeg struct {
+	Lo, Hi int64
+	Rows   int64
+	Seg    unsafe.Pointer
+	Mask   uint64
+}
+
+// VSeg is native code's view of one segment of a table: per column, where its
+// cells are and how they read. The engine builds it once per segment and keeps
+// it with the segment, which it outlives no entry.
+type VSeg struct {
+	Cols   unsafe.Pointer // the first of the segment's VSegCols, column c at c*VSegColSize
+	First  int64          // row 0's rowid, when Dense
+	Dense  int64          // non-zero: row i's rowid is First+i
+	Rowids unsafe.Pointer // the rowid block (uint64s) when not Dense
+}
+
+// VSegCol is one column of a VSeg. A column whose Kind is VSegNone is never in
+// a segment cursor's Mask.
+type VSegCol struct {
+	Kind  int64
+	Block unsafe.Pointer // the cells: 8 bytes a row, or for VSegText nRows+1 uint32 heap bounds
+	Nulls unsafe.Pointer // the NULL bitmap (bit i%8 of byte i/8), or nil: a NULL exits
+	Exc   unsafe.Pointer // the exceptions' bitmap (bit i%64 of uint64 i/64), or nil: one exits
+	Heap  unsafe.Pointer // VSegText's bytes
+}
+
+// VSegCol kinds: how a cell reads as a Value.
 const (
-	VCursorSize     = 96
+	VSegNone    = iota
+	VSegInt     // an int64 cell, an INTEGER
+	VSegFloat   // a double cell, a REAL
+	VSegNumeric // a double cell, an INTEGER when integral and within 2^53, else a REAL
+	VSegIntReal // an int64 cell read as a REAL (a column of REAL affinity)
+	VSegRowid   // the rowid (an INTEGER PRIMARY KEY, stored NULL)
+	VSegText    // TEXT between two heap bounds
+)
+
+const (
+	VCursorSize     = 128
 	VCursorOffRows  = 0
 	VCursorOffN     = 8
 	VCursorOffPos   = 16
@@ -294,6 +369,28 @@ const (
 	VCursorOffRids  = 72
 	VCursorOffReop  = 80
 	VCursorOffState = 88
+	VCursorOffSeg   = 96
+	VCursorOffTab   = 104
+	VCursorOffKey   = 112
+	VCursorOffSrvd  = 120
+	VTabOffSegs     = 0
+	VTabOffN        = 8
+	VTabSegSize     = 40
+	VTabSegOffLo    = 0
+	VTabSegOffHi    = 8
+	VTabSegOffRows  = 16
+	VTabSegOffSeg   = 24
+	VTabSegOffMask  = 32
+	VSegOffCols     = 0
+	VSegOffFirst    = 8
+	VSegOffDense    = 16
+	VSegOffRowids   = 24
+	VSegColSize     = 40
+	VSegColOffKind  = 0
+	VSegColOffBlock = 8
+	VSegColOffNulls = 16
+	VSegColOffExc   = 24
+	VSegColOffHeap  = 32
 	// sliceHeaderSize is the size of a []Value header in the rows array.
 	sliceHeaderSize = 24
 )

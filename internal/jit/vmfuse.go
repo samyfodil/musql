@@ -69,7 +69,7 @@ func vmStepOf(in VInsn, pc int) progStep {
 		s.uses, s.targets = []int{in.A, in.B}, []int{in.T}
 	case VCmpBr, VFCmpBr:
 		s.uses, s.defs, s.targets = []int{in.A, in.B}, []int{in.C}, []int{in.T}
-	case VReal:
+	case VReal, VText:
 		s.defs = []int{in.A}
 	case VMath:
 		s.uses, s.defs = []int{in.A}, []int{in.C}
@@ -104,6 +104,9 @@ func vmStepOf(in VInsn, pc int) progStep {
 		s.uses, s.defs = []int{in.A, int(in.Imm)}, []int{in.C}
 	case VRewind, VNext:
 		s.targets = []int{in.T}
+	case VSeekRowid:
+		s.uses, s.targets = []int{in.B}, []int{in.T}
+	case VSeekRewind:
 	case VOpen, VClose:
 	case VResultRow:
 		if in.Skip == 0 {
@@ -260,7 +263,7 @@ func FuseVM(prog []VInsn, nReg int, hard, entry []bool) []VInsn {
 		case VAdd, VSub, VMul, VAnd, VOr, VShl, VShr, VDiv, VRem, VCmpSet, VNull, VNeg, VNot,
 			VFAdd, VFSub, VFMul, VFDiv, VFCmpSet, VMath:
 			d = in.C
-		case VReal:
+		case VReal, VText:
 			d = in.A
 		default:
 			continue
@@ -461,7 +464,7 @@ func vmEmitNextUse(prog []VInsn, bound []bool, key, pc int) int {
 // vmMovesCursor reports whether op moves its cursor off the row a VColumn
 // before it read.
 func vmMovesCursor(op VOp) bool {
-	return op == VNext || op == VRewind || op == VOpen || op == VClose
+	return op == VNext || op == VRewind || op == VOpen || op == VClose || op == VSeekRowid || op == VSeekRewind
 }
 
 // vmRunColumns adds to mask and maxCol the columns of the cursor pc's VColumn
