@@ -266,3 +266,31 @@ func TestVMText(t *testing.T) {
 		t.Fatalf("pc %d r0 %+v r1 %+v", pc, got, regs[1])
 	}
 }
+
+// TestVMSegRowid reads the rowid of a cursor in segment mode: from the rowid
+// block when there is one, else a dense segment's first plus the row; a
+// cursor with neither exits.
+func TestVMSegRowid(t *testing.T) {
+	if !Available || !VMSegCursor {
+		t.Skip("no segment cursors on this platform")
+	}
+	noGC(t)
+	rids := []uint64{7, 9, 40}
+	dense := &VSeg{First: 100, Dense: 1}
+	sparse := &VSeg{Rowids: unsafe.Pointer(&rids[0])}
+	for _, c := range []struct {
+		seg  *VSeg
+		rids unsafe.Pointer
+		want int64 // -1: exits
+	}{{dense, nil, 102}, {sparse, unsafe.Pointer(&rids[0]), 40}, {&VSeg{}, nil, -1}, {nil, nil, -1}} {
+		regs := []tvalue{{Typ: tvInt, I: -9}}
+		cur := &VCursor{N: 3, Pos: 2, Last: -1, Ok: 1, Rowids: c.rids, Seg: unsafe.Pointer(c.seg)}
+		pc := runVMCursor(t, []VInsn{{Op: VRowid, A: 0, C: 0}, {Op: VExit}}, regs, nil, cur, 0)
+		switch {
+		case c.want < 0 && (pc != 0 || regs[0].I != -9):
+			t.Fatalf("%+v: pc %d r0 %+v, want an exit", c, pc, regs[0])
+		case c.want >= 0 && (pc != 1 || regs[0].Typ != tvInt || regs[0].I != c.want):
+			t.Fatalf("%+v: pc %d r0 %+v, want %d", c, pc, regs[0], c.want)
+		}
+	}
+}
