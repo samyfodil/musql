@@ -246,6 +246,9 @@ type aggAccumulators struct {
 	// (aggPlan.rowWidth), and all of it that is copied.
 	rowFree  bool
 	rowWidth int
+	// slab, when not nil, is where the anchor is copied to: the hash
+	// aggregate's (aggSlab), for a group whose anchor is taken once.
+	slab *aggSlab
 
 	// magnetHit is M, SQLite's regHit. It is a REGISTER, so it survives from
 	// one scanned row to the next: a row on which every census site is jumped
@@ -327,8 +330,12 @@ func (a *aggAccumulators) magnetWalk(ctx *evalCtx, regs []Value) error {
 		if a.rowWidth > 0 && a.rowWidth < len(vals) {
 			vals = vals[:a.rowWidth]
 		}
-		a.anchorVals = cloneValues(vals)
-		a.anchorRowids = cloneValues(ctx.rowids)
+		if a.slab != nil {
+			a.anchorVals, a.anchorRowids = a.slab.cloneValues(vals), a.slab.cloneValues(ctx.rowids)
+		} else {
+			a.anchorVals = cloneValues(vals)
+			a.anchorRowids = cloneValues(ctx.rowids)
+		}
 	}
 	a.haveAnchor = true
 	return nil

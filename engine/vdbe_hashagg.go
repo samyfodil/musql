@@ -9,6 +9,7 @@ package engine
 import (
 	"math"
 	"sort"
+	"unsafe"
 )
 
 // hashAggBucket is one GROUP BY hash-aggregate bucket: the group's own
@@ -52,6 +53,36 @@ type aggSlab struct {
 	ptrs    []*aggItem
 	sets    [][]*aggItem
 	vals    []Value
+	keys    []byte
+}
+
+// key is k as a string carved from the slab's bytes, which nothing writes
+// again: a bucket map's key.
+func (s *aggSlab) key(k []byte) string {
+	if len(k) == 0 {
+		return ""
+	}
+	if len(s.keys) < len(k) {
+		s.keys = make([]byte, max(len(k), s.chunk(1)*16))
+	}
+	out := s.keys[:len(k):len(k)]
+	s.keys = s.keys[len(k):]
+	copy(out, k)
+	return unsafe.String(&out[0], len(out))
+}
+
+// cloneValues is cloneValues over the slab: a group's anchor.
+func (s *aggSlab) cloneValues(vs []Value) []Value {
+	if vs == nil {
+		return nil
+	}
+	out := s.values(vs)
+	for i := range out {
+		if out[i].S != nil {
+			out[i].S = append([]byte(nil), out[i].S...)
+		}
+	}
+	return out
 }
 
 func (s *aggSlab) chunk(need int) int {
@@ -144,6 +175,11 @@ func (s *aggSlab) newAggAccs(plan *aggPlan) *aggAccumulators {
 			a.order[i] = s.clone(op.item.aggTemplates)
 		}
 	}
+	if !s.exact && len(a.magnets) == 0 {
+		// With no census site the anchor is the group's first row, taken once
+		// (magnetWalk).
+		a.slab = s
+	}
 	return a
 }
 
@@ -193,7 +229,7 @@ func (m *vdbe) hashAggStepRow(plan *aggPlan, keyVals []Value, seg int, row, rowi
 		h := m.hashAgg
 		b = h.slab.bucket()
 		*b = hashAggBucket{key: h.slab.values(keyVals), accs: h.slab.newAggAccs(plan)}
-		h.buckets[string(m.aggKeyBuf)] = b
+		h.buckets[h.slab.key(m.aggKeyBuf)] = b
 		if n := len(h.made); n > 0 && !h.unordered && !keyTupleLess(h.made[n-1].key, b.key, m.encoding()) {
 			h.unordered = true
 		}
