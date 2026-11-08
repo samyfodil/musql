@@ -4,6 +4,7 @@ package jit
 
 import (
 	"math"
+	"math/big"
 	"testing"
 
 	"github.com/samyfodil/musql/internal/fir"
@@ -51,6 +52,26 @@ func TestVMRealArith(t *testing.T) {
 				}
 				bf, bok := num(b)
 				af, aok := num(av)
+				if b.Typ == tvInt && av.Typ == tvInt && o.op != VFDiv && VMRealInts {
+					// Two INTEGERs are the INTEGER arm: an INTEGER, or an exit on
+					// overflow.
+					x, y := big.NewInt(b.I), big.NewInt(av.I)
+					switch o.op {
+					case VFAdd:
+						x.Add(x, y)
+					case VFSub:
+						x.Sub(x, y)
+					default:
+						x.Mul(x, y)
+					}
+					switch {
+					case !x.IsInt64() && (args.PC != 0 || !same(regs[2], tint(77))):
+						t.Errorf("op %d (%+v, %+v): pc %d r[2] %+v, want an exit on overflow", o.op, b, av, args.PC, regs[2])
+					case x.IsInt64() && (args.PC != 1 || !same(regs[2], tint(x.Int64()))):
+						t.Errorf("op %d (%+v, %+v): pc %d r[2] %+v, want INTEGER %d", o.op, b, av, args.PC, regs[2], x.Int64())
+					}
+					continue
+				}
 				exit := !bok || !aok || (b.Typ == tvInt && av.Typ == tvInt) || (o.op == VFDiv && af == 0)
 				var want float64
 				if !exit {
