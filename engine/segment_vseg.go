@@ -74,6 +74,9 @@ func (s *segment) vmSegFor(plans []segColPlan) *vmSeg {
 				vc.Exc = unsafe.Pointer(&s.excRows[c][0])
 			}
 		}
+		if vc.Nulls == nil && vc.Exc == nil {
+			vc.Plain = vc.Kind
+		}
 		v.mask |= 1 << uint(c)
 	}
 	if len(v.cols) > 0 {
@@ -81,6 +84,39 @@ func (s *segment) vmSegFor(plans []segColPlan) *vmSeg {
 	}
 	s.vseg.Store(v)
 	return v
+}
+
+// segColKind is the kind every segment of tbl reads column col as
+// (jit.VSegInt and the rest), which native code predicts for that column's
+// reads; 0 where they disagree, or one reads it no way native code does.
+func (p *ReadOnlyPager) segColKind(tbl *resolvedTable, col int) int {
+	if p == nil || p.segs == nil || tbl == nil {
+		return 0
+	}
+	segs := p.segs.byRoot[tbl.root]
+	if p.segs.isLive(tbl.root) {
+		var ok bool
+		if segs, ok = p.segs.liveBaseSegments(tbl.root); !ok {
+			return 0
+		}
+	}
+	plans := segColPlansFor(tbl)
+	kind := int64(0)
+	for _, s := range segs {
+		if s == nil || s.nRows == 0 {
+			continue
+		}
+		v := s.vmSegFor(plans)
+		if col < 0 || col >= len(v.cols) {
+			return 0
+		}
+		k := v.cols[col].Kind
+		if k == jit.VSegNone || kind != 0 && k != kind {
+			return 0
+		}
+		kind = k
+	}
+	return int(kind)
 }
 
 // textBoundsValid reports whether TEXT column c's bounds never step back and

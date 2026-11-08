@@ -304,9 +304,20 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	// A table cursor's columns are read from its segment in place when the
 	// engine hands it over in segment mode (jx.segMode), from its rows when not.
 	segCap := segCapableCursors(prog)
+	var segTables map[int]*resolvedTable
+	if segCap != nil {
+		segTables = map[int]*resolvedTable{}
+		for _, in := range prog.Insns {
+			if t, isTbl := in.P4.(*resolvedTable); isTbl && in.Op == OpOpenRead {
+				segTables[in.P1] = t
+			}
+		}
+	}
 	for pc := range vp {
 		if vp[pc].Op == jit.VColumn && vp[pc].A < len(segCap) && segCap[vp[pc].A] {
-			vp[pc].Imm = 1
+			// The kind the table's segments read the column as, which the read
+			// is specialised for (jit.VSegCol.Plain).
+			vp[pc].Imm, vp[pc].T = 1, p.segColKind(segTables[vp[pc].A], vp[pc].B)
 		}
 		// A correlated rowid seek and the rewind that runs it, which native
 		// code makes itself over the table's segments (vmJIT.tabFor).
