@@ -857,7 +857,17 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		a.Bcond(CondE, e.exitpcLabel())
 		a.B("dispatch")
 	case VColumn:
+		if in.Imm == 1 {
+			e.segColumn(pc, in)
+			break
+		}
 		e.column(pc, in)
+	case VSeekRowid:
+		e.seekRowid(pc, in)
+	case VSeekRewind:
+		e.seekRewind(pc, in)
+	case VText:
+		e.text(pc, in)
 	case VSubstr:
 		e.substr(pc, in)
 	case VTextCmpJump, VTextCmpSet:
@@ -880,21 +890,31 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 			break
 		}
 		e.destNoS(pc, in.C)
-		cb := in.A * VCursorSize
-		a.LdrImm(X9, X0, POffCur)
-		e.ldrAt(X10, X9, cb+VCursorOffOk)
+		dense, have := e.vmLabel("rd"), e.vmLabel("rh")
+		e.curBase(in.A)
+		a.LdrImm(X10, X9, VCursorOffOk)
 		a.Cbz(X10, e.stub(pc))
-		e.ldrAt(X11, X9, cb+VCursorOffRids)
-		a.Cbz(X11, e.stub(pc))
-		e.ldrAt(X10, X9, cb+VCursorOffPos)
-		e.ldrAt(X12, X9, cb+VCursorOffN)
-		a.Cmp(X10, X12)
+		a.LdrImm(X10, X9, VCursorOffPos)
+		a.LdrImm(X4, X9, VCursorOffN)
+		a.Cmp(X10, X4)
 		a.BcondRaw(armHS, e.stub(pc)) // unsigned: a position before the first row is huge
-		a.MovImm64(X12, 8)
-		a.Mul(X10, X10, X12)
-		a.AddReg(X10, X11, X10)
-		m := e.dest(pc, in.C, X10)
-		a.LdrImm(m, X10, 0)
+		a.LdrImm(X4, X9, VCursorOffRids)
+		a.Cbz(X4, dense)
+		a.LdrRegIdx(X5, X4, X10)
+		a.B(have)
+		// No rowid list: a dense segment's rowid is its first plus the row.
+		a.Label(dense)
+		a.LdrImm(X4, X9, VCursorOffSeg)
+		a.Cbz(X4, e.stub(pc))
+		a.LdrImm(X6, X4, VSegOffDense)
+		a.Cbz(X6, e.stub(pc))
+		a.LdrImm(X5, X4, VSegOffFirst)
+		a.AddReg(X5, X5, X10)
+		a.Label(have)
+		m := e.dest(pc, in.C, X5)
+		if m != X5 {
+			a.MovReg(m, X5)
+		}
 		e.storeInt(in, in.C, m)
 	case VRewind:
 		e.unmap(^in.A)

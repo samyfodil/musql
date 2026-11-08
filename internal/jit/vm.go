@@ -158,10 +158,11 @@ const (
 	// write barrier that is on. The bytes already checked in this entry are
 	// not checked again (ProgArgs.TextPtr).
 	VSubstr
-	// VTextCmpJump, VTextCmpSet: VCmpJump and VCmpSet for Cond E or NE over
-	// two TEXTs, equal when their bytes are, or two INTEGERs. Any other pair
+	// VTextCmpJump, VTextCmpSet: VCmpJump and VCmpSet over two TEXTs, ordered
+	// as bytes.Compare orders their bytes, or two INTEGERs. Any other pair
 	// exits, as do two TEXTs when ProgArgs.UTF16 is set: the engine compares
-	// those converted.
+	// those converted. Under Imm 1 (a numeric affinity) a TEXT that is a whole
+	// number exits too. Without VMTextOrder only Cond E and NE, and no Imm.
 	VTextCmpJump
 	VTextCmpSet
 
