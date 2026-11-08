@@ -737,3 +737,57 @@ func (e *vmEmitArm) inSub(pc int, in VInsn) {
 	}
 	e.storeInt(in, in.C, m)
 }
+
+// inText is vm_text_amd64.go's VInText. X4 r[A]'s length and X5 its bytes, X6
+// the list entry and X7 the entries left, X8 and X11 the byte pointers, X12 the
+// bytes left; X9 and X10 the two bytes.
+func (e *vmEmitArm) inText(pc int, in VInsn) {
+	if in.Dead {
+		e.clobber(in.C)
+		return
+	}
+	a, L := e.a, e.lay
+	e.destNoS(pc, in.C)
+	ent, cmpb, next, yes, no, done := e.vmLabel("it"), e.vmLabel("ib"), e.vmLabel("in"), e.vmLabel("iy"), e.vmLabel("io"), e.vmLabel("ie")
+	e.ldrb(X10, in.A, L.OffTyp)
+	a.CmpImm(X10, uint32(L.TypText))
+	a.Bcond(CondNE, e.stub(pc))
+	a.LdrImm(X10, X0, POffUTF16) // the engine compares UTF-16 TEXT
+	a.Cbnz(X10, e.stub(pc))
+	e.ldr(X4, in.A, L.OffS+8)
+	e.ldr(X5, in.A, L.OffS)
+	a.MovImm64(X6, in.Imm)
+	a.MovImm64(X7, int64(in.B))
+	a.Label(ent)
+	a.Cbz(X7, no)
+	a.SubsImm(X7, X7, 1)
+	a.LdrImm(X12, X6, 8)
+	a.Cmp(X12, X4)
+	a.Bcond(CondNE, next)
+	a.LdrImm(X8, X6, 0)
+	a.MovReg(X11, X5)
+	a.Label(cmpb)
+	a.Cbz(X12, yes)
+	a.LdrbImm(X9, X8, 0)
+	a.LdrbImm(X10, X11, 0)
+	a.Cmp(X9, X10)
+	a.Bcond(CondNE, next)
+	a.AddImm(X8, X8, 1)
+	a.AddImm(X11, X11, 1)
+	a.SubsImm(X12, X12, 1)
+	a.B(cmpb)
+	a.Label(next)
+	a.AddImm(X6, X6, 16)
+	a.B(ent)
+	a.Label(yes)
+	a.MovImm16(X8, 1)
+	a.B(done)
+	a.Label(no)
+	a.MovImm16(X8, 0)
+	a.Label(done)
+	m := e.dest(pc, in.C, X8)
+	if m != X8 {
+		a.MovReg(m, X8)
+	}
+	e.storeInt(in, in.C, m)
+}

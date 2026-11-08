@@ -325,3 +325,63 @@ func (a *Asm) OrRegImm8Lower(dst Reg) {
 	a.rex(1, dst)
 	a.emit(0x83, modrm(0b11, 1, dst), 0x20)
 }
+
+// inText is VInText: each TEXT of the list whose length is r[A]'s is compared
+// with it byte by byte. R9 the list entry (in X0 while it is a byte), X2 the
+// entries left, RCX and RDX the two byte pointers, R10 the bytes left.
+func (e *vmEmit) inText(pc int, in VInsn) {
+	if in.Dead {
+		e.clobber(in.C)
+		return
+	}
+	a, L := e.a, e.lay
+	e.destNoS(pc, in.C)
+	ent, cmpb, diff, next, yes, no, done := e.vmLabel("it"), e.vmLabel("ib"), e.vmLabel("id"), e.vmLabel("in"),
+		e.vmLabel("iy"), e.vmLabel("io"), e.vmLabel("ie")
+	a.CmpMemDByte(RSI, e.d(in.A, L.OffTyp), L.TypText)
+	e.jccStub(CondNE, pc)
+	a.CmpMemDByte(RDI, POffUTF16, 0) // the engine compares UTF-16 TEXT
+	e.jccStub(CondNE, pc)
+	a.MovRegImm64(R9, in.Imm)
+	a.MovRegImm64(RAX, int64(in.B))
+	a.MovqXR(X2, RAX)
+	a.Label(ent)
+	a.MovqRX(RAX, X2)
+	a.TestRegReg(RAX, RAX)
+	a.Jcc(CondE, no)
+	a.DecReg(RAX)
+	a.MovqXR(X2, RAX)
+	a.MovRegMemD(R10, R9, 8)
+	a.AluRegMemD(AluCmp, R10, RSI, e.d(in.A, L.OffS+8))
+	a.Jcc(CondNE, next)
+	a.MovRegMemD(RCX, R9, 0)
+	a.MovRegMemD(RDX, RSI, e.d(in.A, L.OffS))
+	a.MovqXR(X0, R9)
+	a.Label(cmpb)
+	a.TestRegReg(R10, R10)
+	a.Jcc(CondE, yes)
+	a.MovzxByte(RAX, RCX)
+	a.MovzxByte(R9, RDX)
+	a.CmpRegReg(RAX, R9)
+	a.Jcc(CondNE, diff)
+	a.IncReg(RCX)
+	a.IncReg(RDX)
+	a.DecReg(R10)
+	a.Jmp(cmpb)
+	a.Label(diff)
+	a.MovqRX(R9, X0)
+	a.Label(next)
+	a.AddRegImm32(R9, 16)
+	a.Jmp(ent)
+	a.Label(yes)
+	a.MovRegImm64(R10, 1)
+	a.Jmp(done)
+	a.Label(no)
+	a.MovRegImm64(R10, 0)
+	a.Label(done)
+	m := e.dest(pc, in.C, R10)
+	if m != R10 {
+		a.MovRegReg(m, R10)
+	}
+	e.storeInt(pc, in, in.C, m)
+}

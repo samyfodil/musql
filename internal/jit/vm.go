@@ -199,6 +199,11 @@ const (
 	// to the cursor's row -- State 5 being a list the engine seeked and handed
 	// over on its row Last, with Served set so the gain is the rows past it.
 	VSeekIdx
+	// VInText: r[C] = 1 when the TEXT in r[A] is, byte for byte, one of the B
+	// TEXTs of the VTextLit list at Imm (which the engine keeps alive and never
+	// writes), else 0. A non-TEXT operand, and ProgArgs.UTF16, exit.
+	// (VMTextOrder)
+	VInText
 
 	// VText: r[A] = the TEXT of the B bytes at Imm, which the engine keeps
 	// alive and never writes, shared as the VDBE's OP_String8 shares its
@@ -374,6 +379,12 @@ type VCursor struct {
 	// Idx, when not nil, is the equality indexes VSeekIdx searches: the first
 	// of the VIdxs of the table's segments, in order.
 	Idx unsafe.Pointer
+}
+
+// VTextLit is one TEXT of a VInText list: its bytes and their length.
+type VTextLit struct {
+	Ptr unsafe.Pointer
+	Len int64
 }
 
 // VIdx is one segment's equality index over a column, as VSeekIdx searches

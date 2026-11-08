@@ -883,6 +883,8 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		e.seekRowid(pc, in)
 	case VSeekIdx:
 		e.seekIdx(pc, in)
+	case VInText:
+		e.inText(pc, in)
 	case VText:
 		e.text(pc, in)
 	case VLike:

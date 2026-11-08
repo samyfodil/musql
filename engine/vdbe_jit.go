@@ -456,7 +456,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	}
 	jx.like = slices.ContainsFunc(vp, func(in jit.VInsn) bool { return in.Op == jit.VLike })
 	jx.text = slices.ContainsFunc(vp, func(in jit.VInsn) bool {
-		return in.Op == jit.VTextCmpJump || in.Op == jit.VTextCmpSet || in.Op == jit.VSubstr
+		return in.Op == jit.VTextCmpJump || in.Op == jit.VTextCmpSet || in.Op == jit.VSubstr || in.Op == jit.VInText
 	})
 	if updAt >= 0 {
 		jx.updSkip = vp[updAt-1].Skip
@@ -1187,6 +1187,11 @@ func lowerVM(in *Instruction, nReg int) jit.VInsn {
 		if plan, _ := in.P4.(*inListPlan); plan != nil && plan.aff != affText && ok(in.P1, in.P2, in.P3) &&
 			in.P3+1+len(plan.lits)+len(plan.params) <= nReg {
 			return jit.VInsn{Op: jit.VInSet, A: in.P1, B: in.P3 + 1, C: in.P2, Imm: int64(in.P3)}
+		}
+		// A list of TEXTs matched as bytes, against the plan's own copy of
+		// their addresses.
+		if plan, _ := in.P4.(*inListPlan); plan != nil && jit.VMTextOrder && len(plan.texts) > 0 && ok(in.P1, in.P2) {
+			return jit.VInsn{Op: jit.VInText, A: in.P1, B: len(plan.texts), C: in.P2, Imm: int64(uintptr(unsafe.Pointer(&plan.texts[0])))}
 		}
 	case OpColumn:
 		// Native code reads a cursor's column from its row list; whether the

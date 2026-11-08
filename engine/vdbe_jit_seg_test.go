@@ -232,6 +232,78 @@ func TestVMJITLikeDifferential(t *testing.T) {
 	}
 }
 
+// TestVMJITInTextDifferential: IN lists of TEXTs compared as bytes, which
+// native code matches (VInText), over TEXTs, NULLs, INTEGERs, BLOBs, embedded
+// NULs and empty strings; and lists it leaves to the VDBE (a NULL member, a
+// NOCASE comparison, no TEXT affinity). In a UTF-8 and a UTF-16 database,
+// with the JIT and without, every row must match.
+func TestVMJITInTextDifferential(t *testing.T) {
+	lowEntryThreshold(t)
+	if !vmJITEnabled {
+		t.Skip("JIT not enabled on this platform")
+	}
+	rng := rand.New(rand.NewSource(19))
+	words := []string{"'SM CASE'", "'SM BOX'", "'MED BAG'", "'AIR'", "'AIR REG'", "'air'", "''", "'AI'", "'AIRR'",
+		"NULL", "11", "x'414952'", "'A' || char(0) || 'IR'", "'LG PKG'"}
+	setup := []string{"CREATE TABLE t(id INTEGER PRIMARY KEY, s TEXT, n, c TEXT COLLATE NOCASE)"}
+	for i := 1; i <= 3000; i++ {
+		setup = append(setup, fmt.Sprintf("INSERT INTO t VALUES(%d, %s, %s, %s)", i,
+			words[rng.Intn(len(words))], words[rng.Intn(len(words))], words[rng.Intn(len(words))]))
+	}
+	setup = append(setup, "VACUUM")
+	queries := []string{
+		"SELECT id, s FROM t WHERE s IN ('SM CASE', 'SM BOX', 'LG PKG')",
+		"SELECT count(*) FROM t WHERE s NOT IN ('AIR', 'AIR REG')",
+		"SELECT id FROM t WHERE s IN ('')",
+		"SELECT id FROM t WHERE s IN ('A' || char(0) || 'IR', 'AIR')",
+		"SELECT id, s IN ('AIR', 'MED BAG') FROM t WHERE id % 7 = 3",
+		"SELECT id FROM t WHERE s IN ('AIR', '11') AND n IN ('AIR', 'air')",
+		"SELECT id FROM t WHERE s IN ('AIR', NULL)",
+		"SELECT id FROM t WHERE s NOT IN ('AIR', NULL)",
+		"SELECT id FROM t WHERE c IN ('air', 'sm case')",
+		"SELECT id FROM t WHERE s COLLATE NOCASE IN ('air')",
+		"SELECT id FROM t WHERE CAST(n AS TEXT) IN ('11', 'AIR', 'AIR REG')",
+		"SELECT id FROM t WHERE s IN ('AIR', 'AIR', 'AIRR', 'AI', 'SM CASE', 'SM BOX', 'MED BAG', 'LG PKG', '')",
+		"SELECT t1.id FROM t t1 JOIN t t2 ON t2.id = t1.id + 1 WHERE t2.s IN ('AIR', 'SM BOX') AND t1.s IN ('MED BAG', '')",
+	}
+	run := func(jitOn bool, enc string) (out []string) {
+		old := vmJITEnabled
+		vmJITEnabled = jitOn
+		defer func() { vmJITEnabled = old }()
+		n, err := OpenOrCreate(filepath.Join(t.TempDir(), "i.musq"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer n.Close()
+		exec := func(s string) {
+			if _, _, err := n.ExecArgs(s, nil); err != nil {
+				t.Fatalf("%s: %v", s, err)
+			}
+			n.CommitIfAutocommit()
+		}
+		exec("PRAGMA encoding='" + enc + "'")
+		for _, s := range setup {
+			exec(s)
+		}
+		for _, q := range queries {
+			cols, rows, err := n.Query(q, nil)
+			if err != nil {
+				t.Fatalf("%s: %v", q, err)
+			}
+			out = append(out, fmt.Sprint(enc, q, cols, rows))
+		}
+		return out
+	}
+	for _, enc := range []string{"UTF-8", "UTF-16le"} {
+		want, got := run(false, enc), run(true, enc)
+		for i := range want {
+			if want[i] != got[i] {
+				t.Fatalf("JIT diverges:\nvdbe %.600s\njit  %.600s", want[i], got[i])
+			}
+		}
+	}
+}
+
 // TestVMJITInSubDifferential: uncorrelated IN subqueries, which native code
 // probes in the set the VDBE builds (VInSub): INTEGER sets, one holding a
 // NULL, an empty one, NOT IN, and sets it leaves to the VDBE (TEXT and REAL

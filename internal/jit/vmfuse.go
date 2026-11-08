@@ -108,6 +108,8 @@ func vmStepOf(in VInsn, pc int) progStep {
 		s.targets = []int{in.T}
 	case VSeekRowid, VSeekIdx:
 		s.uses, s.targets = []int{in.B}, []int{in.T}
+	case VInText:
+		s.uses, s.defs = []int{in.A}, []int{in.C}
 	case VSeekRewind:
 	case VOpen, VClose:
 	case VResultRow:
