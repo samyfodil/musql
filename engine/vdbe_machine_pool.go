@@ -140,7 +140,7 @@ func (prog *Program) putMachineTo(m *vdbe, spare **vdbe) {
 	clear(sub)
 	// The JIT's cursor views and row copies too (vmJIT.enter), scrubbed: they
 	// were three allocations of every point read a native program ran.
-	jcur, jsnap := m.jcur, m.jsnap
+	jcur, jsnap, jlive := m.jcur, m.jsnap, m.jLive[:0]
 	clear(jcur)
 	for i := range jsnap {
 		sn := &jsnap[i]
@@ -172,7 +172,7 @@ func (prog *Program) putMachineTo(m *vdbe, spare **vdbe) {
 	// composite literal this was, without building that 1 KB literal and
 	// copying it over -- most of what returning a machine cost per statement.
 	*m = vdbe{}
-	m.regs, m.cursors, m.recRegs, m.subCache, m.jcur, m.jsnap = regs, cursors, recRegs, sub[:0], jcur, jsnap
+	m.regs, m.cursors, m.recRegs, m.subCache, m.jcur, m.jsnap, m.jLive = regs, cursors, recRegs, sub[:0], jcur, jsnap, jlive
 	m.aggVM, m.aggCtx, m.aggNullRow = agg, actx, nullRow
 	m.colMasks, m.colMasksOf, m.colMasksN, m.colMasksCurs = masks, masksOf, masksN, masksCurs
 	m.aggSpare = aggSpare
