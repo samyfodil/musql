@@ -1264,10 +1264,10 @@ func lowerVM(in *Instruction, nReg int) jit.VInsn {
 			return jit.VInsn{Op: jit.VCmpSet, A: in.P1, B: in.P3, C: in.P2, Cond: vmCond[in.Op]}
 		}
 	case OpFunction:
-		// substr(x, y, 1) of a TEXT whose first y bytes are ASCII and none NUL
-		// is its byte at y-1, which fnSubstr answers from asciiBytes.
+		// substr(x, y, z) of a TEXT whose bytes to y-1+z are ASCII and none NUL
+		// is those bytes from y-1, which fnSubstr shares as well.
 		if name, _ := in.P4.(string); (name == "substr" || name == "substring") && in.P2 == 3 && ok(in.P1, in.P1+2, in.P3) {
-			return jit.VInsn{Op: jit.VSubstr, A: in.P1, C: in.P3, Imm: int64(uintptr(unsafe.Pointer(&asciiBytes[0])))}
+			return jit.VInsn{Op: jit.VSubstr, A: in.P1, C: in.P3}
 		}
 	case OpIf, OpIfNot:
 		if ok(in.P1) {

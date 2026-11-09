@@ -22,23 +22,37 @@ func (e *vmEmitWasm) substr(pc int, in VInsn) {
 	}
 	e.loadI64(in.A+2, L.OffI)
 	w.I64(1)
-	w.op(opI64Ne)
+	w.op(opI64LtS)
 	w.op(opI32Or)
 	e.exitIf(pc)
-	// y from 1 to the length: y-1 below the length, unsigned.
+	// y from 1 to the length: y-1 (t1) below the length, unsigned.
 	e.loadI64(in.A+1, L.OffI)
-	w.Set(e.t1)
-	w.Get(e.t1)
 	w.I64(1)
 	w.op(opI64Sub)
+	w.Set(e.t1)
+	w.Get(e.t1)
 	e.loadI64(in.A, L.OffS+8)
 	w.op(opI64GeU)
 	e.exitIf(pc)
-	// The first y bytes, none NUL or above 0x7f: b-1 below 0x7f, unsigned.
+	// The answer's length (t2): min(z, length-(y-1)).
+	e.loadI64(in.A, L.OffS+8)
+	w.Get(e.t1)
+	w.op(opI64Sub)
+	w.Set(e.t2)
+	e.loadI64(in.A+2, L.OffI)
+	w.Get(e.t2)
+	e.loadI64(in.A+2, L.OffI)
+	w.Get(e.t2)
+	w.op(opI64LtU)
+	w.op(opSelect)
+	w.Set(e.t2)
+	// The bytes to the end, none NUL or above 0x7f: b-1 below 0x7f, unsigned.
 	e.loadI64(in.A, L.OffS)
 	w.op(opI32WrapI64)
 	w.Set(e.txa)
 	w.Get(e.t1)
+	w.Get(e.t2)
+	w.op(opI64Add)
 	w.op(opI32WrapI64)
 	w.Set(e.txb)
 	w.op(opBlock, opVoid, opLoop, opVoid)
@@ -63,21 +77,23 @@ func (e *vmEmitWasm) substr(pc int, in VInsn) {
 	w.Set(e.txb)
 	w.Br(0)
 	w.op(opEnd, opEnd)
-	for _, f := range [][2]int64{{0, int64(L.TypText)}, {int64(L.OffI), 0}, {int64(L.OffF), 0}, {int64(L.OffS + 8), 1}, {int64(L.OffS + 16), 1}} {
+	// The source's own bytes from y-1, the capacity capped at the length: a
+	// register's bytes are never written in place. S first: C may be A.
+	w.Get(e.regs)
+	e.loadI64(in.A, L.OffS)
+	w.Get(e.t1)
+	w.op(opI64Add)
+	w.StoreI64(e.addr(in.C, L.OffS))
+	for _, f := range [][2]int64{{0, int64(L.TypText)}, {int64(L.OffI), 0}, {int64(L.OffF), 0}} {
 		w.Get(e.regs)
 		w.I64(f[1])
 		w.StoreI64(e.addr(in.C, int(f[0])))
 	}
-	w.Get(e.regs)
-	w.Get(e.txa)
-	w.I32(1)
-	w.op(opI32Sub)
-	w.op(opI32Load8U)
-	w.memarg(0, 0)
-	w.op(opI64ExtendI32U)
-	w.I64(in.Imm)
-	w.op(opI64Add)
-	w.StoreI64(e.addr(in.C, L.OffS))
+	for _, off := range []int{L.OffS + 8, L.OffS + 16} {
+		w.Get(e.regs)
+		w.Get(e.t2)
+		w.StoreI64(e.addr(in.C, off))
+	}
 	e.forgetReg(in.C)
 }
 
