@@ -688,9 +688,24 @@ func (p *ReadOnlyPager) viewColumnsGuarded(viewName string, pcv *parsedCreateVie
 			return nil, fmt.Errorf("engine: view %s is circularly defined", viewName)
 		}
 	}
+	key := viewBodyFactsKey{temp: pcv.isTemp, name: r33sFoldIdent(viewName)}
+	if cached, ok := p.viewBodyFacts[key]; ok {
+		return append([]columnInfo(nil), cached.cols...), nil
+	}
+	if cols, ok := p.viewColsFacts[key]; ok {
+		return append([]columnInfo(nil), cols...), nil
+	}
 	p.viewExpansion = append(p.viewExpansion, viewName)
-	defer func() { p.viewExpansion = p.viewExpansion[:len(p.viewExpansion)-1] }()
-	return p.viewColumnInfos(viewName, pcv)
+	cols, err := p.viewColumnInfos(viewName, pcv)
+	p.viewExpansion = p.viewExpansion[:len(p.viewExpansion)-1]
+	if err != nil {
+		return nil, err
+	}
+	if p.viewColsFacts == nil {
+		p.viewColsFacts = map[viewBodyFactsKey][]columnInfo{}
+	}
+	p.viewColsFacts[key] = append([]columnInfo(nil), cols...)
+	return cols, nil
 }
 
 // resolveViewRowsGuarded is resolveFrom's entry point for a FROM item naming a
