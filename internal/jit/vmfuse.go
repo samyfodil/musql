@@ -649,37 +649,53 @@ func VLoops(prog []VInsn) bool {
 	return false
 }
 
-// VReachFrom reports which instructions native code entered at pc can run
-// before it exits. A reachable VReturn may return past any VGosub.
-func VReachFrom(prog []VInsn, pc int) []bool {
+// VReachMarks reports, for every pc at once, the marks of the instructions
+// native code entered there can run before it exits, itself included: bit m
+// of reach[pc] is set when one of them has mark m, its entry in mark (-1 for
+// none). A reachable VReturn may return past any VGosub. One fixpoint over
+// the program, where a walk per entry cost entries times the program.
+func VReachMarks(prog []VInsn, mark []int, nMarks int) [][]uint64 {
 	n := len(prog)
-	reach := make([]bool, n)
-	work := []int{pc}
-	returned := false
-	for len(work) > 0 {
-		at := work[len(work)-1]
-		work = work[:len(work)-1]
-		if at < 0 || at >= n || reach[at] {
-			continue
+	words := (nMarks + 63) / 64
+	reach := make([][]uint64, n)
+	flat := make([]uint64, n*words)
+	var returns []int
+	for g, in := range prog {
+		if in.Op == VGosub {
+			returns = append(returns, g+1)
 		}
-		reach[at] = true
-		switch in := prog[at]; in.Op {
+	}
+	succ := make([][]int, n)
+	for pc, in := range prog {
+		reach[pc] = flat[pc*words : (pc+1)*words : (pc+1)*words]
+		if m := mark[pc]; m >= 0 {
+			reach[pc][m/64] |= 1 << uint(m%64)
+		}
+		switch in.Op {
 		case VExit:
 		case VReturn:
-			if !returned {
-				returned = true
-				for g, x := range prog {
-					if x.Op == VGosub {
-						work = append(work, g+1)
+			succ[pc] = returns
+		default:
+			st := vmStepOf(in, pc)
+			if st.fall {
+				succ[pc] = append(succ[pc], pc+1)
+			}
+			succ[pc] = append(succ[pc], st.targets...)
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for pc := n - 1; pc >= 0; pc-- {
+			for _, s := range succ[pc] {
+				if s < 0 || s >= n || s == pc {
+					continue
+				}
+				for w, v := range reach[s] {
+					if u := reach[pc][w] | v; u != reach[pc][w] {
+						reach[pc][w], changed = u, true
 					}
 				}
 			}
-		default:
-			st := vmStepOf(in, at)
-			if st.fall {
-				work = append(work, at+1)
-			}
-			work = append(work, st.targets...)
 		}
 	}
 	return reach

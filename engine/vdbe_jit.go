@@ -504,17 +504,30 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 		}
 	}
 	if len(vp) <= vmJITReachLimit {
+		// Each entry's cursors, in the order the program first names them.
+		mark := make([]int, len(vp))
+		var order []int
+		nMarks := 0
+		for pc, in := range vp {
+			mark[pc] = -1
+			if vmCursorOp(in.Op) && in.A >= 0 {
+				mark[pc] = in.A
+				nMarks = max(nMarks, in.A+1)
+				if !slices.Contains(order, in.A) {
+					order = append(order, in.A)
+				}
+			}
+		}
+		reach := jit.VReachMarks(vp, mark, nMarks)
 		jx.entryCurs = make([][]int, len(vp))
 		for pc := range vp {
 			if !entry[pc] {
 				continue
 			}
 			jx.entryCurs[pc] = []int{}
-			for at, r := range jit.VReachFrom(vp, pc) {
-				in := vp[at]
-				if r && vmCursorOp(in.Op) &&
-					!slices.Contains(jx.entryCurs[pc], in.A) {
-					jx.entryCurs[pc] = append(jx.entryCurs[pc], in.A)
+			for _, c := range order {
+				if reach[pc][c/64]&(1<<uint(c%64)) != 0 {
+					jx.entryCurs[pc] = append(jx.entryCurs[pc], c)
 				}
 			}
 		}
