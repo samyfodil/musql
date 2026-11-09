@@ -37,15 +37,21 @@ type clusterNode struct {
 
 var locations = []string{"fra", "iad", "sea"}
 
-// freePort is a TCP port free on 127.0.0.1 a moment ago.
-func freePort(t *testing.T) int {
+// freePorts are n TCP ports free on 127.0.0.1 a moment ago, all different:
+// each is held until the last is picked, so the kernel cannot hand one out
+// twice.
+func freePorts(t *testing.T, n int) []int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	ports := make([]int, n)
+	for i := range ports {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+		ports[i] = l.Addr().(*net.TCPAddr).Port
 	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port
+	return ports
 }
 
 // newCluster starts n nodes on localhost, each the others' peer, sharing one
@@ -70,7 +76,7 @@ func clusterConfigs(t *testing.T, n int, dir0 string) []*Config {
 		dir, id string
 		port    int
 	}
-	ids := make([]ident, n)
+	ids, ports := make([]ident, n), freePorts(t, n)
 	for i := range ids {
 		dir := t.TempDir()
 		if i == 0 && dir0 != "" {
@@ -84,7 +90,7 @@ func clusterConfigs(t *testing.T, n int, dir0 string) []*Config {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ids[i] = ident{dir, id, freePort(t)}
+		ids[i] = ident{dir, id, ports[i]}
 	}
 	cfgs := make([]*Config, n)
 	for i := range cfgs {
@@ -107,7 +113,8 @@ peers:
 			t.Fatal(err)
 		}
 		cfg.syncInterval = 100 * time.Millisecond
-		cfg.election = cluster.ElectionTiming{Heartbeat: 200 * time.Millisecond, Election: 200 * time.Millisecond, Lease: 100 * time.Millisecond}
+		// Calm enough that a loaded machine does not churn leaders mid-test.
+		cfg.election = cluster.ElectionTiming{Heartbeat: time.Second, Election: time.Second, Lease: 500 * time.Millisecond}
 		cfgs[i] = cfg
 	}
 	return cfgs
@@ -160,11 +167,17 @@ func (c *clusterNode) ready() {
 	// The admin, read through the master, and this node's own copy of the
 	// state synced: a test that stops the master may only count on what
 	// reached the others.
+	// Signed from that read: a second one can land on a stale copy mid-election.
+	var admin *state.User
 	eventually(c.t, "the admin on "+c.cfg.Node.Name, func() bool {
-		_, err := s.Store().UserByEmail(context.Background(), "admin@example.com")
-		return err == nil && (s.cl == nil || !s.cl.stateSyncing.Load())
+		u, err := s.Store().UserByEmail(context.Background(), "admin@example.com")
+		if err != nil || s.cl != nil && s.cl.stateSyncing.Load() {
+			return false
+		}
+		admin = u
+		return true
 	})
-	c.admin = c.tokenFor("admin@example.com")
+	c.admin = c.sign(admin)
 }
 
 func (c *clusterNode) restart() {
@@ -283,6 +296,9 @@ func acmeEverywhereWith(t *testing.T, nodes []*clusterNode, typ v1.DatabaseType,
 		t.Fatalf("app is %v %v, not %v %v", d.Msg.Database.Type, d.Msg.Database.Durability, typ, want)
 	}
 	eventually(t, "app open on every node", func() bool { return placed(nodes, "app") })
+	if typ != v1.DatabaseType_DATABASE_TYPE_CRDT {
+		eventually(t, "app's writer", func() bool { return masterOf(nodes, "app") >= 0 })
+	}
 }
 
 func TestClusterConcurrentWritesConverge(t *testing.T) {
