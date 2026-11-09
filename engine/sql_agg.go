@@ -183,7 +183,7 @@ type aggItem struct {
 	// srcCall is the FuncExpr this template was planned from (planAggregateCall),
 	// a PLAN-time-only field: it lets an aggregate that turns out to belong to an
 	// ENCLOSING query be re-planned there verbatim. See vdbe_agg_hoist.go.
-	srcCall FuncExpr
+	srcCall *FuncExpr
 
 	// Running state, mutated by step as rows are scanned. Only the fields
 	// relevant to kind are used.
@@ -198,11 +198,9 @@ type aggItem struct {
 	sumWinSet   bool // when orderStrict is set -- see sumWatch/sumOrderFree
 	best        Value
 	haveBest    bool
-	gcBuf       strings.Builder
 	vec1        *vec1TrainState // vec1_train's training vectors and options
-	gcHave      bool
-	gcFirstVal  string // the first contribution's text/separator, kept only when
-	gcFirstSep  string // orderStrict is set -- see orderRisk
+	// gc is group_concat's and the JSON groups' running text (aggConcat).
+	gc *aggConcat
 
 	// orderStrict is armed by the compiler when this query's ROW ORDER is not
 	// provably the order C SQLite feeds its own accumulators
@@ -243,13 +241,8 @@ type aggItem struct {
 	// contributes both, since they're a different storage class and hence
 	// not compareValues-equal, but a second integer 2 contributes only
 	// once) -- see step's shared pre-dispatch dedup check below.
-	seen []Value
-	// seenHead and seenNext chain seen by aggDistinctHash (a hash's latest
-	// index plus one, and each entry's previous one), so a probe compares only
-	// values that hash alike; scanning all of seen made sum(DISTINCT x)
-	// quadratic.
-	seenHead hashIndex
-	seenNext []int
+	// They are kept in dist (aggDistinct), made on the first value.
+	dist *aggDistinct
 
 	// argColl caches the collating sequence of the aggregate's ARGUMENT --
 	// see argCollation. Resolved on the first contributing row (planning has
@@ -300,20 +293,72 @@ type aggItem struct {
 	// stamped by planAggArgRegs; a key that IS the argument (C's bOBPayload==0,
 	// expr.c:7522-7526) shares the argument's register, since C codes it once.
 	obRegs []int
-	// obColls is each key's collating sequence -- sqlite3KeyInfoFromExprList
-	// over the ORDER BY list (select.c:6716) -- resolved on the first row the
-	// way argColl is.
-	obColls   []string
-	obCollSet bool
-	// obBuf holds the admitted rows in ARRIVAL order, which is C's OP_Sequence
-	// column (select.c:6886-6888) breaking ties among equal keys.
-	obBuf []aggOBRow
-	// obCtx is the context the rows were buffered under, for the replay's
-	// encoding; nothing else of it is read.
-	obCtx *evalCtx
-	// obDone marks the buffer as replayed, so a second finalize of the same
-	// accumulator reads the accumulated state rather than stepping it again.
-	obDone bool
+	// ob is the ORDER BY's buffer (aggOrderBuf), made on the first row.
+	ob *aggOrderBuf
+}
+
+// The running state only some accumulators keep, each made on first use, so
+// a sum() or count() carries none of it.
+
+// aggDistinct is a DISTINCT accumulator's values: seen in first-seen order,
+// chained by aggDistinctHash (head, a hash's latest index plus one, and next,
+// each entry's previous one), so a probe compares only values that hash
+// alike; scanning all of seen made sum(DISTINCT x) quadratic.
+type aggDistinct struct {
+	seen []Value
+	head hashIndex
+	next []int
+}
+
+// aggConcat is group_concat's and the JSON groups' text so far: have is
+// whether anything was written, and firstVal and firstSep the first
+// contribution's text and separator, kept only when orderStrict is set (see
+// orderRisk).
+type aggConcat struct {
+	buf                strings.Builder
+	have               bool
+	firstVal, firstSep string
+}
+
+// aggOrderBuf is an aggregate ORDER BY's buffer. colls is each key's
+// collating sequence -- sqlite3KeyInfoFromExprList over the ORDER BY list
+// (select.c:6716) -- resolved on the first row the way argColl is; rows the
+// admitted rows in ARRIVAL order, which is C's OP_Sequence column
+// (select.c:6886-6888) breaking ties among equal keys; ctx the context they
+// were buffered under, for the replay's encoding (nothing else of it is
+// read); done that the buffer was replayed, so a second finalize of the same
+// accumulator reads the accumulated state rather than stepping it again.
+type aggOrderBuf struct {
+	colls   []string
+	collSet bool
+	rows    []aggOBRow
+	ctx     *evalCtx
+	done    bool
+}
+
+// aggDistinctLinear is how many values a DISTINCT accumulator holds before it
+// indexes them by hash.
+const aggDistinctLinear = 8
+
+func (it *aggItem) distState() *aggDistinct {
+	if it.dist == nil {
+		it.dist = &aggDistinct{}
+	}
+	return it.dist
+}
+
+func (it *aggItem) concat() *aggConcat {
+	if it.gc == nil {
+		it.gc = &aggConcat{}
+	}
+	return it.gc
+}
+
+func (it *aggItem) orderBuf() *aggOrderBuf {
+	if it.ob == nil {
+		it.ob = &aggOrderBuf{}
+	}
+	return it.ob
 }
 
 // aggOBRow is one entry of an ORDER BY aggregate's buffer: its sort keys and
@@ -363,11 +408,20 @@ func (it *aggItem) rowExpr(which int) Expr {
 //     select.c:8607).
 //
 // ctx is unused.
+// call is the call this template was planned from (srcCall), or none: a
+// group's clone keeps no copy.
+func (it *aggItem) call() FuncExpr {
+	if it.srcCall == nil {
+		return FuncExpr{}
+	}
+	return *it.srcCall
+}
+
 func (it *aggItem) rowValue(which int, ctx *evalCtx, regs []Value) (Value, error) {
 	if r := it.rowRegs[which]; r > 0 && r <= len(regs) {
 		return regs[r-1], nil
 	}
-	return Value{}, fmt.Errorf("engine: internal: aggregate %s per-row expression %d was never lowered into a register", it.srcCall.Name, which)
+	return Value{}, fmt.Errorf("engine: internal: aggregate %s per-row expression %d was never lowered into a register", it.call().Name, which)
 }
 
 // orderSensitive reports whether the order rows reach step can change this
@@ -529,19 +583,19 @@ func (it *aggItem) obBuffer(ctx *evalCtx, regs []Value) error {
 			return err
 		}
 	}
-	if !it.obCollSet {
-		it.obColls = make([]string, len(it.orderBy))
+	if !it.orderBuf().collSet {
+		it.orderBuf().colls = make([]string, len(it.orderBy))
 		for i, t := range it.orderBy {
-			it.obColls[i], _ = topExprCollation(ctx, t.Expr)
+			it.orderBuf().colls[i], _ = topExprCollation(ctx, t.Expr)
 		}
-		it.obCollSet = true
-		it.obCtx = ctx
+		it.orderBuf().collSet = true
+		it.orderBuf().ctx = ctx
 		it.argCollation(ctx) // cached for the replay, which has no row context
 	}
 	if it.distinct {
 		coll := it.argCollation(ctx)
-		for i := range it.obBuf {
-			prev := &it.obBuf[i]
+		for i := range it.orderBuf().rows {
+			prev := &it.orderBuf().rows[i]
 			if compareValuesCollatedEnc(arg, prev.arg, coll, ctx.encoding()) != 0 {
 				continue
 			}
@@ -563,7 +617,7 @@ func (it *aggItem) obBuffer(ctx *evalCtx, regs []Value) error {
 			return nil
 		}
 	}
-	it.obBuf = append(it.obBuf, aggOBRow{keys: keys, arg: arg, sep: sep})
+	it.orderBuf().rows = append(it.orderBuf().rows, aggOBRow{keys: keys, arg: arg, sep: sep})
 	return nil
 }
 
@@ -579,13 +633,13 @@ func (it *aggItem) obBuffer(ctx *evalCtx, regs []Value) error {
 // still is, so only a tie group can let arrival reach the answer: two tied
 // entries whose argument or separator differ latch orderRisk.
 func (it *aggItem) obReplay() error {
-	it.obDone = true
-	enc := it.obCtx.encoding()
+	it.orderBuf().done = true
+	enc := it.orderBuf().ctx.encoding()
 	less := func(a, b aggOBRow) (bool, bool) {
 		for k, t := range it.orderBy {
 			coll := ""
-			if k < len(it.obColls) {
-				coll = it.obColls[k]
+			if k < len(it.orderBuf().colls) {
+				coll = it.orderBuf().colls[k]
 			}
 			if l, eq := orderTermLess(t, a.keys[k], b.keys[k], coll, enc); !eq {
 				return l, false
@@ -593,13 +647,13 @@ func (it *aggItem) obReplay() error {
 		}
 		return false, true
 	}
-	sort.SliceStable(it.obBuf, func(i, j int) bool {
-		l, _ := less(it.obBuf[i], it.obBuf[j])
+	sort.SliceStable(it.orderBuf().rows, func(i, j int) bool {
+		l, _ := less(it.orderBuf().rows[i], it.orderBuf().rows[j])
 		return l
 	})
 	if it.orderStrict {
-		for i := 1; i < len(it.obBuf); i++ {
-			a, b := it.obBuf[i-1], it.obBuf[i]
+		for i := 1; i < len(it.orderBuf().rows); i++ {
+			a, b := it.orderBuf().rows[i-1], it.orderBuf().rows[i]
 			if _, tie := less(a, b); tie && (!valuesIdentical(a.arg, b.arg) || !valuesIdentical(a.sep, b.sep)) {
 				it.orderRisk = true
 				break
@@ -613,13 +667,13 @@ func (it *aggItem) obReplay() error {
 		it.orderBy, it.filter, it.distinct, it.orderStrict, it.rowRegs = orderBy, filter, distinct, strict, rowRegs
 	}()
 	regs := make([]Value, 2)
-	for _, row := range it.obBuf {
+	for _, row := range it.orderBuf().rows {
 		regs[0], regs[1] = row.arg, row.sep
-		if err := it.step(it.obCtx, regs); err != nil {
+		if err := it.step(it.orderBuf().ctx, regs); err != nil {
 			return err
 		}
 	}
-	it.obBuf = nil
+	it.orderBuf().rows = nil
 	return nil
 }
 
@@ -685,7 +739,7 @@ func planAggregateCall(fc FuncExpr) (*aggItem, error) {
 	// turns out not to own can be re-planned against the query that does (see
 	// hoistOwnerFor, vdbe_agg_hoist.go). Nothing at run time reads it --
 	// cloneAggTemplates deliberately does not copy it.
-	it.srcCall = fc
+	it.srcCall = &fc
 	return it, nil
 }
 
@@ -780,7 +834,7 @@ func planAggregateCallKind(fc FuncExpr) (*aggItem, error) {
 		// DISTINCT is semantically a no-op for min/max (the least/greatest
 		// of a set of values equals the least/greatest of its distinct
 		// values), verified against the reference engine, but the dedup
-		// bookkeeping (it.seen) is harmless overhead either way, so it isn't
+		// bookkeeping (aggDistinct) is harmless overhead either way, so it isn't
 		// specially suppressed here.
 		return &aggItem{kind: kind, expr: fc.Args[0], distinct: fc.Distinct}, nil
 
@@ -867,14 +921,34 @@ func planAggregateCallKind(fc FuncExpr) (*aggItem, error) {
 // that v equals under coll in encoding enc, or remembers v when there is none.
 // Two NULLs are equal, as compareValuesCollatedEnc has them.
 func (it *aggItem) distinctSeen(v Value, coll string, enc TextEncoding) (Value, bool) {
+	d := it.distState()
+	if len(d.seen) < aggDistinctLinear {
+		// A few values are compared in turn; most groups never hold more.
+		for _, s := range d.seen {
+			if compareValuesCollatedEnc(v, s, coll, enc) == 0 {
+				return s, true
+			}
+		}
+		if d.seen == nil {
+			d.seen = make([]Value, 0, aggDistinctLinear)
+		}
+		d.seen = append(d.seen, v)
+		return Value{}, false
+	}
+	if d.next == nil {
+		d.next = make([]int, len(d.seen), 2*len(d.seen))
+		for i, s := range d.seen {
+			d.next[i] = d.head.swap(aggDistinctHash(s, coll, enc), i+1)
+		}
+	}
 	h := aggDistinctHash(v, coll, enc)
-	for i := it.seenHead.get(h); i > 0; i = it.seenNext[i-1] {
-		if s := it.seen[i-1]; compareValuesCollatedEnc(v, s, coll, enc) == 0 {
+	for i := d.head.get(h); i > 0; i = d.next[i-1] {
+		if s := d.seen[i-1]; compareValuesCollatedEnc(v, s, coll, enc) == 0 {
 			return s, true
 		}
 	}
-	it.seen = append(it.seen, v)
-	it.seenNext = append(it.seenNext, it.seenHead.swap(h, len(it.seen)))
+	d.seen = append(d.seen, v)
+	d.next = append(d.next, d.head.swap(h, len(d.seen)))
 	return Value{}, false
 }
 
@@ -950,9 +1024,8 @@ func (it *aggItem) step(ctx *evalCtx, regs []Value) error {
 	if v.Typ == Null {
 		return nil
 	}
-	coll := it.argCollation(ctx)
 	if it.distinct {
-		if s, dup := it.distinctSeen(v, coll, ctx.encoding()); dup {
+		if s, dup := it.distinctSeen(v, it.argCollation(ctx), ctx.encoding()); dup {
 			// The dedup keeps the FIRST spelling of a value, so when the two
 			// are not byte-identical -- 'abc'/'ABC' under NOCASE, INTEGER 1
 			// and REAL 1.0 -- WHICH one every downstream kind then sees is an
@@ -985,7 +1058,7 @@ func (it *aggItem) step(ctx *evalCtx, regs []Value) error {
 			it.best, it.haveBest = v, true
 			return nil
 		}
-		c := compareValuesCollatedEnc(v, it.best, coll, ctx.encoding())
+		c := compareValuesCollatedEnc(v, it.best, it.argCollation(ctx), ctx.encoding())
 		if (it.kind == aggMin && c < 0) || (it.kind == aggMax && c > 0) ||
 			(it.minMaxLastWins && c == 0) {
 			it.best = v
@@ -1027,17 +1100,17 @@ func (it *aggItem) step(ctx *evalCtx, regs []Value) error {
 			// do not. The first row's separator is never emitted, but it is
 			// compared anyway: in another order it would be.
 			switch {
-			case !it.gcHave:
-				it.gcFirstVal, it.gcFirstSep = txt, sep
-			case txt != it.gcFirstVal || sep != it.gcFirstSep:
+			case !it.concat().have:
+				it.concat().firstVal, it.concat().firstSep = txt, sep
+			case txt != it.concat().firstVal || sep != it.concat().firstSep:
 				it.orderRisk = true
 			}
 		}
-		if it.gcHave {
-			it.gcBuf.WriteString(sep)
+		if it.concat().have {
+			it.concat().buf.WriteString(sep)
 		}
-		it.gcBuf.WriteString(txt)
-		it.gcHave = true
+		it.concat().buf.WriteString(txt)
+		it.concat().have = true
 		return nil
 	}
 	return fmt.Errorf("engine: internal: unknown aggregate kind %d", it.kind)
@@ -1054,11 +1127,11 @@ func (it *aggItem) stepJSONWatched(ctx *evalCtx, regs []Value, jstep func(*evalC
 	if !it.orderStrict {
 		return jstep(ctx, regs)
 	}
-	had, before := it.gcHave, it.gcBuf.Len()
+	had, before := it.concat().have, it.concat().buf.Len()
 	if err := jstep(ctx, regs); err != nil {
 		return err
 	}
-	if it.gcBuf.Len() == before {
+	if it.concat().buf.Len() == before {
 		// Nothing contributed: a NULL key in json_group_object, which is
 		// order-free, or a DISTINCT duplicate, which is not -- the dedup keeps
 		// the FIRST spelling and its own `seen` comparison is inside json_funcs.go, so
@@ -1066,14 +1139,14 @@ func (it *aggItem) stepJSONWatched(ctx *evalCtx, regs []Value, jstep func(*evalC
 		it.orderRisk = it.orderRisk || it.distinct
 		return nil
 	}
-	chunk := it.gcBuf.String()[before:]
+	chunk := it.concat().buf.String()[before:]
 	if had {
 		chunk = chunk[1:] // the ',' this call wrote before its own contribution
 	}
 	switch {
 	case !had:
-		it.gcFirstVal = chunk
-	case chunk != it.gcFirstVal:
+		it.concat().firstVal = chunk
+	case chunk != it.concat().firstVal:
 		it.orderRisk = true
 	}
 	return nil
@@ -1115,9 +1188,8 @@ func (it *aggItem) magnetStep(ctx *evalCtx, regs []Value) (touched, hit bool, er
 	if err != nil {
 		return false, false, err
 	}
-	coll := it.argCollation(ctx)
 	if it.distinct {
-		if _, dup := it.distinctSeen(v, coll, ctx.encoding()); dup {
+		if _, dup := it.distinctSeen(v, it.argCollation(ctx), ctx.encoding()); dup {
 			return false, false, nil
 		}
 	}
@@ -1128,7 +1200,7 @@ func (it *aggItem) magnetStep(ctx *evalCtx, regs []Value) (touched, hit bool, er
 		it.best, it.haveBest = v, true
 		return true, false, nil
 	}
-	c := compareValuesCollatedEnc(v, it.best, coll, ctx.encoding())
+	c := compareValuesCollatedEnc(v, it.best, it.argCollation(ctx), ctx.encoding())
 	if (it.kind == aggMin && c < 0) || (it.kind == aggMax && c > 0) {
 		it.best = v
 		return true, false, nil
@@ -1360,7 +1432,7 @@ func aggNumericContribution(v Value) (asInt bool, i int64, f float64) {
 // sumFinalize/minMaxFinalize/groupConcatFinalize all take just the
 // sqlite3_context).
 func (it *aggItem) finalize() (Value, error) {
-	if it.orderBy != nil && !it.obDone {
+	if it.orderBy != nil && !it.orderBuf().done {
 		if err := it.obReplay(); err != nil {
 			return Value{}, err
 		}
@@ -1400,10 +1472,10 @@ func (it *aggItem) finalize() (Value, error) {
 		return it.best, nil
 
 	case aggGroupConcat:
-		if !it.gcHave {
+		if !it.concat().have {
 			return Value{Typ: Null}, nil
 		}
-		return Value{Typ: Text, S: []byte(it.gcBuf.String())}, nil
+		return Value{Typ: Text, S: []byte(it.concat().buf.String())}, nil
 
 	case aggJSONGroupArray:
 		return it.finalizeJSONGroupArray(), nil
@@ -1696,7 +1768,7 @@ func aggArgExprs(agg *aggItem) []Expr {
 	// walks pLeft for every aggregate (expr.c:7215-7220), min()/max() included,
 	// whose aggItem.orderBy is nil. Without it "(SELECT group_concat(n.i ORDER
 	// BY m.i) FROM m)" was handed to the OUTER query for naming only n.i.
-	exprs = append(exprs, agg.srcCall.orderByExprs()...)
+	exprs = append(exprs, agg.call().orderByExprs()...)
 	return exprs
 }
 

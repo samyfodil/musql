@@ -56,10 +56,31 @@ func TestVCursorLayout(t *testing.T) {
 		{"Rowids", unsafe.Offsetof(c.Rowids), VCursorOffRids},
 		{"Reopen", unsafe.Offsetof(c.Reopen), VCursorOffReop},
 		{"State", unsafe.Offsetof(c.State), VCursorOffState},
+		{"Seg", unsafe.Offsetof(c.Seg), VCursorOffSeg},
+		{"Tab", unsafe.Offsetof(c.Tab), VCursorOffTab},
+		{"Key", unsafe.Offsetof(c.Key), VCursorOffKey},
+		{"Served", unsafe.Offsetof(c.Served), VCursorOffSrvd},
+		{"Sel", unsafe.Offsetof(c.Sel), VCursorOffSel},
+		{"Idx", unsafe.Offsetof(c.Idx), VCursorOffIdx},
 	} {
 		if f.got != f.want {
 			t.Errorf("VCursor %s is %d, generated code uses %d", f.name, f.got, f.want)
 		}
+	}
+	var sg VSeg
+	var sc VSegCol
+	if unsafe.Offsetof(sg.Cols) != VSegOffCols || unsafe.Offsetof(sg.First) != VSegOffFirst || unsafe.Offsetof(sg.Dense) != VSegOffDense ||
+		unsafe.Offsetof(sg.Rowids) != VSegOffRowids || unsafe.Sizeof(sc) != VSegColSize || unsafe.Offsetof(sc.Kind) != VSegColOffKind ||
+		unsafe.Offsetof(sc.Block) != VSegColOffBlock || unsafe.Offsetof(sc.Nulls) != VSegColOffNulls ||
+		unsafe.Offsetof(sc.Exc) != VSegColOffExc || unsafe.Offsetof(sc.Heap) != VSegColOffHeap ||
+		unsafe.Offsetof(sc.Plain) != VSegColOffPlain {
+		t.Fatalf("VSeg or VSegCol is laid out differently from what generated code uses")
+	}
+	var ix VIdx
+	if unsafe.Offsetof(ix.Vals) != VIdxOffVals || unsafe.Offsetof(ix.NVals) != VIdxOffNVals || unsafe.Offsetof(ix.Starts) != VIdxOffStarts ||
+		unsafe.Offsetof(ix.Rows) != VIdxOffRows || unsafe.Offsetof(ix.Seg) != VIdxOffSeg || unsafe.Offsetof(ix.Mask) != VIdxOffMask ||
+		unsafe.Offsetof(ix.Count) != VIdxOffCount || unsafe.Offsetof(ix.Lo) != VIdxOffLo || unsafe.Offsetof(ix.Hi) != VIdxOffHi || unsafe.Sizeof(ix) != VIdxSize {
+		t.Fatalf("VIdx is laid out differently from what generated code uses")
 	}
 	var v tvalue
 	if unsafe.Sizeof(v) != 48 || unsafe.Offsetof(v.I) != 8 || unsafe.Offsetof(v.F) != 16 || unsafe.Offsetof(v.S) != 24 {
@@ -73,7 +94,13 @@ func TestVCursorLayout(t *testing.T) {
 // runVMCursor runs prog over one cursor and returns where native code stopped.
 func runVMCursor(t *testing.T, prog []VInsn, regs []tvalue, rows [][]tvalue, cur *VCursor, pc int) int {
 	t.Helper()
-	lay := ValueLayout{Size: 48, OffTyp: 0, OffI: 8, OffF: 16, OffS: 24, TypNull: tvNull, TypInt: tvInt}
+	return runVMCursorArgs(t, prog, regs, rows, cur, &ProgArgs{PC: int64(pc)})
+}
+
+// runVMCursorArgs is runVMCursor with the rest of args as the caller set them.
+func runVMCursorArgs(t *testing.T, prog []VInsn, regs []tvalue, rows [][]tvalue, cur *VCursor, args *ProgArgs) int {
+	t.Helper()
+	lay := ValueLayout{Size: 48, OffTyp: 0, OffI: 8, OffF: 16, OffS: 24, TypNull: tvNull, TypInt: tvInt, TypFloat: tvReal, TypText: tvText}
 	b, err := EmitVM(prog, len(regs), lay)
 	if err != nil {
 		t.Fatalf("EmitVM: %v", err)
@@ -83,8 +110,8 @@ func runVMCursor(t *testing.T, prog []VInsn, regs []tvalue, rows [][]tvalue, cur
 		t.Fatalf("Map: %v", err)
 	}
 	defer code.Close()
-	args := ProgArgs{Regs: (*int64)(unsafe.Pointer(&regs[0])), PC: int64(pc), Cur: cur}
-	code.Call2(&args)
+	args.Regs, args.Cur = (*int64)(unsafe.Pointer(&regs[0])), cur
+	code.Call2(args)
 	return int(args.PC)
 }
 
@@ -179,6 +206,20 @@ func TestVMCursorColumnAndNext(t *testing.T) {
 		}
 		if pc := runVMCursor(t, prog, regs, rows, cur, 1); pc != 2 || regs[1].I != 0 {
 			t.Fatalf("column 1, in the mask: pc %d r1 %+v", pc, regs[1])
+		}
+	})
+	t.Run("a batch with rows past it exits at its end", func(t *testing.T) {
+		rows := newRows(10)
+		regs, cur := newRegs(), cursor(rows, 3)
+		cur.Adv = 2
+		if pc := runVMCursor(t, prog, regs, rows, cur, 0); pc != 4 {
+			t.Fatalf("stopped at %d, want 4 (the Next, for the VDBE's)", pc)
+		}
+		if want := int64(11 * (3 + 4 + 5 + 6 + 7 + 8 + 9)); regs[2].I != want {
+			t.Fatalf("sum %d, want %d", regs[2].I, want)
+		}
+		if cur.Pos != 9 || cur.Last != 9 {
+			t.Fatalf("cursor left at pos %d last %d, want 9, 9: on the batch's last row", cur.Pos, cur.Last)
 		}
 	})
 	t.Run("next on a cursor native code may read but not move", func(t *testing.T) {

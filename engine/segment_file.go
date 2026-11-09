@@ -49,6 +49,9 @@ import (
 // own flags, so a version 6 file may hold version 5 segments -- a verbatim
 // compaction copies them -- and the reader takes either.
 //
+// Version 7 adds the PhysNumeric column (segFlagNumeric): INTEGERs and REALs in
+// one double block. A version 7 file may hold segments of every earlier one.
+//
 // segFileVersion is the format this build writes, and segFileMinVersion the
 // oldest it reads: a file is readable from every build after the one that
 // wrote it. A change to what a reader sees takes a new version, and the reader
@@ -60,7 +63,7 @@ import (
 // segFileMinVersion drops files people may have; it needs a converter first.
 const (
 	segFileMagic      = "MQSF"
-	segFileVersion    = 6
+	segFileVersion    = 7
 	segFileMinVersion = 4
 	segFileHdrSize    = 24 // version 4's header, and the fields every version starts with
 	segFileHdrSizeV5  = 32 // version 5's: those, and the directory's offset

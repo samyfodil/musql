@@ -249,11 +249,16 @@ func (b *segRows) walkStored(yield func(uint64, []Value) bool) {
 }
 
 func (b *segRows) walkWith(widen func(uint64, []Value) []Value, yield func(uint64, []Value) bool) {
+	b.walkWithCols(allColumns, widen, yield)
+}
+
+// walkWithCols is walkWith decoding only the columns in cols (scanTableCols).
+func (b *segRows) walkWithCols(cols columnMask, widen func(uint64, []Value) []Value, yield func(uint64, []Value) bool) {
 	src := b.rp.segs
 	if src == nil {
 		return
 	}
-	seq, handled, err := src.scanSegments(b.root)
+	seq, handled, err := src.scanSegmentsCols(b.root, cols)
 	if err != nil || !handled {
 		return
 	}

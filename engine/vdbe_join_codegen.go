@@ -262,6 +262,13 @@ type joinSource struct {
 	joinSeekKeyExpr Expr
 	joinIdxSeek     *indexSeekPlan
 
+	// joinSortedKey and joinSortedSeek seek this level's rows sorted by one
+	// column, per outer row (OpSortedSeek), where no index or rowid seek
+	// applies: joinSortedKey is the key over the outer tables. Set by
+	// annotateJoinSeeks.
+	joinSortedKey  Expr
+	joinSortedSeek *sortedSeekHint
+
 	// memberScopes, non-nil only for a materialized parenthesized join group
 	// (resolveGroupSource), lists its leaf member scopes in FROM order, each on the
 	// group's one derived cursor with its own columns (offset via colBase). scope is
@@ -330,7 +337,7 @@ func identityOrder(n int) []int {
 // identity order with everything deferred to the innermost body (as join.go
 // does). planJoinPushdown assumes one scope per source, which groups break.
 // Both are optimizations, so this is never wrong.
-func buildJoinPlan(srcs []joinSource, where Expr) joinPlan {
+func buildJoinPlan(c *compiler, srcs []joinSource, where Expr) joinPlan {
 	if groupPresent(srcs) {
 		consts, outerConsts, rest := splitConstWhereTerms(splitTopLevelAnd(where), tableScopesOf(srcs), true)
 		return joinPlan{
@@ -341,7 +348,7 @@ func buildJoinPlan(srcs []joinSource, where Expr) joinPlan {
 			outerConsts: outerConsts,
 		}
 	}
-	return joinPushdownPlan(srcs, tableScopesOf(srcs), where)
+	return joinPushdownPlan(c, srcs, tableScopesOf(srcs), where)
 }
 
 // resolveJoinSources resolves every FROM item into a joinSource, allocating one
@@ -2862,8 +2869,52 @@ func gathersOf(srcs []joinSource) []aggGather {
 // emitJoinLevel), and deferred (conjuncts that need the full, possibly
 // NULL-extended row, emitted by the caller's body). Reusing join.go's planner
 // keeps row order and ON-vs-WHERE safety identical.
-func joinPushdownPlan(srcs []joinSource, scopes []tableScope, where Expr) joinPlan {
-	return planJoinPushdown(where, joinedTablesFor(srcs), scopes)
+func joinPushdownPlan(c *compiler, srcs []joinSource, scopes []tableScope, where Expr) joinPlan {
+	var subFree func(Expr) bool
+	if c != nil && c.pager != nil {
+		subFree = c.subTermsUncorrelated
+	}
+	return planJoinPushdownSub(where, joinedTablesFor(srcs), scopes, subFree)
+}
+
+// subTermsUncorrelated reports whether every sub-select of conjunct e
+// compiles here without binding a row of this query or one enclosing it: a
+// trial compile, so the binder that will compile the term decides. Anything
+// it cannot walk or compile counts as correlated.
+//
+// The verdict is kept for the statement (compiler.subUncorrelated): a trial
+// compile makes the sub-select's own sub-selects ask again, so without it each
+// level of nesting doubled the compiles.
+func (c *compiler) subTermsUncorrelated(e Expr) bool {
+	subs, ok := subSelects(e)
+	if !ok || len(subs) == 0 {
+		return false
+	}
+	root := c
+	for root.outer != nil {
+		root = root.outer
+	}
+	keep := root.trig == nil && root.liveDB == nil && root.liveRow == nil && root.retRow == nil
+	for _, sub := range subs {
+		if v, seen := root.subUncorrelated[sub]; keep && seen {
+			if !v {
+				return false
+			}
+			continue
+		}
+		prog, err := compileSubProgram(c.pager, sub, c)
+		v := err == nil && prog != nil && !prog.Correlated
+		if keep {
+			if root.subUncorrelated == nil {
+				root.subUncorrelated = map[*SelectStmt]bool{}
+			}
+			root.subUncorrelated[sub] = v
+		}
+		if !v {
+			return false
+		}
+	}
+	return true
 }
 
 // joinedTablesFor projects a resolved FROM clause onto the []joinedTable that
@@ -2931,7 +2982,7 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 	// target -- can therefore iterate the b-tree LAZILY instead of materializing
 	// the whole table (see vdbeCursor.streamable). Deeper levels, and any
 	// rightOuter/withoutRowid/derived source, keep materializing.
-	streamOuter := -1
+	streamOuter, orderedOuter := -1, -1
 	if len(plan.execOrder) > 0 {
 		o := plan.execOrder[0]
 		s := srcs[o]
@@ -2947,6 +2998,12 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 			// b-tree pull has nothing to permute. See OpAutoIndexOrder. Not when
 			// no order can show (compiler.rowOrderFree): the key is not applied.
 			streamOuter = o
+		}
+		// One whose key orders it may still stream: when its rows already run
+		// in the key's order, OpAutoIndexOrder has nothing to permute.
+		if streamOuter < 0 && s.derived == nil && s.vtabItem == nil && s.cteItem == nil && s.catalogScope == scopeAny &&
+			!s.rightOuter && !s.tbl.withoutRowid && len(plan.autoIdxKeys) > 0 && plan.autoIdxKeys[0] != nil && plan.autoIdxKeys[0].multiOr == nil {
+			orderedOuter = o
 		}
 	}
 	// The same once-per-run outermost level, when it is a DERIVED source (a
@@ -3041,6 +3098,9 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 		var p5 uint16
 		if i == streamOuter {
 			p5 = 1
+		}
+		if i == orderedOuter {
+			p5 |= 4
 		}
 		if s.flattened {
 			p5 |= 2 // see returningSubqueryLifetimes
@@ -3283,8 +3343,9 @@ func (c *compiler) emitRightOuterSweep(srcs []joinSource, plan joinPlan, order [
 //
 // Only the order changes; a row satisfying no pass is filed last and fails the
 // OR the body still tests.
-func (c *compiler) emitMultiOrGroups(plan joinPlan, level, cur int) error {
-	if level >= len(plan.autoIdxKeys) {
+func (c *compiler) emitMultiOrGroups(plan joinPlan, level, cur int, s joinSource) error {
+	if level >= len(plan.autoIdxKeys) || s.joinSeekKeyExpr != nil {
+		// A rowid seek's one row needs no order.
 		return nil
 	}
 	key := plan.autoIdxKeys[level]
@@ -3421,7 +3482,7 @@ func (c *compiler) emitJoinLevel(srcs []joinSource, plan joinPlan, level int, bo
 		if err := c.emitJoinSeekHint(srcs, order, level, s); err != nil {
 			return err
 		}
-		if err := c.emitMultiOrGroups(plan, level, cur); err != nil {
+		if err := c.emitMultiOrGroups(plan, level, cur, s); err != nil {
 			return err
 		}
 		rewindJump := c.emit(Instruction{Op: OpRewind, P1: cur})
@@ -3490,7 +3551,7 @@ func (c *compiler) emitJoinLevel(srcs []joinSource, plan joinPlan, level int, bo
 	}
 	matchReg := c.alloc()
 	c.emit(Instruction{Op: OpInteger, P1: 0, P2: matchReg})
-	if err := c.emitMultiOrGroups(plan, level, cur); err != nil {
+	if err := c.emitMultiOrGroups(plan, level, cur, s); err != nil {
 		return err
 	}
 	rewindJump := c.emit(Instruction{Op: OpRewind, P1: cur})

@@ -69,7 +69,7 @@ func vmStepOf(in VInsn, pc int) progStep {
 		s.uses, s.targets = []int{in.A, in.B}, []int{in.T}
 	case VCmpBr, VFCmpBr:
 		s.uses, s.defs, s.targets = []int{in.A, in.B}, []int{in.C}, []int{in.T}
-	case VReal:
+	case VReal, VText:
 		s.defs = []int{in.A}
 	case VMath:
 		s.uses, s.defs = []int{in.A}, []int{in.C}
@@ -80,8 +80,10 @@ func vmStepOf(in VInsn, pc int) progStep {
 		s.uses, s.defs = []int{in.A, in.A + 1, in.A + 2}, []int{in.C}
 	case VTextCmpJump:
 		s.uses, s.targets = []int{in.A, in.B}, []int{in.T}
-	case VTextCmpSet:
+	case VTextCmpSet, VLike:
 		s.uses, s.defs = []int{in.A, in.B}, []int{in.C}
+	case VInSub:
+		s.uses, s.defs = []int{in.A}, []int{in.C}
 	case VNotBr:
 		s.uses, s.defs, s.targets = []int{in.A}, []int{in.C}, []int{in.T}
 	case VNullJump, VIf:
@@ -104,6 +106,11 @@ func vmStepOf(in VInsn, pc int) progStep {
 		s.uses, s.defs = []int{in.A, int(in.Imm)}, []int{in.C}
 	case VRewind, VNext:
 		s.targets = []int{in.T}
+	case VSeekRowid, VSeekIdx:
+		s.uses, s.targets = []int{in.B}, []int{in.T}
+	case VInText:
+		s.uses, s.defs = []int{in.A}, []int{in.C}
+	case VSeekRewind:
 	case VOpen, VClose:
 	case VResultRow:
 		if in.Skip == 0 {
@@ -258,9 +265,9 @@ func FuseVM(prog []VInsn, nReg int, hard, entry []bool) []VInsn {
 		case VCopy:
 			d = in.B
 		case VAdd, VSub, VMul, VAnd, VOr, VShl, VShr, VDiv, VRem, VCmpSet, VNull, VNeg, VNot,
-			VFAdd, VFSub, VFMul, VFDiv, VFCmpSet, VMath:
+			VFAdd, VFSub, VFMul, VFDiv, VFCmpSet, VMath, VLike, VInSub:
 			d = in.C
-		case VReal:
+		case VReal, VText:
 			d = in.A
 		default:
 			continue
@@ -461,7 +468,27 @@ func vmEmitNextUse(prog []VInsn, bound []bool, key, pc int) int {
 // vmMovesCursor reports whether op moves its cursor off the row a VColumn
 // before it read.
 func vmMovesCursor(op VOp) bool {
-	return op == VNext || op == VRewind || op == VOpen || op == VClose
+	return op == VNext || op == VRewind || op == VOpen || op == VClose || op == VSeekRowid || op == VSeekIdx || op == VSeekRewind
+}
+
+// vmRunPredicted is vmRunColumns for a segment column read with a predicted
+// kind (T): only the run's predicted reads of the cursor share its check, so
+// a column read the full way, which may not be served, cannot fail it.
+func vmRunPredicted(prog []VInsn, bound []bool, pc int) uint64 {
+	c, mask := prog[pc].A, uint64(1)<<uint(prog[pc].B)
+	for q := pc + 1; q < len(prog) && q < pc+48; q++ {
+		if vmRunStart(prog, bound, q) {
+			break
+		}
+		in := prog[q]
+		if vmMovesCursor(in.Op) && in.A == c {
+			break
+		}
+		if in.Op == VColumn && in.A == c && in.Imm == 1 && in.T != 0 {
+			mask |= uint64(1) << uint(in.B)
+		}
+	}
+	return mask
 }
 
 // vmRunColumns adds to mask and maxCol the columns of the cursor pc's VColumn
@@ -601,6 +628,25 @@ func VReachesResultRow(prog []VInsn) []bool {
 		}
 	}
 	return reach
+}
+
+// VLoops reports whether some native instruction of prog can transfer back to
+// itself or an earlier one: a jump back, or a subroutine.
+func VLoops(prog []VInsn) bool {
+	for pc, in := range prog {
+		switch in.Op {
+		case VExit:
+			continue
+		case VGosub, VReturn:
+			return true
+		}
+		for _, t := range vmStepOf(in, pc).targets {
+			if t <= pc {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // VReachFrom reports which instructions native code entered at pc can run

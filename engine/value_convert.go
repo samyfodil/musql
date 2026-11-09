@@ -399,6 +399,12 @@ func formatFloatText(f float64) string {
 	return s
 }
 
+// FormatReal renders a REAL as SQLite turns one into TEXT (formatFloatText):
+// what sqlite3_column_text, CAST(x AS TEXT) and the sqlite3 shell show, which
+// is not always Go's shortest round-trip form (pow(2,81) is
+// 2.4178516392292584e+24, not ...583e+24).
+func FormatReal(f float64) string { return formatFloatText(f) }
+
 // formatFloatLiteral is "%!0.17g", the rendering quote() (sqlite3QuoteValue,
 // func.c:1114) and JSON (jsonAppendSqlValue, json.c:813) give a REAL:
 // formatFloatText's, except that the '0' flag spells an infinity 9.0e+999 --

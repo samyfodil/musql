@@ -219,3 +219,44 @@ func TestVMTextCmp(t *testing.T) {
 		}
 	}
 }
+
+// TestVMInText matches TEXTs against a list of TEXTs byte for byte, an
+// empty TEXT and an empty list included; a non-TEXT operand and UTF-16
+// comparisons exit.
+func TestVMInText(t *testing.T) {
+	if !Available || !VMTextOrder {
+		t.Skip("no TEXT ops on this platform")
+	}
+	noGC(t)
+	words := []string{"SM CASE", "SM BOX", "", "SM PACK", "SM PKG", "AIR"}
+	lits := make([]VTextLit, len(words))
+	keep := make([][]byte, len(words))
+	for i, w := range words {
+		keep[i] = append([]byte(w), 0)
+		lits[i] = VTextLit{Ptr: unsafe.Pointer(&keep[i][0]), Len: int64(len(w))}
+	}
+	for _, n := range []int{0, 1, len(words)} {
+		prog := []VInsn{{Op: VInText, A: 0, B: n, C: 1, Imm: int64(uintptr(unsafe.Pointer(&lits[0])))}, {Op: VExit}}
+		for _, x := range []string{"SM CASE", "SM BOX", "SM BO", "SM BOXX", "", "AIR", "air", "SM PKG", "SM CAS\\x00"} {
+			regs := []tvalue{{Typ: tvText, S: []byte(x)}, {Typ: tvInt, I: 7}}
+			pc := runVMCursor(t, prog, regs, nil, &VCursor{}, 0)
+			want := int64(0)
+			for _, w := range words[:n] {
+				if w == x {
+					want = 1
+				}
+			}
+			if pc != 1 || regs[1].Typ != tvInt || regs[1].I != want {
+				t.Fatalf("%d words, %q: pc %d r1 %+v, want %d", n, x, pc, regs[1], want)
+			}
+		}
+	}
+	prog := []VInsn{{Op: VInText, A: 0, B: len(words), C: 1, Imm: int64(uintptr(unsafe.Pointer(&lits[0])))}, {Op: VExit}}
+	if pc := runVMCursor(t, prog, []tvalue{{Typ: tvInt, I: 3}, {}}, nil, &VCursor{}, 0); pc != 0 {
+		t.Fatalf("an INTEGER operand ran natively to %d", pc)
+	}
+	regs := []tvalue{{Typ: tvText, S: []byte("AIR")}, {}}
+	if pc := runVMCursorArgs(t, prog, regs, nil, &VCursor{}, &ProgArgs{UTF16: 1}); pc != 0 {
+		t.Fatalf("a UTF-16 comparison ran natively to %d", pc)
+	}
+}

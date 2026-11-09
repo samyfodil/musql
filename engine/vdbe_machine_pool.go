@@ -70,7 +70,11 @@ func (prog *Program) getMachineFrom(spare **vdbe) *vdbe {
 // reason putMachine rebuilds the machine from a composite literal.
 func (m *vdbe) openCursorInto(slot int, p *ReadOnlyPager, tbl *resolvedTable) *vdbeCursor {
 	cur := m.cursorShell(slot)
-	*cur = vdbeCursor{pager: p, tbl: tbl, colMask: allColumns}
+	// A list seek's buffers outlive the cursor, for a subquery that opens it
+	// once per outer row and seeks once (segListSeek).
+	ps := &cur.pointSrc
+	src := segRowSource{listSegs: ps.listSegs[:0], listRows: ps.listRows[:0], listKeys: ps.listKeys[:0], listPerm: ps.listPerm[:0], listHits: ps.listHits[:0]}
+	*cur = vdbeCursor{pager: p, tbl: tbl, colMask: allColumns, pointSrc: src}
 	return cur
 }
 
@@ -127,7 +131,7 @@ func (prog *Program) putMachineTo(m *vdbe, spare **vdbe) {
 	// stops the next statement from reading the last one's row by accident.
 	for _, c := range cursors {
 		if c != nil {
-			*c = vdbeCursor{}
+			*c = vdbeCursor{pointSrc: keptListBuffers(&c.pointSrc)}
 		}
 	}
 	// The sub-cache slice too (reuseSubCache), emptied to its full capacity
@@ -136,7 +140,7 @@ func (prog *Program) putMachineTo(m *vdbe, spare **vdbe) {
 	clear(sub)
 	// The JIT's cursor views and row copies too (vmJIT.enter), scrubbed: they
 	// were three allocations of every point read a native program ran.
-	jcur, jsnap := m.jcur, m.jsnap
+	jcur, jsnap, jlive := m.jcur, m.jsnap, m.jLive[:0]
 	clear(jcur)
 	for i := range jsnap {
 		sn := &jsnap[i]
@@ -168,7 +172,7 @@ func (prog *Program) putMachineTo(m *vdbe, spare **vdbe) {
 	// composite literal this was, without building that 1 KB literal and
 	// copying it over -- most of what returning a machine cost per statement.
 	*m = vdbe{}
-	m.regs, m.cursors, m.recRegs, m.subCache, m.jcur, m.jsnap = regs, cursors, recRegs, sub[:0], jcur, jsnap
+	m.regs, m.cursors, m.recRegs, m.subCache, m.jcur, m.jsnap, m.jLive = regs, cursors, recRegs, sub[:0], jcur, jsnap, jlive
 	m.aggVM, m.aggCtx, m.aggNullRow = agg, actx, nullRow
 	m.colMasks, m.colMasksOf, m.colMasksN, m.colMasksCurs = masks, masksOf, masksN, masksCurs
 	m.aggSpare = aggSpare
@@ -177,6 +181,23 @@ func (prog *Program) putMachineTo(m *vdbe, spare **vdbe) {
 		return
 	}
 	vdbeMachines.Put(m)
+}
+
+// maxKeptList is the most rows a cursor's list buffers may hold and still be
+// pooled with its shell.
+const maxKeptList = 1 << 16
+
+// keptListBuffers is src's list buffers emptied, for the next statement's list
+// (an AutoIndexOrder walk builds one per execution): listSegs cleared, so the
+// pool pins no segment, and none kept past maxKeptList rows.
+func keptListBuffers(src *segRowSource) segRowSource {
+	if cap(src.listSegs) > maxKeptList || cap(src.listRows) > maxKeptList || cap(src.listKeys) > maxKeptList ||
+		cap(src.listPerm) > maxKeptList || cap(src.listHits) > maxKeptList {
+		return segRowSource{}
+	}
+	segs := src.listSegs[:cap(src.listSegs)]
+	clear(segs)
+	return segRowSource{listSegs: segs[:0], listRows: src.listRows[:0], listKeys: src.listKeys[:0], listPerm: src.listPerm[:0], listHits: src.listHits[:0]}
 }
 
 // vdbeMachines holds every released machine, whatever program it ran.

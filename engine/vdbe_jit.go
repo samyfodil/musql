@@ -53,6 +53,13 @@ type vmJIT struct {
 	// VDBE applies them as soon as the call returns (vdbe.applyGathered).
 	updAt int
 
+	// aggAt is the pc of the OpHashAggStep whose registers native code
+	// gathers (gatherAggStep), or -1: entries before aggSort gather into
+	// vdbe.aggRows, and the VDBE steps each row as soon as the call returns.
+	// aggLo..aggHi are the registers gathered, aggKey the key's record and
+	// aggKeyLo its registers' first.
+	aggAt, aggSort, aggLo, aggHi, aggKey, aggKeyLo, aggKeyN int
+
 	// updSkip is the gathered record's Skip (gatherSkip): the columns whose
 	// registers may be stale when the record is made, which updateRow then
 	// reads from the cursor's row instead.
@@ -67,6 +74,9 @@ type vmJIT struct {
 	// compare converted, which VTextCmpJump leaves to the VDBE
 	// (ProgArgs.UTF16), and that no bytes are checked yet (TextPtr).
 	text bool
+	// like is whether it has a VLike, which reads case_sensitive_like
+	// (ProgArgs.LikeCS).
+	like bool
 
 	// seekCols is every column the native code reads of each cursor: what a
 	// seek's rows are copied out with (seekSnap).
@@ -75,6 +85,31 @@ type vmJIT struct {
 	// reopen is, per cursor number, the derived source whose opens native
 	// code may make (reopenSources); nil when there is none.
 	reopen []reopenSrc
+
+	// segCap is, per cursor number, whether its VColumns read a segment in
+	// place (segCapableCursors).
+	segCap []bool
+
+	// tabs is, per cursor number, the table tabFor last worked out for it.
+	tabs []atomic.Pointer[vmTab]
+
+	// safeExit is, per pc, the entry native code that stops there resumes at
+	// keeping its cursors (vdbe.jDefer), or -1: the VDBE reaches that entry
+	// running instructions that touch none and jump nowhere.
+	safeExit []int32
+
+	// idxSpecs is, per cursor number, the index seek native code makes
+	// (lowerIdxSeeks), and idxs the index idxFor last worked out for it.
+	idxSpecs []*idxSeekSpec
+	idxs     []atomic.Pointer[vmIdx]
+
+	// inSlots is the subquery cache slot of each VInSub's set, its B.
+	inSlots []int
+
+	// walkScan is, per cursor number, whether native code advances the
+	// streamed scan (nativeStreamNexts): only then is it handed over a batch
+	// at a time, and otherwise its current row with the columns an entry reads.
+	walkScan []bool
 }
 
 // curCols is one cursor's columns an entry reads.
@@ -96,7 +131,11 @@ var noVMJIT = &vmJIT{}
 // The cache is checked against prog.Insns rather than trusted: a Program
 // copied by value (limit_offset_halt.go) and given new instructions carries
 // the old pointer, and compiles its own.
-func (prog *Program) jitCode() *vmJIT {
+func (prog *Program) jitCode() *vmJIT { return prog.jitCodeOn(nil) }
+
+// jitCodeOn is jitCode for a machine that runs on p, whose segments inform
+// which columns the first compile guesses hold REALs (vmRealLowering).
+func (prog *Program) jitCodeOn(p *ReadOnlyPager) *vmJIT {
 	if len(prog.Insns) == 0 {
 		return nil
 	}
@@ -106,13 +145,36 @@ func (prog *Program) jitCode() *vmJIT {
 		}
 		return jx
 	}
-	jx := compileVMJIT(prog)
+	jx := compileVMJIT(prog, p)
 	if jx == nil {
 		atomic.StorePointer(&prog.vmJIT, unsafe.Pointer(noVMJIT))
 		return nil
 	}
 	atomic.StorePointer(&prog.vmJIT, unsafe.Pointer(jx))
 	return jx
+}
+
+// vmJITLoopFree compiles a program with no loop too. Only tests set it, to run
+// the code generator over straight-line programs.
+var vmJITLoopFree bool
+
+// programLoops reports whether prog has a loop the VDBE runs: a cursor or
+// sorter loop, a subroutine, or a jump back. With none, and none among the
+// instructions native code runs (jit.VLoops), each instruction runs at most
+// once (a FROM-less SELECT, a constant folded per run), which native code
+// cannot pay back the compile for.
+func programLoops(prog *Program) bool {
+	for pc, in := range prog.Insns {
+		switch in.Op {
+		case OpNext, OpSorterNext, OpHashAggNext, OpRightJoinSweepNext, OpSegJoinNext, OpGosub:
+			return true
+		case OpGoto:
+			if in.P2 <= pc {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // maxJITParams bounds the parameters native code reads from registers of
@@ -187,21 +249,23 @@ var valueLayout = jit.ValueLayout{
 // compileVMJIT compiles prog, or returns nil: the JIT off, no emitter for this
 // platform, or nothing in the program it could run natively. nil means the
 // VDBE runs every instruction, which is always correct.
-func compileVMJIT(prog *Program) *vmJIT {
+func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	if !vmJITEnabled || len(prog.Insns) == 0 {
 		return nil
 	}
 	vp := make([]jit.VInsn, len(prog.Insns))
 	entry := make([]bool, len(prog.Insns))
 	native := 0
-	rewindable, walkable := scannableCursors(prog.Insns, prog.NCursors)
+	rewindable, walkable, streamed := scannableCursors(prog.Insns, prog.NCursors)
 	// Whether the program has a pair the fusion pass works on, noted as it is
 	// lowered (jit.VFusable), so a program with none skips the pass.
 	fusable := false
 	nParams := prog.jitParams()
 	ipk := writeCursorIPK(prog)
-	realVP, realOK := vmRealLowering(prog)
+	realVP, realOK := vmRealLowering(prog, p.segStoresReal)
+	textVP, textOK := vmTextLowering(prog, p.segStoresText)
 	reopen := reopenSources(prog)
+	var inSlots []int
 	for pc := range prog.Insns {
 		vp[pc] = lowerVM(&prog.Insns[pc], prog.NReg)
 		if in := &prog.Insns[pc]; (in.Op == OpOpenDerived || in.Op == OpClose) && in.P1 >= 0 && in.P1 < len(reopen) && reopen[in.P1].ds != nil {
@@ -212,6 +276,20 @@ func compileVMJIT(prog *Program) *vmJIT {
 		}
 		if realOK != nil && realOK[pc] {
 			vp[pc] = realVP[pc]
+		} else if textOK != nil && textOK[pc] {
+			vp[pc] = textVP[pc]
+		}
+		if in := &prog.Insns[pc]; in.Op == OpInSub && jit.VMTextOrder {
+			// An uncorrelated IN of one column, which native code probes in the
+			// set the VDBE builds on its first run (inHashSet.ints).
+			if plan, isPlan := in.P4.(*inSubPlan); isPlan && !plan.correlated && !plan.shared && len(plan.affs) == 1 && plan.affs[0] != affText &&
+				(plan.colls[0] == "" || strings.EqualFold(plan.colls[0], "BINARY")) && in.P1 >= 0 && in.P1 < prog.NReg && in.P2 >= 0 && in.P2 < prog.NReg && in.P3 >= 0 {
+				vp[pc] = jit.VInsn{Op: jit.VInSub, A: in.P1, B: len(inSlots), C: in.P2}
+				if plan.not {
+					vp[pc].Imm = 1
+				}
+				inSlots = append(inSlots, in.P3)
+			}
 		}
 		switch in := &prog.Insns[pc]; {
 		case in.Op == OpVariable && in.P1 >= 1 && in.P1 <= nParams && in.P2 >= 0 && in.P2 < prog.NReg:
@@ -240,9 +318,74 @@ func compileVMJIT(prog *Program) *vmJIT {
 			native++
 		}
 	}
+	// A table cursor's columns are read from its segment in place when the
+	// engine hands it over in segment mode (jx.segMode), from its rows when not.
+	segCap := segCapableCursors(prog)
+	var segTables map[int]*resolvedTable
+	if segCap != nil {
+		segTables = map[int]*resolvedTable{}
+		for _, in := range prog.Insns {
+			if t, isTbl := in.P4.(*resolvedTable); isTbl && in.Op == OpOpenRead {
+				segTables[in.P1] = t
+			}
+		}
+	}
+	for pc := range vp {
+		if vp[pc].Op == jit.VColumn && vp[pc].A < len(segCap) && segCap[vp[pc].A] {
+			// The kind the table's segments read the column as, which the read
+			// is specialised for (jit.VSegCol.Plain).
+			vp[pc].Imm, vp[pc].T = 1, p.segColKind(segTables[vp[pc].A], vp[pc].B)
+		}
+		// A correlated rowid seek and the rewind that runs it, which native
+		// code makes itself over the table's segments (vmJIT.tabFor).
+		if in := &prog.Insns[pc]; in.Op == OpSeekRowidHint && in.P3 == 1 && in.P1 >= 0 && in.P1 < len(segCap) && segCap[in.P1] &&
+			in.P2 >= 0 && in.P2 < prog.NReg && pc+1 < len(vp) {
+			if rw := &prog.Insns[pc+1]; rw.Op == OpRewind && rw.P1 == in.P1 && rw.P4 == nil {
+				vp[pc] = jit.VInsn{Op: jit.VSeekRowid, A: in.P1, B: in.P2, T: rw.P2}
+				vp[pc+1] = jit.VInsn{Op: jit.VSeekRewind, A: in.P1, T: rw.P2}
+				for _, q := range []int{pc, pc + 1} {
+					if !entry[q] {
+						entry[q] = true
+						native++
+					}
+				}
+			}
+		}
+	}
+	// An integer equality index seek of a table cursor, which native code
+	// makes itself over the table's one segment (vmJIT.idxFor).
+	idxSpecs, idxPCs, idxInner := lowerIdxSeeks(prog, vp, segCap)
+	for _, q := range idxPCs {
+		if !entry[q] {
+			entry[q] = true
+			native++
+		}
+	}
+	n, walkScan := nativeStreamNexts(prog.Insns, vp, streamed, segCap, prog.NReg)
+	if n > 0 {
+		for pc, in := range prog.Insns {
+			if in.Op == OpNext && vp[pc].Op == jit.VNext && !entry[pc] {
+				entry[pc] = true
+			}
+		}
+		native += n
+	}
+	if !vmJITLoopFree && !programLoops(prog) && !jit.VLoops(vp) {
+		return nil
+	}
 	updAt := gatherUpdate(prog, vp)
 	if updAt >= 0 {
 		entry[updAt-1] = true
+		native++
+	}
+	agg := stepGather{at: -1}
+	if updAt < 0 {
+		agg = gatherAggStep(prog, vp)
+	}
+	for _, at := range agg.ats {
+		// Where the VDBE goes on after stepping a row native code could not
+		// gather.
+		entry[at+1] = true
 		native++
 	}
 	if native == 0 {
@@ -278,6 +421,14 @@ func compileVMJIT(prog *Program) *vmJIT {
 		entry[updAt] = false
 		entries--
 	}
+	for _, q := range idxInner {
+		// Nor past a native index seek: the VDBE that ran the seek runs the
+		// rest of it, its OpAutoIndexOrder above all, which the gotos skip.
+		if entry[q] {
+			entry[q] = false
+			entries--
+		}
+	}
 	if entries == 0 {
 		return nil
 	}
@@ -295,12 +446,35 @@ func compileVMJIT(prog *Program) *vmJIT {
 			marked[pc].Op = OpJIT
 		}
 	}
-	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams, params: nParams, entry: entry, marked: marked, native: native, updAt: updAt}
+	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams, params: nParams, entry: entry, marked: marked, native: native, updAt: updAt,
+		segCap: segCap, walkScan: walkScan, inSlots: inSlots, idxSpecs: idxSpecs,
+		aggAt: agg.at, aggSort: agg.sort, aggLo: agg.lo, aggHi: agg.hi, aggKey: agg.key, aggKeyLo: agg.keyLo, aggKeyN: agg.keyN}
+	if segCap != nil {
+		jx.tabs = make([]atomic.Pointer[vmTab], len(segCap))
+	}
+	if idxSpecs != nil {
+		jx.idxs = make([]atomic.Pointer[vmIdx], len(idxSpecs))
+	}
+	jx.safeExit = make([]int32, len(prog.Insns))
+	for pc := range prog.Insns {
+		jx.safeExit[pc] = -1
+		if !cursorFreeOp(&prog.Insns[pc]) {
+			continue
+		}
+		q := pc + 1
+		for q < len(prog.Insns) && !entry[q] && cursorFreeOp(&prog.Insns[q]) {
+			q++
+		}
+		if q < len(prog.Insns) && entry[q] {
+			jx.safeExit[pc] = int32(q)
+		}
+	}
 	if slices.ContainsFunc(vp, func(in jit.VInsn) bool { return in.Op == jit.VOpen || in.Op == jit.VClose }) {
 		jx.reopen = reopen
 	}
+	jx.like = slices.ContainsFunc(vp, func(in jit.VInsn) bool { return in.Op == jit.VLike })
 	jx.text = slices.ContainsFunc(vp, func(in jit.VInsn) bool {
-		return in.Op == jit.VTextCmpJump || in.Op == jit.VTextCmpSet || in.Op == jit.VSubstr
+		return in.Op == jit.VTextCmpJump || in.Op == jit.VTextCmpSet || in.Op == jit.VSubstr || in.Op == jit.VInText
 	})
 	if updAt >= 0 {
 		jx.updSkip = vp[updAt-1].Skip
@@ -402,7 +576,7 @@ func isCursorOpen(op OpCode) bool {
 // vmCursorOp reports whether op reads or moves its cursor (A).
 func vmCursorOp(op jit.VOp) bool {
 	switch op {
-	case jit.VColumn, jit.VRowid, jit.VNext, jit.VRewind, jit.VOpen, jit.VClose:
+	case jit.VColumn, jit.VRowid, jit.VNext, jit.VRewind, jit.VOpen, jit.VClose, jit.VSeekRowid, jit.VSeekIdx, jit.VSeekRewind:
 		return true
 	}
 	return false
@@ -580,6 +754,121 @@ func gatherUpdate(prog *Program, vp []jit.VInsn) int {
 // nothing but the record, which takes the column from elsewhere. Anything
 // else -- a trigger, a constraint's substitution, a function's argument run
 // -- keeps them all.
+// stepGather is gatherAggStep's verdict: at is -1 when it lowered nothing.
+type stepGather struct {
+	at, sort, lo, hi, key, keyLo, keyN int
+	ats                                []int // every step, at the first
+}
+
+// gatherAggStep lowers a hashed GROUP BY's one OpHashAggStep, when it reads
+// nothing but registers (aggPlan.rowFree) or its row is its key's
+// (aggPlan.rowFromKeys), to a VResultRow that gathers them:
+// the key's and every register an aggregate steps from. Its OpMakeRecord is a
+// view of the key's registers (recView), which native code skips; enter keeps
+// the record pointing at them. Native code then goes on past many rows before
+// the VDBE steps them in order (vdbe.stepGathered).
+//
+// Only where no entry can run both it and an OpResultRow: every OpResultRow
+// follows the OpHashAggSort, which native code never runs, and no native jump
+// crosses it, so the entries before it are the ones that gather.
+func gatherAggStep(prog *Program, vp []jit.VInsn) stepGather {
+	none := stepGather{at: -1}
+	var ats []int
+	sort := -1
+	for pc := range prog.Insns {
+		switch in := &prog.Insns[pc]; in.Op {
+		case OpHashAggStep:
+			// A LEFT JOIN's null row steps the same key and registers again.
+			if len(ats) > 0 {
+				if first := &prog.Insns[ats[0]]; in.P1 != first.P1 || in.P2 != first.P2 || in.P4 != first.P4 {
+					return none
+				}
+			}
+			ats = append(ats, pc)
+		case OpHashAggSort:
+			if sort >= 0 {
+				return none
+			}
+			sort = pc
+		case OpResultRow:
+			if sort < 0 {
+				return none
+			}
+		}
+	}
+	if len(ats) == 0 || sort < ats[len(ats)-1] || vp[sort].Op != jit.VExit {
+		return none
+	}
+	for _, at := range ats {
+		if vp[at].Op != jit.VExit {
+			return none
+		}
+	}
+	step := &prog.Insns[ats[0]]
+	plan, _ := step.P4.(*aggPlan)
+	if plan == nil || !plan.rowFree && !plan.rowFromKeys() {
+		return none
+	}
+	var mrAts []int
+	for pc := range sort {
+		if in := &prog.Insns[pc]; in.Op == OpMakeRecord && in.P3 == step.P1 {
+			_, view := in.P4.(recView)
+			if !view || vp[pc].Op != jit.VExit || len(mrAts) > 0 && (in.P1 != prog.Insns[mrAts[0]].P1 || in.P2 != prog.Insns[mrAts[0]].P2) {
+				return none
+			}
+			mrAts = append(mrAts, pc)
+		}
+	}
+	if len(mrAts) == 0 {
+		return none
+	}
+	mr := &prog.Insns[mrAts[0]]
+	if !plan.rowFree && mr.P2 != len(plan.keyCols) {
+		return none
+	}
+	lo, hi := mr.P1, mr.P1+mr.P2
+	for _, it := range aggPlanTemplates(plan) {
+		for which := range it.rowRegs {
+			if it.rowExpr(which) != nil && it.rowRegs[which] <= 0 {
+				return none
+			}
+		}
+		if len(it.obRegs) != len(it.orderBy) {
+			return none
+		}
+		for _, r := range it.obRegs {
+			if r <= 0 {
+				return none
+			}
+		}
+		for _, r := range segJoinStepRegs(it) {
+			lo, hi = min(lo, r), max(hi, r+1)
+		}
+	}
+	if lo < 0 || hi > prog.NReg || hi-lo > 32 {
+		return none
+	}
+	for pc, in := range vp {
+		if in.Op == jit.VExit || in.T == 0 {
+			continue
+		}
+		if pc < sort && in.T > sort || pc > sort && in.T < sort {
+			return none
+		}
+	}
+	for _, pc := range mrAts {
+		vp[pc] = jit.VInsn{Op: jit.VGoto, T: pc + 1}
+	}
+	for _, pc := range ats {
+		vp[pc] = jit.VInsn{Op: jit.VResultRow, A: lo, B: hi - lo}
+	}
+	return stepGather{at: ats[0], ats: ats, sort: sort, lo: lo, hi: hi, key: step.P1, keyLo: mr.P1, keyN: mr.P2}
+}
+
+// aggGathers is whether an entry at pc gathers OpHashAggStep's rows
+// (gatherAggStep).
+func (jx *vmJIT) aggGathers(pc int) bool { return jx.aggAt >= 0 && pc < jx.aggSort }
+
 func gatherSkip(prog *Program, at int) uint64 {
 	mr := &prog.Insns[at-1]
 	borrow, _ := mr.P4.(recBorrow)
@@ -657,16 +946,17 @@ func gatherSkip(prog *Program, at int) uint64 {
 // be advanced -- its OP_Next is advance() over its frozen row list, which the
 // engine replays after the call (enter) -- but not rewound, which rebuilds
 // the list. A cursor nothing opens is neither.
-func scannableCursors(insns []Instruction, nCursors int) (rewind, next []bool) {
-	rewind, next = make([]bool, nCursors), make([]bool, nCursors)
+func scannableCursors(insns []Instruction, nCursors int) (rewind, next, streamed []bool) {
+	rewind, next, streamed = make([]bool, nCursors), make([]bool, nCursors), make([]bool, nCursors)
 	opened := make([]bool, nCursors)
 	for i := range insns {
 		in := &insns[i]
 		var rew, adv bool
 		switch in.Op {
 		case OpOpenRead:
-			rew = in.P5&1 == 0
-			adv = rew
+			// A scan that may stream (P5 1, or 4 when its rows are in its key's
+			// order) is advanced natively only where nativeStreamNexts says.
+			rew, adv = in.P5&1 == 0, in.P5&5 == 0
 		case OpOpenDerived:
 			rew, adv = true, true
 		case OpOpenWrite:
@@ -679,12 +969,68 @@ func scannableCursors(insns []Instruction, nCursors int) (rewind, next []bool) {
 		}
 		if !opened[in.P1] {
 			opened[in.P1], rewind[in.P1], next[in.P1] = true, rew, adv
+			streamed[in.P1] = in.Op == OpOpenRead && in.P5&5 != 0
 			continue
 		}
 		rewind[in.P1] = rewind[in.P1] && rew
 		next[in.P1] = next[in.P1] && adv
+		streamed[in.P1] = false
 	}
-	return rewind, next
+	return rewind, next, streamed
+}
+
+// segCapableCursors is, per cursor number, whether every open of it is an
+// OpOpenRead of a table, so that it may be handed over in segment mode; nil
+// where this build reads no segment in place (jit.VMSegCursor).
+func segCapableCursors(prog *Program) []bool {
+	if !jit.VMSegCursor || prog.NCursors == 0 {
+		return nil
+	}
+	capable, other := make([]bool, prog.NCursors), make([]bool, prog.NCursors)
+	for i := range prog.Insns {
+		in := &prog.Insns[i]
+		if !isCursorOpen(in.Op) || in.P1 < 0 || in.P1 >= prog.NCursors {
+			continue
+		}
+		if _, ok := in.P4.(*resolvedTable); ok && in.Op == OpOpenRead {
+			capable[in.P1] = true
+		} else {
+			other[in.P1] = true
+		}
+	}
+	for c := range capable {
+		capable[c] = capable[c] && !other[c]
+	}
+	return capable
+}
+
+// nativeStreamNexts lowers the OP_Next of a streamed scan whose loop body, from
+// its top to the Next, native code runs whole: there the scan is walked a
+// batch at a time (seekSnap, walk). In a loop that exits to the VDBE along
+// the way, an entry at the Next would only pay for a batch and the call --
+// except for a scan handed over in segment mode (segCap), which costs no copy:
+// its Next is lowered too, and walks the segment in place.
+func nativeStreamNexts(insns []Instruction, vp []jit.VInsn, streamed, segCap []bool, nReg int) (n int, walk []bool) {
+	for pc := range insns {
+		in := &insns[pc]
+		if in.Op != OpNext || in.P1 < 0 || in.P1 >= len(streamed) || !streamed[in.P1] || in.P2 < 0 || in.P2 >= pc {
+			continue
+		}
+		whole := !slices.ContainsFunc(vp[in.P2:pc], func(v jit.VInsn) bool { return v.Op == jit.VExit })
+		if !whole && (in.P1 >= len(segCap) || !segCap[in.P1]) {
+			continue
+		}
+		if vp[pc] = lowerVM(in, nReg); vp[pc].Op != jit.VExit {
+			n++
+			if whole {
+				if walk == nil {
+					walk = make([]bool, len(streamed))
+				}
+				walk[in.P1] = true
+			}
+		}
+	}
+	return n, walk
 }
 
 // fillColumns is the columns of each cursor the VColumn instructions on the
@@ -975,6 +1321,11 @@ func lowerVM(in *Instruction, nReg int) jit.VInsn {
 			in.P3+1+len(plan.lits)+len(plan.params) <= nReg {
 			return jit.VInsn{Op: jit.VInSet, A: in.P1, B: in.P3 + 1, C: in.P2, Imm: int64(in.P3)}
 		}
+		// A list of TEXTs matched as bytes, against the plan's own copy of
+		// their addresses.
+		if plan, _ := in.P4.(*inListPlan); plan != nil && jit.VMTextOrder && len(plan.texts) > 0 && ok(in.P1, in.P2) {
+			return jit.VInsn{Op: jit.VInText, A: in.P1, B: len(plan.texts), C: in.P2, Imm: int64(uintptr(unsafe.Pointer(&plan.texts[0])))}
+		}
 	case OpColumn:
 		// Native code reads a cursor's column from its row list; whether the
 		// cursor is one it may (scannableCursors) is checked by the caller, and
@@ -1017,7 +1368,16 @@ var (
 	// vmJITReopens counts the entries in which native code reopened a
 	// derived cursor (VOpen).
 	vmJITReopens atomic.Int64
-	vmJITCountSyncs                         bool
+	// vmJITSegWalks counts the entries that walked a cursor in segment mode
+	// (segSync), and vmJITTabSeeks those that seeked one natively (seekSync).
+	vmJITSegWalks, vmJITTabSeeks atomic.Int64
+	// vmJITIdxSeeks counts the index seeks native code made (VSeekIdx) and
+	// vmJITIdxSyncs the times the VDBE took such a cursor back (syncIdxSeek).
+	vmJITIdxSeeks, vmJITIdxSyncs atomic.Int64
+	// vmJITAggGathered counts the hashed GROUP BY steps native code gathered
+	// and the VDBE replayed (gatherAggStep).
+	vmJITAggGathered atomic.Int64
+	vmJITCountSyncs  bool
 
 	// vmJITCursorEnters counts entries into native code that reads or walks a
 	// cursor, while vmJITCountCursorEnters is set.
@@ -1042,6 +1402,21 @@ func jitCursorOK(cur *vdbeCursor) bool {
 	return cur != nil && cur.materialized && cur.sub == nil && cur.vt == nil && cur.segSrc == nil && cur.segCur == nil &&
 		cur.rowRaw == nil && !cur.rowidNull &&
 		cur.streamErrPending == nil && len(cur.rows) >= len(cur.rowids)
+}
+
+// rewindsInVDBE reports whether in, where an entry starts, is an OP_Rewind
+// native code would only exit at: VRewind rewinds a cursor walking its own
+// row list (jitCursorOK, with the Rewind flag enter sets) or one it reopens,
+// and no other.
+func (jx *vmJIT) rewindsInVDBE(m *vdbe, in *Instruction) bool {
+	if in.Op != OpRewind || in.P1 < 0 || in.P1 >= len(m.cursors) {
+		return false
+	}
+	if in.P1 < len(jx.reopen) && jx.reopen[in.P1].ds != nil {
+		return false
+	}
+	cur := m.cursors[in.P1]
+	return cur == nil || !jitCursorOK(cur) || cur.seekReseek || cur.rowStore != nil || cur.refillEach
 }
 
 // jitCursorMask is the columns native code may read from cur's row list:
@@ -1106,7 +1481,8 @@ func (jx *vmJIT) copies(m *vdbe, pc int) int {
 		if cc.cursor < len(jx.reopen) && jx.reopen[cc.cursor].ds != nil {
 			continue // handed over whole when it can be (handReopen)
 		}
-		if cur := m.cursors[cc.cursor]; !jitCursorOK(cur) && (cur == nil || !seekWalkable(cur) || cur.segSrc.point) {
+		if cur := m.cursors[cc.cursor]; !jitCursorOK(cur) && (cur == nil || !jx.seekWalkable(cc.cursor, cur) || cur.segSrc.point) &&
+			(cur == nil || !jx.segModeOK(cc.cursor, cur) && jx.tabFor(cc.cursor, cur) == nil) {
 			n++
 		}
 	}
@@ -1119,6 +1495,18 @@ func (jx *vmJIT) copies(m *vdbe, pc int) int {
 type jitSnap struct {
 	row []Value
 	hdr [1][]Value
+	// segLive is whether this entry handed the cursor over in segment mode
+	// (vmJIT.segMode), at row segEntry of its segment.
+	segLive  bool
+	segEntry int
+	// rowCur and the rest name the segment row row copies while it is kept
+	// past the call, and rowMask its columns copied so far.
+	rowCur  *vdbeCursor
+	rowSeg  *segment
+	rowIdx  int
+	rowPos  int
+	rowGen  uint64
+	rowMask uint64
 
 	// seek is how many rows seekSnap copied out of a seek, 0 when none; rows,
 	// rids and slab hold them. They are kept across entries while the cursor
@@ -1127,6 +1515,13 @@ type jitSnap struct {
 	live  bool
 	entry int
 	seek  int
+	// refs is where each row is in its segment, width a row's length in the
+	// slab; win a scan's batch size, and more whether the scan has rows past
+	// it.
+	refs  []segAheadRow
+	width int
+	win   int
+	more  bool
 	rows  [][]Value
 	rids  []uint64
 	slab  []Value
@@ -1136,54 +1531,87 @@ type jitSnap struct {
 	base  int
 }
 
+// fillFor is the columns of cursor c an entry reads (vmJIT.fill).
+func fillFor(fill []curCols, c int) []int {
+	for _, cc := range fill {
+		if cc.cursor == c {
+			return cc.cols
+		}
+	}
+	return nil
+}
+
 // seekGens numbers seeks across every cursor, so a copy is never taken for
 // another seek's, even by a cursor recycled at the same address.
 var seekGens atomic.Uint64
 
-// jitSeekRows is the most rows of a seek seekSnap copies out.
-const jitSeekRows = 256
+// jitSeekRows is the most rows of a seek seekSnap copies out, and of a
+// scan's batch; a scan's first batch is jitScanRows, each next one twice the
+// last, so a scan that stops early decodes little it does not read.
+const (
+	jitSeekRows = 256
+	jitScanRows = 8
+)
 
-// seekWalkable is whether seekSnap can hand cur's rows over for native code
-// to walk.
-func seekWalkable(cur *vdbeCursor) bool {
+// seekWalkable is whether seekSnap can hand cursor c's rows over for native
+// code to walk.
+func (jx *vmJIT) seekWalkable(c int, cur *vdbeCursor) bool {
 	src := cur.segSrc
 	if src == nil || cur.segCur == nil {
 		return false
 	}
-	return src.point || src.list && len(src.listRows)-src.listPos < jitSeekRows
+	if !src.point && !src.list {
+		return c < len(jx.walkScan) && jx.walkScan[c]
+	}
+	return !src.list || len(src.listRows)-src.listPos < jitSeekRows
 }
 
 // seekSnap hands native code the rows a rowid or index seek on a segment table
-// has left (segPointSeek, segListSeek): the current one and the rest, each
-// with the columns the program reads, in a list it may walk. false when cur is
-// not such a seek or has too many rows to copy.
-func (jx *vmJIT) seekSnap(c int, cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) bool {
+// has left (segPointSeek, segListSeek), or a batch of a scan's: the current
+// one and those after it, each with the columns the program reads, in a list
+// it may walk. false when cur has no such rows or too many to copy.
+//
+// The rows' columns are decoded as entries read them: need, this entry's, for
+// every row handed over, joining those an earlier entry decoded.
+func (jx *vmJIT) seekSnap(c int, cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap, need []int) bool {
 	src := cur.segSrc
-	if src == nil || cur.segCur == nil || !src.point && !src.list {
+	if !jx.seekWalkable(c, cur) {
 		return false
 	}
 	at := 0
-	if src.list {
+	switch {
+	case src.list:
 		at = src.listPos - 1
+	case !src.point:
+		at = cur.pos
 	}
 	if sn.seek == 0 || sn.owner != cur || sn.gen != cur.seekGen || at < sn.base || at >= sn.base+sn.seek {
 		if !jx.seekCopy(c, cur, sn, at) {
 			return false
 		}
 	}
+	sn.decode(cur, need)
 	if vmJITCountSyncs {
 		vmJITSeekSnaps.Add(1)
 	}
 	sn.live, sn.entry = true, at-sn.base
+	adv := int64(1)
+	if sn.more {
+		adv = 2
+	}
+	tab := jc.Tab
+	defer func() { jc.Tab = tab }()
 	*jc = jit.VCursor{Rows: unsafe.Pointer(unsafe.SliceData(sn.rows)), Rowids: unsafe.Pointer(unsafe.SliceData(sn.rids)),
-		N: int64(sn.seek), Pos: int64(sn.entry), Last: -1, Ok: 1, Adv: 1, Mask: sn.mask}
+		N: int64(sn.seek), Pos: int64(sn.entry), Last: -1, Ok: 1, Adv: adv, Mask: sn.mask}
 	return true
 }
 
 // seekCopy copies the rows of cur's seek from list position at (the current
-// row) to the end into sn.
+// row) to the end into sn; or, for a scan, the current row and a batch of
+// those after it, which the source keeps for its next to serve (lookahead).
 func (jx *vmJIT) seekCopy(c int, cur *vdbeCursor, sn *jitSnap, at int) bool {
 	src := cur.segSrc
+	scan := !src.point && !src.list
 	var cols []int
 	for _, cc := range jx.seekCols {
 		if cc.cursor == c {
@@ -1194,39 +1622,368 @@ func (jx *vmJIT) seekCopy(c int, cur *vdbeCursor, sn *jitSnap, at int) bool {
 		return false
 	}
 	n := 1
-	if src.list {
+	var ahead []segAheadRow
+	switch {
+	case src.list:
 		n = len(src.listRows) - at
+	case scan:
+		if sn.owner != cur || sn.gen != cur.seekGen {
+			sn.win = jitScanRows
+		} else {
+			sn.win = min(2*sn.win, jitSeekRows)
+		}
+		ahead = src.lookahead(sn.win - 1)
+		n = 1 + min(len(ahead), sn.win-1)
+		sn.more = len(ahead) > n-1 || !src.drained
 	}
 	if n > jitSeekRows {
 		return false
 	}
 	w := 0
-	var mask uint64
 	for _, col := range cols {
 		if col >= 64 {
 			return false
 		}
 		w = max(w, col+1)
-		mask |= 1 << uint(col)
 	}
 	slab := slices.Grow(sn.slab[:0], n*w)[:n*w]
 	rows, rids := sn.rows[:0], sn.rids[:0]
-	s, row, rid, width := cur.segCur, cur.segRow, cur.rowid, cur.segWidth
-	for k := range n {
-		if k > 0 {
-			s, row = src.listSegs[at+k], src.listRows[at+k]
-			rid = s.Rowid(row)
-			width = min(s.Width(row), len(cur.segSrcCols))
+	refs := append(sn.refs[:0], segAheadRow{cur.segCur, cur.segRow, cur.rowid})
+	for k := 1; k < n; k++ {
+		if scan {
+			refs = append(refs, ahead[k-1])
+		} else {
+			s, row := src.listSegs[at+k], src.listRows[at+k]
+			refs = append(refs, segAheadRow{s, row, s.Rowid(row)})
 		}
-		r := slab[k*w : (k+1)*w : (k+1)*w]
-		for _, col := range cols {
-			r[col] = segColumnValue(cur.segSrcCols, s, row, width, rid, col)
-		}
-		rows, rids = append(rows, r), append(rids, rid)
 	}
-	sn.seek, sn.rows, sn.rids, sn.slab, sn.mask = n, rows, rids, slab, mask
+	for k := range n {
+		rows, rids = append(rows, slab[k*w:(k+1)*w:(k+1)*w]), append(rids, refs[k].rowid)
+	}
+	sn.refs, sn.width = refs, w
+	sn.seek, sn.rows, sn.rids, sn.slab, sn.mask = n, rows, rids, slab, 0
 	sn.owner, sn.gen, sn.base = cur, cur.seekGen, at
 	return true
+}
+
+// decode decodes the columns of cols not decoded yet for every row sn hands
+// over, column by column over each run of consecutive rows of one segment.
+func (sn *jitSnap) decode(cur *vdbeCursor, cols []int) {
+	var want []int
+	for _, col := range cols {
+		if col >= 0 && col < sn.width && sn.mask&(1<<uint(col)) == 0 {
+			want = append(want, col)
+		}
+	}
+	if len(want) == 0 {
+		return
+	}
+	n, w, refs := sn.seek, sn.width, sn.refs
+	for k0 := 0; k0 < n; {
+		s, row := refs[k0].s, refs[k0].row
+		k1 := k0 + 1
+		for k1 < n && refs[k1].s == s && refs[k1].row == row+k1-k0 {
+			k1++
+		}
+		for _, col := range want {
+			segColumnRun(cur.segSrcCols, s, col, row, sn.rids[k0:k1], sn.slab[k0*w+col:], w)
+		}
+		k0 = k1
+	}
+	for _, col := range want {
+		sn.mask |= 1 << uint(col)
+	}
+}
+
+// inSets publishes the sets the program's VInSubs probe: each one ready while
+// the subquery's cached rows are still those its set was built from.
+func (jx *vmJIT) inSets(m *vdbe) *jit.VInSubSet {
+	if len(m.jinsub) < len(jx.inSlots) {
+		m.jinsub = make([]jit.VInSubSet, len(jx.inSlots))
+	}
+	for k, slot := range jx.inSlots {
+		v := &m.jinsub[k]
+		var s *inHashSet
+		if slot < len(m.subCache) {
+			s = m.subCache[slot].inSet
+		}
+		if s == nil || !s.intsOK || !s.current(&m.subCache[slot]) {
+			v.Ready = 0
+			continue
+		}
+		keys := unsafe.Pointer(unsafe.SliceData(s.ints))
+		if v.Keys != keys {
+			v.Keys = keys
+		}
+		v.N, v.HasNull, v.Empty, v.Ready = int64(len(s.ints)), flag(s.hasNull), flag(s.empty), 1
+	}
+	return &m.jinsub[0]
+}
+
+// flag is b as native code's flag word.
+func flag(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// resetVCursor is *jc = jit.VCursor{Last: -1}, storing a pointer field only
+// where it holds one: a whole-struct store is a bulk write barrier on every
+// entry while the collector runs.
+func resetVCursor(jc *jit.VCursor) {
+	if jc.Rows != nil {
+		jc.Rows = nil
+	}
+	if jc.Rowids != nil {
+		jc.Rowids = nil
+	}
+	if jc.Seg != nil {
+		jc.Seg = nil
+	}
+	if jc.Tab != nil {
+		jc.Tab = nil
+	}
+	if jc.Sel != nil {
+		jc.Sel = nil
+	}
+	if jc.Idx != nil {
+		jc.Idx = nil
+	}
+	jc.N, jc.Pos, jc.Last, jc.Ok, jc.Dirty, jc.Rewind, jc.Adv, jc.Mask, jc.Reopen, jc.State = 0, 0, -1, 0, 0, 0, 0, 0, 0, 0
+	jc.Key, jc.Served = 0, 0
+}
+
+// segModeOK reports whether cursor c can be handed over in segment mode: its
+// columns read in place (segCap), positioned on a segment row whose rows next,
+// if any, run on in the same segment -- a point seek's one row, or a scan with
+// no rows pulled ahead and no window of a pre-filter's selection.
+func (jx *vmJIT) segModeOK(c int, cur *vdbeCursor) bool {
+	if c >= len(jx.segCap) || !jx.segCap[c] {
+		return false
+	}
+	src, s := cur.segSrc, cur.segCur
+	switch {
+	case src == nil || s == nil:
+		return false
+	case src.list:
+		// A list in one segment, on its current entry: walked through its rows
+		// (jit.VCursor.Sel).
+		k := src.listPos - 1
+		return s == src.listOne && k >= 0 && k < len(src.listRows) && cur.segRow == src.listRows[k]
+	case src.point:
+		return s == src.pointSeg && cur.segRow == src.pointRow
+	}
+	return src.selPrep == nil && src.aheadPos >= len(src.ahead) && src.si < len(src.segs) && src.segs[src.si] == s && cur.segRow == src.ri-1
+}
+
+// segMode hands cursor c over in segment mode: native code reads its current
+// segment's column blocks in place (jit.VCursor.Seg) from its row, and walks
+// on through the segment's rows the scan yields next. Off the segment's last
+// row it exits for the VDBE's OP_Next when a segment follows.
+func (jx *vmJIT) segMode(c int, cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) bool {
+	if !jx.segModeOK(c, cur) {
+		return false
+	}
+	src, s := cur.segSrc, cur.segCur
+	if src.list {
+		v := s.vmSegFor(cur.segSrcCols)
+		k := src.listPos - 1
+		jc.N, jc.Pos, jc.Last, jc.Ok, jc.Dirty, jc.Rewind, jc.Adv, jc.Mask = int64(len(src.listRows)), int64(k), -1, 1, 0, 0, 1, v.mask
+		jc.Reopen, jc.State = 0, 0
+		if seg := unsafe.Pointer(&v.seg); jc.Seg != seg {
+			jc.Seg = seg
+		}
+		if rids := v.seg.Rowids; jc.Rowids != rids {
+			jc.Rowids = rids
+		}
+		if sel := unsafe.Pointer(unsafe.SliceData(src.listRows)); jc.Sel != sel {
+			jc.Sel = sel
+		}
+		if jc.Rows != nil {
+			jc.Rows = nil
+		}
+		if jx.idxSpecs != nil && jx.idxSpecs[c] != nil && k >= 0 {
+			// A seek native code may make again: the rows it walks on this
+			// list first are counted from here (jit.VSeekIdx, State 5).
+			jc.State, jc.Last, jc.Served = 5, int64(k), -int64(k+1)
+		}
+		sn.segLive, sn.segEntry = true, k
+		return true
+	}
+	end, adv := cur.segRow+1, int64(1)
+	if !src.point {
+		end = src.end
+		if src.si+1 < len(src.segs) {
+			adv = 2
+		}
+	}
+	v := s.vmSegFor(cur.segSrcCols)
+	jc.N, jc.Pos, jc.Last, jc.Ok, jc.Dirty, jc.Rewind, jc.Adv, jc.Mask = int64(end), int64(cur.segRow), -1, 1, 0, 0, adv, v.mask
+	jc.Reopen, jc.State = 0, 0
+	if seg := unsafe.Pointer(&v.seg); jc.Seg != seg {
+		jc.Seg = seg
+	}
+	if rids := v.seg.Rowids; jc.Rowids != rids {
+		jc.Rowids = rids
+	}
+	if jc.Rows != nil {
+		jc.Rows = nil
+	}
+	if jx.idxSpecs != nil && jx.idxSpecs[c] != nil {
+		// As for a list above.
+		jc.State, jc.Last, jc.Served = 5, int64(cur.segRow), -int64(cur.segRow+1)
+	}
+	sn.segLive, sn.segEntry = true, cur.segRow
+	return true
+}
+
+// vmTab is a table's segments as VSeekRowid searches them (jit.VTab), kept
+// on the cursor for the segments it was built from.
+type vmTab struct {
+	tab   jit.VTab
+	segs  []jit.VTabSeg
+	at    []*segment // the segment of each of segs
+	plans []segColPlan
+	// What the answer was worked out from, which it stands for while
+	// unchanged: the pager's segments, and a session's store of the table with
+	// its write counts. none is a table native code may not seek.
+	src    *segSource
+	root   uint32
+	live   *rowStore
+	writes uint64
+	swaps  uint32
+	none   bool
+}
+
+// current reports whether t is still the answer for the table at root over
+// src.
+func (t *vmTab) current(src *segSource, root uint32) bool {
+	return t != nil && t.src == src && t.root == root && (t.live == nil || t.live.writes == t.writes && t.live.swaps == t.swaps)
+}
+
+// tabFor returns cursor c's table as VSeekRowid searches it, or nil where the
+// segments are not the whole answer for every rowid: rows in the delta log or
+// written by the session, a narrower segment, a generated column. The answer
+// is kept on the cursor, and on the program for the cursors it opens next,
+// while what it was worked out from is unchanged.
+func (jx *vmJIT) tabFor(c int, cur *vdbeCursor) *vmTab {
+	if c >= len(jx.segCap) || !jx.segCap[c] || cur.tbl == nil || cur.pager == nil || cur.pager.segs == nil || cur.rowStore != nil {
+		return nil
+	}
+	src, root := cur.pager.segs, cur.tbl.root
+	t := cur.vmTab
+	if !t.current(src, root) {
+		if t = jx.tabs[c].Load(); !t.current(src, root) {
+			t = buildVMTab(cur, src)
+			jx.tabs[c].Store(t)
+		}
+		cur.vmTab = t
+	}
+	if t.none {
+		return nil
+	}
+	return t
+}
+
+// buildVMTab works out tabFor's answer.
+func buildVMTab(cur *vdbeCursor, src *segSource) *vmTab {
+	root := cur.tbl.root
+	t := &vmTab{src: src, root: root, none: true}
+	if cur.tbl.withoutRowid || cursorHasNoBtree(cur) || cur.hasGeneratedCols() || cur.rowStore != nil {
+		return t
+	}
+	var segs []*segment
+	if src.isLive(root) {
+		rows, have, err := src.liveRows(root)
+		if err != nil || !have || rows == nil {
+			return t
+		}
+		t.live, t.writes, t.swaps = rows, rows.writes, rows.swaps
+		var ok bool
+		if segs, ok = src.liveBaseSegments(root); !ok {
+			return t
+		}
+	} else if src.cleanFor(root) {
+		segs = src.byRoot[root]
+	}
+	t.plans = segColPlansFor(cur.tbl)
+	for _, s := range segs {
+		if s == nil || len(s.cols) != len(cur.tbl.cols) {
+			return t
+		}
+		if s.nRows == 0 {
+			continue
+		}
+		v := s.vmSegFor(t.plans)
+		t.segs = append(t.segs, jit.VTabSeg{Lo: int64(s.Rowid(0)), Hi: int64(s.Rowid(s.nRows - 1)), Rows: int64(s.nRows),
+			Seg: unsafe.Pointer(&v.seg), Mask: v.mask})
+		t.at = append(t.at, s)
+	}
+	if len(t.segs) == 0 {
+		return t
+	}
+	t.tab = jit.VTab{Segs: unsafe.Pointer(&t.segs[0]), N: int64(len(t.segs))}
+	t.none = false
+	return t
+}
+
+// seekSync brings a cursor native code seeked (VSeekRowid) up to date with
+// its last seek, as the VDBE's OP_SeekRowidHint and OP_Rewind of that key
+// leave it -- a point source on the row, or none -- and the advance off the
+// row when native code made it.
+func (t *vmTab) seekSync(cur *vdbeCursor, jc *jit.VCursor) {
+	cur.seekConfigured, cur.seekNone, cur.seekKey, cur.seekReseek = true, false, jc.Key, true
+	cur.segFilter, cur.sorted = nil, nil
+	cur.materialized, cur.rows, cur.lazyNorm, cur.rowids, cur.matched = false, nil, false, nil, nil
+	cur.seekGen = seekGens.Add(1)
+	cur.streamErrPending, cur.rowidNull, cur.rowRaw = nil, false, nil
+	cur.pos = -1
+	cur.segSrc, cur.segCur = nil, nil
+	segRowsServed.Add(jc.Served)
+	if jc.State == 3 {
+		return // no row has the key
+	}
+	k := slices.IndexFunc(t.segs, func(ts jit.VTabSeg) bool { return ts.Seg == jc.Seg })
+	if k < 0 {
+		return
+	}
+	s, row := t.at[k], int(jc.Last)
+	cur.pointSrc = segRowSource{point: true, pointSeg: s, pointRow: row, pointDone: true, cols: t.plans}
+	cur.segSrc, cur.segSrcCols = &cur.pointSrc, t.plans
+	cur.pos, cur.rowid, cur.segCur, cur.segRow = 0, s.Rowid(row), s, row
+	cur.segWidth = min(s.Width(row), len(t.plans))
+	if jc.Pos >= jc.N {
+		cur.segSrc, cur.segCur = nil, nil // off its one row
+	}
+}
+
+// segSync brings a cursor segMode handed over up to date with the rows native
+// code moved it over, as advance() would have left it.
+func segSync(cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) {
+	sn.segLive = false
+	if jc.Dirty == 0 {
+		return
+	}
+	if moved := int(jc.Last) - sn.segEntry; jc.Last >= 0 && moved > 0 {
+		cur.pos += moved
+		switch src := cur.segSrc; {
+		case src.list:
+			// Last is a position in the list, which names the row.
+			cur.segRow, src.listPos = src.listRows[jc.Last], int(jc.Last)+1
+		default:
+			cur.segRow = int(jc.Last)
+			if !src.point {
+				src.ri = cur.segRow + 1
+			}
+		}
+		cur.rowid = cur.segCur.Rowid(cur.segRow)
+		cur.segWidth = min(cur.segCur.Width(cur.segRow), len(cur.segSrcCols))
+		segRowsServed.Add(int64(moved))
+	}
+	if jc.Pos >= jc.N && jc.Adv == 1 {
+		cur.segSrc, cur.segCur = nil, nil
+	}
 }
 
 // seekSync brings a cursor seekSnap handed over up to date with the native
@@ -1239,10 +1996,18 @@ func seekSync(cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) {
 	if moved := int(jc.Last) - sn.entry; jc.Last >= 0 && moved > 0 {
 		src, i := cur.segSrc, sn.base+int(jc.Last)
 		cur.pos += moved
-		segRowsServed.Add(int64(moved))
-		cur.segCur, cur.segRow, cur.rowid = src.listSegs[i], src.listRows[i], sn.rids[jc.Last]
+		r := sn.refs[jc.Last]
+		cur.segCur, cur.segRow, cur.rowid = r.s, r.row, r.rowid
+		if src.list {
+			segRowsServed.Add(int64(moved))
+			src.listPos = i + 1
+		} else {
+			// Batch row k is the source's ahead[k-1] (lookahead): the cursor on
+			// row k has taken k of them.
+			segRowsServed.Add(int64(int(jc.Last) - src.aheadPos))
+			src.aheadPos = int(jc.Last)
+		}
 		cur.segWidth = min(cur.segCur.Width(cur.segRow), len(cur.segSrcCols))
-		src.listPos = i + 1
 	}
 	if int(jc.Pos) >= sn.seek {
 		cur.segSrc, cur.segCur = nil, nil
@@ -1263,7 +2028,7 @@ func jitReadColumn(cur *vdbeCursor, i int, dst *Value) bool {
 			}
 		}
 	}
-	if i < 0 || i >= len(cur.rowVals) || cur.rowVals[i].Typ == valueGenErr {
+	if i < 0 || i >= len(cur.rowVals) || cur.rowVals[i].Typ >= valueGenErr {
 		return false
 	}
 	*dst = cur.rowVals[i]
@@ -1285,7 +2050,12 @@ func jitReadColumn(cur *vdbeCursor, i int, dst *Value) bool {
 func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 	regs := m.regs
 	if cap(regs) < jx.nReg || jx.nReg == 0 {
+		m.flushJIT()
 		return pc, -1
+	}
+	resume := m.jDefer && m.jDeferJX == jx && m.jDeferPC == pc
+	if !resume && m.jDefer {
+		m.flushJIT()
 	}
 	args := &m.jargs
 	if jx.params > 0 {
@@ -1303,12 +2073,22 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 			args.UTF16 = 1
 		}
 	}
+	if jx.like {
+		args.LikeCS = 0
+		if m.likeCaseSensitive() {
+			args.LikeCS = 1
+		}
+	}
+	if len(jx.inSlots) > 0 {
+		args.InSets = jx.inSets(m)
+	}
 	args.RowBuf, args.RowCap, args.RowUsed, args.RowsBuf, args.RowsCap, args.Yield = nil, -1, 0, nil, 0, 0
+	gather := jx.updAt >= 0 || jx.aggGathers(pc)
 	switch {
 	case jx.rows == nil || !jx.rows[pc] || m.firstRow:
 		// No OpResultRow native code runs; or the VDBE's stops the run with an
 		// empty row.
-	case m.yieldReuse && len(*rows) == 0:
+	case !gather && m.yieldReuse && len(*rows) == 0:
 		if c := cap(m.yieldRow); c > 0 {
 			args.RowBuf, args.RowCap = (*int64)(unsafe.Pointer(unsafe.SliceData(m.yieldRow[:c]))), int64(c)
 		} else {
@@ -1318,7 +2098,7 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 		// An UPDATE's gathered rows (gatherUpdate) go to a buffer of their
 		// own, which the VDBE stores out of and reuses (vdbe.gatherChunk).
 		buf := m.recChunk
-		if jx.updAt >= 0 {
+		if gather {
 			buf = m.gatherChunk
 		}
 		if c := len(buf); c > 0 {
@@ -1326,7 +2106,8 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 		} else {
 			args.RowCap = 0
 		}
-		if !m.yield {
+		// A step's rows are the VDBE's own, never handed over one by one.
+		if !m.yield || jx.aggGathers(pc) {
 			if cap(*rows) == len(*rows) {
 				// Grown as append would grow it, so a subquery that returns one
 				// row allocates for one; native code gathers rows only as far as
@@ -1346,113 +2127,30 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 			m.jcur = make([]jit.VCursor, jx.nCurs)
 			m.jsnap = make([]jitSnap, jx.nCurs)
 		}
+		if !resume {
+			m.jLive = m.jLive[:0]
+		}
 		for _, c := range curs {
-			jc := &m.jcur[c]
-			*jc = jit.VCursor{Last: -1}
-			if c >= len(m.cursors) || m.cursors[c] == nil {
-				continue
+			if resume && slices.Contains(m.jLive, c) {
+				continue // as native code left it
 			}
-			cur := m.cursors[c]
-			if jx.reopen != nil && jx.handReopen(cur, c, jc) {
-				continue
-			}
-			if jitCursorOK(cur) {
-				jc.Rows = unsafe.Pointer(unsafe.SliceData(cur.rows))
-				// The rowid list is the cursor's rowid only while its position
-				// says so: a seek that sets the rowid apart from the list (the
-				// UPDATE ... FROM target's, a WITHOUT ROWID key's) leaves pos
-				// where it was. Out of the list VRowid exits anyway, and a
-				// native advance keeps the two together.
-				if p := cur.pos; len(cur.rowids) > 0 && (p < 0 || p >= len(cur.rowids) || cur.rowids[p] == cur.rowid) {
-					jc.Rowids = unsafe.Pointer(unsafe.SliceData(cur.rowids))
-				}
-				jc.N, jc.Pos, jc.Ok, jc.Adv = int64(len(cur.rowids)), int64(cur.pos), 1, 1
-				jc.Mask = jitCursorMask(cur)
-				if !cur.seekReseek && cur.rowStore == nil && !cur.refillEach {
-					// A re-seeking cursor rebuilds its rows at every rewind, and
-					// so do a write-path one and an inner co-routine
-					// (derivedSource.rerun).
-					jc.Rewind = 1
-				}
-				continue
-			}
-			if jx.seekSnap(c, cur, jc, &m.jsnap[c]) {
-				continue
-			}
-			// Not a cursor native code can walk: hand over a copy of its current
-			// row, with the columns this entry reads, and let it read only
-			// those. Nothing native moves it (Adv and Rewind are zero), so the
-			// copy stays the cursor's row for as long as the code runs.
-			for _, cc := range jx.fill[pc] {
-				if cc.cursor != c {
-					continue
-				}
-				sn := &m.jsnap[c]
-				n := 0
-				for _, col := range cc.cols {
-					n = max(n, col+1)
-				}
-				if cap(sn.row) < n {
-					sn.row = make([]Value, n)
-				}
-				sn.row = sn.row[:n]
-				var mask uint64
-				for _, col := range cc.cols {
-					if jitReadColumn(cur, col, &sn.row[col]) {
-						mask |= 1 << uint(col)
-					}
-				}
-				if mask != 0 {
-					sn.hdr[0] = sn.row
-					jc.Rows, jc.N, jc.Pos, jc.Ok, jc.Mask = unsafe.Pointer(&sn.hdr[0]), 1, 0, 1, mask
-				}
-			}
+			jx.handCursor(m, pc, c)
+			m.jLive = append(m.jLive, c)
 		}
 		args.Cur = &m.jcur[0]
 	}
+	m.jDefer = false
 	jx.code.Call2(args)
 	if jx.nCurs > 0 {
-		for _, c := range curs {
-			jc := &m.jcur[c]
-			if jc.Reopen != 0 {
-				if jc.Dirty != 0 {
-					syncReopen(m.cursors[c], jc, m.params)
-				}
-				if vmJITCountSyncs && jc.State != 0 {
-					vmJITReopens.Add(1)
-				}
-				continue
+		// Stopped at an instruction that touches no cursor, which the VDBE
+		// runs before it enters again at the next: native code keeps them.
+		if exit := int(args.PC); args.Yield == 0 && exit >= 0 && exit < len(jx.safeExit) && jx.safeExit[exit] >= 0 {
+			m.jDefer, m.jDeferPC, m.jDeferJX = true, int(jx.safeExit[exit]), jx
+		} else {
+			for _, c := range m.jLive {
+				jx.syncCursor(m, c, exit)
 			}
-			if sn := &m.jsnap[c]; sn.live {
-				seekSync(m.cursors[c], jc, sn)
-				continue
-			}
-			if sn := &m.jsnap[c]; len(sn.row) != 0 {
-				clear(sn.row) // the copy holds no row past the call
-				sn.hdr[0] = nil
-			}
-			if jc.Dirty != 0 {
-				// The native advance moved only the position; the cursor's
-				// current row, rowid and the rest follow it here, as advance()
-				// would have left them. Past the end advance leaves the last row
-				// current, and so does this (Last).
-				cur := m.cursors[c]
-				if vmJITCountSyncs {
-					vmJITCursorSyncs.Add(1)
-					if cur.rowStore != nil {
-						vmJITWriteCursorSyncs.Add(1)
-					}
-				}
-				cur.pos = int(jc.Pos)
-				if jc.Last >= 0 {
-					cur.rowid = cur.rowids[jc.Last]
-					cur.rowVals = cur.rows[jc.Last]
-					if cur.lazyNorm {
-						cur.rowVals = cur.normalizeStored(cur.rowVals)
-					}
-					cur.rowRaw = nil
-				}
-			}
+			m.jLive = m.jLive[:0]
 		}
 	}
 	if args.Yield > 0 {
@@ -1461,7 +2159,7 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 			// spare capacity, their Values the chunk's first RowUsed.
 			k := int(args.Yield)
 			*rows = (*rows)[:len(*rows)+k]
-			if jx.updAt < 0 {
+			if !gather {
 				m.recChunk = m.recChunk[args.RowUsed:]
 			}
 			m.jitRows += k
@@ -1470,4 +2168,232 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 		return int(args.PC), int(args.Yield) - 1
 	}
 	return int(args.PC), -1
+}
+
+// handCursor hands cursor c over to native code entered at pc (m.jcur[c]).
+func (jx *vmJIT) handCursor(m *vdbe, pc, c int) {
+	jc := &m.jcur[c]
+	resetVCursor(jc)
+	var cur *vdbeCursor
+	if c < len(m.cursors) {
+		cur = m.cursors[c]
+	}
+	if jx.idxSpecs != nil && jx.idxSpecs[c] != nil && jx.idxSpecs[c].open >= 0 && (cur == nil || cur.closed || cur.tbl == nil) {
+		// A seek cursor native code opens itself (VOpen), not open now: it
+		// seeks the table its open names, as last worked out for an open
+		// cursor while that still stands.
+		if t := jx.openedTab(m, c); t != nil {
+			jc.Tab = unsafe.Pointer(&t.tab)
+			if x := jx.idxFor(c, t); x != nil {
+				jc.Idx = unsafe.Pointer(&x.vidx[0])
+			}
+		}
+		jc.Reopen = jit.VReopenSeek
+		return
+	}
+	if cur == nil {
+		return
+	}
+	if t := jx.tabFor(c, cur); t != nil {
+		jc.Tab = unsafe.Pointer(&t.tab)
+		if jx.idxSpecs != nil && jx.idxSpecs[c] != nil {
+			if x := jx.idxFor(c, t); x != nil {
+				jc.Idx = unsafe.Pointer(&x.vidx[0])
+			}
+		}
+	}
+	if jx.idxSpecs != nil && jx.idxSpecs[c] != nil && jx.idxSpecs[c].open >= 0 {
+		// A seek cursor native code may open and close (VOpen, VClose).
+		defer func() { jc.Reopen = jit.VReopenSeek }()
+	}
+	if jx.reopen != nil && jx.handReopen(cur, c, jc) {
+		return
+	}
+	if jitCursorOK(cur) {
+		jc.Rows = unsafe.Pointer(unsafe.SliceData(cur.rows))
+		// The rowid list is the cursor's rowid only while its position
+		// says so: a seek that sets the rowid apart from the list (the
+		// UPDATE ... FROM target's, a WITHOUT ROWID key's) leaves pos
+		// where it was. Out of the list VRowid exits anyway, and a
+		// native advance keeps the two together.
+		if p := cur.pos; len(cur.rowids) > 0 && (p < 0 || p >= len(cur.rowids) || cur.rowids[p] == cur.rowid) {
+			jc.Rowids = unsafe.Pointer(unsafe.SliceData(cur.rowids))
+		}
+		jc.N, jc.Pos, jc.Ok, jc.Adv = int64(len(cur.rowids)), int64(cur.pos), 1, 1
+		jc.Mask = jitCursorMask(cur)
+		if !cur.seekReseek && cur.rowStore == nil && !cur.refillEach {
+			// A re-seeking cursor rebuilds its rows at every rewind, and
+			// so do a write-path one and an inner co-routine
+			// (derivedSource.rerun).
+			jc.Rewind = 1
+		}
+		return
+	}
+	if jx.segMode(c, cur, jc, &m.jsnap[c]) {
+		return
+	}
+	if jx.seekSnap(c, cur, jc, &m.jsnap[c], fillFor(jx.fill[pc], c)) {
+		return
+	}
+	// Not a cursor native code can walk: hand over a copy of its current
+	// row, with the columns this entry reads, and let it read only
+	// those. Nothing native moves it (Adv and Rewind are zero), so the
+	// copy stays the cursor's row for as long as the code runs.
+	for _, cc := range jx.fill[pc] {
+		if cc.cursor != c {
+			continue
+		}
+		sn := &m.jsnap[c]
+		// A segment row's copy is kept while the cursor stays on it, so a
+		// column is copied once however many entries read it.
+		var mask uint64
+		if cur.segCur != nil && sn.rowCur == cur && sn.rowSeg == cur.segCur && sn.rowIdx == cur.segRow &&
+			sn.rowPos == cur.pos && sn.rowGen == cur.seekGen {
+			mask = sn.rowMask
+		}
+		n := len(sn.row)
+		if mask == 0 {
+			n = 0
+		}
+		for _, col := range cc.cols {
+			n = max(n, col+1)
+		}
+		if cap(sn.row) < n {
+			sn.row = append(make([]Value, 0, n), sn.row...)
+		}
+		sn.row = sn.row[:n]
+		for _, col := range cc.cols {
+			if mask&(1<<uint(col)) == 0 && jitReadColumn(cur, col, &sn.row[col]) {
+				mask |= 1 << uint(col)
+			}
+		}
+		sn.rowCur = nil
+		if cur.segCur != nil {
+			sn.rowCur, sn.rowSeg, sn.rowIdx, sn.rowPos, sn.rowGen, sn.rowMask = cur, cur.segCur, cur.segRow, cur.pos, cur.seekGen, mask
+		}
+		if mask != 0 {
+			sn.hdr[0] = sn.row
+			jc.Rows, jc.N, jc.Pos, jc.Ok, jc.Mask = unsafe.Pointer(&sn.hdr[0]), 1, 0, 1, mask
+		}
+	}
+}
+
+// syncCursor brings cursor c up to date with what native code, which
+// stopped at exit, did to it (m.jcur[c]).
+func (jx *vmJIT) syncCursor(m *vdbe, c, exit int) {
+	jc := &m.jcur[c]
+	if jc.Reopen >= jit.VReopenSeek {
+		if jx.syncSeekOpen(m, c, jc) {
+			return
+		}
+	} else if jc.Reopen != 0 {
+		if jc.Dirty != 0 {
+			syncReopen(m.cursors[c], jc, m.params)
+		}
+		if vmJITCountSyncs && jc.State != 0 {
+			vmJITReopens.Add(1)
+		}
+		return
+	}
+	if jc.Idx != nil && jc.State >= 2 && jc.State <= 4 {
+		// Native code seeked the cursor through its index: the VDBE's
+		// seek of the last key is run here, and walks on to where
+		// native code left it -- unless what it stopped at closes or
+		// reopens the cursor, which drops that state anyway.
+		m.jsnap[c].segLive, m.jsnap[c].live = false, false
+		// Served is the rows the seeks before the last served; the
+		// last served up to the cursor's row, which the VDBE's walk
+		// counts when it takes the cursor back.
+		last, served := int64(0), jc.Served
+		if jc.State != 3 {
+			last = jc.Last + 1
+		}
+		if !jx.idxSpecs[c].listed {
+			last, served = 0, 0
+		}
+		if vmJITCountSyncs {
+			vmJITIdxSeeks.Add(max(jc.Served, 0) + 1)
+		}
+		if at := exit; at >= 0 && at < jx.n {
+			if in := unsafe.Slice(jx.insns, jx.n)[at]; in.P1 == c && (in.Op == OpClose || isCursorOpen(in.Op)) {
+				segRowsServed.Add(served + last)
+				return
+			}
+		}
+		segRowsServed.Add(served)
+		if vmJITCountSyncs {
+			vmJITIdxSyncs.Add(1)
+		}
+		if err := m.syncIdxSeek(jx, c, jc, jx.idxSpecs[c]); err != nil && m.jitErr == nil {
+			m.jitErr = err
+		}
+		return
+	}
+	if jc.Tab != nil && jc.State >= 2 && jc.State <= 4 {
+		// Native code seeked the cursor: the VDBE's seek of the last key
+		// is run here, and leaves the cursor as native code did.
+		m.jsnap[c].segLive, m.jsnap[c].live = false, false
+		cur := m.cursors[c]
+		cur.vmTab.seekSync(cur, jc)
+		if vmJITCountSyncs {
+			vmJITTabSeeks.Add(1)
+		}
+		return
+	}
+	if sn := &m.jsnap[c]; sn.segLive {
+		segSync(m.cursors[c], jc, sn)
+		if vmJITCountSyncs && jc.Dirty != 0 {
+			vmJITSegWalks.Add(1)
+		}
+		return
+	}
+	if sn := &m.jsnap[c]; sn.live {
+		seekSync(m.cursors[c], jc, sn)
+		return
+	}
+	if sn := &m.jsnap[c]; len(sn.row) != 0 && sn.rowCur == nil {
+		clear(sn.row) // the copy holds no row past the call
+		sn.hdr[0] = nil
+	}
+	if jc.Dirty != 0 {
+		// The native advance moved only the position; the cursor's
+		// current row, rowid and the rest follow it here, as advance()
+		// would have left them. Past the end advance leaves the last row
+		// current, and so does this (Last).
+		cur := m.cursors[c]
+		if vmJITCountSyncs {
+			vmJITCursorSyncs.Add(1)
+			if cur.rowStore != nil {
+				vmJITWriteCursorSyncs.Add(1)
+			}
+		}
+		cur.pos = int(jc.Pos)
+		if jc.Last >= 0 {
+			cur.rowid = cur.rowids[jc.Last]
+			cur.rowVals = cur.rows[jc.Last]
+			if cur.lazyNorm {
+				cur.rowVals = cur.normalizeStored(cur.rowVals)
+			}
+			cur.rowRaw = nil
+		}
+	}
+}
+
+// cursorFreeOp reports whether the VDBE's run of in reads or moves no cursor:
+// it reads and writes registers only, so native code may keep its cursors
+// across it.
+func cursorFreeOp(in *Instruction) bool {
+	switch in.Op {
+	case OpMakeRecord, OpConcat, OpSCopy, OpCopy, OpInteger, OpInt64, OpReal, OpString8, OpNull, OpClearSubtype, OpLike, OpGlob, OpSorterInsert,
+		OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight, OpBitNot, OpNegative:
+		return true
+	case OpFunction:
+		switch name, _ := in.P4.(string); name {
+		case "date", "time", "datetime", "julianday", "unixepoch", "strftime", "printf", "format",
+			"upper", "lower", "length", "abs", "round", "substr", "substring", "replace", "trim", "ltrim", "rtrim",
+			"instr", "hex", "typeof", "coalesce", "ifnull", "nullif", "concat", "concat_ws":
+			return true
+		}
+	}
+	return false
 }

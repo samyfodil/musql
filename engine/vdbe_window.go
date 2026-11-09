@@ -882,51 +882,20 @@ func (m *vdbe) partitionAndOrder(plan *windowPlan, lvl windowCall, batch [][]Val
 	// needs none.
 	partColls := m.windowKeyCollations(plan, spec.PartitionBy, batch, vals)
 	var parts [][]int
-	var partKeys [][]Value
-	// byKey finds a partition by a string equal exactly where
-	// keysEqualCollated is (windowPartitionKey), so a FROM clause of many
-	// partitions is not compared against each one in turn. One key it cannot
-	// spell sends every row back to the comparison.
 	byKey := map[string]int{}
-	pks := make([][]Value, len(order))
-	strKeys := make([]string, len(order))
-	for n, i := range order {
+	var buf []byte
+	for _, i := range order {
 		pk, err := keyOf(i, spec.PartitionBy, lvl.partCols)
 		if err != nil {
 			return nil, err
 		}
-		pks[n] = pk
-		if byKey != nil {
-			key, ok := windowPartitionKey(pk, partColls, m.encoding())
-			if !ok {
-				byKey = nil
-			}
-			strKeys[n] = key
-		}
-	}
-	for n, i := range order {
-		pk := pks[n]
-		found := -1
-		if byKey != nil {
-			if j, seen := byKey[strKeys[n]]; seen {
-				found = j
-			} else {
-				byKey[strKeys[n]] = len(parts)
-			}
-		} else {
-			for j, existing := range partKeys {
-				if keysEqualCollated(existing, pk, partColls, m.encoding()) {
-					found = j
-					break
-				}
-			}
-		}
-		if found < 0 {
-			partKeys = append(partKeys, pk)
-			parts = append(parts, []int{i})
+		buf = appendCollatedKeyBytes(buf[:0], pk, partColls, m.encoding())
+		if j, seen := byKey[string(buf)]; seen {
+			parts[j] = append(parts[j], i)
 			continue
 		}
-		parts[found] = append(parts[found], i)
+		byKey[string(buf)] = len(parts)
+		parts = append(parts, []int{i})
 	}
 
 	if len(spec.OrderBy) > 0 {
@@ -1932,7 +1901,7 @@ func compileScanWindow(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 	opBase := c.allocN(plan.nOps)
 	recReg := c.allocRec()
 
-	jplan := joinPushdownPlan(srcs, scopes, stmt.Where)
+	jplan := joinPushdownPlan(c, srcs, scopes, stmt.Where)
 	if len(jplan.buckets) == 1 {
 		jplan.buckets[0] = consumedFirst(c, srcs, jplan.buckets[0])
 	}

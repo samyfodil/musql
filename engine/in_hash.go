@@ -2,6 +2,7 @@ package engine
 
 import (
 	"math"
+	"slices"
 	"strings"
 )
 
@@ -37,6 +38,10 @@ type inHashSet struct {
 	empty   bool
 	from    *[]Value // rows[0] the set was built from, with n, to detect a re-run
 	n       int
+	// ints is every key ascending when all are INTEGERs and the probe's
+	// affinity keeps an INTEGER one (intsOK): native code's set (VInSub).
+	ints   []int64
+	intsOK bool
 }
 
 // inSetFor is the membership set for an uncorrelated single-column IN over
@@ -71,8 +76,32 @@ func (m *vdbe) inSetFor(plan *inSubPlan, slot int, rows [][]Value) *inHashSet {
 		}
 		s.keys[k] = struct{}{}
 	}
+	s.intsOK = s.aff != affText
+	for k := range s.keys {
+		if k.class != 'i' {
+			s.intsOK = false
+			break
+		}
+	}
+	if s.intsOK {
+		s.ints = make([]int64, 0, len(s.keys))
+		for k := range s.keys {
+			s.ints = append(s.ints, k.i)
+		}
+		slices.Sort(s.ints)
+	}
 	e.inSet = s
 	return s
+}
+
+// current reports whether s is still the set over e's rows, which an
+// uncorrelated IN reads again from e.
+func (s *inHashSet) current(e *subCacheEntry) bool {
+	var first *[]Value
+	if len(e.rows) > 0 {
+		first = &e.rows[0]
+	}
+	return e.done && e.inSet == s && s.from == first && s.n == len(e.rows)
 }
 
 // membership is inSubMembership's answer for x.

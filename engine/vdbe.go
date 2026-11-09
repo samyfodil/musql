@@ -8,6 +8,7 @@ package engine
 
 import (
 	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
 	"math"
@@ -25,9 +26,26 @@ import (
 // used per run; registers, cursors, and sorters are not shared across
 // executions.
 type vdbe struct {
+	// jitErr is an error native code's return found taking a cursor back
+	// (syncIdxSeek), which the run returns.
+	jitErr error
+
+	// jLive is the cursors native code holds, handed over. jDefer is set
+	// when it stopped at an instruction that touches no cursor and resumes
+	// at jDeferPC of jDeferJX: taking them back waits for that entry, which
+	// keeps them as they are (vmJIT.enter), or for anything else, which takes
+	// them back first (flushJIT).
+	jLive    []int
+	jDefer   bool
+	jDeferPC int
+	jDeferJX *vmJIT
+
 	regs []Value
 	jx   *vmJIT        // native code for the program run() is given, when it has some
 	jcur []jit.VCursor // native code's view of the cursors it names, filled at each entry
+	// jinsub is native code's view of the program's IN subquery sets
+	// (vmJIT.inSets), filled at each entry.
+	jinsub []jit.VInSubSet
 	// jargs is the argument block of every entry into native code: kept on the
 	// machine and only its live fields set per entry, because zeroing a fresh
 	// one -- most of it the segment JIT's -- was a measurable share of a short
@@ -104,6 +122,10 @@ type vdbe struct {
 	unpackBuf   []Value        // OpSorterData's expanded row (recUnpack)
 	segJoin     *segJoinGroups // OpSegJoinGroups' groups, nil when it declined
 	aggRowidBuf []Value
+	// anchorPad is an anchor row widened to the plan's width (aggPlan.rowWidth).
+	anchorPad []Value
+	// aggValsBuf is aggResult's finalized aggregate values, reused per call.
+	aggValsBuf []Value
 	// aggNullRow is the row a rowFree step (aggPlan.rowFree) hands on in place
 	// of a gathered one: all NULL, at least as wide as any plan's, never
 	// written. The anchor copies it and nothing reads that.
@@ -130,6 +152,9 @@ type vdbe struct {
 	// reused across every item of every group. It carries a register file, this
 	// machine's pager and its bound parameters and nothing else.
 	aggVM *vdbe
+	// aggSubCaches is each item program's run-once cache (aggItemVM), kept for
+	// the machine's one run of its program (the pool's scrub drops it).
+	aggSubCaches map[*Program][]subCacheEntry
 
 	// aggKeyBuf is hashAggStep's reusable group-key encoding buffer -- see its
 	// doc comment for why handing back the same bytes every row is safe.
@@ -145,6 +170,10 @@ type vdbe struct {
 	// are stored as their own copy.
 	gatherChunk []Value
 	keptChunk   []Value
+	// aggRows is the hashed GROUP BY steps native code gathered
+	// (gatherAggStep), and aggSaved the registers stepGathered borrows.
+	aggRows  [][]Value
+	aggSaved []Value
 	// runRids and runRows are the run of rows applyGathered has written in
 	// place and storeInPlace has yet to store.
 	runRids []uint64
@@ -701,47 +730,49 @@ func autoIndexOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) 
 	for i := range perm {
 		perm[i] = i
 	}
-	// Every key value an integer -- an INTEGER column's, and the rowid --
-	// compares as one, under any collating sequence: the keys are copied out
-	// flat once and compared as int64s, not fetched as Values per comparison.
+	// An integer -- an INTEGER column's, and the rowid -- compares as one under
+	// any collating sequence: the leading key columns every row holds as an
+	// INTEGER are copied out flat once and compared as int64s, and only rows
+	// they leave tied fetch the rest as Values.
 	nk := len(key.cols)
-	flat := make([]int64, 0, len(perm)*nk)
-	for i := range perm {
-		for k := range key.cols {
-			v := at(i, k)
-			if v.Typ != Int {
-				flat = nil
-				break
-			}
-			flat = append(flat, v.I)
-		}
-		if flat == nil {
-			break
-		}
+	lead := 0
+	for lead < nk && !slices.ContainsFunc(perm, func(i int) bool { return at(i, lead).Typ != Int }) {
+		lead++
 	}
-	// Stable by the last comparison, on the rows' original positions, which
-	// makes the order total: an unstable sort then gives exactly the stable
-	// one's permutation, in O(n log n) where sort.SliceStable's in-place
-	// merges took most of a 100,000-row scan's time.
-	if flat != nil {
+	if lead == 0 {
+		autoIndexSortValues(perm, key, at, enc)
+	} else {
+		flat := make([]int64, 0, len(perm)*lead)
+		for i := range perm {
+			for k := range lead {
+				flat = append(flat, at(i, k).I)
+			}
+		}
+		desc := func(k, c int) int {
+			if k < len(key.desc) && key.desc[k] {
+				return -c // a DESC column, as autoIndexSortValues explains
+			}
+			return c
+		}
+		// Stable by the last comparison, on the rows' original positions,
+		// which makes the order total: an unstable sort then gives exactly
+		// the stable one's permutation, in O(n log n) where
+		// sort.SliceStable's in-place merges took most of a 100,000-row
+		// scan's time.
 		slices.SortFunc(perm, func(a, b int) int {
-			ka, kb := flat[a*nk:a*nk+nk], flat[b*nk:b*nk+nk]
+			ka, kb := flat[a*lead:a*lead+lead], flat[b*lead:b*lead+lead]
 			for k := range ka {
 				if ka[k] != kb[k] {
-					c := 1
-					if ka[k] < kb[k] {
-						c = -1
-					}
-					if k < len(key.desc) && key.desc[k] {
-						return -c // a DESC column, as below
-					}
-					return c
+					return desc(k, cmp.Compare(ka[k], kb[k]))
+				}
+			}
+			for k := lead; k < nk; k++ {
+				if c := compareValuesCollatedEnc(at(a, k), at(b, k), key.colls[k], enc); c != 0 {
+					return desc(k, c)
 				}
 			}
 			return a - b
 		})
-	} else {
-		autoIndexSortValues(perm, key, at, enc)
 	}
 	rows := make([][]Value, len(perm))
 	rowids := make([]uint64, len(perm))
@@ -1089,7 +1120,7 @@ func (prog *Program) execOuterTrigCap(pager *ReadOnlyPager, outer *evalCtx, para
 // resumed rather than run once.
 func (prog *Program) newMachine(pager *ReadOnlyPager, outer *evalCtx, params []Value, from *vdbe) *vdbe {
 	m := prog.getMachine()
-	m.jx = prog.jitCode()
+	m.jx = prog.jitCodeOn(pager)
 	m.sorters = make([]*vdbeSorter, prog.NSorters)
 	m.distinctSets = make([]*vdbeDistinctSet, prog.NDistinct)
 	m.subCache = reuseSubCache(m.subCache, prog.NSubCache)
@@ -1171,7 +1202,7 @@ func (prog *Program) execWithParentRun(parent *vdbe, pager *ReadOnlyPager, first
 	// most of what such a query allocated. See vdbe_machine_pool.go for what
 	// may be reused.
 	m := prog.getMachine()
-	m.jx = prog.jitCode()
+	m.jx = prog.jitCodeOn(pager)
 	m.sorters = make([]*vdbeSorter, prog.NSorters)
 	m.distinctSets = make([]*vdbeDistinctSet, prog.NDistinct)
 	m.subCache = reuseSubCache(m.subCache, prog.NSubCache)
@@ -1242,7 +1273,7 @@ func (prog *Program) outerCtxUnread() bool {
 			OpColumn, OpRowid, OpOuterColumn, OpOuterRowid,
 			OpInteger, OpVariable, OpNull, OpString8, OpReal, OpSCopy, OpCopy,
 			OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull,
-			OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpSeekRowidSetHint, OpAutoIndexOrder, OpResultRow:
+			OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpSeekRowidSetHint, OpAutoIndexOrder, OpSortedSeek, OpResultRow:
 		default:
 			unread = false
 		}
@@ -1284,13 +1315,67 @@ func (m *vdbe) outerFrame(levels int) *vdbe {
 func cursorColumnMasks(insns []Instruction, ncursors int) []columnMask {
 	for i := range insns {
 		if readsWholeCursorRows(insns[i].Op) {
-			if p, ok := insns[i].P4.(*aggPlan); ok && insns[i].Op == OpAggStep && p.rowFree {
-				continue // gathers no row (aggPlan.rowFree)
+			if p, ok := insns[i].P4.(*aggPlan); ok && (insns[i].Op == OpAggStep || insns[i].Op == OpHashAggStep) && (p.rowFree || p.rowCols != nil) {
+				continue // gathers no row, or rowCols (marked below)
+			}
+			if insns[i].Op == OpAggStep && insns[i].P3 != 0 {
+				continue // reads a sorter record, not the cursors
 			}
 			return nil
 		}
 	}
 	masks := make([]columnMask, ncursors)
+	// What reorders or searches a cursor's rows reads their key columns
+	// without an OpColumn.
+	keyCols := func(cur int, k *autoIndexKey) bool {
+		if k == nil || k.multiOr != nil || cur < 0 || cur >= ncursors {
+			return k == nil
+		}
+		for _, c := range k.cols {
+			if c == xnExpr {
+				return false
+			}
+			if c >= 0 {
+				masks[cur] |= 1 << uint(min(c, 63))
+			}
+		}
+		return true
+	}
+	for i := range insns {
+		in := &insns[i]
+		switch in.Op {
+		case OpAutoIndexOrder, OpRightJoinSweepOrder:
+			k, _ := in.P4.(*autoIndexKey)
+			if !keyCols(in.P1, k) {
+				return nil
+			}
+		case OpSortedSeek:
+			if h, ok := in.P4.(*sortedSeekHint); ok && in.P1 >= 0 && in.P1 < ncursors {
+				masks[in.P1] |= 1 << uint(min(h.col, 63))
+			}
+		case OpSeekIndexHint:
+			// A seek's rows are sorted into its index's order, by its key's
+			// columns, when they are built (autoIndexOrderCursor).
+			if h, ok := in.P4.(*indexSeekHint); ok && h.order != nil && !keyCols(in.P1, h.order) {
+				return nil
+			}
+		case OpMultiOrTag, OpMultiOrSort:
+			return nil
+		}
+	}
+	for i := range insns {
+		p, ok := insns[i].P4.(*aggPlan)
+		if !ok || insns[i].Op != OpHashAggStep || p.rowCols == nil {
+			continue
+		}
+		for _, c := range p.rowCols {
+			for _, g := range p.gathers {
+				if c >= g.offset && c < g.offset+g.n && g.cursor >= 0 && g.cursor < ncursors {
+					masks[g.cursor] |= 1 << uint(min(c-g.offset, 63))
+				}
+			}
+		}
+	}
 	for i := range insns {
 		in := &insns[i]
 		if in.Op != OpColumn || in.P1 < 0 || in.P1 >= ncursors {
@@ -1368,6 +1453,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 		code = jx.marked
 	}
 	jitSkip := -1
+	m.jDefer, m.jLive = false, m.jLive[:0]
 	if jitScore {
 		native := 0
 		if jx != nil {
@@ -1385,17 +1471,33 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 		case OpJIT:
 			if pc == jitSkip {
 				jitSkip = -1
+				if m.flushJIT() {
+					return nil, m.takeJITErr()
+				}
 				op = &insns[pc]
 				goto dispatch
 			}
+			// Native code that stopped at an instruction touching no cursor
+			// resumes here holding them, whatever would decline the entry.
+			resume := m.jDefer && m.jDeferJX == jx && m.jDeferPC == pc
+			if !resume && m.jDefer && m.flushJIT() {
+				return nil, m.takeJITErr()
+			}
 			// An entry whose first cursor native code could not use would only
 			// pay for the call and exit at that instruction.
-			if g := jx.gate[pc]; g >= 0 && (int(g) >= len(m.cursors) || m.cursors[g] == nil) {
+			if g := jx.gate[pc]; !resume && g >= 0 && (int(g) >= len(m.cursors) || m.cursors[g] == nil) {
+				op = &insns[pc]
+				goto dispatch
+			}
+			// Nor one starting at an OP_Rewind native code cannot make: only a
+			// cursor walking its own row list rewinds natively (VRewind), and
+			// a seek's or a reopened one rewinds in the VDBE either way.
+			if !resume && jx.rewindsInVDBE(m, &insns[pc]) {
 				op = &insns[pc]
 				goto dispatch
 			}
 			// Nor one that would copy a row out for too little native work.
-			if jx.light != nil && jx.light[pc] >= 0 && jx.copies(m, pc) > int(jx.light[pc]) {
+			if !resume && jx.light != nil && jx.light[pc] >= 0 && jx.copies(m, pc) > int(jx.light[pc]) {
 				op = &insns[pc]
 				goto dispatch
 			}
@@ -1405,6 +1507,36 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			if jitScore {
 				jitScoreEnter()
+			}
+			if jx.aggGathers(pc) {
+				// Room for a batch of steps, gathered into a list of their own
+				// and stepped before the VDBE runs anything (gatherAggStep).
+				const batch = 256
+				m.aggRows = slices.Grow(m.aggRows[:0], batch)
+				if n := batch * (jx.aggHi - jx.aggLo); len(m.gatherChunk) < n {
+					m.gatherChunk = make([]Value, n)
+				}
+				m.recRegs[jx.aggKey] = m.regs[jx.aggKeyLo : jx.aggKeyLo+jx.aggKeyN : jx.aggKeyLo+jx.aggKeyN]
+				next, n := jx.enter(m, pc, &m.aggRows)
+				pc = next
+				if err := m.jitErr; err != nil {
+					m.jitErr = nil
+					return nil, err
+				}
+				gathered := m.aggRows
+				if n >= 0 {
+					gathered = append(gathered, m.gatherChunk[:n:n])
+				}
+				err := m.stepGathered(jx, &insns[jx.aggAt], gathered)
+				clear(gathered)
+				m.aggRows = gathered[:0]
+				if err != nil {
+					return nil, err
+				}
+				if n < 0 {
+					jitSkip = pc
+				}
+				continue
 			}
 			before := len(rows)
 			if jx.updAt >= 0 {
@@ -1418,6 +1550,10 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			next, n := jx.enter(m, pc, &rows)
 			pc = next
+			if err := m.jitErr; err != nil {
+				m.jitErr = nil
+				return nil, err
+			}
 			if m.countHeld {
 				for _, r := range rows[before:] {
 					m.heldBytes += recursiveRowFootprint(r)
@@ -1960,26 +2096,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			m.regs[op.P3] = bitwiseBinaryValue(bitwiseOpName[op.Op], m.regs[op.P2], m.regs[op.P1])
 
 		case OpOpenRead:
-			rp, perr := m.dbPager(op.P3)
-			if perr != nil {
-				return nil, perr
+			if err := m.execOpenRead(op, insns); err != nil {
+				return nil, err
 			}
-			cur := m.openCursorInto(op.P1, rp, op.P4.(*resolvedTable))
-			cur.streamable = op.P5&1 != 0
-			if cur.streamable && !cur.hasGeneratedCols() {
-				// Only a streaming scan masks: a materialized cursor retains
-				// every row, so a masked row would outlive its record, and it
-				// decodes each row once anyway.
-				//
-				// A generated-column table is excluded for correctness: a
-				// generated column is computed, not read. normalize() runs
-				// computeGeneratedInto over the decoded row, so under a mask
-				// "c AS (a+b)" would be computed from undecoded NULLs and
-				// stored. expandStoredRow also inserts a slot per VIRTUAL
-				// column, so record positions stop matching the mask.
-				cur.colMask = m.cursorMask(insns, op.P1).widenIfTotal(len(cur.tbl.cols))
-			}
-			m.cursors[op.P1] = cur
 
 		case OpSeekRowidHint:
 			if cursorHasNoBtree(m.cursors[op.P1]) {
@@ -2019,86 +2138,31 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			cur.seekSet, cur.seekSetConfigured = slices.Compact(keys), true
 
 		case OpSeekIndexHint:
-			// Coerce the key with the exact affinity the WHERE comparison
-			// applies (P4.aff, pre-computed by detectIndexSeekKey), then
-			// configure the cursor to seek the secondary index b-tree for
-			// candidate rowids on its next OpRewind rather than full-scanning.
-			// The keyed WHERE conjunct is re-evaluated on every fetched row, so
-			// this only prunes the scan; see OpSeekIndexHint (vdbe_op.go) and
-			// vdbeCursor.idxSeek* (vdbe_cursor.go).
-			if cursorHasNoBtree(m.cursors[op.P1]) {
-				break
+			if err := m.execSeekIndexHint(op); err != nil {
+				return nil, err
 			}
-			cur := m.cursors[op.P1]
-			switch h := op.P4.(type) {
-			case *indexSeekHint:
-				probe := applyAffinityToValue(m.regs[op.P2], h.aff)
-				// An IN list's values, each coerced as the one key is: a NULL
-				// equals nothing, so it is no probe.
-				var set []Value
-				textKey := probe.Typ == Text
-				if h.in > 0 {
-					set = make([]Value, 0, h.in)
-					textKey = false
-					for _, v := range m.regs[op.P2 : op.P2+h.in] {
-						if v = applyAffinityToValue(v, h.aff); v.Typ != Null {
-							set = append(set, v)
-							textKey = textKey || v.Typ == Text
-						}
-					}
-				}
-				if h.slot == 0 {
-					cur.idxSeekConfigured, cur.idxSeekMore, cur.idxSeekNext, cur.idxSeekSet = false, cur.idxSeekMore[:0], 0, nil
-				}
-				// A slot out of step is dropped, as is the key of "x IS NULL" (no
-				// posting list holds NULL) and a write's TEXT key in a UTF-16
-				// database; the keys left each bound the rows, and with none the
-				// scan decides.
-				if h.slot == cur.idxSeekNext {
-					cur.idxSeekNext++
-					switch {
-					case h.is && probe.Typ == Null:
-					case cur.rowStore != nil && textKey && isUTF16(m.encoding()):
-					case !cur.idxSeekConfigured:
-						cur.idxSeekConfigured = true
-						cur.idxSeekProbe, cur.idxSeekColl, cur.idxSeekCol, cur.idxSeekSet = probe, h.coll, h.leadingCol, set
-					default:
-						cur.idxSeekMore = append(cur.idxSeekMore, idxSeekKey{col: h.leadingCol, probe: probe, coll: h.coll, set: set})
-					}
-				}
-			default:
-				return nil, fmt.Errorf("vdbe: OpSeekIndexHint without a plan")
-			}
-			cur.seekReseek = op.P3 == 1 // correlated join seek: re-seek per rewind
 
 		case OpAutoIndexOrder:
+			if err := m.execAutoIndexOrder(op); err != nil {
+				return nil, err
+			}
+
+		case OpSortedSeek:
 			cur := m.cursors[op.P1]
-			if cur != nil && cur.rowStore != nil {
-				// A WRITE loop's cursor: the order is kept on it and applied at
-				// every materialization (applyWriteOrder), never skipped -- a
-				// per-row SET subquery was lowered on the promise of it.
-				cur.writeOrder = op.P4.(*autoIndexKey)
-				cur.applyWriteOrder()
+			if cur == nil || cur.rowStore != nil || cur.streamable || cur.seekReseek || cur.refillEach || cur.sub != nil || cur.vt != nil ||
+				cursorHasNoBtree(cur) && cur.fill == nil && !cur.materialized {
+				break // a cursor whose rows are not one list built once
+			}
+			if cur.segSortedSeek(op.P4.(*sortedSeekHint), m.regs[op.P2]) {
 				break
 			}
-			if cur == nil || cursorHasNoBtree(cur) || cur.streamable || cur.seekReseek {
-				// Nothing to permute (no b-tree, or a lazy pull), or a correlated
-				// seek that re-materializes a different row set per rewind.
-				//
-				// A non-correlated seek is permuted like any cursor: it
-				// materializes once and its rows are a superset of the answer, so
-				// sorting that superset and letting the loop filter keeps the same
-				// relative order. Declining leaves the pre-port scan order, never a
-				// different row set -- see OpAutoIndexOrder.
-				break
+			if !cur.materialized {
+				cur.params = m.params
+				if rerr := cur.rewind(); rerr != nil {
+					return nil, rerr
+				}
 			}
-			// The cursor materializes on its first rewind; force that now so the
-			// permutation below is the one every later rewind re-iterates.
-			cur.params = m.params // see vdbeCursor.params
-			if rerr := cur.rewind(); rerr != nil {
-				return nil, rerr
-			}
-			autoIndexOrderCursor(cur, op.P4.(*autoIndexKey), m.encoding())
+			cur.sortedSeek(op.P4.(*sortedSeekHint), m.regs[op.P2], m.encoding())
 
 		case OpMultiOrTag:
 			cur := m.cursors[op.P1]
@@ -2424,10 +2488,37 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 					}
 					m.cursors[op.P1] = m.openCursorInto(op.P1, rp, tbl)
 				}
+				// Nothing reads its rows: one row answers, not the whole table.
+				if empty, ok := m.cursors[op.P1].tableEmpty(); ok {
+					if empty {
+						pc = op.P2
+						continue
+					}
+					break
+				}
 			}
 			cur := m.cursors[op.P1]
+			if cur != nil && cur.sorted != nil && cur.sorted.ok {
+				// A seek narrowed the rows; the full list answers.
+				if len(cur.sorted.orig) == 0 {
+					pc = op.P2
+					continue
+				}
+				break
+			}
 			if cur == nil || (cur.tbl == nil && cur.fill == nil) || cur.rowStore != nil || cur.sub != nil || cur.vt != nil || cur.streamable || cur.seekConfigured ||
 				cur.seekSetConfigured || cur.idxSeekConfigured || cur.seekReseek || cur.segFilter != nil {
+				break
+			}
+			// One row answers here too: the seeks configured after this
+			// rewind again, so a rewind now would copy the whole table only
+			// to be thrown away. Asked afresh, as a rewind would be.
+			cur.emptyKnown = false
+			if empty, ok := cur.tableEmpty(); ok {
+				if empty {
+					pc = op.P2
+					continue
+				}
 				break
 			}
 			cur.params = m.params
@@ -2537,6 +2628,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpRightJoinSweepOrder:
 			cur := m.cursors[op.P1]
+			cur.unsort()
 			if !cur.materialized {
 				if rerr := cur.rewind(); rerr != nil {
 					return nil, rerr
@@ -2549,6 +2641,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpRightJoinSweepRewind:
 			cur := m.cursors[op.P1]
+			cur.unsort()
 			if !cur.materialized {
 				// The main pass never reached this cursor's OpRewind (e.g. an
 				// empty preceding table) -- materialize it now so the sweep
@@ -3025,7 +3118,8 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 
 		case OpHashAggSort:
-			if !m.hashAggSort() {
+			desc, _ := op.P4.([]bool)
+			if !m.hashAggSort(desc, op.P3 == 1) {
 				pc = op.P2
 				continue
 			}
@@ -3102,6 +3196,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				return nil, serr
 			}
 			xs := m.regs[op.P1 : op.P1+len(plan.affs)]
+			if plan.shared && inSubConverts(xs[0], plan) {
+				return nil, fmt.Errorf("%w: an IN converts a group's value that C SQLite shares with the rest of the aggregate's result", errVDBEUnsupported)
+			}
 			if set := m.inSetFor(plan, op.P3, rows); set != nil {
 				m.regs[op.P2] = set.membership(xs[0], plan.not)
 			} else {
@@ -3697,4 +3794,186 @@ func reuseSubCache(s []subCacheEntry, n int) []subCacheEntry {
 	s = s[:n]
 	clear(s)
 	return s
+}
+
+// execOpenRead is OpOpenRead, for the VDBE and for a cursor native code
+// opened (vmJIT.syncIdxSeek).
+func (m *vdbe) execOpenRead(op *Instruction, insns []Instruction) error {
+	rp, perr := m.dbPager(op.P3)
+	if perr != nil {
+		return perr
+	}
+	cur := m.openCursorInto(op.P1, rp, op.P4.(*resolvedTable))
+	cur.streamable = op.P5&1 != 0
+	cur.streamIfOrdered = op.P5&4 != 0
+	if cur.streamable && !cur.hasGeneratedCols() {
+		// Only a streaming scan masks: a materialized cursor retains
+		// every row, so a masked row would outlive its record, and it
+		// decodes each row once anyway.
+		//
+		// A generated-column table is excluded for correctness: a
+		// generated column is computed, not read. normalize() runs
+		// computeGeneratedInto over the decoded row, so under a mask
+		// "c AS (a+b)" would be computed from undecoded NULLs and
+		// stored. expandStoredRow also inserts a slot per VIRTUAL
+		// column, so record positions stop matching the mask.
+		cur.colMask = m.cursorMask(insns, op.P1).widenIfTotal(len(cur.tbl.cols))
+	} else if !cur.streamable {
+		// A materialized cursor's scan leaves the columns nothing reads
+		// unread instead (scanTableCols), which its reads fill in.
+		cur.scanMask = m.cursorMask(insns, op.P1).widenIfTotal(len(cur.tbl.cols))
+	}
+	m.cursors[op.P1] = cur
+	return nil
+}
+
+// execSeekIndexHint is OpSeekIndexHint, for the VDBE and for a cursor native
+// code seeked (vmJIT.syncIdxSeek).
+func (m *vdbe) execSeekIndexHint(op *Instruction) error {
+	// Coerce the key with the exact affinity the WHERE comparison
+	// applies (P4.aff, pre-computed by detectIndexSeekKey), then
+	// configure the cursor to seek the secondary index b-tree for
+	// candidate rowids on its next OpRewind rather than full-scanning.
+	// The keyed WHERE conjunct is re-evaluated on every fetched row, so
+	// this only prunes the scan; see OpSeekIndexHint (vdbe_op.go) and
+	// vdbeCursor.idxSeek* (vdbe_cursor.go).
+	if cursorHasNoBtree(m.cursors[op.P1]) {
+		return nil
+	}
+	cur := m.cursors[op.P1]
+	switch h := op.P4.(type) {
+	case *indexSeekHint:
+		probe := applyAffinityToValue(m.regs[op.P2], h.aff)
+		// An IN list's values, each coerced as the one key is: a NULL
+		// equals nothing, so it is no probe.
+		var set []Value
+		textKey := probe.Typ == Text
+		if h.in > 0 {
+			set = make([]Value, 0, h.in)
+			textKey = false
+			for _, v := range m.regs[op.P2 : op.P2+h.in] {
+				if v = applyAffinityToValue(v, h.aff); v.Typ != Null {
+					set = append(set, v)
+					textKey = textKey || v.Typ == Text
+				}
+			}
+		}
+		if h.slot == 0 {
+			cur.idxSeekConfigured, cur.idxSeekMore, cur.idxSeekNext, cur.idxSeekSet = false, cur.idxSeekMore[:0], 0, nil
+			cur.idxSeekOrder, cur.idxListOnce, cur.idxListReady = h.order, false, false
+		}
+		// A slot out of step is dropped, as is the key of "x IS NULL" (no
+		// posting list holds NULL) and a write's TEXT key in a UTF-16
+		// database; the keys left each bound the rows, and with none the
+		// scan decides.
+		if h.slot == cur.idxSeekNext {
+			cur.idxSeekNext++
+			switch {
+			case h.is && probe.Typ == Null:
+			case cur.rowStore != nil && textKey && isUTF16(m.encoding()):
+			case !cur.idxSeekConfigured:
+				cur.idxSeekConfigured = true
+				cur.idxSeekProbe, cur.idxSeekColl, cur.idxSeekCol, cur.idxSeekSet = probe, h.coll, h.leadingCol, set
+			default:
+				cur.idxSeekMore = append(cur.idxSeekMore, idxSeekKey{col: h.leadingCol, probe: probe, coll: h.coll, set: set})
+			}
+		}
+	default:
+		return fmt.Errorf("vdbe: OpSeekIndexHint without a plan")
+	}
+	cur.seekReseek = op.P3 == 1 // correlated join seek: re-seek per rewind
+	return nil
+}
+
+// execAutoIndexOrder is OpAutoIndexOrder, for the VDBE and for a cursor
+// native code seeked (vmJIT.syncIdxSeek).
+func (m *vdbe) execAutoIndexOrder(op *Instruction) error {
+	cur := m.cursors[op.P1]
+	if cur != nil && cur.rowStore != nil {
+		// A WRITE loop's cursor: the order is kept on it and applied at
+		// every materialization (applyWriteOrder), never skipped -- a
+		// per-row SET subquery was lowered on the promise of it.
+		cur.writeOrder = op.P4.(*autoIndexKey)
+		cur.applyWriteOrder()
+		return nil
+	}
+	if cur == nil || cursorHasNoBtree(cur) || cur.streamable || cur.seekReseek {
+		// Nothing to permute (no b-tree, or a lazy pull), or a correlated
+		// seek that re-materializes a different row set per rewind.
+		//
+		// A non-correlated seek is permuted like any cursor: it
+		// materializes once and its rows are a superset of the answer, so
+		// sorting that superset and letting the loop filter keeps the same
+		// relative order. Declining leaves the pre-port scan order, never a
+		// different row set -- see OpAutoIndexOrder.
+		return nil
+	}
+	if cur.streamIfOrdered && !cur.materialized && !cur.hasGeneratedCols() &&
+		!cur.seekConfigured && !cur.idxSeekConfigured && !cur.seekSetConfigured {
+		if cur.pager.segRowsInKeyOrder(cur.tbl.root, op.P4.(*autoIndexKey)) {
+			// The rows already run in the key's order: the outermost scan
+			// streams them as it would with no key. (A seek's few rows are
+			// sorted for less than asking.)
+			cur.streamable, cur.colMask = true, cur.scanMask.widenIfTotal(len(cur.tbl.cols))
+			return nil
+		}
+		// Or they are put in that order without being built: positioned
+		// on the segment rows, sorted, every rewind after walking them.
+		if src := cur.pager.segKeyOrderList(cur, op.P4.(*autoIndexKey), &cur.pointSrc); src != nil {
+			cur.seekGen = seekGens.Add(1)
+			cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
+			cur.segSrc, cur.segCur, cur.segSrcCols = src, nil, src.cols
+			cur.streamErrPending = nil
+			cur.pos = -1
+			cur.rowidNull = false
+			cur.keyListReady = true
+			return nil
+		}
+	}
+	// The cursor materializes on its first rewind; force that now so the
+	// permutation below is the one every later rewind re-iterates.
+	cur.params = m.params // see vdbeCursor.params
+	cur.unsort()
+	key := op.P4.(*autoIndexKey)
+	// An index seek's rows are positioned in the key's order instead,
+	// when the segments serve it (idxListOnce): the seek keeps its
+	// probe, so every rewind finds the same rows in the same order.
+	once := cur.idxSeekConfigured && !cur.seekConfigured && !cur.seekSetConfigured && !cur.materialized &&
+		key.multiOr == nil && cur.idxSeekOrder == nil
+	if once {
+		cur.idxSeekOrder, cur.idxListOnce = key, true
+	}
+	if rerr := cur.rewind(); rerr != nil {
+		return rerr
+	}
+	if once && cur.segSrc != nil && cur.segSrc.list {
+		cur.idxListReady = true
+		return nil
+	}
+	cur.idxListOnce = false
+	autoIndexOrderCursor(cur, key, m.encoding())
+	return nil
+}
+
+// flushJIT takes back the cursors native code still holds from a stop at an
+// instruction touching none (vdbe.jDefer). It reports whether that left an
+// error (takeJITErr).
+func (m *vdbe) flushJIT() bool {
+	if !m.jDefer {
+		return false
+	}
+	jx, exit := m.jDeferJX, m.jDeferPC
+	m.jDefer = false
+	for _, c := range m.jLive {
+		jx.syncCursor(m, c, exit)
+	}
+	m.jLive = m.jLive[:0]
+	return m.jitErr != nil
+}
+
+// takeJITErr returns the error native code's return left, clearing it.
+func (m *vdbe) takeJITErr() error {
+	err := m.jitErr
+	m.jitErr = nil
+	return err
 }

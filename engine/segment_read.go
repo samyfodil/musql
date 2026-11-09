@@ -16,8 +16,17 @@ import (
 // iter.Seq2 has no room for an error, the scan's error is only known once
 // iteration has stopped: call errFn afterward.
 func (p *ReadOnlyPager) ScanTable(rootPage uint32) (seq iter.Seq2[uint64, []Value], errFn func() error) {
+	return p.scanTableCols(rootPage, allColumns)
+}
+
+// scanTableCols is ScanTable decoding from the segments only the columns in
+// cols; every other column of a segment row reads valueUnread, which a
+// cursor's column read and whole-row read replace with the row itself
+// (vdbeCursor.unreadColumn). A row the log or a write session holds comes
+// whole.
+func (p *ReadOnlyPager) scanTableCols(rootPage uint32, cols columnMask) (seq iter.Seq2[uint64, []Value], errFn func() error) {
 	if p != nil && p.segs != nil {
-		if seq, ok, err := p.segs.scanSegments(rootPage); ok {
+		if seq, ok, err := p.segs.scanSegmentsCols(rootPage, cols); ok {
 			return seq, func() error { return err }
 		}
 	}
@@ -184,6 +193,12 @@ func (p *ReadOnlyPager) ServesLiveRows(rootPage uint32) bool {
 // a caller that wants one column of many (segFilterCount), which is a different
 // question asked through a different door.
 func (src *segSource) scanSegments(rootPage uint32) (iter.Seq2[uint64, []Value], bool, error) {
+	return src.scanSegmentsCols(rootPage, allColumns)
+}
+
+// scanSegmentsCols is scanSegments decoding only the columns in cols from a
+// segment (scanTableCols).
+func (src *segSource) scanSegmentsCols(rootPage uint32, cols columnMask) (iter.Seq2[uint64, []Value], bool, error) {
 	// A write session's own rows come first: they are the merge already done,
 	// plus whatever this session has changed since. See segSource.live.
 	if rows, have, err := src.liveRows(rootPage); err != nil {
@@ -192,7 +207,7 @@ func (src *segSource) scanSegments(rootPage uint32) (iter.Seq2[uint64, []Value],
 		return func(yield func(uint64, []Value) bool) {
 			// One ordered walk rather than a rowid list plus a lookup per row:
 			// a table's committed rows stream from the mapped file.
-			rows.eachSortedUntil(yield)
+			rows.eachSortedUntilCols(cols, yield)
 		}, true, nil
 	}
 	segs, ok := src.byRoot[rootPage]
@@ -237,7 +252,7 @@ func (src *segSource) scanSegments(rootPage uint32) (iter.Seq2[uint64, []Value],
 					}
 					row := make([]Value, w)
 					for c := 0; c < w; c++ {
-						row[c] = sg.Value(c, i)
+						row[c] = sg.valueIf(cols, c, i)
 					}
 					if !yield(uint64(rowid), row) {
 						return
@@ -274,7 +289,7 @@ func (src *segSource) scanSegments(rootPage uint32) (iter.Seq2[uint64, []Value],
 				row := arena[:w:w]
 				arena = arena[w:]
 				for c := 0; c < w; c++ {
-					row[c] = s.Value(c, i)
+					row[c] = s.valueIf(cols, c, i)
 				}
 				if !yield(s.Rowid(i), row) {
 					return

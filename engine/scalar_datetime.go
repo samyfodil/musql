@@ -15,7 +15,9 @@
 package engine
 
 import (
+	"bytes"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -741,8 +743,15 @@ func toLowerASCII(c byte) byte {
 // dateArgText is sqlite3_value_text for a date function argument: nil for
 // NULL, and a C string, so an embedded NUL ends it.
 func dateArgText(v Value) []byte {
-	if v.Typ == Null {
+	switch v.Typ {
+	case Null:
 		return nil
+	case Text, Blob:
+		// The parsers only read z, so the value's own bytes serve.
+		if i := bytes.IndexByte(v.S, 0); i >= 0 {
+			return v.S[:i:i]
+		}
+		return v.S[:len(v.S):len(v.S)]
 	}
 	return []byte(textBeforeNUL(valueToText(v)))
 }
@@ -804,38 +813,73 @@ func fnDateTimeFamily(kind string, args []Value) (v Value, usedNow bool, err err
 		return Value{Typ: Int, I: x.iJD/1000 - jdUnixEpoch/1000}, x.usedNow, nil
 	case "datetime":
 		x.computeYMDHMS()
-		return Value{Typ: Text, S: []byte(dateText(x) + " " + timeText(x))}, x.usedNow, nil
+		b := appendDateText(make([]byte, 0, 24), x)
+		b = append(b, ' ')
+		return Value{Typ: Text, S: appendTimeText(b, x)}, x.usedNow, nil
 	case "time":
 		x.computeHMS()
-		return Value{Typ: Text, S: []byte(timeText(x))}, x.usedNow, nil
+		return Value{Typ: Text, S: appendTimeText(make([]byte, 0, 12), x)}, x.usedNow, nil
 	case "date":
 		x.computeYMD()
-		return Value{Typ: Text, S: []byte(dateText(x))}, x.usedNow, nil
+		return Value{Typ: Text, S: appendDateText(make([]byte, 0, 11), x)}, x.usedNow, nil
 	}
 	return Value{}, false, fmt.Errorf("engine: internal: unknown date/time function kind %q", kind)
 }
 
-// dateText is dateFunc's YYYY-MM-DD (date.c:1308-1333): four digits of |Y|,
-// with a '-' in front of a negative year.
-func dateText(x sqlDateTime) string {
+// appendDateText is dateFunc's YYYY-MM-DD (date.c:1308-1333): four digits
+// of |Y|, with a '-' in front of a negative year.
+func appendDateText(b []byte, x sqlDateTime) []byte {
 	Y := x.Y
-	sign := ""
 	if Y < 0 {
-		Y, sign = -Y, "-"
+		Y = -Y
+		b = append(b, '-')
 	}
-	return fmt.Sprintf("%s%d%d%d%d-%d%d-%d%d", sign, (Y/1000)%10, (Y/100)%10, (Y/10)%10, Y%10,
-		(x.M/10)%10, x.M%10, (x.D/10)%10, x.D%10)
+	b = appendDigits(b, Y, 4)
+	b = append(b, '-')
+	b = appendDigits(b, x.M, 2)
+	b = append(b, '-')
+	return appendDigits(b, x.D, 2)
 }
 
-// timeText is timeFunc's HH:MM:SS[.SSS] (date.c:1266-1293).
-func timeText(x sqlDateTime) string {
-	hm := fmt.Sprintf("%d%d:%d%d:", (x.h/10)%10, x.h%10, (x.m/10)%10, x.m%10)
+// appendTimeText is timeFunc's HH:MM:SS[.SSS] (date.c:1266-1293).
+func appendTimeText(b []byte, x sqlDateTime) []byte {
+	b = appendDigits(b, x.h, 2)
+	b = append(b, ':')
+	b = appendDigits(b, x.m, 2)
+	b = append(b, ':')
 	if x.useSubsec {
 		s := int(1000.0*x.s + 0.5)
-		return hm + fmt.Sprintf("%d%d.%d%d%d", (s/10000)%10, (s/1000)%10, (s/100)%10, (s/10)%10, s%10)
+		b = appendDigits(b, s/1000, 2)
+		b = append(b, '.')
+		return appendDigits(b, s, 3)
 	}
-	s := int(x.s)
-	return hm + fmt.Sprintf("%d%d", (s/10)%10, s%10)
+	return appendDigits(b, int(x.s), 2)
+}
+
+// appendDigits appends the low n decimal digits of v, as date.c writes each
+// one with '0' + (v/10^k)%10.
+func appendDigits(b []byte, v, n int) []byte {
+	var d [4]byte
+	for k := n - 1; k >= 0; k-- {
+		d[k] = byte('0' + v%10)
+		v /= 10
+	}
+	return append(b, d[:n]...)
+}
+
+// appendPadInt is printf's %0Nd (fill '0') or %Nd (fill ' ') for an int.
+func appendPadInt(b []byte, v int, width int, fill byte) []byte {
+	var d [24]byte
+	t := strconv.AppendInt(d[:0], int64(v), 10)
+	pad := width - len(t)
+	if fill == '0' && v < 0 {
+		b = append(b, '-')
+		t = t[1:]
+	}
+	for ; pad > 0; pad-- {
+		b = append(b, fill)
+	}
+	return append(b, t...)
 }
 
 // daysAfterJan01 is date.c:1339.
@@ -854,8 +898,8 @@ func daysAfterMonday(x sqlDateTime) int { return int(((x.iJD + 43200000) / 86400
 // daysAfterSunday is date.c:1372.
 func daysAfterSunday(x sqlDateTime) int { return int(((x.iJD + 129600000) / 86400000) % 7) }
 
-// fnStrftime is strftimeFunc, date.c:1410. Every numeric conversion goes
-// through the printf port, as sqlite3_str_appendf does.
+// fnStrftime is strftimeFunc, date.c:1410. The integer conversions are
+// printf's %0Nd and %Nd written directly; the rest go through the printf port.
 func fnStrftime(args []Value) (Value, bool, error) {
 	if len(args) == 0 {
 		return Value{Typ: Null}, false, nil
@@ -870,16 +914,16 @@ func fnStrftime(args []Value) (Value, bool, error) {
 	}
 	x.computeJD()
 	x.computeYMDHMS()
-	var b strings.Builder
+	var b []byte
 	appendf := func(format string, vals ...Value) error {
 		v, err := fnPrintf(format, vals)
 		if err != nil {
 			return err
 		}
-		b.Write(v.S)
+		b = append(b, v.S...)
 		return nil
 	}
-	intv := func(i int) Value { return Value{Typ: Int, I: int64(i)} }
+	pad := func(v, width int, fill byte) { b = appendPadInt(b, v, width, fill) }
 	j := 0
 	i := 0
 	for ; i < len(zFmt); i++ {
@@ -887,7 +931,7 @@ func fnStrftime(args []Value) (Value, bool, error) {
 			continue
 		}
 		if j < i {
-			b.Write(zFmt[j:i])
+			b = append(b, zFmt[j:i]...)
 		}
 		i++
 		j = i + 1
@@ -895,11 +939,11 @@ func fnStrftime(args []Value) (Value, bool, error) {
 		var err error
 		switch cf {
 		case 'd', 'e':
-			f := "%02d"
+			fill := byte('0')
 			if cf == 'e' {
-				f = "%2d"
+				fill = ' '
 			}
-			err = appendf(f, intv(x.D))
+			pad(x.D, 2, fill)
 		case 'f':
 			s := x.s
 			if s > 59.999 {
@@ -907,23 +951,27 @@ func fnStrftime(args []Value) (Value, bool, error) {
 			}
 			err = appendf("%06.3f", Value{Typ: Float, F: s})
 		case 'F':
-			err = appendf("%04d-%02d-%02d", intv(x.Y), intv(x.M), intv(x.D))
+			pad(x.Y, 4, '0')
+			b = append(b, '-')
+			pad(x.M, 2, '0')
+			b = append(b, '-')
+			pad(x.D, 2, '0')
 		case 'G', 'g':
 			y := x
 			y.iJD += int64(3-daysAfterMonday(x)) * 86400000
 			y.validYMD = false
 			y.computeYMD()
 			if cf == 'g' {
-				err = appendf("%02d", intv(y.Y%100))
+				pad(y.Y%100, 2, '0')
 			} else {
-				err = appendf("%04d", intv(y.Y))
+				pad(y.Y, 4, '0')
 			}
 		case 'H', 'k':
-			f := "%02d"
+			fill := byte('0')
 			if cf == 'k' {
-				f = "%2d"
+				fill = ' '
 			}
-			err = appendf(f, intv(x.h))
+			pad(x.h, 2, fill)
 		case 'I', 'l':
 			h := x.h
 			if h > 12 {
@@ -932,62 +980,68 @@ func fnStrftime(args []Value) (Value, bool, error) {
 			if h == 0 {
 				h = 12
 			}
-			f := "%02d"
+			fill := byte('0')
 			if cf == 'l' {
-				f = "%2d"
+				fill = ' '
 			}
-			err = appendf(f, intv(h))
+			pad(h, 2, fill)
 		case 'j':
-			err = appendf("%03d", intv(daysAfterJan01(x)+1))
+			pad(daysAfterJan01(x)+1, 3, '0')
 		case 'J':
 			err = appendf("%.16g", Value{Typ: Float, F: float64(x.iJD) / 86400000.0})
 		case 'm':
-			err = appendf("%02d", intv(x.M))
+			pad(x.M, 2, '0')
 		case 'M':
-			err = appendf("%02d", intv(x.m))
+			pad(x.m, 2, '0')
 		case 'p', 'P':
 			switch {
 			case x.h >= 12 && cf == 'p':
-				b.WriteString("PM")
+				b = append(b, "PM"...)
 			case x.h >= 12:
-				b.WriteString("pm")
+				b = append(b, "pm"...)
 			case cf == 'p':
-				b.WriteString("AM")
+				b = append(b, "AM"...)
 			default:
-				b.WriteString("am")
+				b = append(b, "am"...)
 			}
 		case 'R':
-			err = appendf("%02d:%02d", intv(x.h), intv(x.m))
+			pad(x.h, 2, '0')
+			b = append(b, ':')
+			pad(x.m, 2, '0')
 		case 's':
 			if x.useSubsec {
 				err = appendf("%.3f", Value{Typ: Float, F: float64(x.iJD-jdUnixEpoch) / 1000.0})
 			} else {
-				err = appendf("%lld", Value{Typ: Int, I: x.iJD/1000 - jdUnixEpoch/1000})
+				b = strconv.AppendInt(b, x.iJD/1000-jdUnixEpoch/1000, 10)
 			}
 		case 'S':
-			err = appendf("%02d", intv(int(x.s)))
+			pad(int(x.s), 2, '0')
 		case 'T':
-			err = appendf("%02d:%02d:%02d", intv(x.h), intv(x.m), intv(int(x.s)))
+			pad(x.h, 2, '0')
+			b = append(b, ':')
+			pad(x.m, 2, '0')
+			b = append(b, ':')
+			pad(int(x.s), 2, '0')
 		case 'u', 'w':
 			c := byte(daysAfterSunday(x)) + '0'
 			if c == '0' && cf == 'u' {
 				c = '7'
 			}
-			b.WriteByte(c)
+			b = append(b, c)
 		case 'U':
-			err = appendf("%02d", intv((daysAfterJan01(x)-daysAfterSunday(x)+7)/7))
+			pad((daysAfterJan01(x)-daysAfterSunday(x)+7)/7, 2, '0')
 		case 'V':
 			y := x
 			y.iJD += int64(3-daysAfterMonday(x)) * 86400000
 			y.validYMD = false
 			y.computeYMD()
-			err = appendf("%02d", intv(daysAfterJan01(y)/7+1))
+			pad(daysAfterJan01(y)/7+1, 2, '0')
 		case 'W':
-			err = appendf("%02d", intv((daysAfterJan01(x)-daysAfterMonday(x)+7)/7))
+			pad((daysAfterJan01(x)-daysAfterMonday(x)+7)/7, 2, '0')
 		case 'Y':
-			err = appendf("%04d", intv(x.Y))
+			pad(x.Y, 4, '0')
 		case '%':
-			b.WriteByte('%')
+			b = append(b, '%')
 		default:
 			// An unknown conversion -- or a '%' ending the format -- resets
 			// the result, which is NULL.
@@ -998,9 +1052,12 @@ func fnStrftime(args []Value) (Value, bool, error) {
 		}
 	}
 	if j < i {
-		b.Write(zFmt[j:])
+		b = append(b, zFmt[j:]...)
 	}
-	return Value{Typ: Text, S: []byte(b.String())}, x.usedNow, nil
+	if b == nil {
+		b = []byte{}
+	}
+	return Value{Typ: Text, S: b}, x.usedNow, nil
 }
 
 // pureFuncError is the sentinel a date/time function's own result carries

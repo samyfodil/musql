@@ -158,10 +158,11 @@ const (
 	// write barrier that is on. The bytes already checked in this entry are
 	// not checked again (ProgArgs.TextPtr).
 	VSubstr
-	// VTextCmpJump, VTextCmpSet: VCmpJump and VCmpSet for Cond E or NE over
-	// two TEXTs, equal when their bytes are, or two INTEGERs. Any other pair
+	// VTextCmpJump, VTextCmpSet: VCmpJump and VCmpSet over two TEXTs, ordered
+	// as bytes.Compare orders their bytes, or two INTEGERs. Any other pair
 	// exits, as do two TEXTs when ProgArgs.UTF16 is set: the engine compares
-	// those converted.
+	// those converted. Under Imm 1 (a numeric affinity) a TEXT that is a whole
+	// number exits too. Without VMTextOrder only Cond E and NE, and no Imm.
 	VTextCmpJump
 	VTextCmpSet
 
@@ -175,7 +176,84 @@ const (
 	// VClose: close cursor A (Ok zero), when VCursor.Reopen is set; any other
 	// exits.
 	VClose
+
+	// ---- Segment seeks (VMSegCursor).
+
+	// VSeekRowid: find the row whose rowid is the INTEGER in r[B] among the
+	// segments of cursor A's table (VCursor.Tab) and put the cursor on it in
+	// segment mode, as the VDBE's OP_SeekRowidHint and OP_Rewind would, then
+	// fall through to the VSeekRewind; jump to T when no row has it. A key
+	// that is no INTEGER, a cursor with no Tab, and the write barrier on exit.
+	VSeekRowid
+	// VSeekRewind: the OP_Rewind after a VSeekRowid, which has done its work:
+	// go on (State 2 becomes 4). Reached any other way, it exits.
+	VSeekRewind
+	// VSeekIdx: put cursor A in segment mode on the rows of its table whose
+	// indexed column (VCursor.Idx) holds the INTEGER in r[B], in the index's
+	// row order, as the VDBE's OP_SeekIndexHint, OP_AutoIndexOrder and
+	// OP_Rewind of that key would, then fall through to the VSeekRewind; jump
+	// to T when no row does. A key that is no INTEGER, a cursor with no Idx, a
+	// key a later segment's range also holds (its rows may span segments) and
+	// the write barrier exit. Key and State are as VSeekRowid leaves them;
+	// Served gains, at each VSeekIdx, the rows the last seek's run served up
+	// to the cursor's row -- State 5 being a list the engine seeked and handed
+	// over on its row Last, with Served set so the gain is the rows past it.
+	VSeekIdx
+	// VInText: r[C] = 1 when the TEXT in r[A] is, byte for byte, one of the B
+	// TEXTs of the VTextLit list at Imm (which the engine keeps alive and never
+	// writes), else 0. A non-TEXT operand, and ProgArgs.UTF16, exit.
+	// (VMTextOrder)
+	VInText
+
+	// VText: r[A] = the TEXT of the B bytes at Imm, which the engine keeps
+	// alive and never writes, shared as the VDBE's OP_String8 shares its
+	// constant. The write barrier on exits. (VMTextOrder)
+	VText
+	// VLike: r[C] = r[A] LIKE r[B] (NOT LIKE when Pat.Not), 1 or 0, for the
+	// pattern Pat, which r[B] must be: the TEXT sharing Pat's constant bytes.
+	// Matched as the engine's likePlan matches, ASCII letters in either case.
+	// A non-TEXT operand, any other pattern, a NUL in r[A]'s TEXT and
+	// ProgArgs.LikeCS (case_sensitive_like) exit. (VMTextOrder)
+	VLike
+	// VInSub: r[C] = 1 when the INTEGER in r[A] is in the set
+	// ProgArgs.InSets[B] holds, else 0; the other way round under Imm 1 (NOT
+	// IN). An empty set answers without reading r[A]. A set not Ready, any
+	// other r[A], and a miss in a set holding a NULL exit. (VMTextOrder)
+	VInSub
 )
+
+// VInSubSet is an uncorrelated IN subquery's rows as VInSub probes them, which
+// the engine publishes at every entry: Keys the INTEGERs ascending, N of
+// them; HasNull, Empty and Ready flags.
+type VInSubSet struct {
+	Keys    unsafe.Pointer
+	N       int64
+	HasNull int64
+	Empty   int64
+	Ready   int64
+}
+
+const (
+	VInSubSize       = 40
+	VInSubOffKeys    = 0
+	VInSubOffN       = 8
+	VInSubOffHasNull = 16
+	VInSubOffEmpty   = 24
+	VInSubOffReady   = 32
+)
+
+// VLikePat is the LIKE pattern a VLike matches: a constant with no '_', no
+// NUL and nothing past ASCII, split at its '%'s as the engine's likePlan
+// splits it.
+type VLikePat struct {
+	Src    uintptr  // the constant's bytes, which the pattern register shares
+	SrcLen int      // and their length
+	Pieces [][]byte // the text between the '%'s, none empty (but an exact "")
+	Head   bool     // the pattern does not start with '%'
+	Tail   bool     // nor end with one
+	Exact  bool     // it has no '%': the text must be Pieces[0]
+	Not    bool     // NOT LIKE
+}
 
 // sdivMagic is the multiplier m and shift s with which n/d, truncated, is
 // (mulhs(m, n) [+ n when m < 0]) >> s, plus 1 when n < 0 -- for a divisor
@@ -235,6 +313,8 @@ type VInsn struct {
 	Skip uint64
 	// Kernel is VMath's function.
 	Kernel *fir.Func
+	// Pat is VLike's pattern.
+	Pat *VLikePat
 }
 
 // VCursor is native code's view of one materialized cursor: the rows the
@@ -261,7 +341,8 @@ type VCursor struct {
 	// Adv is non-zero when native code may advance the cursor (VNext). A cursor
 	// the engine can only read -- a streamed scan's current row, copied into a
 	// one-row list for the length of the call -- has Adv and Rewind zero, so
-	// native code never moves it.
+	// native code never moves it. Adv 2 says the cursor has rows past the N
+	// handed over: a VNext off the end exits rather than falling through.
 	Adv int64
 	// Mask has bit c set for each column c < 64 native code may read; a
 	// column outside it exits. A materialized cursor has them all. A copied
@@ -273,14 +354,107 @@ type VCursor struct {
 	// Reopen is non-zero when an open of the cursor (VOpen) would give it
 	// Rows again, so native code may close and reopen it: Rows, N, Rowids and
 	// Mask are then the reopened cursor's even while it is closed (Ok zero).
-	// The engine's value says what state it handed the cursor over in.
+	// The engine's value says what state it handed the cursor over in. At
+	// VReopenSeek the cursor is one VSeekIdx positions, which an open marks
+	// VReopenSeekOpened for the engine to open when it takes it back.
 	Reopen int64
 	// State is 1 once native code has reopened the cursor (VOpen).
 	State int64
+	// Seg, when not nil, is the cursor's current segment (a *VSeg): a
+	// VColumn marked segment-capable (Imm 1) reads row Pos's cell from the
+	// column blocks there instead of from Rows, and N is where the segment's
+	// rows the cursor walks end. Only where VMSegCursor.
+	Seg unsafe.Pointer
+	// Tab, when not nil, is the segments of the cursor's table (a *VTab),
+	// every row of which they hold: what VSeekRowid searches. Key is the last
+	// key it searched for, State 2 when it found the row (4 once its
+	// VSeekRewind ran) and 3 when not; Served counts its finds.
+	Tab    unsafe.Pointer
+	Key    int64
+	Served int64
+	// Sel, when not nil, is in segment mode the segment row of each position:
+	// a list of N ints, the row at Pos being Sel[Pos] (an index seek's rows,
+	// a scan in a key's order). Nil, the row is Pos.
+	Sel unsafe.Pointer
+	// Idx, when not nil, is the equality indexes VSeekIdx searches: the first
+	// of the VIdxs of the table's segments, in order.
+	Idx unsafe.Pointer
 }
 
+// VTextLit is one TEXT of a VInText list: its bytes and their length.
+type VTextLit struct {
+	Ptr unsafe.Pointer
+	Len int64
+}
+
+// VIdx is one segment's equality index over a column, as VSeekIdx searches
+// it: Vals the NVals distinct INTEGERs ascending, from Lo to Hi, Starts the
+// NVals+1 int32s where each value's rows begin in Rows, Rows the segment rows
+// (ints) in the order a seek visits them, Seg the segment's VSeg and Mask the
+// columns native code reads from it. Count is how many VIdxs this one and
+// those after it in the table's array make.
+type VIdx struct {
+	Vals   unsafe.Pointer
+	NVals  int64
+	Starts unsafe.Pointer
+	Rows   unsafe.Pointer
+	Seg    unsafe.Pointer
+	Mask   uint64
+	Count  int64
+	Lo, Hi int64
+}
+
+// VTab is the segments of a table, in the order the engine searches them.
+type VTab struct {
+	Segs unsafe.Pointer // the first of N VTabSegs
+	N    int64
+}
+
+// VTabSeg is one segment of a VTab: the rowids from Lo to Hi it holds, its
+// Rows, its VSeg, and the columns native code reads from it.
+type VTabSeg struct {
+	Lo, Hi int64
+	Rows   int64
+	Seg    unsafe.Pointer
+	Mask   uint64
+}
+
+// VSeg is native code's view of one segment of a table: per column, where its
+// cells are and how they read. The engine builds it once per segment and keeps
+// it with the segment, which it outlives no entry.
+type VSeg struct {
+	Cols   unsafe.Pointer // the first of the segment's VSegCols, column c at c*VSegColSize
+	First  int64          // row 0's rowid, when Dense
+	Dense  int64          // non-zero: row i's rowid is First+i
+	Rowids unsafe.Pointer // the rowid block (uint64s) when not Dense
+}
+
+// VSegCol is one column of a VSeg. A column whose Kind is VSegNone is never in
+// a segment cursor's Mask.
+type VSegCol struct {
+	Kind  int64
+	Block unsafe.Pointer // the cells: 8 bytes a row, or for VSegText nRows+1 uint32 heap bounds
+	Nulls unsafe.Pointer // the NULL bitmap (bit i%8 of byte i/8), or nil: a NULL exits
+	Exc   unsafe.Pointer // the exceptions' bitmap (bit i%64 of uint64 i/64), or nil: one exits
+	Heap  unsafe.Pointer // VSegText's bytes
+	// Plain is Kind for a column with no NULL bitmap and no exceptions, else
+	// 0: a VColumn that predicted the kind (T) reads such a cell with one test.
+	Plain int64
+}
+
+// VSegCol kinds: how a cell reads as a Value.
 const (
-	VCursorSize     = 96
+	VSegNone    = iota
+	VSegInt     // an int64 cell, an INTEGER
+	VSegFloat   // a double cell, a REAL
+	VSegNumeric // a double cell, an INTEGER when integral and within 2^53, else a REAL
+	VSegIntReal // an int64 cell read as a REAL (a column of REAL affinity)
+	VSegRowid   // the rowid (an INTEGER PRIMARY KEY, stored NULL)
+	VSegText    // TEXT between two heap bounds
+)
+
+const (
+	VCursorSize     = 144
 	VCursorOffRows  = 0
 	VCursorOffN     = 8
 	VCursorOffPos   = 16
@@ -293,6 +467,41 @@ const (
 	VCursorOffRids  = 72
 	VCursorOffReop  = 80
 	VCursorOffState = 88
+	VCursorOffSeg   = 96
+	VCursorOffTab   = 104
+	VCursorOffKey   = 112
+	VCursorOffSrvd  = 120
+	VCursorOffSel   = 128
+	VCursorOffIdx   = 136
+	VIdxOffVals     = 0
+	VIdxOffNVals    = 8
+	VIdxOffStarts   = 16
+	VIdxOffRows     = 24
+	VIdxOffSeg      = 32
+	VIdxOffMask     = 40
+	VIdxOffCount    = 48
+	VIdxOffLo       = 56
+	VIdxOffHi       = 64
+	VIdxSize        = 72
+	VTabOffSegs     = 0
+	VTabOffN        = 8
+	VTabSegSize     = 40
+	VTabSegOffLo    = 0
+	VTabSegOffHi    = 8
+	VTabSegOffRows  = 16
+	VTabSegOffSeg   = 24
+	VTabSegOffMask  = 32
+	VSegOffCols     = 0
+	VSegOffFirst    = 8
+	VSegOffDense    = 16
+	VSegOffRowids   = 24
+	VSegColSize     = 48
+	VSegColOffKind  = 0
+	VSegColOffBlock = 8
+	VSegColOffNulls = 16
+	VSegColOffExc   = 24
+	VSegColOffHeap  = 32
+	VSegColOffPlain = 40
 	// sliceHeaderSize is the size of a []Value header in the rows array.
 	sliceHeaderSize = 24
 )
@@ -312,3 +521,10 @@ type ValueLayout struct {
 
 // VMFuel is how many backward jumps run between two returns to Go.
 const VMFuel = 1 << 20
+
+// VCursor.Reopen of a cursor VSeekIdx positions, which VOpen and VClose may
+// open and close.
+const (
+	VReopenSeek       = 4
+	VReopenSeekOpened = 5
+)

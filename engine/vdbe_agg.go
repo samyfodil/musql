@@ -18,7 +18,10 @@
 // compiler is compileScanAggregate / compileScanGroupBy (vdbe_agg_codegen.go).
 package engine
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 // aggPlan is an OpAggReset/OpAggStep P4 payload: what the aggregate opcodes share
 // across one query's groups. The offset-adjusted table scopes, the total column
@@ -37,6 +40,22 @@ type aggPlan struct {
 	// aggregate ORDER BY). OpAggStep then gathers no row, and the cursors
 	// decode only the columns the program names (cursorColumnMasks).
 	rowFree bool
+	// rowCols, when not nil, is the only columns of the row block anything
+	// reads: rowFree's conditions hold but for a result naming a column (a
+	// GROUP BY key, read from the group's row). The step gathers just those,
+	// and a group keeps its anchor row only up to the last (rowWidth).
+	rowCols  []int
+	rowWidth int
+	// anchorKeep is rowCols when nothing reads the anchor's rowids: a row
+	// spelling every one of them as the anchor does leaves the anchor as it
+	// is instead of being copied again (aggAccumulators.keep).
+	anchorKeep []int
+	// keyCols[i], set with rowCols, is the row block's column GROUP BY key i
+	// is a bare read of, or -1.
+	keyCols []int
+	// groupExprs is the GROUP BY list, for compile-time questions about which
+	// columns a key reads (groupValueReadAgain); nil without a GROUP BY.
+	groupExprs []Expr
 
 	scopes  []tableScope
 	nCols   int   // total column count across every joined table -- the [cols..] block width; len(scopes) rowid slots immediately follow it in the [cols.., rowids..] layout (see aggRowSplit)
@@ -120,6 +139,9 @@ func (m *vdbe) gatherCursorRow(plan *aggPlan) (row []Value, rowids []Value, err 
 	// and hashAggStep, never re-entrantly from expression evaluation.
 	row = growValues(&m.aggRowBuf, plan.nCols)
 	rowids = growValues(&m.aggRowidBuf, len(plan.scopes))
+	if plan.rowCols != nil && m.gatherCols(plan, row) {
+		return row, m.gatherRowids(plan, rowids), nil
+	}
 	// The ROW, once per physical cursor.
 	for _, g := range plan.gathers {
 		cur := m.cursors[g.cursor]
@@ -132,6 +154,47 @@ func (m *vdbe) gatherCursorRow(plan *aggPlan) (row []Value, rowids []Value, err 
 		}
 		copy(row[g.offset:g.offset+len(vals)], vals)
 	}
+	return row, m.gatherRowids(plan, rowids), nil
+}
+
+// rowFromKeys is whether a step's row is its GROUP BY key's registers: every
+// column anything reads is a key's bare read, the group's first row is its
+// anchor (no census site, no certificate), and nothing reads its rowids.
+func (plan *aggPlan) rowFromKeys() bool {
+	if plan.rowFree || plan.anchorKeep == nil || plan.magnet != nil && len(plan.magnet.sites) > 0 || plan.anchorCheck != nil {
+		return false
+	}
+	for _, c := range plan.rowCols {
+		if !slices.Contains(plan.keyCols, c) {
+			return false
+		}
+	}
+	return true
+}
+
+// gatherCols fills just plan.rowCols of row, reporting false (row untouched)
+// when a cursor holding one computes generated columns on a whole-row read.
+func (m *vdbe) gatherCols(plan *aggPlan, row []Value) bool {
+	for _, c := range plan.rowCols {
+		for _, g := range plan.gathers {
+			if c < g.offset || c >= g.offset+g.n {
+				continue
+			}
+			cur := m.cursors[g.cursor]
+			if cur.hasGeneratedCols() {
+				return false
+			}
+			if err := cur.readColumn(c-g.offset, &row[c]); err != nil {
+				return false
+			}
+			break
+		}
+	}
+	return true
+}
+
+// gatherRowids is gatherCursorRow's rowid half.
+func (m *vdbe) gatherRowids(plan *aggPlan, rowids []Value) []Value {
 	// The ROWIDS, once per SCOPE, since that is what evalCtx.rowids is indexed
 	// by. A scope with no rowid pseudo-column of its own -- a derived table, a
 	// view, and every member of a materialized join GROUP -- has none to
@@ -148,7 +211,7 @@ func (m *vdbe) gatherCursorRow(plan *aggPlan) (row []Value, rowids []Value, err 
 			rowids[i] = Value{Typ: Int, I: int64(cur.rowid)}
 		}
 	}
-	return row, rowids, nil
+	return rowids
 }
 
 // growValues returns buf re-sliced to n, reallocating only when it is too
@@ -207,8 +270,15 @@ type aggAccumulators struct {
 	anchorRowids []Value
 	haveAnchor   bool
 	// rowFree is the plan's (aggPlan.rowFree): nothing reads the anchor, so it
-	// is not copied.
-	rowFree bool
+	// is not copied. rowWidth, when not zero, is how much of it anything reads
+	// (aggPlan.rowWidth), and all of it that is copied.
+	rowFree  bool
+	rowWidth int
+	// keep is the plan's anchorKeep.
+	keep []int
+	// slab, when not nil, is where the anchor is copied to: the hash
+	// aggregate's (aggSlab), for a group whose anchor is taken once.
+	slab *aggSlab
 
 	// magnetHit is M, SQLite's regHit. It is a REGISTER, so it survives from
 	// one scanned row to the next: a row on which every census site is jumped
@@ -286,11 +356,33 @@ func (a *aggAccumulators) magnetWalk(ctx *evalCtx, regs []Value) error {
 	if a.rowFree {
 		a.anchorVals, a.anchorRowids = ctx.vals, ctx.rowids
 	} else {
-		a.anchorVals = cloneValues(ctx.vals)
-		a.anchorRowids = cloneValues(ctx.rowids)
+		vals := ctx.vals
+		if a.rowWidth > 0 && a.rowWidth < len(vals) {
+			vals = vals[:a.rowWidth]
+		}
+		if a.haveAnchor && a.keep != nil && anchorSpelledAs(a.anchorVals, vals, a.keep) {
+			return nil
+		}
+		if a.slab != nil {
+			a.anchorVals, a.anchorRowids = a.slab.cloneValues(vals), a.slab.cloneValues(ctx.rowids)
+		} else {
+			a.anchorVals = cloneValues(vals)
+			a.anchorRowids = cloneValues(ctx.rowids)
+		}
 	}
 	a.haveAnchor = true
 	return nil
+}
+
+// anchorSpelledAs reports whether row holds, at every one of cols, exactly
+// what anchor does: a copy of row would read back the same.
+func anchorSpelledAs(anchor, row []Value, cols []int) bool {
+	for _, c := range cols {
+		if c >= len(anchor) || c >= len(row) || anchor[c].intReal != row[c].intReal || !anchorValuesIdentical(anchor[c], row[c]) {
+			return false
+		}
+	}
+	return true
 }
 
 // anchorRow returns the row a groupBareColExpr placeholder (or a correlated
@@ -340,33 +432,14 @@ func reuseAggAccs(a *aggAccumulators, plan *aggPlan) *aggAccumulators {
 		}
 	}
 	*a = aggAccumulators{out: a.out, having: a.having, order: a.order, magnets: a.magnets,
-		check: plan.anchorCheck, rowFree: plan.rowFree}
+		check: plan.anchorCheck, rowFree: plan.rowFree, rowWidth: plan.rowWidth, keep: plan.anchorKeep}
 	if plan.magnet != nil {
 		a.magnetS = plan.magnet.allocS
 	}
 	return a
 }
 
-func newAggAccs(plan *aggPlan) *aggAccumulators {
-	a := &aggAccumulators{out: make([][]*aggItem, len(plan.outPlans)), check: plan.anchorCheck, rowFree: plan.rowFree}
-	for i, it := range plan.outPlans {
-		a.out[i] = cloneAggTemplates(it.aggTemplates)
-	}
-	if plan.havingPlan != nil {
-		a.having = cloneAggTemplates(plan.havingPlan.aggTemplates)
-	}
-	if plan.magnet != nil {
-		a.magnets = cloneAggTemplates(plan.magnet.sites)
-		a.magnetS = plan.magnet.allocS
-	}
-	a.order = make([][]*aggItem, len(plan.orderPlans))
-	for i, op := range plan.orderPlans {
-		if op.item != nil {
-			a.order[i] = cloneAggTemplates(op.item.aggTemplates)
-		}
-	}
-	return a
-}
+func newAggAccs(plan *aggPlan) *aggAccumulators { return (&aggSlab{exact: true}).newAggAccs(plan) }
 
 // aggRowCtx builds the evalCtx an aggregate opcode uses for a row: the query's
 // scopes, the row's concatenated values, one rowid per table (NULL for a LEFT
@@ -467,7 +540,7 @@ func (m *vdbe) aggResult(info *aggResultInfo, groupKey []Value) (Value, error) {
 	default: // aggSetOut
 		it, accs = plan.outPlans[info.idx], m.aggAccs.out[info.idx]
 	}
-	aggVals := make([]Value, len(accs))
+	aggVals := growValues(&m.aggValsBuf, len(accs))
 	for i, acc := range accs {
 		v, err := acc.finalize()
 		if err != nil {
@@ -482,6 +555,17 @@ func (m *vdbe) aggResult(info *aggResultInfo, groupKey []Value) (Value, error) {
 		clearJSONSubtype(groupKey)
 	}
 	bareVals, bareRowids := m.aggAccs.anchorRow(plan)
+	if p := it.prog; p != nil && p.prog != nil {
+		if v, ok := p.seeded(aggVals, groupKey, bareVals, bareRowids); ok {
+			return v, nil
+		}
+	}
+	if len(bareVals) < plan.nCols {
+		// An anchor kept only as wide as anything reads it (aggPlan.rowWidth).
+		pad := growValues(&m.anchorPad, plan.nCols)
+		copy(pad, bareVals)
+		bareVals = pad
+	}
 	// The compiled item: run seeds the three register blocks and the
 	// program reads them, C's answer for the same nodes (AggInfoFuncReg,
 	// expr.c:5342; AggInfoColumnReg, expr.c:4996; the key via OP_Column,

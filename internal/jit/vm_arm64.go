@@ -857,7 +857,25 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		a.Bcond(CondE, e.exitpcLabel())
 		a.B("dispatch")
 	case VColumn:
+		if in.Imm == 1 {
+			e.segColumn(pc, in)
+			break
+		}
 		e.column(pc, in)
+	case VSeekRowid:
+		e.seekRowid(pc, in)
+	case VSeekIdx:
+		e.seekIdx(pc, in)
+	case VInText:
+		e.inText(pc, in)
+	case VSeekRewind:
+		e.seekRewind(pc, in)
+	case VText:
+		e.text(pc, in)
+	case VLike:
+		e.like(pc, in)
+	case VInSub:
+		e.inSub(pc, in)
 	case VSubstr:
 		e.substr(pc, in)
 	case VTextCmpJump, VTextCmpSet:
@@ -880,21 +898,37 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 			break
 		}
 		e.destNoS(pc, in.C)
-		cb := in.A * VCursorSize
-		a.LdrImm(X9, X0, POffCur)
-		e.ldrAt(X10, X9, cb+VCursorOffOk)
+		dense, have := e.vmLabel("rd"), e.vmLabel("rh")
+		e.curBase(in.A)
+		a.LdrImm(X10, X9, VCursorOffOk)
 		a.Cbz(X10, e.stub(pc))
-		e.ldrAt(X11, X9, cb+VCursorOffRids)
-		a.Cbz(X11, e.stub(pc))
-		e.ldrAt(X10, X9, cb+VCursorOffPos)
-		e.ldrAt(X12, X9, cb+VCursorOffN)
-		a.Cmp(X10, X12)
+		a.LdrImm(X10, X9, VCursorOffPos)
+		a.LdrImm(X4, X9, VCursorOffN)
+		a.Cmp(X10, X4)
 		a.BcondRaw(armHS, e.stub(pc)) // unsigned: a position before the first row is huge
-		a.MovImm64(X12, 8)
-		a.Mul(X10, X10, X12)
-		a.AddReg(X10, X11, X10)
-		m := e.dest(pc, in.C, X10)
-		a.LdrImm(m, X10, 0)
+		// A selection's position names its segment row (VCursor.Sel).
+		row := e.vmLabel("rs")
+		a.LdrImm(X4, X9, VCursorOffSel)
+		a.Cbz(X4, row)
+		a.LdrRegIdx(X10, X4, X10)
+		a.Label(row)
+		a.LdrImm(X4, X9, VCursorOffRids)
+		a.Cbz(X4, dense)
+		a.LdrRegIdx(X5, X4, X10)
+		a.B(have)
+		// No rowid list: a dense segment's rowid is its first plus the row.
+		a.Label(dense)
+		a.LdrImm(X4, X9, VCursorOffSeg)
+		a.Cbz(X4, e.stub(pc))
+		a.LdrImm(X6, X4, VSegOffDense)
+		a.Cbz(X6, e.stub(pc))
+		a.LdrImm(X5, X4, VSegOffFirst)
+		a.AddReg(X5, X5, X10)
+		a.Label(have)
+		m := e.dest(pc, in.C, X5)
+		if m != X5 {
+			a.MovReg(m, X5)
+		}
 		e.storeInt(in, in.C, m)
 	case VRewind:
 		e.unmap(^in.A)
@@ -926,21 +960,41 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		a.Cbz(X10, e.stub(pc))
 		e.ldrAt(X10, X9, cb+VCursorOffPos)
 		a.AddImm(X10, X10, 1)
+		e.ldrAt(X11, X9, cb+VCursorOffN)
+		a.Cmp(X10, X11)
+		a.BcondRaw(armHS, done)
 		e.strAt(X10, X9, cb+VCursorOffPos)
 		a.MovImm16(X11, 1)
 		e.strAt(X11, X9, cb+VCursorOffDirty)
-		e.ldrAt(X11, X9, cb+VCursorOffN)
-		a.Cmp(X10, X11)
-		a.BcondRaw(armHS, done) // off the end: fall through
 		e.strAt(X10, X9, cb+VCursorOffLast)
 		e.jmpBlock(pc, in.T)
 		a.Label(done)
+		// Off the end of the rows handed over: one with more past them (Adv 2)
+		// exits for the VDBE's OP_Next to fetch them; any other falls through.
+		e.ldrAt(X11, X9, cb+VCursorOffAdv)
+		a.CmpImm(X11, 2)
+		a.Bcond(CondE, e.stub(pc))
+		e.strAt(X10, X9, cb+VCursorOffPos)
+		a.MovImm16(X11, 1)
+		e.strAt(X11, X9, cb+VCursorOffDirty)
 	case VOpen, VClose:
 		e.unmap(^in.A)
 		cb := in.A * VCursorSize
 		a.LdrImm(X9, X0, POffCur)
 		e.ldrAt(X10, X9, cb+VCursorOffReop)
 		a.Cbz(X10, e.stub(pc))
+		if in.Op == VOpen {
+			// A seek cursor (Reopen 4 or 5): as vm_amd64.go's.
+			gen := e.vmLabel("og")
+			a.CmpImm(X10, VReopenSeek)
+			a.Bcond(CondL, gen)
+			e.curBase(in.A)
+			e.seekIdxServed(e.vmLabel("ov"), e.vmLabel("ok"))
+			a.MovImm16(X10, VReopenSeekOpened)
+			a.StrImm(X10, X9, VCursorOffReop)
+			a.LdrImm(X9, X0, POffCur)
+			a.Label(gen)
+		}
 		a.MovImm16(X11, 1)
 		if in.Op == VOpen {
 			e.ldrAt(X10, X9, cb+VCursorOffN)

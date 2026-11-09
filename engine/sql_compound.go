@@ -7,6 +7,7 @@
 package engine
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -37,19 +38,14 @@ func combineCompound(op CompoundOp, left, right [][]Value, collations []string, 
 	case "UNION":
 		return sortCompoundRows(unionMerge(dedupRows(left, collations, enc), dedupRows(right, collations, enc), collations, enc), collations, enc), nil
 
-	case "INTERSECT":
-		var out [][]Value
-		for _, l := range dedupRows(left, collations, enc) {
-			if rowsContain(right, l, collations, enc) {
-				out = append(out, l)
-			}
+	case "INTERSECT", "EXCEPT":
+		in := newRowKeySet(collations, enc)
+		for _, r := range right {
+			in.add(r)
 		}
-		return sortCompoundRows(out, collations, enc), nil
-
-	case "EXCEPT":
 		var out [][]Value
 		for _, l := range dedupRows(left, collations, enc) {
-			if !rowsContain(right, l, collations, enc) {
+			if in.has(l) == (op == "INTERSECT") {
 				out = append(out, l)
 			}
 		}
@@ -117,16 +113,10 @@ func keysEqualCollated(a, b []Value, collations []string, enc TextEncoding) bool
 // it no longer reads independently afterward), mirroring execSelect's own
 // "kept := results[:0]" idiom.
 func dedupRows(rows [][]Value, collations []string, enc TextEncoding) [][]Value {
+	seen := newRowKeySet(collations, enc)
 	kept := rows[:0]
 	for _, r := range rows {
-		dup := false
-		for _, k := range kept {
-			if keysEqualCollated(k, r, collations, enc) {
-				dup = true
-				break
-			}
-		}
-		if !dup {
+		if seen.add(r) {
 			kept = append(kept, r)
 		}
 	}
@@ -141,50 +131,34 @@ func dedupRows(rows [][]Value, collations []string, enc TextEncoding) [][]Value 
 // three-arm tie is won by the last arm. Folding pairwise left to right
 // reproduces that for any arm count. Unmatched rows are appended.
 func unionMerge(accumulated, newRows [][]Value, collations []string, enc TextEncoding) [][]Value {
+	at := make(map[string]int, len(accumulated)+len(newRows))
+	var buf []byte
+	for i, k := range accumulated {
+		buf = appendCollatedKeyBytes(buf[:0], k, collations, enc)
+		at[string(buf)] = i
+	}
 	out := accumulated
 	for _, r := range newRows {
-		replaced := false
-		for i, k := range out {
-			if keysEqualCollated(k, r, collations, enc) {
-				out[i] = r
-				replaced = true
-				break
-			}
+		buf = appendCollatedKeyBytes(buf[:0], r, collations, enc)
+		if i, ok := at[string(buf)]; ok {
+			out[i] = r
+			continue
 		}
-		if !replaced {
-			out = append(out, r)
-		}
+		at[string(buf)] = len(out)
+		out = append(out, r)
 	}
 	return out
 }
 
-// rowsContain reports whether rows contains a row equal to target under
-// keysEqualCollated (NULL-equal, per-column collated) row-equality -- used
-// by combineCompound's INTERSECT/EXCEPT paths as a set-membership test
-// against the untouched operand (right), so it deliberately does not dedup
-// or mutate rows. A recursive CTE's UNION dedup (rowKeySet, below) follows
-// the same equality under the recursion's own per-column collations
-// (recursiveCTECollations): a recursive CTE's body IS a compound SELECT, so
-// its dedup follows exactly the same leftmost-arm-with-an-opinion rule.
-func rowsContain(rows [][]Value, target []Value, collations []string, enc TextEncoding) bool {
-	for _, r := range rows {
-		if keysEqualCollated(r, target, collations, enc) {
-			return true
-		}
-	}
-	return false
-}
-
-// rowKeySet is rowsContain with a map: the same NULL-equal collated row
-// equality (keysEqualCollated), keyed on collatedKeyBytes. Used where
-// membership is tested per produced row against all rows so far -- a UNION
-// recursive CTE's queue (recQueue), which was quadratic with a linear scan.
-// It relies on collatedKeyBytes' contract, gated by
-// TestRowKeySetMatchesKeysEqualCollated. INTERSECT/EXCEPT keep rowsContain.
+// rowKeySet is a set of rows under NULL-equal collated row equality
+// (keysEqualCollated), keyed on collatedKeyBytes: compound dedup and
+// membership, and a UNION recursive CTE's queue (recQueue). It relies on
+// collatedKeyBytes' contract, gated by TestRowKeySetMatchesKeysEqualCollated.
 type rowKeySet struct {
 	seen       map[string]struct{}
 	collations []string
 	enc        TextEncoding
+	buf        []byte
 
 	// bytes is the key bytes held, plus a string header per key -- what a
 	// recursive CTE's queue counts against its memory cap
@@ -200,8 +174,7 @@ func newRowKeySet(collations []string, enc TextEncoding) *rowKeySet {
 
 // add remembers row and reports whether it was NEWLY added -- false means an
 // equal row (keysEqualCollated) was already present, in which case the set is
-// unchanged, so the FIRST occurrence is the one that survives, matching the
-// linear rowsContain-then-append idiom it replaces.
+// unchanged, so the FIRST occurrence is the one that survives.
 func (s *rowKeySet) add(row []Value) bool {
 	k := string(collatedKeyBytes(row, s.collations, s.enc))
 	if _, dup := s.seen[k]; dup {
@@ -210,6 +183,13 @@ func (s *rowKeySet) add(row []Value) bool {
 	s.seen[k] = struct{}{}
 	s.bytes += int64(len(k)) + 16
 	return true
+}
+
+// has reports whether a row equal to row (keysEqualCollated) is in the set.
+func (s *rowKeySet) has(row []Value) bool {
+	s.buf = appendCollatedKeyBytes(s.buf[:0], row, s.collations, s.enc)
+	_, ok := s.seen[string(s.buf)]
+	return ok
 }
 
 // collatedKeyBytes canonically encodes a row so two rows encode identically iff
@@ -281,22 +261,32 @@ func appendCollatedKeyBytes(buf []byte, vals []Value, collations []string, enc T
 // collatedTextKey canonicalizes one TEXT value so two values encode identically
 // iff collatedTextCompareEnc calls them equal, mirroring its switch:
 //
-//   - NOCASE folds ASCII case and returns (nocaseCompare compares the UTF-8
-//     bytes in every encoding);
+//   - NOCASE folds ASCII case through the first NUL, followed by the length
+//     when there is one, and returns (nocaseCompare compares the UTF-8 bytes in
+//     every encoding);
 //   - RTRIM strips trailing ASCII spaces and falls through;
 //   - BINARY is memcmp -- over the encoded bytes in a UTF-16 database, which
 //     utf16CompareUTF8 computes unit by unit from the UTF-8, so the key is that
 //     unit sequence (utf16Units). Raw bytes would over-split: two different
 //     invalid UTF-8 sequences both decode to U+FFFD.
 func collatedTextKey(collation string, s []byte, enc TextEncoding) []byte {
-	switch strings.ToUpper(collation) {
-	case "NOCASE":
-		out := make([]byte, len(s))
-		for i, c := range s {
+	switch {
+	case asciiEqualFold(collation, "NOCASE"):
+		// nocaseCompare stops at the first NUL and then compares lengths, so
+		// the bytes past that NUL are not part of the key; the length is.
+		z := bytes.IndexByte(s, 0)
+		if z < 0 {
+			z = len(s) - 1
+		}
+		out := make([]byte, z+1, z+9)
+		for i, c := range s[:z+1] {
 			out[i] = asciiLowerByte(c)
 		}
+		if z < len(s)-1 || (z >= 0 && s[z] == 0) {
+			out = binary.BigEndian.AppendUint64(out, uint64(len(s)))
+		}
 		return out
-	case "RTRIM":
+	case asciiEqualFold(collation, "RTRIM"):
 		s = rtrimTrailingSpaces(s)
 	}
 	if !isUTF16(enc) {

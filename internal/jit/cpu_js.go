@@ -23,3 +23,15 @@ const VMReal = true
 // SetCPUForTest narrows the features the float kernels see: none, as wasm
 // has no optional ones.
 func SetCPUForTest(fma, round bool) (restore func()) { return func() {} }
+
+// VMSegCursor reports whether a VColumn marked segment-capable reads a
+// segment cursor's column blocks (VCursor.Seg).
+const VMSegCursor = false
+
+// VMTextOrder reports whether VTextCmpJump and VTextCmpSet take an ordered
+// condition, and a numeric affinity's whole-number test (Imm 1).
+const VMTextOrder = false
+
+// VMRealInts reports whether VFAdd, VFSub and VFMul over two INTEGERs run the
+// INTEGER arm rather than exit.
+const VMRealInts = false

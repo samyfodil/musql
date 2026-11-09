@@ -758,8 +758,32 @@ const (
 	// where an expression reads the column, which is where this is placed.
 	OpGenErrCheck // P1: register.
 
+	// OpSortedSeek: P1: cursor. P2: key register. P3: 1. P4: *sortedSeekHint.
+	// Narrows a join level's materialized cursor P1 to the rows whose column
+	// P4.col equals r[P2], coerced with P4.aff, under P4.coll. The first one
+	// sorts a copy of the cursor's rows by that column, stably, so each key's
+	// run keeps the order a full scan would have visited it in (the scan's own,
+	// or the one OpAutoIndexOrder put it in): the rows the level's loop passes
+	// arrive as they would without the seek. Every conjunct is still evaluated
+	// in the loop, and a cursor it cannot sort keeps all its rows.
+	OpSortedSeek
+
 	numOpCodes // sentinel: count of opcodes, for the disassembler's name table.
 )
+
+// sortedSeekHint is the P4 payload of OpSortedSeek: the column the rows are
+// sorted and searched by, its comparison's collation, and the affinity the
+// comparison applies to the key.
+type sortedSeekHint struct {
+	col  int
+	coll string
+	aff  affinity
+	// keyLen is how many instructions before the OpSortedSeek compute its key.
+	keyLen int
+	// built is set for a RIGHT/FULL JOIN operand: its unmatched-row sweep walks
+	// and marks the built rows, so the segments do not serve it.
+	built bool
+}
 
 // indexSeekHint is the P4 payload of OpSeekIndexHint: everything the runtime
 // needs, beyond the key register, to configure a secondary-index leading-column
@@ -781,6 +805,10 @@ type indexSeekHint struct {
 	// slot is this key's place among the cursor's seek keys; each later slot
 	// is an equality on another column that bounds the rows as well.
 	slot int
+	// order, on a correlated seek of a segment table's index of more than one
+	// column, is the planner's key: each probe's rows, which come in rowid
+	// order, are sorted by it into the order that index's walk visits them.
+	order *autoIndexKey
 	// is marks "x IS key", whose NULL key matches the NULLs.
 	is bool
 	// in, when not zero, is the length of an IN list whose values are in the
@@ -862,6 +890,13 @@ type inSubPlan struct {
 	// must be RE-RUN (against the enclosing frame) on every evaluation rather
 	// than materialized once and cached -- see the OpInSub doc comment above.
 	correlated bool
+	// shared marks a probe that is a group's value C converts in place to
+	// sharedAff, which the aggregate's result reads again
+	// (inSubConvertsGroupValue). sharedReal says the value is a REAL column's,
+	// which C's register holds as a REAL where this one may hold the integer it
+	// is stored as.
+	shared, sharedReal bool
+	sharedAff          affinity
 }
 
 // rowSubPlan is the P4 payload of OpRowSub: a ROW-VALUE comparison one of

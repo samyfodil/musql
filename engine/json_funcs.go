@@ -1219,7 +1219,7 @@ func jsonGroupResult(text []byte, blob, subtype bool) Value {
 // row contributes (as null), so sql_agg.go's step routes here ahead of its
 // generic NULL skip. gcBuf holds the elements between the brackets.
 //
-// DISTINCT's dedup (it.seen) is applied here for the same reason, and dedupes
+// DISTINCT's dedup (aggDistinct) is applied here for the same reason, and dedupes
 // NULL contributions too -- two NULL rows contribute one null element.
 func (it *aggItem) stepJSONGroupArray(ctx *evalCtx, regs []Value) error {
 	v, err := it.rowValue(aggExprArg, ctx, regs)
@@ -1235,11 +1235,11 @@ func (it *aggItem) stepJSONGroupArray(ctx *evalCtx, regs []Value) error {
 	if err != nil {
 		return err
 	}
-	if it.gcHave {
-		it.gcBuf.WriteByte(',')
+	if it.concat().have {
+		it.concat().buf.WriteByte(',')
 	}
-	it.gcBuf.Write(text)
-	it.gcHave = true
+	it.concat().buf.Write(text)
+	it.concat().have = true
 	return nil
 }
 
@@ -1279,12 +1279,13 @@ func (it *aggItem) stepJSONGroupObject(ctx *evalCtx, regs []Value) error {
 		return nil
 	}
 	if it.distinct {
-		for i := 0; i+1 < len(it.seen); i += 2 {
-			if compareValues(k, it.seen[i]) == 0 && compareValues(v, it.seen[i+1]) == 0 {
+		d := it.distState()
+		for i := 0; i+1 < len(d.seen); i += 2 {
+			if compareValues(k, d.seen[i]) == 0 && compareValues(v, d.seen[i+1]) == 0 {
 				return nil
 			}
 		}
-		it.seen = append(it.seen, k, v)
+		d.seen = append(d.seen, k, v)
 	}
 	enc := ctx.encoding()
 	label := jsonGroupKeyText(k, enc)
@@ -1292,13 +1293,13 @@ func (it *aggItem) stepJSONGroupObject(ctx *evalCtx, regs []Value) error {
 	if err != nil {
 		return err
 	}
-	if it.gcHave {
-		it.gcBuf.WriteByte(',')
+	if it.concat().have {
+		it.concat().buf.WriteByte(',')
 	}
-	it.gcBuf.Write(label)
-	it.gcBuf.WriteByte(':')
-	it.gcBuf.Write(valText)
-	it.gcHave = true
+	it.concat().buf.Write(label)
+	it.concat().buf.WriteByte(':')
+	it.concat().buf.Write(valText)
+	it.concat().have = true
 	return nil
 }
 
@@ -1309,9 +1310,9 @@ func (it *aggItem) stepJSONGroupObject(ctx *evalCtx, regs []Value) error {
 func (it *aggItem) finalizeJSONGroupArray() Value {
 	// A stepped jsonb_group_array has no subtype; an empty one (no
 	// aggregate context, json.c:4877-4879) and the text spelling do.
-	return jsonGroupResult([]byte("["+it.gcBuf.String()+"]"), it.jsonb, !(it.jsonb && it.gcHave))
+	return jsonGroupResult([]byte("["+it.concat().buf.String()+"]"), it.jsonb, !(it.jsonb && it.concat().have))
 }
 
 func (it *aggItem) finalizeJSONGroupObject() Value {
-	return jsonGroupResult([]byte("{"+it.gcBuf.String()+"}"), it.jsonb, true)
+	return jsonGroupResult([]byte("{"+it.concat().buf.String()+"}"), it.jsonb, true)
 }

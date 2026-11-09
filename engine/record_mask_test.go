@@ -748,8 +748,10 @@ func TestMaskFiresForARealProjectionScan(t *testing.T) {
 	if m, _ = maskFor("SELECT count(*) FROM t HAVING a > 1"); m != allColumns {
 		t.Fatalf("an aggregate reading its anchor row must decline to mask, got %#x", uint64(m))
 	}
-	if m, _ = maskFor("SELECT a, count(*) FROM t GROUP BY a"); m != allColumns {
-		t.Fatalf("a GROUP BY scan must decline to mask, got %#x", uint64(m))
+	// A hash GROUP BY whose results read only the key gathers just that column
+	// of the group's row (aggPlan.rowCols), so its scan masks too.
+	if m, _ = maskFor("SELECT a, count(*) FROM t GROUP BY a"); m == allColumns || m&(1<<1) == 0 {
+		t.Fatalf("a GROUP BY scan reading its key should mask to include {1}, got %#x", uint64(m))
 	}
 }
 

@@ -52,16 +52,10 @@ func (m *vdbe) groupBatchFinal(plan *groupBatchPlan) [][]Value {
 	outStart := 1 + plan.nGroup
 	outSpan := func(e []Value) []Value { return e[outStart : outStart+plan.nOut] }
 
+	seen := newRowKeySet(plan.outColl, m.encoding())
 	kept := entries[:0]
 	for _, e := range entries {
-		dup := false
-		for _, k := range kept {
-			if keysEqualCollated(outSpan(k), outSpan(e), plan.outColl, m.encoding()) {
-				dup = true
-				break
-			}
-		}
-		if !dup {
+		if seen.add(outSpan(e)) {
 			kept = append(kept, e)
 		}
 	}

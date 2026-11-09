@@ -64,6 +64,89 @@ type segGroupAcc struct {
 	lastDelta []int64
 }
 
+// segGroupSlab carves groups' argument arrays out of chunks, so a group costs
+// no allocation of its own.
+type segGroupSlab struct {
+	ints  []int64
+	uints []uint64
+}
+
+// take gives g its na-long arrays, the minimums and maximums at their identity.
+func (sl *segGroupSlab) take(g *segGroupAcc, na int) {
+	if len(sl.ints) < 3*na {
+		sl.ints = make([]int64, 3*na*segGroupSlabGroups)
+		sl.uints = make([]uint64, na*segGroupSlabGroups)
+	}
+	g.sums, g.mins, g.maxs = sl.ints[:na:na], sl.ints[na:2*na:2*na], sl.ints[2*na:3*na:3*na]
+	g.abs = sl.uints[:na:na]
+	sl.ints, sl.uints = sl.ints[3*na:], sl.uints[na:]
+	for a := range na {
+		g.mins[a], g.maxs[a] = math.MaxInt64, math.MinInt64
+	}
+}
+
+// segGroupSlabGroups is how many groups a slab chunk holds.
+const segGroupSlabGroups = 256
+
+// segGroupTable is the groups segGroupBulk sums, by key: a dense key range
+// finds a group through idx (at key-lo, one past its index in accs; 0 for
+// none), any other through m. The groups sit in one array, so a wide key
+// range with few groups costs four bytes a key, none of which the collector
+// scans.
+type segGroupTable struct {
+	lo   int64
+	idx  []int32
+	m    map[int64]int32
+	accs []segGroupAcc
+}
+
+func newSegGroupTable(dense bool, lo, hi int64) *segGroupTable {
+	if dense {
+		return &segGroupTable{lo: lo, idx: make([]int32, hi-lo+1)}
+	}
+	return &segGroupTable{m: map[int64]int32{}}
+}
+
+// at is key k's group, made empty when there is none. The pointer holds until
+// the next group is made.
+func (t *segGroupTable) at(k int64) *segGroupAcc {
+	var j int32
+	if t.idx != nil {
+		j = t.idx[k-t.lo]
+	} else {
+		j = t.m[k]
+	}
+	if j == 0 {
+		t.accs = append(t.accs, segGroupAcc{})
+		j = int32(len(t.accs))
+		if t.idx != nil {
+			t.idx[k-t.lo] = j
+		} else {
+			t.m[k] = j
+		}
+	}
+	return &t.accs[j-1]
+}
+
+// each calls f on every group with its key, in key order when dense, until f
+// reports false.
+func (t *segGroupTable) each(f func(k int64, g *segGroupAcc) bool) bool {
+	if t.idx != nil {
+		for i, j := range t.idx {
+			if j != 0 && !f(t.lo+int64(i), &t.accs[j-1]) {
+				return false
+			}
+		}
+		return true
+	}
+	for k, j := range t.m {
+		if !f(k, &t.accs[j-1]) {
+			return false
+		}
+	}
+	return true
+}
+
 // segGroupBulk's outcomes.
 const (
 	bulkNotEligible = iota // nothing written: walk the rows
@@ -176,37 +259,23 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 	// the one a single pass would have seen last.
 	na := len(plan.argCols)
 	dense := uint64(hi-lo) < segGroupBulkMaxDense
-	add := func(groups map[int64]*segGroupAcc, slots []segGroupAcc, k int64) *segGroupAcc {
-		var g *segGroupAcc
-		if slots != nil {
-			g = &slots[k-lo]
-		} else if g = groups[k]; g == nil {
-			g = &segGroupAcc{}
-			groups[k] = g
-		}
+	add := func(t *segGroupTable, sl *segGroupSlab, k int64) *segGroupAcc {
+		g := t.at(k)
 		if g.sums == nil {
-			g.sums, g.abs = make([]int64, na), make([]uint64, na)
-			g.mins, g.maxs = make([]int64, na), make([]int64, na)
-			for a := range na {
-				g.mins[a], g.maxs[a] = math.MaxInt64, math.MinInt64
-			}
+			sl.take(g, na)
 		}
 		return g
 	}
 	type partial struct {
-		slots  []segGroupAcc
-		groups map[int64]*segGroupAcc
+		t    *segGroupTable
+		slab segGroupSlab
 	}
 	parts := make([]partial, len(segs))
 	ok := segEach(len(segs), func(si int) bool {
 		s, b, pt := segs[si], bs[si], &parts[si]
-		if dense {
-			pt.slots = make([]segGroupAcc, hi-lo+1)
-		} else {
-			pt.groups = map[int64]*segGroupAcc{}
-		}
+		pt.t = newSegGroupTable(dense, lo, hi)
 		skip, sk := skips[si], 0
-		if w.empty() && dense && len(skip) == 0 && segGroupDenseFlat(s, plan.argCols, b.key, b.args, needSum, needMM, lo, si, pt.slots, plan.bare) {
+		if w.empty() && dense && len(skip) == 0 && segGroupDenseFlat(s, plan.argCols, b.key, b.args, needSum, needMM, lo, si, pt.t, plan.bare) {
 			return true
 		}
 		if !w.empty() && !w.filterable(s) {
@@ -241,7 +310,7 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 					continue
 				}
 			}
-			g := add(pt.groups, pt.slots, b.key[r])
+			g := add(pt.t, &pt.slab, b.key[r])
 			if g.n++; g.n == 1 {
 				g.firstSeg, g.firstRow = si, r
 			}
@@ -270,18 +339,19 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 	if !ok {
 		return bulkNotEligible
 	}
-	var slots []segGroupAcc
-	groups := map[int64]*segGroupAcc{}
-	if dense {
-		slots = make([]segGroupAcc, hi-lo+1)
-	}
+	// The first segment's groups are the merge's start, and a group no earlier
+	// segment had takes a later one's partial whole: the partials are not read
+	// again.
+	groups := parts[0].t
+	var slab segGroupSlab
 	merge := func(k int64, from *segGroupAcc) bool {
 		if from.n == 0 {
 			return true
 		}
-		g := add(groups, slots, k)
+		g := groups.at(k)
 		if g.n == 0 {
-			g.firstSeg, g.firstRow = from.firstSeg, from.firstRow
+			*g = *from
+			return true
 		}
 		g.n += from.n
 		g.lastSeg, g.lastRow = from.lastSeg, from.lastRow
@@ -295,16 +365,9 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		}
 		return true
 	}
-	for _, pt := range parts {
-		for i := range pt.slots {
-			if !merge(lo+int64(i), &pt.slots[i]) {
-				return bulkNotEligible
-			}
-		}
-		for k, g := range pt.groups {
-			if !merge(k, g) {
-				return bulkNotEligible
-			}
+	for _, pt := range parts[1:] {
+		if !pt.t.each(merge) {
+			return bulkNotEligible
 		}
 	}
 	// The log's own live rows, after every segment's and in rowid order, as the
@@ -343,7 +406,7 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 				}
 				args[a] = vals[c].I
 			}
-			g := add(groups, slots, k)
+			g := add(groups, &slab, k)
 			g.n++
 			g.lastDelta = args
 			for a, v := range args {
@@ -360,9 +423,42 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 			}
 		}
 	}
-	var sparse map[int64]*segGroupAcc
-	if !dense {
-		sparse = groups
+	// A HAVING over aggregates, keys and constants alone is decided here, from
+	// the sums, and a group it drops gets no bucket: the drain would output
+	// nothing for it. Every aggregate is a count, sum, min or max over clean
+	// INTEGERs, whose finalized value the sums are.
+	var having *aggItemProgram
+	var havingVals []Value
+	if hp := plan.agg.havingPlan; hp != nil && !hp.usesGroupBare && len(hp.hoisted) == 0 && havingReadsNoRow(hp.rewritten) {
+		having = hp.prog
+	}
+	dropped := func(val Value, g *segGroupAcc) bool {
+		if having == nil {
+			return false
+		}
+		havingVals = havingVals[:0]
+		for _, it := range plan.agg.havingPlan.aggTemplates {
+			v := Value{Typ: Int}
+			switch it.kind {
+			case aggCountStar, aggCount:
+				v.I = g.n
+			case aggSum:
+				v.I = g.sums[argOf[it.rowRegs[aggExprArg]-1]]
+			case aggMin:
+				v.I = g.mins[argOf[it.rowRegs[aggExprArg]-1]]
+			case aggMax:
+				v.I = g.maxs[argOf[it.rowRegs[aggExprArg]-1]]
+			}
+			havingVals = append(havingVals, v)
+		}
+		keyVals[0] = val
+		bare := growValues(&m.aggNullRow, plan.agg.nCols+len(plan.agg.scopes))
+		cols, rids := bare[:plan.agg.nCols], bare[plan.agg.nCols:]
+		if !having.runnable(m, havingVals, keyVals, cols, rids) {
+			return false
+		}
+		v, err := having.run(m, havingVals, keyVals, cols, rids)
+		return err == nil && (v.Typ == Null || !isTruthy(v))
 	}
 
 	// Step each group's last row through the shared code, then add the rest.
@@ -381,6 +477,9 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		val := Value{Typ: Int, I: key}
 		if plan.keyReal {
 			val = Value{Typ: Float, F: math.Float64frombits(uint64(key))}
+		}
+		if dropped(val, g) {
+			return true
 		}
 		m.regs[plan.keyRegs[0]] = val
 		if c := plan.keyCols[0]; c >= 0 && c < len(row) && !plan.bare {
@@ -437,18 +536,8 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		return true
 	}
 	segGroupBulkHits.Add(1)
-	if dense {
-		for i := range slots {
-			if slots[i].n > 0 && !apply(lo+int64(i), &slots[i]) {
-				return bulkFailed
-			}
-		}
-		return bulkAnswered
-	}
-	for k, g := range sparse {
-		if !apply(k, g) {
-			return bulkFailed
-		}
+	if !groups.each(apply) {
+		return bulkFailed
 	}
 	return bulkAnswered
 }
@@ -458,9 +547,9 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 // over rows that updates a struct per row. It is used only when every summed
 // column's zone map proves no sum in this segment can overflow, so the loops
 // carry no check; it reports false otherwise, and the checked loop runs.
-// Results land in slots exactly as the row loop leaves them.
+// Results land in t, empty, exactly as the row loop leaves them.
 func segGroupDenseFlat(s *segment, argCols []int, keys []int64, args [][]int64,
-	needSum, needMM []bool, lo int64, si int, slots []segGroupAcc, bare bool) bool {
+	needSum, needMM []bool, lo int64, si int, t *segGroupTable, bare bool) bool {
 	for a, need := range needSum {
 		if !need {
 			continue
@@ -472,7 +561,7 @@ func segGroupDenseFlat(s *segment, argCols []int, keys []int64, args [][]int64,
 	}
 	nr := s.nRows
 	keys = keys[:nr]
-	width := len(slots)
+	width := len(t.idx)
 	n := make([]int64, width)
 	last := make([]int32, width)
 	for r, k := range keys {
@@ -529,11 +618,12 @@ func segGroupDenseFlat(s *segment, argCols []int, keys []int64, args [][]int64,
 	}
 	ints := make([]int64, 3*na*groups)
 	uints := make([]uint64, na*groups)
+	t.accs = make([]segGroupAcc, 0, groups)
 	for i := range width {
 		if n[i] == 0 {
 			continue
 		}
-		g := &slots[i]
+		g := t.at(lo + int64(i))
 		g.n, g.lastSeg, g.lastRow = n[i], si, int(last[i])
 		if first != nil {
 			g.firstSeg, g.firstRow = si, int(first[i])

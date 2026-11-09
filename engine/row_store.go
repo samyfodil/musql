@@ -660,10 +660,22 @@ func (s *rowStore) eachSorted(fn func(rowid uint64, vals []Value)) {
 // eachSortedUntil is eachSorted for a caller that may stop: yield returning
 // false ends the walk there, so a LIMIT over a table reads no further.
 func (s *rowStore) eachSortedUntil(yield func(rowid uint64, vals []Value) bool) {
+	s.eachSortedUntilCols(allColumns, yield)
+}
+
+// eachSortedUntilCols is eachSortedUntil reading from the segments only the
+// columns in cols (scanTableCols).
+func (s *rowStore) eachSortedUntilCols(cols columnMask, yield func(rowid uint64, vals []Value) bool) {
 	switch {
 	case s == nil:
 	case s.seg != nil:
-		s.segEachSorted(yield)
+		if cols == allColumns {
+			s.segEachSorted(yield)
+			break
+		}
+		s.segEachSortedOver(func(y func(uint64, []Value) bool) {
+			s.seg.walkWithCols(cols, func(rid uint64, vals []Value) []Value { return fullStoredRow(s.seg.tbl, rid, vals) }, y)
+		}, yield)
 	default:
 		var rd spillReader
 		for _, rowid := range s.sortedRowids() {

@@ -142,6 +142,9 @@ func (p *ReadOnlyPager) explainProgram(inner string) (*Program, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(stmt.CTEs) > 0 {
+		defer p.pushCTEScope(stmt.CTEs)()
+	}
 	return p.explainCompile(stmt)
 }
 
@@ -216,7 +219,18 @@ func (p *ReadOnlyPager) explainCompile(stmt *SelectStmt) (*Program, error) {
 		// picks between the two the same way.
 		return compileSelectNoFromPager(p, stmt, nil)
 	}
-	return compileSelectScan(p, stmt, nil)
+	// The rewrites execSelect makes before it compiles, so the plan shown is
+	// the one that runs.
+	stmt = p.r37cFlattenTransparent(stmt)
+	nCTE := len(stmt.CTEs)
+	stmt = p.r41FlattenProjection(stmt)
+	if len(stmt.CTEs) > nCTE {
+		defer p.pushCTEScope(stmt.CTEs[nCTE:])()
+	}
+	if len(stmt.Compound) > 0 {
+		return nil, fmt.Errorf("%w: EXPLAIN of a SELECT whose subquery flattened into a compound", errVDBEUnsupported)
+	}
+	return compileSelectScan(p, p.r41PushDown(stmt), nil)
 }
 
 // explainQueryPlanRows answers "EXPLAIN QUERY PLAN", whose four columns are
@@ -257,6 +271,9 @@ func (p *ReadOnlyPager) explainQueryPlanRows(inner string) (cols []string, rows 
 		stmt, perr := p.explainParse(inner)
 		if perr != nil {
 			return nil, nil, perr
+		}
+		if len(stmt.CTEs) > 0 {
+			defer p.pushCTEScope(stmt.CTEs)()
 		}
 		if lines, err = p.explainPlanOf(stmt); err != nil {
 			return nil, nil, err

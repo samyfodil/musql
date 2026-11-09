@@ -1,6 +1,11 @@
 package engine
 
-import "sync/atomic"
+import (
+	"cmp"
+	"encoding/binary"
+	"slices"
+	"sync/atomic"
+)
 
 // A LAZY row source over a table's segments.
 //
@@ -133,6 +138,21 @@ type segRowSource struct {
 	listPos  int
 	listSegs []*segment
 	listRows []int
+	// listOne is the one segment every row of the list is in, or nil: then
+	// native code walks the list in place (vmJIT.segMode).
+	listOne *segment
+	// listKeys and listPerm are sortListBy's, and listHits segListSeekIndex's,
+	// kept across seeks as the list is.
+	listKeys []int64
+	listPerm []int
+	listHits []int32
+
+	// ahead is the rows a scan has pulled past the cursor's (lookahead), which
+	// next serves, from aheadPos, before pulling more; drained is set once a
+	// pull found none left.
+	ahead    []segAheadRow
+	aheadPos int
+	drained  bool
 
 	// cols is the per-column work segColumn would otherwise redo on every row.
 	// All four facts are properties of the TABLE, not of the row, and deriving
@@ -287,8 +307,150 @@ func (p *ReadOnlyPager) segListSeek(cur *vdbeCursor, rids []int64, into *segRowS
 			segs, rows = append(segs, s), append(rows, i)
 		}
 	}
-	*into = segRowSource{list: true, listSegs: segs, listRows: rows, cols: segColPlansFor(cur.tbl)}
+	*into = segRowSource{list: true, listSegs: segs, listRows: rows, listOne: oneSegment(segs), listKeys: into.listKeys, listPerm: into.listPerm,
+		listHits: into.listHits, cols: segColPlansFor(cur.tbl)}
 	return into, true
+}
+
+// oneSegment is the segment every entry of segs is, or nil.
+func oneSegment(segs []*segment) *segment {
+	if len(segs) == 0 {
+		return nil
+	}
+	for _, s := range segs[1:] {
+		if s != segs[0] {
+			return nil
+		}
+	}
+	return segs[0]
+}
+
+// segListSeekIndex is segListSeek of cur's index seek straight from the
+// segments' equality indexes, where they are the whole answer: one key, a
+// table with nothing in the log, and nothing in the session's store over it
+// (liveBaseSegments), every segment as wide as the table. Their hits are already segment rows, in rowid order, so no
+// rowid is made and searched for again. served is false, and nothing is
+// positioned, where the seek is any other, or matches so much of the table
+// that SeekIndexRowidsByKeys would leave it to the scan.
+func (p *ReadOnlyPager) segListSeekIndex(cur *vdbeCursor, into *segRowSource) (src *segRowSource, served bool) {
+	if !p.segSeekable(cur) || len(cur.idxSeekMore) > 0 || cur.idxSeekSet != nil || cur.idxSeekCol < 0 || cur.idxSeekCol >= len(cur.tbl.cols) {
+		return nil, false
+	}
+	probe, root := cur.idxSeekProbe, cur.tbl.root
+	if probe.Typ == Text && !equalFoldName(effectiveCollation(cur.idxSeekColl), "BINARY") {
+		return nil, false
+	}
+	table := p.segs.byRoot[root]
+	if p.segs.isLive(root) {
+		var ok bool
+		if table, ok = p.segs.liveBaseSegments(root); !ok {
+			return nil, false
+		}
+	} else if !p.segs.cleanFor(root) {
+		return nil, false
+	}
+	segs, rows, hits := into.listSegs[:0], into.listRows[:0], into.listHits
+	total := 0
+	for _, sg := range table {
+		if sg == nil || len(sg.cols) != len(cur.tbl.cols) {
+			return nil, false
+		}
+		var have bool
+		switch probe.Typ {
+		case Int:
+			sg.eqMu.Lock()
+			x, ok := sg.diskIndexFor(cur.idxSeekCol)
+			sg.eqMu.Unlock()
+			if have = ok && x.codec == segIdxCodecPostings; have {
+				hits = x.rowsFor(probe.I, hits[:0])
+			}
+		case Text, Blob:
+			hits, have = sg.segEqualityRowsBytes(cur.idxSeekCol, probe.S)
+		case Float:
+			hits, have = sg.segEqualityRowsFloat(cur.idxSeekCol, probe.F)
+		}
+		if !have {
+			return nil, false
+		}
+		for _, i := range hits {
+			segs, rows = append(segs, sg), append(rows, int(i))
+		}
+		total += sg.nRows
+	}
+	if total == 0 || total >= seekMinRows && 2*len(rows) >= total {
+		return nil, false
+	}
+	*into = segRowSource{list: true, listSegs: segs, listRows: rows, listOne: oneSegment(segs), listKeys: into.listKeys, listPerm: into.listPerm,
+		listHits: hits, cols: segColPlansFor(cur.tbl)}
+	return into, true
+}
+
+// sortListBy puts a list seek's rows in key's order, reporting false, having
+// moved nothing, when a key value is not an INTEGER (the seek then builds its
+// rows and sorts them, autoIndexOrderCursor). Ties keep their rowid order, as
+// the index's own does. A list already in order -- an equality seek whose key
+// is its own column, ties in rowid order -- is left as it is.
+func (src *segRowSource) sortListBy(key *autoIndexKey) bool {
+	n := len(src.listRows)
+	if key == nil || n < 2 {
+		return true
+	}
+	nk := len(key.cols)
+	less := func(ka, kb []int64) int {
+		for k := range ka {
+			if ka[k] != kb[k] {
+				c := cmp.Compare(ka[k], kb[k])
+				if k < len(key.desc) && key.desc[k] {
+					return -c
+				}
+				return c
+			}
+		}
+		return 0
+	}
+	flat := src.listKeys[:0]
+	defer func() { src.listKeys = flat }()
+	for i, s := range src.listSegs {
+		row := src.listRows[i]
+		rid := s.Rowid(row)
+		width := min(s.Width(row), len(src.cols))
+		for _, c := range key.cols {
+			if c < 0 {
+				flat = append(flat, int64(rid))
+				continue
+			}
+			v := segColumnValue(src.cols, s, row, width, rid, c)
+			if v.Typ != Int {
+				return false
+			}
+			flat = append(flat, v.I)
+		}
+	}
+	inOrder := true
+	for i := nk; i < len(flat) && inOrder; i += nk {
+		inOrder = less(flat[i-nk:i], flat[i:i+nk]) <= 0
+	}
+	if inOrder {
+		return true
+	}
+	perm := src.listPerm[:0]
+	for i := range n {
+		perm = append(perm, i)
+	}
+	src.listPerm = perm
+	slices.SortFunc(perm, func(a, b int) int {
+		if c := less(flat[a*nk:a*nk+nk], flat[b*nk:b*nk+nk]); c != 0 {
+			return c
+		}
+		return a - b
+	})
+	segs, rows := make([]*segment, n), make([]int, n)
+	for i, p := range perm {
+		segs[i], rows[i] = src.listSegs[p], src.listRows[p]
+	}
+	copy(src.listSegs, segs)
+	copy(src.listRows, rows)
+	return true
 }
 
 // segSeekable is whether a seek on cur's table may be served by a lazy source
@@ -393,9 +555,46 @@ func segRowSourceWins(cur *vdbeCursor) bool {
 	return wanted*2 <= n
 }
 
+// segAheadRow is one row a scan pulled ahead.
+type segAheadRow struct {
+	s     *segment
+	row   int
+	rowid uint64
+}
+
 // next advances to the next row, or reports false at the end of the last
 // segment.
 func (src *segRowSource) next() (s *segment, row int, rowid uint64, ok bool) {
+	if src.aheadPos < len(src.ahead) {
+		r := src.ahead[src.aheadPos]
+		src.aheadPos++
+		segRowsServed.Add(1)
+		return r.s, r.row, r.rowid, true
+	}
+	return src.pull()
+}
+
+// lookahead pulls rows until k wait past the current one, or none are left,
+// and returns those waiting, in the order next will serve them.
+func (src *segRowSource) lookahead(k int) []segAheadRow {
+	if src.aheadPos > 0 {
+		n := copy(src.ahead, src.ahead[src.aheadPos:])
+		src.ahead, src.aheadPos = src.ahead[:n], 0
+	}
+	for len(src.ahead) < k && !src.drained {
+		s, row, rowid, ok := src.pull()
+		if !ok {
+			src.drained = true
+			break
+		}
+		segRowsServed.Add(-1) // served when taken, as rows pulled ahead may never be
+		src.ahead = append(src.ahead, segAheadRow{s, row, rowid})
+	}
+	return src.ahead
+}
+
+// pull is next past the rows pulled ahead.
+func (src *segRowSource) pull() (s *segment, row int, rowid uint64, ok bool) {
 	if src.point {
 		if src.pointDone {
 			return nil, 0, 0, false
@@ -526,6 +725,58 @@ func segColumnValue(plans []segColPlan, s *segment, row, width int, rowid uint64
 		return Value{Typ: Float, F: float64(v.I)}
 	}
 	return v
+}
+
+// segColumnRun is segColumnValue for column c of len(rowids) consecutive rows
+// of s from row i0, written to dst[0], dst[stride], and so on.
+func segColumnRun(plans []segColPlan, s *segment, c, i0 int, rowids []uint64, dst []Value, stride int) {
+	if !s.fullWidth || c < 0 || c >= len(s.cols) || c >= len(plans) {
+		for k, rid := range rowids {
+			dst[k*stride] = segColumnValue(plans, s, i0+k, min(s.Width(i0+k), len(plans)), rid, c)
+		}
+		return
+	}
+	plan, col := &plans[c], s.cols[c]
+	var nulls []byte
+	if col.nullOff != 0 {
+		nulls = s.buf[col.nullOff:]
+	}
+	var exc []uint64
+	if s.excRows != nil {
+		exc = s.excRows[c]
+	}
+	fixed := !col.bounds && (col.phys == PhysInt64 || col.phys == PhysFloat64 || col.phys == PhysNumeric)
+	var block []byte
+	if fixed {
+		block = s.buf[col.blockOff:]
+	}
+	for k, rid := range rowids {
+		i := i0 + k
+		var v Value
+		switch {
+		case nulls != nil && nulls[i/8]&(1<<uint(i%8)) != 0:
+		case exc != nil && exc[i/64]&(1<<uint(i%64)) != 0:
+			v = s.exc[uint64(i)*uint64(len(s.cols))+uint64(c)]
+		case fixed:
+			raw := binary.LittleEndian.Uint64(block[i*segCellWidth:])
+			switch col.phys {
+			case PhysInt64:
+				v = Value{Typ: Int, I: int64(raw)}
+			case PhysFloat64:
+				v = Value{Typ: Float, F: bitsFloat(raw)}
+			default:
+				v = numericValue(raw)
+			}
+		default:
+			v = s.Value(c, i)
+		}
+		if plan.isIPK && v.Typ == Null {
+			v = Value{Typ: Int, I: int64(rid)}
+		} else if plan.isReal && v.Typ == Int {
+			v = Value{Typ: Float, F: float64(v.I)}
+		}
+		dst[k*stride] = v
+	}
 }
 
 // segFullRow builds the whole row, for the readers that consume one at once

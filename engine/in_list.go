@@ -3,6 +3,9 @@ package engine
 import (
 	"slices"
 	"strings"
+	"unsafe"
+
+	"github.com/samyfodil/musql/internal/jit"
 )
 
 // C probes an ephemeral index for an IN over three or more constants
@@ -32,6 +35,9 @@ type inListPlan struct {
 	// holds a run's set when there are parameters.
 	set  *inListSet
 	slot int
+	// texts is the literals as native code matches them (jit.VInText) when
+	// every one is a TEXT and they compare as bytes: TEXT affinity, BINARY.
+	texts []jit.VTextLit
 }
 
 type inListSet struct {
@@ -74,6 +80,17 @@ func newInListPlan(list []Expr, aff affinity, coll string) *inListPlan {
 	keys, hasNull, ok := inListKeys(plan.lits, aff, coll)
 	if !ok {
 		return nil
+	}
+	if aff == affText && coll == "" && !hasNull {
+		texts := make([]jit.VTextLit, 0, len(plan.lits))
+		for _, v := range plan.lits {
+			if v.Typ != Text {
+				texts = nil
+				break
+			}
+			texts = append(texts, jit.VTextLit{Ptr: unsafe.Pointer(unsafe.SliceData(v.S)), Len: int64(len(v.S))})
+		}
+		plan.texts = texts
 	}
 	if ints, all := inListInts(keys); all && !hasNull {
 		plan.ints = ints

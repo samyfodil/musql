@@ -2214,7 +2214,7 @@ func (p *ReadOnlyPager) planGroupByStmt(stmt *SelectStmt, scopes []tableScope, o
 	// Whether anything could observe the anchor row (stmtReadsAnchorRow), computed
 	// once for the whole statement: per-item checks would miss bare reads in HAVING
 	// or ORDER BY.
-	anchorObservable := stmtReadsAnchorRow(stmt, groupExprs, scopes)
+	anchorObservable := stmtReadsAnchorRow(stmt, groupExprs, scopes, func(sub *SelectStmt) bool { return subqueryStandsAlone(p, sub) })
 
 	var outColls []string
 	if stmt.Distinct {
@@ -2358,15 +2358,7 @@ func (p *ReadOnlyPager) planGroupByStmt(stmt *SelectStmt, scopes []tableScope, o
 // vdbe_agg.go), which feed these instances into the shared
 // aggItem.step/finalize logic.
 func cloneAggTemplates(templates []*aggItem) []*aggItem {
-	if len(templates) == 0 {
-		return nil
-	}
-	accs := make([]*aggItem, len(templates))
-	for i, tmpl := range templates {
-		accs[i] = new(aggItem)
-		resetAggItem(accs[i], tmpl)
-	}
-	return accs
+	return (&aggSlab{exact: true}).clone(templates)
 }
 
 // resetAggItem makes acc a fresh accumulator from tmpl, replacing the whole
@@ -2412,8 +2404,25 @@ func findOutputColByName(outCols []outputColumn, name string) int {
 // database of encoding enc: the order the hash GROUP BY drains its groups in.
 func keyTupleLess(a, b []Value, enc TextEncoding) bool {
 	for i := range a {
+		if a[i].Typ == Int && b[i].Typ == Int {
+			if a[i].I != b[i].I {
+				return a[i].I < b[i].I
+			}
+			continue
+		}
 		if c := compareValuesCollatedEnc(a[i], b[i], "", enc); c != 0 {
 			return c < 0
+		}
+	}
+	return false
+}
+
+// keyTupleLessDesc is keyTupleLess with key i reversed where desc[i]. Two
+// distinct groups never compare equal, so no tiebreak is needed.
+func keyTupleLessDesc(a, b []Value, desc []bool, enc TextEncoding) bool {
+	for i := range a {
+		if c := compareValuesCollatedEnc(a[i], b[i], "", enc); c != 0 {
+			return c < 0 != (i < len(desc) && desc[i])
 		}
 	}
 	return false
@@ -2460,7 +2469,7 @@ func keywordLiteralNotInScope(e ColumnExpr, scopes []tableScope) bool {
 // GROUP BY key. Lets recordSpec skip its census gate when nothing could see the
 // magnet. Over-approximates (a spurious true keeps the decline); walks the select
 // list, HAVING and ORDER BY.
-func stmtReadsAnchorRow(stmt *SelectStmt, groupExprs []Expr, scopes []tableScope) bool {
+func stmtReadsAnchorRow(stmt *SelectStmt, groupExprs []Expr, scopes []tableScope, alone func(*SelectStmt) bool) bool {
 	isKey := func(c ColumnExpr) bool {
 		for _, ge := range groupExprs {
 			if k, ok := ge.(ColumnExpr); ok &&
@@ -2472,9 +2481,29 @@ func stmtReadsAnchorRow(stmt *SelectStmt, groupExprs []Expr, scopes []tableScope
 	}
 	found := false
 	var walk func(e Expr)
+	// A subquery that stands alone reads no row of this one, whatever it
+	// names; asked only of one the walk found a read in, as it compiles it.
+	walkSub := func(sub *SelectStmt) {
+		if sub == nil {
+			return
+		}
+		walkSelectForAnchor(sub, walk)
+		if found && alone(sub) {
+			found = false
+		}
+	}
 	walk = func(e Expr) {
 		if e == nil || found {
 			return
+		}
+		// A GROUP BY expression written out again reads the group's key, as
+		// rewriteGroupExpr substitutes it.
+		if _, col := e.(ColumnExpr); !col {
+			for _, ge := range groupExprs {
+				if exprEqual(e, ge) {
+					return
+				}
+			}
 		}
 		switch x := e.(type) {
 		case ColumnExpr:
@@ -2490,17 +2519,17 @@ func stmtReadsAnchorRow(stmt *SelectStmt, groupExprs []Expr, scopes []tableScope
 				return
 			}
 		case SubqueryExpr:
-			walkSelectForAnchor(x.Stmt, walk)
+			walkSub(x.Stmt)
 			return
 		case ExistsExpr:
-			walkSelectForAnchor(x.Stmt, walk)
+			walkSub(x.Stmt)
 			return
 		case InExpr:
 			walk(x.X)
 			for _, l := range x.List {
 				walk(l)
 			}
-			walkSelectForAnchor(x.Sub, walk)
+			walkSub(x.Sub)
 			return
 		}
 		walkExprOperands(e, walk)
@@ -2513,9 +2542,61 @@ func stmtReadsAnchorRow(stmt *SelectStmt, groupExprs []Expr, scopes []tableScope
 	}
 	walk(stmt.Having)
 	for _, ot := range stmt.OrderBy {
+		// A bare name that is an output column's alias is that column, as
+		// resolveAsName decides before any table is searched; the select
+		// list above walked it already.
+		if c, ok := ot.Expr.(ColumnExpr); ok && c.Qualifier == "" && c.Schema == "" && isOutputAlias(stmt.Columns, c.Name) {
+			continue
+		}
 		walk(ot.Expr)
 	}
 	return found
+}
+
+// subqueryStandsAlone is compiler.subqueryReadsOuter's negation: sub compiles
+// with no outer scope and is not correlated, so it reads no row of the query
+// it sits in.
+func subqueryStandsAlone(p *ReadOnlyPager, sub *SelectStmt) bool {
+	prog, err := compileSubProgram(p, sub, nil)
+	return err == nil && !prog.Correlated
+}
+
+// subqueryReadsRow reports whether e holds a subquery that may read the row of
+// the query it sits in: one that does not stand alone, or one the walk below
+// does not reach (a window's OVER clause), which mentionsSubquery still sees.
+func subqueryReadsRow(p *ReadOnlyPager, e Expr) bool {
+	saw, reads := false, false
+	var walk func(Expr)
+	walk = func(e Expr) {
+		if e == nil || reads {
+			return
+		}
+		var sub *SelectStmt
+		switch x := e.(type) {
+		case SubqueryExpr:
+			sub = x.Stmt
+		case ExistsExpr:
+			sub = x.Stmt
+		case InExpr:
+			sub = x.Sub
+		}
+		if sub != nil {
+			saw = true
+			reads = !subqueryStandsAlone(p, sub)
+		}
+		walkExprOperands(e, walk)
+	}
+	walk(e)
+	return reads || !saw && mentionsSubquery(e)
+}
+
+func isOutputAlias(cols []SelectColumn, name string) bool {
+	for _, sc := range cols {
+		if sc.Alias != "" && equalFoldName(sc.Alias, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // walkSelectForAnchor applies walk to every expression of a nested SELECT --

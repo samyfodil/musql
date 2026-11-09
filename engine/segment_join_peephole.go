@@ -191,12 +191,20 @@ func (l *segJoinLoop) level(in []Instruction, pc int) (int, bool) {
 		rewindAt++
 	}
 	if rewindAt < len(in) && in[pc].Op == OpColumn &&
-		(in[pc+1].Op == OpSeekRowidHint || in[pc+1].Op == OpSeekIndexHint) &&
+		(in[pc+1].Op == OpSeekRowidHint || in[pc+1].Op == OpSeekIndexHint || in[pc+1].Op == OpSortedSeek) &&
 		in[pc+1].P2 == in[pc].P3 && in[pc+1].P3 == 1 && in[rewindAt].Op == OpRewind && in[rewindAt].P1 == in[pc+1].P1 {
 		if _, ok := l.levelOf[in[pc].P1]; !ok {
 			return 0, false // the key comes from a level not entered yet
 		}
+		if h, _ := in[pc+1].P4.(*indexSeekHint); h != nil && h.order != nil {
+			return 0, false // each probe's rows are sorted into an index's order, which the kernel does not keep
+		}
 		pc += 2
+	}
+	// A sorted seek's key computed over the levels entered, which the kernel
+	// has no use for: it joins on the level's own terms.
+	if n, ok := segJoinSortedKey(in, pc, l.levelOf); ok {
+		pc += n + 1
 	}
 	// A LEFT JOIN's level clears its match flag before its Rewind.
 	flag := -1
@@ -279,7 +287,7 @@ func (l *segJoinLoop) level(in []Instruction, pc int) (int, bool) {
 				next = i
 			}
 		}
-		preds, end, ok := segParsePredTree(in, pc+5, len(in), l.cursors[self], next, []int{eq.P2}, skip.P2)
+		preds, end, ok := segParsePredTree(in, pc+5, len(in), l.cursors[self], next, []int{eq.P2}, skip.P2, false)
 		if !ok || len(preds) == 0 {
 			return 0, false
 		}
@@ -1158,6 +1166,36 @@ func segJoinSeekHint(in []Instruction, pc int, opened map[int]bool) int {
 	return pc
 }
 
+// segJoinSortedKey reports how many instructions from pc compute an
+// OpSortedSeek's key, the seek following them: arithmetic over constants and
+// the columns of levels in levelOf, with no jump and nothing written but
+// registers.
+func segJoinSortedKey(in []Instruction, pc int, levelOf map[int]int) (int, bool) {
+	for n := 0; pc+n < len(in); n++ {
+		ins := in[pc+n]
+		switch ins.Op {
+		case OpSortedSeek:
+			// Then the Rewind, after a LEFT JOIN's match flag.
+			r := pc + n + 1
+			if r+1 < len(in) && in[r].Op == OpInteger && in[r].P1 == 0 {
+				r++
+			}
+			h, _ := ins.P4.(*sortedSeekHint)
+			return n, n > 0 && h != nil && h.keyLen == n && ins.P3 == 1 && r < len(in) &&
+				in[r].Op == OpRewind && in[r].P1 == ins.P1
+		case OpColumn:
+			if _, ok := levelOf[ins.P1]; !ok {
+				return 0, false
+			}
+		case OpInteger, OpInt64, OpReal, OpString8, OpNull, OpSCopy, OpCopy,
+			OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder:
+		default:
+			return 0, false
+		}
+	}
+	return 0, false
+}
+
 // segJoinMulti is the level of a value over several levels: computed on a
 // joined row, not once per row of one table.
 const segJoinMulti = -2
@@ -1243,6 +1281,9 @@ func (tr *segJoinTrace) region(pc, limit int) (int, bool) {
 			}
 		}
 		for _, r := range reads {
+			if _, flag, once := constOnceBlock(tr.in, i); once && r == flag {
+				continue // a call computed once: its flag picks no value
+			}
 			// A register written before the run carries that value into
 			// every path that does not write it again: its definition is
 			// part of the expression whether or not the run writes it too.
@@ -1272,12 +1313,20 @@ func (tr *segJoinTrace) region(pc, limit int) (int, bool) {
 	// with none, not written on every path, would read whatever the register
 	// last held -- another row's value -- so it is left untraced, and
 	// anything that reads it declines.
+	//
+	// A call computed once (constOnceBlock) is the exception: its writes are
+	// skipped only once they have been made, so they hold the call's value
+	// either way.
+	once := false
+	if e, _, ok := constOnceBlock(tr.in, pc); ok && e == end {
+		once = true
+	}
 	var partial []int
 	for _, o := range outs {
 		if src, ok := tr.src[o]; ok {
 			level = segJoinMix(level, src.level)
 			deps = append(deps, tr.deps[o]...)
-		} else if !tr.writtenOnEveryPath(pc, end, o) {
+		} else if !once && !tr.writtenOnEveryPath(pc, end, o) {
 			partial = append(partial, o)
 		}
 	}
@@ -1586,7 +1635,8 @@ func segJoinEqOK(eq Instruction) bool {
 // OpHashAggSort. The kernel fills the buckets instead, one row per group
 // stepped through hashAggStepRow and the rest added, as segGroupBulk does,
 // and jumps to the drain. Nothing here reads a row, so the order a level
-// visits its rows in cannot show.
+// visits its rows in cannot show, unless the drain keeps the order the groups
+// were made in, which this refuses.
 func segJoinHashPeephole(prog *Program) bool {
 	if !jitEnabled || prog == nil {
 		return false
@@ -1627,7 +1677,14 @@ func segJoinHashPeephole(prog *Program) bool {
 		return false
 	}
 	closeAt, after, ok := l.tail(in, pc+1)
-	if !ok || after >= len(in) || in[after].Op != OpHashAggSort {
+	// An ORDER BY's emission counter is set between the loop and the drain;
+	// the kernel goes on at closeAt, so it still is.
+	for ok && after < len(in) && in[after].Op == OpInteger {
+		after++
+	}
+	// A drain in the order the groups were made (P3) reads the order the
+	// levels visit their rows in, which the kernel does not keep.
+	if !ok || after >= len(in) || in[after].Op != OpHashAggSort || in[after].P3 != 0 {
 		return false
 	}
 	for _, nb := range l.nullBodies {

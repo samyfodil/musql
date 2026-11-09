@@ -40,6 +40,10 @@ type aggResultRegs struct {
 	// identity (see the owner note above groupKeyExpr, sql_group.go). A
 	// placeholder naming a DIFFERENT owner walks straight past this block.
 	owner *aggPlan
+	// item is the result item being compiled and tree the copy of its
+	// expression compiled, whose subquery bodies are rewritten.
+	item *itemPlan
+	tree Expr
 
 	agg   []int
 	key   []int
@@ -337,8 +341,8 @@ func aggAnchorRegScopesUsable(plan *aggPlan) bool {
 // an opcode needing cursors, record registers, sorters or distinct sets would
 // panic (compileSelfRowExpr's check).
 //
-// nSub is allowed: aggItemVM sizes a subCache from NSubCache, cleared per item per
-// group (a body is not necessarily pure, so this is deliberately not OP_Once).
+// nSub is allowed: aggItemVM keeps each item's subCache for the aggregate's run,
+// so an uncorrelated body runs once, as under C's OP_Once.
 func compileAggItemProgram(pager *ReadOnlyPager, enclosing *compiler, plan *aggPlan, it *itemPlan) *aggItemProgram {
 	if it == nil || it.rewritten == nil {
 		return nil
@@ -407,6 +411,8 @@ func compileAggItemProgram(pager *ReadOnlyPager, enclosing *compiler, plan *aggP
 	c.aggSkipped = enclosing
 	c.aggRegs = &aggResultRegs{
 		owner: plan,
+		item:  it,
+		tree:  tree,
 		agg:   rowRegsFor(p.aggBase, p.nAgg),
 		key:   rowRegsFor(p.keyBase, p.nKey),
 		col:   rowRegsFor(p.colBase, p.nCols),
@@ -498,6 +504,34 @@ func (p *aggItemProgram) runnable(m *vdbe, aggVals, groupKey, bareVals, bareRowi
 		len(bareVals) >= p.nCols && len(bareRowids) >= p.nRowid
 }
 
+// seeded is run's answer without running, for a program that computes
+// nothing: its result is a register of one of the blocks run would seed (a
+// group's column, key, rowid or aggregate value as it stands). A block
+// shorter than its width -- an anchor kept only as wide as anything reads it
+// -- is NULL past its end, as run's padded copy is; any other short block is
+// run's to refuse.
+func (p *aggItemProgram) seeded(aggVals, groupKey, bareVals, bareRowids []Value) (Value, bool) {
+	if in := p.prog.Insns; len(in) != 2 || in[0].Op != OpInit || in[1].Op != OpHalt {
+		return Value{}, false
+	}
+	r := p.resultReg
+	for _, b := range []struct {
+		base, n int
+		vals    []Value
+	}{{p.aggBase, p.nAgg, aggVals}, {p.keyBase, p.nKey, groupKey}, {p.colBase, p.nCols, bareVals}, {p.rowidBase, p.nRowid, bareRowids}} {
+		if r >= b.base && r < b.base+b.n {
+			switch i := r - b.base; {
+			case i < len(b.vals):
+				return b.vals[i], true
+			case b.base == p.colBase:
+				return Value{}, true
+			}
+			return Value{}, false
+		}
+	}
+	return Value{}, false
+}
+
 // run seeds the four register blocks for one group and runs the program.
 func (p *aggItemProgram) run(m *vdbe, aggVals, groupKey, bareVals, bareRowids []Value) (Value, error) {
 	pm := m.aggItemVM(p.prog)
@@ -551,17 +585,23 @@ func (m *vdbe) aggItemVM(prog *Program) *vdbe {
 	vm.trigExcluded, vm.trigExcludedRowid = m.trigExcluded, m.trigExcludedRowid
 	vm.trigReturn, vm.trigReturnRowid = m.trigReturn, m.trigReturnRowid
 	vm.regs = prog.regFile(vm.regs, false)
-	// The run-once cache slots an UNCORRELATED body in this item takes. Sized
-	// and CLEARED per acquisition rather than kept: the slot numbering belongs
-	// to ONE item's program and this machine is shared by every item of every
-	// group, so a kept cache would answer item B out of item A's slot. Clearing
-	// it also makes each evaluation re-run the body, which a body that is not a
-	// pure function of its inputs requires -- see compileAggItemProgram's note.
-	if cap(vm.subCache) < prog.NSubCache {
-		vm.subCache = make([]subCacheEntry, prog.NSubCache)
-	} else {
-		vm.subCache = vm.subCache[:prog.NSubCache]
-		clear(vm.subCache)
+	// The run-once cache slots an UNCORRELATED body in this item takes: the
+	// item's own, since the slot numbering belongs to its program and this
+	// machine runs every item. It lasts for the statement's run, as OP_Once's
+	// bit does in C, so the body runs once and not once per group; a body that
+	// reads the group is correlated and never cached.
+	if prog.NSubCache == 0 {
+		vm.subCache = vm.subCache[:0]
+		return vm
 	}
+	sc, ok := m.aggSubCaches[prog]
+	if !ok {
+		if m.aggSubCaches == nil {
+			m.aggSubCaches = map[*Program][]subCacheEntry{}
+		}
+		sc = make([]subCacheEntry, prog.NSubCache)
+		m.aggSubCaches[prog] = sc
+	}
+	vm.subCache = sc
 	return vm
 }

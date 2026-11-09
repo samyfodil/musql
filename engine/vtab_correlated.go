@@ -21,7 +21,8 @@ package engine
 //
 // # Boundary conditions
 //
-// - Equality operators only.
+// - Equality operators only, but for a right-hand side that reads only an
+//   enclosing query's row, which is fixed for the whole run.
 // - Only sources whose rows are driven by the module's BestIndex/Filter.
 // - INNER joins only; RIGHT/FULL need the full row set materialized upfront.
 // - Not combined with an index-order key from the planner.
@@ -153,8 +154,11 @@ func annotateVtabCorrelations(c *compiler, srcs []joinSource, plan joinPlan) {
 			continue
 		}
 		if level == 0 || s.left {
+			if !s.left {
+				terms = append(terms, enclosingRowTerms(c, s)...)
+			}
 			if len(terms) > 0 {
-				srcs[origIdx].vtabCorr = terms
+				srcs[origIdx].vtabCorr = withConstantTerms(s, terms)
 			}
 			continue
 		}
@@ -170,9 +174,54 @@ func annotateVtabCorrelations(c *compiler, srcs []joinSource, plan joinPlan) {
 			terms = append(terms, vtabCorrTerm{conj: j, col: ci, op: op, rhs: rhs})
 		}
 		if len(terms) > 0 {
-			srcs[origIdx].vtabCorr = terms
+			srcs[origIdx].vtabCorr = withConstantTerms(s, terms)
 		}
 	}
+}
+
+// withConstantTerms adds to a correlated source's terms its arguments and
+// constraints that read no row at all, so they are coded once into the
+// program with the rest rather than compiled and run again for every outer
+// row (foldVtabInputValue).
+func withConstantTerms(s joinSource, terms []vtabCorrTerm) []vtabCorrTerm {
+	constant := func(e Expr) bool { return exprRefsOnly(e, func(ColumnExpr) bool { return false }) }
+	has := func(arg, conj int) bool {
+		for _, t := range terms {
+			if arg > 0 && t.arg == arg || arg == 0 && t.arg == 0 && t.conj == conj {
+				return true
+			}
+		}
+		return false
+	}
+	if s.vtabItem.TableFunc {
+		hidden := hiddenColIndices(s.scope.cols)
+		for ai, arg := range s.vtabItem.TableFuncArgs {
+			if ai < len(hidden) && !has(ai+1, 0) && constant(arg) {
+				terms = append(terms, vtabCorrTerm{arg: ai + 1, col: hidden[ai], op: VtabEQ, rhs: arg})
+			}
+		}
+	}
+	for j, conj := range s.vtabItem.tvfWhere {
+		if ci, op, rhs, ok := matchVtabConstraint(conj, s.scope.cols, s.scope.name); ok && !has(0, j) && constant(rhs) {
+			terms = append(terms, vtabCorrTerm{conj: j, col: ci, op: op, rhs: rhs})
+		}
+	}
+	return terms
+}
+
+// enclosingRowTerms is the outermost level's "vtabcol <op> <expr>" conjuncts
+// whose right-hand side reads an enclosing query's row and nothing of this
+// query's FROM: constant for one run of the subquery, as C codes it
+// (wherecode.c:1584), where a standalone fold cannot see that row.
+func enclosingRowTerms(c *compiler, s joinSource) []vtabCorrTerm {
+	var terms []vtabCorrTerm
+	for j, conj := range s.vtabItem.tvfWhere {
+		ci, op, rhs, ok := matchVtabConstraint(conj, s.scope.cols, s.scope.name)
+		if ok && tvfArgIsLateral(c, rhs, nil) {
+			terms = append(terms, vtabCorrTerm{conj: j, col: ci, op: op, rhs: rhs})
+		}
+	}
+	return terms
 }
 
 // tvfArgIsLateral reports whether a table-valued function argument reads a

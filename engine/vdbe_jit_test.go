@@ -266,7 +266,7 @@ func countSyncs(t *testing.T) {
 // arm64: these tests check what the emitted code computes, and on js/wasm the
 // platform's higher threshold would leave most of their programs on the VDBE.
 func lowEntryThreshold(t *testing.T) {
-	old := vmJITMinWork
-	vmJITMinWork = 3
-	t.Cleanup(func() { vmJITMinWork = old })
+	old, oldFree := vmJITMinWork, vmJITLoopFree
+	vmJITMinWork, vmJITLoopFree = 3, true
+	t.Cleanup(func() { vmJITMinWork, vmJITLoopFree = old, oldFree })
 }

@@ -32,6 +32,10 @@ type compiler struct {
 	// can change.
 	rowOrderFree bool
 
+	// inConstOnce is set while compileFunc codes a call it computes once, so
+	// the call itself compiles plainly.
+	inConstOnce bool
+
 	// recSelfKeepsRow maps the cursor of a recursive CTE's self-reference to
 	// whether an outer join's NULL extension of it keeps the current queue row
 	// (C's pseudo-cursor; emitNullExtend). Set by emitJoinLoops; a cursor
@@ -260,6 +264,19 @@ type compiler struct {
 	// selectInnerLoop does not evaluate the result list of an SRT_Exists
 	// destination (select.c, the "eDest!=SRT_Exists" arm).
 	existsStmt *SelectStmt
+
+	// existsMemo is the programs of the EXISTS directly inside the body of the
+	// one this compiler is compiling twice (compileExistsSubquery: as written,
+	// then with its result list blanked): the first compile records them and
+	// the second, existsMemoRead, takes them, since only the result list
+	// differs. Compiling each again made nested EXISTS cost 2^depth compiles.
+	existsMemo     map[*SelectStmt]*Program
+	existsMemoRead bool
+
+	// subUncorrelated is, on a statement's outermost compiler, whether each
+	// sub-select a WHERE term holds compiled uncorrelated
+	// (subTermsUncorrelated).
+	subUncorrelated map[*SelectStmt]bool
 
 	// existsJoinPlan is the planned existsToJoin rewrite of this compiler's
 	// SELECT (markWherePlanExistsEligibility), nil when there is none or the
@@ -511,6 +528,45 @@ func (c *compiler) here() int { return len(c.insns) }
 
 // patch sets instruction addr's jump target (P2) to target.
 func (c *compiler) patch(addr, target int) { c.insns[addr].P2 = target }
+
+// constOnceBlock reports whether in[pc] opens the block compileFunc codes
+// for a call computed once -- "NotNull flag, end"; the call; "Copy r, dst";
+// "Integer 1, flag" -- returning the address past it and its flag register.
+// Whatever the flag holds, the block leaves dst the call's value, so a reader
+// may take the block as straight-line code.
+func constOnceBlock(in []Instruction, pc int) (end, flag int, ok bool) {
+	if pc < 0 || pc >= len(in) || in[pc].Op != OpNotNull {
+		return 0, 0, false
+	}
+	end, flag = in[pc].P2, in[pc].P1
+	if end-2 <= pc+1 || end > len(in) {
+		return 0, 0, false
+	}
+	if cp, set := in[end-2], in[end-1]; cp.Op != OpCopy || set.Op != OpInteger || set.P1 != 1 || set.P2 != flag {
+		return 0, 0, false
+	}
+	return end, flag, true
+}
+
+// dateTimeLiteralCall reports a date/time function called on literals only,
+// none of them 'now': a value fixed for the statement.
+func dateTimeLiteralCall(x FuncExpr) bool {
+	switch x.Name {
+	case "date", "time", "datetime", "julianday", "unixepoch", "strftime":
+	default:
+		return false
+	}
+	if len(x.Args) == 0 || x.Star || x.Distinct || x.Filter != nil || x.Over != nil || len(x.OrderBy) > 0 {
+		return false
+	}
+	for _, a := range x.Args {
+		lit, ok := a.(LiteralExpr)
+		if !ok || lit.materialized || lit.Val.Typ == Text && asciiEqualFold(string(lit.Val.S), "now") {
+			return false
+		}
+	}
+	return true
+}
 
 // errVDBEUnsupported is returned (wrapped) whenever the compiler meets a
 // construct outside this increment's scope. The integration layer treats any
@@ -1402,18 +1458,34 @@ func (c *compiler) compileExistsSubquery(x ExistsExpr, top bool) (int, error) {
 		// nthValueReach.
 		body = nthValueReach(body, 1)
 	}
-	savedExistsJoin, savedExistsStmt, savedExistsAt := c.existsJoin, c.existsStmt, c.existsAt
-	c.existsJoin, c.existsStmt, c.existsAt = top && !x.Not && existsJoinable(body), body, c.existsPos[x.Stmt]
-	prog, err := c.liveSubSelect(body)
-	c.existsJoin, c.existsStmt, c.existsAt = savedExistsJoin, savedExistsStmt, savedExistsAt
-	if err != nil {
-		return 0, err
+	var memo map[*SelectStmt]*Program
+	if c.outer != nil && c.outer.existsMemo != nil {
+		memo = c.outer.existsMemo
 	}
-	// The compile above has reported every unknown name; the result list is
-	// then dead code to EXISTS (existsBlankedStmt).
-	if blanked := existsBlankedStmt(x.Stmt); blanked != nil {
-		if prog2, err2 := c.liveSubSelect(blanked); err2 == nil {
-			prog = prog2
+	prog := memo[x.Stmt]
+	if prog == nil || !c.outer.existsMemoRead {
+		savedMemo, savedRead := c.existsMemo, c.existsMemoRead
+		c.existsMemo, c.existsMemoRead = map[*SelectStmt]*Program{}, false
+		savedExistsJoin, savedExistsStmt, savedExistsAt := c.existsJoin, c.existsStmt, c.existsAt
+		c.existsJoin, c.existsStmt, c.existsAt = top && !x.Not && existsJoinable(body), body, c.existsPos[x.Stmt]
+		var err error
+		prog, err = c.liveSubSelect(body)
+		c.existsJoin, c.existsStmt, c.existsAt = savedExistsJoin, savedExistsStmt, savedExistsAt
+		if err != nil {
+			c.existsMemo, c.existsMemoRead = savedMemo, savedRead
+			return 0, err
+		}
+		// The compile above has reported every unknown name; the result list is
+		// then dead code to EXISTS (existsBlankedStmt).
+		if blanked := existsBlankedStmt(x.Stmt); blanked != nil {
+			c.existsMemoRead = true
+			if prog2, err2 := c.liveSubSelect(blanked); err2 == nil {
+				prog = prog2
+			}
+		}
+		c.existsMemo, c.existsMemoRead = savedMemo, savedRead
+		if memo != nil {
+			memo[x.Stmt] = prog
 		}
 	}
 	if c.pager == nil && c.liveDB == nil && prog.NCursors != 0 {
@@ -3854,6 +3926,10 @@ func (c *compiler) compileInSubquery(x InExpr) (int, error) {
 	}
 	colls := inSubRowCollations(c.affCtx(), lhsCollOperands, subColls)
 	plan := &inSubPlan{prog: prog, affs: affs, colls: colls, not: x.Not, correlated: prog.Correlated}
+	if arity == 1 && lhsSub == nil && len(subAffs) == 1 {
+		plan.sharedAff, plan.shared = c.inSubConvertsGroupValue(probe[0], subAffs[0], subMats[0], x.Sub, prog.Correlated)
+		plan.sharedReal = plan.shared && groupValueIsReal(probe[0])
+	}
 	d := c.alloc()
 	// A correlated membership subquery re-runs per evaluation (no cache slot);
 	// an uncorrelated one runs once and caches, keyed by a fresh slot.
@@ -4064,6 +4140,25 @@ func declineOrSemantic(err error) error {
 // a wrong-arity call errors even when no row runs it ("SELECT coalesce(1) FROM
 // t LIMIT 0").
 func (c *compiler) compileFunc(x FuncExpr) (int, error) {
+	// A date/time call on literals alone, 'now' aside, has one value for the
+	// whole statement and raises no error, so it is computed once, the first
+	// time it is reached, as C codes a constant expression once
+	// (sqlite3ExprCodeRunJustOnce). A filter on "l_shipdate < date('1995-01-01')"
+	// called it for every row.
+	if !c.inConstOnce && dateTimeLiteralCall(x) {
+		flag, dst := c.alloc(), c.alloc()
+		skip := c.emit(Instruction{Op: OpNotNull, P1: flag})
+		c.inConstOnce = true
+		r, err := c.compileFunc(x)
+		c.inConstOnce = false
+		if err != nil {
+			return 0, err
+		}
+		c.emit(Instruction{Op: OpCopy, P1: r, P2: dst})
+		c.emit(Instruction{Op: OpInteger, P1: 1, P2: flag})
+		c.patch(skip, c.here())
+		return dst, nil
+	}
 	// "f(*)" on a non-aggregate is "f()": the grammar passes zero arguments and the
 	// arity check decides (abs(*) is an arity error).
 	// likelihood()'s probability is checked when the call is coded, as C does: a

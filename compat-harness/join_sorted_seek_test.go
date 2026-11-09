@@ -1,0 +1,114 @@
+package compat
+
+import "testing"
+
+// joinSeekSetup is two tables with no index on the join columns: duplicate,
+// NULL, REAL, TEXT-that-looks-numeric and NOCASE keys, rows inserted out of
+// key order so a level's scan order and its key order differ.
+var joinSeekSetup = []string{
+	"CREATE TABLE a(id INTEGER PRIMARY KEY, k INT, s TEXT COLLATE NOCASE, t TEXT, v)",
+	"CREATE TABLE b(id INTEGER PRIMARY KEY, k INT, s TEXT, t TEXT COLLATE NOCASE, v)",
+	"INSERT INTO a(k,s,t,v) VALUES(3,'X','b',1),(1,'y','a',2),(NULL,'x','A',3),(3,'Y','c',4),(2,'z',NULL,5),(1,'Z','B',6),(4,'w','10',7),(2.0,'W','2',8)",
+	"INSERT INTO b(k,s,t,v) VALUES(1,'x','B',10),(3,'y','a',20),(1,'X','A',30),(NULL,'z','b',40),(5,'Y','10',50),(3,'w','c',60),(2,'x','2',70),(1,'y',NULL,80),(3.0,'Z','C',90)",
+}
+
+// TestJoinSortedSeekKeepsOrder pins joins whose inner level has no index: the
+// level is narrowed per outer row to the rows sharing its join key (OpSortedSeek),
+// and every row, and its ORDER with no ORDER BY, must still be C's.
+func TestJoinSortedSeekKeepsOrder(t *testing.T) {
+	queries := []string{
+		"SELECT a.v, b.v FROM a JOIN b ON a.k=b.k",
+		"SELECT a.v, b.v FROM a JOIN b USING(k)",
+		"SELECT a.v, b.v FROM a, b WHERE b.k=a.k AND b.v>15",
+		"SELECT a.v, b.v FROM a LEFT JOIN b ON a.k=b.k",
+		"SELECT a.v, b.v FROM a LEFT JOIN b ON a.k=b.k AND b.v<60",
+		"SELECT a.v, b.v FROM a LEFT JOIN b ON a.k=b.k WHERE b.v IS NULL",
+		"SELECT a.v, b.v FROM a RIGHT JOIN b ON a.k=b.k",
+		"SELECT a.v, b.v FROM a FULL JOIN b ON a.k=b.k",
+		"SELECT k, a.v, b.v FROM a FULL JOIN b USING(k)",
+		"SELECT a.v, b.v FROM a FULL JOIN b ON a.k=b.k AND a.v>2",
+		"SELECT a.v, b.v FROM a JOIN b ON a.s=b.s",
+		"SELECT a.v, b.v FROM a JOIN b ON b.s=a.s",
+		"SELECT a.v, b.v FROM a JOIN b ON a.t=b.t",
+		"SELECT a.v, b.v FROM a JOIN b ON b.t=a.t",
+		"SELECT a.v, b.v FROM a JOIN b ON a.t=b.k",
+		"SELECT a.v, b.v FROM a JOIN b ON b.k=a.t",
+		"SELECT a.v, b.v FROM a JOIN b ON a.k+0=b.k",
+		"SELECT a.v, b.v FROM a JOIN b ON a.k=b.k JOIN a a2 ON a2.k=b.k",
+		"SELECT a.v, b.v, a2.v FROM a JOIN b ON a.k=b.k LEFT JOIN a a2 ON a2.s=b.s",
+		"SELECT a.v, b.v FROM a JOIN b ON a.k IS b.k",
+		"SELECT x.v, y.v FROM a x JOIN a y ON x.k=y.k",
+		"SELECT sum(a.v*b.v), count(*) FROM a JOIN b ON a.k=b.k",
+		"SELECT a.v, (SELECT group_concat(b.v) FROM b WHERE b.k=a.k) FROM a",
+		"SELECT a.v, b.v FROM a JOIN b ON a.k=b.k LIMIT 3",
+		"SELECT a.k, count(b.v) FROM a LEFT JOIN b ON a.k=b.k GROUP BY a.k",
+		"SELECT a.v, b.v FROM a, b WHERE (b.id=a.k AND a.v<4) OR (b.id=a.k AND b.v>40) OR (b.id=a.k AND a.s='z')",
+		"SELECT sum(a.v*b.v) FROM a, b WHERE (b.id=a.k AND a.v<4) OR (a.k=b.id AND b.v>40)",
+		"SELECT a.v, b.v FROM a, b WHERE (b.k=a.k AND a.v<4) OR (b.k=a.k AND b.v>40)",
+		"SELECT a.v, b.v FROM a, b WHERE (b.k=a.k AND a.v<4) OR (b.v=a.v*10)",
+	}
+	for _, q := range queries {
+		differ(t, q, append(append([]string(nil), joinSeekSetup...), q))
+	}
+}
+
+// TestJoinSortedSeekAfterWrites pins a seek on a table the same statement's
+// earlier rows changed, and one an UPDATE ... FROM drives.
+func TestJoinSortedSeekAfterWrites(t *testing.T) {
+	differ(t, "update from", append(append([]string(nil), joinSeekSetup...),
+		"UPDATE a SET v = v + b.v FROM b WHERE b.k = a.k AND b.v > 50",
+		"SELECT id, v FROM a",
+		"INSERT INTO b(k,v) SELECT a.k, a.v FROM a JOIN b ON a.k=b.k",
+		"SELECT id, k, v FROM b",
+		"DELETE FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k=a.k AND b.v=20)",
+		"SELECT id, v FROM a",
+	))
+}
+
+// TestCompoundDedupUnderCollations pins UNION, INTERSECT and EXCEPT, which
+// dedup through a hashed row set, on keys equal only under a collation or
+// across types, and NOCASE text equal up to a NUL.
+func TestCompoundDedupUnderCollations(t *testing.T) {
+	differ(t, "compound dedup", []string{
+		"CREATE TABLE c(x TEXT COLLATE NOCASE, y)",
+		"INSERT INTO c VALUES('a',1),('A',1),('b',2.0),('B',2),(NULL,NULL),(NULL,NULL),('a'||char(0)||'b',3),('A'||char(0)||'c',3)",
+		"SELECT x, y FROM c UNION SELECT x, y FROM c",
+		"SELECT x FROM c UNION SELECT 'B'",
+		"SELECT x, y FROM c INTERSECT SELECT upper(x), y FROM c",
+		"SELECT x, y FROM c EXCEPT SELECT 'A', 1",
+		"SELECT y FROM c UNION SELECT 2 UNION SELECT 2.0",
+		"SELECT DISTINCT x FROM c",
+		"SELECT x, count(*) FROM c GROUP BY x",
+		"SELECT x, row_number() OVER (PARTITION BY x) FROM c",
+	})
+}
+
+// TestJoinSeekUnderMultiIndexOr pins TPC-H q19's shape: every OR branch pins
+// the inner table's rowid to the outer row, which C answers with one rowid
+// search per branch (MULTI-INDEX OR) and this engine with one rowid seek.
+func TestJoinSeekUnderMultiIndexOr(t *testing.T) {
+	differ(t, "q19 shape", []string{
+		"CREATE TABLE part(pk INTEGER PRIMARY KEY, brand TEXT, size INT)",
+		"CREATE TABLE line(ok INT, pk INT, qty INT, price REAL)",
+		"WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<2000) INSERT INTO part SELECT i, 'B'||(i%5), i%17 FROM s",
+		"WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<6000) INSERT INTO line SELECT i/4, (i*7)%2100, i%30, i*1.5 FROM s",
+		"SELECT sum(price) FROM line, part WHERE (part.pk=line.pk AND brand='B1' AND qty<10) OR (part.pk=line.pk AND brand='B2' AND size<5) OR (part.pk=line.pk AND qty>25)",
+		"SELECT line.ok, part.pk FROM line, part WHERE (part.pk=line.pk AND brand='B1' AND qty<3) OR (part.pk=line.pk AND size=16 AND qty>28)",
+	})
+}
+
+// TestJoinSeekOnTwoColumnKeyKeepsIndexOrder pins a correlated seek on the
+// leading column of a two-column PRIMARY KEY whose rows were written in the
+// key's reverse order: C walks the index, so each outer row's matches come
+// by the second column, not by rowid.
+func TestJoinSeekOnTwoColumnKeyKeepsIndexOrder(t *testing.T) {
+	differ(t, "two-column key order", []string{
+		"CREATE TABLE o(k INTEGER PRIMARY KEY, d TEXT)",
+		"CREATE TABLE l(k INT, n INT, q REAL, PRIMARY KEY(k, n))",
+		"WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<300) INSERT INTO o SELECT i, 'd'||(i%7) FROM s",
+		"WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<1500) INSERT INTO l SELECT 1+(i%300), 10-(i/300), i*0.5 FROM s",
+		"SELECT o.k, l.n, l.q FROM o JOIN l ON l.k = o.k WHERE o.d = 'd3'",
+		"SELECT o.k, group_concat(l.n) FROM o JOIN l ON l.k = o.k WHERE o.k < 20 GROUP BY o.k",
+		"SELECT o.k, sum(l.q) FROM o, l WHERE l.k = o.k AND o.d IN ('d1','d2') GROUP BY o.k ORDER BY 2 DESC LIMIT 5",
+	})
+}

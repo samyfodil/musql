@@ -110,6 +110,9 @@ type vdbeCursor struct {
 	// cursorColumnMasks (vdbe.go) and installed by OpOpenRead; allColumns for
 	// every cursor and every path that does not opt in. It is a PURE
 	// PERFORMANCE HINT: col()/fullRow() re-decode rather than trust it.
+	// scanMask is the columns a materialized cursor's scan decodes from the
+	// segments (scanTableCols); the rest read valueUnread until fetched.
+	scanMask columnMask
 	colMask columnMask
 
 	// seekConfigured/seekKey turn the first rewind() into a rowid point lookup
@@ -161,6 +164,29 @@ type vdbeCursor struct {
 	// false, so that path's materialize-once behaviour is byte-for-byte
 	// unchanged. See rewind().
 	seekReseek bool
+	// idxSeekOrder is the key a correlated index seek's rows are sorted by
+	// (indexSeekHint.order), nil to keep them in rowid order.
+	idxSeekOrder *autoIndexKey
+	// idxListOnce is set by OpAutoIndexOrder on an index seek that runs once:
+	// its rows are positioned as a correlated seek's are, sorted by
+	// idxSeekOrder, rather than built and permuted. idxListReady is that the
+	// list OpAutoIndexOrder positioned stands for every rewind after it, as
+	// the built rows would have.
+	idxListOnce, idxListReady bool
+	// keyListReady is the same for an outermost scan OpAutoIndexOrder
+	// positioned on the table's rows in its key's order (segKeyOrderList).
+	keyListReady bool
+
+	// sorted is OpSortedSeek's copy of the rows, sorted by its column, that
+	// each seek narrows rows/rowids to a run of. nil until the first seek, and
+	// dropped whenever the rows are built again.
+	sorted *sortedRows
+	// segSorted is the same served from the segments (segSortedSeek), kept
+	// across rewinds since nothing is built.
+	segSorted *segSortedRows
+
+	// closed is set by close(); an open makes a fresh cursor.
+	closed bool
 
 	// matched is this cursor's RIGHT/FULL JOIN mark bitmap (parallel to
 	// rows/rowids) -- nil until OpRightJoinMark or OpRightJoinSweepRewind/Next
@@ -173,6 +199,17 @@ type vdbeCursor struct {
 	// is being ordered: the pass OpMultiOrTag filed each row under, consumed
 	// (and cleared) by OpMultiOrSort. See multiOrSortTagged.
 	multiOrGrp []int
+
+	// vmTab is the cursor's table as native code seeks it (vmJIT.tabFor).
+	vmTab *vmTab
+
+	// streamIfOrdered is set by OpOpenRead (P5 4) on the outermost scan when
+	// only its index-order key kept it from streaming: OpAutoIndexOrder lets it
+	// stream when its rows already run in that order (segRowsInKeyOrder).
+	streamIfOrdered bool
+
+	// emptyKnown is whether tableEmpty has answered, and empty its answer.
+	emptyKnown, empty bool
 
 	// streamable is set by OpOpenRead (P5) when the join codegen proved this
 	// cursor is rewound at most once and is not a RIGHT/FULL JOIN mark/sweep
@@ -488,7 +525,7 @@ func (cur *vdbeCursor) normalizeFrom(shared bool, rowid uint64, vals []Value) []
 // more than once per program execution (once per outer-loop combination, for
 // every join level but the outermost).
 func openCursor(p *ReadOnlyPager, tbl *resolvedTable) *vdbeCursor {
-	return &vdbeCursor{pager: p, tbl: tbl, colMask: allColumns}
+	return &vdbeCursor{pager: p, tbl: tbl, colMask: allColumns, scanMask: allColumns}
 }
 
 // readColumn writes column i of the current row into *dst -- OpColumn's whole
@@ -508,8 +545,38 @@ func (cur *vdbeCursor) readColumn(i int, dst *Value) error {
 		return cur.readColumnFromMaskedRow(i, dst)
 	}
 	*dst = cur.rowVals[i]
+	if dst.Typ >= valueGenErr {
+		return cur.oddSlot(i, dst)
+	}
+	return nil
+}
+
+// oddSlot is readColumn's cold half for a slot holding a marker rather than a
+// value: a VIRTUAL column's error, or a column a masked scan left unread,
+// which brings the row in whole first.
+func (cur *vdbeCursor) oddSlot(i int, dst *Value) error {
+	if dst.Typ == valueUnread {
+		if err := cur.fillUnread(); err != nil {
+			return err
+		}
+		*dst = cur.rowVals[i]
+	}
 	if dst.Typ == valueGenErr {
 		return takeGenErr(dst)
+	}
+	return nil
+}
+
+// fillUnread replaces the current row, which a masked scan decoded only in
+// part (scanTableCols), with the whole row, in the cursor's list too.
+func (cur *vdbeCursor) fillUnread() error {
+	vals, found, served := cur.pager.SeekRowidSegments(cur.tbl.root, int64(cur.rowid))
+	if !served || !found {
+		return fmt.Errorf("engine: internal: row %d of %s, read in part, is not there whole", cur.rowid, cur.tbl.name)
+	}
+	cur.rowVals = cur.normalizeFrom(true, cur.rowid, vals)
+	if cur.pos >= 0 && cur.pos < len(cur.rows) {
+		cur.rows[cur.pos] = cur.rowVals
 	}
 	return nil
 }
@@ -558,6 +625,11 @@ func (cur *vdbeCursor) fullRow() ([]Value, error) {
 	}
 	if cur.rowRaw != nil {
 		if err := cur.decodeFullRow(); err != nil {
+			return nil, err
+		}
+	}
+	if slices.ContainsFunc(cur.rowVals, func(v Value) bool { return v.Typ == valueUnread }) {
+		if err := cur.fillUnread(); err != nil {
 			return nil, err
 		}
 	}
@@ -855,6 +927,30 @@ func (cur *vdbeCursor) narrowRowidRangeBy(kind int, key Value) {
 	}
 }
 
+// tableEmpty reports whether the cursor's table has no row, from its first,
+// for a cursor no loop reads (OpIfEmpty's own); ok is false where the answer
+// is the rewind's. Known once, as a rewind materializes once.
+func (cur *vdbeCursor) tableEmpty() (empty, ok bool) {
+	if cur.emptyKnown {
+		return cur.empty, true
+	}
+	if cur.tbl == nil || cur.pager == nil || cur.materialized || cur.fill != nil || cur.rowStore != nil || cur.sub != nil || cur.vt != nil ||
+		cur.seekConfigured || cur.seekSetConfigured || cur.idxSeekConfigured || cur.seekReseek || cur.ranged || cur.segFilter != nil {
+		return false, false
+	}
+	seq, errFn := cur.pager.scanTableCols(cur.tbl.root, 1)
+	empty = true
+	for range seq {
+		empty = false
+		break
+	}
+	if errFn() != nil {
+		return false, false
+	}
+	cur.emptyKnown, cur.empty = true, empty
+	return empty, true
+}
+
 // startSegSource makes src the cursor's row source: the lazy segment scan.
 func (cur *vdbeCursor) startSegSource(src *segRowSource) {
 	// The compiled pre-filter, when OpRewind carried one. Purely a
@@ -867,6 +963,7 @@ func (cur *vdbeCursor) startSegSource(src *segRowSource) {
 	cur.segSrc = src
 	cur.segSrcCols = src.cols
 	cur.segCur = nil
+	cur.seekGen = seekGens.Add(1)
 	cur.streamErrPending = nil
 	cur.pos = -1
 	cur.rowidNull = false
@@ -880,6 +977,10 @@ func openFillCursor(tbl *resolvedTable, fill func() ([][]Value, []int64, error),
 }
 
 func (cur *vdbeCursor) rewind() error {
+	if cur.sorted != nil && (!cur.materialized || cur.fill != nil || cur.seekReseek) {
+		// The rows are about to be built again, possibly into the same arrays.
+		cur.sorted = nil
+	}
 	if cur.sub != nil {
 		return cur.rewindStream()
 	}
@@ -949,6 +1050,14 @@ func (cur *vdbeCursor) rewind() error {
 		cur.matched = nil
 	}
 	if !cur.materialized {
+		if cur.keyListReady && cur.pointSrc.list {
+			// The list is the cursor's own (pointSrc), walked to its end or
+			// not; a walk past the end let go of segSrc.
+			cur.segSrc, cur.segCur = &cur.pointSrc, nil
+			cur.pointSrc.listPos = 0
+			cur.pos = -1
+			return nil
+		}
 		if cur.rowStore != nil {
 			// Whichever exit below built the rows, they are walked in the
 			// planned one-pass order when one was installed.
@@ -1060,6 +1169,25 @@ func (cur *vdbeCursor) rewind() error {
 		// on every row -- so a rowid the list carries that no longer exists is
 		// dropped by the row fetch below.
 		if cur.idxSeekConfigured && !cur.tbl.withoutRowid {
+			if cur.idxListReady && cur.pointSrc.list {
+				cur.segSrc, cur.segCur = &cur.pointSrc, nil
+				cur.pointSrc.listPos = 0
+				cur.pos = -1
+				return nil
+			}
+			cur.idxListReady = false
+			if cur.seekReseek || cur.idxListOnce {
+				if src, served := cur.pager.segListSeekIndex(cur, &cur.pointSrc); served && src.sortListBy(cur.idxSeekOrder) {
+					segIndexSeeksServed.Add(1)
+					cur.seekGen = seekGens.Add(1)
+					cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
+					cur.segSrc, cur.segCur, cur.segSrcCols = src, nil, src.cols
+					cur.streamErrPending = nil
+					cur.pos = -1
+					cur.rowidNull = false
+					return nil
+				}
+			}
 			rowids, served := cur.idxSeekRowids()
 			if served {
 				segIndexSeeksServed.Add(1)
@@ -1067,8 +1195,8 @@ func (cur *vdbeCursor) rewind() error {
 				// Only for a correlated seek, which nothing reorders: a seek
 				// that materializes once may have its rows permuted in place
 				// (OpAutoIndexOrder) or tagged by position (OpMultiOrTag).
-				if cur.seekReseek {
-					if src, served := cur.pager.segListSeek(cur, rowids, &cur.pointSrc); served {
+				if cur.seekReseek || cur.idxListOnce {
+					if src, served := cur.pager.segListSeek(cur, rowids, &cur.pointSrc); served && src.sortListBy(cur.idxSeekOrder) {
 						cur.seekGen = seekGens.Add(1)
 						// Positioned, not built, as a rowid seek is above.
 						cur.segSrc, cur.segCur, cur.segSrcCols = src, nil, src.cols
@@ -1104,6 +1232,9 @@ func (cur *vdbeCursor) rewind() error {
 				if cur.seekReseek {
 					cur.seekSlab = slab
 				}
+				if cur.idxSeekOrder != nil {
+					autoIndexOrderCursor(cur, cur.idxSeekOrder, cur.pager.encoding())
+				}
 				cur.materialized = true
 				cur.pos = -1
 				cur.rowidNull = false
@@ -1121,8 +1252,22 @@ func (cur *vdbeCursor) rewind() error {
 				return nil
 			}
 		}
-		seq, errFn := cur.pager.ScanTable(cur.tbl.root)
+		// Only the columns the program reads are decoded (scanTableCols); a
+		// table computing generated columns, or one with no rowid to fetch the
+		// rest by, is read whole.
+		cols := cur.scanMask
+		if cols == 0 || cur.hasGeneratedCols() || cur.tbl.withoutRowid {
+			cols = allColumns
+		} else if cols != allColumns && cur.tbl.ipkIndex >= 0 {
+			cols |= 1 << uint(min(cur.tbl.ipkIndex, 63))
+		}
+		seq, errFn := cur.pager.scanTableCols(cur.tbl.root, cols)
 		shared := cur.pager.ServesLiveRows(cur.tbl.root)
+		// The copies a shared row's fix-up needs are carved from chunks, as a
+		// seek's are, rather than allocated one per row: an INTEGER PRIMARY
+		// KEY, stored NULL, needs one on every row.
+		plain := shared && !cur.hasGeneratedCols()
+		var slab []Value
 		for rowid, vals := range seq {
 			// The rowid range bounds this scan as it does the segment one, the
 			// rows of the log included. Rowids ascend, so the upper bound ends it.
@@ -1133,6 +1278,17 @@ func (cur *vdbeCursor) rewind() error {
 				continue
 			}
 			cur.rowids = append(cur.rowids, rowid)
+			if n := len(cur.tbl.cols); plain && len(vals) == n && rowNeedsNormalize(cur.tbl.cols, cur.tbl.ipkIndex, vals) {
+				if len(slab) < n {
+					slab = make([]Value, 256*n)
+				}
+				row := slab[:n:n]
+				slab = slab[n:]
+				copy(row, vals)
+				normalizeRowInto(row, cur.tbl.cols, cur.tbl.ipkIndex, rowid)
+				cur.rows = append(cur.rows, row)
+				continue
+			}
 			cur.rows = append(cur.rows, cur.normalizeFrom(shared, rowid, vals))
 		}
 		if err := errFn(); err != nil {
@@ -1149,6 +1305,10 @@ func (cur *vdbeCursor) rewind() error {
 		// move replaces the row ahead of it.
 		if cur.tbl.withoutRowid {
 			cur.orderByWithoutRowidPK()
+		}
+		if cur.idxSeekOrder != nil {
+			// The scan a seek fell back to, in the order its index walk visits.
+			autoIndexOrderCursor(cur, cur.idxSeekOrder, cur.pager.encoding())
 		}
 		cur.materialized = true
 	}
@@ -1402,6 +1562,7 @@ func (cur *vdbeCursor) nullRow() {
 // b-tree cursor, which owns no goroutine). Safe to call more than once, and
 // safe even if rewind was never called.
 func (cur *vdbeCursor) close() {
+	cur.closed = true
 	// Same discipline for the segment row: segCur is what tells readColumn to
 	// go to the segment instead of rowVals, so a closed cursor must not keep
 	// pointing at a row it no longer scans.
@@ -1410,6 +1571,7 @@ func (cur *vdbeCursor) close() {
 	cur.sub = nil
 	cur.rowids = nil
 	cur.rows = nil
+	cur.sorted, cur.segSorted = nil, nil
 	cur.lazyNorm = false
 	// BOTH halves of the current row, never just one. rowRaw is what tells
 	// readColumn a masked rowVals is incomplete, so clearing rowRaw while
@@ -1432,11 +1594,20 @@ func (cur *vdbeCursor) close() {
 // OpRightJoinMark only ever runs immediately after a successful ON test
 // inside the cursor's own Rewind/Next loop body).
 func (cur *vdbeCursor) markMatched() {
-	if cur.matched == nil {
-		cur.matched = make([]bool, len(cur.rows))
+	n, at := len(cur.rows), cur.pos
+	if s := cur.sorted; s != nil && s.ok {
+		// A seek's run: the mark goes on the row's place in the full list,
+		// which the sweep walks.
+		n, at = len(s.orig), -1
+		if cur.pos >= 0 && s.base+cur.pos < len(s.pos) {
+			at = int(s.pos[s.base+cur.pos])
+		}
 	}
-	if cur.pos >= 0 && cur.pos < len(cur.matched) {
-		cur.matched[cur.pos] = true
+	if cur.matched == nil {
+		cur.matched = make([]bool, n)
+	}
+	if at >= 0 && at < len(cur.matched) {
+		cur.matched[at] = true
 	}
 }
 
@@ -1714,6 +1885,17 @@ func (cur *vdbeCursor) reseekRowStoreByPK(db *DB, tbl *tableMeta) bool {
 		key[i] = indexColumnValue(tbl, cur.rowid, cur.rowVals, ci)
 	}
 	enc := db.encoding()
+	if rowids, ok := tbl.rows.uniqConflictCandidates(tbl, pk, key, enc); ok {
+		for _, rid := range rowids {
+			if rvals, have := tbl.rows.get(rid); have && uniqueKeyMatches(db, tbl, pk, key, rid, rvals) {
+				cur.rowid = rid
+				cur.rowVals = normalizeRow(tbl.name, tbl.cols, tbl.ipkIndex, rid, rvals)
+				cur.rowRaw = nil
+				return true
+			}
+		}
+		return false
+	}
 	for rid, rvals := range tbl.rows.all() {
 		match := true
 		for i, ci := range pk.colIdx {

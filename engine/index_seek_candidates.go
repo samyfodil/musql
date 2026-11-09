@@ -162,3 +162,68 @@ func (p *ReadOnlyPager) secondaryIndexSeekCandidates(tableName string, tableRoot
 	}
 	return out, nil
 }
+
+// autoIndexSeekCandidate is a segment table's automatic index (from a PRIMARY
+// KEY or UNIQUE constraint) named name, as a candidate: its SQL is NULL, so
+// its shape is recovered from the table's DDL by ordinal and its name checked,
+// as the planner does (wherePlanIndexChain). For a join level the planner
+// already walks that index on (findJoinIndexSeek).
+func (p *ReadOnlyPager) autoIndexSeekCandidate(tableName string, tableRoot uint32, cols []columnInfo, name string) (indexSeekCandidate, bool) {
+	if name == "" || !p.ScannedFromSegments(tableRoot) {
+		return indexSeekCandidate{}, false
+	}
+	rows, err := p.Schema()
+	if err != nil {
+		return indexSeekCandidate{}, false
+	}
+	tblSQL, owners := "", 0
+	ownerTemp := false
+	for i := range rows {
+		if rows[i].Type == "table" && equalFoldName(rows[i].Name, tableName) {
+			owners++
+			if rows[i].RootPage == tableRoot {
+				tblSQL, ownerTemp = rows[i].SQL, rows[i].Temp
+			}
+		}
+	}
+	if owners != 1 || tblSQL == "" {
+		return indexSeekCandidate{}, false
+	}
+	ordinal, at := 0, 0
+	for i := range rows {
+		r := &rows[i]
+		if r.Type != "index" || r.SQL != "" || r.Temp != ownerTemp || !equalFoldName(r.TblName, tableName) {
+			continue
+		}
+		ordinal++
+		if r.RootPage == 0 && equalFoldName(r.Name, name) {
+			at = ordinal
+		}
+	}
+	if at == 0 || !equalFoldName(name, "sqlite_autoindex_"+tableName+"_"+itoaSmall(at)) {
+		return indexSeekCandidate{}, false
+	}
+	_, _, specs, perr := parseCreateTableColumnsAndAutoIndexes(tblSQL, false)
+	if perr != nil || at > len(specs) {
+		return indexSeekCandidate{}, false
+	}
+	spec := specs[at-1]
+	if spec.onConflict == conflictReplace || len(spec.cols) == 0 || len(spec.desc) > 0 && spec.desc[0] {
+		return indexSeekCandidate{}, false
+	}
+	colIdx := -1
+	for j := range cols {
+		if equalFoldName(cols[j].Name, spec.cols[0]) {
+			colIdx = j
+			break
+		}
+	}
+	if colIdx < 0 {
+		return indexSeekCandidate{}, false
+	}
+	coll := effectiveCollation(cols[colIdx].Collation)
+	if len(spec.colls) > 0 && spec.colls[0] != "" && !equalFoldName(spec.colls[0], coll) {
+		return indexSeekCandidate{}, false
+	}
+	return indexSeekCandidate{name: name, leadingCol: colIdx, coll: coll}, true
+}

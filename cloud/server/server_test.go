@@ -19,6 +19,7 @@ import (
 	v1 "github.com/samyfodil/musql/cloud/gen/cloud/v1"
 	"github.com/samyfodil/musql/cloud/gen/cloud/v1/cloudv1connect"
 	"github.com/samyfodil/musql/cloud/oidc"
+	"github.com/samyfodil/musql/cloud/state"
 )
 
 type env struct {
@@ -66,6 +67,12 @@ func (e *env) tokenFor(email string) string {
 	if err != nil {
 		e.t.Fatal(err)
 	}
+	return e.sign(u)
+}
+
+// sign signs an access token for u.
+func (e *env) sign(u *state.User) string {
+	e.t.Helper()
 	tok, err := e.s.Provider().Sign(&oidc.Claims{
 		Claims: jwt.Claims{Subject: u.ID, Expiry: jwt.NewNumericDate(time.Now().Add(time.Hour))},
 		Use:    oidc.UseAccess, ClientID: oidc.ClientConsole,

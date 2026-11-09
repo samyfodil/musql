@@ -18,6 +18,44 @@ type ColumnTypeCensus struct {
 	Real   int64
 	Text   int64
 	Blob   int64
+	// IntWide counts the INTEGERs a double does not hold exactly, and
+	// RealIntegral the REALs with an integral value a double holds exactly
+	// (-0.0 among them): either rules out PhysNumeric (numericFits).
+	IntWide      int64
+	RealIntegral int64
+}
+
+// numericExact bounds the integers PhysNumeric holds: every one in
+// [-2^53, 2^53] is a double exactly.
+const numericExact = 1 << 53
+
+// countNumeric adds d to what c counts of v for PhysNumeric: v an INTEGER
+// or REAL c counts by its class.
+func (c *ColumnTypeCensus) countNumeric(v Value, d int64) {
+	switch v.Typ {
+	case Int:
+		if v.I < -numericExact || v.I > numericExact {
+			c.IntWide += d
+		}
+	case Float:
+		if numericReadsInt(v.F) {
+			c.RealIntegral += d
+		}
+	}
+}
+
+// numericReadsInt is whether a PhysNumeric cell holding f reads as an
+// INTEGER: integral and within numericExact. -0.0 is, and so a REAL -0.0
+// cannot be stored in one.
+func numericReadsInt(f float64) bool {
+	return f >= -numericExact && f <= numericExact && f == float64(int64(f))
+}
+
+// numericFits is whether every INTEGER and REAL c counted reads back as itself
+// from a PhysNumeric block: an INTEGER as its double, which is integral, and a
+// REAL as itself, which is not.
+func (c ColumnTypeCensus) numericFits() bool {
+	return c.Int > 0 && c.Real > 0 && c.IntWide == 0 && c.RealIntegral == 0
 }
 
 // Rows is the count of rows with stored values, including NULLs.
@@ -112,6 +150,12 @@ const (
 	PhysText                        // 8 bytes: (uint32 heap offset, uint32 length)
 	PhysBlob                        // 8 bytes, same shape as PhysText
 	PhysTagged                      // per-value tag; the escape hatch, priced at ~114ns/row
+	// PhysNumeric is INTEGERs and REALs in one 8-byte double block: a cell
+	// whose value is integral and within numericExact is an INTEGER, any other
+	// a REAL. Only a column whose values all read back as themselves gets one
+	// (numericFits): an INTEGER-declared column holding prices, mostly REALs
+	// and some whole, which PhysFloat64 stored with every INTEGER an exception.
+	PhysNumeric
 )
 
 func (t PhysicalType) String() string {
@@ -126,6 +170,8 @@ func (t PhysicalType) String() string {
 		return "text"
 	case PhysBlob:
 		return "blob"
+	case PhysNumeric:
+		return "numeric"
 	default:
 		return "tagged"
 	}
@@ -161,6 +207,9 @@ func PlanColumn(c ColumnTypeCensus) (PhysicalType, int64) {
 		return PhysNull, 0
 	}
 	class, n := c.Majority()
+	if c.numericFits() && float64(c.Text+c.Blob) <= maxExceptionRate*float64(typed) {
+		return PhysNumeric, c.Text + c.Blob
+	}
 	exceptions := typed - n
 	if float64(exceptions) > maxExceptionRate*float64(typed) {
 		return PhysTagged, 0

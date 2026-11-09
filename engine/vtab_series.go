@@ -5,12 +5,15 @@
 // step=0 is treated as 1; negative step produces descending. start defaults to 0.
 // NULL bounds produce an empty result.
 //
-// An unbounded series (no stop bound) is declined with an error, and so is one
-// longer than maxRows: a scan that cannot stream it (vtab_stream.go)
-// materializes it.
+// A series longer than maxRows is declined with an error: a scan that cannot
+// stream it (vtab_stream.go) materializes it. Without a stop it runs to
+// 4294967295, as in C, unless a constraint on value bounds it.
 package engine
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+)
 
 func init() {
 	RegisterVtabModule("generate_series", seriesModule{})
@@ -42,11 +45,20 @@ const (
 	seriesColStep  = 3
 )
 
-// idxNum bits: which bounds Filter's argv carries, in argv order start,stop,step.
+// idxNum bits, series.c's: which inputs Filter's argv carries, in the order
+// start, stop, step, then the value constraint bounding it from below (=, >=
+// or >) and the one bounding it from above (<= or <).
 const (
-	seriesHasStart = 1 << 0
-	seriesHasStop  = 1 << 1
-	seriesHasStep  = 1 << 2
+	seriesHasStart  = 0x0001
+	seriesHasStop   = 0x0002
+	seriesHasStep   = 0x0004
+	seriesValueEq   = 0x0080
+	seriesValueGE   = 0x0100
+	seriesValueGT   = 0x0200
+	seriesValueLE   = 0x1000
+	seriesValueLT   = 0x2000
+	seriesValueLow  = seriesValueEq | seriesValueGE | seriesValueGT
+	seriesValueHigh = seriesValueLE | seriesValueLT
 )
 
 type seriesTable struct{}
@@ -57,8 +69,10 @@ func (seriesTable) streams() {}
 
 // BestIndex consumes at most one EQ constraint per hidden bound column
 // (start/stop/step), assigning argv slots in the fixed order start, stop, step
-// and recording which are present in IdxNum. Any other constraint (e.g. a range
-// on value) is left for the engine's WHERE to apply.
+// and recording which are present in IdxNum, and, as seriesBestIndex does
+// (series.c:771-824), the usable constraints on value that bound the series:
+// an equality, or the last lower and the last upper bound. The engine still
+// applies every constraint as WHERE, so these only narrow what is generated.
 func (seriesTable) BestIndex(info *VtabIndexInfo) error {
 	argv := 0
 	idxNum := 0
@@ -80,6 +94,41 @@ func (seriesTable) BestIndex(info *VtabIndexInfo) error {
 				idxNum |= target.bit
 				break
 			}
+		}
+	}
+	low, high := -1, -1
+	for i, c := range info.Constraints {
+		if !c.Usable || c.Column != seriesColValue {
+			continue
+		}
+		switch c.Op {
+		case VtabEQ:
+			idxNum = idxNum&^(seriesValueLow|seriesValueHigh) | seriesValueEq
+			low, high = i, -1
+		case VtabGE, VtabGT:
+			if idxNum&seriesValueEq == 0 {
+				bit := seriesValueGE
+				if c.Op == VtabGT {
+					bit = seriesValueGT
+				}
+				idxNum = idxNum&^(seriesValueGE|seriesValueGT) | bit
+				low = i
+			}
+		case VtabLE, VtabLT:
+			if idxNum&seriesValueEq == 0 {
+				bit := seriesValueLE
+				if c.Op == VtabLT {
+					bit = seriesValueLT
+				}
+				idxNum = idxNum&^seriesValueHigh | bit
+				high = i
+			}
+		}
+	}
+	for _, i := range []int{low, high} {
+		if i >= 0 {
+			argv++
+			info.Usage[i].ArgvIndex = argv
 		}
 	}
 	// An UNUSABLE constraint on start/stop/step rejects the whole plan,
@@ -123,80 +172,185 @@ func seriesInputName(col int) string {
 
 func (seriesTable) Open() (VtabCursor, error) { return &seriesCursor{}, nil }
 
-// seriesCursor walks the series: count values from start, step apart.
+// seriesCursor walks the series: count values from base, by apart. start,
+// stop and step are the inputs as given, which the hidden columns report.
 type seriesCursor struct {
 	start, stop, step int64
+	base, by          int64
 	value             int64
 	count, k          uint64
 }
 
+// Filter is seriesFilter (series.c:442-662) without LIMIT, OFFSET and the
+// ORDER BY flags, which this engine does not offer a module: the inputs, then
+// the range the value constraints leave, then the exact last value.
 func (c *seriesCursor) Filter(idxNum int, _ string, argv []Value) error {
-	// Read argv in the order BestIndex assigned: start, stop, step.
+	c.count, c.k = 0, 0
+	// Any NULL input or bound -> empty result (SQLite's documented behavior).
+	for _, v := range argv {
+		if v.Typ == Null {
+			return nil
+		}
+	}
 	i := 0
 	next := func() Value { v := argv[i]; i++; return v }
-	c.start = 0
-	hasStop := false
-	c.step = 1
-	var startV, stopV, stepV Value
+	c.start, c.stop, c.step = 0, 0xffffffff, 1
 	if idxNum&seriesHasStart != 0 {
-		startV = next()
+		c.start = seriesInt(next())
 	}
 	if idxNum&seriesHasStop != 0 {
-		stopV = next()
-		hasStop = true
+		c.stop = seriesInt(next())
 	}
 	if idxNum&seriesHasStep != 0 {
-		stepV = next()
-	}
-	// Any supplied NULL bound -> empty result (SQLite's documented behavior).
-	if (idxNum&seriesHasStart != 0 && startV.Typ == Null) ||
-		(idxNum&seriesHasStop != 0 && stopV.Typ == Null) ||
-		(idxNum&seriesHasStep != 0 && stepV.Typ == Null) {
-		c.count, c.k = 0, 0
-		return nil
-	}
-	if idxNum&seriesHasStart != 0 {
-		c.start = seriesInt(startV)
-	}
-	if idxNum&seriesHasStep != 0 {
-		c.step = seriesInt(stepV)
-		if c.step == 0 {
+		if c.step = seriesInt(next()); c.step == 0 {
 			c.step = 1
 		}
 	}
-	if !hasStop {
-		return fmt.Errorf("engine: generate_series requires a bounded stop in this engine (unbounded series are not materializable)")
+	// A value constraint with no bound on that side starts from the whole
+	// int64 range, which it then narrows.
+	if idxNum&(seriesHasStart|seriesHasStep) == 0 && idxNum&seriesValueLow != 0 {
+		c.start = math.MinInt64
 	}
-	c.stop = seriesInt(stopV)
-
+	if idxNum&(seriesHasStop|seriesHasStep) == 0 && idxNum&(seriesValueEq|seriesValueHigh) != 0 {
+		c.stop = math.MaxInt64
+	}
+	base, term := c.start, c.stop
+	step := uint64(c.step)
+	if c.step < 0 {
+		step = -step // |MinInt64| is 1<<63, as in C
+	}
+	desc := c.step < 0
+	if !desc && base > term || desc && base < term {
+		return nil
+	}
+	if idxNum&(seriesValueLow|seriesValueHigh) != 0 {
+		lo, hi, ok := seriesValueRange(idxNum, next)
+		if !ok {
+			return nil
+		}
+		if !desc {
+			if base < lo {
+				base = int64(uint64(base) + (uint64(lo)-uint64(base))/step*step)
+				if base < lo {
+					if base > int64(uint64(math.MaxInt64)-step) {
+						return nil
+					}
+					base = int64(uint64(base) + step)
+				}
+			}
+			term = min(term, hi)
+		} else {
+			if base > hi {
+				base = int64(uint64(base) - (uint64(base)-uint64(hi))/step*step)
+				if base > hi {
+					if base < int64(1<<63+step) {
+						return nil
+					}
+					base = int64(uint64(base) - step)
+				}
+			}
+			term = max(term, lo)
+		}
+	}
+	var steps uint64
+	if !desc {
+		if base > term {
+			return nil
+		}
+		steps = (uint64(term) - uint64(base)) / step
+	} else {
+		if base < term {
+			return nil
+		}
+		steps = (uint64(base) - uint64(term)) / step
+	}
 	// Count the rows first, to reject a pathologically large series rather than
 	// attempt to materialize it.
 	const maxRows = 1 << 24 // ~16.7M; far beyond any real test, bounded for safety
-	// In uint64: the span of a series over the whole int64 range does not fit
-	// in an int64, and an overflowed count once let
-	// "generate_series(-9223372036854775808, 9223372036854775807, 2)" past this
-	// check into a 2^63-row loop (tabfunc01.test 1300, killed at 27 GB).
-	var count uint64
-	if c.step > 0 {
-		if c.stop >= c.start {
-			count = (uint64(c.stop)-uint64(c.start))/uint64(c.step) + 1
-		}
-	} else { // c.step < 0; -(step+1)+1 is |step| even for MinInt64
-		if c.stop <= c.start {
-			count = (uint64(c.start)-uint64(c.stop))/(uint64(-(c.step+1))+1) + 1
-		}
+	if steps >= maxRows {
+		return fmt.Errorf("engine: generate_series would produce %d rows, exceeding this engine's materialization limit", steps+1)
 	}
-	if count > maxRows {
-		return fmt.Errorf("engine: generate_series would produce %d rows, exceeding this engine's materialization limit", count)
+	c.base, c.by = base, int64(step)
+	if desc {
+		c.by = -c.by
 	}
-	// Exactly count values: a bound check on the value itself wraps at the
-	// int64 ends, and nothing else stops the walk.
-	c.count, c.k, c.value = count, 0, c.start
+	c.count, c.value = steps+1, base
 	return nil
 }
 
-func (c *seriesCursor) Next() error { c.k++; c.value += c.step; return nil }
-func (c *seriesCursor) Eof() bool   { return c.k >= c.count }
+// seriesValueRange is the smallest and largest value the value constraints in
+// idxNum allow, reading their bounds with next, or false when none is. A bound
+// that reads as a REAL (sqlite3_value_numeric_type) is rounded inward.
+func seriesValueRange(idxNum int, next func() Value) (lo, hi int64, ok bool) {
+	lo, hi = math.MinInt64, math.MaxInt64
+	if idxNum&seriesValueEq != 0 {
+		v := applyAffinityToValue(next(), affNumeric)
+		if v.Typ != Float {
+			n := seriesInt(v)
+			return n, n, true
+		}
+		if r := v.F; r != math.Ceil(r) || r < -9223372036854775808.0 || r > 9223372036854775807.0 {
+			return 0, 0, false
+		}
+		n := seriesRealToInt(v.F)
+		return n, n, true
+	}
+	if idxNum&(seriesValueGE|seriesValueGT) != 0 {
+		v := applyAffinityToValue(next(), affNumeric)
+		gt := idxNum&seriesValueGT != 0
+		switch r := v.F; {
+		case v.Typ != Float:
+			lo = seriesInt(v)
+		case r <= -9223372036854775808.0:
+			lo, gt = math.MinInt64, false
+		case r > 9223372036854775807.0:
+			return 0, 0, false
+		default:
+			lo = seriesRealToInt(math.Ceil(r))
+			gt = gt && r == math.Ceil(r)
+		}
+		if gt {
+			if lo == math.MaxInt64 {
+				return 0, 0, false
+			}
+			lo++
+		}
+	}
+	if idxNum&seriesValueHigh != 0 {
+		v := applyAffinityToValue(next(), affNumeric)
+		lt := idxNum&seriesValueLT != 0
+		switch r := v.F; {
+		case v.Typ != Float:
+			hi = seriesInt(v)
+		case r >= 9223372036854775807.0:
+			hi, lt = math.MaxInt64, false
+		case r <= -9223372036854775808.0:
+			return 0, 0, false
+		default:
+			hi = seriesRealToInt(math.Floor(r))
+			lt = lt && r == math.Floor(r)
+		}
+		if lt {
+			if hi == math.MinInt64 {
+				return 0, 0, false
+			}
+			hi--
+		}
+	}
+	return lo, hi, lo <= hi
+}
+
+// seriesRealToInt is seriesRealToI64: r to the nearest int64 toward zero,
+// saturating.
+func seriesRealToInt(r float64) int64 {
+	switch {
+	case r < -9223372036854774784.0:
+		return math.MinInt64
+	case r > 9223372036854774784.0:
+		return math.MaxInt64
+	}
+	return int64(r)
+}
 
 func (c *seriesCursor) Column(i int) (Value, error) {
 	switch i {
@@ -211,6 +365,9 @@ func (c *seriesCursor) Column(i int) (Value, error) {
 	}
 	return Value{}, fmt.Errorf("engine: generate_series: no column %d", i)
 }
+
+func (c *seriesCursor) Next() error { c.k++; c.value += c.by; return nil }
+func (c *seriesCursor) Eof() bool   { return c.k >= c.count }
 
 func (c *seriesCursor) Rowid() (int64, error) { return c.value, nil }
 func (c *seriesCursor) Close() error          { return nil }

@@ -31,6 +31,7 @@ package engine
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -265,7 +266,7 @@ func compileScanAggregate(c *compiler, stmt *SelectStmt, srcs []joinSource, scop
 	// Predicate pushdown: see compileScanPlain (vdbe_scan.go). buckets prune at
 	// their join level; this body tests only the deferred residue. (The local
 	// `plan` here is the aggregate plan, so the pushdown plan is jplan.)
-	jplan := joinPushdownPlan(srcs, scopes, stmt.Where)
+	jplan := joinPushdownPlan(c, srcs, scopes, stmt.Where)
 	if len(jplan.buckets) == 1 {
 		jplan.buckets[0] = consumedFirst(c, srcs, jplan.buckets[0])
 	}
@@ -525,7 +526,7 @@ func planAggArgRegs(c *compiler, plan *aggPlan, grouped bool, srcs []joinSource,
 		// RESOLVE it (resolve.c:1326-1330): "max(x ORDER BY nosuch)" is "no
 		// such column: nosuch" in 3.53.3.
 		if it.orderBy == nil && (it.kind == aggMin || it.kind == aggMax) {
-			for _, ob := range it.srcCall.orderByExprs() {
+			for _, ob := range it.call().orderByExprs() {
 				if err := validateOrderByExprResolves(c, ob); err != nil {
 					return aggArgPlan{}, err
 				}
@@ -663,7 +664,7 @@ func emitDrainStepsWithoutRow(c *compiler, plan *aggPlan, emitDrainStep func(seg
 				return fmt.Errorf("%w: a sorted GROUP BY drain over a row source whose scope and table disagree about their column count, with a per-row aggregate expression to evaluate", errVDBEUnsupported)
 			}
 		}
-		if len(it.orderBy) > 0 || len(it.srcCall.OrderBy) > 0 {
+		if len(it.orderBy) > 0 || len(it.call().OrderBy) > 0 {
 			return fmt.Errorf("%w: a sorted GROUP BY drain over a row source whose scope and table disagree about their column count, with an aggregate ORDER BY to evaluate", errVDBEUnsupported)
 		}
 	}
@@ -1928,7 +1929,10 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 
 		magnet:      gp.magnet,
 		anchorCheck: anchorChk,
+		groupExprs:  gp.groupExprs,
 	}
+	rowFree := !gp.usesGroupBare && !gp.selectHasSubquery && !gp.anchorObservable && anchorChk == nil &&
+		!anyAggOrderBy(aggs) && !orderBySubqueryReadsRow(c.pager, stmt.OrderBy) && !subqueryReadsRow(c.pager, stmt.Having)
 	// See compileScanAggregate's identical call: this is select.c:8746/:8747's
 	// pair for the sorted GROUP BY drain -- finalizeAggFunctions, then HAVING
 	// and the select list CODED against the registers it wrote. Done here so
@@ -1940,6 +1944,31 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	if itemErr != nil {
 		return nil, itemErr
 	}
+	// As compileScanAggregate's: when nothing reads the scanned row but the
+	// steps, which read their registers, the hash path's step gathers none. A
+	// result naming a GROUP BY column reads it from the group's row, so every
+	// item program must leave that block alone.
+	if rowFree {
+		cols, rowids := aggItemsRowReads(plan)
+		if plan.rowFree = len(cols) == 0 && !rowids; !plan.rowFree {
+			plan.rowCols = append(make([]int, 0, len(cols)), cols...)
+			if len(cols) > 0 {
+				plan.rowWidth = slices.Max(cols) + 1
+				if !rowids {
+					plan.anchorKeep = plan.rowCols
+				}
+			}
+			plan.keyCols = make([]int, len(gp.groupExprs))
+			for i, ge := range gp.groupExprs {
+				plan.keyCols[i] = -1
+				if col, ok := ge.(ColumnExpr); ok {
+					if idx, ok := resolveColumnIndex(plan.scopes, col); ok {
+						plan.keyCols[i] = idx
+					}
+				}
+			}
+		}
+	}
 
 	// Hash-aggregate fast path (vdbe_hashagg.go): O(n) instead of sort+drain, only
 	// when byte-identical (see compileScanGroupByHash). Excluded: DISTINCT,
@@ -1947,20 +1976,23 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// scan-ordered groups (hashAggSort drains ascending), select-list subqueries
 	// and bare columns reading the anchor through state only the sorter path has,
 	// and RIGHT/FULL coalesced columns in aggregate arguments, which only the drain
-	// can serve. A reference to a GROUP BY key column is allowed: each bucket holds
+	// can serve. Scan-ordered groups are drained in the order they were made, the
+	// order they arrive in, unless a LIMIT or OFFSET would stop the streamed scan
+	// early. A reference to a GROUP BY key column is allowed: each bucket holds
 	// a full aggAccumulators and magnetWalk runs per bucket in scan order.
-	if !useDistinctBatch && (!hasOrder || orderIsGroupKeyAscending(stmt, gp)) &&
-		!gp.selectHasSubquery &&
+	//
+	// Under any other ORDER BY the groups go on to the same ORDER BY sorter
+	// this path's drain would feed: the hash drain emits them in sorter1's
+	// key order, descending in the keys the ORDER BY pushed DESC onto
+	// (groupDesc), so the emission ordinals that break its ties are the same.
+	ordered := hasOrder && !orderIsGroupKeyAscending(stmt, gp)
+	if !useDistinctBatch && !gp.selectHasSubquery &&
 		!joinHasCoalescedColumns(plan.scopes) &&
-		!anyNonBinaryCollation(gp.groupColls) && !scanOrderGroups {
-		return compileScanGroupByHash(c, stmt, srcs, gp, plan, savedNQueryLoopKnown)
+		!anyNonBinaryCollation(gp.groupColls) && (!scanOrderGroups || !hasLimitOrOffset(stmt)) {
+		return compileScanGroupByHash(c, stmt, srcs, gp, plan, aggs, savedNQueryLoopKnown, ordered, scanOrderGroups, rowFree)
 	}
 
 	sorter1 := c.allocSorter()
-	sorter2 := -1
-	if hasOrder && !useDistinctBatch {
-		sorter2 = c.allocSorter()
-	}
 
 	initAddr := c.emit(Instruction{Op: OpInit})
 	c.patch(initAddr, 1)
@@ -1992,20 +2024,9 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 		coll1 = collationNames(gp.groupColls)
 	}
 	c.emit(Instruction{Op: OpSorterOpen, P1: sorter1, P4: &sorterKeyInfo{nKey: nSortKey, desc: desc1, nulls: nulls1, coll: coll1}})
+	sorter2 := -1
 	if hasOrder && !useDistinctBatch {
-		// sorter2 sorts finished groups by the ORDER BY keys, with the group's emission
-		// ordinal as a final ascending tiebreak (C pushes groups into the ORDER BY sorter
-		// in emission order). Unused with useDistinctBatch.
-		desc2 := make([]bool, nOrder+1)
-		nulls2 := make([]NullsOrder, nOrder+1)
-		// coll2's trailing entry is the sequence-number tiebreak, always BINARY.
-		coll2 := make([]string, nOrder+1)
-		for i, op := range gp.orderPlans {
-			desc2[i] = op.desc
-			nulls2[i] = op.nulls
-			coll2[i] = op.coll
-		}
-		c.emit(Instruction{Op: OpSorterOpen, P1: sorter2, P4: &sorterKeyInfo{nKey: nOrder + 1, desc: desc2, nulls: nulls2, coll: coll2}})
+		sorter2 = c.openGroupOrderSorter(gp)
 	}
 
 	// seqCounterReg is the scan-order sequence counter (see this function's
@@ -2111,7 +2132,7 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// Predicate pushdown: see compileScanPlain (vdbe_scan.go). buckets prune at
 	// their join level; this body tests only the deferred residue. (`plan` is
 	// the aggregate plan here, so the pushdown plan is jplan.)
-	jplan := joinPushdownPlan(srcs, scopes, stmt.Where)
+	jplan := joinPushdownPlan(c, srcs, scopes, stmt.Where)
 	if len(jplan.buckets) == 1 {
 		jplan.buckets[0] = consumedFirst(c, srcs, jplan.buckets[0])
 	}
@@ -2192,15 +2213,21 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// subquery in the WHERE or grouping keys may read them (rowLive), as in
 	// compileScanPlain (e_fkey.test). Restored afterwards: the result phase is not
 	// row-live.
-	savedRowLive := c.rowLive
+	savedRowLive, savedOrderFree := c.rowLive, c.rowOrderFree
 	c.rowLive = true
+	// As compileScanAggregate's, with two more conditions: every grouping term
+	// reads only the outermost loop's table, and that loop carries no order of
+	// its own (an index walk delivering the groups together). The groups then
+	// arrive, and finish, exactly as before; only the order of rows within one,
+	// which nothing here reads, moves.
+	c.rowOrderFree = rowOrderFreeGroups(c, stmt, srcs, jplan, aggs, rowFree)
 	gotoSetup, scanStart := -1, -1
 	if stream {
 		gotoSetup = c.emit(Instruction{Op: OpGoto})
 		scanStart = c.here()
 	}
 	err := aggLoopNQueryLoop(c, savedNQueryLoopKnown, func() error { return emitJoinLoops(c, srcs, jplan, body) })
-	c.rowLive = savedRowLive
+	c.rowLive, c.rowOrderFree = savedRowLive, savedOrderFree
 	if err != nil {
 		return nil, err
 	}
@@ -2241,7 +2268,7 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// batchBase below -- since it also needs the group's OWN key columns,
 	// which live in a record register, copied out via OpRecordColumn, not a
 	// plain register range).
-	var outBase, sort2Base, minSeqSlot, rec2Reg, finalRec, finalBase int
+	var outBase, sort2Base, rec2Reg, finalRec, finalBase int
 	var orderKeyBase, batchBase, batchWidth, batchRecReg int
 	switch {
 	case useDistinctBatch:
@@ -2257,7 +2284,6 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 		batchRecReg = c.allocRec()
 	case hasOrder:
 		sort2Base = c.allocN(nOrder + 1 + nOut)
-		minSeqSlot = sort2Base + nOrder
 		outBase = sort2Base + nOrder + 1
 		rec2Reg = c.allocRec()
 		finalRec = c.allocRec()
@@ -2283,18 +2309,7 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// It is emitted twice (at a boundary, and for the final group),
 	// self-contained each time.
 	emitGroup := func() {
-		if !c.isExistsBody(stmt) {
-			// See isExistsBody: the output list of an EXISTS is never evaluated.
-			for i := 0; i < nOut; i++ {
-				c.emit(Instruction{Op: OpAggResult, P1: outBase + i, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetOut, idx: i}})
-			}
-		}
-		var skipJumps []int
-		if gp.havingPlan != nil {
-			c.emit(Instruction{Op: OpAggResult, P1: havingReg, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetHaving, idx: 0}})
-			// HAVING false or NULL -> skip this group's output.
-			skipJumps = append(skipJumps, c.emit(Instruction{Op: OpIfNot, P1: havingReg, P3: 1}))
-		}
+		skipJumps := c.emitGroupOutputs(stmt, plan, gp, nOut, outBase, havingReg, curKeyRec)
 		switch {
 		case useDistinctBatch:
 			// Collect this group's entry -- [minSeq, groupKey.., out..,
@@ -2328,16 +2343,7 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 			c.emit(Instruction{Op: OpMakeRecord, P1: batchBase, P2: batchWidth, P3: batchRecReg})
 			c.emit(Instruction{Op: OpGroupBatchAppend, P1: batchRecReg})
 		case hasOrder:
-			for i, op := range gp.orderPlans {
-				if op.ordinal > 0 {
-					c.emit(Instruction{Op: OpSCopy, P1: outBase + (op.ordinal - 1), P2: sort2Base + i})
-				} else {
-					c.emit(Instruction{Op: OpAggResult, P1: sort2Base + i, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetOrder, idx: i}})
-				}
-			}
-			c.emit(Instruction{Op: OpSCopy, P1: curEmitSeqReg, P2: minSeqSlot})
-			c.emit(Instruction{Op: OpMakeRecord, P1: sort2Base, P2: nOrder + 1 + nOut, P3: rec2Reg})
-			c.emit(Instruction{Op: OpSorterInsert, P1: sorter2, P2: rec2Reg})
+			c.emitGroupOrderInsert(plan, gp, sorter2, sort2Base, nOut, curEmitSeqReg, curKeyRec, rec2Reg)
 		default:
 			skipJumps = append(skipJumps, c.emitLimitOffsetGate(offsetReg, limitReg, oneReg, haveOffset, haveLimit, outBase, nOut)...)
 		}
@@ -2516,12 +2522,95 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 // The body is WHERE, the GROUP BY keys packed into one record for the bucket
 // lookup, then OpHashAggStep, which reads the row from the positioned cursors
 // like OpAggStep's P3==0 mode, so no payload record is built.
-func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp *groupByPlan, plan *aggPlan, preNQLKnown bool) (*Program, error) {
+// aggItemsRowReads is the columns of the group's row block plan's item
+// programs may read, and whether they may read its rowid block: any operand,
+// or the result register, that falls in one counts.
+func aggItemsRowReads(plan *aggPlan) (cols []int, rowids bool) {
+	seen := map[int]bool{}
+	read := func(it *itemPlan) {
+		if it == nil || it.prog == nil || it.prog.prog == nil {
+			return
+		}
+		p := it.prog
+		// The result register counts too: an item that is just a column is a
+		// program of no instructions whose result IS that column's register.
+		regs := [][]int{{p.resultReg}}
+		for _, ins := range p.prog.Insns {
+			// The registers it reads where segInsnRegs knows them, else all
+			// three operands: a constant operand is not a read of the row.
+			switch ins.Op {
+			case OpInit, OpHalt, OpGoto:
+				continue
+			}
+			if reads, _, _, ok := segInsnRegs(ins); ok {
+				regs = append(regs, reads)
+				continue
+			}
+			regs = append(regs, []int{ins.P1, ins.P2, ins.P3})
+		}
+		for _, rs := range regs {
+			for _, r := range rs {
+				switch {
+				case r >= p.colBase && r < p.colBase+p.nCols && !seen[r-p.colBase]:
+					seen[r-p.colBase] = true
+					cols = append(cols, r-p.colBase)
+				case r >= p.rowidBase && r < p.rowidBase+p.nRowid:
+					rowids = true
+				}
+			}
+		}
+	}
+	for _, it := range plan.outPlans {
+		read(it)
+	}
+	read(plan.havingPlan)
+	for _, op := range plan.orderPlans {
+		read(op.item)
+	}
+	slices.Sort(cols)
+	return cols, rowids
+}
+
+// orderBySubqueryReadsRow is subqueryReadsRow over the ORDER BY's terms.
+func orderBySubqueryReadsRow(p *ReadOnlyPager, terms []OrderTerm) bool {
+	for _, ot := range terms {
+		if subqueryReadsRow(p, ot.Expr) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasLimitOrOffset is whether stmt has a LIMIT or an OFFSET, as written or as
+// a parameter.
+func hasLimitOrOffset(stmt *SelectStmt) bool {
+	return stmt.Limit != nil || stmt.Offset != nil || stmt.LimitParam != nil || stmt.OffsetParam != nil
+}
+
+// rowOrderFreeGroups is compileScanGroupBy's compiler.rowOrderFree: nothing
+// reads the order of rows within a group (rowFree: no anchor; no HAVING, no
+// order-sensitive aggregate), every grouping term reads only the outermost
+// loop's table, and that loop carries no order of its own. The groups then
+// arrive, and finish, as before.
+func rowOrderFreeGroups(c *compiler, stmt *SelectStmt, srcs []joinSource, jplan joinPlan, aggs []*aggItem, rowFree bool) bool {
+	return rowFree && stmt.Having == nil && !anyOrderSensitive(aggs) && len(jplan.execOrder) > 0 &&
+		(len(jplan.autoIdxKeys) == 0 || jplan.autoIdxKeys[0] == nil) &&
+		!slices.ContainsFunc(stmt.GroupBy, func(e Expr) bool {
+			return !keyRefsOnlyCursors(c, e, map[int]bool{srcs[jplan.execOrder[0]].scope.cursor: true})
+		})
+}
+
+func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp *groupByPlan, plan *aggPlan, aggs []*aggItem, preNQLKnown, ordered, scanOrder, rowFree bool) (*Program, error) {
 	nGroup := len(gp.groupExprs)
 	nOut := len(gp.outCols)
 
 	initAddr := c.emit(Instruction{Op: OpInit})
 	c.patch(initAddr, 1)
+	// ordered: the groups go through the ORDER BY sorter (compileScanGroupBy).
+	sorter2 := -1
+	if ordered {
+		sorter2 = c.openGroupOrderSorter(gp)
+	}
 
 	// Scan-phase registers: the group-key columns, packed into their own
 	// small record (keyRec) purely so OpHashAggStep can key its bucket
@@ -2534,7 +2623,7 @@ func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp
 	if len(srcs) == 1 {
 		planConstantKeySeeks(c, srcs, stmt.Where, false)
 	}
-	jplan := joinPushdownPlan(srcs, plan.scopes, stmt.Where)
+	jplan := joinPushdownPlan(c, srcs, plan.scopes, stmt.Where)
 	if len(jplan.buckets) == 1 {
 		jplan.buckets[0] = consumedFirst(c, srcs, jplan.buckets[0])
 	}
@@ -2569,7 +2658,9 @@ func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp
 			}
 			c.emit(Instruction{Op: OpSCopy, P1: r, P2: keyBase + i})
 		}
-		c.emit(Instruction{Op: OpMakeRecord, P1: keyBase, P2: nGroup, P3: keyRec})
+		// A view: the steps read the key before anything writes those
+		// registers, and a new group copies it (aggSlab.cloneValues).
+		c.emit(Instruction{Op: OpMakeRecord, P1: keyBase, P2: nGroup, P3: keyRec, P4: recView{}})
 		if err := emitAggSteps(c, loweredArgs, func(seg int) {
 			c.emit(Instruction{Op: OpHashAggStep, P1: keyRec, P2: seg, P4: plan})
 		}); err != nil {
@@ -2585,39 +2676,61 @@ func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp
 	// subquery in the WHERE or grouping keys may read them (rowLive), as in
 	// compileScanPlain (e_fkey.test). Restored afterwards: the result phase is not
 	// row-live.
-	savedRowLive := c.rowLive
+	savedRowLive, savedOrderFree := c.rowLive, c.rowOrderFree
 	c.rowLive = true
+	c.rowOrderFree = rowOrderFreeGroups(c, stmt, srcs, jplan, aggs, rowFree)
 	err := aggLoopNQueryLoop(c, preNQLKnown, func() error { return emitJoinLoops(c, srcs, jplan, body) })
-	c.rowLive = savedRowLive
+	c.rowLive, c.rowOrderFree = savedRowLive, savedOrderFree
 	if err != nil {
 		return nil, err
 	}
 
 	// Drain phase: one bucket at a time, in group-key-ascending order.
 	curKeyRec := c.allocRec()
-	outBase := c.allocN(nOut)
 	havingReg := -1
 	if gp.havingPlan != nil {
 		havingReg = c.alloc()
 	}
-	offsetReg, limitReg, oneReg, haveOffset, haveLimit := c.emitLimitOffsetCounters(stmt)
+	// Ordered, a group's output is the tail of its ORDER BY sorter record
+	// [orderKeys.., ordinal, out..], as compileScanGroupBy lays it out.
+	nOrder := len(gp.orderPlans)
+	var outBase, sort2Base, seqReg, oneSeq, rec2Reg, finalRec, finalBase int
+	var offsetReg, limitReg, oneReg int
+	var haveOffset, haveLimit bool
+	if ordered {
+		sort2Base = c.allocN(nOrder + 1 + nOut)
+		outBase = sort2Base + nOrder + 1
+		seqReg, oneSeq = c.alloc(), c.alloc()
+		rec2Reg, finalRec, finalBase = c.allocRec(), c.allocRec(), c.allocN(nOut)
+		c.emit(Instruction{Op: OpInteger, P1: 0, P2: seqReg})
+		c.emit(Instruction{Op: OpInteger, P1: 1, P2: oneSeq})
+	} else {
+		outBase = c.allocN(nOut)
+		offsetReg, limitReg, oneReg, haveOffset, haveLimit = c.emitLimitOffsetCounters(stmt)
+	}
 
-	sortJump := c.emit(Instruction{Op: OpHashAggSort})
+	var desc any
+	if slices.Contains(gp.groupDesc, true) {
+		desc = gp.groupDesc
+	}
+	// P3: the groups arrive in scan order (scanOrderGroups), which is the
+	// order they were made.
+	madeOrder := 0
+	if scanOrder {
+		madeOrder = 1
+	}
+	sortJump := c.emit(Instruction{Op: OpHashAggSort, P3: madeOrder, P4: desc})
 	drainLoop := c.here()
 	c.emit(Instruction{Op: OpHashAggData, P2: curKeyRec})
-	if !c.isExistsBody(stmt) {
-		// See isExistsBody: the output list of an EXISTS is never evaluated.
-		for i := 0; i < nOut; i++ {
-			c.emit(Instruction{Op: OpAggResult, P1: outBase + i, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetOut, idx: i}})
-		}
+	if ordered {
+		c.emit(Instruction{Op: OpAdd, P1: oneSeq, P2: seqReg, P3: seqReg})
 	}
-	var skipJumps []int
-	if gp.havingPlan != nil {
-		c.emit(Instruction{Op: OpAggResult, P1: havingReg, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetHaving, idx: 0}})
-		// HAVING false or NULL -> skip this group's output.
-		skipJumps = append(skipJumps, c.emit(Instruction{Op: OpIfNot, P1: havingReg, P3: 1}))
+	skipJumps := c.emitGroupOutputs(stmt, plan, gp, nOut, outBase, havingReg, curKeyRec)
+	if ordered {
+		c.emitGroupOrderInsert(plan, gp, sorter2, sort2Base, nOut, seqReg, curKeyRec, rec2Reg)
+	} else {
+		skipJumps = append(skipJumps, c.emitLimitOffsetGate(offsetReg, limitReg, oneReg, haveOffset, haveLimit, outBase, nOut)...)
 	}
-	skipJumps = append(skipJumps, c.emitLimitOffsetGate(offsetReg, limitReg, oneReg, haveOffset, haveLimit, outBase, nOut)...)
 	skip := c.here()
 	for _, j := range skipJumps {
 		c.patch(j, skip)
@@ -2625,6 +2738,9 @@ func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp
 	c.emit(Instruction{Op: OpHashAggNext, P2: drainLoop})
 	afterDrain := c.here()
 	c.patch(sortJump, afterDrain)
+	if ordered {
+		c.emitOrderedDrain(stmt, sorter2, finalRec, finalBase, nOut)
+	}
 
 	c.emit(Instruction{Op: OpHalt})
 
@@ -2632,6 +2748,7 @@ func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp
 		Insns:      c.insns,
 		NReg:       c.nReg,
 		NCursors:   c.nCursor,
+		NSorters:   c.nSorter,
 		NRecRegs:   c.nRec,
 		NSubCache:  c.nSub,
 		NResultCol: nOut,
@@ -2689,6 +2806,42 @@ func (c *compiler) emitLimitOffsetGate(offsetReg, limitReg, oneReg int, haveOffs
 		c.emit(Instruction{Op: OpSubtract, P1: oneReg, P2: limitReg, P3: limitReg})
 	}
 	return skipJumps
+}
+
+// openGroupOrderSorter opens the sorter a GROUP BY's finished groups are put
+// in their ORDER BY's order by: its keys, then the group's emission ordinal
+// as a final ascending tiebreak (C pushes groups into the ORDER BY sorter in
+// emission order, so its sort is stable over that order).
+func (c *compiler) openGroupOrderSorter(gp *groupByPlan) int {
+	nOrder := len(gp.orderPlans)
+	desc := make([]bool, nOrder+1)
+	nulls := make([]NullsOrder, nOrder+1)
+	// coll's trailing entry is the sequence-number tiebreak, always BINARY.
+	coll := make([]string, nOrder+1)
+	for i, op := range gp.orderPlans {
+		desc[i], nulls[i], coll[i] = op.desc, op.nulls, op.coll
+	}
+	sorter := c.allocSorter()
+	c.emit(Instruction{Op: OpSorterOpen, P1: sorter, P4: &sorterKeyInfo{nKey: nOrder + 1, desc: desc, nulls: nulls, coll: coll}})
+	return sorter
+}
+
+// emitGroupOrderInsert puts a group into its ORDER BY sorter: the record
+// [orderKeys.., ordinal, out..] at sort2Base, the outputs already in place at
+// its tail, each key a copy of the output it names or computed for the group.
+func (c *compiler) emitGroupOrderInsert(plan *aggPlan, gp *groupByPlan, sorter2, sort2Base, nOut, seqReg, curKeyRec, rec2Reg int) {
+	nOrder := len(gp.orderPlans)
+	outBase := sort2Base + nOrder + 1
+	for i, op := range gp.orderPlans {
+		if op.ordinal > 0 {
+			c.emit(Instruction{Op: OpSCopy, P1: outBase + (op.ordinal - 1), P2: sort2Base + i})
+		} else {
+			c.emit(Instruction{Op: OpAggResult, P1: sort2Base + i, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetOrder, idx: i}})
+		}
+	}
+	c.emit(Instruction{Op: OpSCopy, P1: seqReg, P2: sort2Base + nOrder})
+	c.emit(Instruction{Op: OpMakeRecord, P1: sort2Base, P2: nOrder + 1 + nOut, P3: rec2Reg})
+	c.emit(Instruction{Op: OpSorterInsert, P1: sorter2, P2: rec2Reg})
 }
 
 // emitOrderedDrain emits the sorter-2 drain for a GROUP BY + ORDER BY query:
@@ -3011,6 +3164,11 @@ func groupsArriveOutOfKeyOrder(srcs []joinSource, scopes []tableScope, gp *group
 		}
 		j := nEq + next
 		next++
+		// The rowid follows the key's columns, ascending, and is unique: the
+		// whole key of a rowid walk, and the end of the grouping either way.
+		if j == len(key.cols) && c == xnRowid && !src.tbl.withoutRowid {
+			break
+		}
 		if j >= len(key.cols) || j >= len(key.desc) || key.desc[j] ||
 			keyColumnOf(src.tbl, key.cols[j]) != c {
 			inKeyOrder = false
@@ -3065,7 +3223,7 @@ func groupEmissionOrderProvable(p *ReadOnlyPager, c *compiler, srcs []joinSource
 // GROUP BY column.
 func groupingCouldArriveOrdered(p *ReadOnlyPager, srcs []joinSource, scopes []tableScope, gp *groupByPlan, stmt *SelectStmt) bool {
 	if p != nil && len(srcs) > 1 {
-		return !groupTermUnorderable(p, srcs, scopes, gp, stmt)
+		return !groupTermUnorderable(p, srcs, scopes, gp, stmt) && !groupJoinNeverOrdered(p, srcs, scopes, gp, stmt)
 	}
 	if p == nil || len(srcs) != 1 || srcs[0].tbl == nil {
 		return true
@@ -3121,6 +3279,164 @@ func groupingCouldArriveOrdered(p *ReadOnlyPager, srcs []joinSource, scopes []ta
 			}
 		}
 		if covered {
+			return true
+		}
+	}
+	return false
+}
+
+// groupJoinNeverOrdered reports that no join order delivers the grouping
+// unsorted. wherePathSatisfiesOrderBy walks the loops outermost first and stops
+// at the first that is not order-distinct, so a GROUP BY column satisfied
+// neither by an equality term nor by an index of its own table can only be
+// satisfied through a run of order-distinct loops -- and that run cannot start
+// when no table could be order-distinct as the outermost loop: no one-row
+// lookup on constants, no unique index (or rowid) whose key columns are all
+// GROUP BY columns or pinned to constants. Every test errs toward "could": an
+// OR term pins every column it names, an equality between two columns pins
+// both once either is pinned, and any index holding the column disqualifies it.
+func groupJoinNeverOrdered(p *ReadOnlyPager, srcs []joinSource, scopes []tableScope, gp *groupByPlan, stmt *SelectStmt) bool {
+	if stmt == nil || len(scopes) != len(srcs) || len(stmt.From) != len(srcs) || r37cExprMayReferenceRowid(stmt.Where) {
+		return false
+	}
+	jts := make([]joinedTable, len(srcs))
+	for i, s := range srcs {
+		if s.tbl == nil || s.derived != nil || s.cteItem != nil || s.vtabItem != nil || s.tbl.withoutRowid || p.forDB(s.dbIdx) == nil {
+			return false
+		}
+		jts[i] = joinedTable{tbl: s.tbl}
+	}
+	terms := whereSplitAnd(stmt.Where)
+	for _, it := range stmt.From {
+		if len(it.Using) != 0 || it.Natural || r37cExprMayReferenceRowid(it.On) {
+			return false
+		}
+		terms = append(terms, whereSplitAnd(it.On)...)
+	}
+	type tc struct{ tab, col int }
+	local := func(e Expr) (tc, bool) {
+		e, _, _ = whereSkipCollateAndLikely(e)
+		tab, col, ok := wherePlanColumnRef(jts, scopes, e)
+		return tc{tab, col}, ok
+	}
+	// each calls f on every column of this FROM clause that e names.
+	each := func(e Expr, f func(tc)) {
+		var walk func(Expr)
+		walk = func(x Expr) {
+			if x == nil {
+				return
+			}
+			if _, ok := x.(ColumnExpr); ok {
+				if k, ok := local(x); ok {
+					f(k)
+				}
+				return
+			}
+			wherePlanWalkChildren(x, walk)
+		}
+		walk(e)
+	}
+	hasLocal := func(e Expr) bool {
+		found := false
+		each(e, func(tc) { found = true })
+		return found
+	}
+	eq, pinned := map[tc]bool{}, map[tc]bool{}
+	var links [][2]tc
+	for _, t := range terms {
+		inner, _, _ := whereSkipCollateAndLikely(t)
+		var l, r Expr
+		switch x := inner.(type) {
+		case BinaryExpr:
+			switch {
+			case x.Op == "=" || x.Op == "==" || equalFoldName(x.Op, "IS"):
+				l, r = x.L, x.R
+			case equalFoldName(x.Op, "OR"):
+				each(x, func(k tc) { eq[k], pinned[k] = true, true })
+			}
+		case IsNullExpr:
+			if k, ok := local(x.X); ok && !x.Not {
+				eq[k], pinned[k] = true, true
+			}
+		case InExpr:
+			if !x.Not && x.Sub == nil && len(x.List) == 1 {
+				l, r = x.X, x.List[0]
+			}
+		}
+		if l == nil {
+			continue
+		}
+		lk, lok := local(l)
+		rk, rok := local(r)
+		if lok {
+			eq[lk] = true
+			if !hasLocal(r) {
+				pinned[lk] = true
+			}
+		}
+		if rok {
+			eq[rk] = true
+			if !hasLocal(l) {
+				pinned[rk] = true
+			}
+		}
+		if lok && rok {
+			links = append(links, [2]tc{lk, rk})
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for _, lk := range links {
+			if pinned[lk[0]] != pinned[lk[1]] {
+				pinned[lk[0]], pinned[lk[1]], changed = true, true, true
+			}
+		}
+	}
+	groupCols := map[tc]bool{}
+	for _, ge := range gp.groupExprs {
+		if k, ok := local(ge); ok {
+			groupCols[k] = true
+		}
+	}
+	indexes := make([][]whereIndexInfo, len(srcs))
+	for i, s := range srcs {
+		idxs, _, ok := wherePlanIndexList(p.forDB(s.dbIdx), s.tbl, s.tbl.name, "", false, nil)
+		if !ok {
+			return false
+		}
+		indexes[i] = idxs
+	}
+	for i := range srcs {
+		if rowid := (tc{i, -1}); pinned[rowid] || groupCols[rowid] {
+			return false
+		}
+		for _, ix := range indexes[i] {
+			if ix.ipk || !ix.onError {
+				continue
+			}
+			all := true
+			for _, c := range ix.aiColumn[:ix.nKeyCol] {
+				if k := (tc{i, c}); c < 0 || !pinned[k] && !groupCols[k] {
+					all = false
+					break
+				}
+			}
+			if all {
+				return false
+			}
+		}
+	}
+	for k := range groupCols {
+		if k.col < 0 || eq[k] {
+			continue
+		}
+		inIndex := false
+		for _, ix := range indexes[k.tab] {
+			if !ix.ipk && slices.Contains(ix.aiColumn, k.col) {
+				inIndex = true
+			}
+		}
+		if !inIndex {
 			return true
 		}
 	}
@@ -3910,6 +4226,19 @@ func groupByNeededCols(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 		return nil
 	}
 	ok := true
+	// A select-list alias an ORDER BY or HAVING names is that item, whose
+	// columns the select list's own walk marks.
+	alias := func(x ColumnExpr) bool {
+		if x.Qualifier != "" || x.Schema != "" {
+			return false
+		}
+		for _, sc := range stmt.Columns {
+			if sc.HasAlias && equalFoldName(sc.Alias, x.Name) {
+				return true
+			}
+		}
+		return false
+	}
 	var walk func(e Expr)
 	walk = func(e Expr) {
 		if !ok || e == nil {
@@ -3919,6 +4248,9 @@ func groupByNeededCols(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 		case ColumnExpr:
 			if slot := d.slotFor(c, x); slot >= 0 {
 				d.need[slot] = true
+				return
+			}
+			if alias(x) {
 				return
 			}
 			slots := d.coalesceSlots(c, x)
@@ -4201,4 +4533,43 @@ func minMaxRowidQuery(c *compiler, stmt *SelectStmt, srcs []joinSource, plan *ag
 		return 0, false, false
 	}
 	return s.tbl.root, max, true
+}
+
+// emitGroupOutputs emits a GROUP BY group's select list and its HAVING, which
+// jumps (the returned jumps, to be patched past the group's output) when false
+// or NULL. C finalizes every aggregate, then tests HAVING, then evaluates the
+// select list (select.c, finalizeAggFunctions before sqlite3ExprIfFalse before
+// selectInnerLoop). An item here finalizes its own aggregates, so where any
+// item names one the select list is evaluated first, its finalizing raising
+// for every group as C's does; where none does, HAVING comes first, and a
+// group it drops evaluates nothing more, as in C.
+func (c *compiler) emitGroupOutputs(stmt *SelectStmt, plan *aggPlan, gp *groupByPlan, nOut, outBase, havingReg, curKeyRec int) []int {
+	outputs := func() {
+		if !c.isExistsBody(stmt) {
+			// See isExistsBody: the output list of an EXISTS is never evaluated.
+			for i := 0; i < nOut; i++ {
+				c.emit(Instruction{Op: OpAggResult, P1: outBase + i, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetOut, idx: i}})
+			}
+		}
+	}
+	if gp.havingPlan == nil {
+		outputs()
+		return nil
+	}
+	havingFirst := true
+	for _, op := range plan.outPlans {
+		if len(op.aggTemplates) > 0 {
+			havingFirst = false
+		}
+	}
+	if !havingFirst {
+		outputs()
+	}
+	c.emit(Instruction{Op: OpAggResult, P1: havingReg, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetHaving, idx: 0}})
+	// HAVING false or NULL -> skip this group's output.
+	skip := c.emit(Instruction{Op: OpIfNot, P1: havingReg, P3: 1})
+	if havingFirst {
+		outputs()
+	}
+	return []int{skip}
 }

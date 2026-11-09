@@ -46,6 +46,13 @@ func TestColumnarGroupBulkMatchesTheLoop(t *testing.T) {
 		{`SELECT k, min(n) FROM t GROUP BY k ORDER BY k`, false},    // NULLs
 		{`SELECT k, count(DISTINCT v) FROM t GROUP BY k ORDER BY k`, false},
 		{`SELECT id, count(*) FROM t GROUP BY id ORDER BY id LIMIT 20`, false}, // rowid key
+		// A HAVING over aggregates and keys drops its groups before they are
+		// made; one reading anything else is the drain's.
+		{`SELECT k FROM t GROUP BY k HAVING sum(v) > 0`, true},
+		{`SELECT wide FROM t GROUP BY wide HAVING count(*) >= 2 AND max(v) > 990000`, true},
+		{`SELECT k, count(*) FROM t GROUP BY k HAVING min(v) < -999000 OR k = 3 ORDER BY k`, false},
+		{`SELECT k FROM t GROUP BY k HAVING NOT (sum(v) BETWEEN -5000000 AND 5000000)`, true},
+		{`SELECT k FROM t GROUP BY k HAVING CASE WHEN k > 0 THEN sum(v) END IS NULL ORDER BY k`, false},
 	}
 	// A computed key or a bare column is read from the segments alone, so
 	// rows in the delta leave these to the loop.

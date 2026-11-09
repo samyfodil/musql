@@ -18,7 +18,11 @@ import (
 
 // vmRealLowering is, per pc, the REAL arm the instruction there lowers to;
 // ok false where it keeps lowerVM's.
-func vmRealLowering(prog *Program) (out []jit.VInsn, ok []bool) {
+//
+// storesReal, when not nil, says whether a table's segments store a column
+// as REALs (a PhysFloat64 or PhysNumeric block): an INTEGER-declared column
+// of prices is guessed REAL too.
+func vmRealLowering(prog *Program, storesReal func(root uint32, col int) bool) (out []jit.VInsn, ok []bool) {
 	if !jit.VMReal {
 		return nil, nil
 	}
@@ -48,7 +52,8 @@ func vmRealLowering(prog *Program) (out []jit.VInsn, ok []bool) {
 			set(ins.P2, true)
 		case OpColumn:
 			t := tables[ins.P1]
-			set(ins.P3, t != nil && ins.P2 >= 0 && ins.P2 < len(t.cols) && t.cols[ins.P2].Aff == affReal)
+			set(ins.P3, t != nil && ins.P2 >= 0 && ins.P2 < len(t.cols) &&
+				(t.cols[ins.P2].Aff == affReal || storesReal != nil && storesReal(t.root, ins.P2)))
 		case OpSCopy, OpCopy:
 			set(ins.P2, real[ins.P1])
 		case OpInteger, OpInt64, OpNull, OpString8, OpBlob, OpVariable, OpNot, OpRowid:

@@ -149,7 +149,7 @@ func existsInlineOperands(in Instruction) bool {
 		OpColumn, OpRowid, OpOuterColumn, OpOuterRowid,
 		OpInteger, OpVariable, OpNull, OpString8, OpReal, OpSCopy, OpCopy,
 		OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull,
-		OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpSeekRowidSetHint, OpAutoIndexOrder, OpResultRow,
+		OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpSeekRowidSetHint, OpAutoIndexOrder, OpSortedSeek, OpResultRow,
 		OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpConcat, OpFunction, OpOpenDerived:
 		return true
 	}
@@ -228,7 +228,7 @@ func existsInline(prog *Program, at int, sub *Program) {
 			}
 		case OpIf, OpIfNot, OpIsNull, OpNotNull:
 			r.P1, r.P2 = reg(in.P1), jump(in.P2)
-		case OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpSeekRowidSetHint:
+		case OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpSeekRowidSetHint, OpSortedSeek:
 			r.P1, r.P2 = cur(in.P1), reg(in.P2)
 		case OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpConcat:
 			r.P1, r.P2, r.P3 = reg(in.P1), reg(in.P2), reg(in.P3)
