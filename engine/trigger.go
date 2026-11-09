@@ -1643,7 +1643,7 @@ func (db *DB) validateSimpleBodySelectEager(sel *SelectStmt, outer *evalCtx, ord
 			return err
 		}
 	}
-	jts, _, err := pager.resolveFrom(sel.From, nil)
+	jts, err := pager.resolveFromColumns(sel.From)
 	if err != nil {
 		return err
 	}

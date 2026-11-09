@@ -346,13 +346,13 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 					}
 					// &items[i], not &it: resolveViewRowsGuarded needs the AST node's stable
 					// address to recognize a repeat ask about the same FromItem.
-					// The schema-only retry takes a view's columns without running its body
-					// (viewColumnInfos).
+					// The schema-only retry, and a caller that wants columns only, take a
+					// view's columns without running its body (viewColumnInfos).
 					var cols []columnInfo
 					var vrows [][]Value
 					var rerr error
-					if p.derivedSchemaOnly {
-						cols, rerr = rp.viewColumnInfos(it.Table, pcv)
+					if p.derivedSchemaOnly || p.fromColumnsOnly {
+						cols, rerr = rp.viewColumnsGuarded(it.Table, pcv)
 					} else {
 						cols, vrows, rerr = rp.resolveViewRowsGuarded(&items[i], it.Table, pcv, params)
 					}
@@ -673,6 +673,17 @@ func (p *ReadOnlyPager) resolveFromSchemaOnly(items []FromItem) ([]joinedTable, 
 	return jts, nil
 }
 
+// resolveFromColumns is resolveFrom for a caller that reads only the scopes it
+// builds: the tables' columns, never their rows (fromColumnsOnly). Loading them
+// made every compile that expands a view scan each table the view names.
+func (p *ReadOnlyPager) resolveFromColumns(items []FromItem) ([]joinedTable, error) {
+	saved := p.fromColumnsOnly
+	p.fromColumnsOnly = true
+	defer func() { p.fromColumnsOnly = saved }()
+	jts, _, err := p.resolveFrom(items, nil)
+	return jts, err
+}
+
 // derivedSchemaCols builds a FROM subquery's column list without running it,
 // or returns (nil, false) when neither the schema-only retry nor a
 // columns-only resolve (derivedSelectScope) is under way, or the body does not
@@ -746,7 +757,7 @@ func (p *ReadOnlyPager) subqueryColumnNames(sub *SelectStmt, names []string) []s
 	}
 	var scopes []tableScope
 	if len(sub.From) > 0 {
-		jts, _, err := p.resolveFrom(sub.From, nil)
+		jts, err := p.resolveFromColumns(sub.From)
 		if err != nil {
 			return names
 		}
@@ -1079,7 +1090,7 @@ func (p *ReadOnlyPager) armColumnSignals(core *SelectStmt) ([]armColSig, bool) {
 	}
 	var scopes []tableScope
 	if len(core.From) > 0 {
-		jts, _, err := p.resolveFrom(core.From, nil)
+		jts, err := p.resolveFromColumns(core.From)
 		if err != nil {
 			return nil, false
 		}

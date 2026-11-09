@@ -313,7 +313,7 @@ func (p *ReadOnlyPager) r41CompoundNotFlattened(stmt *SelectStmt, arms []*Select
 // collating sequence, folded ("binary" when it declares none), and "" for a
 // result that is not a bare column.
 func (p *ReadOnlyPager) r41ArmCollations(a *SelectStmt) ([]string, bool) {
-	jts, _, err := p.resolveFrom(a.From, nil)
+	jts, err := p.resolveFromColumns(a.From)
 	if err != nil {
 		return nil, false
 	}

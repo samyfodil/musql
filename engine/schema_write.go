@@ -950,7 +950,7 @@ func (db *DB) createTableAsSelect(name string, isTemp bool, sel *SelectStmt, ifN
 		// The tables' columns, never their rows: execSelect below reads those.
 		saved := pager.fromColumnsOnly
 		pager.fromColumnsOnly = true
-		jts, _, ferr := pager.resolveFrom(sel.From, nil)
+		jts, ferr := pager.resolveFromColumns(sel.From)
 		pager.fromColumnsOnly = saved
 		if ferr != nil {
 			return ferr
