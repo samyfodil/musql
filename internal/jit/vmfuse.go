@@ -471,6 +471,26 @@ func vmMovesCursor(op VOp) bool {
 	return op == VNext || op == VRewind || op == VOpen || op == VClose || op == VSeekRowid || op == VSeekIdx || op == VSeekRewind
 }
 
+// vmRunPredicted is vmRunColumns for a segment column read with a predicted
+// kind (T): only the run's predicted reads of the cursor share its check, so
+// a column read the full way, which may not be served, cannot fail it.
+func vmRunPredicted(prog []VInsn, bound []bool, pc int) uint64 {
+	c, mask := prog[pc].A, uint64(1)<<uint(prog[pc].B)
+	for q := pc + 1; q < len(prog) && q < pc+48; q++ {
+		if vmRunStart(prog, bound, q) {
+			break
+		}
+		in := prog[q]
+		if vmMovesCursor(in.Op) && in.A == c {
+			break
+		}
+		if in.Op == VColumn && in.A == c && in.Imm == 1 && in.T != 0 {
+			mask |= uint64(1) << uint(in.B)
+		}
+	}
+	return mask
+}
+
 // vmRunColumns adds to mask and maxCol the columns of the cursor pc's VColumn
 // reads that later VColumns of the same run read before anything moves it:
 // what the first one checks for them all.

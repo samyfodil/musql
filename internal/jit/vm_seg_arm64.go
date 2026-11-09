@@ -30,21 +30,21 @@ func (e *vmEmitArm) segColumn(pc int, in VInsn) {
 	a, L := e.a, e.lay
 	e.destNoS(pc, in.C)
 	delete(e.zeroS, in.C) // every word of the destination is written below
-	seg, nonull, noexc, done := e.vmLabel("sg"), e.vmLabel("sn"), e.vmLabel("sx"), e.vmLabel("sd")
+	seg, nonull, noexc, done, rows := e.vmLabel("sg"), e.vmLabel("sn"), e.vmLabel("sx"), e.vmLabel("sd"), e.vmLabel("sw")
 	kinds := []int{VSegInt, VSegFloat, VSegNumeric, VSegIntReal, VSegRowid, VSegText}
 	at := map[int]string{}
 	for _, k := range kinds {
 		at[k] = e.vmLabel("sk")
 	}
 	if kind, ok := at[in.T]; ok {
-		full, fnosel := e.vmLabel("sf"), e.vmLabel("so")
+		full, fnosel, prows := e.vmLabel("sf"), e.vmLabel("so"), e.vmLabel("sr")
 		base, have := e.holds[^in.A]
 		if have {
 			e.pinned[base] = true
 		} else {
 			mask := uint64(1) << uint(in.B)
 			if e.cache {
-				mask, _ = vmRunColumns(e.prog, e.bound, pc, mask, in.B)
+				mask = vmRunPredicted(e.prog, e.bound, pc)
 			}
 			e.curBase(in.A)
 			a.LdrImm(X10, X9, VCursorOffOk)
@@ -70,7 +70,7 @@ func (e *vmEmitArm) segColumn(pc int, in VInsn) {
 		}
 		a.LdrImm(X5, base, VCursorOffPos)
 		a.LdrImm(X6, base, VCursorOffSeg)
-		a.Cbz(X6, full)
+		a.Cbz(X6, prows)
 		a.LdrImm(X4, base, VCursorOffSel)
 		a.Cbz(X4, fnosel)
 		a.LdrRegIdx(X5, X4, X5)
@@ -81,6 +81,14 @@ func (e *vmEmitArm) segColumn(pc int, in VInsn) {
 		a.LdrImm(X8, X7, VSegColOffPlain)
 		a.CmpImm(X8, uint32(in.T))
 		a.Bcond(CondE, kind)
+		a.B(full)
+		// A cursor reading its row list: the checks above hold and X5 is
+		// its position.
+		a.Label(prows)
+		if base != X9 {
+			a.MovReg(X9, base)
+		}
+		a.B(rows)
 		a.Label(full)
 	} else {
 		e.unmap(^in.A)
@@ -101,6 +109,7 @@ func (e *vmEmitArm) segColumn(pc int, in VInsn) {
 	a.Cbnz(X6, seg)
 
 	// The row list's: the Value copied whole, its string's pointer shared.
+	a.Label(rows)
 	a.MovImm64(X10, sliceHeaderSize)
 	a.Mul(X10, X5, X10)
 	a.LdrImm(X4, X9, VCursorOffRows)

@@ -54,7 +54,7 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 		} else {
 			mask := uint64(1) << uint(in.B)
 			if e.cache {
-				mask, _ = vmRunColumns(e.prog, e.bound, pc, mask, in.B)
+				mask = vmRunPredicted(e.prog, e.bound, pc)
 			}
 			a.MovRegMemD(RAX, RDI, POffCur)
 			a.LeaRegMemD(RAX, RAX, cb)
@@ -81,7 +81,7 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 		a.MovRegMemD(RDX, base, VCursorOffPos)
 		a.MovRegMemD(R9, base, VCursorOffSeg)
 		a.TestRegReg(R9, R9)
-		a.Jcc(CondE, l("full"))
+		a.Jcc(CondE, l("prows"))
 		a.MovRegMemD(R10, base, VCursorOffSel)
 		a.TestRegReg(R10, R10)
 		a.Jcc(CondE, l("fnosel"))
@@ -91,6 +91,12 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 		a.AddRegImm32(R10, int32(in.B*VSegColSize))
 		a.CmpMemDImm8(R10, VSegColOffPlain, int8(in.T))
 		a.Jcc(CondE, l(name))
+		a.Jmp(l("full"))
+		// A cursor reading its row list: the checks above hold and RDX is
+		// its position.
+		a.Label(l("prows"))
+		a.MovRegMemD(RAX, RDI, POffCur)
+		a.Jmp(l("rows"))
 		a.Label(l("full"))
 	} else {
 		e.unmap(^in.A)
@@ -111,6 +117,7 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 	a.Jcc(CondNE, l("seg"))
 
 	// The row list's: the Value copied whole, its string's pointer shared.
+	a.Label(l("rows"))
 	a.MovRegImm64(R10, sliceHeaderSize)
 	a.ImulRegReg(RDX, R10)
 	a.AddRegMemD(RDX, RAX, cb+VCursorOffRows)
