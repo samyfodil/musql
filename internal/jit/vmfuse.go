@@ -1,7 +1,7 @@
 package jit
 
 import (
-	"slices"
+	"math/bits"
 	"sync/atomic"
 )
 
@@ -334,19 +334,57 @@ func VMFusionStatsForTest() (pairs, dead int64) {
 // by native code in this run, so another integer needs only its I word.
 // Everything is forgotten at a boundary.
 type vmKnow struct {
-	isInt, noS, canon map[int]bool
+	isInt, noS, canon knowSet
 	// isFloat: known to hold a REAL (a guard passed, or native code wrote
 	// one).
-	isFloat map[int]bool
-	// konst: known to hold the INTEGER given, which a VInt of this run wrote
-	// with nothing writing the register since.
-	konst map[int]int64
+	isFloat knowSet
+	// konst: known to hold the INTEGER konstV holds for it, which a VInt of
+	// this run wrote with nothing writing the register since.
+	konst  knowSet
+	konstV []int64
 }
 
-func newVMKnow() *vmKnow {
-	return &vmKnow{isInt: map[int]bool{}, noS: map[int]bool{}, canon: map[int]bool{}, isFloat: map[int]bool{},
-		konst: map[int]int64{}}
+// knowSet is a set of registers, a bitmap that grows to the highest one
+// added.
+type knowSet []uint64
+
+func (s knowSet) has(r int) bool { return r >= 0 && r/64 < len(s) && s[r/64]&(1<<(r%64)) != 0 }
+
+func (s *knowSet) add(r int) {
+	if r < 0 {
+		return
+	}
+	if n := r/64 + 1; n > len(*s) {
+		*s = append(*s, make([]uint64, n-len(*s))...)
+	}
+	(*s)[r/64] |= 1 << (r % 64)
 }
+
+func (s knowSet) del(r int) {
+	if r >= 0 && r/64 < len(s) {
+		s[r/64] &^= 1 << (r % 64)
+	}
+}
+
+func (s knowSet) any() bool {
+	for _, w := range s {
+		if w != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// each calls f for every register in s, in ascending order.
+func (s knowSet) each(f func(r int)) {
+	for i, w := range s {
+		for ; w != 0; w &= w - 1 {
+			f(i*64 + bits.TrailingZeros64(w))
+		}
+	}
+}
+
+func newVMKnow() *vmKnow { return &vmKnow{} }
 
 func (k *vmKnow) reset() {
 	clear(k.isInt)
@@ -356,38 +394,59 @@ func (k *vmKnow) reset() {
 	clear(k.konst)
 }
 
+func (k *vmKnow) konstOf(r int) (int64, bool) {
+	if !k.konst.has(r) {
+		return 0, false
+	}
+	return k.konstV[r], true
+}
+
+func (k *vmKnow) setKonst(r int, v int64) {
+	if r < 0 {
+		return
+	}
+	k.konst.add(r)
+	if r >= len(k.konstV) {
+		k.konstV = append(k.konstV, make([]int64, r+1-len(k.konstV))...)
+	}
+	k.konstV[r] = v
+}
+
 // wrote forgets the constants in the registers in writes, before it is
 // emitted.
 func (k *vmKnow) wrote(in VInsn, pc int) {
 	for _, r := range vmStepOf(in, pc).defs {
-		delete(k.konst, r)
+		k.konst.del(r)
 	}
 }
 
 // wroteInt records that native code made r the integer Value.
 func (k *vmKnow) wroteInt(r int) {
-	k.isInt[r], k.noS[r], k.canon[r] = true, true, true
-	delete(k.isFloat, r)
+	k.isInt.add(r)
+	k.noS.add(r)
+	k.canon.add(r)
+	k.isFloat.del(r)
 }
 
 // wroteFloat records that native code made r a REAL Value.
 func (k *vmKnow) wroteFloat(r int) {
-	k.isFloat[r], k.noS[r] = true, true
-	delete(k.isInt, r)
-	delete(k.canon, r)
+	k.isFloat.add(r)
+	k.noS.add(r)
+	k.isInt.del(r)
+	k.canon.del(r)
 }
 
 // wroteAny records that native code wrote r a value of unknown type (a copy
 // of a column or a register, a NULL); noS is whether it is known to hold no
 // string or blob.
 func (k *vmKnow) wroteAny(r int, noS bool) {
-	delete(k.isInt, r)
-	delete(k.canon, r)
-	delete(k.isFloat, r)
+	k.isInt.del(r)
+	k.canon.del(r)
+	k.isFloat.del(r)
 	if noS {
-		k.noS[r] = true
+		k.noS.add(r)
 	} else {
-		delete(k.noS, r)
+		k.noS.del(r)
 	}
 }
 
@@ -577,14 +636,9 @@ func vmRunColumns(prog []VInsn, bound []bool, pc int, mask uint64, maxCol int) (
 // wrote may have the same type with other bytes set), and nothing about a
 // register the rest of the run does not mention.
 
-// vmEntryKeep is the registers the run from pc on reads or writes.
-func vmEntryKeep(prog []VInsn, bound []bool, pc int) map[int]bool {
-	return vmEntryKeepInto(map[int]bool{}, prog, nil, bound, pc)
-}
-
-// vmEntryKeepInto is vmEntryKeep into keep, cleared first, reading the steps
-// from steps (vmStepsOf).
-func vmEntryKeepInto(keep map[int]bool, prog []VInsn, steps []progStep, bound []bool, pc int) map[int]bool {
+// vmEntryKeepInto is the registers the run from pc on reads or writes, into
+// keep, cleared first, reading the steps from steps (vmStepsOf).
+func vmEntryKeepInto(keep knowSet, prog []VInsn, steps []progStep, bound []bool, pc int) knowSet {
 	clear(keep)
 	for q := pc; q < len(prog); q++ {
 		if q > pc && vmRunStart(prog, bound, q) {
@@ -595,10 +649,10 @@ func vmEntryKeepInto(keep map[int]bool, prog []VInsn, steps []progStep, bound []
 			break
 		}
 		for _, r := range st.uses {
-			keep[r] = true
+			keep.add(r)
 		}
 		for _, r := range st.defs {
-			keep[r] = true
+			keep.add(r)
 		}
 	}
 	return keep
@@ -607,26 +661,24 @@ func vmEntryKeepInto(keep map[int]bool, prog []VInsn, steps []progStep, bound []
 // pruneForEntry cuts k down to what an entry stub at pc establishes, and
 // returns the registers it must check: those known to be INTEGERs, and those
 // known to hold no string.
-func (k *vmKnow) pruneForEntry(keep map[int]bool) (ints, noS []int) {
+func (k *vmKnow) pruneForEntry(keep knowSet) (ints, noS []int) {
 	clear(k.canon)
 	clear(k.isFloat) // a REAL op guards its operands again
 	clear(k.konst)
-	for r := range k.isInt {
-		if keep[r] {
+	k.isInt.each(func(r int) {
+		if keep.has(r) {
 			ints = append(ints, r)
 		} else {
-			delete(k.isInt, r)
+			k.isInt.del(r)
 		}
-	}
-	for r := range k.noS {
-		if keep[r] {
+	})
+	k.noS.each(func(r int) {
+		if keep.has(r) {
 			noS = append(noS, r)
 		} else {
-			delete(k.noS, r)
+			k.noS.del(r)
 		}
-	}
-	slices.Sort(ints)
-	slices.Sort(noS)
+	})
 	return ints, noS
 }
 

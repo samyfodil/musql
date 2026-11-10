@@ -92,7 +92,7 @@ func (e *vmEmitWasm) rowColumn(pc int, in VInsn) {
 	// A string or blob is copied with its pointer, as on amd64.
 	w.Get(e.valp)
 	w.LoadI64(vb + uint32(L.OffS))
-	if !e.know.noS[in.C] {
+	if !e.know.noS.has(in.C) {
 		e.loadI64(in.C, L.OffS)
 		w.op(opI64Or)
 	}
@@ -182,7 +182,7 @@ func (e *vmEmitWasm) segColumn(pc int, in VInsn) {
 	w.op(opEnd)
 	// Every word of r[C] is written: one holding a pointer needs the barrier
 	// off.
-	if !e.know.noS[in.C] {
+	if !e.know.noS.has(in.C) {
 		e.loadI64(in.C, L.OffS)
 		w.op(opI64Eqz)
 		w.op(opI32Eqz)
@@ -333,7 +333,7 @@ func (e *vmEmitWasm) segColumn(pc int, in VInsn) {
 	e.exitAt(pc) // a kind this build does not read
 	w.op(opEnd)
 	e.closeIf()
-	delete(e.zeroS, in.C)
+	e.zeroS.del(in.C)
 	e.know.wroteAny(in.C, false)
 }
 

@@ -47,11 +47,11 @@ func (e *vmEmitArm) vmLabel(s string) string {
 // known to be one.
 func (e *vmEmitArm) fload(pc, r int, d VReg, intOK bool, flag Reg64, useFlag bool) {
 	a, L := e.a, e.lay
-	if e.know.isFloat[r] {
+	if e.know.isFloat.has(r) {
 		e.fldr(d, r)
 		return
 	}
-	if e.know.isInt[r] && intOK {
+	if e.know.isInt.has(r) && intOK {
 		a.Scvtf(d, e.src(pc, r, X10))
 		return
 	}
@@ -64,7 +64,7 @@ func (e *vmEmitArm) fload(pc, r int, d VReg, intOK bool, flag Reg64, useFlag boo
 		a.MovImm16(flag, 1)
 	}
 	if !intOK {
-		e.know.isFloat[r] = true
+		e.know.isFloat.add(r)
 	}
 	e.cold = append(e.cold, func() {
 		a.Label(notReal)
@@ -112,7 +112,7 @@ func (e *vmEmitArm) realInsn(pc int, in VInsn) (bool, error) {
 	case VFAdd, VFSub, VFMul, VFDiv:
 		// Two INTEGERs are vm_real_amd64.go's: the INTEGER arm, here for an
 		// add, subtract or multiply, a divide exiting.
-		useFlag := !e.know.isFloat[in.A] && !e.know.isFloat[in.B]
+		useFlag := !e.know.isFloat.has(in.A) && !e.know.isFloat.has(in.B)
 		if useFlag {
 			a.MovImm16(X13, 0)
 		}
@@ -215,7 +215,7 @@ func (e *vmEmitArm) realInsn(pc int, in VInsn) (bool, error) {
 // sqlite3IntFloatCompare would.
 func (e *vmEmitArm) fcmpLoad(pc, r int, d VReg) {
 	a, L := e.a, e.lay
-	if e.know.isFloat[r] {
+	if e.know.isFloat.has(r) {
 		e.fldr(d, r)
 		return
 	}

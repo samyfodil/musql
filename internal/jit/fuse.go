@@ -1058,3 +1058,19 @@ var progPredicatedRows atomic.Int64
 // PredicatedStatsForTest reads and clears how many programs were emitted
 // with a predicated row.
 func PredicatedStatsForTest() int64 { return progPredicatedRows.Swap(0) }
+
+// put appends b to *buf. Within capacity it writes only the bytes and the
+// length: an append of a variadic slice writes the pointer back too, which is
+// a GC write barrier on every instruction emitted while a collection runs.
+func put(buf *[]byte, b []byte) {
+	n := len(*buf)
+	if n+len(b) > cap(*buf) {
+		*buf = append(*buf, b...)
+		return
+	}
+	*buf = (*buf)[:n+len(b)]
+	s := (*buf)[n:]
+	for i, x := range b {
+		s[i] = x
+	}
+}

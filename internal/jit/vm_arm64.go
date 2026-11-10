@@ -68,12 +68,12 @@ func emitVMArm(arm *Arm, prog []VInsn, nReg int, lay ValueLayout, bound, entry [
 	if int64(nReg)*int64(lay.Size) > 1<<30 || n > 1<<28 {
 		return nil, fmt.Errorf("jit: program too large (%d instructions, %d registers)", n, nReg)
 	}
-	e := &vmEmitArm{a: arm, lay: lay, n: n, stubs: make(map[int]bool, n), far: far,
+	e := &vmEmitArm{a: arm, lay: lay, n: n, stubs: make(knowSet, n/64+1), far: far,
 		prog: prog, bound: bound, cache: cache && bound != nil, know: newVMKnow(),
-		holds: map[int]Reg64{}, pinned: map[Reg64]bool{}, fusedStub: map[int]string{}, zeroS: map[int]bool{},
+		holds: map[int]Reg64{}, pinned: knowSet{}, fusedStub: map[int]string{}, zeroS: knowSet{},
 		consts: &firPool{labels: map[uint64]string{}, prefix: "i0"}}
 	e.heads = vmLoopHeads(prog)
-	e.steps, e.keep = vmStepsOf(prog), map[int]bool{}
+	e.steps = vmStepsOf(prog)
 	a := e.a
 
 	a.LdrImm(X1, X0, POffRegs)
@@ -217,7 +217,7 @@ func padArm(a *Arm, align int) {
 // island emits the exit stubs requested since the last island, after a branch
 // over them to next ("" when nothing falls through).
 func (e *vmEmitArm) island(next string) {
-	if len(e.stubs) == 0 && !e.exitpc && len(e.cold) == 0 && len(e.consts.order) == 0 {
+	if !e.stubs.any() && !e.exitpc && len(e.cold) == 0 && len(e.consts.order) == 0 {
 		return
 	}
 	if next != "" {
@@ -229,16 +229,17 @@ func (e *vmEmitArm) island(next string) {
 	for _, c := range cold {
 		c()
 	}
-	for pc := range e.stubs {
+	e.stubs.each(func(pc int) {
 		e.a.Label(e.stubLabel(pc))
 		e.exitAt(pc)
-	}
+	})
 	if e.exitpc {
 		e.a.Label(e.exitpcLabel())
 		e.a.StrImm(X3, X0, POffPC)
 		e.a.Ret()
 	}
-	e.stubs, e.exitpc = map[int]bool{}, false
+	clear(e.stubs)
+	e.exitpc = false
 	e.islandN++
 	e.consts.emit(e.a)
 	e.consts = &firPool{labels: map[uint64]string{}, prefix: "i" + strconv.Itoa(e.islandN)}
@@ -250,9 +251,9 @@ type vmEmitArm struct {
 	a       *Arm
 	lay     ValueLayout
 	n       int
-	stubs   map[int]bool // exit stubs the next island must hold
-	exitpc  bool         // ...and whether it needs an "exit at X3" stub
-	islandN int          // which island is next, for unique labels
+	stubs   knowSet // exit stubs the next island must hold
+	exitpc  bool    // ...and whether it needs an "exit at X3" stub
+	islandN int     // which island is next, for unique labels
 	skips   int
 	far     bool // forward conditional jumps use the long form
 
@@ -260,18 +261,18 @@ type vmEmitArm struct {
 	// steps is every pc's step and keep the set entryPoint reuses, made once
 	// for the emission (vmStepsOf).
 	steps     []progStep
-	keep      map[int]bool
+	keep      knowSet
 	bound     []bool
 	cache     bool
 	know      *vmKnow
 	holds     map[int]Reg64 // see vmEmit.holds
-	pinned    map[Reg64]bool
+	pinned    knowSet
 	heads     []bool
 	fusedStub map[int]string // a VFused pc's exit stub or entry block, which the table points at
 	entries   []vmEntryStubArm
-	zeroS     map[int]bool // vmEmit.zeroS
-	cold      []func()     // vmEmit.cold, emitted in the next island
-	consts    *firPool     // the next island's doubles (vm_real_arm64.go)
+	zeroS     knowSet  // vmEmit.zeroS
+	cold      []func() // vmEmit.cold, emitted in the next island
+	consts    *firPool // the next island's doubles (vm_real_arm64.go)
 }
 
 // coldPath is vm_amd64.go's: when reg is non-zero, branch to body, emitted in
@@ -307,7 +308,7 @@ func (e *vmEmitArm) entryPoint(pc int) {
 	st := vmEntryStubArm{pc: pc}
 	st.ints, st.noS = e.know.pruneForEntry(keep)
 	for k, m := range e.holds {
-		if k < 0 || !keep[k] || !e.know.isInt[k] {
+		if k < 0 || !keep.has(k) || !e.know.isInt.has(k) {
 			delete(e.holds, k)
 			continue
 		}
@@ -378,7 +379,7 @@ func (e *vmEmitArm) exitAt(pc int) {
 
 // stub is the label of the out-of-line exit at pc, in the next island.
 func (e *vmEmitArm) stub(pc int) string {
-	e.stubs[pc] = true
+	e.stubs.add(pc)
 	return e.stubLabel(pc)
 }
 
@@ -448,10 +449,10 @@ func (e *vmEmitArm) writeInt(reg int, src Reg64) {
 
 // clearS, branchWB and destNoS are vm_amd64.go's.
 func (e *vmEmitArm) clearS(reg int) {
-	if !e.zeroS[reg] {
+	if !e.zeroS.has(reg) {
 		return
 	}
-	delete(e.zeroS, reg)
+	e.zeroS.del(reg)
 	// Only when there is a pointer (vm_amd64.go's clearS); CBZ sets no flags.
 	e.skips++
 	skip := "s" + strconv.Itoa(e.skips) + ".cs"
@@ -470,12 +471,12 @@ func (e *vmEmitArm) branchWB(pc int) {
 }
 
 func (e *vmEmitArm) destNoS(pc, r int) {
-	if e.know.noS[r] || e.zeroS[r] {
+	if e.know.noS.has(r) || e.zeroS.has(r) {
 		return
 	}
 	e.ldr(X12, r, e.lay.OffS)
 	e.coldPath(X12, func() { e.branchWB(pc) })
-	e.zeroS[r] = true
+	e.zeroS.add(r)
 }
 
 // ---- what the emitter keeps between steps: vm_amd64.go's, on arm64 ---------
@@ -489,10 +490,10 @@ func (e *vmEmitArm) unmap(key int) { delete(e.holds, key) }
 
 func (e *vmEmitArm) clobber(r int) {
 	e.unmap(r)
-	delete(e.know.isInt, r)
-	delete(e.know.canon, r)
-	delete(e.know.noS, r)
-	delete(e.know.isFloat, r)
+	e.know.isInt.del(r)
+	e.know.canon.del(r)
+	e.know.noS.del(r)
+	e.know.isFloat.del(r)
 }
 
 func (e *vmEmitArm) nextUse(key, pc int) int {
@@ -503,22 +504,22 @@ func (e *vmEmitArm) alloc(pc, want int) (Reg64, bool) {
 	if !e.cache {
 		return 0, false
 	}
-	far := map[Reg64]int{}
+	var far [256]int // for each pool register in use, 1 + when it is next wanted
 	for k, m := range e.holds {
 		u := e.nextUse(k, pc)
 		if u < 0 {
 			u = 1 << 30
 		}
-		far[m] = max(far[m], u)
+		far[m] = max(far[m], u+1)
 	}
 	var best Reg64
 	bestAt := -1
 	for _, m := range vmPool {
-		if e.pinned[m] {
+		if e.pinned.has(int(m)) {
 			continue
 		}
-		at, used := far[m]
-		if !used {
+		at := far[m] - 1
+		if at < 0 {
 			best, bestAt = m, 1<<31
 			break
 		}
@@ -534,17 +535,17 @@ func (e *vmEmitArm) alloc(pc, want int) (Reg64, bool) {
 			delete(e.holds, k)
 		}
 	}
-	e.pinned[best] = true
+	e.pinned.add(int(best))
 	return best, true
 }
 
 func (e *vmEmitArm) src(pc, r int, scratch Reg64) Reg64 {
-	if !e.know.isInt[r] {
+	if !e.know.isInt.has(r) {
 		e.guardInt(pc, r)
-		e.know.isInt[r] = true
+		e.know.isInt.add(r)
 	}
 	if m, ok := e.holds[r]; ok {
-		e.pinned[m] = true
+		e.pinned.add(int(m))
 		return m
 	}
 	if u := e.nextUse(r, pc); u >= 0 {
@@ -559,9 +560,9 @@ func (e *vmEmitArm) src(pc, r int, scratch Reg64) Reg64 {
 }
 
 func (e *vmEmitArm) needNoS(pc, r int) {
-	if !e.know.noS[r] {
+	if !e.know.noS.has(r) {
 		e.guardNoS(pc, r)
-		e.know.noS[r] = true
+		e.know.noS.add(r)
 	}
 }
 
@@ -597,7 +598,7 @@ func (e *vmEmitArm) storeInt(in VInsn, r int, m Reg64) {
 		e.clobber(r)
 		return
 	}
-	if e.know.canon[r] {
+	if e.know.canon.has(r) {
 		e.str(m, r, e.lay.OffI)
 	} else {
 		e.writeInt(r, m)
@@ -639,21 +640,21 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		m := e.dest(pc, in.A, X10)
 		a.MovImm64(m, in.Imm)
 		e.storeInt(in, in.A, m)
-		e.know.konst[in.A] = in.Imm
+		e.know.setKonst(in.A, in.Imm)
 	case VCopy:
 		if in.Dead {
 			e.clobber(in.B)
 			break
 		}
-		if in.Imm != 0 && !e.know.noS[in.A] {
+		if in.Imm != 0 && !e.know.noS.has(in.A) {
 			e.copyAny(pc, in)
 			break
 		}
 		e.needNoS(pc, in.A)
 		e.destNoS(pc, in.B)
-		if e.know.canon[in.A] && in.A != in.B {
+		if e.know.canon.has(in.A) && in.A != in.B {
 			m := e.src(pc, in.A, X10)
-			if e.know.canon[in.B] {
+			if e.know.canon.has(in.B) {
 				e.str(m, in.B, L.OffI)
 			} else {
 				e.writeInt(in.B, m)
@@ -671,11 +672,11 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		}
 		e.clearS(in.B)
 		if in.A != in.B {
-			isInt := e.know.isInt[in.A]
+			isInt := e.know.isInt.has(in.A)
 			e.unmap(in.B)
 			e.know.wroteAny(in.B, true)
 			if isInt {
-				e.know.isInt[in.B] = true
+				e.know.isInt.add(in.B)
 			}
 			if m, ok := e.holds[in.A]; ok {
 				e.holds[in.B] = m
@@ -729,7 +730,7 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		}
 		e.storeInt(in, in.C, x)
 	case VDiv, VRem:
-		if d, ok := e.know.konst[in.A]; ok && d >= 2 && d <= math.MaxInt32 {
+		if d, ok := e.know.konstOf(in.A); ok && d >= 2 && d <= math.MaxInt32 {
 			e.divConst(pc, in, d)
 			break
 		}
@@ -798,7 +799,7 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 			e.jccBlock(c, pc, in.T)
 		}
 	case VNullJump:
-		if e.know.isInt[in.A] {
+		if e.know.isInt.has(in.A) {
 			if in.Imm == 0 {
 				e.jmpBlock(pc, in.T)
 			}
@@ -838,7 +839,7 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		a.BcondRaw(armVS, e.stub(pc)) // -MinInt64 is the VDBE's
 		e.storeInt(in, in.C, x)
 	case VIf:
-		if e.know.isInt[in.A] {
+		if e.know.isInt.has(in.A) {
 			x := e.src(pc, in.A, X10)
 			a.CmpImm(x, 0)
 			if in.Imm != 0 {
@@ -909,7 +910,7 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 	case VSubstr:
 		e.substr(pc, in)
 	case VTextCmpJump, VTextCmpSet:
-		if e.know.isInt[in.A] || e.know.isInt[in.B] {
+		if e.know.isInt.has(in.A) || e.know.isInt.has(in.B) {
 			return e.insn(pc, vmIntCmp(in))
 		}
 		e.textCmp(pc, in)
@@ -918,9 +919,9 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 	case VResultRow:
 		e.resultRow(pc, in)
 	case VIntGuard:
-		if !e.know.isInt[in.A] {
+		if !e.know.isInt.has(in.A) {
 			e.guardInt(pc, in.A)
-			e.know.isInt[in.A] = true
+			e.know.isInt.add(in.A)
 		}
 	case VRowid:
 		if in.Dead {
@@ -1050,7 +1051,7 @@ func (e *vmEmitArm) column(pc int, in VInsn) {
 	vb := in.B * L.Size
 	row, have := e.holds[^in.A]
 	if have {
-		e.pinned[row] = true
+		e.pinned.add(int(row))
 	} else {
 		mask, maxCol := uint64(1)<<uint(in.B), in.B
 		if e.cache {
@@ -1087,7 +1088,7 @@ func (e *vmEmitArm) column(pc int, in VInsn) {
 	}
 	// A string or blob is copied with its pointer, as on amd64.
 	// The destination's first: a far register's load goes through X11.
-	if !e.know.noS[in.C] {
+	if !e.know.noS.has(in.C) {
 		e.ldr(X12, in.C, L.OffS)
 		e.ldrAt(X11, row, vb+L.OffS)
 		a.OrrReg(X11, X11, X12)
@@ -1132,11 +1133,11 @@ func (e *vmEmitArm) copyAny(pc int, in VInsn) {
 		return // a copy onto itself changes nothing
 	}
 	// B's first: a far register's load goes through X11.
-	if !e.know.noS[in.B] {
+	if !e.know.noS.has(in.B) {
 		e.ldr(X12, in.B, L.OffS)
 	}
 	e.ldr(X11, in.A, L.OffS)
-	if !e.know.noS[in.B] {
+	if !e.know.noS.has(in.B) {
 		a.OrrReg(X11, X11, X12)
 	}
 	e.coldPath(X11, func() {
@@ -1150,11 +1151,11 @@ func (e *vmEmitArm) copyAny(pc int, in VInsn) {
 		e.ldr(X9, in.A, f)
 		e.str(X9, in.B, f)
 	}
-	isInt := e.know.isInt[in.A]
+	isInt := e.know.isInt.has(in.A)
 	e.unmap(in.B)
 	e.know.wroteAny(in.B, false)
 	if isInt {
-		e.know.isInt[in.B] = true
+		e.know.isInt.add(in.B)
 	}
 	if m, ok := e.holds[in.A]; ok {
 		e.holds[in.B] = m

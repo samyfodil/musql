@@ -97,7 +97,7 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 		return nil, fmt.Errorf("jit: %d registers", nReg)
 	}
 	e := &vmEmitWasm{w: &Wasm{}, lay: lay, n: n, prog: prog, bound: bound, cache: cache && bound != nil, know: newVMKnow(),
-		zeroS: map[int]bool{}}
+		zeroS: knowSet{}}
 	w := e.w
 	e.regs, e.pc, e.fuel = w.Local(wI32), w.Local(wI32), w.Local(wI64)
 	e.t1, e.t2, e.t3, e.ovf = w.Local(wI64), w.Local(wI64), w.Local(wI64), w.Local(wI64)
@@ -205,7 +205,7 @@ type vmEmitWasm struct {
 	// wb is the write-barrier flag the prologue read; rb a row buffer's
 	// address (VResultRow). zeroS is vmEmit.zeroS.
 	wb, rb uint32
-	zeroS  map[int]bool
+	zeroS  knowSet
 }
 
 // Within pc's code the enclosing blocks are those of pc+1 .. n-1, then the
@@ -282,18 +282,18 @@ func (e *vmEmitWasm) guards(pc int, gs ...guard) {
 // isInt and noS are notInt and hasS, or nil when what they check is known
 // (and from here on, it is).
 func (e *vmEmitWasm) isInt(reg int) guard {
-	if e.know.isInt[reg] {
+	if e.know.isInt.has(reg) {
 		return nil
 	}
-	e.know.isInt[reg] = true
+	e.know.isInt.add(reg)
 	return notInt(reg)
 }
 
 func (e *vmEmitWasm) noS(reg int) guard {
-	if e.know.noS[reg] {
+	if e.know.noS.has(reg) {
 		return nil
 	}
-	e.know.noS[reg] = true
+	e.know.noS.add(reg)
 	return hasS(reg)
 }
 
@@ -302,10 +302,10 @@ func (e *vmEmitWasm) noS(reg int) guard {
 // is on, and with it off the store clears the pointer. nil when its store is
 // Dead or r[reg] is known to hold no pointer.
 func (e *vmEmitWasm) dstNoS(in VInsn, reg int) guard {
-	if in.Dead || e.know.noS[reg] || e.zeroS[reg] {
+	if in.Dead || e.know.noS.has(reg) || e.zeroS.has(reg) {
 		return nil
 	}
-	e.zeroS[reg] = true
+	e.zeroS.add(reg)
 	return func(e *vmEmitWasm) {
 		hasS(reg)(e)
 		e.w.Get(e.wb)
@@ -315,10 +315,10 @@ func (e *vmEmitWasm) dstNoS(in VInsn, reg int) guard {
 
 // clearS clears r[reg]'s string or blob when dstNoS said the store must.
 func (e *vmEmitWasm) clearS(reg int) {
-	if !e.zeroS[reg] {
+	if !e.zeroS.has(reg) {
 		return
 	}
-	delete(e.zeroS, reg)
+	e.zeroS.del(reg)
 	// Only when there is a pointer (vm_amd64.go's clearS).
 	e.loadI64(reg, e.lay.OffS)
 	e.w.op(opI64Eqz)
@@ -354,10 +354,10 @@ func (e *vmEmitWasm) pointerWords(pc int, copy func(f int)) {
 
 // forgetReg records that r[reg] changed other than by storeInt.
 func (e *vmEmitWasm) forgetReg(reg int) {
-	delete(e.know.isInt, reg)
-	delete(e.know.canon, reg)
-	delete(e.know.noS, reg)
-	delete(e.know.isFloat, reg)
+	e.know.isInt.del(reg)
+	e.know.canon.del(reg)
+	e.know.noS.del(reg)
+	e.know.isFloat.del(reg)
 }
 
 // storeInt is writeInt for in's destination: nothing for a Dead store, only
@@ -367,7 +367,7 @@ func (e *vmEmitWasm) storeInt(in VInsn, reg int, src uint32) {
 		e.forgetReg(reg)
 		return
 	}
-	if e.know.canon[reg] {
+	if e.know.canon.has(reg) {
 		e.w.Get(e.regs)
 		e.w.Get(src)
 		e.w.StoreI64(e.addr(reg, e.lay.OffI))
@@ -473,12 +473,12 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 			e.forgetReg(in.B)
 			break
 		}
-		if in.Imm != 0 && !e.know.noS[in.A] {
+		if in.Imm != 0 && !e.know.noS.has(in.A) {
 			e.copyAny(pc, in)
 			break
 		}
 		e.guards(pc, e.noS(in.A), e.dstNoS(in, in.B))
-		if e.know.canon[in.A] && in.A != in.B {
+		if e.know.canon.has(in.A) && in.A != in.B {
 			e.loadI64(in.A, L.OffI)
 			w.Set(e.t1)
 			e.storeInt(VInsn{}, in.B, e.t1)
@@ -491,13 +491,13 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		}
 		e.clearS(in.B)
 		if in.A != in.B {
-			isInt, isFloat := e.know.isInt[in.A], e.know.isFloat[in.A]
+			isInt, isFloat := e.know.isInt.has(in.A), e.know.isFloat.has(in.A)
 			e.know.wroteAny(in.B, true)
 			if isInt {
-				e.know.isInt[in.B] = true
+				e.know.isInt.add(in.B)
 			}
 			if isFloat {
-				e.know.isFloat[in.B] = true
+				e.know.isFloat.add(in.B)
 			}
 		}
 	case VAdd, VSub, VMul, VAnd, VOr:
@@ -608,7 +608,7 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 			e.jumpIf(in.T)
 		}
 	case VNullJump:
-		if e.know.isInt[in.A] {
+		if e.know.isInt.has(in.A) {
 			// An INTEGER is not NULL.
 			if in.Imm == 0 {
 				e.jump(in.T)
@@ -650,7 +650,7 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		w.Set(e.t1)
 		e.storeInt(in, in.C, e.t1)
 	case VIf:
-		if e.know.isInt[in.A] {
+		if e.know.isInt.has(in.A) {
 			e.loadI64(in.A, L.OffI)
 			w.op(opI64Eqz)
 			if in.Imm != 0 {
@@ -720,7 +720,7 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 	case VSubstr:
 		e.substr(pc, in)
 	case VTextCmpJump, VTextCmpSet:
-		if e.know.isInt[in.A] || e.know.isInt[in.B] {
+		if e.know.isInt.has(in.A) || e.know.isInt.has(in.B) {
 			return e.insn(pc, vmIntCmp(in))
 		}
 		e.textCmp(pc, in)
@@ -855,7 +855,7 @@ func (e *vmEmitWasm) copyAny(pc int, in VInsn) {
 		return // a copy onto itself changes nothing
 	}
 	e.loadI64(in.A, L.OffS)
-	if !e.know.noS[in.B] {
+	if !e.know.noS.has(in.B) {
 		e.loadI64(in.B, L.OffS)
 		w.op(opI64Or)
 	}
@@ -864,10 +864,10 @@ func (e *vmEmitWasm) copyAny(pc int, in VInsn) {
 		e.loadI64(in.A, f)
 		w.StoreI64(e.addr(in.B, f))
 	})
-	isInt := e.know.isInt[in.A]
+	isInt := e.know.isInt.has(in.A)
 	e.know.wroteAny(in.B, false)
 	if isInt {
-		e.know.isInt[in.B] = true
+		e.know.isInt.add(in.B)
 	}
 }
 

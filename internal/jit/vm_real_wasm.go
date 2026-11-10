@@ -39,9 +39,9 @@ func (e *vmEmitWasm) loadF64(r int) { e.w.Get(e.regs); e.w.LoadF64(e.addr(r, e.l
 func (e *vmEmitWasm) fload(pc, r int, dst uint32, intOK, flag bool) {
 	w, L := e.w, e.lay
 	switch {
-	case e.know.isFloat[r]:
+	case e.know.isFloat.has(r):
 		e.loadF64(r)
-	case e.know.isInt[r] && intOK:
+	case e.know.isInt.has(r) && intOK:
 		e.loadI64(r, L.OffI)
 		w.op(opF64ConvertI64S)
 	case !intOK:
@@ -49,7 +49,7 @@ func (e *vmEmitWasm) fload(pc, r int, dst uint32, intOK, flag bool) {
 		w.I32(int32(L.TypFloat))
 		w.op(opI32Ne)
 		e.exitIf(pc)
-		e.know.isFloat[r] = true
+		e.know.isFloat.add(r)
 		e.loadF64(r)
 	default:
 		e.loadTyp(r)
@@ -78,12 +78,12 @@ func (e *vmEmitWasm) fload(pc, r int, dst uint32, intOK, flag bool) {
 // sqlite3IntFloatCompare would.
 func (e *vmEmitWasm) fcmpLoad(pc, r int, dst uint32) {
 	w, L := e.w, e.lay
-	if e.know.isFloat[r] {
+	if e.know.isFloat.has(r) {
 		e.loadF64(r)
 		w.Set(dst)
 		return
 	}
-	isInt := e.know.isInt[r]
+	isInt := e.know.isInt.has(r)
 	if !isInt {
 		e.loadTyp(r)
 		w.I32(int32(L.TypFloat))
@@ -161,7 +161,7 @@ func (e *vmEmitWasm) realInsn(pc int, in VInsn) error {
 		// Two INTEGERs are the INTEGER arm, as vm_real_amd64.go's: for an
 		// add, subtract or multiply, which overflows into a REAL only where
 		// it must (that exits); a divide exits.
-		flag := !e.know.isFloat[in.A] && !e.know.isFloat[in.B]
+		flag := !e.know.isFloat.has(in.A) && !e.know.isFloat.has(in.B)
 		if flag {
 			w.I32(0)
 			w.Set(e.fr)
@@ -228,7 +228,7 @@ func (e *vmEmitWasm) realInsn(pc int, in VInsn) error {
 func (e *vmEmitWasm) realOrInts(pc int, in VInsn, f0, f1 uint32) {
 	w, L := e.w, e.lay
 	e.guards(pc, e.dstNoS(in, in.C)) // for both arms
-	zero := e.zeroS[in.C]
+	zero := e.zeroS.has(in.C)
 	w.Get(e.fr)
 	e.openIf()
 	w.Get(f0)
@@ -239,7 +239,7 @@ func (e *vmEmitWasm) realOrInts(pc int, in VInsn, f0, f1 uint32) {
 	e.storeFloat(pc, in, in.C, f0)
 	w.op(opElse)
 	if zero {
-		e.zeroS[in.C] = true // storeFloat cleared it for its own arm
+		e.zeroS.add(in.C) // storeFloat cleared it for its own arm
 	}
 	e.loadI64(in.B, L.OffI)
 	w.Set(e.t1)
@@ -255,7 +255,7 @@ func (e *vmEmitWasm) realOrInts(pc int, in VInsn, f0, f1 uint32) {
 	e.writeInt(in.C, e.t3)
 	e.closeIf()
 	e.forgetReg(in.C)
-	e.know.noS[in.C] = true
+	e.know.noS.add(in.C)
 }
 
 // math emits VMath: the arguments as doubles, the kernel inline over them,
