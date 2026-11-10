@@ -103,9 +103,24 @@ func (p *ReadOnlyPager) explainQuery(inner string, mode explainMode) (cols []str
 	if err != nil {
 		return nil, nil, err
 	}
-	base := 0
+	// Every program the listing's programs run follows them, in the order
+	// they are reached: a FROM subquery's, a scalar or EXISTS subquery's, an
+	// IN subquery's. Each runs on a machine of its own here, where C codes it
+	// into the same program as a co-routine or a subroutine.
+	seen := map[*Program]bool{}
 	for _, arm := range arms {
+		seen[arm.prog] = true
+	}
+	base := 0
+	for k := 0; k < len(arms); k++ {
+		arm := arms[k]
 		for addr, in := range arm.prog.Insns {
+			for _, sub := range explainSubPrograms(in) {
+				if !seen[sub] {
+					seen[sub] = true
+					arms = append(arms, explainSubArms(sub, fmt.Sprintf("subquery of %d", base+addr))...)
+				}
+			}
 			in, err := explainRelocate(in, base)
 			if err != nil {
 				return nil, nil, err
@@ -130,11 +145,48 @@ func (p *ReadOnlyPager) explainQuery(inner string, mode explainMode) (cols []str
 	return explainColumns(), rows, nil
 }
 
-// explainArm is one program of an EXPLAIN listing, and the compound operator
-// that brings it in ("" for the first).
+// explainArm is one program of an EXPLAIN listing, and what brings it in: ""
+// for the statement's own, a compound operator for a later arm, or the
+// instruction that runs a subquery.
 type explainArm struct {
 	op   string
 	prog *Program
+}
+
+// explainSubPrograms is every program in runs: a subquery's, a FROM item's.
+func explainSubPrograms(in Instruction) []*Program {
+	var sub *Program
+	switch x := in.P4.(type) {
+	case *Program:
+		sub = x
+	case *derivedSource:
+		sub = x.prog
+	case *inSubPlan:
+		sub = x.prog
+	case *rowSubPlan:
+		sub = x.prog
+	}
+	if sub == nil {
+		return nil
+	}
+	return []*Program{sub}
+}
+
+// explainSubArms is sub as listed, brought in by what: a compound's arms one
+// after another, each named by its operator after the first.
+func explainSubArms(sub *Program, by string) []explainArm {
+	if sub.Compound == nil {
+		return []explainArm{{op: by, prog: sub}}
+	}
+	arms := make([]explainArm, 0, len(sub.Compound.arms))
+	for i, a := range sub.Compound.arms {
+		op := by
+		if i > 0 {
+			op += ", " + string(sub.Compound.ops[i-1])
+		}
+		arms = append(arms, explainArm{op: op, prog: a})
+	}
+	return arms
 }
 
 // explainRelocate is in as it reads base instructions further down a listing:
