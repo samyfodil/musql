@@ -345,3 +345,46 @@ func TestCatalogRecordRefusesAStaleWriter(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestCatalogRecordLeavesOtherHandles: every open of one file shares its
+// mapping and its directory, so a catalog applied to one handle changes that
+// handle alone -- a reader that opened earlier keeps the ranks it read.
+func TestCatalogRecordLeavesOtherHandles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.musq")
+	s, err := Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execCommitEach(t, s,
+		`CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER)`,
+		`CREATE TABLE u(id INTEGER PRIMARY KEY, y INTEGER)`)
+	s.Close()
+	a, err := OpenSegmentFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := OpenSegmentFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	var was []uint32
+	dc := &deltaCatalog{cat: b.catalog}
+	for _, tb := range a.tables {
+		was = append(was, tb.Rank)
+		dc.ranks = append(dc.ranks, tb.Rank+100)
+		dc.rowids = append(dc.rowids, tb.Rowid+100)
+	}
+	if err := b.applyDeltaCatalog(dc); err != nil {
+		t.Fatal(err)
+	}
+	for i, tb := range a.tables {
+		if tb.Rank != was[i] {
+			t.Fatalf("table %s: another handle's catalog moved this one's rank from %d to %d", tb.Name, was[i], tb.Rank)
+		}
+		if b.tables[i].Rank != was[i]+100 {
+			t.Fatalf("table %s: the handle given the catalog has rank %d, want %d", tb.Name, b.tables[i].Rank, was[i]+100)
+		}
+	}
+}

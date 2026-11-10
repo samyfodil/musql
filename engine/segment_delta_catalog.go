@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
 )
 
 // A CATALOG RECORD (segDeltaCatalog) is how a commit that changes the catalog
@@ -120,6 +121,9 @@ func (f *SegmentFile) applyDeltaCatalog(dc *deltaCatalog) error {
 	if len(dc.ranks) != len(f.tables) {
 		return fmt.Errorf("engine: segment delta: catalog record names %d tables; the file has %d", len(dc.ranks), len(f.tables))
 	}
+	// The directory is shared by every handle over the mapping
+	// (segment_file_share.go); this handle's catalog is its own.
+	f.tables = slices.Clone(f.tables)
 	for i := range f.tables {
 		f.tables[i].Rank, f.tables[i].Rowid = dc.ranks[i], dc.rowids[i]
 	}
