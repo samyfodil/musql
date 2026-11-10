@@ -103,12 +103,28 @@ func TestFollowerStore(t *testing.T) {
 	if _, err := follower.OrgBySlug(ctx, "shop"); err != nil {
 		t.Fatal(err)
 	}
-	// No master: reads answer from this node's copy, and a write waits for a
-	// master rather than failing at once.
+	// No master: this node's copy answers reads, but its "not found" may be a
+	// row it has yet to receive, so a read it finds nothing for waits for a
+	// master (#129) and gets the master's row once there is one.
 	electing.Store(true)
-	if _, err := follower.OrgBySlug(ctx, "shop"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("with no master, the follower's own copy answers: %v, want ErrNotFound (it holds no rows)", err)
+	short, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	if _, err := follower.OrgBySlug(short, "shop"); err == nil || errors.Is(err, ErrNotFound) {
+		t.Fatalf("with no master, a row the follower's copy lacks: %v, want no answer yet", err)
 	}
+	cancel()
+	start := time.Now()
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		electing.Store(false)
+	}()
+	if got, err := follower.OrgBySlug(ctx, "shop"); err != nil || got.ID != o.ID {
+		t.Fatalf("the read did not wait for the master's row: %v %v", got, err)
+	}
+	if time.Since(start) < 300*time.Millisecond {
+		t.Fatal("the read did not wait for a master")
+	}
+	// And a write waits for a master rather than failing at once.
+	electing.Store(true)
 	// A copy that has yet to sync once answers nothing: its "not found" could
 	// be a record it has not received.
 	unsynced.Store(true)
@@ -116,7 +132,7 @@ func TestFollowerStore(t *testing.T) {
 		t.Fatalf("with no master, an unsynced copy: %v, want ErrNoMaster", err)
 	}
 	unsynced.Store(false)
-	start := time.Now()
+	start = time.Now()
 	go func() {
 		time.Sleep(300 * time.Millisecond)
 		electing.Store(false)
@@ -127,11 +143,13 @@ func TestFollowerStore(t *testing.T) {
 	if time.Since(start) < 300*time.Millisecond {
 		t.Fatal("the write did not wait for a master")
 	}
-	// The master stops before the election notices: a read answers from
-	// this node's copy instead of failing.
+	// The master stops before the election notices: a read goes to this
+	// node's copy instead, which holds no rows, so it waits too.
 	srv.Close()
-	if _, err := follower.OrgBySlug(ctx, "shop"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("with the master gone, the follower's own copy answers: %v, want ErrNotFound (it holds no rows)", err)
+	short, cancel = context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+	if _, err := follower.OrgBySlug(short, "shop"); err == nil || errors.Is(err, ErrNotFound) {
+		t.Fatalf("with the master gone, a row the follower's copy lacks: %v, want no answer yet", err)
 	}
 	unsynced.Store(true)
 	if _, err := follower.OrgBySlug(ctx, "shop"); err == nil || errors.Is(err, ErrNotFound) {
