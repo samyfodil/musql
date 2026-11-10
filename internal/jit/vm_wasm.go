@@ -53,6 +53,15 @@ const MaxVMWasmBytes = 6 << 20
 // what the emitter knows (vmKnow): the engine running the module keeps values
 // in machine registers itself, so a guard or a full write known to be
 // redundant is what there is to skip.
+// mapVM is emitVM mapped (Map).
+func mapVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache bool) (*Code, error) {
+	code, err := emitVM(prog, nReg, lay, bound, entry, cache)
+	if err != nil {
+		return nil, err
+	}
+	return Map(code)
+}
+
 func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache bool) ([]byte, error) {
 	// No entry stubs here: an entry starts a run, like a jump target. So a
 	// fused pair whose second pc is an entry is unfused again -- the store of
