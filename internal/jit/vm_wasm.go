@@ -22,6 +22,11 @@ const (
 	opI64LeS    byte = 0x57
 	opIf        byte = 0x04
 	opElse      byte = 0x05
+
+	opI32LtS        byte = 0x48
+	opI32LeU        byte = 0x4D
+	opI32GeS        byte = 0x4E
+	opI64ExtendI32S byte = 0xAC
 )
 
 // MaxVMWasmBytes bounds the module EmitVM produces on wasm. The JS API caps
@@ -95,7 +100,7 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 		e.keyp, e.keyq = w.Local(wI32), w.Local(wI32)
 	}
 	if slices.ContainsFunc(prog, func(in VInsn) bool {
-		return in.Op == VSubstr || in.Op == VTextCmpJump || in.Op == VTextCmpSet
+		return in.Op == VSubstr || in.Op == VTextCmpJump || in.Op == VTextCmpSet || in.Op == VInText || in.Op == VLike
 	}) {
 		e.txa, e.txb = w.Local(wI32), w.Local(wI32)
 	}
@@ -171,6 +176,7 @@ type vmEmitWasm struct {
 	curs, rowp, valp uint32 // the cursor table, a row's header, its first Value (when the program has cursor ops)
 	keyp, keyq       uint32 // VInSet's search: the candidate key and the halfway one
 	txa, txb         uint32 // the TEXT arms' byte addresses
+	txc, txd, txe    uint32 // and the LIKE, IN and numeric-text arms' (textLocals)
 	f0, f1, fr       uint32 // the REAL arms' scratch (vm_real_wasm.go's flocals)
 	cur              int    // the pc whose code is being emitted
 	extra            int    // if-blocks opened inside it
@@ -742,6 +748,14 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		e.textCmp(pc, in)
 	case VInSet:
 		e.inSet(pc, in)
+	case VInText:
+		e.inText(pc, in)
+	case VText:
+		e.text(pc, in)
+	case VLike:
+		e.like(pc, in)
+	case VInSub:
+		e.inSub(pc, in)
 	case VResultRow:
 		e.resultRow(pc, in)
 	case VIntGuard:
