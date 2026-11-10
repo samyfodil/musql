@@ -26,7 +26,7 @@ func SetCPUForTest(fma, round bool) (restore func()) { return func() {} }
 
 // VMSegCursor reports whether a VColumn marked segment-capable reads a
 // segment cursor's column blocks (VCursor.Seg).
-const VMSegCursor = false
+const VMSegCursor = true
 
 // VMTextOrder reports whether VTextCmpJump and VTextCmpSet take an ordered
 // condition, and a numeric affinity's whole-number test (Imm 1).
