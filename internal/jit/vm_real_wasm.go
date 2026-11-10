@@ -158,8 +158,9 @@ func (e *vmEmitWasm) realInsn(pc int, in VInsn) error {
 		w.Set(f0)
 		e.storeFloat(pc, in, in.A, f0)
 	case VFAdd, VFSub, VFMul, VFDiv:
-		// At least one operand must be a REAL: two INTEGERs are the INTEGER
-		// arm's, which overflows into a REAL only where it must.
+		// Two INTEGERs are the INTEGER arm, as vm_real_amd64.go's: for an
+		// add, subtract or multiply, which overflows into a REAL only where
+		// it must (that exits); a divide exits.
 		flag := !e.know.isFloat[in.A] && !e.know.isFloat[in.B]
 		if flag {
 			w.I32(0)
@@ -167,6 +168,10 @@ func (e *vmEmitWasm) realInsn(pc int, in VInsn) error {
 		}
 		e.fload(pc, in.B, f0, true, flag)
 		e.fload(pc, in.A, f1, true, flag)
+		if flag && in.Op != VFDiv && !in.Dead {
+			e.realOrInts(pc, in, f0, f1)
+			break
+		}
 		if flag {
 			w.Get(e.fr)
 			w.op(opI32Eqz)
@@ -215,6 +220,42 @@ func (e *vmEmitWasm) realInsn(pc int, in VInsn) error {
 		return e.math(pc, in)
 	}
 	return nil
+}
+
+// realOrInts is VFAdd, VFSub or VFMul over operands fload left in f0 and f1,
+// fr saying whether either was a REAL: the REAL arm when one was, the INTEGER
+// arm over their I words when neither was.
+func (e *vmEmitWasm) realOrInts(pc int, in VInsn, f0, f1 uint32) {
+	w, L := e.w, e.lay
+	e.guards(pc, e.dstNoS(in, in.C)) // for both arms
+	zero := e.zeroS[in.C]
+	w.Get(e.fr)
+	e.openIf()
+	w.Get(f0)
+	w.Get(f1)
+	w.op(vmWasmFArith[in.Op])
+	w.Set(f0)
+	e.exitNaN(pc, f0)
+	e.storeFloat(pc, in, in.C, f0)
+	w.op(opElse)
+	if zero {
+		e.zeroS[in.C] = true // storeFloat cleared it for its own arm
+	}
+	e.loadI64(in.B, L.OffI)
+	w.Set(e.t1)
+	e.loadI64(in.A, L.OffI)
+	w.Set(e.t2)
+	w.I64(0)
+	w.Set(e.ovf)
+	emitCheckedArith(w, map[VOp]POp{VFAdd: POpAdd, VFSub: POpSub, VFMul: POpMul}[in.Op], e.t1, e.t2, e.t3, e.ovf)
+	w.Get(e.ovf)
+	w.op(opI64Eqz)
+	w.op(opI32Eqz)
+	e.exitIf(pc) // overflow: the VDBE's, which promotes to a REAL
+	e.writeInt(in.C, e.t3)
+	e.closeIf()
+	e.forgetReg(in.C)
+	e.know.noS[in.C] = true
 }
 
 // math emits VMath: the arguments as doubles, the kernel inline over them,
