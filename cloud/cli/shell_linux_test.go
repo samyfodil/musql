@@ -101,3 +101,14 @@ func TestInteractiveShellWidth(t *testing.T) {
 		t.Fatalf("the line was wrapped: %q", out)
 	}
 }
+
+// TestInteractiveShellHomeEnd: Home and End move to the line's ends in every
+// spelling a terminal sends them (#132), not type an "H" or an "F".
+func TestInteractiveShellHomeEnd(t *testing.T) {
+	for _, keys := range [][2]string{{"\x1bOH", "\x1bOF"}, {"\x1b[1~", "\x1b[4~"}, {"\x1b[H", "\x1b[F"}} {
+		_, out := shellOnPTY(t, 80, "41 + 1 AS n"+keys[0]+"SELECT "+keys[1]+";\r.quit\r")
+		if !strings.Contains(out, "42") {
+			t.Fatalf("%q: output %q", keys, out)
+		}
+	}
+}
