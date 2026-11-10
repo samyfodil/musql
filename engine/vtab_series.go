@@ -30,9 +30,13 @@ func (seriesModule) Connect(args []string) ([]VtabColumn, VirtualTable, error) {
 	}
 	cols := []VtabColumn{
 		{Name: "value"},
-		{Name: "start", Hidden: true},
-		{Name: "stop", Hidden: true},
-		{Name: "step", Hidden: true},
+		// NUMERIC, as C declares them: "start hidden" is a column whose type
+		// is the word HIDDEN, which sqlite3AffinityType reads as NUMERIC, and
+		// vtab.c strips the word from the type without recomputing it. So
+		// "start = '1'" is true (#138).
+		{Name: "start", Hidden: true, NumericAffinity: true},
+		{Name: "stop", Hidden: true, NumericAffinity: true},
+		{Name: "step", Hidden: true, NumericAffinity: true},
 	}
 	return cols, seriesTable{}, nil
 }

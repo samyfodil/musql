@@ -89,6 +89,11 @@ var supportedFuncs = map[string]bool{
 	// its arity errors are SQLite's rather than "no such function".
 	"sqlite_compileoption_used": true,
 	"sqlite_compileoption_get":  true,
+
+	// The bounds a generate_series consumes, as C's series reads them
+	// (vtab_series_bounds.go); no SQL identifier can name them.
+	seriesValueBoundFn: true,
+	seriesIntBoundFn:   true,
 }
 
 // init registers the functions whose names live in their own files: the json1
@@ -128,7 +133,7 @@ func funcArity(name string) (min, max int, ok bool) {
 		return lo, hi, true
 	}
 	switch name {
-	case "abs", "length", "octet_length", "lower", "upper", "typeof", "hex":
+	case "abs", "length", "octet_length", "lower", "upper", "typeof", "hex", seriesValueBoundFn, seriesIntBoundFn:
 		return 1, 1, true
 	case "sqlite_compileoption_used", "sqlite_compileoption_get":
 		return 1, 1, true
@@ -243,6 +248,12 @@ func callScalarFuncEnc(name string, args []Value, caseSensitiveLike bool, enc Te
 			return Value{}, fmt.Errorf("engine: abs() takes exactly 1 argument")
 		}
 		return fnAbs(args[0])
+
+	case seriesValueBoundFn:
+		return seriesValueBound(args[0]), nil
+
+	case seriesIntBoundFn:
+		return seriesIntBound(args[0]), nil
 
 	case "length":
 		if len(args) != 1 {
