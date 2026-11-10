@@ -235,6 +235,7 @@ const (
 	aggSetOut    = iota // a select-list output column (plan.outPlans[idx])
 	aggSetHaving        // the HAVING expression (plan.havingPlan; idx ignored)
 	aggSetOrder         // a GROUP BY ORDER BY term (plan.orderPlans[idx].item)
+	aggSetFinal         // every select-list item's aggregates, finalized for their errors alone
 )
 
 // aggResultInfo is an OpAggResult P4 payload: which single item (select-list
@@ -244,6 +245,9 @@ type aggResultInfo struct {
 	plan *aggPlan
 	set  int
 	idx  int
+	// conv says the items run here in C's order (aggPlan.converts), so an IN
+	// may convert a group value in place as C does.
+	conv bool
 }
 
 // aggAccumulators is the VM's live per-group accumulator state (vdbe.aggAccs):
@@ -254,6 +258,10 @@ type aggAccumulators struct {
 	out    [][]*aggItem
 	having []*aggItem
 	order  [][]*aggItem
+
+	// conv is the group values an IN of this group's result converted, which
+	// every item evaluated after it reads converted (groupConv).
+	conv []groupConvValue
 
 	// magnets are this group's own instances of the query's min()/max() census
 	// sites (aggPlan.magnet). Deliberately SEPARATE accumulators from whatever
@@ -533,6 +541,17 @@ func (m *vdbe) aggResult(info *aggResultInfo, groupKey []Value) (Value, error) {
 	var it *itemPlan
 	var accs []*aggItem
 	switch info.set {
+	case aggSetFinal:
+		// finalizeAggFunctions (select.c:6733) runs before HAVING, so an
+		// aggregate a dropped group's outputs name still raises.
+		for _, out := range m.aggAccs.out {
+			for _, acc := range out {
+				if _, err := acc.finalize(); err != nil {
+					return Value{}, err
+				}
+			}
+		}
+		return Value{}, nil
 	case aggSetHaving:
 		it, accs = plan.havingPlan, m.aggAccs.having
 	case aggSetOrder:
@@ -555,6 +574,9 @@ func (m *vdbe) aggResult(info *aggResultInfo, groupKey []Value) (Value, error) {
 		clearJSONSubtype(groupKey)
 	}
 	bareVals, bareRowids := m.aggAccs.anchorRow(plan)
+	if len(m.aggAccs.conv) > 0 {
+		groupKey, bareVals = m.convertedGroup(plan, it, aggVals, groupKey, bareVals)
+	}
 	if p := it.prog; p != nil && p.prog != nil {
 		if v, ok := p.seeded(aggVals, groupKey, bareVals, bareRowids); ok {
 			return v, nil
@@ -591,7 +613,11 @@ func (m *vdbe) aggResult(info *aggResultInfo, groupKey []Value) (Value, error) {
 	// An item that does not lower fails at compile time, so this check only
 	// guards per-execution widths.
 	if p := it.prog; p.runnable(m, aggVals, groupKey, bareVals, bareRowids) {
-		return p.run(m, aggVals, groupKey, bareVals, bareRowids)
+		var conv *[]groupConvValue
+		if info.conv {
+			conv = &m.aggAccs.conv
+		}
+		return p.run(m, conv, aggVals, groupKey, bareVals, bareRowids)
 	}
 	return Value{}, fmt.Errorf("%w: aggregate result item's register block does not match its program", errVDBEUnsupported)
 }

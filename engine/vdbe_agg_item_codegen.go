@@ -533,13 +533,16 @@ func (p *aggItemProgram) seeded(aggVals, groupKey, bareVals, bareRowids []Value)
 }
 
 // run seeds the four register blocks for one group and runs the program.
-func (p *aggItemProgram) run(m *vdbe, aggVals, groupKey, bareVals, bareRowids []Value) (Value, error) {
+func (p *aggItemProgram) run(m *vdbe, conv *[]groupConvValue, aggVals, groupKey, bareVals, bareRowids []Value) (Value, error) {
 	pm := m.aggItemVM(p.prog)
 	copy(pm.regs[p.aggBase:p.aggBase+p.nAgg], aggVals)
 	copy(pm.regs[p.keyBase:p.keyBase+p.nKey], groupKey)
 	copy(pm.regs[p.colBase:p.colBase+p.nCols], bareVals)
 	copy(pm.regs[p.rowidBase:p.rowidBase+p.nRowid], bareRowids)
-	if _, err := pm.run(p.prog.Insns); err != nil {
+	pm.aggConv = conv
+	_, err := pm.run(p.prog.Insns)
+	pm.aggConv = nil
+	if err != nil {
 		return Value{}, err
 	}
 	return pm.regs[p.resultReg], nil

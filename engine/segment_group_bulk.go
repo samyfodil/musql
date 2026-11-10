@@ -457,7 +457,7 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		if !having.runnable(m, havingVals, keyVals, cols, rids) {
 			return false
 		}
-		v, err := having.run(m, havingVals, keyVals, cols, rids)
+		v, err := having.run(m, nil, havingVals, keyVals, cols, rids)
 		return err == nil && (v.Typ == Null || !isTruthy(v))
 	}
 

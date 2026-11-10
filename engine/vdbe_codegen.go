@@ -3120,29 +3120,23 @@ func (c *compiler) compileBinary(x BinaryExpr, top bool) (int, error) {
 	}
 
 	if opc, ok := arithOpcode[x.Op]; ok {
-		l, err := c.compileExpr(x.L)
-		if err != nil {
-			return 0, err
-		}
-		r, err := c.compileExpr(x.R)
+		l, r, skip, err := c.computeOperands(x.L, x.R)
 		if err != nil {
 			return 0, err
 		}
 		d := c.alloc()
 		c.emit(Instruction{Op: opc, P1: r, P2: l, P3: d})
+		c.skippedOperandIsNull(skip, d)
 		return d, nil
 	}
 	if x.Op == "||" {
-		l, err := c.compileExpr(x.L)
-		if err != nil {
-			return 0, err
-		}
-		r, err := c.compileExpr(x.R)
+		l, r, skip, err := c.computeOperands(x.L, x.R)
 		if err != nil {
 			return 0, err
 		}
 		d := c.alloc()
 		c.emit(Instruction{Op: OpConcat, P1: r, P2: l, P3: d})
+		c.skippedOperandIsNull(skip, d)
 		return d, nil
 	}
 
@@ -3335,15 +3329,21 @@ func (c *compiler) compileRowSubCompare(op string, probe RowExpr, sub *SelectStm
 // expressions (compAffinity) and carried in P5, reproducing the run-time
 // comparison's own affinity rule within the FROM-less domain.
 func (c *compiler) compileCompare(op string, le, re Expr, isKind bool) (int, error) {
-	l, err := c.compileExpr(le)
-	if err != nil {
-		return 0, err
-	}
-	r, err := c.compileExpr(re)
-	if err != nil {
+	var l, r int
+	skip := -1
+	var err error
+	if isKind {
+		if l, err = c.compileExpr(le); err != nil {
+			return 0, err
+		}
+		if r, err = c.compileExpr(re); err != nil {
+			return 0, err
+		}
+	} else if l, r, skip, err = c.computeOperands(le, re); err != nil {
 		return 0, err
 	}
 	d := c.alloc()
+	defer c.skippedOperandIsNull(skip, d)
 	aff := c.compAffinity(le, re)
 	p5 := uint16(aff) | p5StoreP2
 	var opc OpCode
@@ -3359,6 +3359,57 @@ func (c *compiler) compileCompare(op string, le, re Expr, isKind bool) (int, err
 	}
 	c.emit(Instruction{Op: opc, P1: r, P2: d, P3: l, P4: c.compCollation(le, re), P5: p5})
 	return d, nil
+}
+
+// computeOperands codes a binary operator's two operands. In an aggregate's
+// result item, where the order is seen (an IN converts a group value in
+// place, groupConv), they are coded as exprComputeOperands (expr.c:2417)
+// codes them: an operand holding a subquery second, and not at all when the
+// other, which might be NULL, is. skip is that IsNull jump, or -1.
+func (c *compiler) computeOperands(le, re Expr) (l, r, skip int, err error) {
+	skip = -1
+	lSub, rSub := exprContainsSubquery(le), exprContainsSubquery(re)
+	if c.aggRegs != nil && lSub && !rSub && exprCanBeNull(re) {
+		if r, err = c.compileExpr(re); err != nil {
+			return 0, 0, 0, err
+		}
+		skip = c.emit(Instruction{Op: OpIsNull, P1: r})
+		l, err = c.compileExpr(le)
+		return l, r, skip, err
+	}
+	if l, err = c.compileExpr(le); err != nil {
+		return 0, 0, 0, err
+	}
+	if c.aggRegs != nil && rSub && exprCanBeNull(le) {
+		skip = c.emit(Instruction{Op: OpIsNull, P1: l})
+	}
+	r, err = c.compileExpr(re)
+	return l, r, skip, err
+}
+
+// skippedOperandIsNull makes d NULL where computeOperands skipped an operand.
+func (c *compiler) skippedOperandIsNull(skip, d int) {
+	if skip < 0 {
+		return
+	}
+	j := c.emit(Instruction{Op: OpGoto})
+	c.patch(skip, c.here())
+	c.emit(Instruction{Op: OpNull, P2: d})
+	c.patch(j, c.here())
+}
+
+// exprCanBeNull is sqlite3ExprCanBeNull (expr.c:2965) for an expression of an
+// aggregate's result: only a literal that is not NULL cannot be.
+func exprCanBeNull(e Expr) bool {
+	for {
+		u, ok := e.(UnaryExpr)
+		if !ok || u.Op != "+" && u.Op != "-" {
+			break
+		}
+		e = u.X
+	}
+	l, ok := e.(LiteralExpr)
+	return !ok || l.Val.Typ == Null
 }
 
 // compCollation is the collation a comparison opcode carries in P4 for
@@ -3382,6 +3433,12 @@ func (c *compiler) compileAndOr(le, re Expr, isAnd, top bool) (int, error) {
 		decideOp = OpIfNot // AND: jump-on-false
 	}
 
+	// An operand holding a subquery is coded second, so the other may decide
+	// the result without it (exprEvalRhsFirst, expr.c:2395, in a value and in a
+	// jump alike). A WHERE's own conjuncts are its terms, coded in order.
+	if !top && exprContainsSubquery(le) && !exprContainsSubquery(re) {
+		le, re = re, le
+	}
 	if isAnd && top {
 		c.inWhereConjunct = true
 	}
@@ -3886,6 +3943,7 @@ func (c *compiler) compileInSubquery(x InExpr) (int, error) {
 	// A single-column probe still goes through the block, so scalar and
 	// row-value membership share one code path rather than two.
 	xBase := c.allocN(arity)
+	probeReg := -1
 	if lhsSub != nil {
 		if cerr := c.emitRowSubqueryProbe(lhsSub, xBase, arity); cerr != nil {
 			return 0, cerr
@@ -3896,6 +3954,7 @@ func (c *compiler) compileInSubquery(x InExpr) (int, error) {
 			if cerr != nil {
 				return 0, cerr
 			}
+			probeReg = reg
 			c.emit(Instruction{Op: OpSCopy, P1: reg, P2: xBase + i})
 		}
 	}
@@ -3929,6 +3988,9 @@ func (c *compiler) compileInSubquery(x InExpr) (int, error) {
 	if arity == 1 && lhsSub == nil && len(subAffs) == 1 {
 		plan.sharedAff, plan.shared = c.inSubConvertsGroupValue(probe[0], subAffs[0], subMats[0], x.Sub, prog.Correlated)
 		plan.sharedReal = plan.shared && groupValueIsReal(probe[0])
+		if plan.shared && !prog.Correlated {
+			plan.conv = c.groupValueConv(probe[0], probeReg)
+		}
 	}
 	d := c.alloc()
 	// A correlated membership subquery re-runs per evaluation (no cache slot);
