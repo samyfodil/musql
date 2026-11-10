@@ -7,6 +7,7 @@ package engine
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -118,7 +119,26 @@ const (
 	lexShareMax = 16 << 20
 )
 
+// lexKept is the tokens of the short texts lexed lately. A table's or view's
+// schema text is lexed again by each helper that reads it, a hundred times for
+// one cold statement over a few views; a statement's own text is lexed by each
+// classifier before it is compiled. Like lexLast it hands out slices with no
+// spare capacity. Emptied when full, so it holds at most lexKeepN texts.
+var lexKept struct {
+	mu sync.Mutex
+	m  map[string][]token
+}
+
+const (
+	lexKeepMin = 32
+	lexKeepMax = 4 << 10
+	lexKeepN   = 128
+)
+
 func lex(s string) ([]token, error) {
+	if len(s) >= lexKeepMin && len(s) <= lexKeepMax {
+		return lexKeep(s)
+	}
 	if len(s) < lexShareMin || len(s) > lexShareMax {
 		return lexUncached(s)
 	}
@@ -131,6 +151,30 @@ func lex(s string) ([]token, error) {
 	}
 	lexLast.Store(&lexEntry{sql: s, toks: toks[:len(toks):len(toks)]})
 	return toks[:len(toks):len(toks)], nil
+}
+
+func lexKeep(s string) ([]token, error) {
+	lexKept.mu.Lock()
+	toks, ok := lexKept.m[s]
+	lexKept.mu.Unlock()
+	if ok {
+		return toks, nil
+	}
+	// Its own copy, which the tokens' texts point into: s may be a slice of a
+	// much longer script, which they would otherwise keep alive.
+	own := strings.Clone(s)
+	toks, err := lexUncached(own)
+	if err != nil {
+		return toks, err
+	}
+	toks = toks[:len(toks):len(toks)]
+	lexKept.mu.Lock()
+	if lexKept.m == nil || len(lexKept.m) >= lexKeepN {
+		lexKept.m = make(map[string][]token, lexKeepN)
+	}
+	lexKept.m[own] = toks
+	lexKept.mu.Unlock()
+	return toks, nil
 }
 
 func lexUncached(s string) ([]token, error) {
