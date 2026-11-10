@@ -84,7 +84,10 @@ func (p *ReadOnlyPager) nullUnusedSubqueryColumns(stmt *SelectStmt) *SelectStmt 
 			continue
 		}
 		it = d
-		cols, ok := p.derivedSchemaColsOnly(sub)
+		cols, ok := p.plainDerivedCols(sub)
+		if !ok {
+			cols, ok = p.derivedSchemaColsOnly(sub)
+		}
 		if !ok || len(cols) != len(sub.Columns) {
 			continue
 		}
@@ -144,6 +147,81 @@ func (p *ReadOnlyPager) derivedSchemaColsOnly(sub *SelectStmt) ([]columnInfo, bo
 	p.derivedSchemaOnly = true
 	defer func() { p.derivedSchemaOnly = saved }()
 	return p.derivedSchemaCols(sub)
+}
+
+// plainDerivedCols is derivedSchemaColsOnly's answer, by name only, for a body
+// whose column names need no compile to know: it reads one table and nothing
+// else, and every result column is an alias or a column of that table, which
+// sqlite3ColumnsFromExprList names by its declared name, no two alike. false
+// sends the body to the compile.
+func (p *ReadOnlyPager) plainDerivedCols(sub *SelectStmt) ([]columnInfo, bool) {
+	if len(sub.Compound) != 0 || len(sub.From) != 1 || len(sub.CTEs) != 0 || len(sub.GroupBy) != 0 ||
+		sub.Having != nil || len(sub.Windows) != 0 || sub.ValuesArms != 0 {
+		return nil, false
+	}
+	it := sub.From[0]
+	if it.Subquery != nil || it.TableFunc || it.Table == "" || it.On != nil ||
+		len(it.Using) != 0 || it.Natural || it.IndexedBy != "" || it.GroupLen != 0 {
+		return nil, false
+	}
+	if _, isCTE := p.lookupCTE(it.Table); isCTE {
+		return nil, false
+	}
+	if _, _, isVtab, err := p.createdVtabDef(it.Table); err != nil || isVtab {
+		return nil, false
+	}
+	tbl, err := p.resolveTableIn(fromItemScope(it), it.Table)
+	if err != nil || tbl == nil {
+		return nil, false
+	}
+	name := it.Alias
+	if name == "" {
+		name = it.Table
+	}
+	colOf := func(c ColumnExpr) int {
+		if c.Qualifier != "" && !equalFoldName(c.Qualifier, name) {
+			return -1
+		}
+		for i, tc := range tbl.cols {
+			if equalFoldName(tc.Name, c.Name) {
+				return i
+			}
+		}
+		return -1
+	}
+	reads := func(e Expr) bool {
+		return e == nil || exprRefsOnly(e, func(c ColumnExpr) bool { return colOf(c) >= 0 })
+	}
+	if !reads(sub.Where) || !reads(sub.LimitParam) || !reads(sub.OffsetParam) {
+		return nil, false
+	}
+	for _, o := range sub.OrderBy {
+		if !reads(o.Expr) {
+			return nil, false
+		}
+	}
+	cols := make([]columnInfo, len(sub.Columns))
+	seen := map[string]bool{}
+	for j, c := range sub.Columns {
+		if c.Star || !reads(c.Expr) {
+			return nil, false
+		}
+		n := c.Alias
+		if !c.HasAlias {
+			ce, isCol := c.Expr.(ColumnExpr)
+			if !isCol {
+				return nil, false
+			}
+			n = tbl.cols[colOf(ce)].Name
+		}
+		k := r33sFoldIdent(n)
+		if seen[k] {
+			return nil, false
+		}
+		seen[k] = true
+		cols[j] = columnInfo{Name: n}
+	}
+	return cols, true
 }
 
 // unusedColumnsEligible is C's list of subqueries disableUnusedSubqueryResultColumns
