@@ -54,11 +54,15 @@ func (a *app) runShell(ctx context.Context, db *sql.DB, script []string, banner 
 	case len(script) == 1:
 		return sh.Script(ctx, script[0])
 	case !a.env.Interactive:
-		b, err := io.ReadAll(a.env.Stdin)
-		if err != nil {
+		// Piped input is read as typed lines, dot-commands and all, and goes on
+		// past an error as C's shell does; the exit status still says one failed.
+		if _, err := sh.run(ctx, &readerLines{r: bufio.NewReader(a.env.Stdin)}, a.env.Stderr, true); err != nil {
 			return err
 		}
-		return sh.Script(ctx, string(b))
+		if sh.failed > 0 {
+			return fmt.Errorf("%d error(s) in the input", sh.failed)
+		}
+		return nil
 	}
 	old, err := term.MakeRaw(a.env.StdinFd)
 	if err != nil {
@@ -116,11 +120,12 @@ type LineReader interface {
 
 // Shell runs SQL and dot-commands against a database and prints results.
 type Shell struct {
-	DB    *sql.DB
-	Out   io.Writer
-	Mode  string // table, csv or json
-	Timer bool   // print each statement's run time
-	reads int    // .read files open, one inside another
+	DB     *sql.DB
+	Out    io.Writer
+	Mode   string // table, csv or json
+	Timer  bool   // print each statement's run time
+	reads  int    // .read files open, one inside another
+	failed int    // statements and dot-commands that reported an error
 }
 
 const (
@@ -146,7 +151,7 @@ func (s *Shell) run(ctx context.Context, in LineReader, errw io.Writer, finish b
 		if errors.Is(err, io.EOF) {
 			if finish && strings.TrimSpace(buf.String()) != "" {
 				if err := s.Script(ctx, buf.String()); err != nil {
-					fmt.Fprintf(errw, "Error: %v\n", err)
+					s.report(errw, err)
 				}
 			}
 			return false, nil
@@ -157,7 +162,7 @@ func (s *Shell) run(ctx context.Context, in LineReader, errw io.Writer, finish b
 		if buf.Len() == 0 && strings.HasPrefix(strings.TrimSpace(line), ".") {
 			quit, err := s.meta(ctx, strings.TrimSpace(line), errw)
 			if err != nil {
-				fmt.Fprintf(errw, "Error: %v\n", err)
+				s.report(errw, err)
 			}
 			if quit {
 				return true, nil
@@ -175,7 +180,7 @@ func (s *Shell) run(ctx context.Context, in LineReader, errw io.Writer, finish b
 			continue
 		}
 		if err := s.Script(ctx, buf.String()); err != nil {
-			fmt.Fprintf(errw, "Error: %v\n", err)
+			s.report(errw, err)
 		}
 		buf.Reset()
 		in.SetPrompt(prompt)
@@ -434,6 +439,24 @@ func (f *fileLines) ReadLine() (string, error) {
 }
 
 func (f *fileLines) SetPrompt(string) {}
+
+// readerLines reads piped input's lines as the REPL reads typed ones.
+type readerLines struct{ r *bufio.Reader }
+
+func (l *readerLines) ReadLine() (string, error) {
+	line, err := l.r.ReadString('\n')
+	if err == io.EOF && line != "" {
+		err = nil
+	}
+	return strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r"), err
+}
+
+func (l *readerLines) SetPrompt(string) {}
+
+func (s *Shell) report(errw io.Writer, err error) {
+	s.failed++
+	fmt.Fprintf(errw, "Error: %v\n", err)
+}
 
 func (s *Shell) listTables(ctx context.Context) error {
 	rows, err := s.DB.QueryContext(ctx, `SELECT name FROM sqlite_schema WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name`)
