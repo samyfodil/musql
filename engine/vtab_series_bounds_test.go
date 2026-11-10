@@ -112,6 +112,40 @@ func TestSeriesBoundsAsC(t *testing.T) {
 		{`SELECT count(*) FROM generate_series(1,3) WHERE start IN (1,2)`, "3"},
 		{`SELECT count(*) FROM generate_series WHERE start IN (1,2) AND stop = 3 AND start = 2`, "2"},
 		{`SELECT count(*) FROM generate_series WHERE start IN (2) AND stop = 3`, "2"},
+		// C runs a consumed IN once for every distinct value of it, so a row
+		// two of them make comes out twice, and one on start, stop or step
+		// makes a series for each value (#155).
+		{`SELECT count(*) FROM generate_series(1,10) WHERE value IN ('5', 5)`, "2"},
+		{`SELECT count(*) FROM generate_series(1,10) WHERE value IN ('5', ' 5', 5.0, 5)`, "3"},
+		{`SELECT count(*) FROM generate_series(1,10) WHERE value = '5' OR value = 5`, "2"},
+		{`SELECT count(*) FROM generate_series WHERE start IN (1,2) AND stop = 3`, "5"},
+		{`SELECT count(*) FROM generate_series WHERE (start = 1 OR start = 2) AND stop = 3`, "5"},
+		{`SELECT count(*) FROM generate_series WHERE start = 1 AND stop IN (2, 3)`, "5"},
+		{`SELECT count(*) FROM generate_series WHERE start = 2 AND start IN (1,2) AND stop = 3`, "2"},
+		{`SELECT group_concat(value) FROM generate_series WHERE start IN (2,1) AND stop = 3`, "1,2,3,2,3"},
+		{`SELECT group_concat(value || ':' || start) FROM generate_series WHERE start IN (3,1) AND stop = 4`, "1:1,2:1,3:1,4:1,3:3,4:3"},
+		{`SELECT count(*) FROM generate_series WHERE start IN (1,1,'1') AND stop = 3`, "3"},
+		{`SELECT count(*) FROM generate_series(1,10) WHERE value IN (NULL, 5)`, "1"},
+		{`SELECT count(*) FROM generate_series WHERE start IN (SELECT NULL) AND stop = 3`, "0"},
+		{`SELECT count(*) FROM generate_series WHERE start IN (SELECT 1 WHERE 0) AND stop = 3`, "0"},
+		{`SELECT group_concat(value || ':' || start || ':' || stop) FROM generate_series WHERE start IN (1,2) AND stop IN (3,4)`,
+			"1:1:3,2:1:3,3:1:3,1:1:4,2:1:4,3:1:4,4:1:4,2:2:3,3:2:3,2:2:4,3:2:4,4:2:4"},
+		{`SELECT group_concat(value || ':' || step) FROM generate_series WHERE start = 1 AND stop = 4 AND step IN (2,1)`, "1:1,2:1,3:1,4:1,1:2,3:2"},
+		{`SELECT group_concat(value) FROM generate_series(10,1,-1) WHERE value IN (3,1,2)`, "1,2,3"},
+		{`SELECT sum(value) FROM generate_series WHERE start IN (1,2,3) AND stop IN (5) AND step IN (1,2)`, "64"},
+		{`SELECT count(*) FROM generate_series(1,10) WHERE value IN (SELECT '5')`, "1"},
+		{`SELECT count(*) FROM generate_series(1,10) WHERE value IN (SELECT '5' UNION ALL SELECT 5)`, "2"},
+		{`SELECT count(*) FROM generate_series(1,10) WHERE rowid IN (SELECT '5')`, "1"},
+		{`SELECT group_concat(value) FROM generate_series(1,10) WHERE value IN (SELECT 6 UNION SELECT 5)`, "5,6"},
+		{`SELECT count(*) FROM generate_series(1,10) WHERE value IN (SELECT value FROM generate_series(3,5))`, "3"},
+		{`SELECT count(*) FROM generate_series WHERE stop = 12 AND start IN (SELECT x COLLATE nocase FROM (SELECT '1e1' AS x UNION ALL SELECT '1E1'))`, "3"},
+		{`SELECT count(*) FROM generate_series(1,20) WHERE value IN (SELECT x COLLATE nocase FROM (SELECT '1e1' AS x UNION ALL SELECT '1E1'))`, "1"},
+		{`SELECT count(*) FROM generate_series(1,20) WHERE value IN (SELECT x COLLATE rtrim FROM (SELECT '5' AS x UNION ALL SELECT '5 '))`, "1"},
+		{`SELECT count(*) FROM generate_series(1,20) WHERE value IN (SELECT x FROM (SELECT '5' AS x UNION ALL SELECT '5 '))`, "2"},
+		{`SELECT count(*) FROM generate_series(1,5) a, generate_series(1,5) b WHERE a.value IN (1,2) AND b.value IN (SELECT 3 UNION SELECT 4)`, "4"},
+		{`SELECT group_concat(a.value || ':' || b.value) FROM generate_series(1,3) a JOIN generate_series(1,3) b ON 1 WHERE b.value IN (2, '2') AND a.value = 1`, "1:2,1:2"},
+		{`SELECT group_concat(value) FROM (SELECT value FROM generate_series WHERE start IN (1,2) AND stop = 3 LIMIT 2 OFFSET 2)`, "3,2"},
+		{`SELECT count(*) FROM generate_series(1,10) WHERE value NOT IN (SELECT '5')`, "10"},
 		{`SELECT count(*) FROM json_each('5') WHERE json = 5`, "1"},
 		{`SELECT json = 5 FROM json_each('5')`, "1"},
 		{`SELECT count(*) FROM json_each('[1]', '$') WHERE root = 5`, "0"},
@@ -132,22 +166,6 @@ func TestSeriesBoundsAsC(t *testing.T) {
 		}
 		if got != tc.want {
 			t.Errorf("%s = %q, want %q (C SQLite's)", tc.q, got, tc.want)
-		}
-	}
-	// C runs a consumed IN once for every distinct value, so a row two of
-	// them make comes out twice: declined.
-	for _, q := range []string{
-		`SELECT count(*) FROM generate_series(1,10) WHERE value IN ('5', 5)`,
-		`SELECT count(*) FROM generate_series(1,10) WHERE value IN ('5', ' 5', 5.0, 5)`,
-		`SELECT count(*) FROM generate_series(1,10) WHERE value = '5' OR value = 5`,
-		// And one on start, stop or step makes a series for each value.
-		`SELECT count(*) FROM generate_series WHERE start IN (1,2) AND stop = 3`,
-		`SELECT count(*) FROM generate_series WHERE (start = 1 OR start = 2) AND stop = 3`,
-		`SELECT count(*) FROM generate_series WHERE start = 1 AND stop IN (2, 3)`,
-		`SELECT count(*) FROM generate_series WHERE start = 2 AND start IN (1,2) AND stop = 3`,
-	} {
-		if _, rows, err := p.Query(q); err == nil {
-			t.Errorf("%s = %v, want it declined (C answers 2 or more)", q, rows)
 		}
 	}
 }

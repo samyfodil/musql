@@ -21,6 +21,7 @@ package engine
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -180,6 +181,8 @@ type VtabIndexInfo struct {
 	Usage       []VtabConstraintUsage // output: parallel to Constraints
 	IdxNum      int                   // output: opaque plan number for Filter
 	IdxStr      string                // output: opaque plan string for Filter
+
+	inLoops []vtabInLoop // the consumed INs Filter runs once for each value of
 }
 
 // ---- registry ----
@@ -484,6 +487,7 @@ func (p *ReadOnlyPager) materializeVtab(it FromItem, params []Value, outer *eval
 	if ea, ok := cur.(vtabEncodingAware); ok {
 		ea.setTextEncoding(p.encoding())
 	}
+	cur = newVtabInLoopCursor(cur, info.inLoops)
 	if err := cur.Filter(info.IdxNum, info.IdxStr, argv); err != nil {
 		return nil, nil, nil, err
 	}
@@ -519,7 +523,7 @@ func (p *ReadOnlyPager) materializeVtab(it FromItem, params []Value, outer *eval
 // plan it chose and the arguments Filter takes for it. argvFrom[k] is the corr
 // entry argv[k] was taken from, -1 for one folded here.
 func (p *ReadOnlyPager) vtabFilterArgs(it FromItem, cols []columnInfo, tab VirtualTable, params []Value, outer *evalCtx, trig *trigCompileCtx, from *vdbe, corr []vtabCorrValue) (info *VtabIndexInfo, argv []Value, argvFrom []int, err error) {
-	constraints, rhsVals, rhsFrom, err := p.buildVtabConstraints(it, cols, params, outer, trig, from, corr)
+	constraints, rhsVals, rhsFrom, loops, err := p.buildVtabConstraints(it, cols, params, outer, trig, from, corr)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -527,6 +531,14 @@ func (p *ReadOnlyPager) vtabFilterArgs(it FromItem, cols []columnInfo, tab Virtu
 	if err := tab.BestIndex(info); err != nil {
 		return nil, nil, nil, err
 	}
+	for i, in := range loops {
+		// The WHERE no longer tests an IN the module was to consume.
+		if info.Usage[i].ArgvIndex < 1 {
+			return nil, nil, nil, fmt.Errorf("%w: %s() did not take the IN it was given", errVDBEUnsupported, it.Table)
+		}
+		info.inLoops = append(info.inLoops, vtabInLoop{arg: info.Usage[i].ArgvIndex - 1, vals: in})
+	}
+	slices.SortFunc(info.inLoops, func(a, b vtabInLoop) int { return a.arg - b.arg })
 	maxArgv := 0
 	for _, u := range info.Usage {
 		if u.ArgvIndex > maxArgv {
@@ -672,25 +684,23 @@ var errVtabArgNotConstant = errors.New("engine: table-valued function argument n
 // earlier in the join is coded per outer row in C (wherecode.c:1584) with
 // xFilter re-run. When the compiler arranged that (vtab_correlated.go), the
 // value arrives computed and the constraint is usable (where.c:4390).
-func (p *ReadOnlyPager) buildVtabConstraints(it FromItem, cols []columnInfo, params []Value, outer *evalCtx, trig *trigCompileCtx, from *vdbe, corr []vtabCorrValue) ([]VtabConstraint, []Value, []int, error) {
-	var cs []VtabConstraint
-	var vals []Value
-	var srcs []int
-
+//
+// A consumed IN (vtabInLoopFn) is offered as an equality, and loops holds, by
+// constraint, the values it runs the module for (vtab_in_loop.go).
+func (p *ReadOnlyPager) buildVtabConstraints(it FromItem, cols []columnInfo, params []Value, outer *evalCtx, trig *trigCompileCtx, from *vdbe, corr []vtabCorrValue) (cs []VtabConstraint, vals []Value, srcs []int, loops map[int][]Value, err error) {
 	hidden := hiddenColIndices(cols)
 	for ai, argExpr := range it.TableFuncArgs {
 		if ai >= len(hidden) {
 			// whereexpr.c:1922 names the eponymous table, which is the module.
-			return nil, nil, nil, fmt.Errorf("engine: too many arguments on %s() - max %d", r33sFoldIdent(it.Table), len(hidden))
+			return nil, nil, nil, nil, fmt.Errorf("engine: too many arguments on %s() - max %d", r33sFoldIdent(it.Table), len(hidden))
 		}
 		src := vtabCorrArgIndex(corr, ai, hidden[ai])
 		var v Value
 		if src >= 0 {
 			v = corr[src].v
 		} else {
-			var err error
 			if v, err = p.foldVtabInputValue(argExpr, params, outer, trig, from); err != nil {
-				return nil, nil, nil, fmt.Errorf("%w: engine: %s(): argument %d is not a constant: %w", errVtabArgNotConstant, it.Table, ai+1, err)
+				return nil, nil, nil, nil, fmt.Errorf("%w: engine: %s(): argument %d is not a constant: %w", errVtabArgNotConstant, it.Table, ai+1, err)
 			}
 		}
 		// Omitted: an argument is not a WHERE conjunct here, so nothing
@@ -706,6 +716,20 @@ func (p *ReadOnlyPager) buildVtabConstraints(it FromItem, cols []columnInfo, par
 		name = it.Table
 	}
 	for ci2, conj := range it.tvfWhere {
+		if f, isLoop := conj.(FuncExpr); isLoop && f.Name == vtabInLoopFn {
+			col, in, lerr := p.vtabInLoopValues(f, params, outer, trig, from)
+			if lerr != nil {
+				return nil, nil, nil, nil, lerr
+			}
+			if loops == nil {
+				loops = map[int][]Value{}
+			}
+			loops[len(cs)] = in
+			cs = append(cs, VtabConstraint{Column: col, Op: VtabEQ, Usable: true, Omitted: true})
+			vals = append(vals, Value{})
+			srcs = append(srcs, -1)
+			continue
+		}
 		ci, op, rhs, ok := matchVtabConstraint(conj, cols, name)
 		if !ok {
 			continue
@@ -725,8 +749,8 @@ func (p *ReadOnlyPager) buildVtabConstraints(it FromItem, cols []columnInfo, par
 			continue
 		}
 		srcs = append(srcs, -1)
-		v, err := p.foldVtabInputValue(rhs, params, outer, trig, from)
-		if err != nil {
+		v, ferr := p.foldVtabInputValue(rhs, params, outer, trig, from)
+		if ferr != nil {
 			// Offered UNUSABLE with a placeholder value, keeping the two
 			// slices parallel. BestIndex never assigns an unusable constraint
 			// an ArgvIndex, so the placeholder is never read.
@@ -737,7 +761,7 @@ func (p *ReadOnlyPager) buildVtabConstraints(it FromItem, cols []columnInfo, par
 		cs = append(cs, VtabConstraint{Column: ci, Op: op, Usable: true, Omitted: omitted})
 		vals = append(vals, v)
 	}
-	return cs, vals, srcs, nil
+	return cs, vals, srcs, loops, nil
 }
 
 // foldVtabInputValue computes one constraint right-hand side by compiling it as

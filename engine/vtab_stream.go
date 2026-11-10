@@ -71,6 +71,7 @@ func (p *ReadOnlyPager) startVtabStream(it FromItem, params []Value, outer *eval
 	if ea, ok := cur.(vtabEncodingAware); ok {
 		ea.setTextEncoding(p.encoding())
 	}
+	cur = newVtabInLoopCursor(cur, info.inLoops)
 	sc := &vtabScan{cur: cur, idxNum: info.IdxNum, idxStr: info.IdxStr, argv: argv, argvFrom: argvFrom}
 	if err := cur.Filter(sc.idxNum, sc.idxStr, sc.argv); err != nil {
 		return nil, err

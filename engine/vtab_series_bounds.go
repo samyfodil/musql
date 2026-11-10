@@ -1,10 +1,10 @@
 package engine
 
 import (
-	"fmt"
 	"maps"
 	"math"
 	"slices"
+	"strings"
 )
 
 // C's generate_series omits every constraint its xBestIndex consumes
@@ -27,14 +27,13 @@ import (
 // conjuncts from the last -- a BETWEEN's ">=" and "<=", an OR's combined
 // comparison (whereCombineDisjuncts) and its IN (exprAnalyzeOrTerm). The
 // rowid is the value. A column whose constraints C may or may not be able to
-// use (a bound reading this statement's own FROM), or whose IN would run the
-// series once per value, is left as it is.
+// use (a bound reading this statement's own FROM) is left as it is. A consumed
+// IN runs the series once for every value of it (vtab_in_loop.go).
 
 const (
 	seriesValueBoundFn = "\x00series_value_bound"
 	seriesIntBoundFn   = "\x00series_int_bound"
 	seriesStepBoundFn  = "\x00series_step_bound"
-	seriesInFn         = "\x00series_in"
 )
 
 // seriesColRowid is the rowid, which seriesBestIndex constrains as value.
@@ -73,33 +72,6 @@ func seriesIntBound(v Value, step bool) Value {
 	return Value{Typ: Int, I: n}
 }
 
-// seriesIn is "value IN (...)" as C runs a consumed one: the series once for
-// every distinct value of the list (an ephemeral index, keyed with the
-// column's affinity). It is 1 for a row one of them makes and 0 for one none
-// does; a row two of them make, which C produces twice, is declined.
-func seriesIn(args []Value) (Value, error) {
-	aff, row := affinity(args[0].I), args[1]
-	var seen []Value
-	hits := 0
-	for _, v := range args[2:] {
-		if v.Typ == Null {
-			continue
-		}
-		v = applyAffinityToValue(v, aff)
-		if slices.ContainsFunc(seen, func(s Value) bool { return compareValues(s, v) == 0 }) {
-			continue
-		}
-		seen = append(seen, v)
-		if b := seriesValueBound(v, VtabEQ); b.Typ == Int && row.Typ == Int && b.I == row.I {
-			hits++
-		}
-	}
-	if hits > 1 {
-		return Value{}, fmt.Errorf("%w: generate_series makes this row for two values of the IN list", errVDBEUnsupported)
-	}
-	return Value{Typ: Int, I: int64(hits)}, nil
-}
-
 type seriesTermKind int
 
 const (
@@ -121,9 +93,10 @@ type seriesTerm struct {
 	commuted bool // the column is the right operand as written
 	colX     Expr
 	rhs      Expr
-	list     []Expr // an IN of two values or more
-	known    bool   // usable, or not, before the statement runs
-	loop     bool   // an IN of start, stop or step, which C runs the series once for each value of
+	list     []Expr      // an IN of two values or more
+	sub      *SelectStmt // an IN (SELECT ...)
+	known    bool        // usable, or not, before the statement runs
+	loop     bool        // an IN, which C runs the series once for each value of
 }
 
 // seriesScope resolves a generate_series item's columns.
@@ -132,6 +105,10 @@ type seriesScope struct {
 	name  string
 	rowid bool // an unqualified rowid is this item's
 	known func(Expr) bool
+	// sub is the affinity of an IN subquery's column, whether it is a
+	// column's, and its collation, when the subquery reads nothing of this
+	// statement and the collation is a built-in one.
+	sub func(*SelectStmt) (affinity, bool, string, bool)
 }
 
 func (s seriesScope) column(e Expr) (int, bool) {
@@ -184,15 +161,18 @@ func (s seriesScope) real(e Expr) (seriesTerm, bool) {
 	if !ok || in.Not || in.Sub == nil && len(in.List) == 0 {
 		return seriesTerm{}, false
 	}
-	t := seriesTerm{col: ci, op: VtabEQ, colX: in.X, known: in.Sub == nil}
+	t := seriesTerm{col: ci, op: VtabEQ, colX: in.X, known: true}
 	for _, v := range in.List {
 		t.known = t.known && s.known(v)
 	}
-	if len(in.List) == 1 {
+	switch {
+	case in.Sub != nil:
+		_, _, _, t.known = s.sub(in.Sub)
+		t.sub, t.loop = in.Sub, true
+	case len(in.List) == 1:
 		t.rhs = in.List[0]
-	} else {
-		t.list = in.List
-		t.loop = ci != seriesColValue && ci != seriesColRowid
+	default:
+		t.list, t.loop = in.List, true
 	}
 	return t, true
 }
@@ -270,7 +250,7 @@ func (s seriesScope) orTerms(j int, e Expr) ([]seriesTerm, bool) {
 		in.col, in.colX, in.known = t.col, t.colX, in.known && t.known
 		in.list = append(in.list, t.rhs)
 	}
-	in.loop = in.col != seriesColValue && in.col != seriesColRowid
+	in.loop = true
 	return append(out, in), true
 }
 
@@ -392,9 +372,6 @@ func (t seriesTerm) bound() Expr {
 		return BinaryExpr{Op: "=", L: t.colX, R: seriesBoundExpr(seriesIntBoundFn, t.rhs, VtabEQ)}
 	case t.col == seriesColStep:
 		return BinaryExpr{Op: "=", L: t.colX, R: seriesBoundExpr(seriesStepBoundFn, t.rhs, VtabEQ)}
-	case t.list != nil:
-		args := append([]Expr{LiteralExpr{Val: Value{Typ: Int, I: int64(seriesColAffinity(t.col))}}, t.colX}, t.list...)
-		return FuncExpr{Name: seriesInFn, Args: args}
 	}
 	op := "="
 	switch t.op {
@@ -404,6 +381,23 @@ func (t seriesTerm) bound() Expr {
 		op = "<="
 	}
 	return BinaryExpr{Op: op, L: t.colX, R: seriesBoundExpr(seriesValueBoundFn, t.rhs, t.op)}
+}
+
+// loopCall is consumed IN t as the module runs it: once for every distinct
+// value of its right-hand side, keyed with the IN's affinity (sqlite3CodeRhsOfIN:
+// the column's for a list, exprINAffinity's for a subquery).
+func (t seriesTerm) loopCall(s seriesScope) Expr {
+	col, aff, coll := t.col, seriesColAffinity(t.col), ""
+	if col == seriesColRowid {
+		col = seriesColValue
+	}
+	if t.sub != nil {
+		var subAff affinity
+		var subCol bool
+		subAff, subCol, coll, _ = s.sub(t.sub)
+		aff = cCompareAffinity(aff, true, subAff, subCol)
+	}
+	return vtabInLoopCall(col, aff, coll, t.list, t.sub)
 }
 
 // seriesBoundExpr is bound e read through conversion fn: a literal read here,
@@ -449,6 +443,7 @@ var seriesTrue = LiteralExpr{Val: Value{Typ: Int, I: 1}}
 type seriesPlan struct {
 	it        *FromItem
 	at        map[int]Expr    // conjunct j as the WHERE tests it
+	loops     map[int]Expr    // conjunct j as the module is offered it, a consumed IN
 	halves    map[[2]int]Expr // a BETWEEN half the module is offered in its place
 	blank     map[int]bool    // a conjunct the module is not offered
 	blankHalf map[[2]int]bool
@@ -456,7 +451,7 @@ type seriesPlan struct {
 }
 
 // seriesItemPlan is the plan for it, or false when it changes nothing.
-func seriesItemPlan(it *FromItem, conj []Expr, rowid bool, known func(Expr) bool) (seriesPlan, bool, error) {
+func seriesItemPlan(it *FromItem, conj []Expr, rowid bool, known func(Expr) bool, sub func(*SelectStmt) (affinity, bool, string, bool)) (seriesPlan, bool, error) {
 	vcols, _, err := seriesModule{}.Connect(nil)
 	if err != nil {
 		return seriesPlan{}, false, nil
@@ -469,7 +464,7 @@ func seriesItemPlan(it *FromItem, conj []Expr, rowid bool, known func(Expr) bool
 	if name == "" {
 		name = it.Table
 	}
-	s := seriesScope{cols: cols, name: name, rowid: rowid, known: known}
+	s := seriesScope{cols: cols, name: name, rowid: rowid, known: known, sub: sub}
 	terms, ok := s.terms(conj, len(it.TableFuncArgs))
 	if !ok {
 		return seriesPlan{}, false, nil
@@ -489,12 +484,9 @@ func seriesItemPlan(it *FromItem, conj []Expr, rowid bool, known func(Expr) bool
 		}
 	}
 	skip := func(t seriesTerm) bool { return unknown[slot(t.col)] }
-	pl := seriesPlan{it: it, at: map[int]Expr{}, halves: map[[2]int]Expr{}, blank: map[int]bool{}, blankHalf: map[[2]int]bool{}}
+	pl := seriesPlan{it: it, at: map[int]Expr{}, loops: map[int]Expr{}, halves: map[[2]int]Expr{}, blank: map[int]bool{}, blankHalf: map[[2]int]bool{}}
 	taken := map[int]bool{}
 	for _, k := range seriesTake(terms, skip) {
-		if terms[k].loop {
-			return seriesPlan{}, false, fmt.Errorf("%w: generate_series runs once for each value of an IN on %s", errVDBEUnsupported, cols[terms[k].col].Name)
-		}
 		taken[k] = true
 	}
 	both := map[int]int{}
@@ -513,6 +505,11 @@ func seriesItemPlan(it *FromItem, conj []Expr, rowid bool, known func(Expr) bool
 		}
 		switch t.kind {
 		case seriesTermReal, seriesTermOrIn:
+			if t.loop {
+				// C tests it no more: the module made every row from it.
+				pl.at[t.conj], pl.loops[t.conj] = seriesTrue, t.loopCall(s)
+				continue
+			}
 			pl.at[t.conj] = t.bound()
 		case seriesTermBetween:
 			pl.halves[[2]int{t.conj, t.half}] = t.bound()
@@ -563,6 +560,33 @@ func seriesBoundConjuncts(p *ReadOnlyPager, stmt *SelectStmt, srcs []joinSource)
 	known := func(e Expr) bool {
 		return exprRefsOnly(e, func(c ColumnExpr) bool { return c.Qualifier != "" && !own[r33sFoldIdent(c.Qualifier)] })
 	}
+	sub := func(s *SelectStmt) (affinity, bool, string, bool) {
+		// One that compiles with no enclosing scope reads nothing outside it.
+		if _, err := compileSubProgram(p, s, nil); err != nil {
+			return affNone, false, "", false
+		}
+		affs, mats, ok := p.subqueryOutputAffinities(s, nil)
+		if !ok || len(affs) != 1 {
+			return affNone, false, "", false
+		}
+		colls, ok := p.subqueryOutputCollations(s, nil)
+		if !ok || len(colls) != 1 {
+			return affNone, false, "", false
+		}
+		// The key's (sqlite3BinaryCompareCollSeq): the subquery column's when
+		// written with COLLATE, else the series column's, BINARY, before any
+		// collation the subquery's column was declared with.
+		coll, explicit := exprCollation(colls[0])
+		if !explicit {
+			coll = ""
+		}
+		switch strings.ToUpper(coll) {
+		case "", "BINARY", "NOCASE", "RTRIM":
+		default:
+			return affNone, false, "", false
+		}
+		return affs[0], mats[0], coll, true
+	}
 	var betweens []int
 	for j, e := range conj {
 		if b, ok := e.(BetweenExpr); ok && !b.Not {
@@ -584,7 +608,7 @@ func seriesBoundConjuncts(p *ReadOnlyPager, stmt *SelectStmt, srcs []joinSource)
 		if _, isSeries := mod.(seriesModule); !isSeries {
 			continue
 		}
-		pl, ok, err := seriesItemPlan(it, conj, len(stmt.From) == 1, known)
+		pl, ok, err := seriesItemPlan(it, conj, len(stmt.From) == 1, known, sub)
 		if err != nil {
 			return nil, err
 		}
@@ -618,6 +642,9 @@ func seriesBoundConjuncts(p *ReadOnlyPager, stmt *SelectStmt, srcs []joinSource)
 		tvf := slices.Clone(out[:len(conj)])
 		for j := range pl.blank {
 			tvf[j] = seriesTrue
+		}
+		for j, e := range pl.loops {
+			tvf[j] = e
 		}
 		for _, j := range betweens {
 			b := conj[j].(BetweenExpr)

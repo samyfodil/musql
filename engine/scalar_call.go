@@ -95,7 +95,6 @@ var supportedFuncs = map[string]bool{
 	seriesValueBoundFn: true,
 	seriesIntBoundFn:   true,
 	seriesStepBoundFn:  true,
-	seriesInFn:         true,
 }
 
 // init registers the functions whose names live in their own files: the json1
@@ -139,8 +138,6 @@ func funcArity(name string) (min, max int, ok bool) {
 		return 1, 1, true
 	case seriesValueBoundFn:
 		return 2, 2, true
-	case seriesInFn:
-		return 3, -1, true
 	case "sqlite_compileoption_used", "sqlite_compileoption_get":
 		return 1, 1, true
 	case "substr", "substring":
@@ -260,9 +257,6 @@ func callScalarFuncEnc(name string, args []Value, caseSensitiveLike bool, enc Te
 
 	case seriesIntBoundFn, seriesStepBoundFn:
 		return seriesIntBound(args[0], name == seriesStepBoundFn), nil
-
-	case seriesInFn:
-		return seriesIn(args)
 
 	case "length":
 		if len(args) != 1 {
