@@ -151,7 +151,10 @@ the file.
   appends those changes to the delta log as one batch and fsyncs
   (`segment_delta_write.go`). It doesn't rewrite the segments.
 - Compaction folds the delta into new segments (`segment_compact.go`). A
-  catalog change (DDL) rewrites the file (`segment_ddl.go`).
+  catalog change that leaves the tables as they are (a view, a trigger,
+  `user_version`) is a catalog record in the delta
+  (`segment_delta_catalog.go`); any other DDL rewrites the file
+  (`segment_ddl.go`).
 - Locking across processes uses OFD byte-range locks (`lock.go`,
   `internal/filelock`).
 

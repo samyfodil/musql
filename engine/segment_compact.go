@@ -69,11 +69,14 @@ func compactSegmentFile(segPath string, tail bool) (bool, error) {
 	}
 	defer dm.Close()
 	st, rerr := replaySegDelta(dm.Data(), baseCtr, basePages, f.committedRows())
+	if rerr == nil {
+		rerr = f.applyDeltaCatalog(st.catalog)
+	}
 	if rerr != nil {
 		f.Close()
 		return false, rerr
 	}
-	if st.empty() {
+	if st.empty() && st.catalog == nil {
 		f.Close()
 		// A delta that carries no surviving change still moved the pair's
 		// recorded state, so it cannot simply be deleted: rewriting the segment
@@ -94,7 +97,8 @@ func compactSegmentFile(segPath string, tail bool) (bool, error) {
 	// business touching the schema, and calling the catalog-less WriteSegmentFile
 	// here silently dropped every index, view, trigger and AUTOINCREMENT counter
 	// from the file it produced -- caught by TestExportImportIsLossless, which
-	// compacts on the way out.
+	// compacts on the way out. The log's last catalog record is the catalog by
+	// now (applyDeltaCatalog), and is folded in with the rows.
 	cat := f.Catalog()
 	if berr != nil {
 		f.Close()

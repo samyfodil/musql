@@ -170,6 +170,11 @@ type joinSource struct {
 	derivedOrderProvable         bool
 	derivedOrderNeedsOuterSafety bool
 
+	// derivedOneRow marks a subquery or view whose body returns at most one row
+	// (selectAtMostOneRow). However the loops nest, it cannot change the order the
+	// other sources' rows arrive in, so the order proofs pass over it.
+	derivedOneRow bool
+
 	// vtabItem, when non-nil, marks a virtual-table source: a table-valued function
 	// call, a persisted CREATE VIRTUAL TABLE, or an eponymous module. Exclusive
 	// with derived; opened through OpOpenDerived's run-once slot, whose vtab branch
@@ -1418,8 +1423,15 @@ func (p *ReadOnlyPager) resolveDerivedSource(c *compiler, state *joinDesugarStat
 		derivedNoFrom:                selectHasFromlessArm(it.Subquery),
 		derivedOrderProvable:         orderProvable,
 		derivedOrderNeedsOuterSafety: needsOuterSafety,
+		derivedOneRow:                selectAtMostOneRow(it.Subquery),
 		nthTail:                      it.Subquery.nthTail,
 	}, nil
+}
+
+// selectAtMostOneRow reports whether s returns at most one row whatever its
+// FROM holds: an aggregate with no GROUP BY, no compound and no window.
+func selectAtMostOneRow(s *SelectStmt) bool {
+	return s != nil && len(s.Compound) == 0 && len(s.GroupBy) == 0 && !cHasWindow(s) && cSelectIsAggregate(s)
 }
 
 // selectHasFromlessArm reports whether s, or any arm of its compound, has no
@@ -1832,6 +1844,7 @@ func (p *ReadOnlyPager) resolveViewSource(c *compiler, state *joinDesugarState, 
 		derivedNoFrom:                pcv != nil && selectHasFromlessArm(pcv.selectStmt),
 		derivedOrderProvable:         orderProvable,
 		derivedOrderNeedsOuterSafety: needsOuterSafety,
+		derivedOneRow:                pcv != nil && selectAtMostOneRow(pcv.selectStmt),
 	}, nil
 }
 

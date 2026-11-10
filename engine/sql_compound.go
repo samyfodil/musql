@@ -542,7 +542,7 @@ func (p *ReadOnlyPager) resolveArmOutputs(sel *SelectStmt) armOutput {
 func (p *ReadOnlyPager) resolveArmOutputsOuter(sel *SelectStmt, outer *evalCtx) armOutput {
 	var scopes []tableScope
 	if len(sel.From) > 0 {
-		jts, _, err := p.resolveFrom(sel.From, nil)
+		jts, err := p.resolveFromColumns(sel.From)
 		if err != nil {
 			// resolveFrom materializes a derived table to learn its columns, so a
 			// body that fails only at run time would sink this arm's name

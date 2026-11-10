@@ -30,10 +30,13 @@ import (
 // That is the hot path and it is 61us-2.4ms depending on the durability asked
 // for.
 //
-// A catalog change REWRITES THE WHOLE FILE. DDL is rare -- a schema moves once
-// per deploy, not once per statement -- so paying O(database) for it buys a much
-// simpler and more checkable design than threading catalog records through the
-// delta.
+// A catalog change REWRITES THE WHOLE FILE, unless it leaves the table
+// directory as it is: a view, a trigger or a header word is a catalog record in
+// the delta instead (segment_delta_catalog.go), since scripts create and drop
+// views as they run. Table and index DDL is rarer -- a schema moves once per
+// deploy, not once per statement -- so paying O(database) for it buys a much
+// simpler and more checkable design than threading directory changes through
+// the delta.
 //
 // It also has to COMPACT first, and that is correctness rather than tidiness: a
 // delta record names its table by its INDEX in the directory, so a DROP TABLE
@@ -218,6 +221,7 @@ func (n *Session) rewriteFileKeeping(keepIndexes bool) error {
 		return ferr
 	}
 	n.tableIndex, n.ipkOf = SegmentFileTableIndex(f)
+	n.committed = committedOf(f)
 	f.Close()
 	// Every row is now IN the segments, so the changes that produced them must not
 	// also be appended as a delta batch.
@@ -486,6 +490,39 @@ func (db *DB) segmentFileContentsOf(temp bool, w *segFileWriter) ([]ConvertedTab
 		tables = append(tables, ct)
 	}
 
+	return db.segmentCatalogFor(temp, tables, seqs)
+}
+
+// segmentCatalogEntries is main's table entries as a rewrite lays them out,
+// without their segments, and the catalog after them: what a catalog record
+// says (catalogDeltaRecord), read from the session without loading a row.
+func (db *DB) segmentCatalogEntries() ([]ConvertedTable, ConvertedCatalog, error) {
+	var tables []ConvertedTable
+	var seqs []uint64
+	aliasRoots := 0
+	for _, t := range db.tables {
+		if t.isTemp {
+			continue
+		}
+		seqs = append(seqs, t.schemaSeq)
+		ct := ConvertedTable{Name: t.name, SQL: t.sql, IPK: t.ipkIndex, Rowid: int64(t.schemaSeq), Root: t.rootPage}
+		for _, c := range t.cols {
+			ct.Cols = append(ct.Cols, c.Name)
+		}
+		if t.aliasOf != "" {
+			ct.Root = db.nextSegmentRoot(false) + uint32(aliasRoots)
+			aliasRoots++
+		}
+		tables = append(tables, ct)
+	}
+	return db.segmentCatalogFor(false, tables, seqs)
+}
+
+// segmentCatalogFor is the catalog a rewrite writes after tables, the entries
+// it laid out in directory order with seqs their schemaSeq (objects' follow):
+// every index, view, trigger and virtual table, the header words, and each
+// entry's Rank.
+func (db *DB) segmentCatalogFor(temp bool, tables []ConvertedTable, seqs []uint64) ([]ConvertedTable, ConvertedCatalog, error) {
 	var cat ConvertedCatalog
 	// The schema cookie belongs to the FILE, and on this format the catalog is the
 	// only place it can live. Every DDL has already bumped the session's own

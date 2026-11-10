@@ -8,59 +8,55 @@ import (
 	"unsafe"
 )
 
-// tvASCII is VSubstr's table, a package variable as the engine's is: its
-// address is in the code, and only a uintptr holds it there, so a local one
-// could be on a stack that moves.
-var tvASCII = func() (b [128]byte) {
-	for i := range b {
-		b[i] = byte(i)
-	}
-	return
-}()
-
-// TestVMSubstr: the one-character substrings native code answers, from the
-// table, and every argument it leaves to the engine with the registers as
+// TestVMSubstr: the ASCII substrings native code answers, sharing the TEXT's
+// bytes, and every argument it leaves to the engine with the registers as
 // they were -- as it does with the write barrier on.
 func TestVMSubstr(t *testing.T) {
 	if !Available {
 		t.Skip("no JIT on this platform")
 	}
 	noGC(t)
-	table := &tvASCII
 	long := strings.Repeat("abcdefgh", 10) + "z"
-	cases := []struct {
-		s      tvalue
-		y, n   tvalue
-		native bool
-	}{
-		{tvalue{Typ: tvText, S: []byte("hello")}, tvalue{Typ: tvInt, I: 1}, tvalue{Typ: tvInt, I: 1}, true},
-		{tvalue{Typ: tvText, S: []byte("hello")}, tvalue{Typ: tvInt, I: 5}, tvalue{Typ: tvInt, I: 1}, true},
-		{tvalue{Typ: tvText, S: []byte(long)}, tvalue{Typ: tvInt, I: 81}, tvalue{Typ: tvInt, I: 1}, true},
-		{tvalue{Typ: tvText, S: []byte(long)}, tvalue{Typ: tvInt, I: 8}, tvalue{Typ: tvInt, I: 1}, true},
-		{tvalue{Typ: tvText, S: []byte(long)}, tvalue{Typ: tvInt, I: 9}, tvalue{Typ: tvInt, I: 1}, true},
-		{tvalue{Typ: tvText, S: []byte(long)}, tvalue{Typ: tvInt, I: 17}, tvalue{Typ: tvInt, I: 1}, true},
-		{tvalue{Typ: tvText, S: []byte("ab\x00cd")}, tvalue{Typ: tvInt, I: 2}, tvalue{Typ: tvInt, I: 1}, true},
-		{tvalue{Typ: tvText, S: []byte("abcdefghij\xc3\xa9")}, tvalue{Typ: tvInt, I: 10}, tvalue{Typ: tvInt, I: 1}, true},
-		{tvalue{Typ: tvText, S: []byte("hello")}, tvalue{Typ: tvInt, I: 6}, tvalue{Typ: tvInt, I: 1}, false},
-		{tvalue{Typ: tvText, S: []byte("hello")}, tvalue{Typ: tvInt, I: 0}, tvalue{Typ: tvInt, I: 1}, false},
-		{tvalue{Typ: tvText, S: []byte("hello")}, tvalue{Typ: tvInt, I: -1}, tvalue{Typ: tvInt, I: 1}, false},
-		{tvalue{Typ: tvText, S: []byte("hello")}, tvalue{Typ: tvInt, I: 2}, tvalue{Typ: tvInt, I: 2}, false},
-		{tvalue{Typ: tvText, S: []byte("hello")}, tvalue{Typ: tvReal, F: 2}, tvalue{Typ: tvInt, I: 1}, false},
-		{tvalue{Typ: tvText, S: []byte("hello")}, tvalue{Typ: tvInt, I: 2}, tvalue{Typ: tvNull}, false},
-		{tvalue{Typ: tvText, S: []byte("ab\x00cd")}, tvalue{Typ: tvInt, I: 3}, tvalue{Typ: tvInt, I: 1}, false},
-		{tvalue{Typ: tvText, S: []byte("ab\x00cd")}, tvalue{Typ: tvInt, I: 4}, tvalue{Typ: tvInt, I: 1}, false},
-		{tvalue{Typ: tvText, S: []byte("abcdefghij\xc3\xa9")}, tvalue{Typ: tvInt, I: 11}, tvalue{Typ: tvInt, I: 1}, false},
-		{tvalue{Typ: tvText, S: []byte("abcdefgh\xc3\xa9ij")}, tvalue{Typ: tvInt, I: 11}, tvalue{Typ: tvInt, I: 1}, false},
-		{tvalue{Typ: tvText, S: []byte("\xc3\xa9abcdefghij")}, tvalue{Typ: tvInt, I: 3}, tvalue{Typ: tvInt, I: 1}, false},
-		{tvalue{Typ: tvText}, tvalue{Typ: tvInt, I: 1}, tvalue{Typ: tvInt, I: 1}, false},
-		{tvalue{Typ: tvBlob, S: []byte("hello")}, tvalue{Typ: tvInt, I: 1}, tvalue{Typ: tvInt, I: 1}, false},
-		{tvalue{Typ: tvNull}, tvalue{Typ: tvInt, I: 1}, tvalue{Typ: tvInt, I: 1}, false},
+	texts := [][]byte{[]byte("hello"), []byte(long), []byte("ab\x00cd"), []byte("abcdefghij\xc3\xa9"),
+		[]byte("abcdefgh\xc3\xa9ij"), []byte("\xc3\xa9abcdefghij"), []byte("x")}
+	type tcase struct{ s, y, z tvalue }
+	var cases []tcase
+	for _, s := range texts {
+		for _, y := range []int64{-1, 0, 1, 2, 5, 6, 8, 9, 10, 11, 17, 81, 82} {
+			for _, z := range []int64{-1, 0, 1, 2, 3, 8, 9, 100, 1 << 62} {
+				cases = append(cases, tcase{tvalue{Typ: tvText, S: s}, tvalue{Typ: tvInt, I: y}, tvalue{Typ: tvInt, I: z}})
+			}
+		}
 	}
-	prog := []VInsn{{Op: VSubstr, A: 0, C: 3, Imm: int64(uintptr(unsafe.Pointer(&table[0])))}, {Op: VExit}}
+	hello := tvalue{Typ: tvText, S: []byte("hello")}
+	one := tvalue{Typ: tvInt, I: 1}
+	cases = append(cases,
+		tcase{hello, tvalue{Typ: tvReal, F: 2}, one},
+		tcase{hello, tvalue{Typ: tvInt, I: 2}, tvalue{Typ: tvNull}},
+		tcase{hello, tvalue{Typ: tvInt, I: 2}, tvalue{Typ: tvReal, F: 1}},
+		tcase{tvalue{Typ: tvText}, one, one},
+		tcase{tvalue{Typ: tvBlob, S: []byte("hello")}, one, one},
+		tcase{tvalue{Typ: tvNull}, one, one})
+	// native reports what native code answers: the bytes from y-1, n of them,
+	// when every byte to their end is ASCII and none NUL.
+	native := func(c tcase) (int64, bool) {
+		if c.s.Typ != tvText || c.y.Typ != tvInt || c.z.Typ != tvInt || c.z.I < 1 || c.y.I < 1 || c.y.I > int64(len(c.s.S)) {
+			return 0, false
+		}
+		n := min(c.z.I, int64(len(c.s.S))-(c.y.I-1))
+		for _, b := range c.s.S[:c.y.I-1+n] {
+			if b == 0 || b >= 0x80 {
+				return 0, false
+			}
+		}
+		return n, true
+	}
+	prog := []VInsn{{Op: VSubstr, A: 0, C: 3}, {Op: VExit}}
 	old := []byte("old")
 	for k, c := range cases {
+		n, ok := native(c)
 		for _, wb := range []bool{false, true} {
-			regs := []tvalue{c.s, c.y, c.n, {Typ: tvText, S: old}}
+			regs := []tvalue{c.s, c.y, c.z, {Typ: tvText, S: old}}
 			var args ProgArgs
 			func() {
 				if wb {
@@ -68,16 +64,15 @@ func TestVMSubstr(t *testing.T) {
 				}
 				runVM(t, prog, nil, regs, &args, 0)
 			}()
-			if !c.native || wb {
+			if !ok || wb {
 				if args.PC != 0 || regs[3].Typ != tvText || &regs[3].S[0] != &old[0] {
-					t.Fatalf("case %d (barrier on %v): pc %d, r3 %+v; want an exit at 0", k, wb, args.PC, regs[3])
+					t.Fatalf("case %d %q y=%d z=%d (barrier on %v): pc %d, r3 %+v; want an exit at 0", k, c.s.S, c.y.I, c.z.I, wb, args.PC, regs[3])
 				}
 				continue
 			}
-			want := c.s.S[c.y.I-1]
 			r := regs[3]
-			if args.PC != 1 || r.Typ != tvText || r.Sub != 0 || r.I != 0 || r.F != 0 || len(r.S) != 1 || cap(r.S) != 1 || &r.S[0] != &table[want] {
-				t.Fatalf("case %d: pc %d, r3 %+v (cap %d); want %q from the table", k, args.PC, r, cap(r.S), want)
+			if args.PC != 1 || r.Typ != tvText || r.Sub != 0 || r.I != 0 || r.F != 0 || int64(len(r.S)) != n || int64(cap(r.S)) != n || &r.S[0] != &c.s.S[c.y.I-1] {
+				t.Fatalf("case %d %q y=%d z=%d: pc %d, r3 %+v (cap %d); want %d bytes from %d, shared", k, c.s.S, c.y.I, c.z.I, args.PC, r, cap(r.S), n, c.y.I-1)
 			}
 		}
 	}
@@ -92,16 +87,14 @@ func TestVMSubstrChecked(t *testing.T) {
 		t.Skip("no JIT on this platform")
 	}
 	noGC(t)
-	table := &tvASCII
-	imm := int64(uintptr(unsafe.Pointer(&table[0])))
 	// r0 the TEXT, r1 y, r2 1; r3 = substr; r4 = y2; r5 = substr at y2; r6 =
 	// y3, r7 = substr at y3. The three run one after another.
 	prog := []VInsn{
-		{Op: VSubstr, A: 0, C: 3, Imm: imm},
+		{Op: VSubstr, A: 0, C: 3},
 		{Op: VCopy, A: 4, B: 1},
-		{Op: VSubstr, A: 0, C: 5, Imm: imm},
+		{Op: VSubstr, A: 0, C: 5},
 		{Op: VCopy, A: 6, B: 1},
-		{Op: VSubstr, A: 0, C: 7, Imm: imm},
+		{Op: VSubstr, A: 0, C: 7},
 		{Op: VExit},
 	}
 	s := strings.Repeat("abcdefgh", 4) + "\x00tail"

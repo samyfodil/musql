@@ -150,13 +150,13 @@ const (
 
 	// ---- TEXT arms.
 
-	// VSubstr: r[C] = substr(r[A], r[A+1], r[A+2]) where that is one ASCII
-	// character: r[A] a TEXT whose first y bytes are ASCII and none NUL, r[A+1]
-	// the INTEGER y, from 1 to the TEXT's length, and r[A+2] the INTEGER 1.
-	// The answer is the byte at y-1, as one byte of the table at Imm (the
-	// engine's own, as its substr answers it). Anything else exits, as does a
-	// write barrier that is on. The bytes already checked in this entry are
-	// not checked again (ProgArgs.TextPtr).
+	// VSubstr: r[C] = substr(r[A], r[A+1], r[A+2]) where that is ASCII: r[A]
+	// a TEXT, r[A+1] the INTEGER y, from 1 to the TEXT's length, r[A+2] the
+	// INTEGER z, at least 1, and the TEXT's bytes up to y-1+z (or its end)
+	// ASCII and none NUL. The answer is those bytes from y-1, sharing the
+	// TEXT's, with the capacity capped at the length. Anything else exits, as
+	// does a write barrier that is on. The bytes already checked in this entry
+	// are not checked again (ProgArgs.TextPtr).
 	VSubstr
 	// VTextCmpJump, VTextCmpSet: VCmpJump and VCmpSet over two TEXTs, ordered
 	// as bytes.Compare orders their bytes, or two INTEGERs. Any other pair

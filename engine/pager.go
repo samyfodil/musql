@@ -80,6 +80,12 @@ type ReadOnlyPager struct {
 	//	// select.c:6044 increments once per FROM item, not per caller asking.
 	viewItemFacts map[*FromItem]viewBodyFactsEntry
 
+	//	// viewColsFacts is viewBodyFacts for a caller that wants a view's columns
+	//	// only (viewColumnsGuarded): found without running the body, once per
+	//	// distinct view, for the same reason. view3.test's doubling chain made a
+	//	// walk without it 2^15 deep.
+	viewColsFacts map[viewBodyFactsKey][]columnInfo
+
 	//	// cteScopes is the stack of WITH frames in dynamic scope, one map per
 	//	// SelectStmt with CTEs whose compile has not returned, pushed by
 	//	// pushCTEScope (cte.go). Nested statements are reached by reentering on

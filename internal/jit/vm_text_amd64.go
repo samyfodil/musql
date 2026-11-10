@@ -19,13 +19,23 @@ func (e *vmEmit) substr(pc int, in VInsn) {
 		e.jccStub(CondNE, pc)
 	}
 	a.CmpMemDImm8(RSI, e.d(in.A+2, L.OffI), 1)
-	e.jccStub(CondNE, pc)
+	e.jccStub(CondL, pc)
 	// y from 1 to the length: y-1 below the length, unsigned.
 	a.MovRegMemD(RAX, RSI, e.d(in.A+1, L.OffI))
 	a.LeaRegMemD(RDX, RAX, -1)
 	a.AluRegMemD(AluCmp, RDX, RSI, e.d(in.A, L.OffS+8))
 	e.jccStub(condAboveEq, pc)
-	// The first y bytes, past those this entry checked at the same pointer
+	// The answer ends at y-1 + min(z, length-(y-1)).
+	clamp := e.vmLabel("sz")
+	a.MovRegMemD(R10, RSI, e.d(in.A, L.OffS+8))
+	a.SubRegReg(R10, RDX)
+	a.MovRegMemD(RAX, RSI, e.d(in.A+2, L.OffI))
+	a.CmpRegReg(RAX, R10)
+	a.Jcc(condBelowEq, clamp)
+	a.MovRegReg(RAX, R10)
+	a.Label(clamp)
+	a.AddRegReg(RAX, RDX)
+	// The bytes to the end, past those this entry checked at the same pointer
 	// (ProgArgs.TextPtr): recorded before they are checked, as a failure
 	// exits and the next entry starts afresh.
 	fresh, scan, have, got := e.vmLabel("sf"), e.vmLabel("ss"), e.vmLabel("sh"), e.vmLabel("sg")
@@ -75,16 +85,27 @@ func (e *vmEmit) substr(pc int, in VInsn) {
 	a.DecReg(RAX)
 	a.Jmp(bytes)
 	a.Label(done)
-	a.MovzxByteDisp(RDX, R9, -1)
-	a.MovRegImm64(RAX, in.Imm)
-	a.AddRegReg(RAX, RDX)
+	// The source's own bytes from y-1, the capacity capped at the length: a
+	// register's bytes are never written in place.
+	keep := e.vmLabel("sk")
+	a.MovRegMemD(RAX, RSI, e.d(in.A+1, L.OffI))
+	a.DecReg(RAX)
+	a.MovRegMemD(RDX, RSI, e.d(in.A, L.OffS+8))
+	a.SubRegReg(RDX, RAX)
+	a.MovRegMemD(RCX, RSI, e.d(in.A+2, L.OffI))
+	a.CmpRegReg(RCX, RDX)
+	a.Jcc(condAboveEq, keep)
+	a.MovRegReg(RDX, RCX)
+	a.Label(keep)
+	a.MovRegMemD(R9, RSI, e.d(in.A, L.OffS))
+	a.AddRegReg(R9, RAX)
 	c := e.d(in.C, 0)
 	a.MovMemDImm(RSI, c, int32(L.TypText))
 	a.MovMemDImm(RSI, c+int32(L.OffI), 0)
 	a.MovMemDImm(RSI, c+int32(L.OffF), 0)
-	a.MovMemDReg(RSI, c+int32(L.OffS), RAX)
-	a.MovMemDImm(RSI, c+int32(L.OffS+8), 1)
-	a.MovMemDImm(RSI, c+int32(L.OffS+16), 1)
+	a.MovMemDReg(RSI, c+int32(L.OffS), R9)
+	a.MovMemDReg(RSI, c+int32(L.OffS+8), RDX)
+	a.MovMemDReg(RSI, c+int32(L.OffS+16), RDX)
 	e.unmap(in.C)
 	e.know.wroteAny(in.C, false)
 }

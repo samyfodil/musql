@@ -802,21 +802,10 @@ func fnSubstr(args []Value) Value {
 			j += sqliteUTF8Skip(s[j:])
 		}
 	}
-	if j == i+1 && s[i] < 0x80 {
-		// One ASCII character, from a table: a Value's bytes are never
-		// written in place, and the capacity of one makes any append copy.
-		return Value{Typ: Text, S: asciiBytes[s[i] : s[i]+1 : s[i]+1]}
-	}
-	return Value{Typ: Text, S: append([]byte(nil), s[i:j]...)}
+	// The argument's own bytes: a Value's bytes are never written in place,
+	// and the capacity capped at the length makes any append copy.
+	return Value{Typ: Text, S: s[i:j:j]}
 }
-
-// asciiBytes is every ASCII byte, for one-character results.
-var asciiBytes = func() (b [128]byte) {
-	for i := range b {
-		b[i] = byte(i)
-	}
-	return
-}()
 
 // substrRange implements SQLite's substr(X,Y[,Z]) index algorithm (see
 // func.c's substrFunc), returning a 0-based [start, start+count) byte/rune

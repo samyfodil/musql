@@ -232,6 +232,9 @@ func readSegmentPairUnlocked(path string) (*SegmentFile, *segDeltaState, error) 
 		return nil, nil, derr
 	}
 	st, rerr := replaySegDelta(data, f.srcChangeCounter, f.srcPageCount, f.committedRows())
+	if rerr == nil {
+		rerr = f.applyDeltaCatalog(st.catalog)
+	}
 	if rerr != nil {
 		f.Close()
 		if m != nil {

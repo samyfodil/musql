@@ -3831,6 +3831,11 @@ func anchorNoIndexInPlay(p *ReadOnlyPager, srcs []joinSource, scopes []tableScop
 	byDB := map[int][]SchemaRow{}
 	opaque := false
 	for i, s := range srcs {
+		// A source of at most one row is no order at all, and what its body walks
+		// orders only its own aggregate, which its own compile proves.
+		if s.derivedOneRow {
+			continue
+		}
 		// A derived table, vtab or CTE hides its FROM from this walk, and C flattens a
 		// simple subquery before planning, so an index can be reached through one
 		// ("SELECT group_concat(x) FROM (SELECT x FROM t)" walks a covering index in
@@ -4041,7 +4046,8 @@ func noIndexAnywhere(p *ReadOnlyPager) bool {
 // (anchor_r28_holes_test.go's control); the heuristic fallback is not C's
 // order.
 func anchorLoopOrderProvable(srcs []joinSource, scopes []tableScope, where Expr) bool {
-	if len(srcs) < 2 {
+	// A source of at most one row orders nothing, wherever it nests.
+	if len(srcs)-countOneRowSources(srcs) < 2 {
 		// One source: this engine full-scans it in ascending rowid order, which
 		// is what SQLite's only remaining access path does too once
 		// anchorNoIndexInPlay has established there is no index to walk.
@@ -4187,11 +4193,25 @@ func cPlanDecidedAll(srcs []joinSource) bool {
 func aggSourcesArePlainTables(srcs []joinSource) bool {
 	for i := range srcs {
 		s := &srcs[i]
+		if s.derivedOneRow {
+			continue
+		}
 		if s.derived != nil || s.vtabItem != nil || s.cteItem != nil || s.tbl == nil {
 			return false
 		}
 	}
-	return len(srcs) > 0
+	return len(srcs) > countOneRowSources(srcs)
+}
+
+// countOneRowSources counts the sources of at most one row (derivedOneRow).
+func countOneRowSources(srcs []joinSource) int {
+	n := 0
+	for i := range srcs {
+		if srcs[i].derivedOneRow {
+			n++
+		}
+	}
+	return n
 }
 
 // armOrderSensitive marks every order-sensitive accumulator

@@ -291,7 +291,7 @@ func (p *ReadOnlyPager) r37cArmAffinities(core *SelectStmt) ([]r37cRawAffinity, 
 			return nil, false
 		}
 	}
-	jts, _, err := p.resolveFrom(core.From, nil)
+	jts, err := p.resolveFromColumns(core.From)
 	if err != nil {
 		return nil, false
 	}
@@ -667,7 +667,7 @@ func (p *ReadOnlyPager) r37cExpandViewRef(it FromItem) (FromItem, bool) {
 	}
 	var scopes []tableScope
 	if len(body.From) > 0 {
-		jts, _, err := p.resolveFrom(body.From, nil)
+		jts, err := p.resolveFromColumns(body.From)
 		if err != nil {
 			return FromItem{}, false
 		}

@@ -74,8 +74,9 @@ const (
 	// (segDeltaSeg); its batches are otherwise version 2's. Version 4 changes
 	// only the checksum (segDeltaChecksum). Version 5 adds the patch record
 	// (segDeltaPatch). Version 6 may hold segment records with a PhysNumeric
-	// column (segFlagNumeric). Every new delta is version 6.
-	segDeltaVersion   = 6
+	// column (segFlagNumeric). Version 7 adds the catalog record
+	// (segDeltaCatalog). Every new delta is version 7.
+	segDeltaVersion   = 7
 	segDeltaHdrSize   = 32
 	segDeltaSuffix    = ".delta"
 	segDeltaTrailerSz = 16 // endCtr + endPages + cksum
@@ -100,11 +101,17 @@ var errDeltaNotForThisFile = errors.New("engine: segment delta was built against
 // It is written only over a committed row of the table's full width (an
 // UPDATE's row written in place, SegDeltaRecord.patch), so the row it lands
 // on always has every column it names.
+//
+// A catalog record (version 7) is the whole catalog after a commit that left
+// the table directory as it was -- a view, a trigger, a header word: kind, a
+// zero table and rowid, the body's length, then the body
+// (encodeDeltaCatalog). The last one in the log is the catalog.
 const (
-	segDeltaPut   = 1
-	segDeltaKill  = 2
-	segDeltaSeg   = 3
-	segDeltaPatch = 4
+	segDeltaPut     = 1
+	segDeltaKill    = 2
+	segDeltaSeg     = 3
+	segDeltaPatch   = 4
+	segDeltaCatalog = 5
 )
 
 // segDeltaSegHdr is a segment record's bytes before its padding.
@@ -126,6 +133,9 @@ type SegDeltaRecord struct {
 	// Seg, when set, makes this a segment record (segDeltaSeg): Rowid is its
 	// first rowid, Vals is unused.
 	Seg []byte
+	// Catalog, when set, makes this a catalog record (segDeltaCatalog): its
+	// body. Table, Rowid and Vals are unused.
+	Catalog []byte
 
 	// patch, when set on a put, is the columns the put changed (true) over the
 	// committed row: a version-5 delta writes only those (segDeltaPatch).
@@ -239,6 +249,10 @@ type segDeltaState struct {
 	// version is the delta's format (segDeltaVersion), which fixes the width of
 	// every batch's length prefix (segDeltaLenWidth).
 	version uint32
+
+	// catalog is the last catalog record the log holds (segDeltaCatalog), nil
+	// when it holds none: the file's own catalog stands.
+	catalog *deltaCatalog
 
 	// heap is how many of the delta's bytes the rows here alias on the heap
 	// rather than in mapping: the batches catch-ups folded in (Session.caughtUp).
@@ -627,6 +641,9 @@ func appendSegmentDeltaAt(segPath string, baseCtr, basePages uint32, recs []SegD
 	if st.version < 3 && hasSegRecord(recs) || st.version < 6 && hasNumericSegRecord(recs) {
 		return errDeltaPredatesSegments
 	}
+	if st.version < 7 && hasCatalogRecord(recs) {
+		return errDeltaPredatesCatalog
+	}
 	var keep *[]byte
 	if carry != nil {
 		keep = &carry.lastBatch
@@ -728,6 +745,8 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, version uint32, recs
 		}
 		n += 13
 		switch {
+		case r.Catalog != nil:
+			n += 4 + int64(len(r.Catalog))
 		case r.patched(version):
 			sizes[i] = int32(r.patchLen(&scratch))
 			n += 4 + int64(sizes[i])
@@ -803,6 +822,20 @@ func writeSegDeltaBatch(f *os.File, off int64, seed uint64, version uint32, recs
 			written += int64(len(r.Seg))
 			continue
 		}
+		if r.Catalog != nil {
+			var hdr [13]byte
+			hdr[0] = segDeltaCatalog
+			buf = append(buf, hdr[:]...)
+			buf = binary.LittleEndian.AppendUint32(buf, uint32(len(r.Catalog)))
+			buf = append(buf, r.Catalog...)
+			written += 13 + 4 + int64(len(r.Catalog))
+			if len(buf) >= segDeltaChunk {
+				if err := flush(); err != nil {
+					return 0, 0, err
+				}
+			}
+			continue
+		}
 		var hdr [13]byte
 		patched := r.patched(version)
 		switch {
@@ -874,7 +907,10 @@ func segDeltaBatchBytes(recs []SegDeltaRecord) int64 {
 			continue
 		}
 		n += 13
-		if !recs[i].Kill {
+		switch {
+		case recs[i].Catalog != nil:
+			n += 4 + int64(len(recs[i].Catalog))
+		case !recs[i].Kill:
 			n += 4 + int64(recs[i].recordLen())
 		}
 	}
@@ -897,6 +933,8 @@ func segDeltaBatchBytesExceed(recs []SegDeltaRecord, limit int64) bool {
 		switch {
 		case r.Seg != nil:
 			bound += segDeltaSegHdr + 7 + int64(len(r.Seg))
+		case r.Catalog != nil:
+			bound += segDeltaMinRecord + 4 + int64(len(r.Catalog))
 		case r.Kill:
 			bound += segDeltaMinRecord
 		case r.src != nil:
@@ -928,6 +966,8 @@ func segDeltaBatchBytesExceed(recs []SegDeltaRecord, limit int64) bool {
 		switch {
 		case r.Seg != nil:
 			n += segDeltaSegHdr + 7 + int64(len(r.Seg))
+		case r.Catalog != nil:
+			n += segDeltaMinRecord + 4 + int64(len(r.Catalog))
 		case r.Kill:
 			n += segDeltaMinRecord
 		case r.patched(segDeltaVersion):
@@ -951,6 +991,10 @@ func segDeltaBatchBound(recs []SegDeltaRecord) (int64, bool) {
 			return 0, false
 		}
 		n += 13
+		if r.Catalog != nil {
+			n += 4 + int64(len(r.Catalog))
+			continue
+		}
 		if !r.Kill {
 			// A patch record's body is its count, the columns and a record of
 			// some of the values: within the whole row's bound plus a varint
@@ -1091,6 +1135,24 @@ func (st *segDeltaState) applyBatch(body []byte) error {
 			}
 			off += n
 			st.put(table, rowid, vals)
+		case segDeltaCatalog:
+			if st.version < 7 {
+				return fmt.Errorf("engine: segment delta: a catalog record in a version-%d delta", st.version)
+			}
+			if off+4 > len(body) {
+				return fmt.Errorf("engine: segment delta: catalog length runs past the batch")
+			}
+			n := int(binary.LittleEndian.Uint32(body[off:]))
+			off += 4
+			if n < 0 || off+n > len(body) {
+				return fmt.Errorf("engine: segment delta: catalog runs past the batch")
+			}
+			dc, err := decodeDeltaCatalog(body[off : off+n])
+			if err != nil {
+				return err
+			}
+			st.catalog = dc
+			off += n
 		case segDeltaPatch:
 			if off+4 > len(body) {
 				return fmt.Errorf("engine: segment delta: patch length runs past the batch")
@@ -1175,7 +1237,7 @@ func (st *segDeltaState) committedRow(table int, rowid int64) ([]Value, bool) {
 func (st *segDeltaState) applyRecs(recs []SegDeltaRecord) bool {
 	total := 0
 	for i := range recs {
-		if recs[i].Seg != nil || (!recs[i].Kill && recs[i].src != nil) {
+		if recs[i].Seg != nil || recs[i].Catalog != nil || (!recs[i].Kill && recs[i].src != nil) {
 			return false
 		}
 		if !recs[i].Kill && !canonicalDeltaRow(recs[i].Vals) {

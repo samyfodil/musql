@@ -112,6 +112,11 @@ type Session struct {
 	// not.
 	catalogAtLastWrite []byte
 	fpScratch          []byte // catalogMoved's buffer
+	// committed is the table directory and catalog the file holds as this
+	// session last read or wrote it, which a catalog record is checked against
+	// (catalogDeltaRecord). Not the read source's: a rewrite does not always
+	// move the session onto the file it wrote (rebase).
+	committed segCommitted
 
 	// seenStat is the (size, mtime) of the segment file and its delta as of the
 	// last time this session looked. The freshness check compares THESE first,
@@ -194,6 +199,7 @@ func openWrite(segPath string, wait time.Duration, prev *Session, before func([]
 	var baseCtr, basePages, endCtr, endPages uint32
 	var tableIndex map[string]int
 	var ipkOf map[string]int
+	var committed segCommitted
 	var rootEdits []ConvertedRootEdit
 	var stamp [2]fileStamp
 	var deltaEnd int64
@@ -232,6 +238,7 @@ func openWrite(segPath string, wait time.Duration, prev *Session, before func([]
 			change = mapChangeWord(segPath)
 		}
 		tableIndex, ipkOf = SegmentFileTableIndex(f)
+		committed = committedOf(f)
 		rootEdits = append([]ConvertedRootEdit(nil), f.Catalog().RootEdits...)
 		baseCtr, basePages = f.srcChangeCounter, f.srcPageCount
 		endCtr, endPages = st.endCtr, st.endPages // the replay's own result, not a second read
@@ -297,6 +304,7 @@ func openWrite(segPath string, wait time.Duration, prev *Session, before func([]
 		changeable: changeable,
 
 		tableIndex: tableIndex, ipkOf: ipkOf,
+		committed: committed,
 	}
 	if len(rootEdits) > 0 {
 		if rerr := db.replayRootEdits(rootEdits); rerr != nil {
@@ -377,6 +385,77 @@ func (n *Session) catalogFingerprint() []byte {
 func (n *Session) catalogMoved() bool {
 	n.fpScratch = n.appendCatalogFingerprint(n.fpScratch[:0])
 	return !bytes.Equal(n.fpScratch, n.catalogAtLastWrite)
+}
+
+// catalogDeltaRecord is the catalog record (segDeltaCatalog) a commit appends
+// for a catalog change that leaves the table directory as the file has it --
+// the same tables in the same order, each with its SQL, columns, INTEGER
+// PRIMARY KEY and root, and the same indexes and virtual tables, encoding,
+// page size, auto_vacuum, journal mode, capture guard and root edits -- so
+// that only views, triggers and the header words moved. false sends the
+// commit to the rewrite, which can write any catalog.
+func (n *Session) catalogDeltaRecord() ([]byte, segCommitted, bool) {
+	db := n.DB
+	if n.committed.tables == nil || db.writableSchemaEditsActive() {
+		return nil, segCommitted{}, false
+	}
+	tables, cat, err := db.segmentCatalogEntries()
+	if err != nil || len(tables) != len(n.committed.tables) {
+		return nil, segCommitted{}, false
+	}
+	for i, t := range tables {
+		ft := n.committed.tables[i]
+		if t.Name != ft.Name || t.SQL != ft.SQL || t.IPK != ft.IPK || t.Root != ft.Root || !slices.Equal(t.Cols, ft.Cols) {
+			return nil, segCommitted{}, false
+		}
+	}
+	fc := n.committed.cat
+	if cat.Encoding != fc.Encoding || cat.PageSize != fc.PageSize || cat.AutoVacuumPlus1 != fc.AutoVacuumPlus1 ||
+		cat.JournalWAL != fc.JournalWAL || cat.CaptureGuard != fc.CaptureGuard ||
+		len(cat.RootEdits) != 0 || len(fc.RootEdits) != 0 {
+		return nil, segCommitted{}, false
+	}
+	// Indexes and virtual tables: the same ones, in the same order.
+	fixed := func(objs []ConvertedObject) []ConvertedObject {
+		var out []ConvertedObject
+		for _, o := range objs {
+			if o.Type != "view" && o.Type != "trigger" {
+				out = append(out, ConvertedObject{Type: o.Type, Name: o.Name, TblName: o.TblName, SQL: o.SQL})
+			}
+		}
+		return out
+	}
+	if !slices.Equal(fixed(cat.Objects), fixed(fc.Objects)) {
+		return nil, segCommitted{}, false
+	}
+	return encodeDeltaCatalog(tables, cat), segCommitted{tables: committedTables(tables), cat: cat}, true
+}
+
+// segCommitted is the table directory and catalog a file holds (see
+// Session.committed): each table's name, SQL, columns, INTEGER PRIMARY KEY and
+// routing root, and the catalog after them. tables is nil when unknown.
+type segCommitted struct {
+	tables []ConvertedTable
+	cat    ConvertedCatalog
+}
+
+// committedOf is what f holds, the catalog record its delta carries applied.
+func committedOf(f *SegmentFile) segCommitted {
+	tables := make([]ConvertedTable, len(f.tables))
+	for i, t := range f.tables {
+		tables[i] = ConvertedTable{Name: t.Name, SQL: t.SQL, Cols: t.Cols, IPK: t.IPK, Root: f.RootOf(i)}
+	}
+	return segCommitted{tables: tables, cat: f.Catalog()}
+}
+
+// committedTables is tables as segCommitted keeps them: without their segments
+// or catalog order, which a catalog record does not compare.
+func committedTables(tables []ConvertedTable) []ConvertedTable {
+	out := make([]ConvertedTable, len(tables))
+	for i, t := range tables {
+		out[i] = ConvertedTable{Name: t.Name, SQL: t.SQL, Cols: t.Cols, IPK: t.IPK, Root: t.Root}
+	}
+	return out
 }
 
 // appendCatalogFingerprint appends the fingerprint to b.
@@ -623,17 +702,25 @@ func (n *Session) commitMainLocked() (bool, error) {
 		n.noteCommittedColumnsStale()
 		return true, nil
 	}
+	// A CATALOG CHANGE that leaves the table directory as it is -- a view, a
+	// trigger, a header word -- is a catalog record in this commit's batch
+	// (catalogDeltaRecord). Any other cannot be a delta record, and it also
+	// invalidates every record already in the log: a record names its table by
+	// its INDEX in the directory, which a DROP moves. rewriteFile folds the log
+	// in and writes the new directory in one step. See segment_ddl.go.
+	var catRec []byte
+	var nowCommitted segCommitted
 	if n.catalogMoved() {
-		// A catalog change cannot be a delta record, and it also invalidates every
-		// record already in the log: a record names its table by its INDEX in the
-		// directory, which a DROP moves. rewriteFile folds the log in and writes
-		// the new directory in one step. See segment_ddl.go.
-		if err := n.rewriteFile(); err != nil {
-			return false, err
+		rec, now, ok := n.catalogDeltaRecord()
+		if !ok {
+			if err := n.rewriteFile(); err != nil {
+				return false, err
+			}
+			n.clearWrittenSinceCommit()
+			n.noteCommittedColumnsStale()
+			return true, nil
 		}
-		n.clearWrittenSinceCommit()
-		n.noteCommittedColumnsStale()
-		return true, nil
+		catRec, nowCommitted = rec, now
 	}
 	// Same reason rewriteFile does it: the delta header names the FILE's identity,
 	// and another writer may have moved it since this session last looked.
@@ -677,7 +764,7 @@ func (n *Session) commitMainLocked() (bool, error) {
 		n.noteCommittedColumnsStale()
 		return true, nil
 	}
-	if changes.len() == 0 && len(segRecs) == 0 {
+	if changes.len() == 0 && len(segRecs) == 0 && catRec == nil {
 		return false, nil
 	}
 	// A BULK LOAD TOO BIG FOR THE DELTA, known before its records are built:
@@ -717,6 +804,9 @@ func (n *Session) commitMainLocked() (bool, error) {
 		return false, err
 	}
 	recs = append(recs, segRecs...)
+	if catRec != nil {
+		recs = append(recs, SegDeltaRecord{Catalog: catRec})
+	}
 	if len(recs) == 0 {
 		// Every change was to a table this file does not hold -- a TEMP table,
 		// say. Nothing to append, and nothing lost.
@@ -767,9 +857,10 @@ func (n *Session) commitMainLocked() (bool, error) {
 	aerr := appendSegmentDeltaAt(n.segPath, n.baseCtr, n.basePages, recs, n.endCtr, n.endPages, &n.appendAt, n.commitSync())
 	if aerr != nil {
 		n.endCtr-- // the append failed, so the state did not move
-		if errors.Is(aerr, errDeltaPredatesSegments) {
-			// A delta older than segment records: the rewrite takes the load's
-			// rows from the row store and leaves a version-3 delta behind.
+		if errors.Is(aerr, errDeltaPredatesSegments) || errors.Is(aerr, errDeltaPredatesCatalog) {
+			// A delta older than segment or catalog records: the rewrite takes
+			// the load's rows from the row store and the catalog from the
+			// session, and leaves a current delta behind.
 			if err := n.rewriteFile(); err != nil {
 				return false, err
 			}
@@ -785,14 +876,22 @@ func (n *Session) commitMainLocked() (bool, error) {
 	n.deltaEnd = n.appendAt.offset
 	n.seenStat = n.pairStamp()
 	n.clearWrittenSinceCommit()
+	// The catalog is written, which is what stops the next commit writing it
+	// again; and the committed view, which read the old one, is read afresh.
+	nCat := 0
+	if catRec != nil {
+		n.catalogAtLastWrite = n.catalogFingerprint()
+		n.committed = nowCommitted
+		nCat = 1
+	}
 	// The log's records extend the columnar view as before; the segments are
 	// published to it whole, below. The batch is only the log's records when
 	// no segment went out with them.
-	batch, logRecs := n.appendAt.lastBatch, recs[:len(recs)-len(segRecs)]
+	batch, logRecs := n.appendAt.lastBatch, recs[:len(recs)-len(segRecs)-nCat]
 	if len(segRecs) > 0 {
 		batch = nil
 	}
-	if !wasCurrent || !n.extendCommittedColumns(batch, logRecs) {
+	if catRec != nil || !wasCurrent || !n.extendCommittedColumns(batch, logRecs) {
 		n.noteCommittedColumnsStale()
 	}
 	if len(segRecs) > 0 {
@@ -2136,6 +2235,7 @@ func (n *Session) reopen(afterFailedCommit bool) error {
 	n.appendAt.release()
 	n.appendAt = fresh.appendAt
 	n.catalogAtLastWrite = fresh.catalogAtLastWrite
+	n.committed = fresh.committed
 	n.seenStat = fresh.seenStat
 	n.deltaEnd = fresh.deltaEnd
 	// The rebuilt file may be another version: its own word mapping, or none.

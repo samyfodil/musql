@@ -504,17 +504,30 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 		}
 	}
 	if len(vp) <= vmJITReachLimit {
+		// Each entry's cursors, in the order the program first names them.
+		mark := make([]int, len(vp))
+		var order []int
+		nMarks := 0
+		for pc, in := range vp {
+			mark[pc] = -1
+			if vmCursorOp(in.Op) && in.A >= 0 {
+				mark[pc] = in.A
+				nMarks = max(nMarks, in.A+1)
+				if !slices.Contains(order, in.A) {
+					order = append(order, in.A)
+				}
+			}
+		}
+		reach := jit.VReachMarks(vp, mark, nMarks)
 		jx.entryCurs = make([][]int, len(vp))
 		for pc := range vp {
 			if !entry[pc] {
 				continue
 			}
 			jx.entryCurs[pc] = []int{}
-			for at, r := range jit.VReachFrom(vp, pc) {
-				in := vp[at]
-				if r && vmCursorOp(in.Op) &&
-					!slices.Contains(jx.entryCurs[pc], in.A) {
-					jx.entryCurs[pc] = append(jx.entryCurs[pc], in.A)
+			for _, c := range order {
+				if reach[pc][c/64]&(1<<uint(c%64)) != 0 {
+					jx.entryCurs[pc] = append(jx.entryCurs[pc], c)
 				}
 			}
 		}
@@ -1264,10 +1277,10 @@ func lowerVM(in *Instruction, nReg int) jit.VInsn {
 			return jit.VInsn{Op: jit.VCmpSet, A: in.P1, B: in.P3, C: in.P2, Cond: vmCond[in.Op]}
 		}
 	case OpFunction:
-		// substr(x, y, 1) of a TEXT whose first y bytes are ASCII and none NUL
-		// is its byte at y-1, which fnSubstr answers from asciiBytes.
+		// substr(x, y, z) of a TEXT whose bytes to y-1+z are ASCII and none NUL
+		// is those bytes from y-1, which fnSubstr shares as well.
 		if name, _ := in.P4.(string); (name == "substr" || name == "substring") && in.P2 == 3 && ok(in.P1, in.P1+2, in.P3) {
-			return jit.VInsn{Op: jit.VSubstr, A: in.P1, C: in.P3, Imm: int64(uintptr(unsafe.Pointer(&asciiBytes[0])))}
+			return jit.VInsn{Op: jit.VSubstr, A: in.P1, C: in.P3}
 		}
 	case OpIf, OpIfNot:
 		if ok(in.P1) {

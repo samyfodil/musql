@@ -102,7 +102,7 @@ func (p *ReadOnlyPager) applyViewColumnNames(sub *SelectStmt, cols []columnInfo)
 	}
 	var scopes []tableScope
 	if len(sub.From) > 0 {
-		jts, _, err := p.resolveFrom(sub.From, nil)
+		jts, err := p.resolveFromColumns(sub.From)
 		if err != nil {
 			return
 		}
@@ -643,7 +643,7 @@ func (p *ReadOnlyPager) armOutputAffinities(core *SelectStmt) ([]affinity, bool)
 	}
 	var scopes []tableScope
 	if len(core.From) > 0 {
-		jts, _, err := p.resolveFrom(core.From, nil)
+		jts, err := p.resolveFromColumns(core.From)
 		if err != nil {
 			return nil, false
 		}
@@ -678,6 +678,34 @@ type viewBodyFactsKey struct {
 type viewBodyFactsEntry struct {
 	cols []columnInfo
 	rows [][]Value
+}
+
+// viewColumnsGuarded is resolveViewRowsGuarded for a caller that wants the
+// view's columns only: the same cycle check, without running the body.
+func (p *ReadOnlyPager) viewColumnsGuarded(viewName string, pcv *parsedCreateView) ([]columnInfo, error) {
+	for _, seen := range p.viewExpansion {
+		if equalFoldName(seen, viewName) {
+			return nil, fmt.Errorf("engine: view %s is circularly defined", viewName)
+		}
+	}
+	key := viewBodyFactsKey{temp: pcv.isTemp, name: r33sFoldIdent(viewName)}
+	if cached, ok := p.viewBodyFacts[key]; ok {
+		return append([]columnInfo(nil), cached.cols...), nil
+	}
+	if cols, ok := p.viewColsFacts[key]; ok {
+		return append([]columnInfo(nil), cols...), nil
+	}
+	p.viewExpansion = append(p.viewExpansion, viewName)
+	cols, err := p.viewColumnInfos(viewName, pcv)
+	p.viewExpansion = p.viewExpansion[:len(p.viewExpansion)-1]
+	if err != nil {
+		return nil, err
+	}
+	if p.viewColsFacts == nil {
+		p.viewColsFacts = map[viewBodyFactsKey][]columnInfo{}
+	}
+	p.viewColsFacts[key] = append([]columnInfo(nil), cols...)
+	return cols, nil
 }
 
 // resolveViewRowsGuarded is resolveFrom's entry point for a FROM item naming a

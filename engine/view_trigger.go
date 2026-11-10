@@ -138,7 +138,7 @@ func (p *ReadOnlyPager) viewColumnInfos(viewName string, pcv *parsedCreateView) 
 	defer p.pushCTEScope(core.CTEs)()
 	var scopes []tableScope
 	if len(core.From) > 0 {
-		jts, _, err := p.resolveFrom(core.From, nil)
+		jts, err := p.resolveFromColumns(core.From)
 		if err != nil {
 			return nil, rewriteViewNoSuchTable(err)
 		}
