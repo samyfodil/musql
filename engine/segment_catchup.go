@@ -157,6 +157,12 @@ func (n *Session) caughtUp(segPath string, before func([]deltaBatch)) (f *Segmen
 			return nil, nil, false
 		}
 	}
+	// A new catalog record is a new schema, which a full read loads; an older
+	// one is the catalog the file opened just now does not know.
+	if nd.catalog != nil || f.applyDeltaCatalog(st.catalog) != nil {
+		f.Close()
+		return nil, nil, false
+	}
 	if before != nil {
 		before(batches)
 	}

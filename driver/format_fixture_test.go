@@ -22,8 +22,11 @@ import (
 // the second. MUSQL_WRITE_FORMAT_FIXTURE=1 writes a new fixture -- only when a
 // format version is added, into a directory of its own, leaving the old one.
 
-// formatFixtureDir is the fixture the current format writes.
-const formatFixtureDir = "testdata/format/v7"
+// formatFixtureDir is the fixture the current format writes: segment file
+// version 7 with a version-7 delta, whose catalog records (a view, a trigger
+// and user_version, after the VACUUM) the v7 fixture's version-6 delta cannot
+// hold.
+const formatFixtureDir = "testdata/format/v7-delta7"
 
 // formatVersionWritten is the segment file version a rewrite writes: a
 // fixture of any older version is written back as this one by its VACUUM.
@@ -34,7 +37,8 @@ const formatVersionWritten = 7
 // rowid alias and a WITHOUT ROWID table, indexes plain, expression and
 // partial, a view, a trigger, AUTOINCREMENT, vectors and a vector index, and
 // fts4, fts5 and rtree tables. The statements after the VACUUM are what the
-// delta log holds.
+// delta log holds: rows, and the catalog records of a view, a trigger and a
+// header word.
 var formatFixtureSetup = []string{
 	"CREATE TABLE kinds(id INTEGER PRIMARY KEY, i INT, r REAL, t TEXT, b BLOB, n NUMERIC, any)",
 	"INSERT INTO kinds VALUES (1, 42, 1.5, 'text', x'00ff10', 12.5, NULL)",
@@ -70,6 +74,9 @@ var formatFixtureSetup = []string{
 	"DELETE FROM kinds WHERE id = 2",
 	"INSERT INTO emb VALUES (5, vector('[0,0,1,0]'))",
 	"INSERT INTO wr VALUES ('z', 9, 'nine')",
+	"CREATE VIEW kinds_late AS SELECT id, t FROM kinds WHERE id > 3",
+	"CREATE TRIGGER kinds_log AFTER INSERT ON kinds BEGIN INSERT INTO log VALUES ('kinds ' || new.id); END",
+	"PRAGMA user_version = 9",
 }
 
 // formatFixtureQueries are answered on the fixture and compared.
