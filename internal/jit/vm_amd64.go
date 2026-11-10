@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strconv"
 )
 
 // condAbove is x86's unsigned "above" (JA), for range checks that fold negatives.
@@ -40,6 +41,24 @@ var vmPool = []Reg{RBX, R11, R13, R15, R12}
 // entry marks the pcs the engine enters at; one that bound does not mark is
 // entered through an entry stub (vmfuse.go), which the dispatch table points at.
 func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache bool) ([]byte, error) {
+	return emitVMWith(newAsmFor(len(prog)), prog, nReg, lay, bound, entry, cache)
+}
+
+// mapVM is emitVM mapped (Map), its encoder taken from a pool and given back
+// once the code is copied out: what compiling a program allocated was most of
+// all the encoder's buffers.
+func mapVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache bool) (*Code, error) {
+	a := asmFor(len(prog))
+	defer a.release()
+	code, err := emitVMWith(a, prog, nReg, lay, bound, entry, cache)
+	if err != nil {
+		return nil, err
+	}
+	return Map(code)
+}
+
+// emitVMWith is emitVM encoding into a.
+func emitVMWith(asm *Asm, prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache bool) ([]byte, error) {
 	if lay.OffTyp != 0 || lay.OffI != 8 || lay.OffF != 16 || lay.Size != lay.OffS+24 {
 		// writeInt stores the type as the whole first word -- type, subtype and
 		// padding together -- so the type must lead it.
@@ -49,10 +68,11 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 	if int64(nReg)*int64(lay.Size) > 1<<30 || n > 1<<28 {
 		return nil, fmt.Errorf("jit: program too large (%d instructions, %d registers)", n, nReg)
 	}
-	e := &vmEmit{a: NewAsm(), lay: lay, n: n, stubs: map[int]bool{}, prog: prog, bound: bound,
+	e := &vmEmit{a: asm, lay: lay, n: n, stubs: make(map[int]bool, n), fix: make([]vmFix, 0, 4*n), prog: prog, bound: bound,
 		cache: cache && bound != nil, know: newVMKnow(), holds: map[int]Reg{}, pinned: map[Reg]bool{},
 		zeroS: map[int]bool{}, consts: newFirPool()}
 	e.heads = vmLoopHeads(prog)
+	e.steps, e.keep = vmStepsOf(prog), map[int]bool{}
 	a := e.a
 
 	a.MovRegMem(RSI, RDI, POffRegs)
@@ -203,7 +223,11 @@ type vmEmit struct {
 	fix      []vmFix
 	stubs    map[int]bool
 
-	prog  []VInsn
+	prog []VInsn
+	// steps is every pc's step and keep the set entryPoint reuses, made once
+	// for the emission (vmStepsOf).
+	steps []progStep
+	keep  map[int]bool
 	bound []bool
 	cache bool
 	know  *vmKnow
@@ -234,7 +258,7 @@ type vmEmit struct {
 // it.
 func (e *vmEmit) coldPath(body func()) {
 	n := len(e.cold)
-	in, back := fmt.Sprintf("c%d", n), fmt.Sprintf("c%d.back", n)
+	in, back := "c"+strconv.Itoa(n), "c"+strconv.Itoa(n)+".back"
 	e.a.Jcc(CondNE, in)
 	e.a.Label(back)
 	e.cold = append(e.cold, func() {
@@ -260,7 +284,8 @@ type vmHold struct {
 // entryPoint makes pc, inside a run, an entry: what the run knows there is
 // cut down to what a stub can check, and the stub is noted.
 func (e *vmEmit) entryPoint(pc int) {
-	keep := vmEntryKeep(e.prog, e.bound, pc)
+	e.keep = vmEntryKeepInto(e.keep, e.prog, e.steps, e.bound, pc)
+	keep := e.keep
 	st := vmEntryStub{pc: pc}
 	st.ints, st.noS = e.know.pruneForEntry(keep)
 	for k, m := range e.holds {
@@ -437,7 +462,7 @@ func (e *vmEmit) clobber(r int) {
 	delete(e.know.isFloat, r)
 }
 
-func (e *vmEmit) nextUse(key, pc int) int { return vmEmitNextUse(e.prog, e.bound, key, pc) }
+func (e *vmEmit) nextUse(key, pc int) int { return vmEmitNextUseIn(e.prog, e.steps, e.bound, key, pc) }
 
 // alloc returns a pool register for a value wanted again at pc want, taking
 // one from whatever the pool holds that is wanted furthest away (or never)
@@ -998,11 +1023,11 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		if in.Op == VOpen {
 			// A seek cursor (Reopen 4 or 5): the rows its last seek's run
 			// served are counted, and the open marked native (5).
-			gen := fmt.Sprintf("op%d.gen", pc)
+			gen := "op" + strconv.Itoa(pc) + ".gen"
 			a.CmpMemDImm8(RAX, cb+VCursorOffReop, VReopenSeek)
 			a.Jcc(CondL, gen)
 			a.LeaRegMemD(R10, RAX, cb)
-			e.seekIdxServed(R10, RDX, fmt.Sprintf("op%d.sv", pc), fmt.Sprintf("op%d.sk", pc))
+			e.seekIdxServed(R10, RDX, "op"+strconv.Itoa(pc)+".sv", "op"+strconv.Itoa(pc)+".sk")
 			a.MovMemDImm(R10, VCursorOffReop, VReopenSeekOpened)
 			a.Label(gen)
 			a.MovRegMemD(RDX, RAX, cb+VCursorOffN)
@@ -1126,7 +1151,7 @@ func (e *vmEmit) inSet(pc int, in VInsn) {
 	if !in.Dead {
 		e.destNoS(pc, in.C)
 	}
-	loop, done, none := fmt.Sprintf("in%d", pc), fmt.Sprintf("in%d.d", pc), fmt.Sprintf("in%d.n", pc)
+	loop, done, none := "in"+strconv.Itoa(pc), "in"+strconv.Itoa(pc)+".d", "in"+strconv.Itoa(pc)+".n"
 	a.LeaRegMemD(RAX, RSI, e.d(in.B, L.OffI))
 	a.Label(loop)
 	a.CmpRegImm32(R9, 1)
@@ -1202,7 +1227,7 @@ func (e *vmEmit) resultRow(pc int, in VInsn) {
 	e.jccWB(pc)
 	a.MovRegMemD(RDX, RDI, POffRowsBuf)
 	a.TestRegReg(RDX, RDX)
-	gather := fmt.Sprintf("rg%d", pc)
+	gather := "rg" + strconv.Itoa(pc)
 	a.Jcc(CondNE, gather)
 
 	// One row, handed over: copy it to RowBuf's head and return.

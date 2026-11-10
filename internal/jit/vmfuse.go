@@ -55,10 +55,10 @@ func VFusable(prev, next VInsn) bool {
 // runs it (an exit hands the same instruction to the VDBE). An instruction
 // with no native form reads every register: it is VDBE code, which may.
 func vmStepOf(in VInsn, pc int) progStep {
-	s := progStep{fall: true}
+	s := progStep{fall: vmFalls(in.Op)}
 	switch in.Op {
 	case VGoto:
-		s.fall, s.targets = false, []int{in.T}
+		s.targets = []int{in.T}
 	case VInt:
 		s.defs = []int{in.A}
 	case VCopy:
@@ -97,7 +97,7 @@ func vmStepOf(in VInsn, pc int) progStep {
 	case VGosub:
 		// The subroutine's VReturn (which reads everything) comes back to
 		// pc+1; the return address is a def.
-		s.defs, s.fall, s.targets = []int{in.A}, false, []int{in.T}
+		s.defs, s.targets = []int{in.A}, []int{in.T}
 	case VColumn, VRowid:
 		s.defs = []int{in.C}
 	case VInSet:
@@ -296,6 +296,18 @@ func EmitVMFused(prog []VInsn, nReg int, lay ValueLayout, entry []bool, fusable 
 	return emitVM(prog, nReg, lay, VMBoundaries(prog, make([]bool, len(prog))), entry, true)
 }
 
+// MapVMFused is EmitVMFused mapped (Map), the encoder's buffers reused from
+// one compile to the next.
+func MapVMFused(prog []VInsn, nReg int, lay ValueLayout, entry []bool, fusable bool) (*Code, error) {
+	if !Fusing() {
+		return mapVM(prog, nReg, lay, nil, nil, false)
+	}
+	if fusable {
+		prog = FuseVM(prog, nReg, VMBoundaries(prog, make([]bool, len(prog))), entry)
+	}
+	return mapVM(prog, nReg, lay, VMBoundaries(prog, make([]bool, len(prog))), entry, true)
+}
+
 // EmitVM compiles a whole VDBE program that may be entered at any pc; see
 // vm.go for the contract.
 func EmitVM(prog []VInsn, nReg int, lay ValueLayout) ([]byte, error) {
@@ -389,8 +401,13 @@ func vmRunStart(prog []VInsn, bound []bool, pc int) bool {
 	if prev.Op == VFused {
 		return false
 	}
-	return !vmStepOf(prev, pc-1).fall || prev.Op == VExit || prev.Op == VReturn || prev.Op == VResultRow
+	return !vmFalls(prev.Op) || prev.Op == VExit || prev.Op == VReturn || prev.Op == VResultRow
 }
+
+// vmFalls reports whether op goes on to the next pc (vmStepOf's fall), which
+// the run boundaries ask of every pc and so is answered without building a
+// step: only a jump and a subroutine call leave it.
+func vmFalls(op VOp) bool { return op != VGoto && op != VGosub }
 
 // VFusedTest is the test a VFused pc was before its pair was fused: what an
 // entry at that pc runs.
@@ -434,6 +451,29 @@ func vmLoopHeads(prog []VInsn) []bool {
 // a register, or a cursor's row (^c) -- a VColumn of the cursor before
 // anything moves it. -1: none does.
 func vmEmitNextUse(prog []VInsn, bound []bool, key, pc int) int {
+	return vmEmitNextUseIn(prog, nil, bound, key, pc)
+}
+
+// vmStepsOf is every pc's step, made once for an emitter, which asks about the
+// same instructions again and again (vmEmitNextUseIn, vmEntryKeepInto).
+func vmStepsOf(prog []VInsn) []progStep {
+	steps := make([]progStep, len(prog))
+	for pc, in := range prog {
+		steps[pc] = vmStepOf(in, pc)
+	}
+	return steps
+}
+
+// vmStepAt is pc's step, from steps when the caller made them.
+func vmStepAt(prog []VInsn, steps []progStep, pc int) progStep {
+	if steps != nil {
+		return steps[pc]
+	}
+	return vmStepOf(prog[pc], pc)
+}
+
+// vmEmitNextUseIn is vmEmitNextUse reading the steps from steps (vmStepsOf).
+func vmEmitNextUseIn(prog []VInsn, steps []progStep, bound []bool, key, pc int) int {
 	for q := pc + 1; q < len(prog); q++ {
 		if vmRunStart(prog, bound, q) {
 			return -1
@@ -451,7 +491,7 @@ func vmEmitNextUse(prog []VInsn, bound []bool, key, pc int) int {
 			}
 			continue
 		}
-		st := vmStepOf(in, q)
+		st := vmStepAt(prog, steps, q)
 		if st.useAll {
 			return -1 // the run ends there
 		}
@@ -527,12 +567,18 @@ func vmRunColumns(prog []VInsn, bound []bool, pc int, mask uint64, maxCol int) (
 
 // vmEntryKeep is the registers the run from pc on reads or writes.
 func vmEntryKeep(prog []VInsn, bound []bool, pc int) map[int]bool {
-	keep := map[int]bool{}
+	return vmEntryKeepInto(map[int]bool{}, prog, nil, bound, pc)
+}
+
+// vmEntryKeepInto is vmEntryKeep into keep, cleared first, reading the steps
+// from steps (vmStepsOf).
+func vmEntryKeepInto(keep map[int]bool, prog []VInsn, steps []progStep, bound []bool, pc int) map[int]bool {
+	clear(keep)
 	for q := pc; q < len(prog); q++ {
 		if q > pc && vmRunStart(prog, bound, q) {
 			break
 		}
-		st := vmStepOf(prog[q], q)
+		st := vmStepAt(prog, steps, q)
 		if st.useAll {
 			break
 		}
