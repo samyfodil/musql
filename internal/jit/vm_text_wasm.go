@@ -566,7 +566,7 @@ func (e *vmEmitWasm) text(pc int, in VInsn) {
 		w.StoreI64(e.addr(in.A, s.off))
 	}
 	w.op(opEnd)
-	delete(e.zeroS, in.A)
+	e.zeroS.del(in.A)
 	e.forgetReg(in.A)
 }
 

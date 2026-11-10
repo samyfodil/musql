@@ -26,21 +26,25 @@ func (e *vmEmitArm) curBase(c int) {
 //
 // A predicted kind (T) shares a run's checks of the cursor and reads a plain
 // column of that kind directly, as on amd64.
+// vmSegKinds is every kind a segment's column reads natively as, in the order
+// segColumn tests them.
+var vmSegKinds = [...]int{VSegInt, VSegFloat, VSegNumeric, VSegIntReal, VSegRowid, VSegText}
+
 func (e *vmEmitArm) segColumn(pc int, in VInsn) {
 	a, L := e.a, e.lay
 	e.destNoS(pc, in.C)
-	delete(e.zeroS, in.C) // every word of the destination is written below
+	e.zeroS.del(in.C) // every word of the destination is written below
 	seg, nonull, noexc, done, rows := e.vmLabel("sg"), e.vmLabel("sn"), e.vmLabel("sx"), e.vmLabel("sd"), e.vmLabel("sw")
-	kinds := []int{VSegInt, VSegFloat, VSegNumeric, VSegIntReal, VSegRowid, VSegText}
-	at := map[int]string{}
-	for _, k := range kinds {
+	var at [VSegText + 1]string
+	for _, k := range vmSegKinds {
 		at[k] = e.vmLabel("sk")
 	}
-	if kind, ok := at[in.T]; ok {
+	if in.T > 0 && in.T < len(at) && at[in.T] != "" {
+		kind := at[in.T]
 		full, fnosel, prows := e.vmLabel("sf"), e.vmLabel("so"), e.vmLabel("sr")
 		base, have := e.holds[^in.A]
 		if have {
-			e.pinned[base] = true
+			e.pinned.add(int(base))
 		} else {
 			mask := uint64(1) << uint(in.B)
 			if e.cache {
@@ -64,7 +68,7 @@ func (e *vmEmitArm) segColumn(pc int, in VInsn) {
 					a.MovReg(m, X9)
 					base = m
 					e.holds[^in.A] = m
-					e.pinned[m] = true
+					e.pinned.add(int(m))
 				}
 			}
 		}
@@ -155,7 +159,7 @@ func (e *vmEmitArm) segColumn(pc int, in VInsn) {
 	a.Cbnz(X8, e.stub(pc)) // an exception: the VDBE's
 	a.Label(noexc)
 	a.LdrImm(X8, X7, VSegColOffKind)
-	for _, k := range kinds {
+	for _, k := range vmSegKinds {
 		a.CmpImm(X8, uint32(k))
 		a.Bcond(CondE, at[k])
 	}
@@ -525,7 +529,7 @@ func (e *vmEmitArm) text(pc int, in VInsn) {
 	a.Bcond(CondE, same)
 	a.Label(store)
 	e.branchWB(pc)
-	delete(e.zeroS, in.A)
+	e.zeroS.del(in.A)
 	a.MovImm16(X9, uint16(L.TypText))
 	e.str(X9, in.A, 0)
 	e.str(xzr, in.A, L.OffI)

@@ -72,13 +72,13 @@ func (e *vmEmit) predictedRowRead(pc int, in VInsn, base Reg, first bool, mask u
 		a.Jmp(l("rows"))
 		return
 	}
-	e.pinned[row] = true
+	e.pinned.add(int(row))
 	dst := e.d(in.C, 0)
 	vb := int32(in.B) * int32(L.Size)
 	// As column copies: the string words only when the column or the
 	// destination holds a string, with the write barrier off.
 	a.MovRegMemD(RDX, row, vb+int32(L.OffS))
-	if !e.know.noS[in.C] {
+	if !e.know.noS.has(in.C) {
 		a.AluRegMemD(AluOr, RDX, RSI, dst+int32(L.OffS))
 	} else {
 		a.TestRegReg(RDX, RDX)
@@ -97,20 +97,39 @@ func (e *vmEmit) predictedRowRead(pc int, in VInsn, base Reg, first bool, mask u
 	a.Jmp(l("done"))
 }
 
+// segKindLabel is the label of the predicted read of a cell of kind k, ""
+// for a kind with none.
+func segKindLabel(k int) string {
+	switch k {
+	case VSegInt:
+		return "int"
+	case VSegFloat:
+		return "float"
+	case VSegNumeric:
+		return "num"
+	case VSegIntReal:
+		return "intreal"
+	case VSegRowid:
+		return "rowid"
+	case VSegText:
+		return "text"
+	}
+	return ""
+}
+
 func (e *vmEmit) segColumn(pc int, in VInsn) {
 	a, L := e.a, e.lay
 	cb := int32(in.A * VCursorSize)
 	e.destNoS(pc, in.C)
-	delete(e.zeroS, in.C) // every word of the destination is written below
+	e.zeroS.del(in.C) // every word of the destination is written below
 	dst := e.d(in.C, 0)
 	pre := "sc" + strconv.Itoa(pc) + "."
 	l := func(s string) string { return pre + s }
-	kindLabel := map[int64]string{VSegInt: "int", VSegFloat: "float", VSegNumeric: "num", VSegIntReal: "intreal", VSegRowid: "rowid", VSegText: "text"}
-	if name, ok := kindLabel[int64(in.T)]; ok {
+	if name := segKindLabel(in.T); name != "" {
 		base, have := e.holds[^in.A]
 		first, mask := !have, uint64(1)<<uint(in.B)
 		if have {
-			e.pinned[base] = true
+			e.pinned.add(int(base))
 		} else {
 			if e.cache {
 				mask = vmRunPredicted(e.prog, e.bound, pc)
@@ -133,7 +152,7 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 					a.MovRegReg(m, RAX)
 					base = m
 					e.holds[^in.A] = m
-					e.pinned[m] = true
+					e.pinned.add(int(m))
 				}
 			}
 		}
@@ -626,7 +645,7 @@ func (e *vmEmit) text(pc int, in VInsn) {
 	a.Jcc(CondE, same)
 	a.Label(store)
 	e.jccWB(pc)
-	delete(e.zeroS, in.A)
+	e.zeroS.del(in.A)
 	a.MovMemDImm(RSI, dst, int32(L.TypText))
 	a.MovMemDImm(RSI, dst+int32(L.OffI), 0)
 	a.MovMemDImm(RSI, dst+int32(L.OffF), 0)

@@ -21,11 +21,11 @@ var vmFKernelXMMs = []XReg{X0, X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12
 // operand is known to be one.
 func (e *vmEmit) fload(pc, r int, x XReg, intOK bool, isReal Reg) {
 	a, L := e.a, e.lay
-	if e.know.isFloat[r] {
+	if e.know.isFloat.has(r) {
 		a.MovsdLoad(x, RSI, e.d(r, L.OffF))
 		return
 	}
-	if e.know.isInt[r] && intOK {
+	if e.know.isInt.has(r) && intOK {
 		a.Xorps(x, x)
 		a.Cvtsi2sdq(x, e.src(pc, r, RAX))
 		return
@@ -38,7 +38,7 @@ func (e *vmEmit) fload(pc, r int, x XReg, intOK bool, isReal Reg) {
 		a.aluImm32(1, isReal, 1)
 	}
 	if !intOK {
-		e.know.isFloat[r] = true
+		e.know.isFloat.add(r)
 	}
 	e.cold = append(e.cold, func() {
 		a.Label(notReal)
@@ -95,7 +95,7 @@ func (e *vmEmit) realInsn(pc int, in VInsn) (bool, error) {
 		// where it must: an add, subtract or multiply of two runs that arm
 		// here, exiting on overflow; a divide exits.
 		flag := Reg(0)
-		if !e.know.isFloat[in.A] && !e.know.isFloat[in.B] {
+		if !e.know.isFloat.has(in.A) && !e.know.isFloat.has(in.B) {
 			flag = RCX
 			a.XorRegReg(RCX, RCX)
 		}
@@ -199,7 +199,7 @@ func (e *vmEmit) realInsn(pc int, in VInsn) (bool, error) {
 // sqlite3IntFloatCompare would.
 func (e *vmEmit) fcmpLoad(pc, r int, x XReg) {
 	a, L := e.a, e.lay
-	if e.know.isFloat[r] {
+	if e.know.isFloat.has(r) {
 		a.MovsdLoad(x, RSI, e.d(r, L.OffF))
 		return
 	}
