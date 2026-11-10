@@ -336,7 +336,18 @@ func (p *Provider) noteExpiry(k *signKey, exp *jwt.NumericDate) error {
 			return nil
 		}
 	}
-	if err := p.store.SetSigningKeyMaxExp(context.Background(), k.kid, want); err != nil {
+	ctx := context.Background()
+	err := p.store.SetSigningKeyMaxExp(ctx, k.kid, want)
+	if errors.Is(err, state.ErrNotFound) {
+		// The state has lost the key or has yet to get it: in a cluster a new
+		// master's copy can be behind the one the key was stored on (#129).
+		// It is stored again as this node holds it, unless it arrived since.
+		err = p.store.AddSigningKey(ctx, &state.SigningKey{KID: k.kid, PrivateKey: k.priv.Seed(), CreatedAt: k.created, MaxExp: want})
+		if errors.Is(err, state.ErrExists) {
+			err = p.store.SetSigningKeyMaxExp(ctx, k.kid, want)
+		}
+	}
+	if err != nil {
 		return err
 	}
 	k.maxExp = want
