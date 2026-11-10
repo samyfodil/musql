@@ -603,9 +603,6 @@ func TestImageMarkerGoesWhenTheDatabaseMoved(t *testing.T) {
 // before it wrote takes an image that knows its later writes, and its next row
 // takes a rowid past every one it wrote, the deleted one's too.
 func TestImageOverABackupSkipsItsOldRowids(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("on windows-arm64 CI the restored site once took its deleted row's rowid, and passed on windows-amd64 in the same run; not yet explained")
-	}
 	lowImageMin(t)
 	c := newCluster(t)
 	c.open("a", imageDDL...)
@@ -626,7 +623,9 @@ func TestImageOverABackupSkipsItsOldRowids(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.exec("b", `DELETE FROM k WHERE v = 'b4'`)
-	c.converge("", imageRowsK)
+	// The clock too: the rows match before a has the deleted row at all, and
+	// a rowid no other node ever had is the restored site's to hand out again.
+	c.converge("", imageRowsK, clockQ)
 	c.dbs["b"].Close()
 	engine.RemoveDatabaseFiles(filepath.Join(c.dir, "b.db"))
 	copyFiles(t, backup, c.dir, "b.db")
