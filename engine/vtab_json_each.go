@@ -124,8 +124,11 @@ func (m jsonEachModule) Connect(args []string) ([]VtabColumn, VirtualTable, erro
 		{Name: "parent"},
 		{Name: "fullkey"},
 		{Name: "path"},
-		{Name: "json", Hidden: true},
-		{Name: "root", Hidden: true},
+		// NUMERIC, as C's "json HIDDEN, root HIDDEN" makes them: the type is
+		// the word HIDDEN, which sqlite3AffinityType reads as NUMERIC before
+		// vtab.c strips it (#138).
+		{Name: "json", Hidden: true, NumericAffinity: true},
+		{Name: "root", Hidden: true, NumericAffinity: true},
 	}, jsonEachTable{name: m.name}, nil
 }
 

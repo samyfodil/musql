@@ -177,11 +177,13 @@ func (m pragmaVtabModule) Connect(args []string) ([]VtabColumn, VirtualTable, er
 	// The two hidden columns are independent in pragmaVtabConnect (pragma.c):
 	// "arg" comes from PragFlg_Result1 and "schema" from SchemaOpt|SchemaReq, so
 	// a pragma can have either, both, or -- cache_size -- only the second.
+	// NUMERIC, as C's "arg HIDDEN" and "schema HIDDEN" make them (see
+	// jsonEachModule.Connect).
 	if !schemaOnly {
-		cols = append(cols, VtabColumn{Name: "arg", Hidden: true})
+		cols = append(cols, VtabColumn{Name: "arg", Hidden: true, NumericAffinity: true})
 	}
 	if !singleArg {
-		cols = append(cols, VtabColumn{Name: "schema", Hidden: true})
+		cols = append(cols, VtabColumn{Name: "schema", Hidden: true, NumericAffinity: true})
 	}
 	return cols, pragmaVtabTable{pragma: m.pragma, nOwn: len(own), singleArg: singleArg, schemaOnly: schemaOnly}, nil
 }

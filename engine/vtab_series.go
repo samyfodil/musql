@@ -30,9 +30,13 @@ func (seriesModule) Connect(args []string) ([]VtabColumn, VirtualTable, error) {
 	}
 	cols := []VtabColumn{
 		{Name: "value"},
-		{Name: "start", Hidden: true},
-		{Name: "stop", Hidden: true},
-		{Name: "step", Hidden: true},
+		// NUMERIC, as C declares them: "start hidden" is a column whose type
+		// is the word HIDDEN, which sqlite3AffinityType reads as NUMERIC, and
+		// vtab.c strips the word from the type without recomputing it. So
+		// "start = '1'" is true (#138).
+		{Name: "start", Hidden: true, NumericAffinity: true},
+		{Name: "stop", Hidden: true, NumericAffinity: true},
+		{Name: "step", Hidden: true, NumericAffinity: true},
 	}
 	return cols, seriesTable{}, nil
 }
@@ -374,7 +378,7 @@ func (c *seriesCursor) Close() error          { return nil }
 
 // seriesInt coerces a bound Value to an int64 the way SQLite's
 // sqlite3_value_int64 would for generate_series' integer inputs: an integer is
-// used directly; a real is truncated toward zero; text/blob is parsed as far as
+// used directly; a real is truncated toward zero, saturating; text/blob is parsed as far as
 // a leading integer goes (0 if none). NULL is handled by the caller before this
 // is reached.
 func seriesInt(v Value) int64 {
@@ -382,7 +386,7 @@ func seriesInt(v Value) int64 {
 	case Int:
 		return v.I
 	case Float:
-		return int64(v.F)
+		return seriesRealToInt(v.F)
 	case Text, Blob:
 		n, _ := parseIntegerPrefix(string(v.S))
 		return n
