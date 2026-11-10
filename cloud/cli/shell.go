@@ -69,7 +69,7 @@ func (a *app) runShell(ctx context.Context, db *sql.DB, script []string, banner 
 	t := term.NewTerminal(struct {
 		io.Reader
 		io.Writer
-	}{a.env.Stdin, a.env.Stdout}, "")
+	}{&keyReader{r: a.env.Stdin}, a.env.Stdout}, "")
 	t.History = loadHistory(filepath.Join(a.env.Dir, "history"))
 	sh.Out = t
 	fmt.Fprintf(t, "%s End statements with ;  .help for commands.\n", banner)
