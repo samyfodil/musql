@@ -1,6 +1,7 @@
 package engine_test
 
 import (
+	"fmt"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -392,6 +393,74 @@ func TestExplainListingCompound(t *testing.T) {
 				case "Init", "Goto", "Rewind", "Next", "If", "IfNot", "IsNull", "NotNull", "Gosub":
 					if p2 := int(rows[i][3].I); p2 < at || p2 >= end {
 						t.Errorf("%s: %d %s jumps to %d, outside its arm [%d,%d)", tc.sql, i, rows[i][1].S, p2, at, end)
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestExplainListingSubqueries: the programs a statement runs follow its own
+// in the listing (#130), each begun by a line naming the instruction that runs
+// it, and every jump lands inside its own program.
+func TestExplainListingSubqueries(t *testing.T) {
+	p := explainDB(t)
+	for _, tc := range []struct {
+		sql  string
+		subs []string // what each later program's first line is brought in by
+	}{
+		{`EXPLAIN SELECT sum(a) FROM (SELECT DISTINCT a FROM (SELECT a FROM t UNION ALL SELECT x FROM u))`,
+			[]string{"OpenDerived", "OpenDerived", "OpenDerived, UNION ALL"}},
+		{`EXPLAIN SELECT a FROM t WHERE b IN (SELECT y FROM u)`, []string{"InSub"}},
+		{`EXPLAIN SELECT (SELECT max(x) FROM u WHERE u.y > t.a) FROM t`, []string{"Subquery"}},
+	} {
+		_, rows, err := p.Query(tc.sql)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.sql, err)
+		}
+		var starts []int
+		for i, r := range rows {
+			if r[0].I != int64(i) {
+				t.Fatalf("%s: row %d addr = %d", tc.sql, i, r[0].I)
+			}
+			if string(r[1].S) == "Init" {
+				starts = append(starts, i)
+			}
+		}
+		if len(starts) != 1+len(tc.subs) {
+			t.Fatalf("%s: programs start at %v, want %d", tc.sql, starts, 1+len(tc.subs))
+		}
+		for k, at := range starts {
+			end := len(rows)
+			if k+1 < len(starts) {
+				end = starts[k+1]
+			}
+			if k > 0 {
+				comment := string(rows[at][7].S)
+				var by int
+				var rest string
+				if n, _ := fmt.Sscanf(comment, "subquery of %d", &by); n != 1 || by >= at {
+					t.Errorf("%s: program %d begins %q", tc.sql, k, comment)
+					continue
+				}
+				want := strings.SplitN(tc.subs[k-1], ", ", 2)
+				if got := string(rows[by][1].S); got != want[0] {
+					t.Errorf("%s: program %d is brought in by %d %s, want %s", tc.sql, k, by, got, want[0])
+				}
+				if len(want) == 2 {
+					rest = ", " + want[1] + ": "
+				} else {
+					rest = ": "
+				}
+				if !strings.HasPrefix(comment, fmt.Sprintf("subquery of %d%s", by, rest)) {
+					t.Errorf("%s: program %d begins %q", tc.sql, k, comment)
+				}
+			}
+			for i := at; i < end; i++ {
+				switch string(rows[i][1].S) {
+				case "Init", "Goto", "Rewind", "Next", "If", "IfNot", "IsNull", "NotNull", "Gosub", "Distinct":
+					if p2 := int(rows[i][3].I); p2 < at || p2 >= end {
+						t.Errorf("%s: %d %s jumps to %d, outside its program [%d,%d)", tc.sql, i, rows[i][1].S, p2, at, end)
 					}
 				}
 			}
