@@ -122,6 +122,33 @@ Run Time: real 0.001
 `musql` is in the [release archive](https://github.com/samyfodil/musql/releases/latest)
 with `musqld` and `musql-convert`. `.help` lists the shell's commands.
 
+Given a server's URL instead of a file, `musql open` runs the same shell on a
+[`musqld`](#as-a-server-no-go-needed) server, with the server's token from
+`--auth-token` or `$MUSQLD_AUTH_TOKEN`. `http://`, `https://`, `ws://`,
+`wss://` and `libsql://` URLs all work:
+
+```sh
+$ ./musql open http://localhost:8080 --auth-token secret
+Connected to http://localhost:8080.
+musql> SELECT count(*) FROM notes;
+```
+
+For musql cloud, point the CLI at the server once, sign in in the browser, and
+open a database by name:
+
+```sh
+$ ./musql config set url https://cloud.example.com
+$ ./musql auth login
+$ ./musql db create app
+$ ./musql db shell app
+Connected to acme/app.
+musql>
+```
+
+`musql --help` lists the rest (organizations, groups, tokens, import and
+export). [cloud/DESIGN.md](cloud/DESIGN.md) describes the server and how to run
+it.
+
 ### As a server, no Go needed
 
 Run `musqld` with Docker; the database lives in the `musql` volume:
