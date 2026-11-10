@@ -94,7 +94,7 @@ func (w *Wasm) Local(t byte) uint32 {
 	return uint32(len(w.locals))
 }
 
-func (w *Wasm) op(b ...byte)      { w.body = append(w.body, b...) }
+func (w *Wasm) op(b ...byte)      { put(&w.body, b) }
 func (w *Wasm) Get(l uint32)      { w.op(opLocalGet); w.body = uleb(w.body, uint64(l)) }
 func (w *Wasm) Set(l uint32)      { w.op(opLocalSet); w.body = uleb(w.body, uint64(l)) }
 func (w *Wasm) I32(v int32)       { w.op(opI32Const); w.body = sleb(w.body, int64(v)) }

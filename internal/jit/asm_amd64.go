@@ -96,7 +96,7 @@ func (e errUnboundLabel) Error() string { return "jit: unbound label " + string(
 // Label marks the current position.
 func (a *Asm) Label(name string) { a.labels[name] = len(a.buf) }
 
-func (a *Asm) emit(b ...byte) { a.buf = append(a.buf, b...) }
+func (a *Asm) emit(b ...byte) { put(&a.buf, b) }
 
 // rex emits the REX prefix for a 64-bit operation on (reg, rm).
 func (a *Asm) rex(reg, rm Reg) {
