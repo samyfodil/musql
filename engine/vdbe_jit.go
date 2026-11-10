@@ -87,8 +87,10 @@ type vmJIT struct {
 	reopen []reopenSrc
 
 	// segCap is, per cursor number, whether its VColumns read a segment in
-	// place (segCapableCursors).
-	segCap []bool
+	// place (segCapableCursors), and segNeed the columns they read, whose
+	// TEXT bounds a segment checks for them (vmSegFor).
+	segCap  []bool
+	segNeed []uint64
 
 	// tabs is, per cursor number, the table tabFor last worked out for it.
 	tabs []atomic.Pointer[vmTab]
@@ -322,7 +324,9 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	// engine hands it over in segment mode (jx.segMode), from its rows when not.
 	segCap := segCapableCursors(prog)
 	var segTables map[int]*resolvedTable
+	var segNeed []uint64
 	if segCap != nil {
+		segNeed = make([]uint64, len(segCap))
 		segTables = map[int]*resolvedTable{}
 		for _, in := range prog.Insns {
 			if t, isTbl := in.P4.(*resolvedTable); isTbl && in.Op == OpOpenRead {
@@ -335,6 +339,9 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 			// The kind the table's segments read the column as, which the read
 			// is specialised for (jit.VSegCol.Plain).
 			vp[pc].Imm, vp[pc].T = 1, p.segColKind(segTables[vp[pc].A], vp[pc].B)
+			if b := vp[pc].B; b >= 0 && b < 64 {
+				segNeed[vp[pc].A] |= 1 << uint(b)
+			}
 		}
 		// A correlated rowid seek and the rewind that runs it, which native
 		// code makes itself over the table's segments (vmJIT.tabFor).
@@ -443,7 +450,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 		}
 	}
 	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams, params: nParams, entry: entry, marked: marked, native: native, updAt: updAt,
-		segCap: segCap, walkScan: walkScan, inSlots: inSlots, idxSpecs: idxSpecs,
+		segCap: segCap, segNeed: segNeed, walkScan: walkScan, inSlots: inSlots, idxSpecs: idxSpecs,
 		aggAt: agg.at, aggSort: agg.sort, aggLo: agg.lo, aggHi: agg.hi, aggKey: agg.key, aggKeyLo: agg.keyLo, aggKeyN: agg.keyN}
 	if segCap != nil {
 		jx.tabs = make([]atomic.Pointer[vmTab], len(segCap))
@@ -1796,7 +1803,7 @@ func (jx *vmJIT) segMode(c int, cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) b
 	}
 	src, s := cur.segSrc, cur.segCur
 	if src.list {
-		v := s.vmSegFor(cur.segSrcCols)
+		v := s.vmSegFor(cur.segSrcCols, jx.segNeed[c])
 		k := src.listPos - 1
 		jc.N, jc.Pos, jc.Last, jc.Ok, jc.Dirty, jc.Rewind, jc.Adv, jc.Mask = int64(len(src.listRows)), int64(k), -1, 1, 0, 0, 1, v.mask
 		jc.Reopen, jc.State = 0, 0
@@ -1827,7 +1834,7 @@ func (jx *vmJIT) segMode(c int, cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) b
 			adv = 2
 		}
 	}
-	v := s.vmSegFor(cur.segSrcCols)
+	v := s.vmSegFor(cur.segSrcCols, jx.segNeed[c])
 	jc.N, jc.Pos, jc.Last, jc.Ok, jc.Dirty, jc.Rewind, jc.Adv, jc.Mask = int64(end), int64(cur.segRow), -1, 1, 0, 0, adv, v.mask
 	jc.Reopen, jc.State = 0, 0
 	if seg := unsafe.Pointer(&v.seg); jc.Seg != seg {
@@ -1884,7 +1891,7 @@ func (jx *vmJIT) tabFor(c int, cur *vdbeCursor) *vmTab {
 	t := cur.vmTab
 	if !t.current(src, root) {
 		if t = jx.tabs[c].Load(); !t.current(src, root) {
-			t = buildVMTab(cur, src)
+			t = buildVMTab(cur, src, jx.segNeed[c])
 			jx.tabs[c].Store(t)
 		}
 		cur.vmTab = t
@@ -1896,7 +1903,7 @@ func (jx *vmJIT) tabFor(c int, cur *vdbeCursor) *vmTab {
 }
 
 // buildVMTab works out tabFor's answer.
-func buildVMTab(cur *vdbeCursor, src *segSource) *vmTab {
+func buildVMTab(cur *vdbeCursor, src *segSource, need uint64) *vmTab {
 	root := cur.tbl.root
 	t := &vmTab{src: src, root: root, none: true}
 	if cur.tbl.withoutRowid || cursorHasNoBtree(cur) || cur.hasGeneratedCols() || cur.rowStore != nil {
@@ -1924,7 +1931,7 @@ func buildVMTab(cur *vdbeCursor, src *segSource) *vmTab {
 		if s.nRows == 0 {
 			continue
 		}
-		v := s.vmSegFor(t.plans)
+		v := s.vmSegFor(t.plans, need)
 		t.segs = append(t.segs, jit.VTabSeg{Lo: int64(s.Rowid(0)), Hi: int64(s.Rowid(s.nRows - 1)), Rows: int64(s.nRows),
 			Seg: unsafe.Pointer(&v.seg), Mask: v.mask})
 		t.at = append(t.at, s)
