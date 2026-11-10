@@ -99,24 +99,94 @@ func (p *ReadOnlyPager) explainQuery(inner string, mode explainMode) (cols []str
 	if mode == explainQueryPlan {
 		return p.explainQueryPlanRows(inner)
 	}
-	prog, err := p.explainProgram(inner)
+	arms, err := p.explainPrograms(inner)
 	if err != nil {
 		return nil, nil, err
 	}
-	rows = make([][]Value, 0, len(prog.Insns))
-	for addr, in := range prog.Insns {
-		rows = append(rows, []Value{
-			{Typ: Int, I: int64(addr)},
-			{Typ: Text, S: []byte(in.Op.String())},
-			{Typ: Int, I: int64(in.P1)},
-			{Typ: Int, I: int64(in.P2)},
-			{Typ: Int, I: int64(in.P3)},
-			explainTextOrNull(formatP4(in)),
-			{Typ: Int, I: int64(in.P5)},
-			explainTextOrNull(disasmComment(prog, addr, in)),
-		})
+	base := 0
+	for _, arm := range arms {
+		for addr, in := range arm.prog.Insns {
+			in, err := explainRelocate(in, base)
+			if err != nil {
+				return nil, nil, err
+			}
+			comment := disasmComment(arm.prog, base+addr, in)
+			if addr == 0 && arm.op != "" {
+				comment = arm.op + ": " + comment
+			}
+			rows = append(rows, []Value{
+				{Typ: Int, I: int64(base + addr)},
+				{Typ: Text, S: []byte(in.Op.String())},
+				{Typ: Int, I: int64(in.P1)},
+				{Typ: Int, I: int64(in.P2)},
+				{Typ: Int, I: int64(in.P3)},
+				explainTextOrNull(formatP4(in)),
+				{Typ: Int, I: int64(in.P5)},
+				explainTextOrNull(comment),
+			})
+		}
+		base += len(arm.prog.Insns)
 	}
 	return explainColumns(), rows, nil
+}
+
+// explainArm is one program of an EXPLAIN listing, and the compound operator
+// that brings it in ("" for the first).
+type explainArm struct {
+	op   string
+	prog *Program
+}
+
+// explainRelocate is in as it reads base instructions further down a listing:
+// every jump target moved with it. A jump is never to address 0, where the
+// program's OpInit is, so a zero target is "no jump" and stays. The opcodes
+// whose target is computed while they run have nothing here to move.
+func explainRelocate(in Instruction, base int) (Instruction, error) {
+	if base == 0 {
+		return in, nil
+	}
+	switch {
+	case explainJumpsComputed(in.Op):
+		return in, fmt.Errorf("%w: EXPLAIN of a compound SELECT whose arm holds %s, whose jump is computed as it runs", errVDBEUnsupported, in.Op)
+	case explainJumpsP2(in) && in.P2 > 0:
+		in.P2 += base
+	case explainJumpsP3(in.Op) && in.P3 > 0:
+		in.P3 += base
+	}
+	return in, nil
+}
+
+// explainJumpsP2, explainJumpsP3 and explainJumpsComputed are the opcodes
+// whose jump the VDBE takes to P2, to P3, or to an address it works out
+// (vdbe.go; TestExplainJumpTablesMatchTheVDBE keeps them in step).
+func explainJumpsP2(in Instruction) bool {
+	switch in.Op {
+	case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
+		return in.P5&p5StoreP2 == 0
+	case OpDistinct, OpGosub, OpGoto, OpGroupSame, OpHashAggNext, OpHashAggSort, OpIf, OpIfEmpty, OpIfNot,
+		OpInit, OpIsNull, OpMustBeInt, OpNext, OpNotExists, OpNotNull, OpRecQueueLimit, OpRecQueueOffset,
+		OpRecQueuePop, OpRewind, OpRightJoinSweepNext, OpRightJoinSweepRewind, OpRowidBound, OpSegEmitRow,
+		OpSegHashAgg, OpSegJoinAgg, OpSegJoinGroups, OpSegJoinHash, OpSegJoinNext, OpSegJoinTop,
+		OpSkipIfRowGone, OpSorterCheck, OpSorterNext, OpSorterSort:
+		return true
+	}
+	return false
+}
+
+func explainJumpsP3(op OpCode) bool {
+	switch op {
+	case OpSegDistinct, OpSegFilterCount, OpSegOrderLimit, OpSegProgram, OpSegVectorTopK:
+		return true
+	}
+	return false
+}
+
+func explainJumpsComputed(op OpCode) bool {
+	switch op {
+	case OpJIT, OpFireTriggers, OpInsert, OpUpdateRow, OpUpsertFind:
+		return true
+	}
+	return false
 }
 
 // explainTextOrNull renders one of the two nullable columns: C SQLite leaves
@@ -130,13 +200,23 @@ func explainTextOrNull(s string) Value {
 	return Value{Typ: Text, S: []byte(s)}
 }
 
-// explainProgram compiles the wrapped statement to the program EXPLAIN lists.
-// It is the SAME compile a plain run does -- so a statement this engine cannot
-// lower still declines here, with its own reason, rather than EXPLAIN quietly
-// answering for something that could not be run.
-func (p *ReadOnlyPager) explainProgram(inner string) (*Program, error) {
+// explainPrograms compiles the wrapped statement to the programs EXPLAIN
+// lists. It is the SAME compile a plain run does -- so a statement this engine
+// cannot lower still declines here, with its own reason, rather than EXPLAIN
+// quietly answering for something that could not be run.
+//
+// A compound compiles to one program per arm (compoundProgram.arms), not to
+// the single stream C SQLite emits with the arms inlined, and the rows the arms
+// make are combined, sorted and limited outside any program. So its listing is
+// each arm's program in turn, as the plan lists each arm's scans
+// (explainCompoundPlan).
+func (p *ReadOnlyPager) explainPrograms(inner string) ([]explainArm, error) {
 	if isExplainableWrite(inner) {
-		return p.explainWriteProgram(inner)
+		prog, err := p.explainWriteProgram(inner)
+		if err != nil {
+			return nil, err
+		}
+		return []explainArm{{prog: prog}}, nil
 	}
 	stmt, err := p.explainParse(inner)
 	if err != nil {
@@ -145,7 +225,23 @@ func (p *ReadOnlyPager) explainProgram(inner string) (*Program, error) {
 	if len(stmt.CTEs) > 0 {
 		defer p.pushCTEScope(stmt.CTEs)()
 	}
-	return p.explainCompile(stmt)
+	first := *stmt
+	first.Compound = nil
+	if len(stmt.Compound) > 0 {
+		first.OrderBy, first.Limit, first.Offset = nil, nil, nil
+	}
+	arms := []explainArm{{}}
+	cores := []*SelectStmt{&first}
+	for _, arm := range stmt.Compound {
+		arms = append(arms, explainArm{op: string(arm.Op)})
+		cores = append(cores, arm.Stmt)
+	}
+	for i, core := range cores {
+		if arms[i].prog, err = p.explainCompile(core); err != nil {
+			return nil, err
+		}
+	}
+	return arms, nil
 }
 
 // isExplainableWrite reports whether the wrapped statement is one the WRITE
@@ -195,25 +291,6 @@ func (p *ReadOnlyPager) explainParse(inner string) (*SelectStmt, error) {
 
 // explainCompile lowers the parsed statement exactly as running it would.
 func (p *ReadOnlyPager) explainCompile(stmt *SelectStmt) (*Program, error) {
-	if len(stmt.Compound) > 0 {
-		// A compound compiles to one program PER ARM here (compoundProgram.arms,
-		// vdbe_compound_codegen.go), not to the single stream C SQLite emits
-		// with the arms inlined. Listing them end to end would print each arm's
-		// own jump targets against a running address that does not exist, so
-		// this declines rather than invent a program. The arms themselves EXPLAIN
-		// individually.
-		//
-		// The QUERY PLAN form reaches this too, and for that one the reason is
-		// NOT the missing stream -- a plan needs none, only the per-arm plans
-		// and a parent tree, which this engine's flat id/parent rows do not
-		// model yet. C's shape, measured against 3.53.3: a UNION ALL with no
-		// ORDER BY is a "COMPOUND QUERY" root with a "LEFT-MOST SUBQUERY" child
-		// and one "<operator>" child per later arm, while ANY merge -- UNION,
-		// INTERSECT, EXCEPT, or a UNION ALL carrying an ORDER BY -- is instead
-		// "MERGE (<operator>)" over LEFT and RIGHT children, each also
-		// reporting "USE TEMP B-TREE FOR ORDER BY".
-		return nil, fmt.Errorf("%w: EXPLAIN of a compound SELECT: this engine compiles one program per arm, so there is no single instruction stream to list", errVDBEUnsupported)
-	}
 	if len(stmt.From) == 0 {
 		// A FROM-less SELECT is compiled by the other entry point -- execSelect
 		// picks between the two the same way.

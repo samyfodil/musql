@@ -344,3 +344,57 @@ func TestExplainThroughEngineExec(t *testing.T) {
 		t.Errorf("after four EXPLAINs: count/changes = %v, want 2/2", rows)
 	}
 }
+
+// TestExplainListingCompound: a compound lists each arm's program in turn
+// (#131), addressed as one listing, every jump landing inside its own arm, and
+// each later arm's first line naming the operator that brings it in.
+func TestExplainListingCompound(t *testing.T) {
+	p := explainDB(t)
+	for _, tc := range []struct {
+		sql string
+		ops []string
+	}{
+		{`EXPLAIN SELECT 1 a UNION ALL SELECT 2`, []string{"", "UNION ALL"}},
+		{`EXPLAIN SELECT a FROM t WHERE b > 2 UNION SELECT x FROM u WHERE y = 9`, []string{"", "UNION"}},
+		{`EXPLAIN SELECT b FROM t INTERSECT SELECT x FROM u EXCEPT SELECT 7 ORDER BY 1 LIMIT 3`, []string{"", "INTERSECT", "EXCEPT"}},
+		{`EXPLAIN VALUES (1), (2), (3)`, []string{"", "UNION ALL", "UNION ALL"}},
+	} {
+		_, rows, err := p.Query(tc.sql)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.sql, err)
+		}
+		var starts []int
+		for i, r := range rows {
+			if r[0].I != int64(i) {
+				t.Fatalf("%s: row %d addr = %d", tc.sql, i, r[0].I)
+			}
+			if string(r[1].S) == "Init" {
+				starts = append(starts, i)
+			}
+		}
+		if len(starts) != len(tc.ops) || starts[0] != 0 {
+			t.Fatalf("%s: arms start at %v, want %d arms", tc.sql, starts, len(tc.ops))
+		}
+		for k, at := range starts {
+			end := len(rows)
+			if k+1 < len(starts) {
+				end = starts[k+1]
+			}
+			comment := string(rows[at][7].S)
+			if tc.ops[k] != "" && !strings.HasPrefix(comment, tc.ops[k]+": start at ") {
+				t.Errorf("%s: arm %d begins %q", tc.sql, k, comment)
+			}
+			if got := string(rows[end-1][1].S); got != "Halt" {
+				t.Errorf("%s: arm %d ends with %s", tc.sql, k, got)
+			}
+			for i := at; i < end; i++ {
+				switch string(rows[i][1].S) {
+				case "Init", "Goto", "Rewind", "Next", "If", "IfNot", "IsNull", "NotNull", "Gosub":
+					if p2 := int(rows[i][3].I); p2 < at || p2 >= end {
+						t.Errorf("%s: %d %s jumps to %d, outside its arm [%d,%d)", tc.sql, i, rows[i][1].S, p2, at, end)
+					}
+				}
+			}
+		}
+	}
+}
