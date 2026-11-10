@@ -1,6 +1,9 @@
 package engine
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
 // inSubConvertsGroupValue reports whether "X IN (sub)" is one C answers by
 // converting X's own register, where X is a group's value the aggregate's result
@@ -375,4 +378,183 @@ func inSubConverts(v Value, plan *inSubPlan) bool {
 	}
 	aff := plan.sharedAff
 	return !affinityIsIdentity(v.Typ, aff) && applyAffinityToValue(v, aff).Typ != v.Typ
+}
+
+// groupConv is a group value an IN converts in place, as C converts the
+// AggInfo register itself: a row column (read as a GROUP BY key or a bare
+// column, one register in C) or an aggregate call (one per distinct call),
+// and the registers of the IN's own item block that hold it.
+type groupConv struct {
+	col  int       // the row column, -1 for an aggregate
+	call *FuncExpr // the aggregate call, when col is -1
+	regs []int
+}
+
+// groupConvValue is a group value as an IN of the group's result left it.
+type groupConvValue struct {
+	g *groupConv
+	v Value
+}
+
+func (g *groupConv) same(h *groupConv) bool {
+	if g.col >= 0 || h.col >= 0 {
+		return g.col == h.col
+	}
+	return exprEqual(*g.call, *h.call)
+}
+
+// groupValueConv is the conversion this IN can make as C makes it, or nil:
+// the IN must be coded at its item's own level (a subquery body reads a copy
+// of the group's register), its probe one of the item's group registers, and
+// nothing in the result may read the value where the converted one cannot
+// reach it.
+func (c *compiler) groupValueConv(x Expr, probeReg int) *groupConv {
+	ph, _ := groupValueOperand(x)
+	regs := c.aggRegs
+	if ph == nil || regs == nil || regs.owner == nil || c.groupValueRegs(ph) != regs {
+		return nil
+	}
+	plan := regs.owner
+	g := &groupConv{col: -1}
+	switch p := ph.(type) {
+	case groupKeyExpr:
+		if g.col = plan.keyColumn(p.idx); g.col < 0 {
+			return nil
+		}
+	case groupBareColExpr:
+		if p.isRowid {
+			return nil
+		}
+		g.col = p.idx
+	case groupAggExpr:
+		if g.call = templateCall(regs.item, p.accIdx); g.call == nil {
+			return nil
+		}
+	}
+	if g.col >= 0 {
+		for k, r := range regs.key {
+			if plan.keyColumn(k) == g.col {
+				g.regs = append(g.regs, r)
+			}
+		}
+		if g.col < len(regs.col) {
+			g.regs = append(g.regs, regs.col[g.col])
+		}
+	} else {
+		for i, r := range regs.agg {
+			if call := templateCall(regs.item, i); call != nil && exprEqual(*call, *g.call) {
+				g.regs = append(g.regs, r)
+			}
+		}
+	}
+	if !slices.Contains(g.regs, probeReg) || !regs.convReachable(g) {
+		return nil
+	}
+	return g
+}
+
+// convReachable reports whether every read of g's value in the aggregate's
+// result is a register of an item block, which sees the converted value: in
+// the IN's own item through g.regs, in any item after it through the group's
+// record (aggAccumulators.conv). A subquery body reads the item's register as
+// it runs (OpOuterAggReg); a window value does not.
+func (regs *aggResultRegs) convReachable(g *groupConv) bool {
+	plan := regs.owner
+	ok := true
+	var walk func(Expr)
+	walk = func(e Expr) {
+		if e == nil || !ok {
+			return
+		}
+		switch x := e.(type) {
+		case windowResultExpr:
+			ok = false
+			return
+		case groupKeyExpr:
+			if x.owner != nil && x.owner != plan {
+				ok = false
+				return
+			}
+			// A GROUP BY expression is a key register of its own, which a
+			// result expression it matches reads (analyzeAggregate).
+			ok = plan.keyColumn(x.idx) != -2
+			return
+		case groupBareColExpr, groupAggExpr:
+			return
+		}
+		walkExprOperands(e, walk)
+	}
+	items := append([]*itemPlan{plan.havingPlan}, plan.outPlans...)
+	for _, op := range plan.orderPlans {
+		items = append(items, op.item)
+	}
+	for _, it := range items {
+		switch {
+		case it == nil:
+		case it == regs.item:
+			walk(regs.tree)
+		default:
+			walk(it.rewritten)
+		}
+	}
+	return ok
+}
+
+// convertGroupValue converts the probe's group value in place, as C's
+// OP_Affinity on rLhs does (expr.c:4164), in every register of the item that
+// holds it, and records it for the items evaluated after this one.
+func (m *vdbe) convertGroupValue(plan *inSubPlan, v Value) {
+	if plan.sharedReal && v.Typ == Int {
+		v = Value{Typ: Float, F: float64(v.I)}
+	}
+	v = applyAffinityToValue(v, plan.sharedAff)
+	for _, r := range plan.conv.regs {
+		m.regs[r] = v
+	}
+	conv := *m.aggConv
+	for i := range conv {
+		if conv[i].g.same(plan.conv) {
+			conv[i].v = v
+			return
+		}
+	}
+	*m.aggConv = append(conv, groupConvValue{g: plan.conv, v: v})
+}
+
+// convertedGroup is the group's values item it reads, with those an IN of
+// the group's result converted: aggVals in place (it is this call's own), the
+// key and the anchor row copied (they are the group's).
+func (m *vdbe) convertedGroup(plan *aggPlan, it *itemPlan, aggVals, groupKey, bareVals []Value) ([]Value, []Value) {
+	var key, cols []Value
+	for _, cv := range m.aggAccs.conv {
+		if cv.g.col < 0 {
+			for i := range aggVals {
+				if call := templateCall(it, i); call != nil && exprEqual(*call, *cv.g.call) {
+					aggVals[i] = cv.v
+				}
+			}
+			continue
+		}
+		for k := range groupKey {
+			if plan.keyColumn(k) == cv.g.col {
+				if key == nil {
+					key = append(growValues(&m.convKeyBuf, 0), groupKey...)
+				}
+				key[k] = cv.v
+			}
+		}
+		if cv.g.col < len(bareVals) {
+			if cols == nil {
+				cols = append(growValues(&m.convColBuf, 0), bareVals...)
+			}
+			cols[cv.g.col] = cv.v
+		}
+	}
+	if key != nil {
+		groupKey = key
+	}
+	if cols != nil {
+		bareVals = cols
+	}
+	return groupKey, bareVals
 }

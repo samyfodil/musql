@@ -897,6 +897,9 @@ type inSubPlan struct {
 	// is stored as.
 	shared, sharedReal bool
 	sharedAff          affinity
+	// conv is the group value converted in place, as C converts its register,
+	// when this engine can (groupValueConv); nil leaves the IN to decline.
+	conv *groupConv
 }
 
 // rowSubPlan is the P4 payload of OpRowSub: a ROW-VALUE comparison one of

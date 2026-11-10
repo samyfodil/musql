@@ -160,6 +160,13 @@ type vdbe struct {
 	// aggSubCaches is each item program's run-once cache (aggItemVM), kept for
 	// the machine's one run of its program (the pool's scrub drops it).
 	aggSubCaches map[*Program][]subCacheEntry
+	// aggConv is the group's record of the values an IN in the item program
+	// running on this machine converted in place (inSubPlan.conv); nil where
+	// the item runs out of C's order, which leaves such an IN to decline.
+	aggConv *[]groupConvValue
+	// convKeyBuf and convColBuf hold a group's key and anchor row as an IN of
+	// its result converted them (convertedGroup).
+	convKeyBuf, convColBuf []Value
 
 	// aggKeyBuf is hashAggStep's reusable group-key encoding buffer -- see its
 	// doc comment for why handing back the same bytes every row is safe.
@@ -3236,7 +3243,10 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			xs := m.regs[op.P1 : op.P1+len(plan.affs)]
 			if plan.shared && inSubConverts(xs[0], plan) {
-				return nil, fmt.Errorf("%w: an IN converts a group's value that C SQLite shares with the rest of the aggregate's result", errVDBEUnsupported)
+				if plan.conv == nil || m.aggConv == nil {
+					return nil, fmt.Errorf("%w: an IN converts a group's value that C SQLite shares with the rest of the aggregate's result", errVDBEUnsupported)
+				}
+				m.convertGroupValue(plan, xs[0])
 			}
 			if set := m.inSetFor(plan, op.P3, rows); set != nil {
 				m.regs[op.P2] = set.membership(xs[0], plan.not)

@@ -327,11 +327,17 @@ func compileScanAggregate(c *compiler, stmt *SelectStmt, srcs []joinSource, scop
 	// Finalize + evaluate every output item into the result registers. This
 	// always runs (even when LIMIT 0 / OFFSET>=1 will suppress the row), so any
 	// evaluation error still surfaces.
-	if !c.isExistsBody(stmt) {
-		// See isExistsBody: the output list of an EXISTS is never evaluated.
-		for i := range outCols {
-			c.emit(Instruction{Op: OpAggResult, P1: resultBase + i, P3: -1, P4: &aggResultInfo{plan: plan, set: aggSetOut, idx: i}})
+	conv := plan.converts()
+	outputs := func() {
+		if !c.isExistsBody(stmt) {
+			// See isExistsBody: the output list of an EXISTS is never evaluated.
+			for i := range outCols {
+				c.emit(Instruction{Op: OpAggResult, P1: resultBase + i, P3: -1, P4: &aggResultInfo{plan: plan, set: aggSetOut, idx: i, conv: conv}})
+			}
 		}
+	}
+	if !conv || plan.havingPlan == nil {
+		outputs()
 	}
 	skipRow := (stmt.Offset != nil && *stmt.Offset >= 1) || (stmt.Limit != nil && *stmt.Limit == 0)
 	// HAVING gates the one row, evaluated AFTER the outputs so an evaluation
@@ -339,11 +345,19 @@ func compileScanAggregate(c *compiler, stmt *SelectStmt, srcs []joinSource, scop
 	// suppresses the row entirely ("SELECT count(*) FROM t1 HAVING NULL" and
 	// "... HAVING 'abc'" both return zero rows -- verified directly), which is
 	// the one way a whole-table aggregate can fail to return its single row.
+	// When an IN converts a group value the items run in C's order instead:
+	// every aggregate finalized, HAVING, then the select list.
 	havingJump := -1
 	if plan.havingPlan != nil {
 		havingReg := c.alloc()
-		c.emit(Instruction{Op: OpAggResult, P1: havingReg, P3: -1, P4: &aggResultInfo{plan: plan, set: aggSetHaving, idx: 0}})
+		if conv {
+			c.emit(Instruction{Op: OpAggResult, P1: havingReg, P3: -1, P4: &aggResultInfo{plan: plan, set: aggSetFinal, conv: true}})
+		}
+		c.emit(Instruction{Op: OpAggResult, P1: havingReg, P3: -1, P4: &aggResultInfo{plan: plan, set: aggSetHaving, idx: 0, conv: conv}})
 		havingJump = c.emit(Instruction{Op: OpIfNot, P1: havingReg, P3: 1})
+		if conv {
+			outputs()
+		}
 	}
 	if boundJump >= 0 {
 		c.patch(boundJump, c.here())
@@ -2308,8 +2322,9 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// key and curEmitSeqReg as its emission ordinal (the ORDER BY tiebreak).
 	// It is emitted twice (at a boundary, and for the final group),
 	// self-contained each time.
+	omit, byMade, conv := aggConvOrder(plan, gp, hasOrder && !useDistinctBatch)
 	emitGroup := func() {
-		skipJumps := c.emitGroupOutputs(stmt, plan, gp, nOut, outBase, havingReg, curKeyRec)
+		skipJumps := c.emitGroupOutputs(stmt, plan, gp, nOut, outBase, havingReg, curKeyRec, omit, conv)
 		switch {
 		case useDistinctBatch:
 			// Collect this group's entry -- [minSeq, groupKey.., out..,
@@ -2321,10 +2336,14 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 			// never allocates.
 			if hasOrder {
 				for i, op := range gp.orderPlans {
+					if byMade {
+						c.emit(Instruction{Op: OpNull, P2: orderKeyBase + i})
+						continue
+					}
 					if op.ordinal > 0 {
 						c.emit(Instruction{Op: OpSCopy, P1: outBase + (op.ordinal - 1), P2: orderKeyBase + i})
 					} else {
-						c.emit(Instruction{Op: OpAggResult, P1: orderKeyBase + i, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetOrder, idx: i}})
+						c.emit(Instruction{Op: OpAggResult, P1: orderKeyBase + i, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetOrder, idx: i, conv: conv}})
 					}
 				}
 			}
@@ -2343,7 +2362,7 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 			c.emit(Instruction{Op: OpMakeRecord, P1: batchBase, P2: batchWidth, P3: batchRecReg})
 			c.emit(Instruction{Op: OpGroupBatchAppend, P1: batchRecReg})
 		case hasOrder:
-			c.emitGroupOrderInsert(plan, gp, sorter2, sort2Base, nOut, curEmitSeqReg, curKeyRec, rec2Reg)
+			c.emitGroupOrderInsert(plan, gp, sorter2, sort2Base, nOut, curEmitSeqReg, curKeyRec, rec2Reg, omit, byMade, conv)
 		default:
 			skipJumps = append(skipJumps, c.emitLimitOffsetGate(offsetReg, limitReg, oneReg, haveOffset, haveLimit, outBase, nOut)...)
 		}
@@ -2725,9 +2744,10 @@ func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp
 	if ordered {
 		c.emit(Instruction{Op: OpAdd, P1: oneSeq, P2: seqReg, P3: seqReg})
 	}
-	skipJumps := c.emitGroupOutputs(stmt, plan, gp, nOut, outBase, havingReg, curKeyRec)
+	omit, byMade, conv := aggConvOrder(plan, gp, ordered)
+	skipJumps := c.emitGroupOutputs(stmt, plan, gp, nOut, outBase, havingReg, curKeyRec, omit, conv)
 	if ordered {
-		c.emitGroupOrderInsert(plan, gp, sorter2, sort2Base, nOut, seqReg, curKeyRec, rec2Reg)
+		c.emitGroupOrderInsert(plan, gp, sorter2, sort2Base, nOut, seqReg, curKeyRec, rec2Reg, omit, byMade, conv)
 	} else {
 		skipJumps = append(skipJumps, c.emitLimitOffsetGate(offsetReg, limitReg, oneReg, haveOffset, haveLimit, outBase, nOut)...)
 	}
@@ -2829,14 +2849,23 @@ func (c *compiler) openGroupOrderSorter(gp *groupByPlan) int {
 // emitGroupOrderInsert puts a group into its ORDER BY sorter: the record
 // [orderKeys.., ordinal, out..] at sort2Base, the outputs already in place at
 // its tail, each key a copy of the output it names or computed for the group.
-func (c *compiler) emitGroupOrderInsert(plan *aggPlan, gp *groupByPlan, sorter2, sort2Base, nOut, seqReg, curKeyRec, rec2Reg int) {
+func (c *compiler) emitGroupOrderInsert(plan *aggPlan, gp *groupByPlan, sorter2, sort2Base, nOut, seqReg, curKeyRec, rec2Reg int, omit []bool, byMade, conv bool) {
 	nOrder := len(gp.orderPlans)
 	outBase := sort2Base + nOrder + 1
 	for i, op := range gp.orderPlans {
+		if byMade {
+			// The groups in the order they were made: the sequence decides.
+			c.emit(Instruction{Op: OpNull, P2: sort2Base + i})
+			continue
+		}
 		if op.ordinal > 0 {
+			if omit != nil && omit[op.ordinal-1] {
+				// The column this term names, coded at the term's place.
+				c.emit(Instruction{Op: OpAggResult, P1: outBase + (op.ordinal - 1), P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetOut, idx: op.ordinal - 1, conv: conv}})
+			}
 			c.emit(Instruction{Op: OpSCopy, P1: outBase + (op.ordinal - 1), P2: sort2Base + i})
 		} else {
-			c.emit(Instruction{Op: OpAggResult, P1: sort2Base + i, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetOrder, idx: i}})
+			c.emit(Instruction{Op: OpAggResult, P1: sort2Base + i, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetOrder, idx: i, conv: conv}})
 		}
 	}
 	c.emit(Instruction{Op: OpSCopy, P1: seqReg, P2: sort2Base + nOrder})
@@ -4563,12 +4592,15 @@ func minMaxRowidQuery(c *compiler, stmt *SelectStmt, srcs []joinSource, plan *ag
 // item names one the select list is evaluated first, its finalizing raising
 // for every group as C's does; where none does, HAVING comes first, and a
 // group it drops evaluates nothing more, as in C.
-func (c *compiler) emitGroupOutputs(stmt *SelectStmt, plan *aggPlan, gp *groupByPlan, nOut, outBase, havingReg, curKeyRec int) []int {
+func (c *compiler) emitGroupOutputs(stmt *SelectStmt, plan *aggPlan, gp *groupByPlan, nOut, outBase, havingReg, curKeyRec int, omit []bool, conv bool) []int {
 	outputs := func() {
 		if !c.isExistsBody(stmt) {
 			// See isExistsBody: the output list of an EXISTS is never evaluated.
 			for i := 0; i < nOut; i++ {
-				c.emit(Instruction{Op: OpAggResult, P1: outBase + i, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetOut, idx: i}})
+				if omit != nil && omit[i] {
+					continue
+				}
+				c.emit(Instruction{Op: OpAggResult, P1: outBase + i, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetOut, idx: i, conv: conv}})
 			}
 		}
 	}
@@ -4582,14 +4614,103 @@ func (c *compiler) emitGroupOutputs(stmt *SelectStmt, plan *aggPlan, gp *groupBy
 			havingFirst = false
 		}
 	}
+	if !havingFirst && conv {
+		// An IN converts a group value, so the items run in C's order: every
+		// aggregate finalized, HAVING, then the select list.
+		c.emit(Instruction{Op: OpAggResult, P1: havingReg, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetFinal, conv: true}})
+		havingFirst = true
+	}
 	if !havingFirst {
 		outputs()
 	}
-	c.emit(Instruction{Op: OpAggResult, P1: havingReg, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetHaving, idx: 0}})
+	c.emit(Instruction{Op: OpAggResult, P1: havingReg, P3: curKeyRec, P4: &aggResultInfo{plan: plan, set: aggSetHaving, idx: 0, conv: conv}})
 	// HAVING false or NULL -> skip this group's output.
 	skip := c.emit(Instruction{Op: OpIfNot, P1: havingReg, P3: 1})
 	if havingFirst {
 		outputs()
 	}
 	return []int{skip}
+}
+
+// aggConvOrder is how plan's result runs in C's order when an IN in it
+// converts a group value (aggPlan.converts), or ok false. With an ORDER BY
+// sorter and no DISTINCT, selectInnerLoop codes a select-list column an ORDER
+// BY term names at that term's place, after the other columns, once for each
+// term naming it (SQLITE_ECEL_OMITREF): omit marks those columns. C drops the
+// sorter when the ORDER BY is the GROUP BY's own list (sqlite3ExprListCompare,
+// select.c): the groups come out as they are made (byMade), and keys the
+// conversion changed must not sort them. A term written as a column's
+// expression is not followed here.
+func aggConvOrder(plan *aggPlan, gp *groupByPlan, sorted bool) (omit []bool, byMade, ok bool) {
+	if !plan.converts() {
+		return nil, false, false
+	}
+	byMade = orderIsGroupList(plan, gp)
+	sorted = sorted && !byMade
+	omit = make([]bool, len(plan.outPlans))
+	for _, op := range gp.orderPlans {
+		switch {
+		case op.ordinal > 0:
+			if sorted {
+				omit[op.ordinal-1] = true
+			}
+		case op.item != nil:
+			for _, out := range plan.outPlans {
+				if exprEqual(op.item.rewritten, out.rewritten) {
+					return nil, false, false
+				}
+			}
+		}
+	}
+	return omit, byMade, true
+}
+
+// orderIsGroupList reports whether the ORDER BY is the GROUP BY's list,
+// term for term: each term the key at its own position, or the column it is.
+func orderIsGroupList(plan *aggPlan, gp *groupByPlan) bool {
+	if len(gp.orderPlans) != len(gp.groupExprs) {
+		return false
+	}
+	for i, op := range gp.orderPlans {
+		e := Expr(nil)
+		switch {
+		case op.ordinal > 0:
+			e = plan.outPlans[op.ordinal-1].rewritten
+		case op.item != nil:
+			e = op.item.rewritten
+		}
+		switch k := e.(type) {
+		case groupKeyExpr:
+			if k.idx != i {
+				return false
+			}
+		case groupBareColExpr:
+			if k.isRowid || k.idx != plan.keyColumn(i) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// converts reports whether an IN in plan's result converts a group value in
+// place (inSubPlan.conv).
+func (plan *aggPlan) converts() bool {
+	items := append([]*itemPlan{plan.havingPlan}, plan.outPlans...)
+	for _, op := range plan.orderPlans {
+		items = append(items, op.item)
+	}
+	for _, it := range items {
+		if it == nil || it.prog == nil || it.prog.prog == nil {
+			continue
+		}
+		for _, in := range it.prog.prog.Insns {
+			if p, ok := in.P4.(*inSubPlan); ok && in.Op == OpInSub && p.conv != nil {
+				return true
+			}
+		}
+	}
+	return false
 }
