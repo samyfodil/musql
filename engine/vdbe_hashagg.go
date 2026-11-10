@@ -55,6 +55,9 @@ type aggSlab struct {
 	sets    [][]*aggItem
 	vals    []Value
 	keys    []byte
+	// nVals is the values every group so far asked for, which sizes the next
+	// chunk of them.
+	nVals int
 }
 
 // key is k as a string carved from the slab's bytes, which nothing writes
@@ -121,10 +124,17 @@ func (s *aggSlab) acc() *aggAccumulators {
 
 func (s *aggSlab) values(vs []Value) []Value {
 	n := len(vs)
+	s.nVals += n
 	if len(s.vals) < n {
 		// A group asks for its key, its anchor and its rowids in turn, so a
-		// chunk sized by one request would leave too little for the next.
-		s.vals = make([]Value, max(n, s.chunk(1)*16))
+		// chunk sized by one request would leave too little for the next:
+		// it holds the chunk's groups at what the groups made so far took
+		// each, or 16 before there are any.
+		per := 16
+		if s.n > 0 {
+			per = s.nVals/s.n + 1
+		}
+		s.vals = make([]Value, max(n, s.chunk(1)*per))
 	}
 	out := s.vals[:n:n]
 	s.vals = s.vals[n:]
