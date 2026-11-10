@@ -174,9 +174,12 @@ func (s *Store) SigningKeys(ctx context.Context) ([]*SigningKey, error) {
 	return out, rows.Err()
 }
 
-// AddSigningKey stores a key.
+// AddSigningKey stores a key, ErrExists when its kid is stored already.
 func (s *Store) AddSigningKey(ctx context.Context, k *SigningKey) error {
 	_, err := s.exec(ctx, `INSERT INTO signing_keys (kid, private_key, created_at, max_exp) VALUES (?, ?, ?, ?)`, k.KID, k.PrivateKey, k.CreatedAt.Unix(), k.MaxExp)
+	if isUnique(err) {
+		return ErrExists
+	}
 	return err
 }
 

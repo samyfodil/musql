@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/samyfodil/musql/cloud/cluster"
 	v1 "github.com/samyfodil/musql/cloud/gen/cloud/v1"
 	"github.com/samyfodil/musql/cloud/oidc"
 	"github.com/samyfodil/musql/cloud/state"
@@ -105,8 +107,11 @@ func (s *Server) admin(ctx context.Context, h http.Header) (*state.User, error) 
 	return u, nil
 }
 
-// rpcErr maps state errors onto Connect codes; anything else is internal and
-// its text is not shown.
+// rpcErr maps state errors onto Connect codes. One that is the cluster's for
+// the moment (an election, a master out of reach, a leader that changed before
+// the write reached its log) is Unavailable, which a client retries; one whose
+// write the leader may have committed as it lost the leadership is Unknown,
+// which it must not. Anything else is internal: its text is logged, not shown.
 func rpcErr(err error) error {
 	var ce *connect.Error
 	switch {
@@ -120,7 +125,12 @@ func rpcErr(err error) error {
 		return connect.NewError(connect.CodeAlreadyExists, errors.New("already exists"))
 	case errors.Is(err, state.ErrInUse):
 		return connect.NewError(connect.CodeFailedPrecondition, errors.New("still in use"))
+	case errors.Is(err, cluster.ErrOutcomeUnknown):
+		return connect.NewError(connect.CodeUnknown, cluster.ErrOutcomeUnknown)
+	case state.Unavailable(err), errors.Is(err, errNoMaster), errors.Is(err, cluster.ErrNotLeader):
+		return connect.NewError(connect.CodeUnavailable, errNoMaster)
 	}
+	log.Printf("musql-cloud: internal error: %v", err)
 	return connect.NewError(connect.CodeInternal, errors.New("internal error"))
 }
 
