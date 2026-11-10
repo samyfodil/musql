@@ -163,26 +163,26 @@ func segClassifyServices(body []Instruction, cursor int, native func(Instruction
 			svc[i] = true
 		}
 	}
-	for changed := true; changed; {
-		changed = false
-		readers, writers := map[int][]int{}, map[int][]int{}
-		for i, in := range body {
-			r, w, _, _ := segInsnRegs(in)
-			if _, _, _, ok := segInsnRegs(in); !ok {
-				r = nil
-				for _, x := range segLowerRegOperands(in) {
-					if x >= 0 {
-						r = append(r, x)
-					}
+	readers, writers := map[int][]int{}, map[int][]int{}
+	for i, in := range body {
+		r, w, _, ok := segInsnRegs(in)
+		if !ok {
+			r = nil
+			for _, x := range segLowerRegOperands(in) {
+				if x >= 0 {
+					r = append(r, x)
 				}
 			}
-			for _, x := range r {
-				readers[x] = append(readers[x], i)
-			}
-			for _, x := range w {
-				writers[x] = append(writers[x], i)
-			}
 		}
+		for _, x := range r {
+			readers[x] = append(readers[x], i)
+		}
+		for _, x := range w {
+			writers[x] = append(writers[x], i)
+		}
+	}
+	for changed := true; changed; {
+		changed = false
 		allSvc := func(is []int) bool {
 			for _, i := range is {
 				if !svc[i] {
