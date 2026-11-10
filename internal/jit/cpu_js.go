@@ -34,4 +34,4 @@ const VMTextOrder = false
 
 // VMRealInts reports whether VFAdd, VFSub and VFMul over two INTEGERs run the
 // INTEGER arm rather than exit.
-const VMRealInts = false
+const VMRealInts = true
