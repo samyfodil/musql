@@ -453,6 +453,13 @@ func (e *vmEmit) forget() {
 // unmap forgets which machine register holds key.
 func (e *vmEmit) unmap(key int) { delete(e.holds, key) }
 
+// unmapCursor forgets what is held for cursor c, which is moving: its address
+// and its row's.
+func (e *vmEmit) unmapCursor(c int) {
+	e.unmap(^c)
+	e.unmap(vmRowKey(c))
+}
+
 // clobber records that native code changed r[r] other than by storeInt.
 func (e *vmEmit) clobber(r int) {
 	e.unmap(r)
@@ -975,7 +982,7 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		}
 		e.storeInt(pc, in, in.C, m)
 	case VRewind:
-		e.unmap(^in.A)
+		e.unmapCursor(in.A)
 		cb := int32(in.A * VCursorSize)
 		a.MovRegMemD(RAX, RDI, POffCur)
 		a.CmpMemDImm8(RAX, cb+VCursorOffOk, 0)
@@ -991,7 +998,7 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		patch(a.buf, nonEmpty+2, len(a.buf))
 		a.MovMemDImm(RAX, cb+VCursorOffLast, 0)
 	case VNext:
-		e.unmap(^in.A)
+		e.unmapCursor(in.A)
 		cb := int32(in.A * VCursorSize)
 		a.MovRegMemD(RAX, RDI, POffCur)
 		a.CmpMemDImm8(RAX, cb+VCursorOffOk, 0)
@@ -1015,7 +1022,7 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		a.MovMemDReg(RAX, cb+VCursorOffPos, RDX)
 		a.MovMemDImm(RAX, cb+VCursorOffDirty, 1)
 	case VOpen, VClose:
-		e.unmap(^in.A)
+		e.unmapCursor(in.A)
 		cb := int32(in.A * VCursorSize)
 		a.MovRegMemD(RAX, RDI, POffCur)
 		a.CmpMemDImm8(RAX, cb+VCursorOffReop, 0)

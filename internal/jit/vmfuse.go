@@ -481,6 +481,9 @@ func vmEmitNextUseIn(prog []VInsn, steps []progStep, bound []bool, key, pc int) 
 		in := prog[q]
 		if key < 0 {
 			c := ^key
+			if c >= vmRowKeyBase {
+				c -= vmRowKeyBase
+			}
 			switch {
 			case in.Op == VColumn && in.A == c:
 				return q
@@ -504,6 +507,15 @@ func vmEmitNextUseIn(prog []VInsn, steps []progStep, bound []bool, key, pc int) 
 	}
 	return -1
 }
+
+// vmRowKeyBase sets apart a cursor's second held key, vmRowKey: the address of
+// the row a segment-capable cursor is on when it reads its row list, next to
+// ^c, the cursor's own.
+const vmRowKeyBase = 1 << 16
+
+// vmRowKey is cursor c's row key: wanted where c's cursor key is, and dropped
+// with it.
+func vmRowKey(c int) int { return ^(c + vmRowKeyBase) }
 
 // vmMovesCursor reports whether op moves its cursor off the row a VColumn
 // before it read.

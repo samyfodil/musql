@@ -1,6 +1,9 @@
 package jit
 
-import "strconv"
+import (
+	"math/bits"
+	"strconv"
+)
 
 // condCarry and condParity are x86's JB (a BT that found the bit set) and JP
 // (an unordered UCOMISD: a NaN).
@@ -39,6 +42,61 @@ func (a *Asm) MovRegMemD32(dst, base Reg, disp int32) {
 // (holds[^A]); each read then tests only that its column is plain (no NULL
 // bitmap, no exceptions) and of the kind predicted, and goes straight to that
 // kind's read. Anything else takes the full read below.
+// predictedRowRead is segColumn's predicted read of a cursor on its row list,
+// reached at label prows with base the cursor's address and RDX its position:
+// the run's first read of the cursor checks the row is as wide as every
+// column the run predicts (mask) and keeps the row's address (vmRowKey), and
+// every later one reads from that, as column does for a plain cursor. Without
+// a register to keep it in, a read takes the row list's full read.
+func (e *vmEmit) predictedRowRead(pc int, in VInsn, base Reg, first bool, mask uint64, l func(string) string) {
+	a, L := e.a, e.lay
+	a.Label(l("prows"))
+	row, have := e.holds[vmRowKey(in.A)]
+	if !have && first {
+		if u := e.nextUse(vmRowKey(in.A), pc); u >= 0 {
+			if m, ok := e.alloc(pc, u, true); ok {
+				row, have = m, true
+				a.MovRegImm64(R10, sliceHeaderSize)
+				a.ImulRegReg(RDX, R10)
+				a.AddRegMemD(RDX, base, VCursorOffRows)
+				a.MovRegMemD(R10, RDX, 8) // the row's length
+				a.CmpRegImm32(R10, int32(bits.Len64(mask)-1))
+				e.jccStub(condBelowEq, pc) // a row narrower than a column: the VDBE's
+				a.MovRegMemD(row, RDX, 0)
+				e.holds[vmRowKey(in.A)] = row
+			}
+		}
+	}
+	if !have {
+		a.MovRegMemD(RAX, RDI, POffCur)
+		a.Jmp(l("rows"))
+		return
+	}
+	e.pinned[row] = true
+	dst := e.d(in.C, 0)
+	vb := int32(in.B) * int32(L.Size)
+	// As column copies: the string words only when the column or the
+	// destination holds a string, with the write barrier off.
+	a.MovRegMemD(RDX, row, vb+int32(L.OffS))
+	if !e.know.noS[in.C] {
+		a.AluRegMemD(AluOr, RDX, RSI, dst+int32(L.OffS))
+	} else {
+		a.TestRegReg(RDX, RDX)
+	}
+	e.coldPath(func() {
+		e.jccWB(pc)
+		for _, off := range []int{L.OffS, L.OffS + 8, L.OffS + 16} {
+			a.MovRegMemD(RDX, row, vb+int32(off))
+			a.MovMemDReg(RSI, dst+int32(off), RDX)
+		}
+	})
+	for _, off := range []int{0, L.OffI, L.OffF} {
+		a.MovRegMemD(RDX, row, vb+int32(off))
+		a.MovMemDReg(RSI, dst+int32(off), RDX)
+	}
+	a.Jmp(l("done"))
+}
+
 func (e *vmEmit) segColumn(pc int, in VInsn) {
 	a, L := e.a, e.lay
 	cb := int32(in.A * VCursorSize)
@@ -50,10 +108,10 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 	kindLabel := map[int64]string{VSegInt: "int", VSegFloat: "float", VSegNumeric: "num", VSegIntReal: "intreal", VSegRowid: "rowid", VSegText: "text"}
 	if name, ok := kindLabel[int64(in.T)]; ok {
 		base, have := e.holds[^in.A]
+		first, mask := !have, uint64(1)<<uint(in.B)
 		if have {
 			e.pinned[base] = true
 		} else {
-			mask := uint64(1) << uint(in.B)
 			if e.cache {
 				mask = vmRunPredicted(e.prog, e.bound, pc)
 			}
@@ -93,14 +151,10 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 		a.CmpMemDImm8(R10, VSegColOffPlain, int8(in.T))
 		a.Jcc(CondE, l(name))
 		a.Jmp(l("full"))
-		// A cursor reading its row list: the checks above hold and RDX is
-		// its position.
-		a.Label(l("prows"))
-		a.MovRegMemD(RAX, RDI, POffCur)
-		a.Jmp(l("rows"))
+		e.predictedRowRead(pc, in, base, first, mask, l)
 		a.Label(l("full"))
 	} else {
-		e.unmap(^in.A)
+		e.unmapCursor(in.A)
 	}
 
 	a.MovRegMemD(RAX, RDI, POffCur)
@@ -127,10 +181,18 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 	e.jccStub(condBelowEq, pc) // a row narrower than the column: the VDBE's
 	a.MovRegMemD(R9, RDX, 0)
 	vb := int32(in.B) * int32(L.Size)
+	// The string words only when the column or the destination holds a
+	// string, as column copies.
 	a.MovRegMemD(RDX, R9, vb+int32(L.OffS))
-	a.TestRegReg(RDX, RDX)
-	e.coldPath(func() { e.jccWB(pc) })
-	for _, off := range []int{0, L.OffI, L.OffF, L.OffS, L.OffS + 8, L.OffS + 16} {
+	a.AluRegMemD(AluOr, RDX, RSI, dst+int32(L.OffS))
+	e.coldPath(func() {
+		e.jccWB(pc)
+		for _, off := range []int{L.OffS, L.OffS + 8, L.OffS + 16} {
+			a.MovRegMemD(RDX, R9, vb+int32(off))
+			a.MovMemDReg(RSI, dst+int32(off), RDX)
+		}
+	})
+	for _, off := range []int{0, L.OffI, L.OffF} {
 		a.MovRegMemD(RDX, R9, vb+int32(off))
 		a.MovMemDReg(RSI, dst+int32(off), RDX)
 	}
@@ -272,6 +334,14 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 	a.Label(l("done"))
 	e.unmap(in.C)
 	e.know.wroteAny(in.C, false)
+	// The I word kept for the run's next read of r[C], as column keeps it:
+	// loaded once here, where every way of reading the column has stored it.
+	if u := e.nextUse(in.C, pc); u >= 0 {
+		if m, ok := e.alloc(pc, u, false); ok {
+			a.MovRegMemD(m, RSI, e.d(in.C, L.OffI))
+			e.holds[in.C] = m
+		}
+	}
 }
 
 // AddRegMemD is  dst += [base+disp].
@@ -284,7 +354,7 @@ func (a *Asm) AddRegMemD(dst, base Reg, disp int32) { a.AluRegMemD(AluAdd, dst, 
 func (e *vmEmit) seekRowid(pc int, in VInsn) {
 	a, L := e.a, e.lay
 	cb := int32(in.A * VCursorSize)
-	e.unmap(^in.A)
+	e.unmapCursor(in.A)
 	pre := "sk" + strconv.Itoa(pc) + "."
 	l := func(s string) string { return pre + s }
 	a.CmpMemDByte(RSI, e.d(in.B, L.OffTyp), L.TypInt)
@@ -392,7 +462,7 @@ func (e *vmEmit) seekRowid(pc int, in VInsn) {
 func (e *vmEmit) seekIdx(pc int, in VInsn) {
 	a, L := e.a, e.lay
 	cb := int32(in.A * VCursorSize)
-	e.unmap(^in.A)
+	e.unmapCursor(in.A)
 	pre := "si" + strconv.Itoa(pc) + "."
 	l := func(s string) string { return pre + s }
 	a.CmpMemDByte(RSI, e.d(in.B, L.OffTyp), L.TypInt)
@@ -525,7 +595,7 @@ func (e *vmEmit) seekIdxServed(cur, tmp Reg, served, skip string) {
 func (e *vmEmit) seekRewind(pc int, in VInsn) {
 	a := e.a
 	cb := int32(in.A * VCursorSize)
-	e.unmap(^in.A)
+	e.unmapCursor(in.A)
 	a.MovRegMemD(RAX, RDI, POffCur)
 	a.CmpMemDImm8(RAX, cb+VCursorOffState, 2)
 	e.jccStub(CondNE, pc)
