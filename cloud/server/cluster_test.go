@@ -5,11 +5,13 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,18 +40,27 @@ type clusterNode struct {
 var locations = []string{"fra", "iad", "sea"}
 
 // freePorts are n TCP ports free on 127.0.0.1 a moment ago, all different:
-// each is held until the last is picked, so the kernel cannot hand one out
-// twice.
+// each is held until the last is picked. They are below every platform's
+// ephemeral range (Linux's from 32768, macOS's and Windows' from 49152), so
+// between this and a node's listen the kernel cannot hand one to an httptest
+// server or an outgoing dial, as a port it picked itself could be.
 func freePorts(t *testing.T, n int) []int {
 	t.Helper()
-	ports := make([]int, n)
-	for i := range ports {
-		l, err := net.Listen("tcp", "127.0.0.1:0")
+	ports := make([]int, 0, n)
+	for try := 0; len(ports) < n; try++ {
+		if try > 1000 {
+			t.Fatal("no free port below the ephemeral range")
+		}
+		p := 20000 + rand.IntN(12000)
+		if slices.Contains(ports, p) {
+			continue
+		}
+		l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
 		if err != nil {
-			t.Fatal(err)
+			continue
 		}
 		defer l.Close()
-		ports[i] = l.Addr().(*net.TCPAddr).Port
+		ports = append(ports, p)
 	}
 	return ports
 }
