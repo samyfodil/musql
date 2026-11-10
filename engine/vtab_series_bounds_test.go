@@ -109,6 +109,9 @@ func TestSeriesBoundsAsC(t *testing.T) {
 		{`SELECT count(*) FROM generate_series(1,10) WHERE value = '5' AND step = '1'`, "1"},
 		{`SELECT count(*) FROM generate_series(1,10,'2') WHERE step = '2'`, "5"},
 		{`SELECT count(*) FROM generate_series(1,10) AS s CROSS JOIN (SELECT 5 AS x) AS t WHERE s.value = '5' AND s.value = t.x`, "0"},
+		{`SELECT count(*) FROM generate_series(1,3) WHERE start IN (1,2)`, "3"},
+		{`SELECT count(*) FROM generate_series WHERE start IN (1,2) AND stop = 3 AND start = 2`, "2"},
+		{`SELECT count(*) FROM generate_series WHERE start IN (2) AND stop = 3`, "2"},
 		{`SELECT count(*) FROM json_each('5') WHERE json = 5`, "1"},
 		{`SELECT json = 5 FROM json_each('5')`, "1"},
 		{`SELECT count(*) FROM json_each('[1]', '$') WHERE root = 5`, "0"},
@@ -137,6 +140,11 @@ func TestSeriesBoundsAsC(t *testing.T) {
 		`SELECT count(*) FROM generate_series(1,10) WHERE value IN ('5', 5)`,
 		`SELECT count(*) FROM generate_series(1,10) WHERE value IN ('5', ' 5', 5.0, 5)`,
 		`SELECT count(*) FROM generate_series(1,10) WHERE value = '5' OR value = 5`,
+		// And one on start, stop or step makes a series for each value.
+		`SELECT count(*) FROM generate_series WHERE start IN (1,2) AND stop = 3`,
+		`SELECT count(*) FROM generate_series WHERE (start = 1 OR start = 2) AND stop = 3`,
+		`SELECT count(*) FROM generate_series WHERE start = 1 AND stop IN (2, 3)`,
+		`SELECT count(*) FROM generate_series WHERE start = 2 AND start IN (1,2) AND stop = 3`,
 	} {
 		if _, rows, err := p.Query(q); err == nil {
 			t.Errorf("%s = %v, want it declined (C answers 2 or more)", q, rows)

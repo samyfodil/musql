@@ -123,6 +123,7 @@ type seriesTerm struct {
 	rhs      Expr
 	list     []Expr // an IN of two values or more
 	known    bool   // usable, or not, before the statement runs
+	loop     bool   // an IN of start, stop or step, which C runs the series once for each value of
 }
 
 // seriesScope resolves a generate_series item's columns.
@@ -191,7 +192,7 @@ func (s seriesScope) real(e Expr) (seriesTerm, bool) {
 		t.rhs = in.List[0]
 	} else {
 		t.list = in.List
-		t.known = t.known && (ci == seriesColValue || ci == seriesColRowid)
+		t.loop = ci != seriesColValue && ci != seriesColRowid
 	}
 	return t, true
 }
@@ -269,7 +270,7 @@ func (s seriesScope) orTerms(j int, e Expr) ([]seriesTerm, bool) {
 		in.col, in.colX, in.known = t.col, t.colX, in.known && t.known
 		in.list = append(in.list, t.rhs)
 	}
-	in.known = in.known && (in.col == seriesColValue || in.col == seriesColRowid)
+	in.loop = in.col != seriesColValue && in.col != seriesColRowid
 	return append(out, in), true
 }
 
@@ -455,10 +456,10 @@ type seriesPlan struct {
 }
 
 // seriesItemPlan is the plan for it, or false when it changes nothing.
-func seriesItemPlan(it *FromItem, conj []Expr, rowid bool, known func(Expr) bool) (seriesPlan, bool) {
+func seriesItemPlan(it *FromItem, conj []Expr, rowid bool, known func(Expr) bool) (seriesPlan, bool, error) {
 	vcols, _, err := seriesModule{}.Connect(nil)
 	if err != nil {
-		return seriesPlan{}, false
+		return seriesPlan{}, false, nil
 	}
 	cols := make([]columnInfo, len(vcols))
 	for i, c := range vcols {
@@ -471,7 +472,7 @@ func seriesItemPlan(it *FromItem, conj []Expr, rowid bool, known func(Expr) bool
 	s := seriesScope{cols: cols, name: name, rowid: rowid, known: known}
 	terms, ok := s.terms(conj, len(it.TableFuncArgs))
 	if !ok {
-		return seriesPlan{}, false
+		return seriesPlan{}, false, nil
 	}
 	// The rowid is value's: a column with a constraint whose usability, or
 	// whose rows, cannot be told here is left whole.
@@ -491,6 +492,9 @@ func seriesItemPlan(it *FromItem, conj []Expr, rowid bool, known func(Expr) bool
 	pl := seriesPlan{it: it, at: map[int]Expr{}, halves: map[[2]int]Expr{}, blank: map[int]bool{}, blankHalf: map[[2]int]bool{}}
 	taken := map[int]bool{}
 	for _, k := range seriesTake(terms, skip) {
+		if terms[k].loop {
+			return seriesPlan{}, false, fmt.Errorf("%w: generate_series runs once for each value of an IN on %s", errVDBEUnsupported, cols[terms[k].col].Name)
+		}
 		taken[k] = true
 	}
 	both := map[int]int{}
@@ -533,18 +537,18 @@ func seriesItemPlan(it *FromItem, conj []Expr, rowid bool, known func(Expr) bool
 		}
 	}
 	if len(pl.at) == 0 && len(pl.extra) == 0 && len(pl.blank) == 0 && len(pl.blankHalf) == 0 {
-		return seriesPlan{}, false
+		return seriesPlan{}, false, nil
 	}
-	return pl, true
+	return pl, true, nil
 }
 
 // seriesBoundConjuncts is stmt with every constraint a generate_series in srcs
 // consumes tested as C's series makes its rows, and those sources' tvfWhere
 // offering the module the consumed constraints alone. It is stmt itself when
 // there is none.
-func seriesBoundConjuncts(p *ReadOnlyPager, stmt *SelectStmt, srcs []joinSource) *SelectStmt {
+func seriesBoundConjuncts(p *ReadOnlyPager, stmt *SelectStmt, srcs []joinSource) (*SelectStmt, error) {
 	if stmt == nil || stmt.Where == nil {
-		return stmt
+		return stmt, nil
 	}
 	conj := splitTopLevelAnd(stmt.Where)
 	own := map[string]bool{}
@@ -580,13 +584,16 @@ func seriesBoundConjuncts(p *ReadOnlyPager, stmt *SelectStmt, srcs []joinSource)
 		if _, isSeries := mod.(seriesModule); !isSeries {
 			continue
 		}
-		pl, ok := seriesItemPlan(it, conj, len(stmt.From) == 1, known)
+		pl, ok, err := seriesItemPlan(it, conj, len(stmt.From) == 1, known)
+		if err != nil {
+			return nil, err
+		}
 		if !ok {
 			continue
 		}
 		for j, e := range pl.at {
 			if _, dup := at[j]; dup {
-				return stmt // two series consume it: neither's bound is it
+				return stmt, nil // two series consume it: neither's bound is it
 			}
 			at[j] = e
 		}
@@ -594,7 +601,7 @@ func seriesBoundConjuncts(p *ReadOnlyPager, stmt *SelectStmt, srcs []joinSource)
 		plans = append(plans, pl)
 	}
 	if len(plans) == 0 {
-		return stmt
+		return stmt, nil
 	}
 	out := slices.Clone(conj)
 	for j, e := range at {
@@ -627,5 +634,5 @@ func seriesBoundConjuncts(p *ReadOnlyPager, stmt *SelectStmt, srcs []joinSource)
 		}
 		pl.it.tvfWhere = append(tvf, extra...)
 	}
-	return &s2
+	return &s2, nil
 }

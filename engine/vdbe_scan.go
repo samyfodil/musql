@@ -273,7 +273,10 @@ func compileScanAttempt(p *ReadOnlyPager, stmt *SelectStmt, outer *compiler, row
 	stmt = vtabOmitConjuncts(stmt, srcs)
 	// The bounds a generate_series consumes, read as C's reads them, in the
 	// WHERE and in the module's own copy alike (vtab_series_bounds.go).
-	stmt = seriesBoundConjuncts(p, stmt, srcs)
+	stmt, err = seriesBoundConjuncts(p, stmt, srcs)
+	if err != nil {
+		return nil, err
+	}
 	// checkFromSupported (join.go) checks every FROM item's effective join
 	// condition, which for USING/NATURAL exists only after
 	// resolveJoinSources desugared it.
