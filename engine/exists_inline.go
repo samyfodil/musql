@@ -69,7 +69,7 @@ func existsInlinable(sub *Program) bool {
 				return false
 			}
 		case OpOpenDerived:
-			if ds, ok := in.P4.(*derivedSource); !ok || !derivedReadsSameRows(ds) {
+			if ds, ok := in.P4.(*derivedSource); !ok || !derivedReadsSameRows(ds) && !seriesFedByRegisters(ds) {
 				return false
 			}
 		}
@@ -95,6 +95,35 @@ func derivedReadsSameRows(ds *derivedSource) bool {
 		return !ds.prog.Correlated && (ds.stmtOnce || ds.cteOnce) && progDeterministic(ds.prog, map[*Program]bool{})
 	}
 	return false
+}
+
+// seriesFedByRegisters reports whether ds is a correlated generate_series
+// whose every argument and pushed WHERE term the body computes into a
+// register before opening it (vtab_correlated.go): its rows are then a
+// function of those registers alone, which relocate with the body, and no
+// value of its constraints is folded against the outer row the body's own
+// machine would have had.
+func seriesFedByRegisters(ds *derivedSource) bool {
+	if !isSeriesSource(ds) || !ds.vtabStream || len(ds.vtabCorr) == 0 || ds.rightJoin || ds.vtabTrig != nil ||
+		ds.rerun || ds.catalogScope != scopeAny || ds.vtabWrite != nil || ds.upfrom != nil || ds.viewUpfrom != nil {
+		return false
+	}
+	args := make([]bool, len(ds.vtab.TableFuncArgs))
+	conjs := make([]bool, len(ds.vtab.tvfWhere))
+	for _, t := range ds.vtabCorr {
+		switch {
+		case t.arg > 0 && t.arg <= len(args):
+			args[t.arg-1] = true
+		case t.arg == 0 && t.conj >= 0 && t.conj < len(conjs):
+			conjs[t.conj] = true
+		}
+	}
+	for _, fed := range append(args, conjs...) {
+		if !fed {
+			return false
+		}
+	}
+	return true
 }
 
 // inlinedSource is ds as an inlined body opens it. A source that streams
@@ -235,7 +264,17 @@ func existsInline(prog *Program, at int, sub *Program) {
 		case OpFunction:
 			r.P1, r.P3 = reg(in.P1), reg(in.P3)
 		case OpOpenDerived:
-			r.P1, r.P2, r.P4 = cur(in.P1), in.P2+slotOff, inlinedSource(in.P4.(*derivedSource))
+			ds := inlinedSource(in.P4.(*derivedSource))
+			if len(ds.vtabCorr) > 0 {
+				cp := *ds
+				cp.vtabCorr = make([]vtabCorrTerm, len(ds.vtabCorr))
+				for k, t := range ds.vtabCorr {
+					t.reg = reg(t.reg)
+					cp.vtabCorr[k] = t
+				}
+				ds = &cp
+			}
+			r.P1, r.P2, r.P4 = cur(in.P1), in.P2+slotOff, ds
 		}
 		out = append(out, r)
 	}

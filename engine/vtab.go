@@ -422,7 +422,7 @@ func (p *ReadOnlyPager) materializeVtab(it FromItem, params []Value, outer *eval
 		return p.materializeFts3Item(it, it.Table, cols, sch)
 	}
 
-	info, argv, err := p.vtabFilterArgs(it, cols, tab, params, outer, trig, from, corr)
+	info, argv, _, err := p.vtabFilterArgs(it, cols, tab, params, outer, trig, from, corr)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -516,15 +516,16 @@ func (p *ReadOnlyPager) materializeVtab(it FromItem, params []Value, outer *eval
 }
 
 // vtabFilterArgs offers the constraints of it to tab's BestIndex and returns the
-// plan it chose and the arguments Filter takes for it.
-func (p *ReadOnlyPager) vtabFilterArgs(it FromItem, cols []columnInfo, tab VirtualTable, params []Value, outer *evalCtx, trig *trigCompileCtx, from *vdbe, corr []vtabCorrValue) (*VtabIndexInfo, []Value, error) {
-	constraints, rhsVals, err := p.buildVtabConstraints(it, cols, params, outer, trig, from, corr)
+// plan it chose and the arguments Filter takes for it. argvFrom[k] is the corr
+// entry argv[k] was taken from, -1 for one folded here.
+func (p *ReadOnlyPager) vtabFilterArgs(it FromItem, cols []columnInfo, tab VirtualTable, params []Value, outer *evalCtx, trig *trigCompileCtx, from *vdbe, corr []vtabCorrValue) (info *VtabIndexInfo, argv []Value, argvFrom []int, err error) {
+	constraints, rhsVals, rhsFrom, err := p.buildVtabConstraints(it, cols, params, outer, trig, from, corr)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	info := &VtabIndexInfo{Constraints: constraints, Usage: make([]VtabConstraintUsage, len(constraints))}
+	info = &VtabIndexInfo{Constraints: constraints, Usage: make([]VtabConstraintUsage, len(constraints))}
 	if err := tab.BestIndex(info); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	maxArgv := 0
 	for _, u := range info.Usage {
@@ -532,13 +533,18 @@ func (p *ReadOnlyPager) vtabFilterArgs(it FromItem, cols []columnInfo, tab Virtu
 			maxArgv = u.ArgvIndex
 		}
 	}
-	argv := make([]Value, maxArgv)
+	argv = make([]Value, maxArgv)
+	argvFrom = make([]int, maxArgv)
+	for k := range argvFrom {
+		argvFrom[k] = -1
+	}
 	for i, u := range info.Usage {
 		if u.ArgvIndex >= 1 && u.ArgvIndex <= maxArgv {
 			argv[u.ArgvIndex-1] = rhsVals[i]
+			argvFrom[u.ArgvIndex-1] = rhsFrom[i]
 		}
 	}
-	return info, argv, nil
+	return info, argv, argvFrom, nil
 }
 
 // materializeWritableVtab reads a writable virtual table's rows from the real
@@ -666,21 +672,25 @@ var errVtabArgNotConstant = errors.New("engine: table-valued function argument n
 // earlier in the join is coded per outer row in C (wherecode.c:1584) with
 // xFilter re-run. When the compiler arranged that (vtab_correlated.go), the
 // value arrives computed and the constraint is usable (where.c:4390).
-func (p *ReadOnlyPager) buildVtabConstraints(it FromItem, cols []columnInfo, params []Value, outer *evalCtx, trig *trigCompileCtx, from *vdbe, corr []vtabCorrValue) ([]VtabConstraint, []Value, error) {
+func (p *ReadOnlyPager) buildVtabConstraints(it FromItem, cols []columnInfo, params []Value, outer *evalCtx, trig *trigCompileCtx, from *vdbe, corr []vtabCorrValue) ([]VtabConstraint, []Value, []int, error) {
 	var cs []VtabConstraint
 	var vals []Value
+	var srcs []int
 
 	hidden := hiddenColIndices(cols)
 	for ai, argExpr := range it.TableFuncArgs {
 		if ai >= len(hidden) {
 			// whereexpr.c:1922 names the eponymous table, which is the module.
-			return nil, nil, fmt.Errorf("engine: too many arguments on %s() - max %d", r33sFoldIdent(it.Table), len(hidden))
+			return nil, nil, nil, fmt.Errorf("engine: too many arguments on %s() - max %d", r33sFoldIdent(it.Table), len(hidden))
 		}
-		v, ok := vtabCorrArgFor(corr, ai, hidden[ai])
-		if !ok {
+		src := vtabCorrArgIndex(corr, ai, hidden[ai])
+		var v Value
+		if src >= 0 {
+			v = corr[src].v
+		} else {
 			var err error
 			if v, err = p.foldVtabInputValue(argExpr, params, outer, trig, from); err != nil {
-				return nil, nil, fmt.Errorf("%w: engine: %s(): argument %d is not a constant: %w", errVtabArgNotConstant, it.Table, ai+1, err)
+				return nil, nil, nil, fmt.Errorf("%w: engine: %s(): argument %d is not a constant: %w", errVtabArgNotConstant, it.Table, ai+1, err)
 			}
 		}
 		// Omitted: an argument is not a WHERE conjunct here, so nothing
@@ -688,6 +698,7 @@ func (p *ReadOnlyPager) buildVtabConstraints(it FromItem, cols []columnInfo, par
 		// honouring omit=1 on the "hidden = arg" term it synthesizes.
 		cs = append(cs, VtabConstraint{Column: hidden[ai], Op: VtabEQ, Usable: true, Omitted: true})
 		vals = append(vals, v)
+		srcs = append(srcs, src)
 	}
 
 	name := it.Alias
@@ -703,15 +714,17 @@ func (p *ReadOnlyPager) buildVtabConstraints(it FromItem, cols []columnInfo, par
 		// for this item, if any -- FromItem.tvfOmitPlus1, stamped only for the
 		// sources whose WHERE was really rewritten. See VtabConstraint.Omitted.
 		omitted := it.tvfOmitPlus1 != 0 && it.tvfOmitPlus1-1 == ci2
-		if cv, ok := vtabCorrValueFor(corr, ci2, ci, op); ok {
+		if src := vtabCorrValueIndex(corr, ci2, ci, op); src >= 0 {
 			// Already computed off the outer row, in a register, before this
 			// level's loop started -- see vtab_correlated.go. The (column,
 			// operator) pair had to match the one re-derived here, so this
 			// value belongs to exactly this constraint.
 			cs = append(cs, VtabConstraint{Column: ci, Op: op, Usable: true, Omitted: omitted})
-			vals = append(vals, cv)
+			vals = append(vals, corr[src].v)
+			srcs = append(srcs, src)
 			continue
 		}
+		srcs = append(srcs, -1)
 		v, err := p.foldVtabInputValue(rhs, params, outer, trig, from)
 		if err != nil {
 			// Offered UNUSABLE with a placeholder value, keeping the two
@@ -724,7 +737,7 @@ func (p *ReadOnlyPager) buildVtabConstraints(it FromItem, cols []columnInfo, par
 		cs = append(cs, VtabConstraint{Column: ci, Op: op, Usable: true, Omitted: omitted})
 		vals = append(vals, v)
 	}
-	return cs, vals, nil
+	return cs, vals, srcs, nil
 }
 
 // foldVtabInputValue computes one constraint right-hand side by compiling it as
