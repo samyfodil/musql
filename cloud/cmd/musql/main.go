@@ -1,8 +1,9 @@
-// musql is the command line for musql: run SQL on a local database file, and
-// for musql cloud, sign in, manage organizations, groups and databases, and
-// run SQL over Hrana.
+// musql is the command line for musql: run SQL on a local database file or a
+// musqld server, and for musql cloud, sign in, manage organizations, groups
+// and databases, and run SQL over Hrana.
 //
 //	musql open app.musq
+//	musql open http://localhost:8080 --auth-token secret
 //	musql config set url https://cloud.example.com
 //	musql auth login
 //	musql db create app
@@ -39,6 +40,7 @@ func main() {
 	err := cli.Run(ctx, cli.Env{
 		Dir:              dir,
 		Token:            os.Getenv("MUSQL_API_TOKEN"),
+		ServerToken:      os.Getenv("MUSQLD_AUTH_TOKEN"),
 		Stdin:            os.Stdin,
 		Stdout:           os.Stdout,
 		Stderr:           os.Stderr,
