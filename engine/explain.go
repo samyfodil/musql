@@ -395,7 +395,7 @@ func (p *ReadOnlyPager) explainQueryPlanRows(inner string) (cols []string, rows 
 		if perr != nil {
 			return nil, nil, perr
 		}
-		lines = topLevelPlanLines(p.explainPlanDetails(prog))
+		lines = p.explainProgPlan(prog, &explainPlanState{})
 	} else {
 		stmt, perr := p.explainParse(inner)
 		if perr != nil {
@@ -442,8 +442,18 @@ func topLevelPlanLines(details []string) []explainPlanLine {
 // line C SQLite prints there instead -- sqlite3WhereBegin's nTabList==0 arm
 // (where.c:6945-6956) says "SCAN CONSTANT ROW" for every FROM-less core except
 // a multi-row VALUES, which names itself "SCAN %d-ROW VALUES CLAUSE" (printf.c:
-// 1022-1025, reached through select.c:2883).
+// 1022-1025, reached through select.c:2883). The programs it runs (a FROM
+// subquery's, an expression's) are lines under the line that names them
+// (explainProgPlan).
 func (p *ReadOnlyPager) explainPlanOf(stmt *SelectStmt) ([]explainPlanLine, error) {
+	return p.explainStmtPlan(stmt, &explainPlanState{})
+}
+
+// explainPlanState is what one statement's plan numbers across its programs:
+// the subqueries, so that each name is the statement's own.
+type explainPlanState struct{ subs int }
+
+func (p *ReadOnlyPager) explainStmtPlan(stmt *SelectStmt, st *explainPlanState) ([]explainPlanLine, error) {
 	if stmt.ValuesArms > 0 && stmt.ValuesArms == len(stmt.Compound) && len(stmt.From) == 0 {
 		// A multi-row VALUES: desugared here into one compound arm per row
 		// (parseValuesSelectCore), but ONE clause to SQLite, which is how it
@@ -451,25 +461,103 @@ func (p *ReadOnlyPager) explainPlanOf(stmt *SelectStmt) ([]explainPlanLine, erro
 		return topLevelPlanLines([]string{fmt.Sprintf("SCAN %d-ROW VALUES CLAUSE", stmt.ValuesArms+1)}), nil
 	}
 	if len(stmt.Compound) > 0 {
-		return p.explainCompoundPlan(stmt)
+		return p.explainCompoundPlan(stmt, st)
 	}
 	prog, err := p.explainCompile(stmt)
 	if err != nil {
 		return nil, err
 	}
-	details := p.explainPlanDetails(prog)
-	if len(details) == 0 && len(stmt.From) == 0 {
+	lines := p.explainProgPlan(prog, st)
+	if len(lines) == 0 && len(stmt.From) == 0 {
 		return topLevelPlanLines([]string{"SCAN CONSTANT ROW"}), nil
 	}
-	return topLevelPlanLines(details), nil
+	return lines, nil
+}
+
+// explainProgPlan is prog's plan: a line per scan in loop order, a FROM
+// subquery's own plan under a "MATERIALIZE (subquery-N)" line before its
+// scan, and each subquery an expression runs under a line naming it, as C
+// prints its "SCALAR SUBQUERY N" and "LIST SUBQUERY N". Every one is a
+// program of its own here, materialized or run per evaluation, where C may
+// code it as a co-routine of the statement's.
+func (p *ReadOnlyPager) explainProgPlan(prog *Program, st *explainPlanState) []explainPlanLine {
+	if prog.Compound != nil {
+		cp := prog.Compound
+		return p.explainArmsPlan(cp.arms, cp.ops, len(cp.orderBy) > 0, st)
+	}
+	var out []explainPlanLine
+	for _, sc := range p.explainPlanScans(prog, st) {
+		if sc.derived != nil {
+			out = append(out, explainPlanLine{detail: "MATERIALIZE " + sc.name})
+			appendPlanUnder(&out, len(out), p.explainProgPlan(sc.derived, st))
+		}
+		out = append(out, explainPlanLine{detail: sc.line})
+	}
+	for _, in := range prog.Insns {
+		var sub *Program
+		var kind string
+		correlated := false
+		switch x := in.P4.(type) {
+		case *Program:
+			if in.Op != OpSubquery && in.Op != OpExists {
+				continue
+			}
+			sub, kind, correlated = x, "SCALAR SUBQUERY", in.P5&p5Correlated != 0
+		case *inSubPlan:
+			sub, kind, correlated = x.prog, "LIST SUBQUERY", x.correlated
+		case *rowSubPlan:
+			sub, kind, correlated = x.prog, "SCALAR SUBQUERY", x.correlated
+		}
+		if sub == nil {
+			continue
+		}
+		if correlated {
+			kind = "CORRELATED " + kind
+		}
+		st.subs++
+		out = append(out, explainPlanLine{detail: fmt.Sprintf("%s %d", kind, st.subs)})
+		appendPlanUnder(&out, len(out), p.explainProgPlan(sub, st))
+	}
+	return out
+}
+
+// explainArmsPlan is a compound's plan from its arms' programs, the tree
+// explainCompoundPlan prints for a statement's own.
+func (p *ReadOnlyPager) explainArmsPlan(arms []*Program, ops []CompoundOp, ordered bool, st *explainPlanState) []explainPlanLine {
+	out := []explainPlanLine{{detail: "COMPOUND QUERY"}}
+	for i, arm := range arms {
+		label := "LEFT-MOST SUBQUERY"
+		if i > 0 && i-1 < len(ops) {
+			label = string(ops[i-1])
+		}
+		out = append(out, explainPlanLine{parent: 1, detail: label})
+		appendPlanUnder(&out, len(out), p.explainProgPlan(arm, st))
+	}
+	if ordered {
+		out = append(out, explainPlanLine{detail: "USE TEMP B-TREE FOR ORDER BY"})
+	}
+	return out
+}
+
+// appendPlanUnder appends lines, a plan of their own, under the line at
+// position parent of out: their top level hangs from it, and the rest keep
+// their parents, renumbered past what out held.
+func appendPlanUnder(out *[]explainPlanLine, parent int, lines []explainPlanLine) {
+	off := len(*out)
+	for _, ln := range lines {
+		if ln.parent == 0 {
+			ln.parent = parent
+		} else {
+			ln.parent += off
+		}
+		*out = append(*out, ln)
+	}
 }
 
 // explainCompoundPlan is the QUERY PLAN of a compound SELECT: a TREE, which is
-// the one shape the flat rows above cannot express.
-//
-// Only the flat family is served -- every connective "UNION ALL" and no
-// statement-level ORDER BY -- because that is the one C SQLite prints
-// without merging. Measured against 3.53.3 for two and three arms:
+// the one shape the flat rows above cannot express. For a flat UNION ALL with
+// no ORDER BY it is C SQLite's own, measured against 3.53.3 for two and three
+// arms:
 //
 //	1|0 COMPOUND QUERY
 //	2|1 LEFT-MOST SUBQUERY
@@ -482,28 +570,14 @@ func (p *ReadOnlyPager) explainPlanOf(stmt *SelectStmt) ([]explainPlanLine, erro
 // (its ids are program addresses; these are positions, which the format's own
 // contract allows -- the TREE is what carries meaning.)
 //
-// Everything else MERGES, and is declined rather than approximated. UNION,
-// INTERSECT and EXCEPT each print "MERGE (<op>)" over LEFT and RIGHT children
-// -- a LEFT-DEEP binary tree for three or more arms, where even an inner
-// UNION ALL becomes its own "MERGE (UNION ALL)" once it is nested inside one
-// -- and so does a UNION ALL carrying an ORDER BY. Every LEAF arm there also
-// reports "USE TEMP B-TREE FOR ORDER BY".
-//
-// That last line is why this is a decline and not a partial answer: this
-// engine does NOT sort to dedup a compound. combineCompound dedups by
-// row EQUALITY and sorts only for an actual ORDER BY (vdbe_compound_codegen.go),
-// so printing C's temp-b-tree line would be a false claim about this
-// program, and omitting it would drop a row C prints from every arm. One is
-// a lie and the other is an incomplete answer; declining says neither.
-func (p *ReadOnlyPager) explainCompoundPlan(stmt *SelectStmt) ([]explainPlanLine, error) {
-	for _, arm := range stmt.Compound {
-		if arm.Op != "UNION ALL" {
-			return nil, fmt.Errorf("%w: EXPLAIN QUERY PLAN of a %s compound: C SQLite reports it as a MERGE over LEFT/RIGHT children, a tree shape this engine does not derive", errVDBEUnsupported, arm.Op)
-		}
-	}
-	if len(stmt.OrderBy) > 0 {
-		return nil, fmt.Errorf("%w: EXPLAIN QUERY PLAN of a UNION ALL carrying an ORDER BY: C SQLite reports that as a MERGE too, with a temp-b-tree line per arm", errVDBEUnsupported)
-	}
+// Every other compound is printed the same way, each arm under its operator,
+// because that is how this engine runs it. C MERGES those: "MERGE (<op>)" over
+// LEFT and RIGHT children, a left-deep binary tree, each leaf sorted into a
+// temp b-tree. This engine runs each arm and combines their rows by equality
+// (combineCompound, vdbe_compound_codegen.go), sorting only for an ORDER BY,
+// which is the one "USE TEMP B-TREE FOR ORDER BY" line it prints. C's tree
+// would describe a program this engine does not run.
+func (p *ReadOnlyPager) explainCompoundPlan(stmt *SelectStmt, st *explainPlanState) ([]explainPlanLine, error) {
 	// Arm 0 is the statement's own core; planning it alone means dropping what
 	// belongs to the compound as a whole (its arms, and the ORDER BY/LIMIT the
 	// grammar attaches to the statement -- see SelectStmt.Compound).
@@ -513,20 +587,14 @@ func (p *ReadOnlyPager) explainCompoundPlan(stmt *SelectStmt) ([]explainPlanLine
 	lines := []explainPlanLine{{detail: "COMPOUND QUERY"}}
 	appendArm := func(label string, arm *SelectStmt) error {
 		lines = append(lines, explainPlanLine{parent: 1, detail: label})
-		parent := len(lines)
-		armLines, err := p.explainPlanOf(arm)
+		armLines, err := p.explainStmtPlan(arm, st)
 		if err != nil {
 			return err
 		}
-		for _, ln := range armLines {
-			// Every arm line is top-level WITHIN its arm, so its parent is the
-			// arm's own node. It cannot be anything else: parseSelectStmt
-			// flattens a compound into ONE Compound slice on the first core
-			// (see SelectStmt.Compound), so an arm never carries a compound --
-			// and therefore never a tree -- of its own.
-			ln.parent = parent
-			lines = append(lines, ln)
-		}
+		// Every arm's lines hang from the arm's own node. parseSelectStmt
+		// flattens a compound into ONE Compound slice on the first core (see
+		// SelectStmt.Compound), so an arm never carries a compound of its own.
+		appendPlanUnder(&lines, len(lines), armLines)
 		return nil
 	}
 	if err := appendArm("LEFT-MOST SUBQUERY", &first); err != nil {
@@ -536,6 +604,9 @@ func (p *ReadOnlyPager) explainCompoundPlan(stmt *SelectStmt) ([]explainPlanLine
 		if err := appendArm(string(arm.Op), arm.Stmt); err != nil {
 			return nil, err
 		}
+	}
+	if len(stmt.OrderBy) > 0 {
+		lines = append(lines, explainPlanLine{detail: "USE TEMP B-TREE FOR ORDER BY"})
 	}
 	return lines, nil
 }
@@ -551,13 +622,14 @@ type explainScan struct {
 	plan     wherePlanExplain // the loop C's planner chose, when the port decided it
 	write    bool             // opened by OpOpenWrite: a DML target, scanned only if rewound
 	order    int              // rank in nested-loop order: the address of this cursor's OpRewind
+	derived  *Program         // a FROM subquery's program, which makes its rows
 }
 
-// explainPlanDetails walks the program once and returns one detail string per
+// explainPlanScans walks the program once and returns one plan line per
 // scanned source, in nested-loop order. The opens are emitted in FROM order
 // (emitJoinLoops) but the LOOPS are emitted outermost-first, so a cursor's own
 // OpRewind is what ranks it -- the same order C lists its levels in.
-func (p *ReadOnlyPager) explainPlanDetails(prog *Program) []string {
+func (p *ReadOnlyPager) explainPlanScans(prog *Program, st *explainPlanState) []explainScanLine {
 	var scans []*explainScan
 	byCursor := map[int]*explainScan{}
 	for _, in := range prog.Insns {
@@ -568,6 +640,9 @@ func (p *ReadOnlyPager) explainPlanDetails(prog *Program) []string {
 			byCursor[in.P1] = s
 		case OpOpenDerived:
 			s := &explainScan{cursor: in.P1, name: explainSourceName(in.P4), order: 1 << 30}
+			if ds, ok := in.P4.(*derivedSource); ok {
+				s.derived = ds.prog
+			}
 			scans = append(scans, s)
 			byCursor[in.P1] = s
 		case OpOpenWrite:
@@ -595,7 +670,6 @@ func (p *ReadOnlyPager) explainPlanDetails(prog *Program) []string {
 		}
 	}
 	sortStableByOrder(scans)
-	sub := 0
 	// A plan line describes a LOOP, and a write's target cursor is not always
 	// one: an INSERT opens its table to insert INTO, never rewinding it, and
 	// C SQLite prints no plan row at all for such a statement (verified:
@@ -603,33 +677,37 @@ func (p *ReadOnlyPager) explainPlanDetails(prog *Program) []string {
 	// UPDATE/DELETE, whose WHERE really does drive a scan over the same
 	// cursor, keeps its line. Only the write cursor is filtered this way --
 	// every read cursor this engine opens is driven by a loop.
-	out := make([]string, 0, len(scans))
+	out := make([]explainScanLine, 0, len(scans))
 	for _, s := range scans {
 		if s.write && s.order == 1<<30 {
 			continue
 		}
 		name := s.name
 		if name == "" {
-			sub++
-			name = fmt.Sprintf("(subquery-%d)", sub)
+			st.subs++
+			name = fmt.Sprintf("(subquery-%d)", st.subs)
 		}
+		line := "SCAN " + name
 		switch {
 		case s.rowidKey:
-			out = append(out, "SEARCH "+name+" USING INTEGER PRIMARY KEY (rowid=?)")
+			line = "SEARCH " + name + " USING INTEGER PRIMARY KEY (rowid=?)"
 		case s.plan.verb != "":
-			out = append(out, s.plan.line(name))
+			line = s.plan.line(name)
 		case s.idxRoot != 0 || s.idxName != "":
-			idx, col := p.explainIndexAt(s.idxRoot, s.idxName)
-			if idx == "" {
-				out = append(out, "SCAN "+name)
-				continue
+			if idx, col := p.explainIndexAt(s.idxRoot, s.idxName); idx != "" {
+				line = "SEARCH " + name + " USING INDEX " + idx + " (" + col + "=?)"
 			}
-			out = append(out, "SEARCH "+name+" USING INDEX "+idx+" ("+col+"=?)")
-		default:
-			out = append(out, "SCAN "+name)
 		}
+		out = append(out, explainScanLine{line: line, name: name, derived: s.derived})
 	}
 	return out
+}
+
+// explainScanLine is one scan's plan line, the name it gives the source, and
+// the program a FROM subquery runs to make its rows.
+type explainScanLine struct {
+	line, name string
+	derived    *Program
 }
 
 // sortStableByOrder puts the scans in nested-loop order (insertion sort: a FROM
