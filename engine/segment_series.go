@@ -265,9 +265,10 @@ func (m *vdbe) segRunSeriesOne(tbl *resolvedTable, rows seriesRows, low *segLowe
 	}
 	bufN := min(rows.n, seriesBlockRows)
 	blocks := make([][]int64, len(low.cols))
+	// A slot read as its NULL indicator stays 0: no series cell is NULL.
 	for i, c := range low.cols {
 		blocks[i] = make([]int64, bufN)
-		if c%seriesCols != seriesColValue {
+		if c%seriesCols != seriesColValue && !low.nullCol[i] {
 			rows.fill(blocks[i], 0, c)
 		}
 	}
@@ -303,7 +304,7 @@ func (m *vdbe) segRunSeriesOne(tbl *resolvedTable, rows seriesRows, low *segLowe
 	for r0 = 0; r0 < rows.n; {
 		n := min(rows.n-r0, seriesBlockRows)
 		for i, c := range low.cols {
-			if c%seriesCols == seriesColValue {
+			if c%seriesCols == seriesColValue && !low.nullCol[i] {
 				rows.fill(blocks[i][:n], r0, c)
 			}
 		}

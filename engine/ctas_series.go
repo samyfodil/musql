@@ -119,6 +119,7 @@ func (p *ReadOnlyPager) ctasSeriesSegments(sel *SelectStmt, cols []columnInfo) (
 		}
 	}
 	values := make([]int64, min(rows.n, segmentRows))
+	notNull := make([]int64, len(values)) // a NULL indicator: no series cell is NULL
 	cells := make([][]uint64, len(cols))
 	for j := range cells {
 		cells[j] = make([]uint64, len(values))
@@ -135,6 +136,9 @@ func (p *ReadOnlyPager) ctasSeriesSegments(sel *SelectStmt, cols []columnInfo) (
 			args := &jit.ProgArgs{N: int64(n), Regs: &local[0], Out: &out, Overflow: &ovf, Sel: (*int64)(unsafe.Pointer(&cells[j][0]))}
 			for i := range low.cols {
 				args.Col[i] = &values[0]
+				if low.nullCol[i] {
+					args.Col[i] = &notNull[0]
+				}
 			}
 			if !segCallKernel(kerns[j], args, svc, low.blocks, nil, local) || ovf != 0 || got >= 0 && int(out) != got {
 				return nil, 0, false
