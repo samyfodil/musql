@@ -290,19 +290,76 @@ func TestExplainQueryPlanCompound(t *testing.T) {
 			t.Errorf("%s:\n got %v\nwant %v", tc.sql, got, tc.want)
 		}
 	}
-	// The merging families decline, cleanly and with their reason.
-	for _, sql := range []string{
-		`EXPLAIN QUERY PLAN SELECT a FROM t UNION SELECT x FROM u`,
-		`EXPLAIN QUERY PLAN SELECT a FROM t INTERSECT SELECT x FROM u`,
-		`EXPLAIN QUERY PLAN SELECT a FROM t EXCEPT SELECT x FROM u`,
-		`EXPLAIN QUERY PLAN SELECT a FROM t UNION ALL SELECT x FROM u ORDER BY 1`,
+	// The merging families print the tree this engine runs: each arm under
+	// its operator, and one sort for an ORDER BY. C prints a MERGE tree there,
+	// which describes a program this engine does not run.
+	for _, tc := range []struct {
+		sql  string
+		want []string
+	}{
+		{`EXPLAIN QUERY PLAN SELECT a FROM t UNION SELECT x FROM u`, []string{
+			"1|0|COMPOUND QUERY", "2|1|LEFT-MOST SUBQUERY", "3|2|SCAN t", "4|1|UNION", "5|4|SCAN u",
+		}},
+		{`EXPLAIN QUERY PLAN SELECT a FROM t INTERSECT SELECT x FROM u EXCEPT SELECT 1`, []string{
+			"1|0|COMPOUND QUERY", "2|1|LEFT-MOST SUBQUERY", "3|2|SCAN t", "4|1|INTERSECT", "5|4|SCAN u",
+			"6|1|EXCEPT", "7|6|SCAN CONSTANT ROW",
+		}},
+		{`EXPLAIN QUERY PLAN SELECT a FROM t UNION ALL SELECT x FROM u ORDER BY 1`, []string{
+			"1|0|COMPOUND QUERY", "2|1|LEFT-MOST SUBQUERY", "3|2|SCAN t", "4|1|UNION ALL", "5|4|SCAN u",
+			"6|0|USE TEMP B-TREE FOR ORDER BY",
+		}},
 	} {
-		if _, _, err := p.Query(sql); err == nil {
-			t.Errorf("%s answered; C SQLite reports a MERGE tree this engine does not derive", sql)
-		} else if !strings.Contains(err.Error(), "MERGE") {
-			t.Errorf("%s: %v -- the decline should name what it cannot reproduce", sql, err)
+		if got := explainPlanRows(t, p, tc.sql); strings.Join(got, " ") != strings.Join(tc.want, " ") {
+			t.Errorf("%s:\n got %v\nwant %v", tc.sql, got, tc.want)
 		}
 	}
+}
+
+// TestExplainQueryPlanSubqueries: the plan of every program a statement runs
+// hangs under the line that names it (#123): a FROM subquery's under its
+// MATERIALIZE line, before its scan, and an expression's under a SUBQUERY line.
+func TestExplainQueryPlanSubqueries(t *testing.T) {
+	p := explainDB(t)
+	for _, tc := range []struct {
+		sql  string
+		want []string
+	}{
+		{`EXPLAIN QUERY PLAN SELECT sum(a) FROM (SELECT a FROM t UNION SELECT x FROM u)`, []string{
+			"1|0|MATERIALIZE (subquery-1)", "2|1|COMPOUND QUERY", "3|2|LEFT-MOST SUBQUERY", "4|3|SCAN t",
+			"5|2|UNION", "6|5|SCAN u", "7|0|SCAN (subquery-1)",
+		}},
+		{`EXPLAIN QUERY PLAN SELECT sum(a) FROM (SELECT DISTINCT a FROM (SELECT a FROM t UNION ALL SELECT x FROM u))`, []string{
+			"1|0|MATERIALIZE (subquery-1)", "2|1|MATERIALIZE (subquery-2)", "3|2|COMPOUND QUERY",
+			"4|3|LEFT-MOST SUBQUERY", "5|4|SCAN t", "6|3|UNION ALL", "7|6|SCAN u",
+			"8|1|SCAN (subquery-2)", "9|0|SCAN (subquery-1)",
+		}},
+		{`EXPLAIN QUERY PLAN SELECT a FROM t WHERE b IN (SELECT y FROM u)`, []string{
+			"1|0|SCAN t", "2|0|LIST SUBQUERY 1", "3|2|SCAN u",
+		}},
+		{`EXPLAIN QUERY PLAN SELECT (SELECT max(x) FROM u WHERE u.y > t.a) FROM t`, []string{
+			"1|0|SCAN t", "2|0|CORRELATED SCALAR SUBQUERY 1", "3|2|SCAN u",
+		}},
+		{`EXPLAIN QUERY PLAN SELECT * FROM t, (SELECT x, count(*) FROM u GROUP BY x) g WHERE g.x = t.b`, []string{
+			"1|0|SCAN t", "2|0|MATERIALIZE (subquery-1)", "3|2|SCAN u", "4|0|SCAN (subquery-1)",
+		}},
+	} {
+		if got := explainPlanRows(t, p, tc.sql); strings.Join(got, " ") != strings.Join(tc.want, " ") {
+			t.Errorf("%s:\n got %v\nwant %v", tc.sql, got, tc.want)
+		}
+	}
+}
+
+func explainPlanRows(t *testing.T, p *engine.ReadOnlyPager, sql string) []string {
+	t.Helper()
+	_, rows, err := p.Query(sql)
+	if err != nil {
+		t.Fatalf("%s: %v", sql, err)
+	}
+	got := make([]string, len(rows))
+	for i, r := range rows {
+		got[i] = strconv.FormatInt(r[0].I, 10) + "|" + strconv.FormatInt(r[1].I, 10) + "|" + string(r[3].S)
+	}
+	return got
 }
 
 // TestExplainThroughEngineExec: EXPLAIN runs nothing, so it belongs on the
