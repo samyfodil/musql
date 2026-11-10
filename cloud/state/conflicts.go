@@ -77,6 +77,12 @@ func (s *Store) ResolveHeld(ctx context.Context) ([]Renamed, error) {
 		}
 		q := fmt.Sprintf(`INSERT INTO %s (%s) VALUES (%s)`, h.Table, strings.Join(cols, ", "), strings.TrimSuffix(strings.Repeat("?, ", len(cols)), ", "))
 		if _, err := s.exec(ctx, q, args...); err != nil {
+			// Another node's rename of this row may have reached this one
+			// since Withheld read it: every node writes the same row.
+			var got string
+			if s.q().QueryRowContext(ctx, fmt.Sprintf(`SELECT "%s" FROM %s WHERE id = ?`, col, h.Table), id).Scan(&got) == nil && got == to {
+				continue
+			}
 			return out, fmt.Errorf("state: rename held %s %s: %w", h.Table, id, err)
 		}
 		out = append(out, Renamed{Table: h.Table, ID: id, From: name, To: to})
