@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -27,9 +28,28 @@ var vmPool = []Reg64{X14, X15, X16, X17, X19, X20, X21, X22, X23, X24, X25}
 //
 // bound and cache are as on amd64 (vm_amd64.go's emitVM).
 func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache bool) ([]byte, error) {
-	b, err := emitVMArm(prog, nReg, lay, bound, entry, cache, false)
+	return emitVMWith(newArmFor(len(prog)), prog, nReg, lay, bound, entry, cache)
+}
+
+// mapVM is emitVM mapped (Map), its encoder taken from a pool and given back
+// once the code is copied out: what compiling a program allocated was most of
+// all the encoder's buffers.
+func mapVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache bool) (*Code, error) {
+	a := armFor(len(prog))
+	defer a.release()
+	code, err := emitVMWith(a, prog, nReg, lay, bound, entry, cache)
+	if err != nil {
+		return nil, err
+	}
+	return Map(code)
+}
+
+// emitVMWith is emitVM encoding into arm.
+func emitVMWith(arm *Arm, prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache bool) ([]byte, error) {
+	b, err := emitVMArm(arm, prog, nReg, lay, bound, entry, cache, false)
 	if err != nil && strings.Contains(err.Error(), "out of range") {
-		b, err = emitVMArm(prog, nReg, lay, bound, entry, cache, true)
+		arm.reset(len(prog))
+		b, err = emitVMArm(arm, prog, nReg, lay, bound, entry, cache, true)
 	}
 	return b, err
 }
@@ -38,7 +58,7 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 // inside the +-1 MB a conditional branch reaches.
 const islandBytes = 256 << 10
 
-func emitVMArm(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache, far bool) ([]byte, error) {
+func emitVMArm(arm *Arm, prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache, far bool) ([]byte, error) {
 	if lay.OffTyp != 0 || lay.OffI != 8 || lay.OffF != 16 || lay.Size != lay.OffS+24 {
 		// writeInt stores the type as the whole first word -- type, subtype and
 		// padding together -- so the type must lead it.
@@ -48,11 +68,12 @@ func emitVMArm(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cac
 	if int64(nReg)*int64(lay.Size) > 1<<30 || n > 1<<28 {
 		return nil, fmt.Errorf("jit: program too large (%d instructions, %d registers)", n, nReg)
 	}
-	e := &vmEmitArm{a: NewArm(), lay: lay, n: n, stubs: map[int]bool{}, far: far,
+	e := &vmEmitArm{a: arm, lay: lay, n: n, stubs: make(map[int]bool, n), far: far,
 		prog: prog, bound: bound, cache: cache && bound != nil, know: newVMKnow(),
 		holds: map[int]Reg64{}, pinned: map[Reg64]bool{}, fusedStub: map[int]string{}, zeroS: map[int]bool{},
 		consts: &firPool{labels: map[uint64]string{}, prefix: "i0"}}
 	e.heads = vmLoopHeads(prog)
+	e.steps, e.keep = vmStepsOf(prog), map[int]bool{}
 	a := e.a
 
 	a.LdrImm(X1, X0, POffRegs)
@@ -115,7 +136,7 @@ func emitVMArm(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cac
 		if !vmFusedEntry(prog, entry, pc) {
 			continue
 		}
-		e.fusedStub[pc] = fmt.Sprintf("f%d", pc)
+		e.fusedStub[pc] = "f" + strconv.Itoa(pc)
 		a.Label(e.fusedStub[pc])
 		e.forget()
 		clear(e.pinned)
@@ -133,7 +154,7 @@ func emitVMArm(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cac
 		case vmRunStart(prog, bound, pc+1):
 			e.jmpBlock(pc, pc+1)
 		case pc+1 < len(entry) && entry[pc+1]:
-			a.B(fmt.Sprintf("n%d", pc+1))
+			a.B("n" + strconv.Itoa(pc+1))
 		default:
 			a.B(e.stub(pc + 1))
 		}
@@ -143,7 +164,7 @@ func emitVMArm(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cac
 		}
 	}
 	for _, en := range e.entries {
-		a.Label(fmt.Sprintf("n%d", en.pc))
+		a.Label("n" + strconv.Itoa(en.pc))
 		for _, r := range en.ints {
 			e.guardInt(en.pc, r)
 		}
@@ -171,7 +192,7 @@ func emitVMArm(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cac
 			target = a.labels[vmBlock(pc)]
 			if l, ok := e.fusedStub[pc]; ok {
 				target = a.labels[l]
-			} else if l, ok := a.labels[fmt.Sprintf("n%d", pc)]; ok {
+			} else if l, ok := a.labels["n"+strconv.Itoa(pc)]; ok {
 				target = l
 			}
 		}
@@ -220,10 +241,10 @@ func (e *vmEmitArm) island(next string) {
 	e.stubs, e.exitpc = map[int]bool{}, false
 	e.islandN++
 	e.consts.emit(e.a)
-	e.consts = &firPool{labels: map[uint64]string{}, prefix: "i" + itoa(e.islandN)}
+	e.consts = &firPool{labels: map[uint64]string{}, prefix: "i" + strconv.Itoa(e.islandN)}
 }
 
-func vmBlock(pc int) string { return fmt.Sprintf("b%d", pc) }
+func vmBlock(pc int) string { return "b" + strconv.Itoa(pc) }
 
 type vmEmitArm struct {
 	a       *Arm
@@ -235,7 +256,11 @@ type vmEmitArm struct {
 	skips   int
 	far     bool // forward conditional jumps use the long form
 
-	prog      []VInsn
+	prog []VInsn
+	// steps is every pc's step and keep the set entryPoint reuses, made once
+	// for the emission (vmStepsOf).
+	steps     []progStep
+	keep      map[int]bool
 	bound     []bool
 	cache     bool
 	know      *vmKnow
@@ -253,7 +278,7 @@ type vmEmitArm struct {
 // the next island (within a conditional branch's reach), which jumps back.
 func (e *vmEmitArm) coldPath(reg Reg64, body func()) {
 	e.skips++
-	in, back := fmt.Sprintf("c%d", e.skips), fmt.Sprintf("c%d.back", e.skips)
+	in, back := "c"+strconv.Itoa(e.skips), "c"+strconv.Itoa(e.skips)+".back"
 	e.a.Cbnz(reg, in)
 	e.a.Label(back)
 	e.cold = append(e.cold, func() {
@@ -277,7 +302,8 @@ type vmHoldArm struct {
 
 // entryPoint is vm_amd64.go's.
 func (e *vmEmitArm) entryPoint(pc int) {
-	keep := vmEntryKeep(e.prog, e.bound, pc)
+	e.keep = vmEntryKeepInto(e.keep, e.prog, e.steps, e.bound, pc)
+	keep := e.keep
 	st := vmEntryStubArm{pc: pc}
 	st.ints, st.noS = e.know.pruneForEntry(keep)
 	for k, m := range e.holds {
@@ -356,10 +382,12 @@ func (e *vmEmitArm) stub(pc int) string {
 	return e.stubLabel(pc)
 }
 
-func (e *vmEmitArm) stubLabel(pc int) string { return fmt.Sprintf("x%d.%d", e.islandN, pc) }
+func (e *vmEmitArm) stubLabel(pc int) string {
+	return "x" + strconv.Itoa(e.islandN) + "." + strconv.Itoa(pc)
+}
 
 // exitpcLabel is the next island's "exit at the pc in X3" stub.
-func (e *vmEmitArm) exitpcLabel() string { return fmt.Sprintf("e%d", e.islandN) }
+func (e *vmEmitArm) exitpcLabel() string { return "e" + strconv.Itoa(e.islandN) }
 
 // jmpBlock branches to target's block, or exits when target is past the end.
 // A backward branch spends fuel first, exiting at target when it runs out.
@@ -388,7 +416,7 @@ func (e *vmEmitArm) jccBlock(c Cond, from, target int) {
 		return
 	}
 	e.skips++
-	skip := fmt.Sprintf("s%d", e.skips)
+	skip := "s" + strconv.Itoa(e.skips)
 	e.a.Bcond(c.Negate(), skip)
 	e.jmpBlock(from, target)
 	e.a.Label(skip)
@@ -426,7 +454,7 @@ func (e *vmEmitArm) clearS(reg int) {
 	delete(e.zeroS, reg)
 	// Only when there is a pointer (vm_amd64.go's clearS); CBZ sets no flags.
 	e.skips++
-	skip := fmt.Sprintf("s%d.cs", e.skips)
+	skip := "s" + strconv.Itoa(e.skips) + ".cs"
 	e.ldr(X12, reg, e.lay.OffS)
 	e.a.Cbz(X12, skip)
 	for k := range 3 {
@@ -467,7 +495,9 @@ func (e *vmEmitArm) clobber(r int) {
 	delete(e.know.isFloat, r)
 }
 
-func (e *vmEmitArm) nextUse(key, pc int) int { return vmEmitNextUse(e.prog, e.bound, key, pc) }
+func (e *vmEmitArm) nextUse(key, pc int) int {
+	return vmEmitNextUseIn(e.prog, e.steps, e.bound, key, pc)
+}
 
 func (e *vmEmitArm) alloc(pc, want int) (Reg64, bool) {
 	if !e.cache {
@@ -821,7 +851,7 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		// An INTEGER jumps on its truth; a NULL jumps when C says so; anything
 		// else is the VDBE's.
 		e.skips++
-		notInt, done := fmt.Sprintf("s%d", e.skips), fmt.Sprintf("s%d.done", e.skips)
+		notInt, done := "s"+strconv.Itoa(e.skips), "s"+strconv.Itoa(e.skips)+".done"
 		e.ldrb(X9, in.A, L.OffTyp)
 		a.CmpImm(X9, uint32(L.TypInt))
 		a.Bcond(CondNE, notInt)
@@ -934,7 +964,7 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		e.unmap(^in.A)
 		cb := in.A * VCursorSize
 		e.skips++
-		nonEmpty := fmt.Sprintf("s%d.rows", e.skips)
+		nonEmpty := "s" + strconv.Itoa(e.skips) + ".rows"
 		a.LdrImm(X9, X0, POffCur)
 		e.ldrAt(X10, X9, cb+VCursorOffOk)
 		a.Cbz(X10, e.stub(pc))
@@ -952,7 +982,7 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		e.unmap(^in.A)
 		cb := in.A * VCursorSize
 		e.skips++
-		done := fmt.Sprintf("s%d.done", e.skips)
+		done := "s" + strconv.Itoa(e.skips) + ".done"
 		a.LdrImm(X9, X0, POffCur)
 		e.ldrAt(X10, X9, cb+VCursorOffOk)
 		a.Cbz(X10, e.stub(pc))
@@ -1136,7 +1166,7 @@ func (e *vmEmitArm) resultRow(pc int, in VInsn) {
 	a, L := e.a, e.lay
 	e.branchWB(pc)
 	e.skips++
-	gather := fmt.Sprintf("s%d.rg", e.skips)
+	gather := "s" + strconv.Itoa(e.skips) + ".rg"
 	a.LdrImm(X9, X0, POffRowsBuf)
 	a.Cbnz(X9, gather)
 
@@ -1212,7 +1242,7 @@ func (e *vmEmitArm) copyRow(in VInsn, dst Reg64) {
 	a.AddReg(X9, X1, X9)
 	a.MovImm64(X11, int64(in.B*L.Size/8))
 	e.skips++
-	loop := fmt.Sprintf("s%d.rr", e.skips)
+	loop := "s" + strconv.Itoa(e.skips) + ".rr"
 	a.Label(loop)
 	a.LdrImm(X12, X9, 0)
 	a.StrImm(X12, dst, 0)
@@ -1235,7 +1265,7 @@ func (e *vmEmitArm) inSet(pc int, in VInsn) {
 	if !in.Dead {
 		e.destNoS(pc, in.C)
 	}
-	loop, done, none := fmt.Sprintf("in%d", pc), fmt.Sprintf("in%d.d", pc), fmt.Sprintf("in%d.n", pc)
+	loop, done, none := "in"+strconv.Itoa(pc), "in"+strconv.Itoa(pc)+".d", "in"+strconv.Itoa(pc)+".n"
 	a.MovImm64(X11, int64(e.off(in.B, L.OffI)))
 	a.AddReg(X11, X1, X11)
 	a.Label(loop)

@@ -287,6 +287,16 @@ func hranaError(w http.ResponseWriter, status int, msg string) {
 
 // serveDB serves Hrana at /db/<org>/<name>/..., for a database token or a
 // user's token.
+// lookupError answers a request whose database could not be looked up: not
+// found when the state says so, unavailable while the cluster cannot say.
+func lookupError(w http.ResponseWriter, err error) {
+	if state.Unavailable(err) {
+		hranaError(w, http.StatusServiceUnavailable, errNoMaster.Error())
+		return
+	}
+	hranaError(w, http.StatusNotFound, "no such database")
+}
+
 func (s *Server) serveDB(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/db/")
 	orgSlug, rest, _ := strings.Cut(rest, "/")
@@ -294,12 +304,12 @@ func (s *Server) serveDB(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	o, err := s.store.OrgBySlug(ctx, orgSlug)
 	if err != nil {
-		hranaError(w, http.StatusNotFound, "no such database")
+		lookupError(w, err)
 		return
 	}
 	d, err := s.store.Database(ctx, o.ID, name)
 	if err != nil {
-		hranaError(w, http.StatusNotFound, "no such database")
+		lookupError(w, err)
 		return
 	}
 	// A regular database in a cluster is served by its group's master, reads

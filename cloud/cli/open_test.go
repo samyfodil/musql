@@ -112,3 +112,35 @@ func TestShellRead(t *testing.T) {
 		t.Fatalf("no file: %q", errs)
 	}
 }
+
+// TestOpenPipedScript: piped input runs dot-commands as the prompt does, so a
+// script of .read lines (#133) reads each file, Windows paths included; it
+// carries on past an error as C's shell does and still exits failing.
+func TestOpenPipedScript(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.musq")
+	if err := os.Mkdir(filepath.Join(dir, "queries"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	q1 := filepath.Join(dir, "queries", "q01.sql")
+	q2 := filepath.Join(dir, "queries", "q02.sql")
+	if err := os.WriteFile(q1, []byte("CREATE TABLE t(x);\r\nINSERT INTO t VALUES (1), (2);\r\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(q2, []byte("SELECT sum(x) AS s\nFROM t"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run := func(stdin string) (string, string, error) {
+		var out, errs bytes.Buffer
+		err := cli.Run(context.Background(), cli.Env{Dir: t.TempDir(), Stdin: strings.NewReader(stdin), Stdout: &out, Stderr: &errs},
+			[]string{"open", path})
+		return out.String(), errs.String(), err
+	}
+	if out, errs, err := run(".read " + q1 + "\n.read " + q2 + "\n"); err != nil || out != "s\n3\n" || errs != "" {
+		t.Fatalf("reads: %q %q %v", out, errs, err)
+	}
+	out, errs, err := run("SELECT nosuch FROM t;\n.mode csv\nSELECT count(*) AS n FROM t;")
+	if err == nil || out != "n\n2\n" || !strings.Contains(errs, "nosuch") {
+		t.Fatalf("past an error: %q %q %v", out, errs, err)
+	}
+}

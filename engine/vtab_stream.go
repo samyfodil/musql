@@ -24,11 +24,13 @@ type vtabStream struct {
 }
 
 // vtabScan is an open, filtered cursor and what filtering it again takes.
+// argvFrom[k] is the vtabCorrValue argv[k] came from, -1 for one folded once.
 type vtabScan struct {
-	cur    VtabCursor
-	idxNum int
-	idxStr string
-	argv   []Value
+	cur      VtabCursor
+	idxNum   int
+	idxStr   string
+	argv     []Value
+	argvFrom []int
 }
 
 // openVtabStreamCursor opens a cursor that streams s, or materializes through
@@ -58,7 +60,7 @@ func (p *ReadOnlyPager) startVtabStream(it FromItem, params []Value, outer *eval
 	for i, c := range vcols {
 		cols[i] = columnInfo{Name: c.Name, DeclType: c.Type, Aff: vtabColumnAffinity(c), Hidden: c.Hidden, Unindexed: c.Unindexed}
 	}
-	info, argv, err := p.vtabFilterArgs(it, cols, tab, params, outer, trig, from, corr)
+	info, argv, argvFrom, err := p.vtabFilterArgs(it, cols, tab, params, outer, trig, from, corr)
 	if err != nil {
 		return nil, err
 	}
@@ -69,7 +71,7 @@ func (p *ReadOnlyPager) startVtabStream(it FromItem, params []Value, outer *eval
 	if ea, ok := cur.(vtabEncodingAware); ok {
 		ea.setTextEncoding(p.encoding())
 	}
-	sc := &vtabScan{cur: cur, idxNum: info.IdxNum, idxStr: info.IdxStr, argv: argv}
+	sc := &vtabScan{cur: cur, idxNum: info.IdxNum, idxStr: info.IdxStr, argv: argv, argvFrom: argvFrom}
 	if err := cur.Filter(sc.idxNum, sc.idxStr, sc.argv); err != nil {
 		return nil, err
 	}
@@ -137,5 +139,64 @@ func (cur *vdbeCursor) advanceVtab() bool {
 	cur.rowid = uint64(rid)
 	cur.rowVals = s.row
 	cur.rowRaw = nil
+	return true
+}
+
+// keptVtab is a correlated source's streamed scan, kept on the machine past
+// the run that opened it: a subquery over generate_series correlated to the
+// outer row opens it once per outer row, and each open resolved the module,
+// asked BestIndex and opened a cursor again, for nothing but new values. Only
+// generate_series is kept: its cursor is a function of Filter's arguments
+// alone, so it reads nothing a later run could have changed.
+type keptVtab struct {
+	ds *derivedSource
+	s  *vtabStream
+}
+
+// maxKeptVtab bounds the scans a machine keeps.
+const maxKeptVtab = 4
+
+// keepVtabStream keeps s, whose scan sc has just been filtered, when every
+// value Filter takes comes from the outer row: the constraints BestIndex was
+// offered are then the same at every open, and only their values change.
+func (m *vdbe) keepVtabStream(ds *derivedSource, s *vtabStream, sc *vtabScan) {
+	if len(m.vtKept) >= maxKeptVtab || !isSeriesSource(ds) {
+		return
+	}
+	for _, from := range sc.argvFrom {
+		if from < 0 {
+			return
+		}
+	}
+	m.vtKept = append(m.vtKept, keptVtab{ds: ds, s: s})
+}
+
+// keptVtabStream is the scan kept for ds, made ready to filter again, or nil.
+func (m *vdbe) keptVtabStream(ds *derivedSource) *vtabStream {
+	for _, k := range m.vtKept {
+		if k.ds == ds {
+			s := k.s
+			s.start, s.fallback, s.fresh = nil, nil, false
+			return s
+		}
+	}
+	return nil
+}
+
+// keepsAll reports whether m keeps a scan for every one of srcs, none of them
+// missing.
+func (m *vdbe) keepsAll(srcs []*derivedSource) bool {
+	if len(srcs) == 0 {
+		return false
+	}
+	for _, ds := range srcs {
+		kept := false
+		for _, k := range m.vtKept {
+			kept = kept || k.ds == ds
+		}
+		if !kept {
+			return false
+		}
+	}
 	return true
 }

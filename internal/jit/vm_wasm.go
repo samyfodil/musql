@@ -22,6 +22,14 @@ const (
 	opI64LeS    byte = 0x57
 	opIf        byte = 0x04
 	opElse      byte = 0x05
+
+	opI32LtS        byte = 0x48
+	opI32LeU        byte = 0x4D
+	opI32GeS        byte = 0x4E
+	opI64ExtendI32S byte = 0xAC
+	opI64Load32S    byte = 0x34
+	opI64Load32U    byte = 0x35
+	opI32ShrU       byte = 0x76
 )
 
 // MaxVMWasmBytes bounds the module EmitVM produces on wasm. The JS API caps
@@ -45,6 +53,15 @@ const MaxVMWasmBytes = 6 << 20
 // what the emitter knows (vmKnow): the engine running the module keeps values
 // in machine registers itself, so a guard or a full write known to be
 // redundant is what there is to skip.
+// mapVM is emitVM mapped (Map).
+func mapVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache bool) (*Code, error) {
+	code, err := emitVM(prog, nReg, lay, bound, entry, cache)
+	if err != nil {
+		return nil, err
+	}
+	return Map(code)
+}
+
 func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache bool) ([]byte, error) {
 	// No entry stubs here: an entry starts a run, like a jump target. So a
 	// fused pair whose second pc is an entry is unfused again -- the store of
@@ -95,15 +112,18 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 		e.keyp, e.keyq = w.Local(wI32), w.Local(wI32)
 	}
 	if slices.ContainsFunc(prog, func(in VInsn) bool {
-		return in.Op == VSubstr || in.Op == VTextCmpJump || in.Op == VTextCmpSet
+		return in.Op == VSubstr || in.Op == VTextCmpJump || in.Op == VTextCmpSet || in.Op == VInText || in.Op == VLike
 	}) {
 		e.txa, e.txb = w.Local(wI32), w.Local(wI32)
 	}
 	for _, in := range prog {
-		if in.Op == VColumn || in.Op == VNext || in.Op == VRewind || in.Op == VRowid || in.Op == VOpen || in.Op == VClose {
+		switch in.Op {
+		case VColumn, VNext, VRewind, VRowid, VOpen, VClose, VSeekRowid, VSeekIdx, VSeekRewind:
 			e.curs, e.rowp, e.valp = w.Local(wI32), w.Local(wI32), w.Local(wI32)
 			w.LoadPtr(POffCur)
 			w.Set(e.curs)
+		}
+		if e.curs != 0 {
 			break
 		}
 	}
@@ -171,6 +191,9 @@ type vmEmitWasm struct {
 	curs, rowp, valp uint32 // the cursor table, a row's header, its first Value (when the program has cursor ops)
 	keyp, keyq       uint32 // VInSet's search: the candidate key and the halfway one
 	txa, txb         uint32 // the TEXT arms' byte addresses
+	txc, txd, txe    uint32 // and the LIKE, IN and numeric-text arms' (textLocals)
+	sk1, sk2, skf    uint32 // the segment and seek arms' scratch (segLocals)
+	skm              uint32
 	f0, f1, fr       uint32 // the REAL arms' scratch (vm_real_wasm.go's flocals)
 	cur              int    // the pc whose code is being emitted
 	extra            int    // if-blocks opened inside it
@@ -679,58 +702,19 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		}, -1)
 	case VColumn:
 		// See vm_amd64.go's VColumn: the same steps.
-		cb := uint32(in.A * VCursorSize)
-		vb := uint32(in.B * L.Size)
-		w.Get(e.curs)
-		w.LoadI64(cb + VCursorOffOk)
-		w.op(opI64Eqz)
-		e.exitIf(pc)
-		w.Get(e.curs)
-		w.LoadI64(cb + VCursorOffMask) // the column must be one the engine made readable
-		w.I64(int64(1) << uint(in.B))
-		w.op(opI64And)
-		w.op(opI64Eqz)
-		e.exitIf(pc)
-		w.Get(e.curs)
-		w.LoadI64(cb + VCursorOffPos)
-		w.Set(e.t1)
-		w.Get(e.t1)
-		w.Get(e.curs)
-		w.LoadI64(cb + VCursorOffN)
-		w.op(opI64GeU) // unsigned: a position before the first row is huge
-		e.exitIf(pc)
-		w.Get(e.curs)
-		w.LoadI64(cb + VCursorOffRows)
-		w.op(opI32WrapI64)
-		w.Get(e.t1)
-		w.op(opI32WrapI64)
-		w.I32(sliceHeaderSize)
-		w.op(opI32Mul)
-		w.op(opI32Add)
-		w.Set(e.rowp)
-		w.Get(e.rowp)
-		w.LoadI64(8) // the row's length
-		w.I64(int64(in.B))
-		w.op(opI64LeU) // a row narrower than the column: the VDBE's
-		e.exitIf(pc)
-		w.Get(e.rowp)
-		w.LoadI64(0)
-		w.op(opI32WrapI64)
-		w.Set(e.valp)
-		// A string or blob is copied with its pointer, as on amd64.
-		w.Get(e.valp)
-		w.LoadI64(vb + uint32(L.OffS))
-		if !e.know.noS[in.C] {
-			e.loadI64(in.C, L.OffS)
-			w.op(opI64Or)
+		if in.Imm == 1 {
+			e.segColumn(pc, in)
+			break
 		}
-		e.pointerWords(pc, func(f int) {
-			w.Get(e.regs)
-			w.Get(e.valp)
-			w.LoadI64(vb + uint32(f))
-			w.StoreI64(e.addr(in.C, f))
-		})
+		e.cursorChecks(pc, in)
+		e.rowColumn(pc, in)
 		e.know.wroteAny(in.C, false)
+	case VSeekRowid:
+		e.seekRowid(pc, in)
+	case VSeekIdx:
+		e.seekIdx(pc, in)
+	case VSeekRewind:
+		e.seekRewind(pc, in)
 	case VReal, VFAdd, VFSub, VFMul, VFDiv, VFCmpJump, VFCmpSet, VFCmpBr, VMath:
 		return e.realInsn(pc, in)
 	case VSubstr:
@@ -742,44 +726,20 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		e.textCmp(pc, in)
 	case VInSet:
 		e.inSet(pc, in)
+	case VInText:
+		e.inText(pc, in)
+	case VText:
+		e.text(pc, in)
+	case VLike:
+		e.like(pc, in)
+	case VInSub:
+		e.inSub(pc, in)
 	case VResultRow:
 		e.resultRow(pc, in)
 	case VIntGuard:
 		e.guards(pc, e.isInt(in.A))
 	case VRowid:
-		if in.Dead {
-			e.forgetReg(in.C)
-			break
-		}
-		e.guards(pc, e.dstNoS(in, in.C))
-		cb := uint32(in.A * VCursorSize)
-		w.Get(e.curs)
-		w.LoadI64(cb + VCursorOffOk)
-		w.op(opI64Eqz)
-		e.exitIf(pc)
-		w.Get(e.curs)
-		w.LoadI64(cb + VCursorOffRids)
-		w.op(opI64Eqz)
-		e.exitIf(pc)
-		w.Get(e.curs)
-		w.LoadI64(cb + VCursorOffPos)
-		w.Set(e.t1)
-		w.Get(e.t1)
-		w.Get(e.curs)
-		w.LoadI64(cb + VCursorOffN)
-		w.op(opI64GeU) // unsigned: a position before the first row is huge
-		e.exitIf(pc)
-		w.Get(e.curs)
-		w.LoadI64(cb + VCursorOffRids)
-		w.op(opI32WrapI64)
-		w.Get(e.t1)
-		w.op(opI32WrapI64)
-		w.I32(8)
-		w.op(opI32Mul)
-		w.op(opI32Add)
-		w.LoadI64(0)
-		w.Set(e.t1)
-		e.storeInt(in, in.C, e.t1)
+		e.segRowid(pc, in)
 	case VOpen, VClose:
 		cb := uint32(in.A * VCursorSize)
 		w.Get(e.curs)
@@ -792,6 +752,15 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 			w.StoreI64(cb + off)
 		}
 		if in.Op == VOpen {
+			// A seek cursor (Reopen 4 or 5): the rows its last seek's run
+			// served are counted, and the open marked native (5).
+			e.cursorField(in.A, VCursorOffReop)
+			w.I64(VReopenSeek)
+			w.op(opI64GeS)
+			w.op(opIf, opVoid)
+			e.seekIdxServed(in.A)
+			set(VCursorOffReop, VReopenSeekOpened)
+			w.op(opEnd)
 			w.Get(e.curs)
 			w.Get(e.curs)
 			w.LoadI64(cb + VCursorOffN)

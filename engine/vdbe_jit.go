@@ -432,11 +432,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	if entries == 0 {
 		return nil
 	}
-	b, err := jit.EmitVMFused(vp, prog.NReg+nParams, valueLayout, entry, fusable)
-	if err != nil {
-		return nil
-	}
-	code, err := jit.Map(b)
+	code, err := jit.MapVMFused(vp, prog.NReg+nParams, valueLayout, entry, fusable)
 	if err != nil {
 		return nil
 	}

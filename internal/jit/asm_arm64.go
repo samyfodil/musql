@@ -2,7 +2,11 @@
 
 package jit
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+	"sync"
+)
 
 // A minimal AArch64 encoder for filter kernel instructions. Every instruction
 // is one word, little-endian. Kernels use only X0-X10 (caller-saved).
@@ -72,6 +76,39 @@ const (
 
 // NewArm returns an empty encoder.
 func NewArm() *Arm { return &Arm{labels: map[string]int{}} }
+
+// newArmFor is an encoder sized for a program of n instructions, whose code,
+// labels and branches grow with it.
+func newArmFor(n int) *Arm {
+	return &Arm{buf: make([]uint32, 0, 64*n+128), labels: make(map[string]int, 4*n), fixups: make([]armFixup, 0, 4*n)}
+}
+
+var armPool sync.Pool
+
+// armFor is newArmFor from armPool, emptied.
+func armFor(n int) *Arm {
+	a, ok := armPool.Get().(*Arm)
+	if !ok {
+		return newArmFor(n)
+	}
+	a.reset(n)
+	return a
+}
+
+// reset empties a for a program of n instructions.
+func (a *Arm) reset(n int) {
+	a.buf = slices.Grow(a.buf[:0], 64*n+128)
+	clear(a.labels)
+	a.fixups = a.fixups[:0]
+}
+
+// release gives a back to armPool, once nothing holds its code; a large one is
+// left to the collector.
+func (a *Arm) release() {
+	if cap(a.buf) <= 1<<18 && len(a.labels) <= 1<<16 {
+		armPool.Put(a)
+	}
+}
 
 // Label marks the current position.
 func (a *Arm) Label(name string) { a.labels[name] = len(a.buf) }

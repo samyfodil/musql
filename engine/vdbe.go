@@ -40,6 +40,11 @@ type vdbe struct {
 	jDeferPC int
 	jDeferJX *vmJIT
 
+	// vtKept is the streamed virtual-table scans a correlated source opens
+	// again for every outer row, kept filtered across the machine's runs
+	// (keptVtabStream).
+	vtKept []keptVtab
+
 	regs []Value
 	jx   *vmJIT        // native code for the program run() is given, when it has some
 	jcur []jit.VCursor // native code's view of the cursors it names, filled at each entry
@@ -1190,18 +1195,19 @@ func (prog *Program) execWithParentRun(parent *vdbe, pager *ReadOnlyPager, first
 	// The aggregate opcodes resolve a correlated
 	// reference through evalCtx.outer, not through OpOuterColumn -- see
 	// Program.OuterFrames and buildOuterEvalCtx.
-	var outerCtx *evalCtx
-	if !prog.outerCtxUnread() {
-		var oerr error
-		if outerCtx, oerr = buildOuterEvalCtx(prog.OuterFrames, parent); oerr != nil {
-			return nil, oerr
-		}
-	}
 	// From the machine pool, as execOuterTrig's machines are: a correlated
 	// subquery runs once per outer row, and a fresh machine for every run was
 	// most of what such a query allocated. See vdbe_machine_pool.go for what
 	// may be reused.
 	m := prog.getMachine()
+	var outerCtx *evalCtx
+	if v := prog.outerCtxVerdict(); !v.unread && !m.keepsAll(v.keptOnly) {
+		var oerr error
+		if outerCtx, oerr = buildOuterEvalCtx(prog.OuterFrames, parent); oerr != nil {
+			prog.putMachine(m)
+			return nil, oerr
+		}
+	}
 	m.jx = prog.jitCodeOn(pager)
 	m.sorters = make([]*vdbeSorter, prog.NSorters)
 	m.distinctSets = make([]*vdbeDistinctSet, prog.NDistinct)
@@ -1260,13 +1266,22 @@ func (m *vdbe) likePlanFor(pat Value) *likePlan {
 // opcodes read m.outer, so this is a WHITELIST of opcodes that do not -- an
 // opcode missing from it keeps the context, which is the safe direction.
 func (prog *Program) outerCtxUnread() bool {
+	return prog.outerCtxVerdict().unread
+}
+
+// outerCtxVerdict is outerCtxUnread's answer, cached, and the correlated
+// generate_series sources that are the only other readers when there are no
+// others (keptOnly): once the machine keeps all of their scans
+// (keptVtabStream), no open of theirs folds a value against the context.
+func (prog *Program) outerCtxVerdict() *outerCtxVerdict {
 	if len(prog.Insns) == 0 {
-		return false
+		return &outerCtxVerdict{}
 	}
 	if v := (*outerCtxVerdict)(atomic.LoadPointer(&prog.outerCtx)); v != nil && v.insns == &prog.Insns[0] && v.n == len(prog.Insns) {
-		return v.unread
+		return v
 	}
-	unread := true
+	v := &outerCtxVerdict{insns: &prog.Insns[0], n: len(prog.Insns), unread: true}
+	others := false
 	for i := range prog.Insns {
 		switch prog.Insns[i].Op {
 		case OpInit, OpOpenRead, OpRewind, OpNext, OpIfEmpty, OpClose, OpHalt, OpGoto,
@@ -1274,20 +1289,31 @@ func (prog *Program) outerCtxUnread() bool {
 			OpInteger, OpVariable, OpNull, OpString8, OpReal, OpSCopy, OpCopy,
 			OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull,
 			OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpSeekRowidSetHint, OpAutoIndexOrder, OpSortedSeek, OpResultRow:
+		case OpOpenDerived:
+			v.unread = false
+			if ds, ok := prog.Insns[i].P4.(*derivedSource); ok && ds.vtabStream && len(ds.vtabCorr) > 0 && isSeriesSource(ds) {
+				v.keptOnly = append(v.keptOnly, ds)
+			} else {
+				others = true
+			}
 		default:
-			unread = false
+			v.unread, others = false, true
 		}
 	}
-	atomic.StorePointer(&prog.outerCtx, unsafe.Pointer(&outerCtxVerdict{insns: &prog.Insns[0], n: len(prog.Insns), unread: unread}))
-	return unread
+	if others {
+		v.keptOnly = nil
+	}
+	atomic.StorePointer(&prog.outerCtx, unsafe.Pointer(v))
+	return v
 }
 
 // outerCtxVerdict is outerCtxUnread's cached answer and the instructions it is
 // about.
 type outerCtxVerdict struct {
-	insns  *Instruction
-	n      int
-	unread bool
+	insns    *Instruction
+	n        int
+	unread   bool
+	keptOnly []*derivedSource
 }
 
 // outerFrame returns the ancestor vdbe levels frames up (levels >= 1): the
@@ -2263,21 +2289,34 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 					// iTarget, 1)" (wherecode.c:1584) feeding the OP_VFilter
 					// below it. No subCache slot: the row set differs per outer
 					// row, which is the entire point.
+					if vs := m.keptVtabStream(ds); vs != nil && ds.vtabStream {
+						for k, ci := range vs.scan.argvFrom {
+							vs.scan.argv[k] = m.regs[ds.vtabCorr[ci].reg]
+						}
+						cur := m.openCursorInto(op.P1, nil, ds.tbl)
+						cur.pos, cur.vt = -1, vs
+						break
+					}
 					corr := make([]vtabCorrValue, len(ds.vtabCorr))
 					for i, t := range ds.vtabCorr {
 						corr[i] = vtabCorrValue{conj: t.conj, arg: t.arg, col: t.col, op: t.op, v: m.regs[t.reg]}
 					}
 					if ds.vtabStream {
 						vt, params, outer := *ds.vtab, m.params, m.outer
-						m.cursors[op.P1] = openVtabStreamCursor(ds.tbl, &vtabStream{
-							start: func() (*vtabScan, error) {
-								return dsPager.startVtabStream(vt, params, outer, ds.vtabTrig, m, corr)
-							},
+						vs := &vtabStream{
 							fallback: func() ([][]Value, []int64, error) {
 								_, rows, rowids, err := dsPager.materializeVtab(vt, params, outer, ds.vtabTrig, m, corr)
 								return rows, rowids, err
 							},
-						})
+						}
+						vs.start = func() (*vtabScan, error) {
+							sc, err := dsPager.startVtabStream(vt, params, outer, ds.vtabTrig, m, corr)
+							if sc != nil && err == nil {
+								m.keepVtabStream(ds, vs, sc)
+							}
+							return sc, err
+						}
+						m.cursors[op.P1] = openVtabStreamCursor(ds.tbl, vs)
 						break
 					}
 					_, rows, rowids, verr := dsPager.materializeVtab(*ds.vtab, m.params, m.outer, ds.vtabTrig, m, corr)

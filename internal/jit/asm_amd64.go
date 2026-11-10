@@ -2,6 +2,11 @@
 
 package jit
 
+import (
+	"slices"
+	"sync"
+)
+
 // A minimal x86-64 encoder: only instructions the filter kernels use.
 
 // Reg is a general-purpose register number.
@@ -39,6 +44,34 @@ type fixup struct {
 }
 
 func NewAsm() *Asm { return &Asm{labels: map[string]int{}} }
+
+// newAsmFor is an encoder sized for a program of n instructions, whose code,
+// labels and jumps grow with it.
+func newAsmFor(n int) *Asm {
+	return &Asm{buf: make([]byte, 0, 256*n+512), labels: make(map[string]int, 4*n), fixups: make([]fixup, 0, 4*n)}
+}
+
+var asmPool sync.Pool
+
+// asmFor is newAsmFor from asmPool, emptied.
+func asmFor(n int) *Asm {
+	a, ok := asmPool.Get().(*Asm)
+	if !ok {
+		return newAsmFor(n)
+	}
+	a.buf = slices.Grow(a.buf[:0], 256*n+512)
+	clear(a.labels)
+	a.fixups = a.fixups[:0]
+	return a
+}
+
+// release gives a back to asmPool, once nothing holds its code; a large one is
+// left to the collector.
+func (a *Asm) release() {
+	if cap(a.buf) <= 1<<20 && len(a.labels) <= 1<<16 {
+		asmPool.Put(a)
+	}
+}
 
 // Code returns the encoded bytes with every jump resolved.
 func (a *Asm) Code() ([]byte, error) {

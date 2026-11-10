@@ -1,6 +1,7 @@
 package engine_test
 
 import (
+	"fmt"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -289,19 +290,76 @@ func TestExplainQueryPlanCompound(t *testing.T) {
 			t.Errorf("%s:\n got %v\nwant %v", tc.sql, got, tc.want)
 		}
 	}
-	// The merging families decline, cleanly and with their reason.
-	for _, sql := range []string{
-		`EXPLAIN QUERY PLAN SELECT a FROM t UNION SELECT x FROM u`,
-		`EXPLAIN QUERY PLAN SELECT a FROM t INTERSECT SELECT x FROM u`,
-		`EXPLAIN QUERY PLAN SELECT a FROM t EXCEPT SELECT x FROM u`,
-		`EXPLAIN QUERY PLAN SELECT a FROM t UNION ALL SELECT x FROM u ORDER BY 1`,
+	// The merging families print the tree this engine runs: each arm under
+	// its operator, and one sort for an ORDER BY. C prints a MERGE tree there,
+	// which describes a program this engine does not run.
+	for _, tc := range []struct {
+		sql  string
+		want []string
+	}{
+		{`EXPLAIN QUERY PLAN SELECT a FROM t UNION SELECT x FROM u`, []string{
+			"1|0|COMPOUND QUERY", "2|1|LEFT-MOST SUBQUERY", "3|2|SCAN t", "4|1|UNION", "5|4|SCAN u",
+		}},
+		{`EXPLAIN QUERY PLAN SELECT a FROM t INTERSECT SELECT x FROM u EXCEPT SELECT 1`, []string{
+			"1|0|COMPOUND QUERY", "2|1|LEFT-MOST SUBQUERY", "3|2|SCAN t", "4|1|INTERSECT", "5|4|SCAN u",
+			"6|1|EXCEPT", "7|6|SCAN CONSTANT ROW",
+		}},
+		{`EXPLAIN QUERY PLAN SELECT a FROM t UNION ALL SELECT x FROM u ORDER BY 1`, []string{
+			"1|0|COMPOUND QUERY", "2|1|LEFT-MOST SUBQUERY", "3|2|SCAN t", "4|1|UNION ALL", "5|4|SCAN u",
+			"6|0|USE TEMP B-TREE FOR ORDER BY",
+		}},
 	} {
-		if _, _, err := p.Query(sql); err == nil {
-			t.Errorf("%s answered; C SQLite reports a MERGE tree this engine does not derive", sql)
-		} else if !strings.Contains(err.Error(), "MERGE") {
-			t.Errorf("%s: %v -- the decline should name what it cannot reproduce", sql, err)
+		if got := explainPlanRows(t, p, tc.sql); strings.Join(got, " ") != strings.Join(tc.want, " ") {
+			t.Errorf("%s:\n got %v\nwant %v", tc.sql, got, tc.want)
 		}
 	}
+}
+
+// TestExplainQueryPlanSubqueries: the plan of every program a statement runs
+// hangs under the line that names it (#123): a FROM subquery's under its
+// MATERIALIZE line, before its scan, and an expression's under a SUBQUERY line.
+func TestExplainQueryPlanSubqueries(t *testing.T) {
+	p := explainDB(t)
+	for _, tc := range []struct {
+		sql  string
+		want []string
+	}{
+		{`EXPLAIN QUERY PLAN SELECT sum(a) FROM (SELECT a FROM t UNION SELECT x FROM u)`, []string{
+			"1|0|MATERIALIZE (subquery-1)", "2|1|COMPOUND QUERY", "3|2|LEFT-MOST SUBQUERY", "4|3|SCAN t",
+			"5|2|UNION", "6|5|SCAN u", "7|0|SCAN (subquery-1)",
+		}},
+		{`EXPLAIN QUERY PLAN SELECT sum(a) FROM (SELECT DISTINCT a FROM (SELECT a FROM t UNION ALL SELECT x FROM u))`, []string{
+			"1|0|MATERIALIZE (subquery-1)", "2|1|MATERIALIZE (subquery-2)", "3|2|COMPOUND QUERY",
+			"4|3|LEFT-MOST SUBQUERY", "5|4|SCAN t", "6|3|UNION ALL", "7|6|SCAN u",
+			"8|1|SCAN (subquery-2)", "9|0|SCAN (subquery-1)",
+		}},
+		{`EXPLAIN QUERY PLAN SELECT a FROM t WHERE b IN (SELECT y FROM u)`, []string{
+			"1|0|SCAN t", "2|0|LIST SUBQUERY 1", "3|2|SCAN u",
+		}},
+		{`EXPLAIN QUERY PLAN SELECT (SELECT max(x) FROM u WHERE u.y > t.a) FROM t`, []string{
+			"1|0|SCAN t", "2|0|CORRELATED SCALAR SUBQUERY 1", "3|2|SCAN u",
+		}},
+		{`EXPLAIN QUERY PLAN SELECT * FROM t, (SELECT x, count(*) FROM u GROUP BY x) g WHERE g.x = t.b`, []string{
+			"1|0|SCAN t", "2|0|MATERIALIZE (subquery-1)", "3|2|SCAN u", "4|0|SCAN (subquery-1)",
+		}},
+	} {
+		if got := explainPlanRows(t, p, tc.sql); strings.Join(got, " ") != strings.Join(tc.want, " ") {
+			t.Errorf("%s:\n got %v\nwant %v", tc.sql, got, tc.want)
+		}
+	}
+}
+
+func explainPlanRows(t *testing.T, p *engine.ReadOnlyPager, sql string) []string {
+	t.Helper()
+	_, rows, err := p.Query(sql)
+	if err != nil {
+		t.Fatalf("%s: %v", sql, err)
+	}
+	got := make([]string, len(rows))
+	for i, r := range rows {
+		got[i] = strconv.FormatInt(r[0].I, 10) + "|" + strconv.FormatInt(r[1].I, 10) + "|" + string(r[3].S)
+	}
+	return got
 }
 
 // TestExplainThroughEngineExec: EXPLAIN runs nothing, so it belongs on the
@@ -342,5 +400,127 @@ func TestExplainThroughEngineExec(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0][0].I != 2 || rows[0][1].I != 2 {
 		t.Errorf("after four EXPLAINs: count/changes = %v, want 2/2", rows)
+	}
+}
+
+// TestExplainListingCompound: a compound lists each arm's program in turn
+// (#131), addressed as one listing, every jump landing inside its own arm, and
+// each later arm's first line naming the operator that brings it in.
+func TestExplainListingCompound(t *testing.T) {
+	p := explainDB(t)
+	for _, tc := range []struct {
+		sql string
+		ops []string
+	}{
+		{`EXPLAIN SELECT 1 a UNION ALL SELECT 2`, []string{"", "UNION ALL"}},
+		{`EXPLAIN SELECT a FROM t WHERE b > 2 UNION SELECT x FROM u WHERE y = 9`, []string{"", "UNION"}},
+		{`EXPLAIN SELECT b FROM t INTERSECT SELECT x FROM u EXCEPT SELECT 7 ORDER BY 1 LIMIT 3`, []string{"", "INTERSECT", "EXCEPT"}},
+		{`EXPLAIN VALUES (1), (2), (3)`, []string{"", "UNION ALL", "UNION ALL"}},
+	} {
+		_, rows, err := p.Query(tc.sql)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.sql, err)
+		}
+		var starts []int
+		for i, r := range rows {
+			if r[0].I != int64(i) {
+				t.Fatalf("%s: row %d addr = %d", tc.sql, i, r[0].I)
+			}
+			if string(r[1].S) == "Init" {
+				starts = append(starts, i)
+			}
+		}
+		if len(starts) != len(tc.ops) || starts[0] != 0 {
+			t.Fatalf("%s: arms start at %v, want %d arms", tc.sql, starts, len(tc.ops))
+		}
+		for k, at := range starts {
+			end := len(rows)
+			if k+1 < len(starts) {
+				end = starts[k+1]
+			}
+			comment := string(rows[at][7].S)
+			if tc.ops[k] != "" && !strings.HasPrefix(comment, tc.ops[k]+": start at ") {
+				t.Errorf("%s: arm %d begins %q", tc.sql, k, comment)
+			}
+			if got := string(rows[end-1][1].S); got != "Halt" {
+				t.Errorf("%s: arm %d ends with %s", tc.sql, k, got)
+			}
+			for i := at; i < end; i++ {
+				switch string(rows[i][1].S) {
+				case "Init", "Goto", "Rewind", "Next", "If", "IfNot", "IsNull", "NotNull", "Gosub":
+					if p2 := int(rows[i][3].I); p2 < at || p2 >= end {
+						t.Errorf("%s: %d %s jumps to %d, outside its arm [%d,%d)", tc.sql, i, rows[i][1].S, p2, at, end)
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestExplainListingSubqueries: the programs a statement runs follow its own
+// in the listing (#130), each begun by a line naming the instruction that runs
+// it, and every jump lands inside its own program.
+func TestExplainListingSubqueries(t *testing.T) {
+	p := explainDB(t)
+	for _, tc := range []struct {
+		sql  string
+		subs []string // what each later program's first line is brought in by
+	}{
+		{`EXPLAIN SELECT sum(a) FROM (SELECT DISTINCT a FROM (SELECT a FROM t UNION ALL SELECT x FROM u))`,
+			[]string{"OpenDerived", "OpenDerived", "OpenDerived, UNION ALL"}},
+		{`EXPLAIN SELECT a FROM t WHERE b IN (SELECT y FROM u)`, []string{"InSub"}},
+		{`EXPLAIN SELECT (SELECT max(x) FROM u WHERE u.y > t.a) FROM t`, []string{"Subquery"}},
+	} {
+		_, rows, err := p.Query(tc.sql)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.sql, err)
+		}
+		var starts []int
+		for i, r := range rows {
+			if r[0].I != int64(i) {
+				t.Fatalf("%s: row %d addr = %d", tc.sql, i, r[0].I)
+			}
+			if string(r[1].S) == "Init" {
+				starts = append(starts, i)
+			}
+		}
+		if len(starts) != 1+len(tc.subs) {
+			t.Fatalf("%s: programs start at %v, want %d", tc.sql, starts, 1+len(tc.subs))
+		}
+		for k, at := range starts {
+			end := len(rows)
+			if k+1 < len(starts) {
+				end = starts[k+1]
+			}
+			if k > 0 {
+				comment := string(rows[at][7].S)
+				var by int
+				var rest string
+				if n, _ := fmt.Sscanf(comment, "subquery of %d", &by); n != 1 || by >= at {
+					t.Errorf("%s: program %d begins %q", tc.sql, k, comment)
+					continue
+				}
+				want := strings.SplitN(tc.subs[k-1], ", ", 2)
+				if got := string(rows[by][1].S); got != want[0] {
+					t.Errorf("%s: program %d is brought in by %d %s, want %s", tc.sql, k, by, got, want[0])
+				}
+				if len(want) == 2 {
+					rest = ", " + want[1] + ": "
+				} else {
+					rest = ": "
+				}
+				if !strings.HasPrefix(comment, fmt.Sprintf("subquery of %d%s", by, rest)) {
+					t.Errorf("%s: program %d begins %q", tc.sql, k, comment)
+				}
+			}
+			for i := at; i < end; i++ {
+				switch string(rows[i][1].S) {
+				case "Init", "Goto", "Rewind", "Next", "If", "IfNot", "IsNull", "NotNull", "Gosub", "Distinct":
+					if p2 := int(rows[i][3].I); p2 < at || p2 >= end {
+						t.Errorf("%s: %d %s jumps to %d, outside its program [%d,%d)", tc.sql, i, rows[i][1].S, p2, at, end)
+					}
+				}
+			}
+		}
 	}
 }

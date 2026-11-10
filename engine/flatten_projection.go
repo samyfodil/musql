@@ -578,12 +578,16 @@ func (p *ReadOnlyPager) r41Arm(stmt *SelectStmt, i int, it FromItem, body *Selec
 			f.others[r33sFoldIdent(c)] = true
 		}
 	}
-	if f.dName != "" {
-		if f.scopes[r33sFoldIdent(f.dName)] {
-			return nil, false
-		}
+	if f.dName != "" && !f.scopes[r33sFoldIdent(f.dName)] {
 		f.alias = f.dName
 	} else {
+		// A name another FROM item also has ("FROM t, t") is one no reference
+		// may qualify by, as it would be ambiguous; with none, the body takes
+		// a name of its own.
+		if f.dName != "" && !r41WalkStmt(stmt, func(c ColumnExpr) bool { return !equalFoldName(c.Qualifier, f.dName) },
+			func(q string) bool { return !equalFoldName(q, f.dName) }) {
+			return nil, false
+		}
 		for n := 1; ; n++ {
 			f.alias = fmt.Sprintf("sqlite_flat_%d", n)
 			if !f.scopes[r33sFoldIdent(f.alias)] {
@@ -1817,8 +1821,8 @@ func (p *ReadOnlyPager) r41ItemNames(o FromItem) (string, []string, bool) {
 }
 
 // r41TVFColumns is every column name, hidden ones included, of a
-// table-valued function item whose module r41 reads (json_each and its kin),
-// or nil.
+// table-valued function item whose module r41 reads (json_each and its kin,
+// and generate_series, which r41SeriesBase flattens), or nil.
 func r41TVFColumns(o FromItem) []string {
 	if o.Schema != "" || o.Subquery != nil {
 		return nil
@@ -1827,7 +1831,9 @@ func r41TVFColumns(o FromItem) []string {
 	if !ok {
 		return nil
 	}
-	if _, isJSON := mod.(jsonEachModule); !isJSON {
+	_, isJSON := mod.(jsonEachModule)
+	_, isSeries := mod.(seriesModule)
+	if !isJSON && !isSeries {
 		return nil
 	}
 	cols, _, err := mod.Connect(nil)

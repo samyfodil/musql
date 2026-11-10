@@ -73,6 +73,18 @@ type remoteConn struct {
 // errUnreachable is a request that did not reach a master that could answer.
 var errUnreachable = errors.New("state: the master is unreachable")
 
+// errLocalMiss is a read this node's copy answered with no row while no master
+// could: the copy may be behind the master, so the row may exist. It waits, as
+// a read with no master does.
+var errLocalMiss = fmt.Errorf("%w: this node's copy has no such row, and may be behind the master", ErrNoMaster)
+
+// fallsBack reports whether a statement that failed with err outside a
+// transaction runs on this node's copy instead: no master answered, and the
+// copy has synced once (Master.Local).
+func (c *remoteConn) fallsBack(err error, inTx bool) bool {
+	return (errors.Is(err, errUnreachable) || errors.Is(err, ErrNoMaster)) && !inTx && c.m.local()
+}
+
 // errRemote is a statement the master refused: its message is the master's.
 type errRemote struct{ msg string }
 
@@ -208,7 +220,7 @@ func (c *remoteConn) ExecContext(ctx context.Context, query string, args []drive
 	}
 	inTx := c.baton != nil
 	r, err := c.run(ctx, st, inTx, false)
-	if errors.Is(err, errUnreachable) && !inTx && c.m.local() {
+	if c.fallsBack(err, inTx) {
 		return c.local.ExecContext(ctx, query, values(args)...)
 	}
 	if err != nil {
@@ -223,14 +235,33 @@ func (c *remoteConn) QueryContext(ctx context.Context, query string, args []driv
 		return nil, err
 	}
 	inTx := c.baton != nil
-	r, err := c.run(ctx, st, inTx, false)
-	if errors.Is(err, errUnreachable) && !inTx && c.m.local() {
-		return localRows(ctx, c.local, query, values(args))
+	deadline := time.Now().Add(retryFor)
+	for try := 0; ; try++ {
+		r, err := c.run(ctx, st, inTx, false)
+		if !c.fallsBack(err, inTx) {
+			if err != nil {
+				return nil, err
+			}
+			return &remoteRows{r: r}, nil
+		}
+		rows, err := localRows(ctx, c.local, query, values(args))
+		if err != nil {
+			return nil, err
+		}
+		if len(rows.rows) > 0 {
+			return rows, nil
+		}
+		// No row here, which the master may yet hold: asked again until it
+		// answers, as long as tx waits for one.
+		if time.Now().After(deadline) {
+			return nil, errLocalMiss
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(min(time.Duration(try+1)*5*time.Millisecond, 200*time.Millisecond)):
+		}
 	}
-	if err != nil {
-		return nil, err
-	}
-	return &remoteRows{r: r}, nil
 }
 
 func values(args []driver.NamedValue) []any {
@@ -246,7 +277,7 @@ func values(args []driver.NamedValue) []any {
 
 // localRows runs query on this node's copy, its rows read whole, as a
 // request's are.
-func localRows(ctx context.Context, db *sql.DB, query string, args []any) (driver.Rows, error) {
+func localRows(ctx context.Context, db *sql.DB, query string, args []any) (*memRows, error) {
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err

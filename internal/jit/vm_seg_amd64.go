@@ -1,8 +1,8 @@
 package jit
 
 import (
-	"fmt"
 	"math/bits"
+	"strconv"
 )
 
 // condCarry and condParity are x86's JB (a BT that found the bit set) and JP
@@ -103,7 +103,8 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 	e.destNoS(pc, in.C)
 	delete(e.zeroS, in.C) // every word of the destination is written below
 	dst := e.d(in.C, 0)
-	l := func(s string) string { return fmt.Sprintf("sc%d.%s", pc, s) }
+	pre := "sc" + strconv.Itoa(pc) + "."
+	l := func(s string) string { return pre + s }
 	kindLabel := map[int64]string{VSegInt: "int", VSegFloat: "float", VSegNumeric: "num", VSegIntReal: "intreal", VSegRowid: "rowid", VSegText: "text"}
 	if name, ok := kindLabel[int64(in.T)]; ok {
 		base, have := e.holds[^in.A]
@@ -354,7 +355,8 @@ func (e *vmEmit) seekRowid(pc int, in VInsn) {
 	a, L := e.a, e.lay
 	cb := int32(in.A * VCursorSize)
 	e.unmapCursor(in.A)
-	l := func(s string) string { return fmt.Sprintf("sk%d.%s", pc, s) }
+	pre := "sk" + strconv.Itoa(pc) + "."
+	l := func(s string) string { return pre + s }
 	a.CmpMemDByte(RSI, e.d(in.B, L.OffTyp), L.TypInt)
 	e.jccStub(CondNE, pc) // seekRowidKey's conversions are the VDBE's
 	e.jccWB(pc)           // the cursor's segment pointers are stored
@@ -461,7 +463,8 @@ func (e *vmEmit) seekIdx(pc int, in VInsn) {
 	a, L := e.a, e.lay
 	cb := int32(in.A * VCursorSize)
 	e.unmapCursor(in.A)
-	l := func(s string) string { return fmt.Sprintf("si%d.%s", pc, s) }
+	pre := "si" + strconv.Itoa(pc) + "."
+	l := func(s string) string { return pre + s }
 	a.CmpMemDByte(RSI, e.d(in.B, L.OffTyp), L.TypInt)
 	e.jccStub(CondNE, pc) // the key's conversions are the VDBE's
 	e.jccWB(pc)           // the cursor's segment pointers are stored
@@ -609,10 +612,10 @@ func (e *vmEmit) text(pc int, in VInsn) {
 	}
 	a, L := e.a, e.lay
 	dst := e.d(in.A, 0)
-	same := fmt.Sprintf("tx%d.same", pc)
+	same := "tx" + strconv.Itoa(pc) + ".same"
 	a.MovRegImm64(RAX, in.Imm)
 	a.AluRegMemD(AluCmp, RAX, RSI, dst+int32(L.OffS))
-	store := fmt.Sprintf("tx%d.store", pc)
+	store := "tx" + strconv.Itoa(pc) + ".store"
 	a.Jcc(CondNE, store)
 	a.CmpMemDByte(RSI, dst, L.TypText)
 	a.Jcc(CondNE, store)

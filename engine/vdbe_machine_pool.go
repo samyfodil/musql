@@ -168,6 +168,11 @@ func (prog *Program) putMachineTo(m *vdbe, spare **vdbe) {
 	// The all-NULL row a row-free aggregate step hands on (aggNullRow), cleared.
 	nullRow := m.aggNullRow[:cap(m.aggNullRow)]
 	clear(nullRow)
+	// The kept virtual-table scans (keptVtabStream), their last row cleared.
+	vtKept := m.vtKept
+	for _, k := range vtKept {
+		clear(k.s.row)
+	}
 	// Zeroed in place, then the kept slices put back: the same machine as the
 	// composite literal this was, without building that 1 KB literal and
 	// copying it over -- most of what returning a machine cost per statement.
@@ -177,9 +182,12 @@ func (prog *Program) putMachineTo(m *vdbe, spare **vdbe) {
 	m.colMasks, m.colMasksOf, m.colMasksN, m.colMasksCurs = masks, masksOf, masksN, masksCurs
 	m.aggSpare = aggSpare
 	if spare != nil && *spare == nil {
+		// A session's own slot outlives the pool's cycles, so it keeps no
+		// scan.
 		*spare = m
 		return
 	}
+	m.vtKept = vtKept
 	vdbeMachines.Put(m)
 }
 

@@ -93,3 +93,44 @@ func TestProviderKeys(t *testing.T) {
 		t.Error("verified a token whose key could not be looked up")
 	}
 }
+
+// TestSignStoresALostKey: a provider whose own key the state does not hold --
+// a cluster's new master can be behind the one it was stored on -- stores it
+// again when it next records an expiry, instead of failing every sign-in with
+// "not found" (#129); and one that arrived meanwhile is updated as it is.
+func TestSignStoresALostKey(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	p, err := New(ctx, store, "http://x", WithNode("n1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := store.SigningKeys(ctx)
+	if err != nil || len(keys) != 1 {
+		t.Fatalf("keys: %v %v", keys, err)
+	}
+	lost := keys[0]
+	if err := store.DeleteSigningKey(ctx, lost.KID); err != nil {
+		t.Fatal(err)
+	}
+	claims := func(d time.Duration) *Claims {
+		return &Claims{Claims: jwt.Claims{Subject: "u", Expiry: jwt.NewNumericDate(time.Now().Add(d))}, Use: UseAccess, ClientID: ClientConsole}
+	}
+	tok, err := p.Sign(claims(time.Hour))
+	if err != nil {
+		t.Fatalf("signing with a key the state lost: %v", err)
+	}
+	if _, err := p.Verify(tok, UseAccess); err != nil {
+		t.Fatal(err)
+	}
+	keys, err = store.SigningKeys(ctx)
+	if err != nil || len(keys) != 1 || keys[0].KID != lost.KID || string(keys[0].PrivateKey) != string(lost.PrivateKey) || keys[0].MaxExp < time.Now().Add(time.Hour).Unix() {
+		t.Fatalf("the key is not stored again as it was: %v %v", keys, err)
+	}
+	if _, err := p.Sign(claims(72 * time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if keys, err = store.SigningKeys(ctx); err != nil || keys[0].MaxExp < time.Now().Add(72*time.Hour).Unix() {
+		t.Fatalf("a later expiry is not recorded: %v %v", keys, err)
+	}
+}

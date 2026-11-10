@@ -24,6 +24,9 @@ type Env struct {
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
+	// ServerToken is a musqld server's bearer token, the default of open's
+	// --auth-token.
+	ServerToken string
 	// Interactive reports whether Stdin is a terminal.
 	Interactive bool
 	// StderrIsTerminal reports whether Stderr is a terminal, where a transfer's

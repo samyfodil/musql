@@ -198,9 +198,14 @@ func (e *Election) Writer() bool {
 	return caughtUp && time.Since(since) >= e.settle && e.r.State() == raft.Leader
 }
 
-// ErrNotLeader is a proposal on a node that is not, or stopped being, the
-// group's leader: the entry may or may not be in the log.
+// ErrNotLeader is a proposal refused before it reached the log, on a node
+// that is not, or stopped being, the group's leader: it did not happen, and
+// may be made again on the new leader.
 var ErrNotLeader = errors.New("cluster: this node is not the group's leader")
+
+// ErrOutcomeUnknown is a proposal the leader had already sent on when it lost
+// the leadership: the entry may or may not commit, so it is not made again.
+var ErrOutcomeUnknown = errors.New("cluster: the leader changed while the entry was being replicated; it may or may not have committed")
 
 // Propose appends data, under key, to the group's log on its leader, and
 // returns once a majority of the members hold it and this node applied it,
@@ -208,15 +213,26 @@ var ErrNotLeader = errors.New("cluster: this node is not the group's leader")
 func (e *Election) Propose(key string, data []byte) error {
 	f := e.r.ApplyLog(raft.Log{Data: data, Extensions: []byte(key)}, 10*time.Second)
 	if err := f.Error(); err != nil {
-		if errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrLeadershipLost) || errors.Is(err, raft.ErrLeadershipTransferInProgress) {
-			return fmt.Errorf("%w: %v", ErrNotLeader, err)
-		}
-		return err
+		return proposeErr(err)
 	}
 	if err, ok := f.Response().(error); ok {
 		return err
 	}
 	return nil
+}
+
+// proposeErr is what a proposal raft refused with err means here: one raft
+// turned away before it reached the log (not the leader, a transfer under way,
+// a full queue) did not happen; one it lost the leadership with had been sent
+// to the members and may yet commit.
+func proposeErr(err error) error {
+	switch {
+	case errors.Is(err, raft.ErrNotLeader), errors.Is(err, raft.ErrLeadershipTransferInProgress), errors.Is(err, raft.ErrEnqueueTimeout):
+		return fmt.Errorf("%w: %v", ErrNotLeader, err)
+	case errors.Is(err, raft.ErrLeadershipLost):
+		return fmt.Errorf("%w: %v", ErrOutcomeUnknown, err)
+	}
+	return err
 }
 
 // Leader is the peer ID of the group's leader as this node knows it, "" when

@@ -31,7 +31,7 @@ package engine
 // computed from the outer loop rather than folded standalone.
 //
 // conj indexes FromItem.tvfWhere, and col/op are what matchVtabConstraint
-// resolved it to. Both are re-checked at runtime (vtabCorrValueFor) to ensure
+// resolved it to. Both are re-checked at runtime (vtabCorrValueIndex) to ensure
 // the value was computed for the correct constraint.
 //
 // rhs is set at compile time and cleared once compiled; reg is the register
@@ -55,31 +55,42 @@ type vtabCorrValue struct {
 	v    Value
 }
 
-// vtabCorrValueFor returns the pre-computed right-hand side for tvfWhere
-// conjunct conj, if one was compiled for exactly the (column, operator) pair
-// the caller re-derived. See vtabCorrTerm's doc comment for why the pair is
-// re-checked rather than trusted.
-func vtabCorrValueFor(corr []vtabCorrValue, conj, col int, op VtabOp) (Value, bool) {
-	for _, cv := range corr {
+// vtabCorrValueIndex is the entry of corr holding the pre-computed right-hand
+// side for tvfWhere conjunct conj, if one was compiled for exactly the
+// (column, operator) pair the caller re-derived, or -1. See vtabCorrTerm's doc
+// comment for why the pair is re-checked rather than trusted.
+func vtabCorrValueIndex(corr []vtabCorrValue, conj, col int, op VtabOp) int {
+	for i, cv := range corr {
 		if cv.arg == 0 && cv.conj == conj {
 			if cv.col != col || cv.op != op {
-				return Value{}, false
+				return -1
 			}
-			return cv.v, true
+			return i
 		}
+	}
+	return -1
+}
+
+// vtabCorrArgFor is the pre-computed value for a table-valued function's ai'th
+// argument, re-checked against the hidden column it was compiled for.
+func vtabCorrArgFor(corr []vtabCorrValue, ai, col int) (Value, bool) {
+	if i := vtabCorrArgIndex(corr, ai, col); i >= 0 {
+		return corr[i].v, true
 	}
 	return Value{}, false
 }
 
-// vtabCorrArgFor is vtabCorrValueFor for a table-valued function's ai'th
-// argument, re-checked against the hidden column it was compiled for.
-func vtabCorrArgFor(corr []vtabCorrValue, ai, col int) (Value, bool) {
-	for _, cv := range corr {
+// vtabCorrArgIndex is vtabCorrArgFor's entry of corr, or -1.
+func vtabCorrArgIndex(corr []vtabCorrValue, ai, col int) int {
+	for i, cv := range corr {
 		if cv.arg == ai+1 {
-			return cv.v, cv.col == col
+			if cv.col != col {
+				return -1
+			}
+			return i
 		}
 	}
-	return Value{}, false
+	return -1
 }
 
 // annotateVtabCorrelations records, on every INNER virtual-table source bound
