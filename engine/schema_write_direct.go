@@ -537,8 +537,8 @@ func alterTableNameAndForm(toks []token) (name, form string, ok bool) {
 // not RENAME TO, which only declines.
 func alterIsRenameTo(toks []token) bool {
 	for i := 0; i+1 < len(toks); i++ {
-		if toks[i].kind == tkIdent && !toks[i].quoted && toks[i].upper() == "RENAME" {
-			return toks[i+1].kind == tkIdent && !toks[i+1].quoted && toks[i+1].upper() == "TO"
+		if toks[i].kind == tkIdent && !toks[i].quoted && toks[i].isKw("RENAME") {
+			return toks[i+1].kind == tkIdent && !toks[i+1].quoted && toks[i+1].isKw("TO")
 		}
 	}
 	return false

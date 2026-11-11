@@ -1243,7 +1243,7 @@ func TxnStmtKind(sqlText string) (kind TxnKind, ok bool) {
 // default, takes nothing until the first access (build.c:5258).
 func BeginTxnLock(sqlText string) (write, exclusive bool) {
 	toks, err := lex(strings.TrimSpace(sqlText))
-	if err != nil || len(toks) < 2 || toks[0].kind != tkIdent || toks[0].upper() != "BEGIN" || toks[1].kind != tkIdent || toks[1].quoted {
+	if err != nil || len(toks) < 2 || toks[0].kind != tkIdent || !toks[0].isKw("BEGIN") || toks[1].kind != tkIdent || toks[1].quoted {
 		return false, false
 	}
 	switch toks[1].upper() {

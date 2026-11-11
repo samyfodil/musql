@@ -469,6 +469,35 @@ func (p *ReadOnlyPager) resolveViewByNameIn(scope schemaScope, name string) (pcv
 	return pcv, true, nil
 }
 
+// viewDefMemo is one sharedViewDefIn answer.
+type viewDefMemo struct {
+	pcv *parsedCreateView
+	ok  bool
+}
+
+// sharedViewDefIn is resolveViewByNameIn parsed once for this pager, for a
+// caller that only reads the definition. The definition is shared by every such
+// caller, so it is never changed and never handed to a compile, which rewrites
+// what it is given; resolveViewByNameIn parses a fresh one for those.
+func (p *ReadOnlyPager) sharedViewDefIn(scope schemaScope, name string) (*parsedCreateView, bool, error) {
+	if p == nil {
+		return p.resolveViewByNameIn(scope, name)
+	}
+	key := scopeCacheKey(scope, name)
+	if m, ok := p.viewDefs[key]; ok {
+		return m.pcv, m.ok, nil
+	}
+	pcv, ok, err := p.resolveViewByNameIn(scope, name)
+	if err != nil {
+		return nil, false, err
+	}
+	if p.viewDefs == nil {
+		p.viewDefs = make(map[string]viewDefMemo)
+	}
+	p.viewDefs[key] = viewDefMemo{pcv: pcv, ok: ok}
+	return pcv, ok, nil
+}
+
 // rewriteViewNoSuchTable adds "main." to an unqualified "no such table: X"
 // error: C reports a table missing from within a view's SQL (its FROM or a
 // nested subquery) qualified ("no such table: main.x"), unlike the same miss
@@ -836,7 +865,7 @@ func (p *ReadOnlyPager) fromItemIsDerived(it FromItem) bool {
 			rp = owner
 		}
 	}
-	_, ok, err := rp.resolveViewByNameIn(fromItemScope(it), it.Table)
+	_, ok, err := rp.sharedViewDefIn(fromItemScope(it), it.Table)
 	return err == nil && ok
 }
 

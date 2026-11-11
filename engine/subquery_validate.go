@@ -99,7 +99,7 @@ func (p *ReadOnlyPager) subqueryScopes(from []FromItem) ([]tableScope, error) {
 			if _, ok := p.lookupCTE(it.Table); ok {
 				return nil, fmt.Errorf("%w: subquery FROM references a CTE", errVDBEUnsupported)
 			}
-			if _, ok, verr := p.resolveViewByNameIn(fromItemScope(it), it.Table); verr == nil && ok {
+			if _, ok, verr := p.sharedViewDefIn(fromItemScope(it), it.Table); verr == nil && ok {
 				return nil, fmt.Errorf("%w: subquery FROM references a view", errVDBEUnsupported)
 			}
 			// A virtual table's columns are declared by its module's Connect (what

@@ -624,7 +624,7 @@ func r38cRenameBodyColumns(body *SelectStmt, colNames []string) (*SelectStmt, bo
 // PRIMARY KEY column. A body carrying either is left alone, as is one with
 // repeated output names. A lone "*" body needs none of those checks.
 func (p *ReadOnlyPager) r37cExpandViewRef(it FromItem) (FromItem, bool) {
-	pcv, ok := p.r37cViewBody(it)
+	pcv, ok := p.r37cViewBody(it, false)
 	if !ok {
 		return FromItem{}, false
 	}
@@ -643,8 +643,10 @@ func (p *ReadOnlyPager) r37cExpandViewRef(it FromItem) (FromItem, bool) {
 		return FromItem{}, false
 	}
 	if len(body.Columns) == 1 && body.Columns[0].Star && body.Columns[0].StarQualifier == "" {
-		return r37cViewItem(it, body), true
+		return p.r37cFreshViewItem(it)
 	}
+	// The checks so far read this pager's shared definition; resolving the
+	// body's FROM compiles what it holds, so the rest works on a fresh one.
 	for _, c := range body.Columns {
 		if c.Star {
 			return FromItem{}, false // "*" mixed with other items: positions shift
@@ -665,6 +667,11 @@ func (p *ReadOnlyPager) r37cExpandViewRef(it FromItem) (FromItem, bool) {
 			}
 		}
 	}
+	fresh, ok, err := p.resolveViewByNameIn(fromItemScope(it), it.Table)
+	if err != nil || !ok || fresh.selectStmt == nil {
+		return FromItem{}, false
+	}
+	body = fresh.selectStmt
 	var scopes []tableScope
 	if len(body.From) > 0 {
 		jts, err := p.resolveFromColumns(body.From)
@@ -688,9 +695,21 @@ func (p *ReadOnlyPager) r37cExpandViewRef(it FromItem) (FromItem, bool) {
 	return r37cViewItem(it, body), true
 }
 
+// r37cFreshViewItem is r37cViewItem over a definition of the expansion's own:
+// the statement it joins is compiled, which rewrites in place.
+func (p *ReadOnlyPager) r37cFreshViewItem(it FromItem) (FromItem, bool) {
+	pcv, ok, err := p.resolveViewByNameIn(fromItemScope(it), it.Table)
+	if err != nil || !ok || pcv.selectStmt == nil {
+		return FromItem{}, false
+	}
+	return r37cViewItem(it, pcv.selectStmt), true
+}
+
 // r37cViewBody is the shared half of the two expanders: it resolves it to a
-// stored view whose body may stand in for it, or reports false.
-func (p *ReadOnlyPager) r37cViewBody(it FromItem) (*parsedCreateView, bool) {
+// stored view whose body may stand in for it, or reports false. The definition
+// is this pager's shared one (sharedViewDefIn) unless fresh asks for one of the
+// caller's own, which a rewrite that builds on the body needs.
+func (p *ReadOnlyPager) r37cViewBody(it FromItem, fresh bool) (*parsedCreateView, bool) {
 	if it.Subquery != nil || it.Table == "" || it.TableFunc {
 		return nil, false
 	}
@@ -719,7 +738,11 @@ func (p *ReadOnlyPager) r37cViewBody(it FromItem) (*parsedCreateView, bool) {
 	if _, terr := p.resolveTableIn(fromItemScope(it), it.Table); terr == nil {
 		return nil, false
 	}
-	pcv, ok, err := p.resolveViewByNameIn(fromItemScope(it), it.Table)
+	view := p.sharedViewDefIn
+	if fresh {
+		view = p.resolveViewByNameIn
+	}
+	pcv, ok, err := view(fromItemScope(it), it.Table)
 	if err != nil || !ok || pcv.selectStmt == nil {
 		return nil, false
 	}
@@ -866,7 +889,7 @@ func (p *ReadOnlyPager) r37cOrdinaryBase(b FromItem) (*resolvedTable, bool) {
 	if isV, verr := p.isVtabItem(b); verr != nil || isV {
 		return nil, false
 	}
-	if _, isView, verr := p.resolveViewByNameIn(fromItemScope(b), b.Table); verr != nil || isView {
+	if _, isView, verr := p.sharedViewDefIn(fromItemScope(b), b.Table); verr != nil || isView {
 		return nil, false
 	}
 	tbl, terr := p.resolveTableIn(fromItemScope(b), b.Table)

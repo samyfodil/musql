@@ -204,6 +204,9 @@ type ReadOnlyPager struct {
 	runFold        bool
 	schemaLoaded   bool
 	resolvedTables map[string]*resolvedTable
+	// viewDefs memoizes, the same way, a view's parsed definition for the
+	// callers that only read it (sharedViewDefIn).
+	viewDefs map[string]viewDefMemo
 
 	// schemaRowsEdited is SnapshotPager's (writer.go) overlay-APPLIED sibling
 	// of schemaRows: DB.writableSchemaEditedRows(), non-nil only while a

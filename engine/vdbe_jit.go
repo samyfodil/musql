@@ -488,6 +488,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	}
 	jx.gate = make([]int16, len(vp))
 	jx.fill = make([][]curCols, len(vp))
+	var fill fillArena
 	seen := map[int]bool{}
 	for pc := range vp {
 		jx.gate[pc] = -1
@@ -495,7 +496,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 			continue
 		}
 		jx.gate[pc] = int16(firstCursor(vp, pc))
-		jx.fill[pc] = fillColumns(vp, pc)
+		jx.fill[pc] = fill.fillColumns(vp, pc)
 		if l := copyLimit(vp, pc); jx.fill[pc] != nil && l >= 0 {
 			if jx.light == nil {
 				jx.light = make([]int8, len(vp))
@@ -1049,10 +1050,21 @@ func nativeStreamNexts(insns []Instruction, vp []jit.VInsn, streamed, segCap []b
 	return n, walk
 }
 
+// fillArena carves the lists fillColumns returns for one program out of two
+// slabs that grow as entries are made, building each in scratch first. A list
+// already handed out keeps the backing it was carved from.
+type fillArena struct {
+	cc      []curCols
+	cols    []int
+	scratch []curCols
+}
+
 // fillColumns is the columns of each cursor the VColumn instructions on the
 // straight path from pc (the path nativeRun weighs, a little longer) read.
-func fillColumns(vp []jit.VInsn, pc int) []curCols {
-	var out []curCols
+func (a *fillArena) fillColumns(vp []jit.VInsn, pc int) []curCols {
+	out := a.scratch[:0]
+	defer func() { a.scratch = out }()
+walk:
 	for steps := 0; steps < 48 && pc >= 0 && pc < len(vp) && vp[pc].Op != jit.VExit; steps++ {
 		in := vp[pc]
 		switch in.Op {
@@ -1060,11 +1072,16 @@ func fillColumns(vp []jit.VInsn, pc int) []curCols {
 			pc = in.T
 			continue
 		case jit.VResultRow:
-			return out // native code returns to Go there
+			break walk // native code returns to Go there
 		case jit.VColumn:
 			i := slices.IndexFunc(out, func(cc curCols) bool { return cc.cursor == in.A })
 			if i < 0 {
-				out = append(out, curCols{cursor: in.A})
+				if len(out) < cap(out) {
+					out = out[:len(out)+1]
+					out[len(out)-1].cursor, out[len(out)-1].cols = in.A, out[len(out)-1].cols[:0]
+				} else {
+					out = append(out, curCols{cursor: in.A})
+				}
 				i = len(out) - 1
 			}
 			if !slices.Contains(out[i].cols, in.B) {
@@ -1073,7 +1090,16 @@ func fillColumns(vp []jit.VInsn, pc int) []curCols {
 		}
 		pc++
 	}
-	return out
+	if len(out) == 0 {
+		return nil
+	}
+	start := len(a.cc)
+	for _, c := range out {
+		at := len(a.cols)
+		a.cols = append(a.cols, c.cols...)
+		a.cc = append(a.cc, curCols{cursor: c.cursor, cols: a.cols[at:len(a.cols):len(a.cols)]})
+	}
+	return a.cc[start:len(a.cc):len(a.cc)]
 }
 
 // firstCursor is the first cursor number a cursor instruction on the native

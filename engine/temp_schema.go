@@ -161,7 +161,7 @@ func withTempKeyword(sqlText string) string {
 		return sqlText
 	}
 	toks, err := lex(sqlText)
-	if err != nil || len(toks) < 2 || toks[0].kind != tkIdent || toks[0].upper() != "CREATE" {
+	if err != nil || len(toks) < 2 || toks[0].kind != tkIdent || !toks[0].isKw("CREATE") {
 		return sqlText
 	}
 	return sqlText[:toks[1].Start] + "TEMP " + sqlText[toks[1].Start:]

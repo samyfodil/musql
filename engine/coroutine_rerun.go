@@ -33,7 +33,7 @@ func (p *ReadOnlyPager) cSubqueryBody(it FromItem) (body *SelectStmt, cte *cteBi
 			return b.core, b, false, true
 		}
 	}
-	pcv, found, err := p.resolveViewByNameIn(fromItemScope(it), it.Table)
+	pcv, found, err := p.sharedViewDefIn(fromItemScope(it), it.Table)
 	if err != nil || !found || pcv == nil {
 		return nil, nil, false, false
 	}
@@ -1178,7 +1178,7 @@ func (p *ReadOnlyPager) cVolatileDepth(s *SelectStmt, seen map[string]bool, dept
 			}
 			continue
 		}
-		if pcv, ok, err := p.resolveViewByNameIn(scopeAny, name); err == nil && ok && pcv != nil {
+		if pcv, ok, err := p.sharedViewDefIn(scopeAny, name); err == nil && ok && pcv != nil {
 			if p.cVolatileDepth(pcv.selectStmt, seen, depth+1) {
 				return true
 			}

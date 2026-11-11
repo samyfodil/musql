@@ -621,7 +621,7 @@ func (p *ReadOnlyPager) resolveVtabModuleForItem(it FromItem) (VtabModule, []str
 			if _, terr := p.resolveTableIn(fromItemScope(it), it.Table); terr == nil {
 				return nil, nil, semanticf("engine: '%s' is not a function", it.Table)
 			}
-			if _, isView, verr := p.resolveViewByNameIn(fromItemScope(it), it.Table); verr == nil && isView {
+			if _, isView, verr := p.sharedViewDefIn(fromItemScope(it), it.Table); verr == nil && isView {
 				return nil, nil, semanticf("engine: '%s' is not a function", it.Table)
 			}
 			// Nothing of the name: sqlite3LocateTableItem's "no such table".
@@ -1193,9 +1193,9 @@ func (p *ReadOnlyPager) createdVtabDefIn(scope schemaScope, name string) (module
 // "CREATE VIRTUAL TABLE".
 func isCreateVirtualTableStmt(toks []token) bool {
 	return len(toks) >= 3 &&
-		toks[0].kind == tkIdent && toks[0].upper() == "CREATE" &&
-		toks[1].kind == tkIdent && toks[1].upper() == "VIRTUAL" &&
-		toks[2].kind == tkIdent && toks[2].upper() == "TABLE"
+		toks[0].kind == tkIdent && toks[0].isKw("CREATE") &&
+		toks[1].kind == tkIdent && toks[1].isKw("VIRTUAL") &&
+		toks[2].kind == tkIdent && toks[2].isKw("TABLE")
 }
 
 // isCreateVirtualTableSQL reports whether sqlText (a stored schema row's SQL) is

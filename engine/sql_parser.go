@@ -140,7 +140,7 @@ func r32nParseSchemaViewSelect(sqlText string) (*SelectStmt, error) {
 			depth++
 		} else if t.kind == tkPunct && t.text == ")" {
 			depth--
-		} else if depth == 0 && t.kind == tkIdent && !t.quoted && t.upper() == "AS" {
+		} else if depth == 0 && t.kind == tkIdent && !t.quoted && t.isKw("AS") {
 			at = i
 			break
 		}
@@ -285,7 +285,7 @@ func (p *parser) next() token {
 
 func (p *parser) peekIsKeyword(kw string) bool {
 	t := p.peek()
-	return t.kind == tkIdent && t.upper() == kw
+	return t.kind == tkIdent && t.isKw(kw)
 }
 
 func (p *parser) peekIsPunct(s string) bool {
@@ -496,7 +496,7 @@ func verbAfterLeadingWith(sqlText string, toks []token) (verb string, ok bool) {
 // finds that boundary: a CTE list carries nested parens and commas and may be
 // RECURSIVE, so no fixed-token lookahead can skip it.
 func verbAfterLeadingWithAt(sqlText string, toks []token) (verb string, at int, ok bool) {
-	if len(toks) == 0 || toks[0].kind != tkIdent || toks[0].upper() != "WITH" {
+	if len(toks) == 0 || toks[0].kind != tkIdent || !toks[0].isKw("WITH") {
 		return "", 0, false
 	}
 	p := newParser(sqlText, toks)
@@ -873,7 +873,7 @@ func (p *parser) parseSelectCore() (*SelectStmt, error) {
 //	SELECT sum(x) over over FROM over WINDOW over AS ()   -- 9,9,9, the CLAUSE
 func (p *parser) peekOpensOverClause() bool {
 	t := p.peek()
-	if t.kind != tkIdent || t.quoted || t.upper() != "OVER" {
+	if t.kind != tkIdent || t.quoted || !t.isKw("OVER") {
 		return false
 	}
 	nt := p.peekAt(1)
@@ -1532,7 +1532,7 @@ func (p *parser) peekStopsAlias(inFrom bool) bool {
 // that pin the split.
 func (p *parser) peekStartsWindowClause() bool {
 	t := p.peek()
-	if t.kind != tkIdent || t.quoted || t.upper() != "WINDOW" {
+	if t.kind != tkIdent || t.quoted || !t.isKw("WINDOW") {
 		return false
 	}
 	nt := p.peekAt(1)
@@ -1543,7 +1543,7 @@ func (p *parser) peekStartsWindowClause() bool {
 		return false // a reserved word cannot be the window's name
 	}
 	as := p.peekAt(2)
-	if as.kind != tkIdent || as.quoted || as.upper() != "AS" {
+	if as.kind != tkIdent || as.quoted || !as.isKw("AS") {
 		return false
 	}
 	open := p.peekAt(3)
@@ -1849,7 +1849,7 @@ func (p *parser) parseFromElement(leading bool) ([]FromItem, []cSrcNode, error) 
 		// (VALUES(1),(2))" yields one column named "column1" over two rows,
 		// verified directly.
 		next := p.peekAt(1)
-		if next.kind == tkIdent && (next.upper() == "SELECT" || next.upper() == "WITH" || next.upper() == "VALUES") {
+		if next.kind == tkIdent && (next.isKw("SELECT") || next.isKw("WITH") || next.isKw("VALUES")) {
 			item, err := p.parseDerivedTable()
 			if err != nil {
 				return nil, nil, err
@@ -2142,7 +2142,7 @@ func (p *parser) tryParseJoinKind() (kind JoinKind, natural, matched bool, err e
 	var words []string
 	for len(words) < 3 {
 		t := p.peek()
-		if t.kind != tkIdent || t.upper() == "JOIN" {
+		if t.kind != tkIdent || t.isKw("JOIN") {
 			break
 		}
 		p.next()
@@ -2803,7 +2803,7 @@ func splitTableConstraints(seg []token, startsConstraint map[string]bool) [][]to
 	i := 0
 	for i < len(seg) {
 		start := i
-		if seg[i].kind == tkIdent && seg[i].upper() == "CONSTRAINT" {
+		if seg[i].kind == tkIdent && seg[i].isKw("CONSTRAINT") {
 			i++
 			// objectNameToken, not tkIdent: a constraint name is SQLite's "nm"
 			// production, so 'x' / "x" / [x] / `x` are all legal spellings. A
@@ -2865,7 +2865,7 @@ func parseFKConstraintShape(rest []token) fkShape {
 	var fk fkShape
 	fk.child = extractParenIdentList(rest)
 	for i := 0; i < len(rest); i++ {
-		if rest[i].kind != tkIdent || rest[i].upper() != "REFERENCES" {
+		if rest[i].kind != tkIdent || !rest[i].isKw("REFERENCES") {
 			continue
 		}
 		if i+1 < len(rest) && rest[i+1].kind == tkIdent {
@@ -3465,13 +3465,13 @@ func (p *parser) parseComparison() (Expr, error) {
 	for {
 		t := p.peek()
 		switch {
-		case t.kind == tkIdent && t.upper() == "ISNULL":
+		case t.kind == tkIdent && t.isKw("ISNULL"):
 			p.next()
 			left = IsNullExpr{X: left}
-		case t.kind == tkIdent && t.upper() == "NOTNULL":
+		case t.kind == tkIdent && t.isKw("NOTNULL"):
 			p.next()
 			left = IsNullExpr{X: left, Not: true}
-		case t.kind == tkIdent && t.upper() == "IS":
+		case t.kind == tkIdent && t.isKw("IS"):
 			p.next()
 			not := p.consumeKeyword("NOT")
 			switch {
@@ -3482,7 +3482,7 @@ func (p *parser) parseComparison() (Expr, error) {
 				// "X IS <expr>": "2 IS TRUE" is 1. Desugared (desugarIsBool) into existing node
 				// kinds rather than a new Expr kind, so no tree walker can miss it.
 				kw := p.next()
-				want := kw.upper() == "TRUE"
+				want := kw.isKw("TRUE")
 				ident := ColumnExpr{Name: kw.text, FallbackLiteral: boolKeywordFallback(kw)}
 				// "X IS TRUE COLLATE c": C parses it as "X IS (TRUE COLLATE c)" and recognizes
 				// the truth test through sqlite3ExprSkipCollate, which drops the collation
@@ -3539,14 +3539,14 @@ func (p *parser) parseComparison() (Expr, error) {
 					left = rowOrBinary(op, left, r)
 				}
 			}
-		case t.kind == tkIdent && t.upper() == "IN":
+		case t.kind == tkIdent && t.isKw("IN"):
 			p.next()
 			list, sub, err := p.parseInRHS()
 			if err != nil {
 				return nil, err
 			}
 			left = makeIn(left, list, sub, false)
-		case t.kind == tkIdent && t.upper() == "BETWEEN":
+		case t.kind == tkIdent && t.isKw("BETWEEN"):
 			p.next()
 			lo, hi, err := p.parseBetweenBounds()
 			if err != nil {
@@ -3557,7 +3557,7 @@ func (p *parser) parseComparison() (Expr, error) {
 			} else {
 				left = BetweenExpr{X: left, Lo: lo, Hi: hi}
 			}
-		case t.kind == tkIdent && t.upper() == "LIKE":
+		case t.kind == tkIdent && t.isKw("LIKE"):
 			p.next()
 			pat, err := p.parseRelational()
 			if err != nil {
@@ -3568,28 +3568,28 @@ func (p *parser) parseComparison() (Expr, error) {
 				return nil, err
 			}
 			left = LikeExpr{X: left, Pattern: pat, Escape: esc}
-		case t.kind == tkIdent && t.upper() == "GLOB":
+		case t.kind == tkIdent && t.isKw("GLOB"):
 			p.next()
 			pat, err := p.parseRelational()
 			if err != nil {
 				return nil, err
 			}
 			left = GlobExpr{X: left, Pattern: pat}
-		case t.kind == tkIdent && t.upper() == "MATCH":
+		case t.kind == tkIdent && t.isKw("MATCH"):
 			p.next()
 			pat, err := p.parseRelational()
 			if err != nil {
 				return nil, err
 			}
 			left = MatchExpr{X: left, Pattern: pat}
-		case t.kind == tkIdent && t.upper() == "REGEXP":
+		case t.kind == tkIdent && t.isKw("REGEXP"):
 			p.next()
 			pat, err := p.parseRelational()
 			if err != nil {
 				return nil, err
 			}
 			left = regexpCall(left, pat)
-		case t.kind == tkIdent && t.upper() == "NOT":
+		case t.kind == tkIdent && t.isKw("NOT"):
 			save := p.pos
 			p.next()
 			switch {
@@ -4184,11 +4184,11 @@ func (p *parser) parsePrimary() (Expr, error) {
 		}
 		return e, nil
 
-	case t.kind == tkIdent && t.upper() == "NULL":
+	case t.kind == tkIdent && t.isKw("NULL"):
 		p.next()
 		return LiteralExpr{Val: Value{Typ: Null}}, nil
 
-	case t.kind == tkIdent && t.upper() == "CASE":
+	case t.kind == tkIdent && t.isKw("CASE"):
 		p.next()
 		var ce CaseExpr
 		if !p.peekIsKeyword("WHEN") {
@@ -4232,7 +4232,7 @@ func (p *parser) parsePrimary() (Expr, error) {
 		}
 		return ce, nil
 
-	case t.kind == tkIdent && t.upper() == "EXISTS":
+	case t.kind == tkIdent && t.isKw("EXISTS"):
 		p.next()
 		if err := p.expectPunct("("); err != nil {
 			return nil, err
@@ -4249,7 +4249,7 @@ func (p *parser) parsePrimary() (Expr, error) {
 		}
 		return ExistsExpr{Stmt: sub}, nil
 
-	case t.kind == tkIdent && t.upper() == "CAST":
+	case t.kind == tkIdent && t.isKw("CAST"):
 		p.next()
 		if err := p.expectPunct("("); err != nil {
 			return nil, err
@@ -4270,7 +4270,7 @@ func (p *parser) parsePrimary() (Expr, error) {
 		}
 		return CastExpr{X: x, Type: typ}, nil
 
-	case t.kind == tkIdent && t.upper() == "RAISE" && !t.quoted && p.peekAt(1).kind == tkPunct && p.peekAt(1).text == "(":
+	case t.kind == tkIdent && t.isKw("RAISE") && !t.quoted && p.peekAt(1).kind == tkPunct && p.peekAt(1).text == "(":
 		// RAISE(...) is a dedicated trigger-program expression, not an ordinary
 		// function call: C SQLite recognizes it in the grammar and rejects
 		// it outside a trigger-program at PREPARE time (verified directly:
@@ -4625,7 +4625,7 @@ func boolKeywordFallback(t token) *Value {
 // "X IS [NOT] TRUE/FALSE" truth test. Quoted spellings are ordinary identifiers
 // ("2 IS [true]" is a column comparison).
 func isBareBoolKeyword(t token) bool {
-	return t.kind == tkIdent && !t.quoted && (t.upper() == "TRUE" || t.upper() == "FALSE")
+	return t.kind == tkIdent && !t.quoted && (t.isKw("TRUE") || t.isKw("FALSE"))
 }
 
 // desugarIsBool builds "X IS [NOT] TRUE/FALSE" from existing nodes:
@@ -5319,7 +5319,7 @@ doneSegments:
 			kwTok := first
 			rest := seg
 			constraintName := ""
-			if kwTok.upper() == "CONSTRAINT" {
+			if kwTok.isKw("CONSTRAINT") {
 				k := 1
 				// See the objectNameToken note in splitTableConstraints above:
 				// a quoted constraint name is legal and used to drop the whole
@@ -5448,7 +5448,7 @@ doneSegments:
 				// bare "FOREIGN" with no "KEY (col, ...)" is not a constraint,
 				// and FOREIGN cannot be a column name either -- see the
 				// PRIMARY case above.
-				if len(rest) < 2 || rest[1].kind != tkIdent || rest[1].upper() != "KEY" ||
+				if len(rest) < 2 || rest[1].kind != tkIdent || !rest[1].isKw("KEY") ||
 					len(extractParenIdentList(rest)) == 0 {
 					return nil, nil, nil, fmt.Errorf("engine: near \",\": syntax error")
 				}
@@ -5469,7 +5469,7 @@ doneSegments:
 		// directly. The table-level form has its own count rule instead (see
 		// validateForeignKeyShapes).
 		for j := 1; j < len(seg); j++ {
-			if seg[j].kind != tkIdent || seg[j].upper() != "REFERENCES" {
+			if seg[j].kind != tkIdent || !seg[j].isKw("REFERENCES") {
 				continue
 			}
 			if j+1 < len(seg) && seg[j+1].kind == tkIdent {
@@ -5524,16 +5524,16 @@ doneSegments:
 			// "[GENERATED ALWAYS] AS (<expr>) [STORED|VIRTUAL]": the AS marks the clause;
 			// the expression text is captured like a CHECK's, and the trailing keyword
 			// (default VIRTUAL) picks the storage kind.
-			if seg[j].kind == tkIdent && seg[j].upper() == "GENERATED" {
+			if seg[j].kind == tkIdent && seg[j].isKw("GENERATED") {
 				// Skip the optional "GENERATED ALWAYS" prefix; the "AS" that
 				// follows is handled by the next iteration.
 				j++
-				if j < len(seg) && seg[j].kind == tkIdent && seg[j].upper() == "ALWAYS" {
+				if j < len(seg) && seg[j].kind == tkIdent && seg[j].isKw("ALWAYS") {
 					j++
 				}
 				continue
 			}
-			if seg[j].kind == tkIdent && seg[j].upper() == "AS" {
+			if seg[j].kind == tkIdent && seg[j].isKw("AS") {
 				if hasGenerated {
 					// "c AS (a+1) AS (a+2)": the column takes one generated clause.
 					return nil, nil, nil, fmt.Errorf("engine: error in generated column %q", name)
@@ -5605,7 +5605,7 @@ doneSegments:
 				// token after it ("b AS (a) WAT") is not in C's grammar.
 				if j < len(seg) {
 					nx := seg[j]
-					if !(nx.kind == tkIdent && (colConstraintStart[nx.upper()] || nx.upper() == "DEFERRABLE")) {
+					if !(nx.kind == tkIdent && (colConstraintStart[nx.upper()] || nx.isKw("DEFERRABLE"))) {
 						return nil, nil, nil, fmt.Errorf("engine: error in generated column %q", name)
 					}
 				}
@@ -5613,7 +5613,7 @@ doneSegments:
 			}
 			// A column-level "CONSTRAINT name" names the following constraint (usually
 			// CHECK); capture it and continue.
-			if seg[j].kind == tkIdent && seg[j].upper() == "CONSTRAINT" {
+			if seg[j].kind == tkIdent && seg[j].isKw("CONSTRAINT") {
 				if j+1 < len(seg) {
 					if nm, ok := objectNameToken(seg[j+1]); ok {
 						pendingCheckName = nm
@@ -5624,14 +5624,14 @@ doneSegments:
 				j++
 				continue
 			}
-			if seg[j].kind == tkIdent && seg[j].upper() == "CHECK" {
+			if seg[j].kind == tkIdent && seg[j].isKw("CHECK") {
 				cc, closeIdx, cerr := parseCheckClauseStructural(createSQL, seg, j)
 				if cerr != nil {
 					return nil, nil, nil, cerr
 				}
 				// A column-level CHECK does not accept a trailing ON CONFLICT in C's grammar
 				// (conflict.test 16.1); reject with C's wording.
-				if closeIdx+1 < len(seg) && seg[closeIdx+1].kind == tkIdent && seg[closeIdx+1].upper() == "ON" {
+				if closeIdx+1 < len(seg) && seg[closeIdx+1].kind == tkIdent && seg[closeIdx+1].isKw("ON") {
 					return nil, nil, nil, fmt.Errorf(`engine: CREATE TABLE: near "ON": syntax error`)
 				}
 				cc.name = pendingCheckName
@@ -5641,21 +5641,21 @@ doneSegments:
 				j = closeIdx + 1
 				continue
 			}
-			if seg[j].kind == tkIdent && seg[j].upper() == "PRIMARY" {
+			if seg[j].kind == tkIdent && seg[j].isKw("PRIMARY") {
 				if isColPK {
 					primaryKeyCount++ // "a PRIMARY KEY PRIMARY KEY": counted once more, so the table has two
 				}
 				isColPK = true
 				k := j + 1
-				if k < len(seg) && seg[k].kind == tkIdent && seg[k].upper() == "KEY" {
+				if k < len(seg) && seg[k].kind == tkIdent && seg[k].isKw("KEY") {
 					k++
 				}
 				// sortorder ::= ASC | DESC | (empty) (parse.y:938-940); ASC is
 				// the default, so only DESC changes anything.
-				if k < len(seg) && seg[k].kind == tkIdent && seg[k].upper() == "DESC" {
+				if k < len(seg) && seg[k].kind == tkIdent && seg[k].isKw("DESC") {
 					pkDesc = true
 					k++
-				} else if k < len(seg) && seg[k].kind == tkIdent && seg[k].upper() == "ASC" {
+				} else if k < len(seg) && seg[k].kind == tkIdent && seg[k].isKw("ASC") {
 					k++
 				}
 				if act, nk, ok, perr := parseTrailingConflictClause(seg, k); perr != nil {
@@ -5668,7 +5668,7 @@ doneSegments:
 				j = k
 				continue
 			}
-			if seg[j].kind == tkIdent && seg[j].upper() == "UNIQUE" {
+			if seg[j].kind == tkIdent && seg[j].isKw("UNIQUE") {
 				isColUnique = true
 				if act, nk, ok, perr := parseTrailingConflictClause(seg, j+1); perr != nil {
 					return nil, nil, nil, perr
@@ -5678,8 +5678,8 @@ doneSegments:
 					continue
 				}
 			}
-			if seg[j].kind == tkIdent && seg[j].upper() == "NOT" &&
-				j+1 < len(seg) && seg[j+1].kind == tkIdent && seg[j+1].upper() == "NULL" {
+			if seg[j].kind == tkIdent && seg[j].isKw("NOT") &&
+				j+1 < len(seg) && seg[j+1].kind == tkIdent && seg[j+1].isKw("NULL") {
 				notNull = true
 				if act, nk, ok, perr := parseTrailingConflictClause(seg, j+2); perr != nil {
 					return nil, nil, nil, perr
@@ -5691,7 +5691,7 @@ doneSegments:
 			}
 			// "ccons ::= NULL onconf" (parse.y:412) has no action at all: a bare
 			// NULL constraint's conflict clause is parsed and dropped.
-			if seg[j].kind == tkIdent && seg[j].upper() == "NULL" && (j == 0 || seg[j-1].kind != tkIdent || seg[j-1].upper() != "NOT") {
+			if seg[j].kind == tkIdent && seg[j].isKw("NULL") && (j == 0 || seg[j-1].kind != tkIdent || !seg[j-1].isKw("NOT")) {
 				if _, nk, ok, perr := parseTrailingConflictClause(seg, j+1); perr != nil {
 					return nil, nil, nil, perr
 				} else if ok {
@@ -5699,13 +5699,13 @@ doneSegments:
 					continue
 				}
 			}
-			if seg[j].kind == tkIdent && seg[j].upper() == "ON" &&
-				j+1 < len(seg) && seg[j+1].kind == tkIdent && seg[j+1].upper() == "CONFLICT" {
+			if seg[j].kind == tkIdent && seg[j].isKw("ON") &&
+				j+1 < len(seg) && seg[j+1].kind == tkIdent && seg[j+1].isKw("CONFLICT") {
 				// An ON CONFLICT not consumed by a PRIMARY KEY, UNIQUE or NOT NULL constraint
 				// above is in a position C's grammar does not allow; reject it.
 				return nil, nil, nil, fmt.Errorf("engine: CREATE TABLE: ON CONFLICT clause in this position is not supported by this write path")
 			}
-			if seg[j].kind == tkIdent && seg[j].upper() == "DEFAULT" {
+			if seg[j].kind == tkIdent && seg[j].isKw("DEFAULT") {
 				// A generated column may not have a DEFAULT, and C's message depends on which
 				// came first: "b AS (a+1) DEFAULT 5" is "cannot use DEFAULT on a generated
 				// column", "b DEFAULT 5 AS (a+1)" is `error in generated column "b"`.
@@ -5723,7 +5723,7 @@ doneSegments:
 				// followers too.
 				if dknown && dend < len(seg) {
 					nx := seg[dend]
-					if !(nx.kind == tkIdent && (colConstraintStart[nx.upper()] || nx.upper() == "NULL" || nx.upper() == "DEFERRABLE")) {
+					if !(nx.kind == tkIdent && (colConstraintStart[nx.upper()] || nx.isKw("NULL") || nx.isKw("DEFERRABLE"))) {
 						dknown = false
 					}
 				}
@@ -5732,7 +5732,7 @@ doneSegments:
 				// not trust the expression parsed out of its prefix either.
 				if ddefer != nil && dend < len(seg) {
 					nx := seg[dend]
-					if !(nx.kind == tkIdent && (colConstraintStart[nx.upper()] || nx.upper() == "NULL" || nx.upper() == "DEFERRABLE")) {
+					if !(nx.kind == tkIdent && (colConstraintStart[nx.upper()] || nx.isKw("NULL") || nx.isKw("DEFERRABLE"))) {
 						ddefer = nil
 					}
 				}
@@ -5743,7 +5743,7 @@ doneSegments:
 			// A column-level COLLATE sets the column's default collation: BINARY, NOCASE or
 			// RTRIM. Any other name is rejected rather than treated as BINARY, which would
 			// return wrong rows.
-			if seg[j].kind == tkIdent && seg[j].upper() == "COLLATE" && j+1 < len(seg) {
+			if seg[j].kind == tkIdent && seg[j].isKw("COLLATE") && j+1 < len(seg) {
 				// The collation name is usually a bare identifier (.text),
 				// but SQLite also accepts a quoted string there (a lexer
 				// tkString token carries its decoded value in .str, not
@@ -5758,7 +5758,7 @@ doneSegments:
 			// Skip a column-level REFERENCES clause whole: its "ON DELETE SET DEFAULT" tail
 			// ends in DEFAULT, which this loop would otherwise read as a second DEFAULT and
 			// lose the real one.
-			if seg[j].kind == tkIdent && seg[j].upper() == "REFERENCES" {
+			if seg[j].kind == tkIdent && seg[j].isKw("REFERENCES") {
 				j = skipColumnReferencesClause(seg, j)
 				continue
 			}
@@ -5937,8 +5937,8 @@ func compileGeneratedColumns(tblName string, cols []columnInfo) {
 // trailing clause. ok is false when it does not; an unknown action after a real
 // "ON CONFLICT" is a parse error.
 func parseTrailingConflictClause(seg []token, idx int) (action conflictAction, next int, ok bool, err error) {
-	if idx+1 >= len(seg) || seg[idx].kind != tkIdent || seg[idx].upper() != "ON" ||
-		seg[idx+1].kind != tkIdent || seg[idx+1].upper() != "CONFLICT" {
+	if idx+1 >= len(seg) || seg[idx].kind != tkIdent || !seg[idx].isKw("ON") ||
+		seg[idx+1].kind != tkIdent || !seg[idx+1].isKw("CONFLICT") {
 		return conflictAbort, idx, false, nil
 	}
 	if idx+2 >= len(seg) || seg[idx+2].kind != tkIdent {
@@ -5966,8 +5966,8 @@ func parseTrailingConflictClause(seg []token, idx int) (action conflictAction, n
 // discards it (a no-op in C, conflict.test 16.2/16.3).
 func extractTrailingOnConflict(seg []token) (act conflictAction, declared bool, err error) {
 	for i := 0; i+1 < len(seg); i++ {
-		if seg[i].kind == tkIdent && seg[i].upper() == "ON" &&
-			seg[i+1].kind == tkIdent && seg[i+1].upper() == "CONFLICT" {
+		if seg[i].kind == tkIdent && seg[i].isKw("ON") &&
+			seg[i+1].kind == tkIdent && seg[i+1].isKw("CONFLICT") {
 			act, _, ok, err := parseTrailingConflictClause(seg, i)
 			if err != nil {
 				return 0, false, err
@@ -6042,7 +6042,7 @@ func extractParenIdentListFull(seg []token) (names []string, desc []bool, colls 
 		}
 		if seg[i].kind == tkIdent {
 			if isSortOrderKeyword(seg[i], len(names) > 0) {
-				if seg[i].upper() == "DESC" && len(desc) > 0 {
+				if seg[i].isKw("DESC") && len(desc) > 0 {
 					desc[len(desc)-1] = true
 				}
 				i++
@@ -6051,7 +6051,7 @@ func extractParenIdentListFull(seg []token) (names []string, desc []bool, colls 
 			// "COLLATE <name>" attaches to the column just collected. The
 			// name may be an identifier or a quoted string, exactly like a
 			// column-level COLLATE clause.
-			if seg[i].upper() == "COLLATE" && !seg[i].quoted && len(names) > 0 && i+1 < len(seg) {
+			if seg[i].isKw("COLLATE") && !seg[i].quoted && len(names) > 0 && i+1 < len(seg) {
 				nx := seg[i+1]
 				switch {
 				case nx.kind == tkString:
@@ -6094,7 +6094,7 @@ func stripPKConstraintAutoincrement(rest []token) ([]token, bool) {
 			depth++
 		case ")":
 			if depth == 1 {
-				if i > 0 && rest[i-1].kind == tkIdent && !rest[i-1].quoted && rest[i-1].upper() == "AUTOINCREMENT" {
+				if i > 0 && rest[i-1].kind == tkIdent && !rest[i-1].quoted && rest[i-1].isKw("AUTOINCREMENT") {
 					out := make([]token, 0, len(rest)-1)
 					out = append(out, rest[:i-1]...)
 					out = append(out, rest[i:]...)

@@ -293,7 +293,7 @@ func tempPragmaAnswersMain(name string) bool {
 // keyword sniff every other top-level dispatcher in this package uses (see
 // e.g. Exec's own token-switch in insert_write.go).
 func isPragmaStmt(toks []token) bool {
-	return len(toks) > 0 && toks[0].kind == tkIdent && toks[0].upper() == "PRAGMA"
+	return len(toks) > 0 && toks[0].kind == tkIdent && toks[0].isKw("PRAGMA")
 }
 
 // ParsePragma parses "PRAGMA [schema.]name [= value | (value)]": SQLite's own
@@ -307,7 +307,7 @@ func ParsePragma(sqlText string) (*PragmaStmt, error) {
 		return nil, err
 	}
 	i := 0
-	if !(i < len(toks) && toks[i].kind == tkIdent && toks[i].upper() == "PRAGMA") {
+	if !(i < len(toks) && toks[i].kind == tkIdent && toks[i].isKw("PRAGMA")) {
 		return nil, fmt.Errorf("engine: PRAGMA: expected PRAGMA")
 	}
 	i++

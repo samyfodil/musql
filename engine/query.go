@@ -72,8 +72,8 @@ func sqlTextTableIsWithoutRowid(createSQL string) bool {
 			if seenOpen && depth == 0 {
 				tail := toks[i+1:]
 				for j := 0; j+1 < len(tail); j++ {
-					if tail[j].kind == tkIdent && tail[j].upper() == "WITHOUT" &&
-						tail[j+1].kind == tkIdent && tail[j+1].upper() == "ROWID" {
+					if tail[j].kind == tkIdent && tail[j].isKw("WITHOUT") &&
+						tail[j+1].kind == tkIdent && tail[j+1].isKw("ROWID") {
 						return true
 					}
 				}

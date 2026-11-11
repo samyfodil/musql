@@ -200,7 +200,7 @@ func (p *ReadOnlyPager) pagerHasName(name string) bool {
 	if _, err := p.resolveTable(name); err == nil {
 		return true
 	}
-	if _, ok, err := p.resolveViewByName(name); err == nil && ok {
+	if _, ok, err := p.sharedViewDefIn(scopeAny, name); err == nil && ok {
 		return true
 	}
 	return isEponymousVtabName(name)

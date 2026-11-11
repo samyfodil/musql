@@ -41,12 +41,12 @@ func splitExplain(sqlText string) (inner string, mode explainMode) {
 		return sqlText, explainNone
 	}
 	toks, err := lex(strings.TrimSpace(sqlText))
-	if err != nil || len(toks) < 2 || toks[0].kind != tkIdent || toks[0].upper() != "EXPLAIN" {
+	if err != nil || len(toks) < 2 || toks[0].kind != tkIdent || !toks[0].isKw("EXPLAIN") {
 		return sqlText, explainNone
 	}
 	rest, m := toks[1:], explainListing
-	if len(rest) >= 3 && rest[0].kind == tkIdent && rest[0].upper() == "QUERY" &&
-		rest[1].kind == tkIdent && rest[1].upper() == "PLAN" {
+	if len(rest) >= 3 && rest[0].kind == tkIdent && rest[0].isKw("QUERY") &&
+		rest[1].kind == tkIdent && rest[1].isKw("PLAN") {
 		rest, m = rest[2:], explainQueryPlan
 	}
 	if len(rest) == 0 || rest[0].Start >= len(sqlText) {

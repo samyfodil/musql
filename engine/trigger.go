@@ -572,10 +572,10 @@ type parsedCreateTrigger struct {
 // CREATE TABLE/[UNIQUE] INDEX/VIEW.
 func isCreateTriggerStmt(toks []token) bool {
 	i := 1
-	if i < len(toks) && toks[i].kind == tkIdent && (toks[i].upper() == "TEMP" || toks[i].upper() == "TEMPORARY") {
+	if i < len(toks) && toks[i].kind == tkIdent && (toks[i].isKw("TEMP") || toks[i].isKw("TEMPORARY")) {
 		i++
 	}
-	return i < len(toks) && toks[i].kind == tkIdent && toks[i].upper() == "TRIGGER"
+	return i < len(toks) && toks[i].kind == tkIdent && toks[i].isKw("TRIGGER")
 }
 
 // parseCreateTriggerStmt parses "CREATE [TEMP|TEMPORARY] TRIGGER [IF NOT

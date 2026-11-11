@@ -178,21 +178,25 @@ func segAttachRowFilter(in []Instruction, at, cursor int) bool {
 	// gets the lowering for the kinds it actually holds (forKinds).
 	guess := segRealAffinityKinds(in, at, cursor)
 	predEnd := -1
+	// The INTEGER lowering of the longest prefix, which the filter keeps: the
+	// last attempt's, when it lowered without the guess.
+	var plain *segLowered
 	for j := at + 1; j < nextAt; j++ {
 		if (in[j].Op != OpIfNot && in[j].Op != OpIf) || in[j].P2 != nextAt {
 			continue
 		}
-		if !segBodyLowers(in[at+1:j+1], at+1, cursor, j+1, guess) {
+		low, lowers := segBodyLowers(in[at+1:j+1], at+1, cursor, j+1, guess)
+		if !lowers {
 			break
 		}
-		predEnd = j + 1
+		predEnd, plain = j+1, low
 	}
 	if predEnd < 0 {
 		return false // no WHERE this models: every row is a candidate anyway
 	}
 	f := &segRowFilter{body: in[at+1 : predEnd], base: at + 1, cursor: cursor, end: predEnd}
-	if low, ok := segLowerBody(f.body, f.base, cursor, predEnd, nil); ok && len(low.cols) > 0 {
-		f.low = segSelecting(low)
+	if plain != nil {
+		f.low = segSelecting(plain)
 	}
 	seen := map[int]bool{}
 	for _, ins := range f.body {
@@ -209,13 +213,18 @@ func segAttachRowFilter(in []Instruction, at, cursor int) bool {
 }
 
 // segBodyLowers reports whether body lowers to a program that reads a
-// column, for INTEGER columns or for guess.
-func segBodyLowers(body []Instruction, base, cursor, end int, guess *segKinds) bool {
+// column, for INTEGER columns or for guess, and returns the INTEGER lowering
+// when that is the one that did (nil when only guess's did).
+func segBodyLowers(body []Instruction, base, cursor, end int, guess *segKinds) (*segLowered, bool) {
 	low, ok := segLowerBody(body, base, cursor, end, nil)
-	if (!ok || len(low.cols) == 0) && guess != nil {
-		low, ok = segLowerBody(body, base, cursor, end, guess)
+	if ok && len(low.cols) > 0 {
+		return low, true
 	}
-	return ok && len(low.cols) > 0
+	if guess == nil {
+		return nil, false
+	}
+	low, ok = segLowerBody(body, base, cursor, end, guess)
+	return nil, ok && len(low.cols) > 0
 }
 
 // segRealAffinityKinds is the kinds of the cursor's table with its

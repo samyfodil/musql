@@ -554,7 +554,7 @@ func attachedStatementIsDML(toks []token) bool {
 // TRIGGER" never do, and fall through to routeAttachedStatement's default
 // decline.
 func isAttachedDropTargetStmt(toks []token) bool {
-	if len(toks) < 2 || toks[0].kind != tkIdent || toks[0].upper() != "DROP" || toks[1].kind != tkIdent {
+	if len(toks) < 2 || toks[0].kind != tkIdent || !toks[0].isKw("DROP") || toks[1].kind != tkIdent {
 		return false
 	}
 	switch toks[1].upper() {
@@ -569,8 +569,8 @@ func isAttachedDropTargetStmt(toks []token) bool {
 // returns newName. RENAME COLUMN's cascade (sqlite3AlterRenameColumn,
 // alter.c:645/676) is not handled and falls through to the decline.
 func isAttachedRenameTableStmt(toks []token) (newName string, ok bool) {
-	if len(toks) < 2 || toks[0].kind != tkIdent || toks[0].upper() != "ALTER" ||
-		toks[1].kind != tkIdent || toks[1].upper() != "TABLE" {
+	if len(toks) < 2 || toks[0].kind != tkIdent || !toks[0].isKw("ALTER") ||
+		toks[1].kind != tkIdent || !toks[1].isKw("TABLE") {
 		return "", false
 	}
 	i := 2
@@ -584,11 +584,11 @@ func isAttachedRenameTableStmt(toks []token) (newName string, ok bool) {
 	if i+1 < len(toks) && toks[i].kind == tkPunct && toks[i].text == "." && isNameToken(toks[i+1]) {
 		i += 2
 	}
-	if i >= len(toks) || toks[i].kind != tkIdent || toks[i].upper() != "RENAME" {
+	if i >= len(toks) || toks[i].kind != tkIdent || !toks[i].isKw("RENAME") {
 		return "", false
 	}
 	i++
-	if i >= len(toks) || toks[i].kind != tkIdent || toks[i].upper() != "TO" {
+	if i >= len(toks) || toks[i].kind != tkIdent || !toks[i].isKw("TO") {
 		return "", false // "RENAME COLUMN ..."/"RENAME <col> TO ..." -- not this shape
 	}
 	i++
@@ -727,7 +727,7 @@ func attachedRoutedStatementWrites(toks []token, routed string) bool {
 	if len(toks) == 0 || toks[0].kind != tkIdent {
 		return false
 	}
-	if toks[0].upper() != "PRAGMA" {
+	if !toks[0].isKw("PRAGMA") {
 		return true
 	}
 	stmt, err := ParsePragma(routed)
@@ -1084,7 +1084,7 @@ func attachedTargetQualifier(trimmed string, toks []token) (qualifier, rewritten
 // shares toks' tokens, so byte offsets stay valid. A missing or unparseable
 // WITH returns toks unchanged; the real parser then reports the error.
 func withSkippedTokens(trimmed string, toks []token) []token {
-	if len(toks) == 0 || toks[0].kind != tkIdent || toks[0].upper() != "WITH" {
+	if len(toks) == 0 || toks[0].kind != tkIdent || !toks[0].isKw("WITH") {
 		return toks
 	}
 	p := newParser(trimmed, toks)
@@ -1117,13 +1117,13 @@ func attachedTargetTokenIndex(toks []token) (int, bool) {
 	switch toks[0].upper() {
 	case "INSERT", "REPLACE":
 		i := 1
-		if i < len(toks) && toks[i].kind == tkIdent && toks[i].upper() == "OR" {
+		if i < len(toks) && toks[i].kind == tkIdent && toks[i].isKw("OR") {
 			i += 2 // OR <action>
 		}
 		return skipIdent(i, "INTO"), true
 	case "UPDATE":
 		i := 1
-		if i < len(toks) && toks[i].kind == tkIdent && toks[i].upper() == "OR" {
+		if i < len(toks) && toks[i].kind == tkIdent && toks[i].isKw("OR") {
 			i += 2
 		}
 		return i, true
@@ -1137,7 +1137,7 @@ func attachedTargetTokenIndex(toks []token) (int, bool) {
 		// create it for real, so a TEMP create is never routed and falls through
 		// to the parser that already reports that error.
 		if i < len(toks) && toks[i].kind == tkIdent &&
-			(toks[i].upper() == "TEMP" || toks[i].upper() == "TEMPORARY") {
+			(toks[i].isKw("TEMP") || toks[i].isKw("TEMPORARY")) {
 			return 0, false
 		}
 		i = skipIdent(i, "UNIQUE")
@@ -1202,7 +1202,7 @@ func createTriggerOnQualifierIndex(toks []token, from int) (int, bool) {
 			i++
 		case "INSTEAD":
 			i++
-			if i < len(toks) && toks[i].kind == tkIdent && toks[i].upper() == "OF" {
+			if i < len(toks) && toks[i].kind == tkIdent && toks[i].isKw("OF") {
 				i++
 			}
 		}
@@ -1215,7 +1215,7 @@ func createTriggerOnQualifierIndex(toks []token, from int) (int, bool) {
 		i++
 	case "UPDATE":
 		i++
-		if i < len(toks) && toks[i].kind == tkIdent && toks[i].upper() == "OF" {
+		if i < len(toks) && toks[i].kind == tkIdent && toks[i].isKw("OF") {
 			i++
 			for {
 				if i >= len(toks) || toks[i].kind != tkIdent {
@@ -1232,7 +1232,7 @@ func createTriggerOnQualifierIndex(toks []token, from int) (int, bool) {
 	default:
 		return 0, false
 	}
-	if i >= len(toks) || toks[i].kind != tkIdent || toks[i].upper() != "ON" {
+	if i >= len(toks) || toks[i].kind != tkIdent || !toks[i].isKw("ON") {
 		return 0, false
 	}
 	i++
@@ -1363,7 +1363,7 @@ func (db *DB) wireOriginatingReaders(w *DB, reads bool) (unwire func(), err erro
 // a CREATE ... AS SELECT, a subquery in a SET/WHERE/VALUES) is inside one.
 func tokensContainSelect(toks []token) bool {
 	for _, t := range toks {
-		if t.kind == tkIdent && !t.quoted && t.upper() == "SELECT" {
+		if t.kind == tkIdent && !t.quoted && t.isKw("SELECT") {
 			return true
 		}
 	}
@@ -1797,7 +1797,7 @@ func StatementIsTempTrigger(sqlText string) bool {
 	if err != nil || len(toks) < 3 {
 		return false
 	}
-	if toks[0].kind != tkIdent || toks[0].upper() != "CREATE" {
+	if toks[0].kind != tkIdent || !toks[0].isKw("CREATE") {
 		return false
 	}
 	if toks[1].kind != tkIdent {
@@ -1808,5 +1808,5 @@ func StatementIsTempTrigger(sqlText string) bool {
 	default:
 		return false
 	}
-	return toks[2].kind == tkIdent && toks[2].upper() == "TRIGGER"
+	return toks[2].kind == tkIdent && toks[2].isKw("TRIGGER")
 }

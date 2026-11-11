@@ -623,7 +623,7 @@ func columnIndexByName(cols []columnInfo, name string) int {
 // update.c:560).
 func fkDMLTargetName(kw string, toks []token, verbAt int) (schema, table string) {
 	i := verbAt + 1
-	if i < len(toks) && toks[i].kind == tkIdent && toks[i].upper() == "OR" {
+	if i < len(toks) && toks[i].kind == tkIdent && toks[i].isKw("OR") {
 		i += 2 // OR <action>
 	}
 	switch kw {
@@ -636,11 +636,11 @@ func fkDMLTargetName(kw string, toks []token, verbAt int) (schema, table string)
 		// function's doc comment above describes twice already. It became
 		// reachable the moment compileWriteProgram started compiling REPLACE
 		// itself and dispatching it here.
-		if i < len(toks) && toks[i].kind == tkIdent && toks[i].upper() == "INTO" {
+		if i < len(toks) && toks[i].kind == tkIdent && toks[i].isKw("INTO") {
 			i++
 		}
 	case "DELETE":
-		if i < len(toks) && toks[i].kind == tkIdent && toks[i].upper() == "FROM" {
+		if i < len(toks) && toks[i].kind == tkIdent && toks[i].isKw("FROM") {
 			i++
 		}
 	}
@@ -710,8 +710,8 @@ func fkStatementReach(kw string, toks []token, verbAt int) fkReach {
 	// "... OR replace(a,'x','y')" (replace is a function) and widened the
 	// reach, inventing a resolution error the oracle does not raise.
 	if verbAt+2 < len(toks) &&
-		toks[verbAt+1].kind == tkIdent && toks[verbAt+1].upper() == "OR" &&
-		toks[verbAt+2].kind == tkIdent && toks[verbAt+2].upper() == "REPLACE" {
+		toks[verbAt+1].kind == tkIdent && toks[verbAt+1].isKw("OR") &&
+		toks[verbAt+2].kind == tkIdent && toks[verbAt+2].isKw("REPLACE") {
 		// An inserted row can evict an existing one, whose ON DELETE actions
 		// C SQLite then compiles.
 		r |= fkReachDelete
@@ -743,7 +743,7 @@ func fkStatementReach(kw string, toks []token, verbAt int) fkReach {
 			}
 		case "DO":
 			// "ON CONFLICT ... DO UPDATE": an upsert can change a parent key.
-			if i+1 < len(toks) && toks[i+1].kind == tkIdent && toks[i+1].upper() == "UPDATE" {
+			if i+1 < len(toks) && toks[i+1].kind == tkIdent && toks[i+1].isKw("UPDATE") {
 				r |= fkReachUpdate
 			}
 		}

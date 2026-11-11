@@ -118,7 +118,7 @@ func (p *ReadOnlyPager) declTypeNestedSelects(from []FromItem) map[string]*Selec
 				}
 				continue
 			}
-			if v, ok := p.r37cViewBody(it); ok && v != nil {
+			if v, ok := p.r37cViewBody(it, false); ok && v != nil {
 				name := it.Alias
 				if name == "" {
 					name = it.Table
