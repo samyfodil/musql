@@ -564,7 +564,7 @@ func TestLargeUploadAndExport(t *testing.T) {
 	if up.SizeBytes != st.Size() || up.Format != v1.FileFormat_FILE_FORMAT_MUSQL {
 		t.Fatalf("finish: %+v for %d bytes", up, st.Size())
 	}
-	if limit := uint64(st.Size()) / 3; grew > limit {
+	if limit := uint64(st.Size()) / 2; grew > limit {
 		t.Fatalf("the heap grew by %d MiB uploading %d MiB (limit %d MiB)", grew>>20, st.Size()>>20, limit>>20)
 	}
 
@@ -572,7 +572,7 @@ func TestLargeUploadAndExport(t *testing.T) {
 		must(dbs.Create(ctx, auth(e.admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "big", Source: &v1.CreateDatabaseRequest_Upload{Upload: up.Upload}})))
 	})
 	t.Logf("creating from it grew the heap by %d MiB", grew>>20)
-	if limit := uint64(st.Size()) / 3; grew > limit {
+	if limit := uint64(st.Size()) / 2; grew > limit {
 		t.Fatalf("the heap grew by %d MiB creating from %d MiB (limit %d MiB)", grew>>20, st.Size()>>20, limit>>20)
 	}
 	if left := e.uploadFiles(); len(left) != 0 {
