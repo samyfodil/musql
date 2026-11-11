@@ -340,7 +340,7 @@ func TestExplainQueryPlanSubqueries(t *testing.T) {
 			"1|0|SCAN t", "2|0|CORRELATED SCALAR SUBQUERY 1", "3|2|SCAN u",
 		}},
 		{`EXPLAIN QUERY PLAN SELECT * FROM t, (SELECT x, count(*) FROM u GROUP BY x) g WHERE g.x = t.b`, []string{
-			"1|0|SCAN t", "2|0|MATERIALIZE (subquery-1)", "3|2|SCAN u", "4|0|SCAN (subquery-1)",
+			"1|0|MATERIALIZE (subquery-1)", "2|1|SCAN u", "3|0|SCAN (subquery-1)", "4|0|SEARCH t USING INDEX i1 (b=?)",
 		}},
 	} {
 		if got := explainPlanRows(t, p, tc.sql); strings.Join(got, " ") != strings.Join(tc.want, " ") {
