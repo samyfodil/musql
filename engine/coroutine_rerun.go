@@ -600,6 +600,11 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 		return giveUp("in a join whose loop order is not followed")
 	}
 	for level, iTab := range order {
+		if optional && auto[level] && (keys[level] == nil || len(keys[level].cols) == 0) {
+			// The scan would keep its own order where C's automatic index
+			// orders the rows by its key.
+			return nil
+		}
 		if rerun[iTab] && level > 0 && !auto[level] {
 			srcs[iTab].coroutineRerun = true
 		}

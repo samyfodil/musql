@@ -551,7 +551,7 @@ type autoIndexKey struct {
 func wherePlanAutoIndexKey(in wherePlanInput, order []int, level int) *autoIndexKey {
 	iTab := order[level]
 	it := in.items[iTab]
-	if !it.colUsedOK {
+	if !it.colUsedOK && !it.ephemeral {
 		return nil
 	}
 	var ready whereMask
@@ -587,11 +587,15 @@ func wherePlanAutoIndexKey(in wherePlanInput, order []int, level int) *autoIndex
 	}
 	k.autoEq = len(k.cols)
 
-	// extraCols. IsView's ALLBITS arm and the WITHOUT ROWID PRIMARY KEY
-	// force-add are both unreachable here (the gate declines a view, a derived
-	// table and a WITHOUT ROWID table), and so is "colUsed & MASKBIT(BMS-1)",
-	// which only fires for a reference to column 63 or beyond.
+	// extraCols. A subquery's table is a view's (TABTYP_VIEW, select.c:5904),
+	// so IsView's ALLBITS arm takes every column for it. The WITHOUT ROWID
+	// PRIMARY KEY force-add is unreachable here (the gate declines a WITHOUT
+	// ROWID table), and so is "colUsed & MASKBIT(BMS-1)", which only fires for
+	// a reference to column 63 or beyond.
 	extra := it.colUsed & ^idxCols
+	if it.ephemeral {
+		extra = ^idxCols
+	}
 	for c := 0; c < len(it.cols); c++ {
 		if extra&(uint64(1)<<uint(c)) != 0 {
 			k.cols = append(k.cols, c)
