@@ -1,6 +1,9 @@
 package engine
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 // A FROM-clause subquery C codes as a co-routine is run where its loop
 // begins: wherecode.c:1550 emits OP_InitCoroutine at the top of that level's
@@ -1434,4 +1437,141 @@ func selectFromNames(s *SelectStmt) []string {
 	}
 	walkSel(s)
 	return out
+}
+
+// wherePlanSingleDerivedOrder is wherePlanSingleTableIndexOrder for a FROM
+// clause of one subquery in a nested compile, where the seed path can make an
+// automatic index win. A subquery's table has only the fake sPk (as
+// wherePlanMultiTableOrderWith's items do), so the choice is its full scan, in
+// the order the rows were made, or that index, which orders them by every
+// column (wherePlanAutoIndexKey).
+//
+// A CTE that C materializes is planned at the estimate of whichever reference
+// codes it first, the body's, or 200 for a later one reusing it (select.c:8086).
+// Which this is depends on coding order, so the plan is taken only when both
+// estimates give it.
+func wherePlanSingleDerivedOrder(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt *SelectStmt) (*autoIndexKey, logEst, bool) {
+	s := &srcs[0]
+	if s.vtabItem != nil || s.catalogScope != scopeAny || s.left || s.rightOuter || s.tbl == nil ||
+		len(s.tbl.cols) >= 63 || len(stmt.Compound) > 0 || stmt.From[0].GroupLen != 0 ||
+		s.cteItem != nil && (s.cteItem.queue != nil || s.cteItem.recSelf != nil) || p.ReverseUnorderedSelects() {
+		return nil, 0, false
+	}
+	items := stmt.From
+	body, cte, _, ok := p.cSubqueryBody(items[0])
+	if !ok || p.cVolatile(body) {
+		return nil, 0, false
+	}
+	if flat, certain := p.cFlattens(stmt, items, 0); flat || !certain {
+		return nil, 0, false
+	}
+	co, certain := p.cCoroutineVerdict(stmt, items, 0, cPushDownFree(stmt, srcs))
+	if !certain {
+		return nil, 0, false
+	}
+	compile := func(sel *SelectStmt) *Program {
+		var prog *Program
+		p.keepingCTEUses(func() {
+			if cte != nil {
+				defer p.enterCTEBodyScope(items[0].Table, cte)()
+			}
+			sp, err := compileSubProgram(p, sel, c.outer)
+			if err == nil {
+				prog = sp
+			}
+		})
+		return prog
+	}
+	var prog *Program
+	switch {
+	case s.derived != nil:
+		prog = s.derived
+	case cte != nil:
+		prog = p.cteBodyProgram(c, items[0].Table, cte)
+	}
+	est, ok := cSelectRowEst(body, prog, compile, c.nQueryLoop, c.nQueryLoopKnown)
+	if !ok {
+		return nil, 0, false
+	}
+	ests := []logEst{est}
+	if cte != nil && !co {
+		ests = append(ests, whereDefaultRowLogEst)
+	}
+	subOB, ok := cSubqueryOrderBy(stmt, items, 0, body, cte)
+	if !ok {
+		return nil, 0, false
+	}
+	for _, cj := range splitTopLevelAnd(stmt.Where) {
+		if wherePlanHasRangeRewrite(cj) {
+			return nil, 0, false
+		}
+	}
+	scopes := tableScopesOf(srcs)
+	wherePlanBindOuter(c, scopes)
+	jts := []joinedTable{{tbl: s.tbl}}
+	where := stmt.Where
+	if !c.onePassPlan {
+		pw, _, pok := wherePlanPropagateConstants(jts, scopes, where)
+		if !pok {
+			return nil, 0, false
+		}
+		where = pw
+	}
+	terms, ok := wherePlanTermsFrom(jts, scopes, where)
+	if !ok {
+		return nil, 0, false
+	}
+	colUsed, colUsedOK := wherePlanColUsed(p, c, jts, scopes, srcs, stmt)
+	sortCtl, ok := wherePlanSortCtlFor(jts, scopes, stmt)
+	if !ok {
+		return nil, 0, false
+	}
+	var key *autoIndexKey
+	var nRow logEst
+	for k, e := range ests {
+		item := whereItem{
+			cols: s.tbl.cols, tabName: "\x00subquery0",
+			colUsedOK: colUsedOK, ipkIndex: -1, szTabRow: 1,
+			idxs: []whereIndexInfo{{
+				name: "sqlite_rowid", aiColumn: []int{xnRowid}, azColl: []string{"BINARY"},
+				aSortOrder: []bool{false}, nKeyCol: 1, aiRowLogEst: []logEst{e, 0},
+				szIdxRow: 3, onError: true, ipk: true,
+			}},
+			nRowLogEst: e, nRowLogEstSet: true,
+			ephemeral: true, correlated: prog != nil && prog.Correlated,
+			subOB: subOB, coroutine: co,
+		}
+		if colUsedOK {
+			item.colUsed = colUsed[0]
+		}
+		in := wherePlanInput{
+			items: []whereItem{item}, terms: terms, sort: sortCtl,
+			noAutoIndex: !p.AutomaticIndex(), winner: c.planWinner,
+		}
+		solve := func(in wherePlanInput) (*autoIndexKey, logEst, bool) {
+			return wherePlanSingleTableSolve(in, stmt, item.idxs, terms, sortCtl, false)
+		}
+		var kk *autoIndexKey
+		var n logEst
+		if c.nQueryLoopKnown {
+			in.nQueryLoop = c.nQueryLoop
+			kk, n, ok = solve(in)
+		} else {
+			kk, n, ok = wherePlanSeedInvariant(in, solve)
+		}
+		if !ok || k > 0 && !autoIndexKeysEqual(key, kk) {
+			return nil, 0, false
+		}
+		key, nRow = kk, n
+	}
+	return key, nRow, true
+}
+
+// autoIndexKeysEqual reports two plans' keys walking the rows alike.
+func autoIndexKeysEqual(a, b *autoIndexKey) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return slices.Equal(a.cols, b.cols) && slices.Equal(a.colls, b.colls) && slices.Equal(a.desc, b.desc) &&
+		a.multiOr == nil && b.multiOr == nil
 }

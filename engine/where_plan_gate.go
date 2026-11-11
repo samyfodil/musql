@@ -695,6 +695,9 @@ func wherePlanSingleTableIndexOrder(p *ReadOnlyPager, c *compiler, srcs []joinSo
 		return nil, 0, false
 	}
 	s := &srcs[0]
+	if (s.derived != nil || s.cteItem != nil) && c.outer != nil {
+		return wherePlanSingleDerivedOrder(p, c, srcs, stmt)
+	}
 	if s.derived != nil || s.vtabItem != nil || s.cteItem != nil ||
 		s.catalogScope != scopeAny ||
 		s.left || s.rightOuter || s.tbl == nil || s.tbl.withoutRowid ||
