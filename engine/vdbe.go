@@ -94,6 +94,12 @@ type vdbe struct {
 	// stmtOnceRows holds the rows of each derivedSource.stmtOnce body, by
 	// program, on the statement's root machine (stmtRoot).
 	stmtOnceRows map[*Program][][]Value
+	// rowOrders and rowSorts hold, on the statement's root machine, a built-once
+	// row list as OpAutoIndexOrder ordered it and as OpSortedSeek sorted it, for
+	// the next open over the same list: a correlated subquery opens its source
+	// once per outer row.
+	rowOrders map[rowOrderKey]rowOrder
+	rowSorts  map[rowSortKey]*sortedRows
 	// rjMatched holds, per cursor, the rowids a correlated RIGHT/FULL JOIN
 	// operand matched (derivedSource.rightJoin), across its rebuilds.
 	rjMatched map[int]map[uint64]bool
@@ -2195,7 +2201,25 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 					return nil, rerr
 				}
 			}
-			cur.sortedSeek(op.P4.(*sortedSeekHint), m.regs[op.P2], m.encoding())
+			h := op.P4.(*sortedSeekHint)
+			var sk rowSortKey
+			cache := cur.sorted == nil && runOnceRows(cur) && len(cur.rows) > 0
+			if cache {
+				sk = rowSortKey{hint: h, first: &cur.rows[0], n: len(cur.rows)}
+				if s, ok := m.stmtRoot().rowSorts[sk]; ok {
+					cp := *s // its own run position
+					cur.sorted, cache = &cp, false
+				}
+			}
+			cur.sortedSeek(h, m.regs[op.P2], m.encoding())
+			if cache && cur.sorted != nil && cur.sorted.ok {
+				root := m.stmtRoot()
+				if root.rowSorts == nil {
+					root.rowSorts = map[rowSortKey]*sortedRows{}
+				}
+				cp := *cur.sorted
+				root.rowSorts[sk] = &cp
+			}
 
 		case OpMultiOrTag:
 			cur := m.cursors[op.P1]
@@ -4002,8 +4026,58 @@ func (m *vdbe) execAutoIndexOrder(op *Instruction) error {
 		return nil
 	}
 	cur.idxListOnce = false
+	if !runOnceRows(cur) || len(cur.rows) == 0 {
+		autoIndexOrderCursor(cur, key, m.encoding())
+		return nil
+	}
+	root := m.stmtRoot()
+	k := rowOrderKey{key: key, first: &cur.rows[0], n: len(cur.rows)}
+	if o, ok := root.rowOrders[k]; ok {
+		cur.rows, cur.rowids = o.rows, o.ids
+		return nil
+	}
+	src := cur.rows
 	autoIndexOrderCursor(cur, key, m.encoding())
+	if root.rowOrders == nil {
+		root.rowOrders = map[rowOrderKey]rowOrder{}
+	}
+	root.rowOrders[k] = rowOrder{src: src, rows: cur.rows, ids: cur.rowids}
 	return nil
+}
+
+// rowOrderKey names a row list (its first row's place and its length) and the
+// key OpAutoIndexOrder ordered it by.
+type rowOrderKey struct {
+	key   *autoIndexKey
+	first *[]Value
+	n     int
+}
+
+// rowOrder is the list src as the key ordered it. Holding src keeps its place
+// from being reused by another list.
+type rowOrder struct {
+	src  [][]Value
+	rows [][]Value
+	ids  []uint64
+}
+
+// rowSortKey is rowOrderKey for OpSortedSeek's copy.
+type rowSortKey struct {
+	hint  *sortedSeekHint
+	first *[]Value
+	n     int
+}
+
+// runOnceRows reports a cursor over the rows a run-once slot holds for the
+// whole statement (openSlotFillCursor), which no later fill changes: the rows
+// rowOrders and rowSorts may key by where the list lives.
+func runOnceRows(cur *vdbeCursor) bool {
+	if !cur.slotFill || cur.slot == nil || !subqueryRowsOnce(cur) {
+		return false
+	}
+	// A correlated body fills its slot again for every outer row.
+	ds := cur.slot.ds
+	return ds.cte != nil && !ds.rerun || ds.cte == nil && ds.prog != nil && !ds.prog.Correlated
 }
 
 // subqueryRowsOnce reports a cursor over a subquery's rows that are one list,

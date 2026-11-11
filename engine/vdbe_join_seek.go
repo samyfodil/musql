@@ -57,7 +57,11 @@ import (
 var joinSeekDisabled bool
 
 func annotateJoinSeeks(c *compiler, srcs []joinSource, plan joinPlan) {
-	if joinSeekDisabled || c == nil || c.pager == nil || len(srcs) < 2 {
+	if joinSeekDisabled || c == nil || c.pager == nil {
+		return
+	}
+	if len(srcs) == 1 {
+		annotateOuterKeySortedSeek(c, srcs, plan)
 		return
 	}
 	order := plan.execOrder
@@ -106,6 +110,30 @@ func annotateJoinSeeks(c *compiler, srcs []joinSource, plan joinPlan) {
 		}
 		srcs[origIdx].joinSortedKey, srcs[origIdx].joinSortedSeek = findJoinSortedSeek(c, s, outer, eqs)
 	}
+}
+
+// annotateOuterKeySortedSeek gives the one subquery of a nested compile a
+// sorted seek on an equality whose key names only the enclosing query, fixed
+// for each run of it: the rows the key matches keep the order they had (a
+// run of sortRowsBy keeps it), found by binary search where a correlated
+// subquery would scan them all on every run.
+func annotateOuterKeySortedSeek(c *compiler, srcs []joinSource, plan joinPlan) {
+	s := srcs[0]
+	if c.outer == nil || s.tbl == nil || s.derived == nil && s.cteItem == nil || s.vtabItem != nil ||
+		s.left || s.rightOuter || len(plan.buckets) == 0 {
+		return
+	}
+	if len(plan.autoIdxKeys) > 0 && plan.autoIdxKeys[0] != nil && plan.autoIdxKeys[0].multiOr != nil {
+		return
+	}
+	eqs := plainUsingRefs(srcs, orCommonConjuncts(plan.buckets[0]))
+	outerOnly := func(e Expr) bool {
+		return exprRefsOnly(e, func(x ColumnExpr) bool {
+			_, _, _, found, _, hard := resolveInScopes(c.scopes, x, c.pager)
+			return hard == nil && !found
+		})
+	}
+	srcs[0].joinSortedKey, srcs[0].joinSortedSeek = findJoinSortedSeekBy(c, s, outerOnly, eqs)
 }
 
 // annotateIndexJoinSeek installs a rowid or index seek on srcs[origIdx] when
@@ -342,6 +370,12 @@ func plainUsingRefs(srcs []joinSource, eqs []Expr) []Expr {
 // affinity, must include every row the equality passes, which
 // seekAffinitySafe guarantees.
 func findJoinSortedSeek(c *compiler, s joinSource, outer map[int]bool, eqs []Expr) (Expr, *sortedSeekHint) {
+	return findJoinSortedSeekBy(c, s, func(e Expr) bool { return keyRefsOnlyCursors(c, e, outer) }, eqs)
+}
+
+// findJoinSortedSeekBy is findJoinSortedSeek with keyOK deciding which keys
+// are bound before the seek.
+func findJoinSortedSeekBy(c *compiler, s joinSource, keyOK func(Expr) bool, eqs []Expr) (Expr, *sortedSeekHint) {
 	for _, cj := range eqs {
 		be, ok := cj.(BinaryExpr)
 		if !ok || (be.Op != "=" && be.Op != "==") {
@@ -349,7 +383,7 @@ func findJoinSortedSeek(c *compiler, s joinSource, outer map[int]bool, eqs []Exp
 		}
 		for _, side := range [2][2]Expr{{be.L, be.R}, {be.R, be.L}} {
 			col, ok := scopeColumnIndex(c, s, side[0])
-			if !ok || col < 0 || col >= len(s.tbl.cols) || !keyRefsOnlyCursors(c, side[1], outer) {
+			if !ok || col < 0 || col >= len(s.tbl.cols) || !keyOK(side[1]) {
 				continue
 			}
 			aff := comparisonAffinity(c.affCtx(), side[0], side[1])
