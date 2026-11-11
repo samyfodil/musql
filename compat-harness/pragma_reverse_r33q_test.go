@@ -91,9 +91,7 @@ var r33qReadouts = []struct{ name, query string }{
 }
 
 // r33qDeclined tracks shapes this engine refuses with the pragma on and off.
-var r33qDeclined = map[string]bool{
-	"join using": true,
-}
+var r33qDeclined = map[string]bool{}
 
 // r33qOpen tracks known-open divergences where the pragma is on.
 var r33qOpen = map[string]bool{

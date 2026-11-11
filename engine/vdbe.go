@@ -3946,9 +3946,11 @@ func (m *vdbe) execAutoIndexOrder(op *Instruction) error {
 		cur.applyWriteOrder()
 		return nil
 	}
-	if cur == nil || cursorHasNoBtree(cur) || cur.streamable || cur.seekReseek {
+	if cur == nil || cursorHasNoBtree(cur) && !subqueryRowsOnce(cur) || cur.streamable || cur.seekReseek {
 		// Nothing to permute (no b-tree, or a lazy pull), or a correlated
-		// seek that re-materializes a different row set per rewind.
+		// seek that re-materializes a different row set per rewind. A
+		// subquery's rows, built once, are permuted: C's automatic index on
+		// one is keyed by every column and then the order they were made in.
 		//
 		// A non-correlated seek is permuted like any cursor: it
 		// materializes once and its rows are a superset of the answer, so
@@ -4002,6 +4004,12 @@ func (m *vdbe) execAutoIndexOrder(op *Instruction) error {
 	cur.idxListOnce = false
 	autoIndexOrderCursor(cur, key, m.encoding())
 	return nil
+}
+
+// subqueryRowsOnce reports a cursor over a subquery's rows that are one list,
+// built at most once.
+func subqueryRowsOnce(cur *vdbeCursor) bool {
+	return (cur.materialized || cur.fill != nil) && !cur.refillEach && cur.sub == nil && cur.vt == nil
 }
 
 // flushJIT takes back the cursors native code still holds from a stop at an
