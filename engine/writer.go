@@ -943,7 +943,9 @@ func (db *DB) stampPager(p *ReadOnlyPager) {
 	p.schemaCorrupt = db.schemaCorrupt
 	p.schemaCorruptGen = db.schemaCorruptGen
 	if db.plans == nil {
-		db.plans = &sharedPlanCache{}
+		if db.plans = takePooledPlans(db.path); db.plans == nil {
+			db.plans = &sharedPlanCache{}
+		}
 	}
 	p.sharedPlans = db.plans
 	// ...and the statistics the connection last loaded, which is what C's

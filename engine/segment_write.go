@@ -1107,6 +1107,10 @@ func (n *Session) Close() error {
 	n.closed = true
 	n.dropTempFileIfUnclaimed() // C's temp database is OPEN_DELETEONCLOSE
 	n.DB.closed = true
+	if err == nil && !n.poisoned {
+		poolPlans(n.DB.path, n.DB.plans)
+		n.DB.plans = nil
+	}
 	n.releaseCommittedColumns()
 	if cerr := n.src.Close(); cerr != nil && err == nil {
 		err = cerr
