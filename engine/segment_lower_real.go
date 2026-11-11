@@ -167,9 +167,10 @@ func segRealOp(in Instruction, real map[int]bool) bool {
 // segIntSources finds the registers written once, by an INTEGER literal or
 // its negation (lits) or a parameter (params: its index).
 func segIntSources(body []Instruction) (lits map[int]bool, params map[int]int) {
+	var rb segRegsBuf
 	writes := map[int]int{}
 	for _, in := range body {
-		_, w, _, _ := segInsnRegs(in)
+		_, w, _, _ := segInsnRegsInto(in, &rb)
 		for _, r := range w {
 			writes[r]++
 		}
@@ -559,12 +560,13 @@ func buildSegMathKernel(name string, nargs int) *fir.Func {
 // is whether an IsNull or NotNull also reads it. ok is false with any other
 // reader, with none, or with two that want different values.
 func segNullReaders(body []Instruction, i, dst int) (answer int64, tested, ok bool) {
+	var rb segRegsBuf
 	answer = -1
 	for j, in := range body {
 		if j == i {
 			continue
 		}
-		reads, _, _, known := segInsnRegs(in)
+		reads, _, _, known := segInsnRegsInto(in, &rb)
 		if !known {
 			if ops := segLowerRegOperands(in); slices.Contains(ops[:], dst) {
 				return 0, false, false

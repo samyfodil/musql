@@ -47,45 +47,59 @@ type segSvcBlock struct {
 // segInsnRegs is the registers in reads and writes, and whether it may end in
 // a jump. ok is false for an opcode a service block cannot run.
 func segInsnRegs(in Instruction) (reads, writes []int, jump, ok bool) {
+	var buf segRegsBuf
+	return segInsnRegsInto(in, &buf)
+}
+
+// segRegsBuf holds the lists segInsnRegsInto returns, so a caller that keeps
+// neither allocates nothing.
+type segRegsBuf struct {
+	r [4]int
+	w [1]int
+}
+
+// segInsnRegsInto is segInsnRegs with its lists in buf, valid until buf is
+// used again.
+func segInsnRegsInto(in Instruction, buf *segRegsBuf) (reads, writes []int, jump, ok bool) {
+	r, w := buf.r[:0], buf.w[:0]
 	switch in.Op {
 	case OpColumn:
-		return nil, []int{in.P3}, false, true
+		return nil, append(w, in.P3), false, true
 	case OpInteger, OpInt64, OpReal, OpString8, OpNull, OpVariable:
-		return nil, []int{in.P2}, false, true
+		return nil, append(w, in.P2), false, true
 	case OpSCopy, OpCopy, OpNot, OpNegative, OpBitNot:
-		return []int{in.P1}, []int{in.P2}, false, true
+		return append(r, in.P1), append(w, in.P2), false, true
 	case OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight:
-		return []int{in.P1, in.P2}, []int{in.P3}, false, true
+		return append(r, in.P1, in.P2), append(w, in.P3), false, true
 	case OpFunction:
-		r := make([]int, in.P2)
-		for i := range r {
-			r[i] = in.P1 + i
+		for i := range in.P2 {
+			r = append(r, in.P1+i)
 		}
-		return r, []int{in.P3}, false, true
+		return r, append(w, in.P3), false, true
 	case OpLike:
-		r := []int{in.P1, in.P3}
+		r = append(r, in.P1, in.P3)
 		if esc, isInt := in.P4.(int); isInt && esc >= 0 {
 			r = append(r, esc)
 		}
-		return r, []int{in.P2}, false, true
+		return r, append(w, in.P2), false, true
 	case OpGlob:
-		return []int{in.P1, in.P3}, []int{in.P2}, false, true
+		return append(r, in.P1, in.P3), append(w, in.P2), false, true
 	case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
 		if in.P5&p5StoreP2 != 0 {
-			return []int{in.P1, in.P3}, []int{in.P2}, false, true
+			return append(r, in.P1, in.P3), append(w, in.P2), false, true
 		}
-		return []int{in.P1, in.P3}, nil, true, true
+		return append(r, in.P1, in.P3), nil, true, true
 	case OpIf, OpIfNot, OpIsNull, OpNotNull:
-		return []int{in.P1}, nil, true, true
+		return append(r, in.P1), nil, true, true
 	case OpInList:
-		return []int{in.P1}, []int{in.P2}, false, true
+		return append(r, in.P1), append(w, in.P2), false, true
 	case OpConcat, OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder:
-		return []int{in.P1, in.P2}, []int{in.P3}, false, true
+		return append(r, in.P1, in.P2), append(w, in.P3), false, true
 	case OpCast:
 		if in.P3 == segCastRenamed {
-			return []int{in.P1}, []int{in.P2}, false, true
+			return append(r, in.P1), append(w, in.P2), false, true
 		}
-		return []int{in.P1}, []int{in.P1}, false, true
+		return append(r, in.P1), append(w, in.P1), false, true
 	}
 	return nil, nil, false, false
 }
@@ -120,7 +134,8 @@ func segNativeLowerable(in Instruction, cursor int) bool {
 // hands the statement to the VDBE, which runs every call again, and a call
 // with an effect or a varying answer must not be made twice.
 func segServiceable(in Instruction, cursor int) bool {
-	if _, _, _, ok := segInsnRegs(in); !ok {
+	var rb segRegsBuf
+	if _, _, _, ok := segInsnRegsInto(in, &rb); !ok {
 		return false
 	}
 	switch in.Op {
@@ -139,6 +154,7 @@ func segServiceable(in Instruction, cursor int) bool {
 // column feeding length() is read by the block that calls it, and the IfNot
 // after a LIKE sees its NULL. nil when an instruction can be neither.
 func segClassifyServices(body []Instruction, cursor int, native func(Instruction) bool) []bool {
+	var rb segRegsBuf
 	svc := make([]bool, len(body))
 	some := false
 	for i, in := range body {
@@ -165,7 +181,7 @@ func segClassifyServices(body []Instruction, cursor int, native func(Instruction
 	}
 	readers, writers := map[int][]int{}, map[int][]int{}
 	for i, in := range body {
-		r, w, _, ok := segInsnRegs(in)
+		r, w, _, ok := segInsnRegsInto(in, &rb)
 		if !ok {
 			r = nil
 			for _, x := range segLowerRegOperands(in) {
@@ -228,6 +244,7 @@ func segClassifyServices(body []Instruction, cursor int, native func(Instruction
 // POpService), and a jump ends one. startOf[i] is the block starting at body
 // index i, -1 elsewhere.
 func segBuildBlocks(body []Instruction, svc []bool, base int, flagFrom int) (blocks []segSvcBlock, startOf []int) {
+	var rb segRegsBuf
 	target := make([]bool, len(body)+1)
 	for _, in := range body {
 		switch in.Op {
@@ -258,7 +275,7 @@ func segBuildBlocks(body []Instruction, svc []bool, base int, flagFrom int) (blo
 				computed = true
 			}
 			b.insns = append(b.insns, body[i])
-			_, _, jump, _ := segInsnRegs(body[i])
+			_, _, jump, _ := segInsnRegsInto(body[i], &rb)
 			i++
 			if jump {
 				b.flag = flagFrom + len(blocks)
@@ -275,6 +292,7 @@ func segBuildBlocks(body []Instruction, svc []bool, base int, flagFrom int) (blo
 // that native code may have written, and what it writes that native code
 // reads or also writes.
 func segBlockHomes(body []Instruction, svc []bool, blocks []segSvcBlock) {
+	var rb segRegsBuf
 	nativeRead, nativeWrite := map[int]bool{}, map[int]bool{}
 	for i, in := range body {
 		if svc[i] {
@@ -285,7 +303,7 @@ func segBlockHomes(body []Instruction, svc []bool, blocks []segSvcBlock) {
 				nativeRead[x] = true // a destination counts too: it is written
 			}
 		}
-		if _, w, _, ok := segInsnRegs(in); ok {
+		if _, w, _, ok := segInsnRegsInto(in, &rb); ok {
 			for _, x := range w {
 				nativeWrite[x] = true
 			}
@@ -298,7 +316,7 @@ func segBlockHomes(body []Instruction, svc []bool, blocks []segSvcBlock) {
 		b := &blocks[bi]
 		seenL, seenW := map[int]bool{}, map[int]bool{}
 		for _, in := range b.insns {
-			r, w, _, _ := segInsnRegs(in)
+			r, w, _, _ := segInsnRegsInto(in, &rb)
 			for _, x := range r {
 				if nativeWrite[x] && !seenL[x] {
 					seenL[x] = true
@@ -503,11 +521,12 @@ func segCallKernel(kern *jit.Code, args *jit.ProgArgs, svc *segSvcRunner, blocks
 // write it back. Without it max(length(s)) took the max of a register the
 // block never wrote, and count(f(x)) would count a NULL f(x) as a row.
 func (l *segLowered) readNatively(r int) {
+	var rb segRegsBuf
 	for bi := range l.blocks {
 		b := &l.blocks[bi]
 		writes := false
 		for _, in := range b.insns {
-			_, w, _, _ := segInsnRegs(in)
+			_, w, _, _ := segInsnRegsInto(in, &rb)
 			for _, x := range w {
 				writes = writes || x == r
 			}
@@ -523,6 +542,7 @@ func (l *segLowered) readNatively(r int) {
 // built-in length, nothing loaded and nothing else written back -- and that no
 // other block reads what it leaves in the window, since POpTextLen skips it.
 func segBlockIsLength(body []Instruction, svc []bool, blocks []segSvcBlock, bi, cursor int) (col, dst int, ok bool) {
+	var rb segRegsBuf
 	b := &blocks[bi]
 	if len(b.load) != 0 || b.flag >= 0 || len(b.writeBack) > 1 || len(b.insns) < 2 {
 		return 0, 0, false
@@ -565,7 +585,7 @@ func segBlockIsLength(body []Instruction, svc []bool, blocks []segSvcBlock, bi, 
 			continue
 		}
 		for _, in := range ob.insns {
-			r, _, _, _ := segInsnRegs(in)
+			r, _, _, _ := segInsnRegsInto(in, &rb)
 			for _, x := range r {
 				if _, written := colOf[x]; written {
 					return 0, 0, false
@@ -590,9 +610,10 @@ func segVecColumn(s *segment, c int) (cells []uint64, heap []byte, ok bool) {
 // segBlockWindowPrivate reports whether no other block reads a register block
 // bi writes into the window -- what lets a native form skip the block.
 func segBlockWindowPrivate(blocks []segSvcBlock, bi int) bool {
+	var rb segRegsBuf
 	writes := map[int]bool{}
 	for _, in := range blocks[bi].insns {
-		_, w, _, _ := segInsnRegs(in)
+		_, w, _, _ := segInsnRegsInto(in, &rb)
 		for _, x := range w {
 			writes[x] = true
 		}
@@ -602,7 +623,7 @@ func segBlockWindowPrivate(blocks []segSvcBlock, bi int) bool {
 			continue
 		}
 		for _, in := range ob.insns {
-			r, _, _, _ := segInsnRegs(in)
+			r, _, _, _ := segInsnRegsInto(in, &rb)
 			for _, x := range r {
 				if writes[x] {
 					return false
