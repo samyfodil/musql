@@ -27,9 +27,9 @@ type sortedRows struct {
 
 // sortedSeek narrows cur to the rows whose column h.col equals probe, sorting
 // the full list by that column the first time.
-func (cur *vdbeCursor) sortedSeek(h *sortedSeekHint, probe Value, enc TextEncoding) {
+func (cur *vdbeCursor) sortedSeek(h *sortedSeekHint, probe Value, regs []Value, enc TextEncoding) {
 	s := cur.sorted
-	if s == nil || s.hint != h {
+	if s == nil || !s.hint.sameSort(h) {
 		cur.unsort()
 		s = cur.sortRowsBy(h, enc)
 		cur.sorted = s
@@ -37,7 +37,7 @@ func (cur *vdbeCursor) sortedSeek(h *sortedSeekHint, probe Value, enc TextEncodi
 	if !s.ok {
 		return
 	}
-	lo, hi := s.find(probe, enc)
+	lo, hi := s.find(h, probe, regs, enc)
 	cur.rows, cur.rowids, s.base = s.rows[lo:hi:hi], s.ids[lo:hi:hi], lo
 }
 
@@ -57,8 +57,11 @@ func (cur *vdbeCursor) sortRowsBy(h *sortedSeekHint, enc TextEncoding) *sortedRo
 	cur.normalizeRowsNow()
 	n := len(cur.rows)
 	ints := make([]int64, n)
+	if len(h.more) > 0 {
+		ints = nil
+	}
 	for i, row := range cur.rows {
-		if h.col >= len(row) {
+		if h.col >= len(row) || slices.ContainsFunc(h.more, func(m sortedSeekCol) bool { return m.col >= len(row) }) {
 			return s
 		}
 		if v := row[h.col]; v.Typ == Int && ints != nil {
@@ -85,6 +88,11 @@ func (cur *vdbeCursor) sortRowsBy(h *sortedSeekHint, enc TextEncoding) *sortedRo
 			if c := compareValuesCollatedEnc(cur.rows[a][h.col], cur.rows[b][h.col], h.coll, enc); c != 0 {
 				return c
 			}
+			for _, mc := range h.more {
+				if c := compareValuesCollatedEnc(cur.rows[a][mc.col], cur.rows[b][mc.col], mc.coll, enc); c != 0 {
+					return c
+				}
+			}
 			return cmp.Compare(a, b)
 		})
 	}
@@ -102,12 +110,16 @@ func (cur *vdbeCursor) sortRowsBy(h *sortedSeekHint, enc TextEncoding) *sortedRo
 	return s
 }
 
-// find is the run of rows whose key column equals probe, once probe takes the
-// comparison's affinity, under the hint's collation. A NULL equals nothing.
-func (s *sortedRows) find(probe Value, enc TextEncoding) (int, int) {
-	probe = applyAffinityToValue(probe, s.hint.aff)
+// find is the run of rows whose key column equals probe, and each further
+// column the key in its register (regs), once every key takes its
+// comparison's affinity, under its collation. A NULL equals nothing.
+func (s *sortedRows) find(h *sortedSeekHint, probe Value, regs []Value, enc TextEncoding) (int, int) {
+	probe = applyAffinityToValue(probe, h.aff)
 	if probe.Typ == Null {
 		return 0, 0
+	}
+	if len(h.more) > 0 {
+		return s.findTuple(h, probe, regs, enc)
 	}
 	if s.ints != nil && probe.Typ == Int {
 		lo, _ := slices.BinarySearch(s.ints, probe.I)
@@ -125,4 +137,46 @@ func (s *sortedRows) find(probe Value, enc TextEncoding) (int, int) {
 		return compareValuesCollatedEnc(s.rows[lo+i][col], probe, coll, enc) > 0
 	})
 	return lo, hi
+}
+
+// findTuple is find over the hint's further columns too.
+func (s *sortedRows) findTuple(h *sortedSeekHint, probe Value, regs []Value, enc TextEncoding) (int, int) {
+	keys := make([]Value, len(h.more))
+	for i, mc := range h.more {
+		if keys[i] = applyAffinityToValue(regs[mc.reg], mc.aff); keys[i].Typ == Null {
+			return 0, 0
+		}
+	}
+	cmpRow := func(row []Value) int {
+		if c := compareValuesCollatedEnc(row[h.col], probe, h.coll, enc); c != 0 {
+			return c
+		}
+		for i, mc := range h.more {
+			if c := compareValuesCollatedEnc(row[mc.col], keys[i], mc.coll, enc); c != 0 {
+				return c
+			}
+		}
+		return 0
+	}
+	lo := sort.Search(len(s.rows), func(i int) bool { return cmpRow(s.rows[i]) >= 0 })
+	hi := lo + sort.Search(len(s.rows)-lo, func(i int) bool { return cmpRow(s.rows[lo+i]) > 0 })
+	return lo, hi
+}
+
+// sameSort reports whether b sorts the rows as a does: the same columns under
+// the same collations and affinities. A level a LEFT JOIN emits twice, for
+// its matched rows and for its NULL row, seeks with two hints that do.
+func (a *sortedSeekHint) sameSort(b *sortedSeekHint) bool {
+	if a == b {
+		return true
+	}
+	if a == nil || b == nil || a.col != b.col || a.coll != b.coll || a.aff != b.aff || len(a.more) != len(b.more) {
+		return false
+	}
+	for i := range a.more {
+		if x, y := a.more[i], b.more[i]; x.col != y.col || x.coll != y.coll || x.aff != y.aff {
+			return false
+		}
+	}
+	return true
 }

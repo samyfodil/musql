@@ -88,8 +88,8 @@ func annotateJoinSeeks(c *compiler, srcs []joinSource, plan joinPlan) {
 		// For a LEFT source only ON conjuncts qualify: a WHERE conjunct is not
 		// part of the match-vs-NULL-extend decision, so pruning with one could
 		// NULL-extend a row SQLite would join. planJoinPushdown already leaves
-		// buckets empty from the first LEFT join on; this enforces the
-		// invariant the seek depends on. A RIGHT/FULL operand's unmatched-row
+		// a LEFT level's bucket empty; this enforces the invariant the seek
+		// depends on. A RIGHT/FULL operand's unmatched-row
 		// sweep is decided the same way, by ON alone.
 		var eqs []Expr
 		eqs = append(eqs, splitTopLevelAnd(s.on)...)
@@ -108,7 +108,7 @@ func annotateJoinSeeks(c *compiler, srcs []joinSource, plan joinPlan) {
 		if planKey != nil && planKey.multiOr != nil {
 			continue // ordered per outer row, inside the loop
 		}
-		srcs[origIdx].joinSortedKey, srcs[origIdx].joinSortedSeek = findJoinSortedSeek(c, s, outer, eqs)
+		srcs[origIdx].joinSortedKey, srcs[origIdx].joinSortedMore, srcs[origIdx].joinSortedSeek = findJoinSortedSeek(c, s, outer, eqs)
 	}
 }
 
@@ -133,7 +133,7 @@ func annotateOuterKeySortedSeek(c *compiler, srcs []joinSource, plan joinPlan) {
 			return hard == nil && !found
 		})
 	}
-	srcs[0].joinSortedKey, srcs[0].joinSortedSeek = findJoinSortedSeekBy(c, s, outerOnly, eqs)
+	srcs[0].joinSortedKey, srcs[0].joinSortedMore, srcs[0].joinSortedSeek = findJoinSortedSeekBy(c, s, outerOnly, eqs)
 }
 
 // annotateIndexJoinSeek installs a rowid or index seek on srcs[origIdx] when
@@ -369,13 +369,20 @@ func plainUsingRefs(srcs []joinSource, eqs []Expr) []Expr {
 // key under the comparison's collation, once the key takes the comparison's
 // affinity, must include every row the equality passes, which
 // seekAffinitySafe guarantees.
-func findJoinSortedSeek(c *compiler, s joinSource, outer map[int]bool, eqs []Expr) (Expr, *sortedSeekHint) {
+//
+// Every further equality on another column joins the key (sortedSeekHint.more):
+// a run of rows equal on one column of few values, a year say, is most of the
+// table for every probe.
+func findJoinSortedSeek(c *compiler, s joinSource, outer map[int]bool, eqs []Expr) (Expr, []Expr, *sortedSeekHint) {
 	return findJoinSortedSeekBy(c, s, func(e Expr) bool { return keyRefsOnlyCursors(c, e, outer) }, eqs)
 }
 
 // findJoinSortedSeekBy is findJoinSortedSeek with keyOK deciding which keys
 // are bound before the seek.
-func findJoinSortedSeekBy(c *compiler, s joinSource, keyOK func(Expr) bool, eqs []Expr) (Expr, *sortedSeekHint) {
+func findJoinSortedSeekBy(c *compiler, s joinSource, keyOK func(Expr) bool, eqs []Expr) (Expr, []Expr, *sortedSeekHint) {
+	var key Expr
+	var more []Expr
+	var h *sortedSeekHint
 	for _, cj := range eqs {
 		be, ok := cj.(BinaryExpr)
 		if !ok || (be.Op != "=" && be.Op != "==") {
@@ -391,10 +398,17 @@ func findJoinSortedSeekBy(c *compiler, s joinSource, keyOK func(Expr) bool, eqs 
 				continue
 			}
 			coll := effectiveCollation(resolveCompareCollation(c.affCtx(), be.L, be.R))
-			return side[1], &sortedSeekHint{col: col, coll: coll, aff: aff, built: s.rightOuter}
+			switch {
+			case h == nil:
+				key, h = side[1], &sortedSeekHint{col: col, coll: coll, aff: aff, built: s.rightOuter}
+			case col != h.col && !slices.ContainsFunc(h.more, func(m sortedSeekCol) bool { return m.col == col }):
+				more = append(more, side[1])
+				h.more = append(h.more, sortedSeekCol{col: col, coll: coll, aff: aff})
+			}
+			break
 		}
 	}
-	return nil, nil
+	return key, more, h
 }
 
 // findJoinRowidSeek looks for an equality pinning s's rowid (or INTEGER PRIMARY
@@ -644,6 +658,14 @@ func (c *compiler) emitJoinSeekHint(srcs []joinSource, order []int, level int, s
 			return err
 		}
 		h := *s.joinSortedSeek
+		h.more = slices.Clone(h.more)
+		for i, k := range s.joinSortedMore {
+			reg, err := c.compileExpr(k)
+			if err != nil {
+				return err
+			}
+			h.more[i].reg = reg
+		}
 		h.keyLen = len(c.insns) - start
 		c.emit(Instruction{Op: OpSortedSeek, P1: cur, P2: keyReg, P3: 1, P4: &h})
 		return nil

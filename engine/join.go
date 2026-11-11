@@ -2500,11 +2500,11 @@ func planJoinPushdownSub(where Expr, jts []joinedTable, scopes []tableScope, sub
 		if checkIdx < 0 {
 			checkIdx = 0
 		}
-		if checkIdx >= firstLeftIdx {
+		if checkIdx >= len(jts) {
+			// A name of a parenthesized join's member: no level of this plan.
 			plan.deferred = append(plan.deferred, cj)
 			continue
 		}
-
 		execLvl := 0
 		for idx := range refs {
 			if p := pos[idx]; p > execLvl {
@@ -2513,6 +2513,14 @@ func planJoinPushdownSub(where Expr, jts []joinedTable, scopes []tableScope, sub
 		}
 		if forceLast {
 			execLvl = len(jts) - 1
+		}
+		// A WHERE term is tested where its tables are bound, as C tests it,
+		// except at a LEFT JOIN's own level, whose rows are decided by ON
+		// alone: a term there waits for the joined row. Past that level the
+		// table's row is its match or its NULL row, as at the end.
+		if checkIdx >= firstLeftIdx && jts[execOrder[execLvl]].left {
+			plan.deferred = append(plan.deferred, cj)
+			continue
 		}
 		plan.buckets[execLvl] = append(plan.buckets[execLvl], cj)
 	}

@@ -783,6 +783,18 @@ type sortedSeekHint struct {
 	// built is set for a RIGHT/FULL JOIN operand: its unmatched-row sweep walks
 	// and marks the built rows, so the segments do not serve it.
 	built bool
+	// more are the key's further columns, each matched as col is against the
+	// register it names: a run equals every one, as an automatic index on
+	// all of them would give it.
+	more []sortedSeekCol
+}
+
+// sortedSeekCol is one further column of a sorted seek's key.
+type sortedSeekCol struct {
+	col  int
+	coll string
+	aff  affinity
+	reg  int
 }
 
 // indexSeekHint is the P4 payload of OpSeekIndexHint: everything the runtime
