@@ -1061,7 +1061,8 @@ func PredicatedStatsForTest() int64 { return progPredicatedRows.Swap(0) }
 
 // put appends b to *buf. Within capacity it writes only the bytes and the
 // length: an append of a variadic slice writes the pointer back too, which is
-// a GC write barrier on every instruction emitted while a collection runs.
+// a GC write barrier on every instruction emitted while a collection runs. The
+// bytes go by copy, which measured faster than a loop over a handful of them.
 func put(buf *[]byte, b []byte) {
 	n := len(*buf)
 	if n+len(b) > cap(*buf) {
@@ -1069,8 +1070,5 @@ func put(buf *[]byte, b []byte) {
 		return
 	}
 	*buf = (*buf)[:n+len(b)]
-	s := (*buf)[n:]
-	for i, x := range b {
-		s[i] = x
-	}
+	copy((*buf)[n:], b)
 }

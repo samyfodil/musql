@@ -30,9 +30,9 @@ func (e *vmEmit) fload(pc, r int, x XReg, intOK bool, isReal Reg) {
 		a.Cvtsi2sdq(x, e.src(pc, r, RAX))
 		return
 	}
-	notReal, done := e.vmLabel("nr"), e.vmLabel("fl")
+	notReal, done := e.vmLabel(), e.vmLabel()
 	a.CmpMemDByte(RSI, e.d(r, L.OffTyp), L.TypFloat)
-	a.Jcc(CondNE, notReal)
+	a.JccL(CondNE, notReal)
 	a.MovsdLoad(x, RSI, e.d(r, L.OffF))
 	if isReal != 0 {
 		a.aluImm32(1, isReal, 1)
@@ -41,7 +41,7 @@ func (e *vmEmit) fload(pc, r int, x XReg, intOK bool, isReal Reg) {
 		e.know.isFloat.add(r)
 	}
 	e.cold = append(e.cold, func() {
-		a.Label(notReal)
+		a.Bind(notReal)
 		if !intOK {
 			e.exitAt(pc)
 			return
@@ -51,13 +51,17 @@ func (e *vmEmit) fload(pc, r int, x XReg, intOK bool, isReal Reg) {
 		a.MovRegMemD(RAX, RSI, e.d(r, L.OffI))
 		a.Xorps(x, x)
 		a.Cvtsi2sdq(x, RAX)
-		a.Jmp(done)
+		a.JmpL(done)
 	})
-	a.Label(done)
+	a.Bind(done)
 }
 
-// vmLabel names a label for one of the REAL arms, unique in the program.
-func (e *vmEmit) vmLabel(s string) string {
+// vmLabel makes a label for one of the arms an instruction branches between.
+func (e *vmEmit) vmLabel() Lbl { return e.a.NewLabel() }
+
+// vmLabelName names a label unique in the program, for code that jumps by
+// name (firEnv, the constant pool).
+func (e *vmEmit) vmLabelName(s string) string {
 	e.nLabel++
 	return "vr" + s + itoa(e.nLabel)
 }
@@ -102,15 +106,15 @@ func (e *vmEmit) realInsn(pc int, in VInsn) (bool, error) {
 		e.fload(pc, in.B, X0, true, flag)
 		e.fload(pc, in.A, X1, true, flag)
 		ints := flag != 0 && in.Op != VFDiv && !in.Dead
-		intArm, join := "", ""
+		var intArm, join Lbl
 		if ints {
 			e.destNoS(pc, in.C) // for both arms, ahead of the test: it sets the flags
 		}
 		if flag != 0 {
 			a.TestRegReg(RCX, RCX)
 			if ints {
-				intArm, join = e.vmLabel("fi"), e.vmLabel("fj")
-				a.Jcc(CondE, intArm)
+				intArm, join = e.vmLabel(), e.vmLabel()
+				a.JccL(CondE, intArm)
 			} else {
 				e.jccStub(CondE, pc)
 			}
@@ -133,8 +137,8 @@ func (e *vmEmit) realInsn(pc int, in VInsn) (bool, error) {
 		e.storeFloat(pc, in, in.C, X0)
 		if ints {
 			L := e.lay
-			a.Jmp(join)
-			a.Label(intArm)
+			a.JmpL(join)
+			a.Bind(intArm)
 			a.MovRegMemD(RAX, RSI, e.d(in.B, L.OffI))
 			a.MovRegMemD(RDX, RSI, e.d(in.A, L.OffI))
 			switch in.Op {
@@ -152,7 +156,7 @@ func (e *vmEmit) realInsn(pc int, in VInsn) (bool, error) {
 			for k := range 3 {
 				a.MovMemDImm(RSI, e.d(in.C, L.OffS+8*k), 0)
 			}
-			a.Label(join)
+			a.Bind(join)
 			e.unmap(in.C)
 			e.know.wroteAny(in.C, true)
 		}
@@ -203,12 +207,12 @@ func (e *vmEmit) fcmpLoad(pc, r int, x XReg) {
 		a.MovsdLoad(x, RSI, e.d(r, L.OffF))
 		return
 	}
-	isInt, done := e.vmLabel("ci"), e.vmLabel("cd")
+	isInt, done := e.vmLabel(), e.vmLabel()
 	a.CmpMemDByte(RSI, e.d(r, L.OffTyp), L.TypFloat)
-	a.Jcc(CondNE, isInt)
+	a.JccL(CondNE, isInt)
 	a.MovsdLoad(x, RSI, e.d(r, L.OffF))
 	e.cold = append(e.cold, func() {
-		a.Label(isInt)
+		a.Bind(isInt)
 		a.CmpMemDByte(RSI, e.d(r, L.OffTyp), L.TypInt)
 		e.jccStub(CondNE, pc)
 		a.MovRegMemD(RAX, RSI, e.d(r, L.OffI))
@@ -220,9 +224,9 @@ func (e *vmEmit) fcmpLoad(pc, r int, x XReg) {
 		e.jccStub(condAbove, pc) // unsigned: outside [-2^53, 2^53]
 		a.Xorps(x, x)
 		a.Cvtsi2sdq(x, RAX)
-		a.Jmp(done)
+		a.JmpL(done)
 	})
-	a.Label(done)
+	a.Bind(done)
 }
 
 // math emits VMath: the arguments as doubles into ProgArgs.Scratch, the
@@ -239,7 +243,7 @@ func (e *vmEmit) math(pc int, in VInsn) error {
 		e.fload(pc, in.A+i, x, in.Imm == 0, 0)
 		a.MovsdStore(RDI, int32(POffScratch+8*i), x)
 	}
-	exit := e.vmLabel("mx")
+	exit := e.vmLabelName("mx")
 	env := &firEnv{
 		args:      []firLoc{firMem(RDI, POffScratch), firMem(RDI, POffScratch+8)}[:in.B],
 		out:       firMem(RDI, POffScratch),
@@ -247,16 +251,16 @@ func (e *vmEmit) math(pc int, in VInsn) error {
 		gprs:      vmFKernelGPRs,
 		xmms:      vmFKernelXMMs,
 		spillBase: RDI, spillDisp: POffScratch + 16, spillN: ProgScratch - 2,
-		prefix: e.vmLabel("k"), pool: e.consts,
+		prefix: e.vmLabelName("k"), pool: e.consts,
 	}
 	if err := emitFirAmd64(a, in.Kernel, env, cpuFeat); err != nil {
 		return err
 	}
-	done := e.vmLabel("md")
-	a.Jmp(done)
+	done := e.vmLabel()
+	a.JmpL(done)
 	a.Label(exit)
 	e.exitAt(pc)
-	a.Label(done)
+	a.Bind(done)
 	a.MovsdLoad(X0, RDI, POffScratch)
 	a.Ucomisd(X0, X0)
 	e.jccStub(ccP, pc) // NaN: NULL
