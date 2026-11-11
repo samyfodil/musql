@@ -414,11 +414,12 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 	if p == nil || c == nil || stmt == nil || len(srcs) < 2 {
 		return nil
 	}
-	volatile := false
+	volatile, sub := false, false
 	for i := range srcs {
 		if srcs[i].derived == nil && (srcs[i].cteItem == nil || srcs[i].cteItem.queue != nil || srcs[i].cteItem.recSelf != nil) {
 			continue
 		}
+		sub = true
 		if len(stmt.From) != len(srcs) {
 			// A parenthesized join's members are items of their own here:
 			// any of them whose body is not deterministic is one this does
@@ -442,10 +443,16 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 			anyTail = true
 		}
 	}
-	if !volatile && !anyTail {
+	if !sub {
 		return nil
 	}
+	// A deterministic body gives C's rows however it is placed, so nothing
+	// here is a decline; C's plan is still taken where it is followed, so an
+	// aggregate reading the arrival order answers (cPlanDecided).
 	decline := func(why string) error {
+		if !volatile && !anyTail {
+			return nil
+		}
 		return fmt.Errorf("%w: a FROM-clause subquery that is not deterministic, %s", errVDBEUnsupported, why)
 	}
 	items := stmt.From
@@ -608,6 +615,13 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 	// index), since it is C's plan either way, and an aggregate reading the
 	// arrival order can rely on it (cPlanDecided).
 	c.planNRow, c.planNRowOK = planNRow, c.outer == nil || c.nQueryLoopKnown
+	// The plan was made under outer join strength reduction; the sources
+	// take it now, as markWherePlanEligibility's do.
+	jts := make([]joinedTable, len(srcs))
+	for i := range srcs {
+		jts[i] = joinedTable{tbl: srcs[i].tbl}
+	}
+	wherePlanReduceOuterJoins(jts, tableScopesOf(srcs), srcs, stmt.Where)
 	noAutoIdx := !p.AutomaticIndex()
 	for level, iTab := range order {
 		k := keys[level]
