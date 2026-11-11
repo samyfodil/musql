@@ -239,6 +239,8 @@ type vmEmit struct {
 	heads  []bool // vmLoopHeads
 	// entries are the entry stubs to emit after the blocks.
 	entries []vmEntryStub
+	// entryRegs is what the entries' register lists are carved from.
+	entryRegs []int
 	// zeroS is the destinations of the instruction being emitted whose string
 	// or blob pointer its store must clear (destNoS).
 	zeroS knowSet
@@ -287,7 +289,7 @@ func (e *vmEmit) entryPoint(pc int) {
 	e.keep = vmEntryKeepInto(e.keep, e.prog, e.steps, e.bound, pc)
 	keep := e.keep
 	st := vmEntryStub{pc: pc}
-	st.ints, st.noS = e.know.pruneForEntry(keep)
+	st.ints, st.noS = e.know.pruneForEntry(keep, &e.entryRegs)
 	for k, m := range e.holds {
 		if k < 0 || !keep.has(k) || !e.know.isInt.has(k) {
 			delete(e.holds, k)

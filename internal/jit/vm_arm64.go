@@ -270,6 +270,7 @@ type vmEmitArm struct {
 	heads     []bool
 	fusedStub map[int]string // a VFused pc's exit stub or entry block, which the table points at
 	entries   []vmEntryStubArm
+	entryRegs []int    // vmEmit.entryRegs
 	zeroS     knowSet  // vmEmit.zeroS
 	cold      []func() // vmEmit.cold, emitted in the next island
 	consts    *firPool // the next island's doubles (vm_real_arm64.go)
@@ -306,7 +307,7 @@ func (e *vmEmitArm) entryPoint(pc int) {
 	e.keep = vmEntryKeepInto(e.keep, e.prog, e.steps, e.bound, pc)
 	keep := e.keep
 	st := vmEntryStubArm{pc: pc}
-	st.ints, st.noS = e.know.pruneForEntry(keep)
+	st.ints, st.noS = e.know.pruneForEntry(keep, &e.entryRegs)
 	for k, m := range e.holds {
 		if k < 0 || !keep.has(k) || !e.know.isInt.has(k) {
 			delete(e.holds, k)

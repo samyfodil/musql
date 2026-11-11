@@ -661,24 +661,36 @@ func vmEntryKeepInto(keep knowSet, prog []VInsn, steps []progStep, bound []bool,
 // pruneForEntry cuts k down to what an entry stub at pc establishes, and
 // returns the registers it must check: those known to be INTEGERs, and those
 // known to hold no string.
-func (k *vmKnow) pruneForEntry(keep knowSet) (ints, noS []int) {
+//
+// The two lists are carved from arena, which grows as entries are made; a
+// list already handed out keeps the backing it was carved from.
+func (k *vmKnow) pruneForEntry(keep knowSet, arena *[]int) (ints, noS []int) {
 	clear(k.canon)
 	clear(k.isFloat) // a REAL op guards its operands again
 	clear(k.konst)
+	start := len(*arena)
 	k.isInt.each(func(r int) {
 		if keep.has(r) {
-			ints = append(ints, r)
+			*arena = append(*arena, r)
 		} else {
 			k.isInt.del(r)
 		}
 	})
+	mid := len(*arena)
 	k.noS.each(func(r int) {
 		if keep.has(r) {
-			noS = append(noS, r)
+			*arena = append(*arena, r)
 		} else {
 			k.noS.del(r)
 		}
 	})
+	a := *arena
+	if mid > start {
+		ints = a[start:mid:mid]
+	}
+	if len(a) > mid {
+		noS = a[mid:len(a):len(a)]
+	}
 	return ints, noS
 }
 
