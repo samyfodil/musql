@@ -1181,7 +1181,7 @@ func segJoinSortedKey(in []Instruction, pc int, levelOf map[int]int) (int, bool)
 				r++
 			}
 			h, _ := ins.P4.(*sortedSeekHint)
-			return n, n > 0 && h != nil && h.keyLen == n && ins.P3 == 1 && r < len(in) &&
+			return n, n > 0 && h != nil && len(h.more) == 0 && h.keyLen == n && ins.P3 == 1 && r < len(in) &&
 				in[r].Op == OpRewind && in[r].P1 == ins.P1
 		case OpColumn:
 			if _, ok := levelOf[ins.P1]; !ok {

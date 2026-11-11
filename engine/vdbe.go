@@ -1391,6 +1391,9 @@ func cursorColumnMasks(insns []Instruction, ncursors int) []columnMask {
 		case OpSortedSeek:
 			if h, ok := in.P4.(*sortedSeekHint); ok && in.P1 >= 0 && in.P1 < ncursors {
 				masks[in.P1] |= 1 << uint(min(h.col, 63))
+				for _, mc := range h.more {
+					masks[in.P1] |= 1 << uint(min(mc.col, 63))
+				}
 			}
 		case OpSeekIndexHint:
 			// A seek's rows are sorted into its index's order, by its key's
@@ -2211,7 +2214,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 					cur.sorted, cache = &cp, false
 				}
 			}
-			cur.sortedSeek(h, m.regs[op.P2], m.encoding())
+			cur.sortedSeek(h, m.regs[op.P2], m.regs, m.encoding())
 			if cache && cur.sorted != nil && cur.sorted.ok {
 				root := m.stmtRoot()
 				if root.rowSorts == nil {

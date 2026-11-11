@@ -272,6 +272,8 @@ type joinSource struct {
 	// applies: joinSortedKey is the key over the outer tables. Set by
 	// annotateJoinSeeks.
 	joinSortedKey  Expr
+	// joinSortedMore are the keys of joinSortedSeek.more, in its order.
+	joinSortedMore []Expr
 	joinSortedSeek *sortedSeekHint
 
 	// memberScopes, non-nil only for a materialized parenthesized join group
@@ -3396,8 +3398,8 @@ func (c *compiler) emitMultiOrGroups(plan joinPlan, level, cur int, s joinSource
 //
 // WHERE pushdown: after the cursor is positioned (and an INNER ON passes), the
 // conjuncts planJoinPushdown assigned to this depth are tested, jumping to Next
-// when false or NULL. Buckets are empty from the first LEFT join on, so a
-// WHERE term never affects match-vs-NULL-extend.
+// when false or NULL. A LEFT level's bucket is empty, so a WHERE term never
+// affects match-vs-NULL-extend.
 //
 // An ON expression compiles with c.scopes narrowed to the sources already
 // bound at this depth: an ON may reference preceding tables only, and an
