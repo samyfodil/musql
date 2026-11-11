@@ -36,6 +36,14 @@ func TestDerivedJoinPlanShapes(t *testing.T) {
 		"SELECT group_concat(ep) FROM li LEFT JOIN (SELECT pk, avg(q) AS t FROM li GROUP BY pk) a ON a.pk = li.pk WHERE a.t > 1",
 		"SELECT group_concat(ep) FROM pt LEFT JOIN (SELECT pk, avg(q) AS t FROM li GROUP BY pk) a ON a.pk = pt.pk JOIN li ON li.pk = a.pk WHERE a.t IS NOT NULL",
 		"SELECT group_concat(ep) FROM li LEFT JOIN (SELECT pk FROM pt WHERE br = 'a') a ON a.pk = li.pk",
+		// C reads a subquery through an automatic index keyed by every one of
+		// its columns, so equal keys arrive in the order of the rest.
+		"SELECT group_concat(q) FROM pt, (SELECT pk, q FROM li LIMIT 100) a WHERE a.pk = pt.pk",
+		"SELECT group_concat(q) FROM pt, (SELECT pk, q FROM li ORDER BY q DESC LIMIT 100) a WHERE a.pk = pt.pk",
+		"SELECT group_concat(q) FROM pt, (SELECT pk, max(q) q FROM li GROUP BY pk, ep ORDER BY q DESC) a WHERE a.pk = pt.pk",
+		"SELECT group_concat(q) FROM (SELECT pk, q FROM li UNION ALL SELECT pk, ep FROM li) a, pt WHERE a.pk = pt.pk",
+		"SELECT br, group_concat(q) FROM (SELECT pk, q FROM li UNION ALL SELECT pk, ep FROM li) a, pt WHERE a.pk = pt.pk GROUP BY br",
+		"SELECT group_concat(q || '-' || ep) FROM pt, (SELECT pk, q, ep FROM li LIMIT 100) a WHERE a.pk = pt.pk AND a.ep > 0.1",
 	} {
 		differ(t, fmt.Sprintf("q-%d", i), append(append([]string(nil), pre...), q))
 	}
