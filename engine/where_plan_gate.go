@@ -813,18 +813,25 @@ func wherePlanSingleTableIndexOrder(p *ReadOnlyPager, c *compiler, srcs []joinSo
 // costs if that shows up.
 func wherePlanSeedInvariant(in wherePlanInput, solve func(wherePlanInput) (*autoIndexKey, logEst, bool)) (*autoIndexKey, logEst, bool) {
 	var first *autoIndexKey
-	var firstWin wherePlanWinner
+	var w, firstWin wherePlanWinner
 	winner := in.winner
 	in.loops = &whereLoopCache{}
+	in.winner = &w
 	for seed := logEst(48); seed >= -600; seed-- {
-		var w wherePlanWinner
-		in.nQueryLoop, in.winner = seed, &w
+		w = wherePlanWinner{flagsOnly: seed != 48}
+		in.nQueryLoop = seed
 		k, _, ok := solve(in)
 		if !ok || k != nil && k.multiOr != nil {
 			return nil, 0, false
 		}
 		if seed == 48 {
 			first, firstWin = k, w
+			if c := in.loops; c.populated && len(c.loops) == 1 && !c.loops[0].autoIdx && !c.loops[0].multiOr {
+				// One way to scan and no automatic index, the one loop a seed
+				// can add or take away (solve's "pFrom->nRow < 3"): every seed
+				// solves the same single path.
+				break
+			}
 			continue
 		}
 		// The EXPLAIN line is not asked to agree: it is printed for a top-level
@@ -914,8 +921,10 @@ func wherePlanSingleTableSolve(in wherePlanInput, stmt *SelectStmt, idxs []where
 		if in.winner != nil && len(res.loops) == 1 {
 			w := &fb.loops[res.loops[0]]
 			in.winner.auto, in.winner.oneRow = w.autoIdx, w.oneRow
-			in.winner.explain = fb.explainLoop(w)
-			in.winner.access = fb.accessOf(w)
+			if !in.winner.flagsOnly {
+				in.winner.explain = fb.explainLoop(w)
+				in.winner.access = fb.accessOf(w)
+			}
 		}
 		if len(res.loops) == 1 && fb.loops[res.loops[0]].autoIdx {
 			// Not the rowid scan after all: see wherePlanSingleIndexKey's
@@ -924,7 +933,7 @@ func wherePlanSingleTableSolve(in wherePlanInput, stmt *SelectStmt, idxs []where
 			if k == nil {
 				return nil, 0, false
 			}
-			if in.winner != nil {
+			if in.winner != nil && !in.winner.flagsOnly {
 				in.winner.access.eq = append([]int(nil), k.cols[:k.autoEq]...)
 			}
 			if reverseOrder && in.sort.nOrderBy() == 0 {

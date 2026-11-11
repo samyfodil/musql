@@ -207,6 +207,11 @@ type ReadOnlyPager struct {
 	// viewDefs memoizes, the same way, a view's parsed definition for the
 	// callers that only read it (sharedViewDefIn).
 	viewDefs map[string]viewDefMemo
+	// autoSpecs and indexStmts memoize the planner's reading of a table's
+	// automatic indexes and of a CREATE INDEX, by their text
+	// (wherePlanIndexChain).
+	autoSpecs  map[string][]autoIndexSpec
+	indexStmts map[string]*parsedCreateIndex
 
 	// schemaRowsEdited is SnapshotPager's (writer.go) overlay-APPLIED sibling
 	// of schemaRows: DB.writableSchemaEditedRows(), non-nil only while a
