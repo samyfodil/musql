@@ -263,6 +263,7 @@ func segLowerBody(body []Instruction, base int, cursor int, aggAt int, kinds *se
 // a cell that is not pure ASCII. Only valid over a segment whose column is
 // clean TEXT, so it is a second program beside the first, not a replacement.
 func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text, textFold bool, kinds *segKinds) (*segLowered, bool) {
+	var rb segRegsBuf
 	// AN OpNull ON A PATH THAT RUNS REFUSES THE WHOLE BODY, and modelling NULL
 	// any more cleverly than that is how this went wrong before.
 	//
@@ -334,7 +335,7 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 	}
 	for i, in := range body {
 		if svc[i] {
-			r, _, _, _ := segInsnRegs(in)
+			r, _, _, _ := segInsnRegsInto(in, &rb)
 			for _, x := range r {
 				delete(nullOnly, x)
 			}

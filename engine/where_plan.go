@@ -203,7 +203,10 @@ type whereLoopCache struct {
 // loop's EXPLAIN QUERY PLAN line.
 type wherePlanWinner struct {
 	auto, oneRow bool
-	explain      wherePlanExplain
+	// flagsOnly asks for auto and oneRow alone: wherePlanSeedInvariant's later
+	// seeds, which compare nothing else.
+	flagsOnly bool
+	explain   wherePlanExplain
 
 	// access is the loop's access path (seek_raise.go).
 	access wherePlanAccess

@@ -373,6 +373,40 @@ func wherePlanPartialIndexList(p *ReadOnlyPager, tbl *resolvedTable, tableName, 
 	return wherePlanIndexChain(p, tbl, tableName, indexedBy, notIndexed, stmt, true)
 }
 
+// autoIndexSpecsOf is the automatic indexes a table's CREATE TABLE text makes,
+// parsed once per pager. The planner only reads them.
+func (p *ReadOnlyPager) autoIndexSpecsOf(createSQL string) ([]autoIndexSpec, error) {
+	if specs, ok := p.autoSpecs[createSQL]; ok {
+		return specs, nil
+	}
+	_, _, specs, err := parseCreateTableColumnsAndAutoIndexes(createSQL, false)
+	if err != nil {
+		return nil, err
+	}
+	if p.autoSpecs == nil {
+		p.autoSpecs = make(map[string][]autoIndexSpec)
+	}
+	p.autoSpecs[createSQL] = specs
+	return specs, nil
+}
+
+// indexStmtOf is a CREATE INDEX parsed once per pager. The planner only reads
+// it.
+func (p *ReadOnlyPager) indexStmtOf(createSQL string) (*parsedCreateIndex, error) {
+	if ix, ok := p.indexStmts[createSQL]; ok {
+		return ix, nil
+	}
+	ix, err := parseCreateIndexStmt(createSQL)
+	if err != nil {
+		return nil, err
+	}
+	if p.indexStmts == nil {
+		p.indexStmts = make(map[string]*parsedCreateIndex)
+	}
+	p.indexStmts[createSQL] = ix
+	return ix, nil
+}
+
 func wherePlanIndexChain(p *ReadOnlyPager, tbl *resolvedTable, tableName, indexedBy string, notIndexed bool, stmt *SelectStmt, partialOK bool) ([]whereIndexInfo, logEst, bool) {
 	if p == nil || tbl == nil || tableName == "" {
 		return nil, 0, false
@@ -457,7 +491,7 @@ func wherePlanIndexChain(p *ReadOnlyPager, tbl *resolvedTable, tableName, indexe
 				if tblSQL == "" {
 					return nil, 0, false
 				}
-				_, _, specs, perr := parseCreateTableColumnsAndAutoIndexes(tblSQL, false)
+				specs, perr := p.autoIndexSpecsOf(tblSQL)
 				if perr != nil {
 					return nil, 0, false
 				}
@@ -487,7 +521,7 @@ func wherePlanIndexChain(p *ReadOnlyPager, tbl *resolvedTable, tableName, indexe
 			}
 			cols, colls, desc, unique = spec.cols, spec.colls, spec.desc, true
 		} else {
-			ixStmt, perr := parseCreateIndexStmt(r.SQL)
+			ixStmt, perr := p.indexStmtOf(r.SQL)
 			if perr != nil || len(ixStmt.cols) == 0 {
 				return nil, 0, false
 			}
@@ -968,9 +1002,12 @@ type whereIdxState struct {
 // The index-expression arm (XN_EXPR) is not reproduced: wherePlanIndexList
 // declines an expression index outright.
 type whereScan struct {
-	b        *wherePlanIdxBuild
-	aiCur    []int // aiCur/aiColumn are the equivalence set; [0] is the original
-	aiColumn []int
+	b *wherePlanIdxBuild
+	// aiCur/aiColumn are the equivalence set, nEquiv of them; [0] is the
+	// original. Eleven at most, as the C's arrays.
+	aiCur    [11]int
+	aiColumn [11]int
+	nEquiv   int
 	iEquiv   int // 1-based, as the C's is
 	k        int // resume position in b.terms
 	opMask   uint16
@@ -981,11 +1018,10 @@ type whereScan struct {
 
 // whereScanInitCol is whereScanInit with pIdx == 0: no affinity or collation
 // filter, and iColumn is a column of the TABLE.
-func (b *wherePlanIdxBuild) whereScanInitCol(iTab, iColumn int, opMask uint16) *whereScan {
-	return &whereScan{
-		b: b, opMask: opMask, iEquiv: 1,
-		aiCur: []int{iTab}, aiColumn: []int{iColumn},
-	}
+func (b *wherePlanIdxBuild) whereScanInitCol(iTab, iColumn int, opMask uint16) whereScan {
+	s := whereScan{b: b, opMask: opMask, iEquiv: 1, nEquiv: 1}
+	s.aiCur[0], s.aiColumn[0] = iTab, iColumn
+	return s
 }
 
 // whereScanInitIdx is whereScanInit with a pIdx: iColumn is index column j,
@@ -993,8 +1029,9 @@ func (b *wherePlanIdxBuild) whereScanInitCol(iTab, iColumn int, opMask uint16) *
 // "if( iColumn==pIdx->pTable->iPKey ) iColumn = XN_ROWID", which ALSO leaves
 // idxaff/zCollName unset, so an index on the INTEGER PRIMARY KEY column matches
 // a rowid term with no affinity or collation check at all.
-func (b *wherePlanIdxBuild) whereScanInitIdx(iTab, j int, opMask uint16, idx *whereIndexInfo) *whereScan {
-	s := &whereScan{b: b, opMask: opMask, iEquiv: 1, aiCur: []int{iTab}}
+func (b *wherePlanIdxBuild) whereScanInitIdx(iTab, j int, opMask uint16, idx *whereIndexInfo) whereScan {
+	s := whereScan{b: b, opMask: opMask, iEquiv: 1, nEquiv: 1}
+	s.aiCur[0] = iTab
 	iColumn := idx.aiColumn[j]
 	if iColumn == b.items[iTab].ipkIndex {
 		iColumn = xnRowid
@@ -1003,7 +1040,7 @@ func (b *wherePlanIdxBuild) whereScanInitIdx(iTab, j int, opMask uint16, idx *wh
 		s.collName = idx.azColl[j]
 		s.hasColl = true
 	}
-	s.aiColumn = []int{iColumn}
+	s.aiColumn[0] = iColumn
 	return s
 }
 
@@ -1024,17 +1061,17 @@ func (s *whereScan) next() int {
 			if s.iEquiv > 1 && t.outerON {
 				continue
 			}
-			if t.op&woEquiv != 0 && len(s.aiCur) < 11 && t.rCursor >= 0 {
+			if t.op&woEquiv != 0 && s.nEquiv < len(s.aiCur) && t.rCursor >= 0 {
 				seen := false
-				for j := range s.aiCur {
+				for j := 0; j < s.nEquiv; j++ {
 					if s.aiCur[j] == t.rCursor && s.aiColumn[j] == t.rColumn {
 						seen = true
 						break
 					}
 				}
 				if !seen {
-					s.aiCur = append(s.aiCur, t.rCursor)
-					s.aiColumn = append(s.aiColumn, t.rColumn)
+					s.aiCur[s.nEquiv], s.aiColumn[s.nEquiv] = t.rCursor, t.rColumn
+					s.nEquiv++
 				}
 			}
 			if t.op&s.opMask == 0 {
@@ -1058,7 +1095,7 @@ func (s *whereScan) next() int {
 			s.k = k + 1
 			return k
 		}
-		if s.iEquiv >= len(s.aiCur) {
+		if s.iEquiv >= s.nEquiv {
 			return -1
 		}
 		s.k = 0
@@ -2519,8 +2556,14 @@ func (b *wherePlanIdxBuild) solve(nRowEst logEst) (*wherePath, bool) {
 	if b.sort.nOrderBy() > 0 && nRowEst != 0 {
 		nOrderBy = b.sort.nOrderBy()
 	}
-	aSortCost := make([]logEst, nOrderBy)
-	aSortSet := make([]bool, nOrderBy)
+	var sortCostBuf [8]logEst
+	var sortSetBuf [8]bool
+	aSortCost, aSortSet := sortCostBuf[:0], sortSetBuf[:0]
+	if nOrderBy <= len(sortCostBuf) {
+		aSortCost, aSortSet = sortCostBuf[:nOrderBy], sortSetBuf[:nOrderBy]
+	} else {
+		aSortCost, aSortSet = make([]logEst, nOrderBy), make([]bool, nOrderBy)
+	}
 
 	// TUNING (where.c): the seed path's row count is MIN(nQueryLoop, 48)
 	// (where.c:5921), read UNCONDITIONALLY on entry -- independent of this
@@ -2538,13 +2581,17 @@ func (b *wherePlanIdxBuild) solve(nRowEst logEst) (*wherePath, bool) {
 	if nOrderBy > 0 {
 		seed.isOrdered = -1 // nLoop > 0 always
 	}
-	aFrom := []wherePath{seed}
+	// The generations alternate between two buffers of mxChoice paths, and
+	// each path's loops are carved from slab.
+	aFrom := append(make([]wherePath, 0, mxChoice), seed)
+	spare := make([]wherePath, 0, mxChoice)
+	var slab []int
 
 	var mxCost, mxUnsort logEst
 	mxI := 0
 
 	for iLoop := 0; iLoop < nLoop; iLoop++ {
-		var aTo []wherePath
+		aTo := spare[:0]
 		for i := range aFrom {
 			pFrom := &aFrom[i]
 			for li := range b.loops {
@@ -2632,7 +2679,11 @@ func (b *wherePlanIdxBuild) solve(nRowEst logEst) (*wherePath, bool) {
 					}
 				}
 
-				next := make([]int, iLoop+1)
+				if cap(slab)-len(slab) < iLoop+1 {
+					slab = make([]int, 0, max(64, 4*(iLoop+1)))
+				}
+				next := slab[len(slab) : len(slab)+iLoop+1 : len(slab)+iLoop+1]
+				slab = slab[:len(slab)+iLoop+1]
 				copy(next, pFrom.loops)
 				next[iLoop] = li
 				aTo[jj] = wherePath{
@@ -2658,7 +2709,7 @@ func (b *wherePlanIdxBuild) solve(nRowEst logEst) (*wherePath, bool) {
 				}
 			}
 		}
-		aFrom = aTo
+		spare, aFrom = aFrom[:0], aTo
 		if len(aFrom) == 0 {
 			return nil, false // "no query solution"
 		}
@@ -2717,9 +2768,13 @@ func (b *wherePlanIdxBuild) plan() (*wherePlanResult, bool) {
 		return res, true
 	}
 	if b.cache != nil && b.cache.populated {
-		// Copies: the solver disables loops (whereInterstageHeuristic) and
-		// raises star-query costs (computeMxChoice) in its own.
-		b.loops, b.planLimitHit, b.partialUnknown = slices.Clone(b.cache.loops), b.cache.limitHit, b.cache.partialUnknown
+		// Copies where the solver changes them: it disables loops
+		// (whereInterstageHeuristic) when there is an ORDER BY, and raises
+		// star-query costs (computeMxChoice) at four tables or more.
+		b.loops, b.planLimitHit, b.partialUnknown = b.cache.loops, b.cache.limitHit, b.cache.partialUnknown
+		if b.sort.nOrderBy() > 0 || len(b.items) >= 4 {
+			b.loops = slices.Clone(b.loops)
+		}
 	} else {
 		b.addAll()
 		if b.cache != nil {
@@ -2832,7 +2887,8 @@ func (b *wherePlanIdxBuild) shortCut() (*wherePlanResult, bool) {
 	var l *whereIdxLoop
 	for i := range it.idxs {
 		if ix := &it.idxs[i]; ix.ipk {
-			if ti := first(b.whereScanInitIdx(0, 0, woEq|woIs, ix)); ti >= 0 {
+			scan := b.whereScanInitIdx(0, 0, woEq|woIs, ix)
+			if ti := first(&scan); ti >= 0 {
 				l = &whereIdxLoop{idx: ix, rRun: 33, nEq: 1, lTerm: []int{ti}}
 			}
 			break
@@ -2850,7 +2906,8 @@ func (b *wherePlanIdxBuild) shortCut() (*wherePlanResult, bool) {
 			}
 			var lTerm []int
 			for j := 0; j < ix.nKeyCol; j++ {
-				ti := first(b.whereScanInitIdx(0, j, opMask, ix))
+				scan := b.whereScanInitIdx(0, j, opMask, ix)
+				ti := first(&scan)
 				if ti < 0 {
 					break
 				}
@@ -2952,8 +3009,10 @@ func wherePlanSingleIndexKey(in wherePlanInput, reverseOrder bool) (key *autoInd
 	}
 	if in.winner != nil {
 		in.winner.auto, in.winner.oneRow = w.autoIdx, w.oneRow
-		in.winner.explain = b.explainLoop(w)
-		in.winner.access = b.accessOf(w)
+		if !in.winner.flagsOnly {
+			in.winner.explain = b.explainLoop(w)
+			in.winner.access = b.accessOf(w)
+		}
 	}
 	if w.autoIdx {
 		// A trusted nested compile's seed is MIN(nQueryLoop,48) (where.c:5921),
@@ -2969,7 +3028,7 @@ func wherePlanSingleIndexKey(in wherePlanInput, reverseOrder bool) (key *autoInd
 		if k == nil {
 			return nil, 0, false
 		}
-		if in.winner != nil {
+		if in.winner != nil && !in.winner.flagsOnly {
 			in.winner.access.eq = append([]int(nil), k.cols[:k.autoEq]...)
 		}
 		if reverseOrder && in.sort.nOrderBy() == 0 {
