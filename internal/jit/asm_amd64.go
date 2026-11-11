@@ -4,6 +4,7 @@ package jit
 
 import (
 	"slices"
+	"strconv"
 	"sync"
 )
 
@@ -35,12 +36,20 @@ const (
 type Asm struct {
 	buf    []byte
 	labels map[string]int
+	// lbls is where each NewLabel label is bound, -1 until it is; Lbl n is
+	// lbls[n-1].
+	lbls   []int
 	fixups []fixup
 }
+
+// Lbl is a label NewLabel made: a jump to it is resolved by number, with no
+// name to build or look up.
+type Lbl int32
 
 type fixup struct {
 	at    int // offset of the rel32 field
 	label string
+	lbl   Lbl // when not 0, the label, and label is unused
 }
 
 func NewAsm() *Asm { return &Asm{labels: map[string]int{}} }
@@ -61,6 +70,7 @@ func asmFor(n int) *Asm {
 	}
 	a.buf = slices.Grow(a.buf[:0], 256*n+512)
 	clear(a.labels)
+	a.lbls = a.lbls[:0]
 	a.fixups = a.fixups[:0]
 	return a
 }
@@ -76,8 +86,17 @@ func (a *Asm) release() {
 // Code returns the encoded bytes with every jump resolved.
 func (a *Asm) Code() ([]byte, error) {
 	for _, f := range a.fixups {
-		target, ok := a.labels[f.label]
+		target, ok := 0, false
+		if f.lbl != 0 {
+			target = a.lbls[f.lbl-1]
+			ok = target >= 0
+		} else {
+			target, ok = a.labels[f.label]
+		}
 		if !ok {
+			if f.lbl != 0 {
+				return nil, errUnboundLabel("#" + strconv.Itoa(int(f.lbl)))
+			}
 			return nil, errUnboundLabel(f.label)
 		}
 		rel := int32(target - (f.at + 4))
@@ -95,6 +114,15 @@ func (e errUnboundLabel) Error() string { return "jit: unbound label " + string(
 
 // Label marks the current position.
 func (a *Asm) Label(name string) { a.labels[name] = len(a.buf) }
+
+// NewLabel makes a label, bound later with Bind.
+func (a *Asm) NewLabel() Lbl {
+	a.lbls = append(a.lbls, -1)
+	return Lbl(len(a.lbls))
+}
+
+// Bind marks the current position as l.
+func (a *Asm) Bind(l Lbl) { a.lbls[l-1] = len(a.buf) }
 
 func (a *Asm) emit(b ...byte) { put(&a.buf, b) }
 
@@ -173,6 +201,20 @@ func (a *Asm) TestRegReg(x, y Reg) {
 func (a *Asm) Jcc(cond Cond, label string) {
 	a.emit(0x0F, 0x80|byte(cond))
 	a.fixups = append(a.fixups, fixup{at: len(a.buf), label: label})
+	a.emit(0, 0, 0, 0)
+}
+
+// JccL is Jcc to a NewLabel label.
+func (a *Asm) JccL(cond Cond, l Lbl) {
+	a.emit(0x0F, 0x80|byte(cond))
+	a.fixups = append(a.fixups, fixup{at: len(a.buf), lbl: l})
+	a.emit(0, 0, 0, 0)
+}
+
+// JmpL is Jmp to a NewLabel label.
+func (a *Asm) JmpL(l Lbl) {
+	a.emit(0xE9)
+	a.fixups = append(a.fixups, fixup{at: len(a.buf), lbl: l})
 	a.emit(0, 0, 0, 0)
 }
 

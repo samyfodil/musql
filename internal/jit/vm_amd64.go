@@ -473,6 +473,23 @@ func (e *vmEmit) clobber(r int) {
 
 func (e *vmEmit) nextUse(key, pc int) int { return vmEmitNextUseIn(e.prog, e.steps, e.bound, key, pc) }
 
+// named is labels by name for one instruction's code: a name is a label of its
+// own the first time it is asked for, and the same label after.
+func (e *vmEmit) named() func(string) Lbl {
+	var names []string
+	var lbls []Lbl
+	return func(s string) Lbl {
+		for i, n := range names {
+			if n == s {
+				return lbls[i]
+			}
+		}
+		l := e.a.NewLabel()
+		names, lbls = append(names, s), append(lbls, l)
+		return l
+	}
+}
+
 // alloc returns a pool register for a value wanted again at pc want, taking
 // one from whatever the pool holds that is wanted furthest away (or never)
 // when none is free; ok is false when every candidate is wanted sooner, or in
@@ -950,7 +967,7 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		}
 		e.destNoS(pc, in.C)
 		cb := int32(in.A * VCursorSize)
-		dense, have, row := e.vmLabel("rd"), e.vmLabel("rh"), e.vmLabel("rs")
+		dense, have, row := e.vmLabel(), e.vmLabel(), e.vmLabel()
 		a.MovRegMemD(RAX, RDI, POffCur)
 		a.CmpMemDImm8(RAX, cb+VCursorOffOk, 0)
 		e.jccStub(CondE, pc)
@@ -960,16 +977,16 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		// A selection's position names its segment row (VCursor.Sel).
 		a.MovRegMemD(RDX, RAX, cb+VCursorOffSel)
 		a.TestRegReg(RDX, RDX)
-		a.Jcc(CondE, row)
+		a.JccL(CondE, row)
 		a.MovRegMemIdx(R9, RDX, R9)
-		a.Label(row)
+		a.Bind(row)
 		a.MovRegMemD(RDX, RAX, cb+VCursorOffRids)
 		a.TestRegReg(RDX, RDX)
-		a.Jcc(CondE, dense)
+		a.JccL(CondE, dense)
 		a.MovRegMemIdx(R10, RDX, R9)
-		a.Jmp(have)
+		a.JmpL(have)
 		// No rowid list: a dense segment's rowid is its first plus the row.
-		a.Label(dense)
+		a.Bind(dense)
 		a.MovRegMemD(RDX, RAX, cb+VCursorOffSeg)
 		a.TestRegReg(RDX, RDX)
 		e.jccStub(CondE, pc)
@@ -977,7 +994,7 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		e.jccStub(CondE, pc)
 		a.MovRegMemD(R10, RDX, VSegOffFirst)
 		a.AddRegReg(R10, R9)
-		a.Label(have)
+		a.Bind(have)
 		m := e.dest(pc, in.C, RAX)
 		if m != R10 {
 			a.MovRegReg(m, R10)
@@ -1032,13 +1049,13 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		if in.Op == VOpen {
 			// A seek cursor (Reopen 4 or 5): the rows its last seek's run
 			// served are counted, and the open marked native (5).
-			gen := "op" + strconv.Itoa(pc) + ".gen"
+			gen := e.vmLabel()
 			a.CmpMemDImm8(RAX, cb+VCursorOffReop, VReopenSeek)
-			a.Jcc(CondL, gen)
+			a.JccL(CondL, gen)
 			a.LeaRegMemD(R10, RAX, cb)
-			e.seekIdxServed(R10, RDX, "op"+strconv.Itoa(pc)+".sv", "op"+strconv.Itoa(pc)+".sk")
+			e.seekIdxServed(R10, RDX, e.vmLabel(), e.vmLabel())
 			a.MovMemDImm(R10, VCursorOffReop, VReopenSeekOpened)
-			a.Label(gen)
+			a.Bind(gen)
 			a.MovRegMemD(RDX, RAX, cb+VCursorOffN)
 			a.MovMemDReg(RAX, cb+VCursorOffPos, RDX)
 			a.MovMemDImm(RAX, cb+VCursorOffLast, -1)
@@ -1160,11 +1177,11 @@ func (e *vmEmit) inSet(pc int, in VInsn) {
 	if !in.Dead {
 		e.destNoS(pc, in.C)
 	}
-	loop, done, none := "in"+strconv.Itoa(pc), "in"+strconv.Itoa(pc)+".d", "in"+strconv.Itoa(pc)+".n"
+	loop, done, none := e.vmLabel(), e.vmLabel(), e.vmLabel()
 	a.LeaRegMemD(RAX, RSI, e.d(in.B, L.OffI))
-	a.Label(loop)
+	a.Bind(loop)
 	a.CmpRegImm32(R9, 1)
-	a.Jcc(CondLE, done)
+	a.JccL(CondLE, done)
 	a.MovRegReg(R10, R9)
 	a.SarRegImm8(R10, 1)
 	a.SubRegReg(R9, R10)
@@ -1172,14 +1189,14 @@ func (e *vmEmit) inSet(pc int, in VInsn) {
 	a.AddRegReg(RCX, RAX)
 	a.AluRegMemD(AluCmp, x, RCX, 0)
 	a.Cmovcc(CondGE, RAX, RCX) // that key is not above x
-	a.Jmp(loop)
-	a.Label(done)
+	a.JmpL(loop)
+	a.Bind(done)
 	a.XorRegReg(R10, R10)
 	a.TestRegReg(R9, R9)
-	a.Jcc(CondE, none)
+	a.JccL(CondE, none)
 	a.AluRegMemD(AluCmp, x, RAX, 0)
 	a.Setcc(CondE, R10)
-	a.Label(none)
+	a.Bind(none)
 	if in.Dead {
 		e.clobber(in.C)
 		return
@@ -1236,8 +1253,8 @@ func (e *vmEmit) resultRow(pc int, in VInsn) {
 	e.jccWB(pc)
 	a.MovRegMemD(RDX, RDI, POffRowsBuf)
 	a.TestRegReg(RDX, RDX)
-	gather := "rg" + strconv.Itoa(pc)
-	a.Jcc(CondNE, gather)
+	gather := e.vmLabel()
+	a.JccL(CondNE, gather)
 
 	// One row, handed over: copy it to RowBuf's head and return.
 	a.MovRegMemD(RAX, RDI, POffRowCap)
@@ -1254,7 +1271,7 @@ func (e *vmEmit) resultRow(pc int, in VInsn) {
 	// Rows gathered: copy this one past the Values used, write its header
 	// past the headers written, and go on. An empty row is the VDBE's: its
 	// header would point past the buffer.
-	a.Label(gather)
+	a.Bind(gather)
 	if in.B == 0 {
 		e.jmpStub(pc)
 		return

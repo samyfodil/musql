@@ -12,7 +12,7 @@ func (e *vmEmit) like(pc int, in VInsn) {
 	}
 	a, L, p := e.a, e.lay, in.Pat
 	e.destNoS(pc, in.C)
-	match, nomatch, done := e.vmLabel("lm"), e.vmLabel("ln"), e.vmLabel("ld")
+	match, nomatch, done := e.vmLabel(), e.vmLabel(), e.vmLabel()
 	a.CmpMemDByte(RSI, e.d(in.A, L.OffTyp), L.TypText)
 	e.jccStub(CondNE, pc)
 	a.CmpMemDByte(RSI, e.d(in.B, L.OffTyp), L.TypText)
@@ -29,22 +29,22 @@ func (e *vmEmit) like(pc int, in VInsn) {
 	a.MovRegMemD(RAX, RSI, e.d(in.A, L.OffS+8))
 
 	// A NUL ends the text as LIKE reads it: the VDBE's.
-	nul, clean := e.vmLabel("lz"), e.vmLabel("lc")
+	nul, clean := e.vmLabel(), e.vmLabel()
 	a.XorRegReg(R9, R9)
-	a.Label(nul)
+	a.Bind(nul)
 	a.CmpRegReg(R9, RAX)
-	a.Jcc(CondGE, clean)
+	a.JccL(CondGE, clean)
 	a.MovRegReg(R10, RDX)
 	a.AddRegReg(R10, R9)
 	a.MovzxByte(RCX, R10)
 	a.TestRegReg(RCX, RCX)
 	e.jccStub(CondE, pc)
 	a.IncReg(R9)
-	a.Jmp(nul)
-	a.Label(clean)
+	a.JmpL(nul)
+	a.Bind(clean)
 	a.XorRegReg(R9, R9)
 
-	at := func(piece []byte, fail string) { // the piece at R10, or on to fail
+	at := func(piece []byte, fail Lbl) { // the piece at R10, or on to fail
 		for k, c := range piece {
 			a.MovzxByteDisp(RCX, R10, int8(k))
 			if lc := c | 0x20; lc >= 'a' && lc <= 'z' {
@@ -53,22 +53,22 @@ func (e *vmEmit) like(pc int, in VInsn) {
 			} else {
 				a.CmpRegImm32(RCX, int32(c))
 			}
-			a.Jcc(CondNE, fail)
+			a.JccL(CondNE, fail)
 		}
 	}
 	pieces := p.Pieces
 	if p.Exact {
 		a.CmpRegImm32(RAX, int32(len(pieces[0])))
-		a.Jcc(CondNE, nomatch)
+		a.JccL(CondNE, nomatch)
 		a.MovRegReg(R10, RDX)
 		at(pieces[0], nomatch)
-		a.Jmp(match)
+		a.JmpL(match)
 	} else {
 		if p.Head && len(pieces) > 0 {
 			first := pieces[0]
 			pieces = pieces[1:]
 			a.CmpRegImm32(RAX, int32(len(first)))
-			a.Jcc(CondL, nomatch)
+			a.JccL(CondL, nomatch)
 			a.MovRegReg(R10, RDX)
 			at(first, nomatch)
 			a.MovRegImm64(R9, int64(len(first)))
@@ -79,40 +79,40 @@ func (e *vmEmit) like(pc int, in VInsn) {
 			a.MovRegReg(R10, RAX)
 			a.SubRegImm32(R10, int32(len(last)))
 			a.CmpRegReg(R10, R9)
-			a.Jcc(CondL, nomatch)
+			a.JccL(CondL, nomatch)
 			a.MovRegReg(RAX, R10)
 			a.AddRegReg(R10, RDX)
 			at(last, nomatch)
 		}
 		// Each piece left at its first place from R9 on, before RAX.
 		for _, piece := range pieces {
-			find, next, found := e.vmLabel("lf"), e.vmLabel("lx"), e.vmLabel("lo")
-			a.Label(find)
+			find, next, found := e.vmLabel(), e.vmLabel(), e.vmLabel()
+			a.Bind(find)
 			a.LeaRegMemD(R10, R9, int32(len(piece)))
 			a.CmpRegReg(R10, RAX)
-			a.Jcc(CondG, nomatch)
+			a.JccL(CondG, nomatch)
 			a.MovRegReg(R10, RDX)
 			a.AddRegReg(R10, R9)
 			at(piece, next)
 			a.AddRegImm32(R9, int32(len(piece)))
-			a.Jmp(found)
-			a.Label(next)
+			a.JmpL(found)
+			a.Bind(next)
 			a.IncReg(R9)
-			a.Jmp(find)
-			a.Label(found)
+			a.JmpL(find)
+			a.Bind(found)
 		}
-		a.Jmp(match)
+		a.JmpL(match)
 	}
 	yes, no := int64(1), int64(0)
 	if p.Not {
 		yes, no = 0, 1
 	}
-	a.Label(match)
+	a.Bind(match)
 	a.MovRegImm64(R10, yes)
-	a.Jmp(done)
-	a.Label(nomatch)
+	a.JmpL(done)
+	a.Bind(nomatch)
 	a.MovRegImm64(R10, no)
-	a.Label(done)
+	a.Bind(done)
 	m := e.dest(pc, in.C, R10)
 	if m != R10 {
 		a.MovRegReg(m, R10)

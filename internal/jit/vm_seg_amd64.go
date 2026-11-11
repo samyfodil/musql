@@ -2,7 +2,6 @@ package jit
 
 import (
 	"math/bits"
-	"strconv"
 )
 
 // condCarry and condParity are x86's JB (a BT that found the bit set) and JP
@@ -48,9 +47,9 @@ func (a *Asm) MovRegMemD32(dst, base Reg, disp int32) {
 // column the run predicts (mask) and keeps the row's address (vmRowKey), and
 // every later one reads from that, as column does for a plain cursor. Without
 // a register to keep it in, a read takes the row list's full read.
-func (e *vmEmit) predictedRowRead(pc int, in VInsn, base Reg, first bool, mask uint64, l func(string) string) {
+func (e *vmEmit) predictedRowRead(pc int, in VInsn, base Reg, first bool, mask uint64, l func(string) Lbl) {
 	a, L := e.a, e.lay
-	a.Label(l("prows"))
+	a.Bind(l("prows"))
 	row, have := e.holds[vmRowKey(in.A)]
 	if !have && first {
 		if u := e.nextUse(vmRowKey(in.A), pc); u >= 0 {
@@ -69,7 +68,7 @@ func (e *vmEmit) predictedRowRead(pc int, in VInsn, base Reg, first bool, mask u
 	}
 	if !have {
 		a.MovRegMemD(RAX, RDI, POffCur)
-		a.Jmp(l("rows"))
+		a.JmpL(l("rows"))
 		return
 	}
 	e.pinned.add(int(row))
@@ -94,7 +93,7 @@ func (e *vmEmit) predictedRowRead(pc int, in VInsn, base Reg, first bool, mask u
 		a.MovRegMemD(RDX, row, vb+int32(off))
 		a.MovMemDReg(RSI, dst+int32(off), RDX)
 	}
-	a.Jmp(l("done"))
+	a.JmpL(l("done"))
 }
 
 // segKindLabel is the label of the predicted read of a cell of kind k, ""
@@ -123,8 +122,7 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 	e.destNoS(pc, in.C)
 	e.zeroS.del(in.C) // every word of the destination is written below
 	dst := e.d(in.C, 0)
-	pre := "sc" + strconv.Itoa(pc) + "."
-	l := func(s string) string { return pre + s }
+	l := e.named()
 	if name := segKindLabel(in.T); name != "" {
 		base, have := e.holds[^in.A]
 		first, mask := !have, uint64(1)<<uint(in.B)
@@ -159,19 +157,19 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 		a.MovRegMemD(RDX, base, VCursorOffPos)
 		a.MovRegMemD(R9, base, VCursorOffSeg)
 		a.TestRegReg(R9, R9)
-		a.Jcc(CondE, l("prows"))
+		a.JccL(CondE, l("prows"))
 		a.MovRegMemD(R10, base, VCursorOffSel)
 		a.TestRegReg(R10, R10)
-		a.Jcc(CondE, l("fnosel"))
+		a.JccL(CondE, l("fnosel"))
 		a.MovRegMemIdx(RDX, R10, RDX)
-		a.Label(l("fnosel"))
+		a.Bind(l("fnosel"))
 		a.MovRegMemD(R10, R9, VSegOffCols)
 		a.AddRegImm32(R10, int32(in.B*VSegColSize))
 		a.CmpMemDImm8(R10, VSegColOffPlain, int8(in.T))
-		a.Jcc(CondE, l(name))
-		a.Jmp(l("full"))
+		a.JccL(CondE, l(name))
+		a.JmpL(l("full"))
 		e.predictedRowRead(pc, in, base, first, mask, l)
-		a.Label(l("full"))
+		a.Bind(l("full"))
 	} else {
 		e.unmapCursor(in.A)
 	}
@@ -188,10 +186,10 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 	e.jccStub(condAboveEq, pc) // unsigned: a position before the first row is huge
 	a.MovRegMemD(R9, RAX, cb+VCursorOffSeg)
 	a.TestRegReg(R9, R9)
-	a.Jcc(CondNE, l("seg"))
+	a.JccL(CondNE, l("seg"))
 
 	// The row list's: the Value copied whole, its string's pointer shared.
-	a.Label(l("rows"))
+	a.Bind(l("rows"))
 	a.MovRegImm64(R10, sliceHeaderSize)
 	a.ImulRegReg(RDX, R10)
 	a.AddRegMemD(RDX, RAX, cb+VCursorOffRows)
@@ -215,21 +213,21 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 		a.MovRegMemD(RDX, R9, vb+int32(off))
 		a.MovMemDReg(RSI, dst+int32(off), RDX)
 	}
-	a.Jmp(l("done"))
+	a.JmpL(l("done"))
 
 	// The segment's: R9 the VSeg, RDX the row (Sel[Pos] when the cursor has
 	// a selection), R10 the column's VSegCol.
-	a.Label(l("seg"))
+	a.Bind(l("seg"))
 	a.MovRegMemD(R10, RAX, cb+VCursorOffSel)
 	a.TestRegReg(R10, R10)
-	a.Jcc(CondE, l("nosel"))
+	a.JccL(CondE, l("nosel"))
 	a.MovRegMemIdx(RDX, R10, RDX)
-	a.Label(l("nosel"))
+	a.Bind(l("nosel"))
 	a.MovRegMemD(R10, R9, VSegOffCols)
 	a.AddRegImm32(R10, int32(in.B*VSegColSize))
 	a.MovRegMemD(RAX, R10, VSegColOffNulls)
 	a.TestRegReg(RAX, RAX)
-	a.Jcc(CondE, l("nonull"))
+	a.JccL(CondE, l("nonull"))
 	a.MovRegReg(RCX, RDX)
 	a.SarRegImm8(RCX, 3)
 	a.AddRegReg(RAX, RCX)
@@ -238,10 +236,10 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 	a.AndRegImm32(RCX, 7)
 	a.BtRegReg(RAX, RCX)
 	e.jccStub(condCarry, pc) // a NULL: the VDBE's
-	a.Label(l("nonull"))
+	a.Bind(l("nonull"))
 	a.MovRegMemD(RAX, R10, VSegColOffExc)
 	a.TestRegReg(RAX, RAX)
-	a.Jcc(CondE, l("noexc"))
+	a.JccL(CondE, l("noexc"))
 	a.MovRegReg(RCX, RDX)
 	a.SarRegImm8(RCX, 6)
 	a.ShlRegImm8(RCX, 3)
@@ -249,14 +247,14 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 	a.MovRegMemD(RAX, RAX, 0)
 	a.BtRegReg(RAX, RDX)
 	e.jccStub(condCarry, pc) // an exception: the VDBE's
-	a.Label(l("noexc"))
+	a.Bind(l("noexc"))
 	a.MovRegMemD(RCX, R10, VSegColOffKind)
 	for _, k := range []struct {
 		kind int
 		name string
 	}{{VSegInt, "int"}, {VSegFloat, "float"}, {VSegNumeric, "num"}, {VSegIntReal, "intreal"}, {VSegRowid, "rowid"}, {VSegText, "text"}} {
 		a.CmpRegImm32(RCX, int32(k.kind))
-		a.Jcc(CondE, l(k.name))
+		a.JccL(CondE, l(k.name))
 	}
 	e.jmpStub(pc) // a kind this build does not read
 
@@ -280,18 +278,18 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 		for k := range 3 {
 			a.MovMemDImm(RSI, dst+int32(L.OffS+8*k), 0)
 		}
-		a.Jmp(l("done"))
+		a.JmpL(l("done"))
 	}
 
-	a.Label(l("int"))
+	a.Bind(l("int"))
 	cell()
 	writeNum(L.TypInt, RAX, none)
 
-	a.Label(l("float"))
+	a.Bind(l("float"))
 	cell()
 	writeNum(L.TypFloat, none, RAX)
 
-	a.Label(l("intreal"))
+	a.Bind(l("intreal"))
 	cell()
 	a.Cvtsi2sdq(X0, RAX)
 	a.MovqRX(RAX, X0)
@@ -299,37 +297,37 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 
 	// An integral double within 2^53 is the INTEGER, any other the REAL
 	// (numericValue). A NaN or a value past int64 fails the round trip.
-	a.Label(l("num"))
+	a.Bind(l("num"))
 	cell()
 	a.MovqXR(X0, RAX)
 	a.Cvttsd2siq(RCX, X0)
 	a.Cvtsi2sdq(X1, RCX)
 	a.Ucomisd(X0, X1)
-	a.Jcc(CondNE, l("numreal"))
-	a.Jcc(condParity, l("numreal"))
+	a.JccL(CondNE, l("numreal"))
+	a.JccL(condParity, l("numreal"))
 	a.MovRegImm64(R10, 1<<53)
 	a.AddRegReg(R10, RCX)
 	a.MovRegImm64(R9, 1<<54)
 	a.CmpRegReg(R10, R9)
-	a.Jcc(condAbove, l("numreal"))
+	a.JccL(condAbove, l("numreal"))
 	writeNum(L.TypInt, RCX, none)
-	a.Label(l("numreal"))
+	a.Bind(l("numreal"))
 	writeNum(L.TypFloat, none, RAX)
 
-	a.Label(l("rowid"))
+	a.Bind(l("rowid"))
 	a.CmpMemDImm8(R9, VSegOffDense, 0)
-	a.Jcc(CondE, l("rowids"))
+	a.JccL(CondE, l("rowids"))
 	a.MovRegMemD(RAX, R9, VSegOffFirst)
 	a.AddRegReg(RAX, RDX)
 	writeNum(L.TypInt, RAX, none)
-	a.Label(l("rowids"))
+	a.Bind(l("rowids"))
 	a.MovRegMemD(RAX, R9, VSegOffRowids)
 	a.MovRegMemIdx(RAX, RAX, RDX)
 	writeNum(L.TypInt, RAX, none)
 
 	// TEXT: the bytes from bound Pos to bound Pos+1 of the heap, shared as
 	// segment.Value shares them, which is a pointer store.
-	a.Label(l("text"))
+	a.Bind(l("text"))
 	e.jccWB(pc)
 	a.MovRegMemD(RAX, R10, VSegColOffBlock)
 	a.ShlRegImm8(RDX, 2)
@@ -339,9 +337,9 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 	a.SubRegReg(RDX, RCX)       // the length
 	// An empty string points at the heap's start, never one past its end:
 	// Go's own slicing of a zero capacity keeps the base pointer.
-	a.Jcc(CondNE, l("tlen"))
+	a.JccL(CondNE, l("tlen"))
 	a.XorRegReg(RCX, RCX)
-	a.Label(l("tlen"))
+	a.Bind(l("tlen"))
 	a.AddRegMemD(RCX, R10, VSegColOffHeap)
 	a.MovMemDImm(RSI, dst, int32(L.TypText))
 	a.MovMemDImm(RSI, dst+int32(L.OffI), 0)
@@ -350,7 +348,7 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 	a.MovMemDReg(RSI, dst+int32(L.OffS+8), RDX)
 	a.MovMemDReg(RSI, dst+int32(L.OffS+16), RDX)
 
-	a.Label(l("done"))
+	a.Bind(l("done"))
 	e.unmap(in.C)
 	e.know.wroteAny(in.C, false)
 	// The I word kept for the run's next read of r[C], as column keeps it:
@@ -374,8 +372,7 @@ func (e *vmEmit) seekRowid(pc int, in VInsn) {
 	a, L := e.a, e.lay
 	cb := int32(in.A * VCursorSize)
 	e.unmapCursor(in.A)
-	pre := "sk" + strconv.Itoa(pc) + "."
-	l := func(s string) string { return pre + s }
+	l := e.named()
 	a.CmpMemDByte(RSI, e.d(in.B, L.OffTyp), L.TypInt)
 	e.jccStub(CondNE, pc) // seekRowidKey's conversions are the VDBE's
 	e.jccWB(pc)           // the cursor's segment pointers are stored
@@ -389,57 +386,57 @@ func (e *vmEmit) seekRowid(pc int, in VInsn) {
 	a.MovRegMemD(R10, R9, VTabOffSegs)
 	a.MovRegMemD(R9, R9, VTabOffN)
 
-	a.Label(l("seg"))
+	a.Bind(l("seg"))
 	a.TestRegReg(R9, R9)
-	a.Jcc(CondE, l("miss"))
+	a.JccL(CondE, l("miss"))
 	a.AluRegMemD(AluCmp, RCX, R10, VTabSegOffLo)
-	a.Jcc(CondL, l("next"))
+	a.JccL(CondL, l("next"))
 	a.AluRegMemD(AluCmp, RCX, R10, VTabSegOffHi)
-	a.Jcc(CondG, l("next"))
+	a.JccL(CondG, l("next"))
 	a.MovRegMemD(RDX, R10, VTabSegOffSeg)
 	a.CmpMemDImm8(RDX, VSegOffDense, 0)
-	a.Jcc(CondE, l("search"))
+	a.JccL(CondE, l("search"))
 	a.MovRegReg(RAX, RCX)
 	a.AluRegMemD(AluSub, RAX, RDX, VSegOffFirst)
-	a.Jmp(l("found"))
+	a.JmpL(l("found"))
 
-	a.Label(l("search"))
+	a.Bind(l("search"))
 	a.MovqXR(X1, R9)
 	a.MovqXR(X2, R10)
 	a.MovRegMemD(RDX, RDX, VSegOffRowids)
 	a.XorRegReg(RAX, RAX)                 // lo
 	a.MovRegMemD(R9, R10, VTabSegOffRows) // hi
-	a.Label(l("bloop"))
+	a.Bind(l("bloop"))
 	a.CmpRegReg(RAX, R9)
-	a.Jcc(CondGE, l("bdone"))
+	a.JccL(CondGE, l("bdone"))
 	a.MovRegReg(R10, RAX)
 	a.AddRegReg(R10, R9)
 	a.SarRegImm8(R10, 1)
 	a.CmpMemIdxReg(RDX, R10, RCX) // rowids[mid] against key
-	a.Jcc(CondGE, l("bhi"))
+	a.JccL(CondGE, l("bhi"))
 	a.LeaRegMemD(RAX, R10, 1)
-	a.Jmp(l("bloop"))
-	a.Label(l("bhi"))
+	a.JmpL(l("bloop"))
+	a.Bind(l("bhi"))
 	a.MovRegReg(R9, R10)
-	a.Jmp(l("bloop"))
-	a.Label(l("bdone"))
+	a.JmpL(l("bloop"))
+	a.Bind(l("bdone"))
 	a.MovqRX(R10, X2)
 	a.MovqRX(R9, X1)
 	a.AluRegMemD(AluCmp, RAX, R10, VTabSegOffRows)
-	a.Jcc(CondGE, l("next"))
+	a.JccL(CondGE, l("next"))
 	a.CmpMemIdxReg(RDX, RAX, RCX)
-	a.Jcc(CondNE, l("next"))
+	a.JccL(CondNE, l("next"))
 	a.MovRegMemD(RDX, R10, VTabSegOffSeg)
-	a.Jmp(l("found"))
+	a.JmpL(l("found"))
 
-	a.Label(l("next"))
+	a.Bind(l("next"))
 	a.AddRegImm32(R10, VTabSegSize)
 	a.DecReg(R9)
-	a.Jmp(l("seg"))
+	a.JmpL(l("seg"))
 
 	// Found at row RAX of VSeg RDX, R10 its VTabSeg: the cursor on that one
 	// row, as a point seek leaves it.
-	a.Label(l("found"))
+	a.Bind(l("found"))
 	a.MovqRX(R9, X0)
 	a.MovMemDReg(R9, VCursorOffSeg, RDX)
 	a.MovMemDReg(R9, VCursorOffKey, RCX)
@@ -459,10 +456,10 @@ func (e *vmEmit) seekRowid(pc int, in VInsn) {
 	a.MovRegMemD(RCX, R9, VCursorOffSrvd)
 	a.IncReg(RCX)
 	a.MovMemDReg(R9, VCursorOffSrvd, RCX)
-	a.Jmp(l("done"))
+	a.JmpL(l("done"))
 
 	// No row: the cursor on none, and on to T.
-	a.Label(l("miss"))
+	a.Bind(l("miss"))
 	a.MovqRX(R9, X0)
 	a.MovMemDReg(R9, VCursorOffKey, RCX)
 	a.MovMemDImm(R9, VCursorOffN, 0)
@@ -471,7 +468,7 @@ func (e *vmEmit) seekRowid(pc int, in VInsn) {
 	a.MovMemDImm(R9, VCursorOffDirty, 1)
 	a.MovMemDImm(R9, VCursorOffState, 3)
 	e.jmpBlock(pc, in.T)
-	a.Label(l("done"))
+	a.Bind(l("done"))
 }
 
 // seekIdx is VSeekIdx: the segments' indexes in turn, each skipped when the
@@ -482,8 +479,7 @@ func (e *vmEmit) seekIdx(pc int, in VInsn) {
 	a, L := e.a, e.lay
 	cb := int32(in.A * VCursorSize)
 	e.unmapCursor(in.A)
-	pre := "si" + strconv.Itoa(pc) + "."
-	l := func(s string) string { return pre + s }
+	l := e.named()
 	a.CmpMemDByte(RSI, e.d(in.B, L.OffTyp), L.TypInt)
 	e.jccStub(CondNE, pc) // the key's conversions are the VDBE's
 	e.jccWB(pc)           // the cursor's segment pointers are stored
@@ -496,61 +492,61 @@ func (e *vmEmit) seekIdx(pc int, in VInsn) {
 	a.MovRegMemD(RCX, RSI, e.d(in.B, L.OffI))
 	a.MovRegMemD(RDX, R9, VIdxOffCount)
 
-	a.Label(l("seg"))
+	a.Bind(l("seg"))
 	a.TestRegReg(RDX, RDX)
-	a.Jcc(CondE, l("miss"))
+	a.JccL(CondE, l("miss"))
 	a.MovqXR(X1, R9) // this segment's index
 	a.MovqXR(X2, RDX)
 	a.AluRegMemD(AluCmp, RCX, R9, VIdxOffLo)
-	a.Jcc(CondL, l("next"))
+	a.JccL(CondL, l("next"))
 	a.AluRegMemD(AluCmp, RCX, R9, VIdxOffHi)
-	a.Jcc(CondG, l("next"))
+	a.JccL(CondG, l("next"))
 	a.MovRegMemD(R10, R9, VIdxOffVals)
 	a.MovRegMemD(RDX, R9, VIdxOffNVals) // hi
 	a.XorRegReg(RAX, RAX)               // lo
-	a.Label(l("bloop"))
+	a.Bind(l("bloop"))
 	a.CmpRegReg(RAX, RDX)
-	a.Jcc(CondGE, l("bdone"))
+	a.JccL(CondGE, l("bdone"))
 	a.MovRegReg(R9, RAX)
 	a.AddRegReg(R9, RDX)
 	a.SarRegImm8(R9, 1)
 	a.CmpMemIdxReg(R10, R9, RCX) // vals[mid] against key
-	a.Jcc(CondGE, l("bhi"))
+	a.JccL(CondGE, l("bhi"))
 	a.LeaRegMemD(RAX, R9, 1)
-	a.Jmp(l("bloop"))
-	a.Label(l("bhi"))
+	a.JmpL(l("bloop"))
+	a.Bind(l("bhi"))
 	a.MovRegReg(RDX, R9)
-	a.Jmp(l("bloop"))
-	a.Label(l("bdone"))
+	a.JmpL(l("bloop"))
+	a.Bind(l("bdone"))
 	a.MovqRX(R9, X1)
 	a.AluRegMemD(AluCmp, RAX, R9, VIdxOffNVals)
-	a.Jcc(CondGE, l("next"))
+	a.JccL(CondGE, l("next"))
 	a.CmpMemIdxReg(R10, RAX, RCX)
-	a.Jcc(CondNE, l("next"))
+	a.JccL(CondNE, l("next"))
 
 	// Found value RAX of segment R9: a later segment whose range holds the
 	// key may hold some of its rows, which the VDBE gathers.
 	a.MovqRX(RDX, X2)
 	a.MovRegReg(R10, R9)
-	a.Label(l("rest"))
+	a.Bind(l("rest"))
 	a.DecReg(RDX)
-	a.Jcc(CondE, l("found"))
+	a.JccL(CondE, l("found"))
 	a.AddRegImm32(R10, VIdxSize)
 	a.AluRegMemD(AluCmp, RCX, R10, VIdxOffLo)
-	a.Jcc(CondL, l("rest"))
+	a.JccL(CondL, l("rest"))
 	a.AluRegMemD(AluCmp, RCX, R10, VIdxOffHi)
 	e.jccStub(CondLE, pc)
-	a.Jmp(l("rest"))
+	a.JmpL(l("rest"))
 
-	a.Label(l("next"))
+	a.Bind(l("next"))
 	a.MovqRX(R9, X1)
 	a.MovqRX(RDX, X2)
 	a.AddRegImm32(R9, VIdxSize)
 	a.DecReg(RDX)
-	a.Jmp(l("seg"))
+	a.JmpL(l("seg"))
 
 	// Its rows are Rows[Starts[RAX]:Starts[RAX+1]].
-	a.Label(l("found"))
+	a.Bind(l("found"))
 	a.MovqRX(R10, X0)
 	e.seekIdxServed(R10, RDX, l("fserved"), l("fsearch"))
 	a.MovMemDReg(R10, VCursorOffKey, RCX)
@@ -575,10 +571,10 @@ func (e *vmEmit) seekIdx(pc int, in VInsn) {
 	a.MovMemDImm(R10, VCursorOffDirty, 1)
 	a.MovMemDImm(R10, VCursorOffAdv, 1)
 	a.MovMemDImm(R10, VCursorOffState, 2)
-	a.Jmp(l("done"))
+	a.JmpL(l("done"))
 
 	// No row: the cursor on none, and on to T.
-	a.Label(l("miss"))
+	a.Bind(l("miss"))
 	a.MovqRX(R10, X0)
 	e.seekIdxServed(R10, RDX, l("mserved"), l("msearch"))
 	a.MovMemDReg(R10, VCursorOffKey, RCX)
@@ -588,26 +584,26 @@ func (e *vmEmit) seekIdx(pc int, in VInsn) {
 	a.MovMemDImm(R10, VCursorOffDirty, 1)
 	a.MovMemDImm(R10, VCursorOffState, 3)
 	e.jmpBlock(pc, in.T)
-	a.Label(l("done"))
+	a.Bind(l("done"))
 }
 
 // seekIdxServed adds to cursor cur's Served the rows its last seek's run
 // served, up to the row it is on, when it has one (State 2, 4 or 5). tmp is
 // scratch.
-func (e *vmEmit) seekIdxServed(cur, tmp Reg, served, skip string) {
+func (e *vmEmit) seekIdxServed(cur, tmp Reg, served, skip Lbl) {
 	a := e.a
 	a.CmpMemDImm8(cur, VCursorOffState, 2)
-	a.Jcc(CondE, served)
+	a.JccL(CondE, served)
 	a.CmpMemDImm8(cur, VCursorOffState, 4)
-	a.Jcc(CondE, served)
+	a.JccL(CondE, served)
 	a.CmpMemDImm8(cur, VCursorOffState, 5)
-	a.Jcc(CondNE, skip)
-	a.Label(served)
+	a.JccL(CondNE, skip)
+	a.Bind(served)
 	a.MovRegMemD(tmp, cur, VCursorOffLast)
 	a.IncReg(tmp)
 	a.AddRegMemD(tmp, cur, VCursorOffSrvd)
 	a.MovMemDReg(cur, VCursorOffSrvd, tmp)
-	a.Label(skip)
+	a.Bind(skip)
 }
 
 // seekRewind is VSeekRewind.
@@ -631,19 +627,19 @@ func (e *vmEmit) text(pc int, in VInsn) {
 	}
 	a, L := e.a, e.lay
 	dst := e.d(in.A, 0)
-	same := "tx" + strconv.Itoa(pc) + ".same"
+	same := e.vmLabel()
 	a.MovRegImm64(RAX, in.Imm)
 	a.AluRegMemD(AluCmp, RAX, RSI, dst+int32(L.OffS))
-	store := "tx" + strconv.Itoa(pc) + ".store"
-	a.Jcc(CondNE, store)
+	store := e.vmLabel()
+	a.JccL(CondNE, store)
 	a.CmpMemDByte(RSI, dst, L.TypText)
-	a.Jcc(CondNE, store)
+	a.JccL(CondNE, store)
 	a.CmpMemDByte(RSI, dst+1, 0) // no subtype
-	a.Jcc(CondNE, store)
+	a.JccL(CondNE, store)
 	a.MovRegImm64(RAX, int64(in.B))
 	a.AluRegMemD(AluCmp, RAX, RSI, dst+int32(L.OffS+8))
-	a.Jcc(CondE, same)
-	a.Label(store)
+	a.JccL(CondE, same)
+	a.Bind(store)
 	e.jccWB(pc)
 	e.zeroS.del(in.A)
 	a.MovMemDImm(RSI, dst, int32(L.TypText))
@@ -653,7 +649,7 @@ func (e *vmEmit) text(pc int, in VInsn) {
 	a.MovMemDReg(RSI, dst+int32(L.OffS), RAX)
 	a.MovMemDImm(RSI, dst+int32(L.OffS+8), int32(in.B))
 	a.MovMemDImm(RSI, dst+int32(L.OffS+16), int32(in.B))
-	a.Label(same)
+	a.Bind(same)
 	e.unmap(in.A)
 	e.know.wroteAny(in.A, false)
 }
@@ -668,8 +664,8 @@ func (e *vmEmit) inSub(pc int, in VInsn) {
 	}
 	a, L := e.a, e.lay
 	e.destNoS(pc, in.C)
-	loop, hi, miss, absent, yes, no, done := e.vmLabel("ql"), e.vmLabel("qh"), e.vmLabel("qm"), e.vmLabel("qa"),
-		e.vmLabel("qy"), e.vmLabel("qn"), e.vmLabel("qd")
+	loop, hi, miss, absent, yes, no, done := e.vmLabel(), e.vmLabel(), e.vmLabel(), e.vmLabel(),
+		e.vmLabel(), e.vmLabel(), e.vmLabel()
 	a.MovRegMemD(R9, RDI, POffInSets)
 	if in.B > 0 {
 		a.AddRegImm32(R9, int32(in.B*VInSubSize))
@@ -677,7 +673,7 @@ func (e *vmEmit) inSub(pc int, in VInsn) {
 	a.CmpMemDImm8(R9, VInSubOffReady, 0)
 	e.jccStub(CondE, pc)
 	a.CmpMemDImm8(R9, VInSubOffEmpty, 0)
-	a.Jcc(CondNE, no)
+	a.JccL(CondNE, no)
 	a.CmpMemDByte(RSI, e.d(in.A, L.OffTyp), L.TypInt)
 	e.jccStub(CondNE, pc)
 	a.MovRegMemD(RCX, RSI, e.d(in.A, L.OffI))
@@ -685,39 +681,39 @@ func (e *vmEmit) inSub(pc int, in VInsn) {
 	a.MovqXR(X0, R9)
 	a.XorRegReg(RAX, RAX)
 	a.MovRegMemD(R10, R9, VInSubOffN)
-	a.Label(loop)
+	a.Bind(loop)
 	a.CmpRegReg(RAX, R10)
-	a.Jcc(CondGE, miss)
+	a.JccL(CondGE, miss)
 	a.MovRegReg(R9, RAX)
 	a.AddRegReg(R9, R10)
 	a.SarRegImm8(R9, 1)
 	a.CmpMemIdxReg(RDX, R9, RCX) // keys[mid] against the key
-	a.Jcc(CondGE, hi)
+	a.JccL(CondGE, hi)
 	a.LeaRegMemD(RAX, R9, 1)
-	a.Jmp(loop)
-	a.Label(hi)
+	a.JmpL(loop)
+	a.Bind(hi)
 	a.MovRegReg(R10, R9)
-	a.Jmp(loop)
-	a.Label(miss)
+	a.JmpL(loop)
+	a.Bind(miss)
 	a.MovqRX(R9, X0)
 	a.AluRegMemD(AluCmp, RAX, R9, VInSubOffN)
-	a.Jcc(CondGE, absent)
+	a.JccL(CondGE, absent)
 	a.CmpMemIdxReg(RDX, RAX, RCX)
-	a.Jcc(CondE, yes)
-	a.Label(absent)
+	a.JccL(CondE, yes)
+	a.Bind(absent)
 	a.CmpMemDImm8(R9, VInSubOffHasNull, 0)
 	e.jccStub(CondNE, pc) // NULL, which the VDBE answers
-	a.Jmp(no)
+	a.JmpL(no)
 	in1, in0 := int64(1), int64(0)
 	if in.Imm == 1 {
 		in1, in0 = 0, 1
 	}
-	a.Label(yes)
+	a.Bind(yes)
 	a.MovRegImm64(R10, in1)
-	a.Jmp(done)
-	a.Label(no)
+	a.JmpL(done)
+	a.Bind(no)
 	a.MovRegImm64(R10, in0)
-	a.Label(done)
+	a.Bind(done)
 	m := e.dest(pc, in.C, R10)
 	if m != R10 {
 		a.MovRegReg(m, R10)
