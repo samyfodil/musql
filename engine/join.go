@@ -2500,6 +2500,11 @@ func planJoinPushdownSub(where Expr, jts []joinedTable, scopes []tableScope, sub
 		if checkIdx < 0 {
 			checkIdx = 0
 		}
+		if checkIdx >= len(jts) {
+			// A name of a parenthesized join's member: no level of this plan.
+			plan.deferred = append(plan.deferred, cj)
+			continue
+		}
 		execLvl := 0
 		for idx := range refs {
 			if p := pos[idx]; p > execLvl {
