@@ -2182,6 +2182,11 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpSortedSeek:
 			cur := m.cursors[op.P1]
+			if cur != nil {
+				if err := m.applyPendingOrder(cur); err != nil {
+					return nil, err
+				}
+			}
 			if cur == nil || cur.rowStore != nil || cur.streamable || cur.seekReseek || cur.refillEach || cur.sub != nil || cur.vt != nil ||
 				cursorHasNoBtree(cur) && cur.fill == nil && !cur.materialized {
 				break // a cursor whose rows are not one list built once
@@ -2581,6 +2586,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpRewind:
 			cur := m.cursors[op.P1]
+			if err := m.applyPendingOrder(cur); err != nil {
+				return nil, err
+			}
 			// P4, when the row-filter recogniser attached one, is a compiled
 			// candidate-set restriction for a columnar scan (see
 			// segment_row_filter.go). Every other cursor ignores it.
@@ -2674,6 +2682,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpRightJoinSweepOrder:
 			cur := m.cursors[op.P1]
+			if err := m.applyPendingOrder(cur); err != nil {
+				return nil, err
+			}
 			cur.unsort()
 			if !cur.materialized {
 				if rerr := cur.rewind(); rerr != nil {
@@ -2687,6 +2698,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpRightJoinSweepRewind:
 			cur := m.cursors[op.P1]
+			if err := m.applyPendingOrder(cur); err != nil {
+				return nil, err
+			}
 			cur.unsort()
 			if !cur.materialized {
 				// The main pass never reached this cursor's OpRewind (e.g. an
@@ -3981,6 +3995,29 @@ func (m *vdbe) execAutoIndexOrder(op *Instruction) error {
 			return nil
 		}
 	}
+	if !cur.materialized && !cur.idxSeekConfigured && !cur.seekConfigured && !cur.seekSetConfigured {
+		// C builds an automatic index under OP_Once where its loop begins, so
+		// a loop never reached never builds it: the order waits for the
+		// cursor's first rewind or seek (applyPendingOrder).
+		cur.pendingOrder = op
+		return nil
+	}
+	return m.orderCursor(cur, op)
+}
+
+// applyPendingOrder puts cur's rows in the order an OpAutoIndexOrder left
+// waiting, before anything reads them.
+func (m *vdbe) applyPendingOrder(cur *vdbeCursor) error {
+	op := cur.pendingOrder
+	if op == nil {
+		return nil
+	}
+	cur.pendingOrder = nil
+	return m.orderCursor(cur, op)
+}
+
+// orderCursor is execAutoIndexOrder's permutation of cur's rows, built now.
+func (m *vdbe) orderCursor(cur *vdbeCursor, op *Instruction) error {
 	// The cursor materializes on its first rewind; force that now so the
 	// permutation below is the one every later rewind re-iterates.
 	cur.params = m.params // see vdbeCursor.params

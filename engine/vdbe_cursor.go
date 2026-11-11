@@ -177,6 +177,10 @@ type vdbeCursor struct {
 	// positioned on the table's rows in its key's order (segKeyOrderList).
 	keyListReady bool
 
+	// pendingOrder is an OpAutoIndexOrder not yet applied: the rows are put
+	// in its order at the first rewind or seek (applyPendingOrder).
+	pendingOrder *Instruction
+
 	// sorted is OpSortedSeek's copy of the rows, sorted by its column, that
 	// each seek narrows rows/rowids to a run of. nil until the first seek, and
 	// dropped whenever the rows are built again.
