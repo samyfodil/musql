@@ -48,3 +48,37 @@ func TestDerivedJoinPlanShapes(t *testing.T) {
 		differ(t, fmt.Sprintf("q-%d", i), append(append([]string(nil), pre...), q))
 	}
 }
+
+// A subquery that only renames another's columns is flattened away in C,
+// leaving the inner one in its place; a UNION, INTERSECT or EXCEPT inside is
+// coded by merging under an ORDER BY C invents, which sets its row estimate
+// and the order its rows arrive in. TPC-DS q2 and q8 are the shapes (issue
+// #169).
+func TestDerivedJoinPassThroughShapes(t *testing.T) {
+	pre := []string{
+		"CREATE TABLE ws(d INT, p REAL)", "CREATE TABLE cs(d INT, p REAL)",
+		"CREATE TABLE dd(sk INT, wk INT, nm TEXT)",
+		"INSERT INTO ws VALUES(1,0.1),(2,0.7),(3,1.3),(1,2.2),(4,0.3)",
+		"INSERT INTO cs VALUES(2,0.2),(3,0.9),(1,1.1),(4,0.05)",
+		"INSERT INTO dd VALUES(1,10,'Sun'),(2,10,'Mon'),(3,11,'Sun'),(4,11,'Mon')",
+		"CREATE TABLE a(x, y)", "INSERT INTO a VALUES(3,'c'),(1,'z'),(2,'b'),(1,'a'),(5,'q')",
+		"CREATE TABLE b(x, y)", "INSERT INTO b VALUES(2,'b'),(1,'a'),(3,'c'),(1,'z'),(9,'x')",
+		"CREATE TABLE s(x, v REAL)", "INSERT INTO s VALUES(1,0.1),(2,0.2),(3,0.3),(1,0.7),(5,1e16),(2,-1e16)",
+	}
+	for i, q := range []string{
+		"WITH w AS (SELECT d, p FROM (SELECT d, p FROM ws UNION ALL SELECT d, p FROM cs) sq) " +
+			"SELECT wk, sum(CASE WHEN nm = 'Sun' THEN p END), group_concat(p) FROM w, dd WHERE sk = d GROUP BY wk",
+		"SELECT wk, group_concat(p) FROM (SELECT d, p FROM (SELECT d, p FROM ws UNION ALL SELECT d, p FROM cs) sq) w, dd WHERE sk = d GROUP BY wk",
+		"SELECT group_concat(t.x || t.y) FROM (SELECT x, y FROM a INTERSECT SELECT x, y FROM b) t, a WHERE a.x = t.x",
+		"SELECT group_concat(t.x || t.y) FROM a, (SELECT x, y FROM a EXCEPT SELECT x, y FROM b) t WHERE a.x = t.x",
+		"SELECT group_concat(t.x || t.y) FROM (SELECT x, y FROM a UNION SELECT x, y FROM b) t, a WHERE a.x = t.x",
+		"SELECT sum(v) FROM s, (SELECT x FROM (SELECT x FROM a INTERSECT SELECT x FROM b) a2) v1 WHERE s.x = v1.x",
+		"SELECT sum(v) FROM s, (SELECT x FROM (SELECT x FROM a INTERSECT SELECT x FROM (SELECT x, count(*) n FROM b GROUP BY x HAVING n > 0) b1) a2) v1 WHERE s.x = v1.x",
+		"SELECT sum(v), group_concat(v1.x) FROM s, (SELECT x FROM (SELECT x FROM a EXCEPT SELECT x FROM b) a2) v1 WHERE s.x >= v1.x",
+		"SELECT group_concat(v1.y) FROM (SELECT x, y FROM (SELECT x, y FROM a UNION SELECT x, y FROM b) a2) v1, s WHERE s.x = v1.x",
+		"SELECT group_concat(v1.yy) FROM (SELECT x, y AS yy FROM (SELECT x, y FROM a UNION SELECT x, y FROM b) a2) v1, s WHERE s.x = v1.x",
+		"SELECT v1.x, sum(v) FROM s, (SELECT x FROM (SELECT x FROM a INTERSECT SELECT x FROM b) a2) v1 WHERE s.x = v1.x GROUP BY v1.x ORDER BY v1.x",
+	} {
+		differ(t, fmt.Sprintf("q-%d", i), append(append([]string(nil), pre...), q))
+	}
+}
