@@ -605,7 +605,7 @@ type tblColumnList struct {
 func (l *tblColumnList) firstTableConstraintSegment() int {
 	for i, seg := range l.segments {
 		j := 0
-		if len(seg) > 1 && seg[0].kind == tkIdent && !seg[0].quoted && seg[0].upper() == "CONSTRAINT" {
+		if len(seg) > 1 && seg[0].kind == tkIdent && !seg[0].quoted && seg[0].isKw("CONSTRAINT") {
 			j = 2 // skip "CONSTRAINT <name>"
 		}
 		if j >= len(seg) || seg[j].kind != tkIdent || seg[j].quoted {
@@ -758,7 +758,7 @@ func checkQualifierEdits(sqlText, oldName, newName string) []textEdit {
 	}
 	var out []textEdit
 	for i := 0; i < len(toks); i++ {
-		if !(toks[i].kind == tkIdent && toks[i].upper() == "CHECK") {
+		if !(toks[i].kind == tkIdent && toks[i].isKw("CHECK")) {
 			continue
 		}
 		if i+1 >= len(toks) || !(toks[i+1].kind == tkPunct && toks[i+1].text == "(") {
@@ -788,7 +788,7 @@ func checkQualifierEdits(sqlText, oldName, newName string) []textEdit {
 func checkClauseIdentTokens(seg []token) []token {
 	var out []token
 	for i := 0; i < len(seg); i++ {
-		if !(seg[i].kind == tkIdent && seg[i].upper() == "CHECK") {
+		if !(seg[i].kind == tkIdent && seg[i].isKw("CHECK")) {
 			continue
 		}
 		if i+1 >= len(seg) || !(seg[i+1].kind == tkPunct && seg[i+1].text == "(") {
@@ -826,7 +826,7 @@ func generatedClauseIdentTokens(seg []token) []token {
 		if err != nil {
 			return out
 		}
-		if i > 0 && seg[i-1].kind == tkIdent && seg[i-1].upper() == "AS" {
+		if i > 0 && seg[i-1].kind == tkIdent && seg[i-1].isKw("AS") {
 			for k := i + 1; k < closeIdx; k++ {
 				if seg[k].kind != tkIdent {
 					continue
@@ -1092,7 +1092,7 @@ func AlterAddColumnDef(sqlText string) (string, bool) {
 	if _, _, _, _, err := dropQualifiedName(p, errPrefix); err != nil || !p.consumeKeyword("ADD") {
 		return "", false
 	}
-	if first := p.peek(); first.kind == tkIdent && !first.quoted && (first.upper() == "CONSTRAINT" || first.upper() == "CHECK") {
+	if first := p.peek(); first.kind == tkIdent && !first.quoted && (first.isKw("CONSTRAINT") || first.isKw("CHECK")) {
 		return "", false
 	}
 	p.consumeKeyword("COLUMN")
@@ -1208,7 +1208,7 @@ func (db *DB) alterTable(sqlText string) error {
 		// "ADD [CONSTRAINT nm] CHECK(expr) onconf" (parse.y:1915-1918):
 		// CONSTRAINT and CHECK never fall back to an identifier, so neither can
 		// begin an ADD COLUMN.
-		if first := p.peek(); first.kind == tkIdent && !first.quoted && (first.upper() == "CONSTRAINT" || first.upper() == "CHECK") {
+		if first := p.peek(); first.kind == tkIdent && !first.quoted && (first.isKw("CONSTRAINT") || first.isKw("CHECK")) {
 			consName := ""
 			if p.consumeKeyword("CONSTRAINT") {
 				n, _, nerr := parseAlterTargetIdent(p)
@@ -2340,7 +2340,7 @@ func orderByAliasSpans(toks []token, name string, starHas func(tables []string) 
 			if depthAt[j] == dep && toks[j].kind == tkIdent && !toks[j].quoted {
 				switch toks[j].upper() {
 				case "FROM", "WHERE", "GROUP", "HAVING", "WINDOW":
-					if toks[j].upper() == "FROM" {
+					if toks[j].isKw("FROM") {
 						from = j
 					}
 					j = i
@@ -2466,7 +2466,7 @@ func r33rViewColumnListSpan(sqlText string) (byteSpan, bool) {
 		return byteSpan{}, false
 	}
 	for i, t := range toks {
-		if t.kind == tkIdent && !t.quoted && t.upper() == "AS" {
+		if t.kind == tkIdent && !t.quoted && t.isKw("AS") {
 			return byteSpan{}, false // the AS came first: no declared list
 		}
 		if t.kind != tkPunct || t.text != "(" {
@@ -2501,7 +2501,7 @@ func r33rAfterAS(toks []token, i int) bool {
 		return false
 	}
 	prev := toks[i-1]
-	return prev.kind == tkIdent && !prev.quoted && prev.upper() == "AS"
+	return prev.kind == tkIdent && !prev.quoted && prev.isKw("AS")
 }
 
 // r34vBoundNameToken reports whether toks[i] is not a column reference for a
@@ -2569,7 +2569,7 @@ func r34vFollowedByASParen(toks []token, j int) bool {
 		}
 	}
 	return j+1 < len(toks) &&
-		toks[j].kind == tkIdent && !toks[j].quoted && toks[j].upper() == "AS" &&
+		toks[j].kind == tkIdent && !toks[j].quoted && toks[j].isKw("AS") &&
 		toks[j+1].kind == tkPunct && toks[j+1].text == "("
 }
 
@@ -2690,7 +2690,7 @@ func emptyInSpans(sqlText string) (exempt, unsure []byteSpan) {
 		return nil, []byteSpan{{0, len(sqlText)}}
 	}
 	for i, t := range toks {
-		if !(t.kind == tkIdent && !t.quoted && t.upper() == "IN") {
+		if !(t.kind == tkIdent && !t.quoted && t.isKw("IN")) {
 			continue
 		}
 		if !(i+2 < len(toks) &&
@@ -2699,7 +2699,7 @@ func emptyInSpans(sqlText string) (exempt, unsure []byteSpan) {
 			continue
 		}
 		j := i - 1
-		if j >= 0 && toks[j].kind == tkIdent && !toks[j].quoted && toks[j].upper() == "NOT" {
+		if j >= 0 && toks[j].kind == tkIdent && !toks[j].quoted && toks[j].isKw("NOT") {
 			j-- // in_op ::= NOT IN  (parse.y:1490)
 		}
 		if j < 0 {
@@ -3694,16 +3694,16 @@ type addColumnDef struct {
 func parseAddColumnDefaultValue(p *parser) (val Value, ok bool, err error) {
 	t := p.peek()
 	switch {
-	case t.kind == tkIdent && t.upper() == "NULL":
+	case t.kind == tkIdent && t.isKw("NULL"):
 		p.next()
 		return Value{Typ: Null}, true, nil
-	case t.kind == tkIdent && t.upper() == "TRUE":
+	case t.kind == tkIdent && t.isKw("TRUE"):
 		p.next()
 		return Value{Typ: Int, I: 1}, true, nil
-	case t.kind == tkIdent && t.upper() == "FALSE":
+	case t.kind == tkIdent && t.isKw("FALSE"):
 		p.next()
 		return Value{Typ: Int, I: 0}, true, nil
-	case t.kind == tkIdent && (t.upper() == "CURRENT_TIME" || t.upper() == "CURRENT_DATE" || t.upper() == "CURRENT_TIMESTAMP"):
+	case t.kind == tkIdent && (t.isKw("CURRENT_TIME") || t.isKw("CURRENT_DATE") || t.isKw("CURRENT_TIMESTAMP")):
 		p.next()
 		return Value{}, false, nil
 	case t.kind == tkPunct && (t.text == "+" || t.text == "-"):
@@ -5394,7 +5394,7 @@ func viewBodyText(createSQL string) string {
 			depth++
 		case t.kind == tkPunct && t.text == ")":
 			depth--
-		case depth == 0 && t.kind == tkIdent && !t.quoted && t.upper() == "AS":
+		case depth == 0 && t.kind == tkIdent && !t.quoted && t.isKw("AS"):
 			return strings.TrimRight(strings.TrimSpace(createSQL[t.End:]), ";")
 		}
 	}
@@ -5505,7 +5505,7 @@ func r34vLocateReferencesParentColumns(sqlText, parent, oldName string, repl ide
 	}
 	var out []textEdit
 	for i := 0; i+2 < len(toks); i++ {
-		if toks[i].kind != tkIdent || toks[i].quoted || toks[i].upper() != "REFERENCES" {
+		if toks[i].kind != tkIdent || toks[i].quoted || !toks[i].isKw("REFERENCES") {
 			continue
 		}
 		nt := toks[i+1]
@@ -5555,7 +5555,7 @@ func locateReferencesTargets(sqlText, target, replacement string) []textEdit {
 	}
 	var out []textEdit
 	for i := 0; i+1 < len(toks); i++ {
-		if toks[i].kind != tkIdent || toks[i].quoted || toks[i].upper() != "REFERENCES" {
+		if toks[i].kind != tkIdent || toks[i].quoted || !toks[i].isKw("REFERENCES") {
 			continue
 		}
 		nt := toks[i+1]
@@ -6557,7 +6557,7 @@ func r45FlatViewColumnRefSkips(sqlText, oldName string) (skips []byteSpan, ok bo
 	// clause of its own that this scan would not reach.
 	selects := 0
 	for _, t := range toks {
-		if t.kind == tkIdent && !t.quoted && t.upper() == "SELECT" {
+		if t.kind == tkIdent && !t.quoted && t.isKw("SELECT") {
 			selects++
 		}
 	}
@@ -6613,7 +6613,7 @@ func r45FlatViewNameStrings(sqlText, oldName string) (names []token, ok bool) {
 	}
 	selects := 0
 	for _, t := range toks {
-		if t.kind == tkIdent && !t.quoted && t.upper() == "SELECT" {
+		if t.kind == tkIdent && !t.quoted && t.isKw("SELECT") {
 			selects++
 		}
 	}
@@ -6645,7 +6645,7 @@ func r45FlatViewNameStrings(sqlText, oldName string) (names []token, ok bool) {
 func r45ScanFlatFromClause(toks []token) (names []string, idx []int, ok bool) {
 	i := 0
 	for ; i < len(toks); i++ {
-		if toks[i].kind == tkIdent && !toks[i].quoted && toks[i].upper() == "FROM" {
+		if toks[i].kind == tkIdent && !toks[i].quoted && toks[i].isKw("FROM") {
 			break
 		}
 	}
@@ -7007,7 +7007,7 @@ func r45FlatViewColumnRenameSkips(sqlText, tblName, oldName string, hasCol func(
 	}
 	selects := 0
 	for _, t := range toks {
-		if t.kind == tkIdent && !t.quoted && t.upper() == "SELECT" {
+		if t.kind == tkIdent && !t.quoted && t.isKw("SELECT") {
 			selects++
 		}
 	}
@@ -7825,7 +7825,7 @@ func defaultNegatesHexMinInt(rawText string) (string, bool) {
 		return "", false
 	}
 	for i, t := range toks {
-		if t.kind != tkIdent || t.quoted || t.upper() != "DEFAULT" {
+		if t.kind != tkIdent || t.quoted || !t.isKw("DEFAULT") {
 			continue
 		}
 		j := i + 1

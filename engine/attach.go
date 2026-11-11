@@ -81,7 +81,7 @@ func ParseAttachStmt(sqlText string) (path, name string, ok bool, err error) {
 	if lerr != nil {
 		return "", "", false, nil
 	}
-	if len(toks) == 0 || toks[0].kind != tkIdent || toks[0].upper() != "ATTACH" {
+	if len(toks) == 0 || toks[0].kind != tkIdent || !toks[0].isKw("ATTACH") {
 		return "", "", false, nil
 	}
 	p := newParser(sqlText, toks)
@@ -409,7 +409,7 @@ func ParseDetachStmt(sqlText string) (name string, ok bool, err error) {
 	if lerr != nil {
 		return "", false, nil
 	}
-	if len(toks) == 0 || toks[0].kind != tkIdent || toks[0].upper() != "DETACH" {
+	if len(toks) == 0 || toks[0].kind != tkIdent || !toks[0].isKw("DETACH") {
 		return "", false, nil
 	}
 	p := newParser(sqlText, toks)
@@ -458,7 +458,7 @@ func ParseDetachStmt(sqlText string) (name string, ok bool, err error) {
 func attachExprLiteral(t token) (text string, ok bool, err error) {
 	switch t.kind {
 	case tkIdent:
-		if !t.quoted && t.upper() == "NULL" {
+		if !t.quoted && t.isKw("NULL") {
 			return "", true, nil
 		}
 		if !t.quoted && nonIdentifierKeywords[t.upper()] {

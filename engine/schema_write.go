@@ -609,7 +609,7 @@ func detectAutoIncrementColumn(createSQL string) (colName string, ok bool, err e
 	autoIncCount := 0
 	for _, seg := range segments {
 		for _, t := range seg {
-			if t.kind == tkIdent && t.upper() == "AUTOINCREMENT" {
+			if t.kind == tkIdent && t.isKw("AUTOINCREMENT") {
 				autoIncCount++
 			}
 		}
@@ -630,7 +630,7 @@ func detectAutoIncrementColumn(createSQL string) (colName string, ok bool, err e
 		}
 		hasAI := false
 		for _, t := range seg {
-			if t.kind == tkIdent && t.upper() == "AUTOINCREMENT" {
+			if t.kind == tkIdent && t.isKw("AUTOINCREMENT") {
 				hasAI = true
 				break
 			}
@@ -652,11 +652,11 @@ func detectAutoIncrementColumn(createSQL string) (colName string, ok bool, err e
 		// not pinned), as does any other constraint kind.
 		if first.kind == tkIdent && tableConstraintKeywords[first.upper()] {
 			k := 0
-			if first.upper() == "CONSTRAINT" {
+			if first.isKw("CONSTRAINT") {
 				k = 2 // skip "CONSTRAINT <name>"
 			}
-			if k+1 < len(seg) && seg[k].kind == tkIdent && seg[k].upper() == "PRIMARY" &&
-				seg[k+1].kind == tkIdent && seg[k+1].upper() == "KEY" {
+			if k+1 < len(seg) && seg[k].kind == tkIdent && seg[k].isKw("PRIMARY") &&
+				seg[k+1].kind == tkIdent && seg[k+1].isKw("KEY") {
 				j := k + 2
 				if j < len(seg) && seg[j].kind == tkPunct && seg[j].text == "(" {
 					j++
@@ -669,10 +669,10 @@ func detectAutoIncrementColumn(createSQL string) (colName string, ok bool, err e
 						j++
 					}
 					if nm != "" {
-						if j < len(seg) && seg[j].kind == tkIdent && seg[j].upper() == "ASC" {
+						if j < len(seg) && seg[j].kind == tkIdent && seg[j].isKw("ASC") {
 							j++
 						}
-						if j+1 < len(seg) && seg[j].kind == tkIdent && seg[j].upper() == "AUTOINCREMENT" &&
+						if j+1 < len(seg) && seg[j].kind == tkIdent && seg[j].isKw("AUTOINCREMENT") &&
 							seg[j+1].kind == tkPunct && seg[j+1].text == ")" {
 							return nm, true, nil
 						}
@@ -711,7 +711,7 @@ func detectAutoIncrementColumn(createSQL string) (colName string, ok bool, err e
 		}
 		declType := joinTypeTokens(seg[1:typeEnd])
 		j := typeEnd
-		for j < len(seg) && !(seg[j].kind == tkIdent && seg[j].upper() == "PRIMARY") {
+		for j < len(seg) && !(seg[j].kind == tkIdent && seg[j].isKw("PRIMARY")) {
 			j++
 		}
 		if j >= len(seg) {
@@ -722,16 +722,16 @@ func detectAutoIncrementColumn(createSQL string) (colName string, ok bool, err e
 			return "", false, fmt.Errorf("near \"AUTOINCREMENT\": syntax error")
 		}
 		j++ // past PRIMARY
-		if j < len(seg) && seg[j].kind == tkIdent && seg[j].upper() == "KEY" {
+		if j < len(seg) && seg[j].kind == tkIdent && seg[j].isKw("KEY") {
 			j++
 		}
-		if j < len(seg) && seg[j].kind == tkIdent && seg[j].upper() == "DESC" {
+		if j < len(seg) && seg[j].kind == tkIdent && seg[j].isKw("DESC") {
 			// A DESC key is not the rowid (build.c:1868-1871 requires
 			// sortOrder!=SQLITE_SO_DESC), so autoInc reaches the error arm at
 			// build.c:1883-1886.
 			return "", false, fmt.Errorf("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY")
 		}
-		if j < len(seg) && seg[j].kind == tkIdent && seg[j].upper() == "ASC" {
+		if j < len(seg) && seg[j].kind == tkIdent && seg[j].isKw("ASC") {
 			j++
 		}
 		// ccons ::= PRIMARY KEY sortorder onconf autoinc (parse.y:414): a
@@ -741,7 +741,7 @@ func detectAutoIncrementColumn(createSQL string) (colName string, ok bool, err e
 		} else if ok {
 			j = nk
 		}
-		if !(j < len(seg) && seg[j].kind == tkIdent && seg[j].upper() == "AUTOINCREMENT") {
+		if !(j < len(seg) && seg[j].kind == tkIdent && seg[j].isKw("AUTOINCREMENT")) {
 			return "", false, fmt.Errorf("column %s: unsupported AUTOINCREMENT placement", name)
 		}
 		if !equalFoldName(strings.TrimSpace(declType), "INTEGER") {
@@ -1630,8 +1630,8 @@ func parseTableTailClauses(sqlText string) (withoutRowid, strict bool, err error
 				tail := toks[i+1:]
 				for j := 0; j < len(tail); j++ {
 					switch {
-					case tail[j].kind == tkIdent && tail[j].upper() == "WITHOUT":
-						if j+1 >= len(tail) || tail[j+1].kind != tkIdent || tail[j+1].upper() != "ROWID" {
+					case tail[j].kind == tkIdent && tail[j].isKw("WITHOUT"):
+						if j+1 >= len(tail) || tail[j+1].kind != tkIdent || !tail[j+1].isKw("ROWID") {
 							return false, false, fmt.Errorf("engine: CREATE TABLE: unexpected trailing input near %q", tail[j].text)
 						}
 						withoutRowid = true
@@ -1639,7 +1639,7 @@ func parseTableTailClauses(sqlText string) (withoutRowid, strict bool, err error
 						if j+1 < len(tail) && tail[j+1].kind == tkPunct && tail[j+1].text == "," {
 							j++
 						}
-					case tail[j].kind == tkIdent && !tail[j].quoted && tail[j].upper() == "STRICT":
+					case tail[j].kind == tkIdent && !tail[j].quoted && tail[j].isKw("STRICT"):
 						// A QUOTED spelling is NOT the option: C SQLite
 						// rejects `CREATE TABLE s1 (a INT) "STRICT"` with
 						// `unknown table option: "STRICT"` (verified
@@ -1678,7 +1678,7 @@ func tailDeclaresStrict(tail []token) bool {
 			return false
 		case t.kind == tkPunct && t.text == ";":
 			return false
-		case t.kind == tkIdent && !t.quoted && t.upper() == "STRICT":
+		case t.kind == tkIdent && !t.quoted && t.isKw("STRICT"):
 			return true
 		}
 	}

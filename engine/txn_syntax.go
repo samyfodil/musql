@@ -23,7 +23,7 @@ func txnWholeStmtSyntaxErr(sqlText string, toks []token) error {
 	if p.peekIsPunct(";") {
 		p.next()
 	}
-	if t := p.peek(); t.kind != tkEOF && !(t.kind == tkIdent && !t.quoted && t.upper() == "TO") {
+	if t := p.peek(); t.kind != tkEOF && !(t.kind == tkIdent && !t.quoted && t.isKw("TO")) {
 		return fmt.Errorf("engine: near %q: syntax error", t.text)
 	}
 	return nil

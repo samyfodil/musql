@@ -1193,9 +1193,9 @@ func (p *ReadOnlyPager) createdVtabDefIn(scope schemaScope, name string) (module
 // "CREATE VIRTUAL TABLE".
 func isCreateVirtualTableStmt(toks []token) bool {
 	return len(toks) >= 3 &&
-		toks[0].kind == tkIdent && toks[0].upper() == "CREATE" &&
-		toks[1].kind == tkIdent && toks[1].upper() == "VIRTUAL" &&
-		toks[2].kind == tkIdent && toks[2].upper() == "TABLE"
+		toks[0].kind == tkIdent && toks[0].isKw("CREATE") &&
+		toks[1].kind == tkIdent && toks[1].isKw("VIRTUAL") &&
+		toks[2].kind == tkIdent && toks[2].isKw("TABLE")
 }
 
 // isCreateVirtualTableSQL reports whether sqlText (a stored schema row's SQL) is

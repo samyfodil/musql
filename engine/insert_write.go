@@ -2102,10 +2102,10 @@ func exprCallsNondeterministicFunc(e Expr) bool {
 // distinguish the statement kind, not a full parse.
 func isCreateIndexStmt(toks []token) bool {
 	i := 1
-	if i < len(toks) && toks[i].kind == tkIdent && toks[i].upper() == "UNIQUE" {
+	if i < len(toks) && toks[i].kind == tkIdent && toks[i].isKw("UNIQUE") {
 		i++
 	}
-	return i < len(toks) && toks[i].kind == tkIdent && toks[i].upper() == "INDEX"
+	return i < len(toks) && toks[i].kind == tkIdent && toks[i].isKw("INDEX")
 }
 
 // isCreateViewStmt reports whether toks (a lexed statement already known to
@@ -2113,10 +2113,10 @@ func isCreateIndexStmt(toks []token) bool {
 // TABLE or CREATE [UNIQUE] INDEX.
 func isCreateViewStmt(toks []token) bool {
 	i := 1
-	if i < len(toks) && toks[i].kind == tkIdent && (toks[i].upper() == "TEMP" || toks[i].upper() == "TEMPORARY") {
+	if i < len(toks) && toks[i].kind == tkIdent && (toks[i].isKw("TEMP") || toks[i].isKw("TEMPORARY")) {
 		i++
 	}
-	return i < len(toks) && toks[i].kind == tkIdent && toks[i].upper() == "VIEW"
+	return i < len(toks) && toks[i].kind == tkIdent && toks[i].isKw("VIEW")
 }
 
 // writeDispatchKeyword returns the keyword Exec/ExecArgs/ParseParamInfo route

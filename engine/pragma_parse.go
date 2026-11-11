@@ -417,7 +417,7 @@ func parsePragmaTableDef(createSQL string) (*pragmaTableDef, error) {
 		if first.kind == tkIdent && tableConstraintKeywords[first.upper()] {
 			kwTok := first
 			rest := seg
-			if kwTok.upper() == "CONSTRAINT" {
+			if kwTok.isKw("CONSTRAINT") {
 				k := 1
 				// The name may be a single-quoted STRING, which is a NAME in
 				// this position -- see pragmaConstraintName. Failing to skip it
@@ -495,31 +495,31 @@ func parsePragmaTableDef(createSQL string) (*pragmaTableDef, error) {
 		for j < len(seg) {
 			t := seg[j]
 			switch {
-			case t.kind == tkIdent && t.upper() == "PRIMARY":
+			case t.kind == tkIdent && t.isKw("PRIMARY"):
 				isColPK = true
 				j++
-				if j < len(seg) && seg[j].kind == tkIdent && seg[j].upper() == "KEY" {
+				if j < len(seg) && seg[j].kind == tkIdent && seg[j].isKw("KEY") {
 					j++
 				}
-				if j < len(seg) && seg[j].kind == tkIdent && seg[j].upper() == "DESC" {
+				if j < len(seg) && seg[j].kind == tkIdent && seg[j].isKw("DESC") {
 					pkDesc = true
 					j++
-				} else if j < len(seg) && seg[j].kind == tkIdent && seg[j].upper() == "ASC" {
+				} else if j < len(seg) && seg[j].kind == tkIdent && seg[j].isKw("ASC") {
 					j++
 				}
-			case t.kind == tkIdent && t.upper() == "NOT" && j+1 < len(seg) && seg[j+1].kind == tkIdent && seg[j+1].upper() == "NULL":
+			case t.kind == tkIdent && t.isKw("NOT") && j+1 < len(seg) && seg[j+1].kind == tkIdent && seg[j+1].isKw("NULL"):
 				col.notNull = true
 				j += 2
-			case t.kind == tkIdent && t.upper() == "UNIQUE":
+			case t.kind == tkIdent && t.isKw("UNIQUE"):
 				def.addAutoIndex(pragmaAutoIndexSpec{cols: []string{name}, kind: "u"})
 				j++
-			case t.kind == tkIdent && t.upper() == "DEFAULT":
+			case t.kind == tkIdent && t.isKw("DEFAULT"):
 				j++
 				text, nj := extractDefaultText(createSQL, seg, j)
 				col.hasDefault = true
 				col.dflt = text
 				j = nj
-			case t.kind == tkIdent && t.upper() == "COLLATE":
+			case t.kind == tkIdent && t.isKw("COLLATE"):
 				// Recorded (upper-cased) rather than skipped: PRAGMA
 				// foreign_key_check compares a child value against a parent
 				// column under THAT column's collating sequence -- see
@@ -530,7 +530,7 @@ func parsePragmaTableDef(createSQL string) (*pragmaTableDef, error) {
 					col.collateSrc = seg[j].text
 					j++
 				}
-			case t.kind == tkIdent && (t.upper() == "GENERATED" || t.upper() == "AS"):
+			case t.kind == tkIdent && (t.isKw("GENERATED") || t.isKw("AS")):
 				// A GENERATED column, in either spelling ("GENERATED ALWAYS AS
 				// (expr)" or the bare "AS (expr)"), optionally followed by
 				// STORED or VIRTUAL (VIRTUAL is the default). Recorded rather
@@ -539,11 +539,11 @@ func parsePragmaTableDef(createSQL string) (*pragmaTableDef, error) {
 				// column -- see pragmaTableInfo.
 				col.generated = true
 				j++
-				if t.upper() == "GENERATED" {
-					if j < len(seg) && seg[j].kind == tkIdent && seg[j].upper() == "ALWAYS" {
+				if t.isKw("GENERATED") {
+					if j < len(seg) && seg[j].kind == tkIdent && seg[j].isKw("ALWAYS") {
 						j++
 					}
-					if j < len(seg) && seg[j].kind == tkIdent && seg[j].upper() == "AS" {
+					if j < len(seg) && seg[j].kind == tkIdent && seg[j].isKw("AS") {
 						j++
 					}
 				}
@@ -555,13 +555,13 @@ func parsePragmaTableDef(createSQL string) (*pragmaTableDef, error) {
 						j = len(seg)
 					}
 				}
-				if j < len(seg) && seg[j].kind == tkIdent && seg[j].upper() == "STORED" {
+				if j < len(seg) && seg[j].kind == tkIdent && seg[j].isKw("STORED") {
 					col.generatedStored = true
 					j++
-				} else if j < len(seg) && seg[j].kind == tkIdent && seg[j].upper() == "VIRTUAL" {
+				} else if j < len(seg) && seg[j].kind == tkIdent && seg[j].isKw("VIRTUAL") {
 					j++
 				}
-			case t.kind == tkIdent && t.upper() == "REFERENCES":
+			case t.kind == tkIdent && t.isKw("REFERENCES"):
 				j++
 				fk, nj := parseReferencesClause(seg, j, name)
 				def.fks = append(def.fks, fk)
@@ -678,16 +678,16 @@ func parseFKTrailingClauses(seg []token, j int, fk *pragmaFK) int {
 			j += 2 // "MATCH <name>"; the name itself is discarded (see doc comment)
 		case "DEFERRABLE":
 			j++
-			if j < len(seg) && seg[j].kind == tkIdent && seg[j].upper() == "INITIALLY" {
-				if j+1 < len(seg) && seg[j+1].kind == tkIdent && seg[j+1].upper() == "DEFERRED" {
+			if j < len(seg) && seg[j].kind == tkIdent && seg[j].isKw("INITIALLY") {
+				if j+1 < len(seg) && seg[j+1].kind == tkIdent && seg[j+1].isKw("DEFERRED") {
 					fk.deferred = true
 				}
 				j += 2
 			}
 		case "NOT":
-			if j+1 < len(seg) && seg[j+1].kind == tkIdent && seg[j+1].upper() == "DEFERRABLE" {
+			if j+1 < len(seg) && seg[j+1].kind == tkIdent && seg[j+1].isKw("DEFERRABLE") {
 				j += 2
-				if j < len(seg) && seg[j].kind == tkIdent && seg[j].upper() == "INITIALLY" {
+				if j < len(seg) && seg[j].kind == tkIdent && seg[j].isKw("INITIALLY") {
 					j += 2
 				}
 			} else {
@@ -725,7 +725,7 @@ func parseFKAction(seg []token, k int) (string, int) {
 		}
 		return "NO ACTION", k + 1
 	case "NO":
-		if k+1 < len(seg) && seg[k+1].kind == tkIdent && seg[k+1].upper() == "ACTION" {
+		if k+1 < len(seg) && seg[k+1].kind == tkIdent && seg[k+1].isKw("ACTION") {
 			return "NO ACTION", k + 2
 		}
 		return "NO ACTION", k + 1
@@ -794,11 +794,11 @@ func parseReferencesClause(seg []token, j int, fromCol string) (pragmaFK, int) {
 // keyword, any leading "CONSTRAINT name" already stripped by the caller).
 func parseTableLevelFK(rest []token) (pragmaFK, bool) {
 	i := 0
-	if !(i < len(rest) && rest[i].kind == tkIdent && rest[i].upper() == "FOREIGN") {
+	if !(i < len(rest) && rest[i].kind == tkIdent && rest[i].isKw("FOREIGN")) {
 		return pragmaFK{}, false
 	}
 	i++
-	if i < len(rest) && rest[i].kind == tkIdent && rest[i].upper() == "KEY" {
+	if i < len(rest) && rest[i].kind == tkIdent && rest[i].isKw("KEY") {
 		i++
 	}
 	if !(i < len(rest) && rest[i].kind == tkPunct && rest[i].text == "(") {
@@ -815,7 +815,7 @@ func parseTableLevelFK(rest []token) (pragmaFK, bool) {
 		}
 	}
 	i = end + 1
-	if !(i < len(rest) && rest[i].kind == tkIdent && rest[i].upper() == "REFERENCES") {
+	if !(i < len(rest) && rest[i].kind == tkIdent && rest[i].isKw("REFERENCES")) {
 		return pragmaFK{}, false
 	}
 	i++
@@ -857,10 +857,10 @@ func parsePragmaIndexHeader(sqlText string) (unique, partial bool) {
 		return false, false
 	}
 	i := 0
-	if i < len(toks) && toks[i].kind == tkIdent && toks[i].upper() == "CREATE" {
+	if i < len(toks) && toks[i].kind == tkIdent && toks[i].isKw("CREATE") {
 		i++
 	}
-	if i < len(toks) && toks[i].kind == tkIdent && toks[i].upper() == "UNIQUE" {
+	if i < len(toks) && toks[i].kind == tkIdent && toks[i].isKw("UNIQUE") {
 		unique = true
 		i++
 	}
@@ -876,7 +876,7 @@ func parsePragmaIndexHeader(sqlText string) (unique, partial bool) {
 			if depth == 0 {
 				seenColumnList = true
 			}
-		case depth == 0 && seenColumnList && t.kind == tkIdent && t.upper() == "WHERE":
+		case depth == 0 && seenColumnList && t.kind == tkIdent && t.isKw("WHERE"):
 			partial = true
 			return unique, partial
 		}
@@ -896,19 +896,19 @@ func parsePragmaIndexColumns(sqlText string) (names []string, descs []bool, coll
 		return nil, nil, nil, false, lerr
 	}
 	i := 0
-	if !(i < len(toks) && toks[i].kind == tkIdent && toks[i].upper() == "CREATE") {
+	if !(i < len(toks) && toks[i].kind == tkIdent && toks[i].isKw("CREATE")) {
 		return nil, nil, nil, false, fmt.Errorf("CREATE INDEX: expected CREATE")
 	}
 	i++
-	if i < len(toks) && toks[i].kind == tkIdent && toks[i].upper() == "UNIQUE" {
+	if i < len(toks) && toks[i].kind == tkIdent && toks[i].isKw("UNIQUE") {
 		unique = true
 		i++
 	}
-	if !(i < len(toks) && toks[i].kind == tkIdent && toks[i].upper() == "INDEX") {
+	if !(i < len(toks) && toks[i].kind == tkIdent && toks[i].isKw("INDEX")) {
 		return nil, nil, nil, false, fmt.Errorf("CREATE INDEX: expected INDEX")
 	}
 	i++
-	if i < len(toks) && toks[i].kind == tkIdent && toks[i].upper() == "IF" {
+	if i < len(toks) && toks[i].kind == tkIdent && toks[i].isKw("IF") {
 		i += 3 // IF NOT EXISTS
 	}
 	if i < len(toks) && toks[i].kind == tkIdent {
@@ -920,7 +920,7 @@ func parsePragmaIndexColumns(sqlText string) (names []string, descs []bool, coll
 			i++
 		}
 	}
-	if !(i < len(toks) && toks[i].kind == tkIdent && toks[i].upper() == "ON") {
+	if !(i < len(toks) && toks[i].kind == tkIdent && toks[i].isKw("ON")) {
 		return nil, nil, nil, false, fmt.Errorf("CREATE INDEX: expected ON")
 	}
 	i++
@@ -940,7 +940,7 @@ func parsePragmaIndexColumns(sqlText string) (names []string, descs []bool, coll
 		}
 		desc := false
 		for _, t := range seg[1:] {
-			if t.kind == tkIdent && t.upper() == "DESC" {
+			if t.kind == tkIdent && t.isKw("DESC") {
 				desc = true
 			}
 		}
@@ -948,7 +948,7 @@ func parsePragmaIndexColumns(sqlText string) (names []string, descs []bool, coll
 		if name == "" {
 			body := seg
 			for len(body) > 1 && body[len(body)-1].kind == tkIdent &&
-				(body[len(body)-1].upper() == "ASC" || body[len(body)-1].upper() == "DESC") {
+				(body[len(body)-1].isKw("ASC") || body[len(body)-1].isKw("DESC")) {
 				body = body[:len(body)-1]
 			}
 			name, coll, _ = indexKeyEntryAsColumn(sqlText[body[0].Start:body[len(body)-1].End])

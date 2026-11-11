@@ -48,6 +48,24 @@ type token struct {
 // 256-byte table where only a-z move and bytes >= 0x80 map to themselves.
 func (t token) upper() string { return asciiUpper(t.text) }
 
+// isKw reports t.upper() == kw for an upper-case kw, without the copy upper
+// makes of a lower-case word.
+func (t token) isKw(kw string) bool {
+	if len(t.text) != len(kw) {
+		return false
+	}
+	for i := 0; i < len(kw); i++ {
+		c := t.text[i]
+		if c >= 'a' && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		if c != kw[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // asciiUpper folds a-z to uppercase; every other byte is unchanged. Returns s
 // unchanged when nothing moves, saving allocation for already-uppercase keywords.
 func asciiUpper(s string) string {
@@ -437,7 +455,7 @@ func SplitStatements(sqlText string) ([]string, error) {
 			first = i
 			// A CREATE [OR REPLACE] [TEMP|TEMPORARY] TRIGGER opens a body whose
 			// own ";"s must not split the script.
-			if t.kind == tkIdent && !t.quoted && t.upper() == "CREATE" {
+			if t.kind == tkIdent && !t.quoted && t.isKw("CREATE") {
 				for j := i + 1; j < len(toks) && j <= i+4; j++ {
 					if toks[j].kind != tkIdent || toks[j].quoted {
 						break
