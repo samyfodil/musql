@@ -161,7 +161,7 @@ func r36dShadowOf(p *ReadOnlyPager, sel *SelectStmt, cteDefs map[string]*CTEDef,
 				return sh, false
 			}
 			tr := findSchemaTableRow(rows, scope, it.Table)
-			pcv, isView, verr := p.resolveViewByNameIn(scope, it.Table)
+			pcv, isView, verr := p.sharedViewDefIn(scope, it.Table)
 			if verr != nil {
 				return sh, false
 			}

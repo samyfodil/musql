@@ -1855,7 +1855,7 @@ func validateFromTablesExist(pager *ReadOnlyPager, items []FromItem) error {
 			}
 		}
 		if _, err := rp.resolveTableIn(fromItemScope(it), it.Table); err != nil {
-			if _, ok, verr := rp.resolveViewByNameIn(fromItemScope(it), it.Table); verr == nil && ok {
+			if _, ok, verr := rp.sharedViewDefIn(fromItemScope(it), it.Table); verr == nil && ok {
 				continue
 			}
 			// A VIRTUAL TABLE exists too, and resolveTableIn cannot see one: its

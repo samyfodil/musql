@@ -43,7 +43,7 @@ func (p *ReadOnlyPager) r41FlattenMultiItem(stmt *SelectStmt, i int, expand bool
 			body, colNames, owner = b.core, b.colNames, b
 		} else {
 			isView = true
-			pcv, ok := p.r37cViewBody(it)
+			pcv, ok := p.r37cViewBody(it, true)
 			if !ok {
 				return nil, false
 			}
@@ -187,7 +187,7 @@ func (p *ReadOnlyPager) r41FlattenMultiItem(stmt *SelectStmt, i int, expand bool
 				// A view: its name binds against the schema from the parent
 				// as it did from the body (no CTE in scope shadows it, checked
 				// above), and its columns are its body's.
-				pcv, isV, verr := p.resolveViewByNameIn(fromItemScope(b), b.Table)
+				pcv, isV, verr := p.sharedViewDefIn(fromItemScope(b), b.Table)
 				if verr != nil || !isV || pcv == nil {
 					return nil, false
 				}

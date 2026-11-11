@@ -621,7 +621,7 @@ func (p *ReadOnlyPager) resolveVtabModuleForItem(it FromItem) (VtabModule, []str
 			if _, terr := p.resolveTableIn(fromItemScope(it), it.Table); terr == nil {
 				return nil, nil, semanticf("engine: '%s' is not a function", it.Table)
 			}
-			if _, isView, verr := p.resolveViewByNameIn(fromItemScope(it), it.Table); verr == nil && isView {
+			if _, isView, verr := p.sharedViewDefIn(fromItemScope(it), it.Table); verr == nil && isView {
 				return nil, nil, semanticf("engine: '%s' is not a function", it.Table)
 			}
 			// Nothing of the name: sqlite3LocateTableItem's "no such table".

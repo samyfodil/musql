@@ -384,7 +384,7 @@ func (p *ReadOnlyPager) columnQualifierCatalogMismatch(x ColumnExpr, from []From
 		}
 		if _, err := rp.resolveTableIn(scope, it.Table); err != nil {
 			// A VIEW is just as legitimate a source as a table.
-			if _, found, verr := rp.resolveViewByNameIn(scope, it.Table); verr == nil && found {
+			if _, found, verr := rp.sharedViewDefIn(scope, it.Table); verr == nil && found {
 				return nil, false
 			}
 			return notFound, true
