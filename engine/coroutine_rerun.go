@@ -243,6 +243,9 @@ func cSelectRowEst(body *SelectStmt, prog *Program, compile func(*SelectStmt) *P
 	if len(body.Compound) == 0 {
 		return cArmRowEst(body, prog, body.Limit, compile, seed, seedOK)
 	}
+	if len(body.Compound) == 1 && body.Compound[0].Op != "UNION ALL" {
+		return cMergeRowEst(body, prog, compile, seed, seedOK)
+	}
 	// multiSelect's UNION ALL arm (select.c:3005-3049): the left-most select
 	// takes the LIMIT (computeLimitRegisters runs there first; every later
 	// arm finds iLimit set and returns at once), and each arm's estimate is
@@ -274,6 +277,113 @@ func cSelectRowEst(body *SelectStmt, prog *Program, compile func(*SelectStmt) *P
 		}
 	}
 	return total, true
+}
+
+// cMergeRowEst is multiSelectByMerge's estimate for a two-arm UNION, EXCEPT or
+// INTERSECT with no ORDER BY or LIMIT of its own. Each arm is coded under the
+// ORDER BY C invents, every result column in turn under the compound's
+// collating sequence (select.c:2997, :3462-3476, :3490); then the right arm's
+// estimate stands for an EXCEPT, the smaller one for an INTERSECT and the sum
+// for a UNION (select.c:3636-3644).
+func cMergeRowEst(body *SelectStmt, prog *Program, compile func(*SelectStmt) *Program, seed logEst, seedOK bool) (logEst, bool) {
+	right := body.Compound[0].Stmt
+	if compile == nil || prog == nil || prog.Compound == nil || right == nil || len(body.OrderBy) != 0 ||
+		body.Limit != nil || body.Offset != nil || body.OffsetParam != nil {
+		return 0, false
+	}
+	colls := prog.Compound.collations
+	arm := func(s *SelectStmt) (logEst, bool) {
+		if len(s.Columns) != len(colls) {
+			return 0, false
+		}
+		a := *s
+		a.Compound, a.Limit, a.Offset = nil, nil, nil
+		a.OrderBy = make([]OrderTerm, len(colls))
+		for k, col := range a.Columns {
+			if col.Star {
+				return 0, false
+			}
+			var e Expr = LiteralExpr{Val: Value{Typ: Int, I: int64(k + 1)}}
+			if colls[k] != "" && !equalFoldName(colls[k], "BINARY") {
+				e = CollateExpr{X: col.Expr, Name: colls[k]}
+			}
+			a.OrderBy[k] = OrderTerm{Expr: e}
+		}
+		return cArmRowEst(&a, compile(&a), nil, compile, seed, seedOK)
+	}
+	l, ok := arm(body)
+	if !ok {
+		return 0, false
+	}
+	r, ok := arm(right)
+	if !ok {
+		return 0, false
+	}
+	switch body.Compound[0].Op {
+	case "UNION":
+		return logEstAdd(r, l), true
+	case "INTERSECT":
+		return min(r, l), true
+	case "EXCEPT":
+		return r, true
+	}
+	return 0, false
+}
+
+// cPassThroughItem is body's one FROM item when body does nothing but name
+// that subquery's result columns, each in its own place: flattened, it leaves
+// exactly that item where body stood, with the same columns.
+func cPassThroughItem(body *SelectStmt) (FromItem, bool) {
+	if body == nil || len(body.Compound) != 0 || len(body.CTEs) != 0 || len(body.From) != 1 ||
+		body.Where != nil || len(body.GroupBy) != 0 || body.Having != nil || len(body.OrderBy) != 0 ||
+		body.Limit != nil || body.LimitParam != nil || body.Offset != nil || body.OffsetParam != nil ||
+		body.Distinct || body.ValuesArms != 0 || cHasWindow(body) {
+		return FromItem{}, false
+	}
+	it := body.From[0]
+	if it.Subquery == nil || it.On != nil || len(it.Using) != 0 || it.Natural || it.GroupLen != 0 || len(it.NestedGroupSpan) != 0 {
+		return FromItem{}, false
+	}
+	names, ok := cResultNames(it.Subquery)
+	if !ok || len(names) != len(body.Columns) {
+		return FromItem{}, false
+	}
+	for k, c := range body.Columns {
+		ce, isCol := c.Expr.(ColumnExpr)
+		if c.Star || !isCol || ce.Schema != "" || (ce.Qualifier != "" && !equalFoldName(ce.Qualifier, it.Alias)) ||
+			!equalFoldName(ce.Name, names[k]) {
+			return FromItem{}, false
+		}
+	}
+	return it, true
+}
+
+// cResultNames is the column names of sub's result, read off its left-most
+// arm: an alias, else a bare column's name. ok is false for a star, any other
+// expression, or a name given twice.
+func cResultNames(sub *SelectStmt) ([]string, bool) {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(sub.Columns))
+	for _, c := range sub.Columns {
+		n := c.Alias
+		if c.Star {
+			return nil, false
+		}
+		if !c.HasAlias {
+			ce, ok := c.Expr.(ColumnExpr)
+			if !ok {
+				return nil, false
+			}
+			n = ce.Name
+		}
+		if f := r33sFoldIdent(n); seen[f] {
+			return nil, false
+		} else {
+			seen[f] = true
+		}
+		out = append(out, n)
+	}
+	return out, true
 }
 
 // cArmRowEst is one simple select's nSelectRow: 320 (tag-select-0650), lowered
@@ -338,6 +448,18 @@ func cArmRowEst(body *SelectStmt, prog *Program, limit *int64, compile func(*Sel
 			return 0, false
 		}
 		prog = compile(&SelectStmt{Columns: []SelectColumn{{Expr: LiteralExpr{Val: Value{Typ: Int, I: 1}}, Text: "1"}}, From: body.From})
+	}
+	if (prog == nil || !prog.planNRowOK) && compile != nil && seedOK && body.Where == nil && len(body.From) == 1 &&
+		body.From[0].Subquery != nil && body.From[0].On == nil && len(body.From[0].Using) == 0 {
+		// One loop over a subquery with no term on it: its full scan outputs
+		// the item's nRowLogEst, the subquery's own estimate (where.c:4142),
+		// on the seed path's MIN(nQueryLoop, 48) (where.c:5921, :6250).
+		sub := body.From[0].Subquery
+		est, ok := cSelectRowEst(sub, compile(sub), compile, seed, seedOK)
+		if !ok {
+			return 0, false
+		}
+		return min(n, min(seed, 48)+est), true
 	}
 	if prog == nil || !prog.planNRowOK {
 		return 0, false
@@ -471,10 +593,15 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 		body *SelectStmt
 		cte  *cteBinding
 		co   bool
+		// scope is the CTE whose body this one was found in, when it is a
+		// pass-through's inner item (cPassThroughItem).
+		scope *cteBinding
 	}
 	subs := map[int]subq{}
 	rerun := map[int]bool{}
 	flatKept := map[int]bool{}
+	passed := map[int]bool{}
+	copied := false
 	for i := range srcs {
 		body, cte, _, ok := p.cSubqueryBody(items[i])
 		if !ok {
@@ -489,6 +616,29 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 		flat, certain := p.cFlattens(stmt, items, i)
 		if !certain {
 			return decline("beside a subquery whose flattening is not followed")
+		}
+		var scope *cteBinding
+		passThrough := false
+		for flat && !volatile && !anyTail && pushFree[i] {
+			in, ok := cPassThroughItem(body)
+			if !ok {
+				break
+			}
+			// Flattened, a body that only names its one subquery's columns
+			// leaves that subquery in its place (flattenSubquery,
+			// select.c:4549-4590), which the FROM loop then looks at again.
+			if !copied {
+				items, copied = append([]FromItem(nil), items...), true
+			}
+			in.Join, in.On, in.Using, in.Natural, in.CrossKeyword = items[i].Join, items[i].On, items[i].Using, items[i].Natural, items[i].CrossKeyword
+			items[i] = in
+			if cte != nil {
+				scope = cte
+			}
+			body, cte, passThrough = in.Subquery, nil, true
+			if flat, certain = p.cFlattens(stmt, items, i); !certain {
+				return decline("beside a subquery whose flattening is not followed")
+			}
 		}
 		if flat {
 			// substExpr copies each result expression into every reference
@@ -513,7 +663,10 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 			// Materialized in C, whose window code then returns every row.
 			return decline("a window select C materializes, read up to an nth_value error")
 		}
-		subs[i] = subq{body: body, cte: cte, co: co}
+		subs[i] = subq{body: body, cte: cte, co: co, scope: scope}
+		if passThrough {
+			passed[i] = true
+		}
 		// An item 0 that a CROSS JOIN (or nothing) follows is the outer loop
 		// whatever it costs: run once, as here.
 		forcedOuter := i == 0 && (len(items) == 1 || items[1].CrossKeyword)
@@ -539,16 +692,15 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 	der := map[int]wherePlanDerivedItem{}
 	for i, sq := range subs {
 		var prog *Program
-		if srcs[i].derived != nil {
-			prog = srcs[i].derived
-		} else if sq.cte != nil {
-			prog = p.cteBodyProgram(c, items[i].Table, sq.cte)
+		scopeName, scope := items[i].Table, sq.cte
+		if sq.scope != nil {
+			scopeName, scope = stmt.From[i].Table, sq.scope
 		}
 		compile := func(s *SelectStmt) *Program {
 			var prog *Program
 			p.keepingCTEUses(func() {
-				if sq.cte != nil {
-					defer p.enterCTEBodyScope(items[i].Table, sq.cte)()
+				if scope != nil {
+					defer p.enterCTEBodyScope(scopeName, scope)()
 				}
 				sp, err := compileSubProgram(p, s, c.outer)
 				if err == nil {
@@ -556,6 +708,14 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 				}
 			})
 			return prog
+		}
+		switch {
+		case passed[i]:
+			prog = compile(sq.body)
+		case srcs[i].derived != nil:
+			prog = srcs[i].derived
+		case sq.cte != nil:
+			prog = p.cteBodyProgram(c, items[i].Table, sq.cte)
 		}
 		est, eok := cSelectRowEst(sq.body, prog, compile, c.nQueryLoop, c.outer == nil || c.nQueryLoopKnown)
 		if sq.cte != nil && !sq.co {
@@ -736,6 +896,15 @@ func cOrderByAllResultCols(parent *SelectStmt) tri {
 // column resolveOrderGroupBy matched it to. ok is false for a term whose match
 // is not followed.
 func cSubqueryOrderBy(parent *SelectStmt, items []FromItem, i int, body *SelectStmt, cte *cteBinding) ([]whereSubOB, bool) {
+	if body != nil && len(body.OrderBy) == 0 && len(body.Compound) != 0 && body.Compound[len(body.Compound)-1].Op != "UNION ALL" {
+		// The ORDER BY multiSelect invents for multiSelectByMerge stays on the
+		// compound (select.c:2997, :3462-3476): every result column, ascending.
+		out := make([]whereSubOB, len(body.Columns))
+		for k := range out {
+			out[k] = whereSubOB{col: k}
+		}
+		return out, true
+	}
 	if body == nil || len(body.OrderBy) == 0 {
 		return nil, true
 	}
