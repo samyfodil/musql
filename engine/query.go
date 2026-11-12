@@ -385,6 +385,10 @@ func (p *ReadOnlyPager) QueryArgs(sqlText string, args []Value) (cols []string, 
 		rows, err = prog.execOuter(p, nil, args)
 		return prog.ColNames, rows, err
 	}
+	if prog, params := p.shapedPlan(sqlText, args); prog != nil {
+		rows, err = prog.execOuter(p, nil, params)
+		return prog.ColNames, rows, err
+	}
 	p.runFold = false
 	trimmed := strings.TrimSpace(sqlText)
 	if toks, lerr := lex(trimmed); lerr == nil && isPragmaStmt(toks) {
@@ -410,6 +414,9 @@ func (p *ReadOnlyPager) QueryArgs(sqlText string, args []Value) (cols []string, 
 	// first run only -- see markMaybeReanalyze's doc comment for why that is
 	// safe).
 	p.writeSession.markMaybeReanalyze(stmt)
+	if cols, rows, ok, err := p.execShaped(stmt, sqlText, args); ok {
+		return cols, rows, err
+	}
 	return p.execSelect(stmt, nil, args, sqlText)
 }
 

@@ -26,6 +26,12 @@ type parser struct {
 	nestedGroupSeq int
 	params *paramTracker // this statement's bound-parameter numbering state; see paramTracker's doc comment
 
+	// shape, when set, turns the literals the outermost select's WHERE and ON
+	// compare with a column into hidden parameters (plan_shape.go); coreDepth
+	// is how many select cores are being parsed, the outermost being 1.
+	shape     *shapeRecorder
+	coreDepth int
+
 	// sawIfNotExists records that the DDL prefix just parsed carried an
 	// "IF NOT EXISTS" clause, so the caller can turn a name collision into a
 	// no-op instead of an error (see parseCreateTableNamePrefix).
@@ -737,6 +743,8 @@ func (p *parser) tryParseCompoundOp() (op CompoundOp, matched bool) {
 // SELECT b FROM t2 ORDER BY 1" parses ORDER BY as belonging to the whole
 // compound rather than being swallowed (or rejected) by the second arm.
 func (p *parser) parseSelectCore() (*SelectStmt, error) {
+	p.coreDepth++
+	defer func() { p.coreDepth-- }()
 	// "VALUES (expr, ...) [, (expr, ...) ...]" is SQLite's row-constructor-
 	// as-SELECT shorthand -- a distinct select-core alternative to SELECT,
 	// not a SELECT variant -- so it's checked here, before requiring the
@@ -792,7 +800,9 @@ func (p *parser) parseSelectCore() (*SelectStmt, error) {
 	}
 
 	if p.consumeKeyword("WHERE") {
+		done := p.shapeClause()
 		w, err := p.parseExpr()
+		done()
 		if err != nil {
 			return nil, err
 		}
@@ -1575,7 +1585,9 @@ func (p *parser) parseJoinConstraint(item *FromItem, kind JoinKind, natural bool
 		if natural {
 			return fmt.Errorf("engine: cannot use ON clause with NATURAL join")
 		}
+		done := p.shapeClause()
 		on, err := p.parseExpr()
+		done()
 		if err != nil {
 			return err
 		}
@@ -3438,10 +3450,12 @@ func rowOrBinary(op string, l, r Expr) Expr {
 // TIGHTER than everything parseComparison handles (= == != <> IS IN LIKE GLOB
 // MATCH REGEXP BETWEEN ISNULL NOTNULL) -- see relationalOps for the evidence.
 func (p *parser) parseRelational() (Expr, error) {
+	ls := p.pos
 	left, err := p.parseBitwise()
 	if err != nil {
 		return nil, err
 	}
+	lt := p.litTok(ls, left)
 	for {
 		t := p.peek()
 		if t.kind != tkPunct || !relationalOps[t.text] {
@@ -3449,19 +3463,24 @@ func (p *parser) parseRelational() (Expr, error) {
 		}
 		op := t.text
 		p.next()
+		rs := p.pos
 		r, err := p.parseBitwise()
 		if err != nil {
 			return nil, err
 		}
-		left = rowOrBinary(op, left, r)
+		left, lt = p.shapeCompare(op, left, lt, r, p.litTok(rs, r)), -1
 	}
 }
 
 func (p *parser) parseComparison() (Expr, error) {
+	ls := p.pos
 	left, err := p.parseRelational()
 	if err != nil {
 		return nil, err
 	}
+	// The token left was parsed from while it is one literal and nothing
+	// since has wrapped it.
+	lt := p.litTok(ls, left)
 	for {
 		t := p.peek()
 		switch {
@@ -3660,14 +3679,17 @@ func (p *parser) parseComparison() (Expr, error) {
 			// "0 LIKE 0 < 2" group as 0 LIKE (0 < 2).
 			op := t.text
 			p.next()
+			rs := p.pos
 			r, err := p.parseRelational()
 			if err != nil {
 				return nil, err
 			}
-			left = rowOrBinary(op, left, r)
+			left, lt = p.shapeCompare(op, left, lt, r, p.litTok(rs, r)), -1
+			continue
 		default:
 			return left, nil
 		}
+		lt = -1
 	}
 }
 

@@ -8,6 +8,11 @@ package engine
 // It parses and resolves but never executes the statement.
 func (p *ReadOnlyPager) ResultDeclTypes(sqlText string) (types []string, ok bool) {
 	prog := p.cachedPlan(sqlText)
+	if prog == nil {
+		// A shape's program answers for every statement of it: the result
+		// columns are not among the literals it reads.
+		prog, _ = p.shapedProgram(sqlText)
+	}
 	if prog != nil {
 		if prog.declTypes != nil {
 			return prog.declTypes, true
