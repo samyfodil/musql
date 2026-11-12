@@ -139,6 +139,9 @@ type vdbe struct {
 	aggRowidBuf []Value
 	// anchorPad is an anchor row widened to the plan's width (aggPlan.rowWidth).
 	anchorPad []Value
+	// anchorRowBuf is an anchor kept as its read columns, placed back at them
+	// (aggAccumulators.anchorRow).
+	anchorRowBuf []Value
 	// aggValsBuf is aggResult's finalized aggregate values, reused per call.
 	aggValsBuf []Value
 	// aggNullRow is the row a rowFree step (aggPlan.rowFree) hands on in place
