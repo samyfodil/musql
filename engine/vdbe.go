@@ -26,6 +26,10 @@ import (
 // used per run; registers, cursors, and sorters are not shared across
 // executions.
 type vdbe struct {
+	// intr is the run's interrupt flag (interruptFlag), read where a loop
+	// turns back.
+	intr *atomic.Bool
+
 	// jitErr is an error native code's return found taking a cursor back
 	// (syncIdxSeek), which the run returns.
 	jitErr error
@@ -726,6 +730,12 @@ func inSubMembership(xs []Value, rows [][]Value, affs []affinity, colls []string
 // The rowid is the last key column, so no two rows can tie; the sort is stable
 // anyway rather than relying on that.
 func autoIndexOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) {
+	autoIndexOrderCursorUntil(cur, key, enc, cur.pager.interruptFlag())
+}
+
+// autoIndexOrderCursorUntil is autoIndexOrderCursor stopping its sort when
+// intr is set, the rows then left in no order (sortStop).
+func autoIndexOrderCursorUntil(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding, intr *atomic.Bool) {
 	// Both orders below compare rows by COLUMN, so a row store's deferred
 	// fix-ups (vdbeCursor.lazyNorm) have to be applied first: a stored IPK slot
 	// is NULL where the key wants the rowid.
@@ -748,6 +758,7 @@ func autoIndexOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) 
 	for i := range perm {
 		perm[i] = i
 	}
+	stop := &sortStop{f: intr}
 	// An integer -- an INTEGER column's, and the rowid -- compares as one under
 	// any collating sequence: the leading key columns every row holds as an
 	// INTEGER are copied out flat once and compared as int64s, and only rows
@@ -758,7 +769,7 @@ func autoIndexOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) 
 		lead++
 	}
 	if lead == 0 {
-		autoIndexSortValues(perm, key, at, enc)
+		autoIndexSortValues(perm, key, at, enc, stop)
 	} else {
 		flat := make([]int64, 0, len(perm)*lead)
 		for i := range perm {
@@ -778,6 +789,9 @@ func autoIndexOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) 
 		// sort.SliceStable's in-place merges took most of a 100,000-row
 		// scan's time.
 		slices.SortFunc(perm, func(a, b int) int {
+			if stop.now() {
+				return 0
+			}
 			ka, kb := flat[a*lead:a*lead+lead], flat[b*lead:b*lead+lead]
 			for k := range ka {
 				if ka[k] != kb[k] {
@@ -873,7 +887,7 @@ func sweepOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) bool
 	for i := range perm {
 		perm[i] = i
 	}
-	autoIndexSortValues(perm, key, at, enc)
+	autoIndexSortValues(perm, key, at, enc, nil)
 	rows := make([][]Value, len(perm))
 	rowids := make([]uint64, len(perm))
 	var matched []bool
@@ -893,8 +907,11 @@ func sweepOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) bool
 // autoIndexSortValues is autoIndexOrderCursor's sort over keys that are not
 // all integers: each comparison fetches the values and compares them under
 // their columns' collating sequences.
-func autoIndexSortValues(perm []int, key *autoIndexKey, at func(i, k int) Value, enc TextEncoding) {
+func autoIndexSortValues(perm []int, key *autoIndexKey, at func(i, k int) Value, enc TextEncoding, stop *sortStop) {
 	slices.SortFunc(perm, func(a, b int) int {
+		if stop.now() {
+			return 0
+		}
 		for k := range key.cols {
 			c := compareValuesCollatedEnc(at(a, k), at(b, k), key.colls[k], enc)
 			if c != 0 {
@@ -1478,6 +1495,7 @@ func (m *vdbe) cursorMask(insns []Instruction, c int) columnMask {
 // empty and the WRITE opcodes report their outcome through m.wctx instead --
 // see vdbe_write.go).
 func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
+	m.intr = m.interruptFlag()
 	pc := 0
 	if m.yield {
 		pc = m.resumePC
@@ -1511,6 +1529,11 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 		}
 		switch op.Op {
 		case OpJIT:
+			// Native code returns at least every so many backward jumps
+			// (jit/vm.go's fuel), so this is where its loops are stopped.
+			if m.intr != nil && m.intr.Load() {
+				return nil, ErrInterrupted
+			}
 			if pc == jitSkip {
 				jitSkip = -1
 				if m.flushJIT() {
@@ -1657,6 +1680,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			continue
 
 		case OpGoto:
+			if op.P2 <= pc && m.intr != nil && m.intr.Load() {
+				return nil, ErrInterrupted
+			}
 			pc = op.P2
 			continue
 
@@ -1678,6 +1704,11 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 
 		case OpHalt:
+			// A loop a kernel cut short for the interrupt (vdbe.interrupted)
+			// is not the statement's answer.
+			if m.intr != nil && m.intr.Load() {
+				return nil, ErrInterrupted
+			}
 			m.done = true
 			return rows, nil
 
@@ -2191,7 +2222,12 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpSortedSeek:
 			cur := m.cursors[op.P1]
+			if cur != nil && cur.rowStore == nil && !cur.streamable && !cur.seekReseek && !cur.refillEach && cur.sub == nil && cur.vt == nil &&
+				(!cursorHasNoBtree(cur) || cur.fill != nil) && cur.segSortedSeek(op.P4.(*sortedSeekHint), m.regs[op.P2], m.encoding()) {
+				break
+			}
 			if cur != nil {
+				cur.unserveSegSorted()
 				if err := m.applyPendingOrder(cur); err != nil {
 					return nil, err
 				}
@@ -2199,9 +2235,6 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			if cur == nil || cur.rowStore != nil || cur.streamable || cur.seekReseek || cur.refillEach || cur.sub != nil || cur.vt != nil ||
 				cursorHasNoBtree(cur) && cur.fill == nil && !cur.materialized {
 				break // a cursor whose rows are not one list built once
-			}
-			if cur.segSortedSeek(op.P4.(*sortedSeekHint), m.regs[op.P2]) {
-				break
 			}
 			if !cur.materialized {
 				cur.params = m.params
@@ -2647,6 +2680,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 		case OpNext:
 			cur := m.cursors[op.P1]
 			if cur.advance() {
+				if m.intr != nil && m.intr.Load() {
+					return nil, ErrInterrupted
+				}
 				pc = op.P2
 				continue
 			}
@@ -2784,7 +2820,11 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			m.sorters[op.P1].insert(m.recRegs[op.P2])
 
 		case OpSorterSort:
-			if !m.sorters[op.P1].sort() {
+			nonEmpty := m.sorters[op.P1].sort(&sortStop{f: m.intr})
+			if m.intr != nil && m.intr.Load() {
+				return nil, ErrInterrupted
+			}
+			if !nonEmpty {
 				pc = op.P2
 				continue
 			}
@@ -2806,6 +2846,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpSorterNext:
 			if m.sorters[op.P1].next() {
+				if m.intr != nil && m.intr.Load() {
+					return nil, ErrInterrupted
+				}
 				pc = op.P2
 				continue
 			}
@@ -3238,6 +3281,15 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			if serr != nil {
 				return nil, serr
 			}
+			if op.P3 < 0 {
+				// Every row's one value, packed (compileSubqueryRows).
+				vals := make([]Value, len(rows))
+				for i, r := range rows {
+					vals[i] = r[0]
+				}
+				m.regs[op.P1] = Value{Typ: Blob, S: encodeRecord(vals)}
+				break
+			}
 			if sub.OrderUnproven && firstRowDependsOnOrder(rows) {
 				return nil, fmt.Errorf("%w: a scalar subquery's first row, over rows whose arrival order is not provably C SQLite's (see anchorPlanOrderProvable)", errVDBEUnsupported)
 			}
@@ -3580,6 +3632,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			return nil, fmt.Errorf("engine: vdbe: unknown opcode %d", op.Op)
 		}
 		pc++
+	}
+	if m.intr != nil && m.intr.Load() {
+		return nil, ErrInterrupted
 	}
 	m.done = true
 	return rows, nil
@@ -4067,7 +4122,10 @@ func (m *vdbe) orderCursor(cur *vdbeCursor, op *Instruction) error {
 	}
 	cur.idxListOnce = false
 	if !runOnceRows(cur) || len(cur.rows) == 0 {
-		autoIndexOrderCursor(cur, key, m.encoding())
+		autoIndexOrderCursorUntil(cur, key, m.encoding(), m.interruptFlag())
+		if m.interrupted() {
+			return ErrInterrupted
+		}
 		return nil
 	}
 	root := m.stmtRoot()
@@ -4077,7 +4135,10 @@ func (m *vdbe) orderCursor(cur *vdbeCursor, op *Instruction) error {
 		return nil
 	}
 	src := cur.rows
-	autoIndexOrderCursor(cur, key, m.encoding())
+	autoIndexOrderCursorUntil(cur, key, m.encoding(), m.interruptFlag())
+	if m.interrupted() {
+		return ErrInterrupted
+	}
 	if root.rowOrders == nil {
 		root.rowOrders = map[rowOrderKey]rowOrder{}
 	}

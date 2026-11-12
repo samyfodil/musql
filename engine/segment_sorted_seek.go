@@ -29,26 +29,53 @@ type segSortedRows struct {
 	one   *segment
 	perm  []int32
 	block []int64
+	// order is the automatic index key a run's rows follow, when the seek
+	// stands in for the OpAutoIndexOrder that would have built and sorted the
+	// table; ordered marks the runs already put in it, by first position.
+	order   *autoIndexKey
+	tbl     *resolvedTable
+	enc     TextEncoding
+	ordered map[int]bool
 }
 
 // segSortedSeek positions cur on the rows whose column h.col equals probe,
 // straight from the segments, as sortedSeek narrows built rows. false, with
 // nothing changed, where the segments are not the whole table or the column
-// is not a clean INTEGER block in every one of them.
-func (cur *vdbeCursor) segSortedSeek(h *sortedSeekHint, probe Value) bool {
+// is not an INTEGER block in every one of them.
+//
+// An OpAutoIndexOrder waiting on cur is taken over rather than applied: a run
+// of the built rows, once sorted by the key, is those rows in the key's order,
+// so each run is put in that order here, without building the table.
+func (cur *vdbeCursor) segSortedSeek(h *sortedSeekHint, probe Value, enc TextEncoding) bool {
 	if h.built || len(h.more) > 0 || cur.materialized || cur.fill != nil || cur.ranged || cur.seekConfigured || cur.idxSeekConfigured || cur.seekSetConfigured ||
 		cur.segSorted == nil && (cur.segSrc != nil || cur.keyListReady) {
 		return false
 	}
+	orderOp := cur.segOrder
+	if cur.pendingOrder != nil {
+		orderOp = cur.pendingOrder
+	}
+	var key *autoIndexKey
+	if orderOp != nil {
+		if key = orderOp.P4.(*autoIndexKey); !segRunOrderable(cur.tbl, key) {
+			return false
+		}
+	}
 	s := cur.segSorted
-	if s == nil || s.hint != h {
+	if s == nil || !s.hint.sameSort(h) || s.order != key {
 		s = cur.pager.segSortedRowsFor(cur, h)
+		if s.ok && key != nil && s.one != nil {
+			s.perm = slices.Clone(s.perm) // the segment's own, shared
+		}
+		s.order, s.tbl, s.enc = key, cur.tbl, enc
 		cur.segSorted = s
 	}
 	if !s.ok {
 		return false
 	}
+	cur.segOrder, cur.pendingOrder = orderOp, nil
 	lo, hi := s.find(probe)
+	s.orderRun(lo, hi)
 	src := &cur.pointSrc
 	segs, rows := src.listSegs[:0], src.listRows[:0]
 	if s.one != nil {
@@ -71,11 +98,94 @@ func (cur *vdbeCursor) segSortedSeek(h *sortedSeekHint, probe Value) bool {
 	return true
 }
 
+// unserveSegSorted takes back a cursor segSortedSeek positioned when the
+// segments stop serving its seeks: its rows are built, in the order the seek
+// took over.
+func (cur *vdbeCursor) unserveSegSorted() {
+	if cur.segSorted == nil || !cur.keyListReady {
+		return
+	}
+	cur.keyListReady, cur.segSrc, cur.segCur, cur.segSorted, cur.pos = false, nil, nil, nil, -1
+	if cur.segOrder != nil {
+		cur.pendingOrder, cur.segOrder = cur.segOrder, nil
+	}
+}
+
+// segRunOrderable reports whether segSortedRows.orderRun can put a run in
+// key's order: plain columns of the table, or the rowid.
+func segRunOrderable(tbl *resolvedTable, key *autoIndexKey) bool {
+	if key.multiOr != nil || key.exprs != nil || len(key.cols) == 0 || len(key.colls) < len(key.cols) {
+		return false
+	}
+	for _, c := range key.cols {
+		if c != -1 && (c < 0 || c >= len(tbl.cols)) {
+			return false
+		}
+	}
+	return true
+}
+
+// orderRun puts the run [lo, hi) in s.order's order, as autoIndexOrderCursor
+// orders the built rows: the key's values as the built rows hold them, ties
+// in the run's own order, which is the rowids'.
+func (s *segSortedRows) orderRun(lo, hi int) {
+	if s.order == nil || hi-lo < 2 || s.ordered[lo] {
+		return
+	}
+	key, n := s.order, hi-lo
+	nk := len(key.cols)
+	vals := make([]Value, n*nk)
+	for i := range n {
+		sg, r := s.at(lo + i)
+		for k, c := range key.cols {
+			var v Value
+			switch {
+			case c < 0 || c == s.tbl.ipkIndex:
+				v = Value{Typ: Int, I: int64(sg.Rowid(r))}
+			default:
+				if v = sg.Value(c, r); v.Typ == Int && s.tbl.cols[c].Aff == affReal {
+					v = Value{Typ: Float, F: float64(v.I)}
+				}
+			}
+			vals[i*nk+k] = v
+		}
+	}
+	perm := make([]int, n)
+	for i := range perm {
+		perm[i] = i
+	}
+	autoIndexSortValues(perm, key, func(i, k int) Value { return vals[i*nk+k] }, s.enc, nil)
+	if s.one != nil {
+		run := slices.Clone(s.perm[lo:hi])
+		for i, j := range perm {
+			s.perm[lo+i] = run[j]
+		}
+	} else {
+		segs, rows := slices.Clone(s.segs[lo:hi]), slices.Clone(s.rows[lo:hi])
+		for i, j := range perm {
+			s.segs[lo+i], s.rows[lo+i] = segs[j], rows[j]
+		}
+	}
+	if s.ordered == nil {
+		s.ordered = map[int]bool{}
+	}
+	s.ordered[lo] = true
+}
+
+// at is the segment and row at position i of the column's order.
+func (s *segSortedRows) at(i int) (*segment, int) {
+	if s.one != nil {
+		return s.one, int(s.perm[i])
+	}
+	return s.segs[i], s.rows[i]
+}
+
 // segSortedRowsFor builds cur's segSortedRows for h: the committed segments,
 // with nothing in the log or the session's store over them, ascending by
 // rowid, each as wide as the table and holding h.col as an int64 block with no
-// NULL and no exception. A REAL column's values are read as REALs, and the
-// INTEGER PRIMARY KEY's are the rowids; both are left to the built rows.
+// exception. A NULL equals no probe, so its rows are left out. A REAL column's
+// values are read as REALs, and the INTEGER PRIMARY KEY's are the rowids; both
+// are left to the built rows.
 func (p *ReadOnlyPager) segSortedRowsFor(cur *vdbeCursor, h *sortedSeekHint) *segSortedRows {
 	s := &segSortedRows{hint: h}
 	if !p.segSeekable(cur) || h.col < 0 || h.col >= len(cur.tbl.cols) || h.col == cur.tbl.ipkIndex || cur.tbl.cols[h.col].Aff == affReal {
@@ -105,12 +215,10 @@ func (p *ReadOnlyPager) segSortedRowsFor(cur *vdbeCursor, h *sortedSeekHint) *se
 	if nonEmpty == 1 {
 		// sortedOn's stable sort keeps a segment's rows, which are in rowid
 		// order, in that order among equal keys.
-		blocks, perm, ok := one.sortedOn([]int{h.col})
-		if !ok {
+		if blocks, perm, ok := one.sortedOn([]int{h.col}); ok {
+			s.one, s.perm, s.block, s.ok = one, perm, blocks[0], true
 			return s
 		}
-		s.one, s.perm, s.block, s.ok = one, perm, blocks[0], true
-		return s
 	}
 	keys, ksegs, krows := make([]int64, 0, n), make([]*segment, 0, n), make([]int, 0, n)
 	var prevRid uint64
@@ -121,12 +229,15 @@ func (p *ReadOnlyPager) segSortedRowsFor(cur *vdbeCursor, h *sortedSeekHint) *se
 		if len(keys) > 0 && sg.Rowid(0) <= prevRid {
 			return s
 		}
-		b, ok := segCleanInt64Column(sg, h.col)
-		if !ok || len(b) < sg.nRows {
+		b, ok := sg.Int64Column(h.col)
+		if !ok || len(b) < sg.nRows || sg.hasException(h.col) {
 			return s
 		}
+		nulls := sg.cols[h.col].nullOff != 0
 		for i := range sg.nRows {
-			keys, ksegs, krows = append(keys, b[i]), append(ksegs, sg), append(krows, i)
+			if !nulls || !sg.isNull(h.col, i) {
+				keys, ksegs, krows = append(keys, b[i]), append(ksegs, sg), append(krows, i)
+			}
 		}
 		prevRid = sg.Rowid(sg.nRows - 1)
 	}

@@ -89,6 +89,7 @@ func (s *Stmt) queryImpl(args []driver.Value) (driver.Rows, error) {
 // A QUERY Exec'd runs and discards rows; RowsAffected is 0.
 // A RETURNING statement's RowsAffected is the preceding statement's change count.
 func (s *Stmt) execContextImpl(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	defer s.conn.watchContext(ctx)()
 	if s.script != nil {
 		return s.execScript(ctx)
 	}
@@ -146,6 +147,7 @@ func (s *Stmt) execContextImpl(ctx context.Context, args []driver.NamedValue) (d
 
 // QueryContext implements driver.StmtQueryContext.
 func (s *Stmt) queryContextImpl(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	defer s.conn.watchContext(ctx)()
 	if s.script != nil {
 		// A script must be Exec'd; Query can only return one result set.
 		return nil, fmt.Errorf("driver: a multi-statement script must be run with Exec, not Query: %s", s.sqlText)

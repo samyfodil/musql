@@ -35,6 +35,7 @@ func (c *Conn) session() (*engine.Session, error) {
 	if obj, detail := nw.SchemaCorrupt(); obj != "" {
 		c.schemaCorruptObj, c.schemaCorruptDetail = obj, detail
 	}
+	nw.SetInterrupt(&c.interrupt)
 	c.ndb = nw
 	return nw, nil
 }

@@ -4,11 +4,15 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"sync/atomic"
 )
 
 // ReadOnlyPager is a read handle on one database: the segment file and its
 // delta (segs), and what every query runs against.
 type ReadOnlyPager struct {
+	// interrupt stops the statements run on this pager (SetInterrupt).
+	interrupt *atomic.Bool
+
 	closer io.Closer
 	meta   pagerMeta
 

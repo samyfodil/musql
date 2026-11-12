@@ -24,6 +24,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 // DB is one connection's engine state over a database on our format: its
@@ -31,6 +32,10 @@ import (
 // A Session embeds it and owns its commit (segment_write.go).
 type DB struct {
 	path string
+
+	// interrupt, when set, stops this session's statements at their next
+	// loop (SetInterrupt).
+	interrupt *atomic.Bool
 
 	// argsOwned is set for an ExecArgsOwned call: the bound arguments' bytes
 	// are the engine's, so a row may keep them without a copy.

@@ -179,7 +179,7 @@ func (s *vdbeSorter) siftDown(i int) {
 // It reports whether the sorter has any entries at all -- mirroring
 // OpRewind's "jump if empty" convention: false with zero entries (nothing to
 // drain), true otherwise, with the first sorted entry now current (pos==0).
-func (s *vdbeSorter) sort() bool {
+func (s *vdbeSorter) sort(stop *sortStop) bool {
 	// entryBefore is a strict TOTAL order (key comparator, then insertion seq),
 	// so an ordinary sort.Slice reproduces the stable order exactly -- and, on the
 	// bounded path where insert's max-heap has scrambled insertion order, the
@@ -192,6 +192,9 @@ func (s *vdbeSorter) sort() bool {
 		// orderTermLess, which was most of a GROUP BY's sort.
 		desc := s.keyInfo.desc
 		slices.SortFunc(s.entries, func(a, b sorterEntry) int {
+			if stop.now() {
+				return 0
+			}
 			for k := range a.key {
 				if c := cmp.Compare(a.key[k].I, b.key[k].I); c != 0 {
 					if desc[k] {
@@ -204,7 +207,7 @@ func (s *vdbeSorter) sort() bool {
 		})
 	} else {
 		sort.Slice(s.entries, func(i, j int) bool {
-			return s.entryBefore(s.entries[i], s.entries[j])
+			return !stop.now() && s.entryBefore(s.entries[i], s.entries[j])
 		})
 	}
 	s.pos = 0

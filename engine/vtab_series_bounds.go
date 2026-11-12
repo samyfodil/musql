@@ -109,6 +109,9 @@ type seriesScope struct {
 	// column's, and its collation, when the subquery reads nothing of this
 	// statement and the collation is a built-in one.
 	sub func(*SelectStmt) (affinity, bool, string, bool)
+	// rows are the IN subqueries that read an enclosing query's row: their
+	// values are computed for each run of this statement (vtabInRowsFn).
+	rows map[*SelectStmt]bool
 }
 
 func (s seriesScope) column(e Expr) (int, bool) {
@@ -400,6 +403,9 @@ func (t seriesTerm) loopCall(s seriesScope) Expr {
 			// Its one row's one value, read like a list's.
 			return vtabInLoopCall(col, aff, coll, []Expr{t.sub.Columns[0].Expr}, nil)
 		}
+		if s.rows[t.sub] {
+			return vtabInLoopCall(col, aff, coll, []Expr{FuncExpr{Name: vtabInRowsFn, Args: []Expr{SubqueryExpr{Stmt: t.sub}}}}, nil)
+		}
 	}
 	return vtabInLoopCall(col, aff, coll, t.list, t.sub)
 }
@@ -455,7 +461,7 @@ type seriesPlan struct {
 }
 
 // seriesItemPlan is the plan for it, or false when it changes nothing.
-func seriesItemPlan(it *FromItem, conj []Expr, rowid bool, known func(Expr) bool, sub func(*SelectStmt) (affinity, bool, string, bool)) (seriesPlan, bool, error) {
+func seriesItemPlan(it *FromItem, conj []Expr, rowid bool, known func(Expr) bool, sub func(*SelectStmt) (affinity, bool, string, bool), rows map[*SelectStmt]bool) (seriesPlan, bool, error) {
 	vcols, _, err := seriesModule{}.Connect(nil)
 	if err != nil {
 		return seriesPlan{}, false, nil
@@ -468,7 +474,7 @@ func seriesItemPlan(it *FromItem, conj []Expr, rowid bool, known func(Expr) bool
 	if name == "" {
 		name = it.Table
 	}
-	s := seriesScope{cols: cols, name: name, rowid: rowid, known: known, sub: sub}
+	s := seriesScope{cols: cols, name: name, rowid: rowid, known: known, sub: sub, rows: rows}
 	terms, ok := s.terms(conj, len(it.TableFuncArgs))
 	if !ok {
 		return seriesPlan{}, false, nil
@@ -564,15 +570,27 @@ func seriesBoundConjuncts(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs 
 	known := func(e Expr) bool {
 		return exprRefsOnly(e, func(c ColumnExpr) bool { return c.Qualifier != "" && !own[r33sFoldIdent(c.Qualifier)] })
 	}
+	rows := map[*SelectStmt]bool{}
 	sub := func(s *SelectStmt) (affinity, bool, string, bool) {
 		// One that compiles with no enclosing scope reads nothing outside it.
-		// One that reads an enclosing query's row is a value fixed for each
-		// run of this statement, as C's IN loop takes it, when it is no more
-		// than that value (seriesOuterValue).
+		// One that reads an enclosing query's row, and nothing of this
+		// statement's, gives values fixed for each run of this statement, as
+		// C's IN loop takes them: the one value, when it is no more than that
+		// (seriesOuterValue), or else its rows, run for each.
 		var outer *evalCtx
 		if _, err := compileSubProgram(p, s, nil); err != nil {
-			if c == nil || !seriesOuterValue(s, known) {
+			if c == nil {
 				return affNone, false, "", false
+			}
+			if !seriesOuterValue(s, known) {
+				var cerr error = err
+				if c.outer != nil {
+					p.keepingCTEUses(func() { _, cerr = compileSubProgram(p, s, c.outer) })
+				}
+				if cerr != nil {
+					return affNone, false, "", false
+				}
+				rows[s] = true
 			}
 			outer = c.enclosingAffCtx()
 		}
@@ -619,7 +637,7 @@ func seriesBoundConjuncts(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs 
 		if _, isSeries := mod.(seriesModule); !isSeries {
 			continue
 		}
-		pl, ok, err := seriesItemPlan(it, conj, len(stmt.From) == 1, known, sub)
+		pl, ok, err := seriesItemPlan(it, conj, len(stmt.From) == 1, known, sub, rows)
 		if err != nil {
 			return nil, err
 		}

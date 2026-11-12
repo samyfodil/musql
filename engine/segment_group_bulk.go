@@ -216,6 +216,9 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 	bs := make([]blocks, len(segs))
 	lo, hi := int64(math.MaxInt64), int64(math.MinInt64)
 	for si, s := range segs {
+		if m.interrupted() {
+			return bulkNotEligible
+		}
 		want := append([]int{plan.keyCols[0]}, plan.argCols...)
 		if plan.keyProg != nil {
 			want = plan.argCols
