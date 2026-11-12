@@ -566,6 +566,9 @@ func (sy *Syncer) installImage(ctx context.Context, im Imager, peer PeerID) erro
 		}
 		pending = false
 	}
+	// What is left of the staged copy, its lock file, goes before the
+	// install is counted: the deferred removal runs only after the return.
+	engine.RemoveDatabaseFiles(staged)
 	// The database is the image now, and the store must follow it even if ctx
 	// ends: a store left as it was would go on as if the database were empty.
 	ctx = context.WithoutCancel(ctx)
