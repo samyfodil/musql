@@ -39,7 +39,20 @@ func cachedPlanOf(s *Session, q string) *Program {
 	if s.DB.plans == nil {
 		return nil
 	}
-	return s.DB.plans.m[q]
+	if p := s.DB.plans.m[q]; p != nil {
+		return p
+	}
+	// A statement with literals its shape reads is kept under the shape.
+	toks, err := lex(q)
+	if err != nil {
+		return nil
+	}
+	lits := literalTokens(toks)
+	idx := s.DB.plans.m[shapeIndexKey(shapeKey(q, lits, ""))]
+	if idx == nil || idx.shape == nil {
+		return nil
+	}
+	return s.DB.plans.m[shapeKey(q, lits, idx.shape.pattern)]
 }
 
 // cachedPlans runs each query once and returns the plans the cache then
