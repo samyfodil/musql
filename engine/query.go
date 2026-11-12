@@ -1152,7 +1152,7 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 	// subqueries) sees them; see ReadOnlyPager.cteScopes. Done before the VDBE
 	// dispatch so resolveJoinSources can consult it.
 	if len(stmt.CTEs) > 0 {
-		pop := p.pushCTEScope(stmt.CTEs)
+		pop := p.pushCTEScopeOf(stmt)
 		defer pop()
 	}
 
