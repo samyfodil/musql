@@ -70,10 +70,12 @@ func (a *app) runShell(ctx context.Context, db *sql.DB, script []string, banner 
 	}
 	defer term.Restore(a.env.StdinFd, old)
 	defer consoleVT(a.env.StdoutFd)()
+	keys := newKeyPump(a.env.Stdin)
+	sh.Interrupts = keys.watch
 	t := term.NewTerminal(struct {
 		io.Reader
 		io.Writer
-	}{&keyReader{r: a.env.Stdin}, a.env.Stdout}, "")
+	}{&keyReader{r: keys}, a.env.Stdout}, "")
 	t.History = loadHistory(filepath.Join(a.env.Dir, "history"))
 	sh.Out = t
 	fmt.Fprintf(t, "%s End statements with ;  .help for commands.\n", banner)
@@ -126,6 +128,9 @@ type Shell struct {
 	Timer  bool   // print each statement's run time
 	reads  int    // .read files open, one inside another
 	failed int    // statements and dot-commands that reported an error
+	// Interrupts, when set, makes a Ctrl+C call cancel while a statement
+	// runs, until the func it returns is called.
+	Interrupts func(cancel context.CancelFunc) (stop func())
 }
 
 const (
@@ -147,6 +152,10 @@ func (s *Shell) run(ctx context.Context, in LineReader, errw io.Writer, finish b
 	var buf strings.Builder
 	in.SetPrompt(prompt)
 	for {
+		// Interrupted as a whole (Ctrl+C on piped input): the rest is not run.
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		line, err := in.ReadLine()
 		if errors.Is(err, io.EOF) {
 			if finish && strings.TrimSpace(buf.String()) != "" {
@@ -219,6 +228,12 @@ func (s *Shell) Script(ctx context.Context, text string) error {
 
 // Exec runs one statement and prints its rows, if it has any.
 func (s *Shell) Exec(ctx context.Context, stmt string, args ...any) error {
+	if s.Interrupts != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+		defer s.Interrupts(cancel)()
+	}
 	if s.Timer {
 		defer func(start time.Time) {
 			fmt.Fprintf(s.Out, "Run Time: real %.3f\n", time.Since(start).Seconds())
