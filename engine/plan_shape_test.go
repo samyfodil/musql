@@ -70,6 +70,10 @@ func TestPlanShapeSharesPrograms(t *testing.T) {
 		`SELECT a FROM t WHERE b = 0 ORDER BY a`,
 		`SELECT a FROM t WHERE b > -3 AND a < 9 ORDER BY a`,
 		`SELECT a FROM t WHERE b > -1 AND a < 9 ORDER BY a`,
+		`SELECT group_concat(c) FROM t WHERE b = 3 OR b = 5`,
+		`SELECT group_concat(c) FROM t WHERE b = 2 OR b = 6`,
+		`SELECT group_concat(c) FROM t WHERE (b = 2 OR a = 9) AND a > 4`,
+		`SELECT group_concat(c) FROM t WHERE (b = 4 OR a = 7) AND a > 3`,
 		`SELECT a FROM t WHERE b = 3 LIMIT 2`,
 		`SELECT a FROM t WHERE b = 4 LIMIT 3`,
 	}

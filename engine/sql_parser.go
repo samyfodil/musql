@@ -2308,11 +2308,17 @@ func (p *parser) parseTableRef() (FromItem, error) {
 func (p *parser) parseExpr() (Expr, error) { return p.parseOr() }
 
 func (p *parser) parseOr() (Expr, error) {
+	made := p.shape.made()
 	l, err := p.parseAnd()
 	if err != nil {
 		return nil, err
 	}
 	chain := 0
+	defer func() {
+		if chain > 0 && p.shape.made() > made {
+			p.shape.underOr = true
+		}
+	}()
 	for p.consumeKeyword("OR") {
 		if chain++; chain >= maxExprDepth {
 			return nil, errExprTreeTooLarge

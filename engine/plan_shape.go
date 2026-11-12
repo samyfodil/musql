@@ -28,6 +28,20 @@ type shapeRecorder struct {
 	toks   []int   // the token each hidden parameter was, in parameter order
 	vals   []Value // and its value
 	active int     // inside the outermost select's WHERE or ON
+	// underOr is set when a hidden parameter is inside an OR: the OR's
+	// analysis (wherePlanOrToIn, the MULTI_OR order) works from literal
+	// operands, and declines where a parameter stands, so such a statement
+	// is not shaped.
+	underOr bool
+}
+
+// made is how many hidden parameters the parser has made; 0 when it makes
+// none.
+func (s *shapeRecorder) made() int {
+	if s == nil {
+		return 0
+	}
+	return len(s.toks)
 }
 
 // planShape is what a program compiled for a shape needs to run another
@@ -130,7 +144,7 @@ func parseSelectShape(sql string) (*SelectStmt, *shapeRecorder, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(p.shape.toks) == 0 {
+	if len(p.shape.toks) == 0 || p.shape.underOr {
 		return stmt, nil, nil
 	}
 	return stmt, p.shape, nil
