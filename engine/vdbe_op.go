@@ -1220,6 +1220,10 @@ type Instruction struct {
 // register-file size it needs and the number of result columns each
 // OpResultRow emits.
 type Program struct {
+	// shape, on a program compiled for a statement's shape, says how another
+	// statement of it binds its literals (plan_shape.go).
+	shape *planShape
+
 	// declTypes memoises ResultDeclTypes for the text this program is cached
 	// under, which the plan cache already drops on every change that could move
 	// a declared type.
