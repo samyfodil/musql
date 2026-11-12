@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 )
 
 // joinedTable is one resolved+materialized FROM item: its scope name (alias,
@@ -2474,6 +2475,7 @@ func planJoinPushdownSub(where Expr, jts []joinedTable, scopes []tableScope, sub
 	}
 
 	plan := joinPlan{execOrder: execOrder, buckets: make([][]Expr, len(jts)), autoIdxKeys: autoIdxKeys}
+	plan.bucketImpliedByOrs(conjuncts, jts, scopes, pos, firstLeftIdx)
 	for _, cj := range conjuncts {
 		if hoist, outer := constWhereTerm(cj, scopes, false); hoist {
 			if outer {
@@ -2559,4 +2561,63 @@ func itemHasNoIndexChain(p *ReadOnlyPager, it FromItem) bool {
 	}
 	_, isCTE := p.lookupCTE(it.Table)
 	return isCTE
+}
+
+// bucketImpliedByOrs tests, where their tables are bound, the conjuncts every
+// disjunct of an OR among conjuncts carries ("(A AND B) OR (A AND C)" carries
+// A): a row the OR passes passes each, so a row one rejects is one the OR
+// rejects too, and the OR, still tested where it stands, decides. Only a
+// term that cannot raise an error is tested early, since it now meets rows
+// the OR never sees: comparisons of columns, literals and parameters.
+func (plan *joinPlan) bucketImpliedByOrs(conjuncts []Expr, jts []joinedTable, scopes []tableScope, pos []int, firstLeftIdx int) {
+	for _, cj := range conjuncts {
+		if be, ok := cj.(BinaryExpr); !ok || be.Op != "OR" {
+			continue
+		}
+		for _, c := range orCommonConjuncts([]Expr{cj})[1:] {
+			if !pruneSafe(c) {
+				continue
+			}
+			refs := map[int]bool{}
+			collectTableRefs(c, scopes, refs)
+			lvl, ok := -1, len(refs) > 0
+			for idx := range refs {
+				if idx < 0 || idx >= len(jts) {
+					ok = false
+					break
+				}
+				lvl = max(lvl, pos[idx])
+			}
+			// Not at a LEFT JOIN's own level, whose rows ON alone decides.
+			if !ok || jts[plan.execOrder[lvl]].left || jts[plan.execOrder[lvl]].rightOuter {
+				continue
+			}
+			plan.buckets[lvl] = append(plan.buckets[lvl], c)
+		}
+	}
+}
+
+// pruneSafe reports whether e is built only of columns, literals, parameters
+// and comparisons, which raise no error and call no function.
+func pruneSafe(e Expr) bool {
+	switch x := e.(type) {
+	case ColumnExpr:
+		return !x.UsingRepr && !x.UsingPinned
+	case LiteralExpr, ParamExpr:
+		return true
+	case CollateExpr:
+		return pruneSafe(x.X)
+	case IsNullExpr:
+		return pruneSafe(x.X)
+	case BetweenExpr:
+		return pruneSafe(x.X) && pruneSafe(x.Lo) && pruneSafe(x.Hi)
+	case InExpr:
+		return x.Sub == nil && pruneSafe(x.X) && !slices.ContainsFunc(x.List, func(e Expr) bool { return !pruneSafe(e) })
+	case BinaryExpr:
+		switch strings.ToUpper(x.Op) {
+		case "=", "==", "<", "<=", ">", ">=", "<>", "!=", "IS", "IS NOT", "AND":
+			return pruneSafe(x.L) && pruneSafe(x.R)
+		}
+	}
+	return false
 }
