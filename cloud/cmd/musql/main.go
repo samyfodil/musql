@@ -18,11 +18,16 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 
 	"golang.org/x/term"
 
 	"github.com/samyfodil/musql/cloud/cli"
 )
+
+// version is the release's tag, which the release build sets
+// (-ldflags "-X main.version=...").
+var version string
 
 func main() {
 	dir := os.Getenv("MUSQL_CONFIG_DIR")
@@ -49,12 +54,41 @@ func main() {
 		StdinFd:          fd,
 		StdoutFd:         int(os.Stdout.Fd()),
 		OpenBrowser:      openBrowser,
+		Version:          buildVersion(),
 	}, os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "musql:", err)
 		stop()
 		os.Exit(1)
 	}
+}
+
+// buildVersion is version, or for a build without it, the module version go
+// install recorded, or else "devel" and the commit it was built from.
+func buildVersion() string {
+	if version != "" {
+		return version
+	}
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "devel"
+	}
+	if v := bi.Main.Version; v != "" && v != "(devel)" {
+		return v
+	}
+	v, dirty := "devel", false
+	for _, s := range bi.Settings {
+		switch {
+		case s.Key == "vcs.revision" && len(s.Value) >= 12:
+			v += " " + s.Value[:12]
+		case s.Key == "vcs.modified":
+			dirty = s.Value == "true"
+		}
+	}
+	if dirty {
+		v += "-dirty"
+	}
+	return v
 }
 
 func openBrowser(url string) error {
