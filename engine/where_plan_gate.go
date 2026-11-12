@@ -2343,7 +2343,7 @@ func wherePlanColUsed(p *ReadOnlyPager, c *compiler, jts []joinedTable, scopes [
 		}
 	}
 	if !crossDB {
-		cteDefs := r36dWithCTEDefs(nil, stmt.CTEs)
+		cteDefs := r36dWithCTEDefs(p.r36dScopeCTEDefs(), stmt.CTEs)
 		sub = func(inner *SelectStmt) bool {
 			if !r36dSubColUsed(p, inner, nil, cteDefs, 0, mark) {
 				ok = false
