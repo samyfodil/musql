@@ -1272,7 +1272,12 @@ func (cur *vdbeCursor) rewind() error {
 		// KEY, stored NULL, needs one on every row.
 		plain := shared && !cur.hasGeneratedCols()
 		var slab []Value
+		interrupted := false
 		for rowid, vals := range seq {
+			if len(cur.rowids)&0xffff == 0xffff && cur.pager.interrupted() {
+				interrupted = true
+				break
+			}
 			// The rowid range bounds this scan as it does the segment one, the
 			// rows of the log included. Rowids ascend, so the upper bound ends it.
 			if cur.ranged && int64(rowid) > cur.rowidHi {
@@ -1294,6 +1299,9 @@ func (cur *vdbeCursor) rewind() error {
 				continue
 			}
 			cur.rows = append(cur.rows, cur.normalizeFrom(shared, rowid, vals))
+		}
+		if interrupted {
+			return ErrInterrupted
 		}
 		if err := errFn(); err != nil {
 			return err

@@ -302,6 +302,9 @@ func (m *vdbe) segRunSeriesOne(tbl *resolvedTable, rows seriesRows, low *segLowe
 	}
 	results := make([]segRunResult, 0, rows.n/seriesBlockRows+1)
 	for r0 = 0; r0 < rows.n; {
+		if m.interrupted() {
+			return Value{}, false
+		}
 		n := min(rows.n-r0, seriesBlockRows)
 		for i, c := range low.cols {
 			if c%seriesCols == seriesColValue && !low.nullCol[i] {

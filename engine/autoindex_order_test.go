@@ -30,7 +30,7 @@ func TestAutoIndexOrderIntKeysAsValues(t *testing.T) {
 		for i := range perm {
 			perm[i] = i
 		}
-		autoIndexSortValues(perm, key, at, UTF8)
+		autoIndexSortValues(perm, key, at, UTF8, nil)
 		var want []uint64
 		var wantRows [][]Value
 		for _, p := range perm {
