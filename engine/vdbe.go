@@ -3240,6 +3240,15 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			if serr != nil {
 				return nil, serr
 			}
+			if op.P3 < 0 {
+				// Every row's one value, packed (compileSubqueryRows).
+				vals := make([]Value, len(rows))
+				for i, r := range rows {
+					vals[i] = r[0]
+				}
+				m.regs[op.P1] = Value{Typ: Blob, S: encodeRecord(vals)}
+				break
+			}
 			if sub.OrderUnproven && firstRowDependsOnOrder(rows) {
 				return nil, fmt.Errorf("%w: a scalar subquery's first row, over rows whose arrival order is not provably C SQLite's (see anchorPlanOrderProvable)", errVDBEUnsupported)
 			}

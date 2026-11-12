@@ -18,6 +18,12 @@ import (
 // list, or one SubqueryExpr for an uncorrelated IN (SELECT ...).
 const vtabInLoopFn = "\x00vtab_in_loop"
 
+// vtabInRowsFn wraps an IN's subquery that reads an enclosing query's row: the
+// list's one value is then every row the subquery gives for that row, computed
+// where it is current (enclosingRowTerms) and packed into one record
+// (compileSubqueryRows).
+const vtabInRowsFn = "\x00vtab_in_rows"
+
 // vtabInLoop is a consumed IN: argv[arg] takes each of vals in turn.
 type vtabInLoop struct {
 	arg  int
@@ -58,9 +64,23 @@ func (p *ReadOnlyPager) vtabInLoopValues(f FuncExpr, params []Value, outer *eval
 		for k, e := range f.Args[3:] {
 			for _, cv := range corr {
 				if cv.arg == 0 && cv.conj == conj && cv.elem == k+1 {
-					vals = append(vals, cv.v)
+					if f, rows := e.(FuncExpr); rows && f.Name == vtabInRowsFn {
+						if cv.v.Typ != Blob {
+							return 0, nil, fmt.Errorf("vdbe: an IN subquery's rows are not a record")
+						}
+						got, err := decodeRecord(cv.v.S)
+						if err != nil {
+							return 0, nil, err
+						}
+						vals = append(vals, got...)
+					} else {
+						vals = append(vals, cv.v)
+					}
 					continue values
 				}
+			}
+			if f, rows := e.(FuncExpr); rows && f.Name == vtabInRowsFn {
+				return 0, nil, fmt.Errorf("%w: an IN subquery that reads an enclosing query, away from the outermost loop", errVDBEUnsupported)
 			}
 			v, err := p.foldVtabInputValue(e, params, outer, trig, from)
 			if err != nil {

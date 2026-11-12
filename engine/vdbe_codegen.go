@@ -1422,6 +1422,26 @@ func (c *compiler) compileScalarSubquery(x SubqueryExpr) (int, error) {
 	return d, nil
 }
 
+// compileSubqueryRows compiles a one-column subquery whose every row is
+// wanted: an OpSubquery with P3 -1, which packs the column's values into one
+// record in a fresh register (vtabInRowsFn).
+func (c *compiler) compileSubqueryRows(x SubqueryExpr) (int, error) {
+	prog, err := c.liveSubSelect(x.Stmt)
+	if err != nil {
+		return 0, err
+	}
+	if prog.NResultCol != 1 {
+		return 0, semanticf("engine: sub-select returns %d columns - expected 1", prog.NResultCol)
+	}
+	d := c.alloc()
+	if prog.Correlated {
+		c.emit(Instruction{Op: OpSubquery, P1: d, P3: -1, P4: prog, P5: p5Correlated})
+	} else {
+		c.emit(Instruction{Op: OpSubquery, P1: d, P2: c.allocSub(), P3: -1, P4: prog})
+	}
+	return d, nil
+}
+
 // compileExistsSubquery compiles "[NOT] EXISTS (SELECT ...)": its SelectStmt
 // into a standalone sub-Program (any column count is fine -- EXISTS ignores
 // the rows' values), then an OpExists producing 1/0 (NOT inverting) into a
@@ -1606,6 +1626,11 @@ func (c *compiler) compileExpr(e Expr) (int, error) {
 		return dst, nil
 
 	case FuncExpr:
+		if x.Name == vtabInRowsFn && len(x.Args) == 1 {
+			if sq, ok := x.Args[0].(SubqueryExpr); ok {
+				return c.compileSubqueryRows(sq)
+			}
+		}
 		return c.compileFunc(x)
 
 	case ColumnExpr:
