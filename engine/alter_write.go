@@ -3779,6 +3779,11 @@ func parseAddColumnDef(p *parser) (*addColumnDef, error) {
 	if nameTok.kind != tkIdent {
 		return nil, fmt.Errorf("engine: ALTER TABLE ADD COLUMN: expected column name, got %q", p.tokenDesc(nameTok))
 	}
+	if !nameTok.quoted && nonIdentifierKeywords[strings.ToUpper(nameTok.text)] {
+		// "ADD PRIMARY KEY (x)" is no column: the name is an nm, which no
+		// such keyword falls back to (parse.y), so C stops at it.
+		return nil, fmt.Errorf("engine: near %q: syntax error", p.tokenDesc(nameTok))
+	}
 	p.next()
 	def := &addColumnDef{name: nameTok.text, rawStart: nameTok.Start}
 
