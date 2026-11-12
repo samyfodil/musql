@@ -2338,7 +2338,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 					}
 					corr := make([]vtabCorrValue, len(ds.vtabCorr))
 					for i, t := range ds.vtabCorr {
-						corr[i] = vtabCorrValue{conj: t.conj, arg: t.arg, col: t.col, op: t.op, v: m.regs[t.reg]}
+						corr[i] = vtabCorrValue{conj: t.conj, arg: t.arg, elem: t.elem, col: t.col, op: t.op, v: m.regs[t.reg]}
 					}
 					if ds.vtabStream {
 						vt, params, outer := *ds.vtab, m.params, m.outer

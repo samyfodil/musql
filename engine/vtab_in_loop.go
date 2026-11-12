@@ -36,7 +36,10 @@ func vtabInLoopCall(col int, aff affinity, coll string, list []Expr, sub *Select
 }
 
 // vtabInLoopValues is the column and the values call f loops over.
-func (p *ReadOnlyPager) vtabInLoopValues(f FuncExpr, params []Value, outer *evalCtx, trig *trigCompileCtx, from *vdbe) (int, []Value, error) {
+//
+// A value that reads an enclosing query's row is the one corr holds for this
+// conjunct (conj), computed where that row is current (enclosingRowTerms).
+func (p *ReadOnlyPager) vtabInLoopValues(f FuncExpr, params []Value, outer *evalCtx, trig *trigCompileCtx, from *vdbe, corr []vtabCorrValue, conj int) (int, []Value, error) {
 	col, aff, coll := int(f.Args[0].(LiteralExpr).Val.I), affinity(f.Args[1].(LiteralExpr).Val.I), string(f.Args[2].(LiteralExpr).Val.S)
 	var vals []Value
 	if s, isSub := f.Args[3].(SubqueryExpr); isSub && len(f.Args) == 4 {
@@ -51,7 +54,14 @@ func (p *ReadOnlyPager) vtabInLoopValues(f FuncExpr, params []Value, outer *eval
 			vals = append(vals, r[0])
 		}
 	} else {
-		for _, e := range f.Args[3:] {
+	values:
+		for k, e := range f.Args[3:] {
+			for _, cv := range corr {
+				if cv.arg == 0 && cv.conj == conj && cv.elem == k+1 {
+					vals = append(vals, cv.v)
+					continue values
+				}
+			}
 			v, err := p.foldVtabInputValue(e, params, outer, trig, from)
 			if err != nil {
 				return 0, nil, err

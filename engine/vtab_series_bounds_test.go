@@ -146,6 +146,18 @@ func TestSeriesBoundsAsC(t *testing.T) {
 		{`SELECT group_concat(a.value || ':' || b.value) FROM generate_series(1,3) a JOIN generate_series(1,3) b ON 1 WHERE b.value IN (2, '2') AND a.value = 1`, "1:2,1:2"},
 		{`SELECT group_concat(value) FROM (SELECT value FROM generate_series WHERE start IN (1,2) AND stop = 3 LIMIT 2 OFFSET 2)`, "3,2"},
 		{`SELECT count(*) FROM generate_series(1,10) WHERE value NOT IN (SELECT '5')`, "10"},
+		// An IN subquery reading an enclosing query's row: one value for each
+		// run of the series statement, consumed as C consumes it (#159).
+		{`SELECT group_concat(x || ':' || (SELECT count(*) FROM generate_series(1,10) WHERE value IN (SELECT t.x)), ' ') FROM (SELECT '5' AS x UNION ALL SELECT 3 UNION ALL SELECT 'x' UNION ALL SELECT 5.0 UNION ALL SELECT '2.0') t`,
+			"5:1 3:1 x:0 5.0:1 2.0:1"},
+		{`SELECT group_concat(x || ':' || coalesce((SELECT group_concat(value) FROM generate_series(1,10) WHERE value IN (SELECT t.x + 1)), '-'), ' ') FROM (SELECT '5' AS x UNION ALL SELECT 3 UNION ALL SELECT 'x' UNION ALL SELECT '2.0') t`,
+			"5:6 3:4 x:1 2.0:3"},
+		{`SELECT group_concat(x || ':' || (SELECT count(*) FROM generate_series(1,10) WHERE value IN (SELECT t.x COLLATE NOCASE)), ' ') FROM (SELECT '5' AS x UNION ALL SELECT '1e1') t`,
+			"5:1 1e1:1"},
+		{`SELECT group_concat(x || ':' || coalesce((SELECT group_concat(value) FROM generate_series WHERE stop = 4 AND start IN (SELECT t.x)), '-'), ' ') FROM (SELECT '2' AS x UNION ALL SELECT '3.0') t`,
+			"2:2,3,4 3.0:3,4"},
+		{`SELECT group_concat(x || ':' || (SELECT count(*) FROM generate_series(1,10) s WHERE s.value IN (SELECT t.x) AND s.value > 1), ' ') FROM (SELECT '5' AS x UNION ALL SELECT '1') t`,
+			"5:1 1:0"},
 		{`SELECT count(*) FROM json_each('5') WHERE json = 5`, "1"},
 		{`SELECT json = 5 FROM json_each('5')`, "1"},
 		{`SELECT count(*) FROM json_each('[1]', '$') WHERE root = 5`, "0"},
