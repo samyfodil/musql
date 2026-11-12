@@ -2191,7 +2191,12 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpSortedSeek:
 			cur := m.cursors[op.P1]
+			if cur != nil && cur.rowStore == nil && !cur.streamable && !cur.seekReseek && !cur.refillEach && cur.sub == nil && cur.vt == nil &&
+				(!cursorHasNoBtree(cur) || cur.fill != nil) && cur.segSortedSeek(op.P4.(*sortedSeekHint), m.regs[op.P2], m.encoding()) {
+				break
+			}
 			if cur != nil {
+				cur.unserveSegSorted()
 				if err := m.applyPendingOrder(cur); err != nil {
 					return nil, err
 				}
@@ -2199,9 +2204,6 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			if cur == nil || cur.rowStore != nil || cur.streamable || cur.seekReseek || cur.refillEach || cur.sub != nil || cur.vt != nil ||
 				cursorHasNoBtree(cur) && cur.fill == nil && !cur.materialized {
 				break // a cursor whose rows are not one list built once
-			}
-			if cur.segSortedSeek(op.P4.(*sortedSeekHint), m.regs[op.P2]) {
-				break
 			}
 			if !cur.materialized {
 				cur.params = m.params
