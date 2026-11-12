@@ -28,6 +28,9 @@ import (
 // which is what gives a transaction read-your-writes. An ATTACHed database's
 // file gets a held session of its own (ndbs, sessionFor).
 type Conn struct {
+	// interrupt stops this connection's running statement (watchContext).
+	interrupt atomic.Bool
+
 	// boostStmts are the statements package boost has prepared on this
 	// connection, by query text; boostNamed is its argument scratch.
 	boostStmts map[string]*Stmt

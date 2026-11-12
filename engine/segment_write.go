@@ -1384,6 +1384,7 @@ func (db *DB) segmentPagerInto(p *ReadOnlyPager, freeze bool) (*ReadOnlyPager, e
 	} else {
 		*p = ReadOnlyPager{meta: pagerMeta{encoding: UTF8, pageSize: 4096}}
 	}
+	p.interrupt = db.interrupt
 	// The schema this session can name, and the handle its committed column
 	// blocks come from. Both are inputs to the source below AND to its cache key.
 	rows := db.segmentSchemaRowsShared()

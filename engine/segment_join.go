@@ -1459,7 +1459,7 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 			for i := range perm {
 				perm[i] = i
 			}
-			autoIndexSortValues(perm, key, func(i, k int) Value { return t.value(int32(i), key.cols[k]) }, segJoinOrderEncoding(cur, m))
+			autoIndexSortValues(perm, key, func(i, k int) Value { return t.value(int32(i), key.cols[k]) }, segJoinOrderEncoding(cur, m), nil)
 		}
 		rank := make([]int32, t.n)
 		for i, r := range perm {
@@ -1621,11 +1621,28 @@ func (w *segJoinWalk) flat() bool {
 // stops the walk, and each reports whether it ran to the end.
 func (w *segJoinWalk) each(at []int32, fn func() bool) bool {
 	k := len(w.tabs)
+	var intr *atomic.Bool
+	if w.m != nil {
+		intr = w.m.interruptFlag()
+	}
+	// Asked every so many rows: a load per row was a measurable part of a
+	// join's time.
+	var asked uint32
+	stopped := func() bool {
+		if asked++; asked&1023 != 0 || intr == nil || !intr.Load() {
+			return false
+		}
+		w.failed = true
+		return true
+	}
 	if w.flat() {
 		// Every later level found by a rowid: at most one row each, so the
 		// nest is a pass over the first level's rows.
 	rows:
 		for j := range w.tabs[0].n {
+			if stopped() {
+				return false
+			}
 			r := int32(j)
 			if w.order0 != nil {
 				r = w.order0[j]
@@ -1664,6 +1681,9 @@ func (w *segJoinWalk) each(at []int32, fn func() bool) bool {
 	}
 	var visit func(i int) bool
 	visit = func(i int) bool {
+		if stopped() {
+			return false
+		}
 		if i == k {
 			return fn()
 		}

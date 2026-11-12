@@ -154,7 +154,7 @@ func (s *segSortedRows) orderRun(lo, hi int) {
 	for i := range perm {
 		perm[i] = i
 	}
-	autoIndexSortValues(perm, key, func(i, k int) Value { return vals[i*nk+k] }, s.enc)
+	autoIndexSortValues(perm, key, func(i, k int) Value { return vals[i*nk+k] }, s.enc, nil)
 	if s.one != nil {
 		run := slices.Clone(s.perm[lo:hi])
 		for i, j := range perm {
