@@ -80,3 +80,62 @@ func TestGroupByAnchorKeepSpellsAsCopied(t *testing.T) {
 		}
 	}
 }
+
+// TestGroupByJoinKeysFromNarrowAnchor: a GROUP BY over a join whose keys come
+// from different tables keeps only those columns of each group's anchor, and
+// reads them back at their columns, as the whole copied row answers -- keys
+// spelled differently but equal included.
+func TestGroupByJoinKeysFromNarrowAnchor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "join.musq")
+	db, err := Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []string{
+		`CREATE TABLE a(id INTEGER, p1, p2, p3, k TEXT COLLATE NOCASE, q REAL)`,
+		`CREATE TABLE b(id INTEGER, r1, r2, r3, r4, r5, y)`,
+	} {
+		if err := db.Exec(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range 40 {
+		k := []string{`'a'`, `'A'`, `'b'`, `'B'`, `'c'`}[i%5]
+		y := []string{`1`, `1.0`, `2`, `'2'`}[i%4]
+		if err := db.Exec(fmt.Sprintf(`INSERT INTO a VALUES(%d, %d, %d, %d, %s, %d.25)`, i%7, i, i, i, k, i)); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Exec(fmt.Sprintf(`INSERT INTO b VALUES(%d, %d, %d, %d, %d, %d, %s)`, i%7, i, i, i, i, i, y)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	p, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	keep := `SELECT a.k, b.y, sum(a.q) AS s, count(*) AS n FROM a JOIN b ON b.id = a.id GROUP BY a.k, b.y ORDER BY s, n`
+	copied := `SELECT a.k, b.y, sum(a.q) AS s, count(*) AS n, b.r5 FROM a JOIN b ON b.id = a.id GROUP BY a.k, b.y ORDER BY s, n`
+	if pl := aggPlanOf(t, p, keep); pl.rowCols == nil || len(pl.rowCols) != 2 {
+		t.Fatalf("%s: rowCols %v, want the two keys", keep, pl.rowCols)
+	}
+	_, got, err := p.Query(keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, want, err := p.Query(copied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) || len(got) == 0 {
+		t.Fatalf("%d groups, %d copied", len(got), len(want))
+	}
+	for i := range got {
+		if g, w := fmt.Sprint(typedRows([][]Value{got[i]})), fmt.Sprint(typedRows([][]Value{want[i][:4]})); g != w {
+			t.Errorf("group %d: %s, copied %s", i, g, w)
+		}
+	}
+}
