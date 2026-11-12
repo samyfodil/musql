@@ -112,3 +112,41 @@ func TestInteractiveShellHomeEnd(t *testing.T) {
 		}
 	}
 }
+
+// TestInteractiveShellInterrupt: Ctrl+C stops the running statement, as in
+// C's shell, and the shell goes on to the next one (#188).
+func TestInteractiveShellInterrupt(t *testing.T) {
+	master, slave := openPTY(t)
+	buf := &syncBuf{}
+	done := make(chan error, 1)
+	path := t.TempDir() + "/i.musq"
+	go func() {
+		done <- cli.Run(context.Background(), cli.Env{Dir: t.TempDir(), Stdin: slave, Stdout: buf, Stderr: io.Discard,
+			Interactive: true, StdinFd: int(slave.Fd()), StdoutFd: int(slave.Fd())}, []string{"open", path})
+	}()
+	for deadline := time.Now().Add(10 * time.Second); !strings.Contains(buf.String(), "Opened"); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("no greeting: %q", buf.String())
+		}
+	}
+	type_ := func(s string) {
+		if _, err := master.Write([]byte(s)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	type_("SELECT sum(a.value * b.value) FROM generate_series(1, 100000) a, generate_series(1, 100000) b;\r")
+	time.Sleep(300 * time.Millisecond)
+	type_("\x03")
+	type_("SELECT 41 + 1 AS n;\r.quit\r")
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the statement was not interrupted: %q", buf.String())
+	}
+	if out := buf.String(); !strings.Contains(out, "interrupted") || !strings.Contains(out, "42") {
+		t.Fatalf("output: %q", out)
+	}
+}
