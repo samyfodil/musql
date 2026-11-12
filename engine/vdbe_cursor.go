@@ -188,6 +188,10 @@ type vdbeCursor struct {
 	// segSorted is the same served from the segments (segSortedSeek), kept
 	// across rewinds since nothing is built.
 	segSorted *segSortedRows
+	// segOrder is the OpAutoIndexOrder segSortedSeek took over: its runs are
+	// put in its order, and the rows are built in it if the segments stop
+	// serving the seek.
+	segOrder *Instruction
 
 	// closed is set by close(); an open makes a fresh cursor.
 	closed bool
@@ -1583,7 +1587,7 @@ func (cur *vdbeCursor) close() {
 	cur.sub = nil
 	cur.rowids = nil
 	cur.rows = nil
-	cur.sorted, cur.segSorted = nil, nil
+	cur.sorted, cur.segSorted, cur.segOrder = nil, nil, nil
 	cur.lazyNorm = false
 	// BOTH halves of the current row, never just one. rowRaw is what tells
 	// readColumn a masked rowVals is incomplete, so clearing rowRaw while

@@ -40,6 +40,8 @@ type Env struct {
 	// OpenBrowser opens a URL for the user; nil or an error means print only.
 	OpenBrowser func(string) error
 	HTTP        *http.Client
+	// Version is what --version prints; empty leaves the flag out.
+	Version string
 }
 
 var errNotSignedIn = errors.New("not signed in: run musql auth login")
@@ -90,6 +92,7 @@ func (a *app) root() *cobra.Command {
 			return nil
 		},
 	}
+	root.Version = a.env.Version
 	root.PersistentFlags().StringVar(&a.url, "url", "", "server URL (default: the configured one)")
 	root.PersistentFlags().StringVar(&a.org, "org", "", "organization slug (default: the current one)")
 	root.PersistentFlags().BoolVar(&a.json, "json", false, "print JSON")

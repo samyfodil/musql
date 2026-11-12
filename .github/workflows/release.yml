@@ -45,7 +45,7 @@ jobs:
           name="musql-${GOOS}-${GOARCH}"
           out="$PWD/dist/$name"
           mkdir -p "$out"
-          flags=(-trimpath -ldflags="-s -w")
+          flags=(-trimpath -ldflags="-s -w -X main.version=$GITHUB_REF_NAME")
           (cd hrana && go build "${flags[@]}" -o "$out/musqld$ext" ./cmd/musqld)
           go build "${flags[@]}" -o "$out/musql-convert$ext" ./cmd/musql-convert
           (cd cloud && go build "${flags[@]}" -o "$out/musql$ext" ./cmd/musql)
@@ -115,7 +115,7 @@ jobs:
           name="musql-cloud-${GOOS}-${GOARCH}"
           out="$PWD/dist/$name"
           mkdir -p "$out"
-          flags=(-trimpath -ldflags="-s -w")
+          flags=(-trimpath -ldflags="-s -w -X main.version=$GITHUB_REF_NAME")
           (
             cd cloud
             go build "${flags[@]}" -tags jitllm -o "$out/musql-cloud$ext" ./cmd/musql-cloud
