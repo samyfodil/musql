@@ -412,7 +412,7 @@ func segParsePredTree(in []Instruction, pc, limit, cursor, nextAt int, leadRegs 
 		// the instructions after them are identical, which is why one matcher
 		// covers both. Nothing else is accepted: an expression bound would put
 		// arbitrary opcodes in this slot.
-		subBound := bound.Op == OpSubquery && bound.P3 <= 1 && bound.P5&p5Correlated == 0
+		subBound := bound.Op == OpSubquery && bound.P3 >= 0 && bound.P3 <= 1 && bound.P5&p5Correlated == 0
 		if col.Op != OpColumn || col.P1 != cursor ||
 			!(segPeepholeBoundOp(bound.Op) || subBound) || (!subBound && bound.P2 != col.P3+1) ||
 			(subBound && bound.P1 != col.P3+1) || (negate && (subBound || boundReg != bound.P2+1)) ||

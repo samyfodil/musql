@@ -186,10 +186,28 @@ func annotateVtabCorrelations(c *compiler, srcs []joinSource, plan joinPlan) {
 			}
 			terms = append(terms, vtabCorrTerm{conj: j, col: ci, op: op, rhs: rhs})
 		}
+		terms = append(terms, inRowsTerms(s)...)
 		if len(terms) > 0 {
 			srcs[origIdx].vtabCorr = withConstantTerms(s, terms)
 		}
 	}
+}
+
+// inRowsTerms is the rows of every IN subquery s consumes that reads an
+// enclosing query's row (vtabInRowsFn): fixed for one run of the statement,
+// so computed where any level opens.
+func inRowsTerms(s joinSource) []vtabCorrTerm {
+	var terms []vtabCorrTerm
+	for j, conj := range s.vtabItem.tvfWhere {
+		if f, isLoop := conj.(FuncExpr); isLoop && f.Name == vtabInLoopFn {
+			for k, e := range f.Args[3:] {
+				if rows, ok := e.(FuncExpr); ok && rows.Name == vtabInRowsFn {
+					terms = append(terms, vtabCorrTerm{conj: j, elem: k + 1, op: VtabEQ, rhs: e})
+				}
+			}
+		}
+	}
+	return terms
 }
 
 // withConstantTerms adds to a correlated source's terms its arguments and
@@ -239,7 +257,7 @@ func enclosingRowTerms(c *compiler, s joinSource) []vtabCorrTerm {
 				continue
 			}
 			for k, e := range f.Args[3:] {
-				if tvfArgIsLateral(c, e, nil) {
+				if rows, ok := e.(FuncExpr); ok && rows.Name == vtabInRowsFn || tvfArgIsLateral(c, e, nil) {
 					terms = append(terms, vtabCorrTerm{conj: j, elem: k + 1, op: VtabEQ, rhs: e})
 				}
 			}
