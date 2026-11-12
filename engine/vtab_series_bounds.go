@@ -396,6 +396,10 @@ func (t seriesTerm) loopCall(s seriesScope) Expr {
 		var subCol bool
 		subAff, subCol, coll, _ = s.sub(t.sub)
 		aff = cCompareAffinity(aff, true, subAff, subCol)
+		if seriesOuterValue(t.sub, s.known) {
+			// Its one row's one value, read like a list's.
+			return vtabInLoopCall(col, aff, coll, []Expr{t.sub.Columns[0].Expr}, nil)
+		}
 	}
 	return vtabInLoopCall(col, aff, coll, t.list, t.sub)
 }
@@ -543,7 +547,7 @@ func seriesItemPlan(it *FromItem, conj []Expr, rowid bool, known func(Expr) bool
 // consumes tested as C's series makes its rows, and those sources' tvfWhere
 // offering the module the consumed constraints alone. It is stmt itself when
 // there is none.
-func seriesBoundConjuncts(p *ReadOnlyPager, stmt *SelectStmt, srcs []joinSource) (*SelectStmt, error) {
+func seriesBoundConjuncts(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []joinSource) (*SelectStmt, error) {
 	if stmt == nil || stmt.Where == nil {
 		return stmt, nil
 	}
@@ -562,14 +566,21 @@ func seriesBoundConjuncts(p *ReadOnlyPager, stmt *SelectStmt, srcs []joinSource)
 	}
 	sub := func(s *SelectStmt) (affinity, bool, string, bool) {
 		// One that compiles with no enclosing scope reads nothing outside it.
+		// One that reads an enclosing query's row is a value fixed for each
+		// run of this statement, as C's IN loop takes it, when it is no more
+		// than that value (seriesOuterValue).
+		var outer *evalCtx
 		if _, err := compileSubProgram(p, s, nil); err != nil {
-			return affNone, false, "", false
+			if c == nil || !seriesOuterValue(s, known) {
+				return affNone, false, "", false
+			}
+			outer = c.enclosingAffCtx()
 		}
-		affs, mats, ok := p.subqueryOutputAffinities(s, nil)
+		affs, mats, ok := p.subqueryOutputAffinities(s, outer)
 		if !ok || len(affs) != 1 {
 			return affNone, false, "", false
 		}
-		colls, ok := p.subqueryOutputCollations(s, nil)
+		colls, ok := p.subqueryOutputCollations(s, outer)
 		if !ok || len(colls) != 1 {
 			return affNone, false, "", false
 		}
@@ -662,4 +673,14 @@ func seriesBoundConjuncts(p *ReadOnlyPager, stmt *SelectStmt, srcs []joinSource)
 		pl.it.tvfWhere = append(tvf, extra...)
 	}
 	return &s2, nil
+}
+
+// seriesOuterValue reports a subquery that is one value computed from what
+// known accepts: a FROM-less SELECT of one column, with no clause that could
+// drop its one row.
+func seriesOuterValue(s *SelectStmt, known func(Expr) bool) bool {
+	return s != nil && len(s.From) == 0 && len(s.CTEs) == 0 && len(s.Compound) == 0 && s.Where == nil &&
+		len(s.GroupBy) == 0 && s.Having == nil && len(s.OrderBy) == 0 && s.Limit == nil && s.Offset == nil &&
+		s.LimitParam == nil && s.OffsetParam == nil && !s.Distinct && s.ValuesArms == 0 && len(s.Windows) == 0 &&
+		len(s.Columns) == 1 && !s.Columns[0].Star && known(s.Columns[0].Expr)
 }

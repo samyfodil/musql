@@ -717,7 +717,7 @@ func (p *ReadOnlyPager) buildVtabConstraints(it FromItem, cols []columnInfo, par
 	}
 	for ci2, conj := range it.tvfWhere {
 		if f, isLoop := conj.(FuncExpr); isLoop && f.Name == vtabInLoopFn {
-			col, in, lerr := p.vtabInLoopValues(f, params, outer, trig, from)
+			col, in, lerr := p.vtabInLoopValues(f, params, outer, trig, from, corr, ci2)
 			if lerr != nil {
 				return nil, nil, nil, nil, lerr
 			}

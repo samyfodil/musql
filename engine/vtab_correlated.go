@@ -39,6 +39,7 @@ package engine
 type vtabCorrTerm struct {
 	conj int
 	arg  int // 1 + the FromItem.TableFuncArgs index this term computes; 0 for a WHERE conjunct
+	elem int // 1 + the index of the value an IN loop (vtabInLoopFn) conjunct takes; 0 otherwise
 	col  int
 	op   VtabOp
 	rhs  Expr
@@ -50,6 +51,7 @@ type vtabCorrTerm struct {
 type vtabCorrValue struct {
 	conj int
 	arg  int
+	elem int
 	col  int
 	op   VtabOp
 	v    Value
@@ -61,7 +63,7 @@ type vtabCorrValue struct {
 // comment for why the pair is re-checked rather than trusted.
 func vtabCorrValueIndex(corr []vtabCorrValue, conj, col int, op VtabOp) int {
 	for i, cv := range corr {
-		if cv.arg == 0 && cv.conj == conj {
+		if cv.arg == 0 && cv.elem == 0 && cv.conj == conj {
 			if cv.col != col || cv.op != op {
 				return -1
 			}
@@ -198,7 +200,7 @@ func withConstantTerms(s joinSource, terms []vtabCorrTerm) []vtabCorrTerm {
 	constant := func(e Expr) bool { return exprRefsOnly(e, func(ColumnExpr) bool { return false }) }
 	has := func(arg, conj int) bool {
 		for _, t := range terms {
-			if arg > 0 && t.arg == arg || arg == 0 && t.arg == 0 && t.conj == conj {
+			if arg > 0 && t.arg == arg || arg == 0 && t.arg == 0 && t.elem == 0 && t.conj == conj {
 				return true
 			}
 		}
@@ -230,6 +232,17 @@ func enclosingRowTerms(c *compiler, s joinSource) []vtabCorrTerm {
 		ci, op, rhs, ok := matchVtabConstraint(conj, s.scope.cols, s.scope.name)
 		if ok && tvfArgIsLateral(c, rhs, nil) {
 			terms = append(terms, vtabCorrTerm{conj: j, col: ci, op: op, rhs: rhs})
+		}
+		// A consumed IN's values the same way, each its own term.
+		if f, isLoop := conj.(FuncExpr); isLoop && f.Name == vtabInLoopFn && len(f.Args) > 3 {
+			if _, isSub := f.Args[3].(SubqueryExpr); isSub {
+				continue
+			}
+			for k, e := range f.Args[3:] {
+				if tvfArgIsLateral(c, e, nil) {
+					terms = append(terms, vtabCorrTerm{conj: j, elem: k + 1, op: VtabEQ, rhs: e})
+				}
+			}
 		}
 	}
 	return terms
