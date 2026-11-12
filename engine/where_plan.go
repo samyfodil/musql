@@ -786,6 +786,7 @@ func wherePlanTermsFromConj(jts []joinedTable, scopes []tableScope, conj []where
 			cursor: -1, column: xnRowid, rCursor: -1, rColumn: xnRowid,
 			parent: -1, outerON: outerON, onItem: onItem,
 			colMask: make([]uint64, len(jts)), colsKnown: true, truthProb: 1,
+			expr: e,
 		}
 		// A desugared row value's usage is its operand elements' -- read off
 		// the comparison as written, whose elements constant propagation
@@ -983,6 +984,7 @@ func wherePlanTermsFromConj(jts []joinedTable, scopes []tableScope, conj []where
 					v.pcx = t.pcx.commute(commuteToggles(x))
 					v.cursor, v.column = rTab, rCol
 					v.rCursor, v.rColumn = lTab, lCol
+					v.expr = whereFlipCmp(x)
 					v.prereqRight = prereqLeft | extraRight
 					v.smallInt = isSmall(lhs)
 					v.op = (whereIdxOperatorMask(op, true) + eExtra) & opMask
@@ -991,6 +993,7 @@ func wherePlanTermsFromConj(jts []joinedTable, scopes []tableScope, conj []where
 			case rOK:
 				// exprCommute rewrites the term in place; there is no copy.
 				t.pcx = t.pcx.commute(commuteToggles(x))
+				t.expr = whereFlipCmp(x)
 				t.cursor, t.column = rTab, rCol
 				t.rCursor, t.rColumn = lTab, lCol
 				t.prereqRight = prereqLeft | extraRight
@@ -1092,6 +1095,17 @@ func wherePlanTermsFromConj(jts []joinedTable, scopes []tableScope, conj []where
 			t.orInfo = orInfos[ri]
 		}
 		virt = append(virt, copies...)
+		if info := orInfos[ri]; info != nil {
+			// Case 2 (whereexpr.c:793): whereCombineDisjuncts inserts each
+			// combined comparison as a VIRTUAL term of the outer clause, no
+			// child of the OR, and analyses it there.
+			for _, ce := range info.combined {
+				c, ccopies := analyze(ce, r.outerON, r.onItem, len(raws)+len(virt))
+				c.virt = true
+				virt = append(virt, c)
+				virt = append(virt, ccopies...)
+			}
+		}
 		// exprAnalyzeOrTerm's case 1 (whereexpr.c:830), "chngToIN": an OR whose
 		// every subterm is "<same column> = <expr>" becomes one virtual
 		// "column IN (...)" term, a child of the OR (markTermAsChild), so once
@@ -1957,4 +1971,20 @@ func whereSkipCollateAndLikely(e Expr) (inner Expr, truthProb logEst, ok bool) {
 		}
 		return e, truthProb, ok
 	}
+}
+
+// whereFlipCmp is comparison x with its sides swapped, as exprCommute leaves it.
+func whereFlipCmp(x BinaryExpr) Expr {
+	op := x.Op
+	switch op {
+	case "<":
+		op = ">"
+	case "<=":
+		op = ">="
+	case ">":
+		op = "<"
+	case ">=":
+		op = "<="
+	}
+	return BinaryExpr{Op: op, L: x.R, R: x.L}
 }

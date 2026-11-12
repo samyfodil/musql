@@ -747,6 +747,9 @@ func itoaSmall(n int) string {
 // whereIdxTerm is one WHERE conjunct as exprAnalyze (whereexpr.c) leaves it --
 // a WhereTerm, restricted to the fields this port's cost model reads.
 type whereIdxTerm struct {
+	// expr is pTerm->pExpr as this port wrote it: the comparison with its
+	// sides swapped for a commuted term. whereCombineDisjuncts copies it.
+	expr Expr
 	// op is eOperator: operatorMask(pExpr->op) masked by WO_ALL or WO_EQUIV,
 	// plus WO_EQUIV itself for a transitive-eligible column-to-column equality.
 	// 0 marks a conjunct no index can use -- which still contributes its

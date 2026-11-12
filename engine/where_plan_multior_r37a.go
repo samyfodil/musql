@@ -32,6 +32,8 @@ type whereOrInfo struct {
 	// of the table that disjunct constrains. Zero means case 3 does not apply and
 	// no WHERE_MULTI_OR loop exists.
 	indexable whereMask
+	// combined are case 2's virtual conjuncts (wherePlanCombineDisjuncts).
+	combined []Expr
 	// subs is pOrInfo->wc.a[]: one term per disjunct in clause order, then
 	// the virtual terms derived from them (a commuted column comparison, the
 	// "x>NULL" child of "x IS NOT NULL") in reverse disjunct order, since
@@ -314,9 +316,12 @@ func wherePlanOrTermInfo(jts []joinedTable, scopes []tableScope, e Expr, outerON
 	}
 	// "if( indexable && pOrWc->nTerm==2 )" -- nTerm counts the virtual entries,
 	// so an OR with a commuted copy never reaches case 2.
-	if len(info.subs) == 2 && info.and[0] == nil && info.and[1] == nil &&
-		wherePlanOrCombines(&info.subs[0], &info.subs[1], subs[0], subs[1]) {
-		return nil, false, false
+	if len(info.subs) == 2 {
+		combined, ok := wherePlanCombineDisjuncts(info)
+		if !ok {
+			return nil, false, false
+		}
+		info.combined = combined
 	}
 	if wherePlanOrMayChangeToIn(info, copied, parentCur) {
 		return nil, false, false
@@ -442,58 +447,6 @@ func wherePlanExprHasCollate(e Expr) bool {
 	}
 	walk(e)
 	return found
-}
-
-// wherePlanOrCombines ports whereCombineDisjuncts' own guard (whereexpr.c:557):
-// does a two-way OR of these disjuncts insert a further virtual conjunct
-// ("x>A OR x=A" adds "x>=A") into the OUTER WHERE clause? If it does, this port
-// declines the OR entirely rather than plan without that term.
-//
-// The operand comparison is sqlite3ExprCompare, which this port does not have;
-// wherePlanExprMayCompareEqual answers conservatively (true whenever the C
-// might), so the decline is the safe direction.
-func wherePlanOrCombines(one, two *whereIdxTerm, ea, eb Expr) bool {
-	const cmpOps = woEq | woLT | woLE | woGT | woGE
-	if one.vnull || two.vnull {
-		return false
-	}
-	if one.op&cmpOps == 0 || two.op&cmpOps == 0 {
-		return false
-	}
-	eOp := (one.op | two.op) & cmpOps
-	if eOp&(woEq|woLT|woLE) != eOp && eOp&(woEq|woGT|woGE) != eOp {
-		return false
-	}
-	ba, aok := ea.(BinaryExpr)
-	bb, bok := eb.(BinaryExpr)
-	if !aok || !bok {
-		return false
-	}
-	if ba.row != nil || bb.row != nil {
-		// A row value's operands are TK_VECTORs, and a vector never compares
-		// equal to a scalar (sqlite3ExprCompare, expr.c): only two row values
-		// can combine, and those are left to the conservative answer.
-		return ba.row != nil && bb.row != nil
-	}
-	return wherePlanExprMayCompareEqual(ba.L, bb.L) && wherePlanExprMayCompareEqual(ba.R, bb.R)
-}
-
-// wherePlanExprMayCompareEqual is a CONSERVATIVE sqlite3ExprCompare: true
-// whenever the C might call the two expressions equal. Only the operand shapes
-// a disjunct of the admitted subset can hold are distinguished; anything else
-// answers true, which only declines an OR that might have been served.
-func wherePlanExprMayCompareEqual(a, b Expr) bool {
-	switch x := a.(type) {
-	case LiteralExpr:
-		return whereLiteralsMayCompareEqual(a, b)
-	case ColumnExpr:
-		y, ok := b.(ColumnExpr)
-		if !ok {
-			return false
-		}
-		return equalFoldName(x.Name, y.Name) && equalFoldName(x.Qualifier, y.Qualifier)
-	}
-	return true
 }
 
 // addOr ports whereLoopAddOr (where.c:4811) for iTab: for every OR term whose
@@ -844,4 +797,86 @@ func wherePlanJoinMultiOrKey(in wherePlanInput, order []int, level, ti int, nQue
 		return nil, false
 	}
 	return &autoIndexKey{multiOr: mo}, true
+}
+
+// wherePlanCombineDisjuncts is case 2 of exprAnalyzeOrTerm for a two-way OR
+// (whereexpr.c:793-803): whereCombineDisjuncts over every pair of the two
+// disjuncts' subterms as whereNthSubterm visits them -- a single term itself, an
+// AND disjunct its own clause's terms, commuted copies and BETWEEN halves
+// included. Each pair comparing the same two operands under compatible
+// operators ("x=A" and "x>A") adds "x>=A" to the outer clause, a virtual term
+// the caller analyses. ok is false where the C's sqlite3ExprCompare answer is
+// not known here.
+func wherePlanCombineDisjuncts(info *whereOrInfo) (combined []Expr, ok bool) {
+	const cmpOps = woEq | woLT | woLE | woGT | woGE
+	nth := func(k int) []whereIdxTerm {
+		if info.and[k] != nil {
+			return info.and[k].terms
+		}
+		return info.subs[k : k+1]
+	}
+	for _, one := range nth(0) {
+		for _, two := range nth(1) {
+			if one.vnull || two.vnull || one.op&cmpOps == 0 || two.op&cmpOps == 0 {
+				continue
+			}
+			eOp := one.op | two.op
+			if eOp&(woEq|woLT|woLE) != eOp && eOp&(woEq|woGT|woGE) != eOp {
+				continue
+			}
+			pa, pb := one.pcx, two.pcx
+			if pa == nil || pb == nil || pa.op == pcxUnknown || pb.op == pcxUnknown {
+				// Operands this port cannot mirror: different ones still rule
+				// the pair out.
+				ea, aok := one.expr.(BinaryExpr)
+				eb, bok := two.expr.(BinaryExpr)
+				if aok && bok && (!wherePlanExprMayCompareEqual(ea.L, eb.L) || !wherePlanExprMayCompareEqual(ea.R, eb.R)) {
+					continue
+				}
+				return nil, false
+			}
+			cl, cr := pcxCompare(pa.l, pb.l, -1), pcxCompare(pa.r, pb.r, -1)
+			if cl == 2 || cr == 2 {
+				continue
+			}
+			if cl < 0 || cr < 0 {
+				return nil, false
+			}
+			if cl != 0 || cr != 0 || pa.commuted != pb.commuted {
+				continue
+			}
+			be, isBin := one.expr.(BinaryExpr)
+			if pa.commuted || one.vector || !isBin || be.row != nil {
+				return nil, false
+			}
+			if eOp&(eOp-1) != 0 {
+				if eOp&(woLT|woLE) != 0 {
+					eOp = woLE
+				} else {
+					eOp = woGE
+				}
+			}
+			op := map[uint16]string{woEq: "=", woLT: "<", woLE: "<=", woGT: ">", woGE: ">="}[eOp]
+			combined = append(combined, BinaryExpr{Op: op, L: be.L, R: be.R})
+		}
+	}
+	return combined, true
+}
+
+// wherePlanExprMayCompareEqual is a CONSERVATIVE sqlite3ExprCompare: true
+// whenever the C might call the two expressions equal. Only the operand shapes
+// a disjunct of the admitted subset can hold are distinguished; anything else
+// answers true, which only declines an OR that might have been served.
+func wherePlanExprMayCompareEqual(a, b Expr) bool {
+	switch x := a.(type) {
+	case LiteralExpr:
+		return whereLiteralsMayCompareEqual(a, b)
+	case ColumnExpr:
+		y, ok := b.(ColumnExpr)
+		if !ok {
+			return false
+		}
+		return equalFoldName(x.Name, y.Name) && equalFoldName(x.Qualifier, y.Qualifier)
+	}
+	return true
 }
