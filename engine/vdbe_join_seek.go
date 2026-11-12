@@ -105,10 +105,18 @@ func annotateJoinSeeks(c *compiler, srcs []joinSource, plan joinPlan) {
 		if table && !s.rightOuter && !s.tbl.withoutRowid && annotateIndexJoinSeek(c, srcs, origIdx, planKey, outer, eqs) {
 			continue
 		}
-		if planKey != nil && planKey.multiOr != nil {
+		if planKey != nil && planKey.multiOr != nil && planKey.multiOr.passes == nil {
 			continue // ordered per outer row, inside the loop
 		}
 		srcs[origIdx].joinSortedKey, srcs[origIdx].joinSortedMore, srcs[origIdx].joinSortedSeek = findJoinSortedSeek(c, s, outer, eqs)
+		if h := srcs[origIdx].joinSortedSeek; h != nil && planKey != nil && planKey.multiOr != nil {
+			// A WHERE_MULTI_OR level files each row under the first disjunct
+			// it passes and sorts them (emitMultiOrGroups); a row outside the
+			// seek's run passes no conjunct of the WHERE, so it is filed last
+			// and dropped either way, and the sort is total, so seeking first
+			// keeps the order. Its rows must be built for the tags.
+			h.built = true
+		}
 	}
 }
 
