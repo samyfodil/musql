@@ -66,9 +66,11 @@ type vmJIT struct {
 	updSkip uint64
 	updPlan *updatePlan // that OP_UpdateRow's
 
-	// params is how many of the nReg registers, the last ones, hold the bound
-	// parameters (Program.jitParams); enter fills them.
+	// params is how many of the nReg registers, the last ones but outer's,
+	// hold the bound parameters (Program.jitParams), and outer the outer
+	// columns the last ones hold (Program.jitOuterCols); enter fills them.
 	params int
+	outer  []jitOuterCol
 
 	// text is whether the code has TEXT arms: enter says whether TEXTs
 	// compare converted, which VTextCmpJump leaves to the VDBE
@@ -200,10 +202,51 @@ func (prog *Program) jitParams() int {
 	return n
 }
 
+// maxJITOuter bounds the outer columns native code reads from registers of
+// their own (jitOuterCols); an OpOuterColumn of a later one exits.
+const maxJITOuter = 8
+
+// jitOuterCol is a column of an enclosing query's cursor that prog reads
+// (OpOuterColumn): depth frames up, that frame's cursor.
+type jitOuterCol struct{ depth, cursor, col int }
+
+// jitOuterCols are the outer columns prog reads, in the order they first
+// appear. A subquery's run never moves its enclosing query's cursors, so
+// vmJIT.enter reads each once into a register past the parameters' and
+// native code copies it from there.
+func (prog *Program) jitOuterCols() []jitOuterCol {
+	var cols []jitOuterCol
+	for i := range prog.Insns {
+		in := &prog.Insns[i]
+		if in.Op != OpOuterColumn {
+			continue
+		}
+		o := jitOuterCol{int(in.P5), in.P1, in.P2}
+		if !slices.Contains(cols, o) && len(cols) < maxJITOuter {
+			cols = append(cols, o)
+		}
+	}
+	return cols
+}
+
+// jitOuter is len(jitOuterCols), counted once.
+func (prog *Program) jitOuter() int {
+	if n := atomic.LoadInt32(&prog.outerRegs); n > 0 {
+		return int(n - 1)
+	}
+	n := len(prog.jitOuterCols())
+	atomic.StoreInt32(&prog.outerRegs, int32(n+1))
+	return n
+}
+
+// jitExtra is how many registers past NReg native code keeps: the
+// parameters', then the outer columns'.
+func (prog *Program) jitExtra() int { return prog.jitParams() + prog.jitOuter() }
+
 // regFile is regs as prog's register file: NReg long, with room past that for
-// jitParams. keep says regs' old values may stay; otherwise they are cleared.
+// jitExtra. keep says regs' old values may stay; otherwise they are cleared.
 func (prog *Program) regFile(regs []Value, keep bool) []Value {
-	if want := prog.NReg + prog.jitParams(); cap(regs) < want {
+	if want := prog.NReg + prog.jitExtra(); cap(regs) < want {
 		return make([]Value, prog.NReg, want)
 	}
 	regs = regs[:prog.NReg]
@@ -263,6 +306,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	// lowered (jit.VFusable), so a program with none skips the pass.
 	fusable := false
 	nParams := prog.jitParams()
+	outer := prog.jitOuterCols()
 	ipk := writeCursorIPK(prog)
 	realVP, realOK := vmRealLowering(prog, p.segStoresReal)
 	textVP, textOK := vmTextLowering(prog, p.segStoresText)
@@ -298,6 +342,12 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 			// A shallow copy of the parameter, from the register past NReg
 			// that enter fills with it (jitParams).
 			vp[pc] = jit.VInsn{Op: jit.VCopy, A: prog.NReg + in.P1 - 1, B: in.P2, Imm: 1}
+		case in.Op == OpOuterColumn && in.P3 >= 0 && in.P3 < prog.NReg:
+			// A shallow copy of the outer column, which enter reads into the
+			// register past the parameters' (jitOuterCols).
+			if i := slices.Index(outer, jitOuterCol{int(in.P5), in.P1, in.P2}); i >= 0 {
+				vp[pc] = jit.VInsn{Op: jit.VCopy, A: prog.NReg + nParams + i, B: in.P3, Imm: 1}
+			}
 		case vp[pc].Op == jit.VColumn && vp[pc].A < len(ipk) && ipk[vp[pc].A] == vp[pc].B:
 			// A rowid table's INTEGER PRIMARY KEY reads as the rowid.
 			vp[pc] = jit.VInsn{Op: jit.VRowid, A: vp[pc].A, C: vp[pc].C}
@@ -439,7 +489,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	if entries == 0 {
 		return nil
 	}
-	code, err := jit.MapVMFused(vp, prog.NReg+nParams, valueLayout, entry, fusable)
+	code, err := jit.MapVMFused(vp, prog.NReg+nParams+len(outer), valueLayout, entry, fusable)
 	if err != nil {
 		return nil
 	}
@@ -449,7 +499,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 			marked[pc].Op = OpJIT
 		}
 	}
-	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams, params: nParams, entry: entry, marked: marked, native: native, updAt: updAt,
+	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams + len(outer), params: nParams, outer: outer, entry: entry, marked: marked, native: native, updAt: updAt,
 		segCap: segCap, segNeed: segNeed, walkScan: walkScan, inSlots: inSlots, idxSpecs: idxSpecs,
 		aggAt: agg.at, aggSort: agg.sort, aggLo: agg.lo, aggHi: agg.hi, aggKey: agg.key, aggKeyLo: agg.keyLo, aggKeyN: agg.keyN}
 	if segCap != nil {
@@ -783,7 +833,9 @@ type stepGather struct {
 // the key's and every register an aggregate steps from. Its OpMakeRecord is a
 // view of the key's registers (recView), which native code skips; enter keeps
 // the record pointing at them. Native code then goes on past many rows before
-// the VDBE steps them in order (vdbe.stepGathered).
+// the VDBE steps them in order (vdbe.stepGathered). An aggregate with no GROUP
+// BY gathers the same way, from its OpAggStep that reads nothing but registers
+// up to its first OpAggResult; it has no key.
 //
 // Only where no entry can run both it and an OpResultRow: every OpResultRow
 // follows the OpHashAggSort, which native code never runs, and no native jump
@@ -794,16 +846,26 @@ func gatherAggStep(prog *Program, vp []jit.VInsn) stepGather {
 	sort := -1
 	for pc := range prog.Insns {
 		switch in := &prog.Insns[pc]; in.Op {
-		case OpHashAggStep:
+		case OpHashAggStep, OpAggStep:
 			// A LEFT JOIN's null row steps the same key and registers again.
 			if len(ats) > 0 {
-				if first := &prog.Insns[ats[0]]; in.P1 != first.P1 || in.P2 != first.P2 || in.P4 != first.P4 {
+				if first := &prog.Insns[ats[0]]; in.Op != first.Op || in.P1 != first.P1 || in.P2 != first.P2 || in.P3 != first.P3 || in.P4 != first.P4 {
 					return none
 				}
+			} else if in.Op == OpAggStep && in.P3 != 0 {
+				return none
+			}
+			if sort >= 0 {
+				return none
 			}
 			ats = append(ats, pc)
-		case OpHashAggSort:
-			if sort >= 0 {
+		case OpHashAggSort, OpAggResult:
+			// A plain aggregate's steps end at its first OpAggResult; a
+			// hashed one's results come after its sort.
+			if len(ats) == 0 || sort >= 0 || (in.Op == OpAggResult) != (prog.Insns[ats[0]].Op == OpAggStep) {
+				if in.Op == OpAggResult {
+					continue
+				}
 				return none
 			}
 			sort = pc
@@ -826,6 +888,12 @@ func gatherAggStep(prog *Program, vp []jit.VInsn) stepGather {
 	if plan == nil || !plan.rowFree && !plan.rowFromKeys() {
 		return none
 	}
+	if step.Op == OpAggStep {
+		if !plan.rowFree {
+			return none
+		}
+		return gatherSteps(prog, vp, plan, ats, sort, nil, -1, -1, 0)
+	}
 	var mrAts []int
 	for pc := range sort {
 		if in := &prog.Insns[pc]; in.Op == OpMakeRecord && in.P3 == step.P1 {
@@ -843,7 +911,17 @@ func gatherAggStep(prog *Program, vp []jit.VInsn) stepGather {
 	if !plan.rowFree && mr.P2 != len(plan.keyCols) {
 		return none
 	}
-	lo, hi := mr.P1, mr.P1+mr.P2
+	return gatherSteps(prog, vp, plan, ats, sort, mrAts, step.P1, mr.P1, mr.P2)
+}
+
+// gatherSteps is gatherAggStep past finding the steps: the registers they
+// gather, keyN of them from keyLo the key's record at key, and the rewrite.
+func gatherSteps(prog *Program, vp []jit.VInsn, plan *aggPlan, ats []int, sort int, mrAts []int, key, keyLo, keyN int) stepGather {
+	none := stepGather{at: -1}
+	lo, hi := keyLo, keyLo+keyN
+	if keyN == 0 {
+		lo, hi = prog.NReg, -1
+	}
 	for _, it := range aggPlanTemplates(plan) {
 		for which := range it.rowRegs {
 			if it.rowExpr(which) != nil && it.rowRegs[which] <= 0 {
@@ -862,7 +940,7 @@ func gatherAggStep(prog *Program, vp []jit.VInsn) stepGather {
 			lo, hi = min(lo, r), max(hi, r+1)
 		}
 	}
-	if lo < 0 || hi > prog.NReg || hi-lo > 32 {
+	if lo < 0 || hi > prog.NReg || hi <= lo || hi-lo > 32 {
 		return none
 	}
 	for pc, in := range vp {
@@ -879,7 +957,7 @@ func gatherAggStep(prog *Program, vp []jit.VInsn) stepGather {
 	for _, pc := range ats {
 		vp[pc] = jit.VInsn{Op: jit.VResultRow, A: lo, B: hi - lo}
 	}
-	return stepGather{at: ats[0], ats: ats, sort: sort, lo: lo, hi: hi, key: step.P1, keyLo: mr.P1, keyN: mr.P2}
+	return stepGather{at: ats[0], ats: ats, sort: sort, lo: lo, hi: hi, key: key, keyLo: keyLo, keyN: keyN}
 }
 
 // aggGathers is whether an entry at pc gathers OpHashAggStep's rows
@@ -1416,8 +1494,8 @@ var (
 	// vmJITIdxSeeks counts the index seeks native code made (VSeekIdx) and
 	// vmJITIdxSyncs the times the VDBE took such a cursor back (syncIdxSeek).
 	vmJITIdxSeeks, vmJITIdxSyncs atomic.Int64
-	// vmJITAggGathered counts the hashed GROUP BY steps native code gathered
-	// and the VDBE replayed (gatherAggStep).
+	// vmJITAggGathered counts the aggregate steps native code gathered and
+	// the VDBE replayed (gatherAggStep).
 	vmJITAggGathered atomic.Int64
 	vmJITCountSyncs  bool
 
@@ -2091,7 +2169,7 @@ func jitReadColumn(cur *vdbeCursor, i int, dst *Value) bool {
 // native code ran no OpResultRow.
 func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 	regs := m.regs
-	if cap(regs) < jx.nReg || jx.nReg == 0 {
+	if cap(regs) < jx.nReg || jx.nReg == 0 || !jx.readOuter(m, regs[:jx.nReg]) {
 		m.flushJIT()
 		return pc, -1
 	}
@@ -2103,7 +2181,7 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 	if jx.params > 0 {
 		// The bound parameters, where native code's OpVariable reads them.
 		regs = regs[:jx.nReg]
-		base := jx.nReg - jx.params
+		base := jx.nReg - len(jx.outer) - jx.params
 		for i := range jx.params {
 			regs[base+i] = paramAt(m.params, i+1)
 		}
@@ -2210,6 +2288,28 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 		return int(args.PC), int(args.Yield) - 1
 	}
 	return int(args.PC), -1
+}
+
+// readOuter reads the outer columns native code copies (jitOuterCols) into
+// the last of regs, or reports a column it could not read, which the VDBE's
+// own OpOuterColumn then reads, or fails on, if the program reaches it.
+func (jx *vmJIT) readOuter(m *vdbe, regs []Value) bool {
+	base := len(regs) - len(jx.outer)
+	for i, o := range jx.outer {
+		fr := m
+		for range o.depth {
+			if fr = fr.parent; fr == nil {
+				return false
+			}
+		}
+		if o.cursor < 0 || o.cursor >= len(fr.cursors) || fr.cursors[o.cursor] == nil {
+			return false
+		}
+		if fr.cursors[o.cursor].readColumn(o.col, &regs[base+i]) != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // handCursor hands cursor c over to native code entered at pc (m.jcur[c]).

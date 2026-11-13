@@ -1588,7 +1588,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				if n := batch * (jx.aggHi - jx.aggLo); len(m.gatherChunk) < n {
 					m.gatherChunk = make([]Value, n)
 				}
-				m.recRegs[jx.aggKey] = m.regs[jx.aggKeyLo : jx.aggKeyLo+jx.aggKeyN : jx.aggKeyLo+jx.aggKeyN]
+				if jx.aggKey >= 0 {
+					m.recRegs[jx.aggKey] = m.regs[jx.aggKeyLo : jx.aggKeyLo+jx.aggKeyN : jx.aggKeyLo+jx.aggKeyN]
+				}
 				next, n := jx.enter(m, pc, &m.aggRows)
 				pc = next
 				if err := m.jitErr; err != nil {
@@ -3193,12 +3195,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			plan := op.P4.(*aggPlan)
 			var row, rowids []Value
 			if op.P3 == 0 && plan.rowFree {
-				// Nothing reads the row (aggPlan.rowFree): the steps read their
-				// registers.
-				if n := plan.nCols + len(plan.scopes); len(m.aggNullRow) < n {
-					m.aggNullRow = make([]Value, n)
-				}
-				row, rowids = m.aggNullRow[:plan.nCols:plan.nCols], m.aggNullRow[plan.nCols:plan.nCols+len(plan.scopes)]
+				row, rowids = m.aggStepNullRow(plan)
 			} else if op.P3 == 0 { // source: plan.cursors (one or more joined table cursors)
 				var gerr error
 				row, rowids, gerr = m.gatherCursorRow(plan)

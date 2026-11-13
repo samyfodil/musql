@@ -292,6 +292,19 @@ func (m *vdbe) stepGathered(jx *vmJIT, step *Instruction, rows [][]Value) error 
 		copy(regs, m.aggSaved)
 		clear(m.aggSaved)
 	}()
+	if step.Op == OpAggStep {
+		// Every row steps from its registers alone, so one context serves the
+		// batch.
+		row, rowids := m.aggStepNullRow(plan)
+		ctx := m.aggRowCtx(plan, row, rowids)
+		for _, r := range rows {
+			copy(regs, r)
+			if err := m.aggStep(ctx, step.P2); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	key := m.regs[jx.aggKeyLo : jx.aggKeyLo+jx.aggKeyN : jx.aggKeyLo+jx.aggKeyN]
 	if plan.rowFree {
 		for _, r := range rows {

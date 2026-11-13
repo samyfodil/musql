@@ -81,6 +81,19 @@ func newSegRowStoreAt(rp *ReadOnlyPager, root uint32, tbl *tableMeta) *rowStore 
 	return &rowStore{seg: &segRows{rp: rp, root: root, tbl: tbl}, m: map[uint64][]Value{}}
 }
 
+// getCols is get decoding only the columns in cols, the rest valueUnread, for
+// a table with no generated column; it skips the memo, which keeps whole rows.
+func (b *segRows) getCols(rid uint64, cols columnMask) ([]Value, bool) {
+	if cols == allColumns || hasGeneratedCols(b.tbl.cols) {
+		return b.get(rid)
+	}
+	vals, found, served := b.rp.SeekRowidSegmentsCols(b.root, int64(rid), cols)
+	if !served || !found {
+		return nil, false
+	}
+	return widenStoredRow(b.tbl.cols, vals), true
+}
+
 // get is rid's committed row, normalized exactly as a table load normalizes it
 // (fullStoredRow: full width, generated columns computed).
 func (b *segRows) get(rid uint64) ([]Value, bool) {
@@ -240,6 +253,45 @@ func (b *segRows) has(rid uint64) bool {
 // walk yields every committed row in ascending signed-rowid order.
 func (b *segRows) walk(yield func(uint64, []Value) bool) {
 	b.walkWith(func(rid uint64, vals []Value) []Value { return fullStoredRow(b.tbl, rid, vals) }, yield)
+}
+
+// walkColumn is walk decoding column col alone, of a table with no generated
+// column, into one row it reuses: a committed file with no log over the table
+// is read a cell at a time, anything else through walkWithCols.
+func (b *segRows) walkColumn(col int, yield func(uint64, []Value) bool) {
+	widen := func(_ uint64, vals []Value) []Value { return widenStoredRow(b.tbl.cols, vals) }
+	src := b.rp.segs
+	if src == nil {
+		return
+	}
+	_, live, err := src.liveRows(b.root)
+	segs, ok := src.byRoot[b.root]
+	if _, _, clean := src.overlayFor(b.root); err != nil || live || !ok || !clean {
+		b.walkWithCols(columnMask(1)<<uint(col), widen, yield)
+		return
+	}
+	row := make([]Value, len(b.tbl.cols))
+	for i := range row {
+		row[i] = Value{Typ: valueUnread}
+	}
+	for _, s := range segs {
+		for i := 0; i < s.nRows; i++ {
+			vals := row
+			if w := min(s.Width(i), len(s.cols)); col < w {
+				row[col] = s.Value(col, i)
+			} else {
+				// A row from before an ADD COLUMN: the column's default.
+				short := make([]Value, w)
+				for c := range short {
+					short[c] = Value{Typ: valueUnread}
+				}
+				vals = widen(s.Rowid(i), short)
+			}
+			if !yield(s.Rowid(i), vals) {
+				return
+			}
+		}
+	}
 }
 
 // walkStored is walk handing out the stored values (widenStoredRow), no
@@ -426,10 +478,15 @@ func (s *rowStore) segLen() int {
 // puts is not yielded a second time: the overlay's keys are taken before the
 // walk, and the base walk skips any rowid the overlay holds by then.
 func (s *rowStore) segAll(yield func(uint64, []Value) bool) {
+	s.segAllWith(s.seg.walk, yield)
+}
+
+// segAllWith is segAll walking the base rows with walk.
+func (s *rowStore) segAllWith(walk func(func(uint64, []Value) bool), yield func(uint64, []Value) bool) {
 	over := slices.Collect(maps.Keys(s.m))
 	if !s.baseGone {
 		stop := false
-		s.seg.walk(func(rid uint64, vals []Value) bool {
+		walk(func(rid uint64, vals []Value) bool {
 			if _, o := s.m[rid]; o || s.isGone(rid) || s.baseGone {
 				return true
 			}

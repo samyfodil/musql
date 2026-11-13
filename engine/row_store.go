@@ -131,6 +131,21 @@ func (s *rowStore) get(rowid uint64) ([]Value, bool) {
 	return s.resolve(vals), ok
 }
 
+// getCols is get for a reader of the columns in cols alone: a committed row
+// of a table with no generated column has the rest valueUnread.
+func (s *rowStore) getCols(rowid uint64, cols columnMask) ([]Value, bool) {
+	if s == nil || s.seg == nil || cols == allColumns {
+		return s.get(rowid)
+	}
+	if vals, ok := s.m[rowid]; ok {
+		return s.resolve(vals), true
+	}
+	if s.baseGone || s.isGone(rowid) {
+		return nil, false
+	}
+	return s.seg.getCols(rowid, cols)
+}
+
 // row returns rowid's row, or nil when there is none.
 func (s *rowStore) row(rowid uint64) []Value {
 	vals, _ := s.get(rowid)
@@ -338,6 +353,17 @@ func (s *rowStore) len() int {
 
 // all yields every row in no particular order. The body may put an existing
 // rowid or drop any rowid as it goes, as a range over a map allows.
+// allFor is all for a reader of column col alone that keeps no row it is
+// handed: a base row of a table with no generated column decodes only that
+// column, the rest left unread, into a row reused from one to the next.
+func (s *rowStore) allFor(col int) iter.Seq2[uint64, []Value] {
+	if s == nil || s.seg == nil || col < 0 || col >= 63 || hasGeneratedCols(s.seg.tbl.cols) {
+		return s.all()
+	}
+	walk := func(yield func(uint64, []Value) bool) { s.seg.walkColumn(col, yield) }
+	return func(yield func(uint64, []Value) bool) { s.segAllWith(walk, yield) }
+}
+
 func (s *rowStore) all() iter.Seq2[uint64, []Value] {
 	if s == nil {
 		return func(func(uint64, []Value) bool) {}
