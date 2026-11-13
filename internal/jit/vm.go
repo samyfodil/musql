@@ -404,6 +404,10 @@ type VCursor struct {
 	// Idx, when not nil, is the equality indexes VSeekIdx searches: the first
 	// of the VIdxs of the table's segments, in order.
 	Idx unsafe.Pointer
+	// Segs, when not nil, is in segment mode the VSeg of each position, a
+	// list of N pointers: the row at Pos is read from Segs[Pos] rather than
+	// Seg (a seek's run over several segments). VRowid exits.
+	Segs unsafe.Pointer
 }
 
 // VTextLit is one TEXT of a VInText list: its bytes and their length.
@@ -417,7 +421,9 @@ type VTextLit struct {
 // NVals+1 int32s where each value's rows begin in Rows, Rows the segment rows
 // (ints) in the order a seek visits them, Seg the segment's VSeg and Mask the
 // columns native code reads from it. Count is how many VIdxs this one and
-// those after it in the table's array make.
+// those after it in the table's array make. Segs, when not nil, makes it an
+// index over several segments: the VSeg of each of Rows, a seek's run its
+// cursor's Segs; Seg is then any one of them.
 type VIdx struct {
 	Vals   unsafe.Pointer
 	NVals  int64
@@ -427,6 +433,7 @@ type VIdx struct {
 	Mask   uint64
 	Count  int64
 	Lo, Hi int64
+	Segs   unsafe.Pointer
 }
 
 // VTab is the segments of a table, in the order the engine searches them.
@@ -479,7 +486,7 @@ const (
 )
 
 const (
-	VCursorSize     = 144
+	VCursorSize     = 152
 	VCursorOffRows  = 0
 	VCursorOffN     = 8
 	VCursorOffPos   = 16
@@ -498,6 +505,7 @@ const (
 	VCursorOffSrvd  = 120
 	VCursorOffSel   = 128
 	VCursorOffIdx   = 136
+	VCursorOffSegs  = 144
 	VIdxOffVals     = 0
 	VIdxOffNVals    = 8
 	VIdxOffStarts   = 16
@@ -507,7 +515,8 @@ const (
 	VIdxOffCount    = 48
 	VIdxOffLo       = 56
 	VIdxOffHi       = 64
-	VIdxSize        = 72
+	VIdxOffSegs     = 72
+	VIdxSize        = 80
 	VTabOffSegs     = 0
 	VTabOffN        = 8
 	VTabSegSize     = 40

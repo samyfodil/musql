@@ -940,6 +940,9 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		a.LdrImm(X4, X9, VCursorOffN)
 		a.Cmp(X10, X4)
 		a.BcondRaw(armHS, e.stub(pc)) // unsigned: a position before the first row is huge
+		// A row of several segments' run (VCursor.Segs) is the VDBE's.
+		a.LdrImm(X4, X9, VCursorOffSegs)
+		a.Cbnz(X4, e.stub(pc))
 		// A selection's position names its segment row (VCursor.Sel).
 		row := e.vmLabel("rs")
 		a.LdrImm(X4, X9, VCursorOffSel)

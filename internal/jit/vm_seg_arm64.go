@@ -76,6 +76,7 @@ func (e *vmEmitArm) segColumn(pc int, in VInsn) {
 		a.LdrImm(X5, base, VCursorOffPos)
 		a.LdrImm(X6, base, VCursorOffSeg)
 		a.Cbz(X6, prows)
+		e.rowSeg(base)
 		a.LdrImm(X4, base, VCursorOffSel)
 		a.Cbz(X4, fnosel)
 		a.LdrRegIdx(X5, X4, X5)
@@ -134,6 +135,7 @@ func (e *vmEmitArm) segColumn(pc int, in VInsn) {
 	a.B(done)
 
 	a.Label(seg)
+	e.rowSeg(X9)
 	nosel := e.vmLabel("sl")
 	a.LdrImm(X4, X9, VCursorOffSel) // a selection's row for the position
 	a.Cbz(X4, nosel)
@@ -332,6 +334,7 @@ func (e *vmEmitArm) seekRowid(pc int, in VInsn) {
 	a.LdrImm(X10, X5, VTabSegOffMask)
 	a.StrImm(X10, X9, VCursorOffMask)
 	a.StrImm(xzr, X9, VCursorOffSel)
+	a.StrImm(xzr, X9, VCursorOffSegs)
 	a.StrImm(X8, X9, VCursorOffPos)
 	a.StrImm(X8, X9, VCursorOffLast)
 	a.AddImm(X10, X8, 1)
@@ -352,6 +355,7 @@ func (e *vmEmitArm) seekRowid(pc int, in VInsn) {
 	a.StrImm(X4, X9, VCursorOffKey)
 	a.StrImm(xzr, X9, VCursorOffN)
 	a.StrImm(xzr, X9, VCursorOffPos)
+	a.StrImm(xzr, X9, VCursorOffSegs)
 	a.MovImm16(X10, 1)
 	a.StrImm(X10, X9, VCursorOffOk)
 	a.StrImm(X10, X9, VCursorOffDirty)
@@ -446,6 +450,12 @@ func (e *vmEmitArm) seekIdx(pc int, in VInsn) {
 	a.LdrImm(X10, X5, VIdxOffRows)
 	a.AddRegLSL3(X10, X10, X11)
 	a.StrImm(X10, X9, VCursorOffSel)
+	fsegs := e.vmLabel("iz")
+	a.LdrImm(X10, X5, VIdxOffSegs)
+	a.Cbz(X10, fsegs)
+	a.AddRegLSL3(X10, X10, X11)
+	a.Label(fsegs)
+	a.StrImm(X10, X9, VCursorOffSegs)
 	a.LdrImm(X10, X5, VIdxOffSeg)
 	a.StrImm(X10, X9, VCursorOffSeg)
 	a.LdrImm(X10, X10, VSegOffRowids)
@@ -468,6 +478,7 @@ func (e *vmEmitArm) seekIdx(pc int, in VInsn) {
 	a.StrImm(X4, X9, VCursorOffKey)
 	a.StrImm(xzr, X9, VCursorOffN)
 	a.StrImm(xzr, X9, VCursorOffPos)
+	a.StrImm(xzr, X9, VCursorOffSegs)
 	a.MovImm16(X10, 1)
 	a.StrImm(X10, X9, VCursorOffOk)
 	a.StrImm(X10, X9, VCursorOffDirty)
@@ -515,6 +526,18 @@ func (e *vmEmitArm) seekRewind(pc int, in VInsn) {
 	a.StrImm(X10, X9, VCursorOffState)
 }
 
+// rowSeg sets X6 to the VSeg of the row at position X5 of the cursor at cur
+// when its Segs lists one per position, leaving X6 its Seg otherwise. X4 is
+// scratch.
+func (e *vmEmitArm) rowSeg(cur Reg64) {
+	a := e.a
+	skip := e.vmLabel("sy")
+	a.LdrImm(X4, cur, VCursorOffSegs)
+	a.Cbz(X4, skip)
+	a.LdrRegIdx(X6, X4, X5)
+	a.Label(skip)
+}
+
 // nullRow is vm_seg_amd64.go's VNullRow.
 func (e *vmEmitArm) nullRow(pc int, in VInsn) {
 	a := e.a
@@ -526,7 +549,7 @@ func (e *vmEmitArm) nullRow(pc int, in VInsn) {
 	for _, f := range []struct {
 		off int
 		v   int64
-	}{{VCursorOffSel, 0}, {VCursorOffRids, 0}, {VCursorOffN, 1}, {VCursorOffPos, 0}, {VCursorOffLast, 0}, {VCursorOffOk, 1},
+	}{{VCursorOffSel, 0}, {VCursorOffSegs, 0}, {VCursorOffRids, 0}, {VCursorOffN, 1}, {VCursorOffPos, 0}, {VCursorOffLast, 0}, {VCursorOffOk, 1},
 		{VCursorOffDirty, 1}, {VCursorOffAdv, 0}, {VCursorOffRew, 0}, {VCursorOffMask, -1}, {VCursorOffState, 6}} {
 		a.MovImm64(X10, f.v)
 		a.StrImm(X10, X9, f.off)

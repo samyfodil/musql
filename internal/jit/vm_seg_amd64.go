@@ -41,6 +41,18 @@ func (a *Asm) MovRegMemD32(dst, base Reg, disp int32) {
 // (holds[^A]); each read then tests only that its column is plain (no NULL
 // bitmap, no exceptions) and of the kind predicted, and goes straight to that
 // kind's read. Anything else takes the full read below.
+// rowSeg sets R9 to the VSeg of the row at position RDX of the cursor at cur
+// when its Segs lists one per position, leaving R9 its Seg otherwise. RCX is
+// scratch.
+func (e *vmEmit) rowSeg(cur Reg, skip Lbl) {
+	a := e.a
+	a.MovRegMemD(RCX, cur, VCursorOffSegs)
+	a.TestRegReg(RCX, RCX)
+	a.JccL(CondE, skip)
+	a.MovRegMemIdx(R9, RCX, RDX)
+	a.Bind(skip)
+}
+
 // predictedRowRead is segColumn's predicted read of a cursor on its row list,
 // reached at label prows with base the cursor's address and RDX its position:
 // the run's first read of the cursor checks the row is as wide as every
@@ -158,6 +170,7 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 		a.MovRegMemD(R9, base, VCursorOffSeg)
 		a.TestRegReg(R9, R9)
 		a.JccL(CondE, l("prows"))
+		e.rowSeg(base, l("fsegs"))
 		a.MovRegMemD(R10, base, VCursorOffSel)
 		a.TestRegReg(R10, R10)
 		a.JccL(CondE, l("fnosel"))
@@ -218,6 +231,8 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 	// The segment's: R9 the VSeg, RDX the row (Sel[Pos] when the cursor has
 	// a selection), R10 the column's VSegCol.
 	a.Bind(l("seg"))
+	a.LeaRegMemD(RCX, RAX, cb)
+	e.rowSeg(RCX, l("segs"))
 	a.MovRegMemD(R10, RAX, cb+VCursorOffSel)
 	a.TestRegReg(R10, R10)
 	a.JccL(CondE, l("nosel"))
@@ -451,6 +466,7 @@ func (e *vmEmit) seekRowid(pc int, in VInsn) {
 	a.MovRegMemD(RCX, R10, VTabSegOffMask)
 	a.MovMemDReg(R9, VCursorOffMask, RCX)
 	a.MovMemDImm(R9, VCursorOffSel, 0)
+	a.MovMemDImm(R9, VCursorOffSegs, 0)
 	a.MovMemDReg(R9, VCursorOffPos, RAX)
 	a.MovMemDReg(R9, VCursorOffLast, RAX)
 	a.IncReg(RAX)
@@ -565,6 +581,12 @@ func (e *vmEmit) seekIdx(pc int, in VInsn) {
 	a.MovRegMemD(RDX, R9, VIdxOffRows)
 	a.LeaIdx(RDX, RDX, RCX)
 	a.MovMemDReg(R10, VCursorOffSel, RDX)
+	a.MovRegMemD(RAX, R9, VIdxOffSegs)
+	a.TestRegReg(RAX, RAX)
+	a.JccL(CondE, l("fsegs"))
+	a.LeaIdx(RAX, RAX, RCX)
+	a.Bind(l("fsegs"))
+	a.MovMemDReg(R10, VCursorOffSegs, RAX)
 	a.MovRegMemD(RCX, R9, VIdxOffSeg)
 	a.MovMemDReg(R10, VCursorOffSeg, RCX)
 	a.MovRegMemD(RCX, RCX, VSegOffRowids)
@@ -586,6 +608,7 @@ func (e *vmEmit) seekIdx(pc int, in VInsn) {
 	a.MovMemDReg(R10, VCursorOffKey, RCX)
 	a.MovMemDImm(R10, VCursorOffN, 0)
 	a.MovMemDImm(R10, VCursorOffPos, 0)
+	a.MovMemDImm(R10, VCursorOffSegs, 0)
 	a.MovMemDImm(R10, VCursorOffOk, 1)
 	a.MovMemDImm(R10, VCursorOffDirty, 1)
 	a.MovMemDImm(R10, VCursorOffState, 3)
@@ -638,7 +661,7 @@ func (e *vmEmit) nullRow(pc int, in VInsn) {
 	a.MovRegMemD(RAX, RDI, POffCur)
 	a.MovRegImm64(RCX, nullSegAddr())
 	a.MovMemDReg(RAX, cb+VCursorOffSeg, RCX)
-	for _, f := range []struct{ off, v int32 }{{VCursorOffSel, 0}, {VCursorOffRids, 0}, {VCursorOffN, 1}, {VCursorOffPos, 0},
+	for _, f := range []struct{ off, v int32 }{{VCursorOffSel, 0}, {VCursorOffSegs, 0}, {VCursorOffRids, 0}, {VCursorOffN, 1}, {VCursorOffPos, 0},
 		{VCursorOffLast, 0}, {VCursorOffOk, 1}, {VCursorOffDirty, 1}, {VCursorOffAdv, 0}, {VCursorOffRew, 0}, {VCursorOffMask, -1},
 		{VCursorOffState, 6}} {
 		a.MovMemDImm(RAX, cb+f.off, f.v)

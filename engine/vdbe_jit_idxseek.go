@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"cmp"
 	"encoding/binary"
 	"fmt"
 	"slices"
@@ -33,8 +34,9 @@ type idxSeekSpec struct {
 	// each segment's rows in the order of sortCols (segment.sortedOn), the
 	// order segSortedSeek puts a run in, and the VDBE takes the cursor back on
 	// native code's run (syncSortedSeek).
-	sorted   *sortedSeekHint
-	sortCols []int
+	sorted    *sortedSeekHint
+	sortCols  []int
+	sortColls []string
 }
 
 // lowerIdxSeeks lowers each integer equality index seek -- an OpSeekIndexHint's
@@ -211,11 +213,12 @@ func lowerIdxSeeks(prog *Program, vp []jit.VInsn, segCap []bool) (specs []*idxSe
 
 // sortedSeekSpec is the spec of the OpSortedSeek at pc when native code can
 // make it as a VSeekIdx, and the pc of its rewind: a seek on an INTEGER
-// column of a segment table, nothing between it and its rewind but a LEFT
-// JOIN's match flag, and the run in an order sortedOn gives -- the column's,
-// ties in rowid order, or the cursor's one automatic index key, run once
-// after its one open and before any seek, on clean ascending columns led by
-// the seek's.
+// column of a segment table, nothing between it and its rewind but constants
+// (a LEFT JOIN's match flag, a literal the level's test compares), and its
+// run in rowid order or in that of the cursor's one automatic index key, run
+// once after its one open and before any seek. The key's columns the seek
+// holds to one value (its own, sortedSeekPins) do not order the rows the
+// loop keeps; the others must be ascending and not REAL.
 func sortedSeekSpec(insns []Instruction, pc int, segCap []bool, nReg int) (*idxSeekSpec, int, bool) {
 	in := &insns[pc]
 	c := in.P1
@@ -225,8 +228,13 @@ func sortedSeekSpec(insns []Instruction, pc int, segCap []bool, nReg int) (*idxS
 		return nil, 0, false
 	}
 	end := pc + 1
-	for end < len(insns) && (insns[end].Op == OpInteger || insns[end].Op == OpNull) {
-		end++
+	for end < len(insns) {
+		switch insns[end].Op {
+		case OpInteger, OpInt64, OpNull, OpReal, OpString8:
+			end++
+			continue
+		}
+		break
 	}
 	if end >= len(insns) || insns[end].Op != OpRewind || insns[end].P1 != c || insns[end].P4 != nil {
 		return nil, 0, false
@@ -251,17 +259,13 @@ func sortedSeekSpec(insns []Instruction, pc int, segCap []bool, nReg int) (*idxS
 	if open < 0 || open > pc || tbl == nil || h.col >= len(tbl.cols) || h.col == tbl.ipkIndex || tbl.cols[h.col].Aff == affReal {
 		return nil, 0, false
 	}
-	spec := &idxSeekSpec{col: h.col, seek: pc, aio: -1, open: -1, sorted: h, sortCols: []int{h.col}}
+	spec := &idxSeekSpec{col: h.col, seek: pc, aio: -1, open: -1, sorted: h, sortCols: []int{h.col}, sortColls: []string{""}}
 	if aio >= 0 {
 		key, _ := insns[aio].P4.(*autoIndexKey)
-		if aio < open || aio > pc || key == nil || !segRunOrderable(tbl, key) || key.rjSweep != nil || key.cols[0] != h.col {
+		if aio < open || aio > pc || key == nil || !segRunOrderable(tbl, key) || key.rjSweep != nil {
 			return nil, 0, false
 		}
-		var cols []int
 		for i, col := range key.cols {
-			if i < len(key.desc) && key.desc[i] {
-				return nil, 0, false
-			}
 			if col < 0 || col == tbl.ipkIndex {
 				// The rowid, last: a run keeps its rows in rowid order.
 				if i != len(key.cols)-1 {
@@ -269,14 +273,29 @@ func sortedSeekSpec(insns []Instruction, pc int, segCap []bool, nReg int) (*idxS
 				}
 				continue
 			}
-			if tbl.cols[col].Aff == affReal {
+			if col == h.col || sortedSeekPins(h, col, key.colls[i]) {
+				continue
+			}
+			if i < len(key.desc) && key.desc[i] || tbl.cols[col].Aff == affReal {
 				return nil, 0, false
 			}
-			cols = append(cols, col)
+			spec.sortCols, spec.sortColls = append(spec.sortCols, col), append(spec.sortColls, key.colls[i])
 		}
-		spec.order, spec.sortCols = key, cols
+		spec.order = key
 	}
 	return spec, end, true
+}
+
+// sortedSeekPins reports whether a sorted seek holds column col to one value
+// under collation coll: every row its loop keeps has it, so a run's order
+// does not depend on it.
+func sortedSeekPins(h *sortedSeekHint, col int, coll string) bool {
+	for _, m := range h.more {
+		if m.col == col && equalFoldName(effectiveCollation(m.coll), effectiveCollation(coll)) {
+			return true
+		}
+	}
+	return false
 }
 
 // openedTab is the table cursor c's OpOpenRead opens, as tabFor last worked
@@ -346,15 +365,19 @@ type vmIdx struct {
 	// no file holds (buildSortedVMIdx).
 	vals   [][]int64
 	starts [][]int32
-	vidx   []jit.VIdx
-	none   bool
+	// rowSegs and segPtrs are, for an index over several segments (one
+	// vidx whose Segs is segPtrs), the segment of each of keep[0]'s rows.
+	rowSegs []*segment
+	segPtrs []unsafe.Pointer
+	vidx    []jit.VIdx
+	none    bool
 }
 
 // idxFor returns cursor c's table as VSeekIdx searches it, or nil.
-func (jx *vmJIT) idxFor(c int, t *vmTab) *vmIdx {
+func (jx *vmJIT) idxFor(c int, t *vmTab, enc TextEncoding) *vmIdx {
 	x := jx.idxs[c].Load()
 	if x == nil || x.tab != t {
-		x = buildVMIdx(t, jx.idxSpecs[c])
+		x = buildVMIdx(t, jx.idxSpecs[c], enc)
 		jx.idxs[c].Store(x)
 	}
 	if x.none {
@@ -366,13 +389,13 @@ func (jx *vmJIT) idxFor(c int, t *vmTab) *vmIdx {
 // buildVMIdx works out t's indexes for spec: every segment, in rowid order,
 // with an index over the column that holds INTEGERs (the postings codec), and
 // whose rows within each value already run in spec's order when it has one.
-func buildVMIdx(t *vmTab, spec *idxSeekSpec) *vmIdx {
+func buildVMIdx(t *vmTab, spec *idxSeekSpec, enc TextEncoding) *vmIdx {
 	x := &vmIdx{tab: t, none: true}
 	if t == nil || t.none || len(t.at) == 0 || len(t.at) != len(t.segs) {
 		return x
 	}
 	if spec.sorted != nil {
-		return buildSortedVMIdx(x, spec)
+		return buildSortedVMIdx(x, spec, enc)
 	}
 	var prevRid uint64
 	for k, sg := range t.at {
@@ -408,7 +431,184 @@ func buildVMIdx(t *vmTab, spec *idxSeekSpec) *vmIdx {
 // buildSortedVMIdx is buildVMIdx for a sorted seek: each segment's rows in
 // the order of the spec's columns, ties in rowid order, as segSortedSeek
 // orders a run, every column a clean INTEGER block.
-func buildSortedVMIdx(x *vmIdx, spec *idxSeekSpec) *vmIdx {
+func buildSortedVMIdx(x *vmIdx, spec *idxSeekSpec, enc TextEncoding) *vmIdx {
+	if y := buildSegSortedVMIdx(&vmIdx{tab: x.tab, none: true}, spec); !y.none && !overlapping(y.vidx) {
+		return y
+	}
+	if y := buildTableSortedVMIdx(&vmIdx{tab: x.tab, none: true}, spec); !y.none {
+		return y
+	}
+	return buildTableSortedVMIdxValues(x, spec, enc)
+}
+
+// overlapping reports whether two segments' indexes share more than a key at
+// their boundary: VSeekIdx exits on a key whose rows two segments hold, which
+// for keys spread over every segment is every key.
+func overlapping(vidx []jit.VIdx) bool {
+	for k := 1; k < len(vidx); k++ {
+		if vidx[k].Lo < vidx[k-1].Hi {
+			return true
+		}
+	}
+	return false
+}
+
+// buildTableSortedVMIdx is buildSortedVMIdx as one index over every segment of
+// the table, as segSortedRowsFor and orderRun order the rows: a NULL key is in
+// no run, and a run's rows go by the spec's columns, a NULL before any
+// INTEGER, ties in rowid order.
+func buildTableSortedVMIdx(x *vmIdx, spec *idxSeekSpec) *vmIdx {
+	t := x.tab
+	nk := len(spec.sortCols)
+	if nk > 4 || nk == 0 || len(t.at) > 1<<16 {
+		return x
+	}
+	type row struct {
+		k     [4]int64
+		nulls uint8
+		seg   uint16
+		r     int32
+	}
+	var rows []row
+	var prevRid uint64
+	mask := ^uint64(0)
+	for si, sg := range t.at {
+		if si > 0 && sg.Rowid(0) <= prevRid {
+			return x
+		}
+		prevRid = sg.Rowid(sg.nRows - 1)
+		mask &= t.segs[si].Mask
+		blocks := make([][]int64, nk)
+		allNull := make([]bool, nk)
+		for j, c := range spec.sortCols {
+			if sg.hasException(c) {
+				return x
+			}
+			b, ok := sg.Int64Column(c)
+			switch {
+			case ok && len(b) >= sg.nRows:
+				blocks[j] = b
+			case j > 0 && sg.cols[c].phys == PhysNull:
+				allNull[j] = true
+			default:
+				return x
+			}
+		}
+		key := spec.sortCols[0]
+		nulls := sg.cols[key].nullOff != 0
+		for i := range sg.nRows {
+			if nulls && sg.isNull(key, i) {
+				continue
+			}
+			rw := row{seg: uint16(si), r: int32(i)}
+			for j, c := range spec.sortCols {
+				if allNull[j] || j > 0 && sg.cols[c].nullOff != 0 && sg.isNull(c, i) {
+					rw.nulls |= 1 << j
+				} else {
+					rw.k[j] = blocks[j][i]
+				}
+			}
+			rows = append(rows, rw)
+		}
+	}
+	if len(rows) == 0 {
+		return x
+	}
+	slices.SortStableFunc(rows, func(a, b row) int {
+		for j := range nk {
+			na, nb := a.nulls>>j&1, b.nulls>>j&1
+			if c := cmp.Compare(nb, na); c != 0 {
+				return c
+			}
+			if c := cmp.Compare(a.k[j], b.k[j]); na == 0 && c != 0 {
+				return c
+			}
+		}
+		return 0
+	})
+	return x.tableIndex(mask, len(rows), func(i int) (int, int, int64) { return int(rows[i].seg), int(rows[i].r), rows[i].k[0] })
+}
+
+// buildTableSortedVMIdxValues is buildTableSortedVMIdx over any columns: a
+// run's rows go by the segments' own values, compared as orderRun's
+// autoIndexSortValues compares them.
+func buildTableSortedVMIdxValues(x *vmIdx, spec *idxSeekSpec, enc TextEncoding) *vmIdx {
+	t := x.tab
+	if len(t.at) > 1<<16 || len(spec.sortColls) != len(spec.sortCols) {
+		return x
+	}
+	type row struct {
+		k   int64
+		seg uint16
+		r   int32
+	}
+	var rows []row
+	var prevRid uint64
+	mask := ^uint64(0)
+	key := spec.sortCols[0]
+	for si, sg := range t.at {
+		if si > 0 && sg.Rowid(0) <= prevRid {
+			return x
+		}
+		prevRid = sg.Rowid(sg.nRows - 1)
+		mask &= t.segs[si].Mask
+		b, ok := sg.Int64Column(key)
+		if !ok || len(b) < sg.nRows || sg.hasException(key) {
+			return x
+		}
+		nulls := sg.cols[key].nullOff != 0
+		for i := range sg.nRows {
+			if !nulls || !sg.isNull(key, i) {
+				rows = append(rows, row{k: b[i], seg: uint16(si), r: int32(i)})
+			}
+		}
+	}
+	if len(rows) == 0 {
+		return x
+	}
+	slices.SortStableFunc(rows, func(a, b row) int {
+		if c := cmp.Compare(a.k, b.k); c != 0 {
+			return c
+		}
+		sa, sb := t.at[a.seg], t.at[b.seg]
+		for j := 1; j < len(spec.sortCols); j++ {
+			c := spec.sortCols[j]
+			if c := compareValuesCollatedEnc(sa.Value(c, int(a.r)), sb.Value(c, int(b.r)), spec.sortColls[j], enc); c != 0 {
+				return c
+			}
+		}
+		return 0
+	})
+	return x.tableIndex(mask, len(rows), func(i int) (int, int, int64) { return int(rows[i].seg), int(rows[i].r), rows[i].k })
+}
+
+// tableIndex makes x the one index over every segment whose n rows, in
+// order, are at(i): segment, row and key.
+func (x *vmIdx) tableIndex(mask uint64, n int, at func(i int) (seg, r int, k int64)) *vmIdx {
+	t := x.tab
+	keep := make([]int, n)
+	x.rowSegs, x.segPtrs = make([]*segment, n), make([]unsafe.Pointer, n)
+	var vals []int64
+	var starts []int32
+	for i := range n {
+		seg, r, k := at(i)
+		keep[i], x.rowSegs[i], x.segPtrs[i] = r, t.at[seg], t.segs[seg].Seg
+		if i == 0 || k != vals[len(vals)-1] {
+			vals, starts = append(vals, k), append(starts, int32(i))
+		}
+	}
+	starts = append(starts, int32(n))
+	x.vidx = []jit.VIdx{{Vals: unsafe.Pointer(unsafe.SliceData(vals)), NVals: int64(len(vals)), Starts: unsafe.Pointer(unsafe.SliceData(starts)),
+		Rows: unsafe.Pointer(unsafe.SliceData(keep)), Seg: t.segs[0].Seg, Mask: mask, Count: 1, Lo: vals[0], Hi: vals[len(vals)-1],
+		Segs: unsafe.Pointer(unsafe.SliceData(x.segPtrs))}}
+	x.keep, x.vals, x.starts = [][]int{keep}, [][]int64{vals}, [][]int32{starts}
+	x.none = false
+	return x
+}
+
+// buildSegSortedVMIdx is buildSortedVMIdx as each segment's own index, over
+// segments whose columns are clean INTEGER blocks (segment.sortedOn).
+func buildSegSortedVMIdx(x *vmIdx, spec *idxSeekSpec) *vmIdx {
 	t := x.tab
 	var prevRid uint64
 	for k, sg := range t.at {
@@ -568,7 +768,15 @@ func (m *vdbe) syncSortedSeek(jx *vmJIT, c int, jc *jit.VCursor, spec *idxSeekSp
 	}
 	src := &cur.pointSrc
 	segs, rows := src.listSegs[:0], src.listRows[:0]
-	if jc.State != 3 {
+	switch {
+	case jc.State == 3:
+	case x.rowSegs != nil:
+		at := int((uintptr(jc.Sel) - uintptr(unsafe.Pointer(unsafe.SliceData(x.keep[0])))) / 8)
+		if jc.Sel == nil || jc.N <= 0 || at < 0 || at+int(jc.N) > len(x.rowSegs) {
+			return fmt.Errorf("engine: internal: cursor %d seeked natively is on no run of its index", c)
+		}
+		segs, rows = append(segs, x.rowSegs[at:at+int(jc.N)]...), append(rows, x.keep[0][at:at+int(jc.N)]...)
+	default:
 		k := slices.IndexFunc(x.vidx, func(v jit.VIdx) bool { return v.Seg == jc.Seg })
 		if k < 0 || jc.Sel == nil || jc.N <= 0 {
 			return fmt.Errorf("engine: internal: cursor %d seeked natively is in no segment of its table", c)

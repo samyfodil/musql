@@ -976,6 +976,9 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		a.MovRegMemD(R9, RAX, cb+VCursorOffPos)
 		a.AluRegMemD(AluCmp, R9, RAX, cb+VCursorOffN)
 		e.jccStub(condAboveEq, pc) // unsigned: a position before the first row is huge
+		// A row of several segments' run (VCursor.Segs) is the VDBE's.
+		a.CmpMemDImm8(RAX, cb+VCursorOffSegs, 0)
+		e.jccStub(CondNE, pc)
 		// A selection's position names its segment row (VCursor.Sel).
 		a.MovRegMemD(RDX, RAX, cb+VCursorOffSel)
 		a.TestRegReg(RDX, RDX)
