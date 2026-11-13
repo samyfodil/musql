@@ -66,9 +66,11 @@ type vmJIT struct {
 	updSkip uint64
 	updPlan *updatePlan // that OP_UpdateRow's
 
-	// params is how many of the nReg registers, the last ones, hold the bound
-	// parameters (Program.jitParams); enter fills them.
+	// params is how many of the nReg registers, the last ones but outer's,
+	// hold the bound parameters (Program.jitParams), and outer the outer
+	// columns the last ones hold (Program.jitOuterCols); enter fills them.
 	params int
+	outer  []jitOuterCol
 
 	// text is whether the code has TEXT arms: enter says whether TEXTs
 	// compare converted, which VTextCmpJump leaves to the VDBE
@@ -200,10 +202,51 @@ func (prog *Program) jitParams() int {
 	return n
 }
 
+// maxJITOuter bounds the outer columns native code reads from registers of
+// their own (jitOuterCols); an OpOuterColumn of a later one exits.
+const maxJITOuter = 8
+
+// jitOuterCol is a column of an enclosing query's cursor that prog reads
+// (OpOuterColumn): depth frames up, that frame's cursor.
+type jitOuterCol struct{ depth, cursor, col int }
+
+// jitOuterCols are the outer columns prog reads, in the order they first
+// appear. A subquery's run never moves its enclosing query's cursors, so
+// vmJIT.enter reads each once into a register past the parameters' and
+// native code copies it from there.
+func (prog *Program) jitOuterCols() []jitOuterCol {
+	var cols []jitOuterCol
+	for i := range prog.Insns {
+		in := &prog.Insns[i]
+		if in.Op != OpOuterColumn {
+			continue
+		}
+		o := jitOuterCol{int(in.P5), in.P1, in.P2}
+		if !slices.Contains(cols, o) && len(cols) < maxJITOuter {
+			cols = append(cols, o)
+		}
+	}
+	return cols
+}
+
+// jitOuter is len(jitOuterCols), counted once.
+func (prog *Program) jitOuter() int {
+	if n := atomic.LoadInt32(&prog.outerRegs); n > 0 {
+		return int(n - 1)
+	}
+	n := len(prog.jitOuterCols())
+	atomic.StoreInt32(&prog.outerRegs, int32(n+1))
+	return n
+}
+
+// jitExtra is how many registers past NReg native code keeps: the
+// parameters', then the outer columns'.
+func (prog *Program) jitExtra() int { return prog.jitParams() + prog.jitOuter() }
+
 // regFile is regs as prog's register file: NReg long, with room past that for
-// jitParams. keep says regs' old values may stay; otherwise they are cleared.
+// jitExtra. keep says regs' old values may stay; otherwise they are cleared.
 func (prog *Program) regFile(regs []Value, keep bool) []Value {
-	if want := prog.NReg + prog.jitParams(); cap(regs) < want {
+	if want := prog.NReg + prog.jitExtra(); cap(regs) < want {
 		return make([]Value, prog.NReg, want)
 	}
 	regs = regs[:prog.NReg]
@@ -263,6 +306,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	// lowered (jit.VFusable), so a program with none skips the pass.
 	fusable := false
 	nParams := prog.jitParams()
+	outer := prog.jitOuterCols()
 	ipk := writeCursorIPK(prog)
 	realVP, realOK := vmRealLowering(prog, p.segStoresReal)
 	textVP, textOK := vmTextLowering(prog, p.segStoresText)
@@ -298,6 +342,12 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 			// A shallow copy of the parameter, from the register past NReg
 			// that enter fills with it (jitParams).
 			vp[pc] = jit.VInsn{Op: jit.VCopy, A: prog.NReg + in.P1 - 1, B: in.P2, Imm: 1}
+		case in.Op == OpOuterColumn && in.P3 >= 0 && in.P3 < prog.NReg:
+			// A shallow copy of the outer column, which enter reads into the
+			// register past the parameters' (jitOuterCols).
+			if i := slices.Index(outer, jitOuterCol{int(in.P5), in.P1, in.P2}); i >= 0 {
+				vp[pc] = jit.VInsn{Op: jit.VCopy, A: prog.NReg + nParams + i, B: in.P3, Imm: 1}
+			}
 		case vp[pc].Op == jit.VColumn && vp[pc].A < len(ipk) && ipk[vp[pc].A] == vp[pc].B:
 			// A rowid table's INTEGER PRIMARY KEY reads as the rowid.
 			vp[pc] = jit.VInsn{Op: jit.VRowid, A: vp[pc].A, C: vp[pc].C}
@@ -439,7 +489,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	if entries == 0 {
 		return nil
 	}
-	code, err := jit.MapVMFused(vp, prog.NReg+nParams, valueLayout, entry, fusable)
+	code, err := jit.MapVMFused(vp, prog.NReg+nParams+len(outer), valueLayout, entry, fusable)
 	if err != nil {
 		return nil
 	}
@@ -449,7 +499,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 			marked[pc].Op = OpJIT
 		}
 	}
-	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams, params: nParams, entry: entry, marked: marked, native: native, updAt: updAt,
+	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams + len(outer), params: nParams, outer: outer, entry: entry, marked: marked, native: native, updAt: updAt,
 		segCap: segCap, segNeed: segNeed, walkScan: walkScan, inSlots: inSlots, idxSpecs: idxSpecs,
 		aggAt: agg.at, aggSort: agg.sort, aggLo: agg.lo, aggHi: agg.hi, aggKey: agg.key, aggKeyLo: agg.keyLo, aggKeyN: agg.keyN}
 	if segCap != nil {
@@ -2119,7 +2169,7 @@ func jitReadColumn(cur *vdbeCursor, i int, dst *Value) bool {
 // native code ran no OpResultRow.
 func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 	regs := m.regs
-	if cap(regs) < jx.nReg || jx.nReg == 0 {
+	if cap(regs) < jx.nReg || jx.nReg == 0 || !jx.readOuter(m, regs[:jx.nReg]) {
 		m.flushJIT()
 		return pc, -1
 	}
@@ -2131,7 +2181,7 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 	if jx.params > 0 {
 		// The bound parameters, where native code's OpVariable reads them.
 		regs = regs[:jx.nReg]
-		base := jx.nReg - jx.params
+		base := jx.nReg - len(jx.outer) - jx.params
 		for i := range jx.params {
 			regs[base+i] = paramAt(m.params, i+1)
 		}
@@ -2238,6 +2288,28 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 		return int(args.PC), int(args.Yield) - 1
 	}
 	return int(args.PC), -1
+}
+
+// readOuter reads the outer columns native code copies (jitOuterCols) into
+// the last of regs, or reports a column it could not read, which the VDBE's
+// own OpOuterColumn then reads, or fails on, if the program reaches it.
+func (jx *vmJIT) readOuter(m *vdbe, regs []Value) bool {
+	base := len(regs) - len(jx.outer)
+	for i, o := range jx.outer {
+		fr := m
+		for range o.depth {
+			if fr = fr.parent; fr == nil {
+				return false
+			}
+		}
+		if o.cursor < 0 || o.cursor >= len(fr.cursors) || fr.cursors[o.cursor] == nil {
+			return false
+		}
+		if fr.cursors[o.cursor].readColumn(o.col, &regs[base+i]) != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // handCursor hands cursor c over to native code entered at pc (m.jcur[c]).

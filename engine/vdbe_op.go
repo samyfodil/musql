@@ -1251,6 +1251,8 @@ type Program struct {
 	// paramRegs caches jitParams: 0 not yet counted, else the count plus one.
 	// A stale count only costs a machine its native code (vmJIT.enter).
 	paramRegs int32
+	// outerRegs caches jitOuter the same way.
+	outerRegs int32
 	// txAppend is txAppendTarget's answer (insert_bulk_direct.go), kept.
 	txAppend *txAppendVerdict
 	NReg       int      // registers to allocate (r[0..NReg-1]).
