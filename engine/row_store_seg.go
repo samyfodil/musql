@@ -426,10 +426,15 @@ func (s *rowStore) segLen() int {
 // puts is not yielded a second time: the overlay's keys are taken before the
 // walk, and the base walk skips any rowid the overlay holds by then.
 func (s *rowStore) segAll(yield func(uint64, []Value) bool) {
+	s.segAllWith(s.seg.walk, yield)
+}
+
+// segAllWith is segAll walking the base rows with walk.
+func (s *rowStore) segAllWith(walk func(func(uint64, []Value) bool), yield func(uint64, []Value) bool) {
 	over := slices.Collect(maps.Keys(s.m))
 	if !s.baseGone {
 		stop := false
-		s.seg.walk(func(rid uint64, vals []Value) bool {
+		walk(func(rid uint64, vals []Value) bool {
 			if _, o := s.m[rid]; o || s.isGone(rid) || s.baseGone {
 				return true
 			}

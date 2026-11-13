@@ -205,7 +205,7 @@ func (s *rowStore) eqIndexFor(col int) (*rsEqIndex, bool) {
 		s.eqIdx = map[int]*rsEqIndex{}
 	}
 	idx := &rsEqIndex{rows: make(map[int64][]uint64, len(s.m))}
-	for rid, vals := range s.all() {
+	for rid, vals := range s.allFor(col) {
 		if col >= len(vals) {
 			idx.short = append(idx.short, rid)
 			continue

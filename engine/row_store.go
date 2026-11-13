@@ -338,6 +338,19 @@ func (s *rowStore) len() int {
 
 // all yields every row in no particular order. The body may put an existing
 // rowid or drop any rowid as it goes, as a range over a map allows.
+// allFor is all for a reader of column col alone: a base row of a table with
+// no generated column decodes only that column, the rest left unread.
+func (s *rowStore) allFor(col int) iter.Seq2[uint64, []Value] {
+	if s == nil || s.seg == nil || col < 0 || col >= 63 || hasGeneratedCols(s.seg.tbl.cols) {
+		return s.all()
+	}
+	b := s.seg
+	walk := func(yield func(uint64, []Value) bool) {
+		b.walkWithCols(columnMask(1)<<uint(col), func(_ uint64, vals []Value) []Value { return widenStoredRow(b.tbl.cols, vals) }, yield)
+	}
+	return func(yield func(uint64, []Value) bool) { s.segAllWith(walk, yield) }
+}
+
 func (s *rowStore) all() iter.Seq2[uint64, []Value] {
 	if s == nil {
 		return func(func(uint64, []Value) bool) {}
