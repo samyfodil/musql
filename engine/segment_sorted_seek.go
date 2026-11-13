@@ -36,6 +36,33 @@ type segSortedRows struct {
 	tbl     *resolvedTable
 	enc     TextEncoding
 	ordered map[int]bool
+	// distinct is how many values the column holds, counted the first time
+	// shortRuns asks; 0 until then.
+	distinct int
+}
+
+// maxSegSortedRun bounds the rows a sorted seek keyed on further columns
+// visits per probe when the segments serve it on its first column alone.
+const maxSegSortedRun = 256
+
+// shortRuns reports whether the column's runs average at most
+// maxSegSortedRun rows. A seek keyed on further columns too is served on
+// this one alone -- a superset of its rows, which the level's loop narrows,
+// as it tests every conjunct -- only where that superset stays small.
+func (s *segSortedRows) shortRuns() bool {
+	n := len(s.keys)
+	key := func(i int) int64 { return s.keys[i] }
+	if s.one != nil {
+		n, key = len(s.perm), func(i int) int64 { return s.block[s.perm[i]] }
+	}
+	if s.distinct == 0 {
+		for i := range n {
+			if i == 0 || key(i) != key(i-1) {
+				s.distinct++
+			}
+		}
+	}
+	return n <= s.distinct*maxSegSortedRun
 }
 
 // segSortedSeek positions cur on the rows whose column h.col equals probe,
@@ -46,8 +73,12 @@ type segSortedRows struct {
 // An OpAutoIndexOrder waiting on cur is taken over rather than applied: a run
 // of the built rows, once sorted by the key, is those rows in the key's order,
 // so each run is put in that order here, without building the table.
+//
+// A key of further columns is served on its first alone where its runs are
+// short (shortRuns): the run holds every row equal on all of them, in the
+// order they would come, and the loop drops the rest.
 func (cur *vdbeCursor) segSortedSeek(h *sortedSeekHint, probe Value, enc TextEncoding) bool {
-	if h.built || len(h.more) > 0 || cur.materialized || cur.fill != nil || cur.ranged || cur.seekConfigured || cur.idxSeekConfigured || cur.seekSetConfigured ||
+	if h.built || cur.materialized || cur.fill != nil || cur.ranged || cur.seekConfigured || cur.idxSeekConfigured || cur.seekSetConfigured ||
 		cur.segSorted == nil && (cur.segSrc != nil || cur.keyListReady) {
 		return false
 	}
@@ -70,7 +101,7 @@ func (cur *vdbeCursor) segSortedSeek(h *sortedSeekHint, probe Value, enc TextEnc
 		s.order, s.tbl, s.enc = key, cur.tbl, enc
 		cur.segSorted = s
 	}
-	if !s.ok {
+	if !s.ok || len(h.more) > 0 && !s.shortRuns() {
 		return false
 	}
 	cur.segOrder, cur.pendingOrder = orderOp, nil
