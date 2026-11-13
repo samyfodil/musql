@@ -285,6 +285,26 @@ func r36dWithCTEDefs(have map[string]*CTEDef, defs []CTEDef) map[string]*CTEDef 
 	return out
 }
 
+// r36dScopeCTEDefs is the WITH definitions already in scope where a statement
+// compiles: an arm of a compound, or a CTE's body, names its statement's CTEs
+// from there. A recursive one maps to nil, which the walk declines.
+func (p *ReadOnlyPager) r36dScopeCTEDefs() map[string]*CTEDef {
+	if p == nil || len(p.cteScopes) == 0 {
+		return nil
+	}
+	out := map[string]*CTEDef{}
+	for _, frame := range p.cteScopes {
+		for k, b := range frame {
+			if b == nil || b.recursive != nil || b.multiSelfRef || b.core == nil {
+				out[k] = nil
+				continue
+			}
+			out[k] = &CTEDef{Name: b.name, ColNames: b.colNames, Select: b.core}
+		}
+	}
+	return out
+}
+
 // r36dSubColUsed walks nested SELECT sel and marks the enclosing statement's
 // colUsed bits for every name resolving outward. shadow is the stack of FROM
 // clauses between sel and the enclosing statement, innermost first; mark is

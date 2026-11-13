@@ -282,6 +282,11 @@ type aggAccumulators struct {
 	// (aggPlan.rowWidth), and all of it that is copied.
 	rowFree  bool
 	rowWidth int
+	// cols, when not nil, is the plan's rowCols, the only columns anything
+	// reads: anchorVals then holds just those, in that order, and anchorRow
+	// places them back at their columns. A group's anchor is its key's few
+	// columns, not the whole joined row.
+	cols []int
 	// keep is the plan's anchorKeep.
 	keep []int
 	// slab, when not nil, is where the anchor is copied to: the hash
@@ -365,10 +370,23 @@ func (a *aggAccumulators) magnetWalk(ctx *evalCtx, regs []Value) error {
 		a.anchorVals, a.anchorRowids = ctx.vals, ctx.rowids
 	} else {
 		vals := ctx.vals
-		if a.rowWidth > 0 && a.rowWidth < len(vals) {
+		if a.cols != nil {
+			if a.haveAnchor && a.keep != nil && anchorColsSpelledAs(a.anchorVals, vals, a.cols) {
+				return nil
+			}
+			var buf [8]Value
+			vals = buf[:0]
+			for _, c := range a.cols {
+				if c < len(ctx.vals) {
+					vals = append(vals, ctx.vals[c])
+				} else {
+					vals = append(vals, Value{Typ: Null})
+				}
+			}
+		} else if a.rowWidth > 0 && a.rowWidth < len(vals) {
 			vals = vals[:a.rowWidth]
 		}
-		if a.haveAnchor && a.keep != nil && anchorSpelledAs(a.anchorVals, vals, a.keep) {
+		if a.cols == nil && a.haveAnchor && a.keep != nil && anchorSpelledAs(a.anchorVals, vals, a.keep) {
 			return nil
 		}
 		if a.slab != nil {
@@ -393,17 +411,39 @@ func anchorSpelledAs(anchor, row []Value, cols []int) bool {
 	return true
 }
 
+// anchorColsSpelledAs is anchorSpelledAs for an anchor holding only cols.
+func anchorColsSpelledAs(anchor, row []Value, cols []int) bool {
+	for i, c := range cols {
+		if i >= len(anchor) || c >= len(row) || anchor[i].intReal != row[c].intReal || !anchorValuesIdentical(anchor[i], row[c]) {
+			return false
+		}
+	}
+	return true
+}
+
 // anchorRow returns the row a groupBareColExpr placeholder (or a correlated
 // subquery in the item) reads for the current group: the row magnetWalk last
 // accepted. A whole-table aggregate whose scan stepped no rows still emits one
 // row, and C reads every column in it as NULL ("SELECT max(b), c FROM t1" over an
 // empty t1 is (NULL, NULL); "count(*), c" is (0, NULL)), so the anchor is then an
 // all-NULL row of plan's width. A GROUP BY group is never empty.
-func (a *aggAccumulators) anchorRow(plan *aggPlan) (vals, rowids []Value) {
+//
+// An anchor kept as its columns alone (cols) is placed back at them in buf.
+func (a *aggAccumulators) anchorRow(plan *aggPlan, buf *[]Value) (vals, rowids []Value) {
 	if !a.haveAnchor {
 		return make([]Value, plan.nCols), make([]Value, len(plan.scopes))
 	}
-	return a.anchorVals, a.anchorRowids
+	if a.cols == nil {
+		return a.anchorVals, a.anchorRowids
+	}
+	row := growValues(buf, a.rowWidth)
+	clear(row)
+	for i, c := range a.cols {
+		if i < len(a.anchorVals) && c < len(row) {
+			row[c] = a.anchorVals[i]
+		}
+	}
+	return row, a.anchorRowids
 }
 
 // newAggAccs clones a fresh accumulator set from plan's item templates
@@ -440,7 +480,7 @@ func reuseAggAccs(a *aggAccumulators, plan *aggPlan) *aggAccumulators {
 		}
 	}
 	*a = aggAccumulators{out: a.out, having: a.having, order: a.order, magnets: a.magnets,
-		check: plan.anchorCheck, rowFree: plan.rowFree, rowWidth: plan.rowWidth, keep: plan.anchorKeep}
+		check: plan.anchorCheck, rowFree: plan.rowFree, rowWidth: plan.rowWidth, cols: plan.rowCols, keep: plan.anchorKeep}
 	if plan.magnet != nil {
 		a.magnetS = plan.magnet.allocS
 	}
@@ -573,7 +613,7 @@ func (m *vdbe) aggResult(info *aggResultInfo, groupKey []Value) (Value, error) {
 	if groupKey != nil {
 		clearJSONSubtype(groupKey)
 	}
-	bareVals, bareRowids := m.aggAccs.anchorRow(plan)
+	bareVals, bareRowids := m.aggAccs.anchorRow(plan, &m.anchorRowBuf)
 	if len(m.aggAccs.conv) > 0 {
 		groupKey, bareVals = m.convertedGroup(plan, it, aggVals, groupKey, bareVals)
 	}

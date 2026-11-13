@@ -47,6 +47,9 @@ type cteBinding struct {
 	name     string
 	colNames []string // explicit "(col, ...)" rename list; nil if none was given
 	core     *SelectStmt
+	// owner is the statement whose WITH defines this CTE, when known
+	// (pushCTEScopeOf): what cteSingleSite counts the CTE's references in.
+	owner *SelectStmt
 
 	// m10d is the "AS [NOT] MATERIALIZED" hint as written; cteM10dYes is what
 	// stops the flattener (r38cExpandCTERef, flatten_limit_r35c.go).
@@ -241,6 +244,16 @@ func (p *ReadOnlyPager) pushCTEScope(defs []CTEDef) func() {
 	return func() {
 		p.cteScopes = p.cteScopes[:len(p.cteScopes)-1]
 	}
+}
+
+// pushCTEScopeOf is pushCTEScope for stmt's own WITH, recording stmt as the
+// owner of each CTE it defines.
+func (p *ReadOnlyPager) pushCTEScopeOf(stmt *SelectStmt) func() {
+	pop := p.pushCTEScope(stmt.CTEs)
+	for _, b := range p.cteScopes[len(p.cteScopes)-1] {
+		b.owner = stmt
+	}
+	return pop
 }
 
 // hideCTEScopes makes every WITH clause currently in scope invisible until the

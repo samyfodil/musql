@@ -765,13 +765,13 @@ func (m *vdbe) openSlotFillCursor(p, slot int, ds *derivedSource, pager *ReadOnl
 	if cur := m.cursors[p]; cur != nil && cur.slotFill {
 		sf := cur.slot
 		if sf.ds != ds || sf.slot != slot || sf.pager != pager {
-			*sf = slotFill{ds: ds, slot: slot, pager: pager}
+			*sf = slotFill{ds: ds, slot: slot, pager: pager, norms: &m.stmtRoot().rowNorms}
 			sf.fill, sf.peek = newFill()
 		}
 		cur.slotOpened()
 		return cur
 	}
-	sf := &slotFill{ds: ds, slot: slot, pager: pager}
+	sf := &slotFill{ds: ds, slot: slot, pager: pager, norms: &m.stmtRoot().rowNorms}
 	sf.fill, sf.peek = newFill()
 	cur := openFillCursor(ds.tbl, sf.fill, true, ds.keepSubtype)
 	cur.slotFill, cur.slot = true, sf
@@ -788,6 +788,28 @@ type slotFill struct {
 	peek  func() ([][]Value, bool)
 	rows  [][]Value
 	ids   []uint64
+	// norms is the statement root's rowNorms.
+	norms *map[rowNormKey][][]Value
+}
+
+// normalized reports whether rows, the list a run-once slot holds, was already
+// read through ds once in this statement, and so holds its REAL affinity and
+// no subtype its read drops; and records it as read now. A correlated
+// subquery opens its source in a machine of its own for every outer row, so
+// the slot is new each time while the list is the same.
+func (sf *slotFill) normalized(rows [][]Value) bool {
+	if sf.norms == nil || len(rows) == 0 || !runOnceSlot(sf.ds) {
+		return false
+	}
+	k := rowNormKey{ds: sf.ds, first: &rows[0], n: len(rows)}
+	if _, ok := (*sf.norms)[k]; ok {
+		return true
+	}
+	if *sf.norms == nil {
+		*sf.norms = map[rowNormKey][][]Value{}
+	}
+	(*sf.norms)[k] = rows
+	return false
 }
 
 // onceRows is the rows run-once slot slot holds, when it has run.
@@ -1018,7 +1040,7 @@ func (cur *vdbeCursor) rewind() error {
 			// The rows this slot's last fill gave, as it left them.
 			cur.rows, cur.rowids, cur.materialized = rows, sf.ids, true
 		} else {
-			if cur.clearSubtypes {
+			if cur.clearSubtypes && (sf == nil || cur.refillEach || !sf.normalized(rows)) {
 				for _, row := range rows {
 					clearDerivedSubtypes(row, cur.fillKeep)
 					derivedRealAffinity(row, cur.tbl)

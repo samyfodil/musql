@@ -727,7 +727,8 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 			// select.c:8086 sets only pSub's). The materialization is earlier
 			// when a reference before this one in the FROM clause made it;
 			// one made anywhere else is not followed (nUse counts more
-			// references than this FROM clause holds).
+			// references than this FROM clause holds), unless this is the
+			// statement's one place naming the CTE (cteSingleSite).
 			reuse, inList := false, 0
 			for k := range items {
 				if osq, ok := subs[k]; ok && osq.cte == sq.cte {
@@ -744,6 +745,8 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 			switch {
 			case reuse:
 				est, eok = whereDefaultRowLogEst, true
+			case inList == 1 && cteSingleSite(sq.cte):
+				// The first of its references C codes (cteSingleSite).
 			case inList != sq.cte.nUse:
 				eok = false
 			}
