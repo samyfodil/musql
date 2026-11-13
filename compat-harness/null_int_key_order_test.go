@@ -36,5 +36,7 @@ func TestNullIntegerKeyOrder(t *testing.T) {
 		"SELECT c1.rowid, (SELECT group_concat(c2.rowid) FROM c c2 WHERE c2.ed = c1.ed AND c2.st = c1.st AND c2.sk = c1.sk) FROM c c1 WHERE c1.rowid < 60",
 	} {
 		differ(t, fmt.Sprintf("q-%d", i), append(append([]string(nil), pre...), q))
+		// Once in segments, the segments serve the seeks themselves.
+		differ(t, fmt.Sprintf("q-%d-vacuumed", i), append(append([]string(nil), pre...), "VACUUM", q))
 	}
 }
