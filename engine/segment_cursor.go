@@ -783,7 +783,7 @@ func segColumnRun(plans []segColPlan, s *segment, c, i0 int, rowids []uint64, ds
 // (gatherCursorRow and friends). It is the path this design exists to AVOID,
 // so it allocates once per cursor and refills rather than per row.
 func (cur *vdbeCursor) segFullRow() []Value {
-	if cap(cur.rowVals) < len(cur.tbl.cols) {
+	if cap(cur.rowVals) < len(cur.tbl.cols) || len(cur.nullVals) > 0 && &cur.rowVals[:1][0] == &cur.nullVals[0] {
 		cur.rowVals = make([]Value, len(cur.tbl.cols))
 	}
 	cur.rowVals = cur.rowVals[:len(cur.tbl.cols)]
