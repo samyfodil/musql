@@ -104,6 +104,10 @@ type vdbe struct {
 	// once per outer row.
 	rowOrders map[rowOrderKey]rowOrder
 	rowSorts  map[rowSortKey]*sortedRows
+	// rowNorms is, on the statement's root machine, the built-once row lists
+	// a derived source's read already took its REAL affinity and dropped its
+	// subtypes on (vdbeCursor.rowsNormalized), holding each list.
+	rowNorms map[rowNormKey][][]Value
 	// rjMatched holds, per cursor, the rowids a correlated RIGHT/FULL JOIN
 	// operand matched (derivedSource.rightJoin), across its rebuilds.
 	rjMatched map[int]map[uint64]bool
@@ -4172,6 +4176,14 @@ type rowSortKey struct {
 	n     int
 }
 
+// rowNormKey names a row list a derived source read (its first row's place
+// and its length), and that source.
+type rowNormKey struct {
+	ds    *derivedSource
+	first *[]Value
+	n     int
+}
+
 // runOnceRows reports a cursor over the rows a run-once slot holds for the
 // whole statement (openSlotFillCursor), which no later fill changes: the rows
 // rowOrders and rowSorts may key by where the list lives.
@@ -4180,7 +4192,13 @@ func runOnceRows(cur *vdbeCursor) bool {
 		return false
 	}
 	// A correlated body fills its slot again for every outer row.
-	ds := cur.slot.ds
+	return runOnceSlot(cur.slot.ds)
+}
+
+// runOnceSlot reports a derived source whose slot is filled once for the
+// whole statement.
+func runOnceSlot(ds *derivedSource) bool {
+	// A correlated body fills its slot again for every outer row.
 	return ds.cte != nil && !ds.rerun || ds.cte == nil && ds.prog != nil && !ds.prog.Correlated
 }
 
