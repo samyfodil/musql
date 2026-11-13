@@ -783,7 +783,9 @@ type stepGather struct {
 // the key's and every register an aggregate steps from. Its OpMakeRecord is a
 // view of the key's registers (recView), which native code skips; enter keeps
 // the record pointing at them. Native code then goes on past many rows before
-// the VDBE steps them in order (vdbe.stepGathered).
+// the VDBE steps them in order (vdbe.stepGathered). An aggregate with no GROUP
+// BY gathers the same way, from its OpAggStep that reads nothing but registers
+// up to its first OpAggResult; it has no key.
 //
 // Only where no entry can run both it and an OpResultRow: every OpResultRow
 // follows the OpHashAggSort, which native code never runs, and no native jump
@@ -794,16 +796,26 @@ func gatherAggStep(prog *Program, vp []jit.VInsn) stepGather {
 	sort := -1
 	for pc := range prog.Insns {
 		switch in := &prog.Insns[pc]; in.Op {
-		case OpHashAggStep:
+		case OpHashAggStep, OpAggStep:
 			// A LEFT JOIN's null row steps the same key and registers again.
 			if len(ats) > 0 {
-				if first := &prog.Insns[ats[0]]; in.P1 != first.P1 || in.P2 != first.P2 || in.P4 != first.P4 {
+				if first := &prog.Insns[ats[0]]; in.Op != first.Op || in.P1 != first.P1 || in.P2 != first.P2 || in.P3 != first.P3 || in.P4 != first.P4 {
 					return none
 				}
+			} else if in.Op == OpAggStep && in.P3 != 0 {
+				return none
+			}
+			if sort >= 0 {
+				return none
 			}
 			ats = append(ats, pc)
-		case OpHashAggSort:
-			if sort >= 0 {
+		case OpHashAggSort, OpAggResult:
+			// A plain aggregate's steps end at its first OpAggResult; a
+			// hashed one's results come after its sort.
+			if len(ats) == 0 || sort >= 0 || (in.Op == OpAggResult) != (prog.Insns[ats[0]].Op == OpAggStep) {
+				if in.Op == OpAggResult {
+					continue
+				}
 				return none
 			}
 			sort = pc
@@ -826,6 +838,12 @@ func gatherAggStep(prog *Program, vp []jit.VInsn) stepGather {
 	if plan == nil || !plan.rowFree && !plan.rowFromKeys() {
 		return none
 	}
+	if step.Op == OpAggStep {
+		if !plan.rowFree {
+			return none
+		}
+		return gatherSteps(prog, vp, plan, ats, sort, nil, -1, -1, 0)
+	}
 	var mrAts []int
 	for pc := range sort {
 		if in := &prog.Insns[pc]; in.Op == OpMakeRecord && in.P3 == step.P1 {
@@ -843,7 +861,17 @@ func gatherAggStep(prog *Program, vp []jit.VInsn) stepGather {
 	if !plan.rowFree && mr.P2 != len(plan.keyCols) {
 		return none
 	}
-	lo, hi := mr.P1, mr.P1+mr.P2
+	return gatherSteps(prog, vp, plan, ats, sort, mrAts, step.P1, mr.P1, mr.P2)
+}
+
+// gatherSteps is gatherAggStep past finding the steps: the registers they
+// gather, keyN of them from keyLo the key's record at key, and the rewrite.
+func gatherSteps(prog *Program, vp []jit.VInsn, plan *aggPlan, ats []int, sort int, mrAts []int, key, keyLo, keyN int) stepGather {
+	none := stepGather{at: -1}
+	lo, hi := keyLo, keyLo+keyN
+	if keyN == 0 {
+		lo, hi = prog.NReg, -1
+	}
 	for _, it := range aggPlanTemplates(plan) {
 		for which := range it.rowRegs {
 			if it.rowExpr(which) != nil && it.rowRegs[which] <= 0 {
@@ -862,7 +890,7 @@ func gatherAggStep(prog *Program, vp []jit.VInsn) stepGather {
 			lo, hi = min(lo, r), max(hi, r+1)
 		}
 	}
-	if lo < 0 || hi > prog.NReg || hi-lo > 32 {
+	if lo < 0 || hi > prog.NReg || hi <= lo || hi-lo > 32 {
 		return none
 	}
 	for pc, in := range vp {
@@ -879,7 +907,7 @@ func gatherAggStep(prog *Program, vp []jit.VInsn) stepGather {
 	for _, pc := range ats {
 		vp[pc] = jit.VInsn{Op: jit.VResultRow, A: lo, B: hi - lo}
 	}
-	return stepGather{at: ats[0], ats: ats, sort: sort, lo: lo, hi: hi, key: step.P1, keyLo: mr.P1, keyN: mr.P2}
+	return stepGather{at: ats[0], ats: ats, sort: sort, lo: lo, hi: hi, key: key, keyLo: keyLo, keyN: keyN}
 }
 
 // aggGathers is whether an entry at pc gathers OpHashAggStep's rows

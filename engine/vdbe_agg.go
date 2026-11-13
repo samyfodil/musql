@@ -489,6 +489,15 @@ func reuseAggAccs(a *aggAccumulators, plan *aggPlan) *aggAccumulators {
 
 func newAggAccs(plan *aggPlan) *aggAccumulators { return (&aggSlab{exact: true}).newAggAccs(plan) }
 
+// aggStepNullRow is the row and rowids an OpAggStep that reads nothing but
+// registers (aggPlan.rowFree) steps with.
+func (m *vdbe) aggStepNullRow(plan *aggPlan) (row, rowids []Value) {
+	if n := plan.nCols + len(plan.scopes); len(m.aggNullRow) < n {
+		m.aggNullRow = make([]Value, n)
+	}
+	return m.aggNullRow[:plan.nCols:plan.nCols], m.aggNullRow[plan.nCols : plan.nCols+len(plan.scopes)]
+}
+
 // aggRowCtx builds the evalCtx an aggregate opcode uses for a row: the query's
 // scopes, the row's concatenated values, one rowid per table (NULL for a LEFT
 // JOIN's NULL-extended table), and the outer/pager/params plumbing. It is reused
