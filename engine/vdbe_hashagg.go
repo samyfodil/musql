@@ -7,7 +7,9 @@
 package engine
 
 import (
+	"cmp"
 	"math"
+	"slices"
 	"sort"
 	"unsafe"
 )
@@ -348,6 +350,10 @@ func (m *vdbe) hashAggSort(desc []bool, made bool) bool {
 		// BINARY order is memcmp over the encoded text, which in a UTF-16
 		// database is not UTF-8 byte order (utf16CompareUTF8); the sorted
 		// drain's sorter orders its groups the same way.
+		if hashAggSortInts(h.sorted, desc) {
+			h.pos = 0
+			return len(h.sorted) > 0
+		}
 		enc := m.encoding()
 		sort.Slice(h.sorted, func(i, j int) bool {
 			if desc != nil {
@@ -358,6 +364,59 @@ func (m *vdbe) hashAggSort(desc []bool, made bool) bool {
 	}
 	h.pos = 0
 	return len(h.sorted) > 0
+}
+
+// hashAggSortInts sorts buckets whose keys are up to four values, each an
+// INTEGER or a NULL, as keyTupleLessDesc orders them, from a flat copy of
+// the keys; it reports false, with buckets untouched, for any other key.
+func hashAggSortInts(buckets []*hashAggBucket, desc []bool) bool {
+	type flatKey struct {
+		k     [4]int64
+		nulls uint8
+		b     *hashAggBucket
+	}
+	if len(buckets) == 0 || len(buckets[0].key) > 4 {
+		return false
+	}
+	flat := make([]flatKey, len(buckets))
+	for i, b := range buckets {
+		if len(b.key) > 4 {
+			return false
+		}
+		f := &flat[i]
+		f.b = b
+		for k, v := range b.key {
+			switch v.Typ {
+			case Int:
+				f.k[k] = v.I
+			case Null:
+				f.nulls |= 1 << k
+			default:
+				return false
+			}
+		}
+	}
+	nk := len(buckets[0].key)
+	slices.SortFunc(flat, func(a, b flatKey) int {
+		for k := range nk {
+			na, nb := a.nulls>>k&1, b.nulls>>k&1
+			c := cmp.Compare(nb, na)
+			if c == 0 && na == 0 {
+				c = cmp.Compare(a.k[k], b.k[k])
+			}
+			if c != 0 {
+				if k < len(desc) && desc[k] {
+					return -c
+				}
+				return c
+			}
+		}
+		return 0
+	})
+	for i := range flat {
+		buckets[i] = flat[i].b
+	}
+	return true
 }
 
 // hashAggData is OpHashAggData's body: make the current (post-sort) bucket's

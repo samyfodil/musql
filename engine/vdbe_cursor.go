@@ -96,6 +96,9 @@ type vdbeCursor struct {
 	// rather than row precisely so that every reader had to be visited when
 	// masking was introduced, and so a new one cannot be added by accident.
 	rowVals []Value
+	// nullVals is the all-NULL row nullRow hands out, made once per cursor:
+	// nothing writes into it (segFullRow refills a buffer of its own).
+	nullVals []Value
 
 	// rowRaw is the CURRENT row's undecoded record while rowVals is masked,
 	// nil once rowVals is complete (which is always, for every cursor whose
@@ -1648,7 +1651,10 @@ func (cur *vdbeCursor) normalizeRowsNow() {
 // column, and rowidNull for OpRowid's body (vdbe.go) to check.
 func (cur *vdbeCursor) nullRow() {
 	cur.segCur = nil // an all-NULL row is not a segment row
-	cur.rowVals = make([]Value, len(cur.tbl.cols))
+	if len(cur.nullVals) != len(cur.tbl.cols) {
+		cur.nullVals = make([]Value, len(cur.tbl.cols))
+	}
+	cur.rowVals = cur.nullVals
 	cur.rowRaw = nil // an all-NULL row is complete by construction
 	cur.rowidNull = true
 }
