@@ -118,8 +118,13 @@ func (p *ReadOnlyPager) r41FlattenMultiItem(stmt *SelectStmt, i int, expand bool
 	}
 	var items []bodyItem
 	var itemAlias []string
-	for _, b := range body.From {
-		if b.TableFunc || b.GroupLen != 0 || len(b.NestedGroupSpan) != 0 || b.Join != JoinInner && b.Join != JoinCross ||
+	for k, b := range body.From {
+		// A LEFT JOIN inside the body moves with its ON clause as it stands:
+		// its NULL rows are the body's, which the parent reads the same
+		// way, and C flattens such a body too (restriction (3) is only on a
+		// subquery that is itself a LEFT JOIN's right operand).
+		left := k > 0 && b.Join == JoinLeft
+		if b.TableFunc || b.GroupLen != 0 || len(b.NestedGroupSpan) != 0 || b.Join != JoinInner && b.Join != JoinCross && !left ||
 			len(b.Using) != 0 || b.Natural || b.IndexedBy != "" || b.NotIndexed {
 			return nil, false
 		}
