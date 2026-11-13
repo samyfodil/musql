@@ -49,10 +49,12 @@ func (cur *vdbeCursor) unsort() {
 	cur.sorted = nil
 }
 
-// intSortKey is a row's key columns, every one an INTEGER, and its position.
+// intSortKey is a row's key columns, every one an INTEGER or a NULL (nulls,
+// a bit per column), and its position.
 type intSortKey struct {
-	k [4]int64
-	p int32
+	k     [4]int64
+	nulls uint8
+	p     int32
 }
 
 func (cur *vdbeCursor) sortRowsBy(h *sortedSeekHint, enc TextEncoding) *sortedRows {
@@ -62,9 +64,9 @@ func (cur *vdbeCursor) sortRowsBy(h *sortedSeekHint, enc TextEncoding) *sortedRo
 	}
 	cur.normalizeRowsNow()
 	n := len(cur.rows)
-	// Key columns every row holds as an INTEGER are copied out flat and
-	// sorted as int64s: an integer compares as one under any collating
-	// sequence (as autoIndexOrderCursor does).
+	// Key columns every row holds as an INTEGER or a NULL are copied out flat
+	// and sorted as int64s: an integer compares as one under any collating
+	// sequence (as autoIndexOrderCursor does), and a NULL before it.
 	k := 1 + len(h.more)
 	var keys []intSortKey
 	if k <= len(intSortKey{}.k) {
@@ -82,10 +84,15 @@ func (cur *vdbeCursor) sortRowsBy(h *sortedSeekHint, enc TextEncoding) *sortedRo
 			if j > 0 {
 				col = h.more[j-1].col
 			}
-			if v := row[col]; v.Typ == Int {
+			switch v := row[col]; v.Typ {
+			case Int:
 				keys[i].k[j] = v.I
-			} else {
+			case Null:
+				keys[i].nulls |= 1 << uint(j)
+			default:
 				keys = nil
+			}
+			if keys == nil {
 				break
 			}
 		}
@@ -99,7 +106,11 @@ func (cur *vdbeCursor) sortRowsBy(h *sortedSeekHint, enc TextEncoding) *sortedRo
 	if keys != nil {
 		slices.SortFunc(keys, func(a, b intSortKey) int {
 			for j := range k {
-				if c := cmp.Compare(a.k[j], b.k[j]); c != 0 {
+				na, nb := a.nulls>>uint(j)&1, b.nulls>>uint(j)&1
+				if c := cmp.Compare(nb, na); c != 0 {
+					return c // a NULL first
+				}
+				if c := cmp.Compare(a.k[j], b.k[j]); na == 0 && c != 0 {
 					return c
 				}
 			}
@@ -125,7 +136,7 @@ func (cur *vdbeCursor) sortRowsBy(h *sortedSeekHint, enc TextEncoding) *sortedRo
 		})
 	}
 	var ints []int64
-	if keys != nil && k == 1 {
+	if keys != nil && k == 1 && !slices.ContainsFunc(keys, func(e intSortKey) bool { return e.nulls != 0 }) {
 		ints = make([]int64, n)
 		for i := range keys {
 			ints[i] = keys[i].k[0]

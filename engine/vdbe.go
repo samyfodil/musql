@@ -913,8 +913,12 @@ func sweepOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) bool
 
 // autoIndexSortValues is autoIndexOrderCursor's sort over keys that are not
 // all integers: each comparison fetches the values and compares them under
-// their columns' collating sequences.
+// their columns' collating sequences. Keys that are all integers or NULLs
+// are copied out flat and compared as int64s, a NULL before every integer.
 func autoIndexSortValues(perm []int, key *autoIndexKey, at func(i, k int) Value, enc TextEncoding, stop *sortStop) {
+	if autoIndexSortInts(perm, key, at, stop) {
+		return
+	}
 	slices.SortFunc(perm, func(a, b int) int {
 		if stop.now() {
 			return 0
@@ -934,6 +938,55 @@ func autoIndexSortValues(perm []int, key *autoIndexKey, at func(i, k int) Value,
 		}
 		return a - b
 	})
+}
+
+// autoIndexSortInts is autoIndexSortValues over keys every row holds as an
+// INTEGER or a NULL, reporting false, with perm untouched, when one is
+// anything else. An integer compares as one under any collating sequence,
+// and a NULL sorts before it, as compareValuesCollatedEnc orders them.
+func autoIndexSortInts(perm []int, key *autoIndexKey, at func(i, k int) Value, stop *sortStop) bool {
+	nk := len(key.cols)
+	n := len(perm)
+	flat := make([]int64, n*nk)
+	nulls := make([]bool, n*nk)
+	for i := range n {
+		for k := range nk {
+			switch v := at(i, k); v.Typ {
+			case Int:
+				flat[i*nk+k] = v.I
+			case Null:
+				nulls[i*nk+k] = true
+			default:
+				return false
+			}
+		}
+	}
+	slices.SortFunc(perm, func(a, b int) int {
+		if stop.now() {
+			return 0
+		}
+		for k := range nk {
+			ia, ib := a*nk+k, b*nk+k
+			c := 0
+			switch {
+			case nulls[ia] && nulls[ib]:
+			case nulls[ia]:
+				c = -1
+			case nulls[ib]:
+				c = 1
+			default:
+				c = cmp.Compare(flat[ia], flat[ib])
+			}
+			if c != 0 {
+				if k < len(key.desc) && key.desc[k] {
+					return -c // as autoIndexSortValues explains
+				}
+				return c
+			}
+		}
+		return a - b
+	})
+	return true
 }
 
 // rowSubCmpColumn compares ONE column position of a row-value comparison under
