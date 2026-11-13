@@ -619,7 +619,7 @@ func buildSegRoundKernel() *fir.Func {
 // segFloatAnswer finalizes a REAL aggregate a program accumulated in FAcc,
 // over rows non-NULL values, with the finalizers the VDBE runs.
 func segFloatAnswer(agg aggKind, rows int64, acc [2]float64) Value {
-	it := aggItem{kind: agg, cnt: rows, rSum: acc[0], rErr: acc[1], sumApprox: rows > 0}
+	it := aggItem{aggItemPlan: &aggItemPlan{kind: agg}, cnt: rows, rSum: acc[0], rErr: acc[1], sumApprox: rows > 0}
 	switch agg {
 	case aggSum:
 		v, _ := finalizeSum(&it)

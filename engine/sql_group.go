@@ -2362,17 +2362,10 @@ func cloneAggTemplates(templates []*aggItem) []*aggItem {
 }
 
 // resetAggItem makes acc a fresh accumulator from tmpl, replacing the whole
-// struct so no running state survives.
+// struct so no running state survives. It shares tmpl's plan (aggItemPlan),
+// which the compiler finished before any row was stepped.
 func resetAggItem(acc, tmpl *aggItem) {
-	// orderStrict, rowRegs and stepSeg are compile-time facts about the scan body
-	// (armOrderSensitive; aggItem.rowRegs; aggItem.stepSeg), the same for every
-	// group, so every clone inherits them.
-	*acc = aggItem{kind: tmpl.kind, expr: tmpl.expr, sepExpr: tmpl.sepExpr, distinct: tmpl.distinct, jsonb: tmpl.jsonb, filter: tmpl.filter,
-		orderStrict: tmpl.orderStrict, rowRegs: tmpl.rowRegs, stepSeg: tmpl.stepSeg,
-		minMaxLastWins: tmpl.minMaxLastWins,
-		// The ORDER BY's compile-time half (aggItem.orderBy); the buffer
-		// and the collations it resolves are per group.
-		orderBy: tmpl.orderBy, obUnique: tmpl.obUnique, obRegs: tmpl.obRegs}
+	*acc = aggItem{aggItemPlan: tmpl.aggItemPlan}
 }
 
 // resetAggItems is cloneAggTemplates into accs when it has one item per
