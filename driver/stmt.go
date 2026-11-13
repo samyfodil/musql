@@ -88,8 +88,9 @@ func (s *Stmt) queryImpl(args []driver.Value) (driver.Rows, error) {
 // ExecContext implements driver.StmtExecContext.
 // A QUERY Exec'd runs and discards rows; RowsAffected is 0.
 // A RETURNING statement's RowsAffected is the preceding statement's change count.
-func (s *Stmt) execContextImpl(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
-	defer s.conn.watchContext(ctx)()
+func (s *Stmt) execContextImpl(ctx context.Context, args []driver.NamedValue) (_ driver.Result, err error) {
+	end := s.conn.watchContext(ctx)
+	defer func() { err = end(err) }()
 	if s.script != nil {
 		return s.execScript(ctx)
 	}
@@ -100,7 +101,6 @@ func (s *Stmt) execContextImpl(ctx context.Context, args []driver.NamedValue) (d
 	// retained reference reads zeroes rather than the next call's arguments.
 	reuse := !s.isQuery && s.conn.plainDML(s.sqlText)
 	var eargs []engine.Value
-	var err error
 	if reuse {
 		eargs, err = bindArgsInto(s.argBuf, s.info, args, &s.bytesArena)
 		s.argBuf = eargs
@@ -146,8 +146,9 @@ func (s *Stmt) execContextImpl(ctx context.Context, args []driver.NamedValue) (d
 }
 
 // QueryContext implements driver.StmtQueryContext.
-func (s *Stmt) queryContextImpl(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
-	defer s.conn.watchContext(ctx)()
+func (s *Stmt) queryContextImpl(ctx context.Context, args []driver.NamedValue) (_ driver.Rows, err error) {
+	end := s.conn.watchContext(ctx)
+	defer func() { err = end(err) }()
 	if s.script != nil {
 		// A script must be Exec'd; Query can only return one result set.
 		return nil, fmt.Errorf("driver: a multi-statement script must be run with Exec, not Query: %s", s.sqlText)
