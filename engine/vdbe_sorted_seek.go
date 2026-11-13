@@ -49,6 +49,12 @@ func (cur *vdbeCursor) unsort() {
 	cur.sorted = nil
 }
 
+// intSortKey is a row's key columns, every one an INTEGER, and its position.
+type intSortKey struct {
+	k [4]int64
+	p int32
+}
+
 func (cur *vdbeCursor) sortRowsBy(h *sortedSeekHint, enc TextEncoding) *sortedRows {
 	s := &sortedRows{hint: h}
 	if !cur.materialized || cur.sub != nil || cur.vt != nil || cur.segSrc != nil || len(cur.rowids) != len(cur.rows) || len(cur.rows) > 1<<31-1 {
@@ -56,34 +62,56 @@ func (cur *vdbeCursor) sortRowsBy(h *sortedSeekHint, enc TextEncoding) *sortedRo
 	}
 	cur.normalizeRowsNow()
 	n := len(cur.rows)
-	ints := make([]int64, n)
-	if len(h.more) > 0 {
-		ints = nil
+	// Key columns every row holds as an INTEGER are copied out flat and
+	// sorted as int64s: an integer compares as one under any collating
+	// sequence (as autoIndexOrderCursor does).
+	k := 1 + len(h.more)
+	var keys []intSortKey
+	if k <= len(intSortKey{}.k) {
+		keys = make([]intSortKey, n)
 	}
 	for i, row := range cur.rows {
 		if h.col >= len(row) || slices.ContainsFunc(h.more, func(m sortedSeekCol) bool { return m.col >= len(row) }) {
 			return s
 		}
-		if v := row[h.col]; v.Typ == Int && ints != nil {
-			ints[i] = v.I
-		} else {
-			ints = nil
+		if keys == nil {
+			continue
+		}
+		for j := range k {
+			col := h.col
+			if j > 0 {
+				col = h.more[j-1].col
+			}
+			if v := row[col]; v.Typ == Int {
+				keys[i].k[j] = v.I
+			} else {
+				keys = nil
+				break
+			}
+		}
+		if keys != nil {
+			keys[i].p = int32(i)
 		}
 	}
 	pos := make([]int32, n)
-	for i := range pos {
-		pos[i] = int32(i)
-	}
 	// The original position breaks ties, so the order is total and a run keeps
 	// the list's order.
-	if ints != nil {
-		slices.SortFunc(pos, func(a, b int32) int {
-			if c := cmp.Compare(ints[a], ints[b]); c != 0 {
-				return c
+	if keys != nil {
+		slices.SortFunc(keys, func(a, b intSortKey) int {
+			for j := range k {
+				if c := cmp.Compare(a.k[j], b.k[j]); c != 0 {
+					return c
+				}
 			}
-			return cmp.Compare(a, b)
+			return cmp.Compare(a.p, b.p)
 		})
+		for i := range keys {
+			pos[i] = keys[i].p
+		}
 	} else {
+		for i := range pos {
+			pos[i] = int32(i)
+		}
 		slices.SortFunc(pos, func(a, b int32) int {
 			if c := compareValuesCollatedEnc(cur.rows[a][h.col], cur.rows[b][h.col], h.coll, enc); c != 0 {
 				return c
@@ -96,15 +124,16 @@ func (cur *vdbeCursor) sortRowsBy(h *sortedSeekHint, enc TextEncoding) *sortedRo
 			return cmp.Compare(a, b)
 		})
 	}
-	s.rows, s.ids = make([][]Value, n), make([]uint64, n)
-	if ints != nil {
-		s.ints = make([]int64, n)
+	var ints []int64
+	if keys != nil && k == 1 {
+		ints = make([]int64, n)
+		for i := range keys {
+			ints[i] = keys[i].k[0]
+		}
 	}
+	s.rows, s.ids, s.ints = make([][]Value, n), make([]uint64, n), ints
 	for i, p := range pos {
 		s.rows[i], s.ids[i] = cur.rows[p], cur.rowids[p]
-		if ints != nil {
-			s.ints[i] = ints[p]
-		}
 	}
 	s.pos, s.orig, s.origIDs, s.ok = pos, cur.rows, cur.rowids, true
 	return s
