@@ -414,7 +414,8 @@ func TestSeekRaiseConsumedFirst(t *testing.T) {
 
 // TestSeekRaisingTermStillSeeks: the seeks that stay exact are still taken --
 // a key the JSON term follows, a key C's own index consumes, and a key that a
-// correlated sub-select, which C tests last, comes before.
+// correlated sub-select, which C tests last, comes before. A seek with no
+// raising term only prunes, and one this wide is left for the scan.
 func TestSeekRaisingTermStillSeeks(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "x.musq")
 	stmts := []string{
@@ -440,7 +441,7 @@ func TestSeekRaisingTermStillSeeks(t *testing.T) {
 		{`SELECT rowid FROM i WHERE json_extract(j, '$') < (SELECT max(v) FROM other) AND k = 7`, false},
 		{`SELECT rowid FROM i WHERE json_extract(j, '$') < (SELECT max(v) FROM other WHERE v > i.k - 100) AND k = 7`, true},
 		{`SELECT rowid FROM x WHERE json_extract(j, '$') < (SELECT max(v) FROM other) AND k = 7`, true},
-		{`SELECT rowid FROM gs WHERE g > 0 AND k = 7`, true},
+		{`SELECT rowid FROM gs WHERE g > 0 AND k = 7`, false},
 		{`SELECT rowid FROM gv WHERE g > 0 AND k = 7`, false},
 		{`SELECT rowid FROM gv WHERE k = 7 AND g > 0`, true},
 	} {

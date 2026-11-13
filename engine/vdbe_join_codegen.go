@@ -3167,7 +3167,7 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 				}
 				h := &indexSeekHint{root: k.root, aff: k.aff, coll: k.coll, leadingCol: k.leadingCol, index: k.index, slot: slot, is: k.is, in: len(k.keySet)}
 				if slot == 0 {
-					h.plan = s.idxSeek.plan
+					h.plan, h.raiseFree = s.idxSeek.plan, s.idxSeek.raiseFree
 				}
 				c.emit(Instruction{Op: OpSeekIndexHint, P1: s.scope.cursor, P2: keyReg, P4: h})
 			}

@@ -829,6 +829,9 @@ type indexSeekHint struct {
 	// plan, on slot 0, is the loop C's planner chose for this table, which
 	// EXPLAIN QUERY PLAN prints in place of the hint's own index.
 	plan wherePlanExplain
+	// raiseFree, on slot 0, says no conjunct tested on this table's rows can
+	// raise, so the seek only prunes and a scan may stand in for it.
+	raiseFree bool
 }
 
 // multiOrOrder is the autoIndexKey variant OpAutoIndexOrder applies when the

@@ -129,11 +129,17 @@ func termMayRaise(e Expr, scopes []tableScope) bool {
 // seekGuard decides which seek keys keep one source's rows exact. raiseAt is
 // the WHERE position of the first per-row conjunct that can raise,
 // tableRaiseAt the first that reads no other table, which an automatic index
-// tests on every row as it builds (constructAutomaticIndex).
+// tests on every row as it builds (constructAutomaticIndex). lateRaise is a
+// raising correlated sub-select, which C tests after the key.
 type seekGuard struct {
 	raiseAt, tableRaiseAt int
+	lateRaise             bool
 	access                wherePlanAccess
 }
+
+// raiseFree reports that no term tested on this source's rows can raise, so a
+// seek only prunes and a scan may stand in for it.
+func (g seekGuard) raiseFree() bool { return g.raiseAt < 0 && !g.lateRaise }
 
 // holdsCorrelatedSelect reports a sub-select naming something outside itself
 // (C's EP_VarSelect): C tests such a term after every other (TERM_VARSELECT).
@@ -165,7 +171,11 @@ func newSeekGuard(c *compiler, srcs []joinSource, i int, cjs []Expr) seekGuard {
 	g := seekGuard{raiseAt: -1, tableRaiseAt: -1}
 	scopes := tableScopesOf(srcs)
 	for pos, cj := range cjs {
-		if !termMayRaise(cj, scopes) || c.holdsCorrelatedSelect(cj) {
+		if !termMayRaise(cj, scopes) {
+			continue
+		}
+		if c.holdsCorrelatedSelect(cj) {
+			g.lateRaise = true
 			continue
 		}
 		if hoist, _ := constWhereTerm(cj, scopes, false); hoist {

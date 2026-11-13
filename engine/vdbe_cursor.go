@@ -167,6 +167,8 @@ type vdbeCursor struct {
 	// idxSeekOrder is the key a correlated index seek's rows are sorted by
 	// (indexSeekHint.order), nil to keep them in rowid order.
 	idxSeekOrder *autoIndexKey
+	// idxSeekRaiseFree is indexSeekHint.raiseFree.
+	idxSeekRaiseFree bool
 	// idxListOnce is set by OpAutoIndexOrder on an index seek that runs once:
 	// its rows are positioned as a correlated seek's are, sorted by
 	// idxSeekOrder, rather than built and permuted. idxListReady is that the
@@ -370,6 +372,30 @@ func (cur *vdbeCursor) idxSeekRowids() ([]int64, bool) {
 // seekNarrowRatio is how many rows a native walk reads in the time a seek
 // fetches one (about 10 ns against 2.5 us, measured over 300k rows).
 const seekNarrowRatio = 256
+
+// seekIsWide reports whether cur's index seek is known to read more than a
+// seekNarrowRatio-th of the table: an estimate says so. No estimate is not wide.
+func (cur *vdbeCursor) seekIsWide() bool {
+	if !cur.idxSeekConfigured || cur.tbl == nil || cur.pager == nil || cur.pager.segs == nil {
+		return false
+	}
+	src, root := cur.pager.segs, cur.tbl.root
+	n := -1
+	first := idxSeekKey{col: cur.idxSeekCol, probe: cur.idxSeekProbe, coll: cur.idxSeekColl, set: cur.idxSeekSet}
+	for _, k := range append([]idxSeekKey{first}, cur.idxSeekMore...) {
+		if !cur.idxSeekKeyServed(k) {
+			continue
+		}
+		if c, _, ok := src.seekIndexKeyEstimate(root, k); ok && (n < 0 || c < n) {
+			n = c
+		}
+	}
+	if n < 0 {
+		return false
+	}
+	total, ok := src.segTableRows(root)
+	return ok && n > total/seekNarrowRatio
+}
 
 // seekIsNarrow reports whether the seek reads at most a seekNarrowRatio-th of
 // the table, so it should answer rather than a walk. An index seek counts the
@@ -1198,6 +1224,13 @@ func (cur *vdbeCursor) rewind() error {
 		// own posting list. It only PRUNES -- the keyed conjunct is re-checked
 		// on every row -- so a rowid the list carries that no longer exists is
 		// dropped by the row fetch below.
+		// A streaming cursor's seek that would fetch a wide share of the
+		// table is left for the stream below when it only prunes -- no row
+		// it skips could raise -- since fetching its rows one by one costs
+		// far more than walking them (seekNarrowRatio).
+		if cur.idxSeekConfigured && cur.idxSeekRaiseFree && cur.idxSeekOrder == nil && cur.streamable && cur.seekIsWide() {
+			cur.idxSeekConfigured = false
+		}
 		if cur.idxSeekConfigured && !cur.tbl.withoutRowid {
 			if cur.idxListReady && cur.pointSrc.list {
 				cur.segSrc, cur.segCur = &cur.pointSrc, nil
