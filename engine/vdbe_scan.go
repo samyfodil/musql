@@ -1145,6 +1145,8 @@ type indexSeekPlan struct {
 	// plan is the loop the ported planner chose for the table, for EXPLAIN
 	// QUERY PLAN (markWherePlanIndexEligibility); empty when it did not decide.
 	plan wherePlanExplain
+	// raiseFree is indexSeekHint.raiseFree.
+	raiseFree bool
 }
 
 // detectIndexSeekKey looks for a WHERE conjunct "<indexed-col> = <const>" a
@@ -1245,6 +1247,7 @@ func detectIndexSeekKey(c *compiler, srcs []joinSource, where Expr) (int, *index
 			}
 		}
 		if first != nil {
+			first.raiseFree = guard.raiseFree()
 			return i, first, true
 		}
 	}

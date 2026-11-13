@@ -4013,6 +4013,7 @@ func (m *vdbe) execSeekIndexHint(op *Instruction) error {
 		if h.slot == 0 {
 			cur.idxSeekConfigured, cur.idxSeekMore, cur.idxSeekNext, cur.idxSeekSet = false, cur.idxSeekMore[:0], 0, nil
 			cur.idxSeekOrder, cur.idxListOnce, cur.idxListReady = h.order, false, false
+			cur.idxSeekRaiseFree = h.raiseFree
 		}
 		// A slot out of step is dropped, as is the key of "x IS NULL" (no
 		// posting list holds NULL) and a write's TEXT key in a UTF-16
