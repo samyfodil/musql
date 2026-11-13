@@ -49,8 +49,8 @@ func (cur *vdbeCursor) unsort() {
 	cur.sorted = nil
 }
 
-// intSortKey is a row's key columns, every one an INTEGER or a NULL (nulls,
-// a bit per column), and its position.
+// intSortKey is a row's leading key columns that every row holds as an
+// INTEGER or a NULL (nulls, a bit per column), and its position.
 type intSortKey struct {
 	k     [4]int64
 	nulls uint8
@@ -64,79 +64,68 @@ func (cur *vdbeCursor) sortRowsBy(h *sortedSeekHint, enc TextEncoding) *sortedRo
 	}
 	cur.normalizeRowsNow()
 	n := len(cur.rows)
-	// Key columns every row holds as an INTEGER or a NULL are copied out flat
-	// and sorted as int64s: an integer compares as one under any collating
-	// sequence (as autoIndexOrderCursor does), and a NULL before it.
 	k := 1 + len(h.more)
-	var keys []intSortKey
-	if k <= len(intSortKey{}.k) {
-		keys = make([]intSortKey, n)
+	keyCol := func(j int) (int, string) {
+		if j == 0 {
+			return h.col, h.coll
+		}
+		return h.more[j-1].col, h.more[j-1].coll
 	}
-	for i, row := range cur.rows {
+	for _, row := range cur.rows {
 		if h.col >= len(row) || slices.ContainsFunc(h.more, func(m sortedSeekCol) bool { return m.col >= len(row) }) {
 			return s
 		}
-		if keys == nil {
-			continue
-		}
-		for j := range k {
-			col := h.col
-			if j > 0 {
-				col = h.more[j-1].col
-			}
-			switch v := row[col]; v.Typ {
-			case Int:
-				keys[i].k[j] = v.I
-			case Null:
-				keys[i].nulls |= 1 << uint(j)
-			default:
-				keys = nil
-			}
-			if keys == nil {
-				break
-			}
-		}
-		if keys != nil {
-			keys[i].p = int32(i)
-		}
 	}
-	pos := make([]int32, n)
+	// The leading key columns every row holds as an INTEGER or a NULL, up to
+	// four, are copied out flat and compared as int64s: an integer compares
+	// as one under any collating sequence (as autoIndexOrderCursor does), and
+	// a NULL before it. Only rows they leave tied compare the rest as Values.
+	lead := 0
+	for lead < min(k, len(intSortKey{}.k)) {
+		col, _ := keyCol(lead)
+		if slices.ContainsFunc(cur.rows, func(row []Value) bool { return row[col].Typ != Int && row[col].Typ != Null }) {
+			break
+		}
+		lead++
+	}
+	keys := make([]intSortKey, n)
+	for i, row := range cur.rows {
+		for j := range lead {
+			col, _ := keyCol(j)
+			if v := row[col]; v.Typ == Null {
+				keys[i].nulls |= 1 << uint(j)
+			} else {
+				keys[i].k[j] = v.I
+			}
+		}
+		keys[i].p = int32(i)
+	}
 	// The original position breaks ties, so the order is total and a run keeps
 	// the list's order.
-	if keys != nil {
-		slices.SortFunc(keys, func(a, b intSortKey) int {
-			for j := range k {
-				na, nb := a.nulls>>uint(j)&1, b.nulls>>uint(j)&1
-				if c := cmp.Compare(nb, na); c != 0 {
-					return c // a NULL first
-				}
-				if c := cmp.Compare(a.k[j], b.k[j]); na == 0 && c != 0 {
-					return c
-				}
+	slices.SortFunc(keys, func(a, b intSortKey) int {
+		for j := range lead {
+			na, nb := a.nulls>>uint(j)&1, b.nulls>>uint(j)&1
+			if c := cmp.Compare(nb, na); c != 0 {
+				return c // a NULL first
 			}
-			return cmp.Compare(a.p, b.p)
-		})
-		for i := range keys {
-			pos[i] = keys[i].p
-		}
-	} else {
-		for i := range pos {
-			pos[i] = int32(i)
-		}
-		slices.SortFunc(pos, func(a, b int32) int {
-			if c := compareValuesCollatedEnc(cur.rows[a][h.col], cur.rows[b][h.col], h.coll, enc); c != 0 {
+			if c := cmp.Compare(a.k[j], b.k[j]); na == 0 && c != 0 {
 				return c
 			}
-			for _, mc := range h.more {
-				if c := compareValuesCollatedEnc(cur.rows[a][mc.col], cur.rows[b][mc.col], mc.coll, enc); c != 0 {
-					return c
-				}
+		}
+		for j := lead; j < k; j++ {
+			col, coll := keyCol(j)
+			if c := compareValuesCollatedEnc(cur.rows[a.p][col], cur.rows[b.p][col], coll, enc); c != 0 {
+				return c
 			}
-			return cmp.Compare(a, b)
-		})
+		}
+		return cmp.Compare(a.p, b.p)
+	})
+	pos := make([]int32, n)
+	for i := range keys {
+		pos[i] = keys[i].p
 	}
 	var ints []int64
-	if keys != nil && k == 1 && !slices.ContainsFunc(keys, func(e intSortKey) bool { return e.nulls != 0 }) {
+	if lead == 1 && k == 1 && !slices.ContainsFunc(keys, func(e intSortKey) bool { return e.nulls != 0 }) {
 		ints = make([]int64, n)
 		for i := range keys {
 			ints[i] = keys[i].k[0]
