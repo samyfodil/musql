@@ -52,6 +52,11 @@ func TestReadGateKeepsLeaseBetweenStatements(t *testing.T) {
 
 func TestReadGateHandsOverAfterSlice(t *testing.T) {
 	g := newReadGate(1)
+	// The hand-over at leave is what this tests. The tick, which a waiter
+	// arms, would release the waiter ungated once the holder had been busy
+	// for a tick, which a loaded machine reaches before leave runs.
+	g.timer = time.AfterFunc(time.Hour, func() {})
+	g.timer.Stop()
 	holder, waiter := &Conn{}, &Conn{}
 	g.enter(holder)
 	got := enterAsync(g, waiter)
