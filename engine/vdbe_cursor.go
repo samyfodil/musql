@@ -373,6 +373,20 @@ func (cur *vdbeCursor) idxSeekRowids() ([]int64, bool) {
 // fetches one (about 10 ns against 2.5 us, measured over 300k rows).
 const seekNarrowRatio = 256
 
+// readMask is the columns a materialized cursor decodes from the segments
+// (scanMask): every one for a table computing generated columns, or one with
+// no rowid to fetch the rest by.
+func (cur *vdbeCursor) readMask() columnMask {
+	cols := cur.scanMask
+	if cols == 0 || cur.hasGeneratedCols() || cur.tbl.withoutRowid {
+		return allColumns
+	}
+	if cols != allColumns && cur.tbl.ipkIndex >= 0 {
+		cols |= 1 << uint(min(cur.tbl.ipkIndex, 63))
+	}
+	return cols
+}
+
 // seekIsWide reports whether cur's index seek is known to read more than a
 // seekNarrowRatio-th of the table: an estimate says so. No estimate is not wide.
 func (cur *vdbeCursor) seekIsWide() bool {
@@ -1276,8 +1290,9 @@ func (cur *vdbeCursor) rewind() error {
 				// one on every row.
 				slab := cur.seekSlab[:0]
 				plain := shared && !cur.hasGeneratedCols()
+				cols := cur.readMask()
 				for _, rid := range rowids {
-					raw, found, ok := cur.pager.SeekRowidSegments(cur.tbl.root, rid)
+					raw, found, ok := cur.pager.SeekRowidSegmentsCols(cur.tbl.root, rid, cols)
 					if !ok || !found {
 						continue
 					}
@@ -1318,13 +1333,7 @@ func (cur *vdbeCursor) rewind() error {
 		// Only the columns the program reads are decoded (scanTableCols); a
 		// table computing generated columns, or one with no rowid to fetch the
 		// rest by, is read whole.
-		cols := cur.scanMask
-		if cols == 0 || cur.hasGeneratedCols() || cur.tbl.withoutRowid {
-			cols = allColumns
-		} else if cols != allColumns && cur.tbl.ipkIndex >= 0 {
-			cols |= 1 << uint(min(cur.tbl.ipkIndex, 63))
-		}
-		seq, errFn := cur.pager.scanTableCols(cur.tbl.root, cols)
+		seq, errFn := cur.pager.scanTableCols(cur.tbl.root, cur.readMask())
 		shared := cur.pager.ServesLiveRows(cur.tbl.root)
 		// The copies a shared row's fix-up needs are carved from chunks, as a
 		// seek's are, rather than allocated one per row: an INTEGER PRIMARY

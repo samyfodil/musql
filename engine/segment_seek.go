@@ -14,13 +14,19 @@ import (
 // first, then delta live/dead, then segments. Segments store rowids in a sorted
 // array and the delta's maps answer in O(1).
 func (src *segSource) seekRowid(rootPage uint32, rid int64) (vals []Value, found, served bool) {
+	return src.seekRowidCols(rootPage, rid, allColumns)
+}
+
+// seekRowidCols is seekRowid decoding only the columns in cols from a
+// segment; the rest read valueUnread.
+func (src *segSource) seekRowidCols(rootPage uint32, rid int64, cols columnMask) (vals []Value, found, served bool) {
 	// A write session's own rows: O(1), and already authoritative. A table that
 	// could not be loaded declines, and the scan the caller falls back to reports
 	// the load error (ScanTable's errFn).
 	if rows, have, err := src.liveRows(rootPage); err != nil {
 		return nil, false, false
 	} else if have {
-		v, ok := rows.get(uint64(rid))
+		v, ok := rows.getCols(uint64(rid), cols)
 		return v, ok, true
 	}
 	segs, ok := src.byRoot[rootPage]
@@ -45,7 +51,7 @@ func (src *segSource) seekRowid(rootPage uint32, rid int64) (vals []Value, found
 		if !hit {
 			continue
 		}
-		return sg.rowAt(i), true, true
+		return sg.rowAtCols(i, cols), true, true
 	}
 	return nil, false, true
 }
@@ -127,14 +133,17 @@ func (s *segment) findRowidFrom(rid int64, from int) (int, bool) {
 }
 
 // rowAt materializes one row with Width columns (short rows from ALTER ADD COLUMN).
-func (s *segment) rowAt(i int) []Value {
+func (s *segment) rowAt(i int) []Value { return s.rowAtCols(i, allColumns) }
+
+// rowAtCols is rowAt decoding only the columns in cols.
+func (s *segment) rowAtCols(i int, cols columnMask) []Value {
 	w := s.Width(i)
 	if w > len(s.cols) {
 		w = len(s.cols)
 	}
 	row := make([]Value, w)
 	for c := 0; c < w; c++ {
-		row[c] = s.Value(c, i)
+		row[c] = s.valueIf(cols, c, i)
 	}
 	return row
 }
@@ -147,6 +156,15 @@ func (p *ReadOnlyPager) SeekRowidSegments(rootPage uint32, rid int64) (vals []Va
 		return nil, false, false
 	}
 	return p.segs.seekRowid(rootPage, rid)
+}
+
+// SeekRowidSegmentsCols is SeekRowidSegments decoding only the columns in
+// cols from a segment; the rest read valueUnread.
+func (p *ReadOnlyPager) SeekRowidSegmentsCols(rootPage uint32, rid int64, cols columnMask) (vals []Value, found, served bool) {
+	if p == nil || p.segs == nil {
+		return nil, false, false
+	}
+	return p.segs.seekRowidCols(rootPage, rid, cols)
 }
 
 // A secondary-index equality seek: finds rowids where a column matches a probe.

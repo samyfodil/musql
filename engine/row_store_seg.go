@@ -81,6 +81,19 @@ func newSegRowStoreAt(rp *ReadOnlyPager, root uint32, tbl *tableMeta) *rowStore 
 	return &rowStore{seg: &segRows{rp: rp, root: root, tbl: tbl}, m: map[uint64][]Value{}}
 }
 
+// getCols is get decoding only the columns in cols, the rest valueUnread, for
+// a table with no generated column; it skips the memo, which keeps whole rows.
+func (b *segRows) getCols(rid uint64, cols columnMask) ([]Value, bool) {
+	if cols == allColumns || hasGeneratedCols(b.tbl.cols) {
+		return b.get(rid)
+	}
+	vals, found, served := b.rp.SeekRowidSegmentsCols(b.root, int64(rid), cols)
+	if !served || !found {
+		return nil, false
+	}
+	return widenStoredRow(b.tbl.cols, vals), true
+}
+
 // get is rid's committed row, normalized exactly as a table load normalizes it
 // (fullStoredRow: full width, generated columns computed).
 func (b *segRows) get(rid uint64) ([]Value, bool) {

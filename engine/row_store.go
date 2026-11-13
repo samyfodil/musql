@@ -131,6 +131,21 @@ func (s *rowStore) get(rowid uint64) ([]Value, bool) {
 	return s.resolve(vals), ok
 }
 
+// getCols is get for a reader of the columns in cols alone: a committed row
+// of a table with no generated column has the rest valueUnread.
+func (s *rowStore) getCols(rowid uint64, cols columnMask) ([]Value, bool) {
+	if s == nil || s.seg == nil || cols == allColumns {
+		return s.get(rowid)
+	}
+	if vals, ok := s.m[rowid]; ok {
+		return s.resolve(vals), true
+	}
+	if s.baseGone || s.isGone(rowid) {
+		return nil, false
+	}
+	return s.seg.getCols(rowid, cols)
+}
+
 // row returns rowid's row, or nil when there is none.
 func (s *rowStore) row(rowid uint64) []Value {
 	vals, _ := s.get(rowid)
