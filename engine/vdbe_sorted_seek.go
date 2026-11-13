@@ -21,6 +21,10 @@ type sortedRows struct {
 	origIDs []uint64
 	// ints is rows' key column when every value is an INTEGER.
 	ints []int64
+	// keyOrder is the order rows compares the hint's key columns in (0 is
+	// hint.col, j its more[j-1]); nil is that order itself. A probe wants
+	// the run equal on every column, which any order groups alike.
+	keyOrder []int
 	// base is where the current run starts in rows.
 	base int
 }
@@ -76,22 +80,26 @@ func (cur *vdbeCursor) sortRowsBy(h *sortedSeekHint, enc TextEncoding) *sortedRo
 			return s
 		}
 	}
-	// The leading key columns every row holds as an INTEGER or a NULL, up to
-	// four, are copied out flat and compared as int64s: an integer compares
-	// as one under any collating sequence (as autoIndexOrderCursor does), and
-	// a NULL before it. Only rows they leave tied compare the rest as Values.
-	lead := 0
-	for lead < min(k, len(intSortKey{}.k)) {
-		col, _ := keyCol(lead)
-		if slices.ContainsFunc(cur.rows, func(row []Value) bool { return row[col].Typ != Int && row[col].Typ != Null }) {
-			break
+	// The key columns every row holds as an INTEGER or a NULL, up to four, go
+	// first and are copied out flat and compared as int64s: an integer
+	// compares as one under any collating sequence (as autoIndexOrderCursor
+	// does), and a NULL before it. Only rows they leave tied compare the rest
+	// as Values.
+	var order, rest []int
+	for j := range k {
+		col, _ := keyCol(j)
+		if len(order) < len(intSortKey{}.k) && !slices.ContainsFunc(cur.rows, func(row []Value) bool { return row[col].Typ != Int && row[col].Typ != Null }) {
+			order = append(order, j)
+		} else {
+			rest = append(rest, j)
 		}
-		lead++
 	}
+	lead := len(order)
+	order = append(order, rest...)
 	keys := make([]intSortKey, n)
 	for i, row := range cur.rows {
 		for j := range lead {
-			col, _ := keyCol(j)
+			col, _ := keyCol(order[j])
 			if v := row[col]; v.Typ == Null {
 				keys[i].nulls |= 1 << uint(j)
 			} else {
@@ -112,7 +120,7 @@ func (cur *vdbeCursor) sortRowsBy(h *sortedSeekHint, enc TextEncoding) *sortedRo
 				return c
 			}
 		}
-		for j := lead; j < k; j++ {
+		for _, j := range order[lead:] {
 			col, coll := keyCol(j)
 			if c := compareValuesCollatedEnc(cur.rows[a.p][col], cur.rows[b.p][col], coll, enc); c != 0 {
 				return c
@@ -132,6 +140,9 @@ func (cur *vdbeCursor) sortRowsBy(h *sortedSeekHint, enc TextEncoding) *sortedRo
 		}
 	}
 	s.rows, s.ids, s.ints = make([][]Value, n), make([]uint64, n), ints
+	if !slices.IsSorted(order) {
+		s.keyOrder = order
+	}
 	for i, p := range pos {
 		s.rows[i], s.ids[i] = cur.rows[p], cur.rowids[p]
 	}
@@ -176,12 +187,24 @@ func (s *sortedRows) findTuple(h *sortedSeekHint, probe Value, regs []Value, enc
 			return 0, 0
 		}
 	}
-	cmpRow := func(row []Value) int {
-		if c := compareValuesCollatedEnc(row[h.col], probe, h.coll, enc); c != 0 {
-			return c
+	cmpKey := func(row []Value, j int) int {
+		if j == 0 {
+			return compareValuesCollatedEnc(row[h.col], probe, h.coll, enc)
 		}
-		for i, mc := range h.more {
-			if c := compareValuesCollatedEnc(row[mc.col], keys[i], mc.coll, enc); c != 0 {
+		mc := h.more[j-1]
+		return compareValuesCollatedEnc(row[mc.col], keys[j-1], mc.coll, enc)
+	}
+	cmpRow := func(row []Value) int {
+		if s.keyOrder != nil {
+			for _, j := range s.keyOrder {
+				if c := cmpKey(row, j); c != 0 {
+					return c
+				}
+			}
+			return 0
+		}
+		for j := range len(h.more) + 1 {
+			if c := cmpKey(row, j); c != 0 {
 				return c
 			}
 		}

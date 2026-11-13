@@ -32,6 +32,8 @@ func TestNullIntegerKeyOrder(t *testing.T) {
 		"SELECT group_concat(f.v) FROM f, f g WHERE g.a = f.b AND g.v < 20",
 		"SELECT group_concat(c1.rowid || c2.rowid) FROM c c1, c c2 WHERE c2.sk = c1.sk AND c2.st = c1.st AND c2.ed = c1.ed AND c1.rowid < 80",
 		"SELECT c1.st, group_concat(c2.rowid) FROM c c1 JOIN c c2 ON c2.sk = c1.sk AND c2.ed = c1.ed WHERE c1.st = 'B' GROUP BY c1.rowid",
+		"SELECT group_concat(c2.rowid) FROM c c1, c c2 WHERE c2.st = c1.st AND c2.ed = c1.ed AND c2.sk = c1.sk AND c1.rowid % 3 = 0",
+		"SELECT c1.rowid, (SELECT group_concat(c2.rowid) FROM c c2 WHERE c2.ed = c1.ed AND c2.st = c1.st AND c2.sk = c1.sk) FROM c c1 WHERE c1.rowid < 60",
 	} {
 		differ(t, fmt.Sprintf("q-%d", i), append(append([]string(nil), pre...), q))
 	}
