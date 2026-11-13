@@ -1494,8 +1494,8 @@ var (
 	// vmJITIdxSeeks counts the index seeks native code made (VSeekIdx) and
 	// vmJITIdxSyncs the times the VDBE took such a cursor back (syncIdxSeek).
 	vmJITIdxSeeks, vmJITIdxSyncs atomic.Int64
-	// vmJITAggGathered counts the hashed GROUP BY steps native code gathered
-	// and the VDBE replayed (gatherAggStep).
+	// vmJITAggGathered counts the aggregate steps native code gathered and
+	// the VDBE replayed (gatherAggStep).
 	vmJITAggGathered atomic.Int64
 	vmJITCountSyncs  bool
 

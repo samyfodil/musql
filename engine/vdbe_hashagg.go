@@ -293,10 +293,13 @@ func (m *vdbe) stepGathered(jx *vmJIT, step *Instruction, rows [][]Value) error 
 		clear(m.aggSaved)
 	}()
 	if step.Op == OpAggStep {
+		// Every row steps from its registers alone, so one context serves the
+		// batch.
 		row, rowids := m.aggStepNullRow(plan)
+		ctx := m.aggRowCtx(plan, row, rowids)
 		for _, r := range rows {
 			copy(regs, r)
-			if err := m.aggStep(m.aggRowCtx(plan, row, rowids), step.P2); err != nil {
+			if err := m.aggStep(ctx, step.P2); err != nil {
 				return err
 			}
 		}
