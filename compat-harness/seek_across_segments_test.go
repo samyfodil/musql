@@ -7,7 +7,8 @@ import (
 
 // Joins probing a table of two segments (issue #169): one keyed in rowid
 // order, whose runs sit in one segment but at the boundary, one scattered
-// over both, its runs ordered by a column holding NULLs. The probes' runs come in C's order (ties of an ORDER BY on the
+// over both, its runs ordered by a column holding NULLs, and one whose runs
+// hold hundreds of rows tied on the automatic index's key. The probes' runs come in C's order (ties of an ORDER BY on the
 // outer table, a group_concat), a LEFT JOIN's unmatched rows read their
 // columns as NULL, and NULL, REAL and TEXT probes match as C matches them.
 func TestSeekAcrossSegments(t *testing.T) {
@@ -15,6 +16,8 @@ func TestSeekAcrossSegments(t *testing.T) {
 		"CREATE TABLE r(id INTEGER PRIMARY KEY, k INT, k2 INT, v INT, w INT, t TEXT, tc TEXT COLLATE NOCASE)",
 		"CREATE TABLE q(id INTEGER PRIMARY KEY, k INT, v INT, w INT, x)",
 		"CREATE TABLE s(id INTEGER PRIMARY KEY, k INT, k2 INT, kf REAL, kt TEXT)",
+		"CREATE TABLE p(id INTEGER PRIMARY KEY, k INT, x INT)",
+		"WITH RECURSIVE g(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM g WHERE i < 70000) INSERT INTO p SELECT i, i % 40, i % 3 FROM g",
 		"WITH RECURSIVE g(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM g WHERE i < 70000) " +
 			"INSERT INTO r SELECT i, i / 3, i % 5, (i * 37) % 1000, CASE WHEN i % 7 = 0 THEN NULL ELSE i % 100 END, " +
 			"char(65 + (i * 2) % 3), char(97 + (i * 5) % 2 - 32 * (i % 3 = 0)) FROM g",
@@ -36,6 +39,7 @@ func TestSeekAcrossSegments(t *testing.T) {
 		"SELECT s.id, q.id, q.x, q.v FROM s JOIN q ON q.k = s.k ORDER BY s.id",
 		"SELECT s.id, r.v, r.id FROM s JOIN r ON r.k = s.k AND r.t = 'B' ORDER BY s.id",
 		"SELECT s.id, r.t, r.id FROM s JOIN r ON r.k = s.k ORDER BY s.id",
+		"SELECT s.id, p.x, p.id FROM s JOIN p ON p.k = s.k % 40 WHERE s.id < 6 ORDER BY s.id",
 		"SELECT s.id, r.v, r.tc FROM s LEFT JOIN r ON r.k = s.k AND r.tc = 'a' ORDER BY s.id",
 		"SELECT s.id, r.w, r.v FROM s LEFT JOIN r ON r.k = s.k ORDER BY s.id",
 		"SELECT count(*), sum(s.id) FROM s LEFT JOIN r ON r.k = s.k AND r.k2 = s.k2 WHERE r.k IS NULL",

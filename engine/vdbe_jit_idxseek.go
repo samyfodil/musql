@@ -471,7 +471,11 @@ func buildTableSortedVMIdx(x *vmIdx, spec *idxSeekSpec) *vmIdx {
 		seg   uint16
 		r     int32
 	}
-	var rows []row
+	n := 0
+	for _, sg := range t.at {
+		n += sg.nRows
+	}
+	rows := make([]row, 0, n)
 	var prevRid uint64
 	mask := ^uint64(0)
 	for si, sg := range t.at {
@@ -516,7 +520,8 @@ func buildTableSortedVMIdx(x *vmIdx, spec *idxSeekSpec) *vmIdx {
 	if len(rows) == 0 {
 		return x
 	}
-	slices.SortStableFunc(rows, func(a, b row) int {
+	// Ties in rowid order: the rows were taken segment by segment.
+	slices.SortFunc(rows, func(a, b row) int {
 		for j := range nk {
 			na, nb := a.nulls>>j&1, b.nulls>>j&1
 			if c := cmp.Compare(nb, na); c != 0 {
@@ -526,7 +531,10 @@ func buildTableSortedVMIdx(x *vmIdx, spec *idxSeekSpec) *vmIdx {
 				return c
 			}
 		}
-		return 0
+		if c := cmp.Compare(a.seg, b.seg); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.r, b.r)
 	})
 	return x.tableIndex(mask, len(rows), func(i int) (int, int, int64) { return int(rows[i].seg), int(rows[i].r), rows[i].k[0] })
 }
@@ -544,7 +552,11 @@ func buildTableSortedVMIdxValues(x *vmIdx, spec *idxSeekSpec, enc TextEncoding) 
 		seg uint16
 		r   int32
 	}
-	var rows []row
+	n := 0
+	for _, sg := range t.at {
+		n += sg.nRows
+	}
+	rows := make([]row, 0, n)
 	var prevRid uint64
 	mask := ^uint64(0)
 	key := spec.sortCols[0]
@@ -568,20 +580,49 @@ func buildTableSortedVMIdxValues(x *vmIdx, spec *idxSeekSpec, enc TextEncoding) 
 	if len(rows) == 0 {
 		return x
 	}
-	slices.SortStableFunc(rows, func(a, b row) int {
-		if c := cmp.Compare(a.k, b.k); c != 0 {
+	// A column whose every value is a number or a NULL is read once, as
+	// compareValuesCollatedEnc orders it (compareNumeric, a NULL first);
+	// any other is read from its segment on each comparison.
+	nums := make([][]Value, len(spec.sortCols))
+	for j := 1; j < len(spec.sortCols); j++ {
+		c, vs := spec.sortCols[j], make([]Value, len(rows))
+		for i, rw := range rows {
+			v := t.at[rw.seg].Value(c, int(rw.r))
+			if v.Typ != Null && v.Typ != Int && v.Typ != Float {
+				vs = nil
+				break
+			}
+			vs[i] = v
+		}
+		nums[j] = vs
+	}
+	perm := make([]int32, len(rows))
+	for i := range perm {
+		perm[i] = int32(i)
+	}
+	slices.SortFunc(perm, func(a, b int32) int {
+		ra, rb := rows[a], rows[b]
+		if c := cmp.Compare(ra.k, rb.k); c != 0 {
 			return c
 		}
-		sa, sb := t.at[a.seg], t.at[b.seg]
 		for j := 1; j < len(spec.sortCols); j++ {
-			c := spec.sortCols[j]
-			if c := compareValuesCollatedEnc(sa.Value(c, int(a.r)), sb.Value(c, int(b.r)), spec.sortColls[j], enc); c != 0 {
+			var va, vb Value
+			if nums[j] != nil {
+				va, vb = nums[j][a], nums[j][b]
+			} else {
+				c := spec.sortCols[j]
+				va, vb = t.at[ra.seg].Value(c, int(ra.r)), t.at[rb.seg].Value(c, int(rb.r))
+			}
+			if c := compareValuesCollatedEnc(va, vb, spec.sortColls[j], enc); c != 0 {
 				return c
 			}
 		}
-		return 0
+		return cmp.Compare(a, b) // rowid order
 	})
-	return x.tableIndex(mask, len(rows), func(i int) (int, int, int64) { return int(rows[i].seg), int(rows[i].r), rows[i].k })
+	return x.tableIndex(mask, len(rows), func(i int) (int, int, int64) {
+		rw := rows[perm[i]]
+		return int(rw.seg), int(rw.r), rw.k
+	})
 }
 
 // tableIndex makes x the one index over every segment whose n rows, in
