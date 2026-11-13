@@ -411,6 +411,16 @@ func (cur *vdbeCursor) seekIsWide() bool {
 	return ok && n > total/seekNarrowRatio
 }
 
+// rowidsAreWide reports whether n rows fetched one by one are more than a
+// seekNarrowRatio-th of cur's table.
+func (cur *vdbeCursor) rowidsAreWide(n int) bool {
+	if cur.tbl == nil || cur.pager == nil || cur.pager.segs == nil {
+		return false
+	}
+	total, ok := cur.pager.segs.segTableRows(cur.tbl.root)
+	return ok && n > total/seekNarrowRatio
+}
+
 // seekIsNarrow reports whether the seek reads at most a seekNarrowRatio-th of
 // the table, so it should answer rather than a walk. An index seek counts the
 // served key with the smallest estimate; no estimate leaves the walk.
@@ -1242,7 +1252,8 @@ func (cur *vdbeCursor) rewind() error {
 		// table is left for the stream below when it only prunes -- no row
 		// it skips could raise -- since fetching its rows one by one costs
 		// far more than walking them (seekNarrowRatio).
-		if cur.idxSeekConfigured && cur.idxSeekRaiseFree && cur.idxSeekOrder == nil && cur.streamable && cur.seekIsWide() {
+		prunesOnly := cur.idxSeekRaiseFree && cur.idxSeekOrder == nil && cur.streamable
+		if cur.idxSeekConfigured && prunesOnly && cur.seekIsWide() {
 			cur.idxSeekConfigured = false
 		}
 		if cur.idxSeekConfigured && !cur.tbl.withoutRowid {
@@ -1266,6 +1277,10 @@ func (cur *vdbeCursor) rewind() error {
 				}
 			}
 			rowids, served := cur.idxSeekRowids()
+			if served && prunesOnly && !cur.seekReseek && !cur.idxListOnce && cur.rowidsAreWide(len(rowids)) {
+				// No estimate said so, but the list itself does.
+				served = false
+			}
 			if served {
 				segIndexSeeksServed.Add(1)
 				cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
