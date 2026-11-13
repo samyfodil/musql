@@ -171,19 +171,11 @@ const (
 	aggVec1Train                      // vec1_train(vector[, config]) -- see engine/vec1_train.go
 )
 
-// aggItem is one aggregate call's execution plan and running state: an
-// accumulator fed one value per surviving row by step, then read out by
-// finalize.
+// aggItem is one aggregate call's accumulator: the plan every accumulator
+// of the call shares (aggItemPlan) and its own running state, fed one value
+// per surviving row by step, then read out by finalize.
 type aggItem struct {
-	kind     aggKind
-	expr     Expr // the aggregate's argument (nil for aggCountStar)
-	sepExpr  Expr // aggGroupConcat's optional separator expression; nil => default ","
-	distinct bool // DISTINCT was written inside the aggregate's argument list
-	jsonb    bool // the jsonb_group_array/jsonb_group_object spelling of a JSON kind
-	// srcCall is the FuncExpr this template was planned from (planAggregateCall),
-	// a PLAN-time-only field: it lets an aggregate that turns out to belong to an
-	// ENCLOSING query be re-planned there verbatim. See vdbe_agg_hoist.go.
-	srcCall *FuncExpr
+	*aggItemPlan
 
 	// Running state, mutated by step as rows are scanned. Only the fields
 	// relevant to kind are used.
@@ -202,6 +194,46 @@ type aggItem struct {
 	// gc is group_concat's and the JSON groups' running text (aggConcat).
 	gc *aggConcat
 
+	// orderRisk is orderStrict's per-kind evidence, latched by step.
+	orderRisk bool
+
+	// seen holds every distinct (per compareValues) non-NULL value already
+	// fed into this accumulator, in first-seen order -- only populated/
+	// consulted when distinct is true. Verified against the reference engine
+	// that DISTINCT dedup happens BEFORE a value reaches the kind-specific
+	// accumulation logic (e.g. sum(DISTINCT x) over integer 2 and TEXT '2'
+	// contributes both, since they're a different storage class and hence
+	// not compareValues-equal, but a second integer 2 contributes only
+	// once) -- see step's shared pre-dispatch dedup check below.
+	// They are kept in dist (aggDistinct), made on the first value.
+	dist *aggDistinct
+
+	// argColl caches the collating sequence of the aggregate's ARGUMENT --
+	// see argCollation. Resolved on the first contributing row (planning has
+	// no evalCtx to resolve a bare column's declared collation against) and
+	// reused for the rest of this accumulator's life; the argument expression
+	// is fixed, so the answer cannot change row to row.
+	argColl    string
+	argCollSet bool
+
+	// ob is the ORDER BY's buffer (aggOrderBuf), made on the first row.
+	ob *aggOrderBuf
+}
+
+// aggItemPlan is an aggregate call as planned and compiled: the same for
+// every group's accumulator, which shares it rather than copying it, so a
+// GROUP BY of many groups keeps one.
+type aggItemPlan struct {
+	kind     aggKind
+	expr     Expr // the aggregate's argument (nil for aggCountStar)
+	sepExpr  Expr // aggGroupConcat's optional separator expression; nil => default ","
+	distinct bool // DISTINCT was written inside the aggregate's argument list
+	jsonb    bool // the jsonb_group_array/jsonb_group_object spelling of a JSON kind
+	// srcCall is the FuncExpr this template was planned from (planAggregateCall),
+	// a PLAN-time-only field: it lets an aggregate that turns out to belong to an
+	// ENCLOSING query be re-planned there verbatim. See vdbe_agg_hoist.go.
+	srcCall *FuncExpr
+
 	// orderStrict is armed by the compiler when this query's ROW ORDER is not
 	// provably the order C SQLite feeds its own accumulators
 	// (anchorPlanOrderProvable, vdbe_agg_codegen.go) AND this accumulator is
@@ -209,7 +241,6 @@ type aggItem struct {
 	// the accumulation TURNED OUT not to depend on the order after all --
 	// orderRisk is the per-kind evidence, latched by step.
 	orderStrict bool
-	orderRisk   bool
 
 	// minMaxLastWins makes a tie keep the later value, as a window
 	// min()/max() over a moving frame does. The plain accumulator (minmaxStep,
@@ -232,25 +263,6 @@ type aggItem struct {
 	// value reaches the accumulator, so a filtered-out row contributes
 	// nothing at all -- not even to count(*).
 	filter Expr
-
-	// seen holds every distinct (per compareValues) non-NULL value already
-	// fed into this accumulator, in first-seen order -- only populated/
-	// consulted when distinct is true. Verified against the reference engine
-	// that DISTINCT dedup happens BEFORE a value reaches the kind-specific
-	// accumulation logic (e.g. sum(DISTINCT x) over integer 2 and TEXT '2'
-	// contributes both, since they're a different storage class and hence
-	// not compareValues-equal, but a second integer 2 contributes only
-	// once) -- see step's shared pre-dispatch dedup check below.
-	// They are kept in dist (aggDistinct), made on the first value.
-	dist *aggDistinct
-
-	// argColl caches the collating sequence of the aggregate's ARGUMENT --
-	// see argCollation. Resolved on the first contributing row (planning has
-	// no evalCtx to resolve a bare column's declared collation against) and
-	// reused for the rest of this accumulator's life; the argument expression
-	// is fixed, so the answer cannot change row to row.
-	argColl    string
-	argCollSet bool
 
 	// rowRegs are the registers a compiled scan body left this accumulator's
 	// per-row values in, indexed by aggExprFilter/aggExprArg/aggExprSep and
@@ -293,8 +305,6 @@ type aggItem struct {
 	// stamped by planAggArgRegs; a key that IS the argument (C's bOBPayload==0,
 	// expr.c:7522-7526) shares the argument's register, since C codes it once.
 	obRegs []int
-	// ob is the ORDER BY's buffer (aggOrderBuf), made on the first row.
-	ob *aggOrderBuf
 }
 
 // The running state only some accumulators keep, each made on first use, so
@@ -660,12 +670,14 @@ func (it *aggItem) obReplay() error {
 			}
 		}
 	}
-	orderBy, filter, distinct, strict, rowRegs := it.orderBy, it.filter, it.distinct, it.orderStrict, it.rowRegs
-	it.orderBy, it.filter, it.distinct, it.orderStrict = nil, nil, false, false
-	it.rowRegs = [3]int{0, 1, 2} // aggExprArg -> regs[0], aggExprSep -> regs[1]
-	defer func() {
-		it.orderBy, it.filter, it.distinct, it.orderStrict, it.rowRegs = orderBy, filter, distinct, strict, rowRegs
-	}()
+	// The replay steps under a plan of its own: the shared one is every
+	// group's, and a cached program may be running elsewhere.
+	shared := it.aggItemPlan
+	replay := *shared
+	replay.orderBy, replay.filter, replay.distinct, replay.orderStrict = nil, nil, false, false
+	replay.rowRegs = [3]int{0, 1, 2} // aggExprArg -> regs[0], aggExprSep -> regs[1]
+	it.aggItemPlan = &replay
+	defer func() { it.aggItemPlan = shared }()
 	regs := make([]Value, 2)
 	for _, row := range it.orderBuf().rows {
 		regs[0], regs[1] = row.arg, row.sep
@@ -757,7 +769,7 @@ func planAggregateCallKind(fc FuncExpr) (*aggItem, error) {
 			// the reference engine's rejection of "count(DISTINCT *)".
 			return nil, fmt.Errorf("engine: unsupported use of DISTINCT with *")
 		}
-		return &aggItem{kind: aggCountStar}, nil
+		return &aggItem{aggItemPlan: &aggItemPlan{kind: aggCountStar}}, nil
 	}
 	// DISTINCT aggregates must have exactly one argument (verified against
 	// the reference engine: group_concat(DISTINCT x, sep) -- otherwise a
@@ -788,7 +800,7 @@ func planAggregateCallKind(fc FuncExpr) (*aggItem, error) {
 				// syntax error; kept explicit rather than silently dropped.
 				return nil, fmt.Errorf("engine: unsupported use of DISTINCT with count()")
 			}
-			return &aggItem{kind: aggCountStar}, nil
+			return &aggItem{aggItemPlan: &aggItemPlan{kind: aggCountStar}}, nil
 		}
 		if len(fc.Args) != 1 {
 			return nil, fmt.Errorf("engine: count() takes exactly 1 argument (or count(*))")
@@ -796,7 +808,7 @@ func planAggregateCallKind(fc FuncExpr) (*aggItem, error) {
 		if err := checkExprSupported(fc.Args[0]); err != nil {
 			return nil, err
 		}
-		return &aggItem{kind: aggCount, expr: fc.Args[0], distinct: fc.Distinct}, nil
+		return &aggItem{aggItemPlan: &aggItemPlan{kind: aggCount, expr: fc.Args[0], distinct: fc.Distinct}}, nil
 
 	case "sum", "total", "avg":
 		if len(fc.Args) != 1 {
@@ -812,7 +824,7 @@ func planAggregateCallKind(fc FuncExpr) (*aggItem, error) {
 		case "avg":
 			kind = aggAvg
 		}
-		return &aggItem{kind: kind, expr: fc.Args[0], distinct: fc.Distinct}, nil
+		return &aggItem{aggItemPlan: &aggItemPlan{kind: kind, expr: fc.Args[0], distinct: fc.Distinct}}, nil
 
 	case "min", "max":
 		// isAggregateCall already only routes the 1-argument form here (a
@@ -836,7 +848,7 @@ func planAggregateCallKind(fc FuncExpr) (*aggItem, error) {
 		// values), verified against the reference engine, but the dedup
 		// bookkeeping (aggDistinct) is harmless overhead either way, so it isn't
 		// specially suppressed here.
-		return &aggItem{kind: kind, expr: fc.Args[0], distinct: fc.Distinct}, nil
+		return &aggItem{aggItemPlan: &aggItemPlan{kind: kind, expr: fc.Args[0], distinct: fc.Distinct}}, nil
 
 	case "group_concat", "string_agg":
 		// string_agg(X,Y) is C SQLite's exact alias for the 2-argument
@@ -869,7 +881,7 @@ func planAggregateCallKind(fc FuncExpr) (*aggItem, error) {
 			}
 			sep = fc.Args[1]
 		}
-		return &aggItem{kind: aggGroupConcat, expr: fc.Args[0], sepExpr: sep, distinct: fc.Distinct}, nil
+		return &aggItem{aggItemPlan: &aggItemPlan{kind: aggGroupConcat, expr: fc.Args[0], sepExpr: sep, distinct: fc.Distinct}}, nil
 
 	case "json_group_array", "jsonb_group_array":
 		if len(fc.Args) != 1 {
@@ -880,7 +892,7 @@ func planAggregateCallKind(fc FuncExpr) (*aggItem, error) {
 		}
 		// jsonb_group_array is the same WAGGREGATE with JSON_BLOB user data
 		// (json.c:5701), which only its result computation reads.
-		return &aggItem{kind: aggJSONGroupArray, expr: fc.Args[0], distinct: fc.Distinct, jsonb: name == "jsonb_group_array"}, nil
+		return &aggItem{aggItemPlan: &aggItemPlan{kind: aggJSONGroupArray, expr: fc.Args[0], distinct: fc.Distinct, jsonb: name == "jsonb_group_array"}}, nil
 
 	case "vec1_train":
 		if len(fc.Args) != 1 && len(fc.Args) != 2 {
@@ -894,7 +906,7 @@ func planAggregateCallKind(fc FuncExpr) (*aggItem, error) {
 				return nil, err
 			}
 		}
-		it := &aggItem{kind: aggVec1Train, expr: fc.Args[0]}
+		it := &aggItem{aggItemPlan: &aggItemPlan{kind: aggVec1Train, expr: fc.Args[0]}}
 		if len(fc.Args) == 2 {
 			it.sepExpr = fc.Args[1]
 		}
@@ -912,7 +924,7 @@ func planAggregateCallKind(fc FuncExpr) (*aggItem, error) {
 		}
 		// sepExpr reused as the VALUE expression here -- see
 		// stepJSONGroupObject's (engine/json_funcs.go) doc comment.
-		return &aggItem{kind: aggJSONGroupObject, expr: fc.Args[0], sepExpr: fc.Args[1], distinct: fc.Distinct, jsonb: name == "jsonb_group_object"}, nil
+		return &aggItem{aggItemPlan: &aggItemPlan{kind: aggJSONGroupObject, expr: fc.Args[0], sepExpr: fc.Args[1], distinct: fc.Distinct, jsonb: name == "jsonb_group_object"}}, nil
 	}
 	return nil, fmt.Errorf("engine: unsupported aggregate function %s()", fc.Name)
 }

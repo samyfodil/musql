@@ -92,7 +92,7 @@ func TestWindowStepArgRegsStamped(t *testing.T) {
 		if call.stepArgs.nWin != 0 {
 			t.Errorf("%s: step-args program reserves %d window-result registers, want 0", tc.sql, call.stepArgs.nWin)
 		}
-		var tmpl aggItem
+		tmpl := aggItem{aggItemPlan: &aggItemPlan{}}
 		stampWindowStepArgRegs(&tmpl, plan, call)
 		if got := tmpl.rowRegs[aggExprArg] - plan.nOps; got != tc.wantArg {
 			t.Errorf("%s: aggExprArg at nOps+%d, want nOps+%d", tc.sql, got, tc.wantArg)

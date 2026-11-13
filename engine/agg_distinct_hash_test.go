@@ -53,7 +53,7 @@ func TestAggDistinctHashFollowsTheComparison(t *testing.T) {
 // TestAggDistinctSeenProbesItsBucket checks that the probe returns the first
 // spelling of a value and keeps values that only share a hash apart.
 func TestAggDistinctSeenProbesItsBucket(t *testing.T) {
-	it := &aggItem{distinct: true}
+	it := &aggItem{aggItemPlan: &aggItemPlan{distinct: true}}
 	if _, dup := it.distinctSeen(Value{Typ: Int, I: 1}, "", UTF8); dup {
 		t.Fatal("first value reported as seen")
 	}

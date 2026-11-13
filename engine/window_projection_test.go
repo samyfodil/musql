@@ -324,7 +324,7 @@ func TestWindowAggArgsStamped(t *testing.T) {
 			t.Fatalf("%s: %d calls", tc.sql, len(plan.calls))
 		}
 		call := plan.calls[0]
-		tmpl := &aggItem{}
+		tmpl := &aggItem{aggItemPlan: &aggItemPlan{}}
 		stampWindowAggRegs(tmpl, call)
 		got := want{
 			arg:    tmpl.rowRegs[aggExprArg] > 0,

@@ -46,7 +46,7 @@ func TestGroupConcatWindowInverse(t *testing.T) {
 // total leaves NaN, which a recomputed frame would not have (sumInverse,
 // func.c:1962).
 func TestSumInverseKeepsInfinityPollution(t *testing.T) {
-	it := &aggItem{kind: aggSum}
+	it := &aggItem{aggItemPlan: &aggItemPlan{kind: aggSum}}
 	for _, v := range []float64{1.5, math.Inf(1)} {
 		it.cnt++
 		it.sumStep(false, 0, v)
@@ -65,7 +65,7 @@ func TestSumInverseKeepsInfinityPollution(t *testing.T) {
 // TestSumInverseIntegerOverflowLatches: an integer total that overflowed on the
 // way in keeps the error even when the inverse brings it back into range.
 func TestSumInverseIntegerOverflowLatches(t *testing.T) {
-	it := &aggItem{kind: aggSum}
+	it := &aggItem{aggItemPlan: &aggItemPlan{kind: aggSum}}
 	for _, v := range []int64{math.MaxInt64, 5} {
 		it.cnt++
 		it.sumStep(true, v, float64(v))
