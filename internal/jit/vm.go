@@ -58,10 +58,12 @@ const (
 	// 0..63 (VShr is arithmetic). Any other amount exits.
 	VShl
 	VShr
-	// VCmpJump: jump to T when r[B] Cond r[A], both integers.
+	// VCmpJump: jump to T when r[B] Cond r[A], both integers. With Imm not 0 a
+	// NULL operand answers too, as a comparison that is not IS does: it falls
+	// through (Imm 1) or jumps to T (Imm 2, SQLITE_JUMPIFNULL).
 	VCmpJump
 	// VCmpSet: r[C] = 1 if r[B] Cond r[A] else 0, both integers: the store form
-	// of a comparison.
+	// of a comparison. With Imm not 0 a NULL operand stores NULL.
 	VCmpSet
 	// VNullJump: jump to T when r[A] is NULL (Imm != 0) or is not NULL (Imm == 0).
 	// Any type answers; nothing is guarded.
@@ -96,7 +98,9 @@ const (
 	VNot
 	// VCmpBr is a VCmpSet at its pc fused with the VIf at the next that tests
 	// its result: compare r[B] Cond r[A], store the 0 or 1 in r[C] unless Dead,
-	// and jump to T when the result is Imm. The next pc is VFused.
+	// and jump to T when the result is Imm&1. The next pc is VFused. With
+	// VCmpNull in Imm a NULL operand stores NULL unless Dead and jumps to T
+	// when VCmpNullJumps is in it too (the test's NULL arm).
 	VCmpBr
 	// VNotBr is a VNot fused the same way: r[C] = !r[A] unless Dead, jump to T
 	// when that is Imm.
@@ -226,6 +230,12 @@ const (
 	// below 64 reading NULL; VRowid, VNext and VRewind exit. The cursor's
 	// segment pointer is stored, so the write barrier exits.
 	VNullRow
+)
+
+// VCmpBr's Imm bits past the result it jumps on.
+const (
+	VCmpNull      = 2
+	VCmpNullJumps = 4
 )
 
 // NullSeg is the one row VNullRow puts a cursor on: every column below 64

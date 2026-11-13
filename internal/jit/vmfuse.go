@@ -235,8 +235,16 @@ func FuseVM(prog []VInsn, nReg int, hard, entry []bool) []VInsn {
 			continue
 		}
 		var op VOp
+		imm := nx.Imm
 		switch in.Op {
 		case VCmpSet:
+			if in.Imm != 0 {
+				// A NULL operand: no store but NULL's, and the test's NULL arm.
+				imm |= VCmpNull
+				if nx.C != 0 {
+					imm |= VCmpNullJumps
+				}
+			}
 			op = VCmpBr
 		case VFCmpSet:
 			op = VFCmpBr
@@ -245,9 +253,10 @@ func FuseVM(prog []VInsn, nReg int, hard, entry []bool) []VInsn {
 		default:
 			continue
 		}
-		// The test's NULL arm (C) cannot matter: the fused compare or NOT
-		// has an INTEGER result whenever it runs natively.
-		out[pc] = VInsn{Op: op, A: in.A, B: in.B, C: in.C, Cond: in.Cond, T: nx.T, Imm: nx.Imm, Dead: dead(pc+1, in.C)}
+		// The test's NULL arm (C) matters only to a compare that answers a
+		// NULL operand (VCmpNullJumps): any other fused compare or NOT has an
+		// INTEGER result whenever it runs natively.
+		out[pc] = VInsn{Op: op, A: in.A, B: in.B, C: in.C, Cond: in.Cond, T: nx.T, Imm: imm, Dead: dead(pc+1, in.C)}
 		// The second half keeps its test, so an entry there -- the VDBE ran
 		// the comparison itself and comes back for the test -- runs it alone.
 		out[pc+1] = VInsn{Op: VFused, A: nx.A, C: nx.C, T: nx.T, Imm: nx.Imm}

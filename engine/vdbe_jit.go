@@ -1382,13 +1382,22 @@ func lowerVM(in *Instruction, nReg int) jit.VInsn {
 		// Two INTEGERs answer before NULL handling, affinity or collation
 		// (compareOp's first arm, vdbe.c:2288), so P4 and P5 matter only for
 		// the store-the-result form, which stays the VDBE's.
+		// A NULL operand answers next (compareOp, vdbe.c:2315) unless NULLs
+		// compare equal: no jump unless JUMPIFNULL, or a NULL stored.
+		var null int64
+		if in.P5&p5NullEq == 0 {
+			null = 1
+			if in.P5&(p5StoreP2|p5JumpIfNull) == p5JumpIfNull {
+				null = 2
+			}
+		}
 		if in.P5&p5StoreP2 == 0 && ok(in.P1, in.P3) {
-			return jit.VInsn{Op: jit.VCmpJump, A: in.P1, B: in.P3, T: in.P2, Cond: vmCond[in.Op]}
+			return jit.VInsn{Op: jit.VCmpJump, A: in.P1, B: in.P3, T: in.P2, Cond: vmCond[in.Op], Imm: null}
 		}
 		// ...and in the store form, the same two integers give 0 or 1 in r[P2]
 		// (deliverCompare).
 		if in.P5&p5StoreP2 != 0 && ok(in.P1, in.P3, in.P2) {
-			return jit.VInsn{Op: jit.VCmpSet, A: in.P1, B: in.P3, C: in.P2, Cond: vmCond[in.Op]}
+			return jit.VInsn{Op: jit.VCmpSet, A: in.P1, B: in.P3, C: in.P2, Cond: vmCond[in.Op], Imm: null}
 		}
 	case OpFunction:
 		// substr(x, y, z) of a TEXT whose bytes to y-1+z are ASCII and none NUL
