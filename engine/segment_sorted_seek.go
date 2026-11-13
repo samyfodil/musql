@@ -65,6 +65,13 @@ func (s *segSortedRows) shortRuns() bool {
 	return n <= s.distinct*maxSegSortedRun
 }
 
+// segSortable reports whether cur is a table's one list of rows, which
+// OpSortedSeek asks the segments to serve (segSortedSeek) before building it.
+func (cur *vdbeCursor) segSortable() bool {
+	return cur.rowStore == nil && !cur.streamable && !cur.seekReseek && !cur.refillEach && cur.sub == nil && cur.vt == nil &&
+		(!cursorHasNoBtree(cur) || cur.fill != nil)
+}
+
 // segSortedSeek positions cur on the rows whose column h.col equals probe,
 // straight from the segments, as sortedSeek narrows built rows. false, with
 // nothing changed, where the segments are not the whole table or the column
@@ -78,9 +85,32 @@ func (s *segSortedRows) shortRuns() bool {
 // short (shortRuns): the run holds every row equal on all of them, in the
 // order they would come, and the loop drops the rest.
 func (cur *vdbeCursor) segSortedSeek(h *sortedSeekHint, probe Value, enc TextEncoding) bool {
+	s, orderOp, ok := cur.segSortedReady(h, enc)
+	if !ok {
+		return false
+	}
+	lo, hi := s.find(probe)
+	s.orderRun(lo, hi)
+	src := &cur.pointSrc
+	segs, rows := src.listSegs[:0], src.listRows[:0]
+	if s.one != nil {
+		for _, r := range s.perm[lo:hi] {
+			segs, rows = append(segs, s.one), append(rows, int(r))
+		}
+	} else {
+		segs, rows = append(segs, s.segs[lo:hi]...), append(rows, s.rows[lo:hi]...)
+	}
+	cur.serveSegRun(orderOp, segs, rows)
+	return true
+}
+
+// segSortedReady is segSortedSeek short of a probe: the cursor's
+// segSortedRows for h and the automatic index order its runs take, made
+// once, and whether the segments serve h's seeks.
+func (cur *vdbeCursor) segSortedReady(h *sortedSeekHint, enc TextEncoding) (*segSortedRows, *Instruction, bool) {
 	if h.built || cur.materialized || cur.fill != nil || cur.ranged || cur.seekConfigured || cur.idxSeekConfigured || cur.seekSetConfigured ||
 		cur.segSorted == nil && (cur.segSrc != nil || cur.keyListReady) {
-		return false
+		return nil, nil, false
 	}
 	orderOp := cur.segOrder
 	if cur.pendingOrder != nil {
@@ -89,7 +119,7 @@ func (cur *vdbeCursor) segSortedSeek(h *sortedSeekHint, probe Value, enc TextEnc
 	var key *autoIndexKey
 	if orderOp != nil {
 		if key = orderOp.P4.(*autoIndexKey); !segRunOrderable(cur.tbl, key) {
-			return false
+			return nil, nil, false
 		}
 	}
 	s := cur.segSorted
@@ -102,20 +132,16 @@ func (cur *vdbeCursor) segSortedSeek(h *sortedSeekHint, probe Value, enc TextEnc
 		cur.segSorted = s
 	}
 	if !s.ok || len(h.more) > 0 && !s.shortRuns() {
-		return false
+		return nil, nil, false
 	}
+	return s, orderOp, true
+}
+
+// serveSegRun positions cur before a seek's run of segment rows, taking
+// over the automatic index order orderOp, as segSortedSeek leaves it.
+func (cur *vdbeCursor) serveSegRun(orderOp *Instruction, segs []*segment, rows []int) {
 	cur.segOrder, cur.pendingOrder = orderOp, nil
-	lo, hi := s.find(probe)
-	s.orderRun(lo, hi)
 	src := &cur.pointSrc
-	segs, rows := src.listSegs[:0], src.listRows[:0]
-	if s.one != nil {
-		for _, r := range s.perm[lo:hi] {
-			segs, rows = append(segs, s.one), append(rows, int(r))
-		}
-	} else {
-		segs, rows = append(segs, s.segs[lo:hi]...), append(rows, s.rows[lo:hi]...)
-	}
 	*src = segRowSource{list: true, listSegs: segs, listRows: rows, listOne: oneSegment(segs), listKeys: src.listKeys, listPerm: src.listPerm,
 		listHits: src.listHits, cols: segColPlansFor(cur.tbl)}
 	cur.seekGen = seekGens.Add(1)
@@ -126,7 +152,6 @@ func (cur *vdbeCursor) segSortedSeek(h *sortedSeekHint, probe Value, enc TextEnc
 	cur.rowidNull = false
 	cur.keyListReady = true
 	segSortedSeeksServed.Add(1)
-	return true
 }
 
 // unserveSegSorted takes back a cursor segSortedSeek positioned when the

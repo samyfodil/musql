@@ -21,6 +21,7 @@ package engine
 import (
 	"fmt"
 	"slices"
+	"unsafe"
 )
 
 // aggPlan is an OpAggReset/OpAggStep P4 payload: what the aggregate opcodes share
@@ -429,21 +430,36 @@ func anchorColsSpelledAs(anchor, row []Value, cols []int) bool {
 // all-NULL row of plan's width. A GROUP BY group is never empty.
 //
 // An anchor kept as its columns alone (cols) is placed back at them in buf.
-func (a *aggAccumulators) anchorRow(plan *aggPlan, buf *[]Value) (vals, rowids []Value) {
+func (a *aggAccumulators) anchorRow(plan *aggPlan, buf *anchorRowBuf) (vals, rowids []Value) {
 	if !a.haveAnchor {
 		return make([]Value, plan.nCols), make([]Value, len(plan.scopes))
 	}
 	if a.cols == nil {
 		return a.anchorVals, a.anchorRowids
 	}
-	row := growValues(buf, a.rowWidth)
-	clear(row)
+	row := buf.row
+	if len(row) != a.rowWidth || len(buf.cols) != len(a.cols) || unsafe.SliceData(buf.cols) != unsafe.SliceData(a.cols) {
+		row = growValues(&buf.row, a.rowWidth)
+		buf.cols = a.cols
+	}
 	for i, c := range a.cols {
-		if i < len(a.anchorVals) && c < len(row) {
-			row[c] = a.anchorVals[i]
+		if c < len(row) {
+			if i < len(a.anchorVals) {
+				row[c] = a.anchorVals[i]
+			} else {
+				row[c] = Value{}
+			}
 		}
 	}
 	return row, a.anchorRowids
+}
+
+// anchorRowBuf is the row anchorRow places an anchor's read columns back in,
+// and the columns it was cleared for: while they are the same, only they are
+// ever written, so the rest is still NULL and the row is not cleared again.
+type anchorRowBuf struct {
+	row  []Value
+	cols []int
 }
 
 // newAggAccs clones a fresh accumulator set from plan's item templates

@@ -118,7 +118,7 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 	}
 	for _, in := range prog {
 		switch in.Op {
-		case VColumn, VNext, VRewind, VRowid, VOpen, VClose, VSeekRowid, VSeekIdx, VSeekRewind:
+		case VColumn, VNext, VRewind, VRowid, VOpen, VClose, VSeekRowid, VSeekIdx, VSeekRewind, VNullRow:
 			e.curs, e.rowp, e.valp = w.Local(wI32), w.Local(wI32), w.Local(wI32)
 			w.LoadPtr(POffCur)
 			w.Set(e.curs)
@@ -715,6 +715,8 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		e.seekIdx(pc, in)
 	case VSeekRewind:
 		e.seekRewind(pc, in)
+	case VNullRow:
+		e.nullRow(pc, in)
 	case VReal, VFAdd, VFSub, VFMul, VFDiv, VFCmpJump, VFCmpSet, VFCmpBr, VMath:
 		return e.realInsn(pc, in)
 	case VSubstr:

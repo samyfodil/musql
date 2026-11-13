@@ -412,6 +412,13 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	// An integer equality index seek of a table cursor, which native code
 	// makes itself over the table's one segment (vmJIT.idxFor).
 	idxSpecs, idxPCs, idxInner := lowerIdxSeeks(prog, vp, segCap)
+	// A seek cursor's NULL row, which its next seek moves it off.
+	for pc, in := range prog.Insns {
+		if in.Op == OpNullRow && in.P1 >= 0 && in.P1 < len(idxSpecs) && idxSpecs[in.P1] != nil {
+			vp[pc] = jit.VInsn{Op: jit.VNullRow, A: in.P1}
+			idxPCs = append(idxPCs, pc)
+		}
+	}
 	for _, q := range idxPCs {
 		if !entry[q] {
 			entry[q] = true
@@ -643,7 +650,7 @@ func isCursorOpen(op OpCode) bool {
 // vmCursorOp reports whether op reads or moves its cursor (A).
 func vmCursorOp(op jit.VOp) bool {
 	switch op {
-	case jit.VColumn, jit.VRowid, jit.VNext, jit.VRewind, jit.VOpen, jit.VClose, jit.VSeekRowid, jit.VSeekIdx, jit.VSeekRewind:
+	case jit.VColumn, jit.VRowid, jit.VNext, jit.VRewind, jit.VOpen, jit.VClose, jit.VSeekRowid, jit.VSeekIdx, jit.VSeekRewind, jit.VNullRow:
 		return true
 	}
 	return false
@@ -2338,7 +2345,7 @@ func (jx *vmJIT) handCursor(m *vdbe, pc, c int) {
 	}
 	if t := jx.tabFor(c, cur); t != nil {
 		jc.Tab = unsafe.Pointer(&t.tab)
-		if jx.idxSpecs != nil && jx.idxSpecs[c] != nil {
+		if spec := jx.idxSpecs; spec != nil && spec[c] != nil && (spec[c].sorted == nil || jx.sortedSeekServed(m, cur, spec[c])) {
 			if x := jx.idxFor(c, t); x != nil {
 				jc.Idx = unsafe.Pointer(&x.vidx[0])
 			}
@@ -2437,6 +2444,17 @@ func (jx *vmJIT) syncCursor(m *vdbe, c, exit int) {
 		}
 		return
 	}
+	if jc.State == 6 {
+		// Native code put the cursor on its NULL row (jit.VNullRow).
+		m.jsnap[c].segLive, m.jsnap[c].live = false, false
+		if jx.idxSpecs[c].sorted != nil {
+			segSortedSeeksServed.Add(1)
+		}
+		if cur := m.cursors[c]; cur != nil {
+			cur.nullRow()
+		}
+		return
+	}
 	if jc.Idx != nil && jc.State >= 2 && jc.State <= 4 {
 		// Native code seeked the cursor through its index: the VDBE's
 		// seek of the last key is run here, and walks on to where
@@ -2456,6 +2474,10 @@ func (jx *vmJIT) syncCursor(m *vdbe, c, exit int) {
 		if vmJITCountSyncs {
 			vmJITIdxSeeks.Add(max(jc.Served, 0) + 1)
 		}
+		spec := jx.idxSpecs[c]
+		if spec.sorted != nil {
+			segSortedSeeksServed.Add(1)
+		}
 		if at := exit; at >= 0 && at < jx.n {
 			if in := unsafe.Slice(jx.insns, jx.n)[at]; in.P1 == c && (in.Op == OpClose || isCursorOpen(in.Op)) {
 				segRowsServed.Add(served + last)
@@ -2466,7 +2488,11 @@ func (jx *vmJIT) syncCursor(m *vdbe, c, exit int) {
 		if vmJITCountSyncs {
 			vmJITIdxSyncs.Add(1)
 		}
-		if err := m.syncIdxSeek(jx, c, jc, jx.idxSpecs[c]); err != nil && m.jitErr == nil {
+		sync := m.syncIdxSeek
+		if spec.sorted != nil {
+			sync = m.syncSortedSeek
+		}
+		if err := sync(jx, c, jc, spec); err != nil && m.jitErr == nil {
 			m.jitErr = err
 		}
 		return

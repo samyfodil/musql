@@ -10,9 +10,9 @@ import (
 )
 
 // TestVMSegColumn reads every kind of segment cell through a segment-capable
-// VColumn, and the same instruction over a row list: a NULL and an exception
-// exit, an integral double within 2^53 is an INTEGER, the rowid comes from a
-// dense segment or its rowid block, and TEXT shares the heap.
+// VColumn, and the same instruction over a row list: a NULL is a NULL, an
+// exception exits, an integral double within 2^53 is an INTEGER, the rowid
+// comes from a dense segment or its rowid block, and TEXT shares the heap.
 func TestVMSegColumn(t *testing.T) {
 	if !Available || !VMSegCursor {
 		t.Skip("no segment cursors on this platform")
@@ -65,7 +65,10 @@ func TestVMSegColumn(t *testing.T) {
 				want, exits := tvalue{}, false
 				switch c {
 				case 0:
-					want, exits = tvalue{Typ: tvInt, I: ints[row]}, row == 4
+					want = tvalue{Typ: tvInt, I: ints[row]}
+					if row == 4 {
+						want = tvalue{Typ: tvNull}
+					}
 				case 1:
 					want, exits = tvalue{Typ: tvReal, F: floats[row]}, row == 1
 				case 2:
@@ -239,6 +242,84 @@ func TestVMSeekIdx(t *testing.T) {
 	regs = []tvalue{{Typ: tvInt, I: 3}, {Typ: tvInt, I: -1}}
 	if pc := runVMCursor(t, prog, regs, nil, &VCursor{Last: -1}, 0); pc != 0 {
 		t.Fatalf("a cursor with no index ran natively to %d", pc)
+	}
+}
+
+// TestVMSeekIdxFallThrough is a seek whose miss falls through (T the next
+// instruction) to work between it and its rewind -- a LEFT JOIN's match flag
+// -- and the rewind takes the empty jump.
+func TestVMSeekIdxFallThrough(t *testing.T) {
+	if !Available || !VMSegCursor {
+		t.Skip("no segment cursors on this platform")
+	}
+	noGC(t)
+	keys := []uint64{7, 3, 7}
+	vals := []uint64{100, 101, 102}
+	cols := []VSegCol{{Kind: VSegInt, Block: unsafe.Pointer(&keys[0])}, {Kind: VSegInt, Block: unsafe.Pointer(&vals[0])}}
+	seg := &VSeg{Cols: unsafe.Pointer(&cols[0]), First: 1, Dense: 1}
+	iv, st, rw := []int64{3, 7}, []int32{0, 1, 3}, []int{1, 0, 2}
+	ix := []VIdx{{Vals: unsafe.Pointer(&iv[0]), NVals: 2, Starts: unsafe.Pointer(&st[0]), Rows: unsafe.Pointer(&rw[0]), Seg: unsafe.Pointer(seg),
+		Mask: 3, Count: 1, Lo: 3, Hi: 7}}
+	prog := []VInsn{
+		{Op: VSeekIdx, A: 0, B: 0, T: 1},
+		{Op: VInt, A: 2, Imm: 0},
+		{Op: VSeekRewind, A: 0, T: 6},
+		{Op: VColumn, A: 0, B: 1, C: 1, Imm: 1},
+		{Op: VNext, A: 0, T: 3},
+		{Op: VExit},
+		{Op: VExit},
+	}
+	for _, c := range []struct {
+		key, pc, state int64
+		r1             uint64
+	}{{7, 5, 4, 102}, {3, 5, 4, 101}, {5, 6, 3, 0}, {9, 6, 3, 0}} {
+		regs := []tvalue{{Typ: tvInt, I: c.key}, {Typ: tvInt, I: 0}, {Typ: tvInt, I: 1}}
+		cur := &VCursor{Last: -1, Idx: unsafe.Pointer(&ix[0])}
+		pc := runVMCursor(t, prog, regs, nil, cur, 0)
+		if int64(pc) != c.pc || cur.State != c.state || regs[2].I != 0 || uint64(regs[1].I) != c.r1 {
+			t.Fatalf("key %d: pc %d state %d r1 %+v r2 %+v, want pc %d state %d r1 %d", c.key, pc, cur.State, regs[1], regs[2], c.pc, c.state, c.r1)
+		}
+	}
+}
+
+// TestVMNullRow puts a seek cursor on its NULL row: its columns read NULL
+// natively, a predicted read too, and VRowid exits; a seek after it takes
+// the cursor back onto rows.
+func TestVMNullRow(t *testing.T) {
+	if !Available || !VMSegCursor {
+		t.Skip("no segment cursors on this platform")
+	}
+	noGC(t)
+	keys := []uint64{7, 3, 7}
+	vals := []uint64{100, 101, 102}
+	cols := []VSegCol{{Kind: VSegInt, Block: unsafe.Pointer(&keys[0]), Plain: VSegInt}, {Kind: VSegInt, Block: unsafe.Pointer(&vals[0]), Plain: VSegInt}}
+	seg := &VSeg{Cols: unsafe.Pointer(&cols[0]), First: 1, Dense: 1}
+	iv, st, rw := []int64{3, 7}, []int32{0, 1, 3}, []int{1, 0, 2}
+	ix := []VIdx{{Vals: unsafe.Pointer(&iv[0]), NVals: 2, Starts: unsafe.Pointer(&st[0]), Rows: unsafe.Pointer(&rw[0]), Seg: unsafe.Pointer(seg),
+		Mask: 3, Count: 1, Lo: 3, Hi: 7}}
+	prog := []VInsn{
+		{Op: VNullRow, A: 0},
+		{Op: VColumn, A: 0, B: 1, C: 1, Imm: 1},
+		{Op: VColumn, A: 0, B: 40, C: 2, Imm: 1, T: VSegInt},
+		{Op: VSeekIdx, A: 0, B: 0, T: 4},
+		{Op: VSeekRewind, A: 0, T: 6},
+		{Op: VColumn, A: 0, B: 1, C: 3, Imm: 1, T: VSegInt},
+		{Op: VExit},
+	}
+	regs := []tvalue{{Typ: tvInt, I: 3}, {Typ: tvInt, I: 9}, {Typ: tvInt, I: 9}, {Typ: tvInt, I: 9}}
+	cur := &VCursor{Last: -1, Idx: unsafe.Pointer(&ix[0])}
+	if pc := runVMCursor(t, prog, regs, nil, cur, 0); pc != 6 || regs[1].Typ != tvNull || regs[2].Typ != tvNull || regs[3].I != 101 ||
+		cur.State != 4 {
+		t.Fatalf("pc %d state %d regs %+v", pc, cur.State, regs)
+	}
+	rowid := []VInsn{{Op: VNullRow, A: 0}, {Op: VRowid, A: 0, C: 1}, {Op: VExit}}
+	cur = &VCursor{Last: -1}
+	if pc := runVMCursor(t, rowid, regs, nil, cur, 0); pc != 1 || cur.State != 6 || cur.Ok != 1 || cur.N != 1 {
+		t.Fatalf("a NULL row's rowid: pc %d state %d", pc, cur.State)
+	}
+	next := []VInsn{{Op: VNullRow, A: 0}, {Op: VNext, A: 0, T: 0}, {Op: VExit}}
+	if pc := runVMCursor(t, next, regs, nil, &VCursor{Last: -1}, 0); pc != 1 {
+		t.Fatalf("a NULL row's next ran natively to %d", pc)
 	}
 }
 
@@ -420,7 +501,7 @@ func TestVMSegSel(t *testing.T) {
 // a predicted kind (T): plain columns of that kind take the shared checks and
 // the direct read, and a column with a NULL bitmap or exceptions, one of
 // another kind, a row list, a NULL and an exception all read as without a
-// prediction.
+// prediction: the NULL natively, the exception by an exit.
 func TestVMSegColumnPredicted(t *testing.T) {
 	if !Available || !VMSegCursor {
 		t.Skip("no segment cursors on this platform")
@@ -471,7 +552,7 @@ func TestVMSegColumnPredicted(t *testing.T) {
 		stop := 5
 		switch row {
 		case 2:
-			stop = 2 // the NULL exits at column 2
+			want[2] = tvalue{Typ: tvNull}
 		case 3:
 			stop = 3 // the exception exits at column 3
 		}

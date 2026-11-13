@@ -106,8 +106,8 @@ func (e *vmEmitWasm) rowColumn(pc int, in VInsn) {
 
 // segColumn is a VColumn marked segment-capable (Imm 1): column B of cursor
 // A's row Pos, from its segment's column blocks when the engine handed it one
-// (VCursor.Seg), else from its row list. A NULL, an exception and a kind this
-// build does not read exit.
+// (VCursor.Seg), else from its row list. An exception and a kind this build
+// does not read exit.
 func (e *vmEmitWasm) segColumn(pc int, in VInsn) {
 	w, L := e.w, e.lay
 	e.segLocals()
@@ -135,7 +135,9 @@ func (e *vmEmitWasm) segColumn(pc int, in VInsn) {
 	w.I32(int32(in.B * VSegColSize))
 	w.op(opI32Add)
 	w.Set(e.valp)
-	// A NULL: its bit in the bitmap.
+	// A NULL: its bit in the bitmap, kept in t3 for the read below.
+	w.I64(0)
+	w.Set(e.t3)
 	e.ptrAt(e.valp, VSegColOffNulls)
 	w.Set(e.sk1)
 	w.Get(e.sk1)
@@ -155,7 +157,8 @@ func (e *vmEmitWasm) segColumn(pc int, in VInsn) {
 	w.op(opI32ShrU)
 	w.I32(1)
 	w.op(opI32And)
-	e.exitIf(pc)
+	w.op(opI64ExtendI32U)
+	w.Set(e.t3)
 	w.op(opEnd)
 	// An exception: its bit in the 64-bit words.
 	e.ptrAt(e.valp, VSegColOffExc)
@@ -190,9 +193,18 @@ func (e *vmEmitWasm) segColumn(pc int, in VInsn) {
 		w.op(opI32And)
 		e.exitIf(pc)
 	}
+	// The column's kind, or -1 for a NULL cell, which is a NULL as
+	// vm_seg_amd64.go's segColumn reads it.
+	w.Get(e.t3)
+	w.op(opI64Eqz)
+	w.op(opIf, opVoid)
 	w.Get(e.valp)
 	w.LoadI64(VSegColOffKind)
 	w.Set(e.t3)
+	w.op(opElse)
+	w.I64(-1)
+	w.Set(e.t3)
+	w.op(opEnd)
 	cell := func() { // t2 = the 8-byte cell at row t1
 		e.ptrAt(e.valp, VSegColOffBlock)
 		w.Set(e.sk1)
@@ -233,6 +245,7 @@ func (e *vmEmitWasm) segColumn(pc int, in VInsn) {
 		w.op(opEnd)
 	}
 	w.op(opBlock, opVoid) // done
+	kind(-1, func() { writeNum(L.TypNull, 0, 0) })
 	kind(VSegInt, func() {
 		cell()
 		writeNum(L.TypInt, e.t2, 0)
@@ -728,9 +741,27 @@ func (e *vmEmitWasm) seekIdxServed(a int) {
 	w.op(opEnd)
 }
 
-// seekRewind is VSeekRewind.
+// nullRow is vm_seg_amd64.go's VNullRow.
+func (e *vmEmitWasm) nullRow(pc int, in VInsn) {
+	e.w.Get(e.wb)
+	e.exitIf(pc)
+	e.setCursorImm(in.A, VCursorOffSeg, nullSegAddr())
+	for _, f := range []struct {
+		off uint32
+		v   int64
+	}{{VCursorOffSel, 0}, {VCursorOffRids, 0}, {VCursorOffN, 1}, {VCursorOffPos, 0}, {VCursorOffLast, 0}, {VCursorOffOk, 1},
+		{VCursorOffDirty, 1}, {VCursorOffAdv, 0}, {VCursorOffRew, 0}, {VCursorOffMask, -1}, {VCursorOffState, 6}} {
+		e.setCursorImm(in.A, f.off, f.v)
+	}
+}
+
+// seekRewind is vm_seg_amd64.go's VSeekRewind.
 func (e *vmEmitWasm) seekRewind(pc int, in VInsn) {
 	w := e.w
+	e.cursorField(in.A, VCursorOffState)
+	w.I64(3)
+	w.op(opI64Eq)
+	e.jumpIf(in.T)
 	e.cursorField(in.A, VCursorOffState)
 	w.I64(2)
 	w.op(opI64Ne)

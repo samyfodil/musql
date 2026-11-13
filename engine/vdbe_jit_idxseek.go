@@ -29,6 +29,12 @@ type idxSeekSpec struct {
 	// equal (loopPinnedCols): rows sharing all of them, the only ones the
 	// loop keeps, run in rowid order when the order has no other column.
 	pinned []int
+	// sorted is the OpSortedSeek a seek stands for, when it does: its index is
+	// each segment's rows in the order of sortCols (segment.sortedOn), the
+	// order segSortedSeek puts a run in, and the VDBE takes the cursor back on
+	// native code's run (syncSortedSeek).
+	sorted   *sortedSeekHint
+	sortCols []int
 }
 
 // lowerIdxSeeks lowers each integer equality index seek -- an OpSeekIndexHint's
@@ -42,14 +48,17 @@ func lowerIdxSeeks(prog *Program, vp []jit.VInsn, segCap []bool) (specs []*idxSe
 	if segCap == nil {
 		return nil, nil, nil
 	}
-	type site struct{ pc, end, c, key, t int }
+	type site struct {
+		pc, end, c, key, t int
+		sorted             bool
+	}
 	var sites []site
 	specs = make([]*idxSeekSpec, len(segCap))
 	bad := make([]bool, len(segCap))
 	insns := prog.Insns
 	for _, in := range insns {
 		switch in.Op {
-		case OpRightJoinMark, OpRightJoinSweepRewind, OpRightJoinSweepNext, OpRightJoinSweepOrder, OpSortedSeek:
+		case OpRightJoinMark, OpRightJoinSweepRewind, OpRightJoinSweepNext, OpRightJoinSweepOrder:
 			if in.P1 >= 0 && in.P1 < len(bad) {
 				bad[in.P1] = true
 			}
@@ -60,6 +69,25 @@ func lowerIdxSeeks(prog *Program, vp []jit.VInsn, segCap []bool) (specs []*idxSe
 			bad[v.A] = true
 		}
 		in := &insns[pc]
+		if in.Op == OpSortedSeek {
+			spec, end, ok := sortedSeekSpec(insns, pc, segCap, prog.NReg)
+			if !ok {
+				if in.P1 >= 0 && in.P1 < len(bad) {
+					bad[in.P1] = true
+				}
+				continue
+			}
+			c := in.P1
+			if prev := specs[c]; prev != nil && (prev.sorted == nil || !prev.sorted.sameSort(spec.sorted) || prev.order != spec.order) {
+				bad[c] = true
+				continue
+			}
+			if specs[c] == nil {
+				specs[c] = spec
+			}
+			sites = append(sites, site{pc, end, c, in.P2, insns[end].P2, true})
+			continue
+		}
 		if in.Op != OpSeekIndexHint || in.P1 < 0 || in.P1 >= len(segCap) || !segCap[in.P1] || in.P2 < 0 || in.P2 >= prog.NReg {
 			continue
 		}
@@ -96,14 +124,15 @@ func lowerIdxSeeks(prog *Program, vp []jit.VInsn, segCap []bool) (specs []*idxSe
 		if o := spec.order; o != nil && (len(o.cols) == 0 || o.cols[0] != h.leadingCol || o.exprs != nil || o.multiOr != nil || o.rjSweep != nil) {
 			continue
 		}
-		if prev := specs[c]; prev != nil && (prev.col != spec.col || prev.order != spec.order || prev.listed != spec.listed || !slices.Equal(prev.pinned, spec.pinned)) {
+		if prev := specs[c]; prev != nil && (prev.sorted != nil || prev.col != spec.col || prev.order != spec.order || prev.listed != spec.listed ||
+			!slices.Equal(prev.pinned, spec.pinned)) {
 			bad[c] = true
 			continue
 		}
 		if specs[c] == nil {
 			specs[c] = spec
 		}
-		sites = append(sites, site{pc, j, c, in.P2, insns[j].P2})
+		sites = append(sites, site{pc, j, c, in.P2, insns[j].P2, false})
 	}
 	any := false
 	for _, s := range sites {
@@ -111,6 +140,18 @@ func lowerIdxSeeks(prog *Program, vp []jit.VInsn, segCap []bool) (specs []*idxSe
 			continue
 		}
 		any = true
+		if s.sorted {
+			// A miss falls through to what comes before the rewind, which
+			// takes the empty jump.
+			vp[s.pc] = jit.VInsn{Op: jit.VSeekIdx, A: s.c, B: s.key, T: s.pc + 1}
+			for q := s.pc + 1; q < s.end; q++ {
+				inner = append(inner, q)
+			}
+			inner = append(inner, s.end)
+			vp[s.end] = jit.VInsn{Op: jit.VSeekRewind, A: s.c, T: s.t}
+			pcs = append(pcs, s.pc)
+			continue
+		}
 		vp[s.pc] = jit.VInsn{Op: jit.VSeekIdx, A: s.c, B: s.key, T: s.t}
 		for q := s.pc + 1; q < s.end; q++ {
 			vp[q] = jit.VInsn{Op: jit.VGoto, T: q + 1}
@@ -133,7 +174,7 @@ func lowerIdxSeeks(prog *Program, vp []jit.VInsn, segCap []bool) (specs []*idxSe
 	// A cursor's opens, all of one table, and its closes: native code makes
 	// them too, so a seek in a subroutine opened per call stays native.
 	for c, spec := range specs {
-		if spec == nil {
+		if spec == nil || spec.sorted != nil {
 			continue
 		}
 		var opens, closes []int
@@ -166,6 +207,76 @@ func lowerIdxSeeks(prog *Program, vp []jit.VInsn, segCap []bool) (specs []*idxSe
 		}
 	}
 	return specs, pcs, inner
+}
+
+// sortedSeekSpec is the spec of the OpSortedSeek at pc when native code can
+// make it as a VSeekIdx, and the pc of its rewind: a seek on an INTEGER
+// column of a segment table, nothing between it and its rewind but a LEFT
+// JOIN's match flag, and the run in an order sortedOn gives -- the column's,
+// ties in rowid order, or the cursor's one automatic index key, run once
+// after its one open and before any seek, on clean ascending columns led by
+// the seek's.
+func sortedSeekSpec(insns []Instruction, pc int, segCap []bool, nReg int) (*idxSeekSpec, int, bool) {
+	in := &insns[pc]
+	c := in.P1
+	h, ok := in.P4.(*sortedSeekHint)
+	if !ok || in.P3 != 1 || c < 0 || c >= len(segCap) || !segCap[c] || in.P2 < 0 || in.P2 >= nReg || h.built || h.col < 0 ||
+		h.aff != affNone && h.aff != affNumeric && h.aff != affInteger {
+		return nil, 0, false
+	}
+	end := pc + 1
+	for end < len(insns) && (insns[end].Op == OpInteger || insns[end].Op == OpNull) {
+		end++
+	}
+	if end >= len(insns) || insns[end].Op != OpRewind || insns[end].P1 != c || insns[end].P4 != nil {
+		return nil, 0, false
+	}
+	open, aio := -1, -1
+	for q, x := range insns {
+		switch {
+		case x.P1 != c:
+		case isCursorOpen(x.Op):
+			if open >= 0 || x.Op != OpOpenRead {
+				return nil, 0, false
+			}
+			open = q
+		case x.Op == OpAutoIndexOrder:
+			if aio >= 0 {
+				return nil, 0, false
+			}
+			aio = q
+		}
+	}
+	tbl, _ := insns[max(open, 0)].P4.(*resolvedTable)
+	if open < 0 || open > pc || tbl == nil || h.col >= len(tbl.cols) || h.col == tbl.ipkIndex || tbl.cols[h.col].Aff == affReal {
+		return nil, 0, false
+	}
+	spec := &idxSeekSpec{col: h.col, seek: pc, aio: -1, open: -1, sorted: h, sortCols: []int{h.col}}
+	if aio >= 0 {
+		key, _ := insns[aio].P4.(*autoIndexKey)
+		if aio < open || aio > pc || key == nil || !segRunOrderable(tbl, key) || key.rjSweep != nil || key.cols[0] != h.col {
+			return nil, 0, false
+		}
+		var cols []int
+		for i, col := range key.cols {
+			if i < len(key.desc) && key.desc[i] {
+				return nil, 0, false
+			}
+			if col < 0 || col == tbl.ipkIndex {
+				// The rowid, last: a run keeps its rows in rowid order.
+				if i != len(key.cols)-1 {
+					return nil, 0, false
+				}
+				continue
+			}
+			if tbl.cols[col].Aff == affReal {
+				return nil, 0, false
+			}
+			cols = append(cols, col)
+		}
+		spec.order, spec.sortCols = key, cols
+	}
+	return spec, end, true
 }
 
 // openedTab is the table cursor c's OpOpenRead opens, as tabFor last worked
@@ -231,8 +342,12 @@ type vmIdx struct {
 	tab  *vmTab
 	segs []*segment
 	keep [][]int // the widened rows each vidx entry points into
-	vidx []jit.VIdx
-	none bool
+	// vals and starts are a sorted seek's own values and run starts, which
+	// no file holds (buildSortedVMIdx).
+	vals   [][]int64
+	starts [][]int32
+	vidx   []jit.VIdx
+	none   bool
 }
 
 // idxFor returns cursor c's table as VSeekIdx searches it, or nil.
@@ -255,6 +370,9 @@ func buildVMIdx(t *vmTab, spec *idxSeekSpec) *vmIdx {
 	x := &vmIdx{tab: t, none: true}
 	if t == nil || t.none || len(t.at) == 0 || len(t.at) != len(t.segs) {
 		return x
+	}
+	if spec.sorted != nil {
+		return buildSortedVMIdx(x, spec)
 	}
 	var prevRid uint64
 	for k, sg := range t.at {
@@ -279,6 +397,45 @@ func buildVMIdx(t *vmTab, spec *idxSeekSpec) *vmIdx {
 			Starts: unsafe.Pointer(unsafe.SliceData(d.starts)), Rows: unsafe.Pointer(unsafe.SliceData(rows)), Seg: t.segs[k].Seg,
 			Mask: t.segs[k].Mask, Lo: d.valueAt(0), Hi: d.valueAt(d.nVals - 1)})
 		x.segs, x.keep = append(x.segs, sg), append(x.keep, rows)
+	}
+	for k := range x.vidx {
+		x.vidx[k].Count = int64(len(x.vidx) - k)
+	}
+	x.none = false
+	return x
+}
+
+// buildSortedVMIdx is buildVMIdx for a sorted seek: each segment's rows in
+// the order of the spec's columns, ties in rowid order, as segSortedSeek
+// orders a run, every column a clean INTEGER block.
+func buildSortedVMIdx(x *vmIdx, spec *idxSeekSpec) *vmIdx {
+	t := x.tab
+	var prevRid uint64
+	for k, sg := range t.at {
+		if k > 0 && sg.Rowid(0) <= prevRid {
+			return x
+		}
+		prevRid = sg.Rowid(sg.nRows - 1)
+		blocks, perm, ok := sg.sortedOn(spec.sortCols)
+		if !ok || len(perm) == 0 {
+			return x
+		}
+		b := blocks[0]
+		rows := make([]int, len(perm))
+		var vals []int64
+		var starts []int32
+		for i, r := range perm {
+			rows[i] = int(r)
+			if i == 0 || b[r] != b[perm[i-1]] {
+				vals, starts = append(vals, b[r]), append(starts, int32(i))
+			}
+		}
+		starts = append(starts, int32(len(perm)))
+		x.vidx = append(x.vidx, jit.VIdx{Vals: unsafe.Pointer(unsafe.SliceData(vals)), NVals: int64(len(vals)),
+			Starts: unsafe.Pointer(unsafe.SliceData(starts)), Rows: unsafe.Pointer(unsafe.SliceData(rows)), Seg: t.segs[k].Seg,
+			Mask: t.segs[k].Mask, Lo: vals[0], Hi: vals[len(vals)-1]})
+		x.segs, x.keep = append(x.segs, sg), append(x.keep, rows)
+		x.vals, x.starts = append(x.vals, vals), append(x.starts, starts)
 	}
 	for k := range x.vidx {
 		x.vidx[k].Count = int64(len(x.vidx) - k)
@@ -378,6 +535,72 @@ func runsInKeyOrder(sg *segment, d *segDiskIndex, rows []int, key *autoIndexKey)
 		}
 	}
 	return true
+}
+
+// sortedSeekServed reports whether the VDBE would serve cursor cur's sorted
+// seeks from the segments (segSortedSeek), as native code serves them, and
+// makes it ready to: only then does native code seek it.
+func (jx *vmJIT) sortedSeekServed(m *vdbe, cur *vdbeCursor, spec *idxSeekSpec) bool {
+	if !cur.segSortable() {
+		return false
+	}
+	_, orderOp, ok := cur.segSortedReady(spec.sorted, m.encoding())
+	var key *autoIndexKey
+	if orderOp != nil {
+		key = orderOp.P4.(*autoIndexKey)
+	}
+	return ok && key == spec.order
+}
+
+// syncSortedSeek takes back a cursor native code seeked for an
+// OpSortedSeek: native code's run is put on the cursor as segSortedSeek
+// puts one, then the cursor rewound and walked to the row native code left
+// it on, or past the last.
+func (m *vdbe) syncSortedSeek(jx *vmJIT, c int, jc *jit.VCursor, spec *idxSeekSpec) error {
+	cur := m.cursors[c]
+	x := jx.idxs[c].Load()
+	if cur == nil || x == nil || x.none {
+		return fmt.Errorf("engine: internal: cursor %d seeked natively has no seek to take back", c)
+	}
+	_, orderOp, ok := cur.segSortedReady(spec.sorted, m.encoding())
+	if !ok {
+		return fmt.Errorf("engine: internal: cursor %d seeked natively is not one the segments serve", c)
+	}
+	src := &cur.pointSrc
+	segs, rows := src.listSegs[:0], src.listRows[:0]
+	if jc.State != 3 {
+		k := slices.IndexFunc(x.vidx, func(v jit.VIdx) bool { return v.Seg == jc.Seg })
+		if k < 0 || jc.Sel == nil || jc.N <= 0 {
+			return fmt.Errorf("engine: internal: cursor %d seeked natively is in no segment of its table", c)
+		}
+		for _, r := range unsafe.Slice((*int)(jc.Sel), jc.N) {
+			segs, rows = append(segs, x.segs[k]), append(rows, r)
+		}
+	}
+	cur.serveSegRun(orderOp, segs, rows)
+	if jc.State == 2 {
+		return nil // the rewind is still to come
+	}
+	cur.segFilter, cur.params = nil, m.params
+	if err := cur.rewind(); err != nil {
+		return err
+	}
+	if jc.State == 3 {
+		return nil
+	}
+	for range jc.Last + 1 {
+		if !cur.advance() {
+			if cur.streamErrPending != nil {
+				return cur.streamErrPending
+			}
+			return fmt.Errorf("engine: internal: cursor %d has fewer rows than native code seeked", c)
+		}
+	}
+	if jc.Pos >= jc.N {
+		for cur.advance() {
+		}
+	}
+	return cur.streamErrPending
 }
 
 // syncIdxSeek brings a cursor native code seeked (jit.VSeekIdx) up to date:
