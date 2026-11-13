@@ -242,6 +242,45 @@ func (b *segRows) walk(yield func(uint64, []Value) bool) {
 	b.walkWith(func(rid uint64, vals []Value) []Value { return fullStoredRow(b.tbl, rid, vals) }, yield)
 }
 
+// walkColumn is walk decoding column col alone, of a table with no generated
+// column, into one row it reuses: a committed file with no log over the table
+// is read a cell at a time, anything else through walkWithCols.
+func (b *segRows) walkColumn(col int, yield func(uint64, []Value) bool) {
+	widen := func(_ uint64, vals []Value) []Value { return widenStoredRow(b.tbl.cols, vals) }
+	src := b.rp.segs
+	if src == nil {
+		return
+	}
+	_, live, err := src.liveRows(b.root)
+	segs, ok := src.byRoot[b.root]
+	if _, _, clean := src.overlayFor(b.root); err != nil || live || !ok || !clean {
+		b.walkWithCols(columnMask(1)<<uint(col), widen, yield)
+		return
+	}
+	row := make([]Value, len(b.tbl.cols))
+	for i := range row {
+		row[i] = Value{Typ: valueUnread}
+	}
+	for _, s := range segs {
+		for i := 0; i < s.nRows; i++ {
+			vals := row
+			if w := min(s.Width(i), len(s.cols)); col < w {
+				row[col] = s.Value(col, i)
+			} else {
+				// A row from before an ADD COLUMN: the column's default.
+				short := make([]Value, w)
+				for c := range short {
+					short[c] = Value{Typ: valueUnread}
+				}
+				vals = widen(s.Rowid(i), short)
+			}
+			if !yield(s.Rowid(i), vals) {
+				return
+			}
+		}
+	}
+}
+
 // walkStored is walk handing out the stored values (widenStoredRow), no
 // generated column computed: what a rewrite of the file copies.
 func (b *segRows) walkStored(yield func(uint64, []Value) bool) {
