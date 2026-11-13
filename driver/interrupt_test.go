@@ -3,6 +3,7 @@ package driver_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,7 +11,8 @@ import (
 )
 
 // TestContextInterruptsStatement: a statement whose context ends stops at its
-// next loop with C's "interrupted", and the connection runs the next one.
+// next loop with C's "interrupted", which also says the context's own error,
+// and the connection runs the next one.
 func TestContextInterruptsStatement(t *testing.T) {
 	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "i.musq"))
 	if err != nil {
@@ -38,8 +40,8 @@ func TestContextInterruptsStatement(t *testing.T) {
 		start := time.Now()
 		_, err := db.QueryContext(ctx, q)
 		cancel()
-		if err == nil || !strings.Contains(err.Error(), "interrupted") {
-			t.Errorf("%s: %v, want interrupted", q, err)
+		if err == nil || !strings.Contains(err.Error(), "interrupted") || !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("%s: %v, want interrupted by the deadline", q, err)
 		}
 		if d := time.Since(start); d > 5*time.Second {
 			t.Errorf("%s: stopped after %v", q, d)
@@ -51,7 +53,7 @@ func TestContextInterruptsStatement(t *testing.T) {
 	}
 	ctx2, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
 	defer cancel()
-	if _, err := db.ExecContext(ctx2, `INSERT INTO t2 SELECT x.a, y.b FROM t x, t y`); err == nil || !strings.Contains(err.Error(), "interrupted") {
+	if _, err := db.ExecContext(ctx2, `INSERT INTO t2 SELECT x.a, y.b FROM t x, t y`); err == nil || !strings.Contains(err.Error(), "interrupted") || !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("insert: %v, want interrupted", err)
 	}
 	var n int
