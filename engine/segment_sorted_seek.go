@@ -39,6 +39,10 @@ type segSortedRows struct {
 	// distinct is how many values the column holds, counted the first time
 	// shortRuns asks; 0 until then.
 	distinct int
+	// seeks is how many seeks the VDBE made through it, which decides when
+	// native code's own index of the table is worth building
+	// (sortedSeekServed).
+	seeks int
 }
 
 // maxSegSortedRun bounds the rows a sorted seek keyed on further columns
@@ -89,6 +93,7 @@ func (cur *vdbeCursor) segSortedSeek(h *sortedSeekHint, probe Value, enc TextEnc
 	if !ok {
 		return false
 	}
+	s.seeks++
 	lo, hi := s.find(probe)
 	s.orderRun(lo, hi)
 	src := &cur.pointSrc

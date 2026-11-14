@@ -2392,7 +2392,7 @@ func (jx *vmJIT) handCursor(m *vdbe, pc, c int) {
 		// cursor while that still stands.
 		if t := jx.openedTab(m, c); t != nil {
 			jc.Tab = unsafe.Pointer(&t.tab)
-			if x := jx.idxFor(c, t, m.encoding()); x != nil {
+			if x := jx.idxFor(c, t, m.encoding(), nil); x != nil {
 				jc.Idx = unsafe.Pointer(&x.vidx[0])
 			}
 		}
@@ -2405,7 +2405,7 @@ func (jx *vmJIT) handCursor(m *vdbe, pc, c int) {
 	if t := jx.tabFor(c, cur); t != nil {
 		jc.Tab = unsafe.Pointer(&t.tab)
 		if spec := jx.idxSpecs; spec != nil && spec[c] != nil && (spec[c].sorted == nil || jx.sortedSeekServed(m, cur, spec[c])) {
-			if x := jx.idxFor(c, t, m.encoding()); x != nil {
+			if x := jx.idxFor(c, t, m.encoding(), cur.segSorted); x != nil {
 				jc.Idx = unsafe.Pointer(&x.vidx[0])
 			}
 		}
