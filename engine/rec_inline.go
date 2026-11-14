@@ -76,9 +76,9 @@ func recInlinable(arm *Program) bool {
 // pass knows: the whitelist recInline relocates, operand by operand.
 func recInlineOperands(in Instruction) bool {
 	switch in.Op {
-	case OpInit, OpGoto, OpHalt, OpOpenDerived, OpRewind, OpNext, OpClose, OpColumn,
-		OpInteger, OpInt64, OpReal, OpString8, OpNull, OpVariable, OpSCopy, OpCopy, OpNot,
-		OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpConcat,
+	case OpInit, OpGoto, OpHalt, OpOpenDerived, OpRewind, OpNext, OpIfEmpty, OpClose, OpColumn,
+		OpInteger, OpInt64, OpReal, OpString8, OpNull, OpVariable, OpSCopy, OpCopy, OpNot, OpBitNot, OpNegative,
+		OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpConcat, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight,
 		OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull,
 		OpFunction, OpResultRow, OpGosub, OpReturn:
 		return true
@@ -118,15 +118,15 @@ func recInline(prog *Program, at int, arm *Program) {
 			r.P1, r.P2, r.P4 = cur(in.P1), in.P2+slotOff, inlinedSource(in.P4.(*derivedSource))
 		case OpClose:
 			r.P1 = cur(in.P1)
-		case OpRewind, OpNext:
+		case OpRewind, OpNext, OpIfEmpty:
 			r.P1, r.P2 = cur(in.P1), jump(in.P2)
 		case OpColumn:
 			r.P1, r.P3 = cur(in.P1), reg(in.P3)
 		case OpInteger, OpInt64, OpReal, OpString8, OpNull, OpVariable:
 			r.P2 = reg(in.P2)
-		case OpSCopy, OpCopy, OpNot:
+		case OpSCopy, OpCopy, OpNot, OpBitNot, OpNegative:
 			r.P1, r.P2 = reg(in.P1), reg(in.P2)
-		case OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpConcat:
+		case OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpConcat, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight:
 			r.P1, r.P2, r.P3 = reg(in.P1), reg(in.P2), reg(in.P3)
 		case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
 			r.P1, r.P3 = reg(in.P1), reg(in.P3)

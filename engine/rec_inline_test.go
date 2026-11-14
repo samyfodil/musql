@@ -49,6 +49,12 @@ func TestRecInlineMatchesTheSubProgram(t *testing.T) {
 		    AND NOT EXISTS (SELECT 1 FROM d AS f, e WHERE f.z = substr(s, k - 1, 1) OR f.lp * e.w = k + d.lp))
 		SELECT count(*), max(s), min(s) FROM x`,
 		`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 20 AND EXISTS (SELECT 1 FROM link WHERE aa + bb > i)) SELECT group_concat(i) FROM c`,
+		// Bit operators, unary minus and NOT, and a join with a CTE, which
+		// tests the CTE for rows first (OpIfEmpty) -- issue #203's shape.
+		`WITH RECURSIVE n(m) AS (VALUES(1),(2),(4),(8),(16)), b(k, m, r) AS (SELECT 1, m, ~m FROM n UNION ALL SELECT k + 1, b.m | n.m, (b.r & ~n.m) FROM b, n WHERE n.m > b.m AND (b.m & n.m) = 0 AND (n.m << 1) >> 1 = n.m) SELECT k, count(*), sum(m), sum(r), sum(-m) FROM b GROUP BY k`,
+		`WITH RECURSIVE e(m) AS (SELECT 1 WHERE 0), b(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM b, e WHERE k < 5) SELECT count(*) FROM b`,
+		`WITH RECURSIVE n(m) AS (VALUES(1),(2)), e(m) AS (SELECT x FROM t1 WHERE x > 100), b(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM b CROSS JOIN n CROSS JOIN e WHERE k < 5 UNION ALL SELECT k + 2 FROM b CROSS JOIN n WHERE k < 9) SELECT group_concat(k) FROM b`,
+		`WITH RECURSIVE b(k, f) AS (SELECT 1, 0 UNION ALL SELECT k + 1, NOT f FROM b WHERE k < 9) SELECT group_concat(f) FROM b`,
 	}
 	ask := func(q string, inline bool) string {
 		recInlineOffForTest, segPeepholesOffForTest = !inline, !inline
