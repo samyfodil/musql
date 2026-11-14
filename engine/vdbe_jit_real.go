@@ -22,7 +22,12 @@ import (
 // storesReal, when not nil, says whether a table's segments store a column
 // as REALs (a PhysFloat64 or PhysNumeric block): an INTEGER-declared column
 // of prices is guessed REAL too.
-func vmRealLowering(prog *Program, storesReal func(root uint32, col int) bool) (out []jit.VInsn, ok []bool) {
+//
+// storesText says the same of TEXT: arithmetic on a column stored as TEXT
+// (numbers a VARCHAR column holds as text) converts it on every row, which
+// only the VDBE does, so the instruction -- and arithmetic on its result --
+// stays the VDBE's rather than enter native code that would exit at it.
+func vmRealLowering(prog *Program, storesReal, storesText func(root uint32, col int) bool) (out []jit.VInsn, ok []bool) {
 	if !jit.VMReal {
 		return nil, nil
 	}
@@ -30,6 +35,7 @@ func vmRealLowering(prog *Program, storesReal func(root uint32, col int) bool) (
 	out, ok = make([]jit.VInsn, n), make([]bool, n)
 	tables := map[int]*resolvedTable{}
 	real := map[int]bool{}
+	text := map[int]bool{}
 	in := func(r int) bool { return r >= 0 && r < prog.NReg }
 	for pc := range prog.Insns {
 		ins := &prog.Insns[pc]
@@ -39,6 +45,7 @@ func vmRealLowering(prog *Program, storesReal func(root uint32, col int) bool) (
 			} else {
 				delete(real, r)
 			}
+			delete(text, r)
 		}
 		switch ins.Op {
 		case OpOpenRead, OpOpenWrite:
@@ -54,18 +61,36 @@ func vmRealLowering(prog *Program, storesReal func(root uint32, col int) bool) (
 			t := tables[ins.P1]
 			set(ins.P3, t != nil && ins.P2 >= 0 && ins.P2 < len(t.cols) &&
 				(t.cols[ins.P2].Aff == affReal || storesReal != nil && storesReal(t.root, ins.P2)))
+			if t != nil && ins.P2 >= 0 && ins.P2 < len(t.cols) && !real[ins.P3] && storesText != nil && storesText(t.root, ins.P2) {
+				text[ins.P3] = true
+			}
 		case OpSCopy, OpCopy:
+			wasText := text[ins.P1]
 			set(ins.P2, real[ins.P1])
+			if wasText {
+				text[ins.P2] = true
+			}
 		case OpInteger, OpInt64, OpNull, OpString8, OpBlob, OpVariable, OpNot, OpRowid:
 			set(ins.P2, false)
 		case OpAdd, OpSubtract, OpMultiply, OpDivide:
 			isReal := real[ins.P1] || real[ins.P2]
+			if text[ins.P1] || text[ins.P2] {
+				// Its result is an INTEGER or a REAL by the text's spelling, a
+				// guess neither arm makes: what it feeds stays the VDBE's too.
+				out[pc], ok[pc] = jit.VInsn{Op: jit.VExit}, true
+				set(ins.P3, false)
+				text[ins.P3] = true
+				break
+			}
 			if isReal && in(ins.P1) && in(ins.P2) && in(ins.P3) {
 				op := map[OpCode]jit.VOp{OpAdd: jit.VFAdd, OpSubtract: jit.VFSub, OpMultiply: jit.VFMul, OpDivide: jit.VFDiv}[ins.Op]
 				out[pc], ok[pc] = jit.VInsn{Op: op, A: ins.P1, B: ins.P2, C: ins.P3}, true
 			}
 			set(ins.P3, isReal)
 		case OpRemainder, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight:
+			if text[ins.P1] || text[ins.P2] {
+				out[pc], ok[pc] = jit.VInsn{Op: jit.VExit}, true
+			}
 			set(ins.P3, false)
 		case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
 			if (real[ins.P1] || real[ins.P3]) && affinity(ins.P5&p5AffMask) != affText && in(ins.P1) && in(ins.P3) {

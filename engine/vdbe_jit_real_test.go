@@ -152,7 +152,7 @@ func vmRealDifferential(t *testing.T, seed int64, n int) (native, arms int) {
 			t.Fatalf("seed %d iter %d: JIT diverges\nprogram %v\nvdbe %v %v\njit  %v %v", seed, iter, insns, want, wantErr, got, gotErr)
 		}
 		native++
-		if _, ok := vmRealLowering(prog, nil); ok != nil {
+		if _, ok := vmRealLowering(prog, nil, nil); ok != nil {
 			for _, o := range ok {
 				if o {
 					arms++
@@ -250,7 +250,7 @@ func TestVMJITRealQueries(t *testing.T) {
 			out[i] = b.String()
 			if stmt, err := ParseSelect(q); err == nil {
 				if prog, err := compileSelectScan(p, stmt, nil); err == nil {
-					if _, ok := vmRealLowering(prog, nil); ok != nil {
+					if _, ok := vmRealLowering(prog, nil, nil); ok != nil {
 						for _, o := range ok {
 							if o {
 								arms++
@@ -290,11 +290,11 @@ func TestVMRealLoweringGuessesStoredReals(t *testing.T) {
 		{Op: OpMultiply, P1: 2, P2: 1, P3: 3},
 	}}
 	stored := func(root uint32, col int) bool { return root == 7 && col == 0 }
-	out, ok := vmRealLowering(prog, stored)
+	out, ok := vmRealLowering(prog, stored, nil)
 	if ok == nil || !ok[3] || out[3].Op != jit.VFMul {
 		t.Fatalf("a stored-REAL column's multiply lowered to %v, want VFMul", out[3])
 	}
-	if _, ok := vmRealLowering(prog, nil); ok != nil && ok[3] {
+	if _, ok := vmRealLowering(prog, nil, nil); ok != nil && ok[3] {
 		t.Fatalf("an INTEGER column's multiply took the REAL arm with no hint")
 	}
 }

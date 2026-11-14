@@ -308,7 +308,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	nParams := prog.jitParams()
 	outer := prog.jitOuterCols()
 	ipk := writeCursorIPK(prog)
-	realVP, realOK := vmRealLowering(prog, p.segStoresReal)
+	realVP, realOK := vmRealLowering(prog, p.segStoresReal, p.segStoresText)
 	textVP, textOK := vmTextLowering(prog, p.segStoresText)
 	reopen := reopenSources(prog)
 	var inSlots []int

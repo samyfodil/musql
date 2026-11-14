@@ -64,6 +64,16 @@ func (s *segment) vmSegFor(plans []segColPlan, need uint64) *vmSeg {
 	return v
 }
 
+// segAllNull is the NULL bitmap of a column NULL in every row of a segment,
+// as long as the longest segment (segmentRows).
+var segAllNull = func() *[segmentRows / 8]byte {
+	var b [segmentRows / 8]byte
+	for i := range b {
+		b[i] = 0xff
+	}
+	return &b
+}()
+
 // buildVMSeg is vmSegFor's view with no TEXT column checked.
 func (s *segment) buildVMSeg(plans []segColPlan) *vmSeg {
 	v := &vmSeg{cols: make([]jit.VSegCol, min(len(s.cols), len(plans), 64))}
@@ -85,6 +95,14 @@ func (s *segment) buildVMSeg(plans []segColPlan) *vmSeg {
 			if col.phys == PhysNull && !hasExc {
 				vc.Kind = jit.VSegRowid
 			}
+		case col.phys == PhysNull:
+			// A column NULL in every row: every bit of its bitmap set, which
+			// native code reads as NULL.
+			if !hasExc && s.nRows <= 8*len(segAllNull) {
+				vc.Kind, vc.Block, vc.Nulls = jit.VSegInt, unsafe.Pointer(&segAllNull[0]), unsafe.Pointer(&segAllNull[0])
+				v.mask |= 1 << uint(c)
+			}
+			continue
 		case col.bounds:
 			if col.phys == PhysText && len(s.heap) > 0 {
 				text = true

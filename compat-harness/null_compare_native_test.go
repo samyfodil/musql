@@ -8,12 +8,12 @@ import (
 // Comparisons of INTEGER columns holding NULLs in a loop native code runs
 // (issue #169): a NULL operand gives NULL in the stored form and jumps or
 // falls through in the jump form as C's comparison does, and IS / IS NOT
-// still compare NULLs equal.
+// still compare NULLs equal. A column NULL in every row reads as NULL.
 func TestNullCompareInNativeLoops(t *testing.T) {
 	pre := []string{
-		"CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT)",
+		"CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT, z)",
 		"WITH RECURSIVE g(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM g WHERE i < 2000) " +
-			"INSERT INTO t SELECT i, CASE WHEN i % 7 = 0 THEN NULL ELSE i % 19 END, CASE WHEN i % 5 = 0 THEN NULL ELSE i % 23 END FROM g",
+			"INSERT INTO t(id, a, b) SELECT i, CASE WHEN i % 7 = 0 THEN NULL ELSE i % 19 END, CASE WHEN i % 5 = 0 THEN NULL ELSE i % 23 END FROM g",
 	}
 	for i, q := range []string{
 		"SELECT count(*), sum(a < b), sum(a >= b), count(a < b), sum((a < b) IS NULL) FROM t",
@@ -24,6 +24,8 @@ func TestNullCompareInNativeLoops(t *testing.T) {
 		"SELECT count(*), sum(a IS b), sum(a IS NOT b) FROM t",
 		"SELECT id, a < b, a = b FROM t WHERE id % 97 = 0 ORDER BY id",
 		"SELECT count(*) FROM t x JOIN t y ON y.id = x.id + 1 WHERE x.a < y.b",
+		"SELECT count(*), count(z), sum(z IS NULL), sum(coalesce(z, a)) FROM t",
+		"SELECT x.id, y.z, x.z IS NULL FROM t x JOIN t y ON y.id = x.id + 1 WHERE x.id % 50 = 0 ORDER BY x.id",
 	} {
 		differ(t, fmt.Sprintf("q-%d", i), append(append([]string(nil), pre...), q))
 		differ(t, fmt.Sprintf("q-%d-vacuumed", i), append(append([]string(nil), pre...), "VACUUM", q))
