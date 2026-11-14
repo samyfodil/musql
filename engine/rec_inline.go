@@ -80,7 +80,7 @@ func recInlineOperands(in Instruction) bool {
 		OpInteger, OpInt64, OpReal, OpString8, OpNull, OpVariable, OpSCopy, OpCopy, OpNot, OpBitNot, OpNegative,
 		OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpConcat, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight,
 		OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull,
-		OpFunction, OpResultRow, OpGosub, OpReturn:
+		OpFunction, OpCast, OpResultRow, OpGosub, OpReturn:
 		return true
 	}
 	return false
@@ -141,7 +141,7 @@ func recInline(prog *Program, at int, arm *Program) {
 			r.P1, r.P3 = reg(in.P1), reg(in.P3)
 		case OpGosub:
 			r.P1, r.P2 = reg(in.P1), jump(in.P2)
-		case OpReturn:
+		case OpReturn, OpCast:
 			r.P1 = reg(in.P1)
 		}
 		out = append(out, r)
