@@ -266,17 +266,19 @@ func sortedSeekSpec(insns []Instruction, pc int, segCap []bool, nReg int) (*idxS
 			return nil, 0, false
 		}
 		for i, col := range key.cols {
+			desc := i < len(key.desc) && key.desc[i]
 			if col < 0 || col == tbl.ipkIndex {
-				// The rowid, last: a run keeps its rows in rowid order.
-				if i != len(key.cols)-1 {
+				// The rowid, last and ascending: a run keeps its rows in rowid
+				// order. (reverse_unordered_selects makes it descending.)
+				if i != len(key.cols)-1 || desc {
 					return nil, 0, false
 				}
 				continue
 			}
 			if col == h.col || sortedSeekPins(h, col, key.colls[i]) {
-				continue
+				continue // one value, whichever way it runs
 			}
-			if i < len(key.desc) && key.desc[i] || tbl.cols[col].Aff == affReal {
+			if desc || tbl.cols[col].Aff == affReal {
 				return nil, 0, false
 			}
 			spec.sortCols, spec.sortColls = append(spec.sortCols, col), append(spec.sortColls, key.colls[i])
