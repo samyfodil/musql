@@ -403,11 +403,11 @@ func applyCTEColNames(name string, colNames []string, cols []columnInfo, rows []
 //     passed through unchanged is shared here but copied per row by the
 //     consumer.
 //   - cteRecursionRowCap bounds time for narrow rows, where the byte cap is
-//     millions of rows away. 300,000 is the largest incrementing bound in the
-//     corpus (bigsort.test 1.0; then 100,000 in temptable2.test,
-//     vacuummem.test, fts5unicode3.test). An unbounded "WITH c(x) AS
-//     (VALUES(1) UNION ALL SELECT x+1 FROM c) INSERT INTO t SELECT x FROM c"
-//     declines in about 1.7s.
+//     millions of rows away. It was 300,000, the largest incrementing bound
+//     in the corpus (bigsort.test 1.0), until a WHERE-bounded recursion of
+//     694,852 rows that C answers declined (issue #202); at 3,000,000 a
+//     recursion nothing stops still declines in seconds, and narrow rows
+//     stay well inside the byte cap.
 //
 // Neither applies when a finite bound is in force (the CTE's own LIMIT or the
 // consumer's, outerRowCapPlus1): such a recursion stops after offset+limit
@@ -423,13 +423,12 @@ func applyCTEColNames(name string, colNames []string, cols []columnInfo, rows []
 // cteRecursionByteCap also bounding what its holder's result rows keep
 // (vdbe.holder): a sudoku solver yields 374,729 rows there and keeps one.
 const (
-	cteRecursionRowCap        = 300_000
+	cteRecursionRowCap        = 3_000_000
 	cteRecursionByteCap       = 512 << 20
 	cteRecursionStreamByteCap = 4 << 30
 	// cteRecursionStreamRowCap is the row cap for rows streamed into an
-	// INSERT: ten times the in-memory one, so a single statement can load
-	// millions of rows, and still low enough that a recursion nothing stops
-	// declines in seconds (about 17 at the rate the 300k cap was measured)
+	// INSERT, so a single statement can load millions of rows, and still low
+	// enough that a recursion nothing stops declines in seconds (about 17)
 	// rather than running until the content cap -- minutes, while every row's
 	// change record accumulated (the fts5 -short harness was OOM-killed at
 	// 30 GB with no row cap here).
