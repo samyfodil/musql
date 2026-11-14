@@ -238,6 +238,8 @@ type vdbe struct {
 	// first time a subquery opcode with slot i executes and reused thereafter.
 	// len == prog.NSubCache; nil for a program with no compiled subquery.
 	subCache []subCacheEntry
+	// subKeyBuf is the scratch a kept subquery's key is built in.
+	subKeyBuf []byte
 
 	// wctx is the write-mode state (the *DB write handle plus the per-statement
 	// mutation bookkeeping) for the WRITE opcodes (OpInsertRow/OpDeleteRow/...,
@@ -500,6 +502,13 @@ func (m *vdbe) stmtRoot() *vdbe {
 	}
 }
 
+// cteShared reports whether every reference to ds's CTE reads the one run of
+// its body the first made (runCTEOnce).
+func (ds *derivedSource) cteShared() bool {
+	b := ds.cte.binding
+	return b.sharedBody() || b.m10d == cteM10dNo && b.nUse >= 2 && ds.cte.placement == cteRefMaterialized
+}
+
 // runCTEOnce is runSubOnce for an ordinary CTE row source (resolveCTESource):
 // resolveCTERows is called directly, with m.params, at execution time. A
 // recursive CTE never reaches here; it opens a compiled queue program. A CTE
@@ -522,16 +531,9 @@ func (m *vdbe) runCTEOnce(slot int, ds *derivedSource, pager *ReadOnlyPager) ([]
 	// while "(SELECT r FROM t) = (SELECT r FROM t)" runs it twice. Only a body
 	// that is not deterministic can tell the two apart, so only that one is
 	// declined when the placement is unknown.
-	shared := b.sharedBody()
-	if b.m10d == cteM10dNo && b.nUse >= 2 {
-		switch ds.cte.placement {
-		case cteRefMaterialized:
-			shared = true
-		case cteRefUnknown:
-			if selectCallsNondeterministicFunc(b.core) {
-				return nil, fmt.Errorf("%w: CTE %s is AS NOT MATERIALIZED, not deterministic and referenced %d times from a FROM clause whose coding is not known", errVDBEUnsupported, ds.cte.name, b.nUse)
-			}
-		}
+	shared := ds.cteShared()
+	if b.m10d == cteM10dNo && b.nUse >= 2 && ds.cte.placement == cteRefUnknown && selectCallsNondeterministicFunc(b.core) {
+		return nil, fmt.Errorf("%w: CTE %s is AS NOT MATERIALIZED, not deterministic and referenced %d times from a FROM clause whose coding is not known", errVDBEUnsupported, ds.cte.name, b.nUse)
 	}
 	root := m.stmtRoot()
 	if shared {
@@ -1625,6 +1627,11 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 	pc := 0
 	if m.yield {
 		pc = m.resumePC
+		// Between two rows handed back, another statement may have changed
+		// what a kept subquery read.
+		for i := range m.subCache {
+			m.subCache[i].keep = nil
+		}
 	}
 	// The program's native code, when it has some (vdbe_jit.go). Dispatch
 	// then reads jx.marked, the same program with OpJIT at each pc that enters
@@ -3399,7 +3406,13 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpSubquery:
 			sub := op.P4.(*Program)
-			rows, serr := m.runSub(op.P5&p5Correlated != 0, op.P2, sub)
+			var rows [][]Value
+			var serr error
+			if op.P5&p5SubKeep != 0 {
+				rows, serr = m.keptSubquery(op.P2, sub)
+			} else {
+				rows, serr = m.runSub(op.P5&p5Correlated != 0, op.P2, sub)
+			}
 			if serr != nil {
 				return nil, serr
 			}

@@ -1540,6 +1540,7 @@ func markSubqueryCorrelated(c *compiler) {
 	for p := c; p != nil; p = p.outer {
 		p.correlated = true
 	}
+	c.poisonSubSinks()
 }
 
 // enclosingOffersRow reports whether any compile enclosing oc (inclusive) can
@@ -1634,6 +1635,7 @@ func (c *compiler) bindOuterAggRef(x ColumnExpr, regRow bool) bool {
 				for p := c; p != oc; p = p.outer {
 					p.correlated = true
 				}
+				c.poisonSubSinks()
 				return true
 			}
 		}
@@ -1650,6 +1652,7 @@ func (c *compiler) bindOuterAggRef(x ColumnExpr, regRow bool) bool {
 		for p := c; p != oc; p = p.outer {
 			p.correlated = true
 		}
+		c.poisonSubSinks()
 		return true
 	}
 	// Last resort: the live enclosing row (compiler.rowOuter), for a subquery
@@ -1660,6 +1663,7 @@ func (c *compiler) bindOuterAggRef(x ColumnExpr, regRow bool) bool {
 	// references in it are per-row constants (aggnested-3.10).
 	if row := c.outerRowCtx(); row != nil {
 		if _, ok, err := resolveRowCtxValue(row, x); err == nil && ok {
+			c.poisonSubSinks()
 			return true
 		}
 	}

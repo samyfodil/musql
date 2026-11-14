@@ -996,6 +996,9 @@ type subCacheEntry struct {
 	inSet *inHashSet
 	// inList is an IN list's set of a run's values (OpInList, in_list.go).
 	inList *inListSet
+	// keep is a correlated subquery's rows, kept by the enclosing values it
+	// reads (subquery_cache.go).
+	keep *subKeep
 }
 
 // derivedSource is OpOpenDerived's P4. Exactly one of these is set:
@@ -1204,6 +1207,7 @@ const (
 	p5LikeNot    uint16 = 0x01 // OpLike: negate the match (NOT LIKE).
 	p5GlobNot    uint16 = 0x01 // OpGlob: negate the match (NOT GLOB). Same bit as p5LikeNot -- disjoint opcodes, so no collision.
 	p5Correlated uint16 = 0x80 // OpSubquery/OpExists: the sub-Program is correlated -- re-run per evaluation against the enclosing frame instead of run-once + cache.
+	p5SubKeep    uint16 = 0x100 // OpSubquery, with p5Correlated: its rows are kept in sub-cache slot P2 by the enclosing values it reads (subquery_cache.go).
 )
 
 // Instruction is one VDBE instruction: an opcode plus SQLite's five operand
@@ -1357,6 +1361,11 @@ type Program struct {
 	// enclosing compile in hand (outerFramesOf, vdbe_codegen.go). See
 	// buildOuterEvalCtx (vdbe.go).
 	OuterFrames []outerFrameInfo
+
+	// outerReads, when not nil, are the enclosing values a correlated scalar
+	// subquery reads, and all it reads of them: its rows are kept by them
+	// (subquery_cache.go).
+	outerReads []outerRead
 
 	// CTEScopeSnapshot is the WITH scope stack (ReadOnlyPager.cteScopes) in
 	// force when this Program was compiled, nil when none. Set by

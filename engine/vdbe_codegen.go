@@ -24,6 +24,10 @@ import (
 type onceSlots struct{ base, count int }
 
 type compiler struct {
+	// subSink, while a scalar subquery of this compile compiles, collects the
+	// reads its code makes of this frame and those above it (outerReadSink).
+	subSink *outerReadSink
+
 	// rowOrderFree is set by compileScanAggregate around its loops when no part
 	// of the result can depend on the order the rows arrive in -- every
 	// aggregate a count, no bare column, nothing reading the anchor row -- so
@@ -1393,7 +1397,10 @@ func (c *compiler) compileScalarSubquery(x SubqueryExpr) (int, error) {
 	}
 	// C codes a scalar subquery with LIMIT 1 (sqlite3CodeSubselect), which a
 	// window select's nth_value check follows (nthValueReach).
+	sink, saved := &outerReadSink{}, c.subSink
+	c.subSink = sink
 	prog, err := c.liveSubSelect(nthValueReach(x.Stmt, 1))
+	c.subSink = saved
 	if err != nil {
 		return 0, err
 	}
@@ -1414,9 +1421,15 @@ func (c *compiler) compileScalarSubquery(x SubqueryExpr) (int, error) {
 		return 0, semanticf("engine: sub-select returns %d columns - expected 1", prog.NResultCol)
 	}
 	d := c.alloc()
-	if prog.Correlated {
+	switch {
+	case prog.Correlated && len(sink.reads) > 0 && !sink.opaque && c.liveDB == nil && subKeepable(prog):
+		// Its rows are kept by the enclosing values it reads
+		// (subquery_cache.go).
+		prog.outerReads = sink.reads
+		c.emit(Instruction{Op: OpSubquery, P1: d, P2: c.allocSub(), P4: prog, P5: p5Correlated | p5SubKeep})
+	case prog.Correlated:
 		c.emit(Instruction{Op: OpSubquery, P1: d, P4: prog, P5: p5Correlated})
-	} else {
+	default:
 		c.emit(Instruction{Op: OpSubquery, P1: d, P2: c.allocSub(), P4: prog})
 	}
 	return d, nil
@@ -1950,6 +1963,7 @@ func (c *compiler) resolveTriggerParam(x ColumnExpr) (int, bool, error) {
 		// full rule; semanticf because C rejects this at prepare time.
 		return 0, false, semanticf("engine: no such column: %s.%s", x.Qualifier, x.Name)
 	}
+	c.poisonSubSinks()
 	c.emit(Instruction{Op: OpParam, P1: which, P2: col, P3: dst})
 	return dst, true, nil
 }
@@ -2055,6 +2069,7 @@ func (c *compiler) emitReturningParam(rc *retRowCompileCtx, x ColumnExpr) (int, 
 		return 0, false, nil
 	}
 	dst := c.allocN(1)
+	c.poisonSubSinks()
 	c.emit(Instruction{Op: OpParam, P1: 3, P2: col, P3: dst})
 	return dst, true, nil
 }
@@ -2107,6 +2122,7 @@ func (c *compiler) emitExcludedParam(ec *exclCompileCtx, x ColumnExpr) (int, boo
 		return 0, false, semanticf("engine: no such column: %s.%s", x.Qualifier, x.Name)
 	}
 	dst := c.allocN(1)
+	c.poisonSubSinks()
 	c.emit(Instruction{Op: OpParam, P1: 2, P2: col, P3: dst})
 	return dst, true, nil
 }
@@ -2416,7 +2432,7 @@ func (c *compiler) compileColumn(x ColumnExpr) (int, error) {
 					p.correlated = true
 				}
 				d := c.alloc()
-				c.emit(Instruction{Op: OpOuterAggReg, P1: reg, P3: d, P5: uint16(level)})
+				c.emitOuterRead(Instruction{Op: OpOuterAggReg, P1: reg, P3: d, P5: uint16(level)})
 				return d, nil
 			}
 			// A RIGHT/FULL JOIN's USING/NATURAL column: aggDrainRow.
@@ -2433,7 +2449,7 @@ func (c *compiler) compileColumn(x ColumnExpr) (int, error) {
 				local := make([]int, len(regs))
 				for i, r := range regs {
 					local[i] = c.alloc()
-					c.emit(Instruction{Op: OpOuterAggReg, P1: r, P3: local[i], P5: uint16(level)})
+					c.emitOuterRead(Instruction{Op: OpOuterAggReg, P1: r, P3: local[i], P5: uint16(level)})
 				}
 				d := c.alloc()
 				c.emit(Instruction{Op: OpSCopy, P1: local[0], P2: d})
@@ -2463,7 +2479,7 @@ func (c *compiler) compileColumn(x ColumnExpr) (int, error) {
 					p.correlated = true
 				}
 				d := c.alloc()
-				c.emit(Instruction{Op: OpOuterAggReg, P1: reg, P3: d, P5: uint16(level)})
+				c.emitOuterRead(Instruction{Op: OpOuterAggReg, P1: reg, P3: d, P5: uint16(level)})
 				if regHoldsVirtual(oc.regScopes, reg) {
 					c.emit(Instruction{Op: OpGenErrCheck, P1: d})
 				}
@@ -2488,7 +2504,7 @@ func (c *compiler) compileColumn(x ColumnExpr) (int, error) {
 				p.correlated = true
 			}
 			d := c.alloc()
-			c.emit(Instruction{Op: OpOuterAggReg, P1: reg, P3: d, P5: uint16(level)})
+			c.emitOuterRead(Instruction{Op: OpOuterAggReg, P1: reg, P3: d, P5: uint16(level)})
 			return d, nil
 		}
 		cursor, colIdx, isRowid, found, fb, hard = resolveInScopes(oc.scopes, x, oc.pager)
@@ -2560,6 +2576,7 @@ func (c *compiler) compileColumn(x ColumnExpr) (int, error) {
 			for p := c; p != nil && p.rowOuter == nil; p = p.outer {
 				p.correlated = true
 			}
+			c.poisonSubSinks()
 			return c.compileLiteral(v), nil
 		}
 	}
@@ -2602,9 +2619,9 @@ func (c *compiler) emitColumnRead(cursor, colIdx int, isRowid bool, level int) i
 	case level == 0:
 		c.emit(Instruction{Op: OpColumn, P1: cursor, P2: colIdx, P3: r})
 	case isRowid:
-		c.emit(Instruction{Op: OpOuterRowid, P1: cursor, P2: r, P5: uint16(level)})
+		c.emitOuterRead(Instruction{Op: OpOuterRowid, P1: cursor, P2: r, P5: uint16(level)})
 	default:
-		c.emit(Instruction{Op: OpOuterColumn, P1: cursor, P2: colIdx, P3: r, P5: uint16(level)})
+		c.emitOuterRead(Instruction{Op: OpOuterColumn, P1: cursor, P2: colIdx, P3: r, P5: uint16(level)})
 	}
 	// A rowid is an integer and has nowhere to put a subtype; only a COLUMN
 	// needs the record round-trip's loss reproduced. See compiler.stripRowSubtype.
@@ -4383,6 +4400,9 @@ func (c *compiler) compileFunc(x FuncExpr) (int, error) {
 		if err := checkLikelihoodLiteralArg(x.Args[1]); err != nil {
 			return 0, semanticf("%v", err)
 		}
+	}
+	if nonConstantFuncs[r33sFoldIdent(x.Name)] {
+		c.poisonSubSinks()
 	}
 	base := c.allocN(len(x.Args))
 	for i, a := range x.Args {

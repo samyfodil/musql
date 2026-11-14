@@ -115,7 +115,7 @@ func (c *compiler) aggResultReg(which, idx int, owner *aggPlan) (int, error) {
 		}
 		markAggCorrelated(c, oc)
 		d := c.alloc()
-		c.emit(Instruction{Op: OpOuterAggReg, P1: regs[idx], P3: d, P5: uint16(level)})
+		c.emitOuterRead(Instruction{Op: OpOuterAggReg, P1: regs[idx], P3: d, P5: uint16(level)})
 		return d, nil
 	}
 	return 0, fmt.Errorf("%w: aggregate-result placeholder outside an aggregate result compile", errVDBEUnsupported)
@@ -163,7 +163,7 @@ func (c *compiler) aggResultRegOrBuffer(which, idx int, ph Expr, owner *aggPlan)
 			// as aggResultReg's own marking above.
 			markAggCorrelated(c, oc)
 			d := c.alloc()
-			c.emit(Instruction{Op: OpOuterAggReg, P1: r, P3: d, P5: uint16(level)})
+			c.emitOuterRead(Instruction{Op: OpOuterAggReg, P1: r, P3: d, P5: uint16(level)})
 			return d, nil
 		}
 		level++
