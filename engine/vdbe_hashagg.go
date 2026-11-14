@@ -7,9 +7,7 @@
 package engine
 
 import (
-	"cmp"
 	"math"
-	"slices"
 	"sort"
 	"unsafe"
 )
@@ -371,56 +369,98 @@ func (m *vdbe) hashAggSort(desc []bool, made bool) bool {
 	return len(h.sorted) > 0
 }
 
-// hashAggSortInts sorts buckets whose keys are up to four values, each an
-// INTEGER or a NULL, as keyTupleLessDesc orders them, from a flat copy of
-// the keys; it reports false, with buckets untouched, for any other key.
+// hashAggSortInts sorts buckets whose keys are all INTEGERs or NULLs as
+// keyTupleLessDesc orders them, by stable radix passes over a columnar copy
+// of the keys, the last column first, each followed by a stable partition
+// that puts its NULLs first, or last where the column is descending; it
+// reports false, with buckets untouched, for any other key.
 func hashAggSortInts(buckets []*hashAggBucket, desc []bool) bool {
-	type flatKey struct {
-		k     [4]int64
-		nulls uint8
-		b     *hashAggBucket
-	}
-	if len(buckets) == 0 || len(buckets[0].key) > 4 {
+	n := len(buckets)
+	if n == 0 {
 		return false
 	}
-	flat := make([]flatKey, len(buckets))
+	nk := len(buckets[0].key)
+	vals := make([]int64, n*nk)
+	var nulls []bool
 	for i, b := range buckets {
-		if len(b.key) > 4 {
+		if len(b.key) != nk {
 			return false
 		}
-		f := &flat[i]
-		f.b = b
 		for k, v := range b.key {
 			switch v.Typ {
 			case Int:
-				f.k[k] = v.I
+				vals[k*n+i] = v.I
 			case Null:
-				f.nulls |= 1 << k
+				if nulls == nil {
+					nulls = make([]bool, n*nk)
+				}
+				nulls[k*n+i] = true
 			default:
 				return false
 			}
 		}
 	}
-	nk := len(buckets[0].key)
-	slices.SortFunc(flat, func(a, b flatKey) int {
-		for k := range nk {
-			na, nb := a.nulls>>k&1, b.nulls>>k&1
-			c := cmp.Compare(nb, na)
-			if c == 0 && na == 0 {
-				c = cmp.Compare(a.k[k], b.k[k])
-			}
-			if c != 0 {
-				if k < len(desc) && desc[k] {
-					return -c
-				}
-				return c
-			}
-		}
-		return 0
-	})
-	for i := range flat {
-		buckets[i] = flat[i].b
+	order := make([]int32, n)
+	for i := range order {
+		order[i] = int32(i)
 	}
+	keys, tk, to := make([]uint64, n), make([]uint64, n), make([]int32, n)
+	for k := nk - 1; k >= 0; k-- {
+		flip := uint64(1) << 63
+		down := k < len(desc) && desc[k]
+		if down {
+			flip = ^uint64(0) >> 1
+		}
+		col := vals[k*n : (k+1)*n]
+		and, or := ^uint64(0), uint64(0)
+		for i, j := range order {
+			u := uint64(col[j]) ^ flip
+			keys[i] = u
+			and &= u
+			or |= u
+		}
+		for shift := uint(0); shift < 64; shift += 8 {
+			if (and^or)>>shift&0xff == 0 {
+				continue
+			}
+			var at [256]int
+			for _, u := range keys {
+				at[u>>shift&0xff]++
+			}
+			sum := 0
+			for d, c := range at {
+				at[d] = sum
+				sum += c
+			}
+			for i, u := range keys {
+				d := u >> shift & 0xff
+				tk[at[d]], to[at[d]] = u, order[i]
+				at[d]++
+			}
+			keys, tk = tk, keys
+			order, to = to, order
+		}
+		if nulls != nil {
+			isNull := nulls[k*n : (k+1)*n]
+			out := to[:0]
+			for _, j := range order {
+				if isNull[j] != down {
+					out = append(out, j)
+				}
+			}
+			for _, j := range order {
+				if isNull[j] == down {
+					out = append(out, j)
+				}
+			}
+			order, to = out, order
+		}
+	}
+	sorted := make([]*hashAggBucket, n)
+	for i, j := range order {
+		sorted[i] = buckets[j]
+	}
+	copy(buckets, sorted)
 	return true
 }
 
