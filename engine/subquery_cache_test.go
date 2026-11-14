@@ -47,15 +47,32 @@ func TestCorrelatedSubqueryKeepsRows(t *testing.T) {
 			t.Errorf("%s:\n kept %.400s\n run  %.400s", q.kept, g, w)
 		}
 	}
-	// An aggregate query binding the enclosing row in its expressions
-	// (bindAggOuterRefs) is not kept: such a binding may resolve at run time.
-	subKeepHits.Store(0)
-	got := p.mustPlain(`SELECT a.id, (SELECT sum(b.x * a.v) FROM b WHERE b.k = a.k) FROM a`)
-	if n := subKeepHits.Load(); n != 0 {
-		t.Errorf("an aggregate reading the enclosing row: %d runs kept", n)
+	// Not kept: an aggregate query binding the enclosing row in its
+	// expressions (bindAggOuterRefs), which may resolve at run time; a
+	// virtual table, whose arguments are coded as it opens; and a window,
+	// whose projection compiles off the chain.
+	for _, q := range []struct{ q, plain string }{
+		{`SELECT a.id, (SELECT sum(b.x * a.v) FROM b WHERE b.k = a.k) FROM a`,
+			`SELECT a.id, (SELECT sum(b.x * a.v) FROM b WHERE b.k = a.k AND random() IS NOT NULL) FROM a`},
+		{`SELECT a.id, (SELECT value FROM json_each((SELECT json_array(a.v) WHERE a.k IS NOT NULL)) WHERE a.k = 1) FROM a`,
+			`SELECT a.id, (SELECT value FROM json_each((SELECT json_array(a.v) WHERE a.k IS NOT NULL)) WHERE a.k = 1 AND random() IS NOT NULL) FROM a`},
+		{`SELECT a.id, (SELECT a.v + sum(x) OVER () FROM b WHERE b.k = a.k) FROM a`,
+			`SELECT a.id, (SELECT a.v + sum(x) OVER () FROM b WHERE b.k = a.k AND random() IS NOT NULL) FROM a`},
+	} {
+		subKeepHits.Store(0)
+		got := p.mustPlain(q.q)
+		if n := subKeepHits.Load(); n != 0 {
+			t.Errorf("%s: %d runs kept", q.q, n)
+		}
+		want := p.mustPlain(q.plain)
+		if g, w := fmt.Sprint(typedRows(got)), fmt.Sprint(typedRows(want)); g != w {
+			t.Errorf("%s:\n kept %.400s\n run  %.400s", q.q, g, w)
+		}
 	}
-	want := p.mustPlain(`SELECT a.id, (SELECT sum(b.x * a.v) FROM b WHERE b.k = a.k AND random() IS NOT NULL) FROM a`)
-	if g, w := fmt.Sprint(typedRows(got)), fmt.Sprint(typedRows(want)); g != w {
-		t.Errorf("an aggregate reading the enclosing row:\n kept %.400s\n run  %.400s", g, w)
+	// A function that is not constant in a window's projection runs for
+	// every enclosing row.
+	q := `SELECT count(DISTINCT (SELECT random() + sum(x) OVER () FROM b WHERE b.k = a.k LIMIT 1)) > 100 FROM a`
+	if got := fmt.Sprint(typedRows(p.mustPlain(q))); got != "[1:1|]" {
+		t.Errorf("%s: %s", q, got)
 	}
 }

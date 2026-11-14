@@ -1422,7 +1422,7 @@ func (c *compiler) compileScalarSubquery(x SubqueryExpr) (int, error) {
 	}
 	d := c.alloc()
 	switch {
-	case prog.Correlated && len(sink.reads) > 0 && !sink.opaque && c.liveDB == nil && prog.Compound == nil && prog.LiveSource == nil:
+	case prog.Correlated && len(sink.reads) > 0 && !sink.opaque && c.liveDB == nil && subKeepable(prog, map[*Program]bool{}):
 		// Its rows are kept by the enclosing values it reads
 		// (subquery_cache.go).
 		prog.outerReads = sink.reads

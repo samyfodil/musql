@@ -69,6 +69,70 @@ func (c *compiler) poisonSubSinks() {
 	}
 }
 
+// subKeepable reports whether nothing prog runs, nor any program it runs in
+// turn, reaches an enclosing row except through its outer-read opcodes, or
+// calls a function that is not constant. Code compiled off the compile chain
+// records nothing in a sink: a virtual table's arguments, coded as it opens,
+// and a window's projection; and the MATCH and fts auxiliary opcodes read the
+// enclosing row through m.outer.
+func subKeepable(prog *Program, seen map[*Program]bool) bool {
+	if prog == nil || seen[prog] {
+		return true
+	}
+	if prog.Compound != nil || prog.LiveSource != nil {
+		return false
+	}
+	seen[prog] = true
+	item := func(it *itemPlan) bool {
+		return it == nil || it.prog == nil || subKeepable(it.prog.prog, seen)
+	}
+	for _, in := range prog.Insns {
+		switch in.Op {
+		case OpMatch, OpFts3Aux, OpFts5Aux, OpWindowAppend, OpWindowFinal, OpGroupBatchAppend, OpGroupBatchFinal:
+			return false
+		}
+		switch p4 := in.P4.(type) {
+		case *Program:
+			if !subKeepable(p4, seen) {
+				return false
+			}
+		case *inSubPlan:
+			if !subKeepable(p4.prog, seen) {
+				return false
+			}
+		case *rowSubPlan:
+			if !subKeepable(p4.prog, seen) {
+				return false
+			}
+		case *derivedSource:
+			if p4.vtab != nil || !subKeepable(p4.prog, seen) {
+				return false
+			}
+		case *aggPlan:
+			if !item(p4.havingPlan) {
+				return false
+			}
+			for _, it := range p4.outPlans {
+				if !item(it) {
+					return false
+				}
+			}
+			for _, op := range p4.orderPlans {
+				if !item(op.item) {
+					return false
+				}
+			}
+		case *ScalarFunction:
+			return false
+		case string:
+			if in.Op == OpFunction && nonConstantFuncs[r33sFoldIdent(p4)] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // maxSubKeep bounds the distinct keys one subquery keeps rows for; past it,
 // rows are kept no longer, nor where the keys seldom repeat.
 const maxSubKeep = 1 << 16
