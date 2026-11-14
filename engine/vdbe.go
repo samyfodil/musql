@@ -145,7 +145,7 @@ type vdbe struct {
 	anchorPad []Value
 	// anchorRowBuf is an anchor kept as its read columns, placed back at them
 	// (aggAccumulators.anchorRow).
-	anchorRowBuf []Value
+	anchorRowBuf anchorRowBuf
 	// aggValsBuf is aggResult's finalized aggregate values, reused per call.
 	aggValsBuf []Value
 	// aggNullRow is the row a rowFree step (aggPlan.rowFree) hands on in place
@@ -2284,8 +2284,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpSortedSeek:
 			cur := m.cursors[op.P1]
-			if cur != nil && cur.rowStore == nil && !cur.streamable && !cur.seekReseek && !cur.refillEach && cur.sub == nil && cur.vt == nil &&
-				(!cursorHasNoBtree(cur) || cur.fill != nil) && cur.segSortedSeek(op.P4.(*sortedSeekHint), m.regs[op.P2], m.encoding()) {
+			if cur != nil && cur.segSortable() && cur.segSortedSeek(op.P4.(*sortedSeekHint), m.regs[op.P2], m.encoding()) {
 				break
 			}
 			if cur != nil {

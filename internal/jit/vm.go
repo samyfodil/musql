@@ -186,7 +186,8 @@ const (
 	// that is no INTEGER, a cursor with no Tab, and the write barrier on exit.
 	VSeekRowid
 	// VSeekRewind: the OP_Rewind after a VSeekRowid, which has done its work:
-	// go on (State 2 becomes 4). Reached any other way, it exits.
+	// go on (State 2 becomes 4). After a seek that found none and fell through
+	// to it (State 3), the rewind's jump to T. Reached any other way, it exits.
 	VSeekRewind
 	// VSeekIdx: put cursor A in segment mode on the rows of its table whose
 	// indexed column (VCursor.Idx) holds the INTEGER in r[B], in the index's
@@ -220,7 +221,31 @@ const (
 	// IN). An empty set answers without reading r[A]. A set not Ready, any
 	// other r[A], and a miss in a set holding a NULL exit. (VMTextOrder)
 	VInSub
+	// VNullRow: the OP_NullRow of a cursor VSeekIdx seeks, which its next
+	// seek moves on: cursor A on NullSeg's one row (State 6), every column
+	// below 64 reading NULL; VRowid, VNext and VRewind exit. The cursor's
+	// segment pointer is stored, so the write barrier exits.
+	VNullRow
 )
+
+// NullSeg is the one row VNullRow puts a cursor on: every column below 64
+// NULL, and no rowid.
+var NullSeg VSeg
+
+var (
+	nullCell uint64
+	nullBits = [1]byte{0xff}
+	nullCols [64]VSegCol
+)
+
+func nullSegAddr() int64 { return int64(uintptr(unsafe.Pointer(&NullSeg))) }
+
+func init() {
+	for i := range nullCols {
+		nullCols[i] = VSegCol{Kind: VSegInt, Block: unsafe.Pointer(&nullCell), Nulls: unsafe.Pointer(&nullBits[0])}
+	}
+	NullSeg.Cols = unsafe.Pointer(&nullCols[0])
+}
 
 // VInSubSet is an uncorrelated IN subquery's rows as VInSub probes them, which
 // the engine publishes at every entry: Keys the INTEGERs ascending, N of
@@ -434,7 +459,7 @@ type VSeg struct {
 type VSegCol struct {
 	Kind  int64
 	Block unsafe.Pointer // the cells: 8 bytes a row, or for VSegText nRows+1 uint32 heap bounds
-	Nulls unsafe.Pointer // the NULL bitmap (bit i%8 of byte i/8), or nil: a NULL exits
+	Nulls unsafe.Pointer // the NULL bitmap (bit i%8 of byte i/8), or nil
 	Exc   unsafe.Pointer // the exceptions' bitmap (bit i%64 of uint64 i/64), or nil: one exits
 	Heap  unsafe.Pointer // VSegText's bytes
 	// Plain is Kind for a column with no NULL bitmap and no exceptions, else

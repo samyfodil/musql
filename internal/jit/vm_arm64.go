@@ -902,6 +902,8 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		e.inText(pc, in)
 	case VSeekRewind:
 		e.seekRewind(pc, in)
+	case VNullRow:
+		e.nullRow(pc, in)
 	case VText:
 		e.text(pc, in)
 	case VLike:

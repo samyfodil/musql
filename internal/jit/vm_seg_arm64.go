@@ -35,6 +35,7 @@ func (e *vmEmitArm) segColumn(pc int, in VInsn) {
 	e.destNoS(pc, in.C)
 	e.zeroS.del(in.C) // every word of the destination is written below
 	seg, nonull, noexc, done, rows := e.vmLabel("sg"), e.vmLabel("sn"), e.vmLabel("sx"), e.vmLabel("sd"), e.vmLabel("sw")
+	null := e.vmLabel("su")
 	var at [VSegText + 1]string
 	for _, k := range vmSegKinds {
 		at[k] = e.vmLabel("sk")
@@ -148,7 +149,7 @@ func (e *vmEmitArm) segColumn(pc int, in VInsn) {
 	a.AndImmLow(X10, X5, 3)
 	a.Asrv(X8, X8, X10)
 	a.AndImmLow(X8, X8, 1)
-	a.Cbnz(X8, e.stub(pc)) // a NULL: the VDBE's
+	a.Cbnz(X8, null)
 	a.Label(nonull)
 	a.LdrImm(X4, X7, VSegColOffExc)
 	a.Cbz(X4, noexc)
@@ -183,6 +184,10 @@ func (e *vmEmitArm) segColumn(pc int, in VInsn) {
 	a.Label(at[VSegInt])
 	cell()
 	writeNum(L.TypInt, X4, xzr)
+
+	// A NULL cell is a NULL, as vm_seg_amd64.go's segColumn reads it.
+	a.Label(null)
+	writeNum(L.TypNull, xzr, xzr)
 
 	a.Label(at[VSegFloat])
 	cell()
@@ -493,16 +498,39 @@ func (e *vmEmitArm) seekIdxServed(served, skip string) {
 	a.Label(skip)
 }
 
-// seekRewind is VSeekRewind.
+// seekRewind is vm_seg_amd64.go's VSeekRewind.
 func (e *vmEmitArm) seekRewind(pc int, in VInsn) {
 	a := e.a
 	e.unmap(^in.A)
 	e.curBase(in.A)
+	found := e.vmLabel("rf")
 	a.LdrImm(X10, X9, VCursorOffState)
 	a.CmpImm(X10, 2)
+	a.Bcond(CondE, found)
+	a.CmpImm(X10, 3)
 	a.Bcond(CondNE, e.stub(pc))
+	e.jmpBlock(pc, in.T)
+	a.Label(found)
 	a.MovImm16(X10, 4)
 	a.StrImm(X10, X9, VCursorOffState)
+}
+
+// nullRow is vm_seg_amd64.go's VNullRow.
+func (e *vmEmitArm) nullRow(pc int, in VInsn) {
+	a := e.a
+	e.unmap(^in.A)
+	e.branchWB(pc)
+	e.curBase(in.A)
+	a.MovImm64(X10, nullSegAddr())
+	a.StrImm(X10, X9, VCursorOffSeg)
+	for _, f := range []struct {
+		off int
+		v   int64
+	}{{VCursorOffSel, 0}, {VCursorOffRids, 0}, {VCursorOffN, 1}, {VCursorOffPos, 0}, {VCursorOffLast, 0}, {VCursorOffOk, 1},
+		{VCursorOffDirty, 1}, {VCursorOffAdv, 0}, {VCursorOffRew, 0}, {VCursorOffMask, -1}, {VCursorOffState, 6}} {
+		a.MovImm64(X10, f.v)
+		a.StrImm(X10, X9, f.off)
+	}
 }
 
 // text is VText: a pointer store, so the write barrier exits.

@@ -944,6 +944,8 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		e.inSub(pc, in)
 	case VSeekRewind:
 		e.seekRewind(pc, in)
+	case VNullRow:
+		e.nullRow(pc, in)
 	case VInSet:
 		e.inSet(pc, in)
 	case VSubstr:

@@ -32,8 +32,8 @@ func (a *Asm) MovRegMemD32(dst, base Reg, disp int32) {
 // register across columns: the two kinds of cursor share this code. RAX, RCX,
 // RDX, R9, R10, X0 and X1 are scratch.
 //
-// A segment cell reads exactly as segColumnValue reads it, or exits: a NULL
-// or an exception exits, and so does a kind the engine left out of the Mask.
+// A segment cell reads exactly as segColumnValue reads it, or exits: an
+// exception exits, and so does a kind the engine left out of the Mask.
 //
 // With a predicted kind (T) a run's reads of one cursor share their checks:
 // the first checks the cursor, every column the run reads of it (the Mask)
@@ -235,7 +235,7 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 	a.MovRegReg(RCX, RDX)
 	a.AndRegImm32(RCX, 7)
 	a.BtRegReg(RAX, RCX)
-	e.jccStub(condCarry, pc) // a NULL: the VDBE's
+	a.JccL(condCarry, l("null"))
 	a.Bind(l("nonull"))
 	a.MovRegMemD(RAX, R10, VSegColOffExc)
 	a.TestRegReg(RAX, RAX)
@@ -284,6 +284,12 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 	a.Bind(l("int"))
 	cell()
 	writeNum(L.TypInt, RAX, none)
+
+	// A NULL cell is a NULL: a column is in the cursor's view only where every
+	// row is as wide as the table, so none reads a default, and the rowid
+	// alias's stored NULL has no bitmap.
+	a.Bind(l("null"))
+	writeNum(L.TypNull, none, none)
 
 	a.Bind(l("float"))
 	cell()
@@ -606,15 +612,37 @@ func (e *vmEmit) seekIdxServed(cur, tmp Reg, served, skip Lbl) {
 	a.Bind(skip)
 }
 
-// seekRewind is VSeekRewind.
+// seekRewind is VSeekRewind: a seek that found none and fell through to it
+// (State 3) takes the rewind's jump to T.
 func (e *vmEmit) seekRewind(pc int, in VInsn) {
 	a := e.a
 	cb := int32(in.A * VCursorSize)
 	e.unmapCursor(in.A)
+	found := e.vmLabel()
 	a.MovRegMemD(RAX, RDI, POffCur)
 	a.CmpMemDImm8(RAX, cb+VCursorOffState, 2)
+	a.JccL(CondE, found)
+	a.CmpMemDImm8(RAX, cb+VCursorOffState, 3)
 	e.jccStub(CondNE, pc)
+	e.jmpBlock(pc, in.T)
+	a.Bind(found)
 	a.MovMemDImm(RAX, cb+VCursorOffState, 4)
+}
+
+// nullRow is VNullRow.
+func (e *vmEmit) nullRow(pc int, in VInsn) {
+	a := e.a
+	cb := int32(in.A * VCursorSize)
+	e.unmapCursor(in.A)
+	e.jccWB(pc)
+	a.MovRegMemD(RAX, RDI, POffCur)
+	a.MovRegImm64(RCX, nullSegAddr())
+	a.MovMemDReg(RAX, cb+VCursorOffSeg, RCX)
+	for _, f := range []struct{ off, v int32 }{{VCursorOffSel, 0}, {VCursorOffRids, 0}, {VCursorOffN, 1}, {VCursorOffPos, 0},
+		{VCursorOffLast, 0}, {VCursorOffOk, 1}, {VCursorOffDirty, 1}, {VCursorOffAdv, 0}, {VCursorOffRew, 0}, {VCursorOffMask, -1},
+		{VCursorOffState, 6}} {
+		a.MovMemDImm(RAX, cb+f.off, f.v)
+	}
 }
 
 // text is VText: a pointer store, so the write barrier exits -- unless r[A]

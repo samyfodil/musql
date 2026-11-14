@@ -21,6 +21,7 @@ package engine
 import (
 	"fmt"
 	"slices"
+	"unsafe"
 )
 
 // aggPlan is an OpAggReset/OpAggStep P4 payload: what the aggregate opcodes share
@@ -282,6 +283,11 @@ type aggAccumulators struct {
 	// (aggPlan.rowWidth), and all of it that is copied.
 	rowFree  bool
 	rowWidth int
+	// fromKeys is a hash aggregate group whose plan reads nothing of its
+	// anchor but GROUP BY key columns, of the first row (rowFromKeys): the
+	// anchor is not kept, anchorRow reads those columns from the group's key,
+	// the first row's.
+	fromKeys bool
 	// cols, when not nil, is the plan's rowCols, the only columns anything
 	// reads: anchorVals then holds just those, in that order, and anchorRow
 	// places them back at their columns. A group's anchor is its key's few
@@ -366,6 +372,10 @@ func (a *aggAccumulators) magnetWalk(ctx *evalCtx, regs []Value) error {
 	if a.magnetHit {
 		return nil
 	}
+	if a.fromKeys {
+		a.haveAnchor = true
+		return nil
+	}
 	if a.rowFree {
 		a.anchorVals, a.anchorRowids = ctx.vals, ctx.rowids
 	} else {
@@ -429,21 +439,49 @@ func anchorColsSpelledAs(anchor, row []Value, cols []int) bool {
 // all-NULL row of plan's width. A GROUP BY group is never empty.
 //
 // An anchor kept as its columns alone (cols) is placed back at them in buf.
-func (a *aggAccumulators) anchorRow(plan *aggPlan, buf *[]Value) (vals, rowids []Value) {
+func (a *aggAccumulators) anchorRow(plan *aggPlan, buf *anchorRowBuf, groupKey []Value) (vals, rowids []Value) {
 	if !a.haveAnchor {
 		return make([]Value, plan.nCols), make([]Value, len(plan.scopes))
 	}
 	if a.cols == nil {
 		return a.anchorVals, a.anchorRowids
 	}
-	row := growValues(buf, a.rowWidth)
-	clear(row)
+	row := buf.row
+	if len(row) != a.rowWidth || len(buf.cols) != len(a.cols) || unsafe.SliceData(buf.cols) != unsafe.SliceData(a.cols) {
+		row = growValues(&buf.row, a.rowWidth)
+		buf.cols = a.cols
+	}
 	for i, c := range a.cols {
-		if i < len(a.anchorVals) && c < len(row) {
-			row[c] = a.anchorVals[i]
+		if c >= len(row) {
+			continue
 		}
+		v := Value{}
+		if a.fromKeys {
+			if k := slices.Index(plan.keyCols, c); k >= 0 && k < len(groupKey) {
+				v = groupKey[k]
+			}
+		} else if i < len(a.anchorVals) {
+			v = a.anchorVals[i]
+		}
+		row[c] = v
+	}
+	if a.fromKeys {
+		// Nothing reads a key-read group's rowids; they are NULL.
+		if len(buf.rowids) != len(plan.scopes) {
+			buf.rowids = make([]Value, len(plan.scopes))
+		}
+		return row, buf.rowids
 	}
 	return row, a.anchorRowids
+}
+
+// anchorRowBuf is the row anchorRow places an anchor's read columns back in,
+// and the columns it was cleared for: while they are the same, only they are
+// ever written, so the rest is still NULL and the row is not cleared again.
+type anchorRowBuf struct {
+	row    []Value
+	cols   []int
+	rowids []Value
 }
 
 // newAggAccs clones a fresh accumulator set from plan's item templates
@@ -622,7 +660,10 @@ func (m *vdbe) aggResult(info *aggResultInfo, groupKey []Value) (Value, error) {
 	if groupKey != nil {
 		clearJSONSubtype(groupKey)
 	}
-	bareVals, bareRowids := m.aggAccs.anchorRow(plan, &m.anchorRowBuf)
+	if m.aggAccs.fromKeys && len(groupKey) != len(plan.keyCols) {
+		return Value{}, fmt.Errorf("engine: internal: a group read from its key has no key")
+	}
+	bareVals, bareRowids := m.aggAccs.anchorRow(plan, &m.anchorRowBuf, groupKey)
 	if len(m.aggAccs.conv) > 0 {
 		groupKey, bareVals = m.convertedGroup(plan, it, aggVals, groupKey, bareVals)
 	}
