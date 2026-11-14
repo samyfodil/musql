@@ -197,27 +197,60 @@ func (s *segSortedRows) orderRun(lo, hi int) {
 	}
 	key, n := s.order, hi-lo
 	nk := len(key.cols)
-	vals := make([]Value, n*nk)
+	// The key's leading columns that are the rowid or an INTEGER block with
+	// no exception in every row's segment are read as int64s, without
+	// decoding; the rest are read only for rows equal on those.
+	ints, nulls := make([]int64, n*nk), make([]bool, n*nk)
+	p := nk
 	for i := range n {
 		sg, r := s.at(lo + i)
-		for k, c := range key.cols {
-			var v Value
-			switch {
-			case c < 0 || c == s.tbl.ipkIndex:
-				v = Value{Typ: Int, I: int64(sg.Rowid(r))}
-			default:
-				if v = sg.Value(c, r); v.Typ == Int && s.tbl.cols[c].Aff == affReal {
-					v = Value{Typ: Float, F: float64(v.I)}
-				}
+		for k, c := range key.cols[:p] {
+			if c < 0 || c == s.tbl.ipkIndex {
+				ints[i*nk+k] = int64(sg.Rowid(r))
+				continue
 			}
-			vals[i*nk+k] = v
+			b, ok := sg.Int64Column(c)
+			if !ok || sg.hasException(c) || s.tbl.cols[c].Aff == affReal {
+				p = k
+				break
+			}
+			if sg.cols[c].nullOff != 0 && sg.isNull(c, r) {
+				nulls[i*nk+k] = true
+			} else {
+				ints[i*nk+k] = b[r]
+			}
 		}
 	}
 	perm := make([]int, n)
 	for i := range perm {
 		perm[i] = i
 	}
-	autoIndexSortValues(perm, key, func(i, k int) Value { return vals[i*nk+k] }, s.enc, nil)
+	slices.SortFunc(perm, func(a, b int) int {
+		for k := range nk {
+			var c int
+			if k < p {
+				x, y := a*nk+k, b*nk+k
+				switch {
+				case nulls[x] && nulls[y]:
+				case nulls[x]:
+					c = -1
+				case nulls[y]:
+					c = 1
+				default:
+					c = cmp.Compare(ints[x], ints[y])
+				}
+			} else {
+				c = compareValuesCollatedEnc(s.cell(lo+a, key.cols[k]), s.cell(lo+b, key.cols[k]), key.colls[k], s.enc)
+			}
+			if c != 0 {
+				if k < len(key.desc) && key.desc[k] {
+					return -c // as autoIndexSortValues explains
+				}
+				return c
+			}
+		}
+		return a - b
+	})
 	if s.one != nil {
 		run := slices.Clone(s.perm[lo:hi])
 		for i, j := range perm {
@@ -233,6 +266,19 @@ func (s *segSortedRows) orderRun(lo, hi int) {
 		s.ordered = map[int]bool{}
 	}
 	s.ordered[lo] = true
+}
+
+// cell is column c of the row at position i, as orderRun reads it.
+func (s *segSortedRows) cell(i, c int) Value {
+	sg, r := s.at(i)
+	if c < 0 || c == s.tbl.ipkIndex {
+		return Value{Typ: Int, I: int64(sg.Rowid(r))}
+	}
+	v := sg.Value(c, r)
+	if v.Typ == Int && s.tbl.cols[c].Aff == affReal {
+		v = Value{Typ: Float, F: float64(v.I)}
+	}
+	return v
 }
 
 // at is the segment and row at position i of the column's order.
@@ -304,16 +350,7 @@ func (p *ReadOnlyPager) segSortedRowsFor(cur *vdbeCursor, h *sortedSeekHint) *se
 		}
 		prevRid = sg.Rowid(sg.nRows - 1)
 	}
-	perm := make([]int32, len(keys))
-	for i := range perm {
-		perm[i] = int32(i)
-	}
-	slices.SortFunc(perm, func(a, b int32) int {
-		if c := cmp.Compare(keys[a], keys[b]); c != 0 {
-			return c
-		}
-		return cmp.Compare(a, b)
-	})
+	perm := radixOrderInt64(keys)
 	s.keys, s.segs, s.rows = make([]int64, len(perm)), make([]*segment, len(perm)), make([]int, len(perm))
 	for i, j := range perm {
 		s.keys[i], s.segs[i], s.rows[i] = keys[j], ksegs[j], krows[j]
