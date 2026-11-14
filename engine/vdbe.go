@@ -919,6 +919,10 @@ func autoIndexSortValues(perm []int, key *autoIndexKey, at func(i, k int) Value,
 	if autoIndexSortInts(perm, key, at, stop) || autoIndexSortNums(perm, key, at, stop) {
 		return
 	}
+	if !isUTF16(enc) && len(key.colls) >= len(key.cols) && !slices.ContainsFunc(key.colls[:len(key.cols)], func(c string) bool { return !binaryCollation(c) }) &&
+		sortBySortKeys(perm, len(key.cols), at, func(k int) bool { return k < len(key.desc) && key.desc[k] }, stop) {
+		return
+	}
 	// Each key read once: at may be dear (a segment join's table finds a
 	// row's segment on every call), and the sort would call it n log n times.
 	nk := len(key.cols)

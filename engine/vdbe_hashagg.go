@@ -356,6 +356,10 @@ func (m *vdbe) hashAggSort(desc []bool, made bool) bool {
 			return len(h.sorted) > 0
 		}
 		enc := m.encoding()
+		if !isUTF16(enc) && hashAggSortKeys(h.sorted, desc) {
+			h.pos = 0
+			return len(h.sorted) > 0
+		}
 		sort.Slice(h.sorted, func(i, j int) bool {
 			if desc != nil {
 				return keyTupleLessDesc(h.sorted[i].key, h.sorted[j].key, desc, enc)
@@ -417,6 +421,35 @@ func hashAggSortInts(buckets []*hashAggBucket, desc []bool) bool {
 	for i := range flat {
 		buckets[i] = flat[i].b
 	}
+	return true
+}
+
+// hashAggSortKeys sorts buckets as keyTupleLessDesc orders them in a UTF-8
+// database, by the keys appendSortKey builds; false, with buckets untouched,
+// where a key holds a REAL.
+func hashAggSortKeys(buckets []*hashAggBucket, desc []bool) bool {
+	if len(buckets) == 0 {
+		return false
+	}
+	nk := len(buckets[0].key)
+	perm := make([]int, len(buckets))
+	for i := range perm {
+		perm[i] = i
+	}
+	at := func(i, k int) Value {
+		if k < len(buckets[i].key) {
+			return buckets[i].key[k]
+		}
+		return Value{}
+	}
+	if !sortBySortKeys(perm, nk, at, func(k int) bool { return k < len(desc) && desc[k] }, nil) {
+		return false
+	}
+	sorted := make([]*hashAggBucket, len(buckets))
+	for i, j := range perm {
+		sorted[i] = buckets[j]
+	}
+	copy(buckets, sorted)
 	return true
 }
 
