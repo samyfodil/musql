@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/binary"
 	"slices"
 )
@@ -72,14 +73,35 @@ func sortBySortKeys(perm []int, nk int, at func(i, k int) Value, desc func(k int
 		}
 		return arena[ends[i-1]:ends[i]]
 	}
-	slices.SortFunc(perm, func(a, b int) int {
+	// Each row's first sixteen key bytes, compared as two integers, decide
+	// most comparisons without reading the key.
+	type rec struct {
+		hi, lo uint64
+		i      int
+	}
+	recs := make([]rec, n)
+	for j, i := range perm {
+		var pre [16]byte
+		copy(pre[:], key(i))
+		recs[j] = rec{binary.BigEndian.Uint64(pre[:8]), binary.BigEndian.Uint64(pre[8:]), i}
+	}
+	slices.SortFunc(recs, func(a, b rec) int {
 		if stop.now() {
 			return 0
 		}
-		if c := bytes.Compare(key(a), key(b)); c != 0 {
+		if a.hi != b.hi {
+			return cmp.Compare(a.hi, b.hi)
+		}
+		if a.lo != b.lo {
+			return cmp.Compare(a.lo, b.lo)
+		}
+		if c := bytes.Compare(key(a.i), key(b.i)); c != 0 {
 			return c
 		}
-		return a - b
+		return a.i - b.i
 	})
+	for j, r := range recs {
+		perm[j] = r.i
+	}
 	return true
 }

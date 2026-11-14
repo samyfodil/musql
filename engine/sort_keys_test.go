@@ -52,3 +52,47 @@ func TestSortKeyOrdersAsBinary(t *testing.T) {
 		t.Fatal("a REAL has a sort key")
 	}
 }
+
+// TestSortBySortKeys: rows sort as a comparison of their values under
+// BINARY would sort them, ties in index order, whatever their keys' first
+// sixteen bytes share.
+func TestSortBySortKeys(t *testing.T) {
+	r := rand.New(rand.NewSource(2))
+	words := [][]byte{[]byte("abcdefghijklmnop"), []byte("abcdefghijklmnopq"), []byte("abcdefghijklmno"), []byte("abcdefghijklmnop\x00"), []byte("b"), {}}
+	const n, nk = 3000, 3
+	rows := make([][]Value, n)
+	for i := range rows {
+		rows[i] = make([]Value, nk)
+		for k := range nk {
+			switch r.Intn(3) {
+			case 0:
+				rows[i][k] = Value{Typ: Int, I: int64(r.Intn(5)) << 40}
+			case 1:
+				rows[i][k] = Value{Typ: Text, S: words[r.Intn(len(words))]}
+			}
+		}
+	}
+	desc := func(k int) bool { return k == 1 }
+	perm := make([]int, n)
+	for i := range perm {
+		perm[i] = i
+	}
+	if !sortBySortKeys(perm, nk, func(i, k int) Value { return rows[i][k] }, desc, nil) {
+		t.Fatal("no sort keys")
+	}
+	for j := 1; j < n; j++ {
+		a, b := perm[j-1], perm[j]
+		c := 0
+		for k := range nk {
+			if c = compareValuesCollatedEnc(rows[a][k], rows[b][k], "", UTF8); c != 0 {
+				if desc(k) {
+					c = -c
+				}
+				break
+			}
+		}
+		if c > 0 || c == 0 && a > b {
+			t.Fatalf("rows %d and %d out of order: %v, %v", a, b, rows[a], rows[b])
+		}
+	}
+}
