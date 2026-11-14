@@ -376,10 +376,10 @@ type vmIdx struct {
 }
 
 // idxFor returns cursor c's table as VSeekIdx searches it, or nil.
-func (jx *vmJIT) idxFor(c int, t *vmTab, enc TextEncoding) *vmIdx {
+func (jx *vmJIT) idxFor(c int, t *vmTab, enc TextEncoding, s *segSortedRows) *vmIdx {
 	x := jx.idxs[c].Load()
 	if x == nil || x.tab != t {
-		x = buildVMIdx(t, jx.idxSpecs[c], enc)
+		x = buildVMIdx(t, jx.idxSpecs[c], enc, s)
 		jx.idxs[c].Store(x)
 	}
 	if x.none {
@@ -391,12 +391,17 @@ func (jx *vmJIT) idxFor(c int, t *vmTab, enc TextEncoding) *vmIdx {
 // buildVMIdx works out t's indexes for spec: every segment, in rowid order,
 // with an index over the column that holds INTEGERs (the postings codec), and
 // whose rows within each value already run in spec's order when it has one.
-func buildVMIdx(t *vmTab, spec *idxSeekSpec, enc TextEncoding) *vmIdx {
+func buildVMIdx(t *vmTab, spec *idxSeekSpec, enc TextEncoding, s *segSortedRows) *vmIdx {
 	x := &vmIdx{tab: t, none: true}
 	if t == nil || t.none || len(t.at) == 0 || len(t.at) != len(t.segs) {
 		return x
 	}
 	if spec.sorted != nil {
+		if len(spec.sortCols) == 1 && s != nil && s.ok {
+			if y := sortedVMIdxFrom(&vmIdx{tab: t, none: true}, s); !y.none {
+				return y
+			}
+		}
 		return buildSortedVMIdx(x, spec, enc)
 	}
 	var prevRid uint64
@@ -625,6 +630,41 @@ func buildTableSortedVMIdxValues(x *vmIdx, spec *idxSeekSpec, enc TextEncoding) 
 	})
 }
 
+// sortedVMIdxFrom is buildSortedVMIdx from the VDBE's own segSortedRows for
+// the seek, with nothing to sort: its runs are in rowid order, or, those the
+// VDBE put in its automatic index's order, in an order that keeps the rows a
+// loop keeps in rowid order (the key's other columns are ones the seek holds
+// to one value). Its rows are copied: orderRun reorders them in place.
+func sortedVMIdxFrom(x *vmIdx, s *segSortedRows) *vmIdx {
+	t := x.tab
+	at := make(map[*segment]int, len(t.at))
+	mask := ^uint64(0)
+	for k, sg := range t.at {
+		at[sg] = k
+		mask &= t.segs[k].Mask
+	}
+	n := len(s.keys)
+	if s.one != nil {
+		n = len(s.perm)
+	}
+	if n == 0 {
+		return x
+	}
+	if s.one != nil {
+		k, ok := at[s.one]
+		if !ok {
+			return x
+		}
+		return x.tableIndex(mask, n, func(i int) (int, int, int64) { return k, int(s.perm[i]), s.block[s.perm[i]] })
+	}
+	for _, sg := range s.segs {
+		if _, ok := at[sg]; !ok {
+			return x
+		}
+	}
+	return x.tableIndex(mask, n, func(i int) (int, int, int64) { return at[s.segs[i]], s.rows[i], s.keys[i] })
+}
+
 // tableIndex makes x the one index over every segment whose n rows, in
 // order, are at(i): segment, row and key.
 func (x *vmIdx) tableIndex(mask uint64, n int, at func(i int) (seg, r int, k int64)) *vmIdx {
@@ -642,8 +682,12 @@ func (x *vmIdx) tableIndex(mask uint64, n int, at func(i int) (seg, r int, k int
 	}
 	starts = append(starts, int32(n))
 	x.vidx = []jit.VIdx{{Vals: unsafe.Pointer(unsafe.SliceData(vals)), NVals: int64(len(vals)), Starts: unsafe.Pointer(unsafe.SliceData(starts)),
-		Rows: unsafe.Pointer(unsafe.SliceData(keep)), Seg: t.segs[0].Seg, Mask: mask, Count: 1, Lo: vals[0], Hi: vals[len(vals)-1],
-		Segs: unsafe.Pointer(unsafe.SliceData(x.segPtrs))}}
+		Rows: unsafe.Pointer(unsafe.SliceData(keep)), Seg: t.segs[0].Seg, Mask: mask, Count: 1, Lo: vals[0], Hi: vals[len(vals)-1]}}
+	if len(t.at) > 1 {
+		// Each row's segment; one segment's rows are its own (VRowid reads
+		// them natively).
+		x.vidx[0].Segs = unsafe.Pointer(unsafe.SliceData(x.segPtrs))
+	}
 	x.keep, x.vals, x.starts = [][]int{keep}, [][]int64{vals}, [][]int32{starts}
 	x.none = false
 	return x
@@ -783,8 +827,18 @@ func runsInKeyOrder(sg *segment, d *segDiskIndex, rows []int, key *autoIndexKey)
 // sortedSeekServed reports whether the VDBE would serve cursor cur's sorted
 // seeks from the segments (segSortedSeek), as native code serves them, and
 // makes it ready to: only then does native code seek it.
+//
+// Only once the VDBE has made enough of the seeks itself (cur.segSorted) to
+// pay for the index -- a sort of the table -- that native code then builds:
+// an entry that built the table's sorted rows for a seek its run might never
+// reach (an outer loop with no rows), or for a handful, paid for them on
+// every query.
 func (jx *vmJIT) sortedSeekServed(m *vdbe, cur *vdbeCursor, spec *idxSeekSpec) bool {
-	if !cur.segSortable() {
+	s := cur.segSorted
+	if !cur.segSortable() || s == nil || !s.ok {
+		return false
+	}
+	if n := max(len(s.keys), len(s.perm)); s.seeks < max(16, n/64) {
 		return false
 	}
 	_, orderOp, ok := cur.segSortedReady(spec.sorted, m.encoding())
