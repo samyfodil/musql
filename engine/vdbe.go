@@ -238,6 +238,8 @@ type vdbe struct {
 	// first time a subquery opcode with slot i executes and reused thereafter.
 	// len == prog.NSubCache; nil for a program with no compiled subquery.
 	subCache []subCacheEntry
+	// subKeyBuf is the scratch a kept subquery's key is built in.
+	subKeyBuf []byte
 
 	// wctx is the write-mode state (the *DB write handle plus the per-statement
 	// mutation bookkeeping) for the WRITE opcodes (OpInsertRow/OpDeleteRow/...,
@@ -1625,6 +1627,11 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 	pc := 0
 	if m.yield {
 		pc = m.resumePC
+		// Between two rows handed back, another statement may have changed
+		// what a kept subquery read.
+		for i := range m.subCache {
+			m.subCache[i].keep = nil
+		}
 	}
 	// The program's native code, when it has some (vdbe_jit.go). Dispatch
 	// then reads jx.marked, the same program with OpJIT at each pc that enters
@@ -3399,7 +3406,13 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpSubquery:
 			sub := op.P4.(*Program)
-			rows, serr := m.runSub(op.P5&p5Correlated != 0, op.P2, sub)
+			var rows [][]Value
+			var serr error
+			if op.P5&p5SubKeep != 0 {
+				rows, serr = m.keptSubquery(op.P2, sub)
+			} else {
+				rows, serr = m.runSub(op.P5&p5Correlated != 0, op.P2, sub)
+			}
 			if serr != nil {
 				return nil, serr
 			}

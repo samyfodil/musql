@@ -1387,6 +1387,7 @@ func (p *ReadOnlyPager) resolveDerivedSource(c *compiler, state *joinDesugarStat
 		// its program be run once and cached (runSubOnce) -- serving every
 		// enclosing row the materialization built for the first one.
 		c.correlated = true
+		c.poisonSubSinks()
 	}
 	// derivedColumnInfos re-resolves the body's FROM to read affinity and
 	// collation, so the body's own WITH must be in scope again here. C binds each
@@ -1976,6 +1977,7 @@ func (p *ReadOnlyPager) resolveCorrelatedCTESource(c *compiler, state *joinDesug
 	// THROUGH, so c staying "uncorrelated" would let it run once and serve
 	// every enclosing row the first row's materialization built.
 	c.correlated = true
+	c.poisonSubSinks()
 
 	// cols exactly mirrors cteSchemaCols' own tail: derivedColumnInfos under
 	// the body's own nested WITH (if any) pushed for the length of the call
@@ -2086,6 +2088,7 @@ func (p *ReadOnlyPager) resolveCTESource(c *compiler, state *joinDesugarState, i
 			// The recursion reads the enclosing row, so c's program re-runs
 			// it per row too (resolveCorrelatedCTESource's propagation).
 			c.correlated = true
+			c.poisonSubSinks()
 		}
 	}
 	name := it.Alias
@@ -2533,6 +2536,7 @@ func (p *ReadOnlyPager) finishGroupSource(c *compiler, state *joinDesugarState, 
 	if prog.Correlated {
 		// As resolveDerivedSource: c reads its outer row through the group.
 		c.correlated = true
+		c.poisonSubSinks()
 	}
 
 	allCols := make([]columnInfo, 0, len(outCols))
