@@ -272,8 +272,39 @@ func (src *segSource) scanSegmentsCols(rootPage uint32, cols columnMask) (iter.S
 		// so callers can retain them. Capacity is capped to prevent aliasing.
 		const chunkRows = 512
 		var arena []Value
+		var raw []segColPlan
+		var rids []uint64
 		for _, s := range segs {
 			nCols := len(s.cols)
+			if s.fullWidth && nCols > 0 {
+				// Every row is nCols wide: a chunk of rows is filled a column
+				// at a time, each read as s.Value reads it (no column plan).
+				if len(raw) < nCols {
+					raw = make([]segColPlan, nCols)
+				}
+				for i0 := 0; i0 < s.nRows; i0 += chunkRows {
+					k := min(chunkRows, s.nRows-i0)
+					block := make([]Value, k*nCols)
+					if len(rids) < k {
+						rids = make([]uint64, chunkRows)
+					}
+					for c := range nCols {
+						if cols != allColumns && !cols.has(c) {
+							for r := range k {
+								block[r*nCols+c] = Value{Typ: valueUnread}
+							}
+							continue
+						}
+						segColumnRun(raw, s, c, i0, rids[:k], block[c:], nCols)
+					}
+					for r := range k {
+						if !yield(s.Rowid(i0+r), block[r*nCols:(r+1)*nCols:(r+1)*nCols]) {
+							return
+						}
+					}
+				}
+				continue
+			}
 			for i := 0; i < s.nRows; i++ {
 				w := s.Width(i)
 				if w > nCols {
