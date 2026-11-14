@@ -55,6 +55,7 @@ func TestRecInlineMatchesTheSubProgram(t *testing.T) {
 		`WITH RECURSIVE e(m) AS (SELECT 1 WHERE 0), b(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM b, e WHERE k < 5) SELECT count(*) FROM b`,
 		`WITH RECURSIVE n(m) AS (VALUES(1),(2)), e(m) AS (SELECT x FROM t1 WHERE x > 100), b(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM b CROSS JOIN n CROSS JOIN e WHERE k < 5 UNION ALL SELECT k + 2 FROM b CROSS JOIN n WHERE k < 9) SELECT group_concat(k) FROM b`,
 		`WITH RECURSIVE b(k, f) AS (SELECT 1, 0 UNION ALL SELECT k + 1, NOT f FROM b WHERE k < 9) SELECT group_concat(f) FROM b`,
+		`WITH RECURSIVE c(i, s, r) AS (SELECT 1, '1', 1.0 UNION ALL SELECT i + 1, CAST(i + 1 AS TEXT), CAST(i AS REAL) / 2 FROM c WHERE i < 6) SELECT group_concat(typeof(s) || s || typeof(r) || r) FROM c`,
 	}
 	ask := func(q string, inline bool) string {
 		recInlineOffForTest, segPeepholesOffForTest = !inline, !inline
