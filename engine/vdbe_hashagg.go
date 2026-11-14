@@ -18,6 +18,8 @@ import (
 type hashAggBucket struct {
 	key  []Value
 	accs *aggAccumulators
+	// at is the group's index into a dense aggregate's state (hashAggState.dense).
+	at int32
 }
 
 // hashAggState is the VM's live hash-aggregate state for one compiled GROUP
@@ -37,6 +39,143 @@ type hashAggState struct {
 	unordered bool
 	// slab is where each bucket, its key and its accumulators are carved from.
 	slab aggSlab
+
+	// A plan denseAggPlan accepts keeps no accumulator set per group: each
+	// group's accumulators are values, len(denseItems) of them from
+	// dense[at*len(denseItems)], with its anchor flags in denseFlags[at],
+	// and the one set denseAccs, whose items are denseItems, is loaded with
+	// the group a step or the drain works on (denseCur).
+	dense      []aggDense
+	denseFlags []uint8
+	denseAccs  *aggAccumulators
+	denseItems []*aggItem
+	denseCur   *hashAggBucket
+}
+
+// aggDense is everything step and finalize read or write of an accumulator
+// of the kinds denseAggPlan accepts.
+type aggDense struct {
+	cnt, iSum                   int64
+	rSum, rErr                  float64
+	topExp, unitExp             int16
+	approx, overflow, win, risk bool
+}
+
+// denseAggOffForTest keeps every group's own accumulator set, so a test can
+// hold dense groups to it.
+var denseAggOffForTest bool
+
+const (
+	denseSeen = 1 << iota
+	denseHit
+	denseAnchor
+)
+
+// denseAggPlan reports whether plan's groups can keep their accumulators as
+// aggDense values: every aggregate a count, sum, total or avg with no
+// DISTINCT or ORDER BY, no census site or anchor certificate, and an anchor
+// that is no row or the group's key (rowFromKeys), so a group's state is its
+// accumulators' numbers and three flags.
+func denseAggPlan(plan *aggPlan) bool {
+	if plan.anchorCheck != nil || plan.magnet != nil && len(plan.magnet.sites) > 0 || !plan.rowFree && !plan.rowFromKeys() {
+		return false
+	}
+	ok := func(it *itemPlan) bool {
+		if it == nil {
+			return true
+		}
+		for _, t := range it.aggTemplates {
+			switch t.kind {
+			case aggCountStar, aggCount, aggSum, aggTotal, aggAvg:
+			default:
+				return false
+			}
+			if t.distinct || t.orderBy != nil {
+				return false
+			}
+		}
+		return true
+	}
+	if !ok(plan.havingPlan) {
+		return false
+	}
+	for _, it := range plan.outPlans {
+		if !ok(it) {
+			return false
+		}
+	}
+	for _, op := range plan.orderPlans {
+		if !ok(op.item) {
+			return false
+		}
+	}
+	return true
+}
+
+// startDense makes h a dense aggregate over plan: the one accumulator set
+// groups are loaded into.
+func (h *hashAggState) startDense(plan *aggPlan) {
+	a := newAggAccs(plan)
+	h.denseAccs = a
+	for _, set := range a.out {
+		h.denseItems = append(h.denseItems, set...)
+	}
+	h.denseItems = append(h.denseItems, a.having...)
+	for _, set := range a.order {
+		h.denseItems = append(h.denseItems, set...)
+	}
+}
+
+// accsOf is b's accumulator set: its own, or a dense aggregate's one set
+// loaded with b's state.
+func (h *hashAggState) accsOf(b *hashAggBucket) *aggAccumulators {
+	if h.denseAccs == nil {
+		return b.accs
+	}
+	if h.denseCur == b {
+		return h.denseAccs
+	}
+	h.storeDense()
+	n := len(h.denseItems)
+	for k, it := range h.denseItems {
+		d := &h.dense[int(b.at)*n+k]
+		it.cnt, it.iSum, it.rSum, it.rErr = d.cnt, d.iSum, d.rSum, d.rErr
+		it.sumTopExp, it.sumUnitExp = int(d.topExp), int(d.unitExp)
+		it.sumApprox, it.sumOverflow, it.sumWinSet, it.orderRisk = d.approx, d.overflow, d.win, d.risk
+	}
+	a, f := h.denseAccs, h.denseFlags[b.at]
+	a.seenRow, a.magnetHit, a.haveAnchor = f&denseSeen != 0, f&denseHit != 0, f&denseAnchor != 0
+	// A row-free plan's anchor is the shared NULL row every step points it
+	// at, so it is kept; conv is each group's result's own.
+	a.conv = nil
+	h.denseCur = b
+	return a
+}
+
+// storeDense saves the loaded group's state from the one accumulator set.
+func (h *hashAggState) storeDense() {
+	b := h.denseCur
+	if b == nil {
+		return
+	}
+	n := len(h.denseItems)
+	for k, it := range h.denseItems {
+		h.dense[int(b.at)*n+k] = aggDense{cnt: it.cnt, iSum: it.iSum, rSum: it.rSum, rErr: it.rErr,
+			topExp: int16(it.sumTopExp), unitExp: int16(it.sumUnitExp), approx: it.sumApprox, overflow: it.sumOverflow, win: it.sumWinSet, risk: it.orderRisk}
+	}
+	a := h.denseAccs
+	var f uint8
+	if a.seenRow {
+		f |= denseSeen
+	}
+	if a.magnetHit {
+		f |= denseHit
+	}
+	if a.haveAnchor {
+		f |= denseAnchor
+	}
+	h.denseFlags[b.at] = f
+	h.denseCur = nil
 }
 
 // aggSlab carves a hash aggregate's groups out of chunks, so a group costs no
@@ -229,11 +368,15 @@ func (m *vdbe) hashAggStep(plan *aggPlan, keyVals []Value, seg int) error {
 		// census site took on its first row (magnetWalk): an existing such
 		// group steps from its registers alone.
 		m.aggKeyBuf = hashAggKeyBytes(m.aggKeyBuf[:0], keyVals)
-		if b := m.hashAgg.buckets[string(m.aggKeyBuf)]; b != nil && b.accs.seenRow && len(b.accs.magnets) == 0 && b.accs.check == nil {
+		var a *aggAccumulators
+		if b := m.hashAgg.buckets[string(m.aggKeyBuf)]; b != nil {
+			a = m.hashAgg.accsOf(b)
+		}
+		if a != nil && a.seenRow && len(a.magnets) == 0 && a.check == nil {
 			if n := plan.nCols + len(plan.scopes); len(m.aggNullRow) < n {
 				m.aggNullRow = make([]Value, n)
 			}
-			m.aggAccs = b.accs
+			m.aggAccs = a
 			return m.aggStep(m.aggRowCtx(plan, m.aggNullRow[:plan.nCols:plan.nCols], m.aggNullRow[plan.nCols:plan.nCols+len(plan.scopes)]), seg)
 		}
 	}
@@ -254,6 +397,9 @@ func (m *vdbe) hashAggStep(plan *aggPlan, keyVals []Value, seg int) error {
 func (m *vdbe) hashAggStepRow(plan *aggPlan, keyVals []Value, seg int, row, rowids []Value) error {
 	if m.hashAgg == nil {
 		m.hashAgg = &hashAggState{buckets: make(map[string]*hashAggBucket)}
+		if !denseAggOffForTest && denseAggPlan(plan) {
+			m.hashAgg.startDense(plan)
+		}
 	}
 	// Key bytes are reused per row: buckets store their own copy, so a lookup key
 	// is discarded after use. String(...) indexing avoids per-row allocations.
@@ -262,14 +408,20 @@ func (m *vdbe) hashAggStepRow(plan *aggPlan, keyVals []Value, seg int, row, rowi
 	if b == nil {
 		h := m.hashAgg
 		b = h.slab.bucket()
-		*b = hashAggBucket{key: h.slab.cloneValues(keyVals), accs: h.slab.newAggAccs(plan)}
+		if h.denseAccs != nil {
+			*b = hashAggBucket{key: h.slab.cloneValues(keyVals), at: int32(len(h.denseFlags))}
+			h.dense = append(h.dense, make([]aggDense, len(h.denseItems))...)
+			h.denseFlags = append(h.denseFlags, 0)
+		} else {
+			*b = hashAggBucket{key: h.slab.cloneValues(keyVals), accs: h.slab.newAggAccs(plan)}
+		}
 		h.buckets[h.slab.key(m.aggKeyBuf)] = b
 		if n := len(h.made); n > 0 && !h.unordered && !keyTupleLess(h.made[n-1].key, b.key, m.encoding()) {
 			h.unordered = true
 		}
 		h.made = append(h.made, b)
 	}
-	m.aggAccs = b.accs
+	m.aggAccs = m.hashAgg.accsOf(b)
 	// JSON subtype is cleared here for grouped queries, matching the sorted drain path.
 	clearJSONSubtype(row)
 	return m.aggStep(m.aggRowCtx(plan, row, rowids), seg)
@@ -498,7 +650,7 @@ func hashAggSortKeys(buckets []*hashAggBucket, desc []bool) bool {
 // return its group-key tuple, mirroring vdbeSorter.data.
 func (m *vdbe) hashAggData() []Value {
 	b := m.hashAgg.sorted[m.hashAgg.pos]
-	m.aggAccs = b.accs
+	m.aggAccs = m.hashAgg.accsOf(b)
 	return b.key
 }
 
