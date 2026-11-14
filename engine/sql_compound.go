@@ -155,7 +155,10 @@ func unionMerge(accumulated, newRows [][]Value, collations []string, enc TextEnc
 // membership, and a UNION recursive CTE's queue (recQueue). It relies on
 // collatedKeyBytes' contract, gated by TestRowKeySetMatchesKeysEqualCollated.
 type rowKeySet struct {
-	seen       map[string]struct{}
+	seen map[string]struct{}
+	// ints holds the rows of one INTEGER, or one REAL equal to an INTEGER,
+	// which compare equal to no row seen holds.
+	ints       int64Set
 	collations []string
 	enc        TextEncoding
 	buf        []byte
@@ -176,20 +179,46 @@ func newRowKeySet(collations []string, enc TextEncoding) *rowKeySet {
 // equal row (keysEqualCollated) was already present, in which case the set is
 // unchanged, so the FIRST occurrence is the one that survives.
 func (s *rowKeySet) add(row []Value) bool {
-	k := string(collatedKeyBytes(row, s.collations, s.enc))
-	if _, dup := s.seen[k]; dup {
+	if n, ok := oneInteger(row); ok {
+		if !s.ints.insert(n) {
+			return false
+		}
+		s.bytes += 16
+		return true
+	}
+	s.buf = appendCollatedKeyBytes(s.buf[:0], row, s.collations, s.enc)
+	if _, dup := s.seen[string(s.buf)]; dup {
 		return false
 	}
-	s.seen[k] = struct{}{}
-	s.bytes += int64(len(k)) + 16
+	s.seen[string(s.buf)] = struct{}{}
+	s.bytes += int64(len(s.buf)) + 16
 	return true
 }
 
 // has reports whether a row equal to row (keysEqualCollated) is in the set.
 func (s *rowKeySet) has(row []Value) bool {
+	if n, ok := oneInteger(row); ok {
+		return s.ints.has(n)
+	}
 	s.buf = appendCollatedKeyBytes(s.buf[:0], row, s.collations, s.enc)
 	_, ok := s.seen[string(s.buf)]
 	return ok
+}
+
+// oneInteger is row's one value as the INTEGER it equals, where row is one
+// INTEGER or one REAL equal to an INTEGER (floatAsCanonicalInt), which
+// appendCollatedKeyBytes keys alike.
+func oneInteger(row []Value) (int64, bool) {
+	if len(row) != 1 {
+		return 0, false
+	}
+	switch row[0].Typ {
+	case Int:
+		return row[0].I, true
+	case Float:
+		return floatAsCanonicalInt(row[0].F)
+	}
+	return 0, false
 }
 
 // collatedKeyBytes canonically encodes a row so two rows encode identically iff

@@ -38,6 +38,25 @@ func (s *int64Set) reserve(n int) {
 	}
 }
 
+// has reports whether v is in the set.
+func (s *int64Set) has(v int64) bool {
+	if v == 0 {
+		return s.zero
+	}
+	if len(s.slots) == 0 {
+		return false
+	}
+	mask := uint64(len(s.slots) - 1)
+	for i := mix64(uint64(v)) & mask; ; i = (i + 1) & mask {
+		switch s.slots[i] {
+		case 0:
+			return false
+		case v:
+			return true
+		}
+	}
+}
+
 // insert adds v and reports whether it was not in the set before.
 func (s *int64Set) insert(v int64) bool {
 	n, zero := s.n, s.zero

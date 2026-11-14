@@ -165,3 +165,30 @@ func BenchmarkRecursiveUnionCTE512(b *testing.B)  { benchRecursiveUnionCTE(b, 51
 func BenchmarkRecursiveUnionCTE1024(b *testing.B) { benchRecursiveUnionCTE(b, 1024) }
 func BenchmarkRecursiveUnionCTE2048(b *testing.B) { benchRecursiveUnionCTE(b, 2048) }
 func BenchmarkRecursiveUnionCTE4096(b *testing.B) { benchRecursiveUnionCTE(b, 4096) }
+
+// TestRowKeySetAddHasMatchKeysEqualCollated: after one row is added, has and
+// add of another answer as keysEqualCollated does, for rows of one value --
+// which take the INTEGER set where they are one -- and of two.
+func TestRowKeySetAddHasMatchKeysEqualCollated(t *testing.T) {
+	vals := rowKeyValueMatrix()
+	var rows [][]Value
+	for _, a := range vals {
+		rows = append(rows, []Value{a}, []Value{a, {Typ: Int, I: 1}})
+	}
+	for _, coll := range []string{"", "NOCASE"} {
+		colls := []string{coll, ""}
+		for _, ra := range rows {
+			for _, rb := range rows {
+				s := newRowKeySet(colls, UTF8)
+				s.add(ra)
+				equal := len(ra) == len(rb) && keysEqualCollated(ra, rb, colls, UTF8)
+				if got := s.has(rb); got != equal {
+					t.Fatalf("coll=%q %v then has(%v) = %v, want %v", coll, ra, rb, got, equal)
+				}
+				if got := s.add(rb); got == equal {
+					t.Fatalf("coll=%q %v then add(%v) = %v, want %v", coll, ra, rb, got, !equal)
+				}
+			}
+		}
+	}
+}
