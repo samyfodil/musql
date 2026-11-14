@@ -41,6 +41,7 @@ func TestCorrelatedSubqueryKeptRows(t *testing.T) {
 		"SELECT id, (SELECT (SELECT count(*) FROM b b2 WHERE b2.y = b.y AND b2.k = a.k) FROM b WHERE b.k = a.k LIMIT 1) FROM a",
 		"SELECT count(DISTINCT (SELECT random() + y FROM b WHERE b.k = a.k LIMIT 1)) > 20 FROM a",
 		"SELECT count(DISTINCT (SELECT random() + sum(x) OVER () FROM b WHERE b.k = a.k LIMIT 1)) > 20 FROM a",
+		"WITH r AS NOT MATERIALIZED (SELECT random() + sum(x) OVER () AS v FROM b) SELECT count(DISTINCT (SELECT v FROM r WHERE a.k = 1)) > 5 FROM a",
 		"SELECT id, (SELECT value FROM json_each((SELECT json_array(a.v, a.w) WHERE a.k IS NOT NULL)) WHERE a.k = 1 LIMIT 1 OFFSET 1) FROM a",
 		"SELECT v, sum(id), (SELECT count(*) FROM b WHERE b.y < sum(a.id) % 5) FROM a GROUP BY v",
 		"SELECT a.id, (SELECT max(y) FROM b WHERE b.k = a2.k) FROM a LEFT JOIN a a2 ON a2.id = a.id + 100",

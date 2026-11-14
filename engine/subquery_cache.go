@@ -75,7 +75,39 @@ func (c *compiler) poisonSubSinks() {
 // records nothing in a sink: a virtual table's arguments, coded as it opens,
 // and a window's projection; and the MATCH and fts auxiliary opcodes read the
 // enclosing row through m.outer.
-func subKeepable(prog *Program, seen map[*Program]bool) bool {
+func subKeepable(prog *Program) bool {
+	return subTreeAll(prog, map[*Program]bool{}, func(in *Instruction) bool {
+		switch in.Op {
+		case OpMatch, OpFts3Aux, OpFts5Aux, OpWindowAppend, OpWindowFinal, OpGroupBatchAppend, OpGroupBatchFinal:
+			return false
+		}
+		switch p4 := in.P4.(type) {
+		case *derivedSource:
+			return p4.vtab == nil
+		case *ScalarFunction:
+			return false
+		case string:
+			return in.Op != OpFunction || !nonConstantFuncs[r33sFoldIdent(p4)]
+		}
+		return true
+	})
+}
+
+// subCTEsShared reports whether every CTE prog's tree reads is read from one
+// run of its body for the whole statement (cteShared), which no number of
+// runs of prog can change. One that is not runs its body again with each
+// run of prog.
+func subCTEsShared(prog *Program) bool {
+	return subTreeAll(prog, map[*Program]bool{}, func(in *Instruction) bool {
+		ds, ok := in.P4.(*derivedSource)
+		return !ok || ds.cte == nil || ds.cteShared()
+	})
+}
+
+// subTreeAll reports whether ok holds for every instruction of prog and of
+// every program it runs, at any depth. A compound or a live body is never
+// walked, and fails.
+func subTreeAll(prog *Program, seen map[*Program]bool, ok func(*Instruction) bool) bool {
 	if prog == nil || seen[prog] {
 		return true
 	}
@@ -84,28 +116,28 @@ func subKeepable(prog *Program, seen map[*Program]bool) bool {
 	}
 	seen[prog] = true
 	item := func(it *itemPlan) bool {
-		return it == nil || it.prog == nil || subKeepable(it.prog.prog, seen)
+		return it == nil || it.prog == nil || subTreeAll(it.prog.prog, seen, ok)
 	}
-	for _, in := range prog.Insns {
-		switch in.Op {
-		case OpMatch, OpFts3Aux, OpFts5Aux, OpWindowAppend, OpWindowFinal, OpGroupBatchAppend, OpGroupBatchFinal:
+	for i := range prog.Insns {
+		in := &prog.Insns[i]
+		if !ok(in) {
 			return false
 		}
 		switch p4 := in.P4.(type) {
 		case *Program:
-			if !subKeepable(p4, seen) {
+			if !subTreeAll(p4, seen, ok) {
 				return false
 			}
 		case *inSubPlan:
-			if !subKeepable(p4.prog, seen) {
+			if !subTreeAll(p4.prog, seen, ok) {
 				return false
 			}
 		case *rowSubPlan:
-			if !subKeepable(p4.prog, seen) {
+			if !subTreeAll(p4.prog, seen, ok) {
 				return false
 			}
 		case *derivedSource:
-			if p4.vtab != nil || !subKeepable(p4.prog, seen) {
+			if !subTreeAll(p4.prog, seen, ok) {
 				return false
 			}
 		case *aggPlan:
@@ -122,12 +154,6 @@ func subKeepable(prog *Program, seen map[*Program]bool) bool {
 					return false
 				}
 			}
-		case *ScalarFunction:
-			return false
-		case string:
-			if in.Op == OpFunction && nonConstantFuncs[r33sFoldIdent(p4)] {
-				return false
-			}
 		}
 	}
 	return true
@@ -138,10 +164,12 @@ func subKeepable(prog *Program, seen map[*Program]bool) bool {
 const maxSubKeep = 1 << 16
 
 // subKeep is a correlated subquery's kept rows, by key (subqueryKey).
+// checked says subCTEsShared was asked, on the first run.
 type subKeep struct {
 	rows       map[string][][]Value
 	hits, runs int
 	off        bool
+	checked    bool
 }
 
 // keptSubquery is OpSubquery's run of a correlated prog whose rows are kept
@@ -153,6 +181,9 @@ func (m *vdbe) keptSubquery(slot int, prog *Program) ([][]Value, error) {
 		e.keep = &subKeep{rows: map[string][][]Value{}}
 	}
 	k := e.keep
+	if !k.checked {
+		k.checked, k.off = true, !subCTEsShared(prog)
+	}
 	if k.off {
 		return prog.execWithParent(m)
 	}

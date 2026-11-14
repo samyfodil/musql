@@ -71,8 +71,20 @@ func TestCorrelatedSubqueryKeepsRows(t *testing.T) {
 	}
 	// A function that is not constant in a window's projection runs for
 	// every enclosing row.
-	q := `SELECT count(DISTINCT (SELECT random() + sum(x) OVER () FROM b WHERE b.k = a.k LIMIT 1)) > 100 FROM a`
-	if got := fmt.Sprint(typedRows(p.mustPlain(q))); got != "[1:1|]" {
-		t.Errorf("%s: %s", q, got)
+	// So does one in the body of a CTE each run reads afresh.
+	for _, q := range []string{
+		`SELECT count(DISTINCT (SELECT random() + sum(x) OVER () FROM b WHERE b.k = a.k LIMIT 1)) > 100 FROM a`,
+		`WITH r AS NOT MATERIALIZED (SELECT random() + sum(x) OVER () AS v FROM b) SELECT count(DISTINCT (SELECT v FROM r WHERE a.k = 1)) > 30 FROM a`,
+	} {
+		if got := fmt.Sprint(typedRows(p.mustPlain(q))); got != "[1:1|]" {
+			t.Errorf("%s: %s", q, got)
+		}
+	}
+	// A CTE every reference reads one run of is kept.
+	subKeepHits.Store(0)
+	q := `WITH r AS (SELECT k, sum(x) s FROM b GROUP BY k) SELECT a.id FROM a, r r1 WHERE r1.k = a.k AND r1.s > (SELECT avg(s) FROM r r2 WHERE r2.k IS NOT a.k)`
+	p.mustPlain(q)
+	if subKeepHits.Load() == 0 {
+		t.Errorf("%s: no run kept", q)
 	}
 }
