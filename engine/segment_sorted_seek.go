@@ -118,12 +118,14 @@ func (cur *vdbeCursor) segSortedReady(h *sortedSeekHint, enc TextEncoding) (*seg
 	}
 	var key *autoIndexKey
 	if orderOp != nil {
-		if key = orderOp.P4.(*autoIndexKey); !segRunOrderable(cur.tbl, key) {
-			return nil, nil, false
-		}
+		key = orderOp.P4.(*autoIndexKey)
 	}
 	s := cur.segSorted
 	if s == nil || !s.hint.sameSort(h) || s.order != key {
+		// One kept for key was made only after this test passed.
+		if key != nil && !segRunOrderable(cur.tbl, key) {
+			return nil, nil, false
+		}
 		s = cur.pager.segSortedRowsFor(cur, h)
 		if s.ok && key != nil && s.one != nil {
 			s.perm = slices.Clone(s.perm) // the segment's own, shared

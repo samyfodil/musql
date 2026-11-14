@@ -393,6 +393,74 @@ func (e *vmEmitArm) exitpcLabel() string { return "e" + strconv.Itoa(e.islandN) 
 
 // jmpBlock branches to target's block, or exits when target is past the end.
 // A backward branch spends fuel first, exiting at target when it runs out.
+// nullCmp is vm_amd64.go's: a comparison that answers a NULL operand.
+func (e *vmEmitArm) nullCmp(pc int, in VInsn) {
+	a, L := e.a, e.lay
+	store := in.Op != VCmpJump && !in.Dead
+	knownA, knownB := e.know.isInt.has(in.A), e.know.isInt.has(in.B)
+	if store {
+		e.destNoS(pc, in.C)
+	}
+	zs := e.zeroS.has(in.C)
+	null, done := e.vmLabel("cn"), e.vmLabel("cd")
+	for _, r := range []int{in.A, in.B} {
+		if !e.know.isInt.has(r) {
+			e.ldrb(X10, r, L.OffTyp)
+			a.CmpImm(X10, uint32(L.TypNull))
+			a.Bcond(CondE, null)
+		}
+	}
+	x := e.src(pc, in.B, X9)
+	y := e.src(pc, in.A, X10)
+	a.Cmp(x, y)
+	if store {
+		a.Cset(X9, in.Cond)
+		e.storeInt(in, in.C, X9) // stores leave the flags alone
+	}
+	switch in.Op {
+	case VCmpJump:
+		e.jccBlock(in.Cond, pc, in.T)
+	case VCmpBr:
+		c := in.Cond
+		if in.Imm&1 == 0 {
+			c = c.Negate()
+		}
+		e.jccBlock(c, pc, in.T)
+	}
+	a.B(done)
+	a.Label(null)
+	if store {
+		a.MovImm16(X10, uint16(L.TypNull))
+		e.str(X10, in.C, 0)
+		e.str(xzr, in.C, L.OffI)
+		e.str(xzr, in.C, L.OffF)
+		if zs {
+			e.zeroS.add(in.C)
+		}
+		e.clearS(in.C)
+	}
+	if in.Op == VCmpJump && in.Imm == 2 || in.Op == VCmpBr && in.Imm&VCmpNullJumps != 0 {
+		e.jmpBlock(pc, in.T)
+	}
+	a.Label(done)
+	e.unmap(in.A)
+	e.unmap(in.B)
+	if !knownA {
+		e.know.isInt.del(in.A)
+	}
+	if !knownB {
+		e.know.isInt.del(in.B)
+	}
+	if in.Op != VCmpJump {
+		if in.Dead {
+			e.clobber(in.C)
+		} else {
+			e.unmap(in.C)
+			e.know.wroteAny(in.C, true)
+		}
+	}
+}
+
 func (e *vmEmitArm) jmpBlock(from, target int) {
 	if target < 0 || target >= e.n {
 		e.a.B(e.stub(target))
@@ -754,11 +822,19 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		}
 		e.storeInt(in, in.C, x)
 	case VCmpJump:
+		if in.Imm != 0 {
+			e.nullCmp(pc, in)
+			break
+		}
 		x := e.src(pc, in.B, X9)
 		y := e.src(pc, in.A, X10)
 		a.Cmp(x, y)
 		e.jccBlock(in.Cond, pc, in.T)
 	case VCmpSet, VCmpBr:
+		if in.Op == VCmpSet && in.Imm != 0 || in.Op == VCmpBr && in.Imm&VCmpNull != 0 {
+			e.nullCmp(pc, in)
+			break
+		}
 		x := e.src(pc, in.B, X9)
 		y := e.src(pc, in.A, X10)
 		if !in.Dead {
@@ -774,7 +850,7 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		}
 		if in.Op == VCmpBr {
 			c := in.Cond
-			if in.Imm == 0 {
+			if in.Imm&1 == 0 {
 				c = c.Negate()
 			}
 			e.jccBlock(c, pc, in.T)
@@ -940,6 +1016,9 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		a.LdrImm(X4, X9, VCursorOffN)
 		a.Cmp(X10, X4)
 		a.BcondRaw(armHS, e.stub(pc)) // unsigned: a position before the first row is huge
+		// A row of several segments' run (VCursor.Segs) is the VDBE's.
+		a.LdrImm(X4, X9, VCursorOffSegs)
+		a.Cbnz(X4, e.stub(pc))
 		// A selection's position names its segment row (VCursor.Sel).
 		row := e.vmLabel("rs")
 		a.LdrImm(X4, X9, VCursorOffSel)

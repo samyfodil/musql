@@ -1382,13 +1382,22 @@ func lowerVM(in *Instruction, nReg int) jit.VInsn {
 		// Two INTEGERs answer before NULL handling, affinity or collation
 		// (compareOp's first arm, vdbe.c:2288), so P4 and P5 matter only for
 		// the store-the-result form, which stays the VDBE's.
+		// A NULL operand answers next (compareOp, vdbe.c:2315) unless NULLs
+		// compare equal: no jump unless JUMPIFNULL, or a NULL stored.
+		var null int64
+		if in.P5&p5NullEq == 0 {
+			null = 1
+			if in.P5&(p5StoreP2|p5JumpIfNull) == p5JumpIfNull {
+				null = 2
+			}
+		}
 		if in.P5&p5StoreP2 == 0 && ok(in.P1, in.P3) {
-			return jit.VInsn{Op: jit.VCmpJump, A: in.P1, B: in.P3, T: in.P2, Cond: vmCond[in.Op]}
+			return jit.VInsn{Op: jit.VCmpJump, A: in.P1, B: in.P3, T: in.P2, Cond: vmCond[in.Op], Imm: null}
 		}
 		// ...and in the store form, the same two integers give 0 or 1 in r[P2]
 		// (deliverCompare).
 		if in.P5&p5StoreP2 != 0 && ok(in.P1, in.P3, in.P2) {
-			return jit.VInsn{Op: jit.VCmpSet, A: in.P1, B: in.P3, C: in.P2, Cond: vmCond[in.Op]}
+			return jit.VInsn{Op: jit.VCmpSet, A: in.P1, B: in.P3, C: in.P2, Cond: vmCond[in.Op], Imm: null}
 		}
 	case OpFunction:
 		// substr(x, y, z) of a TEXT whose bytes to y-1+z are ASCII and none NUL
@@ -1622,6 +1631,13 @@ func (jx *vmJIT) copies(m *vdbe, pc int) int {
 type jitSnap struct {
 	row []Value
 	hdr [1][]Value
+	// segPtrs is a list over several segments as segMode hands it over: each
+	// row's VSeg (jit.VCursor.Segs), the columns all of them read in segsMask,
+	// worked out for the list segsCur's seek segsGen made.
+	segPtrs  []unsafe.Pointer
+	segsMask uint64
+	segsCur  *vdbeCursor
+	segsGen  uint64
 	// segLive is whether this entry handed the cursor over in segment mode
 	// (vmJIT.segMode), at row segEntry of its segment.
 	segLive  bool
@@ -1877,6 +1893,9 @@ func resetVCursor(jc *jit.VCursor) {
 	if jc.Idx != nil {
 		jc.Idx = nil
 	}
+	if jc.Segs != nil {
+		jc.Segs = nil
+	}
 	jc.N, jc.Pos, jc.Last, jc.Ok, jc.Dirty, jc.Rewind, jc.Adv, jc.Mask, jc.Reopen, jc.State = 0, 0, -1, 0, 0, 0, 0, 0, 0, 0
 	jc.Key, jc.Served = 0, 0
 }
@@ -1894,10 +1913,17 @@ func (jx *vmJIT) segModeOK(c int, cur *vdbeCursor) bool {
 	case src == nil || s == nil:
 		return false
 	case src.list:
-		// A list in one segment, on its current entry: walked through its rows
-		// (jit.VCursor.Sel).
+		// A list on its current entry: walked through its rows
+		// (jit.VCursor.Sel), in one segment, or over several when a sorted
+		// seek's (each row's segment in jit.VCursor.Segs).
 		k := src.listPos - 1
-		return s == src.listOne && k >= 0 && k < len(src.listRows) && cur.segRow == src.listRows[k]
+		if k < 0 || k >= len(src.listRows) || cur.segRow != src.listRows[k] {
+			return false
+		}
+		if src.listOne == nil {
+			return jx.idxSpecs != nil && jx.idxSpecs[c] != nil && jx.idxSpecs[c].sorted != nil && k < len(src.listSegs) && src.listSegs[k] == s
+		}
+		return s == src.listOne
 	case src.point:
 		return s == src.pointSeg && cur.segRow == src.pointRow
 	}
@@ -1920,6 +1946,13 @@ func (jx *vmJIT) segMode(c int, cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) b
 		jc.Reopen, jc.State = 0, 0
 		if seg := unsafe.Pointer(&v.seg); jc.Seg != seg {
 			jc.Seg = seg
+		}
+		var segs unsafe.Pointer
+		if src.listOne == nil {
+			segs, jc.Mask = sn.listSegs(cur, src, jx.segNeed[c])
+		}
+		if jc.Segs != segs {
+			jc.Segs = segs
 		}
 		if rids := v.seg.Rowids; jc.Rowids != rids {
 			jc.Rowids = rids
@@ -1950,6 +1983,9 @@ func (jx *vmJIT) segMode(c int, cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) b
 	jc.Reopen, jc.State = 0, 0
 	if seg := unsafe.Pointer(&v.seg); jc.Seg != seg {
 		jc.Seg = seg
+	}
+	if jc.Segs != nil {
+		jc.Segs = nil
 	}
 	if rids := v.seg.Rowids; jc.Rowids != rids {
 		jc.Rowids = rids
@@ -2087,6 +2123,26 @@ func (t *vmTab) seekSync(cur *vdbeCursor, jc *jit.VCursor) {
 
 // segSync brings a cursor segMode handed over up to date with the rows native
 // code moved it over, as advance() would have left it.
+// listSegs is the VSeg of each row of cur's list src, which spans segments,
+// and the columns every one of them reads, kept while the list is the one
+// cur's seek made.
+func (sn *jitSnap) listSegs(cur *vdbeCursor, src *segRowSource, need uint64) (unsafe.Pointer, uint64) {
+	if sn.segsCur != cur || sn.segsGen != cur.seekGen || len(sn.segPtrs) != len(src.listSegs) {
+		sn.segPtrs, sn.segsMask = sn.segPtrs[:0], ^uint64(0)
+		var last *segment
+		var v *vmSeg
+		for _, sg := range src.listSegs {
+			if sg != last {
+				last, v = sg, sg.vmSegFor(cur.segSrcCols, need)
+				sn.segsMask &= v.mask
+			}
+			sn.segPtrs = append(sn.segPtrs, unsafe.Pointer(&v.seg))
+		}
+		sn.segsCur, sn.segsGen = cur, cur.seekGen
+	}
+	return unsafe.Pointer(unsafe.SliceData(sn.segPtrs)), sn.segsMask
+}
+
 func segSync(cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) {
 	sn.segLive = false
 	if jc.Dirty == 0 {
@@ -2098,6 +2154,9 @@ func segSync(cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) {
 		case src.list:
 			// Last is a position in the list, which names the row.
 			cur.segRow, src.listPos = src.listRows[jc.Last], int(jc.Last)+1
+			if src.listOne == nil {
+				cur.segCur = src.listSegs[jc.Last]
+			}
 		default:
 			cur.segRow = int(jc.Last)
 			if !src.point {
@@ -2333,7 +2392,7 @@ func (jx *vmJIT) handCursor(m *vdbe, pc, c int) {
 		// cursor while that still stands.
 		if t := jx.openedTab(m, c); t != nil {
 			jc.Tab = unsafe.Pointer(&t.tab)
-			if x := jx.idxFor(c, t); x != nil {
+			if x := jx.idxFor(c, t, m.encoding()); x != nil {
 				jc.Idx = unsafe.Pointer(&x.vidx[0])
 			}
 		}
@@ -2346,7 +2405,7 @@ func (jx *vmJIT) handCursor(m *vdbe, pc, c int) {
 	if t := jx.tabFor(c, cur); t != nil {
 		jc.Tab = unsafe.Pointer(&t.tab)
 		if spec := jx.idxSpecs; spec != nil && spec[c] != nil && (spec[c].sorted == nil || jx.sortedSeekServed(m, cur, spec[c])) {
-			if x := jx.idxFor(c, t); x != nil {
+			if x := jx.idxFor(c, t, m.encoding()); x != nil {
 				jc.Idx = unsafe.Pointer(&x.vidx[0])
 			}
 		}

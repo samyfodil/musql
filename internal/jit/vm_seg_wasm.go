@@ -122,6 +122,17 @@ func (e *vmEmitWasm) segColumn(pc int, in VInsn) {
 	e.cursorField(in.A, VCursorOffSeg)
 	w.op(opI32WrapI64)
 	w.Set(e.rowp)
+	// Several segments' run: the row's own VSeg (VCursor.Segs).
+	e.cursorField(in.A, VCursorOffSegs)
+	w.op(opI32WrapI64)
+	w.Set(e.sk1)
+	w.Get(e.sk1)
+	w.op(opIf, opVoid)
+	e.index(e.sk1, e.t1, 8)
+	w.LoadI64(0)
+	w.op(opI32WrapI64)
+	w.Set(e.rowp)
+	w.op(opEnd)
 	e.cursorField(in.A, VCursorOffSel)
 	w.op(opI32WrapI64)
 	w.Set(e.sk1)
@@ -370,6 +381,10 @@ func (e *vmEmitWasm) segRowid(pc int, in VInsn) {
 	e.cursorField(in.A, VCursorOffN)
 	w.op(opI64GeU) // unsigned: a position before the first row is huge
 	e.exitIf(pc)
+	e.cursorField(in.A, VCursorOffSegs) // a row of several segments' run
+	w.op(opI64Eqz)
+	w.op(opI32Eqz)
+	e.exitIf(pc)
 	e.cursorField(in.A, VCursorOffSel)
 	w.op(opI32WrapI64)
 	w.Set(e.sk1)
@@ -482,6 +497,7 @@ func (e *vmEmitWasm) seekMiss(a int) {
 	e.setCursorField(a, VCursorOffKey, func() { e.w.Get(e.t1) })
 	e.setCursorImm(a, VCursorOffN, 0)
 	e.setCursorImm(a, VCursorOffPos, 0)
+	e.setCursorImm(a, VCursorOffSegs, 0)
 	e.setCursorImm(a, VCursorOffOk, 1)
 	e.setCursorImm(a, VCursorOffDirty, 1)
 	e.setCursorImm(a, VCursorOffState, 3)
@@ -580,6 +596,7 @@ func (e *vmEmitWasm) seekRowid(pc int, in VInsn) {
 	e.setCursorField(in.A, VCursorOffRids, func() { w.Get(e.sk2); w.LoadI64(VSegOffRowids) })
 	e.setCursorField(in.A, VCursorOffMask, func() { w.Get(e.sk1); w.LoadI64(VTabSegOffMask) })
 	e.setCursorImm(in.A, VCursorOffSel, 0)
+	e.setCursorImm(in.A, VCursorOffSegs, 0)
 	e.setCursorField(in.A, VCursorOffPos, func() { w.Get(e.t3) })
 	e.setCursorField(in.A, VCursorOffLast, func() { w.Get(e.t3) })
 	e.setCursorField(in.A, VCursorOffN, func() { w.Get(e.t3); w.I64(1); w.op(opI64Add) })
@@ -699,6 +716,20 @@ func (e *vmEmitWasm) seekIdx(pc int, in VInsn) {
 		w.op(opI64Shl)
 		w.op(opI64Add)
 	})
+	e.setCursorField(in.A, VCursorOffSegs, func() {
+		w.Get(e.sk1)
+		w.LoadI64(VIdxOffSegs)
+		w.Get(e.t2)
+		w.I64(3)
+		w.op(opI64Shl)
+		w.op(opI64Add)
+		w.I64(0)
+		w.Get(e.sk1)
+		w.LoadI64(VIdxOffSegs)
+		w.op(opI64Eqz)
+		w.op(opI32Eqz)
+		w.op(opSelect)
+	})
 	e.setCursorField(in.A, VCursorOffSeg, func() { w.Get(e.sk1); w.LoadI64(VIdxOffSeg) })
 	e.setCursorField(in.A, VCursorOffRids, func() {
 		e.ptrAt(e.sk1, VIdxOffSeg)
@@ -749,7 +780,7 @@ func (e *vmEmitWasm) nullRow(pc int, in VInsn) {
 	for _, f := range []struct {
 		off uint32
 		v   int64
-	}{{VCursorOffSel, 0}, {VCursorOffRids, 0}, {VCursorOffN, 1}, {VCursorOffPos, 0}, {VCursorOffLast, 0}, {VCursorOffOk, 1},
+	}{{VCursorOffSel, 0}, {VCursorOffSegs, 0}, {VCursorOffRids, 0}, {VCursorOffN, 1}, {VCursorOffPos, 0}, {VCursorOffLast, 0}, {VCursorOffOk, 1},
 		{VCursorOffDirty, 1}, {VCursorOffAdv, 0}, {VCursorOffRew, 0}, {VCursorOffMask, -1}, {VCursorOffState, 6}} {
 		e.setCursorImm(in.A, f.off, f.v)
 	}

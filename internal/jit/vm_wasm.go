@@ -289,6 +289,96 @@ func (e *vmEmitWasm) isInt(reg int) guard {
 	return notInt(reg)
 }
 
+// nullCmp is vm_amd64.go's: a comparison that answers a NULL operand.
+func (e *vmEmitWasm) nullCmp(pc int, in VInsn) {
+	w, L := e.w, e.lay
+	store := in.Op != VCmpJump && !in.Dead
+	knownA, knownB := e.know.isInt.has(in.A), e.know.isInt.has(in.B)
+	if store {
+		e.guards(pc, e.dstNoS(in, in.C))
+	}
+	zs := e.zeroS.has(in.C)
+	nulls := e.nullOperand(in)
+	if nulls {
+		if store {
+			for _, f := range []struct {
+				off int
+				v   int64
+			}{{0, int64(L.TypNull)}, {L.OffI, 0}, {L.OffF, 0}} {
+				w.Get(e.regs)
+				w.I64(f.v)
+				w.StoreI64(e.addr(in.C, f.off))
+			}
+			e.clearS(in.C)
+			if zs {
+				e.zeroS.add(in.C)
+			}
+		}
+		if in.Op == VCmpJump && in.Imm == 2 || in.Op == VCmpBr && in.Imm&VCmpNullJumps != 0 {
+			e.jump(in.T)
+		}
+		w.op(opElse)
+	}
+	e.guards(pc, e.isInt(in.B), e.isInt(in.A))
+	e.loadI64(in.B, L.OffI)
+	e.loadI64(in.A, L.OffI)
+	w.op(scalarCmp(in.Cond))
+	if in.Op == VCmpJump {
+		e.jumpIf(in.T)
+	} else {
+		w.op(opI64ExtendI32U)
+		w.Set(e.t1)
+		e.storeInt(in, in.C, e.t1)
+		if in.Op == VCmpBr {
+			w.Get(e.t1)
+			w.op(opI64Eqz)
+			if in.Imm&1 != 0 {
+				w.op(opI32Eqz) // jump when 1
+			}
+			e.jumpIf(in.T)
+		}
+	}
+	if nulls {
+		e.closeIf()
+	}
+	if !knownA {
+		e.know.isInt.del(in.A)
+	}
+	if !knownB {
+		e.know.isInt.del(in.B)
+	}
+	if store {
+		e.know.wroteAny(in.C, true)
+	}
+}
+
+// nullOperand opens an if on either operand of a comparison that answers a
+// NULL natively (Imm) being NULL, reporting whether it did: an operand known
+// to be an INTEGER is not.
+func (e *vmEmitWasm) nullOperand(in VInsn) bool {
+	if in.Imm == 0 {
+		return false
+	}
+	k := 0
+	for _, r := range []int{in.A, in.B} {
+		if e.know.isInt.has(r) {
+			continue
+		}
+		e.loadTyp(r)
+		e.w.I32(int32(e.lay.TypNull))
+		e.w.op(opI32Eq)
+		if k > 0 {
+			e.w.op(opI32Or)
+		}
+		k++
+	}
+	if k == 0 {
+		return false
+	}
+	e.openIf()
+	return true
+}
+
 func (e *vmEmitWasm) noS(reg int) guard {
 	if e.know.noS.has(reg) {
 		return nil
@@ -571,12 +661,20 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		w.Set(e.t1)
 		e.storeInt(in, in.C, e.t1)
 	case VCmpJump:
+		if in.Imm != 0 {
+			e.nullCmp(pc, in)
+			break
+		}
 		e.guards(pc, e.isInt(in.B), e.isInt(in.A))
 		e.loadI64(in.B, L.OffI)
 		e.loadI64(in.A, L.OffI)
 		w.op(scalarCmp(in.Cond))
 		e.jumpIf(in.T)
 	case VCmpSet, VCmpBr:
+		if in.Op == VCmpSet && in.Imm != 0 || in.Op == VCmpBr && in.Imm&VCmpNull != 0 {
+			e.nullCmp(pc, in)
+			break
+		}
 		e.guards(pc, e.isInt(in.B), e.isInt(in.A), e.dstNoS(in, in.C))
 		e.loadI64(in.B, L.OffI)
 		e.loadI64(in.A, L.OffI)
@@ -587,7 +685,7 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		if in.Op == VCmpBr {
 			w.Get(e.t1)
 			w.op(opI64Eqz)
-			if in.Imm != 0 {
+			if in.Imm&1 != 0 {
 				w.op(opI32Eqz) // jump when 1
 			}
 			e.jumpIf(in.T)

@@ -916,15 +916,24 @@ func sweepOrderCursor(cur *vdbeCursor, key *autoIndexKey, enc TextEncoding) bool
 // their columns' collating sequences. Keys that are all integers or NULLs
 // are copied out flat and compared as int64s, a NULL before every integer.
 func autoIndexSortValues(perm []int, key *autoIndexKey, at func(i, k int) Value, enc TextEncoding, stop *sortStop) {
-	if autoIndexSortInts(perm, key, at, stop) {
+	if autoIndexSortInts(perm, key, at, stop) || autoIndexSortNums(perm, key, at, stop) {
 		return
+	}
+	// Each key read once: at may be dear (a segment join's table finds a
+	// row's segment on every call), and the sort would call it n log n times.
+	nk := len(key.cols)
+	vals := make([]Value, len(perm)*nk)
+	for i := range perm {
+		for k := range nk {
+			vals[i*nk+k] = at(i, k)
+		}
 	}
 	slices.SortFunc(perm, func(a, b int) int {
 		if stop.now() {
 			return 0
 		}
 		for k := range key.cols {
-			c := compareValuesCollatedEnc(at(a, k), at(b, k), key.colls[k], enc)
+			c := compareValuesCollatedEnc(vals[a*nk+k], vals[b*nk+k], key.colls[k], enc)
 			if c != 0 {
 				if k < len(key.desc) && key.desc[k] {
 					// A DESC key column: the b-tree stores it reversed, so the
@@ -976,6 +985,63 @@ func autoIndexSortInts(perm []int, key *autoIndexKey, at func(i, k int) Value, s
 				c = 1
 			default:
 				c = cmp.Compare(flat[ia], flat[ib])
+			}
+			if c != 0 {
+				if k < len(key.desc) && key.desc[k] {
+					return -c // as autoIndexSortValues explains
+				}
+				return c
+			}
+		}
+		return a - b
+	})
+	return true
+}
+
+// autoIndexSortNums is autoIndexSortInts over keys every row holds as an
+// INTEGER, a REAL or a NULL, which compareValuesCollatedEnc orders a NULL
+// first and the numbers by compareNumeric.
+func autoIndexSortNums(perm []int, key *autoIndexKey, at func(i, k int) Value, stop *sortStop) bool {
+	nk := len(key.cols)
+	n := len(perm)
+	bits := make([]int64, n*nk)
+	typs := make([]ValueType, n*nk)
+	for i := range n {
+		for k := range nk {
+			v := at(i, k)
+			switch v.Typ {
+			case Int:
+				bits[i*nk+k] = v.I
+			case Float:
+				bits[i*nk+k] = int64(math.Float64bits(v.F))
+			case Null:
+			default:
+				return false
+			}
+			typs[i*nk+k] = v.Typ
+		}
+	}
+	num := func(j int) Value {
+		if typs[j] == Float {
+			return Value{Typ: Float, F: math.Float64frombits(uint64(bits[j]))}
+		}
+		return Value{Typ: Int, I: bits[j]}
+	}
+	slices.SortFunc(perm, func(a, b int) int {
+		if stop.now() {
+			return 0
+		}
+		for k := range nk {
+			ia, ib := a*nk+k, b*nk+k
+			c := 0
+			switch na, nb := typs[ia] == Null, typs[ib] == Null; {
+			case na && nb:
+			case na:
+				c = -1
+			case nb:
+				c = 1
+			default:
+				c = compareNumeric(num(ia), num(ib))
 			}
 			if c != 0 {
 				if k < len(key.desc) && key.desc[k] {

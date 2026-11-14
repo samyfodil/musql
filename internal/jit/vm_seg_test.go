@@ -282,6 +282,43 @@ func TestVMSeekIdxFallThrough(t *testing.T) {
 	}
 }
 
+// TestVMSeekIdxSegs seeks one index over two segments (VIdx.Segs): a run
+// reads each row from its own segment, and VRowid on it exits.
+func TestVMSeekIdxSegs(t *testing.T) {
+	if !Available || !VMSegCursor {
+		t.Skip("no segment cursors on this platform")
+	}
+	noGC(t)
+	vals0, vals1 := []uint64{100, 101, 102}, []uint64{200, 201}
+	cols0 := []VSegCol{{Kind: VSegInt, Block: unsafe.Pointer(&vals0[0]), Plain: VSegInt}}
+	cols1 := []VSegCol{{Kind: VSegInt, Block: unsafe.Pointer(&vals1[0]), Plain: VSegInt}}
+	seg0 := &VSeg{Cols: unsafe.Pointer(&cols0[0]), First: 1, Dense: 1}
+	seg1 := &VSeg{Cols: unsafe.Pointer(&cols1[0]), First: 4, Dense: 1}
+	// Key 5's rows: seg0 row 2, seg1 row 0, seg0 row 0; key 9's: seg1 row 1.
+	iv, st, rw := []int64{5, 9}, []int32{0, 3, 4}, []int{2, 0, 0, 1}
+	segs := []unsafe.Pointer{unsafe.Pointer(seg0), unsafe.Pointer(seg1), unsafe.Pointer(seg0), unsafe.Pointer(seg1)}
+	ix := []VIdx{{Vals: unsafe.Pointer(&iv[0]), NVals: 2, Starts: unsafe.Pointer(&st[0]), Rows: unsafe.Pointer(&rw[0]), Seg: unsafe.Pointer(seg0),
+		Mask: 1, Count: 1, Lo: 5, Hi: 9, Segs: unsafe.Pointer(&segs[0])}}
+	for _, predicted := range []int{0, VSegInt} {
+		prog := []VInsn{
+			{Op: VSeekIdx, A: 0, B: 0, T: 6},
+			{Op: VSeekRewind, A: 0},
+			{Op: VColumn, A: 0, B: 0, C: 1, Imm: 1, T: predicted},
+			{Op: VAdd, A: 1, B: 2, C: 2},
+			{Op: VNext, A: 0, T: 2},
+			{Op: VRowid, A: 0, C: 3},
+			{Op: VExit},
+		}
+		for _, c := range []struct{ key, sum int64 }{{5, 102 + 200 + 100}, {9, 201}} {
+			regs := []tvalue{{Typ: tvInt, I: c.key}, {Typ: tvInt}, {Typ: tvInt, I: 0}, {Typ: tvInt}}
+			cur := &VCursor{Last: -1, Idx: unsafe.Pointer(&ix[0])}
+			if pc := runVMCursor(t, prog, regs, nil, cur, 0); pc != 5 || regs[2].I != c.sum || cur.Segs == nil {
+				t.Fatalf("predicted %d key %d: pc %d sum %d, want 5 %d", predicted, c.key, pc, regs[2].I, c.sum)
+			}
+		}
+	}
+}
+
 // TestVMNullRow puts a seek cursor on its NULL row: its columns read NULL
 // natively, a predicted read too, and VRowid exits; a seek after it takes
 // the cursor back onto rows.

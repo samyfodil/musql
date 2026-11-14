@@ -556,6 +556,79 @@ func (e *vmEmit) src(pc, r int, scratch Reg) Reg {
 	return scratch
 }
 
+// nullCmp is a comparison that answers a NULL operand natively (VCmpJump
+// and VCmpSet with Imm, VCmpBr with VCmpNull): a NULL stores NULL and falls
+// through or jumps as the VDBE's compareOp does. Past it neither operand, if
+// not known before, nor the result is known an INTEGER, and none is kept in
+// a register: the NULL path made none of them so.
+func (e *vmEmit) nullCmp(pc int, in VInsn) {
+	a, L := e.a, e.lay
+	store := in.Op != VCmpJump && !in.Dead
+	knownA, knownB := e.know.isInt.has(in.A), e.know.isInt.has(in.B)
+	if store {
+		e.destNoS(pc, in.C)
+	}
+	zs := e.zeroS.has(in.C)
+	null, done := e.vmLabel(), e.vmLabel()
+	for _, r := range []int{in.A, in.B} {
+		if !e.know.isInt.has(r) {
+			a.CmpMemDByte(RSI, e.d(r, L.OffTyp), L.TypNull)
+			a.JccL(CondE, null)
+		}
+	}
+	x := e.src(pc, in.B, RAX)
+	y := e.src(pc, in.A, RDX)
+	if store {
+		a.MovRegImm64(R10, 0) // before the compare: a xor would clear the flags after it
+	}
+	a.CmpRegReg(x, y)
+	if store {
+		a.Setcc(in.Cond, R10)
+		e.storeInt(pc, in, in.C, R10) // MOVs leave the flags alone
+	}
+	switch in.Op {
+	case VCmpJump:
+		e.jccBlock(in.Cond, pc, in.T)
+	case VCmpBr:
+		c := in.Cond
+		if in.Imm&1 == 0 {
+			c = c.Negate()
+		}
+		e.jccBlock(c, pc, in.T)
+	}
+	a.JmpL(done)
+	a.Bind(null)
+	if store {
+		a.MovMemDImm(RSI, e.d(in.C, 0), int32(L.TypNull))
+		a.MovMemDImm(RSI, e.d(in.C, L.OffI), 0)
+		a.MovMemDImm(RSI, e.d(in.C, L.OffF), 0)
+		if zs {
+			e.zeroS.add(in.C)
+		}
+		e.clearS(in.C)
+	}
+	if in.Op == VCmpJump && in.Imm == 2 || in.Op == VCmpBr && in.Imm&VCmpNullJumps != 0 {
+		e.jmpBlock(pc, in.T)
+	}
+	a.Bind(done)
+	e.unmap(in.A)
+	e.unmap(in.B)
+	if !knownA {
+		e.know.isInt.del(in.A)
+	}
+	if !knownB {
+		e.know.isInt.del(in.B)
+	}
+	if in.Op != VCmpJump {
+		if in.Dead {
+			e.clobber(in.C)
+		} else {
+			e.unmap(in.C)
+			e.know.wroteAny(in.C, true)
+		}
+	}
+}
+
 // needNoS exits at pc unless r[r] holds no string or blob, unless known.
 func (e *vmEmit) needNoS(pc, r int) {
 	if !e.know.noS.has(r) {
@@ -778,11 +851,19 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		}
 		e.storeInt(pc, in, in.C, res)
 	case VCmpJump:
+		if in.Imm != 0 {
+			e.nullCmp(pc, in)
+			break
+		}
 		x := e.src(pc, in.B, RAX)
 		y := e.src(pc, in.A, RDX)
 		a.CmpRegReg(x, y)
 		e.jccBlock(in.Cond, pc, in.T)
 	case VCmpSet, VCmpBr:
+		if in.Op == VCmpSet && in.Imm != 0 || in.Op == VCmpBr && in.Imm&VCmpNull != 0 {
+			e.nullCmp(pc, in)
+			break
+		}
 		x := e.src(pc, in.B, RAX)
 		y := e.src(pc, in.A, RDX)
 		if !in.Dead {
@@ -802,7 +883,7 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		}
 		if in.Op == VCmpBr {
 			c := in.Cond
-			if in.Imm == 0 {
+			if in.Imm&1 == 0 {
 				c = c.Negate()
 			}
 			e.jccBlock(c, pc, in.T)
@@ -976,6 +1057,9 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		a.MovRegMemD(R9, RAX, cb+VCursorOffPos)
 		a.AluRegMemD(AluCmp, R9, RAX, cb+VCursorOffN)
 		e.jccStub(condAboveEq, pc) // unsigned: a position before the first row is huge
+		// A row of several segments' run (VCursor.Segs) is the VDBE's.
+		a.CmpMemDImm8(RAX, cb+VCursorOffSegs, 0)
+		e.jccStub(CondNE, pc)
 		// A selection's position names its segment row (VCursor.Sel).
 		a.MovRegMemD(RDX, RAX, cb+VCursorOffSel)
 		a.TestRegReg(RDX, RDX)
