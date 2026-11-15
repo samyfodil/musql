@@ -80,6 +80,7 @@ func openSyncer(ctx context.Context, path string, opts ...Option) (*Syncer, *sql
 		return fail(err)
 	}
 	s.mode, s.writer, s.quorum = cfg.mode, cfg.writer, cfg.quorum
+	s.store.changes = cfg.changes
 	if err := s.store.recordMode(ctx, cfg.mode); err != nil {
 		s.Close()
 		return nil, nil, err
@@ -165,6 +166,7 @@ type config struct {
 	interval   time.Duration
 	transport  func(ctx context.Context, s *Syncer) (Transport, error)
 	maxSize    int64
+	changes    Changes
 }
 
 // WithSite sets this node's site id instead of the one Open generates and
