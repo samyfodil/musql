@@ -494,6 +494,12 @@ func (p *ReadOnlyPager) resolveDerivedRows(sub *SelectStmt, params []Value) ([]c
 	if err != nil {
 		return nil, nil, err
 	}
+	return p.finishDerivedRows(sub, subCols, subRows)
+}
+
+// finishDerivedRows is resolveDerivedRows past the run: the column metadata
+// of sub's result, and the rows checked against it.
+func (p *ReadOnlyPager) finishDerivedRows(sub *SelectStmt, subCols []string, subRows [][]Value) ([]columnInfo, [][]Value, error) {
 	// derivedColumnInfos re-derives each output column's origin from the AST,
 	// so it must run inside the subquery's OWN WITH -- selectExpander binds a
 	// result expression to its source exactly once, and it does so between

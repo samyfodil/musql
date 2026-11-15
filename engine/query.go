@@ -565,6 +565,10 @@ func (p *ReadOnlyPager) cachePlan(sqlText string, prog *Program) {
 	if sqlText == "" || prog == nil || p.runFold {
 		return
 	}
+	if sqlText == cteBodyKey {
+		p.bodyCaught = prog
+		return
+	}
 	m := p.planCacheFor()
 	if _, ok := m[sqlText]; !ok && len(m) >= planCacheMax {
 		return
@@ -617,7 +621,7 @@ func (p *ReadOnlyPager) execNoFromKeyed(stmt *SelectStmt, outer *evalCtx, params
 		// buried the real diagnosis and put text in front of it that real
 		// SQLite has no counterpart for. See subquery_validate.go.
 		if errors.Is(verr, errVDBESemantic) || isAmbiguousNameErr(verr) {
-		return nil, nil, verr
+			return nil, nil, verr
 		}
 		if verr != nil {
 			return nil, nil, fmt.Errorf("engine: VDBE-only: FROM-less aggregate statement not compilable to bytecode: %w (no fallback)", verr)
@@ -641,7 +645,7 @@ func (p *ReadOnlyPager) execNoFromKeyed(stmt *SelectStmt, outer *evalCtx, params
 	// buried the real diagnosis and put text in front of it that real
 	// SQLite has no counterpart for. See subquery_validate.go.
 	if errors.Is(verr, errVDBESemantic) || isAmbiguousNameErr(verr) {
-	return nil, nil, verr
+		return nil, nil, verr
 	}
 	if verr != nil {
 		return nil, nil, fmt.Errorf("engine: VDBE-only: FROM-less statement not compilable to bytecode: %w (no fallback)", verr)
@@ -963,7 +967,6 @@ func exprTreeMentionsColumn(e Expr, colName string) bool {
 	}
 }
 
-
 // schemaCatalogQueryGuard declines a statement referencing sqlite_master /
 // sqlite_schema that this engine cannot answer as C does. One rule remains: any
 // reference while the schema holds a virtual table from a module with a private
@@ -1227,7 +1230,7 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 		// buried the real diagnosis and put text in front of it that real
 		// SQLite has no counterpart for. See subquery_validate.go.
 		if errors.Is(verr, errVDBESemantic) || isAmbiguousNameErr(verr) {
-		return nil, nil, verr
+			return nil, nil, verr
 		}
 		if verr != nil {
 			return nil, nil, fmt.Errorf("engine: VDBE-only: compound SELECT not compilable to bytecode (no fallback): %w", verr)
@@ -1297,7 +1300,7 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 	// buried the real diagnosis and put text in front of it that real
 	// SQLite has no counterpart for. See subquery_validate.go.
 	if errors.Is(verr, errVDBESemantic) || isAmbiguousNameErr(verr) {
-	return nil, nil, verr
+		return nil, nil, verr
 	}
 	if verr != nil {
 		return nil, nil, fmt.Errorf("engine: VDBE-only: %w (no fallback)", verr)

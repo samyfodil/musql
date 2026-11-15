@@ -194,7 +194,7 @@ type ReadOnlyPager struct {
 	// CREATE-statement reparse that otherwise dominates a point lookup, and it
 	// also collapses the several Schema() scans a single query already does
 	// (resolveTable, checkIndexExists, view/fts lookups) into one.
-	schemaRows     []SchemaRow
+	schemaRows []SchemaRow
 	// schemaFP memoises schemaRows' fingerprint for this pager's lifetime; 0 means
 	// not computed yet. See ReadOnlyPager.schemaFingerprint.
 	schemaFP uint64
@@ -235,6 +235,9 @@ type ReadOnlyPager struct {
 	//	// are supplied at run time), and a run only reads the Program. Bounded by
 	//	// planCacheMax entries.
 	planCache map[string]*Program
+	// bodyCaught is the program execSelect compiled for a CTE body under
+	// cteBodyKey (resolveCTEBodyRows).
+	bodyCaught *Program
 
 	// sharedPlans is the SESSION's plan cache, when a session stamped this pager.
 	// It outlives the pager, which is the whole point: a held connection builds a

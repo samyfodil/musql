@@ -22,6 +22,7 @@ package engine
 
 import (
 	"fmt"
+	"sync/atomic"
 )
 
 // CTEMaterialization is one CTE's "AS [NOT] MATERIALIZED" hint -- SQLite's
@@ -44,6 +45,12 @@ const (
 // for every FROM-item reference to it for as long as that frame stays on
 // ReadOnlyPager.cteScopes.
 type cteBinding struct {
+	// body is the compiled body a run of the statement holding this binding
+	// left for the next run (resolveCTERows); a binding lives exactly as long
+	// as that statement's Program, which is reused only while the schema and
+	// settings it was compiled under hold.
+	body atomic.Pointer[Program]
+
 	name     string
 	colNames []string // explicit "(col, ...)" rename list; nil if none was given
 	core     *SelectStmt
@@ -339,12 +346,68 @@ func (p *ReadOnlyPager) resolveCTERows(name string, b *cteBinding, params []Valu
 	// Resolve the body in the scope where it was DEFINED (see
 	// cteBinding.scopeDepth): frames pushed since then are invisible to it.
 	defer p.enterCTEBodyScope(name, b)()
-	cols, rows, err := p.resolveDerivedRows(b.core, params)
+	var cols []columnInfo
+	var rows [][]Value
+	var err error
+	if p.cteBodyCacheable() {
+		cols, rows, err = p.resolveCTEBodyRows(b, params)
+	} else {
+		cols, rows, err = p.resolveDerivedRows(b.core, params)
+	}
 	p.cteExpansion = p.cteExpansion[:len(p.cteExpansion)-1]
 	if err != nil {
 		return nil, nil, err
 	}
 	return applyCTEColNames(name, b.colNames, cols, rows)
+}
+
+// cteBodyCacheable reports whether a CTE body run here may reuse, and leave,
+// a compiled body: not in a columns-only or schema-only resolve, and not with
+// a database attached, whose per-statement state a program cannot see (as
+// planCacheFor).
+func (p *ReadOnlyPager) cteBodyCacheable() bool {
+	return !p.fromColumnsOnly && !p.derivedSchemaOnly && len(p.attachedReaders) == 0
+}
+
+// cteBodyKey is the plan-cache key execSelect is handed for a CTE body:
+// cachePlan keeps the program it is given under it in p.bodyCaught, rather
+// than in the plan cache, for resolveCTEBodyRows to put on the binding.
+const cteBodyKey = "\x00cte body"
+
+// cteBodyReuses counts the runs of a CTE body that reused a compiled one, for
+// tests.
+var cteBodyReuses atomic.Int64
+
+// resolveCTEBodyRows is resolveDerivedRows for b's body, running the program
+// an earlier run left on b instead of compiling the body again, and leaving
+// this run's for the next. A compile that folded a run-time value
+// (p.runFold) is not cached, as cachePlan does not cache it.
+func (p *ReadOnlyPager) resolveCTEBodyRows(b *cteBinding, params []Value) ([]columnInfo, [][]Value, error) {
+	sub := b.core
+	var subCols []string
+	var subRows [][]Value
+	if prog := b.body.Load(); prog != nil {
+		cteBodyReuses.Add(1)
+		rows, err := prog.execOuter(p, nil, params)
+		if err != nil {
+			return nil, nil, err
+		}
+		subCols, subRows = prog.ColNames, rows
+	} else {
+		saved := p.bodyCaught
+		p.bodyCaught = nil
+		cols, rows, err := p.execSelect(sub, nil, params, cteBodyKey)
+		caught := p.bodyCaught
+		p.bodyCaught = saved
+		if err != nil {
+			return nil, nil, err
+		}
+		if caught != nil {
+			b.body.CompareAndSwap(nil, caught)
+		}
+		subCols, subRows = cols, rows
+	}
+	return p.finishDerivedRows(sub, subCols, subRows)
 }
 
 // applyCTEColNames applies a CTE's explicit "(col, ...)" rename list (if
