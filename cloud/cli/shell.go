@@ -20,6 +20,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	v1 "github.com/samyfodil/musql/cloud/gen/cloud/v1"
+	"github.com/samyfodil/musql/cloud/internal/terminal"
 	"github.com/samyfodil/musql/engine"
 )
 
@@ -72,7 +73,7 @@ func (a *app) runShell(ctx context.Context, db *sql.DB, script []string, banner 
 	defer consoleVT(a.env.StdoutFd)()
 	keys := newKeyPump(a.env.Stdin)
 	sh.Interrupts = keys.watch
-	t := term.NewTerminal(struct {
+	t := terminal.NewTerminal(struct {
 		io.Reader
 		io.Writer
 	}{&keyReader{r: keys}, a.env.Stdout}, "")
@@ -86,7 +87,7 @@ func (a *app) runShell(ctx context.Context, db *sql.DB, script []string, banner 
 // it wraps what is typed at the width it was given, 80 columns unless told
 // (#101), and the window may have been resized since the last line.
 type sizedTerminal struct {
-	*term.Terminal
+	*terminal.Terminal
 	fd int
 }
 
