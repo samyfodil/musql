@@ -662,3 +662,25 @@ func copyFiles(t *testing.T, from, to, prefix string) {
 		}
 	}
 }
+
+// TestImageKeepsRowsHeldOut: a node that took an image puts a row the image
+// holds out back into its table once a local delete frees the UNIQUE value
+// it wants, as the other nodes do (#226).
+func TestImageKeepsRowsHeldOut(t *testing.T) {
+	lowImageMin(t)
+	c := newCluster(t)
+	c.open("a", imageDDL...)
+	c.open("b")
+	imageHistory(c)
+	c.open("c")
+	waitImage(t, c.dbs["c"])
+	c.converge("", imageRowsT, imageRowsK, imageRowsU, clockQ, heldQ)
+	if dump(t, c.dbs["c"], heldQ) == "" {
+		t.Fatal("c holds no row out; the test means less")
+	}
+	c.exec("c", `DELETE FROM u WHERE e = 'dup'`)
+	c.converge("", imageRowsU, heldQ)
+	if got := dump(t, c.dbs["c"], imageRowsU); got == "" {
+		t.Fatal("c did not put the held-out row back")
+	}
+}
