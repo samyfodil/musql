@@ -136,7 +136,7 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 		return nil, nil, err
 	}
 	jts := make([]joinedTable, len(items))
-	var flatCols []columnInfo
+	itemCols := make([][]columnInfo, 0, len(items))
 	offset := 0
 	var state joinDesugarState
 	for i, it := range items {
@@ -418,7 +418,7 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 		if err := installCoalesceFallback(jts, i, it.Join, fixedHidden); err != nil {
 			return nil, nil, err
 		}
-		flatCols = append(flatCols, tbl.cols...)
+		itemCols = append(itemCols, tbl.cols)
 		offset += len(tbl.cols)
 	}
 	// A group-starting item that acquired its OWN coalesceFallback from a
@@ -438,6 +438,12 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 	// comment (RIGHT/FULL section): the VDBE codegen (vdbe_join_codegen.go's
 	// emitJoinLoops/emitRightOuterSweep) handles any placement or count of
 	// RIGHT/FULL items in a flat FROM clause -- no narrower gate remains.
+	// One copy at its full size, rather than grown item by item: a FROM clause
+	// of wide tables is resolved many times over in one compile.
+	flatCols := make([]columnInfo, 0, offset)
+	for _, cols := range itemCols {
+		flatCols = append(flatCols, cols...)
+	}
 	return jts, flatCols, nil
 }
 
