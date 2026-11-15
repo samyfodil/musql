@@ -201,4 +201,6 @@ jobs:
       - run: go vet ./...
       - working-directory: hrana
         run: go vet ./... && go test ./... -count=1 -timeout 10m
+      - working-directory: replication/rpc
+        run: go vet ./... && go test ./... -race -count=1 -timeout 10m
       - run: go vet -tags sqlite_fts5 ./...

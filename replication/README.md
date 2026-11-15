@@ -13,7 +13,8 @@ Conflicts resolve per column by last-writer-wins on a hybrid logical clock. See
 ```go
 import "github.com/samyfodil/musql/replication"
 
-// newTransport builds your network's replication.Transport (examples/libp2p has one).
+// newTransport builds your network's replication.Transport (replication/rpc
+// has one over ConnectRPC, examples/libp2p one over libp2p).
 db, err := replication.Open(ctx, "app.musq", replication.CRDT(), replication.WithTransport(newTransport))
 if err != nil { ... }
 defer db.Close()
@@ -58,7 +59,10 @@ That is the whole setup:
   `replication.Retire(ctx, db, site)` stops waiting for it.
 
 The network is yours: `replication.WithTransport` takes any `Transport`, and
-this package pulls in none. `examples/libp2p` is a working one over libp2p.
+this package pulls in none. [`replication/rpc`](rpc/) is the wire format,
+generated from `proto/replication/v1`, and a `Transport` over ConnectRPC: a
+program supplies the list of peers and their URLs, mounts one handler, and
+opens each database with `n.Sync(name)`. `examples/libp2p` is one over libp2p.
 
 `Open` is the whole entry point. `Syncer.Attach` and `Node` remain for a
 caller that wires its own transport loop (`WithTransport` hands it the

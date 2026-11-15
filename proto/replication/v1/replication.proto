@@ -1,0 +1,177 @@
+syntax = "proto3";
+
+// The wire format of replication.Transport: what nodes replicating a database
+// send each other. Every request names the database it is for, so one
+// endpoint serves every database a process replicates.
+package replication.v1;
+
+// Cell is one column value of an op (replication.Cell).
+message Cell {
+  string col = 1;
+  // type is the value's storage class: replication.TypeNull to TypeBlob.
+  uint32 type = 2;
+  bytes val = 3;
+}
+
+// Op is one captured insert, update, delete or schema change
+// (replication.Op).
+message Op {
+  string site = 1;
+  uint64 seq = 2;
+  uint64 hlc = 3;
+  string tbl = 4;
+  bytes pk = 5;
+  uint32 kind = 6;
+  repeated Cell cells = 7;
+}
+
+// VVEntry is one site's entry in a version vector.
+message VVEntry {
+  string site = 1;
+  uint64 seq = 2;
+}
+
+// AckEntry is one site's ack: its version vector, stamped by its clock.
+message AckEntry {
+  string site = 1;
+  uint64 hlc = 2;
+  repeated VVEntry vv = 3;
+}
+
+// ClockCell is one cell's clock in a snapshot (replication.ClockCell).
+message ClockCell {
+  string tbl = 1;
+  bytes pk = 2;
+  string col = 3;
+  uint64 hlc = 4;
+  string site = 5;
+  bytes val = 6;
+}
+
+// RangeEntry is a rowid range's owner: its site, and the range's lo.
+message RangeEntry {
+  string site = 1;
+  uint64 lo = 2;
+}
+
+// SnapshotPage is one page of one part of a snapshot
+// (replication.SnapshotPage); next is empty after the part's last page.
+message SnapshotPage {
+  repeated Op ops = 1;
+  repeated VVEntry floors = 2;
+  repeated RangeEntry ranges = 3;
+  repeated ClockCell cells = 4;
+  bytes next = 5;
+}
+
+// ImageRequest is the formats a node can install (replication.ImageRequest).
+message ImageRequest {
+  string layout = 1;
+  uint32 file_version = 2;
+  uint32 min_file_version = 3;
+  uint32 delta_version = 4;
+}
+
+// ImageManifest describes the image that follows it
+// (replication.ImageManifest).
+message ImageManifest {
+  string site = 1;
+  uint32 file_version = 2;
+  uint32 delta_version = 3;
+  string layout = 4;
+  string catalog = 5;
+  // size is the image's length: a segment file, then delta_size bytes of its
+  // delta.
+  uint64 size = 6;
+  uint64 delta_size = 7;
+  // crc32c is the image's CRC-32C (Castagnoli).
+  uint32 crc32c = 8;
+  repeated VVEntry vv = 9;
+  repeated VVEntry floors = 10;
+  repeated RangeEntry ranges = 11;
+  uint64 max_hlc = 12;
+}
+
+// QuorumState is what a Leader-mode node's raft snapshot carries: the
+// Quorum's frontier (replication.Quorum.Frontier).
+message QuorumState {
+  repeated VVEntry frontier = 1;
+}
+
+message ExchangeVVRequest {
+  string database = 1;
+  repeated VVEntry vv = 2;
+}
+
+message ExchangeVVResponse {
+  repeated VVEntry vv = 1;
+}
+
+// GetOpsRequest asks for up to limit of site's ops after from_seq.
+message GetOpsRequest {
+  string database = 1;
+  string site = 2;
+  uint64 from_seq = 3;
+  uint32 limit = 4;
+}
+
+// GetOpsResponse is those ops, or pruned: the responder no longer holds them
+// (replication.ErrPruned), and a snapshot is needed.
+message GetOpsResponse {
+  repeated Op ops = 1;
+  bool pruned = 2;
+}
+
+message ExchangeAcksRequest {
+  string database = 1;
+  repeated AckEntry acks = 2;
+}
+
+message ExchangeAcksResponse {
+  repeated AckEntry acks = 1;
+}
+
+message GetSnapshotRequest {
+  string database = 1;
+  uint32 part = 2;
+  bytes cursor = 3;
+}
+
+message GetSnapshotResponse {
+  SnapshotPage page = 1;
+}
+
+// PushOpsRequest is ops a node committed, or took from a peer, sent on by
+// from.
+message PushOpsRequest {
+  string database = 1;
+  string from = 2;
+  repeated Op ops = 3;
+}
+
+message PushOpsResponse {}
+
+message GetImageRequest {
+  string database = 1;
+  ImageRequest request = 2;
+}
+
+// GetImageResponse is the image's manifest, or why the responder sends none,
+// and then the image's bytes in order.
+message GetImageResponse {
+  oneof msg {
+    ImageManifest manifest = 1;
+    string refused = 2;
+    bytes data = 3;
+  }
+}
+
+// ReplicationService is replication.Transport's calls, and Imager's.
+service ReplicationService {
+  rpc ExchangeVV(ExchangeVVRequest) returns (ExchangeVVResponse);
+  rpc GetOps(GetOpsRequest) returns (GetOpsResponse);
+  rpc ExchangeAcks(ExchangeAcksRequest) returns (ExchangeAcksResponse);
+  rpc GetSnapshot(GetSnapshotRequest) returns (GetSnapshotResponse);
+  rpc PushOps(PushOpsRequest) returns (PushOpsResponse);
+  rpc GetImage(GetImageRequest) returns (stream GetImageResponse);
+}

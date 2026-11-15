@@ -2,8 +2,9 @@ version: v2
 
 # Regenerate with `buf generate` from the repository root. Every file lands
 # under its go_package (module=): hrana/gen for proto/hrana, cloud/gen for
-# proto/cloud. The output root is the repository, so there is no `clean`;
-# delete a removed .proto's generated file by hand.
+# proto/cloud, replication/rpc/gen for proto/replication. The output root is
+# the repository, so there is no `clean`; delete a removed .proto's generated
+# file by hand.
 
 managed:
   enabled: true
@@ -13,6 +14,9 @@ managed:
     - file_option: go_package_prefix
       path: cloud
       value: github.com/samyfodil/musql/cloud/gen
+    - file_option: go_package_prefix
+      path: replication
+      value: github.com/samyfodil/musql/replication/rpc/gen
 
 plugins:
   - local: protoc-gen-go

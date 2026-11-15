@@ -304,7 +304,8 @@ func WithSyncInterval(d time.Duration) Option { return func(c *config) { c.inter
 // WithTransport syncs over the Transport fn builds. fn is called once, with a
 // context that db.Close cancels and the Syncer whose Store the transport serves
 // peers from; a Transport that is an io.Closer is closed by db.Close, after the
-// sync loop has stopped. examples/libp2p is one over libp2p.
+// sync loop has stopped. replication/rpc has one over ConnectRPC, and
+// examples/libp2p one over libp2p.
 func WithTransport(fn func(ctx context.Context, s *Syncer) (Transport, error)) Option {
 	return func(c *config) { c.transport = fn }
 }
