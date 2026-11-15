@@ -295,3 +295,53 @@ func TestSegJoinVolatileMatchesLoop(t *testing.T) {
 		}
 	}
 }
+
+// TestSegJoinGroupsGatherReadColumns holds the join kernel's GROUP BY to the
+// loop where the group's row is read from both tables -- bare columns, a
+// max() census picking the row they come from, and a HAVING over one -- so
+// every column the aggregate reads is gathered, at its table's offset.
+func TestSegJoinGroupsGatherReadColumns(t *testing.T) {
+	setup := []string{
+		`CREATE TABLE k(id INTEGER PRIMARY KEY, a INT, b TEXT, c REAL)`,
+		`CREATE TABLE v(id INTEGER PRIMARY KEY, k_id INTEGER, n INTEGER, s TEXT, x REAL)`,
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 20) INSERT INTO k SELECT i, i * 3 % 7, 'b' || i, i / 4.0 FROM n`,
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 400) INSERT INTO v SELECT i, 1 + i % 20, i * 7 % 23, 's' || (i % 9), i / 8.0 FROM n`,
+	}
+	queries := []string{
+		`SELECT k.a, count(*), v.s, v.x, k.b FROM k JOIN v ON v.k_id = k.id GROUP BY k.a`,
+		`SELECT k.id, max(v.n), v.s, v.id, k.c FROM k JOIN v ON v.k_id = k.id GROUP BY k.id`,
+		`SELECT v.s, min(v.x), k.b, v.n FROM v JOIN k ON k.id = v.k_id GROUP BY v.s`,
+		`SELECT k.a, sum(v.n), v.s FROM k JOIN v ON v.k_id = k.id GROUP BY k.a HAVING v.n > 3`,
+	}
+	run := func(off bool) []string {
+		segPeepholesOffForTest = off
+		defer func() { segPeepholesOffForTest = false }()
+		db, err := OpenOrCreate(filepath.Join(t.TempDir(), "g.musq"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		for _, s := range setup {
+			if _, _, err := db.ExecArgs(s, nil); err != nil {
+				t.Fatalf("%s: %v", s, err)
+			}
+			db.CommitIfAutocommit()
+		}
+		var out []string
+		for _, q := range queries {
+			SegJoinHitsForTest()
+			_, rows, err := db.Query(q, nil)
+			if !off && SegJoinHitsForTest() == 0 {
+				t.Errorf("not served by the join kernel: %s", q)
+			}
+			out = append(out, fmt.Sprint(rows, err))
+		}
+		return out
+	}
+	want, got := run(true), run(false)
+	for i := range want {
+		if want[i] != got[i] {
+			t.Errorf("%s:\n  loop   %.300s\n  kernel %.300s", queries[i], want[i], got[i])
+		}
+	}
+}

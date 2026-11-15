@@ -771,16 +771,68 @@ func (t *segJoinTable) values(c int) []Value {
 	if ok {
 		return v
 	}
-	v = make([]Value, t.n)
-	for r := range v {
-		v[r] = t.value(int32(r), c)
-	}
+	v = t.readColumn(c)
 	t.mu.Lock()
 	if t.vcols == nil {
 		t.vcols = map[int][]Value{}
 	}
 	t.vcols[c] = v
 	t.mu.Unlock()
+	return v
+}
+
+// readColumn is value over every row, read a segment at a time: a clean
+// INTEGER block straight into Values, any other column through
+// segColumnValue, as value reads it.
+func (t *segJoinTable) readColumn(c int) []Value {
+	v := make([]Value, t.n)
+	if c < 0 {
+		for r := range v {
+			v[r] = Value{Typ: Int, I: t.rowids[r]}
+		}
+		return v
+	}
+	plans := segColPlansFor(t.tbl)
+	cell := func(si, row, r int) Value {
+		s := t.segs[si]
+		return segColumnValue(plans, s, row, len(s.cols), uint64(t.rowids[r]), c)
+	}
+	if t.pos == nil {
+		for si, s := range t.segs {
+			base := t.starts[si]
+			if c < len(plans) && c < len(s.cols) && !plans[c].isIPK && !plans[c].isReal {
+				if ints, ok := segCleanInt64Column(s, c); ok {
+					for row := range s.nRows {
+						v[base+row] = Value{Typ: Int, I: ints[row]}
+					}
+					continue
+				}
+			}
+			if s.fullWidth {
+				rids := make([]uint64, s.nRows)
+				for row := range rids {
+					rids[row] = uint64(t.rowids[base+row])
+				}
+				segColumnRun(plans, s, c, 0, rids, v[base:base+s.nRows], 1)
+				continue
+			}
+			for row := range s.nRows {
+				v[base+row] = cell(si, row, base+row)
+			}
+		}
+		return v
+	}
+	si := 0
+	for r, p := range t.pos {
+		if p < 0 {
+			v[r] = t.stored(-1-p, c, t.rowids[r])
+			continue
+		}
+		if int(p) < t.starts[si] || si+1 < len(t.starts) && int(p) >= t.starts[si+1] {
+			si = sort.SearchInts(t.starts, int(p)+1) - 1
+		}
+		v[r] = cell(si, int(p)-t.starts[si], r)
+	}
 	return v
 }
 
@@ -2493,9 +2545,16 @@ func (gs *segJoinGroups) gatherAt(at []int32, row, rowids []Value) bool {
 				gs.gcols = nil
 				return false
 			}
-			cols := make([][]Value, min(ga.n, len(gs.w.tabs[lv].tbl.cols)))
+			// Only the columns the aggregate reads (aggPlan.rowCols, as
+			// gatherCursorRow reads them), none when it reads no row; the
+			// rest stay NULL.
+			tab, agg := gs.w.tabs[lv], gs.plan.agg
+			cols := make([][]Value, min(ga.n, len(tab.tbl.cols)))
+			all := agg.rowCols == nil || hasGeneratedCols(tab.tbl.cols)
 			for c := range cols {
-				cols[c] = gs.w.tabs[lv].values(c)
+				if !agg.rowFree && (all || slices.Contains(agg.rowCols, ga.offset+c)) {
+					cols[c] = tab.values(c)
+				}
 			}
 			gs.gcols[i] = segJoinGatherCols{level: lv, cols: cols}
 		}
@@ -2504,8 +2563,8 @@ func (gs *segJoinGroups) gatherAt(at []int32, row, rowids []Value) bool {
 		gc := gs.gcols[i]
 		r := at[gc.level]
 		for c, col := range gc.cols {
-			if r < 0 {
-				row[ga.offset+c] = Value{} // an optional level's NULL row
+			if r < 0 || col == nil {
+				row[ga.offset+c] = Value{} // an optional level's NULL row, or a column nothing reads
 			} else {
 				row[ga.offset+c] = col[r]
 			}
