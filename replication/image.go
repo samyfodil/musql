@@ -755,6 +755,7 @@ func (s *Store) reloadLocked(ctx context.Context) error {
 		return err
 	}
 	s.vv, s.floors, s.cat, s.ver, s.mayHold = fresh.vv, fresh.floors, fresh.cat, fresh.ver, fresh.mayHold
+	s.anyHeld.Store(fresh.anyHeld.Load())
 	s.selfAck, s.txHeld = Ack{}, nil
 	s.ownSeq.Store(fresh.ownSeq.Load())
 	s.clock.Merge(fresh.clock.Now())
