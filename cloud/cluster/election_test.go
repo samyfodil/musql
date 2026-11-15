@@ -207,7 +207,11 @@ func (r *recorder) Snapshot() ([]byte, error) {
 func (r *recorder) Restore(b []byte) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.applied = strings.Split(string(b), "\n")
+	// A snapshot taken before any entry applied is empty, not one empty entry.
+	r.applied = nil
+	if len(b) > 0 {
+		r.applied = strings.Split(string(b), "\n")
+	}
 	return nil
 }
 
