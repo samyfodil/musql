@@ -3,11 +3,13 @@ package replication
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/samyfodil/musql/boost"
+	"github.com/samyfodil/musql/engine"
 )
 
 // TestBoostCaptures: a boost.DB onto a replicated database writes through
@@ -39,15 +41,24 @@ func TestBoostCaptures(t *testing.T) {
 	if _, err := fast.Exec(ctx, `INSERT INTO notes VALUES('n1', 'exec')`); err != nil {
 		t.Fatal(err)
 	}
-	tx, err := fast.Begin(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO notes VALUES('n2', 'tx')`); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	// A transaction that background sync committed past is ErrBusy, as
+	// with database/sql, and is run again.
+	for {
+		tx, err := fast.Begin(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO notes VALUES('n2', 'tx')`); err != nil {
+			t.Fatal(err)
+		}
+		err = tx.Commit()
+		if errors.Is(err, engine.ErrBusy) {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		break
 	}
 	var size int64
 	if err := fast.QueryRow(ctx, `PRAGMA max_size`).Scan(&size); err != nil || size != 1<<30 {
