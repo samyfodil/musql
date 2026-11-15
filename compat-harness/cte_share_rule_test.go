@@ -41,7 +41,7 @@ func TestCTEShareRuleSweep(t *testing.T) {
 	const fromless = "SELECT random() AS r"
 	var cases [][]string
 	for _, hint := range []string{"NOT MATERIALIZED ", "", "MATERIALIZED "} {
-		for _, body := range []string{fromless,"SELECT random() AS r FROM (SELECT 1) GROUP BY 1"} {
+		for _, body := range []string{fromless, "SELECT random() AS r FROM (SELECT 1) GROUP BY 1"} {
 			w := "WITH t AS " + hint + "(" + body + ") "
 			for _, q := range queries {
 				cases = append(cases, append(append([]string(nil), pre...), w+q))
@@ -50,6 +50,10 @@ func TestCTEShareRuleSweep(t *testing.T) {
 				append(append([]string(nil), pre...), w+"UPDATE u SET v = (a.r = b.r) FROM t a, t b WHERE u.id = 1", "SELECT id, v FROM u"),
 				append(append([]string(nil), pre...), w+"UPDATE u SET v = (SELECT r FROM t) = (SELECT r FROM t)", "SELECT id, v FROM u"),
 				append(append([]string(nil), pre...), "CREATE VIEW v AS "+w+"SELECT a.r = b.r AS e FROM t a, t b", "SELECT e FROM v", "SELECT e FROM x, v", "SELECT count(*) FROM v, x WHERE e"),
+				// A compound's arms are one statement's references (#220).
+				append(append([]string(nil), pre...), "CREATE TABLE z(r)", "INSERT INTO z "+w+"SELECT r FROM t UNION ALL SELECT r FROM t", "SELECT count(DISTINCT r) FROM z"),
+				append(append([]string(nil), pre...), "CREATE TABLE z AS "+w+"SELECT r FROM t UNION ALL SELECT r FROM t UNION ALL SELECT max(r) FROM t GROUP BY 1=1", "SELECT count(DISTINCT r) FROM z"),
+				append(append([]string(nil), pre...), "CREATE TABLE z(r)", "INSERT INTO z "+w+"SELECT r FROM t UNION SELECT r FROM t", "SELECT count(*) FROM z"),
 			)
 		}
 	}

@@ -128,6 +128,10 @@ func compileCompound(pager *ReadOnlyPager, stmt *SelectStmt, outer *compiler) (*
 	firstCore.OrderBy = nil
 	firstCore.Limit = nil
 	firstCore.Offset = nil
+	// The compound's WITH is in scope already (execSelect, compileSubProgram):
+	// pushed again for the first arm, its references there would bind to
+	// bindings of their own, counted and run apart from the other arms'.
+	firstCore.CTEs = nil
 	// See SelectStmt.r35dCompoundOf: this copy is private to the compile, so an
 	// aggregate the arm's planner hands OUTWARD has to be recorded against the
 	// node the enclosing select list actually holds -- the compound itself.
@@ -381,6 +385,11 @@ func (cp *compoundProgram) execOuter(pager *ReadOnlyPager, outer *evalCtx, param
 // so without it an arm in a trigger body found an empty NEW/OLD. nil for
 // ordinary callers.
 func (cp *compoundProgram) execFrom(pager *ReadOnlyPager, params []Value, parent *vdbe, outer *evalCtx, from *vdbe) (cols []string, rows [][]Value, err error) {
+	if parent == nil && from == nil {
+		// The arms are one statement: a CTE they share runs once for all of
+		// them (runCTEOnce), on a root they have in common.
+		from = &vdbe{}
+	}
 	runArm := func(arm *Program, maxRows int) ([][]Value, error) {
 		if parent != nil {
 			return arm.execWithParentRun(parent, pager, false, maxRows)
