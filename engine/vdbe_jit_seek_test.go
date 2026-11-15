@@ -175,16 +175,18 @@ func TestVMJITScanBatchDifferential(t *testing.T) {
 		return out
 	}
 	want := run(false)
-	before := vmJITSeekSnaps.Load()
+	before, walks := vmJITSeekSnaps.Load(), vmJITSegWalks.Load()
 	got := run(true)
-	snaps := vmJITSeekSnaps.Load() - before
+	snaps, walks := vmJITSeekSnaps.Load()-before, vmJITSegWalks.Load()-walks
 	for i := range queries {
 		if want[i] != got[i] {
 			t.Fatalf("JIT diverges on %s\nvdbe %s\njit  %s", queries[i], want[i], got[i])
 		}
 	}
-	if snaps == 0 {
+	// A filter's candidates are walked in segment mode, and a window it
+	// declined as a batch (seekSnap).
+	if snaps+walks == 0 {
 		t.Fatalf("native code walked no scan: the test checks nothing")
 	}
-	t.Logf("%d queries agree; native code walked a scan in %d entries", len(queries), snaps)
+	t.Logf("%d queries agree; native code walked a scan in %d batch and %d segment entries", len(queries), snaps, walks)
 }

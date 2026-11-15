@@ -1639,8 +1639,10 @@ type jitSnap struct {
 	segsCur  *vdbeCursor
 	segsGen  uint64
 	// segLive is whether this entry handed the cursor over in segment mode
-	// (vmJIT.segMode), at row segEntry of its segment.
+	// (vmJIT.segMode), at row segEntry of its segment, and segSel whether
+	// as its pre-filter's candidate rows (segEntry their position).
 	segLive  bool
+	segSel   bool
 	segEntry int
 	// rowCur and the rest name the segment row row copies while it is kept
 	// past the call, and rowMask its columns copied so far.
@@ -1926,8 +1928,15 @@ func (jx *vmJIT) segModeOK(c int, cur *vdbeCursor) bool {
 		return s == src.listOne
 	case src.point:
 		return s == src.pointSeg && cur.segRow == src.pointRow
+	case src.selPrep != nil:
+		// On a candidate of the pre-filter's window: walked through the
+		// window's candidates (jit.VCursor.Sel), exiting past the last for
+		// the VDBE's OP_Next to judge the next window.
+		return !src.selScan && src.aheadPos >= len(src.ahead) && src.si < len(src.segs) && src.segs[src.si] == s &&
+			src.selPos > 0 && src.selPos <= len(src.sel) && cur.segRow == int(src.sel[src.selPos-1]) &&
+			(jx.idxSpecs == nil || jx.idxSpecs[c] == nil)
 	}
-	return src.selPrep == nil && src.aheadPos >= len(src.ahead) && src.si < len(src.segs) && src.segs[src.si] == s && cur.segRow == src.ri-1
+	return src.aheadPos >= len(src.ahead) && src.si < len(src.segs) && src.segs[src.si] == s && cur.segRow == src.ri-1
 }
 
 // segMode hands cursor c over in segment mode: native code reads its current
@@ -1968,7 +1977,31 @@ func (jx *vmJIT) segMode(c int, cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) b
 			// list first are counted from here (jit.VSeekIdx, State 5).
 			jc.State, jc.Last, jc.Served = 5, int64(k), -int64(k+1)
 		}
-		sn.segLive, sn.segEntry = true, k
+		sn.segLive, sn.segSel, sn.segEntry = true, false, k
+		return true
+	}
+	if src.selPrep != nil {
+		v := s.vmSegFor(cur.segSrcCols, jx.segNeed[c])
+		k := src.selPos - 1
+		jc.N, jc.Pos, jc.Last, jc.Ok, jc.Dirty, jc.Rewind, jc.Adv, jc.Mask = int64(len(src.sel)), int64(k), -1, 1, 0, 0, 2, v.mask
+		jc.Reopen, jc.State = 0, 0
+		if seg := unsafe.Pointer(&v.seg); jc.Seg != seg {
+			jc.Seg = seg
+		}
+		if jc.Segs != nil {
+			jc.Segs = nil
+		}
+		if rids := v.seg.Rowids; jc.Rowids != rids {
+			jc.Rowids = rids
+		}
+		// sel's int64s are ints on every target native code runs on.
+		if sel := unsafe.Pointer(unsafe.SliceData(src.sel)); jc.Sel != sel {
+			jc.Sel = sel
+		}
+		if jc.Rows != nil {
+			jc.Rows = nil
+		}
+		sn.segLive, sn.segSel, sn.segEntry = true, true, k
 		return true
 	}
 	end, adv := cur.segRow+1, int64(1)
@@ -1997,7 +2030,7 @@ func (jx *vmJIT) segMode(c int, cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) b
 		// As for a list above.
 		jc.State, jc.Last, jc.Served = 5, int64(cur.segRow), -int64(cur.segRow+1)
 	}
-	sn.segLive, sn.segEntry = true, cur.segRow
+	sn.segLive, sn.segSel, sn.segEntry = true, false, cur.segRow
 	return true
 }
 
@@ -2157,6 +2190,10 @@ func segSync(cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) {
 			if src.listOne == nil {
 				cur.segCur = src.listSegs[jc.Last]
 			}
+		case sn.segSel:
+			// Last is a position among the window's candidates.
+			cur.segRow, src.selPos = int(src.sel[jc.Last]), int(jc.Last)+1
+			segRowsSelected.Add(int64(moved))
 		default:
 			cur.segRow = int(jc.Last)
 			if !src.point {
