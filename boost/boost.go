@@ -17,6 +17,8 @@
 //
 // Open owns its connections; Wrap runs on an existing *sql.DB's pool, which
 // costs a pool round trip per query but shares the pool with other code.
+// OpenConnector owns its connections too, made by a connector that sets each
+// up, such as a replicated database's (replication.Boost).
 //
 // A destination is a *int64, *int, *int32, *float64, *bool, *string,
 // *[]byte, *time.Time (for a column the connection coerces to time), *any, or
@@ -32,6 +34,7 @@ import (
 	sqldriver "database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 
 	_ "github.com/samyfodil/musql/driver" // fills in boostcore.H
@@ -56,6 +59,19 @@ func Open(dsn string) (*DB, error) {
 	return &DB{pool: p}, nil
 }
 
+// OpenConnector opens a database with its own connections made by c, which
+// must make musql's, as sql.OpenDB does with a connector: each is set up the
+// way c sets it up. Close closes c too when it is an io.Closer.
+func OpenConnector(c sqldriver.Connector) (*DB, error) {
+	p := &pool{connector: c, maxIdle: 2, open: 1}
+	dc, err := p.dial(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	p.idle = []any{dc}
+	return &DB{pool: p}, nil
+}
+
 // Wrap runs queries on db's connections, which must be musql's.
 // Exec runs through db itself.
 func Wrap(db *sql.DB) (*DB, error) {
@@ -75,7 +91,8 @@ func Wrap(db *sql.DB) (*DB, error) {
 	return &DB{std: db}, nil
 }
 
-// Close closes the connections Open opened; one in use closes when it is
+// Close closes the connections Open or OpenConnector opened, and an
+// OpenConnector connector that is an io.Closer; one in use closes when it is
 // returned. A wrapped *sql.DB is left open.
 func (db *DB) Close() error {
 	if db.pool == nil {
@@ -207,6 +224,9 @@ func isBadConn(err error) bool { return errors.Is(err, sqldriver.ErrBadConn) }
 // waiter first, then to the idle list.
 type pool struct {
 	dsn string
+	// connector, when set, makes the connections instead of dsn
+	// (OpenConnector).
+	connector sqldriver.Connector
 
 	mu      sync.Mutex
 	idle    []any
@@ -245,14 +265,14 @@ func (p *pool) get(ctx context.Context) (any, error) {
 	if p.maxOpen == 0 || p.open < p.maxOpen {
 		p.open++
 		p.mu.Unlock()
-		return p.dial()
+		return p.dial(ctx)
 	}
 	ch := make(chan handoff, 1)
 	p.waiters = append(p.waiters, ch)
 	p.mu.Unlock()
 	select {
 	case h := <-ch:
-		return p.take(h)
+		return p.take(ctx, h)
 	case <-ctx.Done():
 		p.mu.Lock()
 		for i, w := range p.waiters {
@@ -264,32 +284,45 @@ func (p *pool) get(ctx context.Context) (any, error) {
 		}
 		p.mu.Unlock()
 		// Handed something after all: pass it on.
-		if c, err := p.take(<-ch); err == nil {
+		if c, err := p.take(ctx, <-ch); err == nil {
 			p.put(c, false)
 		}
 		return nil, ctx.Err()
 	}
 }
 
-func (p *pool) take(h handoff) (any, error) {
+func (p *pool) take(ctx context.Context, h handoff) (any, error) {
 	if h.err != nil {
 		return nil, h.err
 	}
 	if h.c == nil {
-		return p.dial()
+		return p.dial(ctx)
 	}
 	boostcore.H.Reset(h.c)
 	return h.c, nil
 }
 
 // dial opens a connection in a slot already counted in p.open.
-func (p *pool) dial() (any, error) {
-	c, err := boostcore.H.Open(p.dsn)
+func (p *pool) dial(ctx context.Context) (any, error) {
+	if p.connector == nil {
+		c, err := boostcore.H.Open(p.dsn)
+		if err != nil {
+			p.release()
+			return nil, err
+		}
+		return c, nil
+	}
+	dc, err := p.connector.Connect(ctx)
 	if err != nil {
 		p.release()
 		return nil, err
 	}
-	return c, nil
+	if !boostcore.H.IsConn(dc) {
+		dc.Close()
+		p.release()
+		return nil, fmt.Errorf("boost: OpenConnector needs a musql connector, not one making %T", dc)
+	}
+	return dc, nil
 }
 
 // release gives up a counted slot, passing it to a waiter if there is one.
@@ -366,6 +399,11 @@ func (p *pool) close() error {
 	var first error
 	for _, c := range idle {
 		if err := boostcore.H.Close(c); err != nil && first == nil {
+			first = err
+		}
+	}
+	if cl, ok := p.connector.(io.Closer); ok {
+		if err := cl.Close(); err != nil && first == nil {
 			first = err
 		}
 	}
