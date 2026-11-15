@@ -46,6 +46,34 @@ func TestOpen(t *testing.T) {
 	}
 }
 
+// TestOpenMemory: open with no file, or ":memory:", runs on an in-memory
+// database and leaves no file behind.
+func TestOpenMemory(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	var errs bytes.Buffer
+	run := func(stdin string, args ...string) (string, error) {
+		var out bytes.Buffer
+		errs.Reset()
+		err := cli.Run(context.Background(), cli.Env{Dir: t.TempDir(), Stdin: strings.NewReader(stdin), Stdout: &out, Stderr: &errs},
+			append([]string{"open"}, args...))
+		return out.String(), err
+	}
+	if out, err := run("CREATE TABLE t(x); INSERT INTO t VALUES (1), (2); SELECT sum(x) AS s FROM t;\n"); err != nil || out != "s\n3\n" {
+		t.Fatalf("no file: %q %v", out, err)
+	}
+	if out, err := run("", ":memory:", "SELECT 1 + 1 AS two;"); err != nil || out != "two\n2\n" {
+		t.Fatalf(":memory: %q %v", out, err)
+	}
+	// Each run is its own database.
+	if _, err := run("SELECT * FROM t;\n"); err == nil || !strings.Contains(errs.String(), "no such table") {
+		t.Fatalf("a second in-memory run saw the first's table: %v %q", err, errs.String())
+	}
+	if ents, err := os.ReadDir(dir); err != nil || len(ents) != 0 {
+		t.Fatalf("left in the working directory: %v %v", ents, err)
+	}
+}
+
 func TestShellTimer(t *testing.T) {
 	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "t.musq"))
 	if err != nil {

@@ -119,6 +119,15 @@ id  name
 Run Time: real 0.001
 ```
 
+With no file, or `:memory:`, it opens an in-memory database, gone when the
+shell exits:
+
+```sh
+$ ./musql open
+Opened an in-memory database; nothing is saved when it exits.
+musql> SELECT 1 + 1;
+```
+
 `musql` is in the [release archive](https://github.com/samyfodil/musql/releases/latest)
 with `musqld` and `musql-convert`. `.help` lists the shell's commands.
 
