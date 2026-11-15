@@ -21,6 +21,7 @@ package engine
 import (
 	"slices"
 	"strings"
+	"sync"
 )
 
 // WO_* : whereexpr.c's operatorMask output. Only the bits this port can price
@@ -2585,10 +2586,19 @@ func (b *wherePlanIdxBuild) solve(nRowEst logEst) (*wherePath, bool) {
 		seed.isOrdered = -1 // nLoop > 0 always
 	}
 	// The generations alternate between two buffers of mxChoice paths, and
-	// each path's loops are carved from slab.
-	aFrom := append(make([]wherePath, 0, mxChoice), seed)
-	spare := make([]wherePath, 0, mxChoice)
-	var slab []int
+	// each path slot owns nLoop entries of loops, as the C's aLoop arrays are
+	// carved once from one allocation: a path written into a slot copies its
+	// predecessor's loops in, rather than taking new space.
+	sc := solveScratchPool.Get().(*solveScratch)
+	defer solveScratchPool.Put(sc)
+	paths, loopSpace := sc.take(2*mxChoice, 2*mxChoice*nLoop)
+	slotLoops := func(gen, jj int) []int {
+		at := (gen*mxChoice + jj) * nLoop
+		return loopSpace[at : at+nLoop : at+nLoop]
+	}
+	aFrom := append(paths[:0:mxChoice], seed)
+	spare := paths[mxChoice : mxChoice : 2*mxChoice]
+	toGen := 1
 
 	var mxCost, mxUnsort logEst
 	mxI := 0
@@ -2682,11 +2692,7 @@ func (b *wherePlanIdxBuild) solve(nRowEst logEst) (*wherePath, bool) {
 					}
 				}
 
-				if cap(slab)-len(slab) < iLoop+1 {
-					slab = make([]int, 0, max(64, 4*(iLoop+1)))
-				}
-				next := slab[len(slab) : len(slab)+iLoop+1 : len(slab)+iLoop+1]
-				slab = slab[:len(slab)+iLoop+1]
+				next := slotLoops(toGen, jj)[:iLoop+1]
 				copy(next, pFrom.loops)
 				next[iLoop] = li
 				aTo[jj] = wherePath{
@@ -2713,11 +2719,36 @@ func (b *wherePlanIdxBuild) solve(nRowEst logEst) (*wherePath, bool) {
 			}
 		}
 		spare, aFrom = aFrom[:0], aTo
+		toGen ^= 1
 		if len(aFrom) == 0 {
 			return nil, false // "no query solution"
 		}
 	}
-	return &aFrom[0], true
+	best := aFrom[0]
+	best.loops = slices.Clone(best.loops)
+	return &best, true
+}
+
+// solveScratch is solve's two generations of paths and their loops, kept
+// between calls: the planner solves many times for one statement.
+type solveScratch struct {
+	paths []wherePath
+	loops []int
+}
+
+var solveScratchPool = sync.Pool{New: func() any { return new(solveScratch) }}
+
+// take is nPaths cleared paths and nLoops loop slots.
+func (sc *solveScratch) take(nPaths, nLoops int) ([]wherePath, []int) {
+	if cap(sc.paths) < nPaths {
+		sc.paths = make([]wherePath, nPaths)
+	}
+	if cap(sc.loops) < nLoops {
+		sc.loops = make([]int, nLoops)
+	}
+	paths := sc.paths[:nPaths]
+	clear(paths)
+	return paths, sc.loops[:nLoops]
 }
 
 // whereInterstageHeuristic ports the where.c routine of that name: if the first
