@@ -576,6 +576,8 @@ func (sy *Syncer) installImage(ctx context.Context, im Imager, peer PeerID) erro
 	if err := s.reloadLocked(ctx); err != nil {
 		return err
 	}
+	s.pend.everything()
+	s.pend.tell(s.changes, s.cat)
 	if err := removeDurable(marker); err != nil {
 		log.Printf("replication: %v (Open removes it)", err)
 	}

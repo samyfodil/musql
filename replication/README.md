@@ -47,6 +47,11 @@ That is the whole setup:
   `db.Close()` stops it.
 - **Offline is fine.** Writes made while a node is partitioned are captured and
   reach the others when it reconnects.
+- **Changes are observable.** `replication.WithChanges(obs)` tells `obs` which
+  rows of which table changed on this node, by primary key, once readers can see
+  them: a local commit, ops a peer pushes or anti-entropy brings, a `Quorum`
+  entry, a snapshot or an image (the last three may name a whole table). A
+  cache over the database drops what it read from those rows.
 - **The log is compacted.** Once every node has acknowledged an op, it is pruned
   (the tables hold its effect); a node that joins after takes a snapshot from a
   peer. A node gone for good would hold that back forever:

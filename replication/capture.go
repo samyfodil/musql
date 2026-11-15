@@ -21,6 +21,9 @@ type capture struct {
 	s    *Syncer
 	conn *driver.Conn
 	buf  []Op // built from this transaction's row changes, at flush time
+	// cat is the catalog this transaction committed with, which names its
+	// tables for Changes.
+	cat *catalog
 	// flushed holds ops written in-txn awaiting commit confirmation.
 	flushed []Op
 	// handoff holds stamped ops between preCommit and handOff, and seen the
@@ -180,7 +183,7 @@ func (c *capture) preCommit(ctx context.Context, conn *driver.Conn, changes []en
 	if err := c.flush(ctx); err != nil {
 		return err
 	}
-	c.committing = true
+	c.cat, c.committing = cat, true
 	return nil
 }
 
@@ -553,6 +556,9 @@ func (c *capture) postCommit() {
 	}
 	c.s.store.NoteLocal(c.s.site, maxSeq)
 	c.s.propagate(c.flushed)
+	if obs := c.s.store.changes; obs != nil {
+		opChanges(c.flushed).tell(obs, c.cat)
+	}
 	var tbls []string
 	for _, op := range c.flushed {
 		if op.Kind != OpSchema && !slices.Contains(tbls, op.Tbl) {

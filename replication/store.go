@@ -32,6 +32,11 @@ type Store struct {
 	site  string
 	clock *Clock
 
+	// changes is told what each committed transaction changed in the
+	// tables (WithChanges), as pend gathers it.
+	changes Changes
+	pend    changeSet
+
 	mu sync.Mutex
 	vv VersionVector // max contiguous seq observed per site
 	// floors is _repl_floors: per site, the seq its ops are pruned up to.
@@ -117,7 +122,7 @@ func (s *Store) begin(ctx context.Context) (storeTx, error) {
 	for {
 		_, err := conn.ExecContext(context.WithoutCancel(ctx), `BEGIN IMMEDIATE`)
 		if err == nil {
-			return storeTx{conn}, nil
+			return storeTx{conn, s}, nil
 		}
 		if !errors.Is(err, engine.ErrBusy) || time.Now().After(deadline) || ctx.Err() != nil {
 			conn.Close()
@@ -128,9 +133,13 @@ func (s *Store) begin(ctx context.Context) (storeTx, error) {
 	}
 }
 
-// storeTx is a transaction begin started.
-type storeTx struct{ *sql.Conn }
+// storeTx is a transaction begin started on s.
+type storeTx struct {
+	*sql.Conn
+	s *Store
+}
 
+// Commit commits the transaction and tells s.changes what it changed.
 func (t storeTx) Commit() error {
 	defer t.Close()
 	_, err := t.ExecContext(context.Background(), `COMMIT`)
@@ -138,12 +147,16 @@ func (t storeTx) Commit() error {
 		// A failed COMMIT leaves the transaction open; the connection goes
 		// back to the pool, so it must not.
 		t.ExecContext(context.Background(), `ROLLBACK`)
+		t.s.pend.take()
+		return err
 	}
-	return err
+	t.s.pend.tell(t.s.changes, t.s.cat)
+	return nil
 }
 
 func (t storeTx) Rollback() error {
 	defer t.Close()
+	t.s.pend.take()
 	_, err := t.ExecContext(context.Background(), `ROLLBACK`)
 	return err
 }
@@ -734,6 +747,10 @@ func (s *Store) ingestTx(ctx context.Context, ops []Op, local, batch bool) (map[
 func (s *Store) applyOp(ctx context.Context, op Op, local bool) error {
 	if op.Kind == OpSchema {
 		clear(s.txHeld)
+		if !local {
+			// A local op's commit told the tables already.
+			s.pend.everything()
+		}
 		cat, ver, err := s.applySchema(ctx, op)
 		if err == nil && cat != nil {
 			s.cat, s.ver = cat, ver
@@ -891,6 +908,11 @@ func (s *Store) applyOps(ctx context.Context, ops []Op, local bool) error {
 	}
 	if err := s.writeRecs(ctx, fresh, won); err != nil || local {
 		return err
+	}
+	if s.changes != nil {
+		for k := range changed {
+			s.pend.row(k.tbl, []byte(k.pk))
+		}
 	}
 	live := map[string]typedVal{}
 	for _, tbl := range tables {
@@ -1199,6 +1221,7 @@ func quotedList(names []string) string {
 // frees up, the next rebuild takes them. The result depends on nothing but the
 // clock, so every node that has the same ops holds the same rows.
 func (s *Store) rebuildTable(ctx context.Context, t *object) error {
+	s.pend.table(t.ID)
 	if _, err := s.q.ExecContext(ctx, `DELETE FROM main.`+quoteIdent(t.Name)); err != nil {
 		return err
 	}
