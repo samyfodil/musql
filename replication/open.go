@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/samyfodil/musql/boost"
 	"github.com/samyfodil/musql/driver"
 )
 
@@ -112,7 +113,24 @@ func openSyncer(ctx context.Context, path string, opts ...Option) (*Syncer, *sql
 	db := sql.OpenDB(c)
 	c.db = db
 	openDBs.Store(db, s)
+	openConnectors.Store(db, c)
 	return s, db, nil
+}
+
+// openConnectors maps each *sql.DB Open returned to its connector, for Boost.
+var openConnectors sync.Map
+
+// Boost returns a *boost.DB onto db's replicated database with connections
+// of its own, each set up as db's are -- change capture attached and
+// WithMaxSize applied -- for boost's fast path. db is the *sql.DB Open
+// returned; it keeps the replication running, so close the boost.DB first.
+func Boost(db *sql.DB) (*boost.DB, error) {
+	v, ok := openConnectors.Load(db)
+	if !ok {
+		return nil, errors.New("replication: Boost needs the *sql.DB Open returned")
+	}
+	// Without Close, so the boost.DB's Close leaves the replication to db's.
+	return boost.OpenConnector(struct{ sqldriver.Connector }{v.(*syncConnector)})
 }
 
 // openDBs maps each *sql.DB Open returned to its Syncer, for the calls that
@@ -419,6 +437,7 @@ func (c *syncConnector) Close() error {
 	var err error
 	c.once.Do(func() {
 		openDBs.Delete(c.db)
+		openConnectors.Delete(c.db)
 		if c.cancel != nil {
 			c.cancel()
 			<-c.done

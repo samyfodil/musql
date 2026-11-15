@@ -9,8 +9,11 @@ import (
 	"io"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/samyfodil/musql/driver"
 )
 
 // TestDestinationMatrixMatchesDatabaseSQL scans every value class into every
@@ -289,3 +292,76 @@ type otherConn struct{}
 func (otherConn) Prepare(string) (sqldriver.Stmt, error) { return nil, io.EOF }
 func (otherConn) Close() error                           { return nil }
 func (otherConn) Begin() (sqldriver.Tx, error)           { return nil, io.EOF }
+
+// countingConnector counts the connections it makes and whether it was
+// closed.
+type countingConnector struct {
+	sqldriver.Connector
+	connects atomic.Int64
+	closed   atomic.Bool
+}
+
+func (c *countingConnector) Connect(ctx context.Context) (sqldriver.Conn, error) {
+	c.connects.Add(1)
+	return c.Connector.Connect(ctx)
+}
+
+func (c *countingConnector) Close() error {
+	c.closed.Store(true)
+	return nil
+}
+
+type otherConnector struct{}
+
+func (otherConnector) Connect(context.Context) (sqldriver.Conn, error) { return otherConn{}, nil }
+func (otherConnector) Driver() sqldriver.Driver                        { return otherDriver{} }
+
+// TestOpenConnector: a database opened on a connector makes every connection
+// with it, answers as database/sql does, and closes it with itself; a
+// connector making another driver's connections is refused.
+func TestOpenConnector(t *testing.T) {
+	if _, err := OpenConnector(otherConnector{}); err == nil || !strings.Contains(err.Error(), "musql") {
+		t.Fatalf("OpenConnector of another driver: %v", err)
+	}
+	path, std := seed(t)
+	base, err := (&driver.Driver{}).OpenConnector(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &countingConnector{Connector: base}
+	db, err := OpenConnector(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	const q = `SELECT count(*), sum(id) FROM t`
+	var n, sum int64
+	if err := db.QueryRow(ctx, q).Scan(&n, &sum); err != nil {
+		t.Fatal(err)
+	}
+	var wn, wsum int64
+	if err := std.QueryRow(q).Scan(&wn, &wsum); err != nil || n != wn || sum != wsum {
+		t.Fatalf("got %d, %d; database/sql %d, %d (%v)", n, sum, wn, wsum, err)
+	}
+	// Three rows held open at once need three connections.
+	var held []*Rows
+	for range 3 {
+		r, err := db.Query(ctx, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, r)
+	}
+	for _, r := range held {
+		r.Close()
+	}
+	if got := c.connects.Load(); got != 3 {
+		t.Fatalf("the connector made %d connections, want 3", got)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !c.closed.Load() {
+		t.Fatal("Close left the connector open")
+	}
+}
