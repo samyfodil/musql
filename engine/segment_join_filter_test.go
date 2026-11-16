@@ -60,7 +60,7 @@ func TestSegJoinClockNotKept(t *testing.T) {
 func TestSegJoinFiltersAgree(t *testing.T) {
 	stmts := []string{
 		"CREATE TABLE o(ok INTEGER PRIMARY KEY, pri TEXT)",
-		"CREATE TABLE l(id INTEGER PRIMARY KEY, ok INTEGER, mode TEXT, sd TEXT, cd TEXT, rd TEXT, q INTEGER, d REAL)",
+		"CREATE TABLE l(id INTEGER PRIMARY KEY, ok INTEGER, mode TEXT, sd TEXT, cd TEXT, rd TEXT, q INTEGER, d REAL, m)",
 	}
 	modes := []string{"MAIL", "SHIP", "AIR", "RAIL", "TRUCK", "FOB", "REG AIR"}
 	for i := 1; i <= 400; i++ {
@@ -71,8 +71,11 @@ func TestSegJoinFiltersAgree(t *testing.T) {
 		if i%23 == 0 {
 			mode = "NULL"
 		}
-		stmts = append(stmts, fmt.Sprintf("INSERT INTO l VALUES(%d, %d, %s, '1994-%02d-%02d', '1994-%02d-%02d', '199%d-%02d-%02d', %d, %d.5)",
-			i, i%400+1, mode, i%12+1, i%28+1, (i+3)%12+1, (i*7)%28+1, 3+i%3, (i*5)%12+1, (i*3)%28+1, i%9, i%4))
+		// m holds the same bytes as TEXT and as a BLOB, which a filter of
+		// it tells apart.
+		m := []string{"'ab'", "x'6162'", "97", "'AB'"}[i%4]
+		stmts = append(stmts, fmt.Sprintf("INSERT INTO l VALUES(%d, %d, %s, '1994-%02d-%02d', '1994-%02d-%02d', '199%d-%02d-%02d', %d, %d.5, %s)",
+			i, i%400+1, mode, i%12+1, i%28+1, (i+3)%12+1, (i*7)%28+1, 3+i%3, (i*5)%12+1, (i*3)%28+1, i%9, i%4, m))
 	}
 	p := newSegPair(t, stmts...)
 	filters := []string{
@@ -88,6 +91,8 @@ func TestSegJoinFiltersAgree(t *testing.T) {
 		"l.d > 1",
 		"l.mode IS NULL OR l.mode <> 'FOB'",
 		"CASE l.mode WHEN 'RAIL' THEN 1 WHEN 'AIR' THEN 1 ELSE 0 END = 1",
+		"l.m IN ('ab', 'zz')",
+		"l.m IN (x'6162', 5)",
 	}
 	var qs []string
 	for i := range filters {
@@ -117,7 +122,7 @@ func TestSegJoinFiltersAgree(t *testing.T) {
 		}
 	}
 	check("segments")
-	p.delta("INSERT INTO l VALUES(9000, 3, 'MAIL', '1994-01-02', '1994-02-02', '1994-03-02', 9, 2.5)",
+	p.delta("INSERT INTO l VALUES(9000, 3, 'MAIL', '1994-01-02', '1994-02-02', '1994-03-02', 9, 2.5, 'ab')",
 		"UPDATE l SET mode = 'SHIP' WHERE id % 5 = 0", "DELETE FROM l WHERE id % 7 = 0")
 	check("rows changed")
 	if segJoinFilterRestricted.Load() == restricted || segJoinPassReuses.Load() == reused {
