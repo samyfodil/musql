@@ -124,19 +124,16 @@ type joinedTable struct {
 	tvfArgs []Expr
 }
 
-// resolveFrom resolves every table named in a FROM clause, computes each
-// table's column offset in a joined row, and returns the flattened column
-// metadata (every table's columns in FROM order) needed for "*" expansion and
-// plan-time affinity lookups.
-func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedTable, []columnInfo, error) {
+// resolveFrom resolves every table named in a FROM clause and computes each
+// table's column offset in a joined row.
+func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedTable, error) {
 	if err := p.checkDerivedJoinSupported(items); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if err := checkSelfJoinGroupSupported(items); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	jts := make([]joinedTable, len(items))
-	itemCols := make([][]columnInfo, 0, len(items))
 	offset := 0
 	var state joinDesugarState
 	for i, it := range items {
@@ -158,16 +155,16 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 			if len(p.attachedReaders) > 0 {
 				owner, oerr := p.itemOwner(it)
 				if oerr != nil {
-					return nil, nil, oerr
+					return nil, oerr
 				}
 				rp = owner
 			} else if it.Schema != "" {
 				ok, serr := p.qualifierResolvesLocally(it.Schema)
 				if serr != nil {
-					return nil, nil, serr
+					return nil, serr
 				}
 				if !ok {
-					return nil, nil, fmt.Errorf("engine: no such table: %s.%s", it.Schema, it.Table)
+					return nil, fmt.Errorf("engine: no such table: %s.%s", it.Schema, it.Table)
 				}
 			}
 		}
@@ -183,7 +180,7 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 				var err error
 				cols, subRows, err = p.resolveDerivedRows(it.Subquery, params)
 				if err != nil {
-					return nil, nil, err
+					return nil, err
 				}
 			}
 			tbl = &resolvedTable{cols: cols, ipkIndex: -1}
@@ -197,7 +194,7 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 			// the resolved table's index chain (select.c:5487-5490), which a CTE
 			// lacks. itemHasNoIndexChain enforces the same on the compiled path.
 			if it.IndexedBy != "" {
-				return nil, nil, fmt.Errorf("engine: no such index: %s", it.IndexedBy)
+				return nil, fmt.Errorf("engine: no such index: %s", it.IndexedBy)
 			}
 			// A recursive CTE is resolved schema-only, by compiling its initial arm
 			// (cteSchemaCols, vdbe_join_codegen.go): resolveFrom's callers only need
@@ -219,7 +216,7 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 				cols, crows, cerr = p.resolveCTERows(it.Table, cteBind, params)
 			}
 			if cerr != nil {
-				return nil, nil, cerr
+				return nil, cerr
 			}
 			tbl = &resolvedTable{cols: cols, ipkIndex: -1}
 			rows = crows
@@ -230,18 +227,18 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 			// source temp_catalog.go builds, the same one the VDBE read path uses,
 			// so main's rows are never reported under temp's name.
 			if it.IndexedBy != "" {
-				return nil, nil, fmt.Errorf("engine: unsupported: INDEXED BY on sqlite_temp_master")
+				return nil, fmt.Errorf("engine: unsupported: INDEXED BY on sqlite_temp_master")
 			}
 			crows, rerr := p.schemaCatalogRows(scopeTemp)
 			if rerr != nil {
-				return nil, nil, rerr
+				return nil, rerr
 			}
 			tbl = &resolvedTable{cols: sqliteSchemaCatalogColumns(), ipkIndex: -1}
 			rows = crows
 			rowids = make([]int64, len(crows)) // parallel-length; unused (noRowid scope)
 			derived = true
 		} else if isV, verr := rp.isVtabItem(it); verr != nil {
-			return nil, nil, verr
+			return nil, verr
 		} else if isV {
 			// A virtual table (table-valued function or persisted CREATE VIRTUAL
 			// TABLE), intercepted before resolveTable since a persisted vtab's
@@ -269,7 +266,7 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 				}
 			}
 			if verr != nil {
-				return nil, nil, verr
+				return nil, verr
 			}
 			tbl = &resolvedTable{cols: vcols, ipkIndex: -1}
 			rows = vrows
@@ -280,7 +277,7 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 				tbl = t
 				if it.IndexedBy != "" {
 					if err := rp.checkIndexExists(it.IndexedBy, it.Table, fromItemScope(it)); err != nil {
-						return nil, nil, err
+						return nil, err
 					}
 				}
 				if !p.fromColumnsOnly {
@@ -290,22 +287,22 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 						rowids = append(rowids, int64(rowid))
 					}
 					if err := errFn(); err != nil {
-						return nil, nil, err
+						return nil, err
 					}
 				}
 			} else if cscope, isCat, cerr := rp.schemaCatalogSourceScope(it); cerr != nil {
-				return nil, nil, cerr
+				return nil, cerr
 			} else if isCat {
 				// A schema catalog resolveTableIn refused (see
 				// validateFromTablesExist, insert_write.go): serve temp_catalog.go's
 				// filtered rows. Reached only after that failure, so a connection
 				// with no temp object keeps the raw-scan path.
 				if it.IndexedBy != "" {
-					return nil, nil, fmt.Errorf("engine: unsupported: INDEXED BY on %s", it.Table)
+					return nil, fmt.Errorf("engine: unsupported: INDEXED BY on %s", it.Table)
 				}
 				crows, rerr := rp.schemaCatalogRows(cscope)
 				if rerr != nil {
-					return nil, nil, rerr
+					return nil, rerr
 				}
 				tbl = &resolvedTable{cols: sqliteSchemaCatalogColumns(), ipkIndex: -1}
 				rows = crows
@@ -319,7 +316,7 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 				// INDEXED BY on a view is "no such index", as in C.
 				pcv, ok, verr := rp.resolveViewByNameIn(fromItemScope(it), it.Table)
 				if verr != nil {
-					return nil, nil, verr
+					return nil, verr
 				}
 				if !ok {
 					// A BARE reference to an eponymous virtual-table module
@@ -329,13 +326,13 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 					if isEponymousVtabName(it.Table) {
 						vcols, vrows, vrowids, mverr := rp.materializeVtab(it, params, nil, nil, nil, nil)
 						if mverr != nil {
-							return nil, nil, mverr
+							return nil, mverr
 						}
 						tbl = &resolvedTable{cols: vcols, ipkIndex: -1}
 						rows = vrows
 						rowids = vrowids
 					} else {
-						return nil, nil, relabelMissingTable(it, terr) // the original "no such table" error
+						return nil, relabelMissingTable(it, terr) // the original "no such table" error
 					}
 				} else {
 					if it.IndexedBy != "" {
@@ -343,7 +340,7 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 						// the hint can never name a usable index, and it says
 						// "no such index" even when an index of that name
 						// exists on another table (indexedby.test).
-						return nil, nil, fmt.Errorf("engine: no such index: %s", it.IndexedBy)
+						return nil, fmt.Errorf("engine: no such index: %s", it.IndexedBy)
 					}
 					// &items[i], not &it: resolveViewRowsGuarded needs the AST node's stable
 					// address to recognize a repeat ask about the same FromItem.
@@ -358,7 +355,7 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 						cols, vrows, rerr = rp.resolveViewRowsGuarded(&items[i], it.Table, pcv, params)
 					}
 					if rerr != nil {
-						return nil, nil, rerr
+						return nil, rerr
 					}
 					tbl = &resolvedTable{cols: cols, ipkIndex: -1}
 					rows = vrows
@@ -383,7 +380,7 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 		}
 		onExpr, hidden, derr := desugarJoinItem(&state, i, it, name, tbl.cols)
 		if derr != nil {
-			return nil, nil, derr
+			return nil, derr
 		}
 		jts[i] = joinedTable{
 			name:             name,
@@ -412,13 +409,12 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 		// fixItemGroupScoping's doc comment.
 		fixedHidden, ferr := fixItemGroupScoping(jts, i, hidden)
 		if ferr != nil {
-			return nil, nil, ferr
+			return nil, ferr
 		}
 		jts[i].coalesced = fixedHidden
 		if err := installCoalesceFallback(jts, i, it.Join, fixedHidden); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
-		itemCols = append(itemCols, tbl.cols)
 		offset += len(tbl.cols)
 	}
 	// A group-starting item that acquired its OWN coalesceFallback from a
@@ -438,13 +434,7 @@ func (p *ReadOnlyPager) resolveFrom(items []FromItem, params []Value) ([]joinedT
 	// comment (RIGHT/FULL section): the VDBE codegen (vdbe_join_codegen.go's
 	// emitJoinLoops/emitRightOuterSweep) handles any placement or count of
 	// RIGHT/FULL items in a flat FROM clause -- no narrower gate remains.
-	// One copy at its full size, rather than grown item by item: a FROM clause
-	// of wide tables is resolved many times over in one compile.
-	flatCols := make([]columnInfo, 0, offset)
-	for _, cols := range itemCols {
-		flatCols = append(flatCols, cols...)
-	}
-	return jts, flatCols, nil
+	return jts, nil
 }
 
 // groupConnectorCoalesceSentinel is the ColumnExpr.UsingReprOwnItem for a
@@ -612,7 +602,7 @@ func (p *ReadOnlyPager) derivedSelectScope(sub *SelectStmt, n int) derivedSelect
 		// column's affinity, and a write statement compiles every time.
 		saved := p.fromColumnsOnly
 		p.fromColumnsOnly = true
-		jts, _, err := p.resolveFrom(sub.From, nil)
+		jts, err := p.resolveFrom(sub.From, nil)
 		p.fromColumnsOnly = saved
 		if err != nil {
 			return derivedSelectScope{}
@@ -679,7 +669,7 @@ func (p *ReadOnlyPager) resolveFromSchemaOnly(items []FromItem) ([]joinedTable, 
 	saved := p.derivedSchemaOnly
 	p.derivedSchemaOnly = true
 	defer func() { p.derivedSchemaOnly = saved }()
-	jts, _, err := p.resolveFrom(items, nil)
+	jts, err := p.resolveFrom(items, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -693,7 +683,7 @@ func (p *ReadOnlyPager) resolveFromColumns(items []FromItem) ([]joinedTable, err
 	saved := p.fromColumnsOnly
 	p.fromColumnsOnly = true
 	defer func() { p.fromColumnsOnly = saved }()
-	jts, _, err := p.resolveFrom(items, nil)
+	jts, err := p.resolveFrom(items, nil)
 	return jts, err
 }
 

@@ -2819,11 +2819,30 @@ func onsOfSources(srcs []joinSource) []Expr {
 // to any table inside a group resolves exactly as if the group had never
 // been parenthesized at all.
 func joinScopes(srcs []joinSource) []compileScope {
-	var scopes []compileScope
+	n := scopeCount(srcs)
+	if n == 0 {
+		return nil
+	}
+	scopes := make([]compileScope, 0, n)
 	for _, s := range srcs {
-		scopes = append(scopes, sourceScopes(s)...)
+		if len(s.memberScopes) > 0 {
+			scopes = append(scopes, s.memberScopes...)
+			continue
+		}
+		sc := s.scope // as sourceScopes, without a slice of its own
+		sc.dbIdx = s.dbIdx
+		scopes = append(scopes, sc)
 	}
 	return scopes
+}
+
+// scopeCount is how many scopes srcs flatten to (sourceScopes).
+func scopeCount(srcs []joinSource) int {
+	n := 0
+	for _, s := range srcs {
+		n += max(len(s.memberScopes), 1)
+	}
+	return n
 }
 
 // tableScopesOf extracts srcs' tableScopes (dropping the cursor number) --
@@ -2831,10 +2850,17 @@ func joinScopes(srcs []joinSource) []compileScope {
 // planGroupByStmt take. Flattened through
 // sourceScopes exactly like joinScopes, for the same reason.
 func tableScopesOf(srcs []joinSource) []tableScope {
-	scopes := joinScopes(srcs)
-	ts := make([]tableScope, len(scopes))
-	for i, s := range scopes {
-		ts[i] = s.tableScope
+	ts := make([]tableScope, 0, scopeCount(srcs))
+	for _, s := range srcs {
+		if len(s.memberScopes) > 0 {
+			for _, m := range s.memberScopes {
+				ts = append(ts, m.tableScope)
+			}
+			continue
+		}
+		t := s.scope.tableScope
+		t.dbIdx = s.dbIdx
+		ts = append(ts, t)
 	}
 	return ts
 }
