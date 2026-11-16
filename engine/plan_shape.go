@@ -45,11 +45,16 @@ func (s *shapeRecorder) made() int {
 }
 
 // planShape is what a program compiled for a shape needs to run another
-// statement of it: where its hidden parameters start, and which of the
-// statement's literals they are ('1' in pattern, by literal ordinal).
+// statement of it: where its hidden parameters start, which of the
+// statement's literals they are ('1' in pattern, by literal ordinal), and
+// which literal each one is, in their own order (order). The parser numbers
+// them as it makes them, which is not always the literals' order: in
+// "5 > (a = 7) + 4" the 7 is made first, inside the operand the 5 is
+// compared with.
 type planShape struct {
 	base    int
 	pattern string
+	order   []int
 }
 
 // shapeClause marks the outermost select's WHERE or ON as the place literals
@@ -188,29 +193,33 @@ func shapeKey(sql string, lits []token, pattern string) string {
 	return b.String()
 }
 
-// shapePattern is the pattern of the literals rec made parameters, among lits.
-func shapePattern(toks []token, lits []token, rec *shapeRecorder) string {
+// shapePattern is the pattern of the literals rec made parameters, among
+// lits, and the literal each of its parameters is (planShape.order).
+func shapePattern(toks []token, lits []token, rec *shapeRecorder) (string, []int) {
 	pat := []byte(strings.Repeat("0", len(lits)))
-	for _, ti := range rec.toks {
+	order := make([]int, len(rec.toks))
+	for k, ti := range rec.toks {
 		for i, t := range lits {
 			if t.Start == toks[ti].Start {
 				pat[i] = '1'
+				order[k] = i
 			}
 		}
 	}
-	return string(pat)
+	return string(pat), order
 }
 
-// shapeArgs is args followed by the values of the literals pattern marks, as
-// the parser reads them; false when one does not read as it did.
+// shapeArgs is args followed by the values of the literals sh's parameters
+// are, in their order, as the parser reads them; false when one does not
+// read as it did.
 func shapeArgs(args []Value, sh *planShape, lits []token) ([]Value, bool) {
-	out := make([]Value, sh.base, sh.base+strings.Count(sh.pattern, "1"))
+	out := make([]Value, sh.base, sh.base+len(sh.order))
 	copy(out, args)
-	for i, t := range lits {
-		if sh.pattern[i] != '1' {
-			continue
+	for _, i := range sh.order {
+		if i >= len(lits) {
+			return nil, false
 		}
-		switch t.kind {
+		switch t := lits[i]; t.kind {
 		case tkNumber:
 			v, err := literalNumber(t.text)
 			if err != nil {
@@ -298,7 +307,8 @@ func (p *ReadOnlyPager) execShaped(stmt *SelectStmt, sqlText string, args []Valu
 		return nil, nil, false, nil
 	}
 	lits := literalTokens(toks)
-	sh := &planShape{base: rec.base, pattern: shapePattern(toks, lits, rec)}
+	pattern, order := shapePattern(toks, lits, rec)
+	sh := &planShape{base: rec.base, pattern: pattern, order: order}
 	params, aok := shapeArgs(args, sh, lits)
 	if !aok {
 		return nil, nil, false, nil

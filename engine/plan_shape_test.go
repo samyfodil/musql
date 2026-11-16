@@ -93,6 +93,14 @@ func TestPlanShapeSharesPrograms(t *testing.T) {
 		`SELECT a FROM t WHERE 'c4' = c ORDER BY a`,
 		`SELECT t.a FROM t JOIN u ON u.x = t.b WHERE u.y > 'y1' AND t.c < 'c3' ORDER BY 1`,
 		`SELECT t.a FROM t JOIN u ON u.x = t.b WHERE u.y > 'y2' AND t.c < 'c4' ORDER BY 1`,
+		// A literal inside the operand another is compared with is made a
+		// parameter first, though it comes second.
+		`SELECT count(*) FROM t WHERE 5 > (b = 3) + 4`,
+		`SELECT count(*) FROM t WHERE 6 > (b = 2) + 5`,
+		`SELECT a FROM t WHERE 6 = (b = 4) + 5 ORDER BY a`,
+		`SELECT a FROM t WHERE 7 = (b = 2) + 6 ORDER BY a`,
+		`SELECT a FROM t WHERE 3 < (c = 'c1') + b ORDER BY a`,
+		`SELECT a FROM t WHERE 4 < (c = 'c2') + b ORDER BY a`,
 	}
 	args := []Value{{Typ: Int, I: 4}}
 	planShapeHits.Store(0)
