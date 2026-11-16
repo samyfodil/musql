@@ -74,14 +74,17 @@ func (p *parser) litTok(start int, e Expr) int {
 	return start
 }
 
-// shapeClass is the kind of number t is, as a shape key records it, or 0 for
+// shapeClass is the kind of literal t is, as a shape key records it, or 0 for
 // a token no shape cuts out. The kind is part of the key, so nothing compiled
 // from a literal's type is shared across types. An integer from -1 to 1 is
 // never cut: the planner estimates "x = K" for one differently
-// (whereIsSmallInt, sqlite3ExprIsInteger in whereLoopOutputAdjust). Nor is a
-// string or a blob: the segment kernels compare a column with a text literal
-// they read at compile time, and not with a parameter.
+// (whereIsSmallInt, sqlite3ExprIsInteger in whereLoopOutputAdjust). A string
+// is: a TEXT bound is read when the statement runs, by the segment filters
+// (segPlanPreds) as by the loop.
 func shapeClass(t token) byte {
+	if t.kind == tkString {
+		return 's'
+	}
 	if t.kind != tkNumber {
 		return 0
 	}
@@ -214,6 +217,8 @@ func shapeArgs(args []Value, sh *planShape, lits []token) ([]Value, bool) {
 				return nil, false
 			}
 			out = append(out, v)
+		case tkString:
+			out = append(out, Value{Typ: Text, S: []byte(t.str)})
 		default:
 			return nil, false
 		}
