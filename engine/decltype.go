@@ -56,7 +56,7 @@ func (p *ReadOnlyPager) selectDeclTypes(stmt *SelectStmt, depth int) ([]string, 
 		// whose caller asks for declared types a scan of each table it names.
 		saved := p.fromColumnsOnly
 		p.fromColumnsOnly = true
-		jts, _, err := p.resolveFrom(stmt.From, nil)
+		jts, err := p.resolveFrom(stmt.From, nil)
 		p.fromColumnsOnly = saved
 		if err != nil {
 			return nil, false
