@@ -235,6 +235,13 @@ func image(r *engine.Reader, m engine.Meta, pageSize int, f *os.File) error {
 		if err := tx.autoVacuumCommit(); err != nil {
 			return err
 		}
+		// The pages the commit moved down leave the file
+		// (sqlite3BtreeCommitPhaseOne's sqlite3PagerTruncateImage): a page
+		// past the end it left, with a stale pointer-map entry, made C's
+		// next commit that moves pages report the file malformed.
+		if tx.doTruncate {
+			bt.pager.dbSize = tx.nPage
+		}
 	}
 	// A fresh file after one commit, as VACUUM INTO writes it.
 	bt.pager.write(tx.page1)
