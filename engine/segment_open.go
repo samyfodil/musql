@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"strings"
+	"sync"
 )
 
 // OPENING A SEGMENT FILE AS A DATABASE -- the step that makes the segment file a
@@ -272,6 +273,53 @@ func schemaSQLOf(rows []SchemaRow, name string) string {
 	return ""
 }
 
+// autoIndexMemo is autoIndexNumbers' answers by CREATE TABLE text: every open
+// of a file derives them twice, for the session's pager and for the
+// committed-columns one, from text that seldom changes.
+var autoIndexMemo struct {
+	mu sync.Mutex
+	m  map[string][]int
+}
+
+const autoIndexMemoN = 1024
+
+// autoIndexNumbers is the N of each sqlite_autoindex_<table>_N row a table's
+// CREATE text implies, in constraint order; none for a text that does not
+// parse as a CREATE TABLE.
+//
+// A WITHOUT ROWID table's PRIMARY KEY constraint gets NO row, which is C
+// SQLite's own shape: it names that index but writes no sqlite_schema row for
+// it, and pragmaIndexInfo's own withoutRowidAutoPKOwner path depends on the
+// absence to know to append the table's non-key columns. Synthesizing one made
+// index_xinfo report the key columns alone.
+//
+// The NUMBER still counts it: C numbers automatic indexes in constraint order,
+// PRIMARY KEY included, so the UNIQUE constraint after a skipped PK is _2 and
+// not _1.
+func autoIndexNumbers(sql string) []int {
+	autoIndexMemo.mu.Lock()
+	nums, ok := autoIndexMemo.m[sql]
+	autoIndexMemo.mu.Unlock()
+	if ok {
+		return nums
+	}
+	if def, err := parsePragmaTableDef(sql); err == nil {
+		for i, spec := range def.autoIdx {
+			if !(def.withoutRowid && spec.kind == "pk") {
+				nums = append(nums, i+1)
+			}
+		}
+	}
+	autoIndexMemo.mu.Lock()
+	if autoIndexMemo.m == nil || len(autoIndexMemo.m) >= autoIndexMemoN {
+		autoIndexMemo.m = make(map[string][]int)
+	}
+	// Its own copy: the text may point into a mapping that is later unmapped.
+	autoIndexMemo.m[strings.Clone(sql)] = nums
+	autoIndexMemo.mu.Unlock()
+	return nums
+}
+
 // buildSegmentPager wires a read pager over a segment file and its replayed delta.
 func buildSegmentPager(path string, f *SegmentFile, st *segDeltaState) (*ReadOnlyPager, error) {
 	p := newReadOnlyPager()
@@ -318,37 +366,20 @@ func buildSegmentPager(path string, f *SegmentFile, st *segDeltaState) (*ReadOnl
 		if strings.TrimSpace(t.SQL) == "" {
 			continue
 		}
-		def, derr := parsePragmaTableDef(t.SQL)
-		if derr != nil {
-			continue // not parseable as a CREATE TABLE: nothing to derive
-		}
 		// An automatic index's ROWID follows its table's: sqlite3StartTable takes
 		// the table's row first (build.c:1377) and each constraint's
 		// sqlite3CreateIndex the next one (build.c:4460) -- a WITHOUT ROWID
 		// table's PRIMARY KEY, which writes no row, taking none.
 		autoRowid := t.Rowid
-		for i, spec := range def.autoIdx {
-			// A WITHOUT ROWID table's PRIMARY KEY constraint gets NO row, which is
-			// C SQLite's own shape: it names that index but writes no
-			// sqlite_schema row for it, and pragmaIndexInfo's own
-			// withoutRowidAutoPKOwner path depends on the absence to know to append
-			// the table's non-key columns. Synthesizing one made index_xinfo report
-			// the key columns alone.
-			//
-			// The NUMBER still counts it: C numbers automatic indexes in constraint
-			// order, PRIMARY KEY included, so the UNIQUE constraint after a skipped
-			// PK is _2 and not _1.
-			if def.withoutRowid && spec.kind == "pk" {
-				continue
-			}
-			keys = append(keys, catalogOrderKey{t.Rank, i + 1})
+		for _, n := range autoIndexNumbers(t.SQL) {
+			keys = append(keys, catalogOrderKey{t.Rank, n})
 			var rid int64
 			if t.Rowid > 0 {
 				autoRowid++
 				rid = autoRowid
 			}
 			rows = append(rows, SchemaRow{
-				Type: "index", Name: fmt.Sprintf("sqlite_autoindex_%s_%d", t.Name, i+1),
+				Type: "index", Name: fmt.Sprintf("sqlite_autoindex_%s_%d", t.Name, n),
 				TblName: t.Name, RootPage: 0, SQL: "", Rowid: rid,
 			})
 		}
