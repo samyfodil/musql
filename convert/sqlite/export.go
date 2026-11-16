@@ -263,6 +263,7 @@ func indexKeyInfo(r *engine.Reader, index string, shape engine.TableShape, enc T
 	if shape.WithoutRowid {
 		for _, k := range trailer {
 			ki.coll = append(ki.coll, k.Collation)
+			ki.desc = append(ki.desc, k.Desc)
 		}
 	}
 	return ki, nil
