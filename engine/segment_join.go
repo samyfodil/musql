@@ -2733,7 +2733,7 @@ func (m *vdbe) segJoinAggregate(plan *segJoinPlan) (bool, error) {
 // segJoinHashAgg fills a hashed GROUP BY's buckets, or reports false having
 // changed nothing. An error is a step's own.
 func (m *vdbe) segJoinHashAgg(plan *segJoinPlan) (bool, error) {
-	if m.hashAgg != nil && len(m.hashAgg.buckets) > 0 {
+	if m.hashAgg != nil && m.hashAgg.groups() > 0 {
 		return false, nil // not the fresh table the loop would fill
 	}
 	gs, ok := m.segJoinGroupsOf(plan)

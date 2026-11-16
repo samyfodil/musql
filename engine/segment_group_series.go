@@ -14,7 +14,7 @@ func (m *vdbe) segHashAggSeries(cur *vdbeCursor, plan *segGroupPlan) bool {
 	if plan.bare || len(plan.preds) > 0 || len(plan.lists) > 0 || plan.agg == nil {
 		return false
 	}
-	if saved := m.hashAgg; saved != nil && len(saved.buckets) > 0 {
+	if saved := m.hashAgg; saved != nil && saved.groups() > 0 {
 		return false
 	}
 	sr, ok := cur.seriesScan()

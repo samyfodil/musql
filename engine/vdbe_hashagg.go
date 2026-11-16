@@ -8,6 +8,7 @@ package engine
 
 import (
 	"math"
+	"math/bits"
 	"sort"
 	"unsafe"
 )
@@ -30,8 +31,11 @@ type hashAggBucket struct {
 // OpHashAggNext exactly like a vdbeSorter's post-sort entries.
 type hashAggState struct {
 	buckets map[string]*hashAggBucket
-	sorted  []*hashAggBucket
-	pos     int
+	// ints is the buckets of the keys of INTEGERs and NULLs (hashAggIntKey),
+	// which buckets does not hold.
+	ints   map[hashAggIntKey]*hashAggBucket
+	sorted []*hashAggBucket
+	pos    int
 	// made is the buckets in the order they were made, and unordered whether
 	// one was made below the one before it: until then made is already the
 	// drain's order (a scan in key order, the columnar walk's dense groups).
@@ -41,24 +45,33 @@ type hashAggState struct {
 	slab aggSlab
 
 	// A plan denseAggPlan accepts keeps no accumulator set per group: each
-	// group's accumulators are values, len(denseItems) of them from
-	// dense[at*len(denseItems)], with its anchor flags in denseFlags[at],
-	// and the one set denseAccs, whose items are denseItems, is loaded with
-	// the group a step or the drain works on (denseCur).
-	dense      []aggDense
+	// group's accumulators are values, len(denseItems) of them (denseOf),
+	// with its anchor flags in denseFlags[at], and the one set denseAccs,
+	// whose items are denseItems, is loaded with the group a step or the
+	// drain works on (denseCur).
+	dense      [][]aggSumState
 	denseFlags []uint8
 	denseAccs  *aggAccumulators
 	denseItems []*aggItem
 	denseCur   *hashAggBucket
 }
 
-// aggDense is everything step and finalize read or write of an accumulator
-// of the kinds denseAggPlan accepts.
-type aggDense struct {
-	cnt, iSum                   int64
-	rSum, rErr                  float64
-	topExp, unitExp             int16
-	approx, overflow, win, risk bool
+// denseChunk is how many groups the first of dense's chunks holds; each
+// chunk holds twice the one before it, so a new group never moves the values
+// of those made before it.
+const denseChunk = 64
+
+// denseChunkOf is the chunk group at's values are in, and its place there.
+func denseChunkOf(at int32) (chunk, off int) {
+	chunk = bits.Len(uint(at)/denseChunk+1) - 1
+	return chunk, int(at) - denseChunk*(1<<chunk-1)
+}
+
+// denseOf is group at's accumulator values.
+func (h *hashAggState) denseOf(at int32) []aggSumState {
+	n := len(h.denseItems)
+	c, off := denseChunkOf(at)
+	return h.dense[c][off*n : off*n+n]
 }
 
 // denseAggOffForTest keeps every group's own accumulator set, so a test can
@@ -72,7 +85,7 @@ const (
 )
 
 // denseAggPlan reports whether plan's groups can keep their accumulators as
-// aggDense values: every aggregate a count, sum, total or avg with no
+// aggSumState values: every aggregate a count, sum, total or avg with no
 // DISTINCT or ORDER BY, no census site or anchor certificate, and an anchor
 // that is no row or the group's key (rowFromKeys), so a group's state is its
 // accumulators' numbers and three flags.
@@ -136,12 +149,9 @@ func (h *hashAggState) accsOf(b *hashAggBucket) *aggAccumulators {
 		return h.denseAccs
 	}
 	h.storeDense()
-	n := len(h.denseItems)
+	ds := h.denseOf(b.at)
 	for k, it := range h.denseItems {
-		d := &h.dense[int(b.at)*n+k]
-		it.cnt, it.iSum, it.rSum, it.rErr = d.cnt, d.iSum, d.rSum, d.rErr
-		it.sumTopExp, it.sumUnitExp = int(d.topExp), int(d.unitExp)
-		it.sumApprox, it.sumOverflow, it.sumWinSet, it.orderRisk = d.approx, d.overflow, d.win, d.risk
+		it.aggSumState = ds[k]
 	}
 	a, f := h.denseAccs, h.denseFlags[b.at]
 	a.seenRow, a.magnetHit, a.haveAnchor = f&denseSeen != 0, f&denseHit != 0, f&denseAnchor != 0
@@ -158,10 +168,9 @@ func (h *hashAggState) storeDense() {
 	if b == nil {
 		return
 	}
-	n := len(h.denseItems)
+	ds := h.denseOf(b.at)
 	for k, it := range h.denseItems {
-		h.dense[int(b.at)*n+k] = aggDense{cnt: it.cnt, iSum: it.iSum, rSum: it.rSum, rErr: it.rErr,
-			topExp: int16(it.sumTopExp), unitExp: int16(it.sumUnitExp), approx: it.sumApprox, overflow: it.sumOverflow, win: it.sumWinSet, risk: it.orderRisk}
+		ds[k] = it.aggSumState
 	}
 	a := h.denseAccs
 	var f uint8
@@ -367,9 +376,8 @@ func (m *vdbe) hashAggStep(plan *aggPlan, keyVals []Value, seg int) error {
 		// The row is read only for a group's anchor, which a group with no
 		// census site took on its first row (magnetWalk): an existing such
 		// group steps from its registers alone.
-		m.aggKeyBuf = hashAggKeyBytes(m.aggKeyBuf[:0], keyVals)
 		var a *aggAccumulators
-		if b := m.hashAgg.buckets[string(m.aggKeyBuf)]; b != nil {
+		if b, _, _ := m.hashAggFind(keyVals); b != nil {
 			a = m.hashAgg.accsOf(b)
 		}
 		if a != nil && a.seenRow && len(a.magnets) == 0 && a.check == nil {
@@ -401,21 +409,28 @@ func (m *vdbe) hashAggStepRow(plan *aggPlan, keyVals []Value, seg int, row, rowi
 			m.hashAgg.startDense(plan)
 		}
 	}
-	// Key bytes are reused per row: buckets store their own copy, so a lookup key
-	// is discarded after use. String(...) indexing avoids per-row allocations.
-	m.aggKeyBuf = hashAggKeyBytes(m.aggKeyBuf[:0], keyVals)
-	b := m.hashAgg.buckets[string(m.aggKeyBuf)]
+	b, ik, isInt := m.hashAggFind(keyVals)
 	if b == nil {
 		h := m.hashAgg
 		b = h.slab.bucket()
 		if h.denseAccs != nil {
-			*b = hashAggBucket{key: h.slab.cloneValues(keyVals), at: int32(len(h.denseFlags))}
-			h.dense = append(h.dense, make([]aggDense, len(h.denseItems))...)
+			at := int32(len(h.denseFlags))
+			*b = hashAggBucket{key: h.slab.cloneValues(keyVals), at: at}
+			if c, _ := denseChunkOf(at); c == len(h.dense) {
+				h.dense = append(h.dense, make([]aggSumState, denseChunk<<c*len(h.denseItems)))
+			}
 			h.denseFlags = append(h.denseFlags, 0)
 		} else {
 			*b = hashAggBucket{key: h.slab.cloneValues(keyVals), accs: h.slab.newAggAccs(plan)}
 		}
-		h.buckets[h.slab.key(m.aggKeyBuf)] = b
+		if isInt {
+			if h.ints == nil {
+				h.ints = map[hashAggIntKey]*hashAggBucket{}
+			}
+			h.ints[ik] = b
+		} else {
+			h.buckets[h.slab.key(m.aggKeyBuf)] = b
+		}
 		if n := len(h.made); n > 0 && !h.unordered && !keyTupleLess(h.made[n-1].key, b.key, m.encoding()) {
 			h.unordered = true
 		}
@@ -426,6 +441,62 @@ func (m *vdbe) hashAggStepRow(plan *aggPlan, keyVals []Value, seg int, row, rowi
 	clearJSONSubtype(row)
 	return m.aggStep(m.aggRowCtx(plan, row, rowids), seg)
 }
+
+// hashAggIntKey is a group key of up to four INTEGERs and NULLs by value,
+// nulls marking the NULLs: hashed and compared in place, where the string
+// key's bytes are hashed again at every growth of the table.
+type hashAggIntKey struct {
+	v        [4]int64
+	n, nulls uint8
+}
+
+// hashAggIntKeyOf is vals as a hashAggIntKey, which two keys share exactly
+// when their string keys (hashAggKeyBytes) are the same: an integer-valued
+// REAL keys as its INTEGER. False for any other kind, or more than four.
+func hashAggIntKeyOf(vals []Value) (hashAggIntKey, bool) {
+	k := hashAggIntKey{n: uint8(len(vals))}
+	if len(vals) > len(k.v) {
+		return k, false
+	}
+	for i, v := range vals {
+		switch v.Typ {
+		case Int:
+			k.v[i] = v.I
+		case Null:
+			k.nulls |= 1 << i
+		case Float:
+			n, ok := floatAsCanonicalInt(v.F)
+			if !ok {
+				return k, false
+			}
+			k.v[i] = n
+		default:
+			return k, false
+		}
+	}
+	return k, true
+}
+
+// hashAggFind is the bucket of keyVals, or nil, and the key it is or would be
+// kept under: ik where isInt, else m.aggKeyBuf's bytes.
+func (m *vdbe) hashAggFind(keyVals []Value) (b *hashAggBucket, ik hashAggIntKey, isInt bool) {
+	h := m.hashAgg
+	if ik, isInt = hashAggIntKeyOf(keyVals); isInt && !hashAggIntKeysOffForTest {
+		return h.ints[ik], ik, true
+	}
+	// Key bytes are reused per row: buckets store their own copy, so a lookup
+	// key is discarded after use. String(...) indexing avoids per-row
+	// allocations.
+	m.aggKeyBuf = hashAggKeyBytes(m.aggKeyBuf[:0], keyVals)
+	return h.buckets[string(m.aggKeyBuf)], ik, false
+}
+
+// hashAggIntKeysOffForTest keys every group by its bytes, so a test can hold
+// the INTEGER keys to them.
+var hashAggIntKeysOffForTest bool
+
+// groups is how many groups h has made.
+func (h *hashAggState) groups() int { return len(h.buckets) + len(h.ints) }
 
 // stepGathered is step's body for each of rows, the registers native code
 // gathered at it (gatherAggStep), in the order it gathered them. The

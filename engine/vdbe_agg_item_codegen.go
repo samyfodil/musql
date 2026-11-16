@@ -511,7 +511,7 @@ func (p *aggItemProgram) runnable(m *vdbe, aggVals, groupKey, bareVals, bareRowi
 // -- is NULL past its end, as run's padded copy is; any other short block is
 // run's to refuse.
 func (p *aggItemProgram) seeded(aggVals, groupKey, bareVals, bareRowids []Value) (Value, bool) {
-	if in := p.prog.Insns; len(in) != 2 || in[0].Op != OpInit || in[1].Op != OpHalt {
+	if !p.runsNothing() {
 		return Value{}, false
 	}
 	r := p.resultReg
@@ -530,6 +530,22 @@ func (p *aggItemProgram) seeded(aggVals, groupKey, bareVals, bareRowids []Value)
 		}
 	}
 	return Value{}, false
+}
+
+// runsNothing reports whether p's result is a register run would seed.
+func (p *aggItemProgram) runsNothing() bool {
+	in := p.prog.Insns
+	return len(in) == 2 && in[0].Op == OpInit && in[1].Op == OpHalt
+}
+
+// seededNoAnchor is seeded for a result that is an aggregate's value or a
+// key's, which no anchor is read for; false for any other.
+func (p *aggItemProgram) seededNoAnchor(aggVals, groupKey []Value) (Value, bool) {
+	r := p.resultReg
+	if !p.runsNothing() || (r < p.aggBase || r >= p.aggBase+p.nAgg) && (r < p.keyBase || r >= p.keyBase+p.nKey) {
+		return Value{}, false
+	}
+	return p.seeded(aggVals, groupKey, nil, nil)
 }
 
 // run seeds the four register blocks for one group and runs the program.
