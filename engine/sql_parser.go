@@ -5170,6 +5170,23 @@ func asCreateTableIdent(t token) (token, bool) {
 	return t, false
 }
 
+// tableConstraintStart is the keywords a table constraint starts with.
+var tableConstraintStart = map[string]bool{
+	"PRIMARY": true, "UNIQUE": true, "CHECK": true, "FOREIGN": true, "CONSTRAINT": true,
+}
+
+// columnConstraintStart is the keywords that end a column definition's
+// declared type. NULL is one of these: SQLite's grammar has a bare "NULL"
+// column constraint (parse.y's `ccons ::= NULL onconf`), so "id INTEGER NULL"
+// declares the type INTEGER and then a no-op constraint -- not the type
+// "INTEGER NULL". Without it here that column was not a rowid alias, and
+// "id INTEGER NULL PRIMARY KEY AUTOINCREMENT" was declined outright.
+var columnConstraintStart = map[string]bool{
+	"PRIMARY": true, "NOT": true, "NULL": true, "UNIQUE": true, "CHECK": true,
+	"CONSTRAINT": true, "DEFAULT": true, "COLLATE": true, "REFERENCES": true,
+	"GENERATED": true, "AS": true,
+}
+
 // parseCreateTableColumnsAndAutoIndexes parses a CREATE TABLE's columns plus
 // every UNIQUE/PRIMARY KEY constraint needing an automatic index
 // (autoIndexSpec) and every CHECK's structural shape (checkConstraint). A
@@ -5237,68 +5254,27 @@ func parseCreateTableColumnsAndAutoIndexes(createSQL string, forceNoRowidAlias b
 	if !(toks[i].kind == tkPunct && toks[i].text == "(") {
 		return nil, nil, nil, fmt.Errorf("engine: CREATE TABLE: expected '('")
 	}
-	i++
-
-	// Split the column/constraint list into top-level (paren-depth-0)
-	// comma-separated segments.
-	var segments [][]token
-	var cur []token
-	depth := 0
-	for {
-		if i >= len(toks) || toks[i].kind == tkEOF {
-			return nil, nil, nil, fmt.Errorf("engine: CREATE TABLE: unterminated column list")
-		}
-		t := toks[i]
-		switch {
-		case t.kind == tkPunct && t.text == "(":
-			depth++
-			cur = append(cur, t)
-			i++
-		case t.kind == tkPunct && t.text == ")":
-			if depth == 0 {
-				segments = append(segments, cur)
-				i++
-				goto doneSegments
-			}
-			depth--
-			cur = append(cur, t)
-			i++
-		case t.kind == tkPunct && t.text == "," && depth == 0:
-			segments = append(segments, cur)
-			cur = nil
-			i++
-		default:
-			cur = append(cur, t)
-			i++
-		}
+	end := matchParen(toks, i)
+	if end < 0 {
+		return nil, nil, nil, fmt.Errorf("engine: CREATE TABLE: unterminated column list")
 	}
-doneSegments:
+	// The column/constraint list's top-level (paren-depth-0) comma-separated
+	// segments.
+	segments := splitTopLevelCommas(toks[i+1 : end])
+	i = end + 1
 
 	// toks[i:] is everything after the column list's closing ")" -- the
 	// table-option tail. See this function's doc comment for why STRICT is
 	// read from the text here rather than passed in.
 	strict := tailDeclaresStrict(toks[i:])
 
-	var cols []columnInfo
+	cols := make([]columnInfo, 0, len(segments))
 	var checks []checkConstraint
 	var specs []autoIndexSpec
 	// fkConstraints collects each table-level FOREIGN KEY's shape so its
 	// column counts can be validated once every column is known -- see
 	// validateForeignKeyShapes.
 	var fkConstraints []fkShape
-	tableConstraintKeywords := map[string]bool{
-		"PRIMARY": true, "UNIQUE": true, "CHECK": true, "FOREIGN": true, "CONSTRAINT": true,
-	}
-	// NULL is one of these: SQLite's grammar has a bare "NULL" column
-	// constraint (parse.y's `ccons ::= NULL onconf`), so "id INTEGER NULL"
-	// declares the type INTEGER and then a no-op constraint -- not the type
-	// "INTEGER NULL". Without it here that column was not a rowid alias, and
-	// "id INTEGER NULL PRIMARY KEY AUTOINCREMENT" was declined outright.
-	colConstraintStart := map[string]bool{
-		"PRIMARY": true, "NOT": true, "NULL": true, "UNIQUE": true, "CHECK": true,
-		"CONSTRAINT": true, "DEFAULT": true, "COLLATE": true, "REFERENCES": true,
-		"GENERATED": true, "AS": true,
-	}
 
 	// A comma between TABLE constraints is optional in SQLite's grammar, so one
 	// comma-separated segment may hold several of them -- "CONSTRAINT one
@@ -5308,7 +5284,7 @@ doneSegments:
 	// failed: two"). Expand those into one segment each up front, so the loop
 	// below keeps handling exactly one constraint per segment; taking only the
 	// first, as this used to, silently DROPPED the rest.
-	segments = expandTableConstraintSegments(segments, tableConstraintKeywords)
+	segments = expandTableConstraintSegments(segments, tableConstraintStart)
 
 	// carriedName is a "CONSTRAINT <name>" that named no constraint of its own
 	// (it ended its segment): SQLite's grammar makes it the name of the NEXT
@@ -5332,14 +5308,15 @@ doneSegments:
 		// A single-quoted column NAME ("CREATE TABLE t('c0a', 'c1b')" -- the
 		// spelling fts3/fts4 use for their shadow tables) is an identifier
 		// here, not a string literal; see asCreateTableIdent. Rewritten in
-		// place so every rule below sees an ordinary quoted identifier. A
-		// leading string can never be a table-constraint keyword, so this is
-		// unambiguous.
+		// place, in the segment's own copy (it shares lex's tokens), so every
+		// rule below sees an ordinary quoted identifier. A leading string can
+		// never be a table-constraint keyword, so this is unambiguous.
 		if seg[0].kind == tkString {
+			seg = append([]token{seg[0]}, seg[1:]...)
 			seg[0], _ = asCreateTableIdent(seg[0])
 		}
 		first := seg[0]
-		if first.kind == tkIdent && tableConstraintKeywords[first.upper()] {
+		if first.kind == tkIdent && first.upperIn(tableConstraintStart) {
 			sawTableConstraint = true
 			// Table-level constraint: "[CONSTRAINT name] PRIMARY KEY(...)", "UNIQUE(...)",
 			// "CHECK(...)" or FOREIGN KEY. A CONSTRAINT name prefix is stripped first so
@@ -5513,19 +5490,14 @@ doneSegments:
 		// (alter.test/index.test). The exact set was derived FROM the oracle,
 		// one CREATE TABLE per keyword -- see nonIdentifierKeywords -- and a
 		// QUOTED spelling stays legal, which is why seg[0].quoted exempts it.
-		if seg[0].kind == tkIdent && !seg[0].quoted && nonIdentifierKeywords[seg[0].upper()] {
+		if seg[0].kind == tkIdent && !seg[0].quoted && seg[0].upperIn(nonIdentifierKeywords) {
 			return nil, nil, nil, fmt.Errorf("engine: near %q: syntax error", seg[0].text)
 		}
 		j := 1
-		var typeToks []token
-		for j < len(seg) {
-			tt := seg[j]
-			if tt.kind == tkIdent && colConstraintStart[tt.upper()] {
-				break
-			}
-			typeToks = append(typeToks, tt)
+		for j < len(seg) && !(seg[j].kind == tkIdent && seg[j].upperIn(columnConstraintStart)) {
 			j++
 		}
+		typeToks := seg[1:j:j]
 		if gerr := validateColumnDefGrammar(seg, 1, j); gerr != nil {
 			return nil, nil, nil, gerr
 		}
@@ -5633,7 +5605,7 @@ doneSegments:
 				// token after it ("b AS (a) WAT") is not in C's grammar.
 				if j < len(seg) {
 					nx := seg[j]
-					if !(nx.kind == tkIdent && (colConstraintStart[nx.upper()] || nx.isKw("DEFERRABLE"))) {
+					if !(nx.kind == tkIdent && (nx.upperIn(columnConstraintStart) || nx.isKw("DEFERRABLE"))) {
 						return nil, nil, nil, fmt.Errorf("engine: error in generated column %q", name)
 					}
 				}
@@ -5751,7 +5723,7 @@ doneSegments:
 				// followers too.
 				if dknown && dend < len(seg) {
 					nx := seg[dend]
-					if !(nx.kind == tkIdent && (colConstraintStart[nx.upper()] || nx.isKw("NULL") || nx.isKw("DEFERRABLE"))) {
+					if !(nx.kind == tkIdent && (nx.upperIn(columnConstraintStart) || nx.isKw("NULL") || nx.isKw("DEFERRABLE"))) {
 						dknown = false
 					}
 				}
@@ -5760,7 +5732,7 @@ doneSegments:
 				// not trust the expression parsed out of its prefix either.
 				if ddefer != nil && dend < len(seg) {
 					nx := seg[dend]
-					if !(nx.kind == tkIdent && (colConstraintStart[nx.upper()] || nx.isKw("NULL") || nx.isKw("DEFERRABLE"))) {
+					if !(nx.kind == tkIdent && (nx.upperIn(columnConstraintStart) || nx.isKw("NULL") || nx.isKw("DEFERRABLE"))) {
 						ddefer = nil
 					}
 				}
