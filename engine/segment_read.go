@@ -1,9 +1,11 @@
 package engine
 
 import (
+	"cmp"
 	"fmt"
 	"iter"
 	"os"
+	"slices"
 )
 
 // Serving table scans from columnar segments. Every read -- VDBE cursors,
@@ -342,11 +344,8 @@ func (p *ReadOnlyPager) segFilterCountTable(rootPage uint32, preds []segPred, ip
 	if !ok {
 		return 0, false
 	}
-	// TEXT bounds require UTF-8 encoding, as byte comparison is collation-aware.
-	for i := range preds {
-		if preds[i].Val.Typ == Text && p.meta.encoding != UTF8 {
-			return 0, false
-		}
+	if !p.segTextBoundsScannable(preds) {
+		return 0, false
 	}
 	// A row-major delta in front of the segments makes a raw block read wrong, and
 	// this used to decline for it outright -- which meant declining after every
@@ -413,6 +412,19 @@ func (p *ReadOnlyPager) segFilterCountTable(rootPage uint32, preds []segPred, ip
 	return total - sub + add, true
 }
 
+// segTextBoundsScannable reports whether a scan of the segments may answer
+// preds' TEXT bounds. Byte comparison is only BINARY's in UTF-8. And an
+// equality is left to the loop, whose cursor finds the matching rows by the
+// segment's equality index instead of comparing every row.
+func (p *ReadOnlyPager) segTextBoundsScannable(preds []segPred) bool {
+	for _, pr := range preds {
+		if pr.Val.Typ == Text && (p.meta.encoding != UTF8 || pr.Op == segEQ) {
+			return false
+		}
+	}
+	return true
+}
+
 // segFilterSumTable answers `sum(col) WHERE <preds>` from the segments.
 // It declines on integer overflow rather than approximating.
 func (p *ReadOnlyPager) segFilterSumTable(rootPage uint32, preds []segPred, col, ipk int) (Value, bool) {
@@ -421,6 +433,9 @@ func (p *ReadOnlyPager) segFilterSumTable(rootPage uint32, preds []segPred, col,
 	}
 	segs, ok := p.segs.byRoot[rootPage]
 	if !ok {
+		return Value{}, false
+	}
+	if !p.segTextBoundsScannable(preds) {
 		return Value{}, false
 	}
 	// A row-major delta beside the segments makes a raw block read wrong, so its
@@ -460,21 +475,7 @@ func (p *ReadOnlyPager) segFilterSumTable(rootPage uint32, preds []segPred, col,
 		if !okCol {
 			return false
 		}
-		cols, okPreds := segPredColumns(s, preds)
-		if !okPreds {
-			return false
-		}
-		for i := 0; i < s.nRows; i++ {
-			keep := true
-			for j, pr := range preds {
-				if i >= len(cols[j]) || !pr.Op.satisfied(cmpInt64(cols[j][i], pr.Val.I)) {
-					keep = false
-					break
-				}
-			}
-			if !keep {
-				continue
-			}
+		take := func(i int) bool {
 			if i >= len(vals) {
 				return false
 			}
@@ -489,6 +490,50 @@ func (p *ReadOnlyPager) segFilterSumTable(rootPage uint32, preds []segPred, col,
 			pt.abs += u
 			pt.sum += v
 			pt.matched++
+			return true
+		}
+		cols, okPreds := segPredColumns(s, preds)
+		if !okPreds {
+			// A bound on a column that is not an int64 block -- a TEXT one, or
+			// a REAL -- is applied a batch at a time, as the count applies it
+			// (segFilterCount); the loop a service block would otherwise run
+			// for every row is several times slower.
+			if !segPredColsFilterable(s, preds) {
+				return false
+			}
+			// The integer bounds first: they are the cheap ones, and a row
+			// they rule out is not compared as text.
+			ordered := slices.SortedStableFunc(slices.Values(preds), func(a, b segPred) int {
+				return cmp.Compare(b2flag(a.Val.Typ != Int), b2flag(b.Val.Typ != Int))
+			})
+			var flags [segFilterBatch]uint8
+			for lo := 0; lo < s.nRows; lo += segFilterBatch {
+				live := flags[:min(segFilterBatch, s.nRows-lo)]
+				for i := range live {
+					live[i] = 1
+				}
+				for _, pr := range ordered {
+					segApplyPred(s, pr, lo, live)
+				}
+				for i, f := range live {
+					if f != 0 && !take(lo+i) {
+						return false
+					}
+				}
+			}
+			return true
+		}
+		for i := 0; i < s.nRows; i++ {
+			keep := true
+			for j, pr := range preds {
+				if i >= len(cols[j]) || !pr.Op.satisfied(cmpInt64(cols[j][i], pr.Val.I)) {
+					keep = false
+					break
+				}
+			}
+			if keep && !take(i) {
+				return false
+			}
 		}
 		return true
 	})
