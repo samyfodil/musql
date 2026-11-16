@@ -116,7 +116,7 @@ type vdbeCursor struct {
 	// scanMask is the columns a materialized cursor's scan decodes from the
 	// segments (scanTableCols); the rest read valueUnread until fetched.
 	scanMask columnMask
-	colMask columnMask
+	colMask  columnMask
 
 	// seekConfigured/seekKey turn the first rewind() into a rowid point lookup
 	// (SeekRowidSegments) instead of a full scan. Set by OpSeekRowidHint; the
@@ -1020,6 +1020,13 @@ func (cur *vdbeCursor) tableEmpty() (empty, ok bool) {
 	if cur.tbl == nil || cur.pager == nil || cur.materialized || cur.fill != nil || cur.rowStore != nil || cur.sub != nil || cur.vt != nil ||
 		cur.seekConfigured || cur.seekSetConfigured || cur.idxSeekConfigured || cur.seekReseek || cur.ranged || cur.segFilter != nil {
 		return false, false
+	}
+	// The segments' row counts, with the log's rows merged, as count(*)
+	// takes them: no row is read, where the scan below builds a chunk of
+	// rows to yield its first.
+	if n, served := cur.pager.segFilterCountTable(cur.tbl.root, nil, cur.tbl.ipkIndex); served {
+		cur.emptyKnown, cur.empty = true, n == 0
+		return n == 0, true
 	}
 	seq, errFn := cur.pager.scanTableCols(cur.tbl.root, 1)
 	empty = true
