@@ -90,6 +90,8 @@ func vmStepOf(in VInsn, pc int) progStep {
 		s.uses, s.targets = []int{in.A}, []int{in.T}
 	case VIntGuard:
 		s.uses = []int{in.A}
+	case VGuardCopy:
+		s.uses, s.defs = []int{in.A, in.C}, []int{in.B}
 	case VNull:
 		s.defs = []int{in.C}
 	case VNeg, VNot:
