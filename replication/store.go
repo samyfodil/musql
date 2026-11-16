@@ -56,6 +56,8 @@ type Store struct {
 	// its version in _repl_meta.
 	cat *catalog
 	ver string
+	// replay is the last schema reduction, for the next schema op (applySchema).
+	replay *schemaReplay
 	// txHeld caches, inside an ingest's transaction, whether a table has
 	// withheld rows.
 	txHeld map[string]bool
@@ -694,8 +696,15 @@ func (s *Store) ingestTx(ctx context.Context, ops []Op, local, batch, whole bool
 		return nil, -1, err
 	}
 	added := map[string]map[uint64]bool{}
-	var run []Op
+	// run is the data ops waiting to merge, or schemaRun the schema ops in a
+	// row waiting to be installed: at most one of them holds any.
+	var run, schemaRun []Op
 	flush := func() error {
+		if len(schemaRun) > 0 {
+			err := s.applySchemaOps(ctx, schemaRun, local)
+			schemaRun = schemaRun[:0]
+			return err
+		}
 		err := s.applyOps(ctx, run, local)
 		run = run[:0]
 		return err
@@ -744,7 +753,21 @@ func (s *Store) ingestTx(ctx context.Context, ops []Op, local, batch, whole bool
 				s.seenRowid(op.Tbl, v)
 			}
 		}
+		if batch && op.Kind == OpSchema {
+			if len(run) > 0 {
+				if err := flush(); err != nil { // a schema op applies after every op before it
+					return nil, i, err
+				}
+			}
+			schemaRun = append(schemaRun, op)
+			continue
+		}
 		if batch && op.Kind != OpSchema {
+			if len(schemaRun) > 0 {
+				if err := flush(); err != nil {
+					return nil, i, err
+				}
+			}
 			if run = append(run, op); len(run) < applyRunMax {
 				continue
 			}
@@ -761,6 +784,25 @@ func (s *Store) ingestTx(ctx context.Context, ops []Op, local, batch, whole bool
 		}
 	}
 	return added, len(ops), flush()
+}
+
+// applySchemaOps installs schema ops in a row, already in the log. More than
+// one go in together: the user tables go straight to what the log reduces to
+// (installSchema), one reduction for the run where one each replayed every
+// schema op before it, and no reader sees the steps between them anyway.
+func (s *Store) applySchemaOps(ctx context.Context, ops []Op, local bool) error {
+	if len(ops) == 1 {
+		return s.applyOp(ctx, ops[0], local)
+	}
+	clear(s.txHeld)
+	if !local {
+		s.pend.everything()
+	}
+	cat, ver, err := s.installSchema(ctx)
+	if err == nil {
+		s.cat, s.ver = cat, ver
+	}
+	return err
 }
 
 // applyOp applies op, already in the log, to the clock and the user tables.

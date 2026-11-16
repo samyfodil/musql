@@ -229,6 +229,7 @@ func releaseSite(site string) {
 // Close closes the syncer's apply handle and frees its site for another Open.
 func (s *Syncer) Close() error {
 	defer releaseSite(s.site)
+	s.store.closeReplay()
 	return s.store.db.Close()
 }
 

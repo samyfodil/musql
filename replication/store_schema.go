@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -174,11 +175,16 @@ func (s *Store) applySchema(ctx context.Context, op Op) (*catalog, string, error
 	}
 	last := len(ops) - 1
 	isLast := ops[last].Site == op.Site && ops[last].Seq == op.Seq
-	target, sc, err := replaySchema(ctx, ops[:last])
+	target, sc, err := s.replayed(ctx, ops[:last])
 	if err != nil {
 		return nil, "", err
 	}
-	defer sc.close()
+	kept := false
+	defer func() {
+		if !kept {
+			sc.close()
+		}
+	}()
 	before := target.clone()
 	so, err := decodeSchemaOp(ops[last])
 	if err != nil {
@@ -212,7 +218,113 @@ func (s *Store) applySchema(ctx context.Context, op Op) (*catalog, string, error
 		return nil, "", err
 	}
 	ver, err := saveCatalog(ctx, s.execQ, target)
-	return target, ver, err
+	if err != nil {
+		return nil, "", err
+	}
+	s.keepReplay(ops, target.clone(), sc)
+	kept = true
+	return target, ver, nil
+}
+
+// schemaReplay is the reduction applySchema made last: the schema ops it
+// reduced, in canonical order, and the catalog and scratch they reduce to.
+// A reduction is a function of its ops alone, each fixed by its (site, seq),
+// so the next schema op, which reduces the same ops before it, starts from
+// this one instead of replaying them all -- for a peer's whole schema, once
+// per op.
+type schemaReplay struct {
+	keys []schemaKey
+	cat  *catalog
+	sc   *scratch
+}
+
+type schemaKey struct {
+	site string
+	seq  uint64
+}
+
+func schemaKeys(ops []Op) []schemaKey {
+	keys := make([]schemaKey, len(ops))
+	for i, op := range ops {
+		keys[i] = schemaKey{op.Site, op.Seq}
+	}
+	return keys
+}
+
+// replayed is replaySchema(ops), from the kept reduction when its ops begin
+// these: only the ops past them are reduced. The caller owns what it returns.
+func (s *Store) replayed(ctx context.Context, ops []Op) (*catalog, *scratch, error) {
+	r := s.replay
+	s.replay = nil
+	if r == nil {
+		return replaySchema(ctx, ops)
+	}
+	if keys := schemaKeys(ops); len(r.keys) > len(keys) || !slices.Equal(r.keys, keys[:len(r.keys)]) {
+		r.sc.close()
+		return replaySchema(ctx, ops)
+	}
+	for _, op := range ops[len(r.keys):] {
+		so, err := decodeSchemaOp(op)
+		if err == nil {
+			_, err = r.cat.apply(ctx, r.sc, so)
+		}
+		if err != nil {
+			r.sc.close()
+			return nil, nil, err
+		}
+	}
+	return r.cat, r.sc, nil
+}
+
+// installSchema puts the user tables at what every schema op in the log
+// reduces to, from whatever they hold (reconcile), and returns that catalog
+// and its version.
+func (s *Store) installSchema(ctx context.Context) (*catalog, string, error) {
+	ops, err := s.schemaOps(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	target, sc, err := s.replayed(ctx, ops)
+	if err != nil {
+		return nil, "", err
+	}
+	kept := false
+	defer func() {
+		if !kept {
+			sc.close()
+		}
+	}()
+	if err := s.reconcile(ctx, s.cat, target); err != nil {
+		return nil, "", err
+	}
+	if err := s.checkInstalled(ctx, sc); err != nil {
+		return nil, "", err
+	}
+	ver, err := saveCatalog(ctx, s.execQ, target)
+	if err != nil {
+		return nil, "", err
+	}
+	s.keepReplay(ops, target.clone(), sc)
+	kept = true
+	return target, ver, nil
+}
+
+// keepReplay keeps cat and sc, what ops reduce to, for the next replayed.
+func (s *Store) keepReplay(ops []Op, cat *catalog, sc *scratch) {
+	if s.replay != nil {
+		s.replay.sc.close()
+	}
+	s.replay = &schemaReplay{keys: schemaKeys(ops), cat: cat, sc: sc}
+}
+
+// closeReplay closes the kept reduction's scratch.
+func (s *Store) closeReplay() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.replay != nil {
+		s.replay.sc.close()
+		s.replay = nil
+	}
 }
 
 // checkInstalled compares the real catalog with the reducer's scratch.
