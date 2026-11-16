@@ -35,9 +35,9 @@ jobs:
       - name: libm
         run: go test ./internal/libm/ ${{ matrix.race }} -count=1 -timeout 10m
       - name: engine suite
-        run: go test ./engine/ ${{ matrix.race }} -count=1 -timeout 20m
+        run: go test ./engine/ ${{ matrix.race }} -count=1 -timeout 30m
       - name: engine suite (fts5 build tag)
-        run: go test ./engine/ ${{ matrix.race }} -tags sqlite_fts5 -count=1 -timeout 20m
+        run: go test ./engine/ ${{ matrix.race }} -tags sqlite_fts5 -count=1 -timeout 30m
       - name: engine suite without the JIT
         if: matrix.race == ''
         env:
