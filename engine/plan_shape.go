@@ -146,6 +146,23 @@ func (p *parser) shapeInList(x Expr, list []Expr) []Expr {
 	return out
 }
 
+// shapeBetween is the bounds of a BETWEEN over x with each number made a
+// hidden parameter where the shape allows, as shapeInList makes a list's.
+// The planner reads the BETWEEN as two comparisons with x.
+func (p *parser) shapeBetween(x, lo, hi Expr) (Expr, Expr) {
+	s := p.shape
+	if s == nil || s.active == 0 || p.coreDepth != 1 || !readsColumn(x) {
+		return lo, hi
+	}
+	bounds := [2]Expr{lo, hi}
+	for i, tok := range p.betweenLits {
+		if tok >= 0 && p.toks[tok].kind == tkNumber {
+			bounds[i] = s.param(tok, bounds[i].(LiteralExpr).Val)
+		}
+	}
+	return bounds[0], bounds[1]
+}
+
 func (s *shapeRecorder) param(tok int, v Value) Expr {
 	s.toks = append(s.toks, tok)
 	s.vals = append(s.vals, v)
