@@ -99,13 +99,16 @@ func TestChangesEveryPath(t *testing.T) {
 	if calls, keys, whole := la.get("notes"); calls-whole != 1 || keys != 2 {
 		t.Fatalf("a's own commit: told rows %d times with %d keys, want once with 2", calls-whole, keys)
 	}
-	lb.waitCalls(t, "notes", 1, false)
 	// The two rows reach b as two ops, which it may apply one at a time: a
-	// delete of n2 before n2 arrives deletes nothing, and n2 then stays.
+	// delete of n2 before n2 arrives deletes nothing, and n2 then stays. Or
+	// they reach it in an image, which tells it of the whole table.
 	for deadline := time.Now().Add(10 * time.Second); dump(t, b, `SELECT count(*) FROM notes`) != "2\n"; time.Sleep(10 * time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatal("a's insert did not reach b")
 		}
+	}
+	if calls, _, _ := lb.get("notes"); calls == 0 {
+		t.Fatal("a's insert reached b untold")
 	}
 	exec(a, `UPDATE notes SET body = 'uno' WHERE id = 'n1'`)
 	if calls, keys, whole := la.get("notes"); calls-whole != 2 || keys != 3 {
