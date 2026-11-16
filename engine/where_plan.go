@@ -19,7 +19,10 @@
 // hint in the WHERE.
 package engine
 
-import "strings"
+import (
+	"math/bits"
+	"strings"
+)
 
 // whereMask is SQLite's Bitmask: bit i is FROM item i. SQLite's is 64 bits
 // wide with the top bit shared by every table past 63; wherePlanOrder declines
@@ -563,8 +566,11 @@ func wherePlanAutoIndexKey(in wherePlanInput, order []int, level int) *autoIndex
 	}
 	notReady := ^ready
 
+	// The key columns first, by the terms that drive the index, then the
+	// table's other columns it carries, then the rowid: counted before the
+	// key is built, so its two lists are allocated once.
 	var idxCols uint64
-	k := &autoIndexKey{}
+	nEq := 0
 	for i := range in.terms {
 		t := &in.terms[i]
 		if !termCanDriveIndex(t, it, iTab, notReady) {
@@ -572,6 +578,28 @@ func wherePlanAutoIndexKey(in wherePlanInput, order []int, level int) *autoIndex
 		}
 		// cMask folds every column at or past bit 63 onto bit 63; the caller's
 		// gate declines a table that wide, so leftColumn is always its own bit.
+		cMask := uint64(1) << uint(t.column)
+		if idxCols&cMask != 0 {
+			continue
+		}
+		idxCols |= cMask
+		nEq++
+	}
+	extra := it.colUsed & ^idxCols
+	if it.ephemeral {
+		extra = ^idxCols
+	}
+	if n := len(it.cols); n < 64 {
+		extra &= uint64(1)<<uint(n) - 1
+	}
+	size := nEq + bits.OnesCount64(extra) + 1
+	k := &autoIndexKey{cols: make([]int, 0, size), colls: make([]string, 0, size)}
+	idxCols = 0
+	for i := range in.terms {
+		t := &in.terms[i]
+		if !termCanDriveIndex(t, it, iTab, notReady) {
+			continue
+		}
 		cMask := uint64(1) << uint(t.column)
 		if idxCols&cMask != 0 {
 			continue
@@ -595,10 +623,6 @@ func wherePlanAutoIndexKey(in wherePlanInput, order []int, level int) *autoIndex
 	// PRIMARY KEY force-add is unreachable here (the gate declines a WITHOUT
 	// ROWID table), and so is "colUsed & MASKBIT(BMS-1)", which only fires for
 	// a reference to column 63 or beyond.
-	extra := it.colUsed & ^idxCols
-	if it.ephemeral {
-		extra = ^idxCols
-	}
 	for c := 0; c < len(it.cols); c++ {
 		if extra&(uint64(1)<<uint(c)) != 0 {
 			k.cols = append(k.cols, c)
