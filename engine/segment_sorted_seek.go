@@ -21,11 +21,14 @@ type segSortedRows struct {
 	hint *sortedSeekHint
 	ok   bool
 	keys []int64
-	segs []*segment
-	rows []int
+	// list is the table's segments, and seg and rows each position's segment,
+	// by its index in list, and row in it: no pointer per row.
+	list []*segment
+	seg  []uint16
+	rows []int32
 	// one is the table's one segment, when it is: then perm, its rows in the
 	// column's order, and block, the column, are the segment's own (sortedOn),
-	// and keys, segs and rows are not built.
+	// and keys, list, seg and rows are not built.
 	one   *segment
 	perm  []int32
 	block []int64
@@ -103,7 +106,9 @@ func (cur *vdbeCursor) segSortedSeek(h *sortedSeekHint, probe Value, enc TextEnc
 			segs, rows = append(segs, s.one), append(rows, int(r))
 		}
 	} else {
-		segs, rows = append(segs, s.segs[lo:hi]...), append(rows, s.rows[lo:hi]...)
+		for i := lo; i < hi; i++ {
+			segs, rows = append(segs, s.list[s.seg[i]]), append(rows, int(s.rows[i]))
+		}
 	}
 	cur.serveSegRun(orderOp, segs, rows)
 	return true
@@ -257,9 +262,9 @@ func (s *segSortedRows) orderRun(lo, hi int) {
 			s.perm[lo+i] = run[j]
 		}
 	} else {
-		segs, rows := slices.Clone(s.segs[lo:hi]), slices.Clone(s.rows[lo:hi])
+		seg, rows := slices.Clone(s.seg[lo:hi]), slices.Clone(s.rows[lo:hi])
 		for i, j := range perm {
-			s.segs[lo+i], s.rows[lo+i] = segs[j], rows[j]
+			s.seg[lo+i], s.rows[lo+i] = seg[j], rows[j]
 		}
 	}
 	if s.ordered == nil {
@@ -286,7 +291,7 @@ func (s *segSortedRows) at(i int) (*segment, int) {
 	if s.one != nil {
 		return s.one, int(s.perm[i])
 	}
-	return s.segs[i], s.rows[i]
+	return s.list[s.seg[i]], int(s.rows[i])
 }
 
 // segSortedRowsFor builds cur's segSortedRows for h: the committed segments,
@@ -329,9 +334,12 @@ func (p *ReadOnlyPager) segSortedRowsFor(cur *vdbeCursor, h *sortedSeekHint) *se
 			return s
 		}
 	}
-	keys, ksegs, krows := make([]int64, 0, n), make([]*segment, 0, n), make([]int, 0, n)
+	if len(segs) > 1<<16 {
+		return s
+	}
+	keys, kseg, krows := make([]int64, 0, n), make([]uint16, 0, n), make([]int32, 0, n)
 	var prevRid uint64
-	for _, sg := range segs {
+	for si, sg := range segs {
 		if sg.nRows == 0 {
 			continue
 		}
@@ -345,15 +353,15 @@ func (p *ReadOnlyPager) segSortedRowsFor(cur *vdbeCursor, h *sortedSeekHint) *se
 		nulls := sg.cols[h.col].nullOff != 0
 		for i := range sg.nRows {
 			if !nulls || !sg.isNull(h.col, i) {
-				keys, ksegs, krows = append(keys, b[i]), append(ksegs, sg), append(krows, i)
+				keys, kseg, krows = append(keys, b[i]), append(kseg, uint16(si)), append(krows, int32(i))
 			}
 		}
 		prevRid = sg.Rowid(sg.nRows - 1)
 	}
 	perm := radixOrderInt64(keys)
-	s.keys, s.segs, s.rows = make([]int64, len(perm)), make([]*segment, len(perm)), make([]int, len(perm))
+	s.list, s.keys, s.seg, s.rows = slices.Clone(segs), make([]int64, len(perm)), make([]uint16, len(perm)), make([]int32, len(perm))
 	for i, j := range perm {
-		s.keys[i], s.segs[i], s.rows[i] = keys[j], ksegs[j], krows[j]
+		s.keys[i], s.seg[i], s.rows[i] = keys[j], kseg[j], krows[j]
 	}
 	s.ok = true
 	return s
