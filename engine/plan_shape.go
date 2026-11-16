@@ -74,14 +74,17 @@ func (p *parser) litTok(start int, e Expr) int {
 	return start
 }
 
-// shapeClass is the kind of number t is, as a shape key records it, or 0 for
+// shapeClass is the kind of literal t is, as a shape key records it, or 0 for
 // a token no shape cuts out. The kind is part of the key, so nothing compiled
 // from a literal's type is shared across types. An integer from -1 to 1 is
 // never cut: the planner estimates "x = K" for one differently
-// (whereIsSmallInt, sqlite3ExprIsInteger in whereLoopOutputAdjust). Nor is a
-// string or a blob: the segment kernels compare a column with a text literal
-// they read at compile time, and not with a parameter.
+// (whereIsSmallInt, sqlite3ExprIsInteger in whereLoopOutputAdjust). A string
+// is: a TEXT bound is read when the statement runs, by the segment filters
+// (segPlanPreds) as by the loop.
 func shapeClass(t token) byte {
+	if t.kind == tkString {
+		return 's'
+	}
 	if t.kind != tkNumber {
 		return 0
 	}
@@ -214,6 +217,8 @@ func shapeArgs(args []Value, sh *planShape, lits []token) ([]Value, bool) {
 				return nil, false
 			}
 			out = append(out, v)
+		case tkString:
+			out = append(out, Value{Typ: Text, S: []byte(t.str)})
 		default:
 			return nil, false
 		}
@@ -289,6 +294,9 @@ func (p *ReadOnlyPager) execShaped(stmt *SelectStmt, sqlText string, args []Valu
 	if lerr != nil {
 		return nil, nil, false, nil
 	}
+	if rec.madeString(toks) && p.fromHasCollatedColumn(stmt.From) {
+		return nil, nil, false, nil
+	}
 	lits := literalTokens(toks)
 	sh := &planShape{base: rec.base, pattern: shapePattern(toks, lits, rec)}
 	params, aok := shapeArgs(args, sh, lits)
@@ -305,6 +313,36 @@ func (p *ReadOnlyPager) execShaped(stmt *SelectStmt, sqlText string, args []Valu
 		}
 	}
 	return cols, rows, true, err
+}
+
+// madeString reports whether s made a string literal a parameter.
+func (s *shapeRecorder) madeString(toks []token) bool {
+	for _, ti := range s.toks {
+		if toks[ti].kind == tkString {
+			return true
+		}
+	}
+	return false
+}
+
+// fromHasCollatedColumn reports whether a table from names has a column of a
+// collation other than BINARY. A string compared with such a column stays a
+// literal: the segment program compares the column with it as a service
+// block, which a TEXT parameter would send to the loop instead, a slower
+// way to the same answer.
+func (p *ReadOnlyPager) fromHasCollatedColumn(from []FromItem) bool {
+	for _, it := range from {
+		tbl, err := p.resolveTable(it.Table)
+		if err != nil {
+			return true
+		}
+		for _, c := range tbl.cols {
+			if c.Collation != "" && !strings.EqualFold(c.Collation, "BINARY") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // fromPlainTables reports whether from names ordinary tables of the main
