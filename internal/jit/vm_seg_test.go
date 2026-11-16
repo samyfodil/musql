@@ -4,6 +4,7 @@ package jit
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math"
 	"testing"
 	"unsafe"
@@ -610,5 +611,76 @@ func TestVMSegColumnPredicted(t *testing.T) {
 	code.Call2(&args)
 	if args.PC != 5 || regs[0].I != 1 || regs[1].F != 2 || regs[2].I != 3 || regs[3].I != 4 || regs[4].I != 1 {
 		t.Fatalf("row list: pc %d regs %+v", args.PC, regs)
+	}
+}
+
+// TestVMSegColumnUnpredicted: reads with no predicted kind (T 0) share a run
+// with predicted ones, either first, on a segment and on a row list: the
+// row's register a run's first read keeps is 0 on a segment, which every
+// later read of the run tests (#128).
+func TestVMSegColumnUnpredicted(t *testing.T) {
+	if !Available || !VMSegCursor {
+		t.Skip("no segment cursors on this platform")
+	}
+	noGC(t)
+	ints := []uint64{5, 6, 7, 8}
+	floats := []uint64{math.Float64bits(1.5), math.Float64bits(2.5), math.Float64bits(3.5), math.Float64bits(4.5)}
+	cols := []VSegCol{
+		{Kind: VSegInt, Block: unsafe.Pointer(&ints[0]), Plain: VSegInt},
+		{Kind: VSegFloat, Block: unsafe.Pointer(&floats[0]), Plain: VSegFloat},
+	}
+	seg := &VSeg{Cols: unsafe.Pointer(&cols[0]), First: 1, Dense: 1}
+	lay := ValueLayout{Size: 48, OffTyp: 0, OffI: 8, OffF: 16, OffS: 24, TypNull: tvNull, TypInt: tvInt, TypFloat: tvReal, TypText: tvText}
+	for _, prog := range [][]VInsn{
+		{
+			{Op: VColumn, A: 0, B: 0, C: 0, Imm: 1},
+			{Op: VColumn, A: 0, B: 1, C: 1, Imm: 1},
+			{Op: VColumn, A: 0, B: 0, C: 2, Imm: 1, T: VSegInt},
+			{Op: VColumn, A: 0, B: 1, C: 3, Imm: 1},
+			{Op: VExit},
+		},
+		{
+			{Op: VColumn, A: 0, B: 0, C: 0, Imm: 1, T: VSegInt},
+			{Op: VColumn, A: 0, B: 1, C: 1, Imm: 1},
+			{Op: VColumn, A: 0, B: 0, C: 2, Imm: 1},
+			{Op: VColumn, A: 0, B: 1, C: 3, Imm: 1, T: VSegFloat},
+			{Op: VExit},
+		},
+	} {
+		entry := make([]bool, len(prog))
+		entry[0] = true
+		b, err := EmitVMFused(prog, 4, lay, entry, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		code, err := Map(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		check := func(what string, cur *VCursor, i int64, f float64) {
+			t.Helper()
+			regs := make([]tvalue, 4)
+			args := ProgArgs{Regs: (*int64)(unsafe.Pointer(&regs[0])), Cur: cur}
+			code.Call2(&args)
+			want := []tvalue{{Typ: tvInt, I: i}, {Typ: tvReal, F: f}, {Typ: tvInt, I: i}, {Typ: tvReal, F: f}}
+			if args.PC != 4 {
+				t.Fatalf("%s: stopped at %d", what, args.PC)
+			}
+			for r := range want {
+				if !same(regs[r], want[r]) {
+					t.Fatalf("%s r%d: %+v, want %+v", what, r, regs[r], want[r])
+				}
+			}
+		}
+		for row := range 4 {
+			cur := &VCursor{N: 4, Pos: int64(row), Last: -1, Ok: 1, Mask: 3, Seg: unsafe.Pointer(seg)}
+			check(fmt.Sprintf("segment row %d", row), cur, int64(ints[row]), math.Float64frombits(floats[row]))
+		}
+		rows := [][]tvalue{{{Typ: tvInt, I: 1}, {Typ: tvReal, F: 2}}, {{Typ: tvInt, I: 3}, {Typ: tvReal, F: 4}}}
+		for row := range rows {
+			cur := &VCursor{Rows: unsafe.Pointer(unsafe.SliceData(rows)), N: 2, Pos: int64(row), Last: -1, Ok: 1, Mask: 3}
+			check(fmt.Sprintf("row list row %d", row), cur, rows[row][0].I, rows[row][1].F)
+		}
+		code.Close()
 	}
 }

@@ -73,6 +73,11 @@ func emitVMWith(asm *Asm, prog []VInsn, nReg int, lay ValueLayout, bound, entry 
 		zeroS: knowSet{}, consts: newFirPool()}
 	e.heads = vmLoopHeads(prog)
 	e.steps = vmStepsOf(prog)
+	for _, in := range prog {
+		if in.Op == VRewind {
+			e.rewinds.add(in.A)
+		}
+	}
 	a := e.a
 
 	a.MovRegMem(RSI, RDI, POffRegs)
@@ -241,6 +246,9 @@ type vmEmit struct {
 	entries []vmEntryStub
 	// entryRegs is what the entries' register lists are carved from.
 	entryRegs []int
+	// rewinds is the cursors native code rewinds, which a nested loop's inner
+	// cursor is: one usually handed over on its row list (segColumn).
+	rewinds knowSet
 	// zeroS is the destinations of the instruction being emitted whose string
 	// or blob pointer its store must clear (destNoS).
 	zeroS knowSet

@@ -93,6 +93,9 @@ type vmJIT struct {
 	// TEXT bounds a segment checks for them (vmSegFor).
 	segCap  []bool
 	segNeed []uint64
+	// rowidSeeks is, per cursor number, whether native code seeks it by
+	// rowid (VSeekRowid), which reads the table tabFor works out.
+	rowidSeeks []bool
 
 	// tabs is, per cursor number, the table tabFor last worked out for it.
 	tabs []atomic.Pointer[vmTab]
@@ -375,6 +378,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	segCap := segCapableCursors(prog)
 	var segTables map[int]*resolvedTable
 	var segNeed []uint64
+	var rowidSeeks []bool
 	if segCap != nil {
 		segNeed = make([]uint64, len(segCap))
 		segTables = map[int]*resolvedTable{}
@@ -400,6 +404,10 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 			if rw := &prog.Insns[pc+1]; rw.Op == OpRewind && rw.P1 == in.P1 && rw.P4 == nil {
 				vp[pc] = jit.VInsn{Op: jit.VSeekRowid, A: in.P1, B: in.P2, T: rw.P2}
 				vp[pc+1] = jit.VInsn{Op: jit.VSeekRewind, A: in.P1, T: rw.P2}
+				if rowidSeeks == nil {
+					rowidSeeks = make([]bool, len(segCap))
+				}
+				rowidSeeks[in.P1] = true
 				for _, q := range []int{pc, pc + 1} {
 					if !entry[q] {
 						entry[q] = true
@@ -507,7 +515,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 		}
 	}
 	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams + len(outer), params: nParams, outer: outer, entry: entry, marked: marked, native: native, updAt: updAt,
-		segCap: segCap, segNeed: segNeed, walkScan: walkScan, inSlots: inSlots, idxSpecs: idxSpecs,
+		segCap: segCap, segNeed: segNeed, rowidSeeks: rowidSeeks, walkScan: walkScan, inSlots: inSlots, idxSpecs: idxSpecs,
 		aggAt: agg.at, aggSort: agg.sort, aggLo: agg.lo, aggHi: agg.hi, aggKey: agg.key, aggKeyLo: agg.keyLo, aggKeyN: agg.keyN}
 	if segCap != nil {
 		jx.tabs = make([]atomic.Pointer[vmTab], len(segCap))
@@ -2082,6 +2090,15 @@ func (jx *vmJIT) tabFor(c int, cur *vdbeCursor) *vmTab {
 	return t
 }
 
+// seekTab is tabFor for a cursor native code seeks, by rowid or through an
+// index, and nil for any other: only a seek reads its table.
+func (jx *vmJIT) seekTab(c int, cur *vdbeCursor) *vmTab {
+	if (c >= len(jx.rowidSeeks) || !jx.rowidSeeks[c]) && (c >= len(jx.idxSpecs) || jx.idxSpecs[c] == nil) {
+		return nil
+	}
+	return jx.tabFor(c, cur)
+}
+
 // buildVMTab works out tabFor's answer.
 func buildVMTab(cur *vdbeCursor, src *segSource, need uint64) *vmTab {
 	root := cur.tbl.root
@@ -2439,7 +2456,7 @@ func (jx *vmJIT) handCursor(m *vdbe, pc, c int) {
 	if cur == nil {
 		return
 	}
-	if t := jx.tabFor(c, cur); t != nil {
+	if t := jx.seekTab(c, cur); t != nil {
 		jc.Tab = unsafe.Pointer(&t.tab)
 		if spec := jx.idxSpecs; spec != nil && spec[c] != nil && (spec[c].sorted == nil || jx.sortedSeekServed(m, cur, spec[c])) {
 			if x := jx.idxFor(c, t, m.encoding(), cur.segSorted); x != nil {

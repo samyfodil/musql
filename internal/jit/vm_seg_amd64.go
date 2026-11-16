@@ -53,41 +53,118 @@ func (e *vmEmit) rowSeg(cur Reg, skip Lbl) {
 	a.Bind(skip)
 }
 
-// predictedRowRead is segColumn's predicted read of a cursor on its row list,
-// reached at label prows with base the cursor's address and RDX its position:
-// the run's first read of the cursor checks the row is as wide as every
-// column the run predicts (mask) and keeps the row's address (vmRowKey), and
-// every later one reads from that, as column does for a plain cursor. Without
-// a register to keep it in, a read takes the row list's full read.
-func (e *vmEmit) predictedRowRead(pc int, in VInsn, base Reg, first bool, mask uint64, l func(string) Lbl) {
-	a, L := e.a, e.lay
+// rowRead is segColumn's predicted read of a cursor on its row list,
+// reached at label prows with base the cursor's address and RDX its
+// position. With a register for the row (row, newRow when this read is the
+// run's first of the cursor), the first read checks the row as rowAddr does
+// and keeps its address there, and every later one reads from it (label
+// prow), going on at label done, which follows unless the caller binds it.
+// Without one, a read takes the row list's full read.
+func (e *vmEmit) rowRead(pc int, in VInsn, base, row Reg, haveRow, newRow bool, checked uint64, l func(string) Lbl) {
+	a := e.a
 	a.Bind(l("prows"))
-	row, have := e.holds[vmRowKey(in.A)]
-	if !have && first {
-		if u := e.nextUse(vmRowKey(in.A), pc); u >= 0 {
-			if m, ok := e.alloc(pc, u, true); ok {
-				row, have = m, true
-				a.MovRegImm64(R10, sliceHeaderSize)
-				a.ImulRegReg(RDX, R10)
-				a.AddRegMemD(RDX, base, VCursorOffRows)
-				a.MovRegMemD(R10, RDX, 8) // the row's length
-				a.CmpRegImm32(R10, int32(bits.Len64(mask)-1))
-				e.jccStub(condBelowEq, pc) // a row narrower than a column: the VDBE's
-				a.MovRegMemD(row, RDX, 0)
-				e.holds[vmRowKey(in.A)] = row
-			}
-		}
-	}
-	if !have {
+	if !haveRow {
 		a.MovRegMemD(RAX, RDI, POffCur)
 		a.JmpL(l("rows"))
 		return
 	}
-	e.pinned.add(int(row))
+	if newRow {
+		e.rowAddr(pc, in, base, 0, row, checked)
+	}
+	a.Bind(l("prow"))
+	e.rowCopy(pc, in, row)
+}
+
+// unpredictedRead is segColumn's read of a column no segment kind is
+// predicted for (T 0), which reads a cursor on its row list as column reads
+// a plain cursor's: the run's first read checks the cursor and keeps the
+// row's address (vmRowKey), and every later one tests only that it has one.
+// On a segment the row's register holds 0, and a later read goes the full
+// way (label full, which the caller binds next).
+func (e *vmEmit) unpredictedRead(pc int, in VInsn, l func(string) Lbl) {
+	a := e.a
+	cb := int32(in.A * VCursorSize)
+	if row, ok := e.holds[vmRowKey(in.A)]; ok {
+		e.pinned.add(int(row))
+		a.TestRegReg(row, row)
+		a.JccL(CondE, l("full"))
+		e.rowCopy(pc, in, row)
+		a.JmpL(l("done"))
+		return
+	}
+	mask := uint64(1) << uint(in.B)
+	if e.cache {
+		mask = vmRunPredicted(e.prog, e.bound, pc)
+	}
+	a.MovRegMemD(RAX, RDI, POffCur)
+	a.CmpMemDImm8(RAX, cb+VCursorOffOk, 0)
+	e.jccStub(CondE, pc)
+	a.MovRegMemD(RDX, RAX, cb+VCursorOffMask)
+	a.MovRegImm64(R10, int64(mask))
+	a.AndRegReg(RDX, R10)
+	a.CmpRegReg(RDX, R10)
+	e.jccStub(CondNE, pc)
+	a.MovRegMemD(RDX, RAX, cb+VCursorOffPos)
+	a.AluRegMemD(AluCmp, RDX, RAX, cb+VCursorOffN)
+	e.jccStub(condAboveEq, pc) // unsigned: a position before the first row is huge
+	row, held := R9, false
+	if u := e.nextUse(vmRowKey(in.A), pc); u >= 0 {
+		if m, ok := e.alloc(pc, u, true); ok {
+			row, held = m, true
+			e.pinned.add(int(m))
+		}
+	}
+	a.CmpMemDImm8(RAX, cb+VCursorOffSeg, 0)
+	a.JccL(CondNE, l("useg"))
+	e.rowAddr(pc, in, RAX, cb, row, mask)
+	e.rowCopy(pc, in, row)
+	a.JmpL(l("done"))
+	// On a segment: its read past the checks just made (label seg), with RAX
+	// the cursors, RDX the position and R9 the VSeg.
+	a.Bind(l("useg"))
+	if held {
+		a.XorRegReg(row, row)
+		e.holds[vmRowKey(in.A)] = row
+	}
+	e.destNoS(pc, in.C)
+	e.zeroS.del(in.C)
+	a.MovRegMemD(R9, RAX, cb+VCursorOffSeg)
+	a.JmpL(l("seg"))
+}
+
+// rowAddr sets row to the address of the row at position RDX of the cursor at
+// base+cb, first checking, as column does for a plain cursor, that every
+// column the run reads of the cursor is readable (those of checked already
+// were) and within the row.
+func (e *vmEmit) rowAddr(pc int, in VInsn, base Reg, cb int32, row Reg, checked uint64) {
+	a := e.a
+	all := uint64(1) << uint(in.B)
+	if e.cache {
+		all = vmRunSegReads(e.prog, e.bound, pc, false)
+	}
+	if extra := all &^ checked; extra != 0 {
+		a.MovRegMemD(R10, base, cb+VCursorOffMask)
+		a.MovRegImm64(R9, int64(extra))
+		a.AndRegReg(R10, R9)
+		a.CmpRegReg(R10, R9)
+		e.jccStub(CondNE, pc)
+	}
+	a.MovRegImm64(R10, sliceHeaderSize)
+	a.ImulRegReg(RDX, R10)
+	a.AddRegMemD(RDX, base, cb+VCursorOffRows)
+	a.MovRegMemD(R10, RDX, 8) // the row's length
+	a.CmpRegImm32(R10, int32(bits.Len64(all)-1))
+	e.jccStub(condBelowEq, pc) // a row narrower than a column: the VDBE's
+	a.MovRegMemD(row, RDX, 0)
+}
+
+// rowCopy copies column B of the row at row into r[C] as column does: the
+// string words only when the column or the destination holds a string, with
+// the write barrier off.
+func (e *vmEmit) rowCopy(pc int, in VInsn, row Reg) {
+	a, L := e.a, e.lay
 	dst := e.d(in.C, 0)
 	vb := int32(in.B) * int32(L.Size)
-	// As column copies: the string words only when the column or the
-	// destination holds a string, with the write barrier off.
 	a.MovRegMemD(RDX, row, vb+int32(L.OffS))
 	if !e.know.noS.has(in.C) {
 		a.AluRegMemD(AluOr, RDX, RSI, dst+int32(L.OffS))
@@ -105,7 +182,6 @@ func (e *vmEmit) predictedRowRead(pc int, in VInsn, base Reg, first bool, mask u
 		a.MovRegMemD(RDX, row, vb+int32(off))
 		a.MovMemDReg(RSI, dst+int32(off), RDX)
 	}
-	a.JmpL(l("done"))
 }
 
 // segKindLabel is the label of the predicted read of a cell of kind k, ""
@@ -131,45 +207,97 @@ func segKindLabel(k int) string {
 func (e *vmEmit) segColumn(pc int, in VInsn) {
 	a, L := e.a, e.lay
 	cb := int32(in.A * VCursorSize)
-	e.destNoS(pc, in.C)
+	if in.T != 0 && segKindLabel(in.T) == "" {
+		e.destNoS(pc, in.C)
+	}
 	e.zeroS.del(in.C) // every word of the destination is written below
 	dst := e.d(in.C, 0)
 	l := e.named()
-	if name := segKindLabel(in.T); name != "" {
+	var rowsLast func() // the row list's read, emitted to run on into done
+	if in.T == 0 {
+		e.unpredictedRead(pc, in, l)
+		a.Bind(l("full"))
+		e.destNoS(pc, in.C)
+		e.zeroS.del(in.C)
+	} else if name := segKindLabel(in.T); name != "" {
 		base, have := e.holds[^in.A]
-		first, mask := !have, uint64(1)<<uint(in.B)
-		if have {
+		row, haveRow := e.holds[vmRowKey(in.A)]
+		first, fast, newRow, mask := !have, have && haveRow, false, uint64(1)<<uint(in.B)
+		if fast {
+			// A later read of the run: row is the row's address on the row
+			// list, 0 on a segment.
+			e.pinned.add(int(base))
+			e.pinned.add(int(row))
+			a.TestRegReg(row, row)
+			a.JccL(CondNE, l("prow"))
+		} else if have {
 			e.pinned.add(int(base))
 		} else {
 			if e.cache {
 				mask = vmRunPredicted(e.prog, e.bound, pc)
 			}
 			a.MovRegMemD(RAX, RDI, POffCur)
-			a.LeaRegMemD(RAX, RAX, cb)
-			a.CmpMemDImm8(RAX, VCursorOffOk, 0)
+			a.CmpMemDImm8(RAX, cb+VCursorOffOk, 0)
 			e.jccStub(CondE, pc)
-			a.MovRegMemD(RDX, RAX, VCursorOffMask)
+			a.MovRegMemD(RDX, RAX, cb+VCursorOffMask)
 			a.MovRegImm64(R10, int64(mask))
 			a.AndRegReg(RDX, R10)
 			a.CmpRegReg(RDX, R10)
 			e.jccStub(CondNE, pc)
-			a.MovRegMemD(RDX, RAX, VCursorOffPos)
-			a.AluRegMemD(AluCmp, RDX, RAX, VCursorOffN)
+			a.MovRegMemD(RDX, RAX, cb+VCursorOffPos)
+			a.AluRegMemD(AluCmp, RDX, RAX, cb+VCursorOffN)
 			e.jccStub(condAboveEq, pc) // unsigned: a position before the first row is huge
 			base = RAX
 			if u := e.nextUse(^in.A, pc); u >= 0 {
 				if m, ok := e.alloc(pc, u, true); ok {
-					a.MovRegReg(m, RAX)
 					base = m
 					e.holds[^in.A] = m
 					e.pinned.add(int(m))
 				}
 			}
+			a.LeaRegMemD(base, RAX, cb)
 		}
-		a.MovRegMemD(RDX, base, VCursorOffPos)
-		a.MovRegMemD(R9, base, VCursorOffSeg)
-		a.TestRegReg(R9, R9)
-		a.JccL(CondE, l("prows"))
+		// A cursor native code rewinds is usually on its row list: its
+		// segment pointer is only compared, and its segment path loads it.
+		rows := e.rewinds.has(in.A)
+		if !fast {
+			if have {
+				a.MovRegMemD(RDX, base, VCursorOffPos) // the check above left it in RDX
+			}
+			if !rows {
+				a.MovRegMemD(R9, base, VCursorOffSeg)
+			}
+		}
+		if !haveRow && first {
+			if u := e.nextUse(vmRowKey(in.A), pc); u >= 0 {
+				if m, ok := e.alloc(pc, u, true); ok {
+					row, haveRow, newRow = m, true, true
+					e.pinned.add(int(m))
+				}
+			}
+		}
+		if !fast {
+			if rows {
+				a.CmpMemDImm8(base, VCursorOffSeg, 0)
+			} else {
+				a.TestRegReg(R9, R9)
+			}
+			a.JccL(CondE, l("prows"))
+		}
+		if newRow {
+			a.XorRegReg(row, row)
+			e.holds[vmRowKey(in.A)] = row
+		}
+		// On a segment: the stores below clear the destination's string
+		// without the write barrier, so it must hold none.
+		e.destNoS(pc, in.C)
+		e.zeroS.del(in.C)
+		if fast {
+			a.MovRegMemD(RDX, base, VCursorOffPos)
+		}
+		if fast || rows {
+			a.MovRegMemD(R9, base, VCursorOffSeg)
+		}
 		e.rowSeg(base, l("fsegs"))
 		a.MovRegMemD(R10, base, VCursorOffSel)
 		a.TestRegReg(R10, R10)
@@ -181,7 +309,13 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 		a.CmpMemDImm8(R10, VSegColOffPlain, int8(in.T))
 		a.JccL(CondE, l(name))
 		a.JmpL(l("full"))
-		e.predictedRowRead(pc, in, base, first, mask, l)
+		read := func() { e.rowRead(pc, in, base, row, haveRow, newRow, mask, l) }
+		if rows {
+			rowsLast = read
+		} else {
+			read()
+			a.JmpL(l("done"))
+		}
 		a.Bind(l("full"))
 	} else {
 		e.unmapCursor(in.A)
@@ -368,6 +502,10 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 	a.MovMemDReg(RSI, dst+int32(L.OffS), RCX)
 	a.MovMemDReg(RSI, dst+int32(L.OffS+8), RDX)
 	a.MovMemDReg(RSI, dst+int32(L.OffS+16), RDX)
+	if rowsLast != nil {
+		a.JmpL(l("done"))
+		rowsLast()
+	}
 
 	a.Bind(l("done"))
 	e.unmap(in.C)

@@ -596,6 +596,13 @@ func vmMovesCursor(op VOp) bool {
 // kind (T): only the run's predicted reads of the cursor share its check, so
 // a column read the full way, which may not be served, cannot fail it.
 func vmRunPredicted(prog []VInsn, bound []bool, pc int) uint64 {
+	return vmRunSegReads(prog, bound, pc, true)
+}
+
+// vmRunSegReads is the columns of pc's segment column read and of the reads
+// of its cursor after it in the run, before anything moves it: the predicted
+// ones only, or all of them.
+func vmRunSegReads(prog []VInsn, bound []bool, pc int, predicted bool) uint64 {
 	c, mask := prog[pc].A, uint64(1)<<uint(prog[pc].B)
 	for q := pc + 1; q < len(prog) && q < pc+48; q++ {
 		if vmRunStart(prog, bound, q) {
@@ -605,7 +612,7 @@ func vmRunPredicted(prog []VInsn, bound []bool, pc int) uint64 {
 		if vmMovesCursor(in.Op) && in.A == c {
 			break
 		}
-		if in.Op == VColumn && in.A == c && in.Imm == 1 && in.T != 0 {
+		if in.Op == VColumn && in.A == c && in.Imm == 1 && (in.T != 0 || !predicted) {
 			mask |= uint64(1) << uint(in.B)
 		}
 	}
