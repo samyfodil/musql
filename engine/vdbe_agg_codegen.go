@@ -261,7 +261,7 @@ func compileScanAggregate(c *compiler, stmt *SelectStmt, srcs []joinSource, scop
 	// Order matters here for group_concat and the min()/max() anchor. A join's
 	// levels take rowid bounds too, which keep it as well: without them an inner
 	// level read its whole table once per outer row.
-	planConstantKeySeeks(c, srcs, stmt.Where, len(srcs) > 1)
+	planConstantKeySeeks(c, srcs, stmt.Where, len(srcs) > 1, false)
 
 	// Predicate pushdown: see compileScanPlain (vdbe_scan.go). buckets prune at
 	// their join level; this body tests only the deferred residue. (The local
@@ -2144,7 +2144,7 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	// (seekIsNarrow). A join plans none: a once-only seek turns the join
 	// kernel away (openSegJoin).
 	if len(srcs) == 1 {
-		planConstantKeySeeks(c, srcs, stmt.Where, false)
+		planConstantKeySeeks(c, srcs, stmt.Where, false, false)
 	}
 
 	// Predicate pushdown: see compileScanPlain (vdbe_scan.go). buckets prune at
@@ -2644,7 +2644,7 @@ func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp
 	// Constant-key seeks, predicate pushdown and index-driven seeks: identical
 	// to compileScanGroupBy's own setup (see there for the doc comment on all).
 	if len(srcs) == 1 {
-		planConstantKeySeeks(c, srcs, stmt.Where, false)
+		planConstantKeySeeks(c, srcs, stmt.Where, false, false)
 	}
 	jplan := joinPushdownPlan(c, srcs, plan.scopes, stmt.Where)
 	if len(jplan.buckets) == 1 {
