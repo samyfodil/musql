@@ -171,6 +171,22 @@ const (
 	aggVec1Train                      // vec1_train(vector[, config]) -- see engine/vec1_train.go
 )
 
+// aggSumState is the running state of count, sum, total and avg, and all a dense
+// group keeps of one (hashAggState.dense).
+type aggSumState struct {
+	cnt         int64 // non-NULL contributing rows (count/sum/total/avg/group_concat)
+	iSum        int64
+	rSum        float64
+	rErr        float64 // Kahan-Babuska-Neumaier error term (see kbnStep)
+	sumTopExp   int16   // the exponent window of the values summed: |v| < 2^sumTopExp
+	sumUnitExp  int16   // and every v is a multiple of 2^sumUnitExp. Maintained only
+	sumWinSet   bool    // when orderStrict is set -- see sumWatch/sumOrderFree
+	sumApprox   bool    // true once any non-integer value has contributed (see finalizeSum)
+	sumOverflow bool    // true once the int64 running sum has overflowed (see finalizeSum)
+	// orderRisk is orderStrict's per-kind evidence, latched by step.
+	orderRisk bool
+}
+
 // aggItem is one aggregate call's accumulator: the plan every accumulator
 // of the call shares (aggItemPlan) and its own running state, fed one value
 // per surviving row by step, then read out by finalize.
@@ -179,23 +195,12 @@ type aggItem struct {
 
 	// Running state, mutated by step as rows are scanned. Only the fields
 	// relevant to kind are used.
-	cnt         int64 // non-NULL contributing rows (count/sum/total/avg/group_concat)
-	rSum        float64
-	rErr        float64 // Kahan-Babuska-Neumaier error term (see kbnStep)
-	iSum        int64
-	sumApprox   bool // true once any non-integer value has contributed (see finalizeSum)
-	sumOverflow bool // true once the int64 running sum has overflowed (see finalizeSum)
-	sumTopExp   int  // the exponent window of the values summed: |v| < 2^sumTopExp
-	sumUnitExp  int  // and every v is a multiple of 2^sumUnitExp. Maintained only
-	sumWinSet   bool // when orderStrict is set -- see sumWatch/sumOrderFree
-	best        Value
-	haveBest    bool
-	vec1        *vec1TrainState // vec1_train's training vectors and options
+	aggSumState
+	best     Value
+	haveBest bool
+	vec1     *vec1TrainState // vec1_train's training vectors and options
 	// gc is group_concat's and the JSON groups' running text (aggConcat).
 	gc *aggConcat
-
-	// orderRisk is orderStrict's per-kind evidence, latched by step.
-	orderRisk bool
 
 	// seen holds every distinct (per compareValues) non-NULL value already
 	// fed into this accumulator, in first-seen order -- only populated/
@@ -1292,15 +1297,16 @@ func (it *aggItem) sumWatch(asInt bool, i int64, f float64) {
 		m := uint64(math.Abs(frac) * (1 << 53))
 		top, unit = exp, exp-53+bits.TrailingZeros64(m)
 	}
+	// Both fit: Frexp's exponents run from -1073 to 1024.
 	if !it.sumWinSet {
-		it.sumTopExp, it.sumUnitExp, it.sumWinSet = top, unit, true
+		it.sumTopExp, it.sumUnitExp, it.sumWinSet = int16(top), int16(unit), true
 		return
 	}
-	if top > it.sumTopExp {
-		it.sumTopExp = top
+	if top > int(it.sumTopExp) {
+		it.sumTopExp = int16(top)
 	}
-	if unit < it.sumUnitExp {
-		it.sumUnitExp = unit
+	if unit < int(it.sumUnitExp) {
+		it.sumUnitExp = int16(unit)
 	}
 }
 
@@ -1331,14 +1337,15 @@ func (it *aggItem) sumOrderFree() bool {
 	// ceil(log2(cnt)): 2^k is an upper bound on how many values were added.
 	k := bits.Len64(uint64(it.cnt - 1))
 	if !it.sumApprox {
-		return it.sumTopExp+k <= 63
+		return int(it.sumTopExp)+k <= 63
 	}
 	// top+k <= 1023 keeps every partial sum FINITE, which the mantissa test
 	// alone does not: 1e308+1e308-1e308 needs only a handful of significant
 	// bits, but the order that adds the two positives first overflows to +Inf
 	// where the other answers 1e308 (this engine served that, wrongly, until the
 	// bound was written down -- compat-harness/aggorder_r29_test.go's sum-kbn).
-	return it.sumTopExp+k <= 1023 && it.sumTopExp+k-it.sumUnitExp <= 53
+	top, unit := int(it.sumTopExp), int(it.sumUnitExp)
+	return top+k <= 1023 && top+k-unit <= 53
 }
 
 // kbnStep is one Kahan-Babuska-Neumaier step (kahanBabuskaNeumaierStep,

@@ -663,6 +663,11 @@ func (m *vdbe) aggResult(info *aggResultInfo, groupKey []Value) (Value, error) {
 	if m.aggAccs.fromKeys && len(groupKey) != len(plan.keyCols) {
 		return Value{}, fmt.Errorf("engine: internal: a group read from its key has no key")
 	}
+	if p := it.prog; p != nil && p.prog != nil && len(m.aggAccs.conv) == 0 {
+		if v, ok := p.seededNoAnchor(aggVals, groupKey); ok {
+			return v, nil
+		}
+	}
 	bareVals, bareRowids := m.aggAccs.anchorRow(plan, &m.anchorRowBuf, groupKey)
 	if len(m.aggAccs.conv) > 0 {
 		groupKey, bareVals = m.convertedGroup(plan, it, aggVals, groupKey, bareVals)

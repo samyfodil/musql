@@ -44,7 +44,7 @@ type segGroupPlan struct {
 // hash table so any refusal can fall back cleanly.
 func (m *vdbe) segHashAggTable(p *ReadOnlyPager, tbl *resolvedTable, plan *segGroupPlan) bool {
 	saved := m.hashAgg
-	if saved != nil && len(saved.buckets) > 0 {
+	if saved != nil && saved.groups() > 0 {
 		return false // not the fresh table this walk may throw away
 	}
 	// The WHERE's bounds resolve now, when the parameters are bound. A bound no
