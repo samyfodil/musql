@@ -9,6 +9,7 @@ import (
 	"math/bits"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -242,6 +243,7 @@ type segJoinTable struct {
 	vcols  map[int][]Value
 	sorted map[int]segJoinSorted
 	exprs  map[segJoinExprKey][]Value
+	passes map[segJoinPassKey][]bool
 	fcols  map[int][]float64
 	// lo/dense map a rowid to its row + 1 when the rowids are dense enough,
 	// else sparse does.
@@ -1216,7 +1218,8 @@ func (w *segJoinWalk) exprValues(a segJoinArg) ([]Value, bool) {
 	// so the expression, is the plan cache's -- unless it reads a parameter,
 	// which the next run may bind to another value. A LIKE's answer follows
 	// case_sensitive_like, which is part of the key.
-	keep := !slices.ContainsFunc(a.expr.insns, func(in Instruction) bool { return in.Op == OpVariable })
+	// Nor one that reads the clock, whose 'now' a later statement moves.
+	keep := !slices.ContainsFunc(a.expr.insns, func(in Instruction) bool { return in.Op == OpVariable }) && !segJoinReadsClock(a.expr)
 	key := segJoinExprKey{a.expr, w.m.likeCaseSensitive()}
 	if keep {
 		t.mu.Lock()
@@ -1269,6 +1272,168 @@ func (w *segJoinWalk) exprValues(a segJoinArg) ([]Value, bool) {
 		t.mu.Unlock()
 	}
 	return out, true
+}
+
+// cachedExpr reports whether a's values are kept already, here or with its
+// table: then they are read rather than computed for some rows.
+func (w *segJoinWalk) cachedExpr(a segJoinArg) bool {
+	if _, ok := w.exprs[a.expr]; ok {
+		return true
+	}
+	t := w.tabs[w.lv(a)]
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, ok := t.exprs[segJoinExprKey{a.expr, w.m.likeCaseSensitive()}]
+	return ok
+}
+
+// exprPassing is a filter's values on the rows pass lets through, computed as
+// exprValues computes them; the other rows are left NULL, and nothing is
+// kept, since which rows were computed depends on the filters before it.
+func (w *segJoinWalk) exprPassing(a segJoinArg, pass []bool) ([]Value, bool) {
+	if a.level < 0 {
+		return w.exprValues(a)
+	}
+	segJoinFilterRestricted.Add(1)
+	t := w.tabs[w.lv(a)]
+	vm := *w.m
+	vm.regs = make([]Value, len(w.m.regs))
+	vm.fnArgBuf, vm.likePlan = nil, nil
+	var row int32
+	cols := map[int][]Value{}
+	for _, op := range a.expr.insns {
+		if op.Op == OpColumn && cols[op.P2] == nil {
+			cols[op.P2] = t.values(op.P2)
+		}
+	}
+	column := func(op *Instruction) Value { return cols[op.P2][row] }
+	// A filter of one column is computed once for each value the column
+	// holds: its answer is a function of that value alone.
+	var only []Value
+	var memo map[segJoinMemoKey]Value
+	if len(cols) == 1 && !slices.ContainsFunc(a.expr.insns, func(in Instruction) bool { return in.Op == OpRowid }) {
+		for _, c := range cols {
+			only = c
+		}
+		memo = map[segJoinMemoKey]Value{}
+	}
+	out := make([]Value, t.n)
+	for r := range t.n {
+		if !pass[r] {
+			continue
+		}
+		row = int32(r)
+		var k segJoinMemoKey
+		if memo != nil {
+			k = segJoinMemoKeyOf(only[r])
+			if v, ok := memo[k]; ok {
+				out[r] = v
+				continue
+			}
+		}
+		v, ok := segJoinEvalRow(&vm, a.expr, column, func(*Instruction) Value { return t.value(row, -1) }, nil)
+		if !ok {
+			return nil, false
+		}
+		out[r] = v
+		if memo != nil {
+			memo[k] = v
+		}
+	}
+	return out, true
+}
+
+// segJoinMemoKey is a value as exactly as it can be told apart: its type,
+// subtype and contents, a REAL by its bits.
+type segJoinMemoKey struct {
+	typ     ValueType
+	subtype uint8
+	intReal bool
+	i       int64
+	f       uint64
+	s       string
+}
+
+func segJoinMemoKeyOf(v Value) segJoinMemoKey {
+	return segJoinMemoKey{v.Typ, v.Subtype, v.intReal, v.I, math.Float64bits(v.F), string(v.S)}
+}
+
+// segJoinFilterRestricted counts the filters computed on some rows only, and
+// segJoinPassReuses the levels whose filters were read back, for tests.
+var segJoinFilterRestricted, segJoinPassReuses atomic.Int64
+
+// segJoinPassKey names what one level of one join's filters let through.
+type segJoinPassKey struct {
+	plan          *segJoinPlan
+	level         int
+	caseSensitive bool
+}
+
+// segJoinPassKeepable reports whether a level's bounds and filters let the
+// same rows through on every run over the same rows: no parameter, register
+// or subquery bound, and no filter reading a parameter or a clock.
+func segJoinPassKeepable(preds []segPlanPred, fs []segJoinArg) bool {
+	for _, p := range preds {
+		if p.ParamIdx != 0 || p.Reg != 0 || p.SubProg != nil {
+			return false
+		}
+	}
+	for _, f := range fs {
+		if f.expr == nil {
+			continue
+		}
+		if f.expr.volatile || segJoinReadsClock(f.expr) || slices.ContainsFunc(f.expr.insns, func(in Instruction) bool { return in.Op == OpVariable }) {
+			return false
+		}
+	}
+	return true
+}
+
+// segJoinDateFuncs are the date and time functions: SQLITE_FUNC_SLOCHNG, a
+// constant within a statement but not across statements when they read the
+// clock ('now', or no argument). They return NULL rather than fail.
+var segJoinDateFuncs = map[string]bool{"date": true, "time": true, "datetime": true, "julianday": true, "strftime": true, "unixepoch": true, "timediff": true}
+
+// segJoinReadsClock reports whether e may call a date function on the
+// current time: one with no argument, or any 'now' in e.
+func segJoinReadsClock(e *segJoinExpr) bool {
+	for _, in := range e.insns {
+		switch in.Op {
+		case OpFunction:
+			if name, ok := in.P4.(string); ok && segJoinDateFuncs[r33sFoldIdent(name)] && in.P2 == 0 {
+				return true
+			}
+		case OpString8:
+			if s, ok := in.P4.(string); ok && strings.EqualFold(strings.TrimSpace(s), "now") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// segJoinExprCannotFail reports whether e is built only of instructions that
+// cannot raise an error: constants, columns, copies, jumps, comparisons and
+// the date functions, which answer NULL for what they cannot read.
+func segJoinExprCannotFail(e *segJoinExpr) bool {
+	if e.volatile {
+		return false
+	}
+	for _, in := range e.insns {
+		switch in.Op {
+		case OpColumn, OpRowid, OpInteger, OpInt64, OpReal, OpString8, OpNull, OpSCopy, OpCopy,
+			OpGoto, OpIf, OpIfNot, OpNotNull, OpIsNull, OpNot,
+			OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
+		case OpFunction:
+			name, ok := in.P4.(string)
+			if !ok || !segJoinDateFuncs[r33sFoldIdent(name)] || udfs[r33sFoldIdent(name)] != nil {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // segJoinEvalRow runs e once on vm's registers, its columns read by column
@@ -1543,6 +1708,31 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 		w.pass[i] = w.tabs[i].passing(preds, resolved)
 	}
 	for i, fs := range plan.filters {
+		if len(fs) == 0 {
+			continue
+		}
+		// What the level's filters let through is kept with its table, as an
+		// expression's values are, when no run can make it another.
+		passKey := segJoinPassKey{plan, i, m.likeCaseSensitive()}
+		var preds []segPlanPred
+		if i < len(plan.preds) {
+			preds = plan.preds[i]
+		}
+		keepPass := segJoinPassKeepable(preds, fs)
+		if keepPass {
+			t := w.tabs[i]
+			t.mu.Lock()
+			kept, ok := t.passes[passKey]
+			t.mu.Unlock()
+			if ok {
+				segJoinPassReuses.Add(1)
+				w.pass[i] = slices.Clone(kept)
+				continue
+			}
+		}
+		// Filters that cannot fail are computed only on the rows the ones
+		// before them let through: which rows are skipped changes no answer.
+		restrict := !slices.ContainsFunc(fs, func(f segJoinArg) bool { return f.expr != nil && !segJoinExprCannotFail(f.expr) })
 		for _, f := range fs {
 			if w.pass[i] == nil {
 				w.pass[i] = make([]bool, w.tabs[i].n)
@@ -1553,7 +1743,13 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 			// The term's value per row, true as the loop's IfNot reads it:
 			// not NULL, and true.
 			var vals []Value
-			if f.expr != nil {
+			if f.expr != nil && restrict && !w.cachedExpr(f) {
+				f.level = i
+				var ok bool
+				if vals, ok = w.exprPassing(f, w.pass[i]); !ok {
+					return nil, false
+				}
+			} else if f.expr != nil {
 				f.level = i
 				var ok bool
 				if vals, ok = w.exprValues(f); !ok {
@@ -1567,6 +1763,15 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 					w.pass[i][r] = false
 				}
 			}
+		}
+		if keepPass {
+			t := w.tabs[i]
+			t.mu.Lock()
+			if t.passes == nil {
+				t.passes = map[segJoinPassKey][]bool{}
+			}
+			t.passes[passKey] = slices.Clone(w.pass[i])
+			t.mu.Unlock()
 		}
 	}
 	// Each later level is found from an earlier one by its recheck's
