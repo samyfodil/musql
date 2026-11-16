@@ -333,7 +333,7 @@ func oneSegment(segs []*segment) *segment {
 // positioned, where the seek is any other, or matches so much of the table
 // that SeekIndexRowidsByKeys would leave it to the scan.
 func (p *ReadOnlyPager) segListSeekIndex(cur *vdbeCursor, into *segRowSource) (src *segRowSource, served bool) {
-	if !p.segSeekable(cur) || len(cur.idxSeekMore) > 0 || cur.idxSeekSet != nil || cur.idxSeekCol < 0 || cur.idxSeekCol >= len(cur.tbl.cols) {
+	if !p.segSeekable(cur) || len(cur.idxSeekMore) > 0 || cur.idxSeekSet != nil || cur.idxSeekRange != nil || cur.idxSeekCol < 0 || cur.idxSeekCol >= len(cur.tbl.cols) {
 		return nil, false
 	}
 	probe, root := cur.idxSeekProbe, cur.tbl.root

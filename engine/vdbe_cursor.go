@@ -148,8 +148,10 @@ type vdbeCursor struct {
 	idxSeekConfigured bool
 	idxSeekProbe      Value
 	idxSeekColl       string
-	// idxSeekSet is the first key's IN list, when it is one (idxSeekKey.set).
-	idxSeekSet []Value
+	// idxSeekSet is the first key's IN list, when it is one (idxSeekKey.set),
+	// and idxSeekRange its range (idxSeekKey.rng).
+	idxSeekSet   []Value
+	idxSeekRange *idxSeekRange
 	// idxSeekCol is the TABLE column the index leads on.
 	idxSeekCol int
 	// idxSeekMore: later OpSeekIndexHint slots, equalities on other columns
@@ -358,11 +360,11 @@ func (cur *vdbeCursor) idxSeekRowids() ([]int64, bool) {
 		if !stored(cur.idxSeekCol) {
 			return nil, false
 		}
-		return cur.pager.SeekIndexRowidsByKeys(cur.tbl.root, []idxSeekKey{{col: cur.idxSeekCol, probe: cur.idxSeekProbe, coll: cur.idxSeekColl, set: cur.idxSeekSet}})
+		return cur.pager.SeekIndexRowidsByKeys(cur.tbl.root, []idxSeekKey{cur.firstSeekKey()})
 	}
 	keys := make([]idxSeekKey, 0, 1+len(cur.idxSeekMore))
 	if stored(cur.idxSeekCol) {
-		keys = append(keys, idxSeekKey{col: cur.idxSeekCol, probe: cur.idxSeekProbe, coll: cur.idxSeekColl, set: cur.idxSeekSet})
+		keys = append(keys, cur.firstSeekKey())
 	}
 	for _, k := range cur.idxSeekMore {
 		if stored(k.col) {
@@ -370,6 +372,11 @@ func (cur *vdbeCursor) idxSeekRowids() ([]int64, bool) {
 		}
 	}
 	return cur.pager.SeekIndexRowidsByKeys(cur.tbl.root, keys)
+}
+
+// firstSeekKey is the cursor's first index seek key.
+func (cur *vdbeCursor) firstSeekKey() idxSeekKey {
+	return idxSeekKey{col: cur.idxSeekCol, probe: cur.idxSeekProbe, coll: cur.idxSeekColl, set: cur.idxSeekSet, rng: cur.idxSeekRange}
 }
 
 // seekNarrowRatio is how many rows a native walk reads in the time a seek
@@ -398,7 +405,7 @@ func (cur *vdbeCursor) seekIsWide() bool {
 	}
 	src, root := cur.pager.segs, cur.tbl.root
 	n := -1
-	first := idxSeekKey{col: cur.idxSeekCol, probe: cur.idxSeekProbe, coll: cur.idxSeekColl, set: cur.idxSeekSet}
+	first := cur.firstSeekKey()
 	for _, k := range append([]idxSeekKey{first}, cur.idxSeekMore...) {
 		if !cur.idxSeekKeyServed(k) {
 			continue
@@ -439,7 +446,7 @@ func (cur *vdbeCursor) seekIsNarrow() bool {
 	case cur.seekSetConfigured:
 		n = len(cur.seekSet)
 	case cur.idxSeekConfigured:
-		first := idxSeekKey{col: cur.idxSeekCol, probe: cur.idxSeekProbe, coll: cur.idxSeekColl, set: cur.idxSeekSet}
+		first := cur.firstSeekKey()
 		for _, k := range append([]idxSeekKey{first}, cur.idxSeekMore...) {
 			if !cur.idxSeekKeyServed(k) {
 				continue
@@ -462,6 +469,9 @@ func (cur *vdbeCursor) seekIsNarrow() bool {
 func (cur *vdbeCursor) idxSeekKeyServed(k idxSeekKey) bool {
 	if c := k.col; c >= 0 && c < len(cur.tbl.cols) && cur.tbl.cols[c].IsGenerated() && !cur.tbl.cols[c].GeneratedStored {
 		return false
+	}
+	if k.rng != nil {
+		return k.rng.numeric()
 	}
 	if equalFoldName(effectiveCollation(k.coll), "BINARY") {
 		return true
@@ -503,6 +513,9 @@ func (cur *vdbeCursor) writeSeekRowids() (hits []uint64, fromSeg, ok bool) {
 	// An IN list's candidates are its values', in rowid order, each once;
 	// fromSeg only when the segments named them all.
 	ask := func(k idxSeekKey) ([]uint64, bool, bool) {
+		if k.rng != nil {
+			return nil, false, false // the store's indexes answer equalities only
+		}
 		if k.set == nil {
 			return askOne(k.col, k.probe, k.coll)
 		}
@@ -519,7 +532,7 @@ func (cur *vdbeCursor) writeSeekRowids() (hits []uint64, fromSeg, ok bool) {
 		slices.SortFunc(out, cmpRowid)
 		return slices.Compact(out), fromSeg, true
 	}
-	first := idxSeekKey{col: cur.idxSeekCol, probe: cur.idxSeekProbe, coll: cur.idxSeekColl, set: cur.idxSeekSet}
+	first := cur.firstSeekKey()
 	if len(cur.idxSeekMore) == 0 {
 		return ask(first)
 	}

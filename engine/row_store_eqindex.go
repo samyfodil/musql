@@ -180,6 +180,9 @@ func (s *rowStore) segEqEstimate(col int, probe Value) int {
 // segEqKeyEstimate is segEqEstimate for a key, an IN list's summed over its
 // values.
 func (s *rowStore) segEqKeyEstimate(k idxSeekKey) int {
+	if k.rng != nil {
+		return math.MaxInt // no equality answers a range
+	}
 	if k.set == nil {
 		return s.segEqEstimate(k.col, k.probe)
 	}

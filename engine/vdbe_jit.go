@@ -1017,8 +1017,12 @@ func gatherSkip(prog *Program, at int) uint64 {
 			}
 			continue
 		case OpSeekIndexHint:
-			if h, _ := in.P4.(*indexSeekHint); h != nil && h.in > 0 {
-				for r := in.P2; r < in.P2+h.in; r++ {
+			if h, _ := in.P4.(*indexSeekHint); h != nil && (h.in > 0 || h.rng != nil) {
+				n := h.in
+				if h.rng != nil {
+					n = 2
+				}
+				for r := in.P2; r < in.P2+n; r++ {
 					if isSkipped(r) {
 						return 0
 					}
