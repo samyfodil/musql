@@ -271,7 +271,7 @@ type joinSource struct {
 	// column, per outer row (OpSortedSeek), where no index or rowid seek
 	// applies: joinSortedKey is the key over the outer tables. Set by
 	// annotateJoinSeeks.
-	joinSortedKey  Expr
+	joinSortedKey Expr
 	// joinSortedMore are the keys of joinSortedSeek.more, in its order.
 	joinSortedMore []Expr
 	joinSortedSeek *sortedSeekHint
@@ -3552,6 +3552,15 @@ func (c *compiler) emitJoinLevel(srcs []joinSource, plan joinPlan, level int, bo
 			c.patch(rewindJump, c.here())
 			h.patches[h.lv[level]] = append(h.patches[h.lv[level]], c.emit(Instruction{Op: OpIfEmpty, P1: cur}))
 			c.patch(skip, c.here())
+		} else if h != nil && h.off == 0 && h.lv[level] != level && c.seekKeyInvariant(s) {
+			// A seek whose key no outer row decides finds the same rows for
+			// every outer row: empty once, it is empty for all of them, and
+			// so is the join, as for an empty full scan above. C seeks it
+			// again for every outer row.
+			skip := c.emit(Instruction{Op: OpGoto})
+			c.patch(rewindJump, c.here())
+			h.patches[h.lv[level]] = append(h.patches[h.lv[level]], c.emit(Instruction{Op: OpGoto}))
+			c.patch(skip, c.here())
 		} else {
 			c.patch(rewindJump, c.here()) // empty -> past this level's own Next, contributing nothing
 		}
@@ -3877,6 +3886,51 @@ type joinHalt struct {
 	tableOpen []bool // the level is a table C opens with OP_OpenRead
 	patches   [][]int
 	off       int // inside a LEFT JOIN's NULL-extended pass
+}
+
+// seekKeyInvariant reports whether s, a table an inner join level seeks
+// (emitJoinSeekHint), is sought by a key that is the same for every outer row:
+// literals and parameters only, and rows no write in this statement can move.
+func (c *compiler) seekKeyInvariant(s joinSource) bool {
+	if c.liveRow != nil || c.writeTbl != nil || s.updateTarget || s.derived != nil || s.vtabItem != nil || s.cteItem != nil {
+		return false
+	}
+	switch {
+	case s.joinSeekKeyExpr != nil:
+		return constSeekKey(s.joinSeekKeyExpr)
+	case s.joinSortedSeek != nil:
+		if !constSeekKey(s.joinSortedKey) {
+			return false
+		}
+		for _, k := range s.joinSortedMore {
+			if !constSeekKey(k) {
+				return false
+			}
+		}
+		return true
+	case s.joinIdxSeek != nil:
+		return constSeekKey(s.joinIdxSeek.keyExpr)
+	}
+	return false
+}
+
+// constSeekKey reports whether e is built from literals and parameters by
+// operators alone: no column, and no function, which may not be
+// deterministic.
+func constSeekKey(e Expr) bool {
+	switch x := e.(type) {
+	case LiteralExpr, ParamExpr:
+		return true
+	case UnaryExpr:
+		return constSeekKey(x.X)
+	case BinaryExpr:
+		return constSeekKey(x.L) && constSeekKey(x.R)
+	case CastExpr:
+		return constSeekKey(x.X)
+	case CollateExpr:
+		return constSeekKey(x.X)
+	}
+	return false
 }
 
 // planJoinHalt is joinHalt for srcs under plan, or nil when no level would use
