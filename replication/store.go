@@ -592,21 +592,40 @@ func (s *Store) ingest(ctx context.Context, ops []Op, local bool) (int, error) {
 	if s.held(ctx, ops) {
 		return len(ops), nil
 	}
-	n, err := s.ingestOnce(ctx, ops, local, true)
+	n, err := s.ingestOnce(ctx, ops, local, true, false)
 	if errors.Is(err, errRunRefused) {
 		// Which op the run failed on is not known: they apply again one at a
 		// time, which finds it and applies the ones before it.
-		n, err = s.ingestOnce(ctx, ops, local, false)
+		n, err = s.ingestOnce(ctx, ops, local, false, false)
 	}
 	return n, err
+}
+
+// IngestEntry applies ops, one consensus entry and so one caller's
+// transaction, in one transaction: a reader sees all of it or none. Unlike
+// Ingest it never commits part of the ops to let a local write in.
+func (s *Store) IngestEntry(ctx context.Context, ops []Op) error {
+	s.waitLocal()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.foldOwn()
+
+	if s.held(ctx, ops) {
+		return nil
+	}
+	_, err := s.ingestOnce(ctx, ops, false, true, true)
+	if errors.Is(err, errRunRefused) {
+		_, err = s.ingestOnce(ctx, ops, false, false, true)
+	}
+	return err
 }
 
 // errRunRefused is ingestOnce's answer for a batch transaction that failed and
 // rolled back.
 var errRunRefused = errors.New("replication: a run of ops was refused")
 
-// ingestOnce is ingest's transaction, with ingestTx's batch.
-func (s *Store) ingestOnce(ctx context.Context, ops []Op, local, batch bool) (int, error) {
+// ingestOnce is ingest's transaction, with ingestTx's batch and whole.
+func (s *Store) ingestOnce(ctx context.Context, ops []Op, local, batch, whole bool) (int, error) {
 	s.ingestWaiting.Add(1)
 	tx, err := s.begin(ctx)
 	s.ingestGot.Add(1)
@@ -617,7 +636,7 @@ func (s *Store) ingestOnce(ctx context.Context, ops []Op, local, batch bool) (in
 	}
 	s.q, s.txHeld = tx, map[string]bool{}
 	cat, ver := s.cat, s.ver
-	added, n, err := s.ingestTx(ctx, ops, local, batch)
+	added, n, err := s.ingestTx(ctx, ops, local, batch, whole)
 	s.q, s.txHeld = s.db, nil
 	if err != nil {
 		tx.Rollback()
@@ -666,8 +685,9 @@ func (s *Store) held(ctx context.Context, ops []Op) bool {
 // ingestTx is ingest's transaction: the seqs it added to the log, by site, and
 // how many ops it took, or the index of the op refused. With batch, the data
 // ops between two schema ops merge a run at a time (applyOps), and an error
-// names no op.
-func (s *Store) ingestTx(ctx context.Context, ops []Op, local, batch bool) (map[string]map[uint64]bool, int, error) {
+// names no op. With whole, it takes every op, however long it holds the write
+// lock.
+func (s *Store) ingestTx(ctx context.Context, ops []Op, local, batch, whole bool) (map[string]map[uint64]bool, int, error) {
 	// A local capture may have changed the schema since this store last looked;
 	// none can while the transaction holds the write lock.
 	if err := s.syncCatalog(ctx); err != nil {
@@ -682,10 +702,10 @@ func (s *Store) ingestTx(ctx context.Context, ops []Op, local, batch bool) (map[
 	}
 	start, hold := time.Now(), s.hold()
 	for i, op := range ops {
-		if i > 0 && time.Since(start) > hold {
+		if !whole && i > 0 && time.Since(start) > hold {
 			return added, i, flush()
 		}
-		if w := s.localWaiting.Load(); i > 0 && w > 0 && time.Since(start) > yieldHold {
+		if w := s.localWaiting.Load(); !whole && i > 0 && w > 0 && time.Since(start) > yieldHold {
 			s.yieldTo.Store(s.localGot.Load() + uint64(w))
 			return added, i, flush()
 		}

@@ -255,8 +255,9 @@ func (q *Quorum) Covers(vv VersionVector) bool {
 }
 
 // Apply applies one committed entry to this node's database. Call it from the
-// consensus log's apply loop, on every node, in log order. An entry already
-// applied (anti-entropy got it first) is a no-op.
+// consensus log's apply loop, on every node, in log order. An entry is one
+// caller transaction and applies as one: a reader never sees part of it. An
+// entry already applied (anti-entropy got it first) is a no-op.
 func (q *Quorum) Apply(ctx context.Context, entry []byte) error {
 	s := q.s.Load()
 	if s == nil {
@@ -266,12 +267,7 @@ func (q *Quorum) Apply(ctx context.Context, entry []byte) error {
 	if err := json.Unmarshal(entry, &ops); err != nil {
 		return fmt.Errorf("replication: a quorum entry does not decode: %w", err)
 	}
-	for _, op := range ops {
-		if err := s.store.Ingest(ctx, op, false); err != nil {
-			return err
-		}
-	}
-	return nil
+	return s.store.IngestEntry(ctx, ops)
 }
 
 // ErrNotWriter is a commit refused because Leader's isWriter says another node

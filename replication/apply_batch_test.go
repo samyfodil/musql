@@ -110,7 +110,7 @@ func ingestEach(t *testing.T, s *Store, ops []Op) {
 	t.Helper()
 	for done := 0; done < len(ops); {
 		s.mu.Lock()
-		n, err := s.ingestOnce(context.Background(), ops[done:], false, false)
+		n, err := s.ingestOnce(context.Background(), ops[done:], false, false, false)
 		s.mu.Unlock()
 		if err != nil {
 			t.Fatal(err)

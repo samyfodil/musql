@@ -463,12 +463,8 @@ func TestQuorumCommitHoldingTheWriteLock(t *testing.T) {
 		_, err := db.ExecContext(ctx, `INSERT INTO t(v) VALUES('h')`)
 		done <- err
 	}()
-	applying := func() bool {
-		g := &s.store.group
-		g.mu.Lock()
-		defer g.mu.Unlock()
-		return g.running
-	}
+	// The hand-off's apply waits for the write lock.
+	applying := func() bool { return s.store.ingestWaiting.Load() > 0 }
 	for !applying() {
 		if time.Since(start) > time.Minute {
 			t.Fatal("the hand-off never reached its apply")
