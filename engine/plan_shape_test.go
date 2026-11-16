@@ -76,6 +76,23 @@ func TestPlanShapeSharesPrograms(t *testing.T) {
 		`SELECT group_concat(c) FROM t WHERE (b = 4 OR a = 7) AND a > 3`,
 		`SELECT a FROM t WHERE b = 3 LIMIT 2`,
 		`SELECT a FROM t WHERE b = 4 LIMIT 3`,
+		`SELECT a FROM t WHERE c = 'c1' ORDER BY a`,
+		`SELECT a FROM t WHERE c = 'c2' ORDER BY a`,
+		`SELECT a FROM t WHERE c > 'c2' AND b < 5 ORDER BY a`,
+		`SELECT a FROM t WHERE c > 'c3' AND b < 6 ORDER BY a`,
+		`SELECT count(*), sum(a) FROM t WHERE c >= 'c2'`,
+		`SELECT count(*), sum(a) FROM t WHERE c >= 'c4'`,
+		`SELECT a FROM t WHERE c <> '' ORDER BY a LIMIT 3`,
+		`SELECT a FROM t WHERE c = '' ORDER BY a`,
+		`SELECT a FROM t WHERE b = '4' ORDER BY a`,
+		`SELECT a FROM t WHERE b = '5' ORDER BY a`,
+		`SELECT a FROM t WHERE b = '5x' ORDER BY a`,
+		`SELECT a FROM t WHERE c = 'C1' COLLATE NOCASE ORDER BY a`,
+		`SELECT a FROM t WHERE c = 'C2' COLLATE NOCASE ORDER BY a`,
+		`SELECT a FROM t WHERE 'c3' = c ORDER BY a`,
+		`SELECT a FROM t WHERE 'c4' = c ORDER BY a`,
+		`SELECT t.a FROM t JOIN u ON u.x = t.b WHERE u.y > 'y1' AND t.c < 'c3' ORDER BY 1`,
+		`SELECT t.a FROM t JOIN u ON u.x = t.b WHERE u.y > 'y2' AND t.c < 'c4' ORDER BY 1`,
 	}
 	args := []Value{{Typ: Int, I: 4}}
 	planShapeHits.Store(0)
@@ -101,6 +118,10 @@ func TestPlanShapeSharesPrograms(t *testing.T) {
 	// The shape's program is the one kept: the second literal of a pair reused it.
 	if _, ok := p.planCacheFor()[shapeIndexKey(shapeKey(`SELECT a FROM t WHERE b = 3 ORDER BY a`, literalTokens(mustLex(t, `SELECT a FROM t WHERE b = 3 ORDER BY a`)), ""))]; !ok {
 		t.Error("no shape kept for a WHERE literal")
+	}
+	const text = `SELECT a FROM t WHERE c = 'c1' ORDER BY a`
+	if _, ok := p.planCacheFor()[shapeIndexKey(shapeKey(text, literalTokens(mustLex(t, text)), ""))]; !ok {
+		t.Error("no shape kept for a WHERE string")
 	}
 }
 
