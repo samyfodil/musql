@@ -166,6 +166,10 @@ func TestIndexSeekFiresWhenEligible(t *testing.T) {
 		"SELECT id FROM t WHERE 'apple' = a", // reversed
 		"SELECT id FROM t WHERE a = ?",       // parameter key
 		"SELECT id FROM t WHERE b = 14 AND a = 'x'",
+		// A range (#261), whose TEXT bound the segments' index declines at
+		// run time, leaving the scan.
+		"SELECT id FROM t WHERE a > 'm'",
+		"SELECT id FROM t WHERE b BETWEEN 10 AND 20",
 	}
 	for _, sql := range fires {
 		d, err := DisassembleScan(p, sql)
@@ -192,7 +196,6 @@ func TestIndexSeekFiresWhenEligible(t *testing.T) {
 	}
 	noFire := []string{
 		"SELECT id FROM t WHERE id = 3",                 // rowid: rowid-seek path, not index-seek
-		"SELECT id FROM t WHERE a > 'm'",                // not equality
 		"SELECT id FROM t WHERE a = b",                  // key references a column
 		"SELECT id FROM t WHERE a = 'x' OR b = 1",       // under OR
 		"SELECT id FROM t WHERE a COLLATE NOCASE = 'x'", // explicit COLLATE on the column operand
