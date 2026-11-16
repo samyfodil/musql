@@ -657,12 +657,19 @@ func sortedVMIdxFrom(x *vmIdx, s *segSortedRows) *vmIdx {
 		}
 		return x.tableIndex(mask, n, func(i int) (int, int, int64) { return k, int(s.perm[i]), s.block[s.perm[i]] })
 	}
-	for _, sg := range s.segs {
-		if _, ok := at[sg]; !ok {
+	idx := make([]int, len(s.list))
+	for i, sg := range s.list {
+		idx[i] = -1
+		if k, ok := at[sg]; ok {
+			idx[i] = k
+		}
+	}
+	for _, g := range s.seg {
+		if idx[g] < 0 {
 			return x
 		}
 	}
-	return x.tableIndex(mask, n, func(i int) (int, int, int64) { return at[s.segs[i]], s.rows[i], s.keys[i] })
+	return x.tableIndex(mask, n, func(i int) (int, int, int64) { return idx[s.seg[i]], int(s.rows[i]), s.keys[i] })
 }
 
 // tableIndex makes x the one index over every segment whose n rows, in
