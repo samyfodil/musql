@@ -62,6 +62,8 @@ type compiler struct {
 	nSub      int // run-once subquery cache slots allocated so far (subCache[]; see the subquery opcodes, vdbe_op.go)
 	nDistinct int // distinct-set trackers allocated so far (see the DISTINCT opcodes, vdbe_op.go)
 	scopes    []compileScope
+	// affMemo is affCtx's last answer (affMemo's doc).
+	affMemo affMemo
 
 	// returningOnceSubBase/Set hold the sub-cache slot base the first tuple of an
 	// unrolled "INSERT ... VALUES ... RETURNING" allocated, so later tuples reuse the
@@ -1801,7 +1803,54 @@ func trigPseudoRowScopes(trig *trigCompileCtx) []tableScope {
 // against, with an outer chain mirroring the compiler's, so a correlated
 // operand gets its declared affinity as at run time.
 func (c *compiler) affCtx() *evalCtx {
-	return c.fillAffCtx(scopesAffCtx(c.scopes))
+	var outer *evalCtx
+	if c.outer != nil {
+		outer = c.outer.affCtx()
+	}
+	m := &c.affMemo
+	if m.ctx != nil && m.matches(c, outer) {
+		return m.ctx
+	}
+	ctx := c.fillAffCtxOuter(scopesAffCtx(c.scopes), outer)
+	*m = affMemo{scopes: c.scopes, trig: c.trig, rowOuter: c.rowOuter, bufOut: c.bufOut, pager: c.pager, outer: outer, ctx: ctx}
+	for _, rs := range c.regScopes {
+		m.regs = append(m.regs, affMemoReg{rs.scope, rs.mirrorsCursorScope})
+	}
+	return ctx
+}
+
+// affMemo is affCtx's last answer and everything it was built from.
+// Comparisons ask for it constantly, and it changes only when the scopes do;
+// they are replaced, never edited in place, and holding them keeps a freed
+// list's address from coming back as another's.
+type affMemo struct {
+	scopes   []compileScope
+	regs     []affMemoReg
+	trig     *trigCompileCtx
+	rowOuter *evalCtx
+	bufOut   *windowBufCols
+	pager    *ReadOnlyPager
+	outer    *evalCtx
+	ctx      *evalCtx
+}
+
+type affMemoReg struct {
+	scope   *tableScope
+	mirrors bool
+}
+
+func (m *affMemo) matches(c *compiler, outer *evalCtx) bool {
+	if len(m.scopes) != len(c.scopes) || len(m.scopes) > 0 && &m.scopes[0] != &c.scopes[0] ||
+		m.trig != c.trig || m.rowOuter != c.rowOuter || m.bufOut != c.bufOut || m.pager != c.pager ||
+		m.outer != outer || len(m.regs) != len(c.regScopes) {
+		return false
+	}
+	for i, rs := range c.regScopes {
+		if m.regs[i] != (affMemoReg{rs.scope, rs.mirrorsCursorScope}) {
+			return false
+		}
+	}
+	return true
 }
 
 // enclosingAffCtx is affCtx without this compile's own FROM scopes: what a
@@ -1814,6 +1863,15 @@ func (c *compiler) enclosingAffCtx() *evalCtx {
 }
 
 func (c *compiler) fillAffCtx(ctx *evalCtx) *evalCtx {
+	var outer *evalCtx
+	if c.outer != nil {
+		outer = c.outer.affCtx()
+	}
+	return c.fillAffCtxOuter(ctx, outer)
+}
+
+// fillAffCtxOuter is fillAffCtx with the enclosing compiler's affCtx given.
+func (c *compiler) fillAffCtxOuter(ctx *evalCtx, outer *evalCtx) *evalCtx {
 	// The pager is what lets a SCALAR SUBQUERY operand report the affinity of
 	// the column it selects (scalarSubqueryColumn resolves the subquery's own
 	// FROM against it). It is read-only here -- nothing in the affinity path
@@ -1850,7 +1908,7 @@ func (c *compiler) fillAffCtx(ctx *evalCtx) *evalCtx {
 	// mutate the caller's evalCtx and create a cycle.
 	switch {
 	case c.outer != nil:
-		ctx.outer = c.outer.affCtx()
+		ctx.outer = outer
 	case c.rowOuter != nil:
 		ctx.outer = c.rowOuter
 	case c.bufOut != nil:
