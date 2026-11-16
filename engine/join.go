@@ -673,17 +673,14 @@ func (p *ReadOnlyPager) derivedColumnInfos(sub *SelectStmt, names []string) []co
 
 // resolveFromSchemaOnly is resolveFrom with derived tables' columns taken from
 // their expression lists rather than by running them, as sqlite3ExpandSubquery
-// (select.c:5885) does. It is only a retry: its one caller
-// (resolveArmOutputsOuter, sql_compound.go) uses it after resolveFrom fails.
+// (select.c:5885) does, and base tables' columns without their rows
+// (resolveFromColumns): its callers read only the scopes it builds. Reading the
+// rows scanned every table an IN subquery's FROM names, at compile time.
 func (p *ReadOnlyPager) resolveFromSchemaOnly(items []FromItem) ([]joinedTable, error) {
 	saved := p.derivedSchemaOnly
 	p.derivedSchemaOnly = true
 	defer func() { p.derivedSchemaOnly = saved }()
-	jts, _, err := p.resolveFrom(items, nil)
-	if err != nil {
-		return nil, err
-	}
-	return jts, nil
+	return p.resolveFromColumns(items)
 }
 
 // resolveFromColumns is resolveFrom for a caller that reads only the scopes it
