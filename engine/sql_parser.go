@@ -30,6 +30,11 @@ type parser struct {
 	// compare with a column into hidden parameters (plan_shape.go); coreDepth
 	// is how many select cores are being parsed, the outermost being 1.
 	shape     *shapeRecorder
+	// inLits is, for the IN list parseInClause last parsed, each element's
+	// literal token (litTok), for shapeInList; betweenLits the same for the
+	// bounds parseBetweenBounds last parsed, for shapeBetween.
+	inLits      []int
+	betweenLits [2]int
 	coreDepth int
 
 	// sawIfNotExists records that the DDL prefix just parsed carried an
@@ -3570,13 +3575,14 @@ func (p *parser) parseComparison() (Expr, error) {
 			if err != nil {
 				return nil, err
 			}
-			left = makeIn(left, list, sub, false)
+			left = makeIn(left, p.shapeInList(left, list), sub, false)
 		case t.kind == tkIdent && t.isKw("BETWEEN"):
 			p.next()
 			lo, hi, err := p.parseBetweenBounds()
 			if err != nil {
 				return nil, err
 			}
+			lo, hi = p.shapeBetween(left, lo, hi)
 			if de, ok := desugarRowBetween(left, lo, hi, false); ok {
 				left = de
 			} else {
@@ -3631,12 +3637,13 @@ func (p *parser) parseComparison() (Expr, error) {
 				if err != nil {
 					return nil, err
 				}
-				left = makeIn(left, list, sub, true)
+				left = makeIn(left, p.shapeInList(left, list), sub, true)
 			case p.consumeKeyword("BETWEEN"):
 				lo, hi, err := p.parseBetweenBounds()
 				if err != nil {
 					return nil, err
 				}
+				lo, hi = p.shapeBetween(left, lo, hi)
 				if de, ok := desugarRowBetween(left, lo, hi, true); ok {
 					left = de
 				} else {
@@ -3712,6 +3719,7 @@ func regexpCall(x, pattern Expr) Expr {
 // "IN (SELECT * FROM <table>)"; a table with more than one column then fails the
 // subquery's one-column check.
 func (p *parser) parseInRHS() (list []Expr, sub *SelectStmt, err error) {
+	p.inLits = nil
 	if p.peekIsPunct("(") {
 		return p.parseInClause()
 	}
@@ -3751,18 +3759,24 @@ func (p *parser) parseInClause() (list []Expr, sub *SelectStmt, err error) {
 		p.next()
 		return list, nil, nil
 	}
+	var lits []int
 	for {
+		start := p.pos
 		e, err := p.parseExpr()
 		if err != nil {
 			return nil, nil, err
 		}
 		list = append(list, e)
+		if p.shape != nil {
+			lits = append(lits, p.litTok(start, e))
+		}
 		if p.peekIsPunct(",") {
 			p.next()
 			continue
 		}
 		break
 	}
+	p.inLits = lits
 	if err := p.expectPunct(")"); err != nil {
 		return nil, nil, err
 	}
@@ -3785,17 +3799,21 @@ func (p *parser) parseBetweenBounds() (lo, hi Expr, err error) {
 	// Both bounds parse at the RELATIONAL tier, which binds tighter than
 	// BETWEEN itself: verified directly, "SELECT 2 BETWEEN 1 AND 2 < 3" is 0,
 	// i.e. 2 BETWEEN 1 AND (2 < 3), not (2 BETWEEN 1 AND 2) < 3.
+	ls := p.pos
 	lo, err = p.parseRelational()
 	if err != nil {
 		return nil, nil, err
 	}
+	lt := p.litTok(ls, lo)
 	if !p.consumeKeyword("AND") {
 		return nil, nil, fmt.Errorf("engine: expected AND in BETWEEN, got %q", p.tokenDesc(p.peek()))
 	}
+	hs := p.pos
 	hi, err = p.parseRelational()
 	if err != nil {
 		return nil, nil, err
 	}
+	p.betweenLits = [2]int{lt, p.litTok(hs, hi)}
 	return lo, hi, nil
 }
 

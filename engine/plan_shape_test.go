@@ -7,8 +7,9 @@ import (
 )
 
 // TestPlanShapeSharesPrograms: statements that differ only in the literals
-// their WHERE and ON compare with a column run one program, each answering as
-// its own compile does; a literal anywhere else keeps them apart (#164).
+// their WHERE and ON compare with a column, list for one or bound it between,
+// run one program, each answering as its own compile does; a literal anywhere
+// else keeps them apart (#164).
 func TestPlanShapeSharesPrograms(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "s.musq")
 	buildDB(t, path,
@@ -101,6 +102,40 @@ func TestPlanShapeSharesPrograms(t *testing.T) {
 		`SELECT a FROM t WHERE 7 = (b = 2) + 6 ORDER BY a`,
 		`SELECT a FROM t WHERE 3 < (c = 'c1') + b ORDER BY a`,
 		`SELECT a FROM t WHERE 4 < (c = 'c2') + b ORDER BY a`,
+		// An IN list's numbers.
+		`SELECT a FROM t WHERE b IN (2, 4, 6) ORDER BY a`,
+		`SELECT a FROM t WHERE b IN (3, 5, 6) ORDER BY a`,
+		`SELECT a FROM t WHERE b NOT IN (2, 4, 6) AND a < 30 ORDER BY a`,
+		`SELECT a FROM t WHERE b NOT IN (3, 5, 6) AND a < 40 ORDER BY a`,
+		`SELECT count(*), sum(a) FROM t WHERE b IN (2, 4)`,
+		`SELECT count(*), sum(a) FROM t WHERE b IN (3, 5)`,
+		`SELECT a FROM t WHERE b IN (0, 4, 5) ORDER BY a`,
+		`SELECT a FROM t WHERE b IN (1, 3, 5) ORDER BY a`,
+		`SELECT a FROM t WHERE b IN ('3', 4, 5) ORDER BY a`,
+		`SELECT a FROM t WHERE b IN ('2', 4, 6) ORDER BY a`,
+		`SELECT a FROM t WHERE b IN (2.0, 3.5, 4) ORDER BY a`,
+		`SELECT a FROM t WHERE b IN (5.0, 2.5, 6) ORDER BY a`,
+		`SELECT count(*) FROM t WHERE 5 > (b IN (2, 3, 4)) + 4`,
+		`SELECT count(*) FROM t WHERE 6 > (b IN (3, 4, 6)) + 5`,
+		`SELECT a FROM t WHERE a IN (3, 9, 27, 81) AND b > 2 ORDER BY a`,
+		`SELECT a FROM t WHERE a IN (4, 8, 16, 32) AND b > 3 ORDER BY a`,
+		`SELECT t.a, u.y FROM t JOIN u ON u.x = t.b AND u.x IN (2, 3, 4) WHERE t.a < 20 ORDER BY 1, 2`,
+		`SELECT t.a, u.y FROM t JOIN u ON u.x = t.b AND u.x IN (3, 5, 6) WHERE t.a < 30 ORDER BY 1, 2`,
+		`SELECT group_concat(a) FROM t WHERE b IN (2, 3, 4) OR a = 7`,
+		`SELECT group_concat(a) FROM t WHERE b IN (3, 4, 5) OR a = 8`,
+		// A BETWEEN's numbers.
+		`SELECT a FROM t WHERE b BETWEEN 2 AND 5 ORDER BY a`,
+		`SELECT a FROM t WHERE b BETWEEN 3 AND 6 ORDER BY a`,
+		`SELECT a FROM t WHERE b NOT BETWEEN 2 AND 5 AND a < 30 ORDER BY a`,
+		`SELECT a FROM t WHERE b NOT BETWEEN 3 AND 4 AND a < 40 ORDER BY a`,
+		`SELECT count(*), sum(b) FROM t WHERE a BETWEEN 10 AND 40 AND b > 2`,
+		`SELECT count(*), sum(b) FROM t WHERE a BETWEEN 5 AND 30 AND b > 3`,
+		`SELECT a FROM t WHERE b BETWEEN 0 AND 4 ORDER BY a`,
+		`SELECT a FROM t WHERE b BETWEEN 0 AND 6 ORDER BY a`,
+		`SELECT a FROM t WHERE c BETWEEN 'c1' AND 'c3' AND b > 2 ORDER BY a`,
+		`SELECT a FROM t WHERE c BETWEEN 'c2' AND 'c4' AND b > 3 ORDER BY a`,
+		`SELECT count(*) FROM t WHERE 5 > (b BETWEEN 2 AND 4) + 4`,
+		`SELECT count(*) FROM t WHERE 6 > (b BETWEEN 3 AND 5) + 5`,
 	}
 	args := []Value{{Typ: Int, I: 4}}
 	planShapeHits.Store(0)
@@ -130,6 +165,11 @@ func TestPlanShapeSharesPrograms(t *testing.T) {
 	const text = `SELECT a FROM t WHERE c = 'c1' ORDER BY a`
 	if _, ok := p.planCacheFor()[shapeIndexKey(shapeKey(text, literalTokens(mustLex(t, text)), ""))]; !ok {
 		t.Error("no shape kept for a WHERE string")
+	}
+	for _, q := range []string{`SELECT a FROM t WHERE b IN (2, 4, 6) ORDER BY a`, `SELECT a FROM t WHERE b BETWEEN 2 AND 5 ORDER BY a`} {
+		if _, ok := p.planCacheFor()[shapeIndexKey(shapeKey(q, literalTokens(mustLex(t, q)), ""))]; !ok {
+			t.Errorf("no shape kept for %s", q)
+		}
 	}
 }
 

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"slices"
 	"strings"
 	"sync/atomic"
 )
@@ -117,6 +118,49 @@ func (p *parser) shapeCompare(op string, l Expr, lt int, r Expr, rt int) Expr {
 		}
 	}
 	return rowOrBinary(op, l, r)
+}
+
+// shapeInList is list, the value list of an IN over x, with its numbers made
+// hidden parameters where the shape allows, as shapeCompare makes one side
+// of a comparison: x reads a column, and each number is a whole element. A
+// string stays literal: native code matches a list of TEXTs as written
+// (inListPlan.texts).
+func (p *parser) shapeInList(x Expr, list []Expr) []Expr {
+	s := p.shape
+	if s == nil || s.active == 0 || p.coreDepth != 1 || len(p.inLits) != len(list) || !readsColumn(x) {
+		return list
+	}
+	var out []Expr
+	for i, tok := range p.inLits {
+		if tok < 0 || p.toks[tok].kind != tkNumber {
+			continue
+		}
+		if out == nil {
+			out = slices.Clone(list)
+		}
+		out[i] = s.param(tok, list[i].(LiteralExpr).Val)
+	}
+	if out == nil {
+		return list
+	}
+	return out
+}
+
+// shapeBetween is the bounds of a BETWEEN over x with each number made a
+// hidden parameter where the shape allows, as shapeInList makes a list's.
+// The planner reads the BETWEEN as two comparisons with x.
+func (p *parser) shapeBetween(x, lo, hi Expr) (Expr, Expr) {
+	s := p.shape
+	if s == nil || s.active == 0 || p.coreDepth != 1 || !readsColumn(x) {
+		return lo, hi
+	}
+	bounds := [2]Expr{lo, hi}
+	for i, tok := range p.betweenLits {
+		if tok >= 0 && p.toks[tok].kind == tkNumber {
+			bounds[i] = s.param(tok, bounds[i].(LiteralExpr).Val)
+		}
+	}
+	return bounds[0], bounds[1]
 }
 
 func (s *shapeRecorder) param(tok int, v Value) Expr {
