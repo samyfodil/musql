@@ -129,6 +129,11 @@ type Shell struct {
 	Timer  bool   // print each statement's run time
 	reads  int    // .read files open, one inside another
 	failed int    // statements and dot-commands that reported an error
+	// out is the file .output or .once sends results to, and stdout the
+	// writer Out was before it; once ends it after the next statement.
+	out    *os.File
+	stdout io.Writer
+	once   bool
 	// Interrupts, when set, makes a Ctrl+C call cancel while a statement
 	// runs, until the func it returns is called.
 	Interrupts func(cancel context.CancelFunc) (stop func())
@@ -142,6 +147,7 @@ const (
 // REPL reads statements until .quit or end of input; errors are printed to
 // errw and do not stop it.
 func (s *Shell) REPL(ctx context.Context, in LineReader, errw io.Writer) error {
+	defer s.endOutput()
 	_, err := s.run(ctx, in, errw, false)
 	return err
 }
@@ -163,6 +169,7 @@ func (s *Shell) run(ctx context.Context, in LineReader, errw io.Writer, finish b
 				if err := s.Script(ctx, buf.String()); err != nil {
 					s.report(errw, err)
 				}
+				s.endOnce()
 			}
 			return false, nil
 		}
@@ -192,6 +199,7 @@ func (s *Shell) run(ctx context.Context, in LineReader, errw io.Writer, finish b
 		if err := s.Script(ctx, buf.String()); err != nil {
 			s.report(errw, err)
 		}
+		s.endOnce()
 		buf.Reset()
 		in.SetPrompt(prompt)
 	}
@@ -357,6 +365,8 @@ const helpText = `.tables              list tables and views
 .mode table|csv|json output format
 .timer on|off        print each statement's run time
 .read FILE           run the SQL and dot-commands in FILE
+.output [FILE]       send results to FILE, or stdout without one (off: nowhere)
+.once FILE           send the next statement's results to FILE
 .quit                leave the shell
 `
 
@@ -384,6 +394,15 @@ func (s *Shell) meta(ctx context.Context, line string, errw io.Writer) (quit boo
 			return false, errors.New("usage: .read FILE")
 		}
 		return s.read(ctx, name, errw)
+	case ".output", ".once":
+		name := strings.TrimSpace(strings.TrimPrefix(line, f[0]))
+		if len(name) >= 2 && (name[0] == '"' || name[0] == '\'') && name[len(name)-1] == name[0] {
+			name = name[1 : len(name)-1]
+		}
+		if f[0] == ".once" && name == "" {
+			return false, errors.New("usage: .once FILE")
+		}
+		return false, s.output(name, f[0] == ".once", errw)
 	case ".help":
 		io.WriteString(s.Out, helpText)
 	case ".tables":
@@ -425,6 +444,49 @@ func (s *Shell) meta(ctx context.Context, line string, errw io.Writer) (quit boo
 		return false, fmt.Errorf("unknown command %s (.help lists them)", f[0])
 	}
 	return false, nil
+}
+
+// output sends results to name, as the sqlite3 shell's .output does: a file,
+// created or truncated; stdout, or no name, for where they went first; stderr,
+// for errw; off, for nowhere. With once, only the next statement's results.
+func (s *Shell) output(name string, once bool, errw io.Writer) error {
+	s.endOutput()
+	switch name {
+	case "", "stdout":
+		return nil
+	case "stderr":
+		s.stdout, s.Out = s.Out, errw
+	case "off":
+		s.stdout, s.Out = s.Out, io.Discard
+	default:
+		f, err := os.Create(name)
+		if err != nil {
+			return err
+		}
+		s.stdout, s.Out, s.out = s.Out, f, f
+	}
+	s.once = once
+	return nil
+}
+
+// endOnce ends a .once redirection after the statement it was for.
+func (s *Shell) endOnce() {
+	if s.once {
+		s.endOutput()
+	}
+}
+
+// endOutput sends results back to where they went before .output or .once,
+// closing the file they went to.
+func (s *Shell) endOutput() {
+	if s.out != nil {
+		s.out.Close()
+		s.out = nil
+	}
+	if s.stdout != nil {
+		s.Out, s.stdout = s.stdout, nil
+	}
+	s.once = false
 }
 
 // read runs the SQL and dot-commands in the file name, as typed at the

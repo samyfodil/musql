@@ -172,3 +172,60 @@ func TestOpenPipedScript(t *testing.T) {
 		t.Fatalf("past an error: %q %q %v", out, errs, err)
 	}
 }
+
+// TestShellOutput: .output sends results to a file until another .output, and
+// back where they went without one; .once sends the next statement's only;
+// errors stay on the error stream, as in the sqlite3 shell (#245).
+func TestShellOutput(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(dir, "t.musq"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	at := func(name string) string { return filepath.Join(dir, name) }
+	read := func(name string) string {
+		t.Helper()
+		b, err := os.ReadFile(at(name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	run := func(in ...string) (string, string) {
+		t.Helper()
+		var out, errs bytes.Buffer
+		sh := &cli.Shell{DB: db, Out: &out, Mode: "table"}
+		if err := sh.REPL(context.Background(), &lines{in: in}, &errs); err != nil {
+			t.Fatal(err)
+		}
+		return out.String(), errs.String()
+	}
+	// The issue's.
+	if out, errs := run(".output "+at("a.txt"), "select 1 a;", ".output", "select 2 b;"); out != "b\n2\n" || errs != "" {
+		t.Fatalf(".output then back: %q %q", out, errs)
+	}
+	if got := read("a.txt"); got != "a\n1\n" {
+		t.Fatalf("a.txt: %q", got)
+	}
+	// Truncated when named again; stdout ends it too; the file is closed when
+	// the shell ends.
+	if out, _ := run(`.output "`+at("a.txt")+`"`, "select 3 c;", ".mode csv", "select 4 d, 5 e;", ".output stdout", "select 6 f;", ".output "+at("b.txt"), "select 7 g;"); out != "f\n6\n" {
+		t.Fatalf("stdout: %q", out)
+	}
+	if got, gotB := read("a.txt"), read("b.txt"); got != "c\n3\nd,e\n4,5\n" || gotB != "g\n7\n" {
+		t.Fatalf("a.txt %q, b.txt %q", got, gotB)
+	}
+	if out, _ := run(".once "+at("o.txt"), "select 8 h;", "select 9 i;"); out != "i\n9\n" || read("o.txt") != "h\n8\n" {
+		t.Fatalf(".once: %q, o.txt %q", out, read("o.txt"))
+	}
+	if out, errs := run(".output off", "select 10 j;", ".output", "select nosuch;", "select 11 k;"); out != "k\n11\n" || !strings.Contains(errs, "nosuch") {
+		t.Fatalf("off, and an error: %q %q", out, errs)
+	}
+	if out, errs := run(".output "+at("e.txt"), "select nosuch;", ".output"); out != "" || !strings.Contains(errs, "nosuch") || read("e.txt") != "" {
+		t.Fatalf("an error while sent to a file: %q %q, e.txt %q", out, errs, read("e.txt"))
+	}
+	if out, errs := run(".output "+at("none/x.txt"), "select 12 l;", ".once"); out != "l\n12\n" || !strings.Contains(errs, "none") || !strings.Contains(errs, "usage: .once FILE") {
+		t.Fatalf("a file that cannot be made, and .once alone: %q %q", out, errs)
+	}
+}
