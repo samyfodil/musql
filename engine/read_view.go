@@ -140,9 +140,15 @@ func (r *Reader) IndexOrder(index string) (key, trailer []KeyColumn, err error) 
 	if !t.withoutRowid {
 		return key, []KeyColumn{{Column: -1}}, nil
 	}
+	// The PRIMARY KEY columns carried after the key keep the PRIMARY KEY's
+	// sort order (sqlite3CreateIndex, build.c: aSortOrder from pPk).
 	trailIdx, trailColl := indexTrailingKeyColsAndCollation(t, keyCols, coll)
 	for i, ci := range trailIdx {
-		trailer = append(trailer, KeyColumn{Column: ci, Collation: trailColl[i]})
+		desc := false
+		if j := slices.Index(t.pkIndex.colIdx, ci); j >= 0 && j < len(t.pkIndex.colDesc) {
+			desc = t.pkIndex.colDesc[j]
+		}
+		trailer = append(trailer, KeyColumn{Column: ci, Collation: trailColl[i], Desc: desc})
 	}
 	return key, trailer, nil
 }
