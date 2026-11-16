@@ -100,15 +100,33 @@ func TestChangesEveryPath(t *testing.T) {
 		t.Fatalf("a's own commit: told rows %d times with %d keys, want once with 2", calls-whole, keys)
 	}
 	lb.waitCalls(t, "notes", 1, false)
+	// The two rows reach b as two ops, which it may apply one at a time: a
+	// delete of n2 before n2 arrives deletes nothing, and n2 then stays.
+	for deadline := time.Now().Add(10 * time.Second); dump(t, b, `SELECT count(*) FROM notes`) != "2\n"; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("a's insert did not reach b")
+		}
+	}
 	exec(a, `UPDATE notes SET body = 'uno' WHERE id = 'n1'`)
 	if calls, keys, whole := la.get("notes"); calls-whole != 2 || keys != 3 {
 		t.Fatalf("a's update: told rows %d times with %d keys, want twice with 3", calls-whole, keys)
 	}
+	_, _, wholeBefore := la.get("notes")
 	exec(b, `DELETE FROM notes WHERE id = 'n2'`)
-	la.waitCalls(t, "notes", 3, false)
 	for deadline := time.Now().Add(10 * time.Second); dump(t, a, `SELECT count(*) FROM notes`) != "1\n"; time.Sleep(10 * time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatal("b's delete did not reach a")
+		}
+	}
+	// a is told of it by the row's key when the op is ingested, or of the
+	// whole table when the delete reaches it in a snapshot page.
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		calls, _, whole := la.get("notes")
+		if calls-whole >= 3 || whole > wholeBefore {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("b's delete reached a untold: %d calls, %d whole", calls, whole)
 		}
 	}
 
