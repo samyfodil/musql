@@ -66,6 +66,24 @@ func (t token) isKw(kw string) bool {
 	return true
 }
 
+// upperIn reports m[t.upper()], folding a short word on the stack rather than
+// into the copy upper makes of a lower-case one.
+func (t token) upperIn(m map[string]bool) bool {
+	var buf [24]byte
+	if len(t.text) > len(buf) {
+		return m[t.upper()]
+	}
+	b := buf[:len(t.text)]
+	for i := range len(b) {
+		c := t.text[i]
+		if c >= 'a' && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		b[i] = c
+	}
+	return m[string(b)]
+}
+
 // asciiUpper folds a-z to uppercase; every other byte is unchanged. Returns s
 // unchanged when nothing moves, saving allocation for already-uppercase keywords.
 func asciiUpper(s string) string {

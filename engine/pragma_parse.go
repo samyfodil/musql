@@ -292,27 +292,27 @@ func matchParen(toks []token, openIdx int) int {
 // splitTopLevelCommas splits toks (already the tokens strictly INSIDE one
 // pair of parens) into comma-separated segments, ignoring commas nested
 // inside a deeper paren level -- e.g. a column's own "VARCHAR(10)" type or a
-// constraint's own "(a, b)" column list must not split the outer list.
+// constraint's own "(a, b)" column list must not split the outer list. The
+// segments are slices of toks, which lex may share: a caller copies one
+// before writing into it.
 func splitTopLevelCommas(toks []token) [][]token {
 	var segments [][]token
-	var cur []token
-	depth := 0
-	for _, t := range toks {
+	from, depth := 0, 0
+	for i, t := range toks {
+		if t.kind != tkPunct {
+			continue
+		}
 		switch {
-		case t.kind == tkPunct && t.text == "(":
+		case t.text == "(":
 			depth++
-			cur = append(cur, t)
-		case t.kind == tkPunct && t.text == ")":
+		case t.text == ")":
 			depth--
-			cur = append(cur, t)
-		case t.kind == tkPunct && t.text == "," && depth == 0:
-			segments = append(segments, cur)
-			cur = nil
-		default:
-			cur = append(cur, t)
+		case t.text == "," && depth == 0:
+			segments = append(segments, toks[from:i:i])
+			from = i + 1
 		}
 	}
-	segments = append(segments, cur)
+	segments = append(segments, toks[from:len(toks):len(toks)])
 	return segments
 }
 
@@ -402,19 +402,17 @@ func parsePragmaTableDef(createSQL string) (*pragmaTableDef, error) {
 	// "auto-assign") even in a STRICT table -- verified directly, PRAGMA
 	// table_info reports notnull=0 for it.
 	rowidAliasName := ""
-	tableConstraintKeywords := map[string]bool{
-		"PRIMARY": true, "UNIQUE": true, "CHECK": true, "FOREIGN": true, "CONSTRAINT": true,
-	}
 
 	for _, seg := range segments {
 		if len(seg) == 0 {
 			continue
 		}
 		if seg[0].kind == tkString {
+			seg = append([]token{seg[0]}, seg[1:]...) // its own: the segment shares lex's tokens
 			seg[0], _ = asCreateTableIdent(seg[0])
 		}
 		first := seg[0]
-		if first.kind == tkIdent && tableConstraintKeywords[first.upper()] {
+		if first.kind == tkIdent && first.upperIn(tableConstraintStart) {
 			kwTok := first
 			rest := seg
 			if kwTok.isKw("CONSTRAINT") {
@@ -484,11 +482,10 @@ func parsePragmaTableDef(createSQL string) (*pragmaTableDef, error) {
 		// Column definition.
 		name := first.text
 		j := 1
-		var typeToks []token
-		for j < len(seg) && !(seg[j].kind == tkIdent && pragmaColConstraintStart[seg[j].upper()]) {
-			typeToks = append(typeToks, seg[j])
+		for j < len(seg) && !(seg[j].kind == tkIdent && seg[j].upperIn(pragmaColConstraintStart)) {
 			j++
 		}
+		typeToks := seg[1:j:j]
 		col := pragmaColumn{name: name, declType: pragmaDeclTypeText(createSQL, typeToks)}
 		isColPK := false
 		pkDesc := false

@@ -581,6 +581,19 @@ func detectAutoIncrementColumn(createSQL string) (colName string, ok bool, err e
 	}
 	inner := toks[start:end]
 
+	autoIncCount := 0
+	for _, t := range inner {
+		if t.kind == tkIdent && t.isKw("AUTOINCREMENT") {
+			autoIncCount++
+		}
+	}
+	if autoIncCount == 0 {
+		return "", false, nil
+	}
+	if autoIncCount > 1 {
+		return "", false, fmt.Errorf("at most one AUTOINCREMENT column is supported by this write path")
+	}
+
 	// Split into top-level (paren-depth-0 relative to inner) comma-separated
 	// segments -- the same split parseCreateTableColumnsAndAutoIndexes
 	// performs over the identical span.
@@ -604,21 +617,6 @@ func detectAutoIncrementColumn(createSQL string) (colName string, ok bool, err e
 	}
 	if len(cur) > 0 {
 		segments = append(segments, cur)
-	}
-
-	autoIncCount := 0
-	for _, seg := range segments {
-		for _, t := range seg {
-			if t.kind == tkIdent && t.isKw("AUTOINCREMENT") {
-				autoIncCount++
-			}
-		}
-	}
-	if autoIncCount == 0 {
-		return "", false, nil
-	}
-	if autoIncCount > 1 {
-		return "", false, fmt.Errorf("at most one AUTOINCREMENT column is supported by this write path")
 	}
 
 	tableConstraintKeywords := map[string]bool{
