@@ -249,6 +249,14 @@ func (g seekGuard) keepRange(col, pos int) bool {
 	return pos < g.raiseAt
 }
 
+// keepIndexRange is keep for a bound of an index range seek: a range may
+// prune only where nothing tested on this source's rows can raise, or where
+// C's loop is that range of an index on that column.
+func (g seekGuard) keepIndexRange(col, pos int) bool {
+	a := g.access
+	return g.raiseAt < 0 || a.known && a.index && a.hasRange && a.rangeCol == col
+}
+
 // consumedFirst moves the equalities C's index consumes to the front of a
 // one-table level's terms when a raising term is among them: C never tests a
 // term on a row its index skips, so a row read here that C skips must fail one

@@ -95,14 +95,14 @@ func lowerIdxSeeks(prog *Program, vp []jit.VInsn, segCap []bool) (specs []*idxSe
 		}
 		c := in.P1
 		h, ok := in.P4.(*indexSeekHint)
-		if !ok || h.slot != 0 || h.in != 0 || h.leadingCol < 0 || h.aff != affNone && h.aff != affNumeric && h.aff != affInteger {
+		if !ok || h.slot != 0 || h.in != 0 || h.rng != nil || h.leadingCol < 0 || h.aff != affNone && h.aff != affNumeric && h.aff != affInteger {
 			continue
 		}
 		j := pc + 1
 		pinned := []int{h.leadingCol}
 		for j < len(insns) && insns[j].Op == OpSeekIndexHint && insns[j].P1 == c {
 			h2, ok := insns[j].P4.(*indexSeekHint)
-			if !ok || h2.slot == 0 || h2.in != 0 {
+			if !ok || h2.slot == 0 || h2.in != 0 || h2.rng != nil {
 				break
 			}
 			if !h2.is {

@@ -826,12 +826,23 @@ type indexSeekHint struct {
 	// in, when not zero, is the length of an IN list whose values are in the
 	// registers from P2 on: the key matches any of them.
 	in int
+	// rng, when not nil, is a range whose bounds are in registers P2 (the
+	// lower) and P2+1 (the upper).
+	rng *indexSeekRangeHint
 	// plan, on slot 0, is the loop C's planner chose for this table, which
 	// EXPLAIN QUERY PLAN prints in place of the hint's own index.
 	plan wherePlanExplain
 	// raiseFree, on slot 0, says no conjunct tested on this table's rows can
 	// raise, so the seek only prunes and a scan may stand in for it.
 	raiseFree bool
+}
+
+// indexSeekRangeHint is an index seek range's shape: which bounds it has,
+// whether each includes its value, and the affinity each comparison applies.
+type indexSeekRangeHint struct {
+	hasLo, hasHi   bool
+	loIncl, hiIncl bool
+	loAff, hiAff   affinity
 }
 
 // multiOrOrder is the autoIndexKey variant OpAutoIndexOrder applies when the

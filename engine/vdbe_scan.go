@@ -585,7 +585,7 @@ func compileScanPlain(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols 
 	// (the key needs no other cursor). One source per query (the first
 	// eligible conjunct); others may still get a correlated seek
 	// (annotateJoinSeeks).
-	planConstantKeySeeks(c, srcs, stmt.Where, true)
+	planConstantKeySeeks(c, srcs, stmt.Where, true, true)
 
 	// A row-mode scan evaluates WHERE and the select list with every cursor
 	// positioned at the current row, so a correlated subquery compiled beneath
@@ -1072,14 +1072,16 @@ func isScopeRowidRef(c *compiler, s joinSource, e Expr) bool {
 // source: a rowid point lookup, else a rowid IN list, else index equalities
 // (which carry the planner's EXPLAIN line). With rowidRange, every source
 // left without one takes a rowid bound. Each only restricts candidates and
-// keeps the scan's order.
-func planConstantKeySeeks(c *compiler, srcs []joinSource, where Expr, rowidRange bool) {
+// keeps the scan's order. An index range is planned for one table's scan of
+// rows alone (scanRanges): an aggregate over a range, or a join, is the
+// segment kernels', whose shapes a seek's hint would hide.
+func planConstantKeySeeks(c *compiler, srcs []joinSource, where Expr, rowidRange, scanRanges bool) {
 	seeked := -1
 	if idx, key, ok := detectRowidSeekKey(c, srcs, where); ok {
 		srcs[idx].seekKeyExpr, seeked = key, idx
 	} else if idx, keys, ok := detectRowidInKeys(c, srcs, where); ok {
 		srcs[idx].seekSet, seeked = keys, idx
-	} else if idx, plan, ok := detectIndexSeekKey(c, srcs, where); ok {
+	} else if idx, plan, ok := detectIndexSeekKey(c, srcs, where, scanRanges && len(srcs) == 1); ok {
 		plan.plan = srcs[idx].planExplain
 		srcs[idx].idxSeek, seeked = plan, idx
 	}
@@ -1136,6 +1138,9 @@ type indexSeekPlan struct {
 	// keySet, when not nil, is "x IN (keySet)": the key is each of them, and
 	// keyExpr is unused.
 	keySet []Expr
+	// rng, when not nil, is a range of x's values: its bounds are the key, and
+	// keyExpr is unused.
+	rng *indexRangePlan
 
 	// order is indexSeekHint.order.
 	order *autoIndexKey
@@ -1172,7 +1177,7 @@ type indexSeekPlan struct {
 // and compared under the index's leading collation, which equals
 // resolveCompareCollation's. SeekIndexRowidsSegments returns rows in rowid
 // order, matching a full scan.
-func detectIndexSeekKey(c *compiler, srcs []joinSource, where Expr) (int, *indexSeekPlan, bool) {
+func detectIndexSeekKey(c *compiler, srcs []joinSource, where Expr, ranges bool) (int, *indexSeekPlan, bool) {
 	if c == nil || c.pager == nil || where == nil || indexSeeksOffForTest {
 		return 0, nil, false
 	}
@@ -1246,12 +1251,103 @@ func detectIndexSeekKey(c *compiler, srcs []joinSource, where Expr) (int, *index
 				first.more = append(first.more, plan)
 			}
 		}
+		var declared []indexSeekCandidate
+		if ranges {
+			// C walks a range of a declared index only: its automatic index
+			// is built for equalities.
+			for _, cd := range cands {
+				if cd.name != "" {
+					declared = append(declared, cd)
+				}
+			}
+		}
+		for _, plan := range rangeSeekPlans(c, s, declared, conjuncts, at, func(col, pos int) bool {
+			if guard == nil {
+				g := newSeekGuard(c, srcs, i, cjs)
+				guard = &g
+			}
+			return guard.keepIndexRange(col, pos)
+		}) {
+			switch {
+			case first == nil:
+				first = plan
+			case len(first.more) < maxSeekKeys-1:
+				first.more = append(first.more, plan)
+			}
+		}
 		if first != nil {
+			if guard == nil {
+				g := newSeekGuard(c, srcs, i, cjs)
+				guard = &g
+			}
 			first.raiseFree = guard.raiseFree()
 			return i, first, true
 		}
 	}
 	return 0, nil, false
+}
+
+// indexRangePlan is a range seek's bounds: each a column-free key, inclusive
+// or not, with the affinity its comparison applies; a nil bound is none.
+type indexRangePlan struct {
+	lo, hi         Expr
+	loIncl, hiIncl bool
+	loAff, hiAff   affinity
+}
+
+// rangeSeekPlans is a seek for each column of s the conjuncts bound -- "x >
+// k", "k >= x", "x BETWEEN lo AND hi", a key a literal or a parameter --
+// taking each column's first lower and first upper bound. Either alone, or
+// both, bound the rows; the conjuncts stay in WHERE, so the seek only prunes.
+// keep says whether a bound at a WHERE position may prune (seekGuard).
+func rangeSeekPlans(c *compiler, s joinSource, cands []indexSeekCandidate, conjuncts []Expr, at []int, keep func(col, pos int) bool) []*indexSeekPlan {
+	var plans []*indexSeekPlan
+	byCol := map[int]*indexSeekPlan{}
+	bound := func(colExpr, key Expr, lower, incl bool, pos int) {
+		colIdx, ok := scopeColumnIndex(c, s, colExpr)
+		if !ok || colIdx == s.tbl.ipkIndex || !isSeekKeyCandidate(key) {
+			return
+		}
+		plan := byCol[colIdx]
+		if plan == nil {
+			p, ok := planForColumn(c, cands, colIdx, colExpr, key)
+			if !ok || !keep(colIdx, pos) {
+				return
+			}
+			p.keyExpr, p.rng = nil, &indexRangePlan{}
+			plan = p
+			byCol[colIdx] = plan
+			plans = append(plans, plan)
+		} else if !keep(colIdx, pos) {
+			return
+		}
+		aff := comparisonAffinity(c.affCtx(), colExpr, key)
+		switch r := plan.rng; {
+		case lower && r.lo == nil:
+			r.lo, r.loIncl, r.loAff = key, incl, aff
+		case !lower && r.hi == nil:
+			r.hi, r.hiIncl, r.hiAff = key, incl, aff
+		}
+	}
+	for n, cj := range conjuncts {
+		switch e := cj.(type) {
+		case BinaryExpr:
+			switch e.Op {
+			case ">", ">=":
+				bound(e.L, e.R, true, e.Op == ">=", at[n])
+				bound(e.R, e.L, false, e.Op == ">=", at[n])
+			case "<", "<=":
+				bound(e.L, e.R, false, e.Op == "<=", at[n])
+				bound(e.R, e.L, true, e.Op == "<=", at[n])
+			}
+		case BetweenExpr:
+			if !e.Not {
+				bound(e.X, e.Lo, true, true, at[n])
+				bound(e.X, e.Hi, false, true, at[n])
+			}
+		}
+	}
+	return plans
 }
 
 // maxSeekKeys bounds how many equalities one seek weighs against each other.

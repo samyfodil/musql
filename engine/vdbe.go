@@ -4142,8 +4142,21 @@ func (m *vdbe) execSeekIndexHint(op *Instruction) error {
 				}
 			}
 		}
+		// A range's bounds, each coerced as its comparison coerces it.
+		var rng *idxSeekRange
+		if r := h.rng; r != nil {
+			rng = &idxSeekRange{loIncl: r.loIncl, hiIncl: r.hiIncl}
+			if r.hasLo {
+				rng.lo = applyAffinityToValue(m.regs[op.P2], r.loAff)
+			}
+			if r.hasHi {
+				rng.hi = applyAffinityToValue(m.regs[op.P2+1], r.hiAff)
+			}
+			probe, textKey = Value{}, false
+		}
 		if h.slot == 0 {
 			cur.idxSeekConfigured, cur.idxSeekMore, cur.idxSeekNext, cur.idxSeekSet = false, cur.idxSeekMore[:0], 0, nil
+			cur.idxSeekRange = nil
 			cur.idxSeekOrder, cur.idxListOnce, cur.idxListReady = h.order, false, false
 			cur.idxSeekRaiseFree = h.raiseFree
 		}
@@ -4156,11 +4169,15 @@ func (m *vdbe) execSeekIndexHint(op *Instruction) error {
 			switch {
 			case h.is && probe.Typ == Null:
 			case cur.rowStore != nil && textKey && isUTF16(m.encoding()):
+			case rng != nil && (cur.rowStore != nil || !rng.numeric()):
+				// The store's own indexes answer equalities only, and only a
+				// number bounds an INTEGER or REAL index.
 			case !cur.idxSeekConfigured:
 				cur.idxSeekConfigured = true
 				cur.idxSeekProbe, cur.idxSeekColl, cur.idxSeekCol, cur.idxSeekSet = probe, h.coll, h.leadingCol, set
+				cur.idxSeekRange = rng
 			default:
-				cur.idxSeekMore = append(cur.idxSeekMore, idxSeekKey{col: h.leadingCol, probe: probe, coll: h.coll, set: set})
+				cur.idxSeekMore = append(cur.idxSeekMore, idxSeekKey{col: h.leadingCol, probe: probe, coll: h.coll, set: set, rng: rng})
 			}
 		}
 	default:

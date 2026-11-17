@@ -440,11 +440,17 @@ type idxSeekKey struct {
 	// set, when not nil, is an IN list's values, each coerced like probe: the
 	// key matches any of them, and probe is unused.
 	set []Value
+	// rng, when not nil, is a range: the key matches the values within its
+	// bounds, and probe and set are unused.
+	rng *idxSeekRange
 }
 
 // seekIndexKeyEstimate is seekIndexEstimate for a key, an IN list's summed
 // over its values.
 func (src *segSource) seekIndexKeyEstimate(rootPage uint32, k idxSeekKey) (n, total int, ok bool) {
+	if k.rng != nil {
+		return src.seekIndexRangeEstimate(rootPage, k.col, *k.rng)
+	}
 	if k.set == nil {
 		return src.seekIndexEstimate(rootPage, k.col, k.probe)
 	}
@@ -461,6 +467,12 @@ func (src *segSource) seekIndexKeyEstimate(rootPage uint32, k idxSeekKey) (n, to
 // seekIndexKeyRowids is SeekIndexRowidsSegments for a key: an IN list's rows
 // are its values', ascending, each once.
 func (p *ReadOnlyPager) seekIndexKeyRowids(rootPage uint32, k idxSeekKey) ([]int64, bool) {
+	if k.rng != nil {
+		if p == nil || p.segs == nil {
+			return nil, false
+		}
+		return p.segs.seekIndexRangeRowids(rootPage, k.col, *k.rng)
+	}
 	if k.set == nil {
 		return p.SeekIndexRowidsSegments(rootPage, k.col, k.probe, k.coll)
 	}

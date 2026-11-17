@@ -3187,15 +3187,28 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 			for slot, k := range append([]*indexSeekPlan{s.idxSeek}, s.idxSeek.more...) {
 				var keyReg int
 				var kerr error
-				if k.keySet != nil {
+				var rh *indexSeekRangeHint
+				switch {
+				case k.rng != nil:
+					// The bounds in two registers, a missing one NULL.
+					lo, hi := k.rng.lo, k.rng.hi
+					rh = &indexSeekRangeHint{hasLo: lo != nil, hasHi: hi != nil, loIncl: k.rng.loIncl, hiIncl: k.rng.hiIncl, loAff: k.rng.loAff, hiAff: k.rng.hiAff}
+					if lo == nil {
+						lo = LiteralExpr{}
+					}
+					if hi == nil {
+						hi = LiteralExpr{}
+					}
+					keyReg, kerr = c.compileExprBlock([]Expr{lo, hi})
+				case k.keySet != nil:
 					keyReg, kerr = c.compileExprBlock(k.keySet)
-				} else {
+				default:
 					keyReg, kerr = c.compileExpr(k.keyExpr)
 				}
 				if kerr != nil {
 					return kerr
 				}
-				h := &indexSeekHint{root: k.root, aff: k.aff, coll: k.coll, leadingCol: k.leadingCol, index: k.index, slot: slot, is: k.is, in: len(k.keySet)}
+				h := &indexSeekHint{root: k.root, aff: k.aff, coll: k.coll, leadingCol: k.leadingCol, index: k.index, slot: slot, is: k.is, in: len(k.keySet), rng: rh}
 				if slot == 0 {
 					h.plan, h.raiseFree = s.idxSeek.plan, s.idxSeek.raiseFree
 				}
