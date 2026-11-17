@@ -1238,14 +1238,28 @@ func (w *segJoinWalk) exprValues(a segJoinArg) ([]Value, bool) {
 		return nil, false
 	}
 	column := func(op *Instruction) Value { return cols[op.P2+1][row] }
+	var memo *segJoinMemo[Value]
+	var only []Value
+	if read := segJoinOneColumn(a.expr, cols); read >= 0 && a.level >= 0 && !a.expr.volatile {
+		memo, only = newSegJoinMemo[Value](), cols[read]
+	}
 	out := make([]Value, n)
 	for r := range n {
+		if memo != nil {
+			if v, ok := memo.get(only[r]); ok {
+				out[r] = v
+				continue
+			}
+		}
 		row = int32(r)
 		v, ok := segJoinEvalRow(&vm, a.expr, column, func(*Instruction) Value { return t.value(row, -1) }, nil)
 		if !ok {
 			return nil, false
 		}
 		out[r] = v
+		if memo != nil {
+			memo.put(only[r], v)
+		}
 	}
 	if a.level < 0 {
 		one := out[0]
@@ -1326,36 +1340,21 @@ func (w *segJoinWalk) filterPassing(a segJoinArg, pass []bool) bool {
 		return t.value(row, i-1)
 	}
 	column := func(op *Instruction) Value { return cell(op.P2 + 1) }
-	// A filter of one column is computed once for each value the column
-	// holds: its answer is a function of that value alone. A plain TEXT
-	// value, which is its bytes alone, is looked up by them, which takes no
-	// key of its own.
-	var memo map[segJoinMemoKey]bool
-	var texts map[string]bool
+	var memo *segJoinMemo[bool]
 	if len(read) == 1 && !slices.ContainsFunc(a.expr.insns, func(in Instruction) bool { return in.Op == OpRowid }) {
-		memo, texts = map[segJoinMemoKey]bool{}, map[string]bool{}
+		memo = newSegJoinMemo[bool]()
 	}
 	for r := range t.n {
 		if !pass[r] {
 			continue
 		}
 		row = int32(r)
-		var k segJoinMemoKey
 		var x Value
-		text := false
 		if memo != nil {
 			x = cell(read[0])
-			if text = x.Typ == Text && x.Subtype == 0 && !x.intReal && x.I == 0 && x.F == 0; text {
-				if v, ok := texts[string(x.S)]; ok {
-					pass[r] = v
-					continue
-				}
-			} else {
-				k = segJoinMemoKeyOf(x)
-				if v, ok := memo[k]; ok {
-					pass[r] = v
-					continue
-				}
+			if v, ok := memo.get(x); ok {
+				pass[r] = v
+				continue
 			}
 		}
 		v, ok := segJoinEvalRow(&vm, a.expr, column, func(*Instruction) Value { return t.value(row, -1) }, nil)
@@ -1364,14 +1363,64 @@ func (w *segJoinWalk) filterPassing(a segJoinArg, pass []bool) bool {
 		}
 		keep := v.Typ != Null && isTruthy(v)
 		pass[r] = keep
-		switch {
-		case text:
-			texts[string(x.S)] = keep
-		case memo != nil:
-			memo[k] = keep
+		if memo != nil {
+			memo.put(x, keep)
 		}
 	}
 	return true
+}
+
+// segJoinMemo is an expression of one column's answers, by the value it read:
+// computed once for each value the column holds, its answer being a function
+// of that value alone. A plain TEXT value, which is its bytes alone, is
+// looked up by them, which takes no key of its own.
+type segJoinMemo[T any] struct {
+	vals  map[segJoinMemoKey]T
+	texts map[string]T
+}
+
+func newSegJoinMemo[T any]() *segJoinMemo[T] {
+	return &segJoinMemo[T]{vals: map[segJoinMemoKey]T{}, texts: map[string]T{}}
+}
+
+func segJoinPlainText(x Value) bool {
+	return x.Typ == Text && x.Subtype == 0 && !x.intReal && x.I == 0 && x.F == 0
+}
+
+func (m *segJoinMemo[T]) get(x Value) (T, bool) {
+	if segJoinPlainText(x) {
+		v, ok := m.texts[string(x.S)]
+		return v, ok
+	}
+	v, ok := m.vals[segJoinMemoKeyOf(x)]
+	return v, ok
+}
+
+func (m *segJoinMemo[T]) put(x Value, v T) {
+	if segJoinPlainText(x) {
+		m.texts[string(x.S)] = v
+		return
+	}
+	m.vals[segJoinMemoKeyOf(x)] = v
+}
+
+// segJoinOneColumn is the index into cols of the one column e reads, or -1
+// when it reads none, more than one, or the rowid.
+func segJoinOneColumn(e *segJoinExpr, cols [][]Value) int {
+	if slices.ContainsFunc(e.insns, func(in Instruction) bool { return in.Op == OpRowid }) {
+		return -1
+	}
+	read := -1
+	for i, c := range cols {
+		if c == nil {
+			continue
+		}
+		if read >= 0 {
+			return -1
+		}
+		read = i
+	}
+	return read
 }
 
 // segJoinClearFailing clears in pass the rows whose value a loop's IfNot
