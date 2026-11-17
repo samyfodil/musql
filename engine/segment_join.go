@@ -243,6 +243,7 @@ type segJoinTable struct {
 	vcols  map[int][]Value
 	sorted map[int]segJoinSorted
 	exprs  map[segJoinExprKey][]Value
+	iexprs map[segJoinExprKey][]int64
 	passes map[segJoinPassKey][]bool
 	fcols  map[int][]float64
 	// lo/dense map a rowid to its row + 1 when the rowids are dense enough,
@@ -1214,13 +1215,7 @@ func (w *segJoinWalk) exprValues(a segJoinArg) ([]Value, bool) {
 	}
 	w.exprs[a.expr] = nil
 	t := w.tabs[w.lv(a)]
-	// Kept with the table while its rows stay the same -- the program, and
-	// so the expression, is the plan cache's -- unless it reads a parameter,
-	// which the next run may bind to another value. A LIKE's answer follows
-	// case_sensitive_like, which is part of the key.
-	// Nor one that reads the clock, whose 'now' a later statement moves.
-	keep := !slices.ContainsFunc(a.expr.insns, func(in Instruction) bool { return in.Op == OpVariable }) && !segJoinReadsClock(a.expr)
-	key := segJoinExprKey{a.expr, w.m.likeCaseSensitive()}
+	key, keep := w.exprKept(a)
 	if keep {
 		t.mu.Lock()
 		v, ok := t.exprs[key]
@@ -1271,6 +1266,17 @@ func (w *segJoinWalk) exprValues(a segJoinArg) ([]Value, bool) {
 	return out, true
 }
 
+// exprKept is the key a's values are kept with its table under, and whether
+// they are: kept while the table's rows stay the same -- the program, and so
+// the expression, is the plan cache's -- unless it reads a parameter, which
+// the next run may bind to another value, or the clock, whose 'now' a later
+// statement moves. A LIKE's answer follows case_sensitive_like, which is
+// part of the key.
+func (w *segJoinWalk) exprKept(a segJoinArg) (segJoinExprKey, bool) {
+	keep := !slices.ContainsFunc(a.expr.insns, func(in Instruction) bool { return in.Op == OpVariable }) && !segJoinReadsClock(a.expr)
+	return segJoinExprKey{a.expr, w.m.likeCaseSensitive()}, keep
+}
+
 // cachedExpr reports whether a's values are kept already, here or with its
 // table: then they are read rather than computed for some rows.
 func (w *segJoinWalk) cachedExpr(a segJoinArg) bool {
@@ -1284,12 +1290,16 @@ func (w *segJoinWalk) cachedExpr(a segJoinArg) bool {
 	return ok
 }
 
-// exprPassing is a filter's values on the rows pass lets through, computed as
-// exprValues computes them; the other rows are left NULL, and nothing is
-// kept, since which rows were computed depends on the filters before it.
-func (w *segJoinWalk) exprPassing(a segJoinArg, pass []bool) ([]Value, bool) {
+// filterPassing clears in pass the rows filter a fails on, computing it only
+// on the rows pass lets through, as exprValues computes it. Nothing is kept,
+// since which rows were computed depends on the filters before it.
+func (w *segJoinWalk) filterPassing(a segJoinArg, pass []bool) bool {
 	if a.level < 0 {
-		return w.exprValues(a)
+		vals, ok := w.exprValues(a)
+		if ok {
+			segJoinClearFailing(pass, vals)
+		}
+		return ok
 	}
 	segJoinFilterRestricted.Add(1)
 	t := w.tabs[w.lv(a)]
@@ -1297,58 +1307,81 @@ func (w *segJoinWalk) exprPassing(a segJoinArg, pass []bool) ([]Value, bool) {
 	vm.regs = make([]Value, len(w.m.regs))
 	vm.fnArgBuf, vm.likePlan = nil, nil
 	var row int32
-	cols, read, ok := t.exprColumns(a.expr)
-	if !ok {
-		return nil, false
+	// With most rows already failing, a column not read yet is read only on
+	// the rows that pass.
+	passing := 0
+	for _, p := range pass {
+		if p {
+			passing++
+		}
 	}
-	column := func(op *Instruction) Value { return cols[op.P2+1][row] }
+	cols, read, ok := t.exprColumnsSparse(a.expr, 2*passing < t.n)
+	if !ok {
+		return false
+	}
+	cell := func(i int) Value {
+		if c := cols[i]; c != nil {
+			return c[row]
+		}
+		return t.value(row, i-1)
+	}
+	column := func(op *Instruction) Value { return cell(op.P2 + 1) }
 	// A filter of one column is computed once for each value the column
 	// holds: its answer is a function of that value alone. A plain TEXT
 	// value, which is its bytes alone, is looked up by them, which takes no
 	// key of its own.
-	var only []Value
-	var memo map[segJoinMemoKey]Value
-	var texts map[string]Value
+	var memo map[segJoinMemoKey]bool
+	var texts map[string]bool
 	if len(read) == 1 && !slices.ContainsFunc(a.expr.insns, func(in Instruction) bool { return in.Op == OpRowid }) {
-		only = cols[read[0]]
-		memo, texts = map[segJoinMemoKey]Value{}, map[string]Value{}
+		memo, texts = map[segJoinMemoKey]bool{}, map[string]bool{}
 	}
-	out := make([]Value, t.n)
 	for r := range t.n {
 		if !pass[r] {
 			continue
 		}
 		row = int32(r)
 		var k segJoinMemoKey
+		var x Value
 		text := false
 		if memo != nil {
-			x := only[r]
+			x = cell(read[0])
 			if text = x.Typ == Text && x.Subtype == 0 && !x.intReal && x.I == 0 && x.F == 0; text {
 				if v, ok := texts[string(x.S)]; ok {
-					out[r] = v
+					pass[r] = v
 					continue
 				}
 			} else {
 				k = segJoinMemoKeyOf(x)
 				if v, ok := memo[k]; ok {
-					out[r] = v
+					pass[r] = v
 					continue
 				}
 			}
 		}
 		v, ok := segJoinEvalRow(&vm, a.expr, column, func(*Instruction) Value { return t.value(row, -1) }, nil)
 		if !ok {
-			return nil, false
+			return false
 		}
-		out[r] = v
+		keep := v.Typ != Null && isTruthy(v)
+		pass[r] = keep
 		switch {
 		case text:
-			texts[string(only[r].S)] = v
+			texts[string(x.S)] = keep
 		case memo != nil:
-			memo[k] = v
+			memo[k] = keep
 		}
 	}
-	return out, true
+	return true
+}
+
+// segJoinClearFailing clears in pass the rows whose value a loop's IfNot
+// would not take: NULL, or false.
+func segJoinClearFailing(pass []bool, vals []Value) {
+	for r, v := range vals {
+		if pass[r] && (v.Typ == Null || !isTruthy(v)) {
+			pass[r] = false
+		}
+	}
 }
 
 // segJoinMemoKey is a value as exactly as it can be told apart: its type,
@@ -1370,6 +1403,12 @@ func segJoinMemoKeyOf(v Value) segJoinMemoKey {
 // indexed by column number plus one (the rowid is -1), and the indexes read,
 // each once. ok is false for a column number below the rowid's.
 func (t *segJoinTable) exprColumns(e *segJoinExpr) (cols [][]Value, read []int, ok bool) {
+	return t.exprColumnsSparse(e, false)
+}
+
+// exprColumnsSparse is exprColumns, but when sparse a column not read already
+// is left nil, for its reader to take a row at a time.
+func (t *segJoinTable) exprColumnsSparse(e *segJoinExpr, sparse bool) (cols [][]Value, read []int, ok bool) {
 	for _, op := range e.insns {
 		if op.Op != OpColumn {
 			continue
@@ -1382,7 +1421,13 @@ func (t *segJoinTable) exprColumns(e *segJoinExpr) (cols [][]Value, read []int, 
 			cols = append(cols, make([][]Value, i+1-len(cols))...)
 		}
 		if !slices.Contains(read, i) {
-			cols[i] = t.values(op.P2)
+			if sparse {
+				t.mu.Lock()
+				cols[i] = t.vcols[op.P2]
+				t.mu.Unlock()
+			} else {
+				cols[i] = t.values(op.P2)
+			}
 			read = append(read, i)
 		}
 	}
@@ -1534,14 +1579,34 @@ func (w *segJoinWalk) ints(a segJoinArg) ([]int64, bool) {
 	if !ok {
 		return nil, false
 	}
+	// Kept with the table as the values are.
+	t := w.tabs[w.lv(a)]
+	key, keep := w.exprKept(a)
+	if keep {
+		t.mu.Lock()
+		v, ok := t.iexprs[key]
+		t.mu.Unlock()
+		if ok {
+			return v, v != nil
+		}
+	}
 	out := make([]int64, len(vals))
 	for i, v := range vals {
 		if v.Typ != Int {
-			return nil, false
+			out = nil
+			break
 		}
 		out[i] = v.I
 	}
-	return out, true
+	if keep {
+		t.mu.Lock()
+		if t.iexprs == nil {
+			t.iexprs = map[segJoinExprKey][]int64{}
+		}
+		t.iexprs[key] = out
+		t.mu.Unlock()
+	}
+	return out, out != nil
 }
 
 // nullable is a's value per row as integers (or, with real, REALs) with
@@ -1776,10 +1841,10 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 			var vals []Value
 			if f.expr != nil && restrict && !w.cachedExpr(f) {
 				f.level = i
-				var ok bool
-				if vals, ok = w.exprPassing(f, w.pass[i]); !ok {
+				if !w.filterPassing(f, w.pass[i]) {
 					return nil, false
 				}
+				continue
 			} else if f.expr != nil {
 				f.level = i
 				var ok bool
@@ -1789,11 +1854,7 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 			} else {
 				vals = w.tabs[i].values(f.col)
 			}
-			for r, v := range vals {
-				if w.pass[i][r] && (v.Typ == Null || !isTruthy(v)) {
-					w.pass[i][r] = false
-				}
-			}
+			segJoinClearFailing(w.pass[i], vals)
 		}
 		if keepPass {
 			t := w.tabs[i]

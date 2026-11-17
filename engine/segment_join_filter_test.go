@@ -54,9 +54,10 @@ func TestSegJoinClockNotKept(t *testing.T) {
 }
 
 // TestSegJoinFiltersAgree: a columnar join's filters, computed only on the
-// rows the ones before them let through (one-column filters once per value)
-// and kept for the next run while the rows stay the same, give the loop's
-// answer -- on a first run, a second, and after the rows change.
+// rows the ones before them let through (one-column filters once per value,
+// a column read on those rows only when most fail) and kept for the next run
+// while the rows stay the same, give the loop's answer -- on a first run, a
+// second, and after the rows change.
 func TestSegJoinFiltersAgree(t *testing.T) {
 	stmts := []string{
 		"CREATE TABLE o(ok INTEGER PRIMARY KEY, pri TEXT)",
@@ -97,7 +98,7 @@ func TestSegJoinFiltersAgree(t *testing.T) {
 	var qs []string
 	for i := range filters {
 		for j := i + 1; j < len(filters); j++ {
-			qs = append(qs, fmt.Sprintf("SELECT l.mode, count(*), sum(l.q), sum(CASE WHEN o.pri = '1-PRI' THEN 1 ELSE 0 END) FROM o, l WHERE o.ok = l.ok AND %s AND %s GROUP BY l.mode ORDER BY l.mode", filters[i], filters[j]))
+			qs = append(qs, fmt.Sprintf("SELECT l.mode, count(*), sum(l.q), sum(CASE WHEN o.pri = '1-PRI' THEN 1 ELSE 0 END), max(l.rd) FROM o, l WHERE o.ok = l.ok AND %s AND %s GROUP BY l.mode ORDER BY l.mode", filters[i], filters[j]))
 		}
 	}
 	restricted, reused := segJoinFilterRestricted.Load(), segJoinPassReuses.Load()
