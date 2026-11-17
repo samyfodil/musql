@@ -189,3 +189,42 @@ func TestColumnarFilteredGroupByMatchesTheLoop(t *testing.T) {
 		`DELETE FROM t WHERE id = 18`)
 	check("with log")
 }
+
+// TestColumnarGroupByCallKeyMatchesTheLoop: a GROUP BY whose one key is a call
+// native code does not make (a service block) groups as the loop does. The key
+// is read past the body, by the kernel's emit, so the block must write it back:
+// before it did, every row grouped under the key 0. A TEXT key cannot be one
+// of the kernel's integers and leaves the statement to the loop.
+func TestColumnarGroupByCallKeyMatchesTheLoop(t *testing.T) {
+	p := newSegPair(t, `CREATE TABLE d(k INTEGER, m INTEGER, s TEXT)`,
+		`INSERT INTO d SELECT value, value / 30, 'x' || value FROM generate_series(1, 20000)`)
+	cases := []struct {
+		sql    string
+		served bool
+	}{
+		{`SELECT length(s), count(*) FROM d GROUP BY 1`, true},
+		{`SELECT length(s), count(*), sum(k) FROM d GROUP BY length(s)`, true},
+		{`SELECT length(s) + m % 2, count(*) FROM d GROUP BY 1`, true},
+		{`SELECT typeof(m), count(*) FROM d GROUP BY 1`, false},
+		{`SELECT typeof(s), count(*) FROM d GROUP BY 1`, false},
+		{`SELECT abs(m) % 3, count(*) FROM d GROUP BY 1`, true},
+	}
+	for _, c := range cases {
+		_, want, err := p.plain(c.sql)
+		if err != nil {
+			t.Fatalf("%s plain: %v", c.sql, err)
+		}
+		ResetSegFilterCountersForTest()
+		_, got, err := p.fast(c.sql)
+		if err != nil {
+			t.Fatalf("%s fast: %v", c.sql, err)
+		}
+		served, _ := SegFilterCountersForTest()
+		if g, w := fmt.Sprint(typedRows(got)), fmt.Sprint(typedRows(want)); g != w {
+			t.Errorf("%s:\n columnar %s\n loop     %s", c.sql, g, w)
+		}
+		if JITEnabled() && (served > 0) != c.served {
+			t.Errorf("%s: served=%d, want served=%v", c.sql, served, c.served)
+		}
+	}
+}

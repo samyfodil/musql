@@ -185,7 +185,9 @@ func segGroupPeephole(prog *Program) bool {
 		}
 		// Its service blocks (a math kernel's rare inputs, a call native code
 		// does not make) run as an aggregate program's do (segGroupKeys).
-		low, okLow := segLowerBody(in[bodyAt:keyAt], bodyAt, cursor, keyAt, nil)
+		// The key is read past the body (POpEmitVal), so a service block that
+		// computes it writes it back.
+		low, okLow := segLowerBodyLive(in[bodyAt:keyAt], bodyAt, cursor, keyAt, nil, []int{keyBase})
 		if !okLow {
 			return false
 		}

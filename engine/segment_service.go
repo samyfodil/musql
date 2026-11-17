@@ -290,10 +290,13 @@ func segBuildBlocks(body []Instruction, svc []bool, base int, flagFrom int) (blo
 
 // segBlockHomes fills each block's load and writeBack lists: what it reads
 // that native code may have written, and what it writes that native code
-// reads or also writes.
-func segBlockHomes(body []Instruction, svc []bool, blocks []segSvcBlock) {
+// reads or also writes, live among them (read after the body).
+func segBlockHomes(body []Instruction, svc []bool, blocks []segSvcBlock, live []int) {
 	var rb segRegsBuf
 	nativeRead, nativeWrite := map[int]bool{}, map[int]bool{}
+	for _, x := range live {
+		nativeRead[x] = true
+	}
 	for i, in := range body {
 		if svc[i] {
 			continue

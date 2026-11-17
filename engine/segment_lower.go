@@ -246,12 +246,19 @@ func (l *segLowered) clone() *segLowered {
 // and parameter kinds given (nil: every one an INTEGER), or reports false
 // when it contains an opcode this does not model.
 func segLowerBody(body []Instruction, base int, cursor int, aggAt int, kinds *segKinds) (*segLowered, bool) {
-	out, ok := segLowerBodyWith(body, base, cursor, aggAt, false, false, kinds)
+	return segLowerBodyLive(body, base, cursor, aggAt, kinds, nil)
+}
+
+// segLowerBodyLive is segLowerBody for a body whose registers live are read
+// after it, by IR the caller adds: a service block that writes one writes it
+// back to the kernel.
+func segLowerBodyLive(body []Instruction, base int, cursor int, aggAt int, kinds *segKinds, live []int) (*segLowered, bool) {
+	out, ok := segLowerBodyWith(body, base, cursor, aggAt, false, false, kinds, live)
 	if !ok || len(out.blocks) == 0 {
 		return out, ok
 	}
 	// LIKE's default rule is case-insensitive; that is the program compiled.
-	if tv, tok := segLowerBodyWith(body, base, cursor, aggAt, true, true, kinds); tok && len(tv.textCol) > 0 && slices.Contains(tv.textCol, true) {
+	if tv, tok := segLowerBodyWith(body, base, cursor, aggAt, true, true, kinds, live); tok && len(tv.textCol) > 0 && slices.Contains(tv.textCol, true) {
 		out.textVar = tv
 	}
 	return out, ok
@@ -262,7 +269,7 @@ func segLowerBody(body []Instruction, base int, cursor int, aggAt int, kinds *se
 // that column's cells, with the block kept right after it as the fallback for
 // a cell that is not pure ASCII. Only valid over a segment whose column is
 // clean TEXT, so it is a second program beside the first, not a replacement.
-func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text, textFold bool, kinds *segKinds) (*segLowered, bool) {
+func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text, textFold bool, kinds *segKinds, live []int) (*segLowered, bool) {
 	var rb segRegsBuf
 	// AN OpNull ON A PATH THAT RUNS REFUSES THE WHOLE BODY, and modelling NULL
 	// any more cleverly than that is how this went wrong before.
@@ -348,7 +355,7 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 		}
 	}
 	blocks, blockAt := segBuildBlocks(body, svc, base, scratchReg+1)
-	segBlockHomes(body, svc, blocks)
+	segBlockHomes(body, svc, blocks, live)
 	for _, b := range blocks {
 		for _, x := range append(append([]int(nil), b.load...), b.writeBack...) {
 			note(x)
