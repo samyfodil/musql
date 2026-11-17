@@ -279,3 +279,42 @@ func TestPlanShapeResultColumns(t *testing.T) {
 		}
 	}
 }
+
+// TestPlanCacheAdmitsWhenFull: past planCacheMax distinct statements, a new
+// statement's program and a new shape are still kept, each replacing an
+// older one, and the cache stays bounded.
+func TestPlanCacheAdmitsWhenFull(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.musq")
+	buildDB(t, path, `CREATE TABLE t(a INTEGER, b INTEGER)`, `INSERT INTO t VALUES(1, 5), (2, 6), (3, 5)`)
+	p, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	for i := range planCacheMax + 50 {
+		if _, _, err := p.QueryArgs(fmt.Sprintf(`SELECT a, %d FROM t`, i+2), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const q = `SELECT b FROM t ORDER BY a`
+	for range 2 {
+		if _, _, err := p.QueryArgs(q, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if p.cachedPlan(q) == nil {
+		t.Error("a statement after the cache filled was not kept")
+	}
+	before := planShapeHits.Load()
+	for _, s := range []string{`SELECT a FROM t WHERE b = 5`, `SELECT a FROM t WHERE b = 6`} {
+		if _, _, err := p.QueryArgs(s, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if planShapeHits.Load() == before {
+		t.Error("a shape made after the cache filled was not reused")
+	}
+	if n := len(p.planCacheFor()); n > planCacheMax {
+		t.Errorf("the cache holds %d programs, past %d", n, planCacheMax)
+	}
+}

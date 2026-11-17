@@ -474,7 +474,8 @@ func (p *ReadOnlyPager) execShaped(stmt *SelectStmt, sqlText string, args []Valu
 	m := p.planCacheFor()
 	if prog := m[key]; prog != nil && shapeNamesSpelled(prog.ColNames, sh, sqlText, toks) {
 		prog.shape = sh
-		if ik := shapeIndexKey(shapeKey(sqlText, lits, "")); m[ik] == nil && len(m) < planCacheMax {
+		if ik := shapeIndexKey(shapeKey(sqlText, lits, "")); m[ik] == nil {
+			planCacheRoom(m, ik)
 			m[ik] = &Program{shape: sh}
 		}
 	}

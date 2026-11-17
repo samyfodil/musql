@@ -423,7 +423,8 @@ func (p *ReadOnlyPager) QueryArgs(sqlText string, args []Value) (cols []string, 
 // planCacheMax bounds the per-pager compiled-plan cache (see the planCache
 // field): generous enough for any realistic distinct-statement working set on
 // one connection, while capping the worst case (a workload that never repeats a
-// query) at a fixed overhead -- once full it stops admitting new plans.
+// query) at a fixed overhead -- once full, each new plan replaces an arbitrary
+// one (planCacheRoom).
 const planCacheMax = 256
 
 // sharedPlanCache is the compiled-plan cache owned by a session rather than one
@@ -570,10 +571,22 @@ func (p *ReadOnlyPager) cachePlan(sqlText string, prog *Program) {
 		return
 	}
 	m := p.planCacheFor()
-	if _, ok := m[sqlText]; !ok && len(m) >= planCacheMax {
+	planCacheRoom(m, sqlText)
+	m[sqlText] = prog
+}
+
+// planCacheRoom makes room in m for key when it holds planCacheMax entries,
+// dropping an arbitrary one: a workload that never repeats a statement keeps
+// replacing them, and the statements a session does repeat keep finding
+// room. A dropped program is compiled again when its statement comes back.
+func planCacheRoom(m map[string]*Program, key string) {
+	if _, ok := m[key]; ok || len(m) < planCacheMax {
 		return
 	}
-	m[sqlText] = prog
+	for k := range m {
+		delete(m, k)
+		break
+	}
 }
 
 // execNoFrom executes a FROM-less SELECT through the VDBE: the select list is
