@@ -71,6 +71,9 @@ type vmJIT struct {
 	// columns the last ones hold (Program.jitOuterCols); enter fills them.
 	params int
 	outer  []jitOuterCol
+	// subs is the sub-cache slots of the subqueries whose values enter copies
+	// past the outer columns' (Program.jitSubs).
+	subs []int
 
 	// text is whether the code has TEXT arms: enter says whether TEXTs
 	// compare converted, which VTextCmpJump leaves to the VDBE
@@ -242,9 +245,45 @@ func (prog *Program) jitOuter() int {
 	return n
 }
 
+// maxJITSubs bounds the subqueries native code reads the value of from
+// registers of their own (jitSubs); a later one's OpSubquery exits.
+const maxJITSubs = 8
+
+// jitSubs are the sub-cache slots of the scalar subqueries prog runs once
+// (an uncorrelated OpSubquery of one value), in the order they first appear.
+// A run makes each value once and keeps it, so vmJIT.enter copies a kept one
+// into a register past the outer columns', with a flag beside it saying it is
+// there, and native code copies it from there (jit.VGuardCopy); before it is
+// made, native code exits at the OpSubquery for the VDBE to make it.
+func (prog *Program) jitSubs() []int {
+	var slots []int
+	for i := range prog.Insns {
+		if in := &prog.Insns[i]; jitSubquery(in) && !slices.Contains(slots, in.P2) && len(slots) < maxJITSubs {
+			slots = append(slots, in.P2)
+		}
+	}
+	return slots
+}
+
+// jitSubquery reports whether in is a scalar subquery a run makes once.
+func jitSubquery(in *Instruction) bool {
+	return in.Op == OpSubquery && in.P5&(p5Correlated|p5SubKeep) == 0 && in.P3 >= 0 && in.P3 <= 1 && in.P2 >= 0
+}
+
+// jitSub is len(jitSubs), counted once.
+func (prog *Program) jitSub() int {
+	if n := atomic.LoadInt32(&prog.subRegs); n > 0 {
+		return int(n - 1)
+	}
+	n := len(prog.jitSubs())
+	atomic.StoreInt32(&prog.subRegs, int32(n+1))
+	return n
+}
+
 // jitExtra is how many registers past NReg native code keeps: the
-// parameters', then the outer columns'.
-func (prog *Program) jitExtra() int { return prog.jitParams() + prog.jitOuter() }
+// parameters', the outer columns', then a value and a flag for each of the
+// subqueries'.
+func (prog *Program) jitExtra() int { return prog.jitParams() + prog.jitOuter() + 2*prog.jitSub() }
 
 // regFile is regs as prog's register file: NReg long, with room past that for
 // jitExtra. keep says regs' old values may stay; otherwise they are cleared.
@@ -310,6 +349,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	fusable := false
 	nParams := prog.jitParams()
 	outer := prog.jitOuterCols()
+	subs := prog.jitSubs()
 	ipk := writeCursorIPK(prog)
 	realVP, realOK := vmRealLowering(prog, p.segStoresReal, p.segStoresText)
 	textVP, textOK := vmTextLowering(prog, p.segStoresText)
@@ -350,6 +390,13 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 			// register past the parameters' (jitOuterCols).
 			if i := slices.Index(outer, jitOuterCol{int(in.P5), in.P1, in.P2}); i >= 0 {
 				vp[pc] = jit.VInsn{Op: jit.VCopy, A: prog.NReg + nParams + i, B: in.P3, Imm: 1}
+			}
+		case jitSubquery(in) && in.P1 >= 0 && in.P1 < prog.NReg:
+			// The subquery's value once the run has made it, which enter
+			// copies past the outer columns' with its flag (jitSubs).
+			if i := slices.Index(subs, in.P2); i >= 0 {
+				r := prog.NReg + nParams + len(outer) + 2*i
+				vp[pc] = jit.VInsn{Op: jit.VGuardCopy, A: r, B: in.P1, C: r + 1}
 			}
 		case vp[pc].Op == jit.VColumn && vp[pc].A < len(ipk) && ipk[vp[pc].A] == vp[pc].B:
 			// A rowid table's INTEGER PRIMARY KEY reads as the rowid.
@@ -514,7 +561,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 			marked[pc].Op = OpJIT
 		}
 	}
-	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams + len(outer), params: nParams, outer: outer, entry: entry, marked: marked, native: native, updAt: updAt,
+	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams + len(outer) + 2*len(subs), params: nParams, outer: outer, subs: subs, entry: entry, marked: marked, native: native, updAt: updAt,
 		segCap: segCap, segNeed: segNeed, rowidSeeks: rowidSeeks, walkScan: walkScan, inSlots: inSlots, idxSpecs: idxSpecs,
 		aggAt: agg.at, aggSort: agg.sort, aggLo: agg.lo, aggHi: agg.hi, aggKey: agg.key, aggKeyLo: agg.keyLo, aggKeyN: agg.keyN}
 	if segCap != nil {
@@ -2305,7 +2352,7 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 	if jx.params > 0 {
 		// The bound parameters, where native code's OpVariable reads them.
 		regs = regs[:jx.nReg]
-		base := jx.nReg - len(jx.outer) - jx.params
+		base := jx.nReg - 2*len(jx.subs) - len(jx.outer) - jx.params
 		for i := range jx.params {
 			regs[base+i] = paramAt(m.params, i+1)
 		}
@@ -2414,11 +2461,30 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 	return int(args.PC), -1
 }
 
+// readSubs copies each subquery value the run has made into its register,
+// flagging it there with an INTEGER, and flags the others NULL (jitSubs).
+func (jx *vmJIT) readSubs(m *vdbe, regs []Value) {
+	base := len(regs) - 2*len(jx.subs)
+	for i, slot := range jx.subs {
+		v, flag := &regs[base+2*i], &regs[base+2*i+1]
+		*flag = Value{}
+		if slot >= len(m.subCache) || !m.subCache[slot].done {
+			continue
+		}
+		*v = Value{}
+		if rows := m.subCache[slot].rows; len(rows) > 0 && len(rows[0]) > 0 {
+			*v = rows[0][0]
+		}
+		*flag = Value{Typ: Int, I: 1}
+	}
+}
+
 // readOuter reads the outer columns native code copies (jitOuterCols) into
 // the last of regs, or reports a column it could not read, which the VDBE's
 // own OpOuterColumn then reads, or fails on, if the program reaches it.
 func (jx *vmJIT) readOuter(m *vdbe, regs []Value) bool {
-	base := len(regs) - len(jx.outer)
+	jx.readSubs(m, regs)
+	base := len(regs) - 2*len(jx.subs) - len(jx.outer)
 	for i, o := range jx.outer {
 		fr := m
 		for range o.depth {

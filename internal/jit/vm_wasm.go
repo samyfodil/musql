@@ -838,6 +838,9 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		e.resultRow(pc, in)
 	case VIntGuard:
 		e.guards(pc, e.isInt(in.A))
+	case VGuardCopy:
+		e.guards(pc, e.isInt(in.C))
+		return e.insn(pc, VInsn{Op: VCopy, A: in.A, B: in.B, Imm: 1})
 	case VRowid:
 		e.segRowid(pc, in)
 	case VOpen, VClose:

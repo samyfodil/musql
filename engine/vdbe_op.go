@@ -1268,6 +1268,8 @@ type Program struct {
 	paramRegs int32
 	// outerRegs caches jitOuter the same way.
 	outerRegs int32
+	// subRegs caches len(jitSubs) the same way.
+	subRegs int32
 	// txAppend is txAppendTarget's answer (insert_bulk_direct.go), kept.
 	txAppend *txAppendVerdict
 	NReg       int      // registers to allocate (r[0..NReg-1]).

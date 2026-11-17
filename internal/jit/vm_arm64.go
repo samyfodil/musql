@@ -1002,6 +1002,12 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 			e.guardInt(pc, in.A)
 			e.know.isInt.add(in.A)
 		}
+	case VGuardCopy:
+		if !e.know.isInt.has(in.C) {
+			e.guardInt(pc, in.C)
+			e.know.isInt.add(in.C)
+		}
+		return e.insn(pc, VInsn{Op: VCopy, A: in.A, B: in.B, Imm: 1})
 	case VRowid:
 		if in.Dead {
 			e.clobber(in.C)

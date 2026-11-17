@@ -230,6 +230,10 @@ const (
 	// below 64 reading NULL; VRowid, VNext and VRewind exit. The cursor's
 	// segment pointer is stored, so the write barrier exits.
 	VNullRow
+	// VGuardCopy: VCopy (shallow, Imm 1) when r[C] is an INTEGER, exiting at
+	// the pc otherwise: a value the VDBE makes once a run, which native code
+	// copies once it is made, with r[C] saying whether it is.
+	VGuardCopy
 )
 
 // VCmpBr's Imm bits past the result it jumps on.

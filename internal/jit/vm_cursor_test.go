@@ -455,3 +455,35 @@ func TestVMRowidAndIntGuard(t *testing.T) {
 		}
 	}
 }
+
+// TestVMGuardCopy: VGuardCopy copies r[A] to r[B] when r[C] is an INTEGER and
+// exits at its pc, r[B] untouched, when it is anything else.
+func TestVMGuardCopy(t *testing.T) {
+	if !Available {
+		t.Skip("no JIT on this platform")
+	}
+	rows := [][]tvalue{{{Typ: tvNull}}}
+	cur := &VCursor{Rows: unsafe.Pointer(unsafe.SliceData(rows)), N: 1, Pos: 0, Last: -1, Ok: 1, Adv: 1, Mask: ^uint64(0)}
+	prog := []VInsn{{Op: VGuardCopy, A: 1, B: 0, C: 2}, {Op: VExit}}
+	for _, v := range []tvalue{{Typ: tvInt, I: 42}, {Typ: tvReal, F: 2.5}, {Typ: tvNull}} {
+		for _, c := range []struct {
+			flag   tvalue
+			wantPC int
+		}{
+			{tvalue{Typ: tvInt, I: 1}, 1},
+			{tvalue{Typ: tvNull}, 0},
+			{tvalue{Typ: tvReal, F: 1}, 0},
+		} {
+			old := tvalue{Typ: tvInt, I: -7}
+			regs := []tvalue{old, v, c.flag}
+			pc := runVMCursor(t, prog, regs, rows, cur, 0)
+			want := old
+			if c.wantPC == 1 {
+				want = v
+			}
+			if pc != c.wantPC || !same(regs[0], want) {
+				t.Errorf("value %+v flag %+v: pc %d r0 %+v, want pc %d r0 %+v", v, c.flag, pc, regs[0], c.wantPC, want)
+			}
+		}
+	}
+}
