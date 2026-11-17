@@ -28,7 +28,15 @@ type shapeRecorder struct {
 	base   int     // the statement's own parameters; the hidden ones follow
 	toks   []int   // the token each hidden parameter was, in parameter order
 	vals   []Value // and its value
-	active int     // inside the outermost select's WHERE or ON
+	active int     // inside the outermost select's WHERE, ON or result list
+	// result is set inside the outermost select's result list, where a
+	// literal that is a whole operand of + - * / % or of a sign is made a
+	// parameter too, unless noResult. names are the columns such a literal
+	// names (shapeName).
+	result     int
+	noResult   bool
+	resultMade bool
+	names      []shapeName
 	// underOr is set when a hidden parameter is inside an OR: the OR's
 	// analysis (wherePlanOrToIn, the MULTI_OR order) works from literal
 	// operands, and declines where a parameter stands, so such a statement
@@ -56,6 +64,39 @@ type planShape struct {
 	base    int
 	pattern string
 	order   []int
+	names   []shapeName
+}
+
+// shapeName is a result column named by its spelling, which holds a literal
+// made a parameter: col is its place in the result, from its first token and
+// next the token after it. A statement of the shape spells it with its own
+// literals, and the tokens around them are the shape's, so its name is read
+// off its own text as the parser reads it (parseSelectList).
+type shapeName struct {
+	col, from, next int
+}
+
+// shapeColNames is names, a shape's program's column names, with each
+// column a literal of sh names spelled as sql spells it.
+func shapeColNames(names []string, sh *planShape, sql string, toks []token) []string {
+	if len(sh.names) == 0 {
+		return names
+	}
+	names = slices.Clone(names)
+	for _, n := range sh.names {
+		names[n.col] = shapeSpan(sql, toks, n.from, n.next)
+	}
+	return names
+}
+
+// shapeSpan is the text of toks[from:next] as a result column's name: up to
+// the start of the token after it, trimmed (parseSelectList).
+func shapeSpan(sql string, toks []token, from, next int) string {
+	end := toks[next-1].End
+	if t := toks[next]; t.Start >= end && t.Start <= len(sql) {
+		end = t.Start
+	}
+	return strings.TrimSpace(sql[toks[from].Start:end])
 }
 
 // shapeClause marks the outermost select's WHERE or ON as the place literals
@@ -104,6 +145,43 @@ func shapeClass(t token) byte {
 		return 0
 	}
 	return 'i'
+}
+
+// shapeArith is the arithmetic l op r with each literal operand made a hidden
+// parameter inside the outermost result list: lt and rt are the operands'
+// literal tokens, or -1. The value is computed when the row is, from a
+// parameter as from a literal.
+func (p *parser) shapeArith(op string, l Expr, lt int, r Expr, rt int) Expr {
+	if s := p.shape; s != nil && s.result > 0 && p.coreDepth == 1 {
+		if lt >= 0 {
+			l = s.param(lt, l.(LiteralExpr).Val)
+		}
+		if rt >= 0 {
+			r = s.param(rt, r.(LiteralExpr).Val)
+		}
+	}
+	return BinaryExpr{Op: op, L: l, R: r}
+}
+
+// shapeSign is x, the operand of a sign, made a hidden parameter inside the
+// outermost result list when it is one literal token, xt. "-9223372036854775808"
+// never reaches here: parseUnary folds it into one literal.
+func (p *parser) shapeSign(x Expr, xt int) Expr {
+	if s := p.shape; s != nil && s.result > 0 && p.coreDepth == 1 && xt >= 0 {
+		return s.param(xt, x.(LiteralExpr).Val)
+	}
+	return x
+}
+
+// shapeResultColumn marks the outermost select's result list as a place
+// literals are made parameters, until the returned func.
+func (p *parser) shapeResultColumn() (done func()) {
+	if p.shape == nil || p.shape.noResult || p.coreDepth != 1 {
+		return func() {}
+	}
+	p.shape.active++
+	p.shape.result++
+	return func() { p.shape.active--; p.shape.result-- }
 }
 
 // shapeCompare is rowOrBinary with a literal operand made a hidden parameter
@@ -164,6 +242,9 @@ func (p *parser) shapeBetween(x, lo, hi Expr) (Expr, Expr) {
 }
 
 func (s *shapeRecorder) param(tok int, v Value) Expr {
+	if s.result > 0 {
+		s.resultMade = true
+	}
 	s.toks = append(s.toks, tok)
 	s.vals = append(s.vals, v)
 	return ParamExpr{Index: s.base + len(s.toks)}
@@ -196,10 +277,40 @@ func parseSelectShape(sql string) (*SelectStmt, *shapeRecorder, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	if p.shape.resultMade && (p.shape.underOr || !shapeResultsFree(stmt, toks)) {
+		// A result column a GROUP BY, HAVING, ORDER BY or window may match
+		// is compared with them as written; a "*" moves the columns the
+		// names count; and an OR there would leave the WHERE unshaped too.
+		p = newParser(sql, toks)
+		p.shape = &shapeRecorder{base: plain.params.maxIndex, noResult: true}
+		if stmt, err = p.parseSelectStmt(); err != nil {
+			return nil, nil, err
+		}
+	}
 	if len(p.shape.toks) == 0 || p.shape.underOr {
 		return stmt, nil, nil
 	}
 	return stmt, p.shape, nil
+}
+
+// shapeResultsFree reports whether stmt's result columns are matched with
+// nothing else in it: no GROUP BY, HAVING or ORDER BY, no window, and no
+// "*" among them.
+func shapeResultsFree(stmt *SelectStmt, toks []token) bool {
+	if len(stmt.GroupBy) > 0 || stmt.Having != nil || len(stmt.OrderBy) > 0 {
+		return false
+	}
+	for _, c := range stmt.Columns {
+		if c.Star {
+			return false
+		}
+	}
+	for _, t := range toks {
+		if t.kind == tkIdent && !t.quoted && (strings.EqualFold(t.text, "OVER") || strings.EqualFold(t.text, "WINDOW")) {
+			return false
+		}
+	}
+	return true
 }
 
 // literalTokens are toks' literals a shape key cuts out (shapeClass).
@@ -289,45 +400,46 @@ var planShapesOffForTest bool
 // fixes; keeping it in the cache's own map drops it whenever the cache is.
 func shapeIndexKey(skeleton string) string { return "\x00shape-of" + skeleton }
 
-// shapedPlan is the program compiled for sqlText's shape, and the parameters
-// that run it for sqlText, or nil.
-func (p *ReadOnlyPager) shapedPlan(sqlText string, args []Value) (*Program, []Value) {
-	prog, lits := p.shapedProgram(sqlText)
+// shapedPlan is the program compiled for sqlText's shape, the parameters
+// that run it for sqlText, and its columns' names as sqlText spells them; or
+// nil.
+func (p *ReadOnlyPager) shapedPlan(sqlText string, args []Value) (*Program, []Value, []string) {
+	prog, toks, lits := p.shapedProgram(sqlText)
 	if prog == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	params, ok := shapeArgs(args, prog.shape, lits)
 	if !ok {
-		return nil, nil
+		return nil, nil, nil
 	}
 	planShapeHits.Add(1)
-	return prog, params
+	return prog, params, shapeColNames(prog.ColNames, prog.shape, sqlText, toks)
 }
 
 // shapedProgram is the program compiled for sqlText's shape, and sqlText's
-// literals, or nil.
-func (p *ReadOnlyPager) shapedProgram(sqlText string) (*Program, []token) {
+// tokens and literals, or nil.
+func (p *ReadOnlyPager) shapedProgram(sqlText string) (*Program, []token, []token) {
 	if planShapesOffForTest || p.sharedPlans == nil && p.planCache == nil || len(p.attachedReaders) > 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	toks, err := lex(sqlText)
 	if err != nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	lits := literalTokens(toks)
 	if len(lits) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	m := p.planCacheFor()
 	idx := m[shapeIndexKey(shapeKey(sqlText, lits, ""))]
 	if idx == nil || idx.shape == nil || len(idx.shape.pattern) != len(lits) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	prog := m[shapeKey(sqlText, lits, idx.shape.pattern)]
 	if prog == nil || prog.shape == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
-	return prog, lits
+	return prog, toks, lits
 }
 
 // execShaped compiles and runs stmt, the parse of sqlText, as its shape's
@@ -352,7 +464,7 @@ func (p *ReadOnlyPager) execShaped(stmt *SelectStmt, sqlText string, args []Valu
 	}
 	lits := literalTokens(toks)
 	pattern, order := shapePattern(toks, lits, rec)
-	sh := &planShape{base: rec.base, pattern: pattern, order: order}
+	sh := &planShape{base: rec.base, pattern: pattern, order: order, names: rec.names}
 	params, aok := shapeArgs(args, sh, lits)
 	if !aok {
 		return nil, nil, false, nil
@@ -360,13 +472,25 @@ func (p *ReadOnlyPager) execShaped(stmt *SelectStmt, sqlText string, args []Valu
 	key := shapeKey(sqlText, lits, sh.pattern)
 	cols, rows, err = p.execSelect(shaped, nil, params, key)
 	m := p.planCacheFor()
-	if prog := m[key]; prog != nil {
+	if prog := m[key]; prog != nil && shapeNamesSpelled(prog.ColNames, sh, sqlText, toks) {
 		prog.shape = sh
 		if ik := shapeIndexKey(shapeKey(sqlText, lits, "")); m[ik] == nil && len(m) < planCacheMax {
 			m[ik] = &Program{shape: sh}
 		}
 	}
 	return cols, rows, true, err
+}
+
+// shapeNamesSpelled reports whether each column sh renames for a statement
+// of the shape is named by its spelling in names, as compiled for sqlText:
+// only then is another statement's spelling its name.
+func shapeNamesSpelled(names []string, sh *planShape, sqlText string, toks []token) bool {
+	for _, n := range sh.names {
+		if n.col >= len(names) || names[n.col] != shapeSpan(sqlText, toks, n.from, n.next) {
+			return false
+		}
+	}
+	return true
 }
 
 // madeString reports whether s made a string literal a parameter.

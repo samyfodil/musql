@@ -385,9 +385,9 @@ func (p *ReadOnlyPager) QueryArgs(sqlText string, args []Value) (cols []string, 
 		rows, err = prog.execOuter(p, nil, args)
 		return prog.ColNames, rows, err
 	}
-	if prog, params := p.shapedPlan(sqlText, args); prog != nil {
+	if prog, params, names := p.shapedPlan(sqlText, args); prog != nil {
 		rows, err = prog.execOuter(p, nil, params)
-		return prog.ColNames, rows, err
+		return names, rows, err
 	}
 	p.runFold = false
 	trimmed := strings.TrimSpace(sqlText)
