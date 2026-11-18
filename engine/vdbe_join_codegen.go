@@ -3012,6 +3012,17 @@ func andConjuncts(cjs []Expr) Expr {
 // (called once per joined row at the innermost level), then OpClose for each.
 // Pushed-down conjuncts (plan.buckets) are tested per level by emitJoinLevel;
 // plan.deferred is the caller's to test inside body.
+// joinSourceOneRow reports a source of at most one row: a subquery or view
+// (derivedOneRow), or a CTE, whose body is an aggregate with no GROUP BY
+// (selectAtMostOneRow).
+func joinSourceOneRow(s joinSource) bool {
+	if s.derivedOneRow {
+		return true
+	}
+	ci := s.cteItem
+	return ci != nil && ci.queue == nil && ci.recSelf == nil && ci.binding != nil && selectAtMostOneRow(ci.binding.core)
+}
+
 func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() error) error {
 	// A virtual-table source whose constraint names a table bound earlier in
 	// this nesting is driven from INSIDE the join instead of above it -- the
@@ -3026,10 +3037,19 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 	// table there -- with no seek hint and not itself a RIGHT/FULL JOIN sweep
 	// target -- can therefore iterate the b-tree LAZILY instead of materializing
 	// the whole table (see vdbeCursor.streamable). Deeper levels, and any
-	// rightOuter/withoutRowid/derived source, keep materializing.
+	// rightOuter/withoutRowid/derived source, keep materializing -- but for a
+	// level below sources of at most one row each (an aggregate with no GROUP
+	// BY, as a subquery or a CTE), which is rewound once a run too, where no
+	// RIGHT or FULL JOIN sweeps a level afterwards.
+	lead := 0
+	if !slices.ContainsFunc(srcs, func(s joinSource) bool { return s.rightOuter }) {
+		for lead < len(plan.execOrder)-1 && joinSourceOneRow(srcs[plan.execOrder[lead]]) {
+			lead++
+		}
+	}
 	streamOuter, orderedOuter := -1, -1
 	if len(plan.execOrder) > 0 {
-		o := plan.execOrder[0]
+		o := plan.execOrder[lead]
 		s := srcs[o]
 		// A planned seek does not exclude it: rewind seeks first and streams
 		// only when the seek declines at run time -- which an automatic seek
@@ -3037,7 +3057,7 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 		// (automaticSeekCandidates) -- instead of materializing the table.
 		if s.derived == nil && s.vtabItem == nil && s.cteItem == nil && s.catalogScope == scopeAny &&
 			!s.rightOuter && !s.tbl.withoutRowid &&
-			(len(plan.autoIdxKeys) == 0 || plan.autoIdxKeys[0] == nil || c.rowOrderFree) {
+			(len(plan.autoIdxKeys) <= lead || plan.autoIdxKeys[lead] == nil || c.rowOrderFree) {
 			// A level carrying an index-order key must MATERIALIZE: the key is
 			// a permutation of the whole row set, which a one-row-at-a-time
 			// b-tree pull has nothing to permute. See OpAutoIndexOrder. Not when
@@ -3047,7 +3067,7 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 		// One whose key orders it may still stream: when its rows already run
 		// in the key's order, OpAutoIndexOrder has nothing to permute.
 		if streamOuter < 0 && s.derived == nil && s.vtabItem == nil && s.cteItem == nil && s.catalogScope == scopeAny &&
-			!s.rightOuter && !s.tbl.withoutRowid && len(plan.autoIdxKeys) > 0 && plan.autoIdxKeys[0] != nil && plan.autoIdxKeys[0].multiOr == nil {
+			!s.rightOuter && !s.tbl.withoutRowid && len(plan.autoIdxKeys) > lead && plan.autoIdxKeys[lead] != nil && plan.autoIdxKeys[lead].multiOr == nil {
 			orderedOuter = o
 		}
 	}

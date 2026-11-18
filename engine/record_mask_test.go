@@ -561,6 +561,33 @@ func TestCursorColumnMasksDerivation(t *testing.T) {
 		}
 	}
 
+	// A sub-program that reads nothing of this one's rows leaves the mask: one
+	// neither correlated nor compiled against an enclosing frame, or a CTE's
+	// body, which runs on its own.
+	alone := &Program{}
+	for _, keep := range []Instruction{
+		{Op: OpSubquery, P4: alone}, {Op: OpExists, P4: alone}, {Op: OpInSub, P4: alone}, {Op: OpRowSub, P4: alone},
+		{Op: OpOpenDerived, P4: &derivedSource{prog: alone}},
+		{Op: OpOpenDerived, P4: &derivedSource{cte: &cteRef{}}},
+	} {
+		with := append(append([]Instruction(nil), insns...), keep)
+		if got := cursorColumnMasks(with, 1); got == nil || got[0] != 1<<0|1<<3 {
+			t.Fatalf("%v over a program reading no row of this one must keep the mask, got %v", keep.Op, got)
+		}
+	}
+	for _, bail := range []Instruction{
+		{Op: OpSubquery, P4: &Program{Correlated: true}},
+		{Op: OpExists, P4: &Program{OuterFrames: []outerFrameInfo{{}}}},
+		{Op: OpOpenDerived, P4: &derivedSource{prog: &Program{Correlated: true}}},
+		{Op: OpOpenDerived, P4: &derivedSource{vtab: &FromItem{}}},
+		{Op: OpOpenDerived, P4: &derivedSource{recSelf: &recQueueSpec{}}},
+	} {
+		with := append(append([]Instruction(nil), insns...), bail)
+		if got := cursorColumnMasks(with, 1); got != nil {
+			t.Fatalf("%v whose program may read this one's rows must make the derivation decline, got %#x", bail.Op, uint64(got[0]))
+		}
+	}
+
 	// A column number out of the range a column mask can express declines
 	// rather than folding onto some bit.
 	if got := cursorColumnMasks([]Instruction{{Op: OpColumn, P1: 0, P2: -1}}, 1); got != nil {
