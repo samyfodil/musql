@@ -39,6 +39,30 @@ func cteSingleSite(b *cteBinding) bool {
 	return encl == nil || encl.m10d != cteM10dNo
 }
 
+// cteUsedOnce reports that b is not AS MATERIALIZED and its statement
+// references it once (CteUse.nUse < 2, select.c:8018), in the statement's own
+// clauses: a reference in another CTE's body is expanded once for each
+// reference to that CTE.
+func cteUsedOnce(b *cteBinding) bool {
+	if b == nil || b.owner == nil || b.m10d == cteM10dYes || b.recursive != nil || b.multiSelfRef {
+		return false
+	}
+	main := *b.owner
+	main.CTEs = nil
+	if n, ok := cteRefsIn(&main, b.name); !ok || n != 1 {
+		return false
+	}
+	for _, d := range b.owner.CTEs {
+		if r33sFoldIdent(d.Name) == r33sFoldIdent(b.name) {
+			continue
+		}
+		if k, ok := cteRefsIn(d.Select, b.name); !ok || k != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // cteRefsIn counts the FROM items of s and every select inside it that name
 // the CTE name; false when a WITH inside s defines that name again.
 func cteRefsIn(s *SelectStmt, name string) (int, bool) {

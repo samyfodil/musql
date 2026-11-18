@@ -91,9 +91,14 @@ func (p *ReadOnlyPager) r41PushInto(stmt *SelectStmt, i int, conj []Expr) (FromI
 	}
 	if it.Subquery == nil {
 		// A view reference is this same subquery once sqlite3SelectExpand has
-		// run. A CTE is not pushed into: tag-select-0420 skips one referenced
-		// twice (nUse>=2), a count this package does not keep.
+		// run, and so is a CTE that tag-select-0420 pushes into: one not AS
+		// MATERIALIZED that its statement names once (nUse<2).
 		ex, ok := p.r37cExpandViewRef(it)
+		if !ok {
+			if b, found := p.lookupCTE(it.Table); found && cteUsedOnce(b) {
+				ex, ok = p.r38cExpandCTERef(it)
+			}
+		}
 		if !ok {
 			return FromItem{}, false
 		}
@@ -111,7 +116,15 @@ func (p *ReadOnlyPager) r41PushInto(stmt *SelectStmt, i int, conj []Expr) (FromI
 		}
 		arms = append(arms, a.Stmt)
 	}
+	agg := len(arms) == 1 && (len(body.GroupBy) != 0 || body.Having != nil || selectIsAggregateQuery(body))
 	switch {
+	case agg:
+		// C never flattens an aggregate subquery (select.c:7804). A HAVING of
+		// its own would be moved by havingToWhere with the pushed terms; that
+		// is left alone.
+		if body.Having != nil {
+			return FromItem{}, false
+		}
 	case len(arms) > 1:
 		if len(body.OrderBy) != 0 || len(body.CTEs) != 0 {
 			return FromItem{}, false
@@ -132,7 +145,7 @@ func (p *ReadOnlyPager) r41PushInto(stmt *SelectStmt, i int, conj []Expr) (FromI
 		return FromItem{}, false
 	}
 	for _, a := range arms {
-		if len(a.GroupBy) != 0 || a.Having != nil || selectIsAggregateQuery(a) || len(a.Columns) != len(body.Columns) {
+		if !agg && (len(a.GroupBy) != 0 || a.Having != nil || selectIsAggregateQuery(a)) || len(a.Columns) != len(body.Columns) {
 			return FromItem{}, false
 		}
 		for _, c := range a.Columns {
@@ -229,6 +242,16 @@ func (p *ReadOnlyPager) r41PushInto(stmt *SelectStmt, i int, conj []Expr) (FromI
 		return FromItem{}, false
 	}
 	nb := *arms[0]
+	if agg {
+		where, having, ok := p.r41HavingToWhere(body, pushed[0])
+		if !ok {
+			return FromItem{}, false
+		}
+		nb.Where = r41AndOnto(nb.Where, where)
+		nb.Having = r41AndOnto(nil, having)
+		it.Subquery = &nb
+		return it, true
+	}
 	nb.Where = r41AndOnto(nb.Where, pushed[0])
 	if len(arms) > 1 {
 		nb.Compound = append([]CompoundArm(nil), body.Compound...)
@@ -331,6 +354,74 @@ func (p *ReadOnlyPager) r41ArmCollations(a *SelectStmt) ([]string, bool) {
 		colls[k] = r33sFoldIdent(name)
 	}
 	return colls, true
+}
+
+// r41HavingToWhere splits the terms pushed into an aggregate body, which
+// pushDownWhereTerms ANDs onto its HAVING (select.c:5277), as havingToWhere
+// then does when there is a GROUP BY: a term sqlite3ExprIsConstantOrGroupBy
+// accepts moves to the WHERE, in order, and the rest stay in the HAVING. A
+// pushed term reads bare columns of the body, so it moves when each column it
+// reads is a GROUP BY term of BINARY collation; that is all a GROUP BY of
+// bare columns can match. false when the answer cannot be known here: a
+// GROUP BY of anything else, a column that does not resolve, or a term that
+// reads no column (ExprAlwaysFalse keeps a constant false one).
+func (p *ReadOnlyPager) r41HavingToWhere(body *SelectStmt, terms []Expr) (where, having []Expr, ok bool) {
+	if len(body.GroupBy) == 0 {
+		return nil, terms, true
+	}
+	jts, err := p.resolveFromColumns(body.From)
+	if err != nil {
+		return nil, nil, false
+	}
+	ctx := &evalCtx{tables: buildScopes(jts)}
+	type ref struct {
+		ctx *evalCtx
+		idx int
+	}
+	resolve := func(ce ColumnExpr) (ref, bool) {
+		if ce.Schema != "" || ce.UsingRepr || ce.UsingPinned {
+			return ref{}, false
+		}
+		c, idx, col, rowid, err := resolveColumnEx(ctx, ce)
+		if err != nil || rowid >= 0 || col == nil {
+			return ref{}, false
+		}
+		return ref{c, idx}, true
+	}
+	group := map[ref]bool{}
+	for _, g := range body.GroupBy {
+		ce, isCol := g.(ColumnExpr)
+		if !isCol {
+			return nil, nil, false
+		}
+		r, rok := resolve(ce)
+		coll, cok := columnDeclaredCollation(ctx, ce)
+		if !rok || !cok {
+			return nil, nil, false
+		}
+		if equalFoldName(coll, "BINARY") {
+			group[r] = true
+		}
+	}
+	for _, t := range terms {
+		reads, moves, known := 0, true, true
+		if !r41Walk(t, func(e Expr) {
+			if ce, isCol := e.(ColumnExpr); isCol {
+				reads++
+				r, rok := resolve(ce)
+				known = known && rok
+				moves = moves && group[r]
+			}
+		}) || !known || reads == 0 {
+			return nil, nil, false
+		}
+		if moves {
+			where = append(where, t)
+		} else {
+			having = append(having, t)
+		}
+	}
+	return where, having, true
 }
 
 // r41AndOnto is sqlite3ExprAnd(pSubq->pWhere, pNew) once per pushed term, in
