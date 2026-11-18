@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"math"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -125,8 +126,11 @@ func (p *parser) litTok(start int, e Expr) int {
 // a token no shape cuts out. The kind is part of the key, so nothing compiled
 // from a literal's type is shared across types. An integer from -1 to 1 is
 // never cut: the planner estimates "x = K" for one differently
-// (whereIsSmallInt, sqlite3ExprIsInteger in whereLoopOutputAdjust). A string
-// is: a TEXT bound is read when the statement runs, by the segment filters
+// (whereIsSmallInt, sqlite3ExprIsInteger in whereLoopOutputAdjust). Nor is a
+// number a sign changes as a literal and not as a value: a REAL zero ("-0.0"
+// is -0.0, 0 - X is +0.0) and 2**63, which parseUnary folds with its "-"
+// into SMALLEST_INT64 (or, in hex, "hex literal too big"). A string is cut:
+// a TEXT bound is read when the statement runs, by the segment filters
 // (segPlanPreds) as by the loop.
 func shapeClass(t token) byte {
 	if t.kind == tkString {
@@ -140,8 +144,11 @@ func shapeClass(t token) byte {
 	case err != nil:
 		return 0
 	case v.Typ == Float:
+		if v.F == 0 || v.F == 1<<63 {
+			return 0
+		}
 		return 'r'
-	case v.I >= -1 && v.I <= 1:
+	case v.I >= -1 && v.I <= 1, v.I == math.MinInt64:
 		return 0
 	}
 	return 'i'
