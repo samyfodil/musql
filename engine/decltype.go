@@ -9,9 +9,10 @@ package engine
 func (p *ReadOnlyPager) ResultDeclTypes(sqlText string) (types []string, ok bool) {
 	prog := p.cachedPlan(sqlText)
 	if prog == nil {
-		// A shape's program answers for every statement of it: the result
-		// columns are not among the literals it reads.
-		prog, _ = p.shapedProgram(sqlText)
+		// A shape's program answers for every statement of it: a result
+		// column holding a literal it reads is an expression, which declares
+		// no type.
+		prog, _, _ = p.shapedProgram(sqlText)
 	}
 	if prog != nil {
 		if prog.declTypes != nil {
