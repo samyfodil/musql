@@ -1581,8 +1581,8 @@ func whereInCollation(jts []joinedTable, scopes []tableScope, l Expr) string {
 //
 // C's chngToIN wants every subterm to be WO_EQ on one table and column, with a
 // column RHS matching the left's affinity (ticket #2249). This reproduces a
-// strict subset -- literal constant RHSs only -- because the rest needs
-// machinery the port lacks:
+// strict subset -- literal and bound-parameter RHSs only, which have no
+// affinity -- because the rest needs machinery the port lacks:
 //
 //   - a column RHS brings a second table into chngToIN (the "2-bit case"),
 //     whose second pass works on commuted copies inside the OR's sub-clause;
@@ -1623,7 +1623,9 @@ func wherePlanOrToIn(jts []joinedTable, scopes []tableScope, e Expr) (Expr, bool
 		if _, hasColl := exprCollation(sb.L); hasColl {
 			return nil, false
 		}
-		if _, isLit := sb.R.(LiteralExpr); !isLit {
+		switch sb.R.(type) {
+		case LiteralExpr, ParamExpr:
+		default:
 			return nil, false
 		}
 		t, c, ok := wherePlanColumnRef(jts, scopes, sb.L)
@@ -1645,14 +1647,21 @@ func wherePlanOrToIn(jts []joinedTable, scopes []tableScope, e Expr) (Expr, bool
 }
 
 // whereLiteralsMayCompareEqual is a CONSERVATIVE sqlite3ExprCompare over two
-// literals: it answers true whenever the C might call them equal. The C
-// compares the two nodes' op and then their TOKEN TEXT with sqlite3StrICmp --
-// so 'x' and 'X' ARE equal there while 1 and 1.0 are not (different ops) -- and
-// this has the parsed VALUE rather than the token, so "1" and "01" answer true
-// here where the C would say no. Erring that way only declines an OR that could
-// have been converted; erring the other way would build the IN term for a pair
-// the C sent to whereCombineDisjuncts first.
+// literals or bound parameters: it answers true whenever the C might call them
+// equal. The C compares the two nodes' op and then their TOKEN TEXT with
+// sqlite3StrICmp -- so 'x' and 'X' ARE equal there while 1 and 1.0 are not
+// (different ops) -- and this has the parsed VALUE rather than the token, so
+// "1" and "01" answer true here where the C would say no. Two parameters are
+// equal there when their text and number are, so "?1" and "?1" are and two
+// "?" never are; a parameter never equals a literal. Erring that way only
+// declines an OR that could have been converted; erring the other way would
+// build the IN term for a pair the C sent to whereCombineDisjuncts first.
 func whereLiteralsMayCompareEqual(a, b Expr) bool {
+	pa, aParam := a.(ParamExpr)
+	pb, bParam := b.(ParamExpr)
+	if aParam || bParam {
+		return aParam && bParam && pa.Index == pb.Index
+	}
 	la, aok := a.(LiteralExpr)
 	lb, bok := b.(LiteralExpr)
 	if !aok || !bok {

@@ -30,9 +30,9 @@ type shapeRecorder struct {
 	vals   []Value // and its value
 	active int     // inside the outermost select's WHERE or ON
 	// underOr is set when a hidden parameter is inside an OR: the OR's
-	// analysis (wherePlanOrToIn, the MULTI_OR order) works from literal
-	// operands, and declines where a parameter stands, so such a statement
-	// is not shaped.
+	// analysis (wherePlanOrToIn, the MULTI_OR order) compares its operands,
+	// and two parameters compare unequal where the literals they stand for
+	// may be equal, so such a statement is not shaped.
 	underOr bool
 }
 
