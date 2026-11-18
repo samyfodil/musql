@@ -245,6 +245,34 @@ too.
 
 Without the JIT, musql loses to C SQLite by a large multiple on scans.
 
+### TPC-H and TPC-DS
+
+Whole decision-support queries, against C SQLite on the same machine:
+
+- **TPC-H: musql beats C SQLite on 21 of the 22 queries,** on amd64 (Xeon
+  D-2123IT) and on Apple M4. Over the 20 timed together it takes 0.36× C's time
+  on amd64 and 0.32× on the M4 (geometric means); the closest is q09 at 0.81×,
+  the furthest q17 at 0.11× ([#125](https://github.com/samyfodil/musql/pull/125)).
+  q15 takes 40 ms against C's 87 ms; q22 is the exception, 17 ms against 14 ms
+  ([#135](https://github.com/samyfodil/musql/pull/135)).
+- **TPC-DS at scale factor 0.5: every query both engines run gives C's
+  answer.** In the survey of all 99 queries, musql's time averaged 0.44× C's
+  and it was faster on 59 of the 77 that ran on both
+  ([#169](https://github.com/samyfodil/musql/issues/169)). The two that stayed
+  behind now lead too: q78 takes 10.4 s against C's 16.2 s and q23 17.5 s
+  against 22.1 s ([#274](https://github.com/samyfodil/musql/pull/274)). A
+  correlated scalar subquery runs once per distinct outer value, so q06 takes
+  0.7 s where C takes 53 s, and q01 0.5 s where C takes 22–29 s
+  ([#212](https://github.com/samyfodil/musql/pull/212)).
+- **A query run once** pays parsing, planning, compiling and JIT. Over 103
+  TPC-H and TPC-DS queries on small samples, each in a fresh process, musql's
+  first runs total 3.2 s against C's 3.7 s, and its repeated runs 0.87 s against
+  3.3 s ([#238](https://github.com/samyfodil/musql/issues/238)).
+
+Statements that differ only in their literals share one compiled program (see
+[How it works](#how-it-works)): 2,000 statements of one shape run in 58 ms
+instead of 400 ms ([#195](https://github.com/samyfodil/musql/pull/195)).
+
 Vector search is faster too: `vector_top_k` beats libSQL's index while
 returning the exact top 10, and every `vec1` index beats C SQLite's. See
 [Vector search](#vector-search).
@@ -465,6 +493,15 @@ scan the values it needs without decoding every field of every row. The JIT
 compiles supported execution paths to native code, with vectorized filter
 kernels on supported CPUs. The planner also uses index seeks and specialized
 aggregate and top-N paths to avoid unnecessary work.
+
+A compiled statement is kept with its native code and reused. Statements that
+differ only in their literals mostly share one: `SELECT * FROM t WHERE price > 10`
+and `... WHERE price > 25`, or `SELECT a * 3 FROM t` and `SELECT a * 4 FROM t`,
+are planned, compiled and JIT-compiled once, and the literals are read when the
+statement runs, as bound parameters are. An application that writes its values
+into the SQL text, rather than binding them, compiles far less. (A literal
+stays part of the statement where it changes the plan: a small integer, one
+under an OR, or one a GROUP BY or ORDER BY could match.)
 
 The driver connects `database/sql` to the parser, planner, and execution engine.
 Committed changes go into an append-only delta; compaction folds them into the
