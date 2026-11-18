@@ -1509,6 +1509,9 @@ func cursorColumnMasks(insns []Instruction, ncursors int) []columnMask {
 			if insns[i].Op == OpAggStep && insns[i].P3 != 0 {
 				continue // reads a sorter record, not the cursors
 			}
+			if subReadsNoRow(&insns[i]) {
+				continue
+			}
 			return nil
 		}
 	}
@@ -1591,6 +1594,27 @@ func cursorColumnMasks(insns []Instruction, ncursors int) []columnMask {
 // sub-program that reaches back into this frame's cursors through
 // buildOuterEvalCtx. See cursorColumnMasks for why an omission here is a
 // performance bug and not a correctness one.
+// subReadsNoRow reports a sub-program opcode whose program reads nothing of
+// this one's rows: it is not correlated and was compiled against no enclosing
+// frame (buildOuterEvalCtx), or it is a CTE's body, which runs on its own
+// (runCTEOnce, resolveCTERows).
+func subReadsNoRow(in *Instruction) bool {
+	alone := func(p *Program) bool { return p != nil && !p.Correlated && len(p.OuterFrames) == 0 }
+	switch in.Op {
+	case OpSubquery, OpExists, OpInSub, OpRowSub:
+		p, _ := in.P4.(*Program)
+		return alone(p)
+	case OpOpenDerived:
+		ds, ok := in.P4.(*derivedSource)
+		if !ok || ds.vtab != nil || ds.recSelf != nil || ds.upfrom != nil || ds.viewUpfrom != nil ||
+			ds.vtabWrite != nil || ds.sinkPlan != nil || ds.catalogScope != scopeAny {
+			return false
+		}
+		return ds.cte != nil && ds.prog == nil || alone(ds.prog)
+	}
+	return false
+}
+
 func readsWholeCursorRows(op OpCode) bool {
 	switch op {
 	case OpAggStep, OpHashAggStep: // gatherCursorRow
@@ -4090,6 +4114,11 @@ func (m *vdbe) execOpenRead(op *Instruction, insns []Instruction) error {
 	cur := m.openCursorInto(op.P1, rp, op.P4.(*resolvedTable))
 	cur.streamable = op.P5&1 != 0
 	cur.streamIfOrdered = op.P5&4 != 0
+	// A materialized scan leaves the columns nothing reads unread
+	// (scanTableCols), which its reads fill in. A streamable cursor
+	// materializes too where the segments cannot stream its rows: a write
+	// session's own rows (ServesLiveRows), or a seek's.
+	cur.scanMask = m.cursorMask(insns, op.P1).widenIfTotal(len(cur.tbl.cols))
 	if cur.streamable && !cur.hasGeneratedCols() {
 		// Only a streaming scan masks: a materialized cursor retains
 		// every row, so a masked row would outlive its record, and it
@@ -4101,11 +4130,7 @@ func (m *vdbe) execOpenRead(op *Instruction, insns []Instruction) error {
 		// "c AS (a+b)" would be computed from undecoded NULLs and
 		// stored. expandStoredRow also inserts a slot per VIRTUAL
 		// column, so record positions stop matching the mask.
-		cur.colMask = m.cursorMask(insns, op.P1).widenIfTotal(len(cur.tbl.cols))
-	} else if !cur.streamable {
-		// A materialized cursor's scan leaves the columns nothing reads
-		// unread instead (scanTableCols), which its reads fill in.
-		cur.scanMask = m.cursorMask(insns, op.P1).widenIfTotal(len(cur.tbl.cols))
+		cur.colMask = cur.scanMask
 	}
 	m.cursors[op.P1] = cur
 	return nil
