@@ -1414,10 +1414,15 @@ func (p *parser) parseSelectList() ([]SelectColumn, error) {
 			cols = append(cols, SelectColumn{Star: true, StarQualifier: qualifier})
 		} else {
 			start := p.pos
+			done := p.shapeResultColumn()
+			made := p.shape.made()
 			e, err := p.parseExpr()
+			done()
 			if err != nil {
 				return nil, err
 			}
+			named := p.shape.made() > made
+			next := p.pos
 			// C takes the span up to the START of the lookahead token
 			// (parse.y's scanpt), so a comment between the expression and
 			// the next real token -- a trailing "-- note" included -- is
@@ -1450,6 +1455,9 @@ func (p *parser) parseSelectList() ([]SelectColumn, error) {
 			col := SelectColumn{Expr: e, Alias: alias, HasAlias: hasAlias, Text: text, RawText: text}
 			if colRef, ok := e.(ColumnExpr); ok && !hasAlias {
 				col.Text = colRef.Name
+			}
+			if named && !hasAlias {
+				p.shape.names = append(p.shape.names, shapeName{col: len(cols), from: start, next: next})
 			}
 			cols = append(cols, col)
 		}
@@ -3871,33 +3879,39 @@ func (p *parser) parseConcat() (Expr, error) {
 }
 
 func (p *parser) parseAddSub() (Expr, error) {
+	ls := p.pos
 	l, err := p.parseMulDiv()
 	if err != nil {
 		return nil, err
 	}
+	lt := p.litTok(ls, l)
 	for p.peekIsPunct("+") || p.peekIsPunct("-") {
 		op := p.next().text
+		rs := p.pos
 		r, err := p.parseMulDiv()
 		if err != nil {
 			return nil, err
 		}
-		l = BinaryExpr{Op: op, L: l, R: r}
+		l, lt = p.shapeArith(op, l, lt, r, p.litTok(rs, r)), -1
 	}
 	return l, nil
 }
 
 func (p *parser) parseMulDiv() (Expr, error) {
+	ls := p.pos
 	l, err := p.parseArrow()
 	if err != nil {
 		return nil, err
 	}
+	lt := p.litTok(ls, l)
 	for p.peekIsPunct("*") || p.peekIsPunct("/") || p.peekIsPunct("%") {
 		op := p.next().text
+		rs := p.pos
 		r, err := p.parseArrow()
 		if err != nil {
 			return nil, err
 		}
-		l = BinaryExpr{Op: op, L: l, R: r}
+		l, lt = p.shapeArith(op, l, lt, r, p.litTok(rs, r)), -1
 	}
 	return l, nil
 }
@@ -4033,9 +4047,13 @@ func (p *parser) parseUnary() (Expr, error) {
 				}
 			}
 		}
+		xs := p.pos
 		x, err := p.parseUnary()
 		if err != nil {
 			return nil, err
+		}
+		if op != "~" {
+			x = p.shapeSign(x, p.litTok(xs, x))
 		}
 		return UnaryExpr{Op: op, X: x}, nil
 	}

@@ -203,3 +203,122 @@ func mustLex(t *testing.T, q string) []token {
 	}
 	return toks
 }
+
+// TestPlanShapeResultColumns: literals that are a whole operand of
+// arithmetic or a sign in the result list are a shape's parameters too, and
+// each statement of the shape names its columns by its own spelling.
+func TestPlanShapeResultColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.musq")
+	buildDB(t, path, `CREATE TABLE t(a INTEGER, b INTEGER, c TEXT COLLATE NOCASE)`)
+	n, err := OpenWrite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Discard()
+	for i := range 40 {
+		c := []string{"'x'", "'X'", "'y'", "NULL"}[i%4]
+		if err := n.Exec(fmt.Sprintf(`INSERT INTO t VALUES(%d, %d, %s)`, i, i%7, c)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := n.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	p, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	fresh, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	// Pairs: the second of each reuses the first's program when shared.
+	pairs := []struct {
+		a, b   string
+		shared bool
+	}{
+		{`SELECT a * 3, - 7 + b FROM t WHERE b > 2`, `SELECT a * 4, - 18 + b FROM t WHERE b > 3`, true},
+		{`SELECT a * 3 AS x, b FROM t WHERE b > 2`, `SELECT a * 5 AS x, b FROM t WHERE b > 2`, true},
+		{`SELECT a * 3 /* three */, b FROM t WHERE b > 4`, `SELECT a * 12 /* three */, b FROM t WHERE b > 4`, true},
+		{`SELECT b, a + 5   FROM t WHERE b > 3`, `SELECT b, a + 600   FROM t WHERE b > 3`, true},
+		{`SELECT + 7 * a, a % 3 FROM t`, `SELECT + 8 * a, a % 4 FROM t`, true},
+		{`SELECT a / 2 FROM t`, `SELECT a / 4 FROM t`, true},
+		{`SELECT a / 2.0 FROM t`, `SELECT a / 4.0 FROM t`, true},
+		{`SELECT - 54 * count(*), sum(a) + 3 FROM t WHERE b > 2`, `SELECT - 55 * count(*), sum(a) + 9 FROM t WHERE b > 3`, true},
+		{`SELECT -9223372036854775808 + a FROM t WHERE b > 5`, `SELECT -9223372036854775807 + a FROM t WHERE b > 5`, false},
+		{`SELECT 9223372036854775807 + a FROM t WHERE b > 5`, `SELECT 9223372036854775806 + a FROM t WHERE b > 5`, true},
+		{`SELECT -1.5 + a FROM t WHERE b >= 5`, `SELECT -9223372036854775808 + a FROM t WHERE b >= 5`, false},
+		{`SELECT -0x10 + a FROM t WHERE b > 5`, `SELECT -0x8000000000000000 + a FROM t WHERE b > 5`, false},
+		{`SELECT -0.5, abs(-0.5) FROM t WHERE b > 5`, `SELECT -0.0, abs(-0.0) FROM t WHERE b > 5`, false},
+		{`SELECT -0.5 * a FROM t WHERE b > 5`, `SELECT -1e-400 * a FROM t WHERE b > 5`, false},
+		{`SELECT CASE WHEN a > 5 THEN a * 2 ELSE 3 END FROM t`, `SELECT CASE WHEN a > 9 THEN a * 7 ELSE 3 END FROM t`, true},
+		{`SELECT a > 5, b = 2 FROM t`, `SELECT a > 7, b = 3 FROM t`, true},
+		{`SELECT likelihood(a > 5, 0.5), a FROM t WHERE b > 2`, `SELECT likelihood(a > 6, 0.5), a FROM t WHERE b > 2`, true},
+		{`SELECT c || 5, a * 2 FROM t WHERE b > 2`, `SELECT c || 5, a * 3 FROM t WHERE b > 2`, true},
+		// Kept as written: a GROUP BY, HAVING or ORDER BY may match a result
+		// column, a "*" moves the columns, and an OR leaves the WHERE.
+		{`SELECT c || 5, count(*) FROM t GROUP BY c || 5`, `SELECT c || 6, count(*) FROM t GROUP BY c || 6`, false},
+		{`SELECT b + 5, count(*) FROM t GROUP BY b + 5`, `SELECT b + 6, count(*) FROM t GROUP BY b + 6`, false},
+		{`SELECT a + 5 FROM t WHERE b > 2 ORDER BY a + 5`, `SELECT a + 6 FROM t WHERE b > 2 ORDER BY a + 6`, false},
+		{`SELECT *, a + 5 FROM t WHERE b = 3`, `SELECT *, a + 6 FROM t WHERE b = 3`, false},
+		{`SELECT a > 5 OR b < 3 FROM t WHERE b > 2`, `SELECT a > 5 OR b < 3 FROM t WHERE b > 3`, true},
+		{`SELECT a > 5 OR b < 3 FROM t WHERE b > 2`, `SELECT a > 6 OR b < 4 FROM t WHERE b > 2`, false},
+		{`SELECT sum(a) OVER (ORDER BY a ROWS 2 PRECEDING) * 3 FROM t`, `SELECT sum(a) OVER (ORDER BY a ROWS 2 PRECEDING) * 4 FROM t`, false},
+	}
+	for round := range 2 {
+		for _, pr := range pairs {
+			for _, q := range []string{pr.a, pr.b} {
+				before := planShapeHits.Load()
+				cols, got, gerr := p.QueryArgs(q, nil)
+				wcols, want, werr := freshQuery(t, fresh, q, nil)
+				if fmt.Sprint(cols, got, gerr) != fmt.Sprint(wcols, want, werr) {
+					t.Errorf("round %d %s:\n got  %q %v %v\n want %q %v %v", round, q, cols, got, gerr, wcols, want, werr)
+				}
+				if hit := planShapeHits.Load() > before; q == pr.b && round == 0 && hit != pr.shared {
+					t.Errorf("%s: reused the shape's program %v, want %v", q, hit, pr.shared)
+				}
+			}
+		}
+	}
+}
+
+// TestPlanCacheAdmitsWhenFull: past planCacheMax distinct statements, a new
+// statement's program and a new shape are still kept, each replacing an
+// older one, and the cache stays bounded.
+func TestPlanCacheAdmitsWhenFull(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.musq")
+	buildDB(t, path, `CREATE TABLE t(a INTEGER, b INTEGER)`, `INSERT INTO t VALUES(1, 5), (2, 6), (3, 5)`)
+	p, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	for i := range planCacheMax + 50 {
+		if _, _, err := p.QueryArgs(fmt.Sprintf(`SELECT a, %d FROM t`, i+2), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const q = `SELECT b FROM t ORDER BY a`
+	for range 2 {
+		if _, _, err := p.QueryArgs(q, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if p.cachedPlan(q) == nil {
+		t.Error("a statement after the cache filled was not kept")
+	}
+	before := planShapeHits.Load()
+	for _, s := range []string{`SELECT a FROM t WHERE b = 5`, `SELECT a FROM t WHERE b = 6`} {
+		if _, _, err := p.QueryArgs(s, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if planShapeHits.Load() == before {
+		t.Error("a shape made after the cache filled was not reused")
+	}
+	if n := len(p.planCacheFor()); n > planCacheMax {
+		t.Errorf("the cache holds %d programs, past %d", n, planCacheMax)
+	}
+}
