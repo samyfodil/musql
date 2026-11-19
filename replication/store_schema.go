@@ -238,6 +238,12 @@ type schemaReplay struct {
 	sc   *scratch
 }
 
+func (r *schemaReplay) close() {
+	if r != nil {
+		r.sc.close()
+	}
+}
+
 type schemaKey struct {
 	site string
 	seq  uint64
@@ -256,6 +262,12 @@ func schemaKeys(ops []Op) []schemaKey {
 func (s *Store) replayed(ctx context.Context, ops []Op) (*catalog, *scratch, error) {
 	r := s.replay
 	s.replay = nil
+	return advanceReplay(ctx, r, ops)
+}
+
+// advanceReplay is replaySchema(ops) from r, a reduction it takes over (nil
+// for none): only the ops past r's are reduced when r's begin these.
+func advanceReplay(ctx context.Context, r *schemaReplay, ops []Op) (*catalog, *scratch, error) {
 	if r == nil {
 		return replaySchema(ctx, ops)
 	}

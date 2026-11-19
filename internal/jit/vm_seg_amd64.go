@@ -909,3 +909,69 @@ func (e *vmEmit) inSub(pc int, in VInsn) {
 	}
 	e.storeInt(pc, in, in.C, m)
 }
+
+// sortSeek is VSortSeek: the first of the Sort's keys at or above the key,
+// binary searched, and the run of those equal to it after. RAX, RCX, RDX, R9,
+// R10, X0 and X1 are scratch.
+func (e *vmEmit) sortSeek(pc int, in VInsn) {
+	a, L := e.a, e.lay
+	cb := int32(in.A * VCursorSize)
+	e.unmapCursor(in.A)
+	l := e.named()
+	a.CmpMemDByte(RSI, e.d(in.B, L.OffTyp), L.TypInt)
+	e.jccStub(CondNE, pc) // the key's conversions are the VDBE's
+	e.jccWB(pc)           // the cursor's row pointers are stored
+	a.MovRegMemD(RAX, RDI, POffCur)
+	a.LeaRegMemD(RAX, RAX, cb)
+	a.MovRegMemD(R9, RAX, VCursorOffSort)
+	a.TestRegReg(R9, R9)
+	e.jccStub(CondE, pc)
+	a.MovqXR(X0, RAX) // the cursor
+	a.MovqXR(X1, R9)  // its Sort
+	a.MovRegMemD(RCX, RSI, e.d(in.B, L.OffI))
+	a.MovRegMemD(R10, R9, VSortOffInts)
+	a.MovRegMemD(RDX, R9, VSortOffN) // hi
+	a.XorRegReg(RAX, RAX)            // lo
+	a.Bind(l("bloop"))
+	a.CmpRegReg(RAX, RDX)
+	a.JccL(CondGE, l("bdone"))
+	a.MovRegReg(R9, RAX)
+	a.AddRegReg(R9, RDX)
+	a.SarRegImm8(R9, 1)
+	a.CmpMemIdxReg(R10, R9, RCX) // ints[mid] against key
+	a.JccL(CondGE, l("bhi"))
+	a.LeaRegMemD(RAX, R9, 1)
+	a.JmpL(l("bloop"))
+	a.Bind(l("bhi"))
+	a.MovRegReg(RDX, R9)
+	a.JmpL(l("bloop"))
+	a.Bind(l("bdone"))
+
+	// The run: RAX to RDX.
+	a.MovqRX(R9, X1)
+	a.MovRegReg(RDX, RAX)
+	a.Bind(l("run"))
+	a.AluRegMemD(AluCmp, RDX, R9, VSortOffN)
+	a.JccL(CondGE, l("end"))
+	a.CmpMemIdxReg(R10, RDX, RCX)
+	a.JccL(CondNE, l("end"))
+	a.IncReg(RDX)
+	a.JmpL(l("run"))
+	a.Bind(l("end"))
+
+	a.MovqRX(R10, X0)
+	a.SubRegReg(RDX, RAX)
+	a.MovMemDReg(R10, VCursorOffN, RDX)
+	a.MovMemDReg(R10, VCursorOffSLo, RAX)
+	a.MovRegMemD(RCX, R9, VSortOffIds)
+	a.LeaIdx(RCX, RCX, RAX)
+	a.MovMemDReg(R10, VCursorOffRids, RCX)
+	a.MovRegReg(RDX, RAX)
+	a.AddRegReg(RDX, RAX)
+	a.AddRegReg(RDX, RAX) // 3*lo words: 24-byte headers
+	a.MovRegMemD(RCX, R9, VSortOffRows)
+	a.LeaIdx(RCX, RCX, RDX)
+	a.MovMemDReg(R10, VCursorOffRows, RCX)
+	a.MovMemDImm(R10, VCursorOffLast, -1)
+	a.MovMemDImm(R10, VCursorOffDirty, 1)
+}

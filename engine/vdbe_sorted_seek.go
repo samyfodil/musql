@@ -4,6 +4,9 @@ import (
 	"cmp"
 	"slices"
 	"sort"
+	"unsafe"
+
+	"github.com/samyfodil/musql/internal/jit"
 )
 
 // sortedRows is OpSortedSeek's state on a cursor (vdbeCursor.sorted).
@@ -27,6 +30,8 @@ type sortedRows struct {
 	keyOrder []int
 	// base is where the current run starts in rows.
 	base int
+	// vs is rows, ids and ints as VSortSeek searches them (handSort).
+	vs jit.VSort
 }
 
 // sortedSeek narrows cur to the rows whose column h.col equals probe, sorting
@@ -231,4 +236,76 @@ func (a *sortedSeekHint) sameSort(b *sortedSeekHint) bool {
 		}
 	}
 	return true
+}
+
+// lowerSortSeeks lowers each OpSortedSeek of a cursor native code walks as a
+// row list -- one lowerIdxSeeks left to the VDBE -- to jit.VSortSeek, and the
+// cursor's OpIfEmpty to jit.VSortEmpty, when its key is one
+// INTEGER-comparable column and every sorted seek of the cursor sorts alike.
+// It returns those sorts by cursor (nil when there are none) and the pcs.
+func lowerSortSeeks(prog *Program, vp []jit.VInsn, idxSpecs []*idxSeekSpec) (sorts []*sortedSeekHint, pcs []int) {
+	sorts = make([]*sortedSeekHint, prog.NCursors)
+	bad := make([]bool, prog.NCursors)
+	for _, in := range prog.Insns {
+		switch in.Op {
+		case OpRightJoinMark, OpRightJoinSweepRewind, OpRightJoinSweepNext, OpRightJoinSweepOrder:
+			if in.P1 >= 0 && in.P1 < len(bad) {
+				bad[in.P1] = true
+			}
+		}
+	}
+	for _, in := range prog.Insns {
+		if in.Op != OpSortedSeek || in.P1 < 0 || in.P1 >= len(sorts) {
+			continue
+		}
+		c := in.P1
+		h, ok := in.P4.(*sortedSeekHint)
+		if !ok || in.P2 < 0 || in.P2 >= prog.NReg || h.built || h.col < 0 || len(h.more) > 0 ||
+			h.aff != affNone && h.aff != affNumeric && h.aff != affInteger || c < len(idxSpecs) && idxSpecs[c] != nil ||
+			sorts[c] != nil && !sorts[c].sameSort(h) {
+			bad[c] = true
+			continue
+		}
+		if sorts[c] == nil {
+			sorts[c] = h
+		}
+	}
+	for pc, in := range prog.Insns {
+		if in.P1 < 0 || in.P1 >= len(sorts) || sorts[in.P1] == nil || bad[in.P1] {
+			continue
+		}
+		switch {
+		case in.Op == OpSortedSeek:
+			vp[pc] = jit.VInsn{Op: jit.VSortSeek, A: in.P1, B: in.P2}
+			pcs = append(pcs, pc)
+		case in.Op == OpIfEmpty && in.P4 == nil:
+			// A miss of the seek before it asks whether the whole list is
+			// empty, which the sort answers.
+			vp[pc] = jit.VInsn{Op: jit.VSortEmpty, A: in.P1, T: in.P2}
+			pcs = append(pcs, pc)
+		}
+	}
+	if len(pcs) == 0 {
+		return nil, nil
+	}
+	for c := range sorts {
+		if bad[c] {
+			sorts[c] = nil
+		}
+	}
+	return sorts, pcs
+}
+
+// handSort hands cur's sorted rows to native code for VSortSeek, when the
+// VDBE's next OpSortedSeek of h would search them as they stand: sorted by h's
+// key, every key an INTEGER (ints), and nothing to order or rebuild first.
+func handSort(cur *vdbeCursor, jc *jit.VCursor, h *sortedSeekHint) {
+	s := cur.sorted
+	if s == nil || !s.ok || s.ints == nil || !s.hint.sameSort(h) || cur.pendingOrder != nil || cur.segSorted != nil ||
+		cur.rowStore != nil || cur.streamable || cur.seekReseek || cur.refillEach || len(s.ints) != len(s.rows) || len(s.ids) != len(s.rows) {
+		return
+	}
+	s.vs = jit.VSort{Ints: unsafe.Pointer(unsafe.SliceData(s.ints)), Rows: unsafe.Pointer(unsafe.SliceData(s.rows)),
+		Ids: unsafe.Pointer(unsafe.SliceData(s.ids)), N: int64(len(s.ints))}
+	jc.Sort, jc.SortLo = unsafe.Pointer(&s.vs), -1
 }

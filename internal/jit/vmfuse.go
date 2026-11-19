@@ -110,6 +110,10 @@ func vmStepOf(in VInsn, pc int) progStep {
 		s.targets = []int{in.T}
 	case VSeekRowid, VSeekIdx:
 		s.uses, s.targets = []int{in.B}, []int{in.T}
+	case VSortSeek:
+		s.uses = []int{in.B}
+	case VSortEmpty:
+		s.targets = []int{in.T}
 	case VInText:
 		s.uses, s.defs = []int{in.A}, []int{in.C}
 	case VSeekRewind, VNullRow:
@@ -591,7 +595,7 @@ func vmRowKey(c int) int { return ^(c + vmRowKeyBase) }
 // before it read.
 func vmMovesCursor(op VOp) bool {
 	return op == VNext || op == VRewind || op == VOpen || op == VClose || op == VSeekRowid || op == VSeekIdx || op == VSeekRewind ||
-		op == VNullRow
+		op == VNullRow || op == VSortSeek
 }
 
 // vmRunPredicted is vmRunColumns for a segment column read with a predicted

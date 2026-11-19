@@ -855,3 +855,65 @@ func (e *vmEmitArm) inText(pc int, in VInsn) {
 	}
 	e.storeInt(in, in.C, m)
 }
+
+// sortSeek is vm_seg_amd64.go's VSortSeek. X9 the cursor, X4 the key, X5 its
+// Sort, X7 the keys; X8 lo, X13 hi and X12 mid of the search.
+func (e *vmEmitArm) sortSeek(pc int, in VInsn) {
+	a, L := e.a, e.lay
+	e.unmap(^in.A)
+	bloop, bhi, bdone, run, end := e.vmLabel("ss"), e.vmLabel("sh"), e.vmLabel("sd"), e.vmLabel("sr"), e.vmLabel("se")
+	e.ldrb(X10, in.B, L.OffTyp)
+	a.CmpImm(X10, uint32(L.TypInt))
+	a.Bcond(CondNE, e.stub(pc)) // the key's conversions are the VDBE's
+	e.branchWB(pc)              // the cursor's row pointers are stored
+	e.ldr(X4, in.B, L.OffI)
+	e.curBase(in.A)
+	a.LdrImm(X5, X9, VCursorOffSort)
+	a.Cbz(X5, e.stub(pc))
+	a.LdrImm(X7, X5, VSortOffInts)
+	a.MovImm16(X8, 0)
+	a.LdrImm(X13, X5, VSortOffN)
+	a.Label(bloop)
+	a.Cmp(X8, X13)
+	a.Bcond(CondGE, bdone)
+	a.AddReg(X12, X8, X13)
+	a.AsrImm(X12, X12, 1)
+	a.LdrRegIdx(X11, X7, X12)
+	a.Cmp(X11, X4)
+	a.Bcond(CondGE, bhi)
+	a.AddImm(X8, X12, 1)
+	a.B(bloop)
+	a.Label(bhi)
+	a.MovReg(X13, X12)
+	a.B(bloop)
+	a.Label(bdone)
+
+	// The run: X8 to X13.
+	a.MovReg(X13, X8)
+	a.LdrImm(X6, X5, VSortOffN)
+	a.Label(run)
+	a.Cmp(X13, X6)
+	a.Bcond(CondGE, end)
+	a.LdrRegIdx(X11, X7, X13)
+	a.Cmp(X11, X4)
+	a.Bcond(CondNE, end)
+	a.AddImm(X13, X13, 1)
+	a.B(run)
+	a.Label(end)
+
+	a.SubReg(X13, X13, X8)
+	a.StrImm(X13, X9, VCursorOffN)
+	a.StrImm(X8, X9, VCursorOffSLo)
+	a.LdrImm(X10, X5, VSortOffIds)
+	a.AddRegLSL3(X10, X10, X8)
+	a.StrImm(X10, X9, VCursorOffRids)
+	a.AddReg(X12, X8, X8)
+	a.AddReg(X12, X12, X8) // 3*lo words: 24-byte headers
+	a.LdrImm(X10, X5, VSortOffRows)
+	a.AddRegLSL3(X10, X10, X12)
+	a.StrImm(X10, X9, VCursorOffRows)
+	a.MovImm64(X10, -1)
+	a.StrImm(X10, X9, VCursorOffLast)
+	a.MovImm16(X10, 1)
+	a.StrImm(X10, X9, VCursorOffDirty)
+}

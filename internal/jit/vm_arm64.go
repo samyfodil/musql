@@ -980,6 +980,18 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		e.seekRewind(pc, in)
 	case VNullRow:
 		e.nullRow(pc, in)
+	case VSortSeek:
+		e.sortSeek(pc, in)
+	case VSortEmpty:
+		e.skips++
+		nonEmpty := "s" + strconv.Itoa(e.skips) + ".sort"
+		a.LdrImm(X9, X0, POffCur)
+		e.ldrAt(X10, X9, in.A*VCursorSize+VCursorOffSort)
+		a.Cbz(X10, e.stub(pc))
+		a.LdrImm(X10, X10, VSortOffN)
+		a.Cbnz(X10, nonEmpty)
+		e.jmpBlock(pc, in.T)
+		a.Label(nonEmpty)
 	case VText:
 		e.text(pc, in)
 	case VLike:
