@@ -465,12 +465,47 @@ func cArmRowEst(body *SelectStmt, prog *Program, limit *int64, compile func(*Sel
 		return min(n, min(seed, 48)+est), true
 	}
 	if prog == nil || !prog.planNRowOK {
-		return 0, false
+		est, ok := cSeriesScanEst(body, seed, seedOK)
+		if !ok {
+			return 0, false
+		}
+		return min(n, est), true
 	}
 	if prog.planNRow < n { // select.c:8295
 		n = prog.planNRow
 	}
 	return n, true
+}
+
+// cSeriesScanEst is the one loop a body with no WHERE term makes over
+// generate_series: the rows seriesBestIndex estimates for its plan, 1000 with
+// both start and stop given and a span it makes very expensive without stop
+// (series.c), on the seed path's MIN(nQueryLoop, 48) (where.c:5921, :6250).
+// Only constant arguments are followed: a column of another loop leaves one
+// unusable where that loop is not outside it.
+func cSeriesScanEst(body *SelectStmt, seed logEst, seedOK bool) (logEst, bool) {
+	if !seedOK || body.Where != nil || body.Distinct || len(body.From) != 1 || body.Limit != nil || body.Offset != nil || body.OffsetParam != nil {
+		return 0, false
+	}
+	it := body.From[0]
+	if !it.TableFunc || !equalFoldName(it.Table, "generate_series") || it.Schema != "" || len(it.TableFuncArgs) == 0 || len(it.TableFuncArgs) > 3 {
+		return 0, false
+	}
+	for _, a := range it.TableFuncArgs {
+		if u, ok := a.(UnaryExpr); ok && (u.Op == "-" || u.Op == "+") {
+			a = u.X
+		}
+		switch a.(type) {
+		case LiteralExpr, ParamExpr:
+		default:
+			return 0, false
+		}
+	}
+	rows := uint64(2147483647)
+	if len(it.TableFuncArgs) >= 2 {
+		rows = 1000
+	}
+	return min(seed, 48) + logEstFromInt(rows), true
 }
 
 // cCoroutineVerdict ports fromClauseTermCanBeCoroutine (select.c:7266) for
