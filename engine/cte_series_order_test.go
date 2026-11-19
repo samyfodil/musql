@@ -237,3 +237,37 @@ func TestSeriesLimit(t *testing.T) {
 		}
 	}
 }
+
+// TestSeriesStreamsPastCap: a series longer than a materialized scan holds,
+// read in place as far as the statement needs (#285). Each answer is C
+// 3.53.3's.
+func TestSeriesStreamsPastCap(t *testing.T) {
+	db, err := Create(filepath.Join(t.TempDir(), "s.musq"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, tc := range []struct{ q, want string }{
+		// A WHERE term the module does not take, and one it leaves unused.
+		{`SELECT value FROM generate_series(5) WHERE value % 2 = 0 LIMIT 3`, `6;8;10;`},
+		{`SELECT value FROM generate_series(5) WHERE value > 12 AND value >= (SELECT 10) LIMIT 3`, `13;14;15;`},
+		// A negative LIMIT is offered to no module; the OFFSET is skipped here,
+		// row by row.
+		{`SELECT value FROM generate_series(5) WHERE value > 4294967290 LIMIT -1 OFFSET 2`, `4294967293;4294967294;4294967295;`},
+		{`SELECT value FROM generate_series(1, 20000000) LIMIT 2 OFFSET 19999997`, `19999998;19999999;`},
+		{`SELECT count(*) FROM generate_series(1, 20000000) WHERE value % 3 = 0`, `6666666;`},
+		// The whole 2^64 values, which no row count holds.
+		{`SELECT value FROM generate_series(-9223372036854775808, 9223372036854775807) WHERE value % 2 = 0 LIMIT 2`,
+			`-9223372036854775808;-9223372036854775806;`},
+		{`SELECT value FROM generate_series(9223372036854775807, -9223372036854775808, -1) WHERE value % 2 = 0 LIMIT 2`,
+			`9223372036854775806;9223372036854775804;`},
+	} {
+		_, rows, err := db.Query(tc.q, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.q, err)
+		}
+		if got := rowsText(rows); got != tc.want {
+			t.Errorf("%s:\n got %s\nwant %s", tc.q, got, tc.want)
+		}
+	}
+}

@@ -97,6 +97,10 @@ func (p *ReadOnlyPager) ctasSeriesSegments(sel *SelectStmt, cols []columnInfo) (
 	if !ok {
 		return nil, 0, false
 	}
+	n, ok := sr.rows()
+	if !ok {
+		return nil, 0, false
+	}
 	kerns := make([]*jit.Code, len(lows))
 	regs := make([][]int64, len(lows))
 	var svc *segSvcRunner
@@ -108,7 +112,7 @@ func (p *ReadOnlyPager) ctasSeriesSegments(sel *SelectStmt, cols []columnInfo) (
 			return nil, 0, false
 		}
 	}
-	rows := seriesRows{srs: []*seriesCursor{sr}, n: sr.count}
+	rows := seriesRows{srs: []*seriesCursor{sr}, n: n}
 	var r0 uint64
 	if len(base.blocks) > 0 {
 		svc = newSegSvcRunner(m, ds.tbl)

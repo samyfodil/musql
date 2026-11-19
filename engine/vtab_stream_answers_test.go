@@ -69,7 +69,8 @@ func TestGenerateSeriesStreamAnswers(t *testing.T) {
 		}
 	}
 	var n int
-	if err := db.QueryRow("SELECT count(*) FROM generate_series(1, 20000000)").Scan(&n); err == nil || !strings.Contains(err.Error(), "materialization limit") {
-		t.Errorf("a series past the cap: %d, %v", n, err)
+	// Past what a materialized scan holds, read in place (#285).
+	if err := db.QueryRow("SELECT count(*) FROM generate_series(1, 20000000)").Scan(&n); err != nil || n != 20000000 {
+		t.Errorf("a series past 2^24 rows: %d, %v", n, err)
 	}
 }
