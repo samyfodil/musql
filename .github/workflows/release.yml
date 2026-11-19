@@ -37,6 +37,7 @@ jobs:
           cache-dependency-path: |
             go.sum
             cloud/go.sum
+            cloud/cli/go.sum
             examples/doom/go.sum
       - name: build
         run: |
@@ -48,7 +49,7 @@ jobs:
           flags=(-trimpath -ldflags="-s -w -X main.version=$GITHUB_REF_NAME")
           (cd hrana && go build "${flags[@]}" -o "$out/musqld$ext" ./cmd/musqld)
           go build "${flags[@]}" -o "$out/musql-convert$ext" ./cmd/musql-convert
-          (cd cloud && go build "${flags[@]}" -o "$out/musql$ext" ./cmd/musql)
+          (cd cloud/cli && go build "${flags[@]}" -o "$out/musql$ext" ./cmd/musql)
           (cd examples/doom && go build "${flags[@]}" -o "$out/musql-doom$ext" ./cmd/doom)
           cp LICENSE README.md "$out/"
           cd dist
@@ -103,7 +104,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache-dependency-path: cloud/go.sum
+          cache-dependency-path: |
+            cloud/go.sum
+            cloud/cli/go.sum
       - uses: actions/download-artifact@v4
         with:
           name: console
@@ -119,6 +122,7 @@ jobs:
           (
             cd cloud
             go build "${flags[@]}" -tags jitllm -o "$out/musql-cloud$ext" ./cmd/musql-cloud
+            cd cli
             go build "${flags[@]}" -o "$out/musql$ext" ./cmd/musql
           )
           cp -r console-dist "$out/console"

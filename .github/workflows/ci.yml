@@ -132,7 +132,9 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-          cache-dependency-path: cloud/go.sum
+          cache-dependency-path: |
+            cloud/go.sum
+            cloud/cli/go.sum
       - name: build, vet, test
         working-directory: cloud
         run: |
@@ -147,8 +149,17 @@ jobs:
           set -e
           for t in linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
             echo "== $t =="
-            CGO_ENABLED=0 GOOS=${t%/*} GOARCH=${t#*/} go build -tags jitllm -o /dev/null ./cmd/musql-cloud ./cmd/musql
+            CGO_ENABLED=0 GOOS=${t%/*} GOARCH=${t#*/} go build -tags jitllm -o /dev/null ./cmd/musql-cloud
+            (cd cli && CGO_ENABLED=0 GOOS=${t%/*} GOARCH=${t#*/} go build -o /dev/null ./cmd/musql)
           done
+      # The CLI is its own module (cloud/cli), so the S3 client it backs up
+      # with stays out of the server's.
+      - name: the CLI (nested module)
+        working-directory: cloud/cli
+        run: |
+          set -e
+          go vet ./...
+          go test ./... -count=1 -timeout 20m
 
   pointread:
     name: bulk load + point reads vs C SQLite (nested module)

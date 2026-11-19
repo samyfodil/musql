@@ -46,6 +46,7 @@ func main() {
 		Dir:              dir,
 		Token:            os.Getenv("MUSQL_API_TOKEN"),
 		ServerToken:      os.Getenv("MUSQLD_AUTH_TOKEN"),
+		Getenv:           os.Getenv,
 		Stdin:            os.Stdin,
 		Stdout:           os.Stdout,
 		Stderr:           os.Stderr,

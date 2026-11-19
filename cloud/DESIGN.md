@@ -10,7 +10,7 @@ own OIDC provider, and serves the console; plus a CLI companion.
 | --- | --- |
 | `cloud/` | Go module `github.com/samyfodil/musql/cloud` (its own, like `hrana/`; `replace` the engine and `hrana` with `../`). |
 | `cloud/cmd/musql-cloud/` | The server binary: reads `config.yaml`, serves everything on one listener. |
-| `cloud/cmd/musql/` | The CLI companion (`musql auth login`, `musql db create`, …), modeled on `turso`. |
+| `cloud/cli/` | The CLI companion (`musql auth login`, `musql db create`, `musql backup`, …), modeled on `turso`: its own module, so the S3 client stays out of the server's; the binary is `cloud/cli/cmd/musql/`. |
 | `cloud/server/` | Wiring: HTTP mux, config, the service implementations. |
 | `cloud/state/` | The service's own state, kept in a musql database (`state.musq`): users, orgs, members, groups, databases, tokens, OIDC clients/keys/sessions, usage. |
 | `cloud/oidc/` | The OIDC provider. |

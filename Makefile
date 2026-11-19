@@ -77,7 +77,7 @@ bench-pointread:
 # builds the server with embedded AI.
 cloud: cloud-console
 	cd cloud && go build -tags '$(TAGS)' -o ../bin/musql-cloud ./cmd/musql-cloud
-	cd cloud && go build -o ../bin/musql ./cmd/musql
+	cd cloud/cli && go build -o ../../bin/musql ./cmd/musql
 
 cloud-console:
 	sh npm/build.sh
