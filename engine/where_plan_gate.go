@@ -226,10 +226,11 @@ func wherePlanMultiTableSourcesWith(p *ReadOnlyPager, c *compiler, srcs []joinSo
 			}
 			continue
 		}
-		if der != nil && s.vtabItem != nil {
-			// A subquery-admitting plan (markCoroutineReruns) takes a module
-			// whose xBestIndex is ported: wherePlanVtabItem.
-			if _, ok := wherePlanVtabItem(p, *s); ok {
+		if s.vtabItem != nil {
+			// A module whose xBestIndex is ported (wherePlanVtabItem):
+			// generate_series in any plan, json_each and json_tree in a
+			// subquery-admitting one (markCoroutineReruns).
+			if vt, ok := wherePlanVtabItem(p, *s); ok && (der != nil || vt.series) {
 				continue
 			}
 			return false
@@ -369,8 +370,8 @@ func wherePlanMultiTableOrderWith(p *ReadOnlyPager, c *compiler, srcs []joinSour
 
 	items := make([]whereItem, len(srcs))
 	for i := range srcs {
-		if der != nil && srcs[i].vtabItem != nil {
-			hidden, ok := wherePlanVtabItem(p, srcs[i])
+		if srcs[i].vtabItem != nil {
+			vt, ok := wherePlanVtabItem(p, srcs[i])
 			if !ok || srcs[i].left || srcs[i].rightOuter {
 				return nil, nil, 0, false
 			}
@@ -381,9 +382,14 @@ func wherePlanMultiTableOrderWith(p *ReadOnlyPager, c *compiler, srcs []joinSour
 					// whereLoopAddOr over a virtual table is not followed.
 					return nil, nil, 0, false
 				}
-				if t.cursor == i && (t.column == hidden[0] || t.column == hidden[1]) {
+				if t.cursor == i && (slices.Contains(vt.hidden, t.column) || vt.series && t.op&woIn != 0) {
 					// A WHERE constraint on the module's hidden input is one
-					// more xBestIndex constraint; not followed.
+					// more xBestIndex constraint; not followed. seriesBestIndex
+					// also takes one on its value, at no change of cost, so
+					// the loop without it (no more prerequisites, the same
+					// cost) is the one whereLoopFindLesser keeps; but an IN
+					// it takes clears orderByConsumed and has
+					// whereLoopAddVirtual call it again, not followed.
 					return nil, nil, 0, false
 				}
 			}
@@ -404,7 +410,7 @@ func wherePlanMultiTableOrderWith(p *ReadOnlyPager, c *compiler, srcs []joinSour
 					}
 					right |= whereMask(1) << uint(r)
 				}
-				terms = append(terms, whereIdxTerm{op: woEq, cursor: i, column: hidden[k], rCursor: -1, rColumn: -1,
+				terms = append(terms, whereIdxTerm{op: woEq, cursor: i, column: vt.hidden[k], rCursor: -1, rColumn: -1,
 					prereqAll: mask | right, prereqRight: right, parent: -1, virt: true, vtabArg: true, truthProb: 1})
 			}
 			// jsonEachBestIndex with the JSON argument: estimatedCost 1.0
@@ -415,6 +421,15 @@ func wherePlanMultiTableOrderWith(p *ReadOnlyPager, c *compiler, srcs []joinSour
 				cols: srcs[i].tbl.cols, tabName: "\x00vtab" + itoaSmall(i),
 				colUsedOK: colUsedOK, ipkIndex: -1, szTabRow: 1,
 				vtab: true, vtabRun: 0, vtabOut: 46,
+			}
+			if vt.series {
+				ordered, ok := seriesOrderConsumed(sortCtl, i, len(srcs[i].vtabItem.TableFuncArgs))
+				if !ok {
+					return nil, nil, 0, false
+				}
+				it := &items[i]
+				it.vtabRun, it.vtabOut = seriesBestIndexCost(len(srcs[i].vtabItem.TableFuncArgs))
+				it.vtabSeries, it.vtabOrdered = true, ordered
 			}
 			continue
 		}
@@ -2783,44 +2798,106 @@ func rightJoinSweepKey(p *ReadOnlyPager, srcs []joinSource, stmt *SelectStmt, r 
 	return key, ok
 }
 
+// wherePlanVtab is a virtual-table item the ported solver takes: the hidden
+// column each table-function argument binds (sqlite3WhereTabFuncArgs), and
+// whether its module is generate_series.
+type wherePlanVtab struct {
+	hidden []int
+	series bool
+}
+
 // wherePlanVtabItem admits a virtual-table source to the ported solver when its
-// module's xBestIndex is ported: json_each and json_tree, called with one or
-// two arguments that name no column at all (so each argument's term has no
-// prerequisite and the first call, all constraints usable, settles the plan).
-// hidden is the module's JSON and ROOT column numbers.
-func wherePlanVtabItem(p *ReadOnlyPager, s joinSource) (hidden [2]int, ok bool) {
+// module's xBestIndex is ported: json_each and json_tree with one or two
+// arguments, and generate_series with one to three. Each argument binds the
+// module's next input column, its JSON and ROOT, or its START, STOP and STEP.
+// An argument naming a column of another item makes that item a prerequisite of
+// the module's only plan (vtabArgPrereq); a subquery or a node the walk does
+// not know is not followed.
+func wherePlanVtabItem(p *ReadOnlyPager, s joinSource) (vt wherePlanVtab, ok bool) {
 	it := s.vtabItem
-	if p == nil || it == nil || s.tbl == nil || !it.TableFunc || len(it.TableFuncArgs) == 0 || len(it.TableFuncArgs) > 2 ||
-		len(s.tbl.cols) >= 63 {
-		return hidden, false
+	if p == nil || it == nil || s.tbl == nil || !it.TableFunc || len(it.TableFuncArgs) == 0 || len(s.tbl.cols) >= 63 {
+		return vt, false
 	}
 	mod, _, err := p.resolveVtabModuleForItem(*it)
 	if err != nil {
-		return hidden, false
+		return vt, false
 	}
-	jm, isJSON := mod.(jsonEachModule)
-	if !isJSON || (jm.name != "json_each" && jm.name != "json_tree") {
-		return hidden, false
-	}
-	hidden = [2]int{-1, -1}
-	for ci, c := range s.tbl.cols {
-		switch {
-		case c.Hidden && equalFoldName(c.Name, "json"):
-			hidden[0] = ci
-		case c.Hidden && equalFoldName(c.Name, "root"):
-			hidden[1] = ci
+	var inputs []string
+	switch m := mod.(type) {
+	case jsonEachModule:
+		if m.name != "json_each" && m.name != "json_tree" {
+			return vt, false
 		}
+		inputs = []string{"json", "root"}
+	case seriesModule:
+		inputs, vt.series = []string{"start", "stop", "step"}, true
+	default:
+		return vt, false
 	}
-	if hidden[0] < 0 || hidden[1] < 0 {
-		return hidden, false
+	if len(it.TableFuncArgs) > len(inputs) {
+		return vt, false
+	}
+	for _, name := range inputs {
+		ci := slices.IndexFunc(s.tbl.cols, func(c columnInfo) bool { return c.Hidden && equalFoldName(c.Name, name) })
+		if ci < 0 {
+			return vt, false
+		}
+		vt.hidden = append(vt.hidden, ci)
 	}
 	for _, a := range it.TableFuncArgs {
-		// An argument naming a column of another item makes that item a
-		// prerequisite of the module's only plan (vtabArgPrereq); a subquery
-		// or a node the walk does not know is not followed.
 		if !r41Walk(a, func(Expr) {}) {
-			return hidden, false
+			return vt, false
 		}
 	}
-	return hidden, true
+	return vt, true
+}
+
+// seriesBestIndexCost is seriesBestIndex's estimatedCost and estimatedRows
+// for a call with nArgs arguments, as whereLoopAddVirtualOne takes them
+// (rRun, nOut): with START and STOP, 2.0 (1.0 with STEP too) and 1000 rows;
+// with START alone the default cost (SQLITE_BIG_DBL/2) and 2147483647 rows.
+func seriesBestIndexCost(nArgs int) (rRun, nOut logEst) {
+	if nArgs >= 2 {
+		cost := 2.0
+		if nArgs == 3 {
+			cost = 1.0
+		}
+		return logEstFromDouble(cost), logEstFromInt(1000)
+	}
+	return logEstFromDouble(1e99 / 2), logEstFromInt(2147483647)
+}
+
+// seriesOrderConsumed is seriesBestIndex's orderByConsumed for item i called
+// with nArgs arguments. allocateIndexInfo hands a module the ORDER BY only when
+// every term but a constant is a bare column of it, none NULLS FIRST; the
+// module consumes it when START and STOP are given and the first is its VALUE.
+// ok is false for a descending one, which this engine's ascending walk of the
+// series does not follow, and a COLLATE on the item's column, not modelled.
+func seriesOrderConsumed(sort *whereSortCtl, i, nArgs int) (ordered, ok bool) {
+	if sort == nil || nArgs < 2 {
+		return false, true
+	}
+	var first *whereSortTerm
+	for k := range sort.ob {
+		t := &sort.ob[k]
+		if t.isConst {
+			continue
+		}
+		if t.bigNull || t.tab != i || t.col == xnNoColumn {
+			return false, true
+		}
+		if !t.bare {
+			return false, false
+		}
+		if first == nil {
+			first = t
+		}
+	}
+	if first == nil || first.col != 0 {
+		return false, true
+	}
+	if first.desc {
+		return false, false
+	}
+	return true, true
 }

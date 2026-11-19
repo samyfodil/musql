@@ -1945,10 +1945,16 @@ func (b *wherePlanIdxBuild) wherePathSatisfiesOrderBy(
 			l = &b.loops[last]
 		}
 		iTab := l.iTab
-		if b.items[iTab].vtab {
-			// WHERE_VIRTUALTABLE (where.c:5225): a module that consumed no
-			// ORDER BY ends the walk, and no later term may be matched.
-			isOrderDistinct = false
+		if it := &b.items[iTab]; it.vtab {
+			// WHERE_VIRTUALTABLE (where.c:5225): a module that consumed the
+			// ORDER BY satisfies all of it, unless it is DISTINCT's own
+			// (WHERE_DISTINCTBY without WHERE_SORTBYGROUP); one that did not
+			// ends the walk, and no later term may be matched.
+			if it.vtabOrdered && (!distinctBy || b.sort != nil && b.sort.sortByGroup) {
+				obSat = obDone
+			} else {
+				isOrderDistinct = false
+			}
 			break
 		}
 

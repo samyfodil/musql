@@ -4,6 +4,8 @@
 // SQLite's LogEst (signed 16-bit fixed-point approximation of 10*log2(x)).
 package engine
 
+import "math"
+
 // logEst is SQLite's LogEst (signed 16-bit LogEstimate). The width is load-bearing
 // for rounding in the planner's arithmetic.
 type logEst = int16
@@ -70,6 +72,18 @@ func logEstFromInt(x uint64) logEst {
 		}
 	}
 	return logEstTab[x&7] + y - 10
+}
+
+// logEstFromDouble is sqlite3LogEstFromDouble (src/util.c): a module's
+// estimatedCost as a LogEst.
+func logEstFromDouble(x float64) logEst {
+	if x <= 1 {
+		return 0
+	}
+	if x <= 2000000000 {
+		return logEstFromInt(uint64(x))
+	}
+	return logEst((math.Float64bits(x)>>52)-1022) * 10
 }
 
 // logEstToInt is sqlite3LogEstToInt (src/util.c). Only ever called on a
