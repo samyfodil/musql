@@ -1661,6 +1661,7 @@ func wherePlanOrToIn(jts []joinedTable, scopes []tableScope, e Expr) (Expr, bool
 // declines an OR that could have been converted; erring the other way would
 // build the IN term for a pair the C sent to whereCombineDisjuncts first.
 func whereLiteralsMayCompareEqual(a, b Expr) bool {
+	a, b = shapeOperand(a), shapeOperand(b)
 	pa, aParam := a.(ParamExpr)
 	pb, bParam := b.(ParamExpr)
 	if aParam || bParam {

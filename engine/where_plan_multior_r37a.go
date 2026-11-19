@@ -868,6 +868,7 @@ func wherePlanCombineDisjuncts(info *whereOrInfo) (combined []Expr, ok bool) {
 // a disjunct of the admitted subset can hold are distinguished; anything else
 // answers true, which only declines an OR that might have been served.
 func wherePlanExprMayCompareEqual(a, b Expr) bool {
+	a, b = shapeOperand(a), shapeOperand(b)
 	switch x := a.(type) {
 	case LiteralExpr:
 		return whereLiteralsMayCompareEqual(a, b)

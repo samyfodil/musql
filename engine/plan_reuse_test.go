@@ -48,11 +48,11 @@ func cachedPlanOf(s *Session, q string) *Program {
 		return nil
 	}
 	lits := literalTokens(toks)
-	idx := s.DB.plans.m[shapeIndexKey(shapeKey(q, lits, ""))]
+	idx := s.DB.plans.m[shapeIndexKey(shapeKey(q, lits, "", false))]
 	if idx == nil || idx.shape == nil {
 		return nil
 	}
-	return s.DB.plans.m[shapeKey(q, lits, idx.shape.pattern)]
+	return s.DB.plans.m[shapeKey(q, lits, idx.shape.pattern, idx.shape.or)]
 }
 
 // cachedPlans runs each query once and returns the plans the cache then

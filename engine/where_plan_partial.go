@@ -150,6 +150,9 @@ func (cv *pcxConv) conv(e Expr) *pcx {
 		}
 		return pcxUnknownNode
 	case ParamExpr:
+		if x.shapeLit != nil {
+			return cv.conv(shapeOperand(x))
+		}
 		return &pcx{op: pcxVariable, opaque: true}
 	case UnaryExpr:
 		switch strings.ToUpper(x.Op) {
