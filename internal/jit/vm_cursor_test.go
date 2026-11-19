@@ -63,6 +63,8 @@ func TestVCursorLayout(t *testing.T) {
 		{"Sel", unsafe.Offsetof(c.Sel), VCursorOffSel},
 		{"Idx", unsafe.Offsetof(c.Idx), VCursorOffIdx},
 		{"Segs", unsafe.Offsetof(c.Segs), VCursorOffSegs},
+		{"Sort", unsafe.Offsetof(c.Sort), VCursorOffSort},
+		{"SortLo", unsafe.Offsetof(c.SortLo), VCursorOffSLo},
 	} {
 		if f.got != f.want {
 			t.Errorf("VCursor %s is %d, generated code uses %d", f.name, f.got, f.want)
@@ -76,6 +78,11 @@ func TestVCursorLayout(t *testing.T) {
 		unsafe.Offsetof(sc.Exc) != VSegColOffExc || unsafe.Offsetof(sc.Heap) != VSegColOffHeap ||
 		unsafe.Offsetof(sc.Plain) != VSegColOffPlain {
 		t.Fatalf("VSeg or VSegCol is laid out differently from what generated code uses")
+	}
+	var so VSort
+	if unsafe.Offsetof(so.Ints) != VSortOffInts || unsafe.Offsetof(so.Rows) != VSortOffRows || unsafe.Offsetof(so.Ids) != VSortOffIds ||
+		unsafe.Offsetof(so.N) != VSortOffN {
+		t.Fatalf("VSort is laid out differently from what generated code uses")
 	}
 	var ix VIdx
 	if unsafe.Offsetof(ix.Vals) != VIdxOffVals || unsafe.Offsetof(ix.NVals) != VIdxOffNVals || unsafe.Offsetof(ix.Starts) != VIdxOffStarts ||
@@ -484,6 +491,84 @@ func TestVMGuardCopy(t *testing.T) {
 			if pc != c.wantPC || !same(regs[0], want) {
 				t.Errorf("value %+v flag %+v: pc %d r0 %+v, want pc %d r0 %+v", v, c.flag, pc, regs[0], c.wantPC, want)
 			}
+		}
+	}
+}
+
+// TestVMSortSeek: VSortSeek puts the cursor on the run of its Sort's rows
+// whose key is the INTEGER in the register -- one row, several, none before,
+// between and past the keys -- which the VRewind after it walks; any other key
+// and a cursor with no Sort exit untouched. VSortEmpty jumps when the Sort
+// holds no row.
+func TestVMSortSeek(t *testing.T) {
+	if !Available {
+		t.Skip("no JIT on this platform")
+	}
+	noGC(t)
+	keys := []int64{1, 3, 3, 3, 7, 7, 9}
+	ids := []uint64{11, 12, 13, 14, 15, 16, 17}
+	rows := make([][]tvalue, len(keys))
+	for i, k := range keys {
+		rows[i] = []tvalue{{Typ: tvInt, I: k}, {Typ: tvInt, I: 1 << (4 * i)}}
+	}
+	sort := &VSort{Ints: unsafe.Pointer(unsafe.SliceData(keys)), Rows: unsafe.Pointer(unsafe.SliceData(rows)),
+		Ids: unsafe.Pointer(unsafe.SliceData(ids)), N: int64(len(keys))}
+	other := [][]tvalue{{{Typ: tvInt, I: 5}, {Typ: tvInt, I: 5}}}
+	cursor := func(s *VSort) *VCursor {
+		return &VCursor{Rows: unsafe.Pointer(unsafe.SliceData(other)), N: 1, Pos: 0, Last: 0, Ok: 1, Adv: 1, Rewind: 1, Mask: ^uint64(0),
+			Sort: unsafe.Pointer(s), SortLo: -1}
+	}
+	// r2 = the sum of the run's column 1, each row a digit of its own.
+	prog := []VInsn{
+		{Op: VSortSeek, A: 0, B: 0},
+		{Op: VRewind, A: 0, T: 6},
+		{Op: VColumn, A: 0, B: 1, C: 1},
+		{Op: VAdd, A: 1, B: 2, C: 2},
+		{Op: VNext, A: 0, T: 2},
+		{Op: VExit},
+		{Op: VExit},
+	}
+	for _, c := range []struct {
+		key    int64
+		lo, n  int
+		sum    int64
+		wantPC int
+	}{
+		{0, 0, 0, 0, 6}, {1, 0, 1, 0x1, 5}, {2, 1, 0, 0, 6}, {3, 1, 3, 0x1110, 5}, {7, 4, 2, 0x110000, 5}, {8, 6, 0, 0, 6},
+		{9, 6, 1, 0x1000000, 5}, {10, 7, 0, 0, 6},
+	} {
+		regs := []tvalue{{Typ: tvInt, I: c.key}, {Typ: tvInt}, {Typ: tvInt}}
+		cur := cursor(sort)
+		pc := runVMCursor(t, prog, regs, nil, cur, 0)
+		if pc != c.wantPC || cur.SortLo != int64(c.lo) || cur.N != int64(c.n) || regs[2].I != c.sum ||
+			cur.Rows != unsafe.Add(sort.Rows, c.lo*24) || cur.Rowids != unsafe.Add(sort.Ids, c.lo*8) {
+			t.Errorf("key %d: pc %d lo %d n %d sum %#x, want pc %d lo %d n %d sum %#x", c.key, pc, cur.SortLo, cur.N, regs[2].I,
+				c.wantPC, c.lo, c.n, c.sum)
+		}
+	}
+	for _, c := range []struct {
+		name string
+		key  tvalue
+		s    *VSort
+	}{
+		{"a REAL key", tvalue{Typ: tvReal, F: 3}, sort},
+		{"a NULL key", tvalue{Typ: tvNull}, sort},
+		{"no Sort", tvalue{Typ: tvInt, I: 3}, nil},
+	} {
+		regs := []tvalue{c.key, {Typ: tvInt}, {Typ: tvInt}}
+		cur := cursor(c.s)
+		if pc := runVMCursor(t, prog, regs, nil, cur, 0); pc != 0 || cur.SortLo != -1 || cur.N != 1 || cur.Rows != unsafe.Pointer(unsafe.SliceData(other)) {
+			t.Errorf("%s: pc %d lo %d n %d, want an exit with the cursor untouched", c.name, pc, cur.SortLo, cur.N)
+		}
+	}
+	empty := []VInsn{{Op: VSortEmpty, A: 0, T: 2}, {Op: VExit}, {Op: VExit}}
+	for _, c := range []struct {
+		name   string
+		s      *VSort
+		wantPC int
+	}{{"rows", sort, 1}, {"none", &VSort{}, 2}, {"no Sort", nil, 0}} {
+		if pc := runVMCursor(t, empty, []tvalue{{}}, nil, cursor(c.s), 0); pc != c.wantPC {
+			t.Errorf("VSortEmpty, %s: pc %d, want %d", c.name, pc, c.wantPC)
 		}
 	}
 }

@@ -112,6 +112,9 @@ type vmJIT struct {
 	// (lowerIdxSeeks), and idxs the index idxFor last worked out for it.
 	idxSpecs []*idxSeekSpec
 	idxs     []atomic.Pointer[vmIdx]
+	// sortSeeks is, per cursor number, the sort of the OpSortedSeek native
+	// code makes over the cursor's sorted rows (lowerSortSeeks).
+	sortSeeks []*sortedSeekHint
 
 	// inSlots is the subquery cache slot of each VInSub's set, its B.
 	inSlots []int
@@ -474,6 +477,8 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 			idxPCs = append(idxPCs, pc)
 		}
 	}
+	sortSeeks, sortPCs := lowerSortSeeks(prog, vp, idxSpecs)
+	idxPCs = append(idxPCs, sortPCs...)
 	for _, q := range idxPCs {
 		if !entry[q] {
 			entry[q] = true
@@ -562,7 +567,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 		}
 	}
 	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams + len(outer) + 2*len(subs), params: nParams, outer: outer, subs: subs, entry: entry, marked: marked, native: native, updAt: updAt,
-		segCap: segCap, segNeed: segNeed, rowidSeeks: rowidSeeks, walkScan: walkScan, inSlots: inSlots, idxSpecs: idxSpecs,
+		segCap: segCap, segNeed: segNeed, rowidSeeks: rowidSeeks, walkScan: walkScan, inSlots: inSlots, idxSpecs: idxSpecs, sortSeeks: sortSeeks,
 		aggAt: agg.at, aggSort: agg.sort, aggLo: agg.lo, aggHi: agg.hi, aggKey: agg.key, aggKeyLo: agg.keyLo, aggKeyN: agg.keyN}
 	if segCap != nil {
 		jx.tabs = make([]atomic.Pointer[vmTab], len(segCap))
@@ -705,7 +710,8 @@ func isCursorOpen(op OpCode) bool {
 // vmCursorOp reports whether op reads or moves its cursor (A).
 func vmCursorOp(op jit.VOp) bool {
 	switch op {
-	case jit.VColumn, jit.VRowid, jit.VNext, jit.VRewind, jit.VOpen, jit.VClose, jit.VSeekRowid, jit.VSeekIdx, jit.VSeekRewind, jit.VNullRow:
+	case jit.VColumn, jit.VRowid, jit.VNext, jit.VRewind, jit.VOpen, jit.VClose, jit.VSeekRowid, jit.VSeekIdx, jit.VSeekRewind, jit.VNullRow,
+		jit.VSortSeek, jit.VSortEmpty:
 		return true
 	}
 	return false
@@ -1932,7 +1938,7 @@ func flag(b bool) int64 {
 	return 0
 }
 
-// resetVCursor is *jc = jit.VCursor{Last: -1}, storing a pointer field only
+// resetVCursor is *jc = jit.VCursor{Last: -1, SortLo: -1}, storing a pointer field only
 // where it holds one: a whole-struct store is a bulk write barrier on every
 // entry while the collector runs.
 func resetVCursor(jc *jit.VCursor) {
@@ -1957,8 +1963,11 @@ func resetVCursor(jc *jit.VCursor) {
 	if jc.Segs != nil {
 		jc.Segs = nil
 	}
+	if jc.Sort != nil {
+		jc.Sort = nil
+	}
 	jc.N, jc.Pos, jc.Last, jc.Ok, jc.Dirty, jc.Rewind, jc.Adv, jc.Mask, jc.Reopen, jc.State = 0, 0, -1, 0, 0, 0, 0, 0, 0, 0
-	jc.Key, jc.Served = 0, 0
+	jc.Key, jc.Served, jc.SortLo = 0, 0, -1
 }
 
 // segModeOK reports whether cursor c can be handed over in segment mode: its
@@ -2553,6 +2562,9 @@ func (jx *vmJIT) handCursor(m *vdbe, pc, c int) {
 		}
 		jc.N, jc.Pos, jc.Ok, jc.Adv = int64(len(cur.rowids)), int64(cur.pos), 1, 1
 		jc.Mask = jitCursorMask(cur)
+		if c < len(jx.sortSeeks) && jx.sortSeeks[c] != nil {
+			handSort(cur, jc, jx.sortSeeks[c])
+		}
 		if !cur.seekReseek && cur.rowStore == nil && !cur.refillEach {
 			// A re-seeking cursor rebuilds its rows at every rewind, and
 			// so do a write-path one and an inner co-routine
@@ -2705,6 +2717,14 @@ func (jx *vmJIT) syncCursor(m *vdbe, c, exit int) {
 	if sn := &m.jsnap[c]; len(sn.row) != 0 && sn.rowCur == nil {
 		clear(sn.row) // the copy holds no row past the call
 		sn.hdr[0] = nil
+	}
+	if jc.Sort != nil && jc.SortLo >= 0 {
+		// Native code seeked the cursor (VSortSeek): its rows are the run,
+		// as sortedSeek leaves them.
+		cur := m.cursors[c]
+		s := cur.sorted
+		lo, hi := int(jc.SortLo), int(jc.SortLo+jc.N)
+		cur.rows, cur.rowids, s.base = s.rows[lo:hi:hi], s.ids[lo:hi:hi], lo
 	}
 	if jc.Dirty != 0 {
 		// The native advance moved only the position; the cursor's

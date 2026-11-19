@@ -234,6 +234,16 @@ const (
 	// the pc otherwise: a value the VDBE makes once a run, which native code
 	// copies once it is made, with r[C] saying whether it is.
 	VGuardCopy
+	// VSortSeek: the OP_SortedSeek of cursor A, which walks a row list: the
+	// cursor's rows become the run of its Sort's whose key equals the INTEGER
+	// in r[B] (Rows, Rowids and N, and SortLo where the run starts), on no row
+	// (Last -1) until the VRewind after it. Any other key, a cursor with no
+	// Sort, and the write barrier on exit.
+	VSortSeek
+	// VSortEmpty: the OP_IfEmpty of a cursor VSortSeek seeks: jump to T when
+	// its Sort, every row the cursor has, holds none. A cursor with no Sort
+	// exits.
+	VSortEmpty
 )
 
 // VCmpBr's Imm bits past the result it jumps on.
@@ -422,6 +432,20 @@ type VCursor struct {
 	// list of N pointers: the row at Pos is read from Segs[Pos] rather than
 	// Seg (a seek's run over several segments). VRowid exits.
 	Segs unsafe.Pointer
+	// Sort, when not nil, is the cursor's rows sorted on the key VSortSeek
+	// searches (a *VSort), and SortLo where its last run starts, or -1.
+	Sort   unsafe.Pointer
+	SortLo int64
+}
+
+// VSort is a row list sorted on an INTEGER key, as VSortSeek searches it: Ints
+// the N keys ascending, Rows (24-byte headers) and Ids the rows and their
+// rowids in the same order.
+type VSort struct {
+	Ints unsafe.Pointer
+	Rows unsafe.Pointer
+	Ids  unsafe.Pointer
+	N    int64
 }
 
 // VTextLit is one TEXT of a VInText list: its bytes and their length.
@@ -500,7 +524,7 @@ const (
 )
 
 const (
-	VCursorSize     = 152
+	VCursorSize     = 168
 	VCursorOffRows  = 0
 	VCursorOffN     = 8
 	VCursorOffPos   = 16
@@ -520,6 +544,12 @@ const (
 	VCursorOffSel   = 128
 	VCursorOffIdx   = 136
 	VCursorOffSegs  = 144
+	VCursorOffSort  = 152
+	VCursorOffSLo   = 160
+	VSortOffInts    = 0
+	VSortOffRows    = 8
+	VSortOffIds     = 16
+	VSortOffN       = 24
 	VIdxOffVals     = 0
 	VIdxOffNVals    = 8
 	VIdxOffStarts   = 16
