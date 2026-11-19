@@ -2870,9 +2870,11 @@ func seriesBestIndexCost(nArgs int) (rRun, nOut logEst) {
 // seriesOrderConsumed is seriesBestIndex's orderByConsumed for item i called
 // with nArgs arguments. allocateIndexInfo hands a module the ORDER BY only when
 // every term but a constant is a bare column of it, none NULLS FIRST; the
-// module consumes it when START and STOP are given and the first is its VALUE.
-// ok is false for a descending one, which this engine's ascending walk of the
-// series does not follow, and a COLLATE on the item's column, not modelled.
+// module consumes it when START and STOP are given and the first is its VALUE,
+// in either direction. C then walks the series descending (idxNum 0x08) where
+// this engine walks it ascending and sorts; a series repeats no value, so both
+// hand on the same rows in the same order. ok is false for a COLLATE on the
+// item's column, not modelled.
 func seriesOrderConsumed(sort *whereSortCtl, i, nArgs int) (ordered, ok bool) {
 	if sort == nil || nArgs < 2 {
 		return false, true
@@ -2895,9 +2897,6 @@ func seriesOrderConsumed(sort *whereSortCtl, i, nArgs int) (ordered, ok bool) {
 	}
 	if first == nil || first.col != 0 {
 		return false, true
-	}
-	if first.desc {
-		return false, false
 	}
 	return true, true
 }

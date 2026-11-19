@@ -111,3 +111,45 @@ func TestSeriesFlattenedOrder(t *testing.T) {
 		}
 	}
 }
+
+// TestSeriesDescOrder: seriesBestIndex consumes an ORDER BY (or GROUP BY
+// taking its direction) on the series' value descending as well as ascending,
+// so an order-reading aggregate over a join the planner arranges around it
+// answers (#283). Each answer is C 3.53.3's, taken from its shell.
+func TestSeriesDescOrder(t *testing.T) {
+	db, err := Create(filepath.Join(t.TempDir(), "s.musq"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, q := range []string{
+		`CREATE TABLE mid(a INT, b INT)`,
+		`INSERT INTO mid SELECT value, value % 5 FROM generate_series(1, 1500)`,
+	} {
+		if err := db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	xy := `FROM generate_series(1, 12) x, generate_series(1, 12) y WHERE y.value % 5 = x.value % 4 `
+	for _, tc := range []struct{ q, want string }{
+		{`SELECT x.value, group_concat(y.value) ` + xy + `GROUP BY x.value ORDER BY x.value DESC`,
+			`12 5,10;11 3,8;10 2,7,12;9 1,6,11;8 5,10;7 3,8;6 2,7,12;5 1,6,11;4 5,10;3 3,8;2 2,7,12;1 1,6,11;`},
+		{`SELECT x.value, group_concat(y.value) ` + xy + `GROUP BY x.value ORDER BY x.value DESC LIMIT 3`,
+			`12 5,10;11 3,8;10 2,7,12;`},
+		{`SELECT x.value, y.value ` + xy + `GROUP BY x.value ORDER BY x.value DESC`,
+			`12 5;11 3;10 2;9 1;8 5;7 3;6 2;5 1;4 5;3 3;2 2;1 1;`},
+		{`SELECT x.value, group_concat(y.value) ` + xy + `AND y.value > x.value GROUP BY x.value ORDER BY x.value DESC`,
+			`10 12;9 11;8 10;7 8;6 7,12;5 6,11;4 5,10;3 8;2 7,12;1 6,11;`},
+		{`SELECT x.value, count(*), group_concat(m.a) FROM mid m, generate_series(1, 9) x
+			WHERE m.b = x.value % 5 AND m.a < 12 GROUP BY x.value ORDER BY x.value DESC`,
+			`9 2 4,9;8 2 3,8;7 2 2,7;6 3 1,6,11;5 2 5,10;4 2 4,9;3 2 3,8;2 2 2,7;1 3 1,6,11;`},
+	} {
+		_, rows, err := db.Query(tc.q, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.q, err)
+		}
+		if got := rowsText(rows); got != tc.want {
+			t.Errorf("%s:\n got %s\nwant %s", tc.q, got, tc.want)
+		}
+	}
+}
