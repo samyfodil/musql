@@ -35,6 +35,10 @@ type capture struct {
 	// that an apply caused (applied counts them) until the next commit.
 	committing, retrying bool
 	applied              uint64
+	// keep is what this transaction's schema change leaves its two
+	// scratches reducing (preCommit's r and w), which the Syncer keeps once it
+	// commits.
+	keep [2]*schemaReplay
 }
 
 // attach wires a capture onto one connection via the driver's capture seam.
@@ -55,6 +59,7 @@ func (s *Syncer) attach(conn *driver.Conn) {
 // preCommit turns the transaction's changes into ops and writes them in-txn.
 // Schema changes are replayed to verify they are deterministic.
 func (c *capture) preCommit(ctx context.Context, conn *driver.Conn, changes []engine.RowChange) error {
+	c.dropKeep()
 	c.buf = c.buf[:0]
 	cat, _, err := c.s.catalogIn(ctx, conn)
 	if err != nil {
@@ -66,6 +71,7 @@ func (c *capture) preCommit(ctx context.Context, conn *driver.Conn, changes []en
 		return fmt.Errorf("%w: this database replicates in %s mode; this node was opened in %s", ErrMode, cat.Mode, c.s.mode)
 	}
 	var w, r *scratch
+	var ops []Op
 	verify := false // a statement the scratch could not run: main must still match
 	for _, ch := range changes {
 		if ch.Kind != engine.RowSchema {
@@ -79,18 +85,21 @@ func (c *capture) preCommit(ctx context.Context, conn *driver.Conn, changes []en
 			if err != nil {
 				return err
 			}
-			ops, err := schemaOpsFrom(rows)
-			if err != nil {
+			if ops, err = schemaOpsFrom(rows); err != nil {
 				return err
 			}
-			if cat, r, err = replaySchema(ctx, ops); err != nil {
+			// From where the last schema change left them, when the log has
+			// not moved under it.
+			kr, kw := c.s.takeReplays()
+			if cat, r, err = advanceReplay(ctx, kr, ops); err != nil {
+				kw.close()
 				return err
 			}
-			defer r.close()
-			if _, w, err = replaySchema(ctx, ops); err != nil {
+			defer c.closeUnkept(r)
+			if _, w, err = advanceReplay(ctx, kw, ops); err != nil {
 				return err
 			}
-			defer w.close()
+			defer c.closeUnkept(w)
 		}
 		if words := sqlWords(ch.SQL); c.s.mode == modeCRDT && words["CREATE"] && words["TRIGGER"] {
 			return fmt.Errorf("%w: %s: triggers are not replicated in CRDT mode", errSchemaUnsupported, ch.SQL)
@@ -183,8 +192,34 @@ func (c *capture) preCommit(ctx context.Context, conn *driver.Conn, changes []en
 	if err := c.flush(ctx); err != nil {
 		return err
 	}
+	if r != nil && hasSchemaOp(c.flushed) && !verify {
+		// Both scratches now hold what the log will reduce to once this
+		// commits: kept for the next schema change when it does.
+		keys := schemaKeys(ops)
+		for _, op := range c.flushed {
+			if op.Kind == OpSchema {
+				keys = append(keys, schemaKey{op.Site, op.Seq})
+			}
+		}
+		c.keep = [2]*schemaReplay{{keys: keys, cat: cat.clone(), sc: r}, {keys: keys, cat: cat.clone(), sc: w}}
+	}
 	c.cat, c.committing = cat, true
 	return nil
+}
+
+// dropKeep closes what a transaction that did not commit would have kept: a
+// failed commit's seqs go to the next one's ops.
+func (c *capture) dropKeep() {
+	c.keep[0].close()
+	c.keep[1].close()
+	c.keep = [2]*schemaReplay{}
+}
+
+// closeUnkept closes sc unless the transaction keeps it (keep).
+func (c *capture) closeUnkept(sc *scratch) {
+	if c.keep[0] == nil || c.keep[0].sc != sc && c.keep[1].sc != sc {
+		sc.close()
+	}
 }
 
 func hasSchemaOp(ops []Op) bool {
@@ -538,6 +573,10 @@ func (c *capture) writeClock(ctx context.Context, op Op) error {
 // it advances the version vector for this site and hands the ops to the syncer
 // for propagation.
 func (c *capture) postCommit() {
+	if c.keep[0] != nil {
+		c.s.keepReplays(c.keep[0], c.keep[1])
+		c.keep = [2]*schemaReplay{}
+	}
 	c.committing = false
 	c.applied = c.s.store.applied.Load()
 	c.s.store.localCommitted()
@@ -575,6 +614,7 @@ func (c *capture) postCommit() {
 
 // discard drops all buffered and flushed-but-uncommitted ops on rollback.
 func (c *capture) discard() {
+	c.dropKeep()
 	c.buf = c.buf[:0]
 	c.flushed = c.flushed[:0]
 	applied := c.s.store.applied.Load()

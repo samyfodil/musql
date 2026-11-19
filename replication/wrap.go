@@ -48,6 +48,31 @@ type Syncer struct {
 
 	// images counts the images installed here (image.go).
 	images atomic.Int32
+
+	// capR and capW are what the schema ops the last committed schema change
+	// left in the log reduce to, as its capture's two scratches hold them
+	// (preCommit's r and w), for the next one to go on from; nil when none is
+	// kept.
+	capMu      sync.Mutex
+	capR, capW *schemaReplay
+}
+
+// takeReplays takes the reductions a capture kept, if any.
+func (s *Syncer) takeReplays() (r, w *schemaReplay) {
+	s.capMu.Lock()
+	defer s.capMu.Unlock()
+	r, w = s.capR, s.capW
+	s.capR, s.capW = nil, nil
+	return r, w
+}
+
+// keepReplays keeps r and w for the next capture, in place of any kept.
+func (s *Syncer) keepReplays(r, w *schemaReplay) {
+	s.capMu.Lock()
+	defer s.capMu.Unlock()
+	s.capR.close()
+	s.capW.close()
+	s.capR, s.capW = r, w
 }
 
 // catalogIn is the installed catalog as conn's transaction sees it.
@@ -230,6 +255,9 @@ func releaseSite(site string) {
 func (s *Syncer) Close() error {
 	defer releaseSite(s.site)
 	s.store.closeReplay()
+	r, w := s.takeReplays()
+	r.close()
+	w.close()
 	return s.store.db.Close()
 }
 
