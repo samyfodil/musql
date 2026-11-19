@@ -16,6 +16,7 @@ var opNames = [numOpCodes]string{
 	OpGosub:                "Gosub",
 	OpReturn:               "Return",
 	OpIfEmpty:              "IfEmpty",
+	OpVtabOmitOffset:       "VtabOmitOffset",
 	OpJIT:                  "JIT",
 	OpInit:                 "Init",
 	OpSegOrderLimit:        "SegOrderLimit",

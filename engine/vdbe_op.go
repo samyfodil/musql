@@ -745,6 +745,13 @@ const (
 	// P3, unless it already is.
 	OpIfEmpty
 
+	// OpVtabOmitOffset P1, P2: r[P2] = 0 when the virtual table cursor P1 was
+	// filtered by a module that took the statement's OFFSET and skipped those
+	// rows itself, r[P2] being that OFFSET's counter: wherecode.c's "Zero
+	// OFFSET counter" (bOmitOffset). Coded after the cursor's OpRewind, where
+	// this engine filters it.
+	OpVtabOmitOffset
+
 	// OpJIT never appears in a compiled program. vdbe_jit.go puts it, in a
 	// COPY of the program that only run() dispatches on, at each pc where the
 	// VDBE enters the program's native code -- so an instruction with no
@@ -1060,6 +1067,10 @@ type derivedSource struct {
 	// (vtab_stream.go): its loop is rewound once a run, or once an open for a
 	// correlated source, and nothing reorders, seeks or sweeps its rows.
 	vtabStream bool
+	// vtabOffset, when positive, is the statement's OFFSET, offered to a
+	// streamed vtab with its LIMIT (vtabFilterArgs); an OpVtabOmitOffset
+	// follows the cursor's OpRewind.
+	vtabOffset int64
 	// vtabTrig is the trigger context vtab was resolved under (c.trig at the
 	// emitting compile), nil outside a trigger body. A table-valued function's
 	// arguments are compiled at run time (buildVtabConstraints /

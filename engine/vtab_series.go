@@ -60,6 +60,7 @@ const (
 	seriesOrderDesc = 0x0008
 	seriesOrderAsc  = 0x0010
 	seriesHasLimit  = 0x0020
+	seriesHasOffset = 0x0040
 	seriesValueEq   = 0x0080
 	seriesValueGE   = 0x0100
 	seriesValueGT   = 0x0200
@@ -141,15 +142,22 @@ func (seriesTable) BestIndex(info *VtabIndexInfo) error {
 	// taken with another constraint left unused is a plan whereLoopAddVirtualOne
 	// refuses ("*pbRetryLimit = 1"), calling xBestIndex again without it.
 	limit := slices.IndexFunc(info.Constraints, func(c VtabConstraint) bool { return c.Op == VtabLimit })
+	offset := slices.IndexFunc(info.Constraints, func(c VtabConstraint) bool { return c.Op == VtabOffset })
 	for i := range info.Constraints {
-		if limit >= 0 && i != limit && i != low && i != high && info.Usage[i].ArgvIndex == 0 {
+		if limit >= 0 && i != limit && i != offset && i != low && i != high && info.Usage[i].ArgvIndex == 0 {
 			limit = -1
 		}
 	}
+	// The OFFSET follows it, and Filter skips those values (omit).
 	if limit >= 0 {
 		argv++
 		info.Usage[limit].ArgvIndex = argv
 		idxNum |= seriesHasLimit
+		if offset >= 0 {
+			argv++
+			info.Usage[offset] = VtabConstraintUsage{ArgvIndex: argv, Omit: true}
+			idxNum |= seriesHasOffset
+		}
 	}
 	// With START and STOP the module consumes an ORDER BY led by its value
 	// and walks the series that way, which a LIMIT makes observable.
@@ -249,9 +257,12 @@ func (c *seriesCursor) Filter(idxNum int, _ string, argv []Value) error {
 			c.step = 1
 		}
 	}
-	limit := int64(-1)
+	limit, offset := int64(-1), int64(0)
 	if idxNum&seriesHasLimit != 0 {
 		limit = seriesInt(next())
+	}
+	if idxNum&seriesHasOffset != 0 {
+		offset = seriesInt(next())
 	}
 	// A value constraint with no bound on that side starts from the whole
 	// int64 range, which it then narrows.
@@ -321,7 +332,19 @@ func (c *seriesCursor) Filter(idxNum int, _ string, argv []Value) error {
 		}
 		desc = !desc
 	}
-	// seriesFilter's LIMIT: no more values than the statement reads.
+	// seriesFilter's OFFSET, then its LIMIT: no more values than the
+	// statement reads.
+	if offset > 0 {
+		if steps < uint64(offset) {
+			return nil
+		}
+		if desc {
+			base = int64(uint64(base) - uint64(offset)*step)
+		} else {
+			base = int64(uint64(base) + uint64(offset)*step)
+		}
+		steps -= uint64(offset)
+	}
 	if limit == 0 {
 		return nil
 	}

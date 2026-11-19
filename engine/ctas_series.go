@@ -89,7 +89,7 @@ func (p *ReadOnlyPager) ctasSeriesSegments(sel *SelectStmt, cols []columnInfo) (
 	if err != nil {
 		return nil, 0, false
 	}
-	sc, err := dsPager.startVtabStream(*ds.vtab, nil, nil, ds.vtabTrig, m, nil)
+	sc, err := dsPager.startVtabStream(*ds.vtab, nil, nil, ds.vtabTrig, m, nil, 0)
 	if err != nil || sc == nil {
 		return nil, 0, false
 	}
