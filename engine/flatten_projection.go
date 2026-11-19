@@ -639,6 +639,11 @@ func (p *ReadOnlyPager) r41Arm(stmt *SelectStmt, i int, it FromItem, body *Selec
 				!nondet && r41MaySubtype(c.Expr) {
 				return nil, false
 			}
+			// sqlite3ColumnsFromExprList names an unaliased item that peels to
+			// a column ("g COLLATE nocase") by that column, not by its text.
+			if _, peeled := skipCollateAndLikely(c.Expr).(ColumnExpr); peeled && !c.HasAlias {
+				return nil, false
+			}
 			rw, ok := r41Rewrite(c.Expr, inBody)
 			if !ok {
 				return nil, false
