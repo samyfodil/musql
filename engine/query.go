@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -576,16 +577,19 @@ func (p *ReadOnlyPager) cachePlan(sqlText string, prog *Program) {
 }
 
 // planCacheRoom makes room in m for key when it holds planCacheMax entries,
-// dropping an arbitrary one: a workload that never repeats a statement keeps
-// replacing them, and the statements a session does repeat keep finding
-// room. A dropped program is compiled again when its statement comes back.
-func planCacheRoom(m map[string]*Program, key string) {
+// dropping an arbitrary one other than keep: a workload that never repeats a
+// statement keeps replacing them, and the statements a session does repeat
+// keep finding room. A dropped program is compiled again when its statement
+// comes back.
+func planCacheRoom(m map[string]*Program, key string, keep ...string) {
 	if _, ok := m[key]; ok || len(m) < planCacheMax {
 		return
 	}
 	for k := range m {
-		delete(m, k)
-		break
+		if !slices.Contains(keep, k) {
+			delete(m, k)
+			return
+		}
 	}
 }
 
