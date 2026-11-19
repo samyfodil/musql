@@ -1035,6 +1035,18 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		e.seekRewind(pc, in)
 	case VNullRow:
 		e.nullRow(pc, in)
+	case VSortSeek:
+		e.sortSeek(pc, in)
+	case VSortEmpty:
+		a.MovRegMemD(RAX, RDI, POffCur)
+		a.MovRegMemD(R9, RAX, int32(in.A*VCursorSize)+VCursorOffSort)
+		a.TestRegReg(R9, R9)
+		e.jccStub(CondE, pc)
+		a.CmpMemDImm8(R9, VSortOffN, 0)
+		nonEmpty := len(a.buf)
+		a.emit(0x0F, 0x80|byte(CondNE), 0, 0, 0, 0)
+		e.jmpBlock(pc, in.T)
+		patch(a.buf, nonEmpty+2, len(a.buf))
 	case VInSet:
 		e.inSet(pc, in)
 	case VSubstr:
