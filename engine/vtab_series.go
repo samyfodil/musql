@@ -13,6 +13,7 @@ package engine
 import (
 	"fmt"
 	"math"
+	"slices"
 )
 
 func init() {
@@ -56,6 +57,9 @@ const (
 	seriesHasStart  = 0x0001
 	seriesHasStop   = 0x0002
 	seriesHasStep   = 0x0004
+	seriesOrderDesc = 0x0008
+	seriesOrderAsc  = 0x0010
+	seriesHasLimit  = 0x0020
 	seriesValueEq   = 0x0080
 	seriesValueGE   = 0x0100
 	seriesValueGT   = 0x0200
@@ -70,6 +74,10 @@ type seriesTable struct{}
 // streams makes generate_series a vtabStreamer: filtering it again is a few
 // integer operations.
 func (seriesTable) streams() {}
+
+// takesLimit: seriesBestIndex takes a LIMIT (series.c), and seriesFilter stops
+// after that many values.
+func (seriesTable) takesLimit() {}
 
 // BestIndex consumes at most one EQ constraint per hidden bound column
 // (start/stop/step), assigning argv slots in the fixed order start, stop, step
@@ -129,6 +137,30 @@ func (seriesTable) BestIndex(info *VtabIndexInfo) error {
 			}
 		}
 	}
+	// The LIMIT goes before the value bounds in argv, as in seriesFilter. One
+	// taken with another constraint left unused is a plan whereLoopAddVirtualOne
+	// refuses ("*pbRetryLimit = 1"), calling xBestIndex again without it.
+	limit := slices.IndexFunc(info.Constraints, func(c VtabConstraint) bool { return c.Op == VtabLimit })
+	for i := range info.Constraints {
+		if limit >= 0 && i != limit && i != low && i != high && info.Usage[i].ArgvIndex == 0 {
+			limit = -1
+		}
+	}
+	if limit >= 0 {
+		argv++
+		info.Usage[limit].ArgvIndex = argv
+		idxNum |= seriesHasLimit
+	}
+	// With START and STOP the module consumes an ORDER BY led by its value
+	// and walks the series that way, which a LIMIT makes observable.
+	if idxNum&(seriesHasStart|seriesHasStop) == seriesHasStart|seriesHasStop &&
+		len(info.OrderBy) > 0 && info.OrderBy[0].Column == seriesColValue {
+		if info.OrderBy[0].Desc {
+			idxNum |= seriesOrderDesc
+		} else {
+			idxNum |= seriesOrderAsc
+		}
+	}
 	for _, i := range []int{low, high} {
 		if i >= 0 {
 			argv++
@@ -185,9 +217,11 @@ type seriesCursor struct {
 	count, k          uint64
 }
 
-// Filter is seriesFilter (series.c:442-662) without LIMIT, OFFSET and the
-// ORDER BY flags, which this engine does not offer a module: the inputs, then
-// the range the value constraints leave, then the exact last value.
+// Filter is seriesFilter (series.c:442-662) without OFFSET, which this engine
+// does not offer a module: the inputs, then the range the value constraints
+// leave, then the exact last value, walked in the order of the ORDER BY it
+// consumed, no further than the LIMIT (vtabRowBound: the statement's LIMIT
+// plus its OFFSET).
 func (c *seriesCursor) Filter(idxNum int, _ string, argv []Value) error {
 	c.count, c.k = 0, 0
 	// Any NULL input or bound -> empty result (SQLite's documented behavior).
@@ -209,6 +243,10 @@ func (c *seriesCursor) Filter(idxNum int, _ string, argv []Value) error {
 		if c.step = seriesInt(next()); c.step == 0 {
 			c.step = 1
 		}
+	}
+	limit := int64(-1)
+	if idxNum&seriesHasLimit != 0 {
+		limit = seriesInt(next())
 	}
 	// A value constraint with no bound on that side starts from the whole
 	// int64 range, which it then narrows.
@@ -267,6 +305,23 @@ func (c *seriesCursor) Filter(idxNum int, _ string, argv []Value) error {
 			return nil
 		}
 		steps = (uint64(base) - uint64(term)) / step
+	}
+	// The ORDER BY it consumed: walked from the other end (series.c's swap of
+	// iBase and iTerm), the exact last value being base and steps apart.
+	if idxNum&seriesOrderDesc != 0 && !desc || idxNum&seriesOrderAsc != 0 && desc {
+		if desc {
+			base = int64(uint64(base) - steps*step)
+		} else {
+			base = int64(uint64(base) + steps*step)
+		}
+		desc = !desc
+	}
+	// seriesFilter's LIMIT: no more values than the statement reads.
+	if limit == 0 {
+		return nil
+	}
+	if limit > 0 && steps >= uint64(limit) {
+		steps = uint64(limit) - 1
 	}
 	// Count the rows first, to reject a pathologically large series rather than
 	// attempt to materialize it.

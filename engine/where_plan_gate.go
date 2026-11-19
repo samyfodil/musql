@@ -2871,8 +2871,9 @@ func seriesBestIndexCost(nArgs int) (rRun, nOut logEst) {
 // with nArgs arguments. allocateIndexInfo hands a module the ORDER BY only when
 // every term but a constant is a bare column of it, none NULLS FIRST; the
 // module consumes it when START and STOP are given and the first is its VALUE,
-// in either direction. C then walks the series descending (idxNum 0x08) where
-// this engine walks it ascending and sorts; a series repeats no value, so both
+// in either direction. C then walks the series descending (idxNum 0x08); this
+// engine does only under a LIMIT the module takes (vtabRowBound), and
+// otherwise walks it ascending and sorts. A series repeats no value, so both
 // hand on the same rows in the same order. ok is false for a COLLATE on the
 // item's column, not modelled.
 func seriesOrderConsumed(sort *whereSortCtl, i, nArgs int) (ordered, ok bool) {

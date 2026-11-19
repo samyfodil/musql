@@ -465,7 +465,7 @@ func cArmRowEst(body *SelectStmt, prog *Program, limit *int64, compile func(*Sel
 		return min(n, min(seed, 48)+est), true
 	}
 	if prog == nil || !prog.planNRowOK {
-		est, ok := cSeriesScanEst(body, seed, seedOK)
+		est, ok := cSeriesScanEst(body, limit != nil, seed, seedOK)
 		if !ok {
 			return 0, false
 		}
@@ -479,12 +479,16 @@ func cArmRowEst(body *SelectStmt, prog *Program, limit *int64, compile func(*Sel
 
 // cSeriesScanEst is the one loop a body with no WHERE term makes over
 // generate_series: the rows seriesBestIndex estimates for its plan, 1000 with
-// both start and stop given and a span it makes very expensive without stop
-// (series.c), on the seed path's MIN(nQueryLoop, 48) (where.c:5921, :6250).
-// Only constant arguments are followed: a column of another loop leaves one
+// both start and stop given, 2500 with start and a LIMIT, and a span it makes
+// very expensive otherwise (series.c), on the seed path's MIN(nQueryLoop, 48)
+// (where.c:5921, :6250). limited is a LIMIT on the body, which
+// sqlite3WhereAddLimit offers the module when the body's ORDER BY, if any, is
+// of its columns; followed only with no ORDER BY, and not for the left-most
+// arm of a compound, which is offered it only without an OFFSET. Only
+// constant arguments are followed: a column of another loop leaves one
 // unusable where that loop is not outside it.
-func cSeriesScanEst(body *SelectStmt, seed logEst, seedOK bool) (logEst, bool) {
-	if !seedOK || body.Where != nil || body.Distinct || len(body.From) != 1 || body.Limit != nil || body.Offset != nil || body.OffsetParam != nil {
+func cSeriesScanEst(body *SelectStmt, limited bool, seed logEst, seedOK bool) (logEst, bool) {
+	if !seedOK || body.Where != nil || body.Distinct || len(body.From) != 1 {
 		return 0, false
 	}
 	it := body.From[0]
@@ -502,8 +506,14 @@ func cSeriesScanEst(body *SelectStmt, seed logEst, seedOK bool) (logEst, bool) {
 		}
 	}
 	rows := uint64(2147483647)
-	if len(it.TableFuncArgs) >= 2 {
+	switch {
+	case len(it.TableFuncArgs) >= 2:
 		rows = 1000
+	case limited:
+		if body.Limit == nil || len(body.OrderBy) != 0 || len(body.GroupBy) != 0 {
+			return 0, false
+		}
+		rows = 2500
 	}
 	return min(seed, 48) + logEstFromInt(rows), true
 }

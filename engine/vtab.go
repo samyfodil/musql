@@ -21,6 +21,7 @@ package engine
 import (
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 )
@@ -119,7 +120,17 @@ const (
 	VtabLE
 	VtabLT
 	VtabGE
+	// VtabLimit is SQLITE_INDEX_CONSTRAINT_LIMIT, offered only to a module
+	// that takes it (vtabLimitTaker), with Column -1. Its value is the most
+	// rows the statement reads from the module: its LIMIT plus its OFFSET,
+	// since this engine applies both itself, so the module skips none.
+	VtabLimit
 )
+
+// vtabLimitTaker is a module whose BestIndex may take a VtabLimit.
+type vtabLimitTaker interface {
+	takesLimit()
+}
 
 // VtabConstraint is one candidate constraint offered to BestIndex: column
 // Column compared with operator Op. Usable is false for a constraint whose
@@ -159,6 +170,12 @@ type omittingVtabModule interface {
 	OmittedConjunct(conj []Expr, scopeName string) int
 }
 
+// VtabOrderBy is one ORDER BY term offered to BestIndex: sqlite3_index_orderby.
+type VtabOrderBy struct {
+	Column int
+	Desc   bool
+}
+
 // VtabConstraintUsage is BestIndex's per-constraint decision, parallel to
 // VtabIndexInfo.Constraints: ArgvIndex is the 1-based slot this constraint's
 // value occupies in Filter's argv (0 = not used).
@@ -179,6 +196,7 @@ type VtabConstraintUsage struct {
 type VtabIndexInfo struct {
 	Constraints []VtabConstraint      // input: candidate constraints
 	Usage       []VtabConstraintUsage // output: parallel to Constraints
+	OrderBy     []VtabOrderBy         // input: the statement's ORDER BY, offered with a VtabLimit only
 	IdxNum      int                   // output: opaque plan number for Filter
 	IdxStr      string                // output: opaque plan string for Filter
 
@@ -527,7 +545,16 @@ func (p *ReadOnlyPager) vtabFilterArgs(it FromItem, cols []columnInfo, tab Virtu
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	info = &VtabIndexInfo{Constraints: constraints, Usage: make([]VtabConstraintUsage, len(constraints))}
+	var orderBy []VtabOrderBy
+	if _, ok := tab.(vtabLimitTaker); ok && len(loops) == 0 {
+		var n int64
+		if n, orderBy, ok = vtabRowBound(it, cols, constraints); ok {
+			constraints = append(constraints, VtabConstraint{Column: -1, Op: VtabLimit, Usable: true, Omitted: true})
+			rhsVals = append(rhsVals, Value{Typ: Int, I: n})
+			rhsFrom = append(rhsFrom, -1)
+		}
+	}
+	info = &VtabIndexInfo{Constraints: constraints, Usage: make([]VtabConstraintUsage, len(constraints)), OrderBy: orderBy}
 	if err := tab.BestIndex(info); err != nil {
 		return nil, nil, nil, err
 	}
@@ -557,6 +584,61 @@ func (p *ReadOnlyPager) vtabFilterArgs(it FromItem, cols []columnInfo, tab Virtu
 		}
 	}
 	return info, argv, argvFrom, nil
+}
+
+// vtabRowBound is the LIMIT sqlite3WhereAddLimit offers a virtual table, as a
+// count of rows (the LIMIT plus the OFFSET), when its conditions hold: a LIMIT
+// on a statement that is not an aggregate, DISTINCT, compound or window query,
+// whose FROM is this one item; every WHERE term one passed to xBestIndex, a
+// constraint on a column of the item with a right-hand side of no other item
+// (cs, all usable), a BETWEEN by its two children; and an ORDER BY, if any, of
+// the item's columns with no NULLS placement against the direction, which is
+// offered with it.
+// false for a LIMIT that does not bound the rows (negative), and for anything
+// this does not follow.
+func vtabRowBound(it FromItem, cols []columnInfo, cs []VtabConstraint) (int64, []VtabOrderBy, bool) {
+	s := it.vtabSelect
+	if s == nil || s.Limit == nil || s.LimitParam != nil || s.OffsetParam != nil || *s.Limit < 0 ||
+		len(s.From) != 1 || len(s.Compound) != 0 || s.Distinct || selectIsAggregateQuery(s) ||
+		// sqlite3WindowRewrite moved the FROM of a window query into a
+		// subquery, so the select WHERE runs for has no virtual table.
+		cHasWindow(s) {
+		return 0, nil, false
+	}
+	name := it.Alias
+	if name == "" {
+		name = it.Table
+	}
+	for _, conj := range it.tvfWhere {
+		if b, ok := conj.(BetweenExpr); ok && !b.Not {
+			continue // its children follow (withVtabWhere)
+		}
+		if _, _, _, ok := matchVtabConstraint(conj, cols, name); !ok {
+			return 0, nil, false
+		}
+	}
+	for _, c := range cs {
+		if !c.Usable {
+			return 0, nil, false
+		}
+	}
+	var orderBy []VtabOrderBy
+	for _, o := range s.OrderBy {
+		// KEYINFO_ORDER_BIGNULL: NULLs placed against the direction.
+		ci, ok := vtabColMatch(o.Expr, cols, name)
+		if !ok || o.NullsFirst() == o.Desc {
+			return 0, nil, false
+		}
+		orderBy = append(orderBy, VtabOrderBy{Column: ci, Desc: o.Desc})
+	}
+	n := *s.Limit
+	if s.Offset != nil && *s.Offset > 0 {
+		if n > math.MaxInt64-*s.Offset {
+			return 0, nil, false
+		}
+		n += *s.Offset
+	}
+	return n, orderBy, true
 }
 
 // materializeWritableVtab reads a writable virtual table's rows from the real
