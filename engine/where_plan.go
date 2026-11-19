@@ -116,6 +116,10 @@ type whereItem struct {
 	// in place of every b-tree loop. See wherePlanVtabItem.
 	vtab             bool
 	vtabRun, vtabOut logEst
+	// vtabSeries is a generate_series item, and vtabOrdered its
+	// orderByConsumed (seriesBestIndex): the statement's ORDER BY, which
+	// allocateIndexInfo handed it, is satisfied by the loop.
+	vtabSeries, vtabOrdered bool
 }
 
 // whereSubOB is one term of a subquery's ORDER BY: col is iOrderByCol-1, the
@@ -252,7 +256,7 @@ func wherePlanOrder(in wherePlanInput) (order []int, keys []*autoIndexKey, nRow 
 		if in.items[i].cols == nil || (len(in.items[i].idxs) == 0 && !in.items[i].vtab) {
 			return nil, nil, 0, false
 		}
-		if in.items[i].vtab && in.sort != nil {
+		if in.items[i].vtab && !in.items[i].vtabSeries && in.sort != nil {
 			// wherePathSatisfiesOrderBy's WHERE_VIRTUALTABLE arm reads the
 			// module's orderByConsumed. jsonEachBestIndex consumes only an
 			// ORDER BY of its own rowid, ascending (json.c:5486), which is

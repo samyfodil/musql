@@ -439,6 +439,17 @@ func selectNamesFromItem(s *SelectStmt, name string) bool {
 	return found
 }
 
+// r41MaySubtype reports whether e calls a function that may hand back a
+// subtype. A flattened copy of it loses that subtype in C (the soft COLLATE
+// substExpr adds codes OP_ClrSubtype, expr.c TK_COLLATE), which a copy here
+// does not model.
+func r41MaySubtype(e Expr) bool {
+	return !walkExprShallow(e, func(f FuncExpr) bool {
+		name := r33sFoldIdent(f.Name)
+		return !strings.HasPrefix(name, "json") && udfs[name] == nil
+	})
+}
+
 // r41FlattenPlainJoin reports whether a body without random() is still one
 // this rewrite flattens as C does: a join whose result columns are bare
 // columns or named, none calling a function that may hand back a subtype (a
@@ -458,11 +469,7 @@ func r41FlattenPlainJoin(stmt, body *SelectStmt) bool {
 		if !c.HasAlias || c.Alias == "" {
 			return false
 		}
-		subtyped := !walkExprShallow(c.Expr, func(f FuncExpr) bool {
-			name := r33sFoldIdent(f.Name)
-			return !strings.HasPrefix(name, "json") && udfs[name] == nil
-		})
-		if subtyped {
+		if r41MaySubtype(c.Expr) {
 			return false
 		}
 	}

@@ -352,9 +352,9 @@ type r41DerivedCol struct {
 	base string
 	// expr, when non-nil, is a result column that is not a bare column,
 	// rewritten onto the base table's name in the parent: substExpr copies it
-	// into every reference (select.c:3797). Only a body calling random() or
-	// randomblob() is flattened with one (r41Arm), since only there is the copy
-	// observable -- each copy is evaluated on its own.
+	// into every reference (select.c:3797). One that may hand back a subtype
+	// is copied only from a body calling random() or randomblob(), where each
+	// copy being evaluated on its own is what C answers (r41MaySubtype).
 	expr Expr
 	// colRef marks an expr that is a bare column of a body item: its copy
 	// keeps the column's own collation and affinity (substExpr adds no
@@ -619,6 +619,7 @@ func (p *ReadOnlyPager) r41Arm(stmt *SelectStmt, i int, it FromItem, body *Selec
 		}
 		return ColumnExpr{Qualifier: f.alias, Name: decl}, true
 	}
+	nondet := selectCallsNondeterministicFunc(body)
 	for _, c := range body.Columns {
 		if c.Star {
 			if c.StarQualifier != "" && !equalFoldName(c.StarQualifier, bName) {
@@ -634,7 +635,13 @@ func (p *ReadOnlyPager) r41Arm(stmt *SelectStmt, i int, it FromItem, body *Selec
 		}
 		ce, isCol := c.Expr.(ColumnExpr)
 		if !isCol {
-			if names != nil || !selectCallsNondeterministicFunc(body) || containsAggregate(c.Expr) || exprHasWindow(c.Expr) {
+			if names != nil || containsAggregate(c.Expr) || exprHasWindow(c.Expr) ||
+				!nondet && r41MaySubtype(c.Expr) {
+				return nil, false
+			}
+			// sqlite3ColumnsFromExprList names an unaliased item that peels to
+			// a column ("g COLLATE nocase") by that column, not by its text.
+			if _, peeled := skipCollateAndLikely(c.Expr).(ColumnExpr); peeled && !c.HasAlias {
 				return nil, false
 			}
 			rw, ok := r41Rewrite(c.Expr, inBody)
