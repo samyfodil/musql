@@ -482,7 +482,8 @@ func (p *ReadOnlyPager) execShaped(stmt *SelectStmt, sqlText string, args []Valu
 	if prog := m[key]; prog != nil && shapeNamesSpelled(prog.ColNames, sh, sqlText, toks) {
 		prog.shape = sh
 		if ik := shapeIndexKey(shapeKey(sqlText, lits, "")); m[ik] == nil {
-			planCacheRoom(m, ik)
+			// The shape's program, just stored, stays: the index names it.
+			planCacheRoom(m, ik, key)
 			m[ik] = &Program{shape: sh}
 		}
 	}
