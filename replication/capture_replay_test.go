@@ -2,8 +2,10 @@ package replication
 
 import (
 	"context"
+	"database/sql"
 	"slices"
 	"testing"
+	"time"
 )
 
 // TestCaptureKeepsSchemaReduction: a local schema change goes on from the
@@ -15,14 +17,36 @@ func TestCaptureKeepsSchemaReduction(t *testing.T) {
 	ctx := context.Background()
 	c := newCluster(t)
 	a := c.open("a")
-	c.open("b")
 	s := syncerOf(t, a)
-	check := func(step string, wantKept bool) {
+	// The log's schema ops, read through db: the store's own connection is
+	// its sync loop's.
+	logOps := func(db *sql.DB) []Op {
 		t.Helper()
-		ops, err := s.store.schemaOps(ctx)
+		rows, err := db.Query(schemaOpsQuery)
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer rows.Close()
+		var all [][]any
+		for rows.Next() {
+			r := make([]any, 4)
+			if err := rows.Scan(&r[0], &r[1], &r[2], &r[3]); err != nil {
+				t.Fatal(err)
+			}
+			all = append(all, r)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		ops, err := schemaOpsFrom(all)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ops
+	}
+	check := func(step string, wantKept bool) {
+		t.Helper()
+		ops := logOps(a)
 		r, w := s.takeReplays()
 		defer s.keepReplays(r, w)
 		if r == nil {
@@ -94,10 +118,29 @@ func TestCaptureKeepsSchemaReduction(t *testing.T) {
 	c.exec("a", `CREATE TABLE t4(x)`)
 	check("after a rollback", true)
 
-	// A peer's schema op lands after the kept ones: the next local change goes
-	// on from them through it.
+	// A peer's schema ops land after the kept ones: the next local change goes
+	// on from them through them. Opened only now, so that none of its ops can
+	// land between two of the local changes above, which would leave the kept
+	// reductions behind the log and a full replay the right answer.
+	b := c.open("b")
 	c.exec("b", `CREATE TABLE fromb(y)`)
-	c.converge("fromb\n", `SELECT name FROM sqlite_master WHERE name = 'fromb'`)
+	siteOps := func(db *sql.DB) int {
+		n := 0
+		for _, op := range logOps(db) {
+			if op.Site == "b" {
+				n++
+			}
+		}
+		return n
+	}
+	// Every one of b's: one arriving after the change below would leave what
+	// it keeps behind the log.
+	for deadline := time.Now().Add(10 * time.Second); siteOps(a) < siteOps(b); {
+		if time.Now().After(deadline) {
+			t.Fatalf("a holds %d of b's %d schema ops", siteOps(a), siteOps(b))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	c.exec("a", `CREATE INDEX t4_x ON t4(x)`)
 	check("after a peer's", true)
 	c.converge("t4_x\n", `SELECT name FROM sqlite_master WHERE name = 't4_x'`, schemaQ)
