@@ -1995,6 +1995,7 @@ func (p *ReadOnlyPager) resolveCorrelatedCTESource(c *compiler, state *joinDesug
 		// next would have counted again.
 		if perr == nil && p.refCountSum() == counts {
 			b.uncorrelated.Store(true)
+			b.probe.Store(prog)
 		}
 		return joinSource{}, false, nil
 	}
@@ -2240,11 +2241,18 @@ func (p *ReadOnlyPager) cteSchemaColsIn(name string, b *cteBinding, outer *compi
 		schemaOnly.LimitParam, schemaOnly.OffsetParam = nil, nil
 		target = &schemaOnly
 	}
-	leave := p.enterFromBody()
-	prog, perr := compileSubProgram(p, target, outer)
-	leave()
-	if perr != nil {
-		return nil, perr // already wrapped errVDBEUnsupported/errVDBESemantic
+	// The program resolveCorrelatedCTESource compiled, in this scope, and
+	// found binds nothing outside the body: this compile's, but for an outer
+	// it does not bind.
+	prog := b.probe.Load()
+	if prog == nil || target != b.core || b.recursive != nil || outer != nil {
+		leave := p.enterFromBody()
+		var perr error
+		prog, perr = compileSubProgram(p, target, outer)
+		leave()
+		if perr != nil {
+			return nil, perr // already wrapped errVDBEUnsupported/errVDBESemantic
+		}
 	}
 	// A CTE body may have its own WITH, and derivedColumnInfos re-resolves the
 	// body's FROM, so push it here too, as resolveDerivedSource does:
