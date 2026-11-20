@@ -30,8 +30,10 @@ type vdbe struct {
 	// turns back.
 	intr *atomic.Bool
 
-	// cmpText is compareAffinity's last two numbers and their text.
-	cmpText [2]cmpTextMemo
+	// cmpText is compareAffinity's last numbers and their text, cmpTextNext
+	// the entry the next replaces.
+	cmpText     [8]cmpTextMemo
+	cmpTextNext uint8
 
 	// jitErr is an error native code's return found taking a cursor back
 	// (syncIdxSeek), which the run returns.
@@ -3842,16 +3844,10 @@ func (m *vdbe) jumpIf(reg, jumpIfNull int, wantTrue bool) bool {
 	return isTruthy(v) == wantTrue
 }
 
-// compareOp implements the six comparison opcodes, OP_Eq..OP_Ge at the value
-// level: P5's affinity nibble is applied to local copies of both operands
-// (never the registers), then compared under P4's collation. With p5NullEq
-// (IS / IS NOT) NULLs compare equal and the result is definite; otherwise a
-// NULL operand yields NULL in store mode, or jumps iff p5JumpIfNull. jump is
-// false in store mode (the result went to r[P2]).
 // compareAffinity is applyAffinityToValue for a comparison's operand. The
-// last two numbers given TEXT affinity are kept with their text: a constant
-// compared with every row of a TEXT column, or a BETWEEN's two, is rendered
-// once, as C's register keeps the string it was given.
+// last few numbers given TEXT affinity are kept with their text: a constant
+// compared with every row of a TEXT column, or the bounds of a few BETWEENs,
+// is rendered once, as C's register keeps the string it was given.
 func (m *vdbe) compareAffinity(v Value, aff affinity) Value {
 	if aff != affText || v.Typ != Int && v.Typ != Float {
 		return applyAffinityToValue(v, aff)
@@ -3866,8 +3862,8 @@ func (m *vdbe) compareAffinity(v Value, aff affinity) Value {
 		}
 	}
 	t := applyAffinityToValue(v, aff)
-	m.cmpText[1] = m.cmpText[0]
-	m.cmpText[0] = cmpTextMemo{typ: v.Typ, bits: bits, text: t, ok: true}
+	m.cmpText[m.cmpTextNext%uint8(len(m.cmpText))] = cmpTextMemo{typ: v.Typ, bits: bits, text: t, ok: true}
+	m.cmpTextNext++
 	return t
 }
 
@@ -3878,6 +3874,12 @@ type cmpTextMemo struct {
 	ok   bool
 }
 
+// compareOp implements the six comparison opcodes, OP_Eq..OP_Ge at the value
+// level: P5's affinity nibble is applied to local copies of both operands
+// (never the registers), then compared under P4's collation. With p5NullEq
+// (IS / IS NOT) NULLs compare equal and the result is definite; otherwise a
+// NULL operand yields NULL in store mode, or jumps iff p5JumpIfNull. jump is
+// false in store mode (the result went to r[P2]).
 func (m *vdbe) compareOp(op *Instruction) (jump bool, target int) {
 	l := m.regs[op.P3] // left operand
 	r := m.regs[op.P1] // right operand

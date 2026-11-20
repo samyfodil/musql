@@ -131,3 +131,53 @@ func TestSegJoinFiltersAgree(t *testing.T) {
 		t.Errorf("filters computed on some rows: %d, levels read back: %d", segJoinFilterRestricted.Load()-restricted, segJoinPassReuses.Load()-reused)
 	}
 }
+
+// TestSegJoinClockFilterNotKept: what a level's filters let through is kept
+// for the next run only where it cannot change between runs. A filter that
+// reads the clock -- 'now', a date function with no argument, or strftime
+// with only its format -- is computed again on every run.
+func TestSegJoinClockFilterNotKept(t *testing.T) {
+	stmts := []string{
+		"CREATE TABLE o(ok INTEGER PRIMARY KEY, pri TEXT)",
+		"CREATE TABLE l(id INTEGER PRIMARY KEY, ok INTEGER, rd TEXT)",
+	}
+	for i := 1; i <= 200; i++ {
+		stmts = append(stmts, fmt.Sprintf("INSERT INTO o VALUES(%d, '%d-PRI')", i, i%5+1))
+	}
+	for i := 1; i <= 2000; i++ {
+		stmts = append(stmts, fmt.Sprintf("INSERT INTO l VALUES(%d, %d, '%d-%02d-01')", i, i%200+1, 1990+i%60, i%12+1))
+	}
+	p := newSegPair(t, stmts...)
+	n, err := OpenWrite(p.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Discard()
+	for _, c := range []struct {
+		filter string
+		kept   bool
+	}{
+		{"l.rd < date('1994-01-01')", true},
+		{"l.rd < strftime('%Y-%m-%d', '2001-01-01')", true},
+		{"l.rd < strftime('%Y-%m-%d')", false},
+		{"l.rd < date()", false},
+		{"l.rd < date('now', '-1 day')", false},
+		{"l.rd < datetime('NOW')", false},
+	} {
+		q := "SELECT o.pri, count(*) FROM o, l WHERE o.ok = l.ok AND " + c.filter + " GROUP BY o.pri ORDER BY o.pri"
+		want := fmt.Sprint(typedRows(p.mustPlain(q)))
+		reused := segJoinPassReuses.Load()
+		for run := 1; run <= 2; run++ {
+			_, rows, err := n.Query(q, nil)
+			if err != nil {
+				t.Fatalf("%s: %v", q, err)
+			}
+			if got := fmt.Sprint(typedRows(rows)); got != want {
+				t.Errorf("%s, run %d:\n fast  %s\n plain %s", c.filter, run, got, want)
+			}
+		}
+		if kept := segJoinPassReuses.Load() != reused; kept != c.kept {
+			t.Errorf("%s: kept %v, want %v", c.filter, kept, c.kept)
+		}
+	}
+}

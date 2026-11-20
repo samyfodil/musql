@@ -1643,6 +1643,28 @@ type segJoinPassKey struct {
 	caseSensitive bool
 }
 
+// segJoinFilterRank orders a level's filters by their cost per row: a
+// column's own value (0), an expression of one column, which filterPassing
+// computes once per value (1), and any other (2).
+func segJoinFilterRank(f segJoinArg) int {
+	if f.expr == nil {
+		return 0
+	}
+	col := -2
+	for _, in := range f.expr.insns {
+		switch in.Op {
+		case OpRowid:
+			return 2
+		case OpColumn:
+			if col != -2 && col != in.P2 {
+				return 2
+			}
+			col = in.P2
+		}
+	}
+	return 1
+}
+
 // segJoinPassKeepable reports whether a level's bounds and filters let the
 // same rows through on every run over the same rows: no parameter, register
 // or subquery bound, and no filter reading a parameter or a clock.
@@ -1674,7 +1696,8 @@ func segJoinReadsClock(e *segJoinExpr) bool {
 	for _, in := range e.insns {
 		switch in.Op {
 		case OpFunction:
-			if name, ok := in.P4.(string); ok && segJoinDateFuncs[r33sFoldIdent(name)] && in.P2 == 0 {
+			// No argument, or strftime with only its format, is 'now'.
+			if name, ok := in.P4.(string); ok && segJoinDateFuncs[r33sFoldIdent(name)] && (in.P2 == 0 || in.P2 == 1 && r33sFoldIdent(name) == "strftime") {
 				return true
 			}
 		case OpString8:
@@ -2075,6 +2098,15 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 		// Filters that cannot fail are computed only on the rows the ones
 		// before them let through: which rows are skipped changes no answer.
 		restrict := !slices.ContainsFunc(fs, func(f segJoinArg) bool { return f.expr != nil && !segJoinExprCannotFail(f.expr) })
+		if restrict {
+			// None can fail, so their order changes only the cost: a filter of
+			// one column, computed once per value, goes first, leaving fewer
+			// rows to the others.
+			fs = slices.Clone(fs)
+			slices.SortStableFunc(fs, func(a, b segJoinArg) int {
+				return cmp.Compare(segJoinFilterRank(a), segJoinFilterRank(b))
+			})
+		}
 		for _, f := range fs {
 			if w.pass[i] == nil {
 				w.pass[i] = make([]bool, w.tabs[i].n)

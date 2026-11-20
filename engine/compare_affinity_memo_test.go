@@ -9,8 +9,8 @@ import (
 // TestCompareTextAffinityMemo: a number compared with a TEXT column takes
 // TEXT affinity, so it answers as the number's text would. The VDBE keeps the
 // last numbers it rendered: a BETWEEN's two constants, alternating per row,
-// and an INTEGER whose value is a REAL's bit pattern, must each still render
-// as themselves.
+// more constants than it keeps, and an INTEGER whose value is a REAL's bit
+// pattern, must each still render as themselves.
 func TestCompareTextAffinityMemo(t *testing.T) {
 	old := vmJITEnabled
 	vmJITEnabled = false
@@ -34,6 +34,8 @@ func TestCompareTextAffinityMemo(t *testing.T) {
 		{`x < 1e300 AND x > 12`, `x < '1.0e+300' AND x > '12'`},
 		{`x >= -3 AND x <> 1.5 AND x < 1.2`, `x >= '-3' AND x <> '1.5' AND x < '1.2'`},
 		{`x = id - 299 OR x = id * 0 + 1.0`, `x = CAST(id - 299 AS TEXT) OR x = '1.0'`},
+		{`x = 0.99 OR x = 1.0 OR x = 1.2 OR x = 1.49 OR x = 1.5 OR x = 12 OR x = 1 OR x = -3 OR x = 1e300 OR x = 4607182418800017408 OR x BETWEEN 1.25 AND 1.3`,
+			`x = '0.99' OR x = '1.0' OR x = '1.2' OR x = '1.49' OR x = '1.5' OR x = '12' OR x = '1' OR x = '-3' OR x = '1.0e+300' OR x = '4607182418800017408' OR x BETWEEN '1.25' AND '1.3'`},
 	} {
 		got, want := "", ""
 		for i, w := range c {
