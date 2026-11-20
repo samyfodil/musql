@@ -2643,6 +2643,9 @@ func (b *wherePlanIdxBuild) solve(nRowEst logEst) (*wherePath, bool) {
 					isOrdered, revMask = b.wherePathSatisfiesOrderBy(
 						b.sort.ob, pFrom.loops, li,
 						b.sort.groupBy, b.sort.distinctBy, false, b.sort.minMax)
+					if nLoop == 1 && nOrderBy > 0 && b.cache != nil {
+						b.cache.recordOrdered(li, len(b.loops), isOrdered)
+					}
 				} else {
 					revMask = pFrom.revLoop
 				}
@@ -2733,6 +2736,13 @@ func (b *wherePlanIdxBuild) solve(nRowEst logEst) (*wherePath, bool) {
 	best := aFrom[0]
 	best.loops = slices.Clone(best.loops)
 	return &best, true
+}
+
+func (c *whereLoopCache) recordOrdered(li, n int, isOrdered int8) {
+	if len(c.ordered) != n {
+		c.ordered = slices.Repeat([]int8{orderedUnknown}, n)
+	}
+	c.ordered[li] = isOrdered
 }
 
 // solveScratch is solve's two generations of paths and their loops, kept
