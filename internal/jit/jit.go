@@ -143,8 +143,9 @@ const (
 	// zero". Counting in the same pass is what makes the distinction without a
 	// second walk.
 	//
-	// Signed overflow is detected and recorded -- the caller declines, because
-	// SQLite switches sum() to floating point there and this cannot.
+	// acc starts from *Out, so a caller running rows in order carries the sum
+	// from one run into the next. Signed overflow is detected and recorded at
+	// the row where C SQLite's sum() would latch it.
 	POpAccSum
 	// POpSetConst: r[A] = B. The VDBE's OpInteger, and the constant halves of
 	// the three-valued-logic epilogue OR and BETWEEN compile into.
@@ -387,7 +388,7 @@ type ProgArgs struct {
 	Col      [MaxProgCols]*int64 // column bases          (offset 0)
 	N        int64               // rows                  (32)
 	Regs     *int64              // the register file      (40)
-	Out      *int64              // accumulator out        (48)
+	Out      *int64              // accumulator out, and a sum's start (48)
 	Overflow *int64              // set non-zero by POpAccSum on overflow (56)
 	Sel      *int64              // POpEmitRow's selection buffer, POpEmitVal's values (64)
 	PC       int64               // EmitVM: the pc to enter at, and on return the pc to resume at (72); EmitProgram: the service to resume after, 1-based, 0 to start

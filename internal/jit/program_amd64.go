@@ -133,12 +133,18 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	a.MovRegMem(RSI, RDI, POffRegs)
 	a.MovRegMem(RCX, RDI, POffN)
 	a.XorRegReg(R8, R8)
-	// Min/max programs seed the accumulator to avoid a first-row check.
+	// Min/max programs seed the accumulator to avoid a first-row check. A sum
+	// starts from the caller's Out, so runs in row order overflow where one
+	// run over all their rows would.
 	for _, in := range insns {
-		if in.Op == POpAccMin {
+		switch in.Op {
+		case POpAccMin:
 			a.MovRegImm64(R8, math.MaxInt64)
-		} else if in.Op == POpAccMax {
+		case POpAccMax:
 			a.MovRegImm64(R8, math.MinInt64)
+		case POpAccSum:
+			a.MovRegMem(R8, RDI, POffOut)
+			a.MovRegMem(R8, R8, 0)
 		}
 	}
 	// A step that would flag an overflow jumps to ovf instead, which ends the
