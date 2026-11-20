@@ -165,8 +165,11 @@ const (
 	// VTextCmpJump, VTextCmpSet: VCmpJump and VCmpSet over two TEXTs, ordered
 	// as bytes.Compare orders their bytes, or two INTEGERs. Any other pair
 	// exits, as do two TEXTs when ProgArgs.UTF16 is set: the engine compares
-	// those converted. Under Imm 1 (a numeric affinity) a TEXT that is a whole
-	// number exits too. Without VMTextOrder only Cond E and NE, and no Imm.
+	// those converted. Under Imm&1 (a numeric affinity) a TEXT that is a whole
+	// number exits too. With VCmpNull in Imm a NULL operand answers as
+	// VCmpBr's does: VTextCmpSet stores NULL, and VTextCmpJump falls through,
+	// or jumps to T with VCmpNullJumps too. Without VMTextOrder only Cond E
+	// and NE, and no numeric affinity.
 	VTextCmpJump
 	VTextCmpSet
 
@@ -332,12 +335,24 @@ func sdivMagic(d int64) (m int64, s uint) {
 }
 
 // vmIntCmp is a VTextCmpJump or VTextCmpSet as the VCmpJump or VCmpSet it is
-// when an operand is known to be an INTEGER: the other must be one too.
+// when an operand is known to be an INTEGER: the other must be one too, or a
+// NULL where the comparison answers one.
 func vmIntCmp(in VInsn) VInsn {
+	null, jumps := in.Imm&VCmpNull != 0, in.Imm&VCmpNullJumps != 0
+	in.Imm = 0
 	if in.Op == VTextCmpJump {
 		in.Op = VCmpJump
+		switch {
+		case null && jumps:
+			in.Imm = 2
+		case null:
+			in.Imm = 1
+		}
 	} else {
 		in.Op = VCmpSet
+		if null {
+			in.Imm = 1
+		}
 	}
 	return in
 }

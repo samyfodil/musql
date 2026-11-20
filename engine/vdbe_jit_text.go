@@ -75,9 +75,9 @@ func vmTextLowering(prog *Program, storesText func(root uint32, col int) bool) (
 				if ok == nil {
 					out, ok = make([]jit.VInsn, n), make([]bool, n)
 				}
-				var imm int64
+				imm := vmTextCmpNull(ins.P5)
 				if affinity(ins.P5&p5AffMask) >= affNumeric {
-					imm = 1
+					imm |= 1
 				}
 				cond := vmCond[ins.Op]
 				if ins.P5&p5StoreP2 == 0 {

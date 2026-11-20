@@ -110,6 +110,27 @@ func (e *vmEmitWasm) textCmp(pc int, in VInsn) {
 		}
 		e.guards(pc, e.dstNoS(in, in.C))
 	}
+	zs := e.zeroS.has(in.C)
+	nulls := in.Imm&VCmpNull != 0 && e.nullOperand(in)
+	if nulls {
+		if in.Op == VTextCmpSet {
+			for _, f := range []struct {
+				off int
+				v   int64
+			}{{0, int64(L.TypNull)}, {L.OffI, 0}, {L.OffF, 0}} {
+				w.Get(e.regs)
+				w.I64(f.v)
+				w.StoreI64(e.addr(in.C, f.off))
+			}
+			e.clearS(in.C)
+			if zs {
+				e.zeroS.add(in.C)
+			}
+		} else if in.Imm&VCmpNullJumps != 0 {
+			e.jump(in.T)
+		}
+		w.op(opElse)
+	}
 	e.loadTyp(in.A)
 	w.I32(int32(L.TypInt))
 	w.op(opI32Eq)
@@ -141,7 +162,7 @@ func (e *vmEmitWasm) textCmp(pc int, in VInsn) {
 	w.op(opI32Eqz)
 	w.op(opI32Or)
 	e.exitIf(pc)
-	if in.Imm == 1 {
+	if in.Imm&1 != 0 {
 		// Under a numeric affinity a TEXT that is a whole number is compared
 		// as one: the VDBE's.
 		e.numericTextExit(pc, in.B)
@@ -158,11 +179,17 @@ func (e *vmEmitWasm) textCmp(pc int, in VInsn) {
 	w.op(scalarCmp(in.Cond))
 	if in.Op == VTextCmpJump {
 		e.jumpIf(in.T)
-		return
+	} else {
+		w.op(opI64ExtendI32U)
+		w.Set(e.t1)
+		e.storeInt(in, in.C, e.t1)
 	}
-	w.op(opI64ExtendI32U)
-	w.Set(e.t1)
-	e.storeInt(in, in.C, e.t1)
+	if nulls {
+		e.closeIf()
+		if in.Op == VTextCmpSet {
+			e.know.wroteAny(in.C, true)
+		}
+	}
 }
 
 // equalText sets t1 to 0 when r[A]'s and r[B]'s TEXTs are the same bytes,

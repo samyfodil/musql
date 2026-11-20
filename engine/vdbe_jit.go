@@ -1396,6 +1396,19 @@ func nativeRun(vp []jit.VInsn, pc, limit int) (w int, cursor bool, reads int) {
 // lowerVM is in's native form, or VExit. Each case is the INTEGER arm of the
 // VDBE's own case for that opcode (vdbe.go), which the VDBE also tests first;
 // every other operand type exits to it.
+// vmTextCmpNull is the Imm bits by which a TEXT comparison with flags p5
+// answers a NULL operand natively, as the INTEGER one does (lowerVM): none
+// when NULLs compare equal (IS), which the VDBE answers.
+func vmTextCmpNull(p5 uint16) int64 {
+	if p5&p5NullEq != 0 {
+		return 0
+	}
+	if p5&(p5StoreP2|p5JumpIfNull) == p5JumpIfNull {
+		return jit.VCmpNull | jit.VCmpNullJumps
+	}
+	return jit.VCmpNull
+}
+
 func lowerVM(in *Instruction, nReg int) jit.VInsn {
 	exit := jit.VInsn{Op: jit.VExit}
 	ok := func(regs ...int) bool {
@@ -1448,11 +1461,12 @@ func lowerVM(in *Instruction, nReg int) jit.VInsn {
 		aff := affinity(in.P5 & p5AffMask)
 		if coll, _ := in.P4.(string); (in.Op == OpEq || in.Op == OpNe) && (aff == affNone || aff == affText) &&
 			(coll == "" || strings.EqualFold(coll, "BINARY")) {
+			null := vmTextCmpNull(in.P5)
 			if in.P5&p5StoreP2 == 0 && ok(in.P1, in.P3) {
-				return jit.VInsn{Op: jit.VTextCmpJump, A: in.P1, B: in.P3, T: in.P2, Cond: vmCond[in.Op]}
+				return jit.VInsn{Op: jit.VTextCmpJump, A: in.P1, B: in.P3, T: in.P2, Cond: vmCond[in.Op], Imm: null}
 			}
 			if in.P5&p5StoreP2 != 0 && ok(in.P1, in.P3, in.P2) {
-				return jit.VInsn{Op: jit.VTextCmpSet, A: in.P1, B: in.P3, C: in.P2, Cond: vmCond[in.Op]}
+				return jit.VInsn{Op: jit.VTextCmpSet, A: in.P1, B: in.P3, C: in.P2, Cond: vmCond[in.Op], Imm: null}
 			}
 		}
 		// Any other comparison under TEXT affinity is one of text values -- a

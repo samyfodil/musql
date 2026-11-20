@@ -213,6 +213,88 @@ func TestVMTextCmp(t *testing.T) {
 	}
 }
 
+// TestVMTextCmpNull: with VCmpNull a NULL operand answers -- the store form
+// stores NULL, the jump form falls through, or jumps with VCmpNullJumps --
+// also once the other operand is known to be an INTEGER, and with a numeric
+// affinity's bit beside it; any other pair answers or exits as without it.
+func TestVMTextCmpNull(t *testing.T) {
+	if !Available {
+		t.Skip("no JIT on this platform")
+	}
+	noGC(t)
+	text := func(s string) tvalue { return tvalue{Typ: tvText, S: []byte(s)} }
+	null, five := tvalue{Typ: tvNull}, tvalue{Typ: tvInt, I: 5}
+	cases := []struct {
+		a, b tvalue
+		eq   int // 1 equal, 0 not, -1 an exit, 2 a NULL operand
+	}{
+		{null, text("a"), 2},
+		{text("a"), null, 2},
+		{null, null, 2},
+		{five, null, 2},
+		{null, five, 2},
+		{text("a"), text("a"), 1},
+		{five, tvalue{Typ: tvInt, I: 6}, 0},
+		{text("5"), five, -1},
+		{tvalue{Typ: tvReal, F: 1}, null, 2},
+		{tvalue{Typ: tvReal, F: 1}, tvalue{Typ: tvReal, F: 1}, -1},
+	}
+	for k, c := range cases {
+		for _, imm := range []int64{VCmpNull, VCmpNull | VCmpNullJumps, 1 | VCmpNull} {
+			for _, cond := range []Cond{CondE, CondNE} {
+				want := c.eq
+				if (want == 0 || want == 1) && cond == CondNE {
+					want = 1 - want
+				}
+				regs := []tvalue{c.a, c.b, text("old")}
+				args := ProgArgs{}
+				runVM(t, []VInsn{{Op: VTextCmpSet, A: 0, B: 1, C: 2, Cond: cond, Imm: imm}, {Op: VExit}}, nil, regs, &args, 0)
+				switch {
+				case want < 0 && (args.PC != 0 || string(regs[2].S) != "old"):
+					t.Fatalf("case %d imm %d %v: set ran to pc %d, r2 %+v; want an exit", k, imm, cond, args.PC, regs[2])
+				case want == 2 && (args.PC != 1 || regs[2].Typ != tvNull || regs[2].S != nil):
+					t.Fatalf("case %d imm %d %v: set pc %d, r2 %+v; want NULL", k, imm, cond, args.PC, regs[2])
+				case want == 0 || want == 1:
+					if args.PC != 1 || regs[2].Typ != tvInt || regs[2].I != int64(want) || regs[2].S != nil {
+						t.Fatalf("case %d imm %d %v: set pc %d, r2 %+v; want %d", k, imm, cond, args.PC, regs[2], want)
+					}
+				}
+				jump := func(prog []VInsn, known []bool, regs []tvalue, at int64) {
+					t.Helper()
+					args := ProgArgs{}
+					runVM(t, prog, known, regs, &args, 0)
+					to := at + 1 // falls through
+					switch {
+					case want < 0:
+						to = at
+					case want == 2 && imm&VCmpNullJumps != 0, want == 1:
+						to = at + 2
+					}
+					if args.PC != to {
+						t.Fatalf("case %d imm %d %v: jump to pc %d; want %d", k, imm, cond, args.PC, to)
+					}
+				}
+				jump([]VInsn{{Op: VTextCmpJump, A: 0, B: 1, T: 2, Cond: cond, Imm: imm}, {Op: VExit}, {Op: VExit}}, nil, []tvalue{c.a, c.b}, 0)
+				// Known to be an INTEGER, it compares as VCmpJump and VCmpSet do.
+				if c.a.Typ == tvInt {
+					jump([]VInsn{{Op: VInt, A: 0, Imm: c.a.I}, {Op: VTextCmpJump, A: 0, B: 1, T: 3, Cond: cond, Imm: imm}, {Op: VExit}, {Op: VExit}},
+						[]bool{true, false, false, false}, []tvalue{{}, c.b}, 1)
+					regs = []tvalue{{}, c.b, text("old")}
+					args = ProgArgs{}
+					prog := []VInsn{{Op: VInt, A: 0, Imm: c.a.I}, {Op: VTextCmpSet, A: 0, B: 1, C: 2, Cond: cond, Imm: imm}, {Op: VExit}}
+					runVM(t, prog, []bool{true, false, false}, regs, &args, 0)
+					switch {
+					case want == 2 && (args.PC != 2 || regs[2].Typ != tvNull || regs[2].S != nil):
+						t.Fatalf("case %d imm %d %v: known INTEGER set pc %d, r2 %+v; want NULL", k, imm, cond, args.PC, regs[2])
+					case (want == 0 || want == 1) && (args.PC != 2 || regs[2].Typ != tvInt || regs[2].I != int64(want)):
+						t.Fatalf("case %d imm %d %v: known INTEGER set pc %d, r2 %+v; want %d", k, imm, cond, args.PC, regs[2], want)
+					}
+				}
+			}
+		}
+	}
+}
+
 // TestVMInText matches TEXTs against a list of TEXTs byte for byte, an
 // empty TEXT and an empty list included; a non-TEXT operand and UTF-16
 // comparisons exit.
