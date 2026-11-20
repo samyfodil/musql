@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"math"
 	"slices"
 	"strings"
@@ -38,11 +39,6 @@ type shapeRecorder struct {
 	noResult   bool
 	resultMade bool
 	names      []shapeName
-	// underOr is set when a hidden parameter is inside an OR: the OR's
-	// analysis (wherePlanOrToIn, the MULTI_OR order) compares its operands,
-	// and two parameters compare unequal where the literals they stand for
-	// may be equal, so such a statement is not shaped.
-	underOr bool
 }
 
 // made is how many hidden parameters the parser has made; 0 when it makes
@@ -66,6 +62,9 @@ type planShape struct {
 	pattern string
 	order   []int
 	names   []shapeName
+	// or is set when the statement has an OR, whose analysis compares
+	// literals: its key records which are equal.
+	or bool
 }
 
 // shapeName is a result column named by its spelling, which holds a literal
@@ -131,9 +130,15 @@ func (p *parser) litTok(start int, e Expr) int {
 // is -0.0, 0 - X is +0.0) and 2**63, which parseUnary folds with its "-"
 // into SMALLEST_INT64 (or, in hex, "hex literal too big"). A string is cut:
 // a TEXT bound is read when the statement runs, by the segment filters
-// (segPlanPreds) as by the loop.
+// (segPlanPreds) as by the loop, unless it holds a NUL, which the planner's
+// comparisons of operands cannot answer for (pcxConv). An integer past 31
+// bits, or one a hex literal makes negative, is a class of its own: those
+// comparisons answer for it differently.
 func shapeClass(t token) byte {
 	if t.kind == tkString {
+		if strings.IndexByte(t.str, 0) >= 0 {
+			return 0
+		}
 		return 's'
 	}
 	if t.kind != tkNumber {
@@ -150,6 +155,10 @@ func shapeClass(t token) byte {
 		return 'r'
 	case v.I >= -1 && v.I <= 1, v.I == math.MinInt64:
 		return 0
+	case v.I < 0:
+		return 'n'
+	case v.I > 0x7fffffff:
+		return 'I'
 	}
 	return 'i'
 }
@@ -254,7 +263,18 @@ func (s *shapeRecorder) param(tok int, v Value) Expr {
 	}
 	s.toks = append(s.toks, tok)
 	s.vals = append(s.vals, v)
-	return ParamExpr{Index: s.base + len(s.toks)}
+	return ParamExpr{Index: s.base + len(s.toks), shapeLit: &v}
+}
+
+// shapeOperand is e as the planner's comparisons of operands see it: a
+// shape's hidden parameter is the literal it stands for. Every statement
+// sharing the program compares the same way, since the shape key records
+// which of their literals are equal (shapeKey).
+func shapeOperand(e Expr) Expr {
+	if p, ok := e.(ParamExpr); ok && p.shapeLit != nil {
+		return LiteralExpr{Val: *p.shapeLit}
+	}
+	return e
 }
 
 // readsColumn reports whether e names a column outside any subquery.
@@ -284,17 +304,17 @@ func parseSelectShape(sql string) (*SelectStmt, *shapeRecorder, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if p.shape.resultMade && (p.shape.underOr || !shapeResultsFree(stmt, toks)) {
+	if p.shape.resultMade && !shapeResultsFree(stmt, toks) {
 		// A result column a GROUP BY, HAVING, ORDER BY or window may match
-		// is compared with them as written; a "*" moves the columns the
-		// names count; and an OR there would leave the WHERE unshaped too.
+		// is compared with them as written, and a "*" moves the columns the
+		// names count.
 		p = newParser(sql, toks)
 		p.shape = &shapeRecorder{base: plain.params.maxIndex, noResult: true}
 		if stmt, err = p.parseSelectStmt(); err != nil {
 			return nil, nil, err
 		}
 	}
-	if len(p.shape.toks) == 0 || p.shape.underOr {
+	if len(p.shape.toks) == 0 {
 		return stmt, nil, nil
 	}
 	return stmt, p.shape, nil
@@ -334,17 +354,28 @@ func literalTokens(toks []token) []token {
 // shapeKey is sql with the literals pattern marks cut out and the others kept
 // as written; with no pattern, every literal is cut out (the skeleton every
 // statement of the shape has). The text between them is kept byte for byte: an
-// unaliased result column is named by its spelling.
-func shapeKey(sql string, lits []token, pattern string) string {
+// unaliased result column is named by its spelling. Under or, a literal cut
+// out is followed by the first other literal of the same value, and the first
+// equal to it ignoring case: an OR's analysis is decided by which operands are
+// equal (wherePlanOrToIn, wherePlanCombineDisjuncts), and the planner compares
+// a hidden parameter as the literal it stands for (shapeOperand).
+func shapeKey(sql string, lits []token, pattern string, or bool) string {
 	var b strings.Builder
 	b.Grow(len(sql) + 8)
 	b.WriteString("\x00shape\x00")
+	var same, fold []int
+	if or && pattern != "" {
+		same, fold = shapeEqualLiterals(lits)
+	}
 	at := 0
 	for i, t := range lits {
 		b.WriteString(sql[at:t.Start])
 		if pattern == "" || pattern[i] == '1' {
 			b.WriteByte('\x01')
 			b.WriteByte(shapeClass(t))
+			if same != nil {
+				fmt.Fprintf(&b, "%d,%d,", same[i], fold[i])
+			}
 		} else {
 			b.WriteByte('\x02')
 			b.WriteString(sql[t.Start:t.End])
@@ -353,6 +384,70 @@ func shapeKey(sql string, lits []token, pattern string) string {
 	}
 	b.WriteString(sql[at:])
 	return b.String()
+}
+
+// hasOr reports whether toks hold the keyword OR.
+func hasOr(toks []token) bool {
+	for _, t := range toks {
+		if t.kind == tkIdent && !t.quoted && strings.EqualFold(t.text, "OR") {
+			return true
+		}
+	}
+	return false
+}
+
+// shapeEqualLiterals is, for each of lits, the first other literal of the
+// same type and value (same) and the first equal to it with ASCII case folded
+// (fold), as whereLiteralsMayCompareEqual compares them; -1 for none. Both nil
+// when no two are equal.
+func shapeEqualLiterals(lits []token) (same, fold []int) {
+	if len(lits) < 2 {
+		return nil, nil
+	}
+	keys := make([]string, len(lits))
+	for i, t := range lits {
+		keys[i] = string(shapeClass(t)) + t.str
+		if t.kind == tkNumber {
+			v, err := literalNumber(t.text)
+			if err != nil {
+				return nil, nil
+			}
+			keys[i] = fmt.Sprintf("%c%d %x", shapeClass(t), v.I, math.Float64bits(v.F))
+		}
+	}
+	first := func(key func(string) string) ([]int, bool) {
+		at := make(map[string][2]int, len(keys))
+		for i, k := range keys {
+			k = key(k)
+			if e, ok := at[k]; !ok {
+				at[k] = [2]int{i, -1}
+			} else if e[1] < 0 {
+				at[k] = [2]int{e[0], i}
+			}
+		}
+		out, any := make([]int, len(keys)), false
+		for i, k := range keys {
+			e := at[key(k)]
+			out[i] = e[0]
+			if e[0] == i {
+				out[i] = e[1]
+			}
+			any = any || out[i] >= 0
+		}
+		return out, any
+	}
+	same, s := first(func(k string) string { return k })
+	fold, f := first(func(k string) string {
+		b := []byte(k)
+		for i, c := range b {
+			b[i] = toLowerASCII(c)
+		}
+		return string(b)
+	})
+	if !s && !f {
+		return nil, nil
+	}
+	return same, fold
 }
 
 // shapePattern is the pattern of the literals rec made parameters, among
@@ -438,11 +533,11 @@ func (p *ReadOnlyPager) shapedProgram(sqlText string) (*Program, []token, []toke
 		return nil, nil, nil
 	}
 	m := p.planCacheFor()
-	idx := m[shapeIndexKey(shapeKey(sqlText, lits, ""))]
+	idx := m[shapeIndexKey(shapeKey(sqlText, lits, "", false))]
 	if idx == nil || idx.shape == nil || len(idx.shape.pattern) != len(lits) {
 		return nil, nil, nil
 	}
-	prog := m[shapeKey(sqlText, lits, idx.shape.pattern)]
+	prog := m[shapeKey(sqlText, lits, idx.shape.pattern, idx.shape.or)]
 	if prog == nil || prog.shape == nil {
 		return nil, nil, nil
 	}
@@ -471,17 +566,17 @@ func (p *ReadOnlyPager) execShaped(stmt *SelectStmt, sqlText string, args []Valu
 	}
 	lits := literalTokens(toks)
 	pattern, order := shapePattern(toks, lits, rec)
-	sh := &planShape{base: rec.base, pattern: pattern, order: order, names: rec.names}
+	sh := &planShape{base: rec.base, pattern: pattern, order: order, names: rec.names, or: hasOr(toks)}
 	params, aok := shapeArgs(args, sh, lits)
 	if !aok {
 		return nil, nil, false, nil
 	}
-	key := shapeKey(sqlText, lits, sh.pattern)
+	key := shapeKey(sqlText, lits, sh.pattern, sh.or)
 	cols, rows, err = p.execSelect(shaped, nil, params, key)
 	m := p.planCacheFor()
 	if prog := m[key]; prog != nil && shapeNamesSpelled(prog.ColNames, sh, sqlText, toks) {
 		prog.shape = sh
-		if ik := shapeIndexKey(shapeKey(sqlText, lits, "")); m[ik] == nil {
+		if ik := shapeIndexKey(shapeKey(sqlText, lits, "", false)); m[ik] == nil {
 			// The shape's program, just stored, stays: the index names it.
 			planCacheRoom(m, ik, key)
 			m[ik] = &Program{shape: sh}

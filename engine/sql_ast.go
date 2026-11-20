@@ -481,6 +481,9 @@ type CaseExpr struct {
 type ParamExpr struct {
 	Index int
 	Name  string // "" for an anonymous ?/?NNN parameter
+	// shapeLit is the literal a shape's hidden parameter stands for, which
+	// the planner compares as it would the literal (shapeOperand).
+	shapeLit *Value
 }
 
 // SubqueryExpr is a parenthesized SELECT used as a scalar expression: it

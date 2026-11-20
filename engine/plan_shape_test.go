@@ -136,6 +136,42 @@ func TestPlanShapeSharesPrograms(t *testing.T) {
 		`SELECT a FROM t WHERE c BETWEEN 'c2' AND 'c4' AND b > 3 ORDER BY a`,
 		`SELECT count(*) FROM t WHERE 5 > (b BETWEEN 2 AND 4) + 4`,
 		`SELECT count(*) FROM t WHERE 6 > (b BETWEEN 3 AND 5) + 5`,
+		// Under an OR, operands that are equal, or not, decide how it is
+		// planned: an IN, x>=A from "x=A OR x>A", or neither.
+		`SELECT a FROM t WHERE b = 2 OR b = 2 ORDER BY a`,
+		`SELECT a FROM t WHERE b = 3 OR b = 4 ORDER BY a`,
+		`SELECT a FROM t WHERE b = 5 OR b = 5 ORDER BY a`,
+		`SELECT a FROM t WHERE b = 4 OR b > 4`,
+		`SELECT a FROM t WHERE b = 4 OR b > 5`,
+		`SELECT a FROM t WHERE b = 5 OR b > 5`,
+		`SELECT a FROM t WHERE b < 3 OR b = 3`,
+		`SELECT a FROM t WHERE b < 2 OR b = 4`,
+		`SELECT a FROM t WHERE b = 2 OR b = 3 OR b = 2`,
+		`SELECT a FROM t WHERE b = 2 OR b = 3 OR b = 6`,
+		`SELECT a FROM t WHERE c = 'c1' OR c = 'C1'`,
+		`SELECT a FROM t WHERE c = 'c2' OR c = 'c2'`,
+		`SELECT a FROM t WHERE c = 'c3' OR c = 'c4'`,
+		`SELECT a FROM t WHERE c = 'c1' OR c > 'c1'`,
+		`SELECT a FROM t WHERE c = 'c2' OR c > 'C2'`,
+		`SELECT a FROM t WHERE c = 'c2' OR c > 'c3'`,
+		`SELECT a FROM t WHERE b = 3 OR a = 3`,
+		`SELECT a FROM t WHERE b = 4 OR a = 5`,
+		`SELECT a FROM t WHERE (b = 2 AND a > 10) OR (b = 2 AND a < 5)`,
+		`SELECT a FROM t WHERE (b = 3 AND a > 10) OR (b = 4 AND a < 5)`,
+		`SELECT a FROM t WHERE b = 3000000000 OR b = 3000000000`,
+		`SELECT a FROM t WHERE b = 3000000000 OR b > 3000000000`,
+		`SELECT a FROM t WHERE b = 2.5 OR b > 2.5`,
+		`SELECT a FROM t WHERE b = 3.5 OR b > 4.5`,
+		`SELECT a FROM t WHERE b = '3' OR b = 3`,
+		`SELECT a FROM t WHERE b = '4' OR b = 4`,
+		`SELECT a FROM t WHERE b = (5) OR b > 5`,
+		`SELECT a FROM t WHERE b = (5) OR b > 6`,
+		`SELECT a FROM t WHERE b = 2 OR b IN (2, 3)`,
+		`SELECT a FROM t WHERE b = 2 OR b IN (4, 3)`,
+		`SELECT t.a, u.y FROM t JOIN u ON u.x = t.b AND (u.x = 2 OR u.x = 2) ORDER BY 1, 2`,
+		`SELECT t.a, u.y FROM t JOIN u ON u.x = t.b AND (u.x = 3 OR u.x = 4) ORDER BY 1, 2`,
+		`SELECT a + 5, b FROM t WHERE b = 6 OR a = 6`,
+		`SELECT a + 6, b FROM t WHERE b = 5 OR a = 7`,
 	}
 	args := []Value{{Typ: Int, I: 4}}
 	planShapeHits.Store(0)
@@ -159,15 +195,15 @@ func TestPlanShapeSharesPrograms(t *testing.T) {
 		t.Errorf("%d statements reused a shape's program", n)
 	}
 	// The shape's program is the one kept: the second literal of a pair reused it.
-	if _, ok := p.planCacheFor()[shapeIndexKey(shapeKey(`SELECT a FROM t WHERE b = 3 ORDER BY a`, literalTokens(mustLex(t, `SELECT a FROM t WHERE b = 3 ORDER BY a`)), ""))]; !ok {
+	if _, ok := p.planCacheFor()[shapeIndexKey(shapeKey(`SELECT a FROM t WHERE b = 3 ORDER BY a`, literalTokens(mustLex(t, `SELECT a FROM t WHERE b = 3 ORDER BY a`)), "", false))]; !ok {
 		t.Error("no shape kept for a WHERE literal")
 	}
 	const text = `SELECT a FROM t WHERE c = 'c1' ORDER BY a`
-	if _, ok := p.planCacheFor()[shapeIndexKey(shapeKey(text, literalTokens(mustLex(t, text)), ""))]; !ok {
+	if _, ok := p.planCacheFor()[shapeIndexKey(shapeKey(text, literalTokens(mustLex(t, text)), "", false))]; !ok {
 		t.Error("no shape kept for a WHERE string")
 	}
 	for _, q := range []string{`SELECT a FROM t WHERE b IN (2, 4, 6) ORDER BY a`, `SELECT a FROM t WHERE b BETWEEN 2 AND 5 ORDER BY a`} {
-		if _, ok := p.planCacheFor()[shapeIndexKey(shapeKey(q, literalTokens(mustLex(t, q)), ""))]; !ok {
+		if _, ok := p.planCacheFor()[shapeIndexKey(shapeKey(q, literalTokens(mustLex(t, q)), "", false))]; !ok {
 			t.Errorf("no shape kept for %s", q)
 		}
 	}
@@ -258,13 +294,15 @@ func TestPlanShapeResultColumns(t *testing.T) {
 		{`SELECT likelihood(a > 5, 0.5), a FROM t WHERE b > 2`, `SELECT likelihood(a > 6, 0.5), a FROM t WHERE b > 2`, true},
 		{`SELECT c || 5, a * 2 FROM t WHERE b > 2`, `SELECT c || 5, a * 3 FROM t WHERE b > 2`, true},
 		// Kept as written: a GROUP BY, HAVING or ORDER BY may match a result
-		// column, a "*" moves the columns, and an OR leaves the WHERE.
+		// column, and a "*" moves the columns.
 		{`SELECT c || 5, count(*) FROM t GROUP BY c || 5`, `SELECT c || 6, count(*) FROM t GROUP BY c || 6`, false},
 		{`SELECT b + 5, count(*) FROM t GROUP BY b + 5`, `SELECT b + 6, count(*) FROM t GROUP BY b + 6`, false},
 		{`SELECT a + 5 FROM t WHERE b > 2 ORDER BY a + 5`, `SELECT a + 6 FROM t WHERE b > 2 ORDER BY a + 6`, false},
 		{`SELECT *, a + 5 FROM t WHERE b = 3`, `SELECT *, a + 6 FROM t WHERE b = 3`, false},
-		{`SELECT a > 5 OR b < 3 FROM t WHERE b > 2`, `SELECT a > 5 OR b < 3 FROM t WHERE b > 3`, true},
-		{`SELECT a > 5 OR b < 3 FROM t WHERE b > 2`, `SELECT a > 6 OR b < 4 FROM t WHERE b > 2`, false},
+		{`SELECT a > 5 OR b < 3 FROM t WHERE b > 2`, `SELECT a > 6 OR b < 4 FROM t WHERE b > 2`, true},
+		// Under an OR, which literals are equal is part of the shape.
+		{`SELECT a > 5 OR b < 3 FROM t WHERE b > 2`, `SELECT a > 5 OR b < 3 FROM t WHERE b > 3`, false},
+		{`SELECT a > 5 OR b < 3 FROM t WHERE b > 2`, `SELECT a > 7 OR b < 4 FROM t WHERE b > 9`, true},
 		{`SELECT sum(a) OVER (ORDER BY a ROWS 2 PRECEDING) * 3 FROM t`, `SELECT sum(a) OVER (ORDER BY a ROWS 2 PRECEDING) * 4 FROM t`, false},
 	}
 	for round := range 2 {
