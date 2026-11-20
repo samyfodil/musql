@@ -1674,7 +1674,8 @@ func segJoinReadsClock(e *segJoinExpr) bool {
 	for _, in := range e.insns {
 		switch in.Op {
 		case OpFunction:
-			if name, ok := in.P4.(string); ok && segJoinDateFuncs[r33sFoldIdent(name)] && in.P2 == 0 {
+			// No argument, or strftime with only its format, is 'now'.
+			if name, ok := in.P4.(string); ok && segJoinDateFuncs[r33sFoldIdent(name)] && (in.P2 == 0 || in.P2 == 1 && r33sFoldIdent(name) == "strftime") {
 				return true
 			}
 		case OpString8:
