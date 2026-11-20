@@ -776,8 +776,13 @@ func buildSegSortedVMIdx(x *vmIdx, spec *idxSeekSpec) *vmIdx {
 		}
 		b := blocks[0]
 		rows := make([]int, len(perm))
-		var vals []int64
-		var starts []int32
+		d := 1
+		for i := 1; i < len(perm); i++ {
+			if b[perm[i]] != b[perm[i-1]] {
+				d++
+			}
+		}
+		vals, starts := make([]int64, 0, d), make([]int32, 0, d+1)
 		for i, r := range perm {
 			rows[i] = int(r)
 			if i == 0 || b[r] != b[perm[i-1]] {
