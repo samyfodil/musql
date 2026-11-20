@@ -103,6 +103,10 @@ type vmJIT struct {
 	// tabs is, per cursor number, the table tabFor last worked out for it.
 	tabs []atomic.Pointer[vmTab]
 
+	// resumeOnly marks the entries only native code that kept its cursors
+	// across a stop takes (vdbe.jDefer).
+	resumeOnly []bool
+
 	// safeExit is, per pc, the entry native code that stops there resumes at
 	// keeping its cursors (vdbe.jDefer), or -1: the VDBE reaches that entry
 	// running instructions that touch none and jump nowhere.
@@ -556,6 +560,19 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	if entries == 0 {
 		return nil
 	}
+	// Past a native OpResultRow, where native code that stopped at the row
+	// keeping its cursors (vdbe.jDefer) goes on. Only that enters there: an
+	// entry that hands the cursors over anew is the one worthEntering
+	// weighed, and found not worth it.
+	var resumeOnly []bool
+	for pc, in := range vp {
+		if q := pc + 1; in.Op == jit.VResultRow && q < len(vp) && !entry[q] && vp[q].Op != jit.VExit && q != updAt {
+			if resumeOnly == nil {
+				resumeOnly = make([]bool, len(vp))
+			}
+			entry[q], resumeOnly[q] = true, true
+		}
+	}
 	code, err := jit.MapVMFused(vp, prog.NReg+nParams+len(outer), valueLayout, entry, fusable)
 	if err != nil {
 		return nil
@@ -566,7 +583,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 			marked[pc].Op = OpJIT
 		}
 	}
-	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams + len(outer) + 2*len(subs), params: nParams, outer: outer, subs: subs, entry: entry, marked: marked, native: native, updAt: updAt,
+	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams + len(outer) + 2*len(subs), params: nParams, outer: outer, subs: subs, entry: entry, resumeOnly: resumeOnly, marked: marked, native: native, updAt: updAt,
 		segCap: segCap, segNeed: segNeed, rowidSeeks: rowidSeeks, walkScan: walkScan, inSlots: inSlots, idxSpecs: idxSpecs, sortSeeks: sortSeeks,
 		aggAt: agg.at, aggSort: agg.sort, aggLo: agg.lo, aggHi: agg.hi, aggKey: agg.key, aggKeyLo: agg.keyLo, aggKeyN: agg.keyN}
 	if segCap != nil {
@@ -578,7 +595,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	jx.safeExit = make([]int32, len(prog.Insns))
 	for pc := range prog.Insns {
 		jx.safeExit[pc] = -1
-		if !cursorFreeOp(&prog.Insns[pc]) {
+		if !cursorFreeOp(&prog.Insns[pc]) && prog.Insns[pc].Op != OpResultRow {
 			continue
 		}
 		q := pc + 1
@@ -1578,7 +1595,10 @@ var (
 	// vmJITAggGathered counts the aggregate steps native code gathered and
 	// the VDBE replayed (gatherAggStep).
 	vmJITAggGathered atomic.Int64
-	vmJITCountSyncs  bool
+	// vmJITResumes counts the entries that went on with the cursors native
+	// code kept across a stop (vdbe.jDefer).
+	vmJITResumes    atomic.Int64
+	vmJITCountSyncs bool
 
 	// vmJITCursorEnters counts entries into native code that reads or walks a
 	// cursor, while vmJITCountCursorEnters is set.
@@ -2357,6 +2377,9 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 	if !resume && m.jDefer {
 		m.flushJIT()
 	}
+	if resume && vmJITCountSyncs {
+		vmJITResumes.Add(1)
+	}
 	args := &m.jargs
 	if jx.params > 0 {
 		// The bound parameters, where native code's OpVariable reads them.
@@ -2444,7 +2467,18 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 	if jx.nCurs > 0 {
 		// Stopped at an instruction that touches no cursor, which the VDBE
 		// runs before it enters again at the next: native code keeps them.
-		if exit := int(args.PC); args.Yield == 0 && exit >= 0 && exit < len(jx.safeExit) && jx.safeExit[exit] >= 0 {
+		// An OpResultRow is one only when the VDBE's adds the row to the
+		// run's own list and goes on: one that ends the run would leave them
+		// with native code, which the next run drops. Native code stops at
+		// each one while the collector marks (jccWB).
+		exit := int(args.PC)
+		keep := exit >= 0 && exit < len(jx.safeExit) && jx.safeExit[exit] >= 0
+		if keep && unsafe.Slice(jx.insns, jx.n)[exit].Op == OpResultRow {
+			keep = args.RowsBuf != nil && !gather && !m.yield && !m.firstRow && m.maxRows <= 0
+		} else {
+			keep = keep && args.Yield == 0
+		}
+		if keep {
 			m.jDefer, m.jDeferPC, m.jDeferJX = true, int(jx.safeExit[exit]), jx
 		} else {
 			for _, c := range m.jLive {
