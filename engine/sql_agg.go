@@ -1533,7 +1533,7 @@ func finalizeSum(it *aggItem) (Value, error) {
 	}
 	if it.sumApprox {
 		if it.sumOverflow {
-			return Value{}, fmt.Errorf("engine: integer overflow")
+			return Value{}, errSumOverflow
 		}
 		return resultDouble(it.kbnTotal()), nil
 	}
