@@ -35,6 +35,10 @@ import (
 // segJoinHits counts statements the join kernel answered, for tests.
 var segJoinHits atomic.Int64
 
+// segJoinArgsSparse counts the aggregate arguments computed on their level's
+// passing rows only (passingValues).
+var segJoinArgsSparse atomic.Int64
+
 // SegJoinHitsForTest reads and clears the counter.
 func SegJoinHitsForTest() int64 { return segJoinHits.Swap(0) }
 
@@ -958,6 +962,9 @@ type segJoinWalk struct {
 
 	m     *vdbe
 	exprs map[*segJoinExpr][]Value // each expression's value per row
+	// sparse is an aggregate argument's value on the rows its level passes
+	// alone (passingValues).
+	sparse map[*segJoinExpr][]Value
 	// nullExprs is each expression's value on the optional level's NULL row.
 	nullExprs map[*segJoinExpr]Value
 
@@ -1370,6 +1377,72 @@ func (w *segJoinWalk) filterPassing(a segJoinArg, pass []bool) bool {
 	return true
 }
 
+// passingValues is a's value on each row of its level that the level's own
+// terms let through, the only rows the walk visits, with those rows: what an
+// aggregate's argument takes when they are few, rather than its value on
+// every row (exprValues). Each other row holds a NULL no one reads. false
+// where a is not an expression of one level's row, or most rows pass.
+func (w *segJoinWalk) passingValues(a segJoinArg) ([]Value, []bool, bool) {
+	if a.expr == nil || a.level < 0 || a.level == segJoinMulti || a.expr.volatile {
+		return nil, nil, false
+	}
+	lv := w.lv(a)
+	pass := w.pass[lv]
+	if pass == nil {
+		return nil, nil, false
+	}
+	if v, ok := w.sparse[a.expr]; ok {
+		return v, pass, v != nil
+	}
+	if w.cachedExpr(a) {
+		return nil, nil, false
+	}
+	t := w.tabs[lv]
+	passing := 0
+	for _, p := range pass {
+		if p {
+			passing++
+		}
+	}
+	if 2*passing >= t.n {
+		return nil, nil, false
+	}
+	if w.sparse == nil {
+		w.sparse = map[*segJoinExpr][]Value{}
+	}
+	w.sparse[a.expr] = nil
+	segJoinArgsSparse.Add(1)
+	vm := *w.m
+	vm.regs = make([]Value, len(w.m.regs))
+	vm.fnArgBuf, vm.likePlan = nil, nil
+	cols, _, ok := t.exprColumnsSparse(a.expr, true)
+	if !ok {
+		return nil, nil, false
+	}
+	var row int32
+	cell := func(i int) Value {
+		if c := cols[i]; c != nil {
+			return c[row]
+		}
+		return t.value(row, i-1)
+	}
+	column := func(op *Instruction) Value { return cell(op.P2 + 1) }
+	out := make([]Value, t.n)
+	for r, p := range pass {
+		if !p {
+			continue
+		}
+		row = int32(r)
+		v, ok := segJoinEvalRow(&vm, a.expr, column, func(*Instruction) Value { return t.value(row, -1) }, nil)
+		if !ok {
+			return nil, nil, false
+		}
+		out[r] = v
+	}
+	w.sparse[a.expr] = out
+	return out, pass, true
+}
+
 // segJoinMemo is an expression of one column's answers, by the value it read:
 // computed once for each value the column holds, its answer being a function
 // of that value alone. A plain TEXT value, which is its bytes alone, is
@@ -1661,6 +1734,28 @@ func (w *segJoinWalk) ints(a segJoinArg) ([]int64, bool) {
 // nullable is a's value per row as integers (or, with real, REALs) with
 // its NULLs marked, or false unless every value is one or the other.
 func (w *segJoinWalk) nullable(a segJoinArg, real bool) (ints []int64, flts []float64, nulls []bool, ok bool) {
+	if vals, pass, sparse := w.passingValues(a); sparse {
+		nulls = make([]bool, len(vals))
+		if real {
+			flts = make([]float64, len(vals))
+		} else {
+			ints = make([]int64, len(vals))
+		}
+		for r, v := range vals {
+			switch {
+			case !pass[r]:
+			case v.Typ == Null:
+				nulls[r] = true
+			case real && v.Typ == Float:
+				flts[r] = v.F
+			case !real && v.Typ == Int:
+				ints[r] = v.I
+			default:
+				return nil, nil, nil, false
+			}
+		}
+		return ints, flts, nulls, true
+	}
 	if real {
 		if v, ok := w.floats(a); ok {
 			return nil, v, nil, true
@@ -1729,6 +1824,9 @@ func (w *segJoinWalk) value(a segJoinArg, at []int32) Value {
 	if at[lv] < 0 {
 		v, _ := w.nullRowValue(a)
 		return v
+	}
+	if vals, pass, ok := w.passingValues(a); ok && pass[at[lv]] {
+		return vals[at[lv]]
 	}
 	vals, ok := w.exprValues(a)
 	if !ok {
