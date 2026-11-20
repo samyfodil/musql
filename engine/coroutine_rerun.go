@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"slices"
+	"weak"
 )
 
 // A FROM-clause subquery C codes as a co-routine is run where its loop
@@ -861,12 +862,19 @@ func markCoroutineReruns(p *ReadOnlyPager, c *compiler, srcs []joinSource, stmt 
 // cteBodyProgram compiles a CTE's body, in the scope it was defined in, for
 // its row estimate only: a reference's rows are produced at run time
 // (runCTEOnce), so nothing else compiles it here. nil when it does not
-// compile.
+// compile. The program is kept for the next ask under the same outer
+// compiler: a body compiled for every reference, inside bodies themselves
+// compiled for every reference of theirs, cost compiles by the power of the
+// nesting.
 func (p *ReadOnlyPager) cteBodyProgram(c *compiler, name string, b *cteBinding) *Program {
 	for _, seen := range p.cteExpansion {
 		if seen.b == b {
 			return nil
 		}
+	}
+	outer := weak.Make(c.outer)
+	if e := b.est.Load(); e != nil && e.outer == outer {
+		return e.prog
 	}
 	var prog *Program
 	p.keepingCTEUses(func() {
@@ -876,6 +884,7 @@ func (p *ReadOnlyPager) cteBodyProgram(c *compiler, name string, b *cteBinding) 
 			prog = sp
 		}
 	})
+	b.est.Store(&cteEstimate{outer, prog})
 	return prog
 }
 
