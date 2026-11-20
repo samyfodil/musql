@@ -3,6 +3,8 @@ package engine
 import (
 	"fmt"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"testing"
 )
 
@@ -73,6 +75,10 @@ func TestVMJITSortSeek(t *testing.T) {
 	// About 10,000 seeks, nearly all misses: a handful of entries, not one a
 	// seek. Counted first: on js/wasm a kernel reads the write-barrier flag
 	// at the address it was compiled with, which jitPointerModes forces on.
+	// And with no GC cycle running, whose write barrier sends every seek back
+	// to the VDBE while it lasts.
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	runtime.GC()
 	CountVMJITCursorEntersForTest(true)
 	VMJITCursorEntersForTest()
 	if _, _, err := db.Query(fmt.Sprintf(`with t as materialized (%s) `+join+` -- enters`, fifth, "0"), nil); err != nil {
