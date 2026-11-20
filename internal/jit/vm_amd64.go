@@ -159,6 +159,9 @@ func emitVMWith(asm *Asm, prog []VInsn, nReg int, lay ValueLayout, bound, entry 
 	for _, c := range e.cold {
 		c()
 	}
+	if e.segRead != 0 {
+		e.emitSegRead()
+	}
 
 	entryOff := map[int]int{}
 	for _, en := range e.entries {
@@ -259,6 +262,9 @@ type vmEmit struct {
 	// nLabel the labels they have made.
 	consts *firPool
 	nLabel int
+	// segRead is the label of segColumn's full read, emitted once after the
+	// blocks when some read calls it; 0 until one does.
+	segRead Lbl
 }
 
 // coldPath branches, when the flags say NE, to body emitted out of line, which

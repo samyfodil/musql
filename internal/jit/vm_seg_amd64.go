@@ -64,8 +64,7 @@ func (e *vmEmit) rowRead(pc int, in VInsn, base, row Reg, haveRow, newRow bool, 
 	a := e.a
 	a.Bind(l("prows"))
 	if !haveRow {
-		a.MovRegMemD(RAX, RDI, POffCur)
-		a.JmpL(l("rows"))
+		a.JmpL(l("full"))
 		return
 	}
 	if newRow {
@@ -119,17 +118,13 @@ func (e *vmEmit) unpredictedRead(pc int, in VInsn, l func(string) Lbl) {
 	e.rowAddr(pc, in, RAX, cb, row, mask)
 	e.rowCopy(pc, in, row)
 	a.JmpL(l("done"))
-	// On a segment: its read past the checks just made (label seg), with RAX
-	// the cursors, RDX the position and R9 the VSeg.
+	// On a segment: the full read (label full, which the caller binds next).
 	a.Bind(l("useg"))
 	if held {
 		a.XorRegReg(row, row)
 		e.holds[vmRowKey(in.A)] = row
 	}
-	e.destNoS(pc, in.C)
-	e.zeroS.del(in.C)
-	a.MovRegMemD(R9, RAX, cb+VCursorOffSeg)
-	a.JmpL(l("seg"))
+	a.JmpL(l("full"))
 }
 
 // rowAddr sets row to the address of the row at position RDX of the cursor at
@@ -321,187 +316,28 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 		e.unmapCursor(in.A)
 	}
 
+	// The full read, shared by every column of the program (segReadAny):
+	// the cursor's address in RAX, the column in X3 and the destination's
+	// address in X4. It returns ZF clear where the VDBE must read the cell.
 	a.MovRegMemD(RAX, RDI, POffCur)
-	a.CmpMemDImm8(RAX, cb+VCursorOffOk, 0)
-	e.jccStub(CondE, pc)
-	a.MovRegMemD(RDX, RAX, cb+VCursorOffMask)
-	a.MovRegImm64(R10, int64(uint64(1)<<uint(in.B)))
-	a.TestRegReg(RDX, R10)
-	e.jccStub(CondE, pc)
-	a.MovRegMemD(RDX, RAX, cb+VCursorOffPos)
-	a.AluRegMemD(AluCmp, RDX, RAX, cb+VCursorOffN)
-	e.jccStub(condAboveEq, pc) // unsigned: a position before the first row is huge
-	a.MovRegMemD(R9, RAX, cb+VCursorOffSeg)
-	a.TestRegReg(R9, R9)
-	a.JccL(CondNE, l("seg"))
-
-	// The row list's: the Value copied whole, its string's pointer shared.
-	a.Bind(l("rows"))
-	a.MovRegImm64(R10, sliceHeaderSize)
-	a.ImulRegReg(RDX, R10)
-	a.AddRegMemD(RDX, RAX, cb+VCursorOffRows)
-	a.MovRegMemD(R10, RDX, 8) // the row's length
-	a.CmpRegImm32(R10, int32(in.B))
-	e.jccStub(condBelowEq, pc) // a row narrower than the column: the VDBE's
-	a.MovRegMemD(R9, RDX, 0)
-	vb := int32(in.B) * int32(L.Size)
-	// The string words only when the column or the destination holds a
-	// string, as column copies.
-	a.MovRegMemD(RDX, R9, vb+int32(L.OffS))
-	a.AluRegMemD(AluOr, RDX, RSI, dst+int32(L.OffS))
-	e.coldPath(func() {
-		e.jccWB(pc)
-		for _, off := range []int{L.OffS, L.OffS + 8, L.OffS + 16} {
-			a.MovRegMemD(RDX, R9, vb+int32(off))
-			a.MovMemDReg(RSI, dst+int32(off), RDX)
-		}
-	})
-	for _, off := range []int{0, L.OffI, L.OffF} {
-		a.MovRegMemD(RDX, R9, vb+int32(off))
-		a.MovMemDReg(RSI, dst+int32(off), RDX)
+	if cb != 0 {
+		a.LeaRegMemD(RAX, RAX, cb)
 	}
-	a.JmpL(l("done"))
-
-	// The segment's: R9 the VSeg, RDX the row (Sel[Pos] when the cursor has
-	// a selection), R10 the column's VSegCol.
-	a.Bind(l("seg"))
-	a.LeaRegMemD(RCX, RAX, cb)
-	e.rowSeg(RCX, l("segs"))
-	a.MovRegMemD(R10, RAX, cb+VCursorOffSel)
-	a.TestRegReg(R10, R10)
-	a.JccL(CondE, l("nosel"))
-	a.MovRegMemIdx(RDX, R10, RDX)
-	a.Bind(l("nosel"))
-	a.MovRegMemD(R10, R9, VSegOffCols)
-	a.AddRegImm32(R10, int32(in.B*VSegColSize))
-	a.MovRegMemD(RAX, R10, VSegColOffNulls)
-	a.TestRegReg(RAX, RAX)
-	a.JccL(CondE, l("nonull"))
-	a.MovRegReg(RCX, RDX)
-	a.SarRegImm8(RCX, 3)
-	a.AddRegReg(RAX, RCX)
-	a.MovzxByte(RAX, RAX)
-	a.MovRegReg(RCX, RDX)
-	a.AndRegImm32(RCX, 7)
-	a.BtRegReg(RAX, RCX)
-	a.JccL(condCarry, l("null"))
-	a.Bind(l("nonull"))
-	a.MovRegMemD(RAX, R10, VSegColOffExc)
-	a.TestRegReg(RAX, RAX)
-	a.JccL(CondE, l("noexc"))
-	a.MovRegReg(RCX, RDX)
-	a.SarRegImm8(RCX, 6)
-	a.ShlRegImm8(RCX, 3)
-	a.AddRegReg(RAX, RCX)
-	a.MovRegMemD(RAX, RAX, 0)
-	a.BtRegReg(RAX, RDX)
-	e.jccStub(condCarry, pc) // an exception: the VDBE's
-	a.Bind(l("noexc"))
-	a.MovRegMemD(RCX, R10, VSegColOffKind)
-	for _, k := range []struct {
-		kind int
-		name string
-	}{{VSegInt, "int"}, {VSegFloat, "float"}, {VSegNumeric, "num"}, {VSegIntReal, "intreal"}, {VSegRowid, "rowid"}, {VSegText, "text"}} {
-		a.CmpRegImm32(RCX, int32(k.kind))
-		a.JccL(CondE, l(k.name))
+	a.MovRegImm64(R10, int64(in.B))
+	a.MovqXR(X3, R10)
+	a.LeaRegMemD(R10, RSI, dst)
+	a.MovqXR(X4, R10)
+	if e.segRead == 0 {
+		e.segRead = a.NewLabel()
 	}
-	e.jmpStub(pc) // a kind this build does not read
-
-	cell := func() { // RAX = the 8-byte cell at row RDX
-		a.MovRegMemD(RAX, R10, VSegColOffBlock)
-		a.MovRegMemIdx(RAX, RAX, RDX)
-	}
-	const none = Reg(255)
-	writeNum := func(typ byte, ival, fval Reg) { // a number, no string
-		a.MovMemDImm(RSI, dst, int32(typ))
-		if ival != none {
-			a.MovMemDReg(RSI, dst+int32(L.OffI), ival)
-		} else {
-			a.MovMemDImm(RSI, dst+int32(L.OffI), 0)
-		}
-		if fval != none {
-			a.MovMemDReg(RSI, dst+int32(L.OffF), fval)
-		} else {
-			a.MovMemDImm(RSI, dst+int32(L.OffF), 0)
-		}
-		for k := range 3 {
-			a.MovMemDImm(RSI, dst+int32(L.OffS+8*k), 0)
-		}
+	a.CallL(e.segRead)
+	e.jccStub(CondNE, pc)
+	if name := segKindLabel(in.T); name != "" {
+		// The predicted kind's read, which a plain column of it jumps to.
 		a.JmpL(l("done"))
+		a.Bind(l(name))
+		e.segArm(in.T, func(Reg) (Reg, int32) { return RSI, dst }, l("done"), func() { e.jccWB(pc) })
 	}
-
-	a.Bind(l("int"))
-	cell()
-	writeNum(L.TypInt, RAX, none)
-
-	// A NULL cell is a NULL: a column is in the cursor's view only where every
-	// row is as wide as the table, so none reads a default, and the rowid
-	// alias's stored NULL has no bitmap.
-	a.Bind(l("null"))
-	writeNum(L.TypNull, none, none)
-
-	a.Bind(l("float"))
-	cell()
-	writeNum(L.TypFloat, none, RAX)
-
-	a.Bind(l("intreal"))
-	cell()
-	a.Cvtsi2sdq(X0, RAX)
-	a.MovqRX(RAX, X0)
-	writeNum(L.TypFloat, none, RAX)
-
-	// An integral double within 2^53 is the INTEGER, any other the REAL
-	// (numericValue). A NaN or a value past int64 fails the round trip.
-	a.Bind(l("num"))
-	cell()
-	a.MovqXR(X0, RAX)
-	a.Cvttsd2siq(RCX, X0)
-	a.Cvtsi2sdq(X1, RCX)
-	a.Ucomisd(X0, X1)
-	a.JccL(CondNE, l("numreal"))
-	a.JccL(condParity, l("numreal"))
-	a.MovRegImm64(R10, 1<<53)
-	a.AddRegReg(R10, RCX)
-	a.MovRegImm64(R9, 1<<54)
-	a.CmpRegReg(R10, R9)
-	a.JccL(condAbove, l("numreal"))
-	writeNum(L.TypInt, RCX, none)
-	a.Bind(l("numreal"))
-	writeNum(L.TypFloat, none, RAX)
-
-	a.Bind(l("rowid"))
-	a.CmpMemDImm8(R9, VSegOffDense, 0)
-	a.JccL(CondE, l("rowids"))
-	a.MovRegMemD(RAX, R9, VSegOffFirst)
-	a.AddRegReg(RAX, RDX)
-	writeNum(L.TypInt, RAX, none)
-	a.Bind(l("rowids"))
-	a.MovRegMemD(RAX, R9, VSegOffRowids)
-	a.MovRegMemIdx(RAX, RAX, RDX)
-	writeNum(L.TypInt, RAX, none)
-
-	// TEXT: the bytes from bound Pos to bound Pos+1 of the heap, shared as
-	// segment.Value shares them, which is a pointer store.
-	a.Bind(l("text"))
-	e.jccWB(pc)
-	a.MovRegMemD(RAX, R10, VSegColOffBlock)
-	a.ShlRegImm8(RDX, 2)
-	a.AddRegReg(RAX, RDX)
-	a.MovRegMemD32(RCX, RAX, 0) // from
-	a.MovRegMemD32(RDX, RAX, 4) // to
-	a.SubRegReg(RDX, RCX)       // the length
-	// An empty string points at the heap's start, never one past its end:
-	// Go's own slicing of a zero capacity keeps the base pointer.
-	a.JccL(CondNE, l("tlen"))
-	a.XorRegReg(RCX, RCX)
-	a.Bind(l("tlen"))
-	a.AddRegMemD(RCX, R10, VSegColOffHeap)
-	a.MovMemDImm(RSI, dst, int32(L.TypText))
-	a.MovMemDImm(RSI, dst+int32(L.OffI), 0)
-	a.MovMemDImm(RSI, dst+int32(L.OffF), 0)
-	a.MovMemDReg(RSI, dst+int32(L.OffS), RCX)
-	a.MovMemDReg(RSI, dst+int32(L.OffS+8), RDX)
-	a.MovMemDReg(RSI, dst+int32(L.OffS+16), RDX)
 	if rowsLast != nil {
 		a.JmpL(l("done"))
 		rowsLast()
@@ -517,6 +353,245 @@ func (e *vmEmit) segColumn(pc int, in VInsn) {
 			a.MovRegMemD(m, RSI, e.d(in.C, L.OffI))
 			e.holds[in.C] = m
 		}
+	}
+}
+
+// emitSegRead emits segColumn's full read, which every column a program reads
+// shares: column X3 of the cursor at RAX, its row Pos, into the Value at X4,
+// read from the segment's blocks when the engine handed one over (VCursor.Seg),
+// else from its row list. It returns with ZF set when it read the cell, and
+// clear, having written nothing, where the VDBE must: a check that fails, an
+// exception, a kind this build does not read, or a string with the write
+// barrier on. RAX, RCX, RDX, R9, R10, X0, X1, X3 and X4 are scratch.
+//
+// A segment cell reads exactly as segColumnValue reads it. The destination
+// holds no string when it is read from a segment (destNoS before the call).
+func (e *vmEmit) emitSegRead() {
+	a, L := e.a, e.lay
+	fail, ok := a.NewLabel(), a.NewLabel()
+	seg, segs, nosel, nonull, noexc, null := a.NewLabel(), a.NewLabel(), a.NewLabel(), a.NewLabel(), a.NewLabel(), a.NewLabel()
+	nostr := a.NewLabel()
+	var at [VSegText + 1]Lbl
+	for _, k := range segArmKinds {
+		at[k] = a.NewLabel()
+	}
+	a.Bind(e.segRead)
+	a.CmpMemDImm8(RAX, VCursorOffOk, 0)
+	a.JccL(CondE, fail)
+	a.MovqRX(RCX, X3)
+	a.CmpRegImm32(RCX, 63)
+	a.JccL(condAbove, fail) // past the mask's 64 columns
+	a.MovRegMemD(RDX, RAX, VCursorOffMask)
+	a.BtRegReg(RDX, RCX)
+	a.JccL(condAboveEq, fail) // the column is not readable
+	a.MovRegMemD(RDX, RAX, VCursorOffPos)
+	a.AluRegMemD(AluCmp, RDX, RAX, VCursorOffN)
+	a.JccL(condAboveEq, fail) // unsigned: a position before the first row is huge
+	a.MovRegMemD(R9, RAX, VCursorOffSeg)
+	a.TestRegReg(R9, R9)
+	a.JccL(CondNE, seg)
+
+	// The row list's: the Value copied whole, its string's pointer shared.
+	a.ImulRegRegImm32(RDX, RDX, sliceHeaderSize)
+	a.AddRegMemD(RDX, RAX, VCursorOffRows)
+	a.MovRegMemD(R10, RDX, 8) // the row's length
+	a.CmpRegReg(R10, RCX)
+	a.JccL(condBelowEq, fail) // a row narrower than the column: the VDBE's
+	a.MovRegMemD(R9, RDX, 0)
+	a.ImulRegRegImm32(RCX, RCX, int32(L.Size))
+	a.AddRegReg(R9, RCX)
+	a.MovqRX(R10, X4)
+	// The string words only when the column or the destination holds a
+	// string, as column copies.
+	a.MovRegMemD(RDX, R9, int32(L.OffS))
+	a.AluRegMemD(AluOr, RDX, R10, int32(L.OffS))
+	a.JccL(CondE, nostr)
+	a.CmpMemDByte(RDI, POffWB, 0)
+	a.JccL(CondNE, fail)
+	for _, off := range []int{L.OffS, L.OffS + 8, L.OffS + 16} {
+		a.MovRegMemD(RDX, R9, int32(off))
+		a.MovMemDReg(R10, int32(off), RDX)
+	}
+	a.Bind(nostr)
+	for _, off := range []int{0, L.OffI, L.OffF} {
+		a.MovRegMemD(RDX, R9, int32(off))
+		a.MovMemDReg(R10, int32(off), RDX)
+	}
+	a.JmpL(ok)
+
+	// The segment's: R9 the VSeg, RDX the row (Sel[Pos] when the cursor has
+	// a selection), R10 the column's VSegCol.
+	a.Bind(seg)
+	e.rowSeg(RAX, segs)
+	a.MovRegMemD(R10, RAX, VCursorOffSel)
+	a.TestRegReg(R10, R10)
+	a.JccL(CondE, nosel)
+	a.MovRegMemIdx(RDX, R10, RDX)
+	a.Bind(nosel)
+	a.MovRegMemD(R10, R9, VSegOffCols)
+	a.MovqRX(RCX, X3)
+	a.ImulRegRegImm32(RCX, RCX, VSegColSize)
+	a.AddRegReg(R10, RCX)
+	a.MovRegMemD(RAX, R10, VSegColOffNulls)
+	a.TestRegReg(RAX, RAX)
+	a.JccL(CondE, nonull)
+	a.MovRegReg(RCX, RDX)
+	a.SarRegImm8(RCX, 3)
+	a.AddRegReg(RAX, RCX)
+	a.MovzxByte(RAX, RAX)
+	a.MovRegReg(RCX, RDX)
+	a.AndRegImm32(RCX, 7)
+	a.BtRegReg(RAX, RCX)
+	a.JccL(condCarry, null)
+	a.Bind(nonull)
+	a.MovRegMemD(RAX, R10, VSegColOffExc)
+	a.TestRegReg(RAX, RAX)
+	a.JccL(CondE, noexc)
+	a.MovRegReg(RCX, RDX)
+	a.SarRegImm8(RCX, 6)
+	a.ShlRegImm8(RCX, 3)
+	a.AddRegReg(RAX, RCX)
+	a.MovRegMemD(RAX, RAX, 0)
+	a.BtRegReg(RAX, RDX)
+	a.JccL(condCarry, fail) // an exception: the VDBE's
+	a.Bind(noexc)
+	a.MovRegMemD(RCX, R10, VSegColOffKind)
+	for _, k := range segArmKinds {
+		a.CmpRegImm32(RCX, int32(k))
+		a.JccL(CondE, at[k])
+	}
+	a.JmpL(fail) // a kind this build does not read
+	dest := func(m Reg) (Reg, int32) {
+		a.MovqRX(m, X4)
+		return m, 0
+	}
+	wb := func() {
+		a.CmpMemDByte(RDI, POffWB, 0)
+		a.JccL(CondNE, fail)
+	}
+	for _, k := range segArmKinds {
+		a.Bind(at[k])
+		e.segArm(k, dest, ok, wb)
+	}
+	a.Bind(null)
+	e.segArm(segArmNull, dest, ok, wb)
+
+	a.Bind(ok)
+	a.XorRegReg(RCX, RCX) // ZF set: read
+	a.Ret()
+	a.Bind(fail)
+	a.aluImm32(1, RCX, 1) // ZF clear: the VDBE's
+	a.Ret()
+}
+
+// segArmKinds is the kinds of segment cell native code reads.
+var segArmKinds = []int{VSegInt, VSegFloat, VSegNumeric, VSegIntReal, VSegRowid, VSegText}
+
+// segArmNull is segArm's NULL, a cell its column's bitmap marks.
+const segArmNull = -1
+
+// segArm reads a segment cell of kind k, RDX its row, R9 its VSeg and R10
+// its VSegCol, into the Value dest gives (base and displacement, the base
+// loaded into the scratch register it is handed where it must be), then
+// jumps to done. wb fails the read when the write barrier is on, which a
+// string's pointer store needs off.
+func (e *vmEmit) segArm(k int, dest func(scratch Reg) (Reg, int32), done Lbl, wb func()) {
+	a, L := e.a, e.lay
+	cell := func() { // RAX = the 8-byte cell at row RDX
+		a.MovRegMemD(RAX, R10, VSegColOffBlock)
+		a.MovRegMemIdx(RAX, RAX, RDX)
+	}
+	const none = Reg(255)
+	writeNum := func(typ byte, ival, fval Reg) { // a number, no string
+		b, d := dest(R10)
+		a.MovMemDImm(b, d, int32(typ))
+		if ival != none {
+			a.MovMemDReg(b, d+int32(L.OffI), ival)
+		} else {
+			a.MovMemDImm(b, d+int32(L.OffI), 0)
+		}
+		if fval != none {
+			a.MovMemDReg(b, d+int32(L.OffF), fval)
+		} else {
+			a.MovMemDImm(b, d+int32(L.OffF), 0)
+		}
+		for k := range 3 {
+			a.MovMemDImm(b, d+int32(L.OffS+8*k), 0)
+		}
+		a.JmpL(done)
+	}
+	switch k {
+	case VSegInt:
+		cell()
+		writeNum(L.TypInt, RAX, none)
+	// A NULL cell is a NULL: a column is in the cursor's view only where
+	// every row is as wide as the table, so none reads a default, and the
+	// rowid alias's stored NULL has no bitmap.
+	case segArmNull:
+		writeNum(L.TypNull, none, none)
+	case VSegFloat:
+		cell()
+		writeNum(L.TypFloat, none, RAX)
+	case VSegIntReal:
+		cell()
+		a.Cvtsi2sdq(X0, RAX)
+		a.MovqRX(RAX, X0)
+		writeNum(L.TypFloat, none, RAX)
+	// An integral double within 2^53 is the INTEGER, any other the REAL
+	// (numericValue). A NaN or a value past int64 fails the round trip.
+	case VSegNumeric:
+		numreal := a.NewLabel()
+		cell()
+		a.MovqXR(X0, RAX)
+		a.Cvttsd2siq(RCX, X0)
+		a.Cvtsi2sdq(X1, RCX)
+		a.Ucomisd(X0, X1)
+		a.JccL(CondNE, numreal)
+		a.JccL(condParity, numreal)
+		a.MovRegImm64(R10, 1<<53)
+		a.AddRegReg(R10, RCX)
+		a.MovRegImm64(R9, 1<<54)
+		a.CmpRegReg(R10, R9)
+		a.JccL(condAbove, numreal)
+		writeNum(L.TypInt, RCX, none)
+		a.Bind(numreal)
+		writeNum(L.TypFloat, none, RAX)
+	case VSegRowid:
+		rowids := a.NewLabel()
+		a.CmpMemDImm8(R9, VSegOffDense, 0)
+		a.JccL(CondE, rowids)
+		a.MovRegMemD(RAX, R9, VSegOffFirst)
+		a.AddRegReg(RAX, RDX)
+		writeNum(L.TypInt, RAX, none)
+		a.Bind(rowids)
+		a.MovRegMemD(RAX, R9, VSegOffRowids)
+		a.MovRegMemIdx(RAX, RAX, RDX)
+		writeNum(L.TypInt, RAX, none)
+	// TEXT: the bytes from bound Pos to bound Pos+1 of the heap, shared as
+	// segment.Value shares them, which is a pointer store.
+	case VSegText:
+		tlen := a.NewLabel()
+		wb()
+		a.MovRegMemD(RAX, R10, VSegColOffBlock)
+		a.ShlRegImm8(RDX, 2)
+		a.AddRegReg(RAX, RDX)
+		a.MovRegMemD32(RCX, RAX, 0) // from
+		a.MovRegMemD32(RDX, RAX, 4) // to
+		a.SubRegReg(RDX, RCX)       // the length
+		// An empty string points at the heap's start, never one past its
+		// end: Go's own slicing of a zero capacity keeps the base pointer.
+		a.JccL(CondNE, tlen)
+		a.XorRegReg(RCX, RCX)
+		a.Bind(tlen)
+		a.AddRegMemD(RCX, R10, VSegColOffHeap)
+		b, d := dest(RAX)
+		a.MovMemDImm(b, d, int32(L.TypText))
+		a.MovMemDImm(b, d+int32(L.OffI), 0)
+		a.MovMemDImm(b, d+int32(L.OffF), 0)
+		a.MovMemDReg(b, d+int32(L.OffS), RCX)
+		a.MovMemDReg(b, d+int32(L.OffS+8), RDX)
+		a.MovMemDReg(b, d+int32(L.OffS+16), RDX)
+		a.JmpL(done)
 	}
 }
 

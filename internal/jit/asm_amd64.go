@@ -218,6 +218,14 @@ func (a *Asm) JmpL(l Lbl) {
 	a.emit(0, 0, 0, 0)
 }
 
+// CallL calls a NewLabel label: a subroutine of the same code, which returns
+// with Ret.
+func (a *Asm) CallL(l Lbl) {
+	a.emit(0xE8)
+	a.fixups = append(a.fixups, fixup{at: len(a.buf), lbl: l})
+	a.emit(0, 0, 0, 0)
+}
+
 // Jmp jumps to label unconditionally.
 func (a *Asm) Jmp(label string) {
 	a.emit(0xE9)
