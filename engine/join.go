@@ -33,6 +33,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync/atomic"
 )
 
 // joinedTable is one resolved+materialized FROM item: its scope name (alias,
@@ -699,6 +700,50 @@ func (p *ReadOnlyPager) derivedSchemaCols(sub *SelectStmt) ([]columnInfo, bool) 
 	if !p.derivedSchemaOnly && !p.fromColumnsOnly || sub == nil {
 		return nil, false
 	}
+	// With no CTE in scope and no view being expanded the compile reads
+	// nothing but the body and the schema, and counts no CTE's uses.
+	key := derivedColsKey{sub, p.derivedSchemaOnly, p.fromColumnsOnly}
+	memo := p.derivedCols != nil && len(p.cteScopes) == 0 && len(p.cteExpansion) == 0 && len(p.viewExpansion) == 0
+	if memo {
+		if a, ok := p.derivedCols[key]; ok {
+			derivedColsReuses.Add(1)
+			return slices.Clone(a.cols), a.ok
+		}
+	}
+	cols, ok := p.derivedSchemaColsCompiled(sub)
+	if memo {
+		p.derivedCols[key] = derivedColsAnswer{slices.Clone(cols), ok}
+	}
+	return cols, ok
+}
+
+// derivedColsReuses counts derivedSchemaCols' answers kept from a compile
+// before.
+var derivedColsReuses atomic.Int64
+
+type derivedColsKey struct {
+	sub                         *SelectStmt
+	schemaOnly, fromColumnsOnly bool
+}
+
+type derivedColsAnswer struct {
+	cols []columnInfo
+	ok   bool
+}
+
+// memoDerivedCols runs fn, a read's compile, keeping derivedSchemaCols'
+// answers for its length.
+func (p *ReadOnlyPager) memoDerivedCols(fn func()) {
+	if p.derivedCols != nil {
+		fn()
+		return
+	}
+	p.derivedCols = map[derivedColsKey]derivedColsAnswer{}
+	defer func() { p.derivedCols = nil }()
+	fn()
+}
+
+func (p *ReadOnlyPager) derivedSchemaColsCompiled(sub *SelectStmt) ([]columnInfo, bool) {
 	prog, err := compileSubProgram(p, sub, nil)
 	if err != nil || prog == nil {
 		return nil, false

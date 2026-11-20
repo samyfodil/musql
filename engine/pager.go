@@ -110,6 +110,11 @@ type ReadOnlyPager struct {
 	//	// cycle (with1.test). pushCTEScope builds a fresh binding per frame.
 	cteExpansion []cteExpansionFrame
 
+	// derivedCols keeps derivedSchemaCols' answers while one read compiles
+	// (memoDerivedCols): derived tables nested in derived tables compiled
+	// each body again for every level above it. nil outside such a compile.
+	derivedCols map[derivedColsKey]derivedColsAnswer
+
 	// cteSelfRefLive counts the recursive CTEs whose selfRef is bound right
 	// now (compileRecursiveCTE, recursiveCTECollations). While one is, a CTE
 	// body's columns can be derived from that stand-in row, so cteSchemaCols
