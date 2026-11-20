@@ -585,32 +585,65 @@ func buildTableSortedVMIdxValues(x *vmIdx, spec *idxSeekSpec, enc TextEncoding) 
 	if len(rows) == 0 {
 		return x
 	}
-	// A column whose every value is a number or a NULL is read once, as
-	// compareValuesCollatedEnc orders it (compareNumeric, a NULL first);
-	// any other is read from its segment on each comparison.
-	nums := make([][]Value, len(spec.sortCols))
-	for j := 1; j < len(spec.sortCols); j++ {
-		c, vs := spec.sortCols[j], make([]Value, len(rows))
-		for i, rw := range rows {
-			v := t.at[rw.seg].Value(c, int(rw.r))
-			if v.Typ != Null && v.Typ != Int && v.Typ != Float {
-				vs = nil
-				break
-			}
-			vs[i] = v
-		}
-		nums[j] = vs
-	}
 	perm := make([]int32, len(rows))
 	for i := range perm {
 		perm[i] = int32(i)
 	}
-	slices.SortFunc(perm, func(a, b int32) int {
-		ra, rb := rows[a], rows[b]
-		if c := cmp.Compare(ra.k, rb.k); c != 0 {
-			return c
-		}
+	// The rows are in rowid order, so a stable sort on the first key is the
+	// order a run of equal keys starts from, and only such a run is sorted on.
+	perm = radixSortByKey(perm, func(p int32) int64 { return rows[p].k })
+	if len(spec.sortCols) == 1 {
+		return x.tableIndex(mask, len(rows), func(i int) (int, int, int64) {
+			rw := rows[perm[i]]
+			return int(rw.seg), int(rw.r), rw.k
+		})
+	}
+	// A column of INTEGER blocks is read once as words, one whose every value
+	// is a number or a NULL as compareValuesCollatedEnc orders it
+	// (compareNumeric, a NULL first); any other is read from its segment on
+	// each comparison. Nothing is read unless a run needs it.
+	var ints [][]int64
+	var nulls [][]bool
+	var nums [][]Value
+	read := func() {
+		ints, nulls, nums = make([][]int64, len(spec.sortCols)), make([][]bool, len(spec.sortCols)), make([][]Value, len(spec.sortCols))
 		for j := 1; j < len(spec.sortCols); j++ {
+			c, is := spec.sortCols[j], make([]int64, len(rows))
+			if ns, ok := segIntWords(t.at, c, rows, is, func(rw row) (uint16, int32) { return rw.seg, rw.r }); ok {
+				ints[j], nulls[j] = is, ns
+				continue
+			}
+			vs := make([]Value, len(rows))
+			for i, rw := range rows {
+				v := t.at[rw.seg].Value(c, int(rw.r))
+				if v.Typ != Null && v.Typ != Int && v.Typ != Float {
+					vs = nil
+					break
+				}
+				vs[i] = v
+			}
+			nums[j] = vs
+		}
+	}
+	rest := func(a, b int32) int {
+		ra, rb := rows[a], rows[b]
+		for j := 1; j < len(spec.sortCols); j++ {
+			if is := ints[j]; is != nil {
+				// A NULL first, as compareValuesCollatedEnc orders it.
+				if ns := nulls[j]; ns != nil && (ns[a] || ns[b]) {
+					if !ns[a] {
+						return 1
+					}
+					if !ns[b] {
+						return -1
+					}
+					continue
+				}
+				if c := cmp.Compare(is[a], is[b]); c != 0 {
+					return c
+				}
+				continue
+			}
 			var va, vb Value
 			if nums[j] != nil {
 				va, vb = nums[j][a], nums[j][b]
@@ -623,7 +656,20 @@ func buildTableSortedVMIdxValues(x *vmIdx, spec *idxSeekSpec, enc TextEncoding) 
 			}
 		}
 		return cmp.Compare(a, b) // rowid order
-	})
+	}
+	for i := 0; i < len(perm); {
+		j := i + 1
+		for j < len(perm) && rows[perm[j]].k == rows[perm[i]].k {
+			j++
+		}
+		if j-i > 1 {
+			if ints == nil {
+				read()
+			}
+			slices.SortFunc(perm[i:j], rest)
+		}
+		i = j
+	}
 	return x.tableIndex(mask, len(rows), func(i int) (int, int, int64) {
 		rw := rows[perm[i]]
 		return int(rw.seg), int(rw.r), rw.k
@@ -974,4 +1020,68 @@ func (m *vdbe) syncIdxSeek(jx *vmJIT, c int, jc *jit.VCursor, spec *idxSeekSpec)
 		return fmt.Errorf("engine: internal: cursor %d has no row %d native code seeked to", c, target)
 	}
 	return nil
+}
+
+// radixSortByKey sorts rows stably by key, a byte of the key at a time,
+// skipping a byte every row shares. It may return its scratch slice.
+func radixSortByKey[T any](rows []T, key func(T) int64) []T {
+	if len(rows) < 64 {
+		slices.SortStableFunc(rows, func(a, b T) int { return cmp.Compare(key(a), key(b)) })
+		return rows
+	}
+	var counts [8][256]int
+	for _, rw := range rows {
+		k := uint64(key(rw)) ^ 1<<63
+		for b := range 8 {
+			counts[b][byte(k>>(8*b))]++
+		}
+	}
+	tmp := make([]T, len(rows))
+	for b := range 8 {
+		c := &counts[b]
+		if c[byte((uint64(key(rows[0]))^1<<63)>>(8*b))] == len(rows) {
+			continue
+		}
+		at := 0
+		for i, n := range c {
+			c[i] = at
+			at += n
+		}
+		for _, rw := range rows {
+			d := byte((uint64(key(rw)) ^ 1<<63) >> (8 * b))
+			tmp[c[d]] = rw
+			c[d]++
+		}
+		rows, tmp = tmp, rows
+	}
+	return rows
+}
+
+// segIntWords fills out with column c of each row, and nulls, nil when there
+// is none, with the rows where it is NULL, when every segment's block of c is
+// INTEGERs with no exception; otherwise it reports false.
+func segIntWords[T any](segs []*segment, c int, rows []T, out []int64, at func(T) (uint16, int32)) ([]bool, bool) {
+	blocks := make([][]int64, len(segs))
+	anyNull := false
+	for si, sg := range segs {
+		b, ok := sg.Int64Column(c)
+		if !ok || len(b) < sg.nRows || sg.hasException(c) {
+			return nil, false
+		}
+		blocks[si] = b
+		anyNull = anyNull || sg.cols[c].nullOff != 0
+	}
+	var nulls []bool
+	if anyNull {
+		nulls = make([]bool, len(rows))
+	}
+	for i, rw := range rows {
+		si, r := at(rw)
+		if nulls != nil && segs[si].isNull(c, int(r)) {
+			nulls[i] = true
+			continue
+		}
+		out[i] = blocks[si][r]
+	}
+	return nulls, true
 }
