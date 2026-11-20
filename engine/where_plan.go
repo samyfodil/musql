@@ -200,7 +200,13 @@ type whereLoopCache struct {
 	limitHit       bool
 	partialUnknown bool
 	populated      bool
+	// ordered is, for one table under an ORDER BY, how many of its terms each
+	// loop satisfies (wherePathSatisfiesOrderBy), orderedUnknown where no
+	// solve has asked.
+	ordered []int8
 }
+
+const orderedUnknown int8 = -128
 
 // wherePlanWinner is what a caller planning an UPDATE's loop, or a subquery
 // inside one, needs to know about the loop that won beyond its order: whether

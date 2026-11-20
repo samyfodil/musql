@@ -146,7 +146,9 @@ func (p *ReadOnlyPager) tryVDBEScan(stmt *SelectStmt, outer *evalCtx, params []V
 	if cacheKey == "" {
 		rowOuter = outer
 	}
-	prog, cerr := compileSelectScanRow(p, stmt, nil, rowOuter)
+	var prog *Program
+	var cerr error
+	p.memoDerivedCols(func() { prog, cerr = compileSelectScanRow(p, stmt, nil, rowOuter) })
 	if cerr != nil {
 		if errors.Is(cerr, errVDBESemantic) {
 			return nil, nil, true, cerr // see tryVDBENoFrom

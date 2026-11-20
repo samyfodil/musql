@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 )
 
 // markWherePlanEligibility decides, once per resolved FROM clause, whether the
@@ -827,45 +828,47 @@ func wherePlanSingleTableIndexOrder(p *ReadOnlyPager, c *compiler, srcs []joinSo
 // wherePlanSeedInvariant runs solve for every seed-path row count C could plan
 // with (MIN(nQueryLoop, 48), down to where costs saturate below -600) and returns
 // the key only if every run agrees, including winner flags and the absence of a
-// multi-OR winner. nRow is 0. A deliberate simplification: 649 solves over one cached loop set, about
-// 0.3ms per scan, once per prepared statement; bound the range by the loops' own
-// costs if that shows up.
+// multi-OR winner. nRow is 0. One table's choice is replayed rather than solved
+// at every seed (seedSingleLoopInvariant); where the replay finds a seed that
+// picks another loop, that seed is solved first, as any disagreement declines.
+// A join still solves all 649, about 0.3ms per scan, once per prepared
+// statement; bound the range by the loops' own costs if that shows up.
 func wherePlanSeedInvariant(in wherePlanInput, solve func(wherePlanInput) (*autoIndexKey, logEst, bool)) (*autoIndexKey, logEst, bool) {
-	var first *autoIndexKey
-	var w, firstWin wherePlanWinner
-	verified := false
+	var w wherePlanWinner
 	winner := in.winner
 	in.loops = &whereLoopCache{}
 	in.winner = &w
-	for seed := logEst(48); seed >= -600; seed-- {
+	solveAt := func(seed logEst) (*autoIndexKey, bool) {
 		w = wherePlanWinner{flagsOnly: seed != 48}
 		in.nQueryLoop = seed
 		k, _, ok := solve(in)
-		if !ok || k != nil && k.multiOr != nil {
-			if verified {
-				panic(fmt.Sprintf("engine: seedSingleLoopInvariant said seed %d plans as seed 48 does, and it does not solve", seed))
-			}
-			return nil, 0, false
-		}
-		if seed == 48 {
-			first, firstWin = k, w
-			if c := in.loops; c.populated && len(c.loops) == 1 && !c.loops[0].autoIdx && !c.loops[0].multiOr {
-				// One way to scan and no automatic index, the one loop a seed
-				// can add or take away (solve's "pFrom->nRow < 3"): every seed
-				// solves the same single path.
-				break
-			}
-			if seedSingleLoopInvariant(in) {
-				if !seedInvariantVerify {
-					break
-				}
-				verified = true
-			}
-			continue
-		}
-		// The EXPLAIN line is not asked to agree: it is printed for a top-level
-		// statement only, which never comes here.
-		if w.auto != firstWin.auto || w.oneRow != firstWin.oneRow || !sameAutoIndexKey(k, first) {
+		return k, ok && (k == nil || k.multiOr == nil)
+	}
+	first, ok := solveAt(48)
+	if !ok {
+		return nil, 0, false
+	}
+	firstWin := w
+	// The EXPLAIN line is not asked to agree: it is printed for a top-level
+	// statement only, which never comes here.
+	agrees := func(seed logEst) bool {
+		k, ok := solveAt(seed)
+		return ok && w.auto == firstWin.auto && w.oneRow == firstWin.oneRow && sameAutoIndexKey(k, first)
+	}
+	verified, done := false, false
+	if c := in.loops; c.populated && len(c.loops) == 1 && !c.loops[0].autoIdx && !c.loops[0].multiOr {
+		// One way to scan and no automatic index, the one loop a seed can add
+		// or take away (solve's "pFrom->nRow < 3"): every seed solves the same
+		// single path.
+		done = true
+	} else if same, other := seedSingleLoopInvariant(in); same {
+		seedInvariantReplays.Add(1)
+		done, verified = !seedInvariantVerify, true
+	} else if other <= 47 && !agrees(other) {
+		return nil, 0, false
+	}
+	for seed := logEst(47); !done && seed >= -600; seed-- {
+		if !agrees(seed) {
 			if verified {
 				panic(fmt.Sprintf("engine: seedSingleLoopInvariant said seed %d plans as seed 48 does, and it does not", seed))
 			}
@@ -883,32 +886,58 @@ func wherePlanSeedInvariant(in wherePlanInput, solve func(wherePlanInput) (*auto
 // engine's tests set it.
 var seedInvariantVerify bool
 
-// seedSingleLoopInvariant reports whether in, one table planned with no ORDER
-// BY, picks one loop at every seed wherePlanSeedInvariant tries, from the
-// loops the seed-48 solve left in in.loops. That loop is all the outcome
-// depends on, so every seed would solve as seed 48 did. It replays solve's
-// choice for one table: mxChoice 1, no sort cost, the seed entering only as
-// the starting row count.
-func seedSingleLoopInvariant(in wherePlanInput) bool {
-	if len(in.items) != 1 || in.sort.nOrderBy() > 0 || in.sort != nil && in.sort.distinctCandidate ||
+// seedInvariantReplays counts the solves seedSingleLoopInvariant answered for.
+var seedInvariantReplays atomic.Int64
+
+// seedSingleLoopInvariant reports whether in, one table, picks one loop at
+// every seed wherePlanSeedInvariant tries, from the loops the seed-48 solve
+// left in in.loops, and otherwise the first seed that picks another (49 if
+// none can be named). That loop is all the outcome depends on, so every seed
+// would solve as seed 48 did. It replays plan's choice for one table: mxChoice
+// 1, the seed entering as the starting row count, and under an ORDER BY a
+// second pass after whereInterstageHeuristic whose sort costs take the first
+// pass's row count. How many ORDER BY terms each loop satisfies does not
+// depend on the seed, and the seed-48 solve recorded it.
+func seedSingleLoopInvariant(in wherePlanInput) (bool, logEst) {
+	if len(in.items) != 1 || in.sort != nil && in.sort.distinctCandidate && !in.sort.distinctBy ||
 		in.loops == nil || !in.loops.populated {
-		return false
+		return false, 49
 	}
 	loops := in.loops.loops
-	win := func(seed logEst) int {
+	nOrderBy := in.sort.nOrderBy()
+	if nOrderBy > 0 && len(in.loops.ordered) != len(loops) {
+		return false, 49
+	}
+	disabled := make([]bool, len(loops))
+	// pick is solve for one table: nRowEst 0 is the first pass, which prices
+	// no sort. It answers -2 for a loop whose order no solve recorded.
+	pick := func(seed, nRowEst logEst) int {
 		best := -1
 		var bCost, bRow, bUnsort logEst
 		for li := range loops {
 			w := &loops[li]
-			if w.disabled || w.prereq != 0 || w.autoIdx && seed < 3 {
+			if w.disabled || w.prereq != 0 || w.autoIdx && seed < 3 || nRowEst != 0 && disabled[li] {
 				continue
 			}
 			rUnsort := w.rRun + seed
 			if w.rSetup != 0 {
 				rUnsort = logEstAdd(w.rSetup, rUnsort)
 			}
-			rCost := logEstAdd(rUnsort, 0)
-			rUnsort = rCost - 2
+			rUnsort = logEstAdd(rUnsort, 0)
+			rCost := rUnsort
+			if nRowEst != 0 {
+				o := in.loops.ordered[li]
+				if o == orderedUnknown {
+					return -2
+				}
+				if o >= 0 && int(o) < nOrderBy {
+					rCost = logEstAdd(rUnsort, whereSortingCost(in.sort, nRowEst, nOrderBy, int(o))) + 3
+				} else {
+					rUnsort -= 2
+				}
+			} else {
+				rUnsort -= 2
+			}
 			nOut := seed + w.nOut
 			if best >= 0 && (bCost < rCost || bCost == rCost && bRow < nOut ||
 				bCost == rCost && bRow == nOut && bUnsort < rUnsort ||
@@ -919,16 +948,36 @@ func seedSingleLoopInvariant(in wherePlanInput) bool {
 		}
 		return best
 	}
+	win := func(seed logEst) int {
+		first := pick(seed, 0)
+		if first < 0 || nOrderBy == 0 {
+			return first
+		}
+		p := &loops[first]
+		for i := range loops {
+			l := &loops[i]
+			disabled[i] = (p.colEq || p.colNull || p.colIn) && l.iTab == p.iTab &&
+				!(l.colEq || l.colNull || l.colRange || l.colIn || l.autoIdx)
+		}
+		nRowEst := seed + p.nOut + 1
+		if seed+p.nOut < 0 {
+			nRowEst = 1
+		}
+		if second := pick(seed, nRowEst); second != -1 {
+			return second
+		}
+		return first
+	}
 	want := win(48)
 	if want < 0 {
-		return false
+		return false, 49
 	}
 	for seed := logEst(47); seed >= -600; seed-- {
 		if win(seed) != want {
-			return false
+			return false, seed
 		}
 	}
-	return true
+	return true, 49
 }
 
 // wherePlanSeedInvariantOrder is wherePlanSeedInvariant for a join: every
