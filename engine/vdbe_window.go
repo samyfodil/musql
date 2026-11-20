@@ -21,6 +21,7 @@
 package engine
 
 import (
+	"cmp"
 	"fmt"
 	"reflect"
 	"slices"
@@ -904,29 +905,57 @@ func (m *vdbe) partitionAndOrder(plan *windowPlan, lvl windowCall, batch [][]Val
 			orderExprs[i] = ot.Expr
 		}
 		orderColls := m.windowKeyCollations(plan, orderExprs, batch, vals)
-		keys := make(map[int][]Value, len(order))
-		for _, i := range order {
-			k, err := keyOf(i, orderExprs, lvl.orderCols)
-			if err != nil {
-				return nil, err
-			}
-			keys[i] = k
+		enc := m.encoding()
+		type keyed struct {
+			at  int
+			row int
+			k   []Value
 		}
+		nk := len(orderExprs)
+		flat := make([]Value, 0, len(order)*nk)
+		ks := make([]keyed, 0, len(order))
 		for _, part := range parts {
-			var sortErr error
-			sort.SliceStable(part, func(a, b int) bool {
-				ka, kb := keys[part[a]], keys[part[b]]
-				for k := range ka {
-					less, equal := orderTermLess(spec.OrderBy[k], ka[k], kb[k], atOrEmpty(orderColls, k), m.encoding())
+			ks = ks[:0]
+			for at, i := range part {
+				for j := range nk {
+					v, err := m.windowOperand(plan, batch[i], atCol(lvl.orderCols, j))
+					if err != nil {
+						return nil, err
+					}
+					flat = append(flat, v)
+				}
+				ks = append(ks, keyed{at, i, flat[len(flat)-nk:]})
+			}
+			// Ties keep the partition's order: at breaks them.
+			slices.SortFunc(ks, func(a, b keyed) int {
+				for k := range a.k {
+					x, y := a.k[k], b.k[k]
+					if x.Typ == Float && y.Typ == Float || x.Typ == Int && y.Typ == Int {
+						c := cmp.Compare(x.F, y.F)
+						if x.Typ == Int {
+							c = cmp.Compare(x.I, y.I)
+						}
+						if c == 0 {
+							continue
+						}
+						if spec.OrderBy[k].Desc {
+							return -c
+						}
+						return c
+					}
+					less, equal := orderTermLess(spec.OrderBy[k], x, y, atOrEmpty(orderColls, k), enc)
 					if equal {
 						continue
 					}
-					return less
+					if less {
+						return -1
+					}
+					return 1
 				}
-				return false
+				return a.at - b.at
 			})
-			if sortErr != nil {
-				return nil, sortErr
+			for j, e := range ks {
+				part[j] = e.row
 			}
 		}
 	}
