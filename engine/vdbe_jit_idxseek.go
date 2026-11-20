@@ -608,9 +608,12 @@ func buildTableSortedVMIdxValues(x *vmIdx, spec *idxSeekSpec, enc TextEncoding) 
 	read := func() {
 		ints, nulls, nums = make([][]int64, len(spec.sortCols)), make([][]bool, len(spec.sortCols)), make([][]Value, len(spec.sortCols))
 		for j := 1; j < len(spec.sortCols); j++ {
-			c, is := spec.sortCols[j], make([]int64, len(rows))
-			if ns, ok := segIntWords(t.at, c, rows, is, func(rw row) (uint16, int32) { return rw.seg, rw.r }); ok {
+			c := spec.sortCols[j]
+			if is, ns, ok := segIntWords(t.at, c, rows, func(rw row) (uint16, int32) { return rw.seg, rw.r }); ok {
 				ints[j], nulls[j] = is, ns
+				continue
+			}
+			if slices.ContainsFunc(t.at, func(sg *segment) bool { p := sg.cols[c].phys; return p == PhysText || p == PhysBlob }) {
 				continue
 			}
 			vs := make([]Value, len(rows))
@@ -723,12 +726,23 @@ func sortedVMIdxFrom(x *vmIdx, s *segSortedRows) *vmIdx {
 func (x *vmIdx) tableIndex(mask uint64, n int, at func(i int) (seg, r int, k int64)) *vmIdx {
 	t := x.tab
 	keep := make([]int, n)
-	x.rowSegs, x.segPtrs = make([]*segment, n), make([]unsafe.Pointer, n)
-	var vals []int64
-	var starts []int32
+	x.rowSegs = make([]*segment, n)
+	if len(t.at) > 1 {
+		x.segPtrs = make([]unsafe.Pointer, n)
+	}
+	d := 0
+	for i, prev := 0, int64(0); i < n; i++ {
+		if _, _, k := at(i); i == 0 || k != prev {
+			d, prev = d+1, k
+		}
+	}
+	vals, starts := make([]int64, 0, d), make([]int32, 0, d+1)
 	for i := range n {
 		seg, r, k := at(i)
-		keep[i], x.rowSegs[i], x.segPtrs[i] = r, t.at[seg], t.segs[seg].Seg
+		keep[i], x.rowSegs[i] = r, t.at[seg]
+		if x.segPtrs != nil {
+			x.segPtrs[i] = t.segs[seg].Seg
+		}
 		if i == 0 || k != vals[len(vals)-1] {
 			vals, starts = append(vals, k), append(starts, int32(i))
 		}
@@ -762,8 +776,13 @@ func buildSegSortedVMIdx(x *vmIdx, spec *idxSeekSpec) *vmIdx {
 		}
 		b := blocks[0]
 		rows := make([]int, len(perm))
-		var vals []int64
-		var starts []int32
+		d := 1
+		for i := 1; i < len(perm); i++ {
+			if b[perm[i]] != b[perm[i-1]] {
+				d++
+			}
+		}
+		vals, starts := make([]int64, 0, d), make([]int32, 0, d+1)
 		for i, r := range perm {
 			rows[i] = int(r)
 			if i == 0 || b[r] != b[perm[i-1]] {
@@ -1057,20 +1076,21 @@ func radixSortByKey[T any](rows []T, key func(T) int64) []T {
 	return rows
 }
 
-// segIntWords fills out with column c of each row, and nulls, nil when there
-// is none, with the rows where it is NULL, when every segment's block of c is
-// INTEGERs with no exception; otherwise it reports false.
-func segIntWords[T any](segs []*segment, c int, rows []T, out []int64, at func(T) (uint16, int32)) ([]bool, bool) {
+// segIntWords is column c of each row, and nulls, nil when there is none,
+// with the rows where it is NULL, when every segment's block of c is INTEGERs
+// with no exception; otherwise it reports false.
+func segIntWords[T any](segs []*segment, c int, rows []T, at func(T) (uint16, int32)) ([]int64, []bool, bool) {
 	blocks := make([][]int64, len(segs))
 	anyNull := false
 	for si, sg := range segs {
 		b, ok := sg.Int64Column(c)
 		if !ok || len(b) < sg.nRows || sg.hasException(c) {
-			return nil, false
+			return nil, nil, false
 		}
 		blocks[si] = b
 		anyNull = anyNull || sg.cols[c].nullOff != 0
 	}
+	out := make([]int64, len(rows))
 	var nulls []bool
 	if anyNull {
 		nulls = make([]bool, len(rows))
@@ -1083,5 +1103,5 @@ func segIntWords[T any](segs []*segment, c int, rows []T, out []int64, at func(T
 		}
 		out[i] = blocks[si][r]
 	}
-	return nulls, true
+	return out, nulls, true
 }
