@@ -335,6 +335,15 @@ func compileScanSorted(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols
 		return nil
 	}
 
+	// A virtual table offered the OFFSET zeroes its counter once filtered,
+	// so that counter is set before the loop, where computeLimitRegisters
+	// sets it.
+	vtabOffsetReg := -1
+	if stmt.LimitParam == nil && stmt.OffsetParam == nil && stmt.Offset != nil && *stmt.Offset > 0 && oneVtabSource(srcs) {
+		vtabOffsetReg = c.alloc()
+		c.emit(literalIntInstr(*stmt.Offset, vtabOffsetReg))
+		srcs[0].vtabOffset = &vtabOffsetPush{n: *stmt.Offset, reg: vtabOffsetReg}
+	}
 	if err := emitJoinLoops(c, srcs, plan, body); err != nil {
 		return nil, err
 	}
@@ -372,6 +381,9 @@ func compileScanSorted(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols
 			return nil, oerr
 		}
 		haveOffset, offsetReg = true, r
+	}
+	if !haveOffset && vtabOffsetReg >= 0 {
+		haveOffset, offsetReg = true, vtabOffsetReg
 	}
 	if !haveOffset && stmt.Offset != nil {
 		off := *stmt.Offset

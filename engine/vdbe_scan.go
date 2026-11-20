@@ -650,6 +650,9 @@ func compileScanPlain(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols 
 			haveOffset = true
 			offsetReg = c.alloc()
 			c.emit(literalIntInstr(off, offsetReg))
+			if stmt.LimitParam == nil && oneVtabSource(srcs) {
+				srcs[0].vtabOffset = &vtabOffsetPush{n: off, reg: offsetReg}
+			}
 		}
 	}
 	if !haveLimit && stmt.Limit != nil && *stmt.Limit >= 0 {

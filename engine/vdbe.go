@@ -2544,7 +2544,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 							},
 						}
 						vs.start = func() (*vtabScan, error) {
-							sc, err := dsPager.startVtabStream(vt, params, outer, ds.vtabTrig, m, corr)
+							sc, err := dsPager.startVtabStream(vt, params, outer, ds.vtabTrig, m, corr, 0)
 							if sc != nil && err == nil {
 								m.keepVtabStream(ds, vs, sc)
 							}
@@ -2573,7 +2573,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				if ds.vtabStream && ds.lazy {
 					m.cursors[op.P1] = openVtabStreamCursor(ds.tbl, &vtabStream{
 						start: func() (*vtabScan, error) {
-							return dsPager.startVtabStream(*ds.vtab, m.params, m.outer, ds.vtabTrig, m, nil)
+							return dsPager.startVtabStream(*ds.vtab, m.params, m.outer, ds.vtabTrig, m, nil, ds.vtabOffset)
 						},
 						fallback: func() ([][]Value, []int64, error) {
 							return m.runVtabOnce(slot, ds, dsPager)
@@ -2746,6 +2746,11 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				break
 			}
 			m.cursors[op.P1] = openDerivedCursor(ds.tbl, rows, ds.keepSubtype)
+
+		case OpVtabOmitOffset:
+			if cur := m.cursors[op.P1]; cur != nil && cur.vt != nil && cur.vt.scan != nil && cur.vt.scan.omitOffset {
+				m.regs[op.P2] = Value{Typ: Int, I: 0}
+			}
 
 		case OpIfEmpty:
 			if op.P1 < 0 || op.P1 >= len(m.cursors) {

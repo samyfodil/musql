@@ -271,3 +271,54 @@ func TestSeriesStreamsPastCap(t *testing.T) {
 		}
 	}
 }
+
+// TestSeriesOffset is sqlite3WhereAddLimit's OFFSET: a lone generate_series
+// takes it with the LIMIT and skips the values in its own walk, which is both
+// instant over billions of values and, under an ORDER BY the module does not
+// consume, a different set of rows than skipping after the sort. The answers
+// are C's. Each runs twice, the second time from the cached plan.
+func TestSeriesOffset(t *testing.T) {
+	db, err := Create(filepath.Join(t.TempDir(), "s.musq"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for range 2 {
+		for _, tc := range []struct{ q, want string }{
+			{`SELECT value FROM generate_series(5) LIMIT -1 OFFSET 4294967289`, `4294967294;4294967295;`},
+			{`SELECT value FROM generate_series(1, 1000000000) LIMIT 5 OFFSET 999999990`, `999999991;999999992;999999993;999999994;999999995;`},
+			{`SELECT value FROM generate_series(1,10) ORDER BY start, value DESC LIMIT 2 OFFSET 1`, `3;2;`},
+			{`SELECT value FROM generate_series(1,10) ORDER BY step, value DESC LIMIT 2 OFFSET 1`, `3;2;`},
+			{`SELECT value FROM generate_series(1,10) ORDER BY value DESC LIMIT 2 OFFSET 1`, `9;8;`},
+			{`SELECT value FROM generate_series(1,10) ORDER BY start DESC LIMIT -1 OFFSET 8`, `9;10;`},
+			{`SELECT value FROM generate_series(1,10) LIMIT 5 OFFSET 10`, ``},
+			{`SELECT value FROM generate_series(1,10) LIMIT 5 OFFSET 9`, `10;`},
+			{`SELECT value FROM generate_series(10,1,-3) LIMIT 2 OFFSET 1`, `7;4;`},
+			{`SELECT value FROM generate_series(5,100) WHERE value > 12 AND value >= (SELECT 10) LIMIT 3 OFFSET 2`, `15;16;17;`},
+			{`SELECT value FROM generate_series(5) WHERE value % 2 = 0 LIMIT 2 OFFSET 1`, `8;10;`},
+			{`WITH t(x) AS (VALUES(1),(2),(3)) SELECT x, (SELECT value + x FROM generate_series(1,10) LIMIT 1 OFFSET 2) FROM t`, `1 4;2 5;3 6;`},
+			{`WITH t(x) AS (VALUES(1),(2),(3)) SELECT x, (SELECT value FROM generate_series(x, 10) LIMIT 1 OFFSET 2) FROM t`, `1 3;2 4;3 5;`},
+			{`SELECT value FROM generate_series(1,100) WHERE value BETWEEN 20 AND 30 LIMIT 2 OFFSET 3`, `23;24;`},
+			{`SELECT a.value, b.value FROM generate_series(1,3) a, generate_series(1,2) b LIMIT 2 OFFSET 3`, `2 2;3 1;`},
+			{`SELECT value FROM generate_series(1,10) LIMIT 0 OFFSET 5`, ``},
+			{`SELECT value FROM generate_series(-9223372036854775808, 9223372036854775807) LIMIT 2 OFFSET 9223372036854775807`, `-1;0;`},
+			{`SELECT value FROM generate_series(1, 4294967295) ORDER BY value DESC LIMIT 2 OFFSET 4294967290`, `5;4;`},
+			{`SELECT value FROM generate_series(1,10) ORDER BY step LIMIT 3 OFFSET 2`, `3;4;5;`},
+			{`SELECT value FROM generate_series(1,10) WHERE value > 3 ORDER BY value DESC LIMIT 2 OFFSET 2`, `8;7;`},
+			{`SELECT value FROM generate_series(1,10,2) ORDER BY value DESC LIMIT -1 OFFSET 3`, `3;1;`},
+			{`SELECT value FROM (SELECT value FROM generate_series(1,10)) LIMIT 2 OFFSET 4`, `5;6;`},
+			{`SELECT value, sum(value) OVER () FROM generate_series(1,10) LIMIT 2 OFFSET 3`, `4 55;5 55;`},
+			{`SELECT value FROM generate_series(1,10) WHERE value = 4 LIMIT 1 OFFSET 0`, `4;`},
+			{`SELECT value FROM generate_series(1,10) WHERE value = 4 LIMIT 1 OFFSET 1`, ``},
+			{`SELECT value FROM generate_series(9223372036854775800, 9223372036854775807, 3) ORDER BY value DESC LIMIT 5 OFFSET 1`, `9223372036854775803;9223372036854775800;`},
+		} {
+			_, rows, err := db.Query(tc.q, nil)
+			if err != nil {
+				t.Fatalf("%s: %v", tc.q, err)
+			}
+			if got := rowsText(rows); got != tc.want {
+				t.Errorf("%s:\n got %s\nwant %s", tc.q, got, tc.want)
+			}
+		}
+	}
+}

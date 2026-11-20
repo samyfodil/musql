@@ -31,6 +31,8 @@ type vtabScan struct {
 	idxStr   string
 	argv     []Value
 	argvFrom []int
+	// omitOffset: the module skips the statement's OFFSET (OpVtabOmitOffset).
+	omitOffset bool
 }
 
 // openVtabStreamCursor opens a cursor that streams s, or materializes through
@@ -43,8 +45,8 @@ func openVtabStreamCursor(tbl *resolvedTable, s *vtabStream) *vdbeCursor {
 
 // startVtabStream is the start of a vtabStream over it: the module resolved
 // and its cursor opened and filtered as materializeVtab would, or nil for a
-// module that is not a vtabStreamer.
-func (p *ReadOnlyPager) startVtabStream(it FromItem, params []Value, outer *evalCtx, trig *trigCompileCtx, from *vdbe, corr []vtabCorrValue) (*vtabScan, error) {
+// module that is not a vtabStreamer. offset is vtabFilterArgs'.
+func (p *ReadOnlyPager) startVtabStream(it FromItem, params []Value, outer *evalCtx, trig *trigCompileCtx, from *vdbe, corr []vtabCorrValue, offset int64) (*vtabScan, error) {
 	mod, modArgs, err := p.resolveVtabModuleForItem(it)
 	if err != nil {
 		return nil, err
@@ -60,7 +62,7 @@ func (p *ReadOnlyPager) startVtabStream(it FromItem, params []Value, outer *eval
 	for i, c := range vcols {
 		cols[i] = columnInfo{Name: c.Name, DeclType: c.Type, Aff: vtabColumnAffinity(c), Hidden: c.Hidden, Unindexed: c.Unindexed}
 	}
-	info, argv, argvFrom, err := p.vtabFilterArgs(it, cols, tab, params, outer, trig, from, corr)
+	info, argv, argvFrom, err := p.vtabFilterArgs(it, cols, tab, params, outer, trig, from, corr, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +74,7 @@ func (p *ReadOnlyPager) startVtabStream(it FromItem, params []Value, outer *eval
 		ea.setTextEncoding(p.encoding())
 	}
 	cur = newVtabInLoopCursor(cur, info.inLoops)
-	sc := &vtabScan{cur: cur, idxNum: info.IdxNum, idxStr: info.IdxStr, argv: argv, argvFrom: argvFrom}
+	sc := &vtabScan{cur: cur, idxNum: info.IdxNum, idxStr: info.IdxStr, argv: argv, argvFrom: argvFrom, omitOffset: info.omitOffset}
 	if err := cur.Filter(sc.idxNum, sc.idxStr, sc.argv); err != nil {
 		return nil, err
 	}

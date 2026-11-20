@@ -121,10 +121,15 @@ const (
 	VtabLT
 	VtabGE
 	// VtabLimit is SQLITE_INDEX_CONSTRAINT_LIMIT, offered only to a module
-	// that takes it (vtabLimitTaker), with Column -1. Its value is the most
-	// rows the statement reads from the module: its LIMIT plus its OFFSET,
-	// since this engine applies both itself, so the module skips none.
+	// that takes it (vtabLimitTaker), with Column -1. Offered with a
+	// VtabOffset, its value is the statement's LIMIT; alone, it is the most
+	// rows the statement reads from the module, its LIMIT plus its OFFSET,
+	// which this engine then skips itself.
 	VtabLimit
+	// VtabOffset is SQLITE_INDEX_CONSTRAINT_OFFSET, offered after a VtabLimit.
+	// A module that takes it and sets Omit skips the rows, and the statement's
+	// OFFSET counter is zeroed (OpVtabOmitOffset).
+	VtabOffset
 )
 
 // vtabLimitTaker is a module whose BestIndex may take a VtabLimit.
@@ -197,6 +202,7 @@ type VtabIndexInfo struct {
 	Constraints []VtabConstraint      // input: candidate constraints
 	Usage       []VtabConstraintUsage // output: parallel to Constraints
 	OrderBy     []VtabOrderBy         // input: the statement's ORDER BY, offered with a VtabLimit only
+	omitOffset  bool                  // the module took the VtabOffset and omits it
 	IdxNum      int                   // output: opaque plan number for Filter
 	IdxStr      string                // output: opaque plan string for Filter
 
@@ -447,7 +453,7 @@ func (p *ReadOnlyPager) materializeVtab(it FromItem, params []Value, outer *eval
 		return p.materializeFts3Item(it, it.Table, cols, sch)
 	}
 
-	info, argv, _, err := p.vtabFilterArgs(it, cols, tab, params, outer, trig, from, corr)
+	info, argv, _, err := p.vtabFilterArgs(it, cols, tab, params, outer, trig, from, corr, 0)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -546,8 +552,10 @@ func (p *ReadOnlyPager) materializeVtab(it FromItem, params []Value, outer *eval
 
 // vtabFilterArgs offers the constraints of it to tab's BestIndex and returns the
 // plan it chose and the arguments Filter takes for it. argvFrom[k] is the corr
-// entry argv[k] was taken from, -1 for one folded here.
-func (p *ReadOnlyPager) vtabFilterArgs(it FromItem, cols []columnInfo, tab VirtualTable, params []Value, outer *evalCtx, trig *trigCompileCtx, from *vdbe, corr []vtabCorrValue) (info *VtabIndexInfo, argv []Value, argvFrom []int, err error) {
+// entry argv[k] was taken from, -1 for one folded here. offset, when positive,
+// is the statement's OFFSET, offered as a VtabOffset: the caller zeroes its
+// counter when the module takes it (info.omitOffset).
+func (p *ReadOnlyPager) vtabFilterArgs(it FromItem, cols []columnInfo, tab VirtualTable, params []Value, outer *evalCtx, trig *trigCompileCtx, from *vdbe, corr []vtabCorrValue, offset int64) (info *VtabIndexInfo, argv []Value, argvFrom []int, err error) {
 	constraints, rhsVals, rhsFrom, loops, err := p.buildVtabConstraints(it, cols, params, outer, trig, from, corr)
 	if err != nil {
 		return nil, nil, nil, err
@@ -555,15 +563,23 @@ func (p *ReadOnlyPager) vtabFilterArgs(it FromItem, cols []columnInfo, tab Virtu
 	var orderBy []VtabOrderBy
 	if _, ok := tab.(vtabLimitTaker); ok && len(loops) == 0 {
 		var n int64
-		if n, orderBy, ok = vtabRowBound(it, cols, constraints); ok {
+		if n, orderBy, ok = vtabRowBound(it, cols, constraints, offset); ok {
 			constraints = append(constraints, VtabConstraint{Column: -1, Op: VtabLimit, Usable: true, Omitted: true})
 			rhsVals = append(rhsVals, Value{Typ: Int, I: n})
 			rhsFrom = append(rhsFrom, -1)
+			if offset > 0 {
+				constraints = append(constraints, VtabConstraint{Column: -1, Op: VtabOffset, Usable: true, Omitted: true})
+				rhsVals = append(rhsVals, Value{Typ: Int, I: offset})
+				rhsFrom = append(rhsFrom, -1)
+			}
 		}
 	}
 	info = &VtabIndexInfo{Constraints: constraints, Usage: make([]VtabConstraintUsage, len(constraints)), OrderBy: orderBy}
 	if err := tab.BestIndex(info); err != nil {
 		return nil, nil, nil, err
+	}
+	if i := len(constraints) - 1; i >= 0 && constraints[i].Op == VtabOffset {
+		info.omitOffset = info.Usage[i].ArgvIndex > 0 && info.Usage[i].Omit
 	}
 	for i, in := range loops {
 		// The WHERE no longer tests an IN the module was to consume.
@@ -600,12 +616,13 @@ func (p *ReadOnlyPager) vtabFilterArgs(it FromItem, cols []columnInfo, tab Virtu
 // constraint on a column of the item with a right-hand side of no other item
 // (cs, all usable), a BETWEEN by its two children; and an ORDER BY, if any, of
 // the item's columns with no NULLS placement against the direction, which is
-// offered with it.
-// false for a LIMIT that does not bound the rows (negative), and for anything
-// this does not follow.
-func vtabRowBound(it FromItem, cols []columnInfo, cs []VtabConstraint) (int64, []VtabOrderBy, bool) {
+// offered with it. With an offset to offer (the statement's own OFFSET,
+// positive), the LIMIT is returned as written, negative too, as
+// sqlite3WhereAddLimit offers it. false for a LIMIT that does not bound the
+// rows (negative) with no offset, and for anything this does not follow.
+func vtabRowBound(it FromItem, cols []columnInfo, cs []VtabConstraint, offset int64) (int64, []VtabOrderBy, bool) {
 	s := it.vtabSelect
-	if s == nil || s.Limit == nil || s.LimitParam != nil || s.OffsetParam != nil || *s.Limit < 0 ||
+	if s == nil || s.Limit == nil || s.LimitParam != nil || s.OffsetParam != nil ||
 		len(s.From) != 1 || len(s.Compound) != 0 || s.Distinct || selectIsAggregateQuery(s) ||
 		// sqlite3WindowRewrite moved the FROM of a window query into a
 		// subquery, so the select WHERE runs for has no virtual table.
@@ -639,6 +656,15 @@ func vtabRowBound(it FromItem, cols []columnInfo, cs []VtabConstraint) (int64, [
 		orderBy = append(orderBy, VtabOrderBy{Column: ci, Desc: o.Desc})
 	}
 	n := *s.Limit
+	if offset > 0 {
+		if s.Offset == nil || *s.Offset != offset {
+			return 0, nil, false
+		}
+		return n, orderBy, true
+	}
+	if n < 0 {
+		return 0, nil, false
+	}
 	if s.Offset != nil && *s.Offset > 0 {
 		if n > math.MaxInt64-*s.Offset {
 			return 0, nil, false

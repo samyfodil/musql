@@ -36,6 +36,18 @@ import (
 // expression trees need a real evalCtx with correctly offset-adjusted
 // tables/vals -- see vdbe_agg.go), and how it's joined onto the sources
 // before it.
+// vtabOffsetPush is a statement's literal OFFSET n, counted in register reg.
+type vtabOffsetPush struct {
+	n   int64
+	reg int
+}
+
+// oneVtabSource reports whether srcs is one uncorrelated virtual table, which
+// sqlite3WhereAddLimit offers the statement's OFFSET (joinSource.vtabOffset).
+func oneVtabSource(srcs []joinSource) bool {
+	return len(srcs) == 1 && srcs[0].vtabItem != nil && len(srcs[0].vtabCorr) == 0
+}
+
 type joinSource struct {
 	// nthTail: the derived body is a window select whose reader meets its
 	// error only on the row that raises it (SelectStmt.nthTail); its rows
@@ -182,6 +194,10 @@ type joinSource struct {
 	// real rowid, so noRowid stays false and the cursor gets materializeVtab's
 	// rowids.
 	vtabItem *FromItem
+	// vtabOffset, set on a statement's one source, is its OFFSET to offer a
+	// virtual table with the LIMIT, and the counter to zero should the module
+	// take it (derivedSource.vtabOffset, OpVtabOmitOffset).
+	vtabOffset *vtabOffsetPush
 
 	// vtabDrivesBestIndex reports whether the rows really come from the module's
 	// BestIndex/Filter cursor rather than a row source materializeVtab serves first
@@ -3126,7 +3142,13 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 			// is folded at RUN time, and that is the only channel by which
 			// "json_each(NEW.x)" in a trigger body can reach the firing row.
 			// See derivedSource.vtabTrig (vdbe_op.go).
-			c.emit(Instruction{Op: OpOpenDerived, P1: s.scope.cursor, P2: s.derivedSlot, P4: &derivedSource{vtab: s.vtabItem, vtabTrig: c.trig, tbl: s.tbl, dbIdx: s.dbIdx, lazy: true, vtabStream: i == streamVtab}})
+			ds := &derivedSource{vtab: s.vtabItem, vtabTrig: c.trig, tbl: s.tbl, dbIdx: s.dbIdx, lazy: true, vtabStream: i == streamVtab}
+			if i == streamVtab && s.vtabOffset != nil {
+				ds.vtabOffset = s.vtabOffset.n
+			} else {
+				srcs[i].vtabOffset = nil
+			}
+			c.emit(Instruction{Op: OpOpenDerived, P1: s.scope.cursor, P2: s.derivedSlot, P4: ds})
 			continue
 		}
 		if s.cteItem != nil {
@@ -3564,6 +3586,9 @@ func (c *compiler) emitJoinLevel(srcs []joinSource, plan joinPlan, level int, bo
 			return err
 		}
 		rewindJump := c.emit(Instruction{Op: OpRewind, P1: cur})
+		if s.vtabOffset != nil {
+			c.emit(Instruction{Op: OpVtabOmitOffset, P1: cur, P2: s.vtabOffset.reg})
+		}
 		loopAddr := c.here()
 		onJump := -1
 		if s.on != nil && !s.onToWhere {

@@ -180,7 +180,7 @@ func (m *vdbe) seriesOf(ds *derivedSource) (*seriesCursor, bool) {
 	if err != nil {
 		return nil, false
 	}
-	sc, err := p.startVtabStream(*ds.vtab, m.params, m.outer, ds.vtabTrig, m, nil)
+	sc, err := p.startVtabStream(*ds.vtab, m.params, m.outer, ds.vtabTrig, m, nil, 0)
 	if err != nil || sc == nil {
 		return nil, false
 	}
