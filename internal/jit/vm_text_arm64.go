@@ -117,6 +117,16 @@ func (e *vmEmitArm) textCmp(pc int, in VInsn) {
 		}
 		e.destNoS(pc, in.C)
 	}
+	zs := e.zeroS.has(in.C)
+	nullArm := in.Imm&VCmpNull != 0
+	null, done := e.vmLabel("tn"), e.vmLabel("td")
+	if nullArm {
+		for _, r := range []int{in.A, in.B} {
+			e.ldrb(X10, r, L.OffTyp)
+			a.CmpImm(X10, uint32(L.TypNull))
+			a.Bcond(CondE, null)
+		}
+	}
 	text, loop, tail := e.vmLabel("tt"), e.vmLabel("tl"), e.vmLabel("te")
 	e.ldrb(X9, in.A, L.OffTyp)
 	e.ldrb(X10, in.B, L.OffTyp)
@@ -135,7 +145,7 @@ func (e *vmEmitArm) textCmp(pc int, in VInsn) {
 	a.Bcond(CondNE, e.stub(pc))
 	a.LdrImm(X9, X0, POffUTF16)
 	a.Cbnz(X9, e.stub(pc))
-	if in.Imm == 1 {
+	if in.Imm&1 != 0 {
 		// Under a numeric affinity a TEXT that is a whole number is compared
 		// as one: the VDBE's.
 		e.numericTextExit(pc, in.B)
@@ -165,9 +175,31 @@ func (e *vmEmitArm) textCmp(pc int, in VInsn) {
 	a.Label(tail)
 	if in.Op == VTextCmpJump {
 		e.jccBlock(in.Cond, pc, in.T)
+	} else {
+		m := e.dest(pc, in.C, X9)
+		a.Cset(m, in.Cond)
+		e.storeInt(in, in.C, m)
+	}
+	if !nullArm {
 		return
 	}
-	m := e.dest(pc, in.C, X9)
-	a.Cset(m, in.Cond)
-	e.storeInt(in, in.C, m)
+	a.B(done)
+	a.Label(null)
+	if in.Op == VTextCmpSet {
+		a.MovImm16(X10, uint16(L.TypNull))
+		e.str(X10, in.C, 0)
+		e.str(xzr, in.C, L.OffI)
+		e.str(xzr, in.C, L.OffF)
+		if zs {
+			e.zeroS.add(in.C)
+		}
+		e.clearS(in.C)
+	} else if in.Imm&VCmpNullJumps != 0 {
+		e.jmpBlock(pc, in.T)
+	}
+	a.Label(done)
+	if in.Op == VTextCmpSet {
+		e.unmap(in.C)
+		e.know.wroteAny(in.C, true)
+	}
 }

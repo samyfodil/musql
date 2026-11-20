@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"math"
 	"slices"
+	"sort"
 	"sync/atomic"
 )
 
@@ -91,7 +92,7 @@ func (cur *vdbeCursor) segSortable() bool {
 // A key of further columns is served on its first alone where its runs are
 // short (shortRuns): the run holds every row equal on all of them, in the
 // order they would come, and the loop drops the rest.
-func (cur *vdbeCursor) segSortedSeek(h *sortedSeekHint, probe Value, enc TextEncoding) bool {
+func (cur *vdbeCursor) segSortedSeek(h *sortedSeekHint, probe Value, regs []Value, enc TextEncoding) bool {
 	s, orderOp, ok := cur.segSortedReady(h, enc)
 	if !ok {
 		return false
@@ -99,6 +100,9 @@ func (cur *vdbeCursor) segSortedSeek(h *sortedSeekHint, probe Value, enc TextEnc
 	s.seeks++
 	lo, hi := s.find(probe)
 	s.orderRun(lo, hi)
+	if ord, ok := s.moreOrder(h); ok {
+		lo, hi = s.narrow(lo, hi, h, ord, regs)
+	}
 	src := &cur.pointSrc
 	segs, rows := src.listSegs[:0], src.listRows[:0]
 	if s.one != nil {
@@ -143,7 +147,10 @@ func (cur *vdbeCursor) segSortedReady(h *sortedSeekHint, enc TextEncoding) (*seg
 		s.order, s.tbl, s.enc = key, cur.tbl, enc
 		cur.segSorted = s
 	}
-	if !s.ok || len(h.more) > 0 && !s.shortRuns() {
+	if !s.ok {
+		return nil, nil, false
+	}
+	if _, narrows := s.moreOrder(h); len(h.more) > 0 && !narrows && !s.shortRuns() {
 		return nil, nil, false
 	}
 	return s, orderOp, true
@@ -271,6 +278,60 @@ func (s *segSortedRows) orderRun(lo, hi int) {
 		s.ordered = map[int]bool{}
 	}
 	s.ordered[lo] = true
+}
+
+// moreOrder is the seek's further columns in the order s.order sorts a run
+// by them, as indexes into h.more, when it sorts by them first: then the
+// rows of a run equal on them all are one stretch of it (narrow).
+func (s *segSortedRows) moreOrder(h *sortedSeekHint) ([]int, bool) {
+	if len(h.more) == 0 || s.order == nil {
+		return nil, false
+	}
+	key := s.order
+	ord := make([]int, 0, len(h.more))
+	for k, c := range key.cols {
+		if len(ord) == len(h.more) {
+			break
+		}
+		if c == h.col {
+			continue
+		}
+		j := slices.IndexFunc(h.more, func(m sortedSeekCol) bool { return m.col == c })
+		if j < 0 || slices.Contains(ord, j) || k < len(key.desc) && key.desc[k] || k >= len(key.colls) ||
+			!equalFoldName(effectiveCollation(key.colls[k]), effectiveCollation(h.more[j].coll)) {
+			return nil, false
+		}
+		ord = append(ord, j)
+	}
+	return ord, len(ord) == len(h.more)
+}
+
+// narrow is the stretch of the run [lo, hi), in s.order's order, whose
+// further columns equal their keys in regs, compared as the built rows'
+// seek compares them (sortedRows.findTuple). A NULL key equals nothing.
+func (s *segSortedRows) narrow(lo, hi int, h *sortedSeekHint, ord []int, regs []Value) (int, int) {
+	keys := make([]Value, len(ord))
+	for i, j := range ord {
+		mc := h.more[j]
+		if mc.reg < 0 || mc.reg >= len(regs) {
+			return lo, hi
+		}
+		if keys[i] = applyAffinityToValue(regs[mc.reg], mc.aff); keys[i].Typ == Null {
+			return lo, lo
+		}
+	}
+	cmpAt := func(i int) int {
+		for k, j := range ord {
+			mc := h.more[j]
+			if c := compareValuesCollatedEnc(s.cell(i, mc.col), keys[k], mc.coll, s.enc); c != 0 {
+				return c
+			}
+		}
+		return 0
+	}
+	a := lo + sort.Search(hi-lo, func(i int) bool { return cmpAt(lo+i) >= 0 })
+	b := a + sort.Search(hi-a, func(i int) bool { return cmpAt(a+i) > 0 })
+	return a, b
 }
 
 // cell is column c of the row at position i, as orderRun reads it.

@@ -1974,6 +1974,9 @@ func (p *ReadOnlyPager) resolveCorrelatedCTESource(c *compiler, state *joinDesug
 			return joinSource{}, false, nil // let the existing guard below report it
 		}
 	}
+	if b.uncorrelated.Load() {
+		return joinSource{}, false, nil
+	}
 	p.cteExpansion = append(p.cteExpansion, cteExpansionFrame{name: cteName, b: b})
 	defer func() { p.cteExpansion = p.cteExpansion[:len(p.cteExpansion)-1] }()
 	// The body resolves in the scope where THIS CTE was DEFINED, exactly like
@@ -1982,9 +1985,18 @@ func (p *ReadOnlyPager) resolveCorrelatedCTESource(c *compiler, state *joinDesug
 	defer p.enterCTEBodyScope(cteName, b)()
 
 	leave := p.enterFromBody()
+	counts := p.refCountSum()
 	prog, perr := compileSubProgram(p, b.core, derivedOuterBarrier(c))
 	leave()
 	if perr != nil || !prog.Correlated {
+		// A body whose every name bound inside it binds inside it under any
+		// enclosing query: no later reference need compile it to ask. Only
+		// where this compile counted no reference (refCountSum), which the
+		// next would have counted again.
+		if perr == nil && p.refCountSum() == counts {
+			b.uncorrelated.Store(true)
+			b.probe.Store(prog)
+		}
 		return joinSource{}, false, nil
 	}
 	// c's own program must now re-run per enclosing row too, not be cached --
@@ -2229,11 +2241,18 @@ func (p *ReadOnlyPager) cteSchemaColsIn(name string, b *cteBinding, outer *compi
 		schemaOnly.LimitParam, schemaOnly.OffsetParam = nil, nil
 		target = &schemaOnly
 	}
-	leave := p.enterFromBody()
-	prog, perr := compileSubProgram(p, target, outer)
-	leave()
-	if perr != nil {
-		return nil, perr // already wrapped errVDBEUnsupported/errVDBESemantic
+	// The program resolveCorrelatedCTESource compiled, in this scope, and
+	// found binds nothing outside the body: this compile's, but for an outer
+	// it does not bind.
+	prog := b.probe.Load()
+	if prog == nil || target != b.core || b.recursive != nil || outer != nil {
+		leave := p.enterFromBody()
+		var perr error
+		prog, perr = compileSubProgram(p, target, outer)
+		leave()
+		if perr != nil {
+			return nil, perr // already wrapped errVDBEUnsupported/errVDBESemantic
+		}
 	}
 	// A CTE body may have its own WITH, and derivedColumnInfos re-resolves the
 	// body's FROM, so push it here too, as resolveDerivedSource does:

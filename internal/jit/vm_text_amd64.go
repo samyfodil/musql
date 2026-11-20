@@ -122,6 +122,15 @@ func (e *vmEmit) textCmp(pc int, in VInsn) {
 		}
 		e.destNoS(pc, in.C)
 	}
+	zs := e.zeroS.has(in.C)
+	nullArm := in.Imm&VCmpNull != 0
+	null, done := e.vmLabel(), e.vmLabel()
+	if nullArm {
+		for _, r := range []int{in.A, in.B} {
+			a.CmpMemDByte(RSI, e.d(r, L.OffTyp), L.TypNull)
+			a.JccL(CondE, null)
+		}
+	}
 	text, loop, tail := e.vmLabel(), e.vmLabel(), e.vmLabel()
 	a.CmpMemDByte(RSI, e.d(in.A, L.OffTyp), L.TypInt)
 	a.JccL(CondNE, text)
@@ -137,7 +146,7 @@ func (e *vmEmit) textCmp(pc int, in VInsn) {
 	e.jccStub(CondNE, pc)
 	a.CmpMemDByte(RDI, POffUTF16, 0)
 	e.jccStub(CondNE, pc)
-	if in.Imm == 1 {
+	if in.Imm&1 != 0 {
 		// Under a numeric affinity a TEXT that is a whole number is compared
 		// as one: the VDBE's.
 		e.numericTextExit(pc, in.B)
@@ -166,15 +175,36 @@ func (e *vmEmit) textCmp(pc int, in VInsn) {
 	a.Bind(tail)
 	if in.Op == VTextCmpJump {
 		e.jccBlock(in.Cond, pc, in.T)
+	} else {
+		a.MovRegImm64(R10, 0) // a MOV leaves the flags alone
+		a.Setcc(in.Cond, R10)
+		m := e.dest(pc, in.C, R10)
+		if m != R10 {
+			a.MovRegReg(m, R10)
+		}
+		e.storeInt(pc, in, in.C, m)
+	}
+	if !nullArm {
 		return
 	}
-	a.MovRegImm64(R10, 0) // a MOV leaves the flags alone
-	a.Setcc(in.Cond, R10)
-	m := e.dest(pc, in.C, R10)
-	if m != R10 {
-		a.MovRegReg(m, R10)
+	a.JmpL(done)
+	a.Bind(null)
+	if in.Op == VTextCmpSet {
+		a.MovMemDImm(RSI, e.d(in.C, 0), int32(L.TypNull))
+		a.MovMemDImm(RSI, e.d(in.C, L.OffI), 0)
+		a.MovMemDImm(RSI, e.d(in.C, L.OffF), 0)
+		if zs {
+			e.zeroS.add(in.C)
+		}
+		e.clearS(in.C)
+	} else if in.Imm&VCmpNullJumps != 0 {
+		e.jmpBlock(pc, in.T)
 	}
-	e.storeInt(pc, in, in.C, m)
+	a.Bind(done)
+	if in.Op == VTextCmpSet {
+		e.unmap(in.C)
+		e.know.wroteAny(in.C, true)
+	}
 }
 
 // orderedText leaves the flags as a signed compare of r[B]'s TEXT with

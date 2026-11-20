@@ -1697,7 +1697,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			if pc == jitSkip {
 				jitSkip = -1
-				if m.flushJIT() {
+				// Native code that stopped here keeping its cursors (enter's
+				// jDefer) takes them back where it enters again.
+				if !m.jDefer && m.flushJIT() {
 					return nil, m.takeJITErr()
 				}
 				op = &insns[pc]
@@ -1708,6 +1710,10 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			resume := m.jDefer && m.jDeferJX == jx && m.jDeferPC == pc
 			if !resume && m.jDefer && m.flushJIT() {
 				return nil, m.takeJITErr()
+			}
+			if !resume && jx.resumeOnly != nil && jx.resumeOnly[pc] {
+				op = &insns[pc]
+				goto dispatch
 			}
 			// An entry whose first cursor native code could not use would only
 			// pay for the call and exit at that instruction.
@@ -2385,7 +2391,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpSortedSeek:
 			cur := m.cursors[op.P1]
-			if cur != nil && cur.segSortable() && cur.segSortedSeek(op.P4.(*sortedSeekHint), m.regs[op.P2], m.encoding()) {
+			if cur != nil && cur.segSortable() && cur.segSortedSeek(op.P4.(*sortedSeekHint), m.regs[op.P2], m.regs, m.encoding()) {
 				break
 			}
 			if cur != nil {

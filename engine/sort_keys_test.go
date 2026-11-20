@@ -12,13 +12,15 @@ import (
 func TestSortKeyOrdersAsBinary(t *testing.T) {
 	r := rand.New(rand.NewSource(1))
 	strs := [][]byte{nil, {}, {0}, {0, 0}, {0, 1}, {1}, {'a'}, {'a', 0}, {'a', 0, 'b'}, {'a', 'b'}, {'a', 0xff}, {0xff}, {0xff, 0}}
-	ints := []int64{math.MinInt64, math.MinInt64 + 1, -256, -1, 0, 1, 255, 256, math.MaxInt64}
+	ints := []int64{math.MinInt64, math.MinInt64 + 1, -65537, -65536, -257, -256, -255, -2, -1, 0, 1, 255, 256, 65535, 65536, math.MaxInt64}
 	gen := func() Value {
-		switch r.Intn(4) {
+		switch r.Intn(5) {
 		case 0:
 			return Value{}
 		case 1:
 			return Value{Typ: Int, I: ints[r.Intn(len(ints))]}
+		case 4:
+			return Value{Typ: Int, I: int64(r.Uint64()) >> r.Intn(64)} // every length, either sign
 		case 2:
 			return Value{Typ: Text, S: strs[r.Intn(len(strs))]}
 		default:

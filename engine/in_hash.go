@@ -32,8 +32,11 @@ type inHashKey struct {
 }
 
 type inHashSet struct {
-	aff     affinity
+	aff affinity
+	// keys is the set unless intsOK, when intKeys is: a set of INTEGERs holds
+	// no pointer, so a big one costs the collector nothing to keep.
 	keys    map[inHashKey]struct{}
+	intKeys map[int64]struct{}
 	hasNull bool
 	empty   bool
 	from    *[]Value // rows[0] the set was built from, with n, to detect a re-run
@@ -61,7 +64,12 @@ func (m *vdbe) inSetFor(plan *inSubPlan, slot int, rows [][]Value) *inHashSet {
 	if s := e.inSet; s != nil && s.from == first && s.n == len(rows) {
 		return s
 	}
-	s := &inHashSet{aff: plan.affs[0], keys: make(map[inHashKey]struct{}, len(rows)), empty: len(rows) == 0, from: first, n: len(rows)}
+	s := &inHashSet{aff: plan.affs[0], empty: len(rows) == 0, from: first, n: len(rows), intsOK: plan.affs[0] != affText}
+	if s.intsOK {
+		s.intKeys = make(map[int64]struct{})
+	} else {
+		s.keys = make(map[inHashKey]struct{}, len(rows))
+	}
 	for _, r := range rows {
 		if len(r) < 1 {
 			return nil
@@ -74,19 +82,24 @@ func (m *vdbe) inSetFor(plan *inSubPlan, slot int, rows [][]Value) *inHashSet {
 			s.hasNull = true
 			continue
 		}
+		if s.intsOK {
+			if k.class == 'i' {
+				s.intKeys[k.i] = struct{}{}
+				continue
+			}
+			s.intsOK = false
+			s.keys = make(map[inHashKey]struct{}, len(rows))
+			for i := range s.intKeys {
+				s.keys[inHashKey{class: 'i', i: i}] = struct{}{}
+			}
+			s.intKeys = nil
+		}
 		s.keys[k] = struct{}{}
 	}
-	s.intsOK = s.aff != affText
-	for k := range s.keys {
-		if k.class != 'i' {
-			s.intsOK = false
-			break
-		}
-	}
 	if s.intsOK {
-		s.ints = make([]int64, 0, len(s.keys))
-		for k := range s.keys {
-			s.ints = append(s.ints, k.i)
+		s.ints = make([]int64, 0, len(s.intKeys))
+		for i := range s.intKeys {
+			s.ints = append(s.ints, i)
 		}
 		slices.Sort(s.ints)
 	}
@@ -113,7 +126,13 @@ func (s *inHashSet) membership(x Value, not bool) Value {
 	if !ok || null {
 		return finalizeIn(false, true, not)
 	}
-	_, found := s.keys[k]
+	var found bool
+	if s.intsOK {
+		_, found = s.intKeys[k.i]
+		found = found && k.class == 'i'
+	} else {
+		_, found = s.keys[k]
+	}
 	return finalizeIn(found, s.hasNull, not)
 }
 

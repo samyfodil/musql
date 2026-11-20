@@ -23,6 +23,7 @@ package engine
 import (
 	"fmt"
 	"sync/atomic"
+	"weak"
 )
 
 // CTEMaterialization is one CTE's "AS [NOT] MATERIALIZED" hint -- SQLite's
@@ -40,6 +41,14 @@ const (
 	cteM10dNo                            // "AS NOT MATERIALIZED" (M10d_No)
 )
 
+// cteEstimate is a CTE body compiled under outer for its row estimate
+// (cteBodyProgram), which only reads it. outer is weak: the binding lives
+// with the statement, the compiler only through its compile.
+type cteEstimate struct {
+	outer weak.Pointer[compiler]
+	prog  *Program
+}
+
 // cteBinding is one CTE's resolved-enough-to-execute shape, built once (by
 // newCTEBinding) when its WITH clause's scope frame is pushed, and reused
 // for every FROM-item reference to it for as long as that frame stays on
@@ -50,6 +59,13 @@ type cteBinding struct {
 	// as that statement's Program, which is reused only while the schema and
 	// settings it was compiled under hold.
 	body atomic.Pointer[Program]
+
+	est atomic.Pointer[cteEstimate] // the last cteBodyProgram
+	// uncorrelated is set once resolveCorrelatedCTESource has found the body
+	// binds no enclosing query's column, and probe is the program it found
+	// that in, which counted no reference (cteSchemaColsIn reads it).
+	uncorrelated atomic.Bool
+	probe        atomic.Pointer[Program]
 
 	name     string
 	colNames []string // explicit "(col, ...)" rename list; nil if none was given
