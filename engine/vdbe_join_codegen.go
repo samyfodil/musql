@@ -1986,7 +1986,8 @@ func (p *ReadOnlyPager) resolveCorrelatedCTESource(c *compiler, state *joinDesug
 
 	leave := p.enterFromBody()
 	counts := p.refCountSum()
-	prog, perr := compileSubProgram(p, b.core, derivedOuterBarrier(c))
+	barrier := derivedOuterBarrier(c)
+	prog, perr := compileSubProgram(p, b.core, barrier)
 	leave()
 	if perr != nil || !prog.Correlated {
 		// A body whose every name bound inside it binds inside it under any
@@ -1996,6 +1997,12 @@ func (p *ReadOnlyPager) resolveCorrelatedCTESource(c *compiler, state *joinDesug
 		if perr == nil && p.refCountSum() == counts {
 			b.uncorrelated.Store(true)
 			b.probe.Store(prog)
+			if barrier == nil {
+				// The compile cteBodyProgram makes for a statement with no
+				// enclosing query: the FROM-body mark changes only which
+				// error a body with no solution gives.
+				b.est.Store(&cteEstimate{prog: prog})
+			}
 		}
 		return joinSource{}, false, nil
 	}

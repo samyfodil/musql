@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"slices"
+	"sync/atomic"
 	"weak"
 )
 
@@ -873,7 +874,10 @@ func (p *ReadOnlyPager) cteBodyProgram(c *compiler, name string, b *cteBinding) 
 		}
 	}
 	outer := weak.Make(c.outer)
-	if e := b.est.Load(); e != nil && e.outer == outer {
+	if e := b.est.Load(); e != nil && e.outer == outer && !(cteEstFromProbeOffForTest && e.prog == b.probe.Load()) {
+		if e.prog == b.probe.Load() {
+			cteEstFromProbe.Add(1)
+		}
 		return e.prog
 	}
 	var prog *Program
@@ -887,6 +891,14 @@ func (p *ReadOnlyPager) cteBodyProgram(c *compiler, name string, b *cteBinding) 
 	b.est.Store(&cteEstimate{outer, prog})
 	return prog
 }
+
+// cteEstFromProbeOffForTest has cteBodyProgram compile a body the
+// correlation probe already compiled, and cteEstFromProbe counts the
+// estimates taken from the probe's program, for tests.
+var (
+	cteEstFromProbeOffForTest bool
+	cteEstFromProbe           atomic.Int64
+)
 
 // keepingCTEUses runs fn, a compile made only to read an estimate off, and
 // then puts back every in-scope CTE's reference count (cteBinding.nUse):
