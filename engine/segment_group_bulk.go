@@ -98,6 +98,7 @@ type segGroupTable struct {
 	idx  []int32
 	m    map[int64]int32
 	accs []segGroupAcc
+	keys []int64 // each group's key, parallel to accs
 }
 
 func newSegGroupTable(dense bool, lo, hi int64) *segGroupTable {
@@ -118,6 +119,7 @@ func (t *segGroupTable) at(k int64) *segGroupAcc {
 	}
 	if j == 0 {
 		t.accs = append(t.accs, segGroupAcc{})
+		t.keys = append(t.keys, k)
 		j = int32(len(t.accs))
 		if t.idx != nil {
 			t.idx[k-t.lo] = j
@@ -141,6 +143,17 @@ func (t *segGroupTable) each(f func(k int64, g *segGroupAcc) bool) bool {
 	}
 	for k, j := range t.m {
 		if !f(k, &t.accs[j-1]) {
+			return false
+		}
+	}
+	return true
+}
+
+// eachMade is each in the order the groups were made, which reads only them
+// rather than the whole key range.
+func (t *segGroupTable) eachMade(f func(k int64, g *segGroupAcc) bool) bool {
+	for i, k := range t.keys {
+		if !f(k, &t.accs[i]) {
 			return false
 		}
 	}
@@ -210,8 +223,9 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 
 	// Every block must be a clean int64 one: no NULLs, no exceptions.
 	type blocks struct {
-		key  []int64 // nil: the key is the rowid
-		args [][]int64
+		key    []int64 // nil: the key is the rowid
+		args   [][]int64
+		lo, hi int64 // the segment's own keys' range
 	}
 	bs := make([]blocks, len(segs))
 	lo, hi := int64(math.MaxInt64), int64(math.MinInt64)
@@ -245,9 +259,12 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		for _, r := range rd {
 			bs[si].args = append(bs[si].args, r.ints)
 		}
+		slo, shi := int64(math.MaxInt64), int64(math.MinInt64)
 		for _, k := range bs[si].key[:s.nRows] {
-			lo, hi = min(lo, k), max(hi, k)
+			slo, shi = min(slo, k), max(shi, k)
 		}
+		bs[si].lo, bs[si].hi = slo, shi
+		lo, hi = min(lo, slo), max(hi, shi)
 	}
 	if lo > hi {
 		if len(deltaLive) > 0 {
@@ -276,9 +293,15 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 	parts := make([]partial, len(segs))
 	ok := segEach(len(segs), func(si int) bool {
 		s, b, pt := segs[si], bs[si], &parts[si]
-		pt.t = newSegGroupTable(dense, lo, hi)
+		// The first segment's groups take every later one's, so span every
+		// key; a later one's span its own.
+		tlo, thi := lo, hi
+		if si > 0 && b.lo <= b.hi {
+			tlo, thi = b.lo, b.hi
+		}
+		pt.t = newSegGroupTable(dense, tlo, thi)
 		skip, sk := skips[si], 0
-		if w.empty() && dense && len(skip) == 0 && segGroupDenseFlat(s, plan.argCols, b.key, b.args, needSum, needMM, lo, si, pt.t, plan.bare) {
+		if w.empty() && dense && len(skip) == 0 && segGroupDenseFlat(s, plan.argCols, b.key, b.args, needSum, needMM, tlo, si, pt.t, plan.bare) {
 			return true
 		}
 		if !w.empty() && !w.filterable(s) {
@@ -346,6 +369,12 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 	// segment had takes a later one's partial whole: the partials are not read
 	// again.
 	groups := parts[0].t
+	made := 0
+	for _, pt := range parts {
+		made += len(pt.t.accs)
+	}
+	groups.accs = slices.Grow(groups.accs, made-len(groups.accs))
+	groups.keys = slices.Grow(groups.keys, made-len(groups.keys))
 	var slab segGroupSlab
 	merge := func(k int64, from *segGroupAcc) bool {
 		if from.n == 0 {
@@ -369,7 +398,7 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		return true
 	}
 	for _, pt := range parts[1:] {
-		if !pt.t.each(merge) {
+		if !pt.t.eachMade(merge) {
 			return bulkNotEligible
 		}
 	}
@@ -622,6 +651,7 @@ func segGroupDenseFlat(s *segment, argCols []int, keys []int64, args [][]int64,
 	ints := make([]int64, 3*na*groups)
 	uints := make([]uint64, na*groups)
 	t.accs = make([]segGroupAcc, 0, groups)
+	t.keys = make([]int64, 0, groups)
 	for i := range width {
 		if n[i] == 0 {
 			continue

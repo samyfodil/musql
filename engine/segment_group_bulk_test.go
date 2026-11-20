@@ -99,3 +99,29 @@ func TestColumnarGroupBulkMatchesTheLoop(t *testing.T) {
 		`DELETE FROM t WHERE id % 7 = 0`, `UPDATE t SET k = -6 WHERE id = 5`)
 	check("delta", true)
 }
+
+// TestColumnarGroupBulkSegmentKeyRanges groups a table of several segments
+// whose keys mostly climb, so each later segment spans keys of its own, while
+// a few of its rows reach back into the first segment's.
+func TestColumnarGroupBulkSegmentKeyRanges(t *testing.T) {
+	p := newSegPair(t,
+		`CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)`,
+		`WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i < 200000)
+		 INSERT INTO t SELECT i, CASE WHEN i % 1000 = 0 THEN i % 37 ELSE i / 4 END, (i * 7919) % 1000 - 500 FROM s`)
+	for _, q := range []string{
+		`SELECT k, count(*), sum(v) FROM t GROUP BY k`,
+		`SELECT k, min(v), max(v) FROM t GROUP BY k ORDER BY k`,
+		`SELECT k, id, count(*) FROM t GROUP BY k`,
+		`SELECT k FROM t GROUP BY k HAVING sum(v) > 1000`,
+	} {
+		want := typedRows(p.mustPlain(q))
+		before := segGroupBulkHits.Load()
+		got := typedRows(p.mustFast(q))
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("%s: fast and plain differ (%d and %d rows)", q, len(got), len(want))
+		}
+		if JITEnabled() && segGroupBulkHits.Load() == before {
+			t.Errorf("%s: bulk did not run", q)
+		}
+	}
+}
