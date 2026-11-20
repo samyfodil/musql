@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"cmp"
 	"slices"
 	"strconv"
 )
@@ -203,14 +202,22 @@ func (s *segment) sortedOn(cols []int) ([][]int64, []int32, bool) {
 	for i := range perm {
 		perm[i] = int32(i)
 	}
-	slices.SortStableFunc(perm, func(a, b int32) int {
+	inOrder := true
+	for r := 1; r < s.nRows && inOrder; r++ {
 		for _, bl := range blocks {
-			if c := cmp.Compare(bl[a], bl[b]); c != 0 {
-				return c
+			if bl[r-1] != bl[r] {
+				inOrder = bl[r-1] < bl[r]
+				break
 			}
 		}
-		return 0
-	})
+	}
+	var scratch []int32
+	for _, bl := range slices.Backward(blocks) {
+		if inOrder {
+			break
+		}
+		perm, scratch = radixSortByKeyWith(perm, scratch, func(r int32) int64 { return bl[r] })
+	}
 	if s.keyPerm == nil {
 		s.keyPerm = map[string][]int32{}
 	}
