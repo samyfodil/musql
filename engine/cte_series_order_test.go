@@ -153,3 +153,87 @@ func TestSeriesDescOrder(t *testing.T) {
 		}
 	}
 }
+
+// TestSeriesLimit: a LIMIT sqlite3WhereAddLimit offers generate_series stops
+// the series there, walked in the order of an ORDER BY the module consumes, so one with START alone answers rather than exceeding
+// what this engine materializes, and a CTE over one takes seriesBestIndex's
+// 2500 rows for START with a LIMIT (#284). Each answer is C 3.53.3's, taken
+// from its shell, including "ORDER BY value DESC LIMIT 2" over an unbounded
+// series: C offers the LIMIT for an ORDER BY of the module's columns and the
+// module takes it without consuming that ORDER BY.
+func TestSeriesLimit(t *testing.T) {
+	db, err := Create(filepath.Join(t.TempDir(), "s.musq"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, q := range []string{
+		`CREATE TABLE mid(a INT, b INT)`,
+		`INSERT INTO mid SELECT value, value % 5 FROM generate_series(1, 1500)`,
+	} {
+		if err := db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct{ q, want string }{
+		{`SELECT value FROM generate_series(-9223372036854775808, 9223372036854775807, 2) LIMIT 3`,
+			`-9223372036854775808;-9223372036854775806;-9223372036854775804;`},
+		{`SELECT value FROM generate_series(-9223372036854775808, 9223372036854775807) LIMIT 3`,
+			`-9223372036854775808;-9223372036854775807;-9223372036854775806;`},
+		{`SELECT value FROM generate_series(9223372036854775807, -9223372036854775808, -3) LIMIT 2`,
+			`9223372036854775807;9223372036854775804;`},
+		{`SELECT value FROM generate_series(9223372036854775807, -9223372036854775808, -1) LIMIT 2 OFFSET 1`,
+			`9223372036854775806;9223372036854775805;`},
+		{`SELECT value FROM generate_series(5) LIMIT 3 OFFSET 2`, `7;8;9;`},
+		{`SELECT value FROM generate_series(4294967290) LIMIT 10`,
+			`4294967290;4294967291;4294967292;4294967293;4294967294;4294967295;`},
+		{`SELECT count(*) FROM (SELECT value FROM generate_series(1) LIMIT 100000)`, `100000;`},
+		{`SELECT max(value) FROM (SELECT value FROM generate_series(10) LIMIT 7)`, `16;`},
+		{`SELECT value FROM generate_series(5) WHERE value > 10 LIMIT 3`, `11;12;13;`},
+		{`SELECT value FROM generate_series(5) WHERE value BETWEEN 10 AND 4000000000 LIMIT 2`, `10;11;`},
+		{`SELECT value FROM generate_series(5) ORDER BY value LIMIT 2 OFFSET 4`, `9;10;`},
+		{`SELECT value FROM generate_series(5) ORDER BY value DESC LIMIT 2`, `6;5;`},
+		{`SELECT value FROM generate_series(5) LIMIT 0`, ``},
+		// With START and STOP the module walks the series in the order of
+		// the ORDER BY it consumed, which its LIMIT makes observable.
+		{`SELECT value FROM (SELECT value FROM generate_series(1,20) ORDER BY value DESC LIMIT 3)`, `20;19;18;`},
+		{`SELECT value FROM generate_series(10,1,-1) ORDER BY value LIMIT 2`, `1;2;`},
+		{`SELECT value FROM generate_series(10,1,-1) ORDER BY value DESC LIMIT 2`, `10;9;`},
+		{`SELECT value FROM generate_series(1,20,3) ORDER BY value DESC LIMIT 3 OFFSET 2`, `13;10;7;`},
+		{`SELECT value FROM generate_series(20,1,-3) ORDER BY value LIMIT 3 OFFSET 1`, `5;8;11;`},
+		{`SELECT value FROM generate_series(1,100) WHERE value > 50 AND value <= 77 ORDER BY value DESC LIMIT 2`, `77;76;`},
+		{`SELECT value FROM generate_series(-9223372036854775808, 9223372036854775807, 7) ORDER BY value DESC LIMIT 2`,
+			`9223372036854775806;9223372036854775799;`},
+		{`SELECT value FROM generate_series(1,20) ORDER BY start, value DESC LIMIT 3`, `3;2;1;`},
+		{`SELECT group_concat(value) FROM (SELECT value FROM generate_series(1,20,2) ORDER BY value DESC LIMIT 4)`, `19,17,15,13;`},
+		// A constraint the module leaves unused keeps the LIMIT from it
+		// (whereLoopAddVirtualOne's retry), or the rows it drops would leave
+		// fewer than the LIMIT.
+		{`SELECT value FROM generate_series(5, 100) WHERE value > 12 AND value >= (SELECT 10) LIMIT 3`, `13;14;15;`},
+		// A window query's FROM is a subquery by the time its WHERE runs.
+		{`SELECT value, sum(value) OVER () FROM generate_series(1,10) LIMIT 2`, `1 55;2 55;`},
+		{`SELECT value, row_number() OVER (ORDER BY value DESC) FROM generate_series(1,10) LIMIT 2`, `10 1;9 2;`},
+		{`SELECT value, sum(value) OVER () FROM generate_series(1,10) ORDER BY value DESC LIMIT 2`, `10 55;9 55;`},
+		{`WITH c AS MATERIALIZED (SELECT value % 7 k, value v FROM generate_series(5) LIMIT 40)
+			SELECT a.v, group_concat(b.v) FROM c a, c b WHERE b.k = a.v % 9 AND a.v < 15 GROUP BY a.v`,
+			`5 5,12,19,26,33,40;6 6,13,20,27,34,41;9 7,14,21,28,35,42;10 8,15,22,29,36,43;11 9,16,23,30,37,44;` +
+				`12 10,17,24,31,38;13 11,18,25,32,39;14 5,12,19,26,33,40;`},
+		{`WITH c AS (SELECT value % 7 k, value v FROM generate_series(5) LIMIT 40) SELECT a.v, b.v FROM c a, c b WHERE b.k = a.v % 9 GROUP BY a.v`,
+			`5 5;6 6;9 7;10 8;11 9;12 10;13 11;14 5;15 6;18 7;19 8;20 9;21 10;22 11;23 5;24 6;27 7;28 8;29 9;30 10;31 11;` +
+				`32 5;33 6;36 7;37 8;38 9;39 10;40 11;41 5;42 6;`},
+		{`WITH c AS (SELECT value % 7 k, value v FROM generate_series(5) LIMIT 400)
+			SELECT m.a, group_concat(c.v) FROM mid m, c WHERE c.k = m.b AND m.a < 4 AND c.v < 60 GROUP BY m.a`,
+			`1 8,15,22,29,36,43,50,57;2 9,16,23,30,37,44,51,58;3 10,17,24,31,38,45,52,59;`},
+		{`WITH c AS MATERIALIZED (SELECT value % 7 k, value v FROM generate_series(5) LIMIT 3000)
+			SELECT m.a, group_concat(c.v) FROM mid m, c WHERE c.k = m.b AND m.a < 4 AND c.v < 60 GROUP BY m.a`,
+			`1 8,15,22,29,36,43,50,57;2 9,16,23,30,37,44,51,58;3 10,17,24,31,38,45,52,59;`},
+	} {
+		_, rows, err := db.Query(tc.q, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.q, err)
+		}
+		if got := rowsText(rows); got != tc.want {
+			t.Errorf("%s:\n got %s\nwant %s", tc.q, got, tc.want)
+		}
+	}
+}
