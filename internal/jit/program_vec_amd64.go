@@ -263,6 +263,10 @@ func (v *vecPlan) emit() ([]byte, error) {
 		broadcast(v.acc, math.MaxInt64)
 	case v.hasAcc && v.accOp == POpAccMax:
 		broadcast(v.acc, math.MinInt64)
+	case v.hasAcc && v.accOp == POpAccSum:
+		a.MovRegMem(RAX, RDI, POffOut)
+		a.MovRegMem(RAX, RAX, 0)
+		a.VmovqToXmm(v.acc, RAX)
 	case v.hasAcc:
 		a.VpxorYmm(v.acc, v.acc, v.acc)
 	}
@@ -492,8 +496,8 @@ func (v *vecPlan) emit() ([]byte, error) {
 			}
 		})
 	}
-	// R9 flags a sum whose absolute values, a register sum's starting value
-	// with them, pass int64 across the lanes.
+	// R9 flags a sum whose absolute values, its starting value with them,
+	// pass int64 across the lanes.
 	a.XorRegReg(R9, R9)
 	for i, in := range v.insns {
 		s, ok := v.absSum[i]
@@ -508,8 +512,13 @@ func (v *vecPlan) emit() ([]byte, error) {
 			a.AddRegReg(R10, RDX)
 			a.Jcc(condOverflow, "absovf")
 		})
-		if in.Op == POpRAccSum {
-			a.MovRegMem32(RDX, RSI, in.A)
+		if in.Op == POpRAccSum || in.Op == POpAccSum {
+			if in.Op == POpRAccSum {
+				a.MovRegMem32(RDX, RSI, in.A)
+			} else {
+				a.MovRegMem(RDX, RDI, POffOut)
+				a.MovRegMem(RDX, RDX, 0)
+			}
 			a.MovRegReg(RAX, RDX)
 			a.NegReg(RAX)
 			a.Cmovcc(condSign, RAX, RDX) // |s0|, MinInt64 staying negative

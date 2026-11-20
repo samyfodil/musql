@@ -131,15 +131,15 @@ func segSeriesPairPeephole(prog *Program) bool {
 // segRunSeries is segRunProgramAll over the series the plan's loop reads,
 // each filtered as its rewind would filter it, or false when a cursor does
 // not stream one or a program cannot run over them.
-func (m *vdbe) segRunSeries(plan *segProgPlan) ([]Value, bool) {
+func (m *vdbe) segRunSeries(plan *segProgPlan) ([]Value, bool, error) {
 	if len(plan.lows) == 0 {
-		return nil, false
+		return nil, false, nil
 	}
 	rows := seriesRows{n: 1}
 	var tbl *resolvedTable
 	for i, c := range plan.src.series {
 		if c < 0 || c >= len(m.cursors) || m.cursors[c] == nil {
-			return nil, false
+			return nil, false, nil
 		}
 		var sr *seriesCursor
 		ok := false
@@ -150,11 +150,11 @@ func (m *vdbe) segRunSeries(plan *segProgPlan) ([]Value, bool) {
 			sr, ok = m.seriesOf(plan.src.seriesSrc[i])
 		}
 		if !ok {
-			return nil, false
+			return nil, false, nil
 		}
 		n, ok := sr.rows()
 		if !ok || n != 0 && rows.n > math.MaxUint64/n {
-			return nil, false
+			return nil, false, nil
 		}
 		rows.srs = append(rows.srs, sr)
 		rows.n *= n
@@ -163,14 +163,19 @@ func (m *vdbe) segRunSeries(plan *segProgPlan) ([]Value, bool) {
 		}
 	}
 	out := make([]Value, len(plan.lows))
+	var latched error
 	for i, low := range plan.lows {
-		v, ok := m.segRunSeriesOne(tbl, rows, low)
+		v, ok, err := m.segRunSeriesOne(tbl, rows, low)
+		if err != nil {
+			latched = err
+			continue
+		}
 		if !ok {
-			return nil, false
+			return nil, false, nil
 		}
 		out[i] = v
 	}
-	return out, true
+	return out, latched == nil, latched
 }
 
 // seriesOf is the series ds reads, filtered as its stream would be, for a
@@ -246,19 +251,19 @@ func (cur *vdbeCursor) seriesScan() (*seriesCursor, bool) {
 	return sr, ok
 }
 
-func (m *vdbe) segRunSeriesOne(tbl *resolvedTable, rows seriesRows, low *segLowered) (Value, bool) {
+func (m *vdbe) segRunSeriesOne(tbl *resolvedTable, rows seriesRows, low *segLowered) (Value, bool, error) {
 	for _, c := range low.cols {
 		if c < 0 || c >= seriesCols*len(rows.srs) {
-			return Value{}, false
+			return Value{}, false, nil
 		}
 	}
 	kern := segProgKernel(low)
 	if kern == nil {
-		return Value{}, false
+		return Value{}, false, nil
 	}
 	regs, ok := m.segProgRegs(low)
 	if !ok {
-		return Value{}, false
+		return Value{}, false, nil
 	}
 	var facc [2]float64
 	switch low.agg {
@@ -305,9 +310,15 @@ func (m *vdbe) segRunSeriesOne(tbl *resolvedTable, rows seriesRows, low *segLowe
 		}
 	}
 	results := make([]segRunResult, 0, rows.n/seriesBlockRows+1)
+	// A sum's blocks run in row order, each from the last's total, which
+	// then stands for all of them (carriesSums).
+	seeded := low.carriesSums()
+	if seeded {
+		results = append(results, segRunResult{})
+	}
 	for r0 = 0; r0 < rows.n; {
 		if m.interrupted() {
-			return Value{}, false
+			return Value{}, false, nil
 		}
 		n := min(rows.n-r0, seriesBlockRows)
 		for i, c := range low.cols {
@@ -317,6 +328,9 @@ func (m *vdbe) segRunSeriesOne(tbl *resolvedTable, rows seriesRows, low *segLowe
 		}
 		local := slices.Clone(regs)
 		var out, ovf int64
+		if seeded {
+			out = results[0].out
+		}
 		args := &jit.ProgArgs{N: int64(n), Regs: &local[0], Out: &out, Overflow: &ovf, FAcc: facc}
 		for i, b := range blocks {
 			args.Col[i] = &b[0]
@@ -325,9 +339,21 @@ func (m *vdbe) segRunSeriesOne(tbl *resolvedTable, rows seriesRows, low *segLowe
 			args.Sel = &vals[0]
 		}
 		if !segCallKernel(kern, args, svc, low.blocks, nil, local) {
-			return Value{}, false
+			return Value{}, false, nil
 		}
 		facc = args.FAcc
+		if seeded {
+			if ovf != 0 {
+				if low.sumLatches() {
+					return Value{}, false, errSumOverflow
+				}
+				return Value{}, false, nil
+			}
+			results[0].out = out
+			results[0].rows += local[low.rowsReg]
+			r0 += n
+			continue
+		}
 		res := segRunResult{out: out, ovf: ovf != 0, set: set, real: rd}
 		switch {
 		case low.distinct:
@@ -338,5 +364,6 @@ func (m *vdbe) segRunSeriesOne(tbl *resolvedTable, rows seriesRows, low *segLowe
 		results = append(results, res)
 		r0 += n
 	}
-	return segProgAnswer(low, results, facc)
+	v, ok := segProgAnswer(low, results, facc)
+	return v, ok, nil
 }

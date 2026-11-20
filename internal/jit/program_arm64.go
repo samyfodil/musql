@@ -114,12 +114,18 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	a.LdrImm(X2, X0, POffN)
 	a.MovImm16(X3, 0)
 	a.MovImm16(X4, 0)
-	// Min/max programs seed the accumulator to avoid a first-row check.
+	// Min/max programs seed the accumulator to avoid a first-row check. A sum
+	// starts from the caller's Out, so runs in row order overflow where one
+	// run over all their rows would.
 	for _, in := range insns {
-		if in.Op == POpAccMin {
+		switch in.Op {
+		case POpAccMin:
 			a.MovImm64(X3, math.MaxInt64)
-		} else if in.Op == POpAccMax {
+		case POpAccMax:
 			a.MovImm64(X3, math.MinInt64)
+		case POpAccSum:
+			a.LdrImm(X3, X0, POffOut)
+			a.LdrImm(X3, X3, 0)
 		}
 	}
 	for c := 0; c < nCols; c++ {

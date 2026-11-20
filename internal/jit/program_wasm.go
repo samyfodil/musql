@@ -84,11 +84,16 @@ func emitProgram(insns []ProgInsn, nCols int) ([]byte, error) {
 	w.LoadPtr(POffRegs)
 	w.Set(regs)
 	for _, in := range insns {
-		if in.Op == POpAccMin {
+		switch in.Op {
+		case POpAccMin:
 			w.I64(math.MaxInt64)
 			w.Set(acc)
-		} else if in.Op == POpAccMax {
+		case POpAccMax:
 			w.I64(math.MinInt64)
+			w.Set(acc)
+		case POpAccSum:
+			w.LoadPtr(POffOut)
+			w.LoadI64(0)
 			w.Set(acc)
 		}
 	}

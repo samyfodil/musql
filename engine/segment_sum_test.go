@@ -43,29 +43,22 @@ func TestColumnarSumMatchesTheLoop(t *testing.T) {
 	}
 }
 
-// An integer sum that overflows switches to REAL in C (sumStep's overflow arm);
-// the columnar path cannot follow it, so it must decline to the loop.
-func TestColumnarSumDeclinesOnOverflow(t *testing.T) {
+// An integer sum that overflows raises "integer overflow" in C (sumStep's
+// latch): the compiled path raises it where it overflows, without going back
+// to the loop.
+func TestColumnarSumOverflowsAsTheLoop(t *testing.T) {
 	p := newSegPair(t,
 		`CREATE TABLE t(a INTEGER, v INTEGER)`,
 		fmt.Sprintf(`INSERT INTO t VALUES(1,%d)`, int64(math.MaxInt64)),
 		fmt.Sprintf(`INSERT INTO t VALUES(2,%d)`, int64(math.MaxInt64)))
-	_, want, werr := p.plain(`SELECT sum(v) FROM t`)
+	_, _, werr := p.plain(`SELECT sum(v) FROM t`)
 	ResetSegFilterCountersForTest()
-	_, got, gerr := p.fast(`SELECT sum(v) FROM t`)
+	_, _, gerr := p.fast(`SELECT sum(v) FROM t`)
 	served, declined := SegFilterCountersForTest()
-	if served != 0 {
-		t.Fatalf("the fast path answered an overflowing sum (served=%d)", served)
-	}
-	if JITEnabled() && declined == 0 {
-		t.Fatal("the guard was never reached, so this proves nothing")
-	}
-	// Whatever the loop does -- a value or an error -- the columnar path must
-	// do the same, because it declined to the same loop.
-	if (werr == nil) != (gerr == nil) {
+	if werr == nil || gerr == nil || werr.Error() != gerr.Error() {
 		t.Fatalf("loop err=%v, columnar err=%v", werr, gerr)
 	}
-	if werr == nil && (got[0][0].Typ != want[0][0].Typ || got[0][0].F != want[0][0].F) {
-		t.Errorf("columnar {%v %v}, loop {%v %v}", got[0][0].Typ, got[0][0].F, want[0][0].Typ, want[0][0].F)
+	if served != 0 || declined != 0 {
+		t.Errorf("served=%d declined=%d: the compiled run should raise the error itself", served, declined)
 	}
 }

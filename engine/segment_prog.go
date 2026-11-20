@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"math"
 	"slices"
 	"sort"
@@ -88,35 +89,46 @@ func segProgVecKernel(low *segLowered) *jit.Code {
 // One pass computes them all where it can (segProgPlan.one): integer counts,
 // sums and extremes, each accumulating in registers of its own. Otherwise each
 // aggregate is its own pass over the same blocks.
-func (m *vdbe) segRunProgramAll(p *ReadOnlyPager, tbl *resolvedTable, plan *segProgPlan) ([]Value, bool) {
+func (m *vdbe) segRunProgramAll(p *ReadOnlyPager, tbl *resolvedTable, plan *segProgPlan) ([]Value, bool, error) {
 	rootPage, ipkCol := tbl.root, tbl.ipkIndex
 	if plan == nil || plan.src == nil {
-		return nil, false
+		return nil, false, nil
 	}
 	kinds, ok := m.segKindsOf(p, tbl, plan.src)
 	if !ok {
-		return nil, false
+		return nil, false, nil
 	}
 	lows, one := plan.forKinds(kinds)
 	if len(lows) == 0 {
-		return nil, false
+		return nil, false, nil
 	}
 	for _, low := range lows {
 		if low != nil && (lowReadsVirtual(tbl.cols, low) || lowReadsVirtual(tbl.cols, low.textVar)) {
-			return nil, false
+			return nil, false, nil
 		}
 	}
 	out := make([]Value, len(lows))
-	if one != nil && m.segRun(p, tbl, rootPage, one, ipkCol, out) {
-		segOnePassRuns.Add(1)
-		return out, true
-	}
-	for i, low := range lows {
-		if !m.segRun(p, tbl, rootPage, low, ipkCol, out[i:i+1]) {
-			return nil, false
+	if one != nil {
+		if served, _ := m.segRun(p, tbl, rootPage, one, ipkCol, out); served {
+			segOnePassRuns.Add(1)
+			return out, true, nil
 		}
 	}
-	return out, true
+	// A sum's overflow is the statement's error only once every other
+	// aggregate is answered: one the loop would have to run might raise its
+	// own error at an earlier row.
+	var latched error
+	for i, low := range lows {
+		served, err := m.segRun(p, tbl, rootPage, low, ipkCol, out[i:i+1])
+		if err != nil {
+			latched = err
+			continue
+		}
+		if !served {
+			return nil, false, nil
+		}
+	}
+	return out, latched == nil, latched
 }
 
 // segKindsOf is which of the columns src loads hold REALs in every segment of
@@ -228,39 +240,49 @@ func (m *vdbe) segProgRegs(low *segLowered) ([]int64, bool) {
 }
 
 // segRun answers low's aggregate into out[0], or each of a program's that
-// computes several into out, over the table's segments.
-func (m *vdbe) segRun(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, low *segLowered, ipkCol int, out []Value) bool {
+// computes several into out, over the table's segments. Its error is the
+// "integer overflow" C's sum() raises, latched in row order.
+func (m *vdbe) segRun(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, low *segLowered, ipkCol int, out []Value) (bool, error) {
 	if p == nil || p.segs == nil || low == nil {
-		return false
+		return false, nil
 	}
 	segs, ok := p.segs.byRoot[rootPage]
 	if !ok {
-		return false
+		return false, nil
 	}
 	// A row-major delta beside the segments makes a raw block read wrong
 	// (segCleanFor). It is merged instead (segDeltaSplit): the kernel runs over
 	// the runs of segment rows the delta does not name, and once more over the
 	// delta's own live rows laid out as blocks. Every aggregate here is an
-	// integer one combined exactly across runs, so the split cannot move an
-	// answer.
+	// integer one, so the split cannot move an answer -- but for where a sum
+	// overflows, which is row order's (carriesSums).
+	seeded := low.carriesSums()
+	if seeded && !segsInRowidOrder(segs) {
+		return false, nil
+	}
 	var split *segDeltaSplit
 	if !p.segCleanFor(rootPage) {
 		// A REAL sum is rounded in row order, which the split does not keep:
 		// it runs the delta's rows after every segment's.
 		if low.fAcc || low.distinctReal() {
-			return false
+			return false, nil
 		}
 		if split, ok = p.segs.deltaSplitFor(rootPage, segs, low, ipkCol); !ok {
-			return false
+			return false, nil
+		}
+		// The delta's rows run after every segment's, which is their row
+		// order only when each comes after every segment row.
+		if seeded && split.n > 0 && split.first <= segsLastRowid(segs) {
+			return false, nil
 		}
 	}
 	kern := segProgKernel(low)
 	if kern == nil {
-		return false
+		return false, nil
 	}
 	regs, ok := m.segProgRegs(low)
 	if !ok {
-		return false
+		return false, nil
 	}
 	// Each extreme starts from the value that never wins, as POpAccMin and
 	// POpAccMax start the accumulator.
@@ -314,7 +336,7 @@ func (m *vdbe) segRun(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, low
 	// the interpreter shares its registers: their segments run one at a time.
 	var svc *segSvcRunner
 	each := segEach
-	if len(low.blocks) > 0 || low.fAcc || low.distinctReal() {
+	if len(low.blocks) > 0 || low.fAcc || low.distinctReal() || seeded {
 		if len(low.blocks) > 0 {
 			svc = newSegSvcRunner(m, tbl)
 		}
@@ -327,10 +349,18 @@ func (m *vdbe) segRun(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, low
 			return true
 		}
 	}
+	// A carried sum's runs fold into one result, each starting from its
+	// total; latched is set when one stops at C's overflow.
+	latched := false
 	ok = each(nSlots, func(si int) bool {
 		res := &results[si]
+		if seeded {
+			res = &results[0]
+		}
 		if si == len(segs) {
-			return split.runDelta(kern, low, regs, res)
+			ok, ovf := split.runDelta(kern, low, regs, res, seeded)
+			latched = seeded && ovf && low.sumLatches()
+			return ok && !latched
 		}
 		s := segs[si]
 		// The text variant over a segment whose text columns are clean TEXT;
@@ -395,7 +425,7 @@ func (m *vdbe) segRun(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, low
 			blocks[i] = buf
 		}
 		if s.nRows == 0 {
-			res.empty = true
+			res.empty = res.empty || !seeded
 			return true
 		}
 		var skip []int // positions of the rows the delta names, ascending
@@ -432,13 +462,16 @@ func (m *vdbe) segRun(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, low
 				m := (end - start) &^ 3
 				local := slices.Clone(regs)
 				var out, ovf int64
+				if seeded {
+					out = low.seedRun(res, local)
+				}
 				args := &jit.ProgArgs{N: int64(m), Regs: &local[0], Out: &out, Overflow: &ovf}
 				for i, b := range blocks {
 					args.Col[i] = &b[start]
 				}
 				vk.Call2(args)
 				if ovf == 0 {
-					if !low.takeRun(res, out, false, local, int64(m)) {
+					if !low.takeRun(res, out, false, local, int64(m), seeded) {
 						return false
 					}
 					start += m
@@ -447,6 +480,9 @@ func (m *vdbe) segRun(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, low
 			if end > start {
 				local := slices.Clone(regs)
 				var out, ovf int64
+				if seeded {
+					out = low.seedRun(res, local)
+				}
 				args := &jit.ProgArgs{N: int64(end - start), Regs: &local[0], Out: &out, Overflow: &ovf}
 				// Only a program with a REAL accumulator carries one, and its
 				// segments run one at a time.
@@ -476,24 +512,31 @@ func (m *vdbe) segRun(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, low
 					start = end + 1
 					continue
 				}
-				if !low.takeRun(res, out, ovf != 0, local, int64(end-start)) {
+				if !low.takeRun(res, out, ovf != 0, local, int64(end-start), seeded) {
+					return false
+				}
+				if seeded && ovf != 0 {
+					latched = low.sumLatches()
 					return false
 				}
 			}
 			start = end + 1
 		}
 		if len(skip) == s.nRows {
-			res.empty = true
+			res.empty = res.empty || !seeded
 		}
 		return true
 	})
+	if latched {
+		return false, errSumOverflow
+	}
 	if !ok {
-		return false
+		return false, nil
 	}
 	if low.multi == nil {
 		v, ok := segProgAnswer(low, results, facc)
 		out[0] = v
-		return ok
+		return ok, nil
 	}
 	per := make([]segRunResult, len(results))
 	for j, sl := range low.multi {
@@ -505,23 +548,23 @@ func (m *vdbe) segRun(p *ReadOnlyPager, tbl *resolvedTable, rootPage uint32, low
 		}
 		v, ok := segProgAnswer(&segLowered{agg: sl.agg}, per, facc)
 		if !ok {
-			return false
+			return false, nil
 		}
 		out[j] = v
 	}
-	return true
+	return true, nil
 }
 
 // takeRun folds one kernel run's answer, over n rows, into res: its
 // accumulator and row count, or each aggregate's, out of the registers, for a
 // program that computes several.
-func (l *segLowered) takeRun(res *segRunResult, out int64, ovf bool, local []int64, n int64) bool {
+func (l *segLowered) takeRun(res *segRunResult, out int64, ovf bool, local []int64, n int64, seeded bool) bool {
 	if l.multi == nil {
 		part := segRunResult{out: out, ovf: ovf}
 		if l.agg != aggCountStar && l.agg != aggCount {
 			part.rows = local[l.rowsReg]
 		}
-		return segCombine(l.agg, res, part)
+		return segCombine(l.agg, res, part, seeded)
 	}
 	if res.multi == nil {
 		res.multi = make([]segRunResult, len(l.multi))
@@ -534,11 +577,101 @@ func (l *segLowered) takeRun(res *segRunResult, out int64, ovf bool, local []int
 		if sl.rows >= 0 {
 			part.rows = local[sl.rows]
 		}
-		if !segCombine(sl.agg, &res.multi[j], part) {
+		if !segCombine(sl.agg, &res.multi[j], part, seeded) {
 			return false
 		}
 	}
 	return true
+}
+
+// seedRun starts a run from res's sums, carried in row order: the returned
+// Out for low's own, each summing slot's register for a program computing
+// several.
+func (l *segLowered) seedRun(res *segRunResult, local []int64) int64 {
+	if l.multi == nil {
+		return res.out
+	}
+	if res.multi != nil {
+		for j, sl := range l.multi {
+			if aggSums(sl.agg) && sl.acc >= 0 {
+				local[sl.acc] = res.multi[j].out
+			}
+		}
+	}
+	return 0
+}
+
+// aggSums reports whether agg adds its values, which C does as sum() does
+// (sumStep), latching "integer overflow" at the first running sum past
+// int64.
+func aggSums(agg aggKind) bool {
+	return agg == aggSum || agg == aggAvg || agg == aggTotal
+}
+
+// carriesSums reports whether low adds integers, and so runs its rows in row
+// order, each run starting from the last's sums (POpAccSum starts from Out):
+// whether a running sum leaves int64 depends on the order, and C's is row
+// order.
+func (l *segLowered) carriesSums() bool {
+	if l.distinct {
+		return false
+	}
+	if l.multi == nil {
+		return aggSums(l.agg)
+	}
+	return slices.ContainsFunc(l.multi, func(sl segAccSlot) bool { return aggSums(sl.agg) })
+}
+
+// sumLatches reports whether a carried run that raised the overflow flag
+// stopped where C's sum() latches "integer overflow": low is one sum() whose
+// body only loads, compares and branches on integers, so its add is the one
+// step that can raise the flag, and the error is sure whatever rows follow.
+func (l *segLowered) sumLatches() bool {
+	if l.multi != nil || l.distinct || l.fAcc || l.agg != aggSum || len(l.blocks) > 0 {
+		return false
+	}
+	for _, in := range l.insns {
+		switch in.Op {
+		case jit.POpLoadCol, jit.POpLoadReg, jit.POpCmp, jit.POpAnd, jit.POpOr, jit.POpNot,
+			jit.POpSkipIfZero, jit.POpSetConst, jit.POpJump, jit.POpJumpIfZero, jit.POpJumpIfNotZero,
+			jit.POpCmpSkip, jit.POpCmpJump, jit.POpAccSum:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// errSumOverflow is sum()'s error once its running sum has left int64
+// (sumFinalize).
+var errSumOverflow = errors.New("engine: integer overflow")
+
+// segsInRowidOrder reports whether segs, in order, hold ascending rowids, so
+// running them one after another is a scan's row order.
+func segsInRowidOrder(segs []*segment) bool {
+	var last uint64
+	seen := false
+	for _, s := range segs {
+		if s.nRows == 0 {
+			continue
+		}
+		if seen && s.Rowid(0) <= last {
+			return false
+		}
+		last, seen = s.Rowid(s.nRows-1), true
+	}
+	return true
+}
+
+// segsLastRowid is the highest rowid in segs, which segsInRowidOrder has
+// found ascending; MinInt64 when they hold no row.
+func segsLastRowid(segs []*segment) int64 {
+	for i := len(segs) - 1; i >= 0; i-- {
+		if s := segs[i]; s.nRows > 0 {
+			return int64(s.Rowid(s.nRows - 1))
+		}
+	}
+	return math.MinInt64
 }
 
 // segProgAnswer folds the runs' results, in row order, into the aggregate's
@@ -796,8 +929,9 @@ func segDistinctAnswer(agg aggKind, results []segRunResult) (Value, bool) {
 
 // segCombine folds part into acc as segRun's final loop folds segments:
 // counts and sums add (a sum that overflows declines), min and max keep the
-// extreme of the runs that matched anything.
-func segCombine(agg aggKind, acc *segRunResult, part segRunResult) bool {
+// extreme of the runs that matched anything. A seeded sum's part already
+// holds acc's total and replaces it.
+func segCombine(agg aggKind, acc *segRunResult, part segRunResult, seeded bool) bool {
 	if part.ovf {
 		acc.ovf = true
 		return true
@@ -814,6 +948,11 @@ func segCombine(agg aggKind, acc *segRunResult, part segRunResult) bool {
 		}
 		acc.rows += part.rows
 	default:
+		if seeded {
+			acc.out = part.out
+			acc.rows += part.rows
+			return true
+		}
 		sum := acc.out + part.out
 		if (part.out > 0 && sum < acc.out) || (part.out < 0 && sum > acc.out) {
 			acc.ovf = true
@@ -836,6 +975,7 @@ type segDeltaSplit struct {
 	named  map[int64]bool
 	blocks [][]int64
 	n      int
+	first  int64 // the lowest live rowid, when n > 0
 }
 
 // deltaSplitFor arranges root's delta for low, or declines: a program with
@@ -867,7 +1007,7 @@ func (src *segSource) deltaSplitFor(rootPage uint32, segs []*segment, low *segLo
 		sp.named[rid] = true
 		rids = append(rids, rid)
 	}
-	slices.Sort(rids) // ascending, as a scan meets them; the aggregates do not care, a reader of this might
+	slices.Sort(rids) // ascending, as a scan meets them
 	for i := range sp.blocks {
 		sp.blocks[i] = make([]int64, len(rids))
 	}
@@ -897,6 +1037,9 @@ func (src *segSource) deltaSplitFor(rootPage uint32, segs []*segment, low *segLo
 		}
 	}
 	sp.n = len(rids)
+	if sp.n > 0 {
+		sp.first = rids[0]
+	}
 	return sp, true
 }
 
@@ -921,14 +1064,18 @@ func (sp *segDeltaSplit) skipIn(s *segment) []int {
 	return out
 }
 
-// runDelta runs the kernel over the delta's live rows.
-func (sp *segDeltaSplit) runDelta(kern *jit.Code, low *segLowered, regs []int64, res *segRunResult) bool {
+// runDelta runs the kernel over the delta's live rows, a seeded run from
+// res's sums, and reports whether it raised the overflow flag.
+func (sp *segDeltaSplit) runDelta(kern *jit.Code, low *segLowered, regs []int64, res *segRunResult, seeded bool) (ok, ovfd bool) {
 	if sp.n == 0 {
-		res.empty = true
-		return true
+		res.empty = res.empty || !seeded
+		return true, false
 	}
 	local := slices.Clone(regs)
 	var out, ovf int64
+	if seeded {
+		out = low.seedRun(res, local)
+	}
 	args := &jit.ProgArgs{N: int64(sp.n), Regs: &local[0], Out: &out, Overflow: &ovf}
 	for i, b := range sp.blocks {
 		args.Col[i] = &b[0]
@@ -939,12 +1086,12 @@ func (sp *segDeltaSplit) runDelta(kern *jit.Code, low *segLowered, regs []int64,
 		args.Sel = &vals[0]
 	}
 	if !segCallKernel(kern, args, nil, nil, nil, local) {
-		return false
+		return false, false
 	}
 	if low.distinct {
 		res.addDistinct(vals[:out])
 		res.out, res.ovf = out, ovf != 0
-		return true
+		return true, ovf != 0
 	}
-	return low.takeRun(res, out, ovf != 0, local, int64(sp.n))
+	return low.takeRun(res, out, ovf != 0, local, int64(sp.n), seeded), ovf != 0
 }

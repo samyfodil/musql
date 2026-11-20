@@ -3073,7 +3073,11 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			// compare int64 lanes and leave a REAL to a slower path.
 			progFirst := plan.prog != nil && cur.pager.segReadsReal(cur.tbl.root, plan.preds)
 			if progFirst {
-				if vs, served := m.segRunProgramAll(cur.pager, cur.tbl, plan.prog); served && len(vs) == 1 {
+				vs, served, err := m.segRunProgramAll(cur.pager, cur.tbl, plan.prog)
+				if err != nil {
+					return nil, err
+				}
+				if served && len(vs) == 1 {
 					segFilterServed.Add(1)
 					m.regs[op.P1] = vs[0]
 					pc = op.P3
@@ -3108,7 +3112,11 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				}
 			}
 			if plan.prog != nil && !progFirst {
-				if vs, served := m.segRunProgramAll(cur.pager, cur.tbl, plan.prog); served && len(vs) == 1 {
+				vs, served, err := m.segRunProgramAll(cur.pager, cur.tbl, plan.prog)
+				if err != nil {
+					return nil, err
+				}
+				if served && len(vs) == 1 {
 					segFilterServed.Add(1)
 					m.regs[op.P1] = vs[0]
 					pc = op.P3
@@ -3190,10 +3198,14 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			var vs []Value
 			var served bool
+			var err error
 			if series {
-				vs, served = m.segRunSeries(pplan)
+				vs, served, err = m.segRunSeries(pplan)
 			} else {
-				vs, served = m.segRunProgramAll(cur.pager, cur.tbl, pplan)
+				vs, served, err = m.segRunProgramAll(cur.pager, cur.tbl, pplan)
+			}
+			if err != nil {
+				return nil, err
 			}
 			if served {
 				segFilterServed.Add(1)
