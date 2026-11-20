@@ -149,11 +149,15 @@ func (m *vdbe) segRunSeries(plan *segProgPlan) ([]Value, bool) {
 		case i < len(plan.src.seriesSrc):
 			sr, ok = m.seriesOf(plan.src.seriesSrc[i])
 		}
-		if !ok || sr.count != 0 && rows.n > math.MaxUint64/sr.count {
+		if !ok {
+			return nil, false
+		}
+		n, ok := sr.rows()
+		if !ok || n != 0 && rows.n > math.MaxUint64/n {
 			return nil, false
 		}
 		rows.srs = append(rows.srs, sr)
-		rows.n *= sr.count
+		rows.n *= n
 		if tbl == nil {
 			tbl = m.cursors[c].tbl
 		}

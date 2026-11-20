@@ -126,11 +126,16 @@ func TestGenerateSeriesRowid(t *testing.T) {
 // TestGenerateSeriesSpanOverflow verifies overflow handling at span limits.
 func TestGenerateSeriesSpanOverflow(t *testing.T) {
 	p := newEmptyPager(t)
-	if _, _, err := p.Query("SELECT value FROM generate_series(-9223372036854775808, 9223372036854775807, 2)"); err == nil {
-		t.Error("the whole-range series answered; want the materialization limit")
+	// Streamed, the whole range is read as far as the LIMIT needs (#285).
+	_, rows, err := p.Query("SELECT value FROM generate_series(-9223372036854775808, 9223372036854775807, 2) WHERE value % 3 = 0 LIMIT 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := vtabRowsInt(t, rows, 0); !eqInts(got, []int64{-9223372036854775806, -9223372036854775800}) {
+		t.Errorf("whole-range series = %v", got)
 	}
 	// The value constraints narrow it first, as seriesFilter does.
-	_, rows, err := p.Query("SELECT value FROM generate_series(-9223372036854775808, 9223372036854775807, 2) WHERE value BETWEEN 1 AND 5")
+	_, rows, err = p.Query("SELECT value FROM generate_series(-9223372036854775808, 9223372036854775807, 2) WHERE value BETWEEN 1 AND 5")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,11 +151,16 @@ func TestGenerateSeriesSpanOverflow(t *testing.T) {
 	}
 }
 
-// TestGenerateSeriesUnboundedDeclines verifies unbounded series are declined.
-func TestGenerateSeriesUnboundedDeclines(t *testing.T) {
+// TestGenerateSeriesUnbounded: a series with no stop runs to 4294967295, read
+// as far as the statement needs.
+func TestGenerateSeriesUnbounded(t *testing.T) {
 	p := newEmptyPager(t)
-	if _, _, err := p.Query("SELECT value FROM generate_series WHERE start=5"); err == nil {
-		t.Error("expected an error for an unbounded generate_series, got none")
+	_, rows, err := p.Query("SELECT value FROM generate_series WHERE start=5 AND value % 1000000 = 0 LIMIT 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := vtabRowsInt(t, rows, 0); !eqInts(got, []int64{1000000, 2000000}) {
+		t.Errorf("values = %v, want [1000000 2000000]", got)
 	}
 }
 

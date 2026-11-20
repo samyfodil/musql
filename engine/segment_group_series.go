@@ -18,7 +18,11 @@ func (m *vdbe) segHashAggSeries(cur *vdbeCursor, plan *segGroupPlan) bool {
 		return false
 	}
 	sr, ok := cur.seriesScan()
-	if !ok || sr.count > segGroupSeriesMaxRows {
+	if !ok {
+		return false
+	}
+	n, ok := sr.rows()
+	if !ok || n > segGroupSeriesMaxRows {
 		return false
 	}
 	width := 0
@@ -35,7 +39,7 @@ func (m *vdbe) segHashAggSeries(cur *vdbeCursor, plan *segGroupPlan) bool {
 	if width == 0 {
 		return false
 	}
-	segs, ok := seriesSegments(seriesRows{srs: []*seriesCursor{sr}, n: sr.count}, width)
+	segs, ok := seriesSegments(seriesRows{srs: []*seriesCursor{sr}, n: n}, width)
 	if !ok {
 		return false
 	}

@@ -65,8 +65,8 @@ func TestSeriesProgramsMatchTheLoop(t *testing.T) {
 		{`SELECT sum(DISTINCT a.value * 1000 + b.value % 7), count(DISTINCT b.value / 1.5) FROM generate_series(1,300) a, generate_series(1,300) b`, nil, 1},
 		{`SELECT sum(a.rowid + b.value) FROM generate_series(1, 10) a, generate_series(1, 10) b`, nil, 0},
 		{`SELECT count(*), sum(b.value) FROM generate_series(1, 300) a, generate_series(1, a.value) b`, nil, -1},
-		{`SELECT sum(value) FROM generate_series(1)`, nil, -1},
-		{`SELECT count(*) FROM generate_series(1, 100000000)`, nil, -1},
+		// Past what a materialized scan holds: the series streams (#285).
+		{`SELECT count(*), sum(value) FROM generate_series(1, 30000000)`, nil, 1},
 	}
 	for _, c := range cases {
 		segPeepholesOffForTest = true

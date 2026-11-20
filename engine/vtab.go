@@ -378,6 +378,10 @@ func vtabDrivesBestIndex(mod VtabModule, it FromItem) bool {
 	return true
 }
 
+// maxVtabRows bounds the rows materializeVtab holds: a module's rows read
+// whole, for a scan that cannot read the cursor in place (vtab_stream.go).
+const maxVtabRows = 1 << 24
+
 // materializeVtab resolves FROM item it as a virtual table and drives its
 // cursor to completion, returning (columns, rows, rowids). params are the bound
 // parameters for call arguments and pushed constraint right-hand sides; outer
@@ -515,6 +519,9 @@ func (p *ReadOnlyPager) materializeVtab(it FromItem, params []Value, outer *eval
 		eof := cur.Eof()
 		if eof {
 			break
+		}
+		if len(rows) == maxVtabRows {
+			return nil, nil, nil, fmt.Errorf("engine: %s has more than %d rows, more than this engine holds for a scan that cannot read it in place", it.Table, maxVtabRows)
 		}
 		row := make([]Value, len(cols))
 		for i := range cols {
