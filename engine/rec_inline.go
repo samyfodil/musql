@@ -1,5 +1,7 @@
 package engine
 
+import "slices"
+
 // A recursive CTE's step -- "SELECT i+1 FROM c WHERE i < N" -- ran as its own
 // sub-program for every row the queue pops: a machine from the pool, its
 // registers and cursors set up, the self cursor opened, the result row copied
@@ -80,7 +82,7 @@ func recInlineOperands(in Instruction) bool {
 		OpInteger, OpInt64, OpReal, OpString8, OpNull, OpVariable, OpSCopy, OpCopy, OpNot, OpBitNot, OpNegative,
 		OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpConcat, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight,
 		OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull,
-		OpFunction, OpCast, OpResultRow, OpGosub, OpReturn:
+		OpFunction, OpCast, OpResultRow, OpGosub, OpReturn, OpSortedSeek:
 		return true
 	}
 	return false
@@ -143,6 +145,16 @@ func recInline(prog *Program, at int, arm *Program) {
 			r.P1, r.P2 = reg(in.P1), jump(in.P2)
 		case OpReturn, OpCast:
 			r.P1 = reg(in.P1)
+		case OpSortedSeek:
+			r.P1, r.P2 = cur(in.P1), reg(in.P2)
+			if h := in.P4.(*sortedSeekHint); len(h.more) > 0 {
+				moved := *h
+				moved.more = slices.Clone(h.more)
+				for i := range moved.more {
+					moved.more[i].reg = reg(moved.more[i].reg)
+				}
+				r.P4 = &moved
+			}
 		}
 		out = append(out, r)
 	}
