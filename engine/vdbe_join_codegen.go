@@ -1974,6 +1974,9 @@ func (p *ReadOnlyPager) resolveCorrelatedCTESource(c *compiler, state *joinDesug
 			return joinSource{}, false, nil // let the existing guard below report it
 		}
 	}
+	if b.uncorrelated.Load() {
+		return joinSource{}, false, nil
+	}
 	p.cteExpansion = append(p.cteExpansion, cteExpansionFrame{name: cteName, b: b})
 	defer func() { p.cteExpansion = p.cteExpansion[:len(p.cteExpansion)-1] }()
 	// The body resolves in the scope where THIS CTE was DEFINED, exactly like
@@ -1982,9 +1985,17 @@ func (p *ReadOnlyPager) resolveCorrelatedCTESource(c *compiler, state *joinDesug
 	defer p.enterCTEBodyScope(cteName, b)()
 
 	leave := p.enterFromBody()
+	counts := p.refCountSum()
 	prog, perr := compileSubProgram(p, b.core, derivedOuterBarrier(c))
 	leave()
 	if perr != nil || !prog.Correlated {
+		// A body whose every name bound inside it binds inside it under any
+		// enclosing query: no later reference need compile it to ask. Only
+		// where this compile counted no reference (refCountSum), which the
+		// next would have counted again.
+		if perr == nil && p.refCountSum() == counts {
+			b.uncorrelated.Store(true)
+		}
 		return joinSource{}, false, nil
 	}
 	// c's own program must now re-run per enclosing row too, not be cached --

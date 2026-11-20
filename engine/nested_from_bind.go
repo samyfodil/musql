@@ -822,6 +822,29 @@ func (p *ReadOnlyPager) nfDBName(dbIdx int) string {
 	return ""
 }
 
+// refCountSum is the sum of what resolving a FROM item counts (view
+// expansions, CTE references in scope): a compile that leaves it as it was
+// counted nothing, since a count only grows but where a probe puts it back.
+func (p *ReadOnlyPager) refCountSum() int {
+	n := 0
+	for _, v := range p.viewRefCount {
+		n += v
+	}
+	for _, ar := range p.attachedReaders {
+		for _, v := range ar.pager.viewRefCount {
+			n += v
+		}
+	}
+	for _, frame := range p.cteScopes {
+		for _, cb := range frame {
+			if cb != nil {
+				n += cb.nUse
+			}
+		}
+	}
+	return n
+}
+
 // nfSnapshotCounts saves what resolving a FROM item counts (view expansions,
 // CTE references), for a probe that must leave no trace.
 func (p *ReadOnlyPager) nfSnapshotCounts() func() {

@@ -61,6 +61,9 @@ type cteBinding struct {
 	body atomic.Pointer[Program]
 
 	est atomic.Pointer[cteEstimate] // the last cteBodyProgram
+	// uncorrelated is set once resolveCorrelatedCTESource has found the body
+	// binds no enclosing query's column.
+	uncorrelated atomic.Bool
 
 	name     string
 	colNames []string // explicit "(col, ...)" rename list; nil if none was given
