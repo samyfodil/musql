@@ -2391,7 +2391,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpSortedSeek:
 			cur := m.cursors[op.P1]
-			if cur != nil && cur.segSortable() && cur.segSortedSeek(op.P4.(*sortedSeekHint), m.regs[op.P2], m.encoding()) {
+			if cur != nil && cur.segSortable() && cur.segSortedSeek(op.P4.(*sortedSeekHint), m.regs[op.P2], m.regs, m.encoding()) {
 				break
 			}
 			if cur != nil {

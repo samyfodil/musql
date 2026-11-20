@@ -910,7 +910,8 @@ func (jx *vmJIT) sortedSeekServed(m *vdbe, cur *vdbeCursor, spec *idxSeekSpec) b
 	if !cur.segSortable() || s == nil || !s.ok {
 		return false
 	}
-	if n := max(len(s.keys), len(s.perm)); s.seeks < max(16, n/64) {
+	if n := max(len(s.keys), len(s.perm)); s.seeks < max(16, n/64) || len(spec.sorted.more) > 0 && !s.shortRuns() {
+		// Native code walks a run whole, where the VDBE narrows it.
 		return false
 	}
 	_, orderOp, ok := cur.segSortedReady(spec.sorted, m.encoding())
