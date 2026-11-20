@@ -446,6 +446,9 @@ type ProgArgs struct {
 	LikeCS int64
 	// InSets is the program's IN subquery sets, VInSub's B indexing them.
 	InSets *VInSubSet
+	// IntTexts is the program's INTEGER constants with their texts,
+	// VIntText's Slot indexing them.
+	IntTexts *VIntTextSlot
 }
 
 // ProgScratch is how many words of ProgArgs.Scratch a kernel may use.
@@ -478,6 +481,7 @@ const (
 	POffTextLen  = POffTextPtr + 8
 	POffLikeCS   = POffTextLen + 8
 	POffInSets   = POffLikeCS + 8
+	POffIntTexts = POffInSets + 8
 )
 
 // progHasService reports whether a program can stop for a service, and so

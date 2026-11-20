@@ -2,6 +2,7 @@ package engine
 
 import (
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"unsafe"
@@ -26,6 +27,9 @@ type vmJIT struct {
 	// OpResultRow (jit.VReachesResultRow): the entries that need a row
 	// buffer. nil when it reaches none from anywhere.
 	rows []bool
+	// intTexts is where each entry finds the INTEGERs the TEXT compares
+	// read as text (jit.VIntText's Slot).
+	intTexts []vmIntTextSrc
 
 	// curs is the cursor numbers the native code reads or advances (VColumn,
 	// VNext), and nCurs the table size it indexes (the largest + 1). gate[pc]
@@ -359,7 +363,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	subs := prog.jitSubs()
 	ipk := writeCursorIPK(prog)
 	realVP, realOK := vmRealLowering(prog, p.segStoresReal, p.segStoresText)
-	textVP, textOK := vmTextLowering(prog, p.segStoresText)
+	textVP, textOK, intTexts := vmTextLowering(prog, p.segStoresText)
 	reopen := reopenSources(prog)
 	var inSlots []int
 	for pc := range prog.Insns {
@@ -585,7 +589,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	}
 	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams + len(outer) + 2*len(subs), params: nParams, outer: outer, subs: subs, entry: entry, resumeOnly: resumeOnly, marked: marked, native: native, updAt: updAt,
 		segCap: segCap, segNeed: segNeed, rowidSeeks: rowidSeeks, walkScan: walkScan, inSlots: inSlots, idxSpecs: idxSpecs, sortSeeks: sortSeeks,
-		aggAt: agg.at, aggSort: agg.sort, aggLo: agg.lo, aggHi: agg.hi, aggKey: agg.key, aggKeyLo: agg.keyLo, aggKeyN: agg.keyN}
+		aggAt: agg.at, aggSort: agg.sort, aggLo: agg.lo, aggHi: agg.hi, aggKey: agg.key, aggKeyLo: agg.keyLo, aggKeyN: agg.keyN, intTexts: intTexts}
 	if segCap != nil {
 		jx.tabs = make([]atomic.Pointer[vmTab], len(segCap))
 	}
@@ -2419,6 +2423,10 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 	if len(jx.inSlots) > 0 {
 		args.InSets = jx.inSets(m)
 	}
+	args.IntTexts = nil
+	if len(jx.intTexts) > 0 {
+		args.IntTexts = jx.fillIntTexts(m)
+	}
 	args.RowBuf, args.RowCap, args.RowUsed, args.RowsBuf, args.RowsCap, args.Yield = nil, -1, 0, nil, 0, 0
 	gather := jx.updAt >= 0 || jx.aggGathers(pc)
 	switch {
@@ -2519,6 +2527,31 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 		return int(args.PC), int(args.Yield) - 1
 	}
 	return int(args.PC), -1
+}
+
+// fillIntTexts is the INTEGERs and texts the TEXT compares read at this
+// entry (jit.VIntTextSlot): a literal's, or the bound parameter's where it is
+// an INTEGER.
+func (jx *vmJIT) fillIntTexts(m *vdbe) *jit.VIntTextSlot {
+	n := len(jx.intTexts)
+	if len(m.jIntTexts) < n {
+		m.jIntTexts, m.jIntTextBuf = make([]jit.VIntTextSlot, n), make([][20]byte, n)
+	}
+	for i, src := range jx.intTexts {
+		s := &m.jIntTexts[i]
+		if src.param == 0 {
+			*s = jit.VIntTextSlot{K: src.k, Text: unsafe.Pointer(unsafe.SliceData(src.text)), Len: int64(len(src.text)), Ok: 1}
+			continue
+		}
+		v := paramAt(m.params, src.param)
+		if v.Typ != Int {
+			*s = jit.VIntTextSlot{}
+			continue
+		}
+		t := strconv.AppendInt(m.jIntTextBuf[i][:0], v.I, 10)
+		*s = jit.VIntTextSlot{K: v.I, Text: unsafe.Pointer(&m.jIntTextBuf[i][0]), Len: int64(len(t)), Ok: 1}
+	}
+	return &m.jIntTexts[0]
 }
 
 // readSubs copies each subquery value the run has made into its register,
