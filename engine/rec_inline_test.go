@@ -56,6 +56,18 @@ func TestRecInlineMatchesTheSubProgram(t *testing.T) {
 		`WITH RECURSIVE n(m) AS (VALUES(1),(2)), e(m) AS (SELECT x FROM t1 WHERE x > 100), b(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM b CROSS JOIN n CROSS JOIN e WHERE k < 5 UNION ALL SELECT k + 2 FROM b CROSS JOIN n WHERE k < 9) SELECT group_concat(k) FROM b`,
 		`WITH RECURSIVE b(k, f) AS (SELECT 1, 0 UNION ALL SELECT k + 1, NOT f FROM b WHERE k < 9) SELECT group_concat(f) FROM b`,
 		`WITH RECURSIVE c(i, s, r) AS (SELECT 1, '1', 1.0 UNION ALL SELECT i + 1, CAST(i + 1 AS TEXT), CAST(i AS REAL) / 2 FROM c WHERE i < 6) SELECT group_concat(typeof(s) || s || typeof(r) || r) FROM c`,
+		// A step that seeks a CTE by the current row (OpSortedSeek), on one
+		// column and on two -- issue #298's shape.
+		`WITH RECURSIVE t(i) AS (SELECT value FROM generate_series(1, 12)),
+		  s(s) AS (SELECT i*i FROM t WHERE i*i < 24),
+		  a(a, b) AS (SELECT t.i, t1.i FROM t, t t1 WHERE t.i <> t1.i AND t.i + t1.i IN (SELECT s FROM s)),
+		  c(lv, r, bmp, path) AS (SELECT 1, a.b, 1 + (1 << (a.b - 1)), '01' || printf('%02d', a.b) FROM a WHERE a.a = 1
+		    UNION ALL SELECT lv + 1, a.b, bmp + (1 << (a.b - 1)), path || printf('%02d', a.b) FROM c, a
+		    WHERE a.a = c.r AND bmp & (1 << (a.b - 1)) = 0 AND lv < 12)
+		SELECT lv, count(*), max(path), min(path) FROM c GROUP BY lv`,
+		`WITH RECURSIVE e(x, y, z) AS (SELECT value % 5, value % 3, value FROM generate_series(1, 40)),
+		  c(k, x, y, z) AS (SELECT 1, 1, 1, 0 UNION ALL SELECT k + 1, e.y + 1, (e.z + k) % 3, e.z FROM c, e WHERE e.x = c.x AND e.y = c.y AND k < 6)
+		SELECT k, count(*), sum(z) FROM c GROUP BY k`,
 	}
 	ask := func(q string, inline bool) string {
 		recInlineOffForTest, segPeepholesOffForTest = !inline, !inline
