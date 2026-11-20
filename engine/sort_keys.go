@@ -4,26 +4,44 @@ import (
 	"bytes"
 	"cmp"
 	"encoding/binary"
+	"math/bits"
 	"slices"
 )
 
 // appendSortKey appends v to dst so that bytes.Compare of two keys built
 // column by column orders them as compareValuesCollatedEnc does under BINARY
 // in a UTF-8 database: a NULL first, then INTEGERs by value, then TEXTs and
-// then BLOBs by their bytes. A TEXT or BLOB's zero bytes are escaped and it
-// ends in two zero bytes, so a prefix sorts first. desc inverts the column's
-// bytes. false for a REAL, which compares with an INTEGER by value.
+// then BLOBs by their bytes. An INTEGER takes only the bytes its value needs,
+// their count in its tag, so the first bytes of a key, which decide most
+// comparisons, hold more columns. A TEXT or BLOB's zero bytes are escaped
+// and it ends in two zero bytes, so a prefix sorts first. desc inverts the
+// column's bytes. false for a REAL, which compares with an INTEGER by value.
 func appendSortKey(dst []byte, v Value, desc bool) ([]byte, bool) {
 	start := len(dst)
 	switch v.Typ {
 	case Null:
 		dst = append(dst, 0)
 	case Int:
-		dst = binary.BigEndian.AppendUint64(append(dst, 1), uint64(v.I)^1<<63)
+		// A negative one by its complement's length, longer first: tags 1
+		// to 9, then 10 to 18 for zero and up.
+		u, tag := uint64(v.I), byte(10)
+		if v.I < 0 {
+			u, tag = ^u, 9
+		}
+		n := (bits.Len64(u) + 7) / 8
+		if v.I < 0 {
+			tag -= byte(n)
+		} else {
+			tag += byte(n)
+		}
+		dst = append(dst, tag)
+		for i := n - 1; i >= 0; i-- {
+			dst = append(dst, byte(uint64(v.I)>>(8*i)))
+		}
 	case Text, Blob:
-		tag := byte(2)
+		tag := byte(32)
 		if v.Typ == Blob {
-			tag = 3
+			tag = 33
 		}
 		dst = append(dst, tag)
 		for _, b := range v.S {
@@ -59,6 +77,10 @@ func sortBySortKeys(perm []int, nk int, at func(i, k int) Value, desc func(k int
 	var arena []byte
 	ends := make([]int, n)
 	for i := range n {
+		if i == 1 {
+			// The first row's size for every row, and a quarter more.
+			arena = slices.Grow(arena, len(arena)*n*5/4)
+		}
 		for k := range nk {
 			var ok bool
 			if arena, ok = appendSortKey(arena, at(i, k), desc(k)); !ok {

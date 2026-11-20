@@ -863,7 +863,7 @@ func (t *segJoinTable) sortedBy(c int) (keys []int64, rows []int32, ok bool) {
 				rows = append(rows, int32(r))
 			}
 		}
-		slices.SortStableFunc(rows, func(a, b int32) int { return cmp.Compare(vals[a], vals[b]) })
+		rows = radixSortByKey(rows, func(r int32) int64 { return vals[r] })
 		keys = make([]int64, len(rows))
 		for i, r := range rows {
 			keys[i] = vals[r]
