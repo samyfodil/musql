@@ -30,6 +30,9 @@ type vdbe struct {
 	// turns back.
 	intr *atomic.Bool
 
+	// cmpText is compareAffinity's last two numbers and their text.
+	cmpText [2]cmpTextMemo
+
 	// jitErr is an error native code's return found taking a cursor back
 	// (syncIdxSeek), which the run returns.
 	jitErr error
@@ -3845,6 +3848,36 @@ func (m *vdbe) jumpIf(reg, jumpIfNull int, wantTrue bool) bool {
 // (IS / IS NOT) NULLs compare equal and the result is definite; otherwise a
 // NULL operand yields NULL in store mode, or jumps iff p5JumpIfNull. jump is
 // false in store mode (the result went to r[P2]).
+// compareAffinity is applyAffinityToValue for a comparison's operand. The
+// last two numbers given TEXT affinity are kept with their text: a constant
+// compared with every row of a TEXT column, or a BETWEEN's two, is rendered
+// once, as C's register keeps the string it was given.
+func (m *vdbe) compareAffinity(v Value, aff affinity) Value {
+	if aff != affText || v.Typ != Int && v.Typ != Float {
+		return applyAffinityToValue(v, aff)
+	}
+	bits := uint64(v.I)
+	if v.Typ == Float {
+		bits = math.Float64bits(v.F)
+	}
+	for i := range m.cmpText {
+		if c := &m.cmpText[i]; c.ok && c.typ == v.Typ && c.bits == bits {
+			return c.text
+		}
+	}
+	t := applyAffinityToValue(v, aff)
+	m.cmpText[1] = m.cmpText[0]
+	m.cmpText[0] = cmpTextMemo{typ: v.Typ, bits: bits, text: t, ok: true}
+	return t
+}
+
+type cmpTextMemo struct {
+	typ  ValueType
+	bits uint64
+	text Value
+	ok   bool
+}
+
 func (m *vdbe) compareOp(op *Instruction) (jump bool, target int) {
 	l := m.regs[op.P3] // left operand
 	r := m.regs[op.P1] // right operand
@@ -3893,10 +3926,10 @@ func (m *vdbe) compareOp(op *Instruction) (jump bool, target int) {
 		// 48-byte Value copy in and another out even for the overwhelmingly
 		// common integer-column-vs-integer-key comparison it leaves untouched.
 		if !affinityIsIdentity(l.Typ, aff) {
-			l = applyAffinityToValue(l, aff)
+			l = m.compareAffinity(l, aff)
 		}
 		if !affinityIsIdentity(r.Typ, aff) {
-			r = applyAffinityToValue(r, aff)
+			r = m.compareAffinity(r, aff)
 		}
 	}
 	// P4 carries the collating sequence (compCollation). It only matters for a
