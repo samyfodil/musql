@@ -525,22 +525,25 @@ func buildTableSortedVMIdx(x *vmIdx, spec *idxSeekSpec) *vmIdx {
 	if len(rows) == 0 {
 		return x
 	}
-	// Ties in rowid order: the rows were taken segment by segment.
-	slices.SortFunc(rows, func(a, b row) int {
-		for j := range nk {
-			na, nb := a.nulls>>j&1, b.nulls>>j&1
-			if c := cmp.Compare(nb, na); c != 0 {
-				return c
+	// Ties in rowid order: the rows were taken segment by segment, and each
+	// pass is stable. The last key first; within a key NULLs first, then by
+	// value.
+	var anyNull uint8
+	for _, r := range rows {
+		anyNull |= r.nulls
+	}
+	var scratch []row
+	for j := nk - 1; j >= 0; j-- {
+		rows, scratch = radixSortByKeyWith(rows, scratch, func(r row) int64 {
+			if r.nulls>>j&1 != 0 {
+				return 0
 			}
-			if c := cmp.Compare(a.k[j], b.k[j]); na == 0 && c != 0 {
-				return c
-			}
+			return r.k[j]
+		})
+		if anyNull>>j&1 != 0 {
+			rows, scratch = radixSortByKeyWith(rows, scratch, func(r row) int64 { return int64(1 - r.nulls>>j&1) })
 		}
-		if c := cmp.Compare(a.seg, b.seg); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.r, b.r)
-	})
+	}
 	return x.tableIndex(mask, len(rows), func(i int) (int, int, int64) { return int(rows[i].seg), int(rows[i].r), rows[i].k[0] })
 }
 
@@ -1045,9 +1048,16 @@ func (m *vdbe) syncIdxSeek(jx *vmJIT, c int, jc *jit.VCursor, spec *idxSeekSpec)
 // radixSortByKey sorts rows stably by key, a byte of the key at a time,
 // skipping a byte every row shares. It may return its scratch slice.
 func radixSortByKey[T any](rows []T, key func(T) int64) []T {
+	rows, _ = radixSortByKeyWith(rows, nil, key)
+	return rows
+}
+
+// radixSortByKeyWith is radixSortByKey with scratch, a slice as long as rows
+// or nil, which it returns with the rows, for the next sort to reuse.
+func radixSortByKeyWith[T any](rows, scratch []T, key func(T) int64) ([]T, []T) {
 	if len(rows) < 64 {
 		slices.SortStableFunc(rows, func(a, b T) int { return cmp.Compare(key(a), key(b)) })
-		return rows
+		return rows, scratch
 	}
 	var counts [8][256]int
 	for _, rw := range rows {
@@ -1056,7 +1066,10 @@ func radixSortByKey[T any](rows []T, key func(T) int64) []T {
 			counts[b][byte(k>>(8*b))]++
 		}
 	}
-	tmp := make([]T, len(rows))
+	tmp := scratch
+	if len(tmp) < len(rows) {
+		tmp = nil
+	}
 	for b := range 8 {
 		c := &counts[b]
 		if c[byte((uint64(key(rows[0]))^1<<63)>>(8*b))] == len(rows) {
@@ -1067,6 +1080,9 @@ func radixSortByKey[T any](rows []T, key func(T) int64) []T {
 			c[i] = at
 			at += n
 		}
+		if tmp == nil {
+			tmp = make([]T, len(rows))
+		}
 		for _, rw := range rows {
 			d := byte((uint64(key(rw)) ^ 1<<63) >> (8 * b))
 			tmp[c[d]] = rw
@@ -1074,7 +1090,7 @@ func radixSortByKey[T any](rows []T, key func(T) int64) []T {
 		}
 		rows, tmp = tmp, rows
 	}
-	return rows
+	return rows, tmp
 }
 
 // segIntWords is column c of each row, and nulls, nil when there is none,
