@@ -180,6 +180,9 @@ func emitVMArm(arm *Arm, prog []VInsn, nReg int, lay ValueLayout, bound, entry [
 			islandAt = len(a.buf)
 		}
 	}
+	if e.segRead != "" {
+		e.emitSegRead()
+	}
 	e.island("")
 
 	a.Label("table")
@@ -273,6 +276,7 @@ type vmEmitArm struct {
 	entryRegs []int    // vmEmit.entryRegs
 	zeroS     knowSet  // vmEmit.zeroS
 	cold      []func() // vmEmit.cold, emitted in the next island
+	segRead   string   // vmEmit.segRead
 	consts    *firPool // the next island's doubles (vm_real_arm64.go)
 }
 

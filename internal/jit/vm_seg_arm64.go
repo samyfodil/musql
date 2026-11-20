@@ -2,6 +2,8 @@
 
 package jit
 
+import "slices"
+
 // The segment cursor, the native rowid seek and the constant TEXT on AArch64,
 // as vm_seg_amd64.go's. X4-X10 are scratch, and the seek's search X11-X13 as
 // well: it calls no helper that keeps them.
@@ -31,18 +33,14 @@ func (e *vmEmitArm) curBase(c int) {
 var vmSegKinds = [...]int{VSegInt, VSegFloat, VSegNumeric, VSegIntReal, VSegRowid, VSegText}
 
 func (e *vmEmitArm) segColumn(pc int, in VInsn) {
-	a, L := e.a, e.lay
+	a := e.a
 	e.destNoS(pc, in.C)
 	e.zeroS.del(in.C) // every word of the destination is written below
-	seg, nonull, noexc, done, rows := e.vmLabel("sg"), e.vmLabel("sn"), e.vmLabel("sx"), e.vmLabel("sd"), e.vmLabel("sw")
-	null := e.vmLabel("su")
-	var at [VSegText + 1]string
-	for _, k := range vmSegKinds {
-		at[k] = e.vmLabel("sk")
-	}
-	if in.T > 0 && in.T < len(at) && at[in.T] != "" {
-		kind := at[in.T]
-		full, fnosel, prows := e.vmLabel("sf"), e.vmLabel("so"), e.vmLabel("sr")
+	done, full := e.vmLabel("sd"), e.vmLabel("sf")
+	kind := ""
+	if slices.Contains(vmSegKinds[:], in.T) {
+		kind = e.vmLabel("sk")
+		fnosel, prows := e.vmLabel("so"), e.vmLabel("sr")
 		base, have := e.holds[^in.A]
 		if have {
 			e.pinned.add(int(base))
@@ -87,62 +85,198 @@ func (e *vmEmitArm) segColumn(pc int, in VInsn) {
 		a.LdrImm(X8, X7, VSegColOffPlain)
 		a.CmpImm(X8, uint32(in.T))
 		a.Bcond(CondE, kind)
-		a.B(full)
-		// A cursor reading its row list: the checks above hold and X5 is
-		// its position.
+		// A cursor reading its row list takes the full read.
 		a.Label(prows)
-		if base != X9 {
-			a.MovReg(X9, base)
-		}
-		a.B(rows)
-		a.Label(full)
 	} else {
 		e.unmap(^in.A)
 	}
 
+	// The full read, shared by every column of the program (emitSegRead):
+	// the cursor in X9, the column in X11, the destination's address in X12
+	// and the return address in X13. X10 comes back non-zero where the VDBE
+	// must read the cell.
+	a.Label(full)
 	e.curBase(in.A)
+	a.MovImm64(X11, int64(in.B))
+	if o := e.off(in.C, 0); o < 4096 {
+		a.AddImm(X12, X1, uint32(o))
+	} else {
+		a.MovImm64(X12, int64(o))
+		a.AddReg(X12, X1, X12)
+	}
+	back := e.vmLabel("sb")
+	a.Adr(X13, back)
+	e.segRead = "segread"
+	a.B(e.segRead)
+	a.Label(back)
+	a.Cbnz(X10, e.stub(pc))
+	if kind != "" {
+		// The predicted kind's read, which a plain column of it jumps to.
+		a.B(done)
+		a.Label(kind)
+		e.segArm(in.T, func(rt Reg64, f int) { e.str(rt, in.C, f) }, done, func() { e.branchWB(pc) })
+	}
+
+	a.Label(done)
+	e.unmap(in.C)
+	e.know.wroteAny(in.C, false)
+}
+
+// segArmNull is segArm's NULL, a cell its column's bitmap marks.
+const segArmNull = -1
+
+// segArm reads a segment cell of kind k, X5 its row, X6 its VSeg and X7 its
+// VSegCol, storing each word of the Value with put, then branches to done.
+// wb fails the read when the write barrier is on, which a string's pointer
+// store needs off. X4, X8, X9 and X10 are scratch.
+func (e *vmEmitArm) segArm(k int, put func(rt Reg64, f int), done string, wb func()) {
+	a, L := e.a, e.lay
+	cell := func() { // X4 = the 8-byte cell at row X5
+		a.LdrImm(X4, X7, VSegColOffBlock)
+		a.LdrRegIdx(X4, X4, X5)
+	}
+	writeNum := func(typ byte, ival, fval Reg64) { // a number, no string
+		a.MovImm16(X10, uint16(typ))
+		put(X10, 0)
+		put(ival, L.OffI)
+		put(fval, L.OffF)
+		for k := range 3 {
+			put(xzr, L.OffS+8*k)
+		}
+		a.B(done)
+	}
+	switch k {
+	case VSegInt:
+		cell()
+		writeNum(L.TypInt, X4, xzr)
+	// A NULL cell is a NULL, as vm_seg_amd64.go's segArm reads it.
+	case segArmNull:
+		writeNum(L.TypNull, xzr, xzr)
+	case VSegFloat:
+		cell()
+		writeNum(L.TypFloat, xzr, X4)
+	case VSegIntReal:
+		cell()
+		a.Scvtf(0, X4)
+		a.FmovToX(X4, 0)
+		writeNum(L.TypFloat, xzr, X4)
+	// An integral double within 2^53 is the INTEGER, any other the REAL
+	// (numericValue). A NaN compares unequal, and a value past int64
+	// saturates and fails the round trip or the range.
+	case VSegNumeric:
+		numReal := e.vmLabel("sr")
+		cell()
+		a.FmovToD(0, X4)
+		a.Fcvtzs(X8, 0)
+		a.Scvtf(1, X8)
+		a.Fcmp(0, 1)
+		a.Bcond(CondNE, numReal)
+		a.MovImm64(X10, 1<<53)
+		a.AddReg(X10, X8, X10)
+		a.MovImm64(X9, 1<<54)
+		a.Cmp(X10, X9)
+		a.BcondRaw(armHI, numReal)
+		writeNum(L.TypInt, X8, xzr)
+		a.Label(numReal)
+		writeNum(L.TypFloat, xzr, X4)
+	case VSegRowid:
+		rowids := e.vmLabel("sw")
+		a.LdrImm(X10, X6, VSegOffDense)
+		a.Cbz(X10, rowids)
+		a.LdrImm(X4, X6, VSegOffFirst)
+		a.AddReg(X4, X4, X5)
+		writeNum(L.TypInt, X4, xzr)
+		a.Label(rowids)
+		a.LdrImm(X4, X6, VSegOffRowids)
+		a.LdrRegIdx(X4, X4, X5)
+		writeNum(L.TypInt, X4, xzr)
+	// TEXT: the bytes from bound Pos to bound Pos+1 of the heap, shared,
+	// which is a pointer store. An empty string points at the heap's start.
+	case VSegText:
+		wb()
+		a.LdrImm(X4, X7, VSegColOffBlock)
+		a.LslImm(X10, X5, 2)
+		a.AddReg(X4, X4, X10)
+		a.LdrWImm(X8, X4, 0)  // from
+		a.LdrWImm(X10, X4, 4) // to
+		a.SubsReg(X10, X10, X8)
+		a.Csel(X8, X8, xzr, CondNE)
+		a.LdrImm(X4, X7, VSegColOffHeap)
+		a.AddReg(X8, X4, X8)
+		a.MovImm16(X4, uint16(L.TypText))
+		put(X4, 0)
+		put(xzr, L.OffI)
+		put(xzr, L.OffF)
+		put(X8, L.OffS)
+		put(X10, L.OffS+8)
+		put(X10, L.OffS+16)
+		a.B(done)
+	}
+}
+
+// emitSegRead emits segColumn's full read, which every column a program reads
+// shares, as vm_seg_amd64.go's: column X11 of the cursor at X9, its row Pos,
+// into the Value at X12, from the segment's blocks when the engine handed one
+// over, else from its row list. It returns through X13 with X10 zero when it
+// read the cell, and non-zero, having written nothing, where the VDBE must.
+// The destination holds no string (destNoS before the call). X4-X10 are
+// scratch; X11-X13 are left as they came.
+func (e *vmEmitArm) emitSegRead() {
+	a, L := e.a, e.lay
+	fail, ok, seg, nonull, noexc, null, nosel, nostr := e.vmLabel("rf"), e.vmLabel("ro"), e.vmLabel("rg"),
+		e.vmLabel("rn"), e.vmLabel("rx"), e.vmLabel("ru"), e.vmLabel("rl"), e.vmLabel("rs")
+	var at [VSegText + 1]string
+	for _, k := range vmSegKinds {
+		at[k] = e.vmLabel("rk")
+	}
+	a.Label(e.segRead)
 	a.LdrImm(X10, X9, VCursorOffOk)
-	a.Cbz(X10, e.stub(pc))
+	a.Cbz(X10, fail)
+	a.CmpImm(X11, 63)
+	a.BcondRaw(armHI, fail) // past the mask's 64 columns
 	a.LdrImm(X10, X9, VCursorOffMask)
-	a.MovImm64(X4, int64(uint64(1)<<uint(in.B)))
-	a.AndReg(X10, X10, X4)
-	a.Cbz(X10, e.stub(pc))
+	a.Asrv(X10, X10, X11)
+	a.AndImmLow(X10, X10, 1)
+	a.Cbz(X10, fail) // the column is not readable
 	a.LdrImm(X5, X9, VCursorOffPos)
 	a.LdrImm(X10, X9, VCursorOffN)
 	a.Cmp(X5, X10)
-	a.BcondRaw(armHS, e.stub(pc)) // unsigned: a position before the first row is huge
+	a.BcondRaw(armHS, fail) // unsigned: a position before the first row is huge
 	a.LdrImm(X6, X9, VCursorOffSeg)
 	a.Cbnz(X6, seg)
 
 	// The row list's: the Value copied whole, its string's pointer shared.
-	a.Label(rows)
 	a.MovImm64(X10, sliceHeaderSize)
 	a.Mul(X10, X5, X10)
 	a.LdrImm(X4, X9, VCursorOffRows)
 	a.AddReg(X10, X4, X10)
 	a.LdrImm(X4, X10, 8) // the row's length
-	a.MovImm64(X8, int64(in.B))
-	a.Cmp(X4, X8)
-	a.BcondRaw(armLS, e.stub(pc)) // a row narrower than the column: the VDBE's
+	a.Cmp(X4, X11)
+	a.BcondRaw(armLS, fail) // a row narrower than the column: the VDBE's
 	a.LdrImm(X7, X10, 0)
-	vb := in.B * L.Size
-	e.ldrAt(X4, X7, vb+L.OffS)
-	e.coldPath(X4, func() { e.branchWB(pc) })
+	a.MovImm64(X10, int64(L.Size))
+	a.Mul(X10, X11, X10)
+	a.AddReg(X7, X7, X10)
+	a.LdrImm(X4, X7, L.OffS)
+	a.Cbz(X4, nostr)
+	a.LdrImm(X10, X0, POffWB)
+	a.Cbnz(X10, fail)
+	a.Label(nostr)
 	for _, off := range []int{0, L.OffI, L.OffF, L.OffS, L.OffS + 8, L.OffS + 16} {
-		e.ldrAt(X4, X7, vb+off)
-		e.str(X4, in.C, off)
+		a.LdrImm(X4, X7, off)
+		a.StrImm(X4, X12, off)
 	}
-	a.B(done)
+	a.B(ok)
 
 	a.Label(seg)
 	e.rowSeg(X9)
-	nosel := e.vmLabel("sl")
 	a.LdrImm(X4, X9, VCursorOffSel) // a selection's row for the position
 	a.Cbz(X4, nosel)
 	a.LdrRegIdx(X5, X4, X5)
 	a.Label(nosel)
 	a.LdrImm(X7, X6, VSegOffCols)
-	a.MovImm64(X4, int64(in.B*VSegColSize))
+	a.MovImm64(X4, VSegColSize)
+	a.Mul(X4, X11, X4)
 	a.AddReg(X7, X7, X4)
 	a.LdrImm(X4, X7, VSegColOffNulls)
 	a.Cbz(X4, nonull)
@@ -159,104 +293,32 @@ func (e *vmEmitArm) segColumn(pc int, in VInsn) {
 	a.LdrRegIdx(X8, X4, X8)
 	a.Asrv(X8, X8, X5) // the amount is taken modulo 64: the row's bit
 	a.AndImmLow(X8, X8, 1)
-	a.Cbnz(X8, e.stub(pc)) // an exception: the VDBE's
+	a.Cbnz(X8, fail) // an exception: the VDBE's
 	a.Label(noexc)
 	a.LdrImm(X8, X7, VSegColOffKind)
 	for _, k := range vmSegKinds {
 		a.CmpImm(X8, uint32(k))
 		a.Bcond(CondE, at[k])
 	}
-	a.B(e.stub(pc)) // a kind this build does not read
-
-	cell := func() { // X4 = the 8-byte cell at row X5
-		a.LdrImm(X4, X7, VSegColOffBlock)
-		a.LdrRegIdx(X4, X4, X5)
+	a.B(fail) // a kind this build does not read
+	put := func(rt Reg64, f int) { a.StrImm(rt, X12, f) }
+	wb := func() {
+		a.LdrImm(X10, X0, POffWB)
+		a.Cbnz(X10, fail)
 	}
-	writeNum := func(typ byte, ival, fval Reg64) { // a number, no string
-		a.MovImm16(X10, uint16(typ))
-		e.str(X10, in.C, 0)
-		e.str(ival, in.C, L.OffI)
-		e.str(fval, in.C, L.OffF)
-		for k := range 3 {
-			e.str(xzr, in.C, L.OffS+8*k)
-		}
-		a.B(done)
+	for _, k := range vmSegKinds {
+		a.Label(at[k])
+		e.segArm(k, put, ok, wb)
 	}
-
-	a.Label(at[VSegInt])
-	cell()
-	writeNum(L.TypInt, X4, xzr)
-
-	// A NULL cell is a NULL, as vm_seg_amd64.go's segColumn reads it.
 	a.Label(null)
-	writeNum(L.TypNull, xzr, xzr)
+	e.segArm(segArmNull, put, ok, wb)
 
-	a.Label(at[VSegFloat])
-	cell()
-	writeNum(L.TypFloat, xzr, X4)
-
-	a.Label(at[VSegIntReal])
-	cell()
-	a.Scvtf(0, X4)
-	a.FmovToX(X4, 0)
-	writeNum(L.TypFloat, xzr, X4)
-
-	// An integral double within 2^53 is the INTEGER, any other the REAL
-	// (numericValue). A NaN compares unequal, and a value past int64
-	// saturates and fails the round trip or the range.
-	numReal := e.vmLabel("sr")
-	a.Label(at[VSegNumeric])
-	cell()
-	a.FmovToD(0, X4)
-	a.Fcvtzs(X8, 0)
-	a.Scvtf(1, X8)
-	a.Fcmp(0, 1)
-	a.Bcond(CondNE, numReal)
-	a.MovImm64(X10, 1<<53)
-	a.AddReg(X10, X8, X10)
-	a.MovImm64(X9, 1<<54)
-	a.Cmp(X10, X9)
-	a.BcondRaw(armHI, numReal)
-	writeNum(L.TypInt, X8, xzr)
-	a.Label(numReal)
-	writeNum(L.TypFloat, xzr, X4)
-
-	rowids := e.vmLabel("sw")
-	a.Label(at[VSegRowid])
-	a.LdrImm(X10, X6, VSegOffDense)
-	a.Cbz(X10, rowids)
-	a.LdrImm(X4, X6, VSegOffFirst)
-	a.AddReg(X4, X4, X5)
-	writeNum(L.TypInt, X4, xzr)
-	a.Label(rowids)
-	a.LdrImm(X4, X6, VSegOffRowids)
-	a.LdrRegIdx(X4, X4, X5)
-	writeNum(L.TypInt, X4, xzr)
-
-	// TEXT: the bytes from bound Pos to bound Pos+1 of the heap, shared, which
-	// is a pointer store. An empty string points at the heap's start.
-	a.Label(at[VSegText])
-	e.branchWB(pc)
-	a.LdrImm(X4, X7, VSegColOffBlock)
-	a.LslImm(X10, X5, 2)
-	a.AddReg(X4, X4, X10)
-	a.LdrWImm(X8, X4, 0)  // from
-	a.LdrWImm(X10, X4, 4) // to
-	a.SubsReg(X10, X10, X8)
-	a.Csel(X8, X8, xzr, CondNE)
-	a.LdrImm(X4, X7, VSegColOffHeap)
-	a.AddReg(X8, X4, X8)
-	a.MovImm16(X4, uint16(L.TypText))
-	e.str(X4, in.C, 0)
-	e.str(xzr, in.C, L.OffI)
-	e.str(xzr, in.C, L.OffF)
-	e.str(X8, in.C, L.OffS)
-	e.str(X10, in.C, L.OffS+8)
-	e.str(X10, in.C, L.OffS+16)
-
-	a.Label(done)
-	e.unmap(in.C)
-	e.know.wroteAny(in.C, false)
+	a.Label(ok)
+	a.MovImm16(X10, 0)
+	a.Br(X13)
+	a.Label(fail)
+	a.MovImm16(X10, 1)
+	a.Br(X13)
 }
 
 // seekRowid is vm_seg_amd64.go's VSeekRowid. X9 the cursor, X4 the key, X5
