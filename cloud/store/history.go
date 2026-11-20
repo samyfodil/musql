@@ -89,6 +89,9 @@ type History struct {
 	baseFI os.FileInfo
 	seq    uint64
 	closed bool
+	// keepFile: a file behind the log is logged as a new base rather than
+	// rolled forward (KeepFile).
+	keepFile bool
 }
 
 var open sync.Map // absolute database path -> *History
@@ -117,10 +120,18 @@ func OnCommit(c engine.CommitInfo) {
 	}
 }
 
+// OpenOption changes how Open brings log and file to one state.
+type OpenOption func(*History)
+
+// KeepFile makes the file win where it is behind the log: it is logged as a
+// new base instead of rolled forward. A file someone put back on purpose (an
+// older copy) is kept as it is.
+func KeepFile() OpenOption { return func(h *History) { h.keepFile = true } }
+
 // Open opens (or starts) the history in dir of the database at dbPath, which
 // must exist, and brings log and file to one state: a commit the log missed
 // is logged; a file behind its log is rolled forward to the log's end.
-func Open(dbPath, dir string) (*History, error) {
+func Open(dbPath, dir string, opts ...OpenOption) (*History, error) {
 	p, err := filepath.Abs(dbPath)
 	if err != nil {
 		return nil, err
@@ -129,6 +140,9 @@ func Open(dbPath, dir string) (*History, error) {
 		return nil, err
 	}
 	h := &History{dir: dir, path: p}
+	for _, o := range opts {
+		o(h)
+	}
 	if err := h.load(); err != nil {
 		return nil, err
 	}
@@ -147,6 +161,65 @@ func Open(dbPath, dir string) (*History, error) {
 	return h, nil
 }
 
+// OpenLog opens the history in dir with no database to follow: a copy of one
+// (Files), to list its snapshots and restore from.
+func OpenLog(dir string) (*History, error) {
+	h := &History{dir: dir}
+	if err := h.load(); err != nil {
+		if h.log != nil {
+			h.log.Close()
+		}
+		return nil, err
+	}
+	return h, nil
+}
+
+// Files is what a copy of the history needs: the files of each snapshot the
+// log records, then the log's first LogEnd bytes. A snapshot's files are
+// written before the record that names it and never change, so a copy that
+// takes them before the log never holds a record without its files.
+type Files struct {
+	Snapshots []string // names in the history's directory
+	LogEnd    int64
+}
+
+// LogName is the log's name in the history's directory.
+const LogName = "log"
+
+// Files lists what the history holds now.
+func (h *History) Files() Files {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	f := Files{LogEnd: h.size}
+	for i := range h.entries {
+		if e := &h.entries[i]; e.isBase() {
+			f.Snapshots = append(f.Snapshots, h.snapshotNames(e)...)
+		}
+	}
+	return f
+}
+
+// RestoreFiles is the snapshot files Restore(at) reads: what a copy of the
+// log needs beside it to restore to that time.
+func (h *History) RestoreFiles(at time.Time) ([]string, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	i, err := h.entryAt(at)
+	if err != nil {
+		return nil, err
+	}
+	return h.snapshotNames(&h.entries[h.baseOf(i)]), nil
+}
+
+func (h *History) snapshotNames(e *entry) []string {
+	musq, delta := h.baseFiles(e.seq)
+	names := []string{filepath.Base(musq)}
+	if e.deltaLen > 0 {
+		names = append(names, filepath.Base(delta))
+	}
+	return names
+}
+
 // Close stops logging; the files stay.
 func (h *History) Close() error {
 	h.mu.Lock()
@@ -159,7 +232,7 @@ func (h *History) Close() error {
 	return h.log.Close()
 }
 
-func (h *History) logPath() string { return filepath.Join(h.dir, "log") }
+func (h *History) logPath() string { return filepath.Join(h.dir, LogName) }
 
 func (h *History) baseFiles(seq uint64) (musq, delta string) {
 	b := filepath.Join(h.dir, "base-"+strconv.FormatUint(seq, 10))
@@ -496,11 +569,28 @@ func (h *History) Restore(at time.Time, dst string) error {
 	if at.After(time.Now()) {
 		return ErrFuture
 	}
-	if err := h.Sync(); err != nil {
-		return err
+	h.mu.Lock()
+	live := h.path != ""
+	h.mu.Unlock()
+	if live {
+		if err := h.Sync(); err != nil {
+			return err
+		}
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	i, err := h.entryAt(at)
+	if err != nil {
+		return err
+	}
+	return h.materialize(i, dst)
+}
+
+// entryAt is the last entry logged at or before at.
+func (h *History) entryAt(at time.Time) (int, error) {
+	if at.After(time.Now()) {
+		return 0, ErrFuture
+	}
 	i := -1
 	for j := range h.entries {
 		if h.entries[j].at.After(at) {
@@ -509,9 +599,9 @@ func (h *History) Restore(at time.Time, dst string) error {
 		i = j
 	}
 	if i < 0 {
-		return ErrBeforeHistory
+		return 0, ErrBeforeHistory
 	}
-	return h.materialize(i, dst)
+	return i, nil
 }
 
 // materialize writes the state after entry i to dst and dst.delta, each
@@ -718,7 +808,7 @@ func (h *History) repairLocked(c engine.CommitInfo) error {
 			h.loggedEnd, h.deltaFI = int64(len(logged)), statOrNil(h.path+".delta")
 			return h.syncLocked(c, 0)
 		}
-		if atEntryBoundary(h, bi, spanLast, logged, fileDelta) {
+		if !h.keepFile && atEntryBoundary(h, bi, spanLast, logged, fileDelta) {
 			return h.rollForward()
 		}
 		break

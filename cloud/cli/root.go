@@ -42,6 +42,9 @@ type Env struct {
 	HTTP        *http.Client
 	// Version is what --version prints; empty leaves the flag out.
 	Version string
+	// Getenv reads the process environment, for S3 credentials and endpoint
+	// (backup, restore); nil reads nothing.
+	Getenv func(string) string
 }
 
 var errNotSignedIn = errors.New("not signed in: run musql auth login")
@@ -96,7 +99,7 @@ func (a *app) root() *cobra.Command {
 	root.PersistentFlags().StringVar(&a.url, "url", "", "server URL (default: the configured one)")
 	root.PersistentFlags().StringVar(&a.org, "org", "", "organization slug (default: the current one)")
 	root.PersistentFlags().BoolVar(&a.json, "json", false, "print JSON")
-	root.AddCommand(a.authCmd(), a.configCmd(), a.orgCmd(), a.groupCmd(), a.dbCmd(), a.openCmd())
+	root.AddCommand(a.authCmd(), a.configCmd(), a.orgCmd(), a.groupCmd(), a.dbCmd(), a.openCmd(), a.backupCmd(), a.restoreCmd())
 	return root
 }
 

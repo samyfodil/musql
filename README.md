@@ -158,6 +158,23 @@ musql>
 export). [cloud/DESIGN.md](cloud/DESIGN.md) describes the server and how to run
 it.
 
+`musql backup` copies a local database to S3-compatible storage (AWS S3, MinIO,
+Cloudflare R2), once or, with `--stream`, as each commit lands. `musql restore`
+writes it back out as of any commit the backup holds:
+
+```sh
+$ export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=us-east-1
+$ ./musql backup app.musq s3://my-bucket/app --stream
+Streaming app.musq to s3://my-bucket/app; interrupt to stop.
+$ ./musql restore s3://my-bucket/app copy.musq --timestamp 2026-11-19T09:30:00Z
+Restored s3://my-bucket/app as of 2026-11-19T03:30:00-06:00 to copy.musq.
+```
+
+The commits are logged in `app.musq.history` beside the database, and the
+bucket mirrors that log: a snapshot, then each commit's bytes, the way musql
+cloud keeps [point-in-time history](cloud/HISTORY.md). `--endpoint` (or
+`$AWS_ENDPOINT_URL`) points it at a store other than AWS.
+
 ### As a server, no Go needed
 
 Run `musqld` with Docker; the database lives in the `musql` volume:
