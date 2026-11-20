@@ -985,6 +985,82 @@ type segJoinWalk struct {
 	// the loop visits that level's rows, nil for rowid order.
 	order0 []int32
 	rank   [][]int32
+	// runOrder is, for a later level whose rows the loop visits in an
+	// index's order, that order: two joined rows first differing there share
+	// the earlier levels, so the link's key, and only rows sharing a key are
+	// ordered (the link does it).
+	runOrder []segJoinRunOrder
+}
+
+type segJoinRunOrder struct {
+	key *autoIndexKey
+	enc TextEncoding
+}
+
+// orderRuns sorts each run of rows sharing a key of level i's link (sk) by
+// the level's index order (runOrder), and sets the level's rank to each row's
+// place in the result. Only a run some row of the earlier level can reach
+// (its keys, those not NULL and passing) is visited, so only those are sorted.
+func (w *segJoinWalk) orderRuns(i int, sk []int64, rows []int32, keys []int64, nulls, from []bool) []int32 {
+	o, t := w.runOrder[i], w.tabs[i]
+	reach := make([]bool, len(sk))
+	reached := 0
+	for r, key := range keys {
+		if nulls != nil && nulls[r] || from != nil && !from[r] {
+			continue
+		}
+		if j, ok := slices.BinarySearch(sk, key); ok && !reach[j] {
+			reach[j] = true
+			for h := j; h < len(sk) && sk[h] == key; h++ {
+				reached++
+			}
+		}
+	}
+	// A column read whole is kept with the table; one read at a few rows
+	// reads them alone.
+	cols := make([][]Value, len(o.key.cols))
+	for k, c := range o.key.cols {
+		if c >= 0 && 4*reached >= t.n {
+			cols[k] = t.values(c)
+		}
+	}
+	rows = slices.Clone(rows)
+	var perm []int
+	for lo := 0; lo < len(sk); {
+		hi := lo + 1
+		for hi < len(sk) && sk[hi] == sk[lo] {
+			hi++
+		}
+		if hi-lo > 1 && reach[lo] {
+			run := rows[lo:hi]
+			slices.Sort(run)
+			perm = perm[:0]
+			for j := range run {
+				perm = append(perm, j)
+			}
+			autoIndexSortValues(perm, o.key, func(j, k int) Value {
+				if cols[k] == nil {
+					return t.value(run[j], o.key.cols[k])
+				}
+				return cols[k][run[j]]
+			}, o.enc, nil)
+			sorted := make([]int32, len(run))
+			for j, p := range perm {
+				sorted[j] = run[p]
+			}
+			copy(run, sorted)
+		}
+		lo = hi
+	}
+	if w.rank == nil {
+		w.rank = make([][]int32, len(w.tabs))
+	}
+	rank := make([]int32, t.n)
+	for j, r := range rows {
+		rank[r] = int32(j)
+	}
+	w.rank[i] = rank
+	return rows
 }
 
 // segJoinScratch is a cursor like cur holding t's rows in rowid order, each
@@ -1903,6 +1979,16 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 		}
 		key := o.key
 		t := w.tabs[lv]
+		if lv != 0 && key.multiOr == nil && key.exprs == nil {
+			if len(key.cols) == 0 || len(key.colls) < len(key.cols) {
+				return nil, false
+			}
+			if w.runOrder == nil {
+				w.runOrder = make([]segJoinRunOrder, k)
+			}
+			w.runOrder[lv] = segJoinRunOrder{key, segJoinOrderEncoding(cur, m)}
+			continue
+		}
 		var perm []int
 		if key.multiOr != nil || key.exprs != nil {
 			// An order by an expression or by a MULTI_OR's sub-scans: the
@@ -1919,7 +2005,20 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 			for i := range perm {
 				perm[i] = i
 			}
-			autoIndexSortValues(perm, key, func(i, k int) Value { return t.value(int32(i), key.cols[k]) }, segJoinOrderEncoding(cur, m), nil)
+			// The key's columns read whole, as the table keeps them: the sort
+			// reads every row's.
+			cols := make([][]Value, len(key.cols))
+			for k, c := range key.cols {
+				if c >= 0 {
+					cols[k] = t.values(c)
+				}
+			}
+			autoIndexSortValues(perm, key, func(i, k int) Value {
+				if cols[k] == nil {
+					return t.value(int32(i), key.cols[k])
+				}
+				return cols[k][i]
+			}, segJoinOrderEncoding(cur, m), nil)
 		}
 		rank := make([]int32, t.n)
 		for i, r := range perm {
@@ -2056,7 +2155,12 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 			} else if sk, rows, ok = w.sortedByValues(b); !ok {
 				return nil, false
 			}
-			if w.rank != nil && w.rank[i] != nil {
+			if p := w.pass[i]; p != nil {
+				sk, rows = passingOnly(sk, rows, p)
+			}
+			if w.runOrder != nil && w.runOrder[i].key != nil {
+				rows = w.orderRuns(i, sk, rows, keys, nulls, w.pass[e.a])
+			} else if w.rank != nil && w.rank[i] != nil {
 				// The rows sharing a key, in the order the loop visits them.
 				rank := w.rank[i]
 				rows = slices.Clone(rows)
@@ -2068,9 +2172,6 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 					slices.SortFunc(rows[lo:hi], func(x, y int32) int { return cmp.Compare(rank[x], rank[y]) })
 					lo = hi
 				}
-			}
-			if p := w.pass[i]; p != nil {
-				sk, rows = passingOnly(sk, rows, p)
 			}
 			l.keys, l.nulls, l.sorted, l.rows = keys, nulls, sk, rows
 		}
