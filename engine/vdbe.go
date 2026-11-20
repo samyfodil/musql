@@ -54,6 +54,10 @@ type vdbe struct {
 	// (keptVtabStream).
 	vtKept []keptVtab
 
+	// memberSeen is the rows an IN subquery's program has returned
+	// (Program.memberRows), nil on any other.
+	memberSeen *memberSet
+
 	regs []Value
 	jx   *vmJIT        // native code for the program run() is given, when it has some
 	jcur []jit.VCursor // native code's view of the cursors it names, filled at each entry
@@ -1258,6 +1262,14 @@ func (prog *Program) execOuterTrigCap(pager *ReadOnlyPager, outer *evalCtx, para
 	}
 	m := prog.newMachine(pager, outer, params, from)
 	m.maxRows = maxRows
+	if prog.memberRows && maxRows == 0 && !memberRowsOffForTest {
+		seen := &memberSet{}
+		m.memberSeen = seen
+		defer func() {
+			memberRowsLeftOut.Add(int64(seen.dups))
+			memberRowsLeftOutNative.Add(int64(seen.native))
+		}()
+	}
 	// Restore the WITH-clause scope this Program was compiled under, for the
 	// span of its whole run -- see Program.CTEScopeSnapshot's doc comment. A
 	// no-op (nil snapshot) for every Program compiled with no WITH clause in
@@ -1997,6 +2009,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			// compound arm hands tens of thousands of these to its consumer, who
 			// keeps them. A row's capacity ends at its last value (recAlloc), so
 			// an append to it cannot reach its neighbour.
+			if m.memberSeen != nil && !m.yield && m.memberSeen.seen(m.regs[op.P1:op.P1+op.P2]) {
+				break
+			}
 			row := []Value{}
 			if op.P2 > 0 {
 				row = m.recAlloc(op.P2)
