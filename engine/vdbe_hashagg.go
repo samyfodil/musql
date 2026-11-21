@@ -32,8 +32,10 @@ type hashAggBucket struct {
 type hashAggState struct {
 	buckets map[string]*hashAggBucket
 	// ints is the buckets of the keys of INTEGERs and NULLs (hashAggIntKey),
-	// which buckets does not hold.
+	// which buckets does not hold, and small those of a key of one INTEGER
+	// below hashAggSmallKeys, indexed by it, which ints does not hold.
 	ints   map[hashAggIntKey]*hashAggBucket
+	small  []*hashAggBucket
 	sorted []*hashAggBucket
 	pos    int
 	// made is the buckets in the order they were made, and unordered whether
@@ -423,7 +425,12 @@ func (m *vdbe) hashAggStepRow(plan *aggPlan, keyVals []Value, seg int, row, rowi
 		} else {
 			*b = hashAggBucket{key: h.slab.cloneValues(keyVals), accs: h.slab.newAggAccs(plan)}
 		}
-		if isInt {
+		if k, isSmall := hashAggSmall(ik, isInt); isSmall {
+			if k >= len(h.small) {
+				h.small = append(h.small, make([]*hashAggBucket, max(1024, 1<<bits.Len(uint(k)))-len(h.small))...)
+			}
+			h.small[k] = b
+		} else if isInt {
 			if h.ints == nil {
 				h.ints = map[hashAggIntKey]*hashAggBucket{}
 			}
@@ -482,6 +489,12 @@ func hashAggIntKeyOf(vals []Value) (hashAggIntKey, bool) {
 func (m *vdbe) hashAggFind(keyVals []Value) (b *hashAggBucket, ik hashAggIntKey, isInt bool) {
 	h := m.hashAgg
 	if ik, isInt = hashAggIntKeyOf(keyVals); isInt && !hashAggIntKeysOffForTest {
+		if k, isSmall := hashAggSmall(ik, true); isSmall {
+			if k < len(h.small) {
+				return h.small[k], ik, true
+			}
+			return nil, ik, true
+		}
 		return h.ints[ik], ik, true
 	}
 	// Key bytes are reused per row: buckets store their own copy, so a lookup
@@ -496,7 +509,20 @@ func (m *vdbe) hashAggFind(keyVals []Value) (b *hashAggBucket, ik hashAggIntKey,
 var hashAggIntKeysOffForTest bool
 
 // groups is how many groups h has made.
-func (h *hashAggState) groups() int { return len(h.buckets) + len(h.ints) }
+func (h *hashAggState) groups() int { return len(h.made) }
+
+// hashAggSmallKeys bounds the keys hashAggState.small holds: 512 KiB of
+// pointers at most, where a map grown to as many groups costs far more.
+const hashAggSmallKeys = 1 << 16
+
+// hashAggSmall is the index in hashAggState.small of a key of one INTEGER
+// ik, where it has one.
+func hashAggSmall(ik hashAggIntKey, isInt bool) (int, bool) {
+	if !isInt || ik.n != 1 || ik.nulls != 0 || ik.v[0] < 0 || ik.v[0] >= hashAggSmallKeys {
+		return 0, false
+	}
+	return int(ik.v[0]), true
+}
 
 // stepGathered is step's body for each of rows, the registers native code
 // gathered at it (gatherAggStep), in the order it gathered them. The
