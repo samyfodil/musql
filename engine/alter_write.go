@@ -3745,7 +3745,7 @@ func parseAddColumnDefaultValue(p *parser) (val Value, ok bool, err error) {
 		return Value{Typ: Text, S: []byte(t.str)}, true, nil
 	case t.kind == tkBlob:
 		p.next()
-		return Value{Typ: Blob, S: t.blob}, true, nil
+		return Value{Typ: Blob, S: []byte(t.str)}, true, nil
 	case t.kind == tkPunct && t.text == "(":
 		// A parenthesized default is constant exactly when sqlite3ValueFromExpr can fold
 		// it (alter.c:389, 395): a shape test, so "(1+2)" is refused while

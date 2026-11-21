@@ -12,7 +12,7 @@ import (
 )
 
 // tokKind identifies the lexical category of a token.
-type tokKind int
+type tokKind uint8
 
 const (
 	tkEOF    tokKind = iota
@@ -31,14 +31,13 @@ const (
 // name of an unaliased result column.
 type token struct {
 	kind   tokKind
-	text   string // ident name / number literal text / punctuation text
-	str    string // decoded value, tkString only
-	blob   []byte // decoded value, tkBlob only
-	quoted bool   // tkIdent only: true for a "...", `...`, or [...] spelling
+	quoted bool // tkIdent only: true for a "...", `...`, or [...] spelling
 	// dquoted is quoted narrowed to double-quote spelling alone: a "..."-spelled
 	// identifier that resolves to no column becomes a string literal, while
 	// `...` and [...] stay hard column references. See ColumnExpr.FallbackLiteral.
 	dquoted bool
+	text    string // ident name / number literal text / punctuation text
+	str     string // decoded value, tkString and tkBlob only
 	Start   int
 	End     int
 }
@@ -295,17 +294,18 @@ func lexUncached(s string) ([]token, error) {
 			if len(hexStr)%2 != 0 {
 				return nil, fmt.Errorf("engine: blob literal %q has an odd number of hex digits", hexStr)
 			}
-			b := make([]byte, len(hexStr)/2)
-			for k := 0; k < len(b); k++ {
+			var b strings.Builder
+			b.Grow(len(hexStr) / 2)
+			for k := 0; k < len(hexStr)/2; k++ {
 				hi, ok1 := hexDigit(hexStr[2*k])
 				lo, ok2 := hexDigit(hexStr[2*k+1])
 				if !ok1 || !ok2 {
 					return nil, fmt.Errorf("engine: invalid hex digit in blob literal %q", hexStr)
 				}
-				b[k] = hi<<4 | lo
+				b.WriteByte(hi<<4 | lo)
 			}
 			i = j + 1
-			toks = append(toks, token{kind: tkBlob, blob: b, Start: start, End: i})
+			toks = append(toks, token{kind: tkBlob, str: b.String(), Start: start, End: i})
 
 		case c == '\'': // string literal; '' escapes a literal quote
 			lit, j, ok := lexQuoted(s, i+1, '\'', true)
