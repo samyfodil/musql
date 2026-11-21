@@ -1435,13 +1435,29 @@ func (w *segJoinWalk) filterPassing(a segJoinArg, pass []bool) bool {
 			passing++
 		}
 	}
-	cols, read, ok := t.exprColumnsSparse(a.expr, 2*passing < t.n)
+	sparse := 2*passing < t.n
+	cols, read, ok := t.exprColumnsSparse(a.expr, true)
 	if !ok {
 		return false
+	}
+	// One INTEGER column read whole is read as integers, not a Value per row.
+	var ints []int64
+	if !sparse && len(read) == 1 && cols[read[0]] == nil {
+		ints, _ = t.col(read[0] - 1)
+	}
+	if ints == nil && !sparse {
+		for _, i := range read {
+			if cols[i] == nil {
+				cols[i] = t.values(i - 1)
+			}
+		}
 	}
 	cell := func(i int) Value {
 		if c := cols[i]; c != nil {
 			return c[row]
+		}
+		if ints != nil {
+			return Value{Typ: Int, I: ints[row]}
 		}
 		return t.value(row, i-1)
 	}
@@ -1788,8 +1804,10 @@ func segJoinReadsClock(e *segJoinExpr) bool {
 }
 
 // segJoinExprCannotFail reports whether e is built only of instructions that
-// cannot raise an error: constants, columns, copies, jumps, comparisons and
-// the date functions, which answer NULL for what they cannot read.
+// cannot raise an error: constants, parameters, columns, copies, jumps,
+// comparisons, IN lists, arithmetic (an overflow goes to REAL, a zero divisor
+// gives NULL) and the date functions, which answer NULL for what they cannot
+// read.
 func segJoinExprCannotFail(e *segJoinExpr) bool {
 	if e.volatile {
 		return false
@@ -1798,7 +1816,8 @@ func segJoinExprCannotFail(e *segJoinExpr) bool {
 		switch in.Op {
 		case OpColumn, OpRowid, OpInteger, OpInt64, OpReal, OpString8, OpNull, OpSCopy, OpCopy,
 			OpGoto, OpIf, OpIfNot, OpNotNull, OpIsNull, OpNot,
-			OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
+			OpEq, OpNe, OpLt, OpLe, OpGt, OpGe,
+			OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpVariable, OpInList:
 		case OpFunction:
 			name, ok := in.P4.(string)
 			if !ok || !segJoinDateFuncs[r33sFoldIdent(name)] || udfs[r33sFoldIdent(name)] != nil {
