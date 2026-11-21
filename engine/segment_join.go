@@ -51,6 +51,9 @@ var segJoinEmptyWalks atomic.Int64
 // segments' packed cells, for tests.
 var segJoinBytesPasses atomic.Int64
 
+// segJoinGatherWhole counts the columns gatherAt read whole, for tests.
+var segJoinGatherWhole atomic.Int64
+
 // segJoinPlan is what OpSegJoinAgg and OpSegJoinGroups carry: the loop's
 // levels and the columns they read, as the recogniser traced them out of the
 // program.
@@ -777,6 +780,13 @@ func (t *segJoinTable) value(r int32, c int) Value {
 	si := sort.SearchInts(t.starts, int(p)+1) - 1
 	s, row := t.segs[si], int(p)-t.starts[si]
 	return segColumnValue(segColPlansFor(t.tbl), s, row, len(s.cols), uint64(t.rowids[r]), c)
+}
+
+// keptValues is values when the table already holds column c's, else nil.
+func (t *segJoinTable) keptValues(c int) []Value {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.vcols[c]
 }
 
 // values is column c of every row as the cursor reads it, kept with the
@@ -2747,13 +2757,18 @@ type segJoinGroups struct {
 	groups []segJoinGroup
 	next   int
 	args   *segJoinArgs
-	// gcols is each of the aggregate's gathers' level and columns, read
-	// once for gatherAt.
-	gcols []segJoinGatherCols
+	// gcols is each of the aggregate's gathers' level and columns, for
+	// gatherAt; gathered counts its calls.
+	gcols    []segJoinGatherCols
+	gathered int
 }
 
+// segJoinGatherCols is the columns a gather reads (read) and those read
+// whole (cols): a column is read a cell at a time until as many rows have
+// been gathered as make the whole column the cheaper read.
 type segJoinGatherCols struct {
 	level int
+	read  []bool
 	cols  [][]Value
 }
 
@@ -3287,24 +3302,36 @@ func (gs *segJoinGroups) gatherAt(at []int32, row, rowids []Value) bool {
 			// gatherCursorRow reads them), none when it reads no row; the
 			// rest stay NULL.
 			tab, agg := gs.w.tabs[lv], gs.plan.agg
-			cols := make([][]Value, min(ga.n, len(tab.tbl.cols)))
+			read := make([]bool, min(ga.n, len(tab.tbl.cols)))
+			cols := make([][]Value, len(read))
 			all := agg.rowCols == nil || hasGeneratedCols(tab.tbl.cols)
-			for c := range cols {
+			for c := range read {
 				if !agg.rowFree && (all || slices.Contains(agg.rowCols, ga.offset+c)) {
-					cols[c] = tab.values(c)
+					read[c] = true
+					cols[c] = tab.keptValues(c)
 				}
 			}
-			gs.gcols[i] = segJoinGatherCols{level: lv, cols: cols}
+			gs.gcols[i] = segJoinGatherCols{level: lv, read: read, cols: cols}
 		}
 	}
+	gs.gathered++
 	for i, ga := range gs.plan.agg.gathers {
 		gc := gs.gcols[i]
+		tab := gs.w.tabs[gc.level]
+		whole := gs.gathered > tab.n/32
 		r := at[gc.level]
-		for c, col := range gc.cols {
-			if r < 0 || col == nil {
+		for c, rd := range gc.read {
+			switch {
+			case r < 0 || !rd:
 				row[ga.offset+c] = Value{} // an optional level's NULL row, or a column nothing reads
-			} else {
-				row[ga.offset+c] = col[r]
+			case gc.cols[c] != nil:
+				row[ga.offset+c] = gc.cols[c][r]
+			case whole:
+				segJoinGatherWhole.Add(1)
+				gc.cols[c] = tab.values(c)
+				row[ga.offset+c] = gc.cols[c][r]
+			default:
+				row[ga.offset+c] = tab.value(r, c)
 			}
 		}
 	}
