@@ -140,7 +140,31 @@ func lexQuoted(s string, j int, closer byte, double bool) (string, int, bool) {
 // parameters, and again to compile it, each time for the same text; its tokens
 // are read, never changed, so the three share one. Keyed by the text. The
 // slice is handed out with no spare capacity, so an append to it is a copy.
-var lexLast atomic.Pointer[lexEntry]
+var lexLast = &lexSlots{slots: make([]atomic.Pointer[lexEntry], 1)}
+
+// lexMid is lexLast for a text too long for lexKept and too short for
+// lexLast, with a few slots: some readers lex a statement trimmed and some as
+// given, which would take turns in one.
+var lexMid = &lexSlots{slots: make([]atomic.Pointer[lexEntry], 4)}
+
+type lexSlots struct {
+	slots []atomic.Pointer[lexEntry]
+	next  atomic.Uint32
+}
+
+func (l *lexSlots) lex(s string) ([]token, error) {
+	for i := range l.slots {
+		if e := l.slots[i].Load(); e != nil && e.sql == s {
+			return e.toks[:len(e.toks):len(e.toks)], nil
+		}
+	}
+	toks, err := lexUncached(s)
+	if err != nil {
+		return toks, err
+	}
+	l.slots[l.next.Add(1)%uint32(len(l.slots))].Store(&lexEntry{sql: s, toks: toks[:len(toks):len(toks)]})
+	return toks[:len(toks):len(toks)], nil
+}
 
 type lexEntry struct {
 	sql  string
@@ -175,18 +199,13 @@ func lex(s string) ([]token, error) {
 	if len(s) >= lexKeepMin && len(s) <= lexKeepMax {
 		return lexKeep(s)
 	}
+	if len(s) > lexKeepMax && len(s) < lexShareMin {
+		return lexMid.lex(s)
+	}
 	if len(s) < lexShareMin || len(s) > lexShareMax {
 		return lexUncached(s)
 	}
-	if e := lexLast.Load(); e != nil && e.sql == s {
-		return e.toks[:len(e.toks):len(e.toks)], nil
-	}
-	toks, err := lexUncached(s)
-	if err != nil {
-		return toks, err
-	}
-	lexLast.Store(&lexEntry{sql: s, toks: toks[:len(toks):len(toks)]})
-	return toks[:len(toks):len(toks)], nil
+	return lexLast.lex(s)
 }
 
 func lexKeep(s string) ([]token, error) {

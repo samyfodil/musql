@@ -48,3 +48,40 @@ func TestLexSharedTokens(t *testing.T) {
 		t.Fatal("an unterminated string lexed")
 	}
 }
+
+// TestLexMidTextShared: a statement too long for lexKept and too short for
+// lexLast, lexed as given and trimmed by turns, as the classifiers and the
+// parser lex it, is lexed once in each spelling: every later lex hands back
+// the first one's tokens, which are a fresh lex's, with no spare capacity.
+func TestLexMidTextShared(t *testing.T) {
+	for _, n := range []int{lexKeepMax + 1, 8 << 10, lexShareMin - 1} {
+		body := "SELECT " + strings.Repeat("a1 + b2, ", n/9)
+		body = body[:n-len("x FROM t \n")] + "x FROM t"
+		given := body + " \n"
+		if len(given) != n {
+			t.Fatalf("text of %d bytes, want %d", len(given), n)
+		}
+		texts := []string{given, strings.TrimSpace(given)}
+		first := make([][]token, 2)
+		for round := range 3 {
+			for i, s := range texts {
+				toks, err := lex(s)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if cap(toks) != len(toks) {
+					t.Fatalf("%d bytes: spare capacity %d", len(s), cap(toks)-len(toks))
+				}
+				if round == 0 {
+					want, _ := lexUncached(s)
+					if !reflect.DeepEqual(toks, want) {
+						t.Fatalf("%d bytes: shared tokens differ from a fresh lex", len(s))
+					}
+					first[i] = toks
+				} else if &toks[0] != &first[i][0] {
+					t.Errorf("%d bytes, round %d: lexed again", len(s), round)
+				}
+			}
+		}
+	}
+}
