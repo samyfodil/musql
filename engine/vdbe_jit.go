@@ -2511,6 +2511,9 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 				m.recChunk = m.recChunk[args.RowUsed:]
 			}
 			m.jitRows += k
+			if m.memberSeen != nil && !gather {
+				*rows = m.memberSeen.keepNew(*rows, len(*rows)-k)
+			}
 			return int(args.PC), -1
 		}
 		return int(args.PC), int(args.Yield) - 1

@@ -1249,6 +1249,11 @@ type Instruction struct {
 // register-file size it needs and the number of result columns each
 // OpResultRow emits.
 type Program struct {
+	// memberRows: the program is an IN subquery's, whose rows only answer
+	// whether a value is among them, so a row identical to one it already
+	// returned is left out (vdbe.memberSeen).
+	memberRows bool
+
 	// shape, on a program compiled for a statement's shape, says how another
 	// statement of it binds its literals (plan_shape.go).
 	shape *planShape
