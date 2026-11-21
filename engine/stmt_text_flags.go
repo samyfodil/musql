@@ -97,5 +97,10 @@ func LeadingStatementVerb(sqlText string) (string, bool) {
 
 // isCreateVirtualTableSQL reports whether sqlText is a CREATE VIRTUAL TABLE.
 func isCreateVirtualTableSQL(sqlText string) bool {
+	// A catalog row's text that does not name the word is no virtual table,
+	// and is not lexed for the statement flags at every open.
+	if !hasWordFold(sqlText, "VIRTUAL") {
+		return false
+	}
 	return stmtTextFlagsFor(sqlText).isCreateVirtualTable
 }
