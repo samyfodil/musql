@@ -325,11 +325,7 @@ func (c *compiler) emitVtabCorrelatedOpen(srcs []joinSource, order []int, level 
 		return nil
 	}
 	saved := c.scopes
-	var visible []compileScope
-	for i := 0; i < level; i++ {
-		visible = append(visible, sourceScopes(srcs[order[i]])...)
-	}
-	c.scopes = visible
+	c.scopes = c.scopesBound(srcs, order, level)
 	defer func() { c.scopes = saved }()
 
 	terms := make([]vtabCorrTerm, len(s.vtabCorr))
