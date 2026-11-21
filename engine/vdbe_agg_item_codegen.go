@@ -25,7 +25,10 @@
 // inner-first walk (resolve.c:703-704).
 package engine
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 // aggResultRegs is the register block an aggregate result expression's
 // placeholders read: one register per finalized accumulator (groupAggExpr.accIdx),
@@ -343,7 +346,7 @@ func aggAnchorRegScopesUsable(plan *aggPlan) bool {
 //
 // nSub is allowed: aggItemVM keeps each item's subCache for the aggregate's run,
 // so an uncorrelated body runs once, as under C's OP_Once.
-func compileAggItemProgram(pager *ReadOnlyPager, enclosing *compiler, plan *aggPlan, it *itemPlan) *aggItemProgram {
+func compileAggItemProgram(pager *ReadOnlyPager, enclosing *compiler, plan *aggPlan, it *itemPlan, anchorScopes []tableScope) *aggItemProgram {
 	if it == nil || it.rewritten == nil {
 		return nil
 	}
@@ -430,13 +433,11 @@ func compileAggItemProgram(pager *ReadOnlyPager, enclosing *compiler, plan *aggP
 		// ambiguous, as SQLite reports, rather than walk outward.
 		c.rowLive = true
 		c.regScopeStrict = true
-		for i := range plan.scopes {
-			// A copy, not &plan.scopes[i]: regScope holds the pointer for the
-			// whole compile and the plan outlives it.
-			sc := plan.scopes[i]
+		for i := range anchorScopes {
+			sc := &anchorScopes[i]
 			c.pushRegScope(regScope{
-				scope:    &sc,
-				regs:     rowRegsFor(p.colBase+sc.offset, len(sc.cols)),
+				scope:    sc,
+				regs:     colRegsOf(c.aggRegs.col, p.colBase, sc.offset, len(sc.cols)),
 				rowidReg: p.rowidBase + i,
 			})
 		}
@@ -458,16 +459,29 @@ func compileAggItemProgram(pager *ReadOnlyPager, enclosing *compiler, plan *aggP
 }
 
 
+// colRegsOf is the registers of n columns from column off, read from col
+// (base's run) when it holds them.
+func colRegsOf(col []int, base, off, n int) []int {
+	if off >= 0 && off+n <= len(col) {
+		return col[off : off+n : off+n]
+	}
+	return rowRegsFor(base+off, n)
+}
+
 // compileAggItemPrograms compiles every item of plan -- select list, HAVING and
 // each non-ordinal ORDER BY term -- so OpAggResult can run one instead of
 // walking its tree. Called once, where the aggPlan is assembled; an item that
 // does not lower simply keeps a nil program.
 func compileAggItemPrograms(pager *ReadOnlyPager, enclosing *compiler, plan *aggPlan) error {
+	// Copies, not plan.scopes itself: a regScope holds its scope's pointer for
+	// the whole compile and the plan outlives it. Every item reads them; none
+	// writes them.
+	anchorScopes := slices.Clone(plan.scopes)
 	stamp := func(it *itemPlan) error {
 		if it == nil {
 			return nil
 		}
-		if it.prog = compileAggItemProgram(pager, enclosing, plan, it); it.prog == nil {
+		if it.prog = compileAggItemProgram(pager, enclosing, plan, it, anchorScopes); it.prog == nil {
 			return fmt.Errorf("%w: aggregate result expression", errVDBEUnsupported)
 		}
 		return nil
