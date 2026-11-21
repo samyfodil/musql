@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"slices"
 	"strconv"
 	"strings"
 )
@@ -2806,14 +2805,26 @@ func isAggregateFuncName(name string) bool {
 // that does not start with a constraint keyword (i.e. a column definition) is
 // passed through untouched -- a COLUMN's own constraints are comma-less by
 // nature and are parsed by the column path below.
-func expandTableConstraintSegments(segments [][]token, startsConstraint map[string]bool) [][]token {
-	out := make([][]token, 0, len(segments))
-	for _, seg := range segments {
-		if len(seg) == 0 || seg[0].kind != tkIdent || !startsConstraint[seg[0].upper()] {
-			out = append(out, seg)
+func expandTableConstraintSegments(segments [][]token, startsConstraint *keywordSet) [][]token {
+	var out [][]token // nil while every segment holds at most one constraint
+	for i, seg := range segments {
+		if len(seg) == 0 || seg[0].kind != tkIdent || !seg[0].in(startsConstraint) {
+			if out != nil {
+				out = append(out, seg)
+			}
 			continue
 		}
-		out = append(out, splitTableConstraints(seg, startsConstraint)...)
+		parts := splitTableConstraints(seg, startsConstraint)
+		if out == nil {
+			if len(parts) == 1 { // the segment itself
+				continue
+			}
+			out = append(make([][]token, 0, len(segments)+len(parts)), segments[:i]...)
+		}
+		out = append(out, parts...)
+	}
+	if out == nil {
+		return segments
 	}
 	return out
 }
@@ -2823,7 +2834,7 @@ func expandTableConstraintSegments(segments [][]token, startsConstraint map[stri
 // UNIQUE/CHECK/FOREIGN keyword that is not part of the constraint already
 // being scanned -- everything inside parentheses (a CHECK expression, a column
 // list) is at depth > 0 and can never split.
-func splitTableConstraints(seg []token, startsConstraint map[string]bool) [][]token {
+func splitTableConstraints(seg []token, startsConstraint *keywordSet) [][]token {
 	var out [][]token
 	i := 0
 	for i < len(seg) {
@@ -2846,7 +2857,7 @@ func splitTableConstraints(seg []token, startsConstraint map[string]bool) [][]to
 				break
 			}
 		}
-		if !(seg[i].kind == tkIdent && startsConstraint[seg[i].upper()]) {
+		if !(seg[i].kind == tkIdent && seg[i].in(startsConstraint)) {
 			// Not a constraint keyword: hand the rest over whole and let the
 			// caller's own validation report it.
 			out = append(out, seg[start:])
@@ -2862,7 +2873,7 @@ func splitTableConstraints(seg []token, startsConstraint map[string]bool) [][]to
 			case t.kind == tkPunct && t.text == ")":
 				depth--
 			}
-			if depth == 0 && t.kind == tkIdent && startsConstraint[t.upper()] {
+			if depth == 0 && t.kind == tkIdent && t.in(startsConstraint) {
 				break
 			}
 			i++
@@ -2939,6 +2950,18 @@ func validateForeignKeyShapes(cols []columnInfo, fks []fkShape) error {
 // DUPLICATE as written -- verified directly: "(a,b,A)" reports "A"
 // (table.test).
 func validateNoDuplicateColumns(cols []columnInfo) error {
+	// A table of ordinary width compares pairs, which costs less than folding
+	// every name into a map.
+	if len(cols) <= 64 {
+		for i := 1; i < len(cols); i++ {
+			for j := range i {
+				if equalFoldName(cols[i].Name, cols[j].Name) {
+					return fmt.Errorf("engine: duplicate column name: %s", cols[i].Name)
+				}
+			}
+		}
+		return nil
+	}
 	seen := make(map[string]bool, len(cols))
 	for _, c := range cols {
 		k := r33sFoldIdent(c.Name)
@@ -4860,6 +4883,21 @@ const (
 // (the five-step algorithm at the link above), applied to a column's
 // declared type name.
 func typeAffinity(declType string) affinity {
+	// An ASCII type folds as C folds it, without the copy ToUpper makes.
+	if isASCII(declType) {
+		switch {
+		case r35aContainsFold(declType, "int"):
+			return affInteger
+		case r35aContainsFold(declType, "char") || r35aContainsFold(declType, "clob") || r35aContainsFold(declType, "text"):
+			return affText
+		case r35aContainsFold(declType, "blob") || declType == "":
+			return affNone
+		case r35aContainsFold(declType, "real") || r35aContainsFold(declType, "floa") || r35aContainsFold(declType, "doub"):
+			return affReal
+		default:
+			return affNumeric
+		}
+	}
 	t := strings.ToUpper(declType)
 	switch {
 	case strings.Contains(t, "INT"):
@@ -4873,6 +4911,15 @@ func typeAffinity(declType string) affinity {
 	default:
 		return affNumeric
 	}
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
 }
 
 // ---- STRICT tables (https://www.sqlite.org/stricttables.html) ----
@@ -5205,6 +5252,12 @@ var tableConstraintStart = map[string]bool{
 	"PRIMARY": true, "UNIQUE": true, "CHECK": true, "FOREIGN": true, "CONSTRAINT": true,
 }
 
+var (
+	tableConstraintKws  = newKeywordSet(tableConstraintStart)
+	columnConstraintKws = newKeywordSet(columnConstraintStart)
+	nonIdentifierKws    = newKeywordSet(nonIdentifierKeywords)
+)
+
 // columnConstraintStart is the keywords that end a column definition's
 // declared type. NULL is one of these: SQLite's grammar has a bare "NULL"
 // column constraint (parse.y's `ccons ::= NULL onconf`), so "id INTEGER NULL"
@@ -5314,7 +5367,7 @@ func parseCreateTableColumnsAndAutoIndexes(createSQL string, forceNoRowidAlias b
 	// failed: two"). Expand those into one segment each up front, so the loop
 	// below keeps handling exactly one constraint per segment; taking only the
 	// first, as this used to, silently DROPPED the rest.
-	segments = expandTableConstraintSegments(segments, tableConstraintStart)
+	segments = expandTableConstraintSegments(segments, tableConstraintKws)
 
 	// carriedName is a "CONSTRAINT <name>" that named no constraint of its own
 	// (it ended its segment): SQLite's grammar makes it the name of the NEXT
@@ -5346,7 +5399,7 @@ func parseCreateTableColumnsAndAutoIndexes(createSQL string, forceNoRowidAlias b
 			seg[0], _ = asCreateTableIdent(seg[0])
 		}
 		first := seg[0]
-		if first.kind == tkIdent && first.upperIn(tableConstraintStart) {
+		if first.kind == tkIdent && first.in(tableConstraintKws) {
 			sawTableConstraint = true
 			// Table-level constraint: "[CONSTRAINT name] PRIMARY KEY(...)", "UNIQUE(...)",
 			// "CHECK(...)" or FOREIGN KEY. A CONSTRAINT name prefix is stripped first so
@@ -5520,11 +5573,11 @@ func parseCreateTableColumnsAndAutoIndexes(createSQL string, forceNoRowidAlias b
 		// (alter.test/index.test). The exact set was derived FROM the oracle,
 		// one CREATE TABLE per keyword -- see nonIdentifierKeywords -- and a
 		// QUOTED spelling stays legal, which is why seg[0].quoted exempts it.
-		if seg[0].kind == tkIdent && !seg[0].quoted && seg[0].upperIn(nonIdentifierKeywords) {
+		if seg[0].kind == tkIdent && !seg[0].quoted && seg[0].in(nonIdentifierKws) {
 			return nil, nil, nil, fmt.Errorf("engine: near %q: syntax error", seg[0].text)
 		}
 		j := 1
-		for j < len(seg) && !(seg[j].kind == tkIdent && seg[j].upperIn(columnConstraintStart)) {
+		for j < len(seg) && !(seg[j].kind == tkIdent && seg[j].in(columnConstraintKws)) {
 			j++
 		}
 		typeToks := seg[1:j:j]
@@ -5635,7 +5688,7 @@ func parseCreateTableColumnsAndAutoIndexes(createSQL string, forceNoRowidAlias b
 				// token after it ("b AS (a) WAT") is not in C's grammar.
 				if j < len(seg) {
 					nx := seg[j]
-					if !(nx.kind == tkIdent && (nx.upperIn(columnConstraintStart) || nx.isKw("DEFERRABLE"))) {
+					if !(nx.kind == tkIdent && (nx.in(columnConstraintKws) || nx.isKw("DEFERRABLE"))) {
 						return nil, nil, nil, fmt.Errorf("engine: error in generated column %q", name)
 					}
 				}
@@ -5753,7 +5806,7 @@ func parseCreateTableColumnsAndAutoIndexes(createSQL string, forceNoRowidAlias b
 				// followers too.
 				if dknown && dend < len(seg) {
 					nx := seg[dend]
-					if !(nx.kind == tkIdent && (nx.upperIn(columnConstraintStart) || nx.isKw("NULL") || nx.isKw("DEFERRABLE"))) {
+					if !(nx.kind == tkIdent && (nx.in(columnConstraintKws) || nx.isKw("NULL") || nx.isKw("DEFERRABLE"))) {
 						dknown = false
 					}
 				}
@@ -5762,7 +5815,7 @@ func parseCreateTableColumnsAndAutoIndexes(createSQL string, forceNoRowidAlias b
 				// not trust the expression parsed out of its prefix either.
 				if ddefer != nil && dend < len(seg) {
 					nx := seg[dend]
-					if !(nx.kind == tkIdent && (nx.upperIn(columnConstraintStart) || nx.isKw("NULL") || nx.isKw("DEFERRABLE"))) {
+					if !(nx.kind == tkIdent && (nx.in(columnConstraintKws) || nx.isKw("NULL") || nx.isKw("DEFERRABLE"))) {
 						ddefer = nil
 					}
 				}
@@ -6154,7 +6207,12 @@ func validateColumnDefGrammar(seg []token, typeStart, consStart int) error {
 		if i >= len(seg) || seg[i].kind != tkIdent || seg[i].quoted {
 			return false
 		}
-		return slices.Contains(words, seg[i].upper())
+		for _, w := range words {
+			if seg[i].isKw(w) {
+				return true
+			}
+		}
+		return false
 	}
 	punct := func(i int, p string) bool { return i < len(seg) && seg[i].kind == tkPunct && seg[i].text == p }
 	// nm/ids: an identifier -- any keyword but the ones that never fall back to
@@ -6164,7 +6222,7 @@ func validateColumnDefGrammar(seg []token, typeStart, consStart int) error {
 			return false
 		}
 		t := seg[i]
-		return t.kind == tkString || t.kind == tkIdent && (t.quoted || !nonIdentifierKeywords[t.upper()])
+		return t.kind == tkString || t.kind == tkIdent && (t.quoted || !t.in(nonIdentifierKws))
 	}
 	// skip moves past the parenthesized group starting at seg[i], or reports
 	// -1 when it never closes.
@@ -6385,6 +6443,9 @@ var colDefConstraintKeyword = map[string]bool{
 // joinTypeTokens reconstructs a declared type name ("VARCHAR(10)") from its
 // tokens, well enough for typeAffinity's substring matching.
 func joinTypeTokens(toks []token) string {
+	if len(toks) == 1 && toks[0].kind != tkString {
+		return toks[0].text
+	}
 	var sb strings.Builder
 	for i, t := range toks {
 		if i > 0 && t.kind == tkIdent {

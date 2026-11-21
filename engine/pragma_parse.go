@@ -331,6 +331,8 @@ var pragmaColConstraintStart = map[string]bool{
 	"GENERATED": true, "AS": true,
 }
 
+var pragmaColConstraintKws = newKeywordSet(pragmaColConstraintStart)
+
 // parsePragmaTableDef parses a CREATE TABLE statement's stored SQL into a
 // pragmaTableDef (see the file comment for why it is a separate parse).
 //
@@ -412,7 +414,7 @@ func parsePragmaTableDef(createSQL string) (*pragmaTableDef, error) {
 			seg[0], _ = asCreateTableIdent(seg[0])
 		}
 		first := seg[0]
-		if first.kind == tkIdent && first.upperIn(tableConstraintStart) {
+		if first.kind == tkIdent && first.in(tableConstraintKws) {
 			kwTok := first
 			rest := seg
 			if kwTok.isKw("CONSTRAINT") {
@@ -482,7 +484,7 @@ func parsePragmaTableDef(createSQL string) (*pragmaTableDef, error) {
 		// Column definition.
 		name := first.text
 		j := 1
-		for j < len(seg) && !(seg[j].kind == tkIdent && seg[j].upperIn(pragmaColConstraintStart)) {
+		for j < len(seg) && !(seg[j].kind == tkIdent && seg[j].in(pragmaColConstraintKws)) {
 			j++
 		}
 		typeToks := seg[1:j:j]
