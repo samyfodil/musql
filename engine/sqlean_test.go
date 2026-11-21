@@ -88,44 +88,6 @@ var sqleanSkip = map[string]string{
 	"stats/08_24": "group_concat over a correlated table-valued function declines: its row order is not provably C's",
 
 	// The *_agg hash aggregates (crypto.sql sections 27-29).
-	"crypto/27_01": "crypto_*_agg aggregates are not implemented",
-	"crypto/27_02": "crypto_*_agg aggregates are not implemented",
-	"crypto/27_03": "crypto_*_agg aggregates are not implemented",
-	"crypto/27_04": "crypto_*_agg aggregates are not implemented",
-	"crypto/27_05": "crypto_*_agg aggregates are not implemented",
-	"crypto/27_06": "crypto_*_agg aggregates are not implemented",
-	"crypto/27_07": "crypto_*_agg aggregates are not implemented",
-	"crypto/27_08": "crypto_*_agg aggregates are not implemented",
-	"crypto/27_09": "crypto_*_agg aggregates are not implemented",
-	"crypto/27_10": "crypto_*_agg aggregates are not implemented",
-	"crypto/27_11": "crypto_*_agg aggregates are not implemented",
-	"crypto/27_12": "crypto_*_agg aggregates are not implemented",
-	"crypto/27_13": "crypto_*_agg aggregates are not implemented",
-	"crypto/27_14": "crypto_*_agg aggregates are not implemented",
-	"crypto/27_15": "crypto_*_agg aggregates are not implemented",
-	"crypto/27_16": "crypto_*_agg aggregates are not implemented",
-	"crypto/27_17": "crypto_*_agg aggregates are not implemented",
-	"crypto/27_18": "crypto_*_agg aggregates are not implemented",
-	"crypto/28_01": "crypto_*_agg aggregates are not implemented",
-	"crypto/28_02": "crypto_*_agg aggregates are not implemented",
-	"crypto/28_03": "crypto_*_agg aggregates are not implemented",
-	"crypto/28_04": "crypto_*_agg aggregates are not implemented",
-	"crypto/28_05": "crypto_*_agg aggregates are not implemented",
-	"crypto/28_06": "crypto_*_agg aggregates are not implemented",
-	"crypto/28_07": "crypto_*_agg aggregates are not implemented",
-	"crypto/28_08": "crypto_*_agg aggregates are not implemented",
-	"crypto/28_09": "crypto_*_agg aggregates are not implemented",
-	"crypto/28_10": "crypto_*_agg aggregates are not implemented",
-	"crypto/29_01": "crypto_*_agg aggregates are not implemented",
-	"crypto/29_02": "crypto_*_agg aggregates are not implemented",
-	"crypto/29_03": "crypto_*_agg aggregates are not implemented",
-	"crypto/29_04": "crypto_*_agg aggregates are not implemented",
-	"crypto/29_05": "crypto_*_agg aggregates are not implemented",
-	"crypto/29_06": "crypto_*_agg aggregates are not implemented",
-	"crypto/29_07": "crypto_*_agg aggregates are not implemented",
-	"crypto/29_08": "crypto_*_agg aggregates are not implemented",
-	"crypto/29_09": "crypto_*_agg aggregates are not implemented",
-	"crypto/29_10": "crypto_*_agg aggregates are not implemented",
 
 	// PCRE2 syntax Go's RE2 does not have (sqlean_regexp.go).
 	"regexp/01_05": "lookahead",
@@ -197,7 +159,7 @@ func TestSQLeanRegistration(t *testing.T) {
 	if err := RegisterSQLean("nope"); err == nil {
 		t.Fatal("RegisterSQLean(nope) succeeded")
 	}
-	withSQLean(t, "stats", "uuid")
+	withSQLean(t, "stats", "uuid", "crypto")
 	if err := RegisterSQLean("stats"); err != nil {
 		t.Fatalf("registering a family twice: %v", err)
 	}

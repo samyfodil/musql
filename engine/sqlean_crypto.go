@@ -30,7 +30,10 @@ func init() {
 		{"xxh3_64", xxh3_64Sum},
 		{"xxh3_128", xxh3_128Sum},
 	}
-	var scalars []sqleanScalar
+	var (
+		scalars []sqleanScalar
+		aggs    []sqleanAggregate
+	)
 	for _, h := range hashes {
 		f := sqleanScalar{name: h.name, lo: 1, hi: 1, fn: func(args []Value) (Value, error) {
 			if args[0].Typ == Null {
@@ -39,11 +42,39 @@ func init() {
 			return sqleanBlob(h.sum(sqleanBytes(args[0]))), nil
 		}}
 		scalars = append(scalars, f, sqleanAlias("crypto_"+h.name, f))
+		newAgg := func() udfAggState { return &cryptoAggHash{sum: h.sum} }
+		aggs = append(aggs,
+			sqleanAggregate{name: h.name + "_agg", lo: 1, hi: 1, plain: true, newAgg: newAgg},
+			sqleanAggregate{name: "crypto_" + h.name + "_agg", lo: 1, hi: 1, plain: true, newAgg: newAgg})
 	}
 	enc := sqleanScalar{name: "encode", lo: 2, hi: 2, fn: cryptoEncode}
 	dec := sqleanScalar{name: "decode", lo: 2, hi: 2, fn: cryptoDecode}
 	scalars = append(scalars, enc, sqleanAlias("crypto_encode", enc), dec, sqleanAlias("crypto_decode", dec))
-	sqleanFamilies["crypto"] = &sqleanFamily{scalars: scalars}
+	sqleanFamilies["crypto"] = &sqleanFamily{scalars: scalars, aggs: aggs}
+}
+
+// cryptoAggHash is agg_hash_step/agg_hash_final: the hash of every non-NULL
+// row's bytes, concatenated in row order, NULL when there were none. The
+// digest depends only on those bytes, so they are kept and hashed at the end.
+type cryptoAggHash struct {
+	sum  func([]byte) []byte
+	buf  []byte
+	have bool
+}
+
+func (a *cryptoAggHash) Step(args []Value) error {
+	if args[0].Typ != Null {
+		a.buf = append(a.buf, sqleanBytes(args[0])...)
+		a.have = true
+	}
+	return nil
+}
+
+func (a *cryptoAggHash) Value() (Value, error) {
+	if !a.have {
+		return sqleanNull, nil
+	}
+	return sqleanBlob(a.sum(a.buf)), nil
 }
 
 type cryptoCodec struct {

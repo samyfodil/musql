@@ -44,6 +44,9 @@ type udfAggState interface {
 type sqleanAggregate struct {
 	name   string
 	lo, hi int
+	// plain is an aggregate registered without xValue and xInverse, which is
+	// no window function.
+	plain  bool
 	newAgg func() udfAggState
 }
 
@@ -152,8 +155,12 @@ func registerSQLeanAggregate(a *sqleanAggregate) error {
 	u := maps.Clone(udafs)
 	u[a.name] = a
 	udafs = u
+	typ := "w"
+	if a.plain {
+		typ = "a"
+	}
 	for n := a.lo; n <= a.hi; n++ {
-		sqleanFuncRows = append(sqleanFuncRows, pragmaFunctionListRow{a.name, 0, "w", "utf8", int64(n), 2048})
+		sqleanFuncRows = append(sqleanFuncRows, pragmaFunctionListRow{a.name, 0, typ, "utf8", int64(n), 2048})
 	}
 	return nil
 }
