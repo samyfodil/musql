@@ -185,13 +185,15 @@ func (p *ReadOnlyPager) segColKind(tbl *resolvedTable, col int) int {
 // stay within the heap: what boundCell checks per read, once for all rows.
 func (s *segment) textBoundsValid(c int) bool {
 	b := s.buf[int(s.cols[c].blockOff):]
+	b = b[:4*(s.nRows+1)]
 	prev := uint32(0)
-	for i := 0; i <= s.nRows; i++ {
-		x := binary.LittleEndian.Uint32(b[4*i:])
-		if x < prev || int(x) > len(s.heap) {
+	// Bounds that never step back stay within the heap if the last does.
+	for len(b) >= 4 {
+		x := binary.LittleEndian.Uint32(b)
+		if x < prev {
 			return false
 		}
-		prev = x
+		prev, b = x, b[4:]
 	}
-	return true
+	return int(prev) <= len(s.heap)
 }
