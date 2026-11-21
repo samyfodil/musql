@@ -367,9 +367,10 @@ type vmIdx struct {
 	// no file holds (buildSortedVMIdx).
 	vals   [][]int64
 	starts [][]int32
-	// rowSegs and segPtrs are, for an index over several segments (one
-	// vidx whose Segs is segPtrs), the segment of each of keep[0]'s rows.
-	rowSegs []*segment
+	// whole is one index over every segment of the table (tableIndex), and
+	// segPtrs, with several segments (the vidx's Segs), each of keep[0]'s
+	// rows' segment.
+	whole   bool
 	segPtrs []unsafe.Pointer
 	vidx    []jit.VIdx
 	none    bool
@@ -812,7 +813,6 @@ func sortedVMIdxFrom(x *vmIdx, s *segSortedRows) *vmIdx {
 func (x *vmIdx) tableIndex(mask uint64, n int, at func(i int) (seg, r int, k int64)) *vmIdx {
 	t := x.tab
 	keep := make([]int, n)
-	x.rowSegs = make([]*segment, n)
 	if len(t.at) > 1 {
 		x.segPtrs = make([]unsafe.Pointer, n)
 	}
@@ -825,7 +825,7 @@ func (x *vmIdx) tableIndex(mask uint64, n int, at func(i int) (seg, r int, k int
 	vals, starts := make([]int64, 0, d), make([]int32, 0, d+1)
 	for i := range n {
 		seg, r, k := at(i)
-		keep[i], x.rowSegs[i] = r, t.at[seg]
+		keep[i] = r
 		if x.segPtrs != nil {
 			x.segPtrs[i] = t.segs[seg].Seg
 		}
@@ -842,7 +842,7 @@ func (x *vmIdx) tableIndex(mask uint64, n int, at func(i int) (seg, r int, k int
 		x.vidx[0].Segs = unsafe.Pointer(unsafe.SliceData(x.segPtrs))
 	}
 	x.keep, x.vals, x.starts = [][]int{keep}, [][]int64{vals}, [][]int32{starts}
-	x.none = false
+	x.whole, x.none = true, false
 	return x
 }
 
@@ -1026,12 +1026,22 @@ func (m *vdbe) syncSortedSeek(jx *vmJIT, c int, jc *jit.VCursor, spec *idxSeekSp
 	segs, rows := src.listSegs[:0], src.listRows[:0]
 	switch {
 	case jc.State == 3:
-	case x.rowSegs != nil:
+	case x.whole:
 		at := int((uintptr(jc.Sel) - uintptr(unsafe.Pointer(unsafe.SliceData(x.keep[0])))) / 8)
-		if jc.Sel == nil || jc.N <= 0 || at < 0 || at+int(jc.N) > len(x.rowSegs) {
+		if jc.Sel == nil || jc.N <= 0 || at < 0 || at+int(jc.N) > len(x.keep[0]) {
 			return fmt.Errorf("engine: internal: cursor %d seeked natively is on no run of its index", c)
 		}
-		segs, rows = append(segs, x.rowSegs[at:at+int(jc.N)]...), append(rows, x.keep[0][at:at+int(jc.N)]...)
+		for i := at; i < at+int(jc.N); i++ {
+			sg := x.tab.at[0]
+			if x.segPtrs != nil {
+				k := slices.IndexFunc(x.tab.segs, func(s jit.VTabSeg) bool { return s.Seg == x.segPtrs[i] })
+				if k < 0 {
+					return fmt.Errorf("engine: internal: cursor %d seeked natively is on no segment of its table", c)
+				}
+				sg = x.tab.at[k]
+			}
+			segs, rows = append(segs, sg), append(rows, x.keep[0][i])
+		}
 	default:
 		k := slices.IndexFunc(x.vidx, func(v jit.VIdx) bool { return v.Seg == jc.Seg })
 		if k < 0 || jc.Sel == nil || jc.N <= 0 {

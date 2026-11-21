@@ -54,3 +54,45 @@ func TestVMJITTableIndexOrder(t *testing.T) {
 		}
 	}
 }
+
+// TestVMJITTableIndexHandBack: native code's index over every segment of a
+// table of several, taken back by the VDBE mid-run (syncSortedSeek) on an
+// opcode native code does not make, each row from its own segment.
+func TestVMJITTableIndexHandBack(t *testing.T) {
+	if !vmJITEnabled {
+		t.Skip("JIT not enabled on this platform")
+	}
+	lowEntryThreshold(t)
+	countSyncs(t)
+	p := newSegPair(t,
+		`CREATE TABLE g(a INT, b INT)`,
+		`INSERT INTO g SELECT value * 3, value % 3 FROM generate_series(1, 3000)`,
+		`CREATE TABLE w(a INT, m INT, s TEXT)`,
+		fmt.Sprintf(`INSERT INTO w SELECT value %% 20011, (value * 13) %% 7, 'r' || value FROM generate_series(1, %d)`, segmentRows+5000))
+	queries := []string{
+		`select g.a, w.m, printf('%s.', w.s) from g left join w on w.a = g.a`,
+		`select g.a, w.m, printf('%s.', w.s) from g left join w on w.a = g.a + 21 order by 1`,
+	}
+	run := func(on bool) []string {
+		old := vmJITEnabled
+		vmJITEnabled = on
+		defer func() { vmJITEnabled = old }()
+		var out []string
+		for _, q := range queries {
+			_, rows, err := p.fast(fmt.Sprintf("%s -- %v", q, on))
+			out = append(out, fmt.Sprint(typedRows(rows), err))
+		}
+		return out
+	}
+	off := run(false)
+	vmJITIdxSyncs.Store(0)
+	on := run(true)
+	for i := range queries {
+		if off[i] != on[i] {
+			t.Errorf("%s:\n JIT off %.300s\n JIT on  %.300s", queries[i], off[i], on[i])
+		}
+	}
+	if vmJITIdxSyncs.Load() == 0 {
+		t.Error("native code handed no seek back")
+	}
+}
