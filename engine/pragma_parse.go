@@ -296,8 +296,24 @@ func matchParen(toks []token, openIdx int) int {
 // segments are slices of toks, which lex may share: a caller copies one
 // before writing into it.
 func splitTopLevelCommas(toks []token) [][]token {
-	var segments [][]token
-	from, depth := 0, 0
+	n, depth := 1, 0
+	for _, t := range toks {
+		if t.kind == tkPunct {
+			switch t.text {
+			case "(":
+				depth++
+			case ")":
+				depth--
+			case ",":
+				if depth == 0 {
+					n++
+				}
+			}
+		}
+	}
+	segments := make([][]token, 0, n)
+	from := 0
+	depth = 0
 	for i, t := range toks {
 		if t.kind != tkPunct {
 			continue
@@ -395,7 +411,7 @@ func parsePragmaTableDef(createSQL string) (*pragmaTableDef, error) {
 	}
 	segments := splitTopLevelCommas(toks[i+1 : end])
 
-	def := &pragmaTableDef{pkPos: map[string]int{}}
+	def := &pragmaTableDef{pkPos: map[string]int{}, cols: make([]pragmaColumn, 0, len(segments))}
 	// rowidAliasName is the column (if any) whose PRIMARY KEY collapsed into
 	// the rowid alias, recorded by both the column-level and the table-level
 	// PRIMARY KEY branches below. Consulted only by the STRICT/WITHOUT ROWID
