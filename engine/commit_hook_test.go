@@ -3,6 +3,7 @@ package engine
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -10,8 +11,8 @@ import (
 // rewrite, reports the state CommitState reads back from the files.
 func TestCommitHookReportsCommittedState(t *testing.T) {
 	var got []CommitInfo
-	Configure(WithCommitHook(func(c CommitInfo) { got = append(got, c) }))
-	defer Configure()
+	Configure(append(slices.Clone(envConfig), WithCommitHook(func(c CommitInfo) { got = append(got, c) }))...)
+	defer restoreEnvConfig()
 	path := filepath.Join(t.TempDir(), "h.musq")
 	s, err := Create(path)
 	if err != nil {

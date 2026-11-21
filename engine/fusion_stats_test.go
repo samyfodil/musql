@@ -18,6 +18,14 @@ func TestMain(m *testing.M) {
 		jit.SetFuseAllForTest(true)
 	}
 	code := m.Run()
+	if os.Getenv("MUSQL_JIT") == "0" && (jitEnabled || vmJITEnabled) {
+		fmt.Println("a test left the JIT on in a MUSQL_JIT=0 run: it must restore the configuration with restoreEnvConfig")
+		code = 1
+	}
+	if os.Getenv("MUSQL_FUSION") == "0" && !jit.FusionOffForTest() {
+		fmt.Println("a test left fusion on in a MUSQL_FUSION=0 run: it must restore the configuration with restoreEnvConfig")
+		code = 1
+	}
 	if os.Getenv("MUSQL_FUSION_STATS") == "1" {
 		emitted, fused, missed, spent := jit.FusionStatsForTest()
 		fmt.Printf("fusion: %d programs emitted, %d fused (%.1f%% skipped), %d unflagged yet changed, %v in the pass\n",

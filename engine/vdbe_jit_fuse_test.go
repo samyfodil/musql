@@ -23,7 +23,7 @@ func runModes(t *testing.T, name string, insns []Instruction, nReg int) bool {
 	}
 	run := func(withJIT, fused bool) (result, bool) {
 		jit.SetFusion(fused)
-		defer jit.SetFusion(true)
+		defer restoreEnvConfig()
 		prog := &Program{Insns: append([]Instruction(nil), insns...), NReg: nReg, NResultCol: nReg}
 		st, err := NewProgramStmt(prog)
 		if err != nil {
@@ -235,10 +235,9 @@ func TestVMJITFusionQueries(t *testing.T) {
 		}
 	}
 	run := func(jitOn, fused bool) []string {
-		old := vmJITEnabled
 		vmJITEnabled = jitOn
 		jit.SetFusion(fused)
-		defer func() { vmJITEnabled = old; jit.SetFusion(true) }()
+		defer restoreEnvConfig()
 		db, err := Create(filepath.Join(t.TempDir(), "f.musq"))
 		if err != nil {
 			t.Fatal(err)

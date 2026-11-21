@@ -140,6 +140,8 @@ func TestSegProgServedMatchesDeclined(t *testing.T) {
 	}
 }
 
-// jit0 is jitEnabled as the process started, so a test that toggles it can put
-// it back without asserting what the environment chose.
-var jit0 = jitEnabled
+// jit0 is jitEnabled as the environment configured it, so a test that toggles
+// it can put it back without asserting what the environment chose. It is set
+// in jit_env_test.go's init: a package variable initialized from jitEnabled
+// would read it before that init applies MUSQL_JIT=0.
+var jit0 bool

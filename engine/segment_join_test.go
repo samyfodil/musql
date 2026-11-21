@@ -86,7 +86,7 @@ func TestSegJoinSessionFollowsWrites(t *testing.T) {
 		t.Fatal("the reference run used the join kernel")
 	}
 	got := run(false)
-	if SegJoinHitsForTest() == 0 {
+	if SegJoinHitsForTest() == 0 && columnarOn() {
 		t.Fatal("the join kernel answered nothing")
 	}
 	for i := range want {
@@ -149,7 +149,7 @@ func TestSegJoinMultiOrMatchesLoop(t *testing.T) {
 	SegJoinHitsForTest()
 	want := run(true)
 	got := run(false)
-	if SegJoinHitsForTest() == 0 {
+	if SegJoinHitsForTest() == 0 && columnarOn() {
 		t.Fatal("the join kernel answered nothing")
 	}
 	for i := range want {
@@ -198,7 +198,7 @@ func TestSegJoinCollatedGroupsMatchLoop(t *testing.T) {
 		for _, q := range queries {
 			SegJoinHitsForTest()
 			_, rows, err := db.Query(q, nil)
-			if !off && SegJoinHitsForTest() == 0 {
+			if !off && SegJoinHitsForTest() == 0 && columnarOn() {
 				t.Errorf("not served by the join kernel: %s", q)
 			}
 			out = append(out, fmt.Sprint(rows, err))
@@ -281,7 +281,7 @@ func TestSegJoinVolatileMatchesLoop(t *testing.T) {
 			segJoinTicks = 0
 			SegJoinHitsForTest()
 			_, rows, err := db.Query(q, nil)
-			if !off && SegJoinHitsForTest() == 0 {
+			if !off && SegJoinHitsForTest() == 0 && columnarOn() {
 				t.Errorf("not served by the join kernel: %s", q)
 			}
 			out = append(out, fmt.Sprint(rows, err, segJoinTicks))
@@ -331,7 +331,7 @@ func TestSegJoinGroupsGatherReadColumns(t *testing.T) {
 		for _, q := range queries {
 			SegJoinHitsForTest()
 			_, rows, err := db.Query(q, nil)
-			if !off && SegJoinHitsForTest() == 0 {
+			if !off && SegJoinHitsForTest() == 0 && columnarOn() {
 				t.Errorf("not served by the join kernel: %s", q)
 			}
 			out = append(out, fmt.Sprint(rows, err))

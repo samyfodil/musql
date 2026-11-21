@@ -43,6 +43,9 @@ var fusionOff atomic.Bool
 // emitted from now on, so a test can compare the two.
 func SetFusion(on bool) { fusionOff.Store(!on) }
 
+// FusionOffForTest reports whether SetFusion turned the pass off.
+func FusionOffForTest() bool { return fusionOff.Load() }
+
 // Fusing reports whether programs emitted now are fused: part of what a
 // cache of emitted programs is keyed by.
 func Fusing() bool { return !fusionOff.Load() }

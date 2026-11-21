@@ -68,7 +68,7 @@ func TestSegWriteFilterNeverDropsARow(t *testing.T) {
 			t.Fatalf("%s: tables differ (%d rows reference, %d filtered)", s, len(want), len(have))
 		}
 	}
-	if fired == 0 {
+	if fired == 0 && columnarOn() {
 		t.Fatal("the write filter never fired -- this test proves nothing")
 	}
 	t.Logf("%d of %d statements went through the write filter", fired, len(stmts))
