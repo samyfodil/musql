@@ -245,9 +245,10 @@ func lexUncached(s string) ([]token, error) {
 	// Pre-sized for typical SQL token density, capped: a statement made of
 	// long literals (rows of vector('[...]')) has far fewer tokens than its
 	// length suggests, and an uncapped guess zeroed megabytes per statement.
-	// append grows it past the cap when a statement needs more.
+	// append grows it past the cap when a statement needs more. TPC-H and
+	// TPC-DS queries and schemas run six to eight bytes a token.
 	n := len(s)
-	toks := make([]token, 0, min(n/4, 4096)+8)
+	toks := make([]token, 0, min(n/6, 4096)+8)
 	i := 0
 
 	isIdentStart := func(c byte) bool {
