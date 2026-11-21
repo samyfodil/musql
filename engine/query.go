@@ -54,7 +54,7 @@ type resolvedTable struct {
 // AUTOINCREMENT and malformed text included), since the read path uses it on any
 // table it may open.
 func sqlTextTableIsWithoutRowid(createSQL string) bool {
-	if !hasWordFold(createSQL, "WITHOUT") {
+	if !r35aContainsFold(createSQL, "without") {
 		return false
 	}
 	toks, err := lex(createSQL)
