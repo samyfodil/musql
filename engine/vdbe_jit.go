@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -2529,29 +2530,52 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 	return int(args.PC), -1
 }
 
-// fillIntTexts is the INTEGERs and texts the TEXT compares read at this
-// entry (jit.VIntTextSlot): a literal's, or the bound parameter's where it is
-// an INTEGER.
+// fillIntTexts is the numbers and texts the TEXT compares read at this entry
+// (jit.VIntTextSlot): a literal's, or the bound parameter's where it is an
+// INTEGER or a REAL.
 func (jx *vmJIT) fillIntTexts(m *vdbe) *jit.VIntTextSlot {
 	n := len(jx.intTexts)
 	if len(m.jIntTexts) < n {
-		m.jIntTexts, m.jIntTextBuf = make([]jit.VIntTextSlot, n), make([][20]byte, n)
+		m.jIntTexts, m.jIntTextBuf = make([]jit.VIntTextSlot, n), make([]jIntTextBuf, n)
 	}
 	for i, src := range jx.intTexts {
 		s := &m.jIntTexts[i]
 		if src.param == 0 {
-			*s = jit.VIntTextSlot{K: src.k, Text: unsafe.Pointer(unsafe.SliceData(src.text)), Len: int64(len(src.text)), Ok: 1}
+			*s = jit.VIntTextSlot{K: src.k, Text: unsafe.Pointer(unsafe.SliceData(src.text)), Len: int64(len(src.text)), Ok: src.kind}
 			continue
 		}
-		v := paramAt(m.params, src.param)
-		if v.Typ != Int {
+		var kind, k int64
+		switch v := paramAt(m.params, src.param); v.Typ {
+		case Int:
+			kind, k = jit.VIntTextInt, v.I
+		case Float:
+			kind, k = jit.VIntTextReal, int64(math.Float64bits(v.F))
+		default:
 			*s = jit.VIntTextSlot{}
 			continue
 		}
-		t := strconv.AppendInt(m.jIntTextBuf[i][:0], v.I, 10)
-		*s = jit.VIntTextSlot{K: v.I, Text: unsafe.Pointer(&m.jIntTextBuf[i][0]), Len: int64(len(t)), Ok: 1}
+		b := &m.jIntTextBuf[i]
+		if b.kind != kind || b.k != k || len(b.text) == 0 {
+			b.kind, b.k, b.text = kind, k, appendNumberText(b.text[:0], kind, k)
+		}
+		*s = jit.VIntTextSlot{K: k, Text: unsafe.Pointer(unsafe.SliceData(b.text)), Len: int64(len(b.text)), Ok: kind}
 	}
 	return &m.jIntTexts[0]
+}
+
+// jIntTextBuf is a bound parameter's text, made for the number k of kind.
+type jIntTextBuf struct {
+	kind, k int64
+	text    []byte
+}
+
+// appendNumberText appends the text TEXT affinity gives the number k of kind
+// (jit.VIntTextSlot): an INTEGER, or the REAL whose bits k is.
+func appendNumberText(b []byte, kind, k int64) []byte {
+	if kind == jit.VIntTextReal {
+		return append(b, valueToText(Value{Typ: Float, F: math.Float64frombits(uint64(k))})...)
+	}
+	return strconv.AppendInt(b, k, 10)
 }
 
 // readSubs copies each subquery value the run has made into its register,

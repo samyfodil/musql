@@ -1,7 +1,7 @@
 package engine
 
 import (
-	"strconv"
+	"math"
 	"strings"
 	"unsafe"
 
@@ -24,9 +24,11 @@ func vmTextLowering(prog *Program, storesText func(root uint32, col int) bool) (
 	// consts is the string literal a register holds, of those text says are
 	// TEXT, for a LIKE's pattern.
 	consts := map[int]string{}
-	// ints is the INTEGER a register is expected to hold: a literal, the sum
-	// of two, or a bound parameter. Native code checks it at run time, so a
-	// wrong guess costs only an exit.
+	// ints is the number a register is expected to hold: an INTEGER or a
+	// REAL literal, the sum of two INTEGERs, or a bound parameter, or a copy
+	// of one. It is the last such write in program order, which may not be
+	// the one a run made (a CASE's arms); native code checks it at run time,
+	// so a wrong guess costs only an exit.
 	ints := map[int]vmIntTextSrc{}
 	in := func(r int) bool { return r >= 0 && r < prog.NReg }
 	for pc := range prog.Insns {
@@ -91,8 +93,8 @@ func vmTextLowering(prog *Program, storesText func(root uint32, col int) bool) (
 					out[pc], ok[pc] = jit.VInsn{Op: jit.VTextCmpSet, A: ins.P1, B: ins.P3, C: ins.P2, Cond: cond, Imm: imm}, true
 				}
 				if ok[pc] && jit.VMTextIntConst && !vmIntTextOffForTest && affinity(ins.P5&p5AffMask) == affText {
-					// Under TEXT affinity an INTEGER is compared with a TEXT as
-					// its text, which the VDBE makes on every row.
+					// Under TEXT affinity a number is compared with a TEXT as its
+					// text, which the VDBE makes on every row.
 					src, isInt := ints[ins.P1]
 					onA := isInt && text[ins.P3] && !text[ins.P1]
 					if !onA {
@@ -101,7 +103,7 @@ func vmTextLowering(prog *Program, storesText func(root uint32, col int) bool) (
 					}
 					if isInt && len(srcs) < jit.MaxIntTexts {
 						if src.param == 0 {
-							src.text = strconv.AppendInt(nil, src.k, 10)
+							src.text = appendNumberText(nil, src.kind, src.k)
 						}
 						out[pc].IntText = &jit.VIntText{OnA: onA, Slot: len(srcs)}
 						srcs = append(srcs, src)
@@ -122,11 +124,15 @@ func vmTextLowering(prog *Program, storesText func(root uint32, col int) bool) (
 		}
 		switch a, b := ints[ins.P1], ints[ins.P2]; {
 		case ins.Op == OpInteger:
-			ints[ins.P2] = vmIntTextSrc{k: int64(ins.P1)}
+			ints[ins.P2] = vmIntTextSrc{kind: jit.VIntTextInt, k: int64(ins.P1)}
+		case ins.Op == OpReal && isFloat64(ins.P4):
+			ints[ins.P2] = vmIntTextSrc{kind: jit.VIntTextReal, k: int64(math.Float64bits(ins.P4.(float64)))}
 		case ins.Op == OpVariable && ins.P1 >= 1:
 			ints[ins.P2] = vmIntTextSrc{param: ins.P1}
+		case (ins.Op == OpSCopy || ins.Op == OpCopy && ins.P3 == 0) && hasSrc(ints, ins.P1):
+			ints[ins.P2] = a
 		case ins.Op == OpAdd && hasLiteral(ints, ins.P1, ins.P2) && (b.k >= 0) == (a.k+b.k >= a.k):
-			ints[ins.P3] = vmIntTextSrc{k: a.k + b.k}
+			ints[ins.P3] = vmIntTextSrc{kind: jit.VIntTextInt, k: a.k + b.k}
 		default:
 			for _, r := range []int{ins.P2, ins.P3} {
 				if writesReg(ins, r) {
@@ -138,19 +144,31 @@ func vmTextLowering(prog *Program, storesText func(root uint32, col int) bool) (
 	return out, ok, srcs
 }
 
-// vmIntTextSrc is where an entry finds a TEXT compare's INTEGER
-// (jit.VIntTextSlot): bound parameter param, or else the literal k, whose
-// text is text.
+// vmIntTextSrc is where an entry finds a TEXT compare's number
+// (jit.VIntTextSlot): bound parameter param, or else the literal k of kind,
+// whose text is text.
 type vmIntTextSrc struct {
 	param int
+	kind  int64
 	k     int64
 	text  []byte
 }
 
-// hasLiteral reports whether each of rs is expected to hold a literal.
+func isFloat64(p4 any) bool {
+	_, is := p4.(float64)
+	return is
+}
+
+func hasSrc(ints map[int]vmIntTextSrc, r int) bool {
+	_, has := ints[r]
+	return has
+}
+
+// hasLiteral reports whether each of rs is expected to hold an INTEGER
+// literal.
 func hasLiteral(ints map[int]vmIntTextSrc, rs ...int) bool {
 	for _, r := range rs {
-		if src, isInt := ints[r]; !isInt || src.param != 0 {
+		if src, isInt := ints[r]; !isInt || src.param != 0 || src.kind != jit.VIntTextInt {
 			return false
 		}
 	}
@@ -160,7 +178,6 @@ func hasLiteral(ints map[int]vmIntTextSrc, rs ...int) bool {
 // vmIntTextOffForTest leaves a TEXT compare's INTEGER constant unread
 // (jit.VIntText), so a test can count what reading it saves.
 var vmIntTextOffForTest bool
-
 
 // vmLikePat is the pattern VLike matches for the string literal pat, or nil
 // where the engine's own likePlan would not take it (a '_', a NUL, a byte

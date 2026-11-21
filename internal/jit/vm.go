@@ -398,23 +398,31 @@ type VInsn struct {
 	IntText *VIntText
 }
 
-// VIntText is a TEXT compare's operand expected to hold an INTEGER, which
-// under TEXT affinity is compared with a TEXT as its decimal text: where it
-// holds ProgArgs.IntTexts[Slot]'s K, the compare reads that slot's text.
-// Any other value leaves the compare to the VDBE as before.
+// VIntText is a TEXT compare's operand expected to hold a number, which
+// under TEXT affinity is compared with a TEXT as its text: where it holds
+// ProgArgs.IntTexts[Slot]'s number, the compare reads that slot's text. Any
+// other value leaves the compare to the VDBE as before.
 type VIntText struct {
 	OnA  bool // the operand is A, else B
 	Slot int
 }
 
-// VIntTextSlot is one INTEGER and its decimal text, which the engine fills
-// at every entry. Ok is zero where there is none: the compare exits.
+// VIntTextSlot is one number and its text, which the engine fills at every
+// entry. Ok is the number's kind, VIntTextInt or VIntTextReal, whose K is
+// the INTEGER or the REAL's bits; zero where there is none: the compare
+// exits.
 type VIntTextSlot struct {
 	K    int64
 	Text unsafe.Pointer
 	Len  int64
 	Ok   int64
 }
+
+// VIntTextSlot.Ok's kinds.
+const (
+	VIntTextInt  = 1
+	VIntTextReal = 2
+)
 
 // Byte offsets of VIntTextSlot's fields and its size, asserted by
 // TestProgArgsLayout.

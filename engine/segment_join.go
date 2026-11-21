@@ -42,6 +42,10 @@ var segJoinArgsSparse atomic.Int64
 // SegJoinHitsForTest reads and clears the counter.
 func SegJoinHitsForTest() int64 { return segJoinHits.Swap(0) }
 
+// segJoinEmptyWalks counts walks that found no joined row from the levels'
+// own terms alone (segJoinWalk.empty), for tests.
+var segJoinEmptyWalks atomic.Int64
+
 // segJoinPlan is what OpSegJoinAgg and OpSegJoinGroups carry: the loop's
 // levels and the columns they read, as the recogniser traced them out of the
 // program.
@@ -959,6 +963,9 @@ type segJoinWalk struct {
 	// optional is plan.optional: the levels whose row is -1, all NULL,
 	// where nothing there matched.
 	optional uint64
+	// empty is a walk with no joined row: a level that is not optional lets
+	// no row through its own terms. Nothing past them is built.
+	empty bool
 
 	m     *vdbe
 	exprs map[*segJoinExpr][]Value // each expression's value per row
@@ -1526,17 +1533,39 @@ func (w *segJoinWalk) passingValues(a segJoinArg) ([]Value, []bool, bool) {
 type segJoinMemo[T any] struct {
 	vals  map[segJoinMemoKey]T
 	texts map[string]T
+	ints  map[int64]T
+	// last is the plain INTEGER found or put last, and lastV its value: a
+	// column in some order repeats its value over runs of rows.
+	haveLast bool
+	last     int64
+	lastV    T
 }
 
 func newSegJoinMemo[T any]() *segJoinMemo[T] {
-	return &segJoinMemo[T]{vals: map[segJoinMemoKey]T{}, texts: map[string]T{}}
+	return &segJoinMemo[T]{vals: map[segJoinMemoKey]T{}, texts: map[string]T{}, ints: map[int64]T{}}
 }
 
 func segJoinPlainText(x Value) bool {
 	return x.Typ == Text && x.Subtype == 0 && !x.intReal && x.I == 0 && x.F == 0
 }
 
+// segJoinPlainInt reports whether x is an INTEGER told apart by I alone: the
+// key segJoinMemoKeyOf gives it holds nothing else.
+func segJoinPlainInt(x Value) bool {
+	return x.Typ == Int && x.Subtype == 0 && !x.intReal && math.Float64bits(x.F) == 0 && len(x.S) == 0
+}
+
 func (m *segJoinMemo[T]) get(x Value) (T, bool) {
+	if segJoinPlainInt(x) {
+		if m.haveLast && m.last == x.I {
+			return m.lastV, true
+		}
+		v, ok := m.ints[x.I]
+		if ok {
+			m.haveLast, m.last, m.lastV = true, x.I, v
+		}
+		return v, ok
+	}
 	if segJoinPlainText(x) {
 		v, ok := m.texts[string(x.S)]
 		return v, ok
@@ -1546,6 +1575,11 @@ func (m *segJoinMemo[T]) get(x Value) (T, bool) {
 }
 
 func (m *segJoinMemo[T]) put(x Value, v T) {
+	if segJoinPlainInt(x) {
+		m.ints[x.I] = v
+		m.haveLast, m.last, m.lastV = true, x.I, v
+		return
+	}
 	if segJoinPlainText(x) {
 		m.texts[string(x.S)] = v
 		return
@@ -2073,6 +2107,9 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 		w.pass[i] = w.tabs[i].passing(preds, resolved)
 	}
 	for i, fs := range plan.filters {
+		if w.noRow() {
+			break
+		}
 		if len(fs) == 0 {
 			continue
 		}
@@ -2143,6 +2180,13 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 			t.passes[passKey] = slices.Clone(w.pass[i])
 			t.mu.Unlock()
 		}
+	}
+	if w.noRow() {
+		// The loop finds no joined row either, so it reaches no later
+		// level's terms and computes no argument.
+		w.empty = true
+		segJoinEmptyWalks.Add(1)
+		return w, true
 	}
 	// Each later level is found from an earlier one by its recheck's
 	// equality, exactly one.
@@ -2235,6 +2279,17 @@ func passingOnly(sk []int64, rows []int32, pass []bool) ([]int64, []int32) {
 	return fsk, frows
 }
 
+// noRow reports whether a level that is not optional lets no row through
+// its own terms, which leaves the join no row.
+func (w *segJoinWalk) noRow() bool {
+	for i, p := range w.pass {
+		if p != nil && !w.opt(i) && !slices.Contains(p, true) {
+			return true
+		}
+	}
+	return false
+}
+
 // flat reports whether every level after the first is found by a rowid.
 func (w *segJoinWalk) flat() bool {
 	for i := 1; i < len(w.link); i++ {
@@ -2249,6 +2304,9 @@ func (w *segJoinWalk) flat() bool {
 // each level's row (-1 for the optional level's NULL row); fn returning false
 // stops the walk, and each reports whether it ran to the end.
 func (w *segJoinWalk) each(at []int32, fn func() bool) bool {
+	if w.empty {
+		return true
+	}
 	k := len(w.tabs)
 	var intr *atomic.Bool
 	if w.m != nil {
@@ -2637,6 +2695,9 @@ func (m *vdbe) segJoinGroupsWith(plan *segJoinPlan, replayInts bool) (gs *segJoi
 	w, ok := m.openSegJoin(plan)
 	if !ok {
 		return nil, false, false
+	}
+	if w.empty {
+		return &segJoinGroups{w: w, plan: plan}, true, false
 	}
 	args, ok := segJoinArgsOf(plan, w, replayInts)
 	if !ok {
