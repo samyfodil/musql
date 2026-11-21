@@ -627,7 +627,6 @@ func openSegment(buf []byte) (*segment, error) {
 		s.firstRowid = binary.LittleEndian.Uint64(buf[rowidOff:])
 	}
 	nullBytes := (nRows + 7) / 8
-	lastIdx := -1
 	for c := 0; c < nCols; c++ {
 		d := segHeaderSize + c*segColDirSize
 		col := segColumn{
@@ -658,31 +657,23 @@ func openSegment(buf []byte) (*segment, error) {
 		// (segment_index_ondisk.go): an offset past the end, or one that cannot
 		// hold a header, is a malformed segment rather than a column without an
 		// index, and saying so here beats discovering it at the first query.
-		if col.idxOff != 0 {
-			if col.idxOff%8 != 0 || int(col.idxOff)+segIdxHdr > len(buf) {
-				return nil, fmt.Errorf("segment: column %d index offset is unaligned or overruns", c)
-			}
-			if lastIdx < 0 || col.idxOff > s.cols[lastIdx].idxOff {
-				lastIdx = c
-			}
+		if col.idxOff != 0 && (col.idxOff%8 != 0 || int(col.idxOff)+segIdxHdr > len(buf)) {
+			return nil, fmt.Errorf("segment: column %d index offset is unaligned or overruns", c)
 		}
 		s.cols[c] = col
 	}
-	// ...AND THE LAST RECORD'S OWN DECLARED LENGTH FITS. The indexes are the
-	// LAST thing in a segment, so without this a truncated file opens cleanly
-	// -- every other block's bounds check is satisfied and the damage is only
-	// visible to the lazy reader. TestSegmentRejectsMalformed's one-byte
-	// truncation caught exactly that. Only the last record is read here: each
-	// is its own page of a mapped file, so reading them all faulted one in per
-	// indexed column at every open, and the lazy reader (openSegColumnIndex)
-	// bounds every record by its length anyway.
-	if lastIdx >= 0 {
-		off := int(s.cols[lastIdx].idxOff)
-		if n := binary.LittleEndian.Uint32(buf[off+12:]); n < segIdxHdr || off+int(n) > len(buf) {
-			return nil, fmt.Errorf("segment: column %d index record overruns", lastIdx)
-		}
-	}
-	if excLen >= 4 {
+	// No index record is read here. Each sits on its own page of the mapped
+	// file, so reading even the last one faulted a page in per segment at every
+	// open, and the lazy reader (openSegColumnIndex) bounds and validates every
+	// record anyway: a damaged one is no index, and the column is scanned. A
+	// truncated FILE is refused at its directory (parseSegmentFile), which
+	// bounds every segment.
+	switch {
+	case excLen == 4:
+		// Room for the count and no exception: what every segment without
+		// exceptions holds. Its page is not touched.
+		s.exc = segNoExceptions
+	case excLen > 4:
 		exc := buf[excOff : excOff+excLen]
 		n := int(binary.LittleEndian.Uint32(exc))
 		s.exc = make(map[uint64]Value, n)
@@ -716,6 +707,10 @@ func openSegment(buf []byte) (*segment, error) {
 	}
 	return s, nil
 }
+
+// segNoExceptions is the exception map of every segment that has none. Nothing
+// writes to it.
+var segNoExceptions = map[uint64]Value{}
 
 // isNull reports whether column c of row i is NULL.
 func (s *segment) isNull(c, i int) bool {
