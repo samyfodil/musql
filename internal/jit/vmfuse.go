@@ -42,8 +42,8 @@ func VFusable(prev, next VInsn) bool {
 		return true
 	}
 	var a [16]int
-	buf := a[:0]
-	ps, ns := vmStepInto(&buf, prev, 0), vmStepInto(&buf, next, 1)
+	ps, buf := vmStepInto(a[:0], prev, 0)
+	ns, _ := vmStepInto(buf, next, 1)
 	for _, d := range ps.defs {
 		if slicesContains(ns.uses, d) {
 			return true
@@ -57,17 +57,18 @@ func VFusable(prev, next VInsn) bool {
 // runs it (an exit hands the same instruction to the VDBE). An instruction
 // with no native form reads every register: it is VDBE code, which may.
 func vmStepOf(in VInsn, pc int) progStep {
-	var buf []int
-	return vmStepInto(&buf, in, pc)
+	s, _ := vmStepInto(nil, in, pc)
+	return s
 }
 
 // vmStepInto is vmStepOf with the step's registers and targets appended to
-// *buf, so the steps of a whole program share one array.
-func vmStepInto(buf *[]int, in VInsn, pc int) progStep {
+// buf, so the steps of a whole program share one array; it returns the grown
+// buf. Taking buf by value lets a caller's stack array stay on the stack.
+func vmStepInto(buf []int, in VInsn, pc int) (progStep, []int) {
 	put := func(xs ...int) []int {
-		i := len(*buf)
-		*buf = append(*buf, xs...)
-		return (*buf)[i:len(*buf):len(*buf)]
+		i := len(buf)
+		buf = append(buf, xs...)
+		return buf[i:len(buf):len(buf)]
 	}
 	s := progStep{fall: vmFalls(in.Op)}
 	switch in.Op {
@@ -152,7 +153,7 @@ func vmStepInto(buf *[]int, in VInsn, pc int) progStep {
 		// to Go.
 		s.useAll = true
 	}
-	return s
+	return s, buf
 }
 
 // vmLiveness returns, per pc, the registers live after it. Past the end of the
@@ -442,8 +443,8 @@ func (k *vmKnow) setKonst(r int, v int64) {
 // emitted.
 func (k *vmKnow) wrote(in VInsn, pc int) {
 	var a [8]int
-	buf := a[:0]
-	for _, r := range vmStepInto(&buf, in, pc).defs {
+	st, _ := vmStepInto(a[:0], in, pc)
+	for _, r := range st.defs {
 		k.konst.del(r)
 	}
 }
@@ -510,8 +511,7 @@ func vmNextUse(prog []VInsn, bound []bool, from, r int) int {
 			return -1
 		}
 		var a [8]int
-		buf := a[:0]
-		st := vmStepInto(&buf, prog[pc], pc)
+		st, _ := vmStepInto(a[:0], prog[pc], pc)
 		if st.useAll || slicesContains(st.uses, r) {
 			return pc
 		}
@@ -547,7 +547,7 @@ func vmStepsOf(prog []VInsn) []progStep {
 	steps := make([]progStep, len(prog))
 	buf := make([]int, 0, 3*len(prog))
 	for pc, in := range prog {
-		steps[pc] = vmStepInto(&buf, in, pc)
+		steps[pc], buf = vmStepInto(buf, in, pc)
 	}
 	return steps
 }
