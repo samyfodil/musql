@@ -4,6 +4,7 @@
 //
 //	musql open app.musq
 //	musql open http://localhost:8080 --auth-token secret
+//	musql dev --db-file app.musq
 //	musql config set url https://cloud.example.com
 //	musql auth login
 //	musql db create app

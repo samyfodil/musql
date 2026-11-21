@@ -476,6 +476,14 @@ move the file in pieces with progress on stderr; an interrupted upload
 continues with `--resume <id>`. Config in `~/.config/musql/` (only the CLI
 reads it).
 
+`musql dev [--db-file path] [--port 8080] [--auth-jwt-key-file key]`, as
+`turso dev`: one database served over Hrana on 127.0.0.1 by `hrana.NewServer`,
+a temporary file when none is given, and no state, sign-in or OIDC. With a key
+file (an Ed25519 public key, PEM or URL-safe base64, as libSQL server reads
+it) a client needs an EdDSA JWT signed by it and not expired; its `a` claim
+`ro` puts it on a read-only handle. Both handles are confined like the
+cloud's, so ATTACH and VACUUM INTO are refused.
+
 ## Releases
 
 A tag `v*` runs `.github/workflows/release.yml`. It attaches to the GitHub
