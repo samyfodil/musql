@@ -115,6 +115,10 @@ type joinSource struct {
 	colUsed     uint64
 	colUsedOK   bool
 
+	// singlePlanOK marks the one source of a single-table FROM whose scan
+	// markWherePlanIndexEligibility had the planner decide.
+	singlePlanOK bool
+
 	// noAutoIndex is "PRAGMA automatic_index is OFF" -- whereLoopAddBtree's
 	// "(pParse->db->flags & SQLITE_AutoIndex)!=0" guard, the one input the ported
 	// planner takes from the CONNECTION rather than from the statement. Set by
