@@ -465,12 +465,29 @@ func overlapping(vidx []jit.VIdx) bool {
 // no run, and a run's rows go by the spec's columns, a NULL before any
 // INTEGER, ties in rowid order.
 func buildTableSortedVMIdx(x *vmIdx, spec *idxSeekSpec) *vmIdx {
-	t := x.tab
-	nk := len(spec.sortCols)
-	if nk > 4 || nk == 0 || len(t.at) > 1<<16 {
+	if len(x.tab.at) > 1<<16 {
 		return x
 	}
-	type row = sortedIdxRow
+	switch len(spec.sortCols) {
+	case 1:
+		return buildTableSortedVMIdxK[[1]int64](x, spec)
+	case 2:
+		return buildTableSortedVMIdxK[[2]int64](x, spec)
+	case 3:
+		return buildTableSortedVMIdxK[[3]int64](x, spec)
+	case 4:
+		return buildTableSortedVMIdxK[[4]int64](x, spec)
+	}
+	return x
+}
+
+// buildTableSortedVMIdxK is buildTableSortedVMIdx with rows as wide as the
+// spec's keys: every radix pass moves every row, which with two keys is 24
+// bytes rather than 40.
+func buildTableSortedVMIdxK[K sortedIdxKeys](x *vmIdx, spec *idxSeekSpec) *vmIdx {
+	t := x.tab
+	nk := len(spec.sortCols)
+	type row = sortedIdxRow[K]
 	n := 0
 	for _, sg := range t.at {
 		n += sg.nRows
@@ -554,18 +571,22 @@ func buildTableSortedVMIdx(x *vmIdx, spec *idxSeekSpec) *vmIdx {
 
 // sortedIdxRow is a row of buildTableSortedVMIdx: its keys, the ones that
 // are NULL (bit j), and where it is.
-type sortedIdxRow struct {
-	k     [4]int64
+type sortedIdxRow[K sortedIdxKeys] struct {
+	k     K
 	nulls uint8
 	seg   uint16
 	r     int32
+}
+
+type sortedIdxKeys interface {
+	[1]int64 | [2]int64 | [3]int64 | [4]int64
 }
 
 // sortTiesByRest sorts each run of rows the first of their nk keys ties by
 // the others, NULLs first, keeping each tie's order; or reports, having
 // changed nothing, that the runs are too long for that to beat a radix pass
 // per key.
-func sortTiesByRest(rows []sortedIdxRow, nk int) bool {
+func sortTiesByRest[K sortedIdxKeys](rows []sortedIdxRow[K], nk int) bool {
 	long := 0
 	for i := 0; i < len(rows); {
 		e := i + 1
@@ -580,7 +601,7 @@ func sortTiesByRest(rows []sortedIdxRow, nk int) bool {
 	if long > len(rows)/8 {
 		return false
 	}
-	less := func(a, b *sortedIdxRow) bool {
+	less := func(a, b *sortedIdxRow[K]) bool {
 		for j := 1; j < nk; j++ {
 			an, bn := a.nulls>>j&1, b.nulls>>j&1
 			switch {
