@@ -3894,10 +3894,8 @@ func (p *ReadOnlyPager) checkGroupConnectorUsing(state *joinDesugarState, span [
 	for _, c := range connectorCols {
 		inConnector[r33sFoldIdent(c.Name)] = true
 	}
-	inLeft := make(map[string]bool, len(state.visible))
-	for _, vc := range state.visible {
-		inLeft[r33sFoldIdent(vc.name)] = true
-	}
+	inLeft := make(map[string]bool, state.nVisible())
+	state.eachVisible(func(_ int, name string) { inLeft[r33sFoldIdent(name)] = true })
 	own := make([]FromItem, len(span))
 	copy(own, span)
 	own[0].Join, own[0].On, own[0].Using, own[0].Natural = JoinCross, nil, nil, false
