@@ -133,8 +133,8 @@ func (s *Server) dbFor(readOnly bool) *sql.DB {
 type Stmt struct {
 	SQL      string
 	Duration time.Duration
-	// RowsRead is the rows the statement returned, RowsWritten the rows it
-	// changed (total_changes moved by).
+	// RowsRead and RowsWritten are the rows the statement read and wrote, as
+	// libSQL counts them for Turso's billing (engine.RowCounter).
 	RowsRead, RowsWritten int64
 	Err                   error
 }

@@ -1994,6 +1994,7 @@ func compileScanWindow(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 	// batch resolution is not row-live.
 	savedRowLive := c.rowLive
 	c.rowLive = true
+	planBillBounds(c, srcs, stmt.Where)
 	jerr := emitJoinLoops(c, srcs, jplan, body)
 	c.rowLive = savedRowLive
 	if jerr != nil {

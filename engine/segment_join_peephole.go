@@ -1160,7 +1160,7 @@ func segJoinSeekHint(in []Instruction, pc int, opened map[int]bool) int {
 	if i == pc || i >= len(in) || !opened[in[i].P1] {
 		return pc
 	}
-	if h := in[i]; h.Op == OpSeekIndexHint && h.P3 == 0 || h.Op == OpSeekRowidRangeHint {
+	if h := in[i]; h.Op == OpSeekIndexHint && h.P3 == 0 || h.Op == OpSeekRowidRangeHint || h.Op == OpRowidReadBound {
 		return i + 1
 	}
 	return pc
