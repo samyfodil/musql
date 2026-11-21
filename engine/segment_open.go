@@ -305,7 +305,7 @@ func autoIndexNumbers(sql string) []int {
 	}
 	// Only a PRIMARY KEY or a UNIQUE constraint makes an automatic index, so a
 	// text naming neither has none, and is not parsed at every open.
-	if !hasWordFold(sql, "PRIMARY") && !hasWordFold(sql, "UNIQUE") {
+	if !r35aContainsFold(sql, "primary") && !r35aContainsFold(sql, "unique") {
 		return nil
 	}
 	if def, err := parsePragmaTableDef(sql); err == nil {
@@ -323,21 +323,6 @@ func autoIndexNumbers(sql string) []int {
 	autoIndexMemo.m[strings.Clone(sql)] = nums
 	autoIndexMemo.mu.Unlock()
 	return nums
-}
-
-// hasWordFold reports whether s holds word, an upper-case ASCII word, in
-// any case.
-func hasWordFold(s, word string) bool {
-	for i := 0; i+len(word) <= len(s); i++ {
-		j := 0
-		for j < len(word) && s[i+j]&^0x20 == word[j] {
-			j++
-		}
-		if j == len(word) {
-			return true
-		}
-	}
-	return false
 }
 
 // buildSegmentPager wires a read pager over a segment file and its replayed delta.
