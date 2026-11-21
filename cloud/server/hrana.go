@@ -223,7 +223,7 @@ func (s *Server) openEntry(d *state.Database) (*entry, error) {
 	}
 	return &entry{db: db, ro: ro, shared: shared, srv: hrana.NewServer(db,
 		hrana.WithReadOnlyDB(ro),
-		hrana.WithAuth(s.hranaAuth(d.OrgID, d.ID)),
+		hrana.WithAccess(s.hranaAuth(d.OrgID, d.ID)),
 		hrana.WithObserver(s.meter.observer(d.ID, d.OrgID)))}, nil
 }
 
@@ -360,16 +360,16 @@ func (s *Server) serveDB(w http.ResponseWriter, r *http.Request) {
 // hranaAuth is the token check of a database's Hrana server: HTTP requests
 // and WebSocket hellos alike. It looks the database up at each call, so a
 // rename, an invalidation or a role change takes effect at once.
-func (s *Server) hranaAuth(orgID, dbID string) func(string) (bool, error) {
-	return func(tok string) (bool, error) {
+func (s *Server) hranaAuth(orgID, dbID string) func(string) (hrana.Access, error) {
+	return func(tok string) (hrana.Access, error) {
 		ctx := context.Background()
 		o, err := s.store.OrgByID(ctx, orgID)
 		if err != nil {
-			return false, authErr(err)
+			return hrana.Access{}, authErr(err)
 		}
 		d, err := s.store.DatabaseByID(ctx, dbID)
 		if err != nil {
-			return false, authErr(err)
+			return hrana.Access{}, authErr(err)
 		}
 		return s.dbAccess(ctx, tok, o, d)
 	}
@@ -388,49 +388,67 @@ func authErr(err error) error {
 	return fmt.Errorf("%w: %v", hrana.ErrUnavailable, err)
 }
 
-// dbAccess decides what a bearer token may do to d: (readOnly, nil) when it
-// may connect at all.
-func (s *Server) dbAccess(ctx context.Context, tok string, o *state.Org, d *state.Database) (bool, error) {
+// dbAccess decides what a bearer token may do to d, when it may connect at
+// all: read only or not, and only what its permissions grant when it has any.
+func (s *Server) dbAccess(ctx context.Context, tok string, o *state.Org, d *state.Database) (hrana.Access, error) {
 	if tok == "" {
-		return false, errNoAccess
+		return hrana.Access{}, errNoAccess
 	}
 	if c, err := s.provider.Verify(tok, oidc.UseDB); err == nil {
 		switch {
 		case c.DB != "":
 			if c.DB != d.ID || c.Gen != d.TokenGen {
-				return false, errNoAccess
+				return hrana.Access{}, errNoAccess
 			}
 		case c.Group != "":
 			g, err := s.store.GroupByID(ctx, c.Group)
 			if err != nil {
-				return false, authErr(err)
+				return hrana.Access{}, authErr(err)
 			}
 			if c.Group != d.GroupID || c.Gen != g.TokenGen {
-				return false, errNoAccess
+				return hrana.Access{}, errNoAccess
 			}
 		default:
-			return false, errNoAccess
+			return hrana.Access{}, errNoAccess
 		}
+		var acc hrana.Access
 		switch c.Access {
 		case accessFull:
-			return false, nil
 		case accessReadOnly:
-			return true, nil
+			acc.ReadOnly = true
+		default:
+			return hrana.Access{}, errNoAccess
 		}
-		return false, errNoAccess
+		if c.Perm != nil {
+			perms := permissionsOf(c.Perm)
+			if hrana.ValidatePermissions(perms) != nil {
+				return hrana.Access{}, errNoAccess
+			}
+			acc.NewAuthorizer = func() driver.Authorizer { return hrana.PermissionAuthorizer(perms) }
+		}
+		return acc, nil
 	}
 	u, err := s.userFromToken(ctx, tok)
 	if err != nil {
-		return false, authErr(err)
+		return hrana.Access{}, authErr(err)
 	}
 	r, err := s.role(ctx, u, o)
 	if err != nil {
-		return false, authErr(err)
+		return hrana.Access{}, authErr(err)
 	}
 	if r == "" {
-		return false, errNoAccess
+		return hrana.Access{}, errNoAccess
 	}
-	return !r.AtLeast(state.RoleMember), nil
+	return hrana.Access{ReadOnly: !r.AtLeast(state.RoleMember)}, nil
+}
+
+// permissionsOf is a token's perm claim as Hrana's permissions.
+func permissionsOf(ps []oidc.Permission) []hrana.Permission {
+	out := make([]hrana.Permission, len(ps))
+	for i, p := range ps {
+		out[i] = hrana.Permission{Tables: p.Tables, Actions: p.Actions}
+	}
+	return out
 }
 
 const (

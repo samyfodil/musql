@@ -45,7 +45,7 @@ type httpStream struct {
 // Multi knows the token before any database's Server exists.
 type config struct {
 	authToken string
-	auth      func(token string) (readOnly bool, err error)
+	auth      func(token string) (Access, error)
 	roDB      *sql.DB
 	idle      time.Duration
 	observe   func(Stmt)
@@ -74,7 +74,10 @@ func WithAuthToken(token string) Option { return func(c *config) { c.authToken =
 // read-only client runs on the database given by WithReadOnlyDB, and is
 // refused when there is none.
 func WithAuth(check func(token string) (readOnly bool, err error)) Option {
-	return func(c *config) { c.auth = check }
+	return WithAccess(func(token string) (Access, error) {
+		ro, err := check(token)
+		return Access{ReadOnly: ro}, err
+	})
 }
 
 // ErrUnavailable is a WithAuth check that could not decide, such as one whose
@@ -96,20 +99,20 @@ func bearer(r *http.Request) string {
 }
 
 // authorize checks a token against WithAuth; the status is 0 when it passes.
-func (c *config) authorize(token string) (readOnly bool, status int) {
+func (c *config) authorize(token string) (Access, int) {
 	if c.auth == nil {
-		return false, 0
+		return Access{}, 0
 	}
-	ro, err := c.auth(token)
+	acc, err := c.auth(token)
 	switch {
 	case errors.Is(err, ErrUnavailable):
-		return false, http.StatusServiceUnavailable
+		return Access{}, http.StatusServiceUnavailable
 	case err != nil:
-		return false, http.StatusUnauthorized
-	case ro && c.roDB == nil:
-		return false, http.StatusForbidden
+		return Access{}, http.StatusUnauthorized
+	case acc.ReadOnly && c.roDB == nil:
+		return Access{}, http.StatusForbidden
 	}
-	return ro, 0
+	return acc, 0
 }
 
 // refuse answers a request authorize did not pass.
@@ -191,7 +194,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"message":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
-	ro, status := s.authorize(bearer(r))
+	acc, status := s.authorize(bearer(r))
 	if status != 0 {
 		refuse(w, status)
 		return
@@ -203,13 +206,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && (path == "v2" || path == "v3" || path == "v3-protobuf"):
 		w.WriteHeader(http.StatusOK)
 	case r.Method == http.MethodPost && (path == "v2/pipeline" || path == "v3/pipeline"):
-		s.pipeline(w, r, false, ro)
+		s.pipeline(w, r, false, acc)
 	case r.Method == http.MethodPost && path == "v3-protobuf/pipeline":
-		s.pipeline(w, r, true, ro)
+		s.pipeline(w, r, true, acc)
 	case r.Method == http.MethodPost && path == "v3/cursor":
-		s.cursor(w, r, false, ro)
+		s.cursor(w, r, false, acc)
 	case r.Method == http.MethodPost && path == "v3-protobuf/cursor":
-		s.cursor(w, r, true, ro)
+		s.cursor(w, r, true, acc)
 	default:
 		http.Error(w, `{"message":"not found"}`, http.StatusNotFound)
 	}
@@ -225,20 +228,21 @@ func newBaton() string {
 // held, and removes the baton: every response hands out a fresh one.
 //
 // A stream opened read-write is never handed to a read-only client.
-func (s *Server) take(ctx context.Context, baton *string, ro bool) (*httpStream, error) {
+func (s *Server) take(ctx context.Context, baton *string, acc Access) (*httpStream, error) {
 	s.reap()
 	if baton == nil || *baton == "" {
-		st, err := newStream(context.WithoutCancel(ctx), s.dbFor(ro), newSQLStore(), s.observe)
+		st, err := newStream(context.WithoutCancel(ctx), s.dbFor(acc.ReadOnly), newSQLStore(), s.observe)
 		if err != nil {
 			return nil, err
 		}
-		hs := &httpStream{stream: st, ro: ro}
+		hs := &httpStream{stream: st, ro: acc.ReadOnly}
 		hs.mu.Lock()
+		hs.setAuthorizer(acc.authorizer())
 		return hs, nil
 	}
 	s.mu.Lock()
 	hs, ok := s.streams[*baton]
-	if ok && ro && !hs.ro {
+	if ok && acc.ReadOnly && !hs.ro {
 		s.mu.Unlock()
 		return nil, protoErr("the baton belongs to a read-write stream")
 	}
@@ -248,6 +252,7 @@ func (s *Server) take(ctx context.Context, baton *string, ro bool) (*httpStream,
 		return nil, protoErr("unknown or expired baton")
 	}
 	hs.mu.Lock()
+	hs.setAuthorizer(acc.authorizer())
 	return hs, nil
 }
 
@@ -285,7 +290,7 @@ func (s *Server) reap() {
 
 const maxHTTPRequestBody = 64 << 20 // 64 MB
 
-func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, protobuf, ro bool) {
+func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, protobuf bool, acc Access) {
 	defer r.Body.Close()
 	r.Body = http.MaxBytesReader(w, r.Body, maxHTTPRequestBody)
 	body, err := readBody(r)
@@ -322,7 +327,7 @@ func (s *Server) pipeline(w http.ResponseWriter, r *http.Request, protobuf, ro b
 		batchLens = append(batchLens, len(rq.GetBatch().GetBatch().GetSteps()))
 	}
 
-	hs, err := s.take(r.Context(), req.Baton, ro)
+	hs, err := s.take(r.Context(), req.Baton, acc)
 	if err != nil {
 		writeHTTPError(w, http.StatusBadRequest, err, protobuf)
 		return
@@ -401,7 +406,7 @@ func (hs *httpStream) handle(ctx context.Context, rq *pbhttp.StreamRequest) (res
 }
 
 // cursor runs a batch and streams its result entries.
-func (s *Server) cursor(w http.ResponseWriter, r *http.Request, protobuf, ro bool) {
+func (s *Server) cursor(w http.ResponseWriter, r *http.Request, protobuf bool, acc Access) {
 	defer r.Body.Close()
 	r.Body = http.MaxBytesReader(w, r.Body, maxHTTPRequestBody)
 	body, err := readBody(r)
@@ -430,7 +435,7 @@ func (s *Server) cursor(w http.ResponseWriter, r *http.Request, protobuf, ro boo
 		}
 		req = &pbhttp.CursorReqBody{Baton: j.Baton, Batch: b}
 	}
-	hs, err := s.take(r.Context(), req.Baton, ro)
+	hs, err := s.take(r.Context(), req.Baton, acc)
 	if err != nil {
 		writeHTTPError(w, http.StatusBadRequest, err, protobuf)
 		return

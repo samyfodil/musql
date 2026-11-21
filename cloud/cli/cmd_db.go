@@ -140,9 +140,10 @@ func (a *app) dbCmd() *cobra.Command {
 	})
 
 	var t struct {
-		readOnly   bool
-		expiration string
-		group      bool
+		readOnly    bool
+		expiration  string
+		group       bool
+		permissions []string
 	}
 	tokCreate := a.cmd("create <name>", "Create a database token", cobra.ExactArgs(1), func(ctx context.Context, args []string) error {
 		org, err := a.orgSlug(ctx)
@@ -161,6 +162,9 @@ func (a *app) dbCmd() *cobra.Command {
 		if req.ExpiresAt, err = parseExpiration(t.expiration, time.Now()); err != nil {
 			return err
 		}
+		if req.Permissions, err = parsePermissions(t.permissions); err != nil {
+			return err
+		}
 		r, err := a.services.db.CreateToken(ctx, connect.NewRequest(req))
 		if err != nil {
 			return err
@@ -171,6 +175,7 @@ func (a *app) dbCmd() *cobra.Command {
 	tokCreate.Flags().BoolVarP(&t.readOnly, "read-only", "r", false, "a read-only token")
 	tokCreate.Flags().StringVarP(&t.expiration, "expiration", "e", "never", "lifetime: never, 7d or a duration like 12h")
 	tokCreate.Flags().BoolVar(&t.group, "group", false, "the name is a group: the token opens all of its databases")
+	tokCreate.Flags().StringArrayVarP(&t.permissions, "permissions", "p", nil, "limit the token to <table|all>:<action>,... (e.g. -p all:data_read -p comments:data_add)")
 	var invYes, invGroup bool
 	tokInvalidate := a.cmd("invalidate <name>", "Invalidate every token of a database", cobra.ExactArgs(1), func(ctx context.Context, args []string) error {
 		org, err := a.orgSlug(ctx)

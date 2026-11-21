@@ -23,6 +23,7 @@ import (
 	"github.com/samyfodil/musql/cloud/oidc"
 	"github.com/samyfodil/musql/cloud/state"
 	"github.com/samyfodil/musql/cloud/store"
+	"github.com/samyfodil/musql/hrana"
 )
 
 type databaseService struct {
@@ -370,6 +371,12 @@ func (s databaseService) CreateToken(ctx context.Context, req *connect.Request[v
 		return nil, err
 	}
 	c := &oidc.Claims{Claims: jwt.Claims{Subject: u.ID, ID: state.NewID()}, Use: oidc.UseDB, Access: access}
+	for _, p := range m.Permissions {
+		c.Perm = append(c.Perm, oidc.Permission{Tables: p.Tables, Actions: p.Actions})
+	}
+	if err := hrana.ValidatePermissions(permissionsOf(c.Perm)); err != nil {
+		return nil, invalid(err.Error())
+	}
 	switch {
 	case m.Name != "":
 		d, err := s.store.Database(ctx, o.ID, m.Name)

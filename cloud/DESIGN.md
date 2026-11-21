@@ -107,8 +107,21 @@ The server is its own issuer at `public_url`:
   database's (group's) token generation, which InvalidateTokens bumps.
   A Hrana connection is confined (`driver.Conn.Confine`): no ATTACH or VACUUM
   INTO for anyone, and a read-only one runs with `query_only` locked on.
+  A token may also carry `perm`, Turso's fine-grained permissions:
+  `[{"t": [tables], "a": [actions]}]`, no `t` meaning every table, with the
+  actions `data_read`, `data_add`, `data_update`, `data_delete`, `schema_add`,
+  `schema_update` and `schema_delete` (CreateToken refuses any other name).
+  Hrana installs `hrana.PermissionAuthorizer` on the connection for each
+  request (`driver.Conn.SetAuthorizer`, the engine's `sqlite3_set_authorizer`),
+  so a statement that needs anything else fails with `SQLITE_AUTH`. A column
+  read needs `data_read` (so an UPDATE or DELETE with a WHERE does too),
+  INSERT `data_add`, UPDATE `data_update`, DELETE `data_delete`, CREATE
+  `schema_add`, ALTER `schema_update` and DROP `schema_delete` on the table the
+  object belongs to; the schema tables need nothing, a pragma that sets
+  something, ANALYZE and REINDEX need `schema_update` on every table, and
+  ATTACH and DETACH are refused.
   Hrana requests carry a database token (or a user access token with a
-  role that allows it), checked by `hrana.WithAuth` on every HTTP request
+  role that allows it), checked by `hrana.WithAccess` on every HTTP request
   and in the WebSocket hello. A bad token, or a record that is not there,
   answers 401; a check the state could not answer (its master out of reach,
   as around an election) answers 503, and an RPC `Unavailable`, so a client
@@ -469,7 +482,7 @@ current token expires, with that reason.
 
 Same verbs as `turso` where they apply: `auth login|logout|whoami|token`,
 `org list|create|switch|members …`, `group list|create|destroy|locations …`,
-`db list|create|show|destroy|shell|tokens create|tokens invalidate|import|export|restore|branch`,
+`db list|create|show|destroy|shell|tokens create [-p table|all:actions]|tokens invalidate|import|export|restore|branch`,
 `db inspect` (size, usage), `db shell` (a REPL over Hrana with `.tables`,
 `.schema`, `.mode`). `db import`, `db create --from-file` and `db export`
 move the file in pieces with progress on stderr; an interrupted upload

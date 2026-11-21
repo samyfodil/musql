@@ -1359,7 +1359,9 @@ type CreateTokenRequest struct {
 	Group  string `protobuf:"bytes,3,opt,name=group,proto3" json:"group,omitempty"`
 	Access Access `protobuf:"varint,4,opt,name=access,proto3,enum=cloud.v1.Access" json:"access,omitempty"`
 	// No expiry when unset.
-	ExpiresAt     *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
+	ExpiresAt *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
+	// Limits the token to these actions; none leaves it unlimited.
+	Permissions   []*TokenPermission `protobuf:"bytes,6,rep,name=permissions,proto3" json:"permissions,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1429,6 +1431,69 @@ func (x *CreateTokenRequest) GetExpiresAt() *timestamppb.Timestamp {
 	return nil
 }
 
+func (x *CreateTokenRequest) GetPermissions() []*TokenPermission {
+	if x != nil {
+		return x.Permissions
+	}
+	return nil
+}
+
+// TokenPermission grants actions on tables, as Turso's fine-grained
+// permissions do. Actions are data_read, data_add, data_update, data_delete,
+// schema_add, schema_update and schema_delete.
+type TokenPermission struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Every table when empty.
+	Tables        []string `protobuf:"bytes,1,rep,name=tables,proto3" json:"tables,omitempty"`
+	Actions       []string `protobuf:"bytes,2,rep,name=actions,proto3" json:"actions,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TokenPermission) Reset() {
+	*x = TokenPermission{}
+	mi := &file_cloud_v1_database_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TokenPermission) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TokenPermission) ProtoMessage() {}
+
+func (x *TokenPermission) ProtoReflect() protoreflect.Message {
+	mi := &file_cloud_v1_database_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TokenPermission.ProtoReflect.Descriptor instead.
+func (*TokenPermission) Descriptor() ([]byte, []int) {
+	return file_cloud_v1_database_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *TokenPermission) GetTables() []string {
+	if x != nil {
+		return x.Tables
+	}
+	return nil
+}
+
+func (x *TokenPermission) GetActions() []string {
+	if x != nil {
+		return x.Actions
+	}
+	return nil
+}
+
 type CreateTokenResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Token         string                 `protobuf:"bytes,1,opt,name=token,proto3" json:"token,omitempty"`
@@ -1438,7 +1503,7 @@ type CreateTokenResponse struct {
 
 func (x *CreateTokenResponse) Reset() {
 	*x = CreateTokenResponse{}
-	mi := &file_cloud_v1_database_proto_msgTypes[22]
+	mi := &file_cloud_v1_database_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1450,7 +1515,7 @@ func (x *CreateTokenResponse) String() string {
 func (*CreateTokenResponse) ProtoMessage() {}
 
 func (x *CreateTokenResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_cloud_v1_database_proto_msgTypes[22]
+	mi := &file_cloud_v1_database_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1463,7 +1528,7 @@ func (x *CreateTokenResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateTokenResponse.ProtoReflect.Descriptor instead.
 func (*CreateTokenResponse) Descriptor() ([]byte, []int) {
-	return file_cloud_v1_database_proto_rawDescGZIP(), []int{22}
+	return file_cloud_v1_database_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *CreateTokenResponse) GetToken() string {
@@ -1486,7 +1551,7 @@ type InvalidateTokensRequest struct {
 
 func (x *InvalidateTokensRequest) Reset() {
 	*x = InvalidateTokensRequest{}
-	mi := &file_cloud_v1_database_proto_msgTypes[23]
+	mi := &file_cloud_v1_database_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1498,7 +1563,7 @@ func (x *InvalidateTokensRequest) String() string {
 func (*InvalidateTokensRequest) ProtoMessage() {}
 
 func (x *InvalidateTokensRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cloud_v1_database_proto_msgTypes[23]
+	mi := &file_cloud_v1_database_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1511,7 +1576,7 @@ func (x *InvalidateTokensRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InvalidateTokensRequest.ProtoReflect.Descriptor instead.
 func (*InvalidateTokensRequest) Descriptor() ([]byte, []int) {
-	return file_cloud_v1_database_proto_rawDescGZIP(), []int{23}
+	return file_cloud_v1_database_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *InvalidateTokensRequest) GetOrg() string {
@@ -1543,7 +1608,7 @@ type InvalidateTokensResponse struct {
 
 func (x *InvalidateTokensResponse) Reset() {
 	*x = InvalidateTokensResponse{}
-	mi := &file_cloud_v1_database_proto_msgTypes[24]
+	mi := &file_cloud_v1_database_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1555,7 +1620,7 @@ func (x *InvalidateTokensResponse) String() string {
 func (*InvalidateTokensResponse) ProtoMessage() {}
 
 func (x *InvalidateTokensResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_cloud_v1_database_proto_msgTypes[24]
+	mi := &file_cloud_v1_database_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1568,7 +1633,7 @@ func (x *InvalidateTokensResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InvalidateTokensResponse.ProtoReflect.Descriptor instead.
 func (*InvalidateTokensResponse) Descriptor() ([]byte, []int) {
-	return file_cloud_v1_database_proto_rawDescGZIP(), []int{24}
+	return file_cloud_v1_database_proto_rawDescGZIP(), []int{25}
 }
 
 // An upload carries a database file (musql or C SQLite) to the server in
@@ -1593,7 +1658,7 @@ type StartUploadRequest struct {
 
 func (x *StartUploadRequest) Reset() {
 	*x = StartUploadRequest{}
-	mi := &file_cloud_v1_database_proto_msgTypes[25]
+	mi := &file_cloud_v1_database_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1605,7 +1670,7 @@ func (x *StartUploadRequest) String() string {
 func (*StartUploadRequest) ProtoMessage() {}
 
 func (x *StartUploadRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cloud_v1_database_proto_msgTypes[25]
+	mi := &file_cloud_v1_database_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1618,7 +1683,7 @@ func (x *StartUploadRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartUploadRequest.ProtoReflect.Descriptor instead.
 func (*StartUploadRequest) Descriptor() ([]byte, []int) {
-	return file_cloud_v1_database_proto_rawDescGZIP(), []int{25}
+	return file_cloud_v1_database_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *StartUploadRequest) GetOrg() string {
@@ -1656,7 +1721,7 @@ type StartUploadResponse struct {
 
 func (x *StartUploadResponse) Reset() {
 	*x = StartUploadResponse{}
-	mi := &file_cloud_v1_database_proto_msgTypes[26]
+	mi := &file_cloud_v1_database_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1668,7 +1733,7 @@ func (x *StartUploadResponse) String() string {
 func (*StartUploadResponse) ProtoMessage() {}
 
 func (x *StartUploadResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_cloud_v1_database_proto_msgTypes[26]
+	mi := &file_cloud_v1_database_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1681,7 +1746,7 @@ func (x *StartUploadResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartUploadResponse.ProtoReflect.Descriptor instead.
 func (*StartUploadResponse) Descriptor() ([]byte, []int) {
-	return file_cloud_v1_database_proto_rawDescGZIP(), []int{26}
+	return file_cloud_v1_database_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *StartUploadResponse) GetUpload() string {
@@ -1719,7 +1784,7 @@ type UploadChunkRequest struct {
 
 func (x *UploadChunkRequest) Reset() {
 	*x = UploadChunkRequest{}
-	mi := &file_cloud_v1_database_proto_msgTypes[27]
+	mi := &file_cloud_v1_database_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1731,7 +1796,7 @@ func (x *UploadChunkRequest) String() string {
 func (*UploadChunkRequest) ProtoMessage() {}
 
 func (x *UploadChunkRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cloud_v1_database_proto_msgTypes[27]
+	mi := &file_cloud_v1_database_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1744,7 +1809,7 @@ func (x *UploadChunkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UploadChunkRequest.ProtoReflect.Descriptor instead.
 func (*UploadChunkRequest) Descriptor() ([]byte, []int) {
-	return file_cloud_v1_database_proto_rawDescGZIP(), []int{27}
+	return file_cloud_v1_database_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *UploadChunkRequest) GetOrg() string {
@@ -1785,7 +1850,7 @@ type UploadChunkResponse struct {
 
 func (x *UploadChunkResponse) Reset() {
 	*x = UploadChunkResponse{}
-	mi := &file_cloud_v1_database_proto_msgTypes[28]
+	mi := &file_cloud_v1_database_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1797,7 +1862,7 @@ func (x *UploadChunkResponse) String() string {
 func (*UploadChunkResponse) ProtoMessage() {}
 
 func (x *UploadChunkResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_cloud_v1_database_proto_msgTypes[28]
+	mi := &file_cloud_v1_database_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1810,7 +1875,7 @@ func (x *UploadChunkResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UploadChunkResponse.ProtoReflect.Descriptor instead.
 func (*UploadChunkResponse) Descriptor() ([]byte, []int) {
-	return file_cloud_v1_database_proto_rawDescGZIP(), []int{28}
+	return file_cloud_v1_database_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *UploadChunkResponse) GetOffset() int64 {
@@ -1832,7 +1897,7 @@ type FinishUploadRequest struct {
 
 func (x *FinishUploadRequest) Reset() {
 	*x = FinishUploadRequest{}
-	mi := &file_cloud_v1_database_proto_msgTypes[29]
+	mi := &file_cloud_v1_database_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1844,7 +1909,7 @@ func (x *FinishUploadRequest) String() string {
 func (*FinishUploadRequest) ProtoMessage() {}
 
 func (x *FinishUploadRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cloud_v1_database_proto_msgTypes[29]
+	mi := &file_cloud_v1_database_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1857,7 +1922,7 @@ func (x *FinishUploadRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FinishUploadRequest.ProtoReflect.Descriptor instead.
 func (*FinishUploadRequest) Descriptor() ([]byte, []int) {
-	return file_cloud_v1_database_proto_rawDescGZIP(), []int{29}
+	return file_cloud_v1_database_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *FinishUploadRequest) GetOrg() string {
@@ -1893,7 +1958,7 @@ type FinishUploadResponse struct {
 
 func (x *FinishUploadResponse) Reset() {
 	*x = FinishUploadResponse{}
-	mi := &file_cloud_v1_database_proto_msgTypes[30]
+	mi := &file_cloud_v1_database_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1905,7 +1970,7 @@ func (x *FinishUploadResponse) String() string {
 func (*FinishUploadResponse) ProtoMessage() {}
 
 func (x *FinishUploadResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_cloud_v1_database_proto_msgTypes[30]
+	mi := &file_cloud_v1_database_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1918,7 +1983,7 @@ func (x *FinishUploadResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FinishUploadResponse.ProtoReflect.Descriptor instead.
 func (*FinishUploadResponse) Descriptor() ([]byte, []int) {
-	return file_cloud_v1_database_proto_rawDescGZIP(), []int{30}
+	return file_cloud_v1_database_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *FinishUploadResponse) GetUpload() string {
@@ -1953,7 +2018,7 @@ type ExportRequest struct {
 
 func (x *ExportRequest) Reset() {
 	*x = ExportRequest{}
-	mi := &file_cloud_v1_database_proto_msgTypes[31]
+	mi := &file_cloud_v1_database_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1965,7 +2030,7 @@ func (x *ExportRequest) String() string {
 func (*ExportRequest) ProtoMessage() {}
 
 func (x *ExportRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cloud_v1_database_proto_msgTypes[31]
+	mi := &file_cloud_v1_database_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1978,7 +2043,7 @@ func (x *ExportRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportRequest.ProtoReflect.Descriptor instead.
 func (*ExportRequest) Descriptor() ([]byte, []int) {
-	return file_cloud_v1_database_proto_rawDescGZIP(), []int{31}
+	return file_cloud_v1_database_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *ExportRequest) GetOrg() string {
@@ -2014,7 +2079,7 @@ type ExportResponse struct {
 
 func (x *ExportResponse) Reset() {
 	*x = ExportResponse{}
-	mi := &file_cloud_v1_database_proto_msgTypes[32]
+	mi := &file_cloud_v1_database_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2026,7 +2091,7 @@ func (x *ExportResponse) String() string {
 func (*ExportResponse) ProtoMessage() {}
 
 func (x *ExportResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_cloud_v1_database_proto_msgTypes[32]
+	mi := &file_cloud_v1_database_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2039,7 +2104,7 @@ func (x *ExportResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportResponse.ProtoReflect.Descriptor instead.
 func (*ExportResponse) Descriptor() ([]byte, []int) {
-	return file_cloud_v1_database_proto_rawDescGZIP(), []int{32}
+	return file_cloud_v1_database_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *ExportResponse) GetContent() []byte {
@@ -2071,7 +2136,7 @@ type StatsRequest struct {
 
 func (x *StatsRequest) Reset() {
 	*x = StatsRequest{}
-	mi := &file_cloud_v1_database_proto_msgTypes[33]
+	mi := &file_cloud_v1_database_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2083,7 +2148,7 @@ func (x *StatsRequest) String() string {
 func (*StatsRequest) ProtoMessage() {}
 
 func (x *StatsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cloud_v1_database_proto_msgTypes[33]
+	mi := &file_cloud_v1_database_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2096,7 +2161,7 @@ func (x *StatsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatsRequest.ProtoReflect.Descriptor instead.
 func (*StatsRequest) Descriptor() ([]byte, []int) {
-	return file_cloud_v1_database_proto_rawDescGZIP(), []int{33}
+	return file_cloud_v1_database_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *StatsRequest) GetOrg() string {
@@ -2147,7 +2212,7 @@ type TopQuery struct {
 
 func (x *TopQuery) Reset() {
 	*x = TopQuery{}
-	mi := &file_cloud_v1_database_proto_msgTypes[34]
+	mi := &file_cloud_v1_database_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2159,7 +2224,7 @@ func (x *TopQuery) String() string {
 func (*TopQuery) ProtoMessage() {}
 
 func (x *TopQuery) ProtoReflect() protoreflect.Message {
-	mi := &file_cloud_v1_database_proto_msgTypes[34]
+	mi := &file_cloud_v1_database_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2172,7 +2237,7 @@ func (x *TopQuery) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TopQuery.ProtoReflect.Descriptor instead.
 func (*TopQuery) Descriptor() ([]byte, []int) {
-	return file_cloud_v1_database_proto_rawDescGZIP(), []int{34}
+	return file_cloud_v1_database_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *TopQuery) GetSql() string {
@@ -2219,7 +2284,7 @@ type StatsResponse struct {
 
 func (x *StatsResponse) Reset() {
 	*x = StatsResponse{}
-	mi := &file_cloud_v1_database_proto_msgTypes[35]
+	mi := &file_cloud_v1_database_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2231,7 +2296,7 @@ func (x *StatsResponse) String() string {
 func (*StatsResponse) ProtoMessage() {}
 
 func (x *StatsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_cloud_v1_database_proto_msgTypes[35]
+	mi := &file_cloud_v1_database_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2244,7 +2309,7 @@ func (x *StatsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatsResponse.ProtoReflect.Descriptor instead.
 func (*StatsResponse) Descriptor() ([]byte, []int) {
-	return file_cloud_v1_database_proto_rawDescGZIP(), []int{35}
+	return file_cloud_v1_database_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *StatsResponse) GetTopQueries() []*TopQuery {
@@ -2341,14 +2406,18 @@ const file_cloud_v1_database_proto_rawDesc = "" +
 	"\bnew_name\x18\x04 \x01(\tR\anewName\x12\x19\n" +
 	"\bin_place\x18\x05 \x01(\bR\ainPlace\"A\n" +
 	"\x0fRestoreResponse\x12.\n" +
-	"\bdatabase\x18\x01 \x01(\v2\x12.cloud.v1.DatabaseR\bdatabase\"\xb5\x01\n" +
+	"\bdatabase\x18\x01 \x01(\v2\x12.cloud.v1.DatabaseR\bdatabase\"\xf2\x01\n" +
 	"\x12CreateTokenRequest\x12\x10\n" +
 	"\x03org\x18\x01 \x01(\tR\x03org\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x14\n" +
 	"\x05group\x18\x03 \x01(\tR\x05group\x12(\n" +
 	"\x06access\x18\x04 \x01(\x0e2\x10.cloud.v1.AccessR\x06access\x129\n" +
 	"\n" +
-	"expires_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\"+\n" +
+	"expires_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\x12;\n" +
+	"\vpermissions\x18\x06 \x03(\v2\x19.cloud.v1.TokenPermissionR\vpermissions\"C\n" +
+	"\x0fTokenPermission\x12\x16\n" +
+	"\x06tables\x18\x01 \x03(\tR\x06tables\x12\x18\n" +
+	"\aactions\x18\x02 \x03(\tR\aactions\"+\n" +
 	"\x13CreateTokenResponse\x12\x14\n" +
 	"\x05token\x18\x01 \x01(\tR\x05token\"U\n" +
 	"\x17InvalidateTokensRequest\x12\x10\n" +
@@ -2445,7 +2514,7 @@ func file_cloud_v1_database_proto_rawDescGZIP() []byte {
 }
 
 var file_cloud_v1_database_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_cloud_v1_database_proto_msgTypes = make([]protoimpl.MessageInfo, 36)
+var file_cloud_v1_database_proto_msgTypes = make([]protoimpl.MessageInfo, 37)
 var file_cloud_v1_database_proto_goTypes = []any{
 	(FileFormat)(0),                  // 0: cloud.v1.FileFormat
 	(Access)(0),                      // 1: cloud.v1.Access
@@ -2471,88 +2540,90 @@ var file_cloud_v1_database_proto_goTypes = []any{
 	(*RestoreRequest)(nil),           // 21: cloud.v1.RestoreRequest
 	(*RestoreResponse)(nil),          // 22: cloud.v1.RestoreResponse
 	(*CreateTokenRequest)(nil),       // 23: cloud.v1.CreateTokenRequest
-	(*CreateTokenResponse)(nil),      // 24: cloud.v1.CreateTokenResponse
-	(*InvalidateTokensRequest)(nil),  // 25: cloud.v1.InvalidateTokensRequest
-	(*InvalidateTokensResponse)(nil), // 26: cloud.v1.InvalidateTokensResponse
-	(*StartUploadRequest)(nil),       // 27: cloud.v1.StartUploadRequest
-	(*StartUploadResponse)(nil),      // 28: cloud.v1.StartUploadResponse
-	(*UploadChunkRequest)(nil),       // 29: cloud.v1.UploadChunkRequest
-	(*UploadChunkResponse)(nil),      // 30: cloud.v1.UploadChunkResponse
-	(*FinishUploadRequest)(nil),      // 31: cloud.v1.FinishUploadRequest
-	(*FinishUploadResponse)(nil),     // 32: cloud.v1.FinishUploadResponse
-	(*ExportRequest)(nil),            // 33: cloud.v1.ExportRequest
-	(*ExportResponse)(nil),           // 34: cloud.v1.ExportResponse
-	(*StatsRequest)(nil),             // 35: cloud.v1.StatsRequest
-	(*TopQuery)(nil),                 // 36: cloud.v1.TopQuery
-	(*StatsResponse)(nil),            // 37: cloud.v1.StatsResponse
-	(*Database)(nil),                 // 38: cloud.v1.Database
-	(*timestamppb.Timestamp)(nil),    // 39: google.protobuf.Timestamp
-	(DatabaseType)(0),                // 40: cloud.v1.DatabaseType
-	(Durability)(0),                  // 41: cloud.v1.Durability
+	(*TokenPermission)(nil),          // 24: cloud.v1.TokenPermission
+	(*CreateTokenResponse)(nil),      // 25: cloud.v1.CreateTokenResponse
+	(*InvalidateTokensRequest)(nil),  // 26: cloud.v1.InvalidateTokensRequest
+	(*InvalidateTokensResponse)(nil), // 27: cloud.v1.InvalidateTokensResponse
+	(*StartUploadRequest)(nil),       // 28: cloud.v1.StartUploadRequest
+	(*StartUploadResponse)(nil),      // 29: cloud.v1.StartUploadResponse
+	(*UploadChunkRequest)(nil),       // 30: cloud.v1.UploadChunkRequest
+	(*UploadChunkResponse)(nil),      // 31: cloud.v1.UploadChunkResponse
+	(*FinishUploadRequest)(nil),      // 32: cloud.v1.FinishUploadRequest
+	(*FinishUploadResponse)(nil),     // 33: cloud.v1.FinishUploadResponse
+	(*ExportRequest)(nil),            // 34: cloud.v1.ExportRequest
+	(*ExportResponse)(nil),           // 35: cloud.v1.ExportResponse
+	(*StatsRequest)(nil),             // 36: cloud.v1.StatsRequest
+	(*TopQuery)(nil),                 // 37: cloud.v1.TopQuery
+	(*StatsResponse)(nil),            // 38: cloud.v1.StatsResponse
+	(*Database)(nil),                 // 39: cloud.v1.Database
+	(*timestamppb.Timestamp)(nil),    // 40: google.protobuf.Timestamp
+	(DatabaseType)(0),                // 41: cloud.v1.DatabaseType
+	(Durability)(0),                  // 42: cloud.v1.Durability
 }
 var file_cloud_v1_database_proto_depIdxs = []int32{
-	38, // 0: cloud.v1.ListDatabasesResponse.databases:type_name -> cloud.v1.Database
-	38, // 1: cloud.v1.GetDatabaseResponse.database:type_name -> cloud.v1.Database
-	39, // 2: cloud.v1.CreateDatabaseRequest.branch_at:type_name -> google.protobuf.Timestamp
-	40, // 3: cloud.v1.CreateDatabaseRequest.type:type_name -> cloud.v1.DatabaseType
-	41, // 4: cloud.v1.CreateDatabaseRequest.durability:type_name -> cloud.v1.Durability
-	38, // 5: cloud.v1.CreateDatabaseResponse.database:type_name -> cloud.v1.Database
-	38, // 6: cloud.v1.RenameDatabaseResponse.database:type_name -> cloud.v1.Database
-	39, // 7: cloud.v1.UsageRequest.from:type_name -> google.protobuf.Timestamp
-	39, // 8: cloud.v1.UsageRequest.to:type_name -> google.protobuf.Timestamp
-	39, // 9: cloud.v1.UsagePoint.hour:type_name -> google.protobuf.Timestamp
+	39, // 0: cloud.v1.ListDatabasesResponse.databases:type_name -> cloud.v1.Database
+	39, // 1: cloud.v1.GetDatabaseResponse.database:type_name -> cloud.v1.Database
+	40, // 2: cloud.v1.CreateDatabaseRequest.branch_at:type_name -> google.protobuf.Timestamp
+	41, // 3: cloud.v1.CreateDatabaseRequest.type:type_name -> cloud.v1.DatabaseType
+	42, // 4: cloud.v1.CreateDatabaseRequest.durability:type_name -> cloud.v1.Durability
+	39, // 5: cloud.v1.CreateDatabaseResponse.database:type_name -> cloud.v1.Database
+	39, // 6: cloud.v1.RenameDatabaseResponse.database:type_name -> cloud.v1.Database
+	40, // 7: cloud.v1.UsageRequest.from:type_name -> google.protobuf.Timestamp
+	40, // 8: cloud.v1.UsageRequest.to:type_name -> google.protobuf.Timestamp
+	40, // 9: cloud.v1.UsagePoint.hour:type_name -> google.protobuf.Timestamp
 	13, // 10: cloud.v1.UsageResponse.points:type_name -> cloud.v1.UsagePoint
 	15, // 11: cloud.v1.UsageResponse.databases:type_name -> cloud.v1.DatabaseUsage
 	13, // 12: cloud.v1.DatabaseUsage.points:type_name -> cloud.v1.UsagePoint
-	39, // 13: cloud.v1.Snapshot.taken_at:type_name -> google.protobuf.Timestamp
+	40, // 13: cloud.v1.Snapshot.taken_at:type_name -> google.protobuf.Timestamp
 	16, // 14: cloud.v1.ListSnapshotsResponse.snapshots:type_name -> cloud.v1.Snapshot
 	16, // 15: cloud.v1.CreateSnapshotResponse.snapshot:type_name -> cloud.v1.Snapshot
-	39, // 16: cloud.v1.RestoreRequest.at:type_name -> google.protobuf.Timestamp
-	38, // 17: cloud.v1.RestoreResponse.database:type_name -> cloud.v1.Database
+	40, // 16: cloud.v1.RestoreRequest.at:type_name -> google.protobuf.Timestamp
+	39, // 17: cloud.v1.RestoreResponse.database:type_name -> cloud.v1.Database
 	1,  // 18: cloud.v1.CreateTokenRequest.access:type_name -> cloud.v1.Access
-	39, // 19: cloud.v1.CreateTokenRequest.expires_at:type_name -> google.protobuf.Timestamp
-	0,  // 20: cloud.v1.FinishUploadResponse.format:type_name -> cloud.v1.FileFormat
-	0,  // 21: cloud.v1.ExportRequest.format:type_name -> cloud.v1.FileFormat
-	39, // 22: cloud.v1.StatsRequest.from:type_name -> google.protobuf.Timestamp
-	39, // 23: cloud.v1.StatsRequest.to:type_name -> google.protobuf.Timestamp
-	36, // 24: cloud.v1.StatsResponse.top_queries:type_name -> cloud.v1.TopQuery
-	2,  // 25: cloud.v1.DatabaseService.List:input_type -> cloud.v1.ListDatabasesRequest
-	4,  // 26: cloud.v1.DatabaseService.Get:input_type -> cloud.v1.GetDatabaseRequest
-	6,  // 27: cloud.v1.DatabaseService.Create:input_type -> cloud.v1.CreateDatabaseRequest
-	8,  // 28: cloud.v1.DatabaseService.Delete:input_type -> cloud.v1.DeleteDatabaseRequest
-	10, // 29: cloud.v1.DatabaseService.Rename:input_type -> cloud.v1.RenameDatabaseRequest
-	12, // 30: cloud.v1.DatabaseService.Usage:input_type -> cloud.v1.UsageRequest
-	17, // 31: cloud.v1.DatabaseService.ListSnapshots:input_type -> cloud.v1.ListSnapshotsRequest
-	19, // 32: cloud.v1.DatabaseService.CreateSnapshot:input_type -> cloud.v1.CreateSnapshotRequest
-	21, // 33: cloud.v1.DatabaseService.Restore:input_type -> cloud.v1.RestoreRequest
-	23, // 34: cloud.v1.DatabaseService.CreateToken:input_type -> cloud.v1.CreateTokenRequest
-	25, // 35: cloud.v1.DatabaseService.InvalidateTokens:input_type -> cloud.v1.InvalidateTokensRequest
-	27, // 36: cloud.v1.DatabaseService.StartUpload:input_type -> cloud.v1.StartUploadRequest
-	29, // 37: cloud.v1.DatabaseService.UploadChunk:input_type -> cloud.v1.UploadChunkRequest
-	31, // 38: cloud.v1.DatabaseService.FinishUpload:input_type -> cloud.v1.FinishUploadRequest
-	33, // 39: cloud.v1.DatabaseService.Export:input_type -> cloud.v1.ExportRequest
-	35, // 40: cloud.v1.DatabaseService.Stats:input_type -> cloud.v1.StatsRequest
-	3,  // 41: cloud.v1.DatabaseService.List:output_type -> cloud.v1.ListDatabasesResponse
-	5,  // 42: cloud.v1.DatabaseService.Get:output_type -> cloud.v1.GetDatabaseResponse
-	7,  // 43: cloud.v1.DatabaseService.Create:output_type -> cloud.v1.CreateDatabaseResponse
-	9,  // 44: cloud.v1.DatabaseService.Delete:output_type -> cloud.v1.DeleteDatabaseResponse
-	11, // 45: cloud.v1.DatabaseService.Rename:output_type -> cloud.v1.RenameDatabaseResponse
-	14, // 46: cloud.v1.DatabaseService.Usage:output_type -> cloud.v1.UsageResponse
-	18, // 47: cloud.v1.DatabaseService.ListSnapshots:output_type -> cloud.v1.ListSnapshotsResponse
-	20, // 48: cloud.v1.DatabaseService.CreateSnapshot:output_type -> cloud.v1.CreateSnapshotResponse
-	22, // 49: cloud.v1.DatabaseService.Restore:output_type -> cloud.v1.RestoreResponse
-	24, // 50: cloud.v1.DatabaseService.CreateToken:output_type -> cloud.v1.CreateTokenResponse
-	26, // 51: cloud.v1.DatabaseService.InvalidateTokens:output_type -> cloud.v1.InvalidateTokensResponse
-	28, // 52: cloud.v1.DatabaseService.StartUpload:output_type -> cloud.v1.StartUploadResponse
-	30, // 53: cloud.v1.DatabaseService.UploadChunk:output_type -> cloud.v1.UploadChunkResponse
-	32, // 54: cloud.v1.DatabaseService.FinishUpload:output_type -> cloud.v1.FinishUploadResponse
-	34, // 55: cloud.v1.DatabaseService.Export:output_type -> cloud.v1.ExportResponse
-	37, // 56: cloud.v1.DatabaseService.Stats:output_type -> cloud.v1.StatsResponse
-	41, // [41:57] is the sub-list for method output_type
-	25, // [25:41] is the sub-list for method input_type
-	25, // [25:25] is the sub-list for extension type_name
-	25, // [25:25] is the sub-list for extension extendee
-	0,  // [0:25] is the sub-list for field type_name
+	40, // 19: cloud.v1.CreateTokenRequest.expires_at:type_name -> google.protobuf.Timestamp
+	24, // 20: cloud.v1.CreateTokenRequest.permissions:type_name -> cloud.v1.TokenPermission
+	0,  // 21: cloud.v1.FinishUploadResponse.format:type_name -> cloud.v1.FileFormat
+	0,  // 22: cloud.v1.ExportRequest.format:type_name -> cloud.v1.FileFormat
+	40, // 23: cloud.v1.StatsRequest.from:type_name -> google.protobuf.Timestamp
+	40, // 24: cloud.v1.StatsRequest.to:type_name -> google.protobuf.Timestamp
+	37, // 25: cloud.v1.StatsResponse.top_queries:type_name -> cloud.v1.TopQuery
+	2,  // 26: cloud.v1.DatabaseService.List:input_type -> cloud.v1.ListDatabasesRequest
+	4,  // 27: cloud.v1.DatabaseService.Get:input_type -> cloud.v1.GetDatabaseRequest
+	6,  // 28: cloud.v1.DatabaseService.Create:input_type -> cloud.v1.CreateDatabaseRequest
+	8,  // 29: cloud.v1.DatabaseService.Delete:input_type -> cloud.v1.DeleteDatabaseRequest
+	10, // 30: cloud.v1.DatabaseService.Rename:input_type -> cloud.v1.RenameDatabaseRequest
+	12, // 31: cloud.v1.DatabaseService.Usage:input_type -> cloud.v1.UsageRequest
+	17, // 32: cloud.v1.DatabaseService.ListSnapshots:input_type -> cloud.v1.ListSnapshotsRequest
+	19, // 33: cloud.v1.DatabaseService.CreateSnapshot:input_type -> cloud.v1.CreateSnapshotRequest
+	21, // 34: cloud.v1.DatabaseService.Restore:input_type -> cloud.v1.RestoreRequest
+	23, // 35: cloud.v1.DatabaseService.CreateToken:input_type -> cloud.v1.CreateTokenRequest
+	26, // 36: cloud.v1.DatabaseService.InvalidateTokens:input_type -> cloud.v1.InvalidateTokensRequest
+	28, // 37: cloud.v1.DatabaseService.StartUpload:input_type -> cloud.v1.StartUploadRequest
+	30, // 38: cloud.v1.DatabaseService.UploadChunk:input_type -> cloud.v1.UploadChunkRequest
+	32, // 39: cloud.v1.DatabaseService.FinishUpload:input_type -> cloud.v1.FinishUploadRequest
+	34, // 40: cloud.v1.DatabaseService.Export:input_type -> cloud.v1.ExportRequest
+	36, // 41: cloud.v1.DatabaseService.Stats:input_type -> cloud.v1.StatsRequest
+	3,  // 42: cloud.v1.DatabaseService.List:output_type -> cloud.v1.ListDatabasesResponse
+	5,  // 43: cloud.v1.DatabaseService.Get:output_type -> cloud.v1.GetDatabaseResponse
+	7,  // 44: cloud.v1.DatabaseService.Create:output_type -> cloud.v1.CreateDatabaseResponse
+	9,  // 45: cloud.v1.DatabaseService.Delete:output_type -> cloud.v1.DeleteDatabaseResponse
+	11, // 46: cloud.v1.DatabaseService.Rename:output_type -> cloud.v1.RenameDatabaseResponse
+	14, // 47: cloud.v1.DatabaseService.Usage:output_type -> cloud.v1.UsageResponse
+	18, // 48: cloud.v1.DatabaseService.ListSnapshots:output_type -> cloud.v1.ListSnapshotsResponse
+	20, // 49: cloud.v1.DatabaseService.CreateSnapshot:output_type -> cloud.v1.CreateSnapshotResponse
+	22, // 50: cloud.v1.DatabaseService.Restore:output_type -> cloud.v1.RestoreResponse
+	25, // 51: cloud.v1.DatabaseService.CreateToken:output_type -> cloud.v1.CreateTokenResponse
+	27, // 52: cloud.v1.DatabaseService.InvalidateTokens:output_type -> cloud.v1.InvalidateTokensResponse
+	29, // 53: cloud.v1.DatabaseService.StartUpload:output_type -> cloud.v1.StartUploadResponse
+	31, // 54: cloud.v1.DatabaseService.UploadChunk:output_type -> cloud.v1.UploadChunkResponse
+	33, // 55: cloud.v1.DatabaseService.FinishUpload:output_type -> cloud.v1.FinishUploadResponse
+	35, // 56: cloud.v1.DatabaseService.Export:output_type -> cloud.v1.ExportResponse
+	38, // 57: cloud.v1.DatabaseService.Stats:output_type -> cloud.v1.StatsResponse
+	42, // [42:58] is the sub-list for method output_type
+	26, // [26:42] is the sub-list for method input_type
+	26, // [26:26] is the sub-list for extension type_name
+	26, // [26:26] is the sub-list for extension extendee
+	0,  // [0:26] is the sub-list for field type_name
 }
 
 func init() { file_cloud_v1_database_proto_init() }
@@ -2571,7 +2642,7 @@ func file_cloud_v1_database_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_cloud_v1_database_proto_rawDesc), len(file_cloud_v1_database_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   36,
+			NumMessages:   37,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
