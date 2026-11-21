@@ -1749,6 +1749,10 @@ func compileScanWindow(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 			// sqlite3WindowUpdate (window.c:689): only an aggregate takes a FILTER.
 			return nil, semanticf("engine: FILTER clause may only be used with aggregate window functions")
 		}
+		if a := udafs[call.name]; a != nil && a.plain {
+			// resolve.c: an aggregate without xValue is no window function.
+			return nil, semanticf("engine: %s() may not be used as a window function", call.name)
+		}
 		if !isWindowFunctionName(call.name) {
 			if !isAggregateCall(call.funcExpr()) {
 				// window.c:689-ish: a function that is neither is refused by name.

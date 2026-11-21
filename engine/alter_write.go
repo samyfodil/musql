@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // ---- shared text-splicing machinery ----
@@ -55,12 +56,12 @@ func applyEdits(s string, edits []textEdit) string {
 // simpleIdentRe matches an identifier that never needs quoting; renderIdent
 // leaves such a new column name bare, as C does. Reserved-keyword collisions are
 // not detected (C would quote "select").
-var simpleIdentRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+var simpleIdentRe = sync.OnceValue(func() *regexp.Regexp { return regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`) })
 
 // renderIdent renders name as it should appear freshly written into SQL
 // text: bare if it's already a simple identifier, double-quoted otherwise.
 func renderIdent(name string) string {
-	if simpleIdentRe.MatchString(name) {
+	if simpleIdentRe().MatchString(name) {
 		return name
 	}
 	return quoteIdent(name)
