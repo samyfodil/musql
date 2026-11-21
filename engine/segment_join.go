@@ -1533,17 +1533,39 @@ func (w *segJoinWalk) passingValues(a segJoinArg) ([]Value, []bool, bool) {
 type segJoinMemo[T any] struct {
 	vals  map[segJoinMemoKey]T
 	texts map[string]T
+	ints  map[int64]T
+	// last is the plain INTEGER found or put last, and lastV its value: a
+	// column in some order repeats its value over runs of rows.
+	haveLast bool
+	last     int64
+	lastV    T
 }
 
 func newSegJoinMemo[T any]() *segJoinMemo[T] {
-	return &segJoinMemo[T]{vals: map[segJoinMemoKey]T{}, texts: map[string]T{}}
+	return &segJoinMemo[T]{vals: map[segJoinMemoKey]T{}, texts: map[string]T{}, ints: map[int64]T{}}
 }
 
 func segJoinPlainText(x Value) bool {
 	return x.Typ == Text && x.Subtype == 0 && !x.intReal && x.I == 0 && x.F == 0
 }
 
+// segJoinPlainInt reports whether x is an INTEGER told apart by I alone: the
+// key segJoinMemoKeyOf gives it holds nothing else.
+func segJoinPlainInt(x Value) bool {
+	return x.Typ == Int && x.Subtype == 0 && !x.intReal && math.Float64bits(x.F) == 0 && len(x.S) == 0
+}
+
 func (m *segJoinMemo[T]) get(x Value) (T, bool) {
+	if segJoinPlainInt(x) {
+		if m.haveLast && m.last == x.I {
+			return m.lastV, true
+		}
+		v, ok := m.ints[x.I]
+		if ok {
+			m.haveLast, m.last, m.lastV = true, x.I, v
+		}
+		return v, ok
+	}
 	if segJoinPlainText(x) {
 		v, ok := m.texts[string(x.S)]
 		return v, ok
@@ -1553,6 +1575,11 @@ func (m *segJoinMemo[T]) get(x Value) (T, bool) {
 }
 
 func (m *segJoinMemo[T]) put(x Value, v T) {
+	if segJoinPlainInt(x) {
+		m.ints[x.I] = v
+		m.haveLast, m.last, m.lastV = true, x.I, v
+		return
+	}
 	if segJoinPlainText(x) {
 		m.texts[string(x.S)] = v
 		return
