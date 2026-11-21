@@ -128,8 +128,8 @@ func (e *vmEmitArm) textCmp(pc int, in VInsn) {
 		}
 	}
 	text, loop, tail := e.vmLabel("tt"), e.vmLabel("tl"), e.vmLabel("te")
-	// kArm takes an operand holding the INTEGER constant IntText names, and
-	// another holding a TEXT.
+	// kArm takes an operand holding the number IntText names, and another
+	// holding a TEXT.
 	k := in.IntText
 	var kArm string
 	if k != nil {
@@ -151,7 +151,11 @@ func (e *vmEmitArm) textCmp(pc int, in VInsn) {
 	a.B(tail)
 	a.Label(text)
 	a.CmpImm(X9, uint32(L.TypText))
-	a.Bcond(CondNE, e.stub(pc))
+	if k != nil && k.OnA {
+		a.Bcond(CondNE, kArm)
+	} else {
+		a.Bcond(CondNE, e.stub(pc))
+	}
 	a.CmpImm(X10, uint32(L.TypText))
 	if k != nil && !k.OnA {
 		a.Bcond(CondNE, kArm)
@@ -181,16 +185,29 @@ func (e *vmEmitArm) textCmp(pc int, in VInsn) {
 		}
 		if k.OnA {
 			a.CmpImm(X10, uint32(L.TypText))
-		} else {
-			a.CmpImm(X10, uint32(L.TypInt))
+			a.Bcond(CondNE, e.stub(pc))
 		}
-		a.Bcond(CondNE, e.stub(pc))
+		// The operand holds the slot's number: its kind, and the INTEGER or
+		// the REAL's bits.
 		off := k.Slot * VIntTextSize
+		isReal, same := e.vmLabel("tr"), e.vmLabel("ts")
 		a.LdrImm(X9, X0, POffIntTexts)
-		a.LdrImm(X10, X9, off+VIntTextOffOk)
-		a.Cbz(X10, e.stub(pc))
-		a.LdrImm(X10, X9, off+VIntTextOffK)
+		a.LdrImm(X6, X9, off+VIntTextOffOk)
+		e.ldrb(X10, kr, L.OffTyp)
+		a.CmpImm(X10, uint32(L.TypInt))
+		a.Bcond(CondNE, isReal)
+		a.CmpImm(X6, VIntTextInt)
+		a.Bcond(CondNE, e.stub(pc))
 		e.ldr(X6, kr, L.OffI)
+		a.B(same)
+		a.Label(isReal)
+		a.CmpImm(X10, uint32(L.TypFloat))
+		a.Bcond(CondNE, e.stub(pc))
+		a.CmpImm(X6, VIntTextReal)
+		a.Bcond(CondNE, e.stub(pc))
+		e.ldr(X6, kr, L.OffF)
+		a.Label(same)
+		a.LdrImm(X10, X9, off+VIntTextOffK)
 		a.Cmp(X6, X10)
 		a.Bcond(CondNE, e.stub(pc))
 		a.LdrImm(X10, X0, POffUTF16)
