@@ -74,6 +74,10 @@ type cteBinding struct {
 	// (view expansions, CTE references), when it counted anything: a later
 	// probe adds the same counts instead of compiling the body again.
 	probeCounts atomic.Pointer[refCounts]
+	// countedProbe is that probe's program when it was compiled with no
+	// enclosing compiler, as cteSchemaColsIn compiles the body: it reads the
+	// column names off it and adds probeCounts.
+	countedProbe atomic.Pointer[Program]
 
 	name     string
 	colNames []string // explicit "(col, ...)" rename list; nil if none was given
@@ -490,6 +494,14 @@ var (
 var (
 	cteProbeCountsOffForTest bool
 	cteProbeCountReplays     atomic.Int64
+)
+
+// cteSchemaFromProbeOffForTest has cteSchemaColsIn compile a body whose
+// probe counted references, and cteSchemaFromProbe counts the column lists
+// read off that probe instead, for tests.
+var (
+	cteSchemaFromProbeOffForTest bool
+	cteSchemaFromProbe           atomic.Int64
 )
 
 func applyCTEColNames(name string, colNames []string, cols []columnInfo, rows [][]Value) ([]columnInfo, [][]Value, error) {
