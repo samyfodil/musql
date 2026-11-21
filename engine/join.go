@@ -1564,7 +1564,7 @@ func buildScopes(jts []joinedTable) []tableScope {
 // resolveFrom and resolveJoinSources (vdbe_join_codegen.go) both thread one
 // state through desugarJoinItem, so they cannot desugar differently.
 type joinDesugarState struct {
-	visible    []visibleCol
+	exposed    []exposedItem
 	scopeNames []string // scopeNames[i] is FROM item i's own scope name (alias, or table name if unaliased), indexed by ABSOLUTE FROM-item index -- see recordScope
 	nested     []bool   // nested[i] mirrors FROM item i's FromItem.NestedNonLeading, same indexing
 
@@ -1639,13 +1639,35 @@ func (state *joinDesugarState) firstScopeNamed(n string) int {
 // USING/NATURAL coalescing did not hide -- as visible to later items, then
 // re-checks the whole clause against checkSharedScopeNames.
 func (state *joinDesugarState) expose(idx int, cols []columnInfo, hidden map[string]int) error {
-	for _, c := range cols {
-		if _, isHidden := hidden[r33sFoldIdent(c.Name)]; isHidden {
-			continue
+	e := exposedItem{tableIdx: idx, cols: cols}
+	if hidden != nil {
+		e.cols = make([]columnInfo, 0, len(cols))
+		for _, c := range cols {
+			if _, isHidden := hidden[r33sFoldIdent(c.Name)]; !isHidden {
+				e.cols = append(e.cols, c)
+			}
 		}
-		state.visible = append(state.visible, visibleCol{tableIdx: idx, name: c.Name})
 	}
+	state.exposed = append(state.exposed, e)
 	return state.checkSharedScopeNames()
+}
+
+// eachVisible calls f with every visible column, in FROM order: its supplying
+// FROM item's index and its name.
+func (state *joinDesugarState) eachVisible(f func(tableIdx int, name string)) {
+	for _, e := range state.exposed {
+		for _, c := range e.cols {
+			f(e.tableIdx, c.Name)
+		}
+	}
+}
+
+func (state *joinDesugarState) nVisible() int {
+	n := 0
+	for _, e := range state.exposed {
+		n += len(e.cols)
+	}
+	return n
 }
 
 // checkSharedScopeNames declines the unaliased-self-join shape SQLite itself
@@ -1716,12 +1738,13 @@ func checkSelfJoinGroupSupported(items []FromItem) error {
 	return nil
 }
 
-// visibleCol is one entry of joinDesugarState.visible: a column name (its
-// original-case spelling, from whichever table contributed it) and the
-// FROM-item index that supplies it.
-type visibleCol struct {
+// exposedItem is one FROM item's visible columns (joinDesugarState.exposed):
+// their names, in the original-case spelling of whichever table contributed
+// each, and the FROM-item index that supplies them. An item whose columns
+// none are hidden shares its column list rather than copying it.
+type exposedItem struct {
 	tableIdx int
-	name     string
+	cols     []columnInfo
 }
 
 // desugarJoinItem computes FROM item idx's effective join condition and
@@ -1762,10 +1785,8 @@ func desugarJoinItem(state *joinDesugarState, idx int, it FromItem, name string,
 		// sqlite3ProcessJoin synthesizes the USING list from the RIGHT table's
 		// columns, in its order and spelling, keeping each that some table on
 		// the left has (select.c:540-556).
-		leftHas := make(map[string]bool, len(state.visible))
-		for _, vc := range state.visible {
-			leftHas[r33sFoldIdent(vc.name)] = true
-		}
+		leftHas := make(map[string]bool, state.nVisible())
+		state.eachVisible(func(_ int, name string) { leftHas[r33sFoldIdent(name)] = true })
 		seen := make(map[string]bool, len(cols))
 		for _, c := range cols {
 			if c.Hidden {
@@ -1826,15 +1847,15 @@ func desugarJoinItem(state *joinDesugarState, idx int, it FromItem, name string,
 		// the level has any RIGHT/FULL join (JT_LTORJ, select.c:600), so the
 		// check here is scoped to that (joinDesugarState.sawRightJoin).
 		repr, ambiguous := -1, false
-		for _, vc := range state.visible {
-			if equalFoldName(vc.name, n) {
+		state.eachVisible(func(tableIdx int, name string) {
+			if equalFoldName(name, n) {
 				if repr == -1 {
-					repr = vc.tableIdx
-				} else if vc.tableIdx != repr {
+					repr = tableIdx
+				} else if tableIdx != repr {
 					ambiguous = true
 				}
 			}
-		}
+		})
 		if repr == -1 {
 			// select.c:588-591's own wording, and its own PREPARE-time
 			// rejection: semanticf so it propagates as the statement's error
