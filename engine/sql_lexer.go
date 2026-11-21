@@ -65,22 +65,38 @@ func (t token) isKw(kw string) bool {
 	return true
 }
 
-// upperIn reports m[t.upper()], folding a short word on the stack rather than
-// into the copy upper makes of a lower-case one.
-func (t token) upperIn(m map[string]bool) bool {
-	var buf [24]byte
-	if len(t.text) > len(buf) {
-		return m[t.upper()]
-	}
-	b := buf[:len(t.text)]
-	for i := range len(b) {
-		c := t.text[i]
-		if c >= 'a' && c <= 'z' {
-			c -= 'a' - 'A'
+// keywordSet is a map of upper-case keywords indexed by length, so a token is
+// tested against the few words of its own length by isKw rather than folded and
+// hashed. A word longer than byLen holds is looked up in the map.
+type keywordSet struct {
+	m     map[string]bool
+	byLen [16][]string
+	long  bool // some word is too long for byLen
+}
+
+func newKeywordSet(m map[string]bool) *keywordSet {
+	s := &keywordSet{m: m}
+	for kw := range m {
+		if len(kw) < len(s.byLen) {
+			s.byLen[len(kw)] = append(s.byLen[len(kw)], kw)
+		} else {
+			s.long = true
 		}
-		b[i] = c
 	}
-	return m[string(b)]
+	return s
+}
+
+// in reports s.m[t.upper()].
+func (t token) in(s *keywordSet) bool {
+	if len(t.text) >= len(s.byLen) {
+		return s.long && s.m[t.upper()]
+	}
+	for _, kw := range s.byLen[len(t.text)] {
+		if t.isKw(kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // asciiUpper folds a-z to uppercase; every other byte is unchanged. Returns s
