@@ -660,16 +660,13 @@ func (e *vmEmitArm) text(pc int, in VInsn) {
 // orderedText leaves the flags as a signed compare of r[B]'s TEXT with
 // r[A]'s would: their bytes up to the shorter's length (zero-extended, so a
 // signed compare orders them unsigned), then their lengths, as bytes.Compare
-// orders them. It goes on to tail.
-func (e *vmEmitArm) orderedText(in VInsn, tail string) {
-	a, L := e.a, e.lay
+// orders them. X4 and X5 hold r[B]'s and r[A]'s lengths, X7 and X8 their
+// bytes. It goes on to tail.
+func (e *vmEmitArm) orderedText(tail string) {
+	a := e.a
 	loop, lens := e.vmLabel("ol"), e.vmLabel("on")
-	e.ldr(X4, in.B, L.OffS+8)
-	e.ldr(X5, in.A, L.OffS+8)
 	a.Cmp(X4, X5)
 	a.Csel(X6, X5, X4, CondG) // the shorter length
-	e.ldr(X7, in.B, L.OffS)
-	e.ldr(X8, in.A, L.OffS)
 	a.Label(loop)
 	a.Cbz(X6, lens)
 	a.LdrbImm(X9, X7, 0)

@@ -357,6 +357,20 @@ func vmIntCmp(in VInsn) VInsn {
 	return in
 }
 
+// textCmpIsInt reports whether a VTextCmpJump or VTextCmpSet whose operands
+// are known INTEGERs (intA, intB) is the INTEGER compare vmIntCmp makes. An
+// operand holding the IntText constant is one, but the other may be a TEXT
+// the compare reads it against as text.
+func textCmpIsInt(in VInsn, intA, intB bool) bool {
+	if k := in.IntText; k != nil {
+		if k.OnA {
+			return intB
+		}
+		return intA
+	}
+	return intA || intB
+}
+
 // VInsn is one instruction of a VM program: the one at its index's pc.
 type VInsn struct {
 	Op VOp
@@ -379,7 +393,40 @@ type VInsn struct {
 	Kernel *fir.Func
 	// Pat is VLike's pattern.
 	Pat *VLikePat
+	// IntText, on a VTextCmpJump or VTextCmpSet under TEXT affinity, is
+	// the INTEGER one operand is expected to hold (VMTextIntConst).
+	IntText *VIntText
 }
+
+// VIntText is a TEXT compare's operand expected to hold an INTEGER, which
+// under TEXT affinity is compared with a TEXT as its decimal text: where it
+// holds ProgArgs.IntTexts[Slot]'s K, the compare reads that slot's text.
+// Any other value leaves the compare to the VDBE as before.
+type VIntText struct {
+	OnA  bool // the operand is A, else B
+	Slot int
+}
+
+// VIntTextSlot is one INTEGER and its decimal text, which the engine fills
+// at every entry. Ok is zero where there is none: the compare exits.
+type VIntTextSlot struct {
+	K    int64
+	Text unsafe.Pointer
+	Len  int64
+	Ok   int64
+}
+
+// Byte offsets of VIntTextSlot's fields and its size, asserted by
+// TestProgArgsLayout.
+const (
+	VIntTextOffK    = 0
+	VIntTextOffText = 8
+	VIntTextOffLen  = 16
+	VIntTextOffOk   = 24
+	VIntTextSize    = 32
+	// MaxIntTexts bounds the slots a program reads.
+	MaxIntTexts = 64
+)
 
 // VCursor is native code's view of one materialized cursor: the rows the
 // cursor holds, and its position. The engine fills it before every entry

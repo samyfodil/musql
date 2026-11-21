@@ -132,10 +132,21 @@ func (e *vmEmit) textCmp(pc int, in VInsn) {
 		}
 	}
 	text, loop, tail := e.vmLabel(), e.vmLabel(), e.vmLabel()
+	// kArm takes an operand holding the INTEGER constant IntText names, and
+	// another holding a TEXT.
+	k := in.IntText
+	var kArm Lbl
+	if k != nil {
+		kArm = e.vmLabel()
+	}
 	a.CmpMemDByte(RSI, e.d(in.A, L.OffTyp), L.TypInt)
 	a.JccL(CondNE, text)
 	a.CmpMemDByte(RSI, e.d(in.B, L.OffTyp), L.TypInt)
-	e.jccStub(CondNE, pc)
+	if k != nil && k.OnA {
+		a.JccL(CondNE, kArm)
+	} else {
+		e.jccStub(CondNE, pc)
+	}
 	a.MovRegMemD(RAX, RSI, e.d(in.B, L.OffI))
 	a.AluRegMemD(AluCmp, RAX, RSI, e.d(in.A, L.OffI))
 	a.JmpL(tail)
@@ -143,7 +154,11 @@ func (e *vmEmit) textCmp(pc int, in VInsn) {
 	a.CmpMemDByte(RSI, e.d(in.A, L.OffTyp), L.TypText)
 	e.jccStub(CondNE, pc)
 	a.CmpMemDByte(RSI, e.d(in.B, L.OffTyp), L.TypText)
-	e.jccStub(CondNE, pc)
+	if k != nil && !k.OnA {
+		a.JccL(CondNE, kArm)
+	} else {
+		e.jccStub(CondNE, pc)
+	}
 	a.CmpMemDByte(RDI, POffUTF16, 0)
 	e.jccStub(CondNE, pc)
 	if in.Imm&1 != 0 {
@@ -152,14 +167,49 @@ func (e *vmEmit) textCmp(pc int, in VInsn) {
 		e.numericTextExit(pc, in.B)
 		e.numericTextExit(pc, in.A)
 	}
+	// RAX and RCX are r[B]'s and r[A]'s lengths, RDX and R9 their bytes.
+	a.MovRegMemD(RAX, RSI, e.d(in.B, L.OffS+8))
+	a.MovRegMemD(RCX, RSI, e.d(in.A, L.OffS+8))
+	a.MovRegMemD(RDX, RSI, e.d(in.B, L.OffS))
+	a.MovRegMemD(R9, RSI, e.d(in.A, L.OffS))
+	if k != nil {
+		core := e.vmLabel()
+		a.JmpL(core)
+		a.Bind(kArm)
+		kr, other := in.A, in.B
+		if !k.OnA {
+			kr, other = in.B, in.A
+		}
+		if k.OnA {
+			a.CmpMemDByte(RSI, e.d(other, L.OffTyp), L.TypText)
+		} else {
+			a.CmpMemDByte(RSI, e.d(kr, L.OffTyp), L.TypInt)
+		}
+		e.jccStub(CondNE, pc)
+		off := int32(k.Slot * VIntTextSize)
+		a.MovRegMemD(R10, RDI, POffIntTexts)
+		a.CmpMemDImm8(R10, off+VIntTextOffOk, 0)
+		e.jccStub(CondE, pc)
+		a.MovRegMemD(RAX, R10, off+VIntTextOffK)
+		a.AluRegMemD(AluCmp, RAX, RSI, e.d(kr, L.OffI))
+		e.jccStub(CondNE, pc)
+		a.CmpMemDByte(RDI, POffUTF16, 0)
+		e.jccStub(CondNE, pc)
+		lenK, ptrK, lenO, ptrO := RCX, R9, RAX, RDX
+		if !k.OnA {
+			lenK, ptrK, lenO, ptrO = RAX, RDX, RCX, R9
+		}
+		a.MovRegMemD(lenK, R10, off+VIntTextOffLen)
+		a.MovRegMemD(ptrK, R10, off+VIntTextOffText)
+		a.MovRegMemD(lenO, RSI, e.d(other, L.OffS+8))
+		a.MovRegMemD(ptrO, RSI, e.d(other, L.OffS))
+		a.Bind(core)
+	}
 	if in.Cond != CondE && in.Cond != CondNE {
-		e.orderedText(in, tail)
+		e.orderedText(tail)
 	} else {
-		a.MovRegMemD(RAX, RSI, e.d(in.A, L.OffS+8))
-		a.AluRegMemD(AluCmp, RAX, RSI, e.d(in.B, L.OffS+8))
+		a.CmpRegReg(RAX, RCX)
 		a.JccL(CondNE, tail)
-		a.MovRegMemD(RDX, RSI, e.d(in.A, L.OffS))
-		a.MovRegMemD(R9, RSI, e.d(in.B, L.OffS))
 		a.Bind(loop)
 		a.TestRegReg(RAX, RAX)
 		a.JccL(CondE, tail)
@@ -208,20 +258,17 @@ func (e *vmEmit) textCmp(pc int, in VInsn) {
 }
 
 // orderedText leaves the flags as a signed compare of r[B]'s TEXT with
-// r[A]'s, both TEXT, would: their bytes unsigned up to the shorter's length,
-// then their lengths, as bytes.Compare orders them. It jumps to tail.
-func (e *vmEmit) orderedText(in VInsn, tail Lbl) {
-	a, L := e.a, e.lay
+// r[A]'s would: their bytes unsigned up to the shorter's length, then their
+// lengths, as bytes.Compare orders them. RAX and RCX hold r[B]'s and r[A]'s
+// lengths, RDX and R9 their bytes. It jumps to tail.
+func (e *vmEmit) orderedText(tail Lbl) {
+	a := e.a
 	loop, diff, lens, out := e.vmLabel(), e.vmLabel(), e.vmLabel(), e.vmLabel()
-	a.MovRegMemD(RAX, RSI, e.d(in.B, L.OffS+8))
-	a.MovRegMemD(RCX, RSI, e.d(in.A, L.OffS+8))
 	a.MovqXR(X0, RAX)
 	a.MovqXR(X1, RCX)
 	a.MovRegReg(R10, RAX)
 	a.CmpRegReg(R10, RCX)
 	a.Cmovcc(CondG, R10, RCX) // the shorter length
-	a.MovRegMemD(RDX, RSI, e.d(in.B, L.OffS))
-	a.MovRegMemD(R9, RSI, e.d(in.A, L.OffS))
 	a.Bind(loop)
 	a.TestRegReg(R10, R10)
 	a.JccL(CondE, lens)

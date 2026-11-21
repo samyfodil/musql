@@ -40,9 +40,29 @@ func TestProgArgsLayout(t *testing.T) {
 		{"TextLen", unsafe.Offsetof(p.TextLen), POffTextLen},
 		{"LikeCS", unsafe.Offsetof(p.LikeCS), POffLikeCS},
 		{"InSets", unsafe.Offsetof(p.InSets), POffInSets},
+		{"IntTexts", unsafe.Offsetof(p.IntTexts), POffIntTexts},
 	} {
 		if c.got != c.want {
 			t.Errorf("ProgArgs.%s is at %d, generated code reads %d", c.name, c.got, c.want)
+		}
+	}
+}
+
+// TestVIntTextSlotLayout: native code reads VIntTextSlot at these offsets.
+func TestVIntTextSlotLayout(t *testing.T) {
+	var s VIntTextSlot
+	for _, c := range []struct {
+		name      string
+		got, want uintptr
+	}{
+		{"K", unsafe.Offsetof(s.K), VIntTextOffK},
+		{"Text", unsafe.Offsetof(s.Text), VIntTextOffText},
+		{"Len", unsafe.Offsetof(s.Len), VIntTextOffLen},
+		{"Ok", unsafe.Offsetof(s.Ok), VIntTextOffOk},
+		{"size", unsafe.Sizeof(s), VIntTextSize},
+	} {
+		if c.got != c.want {
+			t.Errorf("VIntTextSlot.%s is at %d, generated code reads %d", c.name, c.got, c.want)
 		}
 	}
 }

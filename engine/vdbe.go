@@ -64,6 +64,11 @@ type vdbe struct {
 	// jinsub is native code's view of the program's IN subquery sets
 	// (vmJIT.inSets), filled at each entry.
 	jinsub []jit.VInSubSet
+	// jIntTexts and jIntTextBuf are the INTEGERs and texts an entry hands
+	// native code (vmJIT.intTexts): a bound parameter's text is made in its
+	// slot's buffer.
+	jIntTexts   []jit.VIntTextSlot
+	jIntTextBuf [][20]byte
 	// jargs is the argument block of every entry into native code: kept on the
 	// machine and only its live fields set per entry, because zeroing a fresh
 	// one -- most of it the segment JIT's -- was a measurable share of a short

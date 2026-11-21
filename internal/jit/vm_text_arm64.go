@@ -128,12 +128,23 @@ func (e *vmEmitArm) textCmp(pc int, in VInsn) {
 		}
 	}
 	text, loop, tail := e.vmLabel("tt"), e.vmLabel("tl"), e.vmLabel("te")
+	// kArm takes an operand holding the INTEGER constant IntText names, and
+	// another holding a TEXT.
+	k := in.IntText
+	var kArm string
+	if k != nil {
+		kArm = e.vmLabel("tk")
+	}
 	e.ldrb(X9, in.A, L.OffTyp)
 	e.ldrb(X10, in.B, L.OffTyp)
 	a.CmpImm(X9, uint32(L.TypInt))
 	a.Bcond(CondNE, text)
 	a.CmpImm(X10, uint32(L.TypInt))
-	a.Bcond(CondNE, e.stub(pc))
+	if k != nil && k.OnA {
+		a.Bcond(CondNE, kArm)
+	} else {
+		a.Bcond(CondNE, e.stub(pc))
+	}
 	e.ldr(X9, in.B, L.OffI)
 	e.ldr(X10, in.A, L.OffI)
 	a.Cmp(X9, X10)
@@ -142,7 +153,11 @@ func (e *vmEmitArm) textCmp(pc int, in VInsn) {
 	a.CmpImm(X9, uint32(L.TypText))
 	a.Bcond(CondNE, e.stub(pc))
 	a.CmpImm(X10, uint32(L.TypText))
-	a.Bcond(CondNE, e.stub(pc))
+	if k != nil && !k.OnA {
+		a.Bcond(CondNE, kArm)
+	} else {
+		a.Bcond(CondNE, e.stub(pc))
+	}
 	a.LdrImm(X9, X0, POffUTF16)
 	a.Cbnz(X9, e.stub(pc))
 	if in.Imm&1 != 0 {
@@ -151,24 +166,59 @@ func (e *vmEmitArm) textCmp(pc int, in VInsn) {
 		e.numericTextExit(pc, in.B)
 		e.numericTextExit(pc, in.A)
 	}
+	// X4 and X5 are r[B]'s and r[A]'s lengths, X7 and X8 their bytes.
+	e.ldr(X4, in.B, L.OffS+8)
+	e.ldr(X5, in.A, L.OffS+8)
+	e.ldr(X7, in.B, L.OffS)
+	e.ldr(X8, in.A, L.OffS)
+	if k != nil {
+		core := e.vmLabel("tc")
+		a.B(core)
+		a.Label(kArm)
+		kr, other := in.A, in.B
+		if !k.OnA {
+			kr, other = in.B, in.A
+		}
+		if k.OnA {
+			a.CmpImm(X10, uint32(L.TypText))
+		} else {
+			a.CmpImm(X10, uint32(L.TypInt))
+		}
+		a.Bcond(CondNE, e.stub(pc))
+		off := k.Slot * VIntTextSize
+		a.LdrImm(X9, X0, POffIntTexts)
+		a.LdrImm(X10, X9, off+VIntTextOffOk)
+		a.Cbz(X10, e.stub(pc))
+		a.LdrImm(X10, X9, off+VIntTextOffK)
+		e.ldr(X6, kr, L.OffI)
+		a.Cmp(X6, X10)
+		a.Bcond(CondNE, e.stub(pc))
+		a.LdrImm(X10, X0, POffUTF16)
+		a.Cbnz(X10, e.stub(pc))
+		lenK, ptrK, lenO, ptrO := X5, X8, X4, X7
+		if !k.OnA {
+			lenK, ptrK, lenO, ptrO = X4, X7, X5, X8
+		}
+		a.LdrImm(lenK, X9, off+VIntTextOffLen)
+		a.LdrImm(ptrK, X9, off+VIntTextOffText)
+		e.ldr(lenO, other, L.OffS+8)
+		e.ldr(ptrO, other, L.OffS)
+		a.Label(core)
+	}
 	if in.Cond != CondE && in.Cond != CondNE {
-		e.orderedText(in, tail)
+		e.orderedText(tail)
 	} else {
-		e.ldr(X4, in.A, L.OffS+8)
-		e.ldr(X5, in.B, L.OffS+8)
 		a.Cmp(X4, X5)
 		a.Bcond(CondNE, tail)
-		e.ldr(X6, in.A, L.OffS)
-		e.ldr(X7, in.B, L.OffS)
 		a.Label(loop)
 		a.CmpImm(X4, 0)
 		a.Bcond(CondE, tail)
-		a.LdrbImm(X9, X6, 0)
-		a.LdrbImm(X10, X7, 0)
+		a.LdrbImm(X9, X7, 0)
+		a.LdrbImm(X10, X8, 0)
 		a.Cmp(X9, X10)
 		a.Bcond(CondNE, tail)
-		a.AddImm(X6, X6, 1)
 		a.AddImm(X7, X7, 1)
+		a.AddImm(X8, X8, 1)
 		a.SubsImm(X4, X4, 1)
 		a.B(loop)
 	}

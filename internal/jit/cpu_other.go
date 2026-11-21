@@ -20,6 +20,10 @@ const VMSegCursor = false
 // condition, and a numeric affinity's whole-number test (Imm 1).
 const VMTextOrder = false
 
+// VMTextIntConst reports whether VTextCmpJump and VTextCmpSet read an
+// operand holding their IntText constant as its text.
+const VMTextIntConst = false
+
 // VMRealInts reports whether VFAdd, VFSub and VFMul over two INTEGERs run the
 // INTEGER arm rather than exit.
 const VMRealInts = false

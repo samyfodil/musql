@@ -1058,7 +1058,7 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 	case VSubstr:
 		e.substr(pc, in)
 	case VTextCmpJump, VTextCmpSet:
-		if e.know.isInt.has(in.A) || e.know.isInt.has(in.B) {
+		if textCmpIsInt(in, e.know.isInt.has(in.A), e.know.isInt.has(in.B)) {
 			return e.insn(pc, vmIntCmp(in))
 		}
 		e.textCmp(pc, in)
