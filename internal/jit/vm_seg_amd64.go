@@ -1038,6 +1038,10 @@ func (e *vmEmit) sortSeek(pc int, in VInsn) {
 	a.SubRegReg(RDX, RAX)
 	a.MovMemDReg(R10, VCursorOffN, RDX)
 	a.MovMemDReg(R10, VCursorOffSLo, RAX)
+	// An empty run's pointers are the lists' starts: one at lo would point
+	// past the end when lo is N, into whatever the collector finds there.
+	a.TestRegReg(RDX, RDX)
+	a.Cmovcc(CondE, RAX, RDX)
 	a.MovRegMemD(RCX, R9, VSortOffIds)
 	a.LeaIdx(RCX, RCX, RAX)
 	a.MovMemDReg(R10, VCursorOffRids, RCX)

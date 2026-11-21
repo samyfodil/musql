@@ -54,10 +54,12 @@ type fixup struct {
 
 func NewAsm() *Asm { return &Asm{labels: map[string]int{}} }
 
-// newAsmFor is an encoder sized for a program of n instructions, whose code,
-// labels and jumps grow with it.
+// newAsmFor is an encoder sized for a program of n instructions, whose code and
+// jumps grow with it. Most labels are NewLabel numbers: a large program names
+// under one label per instruction, so the name map starts at n+16 and grows
+// when a small one names more.
 func newAsmFor(n int) *Asm {
-	return &Asm{buf: make([]byte, 0, 256*n+512), labels: make(map[string]int, 4*n), fixups: make([]fixup, 0, 4*n)}
+	return &Asm{buf: make([]byte, 0, 256*n+512), labels: make(map[string]int, n+16), fixups: make([]fixup, 0, 4*n)}
 }
 
 var asmPool sync.Pool
