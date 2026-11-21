@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -286,6 +287,11 @@ func openWrite(segPath string, wait time.Duration, prev *Session, before func([]
 		src.Close()
 		change.close()
 		return fail(lerr)
+	}
+	// The open already rendered this catalog as the file's sqlite_master; the
+	// session's first statement renders the same rows.
+	if segs := src.segs.byRoot[schemaRootPage]; len(segs) == 1 && !schemaSegSeedOffForTest {
+		db.schemaSeg, db.schemaSegKey = segs[0], schemaRowsFingerprint(src.schemaRows)
 	}
 	// Opening the schema loads its statistics (sqlite3InitOne ->
 	// sqlite3AnalysisLoad): what sqlite_stat1 holds NOW is what plans use until
@@ -2359,6 +2365,7 @@ func (db *DB) noteCommittedColumnsStale() {
 func (db *DB) cachedSchemaSegment(rows []SchemaRow) (*segment, error) {
 	key := schemaRowsFingerprint(rows)
 	if db.schemaSeg != nil && db.schemaSegKey == key {
+		schemaSegHits.Add(1)
 		return db.schemaSeg, nil
 	}
 	seg, err := buildSchemaSegment(rows)
@@ -2368,6 +2375,13 @@ func (db *DB) cachedSchemaSegment(rows []SchemaRow) (*segment, error) {
 	db.schemaSeg, db.schemaSegKey = seg, key
 	return seg, nil
 }
+
+// schemaSegSeedOffForTest leaves the session's catalog segment unseeded at
+// open; schemaSegHits counts the statements served a rendered one.
+var (
+	schemaSegSeedOffForTest bool
+	schemaSegHits           atomic.Int64
+)
 
 // buildSegSource is the read source a statement sees: the live row store behind
 // every table, the committed column blocks beside it, and the catalog rendered
