@@ -72,6 +72,17 @@ func (s *Server) sweepDeleted(ctx context.Context, now time.Time) error {
 		if now.Before(at) {
 			continue
 		}
+		// Marked first, so a restore that won the race keeps its files and
+		// none after can bring back a database whose files are gone.
+		if !d.Expired {
+			err := s.store.ExpireDeletedDatabase(ctx, d.ID)
+			if errors.Is(err, state.ErrNotFound) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+		}
 		s.removeFiles(&d.Database)
 		if !purge(at) {
 			continue
@@ -86,7 +97,19 @@ func (s *Server) sweepDeleted(ctx context.Context, now time.Time) error {
 		if err != nil {
 			return err
 		}
-		if now.Before(at) || !purge(at) {
+		if now.Before(at) {
+			continue
+		}
+		if !g.Expired {
+			err := s.store.ExpireDeletedGroup(ctx, g.ID)
+			if errors.Is(err, state.ErrNotFound) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+		}
+		if !purge(at) {
 			continue
 		}
 		if err := s.store.PurgeDeletedGroup(ctx, g.ID); err != nil && !errors.Is(err, state.ErrNotFound) {
@@ -128,13 +151,13 @@ func (s databaseService) ListDeleted(ctx context.Context, req *connect.Request[v
 	keep, now := s.retention(ctx, o), time.Now()
 	resp := &v1.ListDeletedResponse{}
 	for _, d := range dbs {
-		if exp := d.DeletedAt.Add(keep); now.Before(exp) {
+		if exp := d.DeletedAt.Add(keep); now.Before(exp) && !d.Expired {
 			resp.Databases = append(resp.Databases, &v1.DeletedDatabase{Database: s.deletedToProto(ctx, o, d),
 				DeletedAt: stamp(d.DeletedAt), ExpiresAt: stamp(exp), DeletedWithGroup: d.DeletedWith})
 		}
 	}
 	for _, g := range groups {
-		if exp := g.DeletedAt.Add(keep); now.Before(exp) {
+		if exp := g.DeletedAt.Add(keep); now.Before(exp) && !g.Expired {
 			resp.Groups = append(resp.Groups, &v1.DeletedGroup{Group: groupToProto(o, &g.Group), DeletedAt: stamp(g.DeletedAt), ExpiresAt: stamp(exp)})
 		}
 	}
@@ -233,6 +256,8 @@ func (s *Server) reopen(ctx context.Context, d *state.Database) {
 
 func (s *Server) restoreDeletedErr(ctx context.Context, err error, groupID string) error {
 	switch {
+	case errors.Is(err, state.ErrExpired):
+		return errExpired
 	case errors.Is(err, state.ErrExists):
 		return connect.NewError(connect.CodeAlreadyExists, errors.New("the name is taken: restore it under new_name"))
 	case errors.Is(err, state.ErrGroupDeleted):

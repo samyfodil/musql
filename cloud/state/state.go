@@ -363,6 +363,10 @@ var migrations = []string{
 		delete_protection INTEGER NOT NULL DEFAULT 0,
 		deleted_at INTEGER NOT NULL
 	);`,
+	// A deleted record past its retention, whose files a sweep may have
+	// removed: it is never restored, even if the retention grows.
+	`ALTER TABLE deleted_databases ADD COLUMN expired INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE deleted_groups ADD COLUMN expired INTEGER NOT NULL DEFAULT 0;`,
 }
 
 func (s *Store) migrate() error {

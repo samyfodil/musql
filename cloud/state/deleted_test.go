@@ -136,3 +136,73 @@ func TestSoftDeleteAndRestore(t *testing.T) {
 		t.Fatalf("a purged group's locations: %d %v", n, err)
 	}
 }
+
+// TestExpiredStaysDeleted: once a sweep marks a deleted database or group
+// past its retention, it is never restored, and a restore that came first
+// makes the mark miss, so the sweep keeps the files.
+func TestExpiredStaysDeleted(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	u, err := s.CreateUser(ctx, "a@example.com", "A", HashPassword("pw"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	org, err := s.CreateOrg(ctx, "acme", "Acme", u.ID, "fra")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := s.CreateGroup(ctx, org.ID, "eu", "fra", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Database{OrgID: org.ID, Name: "a", GroupID: g.ID}
+	b := &Database{OrgID: org.ID, Name: "b", GroupID: g.ID}
+	for _, d := range []*Database{a, b} {
+		if err := s.CreateDatabase(ctx, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := s.SoftDeleteDatabase(ctx, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ExpireDeletedDatabase(ctx, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := s.DeletedDatabaseByID(ctx, a.ID); err != nil || !d.Expired {
+		t.Fatalf("expired: %+v %v", d, err)
+	}
+	if _, err := s.RestoreDatabase(ctx, a.ID, ""); !errors.Is(err, ErrExpired) {
+		t.Fatalf("restore an expired database: %v", err)
+	}
+
+	if err := s.SoftDeleteDatabase(ctx, b.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RestoreDatabase(ctx, b.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ExpireDeletedDatabase(ctx, b.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expire a database restored first: %v", err)
+	}
+
+	// A group whose database expired comes back with none of them.
+	if _, err := s.DeleteGroup(ctx, g.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ExpireDeletedDatabase(ctx, b.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.RestoreGroup(ctx, g.ID, ""); !errors.Is(err, ErrExpired) {
+		t.Fatalf("restore a group holding an expired database: %v", err)
+	}
+	if _, err := s.DeletedGroupByID(ctx, g.ID); err != nil {
+		t.Fatalf("a refused group restore moved the group: %v", err)
+	}
+	if err := s.ExpireDeletedGroup(ctx, g.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.RestoreGroup(ctx, g.ID, ""); !errors.Is(err, ErrExpired) {
+		t.Fatalf("restore an expired group: %v", err)
+	}
+}

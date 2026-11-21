@@ -121,6 +121,28 @@ func TestDeleteKeepsUntilRetention(t *testing.T) {
 	}
 }
 
+// TestExpiredNotRestored: a deleted database a cluster node's sweep marked
+// past its retention, which keeps its record a while after removing its
+// files, is neither listed nor restored when the retention grows.
+func TestExpiredNotRestored(t *testing.T) {
+	e := newEnv(t, "deleted_retention: 2h\n")
+	e.setup()
+	ctx := context.Background()
+	_, _, dbs := e.clients()
+	id := must(dbs.Get(ctx, auth(e.admin, &v1.GetDatabaseRequest{Org: "acme", Name: "app"}))).Msg.Database.Id
+	must(dbs.Delete(ctx, auth(e.admin, &v1.DeleteDatabaseRequest{Org: "acme", Name: "app"})))
+	if err := e.s.Store().ExpireDeletedDatabase(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	e.s.deletedRetention = func(context.Context, *state.Org) time.Duration { return 30 * 24 * time.Hour }
+	if l := must(dbs.ListDeleted(ctx, auth(e.admin, &v1.ListDeletedRequest{Org: "acme"}))).Msg; len(l.Databases) != 0 {
+		t.Fatalf("an expired database listed: %v", l)
+	}
+	if _, err := dbs.RestoreDeleted(ctx, auth(e.admin, &v1.RestoreDeletedRequest{Org: "acme", Id: id})); code(err) != connect.CodeNotFound {
+		t.Fatalf("restore an expired database: %v", err)
+	}
+}
+
 // TestDeleteProtection: a protected database or group is refused, and so is
 // the org holding it.
 func TestDeleteProtection(t *testing.T) {

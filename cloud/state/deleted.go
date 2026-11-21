@@ -11,13 +11,19 @@ import (
 // deleted: the group comes back first.
 var ErrGroupDeleted = errors.New("state: its group is deleted")
 
+// ErrExpired is returned when restoring a database or group past its
+// retention (Expire...).
+var ErrExpired = errors.New("state: deleted too long ago")
+
 // DeletedDatabase is a deleted database's record, kept until its org's
 // retention for deleted databases ends. DeletedWith is the group it was
-// deleted with, "" when it was deleted alone.
+// deleted with, "" when it was deleted alone. Expired is set once a sweep
+// found it past its retention.
 type DeletedDatabase struct {
 	Database
 	DeletedAt   time.Time
 	DeletedWith string
+	Expired     bool
 }
 
 // DeletedGroup is a deleted group's record. Its locations stay in
@@ -25,14 +31,17 @@ type DeletedDatabase struct {
 type DeletedGroup struct {
 	Group
 	DeletedAt time.Time
+	Expired   bool
 }
 
-const deletedDBCols = dbCols + `, deleted_at, deleted_with`
+const deletedDBCols = dbCols + `, deleted_at, deleted_with, expired`
+
+const deletedGroupCols = groupCols + `, deleted_at, expired`
 
 // moveDatabases moves the databases where matches to deleted_databases,
 // stamped now and with the group they go with.
 func moveDatabases(tx *sql.Tx, with, where string, args ...any) error {
-	if _, err := tx.Exec(`INSERT INTO deleted_databases (`+deletedDBCols+`) SELECT `+dbCols+`, ?, ? FROM databases WHERE `+where,
+	if _, err := tx.Exec(`INSERT INTO deleted_databases (`+dbCols+`, deleted_at, deleted_with) SELECT `+dbCols+`, ?, ? FROM databases WHERE `+where,
 		append([]any{now(), with}, args...)...); err != nil {
 		return err
 	}
@@ -105,7 +114,7 @@ func scanDeletedDatabase(r scanner) (*DeletedDatabase, error) {
 	var d DeletedDatabase
 	var parentAt, created, deleted int64
 	if err := r.Scan(&d.ID, &d.OrgID, &d.Name, &d.GroupID, &d.Parent, &parentAt, &d.SchemaOnly, &d.TokenGen, &created, &d.File, &d.Type, &d.Durability,
-		&d.DeleteProtection, &d.BlockReads, &d.BlockWrites, &deleted, &d.DeletedWith); err != nil {
+		&d.DeleteProtection, &d.BlockReads, &d.BlockWrites, &deleted, &d.DeletedWith, &d.Expired); err != nil {
 		return nil, notFound(err)
 	}
 	d.ParentAt, d.CreatedAt, d.DeletedAt = unix(parentAt), unix(created), unix(deleted)
@@ -139,7 +148,7 @@ func (s *Store) DeletedDatabaseByID(ctx context.Context, id string) (*DeletedDat
 func scanDeletedGroup(r scanner) (*DeletedGroup, error) {
 	var g DeletedGroup
 	var created, deleted int64
-	if err := r.Scan(&g.ID, &g.OrgID, &g.Name, &g.Primary, &g.TokenGen, &created, &g.Type, &g.DeleteProtection, &deleted); err != nil {
+	if err := r.Scan(&g.ID, &g.OrgID, &g.Name, &g.Primary, &g.TokenGen, &created, &g.Type, &g.DeleteProtection, &deleted, &g.Expired); err != nil {
 		return nil, notFound(err)
 	}
 	g.CreatedAt, g.DeletedAt = unix(created), unix(deleted)
@@ -149,7 +158,7 @@ func scanDeletedGroup(r scanner) (*DeletedGroup, error) {
 // DeletedGroups lists an org's deleted groups, or every org's when orgID is
 // "".
 func (s *Store) DeletedGroups(ctx context.Context, orgID string) ([]*DeletedGroup, error) {
-	rows, err := s.q().QueryContext(ctx, `SELECT `+groupCols+`, deleted_at FROM deleted_groups WHERE ? = '' OR org_id = ? ORDER BY deleted_at DESC, name`, orgID, orgID)
+	rows, err := s.q().QueryContext(ctx, `SELECT `+deletedGroupCols+` FROM deleted_groups WHERE ? = '' OR org_id = ? ORDER BY deleted_at DESC, name`, orgID, orgID)
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +185,7 @@ func (s *Store) DeletedGroups(ctx context.Context, orgID string) ([]*DeletedGrou
 
 // DeletedGroupByID returns a deleted group.
 func (s *Store) DeletedGroupByID(ctx context.Context, id string) (*DeletedGroup, error) {
-	g, err := scanDeletedGroup(s.q().QueryRowContext(ctx, `SELECT `+groupCols+`, deleted_at FROM deleted_groups WHERE id = ?`, id))
+	g, err := scanDeletedGroup(s.q().QueryRowContext(ctx, `SELECT `+deletedGroupCols+` FROM deleted_groups WHERE id = ?`, id))
 	if err != nil {
 		return nil, err
 	}
@@ -184,13 +193,14 @@ func (s *Store) DeletedGroupByID(ctx context.Context, id string) (*DeletedGroup,
 }
 
 // restoreDatabaseTx moves a deleted database back under name, with a new
-// token generation so no token from before reaches it.
+// token generation so no token from before reaches it. An expired one stays.
 func restoreDatabaseTx(tx *sql.Tx, id, name string) error {
-	if _, err := tx.Exec(`INSERT INTO databases (`+dbCols+`) SELECT id, org_id, ?, group_id, parent, parent_at, schema_only, token_gen + 1, created_at,
-		file, type, durability, delete_protection, block_reads, block_writes FROM deleted_databases WHERE id = ?`, name, id); err != nil {
-		if isUnique(err) {
-			return ErrExists
-		}
+	err := one(tx.Exec(`INSERT INTO databases (`+dbCols+`) SELECT id, org_id, ?, group_id, parent, parent_at, schema_only, token_gen + 1, created_at,
+		file, type, durability, delete_protection, block_reads, block_writes FROM deleted_databases WHERE id = ? AND expired = 0`, name, id))
+	if errors.Is(err, ErrNotFound) {
+		return ErrExpired
+	}
+	if err != nil {
 		return err
 	}
 	return one(tx.Exec(`DELETE FROM deleted_databases WHERE id = ?`, id))
@@ -203,6 +213,9 @@ func (s *Store) RestoreDatabase(ctx context.Context, id, name string) (*Database
 		d, err := scanDeletedDatabase(tx.QueryRow(`SELECT `+deletedDBCols+` FROM deleted_databases WHERE id = ?`, id))
 		if err != nil {
 			return err
+		}
+		if d.Expired {
+			return ErrExpired
 		}
 		var n int
 		if err := tx.QueryRow(`SELECT count(*) FROM groups WHERE id = ?`, d.GroupID).Scan(&n); err != nil {
@@ -229,9 +242,12 @@ func (s *Store) RestoreGroup(ctx context.Context, id, name string) (*Group, []*D
 	var ids []string
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		ids = nil
-		g, err := scanDeletedGroup(tx.QueryRow(`SELECT `+groupCols+`, deleted_at FROM deleted_groups WHERE id = ?`, id))
+		g, err := scanDeletedGroup(tx.QueryRow(`SELECT `+deletedGroupCols+` FROM deleted_groups WHERE id = ?`, id))
 		if err != nil {
 			return err
+		}
+		if g.Expired {
+			return ErrExpired
 		}
 		if name == "" {
 			name = g.Name
@@ -290,6 +306,18 @@ func (s *Store) RestoreGroup(ctx context.Context, id, name string) (*Group, []*D
 		dbs = append(dbs, d)
 	}
 	return g, dbs, nil
+}
+
+// ExpireDeletedDatabase marks a deleted database past its retention, before
+// its files are removed, so it is never restored after; ErrNotFound when it
+// was restored or purged meanwhile.
+func (s *Store) ExpireDeletedDatabase(ctx context.Context, id string) error {
+	return one(s.exec(ctx, `UPDATE deleted_databases SET expired = 1 WHERE id = ?`, id))
+}
+
+// ExpireDeletedGroup is ExpireDeletedDatabase for a group.
+func (s *Store) ExpireDeletedGroup(ctx context.Context, id string) error {
+	return one(s.exec(ctx, `UPDATE deleted_groups SET expired = 1 WHERE id = ?`, id))
 }
 
 // PurgeDeletedDatabase forgets a deleted database for good.
