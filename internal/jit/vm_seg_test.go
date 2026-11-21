@@ -57,53 +57,58 @@ func TestVMSegColumn(t *testing.T) {
 		if dense {
 			seg.Dense = 1
 		}
-		for c := range cols {
-			for row := range n {
-				regs := make([]tvalue, 2)
-				regs[0] = tvalue{Typ: tvInt, I: 77}
-				cur := &VCursor{N: n, Pos: int64(row), Last: -1, Ok: 1, Mask: 1<<6 - 1, Seg: unsafe.Pointer(seg)}
-				pc := runVMCursor(t, []VInsn{{Op: VColumn, A: 0, B: c, C: 0, Imm: 1}, {Op: VExit}}, regs, nil, cur, 0)
-				want, exits := tvalue{}, false
-				switch c {
-				case 0:
-					want = tvalue{Typ: tvInt, I: ints[row]}
-					if row == 4 {
-						want = tvalue{Typ: tvNull}
+		// Cursor and register 1 as well as 0: the read is shared by every
+		// column, which hands it both.
+		for at := range 2 {
+			for c := range cols {
+				for row := range n {
+					regs := make([]tvalue, 2)
+					regs[at] = tvalue{Typ: tvInt, I: 77}
+					curs := make([]VCursor, 2)
+					curs[at] = VCursor{N: n, Pos: int64(row), Last: -1, Ok: 1, Mask: 1<<6 - 1, Seg: unsafe.Pointer(seg)}
+					pc := runVMCursor(t, []VInsn{{Op: VColumn, A: at, B: c, C: at, Imm: 1}, {Op: VExit}}, regs, nil, &curs[0], 0)
+					want, exits := tvalue{}, false
+					switch c {
+					case 0:
+						want = tvalue{Typ: tvInt, I: ints[row]}
+						if row == 4 {
+							want = tvalue{Typ: tvNull}
+						}
+					case 1:
+						want, exits = tvalue{Typ: tvReal, F: floats[row]}, row == 1
+					case 2:
+						if f := nums[row]; f == math.Trunc(f) && math.Abs(f) <= 1<<53 {
+							want = tvalue{Typ: tvInt, I: int64(f)}
+						} else {
+							want = tvalue{Typ: tvReal, F: f}
+						}
+					case 3:
+						want = tvalue{Typ: tvReal, F: float64(ints[row])}
+					case 4:
+						want = tvalue{Typ: tvInt, I: int64(rowids[row])}
+						if dense {
+							want.I = 100 + int64(row)
+						}
+					case 5:
+						want = tvalue{Typ: tvText, S: heap[bounds[row]:bounds[row+1]]}
+					case 6:
+						exits = true
 					}
-				case 1:
-					want, exits = tvalue{Typ: tvReal, F: floats[row]}, row == 1
-				case 2:
-					if f := nums[row]; f == math.Trunc(f) && math.Abs(f) <= 1<<53 {
-						want = tvalue{Typ: tvInt, I: int64(f)}
-					} else {
-						want = tvalue{Typ: tvReal, F: f}
+					if exits {
+						if pc != 0 || regs[at].Typ != tvInt || regs[at].I != 77 {
+							t.Fatalf("col %d row %d: pc %d r%d %+v, want an exit leaving it", c, row, pc, at, regs[at])
+						}
+						continue
 					}
-				case 3:
-					want = tvalue{Typ: tvReal, F: float64(ints[row])}
-				case 4:
-					want = tvalue{Typ: tvInt, I: int64(rowids[row])}
-					if dense {
-						want.I = 100 + int64(row)
+					got := regs[at]
+					same := pc == 1 && got.Typ == want.Typ && got.I == want.I && math.Float64bits(got.F) == math.Float64bits(want.F) &&
+						string(got.S) == string(want.S) && len(got.S) == cap(got.S)
+					if same && want.Typ == tvText && len(want.S) > 0 && &got.S[0] != &heap[bounds[row]] {
+						same = false
 					}
-				case 5:
-					want = tvalue{Typ: tvText, S: heap[bounds[row]:bounds[row+1]]}
-				case 6:
-					exits = true
-				}
-				if exits {
-					if pc != 0 || regs[0].Typ != tvInt || regs[0].I != 77 {
-						t.Fatalf("col %d row %d: pc %d r0 %+v, want an exit leaving r0", c, row, pc, regs[0])
+					if !same {
+						t.Fatalf("dense %v cursor %d col %d row %d: pc %d got %+v, want %+v", dense, at, c, row, pc, got, want)
 					}
-					continue
-				}
-				got := regs[0]
-				same := pc == 1 && got.Typ == want.Typ && got.I == want.I && math.Float64bits(got.F) == math.Float64bits(want.F) &&
-					string(got.S) == string(want.S) && len(got.S) == cap(got.S)
-				if same && want.Typ == tvText && len(want.S) > 0 && &got.S[0] != &heap[bounds[row]] {
-					same = false
-				}
-				if !same {
-					t.Fatalf("dense %v col %d row %d: pc %d got %+v, want %+v", dense, c, row, pc, got, want)
 				}
 			}
 		}
