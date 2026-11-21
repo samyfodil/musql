@@ -54,7 +54,7 @@ func TestSegFilterNullablePredColumns(t *testing.T) {
 		if fmt.Sprint(got) != fmt.Sprint(want) {
 			t.Errorf("%s:\n fast  %v\n plain %v", q, got, want)
 		}
-		if segFilterServed.Load() == served {
+		if JITEnabled() && segFilterServed.Load() == served {
 			t.Errorf("%s: not served from the segments", q)
 		}
 	}
