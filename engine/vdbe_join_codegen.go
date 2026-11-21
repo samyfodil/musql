@@ -3356,12 +3356,11 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 	consts = append(consts, c.existsHoist...)
 	var constJumps []int
 	for _, cj := range consts {
-		c.inWhereConjunct = true
-		reg, err := c.compileExpr(cj)
+		js, err := c.whereFalseJumps(cj)
 		if err != nil {
 			return err
 		}
-		constJumps = append(constJumps, c.emit(Instruction{Op: OpIfNot, P1: reg, P3: 1}))
+		constJumps = append(constJumps, js...)
 	}
 	halt := planJoinHalt(srcs, plan)
 	if halt != nil {
@@ -3571,7 +3570,7 @@ func (c *compiler) emitJoinLevel(srcs []joinSource, plan joinPlan, level int, bo
 	}
 
 	// emitBucket compiles this level's pushed-down WHERE conjuncts as pruning
-	// tests, returning the OpIfNot jump addresses for the caller to patch to
+	// tests, returning the jump addresses for the caller to patch to
 	// this level's Next. A conjunct that evaluates false/NULL skips straight
 	// to this table's next row.
 	emitBucket := func() ([]int, error) {
@@ -3584,12 +3583,11 @@ func (c *compiler) emitJoinLevel(srcs []joinSource, plan joinPlan, level int, bo
 			// by planJoinPushdown/joinPushdownPlan. It is exactly the WhereClause
 			// membership whereexpr.c's tag-20220128a guards on ("pWC->op==TK_AND")
 			// -- see compiler.inWhereConjunct's doc comment.
-			c.inWhereConjunct = true
-			reg, err := c.compileExpr(cj)
+			js, err := c.whereFalseJumps(cj)
 			if err != nil {
 				return nil, err
 			}
-			jumps = append(jumps, c.emit(Instruction{Op: OpIfNot, P1: reg, P3: 1}))
+			jumps = append(jumps, js...)
 		}
 		return jumps, nil
 	}

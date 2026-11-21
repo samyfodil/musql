@@ -2669,24 +2669,23 @@ func (db *DB) compileDeleteStmt(stmt *deleteStmt, trig *trigCompileCtx) (*Progra
 	rewind := c.emit(Instruction{Op: OpRewind, P1: 0})
 	loopTop := c.here()
 
-	whereJump := -1
+	var whereJumps []int
 	if loopWhere != nil {
 		// stmt.where is this DELETE's own top-level WHERE clause -- delete.c:526
 		// feeds it to sqlite3WhereBegin exactly as a SELECT's WHERE is, so it is
 		// the same WhereClause tag-20220128a's "pWC->op==TK_AND" guard sees. See
 		// compiler.inWhereConjunct's doc comment.
-		c.inWhereConjunct = true
 		// ...and it is coded INSIDE the scan loop, cursor 0 standing on the
 		// candidate row, so a CORRELATED subquery beneath it may read that
 		// cursor as its live outer source. See vdbe_write_rowlive.go for the
 		// same delete.c:526 citation read the other way round.
 		undoRowLive := c.whereSpan()
-		wReg, werr := c.compileExpr(loopWhere)
+		var werr error
+		whereJumps, werr = c.whereFalseJumps(loopWhere)
 		undoRowLive()
 		if werr != nil {
 			return nil, werr
 		}
-		whereJump = c.emit(Instruction{Op: OpIfNot, P1: wReg, P3: 1}) // false/NULL -> skip to OpNext
 	}
 	// DELETE RETURNING reads the pre-delete row, captured here while the cursor is
 	// on it and emitted at the AFTER-trigger position below. With triggers,
@@ -2749,8 +2748,8 @@ func (db *DB) compileDeleteStmt(stmt *deleteStmt, trig *trigCompileCtx) (*Progra
 		rp.skipAddr = c.here() // BEFORE RAISE(IGNORE) abandons this delete -> row end
 	}
 	nextAddr := c.here()
-	if whereJump >= 0 {
-		c.patch(whereJump, nextAddr)
+	for _, j := range whereJumps {
+		c.patch(j, nextAddr)
 	}
 	if goneJump >= 0 {
 		// delete.c's iLabel, resolved at the END of sqlite3GenerateRowDelete:
@@ -3108,23 +3107,22 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 	// synthetic join SELECT's own WHERE (update.c:222-223 dups it into it), and
 	// update.c:642's "if( nChangeFrom==0 && sqlite3ResolveExprNames(&sNC,
 	// pWhere) )" is where the C stops resolving it against the target at all.
-	whereJump := -1
+	var whereJumps []int
 	if loopWhere != nil {
 		// stmt.where is this UPDATE's own top-level WHERE clause -- update.c:742/
 		// 1273 feeds it to sqlite3WhereBegin exactly as a SELECT's WHERE is, so it
 		// is the same WhereClause tag-20220128a's "pWC->op==TK_AND" guard sees.
 		// See compiler.inWhereConjunct's doc comment.
-		c.inWhereConjunct = true
 		// ...and, like a SELECT's, it is coded inside the scan loop with cursor
 		// 0 standing on the candidate row, so a CORRELATED subquery beneath it
 		// may read that cursor. See vdbe_write_rowlive.go.
 		undoRowLive := c.whereSpan()
-		wReg, werr := c.compileExpr(loopWhere)
+		var werr error
+		whereJumps, werr = c.whereFalseJumps(loopWhere)
 		undoRowLive()
 		if werr != nil {
 			return nil, werr
 		}
-		whereJump = c.emit(Instruction{Op: OpIfNot, P1: wReg, P3: 1})
 	}
 
 	// Re-seek the real table before reading the row (update.c:875), so OLD.* and
@@ -3388,8 +3386,8 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 	for _, rp := range rowPlans {
 		rp.skipAddr = nextAddr
 	}
-	if whereJump >= 0 {
-		c.patch(whereJump, nextAddr)
+	for _, j := range whereJumps {
+		c.patch(j, nextAddr)
 	}
 	if scanReseek >= 0 {
 		c.patch(scanReseek, nextAddr) // update.c:877's labelContinue

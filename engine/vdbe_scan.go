@@ -701,7 +701,7 @@ func compileScanPlain(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols 
 		// jumping straight past the rest of this body (patched in once that
 		// address is known), exactly like a non-matching row never reaching
 		// OFFSET/LIMIT/the select-list in an ordinary per-row scan.
-		whereJump := -1
+		var whereJumps []int
 		if deferredWhere != nil {
 			// deferredWhere is andConjuncts of plan.deferred -- itself a set of
 			// genuine top-level WHERE AND-conjuncts (splitTopLevelAnd, join.go)
@@ -710,12 +710,11 @@ func compileScanPlain(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols 
 			// ("pWC->op==TK_AND"); compileAndOr's re-arming (if deferredWhere is
 			// itself an AND) recurses this down to each real leaf conjunct. See
 			// compiler.inWhereConjunct's doc comment.
-			c.inWhereConjunct = true
-			wReg, werr := c.compileExpr(deferredWhere)
+			var werr error
+			whereJumps, werr = c.whereFalseJumps(deferredWhere)
 			if werr != nil {
 				return werr
 			}
-			whereJump = c.emit(Instruction{Op: OpIfNot, P1: wReg, P3: 1})
 		}
 
 		// DISTINCT: compute the select list now (needed to test distinctness
@@ -789,8 +788,8 @@ func compileScanPlain(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols 
 		}
 
 		bodyEnd := c.here()
-		if whereJump >= 0 {
-			c.patch(whereJump, bodyEnd)
+		for _, j := range whereJumps {
+			c.patch(j, bodyEnd)
 		}
 		if distinctJump >= 0 {
 			c.patch(distinctJump, bodyEnd)
