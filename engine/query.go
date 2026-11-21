@@ -47,6 +47,19 @@ type resolvedTable struct {
 	// segPlans caches segColPlansFor: the per-column read rules a lazy segment
 	// read applies, which are properties of the table alone.
 	segPlans atomic.Pointer[[]segColPlan]
+
+	// colIdx caches buildColIndex(cols) for every scope built over this table.
+	colIdx atomic.Pointer[map[string]int]
+}
+
+// colIndex is buildColIndex(t.cols), built once per table.
+func (t *resolvedTable) colIndex() map[string]int {
+	if m := t.colIdx.Load(); m != nil {
+		return *m
+	}
+	m := buildColIndex(t.cols)
+	t.colIdx.Store(&m)
+	return m
 }
 
 // sqlTextTableIsWithoutRowid reports whether a CREATE TABLE ends in a top-level
