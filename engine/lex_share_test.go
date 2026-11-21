@@ -49,12 +49,12 @@ func TestLexSharedTokens(t *testing.T) {
 	}
 }
 
-// TestLexMidTextShared: a statement too long for lexKept and too short for
-// lexLast, lexed as given and trimmed by turns, as the classifiers and the
+// TestLexMidTextShared: a statement too long for lexKept and up to
+// lexLongMax, lexed as given and trimmed by turns, as the classifiers and the
 // parser lex it, is lexed once in each spelling: every later lex hands back
 // the first one's tokens, which are a fresh lex's, with no spare capacity.
 func TestLexMidTextShared(t *testing.T) {
-	for _, n := range []int{lexKeepMax + 1, 8 << 10, lexShareMin - 1} {
+	for _, n := range []int{lexKeepMax + 1, 8 << 10, lexShareMin - 1, lexShareMin, 64 << 10, lexLongMax} {
 		body := "SELECT " + strings.Repeat("a1 + b2, ", n/9)
 		body = body[:n-len("x FROM t \n")] + "x FROM t"
 		given := body + " \n"

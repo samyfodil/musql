@@ -147,6 +147,13 @@ var lexLast = &lexSlots{slots: make([]atomic.Pointer[lexEntry], 1)}
 // given, which would take turns in one.
 var lexMid = &lexSlots{slots: make([]atomic.Pointer[lexEntry], 4)}
 
+// lexLong is lexLast for a text up to lexLongMax, with a slot for each of the
+// two spellings. Over it the one slot stays, so at most one text's tokens of
+// megabytes are held.
+var lexLong = &lexSlots{slots: make([]atomic.Pointer[lexEntry], 2)}
+
+const lexLongMax = 1 << 20
+
 type lexSlots struct {
 	slots []atomic.Pointer[lexEntry]
 	next  atomic.Uint32
@@ -204,6 +211,9 @@ func lex(s string) ([]token, error) {
 	}
 	if len(s) < lexShareMin || len(s) > lexShareMax {
 		return lexUncached(s)
+	}
+	if len(s) <= lexLongMax {
+		return lexLong.lex(s)
 	}
 	return lexLast.lex(s)
 }
