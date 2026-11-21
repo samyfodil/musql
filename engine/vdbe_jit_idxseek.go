@@ -470,12 +470,7 @@ func buildTableSortedVMIdx(x *vmIdx, spec *idxSeekSpec) *vmIdx {
 	if nk > 4 || nk == 0 || len(t.at) > 1<<16 {
 		return x
 	}
-	type row struct {
-		k     [4]int64
-		nulls uint8
-		seg   uint16
-		r     int32
-	}
+	type row = sortedIdxRow
 	n := 0
 	for _, sg := range t.at {
 		n += sg.nRows
@@ -533,7 +528,7 @@ func buildTableSortedVMIdx(x *vmIdx, spec *idxSeekSpec) *vmIdx {
 		anyNull |= r.nulls
 	}
 	var scratch []row
-	for j := nk - 1; j >= 0; j-- {
+	pass := func(j int) {
 		rows, scratch = radixSortByKeyWith(rows, scratch, func(r row) int64 {
 			if r.nulls>>j&1 != 0 {
 				return 0
@@ -544,7 +539,74 @@ func buildTableSortedVMIdx(x *vmIdx, spec *idxSeekSpec) *vmIdx {
 			rows, scratch = radixSortByKeyWith(rows, scratch, func(r row) int64 { return int64(1 - r.nulls>>j&1) })
 		}
 	}
+	// The first key alone, then each run of rows it ties, in place by the
+	// rest (stable: rowid order stays within a tie) -- where its runs are
+	// short, which a key nearly unique to its row makes them. Otherwise a
+	// pass per key, as each is stable too.
+	pass(0)
+	if nk > 1 && !sortTiesByRest(rows, nk) {
+		for j := nk - 1; j >= 0; j-- {
+			pass(j)
+		}
+	}
 	return x.tableIndex(mask, len(rows), func(i int) (int, int, int64) { return int(rows[i].seg), int(rows[i].r), rows[i].k[0] })
+}
+
+// sortedIdxRow is a row of buildTableSortedVMIdx: its keys, the ones that
+// are NULL (bit j), and where it is.
+type sortedIdxRow struct {
+	k     [4]int64
+	nulls uint8
+	seg   uint16
+	r     int32
+}
+
+// sortTiesByRest sorts each run of rows the first of their nk keys ties by
+// the others, NULLs first, keeping each tie's order; or reports, having
+// changed nothing, that the runs are too long for that to beat a radix pass
+// per key.
+func sortTiesByRest(rows []sortedIdxRow, nk int) bool {
+	long := 0
+	for i := 0; i < len(rows); {
+		e := i + 1
+		for e < len(rows) && rows[e].k[0] == rows[i].k[0] {
+			e++
+		}
+		if e-i > 16 {
+			long += e - i
+		}
+		i = e
+	}
+	if long > len(rows)/8 {
+		return false
+	}
+	less := func(a, b *sortedIdxRow) bool {
+		for j := 1; j < nk; j++ {
+			an, bn := a.nulls>>j&1, b.nulls>>j&1
+			switch {
+			case an != bn:
+				return an > bn
+			case an != 0:
+				continue
+			case a.k[j] != b.k[j]:
+				return a.k[j] < b.k[j]
+			}
+		}
+		return false
+	}
+	for i := 0; i < len(rows); {
+		e := i + 1
+		for e < len(rows) && rows[e].k[0] == rows[i].k[0] {
+			e++
+		}
+		for a := i + 1; a < e; a++ {
+			for b := a; b > i && less(&rows[b], &rows[b-1]); b-- {
+				rows[b], rows[b-1] = rows[b-1], rows[b]
+			}
+		}
+		i = e
+	}
+	return true
 }
 
 // buildTableSortedVMIdxValues is buildTableSortedVMIdx over any columns: a
