@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -86,8 +87,6 @@ func TestSQLeanSuites(t *testing.T) {
 // sqleanSkip is the suite cases not reproduced, by "<suite>/<label>".
 var sqleanSkip = map[string]string{
 	"stats/08_24": "group_concat over a correlated table-valued function declines: its row order is not provably C's",
-
-	// The *_agg hash aggregates (crypto.sql sections 27-29).
 
 	// PCRE2 syntax Go's RE2 does not have (sqlean_regexp.go).
 	"regexp/01_05": "lookahead",
@@ -263,5 +262,169 @@ func TestDBStat(t *testing.T) {
 	}
 	if _, err := sqleanQuery(t, db, "SELECT name FROM pragma_module_list WHERE name = 'dbstat'"); err != nil {
 		t.Error(err)
+	}
+	// The schema and aggregate constraints as C SQLite answers them: the schema
+	// one is taken and never tested again, the aggregate one is tested against
+	// every row with NUMERIC affinity.
+	for _, c := range []struct{ q, want string }{
+		{"SELECT path, pagetype, pgoffset, pageno, schema, aggregate FROM dbstat('MAIN', 1) WHERE name = 'small'", "[NULL NULL NULL 1 'main' 1]"},
+		{"SELECT count(*) FROM dbstat WHERE aggregate = 'yes'", "[0]"},
+		{"SELECT count(*) FROM dbstat('main', 'yes')", "[0]"},
+		{"SELECT count(*) FROM dbstat('main', '1')", "[4]"},
+		{"SELECT count(*) FROM dbstat WHERE aggregate = '1'", "[4]"},
+		{"SELECT count(*) FROM dbstat('main', NULL)", "[0]"},
+		{"SELECT count(*) FROM dbstat('main', 2)", "[0]"},
+		{"SELECT count(*) = (SELECT count(*) FROM dbstat) FROM dbstat WHERE schema = 'MAIN'", "[1]"},
+		{"SELECT DISTINCT schema, aggregate FROM dbstat('Main')", "['main' 0]"},
+		{"SELECT count(*) FROM dbstat WHERE schema = 'nope'", "[0]"},
+		{"SELECT count(*) FROM dbstat('nope')", "[0]"},
+	} {
+		rows, err := sqleanQuery(t, db, c.q)
+		if err != nil {
+			t.Errorf("%s: %v", c.q, err)
+			continue
+		}
+		if got := dbstatRender(rows); got != c.want {
+			t.Errorf("%s = %s, want %s", c.q, got, c.want)
+		}
+	}
+	for _, q := range []string{
+		"SELECT count(*) FROM dbstat('temp')",
+		"SELECT count(*) FROM dbstat WHERE schema = 'temp'",
+	} {
+		if _, err := sqleanQuery(t, db, q); !errors.Is(err, errVDBEUnsupported) {
+			t.Errorf("%s: %v, want a decline", q, err)
+		}
+	}
+	if err := db.Exec("CREATE VIRTUAL TABLE elsewhere USING dbstat(nope)"); err == nil {
+		if _, err := sqleanQuery(t, db, "SELECT * FROM elsewhere"); err == nil || !strings.Contains(err.Error(), "no such database: nope") {
+			t.Errorf("dbstat(nope): %v", err)
+		}
+	}
+}
+
+func dbstatRender(rows [][]Value) string {
+	var out []string
+	for _, r := range rows {
+		var f []string
+		for _, v := range r {
+			switch v.Typ {
+			case Null:
+				f = append(f, "NULL")
+			case Text:
+				f = append(f, "'"+string(v.S)+"'")
+			default:
+				f = append(f, valueToText(v))
+			}
+		}
+		out = append(out, "["+strings.Join(f, " ")+"]")
+	}
+	return strings.Join(out, " ")
+}
+
+// TestRegexpReplaceEmptyMatches: regexp_replace replaces matches as
+// pcre2_substitute's global loop finds them (the answers are Python's re.sub,
+// which loops the same way), an empty match right after another match
+// included; where PCRE2 would retry an empty match's place for a non-empty one
+// that exists, it declines.
+func TestRegexpReplaceEmptyMatches(t *testing.T) {
+	withSQLean(t, "regexp")
+	db, err := Create(filepath.Join(t.TempDir(), "r.musq"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, c := range [][3]string{
+		{"abc", "b*", "-a--c-"},
+		{"abxd", "x*", "-a-b--d-"},
+		{"", "x*", "-"},
+		{"aaa", "a*", "--"},
+		{"ab cd", `\b`, "-ab- -cd-"},
+		{"héllo", "l*", "-h-é--o-"},
+		{"a\nb", "(?m)^", "-a\n-b"},
+		{"xay", "a|", "-x--y-"},
+		{"abc", "b", "a-c"},
+	} {
+		q := fmt.Sprintf("SELECT regexp_replace(replace('%s', '\\n', char(10)), '%s', '-')", c[0], c[1])
+		rows, err := sqleanQuery(t, db, q)
+		if err != nil {
+			t.Errorf("%s: %v", q, err)
+			continue
+		}
+		if got, want := string(rows[0][0].S), strings.ReplaceAll(c[2], `\n`, "\n"); got != want {
+			t.Errorf("%s = %q, want %q", q, got, want)
+		}
+	}
+	if rows, err := sqleanQuery(t, db, `SELECT regexp_replace('abc', '(b*)', '<$1>')`); err != nil || string(rows[0][0].S) != "<>a<b><>c<>" {
+		t.Errorf("groups of empty matches: %v %v", rows, err)
+	}
+	for _, c := range [][2]string{{"b", "|b"}, {"ab", "b??"}} {
+		q := fmt.Sprintf("SELECT regexp_replace('%s', '%s', '-')", c[0], c[1])
+		if _, err := sqleanQuery(t, db, q); !errors.Is(err, errVDBEUnsupported) {
+			t.Errorf("%s: %v, want a decline", q, err)
+		}
+	}
+}
+
+// TestRegisteredAggregateOrderRisk: where the compiler could not prove the
+// rows arrive in C SQLite's order (orderStrict), a registered aggregate whose
+// result depends on that order declines once two contributions differ, and
+// one that sorts its rows does not.
+func TestRegisteredAggregateOrderRisk(t *testing.T) {
+	withSQLean(t, "crypto", "stats")
+	a, b := Value{Typ: Text, S: []byte("a")}, Value{Typ: Text, S: []byte("b")}
+	one, two := Value{Typ: Int, I: 1}, Value{Typ: Int, I: 2}
+	for _, c := range []struct {
+		name  string
+		vals  []Value
+		risky bool
+	}{
+		{"md5_agg", []Value{a, a, a}, false},
+		{"md5_agg", []Value{a, b}, true},
+		{"sha256_agg", []Value{b, a}, true},
+		{"stddev", []Value{one, two}, true},
+		{"stddev", []Value{two, two}, false},
+		{"median", []Value{two, one, two}, false},
+	} {
+		it := &aggItem{aggItemPlan: &aggItemPlan{kind: aggUDF, udaf: udafs[c.name], orderStrict: true}}
+		it.rowRegs[aggExprArg] = 1
+		for _, v := range c.vals {
+			if err := it.stepUDF(nil, []Value{v}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := it.orderRiskErr(); (err != nil) != c.risky {
+			t.Errorf("%s over %v: %v, want risky=%v", c.name, c.vals, err, c.risky)
+		}
+	}
+}
+
+// TestRegisterSQLeanTakenName: a family whose function name is already taken
+// registers nothing, of it or of the families named with it, so registering
+// without it afterwards succeeds.
+func TestRegisterSQLeanTakenName(t *testing.T) {
+	sf, nc, uf, ua := maps.Clone(supportedFuncs), maps.Clone(nonConstantFuncs), maps.Clone(udfs), maps.Clone(udafs)
+	reg, rows, mods := maps.Clone(sqleanRegistered), sqleanFuncRows, sqleanModuleNames
+	t.Cleanup(func() {
+		for _, m := range sqleanModuleNames[len(mods):] {
+			unregisterVtabModule(m)
+		}
+		supportedFuncs, nonConstantFuncs, udfs, udafs = sf, nc, uf, ua
+		sqleanRegistered, sqleanFuncRows, sqleanModuleNames = reg, rows, mods
+	})
+	if err := RegisterFunction(ScalarFunction{Name: "md5", NArg: 1, Fn: func([]Value) (Value, error) { return Value{}, nil }}); err != nil {
+		t.Fatal(err)
+	}
+	if err := RegisterSQLean("stats", "crypto"); err == nil || !strings.Contains(err.Error(), "md5 is already a function") {
+		t.Fatalf("RegisterSQLean(stats, crypto) = %v", err)
+	}
+	if udafs["median"] != nil || supportedFuncs["sqlean_version"] || len(sqleanFuncRows) != len(rows) {
+		t.Fatal("a failed RegisterSQLean registered some of its functions")
+	}
+	if err := RegisterSQLean("stats"); err != nil {
+		t.Fatalf("RegisterSQLean(stats) after the failure: %v", err)
+	}
+	if udafs["median"] == nil || !supportedFuncs["sqlean_version"] {
+		t.Fatal("RegisterSQLean(stats) registered nothing")
 	}
 }

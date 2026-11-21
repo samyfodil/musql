@@ -1,6 +1,6 @@
 // sqlean's crypto family (src/crypto/extension.c): hash functions returning
-// BLOBs, and encode/decode over base32, base64, base85, hex and url. The
-// *_agg aggregates are not provided.
+// BLOBs, each also as a *_agg aggregate over its rows, and encode/decode over
+// base32, base64, base85, hex and url.
 package engine
 
 import (

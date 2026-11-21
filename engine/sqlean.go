@@ -46,8 +46,11 @@ type sqleanAggregate struct {
 	lo, hi int
 	// plain is an aggregate registered without xValue and xInverse, which is
 	// no window function.
-	plain  bool
-	newAgg func() udfAggState
+	plain bool
+	// orderFree is an aggregate whose result does not depend on the order of
+	// its rows (a percentile sorts them).
+	orderFree bool
+	newAgg    func() udfAggState
 }
 
 // sqleanFamily is what one family registers.
@@ -89,9 +92,36 @@ func RegisterSQLean(families ...string) error {
 	if len(families) == 0 {
 		families = SQLeanFamilies()
 	}
+	// Every name is checked before any is registered, so a taken one leaves
+	// nothing half registered and a retry without it can succeed.
+	taken := func(name string) error {
+		if supportedFuncs[name] || isAggregateFuncName(name) {
+			return fmt.Errorf("engine: %s is already a function", name)
+		}
+		return nil
+	}
+	if len(sqleanRegistered) == 0 {
+		if err := taken("sqlean_version"); err != nil {
+			return err
+		}
+	}
 	for _, name := range families {
-		if sqleanFamilies[strings.ToLower(name)] == nil {
+		fam := sqleanFamilies[strings.ToLower(name)]
+		if fam == nil {
 			return fmt.Errorf("engine: no sqlean family %q (have %s)", name, strings.Join(SQLeanFamilies(), ", "))
+		}
+		if sqleanRegistered[strings.ToLower(name)] {
+			continue
+		}
+		for _, f := range fam.scalars {
+			if err := taken(f.name); err != nil {
+				return err
+			}
+		}
+		for _, a := range fam.aggs {
+			if err := taken(a.name); err != nil {
+				return err
+			}
 		}
 	}
 	if len(sqleanRegistered) == 0 {

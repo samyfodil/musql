@@ -201,6 +201,9 @@ type aggItem struct {
 	haveBest bool
 	vec1     *vec1TrainState // vec1_train's training vectors and options
 	udf      udfAggState     // a registered aggregate's state
+	// udfFirst is a registered aggregate's first arguments, kept only when
+	// orderStrict is set (see orderRisk).
+	udfFirst []Value
 	// gc is group_concat's and the JSON groups' running text (aggConcat).
 	gc *aggConcat
 
@@ -2416,8 +2419,21 @@ func (it *aggItem) stepUDF(ctx *evalCtx, regs []Value) error {
 		if v.Typ == Null {
 			return nil
 		}
-		if _, dup := it.distinctSeen(v, it.argCollation(ctx), ctx.encoding()); dup {
+		if s, dup := it.distinctSeen(v, it.argCollation(ctx), ctx.encoding()); dup {
+			// As in step: which spelling survives is the arrival order's.
+			if it.orderStrict && !valuesIdentical(v, s) {
+				it.orderRisk = true
+			}
 			return nil
+		}
+	}
+	// An aggregate that depends on the order (a hash of the concatenation, a
+	// running variance's rounding) sees it only once two contributions differ.
+	if it.orderStrict && !it.udaf.orderFree {
+		if it.udfFirst == nil {
+			it.udfFirst = append([]Value{}, args[:n]...)
+		} else if !valuesAllIdentical(args[:n], it.udfFirst) {
+			it.orderRisk = true
 		}
 	}
 	return it.udfState().Step(args[:n])

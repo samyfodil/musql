@@ -11,10 +11,10 @@ import (
 
 func init() {
 	perc := func(name string, p float64) sqleanAggregate {
-		return sqleanAggregate{name: name, lo: 1, hi: 1, newAgg: func() udfAggState { return &statsPerc{fixed: true, p: p, hasP: true} }}
+		return sqleanAggregate{name: name, lo: 1, hi: 1, orderFree: true, newAgg: func() udfAggState { return &statsPerc{fixed: true, p: p, hasP: true} }}
 	}
 	percN := func(name string) sqleanAggregate {
-		return sqleanAggregate{name: name, lo: 2, hi: 2, newAgg: func() udfAggState { return &statsPerc{} }}
+		return sqleanAggregate{name: name, lo: 2, hi: 2, orderFree: true, newAgg: func() udfAggState { return &statsPerc{} }}
 	}
 	variance := func(name string, fn func(statsVariance) (float64, bool)) sqleanAggregate {
 		return sqleanAggregate{name: name, lo: 1, hi: 1, newAgg: func() udfAggState { return &statsVarAgg{fn: fn} }}

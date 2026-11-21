@@ -15,6 +15,7 @@ package engine
 import (
 	"fmt"
 	"regexp"
+	"regexp/syntax"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,7 +47,8 @@ func regexpText(v Value) (string, bool) {
 // auxdata.
 var regexpCache struct {
 	sync.Mutex
-	m map[string]*regexp.Regexp
+	m          map[string]*regexp.Regexp
+	positional map[*regexp.Regexp]*regexpPos
 }
 
 // regexpCompile compiles a pattern, or refuses it with sqlean's "invalid
@@ -161,7 +163,7 @@ func regexpCapture(args []Value) (Value, error) {
 	if !ok {
 		return sqleanNull, nil
 	}
-	group := 0
+	var group int64
 	if len(args) == 3 {
 		g := args[2]
 		if g.Typ == Blob {
@@ -171,13 +173,13 @@ func regexpCapture(args []Value) (Value, error) {
 		if !ok || !isInt || n < 0 {
 			return Value{}, fmt.Errorf("invalid group: %s", valueToText(g))
 		}
-		group = int(min(n, 1<<32-1))
+		group = n
 	}
 	re, ok, err := regexpCompile(args[1])
 	if !ok {
 		return sqleanNull, err
 	}
-	if group > re.NumSubexp() {
+	if group > int64(re.NumSubexp()) {
 		return Value{}, fmt.Errorf("invalid group: %s", valueToText(args[2]))
 	}
 	m := re.FindStringSubmatchIndex(s)
@@ -206,15 +208,143 @@ func regexpReplace(args []Value) (Value, error) {
 	}
 	var out strings.Builder
 	last := 0
-	for _, m := range re.FindAllStringSubmatchIndex(s, -1) {
+	if !regexpNullable(re) {
+		// No match is empty, and then Go's matches are PCRE2's.
+		for _, m := range re.FindAllStringSubmatchIndex(s, -1) {
+			out.WriteString(s[last:m[0]])
+			if err := regexpExpand(&out, re, repl, s, m); err != nil {
+				return Value{}, err
+			}
+			last = m[1]
+		}
+		out.WriteString(s[last:])
+		return sqleanText(out.String()), nil
+	}
+	// pcre2_substitute's PCRE2_SUBSTITUTE_GLOBAL loop. Go's FindAll drops an
+	// empty match right after a match, which PCRE2 keeps ("b*" over "abc" is
+	// "-a--c-"); after an empty match PCRE2 retries at the same place for a
+	// non-empty one (PCRE2_NOTEMPTY_ATSTART | PCRE2_ANCHORED), which RE2 cannot
+	// pick, so where one exists this declines.
+	x, err := regexpPositional(re)
+	if err != nil {
+		return Value{}, err
+	}
+	for pos := 0; pos <= len(s); {
+		var m []int
+		if pos == 0 {
+			m = re.FindStringSubmatchIndex(s)
+		} else {
+			_, w := utf8.DecodeLastRuneInString(s[:pos])
+			if m = x.from.FindStringSubmatchIndex(s[pos-w:]); m != nil {
+				m = m[2:]
+				for i := range m {
+					if m[i] >= 0 {
+						m[i] += pos - w
+					}
+				}
+			}
+		}
+		if m == nil {
+			break
+		}
 		out.WriteString(s[last:m[0]])
 		if err := regexpExpand(&out, re, repl, s, m); err != nil {
 			return Value{}, err
 		}
-		last = m[1]
+		last, pos = m[1], m[1]
+		if m[0] != m[1] {
+			continue
+		}
+		if pos == len(s) {
+			break
+		}
+		w := 0
+		if pos > 0 {
+			_, w = utf8.DecodeLastRuneInString(s[:pos])
+		}
+		if n := x.at[min(w, 1)].FindStringIndex(s[pos-w:]); n != nil && n[1] > w {
+			return Value{}, fmt.Errorf("%w: regexp_replace(): an empty match where the pattern could also match a non-empty string", errVDBEUnsupported)
+		}
+		_, w = utf8.DecodeRuneInString(s[pos:])
+		pos += w
 	}
 	out.WriteString(s[last:])
 	return sqleanText(out.String()), nil
+}
+
+// regexpNullable reports whether re might match an empty string, counting
+// every assertion as one that holds.
+func regexpNullable(re *regexp.Regexp) bool {
+	t, err := syntax.Parse(re.String(), syntax.Perl)
+	return err != nil || syntaxNullable(t)
+}
+
+func syntaxNullable(t *syntax.Regexp) bool {
+	switch t.Op {
+	case syntax.OpNoMatch, syntax.OpCharClass, syntax.OpAnyChar, syntax.OpAnyCharNotNL:
+		return false
+	case syntax.OpLiteral:
+		return len(t.Rune) == 0
+	case syntax.OpCapture, syntax.OpPlus:
+		return syntaxNullable(t.Sub[0])
+	case syntax.OpRepeat:
+		return t.Min == 0 || syntaxNullable(t.Sub[0])
+	case syntax.OpConcat:
+		for _, s := range t.Sub {
+			if !syntaxNullable(s) {
+				return false
+			}
+		}
+		return true
+	case syntax.OpAlternate:
+		for _, s := range t.Sub {
+			if syntaxNullable(s) {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
+
+// regexpPositional is re searching from a position past the start of the
+// text, over the text from the rune before it: that rune is consumed first so
+// \b and (?m)^ see it, and the lazy run before group 1 makes group 1 the
+// leftmost match from the position, as PCRE2's start_offset finds it. at[w]
+// is re anchored after w runes (0 or 1), leftmost-longest, to ask whether a
+// non-empty match starts there.
+func regexpPositional(re *regexp.Regexp) (*regexpPos, error) {
+	regexpCache.Lock()
+	x := regexpCache.positional[re]
+	regexpCache.Unlock()
+	if x != nil {
+		return x, nil
+	}
+	p := re.String()
+	x = &regexpPos{}
+	var errs [3]error
+	x.from, errs[0] = regexp.Compile(`\A(?s:.)(?s:.*?)(` + p + `)`)
+	x.at[0], errs[1] = regexp.Compile(`\A(?:` + p + `)`)
+	x.at[1], errs[2] = regexp.Compile(`\A(?s:.)(?:` + p + `)`)
+	for _, err := range errs {
+		if err != nil {
+			return nil, fmt.Errorf("%w: regexp_replace(): %v", errVDBEUnsupported, err)
+		}
+	}
+	x.at[0].Longest()
+	x.at[1].Longest()
+	regexpCache.Lock()
+	if regexpCache.positional == nil || len(regexpCache.positional) >= 256 {
+		regexpCache.positional = map[*regexp.Regexp]*regexpPos{}
+	}
+	regexpCache.positional[re] = x
+	regexpCache.Unlock()
+	return x, nil
+}
+
+type regexpPos struct {
+	from *regexp.Regexp
+	at   [2]*regexp.Regexp
 }
 
 // regexpExpand writes repl for one match, in PCRE2's extended substitution
