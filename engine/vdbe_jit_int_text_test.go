@@ -140,6 +140,8 @@ func TestVMJITTextRealConst(t *testing.T) {
 		defer p.Close()
 		CountVMJITCursorEntersForTest(true)
 		defer CountVMJITCursorEntersForTest(false)
+		defer debug.SetGCPercent(debug.SetGCPercent(-1))
+		runtime.GC()
 		VMJITCursorEntersForTest()
 		if _, _, err := p.QueryArgs("SELECT id FROM t WHERE p BETWEEN 0.99 AND 1.49 ORDER BY id", nil); err != nil {
 			t.Fatal(err)
