@@ -132,8 +132,8 @@ func (e *vmEmit) textCmp(pc int, in VInsn) {
 		}
 	}
 	text, loop, tail := e.vmLabel(), e.vmLabel(), e.vmLabel()
-	// kArm takes an operand holding the INTEGER constant IntText names, and
-	// another holding a TEXT.
+	// kArm takes an operand holding the number IntText names, and another
+	// holding a TEXT.
 	k := in.IntText
 	var kArm Lbl
 	if k != nil {
@@ -152,7 +152,11 @@ func (e *vmEmit) textCmp(pc int, in VInsn) {
 	a.JmpL(tail)
 	a.Bind(text)
 	a.CmpMemDByte(RSI, e.d(in.A, L.OffTyp), L.TypText)
-	e.jccStub(CondNE, pc)
+	if k != nil && k.OnA {
+		a.JccL(CondNE, kArm)
+	} else {
+		e.jccStub(CondNE, pc)
+	}
 	a.CmpMemDByte(RSI, e.d(in.B, L.OffTyp), L.TypText)
 	if k != nil && !k.OnA {
 		a.JccL(CondNE, kArm)
@@ -182,16 +186,27 @@ func (e *vmEmit) textCmp(pc int, in VInsn) {
 		}
 		if k.OnA {
 			a.CmpMemDByte(RSI, e.d(other, L.OffTyp), L.TypText)
-		} else {
-			a.CmpMemDByte(RSI, e.d(kr, L.OffTyp), L.TypInt)
+			e.jccStub(CondNE, pc)
 		}
-		e.jccStub(CondNE, pc)
+		// The operand holds the slot's number: its kind, and the INTEGER or
+		// the REAL's bits.
 		off := int32(k.Slot * VIntTextSize)
+		isReal, same := e.vmLabel(), e.vmLabel()
 		a.MovRegMemD(R10, RDI, POffIntTexts)
-		a.CmpMemDImm8(R10, off+VIntTextOffOk, 0)
-		e.jccStub(CondE, pc)
-		a.MovRegMemD(RAX, R10, off+VIntTextOffK)
-		a.AluRegMemD(AluCmp, RAX, RSI, e.d(kr, L.OffI))
+		a.CmpMemDByte(RSI, e.d(kr, L.OffTyp), L.TypInt)
+		a.JccL(CondNE, isReal)
+		a.CmpMemDImm8(R10, off+VIntTextOffOk, VIntTextInt)
+		e.jccStub(CondNE, pc)
+		a.MovRegMemD(RAX, RSI, e.d(kr, L.OffI))
+		a.JmpL(same)
+		a.Bind(isReal)
+		a.CmpMemDByte(RSI, e.d(kr, L.OffTyp), L.TypFloat)
+		e.jccStub(CondNE, pc)
+		a.CmpMemDImm8(R10, off+VIntTextOffOk, VIntTextReal)
+		e.jccStub(CondNE, pc)
+		a.MovRegMemD(RAX, RSI, e.d(kr, L.OffF))
+		a.Bind(same)
+		a.AluRegMemD(AluCmp, RAX, R10, off+VIntTextOffK)
 		e.jccStub(CondNE, pc)
 		a.CmpMemDByte(RDI, POffUTF16, 0)
 		e.jccStub(CondNE, pc)
