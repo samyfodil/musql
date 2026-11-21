@@ -359,11 +359,16 @@ var pragmaColConstraintKws = newKeywordSet(pragmaColConstraintStart)
 // report it as sqlite_autoindex_<table>_<N>, origin='pk', even though no schema
 // row backs it (on the write side it is indexMeta.isTablePK).
 func parsePragmaTableDef(createSQL string) (*pragmaTableDef, error) {
-	withoutRowid := sqlTextTableIsWithoutRowid(createSQL)
 	toks, err := lex(createSQL)
 	if err != nil {
 		return nil, fmt.Errorf("parsing CREATE TABLE: %w", err)
 	}
+	return parsePragmaTableDefToks(createSQL, toks)
+}
+
+// parsePragmaTableDefToks is parsePragmaTableDef over createSQL's tokens.
+func parsePragmaTableDefToks(createSQL string, toks []token) (*pragmaTableDef, error) {
+	withoutRowid := sqlTextTableIsWithoutRowid(createSQL)
 	i := 0
 	kw := func(s string) bool {
 		if i < len(toks) && toks[i].kind == tkIdent && toks[i].upper() == s {

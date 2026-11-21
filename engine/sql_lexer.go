@@ -257,14 +257,40 @@ func lexKeep(s string) ([]token, error) {
 	return toks, nil
 }
 
+// scratchToks lends token buffers to parses whose results hold no token:
+// opening a database lexes every CREATE text once, and those tokens die with
+// the parse instead of being kept by lexKeep.
+var scratchToks = sync.Pool{New: func() any { return new([]token) }}
+
+// lexScratch lexes s into a pooled buffer; releaseScratch returns it once
+// nothing reads the tokens.
+func lexScratch(s string) ([]token, *[]token, error) {
+	b := scratchToks.Get().(*[]token)
+	toks, err := lexInto(*b, s)
+	return toks, b, err
+}
+
+func releaseScratch(b *[]token, toks []token) {
+	if cap(toks) > 1<<14 {
+		return
+	}
+	*b = toks[:0]
+	scratchToks.Put(b)
+}
+
 func lexUncached(s string) ([]token, error) {
 	// Pre-sized for typical SQL token density, capped: a statement made of
 	// long literals (rows of vector('[...]')) has far fewer tokens than its
 	// length suggests, and an uncapped guess zeroed megabytes per statement.
 	// append grows it past the cap when a statement needs more. TPC-H and
 	// TPC-DS queries and schemas run six to eight bytes a token.
+	return lexInto(make([]token, 0, min(len(s)/6, 4096)+8), s)
+}
+
+// lexInto is lexUncached appending to toks[:0].
+func lexInto(toks []token, s string) ([]token, error) {
+	toks = toks[:0]
 	n := len(s)
-	toks := make([]token, 0, min(n/6, 4096)+8)
 	i := 0
 
 	isIdentStart := func(c byte) bool {

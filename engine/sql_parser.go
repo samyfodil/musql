@@ -5290,6 +5290,12 @@ func parseCreateTableColumnsAndAutoIndexes(createSQL string, forceNoRowidAlias b
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("engine: parsing CREATE TABLE: %w", err)
 	}
+	return parseCreateTableToks(createSQL, toks, forceNoRowidAlias)
+}
+
+// parseCreateTableToks is parseCreateTableColumnsAndAutoIndexes over createSQL's
+// tokens. What it returns holds none of them.
+func parseCreateTableToks(createSQL string, toks []token, forceNoRowidAlias bool) ([]columnInfo, []checkConstraint, []autoIndexSpec, error) {
 	i := 0
 	kw := func(s string) bool {
 		if toks[i].kind == tkIdent && toks[i].upper() == s {
