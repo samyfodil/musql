@@ -4197,7 +4197,7 @@ func (p *parser) parsePrimary() (Expr, error) {
 
 	case t.kind == tkBlob:
 		p.next()
-		return LiteralExpr{Val: Value{Typ: Blob, S: t.blob}}, nil
+		return LiteralExpr{Val: Value{Typ: Blob, S: []byte(t.str)}}, nil
 
 	case t.kind == tkParam:
 		p.next()
