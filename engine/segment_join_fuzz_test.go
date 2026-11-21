@@ -24,7 +24,7 @@ func TestSegJoinFuzzMatchesLoop(t *testing.T) {
 	for seed := range seeds {
 		served += segJoinFuzzSeed(t, int64(seed))
 	}
-	if served == 0 {
+	if served == 0 && columnarOn() {
 		t.Fatal("the join kernel answered nothing")
 	}
 	t.Logf("kernel answered %d statements", served)

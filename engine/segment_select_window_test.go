@@ -62,7 +62,7 @@ func TestSegSelectWindowsMatchScan(t *testing.T) {
 			t.Fatalf("%s %v: got %d rows, want %d\n got %v\nwant %v", q, qa.args, len(got), len(want), got, want)
 		}
 	}
-	if selected == 0 {
+	if selected == 0 && columnarOn() {
 		t.Fatal("no query took the pre-filter, so nothing was tested")
 	}
 }

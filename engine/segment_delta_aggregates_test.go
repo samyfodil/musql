@@ -64,7 +64,7 @@ func TestColumnarAggregatesMergeTheDelta(t *testing.T) {
 	}
 	runs := segOnePassRuns.Load()
 	check("segments")
-	if segOnePassRuns.Load() == runs {
+	if columnarOn() && segOnePassRuns.Load() == runs {
 		t.Fatal("no statement's aggregates were answered in one pass")
 	}
 	// A table whose rows are all in the delta: no segment to correct, so a
@@ -140,7 +140,7 @@ func TestFilteredSumTextBounds(t *testing.T) {
 		s1, _ := SegFilterCountersForTest()
 		return s1 > s0
 	}
-	if !served(`SELECT sum(v) FROM t WHERE name > 'n2500'`) || !served(`SELECT sum(v) FROM t WHERE name > ?`, Value{Typ: Text, S: []byte("n2500")}) {
+	if columnarOn() && (!served(`SELECT sum(v) FROM t WHERE name > 'n2500'`) || !served(`SELECT sum(v) FROM t WHERE name > ?`, Value{Typ: Text, S: []byte("n2500")})) {
 		t.Fatal("a TEXT range was not answered from the segments")
 	}
 	if served(`SELECT sum(v) FROM t WHERE name = ?`, Value{Typ: Text, S: []byte("n2500")}) {

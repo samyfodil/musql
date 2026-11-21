@@ -7,7 +7,7 @@ import (
 )
 
 func TestConfigureJIT(t *testing.T) {
-	defer Configure()
+	defer restoreEnvConfig()
 	Configure(WithoutJIT())
 	if JITEnabled() || vmJITEnabled {
 		t.Fatal("WithoutJIT left a JIT on")

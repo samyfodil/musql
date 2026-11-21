@@ -68,7 +68,7 @@ func TestFlattenSeriesBesideSeries(t *testing.T) {
 		if got := seriesInts(t, p, q); len(got) != 1 || got[0] != 1000000 {
 			t.Errorf("%s = %v", q, got)
 		}
-		if ops := explainOps(t, p, q); !strings.Contains(ops, " SegProgram ") {
+		if ops := explainOps(t, p, q); engine.JITEnabled() && !strings.Contains(ops, " SegProgram ") {
 			t.Errorf("%s: not the series pair loop:%s", q, ops)
 		}
 	}

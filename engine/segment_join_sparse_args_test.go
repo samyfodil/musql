@@ -48,7 +48,7 @@ func TestSegJoinArgsOnPassingRows(t *testing.T) {
 	} {
 		before := segJoinArgsSparse.Load()
 		got := p.mustFast(q)
-		if segJoinArgsSparse.Load() == before {
+		if columnarOn() && segJoinArgsSparse.Load() == before {
 			t.Errorf("%s: no argument computed on the passing rows alone", q)
 		}
 		want := p.mustPlain(q)

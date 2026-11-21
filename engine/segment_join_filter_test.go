@@ -127,7 +127,7 @@ func TestSegJoinFiltersAgree(t *testing.T) {
 	p.delta("INSERT INTO l VALUES(9000, 3, 'MAIL', '1994-01-02', '1994-02-02', '1994-03-02', 9, 2.5, 'ab')",
 		"UPDATE l SET mode = 'SHIP' WHERE id % 5 = 0", "DELETE FROM l WHERE id % 7 = 0")
 	check("rows changed")
-	if segJoinFilterRestricted.Load() == restricted || segJoinPassReuses.Load() == reused {
+	if columnarOn() && (segJoinFilterRestricted.Load() == restricted || segJoinPassReuses.Load() == reused) {
 		t.Errorf("filters computed on some rows: %d, levels read back: %d", segJoinFilterRestricted.Load()-restricted, segJoinPassReuses.Load()-reused)
 	}
 }
@@ -176,7 +176,7 @@ func TestSegJoinClockFilterNotKept(t *testing.T) {
 				t.Errorf("%s, run %d:\n fast  %s\n plain %s", c.filter, run, got, want)
 			}
 		}
-		if kept := segJoinPassReuses.Load() != reused; kept != c.kept {
+		if kept := segJoinPassReuses.Load() != reused; kept != (c.kept && columnarOn()) {
 			t.Errorf("%s: kept %v, want %v", c.filter, kept, c.kept)
 		}
 	}

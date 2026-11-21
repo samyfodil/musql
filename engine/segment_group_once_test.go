@@ -25,7 +25,7 @@ func TestSegGroupOnceBoundsHoisted(t *testing.T) {
 		for _, q := range queries {
 			before := segFilterServed.Load()
 			got := p.mustFast(q)
-			if segFilterServed.Load() == before {
+			if columnarOn() && segFilterServed.Load() == before {
 				t.Errorf("%s %s: the walk did not serve it", stage, q)
 			}
 			want := p.mustPlain(q)

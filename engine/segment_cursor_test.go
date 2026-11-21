@@ -88,7 +88,7 @@ func TestSegLazyRowsMatchTheBtree(t *testing.T) {
 		SegRowsServedForTest()
 		gotCols, gotRows, gerr := col.QueryArgs(q, nil)
 		// A gate that passes because the path declined is no gate.
-		if n := SegRowsServedForTest(); (n > 0) != tc.lazy {
+		if n := SegRowsServedForTest(); columnarOn() && (n > 0) != tc.lazy {
 			t.Errorf("%s\n  served %d rows lazily, wanted lazy=%v (%s)", q, n, tc.lazy, tc.reason)
 		}
 		if (werr == nil) != (gerr == nil) {
@@ -237,7 +237,7 @@ func TestSegRowFilterNeverDropsARow(t *testing.T) {
 				q, len(want), want, len(got), got)
 		}
 	}
-	if filtered == 0 {
+	if filtered == 0 && columnarOn() {
 		t.Fatal("the pre-filter never fired -- this test proves nothing")
 	}
 	t.Logf("%d of %d queries went through the compiled pre-filter", filtered, len(qs))

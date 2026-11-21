@@ -16,7 +16,7 @@ func TestFusionAnswersAsUnfused(t *testing.T) {
 	if !JITEnabled() {
 		t.Skip("no JIT on this machine")
 	}
-	defer Configure()
+	defer restoreEnvConfig()
 	stmts := []string{`CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, w INTEGER, s TEXT)`}
 	rng := rand.New(rand.NewSource(11))
 	for i := 1; i <= 1500; i++ {
