@@ -762,6 +762,15 @@ func (s *segment) Float64Column(c int) ([]float64, bool) {
 	if s.cols[c].nullOff != 0 || s.hasException(c) {
 		return nil, false
 	}
+	return s.float64Block(c)
+}
+
+// float64Block is Float64Column without the NULL and exception gates, for a
+// caller that has dealt with both.
+func (s *segment) float64Block(c int) ([]float64, bool) {
+	if c < 0 || c >= len(s.cols) || s.cols[c].phys != PhysFloat64 || !segLittleEndian {
+		return nil, false
+	}
 	off := int(s.cols[c].blockOff)
 	if off == 0 || uintptr(unsafe.Pointer(&s.buf[off]))%8 != 0 {
 		return nil, false
