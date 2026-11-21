@@ -44,6 +44,15 @@ func TestRadixOrderInt64MatchesComparisonSort(t *testing.T) {
 			if got := radixOrderInt64(vals); !slices.Equal(got, want) {
 				t.Errorf("%s n=%d: radix order differs from the comparison sort", name, n)
 			}
+			sorted := slices.Clone(vals)
+			if got := radixSortInt64(sorted); !slices.Equal(got, want) {
+				t.Errorf("%s n=%d: radixSortInt64's order differs from the comparison sort", name, n)
+			}
+			for i, j := range want {
+				if sorted[i] != vals[j] {
+					t.Fatalf("%s n=%d: radixSortInt64 left %d at %d, want %d", name, n, sorted[i], i, vals[j])
+				}
+			}
 		}
 	}
 }

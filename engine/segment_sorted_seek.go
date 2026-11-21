@@ -419,10 +419,10 @@ func (p *ReadOnlyPager) segSortedRowsFor(cur *vdbeCursor, h *sortedSeekHint) *se
 		}
 		prevRid = sg.Rowid(sg.nRows - 1)
 	}
-	perm := radixOrderInt64(keys)
-	s.list, s.keys, s.seg, s.rows = slices.Clone(segs), make([]int64, len(perm)), make([]uint16, len(perm)), make([]int32, len(perm))
+	perm := radixSortInt64(keys)
+	s.list, s.keys, s.seg, s.rows = slices.Clone(segs), keys, make([]uint16, len(perm)), make([]int32, len(perm))
 	for i, j := range perm {
-		s.keys[i], s.seg[i], s.rows[i] = keys[j], kseg[j], krows[j]
+		s.seg[i], s.rows[i] = kseg[j], krows[j]
 	}
 	s.ok = true
 	return s
