@@ -21,7 +21,7 @@ import (
 const sqleanVersion = "0.28.4"
 
 // sqleanScalar is one sqlean scalar function: its name, the argument counts
-// it is registered with (lo..hi), and its body.
+// it is registered with (lo..hi, hi < 0 for any count), and its body.
 type sqleanScalar struct {
 	name   string
 	lo, hi int
@@ -128,19 +128,23 @@ func RegisterSQLean(families ...string) error {
 
 func registerSQLeanScalar(f sqleanScalar) error {
 	nArg := f.lo
-	if f.lo != f.hi {
+	if f.lo != f.hi || f.hi < 0 {
 		nArg = -1
 	}
+	ranged := f.lo != f.hi && f.hi >= 0
 	if err := RegisterFunction(ScalarFunction{Name: f.name, NArg: nArg, Deterministic: !f.volatile, Fn: f.fn}); err != nil {
 		return err
 	}
-	if f.lo != f.hi {
+	if ranged {
 		u := udfs[f.name]
 		u.ranged, u.lo, u.hi = true, f.lo, f.hi
 	}
 	flags := int64(2048) // SQLITE_DETERMINISTIC, as pragmaFunclistLine reports it
 	if f.volatile {
 		flags = 0
+	}
+	if f.hi < 0 {
+		sqleanFuncRows = append(sqleanFuncRows, pragmaFunctionListRow{f.name, 0, "s", "utf8", -1, flags})
 	}
 	for n := f.lo; n <= f.hi; n++ {
 		sqleanFuncRows = append(sqleanFuncRows, pragmaFunctionListRow{f.name, 0, "s", "utf8", int64(n), flags})

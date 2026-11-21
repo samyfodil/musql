@@ -100,7 +100,32 @@ var sqleanSkip = map[string]string{
 	"regexp/09_24": "(?x) extended mode",
 	"regexp/10_04": "\\b between Unicode word characters",
 	"regexp/10_05": "\\b between Unicode word characters",
+	// The engine cannot register a collation (sql_parser.go knows only BINARY,
+	// NOCASE and RTRIM), so text_nocase does not exist.
+	"text/45_01": "text_nocase collation",
+	"text/45_02": "text_nocase collation",
+	"text/45_03": "text_nocase collation",
+	"text/45_04": "text_nocase collation",
+	"text/45_05": "text_nocase collation",
+	"text/45_06": "text_nocase collation",
+	"text/45_07": "text_nocase collation",
+	"text/45_08": "text_nocase collation",
+	"text/45_09": "text_nocase collation",
+	"text/45_10": "text_nocase collation",
+	"text/45_11": "text_nocase collation",
+	"text/45_12": "text_nocase collation",
+	"text/45_13": "text_nocase collation",
+	"text/45_14": "text_nocase collation",
+	"text/45_15": "text_nocase collation",
+	"text/45_16": "text_nocase collation",
+	"text/71_41": "text_nocase collation",
+	"text/71_42": "text_nocase collation",
+	"text/71_43": "text_nocase collation",
+	"text/71_44": "text_nocase collation",
+	"text/71_45": "text_nocase collation",
 }
+
+var sqleanTrailingComment = regexp.MustCompile(`;\s+--.*$`)
 
 // sqleanStatements splits a suite into its statements: lines up to one
 // ending in ';', without comments and the shell's dot-commands.
@@ -109,6 +134,10 @@ func sqleanStatements(src string) []string {
 	var cur strings.Builder
 	for _, line := range strings.Split(src, "\n") {
 		trim := strings.TrimSpace(line)
+		if m := sqleanTrailingComment.FindString(trim); m != "" {
+			line = strings.TrimSuffix(trim, m) + ";"
+			trim = strings.TrimSpace(line)
+		}
 		if cur.Len() == 0 && (trim == "" || strings.HasPrefix(trim, "--") || strings.HasPrefix(trim, ".")) {
 			continue
 		}
