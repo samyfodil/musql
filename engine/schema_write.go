@@ -551,7 +551,7 @@ func finalizeAutoIncrement(name, createSQL string, withoutRowid bool, cols []col
 func detectAutoIncrementColumn(createSQL string) (colName string, ok bool, err error) {
 	// No token is AUTOINCREMENT in a text that does not spell it. Every caller
 	// has parsed this text already, so not lexing it hides no error.
-	if !hasWordFold(createSQL, "AUTOINCREMENT") {
+	if !r35aContainsFold(createSQL, "autoincrement") {
 		return "", false, nil
 	}
 	toks, lerr := lex(createSQL)
