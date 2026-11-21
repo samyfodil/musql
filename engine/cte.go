@@ -70,6 +70,10 @@ type cteBinding struct {
 	// no compound arm held, the same compileSelectScanRow call a run of the
 	// body makes (cteProbeForRun).
 	probeTop atomic.Pointer[Program]
+	// probeCounts is what the probe that found the body uncorrelated counted
+	// (view expansions, CTE references), when it counted anything: a later
+	// probe adds the same counts instead of compiling the body again.
+	probeCounts atomic.Pointer[refCounts]
 
 	name     string
 	colNames []string // explicit "(col, ...)" rename list; nil if none was given
@@ -479,6 +483,13 @@ func (p *ReadOnlyPager) cteProbeForRun(b *cteBinding, params []Value) *Program {
 var (
 	cteProbeRunOffForTest bool
 	cteProbeRuns          atomic.Int64
+)
+
+// cteProbeCountsOffForTest compiles every probe of a body that counted
+// something, and cteProbeCountReplays counts the probes counted instead.
+var (
+	cteProbeCountsOffForTest bool
+	cteProbeCountReplays     atomic.Int64
 )
 
 func applyCTEColNames(name string, colNames []string, cols []columnInfo, rows [][]Value) ([]columnInfo, [][]Value, error) {

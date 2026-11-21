@@ -1981,6 +1981,10 @@ func (p *ReadOnlyPager) resolveCorrelatedCTESource(c *compiler, state *joinDesug
 	if b.uncorrelated.Load() {
 		return joinSource{}, false, nil
 	}
+	if d := b.probeCounts.Load(); d != nil && !cteProbeCountsOffForTest && p.addRefCounts(d) {
+		cteProbeCountReplays.Add(1)
+		return joinSource{}, false, nil
+	}
 	p.cteExpansion = append(p.cteExpansion, cteExpansionFrame{name: cteName, b: b})
 	defer func() { p.cteExpansion = p.cteExpansion[:len(p.cteExpansion)-1] }()
 	// The body resolves in the scope where THIS CTE was DEFINED, exactly like
@@ -1990,6 +1994,7 @@ func (p *ReadOnlyPager) resolveCorrelatedCTESource(c *compiler, state *joinDesug
 
 	leave := p.enterFromBody()
 	counts := p.refCountSum()
+	was := p.refCountsNow()
 	barrier := derivedOuterBarrier(c)
 	armsFree := p.r41ArmsHeld == 0
 	prog, perr := compileSubProgram(p, b.core, barrier)
@@ -2011,6 +2016,8 @@ func (p *ReadOnlyPager) resolveCorrelatedCTESource(c *compiler, state *joinDesug
 					b.probeTop.Store(prog)
 				}
 			}
+		} else if perr == nil {
+			b.probeCounts.Store(p.refCountsSince(was))
 		}
 		return joinSource{}, false, nil
 	}
