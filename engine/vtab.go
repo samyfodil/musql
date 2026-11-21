@@ -490,6 +490,15 @@ func (p *ReadOnlyPager) materializeVtab(it FromItem, params []Value, outer *eval
 		return cols, rows, rowids, nil
 	}
 
+	// dbstat sizes this database's tables and indexes (vtab_dbstat.go).
+	if dt, isStat := tab.(dbstatTable); isStat {
+		rows, rowids, serr := dt.dbstatRows(p, info.IdxNum, argv)
+		if serr != nil {
+			return nil, nil, nil, serr
+		}
+		return cols, rows, rowids, nil
+	}
+
 	// vec1cat lists the connection's vec1 tables (vec1_cat.go).
 	if _, isCat := tab.(vec1CatTable); isCat {
 		rows, rowids, cerr := p.vec1CatRows()

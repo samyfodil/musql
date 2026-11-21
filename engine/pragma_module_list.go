@@ -50,8 +50,12 @@ func pragmaModuleListRows() []string {
 		merged = append(merged, names[4:]...)
 		names = merged
 	}
-	if len(sqleanModuleNames) > 0 {
-		names = append(names, sqleanModuleNames...)
+	extra := sqleanModuleNames
+	if _, ok := lookupVtabModule("dbstat"); ok {
+		extra = append(slices.Clip(extra), "dbstat")
+	}
+	if len(extra) > 0 {
+		names = append(names, extra...)
 		slices.Sort(names)
 	}
 	return names
