@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 )
 
 // An aggregate over an inner join, answered from the tables' column blocks.
@@ -46,14 +47,19 @@ func SegJoinHitsForTest() int64 { return segJoinHits.Swap(0) }
 // own terms alone (segJoinWalk.empty), for tests.
 var segJoinEmptyWalks atomic.Int64
 
+// segJoinBytesPasses counts level terms passingBytes compared on the
+// segments' packed cells, for tests.
+var segJoinBytesPasses atomic.Int64
+
 // segJoinPlan is what OpSegJoinAgg and OpSegJoinGroups carry: the loop's
 // levels and the columns they read, as the recogniser traced them out of the
 // program.
 type segJoinPlan struct {
-	cursors []int           // per level, outermost first
-	edges   []segJoinEdge   // the equalities joining the levels
-	preds   [][]segPlanPred // per level, its own WHERE terms
-	filters [][]segJoinArg  // per level, its other terms: true or the row is skipped
+	cursors []int                // per level, outermost first
+	edges   []segJoinEdge        // the equalities joining the levels
+	preds   [][]segPlanPred      // per level, its own WHERE terms
+	bounds  map[int]*segJoinExpr // segJoinLoop.bounds
+	filters [][]segJoinArg       // per level, its other terms: true or the row is skipped
 	// optional has bit i set for a level a LEFT JOIN makes optional: an
 	// outer row nothing there matches still joins, with that level's row all
 	// NULL.
@@ -1702,9 +1708,9 @@ func segJoinFilterRank(f segJoinArg) int {
 // segJoinPassKeepable reports whether a level's bounds and filters let the
 // same rows through on every run over the same rows: no parameter, register
 // or subquery bound, and no filter reading a parameter or a clock.
-func segJoinPassKeepable(preds []segPlanPred, fs []segJoinArg) bool {
+func segJoinPassKeepable(preds []segPlanPred, bounds map[int]*segJoinExpr, fs []segJoinArg) bool {
 	for _, p := range preds {
-		if p.ParamIdx != 0 || p.Reg != 0 || p.SubProg != nil {
+		if p.ParamIdx != 0 || p.SubProg != nil || p.Reg != 0 && (bounds[p.Reg] == nil || segJoinReadsClock(bounds[p.Reg])) {
 			return false
 		}
 	}
@@ -1717,6 +1723,34 @@ func segJoinPassKeepable(preds []segPlanPred, fs []segJoinArg) bool {
 		}
 	}
 	return true
+}
+
+// segJoinBounds is preds with each bound a once-block computes computed, on
+// private registers, as the loop's first row would compute it.
+func (m *vdbe) segJoinBounds(plan *segJoinPlan, preds []segPlanPred) ([]segPlanPred, bool) {
+	if !slices.ContainsFunc(preds, func(p segPlanPred) bool { return p.Reg != 0 }) {
+		return preds, true
+	}
+	preds = slices.Clone(preds)
+	vm := *m
+	vm.regs = make([]Value, len(m.regs))
+	vm.fnArgBuf, vm.likePlan = nil, nil
+	none := func(*Instruction) Value { return Value{Typ: Null} }
+	for j, p := range preds {
+		if p.Reg == 0 {
+			continue
+		}
+		e := plan.bounds[p.Reg]
+		if e == nil || p.Reg-1 >= len(vm.regs) {
+			return nil, false
+		}
+		v, ok := segJoinEvalRow(&vm, e, none, none, nil)
+		if !ok {
+			return nil, false
+		}
+		preds[j].Lit, preds[j].Reg = v, 0
+	}
+	return preds, true
 }
 
 // segJoinDateFuncs are the date and time functions: SQLITE_FUNC_SLOCHNG, a
@@ -2094,43 +2128,57 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 		}
 	}
 	w.pass = make([][]bool, k)
+	// What a level's terms let through is kept with its table, as an
+	// expression's values are, when no run can make it another.
+	keep, reused := make([]bool, k), make([]bool, k)
+	for i := range k {
+		var preds []segPlanPred
+		var fs []segJoinArg
+		if i < len(plan.preds) {
+			preds = plan.preds[i]
+		}
+		if i < len(plan.filters) {
+			fs = plan.filters[i]
+		}
+		if len(preds) == 0 && len(fs) == 0 || !segJoinPassKeepable(preds, plan.bounds, fs) {
+			continue
+		}
+		t := w.tabs[i]
+		t.mu.Lock()
+		kept, ok := t.passes[segJoinPassKey{plan, i, m.likeCaseSensitive()}]
+		t.mu.Unlock()
+		if ok {
+			segJoinPassReuses.Add(1)
+			w.pass[i], reused[i] = slices.Clone(kept), true
+		} else {
+			keep[i] = true
+		}
+	}
 	for i, preds := range plan.preds {
-		if len(preds) == 0 {
+		if len(preds) == 0 || reused[i] {
 			continue
 		}
 		// The bounds, resolved now that the parameters are bound, through the
 		// comparison's affinity as the loop applies it.
+		preds, ok := m.segJoinBounds(plan, preds)
+		if !ok {
+			return nil, false
+		}
 		resolved, ok := m.segPlanPreds(&segFilterPlan{preds: preds})
 		if !ok {
 			return nil, false
 		}
-		w.pass[i] = w.tabs[i].passing(preds, resolved)
+		w.pass[i] = w.tabs[i].passing(preds, resolved, m.encoding() == UTF8)
+		if keep[i] && (i >= len(plan.filters) || len(plan.filters[i]) == 0) {
+			w.tabs[i].keepPass(segJoinPassKey{plan, i, m.likeCaseSensitive()}, w.pass[i])
+		}
 	}
 	for i, fs := range plan.filters {
 		if w.noRow() {
 			break
 		}
-		if len(fs) == 0 {
+		if len(fs) == 0 || reused[i] {
 			continue
-		}
-		// What the level's filters let through is kept with its table, as an
-		// expression's values are, when no run can make it another.
-		passKey := segJoinPassKey{plan, i, m.likeCaseSensitive()}
-		var preds []segPlanPred
-		if i < len(plan.preds) {
-			preds = plan.preds[i]
-		}
-		keepPass := segJoinPassKeepable(preds, fs)
-		if keepPass {
-			t := w.tabs[i]
-			t.mu.Lock()
-			kept, ok := t.passes[passKey]
-			t.mu.Unlock()
-			if ok {
-				segJoinPassReuses.Add(1)
-				w.pass[i] = slices.Clone(kept)
-				continue
-			}
 		}
 		// Filters that cannot fail are computed only on the rows the ones
 		// before them let through: which rows are skipped changes no answer.
@@ -2171,14 +2219,8 @@ func (m *vdbe) openSegJoin(plan *segJoinPlan) (*segJoinWalk, bool) {
 			}
 			segJoinClearFailing(w.pass[i], vals)
 		}
-		if keepPass {
-			t := w.tabs[i]
-			t.mu.Lock()
-			if t.passes == nil {
-				t.passes = map[segJoinPassKey][]bool{}
-			}
-			t.passes[passKey] = slices.Clone(w.pass[i])
-			t.mu.Unlock()
+		if keep[i] {
+			w.tabs[i].keepPass(segJoinPassKey{plan, i, m.likeCaseSensitive()}, w.pass[i])
 		}
 	}
 	if w.noRow() {
@@ -2443,7 +2485,7 @@ func (w *segJoinWalk) each(at []int32, fn func() bool) bool {
 // bounds are resolved: the column's value through the comparison's affinity,
 // as the loop applies it to both sides, compared as the loop compares. A NULL
 // satisfies nothing.
-func (t *segJoinTable) passing(preds []segPlanPred, resolved []segPred) []bool {
+func (t *segJoinTable) passing(preds []segPlanPred, resolved []segPred, utf8 bool) []bool {
 	pass := make([]bool, t.n)
 	for r := range pass {
 		pass[r] = true
@@ -2458,6 +2500,9 @@ func (t *segJoinTable) passing(preds []segPlanPred, resolved []segPred) []bool {
 			}
 			continue
 		}
+		if utf8 && t.passingBytes(pr, aff, pass) {
+			continue
+		}
 		for r := range pass {
 			if !pass[r] {
 				continue
@@ -2470,6 +2515,61 @@ func (t *segJoinTable) passing(preds []segPlanPred, resolved []segPred) []bool {
 		}
 	}
 	return pass
+}
+
+// keepPass keeps a copy of what a level's terms let through, under key.
+func (t *segJoinTable) keepPass(key segJoinPassKey, pass []bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.passes == nil {
+		t.passes = map[segJoinPassKey][]bool{}
+	}
+	t.passes[key] = slices.Clone(pass)
+}
+
+// passingBytes clears in pass the rows a TEXT or BLOB bound fails on,
+// comparing each segment's packed cells as segApplyPredBytes does, when every
+// segment holds the column with no NULL and no exception. A cell is the row's
+// value unless the comparison's affinity is numeric and the cell's text reads
+// as a number (parseFullNumeric, as applyAffinitySlow converts it): that row
+// is compared as passing compares any other. false, with pass unchanged, when
+// a segment does not hold the column so.
+func (t *segJoinTable) passingBytes(pr segPred, aff affinity, pass []bool) bool {
+	if t.pos != nil || pr.Val.Typ != Text && pr.Val.Typ != Blob {
+		return false
+	}
+	for _, s := range t.segs {
+		if _, _, ok := s.BytesColumn(pr.Col); !ok || (pr.Val.Typ == Text) != (s.cols[pr.Col].phys == PhysText) {
+			return false
+		}
+	}
+	numeric := pr.Val.Typ == Text && aff != affNone && aff != affText
+	for si, s := range t.segs {
+		cells, heap, _ := s.BytesColumn(pr.Col)
+		base := t.starts[si]
+		for i, raw := range cells {
+			r := base + i
+			if !pass[r] {
+				continue
+			}
+			o, n := uint32(raw), uint32(raw>>32)
+			if int(o)+int(n) > len(heap) {
+				pass[r] = false // read as NULL, as segment.Value reads it
+				continue
+			}
+			b := heap[o : o+n]
+			if numeric && n > 0 {
+				if _, _, _, ok := parseFullNumeric(unsafe.String(&b[0], len(b))); ok {
+					v := applyAffinityToValue(t.value(int32(r), pr.Col), aff)
+					pass[r] = v.Typ != Null && pr.Op.satisfied(compareValues(v, pr.Val))
+					continue
+				}
+			}
+			pass[r] = pr.Op.satisfied(bytes.Compare(b, pr.Val.S))
+		}
+	}
+	segJoinBytesPasses.Add(1)
+	return true
 }
 
 // segJoinSums is what a group's rows add up to, per integer argument.
