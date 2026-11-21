@@ -2038,6 +2038,12 @@ type segJoinTags struct {
 // maxLv, or of cursor self, with every jump forward and inside the run or to
 // its end.
 func segJoinSafeRun(in []Instruction, from, to int, levelOf map[int]int, maxLv, self int) bool {
+	return segJoinSafeRunTo(in, from, to, levelOf, maxLv, self, -1)
+}
+
+// segJoinSafeRunTo is segJoinSafeRun for a run whose jumps may also leave for
+// next.
+func segJoinSafeRunTo(in []Instruction, from, to int, levelOf map[int]int, maxLv, self, next int) bool {
 	if from >= to {
 		return false
 	}
@@ -2052,7 +2058,7 @@ func segJoinSafeRun(in []Instruction, from, to int, levelOf map[int]int, maxLv, 
 			OpConcat, OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder,
 			OpNegative, OpBitNot, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight:
 		case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull, OpGoto:
-			if segJoinIsJump(ins) && (ins.P2 <= j || ins.P2 > to) {
+			if segJoinIsJump(ins) && (ins.P2 <= j || ins.P2 > to) && (next < 0 || ins.P2 != next) {
 				return false
 			}
 		case OpFunction:
@@ -2082,17 +2088,50 @@ func segJoinRun(in []Instruction, from, to, out int) *segJoinExpr {
 // skips the row to next unless it is true. It returns the run and the
 // address after the IfNot.
 func segJoinCrossFilter(in []Instruction, pc, limit int, levelOf map[int]int, lv, next int) (*segJoinExpr, int, bool) {
+	// A WHERE's AND, OR or NOT is coded as jumps (whereFalseJumps): its false
+	// leaves skip to next and its true arms jump to the term's end. The term
+	// ends at the first skip no jump before it reaches past.
+	reach, branched := pc, false
 	for i := pc + 1; i < limit; i++ {
 		ins := in[i]
+		if segJoinIsJump(ins) {
+			if ins.P2 == next {
+				branched = branched || !(ins.Op == OpIfNot && ins.P3 == 1)
+			} else {
+				reach = max(reach, ins.P2)
+			}
+		}
 		if ins.Op != OpIfNot || ins.P2 != next || ins.P3 != 1 {
 			continue
 		}
-		if !segJoinSafeRun(in, pc, i, levelOf, lv, -1) {
+		if reach > i+1 {
+			branched = true
+			continue
+		}
+		if !branched && reach <= i {
+			if !segJoinSafeRun(in, pc, i, levelOf, lv, -1) {
+				return nil, 0, false
+			}
+			return segJoinRun(in, pc, i, ins.P1), i + 1, true
+		}
+		if !segJoinSafeRunTo(in, pc, i+1, levelOf, lv, -1, next) {
 			return nil, 0, false
 		}
-		return segJoinRun(in, pc, i, ins.P1), i + 1, true
+		return segJoinBranchRun(in, pc, i+1, next, ins.P1), i + 1, true
 	}
 	return nil, 0, false
+}
+
+// segJoinBranchRun is in[from:end], a term coded as jumps, as an expression
+// into out: 1 where control reaches end, 0 where it jumps to next.
+func segJoinBranchRun(in []Instruction, from, end, next, out int) *segJoinExpr {
+	e := segJoinRun(in, from, end, out)
+	e.insns = append(e.insns,
+		Instruction{Op: OpInteger, P1: 1, P2: out},
+		Instruction{Op: OpGoto, P2: next + 1},
+		Instruction{Op: OpInteger, P1: 0, P2: out})
+	e.pcs = append(e.pcs, end, end, next)
+	return e
 }
 
 // parseSegJoinTags reads, at pc, the block a MULTI_OR level runs before its
