@@ -66,6 +66,10 @@ type cteBinding struct {
 	// that in, which counted no reference (cteSchemaColsIn reads it).
 	uncorrelated atomic.Bool
 	probe        atomic.Pointer[Program]
+	// probeTop is probe when it was compiled with no enclosing compiler and
+	// no compound arm held, the same compileSelectScanRow call a run of the
+	// body makes (cteProbeForRun).
+	probeTop atomic.Pointer[Program]
 
 	name     string
 	colNames []string // explicit "(col, ...)" rename list; nil if none was given
@@ -402,7 +406,11 @@ func (p *ReadOnlyPager) resolveCTEBodyRows(b *cteBinding, params []Value) ([]col
 	sub := b.core
 	var subCols []string
 	var subRows [][]Value
-	if prog := b.body.Load(); prog != nil {
+	prog := b.body.Load()
+	if prog == nil {
+		prog = p.cteProbeForRun(b, params)
+	}
+	if prog != nil {
 		cteBodyReuses.Add(1)
 		rows, err := prog.execOuter(p, nil, params)
 		if err != nil {
@@ -435,6 +443,44 @@ func (p *ReadOnlyPager) resolveCTEBodyRows(b *cteBinding, params []Value) ([]col
 // list is exempt (verified directly against C SQLite: "WITH c(x,x) AS
 // ..." is accepted with no error, both column named "x" verbatim by this
 // package -- matching CREATE VIEW's identical, already-accepted policy).
+// cteProbeForRun is b's probeTop when execSelect would compile the body to
+// the same program: none of the steps it takes before compileSelectScanRow
+// refuses the body or changes it, past those compileSubProgram takes too.
+// nil sends the run to execSelect.
+func (p *ReadOnlyPager) cteProbeForRun(b *cteBinding, params []Value) *Program {
+	prog := b.probeTop.Load()
+	s := b.core
+	if cteProbeRunOffForTest || prog == nil || prog.Compound != nil || len(s.Compound) > 0 || len(s.From) == 0 ||
+		s.LimitParam != nil || s.OffsetParam != nil || selectTreeHasNested(s) {
+		return nil
+	}
+	// The probe compiled inside a FROM body (enterFromBody), which only an
+	// INDEXED BY reads.
+	if selectTreeMentionsTable(s, func(it FromItem) bool { return it.IndexedBy != "" || it.NotIndexed }) {
+		return nil
+	}
+	if p.validateSelectSchemaQualifiers(s) != nil || p.schemaCatalogQueryGuard(s) != nil ||
+		p.fts5SegmentShadowQueryGuard(s) != nil || p.fts5SpecialQueryGuard(s) != nil {
+		return nil
+	}
+	if _, folded := fts5FoldMatchParams(s, params); folded {
+		return nil
+	}
+	if p.fts5RewriteTableFunc(s) != s || p.fts5RewriteEqMatch(s) != s || p.fts5RewriteUsingMatch(s) != s ||
+		p.countUnionAll(s) != nil || p.r37cFlattenTransparent(s) != s {
+		return nil
+	}
+	cteProbeRuns.Add(1)
+	return prog
+}
+
+// cteProbeRunOffForTest sends every CTE body run to execSelect, and
+// cteProbeRuns counts the runs cteProbeForRun served.
+var (
+	cteProbeRunOffForTest bool
+	cteProbeRuns          atomic.Int64
+)
+
 func applyCTEColNames(name string, colNames []string, cols []columnInfo, rows [][]Value) ([]columnInfo, [][]Value, error) {
 	if colNames != nil {
 		if len(colNames) != len(cols) {
