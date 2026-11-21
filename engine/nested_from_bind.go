@@ -845,6 +845,96 @@ func (p *ReadOnlyPager) refCountSum() int {
 	return n
 }
 
+// refCounts is what resolving FROM items has counted (view expansions, CTE
+// references in scope) at one moment, or what one compile added to it.
+type refCounts struct {
+	ctes  []refCountCTE
+	views []refCountView
+}
+
+type refCountCTE struct {
+	b *cteBinding
+	n int
+}
+
+type refCountView struct {
+	pager *ReadOnlyPager
+	key   string
+	n     int
+}
+
+func (p *ReadOnlyPager) refCountsNow() refCounts {
+	var rc refCounts
+	add := func(rp *ReadOnlyPager) {
+		for k, v := range rp.viewRefCount {
+			rc.views = append(rc.views, refCountView{rp, k, v})
+		}
+	}
+	add(p)
+	for _, ar := range p.attachedReaders {
+		add(ar.pager)
+	}
+	for _, frame := range p.cteScopes {
+		for _, cb := range frame {
+			if cb != nil {
+				rc.ctes = append(rc.ctes, refCountCTE{cb, cb.nUse})
+			}
+		}
+	}
+	return rc
+}
+
+// refCountsSince is what was counted after was.
+func (p *ReadOnlyPager) refCountsSince(was refCounts) *refCounts {
+	now := p.refCountsNow()
+	d := &refCounts{}
+	for _, c := range now.ctes {
+		n := c.n
+		for _, w := range was.ctes {
+			if w.b == c.b {
+				n -= w.n
+				break
+			}
+		}
+		if n != 0 {
+			d.ctes = append(d.ctes, refCountCTE{c.b, n})
+		}
+	}
+	for _, v := range now.views {
+		n := v.n
+		for _, w := range was.views {
+			if w.pager == v.pager && w.key == v.key {
+				n -= w.n
+				break
+			}
+		}
+		if n != 0 {
+			d.views = append(d.views, refCountView{v.pager, v.key, n})
+		}
+	}
+	return d
+}
+
+// addRefCounts counts d again, as compiling what counted it would, unless
+// that would take a view past maxViewReferences (the compile reports it).
+func (p *ReadOnlyPager) addRefCounts(d *refCounts) bool {
+	for _, v := range d.views {
+		if v.pager.viewRefCount[v.key]+v.n > maxViewReferences {
+			return false
+		}
+	}
+	for _, v := range d.views {
+		if v.pager.viewRefCount == nil {
+			v.pager.viewRefCount = map[string]int{}
+		}
+		v.pager.viewRefCount[v.key] += v.n
+	}
+	for _, c := range d.ctes {
+		c.b.nUse += c.n
+	}
+	return true
+}
+
 // nfSnapshotCounts saves what resolving a FROM item counts (view expansions,
 // CTE references), for a probe that must leave no trace.
 func (p *ReadOnlyPager) nfSnapshotCounts() func() {
