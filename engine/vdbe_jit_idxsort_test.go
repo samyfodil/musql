@@ -35,6 +35,8 @@ func TestVMJITTableIndexOrder(t *testing.T) {
 		`select g.a, u.n, u.m from g left join u on u.a = g.a limit 900`,
 		`select g.a, u.m, u.n from g left join u on u.a = g.a * 7 limit 900`,
 		`select g.a, u.m from g left join u on u.a = g.a + 3 and u.n = g.b limit 900`,
+		`select u.a, f.n, f.m from u left join f on f.a = u.a % 50 limit 4000`,
+		`select u.a, f.s, f.x from u left join f on f.a = u.a % 50 limit 4000`,
 	}
 	run := func(on bool) []string {
 		old := vmJITEnabled

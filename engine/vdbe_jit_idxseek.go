@@ -398,8 +398,8 @@ func buildVMIdx(t *vmTab, spec *idxSeekSpec, enc TextEncoding, s *segSortedRows)
 		return x
 	}
 	if spec.sorted != nil {
-		if len(spec.sortCols) == 1 && s != nil && s.ok {
-			if y := sortedVMIdxFrom(&vmIdx{tab: t, none: true}, s); !y.none {
+		if s != nil && s.ok {
+			if y := sortedVMIdxFrom(&vmIdx{tab: t, none: true}, s, spec, enc); !y.none {
 				return y
 			}
 		}
@@ -767,12 +767,17 @@ func buildTableSortedVMIdxValues(x *vmIdx, spec *idxSeekSpec, enc TextEncoding) 
 }
 
 // sortedVMIdxFrom is buildSortedVMIdx from the VDBE's own segSortedRows for
-// the seek, with nothing to sort: its runs are in rowid order, or, those the
-// VDBE put in its automatic index's order, in an order that keeps the rows a
-// loop keeps in rowid order (the key's other columns are ones the seek holds
-// to one value). Its rows are copied: orderRun reorders them in place.
-func sortedVMIdxFrom(x *vmIdx, s *segSortedRows) *vmIdx {
+// the seek. With one column there is nothing to sort: its runs are in rowid
+// order, or, those the VDBE put in its automatic index's order, in an order
+// that keeps the rows a loop keeps in rowid order (the key's other columns
+// are ones the seek holds to one value). With more, each run is sorted on the
+// rest as buildTableSortedVMIdxValues sorts it. Its rows are copied: orderRun
+// reorders them in place.
+func sortedVMIdxFrom(x *vmIdx, s *segSortedRows, spec *idxSeekSpec, enc TextEncoding) *vmIdx {
 	t := x.tab
+	if len(spec.sortColls) != len(spec.sortCols) {
+		return x
+	}
 	at := make(map[*segment]int, len(t.at))
 	mask := ^uint64(0)
 	for k, sg := range t.at {
@@ -786,26 +791,143 @@ func sortedVMIdxFrom(x *vmIdx, s *segSortedRows) *vmIdx {
 	if n == 0 {
 		return x
 	}
+	var pos func(i int) (int, int, int64)
 	if s.one != nil {
 		k, ok := at[s.one]
 		if !ok {
 			return x
 		}
-		return x.tableIndex(mask, n, func(i int) (int, int, int64) { return k, int(s.perm[i]), s.block[s.perm[i]] })
+		pos = func(i int) (int, int, int64) { r := s.perm[i]; return k, int(r), s.block[r] }
+	} else {
+		idx := make([]int, len(s.list))
+		for i, sg := range s.list {
+			idx[i] = -1
+			if k, ok := at[sg]; ok {
+				idx[i] = k
+			}
+		}
+		for _, g := range s.seg {
+			if idx[g] < 0 {
+				return x
+			}
+		}
+		pos = func(i int) (int, int, int64) { return idx[s.seg[i]], int(s.rows[i]), s.keys[i] }
 	}
-	idx := make([]int, len(s.list))
-	for i, sg := range s.list {
-		idx[i] = -1
-		if k, ok := at[sg]; ok {
-			idx[i] = k
+	if len(spec.sortCols) == 1 {
+		return x.tableIndex(mask, n, pos)
+	}
+	perm := make([]int32, n)
+	for i := range perm {
+		perm[i] = int32(i)
+	}
+	var rs runSorter
+	for i := 0; i < n; {
+		_, _, k := pos(i)
+		j := i + 1
+		for j < n {
+			if _, _, kj := pos(j); kj != k {
+				break
+			}
+			j++
+		}
+		if j-i > 1 {
+			rs.sort(t, spec, enc, perm[i:j], pos)
+		}
+		i = j
+	}
+	return x.tableIndex(mask, n, func(i int) (int, int, int64) { return pos(int(perm[i])) })
+}
+
+// runSorter sorts a run of a sorted seek's rows on the spec's columns after
+// the first, a NULL first, ties in rowid order, as
+// buildTableSortedVMIdxValues does. A column is read for the run's rows only
+// once a comparison reaches it: one of an INTEGER block with no exception as
+// int64s, any other cell as its value.
+type runSorter struct {
+	ints   []int64
+	kinds  []uint8 // runInt, runNull or runValue, by column and row
+	vals   []Value
+	filled []bool
+	segs   []int32
+	rows   []int32
+	rids   []uint64
+	ord    []int32
+	tmp    []int32
+}
+
+const (
+	runInt uint8 = iota
+	runNull
+	runValue
+)
+
+func (rs *runSorter) sort(t *vmTab, spec *idxSeekSpec, enc TextEncoding, run []int32, pos func(i int) (int, int, int64)) {
+	nr := len(spec.sortCols) - 1
+	l := len(run)
+	rs.ints, rs.kinds, rs.vals = slices.Grow(rs.ints[:0], l*nr)[:l*nr], slices.Grow(rs.kinds[:0], l*nr)[:l*nr], slices.Grow(rs.vals[:0], l*nr)[:l*nr]
+	rs.filled = slices.Grow(rs.filled[:0], nr)[:nr]
+	clear(rs.filled)
+	rs.segs, rs.rows, rs.rids = slices.Grow(rs.segs[:0], l)[:l], slices.Grow(rs.rows[:0], l)[:l], slices.Grow(rs.rids[:0], l)[:l]
+	rs.ord, rs.tmp = slices.Grow(rs.ord[:0], l)[:l], slices.Grow(rs.tmp[:0], l)[:l]
+	for q, p := range run {
+		seg, r, _ := pos(int(p))
+		rs.segs[q], rs.rows[q], rs.rids[q], rs.ord[q] = int32(seg), int32(r), t.at[seg].Rowid(r), int32(q)
+	}
+	fill := func(j int) {
+		rs.filled[j] = true
+		c := spec.sortCols[j+1]
+		for q := range l {
+			sg, r, at := t.at[rs.segs[q]], int(rs.rows[q]), j*l+q
+			if b, ok := sg.Int64Column(c); ok && r < len(b) && !sg.hasException(c) {
+				if sg.cols[c].nullOff != 0 && sg.isNull(c, r) {
+					rs.kinds[at] = runNull
+				} else {
+					rs.kinds[at], rs.ints[at] = runInt, b[r]
+				}
+				continue
+			}
+			rs.kinds[at], rs.vals[at] = runValue, sg.Value(c, r)
 		}
 	}
-	for _, g := range s.seg {
-		if idx[g] < 0 {
-			return x
+	value := func(at int) Value {
+		switch rs.kinds[at] {
+		case runInt:
+			return Value{Typ: Int, I: rs.ints[at]}
+		case runNull:
+			return Value{Typ: Null}
 		}
+		return rs.vals[at]
 	}
-	return x.tableIndex(mask, n, func(i int) (int, int, int64) { return idx[s.seg[i]], int(s.rows[i]), s.keys[i] })
+	slices.SortFunc(rs.ord, func(a, b int32) int {
+		for j := range nr {
+			if !rs.filled[j] {
+				fill(j)
+			}
+			x, y := j*l+int(a), j*l+int(b)
+			kx, ky := rs.kinds[x], rs.kinds[y]
+			var c int
+			switch {
+			case kx == runInt && ky == runInt:
+				c = cmp.Compare(rs.ints[x], rs.ints[y])
+			case kx == runNull && ky == runNull:
+			case kx == runNull && ky == runInt:
+				c = -1
+			case kx == runInt && ky == runNull:
+				c = 1
+			default:
+				c = compareValuesCollatedEnc(value(x), value(y), spec.sortColls[j+1], enc)
+			}
+			if c != 0 {
+				return c
+			}
+		}
+		return cmp.Compare(rs.rids[a], rs.rids[b])
+	})
+	for q, o := range rs.ord {
+		rs.tmp[q] = run[o]
+	}
+	copy(run, rs.tmp)
+	clear(rs.vals)
 }
 
 // tableIndex makes x the one index over every segment whose n rows, in
