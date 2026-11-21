@@ -963,6 +963,8 @@ func (e *vmEmitArm) sortSeek(pc int, in VInsn) {
 	a.SubReg(X13, X13, X8)
 	a.StrImm(X13, X9, VCursorOffN)
 	a.StrImm(X8, X9, VCursorOffSLo)
+	a.CmpImm(X13, 0)
+	a.Csel(X8, X8, xzr, CondNE) // an empty run's pointers are the lists' starts (amd64's)
 	a.LdrImm(X10, X5, VSortOffIds)
 	a.AddRegLSL3(X10, X10, X8)
 	a.StrImm(X10, X9, VCursorOffRids)

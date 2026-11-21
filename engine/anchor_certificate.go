@@ -6,7 +6,10 @@
 // This trades prepare-time certainty for run-time validation, like orderRiskErr.
 package engine
 
-import "regexp"
+import (
+	"regexp"
+	"sync"
+)
 
 // anchorCheck names the anchor-row slots an aggregate query's items read:
 // column indices and per-scope rowid slots, and whether the GROUP BY key is read.
@@ -204,7 +207,7 @@ func groupEmissionAscendingEverywhere(p *ReadOnlyPager, srcs []joinSource, nGrou
 			return false
 		}
 		for i := range rows {
-			if groupEmissionOrderWordRe.MatchString(rows[i].SQL) {
+			if groupEmissionOrderWordRe().MatchString(rows[i].SQL) {
 				return false
 			}
 		}
@@ -212,4 +215,4 @@ func groupEmissionAscendingEverywhere(p *ReadOnlyPager, srcs []joinSource, nGrou
 	return true
 }
 
-var groupEmissionOrderWordRe = regexp.MustCompile(`(?i)\b(desc|virtual|order)\b`)
+var groupEmissionOrderWordRe = sync.OnceValue(func() *regexp.Regexp { return regexp.MustCompile(`(?i)\b(desc|virtual|order)\b`) })

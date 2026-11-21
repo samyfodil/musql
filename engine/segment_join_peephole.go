@@ -40,7 +40,10 @@ type segJoinLoop struct {
 	// a column against a constant, which skip the level's row. filters are
 	// the level's other terms: an expression over its columns (a LIKE, a
 	// function), whose row is skipped unless the value is true.
-	preds   [][]segPlanPred
+	preds [][]segPlanPred
+	// bounds is the expression each bound a once-block computes is, by the
+	// bound's register plus one (segPlanPred.Reg).
+	bounds  map[int]*segJoinExpr
 	filters [][]segJoinArg
 	// crosses is each level's terms over it and earlier levels, true or the
 	// row is skipped; tags its MULTI_OR order, nil for none.
@@ -163,7 +166,12 @@ func (l *segJoinLoop) levelPreds(in []Instruction, pc, limit int) (int, bool) {
 	var crosses []*segJoinExpr
 	for {
 		// A run the comparisons do not read is the filters' to read.
-		if more, end, ok := segParsePredBlock(in, pc, limit, cursor, next); ok {
+		if more, end, ok := segParsePredBlockOnce(in, pc, limit, cursor, next); ok {
+			for _, p := range more {
+				if p.Reg != 0 {
+					l.bound(in, p)
+				}
+			}
 			preds, pc = append(preds, more...), end
 		}
 		if f, end, ok := segJoinFilter(in, pc, limit, lv, l.levelOf, next); ok {
@@ -180,6 +188,20 @@ func (l *segJoinLoop) levelPreds(in []Instruction, pc, limit int) (int, bool) {
 	l.filters = append(l.filters, filters)
 	l.crosses = append(l.crosses, crosses)
 	return pc, true
+}
+
+// bound keeps p's once-block as an expression: the instructions between its
+// NotNull and the flag it sets, which leave the bound in its register.
+func (l *segJoinLoop) bound(in []Instruction, p segPlanPred) {
+	from, to := p.once[0]+1, p.once[1]-1
+	e := &segJoinExpr{insns: slices.Clone(in[from:to]), out: p.Reg - 1}
+	for pc := from; pc < to; pc++ {
+		e.pcs = append(e.pcs, pc)
+	}
+	if l.bounds == nil {
+		l.bounds = map[int]*segJoinExpr{}
+	}
+	l.bounds[p.Reg] = e
 }
 
 // level reads the next level from pc: its seek, its Rewind, its recheck and
@@ -513,7 +535,7 @@ func segJoinPeephole(prog *Program) bool {
 
 	// The guard takes the place of the first instruction after the opens and
 	// runs it when it declines, so no address moves.
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2, segs: body.segs, orders: l.orders,
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, bounds: l.bounds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2, segs: body.segs, orders: l.orders,
 		fullStep: segJoinFullStep(plan), firstRow: segJoinFirstRow(plan)}
 	at := len(in)
 	out := append([]Instruction(nil), in...)
@@ -826,7 +848,7 @@ func segJoinGroupPeephole(prog *Program) bool {
 	}
 	seqAt := fullOf(seqReg)
 
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2,
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, bounds: l.bounds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2,
 		segs: segs, grouped: true, key: key, keyColl: keyColl, loads: loads, orders: l.orders, fullStep: segJoinFullStep(plan), firstRow: segJoinFirstRow(plan)}
 	out := append([]Instruction(nil), in...)
 	// A volatile call in the drain's run, or a later step's loads, the
@@ -1703,7 +1725,7 @@ func segJoinHashPeephole(prog *Program) bool {
 			return false
 		}
 	}
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2, segs: body.segs,
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, bounds: l.bounds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, args: args, agg: plan, seg: step.P2, segs: body.segs,
 		grouped: true, key: key, orders: l.orders, fullStep: segJoinFullStep(plan), firstRow: segJoinFirstRow(plan)}
 	key.reg = keyReg
 	jp.key = key
@@ -1779,7 +1801,7 @@ func segJoinTopPeephole(prog *Program) bool {
 			order = append(order, a)
 		}
 	}
-	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, agg: nil, orders: l.orders,
+	jp := &segJoinPlan{cursors: l.cursors, edges: l.edges, preds: l.preds, bounds: l.bounds, filters: l.filters, crosses: l.crosses, tags: l.tags, optional: l.outers, agg: nil, orders: l.orders,
 		loads: loads, order: order, keys: ki}
 	// The record's volatile values: the loop computes them on every joined
 	// row, so the walk does, and the copy reads what it got.

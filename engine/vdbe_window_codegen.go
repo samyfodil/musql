@@ -79,7 +79,8 @@ func windowAggArgsLowerable(call *windowCall) bool {
 	case "group_concat", "string_agg":
 		return len(call.args) == 1 || len(call.args) == 2
 	}
-	return false
+	// A registered aggregate maps its arguments the same way (aggUDF).
+	return udafs[call.name] != nil && (len(call.args) == 1 || len(call.args) == 2)
 }
 
 // planWindowOperands assigns every lowerable window operand a batch column

@@ -65,22 +65,38 @@ func (t token) isKw(kw string) bool {
 	return true
 }
 
-// upperIn reports m[t.upper()], folding a short word on the stack rather than
-// into the copy upper makes of a lower-case one.
-func (t token) upperIn(m map[string]bool) bool {
-	var buf [24]byte
-	if len(t.text) > len(buf) {
-		return m[t.upper()]
-	}
-	b := buf[:len(t.text)]
-	for i := range len(b) {
-		c := t.text[i]
-		if c >= 'a' && c <= 'z' {
-			c -= 'a' - 'A'
+// keywordSet is a map of upper-case keywords indexed by length, so a token is
+// tested against the few words of its own length by isKw rather than folded and
+// hashed. A word longer than byLen holds is looked up in the map.
+type keywordSet struct {
+	m     map[string]bool
+	byLen [16][]string
+	long  bool // some word is too long for byLen
+}
+
+func newKeywordSet(m map[string]bool) *keywordSet {
+	s := &keywordSet{m: m}
+	for kw := range m {
+		if len(kw) < len(s.byLen) {
+			s.byLen[len(kw)] = append(s.byLen[len(kw)], kw)
+		} else {
+			s.long = true
 		}
-		b[i] = c
 	}
-	return m[string(b)]
+	return s
+}
+
+// in reports s.m[t.upper()].
+func (t token) in(s *keywordSet) bool {
+	if len(t.text) >= len(s.byLen) {
+		return s.long && s.m[t.upper()]
+	}
+	for _, kw := range s.byLen[len(t.text)] {
+		if t.isKw(kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // asciiUpper folds a-z to uppercase; every other byte is unchanged. Returns s
@@ -241,14 +257,40 @@ func lexKeep(s string) ([]token, error) {
 	return toks, nil
 }
 
+// scratchToks lends token buffers to parses whose results hold no token:
+// opening a database lexes every CREATE text once, and those tokens die with
+// the parse instead of being kept by lexKeep.
+var scratchToks = sync.Pool{New: func() any { return new([]token) }}
+
+// lexScratch lexes s into a pooled buffer; releaseScratch returns it once
+// nothing reads the tokens.
+func lexScratch(s string) ([]token, *[]token, error) {
+	b := scratchToks.Get().(*[]token)
+	toks, err := lexInto(*b, s)
+	return toks, b, err
+}
+
+func releaseScratch(b *[]token, toks []token) {
+	if cap(toks) > 1<<14 {
+		return
+	}
+	*b = toks[:0]
+	scratchToks.Put(b)
+}
+
 func lexUncached(s string) ([]token, error) {
 	// Pre-sized for typical SQL token density, capped: a statement made of
 	// long literals (rows of vector('[...]')) has far fewer tokens than its
 	// length suggests, and an uncapped guess zeroed megabytes per statement.
 	// append grows it past the cap when a statement needs more. TPC-H and
 	// TPC-DS queries and schemas run six to eight bytes a token.
+	return lexInto(make([]token, 0, min(len(s)/6, 4096)+8), s)
+}
+
+// lexInto is lexUncached appending to toks[:0].
+func lexInto(toks []token, s string) ([]token, error) {
+	toks = toks[:0]
 	n := len(s)
-	toks := make([]token, 0, min(n/6, 4096)+8)
 	i := 0
 
 	isIdentStart := func(c byte) bool {

@@ -36,8 +36,8 @@ func TestAutoIndexNumbersWithoutConstraint(t *testing.T) {
 		s    string
 		want bool
 	}{{"x primary y", true}, {"PRIMAR", false}, {"pRiMaRy", true}, {"", false}, {"PRIMARX", false}, {"primary", true}} {
-		if got := hasWordFold(c.s, "PRIMARY"); got != c.want {
-			t.Errorf("hasWordFold(%q) = %v", c.s, got)
+		if got := r35aContainsFold(c.s, "primary"); got != c.want {
+			t.Errorf("r35aContainsFold(%q) = %v", c.s, got)
 		}
 	}
 }

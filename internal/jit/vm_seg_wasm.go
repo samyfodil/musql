@@ -839,6 +839,14 @@ func (e *vmEmitWasm) sortSeek(pc int, in VInsn) {
 	w.op(opEnd, opEnd)
 	e.setCursorField(in.A, VCursorOffN, func() { w.Get(e.t2); w.Get(e.t3); w.op(opI64Sub) })
 	e.setCursorField(in.A, VCursorOffSLo, func() { w.Get(e.t3) })
+	// An empty run's pointers are the lists' starts (amd64's).
+	w.Get(e.t2)
+	w.Get(e.t3)
+	w.op(opI64Eq)
+	w.op(opIf, opVoid)
+	w.I64(0)
+	w.Set(e.t3)
+	w.op(opEnd)
 	e.setCursorField(in.A, VCursorOffRids, func() {
 		w.Get(e.sk1)
 		w.LoadI64(VSortOffIds)
