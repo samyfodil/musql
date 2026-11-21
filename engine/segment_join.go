@@ -1042,9 +1042,14 @@ func (w *segJoinWalk) orderRuns(i int, sk []int64, rows []int32, keys []int64, n
 	// A column read whole is kept with the table; one read at a few rows
 	// reads them alone.
 	cols := make([][]Value, len(o.key.cols))
+	ints := make([][]int64, len(o.key.cols))
 	for k, c := range o.key.cols {
 		if c >= 0 && 4*reached >= t.n {
-			cols[k] = t.values(c)
+			if v, ok := t.col(c); ok {
+				ints[k] = v
+			} else {
+				cols[k] = t.values(c)
+			}
 		}
 	}
 	rows = slices.Clone(rows)
@@ -1062,10 +1067,13 @@ func (w *segJoinWalk) orderRuns(i int, sk []int64, rows []int32, keys []int64, n
 				perm = append(perm, j)
 			}
 			autoIndexSortValues(perm, o.key, func(j, k int) Value {
-				if cols[k] == nil {
-					return t.value(run[j], o.key.cols[k])
+				switch {
+				case ints[k] != nil:
+					return Value{Typ: Int, I: ints[k][run[j]]}
+				case cols[k] != nil:
+					return cols[k][run[j]]
 				}
-				return cols[k][run[j]]
+				return t.value(run[j], o.key.cols[k])
 			}, o.enc, nil)
 			sorted := make([]int32, len(run))
 			for j, p := range perm {
