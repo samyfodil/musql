@@ -2796,7 +2796,7 @@ func isAggregateFuncName(name string) bool {
 		"jsonb_group_array", "jsonb_group_object", "vec1_train":
 		return true
 	}
-	return false
+	return udafs[r33sFoldIdent(name)] != nil
 }
 
 // expandTableConstraintSegments rewrites the comma-split column/constraint
