@@ -482,7 +482,9 @@ a temporary file when none is given, and no state, sign-in or OIDC. With a key
 file (an Ed25519 public key, PEM or URL-safe base64, as libSQL server reads
 it) a client needs an EdDSA JWT signed by it and not expired; its `a` claim
 `ro` puts it on a read-only handle. Both handles are confined like the
-cloud's, so ATTACH and VACUUM INTO are refused.
+cloud's, so ATTACH and VACUUM INTO are refused. Browsers are answered as
+`turso dev` answers them, for any origin (CORS), so a web app on another local
+port can use the database.
 
 ## Releases
 

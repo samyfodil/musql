@@ -486,7 +486,8 @@ For development, `musql dev` is the CLI's counterpart of `turso dev`: one
 database on localhost, temporary unless `--db-file` names one, and no auth
 unless `--auth-jwt-key-file` gives the Ed25519 public key (PEM, or the raw key
 in URL-safe base64) that client JWTs must be signed with (`"a": "ro"` reads
-only, as libSQL server takes it):
+only, as libSQL server takes it). Like `turso dev`, it answers browsers from
+any origin, so a web app on another local port can use it:
 
 ```sh
 $ ./musql dev --db-file app.musq --port 8080

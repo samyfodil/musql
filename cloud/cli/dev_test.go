@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -179,5 +180,72 @@ func TestDevJWT(t *testing.T) {
 				t.Fatalf("%s: %s accepted", key, name)
 			}
 		}
+	}
+}
+
+// TestDevCORS: a browser page on another origin is answered as turso dev
+// answers it: the preflight passes before any token is asked for, echoing the
+// headers asked for, and the response it is for may be read -- a refusal too.
+func TestDevCORS(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyFile := filepath.Join(t.TempDir(), "key.b64")
+	if err := os.WriteFile(keyFile, []byte(base64.RawURLEncoding.EncodeToString(pub)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{nil, {"--auth-jwt-key-file", keyFile}} {
+		url := startDev(t, args...)
+		pre, err := http.NewRequest(http.MethodOptions, url+"/v2/pipeline", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pre.Header.Set("Origin", "http://localhost:5173")
+		pre.Header.Set("Access-Control-Request-Method", "POST")
+		pre.Header.Set("Access-Control-Request-Headers", "authorization,content-type")
+		resp, err := http.DefaultClient.Do(pre)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent || resp.Header.Get("Access-Control-Allow-Origin") != "*" ||
+			resp.Header.Get("Access-Control-Allow-Headers") != "authorization,content-type" ||
+			!strings.Contains(resp.Header.Get("Access-Control-Allow-Methods"), "POST") {
+			t.Fatalf("%v: preflight %d %v", args, resp.StatusCode, resp.Header)
+		}
+		req, err := http.NewRequest(http.MethodPost, url+"/v2/pipeline",
+			strings.NewReader(`{"requests":[{"type":"execute","stmt":{"sql":"SELECT 1"}},{"type":"close"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Origin", "http://localhost:5173")
+		req.Header.Set("Content-Type", "application/json")
+		resp, err = http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		want := http.StatusOK
+		if args != nil {
+			want = http.StatusUnauthorized
+		}
+		if resp.StatusCode != want || resp.Header.Get("Access-Control-Allow-Origin") != "*" {
+			t.Fatalf("%v: POST %d %v, want %d with the origin allowed", args, resp.StatusCode, resp.Header, want)
+		}
+	}
+}
+
+// TestDevQuestionMarkPath: a --db-file with "?" is refused, as the driver
+// would read the rest as parameters and serve another, unconfined file.
+func TestDevQuestionMarkPath(t *testing.T) {
+	dir := t.TempDir()
+	env := cli.Env{Dir: dir, Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: io.Discard}
+	err := cli.Run(context.Background(), env, []string{"dev", "--port", "0", "--db-file", filepath.Join(dir, "a?b.musq")})
+	if err == nil || !strings.Contains(err.Error(), `"?"`) {
+		t.Fatalf("err %v, want the path refused", err)
+	}
+	if _, serr := os.Stat(filepath.Join(dir, "a")); !os.IsNotExist(serr) {
+		t.Fatalf("a file was created: %v", serr)
 	}
 }

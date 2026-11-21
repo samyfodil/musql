@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"syscall"
 
 	"golang.org/x/term"
 
@@ -40,7 +41,7 @@ func main() {
 		}
 		dir = filepath.Join(base, "musql")
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	fd := int(os.Stdin.Fd())
 	err := cli.Run(ctx, cli.Env{

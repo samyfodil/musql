@@ -90,6 +90,11 @@ func (a *app) runDev(ctx context.Context, dbFile, keyFile string, port int) erro
 		}
 		opts = append(opts, hrana.WithAuth(jwtCheck(key)))
 	}
+	// The driver reads what follows a "?" as parameters: the file would be
+	// another one, and its handle unconfined.
+	if strings.Contains(dbFile, "?") {
+		return fmt.Errorf("--db-file %q: a path with \"?\" cannot be served", dbFile)
+	}
 	path := dbFile
 	if path == "" {
 		dir, err := os.MkdirTemp("", "musql-dev-")
@@ -120,7 +125,7 @@ func (a *app) runDev(ctx context.Context, dbFile, keyFile string, port int) erro
 	if err != nil {
 		return err
 	}
-	hs := &http.Server{Handler: srv, ReadHeaderTimeout: 5 * time.Second}
+	hs := &http.Server{Handler: devCORS(srv), ReadHeaderTimeout: 5 * time.Second}
 	done := make(chan error, 1)
 	go func() { done <- hs.Serve(ln) }()
 
@@ -143,12 +148,36 @@ func (a *app) runDev(ctx context.Context, dbFile, keyFile string, port int) erro
 		return err
 	case <-ctx.Done():
 	}
+	// Stopping is what was asked for: requests still running after the grace
+	// period are cut, not reported as a failure.
 	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := hs.Shutdown(sctx); err != nil {
-		return err
+	if hs.Shutdown(sctx) != nil {
+		hs.Close()
 	}
 	return nil
+}
+
+// devCORS answers browsers as turso dev's server does, for any origin, so a
+// web app on another local port can use the database: a preflight is answered
+// here, before any token is asked for, and every response may be read.
+func devCORS(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hd := w.Header()
+		hd.Set("Access-Control-Allow-Origin", "*")
+		if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+			hd.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			// Echoed rather than "*", which a browser does not take to cover
+			// Authorization.
+			if req := r.Header.Get("Access-Control-Request-Headers"); req != "" {
+				hd.Set("Access-Control-Allow-Headers", req)
+			}
+			hd.Set("Access-Control-Max-Age", "86400")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 // readJWTKey reads an Ed25519 public key as libSQL server takes it: a PKIX
