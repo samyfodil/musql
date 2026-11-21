@@ -110,8 +110,8 @@ type Session struct {
 	// Exec of ours ever sees the statement. Detecting at the commit makes it
 	// impossible to miss: whoever ran the DDL, the catalog either moved or it did
 	// not.
-	catalogAtLastWrite []byte
-	fpScratch          []byte // catalogMoved's buffer
+	catalogAtLastWrite catalogPrint
+	fpScratch          catalogPrint // catalogMoved's buffers
 	// committed is the table directory and catalog the file holds as this
 	// session last read or wrote it, which a catalog record is checked against
 	// (catalogDeltaRecord). Not the read source's: a rewrite does not always
@@ -371,20 +371,32 @@ func pragmaDeclineFor(sql string) error {
 	return PragmaHasNoMeaningHere(p.Name)
 }
 
+// catalogPrint is a catalog fingerprint: the header words, as text, and every
+// schema object's kind, name and text, each its own string. The strings are
+// the catalog's own, shared rather than copied, so a print costs a slice
+// header a part, not the schema's text.
+type catalogPrint struct {
+	head  []byte
+	parts []string
+}
+
+func (a catalogPrint) equal(b catalogPrint) bool {
+	return bytes.Equal(a.head, b.head) && slices.Equal(a.parts, b.parts)
+}
+
 // catalogFingerprint is every schema object's name and text, so a statement that
 // moved the catalog can be caught rather than half-applied.
-func (n *Session) catalogFingerprint() []byte {
-	return n.appendCatalogFingerprint(nil)
+func (n *Session) catalogFingerprint() catalogPrint {
+	return n.appendCatalogFingerprint(catalogPrint{})
 }
 
 // catalogMoved reports whether the catalog differs from catalogAtLastWrite. It
-// builds the fingerprint into a buffer the session keeps, so the check every
-// commit makes allocates nothing once the buffer has grown -- it used to build
-// a fresh string by concatenation, three allocations per statement and more
-// per table -- and compares bytes, which stays exact.
+// builds the fingerprint into buffers the session keeps, so the check every
+// commit makes allocates nothing once they have grown, and compares every
+// part, which stays exact.
 func (n *Session) catalogMoved() bool {
-	n.fpScratch = n.appendCatalogFingerprint(n.fpScratch[:0])
-	return !bytes.Equal(n.fpScratch, n.catalogAtLastWrite)
+	n.fpScratch = n.appendCatalogFingerprint(catalogPrint{head: n.fpScratch.head[:0], parts: n.fpScratch.parts[:0]})
+	return !n.fpScratch.equal(n.catalogAtLastWrite)
 }
 
 // catalogDeltaRecord is the catalog record (segDeltaCatalog) a commit appends
@@ -458,13 +470,14 @@ func committedTables(tables []ConvertedTable) []ConvertedTable {
 	return out
 }
 
-// appendCatalogFingerprint appends the fingerprint to b.
-func (n *Session) appendCatalogFingerprint(b []byte) []byte {
+// appendCatalogFingerprint appends the fingerprint to p.
+func (n *Session) appendCatalogFingerprint(p catalogPrint) catalogPrint {
 	// The application-owned header words (user_version etc.) live in the
 	// catalog on this format (ConvertedCatalog.UserVersion), so changing one
 	// changes the catalog and the commit must rewrite the file; a delta
 	// batch carries no catalog. The schema cookie is one of them: "PRAGMA
 	// schema_version=777" alone was forgotten at reopen.
+	b := p.head
 	b = append(b, 'C')
 	b = strconv.AppendUint(b, uint64(n.schemaCookie), 10)
 	b = append(b, 'U')
@@ -481,42 +494,29 @@ func (n *Session) appendCatalogFingerprint(b []byte) []byte {
 	b = strconv.AppendBool(b, n.segWAL)
 	b = append(b, 'G')
 	b = append(b, n.captureGuard...)
-	b = append(b, 0)
+	p.head = b
+	s := p.parts
 	for _, t := range n.tables {
-		b = append(b, 'T')
-		b = append(b, t.name...)
-		b = append(b, 0)
-		b = append(b, t.sql...)
-		b = append(b, 0)
-		b = append(b, t.aliasOf...)
-		b = append(b, 0)
+		s = append(s, "T", t.name, t.sql, t.aliasOf)
 	}
 	// A direct catalog edit changes what the file must say without changing the
 	// live schema (applyCatalogEditsForWrite), so the overlay is part of it.
 	if n.writableSchemaEditsActive() {
 		for _, r := range n.wsCatalogWithOverlay() {
-			b = append(b, 'X')
-			b = fmt.Append(b, r.vals)
-			b = append(b, 0)
+			s = append(s, "W", fmt.Sprint(r.vals))
 		}
 	}
 	for _, i := range n.indexes {
-		b = append(b, 'I')
-		b = append(b, i.name...)
-		b = append(b, 0)
+		s = append(s, "I", i.name)
 	}
 	// Views and triggers too. Leaving them out let CREATE VIEW through, which is
 	// exactly the shape this exists to stop: accepted, visible for the session,
 	// gone at the next open.
 	for _, v := range n.views {
-		b = append(b, 'V')
-		b = append(b, v.name...)
-		b = append(b, 0)
+		s = append(s, "V", v.name)
 	}
 	for _, g := range n.triggers {
-		b = append(b, 'G')
-		b = append(b, g.name...)
-		b = append(b, 0)
+		s = append(s, "G", g.name)
 	}
 	// ...and VIRTUAL TABLES, for exactly the reason views and triggers are here. A
 	// module with SHADOW TABLES (fts5, rtree) changed the table list above and so
@@ -525,13 +525,10 @@ func (n *Session) appendCatalogFingerprint(b []byte) []byte {
 	// the next open -- the fingerprint never moved, so the commit appended a delta
 	// batch and the catalog holding that definition was never written.
 	for _, vt := range n.vtabs {
-		b = append(b, 'X')
-		b = append(b, vt.name...)
-		b = append(b, 0)
-		b = append(b, vt.sql...)
-		b = append(b, 0)
+		s = append(s, "X", vt.name, vt.sql)
 	}
-	return b
+	p.parts = s
+	return p
 }
 
 // ExecArgsNoRet runs one statement and discards its counts, which is what a
