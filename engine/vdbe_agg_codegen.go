@@ -502,6 +502,16 @@ func planAggArgRegs(c *compiler, plan *aggPlan, grouped bool, srcs []joinSource,
 			raised = false
 		}
 		it.stepSeg = seg
+		if i >= nMagnet {
+			if canon := aggSameRowInputs(tmpls[nMagnet:i], it); canon != nil {
+				// C merges identical calls into one AggInfo slot (expr.c:7478);
+				// here the second keeps its accumulator but reads the first's
+				// registers, already filled this row.
+				it.rowRegs = canon.rowRegs
+				it.obRegs = nil
+				continue
+			}
+		}
 		stamped := false
 		for _, which := range [3]int{aggExprFilter, aggExprArg, aggExprSep} {
 			e := it.rowExpr(which)
@@ -554,6 +564,68 @@ func planAggArgRegs(c *compiler, plan *aggPlan, grouped bool, srcs []joinSource,
 		}
 	}
 	return aggArgPlan{lowered: lowered, nSeg: seg + 1, stripLeaves: stripLeaves}, nil
+}
+
+// aggSameRowInputs returns the earlier template whose per-row expressions are
+// it's, spelled alike and evaluated alike: same FILTER, argument and
+// separator, no ORDER BY, nothing that calls a function or reads a subquery.
+// Both are compiled by the same compiler in the same scope, so equal spelling
+// is equal code, and code with no call gives the same value twice.
+func aggSameRowInputs(earlier []*aggItem, it *aggItem) *aggItem {
+	if it.orderBy != nil {
+		return nil
+	}
+	for _, which := range [3]int{aggExprFilter, aggExprArg, aggExprSep} {
+		if !aggRowExprPure(it.rowExpr(which)) {
+			return nil
+		}
+	}
+next:
+	for _, t := range earlier {
+		if t.orderBy != nil {
+			continue
+		}
+		for _, which := range [3]int{aggExprFilter, aggExprArg, aggExprSep} {
+			a, b := it.rowExpr(which), t.rowExpr(which)
+			if (a == nil) != (b == nil) || a != nil && !exprEqual(a, b) {
+				continue next
+			}
+		}
+		return t
+	}
+	return nil
+}
+
+// aggRowExprPure reports whether e is built only of column reads, literals,
+// parameters and operators: no function call and no subquery.
+func aggRowExprPure(e Expr) bool {
+	switch x := e.(type) {
+	case nil, LiteralExpr, ParamExpr, ColumnExpr:
+		return true
+	case UnaryExpr:
+		return aggRowExprPure(x.X)
+	case BinaryExpr:
+		return aggRowExprPure(x.L) && aggRowExprPure(x.R)
+	case CastExpr:
+		return aggRowExprPure(x.X)
+	case CollateExpr:
+		return aggRowExprPure(x.X)
+	case IsNullExpr:
+		return aggRowExprPure(x.X)
+	case BetweenExpr:
+		return aggRowExprPure(x.X) && aggRowExprPure(x.Lo) && aggRowExprPure(x.Hi)
+	case CaseExpr:
+		if !aggRowExprPure(x.Base) || !aggRowExprPure(x.Else) {
+			return false
+		}
+		for _, w := range x.Whens {
+			if !aggRowExprPure(w.When) || !aggRowExprPure(w.Then) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // obKeyArgCursorZeroRisk reports whether 3.53.3 could treat an aggregate's one
