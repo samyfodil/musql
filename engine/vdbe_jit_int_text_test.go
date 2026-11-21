@@ -3,6 +3,8 @@ package engine
 import (
 	"fmt"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"testing"
 
 	"github.com/samyfodil/musql/internal/jit"
@@ -69,6 +71,10 @@ func TestVMJITTextIntConst(t *testing.T) {
 		defer p.Close()
 		CountVMJITCursorEntersForTest(true)
 		defer CountVMJITCursorEntersForTest(false)
+		// A collection marking during the scan has every string store leave
+		// native code, which would count as the compare's exits.
+		defer debug.SetGCPercent(debug.SetGCPercent(-1))
+		runtime.GC()
 		VMJITCursorEntersForTest()
 		if _, _, err := p.QueryArgs("SELECT id FROM t WHERE p BETWEEN 8 AND 8+10 ORDER BY id", nil); err != nil {
 			t.Fatal(err)
