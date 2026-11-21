@@ -627,6 +627,7 @@ func openSegment(buf []byte) (*segment, error) {
 		s.firstRowid = binary.LittleEndian.Uint64(buf[rowidOff:])
 	}
 	nullBytes := (nRows + 7) / 8
+	lastIdx := -1
 	for c := 0; c < nCols; c++ {
 		d := segHeaderSize + c*segColDirSize
 		col := segColumn{
@@ -661,18 +662,25 @@ func openSegment(buf []byte) (*segment, error) {
 			if col.idxOff%8 != 0 || int(col.idxOff)+segIdxHdr > len(buf) {
 				return nil, fmt.Errorf("segment: column %d index offset is unaligned or overruns", c)
 			}
-			// ...AND THE RECORD'S OWN DECLARED LENGTH FITS. The index is the LAST
-			// thing in a segment, so without this a truncated file opens cleanly --
-			// every other block's bounds check is satisfied and the damage is only
-			// visible to the lazy reader. TestSegmentRejectsMalformed's one-byte
-			// truncation caught exactly that. Cheap, because the record carries its
-			// length for this reason.
-			if n := binary.LittleEndian.Uint32(buf[int(col.idxOff)+12:]); n < segIdxHdr ||
-				int(col.idxOff)+int(n) > len(buf) {
-				return nil, fmt.Errorf("segment: column %d index record overruns", c)
+			if lastIdx < 0 || col.idxOff > s.cols[lastIdx].idxOff {
+				lastIdx = c
 			}
 		}
 		s.cols[c] = col
+	}
+	// ...AND THE LAST RECORD'S OWN DECLARED LENGTH FITS. The indexes are the
+	// LAST thing in a segment, so without this a truncated file opens cleanly
+	// -- every other block's bounds check is satisfied and the damage is only
+	// visible to the lazy reader. TestSegmentRejectsMalformed's one-byte
+	// truncation caught exactly that. Only the last record is read here: each
+	// is its own page of a mapped file, so reading them all faulted one in per
+	// indexed column at every open, and the lazy reader (openSegColumnIndex)
+	// bounds every record by its length anyway.
+	if lastIdx >= 0 {
+		off := int(s.cols[lastIdx].idxOff)
+		if n := binary.LittleEndian.Uint32(buf[off+12:]); n < segIdxHdr || off+int(n) > len(buf) {
+			return nil, fmt.Errorf("segment: column %d index record overruns", lastIdx)
+		}
 	}
 	if excLen >= 4 {
 		exc := buf[excOff : excOff+excLen]
