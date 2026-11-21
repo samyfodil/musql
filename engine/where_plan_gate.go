@@ -600,6 +600,7 @@ func markWherePlanIndexEligibility(p *ReadOnlyPager, c *compiler, srcs []joinSou
 	if !ok {
 		return
 	}
+	srcs[0].singlePlanOK = true
 	srcs[0].planAccess = c.planWinner.access
 	srcs[0].planExplain = won.explain
 	if won.explain.verb != "" {
@@ -697,6 +698,15 @@ func wherePlanIndexOrderDecided(p *ReadOnlyPager, c *compiler, srcs []joinSource
 		return ok
 	}
 	if len(srcs) == 1 {
+		if srcs[0].singlePlanOK && !srcs[0].cPlanDecided {
+			if wherePlanHandOffCheckForTest.on {
+				wherePlanHandOffCheckForTest.hits++
+				if _, _, ok := wherePlanSingleTableIndexOrder(p, c, srcs, stmt); !ok {
+					wherePlanHandOffCheckForTest.differ++
+				}
+			}
+			return true
+		}
 		_, _, ok := wherePlanSingleTableIndexOrder(p, c, srcs, stmt)
 		return ok
 	}
