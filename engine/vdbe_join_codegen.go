@@ -334,6 +334,52 @@ func sourceScopes(s joinSource) []compileScope {
 	return []compileScope{sc}
 }
 
+// joinPrefixScopes is one emitJoinLoops' sources and order, and, once built,
+// the scopes of every source in that order (all), ends[n] being where the
+// first n sources' end.
+type joinPrefixScopes struct {
+	srcs  []joinSource
+	order []int
+	all   []compileScope
+	ends  []int
+}
+
+// scopesBound is the scopes of the first n sources in order (sourceScopes of
+// each), what a level's terms may name. Inside emitJoinLoops, which edits no
+// source's scope, every level slices one list; its capacity ends at n, so a
+// scope pushed onto it is pushed onto a copy.
+func (c *compiler) scopesBound(srcs []joinSource, order []int, n int) []compileScope {
+	js := c.joinScopes
+	if js == nil || len(js.srcs) != len(srcs) || len(srcs) == 0 || &js.srcs[0] != &srcs[0] ||
+		len(js.order) != len(order) || len(order) == 0 || &js.order[0] != &order[0] {
+		return scopesOf(srcs, order[:n])
+	}
+	if js.ends == nil {
+		js.ends = make([]int, len(order)+1)
+		for i, o := range order {
+			js.all = append(js.all, sourceScopes(srcs[o])...)
+			js.ends[i+1] = len(js.all)
+		}
+	}
+	e := js.ends[n]
+	if joinScopesCheckForTest != nil {
+		joinScopesCheckForTest(js.all[:e:e], scopesOf(srcs, order[:n]))
+	}
+	return js.all[:e:e]
+}
+
+func scopesOf(srcs []joinSource, order []int) []compileScope {
+	var visible []compileScope
+	for _, o := range order {
+		visible = append(visible, sourceScopes(srcs[o])...)
+	}
+	return visible
+}
+
+// joinScopesCheckForTest, when set, is handed every list scopesBound slices
+// and the list built afresh.
+var joinScopesCheckForTest func(shared, fresh []compileScope)
+
 // groupPresent reports whether any source is a materialized join group. Callers
 // then use conservative strategies, e.g. buildJoinPlan skips reordering and
 // pushdown, as join.go does with groups.
@@ -3390,10 +3436,10 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 			}
 		}
 	}
-	savedHalt := c.joinHalt
-	c.joinHalt = halt
+	savedHalt, savedScopes := c.joinHalt, c.joinScopes
+	c.joinHalt, c.joinScopes = halt, &joinPrefixScopes{srcs: srcs, order: plan.execOrder}
 	err := c.emitJoinLevel(srcs, plan, 0, body)
-	c.joinHalt = savedHalt
+	c.joinHalt, c.joinScopes = savedHalt, savedScopes
 	if err != nil {
 		return err
 	}
@@ -3547,16 +3593,12 @@ func (c *compiler) emitJoinLevel(srcs []joinSource, plan joinPlan, level int, bo
 		// So a correlated reference can name only tables already joined (SQL's ON
 		// scoping) and every cursor it reads is positioned (rowLive is already set).
 		saved := c.scopes
-		var visible []compileScope
-		for i := 0; i <= level; i++ {
-			// sourceScopes, not .scope directly: a materialized parenthesized
-			// join GROUP bound at physical level i contributes EVERY one of
-			// its own leaf members here, not just its connector's -- an ON
-			// condition at a later level (or this same group's own connector
-			// on, tested via this same helper) may reference any of them.
-			visible = append(visible, sourceScopes(srcs[order[i]])...)
-		}
-		c.scopes = visible
+		// sourceScopes, not .scope directly: a materialized parenthesized
+		// join GROUP bound at physical level i contributes EVERY one of its
+		// own leaf members here, not just its connector's -- an ON condition
+		// at a later level (or this same group's own connector on, tested via
+		// this same helper) may reference any of them.
+		c.scopes = c.scopesBound(srcs, order, level+1)
 		// ...and while they are narrowed, this compiler is not a safe target for
 		// the aggregate-association walk: a column its FULL FROM does supply
 		// would look absent here, handing the aggregate to a query further out
