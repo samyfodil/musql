@@ -667,13 +667,33 @@ func segLowerBodyWith(body []Instruction, base int, cursor int, aggAt int, text,
 	}
 	irOf[len(body)] = len(out.insns)
 
-	// Resolve jump targets from PROGRAM addresses to IR indices. A jump past
-	// the body -- to the AggStep or the Next -- means this row is finished.
+	// Resolve jump targets from PROGRAM addresses to IR indices. A jump to the
+	// body's end (aggAt) keeps the row: a WHERE's OR leaves for it once an arm
+	// is true. A jump anywhere else outside the body skips the row, and only
+	// one such address, the loop's Next, may mean that: a body cut inside an
+	// OR has a true arm's jump past its end that keeps the row, so it is
+	// refused.
+	skip, skipSeen := 0, false
+	resolved := make(map[int]bool, len(irJumps))
+	for _, j := range irJumps {
+		resolved[j[0]] = true
+	}
 	for i := range out.insns {
+		if resolved[i] {
+			continue
+		}
 		switch out.insns[i].Op {
 		case jit.POpJump, jit.POpJumpIfZero, jit.POpJumpIfNotZero:
 			t := out.insns[i].A
+			if t == len(body) && base+t == aggAt {
+				out.insns[i].A = irOf[t]
+				continue
+			}
 			if t < 0 || t >= len(body) {
+				if skipSeen && t != skip {
+					return nil, false
+				}
+				skip, skipSeen = t, true
 				out.insns[i].A = jit.ProgNextRow
 				continue
 			}

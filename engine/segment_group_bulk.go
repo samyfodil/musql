@@ -534,6 +534,9 @@ func (m *vdbe) segGroupBulk(segs []*segment, plan *segGroupPlan, ipk int, row, r
 		if err := m.hashAggStepRow(plan.agg, keyVals, plan.seg, row, rowids); err != nil {
 			return false
 		}
+		if plan.agg.cStreams {
+			m.hashAgg.rows += g.n - 1
+		}
 		rest := func(it *aggItem) {
 			switch it.kind {
 			case aggCountStar, aggCount:

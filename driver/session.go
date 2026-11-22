@@ -29,6 +29,7 @@ func (c *Conn) session() (*engine.Session, error) {
 	// session on this Conn) carries into the session that now owns it.
 	nw.SetConnState(c.changes, c.totalChanges, c.lastInsertRowid,
 		c.totalChangesOpaque, c.lastRowidOpaque)
+	nw.SetRowCounter(&c.rows)
 	// ...and the reverse for corruptSchema's latch: a load can SET it (a catalog
 	// whose rootpages collide, engine's replayRootEdits), and the Conn mirror is
 	// what every later statement is refused from and stamped back with.

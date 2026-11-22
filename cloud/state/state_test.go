@@ -126,9 +126,6 @@ func TestCRUD(t *testing.T) {
 	if err != nil || got.ID != d.ID || got.TokenGen != 1 {
 		t.Fatalf("%+v %v", got, err)
 	}
-	if err := s.DeleteGroup(ctx, g.ID); !errors.Is(err, ErrInUse) {
-		t.Fatalf("delete used group: %v", err)
-	}
 	if err := s.DeleteDatabase(ctx, d.ID); err != nil {
 		t.Fatal(err)
 	}

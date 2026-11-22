@@ -506,6 +506,10 @@ type VCursor struct {
 	// searches (a *VSort), and SortLo where its last run starts, or -1.
 	Sort   unsafe.Pointer
 	SortLo int64
+	// Steps counts the rows native code moved the cursor onto: a rewind
+	// onto its first row, a VNext onto the next, a seek's find. The engine
+	// adds them to the statement's rows read when it takes the cursor back.
+	Steps int64
 }
 
 // VSort is a row list sorted on an INTEGER key, as VSortSeek searches it: Ints
@@ -594,7 +598,7 @@ const (
 )
 
 const (
-	VCursorSize     = 168
+	VCursorSize     = 176
 	VCursorOffRows  = 0
 	VCursorOffN     = 8
 	VCursorOffPos   = 16
@@ -616,6 +620,7 @@ const (
 	VCursorOffSegs  = 144
 	VCursorOffSort  = 152
 	VCursorOffSLo   = 160
+	VCursorOffSteps = 168
 	VSortOffInts    = 0
 	VSortOffRows    = 8
 	VSortOffIds     = 16
