@@ -24,8 +24,8 @@ func TestColumnarBetweenMatchesTheLoop(t *testing.T) {
 		{`SELECT count(*) FROM t WHERE v BETWEEN ? AND ?`, []Value{{Typ: Null}, iv(10)}, false},
 		{`SELECT sum(v) FROM t WHERE v BETWEEN ? AND ?`, []Value{iv(-1000), iv(1000)}, true},
 		{`SELECT count(*) FROM t WHERE (v > ? AND k <> ?)`, []Value{iv(0), iv(3)}, true},
-		{`SELECT count(*) FROM t WHERE n BETWEEN 10 AND 4000`, nil, false}, // NULL-bearing column
-		{`SELECT count(*) FROM t WHERE v > -2500`, nil, true}, // Integer; Negative
+		{`SELECT count(*) FROM t WHERE n BETWEEN 10 AND 4000`, nil, true}, // NULL-bearing column: its NULLs are masked
+		{`SELECT count(*) FROM t WHERE v > -2500`, nil, true},             // Integer; Negative
 		{`SELECT count(*) FROM t WHERE v < -2500.5`, nil, true},
 		{`SELECT count(*) FROM t WHERE v NOT BETWEEN -100 AND 100`, nil, true}, // the program JIT, since OR and IN
 	}

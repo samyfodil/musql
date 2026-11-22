@@ -1088,7 +1088,7 @@ func (cur *vdbeCursor) tableEmpty() (empty, ok bool) {
 	// The segments' row counts, with the log's rows merged, as count(*)
 	// takes them: no row is read, where the scan below builds a chunk of
 	// rows to yield its first.
-	if n, served := cur.pager.segFilterCountTable(cur.tbl.root, nil, cur.tbl.ipkIndex); served {
+	if n, served := cur.pager.segFilterCountTable(cur.tbl.root, nil, cur.tbl.cols, cur.tbl.ipkIndex); served {
 		cur.emptyKnown, cur.empty = true, n == 0
 		return n == 0, true
 	}

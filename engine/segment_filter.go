@@ -79,6 +79,41 @@ func segPredColsFilterable(s *segment, preds []segPred) bool {
 	return true
 }
 
+// segPredColsNullable is segPredColsFilterable for a caller that applies the
+// predicates with segApplyPred, which clears the NULL rows. A NULL cell is a
+// NULL only when every row stored every column (a short row's NULL is its
+// column's DEFAULT), and never in the INTEGER PRIMARY KEY (the rowid) or a
+// generated column (computed from the others); cols and ipk are the table's.
+func segPredColsNullable(s *segment, preds []segPred, cols []columnInfo, ipk int) bool {
+	for _, p := range preds {
+		if p.Col < 0 || p.Col >= len(s.cols) || s.hasException(p.Col) {
+			return false
+		}
+		if s.cols[p.Col].nullOff != 0 && (!s.fullWidth || p.Col == ipk || p.Col >= len(cols) || cols[p.Col].GeneratedExpr != "") {
+			return false
+		}
+	}
+	return true
+}
+
+// segMaskNull clears the rows of the batch at lo that are NULL in p's column.
+// A NULL satisfies no comparison, so such a row is out whatever the operator
+// is; the arms after it read a NULL row's cell as garbage and AND it into
+// live, which leaves it cleared.
+func segMaskNull(s *segment, p segPred, lo int, live []uint8) {
+	off := int(s.cols[p.Col].nullOff)
+	if off == 0 {
+		return
+	}
+	bm := s.buf[off:]
+	for i := range live {
+		r := lo + i
+		if bm[r>>3]&(1<<uint(r&7)) != 0 {
+			live[i] = 0
+		}
+	}
+}
+
 func segFilterCount(s *segment, preds []segPred) int {
 	if len(preds) == 0 {
 		return s.nRows
@@ -139,7 +174,10 @@ func segApplyPredFloat(s *segment, p segPred, lo int, live []uint8) bool {
 	if p.Val.Typ != Float {
 		return false
 	}
-	full, ok := s.Float64Column(p.Col)
+	if s.hasException(p.Col) {
+		return false
+	}
+	full, ok := s.float64Block(p.Col)
 	if !ok {
 		return false
 	}
@@ -199,7 +237,7 @@ func segApplyPredBytes(s *segment, p segPred, lo int, live []uint8) bool {
 	if p.Val.Typ != Text && p.Val.Typ != Blob {
 		return false
 	}
-	cells, heap, ok := s.BytesColumn(p.Col)
+	cells, heap, _, ok := s.BytesColumnNulls(p.Col)
 	if !ok {
 		return false
 	}
@@ -237,16 +275,17 @@ func segApplyPredBytes(s *segment, p segPred, lo int, live []uint8) bool {
 }
 
 func segApplyPred(s *segment, p segPred, lo int, live []uint8) {
+	segMaskNull(s, p, lo, live)
 	if segApplyPredFloat(s, p, lo, live) {
 		return
 	}
 	if segApplyPredBytes(s, p, lo, live) {
 		return
 	}
-	if kind, _ := s.scanKind(p.Col); kind == segScanSlice && p.Val.Typ == Int {
-		// Both sides are integers and the column has no NULL and no exception,
-		// so the comparison is an integer comparison and nothing else can
-		// intervene.
+	if s.cols[p.Col].phys == PhysInt64 && !s.hasException(p.Col) && p.Val.Typ == Int {
+		// Both sides are integers and the column has no exception, so the
+		// comparison is an integer comparison and nothing else can intervene.
+		// segMaskNull has cleared the NULL rows.
 		if full, ok := s.Int64Column(p.Col); ok {
 			col := full[lo : lo+len(live)]
 			bound := p.Val.I
