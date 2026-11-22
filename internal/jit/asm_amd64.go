@@ -54,10 +54,12 @@ type fixup struct {
 
 func NewAsm() *Asm { return &Asm{labels: map[string]int{}} }
 
-// newAsmFor is an encoder sized for a program of n instructions, whose code,
-// labels and jumps grow with it.
+// newAsmFor is an encoder sized for a program of n instructions, whose code and
+// jumps grow with it. Most labels are NewLabel numbers: a large program names
+// under one label per instruction, so the name map starts at n+16 and grows
+// when a small one names more.
 func newAsmFor(n int) *Asm {
-	return &Asm{buf: make([]byte, 0, 256*n+512), labels: make(map[string]int, 4*n), fixups: make([]fixup, 0, 4*n)}
+	return &Asm{buf: make([]byte, 0, 256*n+512), labels: make(map[string]int, n+16), fixups: make([]fixup, 0, 4*n)}
 }
 
 var asmPool sync.Pool
@@ -484,6 +486,13 @@ func (a *Asm) MovMemDImm(base Reg, disp int32, imm int32) {
 	a.emit(0xC7)
 	a.memD(0, base, disp)
 	a.emit32(uint32(imm))
+}
+
+// IncMemD adds one to the qword [base+disp].
+func (a *Asm) IncMemD(base Reg, disp int32) {
+	a.rex(0, base)
+	a.emit(0xFF)
+	a.memD(0, base, disp)
 }
 
 // CmpMemDImm8 compares the qword [base+disp] against imm.

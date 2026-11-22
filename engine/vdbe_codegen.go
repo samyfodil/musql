@@ -726,18 +726,16 @@ func compileSelectNoFromTrig(pager *ReadOnlyPager, stmt *SelectStmt, outer *comp
 	// emission (producing zero rows), exactly like execNoFrom's early return.
 	// The result-list expressions below are therefore not evaluated when WHERE
 	// excludes the row.
-	var whereJump = -1
+	var whereJumps []int
 	if stmt.Where != nil {
 		// A FROM-less WHERE still gets the vector-equality rewrite: where.c splits the
 		// WHERE (6941) before the nTabList==0 case (6945) and runs
 		// sqlite3WhereExprAnalyze regardless (6990).
-		c.inWhereConjunct = true
-		wReg, err := c.compileExpr(stmt.Where)
+		var err error
+		whereJumps, err = c.whereFalseJumps(stmt.Where)
 		if err != nil {
 			return nil, err
 		}
-		// OpIfNot with jumpIfNull=1: take the jump when WHERE is false or NULL.
-		whereJump = c.emit(Instruction{Op: OpIfNot, P1: wReg, P3: 1})
 	}
 
 	for i, oc := range outCols {
@@ -778,8 +776,8 @@ func compileSelectNoFromTrig(pager *ReadOnlyPager, stmt *SelectStmt, outer *comp
 	for _, j := range skipJumps {
 		c.patch(j, c.here())
 	}
-	if whereJump >= 0 {
-		c.patch(whereJump, c.here())
+	for _, j := range whereJumps {
+		c.patch(j, c.here())
 	}
 	c.emit(Instruction{Op: OpHalt})
 
@@ -3584,6 +3582,80 @@ func (c *compiler) compileAndOr(le, re Expr, isAnd, top bool) (int, error) {
 	c.patch(jEnd, end)
 	c.patch(jEnd2, end)
 	return d, nil
+}
+
+// whereFalseJumps codes a WHERE clause as jumps taken when it is false or
+// NULL, returned unpatched for the caller to point past the row. AND, OR and
+// NOT branch rather than build a value (sqlite3ExprIfFalse with
+// SQLITE_JUMPIFNULL), so a WHERE that is an OR of ANDs compiles to a chain of
+// tests instead of a three-valued result per operand.
+func (c *compiler) whereFalseJumps(e Expr) ([]int, error) {
+	return c.condJumps(e, false, true, true)
+}
+
+// condJumps codes e as jumps taken when it is true (onTrue) or false, and when
+// it is NULL if jumpIfNull (sqlite3ExprIfTrue, sqlite3ExprIfFalse). top is
+// inWhereConjunct for e, re-armed through AND as compileAndOr does.
+func (c *compiler) condJumps(e Expr, onTrue, jumpIfNull, top bool) ([]int, error) {
+	switch x := e.(type) {
+	case BinaryExpr:
+		if x.Op != "AND" && x.Op != "OR" {
+			break
+		}
+		if !c.noAndOrSimplify {
+			if alt, changed := simplifiedAndOr(x); changed {
+				return c.condJumps(alt, onTrue, jumpIfNull, top)
+			}
+		}
+		le, re := x.L, x.R
+		if !top && exprContainsSubquery(le) && !exprContainsSubquery(re) {
+			le, re = re, le
+		}
+		isAnd := x.Op == "AND"
+		sub := top && isAnd
+		if isAnd != onTrue {
+			// Either operand decides it: a false one for AND, a true one for OR.
+			a, err := c.condJumps(le, onTrue, jumpIfNull, sub)
+			if err != nil {
+				return nil, err
+			}
+			b, err := c.condJumps(re, onTrue, jumpIfNull, sub)
+			if err != nil {
+				return nil, err
+			}
+			return append(a, b...), nil
+		}
+		// The left operand going the other way settles it without the right.
+		skip, err := c.condJumps(le, !onTrue, !jumpIfNull, sub)
+		if err != nil {
+			return nil, err
+		}
+		js, err := c.condJumps(re, onTrue, jumpIfNull, sub)
+		if err != nil {
+			return nil, err
+		}
+		for _, j := range skip {
+			c.patch(j, c.here())
+		}
+		return js, nil
+	case UnaryExpr:
+		if _, exists := x.X.(ExistsExpr); x.Op == "NOT" && !exists {
+			return c.condJumps(x.X, !onTrue, jumpIfNull, false)
+		}
+	}
+	c.inWhereConjunct = top
+	r, err := c.compileExpr(e)
+	if err != nil {
+		return nil, err
+	}
+	op, p3 := OpIfNot, 0
+	if onTrue {
+		op = OpIf
+	}
+	if jumpIfNull {
+		p3 = 1
+	}
+	return []int{c.emit(Instruction{Op: op, P1: r, P3: p3})}, nil
 }
 
 // compileIsNull emits code for "X IS [NOT] NULL" producing a 1/0 boolean.

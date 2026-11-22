@@ -44,7 +44,8 @@ func TestUsage(t *testing.T) {
 		t.Fatalf("%d points", len(u.Points))
 	}
 	p := u.Points[0]
-	if p.Statements != 6 || p.RowsWritten != 3 || p.RowsRead != 3 || p.Errors != 1 || p.BytesStored == 0 || p.P95Ms <= 0 {
+	// The CREATE TABLE writes its catalog entry, each INSERT its row.
+	if p.Statements != 6 || p.RowsWritten != 4 || p.RowsRead != 3 || p.Errors != 1 || p.BytesStored == 0 || p.P95Ms <= 0 {
 		t.Fatalf("usage %+v", p)
 	}
 	org := must(dbs.Usage(ctx, auth(e.admin, &v1.UsageRequest{Org: "acme"}))).Msg

@@ -49,6 +49,7 @@ type config struct {
 	roDB      *sql.DB
 	idle      time.Duration
 	observe   func(Stmt)
+	block     func() Block
 }
 
 func newConfig(opts []Option) config {
@@ -133,8 +134,8 @@ func (s *Server) dbFor(readOnly bool) *sql.DB {
 type Stmt struct {
 	SQL      string
 	Duration time.Duration
-	// RowsRead is the rows the statement returned, RowsWritten the rows it
-	// changed (total_changes moved by).
+	// RowsRead and RowsWritten are the rows the statement read and wrote, as
+	// libSQL counts them for Turso's billing (engine.RowCounter).
 	RowsRead, RowsWritten int64
 	Err                   error
 }
@@ -142,6 +143,23 @@ type Stmt struct {
 // WithObserver calls fn after every statement a client runs (an execute, a
 // batch step, a sequence), on the goroutine that ran it, so fn must be quick.
 func WithObserver(fn func(Stmt)) Option { return func(c *config) { c.observe = fn } }
+
+// Block is what a WithBlock check reports: Reads refuses every statement,
+// Writes every statement that writes. Reason is what the client is told.
+type Block struct {
+	Reads, Writes bool
+	Reason        string
+}
+
+// WithBlock asks check before every statement a client runs, so a change
+// reaches open streams at their next statement. A refused statement fails
+// with the Hrana error code BLOCKED. While writes are blocked a new stream
+// runs on the database WithReadOnlyDB gives, where a write is refused as
+// blocked, and a stream opened for writing before refuses every statement.
+func WithBlock(check func() Block) Option { return func(c *config) { c.block = check } }
+
+// writesBlocked reports a WithBlock check that blocks writes now.
+func (c *config) writesBlocked() bool { return c.block != nil && c.block().Writes && c.roDB != nil }
 
 // NewServer serves db, which must be opened with the musql driver.
 func NewServer(db *sql.DB, opts ...Option) *Server {
@@ -228,10 +246,12 @@ func newBaton() string {
 func (s *Server) take(ctx context.Context, baton *string, ro bool) (*httpStream, error) {
 	s.reap()
 	if baton == nil || *baton == "" {
+		ro = ro || s.writesBlocked()
 		st, err := newStream(context.WithoutCancel(ctx), s.dbFor(ro), newSQLStore(), s.observe)
 		if err != nil {
 			return nil, err
 		}
+		st.ro, st.block = ro, s.block
 		hs := &httpStream{stream: st, ro: ro}
 		hs.mu.Lock()
 		return hs, nil

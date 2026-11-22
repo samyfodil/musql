@@ -114,6 +114,7 @@ func (prog *Program) putMachineTo(m *vdbe, spare **vdbe) {
 	// The column masks, a pure function of the instructions they are tagged
 	// with (cursorMask), kept as they are.
 	masks, masksOf, masksN, masksCurs := m.colMasks, m.colMasksOf, m.colMasksN, m.colMasksCurs
+	billed, billedOf, bareCount := m.billed, m.billedOf, m.bareCount
 	// The last accumulator set, for the next execution to rebuild: nothing
 	// reads it once this one has finished.
 	aggSpare := m.aggAccs
@@ -181,6 +182,7 @@ func (prog *Program) putMachineTo(m *vdbe, spare **vdbe) {
 	m.aggVM, m.aggCtx, m.aggNullRow = agg, actx, nullRow
 	m.colMasks, m.colMasksOf, m.colMasksN, m.colMasksCurs = masks, masksOf, masksN, masksCurs
 	m.aggSpare = aggSpare
+	m.billed, m.billedOf, m.bareCount = billed, billedOf, bareCount
 	if spare != nil && *spare == nil {
 		// A session's own slot outlives the pool's cycles, so it keeps no
 		// scan.
