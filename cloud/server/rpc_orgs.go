@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	"connectrpc.com/connect"
@@ -93,11 +94,32 @@ func (s orgService) Delete(ctx context.Context, req *connect.Request[v1.DeleteOr
 	if err != nil {
 		return nil, rpcErr(err)
 	}
+	groups, err := s.store.Groups(ctx, o.ID)
+	if err != nil {
+		return nil, rpcErr(err)
+	}
+	for _, d := range dbs {
+		if d.DeleteProtection {
+			return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("database %s has delete protection on", d.Name))
+		}
+	}
+	for _, g := range groups {
+		if g.DeleteProtection {
+			return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("group %s has delete protection on", g.Name))
+		}
+	}
+	deleted, err := s.store.DeletedDatabases(ctx, o.ID)
+	if err != nil {
+		return nil, rpcErr(err)
+	}
 	if err := s.store.DeleteOrg(ctx, o.ID); err != nil {
 		return nil, rpcErr(err)
 	}
 	for _, d := range dbs {
 		s.removeFiles(d)
+	}
+	for _, d := range deleted {
+		s.removeFiles(&d.Database)
 	}
 	return connect.NewResponse(&v1.DeleteOrgResponse{}), nil
 }

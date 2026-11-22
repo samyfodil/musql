@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math"
 	"slices"
-	"strconv"
 )
 
 // condAbove is x86's unsigned "above" (JA), for range checks that fold negatives.
@@ -157,7 +156,13 @@ func emitVMWith(asm *Asm, prog []VInsn, nReg int, lay ValueLayout, bound, entry 
 	}
 
 	for _, c := range e.cold {
-		c()
+		if c.in != 0 {
+			a.Bind(c.in)
+		}
+		c.body()
+		if c.back != 0 {
+			a.JmpL(c.back)
+		}
 	}
 	if e.segRead != 0 {
 		e.emitSegRead()
@@ -257,7 +262,7 @@ type vmEmit struct {
 	zeroS knowSet
 	// cold is the code of the paths a block branches out to and back from
 	// (coldPath), emitted after the blocks.
-	cold []func()
+	cold []vmCold
 	// consts is the doubles the REAL arms load (vm_real_amd64.go), and
 	// nLabel the labels they have made.
 	consts *firPool
@@ -273,15 +278,17 @@ type vmEmit struct {
 // this point; it may exit, and must leave every register but RDX as it found
 // it.
 func (e *vmEmit) coldPath(body func()) {
-	n := len(e.cold)
-	in, back := "c"+strconv.Itoa(n), "c"+strconv.Itoa(n)+".back"
-	e.a.Jcc(CondNE, in)
-	e.a.Label(back)
-	e.cold = append(e.cold, func() {
-		e.a.Label(in)
-		body()
-		e.a.Jmp(back)
-	})
+	in, back := e.a.NewLabel(), e.a.NewLabel()
+	e.a.JccL(CondNE, in)
+	e.a.Bind(back)
+	e.cold = append(e.cold, vmCold{in: in, back: back, body: body})
+}
+
+// vmCold is a cold path's body and, for a coldPath, the labels it is entered
+// at and leaves to; they are zero for a body that binds and leaves on its own.
+type vmCold struct {
+	in, back Lbl
+	body     func()
 }
 
 // vmEntryStub is an entry into the middle of a run: the registers to check
@@ -1134,6 +1141,7 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		e.jmpBlock(pc, in.T) // no rows
 		patch(a.buf, nonEmpty+2, len(a.buf))
 		a.MovMemDImm(RAX, cb+VCursorOffLast, 0)
+		a.IncMemD(RAX, cb+VCursorOffSteps)
 	case VNext:
 		e.unmapCursor(in.A)
 		cb := int32(in.A * VCursorSize)
@@ -1150,6 +1158,7 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		a.MovMemDReg(RAX, cb+VCursorOffPos, RDX)
 		a.MovMemDImm(RAX, cb+VCursorOffDirty, 1)
 		a.MovMemDReg(RAX, cb+VCursorOffLast, RDX)
+		a.IncMemD(RAX, cb+VCursorOffSteps)
 		e.jmpBlock(pc, in.T)
 		patch(a.buf, end+2, len(a.buf))
 		// Off the end of the rows handed over: one with more past them (Adv 2)

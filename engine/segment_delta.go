@@ -397,7 +397,7 @@ func segDeltaHeader(baseCtr, basePages uint32) []byte {
 // chained across calls, so a batch summed in pieces sums as it would whole.
 func segDeltaChecksum(v uint32, b []byte, seed uint64) uint64 {
 	if v >= 4 {
-		return uint64(crc32.Update(uint32(seed), segDeltaCRC, b))
+		return uint64(crc32.Update(uint32(seed), crc32.MakeTable(crc32.Castagnoli), b))
 	}
 	h := seed
 	if h == 0 {
@@ -409,8 +409,6 @@ func segDeltaChecksum(v uint32, b []byte, seed uint64) uint64 {
 	}
 	return h
 }
-
-var segDeltaCRC = crc32.MakeTable(crc32.Castagnoli)
 
 // SegDeltaAppendState is where the last append left off: the byte offset the next
 // batch starts at and the running checksum it chains from.

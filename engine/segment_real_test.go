@@ -45,7 +45,9 @@ func TestRealProgramsMatchTheLoop(t *testing.T) {
 		{`SELECT count(*) FROM t WHERE ln(x) IS NULL`, nil, 1},
 		{`SELECT count(*), max(x) FROM t WHERE x/(y-y) IS NOT NULL OR x > 100`, nil, 1},
 		{`SELECT count(*) FROM t WHERE x BETWEEN -1 AND 1`, nil, 1},
-		{`SELECT count(*) FROM t WHERE NOT (sqrt(x) > 3)`, nil, -1}, // a NULL the program cannot hold
+		// NOT is a jump: the comparison's NULL is read only by an If that
+		// treats it as true (segNullReaders).
+		{`SELECT count(*) FROM t WHERE NOT (sqrt(x) > 3)`, nil, 1},
 		{`SELECT count(*), sum(x) FROM t WHERE x > ?`, []Value{real(10.25)}, 1},
 		{`SELECT count(*) FROM t WHERE x > ? AND y < ?`, []Value{integer(3), real(0.5)}, 1},
 		{`SELECT count(*) FROM t WHERE x > ?`, []Value{integer(1 << 60)}, 0}, // the fixed filter compares it exactly
