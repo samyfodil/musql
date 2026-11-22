@@ -59,3 +59,61 @@ func TestAggOrderHandOffAgreesWithPlan(t *testing.T) {
 		t.Fatalf("%d of %d hand-off answers a fresh plan does not decide", wherePlanHandOffCheckForTest.differ, wherePlanHandOffCheckForTest.hits)
 	}
 }
+
+// TestSingleTableOrderHandOffAgreesWithPlan: a single-table FROM whose scan
+// markWherePlanIndexEligibility had the planner decide is answered from that
+// hand-off, and a fresh plan of the same source decides it too: grouped and
+// ordered scans over an index, the rowid scan, a range, and the same shapes
+// as IN and scalar subqueries and as CTE bodies.
+func TestSingleTableOrderHandOffAgreesWithPlan(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "t.musq")
+	buildDB(t, path,
+		`CREATE TABLE a(id INTEGER PRIMARY KEY, x INTEGER, y TEXT)`,
+		`CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER, z INTEGER)`,
+		`CREATE TABLE w(k INTEGER PRIMARY KEY, v INTEGER) WITHOUT ROWID`,
+		`CREATE INDEX a_x ON a(x)`,
+		`CREATE INDEX b_aid ON b(aid)`,
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 300) INSERT INTO a SELECT i, i % 17, 'y' || (i % 5) FROM n`,
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 900) INSERT INTO b SELECT i, i % 300 + 1, i % 23 FROM n`,
+		`INSERT INTO w SELECT id, x FROM a`,
+		`ANALYZE`,
+	)
+	p, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	wherePlanHandOffCheckForTest.on = true
+	defer func() { wherePlanHandOffCheckForTest = handOffCheck{} }()
+	for _, q := range []string{
+		`SELECT x, count(*) FROM a GROUP BY x`,
+		`SELECT x, sum(id) FROM a WHERE x BETWEEN 3 AND 9 GROUP BY x ORDER BY x`,
+		`SELECT aid, max(z) FROM b GROUP BY aid`,
+		`SELECT id, y FROM a ORDER BY id LIMIT 5`,
+		`SELECT count(*), min(z) FROM b WHERE aid = 7`,
+		`SELECT y, count(*) FROM a WHERE id > 100 GROUP BY y`,
+		`SELECT id FROM a WHERE x IN (SELECT z FROM b WHERE aid = 5) ORDER BY id`,
+		`SELECT id, (SELECT max(z) FROM b WHERE aid = 9) FROM a WHERE x = 2`,
+		`SELECT count(*) FROM a WHERE x IN (SELECT x FROM a WHERE id < 40 GROUP BY x)`,
+		`WITH t AS (SELECT aid, sum(z) s FROM b GROUP BY aid) SELECT max(s) FROM t`,
+		`SELECT x, count(*) FROM a WHERE y = 'y3' GROUP BY x HAVING count(*) > 1`,
+		`SELECT id, y FROM a WHERE x = 3`,
+		`SELECT id FROM b WHERE aid = 12`,
+		`SELECT k, v FROM w WHERE v > 3`,
+		`SELECT v, k FROM w WHERE k BETWEEN 10 AND 20`,
+		`SELECT * FROM (SELECT aid, sum(z) s FROM b GROUP BY aid) WHERE s > 10`,
+		`SELECT a.id FROM a WHERE a.x = (SELECT max(s) FROM (SELECT aid, sum(z) s FROM b WHERE aid = a.id GROUP BY aid))`,
+		`SELECT a.id, (SELECT count(*) FROM (SELECT z FROM b WHERE aid = a.id)) FROM a WHERE a.x = 4`,
+		`WITH t AS (SELECT aid, z FROM b WHERE z > 5) SELECT aid FROM t WHERE z < 9`,
+	} {
+		if _, _, err := p.QueryArgs(q, nil); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	if wherePlanHandOffCheckForTest.hits == 0 {
+		t.Fatal("no single-table scan answered from the hand-off")
+	}
+	if wherePlanHandOffCheckForTest.differ != 0 {
+		t.Fatalf("%d of %d hand-off answers a fresh plan does not decide", wherePlanHandOffCheckForTest.differ, wherePlanHandOffCheckForTest.hits)
+	}
+}
