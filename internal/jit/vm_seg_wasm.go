@@ -25,6 +25,11 @@ func (e *vmEmitWasm) setCursorField(a int, off uint32, push func()) {
 	e.w.StoreI64(uint32(a*VCursorSize) + off)
 }
 
+// incSteps adds one to cursor A's Steps.
+func (e *vmEmitWasm) incSteps(a int) {
+	e.setCursorField(a, VCursorOffSteps, func() { e.cursorField(a, VCursorOffSteps); e.w.I64(1); e.w.op(opI64Add) })
+}
+
 func (e *vmEmitWasm) setCursorImm(a int, off uint32, v int64) {
 	e.setCursorField(a, off, func() { e.w.I64(v) })
 }
@@ -605,6 +610,7 @@ func (e *vmEmitWasm) seekRowid(pc int, in VInsn) {
 	e.setCursorImm(in.A, VCursorOffAdv, 1)
 	e.setCursorImm(in.A, VCursorOffState, 2)
 	e.setCursorField(in.A, VCursorOffSrvd, func() { e.cursorField(in.A, VCursorOffSrvd); w.I64(1); w.op(opI64Add) })
+	e.incSteps(in.A)
 	w.op(opElse)
 	e.seekMiss(in.A)
 	w.op(opEnd)
@@ -742,6 +748,7 @@ func (e *vmEmitWasm) seekIdx(pc int, in VInsn) {
 	e.setCursorImm(in.A, VCursorOffDirty, 1)
 	e.setCursorImm(in.A, VCursorOffAdv, 1)
 	e.setCursorImm(in.A, VCursorOffState, 2)
+	e.incSteps(in.A)
 	w.op(opElse)
 	e.seekMiss(in.A)
 	w.op(opEnd)
@@ -839,6 +846,14 @@ func (e *vmEmitWasm) sortSeek(pc int, in VInsn) {
 	w.op(opEnd, opEnd)
 	e.setCursorField(in.A, VCursorOffN, func() { w.Get(e.t2); w.Get(e.t3); w.op(opI64Sub) })
 	e.setCursorField(in.A, VCursorOffSLo, func() { w.Get(e.t3) })
+	// An empty run's pointers are the lists' starts (amd64's).
+	w.Get(e.t2)
+	w.Get(e.t3)
+	w.op(opI64Eq)
+	w.op(opIf, opVoid)
+	w.I64(0)
+	w.Set(e.t3)
+	w.op(opEnd)
 	e.setCursorField(in.A, VCursorOffRids, func() {
 		w.Get(e.sk1)
 		w.LoadI64(VSortOffIds)

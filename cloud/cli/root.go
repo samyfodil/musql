@@ -99,7 +99,7 @@ func (a *app) root() *cobra.Command {
 	root.PersistentFlags().StringVar(&a.url, "url", "", "server URL (default: the configured one)")
 	root.PersistentFlags().StringVar(&a.org, "org", "", "organization slug (default: the current one)")
 	root.PersistentFlags().BoolVar(&a.json, "json", false, "print JSON")
-	root.AddCommand(a.authCmd(), a.configCmd(), a.orgCmd(), a.groupCmd(), a.dbCmd(), a.openCmd(), a.backupCmd(), a.restoreCmd())
+	root.AddCommand(a.authCmd(), a.configCmd(), a.orgCmd(), a.groupCmd(), a.dbCmd(), a.openCmd(), a.devCmd(), a.backupCmd(), a.restoreCmd())
 	return root
 }
 

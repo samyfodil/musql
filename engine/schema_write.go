@@ -549,6 +549,11 @@ func finalizeAutoIncrement(name, createSQL string, withoutRowid bool, cols []col
 // ok=false with an unsupported error. finalizeAutoIncrement then checks the
 // column is the rowid alias.
 func detectAutoIncrementColumn(createSQL string) (colName string, ok bool, err error) {
+	// No token is AUTOINCREMENT in a text that does not spell it. Every caller
+	// has parsed this text already, so not lexing it hides no error.
+	if !r35aContainsFold(createSQL, "autoincrement") {
+		return "", false, nil
+	}
 	toks, lerr := lex(createSQL)
 	if lerr != nil {
 		return "", false, lerr
@@ -1615,6 +1620,11 @@ func parseTableTailClauses(sqlText string) (withoutRowid, strict bool, err error
 	if err != nil {
 		return false, false, err
 	}
+	return parseTableTailToks(toks)
+}
+
+// parseTableTailToks is parseTableTailClauses over the text's tokens.
+func parseTableTailToks(toks []token) (withoutRowid, strict bool, err error) {
 	depth := 0
 	seenOpen := false
 	for i, t := range toks {

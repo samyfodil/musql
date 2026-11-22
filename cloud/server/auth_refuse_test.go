@@ -41,8 +41,9 @@ func TestAuthRefusals(t *testing.T) {
 	restore()
 
 	groups := cloudv1connect.NewGroupServiceClient(e.ts.Client(), e.ts.URL)
+	must(groups.Update(ctx, auth(e.admin, &v1.UpdateGroupRequest{Org: "acme", Name: "default", DeleteProtection: ptrTo(true)})))
 	if _, err := groups.Delete(ctx, auth(e.admin, &v1.DeleteGroupRequest{Org: "acme", Name: "default"})); code(err) != connect.CodeFailedPrecondition {
-		t.Errorf("a group still holding a database: %v", err)
+		t.Errorf("a protected group: %v", err)
 	}
 	if _, err := orgs.Invite(ctx, auth(e.admin, &v1.InviteRequest{Org: "acme", Email: "dee@example.com"})); code(err) != connect.CodeInvalidArgument {
 		t.Errorf("an invite without a role: %v", err)

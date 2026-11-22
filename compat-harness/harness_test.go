@@ -3,6 +3,7 @@ package compat
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -64,21 +65,15 @@ func TestMain(m *testing.M) {
 // run executes stmts against one engine and returns its normalized JSON results.
 func run(t *testing.T, engine string, stmts []string) []map[string]any {
 	t.Helper()
-	f, err := os.CreateTemp(t.TempDir(), "stmts-*.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	enc, _ := json.Marshal(stmts)
-	f.Write(enc)
-	f.Close()
+	stmtsFile := writeStmts(t, stmts)
 
-	cmd := exec.Command(workerBin[engine], f.Name())
+	cmd := exec.Command(workerBin[engine], stmtsFile)
 	cmd.Env = append(os.Environ(),
 		"COMPAT_DSN="+filepath.Join(t.TempDir(), engine+workerExt[engine]),
 	)
 	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("%s worker failed: %v", engine, err)
+		t.Fatalf("%s worker failed: %s", engine, workerFailure(err))
 	}
 	var res []map[string]any
 	if err := json.Unmarshal(out, &res); err != nil {
@@ -87,6 +82,31 @@ func run(t *testing.T, engine string, stmts []string) []map[string]any {
 	normalizeRandomColumnSuffixes(res)
 	blankStorageOnlyColumns(res)
 	return res
+}
+
+// writeStmts writes stmts where a worker reads them. A short write would
+// hand the worker a truncated list, which it rejects as a usage error.
+func writeStmts(t *testing.T, stmts []string) string {
+	t.Helper()
+	enc, err := json.Marshal(stmts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := filepath.Join(t.TempDir(), "stmts.json")
+	if err := os.WriteFile(name, enc, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return name
+}
+
+// workerFailure is err with what the worker wrote to stderr, which says why
+// it exited.
+func workerFailure(err error) string {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && len(ee.Stderr) > 0 {
+		return fmt.Sprintf("%v\n%s", err, ee.Stderr)
+	}
+	return err.Error()
 }
 
 // storageOnlyColumns are columns that vary by implementation storage, not data.

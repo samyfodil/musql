@@ -19,24 +19,18 @@ import (
 // runDeadline executes statements with a timeout to catch hangs.
 func runDeadline(t *testing.T, engine string, stmts []string, d time.Duration) []map[string]any {
 	t.Helper()
-	f, err := os.CreateTemp(t.TempDir(), "stmts-*.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	enc, _ := json.Marshal(stmts)
-	f.Write(enc)
-	f.Close()
+	stmtsFile := writeStmts(t, stmts)
 
 	ctx, cancel := context.WithTimeout(context.Background(), d)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, workerBin[engine], f.Name())
+	cmd := exec.CommandContext(ctx, workerBin[engine], stmtsFile)
 	cmd.Env = append(os.Environ(), "COMPAT_DSN="+filepath.Join(t.TempDir(), engine+".db"))
 	out, err := cmd.Output()
 	if ctx.Err() != nil {
 		t.Fatalf("%s worker did not terminate within %s on: %v", engine, d, stmts)
 	}
 	if err != nil {
-		t.Fatalf("%s worker failed: %v", engine, err)
+		t.Fatalf("%s worker failed: %s", engine, workerFailure(err))
 	}
 	var res []map[string]any
 	if err := json.Unmarshal(out, &res); err != nil {

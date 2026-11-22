@@ -205,27 +205,16 @@ func (s *Shell) run(ctx context.Context, in LineReader, errw io.Writer, finish b
 	}
 }
 
-// Complete reports whether text ends with a finished statement: a ";" outside
-// a literal, comment or trigger body, trailing comments allowed. The engine's
-// splitter decides, so the shell and the server agree on boundaries.
-func Complete(text string) bool {
-	const probe = "musql_probe"
-	without, err := engine.SplitStatements(text)
-	if err != nil || len(without) == 0 {
-		return false
-	}
-	with, err := engine.SplitStatements(text + "\n" + probe)
-	if err != nil {
-		return false
-	}
-	return len(with) == len(without)+1 && with[len(with)-1] == probe
-}
+// Complete reports whether text ends with a finished statement, the way C's
+// shell decides whether to read another line.
+func Complete(text string) bool { return engine.Complete(text) }
 
 // Script runs every statement in text, stopping at the first error.
 func (s *Shell) Script(ctx context.Context, text string) error {
 	stmts, err := engine.SplitStatements(text)
 	if err != nil {
-		return err
+		// Text that does not tokenize gets the server's own error for it.
+		return s.Exec(ctx, text)
 	}
 	for _, st := range stmts {
 		if err := s.Exec(ctx, st); err != nil {

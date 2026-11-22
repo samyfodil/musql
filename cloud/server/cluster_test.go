@@ -472,18 +472,27 @@ func TestClusterPlacement(t *testing.T) {
 	need(nodes[0].groups().AddLocation(ctx, auth(nodes[0].admin, &v1.AddLocationRequest{Org: "acme", Group: "default", Location: "sea"})))(t)
 	eventually(t, "sea to hold app again, rows included", func() bool { return nodes[2].count("app", "back") == 1 })
 
-	// Deleting on one node removes it everywhere.
+	// Deleting on one node closes it everywhere; its files stay until the
+	// sweep after its retention.
 	_, _, dbs := nodes[1].clients()
 	need(dbs.Delete(ctx, auth(nodes[1].admin, &v1.DeleteDatabaseRequest{Org: "acme", Name: "app"})))(t)
-	eventually(t, "app gone from every node", func() bool {
+	eventually(t, "app closed on every node", func() bool {
 		for _, n := range nodes {
 			if n.s.replHandle(d.ID) != nil {
 				return false
 			}
 		}
-		_, err := os.Stat(path)
-		return os.IsNotExist(err)
+		return true
 	})
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("a deleted database's file within its retention: %v", err)
+	}
+	if err := nodes[2].s.sweepDeleted(ctx, time.Now().Add(6*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("a deleted database's file past its retention: %v", err)
+	}
 }
 
 // TestClusterDeclinesWhatCannotReplicate: replication refuses a virtual table
