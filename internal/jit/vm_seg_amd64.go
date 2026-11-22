@@ -691,6 +691,7 @@ func (e *vmEmit) seekRowid(pc int, in VInsn) {
 	a.MovRegMemD(RCX, R9, VCursorOffSrvd)
 	a.IncReg(RCX)
 	a.MovMemDReg(R9, VCursorOffSrvd, RCX)
+	a.IncMemD(R9, VCursorOffSteps)
 	a.JmpL(l("done"))
 
 	// No row: the cursor on none, and on to T.
@@ -812,6 +813,7 @@ func (e *vmEmit) seekIdx(pc int, in VInsn) {
 	a.MovMemDImm(R10, VCursorOffDirty, 1)
 	a.MovMemDImm(R10, VCursorOffAdv, 1)
 	a.MovMemDImm(R10, VCursorOffState, 2)
+	a.IncMemD(R10, VCursorOffSteps)
 	a.JmpL(l("done"))
 
 	// No row: the cursor on none, and on to T.
@@ -1038,6 +1040,10 @@ func (e *vmEmit) sortSeek(pc int, in VInsn) {
 	a.SubRegReg(RDX, RAX)
 	a.MovMemDReg(R10, VCursorOffN, RDX)
 	a.MovMemDReg(R10, VCursorOffSLo, RAX)
+	// An empty run's pointers are the lists' starts: one at lo would point
+	// past the end when lo is N, into whatever the collector finds there.
+	a.TestRegReg(RDX, RDX)
+	a.Cmovcc(CondE, RAX, RDX)
 	a.MovRegMemD(RCX, R9, VSortOffIds)
 	a.LeaIdx(RCX, RCX, RAX)
 	a.MovMemDReg(R10, VCursorOffRids, RCX)

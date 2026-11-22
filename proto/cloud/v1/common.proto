@@ -72,6 +72,9 @@ message Group {
   google.protobuf.Timestamp created_at = 5;
   // What the group's databases default to.
   DatabaseType type = 6;
+  // While set, the group cannot be deleted.
+  bool delete_protection = 7;
+  string id = 8;
 }
 
 message Database {
@@ -87,4 +90,27 @@ message Database {
   google.protobuf.Timestamp created_at = 10;
   DatabaseType type = 11;
   Durability durability = 12;
+  // While set, the database cannot be deleted.
+  bool delete_protection = 13;
+  // Hrana refuses every statement while block_reads is set, and every
+  // statement that writes while block_writes is, with the error code BLOCKED.
+  bool block_reads = 14;
+  bool block_writes = 15;
+}
+
+// A database deleted and kept until expires_at, when it is removed with its
+// history; until then RestoreDeleted brings it back.
+message DeletedDatabase {
+  Database database = 1;
+  google.protobuf.Timestamp deleted_at = 2;
+  google.protobuf.Timestamp expires_at = 3;
+  // Set when it was deleted with its group: restoring the group restores it.
+  string deleted_with_group = 4;
+}
+
+// A deleted group, kept with the databases deleted with it.
+message DeletedGroup {
+  Group group = 1;
+  google.protobuf.Timestamp deleted_at = 2;
+  google.protobuf.Timestamp expires_at = 3;
 }

@@ -95,6 +95,10 @@ export declare type CreateGroupResponse = Message<"cloud.v1.CreateGroupResponse"
 export declare const CreateGroupResponseSchema: GenMessage<CreateGroupResponse>;
 
 /**
+ * Delete deletes a group with its databases, kept as DeleteDatabase keeps a
+ * database (DatabaseService.RestoreDeleted). Refused (FAILED_PRECONDITION)
+ * while the group or one of its databases has delete_protection set.
+ *
  * @generated from message cloud.v1.DeleteGroupRequest
  */
 export declare type DeleteGroupRequest = Message<"cloud.v1.DeleteGroupRequest"> & {
@@ -126,6 +130,50 @@ export declare type DeleteGroupResponse = Message<"cloud.v1.DeleteGroupResponse"
  * Use `create(DeleteGroupResponseSchema)` to create a new message.
  */
 export declare const DeleteGroupResponseSchema: GenMessage<DeleteGroupResponse>;
+
+/**
+ * Update sets the fields given and leaves the others as they are.
+ *
+ * @generated from message cloud.v1.UpdateGroupRequest
+ */
+export declare type UpdateGroupRequest = Message<"cloud.v1.UpdateGroupRequest"> & {
+  /**
+   * @generated from field: string org = 1;
+   */
+  org: string;
+
+  /**
+   * @generated from field: string name = 2;
+   */
+  name: string;
+
+  /**
+   * @generated from field: optional bool delete_protection = 3;
+   */
+  deleteProtection?: boolean | undefined;
+};
+
+/**
+ * Describes the message cloud.v1.UpdateGroupRequest.
+ * Use `create(UpdateGroupRequestSchema)` to create a new message.
+ */
+export declare const UpdateGroupRequestSchema: GenMessage<UpdateGroupRequest>;
+
+/**
+ * @generated from message cloud.v1.UpdateGroupResponse
+ */
+export declare type UpdateGroupResponse = Message<"cloud.v1.UpdateGroupResponse"> & {
+  /**
+   * @generated from field: cloud.v1.Group group = 1;
+   */
+  group?: Group | undefined;
+};
+
+/**
+ * Describes the message cloud.v1.UpdateGroupResponse.
+ * Use `create(UpdateGroupResponseSchema)` to create a new message.
+ */
+export declare const UpdateGroupResponseSchema: GenMessage<UpdateGroupResponse>;
 
 /**
  * @generated from message cloud.v1.AddLocationRequest
@@ -289,6 +337,14 @@ export declare const GroupService: GenService<{
     methodKind: "unary";
     input: typeof DeleteGroupRequestSchema;
     output: typeof DeleteGroupResponseSchema;
+  },
+  /**
+   * @generated from rpc cloud.v1.GroupService.Update
+   */
+  update: {
+    methodKind: "unary";
+    input: typeof UpdateGroupRequestSchema;
+    output: typeof UpdateGroupResponseSchema;
   },
   /**
    * @generated from rpc cloud.v1.GroupService.AddLocation
