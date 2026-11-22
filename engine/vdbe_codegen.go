@@ -302,6 +302,9 @@ type compiler struct {
 	// joinHalt is the running emitJoinLoops' addrHalt chain (joinHalt,
 	// vdbe_join_codegen.go), nil outside one.
 	joinHalt *joinHalt
+	// joinScopes is the running emitJoinLoops' sources and order, and the
+	// scopes of each prefix of that order once asked for (scopesBound).
+	joinScopes *joinPrefixScopes
 	// joinLevelNow is the level whose terms emitJoinLevel is compiling.
 	joinLevelNow int
 

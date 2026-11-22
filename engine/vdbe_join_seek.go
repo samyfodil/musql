@@ -639,15 +639,10 @@ func (c *compiler) emitJoinSeekHint(srcs []joinSource, order []int, level int, s
 		return nil
 	}
 	saved := c.scopes
-	var visible []compileScope
-	for i := 0; i < level; i++ {
-		// sourceScopes, not .scope directly: a preceding materialized
-		// parenthesized join GROUP contributes every one of its own leaf
-		// members here, not just its connector's -- see emitJoinLevel's
-		// identical ON-narrowing comment.
-		visible = append(visible, sourceScopes(srcs[order[i]])...)
-	}
-	c.scopes = visible
+	// A preceding materialized parenthesized join GROUP contributes every one
+	// of its own leaf members here, not just its connector's -- see
+	// emitJoinLevel's identical ON-narrowing comment.
+	c.scopes = c.scopesBound(srcs, order, level)
 	defer func() { c.scopes = saved }()
 
 	cur := s.scope.cursor
