@@ -1942,7 +1942,7 @@ func compileScanWindow(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 	deferredWhere := andConjuncts(jplan.deferred)
 
 	body := func() error {
-		whereJump := -1
+		var whereJumps []int
 		if deferredWhere != nil {
 			// deferredWhere is andConjuncts of plan.deferred -- itself a set of
 			// genuine top-level WHERE AND-conjuncts (splitTopLevelAnd, join.go)
@@ -1954,12 +1954,11 @@ func compileScanWindow(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 			// RIGHT/FULL join or parenthesized group forces a row-value/
 			// subquery WHERE conjunct here instead of into a per-level bucket
 			// (planJoinPushdown's mentionsSubquery forceLast rule, join.go).
-			c.inWhereConjunct = true
-			wReg, werr := c.compileExpr(deferredWhere)
+			var werr error
+			whereJumps, werr = c.whereFalseJumps(deferredWhere)
 			if werr != nil {
 				return werr
 			}
-			whereJump = c.emit(Instruction{Op: OpIfNot, P1: wReg, P3: 1})
 		}
 		for _, s := range srcs {
 			for j := 0; j < len(s.tbl.cols); j++ {
@@ -1974,8 +1973,8 @@ func compileScanWindow(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 		}
 		c.emit(Instruction{Op: OpMakeRecord, P1: colBase, P2: plan.nCols + len(srcs) + plan.nOps, P3: recReg})
 		c.emit(Instruction{Op: OpWindowAppend, P1: recReg})
-		if whereJump >= 0 {
-			c.patch(whereJump, c.here())
+		for _, j := range whereJumps {
+			c.patch(j, c.here())
 		}
 		return nil
 	}
