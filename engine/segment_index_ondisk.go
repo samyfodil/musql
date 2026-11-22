@@ -276,12 +276,44 @@ func radixOrderInt64(vals []int64) []int32 {
 	kp, tp := getScratchU64(n), getScratchU64(n)
 	defer scratchU64.Put(kp)
 	defer scratchU64.Put(tp)
-	keys, tk := *kp, *tp
-	to := make([]int32, n)
-	and, or := ^uint64(0), uint64(0)
+	keys := *kp
 	for i, v := range vals {
-		k := uint64(v) ^ 1<<63
-		keys[i] = k
+		keys[i] = uint64(v) ^ 1<<63
+	}
+	order, _ = radixOrderKeys(keys, *tp, order)
+	return order
+}
+
+// radixSortInt64 is radixOrderInt64 that also sorts vals in place, which it
+// sorts in rather than in a copy.
+func radixSortInt64(vals []int64) []int32 {
+	n := len(vals)
+	order := make([]int32, n)
+	for i := range order {
+		order[i] = int32(i)
+	}
+	if slices.IsSorted(vals) {
+		return order
+	}
+	tp := getScratchU64(n)
+	defer scratchU64.Put(tp)
+	keys := unsafe.Slice((*uint64)(unsafe.Pointer(unsafe.SliceData(vals))), n)
+	for i, v := range vals {
+		keys[i] = uint64(v) ^ 1<<63
+	}
+	order, sorted := radixOrderKeys(keys, *tp, order)
+	for i, k := range sorted {
+		vals[i] = int64(k ^ 1<<63)
+	}
+	return order
+}
+
+// radixOrderKeys sorts keys, sign bits flipped, and order with them, using
+// tk as scratch; the sorted keys are in keys or tk, whichever it returns.
+func radixOrderKeys(keys, tk []uint64, order []int32) ([]int32, []uint64) {
+	to := make([]int32, len(keys))
+	and, or := ^uint64(0), uint64(0)
+	for _, k := range keys {
 		and &= k
 		or |= k
 	}
@@ -306,7 +338,7 @@ func radixOrderInt64(vals []int64) []int32 {
 		keys, tk = tk, keys
 		order, to = to, order
 	}
-	return order
+	return order, keys
 }
 
 func buildSegColumnIndexWith(vals []int64, codec uint16, compare func(a, b int64) int) ([]byte, bool) {
