@@ -211,8 +211,13 @@ type StmtResult struct {
 	Rows             []*Row                 `protobuf:"bytes,2,rep,name=rows,proto3" json:"rows,omitempty"`
 	AffectedRowCount uint64                 `protobuf:"varint,3,opt,name=affected_row_count,json=affectedRowCount,proto3" json:"affected_row_count,omitempty"`
 	LastInsertRowid  *int64                 `protobuf:"zigzag64,4,opt,name=last_insert_rowid,json=lastInsertRowid,proto3,oneof" json:"last_insert_rowid,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// The rows the statement read and wrote, counted as libSQL counts
+	// LIBSQL_STMTSTATUS_ROWS_READ and _WRITTEN, and how long it ran.
+	RowsRead        uint64  `protobuf:"varint,6,opt,name=rows_read,json=rowsRead,proto3" json:"rows_read,omitempty"`
+	RowsWritten     uint64  `protobuf:"varint,7,opt,name=rows_written,json=rowsWritten,proto3" json:"rows_written,omitempty"`
+	QueryDurationMs float64 `protobuf:"fixed64,8,opt,name=query_duration_ms,json=queryDurationMs,proto3" json:"query_duration_ms,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *StmtResult) Reset() {
@@ -269,6 +274,27 @@ func (x *StmtResult) GetAffectedRowCount() uint64 {
 func (x *StmtResult) GetLastInsertRowid() int64 {
 	if x != nil && x.LastInsertRowid != nil {
 		return *x.LastInsertRowid
+	}
+	return 0
+}
+
+func (x *StmtResult) GetRowsRead() uint64 {
+	if x != nil {
+		return x.RowsRead
+	}
+	return 0
+}
+
+func (x *StmtResult) GetRowsWritten() uint64 {
+	if x != nil {
+		return x.RowsWritten
+	}
+	return 0
+}
+
+func (x *StmtResult) GetQueryDurationMs() float64 {
+	if x != nil {
+		return x.QueryDurationMs
 	}
 	return 0
 }
@@ -1381,7 +1407,7 @@ const file_hrana_hrana_proto_rawDesc = "" +
 	"_want_rows\"B\n" +
 	"\bNamedArg\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\"\n" +
-	"\x05value\x18\x02 \x01(\v2\f.hrana.ValueR\x05value\"\xc1\x01\n" +
+	"\x05value\x18\x02 \x01(\v2\f.hrana.ValueR\x05value\"\xad\x02\n" +
 	"\n" +
 	"StmtResult\x12\x1e\n" +
 	"\x04cols\x18\x01 \x03(\v2\n" +
@@ -1389,7 +1415,10 @@ const file_hrana_hrana_proto_rawDesc = "" +
 	"\x04rows\x18\x02 \x03(\v2\n" +
 	".hrana.RowR\x04rows\x12,\n" +
 	"\x12affected_row_count\x18\x03 \x01(\x04R\x10affectedRowCount\x12/\n" +
-	"\x11last_insert_rowid\x18\x04 \x01(\x12H\x00R\x0flastInsertRowid\x88\x01\x01B\x14\n" +
+	"\x11last_insert_rowid\x18\x04 \x01(\x12H\x00R\x0flastInsertRowid\x88\x01\x01\x12\x1b\n" +
+	"\trows_read\x18\x06 \x01(\x04R\browsRead\x12!\n" +
+	"\frows_written\x18\a \x01(\x04R\vrowsWritten\x12*\n" +
+	"\x11query_duration_ms\x18\b \x01(\x01R\x0fqueryDurationMsB\x14\n" +
 	"\x12_last_insert_rowid\"U\n" +
 	"\x03Col\x12\x17\n" +
 	"\x04name\x18\x01 \x01(\tH\x00R\x04name\x88\x01\x01\x12\x1f\n" +

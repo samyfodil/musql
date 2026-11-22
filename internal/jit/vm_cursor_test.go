@@ -497,7 +497,8 @@ func TestVMGuardCopy(t *testing.T) {
 
 // TestVMSortSeek: VSortSeek puts the cursor on the run of its Sort's rows
 // whose key is the INTEGER in the register -- one row, several, none before,
-// between and past the keys -- which the VRewind after it walks; any other key
+// between and past the keys -- which the VRewind after it walks; an empty
+// run's pointers are the lists' starts, never past their end. Any other key
 // and a cursor with no Sort exit untouched. VSortEmpty jumps when the Sort
 // holds no row.
 func TestVMSortSeek(t *testing.T) {
@@ -540,8 +541,13 @@ func TestVMSortSeek(t *testing.T) {
 		regs := []tvalue{{Typ: tvInt, I: c.key}, {Typ: tvInt}, {Typ: tvInt}}
 		cur := cursor(sort)
 		pc := runVMCursor(t, prog, regs, nil, cur, 0)
+		// An empty run points at the lists' starts, never past their end.
+		at := c.lo
+		if c.n == 0 {
+			at = 0
+		}
 		if pc != c.wantPC || cur.SortLo != int64(c.lo) || cur.N != int64(c.n) || regs[2].I != c.sum ||
-			cur.Rows != unsafe.Add(sort.Rows, c.lo*24) || cur.Rowids != unsafe.Add(sort.Ids, c.lo*8) {
+			cur.Rows != unsafe.Add(sort.Rows, at*24) || cur.Rowids != unsafe.Add(sort.Ids, at*8) {
 			t.Errorf("key %d: pc %d lo %d n %d sum %#x, want pc %d lo %d n %d sum %#x", c.key, pc, cur.SortLo, cur.N, regs[2].I,
 				c.wantPC, c.lo, c.n, c.sum)
 		}

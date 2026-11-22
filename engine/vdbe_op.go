@@ -609,6 +609,13 @@ const (
 	// conjunct, still evaluated in the loop, rejects.
 	OpSeekRowidRangeHint
 
+	// OpRowidReadBound: P1: cursor. P2: first bound register. P4 ([]int): the
+	// kind of each bound, from r[P2] on (rowidRangeGT, GE, LT, LE). P3, when
+	// positive, is one more than the rows a pass may count. Bounds the rows
+	// cursor P1's loop counts as read to those C's plan would read
+	// (rowidBillBounds, planBillLimit), and changes nothing the loop visits.
+	OpRowidReadBound
+
 	// OpSeekRowidSetHint: P1: cursor. P2: first key register. P3: how many.
 	// Makes the next OpRewind fetch only the rows whose rowid is one of
 	// r[P2..P2+P3-1] (numeric affinity first), ascending: C's IN loop over the

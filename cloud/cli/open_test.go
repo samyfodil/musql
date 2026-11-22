@@ -94,6 +94,28 @@ func TestShellTimer(t *testing.T) {
 	}
 }
 
+// TestShellBadToken: a statement the tokenizer rejects ends at its ";" and
+// fails with C's error, instead of leaving the prompt waiting for more.
+func TestShellBadToken(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "t.musq"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var out, errs bytes.Buffer
+	sh := &cli.Shell{DB: db, Out: &out, Mode: "table"}
+	in := &lines{in: []string{"select 1::int;", "'';", "SELECT 3 AS three;"}}
+	if err := sh.REPL(context.Background(), in, &errs); err != nil {
+		t.Fatal(err)
+	}
+	if got := errs.String(); got != "Error: unrecognized token: \":\"\nError: near \"''\": syntax error\n" {
+		t.Fatalf("errors %q", got)
+	}
+	if got := out.String(); got != "three\n3\n" {
+		t.Fatalf("out %q", got)
+	}
+}
+
 // TestShellRead: .read runs a file's statements and dot-commands as if typed,
 // its last statement with or without a ";", and carries on past an error as
 // the prompt does; a .quit in it ends the shell, and a file reading itself

@@ -43,6 +43,14 @@ const (
 	DatabaseServiceDeleteProcedure = "/cloud.v1.DatabaseService/Delete"
 	// DatabaseServiceRenameProcedure is the fully-qualified name of the DatabaseService's Rename RPC.
 	DatabaseServiceRenameProcedure = "/cloud.v1.DatabaseService/Rename"
+	// DatabaseServiceUpdateProcedure is the fully-qualified name of the DatabaseService's Update RPC.
+	DatabaseServiceUpdateProcedure = "/cloud.v1.DatabaseService/Update"
+	// DatabaseServiceListDeletedProcedure is the fully-qualified name of the DatabaseService's
+	// ListDeleted RPC.
+	DatabaseServiceListDeletedProcedure = "/cloud.v1.DatabaseService/ListDeleted"
+	// DatabaseServiceRestoreDeletedProcedure is the fully-qualified name of the DatabaseService's
+	// RestoreDeleted RPC.
+	DatabaseServiceRestoreDeletedProcedure = "/cloud.v1.DatabaseService/RestoreDeleted"
 	// DatabaseServiceUsageProcedure is the fully-qualified name of the DatabaseService's Usage RPC.
 	DatabaseServiceUsageProcedure = "/cloud.v1.DatabaseService/Usage"
 	// DatabaseServiceListSnapshotsProcedure is the fully-qualified name of the DatabaseService's
@@ -81,6 +89,9 @@ type DatabaseServiceClient interface {
 	Create(context.Context, *connect.Request[v1.CreateDatabaseRequest]) (*connect.Response[v1.CreateDatabaseResponse], error)
 	Delete(context.Context, *connect.Request[v1.DeleteDatabaseRequest]) (*connect.Response[v1.DeleteDatabaseResponse], error)
 	Rename(context.Context, *connect.Request[v1.RenameDatabaseRequest]) (*connect.Response[v1.RenameDatabaseResponse], error)
+	Update(context.Context, *connect.Request[v1.UpdateDatabaseRequest]) (*connect.Response[v1.UpdateDatabaseResponse], error)
+	ListDeleted(context.Context, *connect.Request[v1.ListDeletedRequest]) (*connect.Response[v1.ListDeletedResponse], error)
+	RestoreDeleted(context.Context, *connect.Request[v1.RestoreDeletedRequest]) (*connect.Response[v1.RestoreDeletedResponse], error)
 	Usage(context.Context, *connect.Request[v1.UsageRequest]) (*connect.Response[v1.UsageResponse], error)
 	ListSnapshots(context.Context, *connect.Request[v1.ListSnapshotsRequest]) (*connect.Response[v1.ListSnapshotsResponse], error)
 	CreateSnapshot(context.Context, *connect.Request[v1.CreateSnapshotRequest]) (*connect.Response[v1.CreateSnapshotResponse], error)
@@ -133,6 +144,24 @@ func NewDatabaseServiceClient(httpClient connect.HTTPClient, baseURL string, opt
 			httpClient,
 			baseURL+DatabaseServiceRenameProcedure,
 			connect.WithSchema(databaseServiceMethods.ByName("Rename")),
+			connect.WithClientOptions(opts...),
+		),
+		update: connect.NewClient[v1.UpdateDatabaseRequest, v1.UpdateDatabaseResponse](
+			httpClient,
+			baseURL+DatabaseServiceUpdateProcedure,
+			connect.WithSchema(databaseServiceMethods.ByName("Update")),
+			connect.WithClientOptions(opts...),
+		),
+		listDeleted: connect.NewClient[v1.ListDeletedRequest, v1.ListDeletedResponse](
+			httpClient,
+			baseURL+DatabaseServiceListDeletedProcedure,
+			connect.WithSchema(databaseServiceMethods.ByName("ListDeleted")),
+			connect.WithClientOptions(opts...),
+		),
+		restoreDeleted: connect.NewClient[v1.RestoreDeletedRequest, v1.RestoreDeletedResponse](
+			httpClient,
+			baseURL+DatabaseServiceRestoreDeletedProcedure,
+			connect.WithSchema(databaseServiceMethods.ByName("RestoreDeleted")),
 			connect.WithClientOptions(opts...),
 		),
 		usage: connect.NewClient[v1.UsageRequest, v1.UsageResponse](
@@ -211,6 +240,9 @@ type databaseServiceClient struct {
 	create           *connect.Client[v1.CreateDatabaseRequest, v1.CreateDatabaseResponse]
 	delete           *connect.Client[v1.DeleteDatabaseRequest, v1.DeleteDatabaseResponse]
 	rename           *connect.Client[v1.RenameDatabaseRequest, v1.RenameDatabaseResponse]
+	update           *connect.Client[v1.UpdateDatabaseRequest, v1.UpdateDatabaseResponse]
+	listDeleted      *connect.Client[v1.ListDeletedRequest, v1.ListDeletedResponse]
+	restoreDeleted   *connect.Client[v1.RestoreDeletedRequest, v1.RestoreDeletedResponse]
 	usage            *connect.Client[v1.UsageRequest, v1.UsageResponse]
 	listSnapshots    *connect.Client[v1.ListSnapshotsRequest, v1.ListSnapshotsResponse]
 	createSnapshot   *connect.Client[v1.CreateSnapshotRequest, v1.CreateSnapshotResponse]
@@ -247,6 +279,21 @@ func (c *databaseServiceClient) Delete(ctx context.Context, req *connect.Request
 // Rename calls cloud.v1.DatabaseService.Rename.
 func (c *databaseServiceClient) Rename(ctx context.Context, req *connect.Request[v1.RenameDatabaseRequest]) (*connect.Response[v1.RenameDatabaseResponse], error) {
 	return c.rename.CallUnary(ctx, req)
+}
+
+// Update calls cloud.v1.DatabaseService.Update.
+func (c *databaseServiceClient) Update(ctx context.Context, req *connect.Request[v1.UpdateDatabaseRequest]) (*connect.Response[v1.UpdateDatabaseResponse], error) {
+	return c.update.CallUnary(ctx, req)
+}
+
+// ListDeleted calls cloud.v1.DatabaseService.ListDeleted.
+func (c *databaseServiceClient) ListDeleted(ctx context.Context, req *connect.Request[v1.ListDeletedRequest]) (*connect.Response[v1.ListDeletedResponse], error) {
+	return c.listDeleted.CallUnary(ctx, req)
+}
+
+// RestoreDeleted calls cloud.v1.DatabaseService.RestoreDeleted.
+func (c *databaseServiceClient) RestoreDeleted(ctx context.Context, req *connect.Request[v1.RestoreDeletedRequest]) (*connect.Response[v1.RestoreDeletedResponse], error) {
+	return c.restoreDeleted.CallUnary(ctx, req)
 }
 
 // Usage calls cloud.v1.DatabaseService.Usage.
@@ -311,6 +358,9 @@ type DatabaseServiceHandler interface {
 	Create(context.Context, *connect.Request[v1.CreateDatabaseRequest]) (*connect.Response[v1.CreateDatabaseResponse], error)
 	Delete(context.Context, *connect.Request[v1.DeleteDatabaseRequest]) (*connect.Response[v1.DeleteDatabaseResponse], error)
 	Rename(context.Context, *connect.Request[v1.RenameDatabaseRequest]) (*connect.Response[v1.RenameDatabaseResponse], error)
+	Update(context.Context, *connect.Request[v1.UpdateDatabaseRequest]) (*connect.Response[v1.UpdateDatabaseResponse], error)
+	ListDeleted(context.Context, *connect.Request[v1.ListDeletedRequest]) (*connect.Response[v1.ListDeletedResponse], error)
+	RestoreDeleted(context.Context, *connect.Request[v1.RestoreDeletedRequest]) (*connect.Response[v1.RestoreDeletedResponse], error)
 	Usage(context.Context, *connect.Request[v1.UsageRequest]) (*connect.Response[v1.UsageResponse], error)
 	ListSnapshots(context.Context, *connect.Request[v1.ListSnapshotsRequest]) (*connect.Response[v1.ListSnapshotsResponse], error)
 	CreateSnapshot(context.Context, *connect.Request[v1.CreateSnapshotRequest]) (*connect.Response[v1.CreateSnapshotResponse], error)
@@ -359,6 +409,24 @@ func NewDatabaseServiceHandler(svc DatabaseServiceHandler, opts ...connect.Handl
 		DatabaseServiceRenameProcedure,
 		svc.Rename,
 		connect.WithSchema(databaseServiceMethods.ByName("Rename")),
+		connect.WithHandlerOptions(opts...),
+	)
+	databaseServiceUpdateHandler := connect.NewUnaryHandler(
+		DatabaseServiceUpdateProcedure,
+		svc.Update,
+		connect.WithSchema(databaseServiceMethods.ByName("Update")),
+		connect.WithHandlerOptions(opts...),
+	)
+	databaseServiceListDeletedHandler := connect.NewUnaryHandler(
+		DatabaseServiceListDeletedProcedure,
+		svc.ListDeleted,
+		connect.WithSchema(databaseServiceMethods.ByName("ListDeleted")),
+		connect.WithHandlerOptions(opts...),
+	)
+	databaseServiceRestoreDeletedHandler := connect.NewUnaryHandler(
+		DatabaseServiceRestoreDeletedProcedure,
+		svc.RestoreDeleted,
+		connect.WithSchema(databaseServiceMethods.ByName("RestoreDeleted")),
 		connect.WithHandlerOptions(opts...),
 	)
 	databaseServiceUsageHandler := connect.NewUnaryHandler(
@@ -439,6 +507,12 @@ func NewDatabaseServiceHandler(svc DatabaseServiceHandler, opts ...connect.Handl
 			databaseServiceDeleteHandler.ServeHTTP(w, r)
 		case DatabaseServiceRenameProcedure:
 			databaseServiceRenameHandler.ServeHTTP(w, r)
+		case DatabaseServiceUpdateProcedure:
+			databaseServiceUpdateHandler.ServeHTTP(w, r)
+		case DatabaseServiceListDeletedProcedure:
+			databaseServiceListDeletedHandler.ServeHTTP(w, r)
+		case DatabaseServiceRestoreDeletedProcedure:
+			databaseServiceRestoreDeletedHandler.ServeHTTP(w, r)
 		case DatabaseServiceUsageProcedure:
 			databaseServiceUsageHandler.ServeHTTP(w, r)
 		case DatabaseServiceListSnapshotsProcedure:
@@ -488,6 +562,18 @@ func (UnimplementedDatabaseServiceHandler) Delete(context.Context, *connect.Requ
 
 func (UnimplementedDatabaseServiceHandler) Rename(context.Context, *connect.Request[v1.RenameDatabaseRequest]) (*connect.Response[v1.RenameDatabaseResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("cloud.v1.DatabaseService.Rename is not implemented"))
+}
+
+func (UnimplementedDatabaseServiceHandler) Update(context.Context, *connect.Request[v1.UpdateDatabaseRequest]) (*connect.Response[v1.UpdateDatabaseResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("cloud.v1.DatabaseService.Update is not implemented"))
+}
+
+func (UnimplementedDatabaseServiceHandler) ListDeleted(context.Context, *connect.Request[v1.ListDeletedRequest]) (*connect.Response[v1.ListDeletedResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("cloud.v1.DatabaseService.ListDeleted is not implemented"))
+}
+
+func (UnimplementedDatabaseServiceHandler) RestoreDeleted(context.Context, *connect.Request[v1.RestoreDeletedRequest]) (*connect.Response[v1.RestoreDeletedResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("cloud.v1.DatabaseService.RestoreDeleted is not implemented"))
 }
 
 func (UnimplementedDatabaseServiceHandler) Usage(context.Context, *connect.Request[v1.UsageRequest]) (*connect.Response[v1.UsageResponse], error) {
