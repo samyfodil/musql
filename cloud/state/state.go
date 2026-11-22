@@ -489,8 +489,10 @@ func retryable(err error) bool {
 	case errors.Is(err, engine.ErrBusy), errors.Is(err, ErrNoMaster), errors.Is(err, replication.ErrNotWriter), errors.Is(err, errUnreachable):
 		return true
 	case errors.As(err, &r):
-		// The master's own error, as text.
-		return strings.Contains(r.msg, engine.ErrBusy.Error()) || strings.Contains(r.msg, replication.ErrNotWriter.Error())
+		// The master's own error, as text, which the driver gives without
+		// its layer prefix.
+		return strings.Contains(r.msg, strings.TrimPrefix(engine.ErrBusy.Error(), "engine: ")) ||
+			strings.Contains(r.msg, replication.ErrNotWriter.Error())
 	}
 	return false
 }
