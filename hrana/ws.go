@@ -46,7 +46,7 @@ type wsConn struct {
 
 	mu      sync.Mutex
 	authed  bool
-	ro      bool // WithAuth marked the client read-only
+	acc     Access // what WithAuth granted the client
 	streams map[int32]*wsStream
 	cursors map[int32]*wsCursor
 	sqls    *sqlStore
@@ -111,14 +111,14 @@ func (s *Server) serveWS(w http.ResponseWriter, r *http.Request) {
 	}
 	// A client that sends its token with the upgrade is checked now, so a
 	// bad one never gets a socket; one that does not sends it in the hello.
-	upgradeAuthed, upgradeRO := false, false
+	upgradeAuthed, upgradeAcc := false, Access{}
 	if s.auth != nil && r.Header.Get("Authorization") != "" {
-		ro, status := s.authorize(bearer(r))
+		acc, status := s.authorize(bearer(r))
 		if status != 0 {
 			refuse(w, status)
 			return
 		}
-		upgradeAuthed, upgradeRO = true, ro
+		upgradeAuthed, upgradeAcc = true, acc
 	}
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: wsSubprotocols, InsecureSkipVerify: true})
 	if err != nil {
@@ -132,7 +132,7 @@ func (s *Server) serveWS(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithCancel(s.base)
 	wc := &wsConn{srv: s, c: c, protobuf: sub == "hrana3-protobuf", ctx: ctx,
-		authed: s.authToken == "" && s.auth == nil || upgradeAuthed, ro: upgradeRO, streams: map[int32]*wsStream{}, cursors: map[int32]*wsCursor{}, sqls: newSQLStore()}
+		authed: s.authToken == "" && s.auth == nil || upgradeAuthed, acc: upgradeAcc, streams: map[int32]*wsStream{}, cursors: map[int32]*wsCursor{}, sqls: newSQLStore()}
 	defer func() {
 		cancel()
 		wc.closeAll()
@@ -173,11 +173,11 @@ func (wc *wsConn) dispatch(msg *pbws.ClientMsg) bool {
 	case *pbws.ClientMsg_Hello:
 		jwt := m.Hello.GetJwt()
 		wc.mu.Lock()
-		ro, status := wc.ro, 0
+		acc, status := wc.acc, 0
 		// A token in the upgrade request already passed; an empty hello
 		// keeps it, a token in the hello replaces it.
 		if wc.srv.auth != nil && (jwt != "" || !wc.authed) {
-			ro, status = wc.srv.authorize(jwt)
+			acc, status = wc.srv.authorize(jwt)
 		}
 		if status == http.StatusServiceUnavailable {
 			wc.mu.Unlock()
@@ -193,7 +193,7 @@ func (wc *wsConn) dispatch(msg *pbws.ClientMsg) bool {
 			wc.c.Close(websocket.StatusPolicyViolation, "authentication failed")
 			return false
 		}
-		wc.authed, wc.ro = true, ro
+		wc.authed, wc.acc = true, acc
 		wc.mu.Unlock()
 		wc.send(&pbws.ServerMsg{Msg: &pbws.ServerMsg_HelloOk{HelloOk: &pbws.HelloOkMsg{}}})
 		return true
@@ -253,8 +253,8 @@ func (wc *wsConn) request(rq *pbws.RequestMsg) {
 		}
 		st := &wsStream{jobs: make(chan func(), 64)}
 		wc.streams[sid] = st
-		ro := wc.ro || wc.srv.writesBlocked()
-		db := wc.srv.dbFor(ro)
+		ro := wc.acc.ReadOnly || wc.srv.writesBlocked()
+		db, authz := wc.srv.dbFor(ro), wc.acc.authorizer()
 		wc.mu.Unlock()
 		wc.srv.ws.Add(1) // under the connection, which Close is already waiting on
 		go func() {
@@ -273,6 +273,7 @@ func (wc *wsConn) request(rq *pbws.RequestMsg) {
 				return
 			}
 			s.ro, s.block = ro, wc.srv.block
+			s.setAuthorizer(authz)
 			st.stream, st.open = s, true
 			wc.reply(id, &pbws.ResponseOkMsg{Response: &pbws.ResponseOkMsg_OpenStream{OpenStream: &pbws.OpenStreamResp{}}})
 		}

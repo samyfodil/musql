@@ -33,16 +33,23 @@ const bearer = (next) => async (req) => {
 	}
 };
 
-const transport = server && createConnectTransport({ baseUrl: server, interceptors: [bearer] });
+export let transport = null;
+export let api = null;
 
-export const api = server && {
-	ai: createClient(AIService, transport),
-	auth: createClient(AuthService, transport),
-	db: createClient(DatabaseService, transport),
-	groups: createClient(GroupService, transport),
-	orgs: createClient(OrgService, transport),
-	users: createClient(UserService, transport),
-};
+/** setBaseURL points the clients at baseURL, the server's own origin when it is null. */
+export function setBaseURL(baseURL) {
+	const base = baseURL || server;
+	transport = base && createConnectTransport({ baseUrl: base, interceptors: [bearer] });
+	api = base && {
+		ai: createClient(AIService, transport),
+		auth: createClient(AuthService, transport),
+		db: createClient(DatabaseService, transport),
+		groups: createClient(GroupService, transport),
+		orgs: createClient(OrgService, transport),
+		users: createClient(UserService, transport),
+	};
+}
+setBaseURL(null);
 
 /** Whether e says the server does not implement the call (yet). */
 export const unimplemented = (e) => ConnectError.from(e).code === Code.Unimplemented;

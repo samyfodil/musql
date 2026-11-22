@@ -1,12 +1,18 @@
 {
-  "name": "musql-console",
+  "name": "@samyfodil/musql-console",
   "private": true,
   "type": "module",
+  "exports": {
+    ".": "./src/index.js",
+    "./vite": "./vite-plugin.js"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "test": "node --test",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "example": "vite -c example/vite.config.js",
+    "build:example": "vite build -c example/vite.config.js"
   },
   "dependencies": {
     "@bufbuild/protobuf": "2.16.0",
@@ -25,14 +31,18 @@
     "@uiw/react-codemirror": "^4.23.0",
     "@xyflow/react": "^12.12.0",
     "lucide-react": "^0.468.0",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
     "recharts": "^3.10.1",
     "sql-formatter": "^15.9.0"
   },
   "devDependencies": {
     "@bufbuild/protoc-gen-es": "2.16.0",
     "@vitejs/plugin-react": "^4.3.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
     "vite": "^6.0.0"
+  },
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
   }
 }

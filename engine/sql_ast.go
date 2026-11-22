@@ -77,6 +77,11 @@ type ColumnExpr struct {
 	// qualified resolver branch tell the two apart.
 	UsingRepr bool
 
+	// authRef numbers this reference's span in the text an authorizer's parse
+	// recorded (authPass.spans, from 1); 0 in every other parse. It sits in
+	// the padding after UsingRepr.
+	authRef int32
+
 	// UsingReprOwnItem, meaningful only with UsingRepr, is the FROM-item index
 	// of the join item this synthesized condition belongs to (the right side
 	// of the "=").
@@ -267,6 +272,8 @@ type FuncExpr struct {
 	Args     []Expr
 	Star     bool
 	Distinct bool
+	// authRef is ColumnExpr.authRef for the whole call.
+	authRef int32
 
 	// NameAsWritten is the call's spelling before Name was folded, kept only
 	// because one diagnostic echoes it VERBATIM: C SQLite reports
@@ -470,6 +477,10 @@ type CaseExpr struct {
 	// isBoolFalse marks the FALSE form of an isBool node, whose keyword
 	// stands in ELSE rather than THEN (desugarIsBool).
 	isBoolFalse bool
+	// iif is the call an iif() or if() was parsed from, as written, which an
+	// authorizer is asked about as a function; authRef numbers its span.
+	iif     string
+	authRef int32
 }
 
 // ParamExpr is a bound-parameter reference: "?", "?NNN", ":name", "@name", or
@@ -674,6 +685,8 @@ type SelectColumn struct {
 	// expanded into there.
 	cName  string
 	nfStar bool
+	// authRef numbers a "*"'s span recorded by an authorizer's parse.
+	authRef int32
 
 	Text string // verbatim source text of Expr, for default column naming (only used when !HasAlias)
 	// RawText is the verbatim source-text SPAN of Expr exactly as typed
