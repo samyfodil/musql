@@ -663,16 +663,24 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 		}
 		reach := jit.VReachMarks(vp, mark, nMarks)
 		jx.entryCurs = make([][]int, len(vp))
+		nEntry := 0
+		for _, e := range entry {
+			if e {
+				nEntry++
+			}
+		}
+		slab := make([]int, 0, nEntry*len(order))
 		for pc := range vp {
 			if !entry[pc] {
 				continue
 			}
-			jx.entryCurs[pc] = []int{}
+			at := len(slab)
 			for _, c := range order {
 				if reach[pc][c/64]&(1<<uint(c%64)) != 0 {
-					jx.entryCurs[pc] = append(jx.entryCurs[pc], c)
+					slab = append(slab, c)
 				}
 			}
+			jx.entryCurs[pc] = slab[at:len(slab):len(slab)]
 		}
 	}
 	for _, in := range vp {
