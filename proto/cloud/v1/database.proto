@@ -226,6 +226,17 @@ message CreateTokenRequest {
   Access access = 4;
   // No expiry when unset.
   google.protobuf.Timestamp expires_at = 5;
+  // Limits the token to these actions; none leaves it unlimited.
+  repeated TokenPermission permissions = 6;
+}
+
+// TokenPermission grants actions on tables, as Turso's fine-grained
+// permissions do. Actions are data_read, data_add, data_update, data_delete,
+// schema_add, schema_update and schema_delete.
+message TokenPermission {
+  // Every table when empty.
+  repeated string tables = 1;
+  repeated string actions = 2;
 }
 
 message CreateTokenResponse {

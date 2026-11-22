@@ -489,10 +489,15 @@ const EXPIRY = [["", "Never"], ["1", "1 hour"], ["24", "1 day"], ["168", "7 days
 function DbToken({ cloud, db, toast, onClose }) {
 	const [readOnly, setReadOnly] = useState(!can(cloud, Role.MEMBER));
 	const [hours, setHours] = useState("168");
+	const [perms, setPerms] = useState("");
 	const [tok, setTok] = useState(null);
 	const go = async () => {
 		try {
-			const r = await api.db.createToken({ org: cloud.org, name: db.name, access: readOnly ? Access.READ_ONLY : Access.FULL, expiresAt: hours ? stamp(new Date(Date.now() + hours * 3600e3)) : undefined });
+			const permissions = perms.split(/\s+/).filter(Boolean).map((p) => {
+				const [table, actions] = p.split(":");
+				return { tables: table === "all" ? [] : [table], actions: (actions || "").split(",") };
+			});
+			const r = await api.db.createToken({ org: cloud.org, name: db.name, access: readOnly ? Access.READ_ONLY : Access.FULL, expiresAt: hours ? stamp(new Date(Date.now() + hours * 3600e3)) : undefined, permissions });
 			setTok(r.token);
 		} catch (e) {
 			toast(message(e), true);
@@ -504,6 +509,8 @@ function DbToken({ cloud, db, toast, onClose }) {
 				<div className="form">
 					<label className="check"><input type="checkbox" checked={readOnly} disabled={!can(cloud, Role.MEMBER)} onChange={(e) => setReadOnly(e.target.checked)} /> Read-only</label>
 					<Field label="Expires"><select value={hours} onChange={(e) => setHours(e.target.value)}>{EXPIRY.map(([v, l]) => <option key={v} value={v}>{l}</option>)}</select></Field>
+					<Field label="Permissions"><input className="mono" spellCheck={false} autoComplete="off" placeholder="all:data_read comments:data_add" value={perms} onChange={(e) => setPerms(e.target.value)} /></Field>
+					<p className="dim small">Empty for no limit. Each entry is a table or all, then actions: data_read, data_add, data_update, data_delete, schema_add, schema_update, schema_delete.</p>
 				</div>
 			)}
 		</Drawer>

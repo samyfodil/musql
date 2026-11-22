@@ -35,6 +35,10 @@ type Conn struct {
 	// interrupt stops this connection's running statement (watchContext).
 	interrupt atomic.Bool
 
+	// authorizer is SetAuthorizer's callback, and authGen counts its changes.
+	authorizer Authorizer
+	authGen    uint64
+
 	// boostStmts are the statements package boost has prepared on this
 	// connection, by query text; boostNamed is its argument scratch.
 	boostStmts map[string]*Stmt

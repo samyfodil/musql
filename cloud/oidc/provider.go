@@ -67,6 +67,14 @@ type Claims struct {
 	Group  string `json:"group,omitempty"`
 	Access string `json:"access,omitempty"`
 	Gen    int64  `json:"gen,omitempty"`
+	// Perm limits a database token to the actions it lists, Turso's claim.
+	Perm []Permission `json:"perm,omitempty"`
+}
+
+// A Permission grants actions on tables; no tables means every table.
+type Permission struct {
+	Tables  []string `json:"t,omitempty"`
+	Actions []string `json:"a"`
 }
 
 // signKey is a signing key and what is known of the tokens it signed.

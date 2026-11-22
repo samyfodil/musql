@@ -43,6 +43,8 @@ func TestDatabaseCommands(t *testing.T) {
 		{[]string{"db", "restore", "app"}, "--timestamp is required"},
 		{[]string{"db", "restore", "app", "--timestamp", "soon"}, "bad timestamp"},
 		{[]string{"db", "tokens", "create", "app", "-e", "soon"}, "soon"},
+		{[]string{"db", "tokens", "create", "app", "-p", "data_read"}, "invalid permission format"},
+		{[]string{"db", "tokens", "create", "app", "-p", "all:data_insert"}, "unknown action"},
 		{[]string{"db", "destroy", "app"}, "not deleted"},
 		{[]string{"db", "tokens", "invalidate", "app"}, "nothing invalidated"},
 		{[]string{"db", "show", "nope"}, "not found"},
@@ -77,6 +79,9 @@ func TestDatabaseCommands(t *testing.T) {
 		t.Fatalf("restore in place: %q", out)
 	}
 
+	if tok := h.run("db", "tokens", "create", "app", "-p", "all:data_read", "-p", "t:data_add,data_update"); strings.Count(tok, ".") != 2 {
+		t.Fatalf("a token with permissions: %q", tok)
+	}
 	if tok := h.run("db", "tokens", "create", "default", "--group"); strings.Count(tok, ".") != 2 {
 		t.Fatalf("a group token: %q", tok)
 	}
