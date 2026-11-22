@@ -160,6 +160,15 @@ type segRowSource struct {
 	// row -- measured as more time in segColumn's own body than in the
 	// segment.Value it wraps.
 	cols []segColPlan
+
+	// bill, when set, counts as read the rows a filter passed over on the
+	// way to the next row it selected, as a walk would have stepped onto
+	// them: the rows it selects are counted as the cursor lands on them.
+	// billPos is the segment row up to which they are counted.
+	bill    *int64
+	billPos int
+	// billLeft is the cursor's own cap on the rows it counts (vdbeCursor's).
+	billLeft *int64
 }
 
 // segColPlan is one column's precomputed read rule.
@@ -627,6 +636,7 @@ func (src *segRowSource) pull() (s *segment, row int, rowid uint64, ok bool) {
 				src.selPrep, _ = segSelectPrep(s, src.filter, src.ipkCol, src.params)
 				src.sel, src.selPos = src.sel[:0], 0
 				src.selHi, src.selWin, src.selScan = src.ri, segSelWindow, false
+				src.billPos = src.ri
 			}
 		}
 		if src.selPrep != nil {
@@ -634,6 +644,10 @@ func (src *segRowSource) pull() (s *segment, row int, rowid uint64, ok bool) {
 				if src.selPos < len(src.sel) {
 					row = int(src.sel[src.selPos])
 					src.selPos++
+					if src.bill != nil {
+						src.billRows(int64(row - src.billPos))
+						src.billPos = row + 1
+					}
 					segRowsServed.Add(1)
 					segRowsSelected.Add(1)
 					return s, row, s.Rowid(row), true
@@ -641,8 +655,13 @@ func (src *segRowSource) pull() (s *segment, row int, rowid uint64, ok bool) {
 				if src.selScan && src.ri < src.selHi {
 					row = src.ri
 					src.ri++
+					src.billPos = src.ri
 					segRowsServed.Add(1)
 					return s, row, s.Rowid(row), true
+				}
+				if src.bill != nil {
+					src.billRows(int64(src.selHi - src.billPos))
+					src.billPos = src.selHi
 				}
 				if src.selHi >= src.end {
 					break
@@ -811,4 +830,13 @@ func (src *segSource) liveBaseSegments(rootPage uint32) (segs []*segment, ok boo
 	}
 	segs = base.rp.segs.byRoot[base.root]
 	return segs, len(segs) > 0
+}
+
+// billRows counts n rows a filter passed over as read, within the cursor's cap.
+func (src *segRowSource) billRows(n int64) {
+	if src.billLeft != nil {
+		n = min(n, *src.billLeft)
+		*src.billLeft -= n
+	}
+	*src.bill += n
 }

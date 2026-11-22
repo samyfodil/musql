@@ -40,7 +40,7 @@ func (e *vmEmit) fload(pc, r int, x XReg, intOK bool, isReal Reg) {
 	if !intOK {
 		e.know.isFloat.add(r)
 	}
-	e.cold = append(e.cold, func() {
+	e.cold = append(e.cold, vmCold{body: func() {
 		a.Bind(notReal)
 		if !intOK {
 			e.exitAt(pc)
@@ -52,7 +52,7 @@ func (e *vmEmit) fload(pc, r int, x XReg, intOK bool, isReal Reg) {
 		a.Xorps(x, x)
 		a.Cvtsi2sdq(x, RAX)
 		a.JmpL(done)
-	})
+	}})
 	a.Bind(done)
 }
 
@@ -211,7 +211,7 @@ func (e *vmEmit) fcmpLoad(pc, r int, x XReg) {
 	a.CmpMemDByte(RSI, e.d(r, L.OffTyp), L.TypFloat)
 	a.JccL(CondNE, isInt)
 	a.MovsdLoad(x, RSI, e.d(r, L.OffF))
-	e.cold = append(e.cold, func() {
+	e.cold = append(e.cold, vmCold{body: func() {
 		a.Bind(isInt)
 		a.CmpMemDByte(RSI, e.d(r, L.OffTyp), L.TypInt)
 		e.jccStub(CondNE, pc)
@@ -225,7 +225,7 @@ func (e *vmEmit) fcmpLoad(pc, r int, x XReg) {
 		a.Xorps(x, x)
 		a.Cvtsi2sdq(x, RAX)
 		a.JmpL(done)
-	})
+	}})
 	a.Bind(done)
 }
 

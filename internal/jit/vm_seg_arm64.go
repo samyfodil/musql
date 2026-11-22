@@ -410,6 +410,9 @@ func (e *vmEmitArm) seekRowid(pc int, in VInsn) {
 	a.LdrImm(X10, X9, VCursorOffSrvd)
 	a.AddImm(X10, X10, 1)
 	a.StrImm(X10, X9, VCursorOffSrvd)
+	a.LdrImm(X10, X9, VCursorOffSteps)
+	a.AddImm(X10, X10, 1)
+	a.StrImm(X10, X9, VCursorOffSteps)
 	a.B(done)
 
 	// No row: the cursor on none, and on to T.
@@ -532,6 +535,9 @@ func (e *vmEmitArm) seekIdx(pc int, in VInsn) {
 	a.StrImm(X10, X9, VCursorOffAdv)
 	a.MovImm16(X10, 2)
 	a.StrImm(X10, X9, VCursorOffState)
+	a.LdrImm(X10, X9, VCursorOffSteps)
+	a.AddImm(X10, X10, 1)
+	a.StrImm(X10, X9, VCursorOffSteps)
 	a.B(done)
 
 	// No row: the cursor on none, and on to T.
@@ -963,6 +969,8 @@ func (e *vmEmitArm) sortSeek(pc int, in VInsn) {
 	a.SubReg(X13, X13, X8)
 	a.StrImm(X13, X9, VCursorOffN)
 	a.StrImm(X8, X9, VCursorOffSLo)
+	a.CmpImm(X13, 0)
+	a.Csel(X8, X8, xzr, CondNE) // an empty run's pointers are the lists' starts (amd64's)
 	a.LdrImm(X10, X5, VSortOffIds)
 	a.AddRegLSL3(X10, X10, X8)
 	a.StrImm(X10, X9, VCursorOffRids)

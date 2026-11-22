@@ -223,6 +223,9 @@ func (x *CreateGroupResponse) GetGroup() *Group {
 	return nil
 }
 
+// Delete deletes a group with its databases, kept as DeleteDatabase keeps a
+// database (DatabaseService.RestoreDeleted). Refused (FAILED_PRECONDITION)
+// while the group or one of its databases has delete_protection set.
 type DeleteGroupRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Org           string                 `protobuf:"bytes,1,opt,name=org,proto3" json:"org,omitempty"`
@@ -311,6 +314,111 @@ func (*DeleteGroupResponse) Descriptor() ([]byte, []int) {
 	return file_cloud_v1_group_proto_rawDescGZIP(), []int{5}
 }
 
+// Update sets the fields given and leaves the others as they are.
+type UpdateGroupRequest struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Org              string                 `protobuf:"bytes,1,opt,name=org,proto3" json:"org,omitempty"`
+	Name             string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	DeleteProtection *bool                  `protobuf:"varint,3,opt,name=delete_protection,json=deleteProtection,proto3,oneof" json:"delete_protection,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *UpdateGroupRequest) Reset() {
+	*x = UpdateGroupRequest{}
+	mi := &file_cloud_v1_group_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdateGroupRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateGroupRequest) ProtoMessage() {}
+
+func (x *UpdateGroupRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_cloud_v1_group_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateGroupRequest.ProtoReflect.Descriptor instead.
+func (*UpdateGroupRequest) Descriptor() ([]byte, []int) {
+	return file_cloud_v1_group_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *UpdateGroupRequest) GetOrg() string {
+	if x != nil {
+		return x.Org
+	}
+	return ""
+}
+
+func (x *UpdateGroupRequest) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *UpdateGroupRequest) GetDeleteProtection() bool {
+	if x != nil && x.DeleteProtection != nil {
+		return *x.DeleteProtection
+	}
+	return false
+}
+
+type UpdateGroupResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Group         *Group                 `protobuf:"bytes,1,opt,name=group,proto3" json:"group,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UpdateGroupResponse) Reset() {
+	*x = UpdateGroupResponse{}
+	mi := &file_cloud_v1_group_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdateGroupResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateGroupResponse) ProtoMessage() {}
+
+func (x *UpdateGroupResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_cloud_v1_group_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateGroupResponse.ProtoReflect.Descriptor instead.
+func (*UpdateGroupResponse) Descriptor() ([]byte, []int) {
+	return file_cloud_v1_group_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *UpdateGroupResponse) GetGroup() *Group {
+	if x != nil {
+		return x.Group
+	}
+	return nil
+}
+
 type AddLocationRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Org           string                 `protobuf:"bytes,1,opt,name=org,proto3" json:"org,omitempty"`
@@ -322,7 +430,7 @@ type AddLocationRequest struct {
 
 func (x *AddLocationRequest) Reset() {
 	*x = AddLocationRequest{}
-	mi := &file_cloud_v1_group_proto_msgTypes[6]
+	mi := &file_cloud_v1_group_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -334,7 +442,7 @@ func (x *AddLocationRequest) String() string {
 func (*AddLocationRequest) ProtoMessage() {}
 
 func (x *AddLocationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cloud_v1_group_proto_msgTypes[6]
+	mi := &file_cloud_v1_group_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -347,7 +455,7 @@ func (x *AddLocationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AddLocationRequest.ProtoReflect.Descriptor instead.
 func (*AddLocationRequest) Descriptor() ([]byte, []int) {
-	return file_cloud_v1_group_proto_rawDescGZIP(), []int{6}
+	return file_cloud_v1_group_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *AddLocationRequest) GetOrg() string {
@@ -380,7 +488,7 @@ type AddLocationResponse struct {
 
 func (x *AddLocationResponse) Reset() {
 	*x = AddLocationResponse{}
-	mi := &file_cloud_v1_group_proto_msgTypes[7]
+	mi := &file_cloud_v1_group_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -392,7 +500,7 @@ func (x *AddLocationResponse) String() string {
 func (*AddLocationResponse) ProtoMessage() {}
 
 func (x *AddLocationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_cloud_v1_group_proto_msgTypes[7]
+	mi := &file_cloud_v1_group_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -405,7 +513,7 @@ func (x *AddLocationResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AddLocationResponse.ProtoReflect.Descriptor instead.
 func (*AddLocationResponse) Descriptor() ([]byte, []int) {
-	return file_cloud_v1_group_proto_rawDescGZIP(), []int{7}
+	return file_cloud_v1_group_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *AddLocationResponse) GetGroup() *Group {
@@ -426,7 +534,7 @@ type RemoveLocationRequest struct {
 
 func (x *RemoveLocationRequest) Reset() {
 	*x = RemoveLocationRequest{}
-	mi := &file_cloud_v1_group_proto_msgTypes[8]
+	mi := &file_cloud_v1_group_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -438,7 +546,7 @@ func (x *RemoveLocationRequest) String() string {
 func (*RemoveLocationRequest) ProtoMessage() {}
 
 func (x *RemoveLocationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cloud_v1_group_proto_msgTypes[8]
+	mi := &file_cloud_v1_group_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -451,7 +559,7 @@ func (x *RemoveLocationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveLocationRequest.ProtoReflect.Descriptor instead.
 func (*RemoveLocationRequest) Descriptor() ([]byte, []int) {
-	return file_cloud_v1_group_proto_rawDescGZIP(), []int{8}
+	return file_cloud_v1_group_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *RemoveLocationRequest) GetOrg() string {
@@ -484,7 +592,7 @@ type RemoveLocationResponse struct {
 
 func (x *RemoveLocationResponse) Reset() {
 	*x = RemoveLocationResponse{}
-	mi := &file_cloud_v1_group_proto_msgTypes[9]
+	mi := &file_cloud_v1_group_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -496,7 +604,7 @@ func (x *RemoveLocationResponse) String() string {
 func (*RemoveLocationResponse) ProtoMessage() {}
 
 func (x *RemoveLocationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_cloud_v1_group_proto_msgTypes[9]
+	mi := &file_cloud_v1_group_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -509,7 +617,7 @@ func (x *RemoveLocationResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveLocationResponse.ProtoReflect.Descriptor instead.
 func (*RemoveLocationResponse) Descriptor() ([]byte, []int) {
-	return file_cloud_v1_group_proto_rawDescGZIP(), []int{9}
+	return file_cloud_v1_group_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *RemoveLocationResponse) GetGroup() *Group {
@@ -529,7 +637,7 @@ type Location struct {
 
 func (x *Location) Reset() {
 	*x = Location{}
-	mi := &file_cloud_v1_group_proto_msgTypes[10]
+	mi := &file_cloud_v1_group_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -541,7 +649,7 @@ func (x *Location) String() string {
 func (*Location) ProtoMessage() {}
 
 func (x *Location) ProtoReflect() protoreflect.Message {
-	mi := &file_cloud_v1_group_proto_msgTypes[10]
+	mi := &file_cloud_v1_group_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -554,7 +662,7 @@ func (x *Location) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Location.ProtoReflect.Descriptor instead.
 func (*Location) Descriptor() ([]byte, []int) {
-	return file_cloud_v1_group_proto_rawDescGZIP(), []int{10}
+	return file_cloud_v1_group_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *Location) GetCode() string {
@@ -580,7 +688,7 @@ type ListLocationsRequest struct {
 
 func (x *ListLocationsRequest) Reset() {
 	*x = ListLocationsRequest{}
-	mi := &file_cloud_v1_group_proto_msgTypes[11]
+	mi := &file_cloud_v1_group_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -592,7 +700,7 @@ func (x *ListLocationsRequest) String() string {
 func (*ListLocationsRequest) ProtoMessage() {}
 
 func (x *ListLocationsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cloud_v1_group_proto_msgTypes[11]
+	mi := &file_cloud_v1_group_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -605,7 +713,7 @@ func (x *ListLocationsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListLocationsRequest.ProtoReflect.Descriptor instead.
 func (*ListLocationsRequest) Descriptor() ([]byte, []int) {
-	return file_cloud_v1_group_proto_rawDescGZIP(), []int{11}
+	return file_cloud_v1_group_proto_rawDescGZIP(), []int{13}
 }
 
 type ListLocationsResponse struct {
@@ -617,7 +725,7 @@ type ListLocationsResponse struct {
 
 func (x *ListLocationsResponse) Reset() {
 	*x = ListLocationsResponse{}
-	mi := &file_cloud_v1_group_proto_msgTypes[12]
+	mi := &file_cloud_v1_group_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -629,7 +737,7 @@ func (x *ListLocationsResponse) String() string {
 func (*ListLocationsResponse) ProtoMessage() {}
 
 func (x *ListLocationsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_cloud_v1_group_proto_msgTypes[12]
+	mi := &file_cloud_v1_group_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -642,7 +750,7 @@ func (x *ListLocationsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListLocationsResponse.ProtoReflect.Descriptor instead.
 func (*ListLocationsResponse) Descriptor() ([]byte, []int) {
-	return file_cloud_v1_group_proto_rawDescGZIP(), []int{12}
+	return file_cloud_v1_group_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *ListLocationsResponse) GetLocations() []*Location {
@@ -671,7 +779,14 @@ const file_cloud_v1_group_proto_rawDesc = "" +
 	"\x12DeleteGroupRequest\x12\x10\n" +
 	"\x03org\x18\x01 \x01(\tR\x03org\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\"\x15\n" +
-	"\x13DeleteGroupResponse\"X\n" +
+	"\x13DeleteGroupResponse\"\x82\x01\n" +
+	"\x12UpdateGroupRequest\x12\x10\n" +
+	"\x03org\x18\x01 \x01(\tR\x03org\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x120\n" +
+	"\x11delete_protection\x18\x03 \x01(\bH\x00R\x10deleteProtection\x88\x01\x01B\x14\n" +
+	"\x12_delete_protection\"<\n" +
+	"\x13UpdateGroupResponse\x12%\n" +
+	"\x05group\x18\x01 \x01(\v2\x0f.cloud.v1.GroupR\x05group\"X\n" +
 	"\x12AddLocationRequest\x12\x10\n" +
 	"\x03org\x18\x01 \x01(\tR\x03org\x12\x14\n" +
 	"\x05group\x18\x02 \x01(\tR\x05group\x12\x1a\n" +
@@ -689,11 +804,12 @@ const file_cloud_v1_group_proto_rawDesc = "" +
 	"\x04node\x18\x02 \x01(\tR\x04node\"\x16\n" +
 	"\x14ListLocationsRequest\"I\n" +
 	"\x15ListLocationsResponse\x120\n" +
-	"\tlocations\x18\x01 \x03(\v2\x12.cloud.v1.LocationR\tlocations2\xd2\x03\n" +
+	"\tlocations\x18\x01 \x03(\v2\x12.cloud.v1.LocationR\tlocations2\x99\x04\n" +
 	"\fGroupService\x12A\n" +
 	"\x04List\x12\x1b.cloud.v1.ListGroupsRequest\x1a\x1c.cloud.v1.ListGroupsResponse\x12E\n" +
 	"\x06Create\x12\x1c.cloud.v1.CreateGroupRequest\x1a\x1d.cloud.v1.CreateGroupResponse\x12E\n" +
-	"\x06Delete\x12\x1c.cloud.v1.DeleteGroupRequest\x1a\x1d.cloud.v1.DeleteGroupResponse\x12J\n" +
+	"\x06Delete\x12\x1c.cloud.v1.DeleteGroupRequest\x1a\x1d.cloud.v1.DeleteGroupResponse\x12E\n" +
+	"\x06Update\x12\x1c.cloud.v1.UpdateGroupRequest\x1a\x1d.cloud.v1.UpdateGroupResponse\x12J\n" +
 	"\vAddLocation\x12\x1c.cloud.v1.AddLocationRequest\x1a\x1d.cloud.v1.AddLocationResponse\x12S\n" +
 	"\x0eRemoveLocation\x12\x1f.cloud.v1.RemoveLocationRequest\x1a .cloud.v1.RemoveLocationResponse\x12P\n" +
 	"\rListLocations\x12\x1e.cloud.v1.ListLocationsRequest\x1a\x1f.cloud.v1.ListLocationsResponseB\x92\x01\n" +
@@ -712,7 +828,7 @@ func file_cloud_v1_group_proto_rawDescGZIP() []byte {
 	return file_cloud_v1_group_proto_rawDescData
 }
 
-var file_cloud_v1_group_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
+var file_cloud_v1_group_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
 var file_cloud_v1_group_proto_goTypes = []any{
 	(*ListGroupsRequest)(nil),      // 0: cloud.v1.ListGroupsRequest
 	(*ListGroupsResponse)(nil),     // 1: cloud.v1.ListGroupsResponse
@@ -720,40 +836,45 @@ var file_cloud_v1_group_proto_goTypes = []any{
 	(*CreateGroupResponse)(nil),    // 3: cloud.v1.CreateGroupResponse
 	(*DeleteGroupRequest)(nil),     // 4: cloud.v1.DeleteGroupRequest
 	(*DeleteGroupResponse)(nil),    // 5: cloud.v1.DeleteGroupResponse
-	(*AddLocationRequest)(nil),     // 6: cloud.v1.AddLocationRequest
-	(*AddLocationResponse)(nil),    // 7: cloud.v1.AddLocationResponse
-	(*RemoveLocationRequest)(nil),  // 8: cloud.v1.RemoveLocationRequest
-	(*RemoveLocationResponse)(nil), // 9: cloud.v1.RemoveLocationResponse
-	(*Location)(nil),               // 10: cloud.v1.Location
-	(*ListLocationsRequest)(nil),   // 11: cloud.v1.ListLocationsRequest
-	(*ListLocationsResponse)(nil),  // 12: cloud.v1.ListLocationsResponse
-	(*Group)(nil),                  // 13: cloud.v1.Group
-	(DatabaseType)(0),              // 14: cloud.v1.DatabaseType
+	(*UpdateGroupRequest)(nil),     // 6: cloud.v1.UpdateGroupRequest
+	(*UpdateGroupResponse)(nil),    // 7: cloud.v1.UpdateGroupResponse
+	(*AddLocationRequest)(nil),     // 8: cloud.v1.AddLocationRequest
+	(*AddLocationResponse)(nil),    // 9: cloud.v1.AddLocationResponse
+	(*RemoveLocationRequest)(nil),  // 10: cloud.v1.RemoveLocationRequest
+	(*RemoveLocationResponse)(nil), // 11: cloud.v1.RemoveLocationResponse
+	(*Location)(nil),               // 12: cloud.v1.Location
+	(*ListLocationsRequest)(nil),   // 13: cloud.v1.ListLocationsRequest
+	(*ListLocationsResponse)(nil),  // 14: cloud.v1.ListLocationsResponse
+	(*Group)(nil),                  // 15: cloud.v1.Group
+	(DatabaseType)(0),              // 16: cloud.v1.DatabaseType
 }
 var file_cloud_v1_group_proto_depIdxs = []int32{
-	13, // 0: cloud.v1.ListGroupsResponse.groups:type_name -> cloud.v1.Group
-	14, // 1: cloud.v1.CreateGroupRequest.type:type_name -> cloud.v1.DatabaseType
-	13, // 2: cloud.v1.CreateGroupResponse.group:type_name -> cloud.v1.Group
-	13, // 3: cloud.v1.AddLocationResponse.group:type_name -> cloud.v1.Group
-	13, // 4: cloud.v1.RemoveLocationResponse.group:type_name -> cloud.v1.Group
-	10, // 5: cloud.v1.ListLocationsResponse.locations:type_name -> cloud.v1.Location
-	0,  // 6: cloud.v1.GroupService.List:input_type -> cloud.v1.ListGroupsRequest
-	2,  // 7: cloud.v1.GroupService.Create:input_type -> cloud.v1.CreateGroupRequest
-	4,  // 8: cloud.v1.GroupService.Delete:input_type -> cloud.v1.DeleteGroupRequest
-	6,  // 9: cloud.v1.GroupService.AddLocation:input_type -> cloud.v1.AddLocationRequest
-	8,  // 10: cloud.v1.GroupService.RemoveLocation:input_type -> cloud.v1.RemoveLocationRequest
-	11, // 11: cloud.v1.GroupService.ListLocations:input_type -> cloud.v1.ListLocationsRequest
-	1,  // 12: cloud.v1.GroupService.List:output_type -> cloud.v1.ListGroupsResponse
-	3,  // 13: cloud.v1.GroupService.Create:output_type -> cloud.v1.CreateGroupResponse
-	5,  // 14: cloud.v1.GroupService.Delete:output_type -> cloud.v1.DeleteGroupResponse
-	7,  // 15: cloud.v1.GroupService.AddLocation:output_type -> cloud.v1.AddLocationResponse
-	9,  // 16: cloud.v1.GroupService.RemoveLocation:output_type -> cloud.v1.RemoveLocationResponse
-	12, // 17: cloud.v1.GroupService.ListLocations:output_type -> cloud.v1.ListLocationsResponse
-	12, // [12:18] is the sub-list for method output_type
-	6,  // [6:12] is the sub-list for method input_type
-	6,  // [6:6] is the sub-list for extension type_name
-	6,  // [6:6] is the sub-list for extension extendee
-	0,  // [0:6] is the sub-list for field type_name
+	15, // 0: cloud.v1.ListGroupsResponse.groups:type_name -> cloud.v1.Group
+	16, // 1: cloud.v1.CreateGroupRequest.type:type_name -> cloud.v1.DatabaseType
+	15, // 2: cloud.v1.CreateGroupResponse.group:type_name -> cloud.v1.Group
+	15, // 3: cloud.v1.UpdateGroupResponse.group:type_name -> cloud.v1.Group
+	15, // 4: cloud.v1.AddLocationResponse.group:type_name -> cloud.v1.Group
+	15, // 5: cloud.v1.RemoveLocationResponse.group:type_name -> cloud.v1.Group
+	12, // 6: cloud.v1.ListLocationsResponse.locations:type_name -> cloud.v1.Location
+	0,  // 7: cloud.v1.GroupService.List:input_type -> cloud.v1.ListGroupsRequest
+	2,  // 8: cloud.v1.GroupService.Create:input_type -> cloud.v1.CreateGroupRequest
+	4,  // 9: cloud.v1.GroupService.Delete:input_type -> cloud.v1.DeleteGroupRequest
+	6,  // 10: cloud.v1.GroupService.Update:input_type -> cloud.v1.UpdateGroupRequest
+	8,  // 11: cloud.v1.GroupService.AddLocation:input_type -> cloud.v1.AddLocationRequest
+	10, // 12: cloud.v1.GroupService.RemoveLocation:input_type -> cloud.v1.RemoveLocationRequest
+	13, // 13: cloud.v1.GroupService.ListLocations:input_type -> cloud.v1.ListLocationsRequest
+	1,  // 14: cloud.v1.GroupService.List:output_type -> cloud.v1.ListGroupsResponse
+	3,  // 15: cloud.v1.GroupService.Create:output_type -> cloud.v1.CreateGroupResponse
+	5,  // 16: cloud.v1.GroupService.Delete:output_type -> cloud.v1.DeleteGroupResponse
+	7,  // 17: cloud.v1.GroupService.Update:output_type -> cloud.v1.UpdateGroupResponse
+	9,  // 18: cloud.v1.GroupService.AddLocation:output_type -> cloud.v1.AddLocationResponse
+	11, // 19: cloud.v1.GroupService.RemoveLocation:output_type -> cloud.v1.RemoveLocationResponse
+	14, // 20: cloud.v1.GroupService.ListLocations:output_type -> cloud.v1.ListLocationsResponse
+	14, // [14:21] is the sub-list for method output_type
+	7,  // [7:14] is the sub-list for method input_type
+	7,  // [7:7] is the sub-list for extension type_name
+	7,  // [7:7] is the sub-list for extension extendee
+	0,  // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_cloud_v1_group_proto_init() }
@@ -762,13 +883,14 @@ func file_cloud_v1_group_proto_init() {
 		return
 	}
 	file_cloud_v1_common_proto_init()
+	file_cloud_v1_group_proto_msgTypes[6].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_cloud_v1_group_proto_rawDesc), len(file_cloud_v1_group_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   13,
+			NumMessages:   15,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
