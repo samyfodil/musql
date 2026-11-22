@@ -4,7 +4,7 @@
 
 import type { GenEnum, GenFile, GenMessage, GenService } from "@bufbuild/protobuf/codegenv2";
 import type { Message } from "@bufbuild/protobuf";
-import type { Database, DatabaseType, Durability } from "./common_pb";
+import type { Database, DatabaseType, DeletedDatabase, DeletedGroup, Durability, Group } from "./common_pb";
 import type { Timestamp } from "@bufbuild/protobuf/wkt";
 
 /**
@@ -176,6 +176,10 @@ export declare type CreateDatabaseResponse = Message<"cloud.v1.CreateDatabaseRes
 export declare const CreateDatabaseResponseSchema: GenMessage<CreateDatabaseResponse>;
 
 /**
+ * Delete keeps the database, closed and its name free, until the server's
+ * retention for deleted databases ends (ListDeleted, RestoreDeleted). A
+ * database with delete_protection set is refused (FAILED_PRECONDITION).
+ *
  * @generated from message cloud.v1.DeleteDatabaseRequest
  */
 export declare type DeleteDatabaseRequest = Message<"cloud.v1.DeleteDatabaseRequest"> & {
@@ -249,6 +253,161 @@ export declare type RenameDatabaseResponse = Message<"cloud.v1.RenameDatabaseRes
  * Use `create(RenameDatabaseResponseSchema)` to create a new message.
  */
 export declare const RenameDatabaseResponseSchema: GenMessage<RenameDatabaseResponse>;
+
+/**
+ * Update sets the fields given and leaves the others as they are.
+ *
+ * @generated from message cloud.v1.UpdateDatabaseRequest
+ */
+export declare type UpdateDatabaseRequest = Message<"cloud.v1.UpdateDatabaseRequest"> & {
+  /**
+   * @generated from field: string org = 1;
+   */
+  org: string;
+
+  /**
+   * @generated from field: string name = 2;
+   */
+  name: string;
+
+  /**
+   * @generated from field: optional bool delete_protection = 3;
+   */
+  deleteProtection?: boolean | undefined;
+
+  /**
+   * @generated from field: optional bool block_reads = 4;
+   */
+  blockReads?: boolean | undefined;
+
+  /**
+   * @generated from field: optional bool block_writes = 5;
+   */
+  blockWrites?: boolean | undefined;
+};
+
+/**
+ * Describes the message cloud.v1.UpdateDatabaseRequest.
+ * Use `create(UpdateDatabaseRequestSchema)` to create a new message.
+ */
+export declare const UpdateDatabaseRequestSchema: GenMessage<UpdateDatabaseRequest>;
+
+/**
+ * @generated from message cloud.v1.UpdateDatabaseResponse
+ */
+export declare type UpdateDatabaseResponse = Message<"cloud.v1.UpdateDatabaseResponse"> & {
+  /**
+   * @generated from field: cloud.v1.Database database = 1;
+   */
+  database?: Database | undefined;
+};
+
+/**
+ * Describes the message cloud.v1.UpdateDatabaseResponse.
+ * Use `create(UpdateDatabaseResponseSchema)` to create a new message.
+ */
+export declare const UpdateDatabaseResponseSchema: GenMessage<UpdateDatabaseResponse>;
+
+/**
+ * ListDeleted lists an org's deleted databases and groups that can still be
+ * restored.
+ *
+ * @generated from message cloud.v1.ListDeletedRequest
+ */
+export declare type ListDeletedRequest = Message<"cloud.v1.ListDeletedRequest"> & {
+  /**
+   * @generated from field: string org = 1;
+   */
+  org: string;
+};
+
+/**
+ * Describes the message cloud.v1.ListDeletedRequest.
+ * Use `create(ListDeletedRequestSchema)` to create a new message.
+ */
+export declare const ListDeletedRequestSchema: GenMessage<ListDeletedRequest>;
+
+/**
+ * @generated from message cloud.v1.ListDeletedResponse
+ */
+export declare type ListDeletedResponse = Message<"cloud.v1.ListDeletedResponse"> & {
+  /**
+   * @generated from field: repeated cloud.v1.DeletedDatabase databases = 1;
+   */
+  databases: DeletedDatabase[];
+
+  /**
+   * @generated from field: repeated cloud.v1.DeletedGroup groups = 2;
+   */
+  groups: DeletedGroup[];
+};
+
+/**
+ * Describes the message cloud.v1.ListDeletedResponse.
+ * Use `create(ListDeletedResponseSchema)` to create a new message.
+ */
+export declare const ListDeletedResponseSchema: GenMessage<ListDeletedResponse>;
+
+/**
+ * RestoreDeleted brings a deleted database back with its data and history,
+ * or a deleted group with the databases deleted with it. Tokens issued
+ * before are invalidated. A database whose group is deleted needs the group
+ * restored first.
+ *
+ * @generated from message cloud.v1.RestoreDeletedRequest
+ */
+export declare type RestoreDeletedRequest = Message<"cloud.v1.RestoreDeletedRequest"> & {
+  /**
+   * @generated from field: string org = 1;
+   */
+  org: string;
+
+  /**
+   * The id of a deleted database or group, from ListDeleted.
+   *
+   * @generated from field: string id = 2;
+   */
+  id: string;
+
+  /**
+   * The name it comes back under; its own when empty. A database restored
+   * with its group whose name is taken comes back as "<name>-<id6>".
+   *
+   * @generated from field: string new_name = 3;
+   */
+  newName: string;
+};
+
+/**
+ * Describes the message cloud.v1.RestoreDeletedRequest.
+ * Use `create(RestoreDeletedRequestSchema)` to create a new message.
+ */
+export declare const RestoreDeletedRequestSchema: GenMessage<RestoreDeletedRequest>;
+
+/**
+ * @generated from message cloud.v1.RestoreDeletedResponse
+ */
+export declare type RestoreDeletedResponse = Message<"cloud.v1.RestoreDeletedResponse"> & {
+  /**
+   * The database restored, or the group's databases.
+   *
+   * @generated from field: repeated cloud.v1.Database databases = 1;
+   */
+  databases: Database[];
+
+  /**
+   * The group restored.
+   *
+   * @generated from field: cloud.v1.Group group = 2;
+   */
+  group?: Group | undefined;
+};
+
+/**
+ * Describes the message cloud.v1.RestoreDeletedResponse.
+ * Use `create(RestoreDeletedResponseSchema)` to create a new message.
+ */
+export declare const RestoreDeletedResponseSchema: GenMessage<RestoreDeletedResponse>;
 
 /**
  * @generated from message cloud.v1.UsageRequest
@@ -1060,6 +1219,30 @@ export declare const DatabaseService: GenService<{
     methodKind: "unary";
     input: typeof RenameDatabaseRequestSchema;
     output: typeof RenameDatabaseResponseSchema;
+  },
+  /**
+   * @generated from rpc cloud.v1.DatabaseService.Update
+   */
+  update: {
+    methodKind: "unary";
+    input: typeof UpdateDatabaseRequestSchema;
+    output: typeof UpdateDatabaseResponseSchema;
+  },
+  /**
+   * @generated from rpc cloud.v1.DatabaseService.ListDeleted
+   */
+  listDeleted: {
+    methodKind: "unary";
+    input: typeof ListDeletedRequestSchema;
+    output: typeof ListDeletedResponseSchema;
+  },
+  /**
+   * @generated from rpc cloud.v1.DatabaseService.RestoreDeleted
+   */
+  restoreDeleted: {
+    methodKind: "unary";
+    input: typeof RestoreDeletedRequestSchema;
+    output: typeof RestoreDeletedResponseSchema;
   },
   /**
    * @generated from rpc cloud.v1.DatabaseService.Usage

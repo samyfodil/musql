@@ -18,6 +18,9 @@ import (
 // OpHashAggStep as matching rows stream past in scan order.
 type hashAggBucket struct {
 	key  []Value
+	// first is the rows stepped before this group's first, on a plan C
+	// answers as a stream (aggPlan.cStreams).
+	first int64
 	accs *aggAccumulators
 	// at is the group's index into a dense aggregate's state (hashAggState.dense).
 	at int32
@@ -56,6 +59,14 @@ type hashAggState struct {
 	denseAccs  *aggAccumulators
 	denseItems []*aggItem
 	denseCur   *hashAggBucket
+
+	// stream is set on a plan C answers as a stream (aggPlan.cStreams): rows
+	// is the rows stepped, emitted how many of sorted's groups had a result
+	// row when the last went out, and billed what streamReads counted so far.
+	stream  bool
+	rows    int64
+	emitted int
+	billed  int64
 }
 
 // denseChunk is how many groups the first of dense's chunks holds; each
@@ -387,6 +398,9 @@ func (m *vdbe) hashAggStep(plan *aggPlan, keyVals []Value, seg int) error {
 				m.aggNullRow = make([]Value, n)
 			}
 			m.aggAccs = a
+			if plan.cStreams {
+				m.hashAgg.rows++
+			}
 			return m.aggStep(m.aggRowCtx(plan, m.aggNullRow[:plan.nCols:plan.nCols], m.aggNullRow[plan.nCols:plan.nCols+len(plan.scopes)]), seg)
 		}
 	}
@@ -442,6 +456,13 @@ func (m *vdbe) hashAggStepRow(plan *aggPlan, keyVals []Value, seg int, row, rowi
 			h.unordered = true
 		}
 		h.made = append(h.made, b)
+		if plan.cStreams {
+			h.stream = true
+			b.first = h.rows
+		}
+	}
+	if plan.cStreams {
+		m.hashAgg.rows++
 	}
 	m.aggAccs = m.hashAgg.accsOf(b)
 	// JSON subtype is cleared here for grouped queries, matching the sorted drain path.
@@ -779,4 +800,23 @@ func floatAsCanonicalInt(f float64) (int64, bool) {
 		return 0, false
 	}
 	return i, true
+}
+
+// streamReads is what a GROUP BY C answers as a stream (aggPlan.cStreams)
+// has read beyond what it already counted. C walks its rows in group order
+// and stops once the LIMIT is met: it reads the rows of every group up to the
+// last with a result row, and the first row of the group after it, which is
+// how it learns that group ended. The hash aggregate stepped every row, but
+// counts only those; where its groups did not come in key order, all of them.
+func (h *hashAggState) streamReads() int64 {
+	n := h.rows
+	if !h.unordered && h.emitted > 0 && len(h.sorted) == len(h.made) && h.emitted < len(h.made) && h.made[h.emitted] == h.sorted[h.emitted] {
+		n = min(h.made[h.emitted].first+1, h.rows)
+	}
+	if n <= h.billed {
+		return 0
+	}
+	d := n - h.billed
+	h.billed = n
+	return d
 }

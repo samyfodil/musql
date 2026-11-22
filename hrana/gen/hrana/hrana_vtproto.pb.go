@@ -226,6 +226,22 @@ func (m *StmtResult) MarshalToSizedBufferVT(dAtA []byte) (int, error) {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
 	}
+	if m.QueryDurationMs != 0 {
+		i -= 8
+		binary.LittleEndian.PutUint64(dAtA[i:], uint64(math.Float64bits(float64(m.QueryDurationMs))))
+		i--
+		dAtA[i] = 0x41
+	}
+	if m.RowsWritten != 0 {
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.RowsWritten))
+		i--
+		dAtA[i] = 0x38
+	}
+	if m.RowsRead != 0 {
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.RowsRead))
+		i--
+		dAtA[i] = 0x30
+	}
 	if m.LastInsertRowid != nil {
 		i = protohelpers.EncodeVarint(dAtA, i, uint64((uint64(*m.LastInsertRowid)<<1)^uint64((*m.LastInsertRowid>>63))))
 		i--
@@ -1467,6 +1483,15 @@ func (m *StmtResult) SizeVT() (n int) {
 	if m.LastInsertRowid != nil {
 		n += 1 + protohelpers.SizeOfZigzag(uint64(*m.LastInsertRowid))
 	}
+	if m.RowsRead != 0 {
+		n += 1 + protohelpers.SizeOfVarint(uint64(m.RowsRead))
+	}
+	if m.RowsWritten != 0 {
+		n += 1 + protohelpers.SizeOfVarint(uint64(m.RowsWritten))
+	}
+	if m.QueryDurationMs != 0 {
+		n += 9
+	}
 	n += len(m.unknownFields)
 	return n
 }
@@ -2524,6 +2549,55 @@ func (m *StmtResult) UnmarshalVT(dAtA []byte) error {
 			v = (v >> 1) ^ uint64((int64(v&1)<<63)>>63)
 			v2 := int64(v)
 			m.LastInsertRowid = &v2
+		case 6:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field RowsRead", wireType)
+			}
+			m.RowsRead = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.RowsRead |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 7:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field RowsWritten", wireType)
+			}
+			m.RowsWritten = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.RowsWritten |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 8:
+			if wireType != 1 {
+				return fmt.Errorf("proto: wrong wireType = %d for field QueryDurationMs", wireType)
+			}
+			var v uint64
+			if (iNdEx + 8) > l {
+				return io.ErrUnexpectedEOF
+			}
+			v = uint64(binary.LittleEndian.Uint64(dAtA[iNdEx:]))
+			iNdEx += 8
+			m.QueryDurationMs = float64(math.Float64frombits(v))
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])

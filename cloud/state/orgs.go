@@ -143,7 +143,7 @@ func (s *Store) UpdateOrgName(ctx context.Context, id, name string) error {
 }
 
 // DeleteOrg removes an org and its records; the caller removes database
-// files first.
+// files. Its deleted databases' records are left to expire at once.
 func (s *Store) DeleteOrg(ctx context.Context, id string) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		if err := one(tx.Exec(`DELETE FROM orgs WHERE id = ?`, id)); err != nil {
@@ -155,12 +155,17 @@ func (s *Store) DeleteOrg(ctx context.Context, id string) error {
 			`DELETE FROM group_locations WHERE group_id IN (SELECT id FROM groups WHERE org_id = ?)`,
 			`DELETE FROM groups WHERE org_id = ?`,
 			`DELETE FROM databases WHERE org_id = ?`,
+			`DELETE FROM group_locations WHERE group_id IN (SELECT id FROM deleted_groups WHERE org_id = ?)`,
+			`DELETE FROM deleted_groups WHERE org_id = ?`,
 		} {
 			if _, err := tx.Exec(q, id); err != nil {
 				return err
 			}
 		}
-		return nil
+		// Its deleted databases' records stay, expiring now, so every node
+		// holding one's files sees it and removes them.
+		_, err := tx.Exec(`UPDATE deleted_databases SET deleted_at = ? WHERE org_id = ?`, now(), id)
+		return err
 	})
 }
 

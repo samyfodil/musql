@@ -8,8 +8,9 @@ import (
 	"time"
 )
 
-// ErrInUse is returned when deleting a group that still holds databases.
-var ErrInUse = errors.New("state: in use")
+// ErrProtected is returned when deleting a database or group whose delete
+// protection is on.
+var ErrProtected = errors.New("state: delete protection is on")
 
 // Group is a set of locations databases are placed in.
 type Group struct {
@@ -22,6 +23,8 @@ type Group struct {
 	CreatedAt time.Time
 	// Type is what the group's databases default to.
 	Type string
+	// DeleteProtection refuses deleting the group while set.
+	DeleteProtection bool
 }
 
 func createGroupTx(tx *sql.Tx, id, orgID, name, location, typ string) error {
@@ -101,12 +104,12 @@ func (s *Store) loadLocations(ctx context.Context, g *Group) error {
 	return rows.Err()
 }
 
-const groupCols = `id, org_id, name, primary_location, token_gen, created_at, type`
+const groupCols = `id, org_id, name, primary_location, token_gen, created_at, type, delete_protection`
 
 func scanGroup(r scanner) (*Group, error) {
 	var g Group
 	var created int64
-	if err := r.Scan(&g.ID, &g.OrgID, &g.Name, &g.Primary, &g.TokenGen, &created, &g.Type); err != nil {
+	if err := r.Scan(&g.ID, &g.OrgID, &g.Name, &g.Primary, &g.TokenGen, &created, &g.Type, &g.DeleteProtection); err != nil {
 		return nil, notFound(err)
 	}
 	g.CreatedAt = unix(created)
@@ -156,24 +159,6 @@ func (s *Store) Groups(ctx context.Context, orgID string) ([]*Group, error) {
 		}
 	}
 	return out, nil
-}
-
-// DeleteGroup removes an empty group.
-func (s *Store) DeleteGroup(ctx context.Context, id string) error {
-	return s.tx(ctx, func(tx *sql.Tx) error {
-		var n int
-		if err := tx.QueryRow(`SELECT count(*) FROM databases WHERE group_id = ?`, id).Scan(&n); err != nil {
-			return err
-		}
-		if n > 0 {
-			return ErrInUse
-		}
-		if err := one(tx.Exec(`DELETE FROM groups WHERE id = ?`, id)); err != nil {
-			return err
-		}
-		_, err := tx.Exec(`DELETE FROM group_locations WHERE group_id = ?`, id)
-		return err
-	})
 }
 
 // AddLocation adds a location to a group.
@@ -277,14 +262,20 @@ type Database struct {
 	File       string
 	Type       string
 	Durability string
+	// DeleteProtection refuses deleting the database while set. BlockReads
+	// refuses every statement a client runs, BlockWrites every one that
+	// writes.
+	DeleteProtection        bool
+	BlockReads, BlockWrites bool
 }
 
-const dbCols = `id, org_id, name, group_id, parent, parent_at, schema_only, token_gen, created_at, file, type, durability`
+const dbCols = `id, org_id, name, group_id, parent, parent_at, schema_only, token_gen, created_at, file, type, durability, delete_protection, block_reads, block_writes`
 
 func scanDatabase(r scanner) (*Database, error) {
 	var d Database
 	var parentAt, created int64
-	if err := r.Scan(&d.ID, &d.OrgID, &d.Name, &d.GroupID, &d.Parent, &parentAt, &d.SchemaOnly, &d.TokenGen, &created, &d.File, &d.Type, &d.Durability); err != nil {
+	if err := r.Scan(&d.ID, &d.OrgID, &d.Name, &d.GroupID, &d.Parent, &parentAt, &d.SchemaOnly, &d.TokenGen, &created, &d.File, &d.Type, &d.Durability,
+		&d.DeleteProtection, &d.BlockReads, &d.BlockWrites); err != nil {
 		return nil, notFound(err)
 	}
 	d.ParentAt, d.CreatedAt = unix(parentAt), unix(created)
@@ -307,8 +298,9 @@ func (s *Store) CreateDatabase(ctx context.Context, d *Database) error {
 	if d.Durability == "" {
 		d.Durability = DurabilityDurable
 	}
-	_, err := s.exec(ctx, `INSERT INTO databases (`+dbCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
-		d.ID, d.OrgID, d.Name, d.GroupID, d.Parent, parentAt, d.SchemaOnly, d.CreatedAt.Unix(), d.File, d.Type, d.Durability)
+	_, err := s.exec(ctx, `INSERT INTO databases (`+dbCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)`,
+		d.ID, d.OrgID, d.Name, d.GroupID, d.Parent, parentAt, d.SchemaOnly, d.CreatedAt.Unix(), d.File, d.Type, d.Durability,
+		d.DeleteProtection, d.BlockReads, d.BlockWrites)
 	if isUnique(err) {
 		return ErrExists
 	}

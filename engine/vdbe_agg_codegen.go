@@ -262,6 +262,7 @@ func compileScanAggregate(c *compiler, stmt *SelectStmt, srcs []joinSource, scop
 	// levels take rowid bounds too, which keep it as well: without them an inner
 	// level read its whole table once per outer row.
 	planConstantKeySeeks(c, srcs, stmt.Where, len(srcs) > 1, false)
+	planBillMinMax(c, srcs, stmt)
 
 	// Predicate pushdown: see compileScanPlain (vdbe_scan.go). buckets prune at
 	// their join level; this body tests only the deferred residue. (The local
@@ -285,26 +286,25 @@ func compileScanAggregate(c *compiler, stmt *SelectStmt, srcs []joinSource, scop
 	}
 
 	body := func() error {
-		whereJump := -1
+		var whereJumps []int
 		if deferredWhere != nil {
 			// deferredWhere is andConjuncts of plan.deferred -- itself a set of
 			// genuine top-level WHERE AND-conjuncts (splitTopLevelAnd, join.go)
 			// recombined into one AND tree -- see emitJoinLevel's identical guard
 			// (vdbe_join_codegen.go) and compiler.inWhereConjunct's doc comment.
-			c.inWhereConjunct = true
-			wReg, werr := c.compileExpr(deferredWhere)
+			var werr error
+			whereJumps, werr = c.whereFalseJumps(deferredWhere)
 			if werr != nil {
 				return werr
 			}
-			whereJump = c.emit(Instruction{Op: OpIfNot, P1: wReg, P3: 1})
 		}
 		if err := emitAggSteps(c, loweredArgs, func(seg int) {
 			c.emit(Instruction{Op: OpAggStep, P2: seg, P3: 0, P4: plan})
 		}); err != nil {
 			return err
 		}
-		if whereJump >= 0 {
-			c.patch(whereJump, c.here())
+		for _, j := range whereJumps {
+			c.patch(j, c.here())
 		}
 		return nil
 	}
@@ -789,7 +789,7 @@ func aggRowCanCarrySubtype(srcs []joinSource) bool {
 // coercion cannot fail today, so this does not depend on another file.
 func aggStepBodyMayRaise(k aggKind) bool {
 	switch k {
-	case aggGroupConcat, aggJSONGroupArray, aggJSONGroupObject, aggVec1Train:
+	case aggGroupConcat, aggJSONGroupArray, aggJSONGroupObject, aggVec1Train, aggUDF:
 		return true
 	}
 	return false
@@ -2008,6 +2008,7 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 		return nil, fmt.Errorf("%w: a GROUP BY with no ORDER BY, over a table carrying an index that could deliver the grouping, in a statement the ported planner declined -- so WHICH ORDER THE GROUPS come out in (select.c's groupBySort==0 arm) is not reproducible", errVDBEUnsupported)
 	}
 	scanOrderGroups := !hasOrder && groupsArriveOutOfKeyOrder(srcs, scopes, gp)
+	cStreams := len(srcs) == 1 && srcs[0].tbl != nil && srcs[0].idxOrderKey != nil && srcs[0].idxOrderKey.groupsSorted
 	plan := &aggPlan{
 		scopes:     scopes,
 		nCols:      nCols,
@@ -2020,6 +2021,7 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 		magnet:      gp.magnet,
 		anchorCheck: anchorChk,
 		groupExprs:  gp.groupExprs,
+		cStreams:    cStreams,
 	}
 	rowFree := !gp.usesGroupBare && !gp.selectHasSubquery && !gp.anchorObservable && anchorChk == nil &&
 		!anyAggOrderBy(aggs) && !orderBySubqueryReadsRow(c.pager, stmt.OrderBy) && !subqueryReadsRow(c.pager, stmt.Having)
@@ -2233,18 +2235,17 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 	deferredWhere := andConjuncts(jplan.deferred)
 
 	body := func() error {
-		whereJump := -1
+		var whereJumps []int
 		if deferredWhere != nil {
 			// See compileScanAggregate's identical guard just above and
 			// compiler.inWhereConjunct's doc comment: deferredWhere is real
 			// top-level WHERE AND-conjuncts, so tag-20220128a's WHERE-position
 			// rule applies here too.
-			c.inWhereConjunct = true
-			wReg, werr := c.compileExpr(deferredWhere)
+			var werr error
+			whereJumps, werr = c.whereFalseJumps(deferredWhere)
 			if werr != nil {
 				return werr
 			}
-			whereJump = c.emit(Instruction{Op: OpIfNot, P1: wReg, P3: 1})
 		}
 		// Each GROUP BY term is compiled ONCE and copied to both destinations:
 		// the sorter's key columns (only on the groupBySort==1 arm, where they
@@ -2294,8 +2295,8 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 			c.emit(Instruction{Op: OpSorterInsert, P1: sorter1, P2: recReg})
 		}
 
-		if whereJump >= 0 {
-			c.patch(whereJump, c.here())
+		for _, j := range whereJumps {
+			c.patch(j, c.here())
 		}
 		return nil
 	}
@@ -2733,18 +2734,17 @@ func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp
 	}
 
 	body := func() error {
-		whereJump := -1
+		var whereJumps []int
 		if deferredWhere != nil {
 			// See compileScanGroupBy's identical guard and
 			// compiler.inWhereConjunct's doc comment: deferredWhere is real
 			// top-level WHERE AND-conjuncts, so tag-20220128a's WHERE-position
 			// rule applies here too.
-			c.inWhereConjunct = true
-			wReg, werr := c.compileExpr(deferredWhere)
+			var werr error
+			whereJumps, werr = c.whereFalseJumps(deferredWhere)
 			if werr != nil {
 				return werr
 			}
-			whereJump = c.emit(Instruction{Op: OpIfNot, P1: wReg, P3: 1})
 		}
 		for i, ge := range gp.groupExprs {
 			r, gerr := c.compileExpr(ge)
@@ -2762,8 +2762,8 @@ func compileScanGroupByHash(c *compiler, stmt *SelectStmt, srcs []joinSource, gp
 			return err
 		}
 
-		if whereJump >= 0 {
-			c.patch(whereJump, c.here())
+		for _, j := range whereJumps {
+			c.patch(j, c.here())
 		}
 		return nil
 	}
@@ -3091,16 +3091,15 @@ func compileNoFromAggregate(pager *ReadOnlyPager, stmt *SelectStmt, outer *compi
 	// skips the AggResult finalize/eval below, exactly like
 	// compileScanAggregate: the query still always yields exactly one
 	// output row.
-	whereJump := -1
+	var whereJumps []int
 	if stmt.Where != nil {
 		// A FROM-less WHERE still gets the vector-equality split (where.c:6941, 6990);
 		// see compiler.inWhereConjunct.
-		c.inWhereConjunct = true
-		wReg, werr := c.compileExpr(stmt.Where)
+		var werr error
+		whereJumps, werr = c.whereFalseJumps(stmt.Where)
 		if werr != nil {
 			return nil, werr
 		}
-		whereJump = c.emit(Instruction{Op: OpIfNot, P1: wReg, P3: 1})
 	}
 	// The one synthetic row's per-row expressions are computed into registers
 	// here, exactly as compileScanAggregate's scan body does it (planAggArgRegs
@@ -3118,8 +3117,8 @@ func compileNoFromAggregate(pager *ReadOnlyPager, stmt *SelectStmt, outer *compi
 	}); err != nil {
 		return nil, err
 	}
-	if whereJump >= 0 {
-		c.patch(whereJump, c.here())
+	for _, j := range whereJumps {
+		c.patch(j, c.here())
 	}
 
 	if !c.isExistsBody(stmt) {
