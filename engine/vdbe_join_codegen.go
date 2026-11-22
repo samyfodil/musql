@@ -262,6 +262,11 @@ type joinSource struct {
 	// by a column-free expression: emitJoinLoops evaluates it after OpOpenRead
 	// and emits OpSeekRowidRangeHint. Set by detectRowidRangeKey.
 	rowidRange *rowidRangeKey
+	// billKeys/billKinds bound the rowids of the rows this source's loop
+	// counts as read (rowidBillBounds, emitRowidBillHint).
+	billKeys  []Expr
+	billKinds []int
+	billLimit int
 
 	// idxSeek, when non-nil, requests a SECONDARY-INDEX leading-column equality
 	// seek for this (ordinary rowid) table: emitJoinLoops evaluates its
@@ -3246,6 +3251,7 @@ func emitJoinLoops(c *compiler, srcs []joinSource, plan joinPlan, body func() er
 			}
 			c.emit(Instruction{Op: OpSeekRowidRangeHint, P1: s.scope.cursor, P2: keyReg, P3: s.rowidRange.kind})
 		}
+		c.emitRowidBillHint(s.scope.cursor, s.billKeys, s.billKinds, s.billLimit)
 		if s.idxSeek != nil {
 			// Evaluate the (column-free constant/parameter) index seek key now --
 			// before any Rewind -- and hand it, with the index's root/affinity/

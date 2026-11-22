@@ -122,10 +122,8 @@ func init() {
 // evalFunc's own (still-present, redundant-by-design) per-call checks.
 func funcArity(name string) (min, max int, ok bool) {
 	if f := udfs[name]; f != nil {
-		if f.NArg < 0 {
-			return 0, -1, true
-		}
-		return f.NArg, f.NArg, true
+		lo, hi := f.arity()
+		return lo, hi, true
 	}
 	if lo, hi, ok := vectorArity(name); ok {
 		return lo, hi, true

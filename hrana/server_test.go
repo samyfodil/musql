@@ -105,6 +105,12 @@ func TestV3JSONPipeline(t *testing.T) {
 	if d := sel["cols"].([]any)[0].(map[string]any)["decltype"]; d != "INTEGER" {
 		t.Fatalf("decltype: %v", d)
 	}
+	if sel["rows_read"] != float64(1) || sel["rows_written"] != float64(0) {
+		t.Fatalf("rows read and written: %v %v", sel["rows_read"], sel["rows_written"])
+	}
+	if d, ok := sel["query_duration_ms"].(float64); !ok || d < 0 {
+		t.Fatalf("query duration: %v", sel["query_duration_ms"])
+	}
 	desc := results[6].(map[string]any)["response"].(map[string]any)["result"].(map[string]any)
 	if p := desc["params"].([]any)[0].(map[string]any)["name"]; p != ":id" || desc["is_readonly"] != true {
 		t.Fatalf("describe: %v", desc)
@@ -148,6 +154,9 @@ func TestV3ProtobufPipelineAndCursor(t *testing.T) {
 	}
 	if n := out.Results[1].GetOk().GetExecute().GetResult().GetAffectedRowCount(); n != 2 {
 		t.Fatalf("affected rows %d", n)
+	}
+	if r := out.Results[1].GetOk().GetExecute().GetResult(); r.GetRowsRead() != 0 || r.GetRowsWritten() != 2 {
+		t.Fatalf("rows read %d, written %d", r.GetRowsRead(), r.GetRowsWritten())
 	}
 
 	// The cursor streams a batch: step_begin, rows, step_end per executed step.
@@ -450,7 +459,8 @@ func TestObserver(t *testing.T) {
 	if len(got) != 4 {
 		t.Fatalf("observed %d statements, want 4", len(got))
 	}
-	if got[0].RowsWritten != 1 || got[1].RowsWritten != 2 || got[2].RowsRead != 3 || got[3].Err == nil {
+	// The CREATE TABLE writes its catalog entry.
+	if got[0].RowsWritten != 2 || got[1].RowsWritten != 2 || got[2].RowsRead != 3 || got[3].Err == nil {
 		t.Fatalf("observed %+v", got)
 	}
 }

@@ -12,7 +12,7 @@ import (
 )
 
 // tokKind identifies the lexical category of a token.
-type tokKind int
+type tokKind uint8
 
 const (
 	tkEOF    tokKind = iota
@@ -31,14 +31,13 @@ const (
 // name of an unaliased result column.
 type token struct {
 	kind   tokKind
-	text   string // ident name / number literal text / punctuation text
-	str    string // decoded value, tkString only
-	blob   []byte // decoded value, tkBlob only
-	quoted bool   // tkIdent only: true for a "...", `...`, or [...] spelling
+	quoted bool // tkIdent only: true for a "...", `...`, or [...] spelling
 	// dquoted is quoted narrowed to double-quote spelling alone: a "..."-spelled
 	// identifier that resolves to no column becomes a string literal, while
 	// `...` and [...] stay hard column references. See ColumnExpr.FallbackLiteral.
 	dquoted bool
+	text    string // ident name / number literal text / punctuation text
+	str     string // decoded value, tkString and tkBlob only
 	Start   int
 	End     int
 }
@@ -66,22 +65,38 @@ func (t token) isKw(kw string) bool {
 	return true
 }
 
-// upperIn reports m[t.upper()], folding a short word on the stack rather than
-// into the copy upper makes of a lower-case one.
-func (t token) upperIn(m map[string]bool) bool {
-	var buf [24]byte
-	if len(t.text) > len(buf) {
-		return m[t.upper()]
-	}
-	b := buf[:len(t.text)]
-	for i := range len(b) {
-		c := t.text[i]
-		if c >= 'a' && c <= 'z' {
-			c -= 'a' - 'A'
+// keywordSet is a map of upper-case keywords indexed by length, so a token is
+// tested against the few words of its own length by isKw rather than folded and
+// hashed. A word longer than byLen holds is looked up in the map.
+type keywordSet struct {
+	m     map[string]bool
+	byLen [16][]string
+	long  bool // some word is too long for byLen
+}
+
+func newKeywordSet(m map[string]bool) *keywordSet {
+	s := &keywordSet{m: m}
+	for kw := range m {
+		if len(kw) < len(s.byLen) {
+			s.byLen[len(kw)] = append(s.byLen[len(kw)], kw)
+		} else {
+			s.long = true
 		}
-		b[i] = c
 	}
-	return m[string(b)]
+	return s
+}
+
+// in reports s.m[t.upper()].
+func (t token) in(s *keywordSet) bool {
+	if len(t.text) >= len(s.byLen) {
+		return s.long && s.m[t.upper()]
+	}
+	for _, kw := range s.byLen[len(t.text)] {
+		if t.isKw(kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // asciiUpper folds a-z to uppercase; every other byte is unchanged. Returns s
@@ -140,7 +155,38 @@ func lexQuoted(s string, j int, closer byte, double bool) (string, int, bool) {
 // parameters, and again to compile it, each time for the same text; its tokens
 // are read, never changed, so the three share one. Keyed by the text. The
 // slice is handed out with no spare capacity, so an append to it is a copy.
-var lexLast atomic.Pointer[lexEntry]
+var lexLast = &lexSlots{slots: make([]atomic.Pointer[lexEntry], 1)}
+
+// lexMid is lexLast for a text too long for lexKept and too short for
+// lexLast, with a few slots: some readers lex a statement trimmed and some as
+// given, which would take turns in one.
+var lexMid = &lexSlots{slots: make([]atomic.Pointer[lexEntry], 4)}
+
+// lexLong is lexLast for a text up to lexLongMax, with a slot for each of the
+// two spellings. Over it the one slot stays, so at most one text's tokens of
+// megabytes are held.
+var lexLong = &lexSlots{slots: make([]atomic.Pointer[lexEntry], 2)}
+
+const lexLongMax = 1 << 20
+
+type lexSlots struct {
+	slots []atomic.Pointer[lexEntry]
+	next  atomic.Uint32
+}
+
+func (l *lexSlots) lex(s string) ([]token, error) {
+	for i := range l.slots {
+		if e := l.slots[i].Load(); e != nil && e.sql == s {
+			return e.toks[:len(e.toks):len(e.toks)], nil
+		}
+	}
+	toks, err := lexUncached(s)
+	if err != nil {
+		return toks, err
+	}
+	l.slots[l.next.Add(1)%uint32(len(l.slots))].Store(&lexEntry{sql: s, toks: toks[:len(toks):len(toks)]})
+	return toks[:len(toks):len(toks)], nil
+}
 
 type lexEntry struct {
 	sql  string
@@ -175,18 +221,16 @@ func lex(s string) ([]token, error) {
 	if len(s) >= lexKeepMin && len(s) <= lexKeepMax {
 		return lexKeep(s)
 	}
+	if len(s) > lexKeepMax && len(s) < lexShareMin {
+		return lexMid.lex(s)
+	}
 	if len(s) < lexShareMin || len(s) > lexShareMax {
 		return lexUncached(s)
 	}
-	if e := lexLast.Load(); e != nil && e.sql == s {
-		return e.toks[:len(e.toks):len(e.toks)], nil
+	if len(s) <= lexLongMax {
+		return lexLong.lex(s)
 	}
-	toks, err := lexUncached(s)
-	if err != nil {
-		return toks, err
-	}
-	lexLast.Store(&lexEntry{sql: s, toks: toks[:len(toks):len(toks)]})
-	return toks[:len(toks):len(toks)], nil
+	return lexLast.lex(s)
 }
 
 func lexKeep(s string) ([]token, error) {
@@ -213,13 +257,40 @@ func lexKeep(s string) ([]token, error) {
 	return toks, nil
 }
 
+// scratchToks lends token buffers to parses whose results hold no token:
+// opening a database lexes every CREATE text once, and those tokens die with
+// the parse instead of being kept by lexKeep.
+var scratchToks = sync.Pool{New: func() any { return new([]token) }}
+
+// lexScratch lexes s into a pooled buffer; releaseScratch returns it once
+// nothing reads the tokens.
+func lexScratch(s string) ([]token, *[]token, error) {
+	b := scratchToks.Get().(*[]token)
+	toks, err := lexInto(*b, s)
+	return toks, b, err
+}
+
+func releaseScratch(b *[]token, toks []token) {
+	if cap(toks) > 1<<14 {
+		return
+	}
+	*b = toks[:0]
+	scratchToks.Put(b)
+}
+
 func lexUncached(s string) ([]token, error) {
 	// Pre-sized for typical SQL token density, capped: a statement made of
 	// long literals (rows of vector('[...]')) has far fewer tokens than its
 	// length suggests, and an uncapped guess zeroed megabytes per statement.
-	// append grows it past the cap when a statement needs more.
+	// append grows it past the cap when a statement needs more. TPC-H and
+	// TPC-DS queries and schemas run six to eight bytes a token.
+	return lexInto(make([]token, 0, min(len(s)/6, 4096)+8), s)
+}
+
+// lexInto is lexUncached appending to toks[:0].
+func lexInto(toks []token, s string) ([]token, error) {
+	toks = toks[:0]
 	n := len(s)
-	toks := make([]token, 0, min(n/4, 4096)+8)
 	i := 0
 
 	isIdentStart := func(c byte) bool {
@@ -266,17 +337,18 @@ func lexUncached(s string) ([]token, error) {
 			if len(hexStr)%2 != 0 {
 				return nil, fmt.Errorf("engine: blob literal %q has an odd number of hex digits", hexStr)
 			}
-			b := make([]byte, len(hexStr)/2)
-			for k := 0; k < len(b); k++ {
+			var b strings.Builder
+			b.Grow(len(hexStr) / 2)
+			for k := 0; k < len(hexStr)/2; k++ {
 				hi, ok1 := hexDigit(hexStr[2*k])
 				lo, ok2 := hexDigit(hexStr[2*k+1])
 				if !ok1 || !ok2 {
 					return nil, fmt.Errorf("engine: invalid hex digit in blob literal %q", hexStr)
 				}
-				b[k] = hi<<4 | lo
+				b.WriteByte(hi<<4 | lo)
 			}
 			i = j + 1
-			toks = append(toks, token{kind: tkBlob, blob: b, Start: start, End: i})
+			toks = append(toks, token{kind: tkBlob, str: b.String(), Start: start, End: i})
 
 		case c == '\'': // string literal; '' escapes a literal quote
 			lit, j, ok := lexQuoted(s, i+1, '\'', true)
