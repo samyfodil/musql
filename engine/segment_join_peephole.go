@@ -1568,6 +1568,9 @@ func segJoinSameInsn(a, b Instruction) bool {
 // IfNot that skips the row to next when the value is false or NULL. It
 // returns the value's source and the address after the IfNot.
 func segJoinFilter(in []Instruction, pc, limit, lv int, levelOf map[int]int, next int) (segJoinArg, int, bool) {
+	if end, branched := segJoinTermEnd(in, pc, limit, next); branched {
+		return segJoinBranchFilter(in, pc, end, lv, levelOf, next)
+	}
 	tr := newSegJoinTrace(in, levelOf)
 	for i := pc; i < limit; i++ {
 		ins := in[i]
@@ -1591,6 +1594,40 @@ func segJoinFilter(in []Instruction, pc, limit, lv int, levelOf map[int]int, nex
 		}
 	}
 	return segJoinArg{}, 0, false
+}
+
+// segJoinBranchFilter is segJoinFilter for a term coded as jumps, in[pc:end]
+// (segJoinTermEnd): its value is 1 where control reaches end, 0 where it
+// skips to next.
+func segJoinBranchFilter(in []Instruction, pc, end, lv int, levelOf map[int]int, next int) (segJoinArg, int, bool) {
+	tr := newSegJoinTrace(in, levelOf)
+	for i := pc; i < end; i++ {
+		ins := in[i]
+		if !segJoinIsJump(ins) {
+			if ins.Op == OpColumn && levelOf[ins.P1] != lv || !tr.step(i) {
+				return segJoinArg{}, 0, false
+			}
+			continue
+		}
+		if ins.P2 != next && (ins.P2 <= i || ins.P2 > end) {
+			return segJoinArg{}, 0, false
+		}
+		if ins.Op == OpGoto {
+			continue
+		}
+		reads, _, _, ok := segInsnRegs(ins)
+		if !ok {
+			return segJoinArg{}, 0, false
+		}
+		for _, r := range reads {
+			if src, ok := tr.src[r]; !ok || src.level != lv && src.level != -1 {
+				return segJoinArg{}, 0, false
+			}
+		}
+	}
+	e := segJoinBranchRun(in, pc, end, next, in[end-1].P1)
+	e.volatile = slices.ContainsFunc(e.insns, segJoinVolatileInsn)
+	return segJoinArg{reg: e.out, level: segJoinVolatileLevel(lv, e), expr: e}, end, true
 }
 
 // segJoinIsRecheck reports whether a join's recheck starts at pc: two column
@@ -2088,10 +2125,29 @@ func segJoinRun(in []Instruction, from, to, out int) *segJoinExpr {
 // skips the row to next unless it is true. It returns the run and the
 // address after the IfNot.
 func segJoinCrossFilter(in []Instruction, pc, limit int, levelOf map[int]int, lv, next int) (*segJoinExpr, int, bool) {
-	// A WHERE's AND, OR or NOT is coded as jumps (whereFalseJumps): its false
-	// leaves skip to next and its true arms jump to the term's end. The term
-	// ends at the first skip no jump before it reaches past.
-	reach, branched := pc, false
+	end, branched := segJoinTermEnd(in, pc, limit, next)
+	switch {
+	case end < 0:
+		return nil, 0, false
+	case !branched:
+		if !segJoinSafeRun(in, pc, end-1, levelOf, lv, -1) {
+			return nil, 0, false
+		}
+		return segJoinRun(in, pc, end-1, in[end-1].P1), end, true
+	}
+	if !segJoinSafeRunTo(in, pc, end, levelOf, lv, -1, next) {
+		return nil, 0, false
+	}
+	return segJoinBranchRun(in, pc, end, next, in[end-1].P1), end, true
+}
+
+// segJoinTermEnd is the address after the term at pc, or -1. A WHERE's AND,
+// OR or NOT is coded as jumps (whereFalseJumps): its false leaves skip to
+// next and its true arms jump to the term's end. The term ends at the first
+// IfNot skipping to next that no jump before it reaches past; branched
+// reports a term coded so.
+func segJoinTermEnd(in []Instruction, pc, limit, next int) (end int, branched bool) {
+	reach := pc
 	for i := pc + 1; i < limit; i++ {
 		ins := in[i]
 		if segJoinIsJump(ins) {
@@ -2108,18 +2164,9 @@ func segJoinCrossFilter(in []Instruction, pc, limit int, levelOf map[int]int, lv
 			branched = true
 			continue
 		}
-		if !branched && reach <= i {
-			if !segJoinSafeRun(in, pc, i, levelOf, lv, -1) {
-				return nil, 0, false
-			}
-			return segJoinRun(in, pc, i, ins.P1), i + 1, true
-		}
-		if !segJoinSafeRunTo(in, pc, i+1, levelOf, lv, -1, next) {
-			return nil, 0, false
-		}
-		return segJoinBranchRun(in, pc, i+1, next, ins.P1), i + 1, true
+		return i + 1, branched || reach > i
 	}
-	return nil, 0, false
+	return -1, false
 }
 
 // segJoinBranchRun is in[from:end], a term coded as jumps, as an expression
