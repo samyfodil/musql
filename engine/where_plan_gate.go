@@ -669,6 +669,16 @@ func markWherePlanExistsEligibility(p *ReadOnlyPager, c *compiler, srcs []joinSo
 	}
 }
 
+// wherePlanHandOffCheckForTest has wherePlanIndexOrderDecided plan again
+// every source set it answers from the hand-off, counting the answers and the
+// plans that disagree.
+var wherePlanHandOffCheckForTest handOffCheck
+
+type handOffCheck struct {
+	on           bool
+	hits, differ int
+}
+
 // wherePlanIndexOrderDecided reports whether the port decided this statement's
 // row order (often the rowid scan, needing no key). Used by the aggregate anchor
 // guard (anchorPlanOrderProvable) instead of the "any index at all" proxy; it
@@ -689,6 +699,23 @@ func wherePlanIndexOrderDecided(p *ReadOnlyPager, c *compiler, srcs []joinSource
 	if len(srcs) == 1 {
 		_, _, ok := wherePlanSingleTableIndexOrder(p, c, srcs, stmt)
 		return ok
+	}
+	// Sources markWherePlanEligibility handed the planner's order to
+	// (wherePlanOK) were decided by it: planning them again only to be told so
+	// cost as much as the plan. markCoroutineReruns' hand-off (cPlanDecided)
+	// takes sources the gate below declines, so those are asked again.
+	planned := true
+	for i := range srcs {
+		planned = planned && srcs[i].wherePlanOK && srcs[i].idxOrderKey != nil && !srcs[i].cPlanDecided
+	}
+	if planned {
+		if wherePlanHandOffCheckForTest.on {
+			wherePlanHandOffCheckForTest.hits++
+			if _, _, _, ok := wherePlanMultiTableOrder(p, c, srcs, stmt); !ok {
+				wherePlanHandOffCheckForTest.differ++
+			}
+		}
+		return true
 	}
 	_, _, _, ok := wherePlanMultiTableOrder(p, c, srcs, stmt)
 	return ok
