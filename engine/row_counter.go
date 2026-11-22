@@ -216,7 +216,7 @@ func (cur *vdbeCursor) tableRows() int64 {
 	if cur.tbl == nil || cur.pager == nil {
 		return 0
 	}
-	n, _ := cur.pager.segFilterCountTable(cur.tbl.root, nil, cur.tbl.ipkIndex)
+	n, _ := cur.pager.segFilterCountTable(cur.tbl.root, nil, cur.tbl.cols, cur.tbl.ipkIndex)
 	return int64(n)
 }
 
