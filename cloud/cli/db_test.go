@@ -92,6 +92,27 @@ func TestDatabaseCommands(t *testing.T) {
 	if out, _, err := h.tryEnv(cli.Env{Stdin: strings.NewReader("yes\n")}, "db", "destroy", "j"); err != nil || !strings.Contains(out, "Deleted j") {
 		t.Fatalf("destroy after a yes: %q %v", out, err)
 	}
+	out := h.run("db", "deleted")
+	f := strings.Fields(strings.Split(out, "\n")[1])
+	if len(f) < 3 || f[1] != "database" || f[2] != "j" {
+		t.Fatalf("deleted: %q", out)
+	}
+	if out := h.run("db", "undelete", f[0], "j2"); !strings.Contains(out, "Restored j2") {
+		t.Fatalf("undelete: %q", out)
+	}
+	if out := h.run("db", "update", "j2", "--delete-protection", "--block-writes"); !strings.Contains(out, "Protected:") || !strings.Contains(out, "Writes:") || strings.Contains(out, "Reads:") {
+		t.Fatalf("update: %q", out)
+	}
+	if _, err := h.try("db", "destroy", "j2", "--yes"); err == nil || !strings.Contains(err.Error(), "delete protection") {
+		t.Fatalf("destroy a protected database: %v", err)
+	}
+	if out := h.run("db", "update", "j2", "--delete-protection=false"); strings.Contains(out, "Protected:") || !strings.Contains(out, "Writes:") {
+		t.Fatalf("update one flag: %q", out)
+	}
+	if out := h.run("group", "update", "default", "--delete-protection"); !strings.Contains(out, "delete protection on") {
+		t.Fatalf("group update: %q", out)
+	}
+	h.run("group", "update", "default", "--delete-protection=false")
 
 	if out, _, err := h.tryEnv(cli.Env{Stdin: strings.NewReader("SELECT x FROM t ORDER BY x;")}, "db", "shell", "app"); err != nil || out != "x\n1\n2\n" {
 		t.Fatalf("a piped script: %q %v", out, err)

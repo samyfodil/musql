@@ -119,7 +119,7 @@ func (a *app) dbCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		if !a.confirm(yes, "Delete database "+args[0]+"? This cannot be undone.") {
+		if !a.confirm(yes, "Delete database "+args[0]+"? It can be restored (db undelete) until the server's retention for deleted databases ends.") {
 			return errors.New("not deleted")
 		}
 		if _, err := a.services.db.Delete(ctx, connect.NewRequest(&v1.DeleteDatabaseRequest{Org: org, Name: args[0]})); err != nil {
@@ -129,6 +129,83 @@ func (a *app) dbCmd() *cobra.Command {
 		return nil
 	})
 	destroy.Flags().BoolVarP(&yes, "yes", "y", false, "do not ask")
+
+	deleted := a.cmd("deleted", "List deleted databases and groups that can be restored", cobra.NoArgs, func(ctx context.Context, args []string) error {
+		org, err := a.orgSlug(ctx)
+		if err != nil {
+			return err
+		}
+		r, err := a.services.db.ListDeleted(ctx, connect.NewRequest(&v1.ListDeletedRequest{Org: org}))
+		if err != nil {
+			return err
+		}
+		var rows [][]string
+		for _, g := range r.Msg.Groups {
+			rows = append(rows, []string{g.Group.Id, "group", g.Group.Name, when(g.DeletedAt), when(g.ExpiresAt)})
+		}
+		for _, d := range r.Msg.Databases {
+			kind := "database"
+			if d.DeletedWithGroup != "" {
+				kind = "database (with its group)"
+			}
+			rows = append(rows, []string{d.Database.Id, kind, d.Database.Name, when(d.DeletedAt), when(d.ExpiresAt)})
+		}
+		return a.list(r.Msg, []string{"ID", "KIND", "NAME", "DELETED", "EXPIRES"}, rows)
+	})
+
+	undelete := a.cmd("undelete <id> [new-name]", "Restore a deleted database or group (ids from db deleted)", cobra.RangeArgs(1, 2), func(ctx context.Context, args []string) error {
+		org, err := a.orgSlug(ctx)
+		if err != nil {
+			return err
+		}
+		req := &v1.RestoreDeletedRequest{Org: org, Id: args[0]}
+		if len(args) == 2 {
+			req.NewName = args[1]
+		}
+		r, err := a.services.db.RestoreDeleted(ctx, connect.NewRequest(req))
+		if err != nil {
+			return err
+		}
+		if r.Msg.Group != nil {
+			a.printf("Restored group %s\n", r.Msg.Group.Name)
+		}
+		for _, d := range r.Msg.Databases {
+			a.printf("Restored %s\n", d.Name)
+		}
+		return nil
+	})
+
+	var upd struct{ protect, blockReads, blockWrites bool }
+	var update *cobra.Command
+	update = a.cmd("update <name>", "Set a database's delete protection and blocks", cobra.ExactArgs(1), func(ctx context.Context, args []string) error {
+		org, err := a.orgSlug(ctx)
+		if err != nil {
+			return err
+		}
+		req := &v1.UpdateDatabaseRequest{Org: org, Name: args[0]}
+		fl := update.Flags()
+		if fl.Changed("delete-protection") {
+			req.DeleteProtection = &upd.protect
+		}
+		if fl.Changed("block-reads") {
+			req.BlockReads = &upd.blockReads
+		}
+		if fl.Changed("block-writes") {
+			req.BlockWrites = &upd.blockWrites
+		}
+		r, err := a.services.db.Update(ctx, connect.NewRequest(req))
+		if err != nil {
+			return err
+		}
+		if a.json {
+			return writeJSON(a.env.Stdout, r.Msg.Database)
+		}
+		a.printDB(r.Msg.Database)
+		return nil
+	})
+	update.Flags().BoolVar(&upd.protect, "delete-protection", false, "refuse deleting the database")
+	update.Flags().BoolVar(&upd.blockReads, "block-reads", false, "refuse every statement")
+	update.Flags().BoolVar(&upd.blockWrites, "block-writes", false, "refuse every statement that writes")
 
 	rename := a.cmd("rename <name> <new-name>", "Rename a database", cobra.ExactArgs(2), func(ctx context.Context, args []string) error {
 		org, err := a.orgSlug(ctx)
@@ -303,7 +380,7 @@ func (a *app) dbCmd() *cobra.Command {
 		},
 	}
 
-	return group("db", "Manage databases", list, create, show, destroy, rename,
+	return group("db", "Manage databases", list, create, show, destroy, deleted, undelete, update, rename,
 		group("tokens", "Manage database tokens", tokCreate, tokInvalidate),
 		imp, export, restore, branch, inspect, shell)
 }
@@ -339,6 +416,15 @@ func (a *app) printDB(d *v1.Database) {
 	}
 	if d.Parent != "" {
 		rows = append(rows, [2]string{"Parent", d.Parent}, [2]string{"Parent at", when(d.ParentAt)})
+	}
+	if d.DeleteProtection {
+		rows = append(rows, [2]string{"Protected", "yes"})
+	}
+	if d.BlockReads {
+		rows = append(rows, [2]string{"Reads", "blocked"})
+	}
+	if d.BlockWrites {
+		rows = append(rows, [2]string{"Writes", "blocked"})
 	}
 	for _, r := range rows {
 		a.printf("%-10s %s\n", r[0]+":", r[1])

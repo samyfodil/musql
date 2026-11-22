@@ -336,7 +336,7 @@ func (src *segSource) scanSegmentsCols(rootPage uint32, cols columnMask) (iter.S
 // served is false when the table is not columnar here, or when any segment
 // declines the predicate shape -- in which case the caller must fall back, and
 // a PARTIAL count is never returned.
-func (p *ReadOnlyPager) segFilterCountTable(rootPage uint32, preds []segPred, ipk int) (int, bool) {
+func (p *ReadOnlyPager) segFilterCountTable(rootPage uint32, preds []segPred, tblCols []columnInfo, ipk int) (int, bool) {
 	if p == nil || p.segs == nil {
 		return 0, false
 	}
@@ -396,7 +396,7 @@ func (p *ReadOnlyPager) segFilterCountTable(rootPage uint32, preds []segPred, ip
 		s := segs[i]
 		// Refuse columns whose NULLs might not be NULLs (ALTER TABLE ADD COLUMN
 		// leaves older records short and synthesizes DEFAULT at read time).
-		if !segPredColsFilterable(s, preds) {
+		if !segPredColsNullable(s, preds, tblCols, ipk) {
 			return false
 		}
 		counts[i] = segFilterCount(s, preds)
@@ -427,7 +427,7 @@ func (p *ReadOnlyPager) segTextBoundsScannable(preds []segPred) bool {
 
 // segFilterSumTable answers `sum(col) WHERE <preds>` from the segments.
 // It declines on integer overflow rather than approximating.
-func (p *ReadOnlyPager) segFilterSumTable(rootPage uint32, preds []segPred, col, ipk int) (Value, bool) {
+func (p *ReadOnlyPager) segFilterSumTable(rootPage uint32, preds []segPred, tblCols []columnInfo, col, ipk int) (Value, bool) {
 	if p == nil || p.segs == nil {
 		return Value{}, false
 	}
@@ -498,7 +498,7 @@ func (p *ReadOnlyPager) segFilterSumTable(rootPage uint32, preds []segPred, col,
 			// a REAL -- is applied a batch at a time, as the count applies it
 			// (segFilterCount); the loop a service block would otherwise run
 			// for every row is several times slower.
-			if !segPredColsFilterable(s, preds) {
+			if !segPredColsNullable(s, preds, tblCols, ipk) {
 				return false
 			}
 			// The integer bounds first: they are the cheap ones, and a row

@@ -19,6 +19,8 @@ var importTables = []struct{ table, renamed string }{
 	{"groups", "name"},
 	{"group_locations", ""},
 	{"databases", "name"},
+	{"deleted_groups", ""},
+	{"deleted_databases", ""},
 	{"platform_tokens", ""},
 	{"refresh_tokens", ""},
 	{"signing_keys", ""},

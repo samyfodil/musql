@@ -50,6 +50,7 @@ snapshots:
 uploads:
   max_bytes: 17179869184   # the largest file one upload may carry (default 16 GiB)
   ttl: "24h"               # an upload that nothing writes to or uses is removed after this
+deleted_retention: "5d"    # a deleted database stays restorable this long (default 5d)
 console:
   dir: "./console/dist"    # the console's build, served at /console/
   cors_origins: []         # other origins allowed to call the API and Hrana
@@ -95,10 +96,13 @@ The server is its own issuer at `public_url`:
   shared ones. **Members** have a role: `owner`, `admin`, `member`, `viewer`.
   Invites by email create a pending membership the user accepts on login.
 - **Group**: a set of locations a database is placed in, and the type its
-  databases default to (`plain`, a regular database, unless set). Every org
-  has a `default` group in the creating node's location.
+  databases default to (`plain`, a regular database, unless set), and a
+  delete protection flag. Every org has a `default` group in the creating
+  node's location.
 - **Database**: `org/name`, type (`plain` | `crdt` | `raft`), group, created_at, size, optional `parent` and
-  `parent_at` (a branch), schema-only flag. Served over Hrana at
+  `parent_at` (a branch), schema-only flag, and three flags set through
+  Update: delete protection, block reads, block writes (see "Deleting,
+  restoring, protecting"). Served over Hrana at
   `https://<public_url>/db/<org>/<name>` (and `wss://` for v3).
 - **Database token**: a JWT signed by the server, claims `db` (or `group`),
   `access` (`full` | `read-only`), `exp` (optional), and `gen`. `db`/`group`
@@ -147,6 +151,54 @@ The server is its own issuer at `public_url`:
   recreates the parent's objects empty.
 - **Standalone and cluster**: see below; a cluster database's history is
   its node's.
+
+## Deleting, restoring, protecting
+
+- **Delete keeps the database.** `DatabaseService.Delete` moves its record
+  from `databases` to `deleted_databases` (stamped `deleted_at`) and closes
+  it: its name is free at once (the `UNIQUE` name is the live table's), no
+  token or Hrana request reaches it (both look the record up by ID or name in
+  the live table), and its file and history stay where they are.
+  `GroupService.Delete` does the same to a group (`deleted_groups`, its
+  locations kept) and every database in it, each marked as deleted with the
+  group.
+- **Retention.** A deleted database is kept for `deleted_retention`
+  (default 5 days), or what `server.WithDeletedRetention(func(ctx, org)
+  time.Duration)` answers for its org, asked at each listing, restore and
+  sweep, so a plan change applies to those deleted already. The sweep that
+  removes stale uploads (every `min(uploads.ttl, 10m)`) also removes the file
+  and history of every deleted database past its retention, then its record,
+  and the records of deleted groups past theirs.
+- **Restore.** `ListDeleted(org)` lists what can still be restored, with
+  `expires_at`. `RestoreDeleted(org, id, new_name)` moves a database back
+  under its name, or `new_name` when the name was taken meanwhile, with its
+  file and history as they were, and its token generation bumped, as
+  InvalidateTokens does, so no token from before reaches it. A database
+  whose group is deleted is refused until the group is restored; restoring a
+  group (an admin's call, as deleting one is) brings back the databases
+  deleted with it, one whose name is taken coming back as `<name>-<id6>`.
+  Restoring a database needs the role deleting one does (member).
+- **Delete protection**, per database (`DatabaseService.Update`) and per
+  group (`GroupService.Update`): Delete fails with `FAILED_PRECONDITION`
+  while it is on, and so do a group's delete while one of its databases has
+  it and an org's delete while any of its databases or groups has it.
+- **Blocks**, per database (`Update`): `block_reads` refuses every statement
+  a client runs, `block_writes` every one that writes, with the Hrana error
+  code `BLOCKED` ("Operation was blocked: …", as libSQL's server answers).
+  Hrana asks the database's open entry before each statement
+  (`hrana.WithBlock`), whose flags are refreshed by the Update call, at every
+  HTTP request and WebSocket hello (the token check reads the record anyway)
+  and by every cluster node's placement pass, so a stream already open meets
+  a block at its next statement on its node. While writes are blocked a new
+  stream runs on the read-only handle, where the engine refuses any write
+  (`query_only` locked on, so nothing in the statement can lift it), and a
+  stream opened for writing before refuses every statement.
+- **In a cluster** the records are state like any other. Each node's
+  placement closes a database whose record is deleted and keeps its files;
+  a restored one is opened again by placement on every node of its group,
+  its file and replication catalog as they were. Each node's sweep removes
+  its own copy past the retention; the record stays 24 hours longer, so a
+  node that was down then still sees it expire and removes its copy.
 
 ## Uploads and exports
 
@@ -319,8 +371,9 @@ peers:
   Placement follows the state: every node runs a reconcile (at start, after
   each state change, and every few seconds) that opens each database whose
   group lists its location and is not open yet (creating an empty file,
-  which syncs schema and rows from the peers), and closes and removes the
-  file and history of one no longer placed there, or deleted. A regular
+  which syncs schema and rows from the peers), closes and removes the
+  file and history of one no longer placed there, and closes one deleted,
+  whose files the sweep removes after its retention. A regular
   database is served by its group's master, reads included (a stream's
   statements run where its transaction is), and so are its history, export,
   branches and restores: the master's copy is the one every write went
@@ -454,16 +507,17 @@ Services, each method checks the caller's role:
 - `AuthService`: WhoAmI, ListPlatformTokens, CreatePlatformToken, RevokePlatformToken.
 - `UserService` (admin): List, Create, Update (name, disabled), ResetPassword, Delete.
 - `OrgService`: List, Create, Update, Delete, ListMembers, Invite, UpdateMember, RemoveMember, ListInvites, AcceptInvite.
-- `GroupService`: List, Create, Delete, AddLocation, RemoveLocation, ListLocations.
-- `DatabaseService`: List, Get, Create (empty, from upload, as branch, from restore point), Delete, Rename, Usage, ListSnapshots, Restore (to time, new or in place), CreateToken, InvalidateTokens, StartUpload / UploadChunk / FinishUpload (a database file in pieces), Export (musq or C SQLite, streamed), Stats (top queries).
+- `GroupService`: List, Create, Delete (with its databases, restorable), Update (delete protection), AddLocation, RemoveLocation, ListLocations.
+- `DatabaseService`: List, Get, Create (empty, from upload, as branch, from restore point), Delete (restorable), Rename, Update (delete protection, block reads, block writes), ListDeleted, RestoreDeleted, Usage, ListSnapshots, Restore (to time, new or in place), CreateToken, InvalidateTokens, StartUpload / UploadChunk / FinishUpload (a database file in pieces), Export (musq or C SQLite, streamed), Stats (top queries).
 - `AIService`: GenerateSQL.
 
 ## Console
 
 The current editor becomes the per-database view. Around it:
 sign-in through OIDC (code + PKCE), an org switcher, database list
-(create, branch, restore, rename, delete, copy URL, create token), group and
-location settings, members and roles, org settings (deleting the org, for
+(create, branch, restore, rename, delete, copy URL, create token, delete
+protection and block toggles, and the deleted databases and groups with a
+restore button), group and location settings (with delete protection), members and roles, org settings (deleting the org, for
 owners, confirmed by typing its slug), users (admins), platform tokens,
 usage charts per database and org, and the editor's new pieces:
 connections (local files kept in the browser, and remote databases on this
@@ -483,11 +537,24 @@ current token expires, with that reason.
 Same verbs as `turso` where they apply: `auth login|logout|whoami|token`,
 `org list|create|switch|members …`, `group list|create|destroy|locations …`,
 `db list|create|show|destroy|shell|tokens create [-p table|all:actions]|tokens invalidate|import|export|restore|branch`,
+`db deleted` (what can be restored), `db undelete <id> [new-name]`,
+`db update <name> --delete-protection --block-reads --block-writes` (each
+`=false` to clear; one left out stays), `group update <name> --delete-protection`,
 `db inspect` (size, usage), `db shell` (a REPL over Hrana with `.tables`,
 `.schema`, `.mode`). `db import`, `db create --from-file` and `db export`
 move the file in pieces with progress on stderr; an interrupted upload
 continues with `--resume <id>`. Config in `~/.config/musql/` (only the CLI
 reads it).
+
+`musql dev [--db-file path] [--port 8080] [--auth-jwt-key-file key]`, as
+`turso dev`: one database served over Hrana on 127.0.0.1 by `hrana.NewServer`,
+a temporary file when none is given, and no state, sign-in or OIDC. With a key
+file (an Ed25519 public key, PEM or URL-safe base64, as libSQL server reads
+it) a client needs an EdDSA JWT signed by it and not expired; its `a` claim
+`ro` puts it on a read-only handle. Both handles are confined like the
+cloud's, so ATTACH and VACUUM INTO are refused. Browsers are answered as
+`turso dev` answers them, for any origin (CORS), so a web app on another local
+port can use the database.
 
 ## Releases
 

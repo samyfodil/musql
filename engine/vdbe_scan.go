@@ -586,6 +586,7 @@ func compileScanPlain(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols 
 	// eligible conjunct); others may still get a correlated seek
 	// (annotateJoinSeeks).
 	planConstantKeySeeks(c, srcs, stmt.Where, true, true)
+	planBillLimit(c, srcs, stmt)
 
 	// A row-mode scan evaluates WHERE and the select list with every cursor
 	// positioned at the current row, so a correlated subquery compiled beneath
@@ -1088,17 +1089,14 @@ func planConstantKeySeeks(c *compiler, srcs []joinSource, where Expr, rowidRange
 		plan.plan = srcs[idx].planExplain
 		srcs[idx].idxSeek, seeked = plan, idx
 	}
-	if !rowidRange {
-		return
-	}
 	for i := range srcs {
-		if i == seeked {
-			continue
-		}
-		if key, ok := detectRowidRangeKey(c, srcs, i, where); ok {
-			srcs[i].rowidRange = key
+		if rowidRange && i != seeked {
+			if key, ok := detectRowidRangeKey(c, srcs, i, where); ok {
+				srcs[i].rowidRange = key
+			}
 		}
 	}
+	planBillBounds(c, srcs, where)
 }
 
 // isSeekKeyCandidate reports whether e is a column-free constant seek key: a

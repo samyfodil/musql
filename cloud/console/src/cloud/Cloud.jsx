@@ -8,7 +8,7 @@ import { Field } from "../components/ColumnPanel.jsx";
 import { MenuButton } from "../components/Menu.jsx";
 import { Spinner } from "../components/Busy.jsx";
 import { fmt } from "../values.js";
-import { Access, api, databaseToken, date, DatabaseType, Durability, FileFormat, message, Role, ROLES, roleName, stamp, typeName, unimplemented } from "./api.js";
+import { Access, api, Code, databaseToken, date, DatabaseType, Durability, FileFormat, message, Role, ROLES, roleName, stamp, typeName, unimplemented } from "./api.js";
 import { server, signIn, signOut } from "./auth.js";
 import { cancelled, downloadExport, uploadFile } from "./transfer.js";
 
@@ -195,7 +195,12 @@ function Loaded({ s, empty, children }) {
 
 function Databases({ cloud, toast, onOpen, setPage, current }) {
 	const org = cloud.org;
-	const [s, reload] = useLoad(() => api.db.list({ org }).then((r) => r.databases), [org]);
+	const [s, reloadList] = useLoad(() => api.db.list({ org }).then((r) => r.databases), [org]);
+	const [deleted, reloadDeleted] = useLoad(() => api.db.listDeleted({ org }), [org]);
+	const reload = () => {
+		reloadList();
+		reloadDeleted();
+	};
 	const [drawer, setDrawer] = useState(null); // {create} | {token: db} | {rename: db} | {del: db}
 	const [xfer, setXfer] = useState(null); // an export under way: {label, done, total, cancel}
 	const dbs = s.data ?? [];
@@ -250,6 +255,34 @@ function Databases({ cloud, toast, onOpen, setPage, current }) {
 			setXfer(null);
 		}
 	}
+	async function update(d, change, done) {
+		try {
+			await api.db.update({ org, name: d.name, ...change });
+			toast(done);
+			reloadList();
+		} catch (e) {
+			toast(unimplemented(e) ? NA : message(e), true);
+		}
+	}
+	// restore brings a deleted database or group back, under another name
+	// when its own is taken.
+	async function restore(id, name) {
+		try {
+			let r;
+			try {
+				r = await api.db.restoreDeleted({ org, id });
+			} catch (e) {
+				if (e.code !== Code.AlreadyExists) throw e;
+				const next = prompt(`The name ${name} is taken. Restore it as:`, `${name}-restored`);
+				if (!next) return;
+				r = await api.db.restoreDeleted({ org, id, newName: next });
+			}
+			toast(`Restored ${r.group ? `${r.group.name} and its databases` : r.databases[0].name}.`);
+			reload();
+		} catch (e) {
+			toast(message(e), true);
+		}
+	}
 	async function invalidate(d) {
 		if (!confirm(`Invalidate every token of ${d.name}? Clients using one stop working.`)) return;
 		try {
@@ -272,7 +305,12 @@ function Databases({ cloud, toast, onOpen, setPage, current }) {
 					<tbody>
 						{dbs.map((d) => (
 							<tr key={d.id}>
-								<td><button className="link mono" title="Open in the editor" onClick={() => open(d)}>{d.name}</button>{d.parent && <span className="badge">branch of {d.parent}</span>}</td>
+								<td>
+									<button className="link mono" title="Open in the editor" onClick={() => open(d)}>{d.name}</button>{d.parent && <span className="badge">branch of {d.parent}</span>}
+									{d.deleteProtection && <span className="badge" title="Delete is refused until protection is turned off">protected</span>}
+									{d.blockReads && <span className="badge" title="Every statement is refused">reads blocked</span>}
+									{d.blockWrites && <span className="badge" title="Every statement that writes is refused">writes blocked</span>}
+								</td>
 								<td><span className="chip mono" title={d.type === DatabaseType.CRDT ? "Replicated: every location writes, and restore is per node" : "One file, full SQLite semantics"}>{typeName(d.type)}</span>{d.durability === Durability.FAST && <span className="chip mono" title="In a cluster, a commit returns once the master has it: a master that stops first takes its last commits along">fast</span>}</td>
 								<td className="mono">{d.group}</td>
 								<td className="num">{bytes(d.sizeBytes)}</td>
@@ -291,7 +329,10 @@ function Databases({ cloud, toast, onOpen, setPage, current }) {
 										"-",
 										member && { label: "Invalidate all tokens…", onClick: () => invalidate(d) },
 										member && { label: "Rename…", onClick: () => setDrawer({ rename: d }) },
-										member && { label: "Delete…", onClick: () => setDrawer({ del: d }) },
+										member && { label: d.deleteProtection ? "Allow deletion" : "Protect from deletion", onClick: () => update(d, { deleteProtection: !d.deleteProtection }, d.deleteProtection ? `${d.name} can be deleted.` : `${d.name} is protected from deletion.`) },
+										member && { label: d.blockWrites ? "Unblock writes" : "Block writes", onClick: () => update(d, { blockWrites: !d.blockWrites }, `Writes to ${d.name} are ${d.blockWrites ? "allowed" : "blocked"}.`) },
+										member && { label: d.blockReads ? "Unblock reads" : "Block reads", onClick: () => update(d, { blockReads: !d.blockReads }, `Reads of ${d.name} are ${d.blockReads ? "allowed" : "blocked"}.`) },
+										member && { label: "Delete…", disabled: d.deleteProtection, onClick: () => setDrawer({ del: d }) },
 									]} />
 								</td>
 							</tr>
@@ -299,6 +340,25 @@ function Databases({ cloud, toast, onOpen, setPage, current }) {
 					</tbody>
 				</table>
 			</Loaded>
+			{(deleted.data?.databases.length > 0 || deleted.data?.groups.length > 0) && (
+				<>
+					<h2 className="cloudsub">Deleted</h2>
+					<table className="cloudtable">
+						<thead><tr><th>Name</th><th>Kind</th><th>Deleted</th><th>Restorable until</th><th /></tr></thead>
+						<tbody>
+							{[...deleted.data.groups.map((g) => ({ id: g.group.id, name: g.group.name, kind: "group", ...g })), ...deleted.data.databases.map((d) => ({ id: d.database.id, name: d.database.name, kind: d.deletedWithGroup ? "database, with its group" : "database", ...d }))].map((x) => (
+								<tr key={x.id}>
+									<td className="mono">{x.name}</td>
+									<td>{x.kind}</td>
+									<td title={when(x.deletedAt)}>{day(x.deletedAt)}</td>
+									<td>{when(x.expiresAt)}</td>
+									<td className="rowactions">{(x.kind === "group" ? can(cloud, Role.ADMIN) : member) && <button className="ghost" onClick={() => restore(x.id, x.name)}>Restore</button>}</td>
+								</tr>
+							))}
+						</tbody>
+					</table>
+				</>
+			)}
 			{drawer?.create && <CreateDb org={org} dbs={dbs} initial={drawer.create} toast={toast} onClose={(made) => { setDrawer(null); made && reload(); }} />}
 			{drawer?.token && <DbToken cloud={cloud} db={drawer.token} toast={toast} onClose={() => setDrawer(null)} />}
 			{drawer?.rename && <RenameDb org={org} db={drawer.rename} inEditor={current?.org === org && current.database === drawer.rename.name} toast={toast} onClose={(now) => renamed(drawer.rename, now)} />}
@@ -462,9 +522,9 @@ function DeleteDb({ org, db, toast, onClose }) {
 		}
 	};
 	return (
-		<Drawer title={`Delete ${db.name}`} subtitle={org} onClose={() => onClose(false)} footer={<><span className="grow" /><button onClick={() => onClose(false)}>Cancel</button><button className="danger" disabled={typed !== db.name} onClick={go}>Delete forever</button></>}>
+		<Drawer title={`Delete ${db.name}`} subtitle={org} onClose={() => onClose(false)} footer={<><span className="grow" /><button onClick={() => onClose(false)}>Cancel</button><button className="danger" disabled={typed !== db.name} onClick={go}>Delete</button></>}>
 			<form className="form" onSubmit={(e) => { e.preventDefault(); typed === db.name && go(); }}>
-				<p>This deletes the database and its data. It cannot be undone.</p>
+				<p>This deletes the database: its URL stops answering and its name is free. It stays under Deleted, restorable with its data and history, until the server's retention for deleted databases ends.</p>
 				<Field label={<>Type <b className="mono">{db.name}</b> to confirm</>}><input spellCheck={false} autoComplete="off" value={typed} onChange={(e) => setTyped(e.target.value)} /></Field>
 				<button type="submit" hidden />
 			</form>
@@ -541,7 +601,10 @@ function Groups({ cloud, toast }) {
 									)}
 								</td>
 								<td>{day(g.createdAt)}</td>
-								<td className="rowactions">{admin && g.name !== "default" && <button className="ghost" onClick={() => confirm(`Delete the group ${g.name}?`) && act(() => api.groups.delete({ org, name: g.name }), `Deleted ${g.name}.`)}>Delete</button>}</td>
+								<td className="rowactions">
+									{admin && <button className="ghost" title={g.deleteProtection ? "Delete is refused until protection is turned off" : "Refuse deleting the group"} onClick={() => act(() => api.groups.update({ org, name: g.name, deleteProtection: !g.deleteProtection }), g.deleteProtection ? `${g.name} can be deleted.` : `${g.name} is protected from deletion.`)}>{g.deleteProtection ? "Unprotect" : "Protect"}</button>}
+									{admin && g.name !== "default" && <button className="ghost" disabled={g.deleteProtection} onClick={() => confirm(`Delete the group ${g.name} and its databases? They stay restorable under Databases › Deleted until the server's retention ends.`) && act(() => api.groups.delete({ org, name: g.name }), `Deleted ${g.name}.`)}>Delete</button>}
+								</td>
 							</tr>
 						))}
 					</tbody>

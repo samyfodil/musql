@@ -37,7 +37,8 @@ func (s *Server) dbToProto(ctx context.Context, o *state.Org, d *state.Database)
 	out := &v1.Database{
 		Id: d.ID, Org: o.Slug, Name: d.Name, Parent: d.Parent, ParentAt: stamp(d.ParentAt),
 		SchemaOnly: d.SchemaOnly, CreatedAt: stamp(d.CreatedAt), Type: typeToProto(d.Type), Durability: durabilityToProto(d),
-		Url: s.cfg.PublicURL + "/db/" + o.Slug + "/" + d.Name + "/",
+		Url:              s.cfg.PublicURL + "/db/" + o.Slug + "/" + d.Name + "/",
+		DeleteProtection: d.DeleteProtection, BlockReads: d.BlockReads, BlockWrites: d.BlockWrites,
 	}
 	if g, err := s.store.GroupByID(ctx, d.GroupID); err == nil {
 		out.Group = g.Name
@@ -332,11 +333,12 @@ func (s databaseService) Delete(ctx context.Context, req *connect.Request[v1.Del
 	if err != nil {
 		return nil, err
 	}
-	// The record goes first: from then on no token reaches the file.
-	if err := s.store.DeleteDatabase(ctx, d.ID); err != nil {
+	// The record goes first: from then on no token reaches the file, which
+	// is kept, with its history, until the sweep after its retention.
+	if err := s.store.SoftDeleteDatabase(ctx, d.ID); err != nil {
 		return nil, rpcErr(err)
 	}
-	s.removeFiles(d)
+	s.closeDB(d.ID)
 	return connect.NewResponse(&v1.DeleteDatabaseResponse{}), nil
 }
 

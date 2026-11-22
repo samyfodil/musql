@@ -28,6 +28,10 @@ import (
 // which is what gives a transaction read-your-writes. An ATTACHed database's
 // file gets a held session of its own (ndbs, sessionFor).
 type Conn struct {
+	// rows counts the rows this connection's statements read and write
+	// (RowCounts), handed to every pager and session they run on.
+	rows engine.RowCounter
+
 	// interrupt stops this connection's running statement (watchContext).
 	interrupt atomic.Bool
 
@@ -728,6 +732,7 @@ func (c *Conn) openWriteOrCreatePath(path string) (*engine.DB, error) {
 	// afterwards. See
 	// engine/conn_state.go.
 	db.SetConnState(c.changes, c.totalChanges, c.lastInsertRowid, c.totalChangesOpaque, c.lastRowidOpaque)
+	db.SetRowCounter(&c.rows)
 	// MAIN ONLY. An ATTACHed database's session reached the capture hook with
 	// its DDL (qualifier stripped) and its rows looking exactly like main's, so a
 	// consumer replicating main by name would have written them into main's
@@ -786,6 +791,7 @@ func (c *Conn) noteConnState(db *engine.DB) {
 // A pager missing any of these answers wrongly rather than declining.
 func (c *Conn) stampConnState(p *engine.ReadOnlyPager) {
 	p.SetConnState(c.changes, c.totalChanges, c.lastInsertRowid, c.totalChangesOpaque, c.lastRowidOpaque)
+	p.SetRowCounter(&c.rows)
 	p.SetTrustedSchema(!c.untrustedSchema)
 	p.SetRtreeConnections(c.rtreeConns)
 	p.SetVec1Connection(c.vec1Conns)

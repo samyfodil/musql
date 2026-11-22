@@ -410,6 +410,9 @@ func (e *vmEmitArm) seekRowid(pc int, in VInsn) {
 	a.LdrImm(X10, X9, VCursorOffSrvd)
 	a.AddImm(X10, X10, 1)
 	a.StrImm(X10, X9, VCursorOffSrvd)
+	a.LdrImm(X10, X9, VCursorOffSteps)
+	a.AddImm(X10, X10, 1)
+	a.StrImm(X10, X9, VCursorOffSteps)
 	a.B(done)
 
 	// No row: the cursor on none, and on to T.
@@ -532,6 +535,9 @@ func (e *vmEmitArm) seekIdx(pc int, in VInsn) {
 	a.StrImm(X10, X9, VCursorOffAdv)
 	a.MovImm16(X10, 2)
 	a.StrImm(X10, X9, VCursorOffState)
+	a.LdrImm(X10, X9, VCursorOffSteps)
+	a.AddImm(X10, X10, 1)
+	a.StrImm(X10, X9, VCursorOffSteps)
 	a.B(done)
 
 	// No row: the cursor on none, and on to T.

@@ -253,7 +253,8 @@ func (wc *wsConn) request(rq *pbws.RequestMsg) {
 		}
 		st := &wsStream{jobs: make(chan func(), 64)}
 		wc.streams[sid] = st
-		db, authz := wc.srv.dbFor(wc.acc.ReadOnly), wc.acc.authorizer()
+		ro := wc.acc.ReadOnly || wc.srv.writesBlocked()
+		db, authz := wc.srv.dbFor(ro), wc.acc.authorizer()
 		wc.mu.Unlock()
 		wc.srv.ws.Add(1) // under the connection, which Close is already waiting on
 		go func() {
@@ -271,6 +272,7 @@ func (wc *wsConn) request(rq *pbws.RequestMsg) {
 				wc.replyErr(id, err)
 				return
 			}
+			s.ro, s.block = ro, wc.srv.block
 			s.setAuthorizer(authz)
 			st.stream, st.open = s, true
 			wc.reply(id, &pbws.ResponseOkMsg{Response: &pbws.ResponseOkMsg_OpenStream{OpenStream: &pbws.OpenStreamResp{}}})
