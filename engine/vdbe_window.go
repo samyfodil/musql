@@ -1749,6 +1749,10 @@ func compileScanWindow(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 			// sqlite3WindowUpdate (window.c:689): only an aggregate takes a FILTER.
 			return nil, semanticf("engine: FILTER clause may only be used with aggregate window functions")
 		}
+		if a := udafs[call.name]; a != nil && a.plain {
+			// resolve.c: an aggregate without xValue is no window function.
+			return nil, semanticf("engine: %s() may not be used as a window function", call.name)
+		}
 		if !isWindowFunctionName(call.name) {
 			if !isAggregateCall(call.funcExpr()) {
 				// window.c:689-ish: a function that is neither is refused by name.
@@ -1938,7 +1942,7 @@ func compileScanWindow(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 	deferredWhere := andConjuncts(jplan.deferred)
 
 	body := func() error {
-		whereJump := -1
+		var whereJumps []int
 		if deferredWhere != nil {
 			// deferredWhere is andConjuncts of plan.deferred -- itself a set of
 			// genuine top-level WHERE AND-conjuncts (splitTopLevelAnd, join.go)
@@ -1950,12 +1954,11 @@ func compileScanWindow(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 			// RIGHT/FULL join or parenthesized group forces a row-value/
 			// subquery WHERE conjunct here instead of into a per-level bucket
 			// (planJoinPushdown's mentionsSubquery forceLast rule, join.go).
-			c.inWhereConjunct = true
-			wReg, werr := c.compileExpr(deferredWhere)
+			var werr error
+			whereJumps, werr = c.whereFalseJumps(deferredWhere)
 			if werr != nil {
 				return werr
 			}
-			whereJump = c.emit(Instruction{Op: OpIfNot, P1: wReg, P3: 1})
 		}
 		for _, s := range srcs {
 			for j := 0; j < len(s.tbl.cols); j++ {
@@ -1970,8 +1973,8 @@ func compileScanWindow(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 		}
 		c.emit(Instruction{Op: OpMakeRecord, P1: colBase, P2: plan.nCols + len(srcs) + plan.nOps, P3: recReg})
 		c.emit(Instruction{Op: OpWindowAppend, P1: recReg})
-		if whereJump >= 0 {
-			c.patch(whereJump, c.here())
+		for _, j := range whereJumps {
+			c.patch(j, c.here())
 		}
 		return nil
 	}
@@ -1994,6 +1997,7 @@ func compileScanWindow(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 	// batch resolution is not row-live.
 	savedRowLive := c.rowLive
 	c.rowLive = true
+	planBillBounds(c, srcs, stmt.Where)
 	jerr := emitJoinLoops(c, srcs, jplan, body)
 	c.rowLive = savedRowLive
 	if jerr != nil {

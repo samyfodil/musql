@@ -34,6 +34,10 @@ type Config struct {
 	Console ConsoleConfig `yaml:"console"`
 	OIDC    OIDCConfig    `yaml:"oidc"`
 	Uploads UploadsConfig `yaml:"uploads"`
+	// DeletedRetention is how long a deleted database is kept, restorable,
+	// before it is removed with its history (default 5d); "0" removes it at
+	// the next sweep. WithDeletedRetention sets it per org instead.
+	DeletedRetention string `yaml:"deleted_retention"`
 
 	// snapshots.every and snapshots.keep, parsed; 0 turns each off.
 	snapshotEvery, snapshotKeep time.Duration
@@ -44,6 +48,8 @@ type Config struct {
 	syncInterval time.Duration
 	// election is raft's timing for the elections; zero is raft's defaults.
 	election cluster.ElectionTiming
+	// deletedRetention is deleted_retention, parsed.
+	deletedRetention time.Duration
 }
 
 // OIDCConfig tunes sign-in. Durations take Go syntax plus "d" for days
@@ -229,6 +235,9 @@ func (c *Config) normalize() error {
 	}
 	if c.Uploads.ttl, err = durationOr(c.Uploads.TTL, 24*time.Hour); err != nil || c.Uploads.ttl == 0 {
 		return fmt.Errorf("config: uploads.ttl %q is not a positive duration", c.Uploads.TTL)
+	}
+	if c.deletedRetention, err = durationOr(c.DeletedRetention, 5*24*time.Hour); err != nil {
+		return fmt.Errorf("config: deleted_retention: %w", err)
 	}
 	return nil
 }
