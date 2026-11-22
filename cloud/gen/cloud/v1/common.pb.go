@@ -483,9 +483,12 @@ type Group struct {
 	Locations []string               `protobuf:"bytes,4,rep,name=locations,proto3" json:"locations,omitempty"`
 	CreatedAt *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
 	// What the group's databases default to.
-	Type          DatabaseType `protobuf:"varint,6,opt,name=type,proto3,enum=cloud.v1.DatabaseType" json:"type,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Type DatabaseType `protobuf:"varint,6,opt,name=type,proto3,enum=cloud.v1.DatabaseType" json:"type,omitempty"`
+	// While set, the group cannot be deleted.
+	DeleteProtection bool   `protobuf:"varint,7,opt,name=delete_protection,json=deleteProtection,proto3" json:"delete_protection,omitempty"`
+	Id               string `protobuf:"bytes,8,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *Group) Reset() {
@@ -560,20 +563,40 @@ func (x *Group) GetType() DatabaseType {
 	return DatabaseType_DATABASE_TYPE_UNSPECIFIED
 }
 
+func (x *Group) GetDeleteProtection() bool {
+	if x != nil {
+		return x.DeleteProtection
+	}
+	return false
+}
+
+func (x *Group) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
 type Database struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	Org           string                 `protobuf:"bytes,2,opt,name=org,proto3" json:"org,omitempty"`
-	Name          string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
-	Group         string                 `protobuf:"bytes,4,opt,name=group,proto3" json:"group,omitempty"`
-	Url           string                 `protobuf:"bytes,5,opt,name=url,proto3" json:"url,omitempty"`
-	SizeBytes     int64                  `protobuf:"varint,6,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
-	Parent        string                 `protobuf:"bytes,7,opt,name=parent,proto3" json:"parent,omitempty"`
-	ParentAt      *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=parent_at,json=parentAt,proto3" json:"parent_at,omitempty"`
-	SchemaOnly    bool                   `protobuf:"varint,9,opt,name=schema_only,json=schemaOnly,proto3" json:"schema_only,omitempty"`
-	CreatedAt     *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
-	Type          DatabaseType           `protobuf:"varint,11,opt,name=type,proto3,enum=cloud.v1.DatabaseType" json:"type,omitempty"`
-	Durability    Durability             `protobuf:"varint,12,opt,name=durability,proto3,enum=cloud.v1.Durability" json:"durability,omitempty"`
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Id         string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Org        string                 `protobuf:"bytes,2,opt,name=org,proto3" json:"org,omitempty"`
+	Name       string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
+	Group      string                 `protobuf:"bytes,4,opt,name=group,proto3" json:"group,omitempty"`
+	Url        string                 `protobuf:"bytes,5,opt,name=url,proto3" json:"url,omitempty"`
+	SizeBytes  int64                  `protobuf:"varint,6,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
+	Parent     string                 `protobuf:"bytes,7,opt,name=parent,proto3" json:"parent,omitempty"`
+	ParentAt   *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=parent_at,json=parentAt,proto3" json:"parent_at,omitempty"`
+	SchemaOnly bool                   `protobuf:"varint,9,opt,name=schema_only,json=schemaOnly,proto3" json:"schema_only,omitempty"`
+	CreatedAt  *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	Type       DatabaseType           `protobuf:"varint,11,opt,name=type,proto3,enum=cloud.v1.DatabaseType" json:"type,omitempty"`
+	Durability Durability             `protobuf:"varint,12,opt,name=durability,proto3,enum=cloud.v1.Durability" json:"durability,omitempty"`
+	// While set, the database cannot be deleted.
+	DeleteProtection bool `protobuf:"varint,13,opt,name=delete_protection,json=deleteProtection,proto3" json:"delete_protection,omitempty"`
+	// Hrana refuses every statement while block_reads is set, and every
+	// statement that writes while block_writes is, with the error code BLOCKED.
+	BlockReads    bool `protobuf:"varint,14,opt,name=block_reads,json=blockReads,proto3" json:"block_reads,omitempty"`
+	BlockWrites   bool `protobuf:"varint,15,opt,name=block_writes,json=blockWrites,proto3" json:"block_writes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -692,6 +715,159 @@ func (x *Database) GetDurability() Durability {
 	return Durability_DURABILITY_UNSPECIFIED
 }
 
+func (x *Database) GetDeleteProtection() bool {
+	if x != nil {
+		return x.DeleteProtection
+	}
+	return false
+}
+
+func (x *Database) GetBlockReads() bool {
+	if x != nil {
+		return x.BlockReads
+	}
+	return false
+}
+
+func (x *Database) GetBlockWrites() bool {
+	if x != nil {
+		return x.BlockWrites
+	}
+	return false
+}
+
+// A database deleted and kept until expires_at, when it is removed with its
+// history; until then RestoreDeleted brings it back.
+type DeletedDatabase struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Database  *Database              `protobuf:"bytes,1,opt,name=database,proto3" json:"database,omitempty"`
+	DeletedAt *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=deleted_at,json=deletedAt,proto3" json:"deleted_at,omitempty"`
+	ExpiresAt *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
+	// Set when it was deleted with its group: restoring the group restores it.
+	DeletedWithGroup string `protobuf:"bytes,4,opt,name=deleted_with_group,json=deletedWithGroup,proto3" json:"deleted_with_group,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *DeletedDatabase) Reset() {
+	*x = DeletedDatabase{}
+	mi := &file_cloud_v1_common_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeletedDatabase) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeletedDatabase) ProtoMessage() {}
+
+func (x *DeletedDatabase) ProtoReflect() protoreflect.Message {
+	mi := &file_cloud_v1_common_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeletedDatabase.ProtoReflect.Descriptor instead.
+func (*DeletedDatabase) Descriptor() ([]byte, []int) {
+	return file_cloud_v1_common_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *DeletedDatabase) GetDatabase() *Database {
+	if x != nil {
+		return x.Database
+	}
+	return nil
+}
+
+func (x *DeletedDatabase) GetDeletedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.DeletedAt
+	}
+	return nil
+}
+
+func (x *DeletedDatabase) GetExpiresAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ExpiresAt
+	}
+	return nil
+}
+
+func (x *DeletedDatabase) GetDeletedWithGroup() string {
+	if x != nil {
+		return x.DeletedWithGroup
+	}
+	return ""
+}
+
+// A deleted group, kept with the databases deleted with it.
+type DeletedGroup struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Group         *Group                 `protobuf:"bytes,1,opt,name=group,proto3" json:"group,omitempty"`
+	DeletedAt     *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=deleted_at,json=deletedAt,proto3" json:"deleted_at,omitempty"`
+	ExpiresAt     *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeletedGroup) Reset() {
+	*x = DeletedGroup{}
+	mi := &file_cloud_v1_common_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeletedGroup) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeletedGroup) ProtoMessage() {}
+
+func (x *DeletedGroup) ProtoReflect() protoreflect.Message {
+	mi := &file_cloud_v1_common_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeletedGroup.ProtoReflect.Descriptor instead.
+func (*DeletedGroup) Descriptor() ([]byte, []int) {
+	return file_cloud_v1_common_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *DeletedGroup) GetGroup() *Group {
+	if x != nil {
+		return x.Group
+	}
+	return nil
+}
+
+func (x *DeletedGroup) GetDeletedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.DeletedAt
+	}
+	return nil
+}
+
+func (x *DeletedGroup) GetExpiresAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ExpiresAt
+	}
+	return nil
+}
+
 var File_cloud_v1_common_proto protoreflect.FileDescriptor
 
 const file_cloud_v1_common_proto_rawDesc = "" +
@@ -721,7 +897,7 @@ const file_cloud_v1_common_proto_rawDesc = "" +
 	"\x05email\x18\x03 \x01(\tR\x05email\x12\"\n" +
 	"\x04role\x18\x04 \x01(\x0e2\x0e.cloud.v1.RoleR\x04role\x129\n" +
 	"\n" +
-	"created_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"\xcc\x01\n" +
+	"created_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"\x89\x02\n" +
 	"\x05Group\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x10\n" +
 	"\x03org\x18\x02 \x01(\tR\x03org\x12\x18\n" +
@@ -729,7 +905,9 @@ const file_cloud_v1_common_proto_rawDesc = "" +
 	"\tlocations\x18\x04 \x03(\tR\tlocations\x129\n" +
 	"\n" +
 	"created_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x12*\n" +
-	"\x04type\x18\x06 \x01(\x0e2\x16.cloud.v1.DatabaseTypeR\x04type\"\x96\x03\n" +
+	"\x04type\x18\x06 \x01(\x0e2\x16.cloud.v1.DatabaseTypeR\x04type\x12+\n" +
+	"\x11delete_protection\x18\a \x01(\bR\x10deleteProtection\x12\x0e\n" +
+	"\x02id\x18\b \x01(\tR\x02id\"\x87\x04\n" +
 	"\bDatabase\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x10\n" +
 	"\x03org\x18\x02 \x01(\tR\x03org\x12\x12\n" +
@@ -748,7 +926,24 @@ const file_cloud_v1_common_proto_rawDesc = "" +
 	"\x04type\x18\v \x01(\x0e2\x16.cloud.v1.DatabaseTypeR\x04type\x124\n" +
 	"\n" +
 	"durability\x18\f \x01(\x0e2\x14.cloud.v1.DurabilityR\n" +
-	"durability*^\n" +
+	"durability\x12+\n" +
+	"\x11delete_protection\x18\r \x01(\bR\x10deleteProtection\x12\x1f\n" +
+	"\vblock_reads\x18\x0e \x01(\bR\n" +
+	"blockReads\x12!\n" +
+	"\fblock_writes\x18\x0f \x01(\bR\vblockWrites\"\xe5\x01\n" +
+	"\x0fDeletedDatabase\x12.\n" +
+	"\bdatabase\x18\x01 \x01(\v2\x12.cloud.v1.DatabaseR\bdatabase\x129\n" +
+	"\n" +
+	"deleted_at\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\tdeletedAt\x129\n" +
+	"\n" +
+	"expires_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\x12,\n" +
+	"\x12deleted_with_group\x18\x04 \x01(\tR\x10deletedWithGroup\"\xab\x01\n" +
+	"\fDeletedGroup\x12%\n" +
+	"\x05group\x18\x01 \x01(\v2\x0f.cloud.v1.GroupR\x05group\x129\n" +
+	"\n" +
+	"deleted_at\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\tdeletedAt\x129\n" +
+	"\n" +
+	"expires_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt*^\n" +
 	"\x04Role\x12\x14\n" +
 	"\x10ROLE_UNSPECIFIED\x10\x00\x12\x0f\n" +
 	"\vROLE_VIEWER\x10\x01\x12\x0f\n" +
@@ -782,7 +977,7 @@ func file_cloud_v1_common_proto_rawDescGZIP() []byte {
 }
 
 var file_cloud_v1_common_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_cloud_v1_common_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_cloud_v1_common_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_cloud_v1_common_proto_goTypes = []any{
 	(Role)(0),                     // 0: cloud.v1.Role
 	(DatabaseType)(0),             // 1: cloud.v1.DatabaseType
@@ -793,26 +988,34 @@ var file_cloud_v1_common_proto_goTypes = []any{
 	(*Invite)(nil),                // 6: cloud.v1.Invite
 	(*Group)(nil),                 // 7: cloud.v1.Group
 	(*Database)(nil),              // 8: cloud.v1.Database
-	(*timestamppb.Timestamp)(nil), // 9: google.protobuf.Timestamp
+	(*DeletedDatabase)(nil),       // 9: cloud.v1.DeletedDatabase
+	(*DeletedGroup)(nil),          // 10: cloud.v1.DeletedGroup
+	(*timestamppb.Timestamp)(nil), // 11: google.protobuf.Timestamp
 }
 var file_cloud_v1_common_proto_depIdxs = []int32{
-	9,  // 0: cloud.v1.User.created_at:type_name -> google.protobuf.Timestamp
-	9,  // 1: cloud.v1.Org.created_at:type_name -> google.protobuf.Timestamp
+	11, // 0: cloud.v1.User.created_at:type_name -> google.protobuf.Timestamp
+	11, // 1: cloud.v1.Org.created_at:type_name -> google.protobuf.Timestamp
 	3,  // 2: cloud.v1.Member.user:type_name -> cloud.v1.User
 	0,  // 3: cloud.v1.Member.role:type_name -> cloud.v1.Role
 	0,  // 4: cloud.v1.Invite.role:type_name -> cloud.v1.Role
-	9,  // 5: cloud.v1.Invite.created_at:type_name -> google.protobuf.Timestamp
-	9,  // 6: cloud.v1.Group.created_at:type_name -> google.protobuf.Timestamp
+	11, // 5: cloud.v1.Invite.created_at:type_name -> google.protobuf.Timestamp
+	11, // 6: cloud.v1.Group.created_at:type_name -> google.protobuf.Timestamp
 	1,  // 7: cloud.v1.Group.type:type_name -> cloud.v1.DatabaseType
-	9,  // 8: cloud.v1.Database.parent_at:type_name -> google.protobuf.Timestamp
-	9,  // 9: cloud.v1.Database.created_at:type_name -> google.protobuf.Timestamp
+	11, // 8: cloud.v1.Database.parent_at:type_name -> google.protobuf.Timestamp
+	11, // 9: cloud.v1.Database.created_at:type_name -> google.protobuf.Timestamp
 	1,  // 10: cloud.v1.Database.type:type_name -> cloud.v1.DatabaseType
 	2,  // 11: cloud.v1.Database.durability:type_name -> cloud.v1.Durability
-	12, // [12:12] is the sub-list for method output_type
-	12, // [12:12] is the sub-list for method input_type
-	12, // [12:12] is the sub-list for extension type_name
-	12, // [12:12] is the sub-list for extension extendee
-	0,  // [0:12] is the sub-list for field type_name
+	8,  // 12: cloud.v1.DeletedDatabase.database:type_name -> cloud.v1.Database
+	11, // 13: cloud.v1.DeletedDatabase.deleted_at:type_name -> google.protobuf.Timestamp
+	11, // 14: cloud.v1.DeletedDatabase.expires_at:type_name -> google.protobuf.Timestamp
+	7,  // 15: cloud.v1.DeletedGroup.group:type_name -> cloud.v1.Group
+	11, // 16: cloud.v1.DeletedGroup.deleted_at:type_name -> google.protobuf.Timestamp
+	11, // 17: cloud.v1.DeletedGroup.expires_at:type_name -> google.protobuf.Timestamp
+	18, // [18:18] is the sub-list for method output_type
+	18, // [18:18] is the sub-list for method input_type
+	18, // [18:18] is the sub-list for extension type_name
+	18, // [18:18] is the sub-list for extension extendee
+	0,  // [0:18] is the sub-list for field type_name
 }
 
 func init() { file_cloud_v1_common_proto_init() }
@@ -826,7 +1029,7 @@ func file_cloud_v1_common_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_cloud_v1_common_proto_rawDesc), len(file_cloud_v1_common_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   6,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

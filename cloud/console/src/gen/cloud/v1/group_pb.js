@@ -9,7 +9,7 @@ import { file_cloud_v1_common } from "./common_pb";
  * Describes the file cloud/v1/group.proto.
  */
 export const file_cloud_v1_group = /*@__PURE__*/
-  fileDesc("ChRjbG91ZC92MS9ncm91cC5wcm90bxIIY2xvdWQudjEiIAoRTGlzdEdyb3Vwc1JlcXVlc3QSCwoDb3JnGAEgASgJIjUKEkxpc3RHcm91cHNSZXNwb25zZRIfCgZncm91cHMYASADKAsyDy5jbG91ZC52MS5Hcm91cCJnChJDcmVhdGVHcm91cFJlcXVlc3QSCwoDb3JnGAEgASgJEgwKBG5hbWUYAiABKAkSEAoIbG9jYXRpb24YAyABKAkSJAoEdHlwZRgEIAEoDjIWLmNsb3VkLnYxLkRhdGFiYXNlVHlwZSI1ChNDcmVhdGVHcm91cFJlc3BvbnNlEh4KBWdyb3VwGAEgASgLMg8uY2xvdWQudjEuR3JvdXAiLwoSRGVsZXRlR3JvdXBSZXF1ZXN0EgsKA29yZxgBIAEoCRIMCgRuYW1lGAIgASgJIhUKE0RlbGV0ZUdyb3VwUmVzcG9uc2UiQgoSQWRkTG9jYXRpb25SZXF1ZXN0EgsKA29yZxgBIAEoCRINCgVncm91cBgCIAEoCRIQCghsb2NhdGlvbhgDIAEoCSI1ChNBZGRMb2NhdGlvblJlc3BvbnNlEh4KBWdyb3VwGAEgASgLMg8uY2xvdWQudjEuR3JvdXAiRQoVUmVtb3ZlTG9jYXRpb25SZXF1ZXN0EgsKA29yZxgBIAEoCRINCgVncm91cBgCIAEoCRIQCghsb2NhdGlvbhgDIAEoCSI4ChZSZW1vdmVMb2NhdGlvblJlc3BvbnNlEh4KBWdyb3VwGAEgASgLMg8uY2xvdWQudjEuR3JvdXAiJgoITG9jYXRpb24SDAoEY29kZRgBIAEoCRIMCgRub2RlGAIgASgJIhYKFExpc3RMb2NhdGlvbnNSZXF1ZXN0Ij4KFUxpc3RMb2NhdGlvbnNSZXNwb25zZRIlCglsb2NhdGlvbnMYASADKAsyEi5jbG91ZC52MS5Mb2NhdGlvbjLSAwoMR3JvdXBTZXJ2aWNlEkEKBExpc3QSGy5jbG91ZC52MS5MaXN0R3JvdXBzUmVxdWVzdBocLmNsb3VkLnYxLkxpc3RHcm91cHNSZXNwb25zZRJFCgZDcmVhdGUSHC5jbG91ZC52MS5DcmVhdGVHcm91cFJlcXVlc3QaHS5jbG91ZC52MS5DcmVhdGVHcm91cFJlc3BvbnNlEkUKBkRlbGV0ZRIcLmNsb3VkLnYxLkRlbGV0ZUdyb3VwUmVxdWVzdBodLmNsb3VkLnYxLkRlbGV0ZUdyb3VwUmVzcG9uc2USSgoLQWRkTG9jYXRpb24SHC5jbG91ZC52MS5BZGRMb2NhdGlvblJlcXVlc3QaHS5jbG91ZC52MS5BZGRMb2NhdGlvblJlc3BvbnNlElMKDlJlbW92ZUxvY2F0aW9uEh8uY2xvdWQudjEuUmVtb3ZlTG9jYXRpb25SZXF1ZXN0GiAuY2xvdWQudjEuUmVtb3ZlTG9jYXRpb25SZXNwb25zZRJQCg1MaXN0TG9jYXRpb25zEh4uY2xvdWQudjEuTGlzdExvY2F0aW9uc1JlcXVlc3QaHy5jbG91ZC52MS5MaXN0TG9jYXRpb25zUmVzcG9uc2VCkgEKDGNvbS5jbG91ZC52MUIKR3JvdXBQcm90b1ABWjVnaXRodWIuY29tL3NhbXlmb2RpbC9tdXNxbC9jbG91ZC9nZW4vY2xvdWQvdjE7Y2xvdWR2MaICA0NYWKoCCENsb3VkLlYxygIIQ2xvdWRcVjHiAhRDbG91ZFxWMVxHUEJNZXRhZGF0YeoCCUNsb3VkOjpWMWIGcHJvdG8z", [file_cloud_v1_common]);
+  fileDesc("ChRjbG91ZC92MS9ncm91cC5wcm90bxIIY2xvdWQudjEiIAoRTGlzdEdyb3Vwc1JlcXVlc3QSCwoDb3JnGAEgASgJIjUKEkxpc3RHcm91cHNSZXNwb25zZRIfCgZncm91cHMYASADKAsyDy5jbG91ZC52MS5Hcm91cCJnChJDcmVhdGVHcm91cFJlcXVlc3QSCwoDb3JnGAEgASgJEgwKBG5hbWUYAiABKAkSEAoIbG9jYXRpb24YAyABKAkSJAoEdHlwZRgEIAEoDjIWLmNsb3VkLnYxLkRhdGFiYXNlVHlwZSI1ChNDcmVhdGVHcm91cFJlc3BvbnNlEh4KBWdyb3VwGAEgASgLMg8uY2xvdWQudjEuR3JvdXAiLwoSRGVsZXRlR3JvdXBSZXF1ZXN0EgsKA29yZxgBIAEoCRIMCgRuYW1lGAIgASgJIhUKE0RlbGV0ZUdyb3VwUmVzcG9uc2UiZQoSVXBkYXRlR3JvdXBSZXF1ZXN0EgsKA29yZxgBIAEoCRIMCgRuYW1lGAIgASgJEh4KEWRlbGV0ZV9wcm90ZWN0aW9uGAMgASgISACIAQFCFAoSX2RlbGV0ZV9wcm90ZWN0aW9uIjUKE1VwZGF0ZUdyb3VwUmVzcG9uc2USHgoFZ3JvdXAYASABKAsyDy5jbG91ZC52MS5Hcm91cCJCChJBZGRMb2NhdGlvblJlcXVlc3QSCwoDb3JnGAEgASgJEg0KBWdyb3VwGAIgASgJEhAKCGxvY2F0aW9uGAMgASgJIjUKE0FkZExvY2F0aW9uUmVzcG9uc2USHgoFZ3JvdXAYASABKAsyDy5jbG91ZC52MS5Hcm91cCJFChVSZW1vdmVMb2NhdGlvblJlcXVlc3QSCwoDb3JnGAEgASgJEg0KBWdyb3VwGAIgASgJEhAKCGxvY2F0aW9uGAMgASgJIjgKFlJlbW92ZUxvY2F0aW9uUmVzcG9uc2USHgoFZ3JvdXAYASABKAsyDy5jbG91ZC52MS5Hcm91cCImCghMb2NhdGlvbhIMCgRjb2RlGAEgASgJEgwKBG5vZGUYAiABKAkiFgoUTGlzdExvY2F0aW9uc1JlcXVlc3QiPgoVTGlzdExvY2F0aW9uc1Jlc3BvbnNlEiUKCWxvY2F0aW9ucxgBIAMoCzISLmNsb3VkLnYxLkxvY2F0aW9uMpkECgxHcm91cFNlcnZpY2USQQoETGlzdBIbLmNsb3VkLnYxLkxpc3RHcm91cHNSZXF1ZXN0GhwuY2xvdWQudjEuTGlzdEdyb3Vwc1Jlc3BvbnNlEkUKBkNyZWF0ZRIcLmNsb3VkLnYxLkNyZWF0ZUdyb3VwUmVxdWVzdBodLmNsb3VkLnYxLkNyZWF0ZUdyb3VwUmVzcG9uc2USRQoGRGVsZXRlEhwuY2xvdWQudjEuRGVsZXRlR3JvdXBSZXF1ZXN0Gh0uY2xvdWQudjEuRGVsZXRlR3JvdXBSZXNwb25zZRJFCgZVcGRhdGUSHC5jbG91ZC52MS5VcGRhdGVHcm91cFJlcXVlc3QaHS5jbG91ZC52MS5VcGRhdGVHcm91cFJlc3BvbnNlEkoKC0FkZExvY2F0aW9uEhwuY2xvdWQudjEuQWRkTG9jYXRpb25SZXF1ZXN0Gh0uY2xvdWQudjEuQWRkTG9jYXRpb25SZXNwb25zZRJTCg5SZW1vdmVMb2NhdGlvbhIfLmNsb3VkLnYxLlJlbW92ZUxvY2F0aW9uUmVxdWVzdBogLmNsb3VkLnYxLlJlbW92ZUxvY2F0aW9uUmVzcG9uc2USUAoNTGlzdExvY2F0aW9ucxIeLmNsb3VkLnYxLkxpc3RMb2NhdGlvbnNSZXF1ZXN0Gh8uY2xvdWQudjEuTGlzdExvY2F0aW9uc1Jlc3BvbnNlQpIBCgxjb20uY2xvdWQudjFCCkdyb3VwUHJvdG9QAVo1Z2l0aHViLmNvbS9zYW15Zm9kaWwvbXVzcWwvY2xvdWQvZ2VuL2Nsb3VkL3YxO2Nsb3VkdjGiAgNDWFiqAghDbG91ZC5WMcoCCENsb3VkXFYx4gIUQ2xvdWRcVjFcR1BCTWV0YWRhdGHqAglDbG91ZDo6VjFiBnByb3RvMw", [file_cloud_v1_common]);
 
 /**
  * Describes the message cloud.v1.ListGroupsRequest.
@@ -54,53 +54,67 @@ export const DeleteGroupResponseSchema = /*@__PURE__*/
   messageDesc(file_cloud_v1_group, 5);
 
 /**
+ * Describes the message cloud.v1.UpdateGroupRequest.
+ * Use `create(UpdateGroupRequestSchema)` to create a new message.
+ */
+export const UpdateGroupRequestSchema = /*@__PURE__*/
+  messageDesc(file_cloud_v1_group, 6);
+
+/**
+ * Describes the message cloud.v1.UpdateGroupResponse.
+ * Use `create(UpdateGroupResponseSchema)` to create a new message.
+ */
+export const UpdateGroupResponseSchema = /*@__PURE__*/
+  messageDesc(file_cloud_v1_group, 7);
+
+/**
  * Describes the message cloud.v1.AddLocationRequest.
  * Use `create(AddLocationRequestSchema)` to create a new message.
  */
 export const AddLocationRequestSchema = /*@__PURE__*/
-  messageDesc(file_cloud_v1_group, 6);
+  messageDesc(file_cloud_v1_group, 8);
 
 /**
  * Describes the message cloud.v1.AddLocationResponse.
  * Use `create(AddLocationResponseSchema)` to create a new message.
  */
 export const AddLocationResponseSchema = /*@__PURE__*/
-  messageDesc(file_cloud_v1_group, 7);
+  messageDesc(file_cloud_v1_group, 9);
 
 /**
  * Describes the message cloud.v1.RemoveLocationRequest.
  * Use `create(RemoveLocationRequestSchema)` to create a new message.
  */
 export const RemoveLocationRequestSchema = /*@__PURE__*/
-  messageDesc(file_cloud_v1_group, 8);
+  messageDesc(file_cloud_v1_group, 10);
 
 /**
  * Describes the message cloud.v1.RemoveLocationResponse.
  * Use `create(RemoveLocationResponseSchema)` to create a new message.
  */
 export const RemoveLocationResponseSchema = /*@__PURE__*/
-  messageDesc(file_cloud_v1_group, 9);
+  messageDesc(file_cloud_v1_group, 11);
 
 /**
  * Describes the message cloud.v1.Location.
  * Use `create(LocationSchema)` to create a new message.
  */
 export const LocationSchema = /*@__PURE__*/
-  messageDesc(file_cloud_v1_group, 10);
+  messageDesc(file_cloud_v1_group, 12);
 
 /**
  * Describes the message cloud.v1.ListLocationsRequest.
  * Use `create(ListLocationsRequestSchema)` to create a new message.
  */
 export const ListLocationsRequestSchema = /*@__PURE__*/
-  messageDesc(file_cloud_v1_group, 11);
+  messageDesc(file_cloud_v1_group, 13);
 
 /**
  * Describes the message cloud.v1.ListLocationsResponse.
  * Use `create(ListLocationsResponseSchema)` to create a new message.
  */
 export const ListLocationsResponseSchema = /*@__PURE__*/
-  messageDesc(file_cloud_v1_group, 12);
+  messageDesc(file_cloud_v1_group, 14);
 
 /**
  * @generated from service cloud.v1.GroupService

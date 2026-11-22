@@ -299,12 +299,11 @@ func (c *compiler) emitWriteConstTerms(where Expr) (loopWhere Expr, jumps []int,
 	}
 	consts, outerConsts, rest := splitConstWhereTerms(splitTopLevelAnd(where), scopes, false)
 	for _, cj := range append(consts, outerConsts...) {
-		c.inWhereConjunct = true
-		reg, cerr := c.compileExpr(cj)
+		js, cerr := c.whereFalseJumps(cj)
 		if cerr != nil {
 			return nil, nil, cerr
 		}
-		jumps = append(jumps, c.emit(Instruction{Op: OpIfNot, P1: reg, P3: 1}))
+		jumps = append(jumps, js...)
 	}
 	return andConjuncts(rest), jumps, nil
 }
