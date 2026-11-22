@@ -95,6 +95,10 @@ func TestSegJoinFiltersAgree(t *testing.T) {
 		"CASE l.mode WHEN 'RAIL' THEN 1 WHEN 'AIR' THEN 1 ELSE 0 END = 1",
 		"l.m IN ('ab', 'zz')",
 		"l.m IN (x'6162', 5)",
+		"l.q IN (3, 2+2, 10-4)",
+		"l.q * 9223372036854775807 > 0",
+		"l.q % (l.q - 4) = 1",
+		"l.d * 2 - 1 > 2",
 	}
 	var qs []string
 	for i := range filters {
@@ -129,6 +133,14 @@ func TestSegJoinFiltersAgree(t *testing.T) {
 	check("rows changed")
 	if columnarOn() && (segJoinFilterRestricted.Load() == restricted || segJoinPassReuses.Load() == reused) {
 		t.Errorf("filters computed on some rows: %d, levels read back: %d", segJoinFilterRestricted.Load()-restricted, segJoinPassReuses.Load()-reused)
+	}
+	// Arithmetic raises no error, so a filter of it is computed only on the
+	// rows it decides, once per value of its column.
+	restricted = segJoinFilterRestricted.Load()
+	qs = []string{"SELECT l.mode, count(*), sum(l.q) FROM o, l WHERE o.ok = l.ok AND l.q IN (3, 2+2, 10-4) GROUP BY l.mode ORDER BY l.mode"}
+	check("arithmetic")
+	if columnarOn() && segJoinFilterRestricted.Load() == restricted {
+		t.Errorf("an arithmetic filter was computed on every row")
 	}
 }
 
