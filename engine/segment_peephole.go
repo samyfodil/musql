@@ -711,7 +711,7 @@ func ResetSegFilterCountersForTest() {
 // satisfy the WHERE. See segPeephole for the argument for each one.
 func segIsScanPrologue(op OpCode) bool {
 	switch op {
-	case OpAutoIndexOrder, OpSeekIndexHint, OpSeekRowidHint, OpSeekRowidRangeHint, OpVariable, OpInteger, OpInt64, OpSCopy:
+	case OpAutoIndexOrder, OpSeekIndexHint, OpSeekRowidHint, OpSeekRowidRangeHint, OpRowidReadBound, OpVariable, OpInteger, OpInt64, OpSCopy:
 		return true
 	}
 	return false
