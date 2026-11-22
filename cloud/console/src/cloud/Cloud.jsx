@@ -2,11 +2,13 @@
 // pages of a musql cloud server, over the management API.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { BarChart3, Boxes, Building2, Database, KeyRound, LogOut, MapPin, Settings, Users, UserCog } from "lucide-react";
+import { BarChart3, Boxes, Building2, Database, KeyRound, LogOut, MapPin, Puzzle, Settings, Users, UserCog } from "lucide-react";
 import Drawer from "../components/Drawer.jsx";
 import { Field } from "../components/ColumnPanel.jsx";
 import { MenuButton } from "../components/Menu.jsx";
 import { Spinner } from "../components/Busy.jsx";
+import Logo, { slotIcon, SlotBoundary } from "../components/Logo.jsx";
+import { useOptions } from "../slots.js";
 import { fmt } from "../values.js";
 import { Access, api, Code, databaseToken, date, DatabaseType, Durability, FileFormat, message, Role, ROLES, roleName, stamp, typeName, unimplemented } from "./api.js";
 import { server, signIn, signOut } from "./auth.js";
@@ -21,6 +23,9 @@ export const PAGES = [
 	["tokens", "Platform tokens", <KeyRound size={14} />],
 	["users", "Users", <UserCog size={14} />, true],
 ];
+
+/** cloudPages is the stock pages and then the extension's: [key, label, icon, admin, component]. */
+export const cloudPages = (o) => [...PAGES, ...o.pages.map((p) => [p.key, p.label, slotIcon(p.icon, 14, <Puzzle size={14} />), !!p.admin, p.component])];
 
 const NA = "Not available on this server.";
 const when = (ts) => (ts ? date(ts).toLocaleString() : "—");
@@ -51,6 +56,8 @@ function useLoad(f, deps) {
 // ---- the side list ----
 
 export function CloudSide({ cloud, page, setPage, toast }) {
+	const o = useOptions();
+	const { docsURL, supportURL } = o.branding;
 	const [newOrg, setNewOrg] = useState(false);
 	if (!server) return <SignInElsewhere />;
 	if (cloud.auth.status !== "in") return <SignedOut cloud={cloud} small />;
@@ -74,13 +81,19 @@ export function CloudSide({ cloud, page, setPage, toast }) {
 			</div>
 			<nav>
 				<div className="group">
-					{PAGES.filter(([, , , admin]) => !admin || cloud.admin).map(([k, label, ic]) => (
+					{cloudPages(o).filter(([, , , admin]) => !admin || cloud.admin).map(([k, label, ic]) => (
 						<button key={k} className={`item${page === k ? " active" : ""}`} onClick={() => setPage(k)}>
 							<span className="ic">{ic}</span><span className="name">{label}</span>
 						</button>
 					))}
 				</div>
-				<p className="dim small pad">{cloud.me?.user?.email}{cloud.admin ? " · server admin" : ""}<br />{new URL(server).host}</p>
+				<p className="dim small pad">
+					{cloud.me?.user?.email}{cloud.admin ? " · server admin" : ""}<br />{new URL(server).host}
+					{(docsURL || supportURL) && <br />}
+					{docsURL && <a className="link" href={docsURL} target="_blank" rel="noopener">Documentation</a>}
+					{docsURL && supportURL && " · "}
+					{supportURL && <a className="link" href={supportURL} target="_blank" rel="noopener">Support</a>}
+				</p>
 			</nav>
 			{newOrg && <NewOrgDrawer cloud={cloud} toast={toast} onClose={() => setNewOrg(false)} />}
 		</>
@@ -88,25 +101,27 @@ export function CloudSide({ cloud, page, setPage, toast }) {
 }
 
 function SignInElsewhere() {
+	const { name } = useOptions().branding;
 	const [url, setUrl] = useState("");
 	const ok = /^https?:\/\/[^/\s]+/.test(url.trim());
 	return (
 		<div className="sideempty">
 			<h3>Cloud</h3>
-			<p className="dim small">Sign in to a musql cloud server. Its console opens there; local files and remote URLs keep working here without one.</p>
+			<p className="dim small">Sign in to a {name} server. Its console opens there; local files and remote URLs keep working here without one.</p>
 			<form className="form" onSubmit={(e) => { e.preventDefault(); ok && location.assign(`${url.trim().replace(/\/+$/, "")}/console/#cloud`); }}>
 				<input spellCheck={false} placeholder="https://cloud.example.com" value={url} onChange={(e) => setUrl(e.target.value)} />
-				<button className="primary" disabled={!ok}>Sign in to a musql cloud</button>
+				<button className="primary" disabled={!ok}>Sign in to a {name}</button>
 			</form>
 		</div>
 	);
 }
 
 function SignedOut({ cloud, small }) {
+	const { name } = useOptions().branding;
 	return (
 		<div className={small ? "sideempty" : "cloud-empty"}>
-			{!small && <div className="logo big">μ</div>}
-			{small ? <h3>Cloud</h3> : <h1>musql cloud</h1>}
+			{!small && <Logo big />}
+			{small ? <h3>Cloud</h3> : <h1>{name}</h1>}
 			<p className="dim small">{cloud.auth.status === "starting" ? "Signing in…" : `Sign in to ${new URL(server).host} to manage its databases.`}</p>
 			{cloud.auth.error && <p className="err small">{cloud.auth.error}</p>}
 			{cloud.auth.status !== "starting" && <button className="primary" onClick={signIn}>Sign in</button>}
@@ -145,12 +160,13 @@ function NewOrgDrawer({ cloud, toast, onClose }) {
 
 // ---- the pages ----
 
-export function CloudMain({ cloud, page, setPage, toast, onOpen, current }) {
+export function CloudMain({ cloud, page, setPage, toast, onOpen, current, slot }) {
+	const o = useOptions();
 	if (!server) {
 		return (
 			<div className="empty">
 				<h1>No cloud here</h1>
-				<p className="dim">This console is not served by a musql cloud server. Enter a server's URL in the list to sign in there.</p>
+				<p className="dim">This console is not served by a {o.branding.name} server. Enter a server's URL in the list to sign in there.</p>
 			</div>
 		);
 	}
@@ -158,6 +174,7 @@ export function CloudMain({ cloud, page, setPage, toast, onOpen, current }) {
 	if (!cloud.me) return <Spinner label="Loading…" />;
 	if (!cloud.org) return <div className="empty"><h1>No organization</h1><p className="dim">You belong to none yet. Accept an invite or ask an admin.</p><MyInvites cloud={cloud} toast={toast} /></div>;
 	const props = { cloud, toast, setPage };
+	const ext = o.pages.find((p) => p.key === page && (!p.admin || cloud.admin));
 	return (
 		<div className="cloudpage">
 			{page === "databases" && <Databases {...props} onOpen={onOpen} current={current} />}
@@ -167,6 +184,7 @@ export function CloudMain({ cloud, page, setPage, toast, onOpen, current }) {
 			{page === "settings" && <OrgSettings {...props} />}
 			{page === "tokens" && <PlatformTokens {...props} />}
 			{page === "users" && cloud.admin && <UsersPage {...props} />}
+			{ext && <SlotBoundary key={ext.key} name={ext.label}><ext.component ctx={slot} /></SlotBoundary>}
 		</div>
 	);
 }
@@ -471,10 +489,15 @@ const EXPIRY = [["", "Never"], ["1", "1 hour"], ["24", "1 day"], ["168", "7 days
 function DbToken({ cloud, db, toast, onClose }) {
 	const [readOnly, setReadOnly] = useState(!can(cloud, Role.MEMBER));
 	const [hours, setHours] = useState("168");
+	const [perms, setPerms] = useState("");
 	const [tok, setTok] = useState(null);
 	const go = async () => {
 		try {
-			const r = await api.db.createToken({ org: cloud.org, name: db.name, access: readOnly ? Access.READ_ONLY : Access.FULL, expiresAt: hours ? stamp(new Date(Date.now() + hours * 3600e3)) : undefined });
+			const permissions = perms.split(/\s+/).filter(Boolean).map((p) => {
+				const [table, actions] = p.split(":");
+				return { tables: table === "all" ? [] : [table], actions: (actions || "").split(",") };
+			});
+			const r = await api.db.createToken({ org: cloud.org, name: db.name, access: readOnly ? Access.READ_ONLY : Access.FULL, expiresAt: hours ? stamp(new Date(Date.now() + hours * 3600e3)) : undefined, permissions });
 			setTok(r.token);
 		} catch (e) {
 			toast(message(e), true);
@@ -486,6 +509,8 @@ function DbToken({ cloud, db, toast, onClose }) {
 				<div className="form">
 					<label className="check"><input type="checkbox" checked={readOnly} disabled={!can(cloud, Role.MEMBER)} onChange={(e) => setReadOnly(e.target.checked)} /> Read-only</label>
 					<Field label="Expires"><select value={hours} onChange={(e) => setHours(e.target.value)}>{EXPIRY.map(([v, l]) => <option key={v} value={v}>{l}</option>)}</select></Field>
+					<Field label="Permissions"><input className="mono" spellCheck={false} autoComplete="off" placeholder="all:data_read comments:data_add" value={perms} onChange={(e) => setPerms(e.target.value)} /></Field>
+					<p className="dim small">Empty for no limit. Each entry is a table or all, then actions: data_read, data_add, data_update, data_delete, schema_add, schema_update, schema_delete.</p>
 				</div>
 			)}
 		</Drawer>

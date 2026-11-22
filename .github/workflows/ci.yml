@@ -106,6 +106,7 @@ jobs:
         run: |
           npm ci --no-audit --no-fund
           npm run build
+          npm run build:example
   libp2p:
     name: libp2p example (nested module)
     runs-on: ubuntu-latest
