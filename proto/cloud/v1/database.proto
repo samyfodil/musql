@@ -12,6 +12,9 @@ service DatabaseService {
   rpc Create(CreateDatabaseRequest) returns (CreateDatabaseResponse);
   rpc Delete(DeleteDatabaseRequest) returns (DeleteDatabaseResponse);
   rpc Rename(RenameDatabaseRequest) returns (RenameDatabaseResponse);
+  rpc Update(UpdateDatabaseRequest) returns (UpdateDatabaseResponse);
+  rpc ListDeleted(ListDeletedRequest) returns (ListDeletedResponse);
+  rpc RestoreDeleted(RestoreDeletedRequest) returns (RestoreDeletedResponse);
   rpc Usage(UsageRequest) returns (UsageResponse);
   rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
   rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
@@ -78,6 +81,9 @@ message CreateDatabaseResponse {
   Database database = 1;
 }
 
+// Delete keeps the database, closed and its name free, until the server's
+// retention for deleted databases ends (ListDeleted, RestoreDeleted). A
+// database with delete_protection set is refused (FAILED_PRECONDITION).
 message DeleteDatabaseRequest {
   string org = 1;
   string name = 2;
@@ -93,6 +99,50 @@ message RenameDatabaseRequest {
 
 message RenameDatabaseResponse {
   Database database = 1;
+}
+
+// Update sets the fields given and leaves the others as they are.
+message UpdateDatabaseRequest {
+  string org = 1;
+  string name = 2;
+  optional bool delete_protection = 3;
+  optional bool block_reads = 4;
+  optional bool block_writes = 5;
+}
+
+message UpdateDatabaseResponse {
+  Database database = 1;
+}
+
+// ListDeleted lists an org's deleted databases and groups that can still be
+// restored.
+message ListDeletedRequest {
+  string org = 1;
+}
+
+message ListDeletedResponse {
+  repeated DeletedDatabase databases = 1;
+  repeated DeletedGroup groups = 2;
+}
+
+// RestoreDeleted brings a deleted database back with its data and history,
+// or a deleted group with the databases deleted with it. Tokens issued
+// before are invalidated. A database whose group is deleted needs the group
+// restored first.
+message RestoreDeletedRequest {
+  string org = 1;
+  // The id of a deleted database or group, from ListDeleted.
+  string id = 2;
+  // The name it comes back under; its own when empty. A database restored
+  // with its group whose name is taken comes back as "<name>-<id6>".
+  string new_name = 3;
+}
+
+message RestoreDeletedResponse {
+  // The database restored, or the group's databases.
+  repeated Database databases = 1;
+  // The group restored.
+  Group group = 2;
 }
 
 message UsageRequest {

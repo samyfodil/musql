@@ -11,7 +11,10 @@
 // distinction).
 package engine
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 // pragmaModuleListNames is the base set every build reports, in the exact
 // order the oracle returns them (already alphabetical).
@@ -46,6 +49,14 @@ func pragmaModuleListRows() []string {
 		merged = append(merged, pragmaModuleListFts5Names...)
 		merged = append(merged, names[4:]...)
 		names = merged
+	}
+	extra := sqleanModuleNames
+	if _, ok := lookupVtabModule("dbstat"); ok {
+		extra = append(slices.Clip(extra), "dbstat")
+	}
+	if len(extra) > 0 {
+		names = append(names, extra...)
+		slices.Sort(names)
 	}
 	return names
 }

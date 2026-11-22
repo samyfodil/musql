@@ -159,6 +159,7 @@ func compileScanSorted(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols
 	// The seeks a constant key allows, as compileScanPlain plans them: they
 	// only narrow the rows the loops read, and the sort below orders them.
 	planConstantKeySeeks(c, srcs, stmt.Where, true, true)
+	planBillLimit(c, srcs, stmt)
 
 	initAddr := c.emit(Instruction{Op: OpInit})
 	c.patch(initAddr, 1)
@@ -256,18 +257,17 @@ func compileScanSorted(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols
 		// exactly like compileScanPlain -- jumping straight past the rest of
 		// this body (patched in once that address is known), before either
 		// the output columns or the ORDER BY keys are computed.
-		whereJump := -1
+		var whereJumps []int
 		if deferredWhere != nil {
 			// See compileScanPlain's identical guard (vdbe_scan.go) and
 			// compiler.inWhereConjunct's doc comment: deferredWhere is real
 			// top-level WHERE AND-conjuncts, so tag-20220128a's WHERE-position
 			// rule applies here too.
-			c.inWhereConjunct = true
-			wReg, werr := c.compileExpr(deferredWhere)
+			var werr error
+			whereJumps, werr = c.whereFalseJumps(deferredWhere)
 			if werr != nil {
 				return werr
 			}
-			whereJump = c.emit(Instruction{Op: OpIfNot, P1: wReg, P3: 1})
 		}
 
 		// Output columns FIRST -- every ordinal/alias-resolved key below
@@ -323,8 +323,8 @@ func compileScanSorted(c *compiler, stmt *SelectStmt, srcs []joinSource, outCols
 		c.emit(Instruction{Op: OpSorterInsert, P1: sorterNum, P2: recReg})
 
 		bodyEnd := c.here()
-		if whereJump >= 0 {
-			c.patch(whereJump, bodyEnd)
+		for _, j := range whereJumps {
+			c.patch(j, bodyEnd)
 		}
 		if distinctJump >= 0 {
 			c.patch(distinctJump, bodyEnd)

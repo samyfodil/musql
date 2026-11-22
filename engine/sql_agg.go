@@ -45,7 +45,7 @@ func isAggregateCall(fc FuncExpr) bool {
 	case "vec1_train":
 		return !fc.Star
 	}
-	return false
+	return udafs[name] != nil && !fc.Star
 }
 
 // containsAggregate reports whether e's expression tree contains an
@@ -169,6 +169,7 @@ const (
 	aggJSONGroupArray                 // json_group_array(expr) -- see engine/json_funcs.go
 	aggJSONGroupObject                // json_group_object(key, value) -- see engine/json_funcs.go
 	aggVec1Train                      // vec1_train(vector[, config]) -- see engine/vec1_train.go
+	aggUDF                            // a registered aggregate (udafs, sqlean.go)
 )
 
 // aggSumState is the running state of count, sum, total and avg, and all a dense
@@ -199,6 +200,10 @@ type aggItem struct {
 	best     Value
 	haveBest bool
 	vec1     *vec1TrainState // vec1_train's training vectors and options
+	udf      udfAggState     // a registered aggregate's state
+	// udfFirst is a registered aggregate's first arguments, kept only when
+	// orderStrict is set (see orderRisk).
+	udfFirst []Value
 	// gc is group_concat's and the JSON groups' running text (aggConcat).
 	gc *aggConcat
 
@@ -234,6 +239,8 @@ type aggItemPlan struct {
 	sepExpr  Expr // aggGroupConcat's optional separator expression; nil => default ","
 	distinct bool // DISTINCT was written inside the aggregate's argument list
 	jsonb    bool // the jsonb_group_array/jsonb_group_object spelling of a JSON kind
+	// udaf is aggUDF's definition; its second argument is sepExpr.
+	udaf *sqleanAggregate
 	// srcCall is the FuncExpr this template was planned from (planAggregateCall),
 	// a PLAN-time-only field: it lets an aggregate that turns out to belong to an
 	// ENCLOSING query be re-planned there verbatim. See vdbe_agg_hoist.go.
@@ -526,6 +533,8 @@ func aggKindName(k aggKind) string {
 		return "json_group_object()"
 	case aggVec1Train:
 		return "vec1_train()"
+	case aggUDF:
+		return "a registered aggregate"
 	}
 	return "an order-sensitive aggregate"
 }
@@ -931,6 +940,21 @@ func planAggregateCallKind(fc FuncExpr) (*aggItem, error) {
 		// stepJSONGroupObject's (engine/json_funcs.go) doc comment.
 		return &aggItem{aggItemPlan: &aggItemPlan{kind: aggJSONGroupObject, expr: fc.Args[0], sepExpr: fc.Args[1], distinct: fc.Distinct, jsonb: name == "jsonb_group_object"}}, nil
 	}
+	if a := udafs[name]; a != nil {
+		if len(fc.Args) < a.lo || len(fc.Args) > a.hi {
+			return nil, semanticf("engine: wrong number of arguments to function %s()", name)
+		}
+		for _, arg := range fc.Args {
+			if err := checkExprSupported(arg); err != nil {
+				return nil, err
+			}
+		}
+		it := &aggItem{aggItemPlan: &aggItemPlan{kind: aggUDF, expr: fc.Args[0], distinct: fc.Distinct, udaf: a}}
+		if len(fc.Args) == 2 {
+			it.sepExpr = fc.Args[1]
+		}
+		return it, nil
+	}
 	return nil, fmt.Errorf("engine: unsupported aggregate function %s()", fc.Name)
 }
 
@@ -1014,6 +1038,9 @@ func (it *aggItem) step(ctx *evalCtx, regs []Value) error {
 		// vec1TrainStep runs for every row, a NULL vector included (which it
 		// rejects).
 		return it.stepVec1Train(ctx, regs)
+
+	case aggUDF:
+		return it.stepUDF(ctx, regs)
 	}
 
 	v, err := it.rowValue(aggExprArg, ctx, regs)
@@ -1504,6 +1531,9 @@ func (it *aggItem) finalize() (Value, error) {
 
 	case aggVec1Train:
 		return it.finalizeVec1Train()
+
+	case aggUDF:
+		return it.udfState().Value()
 	}
 	return Value{}, fmt.Errorf("engine: internal: unknown aggregate kind %d", it.kind)
 }
@@ -2358,4 +2388,53 @@ func aggArgsAreAllPseudoRow(exprs []Expr) bool {
 		walk(e)
 	}
 	return any && ok
+}
+
+func (it *aggItem) udfState() udfAggState {
+	if it.udf == nil {
+		it.udf = it.udaf.newAgg()
+	}
+	return it.udf
+}
+
+// stepUDF is OP_AggStep of a registered aggregate: every argument evaluated,
+// then the step function called with them, NULLs included, as xStep is. A
+// DISTINCT call drops a NULL or a value it has already seen first, as C's
+// ephemeral distinct index does (codeDistinct, select.c).
+func (it *aggItem) stepUDF(ctx *evalCtx, regs []Value) error {
+	var args [2]Value
+	n := 1
+	v, err := it.rowValue(aggExprArg, ctx, regs)
+	if err != nil {
+		return err
+	}
+	args[0] = v
+	if it.sepExpr != nil {
+		if args[1], err = it.rowValue(aggExprSep, ctx, regs); err != nil {
+			return err
+		}
+		n = 2
+	}
+	if it.distinct {
+		if v.Typ == Null {
+			return nil
+		}
+		if s, dup := it.distinctSeen(v, it.argCollation(ctx), ctx.encoding()); dup {
+			// As in step: which spelling survives is the arrival order's.
+			if it.orderStrict && !valuesIdentical(v, s) {
+				it.orderRisk = true
+			}
+			return nil
+		}
+	}
+	// An aggregate that depends on the order (a hash of the concatenation, a
+	// running variance's rounding) sees it only once two contributions differ.
+	if it.orderStrict && !it.udaf.orderFree {
+		if it.udfFirst == nil {
+			it.udfFirst = append([]Value{}, args[:n]...)
+		} else if !valuesAllIdentical(args[:n], it.udfFirst) {
+			it.orderRisk = true
+		}
+	}
+	return it.udfState().Step(args[:n])
 }

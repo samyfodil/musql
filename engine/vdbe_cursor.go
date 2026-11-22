@@ -135,8 +135,22 @@ type vdbeCursor struct {
 	// rowidLo/rowidHi, when ranged, bound the rowids a segment scan visits
 	// (OpSeekRowidRangeHint), inclusive. Like seekKey they only skip rows the
 	// WHERE rejects.
-	ranged           bool
+	ranged bool
+	// billLo/billHi, when billRanged, bound the rowids of the rows the loop
+	// counts as read (OpRowidReadBound), inclusive.
+	billRanged bool
+	// billCapped is set when billLeft caps the rows native code steps the
+	// cursor onto too (vmJIT.foldSteps). A cursor native code opened
+	// itself, which never rewound here, has no cap.
+	billCapped bool
+	// idxSeekDeclared is set when the index seek is a CREATE INDEX's, which C
+	// would seek too, rather than an automatic one (automaticSeekCandidates).
+	idxSeekDeclared  bool
 	rowidLo, rowidHi int64
+	billLo, billHi   int64
+	// billLimit, when set, is one more than the rows a pass counts at most
+	// (OpRowidReadBound's P3).
+	billLimit int64
 
 	// idxSeekConfigured/idxSeekProbe/idxSeekColl/idxSeekCol turn the first
 	// rewind() into a secondary-index leading-column equality lookup
@@ -305,6 +319,21 @@ type vdbeCursor struct {
 	// including the overwhelming majority that have no REAL column at all and
 	// for which the sweep provably cannot change anything.
 	realCached int8 // 0 = not computed; 1 = has a REAL-affinity column; 2 = has none
+
+	// billLeft is how many more rows this pass of the cursor may count as
+	// read (vdbe.billedCursor), set at its rewind: none for a cursor whose
+	// rows are not a table's, walkCap's for a seek walked instead.
+	billLeft int64
+	// walkCap, when set, is one more than the rows a declared index's seek
+	// would have stepped onto, which rewind walked the table for instead
+	// because they are a wide share of it: what the walk counts as read,
+	// never more than C's seek would. Zero is none, so that a cursor native
+	// code opened, which never rewound here, has none.
+	walkCap int64
+	// filterPassed is the rows a write scan's filter left out of the rows it
+	// built (segRows.walkFiltered), which a walk would have stepped onto: its
+	// rewind counts them as read.
+	filterPassed int64
 }
 
 // hasRealCols reports whether this cursor's table declares any REAL-affinity
@@ -400,8 +429,19 @@ func (cur *vdbeCursor) readMask() columnMask {
 // seekIsWide reports whether cur's index seek is known to read more than a
 // seekNarrowRatio-th of the table: an estimate says so. No estimate is not wide.
 func (cur *vdbeCursor) seekIsWide() bool {
-	if !cur.idxSeekConfigured || cur.tbl == nil || cur.pager == nil || cur.pager.segs == nil {
+	n, ok := cur.seekEstimate()
+	if !ok {
 		return false
+	}
+	total, ok := cur.pager.segs.segTableRows(cur.tbl.root)
+	return ok && n > total/seekNarrowRatio
+}
+
+// seekEstimate is the rows cur's index seek is estimated to read: the served
+// key with the smallest estimate.
+func (cur *vdbeCursor) seekEstimate() (int, bool) {
+	if !cur.idxSeekConfigured || cur.tbl == nil || cur.pager == nil || cur.pager.segs == nil {
+		return 0, false
 	}
 	src, root := cur.pager.segs, cur.tbl.root
 	n := -1
@@ -414,11 +454,22 @@ func (cur *vdbeCursor) seekIsWide() bool {
 			n = c
 		}
 	}
-	if n < 0 {
-		return false
+	return n, n >= 0
+}
+
+// readCap is how many rows a pass of a table cursor counts as read.
+func (cur *vdbeCursor) readCap() int64 {
+	n := int64(math.MaxInt64)
+	if cur.walkCap > 0 {
+		n = cur.walkCap - 1
 	}
-	total, ok := src.segTableRows(root)
-	return ok && n > total/seekNarrowRatio
+	if cur.billRanged {
+		n = min(n, cur.billRangeRows())
+	}
+	if cur.billLimit > 0 {
+		n = min(n, cur.billLimit-1)
+	}
+	return n
 }
 
 // rowidsAreWide reports whether n rows fetched one by one are more than a
@@ -1080,6 +1131,7 @@ func openFillCursor(tbl *resolvedTable, fill func() ([][]Value, []int64, error),
 }
 
 func (cur *vdbeCursor) rewind() error {
+	cur.walkCap = 0
 	if cur.sorted != nil && (!cur.materialized || cur.fill != nil || cur.seekReseek) {
 		// The rows are about to be built again, possibly into the same arrays.
 		cur.sorted = nil
@@ -1277,6 +1329,9 @@ func (cur *vdbeCursor) rewind() error {
 		// far more than walking them (seekNarrowRatio).
 		prunesOnly := cur.idxSeekRaiseFree && cur.idxSeekOrder == nil && cur.streamable
 		if cur.idxSeekConfigured && prunesOnly && cur.seekIsWide() {
+			if n, ok := cur.seekEstimate(); ok && cur.idxSeekDeclared {
+				cur.walkCap = int64(n) + 1
+			}
 			cur.idxSeekConfigured = false
 		}
 		if cur.idxSeekConfigured && !cur.tbl.withoutRowid {
@@ -1303,6 +1358,9 @@ func (cur *vdbeCursor) rewind() error {
 			if served && prunesOnly && !cur.seekReseek && !cur.idxListOnce && cur.rowidsAreWide(len(rowids)) {
 				// No estimate said so, but the list itself does.
 				served = false
+				if cur.idxSeekDeclared {
+					cur.walkCap = int64(len(rowids)) + 1
+				}
 			}
 			if served {
 				segIndexSeeksServed.Add(1)
@@ -1820,6 +1878,7 @@ func (cur *vdbeCursor) materializeRowStore() {
 			rows = append(rows, vals)
 			return true
 		})
+		cur.filterPassed = int64(max(0, n-len(rowids)))
 	} else {
 		rowids = make([]uint64, 0, n)
 		rows = make([][]Value, 0, n)
