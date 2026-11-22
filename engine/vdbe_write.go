@@ -105,6 +105,8 @@ type writeCtx struct {
 // row values.
 type insertPlan struct {
 	tbl         *tableMeta
+	// idxWrites is the index entries each stored row writes (DB.indexWrites).
+	idxWrites int
 	displayName string
 	colsGiven   bool
 	colIdx      []int
@@ -180,6 +182,8 @@ type upsertArm struct {
 // resolved target column indices (parallel to the evaluated SET values).
 type updatePlan struct {
 	tbl         *tableMeta
+	// idxWrites is the index entries each updated row writes (DB.indexWrites).
+	idxWrites int
 	displayName string
 	colIdx      []int
 
@@ -1199,6 +1203,7 @@ func (db *DB) compileInsertStmt(stmt *insertStmt, trig *trigCompileCtx) (*Progra
 	}
 	plan := &insertPlan{tbl: tbl, displayName: stmt.table, colsGiven: stmt.cols != nil, colIdx: colIdx, action: stmt.orAction, explicitOr: stmt.explicitOr,
 		replaceDelBefore: delBefore, replaceDelAfter: delAfter}
+	plan.idxWrites = db.indexWrites(tbl, false, nil)
 	recReg := c.allocRec()  // record register, consumed by OpInsert before the next OpMakeRecord
 	rowidReg := c.allocN(1) // rowid register for OpInsert's P3
 	var colNames []string
@@ -1732,6 +1737,7 @@ func (c *compiler) emitUpsertArm(db *DB, tbl *tableMeta, stmt *insertStmt, up *u
 	// guard (update.c:990), store, AFTER (update.c:1117).
 	uplanStore := &updatePlan{tbl: tbl, displayName: stmt.table, colIdx: colIdx,
 		upsertBefore: upBefore, upsertAfter: upAfter}
+	uplanStore.idxWrites = db.indexWrites(tbl, true, colIdx)
 	if upBefore != nil {
 		bp := *upBefore
 		*rowPlans = append(*rowPlans, &bp)
@@ -2653,6 +2659,7 @@ func (db *DB) compileDeleteStmt(stmt *deleteStmt, trig *trigCompileCtx) (*Progra
 	if from := (FromItem{Schema: stmt.schema, Alias: stmt.alias, IndexedBy: stmt.indexedBy, NotIndexed: stmt.notIndexed}); !emitWriteRowidSeekHint(c, tbl, 0, stmt.where) &&
 		!db.emitWriteRowidSetHint(c, tbl, 0, from, stmt.where, trig) {
 		db.emitWriteIndexSeekHint(c, tbl, 0, from, stmt.where, trig)
+		c.emitWriteBillHint(tbl, 0, stmt.where)
 	}
 	loopWhere, constJumps, cerr := c.emitWriteConstTerms(stmt.where)
 	if cerr != nil {
@@ -2985,6 +2992,7 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 	plan := &updatePlan{tbl: tbl, displayName: stmt.table, colIdx: colIdx,
 		conflictAware: conflictAware, action: stmt.orAction, explicitOr: stmt.explicitOr,
 		replaceDelBefore: delBefore, replaceDelAfter: delAfter}
+	plan.idxWrites = db.indexWrites(tbl, true, colIdx)
 	plan.setCol = make([]bool, len(tbl.cols))
 	// Not under a conflict action: an IGNORE skips the rest of the row's body,
 	// which may already have run up to the next instruction the VDBE runs.
@@ -3019,6 +3027,7 @@ func (db *DB) compileUpdateStmt(stmt *updateStmt, trig *trigCompileCtx) (*Progra
 		if from := (FromItem{Schema: stmt.schema, Alias: stmt.alias, IndexedBy: stmt.indexedBy, NotIndexed: stmt.notIndexed}); !emitWriteRowidSeekHint(c, tbl, scanCur, stmt.where) &&
 			!db.emitWriteRowidSetHint(c, tbl, scanCur, from, stmt.where, trig) {
 			db.emitWriteIndexSeekHint(c, tbl, scanCur, from, stmt.where, trig)
+			c.emitWriteBillHint(tbl, scanCur, stmt.where)
 		}
 	}
 	// THE ORDER THIS LOOP VISITS ROWS IN, when a SET subquery may depend on it
@@ -3689,6 +3698,7 @@ func (m *vdbe) opInsert(op *Instruction) (int, error) {
 		return plan.skipAddr, nil
 	}
 	m.wctx.rowsAffected++
+	m.nWritten += 1 + int64(plan.idxWrites)
 	m.wctx.rowsInserted++ // insert.c's "OP_AddImm regRowCount, 1"
 	return -1, nil
 }
@@ -3972,6 +3982,7 @@ func (m *vdbe) opDelete(op *Instruction) error {
 	tbl.dropRow(rowid)
 	m.wctx.undoPut(tbl, rowid, victim)
 	m.wctx.rowsAffected++
+	m.nWritten++
 	return nil
 }
 
@@ -4042,6 +4053,7 @@ func (m *vdbe) updateRow(op *Instruction, full []Value, newRowid uint64, inPlace
 		m.wctx.db.noteRowUpdate(tbl, oldRowid, newRowid, full, full) // capture log (rowhook.go); no full capture here
 		m.wctx.db.notePatch(tbl, newRowid, plan.setCol)
 		m.wctx.rowsAffected++
+		m.nWritten += 1 + int64(plan.idxWrites)
 		return -1, nil
 	}
 	// A BEFORE trigger may have updated this row after the cursor read it, so
@@ -4234,6 +4246,7 @@ func (m *vdbe) updateRow(op *Instruction, full []Value, newRowid uint64, inPlace
 	}
 	m.wctx.db.fkRowMutated(tbl, oldRowid, newRowid, oldVals, full, plan.setCol) // fkColMask of colIdx, built once
 	m.wctx.rowsAffected++
+	m.nWritten += 1 + int64(plan.idxWrites)
 	return -1, nil
 }
 
@@ -4360,6 +4373,7 @@ func (m *vdbe) storeInPlace(plan *updatePlan, cur *vdbeCursor) error {
 		db.notePatch(tbl, rid, plan.setCol)
 	}
 	m.wctx.rowsAffected += len(rids)
+	m.nWritten += int64(len(rids)) * int64(1+plan.idxWrites)
 	return m.fkDrain() // as OpUpdateRow's case does
 }
 
@@ -4579,6 +4593,7 @@ func (m *vdbe) opUpsertStore(op *Instruction) error {
 	m.wctx.db.noteRowUpdate(tbl, oldRowid, newRowid, oldVals, full)
 	m.wctx.db.fkRowMutated(tbl, oldRowid, newRowid, oldVals, full, fkColMask(len(tbl.cols), plan.colIdx))
 	m.wctx.rowsAffected++
+	m.nWritten += 1 + int64(plan.idxWrites)
 	return nil
 }
 
@@ -4630,7 +4645,7 @@ func (m *vdbe) opTxn(op *Instruction) error {
 	return fmt.Errorf("engine: vdbe: unknown transaction verb %d", plan.verb)
 }
 
-func (m *vdbe) opDdl(op *Instruction) error {
+func (m *vdbe) opDdl(op *Instruction) (err error) {
 	plan := op.P4.(*ddlPlan)
 	// This is now the ONLY route a DDL statement takes: the keyword dispatch
 	// that used to carry the same guard (execNonRowStatement, insert_write.go)
@@ -4659,10 +4674,28 @@ func (m *vdbe) opDdl(op *Instruction) error {
 		}
 	}
 	switch plan.kind {
+	case ddlCreateTable, ddlCreateView, ddlCreateTrigger, ddlDropIndex, ddlDropTable, ddlDropView, ddlDropTrigger:
+		// The one catalog entry each writes or removes. C writes its
+		// sqlite_schema row twice for a table or a view (a placeholder,
+		// then the row) and reads it back once in between.
+		db := m.wctx.db
+		objects := len(db.tables) + len(db.indexes) + len(db.views) + len(db.triggers)
+		defer func() {
+			if err == nil && len(db.tables)+len(db.indexes)+len(db.views)+len(db.triggers) != objects {
+				m.nWritten++
+			}
+		}()
+	}
+	switch plan.kind {
 	case ddlCreateTable:
 		return m.wctx.db.noteSchemaChange(m.wctx.db.CreateTable(plan.sql))
 	case ddlCreateIndex:
-		return m.wctx.db.noteSchemaChange(m.wctx.db.CreateIndex(plan.sql))
+		n := len(m.wctx.db.indexes)
+		err := m.wctx.db.CreateIndex(plan.sql)
+		if err == nil {
+			m.countIndexBuild(n)
+		}
+		return m.wctx.db.noteSchemaChange(err)
 	case ddlCreateView:
 		return m.wctx.db.noteSchemaChange(m.wctx.db.CreateView(plan.sql))
 	case ddlDropIndex:
@@ -4886,6 +4919,7 @@ func (db *DB) compileInsertSelectWrite(stmt *insertStmt, tbl *tableMeta, colIdx 
 	}
 	plan := &insertPlan{tbl: tbl, displayName: stmt.table, colsGiven: stmt.cols != nil, colIdx: colIdx, action: stmt.orAction, explicitOr: stmt.explicitOr,
 		replaceDelBefore: delBefore, replaceDelAfter: delAfter}
+	plan.idxWrites = db.indexWrites(tbl, false, nil)
 	// The source runs as a CO-ROUTINE, feeding the loop below one row at a
 	// time, exactly when sqlite3Insert codes it as one: it always does
 	// (insert.c:1140-1156) and falls back to a temp table only for
@@ -5469,4 +5503,26 @@ func soleColumnOf(slotOf []int, i int) int {
 		col = j
 	}
 	return col
+}
+
+// countIndexBuild counts a CREATE INDEX that added the indexes past the first
+// n: its catalog entry, the table's rows read, and an entry written for each
+// (for a partial index, none: its entries are the rows its WHERE keeps). C
+// also reads each entry back out of the sorter it builds the index with.
+func (m *vdbe) countIndexBuild(n int) {
+	db := m.wctx.db
+	for _, ix := range db.indexes[min(n, len(db.indexes)):] {
+		m.nWritten++
+		for _, tbl := range db.tables {
+			if !indexBelongsTo(ix, tbl) || tbl.rows == nil {
+				continue
+			}
+			rows := int64(tbl.rows.len())
+			m.nRead += rows
+			if ix.where == nil && ix.vec == nil {
+				m.nWritten += rows
+			}
+			break
+		}
+	}
 }

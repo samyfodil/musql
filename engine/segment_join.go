@@ -962,6 +962,9 @@ func (t *segJoinTable) row(r int64) int32 {
 // VDBE's nested loop visits them in.
 type segJoinWalk struct {
 	tabs []*segJoinTable
+	// walked is set once a walk over the joined rows (each) has counted the
+	// rows the later levels' lookups found into vdbe.segJoinProbes.
+	walked bool
 	link []segJoinLink // per level after the first
 	// pass[i][r] is whether level i's row r satisfies the level's own WHERE
 	// terms; nil when it has none.
@@ -2364,6 +2367,13 @@ func (w *segJoinWalk) each(at []int32, fn func() bool) bool {
 		w.failed = true
 		return true
 	}
+	// probes is the rows the later levels' lookups find, the rows the loop
+	// would have stepped onto there.
+	var probes int64
+	if !w.walked && w.m != nil {
+		w.walked = true
+		defer func() { w.m.segJoinProbes += probes }()
+	}
 	if w.flat() {
 		// Every later level found by a rowid: at most one row each, so the
 		// nest is a pass over the first level's rows.
@@ -2388,6 +2398,9 @@ func (w *segJoinWalk) each(at []int32, fn func() bool) bool {
 				found := int32(-1)
 				if from := at[l.from]; from >= 0 {
 					found = l.one[from]
+				}
+				if found >= 0 {
+					probes++
 				}
 				if found >= 0 && w.crosses != nil && len(w.crosses[i]) != 0 {
 					if at[i] = found; !w.keep(i, at) {
@@ -2436,7 +2449,11 @@ func (w *segJoinWalk) each(at []int32, fn func() bool) bool {
 		matched := false
 		if from := at[l.from]; from >= 0 {
 			if l.one != nil {
-				if r := l.one[from]; r >= 0 && (pass == nil || pass[r]) {
+				r := l.one[from]
+				if r >= 0 {
+					probes++
+				}
+				if r >= 0 && (pass == nil || pass[r]) {
 					if at[i] = r; w.keep(i, at) {
 						matched = true
 						if !visit(i + 1) {
@@ -2453,6 +2470,7 @@ func (w *segJoinWalk) each(at []int32, fn func() bool) bool {
 					hi++
 				}
 				rows := l.rows[lo:hi]
+				probes += int64(hi - lo)
 				if w.tags != nil && w.tags[i] != nil {
 					// A MULTI_OR level: its rows in the order the loop puts
 					// them in for this outer row.

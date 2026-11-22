@@ -1134,6 +1134,7 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		e.jmpBlock(pc, in.T) // no rows
 		patch(a.buf, nonEmpty+2, len(a.buf))
 		a.MovMemDImm(RAX, cb+VCursorOffLast, 0)
+		a.IncMemD(RAX, cb+VCursorOffSteps)
 	case VNext:
 		e.unmapCursor(in.A)
 		cb := int32(in.A * VCursorSize)
@@ -1150,6 +1151,7 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		a.MovMemDReg(RAX, cb+VCursorOffPos, RDX)
 		a.MovMemDImm(RAX, cb+VCursorOffDirty, 1)
 		a.MovMemDReg(RAX, cb+VCursorOffLast, RDX)
+		a.IncMemD(RAX, cb+VCursorOffSteps)
 		e.jmpBlock(pc, in.T)
 		patch(a.buf, end+2, len(a.buf))
 		// Off the end of the rows handed over: one with more past them (Adv 2)

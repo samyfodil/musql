@@ -392,6 +392,20 @@ type vdbe struct {
 	holder    *vdbe
 	countHeld bool
 	heldBytes int64
+
+	// segJoinProbes is the rows the join kernel's walk found in its later
+	// levels (segJoinWalk.each), counted as read when the kernel answers.
+	segJoinProbes int64
+	// nRead and nWritten are the rows this run read and wrote, which run
+	// adds to the statement's RowCounter when it returns (foldRows).
+	nRead, nWritten int64
+	// billed is, per cursor, whether its rows count as read (billedCursors),
+	// computed from the instructions billedOf starts.
+	billed   []bool
+	billedOf *Instruction
+	// bareCount is the cursor of a bare count(*)'s loop (bareCountCursor), or
+	// -1, computed with billed.
+	bareCount int
 }
 
 // runSub is the subquery opcodes' shared dispatcher: an uncorrelated subquery
@@ -1472,7 +1486,7 @@ func (prog *Program) outerCtxVerdict() *outerCtxVerdict {
 			OpColumn, OpRowid, OpOuterColumn, OpOuterRowid,
 			OpInteger, OpVariable, OpNull, OpString8, OpReal, OpSCopy, OpCopy,
 			OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull,
-			OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpSeekRowidSetHint, OpAutoIndexOrder, OpSortedSeek, OpResultRow:
+			OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpRowidReadBound, OpSeekRowidSetHint, OpAutoIndexOrder, OpSortedSeek, OpResultRow:
 		case OpOpenDerived:
 			v.unread = false
 			if ds, ok := prog.Insns[i].P4.(*derivedSource); ok && ds.vtabStream && len(ds.vtabCorr) > 0 && isSeriesSource(ds) {
@@ -1672,7 +1686,18 @@ func (m *vdbe) cursorMask(insns []Instruction, c int) columnMask {
 // runWrite (write runs: m.wctx set, no OpResultRow so the returned rows are
 // empty and the WRITE opcodes report their outcome through m.wctx instead --
 // see vdbe_write.go).
-func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
+func (m *vdbe) run(insns []Instruction) ([][]Value, error) {
+	rows, err := m.runLoop(insns)
+	if h := m.hashAgg; h != nil && h.stream {
+		m.nRead += h.streamReads()
+	}
+	if m.nRead != 0 || m.nWritten != 0 {
+		m.foldRows()
+	}
+	return rows, err
+}
+
+func (m *vdbe) runLoop(insns []Instruction) (rows [][]Value, err error) {
 	m.intr = m.interruptFlag()
 	pc := 0
 	if m.yield {
@@ -2001,6 +2026,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 
 		case OpResultRow:
+			if h := m.hashAgg; h != nil && h.stream && h.sorted != nil {
+				h.emitted = h.pos + 1
+			}
 			if m.firstRow {
 				return [][]Value{nil}, nil
 			}
@@ -2384,6 +2412,16 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				break
 			}
 			m.cursors[op.P1].narrowRowidRangeBy(op.P3, m.regs[op.P2])
+
+		case OpRowidReadBound:
+			if cursorHasNoBtree(m.cursors[op.P1]) {
+				break
+			}
+			kinds := op.P4.([]int)
+			cur := m.cursors[op.P1]
+			cur.billLimit = int64(op.P3)
+			cur.billRangeBy(kinds, m.regs[op.P2:op.P2+len(kinds)])
+			cur.billLeft, cur.billCapped = min(cur.billLeft, cur.readCap()), true
 
 		case OpInList:
 			m.regs[op.P2] = m.inList(op)
@@ -2867,6 +2905,20 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				}
 				cur.writeHint = 0
 			}
+			cur.billLeft = 0
+			if m.billedCursor(insns, op.P1) {
+				cur.billLeft = cur.readCap()
+				cur.billCapped = cur.billLeft != math.MaxInt64
+				if op.P1 == m.bareCount {
+					cur.billLeft, cur.billCapped = 0, true
+					m.nRead += cur.countReads()
+				}
+				if cur.segFilter != nil && cur.segSrc != nil {
+					cur.segSrc.bill, cur.segSrc.billLeft = &m.nRead, &cur.billLeft
+				}
+				m.nRead += cur.filterPassed
+			}
+			cur.filterPassed = 0
 			if !cur.advance() {
 				if cur.streamErrPending != nil {
 					return nil, cur.streamErrPending
@@ -2874,10 +2926,18 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				pc = op.P2
 				continue
 			}
+			if cur.billLeft > 0 {
+				cur.billLeft--
+				m.nRead++
+			}
 
 		case OpNext:
 			cur := m.cursors[op.P1]
 			if cur.advance() {
+				if cur.billLeft > 0 {
+					cur.billLeft--
+					m.nRead++
+				}
 				if m.intr != nil && m.intr.Load() {
 					return nil, ErrInterrupted
 				}
@@ -3111,6 +3171,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				if served && len(vs) == 1 {
 					segFilterServed.Add(1)
 					m.regs[op.P1] = vs[0]
+					m.nRead += m.segFilterReads(cur, plan, insns, pc, m.regs[op.P1])
 					pc = op.P3
 					continue
 				}
@@ -3123,6 +3184,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 					if total, served := cur.pager.segSemiCountTable(cur.tbl.root, cur.tbl, preds, semis, ins, likes); served {
 						segFilterServed.Add(1)
 						m.regs[op.P1] = Value{Typ: Int, I: int64(total)}
+						m.nRead += m.segFilterReads(cur, plan, insns, pc, m.regs[op.P1])
 						pc = op.P3
 						continue
 					}
@@ -3132,12 +3194,14 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 					if v, served := cur.pager.segFilterSumTable(cur.tbl.root, preds, plan.sumCol, cur.tbl.ipkIndex); served {
 						segFilterServed.Add(1)
 						m.regs[op.P1] = v
+						m.nRead += m.segFilterReads(cur, plan, insns, pc, m.regs[op.P1])
 						pc = op.P3
 						continue
 					}
 				} else if total, served := cur.pager.segFilterCountTable(cur.tbl.root, preds, cur.tbl.ipkIndex); served {
 					segFilterServed.Add(1)
 					m.regs[op.P1] = Value{Typ: Int, I: int64(total)}
+					m.nRead += m.segFilterReads(cur, plan, insns, pc, m.regs[op.P1])
 					pc = op.P3
 					continue
 				}
@@ -3150,6 +3214,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				if served && len(vs) == 1 {
 					segFilterServed.Add(1)
 					m.regs[op.P1] = vs[0]
+					m.nRead += m.segFilterReads(cur, plan, insns, pc, m.regs[op.P1])
 					pc = op.P3
 					continue
 				}
@@ -3180,6 +3245,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			if served {
 				segFilterServed.Add(1)
+				m.nRead += min(guardReads(cur, false, -1), m.prologueReadBound(cur, insns, pc+1))
 				m.segRows, m.segRow = rows[min(plan.offset, len(rows)):], 0
 				pc = op.P3
 				continue
@@ -3196,6 +3262,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			if q, ok := vplan.query.value(m.params); ok {
 				if rows, served := cur.pager.segVectorTopK(cur.tbl.root, vplan, cur.tbl.ipkIndex, q); served {
 					segFilterServed.Add(1)
+					m.nRead += min(guardReads(cur, false, -1), m.prologueReadBound(cur, insns, pc+1))
 					m.segRows, m.segRow = rows[min(vplan.offset, len(rows)):], 0
 					pc = op.P3
 					continue
@@ -3211,6 +3278,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			if rows, served := cur.pager.segDistinctTable(cur.tbl.root, dplan.col, cur.tbl.ipkIndex); served {
 				segFilterServed.Add(1)
+				m.nRead += min(guardReads(cur, false, -1), m.prologueReadBound(cur, insns, pc+1))
 				m.segRows, m.segRow = rows, 0
 				pc = op.P3
 				continue
@@ -3240,6 +3308,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			if served {
 				segFilterServed.Add(1)
+				if !series {
+					m.nRead += min(guardReads(cur, false, -1), m.prologueReadBound(cur, insns, pc+1))
+				}
 				// P1 is the FIRST destination register; the statement's N
 				// aggregates land in P1..P1+N-1, which is the range the
 				// recogniser's own ResultRow reads (see segProgPeephole).
@@ -3256,12 +3327,14 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			if !okPlan {
 				return nil, fmt.Errorf("vdbe: OpSegJoinAgg without a plan")
 			}
+			m.segJoinProbes = 0
 			served, jerr := m.segJoinAggregate(jp)
 			if jerr != nil {
 				return nil, jerr
 			}
 			if served {
 				segFilterServed.Add(1)
+				m.nRead += m.segJoinReads(jp) + m.segJoinProbes
 				pc = op.P2
 				continue
 			}
@@ -3273,7 +3346,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				return nil, fmt.Errorf("vdbe: OpSegJoinGroups without a plan")
 			}
 			m.segJoin = nil
+			m.segJoinProbes = 0
 			if gs, served := m.segJoinGroupsOf(jp); served {
+				m.nRead += m.segJoinReads(jp) + m.segJoinProbes
 				m.segJoin = gs
 				segJoinHits.Add(1)
 				segFilterServed.Add(1)
@@ -3302,12 +3377,14 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			if !okPlan {
 				return nil, fmt.Errorf("vdbe: OpSegJoinHash without a plan")
 			}
+			m.segJoinProbes = 0
 			served, jerr := m.segJoinHashAgg(jp)
 			if jerr != nil {
 				return nil, jerr
 			}
 			if served {
 				segFilterServed.Add(1)
+				m.nRead += m.segJoinReads(jp) + m.segJoinProbes
 				pc = op.P2
 				continue
 			}
@@ -3319,7 +3396,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 				return nil, fmt.Errorf("vdbe: OpSegJoinTop without a plan")
 			}
 			m.segJoin = nil
+			m.segJoinProbes = 0
 			if gs, served := m.segJoinTopOf(jp); served {
+				m.nRead += m.segJoinReads(jp) + m.segJoinProbes
 				m.segJoin = gs
 				segJoinHits.Add(1)
 				segFilterServed.Add(1)
@@ -3374,6 +3453,9 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			if m.segHashAggTable(cur.pager, cur.tbl, gplan) {
 				segFilterServed.Add(1)
+				if !gplan.agg.cStreams {
+					m.nRead += min(guardReads(cur, false, -1), m.prologueReadBound(cur, insns, pc+1))
+				}
 				pc = op.P2
 				continue
 			}
@@ -3774,6 +3856,7 @@ func (m *vdbe) run(insns []Instruction) (rows [][]Value, err error) {
 			}
 			n := tbl.rows.clear()
 			m.wctx.rowsAffected += int(n)
+			m.nWritten += int64(n)
 
 		case OpGenErrCheck:
 			if m.regs[op.P1].Typ == valueGenErr {
@@ -4192,6 +4275,9 @@ func (m *vdbe) execOpenRead(op *Instruction, insns []Instruction) error {
 	cur := m.openCursorInto(op.P1, rp, op.P4.(*resolvedTable))
 	cur.streamable = op.P5&1 != 0
 	cur.streamIfOrdered = op.P5&4 != 0
+	// A cursor native code seeks never rewinds here, but may step here. A
+	// table's rows count (billedCursors).
+	cur.billLeft = math.MaxInt64
 	// A materialized scan leaves the columns nothing reads unread
 	// (scanTableCols), which its reads fill in. A streamable cursor
 	// materializes too where the segments cannot stream its rows: a write
@@ -4262,6 +4348,7 @@ func (m *vdbe) execSeekIndexHint(op *Instruction) error {
 			cur.idxSeekRange = nil
 			cur.idxSeekOrder, cur.idxListOnce, cur.idxListReady = h.order, false, false
 			cur.idxSeekRaiseFree = h.raiseFree
+			cur.idxSeekDeclared = h.index != ""
 		}
 		// A slot out of step is dropped, as is the key of "x IS NULL" (no
 		// posting list holds NULL) and a write's TEXT key in a UTF-16

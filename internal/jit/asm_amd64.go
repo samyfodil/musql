@@ -488,6 +488,13 @@ func (a *Asm) MovMemDImm(base Reg, disp int32, imm int32) {
 	a.emit32(uint32(imm))
 }
 
+// IncMemD adds one to the qword [base+disp].
+func (a *Asm) IncMemD(base Reg, disp int32) {
+	a.rex(0, base)
+	a.emit(0xFF)
+	a.memD(0, base, disp)
+}
+
 // CmpMemDImm8 compares the qword [base+disp] against imm.
 func (a *Asm) CmpMemDImm8(base Reg, disp int32, imm int8) {
 	a.rex(7, base)

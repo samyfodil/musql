@@ -262,6 +262,7 @@ func compileScanAggregate(c *compiler, stmt *SelectStmt, srcs []joinSource, scop
 	// levels take rowid bounds too, which keep it as well: without them an inner
 	// level read its whole table once per outer row.
 	planConstantKeySeeks(c, srcs, stmt.Where, len(srcs) > 1, false)
+	planBillMinMax(c, srcs, stmt)
 
 	// Predicate pushdown: see compileScanPlain (vdbe_scan.go). buckets prune at
 	// their join level; this body tests only the deferred residue. (The local
@@ -1936,6 +1937,7 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 		return nil, fmt.Errorf("%w: a GROUP BY with no ORDER BY, over a table carrying an index that could deliver the grouping, in a statement the ported planner declined -- so WHICH ORDER THE GROUPS come out in (select.c's groupBySort==0 arm) is not reproducible", errVDBEUnsupported)
 	}
 	scanOrderGroups := !hasOrder && groupsArriveOutOfKeyOrder(srcs, scopes, gp)
+	cStreams := len(srcs) == 1 && srcs[0].tbl != nil && srcs[0].idxOrderKey != nil && srcs[0].idxOrderKey.groupsSorted
 	plan := &aggPlan{
 		scopes:     scopes,
 		nCols:      nCols,
@@ -1948,6 +1950,7 @@ func compileScanGroupBy(p *ReadOnlyPager, c *compiler, stmt *SelectStmt, srcs []
 		magnet:      gp.magnet,
 		anchorCheck: anchorChk,
 		groupExprs:  gp.groupExprs,
+		cStreams:    cStreams,
 	}
 	rowFree := !gp.usesGroupBare && !gp.selectHasSubquery && !gp.anchorObservable && anchorChk == nil &&
 		!anyAggOrderBy(aggs) && !orderBySubqueryReadsRow(c.pager, stmt.OrderBy) && !subqueryReadsRow(c.pager, stmt.Having)
