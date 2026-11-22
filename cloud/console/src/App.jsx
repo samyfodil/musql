@@ -18,10 +18,12 @@ import ConnectDrawer from "./components/ConnectDrawer.jsx";
 import { SAMPLE } from "./sample.js";
 import { saved, unsave } from "./library.js";
 import { isStudioTable } from "./vectors.js";
-import { CloudMain, CloudSide, PAGES } from "./cloud/Cloud.jsx";
+import { CloudMain, CloudSide, cloudPages } from "./cloud/Cloud.jsx";
 import { useCloud } from "./cloud/useCloud.js";
-import { server as cloudServer, signIn } from "./cloud/auth.js";
-import { cloudDatabase } from "./cloud/api.js";
+import { server as cloudServer, signIn, token as accessToken } from "./cloud/auth.js";
+import { api, cloudDatabase, roleName, transport } from "./cloud/api.js";
+import Logo, { slotIcon, SlotBoundary } from "./components/Logo.jsx";
+import { Slot, useOptions } from "./slots.js";
 
 // The editor (CodeMirror) loads with the first query tab, not with the page.
 const QueryView = lazy(() => import("./components/QueryView.jsx"));
@@ -50,7 +52,7 @@ function internalNames(schema) {
 	return out;
 }
 
-const ICON = { table: "▦", view: "◇", index: "⋮", trigger: "ϟ", query: "›_", diagram: "⌗" };
+const ICON = { table: "▦", view: "◇", index: "⋮", trigger: "ϟ", query: "›_", diagram: "⌗", ext: "◆" };
 const GROUP = { table: "Tables", view: "Views", index: "Indexes", trigger: "Triggers" };
 
 const THEMES = { system: <Contrast size={17} />, light: <Sun size={17} />, dark: <Moon size={17} /> };
@@ -87,6 +89,8 @@ function useTheme() {
 let querySeq = 0;
 
 export default function App() {
+	const opts = useOptions();
+	const { branding } = opts;
 	const [theme, setTheme, dark] = useTheme();
 	const [dbName, setDbName] = useState(null);
 	const [dirty, setDirty] = useState(false);
@@ -256,7 +260,7 @@ export default function App() {
 
 	function openTab(tab) {
 		setTabs((ts) => {
-			const have = (tab.table && ts.find((t) => t.table === tab.table)) || (tab.kind === "diagram" && ts.find((t) => t.kind === "diagram"));
+			const have = (tab.table && ts.find((t) => t.table === tab.table)) || (tab.kind === "diagram" && ts.find((t) => t.kind === "diagram")) || (tab.kind === "ext" && ts.find((t) => t.kind === "ext" && t.key === tab.key));
 			if (have) {
 				setActive(have.id);
 				return ts.map((t) => (t === have ? { ...t, mode: tab.mode ?? t.mode } : t));
@@ -347,7 +351,7 @@ export default function App() {
 	// #/<database>/diagram: the open database and tab, a table's filter, sort
 	// and view, so a link reopens it and Back and Forward move between tabs.
 	function routeOf(t) {
-		if (!dbName || !t) return dbName ? `#/${encodeURIComponent(dbName)}` : "#/";
+		if (!dbName || !t || t.kind === "ext") return dbName ? `#/${encodeURIComponent(dbName)}` : "#/";
 		const base = `#/${encodeURIComponent(dbName)}`;
 		const st = t.state;
 		const custom = st && (st.mode !== "data" || st.filt?.filters?.length || st.filt?.sql || st.sorts?.length);
@@ -438,7 +442,9 @@ export default function App() {
 	const lastHash = useRef(null);
 	useEffect(() => {
 		if (!dbName) return;
-		viewState(dbName, { tabs: tabs.map(({ id, ...t }) => t), active: tabs.findIndex((t) => t.id === active), section });
+		// An extension's tab belongs to the session, not to the database's kept view.
+		const kept = tabs.filter((t) => t.kind !== "ext");
+		viewState(dbName, { tabs: kept.map(({ id, ...t }) => t), active: kept.findIndex((t) => t.id === active), section });
 		const h = routeOf(current0);
 		if (h === location.hash) return;
 		const sameTab = lastHash.current && lastHash.current.split("?")[0] === h.split("?")[0];
@@ -559,6 +565,33 @@ export default function App() {
 		setSection("cloud");
 		if (page) setCloudPage(page);
 	};
+	const openExtTab = (key) => {
+		const d = opts.databaseTabs.find((t) => t.key === key);
+		if (!d || !cloudTarget) return;
+		setSection("tables");
+		openTab({ kind: "ext", key, title: d.label });
+	};
+	// slot is what an extension's page, tab or banner gets as ctx.
+	const membership = cloud.me?.memberships.find((m) => m.org.slug === cloud.org);
+	const slot = useMemo(
+		() => ({
+			api,
+			transport,
+			server: cloudServer,
+			token: accessToken,
+			user: cloud.me?.user ?? null,
+			admin: cloud.admin,
+			org: membership?.org ?? null,
+			role: roleName(cloud.role),
+			orgs: cloud.me?.memberships.map((m) => m.org) ?? [],
+			database: cloudTarget,
+			toast,
+			navigate: goCloud,
+			openTab: openExtTab,
+			branding,
+		}),
+		[cloud.me, cloud.org, cloud.role, cloud.admin, cloudTarget?.org, cloudTarget?.database, toast, branding],
+	);
 	const fileItems = [
 		{ label: "Undo", hint: remote ? "local only" : "⌘Z", disabled: remote || !hist.undo, onClick: undo },
 		{ label: "Redo", hint: remote ? "local only" : "⇧⌘Z", disabled: remote || !hist.redo, onClick: redo },
@@ -607,14 +640,17 @@ export default function App() {
 		act("Open a file", pickFile, "⌘O", "⇧");
 		act("Open the sample database", () => openDatabase("sample.musq", undefined, SAMPLE), "", "★");
 		act("New empty database", () => openDatabase("untitled.musq"), "", "＋");
-		if (cloudServer) for (const [k, label, , admin] of PAGES) if (!admin || cloud.admin) act(`Cloud: ${label}`, () => goCloud(k), "", "☁");
-		if (!cloudServer) act("Sign in to a musql cloud", () => goCloud(), "", "☁");
+		if (cloudServer) for (const [k, label, , admin] of cloudPages(opts)) if (!admin || cloud.admin) act(`Cloud: ${label}`, () => goCloud(k), "", "☁");
+		if (!cloudServer) act(`Sign in to a ${branding.name}`, () => goCloud(), "", "☁");
+		if (cloudTarget) for (const d of opts.databaseTabs) act(d.label, () => openExtTab(d.key), cloudTarget.database, "◆");
+		if (branding.docsURL) act("Documentation", () => window.open(branding.docsURL, "_blank", "noopener"), "", "?");
+		if (branding.supportURL) act("Support", () => window.open(branding.supportURL, "_blank", "noopener"), "", "?");
 		act("Keyboard shortcuts", () => setKeys(true), "?", "⌨");
 		act(`Theme: ${theme === "dark" ? "light" : "dark"}`, () => setTheme(dark ? "light" : "dark"), "", dark ? "☀" : "☾");
 		return out;
-	}, [schema, internal, counts, library, dbName, theme, dark, recents, remoteList, remote, undo, redo, cloud.admin]);
+	}, [schema, internal, counts, library, dbName, theme, dark, recents, remoteList, remote, undo, redo, cloud.admin, cloudTarget?.org, cloudTarget?.database]);
 
-	const tabsShown = tabs.filter((t) => (section === "sql" ? t.kind === "query" : section === "diagram" ? t.kind === "diagram" : t.kind === "table"));
+	const tabsShown = tabs.filter((t) => (section === "sql" ? t.kind === "query" : section === "diagram" ? t.kind === "diagram" : t.kind === "table" || t.kind === "ext"));
 	const current = tabsShown.find((t) => t.id === active) ?? tabsShown.at(-1);
 
 	function goSection(sec) {
@@ -626,7 +662,7 @@ export default function App() {
 	}
 
 	return (
-		<Studio.Provider value={ctx}>
+		<Studio.Provider value={ctx}><Slot.Provider value={slot}>
 			<div
 				className={`app${sideOpen ? " sideopen" : ""}`}
 				onDragEnter={(e) => e.dataTransfer.types.includes("Files") && setDragging(true)}
@@ -641,12 +677,12 @@ export default function App() {
 				<input id="file" type="file" hidden accept=".musq,.sqlite,.sqlite3,.db,.csv,.tsv,.json" onChange={(e) => { openFile(e.target.files[0]); e.target.value = ""; }} />
 
 				<nav className="rail">
-					<div className="logo" title="musql studio">μ</div>
+					<Logo title={branding.studioName} />
 					{[
 						["tables", <Table2 size={18} />, "Table editor"],
 						["sql", <SquareTerminal size={18} />, "SQL editor"],
 						["diagram", <Network size={18} />, "Schema diagram"],
-						["cloud", <Cloud size={18} />, cloudServer ? "Cloud" : "Sign in to a musql cloud"],
+						["cloud", <Cloud size={18} />, cloudServer ? "Cloud" : `Sign in to a ${branding.name}`],
 					].map(([k, ic, label]) => (
 						<button key={k} className={`railbtn${section === k ? " on" : ""}`} title={label} disabled={!dbName && k !== "tables" && k !== "cloud"} onClick={() => goSection(k)}>
 							{ic}
@@ -751,18 +787,30 @@ export default function App() {
 										{showInternal ? "Show less" : "Show indexes, triggers and internal tables"}
 									</button>
 								)}
+								{cloudTarget && opts.databaseTabs.length > 0 && (
+									<div className="group">
+										<h4>Database</h4>
+										{opts.databaseTabs.map((d) => (
+											<button key={d.key} className={`item${current?.kind === "ext" && current.key === d.key && section === "tables" ? " active" : ""}`} onClick={() => openExtTab(d.key)}>
+												<span className="ic">{slotIcon(d.icon, 14, ICON.ext)}</span>
+												<span className="name">{d.label}</span>
+											</button>
+										))}
+									</div>
+								)}
 							</nav>
 						</>
 					)}
 				</aside>
 
 				<main className="main">
-					{section === "cloud" && <div className="cloudmain"><CloudMain cloud={cloud} page={cloudPage} setPage={setCloudPage} toast={toast} onOpen={openCloud} current={cloudTarget} /></div>}
+					{opts.banners.length > 0 && <div className="banners">{opts.banners.map((B, i) => <SlotBoundary key={i} name="Banner"><B ctx={slot} /></SlotBoundary>)}</div>}
+					{section === "cloud" && <div className="cloudmain"><CloudMain cloud={cloud} page={cloudPage} setPage={setCloudPage} toast={toast} onOpen={openCloud} current={cloudTarget} slot={slot} /></div>}
 					{dbName && section !== "cloud" && (
 						<div className="tabs">
 							{tabsShown.map((t) => (
 								<div key={t.id} className={`tab${t.id === current?.id ? " active" : ""}`} onClick={() => setActive(t.id)} onAuxClick={(e) => e.button === 1 && closeTab(t.id)}>
-									<span className="ic">{t.kind === "table" ? ICON[schema.find((o) => o.name === t.table)?.type ?? "table"] : ICON[t.kind]}</span>
+									<span className="ic">{t.kind === "table" ? ICON[schema.find((o) => o.name === t.table)?.type ?? "table"] : t.kind === "ext" ? slotIcon(opts.databaseTabs.find((d) => d.key === t.key)?.icon, 13, ICON.ext) : ICON[t.kind]}</span>
 									{t.title}
 									<button className="x" title="Close" onClick={(e) => { e.stopPropagation(); closeTab(t.id); }}>×</button>
 								</div>
@@ -785,6 +833,8 @@ export default function App() {
 							<div key={t.id} className="pane" hidden={t.id !== current?.id}>
 								{t.kind === "table" ? (
 									<TableView name={t.table} mode={t.mode} tabId={t.id} state={t.state} />
+								) : t.kind === "ext" ? (
+									<ExtTab tab={opts.databaseTabs.find((d) => d.key === t.key)} slot={slot} />
 								) : t.kind === "diagram" ? (
 									<Suspense fallback={<Spinner label="Loading the diagram…" />}>
 										<Diagram onOpen={(name) => { setSection("tables"); openTable(name); }} />
@@ -809,8 +859,8 @@ export default function App() {
 									</>
 								) : (
 									<>
-										<div className="logo big">μ</div>
-										<h1>musql studio</h1>
+										<Logo big />
+										<h1>{branding.studioName}</h1>
 										<p className="dim">A SQLite-compatible database that runs in your browser. Nothing is uploaded.</p>
 										{recents.length + remoteList.length > 0 && (
 											<div className="recents">
@@ -895,6 +945,12 @@ export default function App() {
 					</div>
 				)}
 			</div>
-		</Studio.Provider>
+		</Slot.Provider></Studio.Provider>
 	);
+}
+
+function ExtTab({ tab, slot }) {
+	if (!tab || !slot.database) return null;
+	const C = tab.component;
+	return <div className="extpane"><div className="cloudpage"><SlotBoundary name={tab.label}><C ctx={slot} /></SlotBoundary></div></div>;
 }
