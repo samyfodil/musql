@@ -6,8 +6,10 @@
 package engine
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"math"
 	"slices"
 	"strconv"
@@ -498,39 +500,42 @@ func (p *ReadOnlyPager) schemaFingerprint() uint64 {
 // cache and by the rendered-catalog cache (segmentPager), which want the same
 // question answered: is this the same schema as last time?
 func schemaRowsFingerprint(rows []SchemaRow) uint64 {
-	const (
-		offset64 = 14695981039346656037
-		prime64  = 1099511628211
-	)
-	h := uint64(offset64)
-	mix := func(b string) {
-		for i := 0; i < len(b); i++ {
-			h ^= uint64(b[i])
-			h *= prime64
-		}
-		h ^= 0xff
-		h *= prime64
-	}
+	var h maphash.Hash
+	h.SetSeed(schemaFPSeed)
 	for i := range rows {
 		r := &rows[i]
-		mix(r.Type)
-		mix(r.Name)
-		mix(r.TblName)
-		mix(r.SQL)
-		mix(r.AliasOf)
-		h ^= uint64(r.RootPage)
-		h *= prime64
-		h ^= uint64(r.Rowid)
-		h *= prime64
+		fpString(&h, r.Type)
+		fpString(&h, r.Name)
+		fpString(&h, r.TblName)
+		fpString(&h, r.SQL)
+		fpString(&h, r.AliasOf)
+		fpUint(&h, uint64(r.RootPage))
+		fpUint(&h, uint64(r.Rowid))
 		if r.Temp {
-			h ^= 1
-			h *= prime64
+			h.WriteByte(1)
+		} else {
+			h.WriteByte(0)
 		}
 	}
 	// Never 0, because schemaFingerprint memoises on a zero field meaning "not
-	// computed yet" and FNV-1a can land on 0 for some input. Setting one bit costs
-	// nothing and removes the case rather than leaving it to be hit once.
-	return h | 1
+	// computed yet". Setting one bit costs nothing and removes the case.
+	return h.Sum64() | 1
+}
+
+// schemaFPSeed seeds the catalog fingerprint. The fingerprint only keys caches
+// inside this process and is never stored, so it need not be stable across runs.
+var schemaFPSeed = maphash.MakeSeed()
+
+func fpUint(h *maphash.Hash, v uint64) {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], v)
+	h.Write(b[:])
+}
+
+// fpString writes s after its length, so no two field splits hash alike.
+func fpString(h *maphash.Hash, s string) {
+	fpUint(h, uint64(len(s)))
+	h.WriteString(s)
 }
 
 // planCacheFor returns the map to read and write, clearing it first when the
