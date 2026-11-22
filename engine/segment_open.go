@@ -136,6 +136,7 @@ func schemaRowidsUsable(rows []SchemaRow) bool {
 }
 
 func buildSchemaSegment(rows []SchemaRow) (*segment, error) {
+	schemaSegBuilds.Add(1)
 	rowids := make([]uint64, 0, len(rows))
 	stored := make([][]Value, 0, len(rows))
 	// ONE PASS for every rootpage, not one pass PER ROW. catalogRootpageFor walks
@@ -214,6 +215,17 @@ func openSegmentsUnlocked(path string) (*ReadOnlyPager, error) {
 		return nil, err
 	}
 	return buildSegmentPager(path, f, st)
+}
+
+// openSegmentColumnsUnlocked is openSegmentsUnlocked for a reader of table
+// segments only (DB.segColumns): no catalog rows and no sqlite_master segment,
+// which the session's own pager already rendered at open.
+func openSegmentColumnsUnlocked(path string) (*ReadOnlyPager, error) {
+	f, st, err := readSegmentPairUnlocked(path)
+	if err != nil {
+		return nil, err
+	}
+	return buildSegmentPagerOf(path, f, st, false)
 }
 
 // readSegmentPairUnlocked reads the segment file and replays its delta, taking no
@@ -330,6 +342,12 @@ func autoIndexNumbers(sql string) []int {
 
 // buildSegmentPager wires a read pager over a segment file and its replayed delta.
 func buildSegmentPager(path string, f *SegmentFile, st *segDeltaState) (*ReadOnlyPager, error) {
+	return buildSegmentPagerOf(path, f, st, true)
+}
+
+// buildSegmentPagerOf is buildSegmentPager; without catalog the pager holds the
+// tables' segments and the delta but no schema.
+func buildSegmentPagerOf(path string, f *SegmentFile, st *segDeltaState, catalog bool) (*ReadOnlyPager, error) {
 	p := newReadOnlyPager()
 
 	src := &segSource{file: f, byRoot: map[uint32][]*segment{}, tableOf: map[uint32]int{}}
@@ -359,6 +377,10 @@ func buildSegmentPager(path string, f *SegmentFile, st *segDeltaState) (*ReadOnl
 		rows = append(rows, SchemaRow{
 			Type: "table", Name: t.Name, TblName: t.Name, RootPage: root, SQL: t.SQL, Rowid: t.Rowid,
 		})
+	}
+	if !catalog {
+		p.segs = src
+		return finishSegmentPager(p, path, f, st), nil
 	}
 	// AUTOMATIC INDEXES, re-derived from each table's own CREATE text the way
 	// OpenWrite re-derives them (buildAutoIndexes, index_write.go).
@@ -429,6 +451,12 @@ func buildSegmentPager(path string, f *SegmentFile, st *segDeltaState) (*ReadOnl
 	p.segs = src
 	p.schemaRows = rows
 	p.schemaLoaded = true
+	return finishSegmentPager(p, path, f, st), nil
+}
+
+// finishSegmentPager stamps p with what the file's catalog records beside its
+// objects, and hands it the file and delta to release.
+func finishSegmentPager(p *ReadOnlyPager, path string, f *SegmentFile, st *segDeltaState) *ReadOnlyPager {
 	// ...and the schema cookie, which a segment file keeps in its catalog because it
 	// has no SQLite header to keep it in. See ConvertedCatalog.SchemaVersion.
 	p.meta.schemaCookie = f.Catalog().SchemaVersion
@@ -456,7 +484,7 @@ func buildSegmentPager(path string, f *SegmentFile, st *segDeltaState) (*ReadOnl
 	// Close releases the mapping through the pager's own closer, so a caller
 	// closes a segment pager exactly as it closes any other.
 	p.closer = segFileCloser{f, st}
-	return p, nil
+	return p
 }
 
 // catalogRootpageFor is the ROOTPAGE a rendered sqlite_master row reports: a

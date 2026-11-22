@@ -2320,7 +2320,7 @@ func (db *DB) committedColumns() *ReadOnlyPager {
 		return db.segColumns
 	}
 	db.dropColsPending() // the view is read again from the file, which has them
-	p, err := openSegmentsUnlocked(db.path)
+	p, err := openSegmentColumnsUnlocked(db.path)
 	if err != nil {
 		// Leave whatever is cached alone rather than dropping it: a stale handle
 		// is never READ (the rowsWrittenSinceCommit gate is what admits a table),
@@ -2377,10 +2377,12 @@ func (db *DB) cachedSchemaSegment(rows []SchemaRow) (*segment, error) {
 }
 
 // schemaSegSeedOffForTest leaves the session's catalog segment unseeded at
-// open; schemaSegHits counts the statements served a rendered one.
+// open; schemaSegHits counts the statements served a rendered one, and
+// schemaSegBuilds the catalogs rendered.
 var (
 	schemaSegSeedOffForTest bool
 	schemaSegHits           atomic.Int64
+	schemaSegBuilds         atomic.Int64
 )
 
 // buildSegSource is the read source a statement sees: the live row store behind
