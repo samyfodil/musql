@@ -12,6 +12,7 @@ replace github.com/samyfodil/musql/examples/libp2p => ../../examples/libp2p
 
 require (
 	connectrpc.com/connect v1.21.0
+	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/johannesboyne/gofakes3 v1.2.0
 	github.com/minio/minio-go/v7 v7.4.1
 	github.com/samyfodil/musql v0.1.1
@@ -41,7 +42,6 @@ require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/fatih/color v1.19.0 // indirect
 	github.com/flynn/noise v1.1.0 // indirect
-	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-logr/logr v1.4.2 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-webgpu/goffi v0.6.3 // indirect

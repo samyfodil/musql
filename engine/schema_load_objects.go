@@ -99,11 +99,16 @@ func (db *DB) loadSchemaObjects(rp *ReadOnlyPager, schemaRows []SchemaRow, what 
 			db.vtabs = append(db.vtabs, vm)
 			continue
 		}
-		withoutRowid, strict, err := parseTableTailClauses(sr.SQL)
+		toks, tb, err := lexScratch(sr.SQL)
 		if err != nil {
 			return fmt.Errorf("engine: "+what+": table %s: %w", sr.Name, err)
 		}
-		cols, checks, specs, err := parseCreateTableColumnsAndAutoIndexes(sr.SQL, withoutRowid)
+		withoutRowid, strict, err := parseTableTailToks(toks)
+		if err != nil {
+			return fmt.Errorf("engine: "+what+": table %s: %w", sr.Name, err)
+		}
+		cols, checks, specs, err := parseCreateTableToks(sr.SQL, toks, withoutRowid)
+		releaseScratch(tb, toks)
 		if err != nil {
 			return fmt.Errorf("engine: "+what+": table %s: %w", sr.Name, err)
 		}

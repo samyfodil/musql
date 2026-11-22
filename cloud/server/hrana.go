@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/samyfodil/musql/driver"
@@ -68,6 +69,21 @@ type entry struct {
 	shared   bool // db is a crdt database's replicated handle, not the entry's
 	last     time.Time
 	inflight int
+	// block is the database's blocks as the state last said, which Hrana
+	// asks before every statement.
+	block atomic.Pointer[hrana.Block]
+}
+
+// setBlock takes d's blocks.
+func (e *entry) setBlock(d *state.Database) {
+	b := hrana.Block{Reads: d.BlockReads, Writes: d.BlockWrites}
+	switch {
+	case b.Reads:
+		b.Reason = "reads are blocked on this database"
+	case b.Writes:
+		b.Reason = "writes are blocked on this database"
+	}
+	e.block.Store(&b)
 }
 
 // pool holds the open databases, opened on first use and closed when idle.
@@ -121,6 +137,16 @@ func (e *entry) close() {
 		e.db.Close()
 	}
 	e.ro.Close()
+}
+
+// refresh gives d's open entry, if any, d's blocks.
+func (p *pool) refresh(d *state.Database) {
+	p.mu.Lock()
+	e := p.m[d.ID]
+	p.mu.Unlock()
+	if e != nil {
+		e.setBlock(d)
+	}
 }
 
 // drop closes a database's servers, before its file is removed or replaced.
@@ -221,10 +247,14 @@ func (s *Server) openEntry(d *state.Database) (*entry, error) {
 		}
 		return nil, err
 	}
-	return &entry{db: db, ro: ro, shared: shared, srv: hrana.NewServer(db,
+	e := &entry{db: db, ro: ro, shared: shared}
+	e.setBlock(d)
+	e.srv = hrana.NewServer(db,
 		hrana.WithReadOnlyDB(ro),
 		hrana.WithAuth(s.hranaAuth(d.OrgID, d.ID)),
-		hrana.WithObserver(s.meter.observer(d.ID, d.OrgID)))}, nil
+		hrana.WithBlock(func() hrana.Block { return *e.block.Load() }),
+		hrana.WithObserver(s.meter.observer(d.ID, d.OrgID)))
+	return e, nil
 }
 
 func openPinged(dsn string) (*sql.DB, error) {
@@ -371,6 +401,7 @@ func (s *Server) hranaAuth(orgID, dbID string) func(string) (bool, error) {
 		if err != nil {
 			return false, authErr(err)
 		}
+		s.pool.refresh(d)
 		return s.dbAccess(ctx, tok, o, d)
 	}
 }

@@ -2181,7 +2181,7 @@ func unsupportedStatementErr(trimmed string) error {
 	// A first token that begins no statement at all is a syntax error AT that
 	// token (parse.y's cmd grammar), the way a shell's ".schema" reaches C.
 	if toks, lerr := lex(trimmed); lerr == nil && len(toks) > 0 && toks[0].kind != tkEOF && !statementStartWords[strings.ToUpper(toks[0].text)] {
-		return fmt.Errorf("engine: near %q: syntax error", toks[0].text)
+		return fmt.Errorf("engine: near \"%s\": syntax error", trimmed[toks[0].Start:toks[0].End])
 	}
 	return fmt.Errorf("engine: unsupported statement (this write path only supports CREATE TABLE/VIEW/TRIGGER, CREATE/DROP INDEX, DROP TABLE/VIEW/TRIGGER, INSERT, UPDATE, DELETE, ATTACH/DETACH, BEGIN/COMMIT/END/ROLLBACK, and SAVEPOINT/RELEASE/ROLLBACK TO): %q", trimmed)
 }

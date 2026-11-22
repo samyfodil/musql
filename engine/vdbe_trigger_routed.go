@@ -257,6 +257,7 @@ func (m *vdbe) opTriggerBodyRouted(op *Instruction) error {
 	// by runOneTrigger's per-step setChanges when this sub-program returns
 	// (Program.CountsChanges, set by compileRoutedTriggerBody).
 	m.wctx.rowsAffected += n
+	m.nWritten += int64(n)
 	return nil
 }
 

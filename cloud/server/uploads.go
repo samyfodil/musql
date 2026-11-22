@@ -387,8 +387,15 @@ func (s *Server) removeStaleExports() {
 	}
 }
 
-// runUploadSweep removes stale uploads every so often until stop is closed.
-func (s *Server) runUploadSweep() {
+// runSweeps removes stale uploads and deleted databases past their
+// retention every so often until stop is closed.
+func (s *Server) runSweeps() {
 	every := min(s.cfg.Uploads.ttl, 10*time.Minute)
-	s.every(every, "uploads", func(context.Context) error { return s.sweepUploads(time.Now()) })
+	s.every(every, "sweep", func(ctx context.Context) error {
+		err := s.sweepUploads(time.Now())
+		if derr := s.sweepDeleted(ctx, time.Now()); err == nil {
+			err = derr
+		}
+		return err
+	})
 }

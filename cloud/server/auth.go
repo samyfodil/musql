@@ -123,8 +123,8 @@ func rpcErr(err error) error {
 		return connect.NewError(connect.CodeNotFound, errors.New("not found"))
 	case errors.Is(err, state.ErrExists):
 		return connect.NewError(connect.CodeAlreadyExists, errors.New("already exists"))
-	case errors.Is(err, state.ErrInUse):
-		return connect.NewError(connect.CodeFailedPrecondition, errors.New("still in use"))
+	case errors.Is(err, state.ErrProtected):
+		return connect.NewError(connect.CodeFailedPrecondition, errors.New("delete protection is on"))
 	case errors.Is(err, cluster.ErrOutcomeUnknown):
 		return connect.NewError(connect.CodeUnknown, cluster.ErrOutcomeUnknown)
 	case state.Unavailable(err), errors.Is(err, errNoMaster), errors.Is(err, cluster.ErrNotLeader):
