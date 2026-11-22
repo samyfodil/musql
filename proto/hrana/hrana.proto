@@ -27,6 +27,11 @@ message StmtResult {
   repeated Row rows = 2;
   uint64 affected_row_count = 3;
   optional sint64 last_insert_rowid = 4;
+  // The rows the statement read and wrote, counted as libSQL counts
+  // LIBSQL_STMTSTATUS_ROWS_READ and _WRITTEN, and how long it ran.
+  uint64 rows_read = 6;
+  uint64 rows_written = 7;
+  double query_duration_ms = 8;
 }
 
 message Col {

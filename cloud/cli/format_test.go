@@ -76,6 +76,12 @@ func TestComplete(t *testing.T) {
 		"CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END;": true,
 		"SELECT 1;\nSELECT 2;":                                    true,
 		"/* ; */":                                                 false,
+		"select 1::int;":                                          true,
+		"'';":                                                     true,
+		"EXPLAIN CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1;":   false,
+		"CREATE TEMP TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END;": true,
+		"SELECT [a;":        false,
+		"SELECT 1; /* open": false,
 	} {
 		if got := Complete(text); got != want {
 			t.Errorf("%q: %v, want %v", text, got, want)
