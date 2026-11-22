@@ -484,7 +484,7 @@ func lexInto(toks []token, s string) ([]token, error) {
 				toks = append(toks, token{kind: tkPunct, text: two, Start: start, End: i})
 			default:
 				if strings.IndexByte("()+-*/%,.;<>=~&|", c) < 0 {
-					return nil, fmt.Errorf("engine: unexpected character %q", c)
+					return nil, fmt.Errorf("engine: unrecognized token: \"%c\"", c)
 				}
 				i++
 				toks = append(toks, token{kind: tkPunct, text: string(c), Start: start, End: i})
