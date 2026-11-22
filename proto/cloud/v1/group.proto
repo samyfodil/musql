@@ -8,6 +8,7 @@ service GroupService {
   rpc List(ListGroupsRequest) returns (ListGroupsResponse);
   rpc Create(CreateGroupRequest) returns (CreateGroupResponse);
   rpc Delete(DeleteGroupRequest) returns (DeleteGroupResponse);
+  rpc Update(UpdateGroupRequest) returns (UpdateGroupResponse);
   rpc AddLocation(AddLocationRequest) returns (AddLocationResponse);
   rpc RemoveLocation(RemoveLocationRequest) returns (RemoveLocationResponse);
   rpc ListLocations(ListLocationsRequest) returns (ListLocationsResponse);
@@ -34,12 +35,26 @@ message CreateGroupResponse {
   Group group = 1;
 }
 
+// Delete deletes a group with its databases, kept as DeleteDatabase keeps a
+// database (DatabaseService.RestoreDeleted). Refused (FAILED_PRECONDITION)
+// while the group or one of its databases has delete_protection set.
 message DeleteGroupRequest {
   string org = 1;
   string name = 2;
 }
 
 message DeleteGroupResponse {}
+
+// Update sets the fields given and leaves the others as they are.
+message UpdateGroupRequest {
+  string org = 1;
+  string name = 2;
+  optional bool delete_protection = 3;
+}
+
+message UpdateGroupResponse {
+  Group group = 1;
+}
 
 message AddLocationRequest {
   string org = 1;

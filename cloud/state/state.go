@@ -326,6 +326,47 @@ var migrations = []string{
 	// A regular database's durability in a cluster. Those from before were
 	// opened without a quorum, which their replication catalog keeps.
 	`ALTER TABLE databases ADD COLUMN durability TEXT NOT NULL DEFAULT 'fast'`,
+	// Delete protection and blocks, and deleted records kept for restore: a
+	// deleted row moves to its own table, so its name is free at once.
+	`ALTER TABLE databases ADD COLUMN delete_protection INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE databases ADD COLUMN block_reads INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE databases ADD COLUMN block_writes INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE groups ADD COLUMN delete_protection INTEGER NOT NULL DEFAULT 0;
+	CREATE TABLE deleted_databases (
+		id TEXT PRIMARY KEY,
+		org_id TEXT NOT NULL,
+		name TEXT NOT NULL,
+		group_id TEXT NOT NULL,
+		parent TEXT NOT NULL DEFAULT '',
+		parent_at INTEGER NOT NULL DEFAULT 0,
+		schema_only INTEGER NOT NULL DEFAULT 0,
+		token_gen INTEGER NOT NULL DEFAULT 0,
+		created_at INTEGER NOT NULL,
+		file TEXT NOT NULL DEFAULT '',
+		type TEXT NOT NULL DEFAULT 'plain',
+		durability TEXT NOT NULL DEFAULT 'fast',
+		delete_protection INTEGER NOT NULL DEFAULT 0,
+		block_reads INTEGER NOT NULL DEFAULT 0,
+		block_writes INTEGER NOT NULL DEFAULT 0,
+		deleted_at INTEGER NOT NULL,
+		deleted_with TEXT NOT NULL DEFAULT ''
+	);
+	CREATE INDEX deleted_databases_org ON deleted_databases (org_id);
+	CREATE TABLE deleted_groups (
+		id TEXT PRIMARY KEY,
+		org_id TEXT NOT NULL,
+		name TEXT NOT NULL,
+		primary_location TEXT NOT NULL,
+		token_gen INTEGER NOT NULL DEFAULT 0,
+		created_at INTEGER NOT NULL,
+		type TEXT NOT NULL DEFAULT 'plain',
+		delete_protection INTEGER NOT NULL DEFAULT 0,
+		deleted_at INTEGER NOT NULL
+	);`,
+	// A deleted record past its retention, whose files a sweep may have
+	// removed: it is never restored, even if the retention grows.
+	`ALTER TABLE deleted_databases ADD COLUMN expired INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE deleted_groups ADD COLUMN expired INTEGER NOT NULL DEFAULT 0;`,
 }
 
 func (s *Store) migrate() error {

@@ -409,6 +409,7 @@ func (s *Server) placeDatabases(ctx context.Context) error {
 	}
 	want, elect := map[string]bool{}, map[string]*state.Group{}
 	for _, d := range dbs {
+		s.pool.refresh(d)
 		g := group(d.GroupID)
 		if g == nil || !slices.Contains(g.Locations, s.cfg.Node.Location) {
 			continue
@@ -440,6 +441,17 @@ func (s *Server) placeDatabases(ctx context.Context) error {
 		d, err := s.store.DatabaseByID(ctx, id)
 		switch {
 		case errors.Is(err, state.ErrNotFound):
+			// A deleted database keeps its files until the sweep after its
+			// retention, which removes them on every node.
+			_, err := s.store.DeletedDatabaseByID(ctx, id)
+			if err == nil {
+				s.closeDB(id)
+				continue
+			}
+			if !errors.Is(err, state.ErrNotFound) {
+				s.log.Printf("place %s: %v", id, err)
+				continue
+			}
 		case err != nil:
 			s.log.Printf("place %s: %v", id, err)
 			continue
