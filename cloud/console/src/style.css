@@ -101,6 +101,8 @@ button:disabled { opacity: .45; cursor: default; }
 	font-size: 14px;
 }
 .logo.big { width: 56px; height: 56px; border-radius: 14px; font-size: 32px; margin: 0 auto 14px; }
+.logo:has(img) { background: none; }
+.logo img { width: 100%; height: 100%; object-fit: contain; border-radius: inherit; }
 .dbname { color: var(--dim); font-family: var(--mono); font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .actions { display: flex; gap: 6px; align-items: center; }
 .menu { position: relative; }
@@ -325,6 +327,8 @@ button.warn { border-color: var(--accent); color: var(--accent); }
 button.danger { border-color: var(--err); color: var(--err); }
 button.link { border: 0; background: transparent; padding: 0 4px; color: var(--accent); }
 button.link:hover { text-decoration: underline; }
+a.link { color: var(--accent); text-decoration: none; }
+a.link:hover { text-decoration: underline; }
 .warn { color: var(--accent); }
 .check { display: flex; align-items: center; gap: 6px; font-size: 12px; white-space: nowrap; }
 .fields .check { grid-column: 1 / -1; font-family: var(--sans); white-space: normal; }
@@ -494,10 +498,11 @@ button.pressed { background: var(--hover); border-color: var(--dim); }
 .side .item:hover { background: var(--hover); }
 .sideempty { display: grid; gap: 6px; padding: 14px 8px; }
 
-.app .main { grid-column: 3; display: grid; grid-template-rows: auto auto 1fr; min-width: 0; min-height: 0; background: var(--panel); }
-.app .main > .tabs { grid-row: 1; }
-.app .main > .sessionbar { grid-row: 2; }
-.app .main > .panes { grid-row: 3; }
+.app .main { grid-column: 3; display: grid; grid-template-rows: auto auto auto 1fr; min-width: 0; min-height: 0; background: var(--panel); }
+.app .main > .banners { grid-row: 1; }
+.app .main > .tabs { grid-row: 2; }
+.app .main > .sessionbar { grid-row: 3; }
+.app .main > .panes { grid-row: 4; }
 .app .tabs { display: flex; align-items: flex-end; gap: 2px; padding: 6px 10px 0; border-bottom: 1px solid var(--line); background: var(--bg); min-height: 40px; }
 .app .tabs .tab { padding: 6px 8px 7px 12px; }
 .newtab { margin: 0 0 4px 2px; }
@@ -782,7 +787,7 @@ label.stagetoggle { display: inline-flex; align-items: center; gap: 5px; font-si
 .stagebar button.primary .kbd { background: rgba(255, 255, 255, 0.2); color: #fff; border-color: transparent; }
 
 /* the cloud section */
-.cloudmain { position: relative; grid-row: 1 / -1; min-height: 0; overflow: auto; background: var(--panel); }
+.cloudmain { position: relative; grid-row: 2 / -1; min-height: 0; overflow: auto; background: var(--panel); }
 .cloudpage { max-width: 1080px; padding: 22px 28px 60px; }
 .cloudhead { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
 .cloudhead h1 { font-size: 20px; margin: 0; font-weight: 600; }
@@ -798,7 +803,7 @@ table.cloudtable { width: 100%; border-collapse: collapse; }
 .cloudtable .badge { margin-left: 6px; }
 .cloudtable .sqlcell { max-width: 460px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .cloudtable.kv th { width: 9em; padding: 8px 10px; }
-.sessionbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--line); background: var(--accent-soft); font-size: 12.5px; }
+.sessionbar, .banner { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--line); background: var(--accent-soft); font-size: 12.5px; }
 .cloud-none { display: grid; justify-items: center; gap: 6px; padding: 48px 20px; border: 1px dashed var(--line); border-radius: var(--radius); text-align: center; }
 .cloud-none p { margin: 0; }
 .cloud-empty { display: grid; justify-items: center; gap: 6px; }
@@ -820,3 +825,6 @@ table.cloudtable { width: 100%; border-collapse: collapse; }
 @media (max-width: 760px) { .cloudpage { padding: 16px; } .cloudtable th:nth-child(4), .cloudtable td:nth-child(4) { display: none; } }
 .cloudpage select { width: auto; font-family: var(--sans); padding: 4px 8px; }
 .cloudhead select { font-size: 13px; }
+
+/* extension slots */
+.extpane { flex: 1; min-height: 0; overflow: auto; }
