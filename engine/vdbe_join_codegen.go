@@ -2069,6 +2069,9 @@ func (p *ReadOnlyPager) resolveCorrelatedCTESource(c *compiler, state *joinDesug
 			}
 		} else if perr == nil {
 			b.probeCounts.Store(p.refCountsSince(was))
+			if barrier == nil {
+				b.countedProbe.Store(prog)
+			}
 		}
 		return joinSource{}, false, nil
 	}
@@ -2318,6 +2321,14 @@ func (p *ReadOnlyPager) cteSchemaColsIn(name string, b *cteBinding, outer *compi
 	// found binds nothing outside the body: this compile's, but for an outer
 	// it does not bind.
 	prog := b.probe.Load()
+	if prog == nil && target == b.core && b.recursive == nil && outer == nil && !cteSchemaFromProbeOffForTest {
+		// A probe that counted references: the compile below would count
+		// the same ones.
+		if cp, d := b.countedProbe.Load(), b.probeCounts.Load(); cp != nil && d != nil && p.addRefCounts(d) {
+			prog = cp
+			cteSchemaFromProbe.Add(1)
+		}
+	}
 	if prog == nil || target != b.core || b.recursive != nil || outer != nil {
 		leave := p.enterFromBody()
 		var perr error
