@@ -22,6 +22,22 @@ type ScalarFunction struct {
 	// WHERE may use it (resolve.c:1219-1228 refuses any other there).
 	Deterministic bool
 	Fn            func(args []Value) (Value, error)
+
+	// ranged is a function registered with each argument count in lo..hi, as
+	// sqlean registers some of its functions once per count.
+	ranged bool
+	lo, hi int
+}
+
+// arity is the argument counts f takes, hi == -1 for any.
+func (f *ScalarFunction) arity() (lo, hi int) {
+	switch {
+	case f.ranged:
+		return f.lo, f.hi
+	case f.NArg < 0:
+		return 0, -1
+	}
+	return f.NArg, f.NArg
 }
 
 // udfs is the registered functions, by lower-cased name.
@@ -81,7 +97,7 @@ func callUDF(name string, args []Value) (Value, bool, error) {
 // call runs f on args, checking the count first as C's function lookup does
 // (a registered NArg matches exactly or the call does not resolve).
 func (f *ScalarFunction) call(args []Value) (Value, error) {
-	if f.NArg >= 0 && len(args) != f.NArg {
+	if lo, hi := f.arity(); len(args) < lo || (hi >= 0 && len(args) > hi) {
 		return Value{}, fmt.Errorf("engine: wrong number of arguments to function %s()", f.Name)
 	}
 	v, err := f.Fn(args)

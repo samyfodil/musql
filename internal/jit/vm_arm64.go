@@ -1083,6 +1083,9 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		e.jmpBlock(pc, in.T) // no rows
 		a.Label(nonEmpty)
 		e.strAt(xzr, X9, cb+VCursorOffLast)
+		e.ldrAt(X10, X9, cb+VCursorOffSteps)
+		a.AddImm(X10, X10, 1)
+		e.strAt(X10, X9, cb+VCursorOffSteps)
 	case VNext:
 		e.unmap(^in.A)
 		cb := in.A * VCursorSize
@@ -1102,6 +1105,9 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		a.MovImm16(X11, 1)
 		e.strAt(X11, X9, cb+VCursorOffDirty)
 		e.strAt(X10, X9, cb+VCursorOffLast)
+		e.ldrAt(X11, X9, cb+VCursorOffSteps)
+		a.AddImm(X11, X11, 1)
+		e.strAt(X11, X9, cb+VCursorOffSteps)
 		e.jmpBlock(pc, in.T)
 		a.Label(done)
 		// Off the end of the rows handed over: one with more past them (Adv 2)

@@ -10,6 +10,9 @@ import (
 // ReadOnlyPager is a read handle on one database: the segment file and its
 // delta (segs), and what every query runs against.
 type ReadOnlyPager struct {
+	// rows is the connection's row counter (SetRowCounter), nil for none.
+	rows *RowCounter
+
 	// interrupt stops the statements run on this pager (SetInterrupt).
 	interrupt *atomic.Bool
 

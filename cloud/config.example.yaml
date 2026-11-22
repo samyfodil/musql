@@ -11,5 +11,6 @@ snapshots:
 uploads:
   max_bytes: 17179869184  # the largest database file one upload may carry
   ttl: "24h"              # an upload nothing writes to or uses is removed after this
+deleted_retention: "5d"   # a deleted database stays restorable this long, then goes with its history
 ai:
   provider: ""   # jitllm | openai | anthropic | openrouter

@@ -55,6 +55,20 @@ type Server struct {
 	// replicate to it.
 	noAdmin       atomic.Bool
 	noAdminLogged time.Time
+
+	// deletedRetention is WithDeletedRetention's; nil keeps the config's.
+	deletedRetention func(ctx context.Context, org *state.Org) time.Duration
+}
+
+// Option configures a Server beyond its config file.
+type Option func(*Server)
+
+// WithDeletedRetention sets how long an org's deleted databases are kept,
+// restorable, in place of deleted_retention. It is asked whenever a deleted
+// database is listed, restored or swept, so a change applies to those
+// deleted already.
+func WithDeletedRetention(fn func(ctx context.Context, org *state.Org) time.Duration) Option {
+	return func(s *Server) { s.deletedRetention = fn }
 }
 
 var errNoAdminYet = errors.New("no admin yet: waiting for the state from a peer, or run musql-cloud init")
@@ -63,7 +77,7 @@ var errNoAdminYet = errors.New("no admin yet: waiting for the state from a peer,
 // in, and builds the handler. Histories are logged by the engine's commit hook,
 // which the process must install (engine.WithCommitHook(store.OnCommit));
 // without it a history catches up only when synced.
-func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) {
+func New(ctx context.Context, cfg *Config, logger *log.Logger, options ...Option) (*Server, error) {
 	if logger == nil {
 		logger = log.New(os.Stderr, "musql-cloud: ", log.LstdFlags)
 	}
@@ -73,6 +87,9 @@ func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) 
 		}
 	}
 	s := &Server{cfg: cfg, log: logger}
+	for _, o := range options {
+		o(s)
+	}
 	s.removeStaleExports()
 	store, err := s.openState(ctx)
 	if err != nil {
@@ -126,7 +143,7 @@ func New(ctx context.Context, cfg *Config, logger *log.Logger) (*Server, error) 
 		s.bg.Go(func() { s.runSnapshots(s.stop) })
 	}
 	s.bg.Go(s.runUsageFlush)
-	s.bg.Go(s.runUploadSweep)
+	s.bg.Go(s.runSweeps)
 	if s.cl != nil {
 		s.bg.Go(s.runCluster)
 	}
