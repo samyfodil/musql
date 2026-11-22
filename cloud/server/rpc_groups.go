@@ -12,7 +12,8 @@ import (
 type groupService struct{ *Server }
 
 func groupToProto(o *state.Org, g *state.Group) *v1.Group {
-	return &v1.Group{Name: g.Name, Org: o.Slug, Primary: g.Primary, Locations: g.Locations, CreatedAt: stamp(g.CreatedAt), Type: typeToProto(g.Type)}
+	return &v1.Group{Id: g.ID, Name: g.Name, Org: o.Slug, Primary: g.Primary, Locations: g.Locations, CreatedAt: stamp(g.CreatedAt), Type: typeToProto(g.Type),
+		DeleteProtection: g.DeleteProtection}
 }
 
 // locations are the deployment's: this node's and its peers'.
@@ -84,8 +85,12 @@ func (s groupService) Delete(ctx context.Context, req *connect.Request[v1.Delete
 	if err != nil {
 		return nil, rpcErr(err)
 	}
-	if err := s.store.DeleteGroup(ctx, g.ID); err != nil {
+	dbs, err := s.store.DeleteGroup(ctx, g.ID)
+	if err != nil {
 		return nil, rpcErr(err)
+	}
+	for _, d := range dbs {
+		s.closeDB(d.ID)
 	}
 	return connect.NewResponse(&v1.DeleteGroupResponse{}), nil
 }

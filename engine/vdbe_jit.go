@@ -663,16 +663,24 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 		}
 		reach := jit.VReachMarks(vp, mark, nMarks)
 		jx.entryCurs = make([][]int, len(vp))
+		nEntry := 0
+		for _, e := range entry {
+			if e {
+				nEntry++
+			}
+		}
+		slab := make([]int, 0, nEntry*len(order))
 		for pc := range vp {
 			if !entry[pc] {
 				continue
 			}
-			jx.entryCurs[pc] = []int{}
+			at := len(slab)
 			for _, c := range order {
 				if reach[pc][c/64]&(1<<uint(c%64)) != 0 {
-					jx.entryCurs[pc] = append(jx.entryCurs[pc], c)
+					slab = append(slab, c)
 				}
 			}
+			jx.entryCurs[pc] = slab[at:len(slab):len(slab)]
 		}
 	}
 	for _, in := range vp {
@@ -1112,7 +1120,7 @@ func gatherSkip(prog *Program, at int) uint64 {
 				}
 				continue
 			}
-		case OpVariable, OpSeekRowidHint, OpSeekRowidRangeHint, OpInteger, OpInt64, OpNull, OpSCopy, OpCopy,
+		case OpVariable, OpSeekRowidHint, OpSeekRowidRangeHint, OpRowidReadBound, OpInteger, OpInt64, OpNull, OpSCopy, OpCopy,
 			OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight,
 			OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpNot, OpNegative:
 			if in.Op == OpNull && in.P3 > in.P2 {
@@ -2310,10 +2318,17 @@ func segSync(cur *vdbeCursor, jc *jit.VCursor, sn *jitSnap) {
 			// Last is a position among the window's candidates.
 			cur.segRow, src.selPos = int(src.sel[jc.Last]), int(jc.Last)+1
 			segRowsSelected.Add(int64(moved))
+			if src.bill != nil {
+				// The rows passed over on the way; the ones landed on are
+				// native code's Steps.
+				src.billRows(int64(cur.segRow + 1 - src.billPos - moved))
+				src.billPos = cur.segRow + 1
+			}
 		default:
 			cur.segRow = int(jc.Last)
 			if !src.point {
 				src.ri = cur.segRow + 1
+				src.billPos = src.ri
 			}
 		}
 		cur.rowid = cur.segCur.Rowid(cur.segRow)
@@ -2481,6 +2496,7 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 				continue // as native code left it
 			}
 			jx.handCursor(m, pc, c)
+			m.jcur[c].Steps = 0
 			m.jLive = append(m.jLive, c)
 		}
 		args.Cur = &m.jcur[0]
@@ -2503,6 +2519,12 @@ func (jx *vmJIT) enter(m *vdbe, pc int, rows *[][]Value) (next, n int) {
 		}
 		if keep {
 			m.jDefer, m.jDeferPC, m.jDeferJX = true, int(jx.safeExit[exit]), jx
+			// A run that ends here never takes them back.
+			for _, c := range m.jLive {
+				if jc := &m.jcur[c]; jc.Steps != 0 {
+					jx.foldSteps(m, c, jc)
+				}
+			}
 		} else {
 			for _, c := range m.jLive {
 				jx.syncCursor(m, c, exit)
@@ -2734,6 +2756,9 @@ func (jx *vmJIT) handCursor(m *vdbe, pc, c int) {
 // stopped at exit, did to it (m.jcur[c]).
 func (jx *vmJIT) syncCursor(m *vdbe, c, exit int) {
 	jc := &m.jcur[c]
+	if jc.Steps != 0 {
+		jx.foldSteps(m, c, jc)
+	}
 	if jc.Reopen >= jit.VReopenSeek {
 		if jx.syncSeekOpen(m, c, jc) {
 			return
@@ -2875,4 +2900,19 @@ func cursorFreeOp(in *Instruction) bool {
 		}
 	}
 	return false
+}
+
+// foldSteps adds the rows native code stepped cursor c onto to the run's rows
+// read, as the VDBE's OP_Rewind and OP_Next count them.
+func (jx *vmJIT) foldSteps(m *vdbe, c int, jc *jit.VCursor) {
+	n := jc.Steps
+	jc.Steps = 0
+	if !m.billedCursor(unsafe.Slice(jx.insns, jx.n), c) {
+		return
+	}
+	if cur := m.cursors[c]; cur != nil && cur.billCapped {
+		n = min(n, cur.billLeft)
+		cur.billLeft -= n
+	}
+	m.nRead += n
 }

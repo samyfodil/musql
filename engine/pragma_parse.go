@@ -296,8 +296,24 @@ func matchParen(toks []token, openIdx int) int {
 // segments are slices of toks, which lex may share: a caller copies one
 // before writing into it.
 func splitTopLevelCommas(toks []token) [][]token {
-	var segments [][]token
-	from, depth := 0, 0
+	n, depth := 1, 0
+	for _, t := range toks {
+		if t.kind == tkPunct {
+			switch t.text {
+			case "(":
+				depth++
+			case ")":
+				depth--
+			case ",":
+				if depth == 0 {
+					n++
+				}
+			}
+		}
+	}
+	segments := make([][]token, 0, n)
+	from := 0
+	depth = 0
 	for i, t := range toks {
 		if t.kind != tkPunct {
 			continue
@@ -331,6 +347,8 @@ var pragmaColConstraintStart = map[string]bool{
 	"GENERATED": true, "AS": true,
 }
 
+var pragmaColConstraintKws = newKeywordSet(pragmaColConstraintStart)
+
 // parsePragmaTableDef parses a CREATE TABLE statement's stored SQL into a
 // pragmaTableDef (see the file comment for why it is a separate parse).
 //
@@ -341,11 +359,16 @@ var pragmaColConstraintStart = map[string]bool{
 // report it as sqlite_autoindex_<table>_<N>, origin='pk', even though no schema
 // row backs it (on the write side it is indexMeta.isTablePK).
 func parsePragmaTableDef(createSQL string) (*pragmaTableDef, error) {
-	withoutRowid := sqlTextTableIsWithoutRowid(createSQL)
 	toks, err := lex(createSQL)
 	if err != nil {
 		return nil, fmt.Errorf("parsing CREATE TABLE: %w", err)
 	}
+	return parsePragmaTableDefToks(createSQL, toks)
+}
+
+// parsePragmaTableDefToks is parsePragmaTableDef over createSQL's tokens.
+func parsePragmaTableDefToks(createSQL string, toks []token) (*pragmaTableDef, error) {
+	withoutRowid := sqlTextTableIsWithoutRowid(createSQL)
 	i := 0
 	kw := func(s string) bool {
 		if i < len(toks) && toks[i].kind == tkIdent && toks[i].upper() == s {
@@ -393,7 +416,7 @@ func parsePragmaTableDef(createSQL string) (*pragmaTableDef, error) {
 	}
 	segments := splitTopLevelCommas(toks[i+1 : end])
 
-	def := &pragmaTableDef{pkPos: map[string]int{}}
+	def := &pragmaTableDef{pkPos: map[string]int{}, cols: make([]pragmaColumn, 0, len(segments))}
 	// rowidAliasName is the column (if any) whose PRIMARY KEY collapsed into
 	// the rowid alias, recorded by both the column-level and the table-level
 	// PRIMARY KEY branches below. Consulted only by the STRICT/WITHOUT ROWID
@@ -412,7 +435,7 @@ func parsePragmaTableDef(createSQL string) (*pragmaTableDef, error) {
 			seg[0], _ = asCreateTableIdent(seg[0])
 		}
 		first := seg[0]
-		if first.kind == tkIdent && first.upperIn(tableConstraintStart) {
+		if first.kind == tkIdent && first.in(tableConstraintKws) {
 			kwTok := first
 			rest := seg
 			if kwTok.isKw("CONSTRAINT") {
@@ -482,7 +505,7 @@ func parsePragmaTableDef(createSQL string) (*pragmaTableDef, error) {
 		// Column definition.
 		name := first.text
 		j := 1
-		for j < len(seg) && !(seg[j].kind == tkIdent && seg[j].upperIn(pragmaColConstraintStart)) {
+		for j < len(seg) && !(seg[j].kind == tkIdent && seg[j].in(pragmaColConstraintKws)) {
 			j++
 		}
 		typeToks := seg[1:j:j]

@@ -31,6 +31,9 @@ import (
 // catalog, its tables' row stores, its pragma settings and connection state.
 // A Session embeds it and owns its commit (segment_write.go).
 type DB struct {
+	// rows is the connection's row counter (SetRowCounter), nil for none.
+	rows *RowCounter
+
 	path string
 
 	// interrupt, when set, stops this session's statements at their next
@@ -957,6 +960,7 @@ func (db *DB) stampPager(p *ReadOnlyPager) {
 	// planner prices with -- not whatever sqlite_stat1 holds now.
 	p.setPlanStats(db.planStats())
 	p.caseSensitiveLike = db.caseSensitiveLike
+	p.rows = db.rows
 	// ...and PRAGMA temp_store, which only the connection knows (see
 	// DB.tempStore) and which its own getter answers from.
 	p.tempStore = db.tempStore

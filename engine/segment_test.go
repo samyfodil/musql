@@ -162,6 +162,8 @@ func TestSegmentTaggedFallbackKeepsEveryValue(t *testing.T) {
 
 // A truncated or corrupt segment is an ERROR at open, never a panic in a scan:
 // the accessors are branch-light precisely because open validated the offsets.
+// The index records are the exception: open reads none of them, and the lazy
+// reader refuses a damaged one, so the column is scanned instead.
 func TestSegmentRejectsMalformed(t *testing.T) {
 	cols := []columnInfo{{Name: "a"}}
 	rows := [][]Value{{{Typ: Int, I: 1}}, {{Typ: Int, I: 2}}}
@@ -169,8 +171,24 @@ func TestSegmentRejectsMalformed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildSegment: %v", err)
 	}
-	if _, err := openSegment(buf[:len(buf)-1]); err == nil {
-		t.Error("a truncated segment opened cleanly")
+	whole, err := openSegment(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := whole.diskIndexFor(0); !ok {
+		t.Fatal("the column has no index record; the truncation below would not cut one")
+	}
+	short, err := openSegment(buf[:len(buf)-1])
+	if err != nil {
+		t.Fatalf("a segment cut inside its last index record: %v", err)
+	}
+	if _, ok := short.diskIndexFor(0); ok {
+		t.Error("a truncated index record was used")
+	}
+	for i, r := range rows {
+		if got := short.Value(0, i); got.Typ != Int || got.I != r[0].I {
+			t.Errorf("row %d of the truncated segment: got %+v", i, got)
+		}
 	}
 	if _, err := openSegment([]byte("nope")); err == nil {
 		t.Error("a non-segment opened cleanly")

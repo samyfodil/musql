@@ -308,12 +308,15 @@ func autoIndexNumbers(sql string) []int {
 	if !r35aContainsFold(sql, "primary") && !r35aContainsFold(sql, "unique") {
 		return nil
 	}
-	if def, err := parsePragmaTableDef(sql); err == nil {
-		for i, spec := range def.autoIdx {
-			if !(def.withoutRowid && spec.kind == "pk") {
-				nums = append(nums, i+1)
+	if toks, tb, err := lexScratch(sql); err == nil {
+		if def, err := parsePragmaTableDefToks(sql, toks); err == nil {
+			for i, spec := range def.autoIdx {
+				if !(def.withoutRowid && spec.kind == "pk") {
+					nums = append(nums, i+1)
+				}
 			}
 		}
+		releaseScratch(tb, toks)
 	}
 	autoIndexMemo.mu.Lock()
 	if autoIndexMemo.m == nil || len(autoIndexMemo.m) >= autoIndexMemoN {

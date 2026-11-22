@@ -32,20 +32,20 @@ func vmRealLowering(prog *Program, storesReal, storesText func(root uint32, col 
 		return nil, nil
 	}
 	n := len(prog.Insns)
-	out, ok = make([]jit.VInsn, n), make([]bool, n)
+	lower := func(pc int, v jit.VInsn) {
+		if ok == nil {
+			out, ok = make([]jit.VInsn, n), make([]bool, n)
+		}
+		out[pc], ok[pc] = v, true
+	}
 	tables := map[int]*resolvedTable{}
-	real := map[int]bool{}
-	text := map[int]bool{}
+	real, text := make(vmRegs, prog.NReg), make(vmRegs, prog.NReg)
 	in := func(r int) bool { return r >= 0 && r < prog.NReg }
 	for pc := range prog.Insns {
 		ins := &prog.Insns[pc]
 		set := func(r int, isReal bool) {
-			if isReal {
-				real[r] = true
-			} else {
-				delete(real, r)
-			}
-			delete(text, r)
+			real.put(r, isReal)
+			text.put(r, false)
 		}
 		switch ins.Op {
 		case OpOpenRead, OpOpenWrite:
@@ -54,51 +54,59 @@ func vmRealLowering(prog *Program, storesReal, storesText func(root uint32, col 
 			}
 		case OpReal:
 			if f, isF := ins.P4.(float64); isF && in(ins.P2) {
-				out[pc], ok[pc] = jit.VInsn{Op: jit.VReal, A: ins.P2, Imm: int64(math.Float64bits(f))}, true
+				lower(pc, jit.VInsn{Op: jit.VReal, A: ins.P2, Imm: int64(math.Float64bits(f))})
 			}
 			set(ins.P2, true)
 		case OpColumn:
 			t := tables[ins.P1]
 			set(ins.P3, t != nil && ins.P2 >= 0 && ins.P2 < len(t.cols) &&
 				(t.cols[ins.P2].Aff == affReal || storesReal != nil && storesReal(t.root, ins.P2)))
-			if t != nil && ins.P2 >= 0 && ins.P2 < len(t.cols) && !real[ins.P3] && storesText != nil && storesText(t.root, ins.P2) {
-				text[ins.P3] = true
+			if t != nil && ins.P2 >= 0 && ins.P2 < len(t.cols) && !real.has(ins.P3) && storesText != nil && storesText(t.root, ins.P2) {
+				text.put(ins.P3, true)
 			}
 		case OpSCopy, OpCopy:
-			wasText := text[ins.P1]
-			set(ins.P2, real[ins.P1])
+			wasText := text.has(ins.P1)
+			set(ins.P2, real.has(ins.P1))
 			if wasText {
-				text[ins.P2] = true
+				text.put(ins.P2, true)
 			}
 		case OpInteger, OpInt64, OpNull, OpString8, OpBlob, OpVariable, OpNot, OpRowid:
 			set(ins.P2, false)
 		case OpAdd, OpSubtract, OpMultiply, OpDivide:
-			isReal := real[ins.P1] || real[ins.P2]
-			if text[ins.P1] || text[ins.P2] {
+			isReal := real.has(ins.P1) || real.has(ins.P2)
+			if text.has(ins.P1) || text.has(ins.P2) {
 				// Its result is an INTEGER or a REAL by the text's spelling, a
 				// guess neither arm makes: what it feeds stays the VDBE's too.
-				out[pc], ok[pc] = jit.VInsn{Op: jit.VExit}, true
+				lower(pc, jit.VInsn{Op: jit.VExit})
 				set(ins.P3, false)
-				text[ins.P3] = true
+				text.put(ins.P3, true)
 				break
 			}
 			if isReal && in(ins.P1) && in(ins.P2) && in(ins.P3) {
-				op := map[OpCode]jit.VOp{OpAdd: jit.VFAdd, OpSubtract: jit.VFSub, OpMultiply: jit.VFMul, OpDivide: jit.VFDiv}[ins.Op]
-				out[pc], ok[pc] = jit.VInsn{Op: op, A: ins.P1, B: ins.P2, C: ins.P3}, true
+				op := jit.VFDiv
+				switch ins.Op {
+				case OpAdd:
+					op = jit.VFAdd
+				case OpSubtract:
+					op = jit.VFSub
+				case OpMultiply:
+					op = jit.VFMul
+				}
+				lower(pc, jit.VInsn{Op: op, A: ins.P1, B: ins.P2, C: ins.P3})
 			}
 			set(ins.P3, isReal)
 		case OpRemainder, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight:
-			if text[ins.P1] || text[ins.P2] {
-				out[pc], ok[pc] = jit.VInsn{Op: jit.VExit}, true
+			if text.has(ins.P1) || text.has(ins.P2) {
+				lower(pc, jit.VInsn{Op: jit.VExit})
 			}
 			set(ins.P3, false)
 		case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
-			if (real[ins.P1] || real[ins.P3]) && affinity(ins.P5&p5AffMask) != affText && in(ins.P1) && in(ins.P3) {
+			if (real.has(ins.P1) || real.has(ins.P3)) && affinity(ins.P5&p5AffMask) != affText && in(ins.P1) && in(ins.P3) {
 				cond := vmCond[ins.Op]
 				if ins.P5&p5StoreP2 == 0 {
-					out[pc], ok[pc] = jit.VInsn{Op: jit.VFCmpJump, A: ins.P1, B: ins.P3, T: ins.P2, Cond: cond}, true
+					lower(pc, jit.VInsn{Op: jit.VFCmpJump, A: ins.P1, B: ins.P3, T: ins.P2, Cond: cond})
 				} else if in(ins.P2) {
-					out[pc], ok[pc] = jit.VInsn{Op: jit.VFCmpSet, A: ins.P1, B: ins.P3, C: ins.P2, Cond: cond}, true
+					lower(pc, jit.VInsn{Op: jit.VFCmpSet, A: ins.P1, B: ins.P3, C: ins.P2, Cond: cond})
 				}
 			}
 			if ins.P5&p5StoreP2 != 0 {
@@ -107,7 +115,7 @@ func vmRealLowering(prog *Program, storesReal, storesText func(root uint32, col 
 		case OpFunction:
 			v, isReal := vmRealCall(ins, real, in)
 			if v.Op != jit.VExit {
-				out[pc], ok[pc] = v, true
+				lower(pc, v)
 			}
 			set(ins.P3, isReal)
 		}
@@ -117,13 +125,13 @@ func vmRealLowering(prog *Program, storesReal, storesText func(root uint32, col 
 
 // vmRealCall lowers a call to a math function or abs(): its VMath, or VExit
 // where none applies; isReal is whether the call answers a REAL.
-func vmRealCall(ins *Instruction, real map[int]bool, in func(int) bool) (jit.VInsn, bool) {
+func vmRealCall(ins *Instruction, real vmRegs, in func(int) bool) (jit.VInsn, bool) {
 	exit := jit.VInsn{Op: jit.VExit}
 	name, isName := ins.P4.(string)
 	if !isName || !in(ins.P3) || (ins.P2 > 0 && (!in(ins.P1) || !in(ins.P1+ins.P2-1))) {
 		return exit, false
 	}
-	argReal := ins.P2 >= 1 && real[ins.P1]
+	argReal := ins.P2 >= 1 && real.has(ins.P1)
 	switch name {
 	case "pi":
 		if ins.P2 == 0 {
@@ -172,3 +180,15 @@ var vmAbsKernel = func() func() *fir.Func {
 		return f
 	}
 }()
+
+// vmRegs is a flag per register of a program. A number outside its registers
+// is never flagged, and flagging one does nothing.
+type vmRegs []bool
+
+func (s vmRegs) has(r int) bool { return r >= 0 && r < len(s) && s[r] }
+
+func (s vmRegs) put(r int, v bool) {
+	if r >= 0 && r < len(s) {
+		s[r] = v
+	}
+}
