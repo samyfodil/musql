@@ -737,6 +737,13 @@ export declare type CreateTokenRequest = Message<"cloud.v1.CreateTokenRequest"> 
    * @generated from field: google.protobuf.Timestamp expires_at = 5;
    */
   expiresAt?: Timestamp | undefined;
+
+  /**
+   * Limits the token to these actions; none leaves it unlimited.
+   *
+   * @generated from field: repeated cloud.v1.TokenPermission permissions = 6;
+   */
+  permissions: TokenPermission[];
 };
 
 /**
@@ -744,6 +751,33 @@ export declare type CreateTokenRequest = Message<"cloud.v1.CreateTokenRequest"> 
  * Use `create(CreateTokenRequestSchema)` to create a new message.
  */
 export declare const CreateTokenRequestSchema: GenMessage<CreateTokenRequest>;
+
+/**
+ * TokenPermission grants actions on tables, as Turso's fine-grained
+ * permissions do. Actions are data_read, data_add, data_update, data_delete,
+ * schema_add, schema_update and schema_delete.
+ *
+ * @generated from message cloud.v1.TokenPermission
+ */
+export declare type TokenPermission = Message<"cloud.v1.TokenPermission"> & {
+  /**
+   * Every table when empty.
+   *
+   * @generated from field: repeated string tables = 1;
+   */
+  tables: string[];
+
+  /**
+   * @generated from field: repeated string actions = 2;
+   */
+  actions: string[];
+};
+
+/**
+ * Describes the message cloud.v1.TokenPermission.
+ * Use `create(TokenPermissionSchema)` to create a new message.
+ */
+export declare const TokenPermissionSchema: GenMessage<TokenPermission>;
 
 /**
  * @generated from message cloud.v1.CreateTokenResponse

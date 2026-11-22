@@ -1,7 +1,3 @@
-import "@fontsource-variable/geist";
-import "@fontsource-variable/geist-mono";
-import { createRoot } from "react-dom/client";
-import App from "./App.jsx";
-import "./style.css";
+import { createConsole } from "./index.js";
 
-createRoot(document.getElementById("app")).render(<App />);
+createConsole(document.getElementById("app"), {});

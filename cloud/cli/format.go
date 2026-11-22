@@ -127,3 +127,20 @@ func parseTime(s string) (*timestamppb.Timestamp, error) {
 	}
 	return nil, fmt.Errorf("bad timestamp %q: use RFC 3339, e.g. 2026-10-23T12:00:00Z", s)
 }
+
+// parsePermissions reads turso's -p flags: <table|all>:<action>,...
+func parsePermissions(flags []string) ([]*v1.TokenPermission, error) {
+	var out []*v1.TokenPermission
+	for _, f := range flags {
+		table, actions, ok := strings.Cut(f, ":")
+		if !ok || table == "" || actions == "" {
+			return nil, fmt.Errorf("invalid permission format: %q (want <table|all>:<action>,...)", f)
+		}
+		p := &v1.TokenPermission{Actions: strings.Split(actions, ",")}
+		if table != "all" {
+			p.Tables = []string{table}
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}

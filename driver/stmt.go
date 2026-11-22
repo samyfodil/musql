@@ -16,6 +16,12 @@ type Stmt struct {
 	sqlText string
 	info    engine.ParamInfo
 	isQuery bool
+	// authGen is the connection's authorizer generation s was last authorized
+	// under; authSQL is the text its authorizer rewrote it to ("" for none),
+	// and authSkip a statement the authorizer made do nothing.
+	authGen  uint64
+	authSQL  string
+	authSkip bool
 	// argBuf is the bound-argument slice an Exec of this statement reuses (see
 	// execContextImpl): one []engine.Value per call is 280 bytes of every
 	// prepared INSERT in a loop. database/sql serialises calls on a driver
@@ -94,6 +100,13 @@ func (s *Stmt) execContextImpl(ctx context.Context, args []driver.NamedValue) (_
 	if s.script != nil {
 		return s.execScript(ctx)
 	}
+	text, skip, err := s.authorize()
+	if err != nil {
+		return nil, err
+	}
+	if skip {
+		return s.skippedResult(), nil
+	}
 	// An Exec that is not a query and returns no rows binds into the statement's
 	// own buffer: nothing keeps the slice after execArgs returns (the engine
 	// copies each Value into a register or a row; the bytes it keeps are
@@ -116,7 +129,7 @@ func (s *Stmt) execContextImpl(ctx context.Context, args []driver.NamedValue) (_
 		// RETURNING statement that is exactly what the oracle reports as
 		// RowsAffected; see below.
 		prevChanges := s.conn.changes
-		rows, qerr := s.conn.queryArgs(s.sqlText, eargs)
+		rows, qerr := s.conn.queryArgs(text, eargs)
 		if qerr != nil {
 			return nil, qerr
 		}
@@ -132,7 +145,7 @@ func (s *Stmt) execContextImpl(ctx context.Context, args []driver.NamedValue) (_
 		return &execResult{rowsAffected: ra, lastInsertID: s.conn.lastInsertRowid}, nil
 	}
 	s.conn.resultDiscarded = true
-	_, err = s.conn.execArgs(s.sqlText, eargs)
+	_, err = s.conn.execArgs(text, eargs)
 	s.conn.resultDiscarded = false
 	if reuse {
 		clear(eargs)
@@ -153,11 +166,18 @@ func (s *Stmt) queryContextImpl(ctx context.Context, args []driver.NamedValue) (
 		// A script must be Exec'd; Query can only return one result set.
 		return nil, fmt.Errorf("driver: a multi-statement script must be run with Exec, not Query: %s", s.sqlText)
 	}
+	text, skip, err := s.authorize()
+	if err != nil {
+		return nil, err
+	}
+	if skip {
+		return &Rows{}, nil
+	}
 	eargs, err := bindArgs(s.info, args)
 	if err != nil {
 		return nil, err
 	}
-	return s.conn.queryArgs(s.sqlText, eargs)
+	return s.conn.queryArgs(text, eargs)
 }
 
 // valuesToNamed converts positional driver.Value args to []driver.NamedValue.

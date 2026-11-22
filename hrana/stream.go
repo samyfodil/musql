@@ -22,6 +22,7 @@ import (
 	"unsafe"
 
 	musqldriver "github.com/samyfodil/musql/driver"
+	"github.com/samyfodil/musql/engine"
 	pb "github.com/samyfodil/musql/hrana/gen/hrana"
 )
 
@@ -82,7 +83,10 @@ func newStream(ctx context.Context, db *sql.DB, sqls *sqlStore, observe func(Stm
 	return &stream{conn: c, sqls: sqls, observe: observe}, nil
 }
 
-func (s *stream) close() error { return s.conn.Close() }
+func (s *stream) close() error {
+	s.setAuthorizer(nil) // the connection goes back to the pool
+	return s.conn.Close()
+}
 
 // state reads the connection's change counters and autocommit state.
 func (s *stream) state() (changes, total, lastID int64, autocommit bool) {
@@ -445,6 +449,9 @@ func toError(err error) *pb.Error {
 		return &pb.Error{Message: be.Error(), Code: ptr("BLOCKED")}
 	}
 	msg := err.Error()
+	if errors.Is(err, engine.ErrAuth) {
+		return &pb.Error{Message: msg, Code: ptr("SQLITE_AUTH")}
+	}
 	return &pb.Error{Message: msg, Code: ptr(errorCode(msg))}
 }
 

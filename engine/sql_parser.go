@@ -126,6 +126,11 @@ type parser struct {
 	// "X IS [NOT] TRUE/FALSE" to defaultClauseIsBool's desugar. Never reset: a
 	// DEFAULT cannot contain a subquery or nested SELECT.
 	inColumnDefault bool
+
+	// authSpans, set only by an authorizer's parse (authorizer.go), collects
+	// the span of every column reference and function call, which each node
+	// numbers in its authRef.
+	authSpans *[]byteSpan
 }
 
 func newParser(src string, toks []token) *parser {
@@ -1404,13 +1409,15 @@ func (p *parser) parseSelectList() ([]SelectColumn, error) {
 	var cols []SelectColumn
 	for {
 		if p.peekIsPunct("*") {
+			start := p.toks[p.pos].Start
 			p.next()
-			cols = append(cols, SelectColumn{Star: true})
+			cols = append(cols, SelectColumn{Star: true, authRef: p.authSpan(start)})
 		} else if qualifier, ok := p.peekQualifiedStar(); ok {
+			start := p.toks[p.pos].Start
 			p.next() // qualifier ident
 			p.next() // "."
 			p.next() // "*"
-			cols = append(cols, SelectColumn{Star: true, StarQualifier: qualifier})
+			cols = append(cols, SelectColumn{Star: true, StarQualifier: qualifier, authRef: p.authSpan(start)})
 		} else {
 			start := p.pos
 			done := p.shapeResultColumn()
@@ -4484,8 +4491,15 @@ func (p *parser) parsePrimary() (Expr, error) {
 			}
 			if (name == "iif" || name == "if") && !star && !distinct && len(fe.OrderBy) == 0 &&
 				fe.Filter == nil && fe.Over == nil && len(args) >= 2 {
-				return rewriteIifToCase(args), nil
+				ce := rewriteIifToCase(args)
+				ce.iif = fe.NameAsWritten
+				if ce.iif == "" {
+					ce.iif = name
+				}
+				ce.authRef = p.authSpan(t.Start)
+				return ce, nil
 			}
+			fe.authRef = p.authSpan(t.Start)
 			return fe, nil
 		}
 		// CURRENT_DATE / CURRENT_TIME / CURRENT_TIMESTAMP are keywords in expression
@@ -4501,11 +4515,11 @@ func (p *parser) parsePrimary() (Expr, error) {
 		if !t.quoted {
 			switch t.upper() {
 			case "CURRENT_DATE":
-				return FuncExpr{Name: "date", CurrentTimeKw: true}, nil
+				return FuncExpr{Name: "date", CurrentTimeKw: true, authRef: p.authSpan(t.Start)}, nil
 			case "CURRENT_TIME":
-				return FuncExpr{Name: "time", CurrentTimeKw: true}, nil
+				return FuncExpr{Name: "time", CurrentTimeKw: true, authRef: p.authSpan(t.Start)}, nil
 			case "CURRENT_TIMESTAMP":
-				return FuncExpr{Name: "datetime", CurrentTimeKw: true}, nil
+				return FuncExpr{Name: "datetime", CurrentTimeKw: true, authRef: p.authSpan(t.Start)}, nil
 			}
 		}
 		name := t.text
@@ -4537,11 +4551,11 @@ func (p *parser) parsePrimary() (Expr, error) {
 				if !ok {
 					return nil, fmt.Errorf("engine: expected column name after '.', got %q", p.tokenDesc(col3))
 				}
-				return ColumnExpr{Schema: name, Qualifier: colName, Name: col3Name}, nil
+				return ColumnExpr{Schema: name, Qualifier: colName, Name: col3Name, authRef: p.authSpan(t.Start)}, nil
 			}
-			return ColumnExpr{Qualifier: name, Name: colName}, nil
+			return ColumnExpr{Qualifier: name, Name: colName, authRef: p.authSpan(t.Start)}, nil
 		}
-		return ColumnExpr{Name: name, FallbackLiteral: identLiteralFallback(t), R32NDQSpan: p.r32nDQSpan(t)}, nil
+		return ColumnExpr{Name: name, FallbackLiteral: identLiteralFallback(t), R32NDQSpan: p.r32nDQSpan(t), authRef: p.authSpan(t.Start)}, nil
 
 	default:
 		if t.kind == tkEOF {
@@ -4602,9 +4616,23 @@ func (p *parser) parseQualifiedNameRef() (Expr, error) {
 		if !ok {
 			return nil, fmt.Errorf("engine: expected column name after '.', got %q", p.tokenDesc(third))
 		}
-		return ColumnExpr{Schema: name, Qualifier: secondName, Name: thirdName}, nil
+		return ColumnExpr{Schema: name, Qualifier: secondName, Name: thirdName, authRef: p.authSpan(first.Start)}, nil
 	}
-	return ColumnExpr{Qualifier: name, Name: secondName}, nil
+	return ColumnExpr{Qualifier: name, Name: secondName, authRef: p.authSpan(first.Start)}, nil
+}
+
+// authSpan records the span from start to the end of the last token consumed,
+// for an authorizer's parse; 0 otherwise.
+func (p *parser) authSpan(start int) int32 {
+	if p.authSpans == nil {
+		return 0
+	}
+	end := start
+	if p.pos > 0 {
+		end = p.toks[p.pos-1].End
+	}
+	*p.authSpans = append(*p.authSpans, byteSpan{start, end})
+	return int32(len(*p.authSpans))
 }
 
 // parseRaiseExpr parses RAISE(...), positioned at RAISE:
