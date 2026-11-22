@@ -911,6 +911,7 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		w.Get(e.curs)
 		w.I64(0)
 		w.StoreI64(cb + VCursorOffLast)
+		e.incSteps(in.A)
 		e.closeIf()
 	case VNext:
 		cb := uint32(in.A * VCursorSize)
@@ -954,6 +955,7 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		w.Get(e.curs)
 		w.Get(e.t1)
 		w.StoreI64(cb + VCursorOffLast)
+		e.incSteps(in.A)
 		e.jump(in.T)
 		e.closeIf()
 	default:

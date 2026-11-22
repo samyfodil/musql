@@ -136,6 +136,21 @@ func TestStoreFailuresAreInternal(t *testing.T) {
 		{"usage_queries", map[string]func() error{
 			"a db's stats": func() error { return errOf(dbs.Stats(ctx, auth(e.admin, &v1.StatsRequest{Org: "acme", Name: "app"}))) },
 		}},
+		{"deleted_databases", map[string]func() error{
+			"delete a db": func() error {
+				return errOf(dbs.Delete(ctx, auth(e.admin, &v1.DeleteDatabaseRequest{Org: "acme", Name: "app"})))
+			},
+			"list deleted": func() error { return errOf(dbs.ListDeleted(ctx, auth(e.admin, &v1.ListDeletedRequest{Org: "acme"}))) },
+			"restore a db": func() error {
+				return errOf(dbs.RestoreDeleted(ctx, auth(e.admin, &v1.RestoreDeletedRequest{Org: "acme", Id: "x"})))
+			},
+			"delete an org": func() error { return errOf(orgs.Delete(ctx, auth(e.admin, &v1.DeleteOrgRequest{Org: "doomed"}))) },
+		}},
+		{"deleted_groups", map[string]func() error{
+			"restore a group": func() error {
+				return errOf(dbs.RestoreDeleted(ctx, auth(e.admin, &v1.RestoreDeletedRequest{Org: "acme", Id: "x"})))
+			},
+		}},
 	} {
 		restore := e.breakTable(tc.table)
 		for name, f := range tc.calls {

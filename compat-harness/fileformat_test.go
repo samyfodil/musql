@@ -72,19 +72,13 @@ func TestFileFormatInterop(t *testing.T) {
 // (possibly different engines), all operate on the exact same on-disk file.
 func runWithDSN(t *testing.T, engine, dsn string, stmts []string) []map[string]any {
 	t.Helper()
-	f, err := os.CreateTemp(t.TempDir(), "stmts-*.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	enc, _ := json.Marshal(stmts)
-	f.Write(enc)
-	f.Close()
+	stmtsFile := writeStmts(t, stmts)
 
-	cmd := exec.Command(workerBin[engine], f.Name())
+	cmd := exec.Command(workerBin[engine], stmtsFile)
 	cmd.Env = append(os.Environ(), "COMPAT_DSN="+dsn)
 	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("%s worker failed: %v", engine, err)
+		t.Fatalf("%s worker failed: %s", engine, workerFailure(err))
 	}
 	var res []map[string]any
 	if err := json.Unmarshal(out, &res); err != nil {

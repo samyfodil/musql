@@ -182,7 +182,7 @@ func segAttachRowFilter(in []Instruction, at, cursor int) bool {
 	// last attempt's, when it lowered without the guess.
 	var plain *segLowered
 	for j := at + 1; j < nextAt; j++ {
-		if (in[j].Op != OpIfNot && in[j].Op != OpIf) || in[j].P2 != nextAt {
+		if (in[j].Op != OpIfNot && in[j].Op != OpIf) || in[j].P2 != nextAt || j+1 == nextAt {
 			continue
 		}
 		low, lowers := segBodyLowers(in[at+1:j+1], at+1, cursor, j+1, guess)

@@ -180,6 +180,18 @@ export declare type Group = Message<"cloud.v1.Group"> & {
    * @generated from field: cloud.v1.DatabaseType type = 6;
    */
   type: DatabaseType;
+
+  /**
+   * While set, the group cannot be deleted.
+   *
+   * @generated from field: bool delete_protection = 7;
+   */
+  deleteProtection: boolean;
+
+  /**
+   * @generated from field: string id = 8;
+   */
+  id: string;
 };
 
 /**
@@ -251,6 +263,26 @@ export declare type Database = Message<"cloud.v1.Database"> & {
    * @generated from field: cloud.v1.Durability durability = 12;
    */
   durability: Durability;
+
+  /**
+   * While set, the database cannot be deleted.
+   *
+   * @generated from field: bool delete_protection = 13;
+   */
+  deleteProtection: boolean;
+
+  /**
+   * Hrana refuses every statement while block_reads is set, and every
+   * statement that writes while block_writes is, with the error code BLOCKED.
+   *
+   * @generated from field: bool block_reads = 14;
+   */
+  blockReads: boolean;
+
+  /**
+   * @generated from field: bool block_writes = 15;
+   */
+  blockWrites: boolean;
 };
 
 /**
@@ -258,6 +290,70 @@ export declare type Database = Message<"cloud.v1.Database"> & {
  * Use `create(DatabaseSchema)` to create a new message.
  */
 export declare const DatabaseSchema: GenMessage<Database>;
+
+/**
+ * A database deleted and kept until expires_at, when it is removed with its
+ * history; until then RestoreDeleted brings it back.
+ *
+ * @generated from message cloud.v1.DeletedDatabase
+ */
+export declare type DeletedDatabase = Message<"cloud.v1.DeletedDatabase"> & {
+  /**
+   * @generated from field: cloud.v1.Database database = 1;
+   */
+  database?: Database | undefined;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp deleted_at = 2;
+   */
+  deletedAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp expires_at = 3;
+   */
+  expiresAt?: Timestamp | undefined;
+
+  /**
+   * Set when it was deleted with its group: restoring the group restores it.
+   *
+   * @generated from field: string deleted_with_group = 4;
+   */
+  deletedWithGroup: string;
+};
+
+/**
+ * Describes the message cloud.v1.DeletedDatabase.
+ * Use `create(DeletedDatabaseSchema)` to create a new message.
+ */
+export declare const DeletedDatabaseSchema: GenMessage<DeletedDatabase>;
+
+/**
+ * A deleted group, kept with the databases deleted with it.
+ *
+ * @generated from message cloud.v1.DeletedGroup
+ */
+export declare type DeletedGroup = Message<"cloud.v1.DeletedGroup"> & {
+  /**
+   * @generated from field: cloud.v1.Group group = 1;
+   */
+  group?: Group | undefined;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp deleted_at = 2;
+   */
+  deletedAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp expires_at = 3;
+   */
+  expiresAt?: Timestamp | undefined;
+};
+
+/**
+ * Describes the message cloud.v1.DeletedGroup.
+ * Use `create(DeletedGroupSchema)` to create a new message.
+ */
+export declare const DeletedGroupSchema: GenMessage<DeletedGroup>;
 
 /**
  * @generated from enum cloud.v1.Role

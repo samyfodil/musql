@@ -35,6 +35,11 @@ import (
 // (compileScanGroupBy / compileScanGroupByHash) and the drain reads them from the
 // sorter record (select.c:8657).
 type aggPlan struct {
+	// cStreams is set on a GROUP BY over one table whose loop C walks in
+	// group order (sqlite3WhereIsOrdered), emitting each group as it ends: what
+	// it reads stops at the LIMIT (hashAggState.streamReads).
+	cStreams bool
+
 	// rowFree is set when no step reads the scanned row itself: every
 	// argument is lowered to a register, and nothing keeps or checks an anchor
 	// row (no bare column, no subquery reading it, no anchor certificate, no
