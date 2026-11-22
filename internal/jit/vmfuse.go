@@ -41,7 +41,9 @@ func VFusable(prev, next VInsn) bool {
 	if next.Op == VIf && (prev.Op == VCmpSet || prev.Op == VFCmpSet || prev.Op == VNot) && next.A == prev.C {
 		return true
 	}
-	ps, ns := vmStepOf(prev, 0), vmStepOf(next, 1)
+	var a [16]int
+	ps, buf := vmStepInto(a[:0], prev, 0)
+	ns, _ := vmStepInto(buf, next, 1)
 	for _, d := range ps.defs {
 		if slicesContains(ns.uses, d) {
 			return true
@@ -55,67 +57,80 @@ func VFusable(prev, next VInsn) bool {
 // runs it (an exit hands the same instruction to the VDBE). An instruction
 // with no native form reads every register: it is VDBE code, which may.
 func vmStepOf(in VInsn, pc int) progStep {
+	s, _ := vmStepInto(nil, in, pc)
+	return s
+}
+
+// vmStepInto is vmStepOf with the step's registers and targets appended to
+// buf, so the steps of a whole program share one array; it returns the grown
+// buf. Taking buf by value lets a caller's stack array stay on the stack.
+func vmStepInto(buf []int, in VInsn, pc int) (progStep, []int) {
+	put := func(xs ...int) []int {
+		i := len(buf)
+		buf = append(buf, xs...)
+		return buf[i:len(buf):len(buf)]
+	}
 	s := progStep{fall: vmFalls(in.Op)}
 	switch in.Op {
 	case VGoto:
-		s.targets = []int{in.T}
+		s.targets = put(in.T)
 	case VInt:
-		s.defs = []int{in.A}
+		s.defs = put(in.A)
 	case VCopy:
-		s.uses, s.defs = []int{in.A}, []int{in.B}
+		s.uses, s.defs = put(in.A), put(in.B)
 	case VAdd, VSub, VMul, VAnd, VOr, VShl, VShr, VDiv, VRem, VCmpSet, VFAdd, VFSub, VFMul, VFDiv, VFCmpSet:
-		s.uses, s.defs = []int{in.A, in.B}, []int{in.C}
+		s.uses, s.defs = put(in.A, in.B), put(in.C)
 	case VCmpJump, VFCmpJump:
-		s.uses, s.targets = []int{in.A, in.B}, []int{in.T}
+		s.uses, s.targets = put(in.A, in.B), put(in.T)
 	case VCmpBr, VFCmpBr:
-		s.uses, s.defs, s.targets = []int{in.A, in.B}, []int{in.C}, []int{in.T}
+		s.uses, s.defs, s.targets = put(in.A, in.B), put(in.C), put(in.T)
 	case VReal, VText:
-		s.defs = []int{in.A}
+		s.defs = put(in.A)
 	case VMath:
-		s.uses, s.defs = []int{in.A}, []int{in.C}
+		s.uses, s.defs = put(in.A), put(in.C)
 		if in.B == 2 {
 			s.uses = append(s.uses, in.A+1)
 		}
 	case VSubstr:
-		s.uses, s.defs = []int{in.A, in.A + 1, in.A + 2}, []int{in.C}
+		s.uses, s.defs = put(in.A, in.A+1, in.A+2), put(in.C)
 	case VTextCmpJump:
-		s.uses, s.targets = []int{in.A, in.B}, []int{in.T}
+		s.uses, s.targets = put(in.A, in.B), put(in.T)
 	case VTextCmpSet, VLike:
-		s.uses, s.defs = []int{in.A, in.B}, []int{in.C}
+		s.uses, s.defs = put(in.A, in.B), put(in.C)
 	case VInSub:
-		s.uses, s.defs = []int{in.A}, []int{in.C}
+		s.uses, s.defs = put(in.A), put(in.C)
 	case VNotBr:
-		s.uses, s.defs, s.targets = []int{in.A}, []int{in.C}, []int{in.T}
+		s.uses, s.defs, s.targets = put(in.A), put(in.C), put(in.T)
 	case VNullJump, VIf:
-		s.uses, s.targets = []int{in.A}, []int{in.T}
+		s.uses, s.targets = put(in.A), put(in.T)
 	case VIntGuard:
-		s.uses = []int{in.A}
+		s.uses = put(in.A)
 	case VGuardCopy:
-		s.uses, s.defs = []int{in.A, in.C}, []int{in.B}
+		s.uses, s.defs = put(in.A, in.C), put(in.B)
 	case VNull:
-		s.defs = []int{in.C}
+		s.defs = put(in.C)
 	case VNeg, VNot:
-		s.uses, s.defs = []int{in.A}, []int{in.C}
+		s.uses, s.defs = put(in.A), put(in.C)
 	case VGosub:
 		// The subroutine's VReturn (which reads everything) comes back to
 		// pc+1; the return address is a def.
-		s.defs, s.targets = []int{in.A}, []int{in.T}
+		s.defs, s.targets = put(in.A), put(in.T)
 	case VColumn, VRowid:
-		s.defs = []int{in.C}
+		s.defs = put(in.C)
 	case VInSet:
 		// The keys from B on are written by the VDBE only, whose exits read
 		// every register.
-		s.uses, s.defs = []int{in.A, int(in.Imm)}, []int{in.C}
+		s.uses, s.defs = put(in.A, int(in.Imm)), put(in.C)
 	case VRewind, VNext:
-		s.targets = []int{in.T}
+		s.targets = put(in.T)
 	case VSeekRowid, VSeekIdx:
-		s.uses, s.targets = []int{in.B}, []int{in.T}
+		s.uses, s.targets = put(in.B), put(in.T)
 	case VSortSeek:
-		s.uses = []int{in.B}
+		s.uses = put(in.B)
 	case VSortEmpty:
-		s.targets = []int{in.T}
+		s.targets = put(in.T)
 	case VInText:
-		s.uses, s.defs = []int{in.A}, []int{in.C}
+		s.uses, s.defs = put(in.A), put(in.C)
 	case VSeekRewind, VNullRow:
 	case VOpen, VClose:
 	case VResultRow:
@@ -138,7 +153,7 @@ func vmStepOf(in VInsn, pc int) progStep {
 		// to Go.
 		s.useAll = true
 	}
-	return s
+	return s, buf
 }
 
 // vmLiveness returns, per pc, the registers live after it. Past the end of the
@@ -146,16 +161,16 @@ func vmStepOf(in VInsn, pc int) progStep {
 // reads a program's result registers after it halts.
 func vmLiveness(prog []VInsn, nReg int) []regSet {
 	n := len(prog)
-	steps := make([]progStep, n)
-	for pc, in := range prog {
-		steps[pc] = vmStepOf(in, pc)
-	}
-	all := newRegSet(nReg)
+	steps := vmStepsOf(prog)
+	w := (nReg + 63) / 64
+	sets := make([]uint64, (2*n+2)*w)
+	set := func(i int) regSet { return regSet(sets[i*w : (i+1)*w : (i+1)*w]) }
+	all, in := set(2*n), set(2*n+1)
 	all.fill()
 	liveIn := make([]regSet, n)
 	liveOut := make([]regSet, n)
 	for i := range liveIn {
-		liveIn[i], liveOut[i] = newRegSet(nReg), newRegSet(nReg)
+		liveIn[i], liveOut[i] = set(2*i), set(2*i+1)
 	}
 	at := func(t int) regSet {
 		if t < 0 || t >= n {
@@ -179,7 +194,6 @@ func vmLiveness(prog []VInsn, nReg int) []regSet {
 			for _, t := range st.targets {
 				liveOut[i].union(at(t))
 			}
-			in := newRegSet(nReg)
 			copy(in, liveOut[i])
 			for _, r := range st.defs {
 				in.del(r)
@@ -207,10 +221,8 @@ func VMBoundaries(prog []VInsn, entry []bool) []bool {
 		if entry == nil || (pc < len(entry) && entry[pc]) {
 			b[pc] = true
 		}
-		for _, t := range vmStepOf(in, pc).targets {
-			if t >= 0 && t < n {
-				b[t] = true
-			}
+		if t, ok := vmTarget(in); ok && t >= 0 && t < n {
+			b[t] = true
 		}
 		if in.Op == VGosub {
 			b[pc+1] = true
@@ -430,7 +442,9 @@ func (k *vmKnow) setKonst(r int, v int64) {
 // wrote forgets the constants in the registers in writes, before it is
 // emitted.
 func (k *vmKnow) wrote(in VInsn, pc int) {
-	for _, r := range vmStepOf(in, pc).defs {
+	var a [8]int
+	st, _ := vmStepInto(a[:0], in, pc)
+	for _, r := range st.defs {
 		k.konst.del(r)
 	}
 }
@@ -496,7 +510,8 @@ func vmNextUse(prog []VInsn, bound []bool, from, r int) int {
 		if pc > from && vmRunStart(prog, bound, pc) {
 			return -1
 		}
-		st := vmStepOf(prog[pc], pc)
+		var a [8]int
+		st, _ := vmStepInto(a[:0], prog[pc], pc)
 		if st.useAll || slicesContains(st.uses, r) {
 			return pc
 		}
@@ -512,10 +527,8 @@ func vmNextUse(prog []VInsn, bound []bool, from, r int) int {
 func vmLoopHeads(prog []VInsn) []bool {
 	h := make([]bool, len(prog)+1)
 	for q, in := range prog {
-		for _, t := range vmStepOf(in, q).targets {
-			if t >= 0 && t <= q {
-				h[t] = true
-			}
+		if t, ok := vmTarget(in); ok && t >= 0 && t <= q {
+			h[t] = true
 		}
 	}
 	return h
@@ -532,10 +545,22 @@ func vmEmitNextUse(prog []VInsn, bound []bool, key, pc int) int {
 // same instructions again and again (vmEmitNextUseIn, vmEntryKeepInto).
 func vmStepsOf(prog []VInsn) []progStep {
 	steps := make([]progStep, len(prog))
+	buf := make([]int, 0, 3*len(prog))
 	for pc, in := range prog {
-		steps[pc] = vmStepOf(in, pc)
+		steps[pc], buf = vmStepInto(buf, in, pc)
 	}
 	return steps
+}
+
+// vmTarget is the place other than the next pc that in can send control to,
+// the one target of vmStepOf, without making the step.
+func vmTarget(in VInsn) (int, bool) {
+	switch in.Op {
+	case VGoto, VCmpJump, VFCmpJump, VCmpBr, VFCmpBr, VTextCmpJump, VNotBr, VNullJump, VIf,
+		VGosub, VRewind, VNext, VSeekRowid, VSeekIdx, VSortEmpty:
+		return in.T, true
+	}
+	return 0, false
 }
 
 // vmStepAt is pc's step, from steps when the caller made them.
@@ -757,14 +782,11 @@ func VReachesResultRow(prog []VInsn) []bool {
 			case VReturn:
 				r = retReach
 			default:
-				st := vmStepOf(in, pc)
-				if st.fall && pc+1 < n && reach[pc+1] {
+				if vmFalls(in.Op) && pc+1 < n && reach[pc+1] {
 					r = true
 				}
-				for _, t := range st.targets {
-					if t >= 0 && t < n && reach[t] {
-						r = true
-					}
+				if t, ok := vmTarget(in); ok && t >= 0 && t < n && reach[t] {
+					r = true
 				}
 			}
 			if r {
@@ -785,10 +807,8 @@ func VLoops(prog []VInsn) bool {
 		case VGosub, VReturn:
 			return true
 		}
-		for _, t := range vmStepOf(in, pc).targets {
-			if t <= pc {
-				return true
-			}
+		if t, ok := vmTarget(in); ok && t <= pc {
+			return true
 		}
 	}
 	return false
@@ -821,11 +841,12 @@ func VReachMarks(prog []VInsn, mark []int, nMarks int) [][]uint64 {
 		case VReturn:
 			succ[pc] = returns
 		default:
-			st := vmStepOf(in, pc)
-			if st.fall {
+			if vmFalls(in.Op) {
 				succ[pc] = append(succ[pc], pc+1)
 			}
-			succ[pc] = append(succ[pc], st.targets...)
+			if t, ok := vmTarget(in); ok {
+				succ[pc] = append(succ[pc], t)
+			}
 		}
 	}
 	for changed := true; changed; {

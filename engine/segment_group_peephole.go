@@ -47,7 +47,7 @@ func segGroupPeephole(prog *Program) bool {
 	guardAt := 2
 	for i := 2; i < rewindAt; i++ {
 		switch in[i].Op {
-		case OpSeekRowidHint, OpSeekRowidSetHint, OpSeekIndexHint, OpSeekRowidRangeHint:
+		case OpSeekRowidHint, OpSeekRowidSetHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpRowidReadBound:
 			guardAt = i + 1
 		}
 	}
@@ -136,7 +136,7 @@ func segGroupPeephole(prog *Program) bool {
 		}
 		for i := 2; i < rewindAt; i++ {
 			switch in[i].Op {
-			case OpAutoIndexOrder, OpSeekRowidHint, OpSeekRowidSetHint, OpSeekIndexHint, OpSeekRowidRangeHint:
+			case OpAutoIndexOrder, OpSeekRowidHint, OpSeekRowidSetHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpRowidReadBound:
 				return false
 			}
 		}

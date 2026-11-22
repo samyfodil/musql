@@ -31,6 +31,9 @@ type stream struct {
 	conn    *sql.Conn
 	sqls    *sqlStore
 	observe func(Stmt)
+	// ro is a stream on the read-only database; block is WithBlock's check.
+	ro    bool
+	block func() Block
 }
 
 // sqlStore is the SQL texts stored with store_sql.
@@ -115,7 +118,12 @@ func (s *stream) sqlOf(sqlText *string, sqlID *int32) (string, error) {
 }
 
 // execute runs one statement; rows are kept only when want_rows is not false.
-func (s *stream) execute(ctx context.Context, st *pb.Stmt) (*pb.StmtResult, error) {
+func (s *stream) execute(ctx context.Context, st *pb.Stmt) (_ *pb.StmtResult, err error) {
+	b, err := s.gate()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { err = b.refused(err) }()
 	q, err := s.sqlOf(st.Sql, st.SqlId)
 	if err != nil {
 		return nil, err
@@ -130,7 +138,8 @@ func (s *stream) execute(ctx context.Context, st *pb.Stmt) (*pb.StmtResult, erro
 	return res, err
 }
 
-// run is execute's statement, also reporting the rows it returned and changed.
+// run is execute's statement, also reporting the rows it read and wrote
+// (Conn.RowCounts).
 // It runs on the musql connection itself and reads the rows as the driver
 // hands them over, sparing database/sql's allocations and goroutine; what
 // database/sql checks first (a done context, a named argument's name) is
@@ -154,6 +163,12 @@ func (s *stream) run(ctx context.Context, q string, st *pb.Stmt) (res *pb.StmtRe
 	err = s.conn.Raw(func(dc any) error {
 		mc := dc.(*musqldriver.Conn)
 		_, total0, _ := mc.ChangeState()
+		read0, written0 := mc.RowCounts()
+		start := time.Now()
+		defer func() {
+			read1, written1 := mc.RowCounts()
+			read, written = read1-read0, written1-written0
+		}()
 		rows, err := mc.QueryContext(ctx, q, args)
 		if err != nil {
 			return err
@@ -187,7 +202,6 @@ func (s *stream) run(ctx context.Context, q string, st *pb.Stmt) (res *pb.StmtRe
 			if err != nil {
 				return err
 			}
-			read++
 			if wantRows {
 				res.Rows = append(res.Rows, alloc.row(vals))
 			}
@@ -197,11 +211,13 @@ func (s *stream) run(ctx context.Context, q string, st *pb.Stmt) (res *pb.StmtRe
 			res.AffectedRowCount = uint64(changes)
 		}
 		res.LastInsertRowid = &lastID
-		written = total - total0
+		read1, written1 := mc.RowCounts()
+		res.RowsRead, res.RowsWritten = uint64(read1-read0), uint64(written1-written0)
+		res.QueryDurationMs = float64(time.Since(start).Microseconds()) / 1000
 		return nil
 	})
 	if err != nil {
-		return nil, read, 0, err
+		return nil, read, written, err
 	}
 	return res, read, written, nil
 }
@@ -281,7 +297,12 @@ func (s *stream) cond(c *pb.BatchCond, res *pb.BatchResult) bool {
 }
 
 // sequence runs a ";"-separated script, discarding results.
-func (s *stream) sequence(ctx context.Context, sqlText *string, sqlID *int32) error {
+func (s *stream) sequence(ctx context.Context, sqlText *string, sqlID *int32) (err error) {
+	b, err := s.gate()
+	if err != nil {
+		return err
+	}
+	defer func() { err = b.refused(err) }()
 	q, err := s.sqlOf(sqlText, sqlID)
 	if err != nil {
 		return err
@@ -290,19 +311,31 @@ func (s *stream) sequence(ctx context.Context, sqlText *string, sqlID *int32) er
 		_, err = s.conn.ExecContext(ctx, q)
 		return err
 	}
-	_, total0, _, _ := s.state()
+	read0, written0 := s.rowCounts()
 	start := time.Now()
 	_, err = s.conn.ExecContext(ctx, q)
 	d := time.Since(start)
-	_, total, _, _ := s.state()
-	s.observe(Stmt{SQL: q, Duration: d, RowsWritten: total - total0, Err: err})
+	read1, written1 := s.rowCounts()
+	s.observe(Stmt{SQL: q, Duration: d, RowsRead: read1 - read0, RowsWritten: written1 - written0, Err: err})
 	return err
+}
+
+// rowCounts is the connection's rows read and written so far.
+func (s *stream) rowCounts() (read, written int64) {
+	s.conn.Raw(func(dc any) error {
+		read, written = dc.(*musqldriver.Conn).RowCounts()
+		return nil
+	})
+	return
 }
 
 // describe reports a statement's parameters, and its columns when it only
 // reads (found by running it with every parameter NULL, which a read-only
 // statement does without side effects).
 func (s *stream) describe(ctx context.Context, sqlText *string, sqlID *int32) (*pb.DescribeResult, error) {
+	if _, err := s.gate(); err != nil {
+		return nil, err
+	}
 	q, err := s.sqlOf(sqlText, sqlID)
 	if err != nil {
 		return nil, err
@@ -358,6 +391,40 @@ func isReadonly(q string) bool {
 	return false
 }
 
+// blockedError is a statement WithBlock refused, reported to the client with
+// code BLOCKED.
+type blockedError struct{ reason string }
+
+func (e blockedError) Error() string {
+	if e.reason == "" {
+		return "Operation was blocked"
+	}
+	return "Operation was blocked: " + e.reason
+}
+
+// gate is the block a statement on s runs under, and the error that refuses
+// it outright: every statement while reads are blocked, and while writes are,
+// every statement on a stream that can write.
+func (s *stream) gate() (Block, error) {
+	if s.block == nil {
+		return Block{}, nil
+	}
+	b := s.block()
+	if b.Reads || b.Writes && !s.ro {
+		return b, blockedError{b.Reason}
+	}
+	return b, nil
+}
+
+// refused is err as a statement run under b reports it: a write the
+// read-only database refused while writes are blocked is blocked.
+func (b Block) refused(err error) error {
+	if err != nil && b.Writes && strings.Contains(err.Error(), "attempt to write a readonly database") {
+		return blockedError{b.Reason}
+	}
+	return err
+}
+
 // protocolError is a malformed request, reported to the client with code
 // HRANA_PROTO_ERROR.
 type protocolError struct{ msg string }
@@ -372,6 +439,10 @@ func toError(err error) *pb.Error {
 	var pe protocolError
 	if errors.As(err, &pe) {
 		return &pb.Error{Message: pe.msg, Code: ptr("HRANA_PROTO_ERROR")}
+	}
+	var be blockedError
+	if errors.As(err, &be) {
+		return &pb.Error{Message: be.Error(), Code: ptr("BLOCKED")}
 	}
 	msg := err.Error()
 	return &pb.Error{Message: msg, Code: ptr(errorCode(msg))}
