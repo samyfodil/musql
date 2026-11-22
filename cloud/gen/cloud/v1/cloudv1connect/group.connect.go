@@ -39,6 +39,8 @@ const (
 	GroupServiceCreateProcedure = "/cloud.v1.GroupService/Create"
 	// GroupServiceDeleteProcedure is the fully-qualified name of the GroupService's Delete RPC.
 	GroupServiceDeleteProcedure = "/cloud.v1.GroupService/Delete"
+	// GroupServiceUpdateProcedure is the fully-qualified name of the GroupService's Update RPC.
+	GroupServiceUpdateProcedure = "/cloud.v1.GroupService/Update"
 	// GroupServiceAddLocationProcedure is the fully-qualified name of the GroupService's AddLocation
 	// RPC.
 	GroupServiceAddLocationProcedure = "/cloud.v1.GroupService/AddLocation"
@@ -55,6 +57,7 @@ type GroupServiceClient interface {
 	List(context.Context, *connect.Request[v1.ListGroupsRequest]) (*connect.Response[v1.ListGroupsResponse], error)
 	Create(context.Context, *connect.Request[v1.CreateGroupRequest]) (*connect.Response[v1.CreateGroupResponse], error)
 	Delete(context.Context, *connect.Request[v1.DeleteGroupRequest]) (*connect.Response[v1.DeleteGroupResponse], error)
+	Update(context.Context, *connect.Request[v1.UpdateGroupRequest]) (*connect.Response[v1.UpdateGroupResponse], error)
 	AddLocation(context.Context, *connect.Request[v1.AddLocationRequest]) (*connect.Response[v1.AddLocationResponse], error)
 	RemoveLocation(context.Context, *connect.Request[v1.RemoveLocationRequest]) (*connect.Response[v1.RemoveLocationResponse], error)
 	ListLocations(context.Context, *connect.Request[v1.ListLocationsRequest]) (*connect.Response[v1.ListLocationsResponse], error)
@@ -89,6 +92,12 @@ func NewGroupServiceClient(httpClient connect.HTTPClient, baseURL string, opts .
 			connect.WithSchema(groupServiceMethods.ByName("Delete")),
 			connect.WithClientOptions(opts...),
 		),
+		update: connect.NewClient[v1.UpdateGroupRequest, v1.UpdateGroupResponse](
+			httpClient,
+			baseURL+GroupServiceUpdateProcedure,
+			connect.WithSchema(groupServiceMethods.ByName("Update")),
+			connect.WithClientOptions(opts...),
+		),
 		addLocation: connect.NewClient[v1.AddLocationRequest, v1.AddLocationResponse](
 			httpClient,
 			baseURL+GroupServiceAddLocationProcedure,
@@ -115,6 +124,7 @@ type groupServiceClient struct {
 	list           *connect.Client[v1.ListGroupsRequest, v1.ListGroupsResponse]
 	create         *connect.Client[v1.CreateGroupRequest, v1.CreateGroupResponse]
 	delete         *connect.Client[v1.DeleteGroupRequest, v1.DeleteGroupResponse]
+	update         *connect.Client[v1.UpdateGroupRequest, v1.UpdateGroupResponse]
 	addLocation    *connect.Client[v1.AddLocationRequest, v1.AddLocationResponse]
 	removeLocation *connect.Client[v1.RemoveLocationRequest, v1.RemoveLocationResponse]
 	listLocations  *connect.Client[v1.ListLocationsRequest, v1.ListLocationsResponse]
@@ -133,6 +143,11 @@ func (c *groupServiceClient) Create(ctx context.Context, req *connect.Request[v1
 // Delete calls cloud.v1.GroupService.Delete.
 func (c *groupServiceClient) Delete(ctx context.Context, req *connect.Request[v1.DeleteGroupRequest]) (*connect.Response[v1.DeleteGroupResponse], error) {
 	return c.delete.CallUnary(ctx, req)
+}
+
+// Update calls cloud.v1.GroupService.Update.
+func (c *groupServiceClient) Update(ctx context.Context, req *connect.Request[v1.UpdateGroupRequest]) (*connect.Response[v1.UpdateGroupResponse], error) {
+	return c.update.CallUnary(ctx, req)
 }
 
 // AddLocation calls cloud.v1.GroupService.AddLocation.
@@ -155,6 +170,7 @@ type GroupServiceHandler interface {
 	List(context.Context, *connect.Request[v1.ListGroupsRequest]) (*connect.Response[v1.ListGroupsResponse], error)
 	Create(context.Context, *connect.Request[v1.CreateGroupRequest]) (*connect.Response[v1.CreateGroupResponse], error)
 	Delete(context.Context, *connect.Request[v1.DeleteGroupRequest]) (*connect.Response[v1.DeleteGroupResponse], error)
+	Update(context.Context, *connect.Request[v1.UpdateGroupRequest]) (*connect.Response[v1.UpdateGroupResponse], error)
 	AddLocation(context.Context, *connect.Request[v1.AddLocationRequest]) (*connect.Response[v1.AddLocationResponse], error)
 	RemoveLocation(context.Context, *connect.Request[v1.RemoveLocationRequest]) (*connect.Response[v1.RemoveLocationResponse], error)
 	ListLocations(context.Context, *connect.Request[v1.ListLocationsRequest]) (*connect.Response[v1.ListLocationsResponse], error)
@@ -185,6 +201,12 @@ func NewGroupServiceHandler(svc GroupServiceHandler, opts ...connect.HandlerOpti
 		connect.WithSchema(groupServiceMethods.ByName("Delete")),
 		connect.WithHandlerOptions(opts...),
 	)
+	groupServiceUpdateHandler := connect.NewUnaryHandler(
+		GroupServiceUpdateProcedure,
+		svc.Update,
+		connect.WithSchema(groupServiceMethods.ByName("Update")),
+		connect.WithHandlerOptions(opts...),
+	)
 	groupServiceAddLocationHandler := connect.NewUnaryHandler(
 		GroupServiceAddLocationProcedure,
 		svc.AddLocation,
@@ -211,6 +233,8 @@ func NewGroupServiceHandler(svc GroupServiceHandler, opts ...connect.HandlerOpti
 			groupServiceCreateHandler.ServeHTTP(w, r)
 		case GroupServiceDeleteProcedure:
 			groupServiceDeleteHandler.ServeHTTP(w, r)
+		case GroupServiceUpdateProcedure:
+			groupServiceUpdateHandler.ServeHTTP(w, r)
 		case GroupServiceAddLocationProcedure:
 			groupServiceAddLocationHandler.ServeHTTP(w, r)
 		case GroupServiceRemoveLocationProcedure:
@@ -236,6 +260,10 @@ func (UnimplementedGroupServiceHandler) Create(context.Context, *connect.Request
 
 func (UnimplementedGroupServiceHandler) Delete(context.Context, *connect.Request[v1.DeleteGroupRequest]) (*connect.Response[v1.DeleteGroupResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("cloud.v1.GroupService.Delete is not implemented"))
+}
+
+func (UnimplementedGroupServiceHandler) Update(context.Context, *connect.Request[v1.UpdateGroupRequest]) (*connect.Response[v1.UpdateGroupResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("cloud.v1.GroupService.Update is not implemented"))
 }
 
 func (UnimplementedGroupServiceHandler) AddLocation(context.Context, *connect.Request[v1.AddLocationRequest]) (*connect.Response[v1.AddLocationResponse], error) {

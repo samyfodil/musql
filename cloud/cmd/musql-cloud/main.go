@@ -60,9 +60,14 @@ func main() {
 		return
 	}
 	// Every commit to a hosted database is logged for its history, and hosted
-	// databases may use FTS5, which the engine leaves opt-in.
+	// databases may use FTS5, dbstat and sqlean's functions, as a Turso
+	// database does, all of which the engine leaves opt-in.
 	engine.Configure(engine.WithCommitHook(store.OnCommit))
 	engine.RegisterFTS5()
+	engine.RegisterDBStat()
+	if err := engine.RegisterSQLean(); err != nil {
+		log.Fatal(err)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	logger := log.New(os.Stderr, "musql-cloud: ", log.LstdFlags)

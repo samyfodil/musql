@@ -301,9 +301,12 @@ func pragmaFunctionListRows() []pragmaFunctionListRow {
 	if _, ok := lookupVtabModule("fts5"); ok {
 		conn = pragmaFunctionListConnRowsFts5
 	}
-	rows := make([]pragmaFunctionListRow, 0, len(pragmaFunctionListBuiltinRows)+len(conn))
+	rows := make([]pragmaFunctionListRow, 0, len(pragmaFunctionListBuiltinRows)+len(conn)+len(sqleanFuncRows))
 	rows = append(rows, pragmaFunctionListBuiltinRows...)
-	return append(rows, conn...)
+	rows = append(rows, conn...)
+	// The sqlean families' functions, registered on the connection as a
+	// loaded extension's are (sqlean.go).
+	return append(rows, sqleanFuncRows...)
 }
 
 // pragmaFunctionListCols is the row shape both forms report.

@@ -349,13 +349,32 @@ func (a *app) groupCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		if !a.confirm(yes, "Delete group "+args[0]+"?") {
+		if !a.confirm(yes, "Delete group "+args[0]+" and its databases? They can be restored (db undelete) until the server's retention for deleted databases ends.") {
 			return fmt.Errorf("not deleted")
 		}
 		_, err = a.services.group.Delete(ctx, connect.NewRequest(&v1.DeleteGroupRequest{Org: org, Name: args[0]}))
 		return err
 	})
 	destroy.Flags().BoolVarP(&yes, "yes", "y", false, "do not ask")
+	var protect bool
+	var update *cobra.Command
+	update = a.cmd("update <name>", "Set a group's delete protection", cobra.ExactArgs(1), func(ctx context.Context, args []string) error {
+		org, err := a.orgSlug(ctx)
+		if err != nil {
+			return err
+		}
+		req := &v1.UpdateGroupRequest{Org: org, Name: args[0]}
+		if update.Flags().Changed("delete-protection") {
+			req.DeleteProtection = &protect
+		}
+		r, err := a.services.group.Update(ctx, connect.NewRequest(req))
+		if err != nil {
+			return err
+		}
+		a.printf("Group %s: delete protection %s\n", r.Msg.Group.Name, onOff(r.Msg.Group.DeleteProtection))
+		return nil
+	})
+	update.Flags().BoolVar(&protect, "delete-protection", false, "refuse deleting the group")
 	locs := a.cmd("list", "List the locations this server offers", cobra.NoArgs, func(ctx context.Context, args []string) error {
 		r, err := a.services.group.ListLocations(ctx, connect.NewRequest(&v1.ListLocationsRequest{}))
 		if err != nil {
@@ -391,6 +410,13 @@ func (a *app) groupCmd() *cobra.Command {
 		}
 		return nil
 	})
-	return group("group", "Manage groups and their locations", list, create, destroy,
+	return group("group", "Manage groups and their locations", list, create, destroy, update,
 		group("locations", "Manage locations", locs, add, rm))
+}
+
+func onOff(on bool) string {
+	if on {
+		return "on"
+	}
+	return "off"
 }

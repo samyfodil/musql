@@ -29,3 +29,11 @@ func (c *Conn) reportedDeclTypes(pager *engine.ReadOnlyPager, sqlText string, co
 func (c *Conn) ChangeState() (changes, totalChanges, lastInsertRowid int64) {
 	return c.changes, c.totalChanges, c.lastInsertRowid
 }
+
+// RowCounts is the rows this connection's statements have read and written,
+// counted as libSQL's LIBSQL_STMTSTATUS_ROWS_READ and ROWS_WRITTEN count them
+// (engine.RowCounter). Both only grow: a statement's own counts are the
+// difference across it, as with ChangeState's total.
+func (c *Conn) RowCounts() (read, written int64) {
+	return c.rows.Read, c.rows.Written
+}
