@@ -1469,6 +1469,26 @@ func (w *segJoinWalk) filterPassing(a segJoinArg, pass []bool) bool {
 	if len(read) == 1 && !slices.ContainsFunc(a.expr.insns, func(in Instruction) bool { return in.Op == OpRowid }) {
 		memo = newSegJoinMemo[bool]()
 	}
+	if memo != nil && ints != nil {
+		for r := range t.n {
+			if !pass[r] {
+				continue
+			}
+			if v, ok := memo.getInt(ints[r]); ok {
+				pass[r] = v
+				continue
+			}
+			row = int32(r)
+			v, ok := segJoinEvalRow(&vm, a.expr, column, func(*Instruction) Value { return t.value(row, -1) }, nil)
+			if !ok {
+				return false
+			}
+			keep := v.Typ != Null && isTruthy(v)
+			pass[r] = keep
+			memo.put(Value{Typ: Int, I: ints[r]}, keep)
+		}
+		return true
+	}
 	for r := range t.n {
 		if !pass[r] {
 			continue
@@ -1592,20 +1612,24 @@ func segJoinPlainInt(x Value) bool {
 
 func (m *segJoinMemo[T]) get(x Value) (T, bool) {
 	if segJoinPlainInt(x) {
-		if m.haveLast && m.last == x.I {
-			return m.lastV, true
-		}
-		v, ok := m.ints[x.I]
-		if ok {
-			m.haveLast, m.last, m.lastV = true, x.I, v
-		}
-		return v, ok
+		return m.getInt(x.I)
 	}
 	if segJoinPlainText(x) {
 		v, ok := m.texts[string(x.S)]
 		return v, ok
 	}
 	v, ok := m.vals[segJoinMemoKeyOf(x)]
+	return v, ok
+}
+
+func (m *segJoinMemo[T]) getInt(i int64) (T, bool) {
+	if m.haveLast && m.last == i {
+		return m.lastV, true
+	}
+	v, ok := m.ints[i]
+	if ok {
+		m.haveLast, m.last, m.lastV = true, i, v
+	}
 	return v, ok
 }
 
