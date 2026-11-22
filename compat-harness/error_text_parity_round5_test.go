@@ -181,6 +181,18 @@ func TestErrorTextParityRound5(t *testing.T) {
 		`CREATE VIRTUAL TABLE ftbad USING fts4(a, nosuchopt=1)`,
 		`CREATE VIRTUAL TABLE ftbad USING rtree(id)`,
 		`SELECT * FROM plain WHERE a MATCH 'x'`,
+		// A character that begins no token, and a statement that starts with a
+		// literal: C names the token as written.
+		`select 1::int`,
+		`select 1 {`,
+		`select 1 \`,
+		`::`,
+		`''`,
+		`'it''s'`,
+		`x'00'`,
+		`"q"`,
+		`[q]`,
+		`12`,
 	} {
 		q := q
 		t.Run(strings.NewReplacer(" ", "_", "(", "", ")", "", "'", "", "*", "star", "/", "-").Replace(q), func(t *testing.T) {
