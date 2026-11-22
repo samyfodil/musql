@@ -20,7 +20,7 @@ func vmTextLowering(prog *Program, storesText func(root uint32, col int) bool) (
 	}
 	n := len(prog.Insns)
 	tables := map[int]*resolvedTable{}
-	text := map[int]bool{}
+	text := make(vmRegs, prog.NReg)
 	// consts is the string literal a register holds, of those text says are
 	// TEXT, for a LIKE's pattern.
 	consts := map[int]string{}
@@ -29,17 +29,13 @@ func vmTextLowering(prog *Program, storesText func(root uint32, col int) bool) (
 	// of one. It is the last such write in program order, which may not be
 	// the one a run made (a CASE's arms); native code checks it at run time,
 	// so a wrong guess costs only an exit.
-	ints := map[int]vmIntTextSrc{}
+	ints := vmIntSrcs{v: make([]vmIntTextSrc, prog.NReg), has: make(vmRegs, prog.NReg)}
 	in := func(r int) bool { return r >= 0 && r < prog.NReg }
 	for pc := range prog.Insns {
 		ins := &prog.Insns[pc]
 		set := func(r int, isText bool) {
 			delete(consts, r)
-			if isText {
-				text[r] = true
-			} else {
-				delete(text, r)
-			}
+			text.put(r, isText)
 		}
 		switch ins.Op {
 		case OpOpenRead, OpOpenWrite:
@@ -63,7 +59,7 @@ func vmTextLowering(prog *Program, storesText func(root uint32, col int) bool) (
 				out[pc], ok[pc] = jit.VInsn{Op: jit.VText, A: ins.P2, B: len(str), Imm: int64(uintptr(unsafe.Pointer(unsafe.StringData(str))))}, true
 			}
 		case OpSCopy, OpCopy:
-			set(ins.P2, text[ins.P1])
+			set(ins.P2, text.has(ins.P1))
 			if str, isConst := consts[ins.P1]; isConst {
 				consts[ins.P2] = str
 			}
@@ -78,7 +74,7 @@ func vmTextLowering(prog *Program, storesText func(root uint32, col int) bool) (
 			set(ins.P2, false)
 		case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
 			coll, _ := ins.P4.(string)
-			if (text[ins.P1] || text[ins.P3]) && (coll == "" || strings.EqualFold(coll, "BINARY")) && in(ins.P1) && in(ins.P3) {
+			if (text.has(ins.P1) || text.has(ins.P3)) && (coll == "" || strings.EqualFold(coll, "BINARY")) && in(ins.P1) && in(ins.P3) {
 				if ok == nil {
 					out, ok = make([]jit.VInsn, n), make([]bool, n)
 				}
@@ -95,11 +91,11 @@ func vmTextLowering(prog *Program, storesText func(root uint32, col int) bool) (
 				if ok[pc] && jit.VMTextIntConst && !vmIntTextOffForTest && affinity(ins.P5&p5AffMask) == affText {
 					// Under TEXT affinity a number is compared with a TEXT as its
 					// text, which the VDBE makes on every row.
-					src, isInt := ints[ins.P1]
-					onA := isInt && text[ins.P3] && !text[ins.P1]
+					src, isInt := ints.get(ins.P1)
+					onA := isInt && text.has(ins.P3) && !text.has(ins.P1)
 					if !onA {
-						src, isInt = ints[ins.P3]
-						isInt = isInt && text[ins.P1] && !text[ins.P3]
+						src, isInt = ints.get(ins.P3)
+						isInt = isInt && text.has(ins.P1) && !text.has(ins.P3)
 					}
 					if isInt && len(srcs) < jit.MaxIntTexts {
 						if src.param == 0 {
@@ -116,27 +112,29 @@ func vmTextLowering(prog *Program, storesText func(root uint32, col int) bool) (
 		default:
 			// Any other write is not known to be a TEXT.
 			for _, r := range []int{ins.P2, ins.P3} {
-				if text[r] && writesReg(ins, r) {
-					delete(text, r)
+				if text.has(r) && writesReg(ins, r) {
+					text.put(r, false)
 					delete(consts, r)
 				}
 			}
 		}
-		switch a, b := ints[ins.P1], ints[ins.P2]; {
+		a, _ := ints.get(ins.P1)
+		b, _ := ints.get(ins.P2)
+		switch {
 		case ins.Op == OpInteger:
-			ints[ins.P2] = vmIntTextSrc{kind: jit.VIntTextInt, k: int64(ins.P1)}
+			ints.set(ins.P2, vmIntTextSrc{kind: jit.VIntTextInt, k: int64(ins.P1)})
 		case ins.Op == OpReal && isFloat64(ins.P4):
-			ints[ins.P2] = vmIntTextSrc{kind: jit.VIntTextReal, k: int64(math.Float64bits(ins.P4.(float64)))}
+			ints.set(ins.P2, vmIntTextSrc{kind: jit.VIntTextReal, k: int64(math.Float64bits(ins.P4.(float64)))})
 		case ins.Op == OpVariable && ins.P1 >= 1:
-			ints[ins.P2] = vmIntTextSrc{param: ins.P1}
+			ints.set(ins.P2, vmIntTextSrc{param: ins.P1})
 		case (ins.Op == OpSCopy || ins.Op == OpCopy && ins.P3 == 0) && hasSrc(ints, ins.P1):
-			ints[ins.P2] = a
+			ints.set(ins.P2, a)
 		case ins.Op == OpAdd && hasLiteral(ints, ins.P1, ins.P2) && (b.k >= 0) == (a.k+b.k >= a.k):
-			ints[ins.P3] = vmIntTextSrc{kind: jit.VIntTextInt, k: a.k + b.k}
+			ints.set(ins.P3, vmIntTextSrc{kind: jit.VIntTextInt, k: a.k + b.k})
 		default:
 			for _, r := range []int{ins.P2, ins.P3} {
 				if writesReg(ins, r) {
-					delete(ints, r)
+					ints.del(r)
 				}
 			}
 		}
@@ -159,16 +157,35 @@ func isFloat64(p4 any) bool {
 	return is
 }
 
-func hasSrc(ints map[int]vmIntTextSrc, r int) bool {
-	_, has := ints[r]
-	return has
+func hasSrc(ints vmIntSrcs, r int) bool { return ints.has.has(r) }
+
+// vmIntSrcs is vmTextLowering's expected number per register (vmRegs).
+type vmIntSrcs struct {
+	v   []vmIntTextSrc
+	has vmRegs
 }
+
+func (m vmIntSrcs) get(r int) (vmIntTextSrc, bool) {
+	if !m.has.has(r) {
+		return vmIntTextSrc{}, false
+	}
+	return m.v[r], true
+}
+
+func (m vmIntSrcs) set(r int, src vmIntTextSrc) {
+	if r >= 0 && r < len(m.v) {
+		m.v[r] = src
+		m.has[r] = true
+	}
+}
+
+func (m vmIntSrcs) del(r int) { m.has.put(r, false) }
 
 // hasLiteral reports whether each of rs is expected to hold an INTEGER
 // literal.
-func hasLiteral(ints map[int]vmIntTextSrc, rs ...int) bool {
+func hasLiteral(ints vmIntSrcs, rs ...int) bool {
 	for _, r := range rs {
-		if src, isInt := ints[r]; !isInt || src.param != 0 || src.kind != jit.VIntTextInt {
+		if src, isInt := ints.get(r); !isInt || src.param != 0 || src.kind != jit.VIntTextInt {
 			return false
 		}
 	}

@@ -295,9 +295,9 @@ func jsonStmtResult(r *pb.StmtResult) map[string]any {
 		"rows":               rows,
 		"affected_row_count": r.GetAffectedRowCount(),
 		"last_insert_rowid":  jsonRowid(r.LastInsertRowid),
-		"rows_read":          0,
-		"rows_written":       0,
-		"query_duration_ms":  0,
+		"rows_read":          r.GetRowsRead(),
+		"rows_written":       r.GetRowsWritten(),
+		"query_duration_ms":  r.GetQueryDurationMs(),
 	}
 }
 
