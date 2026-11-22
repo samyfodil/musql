@@ -1551,7 +1551,7 @@ func buildScopes(jts []joinedTable) []tableScope {
 		// doc comment, query.go): C SQLite errors "no such column:
 		// rowid"/"oid"/"_rowid_" against one just like it does for a
 		// derived table, verified directly.
-		scopes[i] = tableScope{name: jt.name, tableName: jt.tableName, cols: jt.tbl.cols, colIndex: buildColIndex(jt.tbl.cols), offset: jt.offset, coalesced: jt.coalesced, coalesceFallback: jt.coalesceFallback, coalesceRightAt: jt.coalesceRightAt, noRowid: jt.derived || jt.tbl.withoutRowid, nestedNonLeading: jt.nestedNonLeading}
+		scopes[i] = tableScope{name: jt.name, tableName: jt.tableName, cols: jt.tbl.cols, colIndex: jt.tbl.colIndex(), offset: jt.offset, coalesced: jt.coalesced, coalesceFallback: jt.coalesceFallback, coalesceRightAt: jt.coalesceRightAt, noRowid: jt.derived || jt.tbl.withoutRowid, nestedNonLeading: jt.nestedNonLeading}
 	}
 	return scopes
 }

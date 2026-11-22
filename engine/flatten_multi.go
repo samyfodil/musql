@@ -97,7 +97,7 @@ func (p *ReadOnlyPager) r41FlattenMultiItem(stmt *SelectStmt, i int, expand bool
 	// Each body item's name and column names.
 	type bodyItem struct {
 		name string
-		cols map[string]bool
+		cols map[string]int
 	}
 	parentNames := map[string]bool{}
 	for j, o := range stmt.From {
@@ -129,7 +129,7 @@ func (p *ReadOnlyPager) r41FlattenMultiItem(stmt *SelectStmt, i int, expand bool
 			return nil, false
 		}
 		name := b.Alias
-		var cols map[string]bool
+		var cols map[string]int
 		switch {
 		case b.Subquery != nil:
 			if name == "" {
@@ -203,13 +203,12 @@ func (p *ReadOnlyPager) r41FlattenMultiItem(stmt *SelectStmt, i int, expand bool
 				cols = names
 				break
 			}
-			cols = map[string]bool{}
 			for _, c := range tbl.cols {
 				if c.Hidden {
 					return nil, false
 				}
-				cols[r33sFoldIdent(c.Name)] = true
 			}
+			cols = tbl.colIndex()
 		}
 		l := r33sFoldIdent(name)
 		if parentNames[l] {
@@ -233,7 +232,7 @@ func (p *ReadOnlyPager) r41FlattenMultiItem(stmt *SelectStmt, i int, expand bool
 		if ce.Qualifier != "" {
 			q := r33sFoldIdent(ce.Qualifier)
 			for _, o := range items {
-				if o.name == q && o.cols[l] {
+				if _, has := o.cols[l]; has && o.name == q {
 					return ce, true
 				}
 			}
@@ -241,7 +240,7 @@ func (p *ReadOnlyPager) r41FlattenMultiItem(stmt *SelectStmt, i int, expand bool
 		}
 		found := ""
 		for _, o := range items {
-			if o.cols[l] {
+			if _, has := o.cols[l]; has {
 				if found != "" {
 					return nil, false
 				}

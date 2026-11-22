@@ -28,9 +28,9 @@ package engine
 // lookupName asks of it: does it answer to this qualifier, and does it supply
 // this column (or a rowid).
 type r36dItem struct {
-	name  string // folded alias/table name; "" for an unaliased derived table
-	cols  map[string]bool
-	rowid bool // VisibleRowid
+	name  string         // folded alias/table name; "" for an unaliased derived table
+	cols  map[string]int // folded names; the values are unused
+	rowid bool           // VisibleRowid
 }
 
 // r36dShadow is one nested FROM clause reduced to what lookupName needs to
@@ -43,15 +43,24 @@ type r36dItem struct {
 // "t.c" reaches the outer t and its bit stops i1(a,b) covering. (That
 // statement still declines here; the rule follows the C.)
 //
-// cols/rowid are the level-wide union an unqualified name sees. aliases is the
+// items/rowid are the level-wide union an unqualified name sees. aliases is the
 // SELECT's explicit result aliases: NC_UEList matches one after the SrcList
 // and rowid fallback miss, and resolveAlias substitutes the already-resolved
 // expression, so such a name adds no bit and must not climb.
 type r36dShadow struct {
 	items   []r36dItem
-	cols    map[string]bool
 	aliases map[string]bool
 	rowid   bool
+}
+
+// supplies reports whether any item of the level supplies the folded name.
+func (s r36dShadow) supplies(name string) bool {
+	for _, it := range s.items {
+		if _, ok := it.cols[name]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // r36dShadowOf reduces a nested SELECT's FROM clause to an r36dShadow, or false
@@ -79,7 +88,7 @@ type r36dShadow struct {
 // r36dDerivedNames over the stored body, with a declared "(col,...)" list
 // taking precedence.
 func r36dShadowOf(p *ReadOnlyPager, sel *SelectStmt, cteDefs map[string]*CTEDef, depth int) (r36dShadow, bool) {
-	sh := r36dShadow{cols: map[string]bool{}, aliases: map[string]bool{}}
+	sh := r36dShadow{aliases: map[string]bool{}}
 	if p == nil || sel == nil || depth > 8 {
 		// The depth cap is a cycle brake: a view or CTE whose body names itself
 		// is a "circular reference" C SQLite rejects, but this walk runs
@@ -121,7 +130,7 @@ func r36dShadowOf(p *ReadOnlyPager, sel *SelectStmt, cteDefs map[string]*CTEDef,
 		// cols the names it supplies. rowid stays false for every expanded
 		// body: a subquery's Table carries TF_NoVisibleRowid.
 		name := it.Alias
-		var cols map[string]bool
+		var cols map[string]int
 		itemRowid := false
 
 		switch {
@@ -187,10 +196,7 @@ func r36dShadowOf(p *ReadOnlyPager, sel *SelectStmt, cteDefs map[string]*CTEDef,
 			if rerr != nil || rt == nil {
 				return sh, false
 			}
-			cols = make(map[string]bool, len(rt.cols))
-			for _, ci := range rt.cols {
-				cols[r33sFoldIdent(ci.Name)] = true
-			}
+			cols = rt.colIndex()
 			itemRowid = !rt.withoutRowid
 		}
 
@@ -199,9 +205,6 @@ func r36dShadowOf(p *ReadOnlyPager, sel *SelectStmt, cteDefs map[string]*CTEDef,
 			item.name = r33sFoldIdent(name)
 		}
 		sh.items = append(sh.items, item)
-		for n := range cols {
-			sh.cols[n] = true
-		}
 		if itemRowid {
 			sh.rowid = true
 		}
@@ -219,11 +222,11 @@ func r36dShadowOf(p *ReadOnlyPager, sel *SelectStmt, cteDefs map[string]*CTEDef,
 // A compound body takes names from its leftmost arm, which this does not
 // chase (keeping recursive CTEs out too).
 func r36dDerivedNames(p *ReadOnlyPager, sel *SelectStmt, declared []string,
-	cteDefs map[string]*CTEDef, depth int) (map[string]bool, bool) {
+	cteDefs map[string]*CTEDef, depth int) (map[string]int, bool) {
 	if declared != nil {
-		out := make(map[string]bool, len(declared))
+		out := make(map[string]int, len(declared))
 		for _, n := range declared {
-			out[r33sFoldIdent(n)] = true
+			out[r33sFoldIdent(n)] = 0
 		}
 		return out, true
 	}
@@ -237,21 +240,23 @@ func r36dDerivedNames(p *ReadOnlyPager, sel *SelectStmt, declared []string,
 	if !ok {
 		return nil, false
 	}
-	out := map[string]bool{}
+	out := map[string]int{}
 	for _, sc := range sel.Columns {
 		switch {
 		case sc.Star:
-			// A QUALIFIED "x.*" expands only that item's columns; inner.cols is
+			// A QUALIFIED "x.*" expands only that item's columns; this takes
 			// the union over the whole clause, so it is exact only when the
 			// clause has one item.
 			if sc.StarQualifier != "" && len(sel.From) != 1 {
 				return nil, false
 			}
-			for n := range inner.cols {
-				out[n] = true
+			for _, it := range inner.items {
+				for n := range it.cols {
+					out[n] = 0
+				}
 			}
 		case sc.HasAlias:
-			out[r33sFoldIdent(sc.Alias)] = true
+			out[r33sFoldIdent(sc.Alias)] = 0
 		default:
 			ce, isCol := sc.Expr.(ColumnExpr)
 			if !isCol {
@@ -262,10 +267,10 @@ func r36dDerivedNames(p *ReadOnlyPager, sel *SelectStmt, declared []string,
 				if sc.RawText == "" {
 					return nil, false
 				}
-				out[r33sFoldIdent(sc.RawText)] = true
+				out[r33sFoldIdent(sc.RawText)] = 0
 				continue
 			}
-			out[r33sFoldIdent(ce.Name)] = true
+			out[r33sFoldIdent(ce.Name)] = 0
 		}
 	}
 	return out, true
@@ -344,7 +349,7 @@ func r36dSubColUsed(p *ReadOnlyPager, sel *SelectStmt, shadow []r36dShadow, cteD
 					}
 					// A matching item that does not supply the column leaves
 					// cnt at 0, and the loop climbs -- see r36dShadow.
-					if it.cols[lname] || (rowidName && it.rowid) {
+					if _, has := it.cols[lname]; has || (rowidName && it.rowid) {
 						stop = true
 						break
 					}
@@ -362,7 +367,7 @@ func r36dSubColUsed(p *ReadOnlyPager, sel *SelectStmt, shadow []r36dShadow, cteD
 			return true
 		}
 		for _, s := range stack {
-			if s.cols[lname] {
+			if s.supplies(lname) {
 				return true
 			}
 			// lookupName's ROWID fallback is applied PER NameContext -- "if(
