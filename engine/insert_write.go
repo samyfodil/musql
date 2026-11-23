@@ -352,7 +352,7 @@ func parseInsertStmtTokens(p *parser, allowExprValues bool) (*insertStmt, error)
 		stmt.cols = []string{}
 		stmt.rows = [][]Expr{{}}
 	} else {
-		valuesPos := p.pos
+		valuesPos, shapeMade := p.pos, p.shape.made()
 		var savedParams paramTracker
 		if p.params != nil {
 			savedParams = paramTracker{maxIndex: p.params.maxIndex, names: maps.Clone(p.params.names)}
@@ -366,11 +366,14 @@ func parseInsertStmtTokens(p *parser, allowExprValues bool) (*insertStmt, error)
 			}
 			var vals []Expr
 			for {
+				start := p.pos
+				done := p.shapeWriteClause(true)
 				v, err := parseInsertValueExpr(p, allowExprValues)
+				done()
 				if err != nil {
 					return nil, err
 				}
-				vals = append(vals, v)
+				vals = append(vals, p.shapeWriteValue(start, v))
 				if p.peekIsPunct(",") {
 					p.next()
 					continue
@@ -408,6 +411,7 @@ func parseInsertStmtTokens(p *parser, allowExprValues bool) (*insertStmt, error)
 		}
 		if compound {
 			p.pos = valuesPos
+			p.shape.rewind(shapeMade)
 			if p.params != nil {
 				*p.params = savedParams
 			}

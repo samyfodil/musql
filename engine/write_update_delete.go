@@ -218,7 +218,9 @@ func parseDeleteStmtTokens(p *parser) (*deleteStmt, error) {
 		return nil, fmt.Errorf("engine: DELETE: multi-table DELETE is not supported by this write path")
 	}
 	if p.consumeKeyword("WHERE") {
+		done := p.shapeWriteClause(false)
 		expr, err := p.parseExpr()
+		done()
 		if err != nil {
 			return nil, err
 		}
@@ -428,11 +430,14 @@ func parseUpdateStmtTokens(p *parser) (*updateStmt, error) {
 		if err := p.expectPunct("="); err != nil {
 			return nil, err
 		}
+		start := p.pos
+		done := p.shapeWriteClause(true)
 		expr, err := p.parseExpr()
+		done()
 		if err != nil {
 			return nil, err
 		}
-		stmt.sets = append(stmt.sets, assignment{col: colName, expr: expr})
+		stmt.sets = append(stmt.sets, assignment{col: colName, expr: p.shapeWriteValue(start, expr)})
 		if p.peekIsPunct(",") {
 			p.next()
 			continue
@@ -455,7 +460,9 @@ func parseUpdateStmtTokens(p *parser) (*updateStmt, error) {
 		stmt.from = items
 	}
 	if p.consumeKeyword("WHERE") {
+		done := p.shapeWriteClause(false)
 		expr, err := p.parseExpr()
+		done()
 		if err != nil {
 			return nil, err
 		}

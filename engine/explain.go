@@ -325,7 +325,7 @@ func (p *ReadOnlyPager) explainWriteProgram(inner string) (*Program, error) {
 	if p.writeSession == nil {
 		return nil, fmt.Errorf("%w: EXPLAIN of a write statement needs the write session this snapshot came from", errVDBEUnsupported)
 	}
-	return p.writeSession.compileWriteProgram(inner)
+	return p.writeSession.compileWriteProgram(inner, nil)
 }
 
 // explainParse parses and resolves the wrapped statement, the step both
