@@ -66,6 +66,14 @@ sh musql/npm/build.sh
 "dependencies": { "@samyfodil/musql-console": "file:../musql/cloud/console", "react": "^19.0.0", "react-dom": "^19.0.0" }
 ```
 
+Or straight from git, without a clone: the repository's root `package.json`
+is this package, and its `prepare` script builds the wasm module, so the
+installing machine needs Go. Pin a commit:
+
+```json
+"dependencies": { "@samyfodil/musql-console": "github:samyfodil/musql#<commit>", "react": "^19.0.0", "react-dom": "^19.0.0" }
+```
+
 ```js
 // vite.config.js
 import react from "@vitejs/plugin-react";
