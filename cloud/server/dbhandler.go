@@ -43,28 +43,36 @@ func WithDatabaseHandler(pattern string, h func(DatabaseRequest) http.Handler) O
 		if s.dbMux == nil {
 			s.dbMux = http.NewServeMux()
 		}
-		s.dbMux.Handle(pattern, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			h(r.Context().Value(dbRequestKey{}).(DatabaseRequest)).ServeHTTP(w, r)
-		}))
+		s.dbMux.Handle(pattern, dbRoute(h))
 	}
+}
+
+// dbRoute is a WithDatabaseHandler handler as its pattern is registered.
+type dbRoute func(DatabaseRequest) http.Handler
+
+func (h dbRoute) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h(r.Context().Value(dbRequestKey{}).(DatabaseRequest)).ServeHTTP(w, r)
 }
 
 type dbRequestKey struct{}
 
-// dbHandler is the WithDatabaseHandler handler for r, nil for Hrana's.
-func (s *Server) dbHandler(r *http.Request) http.Handler {
+// dbHandles reports whether a WithDatabaseHandler pattern matches r. The
+// mux's own redirects (a path one slash short of a "/files/" pattern, say)
+// do not count: they would send the client to the path after the
+// database's name, which is not where the database is.
+func (s *Server) dbHandles(r *http.Request) bool {
 	if s.dbMux == nil {
-		return nil
+		return false
 	}
-	h, pattern := s.dbMux.Handler(r)
-	if pattern == "" {
-		return nil
-	}
-	return h
+	h, _ := s.dbMux.Handler(r)
+	_, ok := h.(dbRoute)
+	return ok
 }
 
-// serveDBHandler checks r as Hrana would before handing it to h.
-func (s *Server) serveDBHandler(w http.ResponseWriter, r *http.Request, h http.Handler, o *state.Org, d *state.Database, e *entry) {
+// serveDBHandler checks r as Hrana would before handing it to the handler
+// its pattern names. The mux serves it, so the pattern's wildcards are the
+// request's PathValues.
+func (s *Server) serveDBHandler(w http.ResponseWriter, r *http.Request, o *state.Org, d *state.Database, e *entry) {
 	tok, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 	acc, err := s.dbAccess(r.Context(), tok, o, d)
 	switch {
@@ -75,6 +83,7 @@ func (s *Server) serveDBHandler(w http.ResponseWriter, r *http.Request, h http.H
 		hranaError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	e.setBlock(d) // as hranaAuth's refresh does: d is the record as it is now
 	b := e.blocks()
 	if b.Reads {
 		hranaError(w, http.StatusForbidden, b.Reason)
@@ -88,7 +97,7 @@ func (s *Server) serveDBHandler(w http.ResponseWriter, r *http.Request, h http.H
 		return
 	}
 	req := DatabaseRequest{Org: o, Database: d, File: s.dbPath(d), Dir: dir, Access: acc}
-	h.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), dbRequestKey{}, req)))
+	s.dbMux.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), dbRequestKey{}, req)))
 }
 
 // handlerDir is a database's WithDatabaseHandler directory.

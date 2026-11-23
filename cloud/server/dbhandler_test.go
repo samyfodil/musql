@@ -27,6 +27,10 @@ func TestDatabaseHandler(t *testing.T) {
 		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			json.NewEncoder(w).Encode(map[string]any{"db": r.Database.Name, "ro": r.Access.ReadOnly})
 		})
+	}), WithDatabaseHandler("GET /t/{name}", func(DatabaseRequest) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, r.PathValue("name")) })
+	}), WithDatabaseHandler("GET /files/", func(DatabaseRequest) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "files") })
 	}))
 	e.setup()
 	ctx := context.Background()
@@ -34,6 +38,8 @@ func TestDatabaseHandler(t *testing.T) {
 	full := must(dbs.CreateToken(ctx, auth(e.admin, &v1.CreateTokenRequest{Org: "acme", Name: "app"}))).Msg.Token
 	ro := must(dbs.CreateToken(ctx, auth(e.admin, &v1.CreateTokenRequest{Org: "acme", Name: "app", Access: v1.Access_ACCESS_READ_ONLY}))).Msg.Token
 
+	client := *e.ts.Client()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	get := func(path, tok string) (int, string) {
 		t.Helper()
 		req, err := http.NewRequest("GET", e.ts.URL+path, nil)
@@ -43,7 +49,7 @@ func TestDatabaseHandler(t *testing.T) {
 		if tok != "" {
 			req.Header.Set("Authorization", "Bearer "+tok)
 		}
-		resp, err := e.ts.Client().Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -66,6 +72,11 @@ func TestDatabaseHandler(t *testing.T) {
 		{"/db/acme/app/info", "", 401, ""},
 		{"/db/acme/app/info", "nope", 401, ""},
 		{"/db/acme/nope/info", full, 404, ""},
+		{"/db/acme/app/t/orders", full, 200, "orders"},
+		{"/db/acme/app/files/", full, 200, "files"},
+		// The mux would redirect this to /files/, outside the database's
+		// URL: it is Hrana's, which has no such path.
+		{"/db/acme/app/files", full, 404, ""},
 	} {
 		status, body := get(c.path, c.tok)
 		if status != c.status || c.body != "" && body != c.body {
@@ -91,11 +102,18 @@ func TestDatabaseHandler(t *testing.T) {
 	if _, body := get("/db/acme/app/info", full); body != `{"db":"app","ro":true}` {
 		t.Errorf("read-only policy: %s", body)
 	}
-	pols.set("acme", Policy{Access: Deny, Reason: "the quota is used up"})
-	if status, body := get("/db/acme/app/info", full); status != 403 || !strings.Contains(body, "the quota is used up") {
+	pols.set("acme", Policy{Access: Deny, Reason: `the "app" quota is used up`})
+	var refused struct{ Message string }
+	if status, body := get("/db/acme/app/info", full); status != 403 || json.Unmarshal([]byte(body), &refused) != nil || refused.Message != `the "app" quota is used up` {
 		t.Errorf("denied: %d %s", status, body)
 	}
 	pols.set("acme", Policy{})
+
+	must(dbs.Update(ctx, auth(e.admin, &v1.UpdateDatabaseRequest{Org: "acme", Name: "app", BlockReads: ptrTo(true)})))
+	if status, body := get("/db/acme/app/info", full); status != 403 || !strings.Contains(body, "reads are blocked") {
+		t.Errorf("reads blocked: %d %s", status, body)
+	}
+	must(dbs.Update(ctx, auth(e.admin, &v1.UpdateDatabaseRequest{Org: "acme", Name: "app", BlockReads: ptrTo(false)})))
 
 	e.s.removeFiles(r.Database)
 	if _, err := os.Stat(r.Dir); !os.IsNotExist(err) {

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -328,9 +329,15 @@ func removeDBFiles(l interface{ Printf(string, ...any) }, p string) {
 }
 
 func hranaError(w http.ResponseWriter, status int, msg string) {
+	b, err := json.Marshal(struct {
+		Message string `json:"message"`
+	}{msg})
+	if err != nil {
+		b = []byte(`{"message":"error"}`)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	w.Write([]byte(`{"message":"` + msg + `"}`))
+	w.Write(b)
 }
 
 // serveDB serves Hrana at /db/<org>/<name>/..., for a database token or a
@@ -402,8 +409,8 @@ func (s *Server) serveDB(w http.ResponseWriter, r *http.Request) {
 	r2 := r.Clone(ctx)
 	r2.URL.Path = "/" + sub
 	r2.URL.RawPath = ""
-	if h := s.dbHandler(r2); h != nil {
-		s.serveDBHandler(w, r2, h, o, d, e)
+	if s.dbHandles(r2) {
+		s.serveDBHandler(w, r2, o, d, e)
 		return
 	}
 	e.srv.ServeHTTP(w, r2)
