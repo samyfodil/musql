@@ -41,7 +41,12 @@ type Policy struct {
 //
 // fn is asked for a database when a Hrana client first reaches it and again
 // once its answer is a second old, at the next statement, so a stream already
-// open meets a change within a second. It is also asked by the calls that
+// open meets a change within a second. As under the database's own
+// block_writes (hrana.WithBlock), an open stream moves to the read-only handle
+// at its next statement outside a transaction once writes are refused, and
+// back once they are allowed, without reconnecting; what lives on its
+// connection (temp tables, pragmas set on it) does not move with it. It is
+// also asked by the calls that
 // read or write a database's data: Export and AI SQL need the database not
 // denied, Restore in place needs it allowed, and Create and Restore into a new
 // database need the org allowed, asked with db nil, and the database they copy

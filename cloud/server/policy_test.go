@@ -211,11 +211,22 @@ func TestAccessPolicy(t *testing.T) {
 			}
 		}
 	}
+	var n int
+	if err := pinned.QueryRowContext(ctx, "SELECT count(*) FROM t").Scan(&n); err != nil || n != 3 {
+		t.Fatalf("read-only, ws opened before, read: %d %v", n, err)
+	}
 	if _, err := pinned.ExecContext(ctx, "INSERT INTO t VALUES (4)"); !refused(err, "the plan's write quota is used up") {
 		t.Fatalf("read-only, ws opened before: %v", err)
 	}
+	if r := stream.exec("SELECT count(*) FROM t"); !strings.Contains(r, "response_ok") || !strings.Contains(r, `"value":"3"`) {
+		t.Fatalf("read-only, open stream, read: %s", r)
+	}
 	if r := stream.exec("INSERT INTO t VALUES (4)"); !strings.Contains(r, `"code":"BLOCKED"`) || !strings.Contains(r, "write quota") {
 		t.Fatalf("read-only, open stream: %s", r)
+	}
+	roStream := e.wsStream("/db/acme/app", tok)
+	if r := roStream.exec("SELECT count(*) FROM t"); !strings.Contains(r, "response_ok") {
+		t.Fatalf("read-only, stream opened while read-only, read: %s", r)
 	}
 	if _, res := e.pipeline("/db/acme/app", e.admin, "SELECT count(*) FROM t", "INSERT INTO t VALUES (4)"); res[0].Type != "ok" || res[1].Error.Code != "BLOCKED" {
 		t.Fatalf("read-only, a user's token (the console's): %+v", res)
@@ -244,7 +255,6 @@ func TestAccessPolicy(t *testing.T) {
 			t.Fatalf("denied, %s read: %v", c.name, err)
 		}
 	}
-	var n int
 	if err := pinned.QueryRowContext(ctx, "SELECT count(*) FROM t").Scan(&n); !refused(err, "the subscription has lapsed") {
 		t.Fatalf("denied, ws opened before: %v", err)
 	}
@@ -275,7 +285,13 @@ func TestAccessPolicy(t *testing.T) {
 	if _, err := pinned.ExecContext(ctx, "INSERT INTO t VALUES (5)"); err != nil {
 		t.Fatalf("allowed again, ws opened before: %v", err)
 	}
-	if n, err := count(httpDB); err != nil || n != 5 {
+	if r := stream.exec("INSERT INTO t VALUES (6)"); !strings.Contains(r, "response_ok") {
+		t.Fatalf("allowed again, open stream: %s", r)
+	}
+	if r := roStream.exec("INSERT INTO t VALUES (7)"); !strings.Contains(r, "response_ok") {
+		t.Fatalf("allowed again, stream opened while read-only: %s", r)
+	}
+	if n, err := count(httpDB); err != nil || n != 7 {
 		t.Fatalf("allowed again, read: %d %v", n, err)
 	}
 	must(dbs.Create(ctx, auth(e.admin, &v1.CreateDatabaseRequest{Org: "acme", Name: "more"})))

@@ -32,9 +32,12 @@ type stream struct {
 	conn    *sql.Conn
 	sqls    *sqlStore
 	observe func(Stmt)
-	// ro is a stream on the read-only database; block is WithBlock's check.
-	ro    bool
-	block func() Block
+	srv     *Server
+	// ro is a stream on the read-only database, readOnly one whose token is
+	// read-only; block is WithBlock's check.
+	ro, readOnly bool
+	block        func() Block
+	authz        musqldriver.Authorizer
 }
 
 // sqlStore is the SQL texts stored with store_sql.
@@ -64,7 +67,21 @@ func (s *sqlStore) del(id int32) {
 	s.mu.Unlock()
 }
 
-func newStream(ctx context.Context, db *sql.DB, sqls *sqlStore, observe func(Stmt)) (*stream, error) {
+// newStream opens a stream for a client with acc, on the database it runs
+// on now.
+func (srv *Server) newStream(ctx context.Context, acc Access, sqls *sqlStore) (*stream, error) {
+	s := &stream{sqls: sqls, observe: srv.observe, srv: srv, readOnly: acc.ReadOnly, block: srv.block}
+	s.ro = s.wantRO(s.blockNow())
+	c, err := openConn(ctx, srv.dbFor(s.ro))
+	if err != nil {
+		return nil, err
+	}
+	s.conn = c
+	s.setAuthorizer(acc.authorizer())
+	return s, nil
+}
+
+func openConn(ctx context.Context, db *sql.DB) (*sql.Conn, error) {
 	c, err := db.Conn(ctx)
 	if err != nil {
 		return nil, err
@@ -80,7 +97,36 @@ func newStream(ctx context.Context, db *sql.DB, sqls *sqlStore, observe func(Stm
 		c.Close()
 		return nil, err
 	}
-	return &stream{conn: c, sqls: sqls, observe: observe}, nil
+	return c, nil
+}
+
+func (s *stream) blockNow() Block {
+	if s.block == nil {
+		return Block{}
+	}
+	return s.block()
+}
+
+// wantRO reports whether s belongs on the read-only database under b.
+func (s *stream) wantRO(b Block) bool { return s.readOnly || b.Writes && s.srv.roDB != nil }
+
+// follow moves s, outside a transaction, onto the database it belongs on
+// under b, with its authorizer and stored SQL texts. What lives on the
+// connection itself (temp tables, pragmas set on it) stays behind.
+func (s *stream) follow(ctx context.Context, b Block) error {
+	ro := s.wantRO(b)
+	if ro == s.ro || !s.isAutocommit() {
+		return nil
+	}
+	c, err := openConn(ctx, s.srv.dbFor(ro))
+	if err != nil {
+		return err
+	}
+	authz := s.authz
+	s.close()
+	s.conn, s.ro = c, ro
+	s.setAuthorizer(authz)
+	return nil
 }
 
 func (s *stream) close() error {
@@ -123,15 +169,15 @@ func (s *stream) sqlOf(sqlText *string, sqlID *int32) (string, error) {
 
 // execute runs one statement; rows are kept only when want_rows is not false.
 func (s *stream) execute(ctx context.Context, st *pb.Stmt) (_ *pb.StmtResult, err error) {
-	b, err := s.gate()
-	if err != nil {
-		return nil, err
-	}
-	defer func() { err = b.refused(err) }()
 	q, err := s.sqlOf(st.Sql, st.SqlId)
 	if err != nil {
 		return nil, err
 	}
+	b, err := s.gate(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { err = b.refused(err) }()
 	if s.observe == nil {
 		res, _, _, err := s.run(ctx, q, st)
 		return res, err
@@ -302,15 +348,15 @@ func (s *stream) cond(c *pb.BatchCond, res *pb.BatchResult) bool {
 
 // sequence runs a ";"-separated script, discarding results.
 func (s *stream) sequence(ctx context.Context, sqlText *string, sqlID *int32) (err error) {
-	b, err := s.gate()
-	if err != nil {
-		return err
-	}
-	defer func() { err = b.refused(err) }()
 	q, err := s.sqlOf(sqlText, sqlID)
 	if err != nil {
 		return err
 	}
+	b, err := s.gate(ctx, q)
+	if err != nil {
+		return err
+	}
+	defer func() { err = b.refused(err) }()
 	if s.observe == nil {
 		_, err = s.conn.ExecContext(ctx, q)
 		return err
@@ -337,11 +383,11 @@ func (s *stream) rowCounts() (read, written int64) {
 // reads (found by running it with every parameter NULL, which a read-only
 // statement does without side effects).
 func (s *stream) describe(ctx context.Context, sqlText *string, sqlID *int32) (*pb.DescribeResult, error) {
-	if _, err := s.gate(); err != nil {
-		return nil, err
-	}
 	q, err := s.sqlOf(sqlText, sqlID)
 	if err != nil {
+		return nil, err
+	}
+	if _, err := s.gate(ctx, q); err != nil {
 		return nil, err
 	}
 	res := &pb.DescribeResult{
@@ -406,18 +452,25 @@ func (e blockedError) Error() string {
 	return "Operation was blocked: " + e.reason
 }
 
-// gate is the block a statement on s runs under, and the error that refuses
+// gate is the block statement q on s runs under, and the error that refuses
 // it outright: every statement while reads are blocked, and while writes are,
-// every statement on a stream that can write.
-func (s *stream) gate() (Block, error) {
-	if s.block == nil {
-		return Block{}, nil
+// every statement but a rollback on a stream that can write, which only one
+// inside a transaction still is (follow).
+func (s *stream) gate(ctx context.Context, q string) (Block, error) {
+	b := s.blockNow()
+	if err := s.follow(ctx, b); err != nil {
+		return b, err
 	}
-	b := s.block()
-	if b.Reads || b.Writes && !s.ro {
+	if b.Reads || b.Writes && !s.ro && !isRollback(q) {
 		return b, blockedError{b.Reason}
 	}
 	return b, nil
+}
+
+// isRollback reports a single ROLLBACK statement, which writes nothing.
+func isRollback(q string) bool {
+	q = strings.TrimRight(strings.TrimSpace(q), "; \t\r\n")
+	return hasPrefixFold(q, "ROLLBACK") && !strings.Contains(q, ";")
 }
 
 // refused is err as a statement run under b reports it: a write the

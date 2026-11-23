@@ -191,8 +191,12 @@ The server is its own issuer at `public_url`:
   and by every cluster node's placement pass, so a stream already open meets
   a block at its next statement on its node. While writes are blocked a new
   stream runs on the read-only handle, where the engine refuses any write
-  (`query_only` locked on, so nothing in the statement can lift it), and a
-  stream opened for writing before refuses every statement.
+  (`query_only` locked on, so nothing in the statement can lift it). An open
+  stream moves there at its next statement outside a transaction, and back
+  once writes are allowed again, without reconnecting; its connection's own
+  state (temp tables, pragmas set on it) stays behind. A transaction open
+  across a change keeps its handle until it ends; on the read-write handle
+  it refuses everything but `ROLLBACK` while writes are blocked.
 - **Access policy**, per org and database, for an app that embeds the
   server (a lapsed subscription, a used-up quota):
   `server.WithAccessPolicy(func(ctx, org, db) server.Policy)`, where
@@ -205,11 +209,11 @@ The server is its own issuer at `public_url`:
   blocks (`ReadOnly` as `block_writes`, `Deny` as `block_reads`, the
   stronger refusal winning), so HTTP and WebSocket clients, the console's
   included, and a stream already open, are refused with `BLOCKED` and
-  "Operation was blocked: <Reason>" within a second of a change. A libSQL
-  WebSocket connection keeps one stream for its life, so one opened before
-  a change to `ReadOnly` refuses reads too, as under `block_writes`, and one
-  opened while writes were refused keeps the read-only handle after they are
-  allowed again, until it reconnects; HTTP clients take a stream per request.
+  "Operation was blocked: <Reason>" within a second of a change. A stream
+  already open, such as the one a libSQL WebSocket connection keeps for its
+  life, follows `ReadOnly` onto the read-only handle and back as it follows
+  `block_writes`, so it keeps reading under `ReadOnly` and writes again once
+  allowed, without reconnecting.
   Management calls stay open so an org can still fix its account, except
   the ones that read or write data: Export and AI SQL need the database not
   denied, an in-place Restore needs it allowed, and Create (branches and
