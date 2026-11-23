@@ -69,8 +69,9 @@ type entry struct {
 	shared   bool // db is a crdt database's replicated handle, not the entry's
 	last     time.Time
 	inflight int
-	// block is the database's blocks as the state last said, and rec its
-	// record; Hrana asks block, with policy over it, before every statement.
+	// block and rec are the database's blocks and record as the state last
+	// said. Hrana asks blocks, which lays policy over block, before every
+	// statement.
 	block  atomic.Pointer[hrana.Block]
 	rec    atomic.Pointer[state.Database]
 	policy *policyCache // nil without WithAccessPolicy
