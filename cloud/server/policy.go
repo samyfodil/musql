@@ -108,16 +108,26 @@ type policyCache struct {
 	at  time.Time
 }
 
+// policyUnread is the answer while no ask has succeeded: a database whose
+// policy could not be read is refused, not left open.
+var policyUnread = Policy{Access: Deny, Reason: "the access policy could not be read"}
+
 // get answers from the cache, asking again once the answer is policyTTL old.
-// An ask that fails keeps the last answer until the next one is due.
+// An ask that fails keeps the last answer until the next one is due; before
+// any answer it refuses, and the next statement asks again.
 func (c *policyCache) get() Policy {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.at.IsZero() || time.Since(c.at) >= policyTTL {
-		if p, err := c.ask(); err == nil {
-			c.p = p
+		p, err := c.ask()
+		switch {
+		case err == nil:
+			c.p, c.at = p, time.Now()
+		case c.at.IsZero():
+			return policyUnread
+		default:
+			c.at = time.Now()
 		}
-		c.at = time.Now()
 	}
 	return c.p
 }

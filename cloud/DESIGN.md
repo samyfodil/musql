@@ -199,7 +199,8 @@ The server is its own issuer at `public_url`:
   `Policy{Access, Reason}` is `Allow` (the zero value), `ReadOnly` or
   `Deny`, on top of what each token grants. It rides on the blocks above:
   each open database asks the policy when a client first reaches it and
-  again at the first statement after its answer is a second old, and lays
+  again at the first statement after its answer is a second old (a failed
+  ask keeps the last answer, and refuses while there is none), and lays
   it over its own
   blocks (`ReadOnly` as `block_writes`, `Deny` as `block_reads`, the
   stronger refusal winning), so HTTP and WebSocket clients, the console's

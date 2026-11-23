@@ -42,15 +42,24 @@ func TestPolicyOver(t *testing.T) {
 	}
 }
 
-// policyCache asks at most once a policyTTL, and keeps its last answer
-// through an ask that fails.
+// policyCache asks at most once a policyTTL, keeps its last answer through
+// an ask that fails, and refuses until a first ask succeeds.
 func TestPolicyCache(t *testing.T) {
 	asks := 0
-	var err error
+	err := errors.New("state out of reach")
 	c := &policyCache{ask: func() (Policy, error) {
 		asks++
-		return Policy{Access: Access(asks)}, err
+		return Policy{Access: Access(asks - 2)}, err
 	}}
+	if c.get() != policyUnread || c.get() != policyUnread || asks != 2 {
+		t.Fatalf("before a first answer: %d asks", asks)
+	}
+	err = nil
+	asks = 0
+	c.ask = func() (Policy, error) {
+		asks++
+		return Policy{Access: Access(asks)}, err
+	}
 	if c.get().Access != 1 || c.get().Access != 1 || asks != 1 {
 		t.Fatalf("within the TTL: %d asks", asks)
 	}
