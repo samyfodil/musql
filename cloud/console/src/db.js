@@ -80,9 +80,12 @@ export const isRemote = () => !!remote;
 /**
  * connect opens a remote database for every call to go to. SELECT 1 runs first,
  * so a wrong URL or token fails here and leaves the open database as it was.
- * renewal ({exp, mint}) renews an expiring token (renew.js).
+ * renewal ({exp, mint}) renews an expiring token (renew.js). When current()
+ * is false by the time SELECT 1 answers, the caller has moved on to another
+ * database: the connection is dropped, the open one is kept, and connect
+ * returns false.
  */
-export async function connect(url, authToken, renewal) {
+export async function connect(url, authToken, renewal, current = () => true) {
 	const { createClient } = await import("@libsql/client/web");
 	const session = renewal && tokenSession({ token: authToken, exp: renewal.exp, mint: renewal.mint });
 	const client = createClient({ url, authToken: authToken || undefined, intMode: "bigint", fetch: session && authFetch(session) });
@@ -92,8 +95,14 @@ export async function connect(url, authToken, renewal) {
 		session?.stop();
 		throw e;
 	}
+	if (!current()) {
+		session?.stop();
+		client.close();
+		return false;
+	}
 	disconnect();
 	remote = { client, tx: null, url, host: hostOf(url), session };
+	return true;
 }
 
 function disconnect() {

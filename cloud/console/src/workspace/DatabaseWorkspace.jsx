@@ -45,8 +45,9 @@ export function DatabaseProvider({ org, database, children }) {
 				const { database: d } = await api.db.get({ org, name: database });
 				const c = await cloudConnection(org, d.name, d.url, readOnly);
 				if (!live) return;
-				await connect(c.url, c.token, c.renewal);
-				if (!live) return close();
+				// A run the effect has left behind must not replace the
+				// connection a newer run opened.
+				if (!(await connect(c.url, c.token, c.renewal, () => live))) return;
 				const s = await ws.loadSchema();
 				if (!live) return;
 				if (!ws.show(c.name, s, view)) ws.openFirst(s);
