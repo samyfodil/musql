@@ -6,7 +6,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/samyfodil/musql.git",
+    "url": "git+https://github.com/samyfodil/musql.git",
     "directory": "cloud/console"
   },
   "type": "module",
