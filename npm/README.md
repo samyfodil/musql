@@ -7,15 +7,12 @@ them in and out as the bytes of one file.
 
 ## Install
 
-The package is on GitHub Packages. Point the `@samyfodil` scope at it, with a
-GitHub token that can read packages (GitHub requires one even for public
-packages):
-
 ```sh
-echo "@samyfodil:registry=https://npm.pkg.github.com" >> .npmrc
-echo "//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}" >> .npmrc
 npm install @samyfodil/musql
 ```
+
+Every musql release publishes it at the release's version, with the wasm
+module built, so installing it needs no Go.
 
 ## Use
 

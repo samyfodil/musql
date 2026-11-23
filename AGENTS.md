@@ -93,7 +93,7 @@ file by file.
 | `hrana/` | The Hrana server (HTTP, JSON and Protobuf) and `cmd/musqld`, so libSQL/Turso clients can use musql. Its own module, so the engine and driver depend on nothing but `golang.org/x/sys`. Generated code in `hrana/gen/`. |
 | `proto/` | Protobuf definitions. `buf generate` (repo root) writes the Go code into `hrana/gen/`, `cloud/gen/` and `replication/rpc/gen/`, and `examples/libp2p` has its own config. Never edit generated code by hand. |
 | `replication/` | Replication: capture, HLC, op log, CRDT and leader modes. The network is supplied by the caller (`WithTransport`). |
-| `npm/` | The npm package (`@samyfodil/musql`, GitHub Packages): `wasm/main.go` is its WebAssembly module, `index.js` the JavaScript API, `build.sh` builds both. Published by the release workflow on every tag. |
+| `npm/` | The npm package (`@samyfodil/musql`, on npmjs): `wasm/main.go` is its WebAssembly module, `index.js` the JavaScript API, `build.sh` builds both. The release workflow publishes it on every tag, with `@samyfodil/musql-console` (`cloud/console/pack.mjs`) at the same version. |
 | `cloud/console/` | The console: a browser database editor (React, Vite) over the npm package, opening and exporting both musql and C SQLite files. |
 | `replication/rpc/` | Replication's wire format (`proto/replication/v1`), conversions to and from its types, and a `Transport` over ConnectRPC that serves every database a process replicates. Its own module. |
 | `examples/libp2p/` | An example `Transport` over libp2p, its own module. |

@@ -107,6 +107,9 @@ jobs:
           npm ci --no-audit --no-fund
           npm run build
           npm run build:example
+      - name: console package installs and builds
+        working-directory: cloud/console
+        run: ./test-package.sh
   libp2p:
     name: libp2p example (nested module)
     runs-on: ubuntu-latest

@@ -57,14 +57,16 @@ files next to it.
 ### Depending on it
 
 ```sh
-git clone https://github.com/samyfodil/musql
-sh musql/npm/build.sh
-(cd musql/cloud/console && npm ci)
+npm install @samyfodil/musql-console react react-dom
+npm install -D vite @vitejs/plugin-react
 ```
 
-```json
-"dependencies": { "@samyfodil/musql-console": "file:../musql/cloud/console", "react": "^19.0.0", "react-dom": "^19.0.0" }
-```
+Every musql release publishes it at the release's version, depending on
+`@samyfodil/musql` at the same version. `pack.mjs` writes the published
+package from this directory. It ships transformers.js's browser build in
+place of `@huggingface/transformers`, so the install does not pull in
+onnxruntime-node and its CUDA download. `test-package.sh` installs both
+packages into an app outside the repository and builds it, as CI does.
 
 ```js
 // vite.config.js
