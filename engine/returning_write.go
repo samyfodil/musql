@@ -25,6 +25,7 @@
 package engine
 
 import (
+	"slices"
 	"strings"
 )
 
@@ -137,6 +138,14 @@ func statementHasReturningUncached(sqlText string) bool {
 	trimmed := strings.TrimSpace(sqlText)
 	toks, err := lex(trimmed)
 	if err != nil {
+		return false
+	}
+	// The clause starts with the keyword, which no other token spells: a text
+	// without it is answered without the parse, which a statement of inline
+	// literals would pay once per text.
+	if !slices.ContainsFunc(toks, func(t token) bool {
+		return t.kind == tkIdent && !t.quoted && strings.EqualFold(t.text, "RETURNING")
+	}) {
 		return false
 	}
 	switch writeDispatchKeyword(trimmed, toks) {
