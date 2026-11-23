@@ -577,6 +577,43 @@ func (e *vmEmit) src(pc, r int, scratch Reg) Reg {
 	return scratch
 }
 
+// realCmp is nullCmp's path for a REAL operand, bound at real: both
+// operands compared as doubles (fcmpLoad), so a REAL where the lowering
+// guessed an INTEGER -- a derived table's sum(), say -- answers here rather
+// than exiting at every row.
+func (e *vmEmit) realCmp(pc int, in VInsn, real Lbl, zs bool) {
+	a, L := e.a, e.lay
+	store := in.Op != VCmpJump && !in.Dead
+	a.Bind(real)
+	e.fcmpLoad(pc, in.B, X0)
+	e.fcmpLoad(pc, in.A, X1)
+	c := floatCond(in.Cond)
+	if store {
+		a.MovRegImm64(R10, 0)
+	}
+	a.Ucomisd(X0, X1)
+	e.jccStub(ccP, pc)
+	if store {
+		a.Setcc(c, R10)
+		a.MovMemDImm(RSI, e.d(in.C, 0), int32(L.TypInt))
+		a.MovMemDReg(RSI, e.d(in.C, L.OffI), R10)
+		a.MovMemDImm(RSI, e.d(in.C, L.OffF), 0)
+		if zs {
+			e.zeroS.add(in.C)
+		}
+		e.clearS(in.C)
+	}
+	switch in.Op {
+	case VCmpJump:
+		e.jccBlock(c, pc, in.T)
+	case VCmpBr:
+		if in.Imm&1 == 0 {
+			c = floatCond(in.Cond.Negate())
+		}
+		e.jccBlock(c, pc, in.T)
+	}
+}
+
 // nullCmp is a comparison that answers a NULL operand natively (VCmpJump
 // and VCmpSet with Imm, VCmpBr with VCmpNull): a NULL stores NULL and falls
 // through or jumps as the VDBE's compareOp does. Past it neither operand, if
@@ -590,11 +627,17 @@ func (e *vmEmit) nullCmp(pc int, in VInsn) {
 		e.destNoS(pc, in.C)
 	}
 	zs := e.zeroS.has(in.C)
-	null, done := e.vmLabel(), e.vmLabel()
+	null, real, done := e.vmLabel(), e.vmLabel(), e.vmLabel()
 	for _, r := range []int{in.A, in.B} {
 		if !e.know.isInt.has(r) {
 			a.CmpMemDByte(RSI, e.d(r, L.OffTyp), L.TypNull)
 			a.JccL(CondE, null)
+		}
+	}
+	for _, r := range []int{in.A, in.B} {
+		if !e.know.isInt.has(r) {
+			a.CmpMemDByte(RSI, e.d(r, L.OffTyp), L.TypFloat)
+			a.JccL(CondE, real)
 		}
 	}
 	x := e.src(pc, in.B, RAX)
@@ -618,6 +661,10 @@ func (e *vmEmit) nullCmp(pc int, in VInsn) {
 		e.jccBlock(c, pc, in.T)
 	}
 	a.JmpL(done)
+	if !knownA || !knownB {
+		e.realCmp(pc, in, real, zs)
+		a.JmpL(done)
+	}
 	a.Bind(null)
 	if store {
 		a.MovMemDImm(RSI, e.d(in.C, 0), int32(L.TypNull))

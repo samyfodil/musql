@@ -319,6 +319,11 @@ func (e *vmEmitWasm) nullCmp(pc int, in VInsn) {
 		}
 		w.op(opElse)
 	}
+	reals := e.realOperand(in)
+	if reals {
+		e.realCmp(pc, in, zs)
+		w.op(opElse)
+	}
 	e.guards(pc, e.isInt(in.B), e.isInt(in.A))
 	e.loadI64(in.B, L.OffI)
 	e.loadI64(in.A, L.OffI)
@@ -338,6 +343,9 @@ func (e *vmEmitWasm) nullCmp(pc int, in VInsn) {
 			e.jumpIf(in.T)
 		}
 	}
+	if reals {
+		e.closeIf()
+	}
 	if nulls {
 		e.closeIf()
 	}
@@ -349,6 +357,72 @@ func (e *vmEmitWasm) nullCmp(pc int, in VInsn) {
 	}
 	if store {
 		e.know.wroteAny(in.C, true)
+	}
+}
+
+// realOperand is nullOperand's for a REAL operand, which realCmp answers.
+func (e *vmEmitWasm) realOperand(in VInsn) bool {
+	k := 0
+	for _, r := range []int{in.A, in.B} {
+		if e.know.isInt.has(r) {
+			continue
+		}
+		e.loadTyp(r)
+		e.w.I32(int32(e.lay.TypFloat))
+		e.w.op(opI32Eq)
+		if k > 0 {
+			e.w.op(opI32Or)
+		}
+		k++
+	}
+	if k == 0 {
+		return false
+	}
+	e.openIf()
+	return true
+}
+
+// realCmp is vm_amd64.go's: nullCmp's path for a REAL operand. It writes the
+// result in full rather than through storeInt, whose notes the INTEGER path
+// after it must not see.
+func (e *vmEmitWasm) realCmp(pc int, in VInsn, zs bool) {
+	w, L := e.w, e.lay
+	f0, f1 := e.flocals()
+	e.fcmpLoad(pc, in.B, f0)
+	e.fcmpLoad(pc, in.A, f1)
+	e.exitNaN(pc, f0)
+	e.exitNaN(pc, f1)
+	w.Get(f0)
+	w.Get(f1)
+	w.op(fcmpOp(in.Cond))
+	if in.Op == VCmpJump {
+		e.jumpIf(in.T)
+		return
+	}
+	w.op(opI64ExtendI32U)
+	w.Set(e.t1)
+	if !in.Dead {
+		w.Get(e.regs)
+		w.I64(int64(L.TypInt))
+		w.StoreI64(e.addr(in.C, 0))
+		w.Get(e.regs)
+		w.Get(e.t1)
+		w.StoreI64(e.addr(in.C, L.OffI))
+		w.Get(e.regs)
+		w.I64(0)
+		w.StoreI64(e.addr(in.C, L.OffF))
+		e.clearS(in.C)
+		if zs {
+			e.zeroS.add(in.C)
+		}
+	}
+	if in.Op == VCmpBr {
+		w.Get(e.t1)
+		w.op(opI64Eqz)
+		if in.Imm&1 != 0 {
+			w.op(opI32Eqz) // jump when 1
+		}
+		e.jumpIf(in.T)
 	}
 }
 
