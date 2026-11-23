@@ -69,13 +69,26 @@ type entry struct {
 	shared   bool // db is a crdt database's replicated handle, not the entry's
 	last     time.Time
 	inflight int
-	// block is the database's blocks as the state last said, which Hrana
-	// asks before every statement.
-	block atomic.Pointer[hrana.Block]
+	// block and rec are the database's blocks and record as the state last
+	// said. Hrana asks blocks, which lays policy over block, before every
+	// statement.
+	block  atomic.Pointer[hrana.Block]
+	rec    atomic.Pointer[state.Database]
+	policy *policyCache // nil without WithAccessPolicy
 }
 
-// setBlock takes d's blocks.
+// blocks is what Hrana refuses on e now.
+func (e *entry) blocks() hrana.Block {
+	b := *e.block.Load()
+	if e.policy == nil {
+		return b
+	}
+	return e.policy.get().over(b)
+}
+
+// setBlock takes d's blocks and record.
 func (e *entry) setBlock(d *state.Database) {
+	e.rec.Store(d)
 	b := hrana.Block{Reads: d.BlockReads, Writes: d.BlockWrites}
 	switch {
 	case b.Reads:
@@ -139,7 +152,7 @@ func (e *entry) close() {
 	e.ro.Close()
 }
 
-// refresh gives d's open entry, if any, d's blocks.
+// refresh gives d's open entry, if any, d's blocks and record.
 func (p *pool) refresh(d *state.Database) {
 	p.mu.Lock()
 	e := p.m[d.ID]
@@ -249,10 +262,13 @@ func (s *Server) openEntry(d *state.Database) (*entry, error) {
 	}
 	e := &entry{db: db, ro: ro, shared: shared}
 	e.setBlock(d)
+	if s.accessPolicy != nil {
+		e.policy = &policyCache{ask: func() (Policy, error) { return s.entryPolicy(e) }}
+	}
 	e.srv = hrana.NewServer(db,
 		hrana.WithReadOnlyDB(ro),
 		hrana.WithAccess(s.hranaAuth(d.OrgID, d.ID)),
-		hrana.WithBlock(func() hrana.Block { return *e.block.Load() }),
+		hrana.WithBlock(e.blocks),
 		hrana.WithObserver(s.meter.observer(d.ID, d.OrgID)))
 	return e, nil
 }

@@ -112,6 +112,9 @@ func (s databaseService) Restore(ctx context.Context, req *connect.Request[v1.Re
 		if m.NewName != "" {
 			return nil, invalid("in_place and new_name exclude each other")
 		}
+		if err := s.admit(ctx, o, d, Allow); err != nil {
+			return nil, err
+		}
 		restore := s.restoreInPlace
 		if s.cl != nil {
 			restore = s.restoreReplicatedInPlace
@@ -126,6 +129,12 @@ func (s databaseService) Restore(ctx context.Context, req *connect.Request[v1.Re
 		name = d.Name + "-" + at.UTC().Format("20060102-150405")
 	}
 	if err := validName("database", name); err != nil {
+		return nil, err
+	}
+	if err := s.admit(ctx, o, nil, Allow); err != nil {
+		return nil, err
+	}
+	if err := s.admit(ctx, o, d, ReadOnly); err != nil {
 		return nil, err
 	}
 	if _, err := s.store.Database(ctx, o.ID, name); err == nil {

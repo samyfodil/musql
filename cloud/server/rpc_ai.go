@@ -69,6 +69,9 @@ func (s aiService) GenerateSQL(ctx context.Context, req *connect.Request[v1.Gene
 	if err != nil {
 		return nil, rpcErr(err)
 	}
+	if err := s.admit(ctx, o, d, ReadOnly); err != nil {
+		return nil, err
+	}
 	prompt := strings.TrimSpace(m.Prompt)
 	if prompt == "" {
 		return nil, invalid("prompt is empty")

@@ -32,6 +32,7 @@ func WithAccess(check func(token string) (Access, error)) Option {
 
 // setAuthorizer installs fn on the stream's connection; nil removes it.
 func (s *stream) setAuthorizer(fn musqldriver.Authorizer) {
+	s.authz = fn
 	s.conn.Raw(func(dc any) error {
 		dc.(*musqldriver.Conn).SetAuthorizer(fn)
 		return nil

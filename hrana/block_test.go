@@ -5,30 +5,42 @@ import (
 	"database/sql"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/coder/websocket"
+
+	musqldriver "github.com/samyfodil/musql/driver"
 )
+
+// confineRO makes every connection opened with "?hranatest=ro" read-only,
+// so a read-only pool may hold as many as its streams need.
+var confineRO = sync.OnceFunc(func() {
+	musqldriver.RegisterConnectionHook(func(c *musqldriver.Conn, dsn string) error {
+		if strings.Contains(dsn, "hranatest=ro") {
+			c.Confine(true)
+		}
+		return nil
+	})
+})
 
 // blockServer serves one file whose block the test sets.
 func blockServer(t *testing.T) (string, *atomic.Pointer[Block]) {
 	t.Helper()
+	confineRO()
 	path := filepath.Join(t.TempDir(), "b.musq")
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ro, err := sql.Open("sqlite", path)
+	ro, err := sql.Open("sqlite", path+"?hranatest=ro")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ro.SetMaxOpenConns(1)
 	if _, err := db.Exec("CREATE TABLE t(a)"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ro.Exec("PRAGMA query_only = 1"); err != nil {
 		t.Fatal(err)
 	}
 	var b atomic.Pointer[Block]
@@ -75,48 +87,134 @@ func TestBlockOnHTTP(t *testing.T) {
 	}
 }
 
-func TestBlockReachesOpenWebSocketStreams(t *testing.T) {
-	url, b := blockServer(t)
-	ctx := context.Background()
-	c, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(url, "http"), &websocket.DialOptions{Subprotocols: []string{"hrana3"}})
+// wsBlockConn is a WebSocket on a blockServer; exec runs q on a stream.
+type wsBlockConn struct {
+	t  *testing.T
+	c  *websocket.Conn
+	id int
+}
+
+func dialBlock(t *testing.T, url string) *wsBlockConn {
+	t.Helper()
+	c, _, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(url, "http"), &websocket.DialOptions{Subprotocols: []string{"hrana3"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.CloseNow()
-	send := func(m string) string {
-		t.Helper()
-		if err := c.Write(ctx, websocket.MessageText, []byte(m)); err != nil {
-			t.Fatal(err)
-		}
-		_, r, err := c.Read(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return string(r)
+	t.Cleanup(func() { c.CloseNow() })
+	w := &wsBlockConn{t: t, c: c}
+	w.send(`{"type":"hello","jwt":""}`)
+	return w
+}
+
+func (w *wsBlockConn) send(m string) string {
+	w.t.Helper()
+	ctx := context.Background()
+	if err := w.c.Write(ctx, websocket.MessageText, []byte(m)); err != nil {
+		w.t.Fatal(err)
 	}
-	exec2 := func(id, q string) string {
-		return `{"type":"request","request_id":` + id + `,"request":{"type":"execute","stream_id":2,"stmt":{"sql":"` + q + `"}}}`
+	_, r, err := w.c.Read(ctx)
+	if err != nil {
+		w.t.Fatal(err)
 	}
-	send(`{"type":"hello","jwt":""}`)
-	send(openStream)
-	if r := send(execMsg("2", "INSERT INTO t VALUES (1)")); !strings.Contains(r, "response_ok") {
+	return string(r)
+}
+
+func (w *wsBlockConn) request(req string) string {
+	w.t.Helper()
+	w.id++
+	return w.send(`{"type":"request","request_id":` + strconv.Itoa(w.id) + `,"request":` + req + `}`)
+}
+
+func (w *wsBlockConn) open(stream int) {
+	w.t.Helper()
+	if r := w.request(`{"type":"open_stream","stream_id":` + strconv.Itoa(stream) + `}`); !strings.Contains(r, "response_ok") {
+		w.t.Fatalf("open_stream: %s", r)
+	}
+}
+
+func (w *wsBlockConn) exec(stream int, q string) string {
+	w.t.Helper()
+	return w.request(`{"type":"execute","stream_id":` + strconv.Itoa(stream) + `,"stmt":{"sql":"` + q + `"}}`)
+}
+
+// An open stream follows a block: onto the read-only database while writes
+// are blocked, where reads still work, and back once they are allowed.
+func TestBlockReachesOpenWebSocketStreams(t *testing.T) {
+	url, b := blockServer(t)
+	w := dialBlock(t, url)
+	ok := func(r string) bool { return strings.Contains(r, "response_ok") }
+	blocked := func(r string) bool { return strings.Contains(r, `"code":"BLOCKED"`) }
+	w.open(1)
+	if r := w.exec(1, "INSERT INTO t VALUES (1)"); !ok(r) {
 		t.Fatalf("unblocked write: %s", r)
 	}
 
-	b.Store(&Block{Writes: true})
-	if r := send(execMsg("3", "SELECT 1")); !strings.Contains(r, `"code":"BLOCKED"`) {
-		t.Errorf("a stream opened for writing, once writes are blocked: %s", r)
+	b.Store(&Block{Writes: true, Reason: "writes are off"})
+	if r := w.exec(1, "SELECT count(*) FROM t"); !ok(r) || !strings.Contains(r, `"value":"1"`) {
+		t.Errorf("read on a stream opened for writing, once writes are blocked: %s", r)
 	}
-	send(`{"type":"request","request_id":4,"request":{"type":"open_stream","stream_id":2}}`)
-	if r := send(exec2("5", "SELECT count(*) FROM t")); !strings.Contains(r, "response_ok") {
+	if r := w.exec(1, "INSERT INTO t VALUES (2)"); !blocked(r) || !strings.Contains(r, "writes are off") {
+		t.Errorf("write on a stream opened for writing, once writes are blocked: %s", r)
+	}
+	w.open(2)
+	if r := w.exec(2, "SELECT count(*) FROM t"); !ok(r) {
 		t.Errorf("read on a stream opened while writes are blocked: %s", r)
 	}
-	if r := send(exec2("6", "INSERT INTO t VALUES (2)")); !strings.Contains(r, `"code":"BLOCKED"`) {
+	if r := w.exec(2, "INSERT INTO t VALUES (2)"); !blocked(r) {
 		t.Errorf("write on a stream opened while writes are blocked: %s", r)
 	}
 
+	b.Store(&Block{})
+	for _, st := range []int{1, 2} {
+		if r := w.exec(st, "INSERT INTO t VALUES (3)"); !ok(r) {
+			t.Errorf("write on stream %d once writes are allowed again: %s", st, r)
+		}
+	}
+
 	b.Store(&Block{Reads: true})
-	if r := send(exec2("7", "SELECT 1")); !strings.Contains(r, `"code":"BLOCKED"`) {
+	if r := w.exec(2, "SELECT 1"); !blocked(r) {
 		t.Errorf("read on an open stream once reads are blocked: %s", r)
+	}
+}
+
+// A transaction open across a change keeps its connection until it ends:
+// one that can write refuses all but ROLLBACK while writes are blocked, and
+// one on the read-only database cannot write until it commits.
+func TestBlockWaitsForTransaction(t *testing.T) {
+	url, b := blockServer(t)
+	w := dialBlock(t, url)
+	ok := func(r string) bool { return strings.Contains(r, "response_ok") }
+	w.open(1)
+	for _, q := range []string{"BEGIN", "INSERT INTO t VALUES (1)"} {
+		if r := w.exec(1, q); !ok(r) {
+			t.Fatalf("%s: %s", q, r)
+		}
+	}
+
+	b.Store(&Block{Writes: true})
+	if r := w.exec(1, "SELECT count(*) FROM t"); !strings.Contains(r, `"code":"BLOCKED"`) {
+		t.Errorf("read in a write transaction once writes are blocked: %s", r)
+	}
+	if r := w.exec(1, "ROLLBACK"); !ok(r) {
+		t.Fatalf("rollback once writes are blocked: %s", r)
+	}
+	if r := w.exec(1, "SELECT count(*) FROM t"); !ok(r) || !strings.Contains(r, `"value":"0"`) {
+		t.Errorf("read after the rollback: %s", r)
+	}
+	for _, q := range []string{"BEGIN", "SELECT count(*) FROM t"} {
+		if r := w.exec(1, q); !ok(r) {
+			t.Fatalf("read transaction while writes are blocked, %s: %s", q, r)
+		}
+	}
+
+	b.Store(&Block{})
+	if r := w.exec(1, "INSERT INTO t VALUES (2)"); ok(r) || !strings.Contains(r, "readonly") {
+		t.Errorf("write in a read-only transaction once writes are allowed: %s", r)
+	}
+	if r := w.exec(1, "COMMIT"); !ok(r) {
+		t.Fatalf("commit: %s", r)
+	}
+	if r := w.exec(1, "INSERT INTO t VALUES (3)"); !ok(r) {
+		t.Errorf("write after the commit: %s", r)
 	}
 }

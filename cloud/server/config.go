@@ -1,6 +1,8 @@
 // Package server wires musql cloud together: configuration, the management
 // API (ConnectRPC), the OIDC provider, Hrana for each hosted database and the
-// console's static files, all on one http.Handler.
+// console's static files, all on one http.Handler. An app that embeds it
+// sets per-org rules through New's options: WithDeletedRetention, and
+// WithAccessPolicy to make an org's databases read-only or denied.
 package server
 
 import (

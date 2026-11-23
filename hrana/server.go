@@ -36,7 +36,6 @@ type Server struct {
 
 type httpStream struct {
 	*stream
-	ro       bool       // opened on the read-only database
 	mu       sync.Mutex // a stream runs one pipeline at a time
 	lastUsed time.Time
 }
@@ -156,13 +155,14 @@ type Block struct {
 
 // WithBlock asks check before every statement a client runs, so a change
 // reaches open streams at their next statement. A refused statement fails
-// with the Hrana error code BLOCKED. While writes are blocked a new stream
-// runs on the database WithReadOnlyDB gives, where a write is refused as
-// blocked, and a stream opened for writing before refuses every statement.
+// with the Hrana error code BLOCKED. While writes are blocked a stream runs
+// on the database WithReadOnlyDB gives, where a write is refused as blocked:
+// an open stream moves there at its next statement outside a transaction,
+// and back once writes are allowed again, leaving what lives on its
+// connection (temp tables, pragmas set on it) behind. A transaction open
+// across a change keeps its connection until it ends, and while writes are
+// blocked one that can write refuses every statement but ROLLBACK.
 func WithBlock(check func() Block) Option { return func(c *config) { c.block = check } }
-
-// writesBlocked reports a WithBlock check that blocks writes now.
-func (c *config) writesBlocked() bool { return c.block != nil && c.block().Writes && c.roDB != nil }
 
 // NewServer serves db, which must be opened with the musql driver.
 func NewServer(db *sql.DB, opts ...Option) *Server {
@@ -245,19 +245,16 @@ func newBaton() string {
 // take returns the stream a baton names (a new one for no baton) with its lock
 // held, and removes the baton: every response hands out a fresh one.
 //
-// A stream opened read-write is never handed to a read-only client.
+// A stream on the read-write database is never handed to a read-only client.
 func (s *Server) take(ctx context.Context, baton *string, acc Access) (*httpStream, error) {
 	s.reap()
 	if baton == nil || *baton == "" {
-		ro := acc.ReadOnly || s.writesBlocked()
-		st, err := newStream(context.WithoutCancel(ctx), s.dbFor(ro), newSQLStore(), s.observe)
+		st, err := s.newStream(context.WithoutCancel(ctx), acc, newSQLStore())
 		if err != nil {
 			return nil, err
 		}
-		st.ro, st.block = ro, s.block
-		hs := &httpStream{stream: st, ro: ro}
+		hs := &httpStream{stream: st}
 		hs.mu.Lock()
-		hs.setAuthorizer(acc.authorizer())
 		return hs, nil
 	}
 	s.mu.Lock()
@@ -272,6 +269,7 @@ func (s *Server) take(ctx context.Context, baton *string, acc Access) (*httpStre
 		return nil, protoErr("unknown or expired baton")
 	}
 	hs.mu.Lock()
+	hs.readOnly = acc.ReadOnly
 	hs.setAuthorizer(acc.authorizer())
 	return hs, nil
 }
