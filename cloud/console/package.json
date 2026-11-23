@@ -4,7 +4,8 @@
   "type": "module",
   "exports": {
     ".": "./src/index.js",
-    "./vite": "./vite-plugin.js"
+    "./vite": "./vite-plugin.js",
+    "./style.css": "./src/style.css"
   },
   "scripts": {
     "dev": "vite",

@@ -104,6 +104,9 @@ function disconnect() {
 	remote = null;
 }
 
+/** close closes the remote database, if one is open; calls go to the local one again. */
+export const close = () => disconnect();
+
 // value turns a remote value into the local worker's: integers as numbers
 // when exact, else BigInt; blobs as Uint8Array.
 function value(v) {

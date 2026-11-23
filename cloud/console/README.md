@@ -41,13 +41,20 @@ React and CodeMirror, built with Vite.
 
 ## As a library
 
-The console is also a package, `@samyfodil/musql-console`, so another app can
-be this console plus its own pages, name and colors without a fork.
-`src/main.jsx` is the stock app: `createConsole(root, {})`. `example/` is an
-app that adds a page, a database tab, a banner, a theme and a name
-(`npm run example`, or `npm run build:example` for `example/dist/`; its cloud
-parts show when a musql cloud server serves it, with `console.dir` set to
-`example/dist`).
+The console is also a package, `@samyfodil/musql-console`, used two ways:
+
+- `createConsole(root, options)`: the stock console plus an app's own pages,
+  name and colors, without a fork. `src/main.jsx` is the stock app:
+  `createConsole(root, {})`.
+- [Components](#components): the pieces the stock console is built from
+  (the provider, the database editor, the cloud pages, the building blocks),
+  for an app that is its own shell.
+
+`example/` is such a shell: its own header, org switcher and navigation, the
+cloud pages, and a database opening in `DatabaseWorkspace`, with no local
+studio and no server picker (`npm run example`, or `npm run build:example` for
+`example/dist/`; it signs in when a musql cloud server serves it, with
+`console.dir` set to `example/dist`).
 
 The package's entry is its source (`src/index.js`), built by the app's own
 Vite. Vite's library mode would inline the wasm module and the embedding
@@ -145,3 +152,129 @@ same object anywhere under one:
 The object changes when any of these do, so an effect depends on the fields
 it reads (`ctx.org?.slug`), not on `ctx`. Everything else under `src/` is
 private.
+
+## Components
+
+```js
+import "@samyfodil/musql-console/style.css"; // optional: ConsoleProvider imports it too
+import { ConsoleProvider, DatabaseWorkspace, Databases, useCloud } from "@samyfodil/musql-console";
+
+function Shell() {
+	const cloud = useCloud();
+	const [open, setOpen] = useState(null);
+	if (cloud.auth.status !== "in") return <button onClick={cloud.signIn}>Sign in</button>;
+	return open
+		? <DatabaseWorkspace key={`${open.org}/${open.database}`} {...open} />
+		: <Databases org={cloud.org} onOpenDatabase={({ org, database }) => setOpen({ org, database })} />;
+}
+
+createRoot(el).render(<ConsoleProvider><Shell /></ConsoleProvider>);
+```
+
+`createConsole` is assembled from the same pieces, so the stock console and a
+shell built from them look and behave alike. Everything works under one
+`ConsoleProvider`, bound to one server.
+
+### ConsoleProvider
+
+`<ConsoleProvider cloud branding theme>{children}</ConsoleProvider>`
+
+- `cloud`: the server the API calls and sign-in go to, read once when it
+  mounts. `{}` (the default) is the page's own origin.
+  - `baseURL`: the server's origin.
+  - `getToken`: `() => Promise<string>` when the app signs users in itself;
+    every call carries its token, and `signIn` / `signOut` (also options)
+    are the app's. Without it the console signs in with the server's OIDC
+    provider as its `console` client, returning at `callbackPath` on this
+    origin (`/console/callback` for a page under `/console/`, else
+    `/callback`; the server accepts the second for origins in
+    `console.cors_origins`), and keeps the session as the stock console does.
+  - `transport`: a ready ConnectRPC transport to call over instead, which
+    signs its own calls.
+  - `null`: no server.
+- `branding`: as `createConsole`'s (`name`, `logo`, `favicon`, `docsURL`,
+  `supportURL`).
+- `theme`: as `createConsole`'s, CSS variables over the style sheet's tokens.
+
+It holds the style sheet and the fonts, the theme switch (`useTheme()`:
+`[theme, setTheme, dark]`), the toasts, and the signed-in state. The wasm
+engine runs in a worker started with the package.
+
+### useCloud()
+
+The server the provider is bound to:
+
+| Field | What it is |
+| --- | --- |
+| `auth` | `{status, error}`: `"starting"`, `"out"`, `"in"`, or `"none"` without a server. |
+| `user`, `admin` | The signed-in user (`cloud.v1.User`) or `null`, and whether a server admin. |
+| `orgs` | The orgs the user can switch to (`cloud.v1.Org`; a server admin sees every one). |
+| `org`, `setOrg(slug)` | The org in view (a slug, kept in this browser) and its setter. |
+| `role`, `roleIn(slug)` | The user's role (`Role` from `proto/cloud/v1`) in the org in view, or in another. |
+| `signIn()`, `signOut()`, `refresh()` | Sign-in redirect, sign out, and refreshing the session now. |
+| `reload()` | Reads the user and orgs again, after creating or leaving one. |
+| `server` | The server's origin. |
+
+### The database editor
+
+- `DatabaseWorkspace({ org, database })`: what opening a cloud database
+  shows in the stock console: the table list, the table editor and grid, the
+  SQL editor with AI SQL, the schema diagram, the row and column panels, over
+  Hrana with a token it mints (read-only for a viewer) and renews. It fills
+  its container; one database is open at a time on a page, so key it by
+  `org/database`.
+- `DatabaseProvider({ org, database, children })`: opens the database for
+  the parts below, laid out as the app likes; `useDatabase()` under it gives
+  `{org, database, phase, error, readOnly, schema, counts, reload,
+  openTable, openQuery, openDiagram, section, setSection}`.
+  - `TableView({ name, mode })`: a table's rows (`mode` `"data"`) or
+    structure (`"structure"`).
+  - `QueryView({ initial, title, onTitle })`: the SQL editor, loaded with
+    the first one shown.
+  - `Diagram({ onOpen })`: the schema diagram; `onOpen(table)` on opening a
+    table from it.
+- `Grid`: the virtualized grid on its own, over props (`columns`, `count`,
+  `rowAt(i)`, `need(from, to)`, `types`, `sort`, `onSort`, `onPick`,
+  `onEdit`, ...; see `src/components/Grid.jsx`).
+
+### The cloud pages
+
+Each takes `{ org, onOpenDatabase, onNavigate }` (`org` defaults to the org in
+view) and renders inside the console's page container:
+
+- `Databases`: list, create (empty, upload, branch, restore to a time),
+  tokens, rename, delete and restore, protection, blocking, export.
+  `onOpenDatabase({ org, database }, renamedFrom)` opens one; `current`
+  (`{org, database}`) is the one the app has open, reopened when renamed.
+- `Groups`: groups and locations.
+- `Members`: members, roles and invites, and the user's own invites.
+- `Usage`: rows, statements, errors and latency, and top queries.
+- `OrgSettings`: the org, and deleting it (then `onNavigate("databases")`).
+- `PlatformTokens`: the user's API tokens.
+- `Users`: the server's users, for a server admin.
+
+`CLOUD_PAGES` lists them as the stock console does:
+`[{key, label, icon, component, admin}]`.
+
+### Building blocks
+
+- `Toasts` / `useToast()`: `push(text, isError, action?)`, `action` being
+  `{label, run}` (Undo). `ConsoleProvider` holds a `Toasts`.
+- `Drawer({ title, subtitle, footer, onClose, wide, children })`: the panel
+  that slides in from the right; `Field({ label, help, children })` is its
+  form row.
+- `MenuButton({ label, items, className, title })`, `MenuList({ items, x, y,
+  onClose })` and `useContextMenu()`: menus of `{label, hint, danger,
+  disabled, onClick}` and `"-"`.
+- `TableDialog` and `ImportDialog`: creating or editing a table, importing
+  CSV or JSON, on the open database.
+- `Palette({ commands, onClose })`: the ⌘K palette over `{label, group,
+  hint, icon, run}`.
+- `Spinner({ label })`.
+- `@samyfodil/musql-console/style.css`: the style sheet and its tokens
+  (`--bg`, `--panel`, `--side`, `--line`, `--text`, `--dim`, `--accent`,
+  ...), light and dark.
+
+A shell that imports none of `createConsole` leaves the local studio (the
+sample, opening files, remote connections) out of its build.
+
