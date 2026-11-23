@@ -343,7 +343,8 @@ func (db *DB) wsNaturalRootpage(key wsCatalogKey) (int64, bool) {
 // which the synthetic root page names). What IS load-bearing is the last step -- carrying each surviving table's ROWS across by that root --
 // because those rows are this session's only copy of anything it has not
 // committed, and the re-derived tableMeta starts empty.
-func (db *DB) reloadSchemaFromSegmentCatalog(cookieMoved bool) bool {
+func (db *DB) reloadSchemaFromSegmentCatalog(cookieMoved bool) (reloaded bool) {
+	defer db.noteSchemaReloaded(&reloaded)
 	if !db.writableSchemaEditsActive() {
 		return false
 	}
