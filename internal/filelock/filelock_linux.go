@@ -10,3 +10,6 @@ const (
 	ofdSetlk = unix.F_OFD_SETLK
 	ofdGetlk = unix.F_OFD_GETLK
 )
+
+// einvalRetries is 0: Linux returns EINVAL only for a request it cannot serve.
+const einvalRetries = 0

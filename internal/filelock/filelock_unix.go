@@ -26,7 +26,7 @@ func LockRange(f *os.File, start, length int64, exclusive bool) (ok bool, err er
 		Len:    length,
 	}
 
-	if err := unix.FcntlFlock(f.Fd(), ofdSetlk, &lk); err != nil {
+	if err := setlk(f, &lk); err != nil {
 		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EACCES) {
 			return false, nil
 		}
@@ -46,5 +46,25 @@ func UnlockRange(f *os.File, start, length int64) error {
 		Len:    length,
 	}
 
-	return unix.FcntlFlock(f.Fd(), ofdSetlk, &lk)
+	return setlk(f, &lk)
 }
+
+// setlk is F_OFD_SETLK, asked again up to einvalRetries times while it fails
+// with EINVAL. macOS has returned EINVAL about once in 10^6 calls under
+// contention, on a valid descriptor and a valid lock, and no call made to
+// reproduce it has repeated it. A filesystem without OFD locks answers EINVAL
+// every time, so it still fails. The error names the call, so a failure that
+// reaches a caller says it came from the lock.
+func setlk(f *os.File, lk *unix.Flock_t) error {
+	for i := 0; ; i++ {
+		err := fcntlFlock(f.Fd(), ofdSetlk, lk)
+		if err == nil {
+			return nil
+		}
+		if i >= einvalRetries || !errors.Is(err, unix.EINVAL) {
+			return os.NewSyscallError("fcntl F_OFD_SETLK", err)
+		}
+	}
+}
+
+var fcntlFlock = unix.FcntlFlock
