@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { createContext, useCallback, useContext, useState } from "react";
 
 let seq = 0;
 
@@ -24,3 +24,19 @@ export function useToasts() {
 	);
 	return [el, push];
 }
+
+const Toast = createContext(null);
+
+/** Toasts shows the toasts of everything under it; useToast() pushes one. */
+export function Toasts({ children }) {
+	const [el, push] = useToasts();
+	return (
+		<Toast.Provider value={push}>
+			{children}
+			{el}
+		</Toast.Provider>
+	);
+}
+
+/** useToast is push(text, isError, action?) of the Toasts above. */
+export const useToast = () => useContext(Toast);

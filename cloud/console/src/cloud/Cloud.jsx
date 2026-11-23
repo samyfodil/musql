@@ -1,5 +1,6 @@
 // The console's cloud section: the side list (org switcher and pages) and the
-// pages of a musql cloud server, over the management API.
+// pages of a musql cloud server, over the management API. pages.jsx is the
+// pages as the package exports them.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { BarChart3, Boxes, Building2, Database, KeyRound, LogOut, MapPin, Puzzle, Settings, Users, UserCog } from "lucide-react";
@@ -10,7 +11,7 @@ import { Spinner } from "../components/Busy.jsx";
 import Logo, { slotIcon, SlotBoundary } from "../components/Logo.jsx";
 import { useOptions } from "../slots.js";
 import { fmt } from "../values.js";
-import { Access, api, Code, databaseToken, date, DatabaseType, Durability, FileFormat, message, Role, ROLES, roleName, stamp, typeName, unimplemented } from "./api.js";
+import { Access, api, cloudConnection, Code, date, DatabaseType, Durability, FileFormat, message, Role, ROLES, roleName, stamp, typeName, unimplemented } from "./api.js";
 import { server, signIn, signOut } from "./auth.js";
 import { cancelled, downloadExport, uploadFile } from "./transfer.js";
 
@@ -116,13 +117,13 @@ function SignInElsewhere() {
 	);
 }
 
-function SignedOut({ cloud, small }) {
+export function SignedOut({ cloud, small, host = true }) {
 	const { name } = useOptions().branding;
 	return (
 		<div className={small ? "sideempty" : "cloud-empty"}>
 			{!small && <Logo big />}
 			{small ? <h3>Cloud</h3> : <h1>{name}</h1>}
-			<p className="dim small">{cloud.auth.status === "starting" ? "Signing in…" : `Sign in to ${new URL(server).host} to manage its databases.`}</p>
+			<p className="dim small">{cloud.auth.status === "starting" ? "Signing in…" : host ? `Sign in to ${new URL(server).host} to manage its databases.` : "Sign in to manage your databases."}</p>
 			{cloud.auth.error && <p className="err small">{cloud.auth.error}</p>}
 			{cloud.auth.status !== "starting" && <button className="primary" onClick={signIn}>Sign in</button>}
 		</div>
@@ -174,10 +175,12 @@ export function CloudMain({ cloud, page, setPage, toast, onOpen, current, slot }
 	if (!cloud.me) return <Spinner label="Loading…" />;
 	if (!cloud.org) return <div className="empty"><h1>No organization</h1><p className="dim">You belong to none yet. Accept an invite or ask an admin.</p><MyInvites cloud={cloud} toast={toast} /></div>;
 	const props = { cloud, toast, setPage };
+	// The editor opens a cloud database by its connection: a URL and a token that renews.
+	const openDb = async (t, renamedFrom) => onOpen(await cloudConnection(t.org, t.database, t.url, t.readOnly), renamedFrom);
 	const ext = o.pages.find((p) => p.key === page && (!p.admin || cloud.admin));
 	return (
 		<div className="cloudpage">
-			{page === "databases" && <Databases {...props} onOpen={onOpen} current={current} />}
+			{page === "databases" && <Databases {...props} onOpen={openDb} current={current} />}
 			{page === "groups" && <Groups {...props} />}
 			{page === "members" && <Members {...props} />}
 			{page === "usage" && <UsagePage {...props} />}
@@ -189,7 +192,7 @@ export function CloudMain({ cloud, page, setPage, toast, onOpen, current, slot }
 	);
 }
 
-function Head({ title, sub, children }) {
+export function Head({ title, sub, children }) {
 	return (
 		<header className="cloudhead">
 			<div>
@@ -202,7 +205,7 @@ function Head({ title, sub, children }) {
 	);
 }
 
-function Loaded({ s, empty, children }) {
+export function Loaded({ s, empty, children }) {
 	if (s.loading && !s.data) return <Spinner label="Loading…" />;
 	if (s.error) return <p className={unimplemented(s.error) ? "dim pad" : "err pad"}>{unimplemented(s.error) ? NA : message(s.error)}</p>;
 	if (empty) return <div className="cloud-none dim">{empty}</div>;
@@ -211,7 +214,7 @@ function Loaded({ s, empty, children }) {
 
 // ---- databases ----
 
-function Databases({ cloud, toast, onOpen, setPage, current }) {
+export function Databases({ cloud, toast, onOpen, setPage, current }) {
 	const org = cloud.org;
 	const [s, reloadList] = useLoad(() => api.db.list({ org }).then((r) => r.databases), [org]);
 	const [deleted, reloadDeleted] = useLoad(() => api.db.listDeleted({ org }), [org]);
@@ -224,22 +227,11 @@ function Databases({ cloud, toast, onOpen, setPage, current }) {
 	const dbs = s.data ?? [];
 	const member = can(cloud, Role.MEMBER);
 
-	// connection is d as the editor opens it: its URL, and a token that renews itself.
-	async function connection(d) {
-		const readOnly = !member;
-		const first = await databaseToken(org, d.name, readOnly);
-		return {
-			name: `${org}/${d.name}`,
-			// The client resolves "v3/pipeline" against the URL, which drops a
-			// last path segment that has no trailing slash.
-			url: d.url.replace(/\/?$/, "/"),
-			token: first.token,
-			renewal: { exp: first.exp, mint: () => databaseToken(org, d.name, readOnly) },
-		};
-	}
+	// target is d as onOpen gets it; a viewer's token is read-only.
+	const target = (d) => ({ org, database: d.name, url: d.url, readOnly: !member });
 	async function open(d) {
 		try {
-			await onOpen(await connection(d));
+			await onOpen(target(d));
 		} catch (e) {
 			toast(message(e), true);
 		}
@@ -251,7 +243,7 @@ function Databases({ cloud, toast, onOpen, setPage, current }) {
 		reload();
 		if (current?.org !== org || current.database !== was.name) return;
 		try {
-			await onOpen(await connection(now), `${org}/${was.name}`);
+			await onOpen(target(now), `${org}/${was.name}`);
 		} catch (e) {
 			toast(message(e), true);
 		}
@@ -580,7 +572,7 @@ function RenameDb({ org, db, inEditor, toast, onClose }) {
 
 // ---- groups & locations ----
 
-function Groups({ cloud, toast }) {
+export function Groups({ cloud, toast }) {
 	const org = cloud.org;
 	const [s, reload] = useLoad(() => api.groups.list({ org }).then((r) => r.groups), [org]);
 	const [locs] = useLoad(() => api.groups.listLocations({}).then((r) => r.locations), []);
@@ -662,7 +654,7 @@ function NewGroup({ org, codes, toast, onClose }) {
 
 // ---- members ----
 
-function Members({ cloud, toast }) {
+export function Members({ cloud, toast }) {
 	const org = cloud.org;
 	const admin = can(cloud, Role.ADMIN);
 	const [s, reload] = useLoad(() => api.orgs.listMembers({ org }).then((r) => r.members), [org]);
@@ -720,7 +712,7 @@ function Members({ cloud, toast }) {
 	);
 }
 
-function MyInvites({ cloud, toast }) {
+export function MyInvites({ cloud, toast }) {
 	const [s, reload] = useLoad(() => api.orgs.listInvites({ org: "" }).then((r) => r.invites), []);
 	if (!s.data?.length) return null;
 	const accept = async (i) => {
@@ -766,7 +758,7 @@ function InviteDrawer({ org, roles, toast, onClose }) {
 
 // ---- org settings ----
 
-function OrgSettings({ cloud, toast, setPage }) {
+export function OrgSettings({ cloud, toast, setPage }) {
 	const [del, setDel] = useState(false);
 	const org = cloud.me.memberships.find((m) => m.org.slug === cloud.org)?.org;
 	if (!org) return null;
@@ -832,7 +824,7 @@ function DeleteOrg({ org, toast, onClose }) {
 
 // ---- users (server admins) ----
 
-function UsersPage({ toast }) {
+export function UsersPage({ toast }) {
 	const [s, reload] = useLoad(() => api.users.list({}).then((r) => r.users), []);
 	const [drawer, setDrawer] = useState(null); // "create" | {reset: user}
 	const setDisabled = async (u, disabled, quiet) => {
@@ -921,7 +913,7 @@ function ResetPassword({ user, toast, onClose }) {
 
 // ---- platform tokens ----
 
-function PlatformTokens({ toast }) {
+export function PlatformTokens({ toast }) {
 	const [s, reload] = useLoad(() => api.auth.listPlatformTokens({}).then((r) => r.tokens), []);
 	const [mint, setMint] = useState(false);
 	const revoke = async (t) => {
@@ -980,7 +972,7 @@ const SERIES = [
 	["errors", "errors", "#e03131"],
 ];
 
-function UsagePage({ cloud }) {
+export function UsagePage({ cloud }) {
 	const org = cloud.org;
 	const [dbs] = useLoad(() => api.db.list({ org }).then((r) => r.databases), [org]);
 	const [pick, setPick] = useState(""); // "" = the whole org

@@ -36,11 +36,10 @@ const bearer = (next) => async (req) => {
 export let transport = null;
 export let api = null;
 
-/** setBaseURL points the clients at baseURL, the server's own origin when it is null. */
-export function setBaseURL(baseURL) {
-	const base = baseURL || server;
-	transport = base && createConnectTransport({ baseUrl: base, interceptors: [bearer] });
-	api = base && {
+/** setTransport makes every client call over t, or none when t is null. */
+export function setTransport(t) {
+	transport = t || null;
+	api = transport && {
 		ai: createClient(AIService, transport),
 		auth: createClient(AuthService, transport),
 		db: createClient(DatabaseService, transport),
@@ -48,6 +47,12 @@ export function setBaseURL(baseURL) {
 		orgs: createClient(OrgService, transport),
 		users: createClient(UserService, transport),
 	};
+}
+
+/** setBaseURL points the clients at baseURL, the server's own origin when it is null. */
+export function setBaseURL(baseURL) {
+	const base = baseURL || server;
+	setTransport(base && createConnectTransport({ baseUrl: base, interceptors: [bearer] }));
 }
 setBaseURL(null);
 
@@ -87,4 +92,20 @@ export async function databaseToken(org, name, readOnly) {
 		if (authState().status === "out") throw new Error(`Signed out: sign in again to reach ${org}/${name}.`);
 		throw e;
 	}
+}
+
+/**
+ * cloudConnection is a cloud database as the editor opens it: its name
+ * (org/name), its Hrana URL, and a token that renews itself.
+ */
+export async function cloudConnection(org, name, url, readOnly) {
+	const first = await databaseToken(org, name, readOnly);
+	return {
+		name: `${org}/${name}`,
+		// The client resolves "v3/pipeline" against the URL, which drops a
+		// last path segment that has no trailing slash.
+		url: url.replace(/\/?$/, "/"),
+		token: first.token,
+		renewal: { exp: first.exp, mint: () => databaseToken(org, name, readOnly) },
+	};
 }

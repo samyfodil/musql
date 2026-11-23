@@ -40,14 +40,3 @@ export async function listDbs() {
 }
 
 export const forgetDb = (name) => tx("readwrite", (s) => s.delete(name)).catch(() => {});
-
-/** Per-database view state (open tabs), in localStorage. */
-export function viewState(name, v) {
-	const key = `musql-studio:view:${name}`;
-	try {
-		if (v === undefined) return JSON.parse(localStorage.getItem(key) ?? "null");
-		localStorage.setItem(key, JSON.stringify(v));
-	} catch {
-		return null;
-	}
-}
