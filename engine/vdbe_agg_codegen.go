@@ -1527,7 +1527,7 @@ func bindAggOuterRefsReason(c *compiler, allAggs []*aggItem, regRow bool, items 
 				walk(a)
 			}
 			if x.Sub != nil {
-				markSubqueryCorrelated(c)
+				markSubqueryCorrelated(c, x)
 			}
 		case BetweenExpr:
 			walk(x.X)
@@ -1560,9 +1560,9 @@ func bindAggOuterRefsReason(c *compiler, allAggs []*aggItem, regRow bool, items 
 		// reasoning, sql_agg.go) -- but its BODY may still reach a query
 		// enclosing c at run time, which is what markSubqueryCorrelated is for.
 		case SubqueryExpr:
-			markSubqueryCorrelated(c)
+			markSubqueryCorrelated(c, x)
 		case ExistsExpr:
-			markSubqueryCorrelated(c)
+			markSubqueryCorrelated(c, x)
 		default:
 		}
 	}
@@ -1600,10 +1600,17 @@ func bindAggOuterRefsReason(c *compiler, allAggs []*aggItem, regRow bool, items 
 // enclosing column at run time. bindAggOuterRefs does not descend into
 // subqueries, so nothing else sets the flag; uncorrelated, the sub-Program runs
 // once with no parent and the inner reference fails (aggnested.test: "SELECT
-// (SELECT sum(x+(SELECT y)) FROM bb) FROM aa"). Conservative: it costs only the
-// run-once caching. Only taken when an enclosing row exists.
-func markSubqueryCorrelated(c *compiler) {
+// (SELECT sum(x+(SELECT y)) FROM bb) FROM aa"). Only taken when an enclosing
+// row exists and the subquery names something outside itself, as C sets
+// isCorrelated only for a name that resolves further out (resolve.c:542): a
+// compile marked correlated re-runs for every outer row, so an IN over an
+// aggregate query whose HAVING holds "(SELECT max(...) FROM cte)" ran its whole
+// body per probe (TPC-DS q23, #376).
+func markSubqueryCorrelated(c *compiler, e Expr) {
 	if c == nil || (c.outer == nil && c.rowOuter == nil) {
+		return
+	}
+	if c.subNamesOnlyItself(e) {
 		return
 	}
 	if c.rowOuter == nil && !enclosingOffersRow(c.outer) {
@@ -1613,6 +1620,20 @@ func markSubqueryCorrelated(c *compiler) {
 		p.correlated = true
 	}
 	c.poisonSubSinks()
+}
+
+// subNamesOnlyItself reports that every name in e's subqueries resolves inside
+// them, so none can bind a row of c's query or one enclosing it.
+func (c *compiler) subNamesOnlyItself(e Expr) bool {
+	if c.pager == nil {
+		return false
+	}
+	outside := false
+	ok := wherePlanSubqueryNames(c.pager, e, func(ColumnExpr) bool {
+		outside = true
+		return false
+	})
+	return ok && !outside
 }
 
 // enclosingOffersRow reports whether any compile enclosing oc (inclusive) can
