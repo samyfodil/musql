@@ -193,6 +193,30 @@ The server is its own issuer at `public_url`:
   stream runs on the read-only handle, where the engine refuses any write
   (`query_only` locked on, so nothing in the statement can lift it), and a
   stream opened for writing before refuses every statement.
+- **Access policy**, per org and database, for an app that embeds the
+  server (a lapsed subscription, a used-up quota):
+  `server.WithAccessPolicy(func(ctx, org, db) server.Policy)`, where
+  `Policy{Access, Reason}` is `Allow` (the zero value), `ReadOnly` or
+  `Deny`, on top of what each token grants. It rides on the blocks above:
+  each open database asks the policy when a client first reaches it and
+  again at the first statement after its answer is a second old, and lays
+  it over its own
+  blocks (`ReadOnly` as `block_writes`, `Deny` as `block_reads`, the
+  stronger refusal winning), so HTTP and WebSocket clients, the console's
+  included, and a stream already open, are refused with `BLOCKED` and
+  "Operation was blocked: <Reason>" within a second of a change. A libSQL
+  WebSocket connection keeps one stream for its life, so one opened before
+  a change to `ReadOnly` refuses reads too, as under `block_writes`, and one
+  opened while writes were refused keeps the read-only handle after they are
+  allowed again, until it reconnects; HTTP clients take a stream per request.
+  Management calls stay open so an org can still fix its account, except
+  the ones that read or write data: Export and AI SQL need the database not
+  denied, an in-place Restore needs it allowed, and Create (branches and
+  uploads too) and a Restore into a new database need the org allowed (asked
+  with `db` nil) and their source not denied; they fail with
+  `FAILED_PRECONDITION` and the reason. The policy is asked on the statement
+  path, so the embedder answers from its own cache. Without the option
+  nothing is asked.
 - **In a cluster** the records are state like any other. Each node's
   placement closes a database whose record is deleted and keeps its files;
   a restored one is opened again by placement on every node of its group,

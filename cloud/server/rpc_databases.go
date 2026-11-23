@@ -103,11 +103,17 @@ func (s databaseService) Create(ctx context.Context, req *connect.Request[v1.Cre
 	if err := validName("database", m.Name); err != nil {
 		return nil, err
 	}
+	if err := s.admit(ctx, o, nil, Allow); err != nil {
+		return nil, err
+	}
 	var src *state.Database
 	switch {
 	case m.GetBranchOf() != "":
 		if src, err = s.store.Database(ctx, o.ID, m.GetBranchOf()); err != nil {
 			return nil, rpcErr(err)
+		}
+		if err := s.admit(ctx, o, src, ReadOnly); err != nil {
+			return nil, err
 		}
 		// A branch of a regular database is made from its master's history.
 		if c, err := s.atMaster(ctx, src); c != nil || err != nil {
@@ -440,8 +446,11 @@ func (s databaseService) InvalidateTokens(ctx context.Context, req *connect.Requ
 const exportChunk = 1 << 20
 
 func (s databaseService) Export(ctx context.Context, req *connect.Request[v1.ExportRequest], stream *connect.ServerStream[v1.ExportResponse]) error {
-	_, d, _, err := s.lookup(ctx, req, req.Msg.Org, req.Msg.Name, state.RoleMember)
+	o, d, _, err := s.lookup(ctx, req, req.Msg.Org, req.Msg.Name, state.RoleMember)
 	if err != nil {
+		return err
+	}
+	if err := s.admit(ctx, o, d, ReadOnly); err != nil {
 		return err
 	}
 	if c, err := s.atMaster(ctx, d); c != nil || err != nil {

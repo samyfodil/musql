@@ -29,7 +29,7 @@ type env struct {
 	admin string
 }
 
-func newEnv(t *testing.T, extra string) *env {
+func newEnv(t *testing.T, extra string, opts ...Option) *env {
 	t.Helper()
 	dir := t.TempDir()
 	cfg, err := ParseConfig([]byte(`
@@ -46,7 +46,7 @@ node:
 	var h http.Handler
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { h.ServeHTTP(w, r) }))
 	cfg.PublicURL = ts.URL
-	s, err := New(context.Background(), cfg, nil)
+	s, err := New(context.Background(), cfg, nil, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}

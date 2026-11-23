@@ -58,6 +58,8 @@ type Server struct {
 
 	// deletedRetention is WithDeletedRetention's; nil keeps the config's.
 	deletedRetention func(ctx context.Context, org *state.Org) time.Duration
+	// accessPolicy is WithAccessPolicy's; nil allows what tokens grant.
+	accessPolicy func(ctx context.Context, org *state.Org, db *state.Database) Policy
 }
 
 // Option configures a Server beyond its config file.
