@@ -1,6 +1,14 @@
 {
   "name": "@samyfodil/musql-console",
   "private": true,
+  "version": "0.0.0",
+  "description": "The musql console as a React library: a browser database editor over @samyfodil/musql, with slots for an app's own pages, tabs, banners, name and theme.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/samyfodil/musql.git",
+    "directory": "cloud/console"
+  },
   "type": "module",
   "exports": {
     ".": "./src/index.js",
