@@ -208,8 +208,10 @@ jobs:
   # The two npm packages, to the public registry at the tag's version:
   # @samyfodil/musql (npm/), the wasm module built from this tag and tested,
   # then @samyfodil/musql-console (cloud/console, packed by pack.mjs), which
-  # depends on it at the same version. NPM_TOKEN is a token that can publish
-  # the @samyfodil scope.
+  # depends on it at the same version. They publish by npm's trusted
+  # publishing: each package on npmjs names this repository and release.yml as
+  # its publisher, and the job's OIDC token (id-token: write) stands in for an
+  # npm token. That needs npm 11.5.1 or later.
   npm:
     runs-on: ubuntu-latest
     permissions:
@@ -225,6 +227,7 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
           scope: "@samyfodil"
+      - run: npm install -g npm@^11.5.1
       - name: build and test
         run: |
           set -euo pipefail
@@ -235,12 +238,10 @@ jobs:
           npm test
           ./test-package.sh
       - name: publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          (cd npm && npm version "$version" --no-git-tag-version --allow-same-version && npm publish --provenance --access public)
+          (cd npm && npm version "$version" --no-git-tag-version --allow-same-version && npm publish --access public)
           node cloud/console/pack.mjs "$version" "$RUNNER_TEMP/console"
           cd "$RUNNER_TEMP/console"
-          npm publish --provenance --access public
+          npm publish --access public
