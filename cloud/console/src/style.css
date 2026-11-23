@@ -177,7 +177,7 @@ button:disabled { opacity: .45; cursor: default; }
 
 /* tabs */
 .main { display: grid; grid-template-rows: auto 1fr; min-width: 0; min-height: 0; }
-.tabs { display: flex; gap: 2px; padding: 6px 8px 0; border-bottom: 1px solid var(--line); overflow-x: auto; background: var(--bg); }
+.tabs { display: flex; gap: 2px; padding: 6px 8px 0; border-bottom: 1px solid var(--line); overflow-x: auto; overflow-y: hidden; background: var(--bg); }
 .tab {
 	display: flex;
 	align-items: center;
@@ -486,6 +486,12 @@ button.pressed { background: var(--hover); border-color: var(--dim); }
 .railbtn { width: 36px; height: 36px; padding: 0; border: 0; border-radius: 8px; background: transparent; color: var(--dim); font-size: 15px; display: grid; place-items: center; }
 .railbtn:hover:not(:disabled) { background: var(--hover); color: var(--text); }
 .railbtn.on { background: var(--accent-soft); color: var(--accent); }
+.app.norail { grid-template-columns: 248px minmax(0, 1fr); }
+.app.norail .side { grid-column: 1; }
+.app.norail .main { grid-column: 2; }
+.wsctl { display: flex; align-items: center; gap: 2px; }
+.wsctl .railbtn { width: 32px; height: 30px; }
+.wsctl .grow { flex: none; width: 1px; height: 18px; margin: 0 6px; background: var(--line); }
 
 .app .side { grid-column: 2; display: flex; flex-direction: column; gap: 6px; padding: 10px 8px; overflow: auto; background: var(--side); border-right: 1px solid var(--line); }
 .dbswitch .dbbtn { width: 100%; display: flex; align-items: center; gap: 6px; text-align: left; font-weight: 600; padding: 7px 10px; background: var(--panel); }
@@ -625,6 +631,9 @@ button.pressed { background: var(--hover); border-color: var(--dim); }
 }
 @media (max-width: 760px) {
 	.app.sideopen .side { display: flex; position: fixed; left: 52px; top: 0; bottom: 0; width: min(280px, 80vw); z-index: 35; box-shadow: var(--shadow); }
+	.app.norail { grid-template-columns: minmax(0, 1fr); }
+	.app.norail .main { grid-column: 1; }
+	.app.norail.sideopen .side { left: 0; }
 }
 button svg { vertical-align: -2px; flex: none; }
 .chipbtn, .tbar .primary, .kbdbtn { display: inline-flex; align-items: center; gap: 6px; }

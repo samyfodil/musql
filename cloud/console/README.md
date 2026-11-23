@@ -224,7 +224,11 @@ The server the provider is bound to:
   SQL editor with AI SQL, the schema diagram, the row and column panels, over
   Hrana with a token it mints (read-only for a viewer) and renews. It fills
   its container; one database is open at a time on a page, so key it by
-  `org/database`.
+  `org/database`. `controls`, an element of the host's such as a slot in
+  its header, takes the section and search buttons instead of the rail on
+  the left; `title: false` drops the database's name and menu above the
+  table list, for a host that already shows which database is open:
+  `DatabaseWorkspace({ org, database, controls, title })`.
 - `DatabaseProvider({ org, database, children })`: opens the database for
   the parts below, laid out as the app likes; `useDatabase()` under it gives
   `{org, database, phase, error, readOnly, schema, counts, reload,

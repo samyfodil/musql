@@ -2,6 +2,7 @@
 // DatabaseProvider opens it over Hrana with a token it mints and renews, and
 // DatabaseWorkspace is the editor the stock console shows for it.
 import { Suspense, createContext, useContext, useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import { Globe, Keyboard, Network, Search, SquareTerminal, Table2 } from "lucide-react";
 import { close, connect } from "../db.js";
 import { api, cloudConnection, message, Role } from "../cloud/api.js";
@@ -115,17 +116,21 @@ const SECTIONS = [
 /**
  * DatabaseWorkspace is what the stock console shows for a cloud database: the
  * table list, table editor and grid, SQL editor with AI SQL, schema diagram,
- * and the row and column panels. It fills its container.
+ * and the row and column panels. It fills its container. Given controls, an
+ * element of the host's (its header, say), the section and search buttons go
+ * there instead of the rail on the left. title false drops the database's
+ * name and menu above the table list, for a host that already shows which
+ * database is open; its download is in the command palette too.
  */
-export function DatabaseWorkspace({ org, database }) {
+export function DatabaseWorkspace({ org, database, controls, title = true }) {
 	return (
 		<DatabaseProvider org={org} database={database}>
-			<Workspace />
+			<Workspace controls={controls} title={title} />
 		</DatabaseProvider>
 	);
 }
 
-function Workspace() {
+function Workspace({ controls, title }) {
 	const { ws, org, database, phase, error } = useContext(Db);
 	const cloud = useCloud();
 	const [palette, setPalette] = useState(false);
@@ -168,21 +173,25 @@ function Workspace() {
 		ws.enter(sec);
 	}
 
+	const buttons = (
+		<>
+			{SECTIONS.map(([k, ic, label]) => (
+				<button key={k} className={`railbtn${ws.section === k ? " on" : ""}`} title={label} disabled={!ws.name && k !== "tables"} onClick={() => goSection(k)}>
+					{ic}
+				</button>
+			))}
+			<span className="grow" />
+			<button className="railbtn" title="Search everything (⌘K)" onClick={() => setPalette(true)}><Search size={17} /></button>
+			<button className="railbtn" title="Keyboard shortcuts (?)" onClick={() => setKeys(true)}><Keyboard size={17} /></button>
+		</>
+	);
+
 	return (
-		<div className={`app workspace${sideOpen ? " sideopen" : ""}`}>
+		<div className={`app workspace${sideOpen ? " sideopen" : ""}${controls ? " norail" : ""}`}>
 			<BusyBar />
-			<nav className="rail">
-				{SECTIONS.map(([k, ic, label]) => (
-					<button key={k} className={`railbtn${ws.section === k ? " on" : ""}`} title={label} disabled={!ws.name && k !== "tables"} onClick={() => goSection(k)}>
-						{ic}
-					</button>
-				))}
-				<span className="grow" />
-				<button className="railbtn" title="Search everything (⌘K)" onClick={() => setPalette(true)}><Search size={17} /></button>
-				<button className="railbtn" title="Keyboard shortcuts (?)" onClick={() => setKeys(true)}><Keyboard size={17} /></button>
-			</nav>
+			{controls ? createPortal(<nav className="wsctl">{buttons}</nav>, controls) : <nav className="rail">{buttons}</nav>}
 			<aside className="side">
-				<div className="dbswitch">
+				{title && <div className="dbswitch">
 					<MenuButton
 						className="dbbtn"
 						label={<>
@@ -193,7 +202,7 @@ function Workspace() {
 						</>}
 						items={[{ label: "Download as SQL dump", hint: ".sql", disabled: !ws.name, onClick: dump }]}
 					/>
-				</div>
+				</div>}
 				<WorkspaceSide ws={ws} onPick={() => setSideOpen(false)} />
 			</aside>
 			<main className="main">
