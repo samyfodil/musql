@@ -306,8 +306,10 @@ func (s *Server) removeFiles(d *state.Database) {
 	s.closeReplicated(d.ID)
 	s.closeHistory(d.ID)
 	removeDBFiles(s.log, s.dbPath(d))
-	if err := os.RemoveAll(s.histDir(d)); err != nil {
-		s.log.Printf("remove %s: %v", s.histDir(d), err)
+	for _, dir := range []string{s.histDir(d), s.handlerDir(d)} {
+		if err := os.RemoveAll(dir); err != nil {
+			s.log.Printf("remove %s: %v", dir, err)
+		}
 	}
 }
 
@@ -400,6 +402,10 @@ func (s *Server) serveDB(w http.ResponseWriter, r *http.Request) {
 	r2 := r.Clone(ctx)
 	r2.URL.Path = "/" + sub
 	r2.URL.RawPath = ""
+	if h := s.dbHandler(r2); h != nil {
+		s.serveDBHandler(w, r2, h, o, d, e)
+		return
+	}
 	e.srv.ServeHTTP(w, r2)
 }
 

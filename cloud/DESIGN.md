@@ -222,6 +222,19 @@ The server is its own issuer at `public_url`:
   `FAILED_PRECONDITION` and the reason. The policy is asked on the statement
   path, so the embedder answers from its own cache. Without the option
   nothing is asked.
+- **Database handlers**, for an app that embeds the server and serves more
+  of a database's URL than Hrana does (a sync protocol, say):
+  `server.WithDatabaseHandler(pattern, func(server.DatabaseRequest)
+  http.Handler)`, where pattern is a `net/http` ServeMux pattern over the
+  path after the database's name (`GET /info` serves
+  `/db/<org>/<name>/info`) and wins over Hrana's paths. A request it matches
+  goes where a Hrana request would, its group's master in a cluster, and is
+  refused as Hrana would refuse it: 401 for its bearer token, 403 and the
+  reason while the database's blocks or the access policy refuse reads.
+  The handler gets the org, the database record, its file, the token's
+  `hrana.Access` (read-only too while writes are refused) and a directory
+  of its own for the database, under `handlers/` in the data directory and
+  removed with the database's files.
 - **In a cluster** the records are state like any other. Each node's
   placement closes a database whose record is deleted and keeps its files;
   a restored one is opened again by placement on every node of its group,
