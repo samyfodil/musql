@@ -12,3 +12,6 @@ const (
 	ofdSetlk = 90
 	ofdGetlk = 92
 )
+
+// einvalRetries is how many times setlk asks again after a spurious EINVAL.
+const einvalRetries = 3
