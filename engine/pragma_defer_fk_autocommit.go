@@ -154,7 +154,7 @@ func (db *DB) deferFKAutocommitClearOfDML(trimmed string) deferFKClear {
 	if len(db.attached) != 0 {
 		return deferFKUnknown
 	}
-	if _, err := db.cachedWriteProgram(trimmed); err != nil {
+	if _, _, err := db.cachedWriteProgram(trimmed, nil); err != nil {
 		return deferFKKept
 	}
 	return deferFKCleared

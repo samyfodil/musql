@@ -982,7 +982,8 @@ func (db *DB) wsReloadVanishObject(name string) {
 // is", never an error, so it is safe from rollbackTxn/rollbackToSavepoint (C's
 // reload never fails outright, prepare.c:390-406) and
 // writableSchemaResetDecline.
-func (db *DB) reloadSchemaFromEdits() bool {
+func (db *DB) reloadSchemaFromEdits() (reloaded bool) {
+	defer db.noteSchemaReloaded(&reloaded)
 	if db.writableSchemaReload() {
 		return true
 	}
@@ -994,6 +995,15 @@ func (db *DB) reloadSchemaFromEdits() bool {
 		db.wsReloadVanishObject(name)
 	}
 	return true
+}
+
+// noteSchemaReloaded moves schemaGen when *reloaded: the reloaded catalog's
+// tables are new tableMetas, and a write program compiled before it holds
+// the old ones (cachedWriteProgram).
+func (db *DB) noteSchemaReloaded(reloaded *bool) {
+	if *reloaded {
+		db.schemaGen++
+	}
 }
 
 // ---- the three statement kinds ----

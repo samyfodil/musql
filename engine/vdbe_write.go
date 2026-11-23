@@ -353,7 +353,11 @@ func openRowStoreCursor(tbl *tableMeta) *vdbeCursor {
 //     clones while restoring the cookie's number;
 //   - Program.WritePager: a program reading a frozen snapshot is never cached,
 //     or "INSERT INTO t SELECT ... FROM t" would re-read its first snapshot.
-func (db *DB) cachedWriteProgram(sqlText string) (*Program, error) {
+//
+// A statement whose literals a shape makes parameters runs its shape's program
+// (shapedWrite), with those literals appended to args: the returned args are
+// the ones to run the program with.
+func (db *DB) cachedWriteProgram(sqlText string, args []Value) (*Program, []Value, error) {
 	// reverse_unordered_selects is read at compile time -- the scan order a
 	// write's subqueries and its one-pass choice take -- so a program compiled
 	// under one setting is not the program for the other, as for the read plan
@@ -372,24 +376,37 @@ func (db *DB) cachedWriteProgram(sqlText string) (*Program, error) {
 	// same string, which compares without hashing it. Only a program the map
 	// holds is remembered, so the cache's own invalidation above covers it.
 	if db.lastWritePlan != nil && sqlText == db.lastWritePlanText {
-		return db.lastWritePlan, nil
+		return db.lastWritePlan, args, nil
 	}
 	if p, ok := db.writePlans[sqlText]; ok {
 		db.lastWritePlanText, db.lastWritePlan = sqlText, p
-		return p, nil
+		return p, args, nil
 	}
-	db.runFold = false
-	p, err := db.compileWrite(sqlText)
+	if p, params := db.shapedWrite(sqlText, args); p != nil {
+		return p, params, nil
+	}
+	p, ok, err := db.compileCacheable(sqlText, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	if ok {
+		db.writePlans[sqlText] = p
+	}
+	return p, args, nil
+}
+
+// compileCacheable is compileWrite(sqlText) of pre (compileWriteOf), and
+// whether the program may be kept for another run.
+func (db *DB) compileCacheable(sqlText string, pre any) (*Program, bool, error) {
+	db.runFold = false
+	p, err := db.compileWriteOf(sqlText, pre)
+	if err != nil {
+		return nil, false, err
 	}
 	if !segPeepholesOffForTest {
 		segWriteFilterPeephole(p) // see its doc comment for the shapes it may touch
 	}
-	if (p.WritePager == nil || p.FreshWritePager) && !db.runFold {
-		db.writePlans[sqlText] = p
-	}
-	return p, nil
+	return p, (p.WritePager == nil || p.FreshWritePager) && !db.runFold, nil
 }
 
 // tryVDBEWrite compiles sqlText into a write Program and runs it. A compile
@@ -401,7 +418,7 @@ func (db *DB) tryVDBEWrite(sqlText string, args []Value) (rowsAffected, lastInse
 	if sqlText != db.trimIn || sqlText == "" {
 		db.trimIn, db.trimOut = sqlText, strings.TrimSpace(sqlText)
 	}
-	prog, cerr := db.cachedWriteProgram(db.trimOut)
+	prog, args, cerr := db.cachedWriteProgram(db.trimOut, args)
 	if cerr != nil {
 		// A parse/lex error, or the statement's verb is one this write path
 		// does not run at all (unsupportedStatementErr, compileWriteProgram's
@@ -417,7 +434,7 @@ func (db *DB) tryVDBEWrite(sqlText string, args []Value) (rowsAffected, lastInse
 // its result set -- so RETURNING is
 // not a second way into the engine's write execution, just another program.
 func (db *DB) execReturningViaVM(sqlText string, args []Value) (cols []string, rows [][]Value, err error) {
-	prog, cerr := db.cachedWriteProgram(strings.TrimSpace(sqlText))
+	prog, args, cerr := db.cachedWriteProgram(strings.TrimSpace(sqlText), args)
 	if cerr != nil {
 		return nil, nil, cerr
 	}
@@ -772,10 +789,16 @@ func (wc *writeCtx) rollback() {
 // A statement no case names is an ERROR -- unsupportedStatementErr -- not
 // something handed to a second executor. See AGENTS.md Rule 1.
 func (db *DB) compileWrite(sqlText string) (*Program, error) {
+	return db.compileWriteOf(sqlText, nil)
+}
+
+// compileWriteOf is compileWrite with sqlText's INSERT, UPDATE or DELETE
+// already parsed as pre, or parsed here when pre is nil.
+func (db *DB) compileWriteOf(sqlText string, pre any) (*Program, error) {
 	outer := db.aincCollect
 	var ainc []*tableMeta
 	db.aincCollect = &ainc
-	prog, err := db.compileWriteProgram(sqlText)
+	prog, err := db.compileWriteProgram(sqlText, pre)
 	db.aincCollect = outer
 	if prog != nil {
 		prog.Ainc = ainc
@@ -804,7 +827,7 @@ func stmtCountsChanges(sqlText string) bool {
 	return false
 }
 
-func (db *DB) compileWriteProgram(sqlText string) (*Program, error) {
+func (db *DB) compileWriteProgram(sqlText string, pre any) (*Program, error) {
 	toks, err := lexWriteText(sqlText)
 	if err != nil {
 		return nil, err
@@ -845,11 +868,23 @@ func (db *DB) compileWriteProgram(sqlText string) (*Program, error) {
 		case "INSERT", "REPLACE":
 			// REPLACE is INSERT with OE_Replace (parse.y:1114); parseInsertStmt sets the
 			// conflict action itself.
-			prog, err = totalWrite(db.compileInsertWrite(sqlText))(sqlText)
+			if st, ok := pre.(*insertStmt); ok {
+				prog, err = totalWrite(db.compileInsertStmt(st, nil))(sqlText)
+			} else {
+				prog, err = totalWrite(db.compileInsertWrite(sqlText))(sqlText)
+			}
 		case "UPDATE":
-			prog, err = totalWrite(db.compileUpdateWrite(sqlText))(sqlText)
+			if st, ok := pre.(*updateStmt); ok {
+				prog, err = totalWrite(db.compileUpdateStmt(st, nil))(sqlText)
+			} else {
+				prog, err = totalWrite(db.compileUpdateWrite(sqlText))(sqlText)
+			}
 		default:
-			prog, err = totalWrite(db.compileDeleteWrite(sqlText))(sqlText)
+			if st, ok := pre.(*deleteStmt); ok {
+				prog, err = totalWrite(db.compileDeleteStmt(st, nil))(sqlText)
+			} else {
+				prog, err = totalWrite(db.compileDeleteWrite(sqlText))(sqlText)
+			}
 		}
 		if prog != nil {
 			// Record the DML target so runWrite can raise an unresolvable foreign key
