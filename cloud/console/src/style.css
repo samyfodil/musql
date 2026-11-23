@@ -633,7 +633,7 @@ button.pressed { background: var(--hover); border-color: var(--dim); }
 	.app.sideopen .side { display: flex; position: fixed; left: 52px; top: 0; bottom: 0; width: min(280px, 80vw); z-index: 35; box-shadow: var(--shadow); }
 	.app.norail { grid-template-columns: minmax(0, 1fr); }
 	.app.norail .main { grid-column: 1; }
-	.app.norail.sideopen .side { left: 0; }
+	.app.norail.sideopen .side { position: absolute; left: 0; }
 }
 button svg { vertical-align: -2px; flex: none; }
 .chipbtn, .tbar .primary, .kbdbtn { display: inline-flex; align-items: center; gap: 6px; }
