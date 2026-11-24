@@ -6,9 +6,10 @@ import (
 )
 
 // TestSegSortedSeekMultiKey: a sorted seek keyed on two columns is served from
-// the segments on its first column where that column's runs are short, and
-// answers as the seek defeated by a CAST does; where the first column holds
-// few values its runs are most of the table, and the built rows serve it.
+// the segments, and answers as the seek defeated by a CAST does, also where
+// the first column holds few values and its runs are most of the table: each
+// run is sorted on the second column, and a seek takes the stretch equal on
+// both.
 func TestSegSortedSeekMultiKey(t *testing.T) {
 	stmts := []string{
 		`CREATE TABLE c (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, y INTEGER)`,
@@ -38,7 +39,7 @@ func TestSegSortedSeekMultiKey(t *testing.T) {
 		{`SELECT c.id, count(o.id) FROM c LEFT JOIN o ON o.cid = c.a AND o.k2 = c.b GROUP BY c.id`,
 			`SELECT c.id, count(o.id) FROM c LEFT JOIN o ON CAST(o.cid AS INTEGER) = c.a AND CAST(o.k2 AS INTEGER) = c.b GROUP BY c.id`, true},
 		{`SELECT c.id, count(o.id) FROM c JOIN o ON o.yr = c.y AND o.k2 = c.b GROUP BY c.id`,
-			`SELECT c.id, count(o.id) FROM c JOIN o ON CAST(o.yr AS INTEGER) = c.y AND CAST(o.k2 AS INTEGER) = c.b GROUP BY c.id`, false},
+			`SELECT c.id, count(o.id) FROM c JOIN o ON CAST(o.yr AS INTEGER) = c.y AND CAST(o.k2 AS INTEGER) = c.b GROUP BY c.id`, true},
 	} {
 		segSortedSeeksServed.Store(0)
 		got := p.mustFast(tc.seek)
