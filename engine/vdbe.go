@@ -4284,6 +4284,7 @@ func (m *vdbe) execOpenRead(op *Instruction, insns []Instruction) error {
 	cur := m.openCursorInto(op.P1, rp, op.P4.(*resolvedTable))
 	cur.streamable = op.P5&1 != 0
 	cur.streamIfOrdered = op.P5&4 != 0
+	cur.scanList = op.P5&5 == 0 && scanListCursor(insns, op.P1)
 	// A cursor native code seeks never rewinds here, but may step here. A
 	// table's rows count (billedCursors).
 	cur.billLeft = math.MaxInt64
@@ -4441,6 +4442,22 @@ func (m *vdbe) execAutoIndexOrder(op *Instruction) error {
 		return nil
 	}
 	return m.orderCursor(cur, op.P4.(*autoIndexKey), false)
+}
+
+// scanListCursor reports whether nothing in insns seeks cursor c, orders its
+// rows, or marks them by position, so that its rows may be a segment list.
+func scanListCursor(insns []Instruction, c int) bool {
+	for i := range insns {
+		if insns[i].P1 != c {
+			continue
+		}
+		switch insns[i].Op {
+		case OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpSeekRowidSetHint, OpAutoIndexOrder, OpSortedSeek,
+			OpMultiOrTag, OpMultiOrSort, OpRightJoinMark, OpRightJoinSweepRewind, OpRightJoinSweepNext, OpRightJoinSweepOrder:
+			return false
+		}
+	}
+	return true
 }
 
 // applyPendingOrder puts cur's rows in the order an OpAutoIndexOrder left

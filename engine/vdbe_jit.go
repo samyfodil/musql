@@ -2031,14 +2031,14 @@ func (jx *vmJIT) segModeOK(c int, cur *vdbeCursor) bool {
 		return false
 	case src.list:
 		// A list on its current entry: walked through its rows
-		// (jit.VCursor.Sel), in one segment, or over several when a sorted
-		// seek's (each row's segment in jit.VCursor.Segs).
+		// (jit.VCursor.Sel), in one segment, or over several, each row's
+		// segment in jit.VCursor.Segs.
 		k := src.listPos - 1
 		if k < 0 || k >= len(src.listRows) || cur.segRow != src.listRows[k] {
 			return false
 		}
 		if src.listOne == nil {
-			return jx.idxSpecs != nil && jx.idxSpecs[c] != nil && jx.idxSpecs[c].sorted != nil && k < len(src.listSegs) && src.listSegs[k] == s
+			return k < len(src.listSegs) && src.listSegs[k] == s
 		}
 		return s == src.listOne
 	case src.point:
