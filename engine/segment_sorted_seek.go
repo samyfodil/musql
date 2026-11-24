@@ -12,6 +12,10 @@ import (
 // can tell them from the built rows'.
 var segSortedSeeksServed atomic.Int64
 
+// segSortedBuilds counts the segSortedRows built, so a test sees a reopened
+// cursor take over the one it kept.
+var segSortedBuilds atomic.Int64
+
 // segSortedRows is OpSortedSeek's index when the segments serve it: every row
 // of the table's segments, as (segment, row), in the order of the seek's
 // INTEGER column, ties in rowid order -- the order sortRowsBy's stable sort of
@@ -47,6 +51,9 @@ type segSortedRows struct {
 	// native code's own index of the table is worth building
 	// (sortedSeekServed).
 	seeks int
+	// from is the segments it was built from, which a cursor reopened on
+	// the table checks before taking it over (segSortedStill).
+	from []*segment
 }
 
 // maxSegSortedRun bounds the rows a sorted seek keyed on further columns
@@ -140,12 +147,16 @@ func (cur *vdbeCursor) segSortedReady(h *sortedSeekHint, enc TextEncoding) (*seg
 		if key != nil && !segRunOrderable(cur.tbl, key) {
 			return nil, nil, false
 		}
-		s = cur.pager.segSortedRowsFor(cur, h)
-		if s.ok && key != nil && s.one != nil {
-			s.perm = slices.Clone(s.perm) // the segment's own, shared
+		if k := cur.keptSorted; k != nil && k.ok && k.hint.sameSort(h) && k.order == key && k.enc == enc && cur.pager.segSortedStill(cur, k) {
+			s = k
+		} else {
+			s = cur.pager.segSortedRowsFor(cur, h)
+			if s.ok && key != nil && s.one != nil {
+				s.perm = slices.Clone(s.perm) // the segment's own, shared
+			}
+			s.order, s.tbl, s.enc = key, cur.tbl, enc
 		}
-		s.order, s.tbl, s.enc = key, cur.tbl, enc
-		cur.segSorted = s
+		cur.segSorted, cur.keptSorted = s, nil
 	}
 	if !s.ok {
 		return nil, nil, false
@@ -362,20 +373,13 @@ func (s *segSortedRows) at(i int) (*segment, int) {
 // values are read as REALs, and the INTEGER PRIMARY KEY's are the rowids; both
 // are left to the built rows.
 func (p *ReadOnlyPager) segSortedRowsFor(cur *vdbeCursor, h *sortedSeekHint) *segSortedRows {
+	segSortedBuilds.Add(1)
 	s := &segSortedRows{hint: h}
-	if !p.segSeekable(cur) || h.col < 0 || h.col >= len(cur.tbl.cols) || h.col == cur.tbl.ipkIndex || cur.tbl.cols[h.col].Aff == affReal {
+	segs, ok := p.segSortedSegs(cur, h)
+	if !ok {
 		return s
 	}
-	root := cur.tbl.root
-	segs := p.segs.byRoot[root]
-	if p.segs.isLive(root) {
-		var ok bool
-		if segs, ok = p.segs.liveBaseSegments(root); !ok {
-			return s
-		}
-	} else if !p.segs.cleanFor(root) {
-		return s
-	}
+	s.from = slices.Clone(segs)
 	n, nonEmpty := 0, 0
 	var one *segment
 	for _, sg := range segs {
@@ -426,6 +430,26 @@ func (p *ReadOnlyPager) segSortedRowsFor(cur *vdbeCursor, h *sortedSeekHint) *se
 	}
 	s.ok = true
 	return s
+}
+
+// segSortedSegs is the committed segments segSortedRowsFor reads for cur's
+// table and h's column, or false where they are not the whole table.
+func (p *ReadOnlyPager) segSortedSegs(cur *vdbeCursor, h *sortedSeekHint) ([]*segment, bool) {
+	if !p.segSeekable(cur) || h.col < 0 || h.col >= len(cur.tbl.cols) || h.col == cur.tbl.ipkIndex || cur.tbl.cols[h.col].Aff == affReal {
+		return nil, false
+	}
+	root := cur.tbl.root
+	if p.segs.isLive(root) {
+		return p.segs.liveBaseSegments(root)
+	}
+	return p.segs.byRoot[root], p.segs.cleanFor(root)
+}
+
+// segSortedStill reports whether s, built for cur's table, still holds its
+// rows: the segments it was built from are still the whole table.
+func (p *ReadOnlyPager) segSortedStill(cur *vdbeCursor, s *segSortedRows) bool {
+	segs, ok := p.segSortedSegs(cur, s.hint)
+	return ok && slices.Equal(segs, s.from)
 }
 
 // find is the run of rows whose key equals probe once probe takes the

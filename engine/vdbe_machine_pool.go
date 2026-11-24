@@ -74,7 +74,16 @@ func (m *vdbe) openCursorInto(slot int, p *ReadOnlyPager, tbl *resolvedTable) *v
 	// once per outer row and seeks once (segListSeek).
 	ps := &cur.pointSrc
 	src := segRowSource{listSegs: ps.listSegs[:0], listRows: ps.listRows[:0], listKeys: ps.listKeys[:0], listPerm: ps.listPerm[:0], listHits: ps.listHits[:0]}
-	*cur = vdbeCursor{pager: p, tbl: tbl, colMask: allColumns, pointSrc: src}
+	// And its sorted seek's rows, for the same table read the same way
+	// (segSortedReady checks they are still the table's).
+	var kept *segSortedRows
+	if cur.pager == p && cur.tbl == tbl {
+		kept = cur.keptSorted
+		if cur.segSorted != nil {
+			kept = cur.segSorted
+		}
+	}
+	*cur = vdbeCursor{pager: p, tbl: tbl, colMask: allColumns, pointSrc: src, keptSorted: kept}
 	return cur
 }
 
