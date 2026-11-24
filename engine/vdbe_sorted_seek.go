@@ -279,6 +279,20 @@ func (s *sortedRows) findTuple(h *sortedSeekHint, probe Value, regs []Value, enc
 	return s.keep(lo, hi)
 }
 
+// movedRegs is h with its further keys' registers renumbered by reg, for a
+// program whose instructions another takes in (existsInline, recInline).
+func (h *sortedSeekHint) movedRegs(reg func(int) int) *sortedSeekHint {
+	if len(h.more) == 0 {
+		return h
+	}
+	moved := *h
+	moved.more = slices.Clone(h.more)
+	for i := range moved.more {
+		moved.more[i].reg = reg(moved.more[i].reg)
+	}
+	return &moved
+}
+
 // sameSort reports whether b sorts the rows as a does: the same columns under
 // the same collations and affinities. A level a LEFT JOIN emits twice, for
 // its matched rows and for its NULL row, seeks with two hints that do.
