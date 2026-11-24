@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 )
 
 // joinSource is one FROM item ready for codegen: its resolved table, its
@@ -2147,7 +2148,7 @@ func (p *ReadOnlyPager) resolveCTESource(c *compiler, state *joinDesugarState, i
 		return p.resolveRecursiveSelfSource(c, state, i, it, b, sr, offset)
 	}
 
-	b.nUse++
+	b.nUse += 1 + p.inRHSCopies
 
 	// A non-recursive CTE whose body binds an enclosing query's column ("SELECT x
 	// FROM t1 WHERE EXISTS (WITH t2(a) AS (VALUES(x)) SELECT * FROM t2 WHERE a>7)")
@@ -3054,9 +3055,13 @@ func joinPushdownPlan(c *compiler, srcs []joinSource, scopes []tableScope, where
 }
 
 // subTermsUncorrelated reports whether every sub-select of conjunct e
-// compiles here without binding a row of this query or one enclosing it: a
-// trial compile, so the binder that will compile the term decides. Anything
-// it cannot walk or compile counts as correlated.
+// compiles here without binding a row of this query or one enclosing it.
+// When the exact name walk finds no name inside them resolving outside, none
+// can. Otherwise a trial compile decides, so the binder that will compile the
+// term decides. Anything it cannot walk or compile counts as correlated.
+//
+// The trial counts no CTE reference: the term's own compile counts them, as C
+// counts each once (CteUse.nUse, select.c:5767).
 //
 // The verdict is kept for the statement (compiler.subUncorrelated): a trial
 // compile makes the sub-select's own sub-selects ask again, so without it each
@@ -3065,6 +3070,11 @@ func (c *compiler) subTermsUncorrelated(e Expr) bool {
 	subs, ok := subSelects(e)
 	if !ok || len(subs) == 0 {
 		return false
+	}
+	outside := false
+	if wherePlanSubqueryNames(c.pager, e, func(ColumnExpr) bool { outside = true; return true }) && !outside {
+		subNamesDecided.Add(1)
+		return true
 	}
 	root := c
 	for root.outer != nil {
@@ -3078,7 +3088,9 @@ func (c *compiler) subTermsUncorrelated(e Expr) bool {
 			}
 			continue
 		}
-		prog, err := compileSubProgram(c.pager, sub, c)
+		var prog *Program
+		var err error
+		c.pager.keepingCTEUses(func() { prog, err = compileSubProgram(c.pager, sub, c) })
 		v := err == nil && prog != nil && !prog.Correlated
 		if keep {
 			if root.subUncorrelated == nil {
@@ -3092,6 +3104,10 @@ func (c *compiler) subTermsUncorrelated(e Expr) bool {
 	}
 	return true
 }
+
+// subNamesDecided counts the conjuncts subTermsUncorrelated decided from their
+// names, with no trial compile, for tests.
+var subNamesDecided atomic.Int64
 
 // joinedTablesFor projects a resolved FROM clause onto the []joinedTable that
 // planJoinPushdown and the ported SQLite planner read. It is the ONE place the

@@ -113,6 +113,11 @@ type ReadOnlyPager struct {
 	//	// cycle (with1.test). pushCTEScope builds a fresh binding per frame.
 	cteExpansion []cteExpansionFrame
 
+	// inRHSCopies is how many IN right-hand sides enclose the compile now. C
+	// codes each from a copy (sqlite3CodeRhsOfIN, expr.c:3729), and copying
+	// counts every CTE reference in it again (sqlite3SrcListDup, expr.c:1928).
+	inRHSCopies int
+
 	// derivedCols keeps derivedSchemaCols' answers while one read compiles
 	// (memoDerivedCols): derived tables nested in derived tables compiled
 	// each body again for every level above it. nil outside such a compile.
