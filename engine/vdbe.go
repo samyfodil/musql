@@ -2462,6 +2462,15 @@ func (m *vdbe) runLoop(insns []Instruction) (rows [][]Value, err error) {
 				if err := m.applyPendingOrder(cur); err != nil {
 					return nil, err
 				}
+				if key := cur.idxSeekOrder; cur.idxListOnce {
+					// A list OpAutoIndexOrder positioned holds no rows to sort
+					// and search: they are built, in its key's order.
+					cur.idxListOnce, cur.idxListReady, cur.idxSeekOrder = false, false, nil
+					cur.segSrc, cur.segCur = nil, nil
+					if err := m.orderCursor(cur, key, true); err != nil {
+						return nil, err
+					}
+				}
 			}
 			if cur == nil || cur.rowStore != nil || cur.streamable || cur.seekReseek || cur.refillEach || cur.sub != nil || cur.vt != nil ||
 				cursorHasNoBtree(cur) && cur.fill == nil && !cur.materialized {
@@ -4431,7 +4440,7 @@ func (m *vdbe) execAutoIndexOrder(op *Instruction) error {
 		cur.pendingOrder = op
 		return nil
 	}
-	return m.orderCursor(cur, op)
+	return m.orderCursor(cur, op.P4.(*autoIndexKey), false)
 }
 
 // applyPendingOrder puts cur's rows in the order an OpAutoIndexOrder left
@@ -4442,20 +4451,20 @@ func (m *vdbe) applyPendingOrder(cur *vdbeCursor) error {
 		return nil
 	}
 	cur.pendingOrder = nil
-	return m.orderCursor(cur, op)
+	return m.orderCursor(cur, op.P4.(*autoIndexKey), false)
 }
 
-// orderCursor is execAutoIndexOrder's permutation of cur's rows, built now.
-func (m *vdbe) orderCursor(cur *vdbeCursor, op *Instruction) error {
+// orderCursor is execAutoIndexOrder's permutation of cur's rows by key, built
+// now, or the index seek's list positioned in that order unless built is set.
+func (m *vdbe) orderCursor(cur *vdbeCursor, key *autoIndexKey, built bool) error {
 	// The cursor materializes on its first rewind; force that now so the
 	// permutation below is the one every later rewind re-iterates.
 	cur.params = m.params // see vdbeCursor.params
 	cur.unsort()
-	key := op.P4.(*autoIndexKey)
 	// An index seek's rows are positioned in the key's order instead,
 	// when the segments serve it (idxListOnce): the seek keeps its
 	// probe, so every rewind finds the same rows in the same order.
-	once := cur.idxSeekConfigured && !cur.seekConfigured && !cur.seekSetConfigured && !cur.materialized &&
+	once := !built && cur.idxSeekConfigured && !cur.seekConfigured && !cur.seekSetConfigured && !cur.materialized &&
 		key.multiOr == nil && cur.idxSeekOrder == nil
 	if once {
 		cur.idxSeekOrder, cur.idxListOnce = key, true
