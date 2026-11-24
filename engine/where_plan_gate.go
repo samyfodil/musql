@@ -364,7 +364,7 @@ func wherePlanMultiTableOrderWith(p *ReadOnlyPager, c *compiler, srcs []joinSour
 	if !ok {
 		return nil, nil, 0, false
 	}
-	sortCtl, ok := wherePlanSortCtlForOpt(jts, scopes, stmt, der != nil)
+	sortCtl, ok := wherePlanSortCtlForOpt(jts, scopes, stmt, true)
 	if !ok {
 		return nil, nil, 0, false
 	}
@@ -1139,7 +1139,7 @@ func wherePlanSortCtlFor(jts []joinedTable, scopes []tableScope, stmt *SelectStm
 }
 
 // wherePlanSortCtlForOpt is wherePlanSortCtlFor; aggDistinctJoin additionally
-// follows a DISTINCT aggregate over a join (markCoroutineReruns' planner): in
+// follows a DISTINCT aggregate over a join (the multi-table planner): in
 // the whole-table arm (select.c:8851-8865) one aggregate call that is DISTINCT,
 // with no column showing through (nAccumulator 0), hands sqlite3WhereBegin its
 // argument as pResultSet with WHERE_WANT_DISTINCT, which becomes pOrderBy under
