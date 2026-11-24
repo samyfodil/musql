@@ -278,6 +278,87 @@ func TestVMJITRealQueries(t *testing.T) {
 	t.Logf("%d queries agree; %d REAL arms", len(queries), arms)
 }
 
+// TestVMJITCompareUnguessedReals: comparisons whose operands the lowering
+// cannot tell are REALs -- a derived table's sum(), a CASE that is NULL on one
+// arm -- take the INTEGER arm's NULL-aware compare, whose REAL path must
+// answer as the VDBE does over REALs, INTEGERs past 2^53, NULLs and TEXT.
+func TestVMJITCompareUnguessedReals(t *testing.T) {
+	lowEntryThreshold(t)
+	if !vmJITEnabled {
+		t.Skip("JIT not enabled on this platform")
+	}
+	rng := rand.New(rand.NewSource(9))
+	val := func() string {
+		switch rng.Intn(10) {
+		case 0:
+			return "NULL"
+		case 1:
+			return []string{"'abc'", "'2.5'", "9007199254740993"}[rng.Intn(3)]
+		case 2:
+			return fmt.Sprint(rng.Intn(9) - 4)
+		default:
+			return fmt.Sprintf("%.17g", (rng.Float64()-0.5)*math.Pow(10, float64(rng.Intn(4))))
+		}
+	}
+	setup := []string{`CREATE TABLE t(g INTEGER, x, i INTEGER, n)`}
+	for k := range 80 {
+		setup = append(setup, fmt.Sprintf("INSERT INTO t VALUES(%d, %s, %d, %s)", k%9, val(), rng.Intn(7)-3, val()))
+	}
+	const cte = "WITH s AS MATERIALIZED (SELECT g, sum(x) AS sx, sum(i) AS si, max(n) AS mn, min(x) AS lx FROM t GROUP BY g) "
+	var queries []string
+	for _, p := range []string{
+		"a.sx > 0", "a.sx < b.sx", "a.sx >= b.si", "a.si <= b.sx", "a.sx = b.lx", "a.sx <> b.sx", "a.mn > b.sx",
+		"a.lx < a.sx", "a.si > b.si",
+		"CASE WHEN a.sx > 0 THEN b.sx*1.0/a.sx END > CASE WHEN b.si > 0 THEN a.sx/b.si END",
+	} {
+		queries = append(queries,
+			cte+"SELECT a.g, b.g FROM s a, s b WHERE "+p+" ORDER BY 1, 2",
+			cte+"SELECT a.g, b.g, "+p+" FROM s a, s b ORDER BY 1, 2")
+	}
+	run := func(jitOn bool) []string {
+		old := vmJITEnabled
+		vmJITEnabled = jitOn
+		defer func() { vmJITEnabled = old }()
+		db, err := Create(filepath.Join(t.TempDir(), "c.musq"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		for _, s := range setup {
+			if err := db.Exec(s); err != nil {
+				t.Fatalf("%s: %v", s, err)
+			}
+		}
+		p, err := db.SnapshotPager()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer p.Close()
+		out := make([]string, len(queries))
+		for i, q := range queries {
+			_, rows, err := p.QueryArgs(q, nil)
+			if err != nil {
+				t.Fatalf("%s: %v", q, err)
+			}
+			var b strings.Builder
+			for _, row := range rows {
+				for _, v := range row {
+					fmt.Fprintf(&b, " %d:%d:%x:%q", v.Typ, v.I, math.Float64bits(v.F), v.S)
+				}
+				b.WriteString(";")
+			}
+			out[i] = b.String()
+		}
+		return out
+	}
+	want, got := run(false), run(true)
+	for i, q := range queries {
+		if want[i] != got[i] {
+			t.Fatalf("JIT diverges on %s\nvdbe %s\njit  %s", q, want[i], got[i])
+		}
+	}
+}
+
 // TestVMRealLoweringGuessesStoredReals: a column of INTEGER affinity is
 // guessed REAL when the table's segments store it so, and its arithmetic
 // lowers to the REAL arm; without the hint it keeps the INTEGER arm.

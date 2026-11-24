@@ -32,6 +32,55 @@ type sortedRows struct {
 	base int
 	// vs is rows, ids and ints as VSortSeek searches them (handSort).
 	vs jit.VSort
+	// keys is the probe's keys, and last the previous probe's (its bytes
+	// copied, as a register's are reused) with the run it found: an inner
+	// loop seeks with keys an outer row holds, the same each time round.
+	// self is s while they are s's own: a copy (OpSortedSeek shares a sort
+	// between cursors by value) starts them afresh.
+	keys, last     []Value
+	lastBuf        []byte
+	lastLo, lastHi int
+	self           *sortedRows
+}
+
+// probeKeys starts s.keys at probe, in buffers of s's own.
+func (s *sortedRows) probeKeys(probe Value) {
+	if s.self != s {
+		s.self, s.keys, s.last, s.lastBuf = s, nil, nil, nil
+	}
+	s.keys = append(s.keys[:0], probe)
+}
+
+// lastRun is the run the previous probe found, when its keys are s.keys.
+func (s *sortedRows) lastRun() (int, int, bool) {
+	if len(s.last) != len(s.keys) || len(s.last) == 0 {
+		return 0, 0, false
+	}
+	for i, k := range s.keys {
+		if !valuesIdentical(k, s.last[i]) {
+			return 0, 0, false
+		}
+	}
+	return s.lastLo, s.lastHi, true
+}
+
+// keep makes lo..hi the run of s.keys, for the probe after.
+func (s *sortedRows) keep(lo, hi int) (int, int) {
+	s.last, s.lastBuf = append(s.last[:0], s.keys...), s.lastBuf[:0]
+	for _, v := range s.last {
+		if v.Typ == Text || v.Typ == Blob {
+			s.lastBuf = append(s.lastBuf, v.S...)
+		}
+	}
+	n := 0
+	for i := range s.last {
+		if v := &s.last[i]; v.Typ == Text || v.Typ == Blob {
+			v.S = s.lastBuf[n : n+len(v.S) : n+len(v.S)]
+			n += len(v.S)
+		}
+	}
+	s.lastLo, s.lastHi = lo, hi
+	return lo, hi
 }
 
 // sortedSeek narrows cur to the rows whose column h.col equals probe, sorting
@@ -174,6 +223,10 @@ func (s *sortedRows) find(h *sortedSeekHint, probe Value, regs []Value, enc Text
 		}
 		return lo, hi
 	}
+	s.probeKeys(probe)
+	if lo, hi, ok := s.lastRun(); ok {
+		return lo, hi
+	}
 	col, coll := s.hint.col, s.hint.coll
 	lo := sort.Search(len(s.rows), func(i int) bool {
 		return compareValuesCollatedEnc(s.rows[i][col], probe, coll, enc) >= 0
@@ -181,23 +234,29 @@ func (s *sortedRows) find(h *sortedSeekHint, probe Value, regs []Value, enc Text
 	hi := lo + sort.Search(len(s.rows)-lo, func(i int) bool {
 		return compareValuesCollatedEnc(s.rows[lo+i][col], probe, coll, enc) > 0
 	})
-	return lo, hi
+	return s.keep(lo, hi)
 }
 
 // findTuple is find over the hint's further columns too.
 func (s *sortedRows) findTuple(h *sortedSeekHint, probe Value, regs []Value, enc TextEncoding) (int, int) {
-	keys := make([]Value, len(h.more))
-	for i, mc := range h.more {
-		if keys[i] = applyAffinityToValue(regs[mc.reg], mc.aff); keys[i].Typ == Null {
+	s.probeKeys(probe)
+	for _, mc := range h.more {
+		k := applyAffinityToValue(regs[mc.reg], mc.aff)
+		if k.Typ == Null {
 			return 0, 0
 		}
+		s.keys = append(s.keys, k)
 	}
+	if lo, hi, ok := s.lastRun(); ok {
+		return lo, hi
+	}
+	keys := s.keys
 	cmpKey := func(row []Value, j int) int {
 		if j == 0 {
 			return compareValuesCollatedEnc(row[h.col], probe, h.coll, enc)
 		}
 		mc := h.more[j-1]
-		return compareValuesCollatedEnc(row[mc.col], keys[j-1], mc.coll, enc)
+		return compareValuesCollatedEnc(row[mc.col], keys[j], mc.coll, enc)
 	}
 	cmpRow := func(row []Value) int {
 		if s.keyOrder != nil {
@@ -217,7 +276,7 @@ func (s *sortedRows) findTuple(h *sortedSeekHint, probe Value, regs []Value, enc
 	}
 	lo := sort.Search(len(s.rows), func(i int) bool { return cmpRow(s.rows[i]) >= 0 })
 	hi := lo + sort.Search(len(s.rows)-lo, func(i int) bool { return cmpRow(s.rows[lo+i]) > 0 })
-	return lo, hi
+	return s.keep(lo, hi)
 }
 
 // sameSort reports whether b sorts the rows as a does: the same columns under

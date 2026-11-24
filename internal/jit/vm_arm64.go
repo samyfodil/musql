@@ -397,6 +397,40 @@ func (e *vmEmitArm) exitpcLabel() string { return "e" + strconv.Itoa(e.islandN) 
 
 // jmpBlock branches to target's block, or exits when target is past the end.
 // A backward branch spends fuel first, exiting at target when it runs out.
+// realCmp is vm_amd64.go's: nullCmp's path for a REAL operand.
+func (e *vmEmitArm) realCmp(pc int, in VInsn, real string, zs bool) {
+	a, L := e.a, e.lay
+	store := in.Op != VCmpJump && !in.Dead
+	a.Label(real)
+	e.fcmpLoad(pc, in.B, 0)
+	e.fcmpLoad(pc, in.A, 1)
+	// Without a NaN, which exits, FCMP's flags answer the signed conditions
+	// as a CMP's would.
+	a.Fcmp(0, 1)
+	a.BcondRaw(armVS, e.stub(pc))
+	if store {
+		a.Cset(X9, in.Cond)
+		a.MovImm16(X10, uint16(L.TypInt))
+		e.str(X10, in.C, 0)
+		e.str(X9, in.C, L.OffI)
+		e.str(xzr, in.C, L.OffF)
+		if zs {
+			e.zeroS.add(in.C)
+		}
+		e.clearS(in.C)
+	}
+	switch in.Op {
+	case VCmpJump:
+		e.jccBlock(in.Cond, pc, in.T)
+	case VCmpBr:
+		c := in.Cond
+		if in.Imm&1 == 0 {
+			c = c.Negate()
+		}
+		e.jccBlock(c, pc, in.T)
+	}
+}
+
 // nullCmp is vm_amd64.go's: a comparison that answers a NULL operand.
 func (e *vmEmitArm) nullCmp(pc int, in VInsn) {
 	a, L := e.a, e.lay
@@ -406,12 +440,19 @@ func (e *vmEmitArm) nullCmp(pc int, in VInsn) {
 		e.destNoS(pc, in.C)
 	}
 	zs := e.zeroS.has(in.C)
-	null, done := e.vmLabel("cn"), e.vmLabel("cd")
+	null, real, done := e.vmLabel("cn"), e.vmLabel("cr"), e.vmLabel("cd")
 	for _, r := range []int{in.A, in.B} {
 		if !e.know.isInt.has(r) {
 			e.ldrb(X10, r, L.OffTyp)
 			a.CmpImm(X10, uint32(L.TypNull))
 			a.Bcond(CondE, null)
+		}
+	}
+	for _, r := range []int{in.A, in.B} {
+		if !e.know.isInt.has(r) {
+			e.ldrb(X10, r, L.OffTyp)
+			a.CmpImm(X10, uint32(L.TypFloat))
+			a.Bcond(CondE, real)
 		}
 	}
 	x := e.src(pc, in.B, X9)
@@ -432,6 +473,10 @@ func (e *vmEmitArm) nullCmp(pc int, in VInsn) {
 		e.jccBlock(c, pc, in.T)
 	}
 	a.B(done)
+	if !knownA || !knownB {
+		e.realCmp(pc, in, real, zs)
+		a.B(done)
+	}
 	a.Label(null)
 	if store {
 		a.MovImm16(X10, uint16(L.TypNull))
