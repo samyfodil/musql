@@ -197,6 +197,10 @@ type vdbeCursor struct {
 	// keyListReady is the same for an outermost scan OpAutoIndexOrder
 	// positioned on the table's rows in its key's order (segKeyOrderList).
 	keyListReady bool
+	// scanList is a full scan below the outermost loop that nothing seeks,
+	// orders or marks: its rows may be a list over the segments
+	// (segScanList), walked again on each rewind, rather than built.
+	scanList bool
 
 	// pendingOrder is an OpAutoIndexOrder not yet applied: the rows are put
 	// in its order at the first rewind or seek (applyPendingOrder).
@@ -1427,6 +1431,16 @@ func (cur *vdbeCursor) rewind() error {
 		if cur.streamable && !cur.tbl.withoutRowid {
 			if src := cur.pager.newSegRowSource(cur); src != nil {
 				cur.startSegSource(src)
+				return nil
+			}
+		}
+		if cur.scanList && cur.pendingOrder == nil && !cur.ranged {
+			if src := cur.pager.segScanList(cur, &cur.pointSrc); src != nil {
+				cur.seekGen = seekGens.Add(1)
+				cur.rowids, cur.rows = cur.rowids[:0], cur.rows[:0]
+				cur.segSrc, cur.segCur, cur.segSrcCols = src, nil, src.cols
+				cur.streamErrPending = nil
+				cur.pos, cur.rowidNull, cur.keyListReady = -1, false, true
 				return nil
 			}
 		}
