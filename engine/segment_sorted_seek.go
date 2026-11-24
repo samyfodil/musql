@@ -12,6 +12,10 @@ import (
 // can tell them from the built rows'.
 var segSortedSeeksServed atomic.Int64
 
+// segSortedBuilds counts the segSortedRows built, so a test sees a reopened
+// cursor take over the one it kept.
+var segSortedBuilds atomic.Int64
+
 // segSortedRows is OpSortedSeek's index when the segments serve it: every row
 // of the table's segments, as (segment, row), in the order of the seek's
 // INTEGER column, ties in rowid order -- the order sortRowsBy's stable sort of
@@ -47,6 +51,14 @@ type segSortedRows struct {
 	// native code's own index of the table is worth building
 	// (sortedSeekServed).
 	seeks int
+	// from is the segments it was built from, which a cursor reopened on
+	// the table checks before taking it over (segSortedStill).
+	from []*segment
+	// moreHint is the hint moreOrder last answered, with moreOrd and moreOK
+	// its answer: a seek asks once per probe.
+	moreHint *sortedSeekHint
+	moreOrd  []int
+	moreOK   bool
 }
 
 // maxSegSortedRun bounds the rows a sorted seek keyed on further columns
@@ -57,7 +69,10 @@ const maxSegSortedRun = 256
 // maxSegSortedRun rows. A seek keyed on further columns too is served on
 // this one alone -- a superset of its rows, which the level's loop narrows,
 // as it tests every conjunct -- only where that superset stays small.
-func (s *segSortedRows) shortRuns() bool {
+func (s *segSortedRows) shortRuns() bool { return s.runsAtMost(maxSegSortedRun) }
+
+// runsAtMost reports whether the column's runs average at most m rows.
+func (s *segSortedRows) runsAtMost(m int) bool {
 	n := len(s.keys)
 	key := func(i int) int64 { return s.keys[i] }
 	if s.one != nil {
@@ -70,7 +85,7 @@ func (s *segSortedRows) shortRuns() bool {
 			}
 		}
 	}
-	return n <= s.distinct*maxSegSortedRun
+	return n <= s.distinct*m
 }
 
 // segSortable reports whether cur is a table's one list of rows, which
@@ -140,12 +155,16 @@ func (cur *vdbeCursor) segSortedReady(h *sortedSeekHint, enc TextEncoding) (*seg
 		if key != nil && !segRunOrderable(cur.tbl, key) {
 			return nil, nil, false
 		}
-		s = cur.pager.segSortedRowsFor(cur, h)
-		if s.ok && key != nil && s.one != nil {
-			s.perm = slices.Clone(s.perm) // the segment's own, shared
+		if k := cur.keptSorted; k != nil && k.ok && k.hint.sameSort(h) && k.order == key && k.enc == enc && cur.pager.segSortedStill(cur, k) {
+			s = k
+		} else {
+			s = cur.pager.segSortedRowsFor(cur, h)
+			if s.ok && key != nil && s.one != nil {
+				s.perm = slices.Clone(s.perm) // the segment's own, shared
+			}
+			s.order, s.tbl, s.enc = key, cur.tbl, enc
 		}
-		s.order, s.tbl, s.enc = key, cur.tbl, enc
-		cur.segSorted = s
+		cur.segSorted, cur.keptSorted = s, nil
 	}
 	if !s.ok {
 		return nil, nil, false
@@ -287,6 +306,15 @@ func (s *segSortedRows) moreOrder(h *sortedSeekHint) ([]int, bool) {
 	if len(h.more) == 0 || s.order == nil {
 		return nil, false
 	}
+	if s.moreHint != h {
+		s.moreOrd, s.moreOK = s.moreOrderOf(h)
+		s.moreHint = h
+	}
+	return s.moreOrd, s.moreOK
+}
+
+// moreOrderOf is moreOrder worked out.
+func (s *segSortedRows) moreOrderOf(h *sortedSeekHint) ([]int, bool) {
 	key := s.order
 	ord := make([]int, 0, len(h.more))
 	for k, c := range key.cols {
@@ -323,7 +351,14 @@ func (s *segSortedRows) narrow(lo, hi int, h *sortedSeekHint, ord []int, regs []
 	cmpAt := func(i int) int {
 		for k, j := range ord {
 			mc := h.more[j]
-			if c := compareValuesCollatedEnc(s.cell(i, mc.col), keys[k], mc.coll, s.enc); c != 0 {
+			c, ok := 0, false
+			if keys[k].Typ == Int {
+				c, ok = s.cmpCellInt(i, mc.col, keys[k].I)
+			}
+			if !ok {
+				c = compareValuesCollatedEnc(s.cell(i, mc.col), keys[k], mc.coll, s.enc)
+			}
+			if c != 0 {
 				return c
 			}
 		}
@@ -332,6 +367,24 @@ func (s *segSortedRows) narrow(lo, hi int, h *sortedSeekHint, ord []int, regs []
 	a := lo + sort.Search(hi-lo, func(i int) bool { return cmpAt(lo+i) >= 0 })
 	b := a + sort.Search(hi-a, func(i int) bool { return cmpAt(a+i) > 0 })
 	return a, b
+}
+
+// cmpCellInt compares column c of the row at position i with k, where the row
+// holds an INTEGER in the column's block, as orderRun reads it: no Value is
+// decoded. false where it does not.
+func (s *segSortedRows) cmpCellInt(i, c int, k int64) (int, bool) {
+	sg, r := s.at(i)
+	if c < 0 || c == s.tbl.ipkIndex {
+		return cmp.Compare(int64(sg.Rowid(r)), k), true
+	}
+	if s.tbl.cols[c].Aff == affReal || sg.hasException(c) {
+		return 0, false
+	}
+	b, ok := sg.Int64Column(c)
+	if !ok || r >= len(b) || sg.cols[c].nullOff != 0 && sg.isNull(c, r) {
+		return 0, false
+	}
+	return cmp.Compare(b[r], k), true
 }
 
 // cell is column c of the row at position i, as orderRun reads it.
@@ -362,20 +415,13 @@ func (s *segSortedRows) at(i int) (*segment, int) {
 // values are read as REALs, and the INTEGER PRIMARY KEY's are the rowids; both
 // are left to the built rows.
 func (p *ReadOnlyPager) segSortedRowsFor(cur *vdbeCursor, h *sortedSeekHint) *segSortedRows {
+	segSortedBuilds.Add(1)
 	s := &segSortedRows{hint: h}
-	if !p.segSeekable(cur) || h.col < 0 || h.col >= len(cur.tbl.cols) || h.col == cur.tbl.ipkIndex || cur.tbl.cols[h.col].Aff == affReal {
+	segs, ok := p.segSortedSegs(cur, h)
+	if !ok {
 		return s
 	}
-	root := cur.tbl.root
-	segs := p.segs.byRoot[root]
-	if p.segs.isLive(root) {
-		var ok bool
-		if segs, ok = p.segs.liveBaseSegments(root); !ok {
-			return s
-		}
-	} else if !p.segs.cleanFor(root) {
-		return s
-	}
+	s.from = slices.Clone(segs)
 	n, nonEmpty := 0, 0
 	var one *segment
 	for _, sg := range segs {
@@ -428,6 +474,26 @@ func (p *ReadOnlyPager) segSortedRowsFor(cur *vdbeCursor, h *sortedSeekHint) *se
 	return s
 }
 
+// segSortedSegs is the committed segments segSortedRowsFor reads for cur's
+// table and h's column, or false where they are not the whole table.
+func (p *ReadOnlyPager) segSortedSegs(cur *vdbeCursor, h *sortedSeekHint) ([]*segment, bool) {
+	if !p.segSeekable(cur) || h.col < 0 || h.col >= len(cur.tbl.cols) || h.col == cur.tbl.ipkIndex || cur.tbl.cols[h.col].Aff == affReal {
+		return nil, false
+	}
+	root := cur.tbl.root
+	if p.segs.isLive(root) {
+		return p.segs.liveBaseSegments(root)
+	}
+	return p.segs.byRoot[root], p.segs.cleanFor(root)
+}
+
+// segSortedStill reports whether s, built for cur's table, still holds its
+// rows: the segments it was built from are still the whole table.
+func (p *ReadOnlyPager) segSortedStill(cur *vdbeCursor, s *segSortedRows) bool {
+	segs, ok := p.segSortedSegs(cur, s.hint)
+	return ok && slices.Equal(segs, s.from)
+}
+
 // find is the run of rows whose key equals probe once probe takes the
 // comparison's affinity. Every key is an INTEGER: a REAL equals one only when
 // it is that integer exactly, and NULL, TEXT and BLOB equal none.
@@ -448,16 +514,20 @@ func (s *segSortedRows) find(probe Value) (int, int) {
 	}
 	if s.one != nil {
 		lo, _ := slices.BinarySearchFunc(s.perm, k, func(r int32, k int64) int { return cmp.Compare(s.block[r], k) })
-		hi := lo
-		for hi < len(s.perm) && s.block[s.perm[hi]] == k {
-			hi++
-		}
-		return lo, hi
+		return lo, runEnd(lo, len(s.perm), func(i int) bool { return s.block[s.perm[i]] > k })
 	}
 	lo, _ := slices.BinarySearch(s.keys, k)
-	hi := lo
-	for hi < len(s.keys) && s.keys[hi] == k {
-		hi++
+	return lo, runEnd(lo, len(s.keys), func(i int) bool { return s.keys[i] > k })
+}
+
+// runEnd is the first position from lo to n that is past, which holds from
+// some position on: galloped to, so a short run costs a few probes and a run
+// of thousands of rows a few dozen.
+func runEnd(lo, n int, past func(int) bool) int {
+	bound, step := lo, 1
+	for bound < n && !past(bound) {
+		lo, bound, step = bound+1, bound+step, step*2
 	}
-	return lo, hi
+	bound = min(bound, n)
+	return lo + sort.Search(bound-lo, func(i int) bool { return past(lo + i) })
 }

@@ -3034,11 +3034,23 @@ func gathersOf(srcs []joinSource) []aggGather {
 // NULL-extended row, emitted by the caller's body). Reusing join.go's planner
 // keeps row order and ON-vs-WHERE safety identical.
 func joinPushdownPlan(c *compiler, srcs []joinSource, scopes []tableScope, where Expr) joinPlan {
+	jts := joinedTablesFor(srcs)
 	var subFree func(Expr) bool
+	var subUsage func(Expr) (whereMask, bool)
 	if c != nil && c.pager != nil {
 		subFree = c.subTermsUncorrelated
+		// The planner's own scopes, so a term's subqueries are placed by the
+		// mask its prereqAll was priced with (wherePlanTermsFrom).
+		var ps []tableScope
+		subUsage = func(e Expr) (whereMask, bool) {
+			if ps == nil {
+				ps = tableScopesOf(srcs)
+				wherePlanBindOuter(c, ps)
+			}
+			return wherePlanSubqueryUsage(jts, ps, e)
+		}
 	}
-	return planJoinPushdownSub(where, joinedTablesFor(srcs), scopes, subFree)
+	return planJoinPushdownSub(where, jts, scopes, subFree, subUsage)
 }
 
 // subTermsUncorrelated reports whether every sub-select of conjunct e
