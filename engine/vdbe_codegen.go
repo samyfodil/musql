@@ -4106,7 +4106,9 @@ func (c *compiler) compileInSubquery(x InExpr) (int, error) {
 	} else if n != arity {
 		return 0, semanticf("sub-select returns %d columns - expected %d", n, arity)
 	}
+	c.pager.inRHSCopies++
 	prog, err := c.liveSubSelect(x.Sub)
+	c.pager.inRHSCopies--
 	if err != nil {
 		return 0, err
 	}
