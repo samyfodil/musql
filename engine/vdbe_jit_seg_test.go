@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math/rand"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"testing"
 
@@ -450,6 +452,13 @@ func TestVMJITIdxSeekDifferential(t *testing.T) {
 				}
 				out = append(out, fmt.Sprint(q, cols, rows))
 			}
+		}
+		if jitOn {
+			// With no GC cycle running: on js/wasm its write barrier sends
+			// every seek back to the VDBE while it lasts, and a run could make
+			// none natively.
+			defer debug.SetGCPercent(debug.SetGCPercent(-1))
+			runtime.GC()
 		}
 		query()
 		for _, s := range writes {
