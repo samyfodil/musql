@@ -2,11 +2,12 @@ package engine
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
 
 // TestSeedInvariantOrderedReplay: a one-table subquery planned where its
-// enclosing loop count is unknown, under DISTINCT or ORDER BY, is decided by
+// enclosing loop count is unknown (a correlated term's trial compile), under DISTINCT or ORDER BY, is decided by
 // replaying the solve rather than solving at every seed. The engine's tests
 // still solve every seed and panic where the replay disagrees
 // (seedInvariantVerify). A full scan, an automatic index and indexes that
@@ -44,10 +45,22 @@ func TestSeedInvariantOrderedReplay(t *testing.T) {
 			}
 			p := newSegPair(t, stmts...)
 			for _, b := range bodies {
-				for _, q := range []string{
+				// Named as it is, the body binds nothing outside, so its term
+				// is placed without a trial compile and plans where the loop
+				// count is known. Naming t.x, it binds the enclosing row, and
+				// the trial compile plans it while the count is not yet known.
+				corr := strings.ReplaceAll(b, "FROM u WHERE", "FROM u WHERE t.x >= 0 AND")
+				qs := []string{
 					`SELECT a, sum(x) FROM t, u WHERE t.g = u.c AND u.b BETWEEN (` + b + `) AND 40 GROUP BY a ORDER BY a`,
 					`WITH r AS (SELECT a, sum(x) s FROM t, u WHERE t.g = u.c AND u.e >= (` + b + `) GROUP BY a) SELECT count(*), sum(s) FROM r`,
-				} {
+				}
+				// It runs once per joined row, so only over the smaller tables.
+				if n <= 97 {
+					qs = append(qs,
+						`SELECT a, sum(x) FROM t, u WHERE t.g = u.c AND u.b BETWEEN (`+corr+`) AND 40 GROUP BY a ORDER BY a`,
+						`WITH r AS (SELECT a, sum(x) s FROM t, u WHERE t.g = u.c AND u.e >= (`+corr+`) GROUP BY a) SELECT count(*), sum(s) FROM r`)
+				}
+				for _, q := range qs {
 					got := p.mustFast(q)
 					want := p.mustPlain(q)
 					if g, w := fmt.Sprint(typedRows(got)), fmt.Sprint(typedRows(want)); g != w {
