@@ -257,8 +257,10 @@ func existsInline(prog *Program, at int, sub *Program) {
 			}
 		case OpIf, OpIfNot, OpIsNull, OpNotNull:
 			r.P1, r.P2 = reg(in.P1), jump(in.P2)
-		case OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpRowidReadBound, OpSeekRowidSetHint, OpSortedSeek:
+		case OpSeekRowidHint, OpSeekIndexHint, OpSeekRowidRangeHint, OpRowidReadBound, OpSeekRowidSetHint:
 			r.P1, r.P2 = cur(in.P1), reg(in.P2)
+		case OpSortedSeek:
+			r.P1, r.P2, r.P4 = cur(in.P1), reg(in.P2), in.P4.(*sortedSeekHint).movedRegs(reg)
 		case OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpConcat:
 			r.P1, r.P2, r.P3 = reg(in.P1), reg(in.P2), reg(in.P3)
 		case OpFunction:
