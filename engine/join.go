@@ -2486,15 +2486,18 @@ type joinPlan struct {
 // bound, deferring it if that is at or past the first LEFT-joined table (LEFT
 // tables are never reordered) or it contains a correlated subquery.
 func planJoinPushdown(where Expr, jts []joinedTable, scopes []tableScope) joinPlan {
-	return planJoinPushdownSub(where, jts, scopes, nil)
+	return planJoinPushdownSub(where, jts, scopes, nil, nil)
 }
 
 // planJoinPushdownSub is planJoinPushdown placing a conjunct that holds a
 // subquery by the tables it names outside it, as any other, when subFree says
 // none of its subqueries reads a row of this FROM clause: where.c's prereqAll
-// counts a subquery's correlated columns only (exprSelectUsage). nil subFree
-// keeps every such conjunct for the innermost level.
-func planJoinPushdownSub(where Expr, jts []joinedTable, scopes []tableScope, subFree func(Expr) bool) joinPlan {
+// counts a subquery's correlated columns only (exprSelectUsage). One whose
+// subqueries do read them is placed by those items too, which subUsage
+// answers, and tested after the level's other terms (TERM_VARSELECT,
+// wherecode.c's iLoop 3). nil subFree, or no answer from subUsage, keeps such
+// a conjunct for the innermost level.
+func planJoinPushdownSub(where Expr, jts []joinedTable, scopes []tableScope, subFree func(Expr) bool, subUsage func(Expr) (whereMask, bool)) joinPlan {
 	if hasRightOuter(jts) || hasGroups(jts) {
 		// Defer every conjunct with a RIGHT/FULL item or a join group. A
 		// RIGHT/FULL match decision is global, so pruning any combination early
@@ -2541,6 +2544,7 @@ func planJoinPushdownSub(where Expr, jts []joinedTable, scopes []tableScope, sub
 
 	plan := joinPlan{execOrder: execOrder, buckets: make([][]Expr, len(jts)), autoIdxKeys: autoIdxKeys}
 	plan.bucketImpliedByOrs(conjuncts, jts, scopes, pos, firstLeftIdx)
+	varSelect := make([][]Expr, len(jts))
 	for _, cj := range conjuncts {
 		if hoist, outer := constWhereTerm(cj, scopes, false); hoist {
 			if outer {
@@ -2552,14 +2556,29 @@ func planJoinPushdownSub(where Expr, jts []joinedTable, scopes []tableScope, sub
 		}
 		refs := map[int]bool{}
 		collectTableRefs(cj, scopes, refs)
+		correlated := mentionsSubquery(cj) && !levelZeroConstTerm(cj, scopes, false) && !constSubTerm(cj, scopes) &&
+			(subFree == nil || !subFree(cj))
+		forceLast := correlated
+		if correlated && subUsage != nil && len(jts) < 64 {
+			// subSelects walks what collectTableRefs walks: when it walks the
+			// whole conjunct, refs holds every item named outside its
+			// subqueries.
+			_, walked := subSelects(cj)
+			if m, ok := subUsage(cj); walked && ok && m != 0 {
+				for i := range jts {
+					if m&(whereMask(1)<<uint(i)) != 0 {
+						refs[i] = true
+					}
+				}
+				forceLast = false
+			}
+		}
 		origMax := -1
 		for idx := range refs {
 			if idx > origMax {
 				origMax = idx
 			}
 		}
-		forceLast := mentionsSubquery(cj) && !levelZeroConstTerm(cj, scopes, false) && !constSubTerm(cj, scopes) &&
-			(subFree == nil || !subFree(cj))
 		checkIdx := origMax
 		if forceLast && checkIdx < len(jts)-1 {
 			checkIdx = len(jts) - 1
@@ -2589,7 +2608,14 @@ func planJoinPushdownSub(where Expr, jts []joinedTable, scopes []tableScope, sub
 			plan.deferred = append(plan.deferred, cj)
 			continue
 		}
+		if correlated {
+			varSelect[execLvl] = append(varSelect[execLvl], cj)
+			continue
+		}
 		plan.buckets[execLvl] = append(plan.buckets[execLvl], cj)
+	}
+	for i, v := range varSelect {
+		plan.buckets[i] = append(plan.buckets[i], v...)
 	}
 	return plan
 }
