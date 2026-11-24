@@ -788,7 +788,8 @@ func (e *vmEmitWasm) seekIdx(pc int, in VInsn) {
 // seekIdxServed adds to cursor A's Served the rows its last seek's run
 // served, up to the row it is on, when it has one (State 2, 4 or 5).
 // seekIdxPack is vm_seg_amd64.go's: t1 the key, sk1 the index, sk2 its
-// Pack, skf whether a key is outside its width and skm a further key.
+// Pack and then its Filter, skf whether a key is outside its width or its
+// bit clear, and skm a further key and then the bit.
 func (e *vmEmitWasm) seekIdxPack(pc int, in VInsn) {
 	w, L := e.w, e.lay
 	e.ptrAt(e.sk1, VIdxOffPack)
@@ -826,6 +827,39 @@ func (e *vmEmitWasm) seekIdxPack(pc int, in VInsn) {
 		w.op(opI64Or)
 		w.Set(e.t1)
 	}
+	// Most keys no row holds have their bit clear in the filter.
+	e.ptrAt(e.sk1, VIdxOffFilter)
+	w.Set(e.sk2)
+	w.Get(e.sk2)
+	w.op(opIf, opVoid)
+	mul := uint64(VIdxFilterMul)
+	w.Get(e.t1)
+	w.I64(int64(mul))
+	w.op(opI64Mul)
+	w.I64(32)
+	w.op(opI64ShrU)
+	w.Get(e.sk1)
+	w.LoadI64(VIdxOffFMask)
+	w.op(opI64And)
+	w.Set(e.skm)
+	w.Get(e.sk2)
+	w.Get(e.skm)
+	w.I64(6)
+	w.op(opI64ShrU)
+	w.op(opI32WrapI64)
+	w.I32(3)
+	w.op(opI32Shl)
+	w.op(opI32Add)
+	w.LoadI64(0)
+	w.Get(e.skm)
+	w.op(opI64ShrU)
+	w.I64(1)
+	w.op(opI64And)
+	w.op(opI64Eqz)
+	w.Get(e.skf)
+	w.op(opI32Or)
+	w.Set(e.skf)
+	w.op(opEnd)
 	w.Get(e.skf)
 	w.op(opIf, opVoid)
 	w.I64(-1)
