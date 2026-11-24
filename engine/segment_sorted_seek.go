@@ -3,6 +3,7 @@ package engine
 import (
 	"cmp"
 	"math"
+	"math/bits"
 	"slices"
 	"sort"
 	"sync/atomic"
@@ -15,6 +16,10 @@ var segSortedSeeksServed atomic.Int64
 // segSortedBuilds counts the segSortedRows built, so a test sees a reopened
 // cursor take over the one it kept.
 var segSortedBuilds atomic.Int64
+
+// segBloomsBuilt counts the filters buildBloom made, so a test sees one
+// answer its probes.
+var segBloomsBuilt atomic.Int64
 
 // segSortedRows is OpSortedSeek's index when the segments serve it: every row
 // of the table's segments, as (segment, row), in the order of the seek's
@@ -59,7 +64,20 @@ type segSortedRows struct {
 	moreHint *sortedSeekHint
 	moreOrd  []int
 	moreOK   bool
+	// bloom holds every row's key, the column and the hint's further columns
+	// as int64s, hashed (bloomKey): a probe whose key it lacks equals no row,
+	// and is answered without a search, as C's OP_Filter answers one before
+	// it searches its automatic index. Built once most of the first probes
+	// have missed (misses); bloomTried stops a second attempt.
+	bloom      []uint64
+	bloomMask  uint64
+	bloomTried bool
+	misses     int
 }
+
+// segBloomMinRows is the fewest rows a table needs for a filter over its keys:
+// below it, the search the filter saves costs no more than the hash.
+const segBloomMinRows = 1024
 
 // maxSegSortedRun bounds the rows a sorted seek keyed on further columns
 // visits per probe when the segments serve it on its first column alone.
@@ -113,12 +131,22 @@ func (cur *vdbeCursor) segSortedSeek(h *sortedSeekHint, probe Value, regs []Valu
 		return false
 	}
 	s.seeks++
+	if !s.bloomTried && s.seeks >= 64 && s.misses*2 >= s.seeks {
+		s.buildBloom()
+	}
+	src := &cur.pointSrc
+	if s.bloom != nil && !s.bloomHas(h, probe, regs) {
+		cur.serveSegRun(orderOp, src.listSegs[:0], src.listRows[:0])
+		return true
+	}
 	lo, hi := s.find(probe)
 	s.orderRun(lo, hi)
 	if ord, ok := s.moreOrder(h); ok {
 		lo, hi = s.narrow(lo, hi, h, ord, regs)
 	}
-	src := &cur.pointSrc
+	if lo == hi {
+		s.misses++
+	}
 	segs, rows := src.listSegs[:0], src.listRows[:0]
 	if s.one != nil {
 		for _, r := range s.perm[lo:hi] {
@@ -498,18 +526,8 @@ func (p *ReadOnlyPager) segSortedStill(cur *vdbeCursor, s *segSortedRows) bool {
 // comparison's affinity. Every key is an INTEGER: a REAL equals one only when
 // it is that integer exactly, and NULL, TEXT and BLOB equal none.
 func (s *segSortedRows) find(probe Value) (int, int) {
-	probe = applyAffinityToValue(probe, s.hint.aff)
-	var k int64
-	switch probe.Typ {
-	case Int:
-		k = probe.I
-	case Float:
-		f := probe.F
-		if f != math.Trunc(f) || f < -9223372036854775808.0 || f >= 9223372036854775808.0 {
-			return 0, 0
-		}
-		k = int64(f)
-	default:
+	k, ok := segSeekInt(applyAffinityToValue(probe, s.hint.aff))
+	if !ok {
 		return 0, 0
 	}
 	if s.one != nil {
@@ -518,6 +536,115 @@ func (s *segSortedRows) find(probe Value) (int, int) {
 	}
 	lo, _ := slices.BinarySearch(s.keys, k)
 	return lo, runEnd(lo, len(s.keys), func(i int) bool { return s.keys[i] > k })
+}
+
+// segSeekInt is the INTEGER a key equals, when it equals one: a REAL only
+// when it is that integer exactly, and NULL, TEXT and BLOB none.
+func segSeekInt(v Value) (int64, bool) {
+	switch v.Typ {
+	case Int:
+		return v.I, true
+	case Float:
+		f := v.F
+		if f != math.Trunc(f) || f < -9223372036854775808.0 || f >= 9223372036854775808.0 {
+			return 0, false
+		}
+		return int64(f), true
+	}
+	return 0, false
+}
+
+// bloomKey mixes one more of a key's int64s into its hash.
+func bloomKey(x uint64, v int64) uint64 {
+	x ^= uint64(v)
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	return x ^ x>>31
+}
+
+// buildBloom fills s.bloom from every row the segments hold, when the column
+// and each further column of s.hint are INTEGER blocks with no exception
+// (or the rowid) in every segment: then a key that is no tuple of int64s
+// equals no row, and one that is equals only rows its hash marks. A row with
+// a NULL in its key equals no probe and is left out.
+func (s *segSortedRows) buildBloom() {
+	s.bloomTried = true
+	cols := []int{s.hint.col}
+	for _, mc := range s.hint.more {
+		if mc.col >= 0 && mc.col != s.tbl.ipkIndex && (mc.col >= len(s.tbl.cols) || s.tbl.cols[mc.col].Aff == affReal) {
+			return
+		}
+		cols = append(cols, mc.col)
+	}
+	n := 0
+	for _, sg := range s.from {
+		n += sg.nRows
+	}
+	if n < segBloomMinRows {
+		return
+	}
+	m := uint64(1) << bits.Len64(uint64(n)*8-1)
+	bloom := make([]uint64, m/64)
+	blocks := make([][]int64, len(cols))
+	for _, sg := range s.from {
+		if sg.nRows == 0 {
+			continue
+		}
+		for j, c := range cols {
+			blocks[j] = nil
+			if c < 0 || c == s.tbl.ipkIndex {
+				continue
+			}
+			b, ok := sg.Int64Column(c)
+			if !ok || len(b) < sg.nRows || sg.hasException(c) {
+				return
+			}
+			blocks[j] = b
+		}
+	rows:
+		for r := range sg.nRows {
+			var x uint64
+			for j, c := range cols {
+				v := int64(sg.Rowid(r))
+				if blocks[j] != nil {
+					if sg.cols[c].nullOff != 0 && sg.isNull(c, r) {
+						continue rows
+					}
+					v = blocks[j][r]
+				}
+				x = bloomKey(x, v)
+			}
+			b1, b2 := x&(m-1), x>>32&(m-1)
+			bloom[b1/64] |= 1 << (b1 % 64)
+			bloom[b2/64] |= 1 << (b2 % 64)
+		}
+	}
+	s.bloom, s.bloomMask = bloom, m-1
+	segBloomsBuilt.Add(1)
+}
+
+// bloomHas reports whether a row may equal the probe and h's further keys in
+// regs, each taking its comparison's affinity: false only where none does.
+func (s *segSortedRows) bloomHas(h *sortedSeekHint, probe Value, regs []Value) bool {
+	k, ok := segSeekInt(applyAffinityToValue(probe, h.aff))
+	if !ok {
+		return false
+	}
+	x := bloomKey(0, k)
+	for _, mc := range h.more {
+		if mc.reg < 0 || mc.reg >= len(regs) {
+			return true
+		}
+		v, ok := segSeekInt(applyAffinityToValue(regs[mc.reg], mc.aff))
+		if !ok {
+			return false
+		}
+		x = bloomKey(x, v)
+	}
+	b1, b2 := x&s.bloomMask, x>>32&s.bloomMask
+	return s.bloom[b1/64]&(1<<(b1%64)) != 0 && s.bloom[b2/64]&(1<<(b2%64)) != 0
 }
 
 // runEnd is the first position from lo to n that is past, which holds from
