@@ -88,7 +88,7 @@ func TestVCursorLayout(t *testing.T) {
 	if unsafe.Offsetof(ix.Vals) != VIdxOffVals || unsafe.Offsetof(ix.NVals) != VIdxOffNVals || unsafe.Offsetof(ix.Starts) != VIdxOffStarts ||
 		unsafe.Offsetof(ix.Rows) != VIdxOffRows || unsafe.Offsetof(ix.Seg) != VIdxOffSeg || unsafe.Offsetof(ix.Mask) != VIdxOffMask ||
 		unsafe.Offsetof(ix.Count) != VIdxOffCount || unsafe.Offsetof(ix.Lo) != VIdxOffLo || unsafe.Offsetof(ix.Hi) != VIdxOffHi || unsafe.Offsetof(ix.Segs) != VIdxOffSegs ||
-		unsafe.Sizeof(ix) != VIdxSize {
+		unsafe.Offsetof(ix.Pack) != VIdxOffPack || unsafe.Sizeof(ix) != VIdxSize {
 		t.Fatalf("VIdx is laid out differently from what generated code uses")
 	}
 	var v tvalue

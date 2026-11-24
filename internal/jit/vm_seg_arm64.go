@@ -439,14 +439,24 @@ func (e *vmEmitArm) seekIdx(pc int, in VInsn) {
 	seg, bloop, bhi, bdone, rest, next, found, miss, done := e.vmLabel("is"), e.vmLabel("ib"), e.vmLabel("ih"), e.vmLabel("id"),
 		e.vmLabel("ir"), e.vmLabel("in"), e.vmLabel("if"), e.vmLabel("im"), e.vmLabel("ie")
 	fserved, fskip, mserved, mskip := e.vmLabel("iv"), e.vmLabel("iw"), e.vmLabel("ix"), e.vmLabel("iy")
-	e.ldrb(X10, in.B, L.OffTyp)
-	a.CmpImm(X10, uint32(L.TypInt))
-	a.Bcond(CondNE, e.stub(pc)) // the key's conversions are the VDBE's
-	e.branchWB(pc)              // the cursor's segment pointers are stored
-	e.ldr(X4, in.B, L.OffI)
+	e.branchWB(pc) // the cursor's segment pointers are stored
 	e.curBase(in.A)
 	a.LdrImm(X5, X9, VCursorOffIdx)
 	a.Cbz(X5, e.stub(pc))
+	e.ldrb(X10, in.B, L.OffTyp)
+	if len(in.More) > 0 {
+		// A sorted seek's NULL key finds no row, and its miss is taken back
+		// with no key.
+		a.MovImm64(X4, -1)
+		a.CmpImm(X10, uint32(L.TypNull))
+		a.Bcond(CondE, miss)
+	}
+	a.CmpImm(X10, uint32(L.TypInt))
+	a.Bcond(CondNE, e.stub(pc)) // the key's conversions are the VDBE's
+	e.ldr(X4, in.B, L.OffI)
+	if len(in.More) > 0 {
+		e.seekIdxPack(pc, in)
+	}
 	a.LdrImm(X6, X5, VIdxOffCount)
 
 	a.Label(seg)
@@ -559,6 +569,41 @@ func (e *vmEmitArm) seekIdx(pc int, in VInsn) {
 // seekIdxServed adds to the cursor in X9's Served the rows its last seek's run
 // served, up to the row it is on, when it has one (State 2, 4 or 5). X10 and
 // X11 are scratch.
+// seekIdxPack is vm_seg_amd64.go's: X4 the key, X5 the index, X7 its Pack.
+func (e *vmEmitArm) seekIdxPack(pc int, in VInsn) {
+	a, L := e.a, e.lay
+	packed, nopack := e.vmLabel("ip"), e.vmLabel("iq")
+	a.LdrImm(X7, X5, VIdxOffPack)
+	a.Cbz(X7, packed)
+	for _, r := range in.More {
+		e.ldrb(X10, r, L.OffTyp)
+		a.CmpImm(X10, uint32(L.TypNull))
+		a.Bcond(CondE, nopack)
+		a.CmpImm(X10, uint32(L.TypInt))
+		a.Bcond(CondNE, e.stub(pc))
+	}
+	a.CmpImm(X4, 0)
+	a.Bcond(CondL, nopack)
+	a.LdrImm(X10, X7, 0)
+	a.Cmp(X4, X10)
+	a.Bcond(CondGE, nopack)
+	for j, r := range in.More {
+		e.ldr(X11, r, L.OffI)
+		a.CmpImm(X11, 0)
+		a.Bcond(CondL, nopack)
+		a.LdrImm(X10, X7, 16+16*j)
+		a.Cmp(X11, X10)
+		a.Bcond(CondGE, nopack)
+		a.LdrImm(X10, X7, 8+16*j)
+		a.Lslv(X4, X4, X10)
+		a.OrrReg(X4, X4, X11)
+	}
+	a.B(packed)
+	a.Label(nopack)
+	a.MovImm64(X4, -1)
+	a.Label(packed)
+}
+
 func (e *vmEmitArm) seekIdxServed(served, skip string) {
 	a := e.a
 	a.LdrImm(X10, X9, VCursorOffState)

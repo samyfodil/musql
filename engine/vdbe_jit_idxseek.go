@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"encoding/binary"
 	"fmt"
+	"math/bits"
 	"slices"
 	"unsafe"
 
@@ -37,6 +38,17 @@ type idxSeekSpec struct {
 	sorted    *sortedSeekHint
 	sortCols  []int
 	sortColls []string
+	// pack is the columns of a sorted seek's further keys, in its hint's
+	// order, where each is an INTEGER column the seek holds to one value:
+	// native code packs their keys with the first into one (jit.VIdx.Pack),
+	// and a probe finds exactly its stretch of rows (buildPackedSortedVMIdx),
+	// in the order of the automatic index key's other columns, rest (indexes
+	// into its cols), then the rowid. packOnly is a seek only such an index
+	// serves: one of rest is a REAL or descending.
+	pack     []int
+	rest     []int
+	packOnly bool
+	tbl      *resolvedTable
 }
 
 // lowerIdxSeeks lowers each integer equality index seek -- an OpSeekIndexHint's
@@ -146,6 +158,11 @@ func lowerIdxSeeks(prog *Program, vp []jit.VInsn, segCap []bool) (specs []*idxSe
 			// A miss falls through to what comes before the rewind, which
 			// takes the empty jump.
 			vp[s.pc] = jit.VInsn{Op: jit.VSeekIdx, A: s.c, B: s.key, T: s.pc + 1}
+			if specs[s.c].pack != nil {
+				for _, m := range insns[s.pc].P4.(*sortedSeekHint).more {
+					vp[s.pc].More = append(vp[s.pc].More, m.reg)
+				}
+			}
 			for q := s.pc + 1; q < s.end; q++ {
 				inner = append(inner, q)
 			}
@@ -259,7 +276,7 @@ func sortedSeekSpec(insns []Instruction, pc int, segCap []bool, nReg int) (*idxS
 	if open < 0 || open > pc || tbl == nil || h.col >= len(tbl.cols) || h.col == tbl.ipkIndex || tbl.cols[h.col].Aff == affReal {
 		return nil, 0, false
 	}
-	spec := &idxSeekSpec{col: h.col, seek: pc, aio: -1, open: -1, sorted: h, sortCols: []int{h.col}, sortColls: []string{""}}
+	spec := &idxSeekSpec{col: h.col, seek: pc, aio: -1, open: -1, sorted: h, sortCols: []int{h.col}, sortColls: []string{""}, tbl: tbl}
 	if aio >= 0 {
 		key, _ := insns[aio].P4.(*autoIndexKey)
 		if aio < open || aio > pc || key == nil || !segRunOrderable(tbl, key) || key.rjSweep != nil {
@@ -278,12 +295,27 @@ func sortedSeekSpec(insns []Instruction, pc int, segCap []bool, nReg int) (*idxS
 			if col == h.col || sortedSeekPins(h, col, key.colls[i]) {
 				continue // one value, whichever way it runs
 			}
+			spec.rest = append(spec.rest, i)
 			if desc || tbl.cols[col].Aff == affReal {
-				return nil, 0, false
+				spec.packOnly = true
+				continue
 			}
 			spec.sortCols, spec.sortColls = append(spec.sortCols, col), append(spec.sortColls, key.colls[i])
 		}
 		spec.order = key
+	}
+	if len(h.more) > 0 {
+		for _, m := range h.more {
+			if m.reg < 0 || m.reg >= nReg || m.col < 0 || m.col >= len(tbl.cols) || m.col == tbl.ipkIndex || m.col == h.col ||
+				tbl.cols[m.col].Aff == affReal || m.aff != affNone && m.aff != affNumeric && m.aff != affInteger || slices.Contains(spec.pack, m.col) {
+				spec.pack = nil
+				break
+			}
+			spec.pack = append(spec.pack, m.col)
+		}
+	}
+	if spec.packOnly && spec.pack == nil {
+		return nil, 0, false
 	}
 	return spec, end, true
 }
@@ -374,6 +406,9 @@ type vmIdx struct {
 	segPtrs []unsafe.Pointer
 	vidx    []jit.VIdx
 	none    bool
+	// pack is the whole index's packing of its keys (jit.VIdx.Pack), when
+	// it packs them (buildPackedSortedVMIdx).
+	pack []int64
 }
 
 // idxFor returns cursor c's table as VSeekIdx searches it, or nil.
@@ -398,6 +433,11 @@ func buildVMIdx(t *vmTab, spec *idxSeekSpec, enc TextEncoding, s *segSortedRows)
 		return x
 	}
 	if spec.sorted != nil {
+		if spec.pack != nil {
+			if y := buildPackedSortedVMIdx(&vmIdx{tab: t, none: true}, spec, enc); !y.none || spec.packOnly {
+				return y
+			}
+		}
 		if s != nil && s.ok {
 			if y := sortedVMIdxFrom(&vmIdx{tab: t, none: true}, s, spec, enc); !y.none {
 				return y
@@ -968,6 +1008,138 @@ func (x *vmIdx) tableIndex(mask uint64, n int, at func(i int) (seg, r int, k int
 	return x
 }
 
+// buildPackedSortedVMIdx is buildSortedVMIdx as one index over every
+// segment of the table whose keys are each row's key and further keys
+// packed into one (jit.VIdx.Pack), every column a clean INTEGER block:
+// widths are those of the largest value of each, and a row with a NULL key,
+// which no seek finds, is left out. A run is then exactly the rows equal on
+// every key, put in the automatic index key's order of its other columns
+// (idxSeekSpec.rest) as orderRun puts a run, ties in rowid order: the order
+// the seek takes them in. None where a key is below 0 or the widths need
+// more than 62 bits.
+func buildPackedSortedVMIdx(x *vmIdx, spec *idxSeekSpec, enc TextEncoding) *vmIdx {
+	t := x.tab
+	if len(t.at) > 1<<16 {
+		return x
+	}
+	cols := append([]int{spec.col}, spec.pack...)
+	n := 0
+	for _, sg := range t.at {
+		n += sg.nRows
+	}
+	type at struct {
+		seg uint16
+		r   int32
+	}
+	keys, where := make([]int64, 0, n), make([]at, 0, n)
+	vals := make([]int64, 0, n*len(cols))
+	hi := make([]int64, len(cols))
+	blocks := make([][]int64, len(cols))
+	mask := ^uint64(0)
+	var prevRid uint64
+	for si, sg := range t.at {
+		if sg.nRows == 0 {
+			continue
+		}
+		if si > 0 && sg.Rowid(0) <= prevRid {
+			return x
+		}
+		prevRid = sg.Rowid(sg.nRows - 1)
+		mask &= t.segs[si].Mask
+		none := false
+		for j, c := range cols {
+			b, ok := sg.Int64Column(c)
+			switch {
+			case sg.hasException(c):
+				return x
+			case ok && len(b) >= sg.nRows:
+				blocks[j] = b
+			case sg.cols[c].phys == PhysNull:
+				none = true
+			default:
+				return x
+			}
+		}
+		if none {
+			continue
+		}
+	rows:
+		for r := range sg.nRows {
+			for _, c := range cols {
+				if sg.cols[c].nullOff != 0 && sg.isNull(c, r) {
+					continue rows
+				}
+			}
+			for j := range cols {
+				v := blocks[j][r]
+				if v < 0 {
+					return x
+				}
+				hi[j] = max(hi[j], v)
+				vals = append(vals, v)
+			}
+			where = append(where, at{uint16(si), int32(r)})
+		}
+	}
+	if len(where) == 0 {
+		return x
+	}
+	pack, total := make([]int64, 0, 2*len(cols)-1), 0
+	for j := range cols {
+		w := bits.Len64(uint64(hi[j]))
+		if total += w; total > 62 {
+			return x
+		}
+		if j > 0 {
+			pack = append(pack, int64(w))
+		}
+		pack = append(pack, int64(1)<<w)
+	}
+	for i := range where {
+		k := vals[i*len(cols)]
+		for j := 1; j < len(cols); j++ {
+			k = k<<pack[2*j-1] | vals[i*len(cols)+j]
+		}
+		keys = append(keys, k)
+	}
+	perm := radixSortInt64(keys)
+	if len(spec.rest) > 0 {
+		key, tbl := spec.order, spec.tbl
+		cell := func(w at, c int) Value {
+			sg := t.at[w.seg]
+			v := sg.Value(c, int(w.r))
+			if v.Typ == Int && tbl.cols[c].Aff == affReal {
+				v = Value{Typ: Float, F: float64(v.I)}
+			}
+			return v
+		}
+		for i := 0; i < len(keys); {
+			e := i + 1
+			for e < len(keys) && keys[e] == keys[i] {
+				e++
+			}
+			if e-i > 1 {
+				slices.SortStableFunc(perm[i:e], func(a, b int32) int {
+					for _, k := range spec.rest {
+						c := compareValuesCollatedEnc(cell(where[a], key.cols[k]), cell(where[b], key.cols[k]), key.colls[k], enc)
+						if c != 0 {
+							if k < len(key.desc) && key.desc[k] {
+								return -c
+							}
+							return c
+						}
+					}
+					return 0
+				})
+			}
+			i = e
+		}
+	}
+	x.tableIndex(mask, len(keys), func(i int) (int, int, int64) { w := where[perm[i]]; return int(w.seg), int(w.r), keys[i] })
+	x.vidx[0].Pack, x.pack = unsafe.Pointer(unsafe.SliceData(pack)), pack
+	return x
+}
+
 // buildSegSortedVMIdx is buildSortedVMIdx as each segment's own index, over
 // segments whose columns are clean INTEGER blocks (segment.sortedOn).
 func buildSegSortedVMIdx(x *vmIdx, spec *idxSeekSpec) *vmIdx {
@@ -1119,18 +1291,28 @@ const maxNativeSortedRun = 16
 // an entry that built the table's sorted rows for a seek its run might never
 // reach (an outer loop with no rows), or for a handful, paid for them on
 // every query.
-func (jx *vmJIT) sortedSeekServed(m *vdbe, cur *vdbeCursor, spec *idxSeekSpec) bool {
+func (jx *vmJIT) sortedSeekServed(m *vdbe, c int, cur *vdbeCursor, t *vmTab, spec *idxSeekSpec) bool {
 	s := cur.segSorted
 	if !cur.segSortable() || s == nil || !s.ok {
 		return false
 	}
-	if n := max(len(s.keys), len(s.perm)); s.seeks < max(16, n/64) || len(spec.sorted.more) > 0 && !s.shortRuns() {
-		// Native code walks a run whole, where the VDBE narrows it.
+	if n := max(len(s.keys), len(s.perm)); s.seeks < max(16, n/64) {
 		return false
 	}
-	if _, narrows := s.moreOrder(spec.sorted); narrows && !s.runsAtMost(maxNativeSortedRun) {
-		// Nor where the VDBE halves a run native code would walk.
-		return false
+	// An index of packed keys finds a probe's stretch as the VDBE narrows
+	// its run.
+	if spec.pack == nil || jx.idxFor(c, t, m.encoding(), s) == nil || jx.idxs[c].Load().pack == nil {
+		if spec.packOnly {
+			return false
+		}
+		if len(spec.sorted.more) > 0 && !s.shortRuns() {
+			// Native code walks a run whole, where the VDBE narrows it.
+			return false
+		}
+		if _, narrows := s.moreOrder(spec.sorted); narrows && !s.runsAtMost(maxNativeSortedRun) {
+			// Nor where the VDBE halves a run native code would walk.
+			return false
+		}
 	}
 	_, orderOp, ok := cur.segSortedReady(spec.sorted, m.encoding())
 	var key *autoIndexKey

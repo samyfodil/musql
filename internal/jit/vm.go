@@ -206,6 +206,10 @@ const (
 	// Served gains, at each VSeekIdx, the rows the last seek's run served up
 	// to the cursor's row -- State 5 being a list the engine seeked and handed
 	// over on its row Last, with Served set so the gain is the rows past it.
+	// More, when set, is the registers of the seek's further keys, each an
+	// INTEGER or the seek exits; with an Idx whose Pack is set, the key
+	// searched is r[B] and theirs packed into one (VIdx.Pack), and a key
+	// outside its width matches no row.
 	VSeekIdx
 	// VInText: r[C] = 1 when the TEXT in r[A] is, byte for byte, one of the B
 	// TEXTs of the VTextLit list at Imm (which the engine keeps alive and never
@@ -389,6 +393,8 @@ type VInsn struct {
 	// them may be dead. The engine sets it only where it does not read those
 	// slots and does not need those registers.
 	Skip uint64
+	// More is VSeekIdx's further key registers.
+	More []int
 	// Kernel is VMath's function.
 	Kernel *fir.Func
 	// Pat is VLike's pattern.
@@ -546,6 +552,12 @@ type VIdx struct {
 	Count  int64
 	Lo, Hi int64
 	Segs   unsafe.Pointer
+	// Pack, when not nil, makes Vals packed keys, a VSeekIdx's key and its
+	// further keys in one: int64s, the first key's limit, then for each
+	// further key its width and limit. Every key is at least 0 and below its
+	// limit, which is 1 << width; the packed key is each width's shift of
+	// the key before and the next ORed in.
+	Pack unsafe.Pointer
 }
 
 // VTab is the segments of a table, in the order the engine searches them.
@@ -635,7 +647,8 @@ const (
 	VIdxOffLo       = 56
 	VIdxOffHi       = 64
 	VIdxOffSegs     = 72
-	VIdxSize        = 80
+	VIdxOffPack     = 80
+	VIdxSize        = 88
 	VTabOffSegs     = 0
 	VTabOffN        = 8
 	VTabSegSize     = 40

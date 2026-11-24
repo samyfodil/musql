@@ -626,16 +626,45 @@ func (e *vmEmitWasm) seekRowid(pc int, in VInsn) {
 func (e *vmEmitWasm) seekIdx(pc int, in VInsn) {
 	w := e.w
 	e.segLocals()
-	e.seekKey(pc, in)
+	if len(in.More) == 0 {
+		e.seekKey(pc, in)
+	} else {
+		e.loadTyp(in.B)
+		w.I32(int32(e.lay.TypInt))
+		w.op(opI32Ne)
+		e.loadTyp(in.B)
+		w.I32(int32(e.lay.TypNull))
+		w.op(opI32Ne)
+		w.op(opI32And)
+		w.Get(e.wb)
+		w.op(opI32Or)
+		e.exitIf(pc)
+		e.loadI64(in.B, e.lay.OffI)
+		w.Set(e.t1)
+	}
 	e.cursorField(in.A, VCursorOffIdx)
 	w.op(opI32WrapI64)
 	w.Set(e.sk1)
 	w.Get(e.sk1)
 	w.op(opI32Eqz)
 	e.exitIf(pc)
+	if len(in.More) > 0 {
+		e.seekIdxPack(pc, in)
+	}
 	w.Get(e.sk1)
 	w.LoadI64(VIdxOffCount)
 	w.Set(e.t2)
+	if len(in.More) > 0 {
+		// A sorted seek's NULL key finds no row, and its miss is taken back
+		// with no key: no segment is searched.
+		w.I64(0)
+		w.Get(e.t2)
+		e.loadTyp(in.B)
+		w.I32(int32(e.lay.TypNull))
+		w.op(opI32Eq)
+		w.op(opSelect)
+		w.Set(e.t2)
+	}
 	w.I32(1)
 	w.Set(e.skf)
 	w.op(opBlock, opVoid, opLoop, opVoid) // out, seg
@@ -758,6 +787,66 @@ func (e *vmEmitWasm) seekIdx(pc int, in VInsn) {
 
 // seekIdxServed adds to cursor A's Served the rows its last seek's run
 // served, up to the row it is on, when it has one (State 2, 4 or 5).
+// seekIdxPack is vm_seg_amd64.go's: t1 the key, sk1 the index, sk2 its
+// Pack, skf whether a key is outside its width and skm a further key.
+func (e *vmEmitWasm) seekIdxPack(pc int, in VInsn) {
+	w, L := e.w, e.lay
+	e.ptrAt(e.sk1, VIdxOffPack)
+	w.Set(e.sk2)
+	w.Get(e.sk2)
+	w.op(opIf, opVoid)
+	for _, r := range in.More {
+		e.loadTyp(r)
+		w.I32(int32(L.TypInt))
+		w.op(opI32Ne)
+		e.loadTyp(r)
+		w.I32(int32(L.TypNull))
+		w.op(opI32Ne)
+		w.op(opI32And)
+		e.exitIf(pc)
+	}
+	e.packOutside(e.t1, 0)
+	w.Set(e.skf)
+	for j, r := range in.More {
+		e.loadI64(r, L.OffI)
+		w.Set(e.skm)
+		w.Get(e.skf)
+		e.packOutside(e.skm, uint32(16+16*j))
+		w.op(opI32Or)
+		e.loadTyp(r)
+		w.I32(int32(L.TypNull))
+		w.op(opI32Eq)
+		w.op(opI32Or)
+		w.Set(e.skf)
+		w.Get(e.t1)
+		w.Get(e.sk2)
+		w.LoadI64(uint32(8 + 16*j))
+		w.op(opI64Shl)
+		w.Get(e.skm)
+		w.op(opI64Or)
+		w.Set(e.t1)
+	}
+	w.Get(e.skf)
+	w.op(opIf, opVoid)
+	w.I64(-1)
+	w.Set(e.t1)
+	w.op(opEnd, opEnd)
+}
+
+// packOutside pushes whether the key in local k is below 0 or at least the
+// limit at off of the Pack in sk2.
+func (e *vmEmitWasm) packOutside(k uint32, off uint32) {
+	w := e.w
+	w.Get(k)
+	w.I64(0)
+	w.op(opI64LtS)
+	w.Get(k)
+	w.Get(e.sk2)
+	w.LoadI64(off)
+	w.op(opI64GeS)
+	w.op(opI32Or)
+}
+
 func (e *vmEmitWasm) seekIdxServed(a int) {
 	w := e.w
 	for i, s := range []int64{2, 4, 5} {

@@ -124,7 +124,9 @@ func vmStepInto(buf []int, in VInsn, pc int) (progStep, []int) {
 	case VRewind, VNext:
 		s.targets = put(in.T)
 	case VSeekRowid, VSeekIdx:
-		s.uses, s.targets = put(in.B), put(in.T)
+		i := len(buf)
+		buf = append(append(buf, in.B), in.More...)
+		s.uses, s.targets = buf[i:len(buf):len(buf)], put(in.T)
 	case VSortSeek:
 		s.uses = put(in.B)
 	case VSortEmpty:

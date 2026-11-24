@@ -716,16 +716,26 @@ func (e *vmEmit) seekIdx(pc int, in VInsn) {
 	cb := int32(in.A * VCursorSize)
 	e.unmapCursor(in.A)
 	l := e.named()
-	a.CmpMemDByte(RSI, e.d(in.B, L.OffTyp), L.TypInt)
-	e.jccStub(CondNE, pc) // the key's conversions are the VDBE's
-	e.jccWB(pc)           // the cursor's segment pointers are stored
+	e.jccWB(pc) // the cursor's segment pointers are stored
 	a.MovRegMemD(RAX, RDI, POffCur)
 	a.LeaRegMemD(RAX, RAX, cb)
 	a.MovRegMemD(R9, RAX, VCursorOffIdx)
 	a.TestRegReg(R9, R9)
 	e.jccStub(CondE, pc)
 	a.MovqXR(X0, RAX) // the cursor
+	if len(in.More) > 0 {
+		// A sorted seek's NULL key finds no row, and its miss is taken back
+		// with no key.
+		a.MovRegImm64(RCX, -1)
+		a.CmpMemDByte(RSI, e.d(in.B, L.OffTyp), L.TypNull)
+		a.JccL(CondE, l("miss"))
+	}
+	a.CmpMemDByte(RSI, e.d(in.B, L.OffTyp), L.TypInt)
+	e.jccStub(CondNE, pc) // the key's conversions are the VDBE's
 	a.MovRegMemD(RCX, RSI, e.d(in.B, L.OffI))
+	if len(in.More) > 0 {
+		e.seekIdxPack(pc, in, l("packed"), l("nopack"))
+	}
 	a.MovRegMemD(RDX, R9, VIdxOffCount)
 
 	a.Bind(l("seg"))
@@ -829,6 +839,40 @@ func (e *vmEmit) seekIdx(pc int, in VInsn) {
 	a.MovMemDImm(R10, VCursorOffState, 3)
 	e.jmpBlock(pc, in.T)
 	a.Bind(l("done"))
+}
+
+// seekIdxPack makes RCX, the key, VSeekIdx's packed key where the index R9
+// packs its keys (VIdx.Pack): -1, below every packed key, where one is
+// outside its width or is NULL. Where it does not, the key stays the first
+// alone, and the loop tests the rest. A further key that is neither an
+// INTEGER nor NULL exits.
+func (e *vmEmit) seekIdxPack(pc int, in VInsn, packed, nopack Lbl) {
+	a, L := e.a, e.lay
+	a.MovRegMemD(R10, R9, VIdxOffPack)
+	a.TestRegReg(R10, R10)
+	a.JccL(CondE, packed)
+	for _, r := range in.More {
+		a.CmpMemDByte(RSI, e.d(r, L.OffTyp), L.TypNull)
+		a.JccL(CondE, nopack)
+		a.CmpMemDByte(RSI, e.d(r, L.OffTyp), L.TypInt)
+		e.jccStub(CondNE, pc)
+	}
+	a.MovRegReg(RAX, RCX)
+	a.AluRegMemD(AluCmp, RAX, R10, 0)
+	a.JccL(condAboveEq, nopack) // unsigned: a negative key too
+	for j, r := range in.More {
+		a.MovRegMemD(RDX, RSI, e.d(r, L.OffI))
+		a.AluRegMemD(AluCmp, RDX, R10, int32(16+16*j))
+		a.JccL(condAboveEq, nopack)
+		a.MovRegMemD(RCX, R10, int32(8+16*j))
+		a.ShlRegCL(RAX)
+		a.OrRegReg(RAX, RDX)
+	}
+	a.MovRegReg(RCX, RAX)
+	a.JmpL(packed)
+	a.Bind(nopack)
+	a.MovRegImm64(RCX, -1)
+	a.Bind(packed)
 }
 
 // seekIdxServed adds to cursor cur's Served the rows its last seek's run
