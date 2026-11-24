@@ -45,10 +45,14 @@ type segSortedRows struct {
 	// order is the automatic index key a run's rows follow, when the seek
 	// stands in for the OpAutoIndexOrder that would have built and sorted the
 	// table; ordered marks the runs already put in it, by first position.
-	order   *autoIndexKey
-	tbl     *resolvedTable
-	enc     TextEncoding
-	ordered map[int]bool
+	order *autoIndexKey
+	// narrowKey sorts a run by the seek's further columns, then the rowid,
+	// where no automatic index order does: a run's rows equal on them all
+	// are then one stretch, still in rowid order, which narrow finds.
+	narrowKey *autoIndexKey
+	tbl       *resolvedTable
+	enc       TextEncoding
+	ordered   map[int]bool
 	// distinct is how many values the column holds, counted the first time
 	// shortRuns asks; 0 until then.
 	distinct int
@@ -191,6 +195,9 @@ func (cur *vdbeCursor) segSortedReady(h *sortedSeekHint, enc TextEncoding) (*seg
 				s.perm = slices.Clone(s.perm) // the segment's own, shared
 			}
 			s.order, s.tbl, s.enc = key, cur.tbl, enc
+			if key == nil {
+				s.narrowKey = narrowKeyFor(cur.tbl, h)
+			}
 		}
 		cur.segSorted, cur.keptSorted = s, nil
 	}
@@ -251,10 +258,11 @@ func segRunOrderable(tbl *resolvedTable, key *autoIndexKey) bool {
 // orders the built rows: the key's values as the built rows hold them, ties
 // in the run's own order, which is the rowids'.
 func (s *segSortedRows) orderRun(lo, hi int) {
-	if s.order == nil || hi-lo < 2 || s.ordered[lo] {
+	key := s.runKey()
+	if key == nil || hi-lo < 2 || s.ordered[lo] {
 		return
 	}
-	key, n := s.order, hi-lo
+	n := hi - lo
 	nk := len(key.cols)
 	// The key's leading columns that are the rowid or an INTEGER block with
 	// no exception in every row's segment are read as int64s, without
@@ -331,7 +339,7 @@ func (s *segSortedRows) orderRun(lo, hi int) {
 // by them, as indexes into h.more, when it sorts by them first: then the
 // rows of a run equal on them all are one stretch of it (narrow).
 func (s *segSortedRows) moreOrder(h *sortedSeekHint) ([]int, bool) {
-	if len(h.more) == 0 || s.order == nil {
+	if len(h.more) == 0 || s.runKey() == nil {
 		return nil, false
 	}
 	if s.moreHint != h {
@@ -343,7 +351,7 @@ func (s *segSortedRows) moreOrder(h *sortedSeekHint) ([]int, bool) {
 
 // moreOrderOf is moreOrder worked out.
 func (s *segSortedRows) moreOrderOf(h *sortedSeekHint) ([]int, bool) {
-	key := s.order
+	key := s.runKey()
 	ord := make([]int, 0, len(h.more))
 	for k, c := range key.cols {
 		if len(ord) == len(h.more) {
@@ -657,4 +665,30 @@ func runEnd(lo, n int, past func(int) bool) int {
 	}
 	bound = min(bound, n)
 	return lo + sort.Search(bound-lo, func(i int) bool { return past(lo + i) })
+}
+
+// runKey is the order a run is put in: the automatic index's, or narrowKey.
+func (s *segSortedRows) runKey() *autoIndexKey {
+	if s.order != nil {
+		return s.order
+	}
+	return s.narrowKey
+}
+
+// narrowKeyFor is the key that sorts a run of h's seek by its further
+// columns, then the rowid, as the built rows' seek sorts them
+// (sortRowsBy); nil where h has none or one is not a column.
+func narrowKeyFor(tbl *resolvedTable, h *sortedSeekHint) *autoIndexKey {
+	if len(h.more) == 0 {
+		return nil
+	}
+	key := &autoIndexKey{}
+	for _, m := range h.more {
+		if m.col < 0 || m.col >= len(tbl.cols) {
+			return nil
+		}
+		key.cols, key.colls = append(key.cols, m.col), append(key.colls, m.coll)
+	}
+	key.cols, key.colls = append(key.cols, -1), append(key.colls, "")
+	return key
 }
