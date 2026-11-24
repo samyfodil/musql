@@ -3,6 +3,7 @@ package engine
 import (
 	"slices"
 	"strconv"
+	"sync/atomic"
 )
 
 // segRowsInKeyOrder reports whether the table's rows, read in rowid order,
@@ -171,6 +172,77 @@ func (p *ReadOnlyPager) segKeyOrderList(cur *vdbeCursor, key *autoIndexKey, into
 	if prev == nil {
 		return nil
 	}
+	*into = segRowSource{list: true, listSegs: lsegs, listRows: lrows, listOne: oneSegment(lsegs), listKeys: into.listKeys, listPerm: into.listPerm,
+		listHits: into.listHits, cols: segColPlansFor(cur.tbl)}
+	return into
+}
+
+// segScanListMin is the fewest rows segScanList lists: a smaller table is
+// built, which native code walks from its first rewind.
+const segScanListMin = 1024
+
+// segScanLists counts the lists segScanList built, for tests.
+var segScanLists atomic.Int64
+
+// segScanList positions a lazy source on every row of cur's table in rowid
+// order, for a full scan below the outermost loop. C scans such a table again
+// for each outer row, reading only the columns it tests; built instead, every
+// row took the table's full width. nil where the segments are not the whole
+// answer, their rowids do not follow each other, or the table is small.
+func (p *ReadOnlyPager) segScanList(cur *vdbeCursor, into *segRowSource) *segRowSource {
+	if !p.segSeekable(cur) || !p.segs.cleanFor(cur.tbl.root) {
+		return nil
+	}
+	root := cur.tbl.root
+	segs := p.segs.byRoot[root]
+	if p.segs.isLive(root) {
+		var ok bool
+		if segs, ok = p.segs.liveBaseSegments(root); !ok {
+			return nil
+		}
+	}
+	n := 0
+	for _, s := range segs {
+		if s == nil || len(s.cols) != len(cur.tbl.cols) {
+			return nil
+		}
+		n += s.nRows
+	}
+	if n < segScanListMin {
+		return nil
+	}
+	var prev *segment
+	for _, s := range segs {
+		if s.nRows == 0 {
+			continue
+		}
+		if prev != nil && int64(s.Rowid(0)) <= int64(prev.Rowid(prev.nRows-1)) {
+			return nil
+		}
+		prev = s
+	}
+	lsegs, lrows := into.listSegs[:0], into.listRows[:0]
+	if cur.segFilter == nil {
+		lsegs, lrows = slices.Grow(lsegs, n), slices.Grow(lrows, n)
+	}
+	var sel []int64
+	for _, s := range segs {
+		if cur.segFilter != nil {
+			// The pre-filter names its own columns and the statement's
+			// parameters only, so it selects the same rows on every rewind.
+			var ok bool
+			if sel, ok = segSelectRows(s, cur.segFilter, cur.tbl.ipkIndex, cur.params, sel[:0]); ok {
+				for _, r := range sel {
+					lsegs, lrows = append(lsegs, s), append(lrows, int(r))
+				}
+				continue
+			}
+		}
+		for r := range s.nRows {
+			lsegs, lrows = append(lsegs, s), append(lrows, r)
+		}
+	}
+	segScanLists.Add(1)
 	*into = segRowSource{list: true, listSegs: lsegs, listRows: lrows, listOne: oneSegment(lsegs), listKeys: into.listKeys, listPerm: into.listPerm,
 		listHits: into.listHits, cols: segColPlansFor(cur.tbl)}
 	return into
