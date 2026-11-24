@@ -1104,6 +1104,12 @@ func runsInKeyOrder(sg *segment, d *segDiskIndex, rows []int, key *autoIndexKey)
 	return true
 }
 
+// maxNativeSortedRun is the longest average run native code walks whole for a
+// seek keyed on further columns too, where the VDBE narrows the run to them
+// (segSortedRows.narrow): past it, a million probes of TPC-DS q49 each walked
+// hundreds of rows.
+const maxNativeSortedRun = 16
+
 // sortedSeekServed reports whether the VDBE would serve cursor cur's sorted
 // seeks from the segments (segSortedSeek), as native code serves them, and
 // makes it ready to: only then does native code seek it.
@@ -1120,6 +1126,10 @@ func (jx *vmJIT) sortedSeekServed(m *vdbe, cur *vdbeCursor, spec *idxSeekSpec) b
 	}
 	if n := max(len(s.keys), len(s.perm)); s.seeks < max(16, n/64) || len(spec.sorted.more) > 0 && !s.shortRuns() {
 		// Native code walks a run whole, where the VDBE narrows it.
+		return false
+	}
+	if _, narrows := s.moreOrder(spec.sorted); narrows && !s.runsAtMost(maxNativeSortedRun) {
+		// Nor where the VDBE halves a run native code would walk.
 		return false
 	}
 	_, orderOp, ok := cur.segSortedReady(spec.sorted, m.encoding())

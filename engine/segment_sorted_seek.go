@@ -54,6 +54,11 @@ type segSortedRows struct {
 	// from is the segments it was built from, which a cursor reopened on
 	// the table checks before taking it over (segSortedStill).
 	from []*segment
+	// moreHint is the hint moreOrder last answered, with moreOrd and moreOK
+	// its answer: a seek asks once per probe.
+	moreHint *sortedSeekHint
+	moreOrd  []int
+	moreOK   bool
 }
 
 // maxSegSortedRun bounds the rows a sorted seek keyed on further columns
@@ -64,7 +69,10 @@ const maxSegSortedRun = 256
 // maxSegSortedRun rows. A seek keyed on further columns too is served on
 // this one alone -- a superset of its rows, which the level's loop narrows,
 // as it tests every conjunct -- only where that superset stays small.
-func (s *segSortedRows) shortRuns() bool {
+func (s *segSortedRows) shortRuns() bool { return s.runsAtMost(maxSegSortedRun) }
+
+// runsAtMost reports whether the column's runs average at most m rows.
+func (s *segSortedRows) runsAtMost(m int) bool {
 	n := len(s.keys)
 	key := func(i int) int64 { return s.keys[i] }
 	if s.one != nil {
@@ -77,7 +85,7 @@ func (s *segSortedRows) shortRuns() bool {
 			}
 		}
 	}
-	return n <= s.distinct*maxSegSortedRun
+	return n <= s.distinct*m
 }
 
 // segSortable reports whether cur is a table's one list of rows, which
@@ -298,6 +306,15 @@ func (s *segSortedRows) moreOrder(h *sortedSeekHint) ([]int, bool) {
 	if len(h.more) == 0 || s.order == nil {
 		return nil, false
 	}
+	if s.moreHint != h {
+		s.moreOrd, s.moreOK = s.moreOrderOf(h)
+		s.moreHint = h
+	}
+	return s.moreOrd, s.moreOK
+}
+
+// moreOrderOf is moreOrder worked out.
+func (s *segSortedRows) moreOrderOf(h *sortedSeekHint) ([]int, bool) {
 	key := s.order
 	ord := make([]int, 0, len(h.more))
 	for k, c := range key.cols {
@@ -334,7 +351,14 @@ func (s *segSortedRows) narrow(lo, hi int, h *sortedSeekHint, ord []int, regs []
 	cmpAt := func(i int) int {
 		for k, j := range ord {
 			mc := h.more[j]
-			if c := compareValuesCollatedEnc(s.cell(i, mc.col), keys[k], mc.coll, s.enc); c != 0 {
+			c, ok := 0, false
+			if keys[k].Typ == Int {
+				c, ok = s.cmpCellInt(i, mc.col, keys[k].I)
+			}
+			if !ok {
+				c = compareValuesCollatedEnc(s.cell(i, mc.col), keys[k], mc.coll, s.enc)
+			}
+			if c != 0 {
 				return c
 			}
 		}
@@ -343,6 +367,24 @@ func (s *segSortedRows) narrow(lo, hi int, h *sortedSeekHint, ord []int, regs []
 	a := lo + sort.Search(hi-lo, func(i int) bool { return cmpAt(lo+i) >= 0 })
 	b := a + sort.Search(hi-a, func(i int) bool { return cmpAt(a+i) > 0 })
 	return a, b
+}
+
+// cmpCellInt compares column c of the row at position i with k, where the row
+// holds an INTEGER in the column's block, as orderRun reads it: no Value is
+// decoded. false where it does not.
+func (s *segSortedRows) cmpCellInt(i, c int, k int64) (int, bool) {
+	sg, r := s.at(i)
+	if c < 0 || c == s.tbl.ipkIndex {
+		return cmp.Compare(int64(sg.Rowid(r)), k), true
+	}
+	if s.tbl.cols[c].Aff == affReal || sg.hasException(c) {
+		return 0, false
+	}
+	b, ok := sg.Int64Column(c)
+	if !ok || r >= len(b) || sg.cols[c].nullOff != 0 && sg.isNull(c, r) {
+		return 0, false
+	}
+	return cmp.Compare(b[r], k), true
 }
 
 // cell is column c of the row at position i, as orderRun reads it.
@@ -472,16 +514,20 @@ func (s *segSortedRows) find(probe Value) (int, int) {
 	}
 	if s.one != nil {
 		lo, _ := slices.BinarySearchFunc(s.perm, k, func(r int32, k int64) int { return cmp.Compare(s.block[r], k) })
-		hi := lo
-		for hi < len(s.perm) && s.block[s.perm[hi]] == k {
-			hi++
-		}
-		return lo, hi
+		return lo, runEnd(lo, len(s.perm), func(i int) bool { return s.block[s.perm[i]] > k })
 	}
 	lo, _ := slices.BinarySearch(s.keys, k)
-	hi := lo
-	for hi < len(s.keys) && s.keys[hi] == k {
-		hi++
+	return lo, runEnd(lo, len(s.keys), func(i int) bool { return s.keys[i] > k })
+}
+
+// runEnd is the first position from lo to n that is past, which holds from
+// some position on: galloped to, so a short run costs a few probes and a run
+// of thousands of rows a few dozen.
+func runEnd(lo, n int, past func(int) bool) int {
+	bound, step := lo, 1
+	for bound < n && !past(bound) {
+		lo, bound, step = bound+1, bound+step, step*2
 	}
-	return lo, hi
+	bound = min(bound, n)
+	return lo + sort.Search(bound-lo, func(i int) bool { return past(lo + i) })
 }
