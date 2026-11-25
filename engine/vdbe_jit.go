@@ -534,8 +534,9 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	// A program left with no entry at all gets no code: its run loop then pays
 	// nothing for the JIT, not even the check.
 	entries := 0
+	loops, vdbeLoops := jit.VLoopReach(vp), programLoops(prog)
 	for pc := range entry {
-		if entry[pc] && !worthEntering(vp, pc) {
+		if entry[pc] && !worthEntering(vp, pc, vdbeLoops && !loops[pc]) {
 			entry[pc] = false
 		}
 		if entry[pc] {
@@ -1159,6 +1160,9 @@ func scannableCursors(insns []Instruction, nCursors int) (rewind, next, streamed
 			rew, adv = in.P5&1 == 0, in.P5&5 == 0
 		case OpOpenDerived:
 			rew, adv = true, true
+			if ds, ok := in.P4.(*derivedSource); ok && (ds.recSelf != nil || derivedAlwaysStreams(ds)) {
+				rew, adv = false, false
+			}
 		case OpOpenWrite:
 			rew, adv = false, true
 		default:
@@ -1177,6 +1181,14 @@ func scannableCursors(insns []Instruction, nCursors int) (rewind, next, streamed
 		streamed[in.P1] = false
 	}
 	return rewind, next, streamed
+}
+
+// derivedAlwaysStreams reports whether OpOpenDerived opens ds as a co-routine
+// (streamsDerived) whatever machine runs it: its rows arrive one advance at a
+// time, which native code cannot make.
+func derivedAlwaysStreams(ds *derivedSource) bool {
+	return (ds.stream == streamAlways || ds.stream == streamCoroutine) && ds.prog != nil && ds.prog.Compound == nil &&
+		!ds.prog.Correlated && ds.prog.LiveSource == nil && ds.upfrom == nil && ds.viewUpfrom == nil
 }
 
 // segCapableCursors is, per cursor number, whether every open of it is an
@@ -1336,9 +1348,16 @@ const vmJITCursorEntryWork = 5
 
 // worthEntering reports whether an entry at pc does enough native work to pay
 // for itself: vmJITMinWork, plus vmJITCursorEntryWork when the run touches a
-// cursor.
-func worthEntering(vp []jit.VInsn, pc int) bool {
-	w, cursor, _ := nativeRun(vp, pc, vmJITMinWork+vmJITCursorEntryWork)
+// cursor. An entry in a program the VDBE loops over, from which native code
+// cannot loop itself (repeated), may be made again on every pass and pays an
+// entry's whole bookkeeping each time -- registers, rows, cursors handed over
+// and back -- which in a recursive CTE's step cost more than the VDBE took for
+// the run: it must do vmJITCopyWork past vmJITMinWork.
+func worthEntering(vp []jit.VInsn, pc int, repeated bool) bool {
+	w, cursor, _ := nativeRun(vp, pc, vmJITMinWork+vmJITCopyWork)
+	if repeated {
+		return w >= vmJITMinWork+vmJITCopyWork
+	}
 	if cursor {
 		return w >= vmJITMinWork+vmJITCursorEntryWork
 	}
