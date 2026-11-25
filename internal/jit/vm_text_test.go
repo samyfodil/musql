@@ -3,6 +3,7 @@
 package jit
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"unsafe"
@@ -333,5 +334,92 @@ func TestVMInText(t *testing.T) {
 	regs := []tvalue{{Typ: tvText, S: []byte("AIR")}, {}}
 	if pc := runVMCursorArgs(t, prog, regs, nil, &VCursor{}, &ProgArgs{UTF16: 1}); pc != 0 {
 		t.Fatalf("a UTF-16 comparison ran natively to %d", pc)
+	}
+}
+
+// TestVMTextNumberOrder: under a numeric affinity an INTEGER or a REAL is
+// less than a TEXT that is not a whole number, and with no affinity
+// (VTextCmpNoAff) than any TEXT, on either side and with every condition; a
+// whole number under a numeric affinity, a UTF-16 database, a BLOB and a
+// TEXT affinity exit.
+func TestVMTextNumberOrder(t *testing.T) {
+	if !Available || !VMTextOrder {
+		t.Skip("no ordered TEXT comparison on this platform")
+	}
+	noGC(t)
+	words := []string{"", " ", "a", "1995-03-15", "2002-04-02", "12", " 12 ", "+1.5", "-.5", "1e5", "1e", "5.", ".", "1x",
+		"0x10", "\t7\n", "1.2.3", "e5", "+", "9 9", "\xff"}
+	nums := []tvalue{{Typ: tvInt, I: 2002}, {Typ: tvInt, I: -3}, {Typ: tvReal, F: 2.5}, {Typ: tvReal, F: math.Inf(-1)}}
+	others := []tvalue{{Typ: tvBlob, S: []byte("a")}}
+	for _, w := range words {
+		others = append(others, tvalue{Typ: tvText, S: []byte(w)})
+	}
+	conds := []Cond{CondL, CondLE, CondG, CondGE, CondE, CondNE}
+	for _, imm := range []int64{0, 1, 1 | VCmpNull, VTextCmpNoAff, VTextCmpNoAff | VCmpNull} {
+		for _, utf16 := range []int64{0, 1} {
+			for _, num := range nums {
+				for _, o := range others {
+					for _, textOnA := range []bool{false, true} {
+						for _, cond := range conds {
+							a, b := num, o
+							if textOnA {
+								a, b = o, num
+							}
+							exit := imm&(1|VTextCmpNoAff) == 0 || utf16 != 0 || o.Typ != tvText || imm&1 != 0 && fullNumber(string(o.S))
+							// B cond A, B the left operand: a number is the lesser.
+							c := 1
+							if textOnA {
+								c = -1
+							}
+							want := map[Cond]bool{CondL: c < 0, CondLE: c <= 0, CondG: c > 0, CondGE: c >= 0, CondE: false, CondNE: true}[cond]
+							regs := []tvalue{a, b, {Typ: tvText, S: []byte("old")}}
+							args := ProgArgs{UTF16: utf16}
+							runVM(t, []VInsn{{Op: VTextCmpSet, A: 0, B: 1, C: 2, Cond: cond, Imm: imm}, {Op: VExit}}, nil, regs, &args, 0)
+							switch {
+							case exit && (args.PC != 0 || string(regs[2].S) != "old"):
+								t.Fatalf("imm %d utf16 %d: %+v cond %x %+v: set ran to pc %d r2 %+v, want an exit", imm, utf16, b, cond, a, args.PC, regs[2])
+							case !exit && (args.PC != 1 || regs[2].Typ != tvInt || (regs[2].I == 1) != want):
+								t.Fatalf("imm %d: %+v cond %x %+v: set pc %d r2 %+v, want %v", imm, b, cond, a, args.PC, regs[2], want)
+							}
+							args = ProgArgs{UTF16: utf16}
+							runVM(t, []VInsn{{Op: VTextCmpJump, A: 0, B: 1, T: 2, Cond: cond, Imm: imm}, {Op: VExit}, {Op: VExit}}, nil, []tvalue{a, b}, &args, 0)
+							to := int64(1)
+							switch {
+							case exit:
+								to = 0
+							case want:
+								to = 2
+							}
+							if args.PC != to {
+								t.Fatalf("imm %d utf16 %d: %+v cond %x %+v: jump to pc %d, want %d", imm, utf16, b, cond, a, args.PC, to)
+							}
+							// Known to be an INTEGER, the number still meets the TEXT.
+							if num.Typ == tvInt && imm&(1|VTextCmpNoAff) != 0 {
+								ka, kb, known := 0, 1, []bool{true, false, false, false}
+								regs = []tvalue{{}, o}
+								if textOnA {
+									regs = []tvalue{o, {}}
+									ka = 1
+									kb = 0
+								}
+								args = ProgArgs{UTF16: utf16}
+								prog := []VInsn{{Op: VInt, A: ka, Imm: num.I}, {Op: VTextCmpJump, A: 0, B: 1, T: 3, Cond: cond, Imm: imm}, {Op: VExit}, {Op: VExit}}
+								runVM(t, prog, known, regs, &args, 0)
+								to := int64(2)
+								switch {
+								case exit:
+									to = 1
+								case want:
+									to = 3
+								}
+								if args.PC != to {
+									t.Fatalf("known INTEGER r%d (other r%d) imm %d utf16 %d: %+v cond %x %+v: jump to pc %d, want %d", ka, kb, imm, utf16, b, cond, a, args.PC, to)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 }

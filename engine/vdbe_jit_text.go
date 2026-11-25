@@ -37,6 +37,7 @@ func vmTextLowering(prog *Program, storesText func(root uint32, col int) bool) (
 			delete(consts, r)
 			text.put(r, isText)
 		}
+		var cast *vmIntTextSrc
 		switch ins.Op {
 		case OpOpenRead, OpOpenWrite:
 			if t, isTbl := ins.P4.(*resolvedTable); isTbl {
@@ -57,6 +58,31 @@ func vmTextLowering(prog *Program, storesText func(root uint32, col int) bool) (
 					out, ok = make([]jit.VInsn, n), make([]bool, n)
 				}
 				out[pc], ok[pc] = jit.VInsn{Op: jit.VText, A: ins.P2, B: len(str), Imm: int64(uintptr(unsafe.Pointer(unsafe.StringData(str))))}, true
+			}
+		case OpCast:
+			// CAST('2002-04-02' AS date), its literal's number: what the VDBE
+			// makes of the literal, where the register still holds it.
+			str, isConst := consts[ins.P1]
+			target, _ := ins.P4.(string)
+			if !isConst || !in(ins.P1) || int64(len(str)) >= 1<<31 || target != "NUMERIC" && target != "INTEGER" && target != "REAL" {
+				break
+			}
+			v := castValueEnc(Value{Typ: Text, S: []byte(str)}, target, UTF8)
+			vi := jit.VInsn{Op: jit.VCastConst, A: ins.P1, B: len(str), Imm: int64(uintptr(unsafe.Pointer(unsafe.StringData(str))))}
+			switch {
+			case v.Typ == Int:
+				vi.K = v.I
+				cast = &vmIntTextSrc{kind: jit.VIntTextInt, k: v.I}
+			case v.Typ == Float && jit.VMReal:
+				vi.C, vi.K = 1, int64(math.Float64bits(v.F))
+				cast = &vmIntTextSrc{kind: jit.VIntTextReal, k: vi.K}
+			}
+			if cast != nil {
+				if ok == nil {
+					out, ok = make([]jit.VInsn, n), make([]bool, n)
+				}
+				out[pc], ok[pc] = vi, true
+				set(ins.P1, false)
 			}
 		case OpSCopy, OpCopy:
 			set(ins.P2, text.has(ins.P1))
@@ -79,7 +105,10 @@ func vmTextLowering(prog *Program, storesText func(root uint32, col int) bool) (
 					out, ok = make([]jit.VInsn, n), make([]bool, n)
 				}
 				imm := vmTextCmpNull(ins.P5)
-				if affinity(ins.P5&p5AffMask) >= affNumeric {
+				switch affinity(ins.P5 & p5AffMask) {
+				case affNone:
+					imm |= jit.VTextCmpNoAff
+				case affNumeric, affInteger, affReal:
 					imm |= 1
 				}
 				cond := vmCond[ins.Op]
@@ -121,6 +150,8 @@ func vmTextLowering(prog *Program, storesText func(root uint32, col int) bool) (
 		a, _ := ints.get(ins.P1)
 		b, _ := ints.get(ins.P2)
 		switch {
+		case cast != nil:
+			ints.set(ins.P1, *cast)
 		case ins.Op == OpInteger:
 			ints.set(ins.P2, vmIntTextSrc{kind: jit.VIntTextInt, k: int64(ins.P1)})
 		case ins.Op == OpReal && isFloat64(ins.P4):

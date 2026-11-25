@@ -1087,6 +1087,16 @@ func (e *vmEmit) insn(pc int, in VInsn) error {
 		e.inText(pc, in)
 	case VText:
 		e.text(pc, in)
+	case VCastConst:
+		a.CmpMemDByte(RSI, e.d(in.A, L.OffTyp), L.TypText)
+		e.jccStub(CondNE, pc)
+		a.MovRegImm64(RAX, in.Imm)
+		a.AluRegMemD(AluCmp, RAX, RSI, e.d(in.A, L.OffS))
+		e.jccStub(CondNE, pc)
+		a.MovRegImm64(RAX, int64(in.B))
+		a.AluRegMemD(AluCmp, RAX, RSI, e.d(in.A, L.OffS+8))
+		e.jccStub(CondNE, pc)
+		return e.insn(pc, castConstValue(in))
 	case VLike:
 		e.like(pc, in)
 	case VInSub:

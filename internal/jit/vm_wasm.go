@@ -907,7 +907,7 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 	case VSubstr:
 		e.substr(pc, in)
 	case VTextCmpJump, VTextCmpSet:
-		if e.know.isInt.has(in.A) || e.know.isInt.has(in.B) {
+		if textCmpIsInt(in, e.know.isInt.has(in.A), e.know.isInt.has(in.B)) {
 			return e.insn(pc, vmIntCmp(in))
 		}
 		e.textCmp(pc, in)
@@ -917,6 +917,20 @@ func (e *vmEmitWasm) insn(pc int, in VInsn) error {
 		e.inText(pc, in)
 	case VText:
 		e.text(pc, in)
+	case VCastConst:
+		e.loadTyp(in.A)
+		w.I32(int32(L.TypText))
+		w.op(opI32Ne)
+		e.loadI64(in.A, L.OffS)
+		w.I64(in.Imm)
+		w.op(opI64Ne)
+		w.op(opI32Or)
+		e.loadI64(in.A, L.OffS+8)
+		w.I64(int64(in.B))
+		w.op(opI64Ne)
+		w.op(opI32Or)
+		e.exitIf(pc)
+		return e.insn(pc, castConstValue(in))
 	case VLike:
 		e.like(pc, in)
 	case VInSub:

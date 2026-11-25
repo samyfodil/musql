@@ -139,27 +139,37 @@ func (e *vmEmit) textCmp(pc int, in VInsn) {
 	if k != nil {
 		kArm = e.vmLabel()
 	}
+	// mixed takes a number and a TEXT under a numeric affinity or none.
+	numeric := in.Imm&(1|VTextCmpNoAff) != 0
+	var mixed Lbl
+	if numeric {
+		mixed = e.vmLabel()
+	}
+	other := func() {
+		switch {
+		case k != nil && k.OnA:
+			a.JccL(CondNE, kArm)
+		case numeric:
+			a.JccL(CondNE, mixed)
+		default:
+			e.jccStub(CondNE, pc)
+		}
+	}
 	a.CmpMemDByte(RSI, e.d(in.A, L.OffTyp), L.TypInt)
 	a.JccL(CondNE, text)
 	a.CmpMemDByte(RSI, e.d(in.B, L.OffTyp), L.TypInt)
-	if k != nil && k.OnA {
-		a.JccL(CondNE, kArm)
-	} else {
-		e.jccStub(CondNE, pc)
-	}
+	other()
 	a.MovRegMemD(RAX, RSI, e.d(in.B, L.OffI))
 	a.AluRegMemD(AluCmp, RAX, RSI, e.d(in.A, L.OffI))
 	a.JmpL(tail)
 	a.Bind(text)
 	a.CmpMemDByte(RSI, e.d(in.A, L.OffTyp), L.TypText)
-	if k != nil && k.OnA {
-		a.JccL(CondNE, kArm)
-	} else {
-		e.jccStub(CondNE, pc)
-	}
+	other()
 	a.CmpMemDByte(RSI, e.d(in.B, L.OffTyp), L.TypText)
 	if k != nil && !k.OnA {
 		a.JccL(CondNE, kArm)
+	} else if numeric {
+		a.JccL(CondNE, mixed)
 	} else {
 		e.jccStub(CondNE, pc)
 	}
@@ -220,6 +230,36 @@ func (e *vmEmit) textCmp(pc int, in VInsn) {
 		a.MovRegMemD(ptrO, RSI, e.d(other, L.OffS))
 		a.Bind(core)
 	}
+	if numeric {
+		// A TEXT the affinity leaves a TEXT is greater than any number
+		// (sqlite3MemCompare); one a numeric affinity makes a number is the
+		// VDBE's.
+		core, aText := e.vmLabel(), e.vmLabel()
+		a.JmpL(core)
+		a.Bind(mixed)
+		a.CmpMemDByte(RDI, POffUTF16, 0)
+		e.jccStub(CondNE, pc)
+		a.CmpMemDByte(RSI, e.d(in.A, L.OffTyp), L.TypText)
+		a.JccL(CondE, aText)
+		e.isNumber(pc, in.A)
+		a.CmpMemDByte(RSI, e.d(in.B, L.OffTyp), L.TypText)
+		e.jccStub(CondNE, pc)
+		if in.Imm&1 != 0 {
+			e.numericTextExit(pc, in.B)
+		}
+		a.MovRegImm64(R10, 1)
+		a.CmpRegImm32(R10, 0)
+		a.JmpL(tail)
+		a.Bind(aText)
+		e.isNumber(pc, in.B)
+		if in.Imm&1 != 0 {
+			e.numericTextExit(pc, in.A)
+		}
+		a.MovRegImm64(R10, -1)
+		a.CmpRegImm32(R10, 0)
+		a.JmpL(tail)
+		a.Bind(core)
+	}
 	if in.Cond != CondE && in.Cond != CondNE {
 		e.orderedText(tail)
 	} else {
@@ -270,6 +310,17 @@ func (e *vmEmit) textCmp(pc int, in VInsn) {
 		e.unmap(in.C)
 		e.know.wroteAny(in.C, true)
 	}
+}
+
+// isNumber exits at pc unless r[r] is an INTEGER or a REAL.
+func (e *vmEmit) isNumber(pc, r int) {
+	a, L := e.a, e.lay
+	yes := e.vmLabel()
+	a.CmpMemDByte(RSI, e.d(r, L.OffTyp), L.TypInt)
+	a.JccL(CondE, yes)
+	a.CmpMemDByte(RSI, e.d(r, L.OffTyp), L.TypFloat)
+	e.jccStub(CondNE, pc)
+	a.Bind(yes)
 }
 
 // orderedText leaves the flags as a signed compare of r[B]'s TEXT with
