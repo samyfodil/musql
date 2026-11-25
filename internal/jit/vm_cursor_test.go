@@ -82,7 +82,7 @@ func TestVCursorLayout(t *testing.T) {
 	var so VSort
 	if unsafe.Offsetof(so.Ints) != VSortOffInts || unsafe.Offsetof(so.Rows) != VSortOffRows || unsafe.Offsetof(so.Ids) != VSortOffIds ||
 		unsafe.Offsetof(so.N) != VSortOffN || unsafe.Offsetof(so.Key) != VSortOffKey || unsafe.Offsetof(so.KLen) != VSortOffKLen ||
-		unsafe.Offsetof(so.KLo) != VSortOffKLo || unsafe.Offsetof(so.KN) != VSortOffKN {
+		unsafe.Offsetof(so.KLo) != VSortOffKLo || unsafe.Offsetof(so.KN) != VSortOffKN || unsafe.Offsetof(so.KInt) != VSortOffKInt {
 		t.Fatalf("VSort is laid out differently from what generated code uses")
 	}
 	var ix VIdx
@@ -577,11 +577,36 @@ func TestVMSortSeek(t *testing.T) {
 			t.Errorf("constant run %d+%d: pc %d lo %d n %d sum %#x, want pc %d sum %#x", c.lo, c.n, pc, cur.SortLo, cur.N, regs[2].I, c.wantPC, sum)
 		}
 	}
+	// An INTEGER constant's run, on keys that are not all INTEGERs: the
+	// register holding that INTEGER takes it.
+	intSort := *sort
+	intSort.Ints, intSort.KLen, intSort.KInt = nil, -1, -5
+	for _, c := range []struct{ lo, n, wantPC int }{{1, 3, 5}, {4, 0, 6}, {0, 7, 5}} {
+		is := intSort
+		is.KLo, is.KN = int64(c.lo), int64(c.n)
+		regs := []tvalue{{Typ: tvInt, I: -5}, {Typ: tvInt}, {Typ: tvInt}}
+		cur := cursor(&is)
+		pc := runVMCursor(t, prog, regs, nil, cur, 0)
+		at, sum := c.lo, int64(0)
+		if c.n == 0 {
+			at = 0
+		}
+		for i := c.lo; i < c.lo+c.n; i++ {
+			sum += 1 << (4 * i)
+		}
+		if pc != c.wantPC || cur.SortLo != int64(c.lo) || cur.N != int64(c.n) || regs[2].I != sum ||
+			cur.Rows != unsafe.Add(sort.Rows, at*24) || cur.Rowids != unsafe.Add(sort.Ids, at*8) {
+			t.Errorf("INTEGER constant run %d+%d: pc %d lo %d n %d sum %#x, want pc %d sum %#x", c.lo, c.n, pc, cur.SortLo, cur.N, regs[2].I, c.wantPC, sum)
+		}
+	}
 	for _, c := range []struct {
 		name string
 		key  tvalue
 		s    *VSort
 	}{
+		{"another INTEGER", tvalue{Typ: tvInt, I: 5}, &intSort},
+		{"the INTEGER constant as a REAL", tvalue{Typ: tvReal, F: -5}, &intSort},
+		{"a TEXT on an INTEGER constant", tvalue{Typ: tvText, S: konst}, &intSort},
 		{"a REAL key", tvalue{Typ: tvReal, F: 3}, sort},
 		{"a NULL key", tvalue{Typ: tvNull}, sort},
 		{"no Sort", tvalue{Typ: tvInt, I: 3}, nil},

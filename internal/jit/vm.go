@@ -244,8 +244,9 @@ const (
 	VGuardCopy
 	// VSortSeek: the OP_SortedSeek of cursor A, which walks a row list: the
 	// cursor's rows become the run of its Sort's whose key equals the INTEGER
-	// in r[B], or the Sort's run for its TEXT constant when r[B] holds that
-	// constant's bytes (Rows, Rowids and N, and SortLo where the run starts),
+	// in r[B], or the Sort's run for its constant when r[B] holds that
+	// TEXT constant's bytes, or that INTEGER where the keys are not all
+	// INTEGERs (Rows, Rowids and N, and SortLo where the run starts),
 	// on no row (Last -1) until the VRewind after it. Any other key, a cursor
 	// with no Sort, and the write barrier on exit.
 	VSortSeek
@@ -537,9 +538,10 @@ type VCursor struct {
 // VSort is a row list sorted on a key, as VSortSeek searches it: Ints the N
 // keys ascending when each is an INTEGER (nil otherwise), Rows (24-byte
 // headers) and Ids the rows and their rowids in the same order. Key, when
-// KLen is not 0, is the bytes of a TEXT constant the seek's key register
+// KLen is above 0, is the bytes of a TEXT constant the seek's key register
 // holds, and KLo and KN the run the engine found for it: a register holding
-// those very bytes holds that constant.
+// those very bytes holds that constant. KLen -1 is an INTEGER constant, KInt,
+// on keys that are not all INTEGERs (Ints nil), and KLo and KN its run.
 type VSort struct {
 	Ints unsafe.Pointer
 	Rows unsafe.Pointer
@@ -549,6 +551,7 @@ type VSort struct {
 	KLen int64
 	KLo  int64
 	KN   int64
+	KInt int64
 }
 
 // VTextLit is one TEXT of a VInText list: its bytes and their length.
@@ -675,6 +678,7 @@ const (
 	VSortOffKLen    = 40
 	VSortOffKLo     = 48
 	VSortOffKN      = 56
+	VSortOffKInt    = 64
 	VIdxOffVals     = 0
 	VIdxOffNVals    = 8
 	VIdxOffStarts   = 16

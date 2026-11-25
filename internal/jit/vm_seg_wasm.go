@@ -953,7 +953,20 @@ func (e *vmEmitWasm) sortSeek(pc int, in VInsn) {
 	w.Set(e.sk2)
 	w.Get(e.sk2)
 	w.op(opI32Eqz)
+	w.op(opIf, opVoid)
+	// An INTEGER on keys that are not all INTEGERs: the constant's run.
+	w.Get(e.sk1)
+	w.LoadI64(VSortOffKLen)
+	w.I64(-1)
+	w.op(opI64Ne)
+	w.Get(e.sk1)
+	w.LoadI64(VSortOffKInt)
+	w.Get(e.t1)
+	w.op(opI64Ne)
+	w.op(opI32Or)
 	e.exitIf(pc)
+	e.konstRun()
+	w.op(opElse)
 	w.Get(e.sk1)
 	w.LoadI64(VSortOffN)
 	w.Set(e.skm)
@@ -977,6 +990,7 @@ func (e *vmEmitWasm) sortSeek(pc int, in VInsn) {
 	w.Set(e.t2)
 	w.Br(0)
 	w.op(opEnd, opEnd)
+	w.op(opEnd)
 	w.op(opElse)
 	// Any other key's conversions are the VDBE's, but the constant's.
 	e.loadTyp(in.B)
@@ -997,14 +1011,7 @@ func (e *vmEmitWasm) sortSeek(pc int, in VInsn) {
 	w.op(opI64Ne)
 	w.op(opI32Or)
 	e.exitIf(pc)
-	w.Get(e.sk1)
-	w.LoadI64(VSortOffKLo)
-	w.Set(e.t3)
-	w.Get(e.sk1)
-	w.LoadI64(VSortOffKN)
-	w.Get(e.t3)
-	w.op(opI64Add)
-	w.Set(e.t2)
+	e.konstRun()
 	w.op(opEnd)
 	e.setCursorField(in.A, VCursorOffN, func() { w.Get(e.t2); w.Get(e.t3); w.op(opI64Sub) })
 	e.setCursorField(in.A, VCursorOffSLo, func() { w.Get(e.t3) })
@@ -1034,4 +1041,18 @@ func (e *vmEmitWasm) sortSeek(pc int, in VInsn) {
 	})
 	e.setCursorImm(in.A, VCursorOffLast, -1)
 	e.setCursorImm(in.A, VCursorOffDirty, 1)
+}
+
+// konstRun sets sortSeek's run, t3 to t2, to the one the engine found for
+// its Sort's constant.
+func (e *vmEmitWasm) konstRun() {
+	w := e.w
+	w.Get(e.sk1)
+	w.LoadI64(VSortOffKLo)
+	w.Set(e.t3)
+	w.Get(e.sk1)
+	w.LoadI64(VSortOffKN)
+	w.Get(e.t3)
+	w.op(opI64Add)
+	w.Set(e.t2)
 }

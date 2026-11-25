@@ -25,8 +25,8 @@ func vmTextLowering(prog *Program, storesText func(root uint32, col int) bool) (
 	// TEXT, for a LIKE's pattern.
 	consts := map[int]string{}
 	// ints is the number a register is expected to hold: an INTEGER or a
-	// REAL literal, the sum of two INTEGERs, or a bound parameter, or a copy
-	// of one. It is the last such write in program order, which may not be
+	// REAL literal, the sum of two INTEGERs or one negated, or a bound
+	// parameter, or a copy of one. It is the last such write in program order, which may not be
 	// the one a run made (a CASE's arms); native code checks it at run time,
 	// so a wrong guess costs only an exit.
 	ints := vmIntSrcs{v: make([]vmIntTextSrc, prog.NReg), has: make(vmRegs, prog.NReg)}
@@ -162,6 +162,8 @@ func vmTextLowering(prog *Program, storesText func(root uint32, col int) bool) (
 			ints.set(ins.P2, a)
 		case ins.Op == OpAdd && hasLiteral(ints, ins.P1, ins.P2) && (b.k >= 0) == (a.k+b.k >= a.k):
 			ints.set(ins.P3, vmIntTextSrc{kind: jit.VIntTextInt, k: a.k + b.k})
+		case ins.Op == OpNegative && hasLiteral(ints, ins.P1) && a.k != math.MinInt64:
+			ints.set(ins.P2, vmIntTextSrc{kind: jit.VIntTextInt, k: -a.k})
 		default:
 			for _, r := range []int{ins.P2, ins.P3} {
 				if writesReg(ins, r) {

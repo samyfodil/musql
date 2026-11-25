@@ -1047,7 +1047,7 @@ func (e *vmEmit) inSub(pc int, in VInsn) {
 }
 
 // sortSeek is VSortSeek: the first of the Sort's keys at or above the key,
-// binary searched, and the run of those equal to it after; or, for the TEXT
+// binary searched, and the run of those equal to it after; or, for the
 // constant, the run the engine found. RAX, RCX, RDX, R9, R10, X0 and X1 are
 // scratch.
 func (e *vmEmit) sortSeek(pc int, in VInsn) {
@@ -1076,15 +1076,26 @@ func (e *vmEmit) sortSeek(pc int, in VInsn) {
 	a.MovRegMemD(RCX, R9, VSortOffKey)
 	a.AluRegMemD(AluCmp, RCX, RSI, e.d(in.B, L.OffS))
 	e.jccStub(CondNE, pc)
+	a.Bind(l("konst"))
 	a.MovRegMemD(RAX, R9, VSortOffKLo)
 	a.MovRegMemD(RDX, R9, VSortOffKN)
 	a.AddRegReg(RDX, RAX)
 	a.JmpL(l("end"))
 
+	// An INTEGER on keys that are not all INTEGERs: the constant's run.
+	a.Bind(l("kint"))
+	a.MovRegMemD(RCX, R9, VSortOffKLen)
+	a.CmpRegImm32(RCX, -1)
+	e.jccStub(CondNE, pc)
+	a.MovRegMemD(RCX, R9, VSortOffKInt)
+	a.AluRegMemD(AluCmp, RCX, RSI, e.d(in.B, L.OffI))
+	e.jccStub(CondNE, pc)
+	a.JmpL(l("konst"))
+
 	a.Bind(l("int"))
 	a.MovRegMemD(R10, R9, VSortOffInts)
 	a.TestRegReg(R10, R10)
-	e.jccStub(CondE, pc)
+	a.JccL(CondE, l("kint"))
 	a.MovRegMemD(RCX, RSI, e.d(in.B, L.OffI))
 	a.MovRegMemD(RDX, R9, VSortOffN) // hi
 	a.XorRegReg(RAX, RAX)            // lo
