@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"cmp"
+	"math"
 	"slices"
 	"sort"
 	"unsafe"
@@ -319,17 +320,32 @@ func (a *sortedSeekHint) sameSort(b *sortedSeekHint) bool {
 }
 
 // sortConst is the one constant a sorted seek's key register is given: an
-// OpString8's TEXT, or the parameter an OpVariable reads (a literal is one,
-// in a plan shared by its values).
+// OpString8's TEXT, the parameter an OpVariable reads (a literal is one, in a
+// plan shared by its values), or an OpInteger's INTEGER, either of the last
+// two negated or not (neg).
 type sortConst struct {
 	str   string
 	param int
+	neg   bool
+	isInt bool
+	i     int64
 }
 
-// value is the constant, as the register holds it.
+// value is the constant, as the register holds it: none for a negated
+// parameter that is not an INTEGER native code can negate.
 func (k sortConst) value(params []Value) Value {
 	if k.param > 0 {
-		return paramAt(params, k.param)
+		v := paramAt(params, k.param)
+		if !k.neg {
+			return v
+		}
+		if v.Typ != Int || v.I == math.MinInt64 {
+			return Value{}
+		}
+		return Value{Typ: Int, I: -v.I}
+	}
+	if k.isInt {
+		return Value{Typ: Int, I: k.i}
 	}
 	if k.str == "" {
 		return Value{}
@@ -356,6 +372,17 @@ func lowerSortSeeks(prog *Program, vp []jit.VInsn, idxSpecs []*idxSeekSpec) (sor
 			k.str, _ = in.P4.(string)
 		case OpVariable:
 			k.param = max(in.P1, 0)
+		case OpInteger:
+			k.isInt, k.i = true, int64(in.P1)
+		case OpNegative:
+			// A guess, as is every register's here: native code takes the
+			// constant's run only for a key that holds it.
+			switch src := konst[in.P1]; {
+			case src.isInt:
+				k.isInt, k.i = true, -src.i
+			case src.param > 0 && !src.neg:
+				k.param, k.neg = src.param, true
+			}
 		default:
 			continue
 		}
@@ -382,8 +409,13 @@ func lowerSortSeeks(prog *Program, vp []jit.VInsn, idxSpecs []*idxSeekSpec) (sor
 		if ok && len(h.more) == 0 {
 			key = konst[in.P2]
 		}
+		intAff := ok && (h.aff == affNone || h.aff == affNumeric || h.aff == affInteger)
+		if ok && sorts[c] != nil && keys[c] != key && intAff {
+			// Seeks with different keys search the INTEGERs, as any key does.
+			key, keys[c] = sortConst{}, sortConst{}
+		}
 		if !ok || in.P2 < 0 || in.P2 >= prog.NReg || h.built || h.col < 0 ||
-			key == (sortConst{}) && h.aff != affNone && h.aff != affNumeric && h.aff != affInteger || c < len(idxSpecs) && idxSpecs[c] != nil ||
+			key == (sortConst{}) && !intAff || c < len(idxSpecs) && idxSpecs[c] != nil ||
 			sorts[c] != nil && (!sorts[c].sameSort(h) || keys[c] != key) {
 			bad[c] = true
 			continue
@@ -420,14 +452,16 @@ func lowerSortSeeks(prog *Program, vp []jit.VInsn, idxSpecs []*idxSeekSpec) (sor
 
 // handSort hands cur's sorted rows to native code for VSortSeek, when the
 // VDBE's next OpSortedSeek of h would search them as they stand: sorted by h's
-// key, every key an INTEGER (ints) or key, the seek's constant, a TEXT, and
-// nothing to order or rebuild first (segments that tried to serve the seek
-// and could not leave them to it). The constant's run is find's, the VDBE's
-// own search, made again whenever its bytes are not the ones it was made for.
+// key, every key an INTEGER (ints) or key, the seek's constant, a TEXT or an
+// INTEGER, and nothing to order or rebuild first (segments that tried to
+// serve the seek and could not leave them to it). The constant's run is
+// find's, the VDBE's own search, made again whenever its bytes or its value
+// are not the ones it was made for.
 func handSort(cur *vdbeCursor, jc *jit.VCursor, h *sortedSeekHint, key Value, enc TextEncoding) {
 	s := cur.sorted
 	text := key.Typ == Text && len(key.S) > 0
-	if s == nil || !s.ok || s.ints == nil && !text || !s.hint.sameSort(h) || cur.pendingOrder != nil || cur.segSorted != nil && cur.segSorted.ok ||
+	intKey := key.Typ == Int && s != nil && s.ints == nil
+	if s == nil || !s.ok || s.ints == nil && !text && !intKey || !s.hint.sameSort(h) || cur.pendingOrder != nil || cur.segSorted != nil && cur.segSorted.ok ||
 		cur.rowStore != nil || cur.streamable || cur.seekReseek || cur.refillEach || s.ints != nil && len(s.ints) != len(s.rows) ||
 		len(s.ids) != len(s.rows) {
 		return
@@ -435,6 +469,11 @@ func handSort(cur *vdbeCursor, jc *jit.VCursor, h *sortedSeekHint, key Value, en
 	s.vs.Ints, s.vs.Rows, s.vs.Ids, s.vs.N = unsafe.Pointer(unsafe.SliceData(s.ints)), unsafe.Pointer(unsafe.SliceData(s.rows)),
 		unsafe.Pointer(unsafe.SliceData(s.ids)), int64(len(s.rows))
 	switch p := unsafe.Pointer(unsafe.SliceData(key.S)); {
+	case intKey:
+		if s.vs.KLen != -1 || s.vs.KInt != key.I {
+			lo, hi := s.find(h, key, nil, enc)
+			s.vs.Key, s.vs.KLen, s.vs.KInt, s.vs.KLo, s.vs.KN = nil, -1, key.I, int64(lo), int64(hi-lo)
+		}
 	case !text:
 		s.vs.Key, s.vs.KLen = nil, 0
 	case s.vs.Key != p || s.vs.KLen != int64(len(key.S)) || !bytes.Equal(s.keyBytes, key.S):

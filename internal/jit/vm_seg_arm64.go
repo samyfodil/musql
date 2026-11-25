@@ -986,7 +986,7 @@ func (e *vmEmitArm) sortSeek(pc int, in VInsn) {
 	a, L := e.a, e.lay
 	e.unmap(^in.A)
 	bloop, bhi, bdone, run, end := e.vmLabel("ss"), e.vmLabel("sh"), e.vmLabel("sd"), e.vmLabel("sr"), e.vmLabel("se")
-	isInt := e.vmLabel("si")
+	isInt, konst, kint := e.vmLabel("si"), e.vmLabel("sk"), e.vmLabel("sn")
 	e.branchWB(pc) // the cursor's row pointers are stored
 	e.curBase(in.A)
 	a.LdrImm(X5, X9, VCursorOffSort)
@@ -1006,15 +1006,26 @@ func (e *vmEmitArm) sortSeek(pc int, in VInsn) {
 	a.LdrImm(X11, X5, VSortOffKey)
 	a.Cmp(X11, X12)
 	a.Bcond(CondNE, e.stub(pc))
+	a.Label(konst)
 	a.LdrImm(X8, X5, VSortOffKLo)
 	a.LdrImm(X13, X5, VSortOffKN)
 	a.AddReg(X13, X13, X8)
 	a.B(end)
 
+	// An INTEGER on keys that are not all INTEGERs: the constant's run.
+	a.Label(kint)
+	a.LdrImm(X11, X5, VSortOffKLen)
+	a.AddImm(X11, X11, 1)
+	a.Cbnz(X11, e.stub(pc))
+	a.LdrImm(X11, X5, VSortOffKInt)
+	a.Cmp(X11, X4)
+	a.Bcond(CondNE, e.stub(pc))
+	a.B(konst)
+
 	a.Label(isInt)
 	e.ldr(X4, in.B, L.OffI)
 	a.LdrImm(X7, X5, VSortOffInts)
-	a.Cbz(X7, e.stub(pc))
+	a.Cbz(X7, kint)
 	a.MovImm16(X8, 0)
 	a.LdrImm(X13, X5, VSortOffN)
 	a.Label(bloop)
