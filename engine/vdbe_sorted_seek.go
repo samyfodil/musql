@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"cmp"
 	"slices"
 	"sort"
@@ -31,8 +32,10 @@ type sortedRows struct {
 	keyOrder []int
 	// base is where the current run starts in rows.
 	base int
-	// vs is rows, ids and ints as VSortSeek searches them (handSort).
-	vs jit.VSort
+	// vs is rows, ids and ints as VSortSeek searches them (handSort), and
+	// keyBytes the bytes of the constant whose run it holds.
+	vs       jit.VSort
+	keyBytes []byte
 	// keys is the probe's keys, and last the previous probe's (its bytes
 	// copied, as a register's are reused) with the run it found: an inner
 	// loop seeks with keys an outer row holds, the same each time round.
@@ -315,14 +318,52 @@ func (a *sortedSeekHint) sameSort(b *sortedSeekHint) bool {
 	return true
 }
 
+// sortConst is the one constant a sorted seek's key register is given: an
+// OpString8's TEXT, or the parameter an OpVariable reads (a literal is one,
+// in a plan shared by its values).
+type sortConst struct {
+	str   string
+	param int
+}
+
+// value is the constant, as the register holds it.
+func (k sortConst) value(params []Value) Value {
+	if k.param > 0 {
+		return paramAt(params, k.param)
+	}
+	if k.str == "" {
+		return Value{}
+	}
+	return Value{Typ: Text, S: unsafe.Slice(unsafe.StringData(k.str), len(k.str))[:len(k.str):len(k.str)]}
+}
+
 // lowerSortSeeks lowers each OpSortedSeek of a cursor native code walks as a
 // row list -- one lowerIdxSeeks left to the VDBE -- to jit.VSortSeek, and the
-// cursor's OpIfEmpty to jit.VSortEmpty, when its key is one
-// INTEGER-comparable column and every sorted seek of the cursor sorts alike.
-// It returns those sorts by cursor (nil when there are none) and the pcs.
-func lowerSortSeeks(prog *Program, vp []jit.VInsn, idxSpecs []*idxSeekSpec) (sorts []*sortedSeekHint, pcs []int) {
-	sorts = make([]*sortedSeekHint, prog.NCursors)
+// cursor's OpIfEmpty to jit.VSortEmpty, when every sorted seek of the cursor
+// sorts alike and its key is one INTEGER-comparable column, or one column
+// sought with the one constant its key's register is given. It returns those
+// sorts and constants by cursor (nil when there are none) and the pcs.
+func lowerSortSeeks(prog *Program, vp []jit.VInsn, idxSpecs []*idxSeekSpec) (sorts []*sortedSeekHint, keys []sortConst, pcs []int) {
+	sorts, keys = make([]*sortedSeekHint, prog.NCursors), make([]sortConst, prog.NCursors)
 	bad := make([]bool, prog.NCursors)
+	// The constant each register is only ever given, the zero sortConst
+	// where it is given several.
+	konst := map[int]sortConst{}
+	for _, in := range prog.Insns {
+		var k sortConst
+		switch in.Op {
+		case OpString8:
+			k.str, _ = in.P4.(string)
+		case OpVariable:
+			k.param = max(in.P1, 0)
+		default:
+			continue
+		}
+		if had, ok := konst[in.P2]; ok && had != k {
+			k = sortConst{}
+		}
+		konst[in.P2] = k
+	}
 	for _, in := range prog.Insns {
 		switch in.Op {
 		case OpRightJoinMark, OpRightJoinSweepRewind, OpRightJoinSweepNext, OpRightJoinSweepOrder:
@@ -337,14 +378,18 @@ func lowerSortSeeks(prog *Program, vp []jit.VInsn, idxSpecs []*idxSeekSpec) (sor
 		}
 		c := in.P1
 		h, ok := in.P4.(*sortedSeekHint)
+		var key sortConst
+		if ok && len(h.more) == 0 {
+			key = konst[in.P2]
+		}
 		if !ok || in.P2 < 0 || in.P2 >= prog.NReg || h.built || h.col < 0 ||
-			h.aff != affNone && h.aff != affNumeric && h.aff != affInteger || c < len(idxSpecs) && idxSpecs[c] != nil ||
-			sorts[c] != nil && !sorts[c].sameSort(h) {
+			key == (sortConst{}) && h.aff != affNone && h.aff != affNumeric && h.aff != affInteger || c < len(idxSpecs) && idxSpecs[c] != nil ||
+			sorts[c] != nil && (!sorts[c].sameSort(h) || keys[c] != key) {
 			bad[c] = true
 			continue
 		}
 		if sorts[c] == nil {
-			sorts[c] = h
+			sorts[c], keys[c] = h, key
 		}
 	}
 	for pc, in := range prog.Insns {
@@ -363,26 +408,41 @@ func lowerSortSeeks(prog *Program, vp []jit.VInsn, idxSpecs []*idxSeekSpec) (sor
 		}
 	}
 	if len(pcs) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	for c := range sorts {
 		if bad[c] {
-			sorts[c] = nil
+			sorts[c], keys[c] = nil, sortConst{}
 		}
 	}
-	return sorts, pcs
+	return sorts, keys, pcs
 }
 
 // handSort hands cur's sorted rows to native code for VSortSeek, when the
 // VDBE's next OpSortedSeek of h would search them as they stand: sorted by h's
-// key, every key an INTEGER (ints), and nothing to order or rebuild first.
-func handSort(cur *vdbeCursor, jc *jit.VCursor, h *sortedSeekHint) {
+// key, every key an INTEGER (ints) or key, the seek's constant, a TEXT, and
+// nothing to order or rebuild first (segments that tried to serve the seek
+// and could not leave them to it). The constant's run is find's, the VDBE's
+// own search, made again whenever its bytes are not the ones it was made for.
+func handSort(cur *vdbeCursor, jc *jit.VCursor, h *sortedSeekHint, key Value, enc TextEncoding) {
 	s := cur.sorted
-	if s == nil || !s.ok || s.ints == nil || !s.hint.sameSort(h) || cur.pendingOrder != nil || cur.segSorted != nil ||
-		cur.rowStore != nil || cur.streamable || cur.seekReseek || cur.refillEach || len(s.ints) != len(s.rows) || len(s.ids) != len(s.rows) {
+	text := key.Typ == Text && len(key.S) > 0
+	if s == nil || !s.ok || s.ints == nil && !text || !s.hint.sameSort(h) || cur.pendingOrder != nil || cur.segSorted != nil && cur.segSorted.ok ||
+		cur.rowStore != nil || cur.streamable || cur.seekReseek || cur.refillEach || s.ints != nil && len(s.ints) != len(s.rows) ||
+		len(s.ids) != len(s.rows) {
 		return
 	}
-	s.vs = jit.VSort{Ints: unsafe.Pointer(unsafe.SliceData(s.ints)), Rows: unsafe.Pointer(unsafe.SliceData(s.rows)),
-		Ids: unsafe.Pointer(unsafe.SliceData(s.ids)), N: int64(len(s.ints))}
+	s.vs.Ints, s.vs.Rows, s.vs.Ids, s.vs.N = unsafe.Pointer(unsafe.SliceData(s.ints)), unsafe.Pointer(unsafe.SliceData(s.rows)),
+		unsafe.Pointer(unsafe.SliceData(s.ids)), int64(len(s.rows))
+	switch p := unsafe.Pointer(unsafe.SliceData(key.S)); {
+	case !text:
+		s.vs.Key, s.vs.KLen = nil, 0
+	case s.vs.Key != p || s.vs.KLen != int64(len(key.S)) || !bytes.Equal(s.keyBytes, key.S):
+		lo, hi := s.find(h, key, nil, enc)
+		// A buffer of its own: a copy of s (OpSortedSeek shares sorts by
+		// value) keeps the bytes its run was found for.
+		s.keyBytes = append([]byte(nil), key.S...)
+		s.vs.Key, s.vs.KLen, s.vs.KLo, s.vs.KN = p, int64(len(key.S)), int64(lo), int64(hi-lo)
+	}
 	jc.Sort, jc.SortLo = unsafe.Pointer(&s.vs), -1
 }

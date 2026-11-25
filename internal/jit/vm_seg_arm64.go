@@ -986,15 +986,35 @@ func (e *vmEmitArm) sortSeek(pc int, in VInsn) {
 	a, L := e.a, e.lay
 	e.unmap(^in.A)
 	bloop, bhi, bdone, run, end := e.vmLabel("ss"), e.vmLabel("sh"), e.vmLabel("sd"), e.vmLabel("sr"), e.vmLabel("se")
-	e.ldrb(X10, in.B, L.OffTyp)
-	a.CmpImm(X10, uint32(L.TypInt))
-	a.Bcond(CondNE, e.stub(pc)) // the key's conversions are the VDBE's
-	e.branchWB(pc)              // the cursor's row pointers are stored
-	e.ldr(X4, in.B, L.OffI)
+	isInt := e.vmLabel("si")
+	e.branchWB(pc) // the cursor's row pointers are stored
 	e.curBase(in.A)
 	a.LdrImm(X5, X9, VCursorOffSort)
 	a.Cbz(X5, e.stub(pc))
+	e.ldrb(X10, in.B, L.OffTyp)
+	a.CmpImm(X10, uint32(L.TypInt))
+	a.Bcond(CondE, isInt)
+	// Any other key's conversions are the VDBE's, but the constant's.
+	a.CmpImm(X10, uint32(L.TypText))
+	a.Bcond(CondNE, e.stub(pc))
+	e.ldr(X12, in.B, L.OffS+8) // before X11, which a far register's load uses
+	a.LdrImm(X11, X5, VSortOffKLen)
+	a.Cbz(X11, e.stub(pc))
+	a.Cmp(X11, X12)
+	a.Bcond(CondNE, e.stub(pc))
+	e.ldr(X12, in.B, L.OffS)
+	a.LdrImm(X11, X5, VSortOffKey)
+	a.Cmp(X11, X12)
+	a.Bcond(CondNE, e.stub(pc))
+	a.LdrImm(X8, X5, VSortOffKLo)
+	a.LdrImm(X13, X5, VSortOffKN)
+	a.AddReg(X13, X13, X8)
+	a.B(end)
+
+	a.Label(isInt)
+	e.ldr(X4, in.B, L.OffI)
 	a.LdrImm(X7, X5, VSortOffInts)
+	a.Cbz(X7, e.stub(pc))
 	a.MovImm16(X8, 0)
 	a.LdrImm(X13, X5, VSortOffN)
 	a.Label(bloop)
