@@ -818,6 +818,27 @@ func VLoops(prog []VInsn) bool {
 	return false
 }
 
+// VLoopReach reports, for every pc, whether native code entered there can
+// reach an instruction that loops back before it exits: a jump to itself or
+// an earlier pc, a VGosub or a VReturn.
+func VLoopReach(prog []VInsn) []bool {
+	mark := make([]int, len(prog))
+	for pc, in := range prog {
+		mark[pc] = -1
+		if in.Op == VGosub || in.Op == VReturn {
+			mark[pc] = 0
+		} else if t, ok := vmTarget(in); ok && t <= pc {
+			mark[pc] = 0
+		}
+	}
+	reach := VReachMarks(prog, mark, 1)
+	loops := make([]bool, len(prog))
+	for pc := range prog {
+		loops[pc] = reach[pc][0]&1 != 0
+	}
+	return loops
+}
+
 // VReachMarks reports, for every pc at once, the marks of the instructions
 // native code entered there can run before it exits, itself included: bit m
 // of reach[pc] is set when one of them has mark m, its entry in mark (-1 for
