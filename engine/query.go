@@ -1287,9 +1287,13 @@ func (p *ReadOnlyPager) execSelect(stmt *SelectStmt, outer *evalCtx, params []Va
 	stmt = p.nullUnusedSubqueryColumns(stmt)
 	stmt = nthValueReachOwn(stmt)
 	stmt = p.nthValueTail(stmt)
-	// count(*) over a UNION ALL is the sum of its arms' counts (count_union_all.go).
+	// count(*) over a UNION ALL is the sum of its arms' counts (count_union_all.go),
+	// and over a cross join the product of its tables' (count_cross_join.go).
 	if outer == nil {
 		if f := p.countUnionAll(stmt); f != nil {
+			return p.execNoFromKeyed(f, outer, params, cacheKey)
+		}
+		if f := p.countCrossJoin(stmt); f != nil {
 			return p.execNoFromKeyed(f, outer, params, cacheKey)
 		}
 	}
