@@ -20,6 +20,7 @@
 package engine
 
 import (
+	"errors"
 	"math"
 	"sort"
 )
@@ -153,7 +154,48 @@ func compileCompound(pager *ReadOnlyPager, stmt *SelectStmt, outer *compiler) (*
 	// lists and IgnorableDistinct drops their DISTINCT. A merged arm writes to a
 	// co-routine and is evaluated as usual.
 	existsBody := outer != nil && outer.existsStmt == stmt
+
+	// resolveAllArmOutputsOuter is a second, throwaway resolution of every
+	// arm's FROM, run only for its facts: the collations, and the result
+	// positions ORDER BY terms resolve to. For an arm naming a view it would
+	// bump pager.viewRefCount (countViewReference, C's nTabRef++,
+	// select.c:6036-6044) a second time per reference, so the counter is
+	// snapshotted and restored around it, as resolveGroupSource does for its
+	// columns-only walk: view3.test's "SELECT * FROM v32768" (32768
+	// references) stays under the 65535 cap while the doubled UNION form
+	// still exceeds it.
+	//
+	// pager can be nil: a write-path subquery with no snapshot reaches here
+	// that way. Any arm with a FROM would already have declined in
+	// resolveJoinSources, so every arm is FROM-less and no view is involved;
+	// the snapshot/restore is skipped rather than dereferencing nil (a
+	// generated column "y AS ((SELECT 1 UNION SELECT 2))" crashed here
+	// before).
+	var savedViewRefCount map[string]int
+	if pager != nil {
+		savedViewRefCount = make(map[string]int, len(pager.viewRefCount))
+		for k, v := range pager.viewRefCount {
+			savedViewRefCount[k] = v
+		}
+	}
+	arms := pager.resolveAllArmOutputsOuter(stmt, outerSchemaCtx(pager, outer))
+	if pager != nil {
+		pager.viewRefCount = savedViewRefCount
+	}
+	var mergeColls []string
+	if len(stmt.OrderBy) == 0 && seqFrom > 0 && len(arms) > 0 && arms[0].ok {
+		mergeColls = compoundColumnCollations(arms, len(arms[0].outCols))
+	}
+
 	compileArm := func(i int, arm *SelectStmt) (*Program, error) {
+		if i < seqFrom && mergeColls != nil {
+			if a, ok := mergeArmOrdered(arm, mergeColls); ok {
+				prog, err := compileSubProgram(pager, a, outer)
+				if !errors.Is(err, errVDBEUnsupported) {
+					return prog, err
+				}
+			}
+		}
 		if !existsBody || i < seqFrom {
 			return compileSubProgram(pager, arm, outer)
 		}
@@ -232,34 +274,6 @@ func compileCompound(pager *ReadOnlyPager, stmt *SelectStmt, outer *compiler) (*
 	// terms resolve to result positions here, at compile time (exec keeps
 	// only cp.orderByIdx), and so compoundColumnCollations/
 	// resolveCompoundOrderCollation can find each position's collation.
-	//
-	// resolveAllArmOutputsOuter is a second, throwaway resolution of every
-	// arm's FROM, run only for those facts; for an arm naming a view it
-	// would bump pager.viewRefCount (countViewReference, C's nTabRef++,
-	// select.c:6036-6044) a second time per reference. The counter is
-	// snapshotted and restored around it, as resolveGroupSource does for
-	// its columns-only walk, so view3.test's "SELECT * FROM v32768"
-	// (32768 references) stays under the 65535 cap while the doubled
-	// UNION form still exceeds it.
-	//
-	// pager can be nil: a write-path subquery with no snapshot reaches here
-	// that way. Any arm with a FROM would already have declined in
-	// resolveJoinSources, so every arm is FROM-less and no view is involved;
-	// the snapshot/restore is skipped rather than dereferencing nil (a
-	// generated column "y AS ((SELECT 1 UNION SELECT 2))" crashed here
-	// before).
-	var savedViewRefCount map[string]int
-	if pager != nil {
-		savedViewRefCount = make(map[string]int, len(pager.viewRefCount))
-		for k, v := range pager.viewRefCount {
-			savedViewRefCount[k] = v
-		}
-	}
-	arms := pager.resolveAllArmOutputsOuter(stmt, outerSchemaCtx(pager, outer))
-	if pager != nil {
-		pager.viewRefCount = savedViewRefCount
-	}
-
 	cp.collations = compoundColumnCollations(arms, firstProg.NResultCol)
 
 	cp.orderByIdx = make([]int, len(stmt.OrderBy))
@@ -464,4 +478,29 @@ func (cp *compoundProgram) execFrom(pager *ReadOnlyPager, params []Value, parent
 	rows = rows[start:end]
 
 	return cols, rows, nil
+}
+
+// mergeArmOrdered is arm as multiSelectByMerge codes it in a compound with no
+// ORDER BY: under the one C invents, every result column in turn under the
+// compound's collating sequence (select.c:2997, :3462-3476, :3490). The
+// ORDER BY changes which plan the arm's planner picks; the rows are the same,
+// and combineCompound orders them anyway. A "*" item, whose columns the arm
+// has not expanded yet, leaves the arm as it is.
+func mergeArmOrdered(arm *SelectStmt, colls []string) (*SelectStmt, bool) {
+	if len(arm.From) == 0 || len(arm.OrderBy) != 0 || len(arm.Columns) != len(colls) {
+		return nil, false
+	}
+	a := *arm
+	a.OrderBy = make([]OrderTerm, len(colls))
+	for k, col := range a.Columns {
+		if col.Star {
+			return nil, false
+		}
+		var e Expr = LiteralExpr{Val: Value{Typ: Int, I: int64(k + 1)}}
+		if colls[k] != "" && !equalFoldName(colls[k], "BINARY") {
+			e = CollateExpr{X: col.Expr, Name: colls[k]}
+		}
+		a.OrderBy[k] = OrderTerm{Expr: e}
+	}
+	return &a, true
 }
