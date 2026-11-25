@@ -135,33 +135,37 @@ func (e *vmEmitArm) textCmp(pc int, in VInsn) {
 	if k != nil {
 		kArm = e.vmLabel("tk")
 	}
+	// mixed takes a number and a TEXT under a numeric affinity or none.
+	numeric := in.Imm&(1|VTextCmpNoAff) != 0
+	var mixed string
+	if numeric {
+		mixed = e.vmLabel("tm")
+	}
+	other := func(onA bool) {
+		switch {
+		case k != nil && k.OnA == onA:
+			a.Bcond(CondNE, kArm)
+		case numeric:
+			a.Bcond(CondNE, mixed)
+		default:
+			a.Bcond(CondNE, e.stub(pc))
+		}
+	}
 	e.ldrb(X9, in.A, L.OffTyp)
 	e.ldrb(X10, in.B, L.OffTyp)
 	a.CmpImm(X9, uint32(L.TypInt))
 	a.Bcond(CondNE, text)
 	a.CmpImm(X10, uint32(L.TypInt))
-	if k != nil && k.OnA {
-		a.Bcond(CondNE, kArm)
-	} else {
-		a.Bcond(CondNE, e.stub(pc))
-	}
+	other(true)
 	e.ldr(X9, in.B, L.OffI)
 	e.ldr(X10, in.A, L.OffI)
 	a.Cmp(X9, X10)
 	a.B(tail)
 	a.Label(text)
 	a.CmpImm(X9, uint32(L.TypText))
-	if k != nil && k.OnA {
-		a.Bcond(CondNE, kArm)
-	} else {
-		a.Bcond(CondNE, e.stub(pc))
-	}
+	other(true)
 	a.CmpImm(X10, uint32(L.TypText))
-	if k != nil && !k.OnA {
-		a.Bcond(CondNE, kArm)
-	} else {
-		a.Bcond(CondNE, e.stub(pc))
-	}
+	other(false)
 	a.LdrImm(X9, X0, POffUTF16)
 	a.Cbnz(X9, e.stub(pc))
 	if in.Imm&1 != 0 {
@@ -222,6 +226,38 @@ func (e *vmEmitArm) textCmp(pc int, in VInsn) {
 		e.ldr(ptrO, other, L.OffS)
 		a.Label(core)
 	}
+	if numeric {
+		// A TEXT the affinity leaves a TEXT is greater than any number
+		// (sqlite3MemCompare); one a numeric affinity makes a number is the
+		// VDBE's.
+		core, aText := e.vmLabel("tc"), e.vmLabel("ta")
+		a.B(core)
+		a.Label(mixed)
+		a.LdrImm(X9, X0, POffUTF16)
+		a.Cbnz(X9, e.stub(pc))
+		e.ldrb(X9, in.A, L.OffTyp)
+		a.CmpImm(X9, uint32(L.TypText))
+		a.Bcond(CondE, aText)
+		e.isNumber(pc, in.A)
+		e.ldrb(X9, in.B, L.OffTyp)
+		a.CmpImm(X9, uint32(L.TypText))
+		a.Bcond(CondNE, e.stub(pc))
+		if in.Imm&1 != 0 {
+			e.numericTextExit(pc, in.B)
+		}
+		a.MovImm64(X9, 1)
+		a.CmpImm(X9, 0)
+		a.B(tail)
+		a.Label(aText)
+		e.isNumber(pc, in.B)
+		if in.Imm&1 != 0 {
+			e.numericTextExit(pc, in.A)
+		}
+		a.MovImm64(X9, -1)
+		a.CmpImm(X9, 0)
+		a.B(tail)
+		a.Label(core)
+	}
 	if in.Cond != CondE && in.Cond != CondNE {
 		e.orderedText(tail)
 	} else {
@@ -269,4 +305,16 @@ func (e *vmEmitArm) textCmp(pc int, in VInsn) {
 		e.unmap(in.C)
 		e.know.wroteAny(in.C, true)
 	}
+}
+
+// isNumber exits at pc unless r[r] is an INTEGER or a REAL.
+func (e *vmEmitArm) isNumber(pc, r int) {
+	a, L := e.a, e.lay
+	yes := e.vmLabel("tn")
+	e.ldrb(X10, r, L.OffTyp)
+	a.CmpImm(X10, uint32(L.TypInt))
+	a.Bcond(CondE, yes)
+	a.CmpImm(X10, uint32(L.TypFloat))
+	a.Bcond(CondNE, e.stub(pc))
+	a.Label(yes)
 }

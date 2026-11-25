@@ -131,9 +131,16 @@ func (e *vmEmitWasm) textCmp(pc int, in VInsn) {
 		}
 		w.op(opElse)
 	}
+	numeric := in.Imm&(1|VTextCmpNoAff) != 0
 	e.loadTyp(in.A)
 	w.I32(int32(L.TypInt))
 	w.op(opI32Eq)
+	if numeric {
+		e.loadTyp(in.B)
+		w.I32(int32(L.TypInt))
+		w.op(opI32Eq)
+		w.op(opI32And)
+	}
 	w.op(opIf, opVoid)
 	e.loadTyp(in.B)
 	w.I32(int32(L.TypInt))
@@ -149,6 +156,19 @@ func (e *vmEmitWasm) textCmp(pc int, in VInsn) {
 	w.op(opI64ExtendI32S)
 	w.Set(e.t1)
 	w.op(opElse)
+	if numeric {
+		e.loadTyp(in.A)
+		w.I32(int32(L.TypText))
+		w.op(opI32Eq)
+		e.loadTyp(in.B)
+		w.I32(int32(L.TypText))
+		w.op(opI32Eq)
+		w.op(opI32And)
+		w.op(opI32Eqz)
+		w.op(opIf, opVoid)
+		e.mixedNumberText(pc, in)
+		w.op(opElse)
+	}
 	e.loadTyp(in.A)
 	w.I32(int32(L.TypText))
 	w.op(opI32Ne)
@@ -173,6 +193,9 @@ func (e *vmEmitWasm) textCmp(pc int, in VInsn) {
 	} else {
 		e.equalText(in)
 	}
+	if numeric {
+		w.op(opEnd) // a number and a TEXT
+	}
 	w.op(opEnd) // INTEGERs or TEXTs
 	w.Get(e.t1)
 	w.I64(0)
@@ -190,6 +213,50 @@ func (e *vmEmitWasm) textCmp(pc int, in VInsn) {
 			e.know.wroteAny(in.C, true)
 		}
 	}
+}
+
+// mixedNumberText sets t1 for an INTEGER or a REAL against a TEXT under a
+// numeric affinity or none, as vm_text_amd64.go's textCmp does: a TEXT the
+// affinity leaves a TEXT is the greater. Any other pair exits.
+func (e *vmEmitWasm) mixedNumberText(pc int, in VInsn) {
+	w, L := e.w, e.lay
+	w.Get(0)
+	w.LoadI64(POffUTF16)
+	w.op(opI64Eqz)
+	w.op(opI32Eqz)
+	e.exitIf(pc)
+	isNumber := func(r int) {
+		e.loadTyp(r)
+		w.I32(int32(L.TypInt))
+		w.op(opI32Ne)
+		e.loadTyp(r)
+		w.I32(int32(L.TypFloat))
+		w.op(opI32Ne)
+		w.op(opI32And)
+		e.exitIf(pc)
+	}
+	e.loadTyp(in.A)
+	w.I32(int32(L.TypText))
+	w.op(opI32Eq)
+	w.op(opIf, opVoid)
+	isNumber(in.B)
+	if in.Imm&1 != 0 {
+		e.numericTextExit(pc, in.A)
+	}
+	w.I64(-1)
+	w.Set(e.t1)
+	w.op(opElse)
+	isNumber(in.A)
+	e.loadTyp(in.B)
+	w.I32(int32(L.TypText))
+	w.op(opI32Ne)
+	e.exitIf(pc)
+	if in.Imm&1 != 0 {
+		e.numericTextExit(pc, in.B)
+	}
+	w.I64(1)
+	w.Set(e.t1)
+	w.op(opEnd)
 }
 
 // equalText sets t1 to 0 when r[A]'s and r[B]'s TEXTs are the same bytes,

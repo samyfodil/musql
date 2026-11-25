@@ -1043,6 +1043,19 @@ func (e *vmEmitArm) insn(pc int, in VInsn) error {
 		a.Label(nonEmpty)
 	case VText:
 		e.text(pc, in)
+	case VCastConst:
+		e.ldrb(X10, in.A, L.OffTyp)
+		a.CmpImm(X10, uint32(L.TypText))
+		a.Bcond(CondNE, e.stub(pc))
+		e.ldr(X10, in.A, L.OffS)
+		a.MovImm64(X8, in.Imm)
+		a.Cmp(X10, X8)
+		a.Bcond(CondNE, e.stub(pc))
+		e.ldr(X10, in.A, L.OffS+8)
+		a.MovImm64(X8, int64(in.B))
+		a.Cmp(X10, X8)
+		a.Bcond(CondNE, e.stub(pc))
+		return e.insn(pc, castConstValue(in))
 	case VLike:
 		e.like(pc, in)
 	case VInSub:

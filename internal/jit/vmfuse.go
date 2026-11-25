@@ -86,6 +86,8 @@ func vmStepInto(buf []int, in VInsn, pc int) (progStep, []int) {
 		s.uses, s.defs, s.targets = put(in.A, in.B), put(in.C), put(in.T)
 	case VReal, VText:
 		s.defs = put(in.A)
+	case VCastConst:
+		s.uses, s.defs = put(in.A), put(in.A)
 	case VMath:
 		s.uses, s.defs = put(in.A), put(in.C)
 		if in.B == 2 {

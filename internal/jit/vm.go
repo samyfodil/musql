@@ -166,7 +166,8 @@ const (
 	// as bytes.Compare orders their bytes, or two INTEGERs. Any other pair
 	// exits, as do two TEXTs when ProgArgs.UTF16 is set: the engine compares
 	// those converted. Under Imm&1 (a numeric affinity) a TEXT that is a whole
-	// number exits too. With VCmpNull in Imm a NULL operand answers as
+	// number exits too, and an INTEGER or a REAL is less than any other TEXT,
+	// as it is than any TEXT under VTextCmpNoAff. With VCmpNull in Imm a NULL operand answers as
 	// VCmpBr's does: VTextCmpSet stores NULL, and VTextCmpJump falls through,
 	// or jumps to T with VCmpNullJumps too. Without VMTextOrder only Cond E
 	// and NE, and no numeric affinity.
@@ -252,6 +253,10 @@ const (
 	// its Sort, every row the cursor has, holds none. A cursor with no Sort
 	// exits.
 	VSortEmpty
+	// VCastConst: r[A] = K, an INTEGER, or with C 1 the REAL whose bits K
+	// are, where r[A] is the TEXT of the B bytes at Imm: the constant a VText
+	// put there, which the engine cast to K. Any other value exits.
+	VCastConst
 )
 
 // VCmpBr's Imm bits past the result it jumps on.
@@ -259,6 +264,10 @@ const (
 	VCmpNull      = 2
 	VCmpNullJumps = 4
 )
+
+// VTextCmpNoAff, on a VTextCmpJump or VTextCmpSet, is a comparison with no
+// affinity, where an INTEGER or a REAL is less than any TEXT.
+const VTextCmpNoAff = 8
 
 // NullSeg is the one row VNullRow puts a cursor on: every column below 64
 // NULL, and no rowid.
@@ -365,8 +374,12 @@ func vmIntCmp(in VInsn) VInsn {
 // textCmpIsInt reports whether a VTextCmpJump or VTextCmpSet whose operands
 // are known INTEGERs (intA, intB) is the INTEGER compare vmIntCmp makes. An
 // operand holding the IntText constant is one, but the other may be a TEXT
-// the compare reads it against as text.
+// the compare reads it against as text. Under a numeric affinity or none the
+// other may be a TEXT the compare answers.
 func textCmpIsInt(in VInsn, intA, intB bool) bool {
+	if in.Imm&(1|VTextCmpNoAff) != 0 {
+		return intA && intB
+	}
 	if k := in.IntText; k != nil {
 		if k.OnA {
 			return intB
@@ -398,6 +411,8 @@ type VInsn struct {
 	More []int
 	// Kernel is VMath's function.
 	Kernel *fir.Func
+	// K is VCastConst's value.
+	K int64
 	// Pat is VLike's pattern.
 	Pat *VLikePat
 	// IntText, on a VTextCmpJump or VTextCmpSet under TEXT affinity, is
@@ -719,3 +734,12 @@ const (
 	VReopenSeek       = 4
 	VReopenSeekOpened = 5
 )
+
+// castConstValue is the VInt or VReal that writes VCastConst in's value.
+func castConstValue(in VInsn) VInsn {
+	op := VInt
+	if in.C == 1 {
+		op = VReal
+	}
+	return VInsn{Op: op, A: in.A, Imm: in.K, Dead: in.Dead}
+}
