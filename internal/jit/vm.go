@@ -137,7 +137,8 @@ const (
 	// VFAdd, VFSub, VFMul, VFDiv: r[C] = r[B] op r[A] in floating point, each
 	// operand an INTEGER (read as a double) or a REAL, at least one a REAL.
 	// Two INTEGERs, any other operand, a zero divisor and a NaN result (each
-	// NULL or the INTEGER arm) exit.
+	// NULL or the INTEGER arm) exit. Under Imm VFText a TEXT operand that
+	// spells a REAL plainly reads as that REAL too.
 	VFAdd
 	VFSub
 	VFMul
@@ -254,6 +255,12 @@ const (
 	// exits.
 	VSortEmpty
 )
+
+// VFText, on a VFAdd, VFSub, VFMul or VFDiv, reads a TEXT operand spelled
+// [-]digits.digits, with fewer than 2^53 as its digits and at most 22 after
+// the point, as the REAL sqlite3AtoF makes of it: the digits over a power of
+// ten, which one IEEE divide rounds as AtoF does. Any other TEXT exits.
+const VFText = 1
 
 // VCmpBr's Imm bits past the result it jumps on.
 const (

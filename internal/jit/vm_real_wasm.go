@@ -35,8 +35,9 @@ func (e *vmEmitWasm) flocals() (uint32, uint32) {
 func (e *vmEmitWasm) loadF64(r int) { e.w.Get(e.regs); e.w.LoadF64(e.addr(r, e.lay.OffF)) }
 
 // fload sets dst to r[r] as a double: a REAL's F, an INTEGER converted (only
-// when intOK), anything else exiting at pc. With flag, a REAL sets fr.
-func (e *vmEmitWasm) fload(pc, r int, dst uint32, intOK, flag bool) {
+// when intOK), a TEXT spelling a REAL (only when text, VFText), anything
+// else exiting at pc. With flag, a REAL sets fr.
+func (e *vmEmitWasm) fload(pc, r int, dst uint32, intOK, text, flag bool) {
 	w, L := e.w, e.lay
 	switch {
 	case e.know.isFloat.has(r):
@@ -62,15 +63,174 @@ func (e *vmEmitWasm) fload(pc, r int, dst uint32, intOK, flag bool) {
 		}
 		e.loadF64(r)
 		w.op(opElse)
-		e.loadTyp(r)
-		w.I32(int32(L.TypInt))
-		w.op(opI32Ne)
-		e.exitIf(pc)
-		e.loadI64(r, L.OffI)
-		w.op(opF64ConvertI64S)
+		if text {
+			e.loadTyp(r)
+			w.I32(int32(L.TypInt))
+			w.op(opI32Eq)
+			w.op(opIf, wF64)
+			e.loadI64(r, L.OffI)
+			w.op(opF64ConvertI64S)
+			w.op(opElse)
+			e.ftext(pc, r, flag)
+			w.op(opEnd)
+		} else {
+			e.loadTyp(r)
+			w.I32(int32(L.TypInt))
+			w.op(opI32Ne)
+			e.exitIf(pc)
+			e.loadI64(r, L.OffI)
+			w.op(opF64ConvertI64S)
+		}
 		w.op(opEnd)
 	}
 	w.Set(dst)
+}
+
+// ftext pushes the REAL a TEXT r[r] spells as [-]digits.digits, as
+// vm_real_amd64.go's does. txa walks the text to its end in txb, t1 is the
+// digits, t2 the digits after the point and then the power of ten's count,
+// fc the byte and fp the power of ten.
+func (e *vmEmitWasm) ftext(pc, r int, flag bool) {
+	w, L := e.w, e.lay
+	if e.fc == 0 {
+		e.fc, e.fp = w.Local(wI32), w.Local(wF64)
+	}
+	digit := func() {
+		w.Get(e.fc)
+		w.I32('0')
+		w.op(opI32Sub)
+		w.Set(e.fc)
+		w.Get(e.fc)
+		w.I32(9)
+		w.op(opI32GtU)
+		e.exitIf(pc)
+		w.Get(e.t1)
+		w.I64(10)
+		w.op(opI64Mul)
+		w.Get(e.fc)
+		w.op(opI64ExtendI32U)
+		w.op(opI64Add)
+		w.Set(e.t1)
+		w.Get(e.t1)
+		w.I64(53)
+		w.op(opI64ShrU)
+		w.op(opI64Eqz)
+		w.op(opI32Eqz)
+		e.exitIf(pc) // 2^53 and above
+	}
+	next := func() { // fc = the byte at txa, txa past it
+		w.Get(e.txa)
+		w.op(opI32Load8U)
+		w.memarg(0, 0)
+		w.Set(e.fc)
+		w.Get(e.txa)
+		w.I32(1)
+		w.op(opI32Add)
+		w.Set(e.txa)
+	}
+	e.loadTyp(r)
+	w.I32(int32(L.TypText))
+	w.op(opI32Ne)
+	e.exitIf(pc)
+	e.loadI64(r, L.OffS)
+	w.op(opI32WrapI64)
+	w.Set(e.txa)
+	e.loadI64(r, L.OffS+8)
+	w.op(opI32WrapI64)
+	w.Get(e.txa)
+	w.op(opI32Add)
+	w.Set(e.txb) // the end
+	w.Get(e.txa)
+	w.Get(e.txb)
+	w.op(opI32Eq)
+	e.exitIf(pc)
+	w.Get(e.txa)
+	w.op(opI32Load8U)
+	w.memarg(0, 0)
+	w.I32('-')
+	w.op(opI32Eq)
+	w.op(opIf, opVoid)
+	w.Get(e.txa)
+	w.I32(1)
+	w.op(opI32Add)
+	w.Set(e.txa)
+	w.op(opEnd)
+	// A digit and the point at least.
+	w.Get(e.txb)
+	w.Get(e.txa)
+	w.op(opI32Sub)
+	w.I32(2)
+	w.op(opI32LtS)
+	e.exitIf(pc)
+	w.I64(0)
+	w.Set(e.t1)
+	w.op(opBlock, opVoid, opLoop, opVoid)
+	w.Get(e.txa)
+	w.Get(e.txb)
+	w.op(opI32Eq)
+	e.exitIf(pc) // no point: an INTEGER's spelling
+	next()
+	w.Get(e.fc)
+	w.I32('.')
+	w.op(opI32Eq)
+	w.BrIf(1)
+	digit()
+	w.Br(0)
+	w.op(opEnd, opEnd)
+	w.Get(e.txb)
+	w.Get(e.txa)
+	w.op(opI32Sub)
+	w.op(opI64ExtendI32U)
+	w.Set(e.t2)
+	w.Get(e.t2)
+	w.I64(22)
+	w.op(opI64GtU)
+	e.exitIf(pc)
+	w.op(opBlock, opVoid, opLoop, opVoid)
+	w.Get(e.txa)
+	w.Get(e.txb)
+	w.op(opI32Eq)
+	w.BrIf(1)
+	next()
+	digit()
+	w.Br(0)
+	w.op(opEnd, opEnd)
+	// 10^k by tens, each power up to 10^22 exact.
+	w.F64(1)
+	w.Set(e.fp)
+	w.op(opBlock, opVoid, opLoop, opVoid)
+	w.Get(e.t2)
+	w.op(opI64Eqz)
+	w.BrIf(1)
+	w.Get(e.fp)
+	w.F64(10)
+	w.op(opF64Mul)
+	w.Set(e.fp)
+	w.Get(e.t2)
+	w.I64(1)
+	w.op(opI64Sub)
+	w.Set(e.t2)
+	w.Br(0)
+	w.op(opEnd, opEnd)
+	w.Get(e.t1)
+	w.op(opF64ConvertI64S)
+	w.Get(e.fp)
+	w.op(opF64Div)
+	w.Set(e.fp)
+	w.Get(e.fp)
+	w.op(opF64Neg)
+	w.Get(e.fp)
+	e.loadI64(r, L.OffS)
+	w.op(opI32WrapI64)
+	w.op(opI32Load8U)
+	w.memarg(0, 0)
+	w.I32('-')
+	w.op(opI32Eq)
+	w.op(opSelect)
+	if flag {
+		w.I32(1)
+		w.Set(e.fr)
+	}
 }
 
 // fcmpLoad sets dst to a comparison's operand: a REAL, or an INTEGER within
@@ -166,8 +326,8 @@ func (e *vmEmitWasm) realInsn(pc int, in VInsn) error {
 			w.I32(0)
 			w.Set(e.fr)
 		}
-		e.fload(pc, in.B, f0, true, flag)
-		e.fload(pc, in.A, f1, true, flag)
+		e.fload(pc, in.B, f0, true, in.Imm&VFText != 0, flag)
+		e.fload(pc, in.A, f1, true, in.Imm&VFText != 0, flag)
 		if flag && in.Op != VFDiv && !in.Dead {
 			e.realOrInts(pc, in, f0, f1)
 			break
@@ -269,7 +429,7 @@ func (e *vmEmitWasm) math(pc int, in VInsn) error {
 	args := make([]uint32, in.B)
 	for i := range args {
 		args[i] = e.w.Local(wF64)
-		e.fload(pc, in.A+i, args[i], in.Imm == 0, false)
+		e.fload(pc, in.A+i, args[i], in.Imm == 0, false, false)
 	}
 	if err := emitFirWasm(e.w, in.Kernel, args, f0, func() { e.exitAt(pc) }); err != nil {
 		return err

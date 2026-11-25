@@ -112,7 +112,8 @@ func emitVM(prog []VInsn, nReg int, lay ValueLayout, bound, entry []bool, cache 
 		e.keyp, e.keyq = w.Local(wI32), w.Local(wI32)
 	}
 	if slices.ContainsFunc(prog, func(in VInsn) bool {
-		return in.Op == VSubstr || in.Op == VTextCmpJump || in.Op == VTextCmpSet || in.Op == VInText || in.Op == VLike
+		return in.Op == VSubstr || in.Op == VTextCmpJump || in.Op == VTextCmpSet || in.Op == VInText || in.Op == VLike ||
+			(in.Op == VFAdd || in.Op == VFSub || in.Op == VFMul || in.Op == VFDiv) && in.Imm&VFText != 0
 	}) {
 		e.txa, e.txb = w.Local(wI32), w.Local(wI32)
 	}
@@ -195,6 +196,7 @@ type vmEmitWasm struct {
 	sk1, sk2, skf    uint32 // the segment and seek arms' scratch (segLocals)
 	skm              uint32
 	f0, f1, fr       uint32 // the REAL arms' scratch (vm_real_wasm.go's flocals)
+	fc, fp           uint32 // and a TEXT operand's (ftext)
 	cur              int    // the pc whose code is being emitted
 	extra            int    // if-blocks opened inside it
 

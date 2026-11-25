@@ -2,6 +2,8 @@
 
 package jit
 
+import "math"
+
 // The VM JIT's REAL arms (vm.go's VReal to VMath) on AArch64, as on x86-64
 // (vm_real_amd64.go): a REAL operand is loaded into a D register from its F
 // word, an INTEGER one converted from its I word, and every check runs before
@@ -42,10 +44,10 @@ func (e *vmEmitArm) vmLabel(s string) string {
 }
 
 // fload puts r[r] in d as a double: a REAL's F, an INTEGER converted (only
-// when intOK), anything else exiting at pc. When useFlag is set, flag becomes
-// 1 when the operand was a REAL; the caller sets it only where no operand is
-// known to be one.
-func (e *vmEmitArm) fload(pc, r int, d VReg, intOK bool, flag Reg64, useFlag bool) {
+// when intOK), a TEXT spelling a REAL (only when text, VFText), anything
+// else exiting at pc. When useFlag is set, flag becomes 1 when the operand
+// was a REAL; the caller sets it only where no operand is known to be one.
+func (e *vmEmitArm) fload(pc, r int, d VReg, intOK, text bool, flag Reg64, useFlag bool) {
 	a, L := e.a, e.lay
 	if e.know.isFloat.has(r) {
 		e.fldr(d, r)
@@ -73,12 +75,110 @@ func (e *vmEmitArm) fload(pc, r int, d VReg, intOK bool, flag Reg64, useFlag boo
 			return
 		}
 		a.CmpImm(X12, uint32(L.TypInt))
-		a.Bcond(CondNE, e.stub(pc))
+		notInt := e.vmLabel("ft")
+		if text {
+			a.Bcond(CondNE, notInt)
+		} else {
+			a.Bcond(CondNE, e.stub(pc))
+		}
 		e.ldr(X10, r, L.OffI)
 		a.Scvtf(d, X10)
 		a.B(done)
+		if text {
+			a.Label(notInt)
+			e.ftext(pc, r, d, flag, useFlag)
+			a.B(done)
+		}
 	})
 	a.Label(done)
+}
+
+// ftext is vm_real_amd64.go's: the REAL a TEXT r[r] spells as
+// [-]digits.digits, its type byte in X12. X9 walks the text to its end in
+// X10, X11 is the digits, D2 and D3 scratch.
+func (e *vmEmitArm) ftext(pc, r int, d VReg, flag Reg64, useFlag bool) {
+	a, L := e.a, e.lay
+	unsigned, loop, dot, fracLoop, conv := e.vmLabel("tu"), e.vmLabel("tl"), e.vmLabel("td"), e.vmLabel("tf"), e.vmLabel("tc")
+	pLoop, pDone, pos := e.vmLabel("tp"), e.vmLabel("tq"), e.vmLabel("ts")
+	a.CmpImm(X12, uint32(L.TypText))
+	a.Bcond(CondNE, e.stub(pc))
+	e.ldr(X9, r, L.OffS)
+	e.ldr(X10, r, L.OffS+8)
+	a.AddReg(X10, X10, X9) // the end
+	a.Cmp(X9, X10)
+	a.Bcond(CondE, e.stub(pc))
+	a.LdrbImm(X12, X9, 0)
+	a.CmpImm(X12, '-')
+	a.Bcond(CondNE, unsigned)
+	a.AddImm(X9, X9, 1)
+	// A digit and the point at least.
+	a.Label(unsigned)
+	a.SubReg(X12, X10, X9)
+	a.CmpImm(X12, 2)
+	a.Bcond(CondL, e.stub(pc))
+	a.MovImm16(X11, 0)
+	a.Label(loop)
+	a.Cmp(X9, X10)
+	a.Bcond(CondE, e.stub(pc)) // no point: an INTEGER's spelling
+	a.LdrbImm(X12, X9, 0)
+	a.AddImm(X9, X9, 1)
+	a.CmpImm(X12, '.')
+	a.Bcond(CondE, dot)
+	e.fdigit(pc)
+	a.B(loop)
+
+	a.Label(dot)
+	a.SubReg(X12, X10, X9)
+	a.CmpImm(X12, 22)
+	a.Bcond(CondG, e.stub(pc))
+	a.FmovToD(3, X12) // k
+	a.Label(fracLoop)
+	a.Cmp(X9, X10)
+	a.Bcond(CondE, conv)
+	a.LdrbImm(X12, X9, 0)
+	a.AddImm(X9, X9, 1)
+	e.fdigit(pc)
+	a.B(fracLoop)
+
+	a.Label(conv)
+	a.FmovToX(X12, 3)
+	a.Scvtf(d, X11)
+	// 10^k by tens, each power up to 10^22 exact.
+	a.MovImm64(X9, int64(math.Float64bits(1)))
+	a.FmovToD(2, X9)
+	a.MovImm64(X9, int64(math.Float64bits(10)))
+	a.FmovToD(3, X9)
+	a.Label(pLoop)
+	a.Cbz(X12, pDone)
+	a.Fmul(2, 2, 3)
+	a.SubsImm(X12, X12, 1)
+	a.B(pLoop)
+	a.Label(pDone)
+	a.Fdiv(d, d, 2)
+	e.ldr(X9, r, L.OffS)
+	a.LdrbImm(X12, X9, 0)
+	a.CmpImm(X12, '-')
+	a.Bcond(CondNE, pos)
+	a.Fneg(d, d)
+	a.Label(pos)
+	if useFlag {
+		a.MovImm16(flag, 1)
+	}
+}
+
+// fdigit takes the byte in X12 into X11 as the next decimal digit, exiting at
+// pc on any other byte and once X11 reaches 2^53.
+func (e *vmEmitArm) fdigit(pc int) {
+	a := e.a
+	a.SubsImm(X12, X12, '0')
+	a.CmpImm(X12, 9)
+	a.BcondRaw(armHI, e.stub(pc))
+	a.AddRegLSL3(X12, X12, X11) // the digit + 8s
+	a.AddReg(X12, X12, X11)
+	a.AddReg(X12, X12, X11)
+	a.MovReg(X11, X12)
+	a.LsrImm(X12, X11, 53)
+	a.Cbnz(X12, e.stub(pc))
 }
 
 // storeFloat makes r[r] the REAL in d: Value{Typ: Float, F: d}.
@@ -116,8 +216,8 @@ func (e *vmEmitArm) realInsn(pc int, in VInsn) (bool, error) {
 		if useFlag {
 			a.MovImm16(X13, 0)
 		}
-		e.fload(pc, in.B, 0, true, X13, useFlag)
-		e.fload(pc, in.A, 1, true, X13, useFlag)
+		e.fload(pc, in.B, 0, true, in.Imm&VFText != 0, X13, useFlag)
+		e.fload(pc, in.A, 1, true, in.Imm&VFText != 0, X13, useFlag)
 		ints := useFlag && in.Op != VFDiv && !in.Dead
 		intArm, join := "", ""
 		if useFlag {
@@ -251,7 +351,7 @@ func (e *vmEmitArm) math(pc int, in VInsn) error {
 	a := e.a
 	for i := 0; i < in.B; i++ {
 		d := VReg(i)
-		e.fload(pc, in.A+i, d, in.Imm == 0, 0, false)
+		e.fload(pc, in.A+i, d, in.Imm == 0, false, 0, false)
 		a.StrD(d, X0, POffScratch+8*i)
 	}
 	exit := e.vmLabel("mx")
