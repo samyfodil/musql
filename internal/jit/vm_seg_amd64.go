@@ -1047,16 +1047,15 @@ func (e *vmEmit) inSub(pc int, in VInsn) {
 }
 
 // sortSeek is VSortSeek: the first of the Sort's keys at or above the key,
-// binary searched, and the run of those equal to it after. RAX, RCX, RDX, R9,
-// R10, X0 and X1 are scratch.
+// binary searched, and the run of those equal to it after; or, for the TEXT
+// constant, the run the engine found. RAX, RCX, RDX, R9, R10, X0 and X1 are
+// scratch.
 func (e *vmEmit) sortSeek(pc int, in VInsn) {
 	a, L := e.a, e.lay
 	cb := int32(in.A * VCursorSize)
 	e.unmapCursor(in.A)
 	l := e.named()
-	a.CmpMemDByte(RSI, e.d(in.B, L.OffTyp), L.TypInt)
-	e.jccStub(CondNE, pc) // the key's conversions are the VDBE's
-	e.jccWB(pc)           // the cursor's row pointers are stored
+	e.jccWB(pc) // the cursor's row pointers are stored
 	a.MovRegMemD(RAX, RDI, POffCur)
 	a.LeaRegMemD(RAX, RAX, cb)
 	a.MovRegMemD(R9, RAX, VCursorOffSort)
@@ -1064,8 +1063,29 @@ func (e *vmEmit) sortSeek(pc int, in VInsn) {
 	e.jccStub(CondE, pc)
 	a.MovqXR(X0, RAX) // the cursor
 	a.MovqXR(X1, R9)  // its Sort
-	a.MovRegMemD(RCX, RSI, e.d(in.B, L.OffI))
+	a.CmpMemDByte(RSI, e.d(in.B, L.OffTyp), L.TypInt)
+	a.JccL(CondE, l("int"))
+	// Any other key's conversions are the VDBE's, but the constant's.
+	a.CmpMemDByte(RSI, e.d(in.B, L.OffTyp), L.TypText)
+	e.jccStub(CondNE, pc)
+	a.MovRegMemD(RCX, R9, VSortOffKLen)
+	a.TestRegReg(RCX, RCX)
+	e.jccStub(CondE, pc)
+	a.AluRegMemD(AluCmp, RCX, RSI, e.d(in.B, L.OffS+8))
+	e.jccStub(CondNE, pc)
+	a.MovRegMemD(RCX, R9, VSortOffKey)
+	a.AluRegMemD(AluCmp, RCX, RSI, e.d(in.B, L.OffS))
+	e.jccStub(CondNE, pc)
+	a.MovRegMemD(RAX, R9, VSortOffKLo)
+	a.MovRegMemD(RDX, R9, VSortOffKN)
+	a.AddRegReg(RDX, RAX)
+	a.JmpL(l("end"))
+
+	a.Bind(l("int"))
 	a.MovRegMemD(R10, R9, VSortOffInts)
+	a.TestRegReg(R10, R10)
+	e.jccStub(CondE, pc)
+	a.MovRegMemD(RCX, RSI, e.d(in.B, L.OffI))
 	a.MovRegMemD(RDX, R9, VSortOffN) // hi
 	a.XorRegReg(RAX, RAX)            // lo
 	a.Bind(l("bloop"))

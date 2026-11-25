@@ -81,7 +81,8 @@ func TestVCursorLayout(t *testing.T) {
 	}
 	var so VSort
 	if unsafe.Offsetof(so.Ints) != VSortOffInts || unsafe.Offsetof(so.Rows) != VSortOffRows || unsafe.Offsetof(so.Ids) != VSortOffIds ||
-		unsafe.Offsetof(so.N) != VSortOffN {
+		unsafe.Offsetof(so.N) != VSortOffN || unsafe.Offsetof(so.Key) != VSortOffKey || unsafe.Offsetof(so.KLen) != VSortOffKLen ||
+		unsafe.Offsetof(so.KLo) != VSortOffKLo || unsafe.Offsetof(so.KN) != VSortOffKN {
 		t.Fatalf("VSort is laid out differently from what generated code uses")
 	}
 	var ix VIdx
@@ -553,6 +554,29 @@ func TestVMSortSeek(t *testing.T) {
 				c.wantPC, c.lo, c.n, c.sum)
 		}
 	}
+	// A TEXT constant's run, the engine's: the register holding its very
+	// bytes takes it, whatever the keys are.
+	konst := []byte("TN")
+	textSort := *sort
+	textSort.Ints, textSort.Key, textSort.KLen = nil, unsafe.Pointer(unsafe.SliceData(konst)), int64(len(konst))
+	for _, c := range []struct{ lo, n, wantPC int }{{1, 3, 5}, {4, 0, 6}, {0, 7, 5}} {
+		ts := textSort
+		ts.KLo, ts.KN = int64(c.lo), int64(c.n)
+		regs := []tvalue{{Typ: tvText, S: konst}, {Typ: tvInt}, {Typ: tvInt}}
+		cur := cursor(&ts)
+		pc := runVMCursor(t, prog, regs, nil, cur, 0)
+		at, sum := c.lo, int64(0)
+		if c.n == 0 {
+			at = 0
+		}
+		for i := c.lo; i < c.lo+c.n; i++ {
+			sum += 1 << (4 * i)
+		}
+		if pc != c.wantPC || cur.SortLo != int64(c.lo) || cur.N != int64(c.n) || regs[2].I != sum ||
+			cur.Rows != unsafe.Add(sort.Rows, at*24) || cur.Rowids != unsafe.Add(sort.Ids, at*8) {
+			t.Errorf("constant run %d+%d: pc %d lo %d n %d sum %#x, want pc %d sum %#x", c.lo, c.n, pc, cur.SortLo, cur.N, regs[2].I, c.wantPC, sum)
+		}
+	}
 	for _, c := range []struct {
 		name string
 		key  tvalue
@@ -561,6 +585,11 @@ func TestVMSortSeek(t *testing.T) {
 		{"a REAL key", tvalue{Typ: tvReal, F: 3}, sort},
 		{"a NULL key", tvalue{Typ: tvNull}, sort},
 		{"no Sort", tvalue{Typ: tvInt, I: 3}, nil},
+		{"a TEXT key and no constant", tvalue{Typ: tvText, S: konst}, sort},
+		{"the constant's bytes elsewhere", tvalue{Typ: tvText, S: []byte("TN")}, &textSort},
+		{"a prefix of the constant", tvalue{Typ: tvText, S: konst[:1]}, &textSort},
+		{"the constant as a BLOB", tvalue{Typ: tvBlob, S: konst}, &textSort},
+		{"an INTEGER key and no INTEGERs", tvalue{Typ: tvInt, I: 3}, &textSort},
 	} {
 		regs := []tvalue{c.key, {Typ: tvInt}, {Typ: tvInt}}
 		cur := cursor(c.s)
