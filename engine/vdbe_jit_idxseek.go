@@ -1435,6 +1435,10 @@ func (m *vdbe) syncIdxSeek(jx *vmJIT, c int, jc *jit.VCursor, spec *idxSeekSpec)
 		}
 	}
 	cur.segFilter, cur.params = nil, m.params
+	// The order waits for the rewind (execAutoIndexOrder), as OpRewind's does.
+	if err := m.applyPendingOrder(cur); err != nil {
+		return err
+	}
 	if err := cur.rewind(); err != nil {
 		return err
 	}

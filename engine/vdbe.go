@@ -4434,10 +4434,11 @@ func (m *vdbe) execAutoIndexOrder(op *Instruction) error {
 			return nil
 		}
 	}
-	if !cur.materialized && !cur.idxSeekConfigured && !cur.seekConfigured && !cur.seekSetConfigured {
+	if !cur.materialized && !cur.seekConfigured && !cur.seekSetConfigured {
 		// C builds an automatic index under OP_Once where its loop begins, so
 		// a loop never reached never builds it: the order waits for the
-		// cursor's first rewind or seek (applyPendingOrder).
+		// cursor's first rewind or seek (applyPendingOrder). A partial one,
+		// on the rows a hint pins, waits too.
 		cur.pendingOrder = op
 		return nil
 	}
@@ -4471,9 +4472,14 @@ func (m *vdbe) applyPendingOrder(cur *vdbeCursor) error {
 	return m.orderCursor(cur, op.P4.(*autoIndexKey), false)
 }
 
+// autoIndexOrdersBuilt counts orderCursor's calls, so a test sees which
+// automatic indexes a statement built.
+var autoIndexOrdersBuilt atomic.Int64
+
 // orderCursor is execAutoIndexOrder's permutation of cur's rows by key, built
 // now, or the index seek's list positioned in that order unless built is set.
 func (m *vdbe) orderCursor(cur *vdbeCursor, key *autoIndexKey, built bool) error {
+	autoIndexOrdersBuilt.Add(1)
 	// The cursor materializes on its first rewind; force that now so the
 	// permutation below is the one every later rewind re-iterates.
 	cur.params = m.params // see vdbeCursor.params
