@@ -534,9 +534,9 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 	// A program left with no entry at all gets no code: its run loop then pays
 	// nothing for the JIT, not even the check.
 	entries := 0
-	loops := jit.VLoopReach(vp)
+	loops, vdbeLoops := jit.VLoopReach(vp), programLoops(prog)
 	for pc := range entry {
-		if entry[pc] && !worthEntering(vp, pc, loops[pc]) {
+		if entry[pc] && !worthEntering(vp, pc, vdbeLoops && !loops[pc]) {
 			entry[pc] = false
 		}
 		if entry[pc] {
@@ -1348,14 +1348,14 @@ const vmJITCursorEntryWork = 5
 
 // worthEntering reports whether an entry at pc does enough native work to pay
 // for itself: vmJITMinWork, plus vmJITCursorEntryWork when the run touches a
-// cursor. An entry from which native code cannot loop (loops) is made again
-// for every pass of the VDBE's loop around it, and pays an entry's whole
-// bookkeeping each time -- registers, rows, cursors handed over and back --
-// which in a recursive CTE's step cost more than the VDBE took for the run:
-// it must do vmJITCopyWork past vmJITMinWork.
-func worthEntering(vp []jit.VInsn, pc int, loops bool) bool {
+// cursor. An entry in a program the VDBE loops over, from which native code
+// cannot loop itself (repeated), may be made again on every pass and pays an
+// entry's whole bookkeeping each time -- registers, rows, cursors handed over
+// and back -- which in a recursive CTE's step cost more than the VDBE took for
+// the run: it must do vmJITCopyWork past vmJITMinWork.
+func worthEntering(vp []jit.VInsn, pc int, repeated bool) bool {
 	w, cursor, _ := nativeRun(vp, pc, vmJITMinWork+vmJITCopyWork)
-	if !loops {
+	if repeated {
 		return w >= vmJITMinWork+vmJITCopyWork
 	}
 	if cursor {
