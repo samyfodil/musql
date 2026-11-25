@@ -746,7 +746,7 @@ func (s *rowStore) rowidBound(max bool) (uint64, bool) {
 		return 0, false
 	}
 	if max && s.maxKnown {
-		return s.max, true
+		return s.max, !s.maxNone
 	}
 	var best uint64
 	found := false

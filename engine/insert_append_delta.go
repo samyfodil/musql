@@ -164,7 +164,7 @@ func (n *Session) publishAppendLoads(tables []*tableMeta, recs []SegDeltaRecord)
 		if s.nKnown {
 			s.n += segs[i].nRows
 		}
-		s.max, s.maxKnown = last, true
+		s.max, s.maxKnown, s.maxNone = last, true, false
 		if s.ubKnown && rowidLess(s.ub, last) {
 			s.ub = last
 		}
