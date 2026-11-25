@@ -22,7 +22,8 @@ type sortedRows struct {
 	pos     []int32
 	orig    [][]Value
 	origIDs []uint64
-	// ints is rows' key column when every value is an INTEGER.
+	// ints is rows' key column when every value is an INTEGER and it orders
+	// them first.
 	ints []int64
 	// keyOrder is the order rows compares the hint's key columns in (0 is
 	// hint.col, j its more[j-1]); nil is that order itself. A probe wants
@@ -186,8 +187,11 @@ func (cur *vdbeCursor) sortRowsBy(h *sortedSeekHint, enc TextEncoding) *sortedRo
 	for i := range keys {
 		pos[i] = keys[i].p
 	}
+	// The key column's INTEGERs when it orders the rows first: a seek with
+	// further keys finds their run within its run, which VSortSeek serves
+	// whole, as the loop tests every conjunct.
 	var ints []int64
-	if lead == 1 && k == 1 && !slices.ContainsFunc(keys, func(e intSortKey) bool { return e.nulls != 0 }) {
+	if lead >= 1 && order[0] == 0 && !slices.ContainsFunc(keys, func(e intSortKey) bool { return e.nulls&1 != 0 }) {
 		ints = make([]int64, n)
 		for i := range keys {
 			ints[i] = keys[i].k[0]
@@ -333,7 +337,7 @@ func lowerSortSeeks(prog *Program, vp []jit.VInsn, idxSpecs []*idxSeekSpec) (sor
 		}
 		c := in.P1
 		h, ok := in.P4.(*sortedSeekHint)
-		if !ok || in.P2 < 0 || in.P2 >= prog.NReg || h.built || h.col < 0 || len(h.more) > 0 ||
+		if !ok || in.P2 < 0 || in.P2 >= prog.NReg || h.built || h.col < 0 ||
 			h.aff != affNone && h.aff != affNumeric && h.aff != affInteger || c < len(idxSpecs) && idxSpecs[c] != nil ||
 			sorts[c] != nil && !sorts[c].sameSort(h) {
 			bad[c] = true
