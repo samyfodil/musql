@@ -253,7 +253,11 @@ func sortedSeekSpec(insns []Instruction, pc int, segCap []bool, nReg int) (*idxS
 		}
 		break
 	}
-	if end >= len(insns) || insns[end].Op != OpRewind || insns[end].P1 != c || insns[end].P4 != nil {
+	// A row filter on the rewind (segRowFilter) is a hint for a scan, which
+	// a seek's run never takes: the loop tests every conjunct it holds, and
+	// taking the cursor back drops it (syncSortedSeek).
+	if _, hint := insns[min(end, len(insns)-1)].P4.(*segRowFilter); end >= len(insns) || insns[end].Op != OpRewind || insns[end].P1 != c ||
+		insns[end].P4 != nil && !hint {
 		return nil, 0, false
 	}
 	open, aio := -1, -1
