@@ -408,7 +408,8 @@ type vmIdx struct {
 	none    bool
 	// pack is the whole index's packing of its keys (jit.VIdx.Pack), when
 	// it packs them (buildPackedSortedVMIdx).
-	pack []int64
+	pack   []int64
+	filter []uint64
 }
 
 // idxFor returns cursor c's table as VSeekIdx searches it, or nil.
@@ -1137,6 +1138,18 @@ func buildPackedSortedVMIdx(x *vmIdx, spec *idxSeekSpec, enc TextEncoding) *vmId
 	}
 	x.tableIndex(mask, len(keys), func(i int) (int, int, int64) { w := where[perm[i]]; return int(w.seg), int(w.r), keys[i] })
 	x.vidx[0].Pack, x.pack = unsafe.Pointer(unsafe.SliceData(pack)), pack
+	// A filter of 16 bits a key: most probes of a join find no row, and
+	// are answered by one bit rather than a search.
+	nbits := uint64(64)
+	for nbits < 16*uint64(x.vidx[0].NVals) && nbits < 1<<32 {
+		nbits <<= 1
+	}
+	x.filter = make([]uint64, nbits/64)
+	for _, k := range x.vals[0] {
+		b := jit.VIdxFilterBit(k, nbits-1)
+		x.filter[b/64] |= 1 << (b % 64)
+	}
+	x.vidx[0].Filter, x.vidx[0].FilterMask = unsafe.Pointer(unsafe.SliceData(x.filter)), nbits-1
 	return x
 }
 

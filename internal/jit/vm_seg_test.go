@@ -272,6 +272,17 @@ func TestVMSeekIdxPacked(t *testing.T) {
 	pv, ps, pr := []int64{10, 13, 25, 127}, []int32{0, 2, 3, 5, 6}, []int{0, 2, 3, 1, 4, 5}
 	packed := []VIdx{{Vals: unsafe.Pointer(&pv[0]), NVals: 4, Starts: unsafe.Pointer(&ps[0]), Rows: unsafe.Pointer(&pr[0]), Seg: unsafe.Pointer(seg),
 		Mask: 7, Count: 1, Lo: 10, Hi: 127, Pack: unsafe.Pointer(&pack[0])}}
+	// The same with a filter of its keys' bits, and with one whose bits are
+	// all clear, which finds none for any key.
+	const fmask = 255
+	fbits, clear := make([]uint64, 4), make([]uint64, 4)
+	for _, k := range pv {
+		b := VIdxFilterBit(k, fmask)
+		fbits[b/64] |= 1 << (b % 64)
+	}
+	filtered, cleared := slices.Clone(packed), slices.Clone(packed)
+	filtered[0].Filter, filtered[0].FilterMask = unsafe.Pointer(&fbits[0]), fmask
+	cleared[0].Filter, cleared[0].FilterMask = unsafe.Pointer(&clear[0]), fmask
 	uv, us, ur := []int64{1, 3, 15}, []int32{0, 3, 5, 6}, []int{0, 2, 3, 1, 4, 5}
 	plain := []VIdx{{Vals: unsafe.Pointer(&uv[0]), NVals: 3, Starts: unsafe.Pointer(&us[0]), Rows: unsafe.Pointer(&ur[0]), Seg: unsafe.Pointer(seg),
 		Mask: 7, Count: 1, Lo: 1, Hi: 15}}
@@ -292,6 +303,9 @@ func TestVMSeekIdxPacked(t *testing.T) {
 		{packed, 1, 2, []int{0, 2}, 102}, {packed, 1, 5, []int{3}, 103}, {packed, 3, 1, []int{1, 4}, 104}, {packed, 15, 7, []int{5}, 105},
 		{packed, 1, 3, nil, 0}, {packed, 2, 2, nil, 0}, {packed, 0, 0, nil, 0}, {packed, 16, 0, nil, 0}, {packed, -1, 2, nil, 0},
 		{packed, 1, 8, nil, 0}, {packed, 1, -1, nil, 0}, {packed, 2, 1 << 40, nil, 0},
+		{filtered, 1, 2, []int{0, 2}, 102}, {filtered, 3, 1, []int{1, 4}, 104}, {filtered, 15, 7, []int{5}, 105},
+		{filtered, 1, 3, nil, 0}, {filtered, 2, 2, nil, 0}, {filtered, 16, 0, nil, 0},
+		{cleared, 1, 2, nil, 0}, {cleared, 15, 7, nil, 0},
 		{plain, 1, 99, []int{0, 2, 3}, 103}, {plain, 3, -5, []int{1, 4}, 104}, {plain, 2, 2, nil, 0},
 	} {
 		regs := []tvalue{{Typ: tvInt, I: c.a}, {Typ: tvInt, I: c.b}, {Typ: tvInt, I: -1}}
