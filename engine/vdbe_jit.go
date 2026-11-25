@@ -124,6 +124,9 @@ type vmJIT struct {
 	// sortSeeks is, per cursor number, the sort of the OpSortedSeek native
 	// code makes over the cursor's sorted rows (lowerSortSeeks).
 	sortSeeks []*sortedSeekHint
+	// sortKeys is, per cursor number, the constant its sorted seeks are made
+	// with, if any.
+	sortKeys []sortConst
 
 	// inSlots is the subquery cache slot of each VInSub's set, its B.
 	inSlots []int
@@ -486,7 +489,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 			idxPCs = append(idxPCs, pc)
 		}
 	}
-	sortSeeks, sortPCs := lowerSortSeeks(prog, vp, idxSpecs)
+	sortSeeks, sortKeys, sortPCs := lowerSortSeeks(prog, vp, idxSpecs)
 	idxPCs = append(idxPCs, sortPCs...)
 	for _, q := range idxPCs {
 		if !entry[q] {
@@ -589,7 +592,7 @@ func compileVMJIT(prog *Program, p *ReadOnlyPager) *vmJIT {
 		}
 	}
 	jx := &vmJIT{code: code, insns: &prog.Insns[0], n: len(prog.Insns), nReg: prog.NReg + nParams + len(outer) + 2*len(subs), params: nParams, outer: outer, subs: subs, entry: entry, resumeOnly: resumeOnly, marked: marked, native: native, updAt: updAt,
-		segCap: segCap, segNeed: segNeed, rowidSeeks: rowidSeeks, walkScan: walkScan, inSlots: inSlots, idxSpecs: idxSpecs, sortSeeks: sortSeeks,
+		segCap: segCap, segNeed: segNeed, rowidSeeks: rowidSeeks, walkScan: walkScan, inSlots: inSlots, idxSpecs: idxSpecs, sortSeeks: sortSeeks, sortKeys: sortKeys,
 		aggAt: agg.at, aggSort: agg.sort, aggLo: agg.lo, aggHi: agg.hi, aggKey: agg.key, aggKeyLo: agg.keyLo, aggKeyN: agg.keyN, intTexts: intTexts}
 	if segCap != nil {
 		jx.tabs = make([]atomic.Pointer[vmTab], len(segCap))
@@ -2693,7 +2696,7 @@ func (jx *vmJIT) handCursor(m *vdbe, pc, c int) {
 		jc.N, jc.Pos, jc.Ok, jc.Adv = int64(len(cur.rowids)), int64(cur.pos), 1, 1
 		jc.Mask = jitCursorMask(cur)
 		if c < len(jx.sortSeeks) && jx.sortSeeks[c] != nil {
-			handSort(cur, jc, jx.sortSeeks[c])
+			handSort(cur, jc, jx.sortSeeks[c], jx.sortKeys[c].value(m.params), m.encoding())
 		}
 		if !cur.seekReseek && cur.rowStore == nil && !cur.refillEach {
 			// A re-seeking cursor rebuilds its rows at every rewind, and
