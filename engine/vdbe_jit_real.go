@@ -74,13 +74,11 @@ func vmRealLowering(prog *Program, storesReal, storesText func(root uint32, col 
 			set(ins.P2, false)
 		case OpAdd, OpSubtract, OpMultiply, OpDivide:
 			isReal := real.has(ins.P1) || real.has(ins.P2)
+			var imm int64
 			if text.has(ins.P1) || text.has(ins.P2) {
-				// Its result is an INTEGER or a REAL by the text's spelling, a
-				// guess neither arm makes: what it feeds stays the VDBE's too.
-				lower(pc, jit.VInsn{Op: jit.VExit})
-				set(ins.P3, false)
-				text.put(ins.P3, true)
-				break
+				// A TEXT spelling a REAL plainly is that REAL (VFText); any
+				// other spelling leaves for the VDBE.
+				isReal, imm = true, jit.VFText
 			}
 			if isReal && in(ins.P1) && in(ins.P2) && in(ins.P3) {
 				op := jit.VFDiv
@@ -92,7 +90,9 @@ func vmRealLowering(prog *Program, storesReal, storesText func(root uint32, col 
 				case OpMultiply:
 					op = jit.VFMul
 				}
-				lower(pc, jit.VInsn{Op: op, A: ins.P1, B: ins.P2, C: ins.P3})
+				lower(pc, jit.VInsn{Op: op, A: ins.P1, B: ins.P2, C: ins.P3, Imm: imm})
+			} else if imm != 0 {
+				lower(pc, jit.VInsn{Op: jit.VExit})
 			}
 			set(ins.P3, isReal)
 		case OpRemainder, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight:
