@@ -46,9 +46,13 @@ type rowStore struct {
 	reshapes uint64
 
 	// max caches the largest rowid for nextRowidForTable. Cleared on drop
-	// to match SQLite's rowid reuse behavior.
+	// to match SQLite's rowid reuse behavior. maxNone, while maxKnown, says
+	// the store holds no row at all: an empty store is remembered too, or
+	// every row an INSERT adds to one whose rows were all deleted (and are
+	// still in its segments, marked gone) walked every one of them (#392).
 	max      uint64
 	maxKnown bool
+	maxNone  bool
 
 	// ub is an UPPER BOUND on every rowid the store holds, while ubKnown:
 	// raised by every put, left alone by a drop (still a bound), and dropped
@@ -474,8 +478,8 @@ func (s *rowStore) putHeld(rowid uint64, vals, held []Value) {
 	if len(s.uqIdx) > 0 {
 		s.noteUniqWrite(rowid, old, vals)
 	}
-	if s.maxKnown && rowidLess(s.max, rowid) {
-		s.max = rowid
+	if s.maxKnown && (s.maxNone || rowidLess(s.max, rowid)) {
+		s.max, s.maxNone = rowid, false
 	}
 	if s.ubKnown && rowidLess(s.ub, rowid) {
 		s.ub = rowid
@@ -624,11 +628,11 @@ func (s *rowStore) maxRowid() (uint64, bool) {
 		return 0, false
 	}
 	if s.maxKnown {
-		return s.max, true
+		return s.max, !s.maxNone
 	}
 	if s.seg != nil {
 		max, found := s.segMaxRowid()
-		s.max, s.maxKnown = max, found
+		s.max, s.maxKnown, s.maxNone = max, true, !found
 		return max, found
 	}
 	var max uint64
@@ -640,7 +644,7 @@ func (s *rowStore) maxRowid() (uint64, bool) {
 			max, found = rowid, true
 		}
 	}
-	s.max, s.maxKnown = max, found
+	s.max, s.maxKnown, s.maxNone = max, true, !found
 	return max, found
 }
 
