@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"slices"
 	"testing"
 	"unsafe"
 )
@@ -248,6 +249,84 @@ func TestVMSeekIdx(t *testing.T) {
 	regs = []tvalue{{Typ: tvInt, I: 3}, {Typ: tvInt, I: -1}}
 	if pc := runVMCursor(t, prog, regs, nil, &VCursor{Last: -1}, 0); pc != 0 {
 		t.Fatalf("a cursor with no index ran natively to %d", pc)
+	}
+}
+
+// TestVMSeekIdxPacked seeks two keys at once through an index of packed keys
+// (VIdx.Pack): a run is the rows equal on both, a key outside its width is a
+// miss, and a further key that is no INTEGER exits. With no Pack the first
+// key alone is sought.
+func TestVMSeekIdxPacked(t *testing.T) {
+	if !Available || !VMSegCursor {
+		t.Skip("no segment cursors on this platform")
+	}
+	noGC(t)
+	as := []uint64{1, 3, 1, 1, 3, 15}
+	bs := []uint64{2, 1, 2, 5, 1, 7}
+	vs := []uint64{100, 101, 102, 103, 104, 105}
+	cols := []VSegCol{{Kind: VSegInt, Block: unsafe.Pointer(&as[0])}, {Kind: VSegInt, Block: unsafe.Pointer(&bs[0])},
+		{Kind: VSegInt, Block: unsafe.Pointer(&vs[0])}}
+	seg := &VSeg{Cols: unsafe.Pointer(&cols[0]), First: 1, Dense: 1}
+	// a < 16 and b < 8: a<<3 | b.
+	pack := []int64{16, 3, 8}
+	pv, ps, pr := []int64{10, 13, 25, 127}, []int32{0, 2, 3, 5, 6}, []int{0, 2, 3, 1, 4, 5}
+	packed := []VIdx{{Vals: unsafe.Pointer(&pv[0]), NVals: 4, Starts: unsafe.Pointer(&ps[0]), Rows: unsafe.Pointer(&pr[0]), Seg: unsafe.Pointer(seg),
+		Mask: 7, Count: 1, Lo: 10, Hi: 127, Pack: unsafe.Pointer(&pack[0])}}
+	uv, us, ur := []int64{1, 3, 15}, []int32{0, 3, 5, 6}, []int{0, 2, 3, 1, 4, 5}
+	plain := []VIdx{{Vals: unsafe.Pointer(&uv[0]), NVals: 3, Starts: unsafe.Pointer(&us[0]), Rows: unsafe.Pointer(&ur[0]), Seg: unsafe.Pointer(seg),
+		Mask: 7, Count: 1, Lo: 1, Hi: 15}}
+	prog := []VInsn{
+		{Op: VSeekIdx, A: 0, B: 0, More: []int{1}, T: 5},
+		{Op: VSeekRewind, A: 0},
+		{Op: VColumn, A: 0, B: 2, C: 2, Imm: 1},
+		{Op: VNext, A: 0, T: 2},
+		{Op: VExit},
+		{Op: VExit},
+	}
+	for _, c := range []struct {
+		ix   []VIdx
+		a, b int64
+		run  []int
+		last uint64
+	}{
+		{packed, 1, 2, []int{0, 2}, 102}, {packed, 1, 5, []int{3}, 103}, {packed, 3, 1, []int{1, 4}, 104}, {packed, 15, 7, []int{5}, 105},
+		{packed, 1, 3, nil, 0}, {packed, 2, 2, nil, 0}, {packed, 0, 0, nil, 0}, {packed, 16, 0, nil, 0}, {packed, -1, 2, nil, 0},
+		{packed, 1, 8, nil, 0}, {packed, 1, -1, nil, 0}, {packed, 2, 1 << 40, nil, 0},
+		{plain, 1, 99, []int{0, 2, 3}, 103}, {plain, 3, -5, []int{1, 4}, 104}, {plain, 2, 2, nil, 0},
+	} {
+		regs := []tvalue{{Typ: tvInt, I: c.a}, {Typ: tvInt, I: c.b}, {Typ: tvInt, I: -1}}
+		cur := &VCursor{Last: -1, Idx: unsafe.Pointer(&c.ix[0])}
+		pc := runVMCursor(t, prog, regs, nil, cur, 0)
+		if c.run == nil {
+			if pc != 5 || cur.State != 3 || regs[2].I != -1 {
+				t.Fatalf("(%d, %d), packed %v: pc %d state %d r2 %+v, want none", c.a, c.b, c.ix[0].Pack != nil, pc, cur.State, regs[2])
+			}
+			continue
+		}
+		if pc != 4 || cur.State != 4 || cur.N != int64(len(c.run)) || regs[2].Typ != tvInt || regs[2].I != int64(c.last) {
+			t.Fatalf("(%d, %d), packed %v: pc %d state %d N %d r2 %+v", c.a, c.b, c.ix[0].Pack != nil, pc, cur.State, cur.N, regs[2])
+		}
+		if sel := unsafe.Slice((*int)(cur.Sel), cur.N); !slices.Equal(sel, c.run) {
+			t.Fatalf("(%d, %d): run %v, want %v", c.a, c.b, sel, c.run)
+		}
+	}
+	// A NULL key finds none; a REAL first key, or a REAL further key the
+	// index packs, is the VDBE's to convert.
+	null, real := tvalue{Typ: tvNull}, tvalue{Typ: tvReal, F: 2}
+	one := tvalue{Typ: tvInt, I: 1}
+	for _, c := range []struct {
+		ix   []VIdx
+		a, b tvalue
+		pc   int
+	}{
+		{packed, null, one, 5}, {plain, null, one, 5}, {packed, one, null, 5}, {packed, null, null, 5},
+		{packed, real, one, 0}, {plain, real, one, 0}, {packed, one, real, 0}, {plain, one, real, 4},
+	} {
+		regs := []tvalue{c.a, c.b, {Typ: tvInt, I: -1}}
+		cur := &VCursor{Last: -1, Idx: unsafe.Pointer(&c.ix[0])}
+		if pc := runVMCursor(t, prog, regs, nil, cur, 0); pc != c.pc || pc == 5 && cur.State != 3 {
+			t.Fatalf("keys %+v %+v, packed %v: pc %d state %d, want pc %d", c.a, c.b, c.ix[0].Pack != nil, pc, cur.State, c.pc)
+		}
 	}
 }
 
