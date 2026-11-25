@@ -270,6 +270,11 @@ func sortedSeekSpec(insns []Instruction, pc int, segCap []bool, nReg int) (*idxS
 				return nil, 0, false
 			}
 			aio = q
+		case x.Op == OpSeekIndexHint:
+			// The cursor pinned to the rows a hint finds is built, which
+			// the segments never serve (segSortedReady); its sort is
+			// lowerSortSeeks'.
+			return nil, 0, false
 		}
 	}
 	tbl, _ := insns[max(open, 0)].P4.(*resolvedTable)
