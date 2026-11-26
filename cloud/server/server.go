@@ -60,6 +60,8 @@ type Server struct {
 	deletedRetention func(ctx context.Context, org *state.Org) time.Duration
 	// accessPolicy is WithAccessPolicy's; nil allows what tokens grant.
 	accessPolicy func(ctx context.Context, org *state.Org, db *state.Database) Policy
+	// dbMux is WithDatabaseHandler's patterns; nil without one.
+	dbMux *http.ServeMux
 }
 
 // Option configures a Server beyond its config file.

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -306,8 +307,10 @@ func (s *Server) removeFiles(d *state.Database) {
 	s.closeReplicated(d.ID)
 	s.closeHistory(d.ID)
 	removeDBFiles(s.log, s.dbPath(d))
-	if err := os.RemoveAll(s.histDir(d)); err != nil {
-		s.log.Printf("remove %s: %v", s.histDir(d), err)
+	for _, dir := range []string{s.histDir(d), s.handlerDir(d)} {
+		if err := os.RemoveAll(dir); err != nil {
+			s.log.Printf("remove %s: %v", dir, err)
+		}
 	}
 }
 
@@ -326,9 +329,15 @@ func removeDBFiles(l interface{ Printf(string, ...any) }, p string) {
 }
 
 func hranaError(w http.ResponseWriter, status int, msg string) {
+	b, err := json.Marshal(struct {
+		Message string `json:"message"`
+	}{msg})
+	if err != nil {
+		b = []byte(`{"message":"error"}`)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	w.Write([]byte(`{"message":"` + msg + `"}`))
+	w.Write(b)
 }
 
 // serveDB serves Hrana at /db/<org>/<name>/..., for a database token or a
@@ -400,6 +409,10 @@ func (s *Server) serveDB(w http.ResponseWriter, r *http.Request) {
 	r2 := r.Clone(ctx)
 	r2.URL.Path = "/" + sub
 	r2.URL.RawPath = ""
+	if s.dbHandles(r2) {
+		s.serveDBHandler(w, r2, o, d, e)
+		return
+	}
 	e.srv.ServeHTTP(w, r2)
 }
 
