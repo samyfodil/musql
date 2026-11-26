@@ -552,8 +552,10 @@ func (m *vdbe) aggRowCtx(plan *aggPlan, row []Value, rowids []Value) *evalCtx {
 	if m.aggCtx == nil {
 		m.aggCtx = new(evalCtx)
 	}
-	*m.aggCtx = evalCtx{tables: plan.scopes, vals: row, rowids: rowids, outer: m.outer, pager: m.pager, params: m.params}
-	return m.aggCtx
+	c := m.aggCtx
+	*c = evalCtx{}
+	c.tables, c.vals, c.rowids, c.outer, c.pager, c.params = plan.scopes, row, rowids, m.outer, m.pager, m.params
+	return c
 }
 
 // aggStep advances every accumulator in the select list, HAVING and ORDER BY

@@ -338,11 +338,14 @@ type recQueue struct {
 	spec *recQueueSpec
 	enc  TextEncoding
 
-	// fifo/head is the queue when there is no ORDER BY: rows are appended at
-	// the tail and taken from head, and a taken slot is cleared so the row it
-	// held can be collected as soon as the step that expands it is done.
-	fifo [][]Value
-	head int
+	// fifo/head is the queue when there is no ORDER BY: rows of spec.nCol
+	// values laid end to end, appended at the tail and taken from row head.
+	// One slab rather than a slice per row, which was an allocation for every
+	// row a step produced.
+	fifo  []Value
+	head  int
+	nfifo int     // rows in fifo, taken or not
+	tmp   []Value // a row bound for disk, with its subtypes cleared
 
 	// pq is the queue when there is an ORDER BY. seq is select.c:1489's
 	// OP_Sequence column, which makes every key unique and breaks a tie in
@@ -389,7 +392,7 @@ func (q *recQueue) len() int {
 	if len(q.spec.orderKeys) > 0 {
 		return len(q.pq.items)
 	}
-	n := len(q.fifo) - q.head
+	n := q.nfifo - q.head
 	if q.disk != nil {
 		n += q.disk.n
 	}
@@ -399,18 +402,17 @@ func (q *recQueue) len() int {
 // push queues one row the setup query or a recursive step produced. The row
 // reaches the queue as a record in C (OP_MakeRecord, select.c:1316/:1481), and
 // a record carries no subtype, so the subtype is cleared here -- where the old
-// path cleared it when the rows were opened as a derived cursor.
+// path cleared it when the rows were opened as a derived cursor. The priority
+// queue keeps row itself; the FIFO copies it, so its caller may reuse row.
 func (q *recQueue) push(row []Value) {
 	if q.seen != nil && !q.seen.add(row) {
 		return
-	}
-	for i := range row {
-		row[i].Subtype = 0
 	}
 	fp := recursiveRowFootprint(row)
 	q.producedBytes += fp
 	q.queuedBytes += fp
 	if len(q.spec.orderKeys) > 0 {
+		clearSubtypes(row)
 		heap.Push(&q.pq, recPQItem{row: row, seq: q.seq})
 		q.seq++
 		return
@@ -424,10 +426,21 @@ func (q *recQueue) push(row []Value) {
 	// full; back to memory once the file has drained.
 	if q.disk != nil && (q.disk.n > 0 || q.queuedBytes > recQueueSpillBytes) {
 		q.queuedBytes -= fp
-		q.disk.push(row)
+		q.tmp = append(q.tmp[:0], row...)
+		clearSubtypes(q.tmp)
+		q.disk.push(q.tmp)
 		return
 	}
-	q.fifo = append(q.fifo, row)
+	n := len(q.fifo)
+	q.fifo = append(q.fifo, row...)
+	q.nfifo++
+	clearSubtypes(q.fifo[n:])
+}
+
+func clearSubtypes(row []Value) {
+	for i := range row {
+		row[i].Subtype = 0
+	}
 }
 
 // pop takes the next row off the queue: the head of the FIFO, or the least
@@ -441,24 +454,27 @@ func (q *recQueue) pop() ([]Value, bool) {
 		q.queuedBytes -= recursiveRowFootprint(row)
 		return row, true
 	}
-	if q.head >= len(q.fifo) {
-		q.fifo, q.head = q.fifo[:0], 0
+	w := q.spec.nCol
+	if q.head >= q.nfifo {
+		clear(q.fifo)
+		q.fifo, q.head, q.nfifo = q.fifo[:0], 0, 0
 		if q.disk != nil && q.disk.n > 0 {
 			return q.disk.pop()
 		}
 		return nil, false
 	}
-	row := q.fifo[q.head]
-	q.fifo[q.head] = nil
+	// Reclaim the consumed prefix once it is at least half the slab, so a
+	// long-running recursion's queue stays proportional to its frontier. It
+	// overwrites rows already taken, whose values the registers and the self
+	// cursor hold copies of.
+	if q.head >= 1024 && q.head*2 >= q.nfifo {
+		n := copy(q.fifo, q.fifo[q.head*w:])
+		clear(q.fifo[n:])
+		q.fifo, q.nfifo, q.head = q.fifo[:n], q.nfifo-q.head, 0
+	}
+	row := q.fifo[q.head*w : (q.head+1)*w : (q.head+1)*w]
 	q.head++
 	q.queuedBytes -= recursiveRowFootprint(row)
-	// Reclaim the consumed prefix once it is at least half the backing array,
-	// so a long-running recursion's queue stays proportional to its frontier.
-	if q.head >= 1024 && q.head*2 >= len(q.fifo) {
-		n := copy(q.fifo, q.fifo[q.head:])
-		clear(q.fifo[n:])
-		q.fifo, q.head = q.fifo[:n], 0
-	}
 	return row, true
 }
 
@@ -669,7 +685,8 @@ func (m *vdbe) openRecursiveSelf(ds *derivedSource, shell *vdbeCursor) (*vdbeCur
 	if shell == nil {
 		shell = new(vdbeCursor)
 	}
-	*shell = vdbeCursor{tbl: ds.tbl, rows: cur.selfRows, rowids: cur.selfRids, materialized: true, colMask: allColumns}
+	*shell = vdbeCursor{}
+	shell.tbl, shell.rows, shell.rowids, shell.materialized, shell.colMask = ds.tbl, cur.selfRows, cur.selfRids, true, allColumns
 	return shell, nil
 }
 

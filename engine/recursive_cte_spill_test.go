@@ -104,3 +104,51 @@ func TestRecQueueDiskKeepsFIFOOrder(t *testing.T) {
 		t.Fatal("nothing was spilled")
 	}
 }
+
+// TestRecQueueFIFOCopiesTheRow: OpRecQueuePush hands the FIFO its registers,
+// not a row of its own, and the FIFO keeps its rows in one slab it compacts
+// as it goes. Pushing from one reused buffer through frontiers wide and narrow,
+// every row must come back as it was pushed, its subtype cleared, and the
+// buffer's own subtype left alone.
+func TestRecQueueFIFOCopiesTheRow(t *testing.T) {
+	rng := rand.New(rand.NewSource(7))
+	q := newRecQueue(&recQueueSpec{name: "q", nCol: 2, unionAll: true}, UTF8)
+	buf := make([]Value, 2)
+	var ref []int
+	next, compacted := 0, 0
+	for step := 0; step < 200000; step++ {
+		grow := 30
+		if step/20000%2 == 0 {
+			grow = 70
+		}
+		if len(ref) == 0 || rng.Intn(100) < grow {
+			buf[0] = Value{Typ: Int, I: int64(next), Subtype: 74}
+			buf[1] = Value{Typ: Text, S: []byte(fmt.Sprint("r", next))}
+			q.push(buf)
+			if buf[0].Subtype != 74 {
+				t.Fatal("push cleared its caller's subtype")
+			}
+			ref = append(ref, next)
+			next++
+			continue
+		}
+		head := q.head
+		got, ok := q.pop()
+		if q.head < head {
+			compacted++
+		}
+		if !ok || len(got) != 2 || got[0].I != int64(ref[0]) || string(got[1].S) != fmt.Sprint("r", ref[0]) || got[0].Subtype != 0 {
+			t.Fatalf("step %d: popped %v %v, want %d", step, got, ok, ref[0])
+		}
+		ref = ref[1:]
+		if q.len() != len(ref) {
+			t.Fatalf("step %d: len %d, want %d", step, q.len(), len(ref))
+		}
+	}
+	if q.disk != nil {
+		t.Fatal("the queue spilled, so the slab was not what answered")
+	}
+	if compacted == 0 {
+		t.Fatal("the slab was never compacted")
+	}
+}
