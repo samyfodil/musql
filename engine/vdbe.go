@@ -2083,8 +2083,10 @@ func (m *vdbe) runLoop(insns []Instruction) (rows [][]Value, err error) {
 			if q == nil || op.P2 != q.spec.nCol {
 				return nil, fmt.Errorf("engine: internal: recursive CTE row push with no queue or %d values", op.P2)
 			}
-			row := make([]Value, op.P2)
-			copy(row, m.regs[op.P1:op.P1+op.P2])
+			row := m.regs[op.P1 : op.P1+op.P2 : op.P1+op.P2]
+			if len(q.spec.orderKeys) > 0 {
+				row = slices.Clone(row)
+			}
 			q.push(row)
 
 		case OpRowidBound:
