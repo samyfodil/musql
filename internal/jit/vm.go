@@ -257,7 +257,8 @@ const (
 	VSortEmpty
 	// VCastConst: r[A] = K, an INTEGER, or with C 1 the REAL whose bits K
 	// are, where r[A] is the TEXT of the B bytes at Imm: the constant a VText
-	// put there, which the engine cast to K. Any other value exits.
+	// put there, which the engine cast to K. With C 2 the cast is to TEXT and
+	// r[A] stays as it is. Any other value exits.
 	VCastConst
 )
 
@@ -746,11 +747,14 @@ const (
 	VReopenSeekOpened = 5
 )
 
-// castConstValue is the VInt or VReal that writes VCastConst in's value.
+// castConstValue is the VInt, VReal or VText that writes VCastConst in's
+// value.
 func castConstValue(in VInsn) VInsn {
-	op := VInt
-	if in.C == 1 {
-		op = VReal
+	switch in.C {
+	case 1:
+		return VInsn{Op: VReal, A: in.A, Imm: in.K, Dead: in.Dead}
+	case 2:
+		return VInsn{Op: VText, A: in.A, B: in.B, Imm: in.Imm, Dead: in.Dead}
 	}
-	return VInsn{Op: op, A: in.A, Imm: in.K, Dead: in.Dead}
+	return VInsn{Op: VInt, A: in.A, Imm: in.K, Dead: in.Dead}
 }

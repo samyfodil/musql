@@ -64,11 +64,21 @@ func vmTextLowering(prog *Program, storesText func(root uint32, col int) bool) (
 			// makes of the literal, where the register still holds it.
 			str, isConst := consts[ins.P1]
 			target, _ := ins.P4.(string)
-			if !isConst || !in(ins.P1) || int64(len(str)) >= 1<<31 || target != "NUMERIC" && target != "INTEGER" && target != "REAL" {
+			if !isConst || !in(ins.P1) || int64(len(str)) >= 1<<31 || target != "NUMERIC" && target != "INTEGER" && target != "REAL" && target != "TEXT" {
+				break
+			}
+			vi := jit.VInsn{Op: jit.VCastConst, A: ins.P1, B: len(str), Imm: int64(uintptr(unsafe.Pointer(unsafe.StringData(str))))}
+			if target == "TEXT" {
+				// CAST('2002-04-01' AS varchar): a TEXT cast leaves a TEXT's
+				// bytes as they are (castValueEnc).
+				vi.C = 2
+				if ok == nil {
+					out, ok = make([]jit.VInsn, n), make([]bool, n)
+				}
+				out[pc], ok[pc] = vi, true
 				break
 			}
 			v := castValueEnc(Value{Typ: Text, S: []byte(str)}, target, UTF8)
-			vi := jit.VInsn{Op: jit.VCastConst, A: ins.P1, B: len(str), Imm: int64(uintptr(unsafe.Pointer(unsafe.StringData(str))))}
 			switch {
 			case v.Typ == Int:
 				vi.K = v.I
