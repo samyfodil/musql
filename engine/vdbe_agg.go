@@ -326,6 +326,13 @@ type aggAccumulators struct {
 	checkVals  []Value
 	checkSeen  bool
 	anchorRisk bool
+
+	// lean is the segment-0 accumulators in aggStep's order when every one is
+	// a count, sum, total or avg of a register with no FILTER, ORDER BY or
+	// DISTINCT, and leanState says whether it was worked out (1) or cannot
+	// be (-1). See aggStepLean.
+	lean      []*aggItem
+	leanState int8
 }
 
 // magnetWalk runs the query's min()/max() census over one row and reports
@@ -599,6 +606,69 @@ func (m *vdbe) aggStep(ctx *evalCtx, seg int) error {
 		}
 	}
 	return nil
+}
+
+// aggStepLeanOff turns aggStepLean off, for tests that compare it with aggStep.
+var aggStepLeanOff bool
+
+// aggStepLean steps a's accumulators over the registers when nothing else
+// in aggStep has work on this row: no min/max census and no anchor
+// certificate, so after the group's first row magnetWalk only re-sets
+// magnetHit to true; and every accumulator is a plain count, sum, total or
+// avg of a register (aggAccumulators.lean). It reports false, having done
+// nothing, for any other row.
+func (a *aggAccumulators) aggStepLean(regs []Value) bool {
+	if aggStepLeanOff || !a.seenRow || len(a.magnets) != 0 || a.check != nil {
+		return false
+	}
+	if a.leanState == 0 {
+		a.leanState = -1
+		var lean []*aggItem
+		sets := append(append(slices.Clone(a.out), a.having), a.order...)
+		for _, accs := range sets {
+			for _, it := range accs {
+				if it.stepSeg != 0 {
+					continue
+				}
+				if it.filter != nil || it.orderBy != nil || it.distinct {
+					return false
+				}
+				switch it.kind {
+				case aggCountStar:
+				case aggCount, aggSum, aggTotal, aggAvg:
+					if r := it.rowRegs[aggExprArg]; r <= 0 || r > len(regs) {
+						return false
+					}
+				default:
+					return false
+				}
+				lean = append(lean, it)
+			}
+		}
+		a.lean, a.leanState = lean, 1
+	}
+	if a.leanState < 0 {
+		return false
+	}
+	for _, it := range a.lean {
+		if it.kind == aggCountStar {
+			it.cnt++
+			continue
+		}
+		v := regs[it.rowRegs[aggExprArg]-1]
+		if v.Typ == Null {
+			continue
+		}
+		it.cnt++
+		if it.kind != aggCount {
+			asInt, i, f := aggNumericContribution(v)
+			if it.orderStrict {
+				it.sumWatch(asInt, i, f)
+			}
+			it.sumStep(asInt, i, f)
+		}
+	}
+	return true
 }
 
 // stepAccs steps every accumulator in one item's set that belongs to step

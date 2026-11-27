@@ -3498,6 +3498,9 @@ func (m *vdbe) runLoop(insns []Instruction) (rows [][]Value, err error) {
 
 		case OpAggStep:
 			plan := op.P4.(*aggPlan)
+			if op.P2 == 0 && op.P3 == 0 && plan.rowFree && m.aggAccs.aggStepLean(m.regs) {
+				break
+			}
 			var row, rowids []Value
 			if op.P3 == 0 && plan.rowFree {
 				row, rowids = m.aggStepNullRow(plan)
