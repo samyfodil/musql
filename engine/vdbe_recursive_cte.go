@@ -18,6 +18,7 @@ import (
 	"container/heap"
 	"encoding/binary"
 	"fmt"
+	"sync/atomic"
 )
 
 // recQueueSpec is OpRecQueueOpen's P4: everything about one recursive CTE's
@@ -261,13 +262,21 @@ func (p *ReadOnlyPager) compileRecursiveCTE(name string, b *cteBinding, cols []c
 	c.emit(Instruction{Op: OpRecQueueOpen, P4: spec})
 	c.emit(Instruction{Op: OpRecQueueFill, P1: 0, P4: seed})
 	top := c.here()
-	toBreak = append(toBreak, c.emit(Instruction{Op: OpRecQueuePop, P3: regCur}))
-	toCont := c.emit(Instruction{Op: OpRecQueueOffset})
+	pop, toCont := Instruction{Op: OpRecQueuePop, P3: regCur}, -1
+	if spec.offset <= 0 {
+		pop.P5 = 1 // no OFFSET to skip rows: the pop counts each one out itself
+	}
+	toBreak = append(toBreak, c.emit(pop))
+	if spec.offset > 0 {
+		toCont = c.emit(Instruction{Op: OpRecQueueOffset})
+	}
 	c.emit(Instruction{Op: OpResultRow, P1: regCur, P2: nCol})
 	if spec.hasLimit {
 		toBreak = append(toBreak, c.emit(Instruction{Op: OpRecQueueLimit}))
 	}
-	c.patch(toCont, c.here())
+	if toCont >= 0 {
+		c.patch(toCont, c.here())
+	}
 	for _, arm := range arms {
 		c.emit(Instruction{Op: OpRecQueueFill, P1: 1, P4: arm})
 	}
@@ -432,7 +441,12 @@ func (q *recQueue) push(row []Value) {
 		return
 	}
 	n := len(q.fifo)
-	q.fifo = append(q.fifo, row...)
+	// Value by value: append(row...) and copy are a call each, most of the
+	// cost of a row of one or two values. recQueuePop and a co-routine's
+	// yield do the same.
+	for _, v := range row {
+		q.fifo = append(q.fifo, v)
+	}
 	q.nfifo++
 	clearSubtypes(q.fifo[n:])
 }
@@ -624,9 +638,14 @@ func (m *vdbe) recQueuePop(op *Instruction) (bool, error) {
 	if op.P3 < 0 || op.P3+len(row) > len(m.regs) {
 		return false, fmt.Errorf("vdbe: recursive CTE %s row register %d out of range", q.spec.name, op.P3)
 	}
-	copy(m.regs[op.P3:], row)
+	for i, v := range row {
+		m.regs[op.P3+i] = v
+	}
 	q.cur.row = row
 	m.recCur = &q.cur
+	if op.P5 != 0 {
+		q.emitted++
+	}
 	return true, nil
 }
 
@@ -676,6 +695,7 @@ func (m *vdbe) openRecursiveSelf(ds *derivedSource, shell *vdbeCursor) (*vdbeCur
 	// back from the pool as some other cursor (a join's table scan read the
 	// self row's one column as its second: with5.test). It is rebuilt whole,
 	// so nothing of the previous step survives in it.
+	recSelfOpens.Add(1)
 	cur.selfBuf = append(cur.selfBuf[:0], cur.row...)
 	clearDerivedSubtypes(cur.selfBuf, nil) // openDerivedCursor's rule
 	if cur.selfRows == nil {
@@ -689,6 +709,9 @@ func (m *vdbe) openRecursiveSelf(ds *derivedSource, shell *vdbeCursor) (*vdbeCur
 	shell.tbl, shell.rows, shell.rowids, shell.materialized, shell.colMask = ds.tbl, cur.selfRows, cur.selfRids, true, allColumns
 	return shell, nil
 }
+
+// recSelfOpens counts self cursors opened, for tests.
+var recSelfOpens atomic.Int64
 
 // recQueueSpilled counts rows written to a queue file, for tests.
 var recQueueSpilled int64

@@ -162,6 +162,7 @@ var opNames = [numOpCodes]string{
 	OpRecQueueFill:         "RecQueueFill",
 	OpRecQueuePush:         "RecQueuePush",
 	OpRecQueueCheck:        "RecQueueCheck",
+	OpRecSelfColumn:        "RecSelfColumn",
 	OpRowidBound:           "RowidBound",
 	OpRecQueuePop:          "RecQueuePop",
 	OpRecQueueOffset:       "RecQueueOffset",

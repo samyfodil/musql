@@ -694,6 +694,10 @@ const (
 	// OpRecQueueCheck: the caps OpRecQueueFill applies after a recursive
 	// step, after an inlined one (recQueueCaps).
 	OpRecQueueCheck
+	// OpRecSelfColumn: r[P3] = column P2 of the row the recursive CTE P4
+	// (*recQueueSpec) popped last -- an inlined step's read of its self
+	// reference, with no one-row cursor opened per row (rec_inline.go).
+	OpRecSelfColumn
 	// OpRowidBound: C's min/max optimization (select.c minMaxQuery, OP_Last).
 	// r[P1] = min(rowid) (P3 0) or max(rowid) (P3 1) of the table rooted at
 	// P4(uint32), NULL for an empty table, then jump to P2. Falls through,
@@ -701,7 +705,8 @@ const (
 	// computes it the slow way.
 	OpRowidBound
 	// OpRecQueuePop: P2: jump target when the queue is empty. P3: base register
-	// of the popped row. select.c:2796-2805: OP_Rewind queue, OP_NullRow
+	// of the popped row. P5: count the row emitted, OpRecQueueOffset's work
+	// when there is no OFFSET. select.c:2796-2805: OP_Rewind queue, OP_NullRow
 	// current, OP_RowData/OP_Column into regCurrent, OP_Delete.
 	OpRecQueuePop
 	// OpRecQueueOffset: P2: jump target while an OFFSET is still skipping

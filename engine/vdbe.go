@@ -2033,7 +2033,10 @@ func (m *vdbe) runLoop(insns []Instruction) (rows [][]Value, err error) {
 				return [][]Value{nil}, nil
 			}
 			if m.yieldReuse && len(rows) == 0 {
-				m.yieldRow = append(m.yieldRow[:0], m.regs[op.P1:op.P1+op.P2]...)
+				m.yieldRow = m.yieldRow[:0]
+				for _, v := range m.regs[op.P1 : op.P1+op.P2] {
+					m.yieldRow = append(m.yieldRow, v)
+				}
 				m.yieldRows = append(m.yieldRows[:0], m.yieldRow)
 				m.resumePC = pc + 1
 				return m.yieldRows, nil
@@ -2099,6 +2102,14 @@ func (m *vdbe) runLoop(insns []Instruction) (rows [][]Value, err error) {
 				pc = op.P2
 				continue
 			}
+
+		case OpRecSelfColumn:
+			cur := m.recCur
+			if cur == nil || op.P4 != any(cur.spec) || op.P2 >= len(cur.row) {
+				return nil, fmt.Errorf("engine: internal: recursive CTE self column %d with no current row", op.P2)
+			}
+			m.regs[op.P3] = cur.row[op.P2]
+			m.regs[op.P3].Subtype = 0
 
 		case OpRecQueueCheck:
 			if m.recq == nil {
