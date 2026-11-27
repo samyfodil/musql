@@ -28,8 +28,9 @@ cat >index.html <<'EOF'
 <html><body><div id="root"></div><script type="module" src="/src/main.jsx"></script></body></html>
 EOF
 cat >src/main.jsx <<'EOF'
-import { createConsole } from "@samyfodil/musql-console";
+import { createConsole, roleName, transport } from "@samyfodil/musql-console";
 createConsole(document.getElementById("root"), {});
+console.log(roleName(0), transport);
 EOF
 cat >vite.config.js <<'EOF'
 import react from "@vitejs/plugin-react";
