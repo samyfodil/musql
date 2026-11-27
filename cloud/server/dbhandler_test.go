@@ -132,6 +132,15 @@ func TestDatabaseHandlerBytesServed(t *testing.T) {
 			if err := http.NewResponseController(w).Flush(); err != nil {
 				t.Errorf("flush: %v", err)
 			}
+			f, ok := w.(http.Flusher)
+			if !ok {
+				t.Errorf("the handler's writer is not an http.Flusher")
+			} else {
+				f.Flush()
+			}
+			if _, ok := w.(http.Hijacker); !ok {
+				t.Errorf("the handler's writer is not an http.Hijacker")
+			}
 			io.Copy(w, strings.NewReader(strings.Repeat("b", n-1000)))
 		})
 	}))

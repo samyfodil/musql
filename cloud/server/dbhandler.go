@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -109,7 +111,9 @@ func (s *Server) serveDBHandler(w http.ResponseWriter, r *http.Request, o *state
 }
 
 // countingWriter counts the response body bytes written through it.
-// http.ResponseController reaches the writer beneath through Unwrap.
+// http.ResponseController reaches the writer beneath through Unwrap, and
+// Flush and Hijack keep a handler's w.(http.Flusher) and w.(http.Hijacker)
+// working. A hijacked connection's bytes are not counted.
 type countingWriter struct {
 	http.ResponseWriter
 	n int64
@@ -129,6 +133,12 @@ func (c *countingWriter) ReadFrom(r io.Reader) (int64, error) {
 }
 
 func (c *countingWriter) Unwrap() http.ResponseWriter { return c.ResponseWriter }
+
+func (c *countingWriter) Flush() { http.NewResponseController(c.ResponseWriter).Flush() }
+
+func (c *countingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return http.NewResponseController(c.ResponseWriter).Hijack()
+}
 
 // handlerDir is a database's WithDatabaseHandler directory.
 func (s *Server) handlerDir(d *state.Database) string {
