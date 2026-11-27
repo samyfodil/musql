@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -55,6 +56,14 @@ func TestRecInlineMatchesTheSubProgram(t *testing.T) {
 		`WITH RECURSIVE e(m) AS (SELECT 1 WHERE 0), b(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM b, e WHERE k < 5) SELECT count(*) FROM b`,
 		`WITH RECURSIVE n(m) AS (VALUES(1),(2)), e(m) AS (SELECT x FROM t1 WHERE x > 100), b(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM b CROSS JOIN n CROSS JOIN e WHERE k < 5 UNION ALL SELECT k + 2 FROM b CROSS JOIN n WHERE k < 9) SELECT group_concat(k) FROM b`,
 		`WITH RECURSIVE b(k, f) AS (SELECT 1, 0 UNION ALL SELECT k + 1, NOT f FROM b WHERE k < 9) SELECT group_concat(f) FROM b`,
+		// A function computed once per statement keeps a flag register that is
+		// read before it is written: its load is not a constant to hoist.
+		`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 3 AND date('2000-01-01') = '2000-01-01') SELECT group_concat(i) FROM c`,
+		`WITH RECURSIVE c(i, d) AS (SELECT 1, '' UNION ALL SELECT i + 1, date('2000-01-01', '+' || i || ' days') || upper('x') FROM c WHERE i < 4) SELECT group_concat(d) FROM c`,
+		// The self row read straight from the queue: no subtype, no affinity.
+		`WITH RECURSIVE c(i, j) AS (SELECT 1, json('[1]') UNION ALL SELECT i + 1, json_array(j, json(j)) FROM c WHERE i < 4) SELECT group_concat(j, ' | ') FROM c`,
+		`WITH RECURSIVE c(i, s) AS (SELECT 1, '007' UNION ALL SELECT i + 1, s || '' FROM c WHERE i < 3) SELECT group_concat(typeof(s) || s) FROM c`,
+		`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c, t1 WHERE i < 6) SELECT count(*), sum(i) FROM c`,
 		`WITH RECURSIVE c(i, s, r) AS (SELECT 1, '1', 1.0 UNION ALL SELECT i + 1, CAST(i + 1 AS TEXT), CAST(i AS REAL) / 2 FROM c WHERE i < 6) SELECT group_concat(typeof(s) || s || typeof(r) || r) FROM c`,
 		// A step that seeks a CTE by the current row (OpSortedSeek), on one
 		// column and on two -- issue #298's shape.
@@ -116,5 +125,38 @@ func TestRecInlineMatchesTheSubProgram(t *testing.T) {
 	}
 	if want, got := load(false), load(true); got != want {
 		t.Errorf("recursive INSERT:\n inlined     %s\n sub-program %s", got, want)
+	}
+}
+
+// TestRecInlineReadsTheSelfRowDirectly: an inlined step that reads its self
+// reference only by column opens no one-row cursor per popped row; the
+// sub-program it replaces opened one per row.
+func TestRecInlineReadsTheSelfRowDirectly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.musq")
+	buildDB(t, path, `CREATE TABLE t1(x)`, `INSERT INTO t1 VALUES(1),(2)`)
+	opens := func(q string, inline bool) int64 {
+		recInlineOffForTest = !inline
+		defer func() { recInlineOffForTest = false }()
+		n, err := OpenWrite(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer n.Discard()
+		before := recSelfOpens.Load()
+		if _, _, err := n.Query(q, nil); err != nil {
+			t.Fatal(err)
+		}
+		return recSelfOpens.Load() - before
+	}
+	for _, q := range []string{
+		`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 500) SELECT count(*) FROM c`,
+		`WITH RECURSIVE n(m) AS (VALUES(1)), c(i) AS (SELECT 1 UNION ALL SELECT i + m FROM c, n WHERE i < 50) SELECT count(*) FROM c`,
+	} {
+		if got := opens(q, false); got == 0 {
+			t.Errorf("%s: the sub-program opened no self cursor: the counter is not reached", q)
+		}
+		if got := opens(q, true); got != 0 {
+			t.Errorf("%s: the inlined step opened its self cursor %d times", q, got)
+		}
 	}
 }

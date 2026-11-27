@@ -1147,19 +1147,49 @@ func buildPackedSortedVMIdx(x *vmIdx, spec *idxSeekSpec, enc TextEncoding) *vmId
 	}
 	x.tableIndex(mask, len(keys), func(i int) (int, int, int64) { w := where[perm[i]]; return int(w.seg), int(w.r), keys[i] })
 	x.vidx[0].Pack, x.pack = unsafe.Pointer(unsafe.SliceData(pack)), pack
-	// A filter of 16 bits a key: most probes of a join find no row, and
-	// are answered by one bit rather than a search.
-	nbits := uint64(64)
-	for nbits < 16*uint64(x.vidx[0].NVals) && nbits < 1<<32 {
+	// A filter of 32 bits a key, two of them set: most probes of a join find
+	// no row, and are answered by two bits rather than a search. A key's
+	// 512-bit block is its prefix's (filterShift): a join's inner probes share
+	// the outer loops' keys, so they read a few lines of it rather than one
+	// at random each.
+	nbits := uint64(512)
+	for nbits < 32*uint64(x.vidx[0].NVals) && nbits < 1<<32 {
 		nbits <<= 1
 	}
+	shift := filterShift(x.vals[0], pack[len(pack)-2])
 	x.filter = make([]uint64, nbits/64)
 	for _, k := range x.vals[0] {
-		b := jit.VIdxFilterBit(k, nbits-1)
-		x.filter[b/64] |= 1 << (b % 64)
+		b1, b2 := jit.VIdxFilterBits(k, nbits/512, shift)
+		x.filter[b1/64] |= 1 << (b1 % 64)
+		x.filter[b2/64] |= 1 << (b2 % 64)
 	}
-	x.vidx[0].Filter, x.vidx[0].FilterMask = unsafe.Pointer(unsafe.SliceData(x.filter)), nbits-1
+	x.vidx[0].Filter, x.vidx[0].FilterBlocks, x.vidx[0].FilterShift = unsafe.Pointer(unsafe.SliceData(x.filter)), nbits/512, shift
 	return x
+}
+
+// filterShift is the shift that takes sorted packed keys to their prefix,
+// at most width, the last column's: the widest under which no more than a
+// sixteenth of the keys share a prefix with more than 32 others, whose block
+// they would fill. A narrower prefix takes the last column's top bits too,
+// which a join's probes walk in order.
+func filterShift(keys []int64, width int64) int64 {
+	for ; width > 0; width-- {
+		crowded := 0
+		for i := 0; i < len(keys); {
+			e := i + 1
+			for e < len(keys) && keys[e]>>width == keys[i]>>width {
+				e++
+			}
+			if e-i > 32 {
+				crowded += e - i
+			}
+			i = e
+		}
+		if crowded*16 <= len(keys) {
+			break
+		}
+	}
+	return width
 }
 
 // buildSegSortedVMIdx is buildSortedVMIdx as each segment's own index, over

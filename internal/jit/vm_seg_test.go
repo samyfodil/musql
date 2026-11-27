@@ -274,15 +274,16 @@ func TestVMSeekIdxPacked(t *testing.T) {
 		Mask: 7, Count: 1, Lo: 10, Hi: 127, Pack: unsafe.Pointer(&pack[0])}}
 	// The same with a filter of its keys' bits, and with one whose bits are
 	// all clear, which finds none for any key.
-	const fmask = 255
-	fbits, clear := make([]uint64, 4), make([]uint64, 4)
+	const fblocks, fshift = 4, 3
+	fbits, clear := make([]uint64, 32), make([]uint64, 32)
 	for _, k := range pv {
-		b := VIdxFilterBit(k, fmask)
-		fbits[b/64] |= 1 << (b % 64)
+		b1, b2 := VIdxFilterBits(k, fblocks, fshift)
+		fbits[b1/64] |= 1 << (b1 % 64)
+		fbits[b2/64] |= 1 << (b2 % 64)
 	}
 	filtered, cleared := slices.Clone(packed), slices.Clone(packed)
-	filtered[0].Filter, filtered[0].FilterMask = unsafe.Pointer(&fbits[0]), fmask
-	cleared[0].Filter, cleared[0].FilterMask = unsafe.Pointer(&clear[0]), fmask
+	filtered[0].Filter, filtered[0].FilterBlocks, filtered[0].FilterShift = unsafe.Pointer(&fbits[0]), fblocks, fshift
+	cleared[0].Filter, cleared[0].FilterBlocks, cleared[0].FilterShift = unsafe.Pointer(&clear[0]), fblocks, fshift
 	uv, us, ur := []int64{1, 3, 15}, []int32{0, 3, 5, 6}, []int{0, 2, 3, 1, 4, 5}
 	plain := []VIdx{{Vals: unsafe.Pointer(&uv[0]), NVals: 3, Starts: unsafe.Pointer(&us[0]), Rows: unsafe.Pointer(&ur[0]), Seg: unsafe.Pointer(seg),
 		Mask: 7, Count: 1, Lo: 1, Hi: 15}}
@@ -340,6 +341,54 @@ func TestVMSeekIdxPacked(t *testing.T) {
 		cur := &VCursor{Last: -1, Idx: unsafe.Pointer(&c.ix[0])}
 		if pc := runVMCursor(t, prog, regs, nil, cur, 0); pc != c.pc || pc == 5 && cur.State != 3 {
 			t.Fatalf("keys %+v %+v, packed %v: pc %d state %d, want pc %d", c.a, c.b, c.ix[0].Pack != nil, pc, cur.State, c.pc)
+		}
+	}
+}
+
+// TestVMSeekIdxFilterGeometry: native code tests a packed key's two filter
+// bits where VIdxFilterBits puts them, for every block count and prefix
+// shift: with only one key's bits set, that key is found and keys whose bits
+// are clear are not.
+func TestVMSeekIdxFilterGeometry(t *testing.T) {
+	if !Available || !VMSegCursor {
+		t.Skip("no segment cursors on this platform")
+	}
+	noGC(t)
+	as := []uint64{1, 3, 1, 1, 3, 15}
+	bs := []uint64{2, 1, 2, 5, 1, 7}
+	vs := []uint64{100, 101, 102, 103, 104, 105}
+	cols := []VSegCol{{Kind: VSegInt, Block: unsafe.Pointer(&as[0])}, {Kind: VSegInt, Block: unsafe.Pointer(&bs[0])},
+		{Kind: VSegInt, Block: unsafe.Pointer(&vs[0])}}
+	seg := &VSeg{Cols: unsafe.Pointer(&cols[0]), First: 1, Dense: 1}
+	pack := []int64{16, 3, 8}
+	pv, ps, pr := []int64{10, 13, 25, 127}, []int32{0, 2, 3, 5, 6}, []int{0, 2, 3, 1, 4, 5}
+	prog := []VInsn{
+		{Op: VSeekIdx, A: 0, B: 0, More: []int{1}, T: 5},
+		{Op: VSeekRewind, A: 0},
+		{Op: VColumn, A: 0, B: 2, C: 2, Imm: 1},
+		{Op: VNext, A: 0, T: 2},
+		{Op: VExit},
+		{Op: VExit},
+	}
+	for _, g := range []struct{ blocks, shift int64 }{{1, 0}, {1, 3}, {2, 0}, {4, 3}, {8, 1}, {64, 2}, {1 << 10, 3}} {
+		for _, only := range pv {
+			bits := make([]uint64, 8*g.blocks)
+			b1, b2 := VIdxFilterBits(only, uint64(g.blocks), g.shift)
+			bits[b1/64] |= 1 << (b1 % 64)
+			bits[b2/64] |= 1 << (b2 % 64)
+			ix := []VIdx{{Vals: unsafe.Pointer(&pv[0]), NVals: 4, Starts: unsafe.Pointer(&ps[0]), Rows: unsafe.Pointer(&pr[0]), Seg: unsafe.Pointer(seg),
+				Mask: 7, Count: 1, Lo: 10, Hi: 127, Pack: unsafe.Pointer(&pack[0]),
+				Filter: unsafe.Pointer(&bits[0]), FilterBlocks: uint64(g.blocks), FilterShift: g.shift}}
+			for _, k := range pv {
+				c1, c2 := VIdxFilterBits(k, uint64(g.blocks), g.shift)
+				passes := bits[c1/64]&(1<<(c1%64)) != 0 && bits[c2/64]&(1<<(c2%64)) != 0
+				regs := []tvalue{{Typ: tvInt, I: k >> 3}, {Typ: tvInt, I: k & 7}, {Typ: tvInt, I: -1}}
+				cur := &VCursor{Last: -1, Idx: unsafe.Pointer(&ix[0])}
+				pc := runVMCursor(t, prog, regs, nil, cur, 0)
+				if found := pc == 4; found != passes || k == only && !found {
+					t.Fatalf("blocks %d shift %d, bits of %d only: key %d found %v, Go filter passes %v", g.blocks, g.shift, only, k, found, passes)
+				}
+			}
 		}
 	}
 }
