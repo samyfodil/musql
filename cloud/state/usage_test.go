@@ -32,7 +32,7 @@ func TestUsageAndSnapshots(t *testing.T) {
 	hour := time.Date(2026, 10, 1, 13, 0, 0, 0, time.UTC)
 	add := func(stmts int64, us int64) {
 		t.Helper()
-		h := &UsageHour{DBID: "d1", OrgID: "o1", Hour: hour, Statements: stmts, RowsRead: 2 * stmts, BytesStored: stmts * 100}
+		h := &UsageHour{DBID: "d1", OrgID: "o1", Hour: hour, Statements: stmts, RowsRead: 2 * stmts, BytesStored: stmts * 100, BytesServed: stmts * 10}
 		for range stmts {
 			h.Latency.Add(us)
 		}
@@ -48,7 +48,7 @@ func TestUsageAndSnapshots(t *testing.T) {
 		t.Fatalf("%v %v", hs, err)
 	}
 	h := hs[0]
-	if h.Statements != 4 || h.RowsRead != 8 || h.BytesStored != 300 || !h.Hour.Equal(hour) {
+	if h.Statements != 4 || h.RowsRead != 8 || h.BytesStored != 300 || h.BytesServed != 40 || !h.Hour.Equal(hour) {
 		t.Fatalf("%+v", h)
 	}
 	if p50, p95 := h.Latency.Quantile(0.5), h.Latency.Quantile(0.95); p50 > 1.2 || p95 < 90 {

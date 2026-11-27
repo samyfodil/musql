@@ -118,14 +118,14 @@ func TestClusterStateUsageIsPerNode(t *testing.T) {
 	b := openClusterState(t, net, "b")
 	hour := time.Unix(3600*1000, 0).UTC()
 	for _, s := range []*Store{a, b} {
-		if err := s.AddUsage(ctx, []*UsageHour{{DBID: "d", OrgID: "o", Hour: hour, Statements: 3}}, []*QueryUsage{{DBID: "d", Hour: hour, SQL: "SELECT ?", Count: 2}}); err != nil {
+		if err := s.AddUsage(ctx, []*UsageHour{{DBID: "d", OrgID: "o", Hour: hour, Statements: 3, BytesServed: 5}}, []*QueryUsage{{DBID: "d", Hour: hour, SQL: "SELECT ?", Count: 2}}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	eventually(t, "both nodes' usage summed", func() bool {
 		for _, s := range []*Store{a, b} {
 			h, err := s.UsageHours(ctx, "o", "", hour, hour.Add(time.Hour))
-			if err != nil || len(h) != 1 || h[0].Statements != 6 {
+			if err != nil || len(h) != 1 || h[0].Statements != 6 || h[0].BytesServed != 10 {
 				return false
 			}
 			q, err := s.TopQueries(ctx, "d", hour, hour.Add(time.Hour), 10)

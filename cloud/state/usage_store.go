@@ -13,11 +13,12 @@ type usageSQL struct{ latency, hour, query string }
 
 var standaloneUsage = usageSQL{
 	latency: `SELECT latency FROM usage_hours WHERE ?1 = '' AND db_id = ?2 AND hour = ?3`,
-	hour: `INSERT INTO usage_hours (db_id, org_id, hour, statements, rows_read, rows_written, errors, bytes_stored, latency)
-		SELECT ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10 WHERE ?1 = ''
+	hour: `INSERT INTO usage_hours (db_id, org_id, hour, statements, rows_read, rows_written, errors, bytes_stored, bytes_served, latency)
+		SELECT ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11 WHERE ?1 = ''
 		ON CONFLICT (db_id, hour) DO UPDATE SET statements = statements + excluded.statements,
 			rows_read = rows_read + excluded.rows_read, rows_written = rows_written + excluded.rows_written,
 			errors = errors + excluded.errors, bytes_stored = max(bytes_stored, excluded.bytes_stored),
+			bytes_served = bytes_served + excluded.bytes_served,
 			latency = excluded.latency`,
 	query: `INSERT INTO usage_queries (db_id, hour, sql, count, total_us, rows_read, rows_written)
 		SELECT ?2, ?3, ?4, ?5, ?6, ?7, ?8 WHERE ?1 = ''
@@ -27,11 +28,12 @@ var standaloneUsage = usageSQL{
 
 var nodeUsage = usageSQL{
 	latency: `SELECT latency FROM node_usage_hours WHERE node = ?1 AND db_id = ?2 AND hour = ?3`,
-	hour: `INSERT INTO node_usage_hours (node, db_id, org_id, hour, statements, rows_read, rows_written, errors, bytes_stored, latency)
-		VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+	hour: `INSERT INTO node_usage_hours (node, db_id, org_id, hour, statements, rows_read, rows_written, errors, bytes_stored, bytes_served, latency)
+		VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
 		ON CONFLICT (node, db_id, hour) DO UPDATE SET statements = statements + excluded.statements,
 			rows_read = rows_read + excluded.rows_read, rows_written = rows_written + excluded.rows_written,
 			errors = errors + excluded.errors, bytes_stored = max(bytes_stored, excluded.bytes_stored),
+			bytes_served = bytes_served + excluded.bytes_served,
 			latency = excluded.latency`,
 	query: `INSERT INTO node_usage_queries (node, db_id, hour, sql, count, total_us, rows_read, rows_written)
 		VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -40,7 +42,7 @@ var nodeUsage = usageSQL{
 }
 
 // AddUsage adds counts to what is kept, in one transaction. Bytes stored is
-// the largest size seen in the hour.
+// the largest size seen in the hour; every other count is summed.
 func (s *Store) AddUsage(ctx context.Context, hours []*UsageHour, queries []*QueryUsage) error {
 	q := standaloneUsage
 	if s.node != "" {
@@ -60,7 +62,7 @@ func (s *Store) AddUsage(ctx context.Context, hours []*UsageHour, queries []*Que
 				return err
 			}
 			if _, err := tx.ExecContext(ctx, q.hour, s.node, h.DBID, h.OrgID, h.Hour.Unix(), h.Statements, h.RowsRead, h.RowsWritten,
-				h.Errors, h.BytesStored, merged.marshal()); err != nil {
+				h.Errors, h.BytesStored, h.BytesServed, merged.marshal()); err != nil {
 				return err
 			}
 		}
@@ -76,9 +78,9 @@ func (s *Store) AddUsage(ctx context.Context, hours []*UsageHour, queries []*Que
 // UsageHours lists the hours in [from, to) of one database, or of every
 // database of an org when dbID is empty, by hour: every node's counts summed.
 func (s *Store) UsageHours(ctx context.Context, orgID, dbID string, from, to time.Time) ([]*UsageHour, error) {
-	rows, err := s.q().QueryContext(ctx, `SELECT db_id, org_id, hour, statements, rows_read, rows_written, errors, bytes_stored, latency
+	rows, err := s.q().QueryContext(ctx, `SELECT db_id, org_id, hour, statements, rows_read, rows_written, errors, bytes_stored, bytes_served, latency
 		FROM usage_hours WHERE org_id = ?1 AND (?2 = '' OR db_id = ?2) AND hour >= ?3 AND hour < ?4
-		UNION ALL SELECT db_id, org_id, hour, statements, rows_read, rows_written, errors, bytes_stored, latency
+		UNION ALL SELECT db_id, org_id, hour, statements, rows_read, rows_written, errors, bytes_stored, bytes_served, latency
 		FROM node_usage_hours WHERE org_id = ?1 AND (?2 = '' OR db_id = ?2) AND hour >= ?3 AND hour < ?4
 		ORDER BY hour, db_id`,
 		orgID, dbID, from.Unix(), to.Unix())
@@ -91,7 +93,7 @@ func (s *Store) UsageHours(ctx context.Context, orgID, dbID string, from, to tim
 		var h UsageHour
 		var hour int64
 		var lat string
-		if err := rows.Scan(&h.DBID, &h.OrgID, &hour, &h.Statements, &h.RowsRead, &h.RowsWritten, &h.Errors, &h.BytesStored, &lat); err != nil {
+		if err := rows.Scan(&h.DBID, &h.OrgID, &hour, &h.Statements, &h.RowsRead, &h.RowsWritten, &h.Errors, &h.BytesStored, &h.BytesServed, &lat); err != nil {
 			return nil, err
 		}
 		if err := h.Latency.unmarshal(lat); err != nil {
@@ -105,6 +107,7 @@ func (s *Store) UsageHours(ctx context.Context, orgID, dbID string, from, to tim
 			p.RowsWritten += h.RowsWritten
 			p.Errors += h.Errors
 			p.BytesStored = max(p.BytesStored, h.BytesStored)
+			p.BytesServed += h.BytesServed
 			p.Latency.Merge(&h.Latency)
 			continue
 		}

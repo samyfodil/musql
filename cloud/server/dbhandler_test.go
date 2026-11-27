@@ -120,3 +120,50 @@ func TestDatabaseHandler(t *testing.T) {
 		t.Errorf("dir left after the database's files: %v", err)
 	}
 }
+
+// TestDatabaseHandlerBytesServed: the response body bytes a database handler
+// writes count in the database's usage; a refused request's and a HEAD's do
+// not.
+func TestDatabaseHandlerBytesServed(t *testing.T) {
+	const n = 3000
+	e := newEnv(t, "", WithDatabaseHandler("GET /blob", func(DatabaseRequest) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			io.WriteString(w, strings.Repeat("a", 1000))
+			if err := http.NewResponseController(w).Flush(); err != nil {
+				t.Errorf("flush: %v", err)
+			}
+			io.Copy(w, strings.NewReader(strings.Repeat("b", n-1000)))
+		})
+	}))
+	e.setup()
+	ctx := context.Background()
+	_, _, dbs := e.clients()
+	tok := must(dbs.CreateToken(ctx, auth(e.admin, &v1.CreateTokenRequest{Org: "acme", Name: "app"}))).Msg.Token
+	for _, c := range []struct {
+		method, tok string
+		status      int
+	}{{"GET", tok, 200}, {"GET", "nope", 401}, {"HEAD", tok, 200}} {
+		req, err := http.NewRequest(c.method, e.ts.URL+"/db/acme/app/blob", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+c.tok)
+		resp, err := e.ts.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil || resp.StatusCode != c.status || c.status == 200 && c.method == "GET" && len(b) != n {
+			t.Fatalf("%s %s: %d, %d bytes, %v", c.method, c.tok, resp.StatusCode, len(b), err)
+		}
+	}
+	u := must(dbs.Usage(ctx, auth(e.admin, &v1.UsageRequest{Org: "acme", Name: "app"}))).Msg
+	if len(u.Points) != 1 || u.Points[0].BytesServed != n {
+		t.Fatalf("usage %+v", u.Points)
+	}
+	org := must(dbs.Usage(ctx, auth(e.admin, &v1.UsageRequest{Org: "acme"}))).Msg
+	if len(org.Points) != 1 || org.Points[0].BytesServed != n {
+		t.Fatalf("org usage %+v", org.Points)
+	}
+}

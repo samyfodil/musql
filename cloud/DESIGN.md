@@ -501,10 +501,13 @@ database holding what a cluster refuses joining one.
 
 ## Usage analytics
 
-Per database, per hour (per node, summed when read): rows read, rows written, statements, errors, bytes
-stored, p50/p95 latency; per org totals. Counted at the Hrana layer and kept
-in state. The API returns series; the console charts them. Top queries:
-normalized statement text with counts and total time.
+Per database, per hour (per node, summed when read): rows read, rows
+written, statements, errors, bytes stored, bytes served, p50/p95 latency; per
+org totals. Counted at the Hrana layer and kept in state, except bytes
+served: the response body bytes `WithDatabaseHandler` handlers wrote, counted
+around the handler in `serveDBHandler`, so a consumer can bill what its
+handlers send (libSQL sync, say). The API returns series; the console charts
+them. Top queries: normalized statement text with counts and total time.
 
 Each node counts what it serves in memory and writes it to the state every
 minute. A usage or stats read first writes this node's counts and has every

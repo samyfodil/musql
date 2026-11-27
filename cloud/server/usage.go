@@ -15,9 +15,10 @@ import (
 	"github.com/samyfodil/musql/cloud/state"
 )
 
-// meter counts Hrana statements per database per hour in memory and writes
-// them to the state in batches (flush), so a statement costs a few counter
-// bumps under one database's lock, never a write.
+// meter counts Hrana statements, and the bytes database handlers serve, per
+// database per hour in memory and writes them to the state in batches
+// (flush), so a statement costs a few counter bumps under one database's
+// lock, never a write.
 type meter struct {
 	store *state.Store
 	size  func(dbID string) int64
@@ -97,26 +98,48 @@ func (s *Server) serveFlushUsage(w http.ResponseWriter, r *http.Request) {
 
 // observer is the hrana.WithObserver callback for one database.
 func (m *meter) observer(dbID, orgID string) func(hrana.Stmt) {
+	dm := m.db(dbID, orgID)
+	return func(st hrana.Stmt) { dm.add(m.normalize(st.SQL), st) }
+}
+
+// served counts n response bytes a database handler sent.
+func (m *meter) served(dbID, orgID string, n int64) {
+	if n == 0 {
+		return
+	}
+	dm := m.db(dbID, orgID)
+	dm.mu.Lock()
+	dm.hour().h.BytesServed += n
+	dm.mu.Unlock()
+}
+
+func (m *meter) db(dbID, orgID string) *dbMeter {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	dm, ok := m.dbs[dbID]
 	if !ok {
 		dm = &dbMeter{dbID: dbID, orgID: orgID, hours: map[int64]*hourMeter{}}
 		m.dbs[dbID] = dm
 	}
-	m.mu.Unlock()
-	return func(st hrana.Stmt) { dm.add(m.normalize(st.SQL), st) }
+	return dm
 }
 
-func (dm *dbMeter) add(q string, st hrana.Stmt) {
+// hour is the current hour's counts, made if new. dm.mu is held.
+func (dm *dbMeter) hour() *hourMeter {
 	hour := time.Now().Unix() / 3600 * 3600
-	us := st.Duration.Microseconds()
-	dm.mu.Lock()
-	defer dm.mu.Unlock()
 	hm, ok := dm.hours[hour]
 	if !ok {
 		hm = &hourMeter{h: state.UsageHour{DBID: dm.dbID, OrgID: dm.orgID, Hour: time.Unix(hour, 0).UTC()}, queries: map[string]*state.QueryUsage{}}
 		dm.hours[hour] = hm
 	}
+	return hm
+}
+
+func (dm *dbMeter) add(q string, st hrana.Stmt) {
+	us := st.Duration.Microseconds()
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	hm := dm.hour()
 	hm.h.Statements++
 	hm.h.RowsRead += st.RowsRead
 	hm.h.RowsWritten += st.RowsWritten

@@ -367,6 +367,9 @@ var migrations = []string{
 	// removed: it is never restored, even if the retention grows.
 	`ALTER TABLE deleted_databases ADD COLUMN expired INTEGER NOT NULL DEFAULT 0;
 	ALTER TABLE deleted_groups ADD COLUMN expired INTEGER NOT NULL DEFAULT 0;`,
+	// The response bytes database handlers sent.
+	`ALTER TABLE usage_hours ADD COLUMN bytes_served INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE node_usage_hours ADD COLUMN bytes_served INTEGER NOT NULL DEFAULT 0;`,
 }
 
 func (s *Store) migrate() error {
