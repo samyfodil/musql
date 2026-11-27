@@ -9,6 +9,22 @@ name: release
 # musql cloud is built with -tags jitllm, the embedded AI, on all six targets
 # (it cross-compiles with CGO_ENABLED=0 on each), and ships the console, which
 # its own job builds once for every archive.
+#
+# The Go modules a consumer depends on (the root, cloud, hrana and
+# examples/libp2p) are released together: the modules job checks that they
+# require one another at the tag's version, tags cloud/, hrana/ and
+# examples/libp2p/ at the same commit, and every other job waits for it.
+#
+# To release vX.Y.Z:
+#
+#	scripts/release-modules vX.Y.Z   # on main: every go.mod requires vX.Y.Z
+#	git commit -am "go.mod: require the modules at vX.Y.Z"
+#	git push origin main
+#	git tag vX.Y.Z && git push origin vX.Y.Z
+#
+# Only push the root tag; the workflow pushes the others. When the requires do
+# not match, the modules job fails and nothing is published: delete the tag
+# (git push origin :vX.Y.Z), commit the bump, and tag again.
 
 on:
   push:
@@ -19,7 +35,29 @@ permissions:
   packages: write
 
 jobs:
+  modules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: requires match the tag
+        run: |
+          scripts/release-modules "$GITHUB_REF_NAME"
+          git diff --exit-code
+      - name: tag the modules
+        run: |
+          set -euo pipefail
+          tags=()
+          for m in cloud hrana examples/libp2p; do
+            git tag "$m/$GITHUB_REF_NAME" "$GITHUB_SHA"
+            tags+=("$m/$GITHUB_REF_NAME")
+          done
+          git push origin "${tags[@]}"
+
   build:
+    needs: modules
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -64,6 +102,7 @@ jobs:
   # The console (cloud/console), built once for the six cloud archives. It
   # imports the npm package, so the package's wasm module is built first.
   console:
+    needs: modules
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -164,6 +203,7 @@ jobs:
         run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
 
   image:
+    needs: modules
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -185,6 +225,7 @@ jobs:
   # musql cloud as an image of its own (cloud/Dockerfile): the server with the
   # embedded AI, and the console, which the Dockerfile builds itself.
   image-cloud:
+    needs: modules
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -213,6 +254,7 @@ jobs:
   # its publisher, and the job's OIDC token (id-token: write) stands in for an
   # npm token. That needs npm 11.5.1 or later.
   npm:
+    needs: modules
     runs-on: ubuntu-latest
     permissions:
       contents: read

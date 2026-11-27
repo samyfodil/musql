@@ -217,6 +217,17 @@ The server the provider is bound to:
 | `reload()` | Reads the user and orgs again, after creating or leaving one. |
 | `server` | The server's origin. |
 
+Two more from the package's entry, for an app with ConnectRPC services of
+its own on the same server:
+
+- `transport`: the transport the console's clients call over, the
+  provider's server with the session's bearer token:
+  `createClient(BillingService, transport)`. It is a live binding that the
+  provider sets, `null` without a server, so read it when making the client,
+  not at import.
+- `roleName(role)`: a `Role`'s name, `"viewer"`, `"member"`, `"admin"` or
+  `"owner"`, and `"none"` for any other.
+
 ### The database editor
 
 - `DatabaseWorkspace({ org, database })`: what opening a cloud database

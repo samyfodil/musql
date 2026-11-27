@@ -7,6 +7,7 @@ export { useConsole } from "./slots.js";
 // The pieces it is built from, for an app that is its own shell.
 export { ConsoleProvider } from "./provider.jsx";
 export { useCloud } from "./cloud/useCloud.js";
+export { roleName, transport } from "./cloud/api.js";
 export { useTheme } from "./theme.jsx";
 export { DatabaseProvider, DatabaseWorkspace, Diagram, QueryView, useDatabase } from "./workspace/DatabaseWorkspace.jsx";
 export { default as TableView } from "./components/TableView.jsx";
