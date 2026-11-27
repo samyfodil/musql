@@ -592,18 +592,29 @@ type VIdx struct {
 	// limit, which is 1 << width; the packed key is each width's shift of
 	// the key before and the next ORed in.
 	Pack unsafe.Pointer
-	// Filter, when not nil, has a packed index's bit VIdxFilterBit set for
-	// each of its keys (uint64 words), FilterMask the bits' mask: a key
-	// whose bit is clear has no row.
-	Filter     unsafe.Pointer
-	FilterMask uint64
+	// Filter, when not nil, has a packed index's bits VIdxFilterBits set
+	// for each of its keys (uint64 words): a key with either clear has no row.
+	// It is FilterBlocks blocks of 512 bits; a key's block is its prefix's,
+	// the key shifted right by FilterShift, so a join's probes that share a
+	// prefix read one cache line however large the filter.
+	Filter       unsafe.Pointer
+	FilterBlocks uint64
+	FilterShift  int64
 }
 
-// VIdxFilterMul is the multiplier of VIdxFilterBit's hash.
-const VIdxFilterMul = 0x9E3779B97F4A7C15
+// VIdxFilterMul and VIdxFilterMul2 are the multipliers of VIdxFilterBits'
+// two hashes, the block's and the bits' in it.
+const (
+	VIdxFilterMul  = 0x9E3779B97F4A7C15
+	VIdxFilterMul2 = 0xC2B2AE3D27D4EB4F
+)
 
-// VIdxFilterBit is packed key k's bit in a VIdx's Filter.
-func VIdxFilterBit(k int64, mask uint64) uint64 { return uint64(k) * VIdxFilterMul >> 32 & mask }
+// VIdxFilterBits are packed key k's two bits in a VIdx's Filter, both in
+// one block.
+func VIdxFilterBits(k int64, blocks uint64, shift int64) (uint64, uint64) {
+	b, h := (uint64(k>>shift)*VIdxFilterMul>>32*blocks>>32)<<9, uint64(k)*VIdxFilterMul2
+	return b | h>>55, b | h>>46&511
+}
 
 // VTab is the segments of a table, in the order the engine searches them.
 type VTab struct {
@@ -699,8 +710,9 @@ const (
 	VIdxOffSegs     = 72
 	VIdxOffPack     = 80
 	VIdxOffFilter   = 88
-	VIdxOffFMask    = 96
-	VIdxSize        = 104
+	VIdxOffFBlocks  = 96
+	VIdxOffFShift   = 104
+	VIdxSize        = 112
 	VTabOffSegs     = 0
 	VTabOffN        = 8
 	VTabSegSize     = 40

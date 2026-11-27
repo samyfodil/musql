@@ -79,3 +79,32 @@ func TestVMJITPackedSortedSeek(t *testing.T) {
 		}
 	}
 }
+
+// TestFilterShiftNarrowsACrowdedPrefix: a packed index's filter blocks follow
+// the key's prefix, all but its last column, unless one prefix holds so many
+// keys that its block would fill; then the prefix takes the last column's top
+// bits too, until no run is longer than a block holds.
+func TestFilterShiftNarrowsACrowdedPrefix(t *testing.T) {
+	keys := func(prefixes int64, crowded int) []int64 {
+		var out []int64
+		for p := range prefixes {
+			n := 4
+			if p == 2 {
+				n = crowded
+			}
+			for i := range int64(n) {
+				out = append(out, p<<20|i)
+			}
+		}
+		return out
+	}
+	if got := filterShift(keys(6, 4), 20); got != 20 {
+		t.Errorf("even prefixes: shift %d, want the last column's width 20", got)
+	}
+	if got := filterShift(keys(6, 1000), 20); got != 5 {
+		t.Errorf("one prefix of 1000 keys: shift %d, want 5, runs of 32", got)
+	}
+	if got := filterShift(keys(200, 40), 20); got != 20 {
+		t.Errorf("one prefix of 40 keys among 840: shift %d, want 20", got)
+	}
+}
