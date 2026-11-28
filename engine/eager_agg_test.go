@@ -85,6 +85,43 @@ var eagerAggRefused = []string{
 	`SELECT d.g, count(*) AS n FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g HAVING nope > 1`,
 }
 
+// TestEagerAggregateStat1: ANALYZE's rows per key decide the fan-out where an
+// index on the key has them: facts as large against the dim as fa and fb, but
+// with a key each row of its own, are left to the join.
+func TestEagerAggregateStat1(t *testing.T) {
+	schema := []string{
+		`CREATE TABLE ua(k INTEGER, x INTEGER)`,
+		`INSERT INTO ua SELECT value, value % 9 FROM generate_series(1, 2000)`,
+		`CREATE INDEX ua_k ON ua(k)`,
+		`CREATE TABLE ub(k INTEGER, y INTEGER)`,
+		`INSERT INTO ub SELECT value, value % 5 FROM generate_series(1, 2000)`,
+		`CREATE INDEX ub_k ON ub(k)`,
+		`CREATE TABLE d(k INTEGER, g TEXT)`,
+		`INSERT INTO d SELECT value * 30, 'g' || (value % 3) FROM generate_series(1, 60)`,
+	}
+	q := `SELECT d.g, count(*), max(b.y) FROM ua a JOIN d USING (k) JOIN ub b USING (k) GROUP BY d.g`
+	for _, analyzed := range []bool{false, true} {
+		path := filepath.Join(t.TempDir(), "s.musq")
+		if analyzed {
+			buildDB(t, path, append(schema, `ANALYZE`)...)
+		} else {
+			buildDB(t, path, schema...)
+		}
+		p, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stmt, err := parseSelectStatement(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := p.eagerAggregate(stmt) != nil; got == analyzed {
+			t.Errorf("analyzed=%v: rewritten %v", analyzed, got)
+		}
+		p.Close()
+	}
+}
+
 // TestEagerAggregate: #400. A fanning-out join under count/min/max is joined
 // per key (eager_agg.go) and answers as the join itself does; the shapes it
 // must refuse keep the join. The reference for a served one is the same query with fb read

@@ -44,10 +44,10 @@ import (
 // every other comparison converts the group's values alike.
 //
 // The rewrite fires only where it pays: at least two facts each with at least
-// eagerAggMinFanout rows per key, estimated as the table's rows over the
-// smallest kept table's. A filter on a kept table with an index the facts could
-// be seeked through is a selective star join, whose nested loop reads only
-// what matches, and is left alone.
+// eagerAggMinFanout rows per key: what ANALYZE measured through an index on the
+// key, or else the table's rows over the smallest kept table's. A filter on a
+// kept table with an index the facts could be seeked through is a selective
+// star join, whose nested loop reads only what matches, and is left alone.
 //
 // Like countCrossJoin, only for a statement with no enclosing query (a
 // top-level one, or a subquery body compileSubProgram reaches without an outer
@@ -512,7 +512,14 @@ func (ea *eaState) choose() bool {
 	}
 	facts := 0
 	for i, t := range ea.tabs {
-		if ea.candidate(t) && rows[i] >= eagerAggMinFanout*kept {
+		if !ea.candidate(t) {
+			continue
+		}
+		fans := rows[i] >= eagerAggMinFanout*kept
+		if m, ok := ea.statFanout(t); ok {
+			fans = m >= eagerAggMinFanout
+		}
+		if fans {
 			t.pre = true
 			facts++
 		}
@@ -545,6 +552,31 @@ func (ea *eaState) choose() bool {
 		}
 	}
 	return true
+}
+
+// statFanout returns the rows per key ANALYZE measured for t's key, from an
+// index that leads with it.
+func (ea *eaState) statFanout(t *eaTable) (uint64, bool) {
+	st := wherePlanStat1For(ea.p, t.rt)
+	if st == nil {
+		return 0, false
+	}
+	cands, err := ea.p.secondaryIndexSeekCandidates(t.it.Table, t.rt.root, t.rt.cols)
+	if err != nil {
+		return 0, false
+	}
+	for _, c := range cands {
+		is := st.indexes[r33sFoldIdent(c.name)]
+		if c.leadingCol != t.key || is == nil || !is.hasStat1 || len(is.decodes) == 0 {
+			continue
+		}
+		var a [2]logEst
+		for _, z := range is.decodes {
+			decodeStat1(z, 2, a[:])
+		}
+		return logEstToInt(a[1]), true
+	}
+	return 0, false
 }
 
 // candidate reports a table that could be pre-aggregated: reached through one
