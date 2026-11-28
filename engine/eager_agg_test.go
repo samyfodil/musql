@@ -43,7 +43,7 @@ var eagerAggSchema = []string{
 
 var eagerAggServed = []string{
 	`SELECT d.g, count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
-	`SELECT d.g, count(*) AS n, count(a.x), count(b.t), max(b.t), min(b.t), max(a.x), min(a.x), min(d.h), count(d.h) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
+	`SELECT d.g, count(*) AS n, count(a.x), count(b.t), max(b.t), min(b.t), max(a.x), min(a.x), max(b.y), min(b.y), max(a.r), min(d.h), count(d.h) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
 	`SELECT d.h, count(*), max(a.x) FROM fa a, d, fb b WHERE a.k = d.k AND b.k = d.k AND a.x > 5 AND b.y < 30 GROUP BY d.h HAVING count(*) > 10 ORDER BY 2 DESC, 1`,
 	`SELECT d.g, d.h, count(*) c FROM d JOIN fa a ON a.k = d.k JOIN fb b ON b.k = a.k GROUP BY d.g, d.h ORDER BY c DESC, d.g, d.h LIMIT 5 OFFSET 2`,
 	`SELECT dt.g, count(*), max(b.t) FROM fa a JOIN dt USING (k) JOIN fb b USING (k) GROUP BY dt.g`,
@@ -60,7 +60,6 @@ var eagerAggServed = []string{
 }
 
 var eagerAggRefused = []string{
-	`SELECT d.g, max(b.y), min(b.y) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
 	`SELECT d.g, max(a.s), min(a.s), max(a.r) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
 	`SELECT d.g, count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g, a.s`,
 	`SELECT d.h, d.g, count(*) FROM fa JOIN d ON fa.k = d.k JOIN fb ON fb.k = fa.k GROUP BY d.g`,
@@ -175,15 +174,16 @@ func TestEagerAggregate(t *testing.T) {
 // TestEagerAggregateCollation: min/max and a group's key take one of the
 // group's equal values, and which one depends on the order rows arrive in. The
 // per-key join's is not C's, so a column whose equal values may differ in bytes
-// (texts under NOCASE or RTRIM, 5 and 5.0, the integer and the REAL -2^63) is
-// not rewritten, and answers as written. An INTEGER column is.
+// (texts under NOCASE or RTRIM, 5 and 5.0, the integer and the REAL -2^63,
+// 0.0 and -0.0) is not rewritten, and answers as written. An INTEGER column
+// is, and so is a REAL one without -0.0.
 func TestEagerAggregateCollation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "c.musq")
 	buildDB(t, path,
 		`CREATE TABLE d(k INTEGER, g TEXT, n)`,
 		`INSERT INTO d SELECT value, 'g' || (value % 3), CASE WHEN value % 2 THEN 1 ELSE 1.0 END FROM generate_series(0, 19)`,
-		`CREATE TABLE fa(k INTEGER, x INTEGER, s TEXT COLLATE NOCASE, u TEXT COLLATE RTRIM, v, i INTEGER)`,
-		`INSERT INTO fa SELECT value % 20, value, CASE WHEN value % 20 < 7 THEN 'a' ELSE 'B' END, CASE WHEN value % 3 = 0 THEN 'b ' ELSE 'b' END, CASE WHEN value % 3 THEN 5 ELSE 5.0 END, CASE WHEN value % 3 THEN -9223372036854775808 ELSE -9223372036854775808.0 END FROM generate_series(0, 399)`,
+		`CREATE TABLE fa(k INTEGER, x INTEGER, s TEXT COLLATE NOCASE, u TEXT COLLATE RTRIM, v, i INTEGER, w, z REAL)`,
+		`INSERT INTO fa SELECT value % 20, value, CASE WHEN value % 20 < 7 THEN 'a' ELSE 'B' END, CASE WHEN value % 3 = 0 THEN 'b ' ELSE 'b' END, CASE WHEN value % 3 THEN 5 ELSE 5.0 END, CASE WHEN value % 3 THEN -9223372036854775808 ELSE -9223372036854775808.0 END, CASE WHEN value % 3 THEN 0.0 ELSE -0.0 END, (value % 7) / 2.0 - 1 FROM generate_series(0, 399)`,
 		`CREATE TABLE fm(k INTEGER, s TEXT COLLATE NOCASE)`,
 		`INSERT INTO fm SELECT value % 20, char(CASE value % 3 WHEN 0 THEN 97 WHEN 1 THEN 65 ELSE 98 END) FROM generate_series(0, 399)`,
 		`CREATE TABLE fb(k INTEGER, y)`,
@@ -206,12 +206,14 @@ func TestEagerAggregateCollation(t *testing.T) {
 		`SELECT d.g, min(a.i), typeof(min(a.i)) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
 		`SELECT d.n, count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.n`,
 		`SELECT d.k, min(a.x), max(a.x) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.k`,
+		`SELECT d.g, max(a.w), min(a.w) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.g`,
+		`SELECT d.k, min(a.z), max(a.z), count(*) FROM fa a JOIN d USING (k) JOIN fb b USING (k) GROUP BY d.k`,
 	} {
 		stmt, err := parseSelectStatement(q)
 		if err != nil {
 			t.Fatalf("%s: %v", q, err)
 		}
-		tieFree := strings.Contains(q, "a.x")
+		tieFree := strings.Contains(q, "a.x") || strings.Contains(q, "a.z")
 		if rewritten := p.eagerAggregate(stmt) != nil; rewritten != tieFree {
 			t.Errorf("%s: rewritten %v", q, rewritten)
 		}

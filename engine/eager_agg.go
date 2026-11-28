@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/bits"
+	"slices"
 	"strings"
 )
 
@@ -675,10 +676,11 @@ func (ea *eaState) candidate(t *eaTable) bool {
 
 // tieFree reports that no two of the values t holds in col compare equal with
 // different bytes: col is BINARY, each segment stores it as a block of
-// INTEGERs, TEXTs or BLOBs with no exception and no short row, and neither the
-// delta log nor a write session's rows add one. A group's key and its min and max are then the same value
-// from whichever of its equal rows the per-key join reaches first, where C's
-// pick from its own join order (1 or 1.0, 'a' or 'A').
+// INTEGERs, REALs other than -0.0, TEXTs or BLOBs with no exception and no
+// short row, and neither the delta log nor a write session's rows add one. A
+// group's key and its min and max are then the same value from whichever of
+// its equal rows the per-key join reaches first, where C's pick from its own
+// join order (1 or 1.0, 0.0 or -0.0, 'a' or 'A').
 func (ea *eaState) tieFree(t *eaTable, col int) bool {
 	if col == t.rt.ipkIndex {
 		return true
@@ -694,7 +696,14 @@ func (ea *eaState) tieFree(t *eaTable, col int) bool {
 		if !s.fullWidth || col >= len(s.cols) || s.hasException(col) {
 			return false
 		}
-		if ph := s.cols[col].phys; ph != PhysNull && ph != PhysInt64 && ph != PhysText && ph != PhysBlob {
+		switch s.cols[col].phys {
+		case PhysNull, PhysInt64, PhysText, PhysBlob:
+		case PhysFloat64:
+			f, ok := s.float64Block(col)
+			if !ok || slices.ContainsFunc(f, func(v float64) bool { return v == 0 && math.Signbit(v) }) {
+				return false
+			}
+		default:
 			return false
 		}
 	}
