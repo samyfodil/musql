@@ -10,6 +10,9 @@ import "testing"
 // enough to span many cell, row and byte chunks.
 func TestWindowBufferRepresentationParity(t *testing.T) {
 	driverParity(t, "window-buffer-repr", []string{
+		// The oracle build has no generate_series.
+		`CREATE TABLE gs(value INTEGER)`,
+		`INSERT INTO gs WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 200000) SELECT x FROM c`,
 		`CREATE TABLE r(k INTEGER PRIMARY KEY, g, v, t TEXT, b BLOB, f REAL)`,
 		`INSERT INTO r VALUES` +
 			`(1, 'a', 1, 'one', x'01', 1.5),` +
@@ -20,7 +23,7 @@ func TestWindowBufferRepresentationParity(t *testing.T) {
 			`(6, 'b', -7, 'six', x'06', -2.25),` +
 			`(7, 'c', 9223372036854775807, 'seven', x'07', 0.1),` +
 			`(8, 'c', -9223372036854775808, '8', x'', 8.0)`,
-		`INSERT INTO r SELECT 100+value, 'z', value, hex(zeroblob(1500+value)), x'', value*0.5 FROM generate_series(1,3)`,
+		`INSERT INTO r SELECT 100+value, 'z', value, hex(zeroblob(1500+value)), x'', value*0.5 FROM gs WHERE value <= 3`,
 		`SELECT k, typeof(lag(v) OVER w), quote(lag(v) OVER w), quote(lead(t) OVER w), quote(lead(b) OVER w), quote(lag(f) OVER w)
 		   FROM r WINDOW w AS (PARTITION BY g ORDER BY k) ORDER BY k`,
 		`SELECT k, quote(first_value(v) OVER w), quote(last_value(t) OVER w), quote(nth_value(b, 2) OVER w), typeof(nth_value(f, 2) OVER w)
@@ -40,14 +43,14 @@ func TestWindowBufferRepresentationParity(t *testing.T) {
 		                avg(value * 0.25) OVER (PARTITION BY value % 7 ORDER BY value ROWS BETWEEN 5 PRECEDING AND 2 FOLLOWING) AS y,
 		                nth_value(CASE WHEN value % 5 THEN value END, 2) OVER p AS z,
 		                last_value(CAST(value AS BLOB)) OVER p AS w
-		           FROM generate_series(1, 60000)
+		           FROM gs WHERE value <= 60000
 		         WINDOW p AS (PARTITION BY value % 3 ORDER BY value))`,
 		`SELECT max(i), min(i), sum(typeof(i) = 'integer')
-		   FROM (SELECT sum(value) OVER (ORDER BY value) i FROM generate_series(1, 200000))`,
+		   FROM (SELECT sum(value) OVER (ORDER BY value) i FROM gs WHERE value <= 200000)`,
 		`SELECT g, count(*), max(c), min(s), max(length(gc))
 		   FROM (SELECT value % 4 g, count(*) OVER w c, sum(value * 1.5) OVER w s,
 		                group_concat(char(65 + value % 26), '') OVER (PARTITION BY value % 4 ORDER BY value ROWS 9 PRECEDING) gc
-		           FROM generate_series(1, 40000) WINDOW w AS (PARTITION BY value % 4 ORDER BY value / 10))
+		           FROM gs WHERE value <= 40000 WINDOW w AS (PARTITION BY value % 4 ORDER BY value / 10))
 		  GROUP BY g ORDER BY g`,
 	})
 }
