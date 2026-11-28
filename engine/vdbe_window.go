@@ -1987,6 +1987,16 @@ func compileScanWindow(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 	annotateJoinSeeks(c, srcs, jplan)
 	deferredWhere := andConjuncts(jplan.deferred)
 
+	// realCols marks the payload columns read with OP_RealAffinity
+	// (windowRows.appendRow).
+	realCols := make([]bool, plan.nCols+len(srcs))
+	for _, s := range srcs {
+		for j, col := range s.tbl.cols {
+			if k := s.scope.offset + j; k < plan.nCols {
+				realCols[k] = col.Aff == affReal && !col.noRealRead
+			}
+		}
+	}
 	body := func() error {
 		var whereJumps []int
 		if deferredWhere != nil {
@@ -2017,7 +2027,7 @@ func compileScanWindow(c *compiler, stmt *SelectStmt, srcs []joinSource, scopes 
 		if operr := emitWindowOperands(c, opBase, opExprs, plan); operr != nil {
 			return operr
 		}
-		c.emit(Instruction{Op: OpWindowAppend, P1: colBase, P2: plan.nCols + len(srcs) + plan.nOps})
+		c.emit(Instruction{Op: OpWindowAppend, P1: colBase, P2: plan.nCols + len(srcs) + plan.nOps, P4: realCols})
 		for _, j := range whereJumps {
 			c.patch(j, c.here())
 		}

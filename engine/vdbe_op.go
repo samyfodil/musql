@@ -54,8 +54,9 @@ const (
 	// (P1, P2: r[P2] = ~r[P1], bitNotValueUnary -- NULL-preserving,
 	// otherwise always an INTEGER result; SQLite unary "~", compileUnary's
 	// "~" case).
-	// OpWindowAppend (P1: first register, P2: count) appends one scanned
-	// row's [cols.., rowids.., operands..] payload to the window batch; OpWindowFinal
+	// OpWindowAppend (P1: first register, P2: count, P4: []bool, which of the
+	// cols and rowids read as REAL) appends one scanned row's [cols..,
+	// rowids.., operands..] payload to the window batch; OpWindowFinal
 	// (P4: *windowPlan) resolves the whole batch into the query's result rows
 	// at once. See vdbe_window.go -- a window function is defined over a
 	// PARTITION of the result set, which does not exist until the scan ends.

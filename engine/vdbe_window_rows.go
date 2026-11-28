@@ -1,6 +1,9 @@
 package engine
 
-import "math"
+import (
+	"fmt"
+	"math"
+)
 
 // windowRows is a window query's batch (OpWindowAppend): every scanned row,
 // held without Go pointers. A batch is the whole result before any window is
@@ -59,9 +62,27 @@ const (
 
 func (r *windowRows) len() int { return r.n }
 
-// appendRow buffers one row as a record holds it (recordValue), so it reads
-// back as OpMakeRecord's copy of the same registers would.
-func (r *windowRows) appendRow(vals []Value) {
+// appendRow buffers one row: its first len(realCols) values are the scanned
+// columns and rowids, the rest its operands.
+//
+// A MEM_IntReal (which a VIRTUAL generated column of REAL affinity makes, and
+// a copy of one carries) is the one value whose reading back C decides by
+// where it is read. The outer select reads a column through the window
+// sub-select's result column, which has that column's affinity
+// (sqlite3WindowRewrite, selectWindowRewriteExprCb), and reading a REAL one
+// applies OP_RealAffinity (sqlite3ColumnDefault): such a payload value is
+// stored as the REAL it reads as (realCols), any other as the integer a
+// record holds (recordValue). What a window function's operand reads depends
+// on which nested sub-select its window is coded in and on the operands
+// beside it, which this batch does not reproduce, so an IntReal operand
+// declines.
+func (r *windowRows) appendRow(vals []Value, realCols []bool) error {
+	payload := len(realCols)
+	for i := payload; i < len(vals); i++ {
+		if vals[i].intReal {
+			return fmt.Errorf("%w: a window operand holding a REAL generated column's integer value", errVDBEUnsupported)
+		}
+	}
 	k := len(r.cells) - 1
 	if k < 0 || cap(r.cells[k])-len(r.cells[k]) < len(vals) {
 		r.cells = append(r.cells, make([]winCell, 0, max(winCellChunk, len(vals))))
@@ -75,7 +96,11 @@ func (r *windowRows) appendRow(vals []Value) {
 			cs[i] = winCell{typ: v.Typ, sub: v.Subtype, a: uint64(v.I), b: math.Float64bits(v.F)}
 			continue
 		}
-		cs[i] = r.cell(recordValue(vals[i]))
+		v := vals[i]
+		if v.intReal && i < payload && realCols[i] {
+			v.intReal = false
+		}
+		cs[i] = r.cell(recordValue(v))
 	}
 	if r.n&(1<<winRowChunkLg-1) == 0 {
 		r.rows = append(r.rows, make([]winRow, 0, 1<<winRowChunkLg))
@@ -83,6 +108,7 @@ func (r *windowRows) appendRow(vals []Value) {
 	last := &r.rows[len(r.rows)-1]
 	*last = append(*last, winRow{chunk: uint32(k), off: uint32(off), n: uint32(len(vals))})
 	r.n++
+	return nil
 }
 
 // cellsOf is row ri's cells.

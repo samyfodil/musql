@@ -2366,7 +2366,10 @@ func (m *vdbe) runLoop(insns []Instruction) (rows [][]Value, err error) {
 			if m.windowBatch == nil {
 				m.windowBatch = &windowRows{}
 			}
-			m.windowBatch.appendRow(m.regs[op.P1 : op.P1+op.P2])
+			realCols, _ := op.P4.([]bool)
+			if aerr := m.windowBatch.appendRow(m.regs[op.P1:op.P1+op.P2], realCols); aerr != nil {
+				return nil, aerr
+			}
 
 		case OpWindowFinal:
 			extra, werr := m.windowFinal(op.P4.(*windowPlan))
