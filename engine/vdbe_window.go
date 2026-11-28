@@ -337,6 +337,9 @@ func (w *windowRowCtxs) at(ri int, acc *aggItem) *evalCtx {
 	pending := acc.rowCollationPending()
 	switch {
 	case pending && acc.orderBy != nil:
+		if w.rowFree {
+			return p.windowRowCtx(w.m, w.batch.headRow(n), w.vals[ri])
+		}
 		var row []Value
 		return p.windowRowCtx(w.m, w.batch.rangeInto(ri, 0, n, &row), w.vals[ri])
 	case w.ctx == nil && w.rowFree:

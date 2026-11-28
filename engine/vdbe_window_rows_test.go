@@ -164,6 +164,9 @@ func TestWindowStepDecodesOnlyWhatItReads(t *testing.T) {
 	if a == b || a.vals[0].I != 0 || b.vals[0].I != 1000 {
 		t.Fatal("an ORDER BY aggregate's contexts must be its own until its collations resolve")
 	}
+	if a, b := free.at(0, ob), free.at(1, ob); a == b || &a.vals[0] != &b.vals[0] {
+		t.Fatal("a row-free ORDER BY aggregate's own contexts should share the decoded head row")
+	}
 
 	sum.rowRegs[aggExprArg] = 3
 	read := sum.operandRegsRead()
