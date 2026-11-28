@@ -3,6 +3,7 @@ package engine
 import (
 	"cmp"
 	"encoding/binary"
+	"math/bits"
 	"slices"
 	"sync/atomic"
 )
@@ -383,20 +384,48 @@ func (p *ReadOnlyPager) segListSeekIndex(cur *vdbeCursor, into *segRowSource) (s
 
 // sortListBy puts a list seek's rows in key's order, reporting false, having
 // moved nothing, when a key value is not an INTEGER (the seek then builds its
-// rows and sorts them, autoIndexOrderCursor). Ties keep their rowid order, as
-// the index's own does. A list already in order -- an equality seek whose key
-// is its own column, ties in rowid order -- is left as it is.
-func (src *segRowSource) sortListBy(key *autoIndexKey) bool {
+// rows and sorts them, autoIndexOrderCursor), a key column is an expression,
+// or key has more than 64 columns.
+// Ties keep their rowid order, as the index's own does. A list already in
+// order -- an equality seek whose key is its own column, ties in rowid order --
+// is left as it is.
+//
+// A key column pinned is one the seek holds to a single number: every row the
+// re-checked WHERE keeps ties on it, so it is not read.
+func (src *segRowSource) sortListBy(key *autoIndexKey, pinned func(c int) bool) bool {
 	n := len(src.listRows)
 	if key == nil || n < 2 {
 		return true
 	}
-	nk := len(key.cols)
+	// An expression's value is not in the row; a multi-OR order is no one key.
+	if len(key.cols) > 64 || key.multiOr != nil || slices.Contains(key.cols, xnExpr) {
+		return false
+	}
+	// Bit k of skip is key column k pinned; bit j of desc is the j-th column
+	// read descending.
+	var skip, desc uint64
+	nk := 0
+	for k, c := range key.cols {
+		if c >= 0 && pinned(c) {
+			skip |= 1 << k
+			continue
+		}
+		if k < len(key.desc) && key.desc[k] {
+			desc |= 1 << nk
+		}
+		nk++
+	}
+	switch {
+	case nk == 0:
+		return true
+	case nk == 1 && desc == 0 && key.cols[bits.TrailingZeros64(^skip)] < 0 && src.listRowidsAscend():
+		return true
+	}
 	less := func(ka, kb []int64) int {
 		for k := range ka {
 			if ka[k] != kb[k] {
 				c := cmp.Compare(ka[k], kb[k])
-				if k < len(key.desc) && key.desc[k] {
+				if desc&(1<<k) != 0 {
 					return -c
 				}
 				return c
@@ -410,7 +439,10 @@ func (src *segRowSource) sortListBy(key *autoIndexKey) bool {
 		row := src.listRows[i]
 		rid := s.Rowid(row)
 		width := min(s.Width(row), len(src.cols))
-		for _, c := range key.cols {
+		for k, c := range key.cols {
+			if skip&(1<<k) != 0 {
+				continue
+			}
 			if c < 0 {
 				flat = append(flat, int64(rid))
 				continue
@@ -446,6 +478,16 @@ func (src *segRowSource) sortListBy(key *autoIndexKey) bool {
 	}
 	copy(src.listSegs, segs)
 	copy(src.listRows, rows)
+	return true
+}
+
+// listRowidsAscend reports whether a list seek's rows are in rowid order.
+func (src *segRowSource) listRowidsAscend() bool {
+	for i := 1; i < len(src.listRows); i++ {
+		if int64(src.listSegs[i-1].Rowid(src.listRows[i-1])) >= int64(src.listSegs[i].Rowid(src.listRows[i])) {
+			return false
+		}
+	}
 	return true
 }
 

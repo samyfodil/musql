@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"math/bits"
 	"slices"
 	"unsafe"
@@ -456,6 +457,7 @@ func buildVMIdx(t *vmTab, spec *idxSeekSpec, enc TextEncoding, s *segSortedRows)
 		return buildSortedVMIdx(x, spec, enc)
 	}
 	var prevRid uint64
+	ds := make([]*segDiskIndex, 0, len(t.at))
 	for k, sg := range t.at {
 		if sg.nRows == 0 || k > 0 && sg.Rowid(0) <= prevRid {
 			return x
@@ -467,6 +469,7 @@ func buildVMIdx(t *vmTab, spec *idxSeekSpec, enc TextEncoding, s *segSortedRows)
 		if !ok || d.codec != segIdxCodecPostings || d.nVals == 0 || d.nRows == 0 || len(d.posts) < 4*d.nRows {
 			return x
 		}
+		ds = append(ds, d)
 		rows := make([]int, d.nRows)
 		for i := range rows {
 			rows[i] = int(binary.LittleEndian.Uint32(d.posts[4*i:]))
@@ -483,8 +486,71 @@ func buildVMIdx(t *vmTab, spec *idxSeekSpec, enc TextEncoding, s *segSortedRows)
 		x.vidx[k].Count = int64(len(x.vidx) - k)
 	}
 	x.none = false
+	// Keys whose rows several segments hold, which VSeekIdx leaves to the
+	// VDBE, are one run in one index over the table when the seek takes a
+	// key's rows in rowid order: each segment's in turn.
+	if overlapping(x.vidx) && (spec.order == nil || pinnedToRowid(spec)) {
+		if y := mergedVMIdx(&vmIdx{tab: t, none: true}, ds, x.keep); !y.none {
+			return y
+		}
+	}
 	return x
 }
+
+// mergedVMIdx is one index over every segment of x's table from each
+// segment's own (ds, with their rows rows): a key's rows are each segment's
+// run of it, in the segments' order.
+func mergedVMIdx(x *vmIdx, ds []*segDiskIndex, rows [][]int) *vmIdx {
+	t := x.tab
+	if len(ds) > maxMergedSegs {
+		return x
+	}
+	n := 0
+	for _, d := range ds {
+		n += d.nRows
+	}
+	if n > math.MaxInt32 {
+		return x
+	}
+	type at struct {
+		k   int64
+		seg uint16
+		r   int32
+	}
+	all := make([]at, 0, n)
+	next := make([]int, len(ds))
+	mask := ^uint64(0)
+	for k := range ds {
+		mask &= t.segs[k].Mask
+	}
+	for {
+		lo, any := int64(0), false
+		for k, d := range ds {
+			if next[k] < d.nVals && (!any || d.valueAt(next[k]) < lo) {
+				lo, any = d.valueAt(next[k]), true
+			}
+		}
+		if !any {
+			break
+		}
+		for k, d := range ds {
+			if i := next[k]; i < d.nVals && d.valueAt(i) == lo {
+				for _, r := range rows[k][d.start(i):d.start(i+1)] {
+					all = append(all, at{lo, uint16(k), int32(r)})
+				}
+				next[k]++
+			}
+		}
+	}
+	if len(all) == 0 {
+		return x
+	}
+	return x.tableIndex(mask, len(all), func(i int) (int, int, int64) { return int(all[i].seg), int(all[i].r), all[i].k })
+}
+
+// maxMergedSegs bounds mergedVMIdx's merge, which compares a key of every
+// segment per key.
+const maxMergedSegs = 256
 
 // buildSortedVMIdx is buildVMIdx for a sorted seek: each segment's rows in
 // the order of the spec's columns, ties in rowid order, as segSortedSeek
@@ -1485,11 +1551,11 @@ func (m *vdbe) syncIdxSeek(jx *vmJIT, c int, jc *jit.VCursor, spec *idxSeekSpec)
 	if jc.Last < 0 || jc.Last >= jc.N || jc.Sel == nil {
 		return fmt.Errorf("engine: internal: cursor %d seeked natively is on no row", c)
 	}
-	k := slices.IndexFunc(x.vidx, func(v jit.VIdx) bool { return v.Seg == jc.Seg })
-	if k < 0 {
+	sg := x.rowSegment(jc)
+	if sg == nil {
 		return fmt.Errorf("engine: internal: cursor %d seeked natively is in no segment of its table", c)
 	}
-	target := x.segs[k].Rowid(*(*int)(unsafe.Add(jc.Sel, 8*jc.Last)))
+	target := sg.Rowid(*(*int)(unsafe.Add(jc.Sel, 8*jc.Last)))
 	past, found := jc.Pos >= jc.N, false
 	for cur.advance() {
 		if !found && cur.rowid == target {
@@ -1504,6 +1570,28 @@ func (m *vdbe) syncIdxSeek(jx *vmJIT, c int, jc *jit.VCursor, spec *idxSeekSpec)
 	}
 	if !found {
 		return fmt.Errorf("engine: internal: cursor %d has no row %d native code seeked to", c, target)
+	}
+	return nil
+}
+
+// rowSegment is the segment of the row native code left cursor jc on in x,
+// or nil.
+func (x *vmIdx) rowSegment(jc *jit.VCursor) *segment {
+	if !x.whole {
+		if k := slices.IndexFunc(x.vidx, func(v jit.VIdx) bool { return v.Seg == jc.Seg }); k >= 0 {
+			return x.segs[k]
+		}
+		return nil
+	}
+	if x.segPtrs == nil {
+		return x.tab.at[0]
+	}
+	at := int((uintptr(jc.Sel)-uintptr(unsafe.Pointer(unsafe.SliceData(x.keep[0]))))/8) + int(jc.Last)
+	if at < 0 || at >= len(x.segPtrs) {
+		return nil
+	}
+	if k := slices.IndexFunc(x.tab.segs, func(s jit.VTabSeg) bool { return s.Seg == x.segPtrs[at] }); k >= 0 {
+		return x.tab.at[k]
 	}
 	return nil
 }

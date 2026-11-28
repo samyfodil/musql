@@ -360,6 +360,11 @@ type vdbe struct {
 	yieldReuse bool
 	yieldRow   []Value
 	yieldRows  [][]Value
+	// yieldHolds is set on a co-routine whose consumer runs nothing outside
+	// the statement between two of its rows: a read that does not yield, or
+	// a co-routine that holds. Native code then keeps its cursors across a
+	// yield (vdbe.jDefer), since nothing can change what they read.
+	yieldHolds bool
 
 	// likePlan is the last LIKE pattern this machine analysed (likePlanFor).
 	likePlan *likePlan
@@ -1721,7 +1726,10 @@ func (m *vdbe) runLoop(insns []Instruction) (rows [][]Value, err error) {
 		code = jx.marked
 	}
 	jitSkip := -1
-	m.jDefer, m.jLive = false, m.jLive[:0]
+	// A co-routine resumes holding the cursors it kept across its yield.
+	if !m.yield || !m.yieldHolds || !m.jDefer {
+		m.jDefer, m.jLive = false, m.jLive[:0]
+	}
 	if jitScore {
 		native := 0
 		if jx != nil {
