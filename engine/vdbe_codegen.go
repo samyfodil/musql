@@ -914,6 +914,8 @@ func compileSubProgram(pager *ReadOnlyPager, stmt *SelectStmt, outer *compiler) 
 			stmt = f
 		} else if f := pager.countCrossJoin(stmt); f != nil {
 			stmt = f
+		} else if f := pager.eagerAggregate(stmt); f != nil {
+			stmt = f
 		}
 	}
 	if pager != nil && pager.r41ArmsHeld == 0 && len(stmt.Compound) == 0 && len(stmt.From) != 0 {
