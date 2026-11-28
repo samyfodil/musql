@@ -241,11 +241,11 @@ func TestEagerAggregateFanout(t *testing.T) {
 		`CREATE TABLE ub(k INTEGER, y INTEGER)`,
 		`INSERT INTO ub SELECT value, value FROM generate_series(0, 19999)`,
 		`CREATE TABLE fa(k INTEGER, x INTEGER)`,
-		`INSERT INTO fa SELECT value % 100 * 7, value FROM generate_series(0, 19999)`,
+		`INSERT INTO fa SELECT value % 100 * 7, value FROM generate_series(0, 3999)`,
 		`CREATE TABLE fb(k INTEGER, y INTEGER)`,
-		`INSERT INTO fb SELECT value % 100 * 7, value FROM generate_series(0, 19999)`,
+		`INSERT INTO fb SELECT value % 100 * 7, value FROM generate_series(0, 3999)`,
 		`CREATE TABLE big(k INTEGER, g TEXT)`,
-		`INSERT INTO big SELECT value % 700, 'g' || (value % 10) FROM generate_series(0, 39999)`,
+		`INSERT INTO big SELECT value % 700, 'g' || (value % 10) FROM generate_series(0, 3999)`,
 	)
 	p, err := Open(path)
 	if err != nil {

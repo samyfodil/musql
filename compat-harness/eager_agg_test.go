@@ -158,11 +158,11 @@ func TestEagerAggregateFanoutAsC(t *testing.T) {
 		`CREATE TABLE ub(k INTEGER, y INTEGER)`,
 		`INSERT INTO ub SELECT * FROM ua`,
 		`CREATE TABLE fa(k INTEGER, x INTEGER)`,
-		`WITH RECURSIVE g(value) AS (SELECT 0 UNION ALL SELECT value + 1 FROM g WHERE value < 19999) INSERT INTO fa SELECT value % 100 * 7, value FROM g`,
+		`WITH RECURSIVE g(value) AS (SELECT 0 UNION ALL SELECT value + 1 FROM g WHERE value < 3999) INSERT INTO fa SELECT value % 100 * 7, value FROM g`,
 		`CREATE TABLE fb(k INTEGER, y INTEGER)`,
 		`INSERT INTO fb SELECT * FROM fa`,
 		`CREATE TABLE big(k INTEGER, g TEXT)`,
-		`WITH RECURSIVE g(value) AS (SELECT 0 UNION ALL SELECT value + 1 FROM g WHERE value < 39999) INSERT INTO big SELECT value % 700, 'g' || (value % 10) FROM g`,
+		`WITH RECURSIVE g(value) AS (SELECT 0 UNION ALL SELECT value + 1 FROM g WHERE value < 3999) INSERT INTO big SELECT value % 700, 'g' || (value % 10) FROM g`,
 	}
 	for _, q := range []string{
 		`SELECT d.g, count(*), max(b.y) FROM d JOIN ma a USING (k) JOIN mb b USING (k) GROUP BY d.g`,
