@@ -48,10 +48,12 @@ func recInlinable(arm *Program) bool {
 		return false
 	}
 	for _, in := range arm.Insns {
-		if !recInlineOperands(in) {
+		if !inlineOperands(in) {
 			return false
 		}
 		switch in.Op {
+		case OpOuterColumn, OpOuterRowid:
+			return false
 		case OpOpenDerived:
 			ds, ok := in.P4.(*derivedSource)
 			if !ok || ds == nil {
@@ -61,10 +63,6 @@ func recInlinable(arm *Program) bool {
 				ds.recSelf != nil && (ds.catalogScope != scopeAny || ds.vtabWrite != nil || ds.dbIdx != 0) {
 				return false
 			}
-		case OpRewind:
-			if in.P4 != nil {
-				return false // a row-filter plan: not read here, so not relocated
-			}
 		case OpFunction:
 			if _, isName := in.P4.(string); !isName {
 				return false
@@ -72,20 +70,6 @@ func recInlinable(arm *Program) bool {
 		}
 	}
 	return true
-}
-
-// recInlineOperands reports whether in is an opcode whose every operand this
-// pass knows: the whitelist recInline relocates, operand by operand.
-func recInlineOperands(in Instruction) bool {
-	switch in.Op {
-	case OpInit, OpGoto, OpHalt, OpOpenDerived, OpRewind, OpNext, OpIfEmpty, OpClose, OpColumn,
-		OpInteger, OpInt64, OpReal, OpString8, OpNull, OpVariable, OpSCopy, OpCopy, OpNot, OpBitNot, OpNegative,
-		OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpConcat, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight,
-		OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpIf, OpIfNot, OpIsNull, OpNotNull,
-		OpFunction, OpCast, OpResultRow, OpGosub, OpReturn, OpSortedSeek:
-		return true
-	}
-	return false
 }
 
 // recInline replaces prog.Insns[at], "RecQueueFill 1 arm", with a jump into a
@@ -104,7 +88,6 @@ func recInlineOperands(in Instruction) bool {
 func recInline(prog *Program, at int, arm *Program) {
 	regOff, curOff, slotOff := prog.NReg, prog.NCursors, prog.NSubCache
 	reg := func(r int) int { return r + regOff }
-	cur := func(c int) int { return c + curOff }
 
 	self, spec := recSelfCursor(arm)
 	if spec == nil {
@@ -139,58 +122,22 @@ func recInline(prog *Program, at int, arm *Program) {
 	done := pc
 	newAddr[len(ins)] = done
 	newAddr[0] = newAddr[ins[0].P2]
-	jump := func(a int) int { return newAddr[a] }
 	back := at + 1
 	if back < len(prog.Insns) && prog.Insns[back].Op == OpGoto {
 		back = prog.Insns[back].P2
 	}
 
+	x := inlineReloc{regOff: regOff, curOff: curOff, slotOff: slotOff, jump: func(a int) int { return newAddr[a] }}
 	relocate := func(in Instruction) Instruction {
-		r := in
-		switch in.Op {
-		case OpGoto:
-			r.P2 = jump(in.P2)
-		case OpHalt:
-			r = Instruction{Op: OpGoto, P2: done}
-		case OpResultRow:
-			r = Instruction{Op: OpRecQueuePush, P1: reg(in.P1), P2: in.P2}
-		case OpOpenDerived:
-			r.P1, r.P2, r.P4 = cur(in.P1), in.P2+slotOff, inlinedSource(in.P4.(*derivedSource))
-		case OpClose:
-			r.P1 = cur(in.P1)
-		case OpRewind, OpNext, OpIfEmpty:
-			r.P1, r.P2 = cur(in.P1), jump(in.P2)
-		case OpColumn:
-			if spec != nil && in.P1 == self {
-				r = Instruction{Op: OpRecSelfColumn, P2: in.P2, P3: reg(in.P3), P4: spec}
-			} else {
-				r.P1, r.P3 = cur(in.P1), reg(in.P3)
-			}
-		case OpInteger, OpInt64, OpReal, OpString8, OpNull, OpVariable:
-			r.P2 = reg(in.P2)
-		case OpSCopy, OpCopy, OpNot, OpBitNot, OpNegative:
-			r.P1, r.P2 = reg(in.P1), reg(in.P2)
-		case OpAdd, OpSubtract, OpMultiply, OpDivide, OpRemainder, OpConcat, OpBitAnd, OpBitOr, OpShiftLeft, OpShiftRight:
-			r.P1, r.P2, r.P3 = reg(in.P1), reg(in.P2), reg(in.P3)
-		case OpEq, OpNe, OpLt, OpLe, OpGt, OpGe:
-			r.P1, r.P3 = reg(in.P1), reg(in.P3)
-			if in.P5&p5StoreP2 != 0 {
-				r.P2 = reg(in.P2)
-			} else {
-				r.P2 = jump(in.P2)
-			}
-		case OpIf, OpIfNot, OpIsNull, OpNotNull:
-			r.P1, r.P2 = reg(in.P1), jump(in.P2)
-		case OpFunction:
-			r.P1, r.P3 = reg(in.P1), reg(in.P3)
-		case OpGosub:
-			r.P1, r.P2 = reg(in.P1), jump(in.P2)
-		case OpReturn, OpCast:
-			r.P1 = reg(in.P1)
-		case OpSortedSeek:
-			r.P1, r.P2, r.P4 = cur(in.P1), reg(in.P2), in.P4.(*sortedSeekHint).movedRegs(reg)
+		switch {
+		case in.Op == OpHalt:
+			return Instruction{Op: OpGoto, P2: done}
+		case in.Op == OpResultRow:
+			return Instruction{Op: OpRecQueuePush, P1: reg(in.P1), P2: in.P2}
+		case in.Op == OpColumn && spec != nil && in.P1 == self:
+			return Instruction{Op: OpRecSelfColumn, P2: in.P2, P3: reg(in.P3), P4: spec}
 		}
-		return r
+		return x.relocate(in)
 	}
 
 	out := prog.Insns

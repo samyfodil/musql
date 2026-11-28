@@ -104,10 +104,12 @@ func compileSelectScanRow(p *ReadOnlyPager, stmt *SelectStmt, outer *compiler, r
 		// fastest for its one shape; the compiled program covers the rest built
 		// from comparisons. (segPeepholesOffForTest: a differential test's
 		// reference is the plain loop.)
-		// A correlated EXISTS becomes a subroutine first (exists_inline.go), so
-		// the count recogniser below can see one as a semi-join.
+		// A correlated EXISTS or scalar subquery becomes a subroutine first
+		// (exists_inline.go, subquery_inline.go), so the count recogniser
+		// below can see an EXISTS as a semi-join.
 		if !segPeepholesOffForTest {
 			existsInlinePeephole(prog)
+			subqueryInlinePeephole(prog)
 		}
 		if !segPeepholesOffForTest && !segPeephole(prog) && !segVectorPeephole(prog) && !segOrderPeephole(prog) &&
 			!segGroupPeephole(prog) && !segDistinctPeephole(prog) && !segJoinPeephole(prog) && !segJoinGroupPeephole(prog) && !segJoinHashPeephole(prog) && !segJoinTopPeephole(prog) {

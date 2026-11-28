@@ -160,3 +160,71 @@ func TestRecInlineReadsTheSelfRowDirectly(t *testing.T) {
 		}
 	}
 }
+
+// TestRecInlineWalksATable: a step that joins a table, by a scan, an index
+// seek or a rowid seek -- a graph or tree walk -- is inlined like any other,
+// with the same answers as its sub-program.
+func TestRecInlineWalksATable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "w.musq")
+	buildDB(t, path,
+		`CREATE TABLE edge(a INTEGER, b INTEGER, w REAL)`,
+		`CREATE INDEX edge_a ON edge(a)`,
+		`WITH RECURSIVE g(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM g WHERE i < 300) INSERT INTO edge SELECT i, i * 2, i / 7.0 FROM g`,
+		`INSERT INTO edge SELECT a, a * 2 + 1, w FROM edge WHERE a % 3 = 0`,
+		`CREATE TABLE plain(a INTEGER, b INTEGER)`,
+		`INSERT INTO plain SELECT a, b FROM edge`,
+		`CREATE TABLE emp(id INTEGER PRIMARY KEY, boss INTEGER, name TEXT)`,
+		`WITH RECURSIVE g(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM g WHERE i < 400) INSERT INTO emp SELECT i, CASE WHEN i = 1 THEN NULL ELSE i / 2 END, 'e' || i FROM g`)
+	queries := []string{
+		`WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < (SELECT count(*) FROM plain WHERE a < 50)) SELECT count(*), sum(n) FROM r`,
+		// Down an index on edge(a).
+		`WITH RECURSIVE r(n, d) AS (SELECT 1, 0 UNION SELECT edge.b, d + 1 FROM r JOIN edge ON edge.a = r.n WHERE d < 12) SELECT count(*), sum(n), max(d) FROM r`,
+		`WITH RECURSIVE r(n, p) AS (SELECT 3, '3' UNION ALL SELECT edge.b, p || '>' || edge.b FROM r, edge WHERE edge.a = r.n AND edge.w < 30) SELECT count(*), max(p), min(p) FROM r`,
+		// The same walk over a table with no index: a scan per step.
+		`WITH RECURSIVE r(n, d) AS (SELECT 1, 0 UNION SELECT plain.b, d + 1 FROM r JOIN plain ON plain.a = r.n WHERE d < 8) SELECT count(*), sum(n), max(d) FROM r`,
+		// Up a tree by rowid.
+		`WITH RECURSIVE up(id, boss, depth) AS (SELECT id, boss, 0 FROM emp WHERE id = 397 UNION ALL SELECT emp.id, emp.boss, depth + 1 FROM up JOIN emp ON emp.id = up.boss) SELECT group_concat(id), max(depth) FROM up`,
+		// Down the same tree, through its boss column with no index.
+		`WITH RECURSIVE dn(id, depth) AS (SELECT 1, 0 UNION ALL SELECT emp.id, depth + 1 FROM dn JOIN emp ON emp.boss = dn.id WHERE depth < 4) SELECT count(*), sum(id), max(depth) FROM dn`,
+		// The rowid read back, and a table column carried along.
+		`WITH RECURSIVE up(id, names) AS (SELECT 250, '' UNION ALL SELECT emp.boss, names || emp.name || ',' FROM up, emp WHERE emp.rowid = up.id AND emp.boss IS NOT NULL) SELECT names FROM up ORDER BY length(names) DESC LIMIT 1`,
+	}
+	// steps is how many recursive steps of q's program still run as
+	// sub-programs ("RecQueueFill 1"), which EXPLAIN shows after inlining.
+	run := func(q string, inline bool) (rows string, steps int) {
+		recInlineOffForTest = !inline
+		defer func() { recInlineOffForTest = false }()
+		n, err := OpenWrite(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer n.Discard()
+		_, res, err := n.Query(q, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		_, ops, err := n.Query("EXPLAIN "+q, nil)
+		if err != nil {
+			t.Fatalf("EXPLAIN %s: %v", q, err)
+		}
+		for _, r := range ops {
+			if string(r[1].S) == "RecQueueFill" && r[2].I == 1 {
+				steps++
+			}
+		}
+		return fmt.Sprint(typedRows(res)), steps
+	}
+	for _, q := range queries {
+		want, subSteps := run(q, false)
+		got, steps := run(q, true)
+		if got != want {
+			t.Errorf("%s:\n inlined     %s\n sub-program %s", q, got, want)
+		}
+		if subSteps == 0 {
+			t.Errorf("%s: EXPLAIN shows no step run as a sub-program even with inlining off", q)
+		}
+		if steps != 0 {
+			t.Errorf("%s: %d steps not inlined", q, steps)
+		}
+	}
+}
