@@ -63,7 +63,7 @@ import "fmt"
 // after that sort. windowPeerEnds is the same peer-boundary computation
 // computeWindowCall itself uses (same keys, same collations), so the runs
 // walked here are exactly the peer groups the functions will see.
-func (m *vdbe) windowPeerAmbiguous(plan *windowPlan, lvl windowCall, parts [][]int, batch, vals [][]Value) (bool, error) {
+func (m *vdbe) windowPeerAmbiguous(plan *windowPlan, lvl windowCall, parts [][]int, batch *windowRows, vals [][]Value) (bool, error) {
 	for _, part := range parts {
 		ends, err := m.windowPeerEnds(plan, lvl, part, batch, vals)
 		if err != nil {
@@ -75,7 +75,7 @@ func (m *vdbe) windowPeerAmbiguous(plan *windowPlan, lvl windowCall, parts [][]i
 			// against its first is enough to decide the whole run.
 			ambiguous := false
 			for k := i + 1; k < j; k++ {
-				if !windowEntriesIdentical(batch[part[i]], batch[part[k]]) {
+				if !batch.identical(part[i], part[k]) {
 					ambiguous = true
 					break
 				}
@@ -500,23 +500,22 @@ func collationOrBinary(name string) string {
 // constrained by the prerequisite mask rather than by cost, so the model above
 // does not describe it. rowids are compared alongside the columns for the same
 // reason windowEntriesIdentical compares them: a projection may name one.
-func (m *vdbe) windowPeerLoopImmune(plan *windowPlan, batch [][]Value, run []int) bool {
+func (m *vdbe) windowPeerLoopImmune(plan *windowPlan, batch *windowRows, run []int) bool {
 	if len(plan.srcColOfs) < 2 || len(run) < 2 {
 		return false
 	}
 	nSrc := len(plan.srcColOfs) - 1
 	varying := 0
-	first := batch[run[0]]
+	first := run[0]
 	for i := 0; i < nSrc; i++ {
 		lo, hi := plan.srcColOfs[i], plan.srcColOfs[i+1]
 		same := true
 		for _, ri := range run[1:] {
-			e := batch[ri]
-			if !windowEntriesIdentical(first[lo:hi], e[lo:hi]) {
+			if !batch.identicalRange(first, ri, lo, hi) {
 				same = false
 				break
 			}
-			if r := plan.nCols + i; r < len(first) && r < len(e) && !valuesIdentical(first[r], e[r]) {
+			if r := plan.nCols + i; r < batch.width(first) && r < batch.width(ri) && !batch.identicalRange(first, ri, r, r+1) {
 				same = false
 				break
 			}
