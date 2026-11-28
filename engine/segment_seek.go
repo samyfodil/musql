@@ -272,21 +272,29 @@ func (s *rowStore) snapshotIndexRowids(col int, probe Value) ([]int64, bool) {
 
 // certainlyUnequal reports whether a stored value can match an equality probe
 // under no collation or affinity the comparison might use: a NULL, two
-// different integers, two different floats, a BLOB against anything but the
-// same bytes as a BLOB (no affinity converts to or from one), or two texts that
-// differ even with case folded and trailing spaces trimmed (so BINARY, NOCASE
-// and RTRIM all agree). Anything else, such as an integer against a float or a
-// text, may be equal and is kept.
+// different numbers, a BLOB against anything but the same bytes as a BLOB (no
+// affinity converts to or from one), a number against a text that is not one
+// (only a numeric affinity converts the text, and a numeric probe means the
+// comparison's affinity is not TEXT), or two texts that differ even with case
+// folded and trailing spaces trimmed (so BINARY, NOCASE and RTRIM all agree).
+// Anything else, such as a number against a text probe, may be equal and is
+// kept.
 func certainlyUnequal(v, probe Value) bool {
+	numeric := func(t ValueType) bool { return t == Int || t == Float }
 	switch {
 	case v.Typ == Null || probe.Typ == Null:
 		return true
 	case v.Typ == Blob || probe.Typ == Blob:
 		return v.Typ != probe.Typ || string(v.S) != string(probe.S)
-	case v.Typ == Int && probe.Typ == Int:
-		return v.I != probe.I
-	case v.Typ == Float && probe.Typ == Float:
-		return v.F != probe.F
+	case numeric(v.Typ) && numeric(probe.Typ):
+		return compareValues(v, probe) != 0
+	case v.Typ == Text && numeric(probe.Typ):
+		// An infinity is not a number a text parses as, but its text is.
+		if probe.Typ == Float && math.IsInf(probe.F, 0) {
+			return false
+		}
+		_, _, _, ok := parseFullNumeric(string(v.S))
+		return !ok
 	case v.Typ == Text && probe.Typ == Text:
 		return !strings.EqualFold(strings.TrimRight(string(v.S), " "), strings.TrimRight(string(probe.S), " "))
 	}
@@ -329,18 +337,7 @@ func segIndexRowids(segs []*segment, col int, probe Value) ([]int64, bool) {
 		if col < 0 || col >= len(sg.cols) {
 			return nil, false
 		}
-		var pos []int32
-		var have bool
-		switch probe.Typ {
-		case Int:
-			pos, have = sg.segEqualityRows(col, probe.I)
-		case Text, Blob:
-			pos, have = sg.segEqualityRowsBytes(col, probe.S)
-		case Float:
-			pos, have = sg.segEqualityRowsFloat(col, probe.F)
-		default:
-			return nil, false
-		}
+		pos, have := sg.seekRows(col, probe, nil)
 		if !have {
 			return nil, false // this column is not indexable; scan instead
 		}

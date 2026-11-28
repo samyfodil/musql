@@ -116,6 +116,9 @@ type segment struct {
 	// on first use (segment_eqindex.go).
 	eqMu    eqCountMu
 	diskIdx map[int]*segDiskIndex
+	// partIdx is the index of each column diskIdx has none for because some
+	// of its rows are NULL or of another storage class (partIndexFor).
+	partIdx map[int]*segPartIndex
 
 	// Lazily built NULL indicators, one per column: a 0/1 int64 block the JIT
 	// can read where the bitmap cannot. See segment_nullidx.go.
@@ -802,6 +805,43 @@ func (s *segment) BytesColumn(c int) (cells []uint64, heap []byte, ok bool) {
 		return nil, nil, false
 	}
 	return unsafe.Slice((*uint64)(unsafe.Pointer(&s.buf[off])), s.nRows), s.heap, true
+}
+
+// fixedBlock is an INTEGER, REAL or PhysNumeric column's 8-byte cells, with
+// no NULL or exception gate: such a row's cell means nothing.
+func (s *segment) fixedBlock(c int) ([]int64, bool) {
+	if c < 0 || c >= len(s.cols) || !segLittleEndian || s.cols[c].bounds {
+		return nil, false
+	}
+	switch s.cols[c].phys {
+	case PhysInt64, PhysFloat64, PhysNumeric:
+	default:
+		return nil, false
+	}
+	off := int(s.cols[c].blockOff)
+	if off == 0 || uintptr(unsafe.Pointer(&s.buf[off]))%8 != 0 {
+		return nil, false
+	}
+	return unsafe.Slice((*int64)(unsafe.Pointer(&s.buf[off])), s.nRows), true
+}
+
+// rawBytesCells is a TEXT or BLOB column's cells with no NULL or exception
+// gate: such a row's cell means nothing.
+func (s *segment) rawBytesCells(c int) ([]uint64, bool) {
+	if c < 0 || c >= len(s.cols) || !segLittleEndian {
+		return nil, false
+	}
+	if ph := s.cols[c].phys; ph != PhysText && ph != PhysBlob {
+		return nil, false
+	}
+	if s.cols[c].bounds {
+		return s.boundsCells(c)
+	}
+	off := int(s.cols[c].blockOff)
+	if off == 0 || uintptr(unsafe.Pointer(&s.buf[off]))%8 != 0 {
+		return nil, false
+	}
+	return unsafe.Slice((*uint64)(unsafe.Pointer(&s.buf[off])), s.nRows), true
 }
 
 // BytesColumnNulls is BytesColumn for a column that may hold NULLs: nulls is

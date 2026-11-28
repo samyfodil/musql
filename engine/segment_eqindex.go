@@ -1,6 +1,9 @@
 package engine
 
 import (
+	"encoding/binary"
+	"math"
+	"slices"
 	"sync"
 	"unsafe"
 )
@@ -14,29 +17,190 @@ import (
 // column's view must not both build it into the same map.
 type eqCountMu = sync.Mutex
 
-// segEqualityCount answers "how many rows have col = v" from the file's index,
-// or reports false when this column has none.
+// segEqualityCount answers "how many rows have col = v" from the column's
+// index, or reports false when it has none or a row of another storage class
+// might equal v. A NULL row equals nothing.
 func (s *segment) segEqualityCount(col int, v int64) (int, bool) {
 	s.eqMu.Lock()
-	x, ok := s.diskIndexFor(col)
+	x, exc, ok := s.seekIndexFor(col)
 	s.eqMu.Unlock()
 	if !ok {
 		return 0, false
 	}
+	probe := Value{Typ: Int, I: v}
+	for _, r := range exc {
+		if !certainlyUnequal(s.Value(col, int(r)), probe) {
+			return 0, false
+		}
+	}
 	return x.countFor(v)
 }
 
-// segEqualityRows is "which rows have col = v", ascending by position -- which is
-// ascending by ROWID too, because a segment stores its rows in rowid order (see
-// segment_seek.go). Reports false when this column has no index.
-func (s *segment) segEqualityRows(col int, v int64) ([]int32, bool) {
+// seekRows appends to dst the rows of col a seek for probe tests, ascending by
+// position -- which is ascending by ROWID too, because a segment stores its
+// rows in rowid order (see segment_seek.go): those the column's index holds
+// probe in, and those of another storage class that might equal it. false
+// when col has no index probe can ask.
+func (s *segment) seekRows(col int, probe Value, dst []int32) ([]int32, bool) {
 	s.eqMu.Lock()
-	x, ok := s.diskIndexFor(col)
+	x, exc, ok := s.seekIndexFor(col)
 	s.eqMu.Unlock()
-	if !ok || x.codec != segIdxCodecPostings {
+	if !ok {
+		return dst, false
+	}
+	at := len(dst)
+	switch probe.Typ {
+	case Int:
+		switch x.codec {
+		case segIdxCodecPostings:
+			dst = x.rowsFor(probe.I, dst)
+		case segIdxCodecFloat:
+			// A REAL equals the INTEGER of its value. One too wide for a
+			// double finds the REALs nearest it, which the seek tests again.
+			dst, _ = x.rowsForFloat(float64(probe.I), dst)
+		default:
+			return dst, false
+		}
+	case Float:
+		switch x.codec {
+		case segIdxCodecFloat:
+			dst, _ = x.rowsForFloat(probe.F, dst)
+		case segIdxCodecPostings:
+			// Only an integral REAL equals an INTEGER, and only the one of
+			// its value.
+			if f := probe.F; f == math.Trunc(f) && f >= -(1<<63) && f < 1<<63 {
+				dst = x.rowsFor(int64(f), dst)
+			}
+		default:
+			return dst, false
+		}
+	case Text, Blob:
+		if dst, ok = x.rowsForBytes(probe.S, dst); !ok {
+			return dst, false
+		}
+	default:
+		return dst, false
+	}
+	hit := len(dst)
+	for _, r := range exc {
+		if !certainlyUnequal(s.Value(col, int(r)), probe) {
+			dst = append(dst, r)
+		}
+	}
+	if hit > at && len(dst) > hit {
+		slices.Sort(dst[at:])
+	}
+	return dst, true
+}
+
+// seekIndexFor is col's index for a seek, which tests each row it is given:
+// the file's (diskIndexFor), or partIndexFor's, with the rows it leaves out
+// that are of another storage class. A PhysNumeric column, INTEGERs and REALs
+// in one block of doubles, has its index ordered by value as a REAL column's
+// is. The caller holds eqMu.
+func (s *segment) seekIndexFor(col int) (*segDiskIndex, []int32, bool) {
+	if x, ok := s.diskIndexFor(col); ok {
+		return x, nil, true
+	}
+	if p, ok := s.partIndexFor(col); ok {
+		return p.x, p.exc, true
+	}
+	return nil, nil, false
+}
+
+// segPartIndex is the index of a column holding NULLs or values of another
+// storage class over its other rows, and the rows of another class,
+// ascending. A NULL equals nothing, so its rows are in neither.
+type segPartIndex struct {
+	x   *segDiskIndex
+	exc []int32
+}
+
+// partIndexFor is col's segPartIndex, built on first use, for the column
+// diskIndexFor refuses for its NULLs or exceptions. Only a segment whose rows
+// are all full width has one: a short row is marked NULL and reads as the
+// column's DEFAULT. The caller holds eqMu.
+func (s *segment) partIndexFor(col int) (*segPartIndex, bool) {
+	if col < 0 || col >= len(s.cols) || !s.fullWidth || s.nRows == 0 || s.cols[col].nullOff == 0 && !s.hasException(col) && s.cols[col].phys != PhysNumeric {
 		return nil, false
 	}
-	return x.rowsFor(v, nil), true
+	if p, seen := s.partIdx[col]; seen {
+		return p, p != nil
+	}
+	if s.partIdx == nil {
+		s.partIdx = map[int]*segPartIndex{}
+	}
+	p := s.buildPartIndex(col)
+	s.partIdx[col] = p
+	return p, p != nil
+}
+
+// buildPartIndex is partIndexFor's index, nil when col's cells cannot be read
+// in place or no row is of the column's own class.
+func (s *segment) buildPartIndex(col int) *segPartIndex {
+	var cells []int64
+	var heap []byte
+	switch s.cols[col].phys {
+	case PhysInt64, PhysFloat64, PhysNumeric:
+		v, ok := s.fixedBlock(col)
+		if !ok {
+			return nil
+		}
+		cells = v
+	case PhysText, PhysBlob:
+		c, ok := s.rawBytesCells(col)
+		if !ok {
+			return nil
+		}
+		cells, heap = unsafe.Slice((*int64)(unsafe.Pointer(unsafe.SliceData(c))), len(c)), s.heap
+	default:
+		return nil
+	}
+	if len(cells) != s.nRows {
+		return nil
+	}
+	p := &segPartIndex{}
+	pos := make([]int32, 0, s.nRows)
+	sub := make([]int64, 0, s.nRows)
+	var exc []uint64
+	if s.hasException(col) {
+		exc = s.excRows[col]
+	}
+	for i := range s.nRows {
+		switch {
+		case exc != nil && exc[i/64]&(1<<uint(i%64)) != 0:
+			p.exc = append(p.exc, int32(i))
+		case !s.isNull(col, i):
+			pos, sub = append(pos, int32(i)), append(sub, cells[i])
+		}
+	}
+	if len(sub) == 0 {
+		return nil
+	}
+	var blk []byte
+	var ok bool
+	switch s.cols[col].phys {
+	case PhysInt64:
+		blk, ok = buildSegColumnIndex(sub)
+	case PhysFloat64, PhysNumeric:
+		blk, ok = buildSegColumnIndexFloat(sub)
+	default:
+		blk, ok = buildSegColumnIndexBytes(sub, heap)
+	}
+	if !ok {
+		return nil
+	}
+	buf := make([]byte, 8+len(blk)) // 8-aligned, as in a file
+	copy(buf[8:], blk)
+	if p.x, ok = openSegColumnIndex(buf, 8, len(sub), heap, nil); !ok {
+		return nil
+	}
+	// The record's positions are into sub; the segment's rows are pos.
+	for k := range p.x.nRows {
+		at := p.x.posts[4*k:]
+		binary.LittleEndian.PutUint32(at, uint32(pos[binary.LittleEndian.Uint32(at)]))
+	}
+	return p
 }
 
 // diskIndexFor is this column's on-disk index, opened once and remembered. The
@@ -158,17 +322,23 @@ func (s *segment) segEqualityRowsBytes(col int, probe []byte) ([]int32, bool) {
 	return x.rowsForBytes(probe, nil)
 }
 
-// segEqualityCountOf is how many rows hold probe in col, a TEXT or BLOB probe
-// compared under BINARY, without building their positions. false when this
-// column has no index the probe can ask.
+// segEqualityCountOf is how many rows seekRows would answer for probe, a TEXT
+// or BLOB probe compared under BINARY, without building their positions.
+// false when this column has no index the probe can ask.
 func (s *segment) segEqualityCountOf(col int, probe Value) (int, bool) {
 	s.eqMu.Lock()
-	x, ok := s.diskIndexFor(col)
+	x, exc, ok := s.seekIndexFor(col)
 	s.eqMu.Unlock()
 	if !ok {
 		return 0, false
 	}
-	return x.countForValue(probe)
+	n, ok := x.countForValue(probe)
+	for _, r := range exc {
+		if !certainlyUnequal(s.Value(col, int(r)), probe) {
+			n++
+		}
+	}
+	return n, ok
 }
 
 // segEqualityRowsFloat is segEqualityRows for a REAL probe.
