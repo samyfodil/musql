@@ -109,17 +109,21 @@ func wideWindowRows(n, nCols, nOps int) *windowRows {
 // TestWindowStepDecodesOnlyWhatItReads pins what an aggregate step decodes
 // from a buffered row. Its context's columns and rowids are read only to
 // resolve a collation, once per accumulator, so a sum() decodes them for its
-// first row and never again, while a max() decodes each row until its
-// collation is resolved; of the operand block only the cells the
-// accumulator's registers name are decoded. Decoding whole rows per step made
+// first row and never again, while over a RIGHT or FULL join's USING column a
+// max() decodes each row until its collation is resolved; of the operand
+// block only the cells the accumulator's registers name are decoded. Decoding whole rows per step made
 // a window over a wide table several times slower than before the batch held
 // its rows as cells.
 func TestWindowStepDecodesOnlyWhatItReads(t *testing.T) {
 	const nCols, nOps = 30, 9
 	batch := wideWindowRows(3, nCols, nOps)
-	plan := &windowPlan{nCols: nCols, nRowids: 1}
+	// A FULL JOIN's USING column resolves its collation against the row.
+	plan := &windowPlan{nCols: nCols, nRowids: 1, scopes: []tableScope{{coalesceFallback: map[string][]int{}}}}
 	vals := make([][]Value, 3)
-	rows := windowRowCtxs{m: &vdbe{}, plan: plan, batch: batch, vals: vals}
+	rows := newWindowRowCtxs(&vdbe{}, plan, batch, vals)
+	if rows.rowFree {
+		t.Fatal("a scope with a coalesce fallback must not be row-free")
+	}
 
 	sum := &aggItem{aggItemPlan: &aggItemPlan{kind: aggSum}}
 	if sum.rowCollationPending() {
@@ -144,6 +148,15 @@ func TestWindowStepDecodesOnlyWhatItReads(t *testing.T) {
 	mx.argCollSet = true
 	if ctx := rows.at(1, mx); ctx.vals[0].I != 2000 {
 		t.Fatalf("max()'s context was decoded after its collation was resolved (%d)", ctx.vals[0].I)
+	}
+
+	// With no such column no collation depends on the row: max() decodes none.
+	free := newWindowRowCtxs(&vdbe{}, &windowPlan{nCols: nCols, nRowids: 1}, batch, vals)
+	mx2 := &aggItem{aggItemPlan: &aggItemPlan{kind: aggMax}}
+	for ri := range 3 {
+		if ctx := free.at(ri, mx2); ctx.vals[0].I != 0 {
+			t.Fatalf("row %d: max()'s context was decoded though no collation depends on the row", ri)
+		}
 	}
 
 	ob := &aggItem{aggItemPlan: &aggItemPlan{kind: aggGroupConcat, orderBy: []OrderTerm{{}}}}
